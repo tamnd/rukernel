@@ -1,9 +1,12 @@
 //! Safe helpers for the kernel crates of rukernel.
 //!
-//! This crate contains no `unsafe` code. Each helper reports an overflow and does not wrap.
+//! This crate contains no `unsafe` code. Each helper reports an overflow and does not wrap. The
+//! `chacha` module has the ChaCha20 random generator of the kernel.
 
 #![no_std]
 #![forbid(unsafe_code)]
+
+pub mod chacha;
 
 /// Moves `value` up to the next multiple of `align`.
 ///

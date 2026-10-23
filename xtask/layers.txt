@@ -9,8 +9,12 @@ rk-abi    0
 rk-lib    0
 rk-sched  1
 rk-mm     1
+rk-proc   2
 rk-vfs    2
 rk-fs-tmpfs 3
+rk-drv-mem 3
+rk-drv-tty 3
+rk-syscall 5
 rukernel  5
 rk-abigen tool
 xtask     tool

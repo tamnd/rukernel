@@ -71,6 +71,11 @@ QEMU loads the ELF image directly through the PVH entry note. The build also wri
 | `core/rk-mm/` | The memory manager: areas, page faults, copy on write, `mmap` and `brk` |
 | `fs/rk-vfs/` | The virtual file system: inodes, dentries, mounts, path walks, open files and the cpio reader |
 | `fs/rk-fs-tmpfs/` | tmpfs, the file system in memory that holds the initramfs |
+| `core/rk-proc/` | Processes and threads: process IDs, `fork`, `execve`, `exit` and `wait4` |
+| `core/rk-syscall/` | The system call table and the system calls of R1 |
+| `drv/rk-drv-mem/` | The memory devices: `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom` |
+| `drv/rk-drv-tty/` | The console tty on the serial port |
+| `tests/user/` | The C test programs that run in user mode |
 | `xtask/` | The build checks |
 
 [`spec/23-package-layout.md`](spec/23-package-layout.md) gives the full crate tree. The crates come into the tree as the milestones need them.

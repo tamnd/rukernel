@@ -32,6 +32,26 @@ name = "rk-abigen"
 version = "0.1.1"
 
 [[package]]
+name = "rk-drv-mem"
+version = "0.1.1"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-lib",
+ "rk-vfs",
+]
+
+[[package]]
+name = "rk-drv-tty"
+version = "0.1.1"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-vfs",
+ "zerocopy",
+]
+
+[[package]]
 name = "rk-frame"
 version = "0.1.1"
 
@@ -57,10 +77,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-proc"
+version = "0.1.1"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-mm",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-sched"
 version = "0.1.1"
 dependencies = [
  "rk-frame",
+]
+
+[[package]]
+name = "rk-syscall"
+version = "0.1.1"
+dependencies = [
+ "rk-abi",
+ "rk-drv-mem",
+ "rk-drv-tty",
+ "rk-frame",
+ "rk-mm",
+ "rk-proc",
+ "rk-vfs",
+ "zerocopy",
 ]
 
 [[package]]
@@ -76,10 +120,14 @@ name = "rukernel"
 version = "0.1.1"
 dependencies = [
  "rk-abi",
+ "rk-drv-mem",
+ "rk-drv-tty",
  "rk-frame",
  "rk-fs-tmpfs",
  "rk-mm",
+ "rk-proc",
  "rk-sched",
+ "rk-syscall",
  "rk-vfs",
 ]
 

@@ -1,0 +1,19 @@
+[package]
+name = "rk-drv-mem"
+description = "The memory devices of rukernel: null, zero, full, random and urandom, and the kernel random generator."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+rk-lib.workspace = true
+rk-vfs.workspace = true
+
+[lints]
+workspace = true

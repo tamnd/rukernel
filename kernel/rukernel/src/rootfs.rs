@@ -27,3 +27,28 @@ pub(crate) fn init(boot: &BootInfo) {
 pub(crate) fn context() -> Option<&'static FsContext> {
     ROOT.get()
 }
+
+/// Makes `/dev` and the device files of the console and the memory devices, if the initramfs did
+/// not make them. Linux has devtmpfs for this. rukernel gets devtmpfs in a later release.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn make_dev(fs: &FsContext) {
+    use rk_vfs::inode::mode::S_IFCHR;
+
+    let root = fs.root().clone();
+    let _ = fs.mkdir(&root, b"/dev", 0o755);
+    let mut nodes = alloc::vec![
+        (alloc::string::String::from("console"), 0o600, rk_drv_tty::CONSOLE_RDEV),
+        (alloc::string::String::from("tty"), 0o666, rk_drv_tty::TTY_RDEV),
+        (alloc::string::String::from("ttyS0"), 0o660, rk_drv_tty::TTYS0_RDEV),
+    ];
+    for dev in rk_drv_mem::MemDevice::ALL {
+        nodes.push((alloc::string::String::from(dev.name()), 0o666, dev.rdev()));
+    }
+    for (name, perm, rdev) in nodes {
+        let path = alloc::format!("/dev/{name}");
+        match fs.mknod(&root, path.as_bytes(), S_IFCHR | perm, rdev) {
+            Ok(_) | Err(rk_abi::Errno::EEXIST) => {}
+            Err(e) => println!("rootfs: cannot make {path}, error {}", e.get()),
+        }
+    }
+}

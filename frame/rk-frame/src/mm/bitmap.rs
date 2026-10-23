@@ -5,7 +5,7 @@
 //! same frame two times.
 //!
 //! This is the frame allocator of R0. The buddy allocator and the per CPU lists come in R1 and R4,
-//! per spec/05-memory.md.
+//! per spec/07-memory.md.
 
 /// A bitmap for `WORDS * 64` frames.
 pub(crate) struct FrameBitmap<const WORDS: usize> {

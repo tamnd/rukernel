@@ -57,3 +57,17 @@ fn put(b: u8) {
     }
     UART.data.write(b);
 }
+
+/// Writes bytes to COM1 with no change. The tty layer does the output processing of a user
+/// write.
+pub(crate) fn write_raw(bytes: &[u8]) {
+    for &b in bytes {
+        put(b);
+    }
+}
+
+/// Reads one byte from COM1, if a byte came.
+pub(crate) fn try_read() -> Option<u8> {
+    // Bit 0 of the line status is set when the receive buffer has a byte.
+    if UART.line_status.read() & 0x01 != 0 { Some(UART.data.read()) } else { None }
+}
