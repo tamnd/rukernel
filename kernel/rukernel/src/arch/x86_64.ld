@@ -36,11 +36,14 @@ SECTIONS
     . = ALIGN(4096) + KERNEL_BASE;
     __kernel_start = .;
 
+    __text_start = .;
     .text : AT(ADDR(.text) - KERNEL_BASE) {
         *(.text .text.*)
     } :text
 
     . = ALIGN(4096);
+    __text_end = .;
+    __rodata_start = .;
     .rodata : AT(ADDR(.rodata) - KERNEL_BASE) {
         *(.rodata .rodata.*)
         /* The exception table: pairs of a faulting instruction and its fixup address. */
@@ -51,17 +54,28 @@ SECTIONS
     } :rodata
 
     . = ALIGN(4096);
+    __rodata_end = .;
+    __data_start = .;
     .data : AT(ADDR(.data) - KERNEL_BASE) {
         *(.data .data.*)
+        *(.got .got.*)
     } :data
 
     .bss : AT(ADDR(.bss) - KERNEL_BASE) {
+        . = ALIGN(16);
+        __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        . = ALIGN(16);
+        __bss_end = .;
     } :data
 
     . = ALIGN(4096);
     __kernel_end = .;
+
+    /* The boot code clears the bss before paging is on, so it needs the physical addresses. */
+    __bss_start_phys = __bss_start - KERNEL_BASE;
+    __bss_end_phys = __bss_end - KERNEL_BASE;
 
     /DISCARD/ : {
         *(.eh_frame .eh_frame_hdr .comment .note.GNU-stack)

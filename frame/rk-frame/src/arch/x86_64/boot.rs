@@ -8,7 +8,7 @@
 //! The assembly below makes boot page tables that map the first 1 GiB of physical memory two
 //! times: at address 0, and at the kernel base `0xffffffff80000000`. Then it turns on long mode,
 //! moves to the kernel base and calls `rk_frame_x86_64_entry`. The identity map is only for the
-//! boot path. The kernel page tables replace these tables in R0.
+//! boot path. `paging::init` replaces these tables with the kernel page tables.
 
 use crate::addr::PhysAddr;
 use crate::boot::{BootInfo, MemoryKind};
@@ -31,6 +31,11 @@ core::arch::global_asm!(
 rk_pvh_start32:
     cli
     cld
+    movl $__bss_start_phys, %edi    # clear the bss: the loader does not have to clear it
+    movl $__bss_end_phys, %ecx
+    subl %edi, %ecx
+    xorl %eax, %eax
+    rep stosb
     movl %ebx, %edi                 # the physical address of hvm_start_info
     movl $boot_pml4, %eax
     movl %eax, %cr3
@@ -119,6 +124,8 @@ extern "C" fn rk_frame_x86_64_entry(start_info: u64) -> ! {
     super::init_cpu();
     let mut info = BootInfo::new("pvh");
     read_start_info(start_info, &mut info);
+    crate::mm::frame::init(&info, super::paging::kernel_end_phys());
+    super::paging::init(&info);
     crate::boot::start(info)
 }
 

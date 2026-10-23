@@ -31,6 +31,8 @@ fn main(boot: &'static BootInfo) -> ! {
         );
     }
     println!("memory: {} MiB usable", boot.usable_bytes() >> 20);
+    let frames = rk_frame::mm::frame_stats();
+    println!("memory: {} of {} frames free", frames.free, frames.total);
 
     if let Some(test) = param(boot.cmdline(), "rk.test") {
         let passed = selftest::run(test);

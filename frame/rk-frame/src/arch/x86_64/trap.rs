@@ -206,3 +206,37 @@ pub(crate) fn probe_read_u64(addr: usize) -> Option<u64> {
     }
     if failed == 0 { Some(value) } else { None }
 }
+
+/// Tells if a write to `addr` is allowed, with a locked OR of 0. The OR does not change the value.
+/// A fault gives `false`.
+#[inline(never)]
+pub(crate) fn probe_writable(addr: usize) -> bool {
+    let failed: u32;
+    // SAFETY: the exception table entry sends a fault at the OR to the fixup code. The caller
+    // gives an address in the kernel image, which is normal memory. A locked OR of 0 is atomic and
+    // leaves the value as it was, so no other access sees a change.
+    unsafe {
+        core::arch::asm!(
+            "2: lock or qword ptr [{addr}], 0",
+            "xor {failed:e}, {failed:e}",
+            "3:",
+            ".pushsection __ex_table, \"a\"",
+            ".balign 8",
+            ".quad 2b, 4f",
+            ".popsection",
+            ".pushsection .text.rk_fixup, \"ax\"",
+            "4: mov {failed:e}, 1",
+            "jmp 3b",
+            ".popsection",
+            addr = in(reg) addr,
+            failed = out(reg) failed,
+            options(nostack),
+        );
+    }
+    failed == 0
+}
+
+/// The virtual address range of the kernel image.
+pub(crate) fn kernel_image() -> (usize, usize) {
+    super::paging::kernel_image()
+}
