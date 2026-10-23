@@ -1,10 +1,24 @@
 //! x86-64.
 
 mod boot;
+mod gdt;
+mod idt;
 mod io;
 pub(crate) mod serial;
+pub(crate) mod trap;
 
 use io::Port;
+
+/// Sets up the CPU tables of the boot CPU: the GDT, the TSS and the IDT.
+pub(crate) fn init_cpu() {
+    gdt::init();
+    idt::init();
+}
+
+/// Handles an interrupt from a device or the local APIC.
+fn interrupt(vector: u8) {
+    crate::console::_print_panic(format_args!("rk-frame: spurious interrupt on vector {vector}\n"));
+}
 
 /// Stops this CPU with interrupts off. The CPU does not continue.
 pub fn halt_forever() -> ! {

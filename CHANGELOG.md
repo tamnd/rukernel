@@ -6,6 +6,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- Traps on x86-64. The GDT has the Linux selectors. The TSS has separate stacks for a double fault, an NMI and a machine check. The IDT sends all 256 vectors to one trap handler. An unhandled kernel exception prints an Oops message with the registers and panics.
+- An exception table, as in Linux. `rk_frame::trap::probe_read_u64` reads an address and gives an error on a fault, with no panic.
+- The `trap` boot test.
 - The release workflow publishes `rk-abi`, `rk-frame`, `rk-lib` and `rukernel` to crates.io. The publish script obeys the crates.io rate limits.
 
 ## [0.0.1] (2026-10-23)

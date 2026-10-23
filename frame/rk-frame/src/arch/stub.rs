@@ -34,3 +34,18 @@ pub fn halt_forever() -> ! {
 pub fn qemu_exit(_code: u32) -> ! {
     halt_forever()
 }
+
+/// The trap counters and functions. These architectures have no trap handler yet.
+pub(crate) mod trap {
+    use core::sync::atomic::AtomicU64;
+
+    pub(crate) static BREAKPOINTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static PAGE_FAULTS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FIXUPS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn breakpoint() {}
+
+    pub(crate) fn probe_read_u64(_addr: usize) -> Option<u64> {
+        None
+    }
+}

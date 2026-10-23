@@ -12,6 +12,8 @@
 
 #[cfg(target_os = "none")]
 mod kernel;
+#[cfg(target_os = "none")]
+mod selftest;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

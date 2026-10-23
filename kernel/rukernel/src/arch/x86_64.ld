@@ -43,6 +43,11 @@ SECTIONS
     . = ALIGN(4096);
     .rodata : AT(ADDR(.rodata) - KERNEL_BASE) {
         *(.rodata .rodata.*)
+        /* The exception table: pairs of a faulting instruction and its fixup address. */
+        . = ALIGN(16);
+        __start___ex_table = .;
+        KEEP(*(__ex_table))
+        __stop___ex_table = .;
     } :rodata
 
     . = ALIGN(4096);

@@ -16,12 +16,15 @@ pub const UNAME_MACHINE: &str = "riscv64";
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) mod x86_64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub use x86_64::{halt_forever, qemu_exit};
+pub(crate) use x86_64 as imp;
 
 #[cfg(all(target_os = "none", not(target_arch = "x86_64")))]
-mod stub;
+pub(crate) mod stub;
 #[cfg(all(target_os = "none", not(target_arch = "x86_64")))]
-pub use stub::{halt_forever, qemu_exit};
+pub(crate) use stub as imp;
+
+#[cfg(target_os = "none")]
+pub use imp::{halt_forever, qemu_exit};
 
 /// Tells the processor that this CPU waits in a spin loop.
 #[inline]
