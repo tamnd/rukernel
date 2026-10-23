@@ -1,8 +1,8 @@
-//! The system call table.
+//! The system call table of the boot self tests.
 //!
-//! Each system call number goes to a handler. In R0 no system call has a handler yet, so each
-//! number gives `ENOSYS`, as Linux gives for a number that it does not know. R1 adds the first
-//! handlers, per spec/22-milestones.md.
+//! The self tests run small user programs that have no process. Each system call number gives
+//! `ENOSYS`, as Linux gives for a number that it does not know, except the calls that the tests
+//! use. A real process uses the table in rk-syscall.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;

@@ -390,30 +390,117 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The self tests that `boot-test` runs, each in its own boot.
 const BOOT_TESTS: &[&str] =
-    &["boot", "trap", "mm", "heap", "timer", "initramfs", "syscall", "vm", "task", "fault"];
+    &["boot", "trap", "mm", "heap", "timer", "initramfs", "syscall", "vm", "task", "fault", "init"];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
-const BZIMAGE_TESTS: &[&str] = &["boot", "mm", "initramfs"];
+const BZIMAGE_TESTS: &[&str] = &["boot", "mm", "initramfs", "init"];
+
+/// A C compiler for the user test programs, and its flags for a static program and a static PIE
+/// program.
+struct UserCc {
+    command: Vec<String>,
+    static_flags: &'static [&'static str],
+    pie_flags: &'static [&'static str],
+}
+
+/// Finds a C compiler that makes x86-64 Linux programs with musl. `RK_USER_CC` gives the command,
+/// for example `musl-gcc` or `zig cc -target x86_64-linux-musl`. Then `musl-gcc` and `zig` are
+/// tried. CI must have a compiler, so that CI does not skip the `init` test.
+fn find_user_cc() -> Result<Option<UserCc>> {
+    let works = |cmd: &str, arg: &str| {
+        Command::new(cmd).arg(arg).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+    };
+    let gcc = |command: Vec<String>| UserCc {
+        command,
+        static_flags: &["-static"],
+        pie_flags: &["-static-pie", "-fPIE"],
+    };
+    let zig = |command: Vec<String>| UserCc {
+        command,
+        static_flags: &["-static"],
+        pie_flags: &["-static", "-fPIE"],
+    };
+    if let Ok(cc) = std::env::var("RK_USER_CC") {
+        let command: Vec<String> = cc.split_whitespace().map(String::from).collect();
+        let is_zig = command.first().is_some_and(|c| c.ends_with("zig"));
+        return Ok(Some(if is_zig { zig(command) } else { gcc(command) }));
+    }
+    if works("musl-gcc", "--version") {
+        return Ok(Some(gcc(vec![String::from("musl-gcc")])));
+    }
+    if works("zig", "version") {
+        let command = ["zig", "cc", "-target", "x86_64-linux-musl"].map(String::from).to_vec();
+        return Ok(Some(zig(command)));
+    }
+    if std::env::var_os("CI").is_some() {
+        return Err(String::from("no C compiler for the user test programs, install musl-tools"));
+    }
+    Ok(None)
+}
+
+/// Compiles the user test program `name` from tests/user to `out`.
+fn compile_user(cc: &UserCc, name: &str, pie: bool, out: &Path) -> Result {
+    let src = workspace_root().join("tests/user").join(format!("{name}.c"));
+    let flags = if pie { cc.pie_flags } else { cc.static_flags };
+    let status = Command::new(&cc.command[0])
+        .args(&cc.command[1..])
+        .args(flags)
+        .args(["-O2", "-s", "-Wall", "-Werror", "-o"])
+        .arg(out)
+        .arg(&src)
+        .status()
+        .map_err(|e| format!("{}: {e}", cc.command[0]))?;
+    if !status.success() {
+        return Err(format!("{}: the compiler failed with {status}", src.display()));
+    }
+    Ok(())
+}
+
+/// Builds the user test programs: init as a static program and hello as a static PIE program.
+/// Gives `None` if there is no C compiler.
+fn build_user(dir: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    let (init, hello) = (dir.join("user-init"), dir.join("user-hello"));
+    let Some(cc) = find_user_cc()? else {
+        println!("user programs: skipped, no C compiler, set RK_USER_CC");
+        let _ = fs::remove_file(&init);
+        return Ok(None);
+    };
+    compile_user(&cc, "init", false, &init)?;
+    compile_user(&cc, "hello", true, &hello)?;
+    let read = |p: &Path| fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+    Ok(Some((read(&init)?, read(&hello)?)))
+}
 
 /// Builds the x86-64 kernel and the initramfs of the boot tests, and gives the path of the ELF
 /// image. The initramfs is in the same directory.
 fn build_kernel() -> Result<PathBuf> {
     cargo(&["build", "--package", "rukernel", "--target", "x86_64-unknown-none"])?;
     let kernel = workspace_root().join("target/x86_64-unknown-none/debug/rukernel");
+    let user = build_user(kernel.parent().ok_or("the kernel path has no directory")?)?;
     let initramfs = kernel.with_file_name("initramfs.cpio");
-    fs::write(&initramfs, test_initramfs()).map_err(|e| format!("{}: {e}", initramfs.display()))?;
+    fs::write(&initramfs, test_initramfs(user.as_ref()))
+        .map_err(|e| format!("{}: {e}", initramfs.display()))?;
     Ok(kernel)
 }
 
-/// The initramfs that the `initramfs` self test reads, per kernel/rukernel/src/selftest.rs.
-fn test_initramfs() -> Vec<u8> {
+/// The initramfs that the `initramfs` and `init` self tests read, per
+/// kernel/rukernel/src/selftest.rs and tests/user/init.c. With no user programs, `/init` is a
+/// script that cannot run.
+fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
     w.add(b"etc", 0o040_755, b"");
     w.add_raw(100, b"etc/motd", 0o100_644, 2, (0, 0), b"");
     w.add_raw(100, b"etc/motd.link", 0o100_644, 2, (0, 0), b"rukernel initramfs\n");
     w.add(b"motd", 0o120_777, b"etc/motd");
-    w.add(b"init", 0o100_755, b"#!/bin/sh\n");
+    match user {
+        Some((init, hello)) => {
+            w.add(b"init", 0o100_755, init);
+            w.add(b"bin", 0o040_755, b"");
+            w.add(b"bin/hello", 0o100_755, hello);
+        }
+        None => w.add(b"init", 0o100_755, b"#!/bin/sh\n"),
+    }
     w.finish()
 }
 
@@ -603,10 +690,15 @@ fn qemu(args: &[String]) -> Result {
     Ok(())
 }
 
+/// Tells if the boot test `test` can run. The `init` test needs the user programs.
+fn can_run(kernel: &Path, test: &str) -> bool {
+    test != "init" || kernel.with_file_name("user-init").exists()
+}
+
 fn boot_test() -> Result {
     let kernel = build_kernel()?;
     let mut errors = Vec::new();
-    for test in BOOT_TESTS {
+    for test in BOOT_TESTS.iter().filter(|t| can_run(&kernel, t)) {
         let cmdline = format!("console=ttyS0 rk.test={test}");
         let (status, log) = run_with_timeout(qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)?;
         let passed = status == Some(QEMU_PASS) && log.contains(&format!("rk.test={test}: pass"));
@@ -618,7 +710,7 @@ fn boot_test() -> Result {
         }
     }
     let bzimage = build_bzimage()?;
-    for test in BZIMAGE_TESTS {
+    for test in BZIMAGE_TESTS.iter().filter(|t| can_run(&kernel, t)) {
         let cmdline = format!("console=ttyS0 rk.test={test}");
         let (status, log) = run_with_timeout(qemu_command(&bzimage, &cmdline), BOOT_TEST_TIMEOUT)?;
         let passed = status == Some(QEMU_PASS)
@@ -633,7 +725,7 @@ fn boot_test() -> Result {
     }
     match find_ovmf()? {
         Some(firmware) => {
-            for test in BZIMAGE_TESTS {
+            for test in BZIMAGE_TESTS.iter().filter(|t| can_run(&kernel, t)) {
                 let cmdline = format!("console=ttyS0 rk.test={test}");
                 let mut cmd = qemu_command(&bzimage, &cmdline);
                 cmd.arg("-drive")

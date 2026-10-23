@@ -24,7 +24,14 @@ pub(crate) mod stub;
 pub(crate) use stub as imp;
 
 #[cfg(target_os = "none")]
-pub use imp::{halt_forever, qemu_exit};
+pub use imp::{halt_forever, qemu_exit, random_seed};
+
+/// Gives 64 bits for a random seed. A host build is for the unit tests only, so the value is a
+/// constant.
+#[cfg(not(target_os = "none"))]
+pub fn random_seed() -> u64 {
+    0x9e37_79b9_7f4a_7c15
+}
 
 /// Tells the processor that this CPU waits in a spin loop.
 #[inline]

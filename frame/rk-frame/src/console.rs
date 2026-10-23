@@ -41,6 +41,25 @@ pub fn _print_panic(args: fmt::Arguments<'_>) {
     }
 }
 
+/// Writes bytes to the console with no change: a line feed stays a line feed. The console device
+/// of the tty layer uses this function for the output of user programs.
+pub fn write_bytes(bytes: &[u8]) {
+    let _guard = CONSOLE.lock();
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    crate::arch::x86_64::serial::write_raw(bytes);
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    let _ = bytes;
+}
+
+/// Reads one byte from the console, if a byte came. The console is polled until the tty layer
+/// gets the interrupt of the serial port.
+pub fn try_read_byte() -> Option<u8> {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    return crate::arch::x86_64::serial::try_read();
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    None
+}
+
 /// Writes formatted text to the early console.
 #[macro_export]
 macro_rules! print {

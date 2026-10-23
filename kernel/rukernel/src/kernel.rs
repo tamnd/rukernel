@@ -4,7 +4,9 @@ use crate::{rootfs, selftest};
 use rk_frame::boot::BootInfo;
 use rk_frame::{arch, println};
 
-/// The release that the kernel claims, per spec/17-upstream-tracking.md section 17.4.
+#[cfg(target_arch = "x86_64")]
+use rk_syscall::UNAME_RELEASE;
+#[cfg(not(target_arch = "x86_64"))]
 const UNAME_RELEASE: &str = "7.3.0-rukernel";
 
 /// The exit code for a passed self test. QEMU exits with the status 33.
@@ -39,14 +41,50 @@ fn main(boot: &'static BootInfo) -> ! {
     rk_sched::init();
     rootfs::init(boot);
 
-    if let Some(test) = param(boot.cmdline(), "rk.test") {
+    let test = param(boot.cmdline(), "rk.test");
+    if let Some(test) = test.filter(|&t| t != "init") {
         let passed = selftest::run(test);
         println!("rk.test={test}: {}", if passed { "pass" } else { "fail" });
         arch::qemu_exit(if passed { EXIT_PASS } else { EXIT_FAIL });
     }
 
-    println!("rukernel: nothing to run yet, the CPU stops");
-    arch::halt_forever()
+    #[cfg(target_arch = "x86_64")]
+    run_init(boot, test.is_some());
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        println!("rukernel: no user mode on this architecture yet, the CPU stops");
+        arch::halt_forever()
+    }
+}
+
+/// Starts init and waits for it to end. Linux stops with a panic when init ends, and so does
+/// rukernel. With `rk.test=init`, the test passes if init exits with the code 0.
+#[cfg(target_arch = "x86_64")]
+fn run_init(boot: &'static BootInfo, test: bool) -> ! {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    rk_drv_mem::init();
+    rk_drv_tty::init();
+    rk_syscall::init();
+    let Some(fs) = rootfs::context() else {
+        panic!("no root file system");
+    };
+    rootfs::make_dev(fs);
+    let path = param(boot.cmdline(), "rdinit").unwrap_or("/init");
+    let argv = vec![Vec::from(path.as_bytes())];
+    let envp = vec![b"HOME=/".to_vec(), b"TERM=linux".to_vec()];
+    if let Err(e) = rk_syscall::spawn_init(fs.clone(), path.as_bytes(), argv, envp) {
+        panic!("No working init found. Error {} for {path}.", e.get());
+    }
+    let status = rk_proc::wait_for_init();
+    println!("rukernel: {} system calls", rk_syscall::count());
+    if test {
+        let passed = status.exit_code() == Some(0);
+        println!("rk.test=init: {}", if passed { "pass" } else { "fail" });
+        arch::qemu_exit(if passed { EXIT_PASS } else { EXIT_FAIL });
+    }
+    panic!("Attempted to kill init! exitcode={:#010x}", status.0);
 }
 
 /// Gives the value of `name=value` on the command line.

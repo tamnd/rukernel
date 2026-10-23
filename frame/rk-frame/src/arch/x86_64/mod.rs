@@ -22,6 +22,50 @@ pub(crate) fn init_cpu() {
     user::init();
 }
 
+/// Gives 64 bits for a random seed. The value comes from `rdrand` if the CPU has it, or else from
+/// the time stamp counter, which is not random but is different at each call.
+pub fn random_seed() -> u64 {
+    // CPUID leaf 1, ECX bit 30.
+    let ecx: u32;
+    // SAFETY: `cpuid` only writes the four registers. LLVM uses rbx, so the code keeps it.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp:r}, rbx",
+            "cpuid",
+            "mov rbx, {tmp:r}",
+            tmp = out(reg) _,
+            inout("eax") 1u32 => _,
+            inout("ecx") 0u32 => ecx,
+            out("edx") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    if ecx & (1 << 30) != 0 {
+        for _ in 0..10 {
+            let value: u64;
+            let ok: u8;
+            // SAFETY: CPUID tells that the CPU has `rdrand`. It writes only the two registers and
+            // the flags.
+            unsafe {
+                core::arch::asm!(
+                    "rdrand {v}",
+                    "setc {ok}",
+                    v = out(reg) value,
+                    ok = out(reg_byte) ok,
+                    options(nomem, nostack),
+                );
+            }
+            if ok != 0 {
+                return value;
+            }
+        }
+    }
+    let (lo, hi): (u32, u32);
+    // SAFETY: `rdtsc` writes only EAX and EDX.
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
 /// Handles an interrupt from a device or the local APIC.
 fn interrupt(vector: u8) {
     if !apic::handle(vector) {

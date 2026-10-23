@@ -35,6 +35,12 @@ pub fn qemu_exit(_code: u32) -> ! {
     halt_forever()
 }
 
+/// Gives 64 bits for a random seed. These architectures have no source yet, so the value is a
+/// constant.
+pub fn random_seed() -> u64 {
+    0x9e37_79b9_7f4a_7c15
+}
+
 /// The trap counters and functions. These architectures have no trap handler yet.
 pub(crate) mod trap {
     use core::sync::atomic::AtomicU64;

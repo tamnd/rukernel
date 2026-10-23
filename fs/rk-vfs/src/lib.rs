@@ -1,9 +1,9 @@
 //! The virtual file system of rukernel.
 //!
-//! The VFS gives one model of files to each file system, per spec/08-vfs.md. A file system gives
-//! `Inode` objects. The VFS keeps the dentries of the names in use, the mounts of a name space and
-//! the open files, walks paths, and does the part of each system call on names that is the same
-//! for each file system. It also reads the cpio archive of the initramfs.
+//! The VFS gives one model of files to each file system, per spec/08-vfs-and-filesystems.md. A
+//! file system gives `Inode` objects. The VFS keeps the dentries of the names in use, the mounts
+//! of a name space and the open files, walks paths, and does the part of each system call on
+//! names that is the same for each file system. It also reads the cpio archive of the initramfs.
 //!
 //! The crate has no code for one CPU or one architecture, so the tests on the host examine it with
 //! tmpfs.
