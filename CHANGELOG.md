@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.1.0] (2026-10-23)
+
+This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` passes for x86-64, each system call number gives `ENOSYS`, and CI enforces the unsafe rule.
+
 ### Added
 
 - The kernel heap. rk-frame gives the global allocator, so the safe crates can use `Box`, `Vec`, `BTreeMap` and `Arc`. A small object comes from a slab of 16 to 2048 bytes in the direct map. A large object gets its own pages with a guard page after it. The new `heap` boot test examines it.
@@ -77,6 +81,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.1.0]: https://github.com/tamnd/rukernel/releases/tag/v0.1.0
 [0.0.4]: https://github.com/tamnd/rukernel/releases/tag/v0.0.4
 [0.0.3]: https://github.com/tamnd/rukernel/releases/tag/v0.0.3
 [0.0.2]: https://github.com/tamnd/rukernel/releases/tag/v0.0.2
