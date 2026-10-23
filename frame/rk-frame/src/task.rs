@@ -200,6 +200,11 @@ impl Task {
         self.state.load(Ordering::Acquire) == EXITED
     }
 
+    /// Tells if the task waits in a wait queue.
+    pub fn is_blocked(&self) -> bool {
+        self.state.load(Ordering::Acquire) == BLOCKED
+    }
+
     /// Makes a blocked task runnable. Gives `false` if the task was not blocked.
     pub fn wake(self: &Arc<Self>) -> bool {
         let woken = self

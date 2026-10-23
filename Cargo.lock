@@ -56,6 +56,17 @@ name = "rk-frame"
 version = "0.1.3"
 
 [[package]]
+name = "rk-fs-proc"
+version = "0.1.3"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-mm",
+ "rk-proc",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-fs-tmpfs"
 version = "0.1.3"
 dependencies = [
@@ -124,6 +135,7 @@ dependencies = [
  "rk-drv-mem",
  "rk-drv-tty",
  "rk-frame",
+ "rk-fs-proc",
  "rk-fs-tmpfs",
  "rk-mm",
  "rk-proc",

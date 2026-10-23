@@ -253,6 +253,9 @@ fn bind_mounts() {
     assert_eq!(fs.namespace().bind(&f, &b).err(), Some(Errno::ENOTDIR));
     fs.namespace().bind(&a, &b).unwrap();
     assert_eq!(read_file(&fs, &root, b"/b/f").as_deref(), Ok(&b"data"[..]));
+    let bf = fs.resolve(&root, b"/b/f", true).unwrap();
+    assert_eq!(bf.absolute_path(), b"/b/f");
+    assert_eq!(root.absolute_path(), b"/");
     assert_eq!(fs.namespace().mounts().len(), 2);
     assert_eq!(fs.namespace().mounts()[1].source(), MountSource::rootfs());
 }

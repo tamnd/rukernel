@@ -13,6 +13,15 @@ static ROOT: Once<FsContext> = Once::new();
 /// Makes the root tmpfs and unpacks the initramfs into it, if the boot loader gave one.
 pub(crate) fn init(boot: &BootInfo) {
     rk_vfs::fstype::register(rk_fs_tmpfs::FS_TYPE);
+    #[cfg(target_arch = "x86_64")]
+    {
+        rk_vfs::fstype::register(rk_fs_proc::FS_TYPE);
+        rk_fs_proc::set_kernel_info(rk_fs_proc::KernelInfo {
+            release: rk_syscall::UNAME_RELEASE,
+            version: rk_syscall::UNAME_VERSION,
+            cmdline: alloc::string::String::from(boot.cmdline()),
+        });
+    }
     let root = ROOT.call_once(|| FsContext::new(MountNamespace::new(rk_fs_tmpfs::new(0o755))));
     let Some(data) = boot.initrd_bytes() else {
         println!("initramfs: none, the root file system is empty");

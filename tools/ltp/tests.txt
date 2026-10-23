@@ -1,9 +1,66 @@
 # The LTP tests that the ltp boot test runs, one name on each line. tools/ltp/build.sh builds
-# them. A test that is not in this list does not pass yet.
+# them. A test that is not in this list does not pass yet, or cannot pass for a reason below.
+#
+# clone08 and clone10 use CLONE_THREAD or CLONE_SETTLS, and the clone function of musl refuses
+# them with EINVAL. clone09 needs network name spaces. clone11 needs the kernel configuration.
+# fork13 forks until its run time is over, and fork14 maps 16 TiB and forks after each GiB. They
+# are too slow for the boot test.
+brk01
+brk02
+clone01
 clone02
+clone03
+clone04
+clone05
+clone06
+clone07
+exit_group01
 exit01
+exit02
+fork_procs
+fork01
+fork03
+fork04
 fork05
+fork07
+fork08
+fork09
+fork10
+getpid01
+getppid01
+getppid02
+gettid01
+gettid02
+mmap02
+mmap03
+mmap04
+mmap05
+mmap06
+mmap09
+mmap10
 mmap11
+mmap15
+mmap17
+mmap19
+mmap22
 mprotect02
 mprotect03
 mprotect04
+mprotect05
+munmap01
+munmap03
+wait01
+wait02
+wait401
+wait402
+wait403
+waitpid03
+waitpid04
+waitpid06
+waitpid07
+waitpid08
+waitpid09
+waitpid10
+waitpid11
+waitpid12
+waitpid13

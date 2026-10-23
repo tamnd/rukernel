@@ -4,14 +4,14 @@ use crate::cx::{Cx, SysResult};
 use crate::run::{random16, start_thread};
 use rk_abi::Errno;
 use rk_abi::native::sched::{
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_FILES, CLONE_FS, CLONE_PARENT_SETTID,
-    CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_FILES, CLONE_FS, CLONE_PARENT,
+    CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
 };
 use rk_abi::native::signal::SIGCHLD;
 use rk_abi::native::wait::{WCONTINUED, WNOHANG, WUNTRACED};
 use rk_frame::task::yield_now;
 use rk_proc::exec::{ExecArgs, exec};
-use rk_proc::{ForkShare, Pid, Process, WaitStatus, WaitTarget};
+use rk_proc::{ForkShare, Pid, Process, VforkDone, WaitStatus, WaitTarget};
 
 /// The number of signals. Linux names it `_NSIG`.
 const NSIG: u64 = 64;
@@ -53,13 +53,12 @@ pub(crate) fn clone(
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread(cx.thread)?
     } else {
-        // R1 has no wait for `CLONE_VFORK`, so the child gets a copy of the memory and the parent
-        // continues at once. A child that calls only `execve` or `_exit` sees no change.
         let share = ForkShare {
-            vm: flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0,
+            vm: flags & CLONE_VM != 0,
             files: flags & CLONE_FILES != 0,
             fs: flags & CLONE_FS != 0,
             exit_signal: (flags & CSIGNAL) as u32,
+            parent: flags & CLONE_PARENT != 0,
         };
         rk_proc::fork(cx.thread, share)?
     };
@@ -83,9 +82,16 @@ pub(crate) fn clone(
     if flags & CLONE_CHILD_CLEARTID != 0 {
         thread.set_clear_child_tid(ctid as usize);
     }
+    let vfork = (flags & CLONE_VFORK != 0).then(VforkDone::new);
+    if let Some(done) = &vfork {
+        thread.set_vfork_done(done.clone());
+    }
     if let Err(e) = start_thread(thread.clone(), regs) {
         rk_proc::exit_thread(&thread, WaitStatus::exited(0));
         return Err(e);
+    }
+    if let Some(done) = vfork {
+        done.wait();
     }
     Ok(u64::from(tid))
 }

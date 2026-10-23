@@ -11,6 +11,7 @@ members = [
     "drv/rk-drv-mem",
     "drv/rk-drv-tty",
     "fs/rk-vfs",
+    "fs/rk-fs-proc",
     "fs/rk-fs-tmpfs",
     "kernel/rukernel",
     "tools/rk-abigen",
@@ -41,6 +42,7 @@ rk-syscall = { path = "core/rk-syscall", version = "0.1.3" }
 rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.1.3" }
 rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.1.3" }
 rk-vfs = { path = "fs/rk-vfs", version = "0.1.3" }
+rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.1.3" }
 rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.1.3" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 
