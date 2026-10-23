@@ -4,6 +4,7 @@
 //! threads. A `Thread` runs in one kernel task. The parent of a process waits for it with `wait4`,
 //! and a process that ends stays as a zombie until its parent reaps it, as in Linux.
 
+use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE};
 use crate::signal::{
     AltStack, CLD_EXITED, CLD_KILLED, NSIG, Pending, SIG_IGN, SigAction, SigInfo, SigSet,
 };
@@ -104,6 +105,7 @@ pub struct Process {
     start_tick: u64,
     /// The value of `/proc/PID/oom_score_adj`. rukernel has no OOM killer yet.
     oom_score_adj: AtomicI32,
+    limits: SpinLock<[Limit; RLIM_NLIMITS]>,
 }
 
 impl core::fmt::Debug for Process {
@@ -379,6 +381,25 @@ impl Process {
         self.oom_score_adj.store(value, Ordering::Relaxed);
     }
 
+    /// The soft and the hard limit of `resource`, which is less than `RLIM_NLIMITS`.
+    pub fn limit(&self, resource: usize) -> Limit {
+        self.limits.lock()[resource]
+    }
+
+    /// Sets the limit of `resource`. The caller checks the values.
+    pub fn set_limit(&self, resource: usize, limit: Limit) {
+        self.limits.lock()[resource] = limit;
+    }
+
+    /// The status of the process when `sig` ends it with the default action. The core dump bit
+    /// is set for a signal that dumps core when `RLIMIT_CORE` is not 0. rukernel does not write
+    /// the core file yet.
+    pub fn fatal_status(&self, sig: u32) -> WaitStatus {
+        let core = crate::signal::default_action(sig) == crate::signal::DefaultAction::CoreDump
+            && self.limit(RLIMIT_CORE).cur != 0;
+        WaitStatus::signaled(sig, core)
+    }
+
     /// The state letter of `/proc/PID/stat`: `Z` for a zombie, `R` if a thread runs or can
     /// run, and `S` if each thread waits.
     pub fn state_letter(&self) -> u8 {
@@ -435,6 +456,11 @@ impl Process {
             image: SpinLock::new(Image::default()),
             start_tick: rk_frame::time::ticks(),
             oom_score_adj: AtomicI32::new(0),
+            limits: SpinLock::new(crate::limits::defaults(
+                rk_mm::STACK_SIZE as u64,
+                u64::from(PID_MAX),
+                rk_vfs::fdtable::NR_OPEN_DEFAULT as u64,
+            )),
         })
     }
 }
@@ -558,7 +584,7 @@ impl Thread {
                 continue;
             }
             if action.is_fatal(sig) {
-                return Some(Delivery::Fatal(WaitStatus::signaled(sig, false)));
+                return Some(Delivery::Fatal(self.process.fatal_status(sig)));
             }
             if action.flags & u64::from(rk_abi::native::signal::SA_RESETHAND) != 0 {
                 shared.actions[sig as usize - 1] = SigAction::default();
@@ -692,6 +718,7 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
         exit_signal,
     );
     *child.image.lock() = pp.image.lock().clone();
+    *child.limits.lock() = *pp.limits.lock();
     child.set_oom_score_adj(pp.oom_score_adj());
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     child.state.lock().threads.push(thread.clone());
@@ -769,7 +796,7 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     }
     if action.is_fatal(sig) && target.is_some() {
         drop(shared);
-        kill_group(process, WaitStatus::signaled(sig, false));
+        kill_group(process, process.fatal_status(sig));
         return;
     }
     match thread {

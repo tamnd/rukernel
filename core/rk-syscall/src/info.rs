@@ -13,16 +13,10 @@ use rk_abi::native::types::{
 };
 use rk_frame::time::{HZ, ticks};
 use rk_proc::exec::USER_HZ;
+use rk_proc::limits::{Limit, RLIM_NLIMITS};
 use zerocopy::FromZeros;
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
-
-/// The resources of `prlimit64`. Linux has 16.
-const RLIM_NLIMITS: u64 = 16;
-const RLIMIT_STACK: u64 = 3;
-const RLIMIT_NPROC: u64 = 6;
-const RLIMIT_NOFILE: u64 = 7;
-const RLIM_INFINITY: u64 = u64::MAX;
 
 /// The most bytes of one `getrandom`. Linux names it `MAX_RW_COUNT`.
 const MAX_RANDOM: usize = 0x7fff_f000;
@@ -145,31 +139,28 @@ pub(crate) fn uname(cx: &Cx<'_>, buf: u64) -> SysResult {
     Ok(0)
 }
 
-/// The limit of `resource`. R1 has no limits, so each value is the default of Linux.
-fn limit(resource: u64) -> Rlimit64 {
-    let (cur, max) = match resource {
-        RLIMIT_STACK => (rk_mm::STACK_SIZE as u64, RLIM_INFINITY),
-        RLIMIT_NPROC => (u64::from(rk_proc::PID_MAX), u64::from(rk_proc::PID_MAX)),
-        RLIMIT_NOFILE => (rk_vfs::fdtable::NR_OPEN_DEFAULT as u64, 4096),
-        _ => (RLIM_INFINITY, RLIM_INFINITY),
-    };
-    Rlimit64 { rlim_cur: cur, rlim_max: max }
-}
-
 pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64) -> SysResult {
-    if resource >= RLIM_NLIMITS {
-        return Err(Errno::EINVAL);
-    }
-    if pid as i32 != 0 && rk_proc::find_process(pid as u32).is_none() {
-        return Err(Errno::ESRCH);
-    }
-    if new != 0 {
+    let resource =
+        usize::try_from(resource).ok().filter(|&r| r < RLIM_NLIMITS).ok_or(Errno::EINVAL)?;
+    let process = match pid as i32 {
+        0 => cx.thread.process().clone(),
+        p => rk_proc::find_process(p as u32).ok_or(Errno::ESRCH)?,
+    };
+    let new = if new == 0 {
+        None
+    } else {
         let n: Rlimit64 = cx.read_val(new)?;
         if n.rlim_cur > n.rlim_max {
             return Err(Errno::EINVAL);
         }
+        Some(Limit { cur: n.rlim_cur, max: n.rlim_max })
+    };
+    let l = process.limit(resource);
+    cx.write_opt(old, &Rlimit64 { rlim_cur: l.cur, rlim_max: l.max })?;
+    if let Some(n) = new {
+        // Each process runs as root with `CAP_SYS_RESOURCE` in R1, so it can raise the hard limit.
+        process.set_limit(resource, n);
     }
-    cx.write_opt(old, &limit(resource))?;
     Ok(0)
 }
 

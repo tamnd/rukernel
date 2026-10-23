@@ -81,6 +81,9 @@ pub struct Vma<F> {
     pub prot: Prot,
     /// `MAP_SHARED`: a write goes to the backing, and each address space that maps it sees it.
     pub shared: bool,
+    /// The area can get write access. It is false for a shared mapping of a file that is not open
+    /// for writing. Linux names it `VM_MAYWRITE`.
+    pub may_write: bool,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -90,7 +93,7 @@ pub struct Vma<F> {
 impl<F: Clone> Vma<F> {
     /// Makes an anonymous private area.
     pub fn anon(start: usize, end: usize, prot: Prot, kind: VmaKind) -> Self {
-        Self { start, end, prot, shared: false, backing: Backing::Anon, kind }
+        Self { start, end, prot, shared: false, may_write: true, backing: Backing::Anon, kind }
     }
 
     /// Cuts the area at `addr`. This area keeps the part below `addr`, and the function gives the
@@ -281,6 +284,7 @@ mod tests {
             end: 20 * P,
             prot: Prot::RW,
             shared: true,
+            may_write: true,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });

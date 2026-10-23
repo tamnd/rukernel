@@ -69,6 +69,10 @@ pub const MMAP_MIN_ADDR: usize = 0x1_0000;
 pub const STACK_TOP: usize = USER_END;
 /// The size of the main stack area. The `RLIMIT_STACK` default of Linux is 8 MiB.
 pub const STACK_SIZE: usize = 8 << 20;
+/// The most areas that an address space can have. Linux names it `vm.max_map_count`.
+pub const MAX_MAP_COUNT: usize = 65530;
+/// The range for `MAP_32BIT`, as in Linux on x86-64.
+const LOW32: (usize, usize) = (0x4000_0000, 0x8000_0000);
 /// The top of the `mmap` area. Linux puts it a gap of 128 MiB below the stack.
 pub const MMAP_TOP: usize = STACK_TOP - (128 << 20);
 
@@ -98,6 +102,10 @@ pub struct MmapRequest {
     pub fixed: bool,
     /// `MAP_FIXED_NOREPLACE`: use the address, or fail with `EEXIST`.
     pub noreplace: bool,
+    /// `MAP_32BIT`: put the mapping in the range from 1 GiB to 2 GiB, as Linux does on x86-64.
+    pub low32: bool,
+    /// The area can get write access later. See [`Vma::may_write`].
+    pub may_write: bool,
     /// The file and the page aligned offset, or `None` for anonymous memory.
     pub file: Option<(FileRef, u64)>,
     /// What the area is for.
@@ -114,6 +122,8 @@ impl MmapRequest {
             shared: false,
             fixed: false,
             noreplace: false,
+            low32: false,
+            may_write: true,
             file: None,
             kind: VmaKind::Normal,
         }
@@ -210,17 +220,22 @@ impl AddressSpace {
                 }
                 self.unmap_locked(&mut st, req.addr, req.addr + len);
             }
+            if st.vmas.len() >= MAX_MAP_COUNT {
+                return Err(Errno::ENOMEM);
+            }
             req.addr
         } else {
+            if st.vmas.len() >= MAX_MAP_COUNT {
+                return Err(Errno::ENOMEM);
+            }
+            let (bottom, top) = if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, MMAP_TOP) };
             let hint = req.addr & !(PAGE_SIZE - 1);
             let hint_ok = hint >= MMAP_MIN_ADDR
-                && hint.checked_add(len).is_some_and(|e| e <= USER_END)
+                && hint
+                    .checked_add(len)
+                    .is_some_and(|e| e <= if req.low32 { top } else { USER_END })
                 && !st.vmas.overlaps(hint, hint + len);
-            if hint_ok {
-                hint
-            } else {
-                st.vmas.find_gap(len, MMAP_MIN_ADDR, MMAP_TOP).ok_or(Errno::ENOMEM)?
-            }
+            if hint_ok { hint } else { st.vmas.find_gap(len, bottom, top).ok_or(Errno::ENOMEM)? }
         };
         let backing = match req.file {
             Some((file, offset)) => Backing::File { file, offset },
@@ -235,6 +250,7 @@ impl AddressSpace {
             end: start + len,
             prot: req.prot,
             shared: req.shared,
+            may_write: req.may_write,
             backing,
             kind: req.kind,
         });
@@ -254,12 +270,18 @@ impl AddressSpace {
     /// # Errors
     ///
     /// `EINVAL` if `addr` is not page aligned, `len` is 0 or the range is not in the user half.
+    /// `ENOMEM` if the range is in the middle of an area and the split makes too many areas.
     pub fn munmap(&self, addr: usize, len: usize) -> Result<(), Errno> {
         let end = page_up(len)
             .and_then(|l| addr.checked_add(l))
             .filter(|&e| len != 0 && is_page_aligned(addr) && e <= USER_END)
             .ok_or(Errno::EINVAL)?;
         let mut st = self.state.lock();
+        if st.vmas.len() >= MAX_MAP_COUNT
+            && st.vmas.find(addr).is_some_and(|vma| vma.start < addr && end < vma.end)
+        {
+            return Err(Errno::ENOMEM);
+        }
         self.unmap_locked(&mut st, addr, end);
         Ok(())
     }
@@ -268,7 +290,8 @@ impl AddressSpace {
     ///
     /// # Errors
     ///
-    /// `EINVAL` if `addr` is not page aligned, and `ENOMEM` if a page of the range is not mapped.
+    /// `EINVAL` if `addr` is not page aligned, `ENOMEM` if a page of the range is not mapped, and
+    /// `EACCES` for write access to an area that cannot get it.
     pub fn mprotect(&self, addr: usize, len: usize, prot: Prot) -> Result<(), Errno> {
         if !is_page_aligned(addr) {
             return Err(Errno::EINVAL);
@@ -280,6 +303,9 @@ impl AddressSpace {
         let mut st = self.state.lock();
         if !st.vmas.covers(addr, end) {
             return Err(Errno::ENOMEM);
+        }
+        if prot.write && st.vmas.iter().any(|v| v.start < end && addr < v.end && !v.may_write) {
+            return Err(Errno::EACCES);
         }
         st.vmas.update_range(addr, end, |vma| vma.prot = prot);
         for page in self.vm.mapped_pages(VirtAddr::new(addr), VirtAddr::new(end)) {

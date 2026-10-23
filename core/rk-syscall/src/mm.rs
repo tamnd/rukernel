@@ -15,9 +15,25 @@ use rk_frame::sync::SpinLock;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
 use rk_vfs::InodeRef;
 
-/// The flags of `mmap` that `MAP_SHARED_VALIDATE` accepts. The other flags of Linux have no
-/// effect in R1, so they are accepted too.
-const KNOWN_FLAGS: u32 = 0x1f_ffff;
+/// The flags of `mmap` that `MAP_SHARED_VALIDATE` accepts. Linux names the mask `LEGACY_MAP_MASK`.
+/// It has the map type, `MAP_FIXED`, `MAP_ANONYMOUS`, `MAP_32BIT`, `MAP_GROWSDOWN`,
+/// `MAP_DENYWRITE`, `MAP_EXECUTABLE`, `MAP_LOCKED`, `MAP_NORESERVE`, `MAP_POPULATE`,
+/// `MAP_NONBLOCK`, `MAP_STACK`, `MAP_HUGETLB`, `MAP_UNINITIALIZED` and the huge page size bits.
+const KNOWN_FLAGS: u32 = 0xfc07_f973;
+
+/// Tells if `flags` has `MAP_32BIT`. Only x86-64 has the flag.
+#[cfg(target_arch = "x86_64")]
+fn low32(flags: u32) -> bool {
+    flags & rk_abi::native::mman::MAP_32BIT != 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn low32(_flags: u32) -> bool {
+    false
+}
+
+/// The device number of `/dev/zero`.
+const DEV_ZERO: u64 = rk_vfs::device::makedev(1, 5);
 
 /// The pages of a regular file, for a file mapping.
 ///
@@ -86,6 +102,8 @@ pub(crate) fn mmap(
     offset: u64,
 ) -> SysResult {
     let flags = flags as u32;
+    // Linux looks up the descriptor before it checks the other arguments.
+    let file = if flags & MAP_ANONYMOUS != 0 { None } else { Some(cx.file(fd)?) };
     let prot = Prot::from_bits(prot as u32).ok_or(Errno::EINVAL)?;
     let shared = match flags & MAP_TYPE {
         MAP_SHARED => true,
@@ -101,21 +119,27 @@ pub(crate) fn mmap(
     if len == 0 || offset as usize % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
     }
-    let file = if flags & MAP_ANONYMOUS != 0 {
-        None
-    } else {
-        let file = cx.file(fd)?;
-        let inode = file.inode().ok_or(Errno::ENODEV)?;
-        let meta = inode.metadata();
-        if meta.file_type() != Some(rk_vfs::FileType::Regular) {
-            return Err(Errno::ENODEV);
+    let may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
+    let file = match file {
+        None => None,
+        Some(file) => {
+            let inode = file.inode().ok_or(Errno::ENODEV)?;
+            let meta = inode.metadata();
+            if !file.flags().readable() || (shared && prot.write && !file.flags().writable()) {
+                return Err(Errno::EACCES);
+            }
+            match meta.file_type() {
+                Some(rk_vfs::FileType::Regular) => {
+                    let path =
+                        file.location().map(rk_vfs::Location::absolute_path).unwrap_or_default();
+                    let pages: Arc<dyn MmFile> = file_pages(inode, path);
+                    Some((pages, offset))
+                }
+                // A mapping of /dev/zero is anonymous memory, as in Linux.
+                Some(rk_vfs::FileType::CharDevice) if meta.rdev == DEV_ZERO => None,
+                _ => return Err(Errno::ENODEV),
+            }
         }
-        if !file.flags().readable() || (shared && prot.write && !file.flags().writable()) {
-            return Err(Errno::EACCES);
-        }
-        let path = file.location().map(rk_vfs::Location::absolute_path).unwrap_or_default();
-        let pages: Arc<dyn MmFile> = file_pages(inode, path);
-        Some((pages, offset))
     };
     let req = MmapRequest {
         addr: addr as usize,
@@ -124,6 +148,8 @@ pub(crate) fn mmap(
         shared,
         fixed: flags & MAP_FIXED != 0,
         noreplace: flags & MAP_FIXED_NOREPLACE != 0,
+        low32: low32(flags),
+        may_write,
         file,
         kind: VmaKind::Normal,
     };
