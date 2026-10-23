@@ -15,6 +15,10 @@ pub(crate) mod bitmap;
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) mod frame;
 #[cfg(target_os = "none")]
+mod heap;
+#[cfg(target_os = "none")]
 pub use frame::{
     Frame, FrameStats, Mapping, PageInfo, alloc_frame, frame_stats, query, translate, vmap,
 };
+#[cfg(target_os = "none")]
+pub use heap::{HeapStats, heap_stats};
