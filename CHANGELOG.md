@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.1.1] (2026-10-23)
+
+This release starts milestone R1. A user process can now have its own address space, and the kernel can run more than one task.
+
 ### Added
 
 - Kernel tasks in `rk_frame::task`. A task has a kernel stack of 32 KiB on the heap, with an unmapped page before and after it. `TaskOptions::spawn` makes a task, `yield_now` lets the next task run, `exit` ends the task, and a `WaitQueue` blocks a task until a condition is true. `should_yield` tells a task that runs user code that its time slice of 4 ticks is over. The new `task` boot test runs three tasks in turns and a task that waits in a wait queue.
@@ -93,6 +97,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.1.1]: https://github.com/tamnd/rukernel/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tamnd/rukernel/releases/tag/v0.1.0
 [0.0.4]: https://github.com/tamnd/rukernel/releases/tag/v0.0.4
 [0.0.3]: https://github.com/tamnd/rukernel/releases/tag/v0.0.3
