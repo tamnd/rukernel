@@ -106,6 +106,7 @@ pub fn poll_input() {
     }
     if received {
         INPUT_WAIT.wake_all();
+        rk_vfs::wait::poll_wake();
     }
     let handler = *SIGNAL.lock();
     if let Some(send) = handler {

@@ -10,8 +10,10 @@ use rk_abi::native::fcntl::{
 };
 use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
+use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::stat::{STATX_BASIC_STATS, STATX_MNT_ID};
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
+use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::device::{major, minor};
 use rk_vfs::inode::{Metadata, SetAttr, Timespec};
 use rk_vfs::{File, Location, Whence};
@@ -125,7 +127,16 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
     if !file.flags().writable() {
         return Err(Errno::EBADF);
     }
-    write_with(cx, buf, count, |_, b| file.write(b))
+    sigpipe(cx, write_with(cx, buf, count, |_, b| file.write(b)))
+}
+
+/// Sends `SIGPIPE` to the thread when a write gives `EPIPE`, as `pipe_write` of Linux does.
+fn sigpipe(cx: &Cx<'_>, r: SysResult) -> SysResult {
+    if r == Err(Errno::EPIPE) {
+        let pid = cx.process().pid();
+        cx.thread.send_signal(SigInfo::new(SIGPIPE, SI_USER, pid));
+    }
+    r
 }
 
 pub(crate) fn pread(cx: &Cx<'_>, fd: u64, buf: u64, count: u64, offset: u64) -> SysResult {
@@ -202,7 +213,7 @@ pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
         }
         let n = match write_with(cx, v.iov_base, v.iov_len, |_, b| file.write(b)) {
             Ok(n) => n,
-            Err(e) if done == 0 => return Err(e),
+            Err(e) if done == 0 => return sigpipe(cx, Err(e)),
             Err(_) => break,
         };
         done += n;

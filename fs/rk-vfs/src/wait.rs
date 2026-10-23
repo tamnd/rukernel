@@ -1,6 +1,7 @@
 //! The waits of the file operations.
 //!
-//! A read of a pipe or a terminal waits until data comes, and a signal can stop the wait. The
+//! A read of a pipe or a terminal waits until data comes, and a signal can stop the wait. `poll`
+//! and `select` wait on `POLL_WAIT`, and a file with a new event calls `poll_wake`. The
 //! process layer gives the check of the signals with `set_interrupt_check`. The queue blocks the
 //! task on the kernel of x86-64. On the other targets of R1 and on the host there are no tasks, so
 //! the queue tests the condition again in a loop.
@@ -42,6 +43,25 @@ impl WaitQueue {
         }
     }
 
+    /// Blocks the current task until `cond` gives a value or the tick count is at `deadline`.
+    /// Gives `None` at the deadline. On the host there is no clock, so `cond` is tested one time.
+    pub fn wait_until_timeout<R>(
+        &self,
+        deadline: u64,
+        cond: impl FnMut() -> Option<R>,
+    ) -> Option<R> {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        {
+            self.inner.wait_until_timeout(deadline, cond)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        {
+            let _ = deadline;
+            let mut cond = cond;
+            cond()
+        }
+    }
+
     /// Blocks the current task until `cond` gives a value, or a signal comes. Gives
     /// `ERESTARTSYS` for a signal, so that the system call layer can start the call again.
     ///
@@ -68,6 +88,15 @@ impl Default for WaitQueue {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The queue of `poll` and `select`. A wait for the events of more than one file waits here, and
+/// each file that has a new event wakes it.
+pub static POLL_WAIT: WaitQueue = WaitQueue::new();
+
+/// Wakes the tasks in `poll` and `select`, because a file has a new event.
+pub fn poll_wake() {
+    POLL_WAIT.wake_all();
 }
 
 /// The check of the process layer: it tells if a signal must stop the wait of the current task.

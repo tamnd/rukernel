@@ -21,6 +21,7 @@ pub mod file;
 pub mod fs;
 pub mod inode;
 pub mod path;
+pub mod pipe;
 pub mod wait;
 
 pub use dentry::{Dentry, Location, Mount, MountNamespace};

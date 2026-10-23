@@ -11,7 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
@@ -273,6 +275,79 @@ static void test_signals(void)
 	signal(SIGUSR2, SIG_DFL);
 }
 
+static volatile sig_atomic_t got_pipe;
+
+static void on_pipe(int sig)
+{
+	got_pipe = sig;
+}
+
+static void test_pipes(void)
+{
+	int p[2];
+	char buf[64];
+	check("pipe", pipe(p) == 0);
+	pid_t pid = fork();
+	if (pid == 0) {
+		char *argv[] = { "/bin/hello", "arg", NULL };
+		char *envp[] = { NULL };
+		dup2(p[1], 1);
+		close(p[0]);
+		close(p[1]);
+		execve(argv[0], argv, envp);
+		_exit(99);
+	}
+	close(p[1]);
+	size_t got = 0;
+	ssize_t n;
+	while ((n = read(p[0], buf + got, sizeof(buf) - 1 - got)) > 0)
+		got += n;
+	buf[got] = 0;
+	check("a pipe takes the output of a child", strcmp(buf, "hello: static pie runs\n") == 0);
+	check("read gives end of file when the writer exits", n == 0);
+	int status = 0;
+	waitpid(pid, &status, 0);
+	close(p[0]);
+
+	check("pipe2 with O_NONBLOCK", pipe2(p, O_NONBLOCK | O_CLOEXEC) == 0);
+	check("an empty pipe gives EAGAIN", read(p[0], buf, 1) == -1 && errno == EAGAIN);
+	struct pollfd fds[2] = { { p[0], POLLIN, 0 }, { p[1], POLLOUT, 0 } };
+	check("poll of an empty pipe", poll(fds, 2, 0) == 1 && fds[0].revents == 0 &&
+					   fds[1].revents == POLLOUT);
+	write(p[1], "x", 1);
+	check("poll sees the data", poll(fds, 1, 0) == 1 && fds[0].revents == POLLIN);
+	fd_set rd;
+	FD_ZERO(&rd);
+	FD_SET(p[0], &rd);
+	struct timeval tv = { 0, 0 };
+	check("select sees the data", select(p[0] + 1, &rd, NULL, NULL, &tv) == 1 &&
+					  FD_ISSET(p[0], &rd));
+	read(p[0], buf, 1);
+	FD_SET(p[0], &rd);
+	tv.tv_usec = 20000;
+	check("select waits for the timeout", select(p[0] + 1, &rd, NULL, NULL, &tv) == 0 &&
+						  !FD_ISSET(p[0], &rd));
+
+	pid = fork();
+	if (pid == 0) {
+		struct timespec d = { 0, 20 * 1000 * 1000 };
+		nanosleep(&d, NULL);
+		write(p[1], "y", 1);
+		_exit(0);
+	}
+	fds[0].revents = 0;
+	check("poll waits for a writer", poll(fds, 1, 5000) == 1 && fds[0].revents == POLLIN);
+	waitpid(pid, &status, 0);
+	read(p[0], buf, 1);
+
+	close(p[0]);
+	signal(SIGPIPE, on_pipe);
+	check("a write with no reader gives EPIPE", write(p[1], "z", 1) == -1 && errno == EPIPE);
+	check("a write with no reader sends SIGPIPE", got_pipe == SIGPIPE);
+	signal(SIGPIPE, SIG_DFL);
+	close(p[1]);
+}
+
 static void test_tty(void)
 {
 	char buf[64];
@@ -308,6 +383,7 @@ int main(int argc, char **argv)
 	test_exec();
 	test_time();
 	test_signals();
+	test_pipes();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");

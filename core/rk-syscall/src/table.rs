@@ -1,7 +1,7 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, info, mm, process, signal};
+use crate::{fs, info, mm, poll, process, signal};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
@@ -25,6 +25,12 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
     match n {
         nr::READ => fs::read(cx, a[0], a[1], a[2]),
         nr::WRITE => fs::write(cx, a[0], a[1], a[2]),
+        nr::POLL => poll::poll(cx, a[0], a[1], a[2]),
+        nr::PPOLL => poll::ppoll(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::SELECT => poll::select(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::PSELECT6 => poll::pselect6(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::PIPE => poll::pipe(cx, a[0]),
+        nr::PIPE2 => poll::pipe2(cx, a[0], a[1]),
         nr::OPEN => fs::openat(cx, at_fdcwd(), a[0], a[1], a[2]),
         nr::CLOSE => fs::close(cx, a[0]),
         nr::STAT => fs::fstatat(cx, at_fdcwd(), a[0], a[1], 0),

@@ -30,6 +30,8 @@ mod info;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod mm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod poll;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod process;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod run;
