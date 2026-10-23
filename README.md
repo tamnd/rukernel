@@ -67,6 +67,7 @@ QEMU loads the ELF image directly through the PVH entry note. The build also wri
 | `frame/rk-frame/` | The only crate that can contain `unsafe` code |
 | `core/rk-abi/` | The typed Linux ABI: error numbers now, generated tables later |
 | `core/rk-lib/` | Safe helpers that all kernel crates use |
+| `core/rk-sched/` | The scheduler: a round robin queue in R1 |
 | `xtask/` | The build checks |
 
 [`spec/23-package-layout.md`](spec/23-package-layout.md) gives the full crate tree. The crates come into the tree as the milestones need them.

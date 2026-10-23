@@ -40,11 +40,19 @@ name = "rk-lib"
 version = "0.1.0"
 
 [[package]]
+name = "rk-sched"
+version = "0.1.0"
+dependencies = [
+ "rk-frame",
+]
+
+[[package]]
 name = "rukernel"
 version = "0.1.0"
 dependencies = [
  "rk-abi",
  "rk-frame",
+ "rk-sched",
 ]
 
 [[package]]

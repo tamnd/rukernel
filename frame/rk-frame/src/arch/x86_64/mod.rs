@@ -8,6 +8,7 @@ mod idt;
 mod io;
 pub(crate) mod paging;
 pub(crate) mod serial;
+pub(crate) mod task;
 pub(crate) mod trap;
 pub(crate) mod user;
 

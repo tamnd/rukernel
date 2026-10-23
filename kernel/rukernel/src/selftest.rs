@@ -24,6 +24,8 @@ pub(crate) fn run(name: &str) -> bool {
         "syscall" => syscall_test(),
         #[cfg(target_arch = "x86_64")]
         "vm" => vm_test(),
+        #[cfg(target_arch = "x86_64")]
+        "task" => task_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -502,5 +504,76 @@ fn vm_test() -> bool {
         check("the address spaces give back the shared code frame", Arc::strong_count(&code) == 1);
     drop(code);
     ok &= check("the frames and the page tables go back", mm::frame_stats().free == free_before);
+    ok
+}
+
+/// Three tasks take turns, a task waits in a wait queue for another task, and the stacks of the
+/// exited tasks go back to the heap.
+#[cfg(target_arch = "x86_64")]
+fn task_test() -> bool {
+    use alloc::vec::Vec;
+    use rk_frame::sync::SpinLock;
+    use rk_frame::task::{self, Task, TaskOptions, WaitQueue};
+
+    static LOG: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+    static QUEUE: WaitQueue = WaitQueue::new();
+    static VALUE: AtomicU64 = AtomicU64::new(0);
+
+    let heap_before = mm::heap_stats().in_use;
+    let mut tasks = Vec::new();
+    for n in 1..=3u64 {
+        let task = TaskOptions::new(move || {
+            for round in 0..3 {
+                LOG.lock().push(n * 10 + round);
+                task::yield_now();
+            }
+        })
+        .data(n)
+        .spawn();
+        let Some(task) = task else { return check("a stack for each task", false) };
+        tasks.push(task);
+    }
+    let mut ok = check(
+        "each task has its data",
+        tasks.iter().zip(1..).all(|(t, n)| t.data().downcast_ref::<u64>() == Some(&n)),
+    );
+    while !tasks.iter().all(|t| t.is_exited()) {
+        task::yield_now();
+    }
+    let log = core::mem::take(&mut *LOG.lock());
+    println!("rk.test: the tasks ran in the order {log:?}");
+    ok &= check("the tasks take turns", log == [10, 20, 30, 11, 21, 31, 12, 22, 32]);
+    ok &= check("the boot task is the current task", Task::current().id() == 0);
+
+    let waiter = TaskOptions::new(|| {
+        let value = QUEUE.wait_until(|| match VALUE.load(Ordering::Acquire) {
+            0 => None,
+            v => Some(v),
+        });
+        LOG.lock().push(value);
+    })
+    .spawn();
+    let Some(waiter) = waiter else { return check("a stack for the waiter", false) };
+    // The waiter runs and blocks. Then the boot task is the only task that can run.
+    task::yield_now();
+    ok &= check("the waiter blocks", !waiter.is_exited() && LOG.lock().is_empty());
+    VALUE.store(42, Ordering::Release);
+    ok &= check("the wake finds the waiter", QUEUE.wake_one());
+    while !waiter.is_exited() {
+        task::yield_now();
+    }
+    ok &= check("the waiter gets the value", *LOG.lock() == [42]);
+
+    drop(tasks);
+    drop(waiter);
+    LOG.lock().clear();
+    LOG.lock().shrink_to_fit();
+    let heap_after = mm::heap_stats().in_use;
+    println!("rk.test: heap in use {heap_before} before, {heap_after} after");
+    // The boot task and the buffers of the queues stay, but each stack is larger than them.
+    ok &= check(
+        "the stacks go back to the heap",
+        heap_after - heap_before < task::KERNEL_STACK_SIZE as u64,
+    );
     ok
 }
