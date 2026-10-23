@@ -343,7 +343,8 @@ fn build_kernel() -> Result<PathBuf> {
     Ok(workspace_root().join("target/x86_64-unknown-none/debug/rukernel"))
 }
 
-/// The QEMU command for the x86-64 kernel. KVM is used when the host has it.
+/// The QEMU command for the x86-64 kernel. KVM is used when the host has it and this user can open
+/// it. A CI runner can have `/dev/kvm` with no access for the runner user.
 fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-m", "512M", "-smp", "1", "-display", "none"])
@@ -352,7 +353,7 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
         .arg("-kernel")
         .arg(kernel)
         .args(["-append", cmdline]);
-    if Path::new("/dev/kvm").exists() {
+    if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);
     } else {
         cmd.args(["-accel", "tcg", "-cpu", "max"]);

@@ -15,3 +15,4 @@ DEFIN = "DEFIN"   # BPF_CORE_TYPE_DEFINED and similar, split by the checker
 Veru = "Veru"     # VeruSAGE
 wrk = "wrk"       # the HTTP benchmark tool
 passt = "passt"   # the user mode network stack of Podman
+IST = "IST"       # the x86-64 Interrupt Stack Table
