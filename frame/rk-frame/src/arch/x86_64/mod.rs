@@ -1,5 +1,6 @@
 //! x86-64.
 
+pub(crate) mod apic;
 mod boot;
 mod gdt;
 mod idt;
@@ -18,7 +19,52 @@ pub(crate) fn init_cpu() {
 
 /// Handles an interrupt from a device or the local APIC.
 fn interrupt(vector: u8) {
-    crate::console::_print_panic(format_args!("rk-frame: spurious interrupt on vector {vector}\n"));
+    if !apic::handle(vector) {
+        crate::console::_print_panic(format_args!(
+            "rk-frame: spurious interrupt on vector {vector}\n"
+        ));
+        apic::eoi();
+    }
+}
+
+/// The timer values that the architecture independent code reads.
+pub(crate) mod timer {
+    pub(crate) use super::apic::{HZ, TICKS, TIMER_HZ};
+}
+
+/// Interrupt control on this CPU.
+///
+/// The interrupt handlers use only atomic values and the local APIC. They take no lock, so an
+/// interrupt cannot stop on a lock that the interrupted code holds.
+pub(crate) mod irq {
+    /// Lets this CPU take interrupts.
+    pub(crate) fn enable() {
+        // SAFETY: the IDT has a gate for each vector, and the handlers take no locks.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    }
+
+    /// Stops this CPU from taking interrupts.
+    pub(crate) fn disable() {
+        // SAFETY: `cli` changes only the interrupt flag.
+        unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    }
+
+    /// Tells if this CPU takes interrupts.
+    pub(crate) fn enabled() -> bool {
+        let flags: u64;
+        // SAFETY: `pushfq` and `pop` read the flags through the stack and change nothing else.
+        unsafe {
+            core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags))
+        };
+        flags & (1 << 9) != 0
+    }
+
+    /// Lets this CPU take interrupts and waits for the next one. `sti` takes effect after the next
+    /// instruction, so an interrupt that comes before `hlt` still wakes the CPU.
+    pub(crate) fn wait() {
+        // SAFETY: as for `enable`. `hlt` waits for an interrupt and changes no memory.
+        unsafe { core::arch::asm!("sti", "hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Stops this CPU with interrupts off. The CPU does not continue.

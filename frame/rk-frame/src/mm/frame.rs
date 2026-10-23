@@ -149,6 +149,18 @@ pub fn vmap(frame: Frame) -> Result<Mapping, Frame> {
     Ok(Mapping { virt, frame: Some(frame) })
 }
 
+/// Maps one page of device registers at a new kernel virtual address and gives the address. The
+/// mapping stays for all of the run time.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vmap_mmio(phys: u64) -> Option<usize> {
+    let virt = NEXT_VMALLOC.fetch_add(2 * PAGE_SIZE, Ordering::Relaxed);
+    if virt >= paging::VMALLOC_END {
+        return None;
+    }
+    paging::map_mmio_page(virt, phys).ok()?;
+    Some(virt)
+}
+
 impl Mapping {
     /// The kernel virtual address of the mapping.
     pub fn addr(&self) -> VirtAddr {

@@ -308,7 +308,7 @@ const QEMU_PASS: i32 = 33;
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The self tests that `boot-test` runs, each in its own boot.
-const BOOT_TESTS: &[&str] = &["boot", "trap", "mm"];
+const BOOT_TESTS: &[&str] = &["boot", "trap", "mm", "timer"];
 
 /// Builds the x86-64 kernel and gives the path of the ELF image.
 fn build_kernel() -> Result<PathBuf> {

@@ -35,6 +35,8 @@ const BOOT_IDENTITY_LIMIT: u64 = 1 << 30;
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+const WRITE_THROUGH: u64 = 1 << 3;
+const NO_CACHE: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 const GLOBAL: u64 = 1 << 8;
 const NO_EXECUTE: u64 = 1 << 63;
@@ -216,6 +218,15 @@ pub(crate) fn map_page(virt: usize, phys: u64, writable: bool) -> Result<(), ()>
     assert!((VMALLOC_START..VMALLOC_END).contains(&virt), "{virt:#x} is not in the vmalloc range");
     let _guard = TABLES.lock();
     let flags = GLOBAL | NO_EXECUTE | if writable { WRITABLE } else { 0 };
+    map_4k(KERNEL_PML4.load(Ordering::Acquire), virt, phys, flags)
+}
+
+/// Maps one 4 KiB page of device registers in the vmalloc range. The page is writable and not
+/// cached.
+pub(crate) fn map_mmio_page(virt: usize, phys: u64) -> Result<(), ()> {
+    assert!((VMALLOC_START..VMALLOC_END).contains(&virt), "{virt:#x} is not in the vmalloc range");
+    let _guard = TABLES.lock();
+    let flags = WRITABLE | WRITE_THROUGH | NO_CACHE | GLOBAL | NO_EXECUTE;
     map_4k(KERNEL_PML4.load(Ordering::Acquire), virt, phys, flags)
 }
 

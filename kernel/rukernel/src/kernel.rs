@@ -33,6 +33,7 @@ fn main(boot: &'static BootInfo) -> ! {
     println!("memory: {} MiB usable", boot.usable_bytes() >> 20);
     let frames = rk_frame::mm::frame_stats();
     println!("memory: {} of {} frames free", frames.free, frames.total);
+    println!("timer: {} Hz, tick at {} Hz", rk_frame::time::timer_frequency(), rk_frame::time::HZ);
 
     if let Some(test) = param(boot.cmdline(), "rk.test") {
         let passed = selftest::run(test);

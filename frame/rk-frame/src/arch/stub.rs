@@ -82,3 +82,27 @@ pub(crate) mod paging {
         None
     }
 }
+
+/// The timer values. These architectures have no timer yet, so the values stay 0.
+pub(crate) mod timer {
+    use core::sync::atomic::AtomicU64;
+
+    pub(crate) const HZ: u64 = 250;
+    pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Interrupt control. These architectures take no interrupts yet.
+pub(crate) mod irq {
+    pub(crate) fn enable() {}
+
+    pub(crate) fn disable() {}
+
+    pub(crate) fn enabled() -> bool {
+        false
+    }
+
+    pub(crate) fn wait() {
+        core::hint::spin_loop();
+    }
+}

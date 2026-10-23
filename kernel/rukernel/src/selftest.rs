@@ -8,6 +8,7 @@ use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{self, Frame};
 use rk_frame::println;
 use rk_frame::trap::{self, Fault};
+use rk_frame::{irq, time};
 
 /// Runs the test `name`. Gives `true` when it passes.
 pub(crate) fn run(name: &str) -> bool {
@@ -15,6 +16,7 @@ pub(crate) fn run(name: &str) -> bool {
         "boot" => true,
         "trap" => trap_test(),
         "mm" => mm_test(),
+        "timer" => timer_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -149,5 +151,25 @@ fn mm_test() -> bool {
     } else {
         ok &= check("a frame for vmap", false);
     }
+    ok
+}
+
+fn timer_test() -> bool {
+    // A tenth of a second of ticks. The wait stops after a fixed number of interrupts, so a timer
+    // that does not work gives a failure and not a hang.
+    let want = time::HZ / 10;
+    let mut ok = check("interrupts are off at boot", !irq::enabled());
+    ok &= check("the timer frequency is known", time::timer_frequency() > 0);
+    let start = time::ticks();
+    let mut waits = 0;
+    while time::ticks() - start < want && waits < 10 * want {
+        irq::wait();
+        waits += 1;
+    }
+    irq::disable();
+    let got = time::ticks() - start;
+    println!("rk.test: {got} ticks in {waits} waits, timer at {} Hz", time::timer_frequency());
+    ok &= check("the timer interrupts arrive", got >= want);
+    ok &= check("interrupts are off again", !irq::enabled());
     ok
 }

@@ -15,7 +15,11 @@ pub mod addr;
 pub mod arch;
 pub mod boot;
 pub mod console;
+#[cfg(target_os = "none")]
+pub mod irq;
 pub mod mm;
 pub mod sync;
+#[cfg(target_os = "none")]
+pub mod time;
 #[cfg(target_os = "none")]
 pub mod trap;
