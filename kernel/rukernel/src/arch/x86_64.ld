@@ -24,6 +24,7 @@ SECTIONS
     . = 0x100000;
 
     .boot : {
+        KEEP(*(.boot.head))
         KEEP(*(.boot.text))
         . = ALIGN(4096);
         KEEP(*(.boot.data))

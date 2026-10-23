@@ -2,6 +2,7 @@
 
 pub(crate) mod apic;
 mod boot;
+mod boot_params;
 mod gdt;
 mod idt;
 mod io;
