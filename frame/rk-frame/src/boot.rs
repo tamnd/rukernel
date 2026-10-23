@@ -139,10 +139,21 @@ impl BootInfo {
         true
     }
 
-    /// Adds a memory map entry. An entry with length 0 is ignored. When the table is full, the
-    /// entry is ignored, and the boot log tells it.
+    /// Adds a memory map entry. An entry with length 0 is ignored. An entry that starts at the end
+    /// of the last entry and has the same kind becomes part of the last entry. An EFI memory map
+    /// has many such entries. When the table is full, the entry is ignored.
     pub fn push_region(&mut self, start: PhysAddr, len: u64, kind: MemoryKind) {
-        if len == 0 || self.region_count == MAX_REGIONS {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.region_count.checked_sub(1).map(|i| &mut self.regions[i])
+            && last.kind == kind
+            && last.start.get().checked_add(last.len) == Some(start.get())
+        {
+            last.len += len;
+            return;
+        }
+        if self.region_count == MAX_REGIONS {
             return;
         }
         self.regions[self.region_count] = MemoryRegion { start, len, kind };
@@ -234,5 +245,18 @@ mod tests {
         info.push_region(PhysAddr::new(0x200000), 0, MemoryKind::Usable);
         assert_eq!(info.memory().len(), 3);
         assert_eq!(info.usable_bytes(), 0x9f000 + 0x7ff00000);
+    }
+
+    #[test]
+    fn adjacent_regions_of_one_kind_merge() {
+        let mut info = BootInfo::new("test");
+        info.push_region(PhysAddr::new(0), 0x1000, MemoryKind::Usable);
+        info.push_region(PhysAddr::new(0x1000), 0x1000, MemoryKind::Usable);
+        info.push_region(PhysAddr::new(0x2000), 0x1000, MemoryKind::Reserved);
+        info.push_region(PhysAddr::new(0x4000), 0x1000, MemoryKind::Reserved);
+        let m = info.memory();
+        assert_eq!(m.len(), 3);
+        assert_eq!((m[0].start.get(), m[0].len), (0, 0x2000));
+        assert_eq!((m[2].start.get(), m[2].len), (0x4000, 0x1000));
     }
 }

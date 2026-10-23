@@ -2,7 +2,7 @@
 
 rukernel is an operating system kernel in Rust. It has the same user interface as Linux 7.3. A program that runs on Linux runs on rukernel with no change. The target speed is the speed of Linux on the same machine.
 
-The project is at milestone R0. The design is complete and is in [`spec/`](spec/). The kernel boots on x86-64 under QEMU through PVH or the Linux boot protocol and prints the memory map. It does not run programs yet.
+The project is at milestone R0. The design is complete and is in [`spec/`](spec/). The kernel boots on x86-64 under QEMU through PVH, the Linux boot protocol or UEFI and prints the memory map. It does not run programs yet.
 
 ## The goal
 
@@ -46,7 +46,7 @@ This command runs the same checks as the CI gate. The cheapest checks run first.
 | `cargo xtask layers` | Each crate depends only on crates in its layer or a lower layer, as `xtask/layers.txt` gives |
 | `cargo xtask style` | The prose has no em dashes, no en dashes and no horizontal rules |
 | `cargo xtask targets` | The kernel crates build for `x86_64-unknown-none`, `aarch64-unknown-none` and `riscv64gc-unknown-none-elf` |
-| `cargo xtask boot-test` | The kernel boots in QEMU on x86-64 and each self test passes, and the bzImage boots through the Linux boot protocol |
+| `cargo xtask boot-test` | The kernel boots in QEMU on x86-64 and each self test passes, and the bzImage boots through the Linux boot protocol and UEFI |
 
 ## Boot the kernel
 
@@ -56,7 +56,7 @@ You need `qemu-system-x86_64`. This command builds the kernel and boots it in QE
 cargo xtask qemu rk.test=boot
 ```
 
-QEMU loads the ELF image directly through the PVH entry note. The build also writes a bzImage next to the ELF image, in `target/x86_64-unknown-none/debug/bzImage`. A loader of the Linux boot protocol, such as QEMU with `-kernel` or GRUB with `linux`, can boot it. The boot test boots the bzImage too. UEFI comes later in R0.
+QEMU loads the ELF image directly through the PVH entry note. The build also writes a bzImage next to the ELF image, in `target/x86_64-unknown-none/debug/bzImage`. A loader of the Linux boot protocol, such as QEMU with `-kernel` or GRUB with `linux`, can boot it. The bzImage is also an EFI application, so UEFI firmware can start it directly. The boot test boots the bzImage with the BIOS of QEMU and with OVMF. It finds OVMF in the usual package paths, or `RK_OVMF` gives the path.
 
 ## Repository layout
 

@@ -445,7 +445,7 @@ fn bzimage(elf: &[u8]) -> Result<Vec<u8>> {
     }
     let file_end = segments.iter().map(|s| s.1 + s.2).max().ok_or("the kernel has no segments")?;
     let mem_end = segments.iter().map(|s| s.1 + s.3).max().unwrap_or(file_end);
-    let mut payload = vec![0; usize_of(file_end - BZIMAGE_LOAD)?.next_multiple_of(16)];
+    let mut payload = vec![0; usize_of(file_end - BZIMAGE_LOAD)?.next_multiple_of(PE_FILE_ALIGN)];
     for &(offset, paddr, filesz, _) in &segments {
         let (at, len) = (usize_of(paddr - BZIMAGE_LOAD)?, usize_of(filesz)?);
         let data = elf.get(offset..offset + len).ok_or("a segment is outside the file")?;
@@ -501,8 +501,50 @@ fn bzimage(elf: &[u8]) -> Result<Vec<u8>> {
     let at = BZIMAGE_SETUP_SIZE - 0x200;
     image[at..at + version.len()].copy_from_slice(version.as_bytes());
     put::<2>(&mut image, 0x20e, (at - 0x200) as u64);
+    pe_header(&mut image, payload.len() as u64);
     image.extend_from_slice(&payload);
     Ok(image)
+}
+
+/// The file alignment of the PE image. It is also the alignment of the payload.
+const PE_FILE_ALIGN: usize = 0x200;
+/// The offset of the PE signature in the boot sector.
+const PE_OFFSET: usize = 0x40;
+/// The offset of `rk_efi_entry` from the start of the payload, per `boot.rs`.
+const EFI_ENTRY: u64 = 0x400;
+
+/// Writes the PE/COFF header in the boot sector, so that UEFI firmware can start the bzImage as
+/// an EFI application, per the PE format of Microsoft. The image has one section. It is the
+/// payload, at the first page after the setup part. The image has no relocations, because the
+/// EFI stub uses only RIP relative addresses.
+fn pe_header(image: &mut [u8], payload: u64) {
+    let setup = BZIMAGE_SETUP_SIZE as u64;
+    image[0..2].copy_from_slice(b"MZ");
+    put::<4>(image, 0x3c, PE_OFFSET as u64); // e_lfanew
+    let coff = PE_OFFSET + 4;
+    image[PE_OFFSET..coff].copy_from_slice(b"PE\0\0");
+    put::<2>(image, coff, 0x8664); // Machine: x86-64
+    put::<2>(image, coff + 2, 1); // NumberOfSections
+    put::<2>(image, coff + 16, 240); // SizeOfOptionalHeader
+    put::<2>(image, coff + 18, 0x0206); // EXECUTABLE_IMAGE, LINE_NUMS_STRIPPED, DEBUG_STRIPPED
+    let opt = coff + 20;
+    put::<2>(image, opt, 0x20b); // PE32+
+    put::<4>(image, opt + 4, payload); // SizeOfCode
+    put::<4>(image, opt + 16, setup + EFI_ENTRY); // AddressOfEntryPoint
+    put::<4>(image, opt + 20, setup); // BaseOfCode
+    put::<4>(image, opt + 32, 0x1000); // SectionAlignment
+    put::<4>(image, opt + 36, PE_FILE_ALIGN as u64); // FileAlignment
+    put::<4>(image, opt + 56, setup + payload.next_multiple_of(0x1000)); // SizeOfImage
+    put::<4>(image, opt + 60, setup); // SizeOfHeaders
+    put::<2>(image, opt + 68, 10); // Subsystem: EFI application
+    put::<4>(image, opt + 108, 16); // NumberOfRvaAndSizes. Each data directory is empty.
+    let section = opt + 240;
+    image[section..section + 8].copy_from_slice(b".text\0\0\0");
+    put::<4>(image, section + 8, payload); // VirtualSize
+    put::<4>(image, section + 12, setup); // VirtualAddress
+    put::<4>(image, section + 16, payload); // SizeOfRawData
+    put::<4>(image, section + 20, setup); // PointerToRawData
+    put::<4>(image, section + 36, 0x6000_0020); // CNT_CODE, MEM_EXECUTE, MEM_READ
 }
 
 /// Builds the x86-64 kernel and the bzImage, and gives the path of the bzImage.
@@ -570,7 +612,52 @@ fn boot_test() -> Result {
             errors.push(format!("boot test {test} with the bzImage: fail with {status}\n{log}"));
         }
     }
+    match find_ovmf()? {
+        Some(firmware) => {
+            for test in BZIMAGE_TESTS {
+                let cmdline = format!("console=ttyS0 rk.test={test}");
+                let mut cmd = qemu_command(&bzimage, &cmdline);
+                cmd.arg("-drive")
+                    .arg(format!("if=pflash,format=raw,readonly=on,file={}", firmware.display()));
+                let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT)?;
+                let passed = status == Some(QEMU_PASS)
+                    && log.contains("booting with efi")
+                    && log.contains(&format!("rk.test={test}: pass"));
+                if passed {
+                    println!("boot test {test} with UEFI: pass");
+                } else {
+                    let status =
+                        status.map_or(String::from("a timeout"), |s| format!("status {s}"));
+                    errors.push(format!("boot test {test} with UEFI: fail with {status}\n{log}"));
+                }
+            }
+        }
+        None => println!("boot tests with UEFI: skipped, no OVMF firmware, set RK_OVMF"),
+    }
     report("boot tests", errors)
+}
+
+/// The places where a package puts the OVMF firmware: Homebrew, Debian and Ubuntu, and Fedora.
+const OVMF_PATHS: &[&str] = &[
+    "/opt/homebrew/share/qemu/edk2-x86_64-code.fd",
+    "/usr/local/share/qemu/edk2-x86_64-code.fd",
+    "/usr/share/OVMF/OVMF_CODE_4M.fd",
+    "/usr/share/OVMF/OVMF_CODE.fd",
+    "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+    "/usr/share/qemu/edk2-x86_64-code.fd",
+];
+
+/// Finds the OVMF firmware for the UEFI boot tests. `RK_OVMF` gives the path. In CI the firmware
+/// must be there, so that CI does not skip the tests.
+fn find_ovmf() -> Result<Option<PathBuf>> {
+    if let Some(path) = std::env::var_os("RK_OVMF") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    let found = OVMF_PATHS.iter().map(PathBuf::from).find(|p| p.exists());
+    if found.is_none() && std::env::var_os("CI").is_some() {
+        return Err(String::from("no OVMF firmware for the UEFI boot tests, install ovmf"));
+    }
+    Ok(found)
 }
 
 /// Runs a command, collects its standard output and stops it after `timeout`. Gives the exit
