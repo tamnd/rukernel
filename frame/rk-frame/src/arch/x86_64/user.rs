@@ -40,6 +40,23 @@ pub struct UserRegs {
     pub rflags: u64,
 }
 
+/// The x87, MMX and SSE state of a user thread, in the `fxsave` format.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpuState([u8; 512]);
+
+impl Default for FpuState {
+    /// The state after `fninit`, with the MXCSR value that Linux gives a new program: all SSE
+    /// exceptions are masked.
+    fn default() -> Self {
+        let mut s = [0; 512];
+        s[0..2].copy_from_slice(&0x037f_u16.to_le_bytes()); // FCW
+        s[24..28].copy_from_slice(&0x1f80_u32.to_le_bytes()); // MXCSR
+        s[28..32].copy_from_slice(&0xffbf_u32.to_le_bytes()); // MXCSR_MASK, as the CPU gives it
+        Self(s)
+    }
+}
+
 /// The way that the CPU came back from user mode, as `rk_user_return` gets it in RAX.
 pub(crate) const RETURN_SYSCALL: u64 = 0;
 pub(crate) const RETURN_INTERRUPT: u64 = 1;
@@ -151,6 +168,7 @@ const IA32_EFER: u32 = 0xc000_0080;
 const IA32_STAR: u32 = 0xc000_0081;
 const IA32_LSTAR: u32 = 0xc000_0082;
 const IA32_FMASK: u32 = 0xc000_0084;
+const IA32_FS_BASE: u32 = 0xc000_0100;
 /// EFER.SCE: the CPU accepts the `syscall` instruction.
 const EFER_SCE: u64 = 1 << 0;
 
@@ -181,9 +199,45 @@ fn wrmsr(msr: u32, value: u64) {
     };
 }
 
-/// Sets up the `syscall` instruction. `sysret` would take the user code segment at STAR[63:48]
-/// plus 16, and the user stack segment at STAR[63:48] plus 8.
+/// CR0.MP: `wait` and `fwait` examine CR0.TS.
+const CR0_MP: u64 = 1 << 1;
+/// CR0.EM: the CPU has no x87 unit. It must be clear for SSE.
+const CR0_EM: u64 = 1 << 2;
+/// CR4.OSFXSR: the kernel uses `fxsave` and `fxrstor`, so the SSE instructions work.
+const CR4_OSFXSR: u64 = 1 << 9;
+/// CR4.OSXMMEXCPT: the kernel handles the SIMD floating point exception.
+const CR4_OSXMMEXCPT: u64 = 1 << 10;
+
+/// Lets user code use x87, MMX and SSE. CR4.OSXSAVE stays clear, so CPUID tells user code that
+/// AVX is not available, and the `fxsave` state is complete. The kernel itself does not use these
+/// registers, because the target has no SSE.
+fn enable_sse() {
+    let (mut cr0, mut cr4): (u64, u64);
+    // SAFETY: reading CR0 and CR4 has no side effect.
+    unsafe {
+        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags))
+    };
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
+    };
+    cr0 = (cr0 & !CR0_EM) | CR0_MP;
+    cr4 |= CR4_OSFXSR | CR4_OSXMMEXCPT;
+    // SAFETY: these bits change only how the CPU runs x87 and SSE instructions. The kernel code
+    // has none, and each x86-64 CPU has SSE2.
+    unsafe {
+        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags))
+    };
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags))
+    };
+}
+
+/// Sets up the `syscall` instruction and SSE. `sysret` would take the user code segment at
+/// STAR[63:48] plus 16, and the user stack segment at STAR[63:48] plus 8.
 pub(crate) fn init() {
+    enable_sse();
     wrmsr(IA32_STAR, (u64::from(USER32_CS) << 48) | (u64::from(KERNEL_CS) << 32));
     wrmsr(IA32_LSTAR, rk_syscall_entry as *const () as u64);
     wrmsr(IA32_FMASK, SYSCALL_MASK);
@@ -197,9 +251,10 @@ pub(crate) enum Return {
     Exception { vector: u8, error: u64, cr2: u64 },
 }
 
-/// Runs user code with the registers `regs` until it comes back to the kernel. When this function
-/// returns, `regs` has the user registers at that time.
-pub(crate) fn enter(regs: &mut UserRegs) -> Return {
+/// Runs user code with the registers `regs`, the FPU state `fpu` and the FS base `fs_base`, until
+/// it comes back to the kernel. When this function returns, `regs` and `fpu` have the user values
+/// at that time. User code cannot change the FS base, because CR4.FSGSBASE is clear.
+pub(crate) fn enter(regs: &mut UserRegs, fpu: &mut FpuState, fs_base: u64) -> Return {
     if regs.rip >= LOWER_HALF_END {
         // `iretq` to this address would fault in kernel mode. User code that jumps there gets a
         // general protection fault, so the result is the same.
@@ -208,11 +263,24 @@ pub(crate) fn enter(regs: &mut UserRegs) -> Return {
     regs.rflags = (regs.rflags & USER_FLAGS) | FIXED_FLAGS;
     let was_enabled = super::irq::enabled();
     super::irq::disable();
+    // A value that is not canonical makes `wrmsr` fault. The user gets a value of 0 then, as an
+    // access through it would fault.
+    wrmsr(IA32_FS_BASE, if fs_base < LOWER_HALF_END { fs_base } else { 0 });
+    // SAFETY: `fpu` is a valid `fxsave` area of 512 bytes, aligned to 16. Its MXCSR has no
+    // reserved bit set, because only `fxsave` and `FpuState::default` write it.
+    unsafe {
+        core::arch::asm!("fxrstor64 [{}]", in(reg) fpu.0.as_ptr(), options(nostack, readonly, preserves_flags))
+    };
     // SAFETY: the user registers go to user mode with the user selectors and IOPL 0, so the user
     // code can touch only the user pages. Each path back to the kernel saves the user registers in
     // `regs` and returns here with the registers of the kernel as they were. `regs` lives until
     // the call returns, and no other reference to it exists in that time.
     let how = unsafe { rk_user_enter(regs) };
+    // SAFETY: `fpu` is a writable area of 512 bytes, aligned to 16, and no other reference to it
+    // exists in this call.
+    unsafe {
+        core::arch::asm!("fxsave64 [{}]", in(reg) fpu.0.as_mut_ptr(), options(nostack, preserves_flags))
+    };
     if was_enabled {
         super::irq::enable();
     }

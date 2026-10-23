@@ -10,7 +10,7 @@ use crate::addr::{PAGE_SIZE, VirtAddr};
 use crate::arch::imp::{paging, user};
 use crate::mm::Frame;
 
-pub use user::UserRegs;
+pub use user::{FpuState, UserRegs};
 
 /// The end of the user half of the address space. Each user address is below it.
 pub const USER_END: usize = paging::USER_END;
@@ -37,10 +37,13 @@ pub struct UserException {
     pub addr: u64,
 }
 
-/// The registers of one user thread.
+/// The registers of one user thread: the general registers, the x87 and SSE state, and the FS
+/// base, which holds the thread pointer on x86-64.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UserContext {
     regs: UserRegs,
+    fpu: FpuState,
+    fs_base: u64,
 }
 
 impl UserContext {
@@ -49,7 +52,7 @@ impl UserContext {
     pub fn new(entry: VirtAddr, stack: VirtAddr) -> Self {
         let regs =
             UserRegs { rip: entry.get() as u64, rsp: stack.get() as u64, ..UserRegs::default() };
-        Self { regs }
+        Self { regs, ..Self::default() }
     }
 
     /// The registers.
@@ -62,11 +65,27 @@ impl UserContext {
         &mut self.regs
     }
 
+    /// The x87 and SSE state.
+    pub fn fpu(&self) -> &FpuState {
+        &self.fpu
+    }
+
+    /// The FS base. `arch_prctl(ARCH_GET_FS)` gives it.
+    pub fn fs_base(&self) -> u64 {
+        self.fs_base
+    }
+
+    /// Sets the FS base, for `arch_prctl(ARCH_SET_FS)`. The kernel loads it at the next entry to
+    /// user mode. A value that is not canonical makes the entry load 0.
+    pub fn set_fs_base(&mut self, value: u64) {
+        self.fs_base = value;
+    }
+
     /// Runs the user code until it comes back to the kernel, and gives the reason. The registers
     /// then have the values of the user code at that time. After a system call, the instruction
     /// pointer is after the `syscall` instruction.
     pub fn execute(&mut self) -> ReturnReason {
-        match user::enter(&mut self.regs) {
+        match user::enter(&mut self.regs, &mut self.fpu, self.fs_base) {
             user::Return::Syscall => ReturnReason::Syscall,
             user::Return::Interrupt => ReturnReason::Interrupt,
             user::Return::Exception { vector, error, cr2 } => {
