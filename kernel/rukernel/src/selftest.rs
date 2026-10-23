@@ -315,5 +315,77 @@ fn syscall_test() -> bool {
         ctx.regs().r12 == NR_SYSCALLS as u64 && ctx.regs().rbx == 0,
     );
     ok &= check("interrupts are off again", !irq::enabled());
+    ok &= fpu_test();
+    ok
+}
+
+/// The user programs of the FPU test. Program A puts a value in XMM0, makes a system call, copies
+/// XMM0 to RBX and reads the word at FS:0 into RCX. Program B puts another value in XMM0. The
+/// test runs B between the system call of A and its return, so A sees its own value only if the
+/// kernel keeps the SSE state of each context.
+#[cfg(target_arch = "x86_64")]
+const FPU_PROGRAM_A: [u8; 36] = [
+    0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 0x1122334455667788
+    0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+    0xb8, 0x27, 0, 0, 0, // mov eax, 39
+    0x0f, 0x05, // syscall
+    0x66, 0x48, 0x0f, 0x7e, 0xc3, // movq rbx, xmm0
+    0x64, 0x48, 0x8b, 0x0c, 0x25, 0, 0, 0, 0, // mov rcx, fs:[0]
+];
+#[cfg(target_arch = "x86_64")]
+const FPU_PROGRAM_B: [u8; 15] = [
+    0x48, 0xb8, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, // mov rax, 0x9999999999999999
+    0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
+];
+
+#[cfg(target_arch = "x86_64")]
+fn fpu_test() -> bool {
+    use crate::syscall;
+    use rk_frame::user::{self, ReturnReason, UserContext};
+
+    const CODE: usize = 0x40_1000;
+    const B_OFFSET: usize = 0x80;
+    const DATA: usize = 0x60_0000;
+    const STACK: usize = 0x7fff_fffd_e000;
+    const INT3: u8 = 0xcc;
+
+    let (Some(mut code), Some(mut data), Some(stack)) =
+        (mm::alloc_frame(), mm::alloc_frame(), mm::alloc_frame())
+    else {
+        return check("three frames for the FPU test", false);
+    };
+    let mut bytes = [INT3; 4096];
+    bytes[..FPU_PROGRAM_A.len()].copy_from_slice(&FPU_PROGRAM_A);
+    bytes[B_OFFSET..B_OFFSET + FPU_PROGRAM_B.len()].copy_from_slice(&FPU_PROGRAM_B);
+    for (i, chunk) in bytes.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(chunk);
+        code.write_u64(i, u64::from_le_bytes(word));
+    }
+    data.zero();
+    data.write_u64(2, 0xfeed_f00d);
+    let mut ok = check(
+        "the FPU test pages are mapped",
+        user::map_page(VirtAddr::new(CODE), code, false, true).is_ok()
+            && user::map_page(VirtAddr::new(DATA), data, false, false).is_ok()
+            && user::map_page(VirtAddr::new(STACK), stack, true, false).is_ok(),
+    );
+
+    let mut a = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(STACK + 4096));
+    a.set_fs_base((DATA + 16) as u64);
+    let mut b = UserContext::new(VirtAddr::new(CODE + B_OFFSET), VirtAddr::new(STACK + 4096));
+    let run = |ctx: &mut UserContext| loop {
+        match ctx.execute() {
+            ReturnReason::Interrupt => continue,
+            other => break other,
+        }
+    };
+    ok &= check("program A makes a system call", run(&mut a) == ReturnReason::Syscall);
+    syscall::dispatch(&mut a);
+    ok &= check("program B stops at its int3", matches!(run(&mut b), ReturnReason::Exception(_)));
+    ok &= check("program A stops at its int3", matches!(run(&mut a), ReturnReason::Exception(_)));
+    ok &= check("XMM0 of program A is kept", a.regs().rbx == 0x1122_3344_5566_7788);
+    ok &= check("the FS base of program A is used", a.regs().rcx == 0xfeed_f00d);
+    ok &= check("the SSE state of the two programs is different", a.fpu() != b.fpu());
     ok
 }
