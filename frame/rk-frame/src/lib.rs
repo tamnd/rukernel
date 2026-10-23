@@ -16,3 +16,5 @@ pub mod arch;
 pub mod boot;
 pub mod console;
 pub mod sync;
+#[cfg(target_os = "none")]
+pub mod trap;

@@ -1,5 +1,6 @@
 //! The main function and the panic handler.
 
+use crate::selftest;
 use rk_frame::boot::BootInfo;
 use rk_frame::{arch, println};
 
@@ -32,13 +33,7 @@ fn main(boot: &'static BootInfo) -> ! {
     println!("memory: {} MiB usable", boot.usable_bytes() >> 20);
 
     if let Some(test) = param(boot.cmdline(), "rk.test") {
-        let passed = match test {
-            "boot" => true,
-            other => {
-                println!("rk.test: unknown test {other}");
-                false
-            }
-        };
+        let passed = selftest::run(test);
         println!("rk.test={test}: {}", if passed { "pass" } else { "fail" });
         arch::qemu_exit(if passed { EXIT_PASS } else { EXIT_FAIL });
     }

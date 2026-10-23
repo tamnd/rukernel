@@ -116,6 +116,7 @@ const BOOT_IDENTITY_LIMIT: u64 = 1 << 30;
 #[unsafe(no_mangle)]
 extern "C" fn rk_frame_x86_64_entry(start_info: u64) -> ! {
     super::serial::init();
+    super::init_cpu();
     let mut info = BootInfo::new("pvh");
     read_start_info(start_info, &mut info);
     crate::boot::start(info)
