@@ -1,0 +1,2526 @@
+# rk-abigen generated this file from Linux 7.3, from arch/x86/entry/syscalls/syscall_64.tbl.
+# Do not edit it. Change rk-abigen and run it again.
+#
+# One entry for each line of the table with one of the ABIs below.
+# The native 64 bit table uses the ABIs in `native`.
+
+native = ["common", "64"]
+other = ["x32"]
+
+[[syscall]]
+nr = 0
+abi = "common"
+name = "read"
+entry = "sys_read"
+
+[[syscall]]
+nr = 1
+abi = "common"
+name = "write"
+entry = "sys_write"
+
+[[syscall]]
+nr = 2
+abi = "common"
+name = "open"
+entry = "sys_open"
+
+[[syscall]]
+nr = 3
+abi = "common"
+name = "close"
+entry = "sys_close"
+
+[[syscall]]
+nr = 4
+abi = "common"
+name = "stat"
+entry = "sys_newstat"
+
+[[syscall]]
+nr = 5
+abi = "common"
+name = "fstat"
+entry = "sys_newfstat"
+
+[[syscall]]
+nr = 6
+abi = "common"
+name = "lstat"
+entry = "sys_newlstat"
+
+[[syscall]]
+nr = 7
+abi = "common"
+name = "poll"
+entry = "sys_poll"
+
+[[syscall]]
+nr = 8
+abi = "common"
+name = "lseek"
+entry = "sys_lseek"
+
+[[syscall]]
+nr = 9
+abi = "common"
+name = "mmap"
+entry = "sys_mmap"
+
+[[syscall]]
+nr = 10
+abi = "common"
+name = "mprotect"
+entry = "sys_mprotect"
+
+[[syscall]]
+nr = 11
+abi = "common"
+name = "munmap"
+entry = "sys_munmap"
+
+[[syscall]]
+nr = 12
+abi = "common"
+name = "brk"
+entry = "sys_brk"
+
+[[syscall]]
+nr = 13
+abi = "64"
+name = "rt_sigaction"
+entry = "sys_rt_sigaction"
+
+[[syscall]]
+nr = 14
+abi = "common"
+name = "rt_sigprocmask"
+entry = "sys_rt_sigprocmask"
+
+[[syscall]]
+nr = 15
+abi = "64"
+name = "rt_sigreturn"
+entry = "sys_rt_sigreturn"
+
+[[syscall]]
+nr = 16
+abi = "64"
+name = "ioctl"
+entry = "sys_ioctl"
+
+[[syscall]]
+nr = 17
+abi = "common"
+name = "pread64"
+entry = "sys_pread64"
+
+[[syscall]]
+nr = 18
+abi = "common"
+name = "pwrite64"
+entry = "sys_pwrite64"
+
+[[syscall]]
+nr = 19
+abi = "64"
+name = "readv"
+entry = "sys_readv"
+
+[[syscall]]
+nr = 20
+abi = "64"
+name = "writev"
+entry = "sys_writev"
+
+[[syscall]]
+nr = 21
+abi = "common"
+name = "access"
+entry = "sys_access"
+
+[[syscall]]
+nr = 22
+abi = "common"
+name = "pipe"
+entry = "sys_pipe"
+
+[[syscall]]
+nr = 23
+abi = "common"
+name = "select"
+entry = "sys_select"
+
+[[syscall]]
+nr = 24
+abi = "common"
+name = "sched_yield"
+entry = "sys_sched_yield"
+
+[[syscall]]
+nr = 25
+abi = "common"
+name = "mremap"
+entry = "sys_mremap"
+
+[[syscall]]
+nr = 26
+abi = "common"
+name = "msync"
+entry = "sys_msync"
+
+[[syscall]]
+nr = 27
+abi = "common"
+name = "mincore"
+entry = "sys_mincore"
+
+[[syscall]]
+nr = 28
+abi = "common"
+name = "madvise"
+entry = "sys_madvise"
+
+[[syscall]]
+nr = 29
+abi = "common"
+name = "shmget"
+entry = "sys_shmget"
+
+[[syscall]]
+nr = 30
+abi = "common"
+name = "shmat"
+entry = "sys_shmat"
+
+[[syscall]]
+nr = 31
+abi = "common"
+name = "shmctl"
+entry = "sys_shmctl"
+
+[[syscall]]
+nr = 32
+abi = "common"
+name = "dup"
+entry = "sys_dup"
+
+[[syscall]]
+nr = 33
+abi = "common"
+name = "dup2"
+entry = "sys_dup2"
+
+[[syscall]]
+nr = 34
+abi = "common"
+name = "pause"
+entry = "sys_pause"
+
+[[syscall]]
+nr = 35
+abi = "common"
+name = "nanosleep"
+entry = "sys_nanosleep"
+
+[[syscall]]
+nr = 36
+abi = "common"
+name = "getitimer"
+entry = "sys_getitimer"
+
+[[syscall]]
+nr = 37
+abi = "common"
+name = "alarm"
+entry = "sys_alarm"
+
+[[syscall]]
+nr = 38
+abi = "common"
+name = "setitimer"
+entry = "sys_setitimer"
+
+[[syscall]]
+nr = 39
+abi = "common"
+name = "getpid"
+entry = "sys_getpid"
+
+[[syscall]]
+nr = 40
+abi = "common"
+name = "sendfile"
+entry = "sys_sendfile64"
+
+[[syscall]]
+nr = 41
+abi = "common"
+name = "socket"
+entry = "sys_socket"
+
+[[syscall]]
+nr = 42
+abi = "common"
+name = "connect"
+entry = "sys_connect"
+
+[[syscall]]
+nr = 43
+abi = "common"
+name = "accept"
+entry = "sys_accept"
+
+[[syscall]]
+nr = 44
+abi = "common"
+name = "sendto"
+entry = "sys_sendto"
+
+[[syscall]]
+nr = 45
+abi = "64"
+name = "recvfrom"
+entry = "sys_recvfrom"
+
+[[syscall]]
+nr = 46
+abi = "64"
+name = "sendmsg"
+entry = "sys_sendmsg"
+
+[[syscall]]
+nr = 47
+abi = "64"
+name = "recvmsg"
+entry = "sys_recvmsg"
+
+[[syscall]]
+nr = 48
+abi = "common"
+name = "shutdown"
+entry = "sys_shutdown"
+
+[[syscall]]
+nr = 49
+abi = "common"
+name = "bind"
+entry = "sys_bind"
+
+[[syscall]]
+nr = 50
+abi = "common"
+name = "listen"
+entry = "sys_listen"
+
+[[syscall]]
+nr = 51
+abi = "common"
+name = "getsockname"
+entry = "sys_getsockname"
+
+[[syscall]]
+nr = 52
+abi = "common"
+name = "getpeername"
+entry = "sys_getpeername"
+
+[[syscall]]
+nr = 53
+abi = "common"
+name = "socketpair"
+entry = "sys_socketpair"
+
+[[syscall]]
+nr = 54
+abi = "64"
+name = "setsockopt"
+entry = "sys_setsockopt"
+
+[[syscall]]
+nr = 55
+abi = "64"
+name = "getsockopt"
+entry = "sys_getsockopt"
+
+[[syscall]]
+nr = 56
+abi = "common"
+name = "clone"
+entry = "sys_clone"
+
+[[syscall]]
+nr = 57
+abi = "common"
+name = "fork"
+entry = "sys_fork"
+
+[[syscall]]
+nr = 58
+abi = "common"
+name = "vfork"
+entry = "sys_vfork"
+
+[[syscall]]
+nr = 59
+abi = "64"
+name = "execve"
+entry = "sys_execve"
+
+[[syscall]]
+nr = 60
+abi = "common"
+name = "exit"
+entry = "sys_exit"
+noreturn = true
+
+[[syscall]]
+nr = 61
+abi = "common"
+name = "wait4"
+entry = "sys_wait4"
+
+[[syscall]]
+nr = 62
+abi = "common"
+name = "kill"
+entry = "sys_kill"
+
+[[syscall]]
+nr = 63
+abi = "common"
+name = "uname"
+entry = "sys_newuname"
+
+[[syscall]]
+nr = 64
+abi = "common"
+name = "semget"
+entry = "sys_semget"
+
+[[syscall]]
+nr = 65
+abi = "common"
+name = "semop"
+entry = "sys_semop"
+
+[[syscall]]
+nr = 66
+abi = "common"
+name = "semctl"
+entry = "sys_semctl"
+
+[[syscall]]
+nr = 67
+abi = "common"
+name = "shmdt"
+entry = "sys_shmdt"
+
+[[syscall]]
+nr = 68
+abi = "common"
+name = "msgget"
+entry = "sys_msgget"
+
+[[syscall]]
+nr = 69
+abi = "common"
+name = "msgsnd"
+entry = "sys_msgsnd"
+
+[[syscall]]
+nr = 70
+abi = "common"
+name = "msgrcv"
+entry = "sys_msgrcv"
+
+[[syscall]]
+nr = 71
+abi = "common"
+name = "msgctl"
+entry = "sys_msgctl"
+
+[[syscall]]
+nr = 72
+abi = "common"
+name = "fcntl"
+entry = "sys_fcntl"
+
+[[syscall]]
+nr = 73
+abi = "common"
+name = "flock"
+entry = "sys_flock"
+
+[[syscall]]
+nr = 74
+abi = "common"
+name = "fsync"
+entry = "sys_fsync"
+
+[[syscall]]
+nr = 75
+abi = "common"
+name = "fdatasync"
+entry = "sys_fdatasync"
+
+[[syscall]]
+nr = 76
+abi = "common"
+name = "truncate"
+entry = "sys_truncate"
+
+[[syscall]]
+nr = 77
+abi = "common"
+name = "ftruncate"
+entry = "sys_ftruncate"
+
+[[syscall]]
+nr = 78
+abi = "common"
+name = "getdents"
+entry = "sys_getdents"
+
+[[syscall]]
+nr = 79
+abi = "common"
+name = "getcwd"
+entry = "sys_getcwd"
+
+[[syscall]]
+nr = 80
+abi = "common"
+name = "chdir"
+entry = "sys_chdir"
+
+[[syscall]]
+nr = 81
+abi = "common"
+name = "fchdir"
+entry = "sys_fchdir"
+
+[[syscall]]
+nr = 82
+abi = "common"
+name = "rename"
+entry = "sys_rename"
+
+[[syscall]]
+nr = 83
+abi = "common"
+name = "mkdir"
+entry = "sys_mkdir"
+
+[[syscall]]
+nr = 84
+abi = "common"
+name = "rmdir"
+entry = "sys_rmdir"
+
+[[syscall]]
+nr = 85
+abi = "common"
+name = "creat"
+entry = "sys_creat"
+
+[[syscall]]
+nr = 86
+abi = "common"
+name = "link"
+entry = "sys_link"
+
+[[syscall]]
+nr = 87
+abi = "common"
+name = "unlink"
+entry = "sys_unlink"
+
+[[syscall]]
+nr = 88
+abi = "common"
+name = "symlink"
+entry = "sys_symlink"
+
+[[syscall]]
+nr = 89
+abi = "common"
+name = "readlink"
+entry = "sys_readlink"
+
+[[syscall]]
+nr = 90
+abi = "common"
+name = "chmod"
+entry = "sys_chmod"
+
+[[syscall]]
+nr = 91
+abi = "common"
+name = "fchmod"
+entry = "sys_fchmod"
+
+[[syscall]]
+nr = 92
+abi = "common"
+name = "chown"
+entry = "sys_chown"
+
+[[syscall]]
+nr = 93
+abi = "common"
+name = "fchown"
+entry = "sys_fchown"
+
+[[syscall]]
+nr = 94
+abi = "common"
+name = "lchown"
+entry = "sys_lchown"
+
+[[syscall]]
+nr = 95
+abi = "common"
+name = "umask"
+entry = "sys_umask"
+
+[[syscall]]
+nr = 96
+abi = "common"
+name = "gettimeofday"
+entry = "sys_gettimeofday"
+
+[[syscall]]
+nr = 97
+abi = "common"
+name = "getrlimit"
+entry = "sys_getrlimit"
+
+[[syscall]]
+nr = 98
+abi = "common"
+name = "getrusage"
+entry = "sys_getrusage"
+
+[[syscall]]
+nr = 99
+abi = "common"
+name = "sysinfo"
+entry = "sys_sysinfo"
+
+[[syscall]]
+nr = 100
+abi = "common"
+name = "times"
+entry = "sys_times"
+
+[[syscall]]
+nr = 101
+abi = "64"
+name = "ptrace"
+entry = "sys_ptrace"
+
+[[syscall]]
+nr = 102
+abi = "common"
+name = "getuid"
+entry = "sys_getuid"
+
+[[syscall]]
+nr = 103
+abi = "common"
+name = "syslog"
+entry = "sys_syslog"
+
+[[syscall]]
+nr = 104
+abi = "common"
+name = "getgid"
+entry = "sys_getgid"
+
+[[syscall]]
+nr = 105
+abi = "common"
+name = "setuid"
+entry = "sys_setuid"
+
+[[syscall]]
+nr = 106
+abi = "common"
+name = "setgid"
+entry = "sys_setgid"
+
+[[syscall]]
+nr = 107
+abi = "common"
+name = "geteuid"
+entry = "sys_geteuid"
+
+[[syscall]]
+nr = 108
+abi = "common"
+name = "getegid"
+entry = "sys_getegid"
+
+[[syscall]]
+nr = 109
+abi = "common"
+name = "setpgid"
+entry = "sys_setpgid"
+
+[[syscall]]
+nr = 110
+abi = "common"
+name = "getppid"
+entry = "sys_getppid"
+
+[[syscall]]
+nr = 111
+abi = "common"
+name = "getpgrp"
+entry = "sys_getpgrp"
+
+[[syscall]]
+nr = 112
+abi = "common"
+name = "setsid"
+entry = "sys_setsid"
+
+[[syscall]]
+nr = 113
+abi = "common"
+name = "setreuid"
+entry = "sys_setreuid"
+
+[[syscall]]
+nr = 114
+abi = "common"
+name = "setregid"
+entry = "sys_setregid"
+
+[[syscall]]
+nr = 115
+abi = "common"
+name = "getgroups"
+entry = "sys_getgroups"
+
+[[syscall]]
+nr = 116
+abi = "common"
+name = "setgroups"
+entry = "sys_setgroups"
+
+[[syscall]]
+nr = 117
+abi = "common"
+name = "setresuid"
+entry = "sys_setresuid"
+
+[[syscall]]
+nr = 118
+abi = "common"
+name = "getresuid"
+entry = "sys_getresuid"
+
+[[syscall]]
+nr = 119
+abi = "common"
+name = "setresgid"
+entry = "sys_setresgid"
+
+[[syscall]]
+nr = 120
+abi = "common"
+name = "getresgid"
+entry = "sys_getresgid"
+
+[[syscall]]
+nr = 121
+abi = "common"
+name = "getpgid"
+entry = "sys_getpgid"
+
+[[syscall]]
+nr = 122
+abi = "common"
+name = "setfsuid"
+entry = "sys_setfsuid"
+
+[[syscall]]
+nr = 123
+abi = "common"
+name = "setfsgid"
+entry = "sys_setfsgid"
+
+[[syscall]]
+nr = 124
+abi = "common"
+name = "getsid"
+entry = "sys_getsid"
+
+[[syscall]]
+nr = 125
+abi = "common"
+name = "capget"
+entry = "sys_capget"
+
+[[syscall]]
+nr = 126
+abi = "common"
+name = "capset"
+entry = "sys_capset"
+
+[[syscall]]
+nr = 127
+abi = "64"
+name = "rt_sigpending"
+entry = "sys_rt_sigpending"
+
+[[syscall]]
+nr = 128
+abi = "64"
+name = "rt_sigtimedwait"
+entry = "sys_rt_sigtimedwait"
+
+[[syscall]]
+nr = 129
+abi = "64"
+name = "rt_sigqueueinfo"
+entry = "sys_rt_sigqueueinfo"
+
+[[syscall]]
+nr = 130
+abi = "common"
+name = "rt_sigsuspend"
+entry = "sys_rt_sigsuspend"
+
+[[syscall]]
+nr = 131
+abi = "64"
+name = "sigaltstack"
+entry = "sys_sigaltstack"
+
+[[syscall]]
+nr = 132
+abi = "common"
+name = "utime"
+entry = "sys_utime"
+
+[[syscall]]
+nr = 133
+abi = "common"
+name = "mknod"
+entry = "sys_mknod"
+
+[[syscall]]
+nr = 134
+abi = "64"
+name = "uselib"
+
+[[syscall]]
+nr = 135
+abi = "common"
+name = "personality"
+entry = "sys_personality"
+
+[[syscall]]
+nr = 136
+abi = "common"
+name = "ustat"
+entry = "sys_ustat"
+
+[[syscall]]
+nr = 137
+abi = "common"
+name = "statfs"
+entry = "sys_statfs"
+
+[[syscall]]
+nr = 138
+abi = "common"
+name = "fstatfs"
+entry = "sys_fstatfs"
+
+[[syscall]]
+nr = 139
+abi = "common"
+name = "sysfs"
+entry = "sys_sysfs"
+
+[[syscall]]
+nr = 140
+abi = "common"
+name = "getpriority"
+entry = "sys_getpriority"
+
+[[syscall]]
+nr = 141
+abi = "common"
+name = "setpriority"
+entry = "sys_setpriority"
+
+[[syscall]]
+nr = 142
+abi = "common"
+name = "sched_setparam"
+entry = "sys_sched_setparam"
+
+[[syscall]]
+nr = 143
+abi = "common"
+name = "sched_getparam"
+entry = "sys_sched_getparam"
+
+[[syscall]]
+nr = 144
+abi = "common"
+name = "sched_setscheduler"
+entry = "sys_sched_setscheduler"
+
+[[syscall]]
+nr = 145
+abi = "common"
+name = "sched_getscheduler"
+entry = "sys_sched_getscheduler"
+
+[[syscall]]
+nr = 146
+abi = "common"
+name = "sched_get_priority_max"
+entry = "sys_sched_get_priority_max"
+
+[[syscall]]
+nr = 147
+abi = "common"
+name = "sched_get_priority_min"
+entry = "sys_sched_get_priority_min"
+
+[[syscall]]
+nr = 148
+abi = "common"
+name = "sched_rr_get_interval"
+entry = "sys_sched_rr_get_interval"
+
+[[syscall]]
+nr = 149
+abi = "common"
+name = "mlock"
+entry = "sys_mlock"
+
+[[syscall]]
+nr = 150
+abi = "common"
+name = "munlock"
+entry = "sys_munlock"
+
+[[syscall]]
+nr = 151
+abi = "common"
+name = "mlockall"
+entry = "sys_mlockall"
+
+[[syscall]]
+nr = 152
+abi = "common"
+name = "munlockall"
+entry = "sys_munlockall"
+
+[[syscall]]
+nr = 153
+abi = "common"
+name = "vhangup"
+entry = "sys_vhangup"
+
+[[syscall]]
+nr = 154
+abi = "common"
+name = "modify_ldt"
+entry = "sys_modify_ldt"
+
+[[syscall]]
+nr = 155
+abi = "common"
+name = "pivot_root"
+entry = "sys_pivot_root"
+
+[[syscall]]
+nr = 156
+abi = "64"
+name = "_sysctl"
+entry = "sys_ni_syscall"
+
+[[syscall]]
+nr = 157
+abi = "common"
+name = "prctl"
+entry = "sys_prctl"
+
+[[syscall]]
+nr = 158
+abi = "common"
+name = "arch_prctl"
+entry = "sys_arch_prctl"
+
+[[syscall]]
+nr = 159
+abi = "common"
+name = "adjtimex"
+entry = "sys_adjtimex"
+
+[[syscall]]
+nr = 160
+abi = "common"
+name = "setrlimit"
+entry = "sys_setrlimit"
+
+[[syscall]]
+nr = 161
+abi = "common"
+name = "chroot"
+entry = "sys_chroot"
+
+[[syscall]]
+nr = 162
+abi = "common"
+name = "sync"
+entry = "sys_sync"
+
+[[syscall]]
+nr = 163
+abi = "common"
+name = "acct"
+entry = "sys_acct"
+
+[[syscall]]
+nr = 164
+abi = "common"
+name = "settimeofday"
+entry = "sys_settimeofday"
+
+[[syscall]]
+nr = 165
+abi = "common"
+name = "mount"
+entry = "sys_mount"
+
+[[syscall]]
+nr = 166
+abi = "common"
+name = "umount2"
+entry = "sys_umount"
+
+[[syscall]]
+nr = 167
+abi = "common"
+name = "swapon"
+entry = "sys_swapon"
+
+[[syscall]]
+nr = 168
+abi = "common"
+name = "swapoff"
+entry = "sys_swapoff"
+
+[[syscall]]
+nr = 169
+abi = "common"
+name = "reboot"
+entry = "sys_reboot"
+
+[[syscall]]
+nr = 170
+abi = "common"
+name = "sethostname"
+entry = "sys_sethostname"
+
+[[syscall]]
+nr = 171
+abi = "common"
+name = "setdomainname"
+entry = "sys_setdomainname"
+
+[[syscall]]
+nr = 172
+abi = "common"
+name = "iopl"
+entry = "sys_iopl"
+
+[[syscall]]
+nr = 173
+abi = "common"
+name = "ioperm"
+entry = "sys_ioperm"
+
+[[syscall]]
+nr = 174
+abi = "64"
+name = "create_module"
+
+[[syscall]]
+nr = 175
+abi = "common"
+name = "init_module"
+entry = "sys_init_module"
+
+[[syscall]]
+nr = 176
+abi = "common"
+name = "delete_module"
+entry = "sys_delete_module"
+
+[[syscall]]
+nr = 177
+abi = "64"
+name = "get_kernel_syms"
+
+[[syscall]]
+nr = 178
+abi = "64"
+name = "query_module"
+
+[[syscall]]
+nr = 179
+abi = "common"
+name = "quotactl"
+entry = "sys_quotactl"
+
+[[syscall]]
+nr = 180
+abi = "64"
+name = "nfsservctl"
+
+[[syscall]]
+nr = 181
+abi = "common"
+name = "getpmsg"
+
+[[syscall]]
+nr = 182
+abi = "common"
+name = "putpmsg"
+
+[[syscall]]
+nr = 183
+abi = "common"
+name = "afs_syscall"
+
+[[syscall]]
+nr = 184
+abi = "common"
+name = "tuxcall"
+
+[[syscall]]
+nr = 185
+abi = "common"
+name = "security"
+
+[[syscall]]
+nr = 186
+abi = "common"
+name = "gettid"
+entry = "sys_gettid"
+
+[[syscall]]
+nr = 187
+abi = "common"
+name = "readahead"
+entry = "sys_readahead"
+
+[[syscall]]
+nr = 188
+abi = "common"
+name = "setxattr"
+entry = "sys_setxattr"
+
+[[syscall]]
+nr = 189
+abi = "common"
+name = "lsetxattr"
+entry = "sys_lsetxattr"
+
+[[syscall]]
+nr = 190
+abi = "common"
+name = "fsetxattr"
+entry = "sys_fsetxattr"
+
+[[syscall]]
+nr = 191
+abi = "common"
+name = "getxattr"
+entry = "sys_getxattr"
+
+[[syscall]]
+nr = 192
+abi = "common"
+name = "lgetxattr"
+entry = "sys_lgetxattr"
+
+[[syscall]]
+nr = 193
+abi = "common"
+name = "fgetxattr"
+entry = "sys_fgetxattr"
+
+[[syscall]]
+nr = 194
+abi = "common"
+name = "listxattr"
+entry = "sys_listxattr"
+
+[[syscall]]
+nr = 195
+abi = "common"
+name = "llistxattr"
+entry = "sys_llistxattr"
+
+[[syscall]]
+nr = 196
+abi = "common"
+name = "flistxattr"
+entry = "sys_flistxattr"
+
+[[syscall]]
+nr = 197
+abi = "common"
+name = "removexattr"
+entry = "sys_removexattr"
+
+[[syscall]]
+nr = 198
+abi = "common"
+name = "lremovexattr"
+entry = "sys_lremovexattr"
+
+[[syscall]]
+nr = 199
+abi = "common"
+name = "fremovexattr"
+entry = "sys_fremovexattr"
+
+[[syscall]]
+nr = 200
+abi = "common"
+name = "tkill"
+entry = "sys_tkill"
+
+[[syscall]]
+nr = 201
+abi = "common"
+name = "time"
+entry = "sys_time"
+
+[[syscall]]
+nr = 202
+abi = "common"
+name = "futex"
+entry = "sys_futex"
+
+[[syscall]]
+nr = 203
+abi = "common"
+name = "sched_setaffinity"
+entry = "sys_sched_setaffinity"
+
+[[syscall]]
+nr = 204
+abi = "common"
+name = "sched_getaffinity"
+entry = "sys_sched_getaffinity"
+
+[[syscall]]
+nr = 205
+abi = "64"
+name = "set_thread_area"
+
+[[syscall]]
+nr = 206
+abi = "64"
+name = "io_setup"
+entry = "sys_io_setup"
+
+[[syscall]]
+nr = 207
+abi = "common"
+name = "io_destroy"
+entry = "sys_io_destroy"
+
+[[syscall]]
+nr = 208
+abi = "common"
+name = "io_getevents"
+entry = "sys_io_getevents"
+
+[[syscall]]
+nr = 209
+abi = "64"
+name = "io_submit"
+entry = "sys_io_submit"
+
+[[syscall]]
+nr = 210
+abi = "common"
+name = "io_cancel"
+entry = "sys_io_cancel"
+
+[[syscall]]
+nr = 211
+abi = "64"
+name = "get_thread_area"
+
+[[syscall]]
+nr = 212
+abi = "common"
+name = "lookup_dcookie"
+
+[[syscall]]
+nr = 213
+abi = "common"
+name = "epoll_create"
+entry = "sys_epoll_create"
+
+[[syscall]]
+nr = 214
+abi = "64"
+name = "epoll_ctl_old"
+
+[[syscall]]
+nr = 215
+abi = "64"
+name = "epoll_wait_old"
+
+[[syscall]]
+nr = 216
+abi = "common"
+name = "remap_file_pages"
+entry = "sys_remap_file_pages"
+
+[[syscall]]
+nr = 217
+abi = "common"
+name = "getdents64"
+entry = "sys_getdents64"
+
+[[syscall]]
+nr = 218
+abi = "common"
+name = "set_tid_address"
+entry = "sys_set_tid_address"
+
+[[syscall]]
+nr = 219
+abi = "common"
+name = "restart_syscall"
+entry = "sys_restart_syscall"
+
+[[syscall]]
+nr = 220
+abi = "common"
+name = "semtimedop"
+entry = "sys_semtimedop"
+
+[[syscall]]
+nr = 221
+abi = "common"
+name = "fadvise64"
+entry = "sys_fadvise64"
+
+[[syscall]]
+nr = 222
+abi = "64"
+name = "timer_create"
+entry = "sys_timer_create"
+
+[[syscall]]
+nr = 223
+abi = "common"
+name = "timer_settime"
+entry = "sys_timer_settime"
+
+[[syscall]]
+nr = 224
+abi = "common"
+name = "timer_gettime"
+entry = "sys_timer_gettime"
+
+[[syscall]]
+nr = 225
+abi = "common"
+name = "timer_getoverrun"
+entry = "sys_timer_getoverrun"
+
+[[syscall]]
+nr = 226
+abi = "common"
+name = "timer_delete"
+entry = "sys_timer_delete"
+
+[[syscall]]
+nr = 227
+abi = "common"
+name = "clock_settime"
+entry = "sys_clock_settime"
+
+[[syscall]]
+nr = 228
+abi = "common"
+name = "clock_gettime"
+entry = "sys_clock_gettime"
+
+[[syscall]]
+nr = 229
+abi = "common"
+name = "clock_getres"
+entry = "sys_clock_getres"
+
+[[syscall]]
+nr = 230
+abi = "common"
+name = "clock_nanosleep"
+entry = "sys_clock_nanosleep"
+
+[[syscall]]
+nr = 231
+abi = "common"
+name = "exit_group"
+entry = "sys_exit_group"
+noreturn = true
+
+[[syscall]]
+nr = 232
+abi = "common"
+name = "epoll_wait"
+entry = "sys_epoll_wait"
+
+[[syscall]]
+nr = 233
+abi = "common"
+name = "epoll_ctl"
+entry = "sys_epoll_ctl"
+
+[[syscall]]
+nr = 234
+abi = "common"
+name = "tgkill"
+entry = "sys_tgkill"
+
+[[syscall]]
+nr = 235
+abi = "common"
+name = "utimes"
+entry = "sys_utimes"
+
+[[syscall]]
+nr = 236
+abi = "64"
+name = "vserver"
+
+[[syscall]]
+nr = 237
+abi = "common"
+name = "mbind"
+entry = "sys_mbind"
+
+[[syscall]]
+nr = 238
+abi = "common"
+name = "set_mempolicy"
+entry = "sys_set_mempolicy"
+
+[[syscall]]
+nr = 239
+abi = "common"
+name = "get_mempolicy"
+entry = "sys_get_mempolicy"
+
+[[syscall]]
+nr = 240
+abi = "common"
+name = "mq_open"
+entry = "sys_mq_open"
+
+[[syscall]]
+nr = 241
+abi = "common"
+name = "mq_unlink"
+entry = "sys_mq_unlink"
+
+[[syscall]]
+nr = 242
+abi = "common"
+name = "mq_timedsend"
+entry = "sys_mq_timedsend"
+
+[[syscall]]
+nr = 243
+abi = "common"
+name = "mq_timedreceive"
+entry = "sys_mq_timedreceive"
+
+[[syscall]]
+nr = 244
+abi = "64"
+name = "mq_notify"
+entry = "sys_mq_notify"
+
+[[syscall]]
+nr = 245
+abi = "common"
+name = "mq_getsetattr"
+entry = "sys_mq_getsetattr"
+
+[[syscall]]
+nr = 246
+abi = "64"
+name = "kexec_load"
+entry = "sys_kexec_load"
+
+[[syscall]]
+nr = 247
+abi = "64"
+name = "waitid"
+entry = "sys_waitid"
+
+[[syscall]]
+nr = 248
+abi = "common"
+name = "add_key"
+entry = "sys_add_key"
+
+[[syscall]]
+nr = 249
+abi = "common"
+name = "request_key"
+entry = "sys_request_key"
+
+[[syscall]]
+nr = 250
+abi = "common"
+name = "keyctl"
+entry = "sys_keyctl"
+
+[[syscall]]
+nr = 251
+abi = "common"
+name = "ioprio_set"
+entry = "sys_ioprio_set"
+
+[[syscall]]
+nr = 252
+abi = "common"
+name = "ioprio_get"
+entry = "sys_ioprio_get"
+
+[[syscall]]
+nr = 253
+abi = "common"
+name = "inotify_init"
+entry = "sys_inotify_init"
+
+[[syscall]]
+nr = 254
+abi = "common"
+name = "inotify_add_watch"
+entry = "sys_inotify_add_watch"
+
+[[syscall]]
+nr = 255
+abi = "common"
+name = "inotify_rm_watch"
+entry = "sys_inotify_rm_watch"
+
+[[syscall]]
+nr = 256
+abi = "common"
+name = "migrate_pages"
+entry = "sys_migrate_pages"
+
+[[syscall]]
+nr = 257
+abi = "common"
+name = "openat"
+entry = "sys_openat"
+
+[[syscall]]
+nr = 258
+abi = "common"
+name = "mkdirat"
+entry = "sys_mkdirat"
+
+[[syscall]]
+nr = 259
+abi = "common"
+name = "mknodat"
+entry = "sys_mknodat"
+
+[[syscall]]
+nr = 260
+abi = "common"
+name = "fchownat"
+entry = "sys_fchownat"
+
+[[syscall]]
+nr = 261
+abi = "common"
+name = "futimesat"
+entry = "sys_futimesat"
+
+[[syscall]]
+nr = 262
+abi = "common"
+name = "newfstatat"
+entry = "sys_newfstatat"
+
+[[syscall]]
+nr = 263
+abi = "common"
+name = "unlinkat"
+entry = "sys_unlinkat"
+
+[[syscall]]
+nr = 264
+abi = "common"
+name = "renameat"
+entry = "sys_renameat"
+
+[[syscall]]
+nr = 265
+abi = "common"
+name = "linkat"
+entry = "sys_linkat"
+
+[[syscall]]
+nr = 266
+abi = "common"
+name = "symlinkat"
+entry = "sys_symlinkat"
+
+[[syscall]]
+nr = 267
+abi = "common"
+name = "readlinkat"
+entry = "sys_readlinkat"
+
+[[syscall]]
+nr = 268
+abi = "common"
+name = "fchmodat"
+entry = "sys_fchmodat"
+
+[[syscall]]
+nr = 269
+abi = "common"
+name = "faccessat"
+entry = "sys_faccessat"
+
+[[syscall]]
+nr = 270
+abi = "common"
+name = "pselect6"
+entry = "sys_pselect6"
+
+[[syscall]]
+nr = 271
+abi = "common"
+name = "ppoll"
+entry = "sys_ppoll"
+
+[[syscall]]
+nr = 272
+abi = "common"
+name = "unshare"
+entry = "sys_unshare"
+
+[[syscall]]
+nr = 273
+abi = "64"
+name = "set_robust_list"
+entry = "sys_set_robust_list"
+
+[[syscall]]
+nr = 274
+abi = "64"
+name = "get_robust_list"
+entry = "sys_get_robust_list"
+
+[[syscall]]
+nr = 275
+abi = "common"
+name = "splice"
+entry = "sys_splice"
+
+[[syscall]]
+nr = 276
+abi = "common"
+name = "tee"
+entry = "sys_tee"
+
+[[syscall]]
+nr = 277
+abi = "common"
+name = "sync_file_range"
+entry = "sys_sync_file_range"
+
+[[syscall]]
+nr = 278
+abi = "64"
+name = "vmsplice"
+entry = "sys_vmsplice"
+
+[[syscall]]
+nr = 279
+abi = "64"
+name = "move_pages"
+entry = "sys_move_pages"
+
+[[syscall]]
+nr = 280
+abi = "common"
+name = "utimensat"
+entry = "sys_utimensat"
+
+[[syscall]]
+nr = 281
+abi = "common"
+name = "epoll_pwait"
+entry = "sys_epoll_pwait"
+
+[[syscall]]
+nr = 282
+abi = "common"
+name = "signalfd"
+entry = "sys_signalfd"
+
+[[syscall]]
+nr = 283
+abi = "common"
+name = "timerfd_create"
+entry = "sys_timerfd_create"
+
+[[syscall]]
+nr = 284
+abi = "common"
+name = "eventfd"
+entry = "sys_eventfd"
+
+[[syscall]]
+nr = 285
+abi = "common"
+name = "fallocate"
+entry = "sys_fallocate"
+
+[[syscall]]
+nr = 286
+abi = "common"
+name = "timerfd_settime"
+entry = "sys_timerfd_settime"
+
+[[syscall]]
+nr = 287
+abi = "common"
+name = "timerfd_gettime"
+entry = "sys_timerfd_gettime"
+
+[[syscall]]
+nr = 288
+abi = "common"
+name = "accept4"
+entry = "sys_accept4"
+
+[[syscall]]
+nr = 289
+abi = "common"
+name = "signalfd4"
+entry = "sys_signalfd4"
+
+[[syscall]]
+nr = 290
+abi = "common"
+name = "eventfd2"
+entry = "sys_eventfd2"
+
+[[syscall]]
+nr = 291
+abi = "common"
+name = "epoll_create1"
+entry = "sys_epoll_create1"
+
+[[syscall]]
+nr = 292
+abi = "common"
+name = "dup3"
+entry = "sys_dup3"
+
+[[syscall]]
+nr = 293
+abi = "common"
+name = "pipe2"
+entry = "sys_pipe2"
+
+[[syscall]]
+nr = 294
+abi = "common"
+name = "inotify_init1"
+entry = "sys_inotify_init1"
+
+[[syscall]]
+nr = 295
+abi = "64"
+name = "preadv"
+entry = "sys_preadv"
+
+[[syscall]]
+nr = 296
+abi = "64"
+name = "pwritev"
+entry = "sys_pwritev"
+
+[[syscall]]
+nr = 297
+abi = "64"
+name = "rt_tgsigqueueinfo"
+entry = "sys_rt_tgsigqueueinfo"
+
+[[syscall]]
+nr = 298
+abi = "common"
+name = "perf_event_open"
+entry = "sys_perf_event_open"
+
+[[syscall]]
+nr = 299
+abi = "64"
+name = "recvmmsg"
+entry = "sys_recvmmsg"
+
+[[syscall]]
+nr = 300
+abi = "common"
+name = "fanotify_init"
+entry = "sys_fanotify_init"
+
+[[syscall]]
+nr = 301
+abi = "common"
+name = "fanotify_mark"
+entry = "sys_fanotify_mark"
+
+[[syscall]]
+nr = 302
+abi = "common"
+name = "prlimit64"
+entry = "sys_prlimit64"
+
+[[syscall]]
+nr = 303
+abi = "common"
+name = "name_to_handle_at"
+entry = "sys_name_to_handle_at"
+
+[[syscall]]
+nr = 304
+abi = "common"
+name = "open_by_handle_at"
+entry = "sys_open_by_handle_at"
+
+[[syscall]]
+nr = 305
+abi = "common"
+name = "clock_adjtime"
+entry = "sys_clock_adjtime"
+
+[[syscall]]
+nr = 306
+abi = "common"
+name = "syncfs"
+entry = "sys_syncfs"
+
+[[syscall]]
+nr = 307
+abi = "64"
+name = "sendmmsg"
+entry = "sys_sendmmsg"
+
+[[syscall]]
+nr = 308
+abi = "common"
+name = "setns"
+entry = "sys_setns"
+
+[[syscall]]
+nr = 309
+abi = "common"
+name = "getcpu"
+entry = "sys_getcpu"
+
+[[syscall]]
+nr = 310
+abi = "64"
+name = "process_vm_readv"
+entry = "sys_process_vm_readv"
+
+[[syscall]]
+nr = 311
+abi = "64"
+name = "process_vm_writev"
+entry = "sys_process_vm_writev"
+
+[[syscall]]
+nr = 312
+abi = "common"
+name = "kcmp"
+entry = "sys_kcmp"
+
+[[syscall]]
+nr = 313
+abi = "common"
+name = "finit_module"
+entry = "sys_finit_module"
+
+[[syscall]]
+nr = 314
+abi = "common"
+name = "sched_setattr"
+entry = "sys_sched_setattr"
+
+[[syscall]]
+nr = 315
+abi = "common"
+name = "sched_getattr"
+entry = "sys_sched_getattr"
+
+[[syscall]]
+nr = 316
+abi = "common"
+name = "renameat2"
+entry = "sys_renameat2"
+
+[[syscall]]
+nr = 317
+abi = "common"
+name = "seccomp"
+entry = "sys_seccomp"
+
+[[syscall]]
+nr = 318
+abi = "common"
+name = "getrandom"
+entry = "sys_getrandom"
+
+[[syscall]]
+nr = 319
+abi = "common"
+name = "memfd_create"
+entry = "sys_memfd_create"
+
+[[syscall]]
+nr = 320
+abi = "common"
+name = "kexec_file_load"
+entry = "sys_kexec_file_load"
+
+[[syscall]]
+nr = 321
+abi = "common"
+name = "bpf"
+entry = "sys_bpf"
+
+[[syscall]]
+nr = 322
+abi = "64"
+name = "execveat"
+entry = "sys_execveat"
+
+[[syscall]]
+nr = 323
+abi = "common"
+name = "userfaultfd"
+entry = "sys_userfaultfd"
+
+[[syscall]]
+nr = 324
+abi = "common"
+name = "membarrier"
+entry = "sys_membarrier"
+
+[[syscall]]
+nr = 325
+abi = "common"
+name = "mlock2"
+entry = "sys_mlock2"
+
+[[syscall]]
+nr = 326
+abi = "common"
+name = "copy_file_range"
+entry = "sys_copy_file_range"
+
+[[syscall]]
+nr = 327
+abi = "64"
+name = "preadv2"
+entry = "sys_preadv2"
+
+[[syscall]]
+nr = 328
+abi = "64"
+name = "pwritev2"
+entry = "sys_pwritev2"
+
+[[syscall]]
+nr = 329
+abi = "common"
+name = "pkey_mprotect"
+entry = "sys_pkey_mprotect"
+
+[[syscall]]
+nr = 330
+abi = "common"
+name = "pkey_alloc"
+entry = "sys_pkey_alloc"
+
+[[syscall]]
+nr = 331
+abi = "common"
+name = "pkey_free"
+entry = "sys_pkey_free"
+
+[[syscall]]
+nr = 332
+abi = "common"
+name = "statx"
+entry = "sys_statx"
+
+[[syscall]]
+nr = 333
+abi = "common"
+name = "io_pgetevents"
+entry = "sys_io_pgetevents"
+
+[[syscall]]
+nr = 334
+abi = "common"
+name = "rseq"
+entry = "sys_rseq"
+
+[[syscall]]
+nr = 335
+abi = "common"
+name = "uretprobe"
+entry = "sys_uretprobe"
+
+[[syscall]]
+nr = 336
+abi = "common"
+name = "uprobe"
+entry = "sys_uprobe"
+
+[[syscall]]
+nr = 424
+abi = "common"
+name = "pidfd_send_signal"
+entry = "sys_pidfd_send_signal"
+
+[[syscall]]
+nr = 425
+abi = "common"
+name = "io_uring_setup"
+entry = "sys_io_uring_setup"
+
+[[syscall]]
+nr = 426
+abi = "common"
+name = "io_uring_enter"
+entry = "sys_io_uring_enter"
+
+[[syscall]]
+nr = 427
+abi = "common"
+name = "io_uring_register"
+entry = "sys_io_uring_register"
+
+[[syscall]]
+nr = 428
+abi = "common"
+name = "open_tree"
+entry = "sys_open_tree"
+
+[[syscall]]
+nr = 429
+abi = "common"
+name = "move_mount"
+entry = "sys_move_mount"
+
+[[syscall]]
+nr = 430
+abi = "common"
+name = "fsopen"
+entry = "sys_fsopen"
+
+[[syscall]]
+nr = 431
+abi = "common"
+name = "fsconfig"
+entry = "sys_fsconfig"
+
+[[syscall]]
+nr = 432
+abi = "common"
+name = "fsmount"
+entry = "sys_fsmount"
+
+[[syscall]]
+nr = 433
+abi = "common"
+name = "fspick"
+entry = "sys_fspick"
+
+[[syscall]]
+nr = 434
+abi = "common"
+name = "pidfd_open"
+entry = "sys_pidfd_open"
+
+[[syscall]]
+nr = 435
+abi = "common"
+name = "clone3"
+entry = "sys_clone3"
+
+[[syscall]]
+nr = 436
+abi = "common"
+name = "close_range"
+entry = "sys_close_range"
+
+[[syscall]]
+nr = 437
+abi = "common"
+name = "openat2"
+entry = "sys_openat2"
+
+[[syscall]]
+nr = 438
+abi = "common"
+name = "pidfd_getfd"
+entry = "sys_pidfd_getfd"
+
+[[syscall]]
+nr = 439
+abi = "common"
+name = "faccessat2"
+entry = "sys_faccessat2"
+
+[[syscall]]
+nr = 440
+abi = "common"
+name = "process_madvise"
+entry = "sys_process_madvise"
+
+[[syscall]]
+nr = 441
+abi = "common"
+name = "epoll_pwait2"
+entry = "sys_epoll_pwait2"
+
+[[syscall]]
+nr = 442
+abi = "common"
+name = "mount_setattr"
+entry = "sys_mount_setattr"
+
+[[syscall]]
+nr = 443
+abi = "common"
+name = "quotactl_fd"
+entry = "sys_quotactl_fd"
+
+[[syscall]]
+nr = 444
+abi = "common"
+name = "landlock_create_ruleset"
+entry = "sys_landlock_create_ruleset"
+
+[[syscall]]
+nr = 445
+abi = "common"
+name = "landlock_add_rule"
+entry = "sys_landlock_add_rule"
+
+[[syscall]]
+nr = 446
+abi = "common"
+name = "landlock_restrict_self"
+entry = "sys_landlock_restrict_self"
+
+[[syscall]]
+nr = 447
+abi = "common"
+name = "memfd_secret"
+entry = "sys_memfd_secret"
+
+[[syscall]]
+nr = 448
+abi = "common"
+name = "process_mrelease"
+entry = "sys_process_mrelease"
+
+[[syscall]]
+nr = 449
+abi = "common"
+name = "futex_waitv"
+entry = "sys_futex_waitv"
+
+[[syscall]]
+nr = 450
+abi = "common"
+name = "set_mempolicy_home_node"
+entry = "sys_set_mempolicy_home_node"
+
+[[syscall]]
+nr = 451
+abi = "common"
+name = "cachestat"
+entry = "sys_cachestat"
+
+[[syscall]]
+nr = 452
+abi = "common"
+name = "fchmodat2"
+entry = "sys_fchmodat2"
+
+[[syscall]]
+nr = 453
+abi = "common"
+name = "map_shadow_stack"
+entry = "sys_map_shadow_stack"
+
+[[syscall]]
+nr = 454
+abi = "common"
+name = "futex_wake"
+entry = "sys_futex_wake"
+
+[[syscall]]
+nr = 455
+abi = "common"
+name = "futex_wait"
+entry = "sys_futex_wait"
+
+[[syscall]]
+nr = 456
+abi = "common"
+name = "futex_requeue"
+entry = "sys_futex_requeue"
+
+[[syscall]]
+nr = 457
+abi = "common"
+name = "statmount"
+entry = "sys_statmount"
+
+[[syscall]]
+nr = 458
+abi = "common"
+name = "listmount"
+entry = "sys_listmount"
+
+[[syscall]]
+nr = 459
+abi = "common"
+name = "lsm_get_self_attr"
+entry = "sys_lsm_get_self_attr"
+
+[[syscall]]
+nr = 460
+abi = "common"
+name = "lsm_set_self_attr"
+entry = "sys_lsm_set_self_attr"
+
+[[syscall]]
+nr = 461
+abi = "common"
+name = "lsm_list_modules"
+entry = "sys_lsm_list_modules"
+
+[[syscall]]
+nr = 462
+abi = "common"
+name = "mseal"
+entry = "sys_mseal"
+
+[[syscall]]
+nr = 463
+abi = "common"
+name = "setxattrat"
+entry = "sys_setxattrat"
+
+[[syscall]]
+nr = 464
+abi = "common"
+name = "getxattrat"
+entry = "sys_getxattrat"
+
+[[syscall]]
+nr = 465
+abi = "common"
+name = "listxattrat"
+entry = "sys_listxattrat"
+
+[[syscall]]
+nr = 466
+abi = "common"
+name = "removexattrat"
+entry = "sys_removexattrat"
+
+[[syscall]]
+nr = 467
+abi = "common"
+name = "open_tree_attr"
+entry = "sys_open_tree_attr"
+
+[[syscall]]
+nr = 468
+abi = "common"
+name = "file_getattr"
+entry = "sys_file_getattr"
+
+[[syscall]]
+nr = 469
+abi = "common"
+name = "file_setattr"
+entry = "sys_file_setattr"
+
+[[syscall]]
+nr = 470
+abi = "common"
+name = "listns"
+entry = "sys_listns"
+
+[[syscall]]
+nr = 471
+abi = "common"
+name = "rseq_slice_yield"
+entry = "sys_rseq_slice_yield"
+
+[[syscall]]
+nr = 472
+abi = "common"
+name = "fchroot"
+entry = "sys_fchroot"
+
+[[syscall]]
+nr = 512
+abi = "x32"
+name = "rt_sigaction"
+entry = "compat_sys_rt_sigaction"
+
+[[syscall]]
+nr = 513
+abi = "x32"
+name = "rt_sigreturn"
+entry = "compat_sys_x32_rt_sigreturn"
+
+[[syscall]]
+nr = 514
+abi = "x32"
+name = "ioctl"
+entry = "compat_sys_ioctl"
+
+[[syscall]]
+nr = 515
+abi = "x32"
+name = "readv"
+entry = "sys_readv"
+
+[[syscall]]
+nr = 516
+abi = "x32"
+name = "writev"
+entry = "sys_writev"
+
+[[syscall]]
+nr = 517
+abi = "x32"
+name = "recvfrom"
+entry = "compat_sys_recvfrom"
+
+[[syscall]]
+nr = 518
+abi = "x32"
+name = "sendmsg"
+entry = "compat_sys_sendmsg"
+
+[[syscall]]
+nr = 519
+abi = "x32"
+name = "recvmsg"
+entry = "compat_sys_recvmsg"
+
+[[syscall]]
+nr = 520
+abi = "x32"
+name = "execve"
+entry = "compat_sys_execve"
+
+[[syscall]]
+nr = 521
+abi = "x32"
+name = "ptrace"
+entry = "compat_sys_ptrace"
+
+[[syscall]]
+nr = 522
+abi = "x32"
+name = "rt_sigpending"
+entry = "compat_sys_rt_sigpending"
+
+[[syscall]]
+nr = 523
+abi = "x32"
+name = "rt_sigtimedwait"
+entry = "compat_sys_rt_sigtimedwait_time64"
+
+[[syscall]]
+nr = 524
+abi = "x32"
+name = "rt_sigqueueinfo"
+entry = "compat_sys_rt_sigqueueinfo"
+
+[[syscall]]
+nr = 525
+abi = "x32"
+name = "sigaltstack"
+entry = "compat_sys_sigaltstack"
+
+[[syscall]]
+nr = 526
+abi = "x32"
+name = "timer_create"
+entry = "compat_sys_timer_create"
+
+[[syscall]]
+nr = 527
+abi = "x32"
+name = "mq_notify"
+entry = "compat_sys_mq_notify"
+
+[[syscall]]
+nr = 528
+abi = "x32"
+name = "kexec_load"
+entry = "compat_sys_kexec_load"
+
+[[syscall]]
+nr = 529
+abi = "x32"
+name = "waitid"
+entry = "compat_sys_waitid"
+
+[[syscall]]
+nr = 530
+abi = "x32"
+name = "set_robust_list"
+entry = "compat_sys_set_robust_list"
+
+[[syscall]]
+nr = 531
+abi = "x32"
+name = "get_robust_list"
+entry = "compat_sys_get_robust_list"
+
+[[syscall]]
+nr = 532
+abi = "x32"
+name = "vmsplice"
+entry = "sys_vmsplice"
+
+[[syscall]]
+nr = 533
+abi = "x32"
+name = "move_pages"
+entry = "sys_move_pages"
+
+[[syscall]]
+nr = 534
+abi = "x32"
+name = "preadv"
+entry = "compat_sys_preadv64"
+
+[[syscall]]
+nr = 535
+abi = "x32"
+name = "pwritev"
+entry = "compat_sys_pwritev64"
+
+[[syscall]]
+nr = 536
+abi = "x32"
+name = "rt_tgsigqueueinfo"
+entry = "compat_sys_rt_tgsigqueueinfo"
+
+[[syscall]]
+nr = 537
+abi = "x32"
+name = "recvmmsg"
+entry = "compat_sys_recvmmsg_time64"
+
+[[syscall]]
+nr = 538
+abi = "x32"
+name = "sendmmsg"
+entry = "compat_sys_sendmmsg"
+
+[[syscall]]
+nr = 539
+abi = "x32"
+name = "process_vm_readv"
+entry = "sys_process_vm_readv"
+
+[[syscall]]
+nr = 540
+abi = "x32"
+name = "process_vm_writev"
+entry = "sys_process_vm_writev"
+
+[[syscall]]
+nr = 541
+abi = "x32"
+name = "setsockopt"
+entry = "sys_setsockopt"
+
+[[syscall]]
+nr = 542
+abi = "x32"
+name = "getsockopt"
+entry = "sys_getsockopt"
+
+[[syscall]]
+nr = 543
+abi = "x32"
+name = "io_setup"
+entry = "compat_sys_io_setup"
+
+[[syscall]]
+nr = 544
+abi = "x32"
+name = "io_submit"
+entry = "compat_sys_io_submit"
+
+[[syscall]]
+nr = 545
+abi = "x32"
+name = "execveat"
+entry = "compat_sys_execveat"
+
+[[syscall]]
+nr = 546
+abi = "x32"
+name = "preadv2"
+entry = "compat_sys_preadv64v2"
+
+[[syscall]]
+nr = 547
+abi = "x32"
+name = "pwritev2"
+entry = "compat_sys_pwritev64v2"

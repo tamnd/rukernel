@@ -146,6 +146,34 @@ jobs:
       - name: boot tests
         run: cargo xtask boot-test
 
+  # rk-abigen reads the pinned Linux tree and writes abi/ and core/rk-abi/src/generated/. This job
+  # runs it again and fails if the output is not the same as the files in the tree, per
+  # spec/04-abi-surface.md section 4.3. The tarball is in the cache, and its SHA-256 is checked
+  # each time.
+  abi:
+    name: generated abi
+    needs: quick
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: abi
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/rk-abigen/*.tar.xz
+          key: rk-abigen-${{ hashFiles('tools/rk-abigen/src/main.rs') }}
+          restore-keys: rk-abigen-
+      - name: cargo xtask abi
+        run: cargo xtask abi
+
   docs:
     name: documentation
     needs: quick
@@ -201,7 +229,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, targets, boot, docs, deny, typos]
+    needs: [quick, test, targets, boot, abi, docs, deny, typos]
     runs-on: ubuntu-24.04
     permissions: {}
     steps:
