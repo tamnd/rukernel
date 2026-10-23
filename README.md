@@ -69,6 +69,8 @@ QEMU loads the ELF image directly through the PVH entry note. The build also wri
 | `core/rk-lib/` | Safe helpers that all kernel crates use |
 | `core/rk-sched/` | The scheduler: a round robin queue in R1 |
 | `core/rk-mm/` | The memory manager: areas, page faults, copy on write, `mmap` and `brk` |
+| `fs/rk-vfs/` | The virtual file system: inodes, dentries, mounts, path walks, open files and the cpio reader |
+| `fs/rk-fs-tmpfs/` | tmpfs, the file system in memory that holds the initramfs |
 | `xtask/` | The build checks |
 
 [`spec/23-package-layout.md`](spec/23-package-layout.md) gives the full crate tree. The crates come into the tree as the milestones need them.

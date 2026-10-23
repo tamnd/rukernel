@@ -16,6 +16,8 @@ extern crate alloc;
 #[cfg(target_os = "none")]
 mod kernel;
 #[cfg(target_os = "none")]
+mod rootfs;
+#[cfg(target_os = "none")]
 mod selftest;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod syscall;

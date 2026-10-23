@@ -156,6 +156,58 @@ rk_efi_entry:                       # RCX: the image handle, RDX: the system tab
     jmp 2b
 3:
 
+    # The initramfs, from the LoadFile2 protocol on the initrd media device path, as the EFI stub
+    # of Linux gets it. QEMU writes the address of its own copy in the setup header, but the
+    # firmware can use that memory, so the stub clears the fields first.
+    movq $0, 0x218(%r15)            # ramdisk_image and ramdisk_size
+    leaq rk_efi_initrd_path(%rip), %rax
+    movq %rax, 0x58(%rsp)
+    leaq rk_efi_load_file2_guid(%rip), %rcx
+    leaq 0x58(%rsp), %rdx
+    leaq 0x60(%rsp), %r8
+    call *0xb8(%r14)                # LocateDevicePath
+    testq %rax, %rax
+    jnz 8f
+    movq 0x60(%rsp), %rcx
+    leaq rk_efi_load_file2_guid(%rip), %rdx
+    leaq 0x28(%rsp), %r8
+    call *0x98(%r14)                # HandleProtocol
+    testq %rax, %rax
+    jnz 8f
+    movq $0, 0x38(%rsp)             # ask for the size
+    movq 0x28(%rsp), %rcx
+    movq 0x58(%rsp), %rdx
+    xorl %r8d, %r8d
+    leaq 0x38(%rsp), %r9
+    movq $0, 0x20(%rsp)
+    call *(%rcx)                    # LoadFile
+    movq 0x38(%rsp), %rbp
+    testq %rbp, %rbp
+    jz 8f
+    movq $0x7fffffff, 0x30(%rsp)    # initrd_addr_max of the setup header
+    movl $1, %ecx                   # AllocateMaxAddress
+    movl $2, %edx                   # EfiLoaderData
+    leaq 0xfff(%rbp), %r8
+    shrq $12, %r8
+    leaq 0x30(%rsp), %r9
+    call *0x28(%r14)                # AllocatePages
+    testq %rax, %rax
+    jnz 8f
+    movq 0x28(%rsp), %rcx
+    movq 0x58(%rsp), %rdx
+    xorl %r8d, %r8d
+    leaq 0x38(%rsp), %r9
+    movq 0x30(%rsp), %rax
+    movq %rax, 0x20(%rsp)
+    call *(%rcx)                    # LoadFile
+    testq %rax, %rax
+    jnz 8f
+    movq 0x30(%rsp), %rax
+    movl %eax, 0x218(%r15)          # ramdisk_image
+    movq 0x38(%rsp), %rax
+    movl %eax, 0x21c(%r15)          # ramdisk_size
+8:
+
     leaq rk_efi_acpi20_guid(%rip), %rdi # the ACPI RSDP, from the configuration table
     call rk_efi_find_table
     testq %rax, %rax
@@ -250,6 +302,18 @@ rk_efi_acpi10_guid:                 # eb9d2d30-2d88-11d3-9a16-0090273fc14d
     .long 0xeb9d2d30
     .word 0x2d88, 0x11d3
     .byte 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d
+rk_efi_load_file2_guid:             # 4006c0c1-fcb3-403e-996d-4a6c8724e06d
+    .long 0x4006c0c1
+    .word 0xfcb3, 0x403e
+    .byte 0x99, 0x6d, 0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d
+rk_efi_initrd_path:                 # a vendor media node and the end node
+    .byte 4, 3
+    .word 20
+    .long 0x5568e427                # LINUX_EFI_INITRD_MEDIA_GUID
+    .word 0x68fc, 0x4f3d
+    .byte 0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68
+    .byte 0x7f, 0xff
+    .word 4
 
     .section .boot.text, "ax"
     .code32

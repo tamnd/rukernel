@@ -20,6 +20,7 @@ pub(crate) fn run(name: &str) -> bool {
         "mm" => mm_test(),
         "heap" => heap_test(),
         "timer" => timer_test(),
+        "initramfs" => initramfs_test(),
         #[cfg(target_arch = "x86_64")]
         "syscall" => syscall_test(),
         #[cfg(target_arch = "x86_64")]
@@ -701,5 +702,37 @@ fn fault_test() -> bool {
         space.write(DATA + 4000, b"hello\0").is_ok()
             && space.read_cstr(DATA + 4000, 64).as_deref() == Ok(&b"hello"[..]),
     );
+    ok
+}
+
+/// The content of /etc/motd in the initramfs that `cargo xtask boot-test` makes.
+const MOTD: &[u8] = b"rukernel initramfs\n";
+
+/// Reads the initramfs that `cargo xtask boot-test` makes: a file, a symbolic link, a hard link
+/// and a directory entry list.
+fn initramfs_test() -> bool {
+    let Some(fs) = crate::rootfs::context() else {
+        return check("the root file system is there", false);
+    };
+    let read = |path: &[u8]| -> Option<alloc::vec::Vec<u8>> {
+        let at = fs.resolve(fs.root(), path, true).ok()?;
+        rk_vfs::file::read_all(at.inode()).ok()
+    };
+    let mut ok =
+        check("/etc/motd has the correct content", read(b"/etc/motd").as_deref() == Some(MOTD));
+    ok &= check("/motd follows the symbolic link", read(b"/motd").as_deref() == Some(MOTD));
+    ok &= check(
+        "/etc/motd.link is a hard link",
+        fs.resolve(fs.root(), b"/etc/motd.link", false)
+            .map(|at| at.inode().metadata())
+            .is_ok_and(|m| m.nlink == 2),
+    );
+    ok &= check(
+        "/init is executable",
+        fs.resolve(fs.root(), b"/init", false)
+            .map(|at| at.inode().metadata())
+            .is_ok_and(|m| m.mode & 0o111 != 0),
+    );
+    ok &= check("/missing is not there", fs.resolve(fs.root(), b"/missing", true).is_err());
     ok
 }

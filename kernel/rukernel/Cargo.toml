@@ -18,8 +18,10 @@ bench = false
 [dependencies]
 rk-abi.workspace = true
 rk-frame.workspace = true
+rk-fs-tmpfs.workspace = true
 rk-mm.workspace = true
 rk-sched.workspace = true
+rk-vfs.workspace = true
 
 [lints]
 workspace = true
