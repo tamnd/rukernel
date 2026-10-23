@@ -294,6 +294,8 @@ pub fn exec(thread: &Thread, args: ExecArgs, random: [u8; 16]) -> Result<ExecIma
     let ctx = fs.lock().clone();
     let path = args.path.clone();
     let (space, image, _at) = build(&ctx, args, random)?;
+    // The new program is ready, so the exec cannot fail now. The other threads end first.
+    crate::process::kill_other_threads(thread);
     let space = Arc::new(space);
     space.activate();
     let old = process.replace_vm(space);

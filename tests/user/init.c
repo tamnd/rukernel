@@ -4,6 +4,7 @@
  * argument "tty", init also reads a line from the console and waits for ^C, which the boot test
  * types.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -11,7 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -348,6 +351,115 @@ static void test_pipes(void)
 	close(p[1]);
 }
 
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+static long counter, ready;
+static volatile sig_atomic_t usr1_tid;
+
+static void *add_many(void *arg)
+{
+	for (int i = 0; i < 2000; i++) {
+		pthread_mutex_lock(&lock);
+		long v = counter;
+		if (i % 100 == 0)
+			sched_yield();
+		counter = v + 1;
+		pthread_mutex_unlock(&lock);
+	}
+	return arg;
+}
+
+static void *wait_ready(void *arg)
+{
+	pthread_mutex_lock(&lock);
+	while (!ready)
+		pthread_cond_wait(&cond, &lock);
+	pthread_mutex_unlock(&lock);
+	return (void *)(long)gettid();
+}
+
+static void on_usr1(int sig)
+{
+	usr1_tid = gettid();
+}
+
+static void *wait_signal(void *arg)
+{
+	while (!usr1_tid)
+		sched_yield();
+	return NULL;
+}
+
+static void *spin(void *arg)
+{
+	for (;;)
+		sched_yield();
+	return NULL;
+}
+
+static void test_threads(void)
+{
+	pthread_t t[4];
+	void *ret;
+	for (long i = 0; i < 4; i++)
+		pthread_create(&t[i], NULL, add_many, (void *)i);
+	int joined = 1;
+	for (long i = 0; i < 4; i++)
+		joined &= pthread_join(t[i], &ret) == 0 && ret == (void *)i;
+	check("pthread_join gives the value of each thread", joined);
+	check("a mutex keeps the counter right", counter == 8000);
+
+	pthread_create(&t[0], NULL, wait_ready, NULL);
+	sched_yield();
+	pthread_mutex_lock(&lock);
+	ready = 1;
+	pthread_cond_signal(&cond);
+	pthread_mutex_unlock(&lock);
+	pthread_join(t[0], &ret);
+	check("a condition variable wakes a thread", ret != NULL && (long)ret != getpid());
+
+	signal(SIGUSR1, on_usr1);
+	pthread_create(&t[0], NULL, wait_signal, NULL);
+	pid_t tid = 0;
+	pthread_kill(t[0], SIGUSR1);
+	pthread_join(t[0], NULL);
+	tid = usr1_tid;
+	check("pthread_kill runs the handler in the thread", tid != 0 && tid != getpid());
+	signal(SIGUSR1, SIG_DFL);
+
+	int word = 1;
+	struct timespec ts = { 0, 20 * 1000 * 1000 };
+	check("futex wait with a different value", syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 0,
+							   NULL) == -1 && errno == EAGAIN);
+	check("futex wait with a timeout", syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 1, &ts) ==
+						   -1 && errno == ETIMEDOUT);
+	check("futex wake with no waiter", syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1) == 0);
+
+	pid_t pid = fork();
+	if (pid == 0) {
+		pthread_create(&t[0], NULL, spin, NULL);
+		sched_yield();
+		exit(3);
+	}
+	int status = 0;
+	check("exit ends each thread of the process", waitpid(pid, &status, 0) == pid &&
+							   WIFEXITED(status) && WEXITSTATUS(status) == 3);
+
+	pid = fork();
+	if (pid == 0) {
+		char *argv[] = { "/bin/hello", "arg", NULL };
+		char *envp[] = { NULL };
+		int out = open("/dev/null", O_WRONLY);
+		dup2(out, 1);
+		pthread_create(&t[0], NULL, spin, NULL);
+		sched_yield();
+		execve(argv[0], argv, envp);
+		_exit(99);
+	}
+	check("execve ends the other threads", waitpid(pid, &status, 0) == pid &&
+						     WIFEXITED(status) && WEXITSTATUS(status) == 7);
+}
+
 static void test_tty(void)
 {
 	char buf[64];
@@ -384,6 +496,7 @@ int main(int argc, char **argv)
 	test_time();
 	test_signals();
 	test_pipes();
+	test_threads();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
