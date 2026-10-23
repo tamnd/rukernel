@@ -1,0 +1,95 @@
+# rukernel
+
+rukernel is an operating system kernel in Rust. It has the same user interface as Linux 7.3. A program that runs on Linux runs on rukernel with no change. The target speed is the speed of Linux on the same machine.
+
+The project is at milestone R0. The design is complete and is in [`spec/`](spec/). The code is a skeleton. The kernel does not boot yet.
+
+## The goal
+
+The goal has five axes. Each axis has a number that a test can measure. [`spec/02-the-goal.md`](spec/02-the-goal.md) gives the gates.
+
+1. **ABI.** rukernel implements each system call, ioctl, netlink family, procfs file and sysfs file of Linux 7.3 that real programs use. A test runs each program on rukernel and on Linux in identical virtual machines and compares the results.
+2. **Speed.** Each benchmark class is within its gate of Linux 7.3 on the same machine. The gates are 5% to 10%, by class.
+3. **Foreign programs.** Windows programs run through unmodified Wine and Proton. macOS command line programs run through a Darwin user land.
+4. **Safety.** All `unsafe` code is in one crate, `rk-frame`, with a budget of 25,000 lines. All other crates forbid `unsafe` code. Verus proofs cover the core of `rk-frame`.
+5. **Upstream.** rukernel implements each new Linux release in 63 days or less.
+
+## The design
+
+- **Framekernel.** The kernel has one address space and one privilege level, as Linux has. Only `rk-frame` can contain `unsafe` code. The build fails if another crate contains `unsafe` code.
+- **The ABI is data.** A tool, `rk-abigen`, reads the Linux source tree and generates the system call tables, structure layouts, constants and ioctl numbers. No person types these values.
+- **Linux is the oracle.** The tests do not compare rukernel with a man page. They compare rukernel with a real Linux kernel. If Linux has a bug that programs see, rukernel has the same bug, and the register records it.
+- **No Linux modules.** rukernel does not load `.ko` files. All parts are built in. `modprobe` succeeds for each part that rukernel has.
+- **Stable Rust only.** The kernel builds with a stable Rust toolchain. The toolchain version is in [`rust-toolchain.toml`](rust-toolchain.toml).
+
+## The three repositories
+
+| Repository | Contents | License |
+|---|---|---|
+| [tamnd/rukernel](https://github.com/tamnd/rukernel) | The kernel, the ABI generator and the design | GPL-2.0-only |
+| [tamnd/rukernel-compat](https://github.com/tamnd/rukernel-compat) | The differential test harness, `rkc` | Apache-2.0 |
+| [tamnd/rukernel-bench](https://github.com/tamnd/rukernel-bench) | The benchmark harness, `rkb` | Apache-2.0 |
+
+## Build and test
+
+You need `rustup`. The toolchain file installs the correct Rust version and the three bare metal targets.
+
+```
+cargo xtask ci
+```
+
+This command runs the same checks as the CI gate. The cheapest checks run first.
+
+| Command | What it checks |
+|---|---|
+| `cargo xtask unsafe` | Each crate root has `#![forbid(unsafe_code)]`, except the crates in `xtask/unsafe-allowed.txt` |
+| `cargo xtask layers` | Each crate depends only on crates in its layer or a lower layer, as `xtask/layers.txt` gives |
+| `cargo xtask style` | The prose has no em dashes, no en dashes and no horizontal rules |
+| `cargo xtask targets` | The kernel crates build for `x86_64-unknown-none`, `aarch64-unknown-none` and `riscv64gc-unknown-none-elf` |
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `spec/` | The design, in 25 documents |
+| `frame/rk-frame/` | The only crate that can contain `unsafe` code |
+| `core/rk-abi/` | The typed Linux ABI: error numbers now, generated tables later |
+| `core/rk-lib/` | Safe helpers that all kernel crates use |
+| `xtask/` | The build checks |
+
+[`spec/23-package-layout.md`](spec/23-package-layout.md) gives the full crate tree. The crates come into the tree as the milestones need them.
+
+## Milestones
+
+Each milestone has an exit criterion that a script can check. Each milestone also stops at a useful point. [`spec/22-milestones.md`](spec/22-milestones.md) gives the details. Each milestone has a [tracking issue](https://github.com/tamnd/rukernel/issues?q=label%3Akind%2Fmilestone).
+
+| Milestone | Result |
+|---|---|
+| R0 | The skeleton. `rk-frame` boots on x86-64 under QEMU. The generated ABI exists. |
+| R1 | A static BusyBox boots to a shell. |
+| R2 | glibc programs run with dynamic linking. gdb and strace work. |
+| R3 | Debian boots from an ext4 disk. |
+| R4 | Memory, scheduling and networking at depth. arm64 is tier 1. |
+| R5 | Distributions boot with systemd. |
+| R6 | Containers, KVM and Windows programs. |
+| R7 | The BPF JIT, BTF, perf and tracing. |
+| R8 | Bare metal servers at Linux speed. riscv64 is tier 2. |
+| R9 | macOS command line programs. arm64 is at Linux speed. |
+| R10 | The desktop. This is 1.0. |
+| R11 | Primitives that Linux does not have, for Wine. |
+| R12 | Proofs for all of `rk-frame`. |
+
+## What rukernel is not
+
+- rukernel is not a Linux fork. It is not a translation of Linux from C to Rust. The code is new.
+- rukernel does not load Linux drivers. A `.ko` file uses the internal structures of one Linux build, and rukernel does not have them.
+- rukernel is not a Windows kernel or a macOS kernel. A program that needs a Windows kernel driver or a macOS kernel extension does not run.
+- rukernel does not ship Apple frameworks and does not load them.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems as [SECURITY.md](SECURITY.md) tells you.
+
+## License
+
+The kernel is under the GNU General Public License, version 2 only. Refer to [LICENSE](LICENSE). This is the license of Linux. Thus a developer can read the Linux source and use its algorithms in rukernel. The harness repositories are under the Apache License 2.0.

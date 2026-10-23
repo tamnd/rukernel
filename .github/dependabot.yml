@@ -1,0 +1,37 @@
+# Dependabot moves the pinned action SHAs and the Cargo dependencies once a week. The cooldown keeps
+# a new release out for seven days. Most malicious releases are found and removed in that time.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels: ["kind/chore", "area/build"]
+    commit-message:
+      prefix: "deps"
+    groups:
+      patch:
+        update-types: ["patch"]
+      minor:
+        update-types: ["minor"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    cooldown:
+      default-days: 7
+    labels: ["kind/chore", "area/build"]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]

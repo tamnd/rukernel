@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "frame/rk-frame",
+    "core/rk-abi",
+    "core/rk-lib",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98.0"
+license = "GPL-2.0-only"
+repository = "https://github.com/tamnd/rukernel"
+homepage = "https://github.com/tamnd/rukernel/tree/main/spec"
+authors = ["tamnd <tamnd87@gmail.com>"]
+publish = false
+
+# The crates of the kernel. Each crate uses `{ workspace = true }`, so that one line here sets the
+# path for all users.
+[workspace.dependencies]
+rk-frame = { path = "frame/rk-frame" }
+rk-abi = { path = "core/rk-abi" }
+rk-lib = { path = "core/rk-lib" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Each unsafe block in rk-frame tells why it is sound, per spec/03-architecture.md section 3.1.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+# A kernel cannot stop on an unexpected value. These lints find the places that can.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+debug = "line-tables-only"
+codegen-units = 1

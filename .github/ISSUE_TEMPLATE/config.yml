@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question about the design
+    url: https://github.com/tamnd/rukernel/discussions
+    about: The design is in spec/. If a part of it is wrong, start a discussion.
+  - name: Security report
+    url: https://github.com/tamnd/rukernel/security/advisories/new
+    about: Memory unsafety, privilege escalation or an information leak. Do not open a public issue.

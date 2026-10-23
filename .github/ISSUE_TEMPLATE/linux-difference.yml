@@ -1,0 +1,41 @@
+name: Difference from Linux
+description: A program gives a different result on rukernel and on Linux 7.3.
+labels: ["kind/compat"]
+body:
+  - type: markdown
+    attributes:
+      value: A difference from Linux is a bug, also if the Linux behavior looks wrong. Give the output of both kernels.
+  - type: textarea
+    id: program
+    attributes:
+      label: Program
+      description: Give the program, the command and the input. The smallest case is the most useful.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: linux
+    attributes:
+      label: Result on Linux
+      description: Give the output, the exit status and, if possible, the strace output.
+    validations:
+      required: true
+  - type: textarea
+    id: rukernel
+    attributes:
+      label: Result on rukernel
+      description: Give the output, the exit status and, if possible, the ktrace or strace output.
+    validations:
+      required: true
+  - type: input
+    id: linux-version
+    attributes:
+      label: Linux version
+      description: The output of `uname -r` on the reference kernel.
+    validations:
+      required: true
+  - type: input
+    id: rkc
+    attributes:
+      label: rkc command
+      description: If the rukernel-compat harness found the difference, give the command.

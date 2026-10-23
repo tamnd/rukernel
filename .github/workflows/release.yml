@@ -1,0 +1,81 @@
+# The release workflow. A signed tag `vX.Y.Z` on main starts it.
+#
+# The workflow runs the full gate again on the tag, makes a source archive, makes a build provenance
+# attestation for the archive, and publishes a GitHub release. Anybody can verify the archive with
+# `gh attestation verify rukernel-X.Y.Z.tar.gz --repo tamnd/rukernel`.
+#
+# The release job uses no cache. A cache that a pull request wrote must not go into a release.
+
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  gate:
+    name: full gate on the tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: the version in Cargo.toml agrees with the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$TAG" ]; then
+            echo "Cargo.toml has $version and the tag is $TAG"
+            exit 1
+          fi
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  publish:
+    name: archive, attest and publish
+    needs: gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: make the source archive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="rukernel-${TAG#v}"
+          git archive --format=tar --prefix="$name/" "$TAG" | gzip -n -9 > "$name.tar.gz"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cat "$name.tar.gz.sha256"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: rukernel-*.tar.gz
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" rukernel-*.tar.gz rukernel-*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "rukernel $TAG"

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+# The generated ABI tables are compared byte for byte with the output of rk-abigen.
+abi/** -diff linguist-generated
+*.bin binary

@@ -1,0 +1,47 @@
+name: Bug
+description: A crash, a hang, an oops or a wrong result in rukernel.
+labels: ["kind/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: If Linux 7.3 gives a different result for the same program, use the "Difference from Linux" form.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Give the result that you got. Attach the oops or the log.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: Give the smallest program or the smallest list of steps.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: rukernel version
+      description: The output of `uname -a` and `cat /sys/kernel/rukernel/version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      options: [x86-64, arm64, riscv64]
+    validations:
+      required: true
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: The virtual machine and its options, or the hardware.

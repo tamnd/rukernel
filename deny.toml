@@ -1,0 +1,39 @@
+# cargo-deny configuration. CI runs it for each commit.
+#
+# The kernel is GPL-2.0-only. GPL-2.0 cannot carry Apache-2.0 code. Thus Apache-2.0 is not in the
+# list. A crate under "MIT OR Apache-2.0" is correct, because we use it under MIT.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+# The crates of this workspace are GPL-2.0-only and are not published.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

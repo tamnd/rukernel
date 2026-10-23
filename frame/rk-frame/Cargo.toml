@@ -1,0 +1,13 @@
+[package]
+name = "rk-frame"
+description = "The trusted base of rukernel. The only crate that can contain unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

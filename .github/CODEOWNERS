@@ -1,0 +1,5 @@
+# The owner reviews each change to the trusted base and to the build policy.
+* @tamnd
+/frame/ @tamnd
+/xtask/unsafe-allowed.txt @tamnd
+/.github/ @tamnd

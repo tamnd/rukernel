@@ -1,0 +1,16 @@
+# Linux, hardware and tool names that the spelling check reads as mistakes.
+
+[files]
+extend-exclude = ["LICENSE"]
+
+[default.extend-words]
+AER = "AER"       # PCIe Advanced Error Reporting
+SME = "SME"       # AMD Secure Memory Encryption, Arm Scalable Matrix Extension
+SEH = "SEH"       # Windows structured exception handling
+HDA = "HDA"       # Intel High Definition Audio
+CNA = "CNA"       # CVE Numbering Authority
+RTO = "RTO"       # TCP retransmission timeout
+DEFIN = "DEFIN"   # BPF_CORE_TYPE_DEFINED and similar, split by the checker
+Veru = "Veru"     # VeruSAGE
+wrk = "wrk"       # the HTTP benchmark tool
+passt = "passt"   # the user mode network stack of Podman

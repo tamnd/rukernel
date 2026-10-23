@@ -1,0 +1,10 @@
+# The layer of each crate, per spec/23-package-layout.md section 23.2.
+#
+# A crate depends only on crates in its layer or a lower layer. A crate with the layer `tool` is
+# build tooling. It can depend on any crate, and no kernel crate can depend on it.
+# `cargo xtask layers` checks this file against the Cargo.toml of each crate.
+
+rk-frame  0
+rk-abi    0
+rk-lib    0
+xtask     tool

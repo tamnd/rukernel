@@ -1,0 +1,31 @@
+name: Performance
+description: rukernel is slower than Linux 7.3 on the same machine.
+labels: ["kind/perf"]
+body:
+  - type: textarea
+    id: benchmark
+    attributes:
+      label: Benchmark
+      description: Give the command. If the benchmark is in rukernel-bench, give the rkb command.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Results
+      description: Give the median of ten runs and the interquartile range for each kernel.
+    validations:
+      required: true
+  - type: textarea
+    id: machine
+    attributes:
+      label: Machine
+      description: Give the CPU, the memory, the microcode, the mitigations and the Linux configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: profile
+    attributes:
+      label: Profile
+      description: If you have a perf profile of both kernels, attach it.

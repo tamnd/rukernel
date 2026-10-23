@@ -1,0 +1,193 @@
+# The gate for each commit. Each job here must pass before a change merges.
+#
+# Each action is pinned to a full commit SHA. The version is in a comment. A tag can move and a SHA
+# cannot. Dependabot moves the SHAs once a week, and zizmor examines this file in security.yml.
+#
+# The runner images have explicit names, not `-latest`. Thus a new image is a commit, and a green
+# run does not change to red with no change in the tree.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# A new push cancels the run that it replaces. The default branch is not cancelled, because the
+# badge and the bisect history use the runs on main.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  # The cheapest checks run first. Thus a format mistake costs seconds and not a full matrix.
+  quick:
+    name: format, lints and house rules
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      # spec/03-architecture.md section 3.1. This is the most important check in the tree.
+      - name: unsafe rule
+        run: cargo xtask unsafe
+      - name: layer rule
+        run: cargo xtask layers
+      - name: prose rules
+        run: cargo xtask style
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets
+
+  test:
+    name: test on ${{ matrix.name }}
+    needs: quick
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86-64
+            os: ubuntu-24.04
+          - name: linux arm64
+            os: ubuntu-24.04-arm
+          - name: macos arm64
+            os: macos-26
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        if: runner.os == 'Linux'
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Each test binary runs after a failure. Thus a run shows all failures on a host, not only
+      # the first failure.
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
+
+  # The kernel crates are no_std and build for the bare metal targets of
+  # spec/15-boot-and-platform.md section 15.1. A crate that uses std by mistake fails here.
+  targets:
+    name: build for ${{ matrix.target }}
+    needs: quick
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-none
+          - aarch64-unknown-none
+          - riscv64gc-unknown-none-elf
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: cargo build, debug and release
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          crates=$(awk '!/^#/ && NF == 2 && $2 != "tool" { printf "-p %s ", $1 }' xtask/layers.txt)
+          # shellcheck disable=SC2086
+          cargo build --target "$TARGET" $crates
+          # shellcheck disable=SC2086
+          cargo build --target "$TARGET" --release $crates
+
+  docs:
+    name: documentation
+    needs: quick
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps
+
+  # The kernel is GPL-2.0-only. deny.toml gives the licenses that GPL-2.0 can carry. This job also
+  # examines the advisory database and the sources of each dependency.
+  deny:
+    name: licenses, advisories and sources
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  typos:
+    name: spelling
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+
+  # The ruleset on main requires one check with the name `ci`. This job is that check. Thus a new
+  # job in this file does not need a change to the ruleset.
+  ci:
+    name: ci
+    if: always()
+    needs: [quick, test, targets, docs, deny, typos]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: all jobs passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "a required job did not pass"
+              exit 1
+            fi
+          done
