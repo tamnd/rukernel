@@ -177,6 +177,42 @@ jobs:
       - name: cargo xtask abi
         run: cargo xtask abi
 
+  # L1 of rukernel-compat, per spec/18-rukernel-compat.md section 18.4. rkc builds the uAPI headers
+  # of the reference from its tarball and compares the generated ABI of this tree with them. It
+  # uses the output of the Linux build and clang as the oracle, not the method of rk-abigen.
+  l1:
+    name: rkc l1 against 7.3
+    needs: quick
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tamnd/rukernel-compat
+          path: compat
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: l1
+          workspaces: compat -> target
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/rkc/*.tar.xz
+          key: rkc-tarball-${{ hashFiles('compat/references/*.toml') }}
+          restore-keys: rkc-tarball-
+      - name: clang version
+        run: clang --version
+      - name: rkc l1
+        working-directory: compat
+        run: cargo run --quiet --bin rkc -- l1 --reference 7.3 --abi ../abi/7.3
+
   docs:
     name: documentation
     needs: quick
@@ -232,7 +268,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, targets, boot, abi, docs, deny, typos]
+    needs: [quick, test, targets, boot, abi, l1, docs, deny, typos]
     runs-on: ubuntu-24.04
     permissions: {}
     steps:

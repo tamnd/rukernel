@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- A CI job runs `rkc l1 --reference 7.3` of rukernel-compat on each pull request. It compares the generated ABI of each architecture with the uAPI headers that the Linux 7.3 build installs. The job is part of the `ci` check.
+
 ## [0.0.4] (2026-10-23)
 
 ### Added
