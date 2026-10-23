@@ -2,7 +2,7 @@
 
 rukernel is an operating system kernel in Rust. It has the same user interface as Linux 7.3. A program that runs on Linux runs on rukernel with no change. The target speed is the speed of Linux on the same machine.
 
-The project is at milestone R0. The design is complete and is in [`spec/`](spec/). The code is a skeleton. The kernel does not boot yet.
+The project is at milestone R0. The design is complete and is in [`spec/`](spec/). The kernel boots on x86-64 under QEMU through PVH and prints the memory map. It does not run programs yet.
 
 ## The goal
 
@@ -46,12 +46,24 @@ This command runs the same checks as the CI gate. The cheapest checks run first.
 | `cargo xtask layers` | Each crate depends only on crates in its layer or a lower layer, as `xtask/layers.txt` gives |
 | `cargo xtask style` | The prose has no em dashes, no en dashes and no horizontal rules |
 | `cargo xtask targets` | The kernel crates build for `x86_64-unknown-none`, `aarch64-unknown-none` and `riscv64gc-unknown-none-elf` |
+| `cargo xtask boot-test` | The kernel boots in QEMU on x86-64 and each self test passes |
+
+## Boot the kernel
+
+You need `qemu-system-x86_64`. This command builds the kernel and boots it in QEMU. The serial console is on the terminal. The arguments become the kernel command line.
+
+```
+cargo xtask qemu rk.test=boot
+```
+
+QEMU loads the ELF image directly through the PVH entry note. The Linux boot protocol and UEFI come later in R0.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | `spec/` | The design, in 25 documents |
+| `kernel/rukernel/` | The kernel binary and its linker script |
 | `frame/rk-frame/` | The only crate that can contain `unsafe` code |
 | `core/rk-abi/` | The typed Linux ABI: error numbers now, generated tables later |
 | `core/rk-lib/` | Safe helpers that all kernel crates use |
