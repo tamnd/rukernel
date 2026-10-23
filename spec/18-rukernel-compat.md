@@ -57,9 +57,9 @@ KUnit is deliberately not in the table. KUnit tests are kernel internal: they ca
 
 Compatibility is reported at five levels with their own denominators, because "passes 92% of LTP" and "boots Fedora" are claims about different things and one number cannot carry both.
 
-**L1, the static floor.** A static busybox and a static Go binary run as PID 1 and complete a scripted session: shell, `ps`, `mount`, `ip`, `wget` against the harness. Denominator: the scripted steps.
+**L1, the ABI floor.** `rkc l1` compares what `rk-abigen` generated (system call numbers, structure layouts, constants and ioctl numbers) with the headers and the BTF of the reference build, for each architecture. It needs no running guest, which is why it is the R0 gate. Denominator: entries in the inventory of document 04.
 
-**L2, the syscall level.** The gVisor syscall suite, LTP `syscalls`, and kselftest collections for the core (`clone3`, `pidfd`, `futex`, `rseq`, `mm`, `mount_setattr`, `filesystems`, `exec`, `timens`, `signal`, `seccomp`, `landlock`, `io_uring` via liburing's tests). Denominator: cases the reference passes. Reported per syscall family against the inventory from document 04, so a reader can see that `epoll` is at 100% and `fanotify` is at 40% rather than both being averaged into 85%.
+**L2, the syscall level.** It starts with the static floor: a static busybox and a static Go binary run as PID 1 and complete a scripted session (shell, `ps`, `mount`, `ip`, `wget` against the harness). Then the gVisor syscall suite, LTP `syscalls`, and kselftest collections for the core (`clone3`, `pidfd`, `futex`, `rseq`, `mm`, `mount_setattr`, `filesystems`, `exec`, `timens`, `signal`, `seccomp`, `landlock`, `io_uring` via liburing's tests). Denominator: cases the reference passes. Reported per syscall family against the inventory from document 04, so a reader can see that `epoll` is at 100% and `fanotify` is at 40% rather than both being averaged into 85%.
 
 **L3, the subsystem level.** fstests on ext4, xfs, btrfs, tmpfs and overlayfs; blktests; LTP `net`, `containers`, `controllers`, `mm`; the netlink and nftables selftests; the BPF selftests (`test_progs`, `test_verifier`). Denominator: cases the reference passes on the same configuration.
 
