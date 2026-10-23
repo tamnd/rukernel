@@ -4,12 +4,16 @@
 //! threads. A `Thread` runs in one kernel task. The parent of a process waits for it with `wait4`,
 //! and a process that ends stays as a zombie until its parent reaps it, as in Linux.
 
+use crate::signal::{
+    AltStack, CLD_EXITED, CLD_KILLED, NSIG, Pending, SIG_IGN, SigAction, SigInfo, SigSet,
+};
 use crate::wait::{WaitStatus, WaitTarget};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rk_abi::Errno;
+use rk_abi::native::signal::{SA_NOCLDWAIT, SIGCHLD, SIGKILL};
 use rk_frame::sync::SpinLock;
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
@@ -46,6 +50,32 @@ struct State {
     comm: Vec<u8>,
 }
 
+/// The signal state that the threads of a process share: the actions and the queue of the
+/// signals that any thread can take.
+struct SharedSignals {
+    actions: [SigAction; NSIG as usize],
+    pending: Pending,
+}
+
+/// The signal state of one thread.
+#[derive(Default)]
+struct ThreadSignals {
+    blocked: SigSet,
+    pending: Pending,
+    /// The mask that `rt_sigsuspend` replaced. The kernel puts it back after the delivery.
+    saved_mask: Option<SigSet>,
+    altstack: AltStack,
+}
+
+/// What the thread must do with the next signal that it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Run the handler of the action.
+    Handler(SigInfo, SigAction),
+    /// End the process with this status.
+    Fatal(WaitStatus),
+}
+
 /// A process: a thread group in the words of Linux.
 pub struct Process {
     pid: Pid,
@@ -55,6 +85,9 @@ pub struct Process {
     vm: SpinLock<Option<Arc<AddressSpace>>>,
     files: SpinLock<Option<SharedFiles>>,
     fs: SpinLock<Option<SharedFs>>,
+    signals: SpinLock<SharedSignals>,
+    /// The signal that the parent gets when the process ends, or 0.
+    exit_signal: u32,
 }
 
 impl core::fmt::Debug for Process {
@@ -73,6 +106,7 @@ pub struct Thread {
     clear_child_tid: AtomicUsize,
     /// The thread must stop at its next return to the kernel, because its group exits.
     killed: AtomicBool,
+    signals: SpinLock<ThreadSignals>,
 }
 
 impl core::fmt::Debug for Thread {
@@ -239,6 +273,41 @@ impl Process {
         &self.child_wait
     }
 
+    /// The action of `sig`.
+    pub fn action(&self, sig: u32) -> SigAction {
+        self.signals.lock().actions[sig as usize - 1]
+    }
+
+    /// Sets the action of `sig` and gives the old one, for `rt_sigaction`. If the new action
+    /// discards the signal, the pending instances go too, as POSIX tells.
+    pub fn set_action(&self, sig: u32, action: SigAction) -> SigAction {
+        let mut sigs = self.signals.lock();
+        let old = core::mem::replace(&mut sigs.actions[sig as usize - 1], action);
+        if action.ignores(sig) {
+            sigs.pending.discard(sig);
+            for t in self.threads() {
+                t.signals.lock().pending.discard(sig);
+            }
+        }
+        old
+    }
+
+    /// Sets each action that has a handler back to `SIG_DFL`, for `execve`. An ignored signal
+    /// stays ignored.
+    pub fn reset_actions(&self) {
+        for a in &mut self.signals.lock().actions {
+            if a.handler != SIG_IGN {
+                *a = SigAction::default();
+            }
+        }
+    }
+
+    /// The signal that the parent gets when the process ends, or 0.
+    pub fn exit_signal(&self) -> u32 {
+        self.exit_signal
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pid: Pid,
         parent: Weak<Process>,
@@ -248,6 +317,8 @@ impl Process {
         vm: Arc<AddressSpace>,
         files: SharedFiles,
         fs: SharedFs,
+        actions: [SigAction; NSIG as usize],
+        exit_signal: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
             pid,
@@ -265,6 +336,8 @@ impl Process {
             vm: SpinLock::new(Some(vm)),
             files: SpinLock::new(Some(files)),
             fs: SpinLock::new(Some(fs)),
+            signals: SpinLock::new(SharedSignals { actions, pending: Pending::new() }),
+            exit_signal,
         })
     }
 }
@@ -312,13 +385,110 @@ impl Thread {
         }
     }
 
-    fn new(tid: Pid, process: Arc<Process>) -> Arc<Self> {
+    /// Wakes the task of the thread, so that a wait sees a new signal.
+    fn wake(&self) {
+        if let Some(task) = self.task() {
+            task.wake();
+        }
+    }
+
+    /// The signals that the thread blocks.
+    pub fn blocked(&self) -> SigSet {
+        self.signals.lock().blocked
+    }
+
+    /// Sets the signals that the thread blocks. `SIGKILL` and `SIGSTOP` stay unblocked.
+    pub fn set_blocked(&self, set: SigSet) {
+        self.signals.lock().blocked = set.without(SigSet::UNBLOCKABLE);
+    }
+
+    /// Keeps `mask` to put back after the next delivery, for `rt_sigsuspend`.
+    pub fn set_saved_mask(&self, mask: SigSet) {
+        self.signals.lock().saved_mask = Some(mask);
+    }
+
+    /// Takes the mask that `rt_sigsuspend` replaced.
+    pub fn take_saved_mask(&self) -> Option<SigSet> {
+        self.signals.lock().saved_mask.take()
+    }
+
+    /// The pending signals of the thread and of its process.
+    pub fn pending(&self) -> SigSet {
+        let shared = self.process.signals.lock().pending.set();
+        SigSet(shared.0 | self.signals.lock().pending.set().0)
+    }
+
+    /// Tells if a wait must stop: the group exits, or a signal that is not blocked is pending.
+    pub fn signal_pending(&self) -> bool {
+        self.is_killed() || !self.pending().without(self.blocked()).is_empty()
+    }
+
+    /// The alternate signal stack.
+    pub fn altstack(&self) -> AltStack {
+        self.signals.lock().altstack
+    }
+
+    /// Sets the alternate signal stack.
+    pub fn set_altstack(&self, stack: AltStack) {
+        self.signals.lock().altstack = stack;
+    }
+
+    /// Takes the next signal that the thread does not block, first from its own queue and then
+    /// from the queue of the process. A signal that its action discards goes away. Gives `None`
+    /// if no signal is ready. For a handler with `SA_RESETHAND`, the action goes back to
+    /// `SIG_DFL`.
+    pub fn dequeue_signal(&self) -> Option<Delivery> {
+        loop {
+            let mut shared = self.process.signals.lock();
+            let mut own = self.signals.lock();
+            let blocked = own.blocked;
+            let info = own.pending.take(blocked).or_else(|| shared.pending.take(blocked))?;
+            let sig = info.signo;
+            let action = shared.actions[sig as usize - 1];
+            if action.ignores(sig) {
+                continue;
+            }
+            if action.is_fatal(sig) {
+                return Some(Delivery::Fatal(WaitStatus::signaled(sig, false)));
+            }
+            if action.flags & u64::from(rk_abi::native::signal::SA_RESETHAND) != 0 {
+                shared.actions[sig as usize - 1] = SigAction::default();
+            }
+            return Some(Delivery::Handler(info, action));
+        }
+    }
+
+    /// Sends a signal to this thread, for `tkill`, `tgkill` and the exceptions. See
+    /// `send_signal`.
+    pub fn send_signal(self: &Arc<Self>, info: SigInfo) {
+        deliver(&self.process, Some(self), info);
+    }
+
+    /// Sends a signal that an exception caused. The thread cannot block or ignore it: if it
+    /// does, the action goes back to `SIG_DFL` and the signal ends the process, as
+    /// `force_sig_info` of Linux does.
+    pub fn force_signal(self: &Arc<Self>, info: SigInfo) {
+        let sig = info.signo;
+        {
+            let mut shared = self.process.signals.lock();
+            let mut own = self.signals.lock();
+            let action = &mut shared.actions[sig as usize - 1];
+            if action.handler == SIG_IGN || own.blocked.contains(sig) {
+                *action = SigAction::default();
+                own.blocked.remove(sig);
+            }
+        }
+        self.send_signal(info);
+    }
+
+    fn new(tid: Pid, process: Arc<Process>, blocked: SigSet) -> Arc<Self> {
         Arc::new(Self {
             tid,
             process,
             task: SpinLock::new(Weak::new()),
             clear_child_tid: AtomicUsize::new(0),
             killed: AtomicBool::new(false),
+            signals: SpinLock::new(ThreadSignals { blocked, ..ThreadSignals::default() }),
         })
     }
 }
@@ -346,8 +516,10 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
         vm,
         files,
         Arc::new(SpinLock::new(fs)),
+        [SigAction::default(); NSIG as usize],
+        0,
     );
-    let thread = Thread::new(pid, process.clone());
+    let thread = Thread::new(pid, process.clone(), SigSet::EMPTY);
     process.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&process));
     table.threads.insert(pid, Arc::downgrade(&thread));
@@ -363,6 +535,8 @@ pub struct ForkShare {
     pub files: bool,
     /// `CLONE_FS`: the root, the current directory and the umask.
     pub fs: bool,
+    /// The signal that the parent gets when the child ends: the low byte of the `clone` flags.
+    pub exit_signal: u32,
 }
 
 /// Makes a child process of the process of `parent`, for `fork` and `clone` without
@@ -383,10 +557,22 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
         let s = pp.state.lock();
         (s.pgid, s.sid, s.comm.clone())
     };
+    let actions = pp.signals.lock().actions;
     let mut table = TABLE.lock();
     let pid = alloc_pid(&mut table)?;
-    let child = Process::new(pid, Arc::downgrade(pp), pgid, sid, comm, vm, files, fs);
-    let thread = Thread::new(pid, child.clone());
+    let child = Process::new(
+        pid,
+        Arc::downgrade(pp),
+        pgid,
+        sid,
+        comm,
+        vm,
+        files,
+        fs,
+        actions,
+        share.exit_signal,
+    );
+    let thread = Thread::new(pid, child.clone(), parent.blocked());
     child.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
@@ -405,7 +591,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     let process = thread.process.clone();
     let mut table = TABLE.lock();
     let tid = alloc_pid(&mut table)?;
-    let new = Thread::new(tid, process.clone());
+    let new = Thread::new(tid, process.clone(), thread.blocked());
     table.threads.insert(tid, Arc::downgrade(&new));
     drop(table);
     process.state.lock().threads.push(new.clone());
@@ -434,6 +620,83 @@ pub fn exit_group(thread: &Thread, status: WaitStatus) {
     for t in others {
         t.kill();
     }
+}
+
+/// Sends a signal to `process`, or to `thread` of that process if it is given.
+///
+/// An action that discards the signal discards it now. `SIGKILL`, and a signal that ends the
+/// process with a thread that does not block it, start the exit of the group at once. Each other
+/// signal goes in the queue, and a thread that does not block it wakes up.
+fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
+    let sig = info.signo;
+    if sig == 0 || sig > NSIG || process.is_zombie() || process.group_exit().is_some() {
+        return;
+    }
+    if sig == SIGKILL {
+        kill_group(process, WaitStatus::signaled(sig, false));
+        return;
+    }
+    let threads = match thread {
+        Some(t) => alloc::vec![t.clone()],
+        None => process.threads(),
+    };
+    let mut shared = process.signals.lock();
+    let action = shared.actions[sig as usize - 1];
+    let target = threads.iter().find(|t| !t.signals.lock().blocked.contains(sig)).cloned();
+    if action.ignores(sig) && target.is_some() {
+        return;
+    }
+    if action.is_fatal(sig) && target.is_some() {
+        drop(shared);
+        kill_group(process, WaitStatus::signaled(sig, false));
+        return;
+    }
+    match thread {
+        Some(t) => {
+            t.signals.lock().pending.push(info);
+        }
+        None => {
+            shared.pending.push(info);
+        }
+    }
+    drop(shared);
+    if let Some(t) = target {
+        t.wake();
+    }
+}
+
+/// Sends a signal to each thread of `process`, for `kill` and the signals of the terminal.
+pub fn send_signal(process: &Process, info: SigInfo) {
+    deliver(process, None, info);
+}
+
+/// Tells the parent of `process` that the process ended with `status`: it sends the exit signal,
+/// and gives `true` if the parent ignores `SIGCHLD` or has `SA_NOCLDWAIT`. The process is then
+/// reaped at once, as in Linux.
+fn notify_parent(process: &Process, parent: &Process, status: WaitStatus) -> bool {
+    let action = parent.action(SIGCHLD);
+    let mut sig = process.exit_signal;
+    let mut autoreap = false;
+    if sig == SIGCHLD {
+        if action.handler == SIG_IGN {
+            autoreap = true;
+            sig = 0;
+        } else if action.flags & u64::from(SA_NOCLDWAIT) != 0 {
+            autoreap = true;
+        }
+    }
+    if sig != 0 {
+        let mut info = SigInfo::new(sig, CLD_EXITED, process.pid);
+        match status.signal() {
+            Some(s) => {
+                info.code = CLD_KILLED;
+                info.status = s as i32;
+            }
+            None => info.status = status.exit_code().unwrap_or(0),
+        }
+        send_signal(parent, info);
+    }
+    autoreap
 }
 
 /// Starts the exit of each thread of `process` with `status`, for a fatal signal from another
@@ -490,6 +753,10 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     }
     match parent {
         Some(parent) => {
+            if notify_parent(&process, &parent, status) {
+                parent.state.lock().children.retain(|c| !Arc::ptr_eq(c, &process));
+                TABLE.lock().processes.remove(&process.pid);
+            }
             parent.child_wait.wake_all();
         }
         None if process.pid == INIT_PID => {

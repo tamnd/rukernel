@@ -1,4 +1,8 @@
 use crate::elf::{self, ElfType, SegmentFlags};
+use crate::signal::{
+    AltStack, CLD_EXITED, DefaultAction, Pending, SEGV_MAPERR, SI_USER, SIG_IGN, SS_DISABLE,
+    SS_ONSTACK, SigAction, SigInfo, SigSet, default_action,
+};
 use crate::stack::{self, StackArgs};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -152,4 +156,87 @@ fn initial_stack_limits() {
     let many = vec![vec![b'a'; 1000]; 3000];
     assert_eq!(stack::args_size(&many, &[]), Err(Errno::E2BIG));
     assert_eq!(stack::args_size(&[b"ab".to_vec()], &[b"c".to_vec()]), Ok(3 + 8 + 2 + 8));
+}
+
+#[test]
+fn sigset_next_gives_synchronous_signals_first() {
+    use rk_abi::native::signal::{SIGINT, SIGKILL, SIGSEGV, SIGTERM, SIGUSR1};
+    let mut set = SigSet::EMPTY;
+    assert_eq!(set.next(), None);
+    set.add(SIGTERM);
+    set.add(SIGUSR1);
+    assert_eq!(set.next(), Some(SIGUSR1));
+    set.add(SIGSEGV);
+    assert_eq!(set.next(), Some(SIGSEGV));
+    set.add(SIGINT);
+    assert_eq!(set.without(SigSet(SigSet::bit(SIGSEGV))).next(), Some(SIGINT));
+    assert!(SigSet::UNBLOCKABLE.contains(SIGKILL));
+    assert!(!set.contains(0) && !set.contains(65));
+}
+
+#[test]
+fn default_actions() {
+    use rk_abi::native::signal::{SIGCHLD, SIGCONT, SIGINT, SIGRTMIN, SIGSEGV, SIGTSTP};
+    assert_eq!(default_action(SIGINT), DefaultAction::Terminate);
+    assert_eq!(default_action(SIGSEGV), DefaultAction::CoreDump);
+    assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+    assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
+    assert_eq!(default_action(SIGTSTP), DefaultAction::Stop);
+    assert_eq!(default_action(SIGRTMIN + 3), DefaultAction::Terminate);
+    let dfl = SigAction::default();
+    assert!(dfl.is_fatal(SIGINT) && !dfl.ignores(SIGINT));
+    assert!(dfl.ignores(SIGCHLD) && dfl.ignores(SIGTSTP));
+    let ign = SigAction { handler: SIG_IGN, ..SigAction::default() };
+    assert!(ign.ignores(SIGINT) && !ign.is_fatal(SIGINT));
+    let handler = SigAction { handler: 0x1000, ..SigAction::default() };
+    assert!(!handler.ignores(SIGCHLD) && !handler.is_fatal(SIGINT));
+}
+
+#[test]
+fn pending_queue() {
+    use rk_abi::native::signal::{SIGINT, SIGRTMIN, SIGUSR1};
+    let mut p = Pending::new();
+    assert!(p.push(SigInfo::new(SIGUSR1, SI_USER, 5)));
+    assert!(!p.push(SigInfo::new(SIGUSR1, SI_USER, 6)));
+    assert!(p.push(SigInfo::new(SIGRTMIN, SI_USER, 7)));
+    assert!(p.push(SigInfo::new(SIGRTMIN, SI_USER, 8)));
+    assert!(p.push(SigInfo::new(SIGINT, SI_USER, 9)));
+    let blocked = SigSet(SigSet::bit(SIGINT));
+    assert_eq!(p.take(blocked).map(|i| i.pid), Some(5));
+    assert_eq!(p.take(blocked).map(|i| i.pid), Some(7));
+    assert!(p.set().contains(SIGRTMIN));
+    assert_eq!(p.take(blocked).map(|i| i.pid), Some(8));
+    assert!(!p.set().contains(SIGRTMIN));
+    assert_eq!(p.take(blocked), None);
+    p.discard(SIGINT);
+    assert!(p.set().is_empty());
+    assert_eq!(p.take(SigSet::EMPTY), None);
+}
+
+#[test]
+fn siginfo_layout() {
+    use rk_abi::native::signal::{SIGCHLD, SIGSEGV};
+    let mut chld = SigInfo::new(SIGCHLD, CLD_EXITED, 42);
+    chld.status = 3;
+    let b = chld.to_bytes();
+    assert_eq!(b.len(), 128);
+    assert_eq!(&b[0..4], &SIGCHLD.to_ne_bytes());
+    assert_eq!(&b[8..12], &CLD_EXITED.to_ne_bytes());
+    assert_eq!(&b[16..20], &42u32.to_ne_bytes());
+    assert_eq!(&b[24..28], &3i32.to_ne_bytes());
+    let segv = SigInfo::fault(SIGSEGV, SEGV_MAPERR, 0xdead_0000);
+    let b = segv.to_bytes();
+    assert_eq!(&b[16..24], &0xdead_0000u64.to_ne_bytes());
+    assert_eq!(size_of::<SigAction>(), 32);
+}
+
+#[test]
+fn altstack_flags() {
+    let off = AltStack::default();
+    assert_eq!(off.flags_at(0x1000), SS_DISABLE);
+    let s = AltStack { sp: 0x1000, size: 0x2000, flags: 0 };
+    assert!(s.contains(0x3000) && s.contains(0x1001));
+    assert!(!s.contains(0x1000) && !s.contains(0x3001));
+    assert_eq!(s.flags_at(0x2000), SS_ONSTACK);
+    assert_eq!(s.flags_at(0x8000), 0);
 }

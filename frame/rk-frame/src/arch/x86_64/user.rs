@@ -57,6 +57,29 @@ impl Default for FpuState {
     }
 }
 
+/// The bits of MXCSR that `fxrstor` accepts on each x86-64 CPU. A reserved bit set makes it
+/// fault.
+const MXCSR_VALID: u32 = 0xffbf;
+
+impl FpuState {
+    /// The size of the `fxsave` area.
+    pub const SIZE: usize = 512;
+
+    /// The state in the `fxsave` format, for the signal frame.
+    pub fn as_bytes(&self) -> &[u8; Self::SIZE] {
+        &self.0
+    }
+
+    /// Makes a state from bytes in the `fxsave` format, for `rt_sigreturn`. The reserved bits of
+    /// MXCSR are cleared, so the bytes from user memory cannot make `fxrstor` fault.
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Self {
+        let mut s = *bytes;
+        let mxcsr = u32::from_le_bytes([s[24], s[25], s[26], s[27]]) & MXCSR_VALID;
+        s[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        Self(s)
+    }
+}
+
 /// The way that the CPU came back from user mode, as `rk_user_return` gets it in RAX.
 pub(crate) const RETURN_SYSCALL: u64 = 0;
 pub(crate) const RETURN_INTERRUPT: u64 = 1;

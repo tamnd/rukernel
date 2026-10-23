@@ -7,12 +7,17 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+use rk_abi::native::syscalls as nr;
 use rk_frame::addr::VirtAddr;
 use rk_frame::println;
 use rk_frame::task::{TaskOptions, should_yield, yield_now};
 use rk_frame::user::{ReturnReason, UserContext, UserException};
 use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
+use rk_proc::signal::{
+    BUS_ADRALN, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL, SIG_IGN,
+    SigInfo,
+};
 use rk_proc::{Thread, WaitStatus};
 use rk_vfs::FsContext;
 
@@ -29,13 +34,13 @@ const DIVIDE_ERROR: u8 = 0;
 const DEBUG: u8 = 1;
 const BREAKPOINT: u8 = 3;
 const INVALID_OPCODE: u8 = 6;
-const GENERAL_PROTECTION: u8 = 13;
 const PAGE_FAULT: u8 = 14;
 const X87_FLOATING_POINT: u8 = 16;
 const ALIGNMENT_CHECK: u8 = 17;
 const SIMD_FLOATING_POINT: u8 = 19;
 
 /// The bits of the error code of a page fault.
+const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 const PF_INSTR: u64 = 1 << 4;
 
@@ -87,16 +92,41 @@ pub fn spawn_init(
     start_thread(thread, UserContext::new(VirtAddr::new(image.entry), VirtAddr::new(image.sp)))
 }
 
-/// Gives the signal of a user exception, as the trap handlers of arch/x86/kernel/traps.c give it.
-fn exception_signal(e: &UserException) -> u32 {
+/// Gives the signal of a user exception at `ip`, as the trap handlers of
+/// arch/x86/kernel/traps.c give it.
+fn exception_signal(e: &UserException, ip: u64) -> SigInfo {
     match e.vector {
-        DIVIDE_ERROR | X87_FLOATING_POINT | SIMD_FLOATING_POINT => SIGFPE,
-        DEBUG | BREAKPOINT => SIGTRAP,
-        INVALID_OPCODE => SIGILL,
-        ALIGNMENT_CHECK => SIGBUS,
-        GENERAL_PROTECTION | PAGE_FAULT => SIGSEGV,
-        _ => SIGSEGV,
+        DIVIDE_ERROR => SigInfo::fault(SIGFPE, FPE_INTDIV, ip),
+        X87_FLOATING_POINT | SIMD_FLOATING_POINT => SigInfo::fault(SIGFPE, SI_KERNEL, ip),
+        DEBUG | BREAKPOINT => SigInfo::fault(SIGTRAP, SI_KERNEL, 0),
+        INVALID_OPCODE => SigInfo::fault(SIGILL, ILL_ILLOPN, ip),
+        ALIGNMENT_CHECK => SigInfo::fault(SIGBUS, BUS_ADRALN, 0),
+        PAGE_FAULT => {
+            let code = if e.error & PF_PRESENT != 0 { SEGV_ACCERR } else { SEGV_MAPERR };
+            SigInfo::fault(SIGSEGV, code, e.addr)
+        }
+        _ => SigInfo::fault(SIGSEGV, SI_KERNEL, 0),
     }
+}
+
+/// Sends the signal of a user exception to the thread. If the signal ends the process, the
+/// kernel log tells where the fault was.
+fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException) {
+    let info = exception_signal(e, regs.regs().rip);
+    let sig = info.signo;
+    let process = thread.process();
+    let action = process.action(sig);
+    if action.handler == SIG_DFL || action.handler == SIG_IGN || thread.blocked().contains(sig) {
+        println!(
+            "{}[{}]: signal {sig} at ip {:#x} addr {:#x} error {:#x}",
+            core::str::from_utf8(&process.comm()).unwrap_or("?"),
+            thread.tid(),
+            regs.regs().rip,
+            e.addr,
+            e.error
+        );
+    }
+    thread.force_signal(info);
 }
 
 /// Handles a page fault of the thread. Gives `false` if the memory manager did not repair it.
@@ -112,27 +142,6 @@ fn page_fault(thread: &Thread, e: &UserException) -> bool {
     vm.handle_fault(e.addr as usize, access).is_ok()
 }
 
-/// The length of the `syscall` instruction.
-const SYSCALL_INSN_LEN: u64 = 2;
-
-/// Handles a system call that a signal stopped with a restart number. No signal handler runs in
-/// R1, so the call starts again: the instruction pointer goes back to the `syscall` instruction,
-/// as `handle_signal` of arch/x86/kernel/signal.c does it. `restart_syscall` is not there yet, so
-/// `ERESTART_RESTARTBLOCK` gives `EINTR`.
-fn restart_syscall(regs: &mut UserContext, number: u64) {
-    let Some(e) = Errno::from_syscall_return(regs.regs().rax as isize) else { return };
-    if !e.is_restart() {
-        return;
-    }
-    if e == Errno::ERESTART_RESTARTBLOCK {
-        regs.set_syscall_return(Errno::EINTR.to_syscall_return() as u64);
-        return;
-    }
-    let r = regs.regs_mut();
-    r.rax = number;
-    r.rip -= SYSCALL_INSN_LEN;
-}
-
 /// Runs the user thread until it ends.
 fn run(thread: Arc<Thread>, mut regs: UserContext) {
     let status = loop {
@@ -143,6 +152,9 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
         let Some(vm) = process.vm() else { break WaitStatus::exited(0) };
         vm.activate();
         drop(vm);
+        // The number of a system call that can start again after a signal. `rt_sigreturn` puts
+        // back the registers of the frame, so its return value is not a restart code.
+        let mut syscall = None;
         match regs.execute() {
             ReturnReason::Syscall => {
                 COUNT.fetch_add(1, Ordering::Relaxed);
@@ -152,29 +164,22 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
                 if let Some(status) = cx.exit {
                     break status;
                 }
-                restart_syscall(&mut regs, number);
+                if number != u64::from(nr::RT_SIGRETURN) {
+                    syscall = Some(number);
+                }
             }
             ReturnReason::Interrupt => {}
             ReturnReason::Exception(e) => {
-                if e.vector == PAGE_FAULT && page_fault(&thread, &e) {
-                    continue;
+                if !(e.vector == PAGE_FAULT && page_fault(&thread, &e)) {
+                    fault(&thread, &regs, &e);
                 }
-                let sig = exception_signal(&e);
-                println!(
-                    "{}[{}]: signal {sig} at ip {:#x} addr {:#x} error {:#x}",
-                    core::str::from_utf8(&process.comm()).unwrap_or("?"),
-                    thread.tid(),
-                    regs.regs().rip,
-                    e.addr,
-                    e.error
-                );
-                let status = WaitStatus::signaled(sig, false);
-                rk_proc::exit_group(&thread, status);
-                break status;
             }
         }
         if should_yield() {
             yield_now();
+        }
+        if let Some(status) = crate::signal::deliver(&thread, &mut regs, syscall) {
+            break status;
         }
     };
     let clear = thread.clear_child_tid();
@@ -191,7 +196,9 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
 pub fn init() {
     rk_vfs::inode::set_clock(crate::info::realtime);
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
-        let _ = crate::process::signal_group(pgrp, sig);
+        let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });
-    rk_vfs::wait::set_interrupt_check(|| rk_proc::current_thread().is_some_and(|t| t.is_killed()));
+    rk_vfs::wait::set_interrupt_check(|| {
+        rk_proc::current_thread().is_some_and(|t| t.signal_pending())
+    });
 }

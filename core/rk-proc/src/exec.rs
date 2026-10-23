@@ -304,6 +304,10 @@ pub fn exec(thread: &Thread, args: ExecArgs, random: [u8; 16]) -> Result<ExecIma
         table.close_on_exec();
         process.set_files(Arc::new(rk_frame::sync::SpinLock::new(table)));
     }
+    // The handlers are in the old program, so they go back to the default action. The mask and
+    // the pending signals stay, as POSIX tells.
+    process.reset_actions();
+    thread.set_altstack(crate::signal::AltStack::default());
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&path);
     process.set_comm(name);
     Ok(image)
