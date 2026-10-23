@@ -37,7 +37,7 @@ fn main() -> ExitCode {
         "style" => check_style(),
         "targets" => build_targets(),
         "qemu" => qemu(&std::env::args().skip(2).collect::<Vec<_>>()),
-        "boot-test" => boot_test(),
+        "boot-test" => boot_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "abi" => check_abi(),
         "ci" => ci(),
         _ => Err(String::from(
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
              style    the prose has no em dashes, no en dashes and no horizontal rules\n\
              targets  the kernel crates build for the three bare metal targets\n\
              qemu     boot the x86-64 kernel in QEMU, with the arguments as the command line\n\
-             boot-test  boot the x86-64 kernel in QEMU and check the self tests\n\
+             boot-test  boot the x86-64 kernel in QEMU and check the self tests, or only the named tests\n\
              abi      run rk-abigen on the pinned Linux tree and check that the output is in the tree\n\
              ci       all of the above except qemu and abi, and fmt, clippy, test and doc",
         )),
@@ -376,7 +376,7 @@ fn ci() -> Result {
     cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
     cargo(&["test", "--workspace", "--no-fail-fast"])?;
     build_targets()?;
-    boot_test()?;
+    boot_test(&[])?;
     cargo(&["doc", "--workspace", "--no-deps"])?;
     println!("all checks passed");
     Ok(())
@@ -403,6 +403,7 @@ const BOOT_TESTS: &[&str] = &[
     "init",
     "tty",
     "busybox",
+    "ltp",
 ];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
@@ -490,7 +491,8 @@ const BUSYBOX_URL: &str = "https://busybox.net/downloads/binaries/1.35.0-x86_64-
 const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348";
 
 /// The applets that the `busybox` boot test uses. Each one is a link to /bin/busybox.
-const BUSYBOX_APPLETS: &[&str] = &["sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test"];
+const BUSYBOX_APPLETS: &[&str] =
+    &["sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test", "mkdir", "rm", "true", "false"];
 
 /// Gives the SHA-256 of `path` in hexadecimal, from `sha256sum` or `shasum`.
 fn sha256(path: &Path) -> Result<String> {
@@ -537,6 +539,84 @@ fn busybox(dir: &Path) -> Result<Option<Vec<u8>>> {
     read(&path).map(Some)
 }
 
+/// The longest time that the `ltp` boot test can take. It runs each test of tools/ltp/tests.txt.
+const LTP_TIMEOUT: Duration = Duration::from_secs(1200);
+
+/// The directory of the LTP tests that tools/ltp/build.sh makes: `RK_LTP`, or target/ltp.
+fn ltp_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("RK_LTP")
+        .map_or_else(|| workspace_root().join("target/ltp"), PathBuf::from);
+    dir.join("VERSION").exists().then_some(dir)
+}
+
+/// The names of the LTP tests that the `ltp` boot test runs, from tools/ltp/tests.txt. A line
+/// that starts with `#` is a comment.
+fn ltp_tests() -> Result<Vec<String>> {
+    let text = read(&workspace_root().join("tools/ltp/tests.txt"))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect())
+}
+
+/// The script that the `ltp` boot test runs as init. A test passes with the exit code 0, or 32
+/// (`TCONF`) when the test does not apply. The output of a test that fails goes to the console.
+fn ltp_script(tests: &[String]) -> String {
+    let mut script =
+        String::from("#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp\nfailed=0\nfor t in \\\n");
+    for t in tests {
+        script.push_str(&format!("    {t} \\\n"));
+    }
+    script.push_str(concat!(
+        "; do\n",
+        "    /ltp/$t > /tmp/ltp.log 2>&1\n",
+        "    code=$?\n",
+        "    case $code in\n",
+        "    0) echo \"ltp: $t: pass\" ;;\n",
+        "    32) echo \"ltp: $t: does not apply\" ;;\n",
+        "    *) echo \"ltp: $t: FAIL with $code\"; cat /tmp/ltp.log; failed=1 ;;\n",
+        "    esac\n",
+        "done\n",
+        "exit $failed\n",
+    ));
+    script
+}
+
+/// Writes the initramfs of the `ltp` boot test next to the kernel: BusyBox, the LTP tests and
+/// the script. Gives `false` if LTP or BusyBox is not there.
+fn build_ltp_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
+    let (Some(dir), Some(busybox)) = (ltp_dir(), busybox) else {
+        return Ok(false);
+    };
+    let tests = ltp_tests()?;
+    let mut w = rk_vfs::cpio::Writer::new();
+    w.add(b".", 0o040_755, b"");
+    for d in [&b"bin"[..], b"tmp", b"etc", b"ltp"] {
+        w.add(d, 0o040_755, b"");
+    }
+    w.add(b"bin/busybox", 0o100_755, busybox);
+    for applet in BUSYBOX_APPLETS {
+        w.add(format!("bin/{applet}").as_bytes(), 0o120_777, b"busybox");
+    }
+    w.add(
+        b"etc/passwd",
+        0o100_644,
+        b"root:x:0:0:root:/:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n",
+    );
+    w.add(b"etc/group", 0o100_644, b"root:x:0:\nnogroup:x:65534:\n");
+    for t in &tests {
+        let path = dir.join(t);
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        w.add(format!("ltp/{t}").as_bytes(), 0o100_755, &bytes);
+    }
+    w.add(b"ltp/run", 0o100_755, ltp_script(&tests).as_bytes());
+    let path = kernel.with_file_name("initramfs-ltp.cpio");
+    fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
 /// Builds the x86-64 kernel and the initramfs of the boot tests, and gives the path of the ELF
 /// image. The initramfs is in the same directory.
 fn build_kernel() -> Result<PathBuf> {
@@ -554,6 +634,10 @@ fn build_kernel() -> Result<PathBuf> {
     let initramfs = kernel.with_file_name("initramfs.cpio");
     fs::write(&initramfs, test_initramfs(user.as_ref(), busybox.as_deref()))
         .map_err(|e| format!("{}: {e}", initramfs.display()))?;
+    let ltp = kernel.with_file_name("initramfs-ltp.cpio");
+    if !build_ltp_initramfs(&kernel, busybox.as_deref())? {
+        let _ = fs::remove_file(&ltp);
+    }
     Ok(kernel)
 }
 
@@ -747,6 +831,11 @@ fn build_bzimage() -> Result<PathBuf> {
 /// The QEMU command for the x86-64 kernel. KVM is used when the host has it and this user can open
 /// it. A CI runner can have `/dev/kvm` with no access for the runner user.
 fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
+    qemu_command_with(kernel, &kernel.with_file_name("initramfs.cpio"), cmdline)
+}
+
+/// The QEMU command for the x86-64 kernel with the initramfs `initrd`.
+fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args(["-machine", "q35", "-m", "512M", "-smp", "1", "-display", "none"])
         .args(["-serial", "stdio", "-no-reboot", "-monitor", "none"])
@@ -754,7 +843,7 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
         .arg("-kernel")
         .arg(kernel)
         .arg("-initrd")
-        .arg(kernel.with_file_name("initramfs.cpio"))
+        .arg(initrd)
         .args(["-append", cmdline]);
     if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);
@@ -780,6 +869,7 @@ fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
         "init" | "tty" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
+        "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         _ => true,
     }
 }
@@ -790,13 +880,14 @@ fn test_cmdline(test: &str) -> String {
     match test {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
+        "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         _ => format!("console=ttyS0 rk.test={test}"),
     }
 }
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "busybox") { "init" } else { test };
+    let test = if matches!(test, "tty" | "busybox" | "ltp") { "init" } else { test };
     format!("rk.test={test}: pass")
 }
 
@@ -818,12 +909,21 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
     }
 }
 
-fn boot_test() -> Result {
+fn boot_test(names: &[String]) -> Result {
+    if let Some(name) = names.iter().find(|n| !BOOT_TESTS.contains(&n.as_str())) {
+        return Err(format!("{name}: no such boot test"));
+    }
     let kernel = build_kernel()?;
     let mut errors = Vec::new();
-    for test in BOOT_TESTS.iter().filter(|t| can_run(&kernel, t)) {
-        let cmd = qemu_command(&kernel, &test_cmdline(test));
-        let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
+    let named = |t: &&&str| names.is_empty() || names.iter().any(|n| n == **t);
+    for test in BOOT_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
+        let (cmd, timeout) = if *test == "ltp" {
+            let initrd = kernel.with_file_name("initramfs-ltp.cpio");
+            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), LTP_TIMEOUT)
+        } else {
+            (qemu_command(&kernel, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
+        };
+        let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
         let passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
         if passed {
             println!("boot test {test}: pass");
@@ -833,7 +933,7 @@ fn boot_test() -> Result {
         }
     }
     let bzimage = build_bzimage()?;
-    for test in BZIMAGE_TESTS.iter().filter(|t| can_run(&kernel, t)) {
+    for test in BZIMAGE_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
         let cmd = qemu_command(&bzimage, &test_cmdline(test));
         let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
         let passed = status == Some(QEMU_PASS)
@@ -848,7 +948,7 @@ fn boot_test() -> Result {
     }
     match find_ovmf()? {
         Some(firmware) => {
-            for test in BZIMAGE_TESTS.iter().filter(|t| can_run(&kernel, t)) {
+            for test in BZIMAGE_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
                 let mut cmd = qemu_command(&bzimage, &test_cmdline(test));
                 cmd.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", firmware.display()));
