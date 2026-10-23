@@ -17,6 +17,8 @@ pub(crate) fn run(name: &str) -> bool {
         "trap" => trap_test(),
         "mm" => mm_test(),
         "timer" => timer_test(),
+        #[cfg(target_arch = "x86_64")]
+        "syscall" => syscall_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -170,6 +172,98 @@ fn timer_test() -> bool {
     let got = time::ticks() - start;
     println!("rk.test: {got} ticks in {waits} waits, timer at {} Hz", time::timer_frequency());
     ok &= check("the timer interrupts arrive", got >= want);
+    ok &= check("interrupts are off again", !irq::enabled());
+    ok
+}
+
+/// The user program of the syscall test. It makes each system call number from 0 to the end of
+/// the table, and counts the returns that are not `-ENOSYS` in RBX. Then it stops with `int3`.
+#[cfg(target_arch = "x86_64")]
+const SYSCALL_PROGRAM: [u8; 31] = [
+    0x45, 0x31, 0xe4, // xor r12d, r12d
+    0x31, 0xdb, // xor ebx, ebx
+    0x44, 0x89, 0xe0, // 1: mov eax, r12d
+    0x0f, 0x05, // syscall
+    0x48, 0x83, 0xf8, 0xda, // cmp rax, -38
+    0x74, 0x02, // je 2f
+    0xff, 0xc3, // inc ebx
+    0x41, 0xff, 0xc4, // 2: inc r12d
+    0x41, 0x81, 0xfc, 0, 0, 0, 0, // cmp r12d, NR_SYSCALLS
+    0x72, 0xe7, // jb 1b
+    0xcc, // int3
+];
+
+/// The offset of the 32 bit value of the `cmp r12d` instruction in `SYSCALL_PROGRAM`.
+#[cfg(target_arch = "x86_64")]
+const SYSCALL_PROGRAM_LIMIT: usize = 24;
+
+#[cfg(target_arch = "x86_64")]
+fn syscall_test() -> bool {
+    use crate::syscall;
+    use rk_abi::native::syscalls::NR_SYSCALLS;
+    use rk_frame::user::{self, ReturnReason, UserContext};
+
+    const CODE: usize = 0x40_0000;
+    const STACK: usize = 0x7fff_ffff_e000;
+    const BREAKPOINT: u8 = 3;
+
+    let mut program = SYSCALL_PROGRAM;
+    let limit = (NR_SYSCALLS as u32).to_le_bytes();
+    program[SYSCALL_PROGRAM_LIMIT..SYSCALL_PROGRAM_LIMIT + 4].copy_from_slice(&limit);
+    let (Some(mut code), Some(mut stack)) = (mm::alloc_frame(), mm::alloc_frame()) else {
+        return check("two frames for the user pages", false);
+    };
+    code.zero();
+    stack.zero();
+    for (i, chunk) in program.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        code.write_u64(i, u64::from_le_bytes(word));
+    }
+    let mut ok = check(
+        "the user pages are mapped",
+        user::map_page(VirtAddr::new(CODE), code, false, true).is_ok()
+            && user::map_page(VirtAddr::new(STACK), stack, true, false).is_ok(),
+    );
+    ok &= check(
+        "the kernel refuses a user page in the kernel half",
+        mm::alloc_frame().is_some_and(|f| {
+            user::map_page(VirtAddr::new(user::USER_END), f, true, false).is_err()
+        }),
+    );
+    let user_page = mm::query(VirtAddr::new(CODE));
+    ok &= check(
+        "the code page is a user page, executable and read only",
+        user_page.is_some_and(|i| i.user && i.executable && !i.writable),
+    );
+
+    let mut ctx = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(STACK + 4096));
+    let start = syscall::count();
+    let mut interrupts = 0u64;
+    // Each number is one return, and the timer can add more. The limit stops a loop that does
+    // not end.
+    let reason = loop {
+        if syscall::count() - start > 2 * NR_SYSCALLS as u64 {
+            break None;
+        }
+        match ctx.execute() {
+            ReturnReason::Syscall => syscall::dispatch(&mut ctx),
+            ReturnReason::Interrupt => interrupts += 1,
+            ReturnReason::Exception(e) => break Some(e),
+        }
+    };
+    let calls = syscall::count() - start;
+    println!("rk.test: {calls} system calls, {interrupts} interrupts in user mode");
+    ok &= check(
+        "the program stops at its int3",
+        reason.is_some_and(|e| e.vector == BREAKPOINT)
+            && ctx.regs().rip == (CODE + SYSCALL_PROGRAM.len()) as u64,
+    );
+    ok &= check("each system call number is made", calls == NR_SYSCALLS as u64);
+    ok &= check(
+        "each number gives -ENOSYS",
+        ctx.regs().r12 == NR_SYSCALLS as u64 && ctx.regs().rbx == 0,
+    );
     ok &= check("interrupts are off again", !irq::enabled());
     ok
 }
