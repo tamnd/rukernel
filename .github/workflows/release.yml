@@ -41,6 +41,10 @@ jobs:
             echo "Cargo.toml has $version and the tag is $TAG"
             exit 1
           fi
+      - name: install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86
       - name: cargo xtask ci
         run: cargo xtask ci
 
@@ -77,5 +81,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" rukernel-*.tar.gz rukernel-*.tar.gz.sha256 \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "rukernel $TAG"
+          # A maintainer can publish the release notes before this job runs. Then the job only
+          # adds the archive and the checksum to that release.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" rukernel-*.tar.gz rukernel-*.tar.gz.sha256 \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" rukernel-*.tar.gz rukernel-*.tar.gz.sha256 \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "rukernel $TAG"
+          fi

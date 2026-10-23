@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.0.1] (2026-10-23)
+
 ### Added
 
 - The design, in `spec/`.
@@ -12,3 +14,5 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The CI gate, the security workflows and the release workflow.
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
+
+[0.0.1]: https://github.com/tamnd/rukernel/releases/tag/v0.0.1
