@@ -122,29 +122,83 @@ fn policy(file: &str) -> Result<Vec<Vec<String>>> {
 }
 
 fn check_unsafe() -> Result {
-    let allowed: BTreeSet<String> =
-        policy("unsafe-allowed.txt")?.into_iter().filter_map(|f| f.into_iter().next()).collect();
-    let crates = crates()?;
+    let mut budgets = BTreeMap::new();
     let mut errors = Vec::new();
-    for c in &crates {
-        if allowed.contains(&c.name) {
-            continue;
+    for fields in policy("unsafe-allowed.txt")? {
+        if let [name, budget] = fields.as_slice()
+            && let Ok(budget) = budget.parse::<usize>()
+        {
+            budgets.insert(name.clone(), budget);
+        } else {
+            errors.push(format!("xtask/unsafe-allowed.txt: malformed line: {}", fields.join(" ")));
         }
-        let text = read(&c.root)?;
-        if !text.lines().any(|l| l.trim() == "#![forbid(unsafe_code)]") {
+    }
+    let audited = read(&workspace_root().join("frame/AUDITED.md"))?;
+    let crates = crates()?;
+    for c in &crates {
+        let Some(&budget) = budgets.get(&c.name) else {
+            if !forbids_unsafe(&read(&c.root)?) {
+                errors.push(format!(
+                    "{}: the crate root does not have #![forbid(unsafe_code)]",
+                    c.root.display()
+                ));
+            }
+            continue;
+        };
+        if !audited.lines().any(|l| l.trim() == format!("## {}", c.name)) {
+            errors.push(format!("frame/AUDITED.md: no section for {}", c.name));
+        }
+        let mut files = Vec::new();
+        walk(&c.dir.join("src"), &mut files)?;
+        let mut count = CodeCount::default();
+        for file in files.iter().filter(|f| f.extension().is_some_and(|e| e == "rs")) {
+            count.add(&read(file)?);
+        }
+        println!(
+            "{}: {} lines of code, {} unsafe blocks, budget {budget} lines",
+            c.name, count.lines, count.unsafe_blocks
+        );
+        if count.lines > budget {
             errors.push(format!(
-                "{}: the crate root does not have #![forbid(unsafe_code)]",
-                c.root.display()
+                "{}: {} lines of code is over the budget of {budget}",
+                c.name, count.lines
             ));
         }
     }
     let names: BTreeSet<&str> = crates.iter().map(|c| c.name.as_str()).collect();
-    for name in &allowed {
+    for name in budgets.keys() {
         if !names.contains(name.as_str()) {
             errors.push(format!("xtask/unsafe-allowed.txt: {name} is not a workspace crate"));
         }
     }
     report("unsafe rule", errors)
+}
+
+/// Tells if a crate root forbids unsafe code. The attribute must be on a line of its own.
+fn forbids_unsafe(root: &str) -> bool {
+    root.lines().any(|l| l.trim() == "#![forbid(unsafe_code)]")
+}
+
+/// The size of the Rust code of a crate.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodeCount {
+    /// The lines that are not blank and not only a comment.
+    lines: usize,
+    /// The `unsafe` blocks. An `unsafe fn` or an `unsafe impl` is not a block.
+    unsafe_blocks: usize,
+}
+
+impl CodeCount {
+    fn add(&mut self, text: &str) {
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            self.lines += 1;
+            let code = line.split("//").next().unwrap_or("");
+            self.unsafe_blocks += code.matches("unsafe {").count();
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -441,6 +495,28 @@ fn report(check: &str, errors: Vec<String>) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_forbid_attribute() {
+        assert!(forbids_unsafe("//! A crate.\n\n#![forbid(unsafe_code)]\n"));
+        assert!(!forbids_unsafe("//! A crate.\n#![deny(unsafe_code)]\n"));
+        assert!(!forbids_unsafe("// #![forbid(unsafe_code)] is not here\n"));
+    }
+
+    #[test]
+    fn code_count() {
+        let mut count = CodeCount::default();
+        count.add(
+            "//! A module.\n\n\
+             fn f() {\n\
+             \x20   // SAFETY: a reason.\n\
+             \x20   unsafe { g() };\n\
+             \x20   let x = unsafe { h() } + unsafe { h() }; // unsafe { not this }\n\
+             }\n\
+             unsafe impl Sync for T {}\n",
+        );
+        assert_eq!(count, CodeCount { lines: 5, unsafe_blocks: 3 });
+    }
 
     #[test]
     fn horizontal_rules() {
