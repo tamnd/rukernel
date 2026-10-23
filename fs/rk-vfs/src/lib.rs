@@ -21,6 +21,7 @@ pub mod file;
 pub mod fs;
 pub mod inode;
 pub mod path;
+pub mod wait;
 
 pub use dentry::{Dentry, Location, Mount, MountNamespace};
 pub use fdtable::{FdEntry, FdTable};
@@ -30,3 +31,4 @@ pub use inode::{
     DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, anon_dev, now,
     set_clock,
 };
+pub use wait::WaitQueue;

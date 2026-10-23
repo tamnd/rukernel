@@ -112,6 +112,27 @@ fn page_fault(thread: &Thread, e: &UserException) -> bool {
     vm.handle_fault(e.addr as usize, access).is_ok()
 }
 
+/// The length of the `syscall` instruction.
+const SYSCALL_INSN_LEN: u64 = 2;
+
+/// Handles a system call that a signal stopped with a restart number. No signal handler runs in
+/// R1, so the call starts again: the instruction pointer goes back to the `syscall` instruction,
+/// as `handle_signal` of arch/x86/kernel/signal.c does it. `restart_syscall` is not there yet, so
+/// `ERESTART_RESTARTBLOCK` gives `EINTR`.
+fn restart_syscall(regs: &mut UserContext, number: u64) {
+    let Some(e) = Errno::from_syscall_return(regs.regs().rax as isize) else { return };
+    if !e.is_restart() {
+        return;
+    }
+    if e == Errno::ERESTART_RESTARTBLOCK {
+        regs.set_syscall_return(Errno::EINTR.to_syscall_return() as u64);
+        return;
+    }
+    let r = regs.regs_mut();
+    r.rax = number;
+    r.rip -= SYSCALL_INSN_LEN;
+}
+
 /// Runs the user thread until it ends.
 fn run(thread: Arc<Thread>, mut regs: UserContext) {
     let status = loop {
@@ -125,11 +146,13 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
         match regs.execute() {
             ReturnReason::Syscall => {
                 COUNT.fetch_add(1, Ordering::Relaxed);
+                let number = regs.syscall_number();
                 let mut cx = Cx { thread: &thread, regs: &mut regs, exit: None };
                 table::dispatch(&mut cx);
                 if let Some(status) = cx.exit {
                     break status;
                 }
+                restart_syscall(&mut regs, number);
             }
             ReturnReason::Interrupt => {}
             ReturnReason::Exception(e) => {
@@ -170,5 +193,5 @@ pub fn init() {
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::process::signal_group(pgrp, sig);
     });
-    rk_drv_tty::set_interrupt_check(|| rk_proc::current_thread().is_some_and(|t| t.is_killed()));
+    rk_vfs::wait::set_interrupt_check(|| rk_proc::current_thread().is_some_and(|t| t.is_killed()));
 }

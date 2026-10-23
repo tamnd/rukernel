@@ -10,13 +10,18 @@
 //!
 //! The kernel runs with interrupts off, so a task in the kernel is not preempted. A task that runs
 //! user code yields when `should_yield` tells that its time slice is over. In R1 there is one CPU.
+//!
+//! An interrupt handler takes no lock, so it cannot wake a task. The work that an interrupt starts
+//! runs later as a bottom half, when the kernel is back from the interrupt and holds no lock: in
+//! the idle loop of the scheduler, and after an interrupt in user mode. The bottom half wakes the
+//! tasks whose timeout is over, and then calls each function of `add_bottom_half`.
 
 use crate::arch::imp::task::{TaskContext, switch};
 use crate::sync::{Once, SpinLock};
 use alloc::alloc::{Layout, alloc, dealloc};
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -262,9 +267,10 @@ fn schedule() {
         if let Some(next) = scheduler().dequeue() {
             break next;
         }
-        // No task can run. An interrupt handler can wake a task.
+        // No task can run. The bottom half of an interrupt can wake a task.
         crate::irq::wait();
         crate::irq::disable();
+        run_bottom_half();
     };
     next.state.store(RUNNING, Ordering::Release);
     next.start_tick.store(crate::time::ticks(), Ordering::Relaxed);
@@ -303,6 +309,47 @@ pub(crate) extern "C" fn task_start() -> ! {
     exit()
 }
 
+/// The tasks that wait with a timeout, by the tick of the timeout and the task number.
+static TIMERS: SpinLock<BTreeMap<(u64, u64), Weak<Task>>> = SpinLock::new(BTreeMap::new());
+
+/// The most functions that `add_bottom_half` keeps.
+const MAX_BOTTOM_HALVES: usize = 4;
+
+/// The functions of the bottom half.
+static BOTTOM_HALVES: SpinLock<[Option<fn()>; MAX_BOTTOM_HALVES]> =
+    SpinLock::new([None; MAX_BOTTOM_HALVES]);
+
+/// Adds a function to the bottom half. A driver gives the function that takes the data of its
+/// device, for a device that has no interrupt. The function runs with interrupts off and must not
+/// block.
+///
+/// # Panics
+///
+/// Panics if the bottom half has `MAX_BOTTOM_HALVES` functions already.
+pub fn add_bottom_half(f: fn()) {
+    let mut halves = BOTTOM_HALVES.lock();
+    let slot = halves.iter_mut().find(|h| h.is_none()).expect("too many bottom halves");
+    *slot = Some(f);
+}
+
+/// Runs the bottom half: it wakes each task whose timeout is over, and then calls each function
+/// of `add_bottom_half`.
+pub(crate) fn run_bottom_half() {
+    let now = crate::time::ticks();
+    let expired = {
+        let mut timers = TIMERS.lock();
+        let later = timers.split_off(&(now + 1, 0));
+        core::mem::replace(&mut *timers, later)
+    };
+    for task in expired.values().filter_map(Weak::upgrade) {
+        task.wake();
+    }
+    let halves = *BOTTOM_HALVES.lock();
+    for f in halves.into_iter().flatten() {
+        f();
+    }
+}
+
 /// A queue of tasks that wait for a condition.
 pub struct WaitQueue {
     waiters: SpinLock<VecDeque<Arc<Task>>>,
@@ -339,6 +386,26 @@ impl WaitQueue {
             drop(current);
             block();
         }
+    }
+
+    /// Blocks the current task until `cond` gives a value or the tick count is at `deadline`, as
+    /// `wait_until` blocks it. Gives `None` if the deadline comes first.
+    pub fn wait_until_timeout<R>(
+        &self,
+        deadline: u64,
+        mut cond: impl FnMut() -> Option<R>,
+    ) -> Option<R> {
+        let current = Task::current();
+        let key = (deadline, current.id);
+        TIMERS.lock().insert(key, Arc::downgrade(&current));
+        drop(current);
+        let value = self.wait_until(|| match cond() {
+            Some(value) => Some(Some(value)),
+            None if crate::time::ticks() >= deadline => Some(None),
+            None => None,
+        });
+        TIMERS.lock().remove(&key);
+        value
     }
 
     /// Wakes the first task that waits. Gives `false` if no task was woken.

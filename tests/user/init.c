@@ -1,8 +1,11 @@
 /*
  * The init program of the rk.test=init boot test. It is a static ELF file. Each check prints
- * one line. init exits with 0 if each check passes, and with 1 if a check fails.
+ * one line. init exits with 0 if each check passes, and with 1 if a check fails. With the
+ * argument "tty", init also reads a line from the console and waits for ^C, which the boot test
+ * types.
  */
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +15,7 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -136,7 +140,30 @@ static void test_time(void)
 	check("the clock goes forward in the sleep", ns >= 10 * 1000 * 1000);
 }
 
-int main(void)
+static void test_tty(void)
+{
+	char buf[64];
+	memset(buf, 0, sizeof(buf));
+	printf("init: type a line\n");
+	ssize_t n = read(0, buf, sizeof(buf));
+	check("read of a line from the console", n == 6 && strcmp(buf, "hello\n") == 0);
+
+	pid_t pid = fork();
+	if (pid == 0) {
+		setpgid(0, 0);
+		for (;;)
+			;
+	}
+	setpgid(pid, pid);
+	check("tcsetpgrp to the child", tcsetpgrp(0, pid) == 0 && tcgetpgrp(0) == pid);
+	printf("init: press ^C\n");
+	int status = 0;
+	check("^C stops the foreground job", waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+						    WTERMSIG(status) == SIGINT);
+	check("tcsetpgrp back to init", tcsetpgrp(0, getpgrp()) == 0);
+}
+
+int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	test_ids();
@@ -147,6 +174,8 @@ int main(void)
 	test_fork();
 	test_exec();
 	test_time();
+	if (argc > 1 && strcmp(argv[1], "tty") == 0)
+		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }
