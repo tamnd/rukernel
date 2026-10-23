@@ -3,6 +3,8 @@
 //! `rk.test=NAME` on the command line runs one test and stops the virtual machine with the result.
 //! `cargo xtask boot-test` boots the kernel one time for each test.
 
+#[cfg(target_arch = "x86_64")]
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{self, Frame};
@@ -20,6 +22,8 @@ pub(crate) fn run(name: &str) -> bool {
         "timer" => timer_test(),
         #[cfg(target_arch = "x86_64")]
         "syscall" => syscall_test(),
+        #[cfg(target_arch = "x86_64")]
+        "vm" => vm_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -32,6 +36,14 @@ fn check(what: &str, ok: bool) -> bool {
     println!("rk.test: {what}: {}", if ok { "ok" } else { "FAIL" });
     ok
 }
+
+/// The permissions of the user pages of the tests.
+#[cfg(target_arch = "x86_64")]
+const RX: rk_frame::vm::PageProt = rk_frame::vm::PageProt { writable: false, executable: true };
+#[cfg(target_arch = "x86_64")]
+const RW: rk_frame::vm::PageProt = rk_frame::vm::PageProt { writable: true, executable: false };
+#[cfg(target_arch = "x86_64")]
+const RO: rk_frame::vm::PageProt = rk_frame::vm::PageProt { writable: false, executable: false };
 
 /// An address that is canonical and has no mapping. A read from it is a page fault.
 const UNMAPPED: usize = 0xffff_c000_0000_0000;
@@ -251,7 +263,8 @@ const SYSCALL_PROGRAM_LIMIT: usize = 24;
 fn syscall_test() -> bool {
     use crate::syscall;
     use rk_abi::native::syscalls::NR_SYSCALLS;
-    use rk_frame::user::{self, ReturnReason, UserContext};
+    use rk_frame::user::{ReturnReason, UserContext};
+    use rk_frame::vm::{self, MapError, VmSpace};
 
     const CODE: usize = 0x40_0000;
     const STACK: usize = 0x7fff_ffff_e000;
@@ -270,22 +283,29 @@ fn syscall_test() -> bool {
         word[..chunk.len()].copy_from_slice(chunk);
         code.write_u64(i, u64::from_le_bytes(word));
     }
+    let Some(space) = VmSpace::new() else {
+        return check("an address space for the user pages", false);
+    };
     let mut ok = check(
         "the user pages are mapped",
-        user::map_page(VirtAddr::new(CODE), code, false, true).is_ok()
-            && user::map_page(VirtAddr::new(STACK), stack, true, false).is_ok(),
+        space.map(VirtAddr::new(CODE), Arc::new(code), RX).is_ok()
+            && space.map(VirtAddr::new(STACK), Arc::new(stack), RW).is_ok(),
     );
     ok &= check(
         "the kernel refuses a user page in the kernel half",
         mm::alloc_frame().is_some_and(|f| {
-            user::map_page(VirtAddr::new(user::USER_END), f, true, false).is_err()
+            space.map(VirtAddr::new(vm::USER_END), Arc::new(f), RW) == Err(MapError::BadAddress)
         }),
     );
-    let user_page = mm::query(VirtAddr::new(CODE));
     ok &= check(
-        "the code page is a user page, executable and read only",
-        user_page.is_some_and(|i| i.user && i.executable && !i.writable),
+        "the code page is executable and read only",
+        space.page(VirtAddr::new(CODE)).is_some_and(|(_, p)| p == RX),
     );
+    ok &= check(
+        "the kernel table does not map the user page",
+        mm::query(VirtAddr::new(CODE)).is_none(),
+    );
+    space.activate();
 
     let mut ctx = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(STACK + 4096));
     let start = syscall::count();
@@ -315,6 +335,8 @@ fn syscall_test() -> bool {
         ctx.regs().r12 == NR_SYSCALLS as u64 && ctx.regs().rbx == 0,
     );
     ok &= check("interrupts are off again", !irq::enabled());
+    VmSpace::deactivate();
+    drop(space);
     ok &= fpu_test();
     ok
 }
@@ -341,7 +363,8 @@ const FPU_PROGRAM_B: [u8; 15] = [
 #[cfg(target_arch = "x86_64")]
 fn fpu_test() -> bool {
     use crate::syscall;
-    use rk_frame::user::{self, ReturnReason, UserContext};
+    use rk_frame::user::{ReturnReason, UserContext};
+    use rk_frame::vm::VmSpace;
 
     const CODE: usize = 0x40_1000;
     const B_OFFSET: usize = 0x80;
@@ -364,12 +387,16 @@ fn fpu_test() -> bool {
     }
     data.zero();
     data.write_u64(2, 0xfeed_f00d);
+    let Some(space) = VmSpace::new() else {
+        return check("an address space for the FPU test", false);
+    };
     let mut ok = check(
         "the FPU test pages are mapped",
-        user::map_page(VirtAddr::new(CODE), code, false, true).is_ok()
-            && user::map_page(VirtAddr::new(DATA), data, false, false).is_ok()
-            && user::map_page(VirtAddr::new(STACK), stack, true, false).is_ok(),
+        space.map(VirtAddr::new(CODE), Arc::new(code), RX).is_ok()
+            && space.map(VirtAddr::new(DATA), Arc::new(data), RO).is_ok()
+            && space.map(VirtAddr::new(STACK), Arc::new(stack), RW).is_ok(),
     );
+    space.activate();
 
     let mut a = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(STACK + 4096));
     a.set_fs_base((DATA + 16) as u64);
@@ -387,5 +414,93 @@ fn fpu_test() -> bool {
     ok &= check("XMM0 of program A is kept", a.regs().rbx == 0x1122_3344_5566_7788);
     ok &= check("the FS base of program A is used", a.regs().rcx == 0xfeed_f00d);
     ok &= check("the SSE state of the two programs is different", a.fpu() != b.fpu());
+    VmSpace::deactivate();
+    ok
+}
+
+/// The user program of the address space test: it reads the word at `VM_DATA` into RBX.
+#[cfg(target_arch = "x86_64")]
+const VM_PROGRAM: [u8; 9] = [
+    0x48, 0x8b, 0x1c, 0x25, 0, 0, 0x60, 0,    // mov rbx, [0x600000]
+    0xcc, // int3
+];
+
+/// Two address spaces map the same code frame and different data frames at the same addresses.
+/// Each program reads its own data. When the address spaces go, each frame goes back.
+#[cfg(target_arch = "x86_64")]
+fn vm_test() -> bool {
+    use rk_frame::user::{ReturnReason, UserContext};
+    use rk_frame::vm::{UserFault, VmSpace};
+
+    const CODE: usize = 0x40_0000;
+    const DATA: usize = 0x60_0000;
+    const STACK: usize = 0x7fff_ffff_e000;
+
+    // The heap keeps its slab pages, so one address space with one page comes and goes before
+    // the count. Then the nodes of the page map come from a slab that exists.
+    let warm = VmSpace::new().zip(mm::alloc_zeroed_frame());
+    if let Some((space, frame)) = warm {
+        let _ = space.map(VirtAddr::new(DATA), Arc::new(frame), RW);
+    }
+    let free_before = mm::frame_stats().free;
+    let Some(code) = mm::alloc_zeroed_frame() else {
+        return check("a frame for the code", false);
+    };
+    code.write_bytes(0, &VM_PROGRAM);
+    let code = Arc::new(code);
+    let mut ok = true;
+    let mut values = [0u64; 2];
+    for (i, value) in values.iter_mut().enumerate() {
+        let (Some(space), Some(data), Some(stack)) =
+            (VmSpace::new(), mm::alloc_zeroed_frame(), mm::alloc_zeroed_frame())
+        else {
+            return check("an address space and two frames", false);
+        };
+        ok &= check(
+            "the pages are mapped",
+            space.map(VirtAddr::new(CODE), code.clone(), RX).is_ok()
+                && space.map(VirtAddr::new(DATA), Arc::new(data), RW).is_ok()
+                && space.map(VirtAddr::new(STACK), Arc::new(stack), RW).is_ok(),
+        );
+        let word = 0x1111_0000 + i as u64;
+        ok &= check(
+            "the kernel writes user memory",
+            space.write(VirtAddr::new(DATA), &word.to_le_bytes()).is_ok(),
+        );
+        let mut back = [0u8; 8];
+        ok &= check(
+            "the kernel reads user memory",
+            space.read(VirtAddr::new(DATA), &mut back).is_ok() && u64::from_le_bytes(back) == word,
+        );
+        ok &= check(
+            "a write to the code page faults",
+            space.write(VirtAddr::new(CODE), &[0]) == Err(UserFault { addr: CODE, write: true }),
+        );
+        ok &= check(
+            "a read across the end of a page stops at the unmapped page",
+            space.read(VirtAddr::new(DATA + 4092), &mut back)
+                == Err(UserFault { addr: DATA + 4096, write: false }),
+        );
+        space.activate();
+        let mut ctx = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(STACK + 4096));
+        let reason = loop {
+            match ctx.execute() {
+                ReturnReason::Interrupt => continue,
+                other => break other,
+            }
+        };
+        ok &= check(
+            "the program stops at its int3",
+            matches!(reason, ReturnReason::Exception(e) if e.vector == 3),
+        );
+        *value = ctx.regs().rbx;
+        // The address space is active when it goes, so the drop loads the kernel table.
+        drop(space);
+    }
+    ok &= check("each address space has its own data", values == [0x1111_0000, 0x1111_0001]);
+    ok &=
+        check("the address spaces give back the shared code frame", Arc::strong_count(&code) == 1);
+    drop(code);
+    ok &= check("the frames and the page tables go back", mm::frame_stats().free == free_before);
     ok
 }

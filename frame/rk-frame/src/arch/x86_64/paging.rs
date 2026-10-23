@@ -16,7 +16,7 @@
 use crate::addr::PAGE_SIZE;
 use crate::boot::{BootInfo, MemoryKind};
 use crate::mm::PageInfo;
-use crate::mm::frame::alloc_table_frame;
+use crate::mm::frame::{alloc_table_frame, free_frame_phys};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -47,6 +47,9 @@ const NO_EXECUTE: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
 const HUGE_SIZE: u64 = 2 << 20;
+
+/// The top level entries of the kernel half of the address space.
+const KERNEL_HALF: core::ops::Range<usize> = 256..512;
 
 unsafe extern "C" {
     static __text_start: u8;
@@ -205,6 +208,12 @@ pub(crate) fn init(info: &BootInfo) {
         v += PAGE_SIZE;
     }
 
+    // Each top level entry of the kernel half points to a table now. A user address space copies
+    // these entries, so a later kernel mapping is in each address space too.
+    for i in KERNEL_HALF {
+        next_table(pml4, i, 0).unwrap_or_else(|()| panic!("no frame for the kernel page tables"));
+    }
+
     KERNEL_PML4.store(pml4, Ordering::Release);
     // SAFETY: the new tables map the kernel image at the same virtual addresses as the boot
     // tables, so the code, the stack, the GDT, the IDT and the TSS stay at their addresses. Each
@@ -222,6 +231,7 @@ pub(crate) fn init(info: &BootInfo) {
         );
     }
     DIRECT_MAP.store(true, Ordering::Release);
+    ACTIVE.store(pml4, Ordering::Release);
 }
 
 /// Maps one 4 KiB page of the vmalloc range.
@@ -239,35 +249,6 @@ pub(crate) fn map_mmio_page(virt: usize, phys: u64) -> Result<(), ()> {
     let _guard = TABLES.lock();
     let flags = WRITABLE | WRITE_THROUGH | NO_CACHE | GLOBAL | NO_EXECUTE;
     map_4k(KERNEL_PML4.load(Ordering::Acquire), virt, phys, flags)
-}
-
-/// The end of the user half of the address space. Linux names it `TASK_SIZE_MAX`. The last page
-/// below the end of the lower half is not used, as in Linux.
-pub(crate) const USER_END: usize = 0x0000_7fff_ffff_f000;
-
-/// Maps one 4 KiB page in the user half of the address space. Gives `Err` if the page is mapped
-/// already, or if no frame is free for a page table.
-///
-/// In R0 the user pages are in the kernel page tables, and they stay for all of the run time.
-/// Each process gets its own tables in R1.
-pub(crate) fn map_user_page(
-    virt: usize,
-    phys: u64,
-    writable: bool,
-    executable: bool,
-) -> Result<(), ()> {
-    assert!(virt < USER_END, "{virt:#x} is not in the user half");
-    let _guard = TABLES.lock();
-    let pt = leaf_table(KERNEL_PML4.load(Ordering::Acquire), virt, USER)?;
-    let index = indexes(virt)[3];
-    if read_entry(pt, index) & PRESENT != 0 {
-        return Err(());
-    }
-    let flags =
-        USER | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
-    write_entry(pt, index, phys | flags | PRESENT);
-    flush(virt);
-    Ok(())
 }
 
 /// Removes the mapping of one 4 KiB page of the vmalloc range. Gives the physical address that
@@ -329,4 +310,145 @@ pub(crate) fn query(virt: usize) -> Option<PageInfo> {
         table = e & ADDR_MASK;
     }
     None
+}
+
+/// The end of the user half of the address space. Linux names it `TASK_SIZE_MAX`. The last page
+/// below the end of the lower half is not used, as in Linux.
+pub(crate) const USER_END: usize = 0x0000_7fff_ffff_f000;
+
+/// The top level table that CR3 has now.
+static ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the top level table of a new user address space and gives its physical address. The
+/// user half is empty, and the kernel half has the entries of the kernel table.
+pub(crate) fn new_user_root() -> Option<u64> {
+    let root = alloc_table_frame()?;
+    let kernel = KERNEL_PML4.load(Ordering::Acquire);
+    for i in KERNEL_HALF {
+        write_entry(root, i, read_entry(kernel, i));
+    }
+    Some(root)
+}
+
+/// Gives back the tables of the user half of `root` and `root` itself. The caller removed the
+/// mappings of the pages, and `root` is not active.
+pub(crate) fn free_user_root(root: u64) {
+    assert!(ACTIVE.load(Ordering::Acquire) != root, "the address space is active");
+    fn free_level(table: u64, level: usize) {
+        if level > 1 {
+            for i in 0..512 {
+                let e = read_entry(table, i);
+                if e & PRESENT != 0 {
+                    free_level(e & ADDR_MASK, level - 1);
+                }
+            }
+        }
+        free_frame_phys(table);
+    }
+    for i in 0..KERNEL_HALF.start {
+        let e = read_entry(root, i);
+        if e & PRESENT != 0 {
+            free_level(e & ADDR_MASK, 3);
+        }
+    }
+    free_frame_phys(root);
+}
+
+/// The page table entry flags for a user page.
+fn user_flags(writable: bool, executable: bool) -> u64 {
+    USER | PRESENT | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE }
+}
+
+/// Gives the last level entry for `virt` in `root`, if the tables to it exist.
+fn user_leaf(root: u64, virt: usize) -> Option<(u64, usize)> {
+    let [i4, i3, i2, i1] = indexes(virt);
+    let mut table = root;
+    for i in [i4, i3, i2] {
+        let e = read_entry(table, i);
+        if e & PRESENT == 0 {
+            return None;
+        }
+        table = e & ADDR_MASK;
+    }
+    Some((table, i1))
+}
+
+/// Drops the TLB entry of `virt` if `root` is active.
+fn flush_user(root: u64, virt: usize) {
+    if ACTIVE.load(Ordering::Acquire) == root {
+        flush(virt);
+    }
+}
+
+/// Maps one 4 KiB page at `virt` in the user address space `root`. Gives `Err` if no frame is free
+/// for a page table. The caller makes sure that `virt` is page aligned, below `USER_END` and not
+/// mapped.
+pub(crate) fn user_map(
+    root: u64,
+    virt: usize,
+    phys: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), ()> {
+    assert!(virt < USER_END, "{virt:#x} is not in the user half");
+    let pt = leaf_table(root, virt, USER)?;
+    write_entry(pt, indexes(virt)[3], phys | user_flags(writable, executable));
+    flush_user(root, virt);
+    Ok(())
+}
+
+/// Removes the mapping of one 4 KiB page at `virt` in `root`, and gives the physical address that
+/// it mapped.
+pub(crate) fn user_unmap(root: u64, virt: usize) -> Option<u64> {
+    let (table, i) = user_leaf(root, virt)?;
+    let e = read_entry(table, i);
+    if e & PRESENT == 0 {
+        return None;
+    }
+    write_entry(table, i, 0);
+    flush_user(root, virt);
+    Some(e & ADDR_MASK)
+}
+
+/// Changes the permissions of a mapped page at `virt` in `root`.
+pub(crate) fn user_protect(root: u64, virt: usize, writable: bool, executable: bool) {
+    if let Some((table, i)) = user_leaf(root, virt) {
+        let e = read_entry(table, i);
+        if e & PRESENT != 0 {
+            write_entry(table, i, (e & ADDR_MASK) | user_flags(writable, executable));
+            flush_user(root, virt);
+        }
+    }
+}
+
+/// Walks the user address space `root` for one virtual address.
+pub(crate) fn user_query(root: u64, virt: usize) -> Option<PageInfo> {
+    let (table, i) = user_leaf(root, virt)?;
+    let e = read_entry(table, i);
+    if e & PRESENT == 0 {
+        return None;
+    }
+    Some(PageInfo {
+        phys: crate::addr::PhysAddr::new(e & ADDR_MASK),
+        writable: e & WRITABLE != 0,
+        executable: e & NO_EXECUTE == 0,
+        user: true,
+    })
+}
+
+/// Loads `root` into CR3. A value of 0 loads the kernel table.
+pub(crate) fn activate(root: u64) {
+    let root = if root == 0 { KERNEL_PML4.load(Ordering::Acquire) } else { root };
+    if ACTIVE.swap(root, Ordering::AcqRel) == root {
+        return;
+    }
+    // SAFETY: `root` is the kernel table or a table from `new_user_root`. Each one has the kernel
+    // half of the kernel table, so the code, the stack and the data of the kernel stay mapped at
+    // the same addresses.
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
+}
+
+/// Tells if `root` is in CR3 now.
+pub(crate) fn is_active(root: u64) -> bool {
+    ACTIVE.load(Ordering::Acquire) == root
 }

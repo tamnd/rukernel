@@ -1,14 +1,16 @@
-//! User mode: user pages and the entry to user code.
+//! User mode: the entry to user code.
 //!
 //! A `UserContext` holds the user registers. `execute` runs the user code until it makes a system
 //! call, takes an exception or is interrupted, and then gives the reason. The kernel handles the
 //! reason and calls `execute` again. This is the model of OSTD, per spec/03-architecture.md.
 //!
+//! The user code runs in the address space that is active. The kernel activates the `VmSpace` of
+//! the process before it calls `execute`.
+//!
 //! Only x86-64 has user mode in R0. arm64 gets it in R4 and riscv64 in R8.
 
-use crate::addr::{PAGE_SIZE, VirtAddr};
+use crate::addr::VirtAddr;
 use crate::arch::imp::{paging, user};
-use crate::mm::Frame;
 
 pub use user::{FpuState, UserRegs};
 
@@ -109,38 +111,4 @@ impl UserContext {
     pub fn set_syscall_return(&mut self, value: u64) {
         self.regs.rax = value;
     }
-}
-
-/// A user page could not be mapped.
-#[derive(Debug)]
-pub struct MapError {
-    /// The frame that was not mapped.
-    pub frame: Frame,
-}
-
-/// Maps `frame` at the user address `addr`. The frame stays mapped for all of the run time.
-///
-/// In R0 there is one address space, and nothing removes a user page. Each process gets its own
-/// address space in R1.
-///
-/// # Errors
-///
-/// Gives the frame back if `addr` is not page aligned, is not in the user half, is mapped
-/// already, or if no frame is free for a page table.
-pub fn map_page(
-    addr: VirtAddr,
-    frame: Frame,
-    writable: bool,
-    executable: bool,
-) -> Result<(), MapError> {
-    let a = addr.get();
-    if !a.is_multiple_of(PAGE_SIZE) || a >= USER_END {
-        return Err(MapError { frame });
-    }
-    if paging::map_user_page(a, frame.addr().get(), writable, executable).is_err() {
-        return Err(MapError { frame });
-    }
-    // The page tables own the frame now.
-    core::mem::forget(frame);
-    Ok(())
 }
