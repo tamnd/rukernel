@@ -143,8 +143,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends qemu-system-x86 ovmf musl-tools
+      # tools/ltp/build.sh builds the LTP tests in a container. The cache keeps them until the
+      # script changes.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: ltp
+        with:
+          path: ~/.cache/rk-ltp
+          key: ltp-${{ hashFiles('tools/ltp/build.sh') }}
+      - name: build the LTP tests
+        if: steps.ltp.outputs.cache-hit != 'true'
+        run: tools/ltp/build.sh ~/.cache/rk-ltp
       - name: boot tests
-        run: cargo xtask boot-test
+        run: RK_LTP="$HOME/.cache/rk-ltp" cargo xtask boot-test
 
   # rk-abigen reads the pinned Linux tree and writes abi/ and core/rk-abi/src/generated/. This job
   # runs it again and fails if the output is not the same as the files in the tree, per

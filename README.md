@@ -64,6 +64,13 @@ The `init` and `tty` boot tests run the C programs in `tests/user`. The build co
 cargo xtask qemu console=ttyS0 rdinit=/bin/sh -- -i
 ```
 
+The `ltp` boot test runs tests of the Linux Test Project. `tools/ltp/build.sh` builds them as static musl programs in an Alpine container, and needs docker. The test runs each test in `tools/ltp/tests.txt`. It finds the programs in `target/ltp`, or in the directory that `RK_LTP` gives. To run only some boot tests, give their names:
+
+```
+tools/ltp/build.sh target/ltp
+cargo xtask boot-test ltp
+```
+
 ## Repository layout
 
 | Path | Contents |

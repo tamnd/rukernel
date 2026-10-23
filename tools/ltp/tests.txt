@@ -1,0 +1,9 @@
+# The LTP tests that the ltp boot test runs, one name on each line. tools/ltp/build.sh builds
+# them. A test that is not in this list does not pass yet.
+clone02
+exit01
+fork05
+mmap11
+mprotect02
+mprotect03
+mprotect04
