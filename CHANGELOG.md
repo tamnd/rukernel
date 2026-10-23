@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.1.2] (2026-10-24)
+
+This release continues milestone R1. The kernel now runs a static program from the initramfs as the first process.
+
 ### Added
 
 - rk-abi has six new groups of constants: `stat` for the mode bits and `statx`, `ioctls` for the terminal and file `ioctl` commands, `termbits` for `struct termios`, `auxv` for the auxiliary vector, `elf` for the ELF headers and `random` for `getrandom`. rk-abigen generates them from the uAPI headers, as it does for the other groups.
@@ -117,6 +121,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.1.2]: https://github.com/tamnd/rukernel/releases/tag/v0.1.2
 [0.1.1]: https://github.com/tamnd/rukernel/releases/tag/v0.1.1
 [0.1.0]: https://github.com/tamnd/rukernel/releases/tag/v0.1.0
 [0.0.4]: https://github.com/tamnd/rukernel/releases/tag/v0.0.4
