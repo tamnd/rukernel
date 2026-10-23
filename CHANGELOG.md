@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.0.2] (2026-10-23)
+
 ### Added
 
 - Traps on x86-64. The GDT has the Linux selectors. The TSS has separate stacks for a double fault, an NMI and a machine check. The IDT sends all 256 vectors to one trap handler. An unhandled kernel exception prints an Oops message with the registers and panics.
@@ -33,4 +35,5 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.0.2]: https://github.com/tamnd/rukernel/releases/tag/v0.0.2
 [0.0.1]: https://github.com/tamnd/rukernel/releases/tag/v0.0.1
