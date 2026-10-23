@@ -126,7 +126,13 @@ fn heap_test() -> bool {
     let used = frames - mm::frame_stats().free;
     drop(big);
     let back = mm::frame_stats().free;
-    ok &= check("the frames of a large block come back", used >= 256 && back == frames);
+    // The 256 data frames come back. The block can need a new page table, and the page tables of
+    // the heap range stay.
+    let tables = used.saturating_sub(256);
+    ok &= check(
+        "the frames of a large block come back",
+        used >= 256 && tables <= 2 && back + tables == frames,
+    );
     ok &= check("the heap gives back each byte", mm::heap_stats().in_use == start);
     ok
 }

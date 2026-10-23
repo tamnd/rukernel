@@ -402,6 +402,7 @@ const BOOT_TESTS: &[&str] = &[
     "fault",
     "init",
     "tty",
+    "busybox",
 ];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
@@ -483,22 +484,84 @@ fn build_user(dir: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     Ok(Some((read(&init)?, read(&hello)?)))
 }
 
+/// The static BusyBox that the `busybox` boot test runs, from the binaries of busybox.net. The
+/// test checks the SHA-256 of the file. `RK_BUSYBOX` gives the path of a different BusyBox.
+const BUSYBOX_URL: &str = "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox";
+const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348";
+
+/// The applets that the `busybox` boot test uses. Each one is a link to /bin/busybox.
+const BUSYBOX_APPLETS: &[&str] = &["sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test"];
+
+/// Gives the SHA-256 of `path` in hexadecimal, from `sha256sum` or `shasum`.
+fn sha256(path: &Path) -> Result<String> {
+    for cmd in [&["sha256sum"][..], &["shasum", "-a", "256"]] {
+        let Ok(out) = Command::new(cmd[0]).args(&cmd[1..]).arg(path).output() else {
+            continue;
+        };
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            return Ok(text.split_whitespace().next().unwrap_or_default().to_owned());
+        }
+    }
+    Err(String::from("no sha256sum or shasum for the check of BusyBox"))
+}
+
+/// Gives the bytes of the static BusyBox. The first run downloads it with `curl` into the
+/// directory `dir`. Gives `None` if there is no BusyBox and the run is not in CI.
+fn busybox(dir: &Path) -> Result<Option<Vec<u8>>> {
+    let read = |p: &Path| fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+    if let Some(path) = std::env::var_os("RK_BUSYBOX") {
+        return read(Path::new(&path)).map(Some);
+    }
+    let path = dir.join("busybox");
+    if !path.exists() {
+        let status = Command::new("curl")
+            .args(["--silent", "--show-error", "--fail", "--location", "--output"])
+            .arg(&path)
+            .arg(BUSYBOX_URL)
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            let _ = fs::remove_file(&path);
+            if std::env::var_os("CI").is_some() {
+                return Err(format!("cannot download {BUSYBOX_URL}"));
+            }
+            println!("busybox: skipped, the download failed, set RK_BUSYBOX");
+            return Ok(None);
+        }
+    }
+    let sum = sha256(&path)?;
+    if sum != BUSYBOX_SHA256 {
+        let _ = fs::remove_file(&path);
+        return Err(format!("{}: the SHA-256 is {sum}, not {BUSYBOX_SHA256}", path.display()));
+    }
+    read(&path).map(Some)
+}
+
 /// Builds the x86-64 kernel and the initramfs of the boot tests, and gives the path of the ELF
 /// image. The initramfs is in the same directory.
 fn build_kernel() -> Result<PathBuf> {
     cargo(&["build", "--package", "rukernel", "--target", "x86_64-unknown-none"])?;
     let kernel = workspace_root().join("target/x86_64-unknown-none/debug/rukernel");
-    let user = build_user(kernel.parent().ok_or("the kernel path has no directory")?)?;
+    let dir = kernel.parent().ok_or("the kernel path has no directory")?;
+    let user = build_user(dir)?;
+    let busybox = busybox(dir)?;
+    let marker = kernel.with_file_name("busybox-ready");
+    if busybox.is_some() {
+        fs::write(&marker, b"").map_err(|e| format!("{}: {e}", marker.display()))?;
+    } else {
+        let _ = fs::remove_file(&marker);
+    }
     let initramfs = kernel.with_file_name("initramfs.cpio");
-    fs::write(&initramfs, test_initramfs(user.as_ref()))
+    fs::write(&initramfs, test_initramfs(user.as_ref(), busybox.as_deref()))
         .map_err(|e| format!("{}: {e}", initramfs.display()))?;
     Ok(kernel)
 }
 
 /// The initramfs that the `initramfs` and `init` self tests read, per
 /// kernel/rukernel/src/selftest.rs and tests/user/init.c. With no user programs, `/init` is a
-/// script that cannot run.
-fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
+/// script that cannot run. With BusyBox, /bin has BusyBox and a link for each applet of
+/// `BUSYBOX_APPLETS`.
+fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>, busybox: Option<&[u8]>) -> Vec<u8> {
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
     w.add(b"etc", 0o040_755, b"");
@@ -512,6 +575,15 @@ fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>) -> Vec<u8> {
             w.add(b"bin/hello", 0o100_755, hello);
         }
         None => w.add(b"init", 0o100_755, b"#!/bin/sh\n"),
+    }
+    if let Some(busybox) = busybox {
+        if user.is_none() {
+            w.add(b"bin", 0o040_755, b"");
+        }
+        w.add(b"bin/busybox", 0o100_755, busybox);
+        for applet in BUSYBOX_APPLETS {
+            w.add(format!("bin/{applet}").as_bytes(), 0o120_777, b"busybox");
+        }
     }
     w.finish()
 }
@@ -702,9 +774,14 @@ fn qemu(args: &[String]) -> Result {
     Ok(())
 }
 
-/// Tells if the boot test `test` can run. The `init` and `tty` tests need the user programs.
+/// Tells if the boot test `test` can run. The `init` and `tty` tests need the user programs, and
+/// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
-    !matches!(test, "init" | "tty") || kernel.with_file_name("user-init").exists()
+    match test {
+        "init" | "tty" => kernel.with_file_name("user-init").exists(),
+        "busybox" => kernel.with_file_name("busybox-ready").exists(),
+        _ => true,
+    }
 }
 
 /// The command line of a boot test. The `tty` test runs init with the argument `tty`, which is
@@ -712,13 +789,14 @@ fn can_run(kernel: &Path, test: &str) -> bool {
 fn test_cmdline(test: &str) -> String {
     match test {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
+        "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         _ => format!("console=ttyS0 rk.test={test}"),
     }
 }
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if test == "tty" { "init" } else { test };
+    let test = if matches!(test, "tty" | "busybox") { "init" } else { test };
     format!("rk.test={test}: pass")
 }
 
@@ -727,6 +805,15 @@ fn pass_line(test: &str) -> String {
 fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
     match test {
         "tty" => &[("init: type a line", b"hello\n"), ("init: press ^C", b"\x03")],
+        // The shell runs a pipeline, then a job in the foreground. `^C` stops the job, and the
+        // shell exits with 0 if the job ended with `SIGINT`. The quotes keep the echo of the
+        // typed line different from the output.
+        "busybox" => &[
+            ("/ # ", b"echo one two | tr a-z A-Z | cat\n"),
+            ("ONE TWO", b"sh -c 'while :; do echo T\"ICK\"; sleep 1; done'\n"),
+            ("TICK", b"\x03"),
+            ("TICK", b"test $? = 130; exit $?\n"),
+        ],
         _ => &[],
     }
 }
