@@ -7,6 +7,10 @@ name = "rk-abi"
 version = "0.0.2"
 
 [[package]]
+name = "rk-abigen"
+version = "0.0.2"
+
+[[package]]
 name = "rk-frame"
 version = "0.0.2"
 

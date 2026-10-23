@@ -34,7 +34,7 @@ cargo test --workspace
 
 **The layer rule.** A crate depends only on crates in its layer or a lower layer. `xtask/layers.txt` gives the layers. Section 23.2 of the same document gives the reasons.
 
-**The ABI is generated.** Do not write a system call number, a structure layout or a uAPI constant by hand. Change `rk-abigen` or its input.
+**The ABI is generated.** Do not write a system call number, a structure layout or a uAPI constant by hand. Change `rk-abigen` or its input. Then run `cargo run -p rk-abigen -- fetch` one time and `cargo run -p rk-abigen -- generate`, and commit the files in `abi/` and `core/rk-abi/src/generated/`. `cargo xtask abi` does the same steps and fails if the output is not in the tree.
 
 **A behavior difference from Linux is a bug.** If Linux and rukernel give different results, fix rukernel. If the difference is correct, add an entry to the register in `rukernel-compat` and give the reason.
 

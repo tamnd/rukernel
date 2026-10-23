@@ -5,6 +5,7 @@ members = [
     "core/rk-abi",
     "core/rk-lib",
     "kernel/rukernel",
+    "tools/rk-abigen",
     "xtask",
 ]
 

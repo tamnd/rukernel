@@ -1,6 +1,7 @@
 //! The build checks of rukernel.
 //!
-//! Each check is a command: `cargo xtask unsafe`, `layers`, `style`, `targets`, `boot-test` or `ci`.
+//! Each check is a command: `cargo xtask unsafe`, `layers`, `style`, `targets`, `boot-test`, `abi`
+//! or `ci`.
 //! The CI gate runs the same commands. Thus a check that passes on a developer machine passes in
 //! CI. `cargo xtask qemu` boots the kernel for a person to use.
 
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
         "targets" => build_targets(),
         "qemu" => qemu(&std::env::args().skip(2).collect::<Vec<_>>()),
         "boot-test" => boot_test(),
+        "abi" => check_abi(),
         "ci" => ci(),
         _ => Err(String::from(
             "usage: cargo xtask <unsafe | layers | style | targets | qemu | boot-test | ci>\n\n\
@@ -46,7 +48,8 @@ fn main() -> ExitCode {
              targets  the kernel crates build for the three bare metal targets\n\
              qemu     boot the x86-64 kernel in QEMU, with the arguments as the command line\n\
              boot-test  boot the x86-64 kernel in QEMU and check the self tests\n\
-             ci       all of the above except qemu, and fmt, clippy, test and doc",
+             abi      run rk-abigen on the pinned Linux tree and check that the output is in the tree\n\
+             ci       all of the above except qemu and abi, and fmt, clippy, test and doc",
         )),
     };
     match result {
@@ -284,6 +287,30 @@ fn build_targets() -> Result {
         }
         cargo(&args)?;
     }
+    Ok(())
+}
+
+/// The directories that rk-abigen writes.
+const ABI_OUTPUT: &[&str] = &["abi", "core/rk-abi/src/generated"];
+
+/// Runs rk-abigen and fails if its output is not the same as the files in the tree. The check
+/// downloads the Linux tarball one time, so `ci` does not run it. CI runs it as its own job.
+fn check_abi() -> Result {
+    cargo(&["run", "--quiet", "--package", "rk-abigen", "--", "fetch"])?;
+    cargo(&["run", "--quiet", "--package", "rk-abigen", "--", "generate"])?;
+    let out = Command::new("git")
+        .args(["status", "--porcelain", "--"])
+        .args(ABI_OUTPUT)
+        .current_dir(workspace_root())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    let changed = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !changed.trim().is_empty() {
+        return Err(format!(
+            "abi: the rk-abigen output is not the same as the tree. Commit the new output:\n{changed}"
+        ));
+    }
+    println!("abi: ok");
     Ok(())
 }
 

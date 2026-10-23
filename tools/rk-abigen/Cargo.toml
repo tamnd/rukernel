@@ -1,0 +1,13 @@
+[package]
+name = "rk-abigen"
+description = "The ABI generator of rukernel. It reads a pinned Linux tree and writes the ABI as data."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
