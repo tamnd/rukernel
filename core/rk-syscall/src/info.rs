@@ -92,21 +92,8 @@ pub(crate) fn time(cx: &Cx<'_>, tloc: u64) -> SysResult {
 /// Waits until the tick count is at `deadline`, or the thread must stop. Gives `true` if the
 /// thread must stop first.
 fn sleep_until(thread: &rk_proc::Thread, deadline: u64) -> bool {
-    loop {
-        if thread.is_killed() {
-            return true;
-        }
-        if ticks() >= deadline {
-            return false;
-        }
-        rk_frame::task::yield_now();
-        if ticks() < deadline {
-            // No other task ran or the tick did not come yet. The CPU waits for the next
-            // interrupt, which is at most one tick.
-            rk_frame::irq::wait();
-            rk_frame::irq::disable();
-        }
-    }
+    let queue = rk_frame::task::WaitQueue::new();
+    queue.wait_until_timeout(deadline, || thread.is_killed().then_some(())).is_some()
 }
 
 pub(crate) fn clock_nanosleep(

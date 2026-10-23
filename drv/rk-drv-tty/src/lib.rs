@@ -2,8 +2,11 @@
 //!
 //! R1 has one terminal: the serial console. `/dev/console` (5, 1), `/dev/tty` (5, 0) and
 //! `/dev/ttyS0` (4, 64) open it. The line discipline does the input and output processing, per
-//! spec/22-milestones.md item R1. The console polls the serial port for input. The interrupt of
-//! the serial port comes with the change that gives the signals of the terminal to the processes.
+//! spec/22-milestones.md item R1.
+//!
+//! R1 has no I/O APIC, so the serial port has no interrupt. The driver reads the serial port in
+//! the bottom half of rk-frame instead, after each interrupt. The timer interrupts 250 times each
+//! second, so the input comes in at most 4 ms, and `^C` stops a program that does not read.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -26,7 +29,7 @@ use rk_abi::native::types::{Termios, Winsize};
 use rk_frame::sync::SpinLock;
 use rk_vfs::device::{self, CharDevice, makedev};
 use rk_vfs::inode::Result;
-use rk_vfs::{File, FileOps, UserMemory};
+use rk_vfs::{File, FileOps, UserMemory, WaitQueue};
 use zerocopy::{FromZeros, IntoBytes};
 
 /// The device number of `/dev/tty`, the controlling terminal of the caller.
@@ -65,31 +68,8 @@ pub fn set_signal_handler(f: fn(u32, u32)) {
     *SIGNAL.lock() = Some(f);
 }
 
-/// The function that tells if the caller must stop a wait, because a signal ends it.
-static INTERRUPTED: SpinLock<Option<fn() -> bool>> = SpinLock::new(None);
-
-/// Sets the function that tells if a read that waits must stop with `EINTR`.
-pub fn set_interrupt_check(f: fn() -> bool) {
-    *INTERRUPTED.lock() = Some(f);
-}
-
-fn interrupted() -> bool {
-    let check = *INTERRUPTED.lock();
-    check.is_some_and(|f| f())
-}
-
-/// Waits a short time for input. The serial port has no interrupt in R1, so the reader polls it.
-/// Another task runs first. If no task runs, the CPU waits for the next timer tick.
-fn wait_for_input() {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    {
-        rk_frame::task::yield_now();
-        rk_frame::irq::wait();
-        rk_frame::irq::disable();
-    }
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
-    core::hint::spin_loop();
-}
+/// The readers of the console wait here for input.
+static INPUT_WAIT: WaitQueue = WaitQueue::new();
 
 /// Makes `sid` the session and `pgrp` the foreground process group of the console. The kernel
 /// calls it for init, which has the console as its controlling terminal.
@@ -106,13 +86,16 @@ fn console_write(tty: &Tty, data: &[u8]) {
     rk_frame::console::write_bytes(&out);
 }
 
-/// Takes the bytes that came from the serial port, and gives each signal to the process layer.
-fn poll_input() {
+/// Takes the bytes that came from the serial port, wakes the readers and gives each signal to
+/// the process layer.
+pub fn poll_input() {
     let mut signals = Vec::new();
+    let mut received = false;
     {
         let mut tty = CONSOLE.lock();
         let mut echo = Vec::new();
         while let Some(b) = rk_frame::console::try_read_byte() {
+            received = true;
             if let Some(sig) = tty.ldisc.receive(b, &mut echo) {
                 signals.push((tty.pgrp, sig));
             }
@@ -120,6 +103,9 @@ fn poll_input() {
         if !echo.is_empty() {
             console_write(&tty, &echo);
         }
+    }
+    if received {
+        INPUT_WAIT.wake_all();
     }
     let handler = *SIGNAL.lock();
     if let Some(send) = handler {
@@ -136,22 +122,17 @@ struct ConsoleFile;
 
 impl FileOps for ConsoleFile {
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
-        loop {
+        INPUT_WAIT.wait_interruptible(|| {
             poll_input();
-            {
-                let mut tty = CONSOLE.lock();
-                if tty.ldisc.readable() || buf.is_empty() {
-                    return Ok(tty.ldisc.read(buf));
-                }
+            let mut tty = CONSOLE.lock();
+            if tty.ldisc.readable() || buf.is_empty() {
+                return Ok(Some(tty.ldisc.read(buf)));
             }
             if file.flags().nonblock() {
                 return Err(Errno::EAGAIN);
             }
-            if interrupted() {
-                return Err(Errno::EINTR);
-            }
-            wait_for_input();
-        }
+            Ok(None)
+        })
     }
 
     fn write(&self, _file: &File, buf: &[u8]) -> Result<usize> {
@@ -221,11 +202,14 @@ impl CharDevice for ConsoleDevice {
     }
 }
 
-/// Adds the console devices to the table of character devices.
+/// Adds the console devices to the table of character devices, and adds `poll_input` to the
+/// bottom half.
 pub fn init() {
     for rdev in [TTY_RDEV, CONSOLE_RDEV, TTYS0_RDEV] {
         device::register_char(rdev, Arc::new(ConsoleDevice));
     }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    rk_frame::task::add_bottom_half(poll_input);
 }
 
 #[cfg(test)]

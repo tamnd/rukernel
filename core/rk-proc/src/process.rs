@@ -509,7 +509,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
 ///
 /// # Errors
 ///
-/// Gives `ECHILD` if no child matches, and `EINTR` if `interrupted` gives `true`.
+/// Gives `ECHILD` if no child matches, and `ERESTARTSYS` if `interrupted` gives `true`.
 pub fn wait_child(
     process: &Process,
     target: WaitTarget,
@@ -551,7 +551,7 @@ pub fn wait_child(
             return Some(Ok(None));
         }
         if interrupted() {
-            return Some(Err(Errno::EINTR));
+            return Some(Err(Errno::ERESTARTSYS));
         }
         None
     })

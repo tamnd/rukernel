@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -389,8 +389,20 @@ const QEMU_PASS: i32 = 33;
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The self tests that `boot-test` runs, each in its own boot.
-const BOOT_TESTS: &[&str] =
-    &["boot", "trap", "mm", "heap", "timer", "initramfs", "syscall", "vm", "task", "fault", "init"];
+const BOOT_TESTS: &[&str] = &[
+    "boot",
+    "trap",
+    "mm",
+    "heap",
+    "timer",
+    "initramfs",
+    "syscall",
+    "vm",
+    "task",
+    "fault",
+    "init",
+    "tty",
+];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
 const BZIMAGE_TESTS: &[&str] = &["boot", "mm", "initramfs", "init"];
@@ -690,18 +702,42 @@ fn qemu(args: &[String]) -> Result {
     Ok(())
 }
 
-/// Tells if the boot test `test` can run. The `init` test needs the user programs.
+/// Tells if the boot test `test` can run. The `init` and `tty` tests need the user programs.
 fn can_run(kernel: &Path, test: &str) -> bool {
-    test != "init" || kernel.with_file_name("user-init").exists()
+    !matches!(test, "init" | "tty") || kernel.with_file_name("user-init").exists()
+}
+
+/// The command line of a boot test. The `tty` test runs init with the argument `tty`, which is
+/// after `--`, as Linux gives the arguments of init.
+fn test_cmdline(test: &str) -> String {
+    match test {
+        "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
+        _ => format!("console=ttyS0 rk.test={test}"),
+    }
+}
+
+/// The line that the kernel prints when the boot test `test` passes.
+fn pass_line(test: &str) -> String {
+    let test = if test == "tty" { "init" } else { test };
+    format!("rk.test={test}: pass")
+}
+
+/// The input of a boot test. When the log has the text of an entry, the test writes the bytes of
+/// the entry to the serial port. The `tty` test types a line and then `^C`.
+fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
+    match test {
+        "tty" => &[("init: type a line", b"hello\n"), ("init: press ^C", b"\x03")],
+        _ => &[],
+    }
 }
 
 fn boot_test() -> Result {
     let kernel = build_kernel()?;
     let mut errors = Vec::new();
     for test in BOOT_TESTS.iter().filter(|t| can_run(&kernel, t)) {
-        let cmdline = format!("console=ttyS0 rk.test={test}");
-        let (status, log) = run_with_timeout(qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)?;
-        let passed = status == Some(QEMU_PASS) && log.contains(&format!("rk.test={test}: pass"));
+        let cmd = qemu_command(&kernel, &test_cmdline(test));
+        let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
+        let passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
         if passed {
             println!("boot test {test}: pass");
         } else {
@@ -711,11 +747,11 @@ fn boot_test() -> Result {
     }
     let bzimage = build_bzimage()?;
     for test in BZIMAGE_TESTS.iter().filter(|t| can_run(&kernel, t)) {
-        let cmdline = format!("console=ttyS0 rk.test={test}");
-        let (status, log) = run_with_timeout(qemu_command(&bzimage, &cmdline), BOOT_TEST_TIMEOUT)?;
+        let cmd = qemu_command(&bzimage, &test_cmdline(test));
+        let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
         let passed = status == Some(QEMU_PASS)
             && log.contains("booting with linux")
-            && log.contains(&format!("rk.test={test}: pass"));
+            && log.contains(&pass_line(test));
         if passed {
             println!("boot test {test} with the bzImage: pass");
         } else {
@@ -726,14 +762,13 @@ fn boot_test() -> Result {
     match find_ovmf()? {
         Some(firmware) => {
             for test in BZIMAGE_TESTS.iter().filter(|t| can_run(&kernel, t)) {
-                let cmdline = format!("console=ttyS0 rk.test={test}");
-                let mut cmd = qemu_command(&bzimage, &cmdline);
+                let mut cmd = qemu_command(&bzimage, &test_cmdline(test));
                 cmd.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", firmware.display()));
-                let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT)?;
+                let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
                 let passed = status == Some(QEMU_PASS)
                     && log.contains("booting with efi")
-                    && log.contains(&format!("rk.test={test}: pass"));
+                    && log.contains(&pass_line(test));
                 if passed {
                     println!("boot test {test} with UEFI: pass");
                 } else {
@@ -771,22 +806,48 @@ fn find_ovmf() -> Result<Option<PathBuf>> {
     Ok(found)
 }
 
-/// Runs a command, collects its standard output and stops it after `timeout`. Gives the exit
-/// status, or `None` for a timeout.
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(Option<i32>, String)> {
+/// Runs a command, collects its standard output and stops it after `timeout`. When the output has
+/// the text of the next entry of `input`, the bytes of the entry go to the standard input of the
+/// command. Gives the exit status, or `None` for a timeout.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+    input: &[(&str, &[u8])],
+) -> Result<(Option<i32>, String)> {
     let mut child = cmd
         .stdout(Stdio::piped())
-        .stdin(Stdio::null())
+        .stdin(if input.is_empty() { Stdio::null() } else { Stdio::piped() })
         .spawn()
         .map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
     let mut stdout = child.stdout.take().ok_or("no standard output")?;
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = stdout.read_to_end(&mut out);
-        String::from_utf8_lossy(&out).into_owned()
-    });
+    let mut stdin = child.stdin.take();
+    let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader = {
+        let out = out.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&buf[..n]);
+            }
+        })
+    };
+    let mut next = input.iter();
+    let mut waiting = next.next();
     let start = Instant::now();
     let status = loop {
+        if let (Some((text, bytes)), Some(pipe)) = (waiting, stdin.as_mut()) {
+            let seen = {
+                let out = out.lock().unwrap_or_else(|e| e.into_inner());
+                String::from_utf8_lossy(&out).contains(text)
+            };
+            if seen {
+                pipe.write_all(bytes).and_then(|()| pipe.flush()).map_err(|e| e.to_string())?;
+                waiting = next.next();
+            }
+        }
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             break status.code();
         }
@@ -797,7 +858,9 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(Option<i32>,
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let log = reader.join().unwrap_or_default();
+    drop(stdin);
+    let _ = reader.join();
+    let log = String::from_utf8_lossy(&out.lock().unwrap_or_else(|e| e.into_inner())).into_owned();
     Ok((status, log))
 }
 

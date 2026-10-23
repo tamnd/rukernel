@@ -72,7 +72,9 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     };
     rootfs::make_dev(fs);
     let path = param(boot.cmdline(), "rdinit").unwrap_or("/init");
-    let argv = vec![Vec::from(path.as_bytes())];
+    // The words after `--` are the arguments of init, as Linux gives them.
+    let mut argv = vec![Vec::from(path.as_bytes())];
+    argv.extend(init_args(boot.cmdline()).map(|w| w.as_bytes().to_vec()));
     let envp = vec![b"HOME=/".to_vec(), b"TERM=linux".to_vec()];
     if let Err(e) = rk_syscall::spawn_init(fs.clone(), path.as_bytes(), argv, envp) {
         panic!("No working init found. Error {} for {path}.", e.get());
@@ -87,9 +89,18 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     panic!("Attempted to kill init! exitcode={:#010x}", status.0);
 }
 
-/// Gives the value of `name=value` on the command line.
+/// Gives the value of `name=value` on the command line. A word after `--` is for init.
 fn param<'a>(cmdline: &'a str, name: &str) -> Option<&'a str> {
-    cmdline.split_ascii_whitespace().find_map(|w| w.strip_prefix(name)?.strip_prefix('='))
+    cmdline
+        .split_ascii_whitespace()
+        .take_while(|w| *w != "--")
+        .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// Gives the words after `--` on the command line.
+#[cfg(target_arch = "x86_64")]
+fn init_args(cmdline: &str) -> impl Iterator<Item = &str> {
+    cmdline.split_ascii_whitespace().skip_while(|w| *w != "--").skip(1)
 }
 
 #[panic_handler]

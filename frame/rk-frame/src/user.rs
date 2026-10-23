@@ -89,7 +89,10 @@ impl UserContext {
     pub fn execute(&mut self) -> ReturnReason {
         match user::enter(&mut self.regs, &mut self.fpu, self.fs_base) {
             user::Return::Syscall => ReturnReason::Syscall,
-            user::Return::Interrupt => ReturnReason::Interrupt,
+            user::Return::Interrupt => {
+                crate::task::run_bottom_half();
+                ReturnReason::Interrupt
+            }
             user::Return::Exception { vector, error, cr2 } => {
                 ReturnReason::Exception(UserException { vector, error, addr: cr2 })
             }

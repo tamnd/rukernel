@@ -15,6 +15,24 @@ impl Errno {
     /// The largest error number. Linux calls this value `MAX_ERRNO`.
     pub const MAX: u16 = 4095;
 
+    // The numbers from 512 to 516 are for the kernel only, per include/linux/errno.h. A system
+    // call that a signal stops gives one of them. The system call layer then starts the call
+    // again, or gives `EINTR` to user space. User space never sees these numbers.
+
+    /// Start the call again if no signal handler runs, or if the handler has `SA_RESTART`.
+    pub const ERESTARTSYS: Self = Self(512);
+    /// Always start the call again.
+    pub const ERESTARTNOINTR: Self = Self(513);
+    /// Start the call again only if no signal handler runs.
+    pub const ERESTARTNOHAND: Self = Self(514);
+    /// Start the call again with `restart_syscall` if no signal handler runs.
+    pub const ERESTART_RESTARTBLOCK: Self = Self(516);
+
+    /// Tells if the number is one of the restart numbers of the kernel.
+    pub const fn is_restart(self) -> bool {
+        matches!(self.0, 512..=514 | 516)
+    }
+
     /// Makes an error number. Gives `None` if the number is zero or larger than [`Errno::MAX`].
     pub const fn new(n: u16) -> Option<Self> {
         if n == 0 || n > Self::MAX { None } else { Some(Self(n)) }
