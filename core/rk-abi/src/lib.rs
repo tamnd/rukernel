@@ -53,6 +53,12 @@ mod tests {
         assert_eq!(aarch64::signal::SIGSTKSZ, 16384);
         // Linux 7.3 also has FUTEX_ROBUST_UNLOCK and FUTEX_ROBUST_LIST32 in the mask.
         assert_eq!(x86_64::futex::FUTEX_CMD_MASK, !(128 | 256 | 512 | 1024));
+        assert_eq!(x86_64::stat::S_IFDIR, 0o40000);
+        assert_eq!(x86_64::ioctls::TCGETS, 0x5401);
+        assert_eq!(x86_64::termbits::ICANON, 2);
+        assert_eq!(x86_64::auxv::AT_RANDOM, 25);
+        assert_eq!(x86_64::elf::PT_LOAD, 1);
+        assert_eq!(x86_64::random::GRND_NONBLOCK, 1);
     }
 
     #[test]
