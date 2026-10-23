@@ -82,6 +82,8 @@ pub struct Process {
     state: SpinLock<State>,
     /// The process waits here in `wait4` for a change of its children.
     child_wait: WaitQueue,
+    /// `execve` waits here until the other threads of the process are gone.
+    thread_exit: WaitQueue,
     vm: SpinLock<Option<Arc<AddressSpace>>>,
     files: SpinLock<Option<SharedFiles>>,
     fs: SpinLock<Option<SharedFs>>,
@@ -333,6 +335,7 @@ impl Process {
                 comm,
             }),
             child_wait: WaitQueue::new(),
+            thread_exit: WaitQueue::new(),
             vm: SpinLock::new(Some(vm)),
             files: SpinLock::new(Some(files)),
             fs: SpinLock::new(Some(fs)),
@@ -712,6 +715,23 @@ pub fn kill_group(process: &Process, status: WaitStatus) {
     }
 }
 
+/// Ends each other thread of the process of `thread`, and waits until they are gone, as
+/// `de_thread` of Linux does. `execve` calls it before it replaces the program, because the other
+/// threads cannot run in the new program.
+pub(crate) fn kill_other_threads(thread: &Thread) {
+    let process = &thread.process;
+    let others: Vec<Arc<Thread>> =
+        process.state.lock().threads.iter().filter(|t| t.tid != thread.tid).cloned().collect();
+    if others.is_empty() {
+        return;
+    }
+    for t in &others {
+        t.kill();
+    }
+    drop(others);
+    process.thread_exit.wait_until(|| (process.state.lock().threads.len() <= 1).then_some(()));
+}
+
 /// Ends `thread`. The caller then ends the task. If this is the last thread of its process, the
 /// process ends: it closes its files, drops its address space, gives its children to init and
 /// becomes a zombie for its parent. `status` is the status of the thread, and the status of the
@@ -725,6 +745,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         s.threads.is_empty()
     };
     if !last {
+        process.thread_exit.wake_all();
         return;
     }
     // The task runs on the page table of the address space, so the kernel table goes first.

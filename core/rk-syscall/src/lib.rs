@@ -26,6 +26,8 @@ mod cx;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod fs;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod futex;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod info;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod mm;

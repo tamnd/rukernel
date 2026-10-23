@@ -182,12 +182,7 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
             break status;
         }
     };
-    let clear = thread.clear_child_tid();
-    if clear != 0
-        && let Some(vm) = thread.process().vm()
-    {
-        let _ = vm.write(clear, &0u32.to_ne_bytes());
-    }
+    crate::futex::exit_clear_tid(&thread);
     rk_proc::exit_thread(&thread, status);
 }
 

@@ -447,6 +447,27 @@ impl AddressSpace {
 
     /// Handles a fault of a copy. A fault that `handle_fault` handles but that the copy gets
     /// again would loop, so a second fault at the same page is `EFAULT`.
+    /// Gives the physical address of `addr` if it is in a shared area, else `None`. A futex in a
+    /// shared area uses the physical address as its key, so that each address space that maps the
+    /// page finds the same futex. A page that is not there yet gets its frame.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EFAULT` if `addr` is not in an area that allows a read.
+    pub fn shared_phys(&self, addr: usize) -> Result<Option<u64>, Errno> {
+        let shared = match self.state.lock().vmas.find(addr) {
+            Some(vma) if vma.prot.read => vma.shared,
+            _ => return Err(Errno::EFAULT),
+        };
+        if !shared {
+            return Ok(None);
+        }
+        self.fault_in(addr, Access::Read)?;
+        let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
+        let (frame, _) = self.vm.page(page).ok_or(Errno::EFAULT)?;
+        Ok(Some(frame.addr().get() + (addr & (PAGE_SIZE - 1)) as u64))
+    }
+
     fn fault_in(&self, addr: usize, access: Access) -> Result<(), Errno> {
         self.handle_fault(addr, access)?;
         let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
