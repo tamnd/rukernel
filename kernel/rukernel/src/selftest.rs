@@ -26,6 +26,8 @@ pub(crate) fn run(name: &str) -> bool {
         "vm" => vm_test(),
         #[cfg(target_arch = "x86_64")]
         "task" => task_test(),
+        #[cfg(target_arch = "x86_64")]
+        "fault" => fault_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -41,11 +43,14 @@ fn check(what: &str, ok: bool) -> bool {
 
 /// The permissions of the user pages of the tests.
 #[cfg(target_arch = "x86_64")]
-const RX: rk_frame::vm::PageProt = rk_frame::vm::PageProt { writable: false, executable: true };
+const RX: rk_frame::vm::PageProt =
+    rk_frame::vm::PageProt { readable: true, writable: false, executable: true };
 #[cfg(target_arch = "x86_64")]
-const RW: rk_frame::vm::PageProt = rk_frame::vm::PageProt { writable: true, executable: false };
+const RW: rk_frame::vm::PageProt =
+    rk_frame::vm::PageProt { readable: true, writable: true, executable: false };
 #[cfg(target_arch = "x86_64")]
-const RO: rk_frame::vm::PageProt = rk_frame::vm::PageProt { writable: false, executable: false };
+const RO: rk_frame::vm::PageProt =
+    rk_frame::vm::PageProt { readable: true, writable: false, executable: false };
 
 /// An address that is canonical and has no mapping. A read from it is a page fault.
 const UNMAPPED: usize = 0xffff_c000_0000_0000;
@@ -574,6 +579,127 @@ fn task_test() -> bool {
     ok &= check(
         "the stacks go back to the heap",
         heap_after - heap_before < task::KERNEL_STACK_SIZE as u64,
+    );
+    ok
+}
+
+/// The user program of the fault test. It writes the first two pages of the data area and reads
+/// the third one. Each page has no frame before the access.
+#[cfg(target_arch = "x86_64")]
+const FAULT_PROGRAM: [u8; 33] = [
+    0x48, 0xc7, 0x04, 0x25, 0, 0, 0, 0x10, 1, 0, 0, 0, // mov qword [0x10000000], 1
+    0x48, 0xc7, 0x04, 0x25, 0, 0x10, 0, 0x10, 1, 0, 0, 0, // mov qword [0x10001000], 1
+    0x48, 0x8b, 0x1c, 0x25, 0, 0x20, 0, 0x10, // mov rbx, [0x10002000]
+    0xcc, // int3
+];
+
+/// A user program gets its pages at the first access, and `fork`, copy on write, `munmap`,
+/// `mprotect` and `brk` change the address space as Linux does.
+#[cfg(target_arch = "x86_64")]
+fn fault_test() -> bool {
+    use rk_abi::Errno;
+    use rk_frame::user::{ReturnReason, UserContext};
+    use rk_mm::{Access, AddressSpace, MmapRequest, Prot};
+
+    const CODE: usize = 0x40_0000;
+    const DATA: usize = 0x1000_0000;
+    const HEAP: usize = 0x80_0000;
+    const PAGE_FAULT: u8 = 14;
+    const RX: Prot = Prot { read: true, write: false, exec: true };
+    const RO: Prot = Prot { read: true, write: false, exec: false };
+
+    let Ok(space) = AddressSpace::new() else { return check("an address space", false) };
+    let fixed = |addr, len, prot| MmapRequest { addr, fixed: true, ..MmapRequest::anon(len, prot) };
+    let stack_top = rk_mm::STACK_TOP;
+    let mut ok = check(
+        "the areas are mapped",
+        space.mmap(fixed(CODE, 4096, Prot::RW)) == Ok(CODE)
+            && space.mmap(fixed(DATA, 3 * 4096, Prot::RW)) == Ok(DATA)
+            && space.mmap(fixed(stack_top - 0x1_0000, 0x1_0000, Prot::RW)).is_ok(),
+    );
+    ok &= check(
+        "the program is written and made executable",
+        space.write(CODE, &FAULT_PROGRAM).is_ok() && space.mprotect(CODE, 4096, RX).is_ok(),
+    );
+    ok &= check("no data page has a frame yet", space.vm().page_count() == 1);
+
+    space.activate();
+    let mut ctx = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(stack_top));
+    let mut faults = 0;
+    let reason = loop {
+        match ctx.execute() {
+            ReturnReason::Interrupt => {}
+            ReturnReason::Exception(e) if e.vector == PAGE_FAULT => {
+                faults += 1;
+                let access = if e.error & 2 != 0 { Access::Write } else { Access::Read };
+                if space.handle_fault(e.addr as usize, access).is_err() {
+                    break None;
+                }
+            }
+            other => break Some(other),
+        }
+    };
+    rk_frame::vm::VmSpace::deactivate();
+    ok &= check(
+        "the program stops at its int3",
+        matches!(reason, Some(ReturnReason::Exception(e)) if e.vector == 3),
+    );
+    ok &= check("each data page is one fault", faults == 3);
+    ok &= check("a new page reads as zero", ctx.regs().rbx == 0);
+    let read = |s: &AddressSpace, addr| {
+        let mut b = [0u8; 8];
+        s.read(addr, &mut b).map(|()| u64::from_le_bytes(b))
+    };
+    ok &= check("the kernel reads what the program wrote", read(&space, DATA) == Ok(1));
+
+    let Ok(child) = space.fork() else { return check("the fork", false) };
+    ok &= check(
+        "a write in the child copies the page",
+        child.write(DATA, &2u64.to_le_bytes()).is_ok()
+            && read(&child, DATA) == Ok(2)
+            && read(&space, DATA) == Ok(1),
+    );
+    ok &= check(
+        "a write in the parent copies the page too",
+        space.write(DATA + 4096, &3u64.to_le_bytes()).is_ok()
+            && read(&space, DATA + 4096) == Ok(3)
+            && read(&child, DATA + 4096) == Ok(1),
+    );
+    ok &= check(
+        "mprotect makes a page read only",
+        child.mprotect(DATA, 4096, RO).is_ok()
+            && child.write(DATA, &[0]) == Err(Errno::EFAULT)
+            && read(&child, DATA) == Ok(2),
+    );
+    ok &= check(
+        "mprotect of an unmapped range fails",
+        child.mprotect(0x2000_0000, 4096, RO) == Err(Errno::ENOMEM),
+    );
+    ok &= check(
+        "munmap removes the middle page",
+        space.munmap(DATA + 4096, 4096).is_ok()
+            && read(&space, DATA + 4096) == Err(Errno::EFAULT)
+            && read(&space, DATA) == Ok(1)
+            && read(&child, DATA + 4096) == Ok(1),
+    );
+    let gap = space.mmap(MmapRequest::anon(4096, Prot::RW));
+    ok &= check(
+        "mmap without an address takes the top of the mmap area",
+        gap == Ok(rk_mm::MMAP_TOP - 4096),
+    );
+
+    space.set_brk_start(HEAP);
+    ok &= check("brk grows the heap", space.brk(HEAP + 0x1800) == HEAP + 0x1800);
+    ok &= check("the heap can be written", space.write(HEAP + 0x1000, &[7]).is_ok());
+    ok &= check("brk below the start fails", space.brk(HEAP - 4096) == HEAP + 0x1800);
+    ok &= check(
+        "brk shrinks the heap",
+        space.brk(HEAP) == HEAP && space.write(HEAP + 0x1000, &[7]) == Err(Errno::EFAULT),
+    );
+    ok &= check(
+        "a string is read up to its zero byte",
+        space.write(DATA + 4000, b"hello\0").is_ok()
+            && space.read_cstr(DATA + 4000, 64).as_deref() == Ok(&b"hello"[..]),
     );
     ok
 }

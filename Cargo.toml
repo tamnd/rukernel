@@ -4,6 +4,7 @@ members = [
     "frame/rk-frame",
     "core/rk-abi",
     "core/rk-lib",
+    "core/rk-mm",
     "core/rk-sched",
     "kernel/rukernel",
     "tools/rk-abigen",
@@ -27,6 +28,7 @@ publish = true
 rk-frame = { path = "frame/rk-frame", version = "0.1.1" }
 rk-abi = { path = "core/rk-abi", version = "0.1.1" }
 rk-lib = { path = "core/rk-lib", version = "0.1.1" }
+rk-mm = { path = "core/rk-mm", version = "0.1.1" }
 rk-sched = { path = "core/rk-sched", version = "0.1.1" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 

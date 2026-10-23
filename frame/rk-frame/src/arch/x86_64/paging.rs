@@ -354,8 +354,12 @@ pub(crate) fn free_user_root(root: u64) {
     free_frame_phys(root);
 }
 
-/// The page table entry flags for a user page.
-fn user_flags(writable: bool, executable: bool) -> u64 {
+/// The page table entry flags for a user page. A page that allows no access is not present, so
+/// each access to it is a page fault.
+fn user_flags(readable: bool, writable: bool, executable: bool) -> u64 {
+    if !(readable || writable || executable) {
+        return 0;
+    }
     USER | PRESENT | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE }
 }
 
@@ -380,60 +384,34 @@ fn flush_user(root: u64, virt: usize) {
     }
 }
 
+/// The permissions of a user page: readable, writable and executable.
+pub(crate) type UserProt = (bool, bool, bool);
+
 /// Maps one 4 KiB page at `virt` in the user address space `root`. Gives `Err` if no frame is free
 /// for a page table. The caller makes sure that `virt` is page aligned, below `USER_END` and not
 /// mapped.
-pub(crate) fn user_map(
-    root: u64,
-    virt: usize,
-    phys: u64,
-    writable: bool,
-    executable: bool,
-) -> Result<(), ()> {
+pub(crate) fn user_map(root: u64, virt: usize, phys: u64, prot: UserProt) -> Result<(), ()> {
     assert!(virt < USER_END, "{virt:#x} is not in the user half");
     let pt = leaf_table(root, virt, USER)?;
-    write_entry(pt, indexes(virt)[3], phys | user_flags(writable, executable));
+    write_entry(pt, indexes(virt)[3], phys | user_flags(prot.0, prot.1, prot.2));
     flush_user(root, virt);
     Ok(())
 }
 
-/// Removes the mapping of one 4 KiB page at `virt` in `root`, and gives the physical address that
-/// it mapped.
-pub(crate) fn user_unmap(root: u64, virt: usize) -> Option<u64> {
-    let (table, i) = user_leaf(root, virt)?;
-    let e = read_entry(table, i);
-    if e & PRESENT == 0 {
-        return None;
-    }
-    write_entry(table, i, 0);
-    flush_user(root, virt);
-    Some(e & ADDR_MASK)
-}
-
-/// Changes the permissions of a mapped page at `virt` in `root`.
-pub(crate) fn user_protect(root: u64, virt: usize, writable: bool, executable: bool) {
+/// Removes the mapping of one 4 KiB page at `virt` in `root`.
+pub(crate) fn user_unmap(root: u64, virt: usize) {
     if let Some((table, i)) = user_leaf(root, virt) {
-        let e = read_entry(table, i);
-        if e & PRESENT != 0 {
-            write_entry(table, i, (e & ADDR_MASK) | user_flags(writable, executable));
-            flush_user(root, virt);
-        }
+        write_entry(table, i, 0);
+        flush_user(root, virt);
     }
 }
 
-/// Walks the user address space `root` for one virtual address.
-pub(crate) fn user_query(root: u64, virt: usize) -> Option<PageInfo> {
-    let (table, i) = user_leaf(root, virt)?;
-    let e = read_entry(table, i);
-    if e & PRESENT == 0 {
-        return None;
+/// Changes the permissions of the page at `virt` in `root`, which maps `phys`.
+pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
+    if let Some((table, i)) = user_leaf(root, virt) {
+        write_entry(table, i, phys | user_flags(prot.0, prot.1, prot.2));
+        flush_user(root, virt);
     }
-    Some(PageInfo {
-        phys: crate::addr::PhysAddr::new(e & ADDR_MASK),
-        writable: e & WRITABLE != 0,
-        executable: e & NO_EXECUTE == 0,
-        user: true,
-    })
 }
 
 /// Loads `root` into CR3. A value of 0 loads the kernel table.
