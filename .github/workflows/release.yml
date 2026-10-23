@@ -128,4 +128,4 @@ jobs:
             exit 0
           fi
           # Each crate comes after the crates that it depends on.
-          .github/scripts/publish-crates.sh rk-abi rk-frame rk-lib rukernel
+          .github/scripts/publish-crates.sh rk-abi rk-frame rk-lib rk-sched rukernel

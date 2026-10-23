@@ -22,6 +22,8 @@ pub mod console;
 pub mod irq;
 pub mod mm;
 pub mod sync;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod task;
 #[cfg(target_os = "none")]
 pub mod time;
 #[cfg(target_os = "none")]

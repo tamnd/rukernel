@@ -1,0 +1,16 @@
+[package]
+name = "rk-sched"
+description = "The scheduler of rukernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-frame.workspace = true
+
+[lints]
+workspace = true

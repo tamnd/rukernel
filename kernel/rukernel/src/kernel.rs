@@ -35,6 +35,9 @@ fn main(boot: &'static BootInfo) -> ! {
     println!("memory: {} of {} frames free", frames.free, frames.total);
     println!("timer: {} Hz, tick at {} Hz", rk_frame::time::timer_frequency(), rk_frame::time::HZ);
 
+    #[cfg(target_arch = "x86_64")]
+    rk_sched::init();
+
     if let Some(test) = param(boot.cmdline(), "rk.test") {
         let passed = selftest::run(test);
         println!("rk.test={test}: {}", if passed { "pass" } else { "fail" });
