@@ -7,7 +7,7 @@
 //!
 //! In R1 each process runs as root, so the VFS does not examine the permission bits yet.
 
-use crate::dentry::{Location, MountNamespace};
+use crate::dentry::{Location, MountNamespace, MountSource};
 use crate::device;
 use crate::file::File;
 use crate::inode::{FileType, InodeRef, Result, SetAttr, mode};
@@ -367,9 +367,15 @@ impl FsContext {
     }
 
     /// Mounts the file system with the root `root` on the directory `path`.
-    pub fn mount(&self, root: InodeRef, start: &Location, path: &[u8]) -> Result<()> {
+    pub fn mount(
+        &self,
+        root: InodeRef,
+        start: &Location,
+        path: &[u8],
+        source: MountSource,
+    ) -> Result<()> {
         let at = self.resolve(start, path, true)?;
-        self.ns.mount(root, &at).map(drop)
+        self.ns.mount(root, &at, source).map(drop)
     }
 }
 

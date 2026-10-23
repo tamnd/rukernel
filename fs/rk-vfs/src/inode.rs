@@ -262,4 +262,10 @@ pub trait Inode: Any + Send + Sync {
     fn fs_id(&self) -> u64 {
         self.metadata().dev
     }
+
+    /// The magic number of the file system, as `f_type` of `statfs` gives it. The values are in
+    /// `<linux/magic.h>`.
+    fn fs_magic(&self) -> u64 {
+        0
+    }
 }

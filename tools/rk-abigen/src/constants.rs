@@ -102,6 +102,13 @@ const GROUPS: &[Group] = &[
         doc: "The operations and flags of `futex`.",
     },
     Group {
+        module: "mount",
+        header: "linux/mount.h",
+        prefixes: &["MS_", "MNT_"],
+        ty: "u32",
+        doc: "The flags of `mount` and `umount2`.",
+    },
+    Group {
         module: "time",
         header: "linux/time.h",
         prefixes: &["CLOCK_", "TIMER_", "ITIMER_"],

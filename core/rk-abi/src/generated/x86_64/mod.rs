@@ -12,6 +12,7 @@ pub mod fcntl;
 pub mod futex;
 pub mod ioctls;
 pub mod mman;
+pub mod mount;
 pub mod open;
 pub mod poll;
 pub mod random;

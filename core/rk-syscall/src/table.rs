@@ -1,7 +1,7 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, futex, info, mm, poll, process, signal};
+use crate::{fs, futex, info, mm, mount, poll, process, signal};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
@@ -118,7 +118,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::RT_SIGPENDING => signal::rt_sigpending(cx, a[0], a[1]),
         nr::RT_SIGSUSPEND => signal::rt_sigsuspend(cx, a[0], a[1]),
         nr::MKNOD => fs::mknodat(cx, at_fdcwd(), a[0], a[1], a[2]),
-        nr::STATFS => fs::statfs(cx, a[1]),
+        nr::STATFS => fs::statfs(cx, a[0], a[1]),
+        nr::MOUNT => mount::mount(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::UMOUNT2 => mount::umount2(cx, a[0], a[1]),
         nr::FSTATFS => fs::fstatfs(cx, a[0], a[1]),
         nr::PRCTL => process::prctl(cx, a[0], a[1]),
         nr::ARCH_PRCTL => process::arch_prctl(cx, a[0], a[1]),
