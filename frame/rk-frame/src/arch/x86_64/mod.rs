@@ -8,13 +8,16 @@ mod io;
 pub(crate) mod paging;
 pub(crate) mod serial;
 pub(crate) mod trap;
+pub(crate) mod user;
 
 use io::Port;
 
-/// Sets up the CPU tables of the boot CPU: the GDT, the TSS and the IDT.
+/// Sets up the CPU tables of the boot CPU: the GDT, the TSS and the IDT. Also sets up the
+/// `syscall` instruction.
 pub(crate) fn init_cpu() {
     gdt::init();
     idt::init();
+    user::init();
 }
 
 /// Handles an interrupt from a device or the local APIC.

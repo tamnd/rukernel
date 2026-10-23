@@ -3,7 +3,8 @@
 //! The entry code in `idt.rs` calls `rk_frame_x86_64_trap` for each exception and interrupt. An
 //! exception in the kernel that has an entry in the exception table continues at the fixup
 //! address of the entry. This is the method of Linux, and the user copy functions use it later.
-//! Each other exception in the kernel is a bug, and the kernel panics.
+//! Each other exception in the kernel is a bug, and the kernel panics. A trap from user mode goes
+//! to `user::trap`.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -132,6 +133,11 @@ extern "C" fn rk_frame_x86_64_trap(frame: *mut TrapFrame) {
     // to the frame exists while this function runs.
     let frame = unsafe { &mut *frame };
     let vector = frame.vector as u8;
+    if frame.cs & 3 == 3 {
+        let cr2 = if vector == PAGE_FAULT { read_cr2() } else { 0 };
+        super::user::trap(frame, cr2);
+        return;
+    }
     if vector >= FIRST_IRQ_VECTOR {
         super::interrupt(vector);
         return;

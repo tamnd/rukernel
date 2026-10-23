@@ -108,32 +108,39 @@ fn indexes(virt: usize) -> [usize; 4] {
     [(virt >> 39) & 511, (virt >> 30) & 511, (virt >> 21) & 511, (virt >> 12) & 511]
 }
 
-/// Gives the next level table for an entry, and makes one if the entry is empty.
-fn next_table(table: u64, index: usize) -> Result<u64, ()> {
+/// Gives the next level table for an entry, and makes one if the entry is empty. `upper` is
+/// `USER` for a user mapping and 0 for a kernel mapping.
+fn next_table(table: u64, index: usize, upper: u64) -> Result<u64, ()> {
     let e = read_entry(table, index);
     if e & PRESENT != 0 {
         assert!(e & HUGE == 0, "a huge page is in the path of a 4 KiB mapping");
+        assert!(e & USER == upper, "a user mapping and a kernel mapping share a table");
         return Ok(e & ADDR_MASK);
     }
     let new = alloc_table_frame().ok_or(())?;
     // The upper levels allow everything. The last level gives the permissions.
-    write_entry(table, index, new | PRESENT | WRITABLE);
+    write_entry(table, index, new | PRESENT | WRITABLE | upper);
     Ok(new)
 }
 
+/// Gives the last level table for `virt`, and makes the tables that are not there.
+fn leaf_table(pml4: u64, virt: usize, upper: u64) -> Result<u64, ()> {
+    let [i4, i3, i2, _] = indexes(virt);
+    let pdpt = next_table(pml4, i4, upper)?;
+    let pd = next_table(pdpt, i3, upper)?;
+    next_table(pd, i2, upper)
+}
+
 fn map_4k(pml4: u64, virt: usize, phys: u64, flags: u64) -> Result<(), ()> {
-    let [i4, i3, i2, i1] = indexes(virt);
-    let pdpt = next_table(pml4, i4)?;
-    let pd = next_table(pdpt, i3)?;
-    let pt = next_table(pd, i2)?;
-    write_entry(pt, i1, phys | flags | PRESENT);
+    let pt = leaf_table(pml4, virt, 0)?;
+    write_entry(pt, indexes(virt)[3], phys | flags | PRESENT);
     Ok(())
 }
 
 fn map_2m(pml4: u64, virt: usize, phys: u64, flags: u64) -> Result<(), ()> {
     let [i4, i3, i2, _] = indexes(virt);
-    let pdpt = next_table(pml4, i4)?;
-    let pd = next_table(pdpt, i3)?;
+    let pdpt = next_table(pml4, i4, 0)?;
+    let pd = next_table(pdpt, i3, 0)?;
     write_entry(pd, i2, phys | flags | PRESENT | HUGE);
     Ok(())
 }
@@ -228,6 +235,35 @@ pub(crate) fn map_mmio_page(virt: usize, phys: u64) -> Result<(), ()> {
     let _guard = TABLES.lock();
     let flags = WRITABLE | WRITE_THROUGH | NO_CACHE | GLOBAL | NO_EXECUTE;
     map_4k(KERNEL_PML4.load(Ordering::Acquire), virt, phys, flags)
+}
+
+/// The end of the user half of the address space. Linux names it `TASK_SIZE_MAX`. The last page
+/// below the end of the lower half is not used, as in Linux.
+pub(crate) const USER_END: usize = 0x0000_7fff_ffff_f000;
+
+/// Maps one 4 KiB page in the user half of the address space. Gives `Err` if the page is mapped
+/// already, or if no frame is free for a page table.
+///
+/// In R0 the user pages are in the kernel page tables, and they stay for all of the run time.
+/// Each process gets its own tables in R1.
+pub(crate) fn map_user_page(
+    virt: usize,
+    phys: u64,
+    writable: bool,
+    executable: bool,
+) -> Result<(), ()> {
+    assert!(virt < USER_END, "{virt:#x} is not in the user half");
+    let _guard = TABLES.lock();
+    let pt = leaf_table(KERNEL_PML4.load(Ordering::Acquire), virt, USER)?;
+    let index = indexes(virt)[3];
+    if read_entry(pt, index) & PRESENT != 0 {
+        return Err(());
+    }
+    let flags =
+        USER | if writable { WRITABLE } else { 0 } | if executable { 0 } else { NO_EXECUTE };
+    write_entry(pt, index, phys | flags | PRESENT);
+    flush(virt);
+    Ok(())
 }
 
 /// Removes the mapping of one 4 KiB page of the vmalloc range. Gives the physical address that

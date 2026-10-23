@@ -23,3 +23,5 @@ pub mod sync;
 pub mod time;
 #[cfg(target_os = "none")]
 pub mod trap;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod user;

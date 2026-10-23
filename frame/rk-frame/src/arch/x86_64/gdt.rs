@@ -14,13 +14,10 @@ pub(crate) const KERNEL_CS: u16 = 0x10;
 /// The kernel data segment. Linux names it `__KERNEL_DS`.
 pub(crate) const KERNEL_DS: u16 = 0x18;
 /// The 32 bit user code segment, for compat programs. Linux names it `__USER32_CS`.
-#[allow(dead_code)]
 pub(crate) const USER32_CS: u16 = 0x23;
 /// The user data segment. Linux names it `__USER_DS`.
-#[allow(dead_code)]
 pub(crate) const USER_DS: u16 = 0x2b;
 /// The 64 bit user code segment. Linux names it `__USER_CS`.
-#[allow(dead_code)]
 pub(crate) const USER_CS: u16 = 0x33;
 /// The task state segment. It uses two slots.
 const TSS_SELECTOR: u16 = 0x40;
@@ -32,8 +29,12 @@ pub(crate) const IST_NMI: u8 = 2;
 /// The interrupt stack table slot for a machine check.
 pub(crate) const IST_MACHINE_CHECK: u8 = 3;
 
-/// The size of each interrupt stack.
+/// The size of each interrupt stack and of the entry stack.
 const IST_STACK_SIZE: usize = 16 * 1024;
+
+/// The index of the entry stack in `Tables::stacks`. The CPU loads RSP0 of the TSS when a trap
+/// comes from user mode, so the trap entry code runs on this stack.
+const ENTRY_STACK: usize = 3;
 
 /// The 64 bit task state segment.
 #[repr(C, packed(4))]
@@ -55,7 +56,7 @@ struct Stack([u8; IST_STACK_SIZE]);
 struct Tables {
     gdt: UnsafeCell<[u64; 10]>,
     tss: UnsafeCell<Tss>,
-    stacks: UnsafeCell<[Stack; 3]>,
+    stacks: UnsafeCell<[Stack; 4]>,
 }
 
 // SAFETY: only `init` writes the tables, one time, before the CPU loads them. The `LOADED` flag
@@ -73,7 +74,7 @@ static TABLES: Tables = Tables {
         reserved3: 0,
         iomap_base: size_of::<Tss>() as u16,
     }),
-    stacks: UnsafeCell::new([const { Stack([0; IST_STACK_SIZE]) }; 3]),
+    stacks: UnsafeCell::new([const { Stack([0; IST_STACK_SIZE]) }; 4]),
 };
 
 static LOADED: AtomicBool = AtomicBool::new(false);
@@ -103,6 +104,9 @@ pub(crate) fn init() {
         // No reference to the TSS exists.
         unsafe { (*tss).ist[usize::from(slot) - 1] = top };
     }
+    let top = stacks.wrapping_add(ENTRY_STACK + 1) as u64;
+    // SAFETY: as above, for RSP0.
+    unsafe { (*tss).rsp[0] = top };
 
     let tss_base = tss as u64;
     let tss_limit = size_of::<Tss>() as u64 - 1;

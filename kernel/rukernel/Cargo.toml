@@ -16,6 +16,7 @@ doctest = false
 bench = false
 
 [dependencies]
+rk-abi.workspace = true
 rk-frame.workspace = true
 
 [lints]
