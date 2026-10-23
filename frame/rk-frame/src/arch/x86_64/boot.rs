@@ -126,6 +126,7 @@ extern "C" fn rk_frame_x86_64_entry(start_info: u64) -> ! {
     read_start_info(start_info, &mut info);
     crate::mm::frame::init(&info, super::paging::kernel_end_phys());
     super::paging::init(&info);
+    super::apic::init();
     crate::boot::start(info)
 }
 
