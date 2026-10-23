@@ -91,6 +91,13 @@ pub fn alloc_frame() -> Option<Frame> {
     Some(Frame { phys: (frame * PAGE_SIZE) as u64 })
 }
 
+/// Takes a free frame and fills it with zeros.
+pub fn alloc_zeroed_frame() -> Option<Frame> {
+    let mut frame = alloc_frame()?;
+    frame.zero();
+    Some(frame)
+}
+
 impl Frame {
     /// The number of 8 byte words in a frame.
     pub const WORDS: usize = PAGE_SIZE / 8;
@@ -130,6 +137,67 @@ impl Frame {
     pub fn zero(&mut self) {
         // SAFETY: as for `write_u64`, for all of the frame.
         unsafe { core::ptr::write_bytes(self.word_ptr(0).cast::<u8>(), 0, PAGE_SIZE) };
+    }
+
+    /// The kernel address of the byte `offset` of the frame, for a copy of `len` bytes.
+    fn byte_ptr(&self, offset: usize, len: usize) -> *mut u8 {
+        assert!(offset + len <= PAGE_SIZE, "{len} bytes at {offset} are outside the frame");
+        (paging::phys_to_virt(self.phys) as *mut u8).wrapping_add(offset)
+    }
+
+    /// Copies bytes from the frame at `offset` to `buf`.
+    ///
+    /// The frame can be mapped in user address spaces, and user code can write it at the same
+    /// time. Thus the copy reads each byte with a volatile access, and no Rust reference to the
+    /// contents of a frame exists.
+    ///
+    /// # Panics
+    ///
+    /// If the bytes are not all in the frame.
+    pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) {
+        let p = self.byte_ptr(offset, buf.len());
+        for (i, b) in buf.iter_mut().enumerate() {
+            // SAFETY: the frame is mapped in the direct map, and the byte is in the frame. The
+            // read is volatile, as the frame is memory that user code can share.
+            *b = unsafe { p.add(i).read_volatile() };
+        }
+    }
+
+    /// Copies `buf` to the frame at `offset`. A frame that is shared through an `Arc` is written
+    /// through a shared reference, as the memory of a `MAP_SHARED` mapping is.
+    ///
+    /// # Panics
+    ///
+    /// If the bytes are not all in the frame.
+    pub fn write_bytes(&self, offset: usize, buf: &[u8]) {
+        let p = self.byte_ptr(offset, buf.len());
+        for (i, &b) in buf.iter().enumerate() {
+            // SAFETY: as for `read_bytes`. No Rust reference to the contents exists, so the
+            // volatile write cannot change a value that safe code holds.
+            unsafe { p.add(i).write_volatile(b) };
+        }
+    }
+
+    /// Fills `len` bytes at `offset` with zeros.
+    ///
+    /// # Panics
+    ///
+    /// If the bytes are not all in the frame.
+    pub fn fill_zero(&self, offset: usize, len: usize) {
+        let p = self.byte_ptr(offset, len);
+        for i in 0..len {
+            // SAFETY: as for `write_bytes`.
+            unsafe { p.add(i).write_volatile(0) };
+        }
+    }
+
+    /// Copies all of `other` to this frame. Copy on write uses this.
+    pub fn copy_from(&self, other: &Frame) {
+        let mut buf = [0u8; 512];
+        for offset in (0..PAGE_SIZE).step_by(buf.len()) {
+            other.read_bytes(offset, &mut buf);
+            self.write_bytes(offset, &buf);
+        }
     }
 }
 

@@ -11,6 +11,9 @@
 
 #![no_std]
 
+#[cfg(target_os = "none")]
+extern crate alloc;
+
 pub mod addr;
 pub mod arch;
 pub mod boot;
@@ -25,3 +28,5 @@ pub mod time;
 pub mod trap;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod user;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod vm;
