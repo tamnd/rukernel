@@ -1,6 +1,6 @@
 //! The entry points of the kernel image.
 //!
-//! The kernel has three entries, per spec/15-boot-and-platform.md section 15.3:
+//! The kernel has four entries, per spec/15-boot-and-platform.md section 15.3:
 //!
 //! - The PVH entry. QEMU, Firecracker and Cloud Hypervisor load an ELF kernel directly when it has
 //!   a `XEN_ELFNOTE_PHYS32_ENTRY` note. Linux uses the same entry for the same loaders. The loader
@@ -8,10 +8,11 @@
 //!   `hvm_start_info` structure in EBX.
 //! - The 32 bit entry of the Linux boot protocol, at the start of the protected mode code of a
 //!   bzImage. The loader puts the physical address of a `boot_params` structure in ESI. The real
-//!   mode setup code in `setup.rs` also comes here.
+//!   mode setup code in the `.rk_setup` section also comes here.
 //! - The 64 bit entry of the Linux boot protocol, 0x200 bytes after the 32 bit entry. The loader
 //!   starts the CPU in long mode with an identity map, and puts `boot_params` in RSI. The EFI stub
 //!   also comes here.
+//! - The EFI stub, 0x400 bytes after the 32 bit entry. It is the entry point of the PE image.
 //!
 //! The assembly below makes boot page tables that map the first 1 GiB of physical memory two
 //! times: at address 0, and at the kernel base `0xffffffff80000000`. Then it turns on long mode,
@@ -69,6 +70,186 @@ rk_linux_start64:                   # the 64 bit entry: RSI has boot_params
     pushq $0x08
     pushq $rk_boot64
     lretq
+
+    # The EFI stub, at the entry point of the PE image. The firmware can load the image at any
+    # address, so the code uses only RIP relative addresses until it jumps to the copy of the
+    # kernel at 1 MiB. The calls use the Microsoft x64 convention of UEFI.
+    .org 0x400
+    .global rk_efi_entry
+rk_efi_entry:                       # RCX: the image handle, RDX: the system table
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    subq $0x68, %rsp                # the shadow space, a stack argument and the variables
+    movq %rcx, %r12
+    movq %rdx, %r13
+    movq 0x60(%r13), %r14           # the boot services
+
+    movq $0x100000, 0x30(%rsp)      # the pages of the kernel, at 1 MiB
+    movl $2, %ecx                   # AllocateAddress
+    movl $2, %edx                   # EfiLoaderData
+    movl $__kernel_pages_phys, %r8d
+    leaq 0x30(%rsp), %r9
+    call *0x28(%r14)                # AllocatePages
+    testq %rax, %rax
+    jnz 9f
+
+    movq $0x3fffffff, 0x30(%rsp)    # the boot data, below the 1 GiB that the boot page tables map
+    movl $1, %ecx                   # AllocateMaxAddress
+    movl $2, %edx                   # EfiLoaderData
+    movl $16, %r8d
+    leaq 0x30(%rsp), %r9
+    call *0x28(%r14)                # AllocatePages
+    testq %rax, %rax
+    jnz 9f
+    movq 0x30(%rsp), %r15           # boot_params, the command line at 0x1000, the map at 0x2000
+    movq %r15, %rdi
+    movl $0x10000, %ecx
+    xorl %eax, %eax
+    rep stosb
+
+    leaq rk_linux_start32(%rip), %rsi   # copy the kernel to 1 MiB
+    movl $0x100000, %edi
+    movl $__bss_start_phys, %ecx
+    subl %edi, %ecx
+    rep movsb
+    leaq rk_linux_start32 - 0x1000 + 0x1f1(%rip), %rsi  # the setup header, in the PE headers
+    leaq 0x1f1(%r15), %rdi
+    movl $0x290 - 0x1f1, %ecx
+    rep movsb
+
+    movq %r12, %rcx                 # the command line, from the load options
+    leaq rk_efi_loaded_image_guid(%rip), %rdx
+    leaq 0x30(%rsp), %r8
+    call *0x98(%r14)                # HandleProtocol
+    testq %rax, %rax
+    jnz 3f
+    movq 0x30(%rsp), %rax
+    movl 0x30(%rax), %ecx           # LoadOptionsSize, in bytes
+    movq 0x38(%rax), %rsi           # LoadOptions, UTF-16
+    shrl $1, %ecx
+    cmpl $2047, %ecx
+    jbe 1f
+    movl $2047, %ecx
+1:
+    leaq 0x1000(%r15), %rdi
+    movl %edi, 0x228(%r15)          # cmd_line_ptr
+    testq %rsi, %rsi
+    jz 3f
+2:
+    testl %ecx, %ecx
+    jz 3f
+    movzwl (%rsi), %eax
+    testl %eax, %eax
+    jz 3f
+    cmpl $0x7f, %eax
+    jbe 4f
+    movl $0x3f, %eax                # "?" for a character that is not ASCII
+4:
+    movb %al, (%rdi)
+    addq $2, %rsi
+    incq %rdi
+    decl %ecx
+    jmp 2b
+3:
+
+    leaq rk_efi_acpi20_guid(%rip), %rdi # the ACPI RSDP, from the configuration table
+    call rk_efi_find_table
+    testq %rax, %rax
+    jnz 5f
+    leaq rk_efi_acpi10_guid(%rip), %rdi
+    call rk_efi_find_table
+5:
+    movq %rax, 0x070(%r15)          # acpi_rsdp_addr
+
+    movl $2, %ebx                   # the memory map. ExitBootServices can fail one time
+6:
+    movq $0xe000, 0x38(%rsp)
+    leaq 0x38(%rsp), %rcx
+    leaq 0x2000(%r15), %rdx
+    leaq 0x40(%rsp), %r8
+    leaq 0x48(%rsp), %r9
+    leaq 0x50(%rsp), %rax
+    movq %rax, 0x20(%rsp)
+    call *0x38(%r14)                # GetMemoryMap
+    testq %rax, %rax
+    jnz 9f
+    movq %r12, %rcx
+    movq 0x40(%rsp), %rdx
+    call *0xe8(%r14)                # ExitBootServices
+    testq %rax, %rax
+    jz 7f
+    decl %ebx
+    jnz 6b
+    jmp 9f
+7:
+    cli
+    movl $0x34364c45, 0x1c0(%r15)   # efi_loader_signature: "EL64"
+    movq %r13, %rax
+    movl %eax, 0x1c4(%r15)          # efi_systab
+    shrq $32, %rax
+    movl %eax, 0x1d8(%r15)          # efi_systab_hi
+    movq 0x48(%rsp), %rax
+    movl %eax, 0x1c8(%r15)          # efi_memdesc_size
+    movl 0x50(%rsp), %eax
+    movl %eax, 0x1cc(%r15)          # efi_memdesc_version
+    leaq 0x2000(%r15), %rax
+    movl %eax, 0x1d0(%r15)          # efi_memmap
+    movq 0x38(%rsp), %rax
+    movl %eax, 0x1d4(%r15)          # efi_memmap_size
+    movq %r15, %rsi
+    movl $rk_linux_start64, %eax
+    jmp *%rax
+
+9:
+    movabsq $0x8000000000000001, %rax   # EFI_LOAD_ERROR
+    addq $0x68, %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
+    popq %rbx
+    ret
+
+rk_efi_find_table:                  # RDI: a GUID. Gives the table in RAX, or 0
+    movq 0x68(%r13), %rcx           # NumberOfTableEntries
+    movq 0x70(%r13), %rdx           # ConfigurationTable
+1:
+    testq %rcx, %rcx
+    jz 2f
+    movq (%rdx), %rax
+    cmpq (%rdi), %rax
+    jne 3f
+    movq 8(%rdx), %rax
+    cmpq 8(%rdi), %rax
+    jne 3f
+    movq 16(%rdx), %rax
+    ret
+3:
+    addq $24, %rdx
+    decq %rcx
+    jmp 1b
+2:
+    xorl %eax, %eax
+    ret
+
+    .balign 8
+rk_efi_loaded_image_guid:           # 5b1b31a1-9562-11d2-8e3f-00a0c969723b
+    .long 0x5b1b31a1
+    .word 0x9562, 0x11d2
+    .byte 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b
+rk_efi_acpi20_guid:                 # 8868e871-e4f1-11d3-bc22-0080c73c8881
+    .long 0x8868e871
+    .word 0xe4f1, 0x11d3
+    .byte 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81
+rk_efi_acpi10_guid:                 # eb9d2d30-2d88-11d3-9a16-0090273fc14d
+    .long 0xeb9d2d30
+    .word 0x2d88, 0x11d3
+    .byte 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d
 
     .section .boot.text, "ax"
     .code32

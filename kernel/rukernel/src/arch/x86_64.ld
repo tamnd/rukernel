@@ -77,6 +77,8 @@ SECTIONS
     /* The boot code clears the bss before paging is on, so it needs the physical addresses. */
     __bss_start_phys = __bss_start - KERNEL_BASE;
     __bss_end_phys = __bss_end - KERNEL_BASE;
+    /* The EFI stub allocates the pages of the kernel before it copies the kernel. */
+    __kernel_pages_phys = (__kernel_end - KERNEL_BASE - 0x100000) / 4096;
 
     /DISCARD/ : {
         *(.eh_frame .eh_frame_hdr .comment .note.GNU-stack)

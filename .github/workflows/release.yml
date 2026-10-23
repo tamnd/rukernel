@@ -45,10 +45,10 @@ jobs:
             echo "each path dependency in [workspace.dependencies] must have version $version"
             exit 1
           fi
-      - name: install qemu
+      - name: install qemu and ovmf
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 ovmf
       - name: cargo xtask ci
         run: cargo xtask ci
       - name: the crates package and build alone

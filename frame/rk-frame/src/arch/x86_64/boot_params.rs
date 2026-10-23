@@ -17,6 +17,11 @@ const EXT_RAMDISK_SIZE: u64 = 0x0c4;
 const EXT_CMD_LINE_PTR: u64 = 0x0c8;
 /// `efi_loader_signature`: "EL64" when the EFI stub of a 64 bit kernel made the structure.
 const EFI_LOADER_SIGNATURE: u64 = 0x1c0;
+/// The EFI memory map that the EFI stub gives: the address, the size and the size of one entry.
+const EFI_MEMDESC_SIZE: u64 = 0x1c8;
+const EFI_MEMMAP: u64 = 0x1d0;
+const EFI_MEMMAP_SIZE: u64 = 0x1d4;
+const EFI_MEMMAP_HI: u64 = 0x1dc;
 /// `e820_entries`: the number of entries in `e820_table`.
 const E820_ENTRIES: u64 = 0x1e8;
 /// The setup header fields.
@@ -73,6 +78,9 @@ pub(super) fn read(base: u64) -> BootInfo {
         let (addr, size, kind) = (read_u64(at, 0), read_u64(at, 8), read_u32(at, 16));
         info.push_region(PhysAddr::new(addr), size, MemoryKind::from_e820(kind));
     }
+    if entries == 0 && protocol == "efi" {
+        read_efi_memory_map(base, &mut info);
+    }
 
     let image = u64::from(read_u32(base, RAMDISK_IMAGE))
         | u64::from(read_u32(base, EXT_RAMDISK_IMAGE)) << 32;
@@ -97,4 +105,31 @@ pub(super) fn read(base: u64) -> BootInfo {
 /// loader on a BIOS machine does not have to give the RSDP.
 fn find_rsdp() -> Option<u64> {
     BIOS_ROM.step_by(16).find(|&a| read_phys::<u64>(a) == Some(RSDP_SIGNATURE))
+}
+
+/// Reads the EFI memory map that the EFI stub gives, and adds each entry with the E820 kind that
+/// Linux gives it in `do_add_efi_memmap`. After ExitBootServices, the memory of the loader and of
+/// the boot services is free.
+fn read_efi_memory_map(base: u64, info: &mut BootInfo) {
+    let map =
+        u64::from(read_u32(base, EFI_MEMMAP)) | u64::from(read_u32(base, EFI_MEMMAP_HI)) << 32;
+    let size = u64::from(read_u32(base, EFI_MEMMAP_SIZE));
+    let stride = u64::from(read_u32(base, EFI_MEMDESC_SIZE));
+    if map == 0 || stride < 40 {
+        return;
+    }
+    for i in 0..size / stride {
+        let at = map + i * stride;
+        let (kind, start, pages) = (read_u32(at, 0), read_u64(at, 8), read_u64(at, 24));
+        let kind = match kind {
+            // The loader code and data, the boot services code and data, and conventional memory.
+            1..=4 | 7 => MemoryKind::Usable,
+            8 => MemoryKind::Unusable,
+            9 => MemoryKind::AcpiReclaimable,
+            10 => MemoryKind::AcpiNvs,
+            14 => MemoryKind::Persistent,
+            _ => MemoryKind::Reserved,
+        };
+        info.push_region(PhysAddr::new(start), pages.saturating_mul(4096), kind);
+    }
 }

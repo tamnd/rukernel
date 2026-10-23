@@ -139,10 +139,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: boot
-      - name: install qemu
+      - name: install qemu and ovmf
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 ovmf
       - name: boot tests
         run: cargo xtask boot-test
 
