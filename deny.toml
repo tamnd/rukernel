@@ -14,6 +14,8 @@ ignore = []
 [licenses]
 version = 2
 allow = [
+  # The crates of this workspace.
+  "GPL-2.0-only",
   "MIT",
   "MIT-0",
   "BSD-2-Clause",
@@ -24,7 +26,7 @@ allow = [
 ]
 confidence-threshold = 0.93
 
-# The crates of this workspace are GPL-2.0-only and are not published.
+# The crates of this workspace that are not published, for example xtask.
 [licenses.private]
 ignore = true
 
