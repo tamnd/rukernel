@@ -72,6 +72,11 @@ impl UserContext {
         &self.fpu
     }
 
+    /// Sets the x87 and SSE state, for a signal handler and `rt_sigreturn`.
+    pub fn set_fpu(&mut self, fpu: FpuState) {
+        self.fpu = fpu;
+    }
+
     /// The FS base. `arch_prctl(ARCH_GET_FS)` gives it.
     pub fn fs_base(&self) -> u64 {
         self.fs_base

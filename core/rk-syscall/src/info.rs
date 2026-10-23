@@ -89,11 +89,11 @@ pub(crate) fn time(cx: &Cx<'_>, tloc: u64) -> SysResult {
     Ok(sec)
 }
 
-/// Waits until the tick count is at `deadline`, or the thread must stop. Gives `true` if the
-/// thread must stop first.
+/// Waits until the tick count is at `deadline`, or a signal comes. Gives `true` if a signal
+/// comes first.
 fn sleep_until(thread: &rk_proc::Thread, deadline: u64) -> bool {
     let queue = rk_frame::task::WaitQueue::new();
-    queue.wait_until_timeout(deadline, || thread.is_killed().then_some(())).is_some()
+    queue.wait_until_timeout(deadline, || thread.signal_pending().then_some(())).is_some()
 }
 
 pub(crate) fn clock_nanosleep(

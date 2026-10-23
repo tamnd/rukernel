@@ -4,7 +4,8 @@
 //! interrupts and the exceptions of the thread come back to the task, as in OSTD, per
 //! spec/03-architecture.md. The task calls the handler of the system call from the table, then
 //! enters user mode again. A page fault goes to the memory manager. A fault that the memory
-//! manager does not repair ends the process with the signal of the fault.
+//! manager does not repair sends the signal of the fault. Before each return to user mode, the task
+//! delivers the next signal that the thread does not block.
 //!
 //! The handlers check the arguments as Linux does and give the same errors. The tables of
 //! numbers and types come from rk-abi. A number with no handler gives `ENOSYS`.
@@ -32,6 +33,8 @@ mod mm;
 mod process;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod run;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod table;
 

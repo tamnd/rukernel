@@ -5,6 +5,7 @@
  * types.
  */
 #include <errno.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -140,6 +141,138 @@ static void test_time(void)
 	check("the clock goes forward in the sleep", ns >= 10 * 1000 * 1000);
 }
 
+static volatile sig_atomic_t got_sig, got_code, got_pid, chld_count, on_altstack;
+static volatile void *got_addr;
+static char altstack[16384];
+static sigjmp_buf segv_env;
+
+static void on_signal(int sig, siginfo_t *info, void *uc)
+{
+	(void)uc;
+	got_sig = sig;
+	got_code = info->si_code;
+	got_pid = info->si_pid;
+}
+
+static void on_chld(int sig, siginfo_t *info, void *uc)
+{
+	(void)sig;
+	(void)uc;
+	chld_count++;
+	got_pid = info->si_pid;
+}
+
+static void on_segv(int sig, siginfo_t *info, void *uc)
+{
+	(void)sig;
+	(void)uc;
+	got_addr = info->si_addr;
+	siglongjmp(segv_env, 1);
+}
+
+static void on_alt(int sig)
+{
+	char here;
+	(void)sig;
+	on_altstack = &here >= altstack && &here < altstack + sizeof(altstack);
+}
+
+static void set_handler(int sig, void (*fn)(int, siginfo_t *, void *), int flags)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = fn;
+	sa.sa_flags = SA_SIGINFO | flags;
+	sigaction(sig, &sa, NULL);
+}
+
+static void test_signals(void)
+{
+	volatile double x = 1.5;
+	set_handler(SIGUSR1, on_signal, 0);
+	raise(SIGUSR1);
+	check("a handler runs and returns", got_sig == SIGUSR1 && got_code == SI_TKILL && x * 2 == 3.0);
+
+	sigset_t set, old;
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	got_sig = 0;
+	kill(getpid(), SIGUSR1);
+	sigset_t pend;
+	sigpending(&pend);
+	check("a blocked signal stays pending", got_sig == 0 && sigismember(&pend, SIGUSR1));
+	sigprocmask(SIG_SETMASK, &old, NULL);
+	check("the signal comes when it is unblocked", got_sig == SIGUSR1 && got_code == SI_USER && got_pid == 1);
+
+	signal(SIGUSR2, SIG_IGN);
+	check("an ignored signal has no effect", kill(getpid(), SIGUSR2) == 0);
+	signal(SIGUSR2, SIG_DFL);
+
+	set_handler(SIGCHLD, on_chld, SA_RESTART);
+	int status;
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(0);
+	while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
+		;
+	check("SIGCHLD comes when a child ends", chld_count >= 1 && got_pid == pid);
+	signal(SIGCHLD, SIG_DFL);
+
+	pid = fork();
+	if (pid == 0) {
+		for (;;)
+			pause();
+	}
+	kill(pid, SIGTERM);
+	check("SIGTERM ends a child", waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+	      WTERMSIG(status) == SIGTERM);
+
+	sigprocmask(SIG_BLOCK, &set, &old);
+	got_sig = 0;
+	pid = fork();
+	if (pid == 0) {
+		kill(getppid(), SIGUSR1);
+		_exit(0);
+	}
+	sigset_t none;
+	sigemptyset(&none);
+	int r = sigsuspend(&none);
+	check("sigsuspend waits for a signal", r == -1 && errno == EINTR && got_sig == SIGUSR1);
+	sigprocmask(SIG_SETMASK, &old, NULL);
+	waitpid(pid, &status, 0);
+
+	got_sig = 0;
+	pid = fork();
+	if (pid == 0) {
+		struct timespec d = {0, 20 * 1000 * 1000};
+		nanosleep(&d, NULL);
+		kill(getppid(), SIGUSR1);
+		_exit(0);
+	}
+	struct timespec d = {5, 0};
+	r = nanosleep(&d, NULL);
+	check("a signal stops nanosleep", r == -1 && errno == EINTR && got_sig == SIGUSR1);
+	waitpid(pid, &status, 0);
+
+	set_handler(SIGSEGV, on_segv, 0);
+	if (sigsetjmp(segv_env, 1) == 0)
+		*(volatile int *)8 = 1;
+	check("SIGSEGV gives the fault address", got_addr == (void *)8);
+	signal(SIGSEGV, SIG_DFL);
+
+	stack_t ss = {.ss_sp = altstack, .ss_size = sizeof(altstack), .ss_flags = 0};
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_alt;
+	sa.sa_flags = SA_ONSTACK;
+	check("sigaltstack", sigaltstack(&ss, NULL) == 0);
+	sigaction(SIGUSR2, &sa, NULL);
+	raise(SIGUSR2);
+	check("a handler runs on the alternate stack", on_altstack);
+	signal(SIGUSR2, SIG_DFL);
+}
+
 static void test_tty(void)
 {
 	char buf[64];
@@ -174,6 +307,7 @@ int main(int argc, char **argv)
 	test_fork();
 	test_exec();
 	test_time();
+	test_signals();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");

@@ -1,7 +1,7 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, info, mm, process};
+use crate::{fs, info, mm, process, signal};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
@@ -35,8 +35,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::MPROTECT => mm::mprotect(cx, a[0], a[1], a[2]),
         nr::MUNMAP => mm::munmap(cx, a[0], a[1]),
         nr::BRK => mm::brk(cx, a[0]),
-        nr::RT_SIGACTION => process::rt_sigaction(cx, a[0], a[1], a[2], a[3]),
-        nr::RT_SIGPROCMASK => process::rt_sigprocmask(cx, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGACTION => signal::rt_sigaction(cx, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGPROCMASK => signal::rt_sigprocmask(cx, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGRETURN => signal::rt_sigreturn(cx),
         nr::IOCTL => fs::ioctl(cx, a[0], a[1], a[2]),
         nr::PREAD64 => fs::pread(cx, a[0], a[1], a[2], a[3]),
         nr::PWRITE64 => fs::pwrite(cx, a[0], a[1], a[2], a[3]),
@@ -45,6 +46,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::ACCESS => fs::faccessat(cx, at_fdcwd(), a[0], a[1], 0),
         nr::SCHED_YIELD => process::sched_yield(),
         nr::MADVISE => mm::madvise(cx, a[0], a[1], a[2]),
+        nr::PAUSE => signal::pause(cx),
         nr::DUP => fs::dup(cx, a[0]),
         nr::DUP2 => fs::dup2(cx, a[0], a[1]),
         nr::GETPID => Ok(u64::from(cx.process().pid())),
@@ -54,7 +56,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::EXECVE => process::execve(cx, a[0], a[1], a[2]),
         nr::EXIT => process::exit(cx, a[0]),
         nr::WAIT4 => process::wait4(cx, a[0], a[1], a[2], a[3]),
-        nr::KILL => process::kill(cx, a[0], a[1]),
+        nr::KILL => signal::kill(cx, a[0], a[1]),
         nr::UNAME => info::uname(cx, a[0]),
         nr::FCNTL => fs::fcntl(cx, a[0], a[1], a[2]),
         nr::FSYNC | nr::FDATASYNC => cx.file(a[0]).map(|_| 0),
@@ -106,7 +108,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SETSID => cx.process().set_sid().map(u64::from),
         nr::GETPGID => process::getpgid(cx, a[0]),
         nr::GETSID => process::getsid(cx, a[0]),
-        nr::SIGALTSTACK => Ok(0),
+        nr::SIGALTSTACK => signal::sigaltstack(cx, a[0], a[1]),
+        nr::RT_SIGPENDING => signal::rt_sigpending(cx, a[0], a[1]),
+        nr::RT_SIGSUSPEND => signal::rt_sigsuspend(cx, a[0], a[1]),
         nr::MKNOD => fs::mknodat(cx, at_fdcwd(), a[0], a[1], a[2]),
         nr::STATFS => fs::statfs(cx, a[1]),
         nr::FSTATFS => fs::fstatfs(cx, a[0], a[1]),
@@ -114,7 +118,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::ARCH_PRCTL => process::arch_prctl(cx, a[0], a[1]),
         nr::SYNC => Ok(0),
         nr::GETTID => Ok(u64::from(cx.thread.tid())),
-        nr::TKILL => process::kill(cx, a[0], a[1]),
+        nr::TKILL => signal::tkill(cx, a[0], a[1]),
         nr::TIME => info::time(cx, a[0]),
         nr::SET_TID_ADDRESS => {
             cx.thread.set_clear_child_tid(a[0] as usize);
@@ -126,7 +130,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::CLOCK_NANOSLEEP => info::clock_nanosleep(cx, a[0], a[1], a[2], a[3]),
         nr::NANOSLEEP => info::clock_nanosleep(cx, 0, 0, a[0], a[1]),
         nr::EXIT_GROUP => process::exit_group(cx, a[0]),
-        nr::TGKILL => process::kill(cx, a[1], a[2]),
+        nr::TGKILL => signal::tgkill(cx, a[0], a[1], a[2]),
         nr::OPENAT => fs::openat(cx, a[0], a[1], a[2], a[3]),
         nr::MKDIRAT => fs::mkdirat(cx, a[0], a[1], a[2]),
         nr::MKNODAT => fs::mknodat(cx, a[0], a[1], a[2], a[3]),

@@ -84,6 +84,7 @@ dependencies = [
  "rk-frame",
  "rk-mm",
  "rk-vfs",
+ "zerocopy",
 ]
 
 [[package]]
