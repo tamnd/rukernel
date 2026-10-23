@@ -16,7 +16,13 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - Each process keeps its command line, the file of its program, the tick of its start and its `oom_score_adj`.
 - The `ltp` boot test mounts procfs on `/proc` and a tmpfs on `/dev/shm`. `RK_LTP_TESTS` gives other tests for a run by hand.
 - `clone` with `CLONE_PARENT`. The child gets the parent and the exit signal of the caller.
-- The `ltp` boot test runs 59 tests of `fork`, `clone`, `exit`, `wait`, `waitpid`, `wait4`, `getpid`, `gettid`, `brk`, `mmap`, `mprotect` and `munmap`.
+- The `ltp` boot test runs 66 tests of `fork`, `clone`, `exit`, `wait`, `waitpid`, `wait4`, `getpid`, `gettid`, `brk`, `mmap`, `mprotect` and `munmap`.
+- Resource limits for each process. `prlimit64` reads and changes them, and `fork` copies them. A new soft limit above the hard limit gives `EINVAL`. The kernel does not enforce the limits yet.
+- The status of a process that a signal ends with a core dump has the core dump bit when `RLIMIT_CORE` is not 0. The kernel does not write a core file.
+- `mmap` with `MAP_32BIT` puts the mapping between 1 GiB and 2 GiB, as Linux does on x86-64.
+- `mmap` of `/dev/zero` makes anonymous memory, as Linux does.
+- An address space has 65530 areas at most, the default `vm.max_map_count` of Linux. `mmap` gives `ENOMEM` at the limit, and so does a `munmap` that cuts an area in two.
+- `mprotect` gives `EACCES` for write access to a shared mapping of a file that is not open for writing.
 - The `mount` group of constants from `<linux/mount.h>` in rk-abi.
 - `AddressSpace::shared_phys` in rk-mm gives the physical address of a shared page.
 - init mounts procfs and reads `/proc/meminfo`, `/proc/self/stat`, `/proc/self/status`, `/proc/self/maps`, `/proc/mounts` and `/proc/sys/kernel/pid_max`.
@@ -24,6 +30,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- `mmap` looks up the descriptor before it examines the other arguments, so a closed descriptor gives `EBADF` as on Linux. `MAP_SHARED_VALIDATE` accepts only the flags of the Linux mask `LEGACY_MAP_MASK`.
 - `vfork` and `clone` with `CLONE_VFORK` make the parent wait until the child calls `execve` or ends. The child uses the memory of the parent until then, as on Linux. Before, the child got a copy of the memory and the parent continued at once.
 - A shared anonymous mapping keeps its pages in a shared object, so a page that the parent did not touch before `fork` is shared too. Before, the parent and the child each got a different page at the first access. `/proc/PID/maps` shows the area as `/dev/zero (deleted)`, as Linux does.
 - `statfs` examines the file system of its path, and `statfs` and `fstatfs` give the magic number of that file system. Before, `statfs` examined the root and did not read the path.

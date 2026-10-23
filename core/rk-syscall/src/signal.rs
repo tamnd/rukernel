@@ -212,7 +212,7 @@ pub(crate) fn deliver(
             if setup_frame(thread, regs, &info, &action, mask).is_err() {
                 // The frame does not fit, so the thread cannot run the handler. Linux sends
                 // `SIGSEGV` with the default action then.
-                let status = WaitStatus::signaled(SIGSEGV, false);
+                let status = thread.process().fatal_status(SIGSEGV);
                 rk_proc::exit_group(thread, status);
                 return Some(thread.process().group_exit().unwrap_or(status));
             }
