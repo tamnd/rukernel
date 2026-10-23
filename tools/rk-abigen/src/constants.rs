@@ -115,6 +115,48 @@ const GROUPS: &[Group] = &[
         ty: "u32",
         doc: "The events of `poll`.",
     },
+    Group {
+        module: "stat",
+        header: "linux/stat.h",
+        prefixes: &["S_I", "STATX_"],
+        ty: "u32",
+        doc: "The file type and mode bits of `st_mode`, and the masks and attributes of `statx`.",
+    },
+    Group {
+        module: "ioctls",
+        header: "asm/ioctls.h",
+        prefixes: &["TC", "TIOC", "FIO", "FIONREAD", "FIONBIO"],
+        ty: "u32",
+        doc: "The generic `ioctl` commands of terminals and files.",
+    },
+    Group {
+        module: "termbits",
+        header: "asm/termbits.h",
+        prefixes: &[""],
+        ty: "u32",
+        doc: "The flags, the control characters and the speeds of `struct termios`.",
+    },
+    Group {
+        module: "auxv",
+        header: "linux/auxvec.h",
+        prefixes: &["AT_"],
+        ty: "u32",
+        doc: "The types of the entries of the auxiliary vector.",
+    },
+    Group {
+        module: "elf",
+        header: "linux/elf.h",
+        prefixes: &["ET_", "PT_", "PF_", "EM_", "ELFCLASS", "ELFDATA", "EV_", "EI_", "ELFOSABI_"],
+        ty: "u32",
+        doc: "The values of the ELF header and the program header.",
+    },
+    Group {
+        module: "random",
+        header: "linux/random.h",
+        prefixes: &["GRND_"],
+        ty: "u32",
+        doc: "The flags of `getrandom`.",
+    },
 ];
 
 /// The probe gives up after this many tries. Each try drops the macros that failed.
