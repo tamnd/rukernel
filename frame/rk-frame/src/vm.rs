@@ -23,13 +23,30 @@ use alloc::sync::Arc;
 /// The end of the user half of the address space. Each user address is below it.
 pub const USER_END: usize = paging::USER_END;
 
-/// The permissions of a user page. Each mapped page can be read.
+/// The permissions of a user page. A page that allows no access keeps its frame, but each access
+/// to it is a page fault. On x86-64, a page that allows a write or an instruction fetch can also
+/// be read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageProt {
+    /// A read is allowed.
+    pub readable: bool,
     /// A write is allowed.
     pub writable: bool,
     /// An instruction fetch is allowed.
     pub executable: bool,
+}
+
+impl PageProt {
+    /// A page that allows no access.
+    pub const NONE: Self = Self { readable: false, writable: false, executable: false };
+
+    fn bits(self) -> paging::UserProt {
+        (self.readable, self.writable, self.executable)
+    }
+
+    fn allows(self, write: bool) -> bool {
+        if write { self.writable } else { self.readable || self.writable || self.executable }
+    }
 }
 
 /// Why a page could not be mapped.
@@ -56,8 +73,8 @@ pub struct UserFault {
 struct Inner {
     /// The physical address of the top level table.
     root: u64,
-    /// The frame at each mapped page address.
-    pages: BTreeMap<usize, Arc<Frame>>,
+    /// The frame and the permissions at each mapped page address.
+    pages: BTreeMap<usize, (Arc<Frame>, PageProt)>,
 }
 
 /// The page table of one user address space.
@@ -87,37 +104,34 @@ impl VmSpace {
         if inner.pages.contains_key(&a) {
             return Err(MapError::Mapped);
         }
-        paging::user_map(inner.root, a, frame.addr().get(), prot.writable, prot.executable)
+        paging::user_map(inner.root, a, frame.addr().get(), prot.bits())
             .map_err(|()| MapError::NoMemory)?;
-        inner.pages.insert(a, frame);
+        inner.pages.insert(a, (frame, prot));
         Ok(())
     }
 
     /// Removes the page at `addr` and gives its frame.
     pub fn unmap(&self, addr: VirtAddr) -> Option<Arc<Frame>> {
         let mut inner = self.inner.lock();
-        let frame = inner.pages.remove(&addr.get())?;
+        let (frame, _) = inner.pages.remove(&addr.get())?;
         paging::user_unmap(inner.root, addr.get());
         Some(frame)
     }
 
     /// Changes the permissions of the page at `addr`. Gives `false` if no page is mapped there.
     pub fn protect(&self, addr: VirtAddr, prot: PageProt) -> bool {
-        let inner = self.inner.lock();
-        if !inner.pages.contains_key(&addr.get()) {
-            return false;
-        }
-        paging::user_protect(inner.root, addr.get(), prot.writable, prot.executable);
+        let mut inner = self.inner.lock();
+        let root = inner.root;
+        let Some((frame, old)) = inner.pages.get_mut(&addr.get()) else { return false };
+        *old = prot;
+        paging::user_protect(root, addr.get(), frame.addr().get(), prot.bits());
         true
     }
 
     /// Gives the frame and the permissions of the page that contains `addr`.
     pub fn page(&self, addr: VirtAddr) -> Option<(Arc<Frame>, PageProt)> {
         let page = addr.get() & !(PAGE_SIZE - 1);
-        let inner = self.inner.lock();
-        let frame = inner.pages.get(&page)?.clone();
-        let info = paging::user_query(inner.root, page)?;
-        Some((frame, PageProt { writable: info.writable, executable: info.executable }))
+        self.inner.lock().pages.get(&page).cloned()
     }
 
     /// Gives the page addresses in `start..end` that are mapped, in order.
@@ -193,9 +207,8 @@ impl VmSpace {
             let n = (PAGE_SIZE - offset).min(end - at);
             let frame = {
                 let inner = self.inner.lock();
-                let ok = paging::user_query(inner.root, page).is_some_and(|i| !write || i.writable);
                 match inner.pages.get(&page) {
-                    Some(frame) if ok => frame.clone(),
+                    Some((frame, prot)) if prot.allows(write) => frame.clone(),
                     _ => return Err(UserFault { addr: at, write }),
                 }
             };
