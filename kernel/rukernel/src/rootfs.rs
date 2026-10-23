@@ -12,6 +12,7 @@ static ROOT: Once<FsContext> = Once::new();
 
 /// Makes the root tmpfs and unpacks the initramfs into it, if the boot loader gave one.
 pub(crate) fn init(boot: &BootInfo) {
+    rk_vfs::fstype::register(rk_fs_tmpfs::FS_TYPE);
     let root = ROOT.call_once(|| FsContext::new(MountNamespace::new(rk_fs_tmpfs::new(0o755))));
     let Some(data) = boot.initrd_bytes() else {
         println!("initramfs: none, the root file system is empty");

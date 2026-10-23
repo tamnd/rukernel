@@ -110,12 +110,32 @@ impl Dentry {
     }
 }
 
+/// The source, the type and the flags of a mount, as `/proc/self/mounts` shows them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountSource {
+    /// The source argument of `mount(2)`, for example a device or `none`.
+    pub source: Vec<u8>,
+    /// The name of the file system type.
+    pub fstype: &'static str,
+    /// The flags of the mount: `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV`, `MS_NOEXEC` and the
+    /// others.
+    pub flags: u64,
+}
+
+impl MountSource {
+    /// The source of the root of the initramfs, which Linux names `rootfs`.
+    pub fn rootfs() -> Self {
+        Self { source: Vec::from(&b"rootfs"[..]), fstype: "rootfs", flags: 0 }
+    }
+}
+
 /// A mounted file system.
 pub struct Mount {
     id: u64,
     root: Arc<Dentry>,
     /// The place of the mount, or `None` for the root mount of a name space.
     mountpoint: Option<Location>,
+    source: SpinLock<MountSource>,
 }
 
 impl core::fmt::Debug for Mount {
@@ -138,6 +158,16 @@ impl Mount {
     /// The place of the mount.
     pub fn mountpoint(&self) -> Option<&Location> {
         self.mountpoint.as_ref()
+    }
+
+    /// The source, the type and the flags.
+    pub fn source(&self) -> MountSource {
+        self.source.lock().clone()
+    }
+
+    /// Sets the flags, for `MS_REMOUNT`.
+    pub fn set_flags(&self, flags: u64) {
+        self.source.lock().flags = flags;
     }
 }
 
@@ -176,12 +206,13 @@ pub struct MountNamespace {
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl MountNamespace {
-    /// Makes a name space with the root `root`.
+    /// Makes a name space with the root `root`. The root mount has the source `rootfs`.
     pub fn new(root: InodeRef) -> Arc<Self> {
         let mount = Arc::new(Mount {
             id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
             root: Dentry::new_root(root),
             mountpoint: None,
+            source: SpinLock::new(MountSource::rootfs()),
         });
         Arc::new(Self { root: mount.clone(), mounts: SpinLock::new(Vec::from([mount])) })
     }
@@ -192,14 +223,33 @@ impl MountNamespace {
     }
 
     /// Mounts the file system with the root `root` on the directory `at`.
-    pub fn mount(&self, root: InodeRef, at: &Location) -> Result<Arc<Mount>> {
-        if !at.inode().metadata().is_dir() || !root.metadata().is_dir() {
+    pub fn mount(&self, root: InodeRef, at: &Location, source: MountSource) -> Result<Arc<Mount>> {
+        if !root.metadata().is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        self.mount_dentry(Dentry::new_root(root), at, source)
+    }
+
+    /// Mounts the tree at `from` on `at`, for `MS_BIND`. The new mount has the source of the
+    /// mount of `from`. A file can be mounted on a file, and a directory on a directory.
+    pub fn bind(&self, from: &Location, at: &Location) -> Result<Arc<Mount>> {
+        self.mount_dentry(from.dentry.clone(), at, from.mount.source())
+    }
+
+    fn mount_dentry(
+        &self,
+        root: Arc<Dentry>,
+        at: &Location,
+        source: MountSource,
+    ) -> Result<Arc<Mount>> {
+        if root.inode().metadata().is_dir() != at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
         let mount = Arc::new(Mount {
             id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
-            root: Dentry::new_root(root),
+            root,
             mountpoint: Some(at.clone()),
+            source: SpinLock::new(source),
         });
         self.mounts.lock().push(mount.clone());
         Ok(mount)

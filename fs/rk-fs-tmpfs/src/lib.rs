@@ -59,6 +59,30 @@ struct Node {
     data: SpinLock<Data>,
 }
 
+/// The magic number of tmpfs, `TMPFS_MAGIC` of `<linux/magic.h>`.
+pub const TMPFS_MAGIC: u64 = 0x0102_1994;
+
+/// The file system type for `mount -t tmpfs`.
+pub const FS_TYPE: rk_vfs::fstype::FsType =
+    rk_vfs::fstype::FsType { name: "tmpfs", nodev: true, make: mount };
+
+/// Makes a new tmpfs for `mount(2)`. The option `mode=` gives the permission bits of the root in
+/// octal. The default is 1777, as Linux gives.
+pub fn mount(data: &[u8]) -> Result<InodeRef> {
+    let perm = match rk_vfs::fstype::option(data, b"mode") {
+        Some(v) => parse_octal(v).ok_or(Errno::EINVAL)?,
+        None => 0o1777,
+    };
+    Ok(new(perm))
+}
+
+fn parse_octal(v: &[u8]) -> Option<u32> {
+    if v.is_empty() || v.len() > 6 {
+        return None;
+    }
+    v.iter().try_fold(0u32, |n, &b| (b'0'..=b'7').contains(&b).then(|| n * 8 + u32::from(b - b'0')))
+}
+
 /// Makes a new tmpfs and gives its root directory, with the permission bits `perm`.
 pub fn new(perm: u32) -> InodeRef {
     let fs = Arc::new(Fs { dev: rk_vfs::anon_dev(), next_ino: AtomicU64::new(1) });
@@ -372,6 +396,10 @@ impl Inode for Node {
 
     fn fs_id(&self) -> u64 {
         self.fs.dev
+    }
+
+    fn fs_magic(&self) -> u64 {
+        TMPFS_MAGIC
     }
 }
 

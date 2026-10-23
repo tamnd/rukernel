@@ -305,9 +305,9 @@ pub(crate) fn statx(
     Ok(0)
 }
 
-fn statfs_of(meta: &Metadata) -> Statfs {
+fn statfs_of(meta: &Metadata, magic: u64) -> Statfs {
     let mut s = Statfs::new_zeroed();
-    s.f_type = TMPFS_MAGIC;
+    s.f_type = if magic == 0 { TMPFS_MAGIC } else { magic as i64 };
     s.f_bsize = rk_mm::PAGE_SIZE as i64;
     s.f_frsize = rk_mm::PAGE_SIZE as i64;
     s.f_namelen = 255;
@@ -315,15 +315,18 @@ fn statfs_of(meta: &Metadata) -> Statfs {
     s
 }
 
-pub(crate) fn statfs(cx: &Cx<'_>, _buf: u64) -> SysResult {
-    let meta = cx.fs()?.root().inode().metadata();
-    cx.write_val(_buf, &statfs_of(&meta))?;
+pub(crate) fn statfs(cx: &Cx<'_>, path: u64, buf: u64) -> SysResult {
+    let path = cx.read_path(path)?;
+    let fs = cx.fs()?;
+    let inode = fs.resolve(fs.cwd(), &path, true)?.inode().clone();
+    cx.write_val(buf, &statfs_of(&inode.metadata(), inode.fs_magic()))?;
     Ok(0)
 }
 
 pub(crate) fn fstatfs(cx: &Cx<'_>, fd: u64, buf: u64) -> SysResult {
-    let meta = cx.file(fd)?.metadata()?;
-    cx.write_val(buf, &statfs_of(&meta))?;
+    let file = cx.file(fd)?;
+    let magic = file.location().map_or(0, |at| at.inode().fs_magic());
+    cx.write_val(buf, &statfs_of(&file.metadata()?, magic))?;
     Ok(0)
 }
 

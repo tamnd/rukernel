@@ -16,9 +16,11 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/statfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -460,6 +462,36 @@ static void test_threads(void)
 						     WIFEXITED(status) && WEXITSTATUS(status) == 7);
 }
 
+static void test_mount(void)
+{
+	struct statfs st;
+	char buf[8] = {0};
+	int fd;
+
+	mkdir("/mnt", 0755);
+	mkdir("/mnt2", 0755);
+	check("mount tmpfs", mount("none", "/mnt", "tmpfs", 0, "mode=700") == 0);
+	check("statfs gives TMPFS_MAGIC", statfs("/mnt", &st) == 0 && st.f_type == 0x01021994);
+	fd = open("/mnt/f", O_CREAT | O_RDWR, 0644);
+	check("a file in the new tmpfs", fd >= 0 && write(fd, "data", 4) == 4);
+	close(fd);
+	check("mount --bind", mount("/mnt", "/mnt2", NULL, MS_BIND, NULL) == 0);
+	fd = open("/mnt2/f", O_RDONLY);
+	check("the bind mount shows the file", fd >= 0 && read(fd, buf, 4) == 4 && !strcmp(buf, "data"));
+	close(fd);
+	check("mount --make-private", mount(NULL, "/mnt", NULL, MS_PRIVATE, NULL) == 0);
+	check("mount -o remount,ro", mount(NULL, "/mnt", NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0);
+	errno = 0;
+	check("an unknown type gives ENODEV", mount("none", "/mnt", "nofs", 0, NULL) == -1 && errno == ENODEV);
+	check("umount the bind mount", umount("/mnt2") == 0);
+	check("umount2 with MNT_DETACH", umount2("/mnt", MNT_DETACH) == 0);
+	errno = 0;
+	check("umount of a directory gives EINVAL", umount("/mnt") == -1 && errno == EINVAL);
+	check("the file is gone with the mount", access("/mnt/f", F_OK) == -1 && errno == ENOENT);
+	rmdir("/mnt");
+	rmdir("/mnt2");
+}
+
 static void test_tty(void)
 {
 	char buf[64];
@@ -497,6 +529,7 @@ int main(int argc, char **argv)
 	test_signals();
 	test_pipes();
 	test_threads();
+	test_mount();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");

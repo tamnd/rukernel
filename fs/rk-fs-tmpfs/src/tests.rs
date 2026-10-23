@@ -4,7 +4,7 @@ use super::*;
 use alloc::vec;
 use rk_abi::native::open as o;
 use rk_vfs::cpio;
-use rk_vfs::{FdTable, File, FsContext, Location, MountNamespace, Whence};
+use rk_vfs::{FdTable, File, FsContext, Location, MountNamespace, MountSource, Whence};
 
 fn setup() -> (FsContext, Location) {
     let fs = FsContext::new(MountNamespace::new(new(0o755)));
@@ -219,7 +219,8 @@ fn mounts() {
     let (mut fs, root) = setup();
     fs.mkdir(&root, b"/mnt", 0o755).unwrap();
     write_file(&fs, &root, b"/mnt/hidden", b"below");
-    fs.mount(new(0o1777), &root, b"/mnt").unwrap();
+    let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
+    fs.mount(new(0o1777), &root, b"/mnt", tmp.clone()).unwrap();
     assert_eq!(fs.open(&root, b"/mnt/hidden", o::O_RDONLY, 0).err(), Some(Errno::ENOENT));
     write_file(&fs, &root, b"/mnt/top", b"above");
     fs.mkdir(&root, b"/mnt/d", 0o755).unwrap();
@@ -232,8 +233,28 @@ fn mounts() {
     assert_eq!(fs.remove(&root, b"/mnt", true).err(), Some(Errno::EBUSY));
     let mnt = fs.resolve(&root, b"/mnt", true).unwrap();
     assert_eq!(mnt.inode().metadata().mode, mode::S_IFDIR | 0o1777);
+    assert_eq!(mnt.mount.source(), tmp);
     fs.namespace().unmount(&mnt).unwrap();
     assert_eq!(read_file(&fs, &root, b"/mnt/hidden").as_deref(), Ok(&b"below"[..]));
+}
+
+#[test]
+fn bind_mounts() {
+    let (fs, root) = setup();
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    fs.mkdir(&root, b"/b", 0o755).unwrap();
+    write_file(&fs, &root, b"/a/f", b"data");
+    write_file(&fs, &root, b"/g", b"");
+    let a = fs.resolve(&root, b"/a", true).unwrap();
+    let b = fs.resolve(&root, b"/b", true).unwrap();
+    let g = fs.resolve(&root, b"/g", true).unwrap();
+    assert_eq!(fs.namespace().bind(&a, &g).err(), Some(Errno::ENOTDIR));
+    let f = fs.resolve(&root, b"/a/f", true).unwrap();
+    assert_eq!(fs.namespace().bind(&f, &b).err(), Some(Errno::ENOTDIR));
+    fs.namespace().bind(&a, &b).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/b/f").as_deref(), Ok(&b"data"[..]));
+    assert_eq!(fs.namespace().mounts().len(), 2);
+    assert_eq!(fs.namespace().mounts()[1].source(), MountSource::rootfs());
 }
 
 #[test]
@@ -301,4 +322,13 @@ fn descriptor_table() {
     assert_eq!(t.iter().map(|(fd, _)| fd).collect::<Vec<_>>(), [0, 1, 2, 5]);
     assert_eq!(t.remove_range(1, 4).len(), 2);
     assert_eq!(t.iter().map(|(fd, _)| fd).collect::<Vec<_>>(), [0, 5]);
+}
+
+#[test]
+fn mount_options() {
+    let root = mount(b"size=1m,mode=700").unwrap();
+    assert_eq!(root.metadata().mode, mode::S_IFDIR | 0o700);
+    assert_eq!(root.fs_magic(), TMPFS_MAGIC);
+    assert_eq!(mount(b"").unwrap().metadata().mode, mode::S_IFDIR | 0o1777);
+    assert_eq!(mount(b"mode=9").err(), Some(Errno::EINVAL));
 }
