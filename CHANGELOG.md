@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.0.3] (2026-10-23)
+
 ### Added
 
 - `rk-abigen`, the ABI generator, in `tools/rk-abigen`. `rk-abigen fetch` downloads the Linux 7.3 tarball and checks its SHA-256. `rk-abigen generate` writes the system call tables of x86-64, arm64 and riscv64 into `abi/7.3/` as TOML and into `rk-abi` as Rust.
@@ -20,6 +22,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Changed
 
 - rk-abigen now generates the `Errno` constants from `<asm/errno.h>`. `Errno` has all the error numbers of Linux, from `EPERM` (1) to `EHWPOISON` (133), and the hand-written list is gone.
+
+### Fixed
+
+- The boot tests use KVM only when the runner can open `/dev/kvm`. Otherwise QEMU uses TCG.
+- The license check allows GPL-2.0-only for the crates of this workspace, because they are published now.
 
 ## [0.0.2] (2026-10-23)
 
@@ -52,5 +59,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.0.3]: https://github.com/tamnd/rukernel/releases/tag/v0.0.3
 [0.0.2]: https://github.com/tamnd/rukernel/releases/tag/v0.0.2
 [0.0.1]: https://github.com/tamnd/rukernel/releases/tag/v0.0.1

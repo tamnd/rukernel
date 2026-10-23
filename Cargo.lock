@@ -22,26 +22,26 @@ dependencies = [
 
 [[package]]
 name = "rk-abi"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "rk-abigen"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "rk-frame"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "rk-lib"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "rukernel"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -66,7 +66,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "xtask"
-version = "0.0.2"
+version = "0.0.3"
 
 [[package]]
 name = "zerocopy"
