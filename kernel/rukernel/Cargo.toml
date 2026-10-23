@@ -1,0 +1,22 @@
+[package]
+name = "rukernel"
+description = "The rukernel binary. It links all parts of the kernel."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rukernel"
+test = false
+doctest = false
+bench = false
+
+[dependencies]
+rk-frame.workspace = true
+
+[lints]
+workspace = true

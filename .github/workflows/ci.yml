@@ -121,6 +121,31 @@ jobs:
           # shellcheck disable=SC2086
           cargo build --target "$TARGET" --release $crates
 
+  # The kernel boots in QEMU and runs its self tests. QEMU exits with status 33 for a pass.
+  # Without KVM on the runner, QEMU uses TCG. This is slow, but the R0 tests are short.
+  boot:
+    name: boot in qemu on x86-64
+    needs: quick
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: boot
+      - name: install qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+      - name: boot tests
+        run: cargo xtask boot-test
+
   docs:
     name: documentation
     needs: quick
@@ -176,7 +201,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, targets, docs, deny, typos]
+    needs: [quick, test, targets, boot, docs, deny, typos]
     runs-on: ubuntu-24.04
     permissions: {}
     steps:

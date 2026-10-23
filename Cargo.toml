@@ -4,6 +4,7 @@ members = [
     "frame/rk-frame",
     "core/rk-abi",
     "core/rk-lib",
+    "kernel/rukernel",
     "xtask",
 ]
 

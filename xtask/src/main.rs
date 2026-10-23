@@ -1,14 +1,17 @@
 //! The build checks of rukernel.
 //!
-//! Each check is a command: `cargo xtask unsafe`, `layers`, `style`, `targets` or `ci`. The CI gate
-//! runs the same commands. Thus a check that passes on a developer machine passes in CI.
+//! Each check is a command: `cargo xtask unsafe`, `layers`, `style`, `targets`, `boot-test` or `ci`.
+//! The CI gate runs the same commands. Thus a check that passes on a developer machine passes in
+//! CI. `cargo xtask qemu` boots the kernel for a person to use.
 
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 
 /// The bare metal targets of the kernel, per spec/15-boot-and-platform.md section 15.1.
 const KERNEL_TARGETS: &[&str] =
@@ -32,14 +35,18 @@ fn main() -> ExitCode {
         "layers" => check_layers(),
         "style" => check_style(),
         "targets" => build_targets(),
+        "qemu" => qemu(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "boot-test" => boot_test(),
         "ci" => ci(),
         _ => Err(String::from(
-            "usage: cargo xtask <unsafe | layers | style | targets | ci>\n\n\
+            "usage: cargo xtask <unsafe | layers | style | targets | qemu | boot-test | ci>\n\n\
              unsafe   each crate root forbids unsafe code, except the crates in xtask/unsafe-allowed.txt\n\
              layers   each crate depends only on its layer or a lower layer, per xtask/layers.txt\n\
              style    the prose has no em dashes, no en dashes and no horizontal rules\n\
              targets  the kernel crates build for the three bare metal targets\n\
-             ci       all of the above, and fmt, clippy, test and doc",
+             qemu     boot the x86-64 kernel in QEMU, with the arguments as the command line\n\
+             boot-test  boot the x86-64 kernel in QEMU and check the self tests\n\
+             ci       all of the above except qemu, and fmt, clippy, test and doc",
         )),
     };
     match result {
@@ -288,9 +295,99 @@ fn ci() -> Result {
     cargo(&["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"])?;
     cargo(&["test", "--workspace", "--no-fail-fast"])?;
     build_targets()?;
+    boot_test()?;
     cargo(&["doc", "--workspace", "--no-deps"])?;
     println!("all checks passed");
     Ok(())
+}
+
+/// The QEMU exit status for a passed self test: `(0x10 << 1) | 1`, per kernel/rukernel/src/kernel.rs.
+const QEMU_PASS: i32 = 33;
+
+/// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
+const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The self tests that `boot-test` runs, each in its own boot.
+const BOOT_TESTS: &[&str] = &["boot"];
+
+/// Builds the x86-64 kernel and gives the path of the ELF image.
+fn build_kernel() -> Result<PathBuf> {
+    cargo(&["build", "--package", "rukernel", "--target", "x86_64-unknown-none"])?;
+    Ok(workspace_root().join("target/x86_64-unknown-none/debug/rukernel"))
+}
+
+/// The QEMU command for the x86-64 kernel. KVM is used when the host has it.
+fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
+    let mut cmd = Command::new("qemu-system-x86_64");
+    cmd.args(["-machine", "q35", "-m", "512M", "-smp", "1", "-display", "none"])
+        .args(["-serial", "stdio", "-no-reboot", "-monitor", "none"])
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        .arg("-kernel")
+        .arg(kernel)
+        .args(["-append", cmdline]);
+    if Path::new("/dev/kvm").exists() {
+        cmd.args(["-accel", "kvm", "-cpu", "host"]);
+    } else {
+        cmd.args(["-accel", "tcg", "-cpu", "max"]);
+    }
+    cmd
+}
+
+fn qemu(args: &[String]) -> Result {
+    let kernel = build_kernel()?;
+    let cmdline = if args.is_empty() { String::from("console=ttyS0") } else { args.join(" ") };
+    let status = qemu_command(&kernel, &cmdline)
+        .status()
+        .map_err(|e| format!("cannot run qemu-system-x86_64: {e}"))?;
+    println!("qemu exited with {status}");
+    Ok(())
+}
+
+fn boot_test() -> Result {
+    let kernel = build_kernel()?;
+    let mut errors = Vec::new();
+    for test in BOOT_TESTS {
+        let cmdline = format!("console=ttyS0 rk.test={test}");
+        let (status, log) = run_with_timeout(qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)?;
+        let passed = status == Some(QEMU_PASS) && log.contains(&format!("rk.test={test}: pass"));
+        if passed {
+            println!("boot test {test}: pass");
+        } else {
+            let status = status.map_or(String::from("a timeout"), |s| format!("status {s}"));
+            errors.push(format!("boot test {test}: fail with {status}\n{log}"));
+        }
+    }
+    report("boot tests", errors)
+}
+
+/// Runs a command, collects its standard output and stops it after `timeout`. Gives the exit
+/// status, or `None` for a timeout.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<(Option<i32>, String)> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot run {:?}: {e}", cmd.get_program()))?;
+    let mut stdout = child.stdout.take().ok_or("no standard output")?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status.code();
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let log = reader.join().unwrap_or_default();
+    Ok((status, log))
 }
 
 fn cargo(args: &[&str]) -> Result {

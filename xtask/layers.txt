@@ -7,4 +7,5 @@
 rk-frame  0
 rk-abi    0
 rk-lib    0
+rukernel  5
 xtask     tool
