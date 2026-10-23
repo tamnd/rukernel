@@ -1,7 +1,8 @@
 # The crates that can contain unsafe code, per spec/23-package-layout.md section 23.3.
 #
-# Each other crate has #![forbid(unsafe_code)] at its root, and `cargo xtask unsafe` checks it.
-# To add a crate to this list, open an issue with the label area/frame. Give the reason, the owner
-# and the size budget.
+# Each line is a crate name and its budget in lines of code. Each other crate has
+# #![forbid(unsafe_code)] at its root, and `cargo xtask unsafe` checks it. Each crate here needs a
+# section in frame/AUDITED.md with the reason, the owner and the audit. To add a crate to this
+# list, open an issue with the label area/frame.
 
-rk-frame
+rk-frame  25000     # spec/02-the-goal.md section 2.4
