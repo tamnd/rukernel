@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.0.4] (2026-10-23)
+
 ### Added
 
 - The Linux boot protocol on x86-64. `cargo xtask boot-test` writes a bzImage next to the ELF image. The real mode setup code gets the E820 memory map from the BIOS and goes to the 32 bit entry. The 64 bit entry is 0x200 bytes after it. The kernel reads the command line, the memory map, the initramfs and the ACPI RSDP from `boot_params`.
@@ -70,6 +72,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.0.4]: https://github.com/tamnd/rukernel/releases/tag/v0.0.4
 [0.0.3]: https://github.com/tamnd/rukernel/releases/tag/v0.0.3
 [0.0.2]: https://github.com/tamnd/rukernel/releases/tag/v0.0.2
 [0.0.1]: https://github.com/tamnd/rukernel/releases/tag/v0.0.1
