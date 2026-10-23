@@ -491,8 +491,9 @@ const BUSYBOX_URL: &str = "https://busybox.net/downloads/binaries/1.35.0-x86_64-
 const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348";
 
 /// The applets that the `busybox` boot test uses. Each one is a link to /bin/busybox.
-const BUSYBOX_APPLETS: &[&str] =
-    &["sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test", "mkdir", "rm", "true", "false"];
+const BUSYBOX_APPLETS: &[&str] = &[
+    "sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test", "mkdir", "rm", "true", "false", "mount",
+];
 
 /// Gives the SHA-256 of `path` in hexadecimal, from `sha256sum` or `shasum`.
 fn sha256(path: &Path) -> Result<String> {
@@ -552,6 +553,10 @@ fn ltp_dir() -> Option<PathBuf> {
 /// The names of the LTP tests that the `ltp` boot test runs, from tools/ltp/tests.txt. A line
 /// that starts with `#` is a comment.
 fn ltp_tests() -> Result<Vec<String>> {
+    // RK_LTP_TESTS gives other tests for a run by hand.
+    if let Ok(list) = std::env::var("RK_LTP_TESTS") {
+        return Ok(list.split_ascii_whitespace().map(String::from).collect());
+    }
     let text = read(&workspace_root().join("tools/ltp/tests.txt"))?;
     Ok(text
         .lines()
@@ -564,8 +569,11 @@ fn ltp_tests() -> Result<Vec<String>> {
 /// The script that the `ltp` boot test runs as init. A test passes with the exit code 0, or 32
 /// (`TCONF`) when the test does not apply. The output of a test that fails goes to the console.
 fn ltp_script(tests: &[String]) -> String {
-    let mut script =
-        String::from("#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp\nfailed=0\nfor t in \\\n");
+    let mut script = String::from(concat!(
+        "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp\n",
+        "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
+        "failed=0\nfor t in \\\n",
+    ));
     for t in tests {
         script.push_str(&format!("    {t} \\\n"));
     }
@@ -593,7 +601,7 @@ fn build_ltp_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
     let tests = ltp_tests()?;
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
-    for d in [&b"bin"[..], b"tmp", b"etc", b"ltp"] {
+    for d in [&b"bin"[..], b"tmp", b"etc", b"ltp", b"proc"] {
         w.add(d, 0o040_755, b"");
     }
     w.add(b"bin/busybox", 0o100_755, busybox);

@@ -195,6 +195,35 @@ impl Location {
     pub fn is_mount_root(&self) -> bool {
         Arc::ptr_eq(&self.dentry, &self.mount.root)
     }
+
+    /// The path from the root of the name space, through the mount points. It is for the
+    /// places that show a file to a person, as `/proc/PID/maps`. `FsContext::path_of` gives the
+    /// path from the root of a process.
+    pub fn absolute_path(&self) -> Vec<u8> {
+        let mut parts = Vec::new();
+        let mut at = self.clone();
+        loop {
+            if at.is_mount_root() {
+                match at.mount.mountpoint.clone() {
+                    Some(up) => at = up,
+                    None => break,
+                }
+                continue;
+            }
+            parts.push(at.dentry.name());
+            let Some(parent) = at.dentry.parent() else { break };
+            at.dentry = parent;
+        }
+        if parts.is_empty() {
+            return Vec::from(&b"/"[..]);
+        }
+        let mut path = Vec::new();
+        for part in parts.iter().rev() {
+            path.push(b'/');
+            path.extend_from_slice(part);
+        }
+        path
+    }
 }
 
 /// The mounts that a group of processes sees, as a mount name space of Linux.

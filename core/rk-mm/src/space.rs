@@ -5,6 +5,7 @@
 //! read only in both, and the first write copies it. This is copy on write.
 
 use crate::vma::{Backing, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -23,6 +24,11 @@ pub trait MmFile: Send + Sync {
     ///
     /// Gives `ENOMEM` if no frame is free, or an error of the file system.
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno>;
+
+    /// The device, the inode number and the path of the file, as `/proc/PID/maps` shows them.
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        (0, 0, Vec::new())
+    }
 }
 
 /// A file in an area.
@@ -31,6 +37,29 @@ pub type FileRef = Arc<dyn MmFile>;
 impl core::fmt::Debug for dyn MmFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("MmFile")
+    }
+}
+
+/// The memory of a shared anonymous area. Each address space that maps the area after `fork`
+/// finds the same frames here, also for a page that no process touched before the `fork`. Linux
+/// keeps this memory in a shmem file.
+struct SharedAnon {
+    pages: SpinLock<BTreeMap<u64, Arc<Frame>>>,
+}
+
+impl MmFile for SharedAnon {
+    fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
+        let mut pages = self.pages.lock();
+        if let Some(frame) = pages.get(&index) {
+            return Ok(frame.clone());
+        }
+        let frame = anon_frame()?;
+        pages.insert(index, frame.clone());
+        Ok(frame)
+    }
+
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        (0, 0, b"/dev/zero (deleted)".to_vec())
     }
 }
 
@@ -195,6 +224,10 @@ impl AddressSpace {
         };
         let backing = match req.file {
             Some((file, offset)) => Backing::File { file, offset },
+            None if req.shared => {
+                let file: FileRef = Arc::new(SharedAnon { pages: SpinLock::new(BTreeMap::new()) });
+                Backing::File { file, offset: 0 }
+            }
             None => Backing::Anon,
         };
         st.vmas.insert(Vma {

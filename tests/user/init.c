@@ -492,6 +492,52 @@ static void test_mount(void)
 	rmdir("/mnt2");
 }
 
+/* Reads the file `path` into `buf` and gives the byte count, or -1. */
+static ssize_t read_file(const char *path, char *buf, size_t len)
+{
+	int fd = open(path, O_RDONLY);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, len - 1);
+	close(fd);
+	if (n >= 0)
+		buf[n] = 0;
+	return n;
+}
+
+static void test_proc(void)
+{
+	char buf[4096], want[64], link[256];
+	struct statfs st;
+	ssize_t n;
+	int fd;
+
+	mkdir("/proc", 0555);
+	check("mount proc", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	check("statfs gives PROC_SUPER_MAGIC", statfs("/proc", &st) == 0 && st.f_type == 0x9fa0);
+	check("/proc/meminfo", read_file("/proc/meminfo", buf, sizeof(buf)) > 0 && !strncmp(buf, "MemTotal:", 9));
+	snprintf(want, sizeof(want), "%d (init) R 0 ", getpid());
+	check("/proc/self/stat", read_file("/proc/self/stat", buf, sizeof(buf)) > 0 && !strncmp(buf, want, strlen(want)));
+	check("/proc/self/status", read_file("/proc/self/status", buf, sizeof(buf)) > 0 && strstr(buf, "\nState:\tR (running)\n"));
+	check("/proc/self/cmdline", read_file("/proc/self/cmdline", buf, sizeof(buf)) > 0 && !strcmp(buf, "/init"));
+	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n"));
+	check("/proc/mounts", read_file("/proc/mounts", buf, sizeof(buf)) > 0 && strstr(buf, "proc /proc proc rw 0 0\n"));
+	n = readlink("/proc/self/exe", link, sizeof(link) - 1);
+	check("/proc/self/exe", n == 5 && !strncmp(link, "/init", 5));
+	fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
+	check("/proc/sys/kernel/pid_max", fd >= 0 && read(fd, buf, sizeof(buf)) == 8 && !strncmp(buf, "4194304\n", 8));
+	close(fd);
+	fd = open("/proc/self/oom_score_adj", O_WRONLY);
+	check("write /proc/self/oom_score_adj", fd >= 0 && write(fd, "-500\n", 5) == 5);
+	close(fd);
+	check("read /proc/self/oom_score_adj", read_file("/proc/self/oom_score_adj", buf, sizeof(buf)) == 5 && !strcmp(buf, "-500\n"));
+	errno = 0;
+	check("/proc/self/nothing gives ENOENT", open("/proc/self/nothing", O_RDONLY) == -1 && errno == ENOENT);
+	check("umount proc", umount("/proc") == 0);
+}
+
 static void test_tty(void)
 {
 	char buf[64];
@@ -530,6 +576,7 @@ int main(int argc, char **argv)
 	test_pipes();
 	test_threads();
 	test_mount();
+	test_proc();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");

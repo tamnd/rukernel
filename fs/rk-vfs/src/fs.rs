@@ -65,6 +65,11 @@ impl FsContext {
         &self.cwd
     }
 
+    /// The umask.
+    pub fn umask(&self) -> u32 {
+        self.umask
+    }
+
     /// Sets the umask and gives the old umask.
     pub fn set_umask(&mut self, umask: u32) -> u32 {
         core::mem::replace(&mut self.umask, umask & 0o777)

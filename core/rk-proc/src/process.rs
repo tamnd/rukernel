@@ -11,14 +11,14 @@ use crate::wait::{WaitStatus, WaitTarget};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDWAIT, SIGCHLD, SIGKILL};
 use rk_frame::sync::SpinLock;
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
-use rk_vfs::{FdTable, FsContext};
+use rk_vfs::{FdTable, FsContext, Location};
 
 /// A process ID or a thread ID.
 pub type Pid = u32;
@@ -48,6 +48,15 @@ struct State {
     /// The status that the parent gets. The process is a zombie when this is set.
     zombie: Option<WaitStatus>,
     comm: Vec<u8>,
+}
+
+/// What `execve` gave the process: the arguments and the file of the program.
+#[derive(Clone, Default)]
+struct Image {
+    /// The arguments, each one with a zero byte at its end, as `/proc/PID/cmdline` gives them.
+    cmdline: Vec<u8>,
+    /// The file of the program, for `/proc/PID/exe`.
+    exe: Option<Location>,
 }
 
 /// The signal state that the threads of a process share: the actions and the queue of the
@@ -90,6 +99,11 @@ pub struct Process {
     signals: SpinLock<SharedSignals>,
     /// The signal that the parent gets when the process ends, or 0.
     exit_signal: u32,
+    image: SpinLock<Image>,
+    /// The tick of the timer when the process was made.
+    start_tick: u64,
+    /// The value of `/proc/PID/oom_score_adj`. rukernel has no OOM killer yet.
+    oom_score_adj: AtomicI32,
 }
 
 impl core::fmt::Debug for Process {
@@ -109,6 +123,32 @@ pub struct Thread {
     /// The thread must stop at its next return to the kernel, because its group exits.
     killed: AtomicBool,
     signals: SpinLock<ThreadSignals>,
+    /// The parent of a `vfork` child waits on this.
+    vfork_done: SpinLock<Option<Arc<VforkDone>>>,
+}
+
+/// The wait of the parent of a `vfork` child. The parent waits until the child calls `execve` or
+/// ends, as `CLONE_VFORK` tells, because the child uses the memory of the parent until then.
+pub struct VforkDone {
+    done: AtomicBool,
+    wait: WaitQueue,
+}
+
+impl VforkDone {
+    /// Makes a wait that is not done.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self { done: AtomicBool::new(false), wait: WaitQueue::new() })
+    }
+
+    /// Waits until the child calls `execve` or ends.
+    pub fn wait(&self) {
+        self.wait.wait_until(|| self.done.load(Ordering::Acquire).then_some(()));
+    }
+
+    fn complete(&self) {
+        self.done.store(true, Ordering::Release);
+        self.wait.wake_all();
+    }
 }
 
 impl core::fmt::Debug for Thread {
@@ -304,6 +344,57 @@ impl Process {
         }
     }
 
+    /// The arguments of the program, each one with a zero byte at its end.
+    pub fn cmdline(&self) -> Vec<u8> {
+        self.image.lock().cmdline.clone()
+    }
+
+    /// The file of the program, or `None` before the first `execve`.
+    pub fn exe(&self) -> Option<Location> {
+        self.image.lock().exe.clone()
+    }
+
+    /// Sets the arguments and the file of the program, after `execve`.
+    pub fn set_image(&self, argv: &[Vec<u8>], exe: Location) {
+        let mut cmdline = Vec::new();
+        for arg in argv {
+            cmdline.extend_from_slice(arg);
+            cmdline.push(0);
+        }
+        *self.image.lock() = Image { cmdline, exe: Some(exe) };
+    }
+
+    /// The tick of the timer when the process was made.
+    pub fn start_tick(&self) -> u64 {
+        self.start_tick
+    }
+
+    /// The value of `/proc/PID/oom_score_adj`.
+    pub fn oom_score_adj(&self) -> i32 {
+        self.oom_score_adj.load(Ordering::Relaxed)
+    }
+
+    /// Sets the value of `/proc/PID/oom_score_adj`.
+    pub fn set_oom_score_adj(&self, value: i32) {
+        self.oom_score_adj.store(value, Ordering::Relaxed);
+    }
+
+    /// The state letter of `/proc/PID/stat`: `Z` for a zombie, `R` if a thread runs or can
+    /// run, and `S` if each thread waits.
+    pub fn state_letter(&self) -> u8 {
+        let s = self.state.lock();
+        if s.zombie.is_some() {
+            return b'Z';
+        }
+        let running = s.threads.iter().any(|t| t.task().is_some_and(|task| !task.is_blocked()));
+        if running { b'R' } else { b'S' }
+    }
+
+    /// The signals that any thread of the process can take.
+    pub fn shared_pending(&self) -> SigSet {
+        self.signals.lock().pending.set()
+    }
+
     /// The signal that the parent gets when the process ends, or 0.
     pub fn exit_signal(&self) -> u32 {
         self.exit_signal
@@ -341,11 +432,26 @@ impl Process {
             fs: SpinLock::new(Some(fs)),
             signals: SpinLock::new(SharedSignals { actions, pending: Pending::new() }),
             exit_signal,
+            image: SpinLock::new(Image::default()),
+            start_tick: rk_frame::time::ticks(),
+            oom_score_adj: AtomicI32::new(0),
         })
     }
 }
 
 impl Thread {
+    /// Sets the wait of the parent, for a child of `vfork`.
+    pub fn set_vfork_done(&self, done: Arc<VforkDone>) {
+        *self.vfork_done.lock() = Some(done);
+    }
+
+    /// Lets the parent of a `vfork` child continue. `execve` and the exit call it.
+    pub(crate) fn release_vfork(&self) {
+        if let Some(done) = self.vfork_done.lock().take() {
+            done.complete();
+        }
+    }
+
     /// The thread ID.
     pub fn tid(&self) -> Pid {
         self.tid
@@ -492,6 +598,7 @@ impl Thread {
             clear_child_tid: AtomicUsize::new(0),
             killed: AtomicBool::new(false),
             signals: SpinLock::new(ThreadSignals { blocked, ..ThreadSignals::default() }),
+            vfork_done: SpinLock::new(None),
         })
     }
 }
@@ -540,6 +647,9 @@ pub struct ForkShare {
     pub fs: bool,
     /// The signal that the parent gets when the child ends: the low byte of the `clone` flags.
     pub exit_signal: u32,
+    /// `CLONE_PARENT`: the child gets the parent of the caller, and the exit signal of the
+    /// caller.
+    pub parent: bool,
 }
 
 /// Makes a child process of the process of `parent`, for `fork` and `clone` without
@@ -561,11 +671,17 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
         (s.pgid, s.sid, s.comm.clone())
     };
     let actions = pp.signals.lock().actions;
+    let (owner, exit_signal) = if share.parent {
+        // Linux gives `EINVAL` for init, which has no parent.
+        (pp.parent().ok_or(Errno::EINVAL)?, pp.exit_signal)
+    } else {
+        (pp.clone(), share.exit_signal)
+    };
     let mut table = TABLE.lock();
     let pid = alloc_pid(&mut table)?;
     let child = Process::new(
         pid,
-        Arc::downgrade(pp),
+        Arc::downgrade(&owner),
         pgid,
         sid,
         comm,
@@ -573,14 +689,16 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
         files,
         fs,
         actions,
-        share.exit_signal,
+        exit_signal,
     );
+    *child.image.lock() = pp.image.lock().clone();
+    child.set_oom_score_adj(pp.oom_score_adj());
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     child.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
     drop(table);
-    pp.state.lock().children.push(child);
+    owner.state.lock().children.push(child);
     Ok(thread)
 }
 
@@ -737,6 +855,7 @@ pub(crate) fn kill_other_threads(thread: &Thread) {
 /// becomes a zombie for its parent. `status` is the status of the thread, and the status of the
 /// group goes first.
 pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
+    thread.release_vfork();
     let process = thread.process.clone();
     TABLE.lock().threads.remove(&thread.tid);
     let last = {

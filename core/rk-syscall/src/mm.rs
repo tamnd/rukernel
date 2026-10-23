@@ -4,6 +4,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::mman::{
     MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
@@ -25,6 +26,8 @@ const KNOWN_FLAGS: u32 = 0x1f_ffff;
 /// file. The page cache of R2 replaces this type.
 struct FilePages {
     inode: InodeRef,
+    /// The path of the file when it was first mapped.
+    path: Vec<u8>,
     pages: SpinLock<BTreeMap<u64, Arc<Frame>>>,
 }
 
@@ -48,20 +51,27 @@ impl MmFile for FilePages {
         let frame = Arc::new(frame);
         Ok(self.pages.lock().entry(index).or_insert(frame).clone())
     }
+
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        let meta = self.inode.metadata();
+        (meta.dev, meta.ino, self.path.clone())
+    }
 }
 
 /// The page cache of the files that a process mapped, so that two mappings of one file share
 /// their pages.
 static MAPPED: SpinLock<BTreeMap<usize, Arc<FilePages>>> = SpinLock::new(BTreeMap::new());
 
-/// Gives the pages of `inode`. An entry stays while a mapping holds it.
-fn file_pages(inode: &InodeRef) -> Arc<FilePages> {
+/// Gives the pages of `inode`, which has the path `path`. An entry stays while a mapping holds
+/// it.
+fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
     let key = Arc::as_ptr(inode).cast::<()>() as usize;
     let mut map = MAPPED.lock();
     map.retain(|_, pages| Arc::strong_count(pages) > 1);
     map.entry(key)
         .or_insert_with(|| {
-            Arc::new(FilePages { inode: inode.clone(), pages: SpinLock::new(BTreeMap::new()) })
+            let pages = SpinLock::new(BTreeMap::new());
+            Arc::new(FilePages { inode: inode.clone(), path, pages })
         })
         .clone()
 }
@@ -103,7 +113,8 @@ pub(crate) fn mmap(
         if !file.flags().readable() || (shared && prot.write && !file.flags().writable()) {
             return Err(Errno::EACCES);
         }
-        let pages: Arc<dyn MmFile> = file_pages(inode);
+        let path = file.location().map(rk_vfs::Location::absolute_path).unwrap_or_default();
+        let pages: Arc<dyn MmFile> = file_pages(inode, path);
         Some((pages, offset))
     };
     let req = MmapRequest {

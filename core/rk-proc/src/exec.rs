@@ -175,12 +175,13 @@ fn read_headers(inode: &InodeRef) -> Result<ElfHeader, Errno> {
 }
 
 /// Makes the new address space and the initial stack for `args`. `random` gives the 16 bytes of
-/// `AT_RANDOM`.
+/// `AT_RANDOM`. Also gives the file of the program and the arguments, which an interpreter line
+/// changes.
 fn build(
     fs: &FsContext,
     mut args: ExecArgs,
     random: [u8; 16],
-) -> Result<(AddressSpace, ExecImage, Location), Errno> {
+) -> Result<(AddressSpace, ExecImage, Location, Vec<Vec<u8>>), Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
     let (at, header) = loop {
@@ -276,7 +277,7 @@ fn build(
     )?;
     space.write(image.sp, &image.bytes)?;
     let start = interp.map_or(entry, |i| i.bias + i.header.entry as usize);
-    Ok((space, ExecImage { entry: start, sp: image.sp }, at))
+    Ok((space, ExecImage { entry: start, sp: image.sp }, at, args.argv))
 }
 
 /// Runs a new program in the process of `thread`. On success the process has the new address
@@ -293,13 +294,14 @@ pub fn exec(thread: &Thread, args: ExecArgs, random: [u8; 16]) -> Result<ExecIma
     let fs = process.fs().ok_or(Errno::ESRCH)?;
     let ctx = fs.lock().clone();
     let path = args.path.clone();
-    let (space, image, _at) = build(&ctx, args, random)?;
+    let (space, image, at, argv) = build(&ctx, args, random)?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
     let space = Arc::new(space);
     space.activate();
     let old = process.replace_vm(space);
     drop(old);
+    thread.release_vfork();
     if let Some(files) = process.files() {
         // A table that another process shares stays with it, and this process takes a copy.
         let mut table = files.lock().clone();
@@ -312,5 +314,6 @@ pub fn exec(thread: &Thread, args: ExecArgs, random: [u8; 16]) -> Result<ExecIma
     thread.set_altstack(crate::signal::AltStack::default());
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&path);
     process.set_comm(name);
+    process.set_image(&argv, at);
     Ok(image)
 }
