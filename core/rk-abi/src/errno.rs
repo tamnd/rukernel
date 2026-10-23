@@ -7,29 +7,10 @@
 /// Linux uses the top 4095 values of the return register for errors.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(transparent)]
-pub struct Errno(u16);
+pub struct Errno(pub(crate) u16);
 
 impl Errno {
-    /// Operation not permitted.
-    pub const EPERM: Self = Self(1);
-    /// No such file or directory.
-    pub const ENOENT: Self = Self(2);
-    /// Interrupted system call.
-    pub const EINTR: Self = Self(4);
-    /// Input/output error.
-    pub const EIO: Self = Self(5);
-    /// Bad file descriptor.
-    pub const EBADF: Self = Self(9);
-    /// Resource temporarily unavailable.
-    pub const EAGAIN: Self = Self(11);
-    /// Cannot allocate memory.
-    pub const ENOMEM: Self = Self(12);
-    /// Bad address.
-    pub const EFAULT: Self = Self(14);
-    /// Invalid argument.
-    pub const EINVAL: Self = Self(22);
-    /// Function not implemented.
-    pub const ENOSYS: Self = Self(38);
+    // rk-abigen generates the constants `Errno::EPERM` and the others in src/generated/errno.rs.
 
     /// The largest error number. Linux calls this value `MAX_ERRNO`.
     pub const MAX: u16 = 4095;

@@ -38,6 +38,24 @@ mod tests {
     }
 
     #[test]
+    fn known_constants() {
+        use crate::Errno;
+        assert_eq!(Errno::ENOSYS.get(), 38);
+        assert_eq!(Errno::EWOULDBLOCK, Errno::EAGAIN);
+        assert_eq!(x86_64::errno::EHWPOISON, 133);
+        // O_DIRECT and O_DIRECTORY are not the same on x86-64 and arm64.
+        assert_eq!(x86_64::open::O_DIRECTORY, 0o200000);
+        assert_eq!(aarch64::open::O_DIRECTORY, 0o40000);
+        assert_eq!(riscv64::open::O_DIRECTORY, 0o200000);
+        assert_eq!(x86_64::at::AT_FDCWD, -100);
+        assert_eq!(x86_64::mman::MAP_ANONYMOUS, 0x20);
+        assert_eq!(x86_64::sched::CLONE_INTO_CGROUP, 1 << 33);
+        assert_eq!(aarch64::signal::SIGSTKSZ, 16384);
+        // Linux 7.3 also has FUTEX_ROBUST_UNLOCK and FUTEX_ROBUST_LIST32 in the mask.
+        assert_eq!(x86_64::futex::FUTEX_CMD_MASK, !(128 | 256 | 512 | 1024));
+    }
+
+    #[test]
     fn the_name_table_matches_the_numbers() {
         assert_eq!(x86_64::syscalls::SYSCALLS[x86_64::syscalls::WRITE as usize], Some("write"));
         // uselib has a number on x86-64 but no entry point.

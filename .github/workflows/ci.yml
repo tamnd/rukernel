@@ -171,6 +171,9 @@ jobs:
           path: ~/.cache/rk-abigen/*.tar.xz
           key: rk-abigen-${{ hashFiles('tools/rk-abigen/src/main.rs') }}
           restore-keys: rk-abigen-
+      # rk-abigen compiles the constant probes with clang. The runner image has it.
+      - name: clang version
+        run: clang --version
       - name: cargo xtask abi
         run: cargo xtask abi
 

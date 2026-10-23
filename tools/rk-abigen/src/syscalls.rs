@@ -21,7 +21,7 @@ struct Entry {
 }
 
 /// The table of one architecture.
-struct Arch {
+struct Table {
     /// The Rust name of the architecture, as `target_arch` gives it.
     name: &'static str,
     /// The path of the table in the Linux tree.
@@ -42,7 +42,7 @@ fn read(tree: &Path, path: &str) -> Result<String> {
 }
 
 /// Reads `syscall_abis_64` and `syscalltbl` from an arch Makefile.syscalls.
-fn generic_arch(tree: &Path, name: &'static str, makefile: &str) -> Result<Arch> {
+fn generic_arch(tree: &Path, name: &'static str, makefile: &str) -> Result<Table> {
     let text = read(tree, makefile)?;
     let mut native: Vec<String> = GENERIC_ABIS.iter().map(|s| s.to_string()).collect();
     let mut table = GENERIC_TABLE.to_string();
@@ -57,14 +57,14 @@ fn generic_arch(tree: &Path, name: &'static str, makefile: &str) -> Result<Arch>
             table = path.replace("%", "64");
         }
     }
-    Ok(Arch { name, table, native, other: Vec::new() })
+    Ok(Table { name, table, native, other: Vec::new() })
 }
 
-fn arches(tree: &Path) -> Result<Vec<Arch>> {
+fn arches(tree: &Path) -> Result<Vec<Table>> {
     Ok(vec![
         // arch/x86/entry/syscalls/Makefile: unistd_64.h uses common,64 and unistd_x32.h uses
         // common,x32. Only the 64 bit table is native in R0. The x32 lines go in the TOML file.
-        Arch {
+        Table {
             name: "x86_64",
             table: "arch/x86/entry/syscalls/syscall_64.tbl".into(),
             native: vec!["common".into(), "64".into()],
@@ -111,12 +111,7 @@ fn toml_str(s: &str) -> String {
 }
 
 pub(crate) fn generate(tree: &Path, out: &mut Output) -> Result {
-    let mut arches = arches(tree)?;
-    // rustfmt sorts the module declarations, so the generator writes them in that order.
-    arches.sort_by_key(|a| a.name);
-    let mut generated_mod = banner("//", "with the modules of each architecture");
-    generated_mod.push_str("\n//! The generated ABI of each architecture.\n\n");
-    for arch in &arches {
+    for arch in &arches(tree)? {
         let entries = parse(&arch.table, &read(tree, &arch.table)?)?;
         let native: Vec<&Entry> = entries.iter().filter(|e| arch.native.contains(&e.abi)).collect();
         // scripts/syscalltbl.sh rejects a table that is not sorted or has a number two times.
@@ -129,22 +124,12 @@ pub(crate) fn generate(tree: &Path, out: &mut Output) -> Result {
             }
         }
         out.abi(&format!("{}/syscalls.toml", arch.name), toml(arch, &entries));
-        out.rust(&format!("{}/syscalls.rs", arch.name), rust(arch, &native));
-        out.rust(
-            &format!("{}/mod.rs", arch.name),
-            format!(
-                "{}\n//! The ABI of {}.\n\npub mod syscalls;\n",
-                banner("//", "with the modules of this architecture"),
-                arch.name
-            ),
-        );
-        let _ = writeln!(generated_mod, "pub mod {};", arch.name);
+        out.module(arch.name, "syscalls", rust(arch, &native));
     }
-    out.rust("mod.rs", generated_mod);
     Ok(())
 }
 
-fn toml(arch: &Arch, entries: &[Entry]) -> String {
+fn toml(arch: &Table, entries: &[Entry]) -> String {
     let mut s = banner("#", &format!("from {}", arch.table));
     let _ = writeln!(s, "#\n# One entry for each line of the table with one of the ABIs below.");
     let _ = writeln!(s, "# The native 64 bit table uses the ABIs in `native`.\n");
@@ -175,7 +160,7 @@ fn toml(arch: &Arch, entries: &[Entry]) -> String {
     s
 }
 
-fn rust(arch: &Arch, native: &[&Entry]) -> String {
+fn rust(arch: &Table, native: &[&Entry]) -> String {
     let count = native.last().map_or(0, |e| e.nr + 1);
     let mut s = banner("//", &format!("from {}", arch.table));
     let _ = writeln!(
