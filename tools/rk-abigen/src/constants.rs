@@ -7,12 +7,12 @@
 //! method as asm-offsets in Linux, and the assembly output has the value. A macro that is not an
 //! integer constant expression fails a `_Static_assert` in the probe, and the generator drops it.
 
-use crate::{ARCHES, Arch, Output, Result, banner};
+use crate::{ARCHES, Arch, Output, Result, banner, run_input};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// One group of constants.
 struct Group {
@@ -129,33 +129,16 @@ struct Constant {
     alias: Option<String>,
 }
 
-fn clang(arch: &Arch, sysroot: &Path) -> Command {
+/// A clang command for the target, with the installed headers. scripts/headers_install.sh
+/// defines `__EXPORTED_HEADERS__`, so the generator defines it too.
+pub(crate) fn clang(arch: &Arch, sysroot: &Path) -> Command {
     let mut cmd = Command::new("clang");
     cmd.arg(format!("--target={}", arch.triple))
+        .arg("-D__EXPORTED_HEADERS__")
         .args(["-std=gnu11", "-ffreestanding", "-nostdlibinc", "-x", "c", "-"])
         .arg("-I")
         .arg(sysroot.join("include"));
     cmd
-}
-
-/// Runs `cmd` with `input` on stdin. Gives stdout and stderr, and whether the command passed.
-fn run_input(cmd: &mut Command, input: &str) -> Result<(bool, String, String)> {
-    use std::io::Write as _;
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{cmd:?}: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes()).map_err(|e| format!("{cmd:?}: {e}"))?;
-    }
-    let out = child.wait_with_output().map_err(|e| format!("{cmd:?}: {e}"))?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
 }
 
 /// Gives the object-like macros that `header` defines, with their definitions.

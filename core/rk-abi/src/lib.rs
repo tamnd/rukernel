@@ -56,6 +56,29 @@ mod tests {
     }
 
     #[test]
+    fn known_layouts() {
+        assert_eq!(size_of::<x86_64::types::Stat>(), 144);
+        assert_eq!(size_of::<aarch64::types::Stat>(), 128);
+        assert_eq!(size_of::<riscv64::types::Stat>(), 128);
+        // struct epoll_event is packed only on x86-64.
+        assert_eq!(size_of::<x86_64::types::EpollEvent>(), 12);
+        assert_eq!(size_of::<aarch64::types::EpollEvent>(), 16);
+        assert_eq!(size_of::<x86_64::types::Statx>(), 256);
+        assert_eq!(size_of::<x86_64::types::CloneArgs>(), 88);
+        assert_eq!(size_of::<x86_64::types::NewUtsname>(), 390);
+    }
+
+    #[test]
+    fn a_structure_is_read_from_bytes() {
+        use zerocopy::FromBytes;
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&5i64.to_ne_bytes());
+        bytes[8..].copy_from_slice(&7i64.to_ne_bytes());
+        let ts = x86_64::types::KernelTimespec::read_from_bytes(&bytes);
+        assert_eq!(ts.map(|t| (t.tv_sec, t.tv_nsec)), Ok((5, 7)));
+    }
+
+    #[test]
     fn the_name_table_matches_the_numbers() {
         assert_eq!(x86_64::syscalls::SYSCALLS[x86_64::syscalls::WRITE as usize], Some("write"));
         // uselib has a number on x86-64 but no entry point.

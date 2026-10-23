@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod constants;
+mod layouts;
 mod syscalls;
 mod sysroot;
 
@@ -18,7 +19,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 /// The pinned Linux release, per spec/17-upstream-tracking.md.
 const LINUX_VERSION: &str = "7.3";
@@ -101,6 +102,26 @@ fn run(cmd: &mut Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Runs `cmd` with `input` on stdin. Gives stdout and stderr, and whether the command passed.
+fn run_input(cmd: &mut Command, input: &str) -> Result<(bool, String, String)> {
+    use std::io::Write as _;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd:?}: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.as_bytes()).map_err(|e| format!("{cmd:?}: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("{cmd:?}: {e}"))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
 /// Gives the SHA-256 of a file. Linux has `sha256sum` and macOS has `shasum`.
 fn sha256(path: &Path) -> Result<String> {
     let out = run(Command::new("sha256sum").arg(path))
@@ -152,7 +173,9 @@ fn generate(tree: Option<PathBuf>) -> Result {
     let root = workspace_root();
     let mut out = Output::new(&root)?;
     syscalls::generate(&tree, &mut out)?;
-    constants::generate(&tree, &cache_dir()?.join("sysroot"), &mut out)?;
+    let sysroot = cache_dir()?.join("sysroot");
+    constants::generate(&tree, &sysroot, &mut out)?;
+    layouts::generate(&sysroot, &mut out)?;
     out.finish()
 }
 
