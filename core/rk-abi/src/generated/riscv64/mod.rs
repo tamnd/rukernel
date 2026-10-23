@@ -15,4 +15,5 @@ pub mod sched;
 pub mod signal;
 pub mod syscalls;
 pub mod time;
+pub mod types;
 pub mod wait;

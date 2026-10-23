@@ -1,0 +1,869 @@
+# rk-abigen generated this file from Linux 7.3, from the uAPI headers.
+# Do not edit it. Change rk-abigen and run it again.
+#
+# The layout of each structure in rk-abigen/src/layouts.rs.
+
+[[struct]]
+name = "stat"
+size = 128
+align = 8
+[[struct.field]]
+name = "st_dev"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "st_ino"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "st_mode"
+type = "u32"
+offset = 16
+[[struct.field]]
+name = "st_nlink"
+type = "u32"
+offset = 20
+[[struct.field]]
+name = "st_uid"
+type = "u32"
+offset = 24
+[[struct.field]]
+name = "st_gid"
+type = "u32"
+offset = 28
+[[struct.field]]
+name = "st_rdev"
+type = "u64"
+offset = 32
+[[struct.field]]
+name = "__pad1"
+type = "u64"
+offset = 40
+[[struct.field]]
+name = "st_size"
+type = "i64"
+offset = 48
+[[struct.field]]
+name = "st_blksize"
+type = "i32"
+offset = 56
+[[struct.field]]
+name = "__pad2"
+type = "i32"
+offset = 60
+[[struct.field]]
+name = "st_blocks"
+type = "i64"
+offset = 64
+[[struct.field]]
+name = "st_atime"
+type = "i64"
+offset = 72
+[[struct.field]]
+name = "st_atime_nsec"
+type = "u64"
+offset = 80
+[[struct.field]]
+name = "st_mtime"
+type = "i64"
+offset = 88
+[[struct.field]]
+name = "st_mtime_nsec"
+type = "u64"
+offset = 96
+[[struct.field]]
+name = "st_ctime"
+type = "i64"
+offset = 104
+[[struct.field]]
+name = "st_ctime_nsec"
+type = "u64"
+offset = 112
+[[struct.field]]
+name = "__unused4"
+type = "u32"
+offset = 120
+[[struct.field]]
+name = "__unused5"
+type = "u32"
+offset = 124
+
+[[struct]]
+name = "__kernel_fsid_t"
+size = 8
+align = 4
+[[struct.field]]
+name = "val"
+type = "[i32; 2]"
+offset = 0
+
+[[struct]]
+name = "statfs"
+size = 120
+align = 8
+[[struct.field]]
+name = "f_type"
+type = "i64"
+offset = 0
+[[struct.field]]
+name = "f_bsize"
+type = "i64"
+offset = 8
+[[struct.field]]
+name = "f_blocks"
+type = "i64"
+offset = 16
+[[struct.field]]
+name = "f_bfree"
+type = "i64"
+offset = 24
+[[struct.field]]
+name = "f_bavail"
+type = "i64"
+offset = 32
+[[struct.field]]
+name = "f_files"
+type = "i64"
+offset = 40
+[[struct.field]]
+name = "f_ffree"
+type = "i64"
+offset = 48
+[[struct.field]]
+name = "f_fsid"
+type = "KernelFsidT"
+offset = 56
+[[struct.field]]
+name = "f_namelen"
+type = "i64"
+offset = 64
+[[struct.field]]
+name = "f_frsize"
+type = "i64"
+offset = 72
+[[struct.field]]
+name = "f_flags"
+type = "i64"
+offset = 80
+[[struct.field]]
+name = "f_spare"
+type = "[i64; 4]"
+offset = 88
+
+[[struct]]
+name = "statx_timestamp"
+size = 16
+align = 8
+[[struct.field]]
+name = "tv_sec"
+type = "i64"
+offset = 0
+[[struct.field]]
+name = "tv_nsec"
+type = "u32"
+offset = 8
+[[struct.field]]
+name = "__reserved"
+type = "i32"
+offset = 12
+
+[[struct]]
+name = "statx"
+size = 256
+align = 8
+[[struct.field]]
+name = "stx_mask"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "stx_blksize"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "stx_attributes"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "stx_nlink"
+type = "u32"
+offset = 16
+[[struct.field]]
+name = "stx_uid"
+type = "u32"
+offset = 20
+[[struct.field]]
+name = "stx_gid"
+type = "u32"
+offset = 24
+[[struct.field]]
+name = "stx_mode"
+type = "u16"
+offset = 28
+[[struct.field]]
+name = "__spare0"
+type = "[u16; 1]"
+offset = 30
+[[struct.field]]
+name = "stx_ino"
+type = "u64"
+offset = 32
+[[struct.field]]
+name = "stx_size"
+type = "u64"
+offset = 40
+[[struct.field]]
+name = "stx_blocks"
+type = "u64"
+offset = 48
+[[struct.field]]
+name = "stx_attributes_mask"
+type = "u64"
+offset = 56
+[[struct.field]]
+name = "stx_atime"
+type = "StatxTimestamp"
+offset = 64
+[[struct.field]]
+name = "stx_btime"
+type = "StatxTimestamp"
+offset = 80
+[[struct.field]]
+name = "stx_ctime"
+type = "StatxTimestamp"
+offset = 96
+[[struct.field]]
+name = "stx_mtime"
+type = "StatxTimestamp"
+offset = 112
+[[struct.field]]
+name = "stx_rdev_major"
+type = "u32"
+offset = 128
+[[struct.field]]
+name = "stx_rdev_minor"
+type = "u32"
+offset = 132
+[[struct.field]]
+name = "stx_dev_major"
+type = "u32"
+offset = 136
+[[struct.field]]
+name = "stx_dev_minor"
+type = "u32"
+offset = 140
+[[struct.field]]
+name = "stx_mnt_id"
+type = "u64"
+offset = 144
+[[struct.field]]
+name = "stx_dio_mem_align"
+type = "u32"
+offset = 152
+[[struct.field]]
+name = "stx_dio_offset_align"
+type = "u32"
+offset = 156
+[[struct.field]]
+name = "stx_subvol"
+type = "u64"
+offset = 160
+[[struct.field]]
+name = "stx_atomic_write_unit_min"
+type = "u32"
+offset = 168
+[[struct.field]]
+name = "stx_atomic_write_unit_max"
+type = "u32"
+offset = 172
+[[struct.field]]
+name = "stx_atomic_write_segments_max"
+type = "u32"
+offset = 176
+[[struct.field]]
+name = "stx_dio_read_offset_align"
+type = "u32"
+offset = 180
+[[struct.field]]
+name = "stx_atomic_write_unit_max_opt"
+type = "u32"
+offset = 184
+[[struct.field]]
+name = "__spare2"
+type = "[u32; 1]"
+offset = 188
+[[struct.field]]
+name = "__spare3"
+type = "[u64; 8]"
+offset = 192
+
+[[struct]]
+name = "__kernel_timespec"
+size = 16
+align = 8
+[[struct.field]]
+name = "tv_sec"
+type = "i64"
+offset = 0
+[[struct.field]]
+name = "tv_nsec"
+type = "i64"
+offset = 8
+
+[[struct]]
+name = "__kernel_itimerspec"
+size = 32
+align = 8
+[[struct.field]]
+name = "it_interval"
+type = "KernelTimespec"
+offset = 0
+[[struct.field]]
+name = "it_value"
+type = "KernelTimespec"
+offset = 16
+
+[[struct]]
+name = "__kernel_old_timeval"
+size = 16
+align = 8
+[[struct.field]]
+name = "tv_sec"
+type = "i64"
+offset = 0
+[[struct.field]]
+name = "tv_usec"
+type = "i64"
+offset = 8
+
+[[struct]]
+name = "__kernel_old_itimerval"
+size = 32
+align = 8
+[[struct.field]]
+name = "it_interval"
+type = "KernelOldTimeval"
+offset = 0
+[[struct.field]]
+name = "it_value"
+type = "KernelOldTimeval"
+offset = 16
+
+[[struct]]
+name = "iovec"
+size = 16
+align = 8
+[[struct.field]]
+name = "iov_base"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "iov_len"
+type = "u64"
+offset = 8
+
+[[struct]]
+name = "new_utsname"
+size = 390
+align = 1
+[[struct.field]]
+name = "sysname"
+type = "[u8; 65]"
+offset = 0
+[[struct.field]]
+name = "nodename"
+type = "[u8; 65]"
+offset = 65
+[[struct.field]]
+name = "release"
+type = "[u8; 65]"
+offset = 130
+[[struct.field]]
+name = "version"
+type = "[u8; 65]"
+offset = 195
+[[struct.field]]
+name = "machine"
+type = "[u8; 65]"
+offset = 260
+[[struct.field]]
+name = "domainname"
+type = "[u8; 65]"
+offset = 325
+
+[[struct]]
+name = "rlimit"
+size = 16
+align = 8
+[[struct.field]]
+name = "rlim_cur"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "rlim_max"
+type = "u64"
+offset = 8
+
+[[struct]]
+name = "rlimit64"
+size = 16
+align = 8
+[[struct.field]]
+name = "rlim_cur"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "rlim_max"
+type = "u64"
+offset = 8
+
+[[struct]]
+name = "rusage"
+size = 144
+align = 8
+[[struct.field]]
+name = "ru_utime"
+type = "KernelOldTimeval"
+offset = 0
+[[struct.field]]
+name = "ru_stime"
+type = "KernelOldTimeval"
+offset = 16
+[[struct.field]]
+name = "ru_maxrss"
+type = "i64"
+offset = 32
+[[struct.field]]
+name = "ru_ixrss"
+type = "i64"
+offset = 40
+[[struct.field]]
+name = "ru_idrss"
+type = "i64"
+offset = 48
+[[struct.field]]
+name = "ru_isrss"
+type = "i64"
+offset = 56
+[[struct.field]]
+name = "ru_minflt"
+type = "i64"
+offset = 64
+[[struct.field]]
+name = "ru_majflt"
+type = "i64"
+offset = 72
+[[struct.field]]
+name = "ru_nswap"
+type = "i64"
+offset = 80
+[[struct.field]]
+name = "ru_inblock"
+type = "i64"
+offset = 88
+[[struct.field]]
+name = "ru_oublock"
+type = "i64"
+offset = 96
+[[struct.field]]
+name = "ru_msgsnd"
+type = "i64"
+offset = 104
+[[struct.field]]
+name = "ru_msgrcv"
+type = "i64"
+offset = 112
+[[struct.field]]
+name = "ru_nsignals"
+type = "i64"
+offset = 120
+[[struct.field]]
+name = "ru_nvcsw"
+type = "i64"
+offset = 128
+[[struct.field]]
+name = "ru_nivcsw"
+type = "i64"
+offset = 136
+
+[[struct]]
+name = "pollfd"
+size = 8
+align = 4
+[[struct.field]]
+name = "fd"
+type = "i32"
+offset = 0
+[[struct.field]]
+name = "events"
+type = "i16"
+offset = 4
+[[struct.field]]
+name = "revents"
+type = "i16"
+offset = 6
+
+[[struct]]
+name = "clone_args"
+size = 88
+align = 8
+[[struct.field]]
+name = "flags"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "pidfd"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "child_tid"
+type = "u64"
+offset = 16
+[[struct.field]]
+name = "parent_tid"
+type = "u64"
+offset = 24
+[[struct.field]]
+name = "exit_signal"
+type = "u64"
+offset = 32
+[[struct.field]]
+name = "stack"
+type = "u64"
+offset = 40
+[[struct.field]]
+name = "stack_size"
+type = "u64"
+offset = 48
+[[struct.field]]
+name = "tls"
+type = "u64"
+offset = 56
+[[struct.field]]
+name = "set_tid"
+type = "u64"
+offset = 64
+[[struct.field]]
+name = "set_tid_size"
+type = "u64"
+offset = 72
+[[struct.field]]
+name = "cgroup"
+type = "u64"
+offset = 80
+
+[[struct]]
+name = "sched_attr"
+size = 56
+align = 8
+[[struct.field]]
+name = "size"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "sched_policy"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "sched_flags"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "sched_nice"
+type = "i32"
+offset = 16
+[[struct.field]]
+name = "sched_priority"
+type = "u32"
+offset = 20
+[[struct.field]]
+name = "sched_runtime"
+type = "u64"
+offset = 24
+[[struct.field]]
+name = "sched_deadline"
+type = "u64"
+offset = 32
+[[struct.field]]
+name = "sched_period"
+type = "u64"
+offset = 40
+[[struct.field]]
+name = "sched_util_min"
+type = "u32"
+offset = 48
+[[struct.field]]
+name = "sched_util_max"
+type = "u32"
+offset = 52
+
+[[struct]]
+name = "epoll_event"
+size = 16
+align = 8
+[[struct.field]]
+name = "events"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "data"
+type = "u64"
+offset = 8
+
+[[struct]]
+name = "robust_list"
+size = 8
+align = 8
+[[struct.field]]
+name = "next"
+type = "u64"
+offset = 0
+
+[[struct]]
+name = "robust_list_head"
+size = 24
+align = 8
+[[struct.field]]
+name = "list"
+type = "RobustList"
+offset = 0
+[[struct.field]]
+name = "futex_offset"
+type = "i64"
+offset = 8
+[[struct.field]]
+name = "list_op_pending"
+type = "u64"
+offset = 16
+
+[[struct]]
+name = "futex_waitv"
+size = 24
+align = 8
+[[struct.field]]
+name = "val"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "uaddr"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "flags"
+type = "u32"
+offset = 16
+[[struct.field]]
+name = "__reserved"
+type = "u32"
+offset = 20
+
+[[struct]]
+name = "open_how"
+size = 24
+align = 8
+[[struct.field]]
+name = "flags"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "mode"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "resolve"
+type = "u64"
+offset = 16
+
+[[struct]]
+name = "sysinfo"
+size = 112
+align = 8
+[[struct.field]]
+name = "uptime"
+type = "i64"
+offset = 0
+[[struct.field]]
+name = "loads"
+type = "[u64; 3]"
+offset = 8
+[[struct.field]]
+name = "totalram"
+type = "u64"
+offset = 32
+[[struct.field]]
+name = "freeram"
+type = "u64"
+offset = 40
+[[struct.field]]
+name = "sharedram"
+type = "u64"
+offset = 48
+[[struct.field]]
+name = "bufferram"
+type = "u64"
+offset = 56
+[[struct.field]]
+name = "totalswap"
+type = "u64"
+offset = 64
+[[struct.field]]
+name = "freeswap"
+type = "u64"
+offset = 72
+[[struct.field]]
+name = "procs"
+type = "u16"
+offset = 80
+[[struct.field]]
+name = "pad"
+type = "u16"
+offset = 82
+[[struct.field]]
+name = "totalhigh"
+type = "u64"
+offset = 88
+[[struct.field]]
+name = "freehigh"
+type = "u64"
+offset = 96
+[[struct.field]]
+name = "mem_unit"
+type = "u32"
+offset = 104
+[[struct.field]]
+name = "_f"
+type = "[u8; 0]"
+offset = 108
+
+[[struct]]
+name = "sigaltstack"
+size = 24
+align = 8
+[[struct.field]]
+name = "ss_sp"
+type = "u64"
+offset = 0
+[[struct.field]]
+name = "ss_flags"
+type = "i32"
+offset = 8
+[[struct.field]]
+name = "ss_size"
+type = "u64"
+offset = 16
+
+[[struct]]
+name = "__user_cap_header_struct"
+size = 8
+align = 4
+[[struct.field]]
+name = "version"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "pid"
+type = "i32"
+offset = 4
+
+[[struct]]
+name = "__user_cap_data_struct"
+size = 12
+align = 4
+[[struct.field]]
+name = "effective"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "permitted"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "inheritable"
+type = "u32"
+offset = 8
+
+[[struct]]
+name = "termios"
+size = 36
+align = 4
+[[struct.field]]
+name = "c_iflag"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "c_oflag"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "c_cflag"
+type = "u32"
+offset = 8
+[[struct.field]]
+name = "c_lflag"
+type = "u32"
+offset = 12
+[[struct.field]]
+name = "c_line"
+type = "u8"
+offset = 16
+[[struct.field]]
+name = "c_cc"
+type = "[u8; 19]"
+offset = 17
+
+[[struct]]
+name = "termios2"
+size = 44
+align = 4
+[[struct.field]]
+name = "c_iflag"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "c_oflag"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "c_cflag"
+type = "u32"
+offset = 8
+[[struct.field]]
+name = "c_lflag"
+type = "u32"
+offset = 12
+[[struct.field]]
+name = "c_line"
+type = "u8"
+offset = 16
+[[struct.field]]
+name = "c_cc"
+type = "[u8; 19]"
+offset = 17
+[[struct.field]]
+name = "c_ispeed"
+type = "u32"
+offset = 36
+[[struct.field]]
+name = "c_ospeed"
+type = "u32"
+offset = 40
+
+[[struct]]
+name = "winsize"
+size = 8
+align = 2
+[[struct.field]]
+name = "ws_row"
+type = "u16"
+offset = 0
+[[struct.field]]
+name = "ws_col"
+type = "u16"
+offset = 2
+[[struct.field]]
+name = "ws_xpixel"
+type = "u16"
+offset = 4
+[[struct.field]]
+name = "ws_ypixel"
+type = "u16"
+offset = 6
