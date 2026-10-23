@@ -26,6 +26,10 @@ pub(crate) const PAGE_OFFSET: usize = 0xffff_8880_0000_0000;
 pub(crate) const VMALLOC_START: usize = 0xffff_c900_0000_0000;
 /// The end of the vmalloc range.
 pub(crate) const VMALLOC_END: usize = 0xffff_e8ff_ffff_ffff;
+/// The heap range is the last 4 TiB of the vmalloc range. `vmap` uses the addresses below it.
+pub(crate) const HEAP_START: usize = 0xffff_e500_0000_0000;
+/// The end of the heap range.
+pub(crate) const HEAP_END: usize = 0xffff_e900_0000_0000;
 /// The virtual address of the kernel image at physical address 0.
 pub(crate) const KERNEL_BASE: usize = 0xffff_ffff_8000_0000;
 

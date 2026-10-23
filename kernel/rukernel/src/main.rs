@@ -11,6 +11,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_os = "none")]
+extern crate alloc;
+
+#[cfg(target_os = "none")]
 mod kernel;
 #[cfg(target_os = "none")]
 mod selftest;

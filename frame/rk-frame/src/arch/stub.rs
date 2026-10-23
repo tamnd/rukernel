@@ -64,7 +64,8 @@ pub(crate) mod paging {
     use crate::mm::PageInfo;
 
     pub(crate) const VMALLOC_START: usize = 0;
-    pub(crate) const VMALLOC_END: usize = 0;
+    pub(crate) const HEAP_START: usize = 0;
+    pub(crate) const HEAP_END: usize = 0;
 
     pub(crate) fn phys_to_virt(_phys: u64) -> usize {
         unreachable!("no page tables on this architecture yet")

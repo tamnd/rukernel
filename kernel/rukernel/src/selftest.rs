@@ -16,6 +16,7 @@ pub(crate) fn run(name: &str) -> bool {
         "boot" => true,
         "trap" => trap_test(),
         "mm" => mm_test(),
+        "heap" => heap_test(),
         "timer" => timer_test(),
         #[cfg(target_arch = "x86_64")]
         "syscall" => syscall_test(),
@@ -59,6 +60,55 @@ static WRITABLE: AtomicU64 = AtomicU64::new(0);
 
 fn addr_of<T>(value: &T) -> VirtAddr {
     VirtAddr::new(core::ptr::from_ref(value) as usize)
+}
+
+fn heap_test() -> bool {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
+
+    let start = mm::heap_stats().in_use;
+    let boxed = Box::new(0x5eed_u64);
+    let mut ok = check("a box keeps its value", *boxed == 0x5eed);
+    drop(boxed);
+
+    // A vector that grows through all size classes and then into the large objects.
+    let mut v: Vec<u64> = Vec::new();
+    for i in 0..100_000 {
+        v.push(i * 3);
+    }
+    ok &= check(
+        "a vector of 100000 values",
+        v.len() == 100_000 && v.iter().enumerate().all(|(i, &x)| x == i as u64 * 3),
+    );
+    drop(v);
+
+    let mut map = BTreeMap::new();
+    for i in 0..5000_u32 {
+        map.insert(i.wrapping_mul(2_654_435_761), i);
+    }
+    ok &= check(
+        "a map of 5000 keys",
+        map.len() == 5000 && map.values().sum::<u32>() == 4999 * 5000 / 2,
+    );
+    drop(map);
+
+    // Small objects are different and are aligned to their size.
+    let boxes: Vec<Box<[u8; 48]>> = (0..1000).map(|i| Box::new([i as u8; 48])).collect();
+    let aligned = boxes.iter().all(|b| (b.as_ptr() as usize).is_multiple_of(16));
+    let kept = boxes.iter().enumerate().all(|(i, b)| b.iter().all(|&x| x == i as u8));
+    ok &= check("1000 small boxes keep their values", aligned && kept);
+    drop(boxes);
+
+    let frames = mm::frame_stats().free;
+    let big: Vec<u8> = alloc::vec![0xa5; 1 << 20];
+    ok &= check("a block of 1 MiB", big.iter().all(|&b| b == 0xa5));
+    let used = frames - mm::frame_stats().free;
+    drop(big);
+    let back = mm::frame_stats().free;
+    ok &= check("the frames of a large block come back", used >= 256 && back == frames);
+    ok &= check("the heap gives back each byte", mm::heap_stats().in_use == start);
+    ok
 }
 
 fn mm_test() -> bool {

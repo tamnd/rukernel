@@ -51,6 +51,18 @@ pub(crate) fn alloc_table_frame() -> Option<u64> {
     Some(phys)
 }
 
+/// Takes one frame and gives its physical address. The heap uses this function. It owns the
+/// frame until it gives it back with `free_frame_phys`.
+pub(crate) fn alloc_frame_phys() -> Option<u64> {
+    let frame = FRAMES.lock().alloc()?;
+    Some((frame * PAGE_SIZE) as u64)
+}
+
+/// Gives back a frame that `alloc_frame_phys` gave.
+pub(crate) fn free_frame_phys(phys: u64) {
+    FRAMES.lock().free(phys as usize / PAGE_SIZE);
+}
+
 /// The number of frames that the allocator manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameStats {
@@ -143,7 +155,7 @@ pub struct Mapping {
 pub fn vmap(frame: Frame) -> Result<Mapping, Frame> {
     // Each mapping has a guard page after it, so an overrun is a page fault.
     let virt = NEXT_VMALLOC.fetch_add(2 * PAGE_SIZE, Ordering::Relaxed);
-    if virt >= paging::VMALLOC_END || paging::map_page(virt, frame.phys, true).is_err() {
+    if virt >= paging::HEAP_START || paging::map_page(virt, frame.phys, true).is_err() {
         return Err(frame);
     }
     Ok(Mapping { virt, frame: Some(frame) })
@@ -154,7 +166,7 @@ pub fn vmap(frame: Frame) -> Result<Mapping, Frame> {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn vmap_mmio(phys: u64) -> Option<usize> {
     let virt = NEXT_VMALLOC.fetch_add(2 * PAGE_SIZE, Ordering::Relaxed);
-    if virt >= paging::VMALLOC_END {
+    if virt >= paging::HEAP_START {
         return None;
     }
     paging::map_mmio_page(virt, phys).ok()?;
