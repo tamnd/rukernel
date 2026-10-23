@@ -391,10 +391,127 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// The self tests that `boot-test` runs, each in its own boot.
 const BOOT_TESTS: &[&str] = &["boot", "trap", "mm", "timer", "syscall"];
 
+/// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
+const BZIMAGE_TESTS: &[&str] = &["boot", "mm"];
+
 /// Builds the x86-64 kernel and gives the path of the ELF image.
 fn build_kernel() -> Result<PathBuf> {
     cargo(&["build", "--package", "rukernel", "--target", "x86_64-unknown-none"])?;
     Ok(workspace_root().join("target/x86_64-unknown-none/debug/rukernel"))
+}
+
+/// The physical address where the loader puts the payload of the bzImage, and the kernel runs.
+const BZIMAGE_LOAD: u64 = 0x10_0000;
+/// The size of the setup part of the bzImage: the boot sector and 7 setup sectors.
+const BZIMAGE_SETUP_SECTS: u8 = 7;
+const BZIMAGE_SETUP_SIZE: usize = (BZIMAGE_SETUP_SECTS as usize + 1) * 512;
+
+/// Reads a little endian integer of `N` bytes at `at`.
+fn le<const N: usize>(b: &[u8], at: usize) -> Result<u64> {
+    let bytes = b.get(at..at + N).ok_or("the ELF file is too short")?;
+    Ok(bytes.iter().rev().fold(0, |v, &x| (v << 8) | u64::from(x)))
+}
+
+/// Writes the little endian integer `v` of `N` bytes at `at`.
+fn put<const N: usize>(b: &mut [u8], at: usize, v: u64) {
+    for (i, x) in b[at..at + N].iter_mut().enumerate() {
+        *x = (v >> (8 * i)) as u8;
+    }
+}
+
+/// Makes a bzImage from the kernel ELF file, per Documentation/arch/x86/boot.rst in the Linux
+/// tree. The setup part is the `.rk_setup` section with the setup header. The payload is the
+/// `PT_LOAD` segments as one flat image from `BZIMAGE_LOAD`.
+fn bzimage(elf: &[u8]) -> Result<Vec<u8>> {
+    if elf.get(..4) != Some(b"\x7fELF".as_slice()) || elf.get(4) != Some(&2) {
+        return Err(String::from("the kernel is not an ELF64 file"));
+    }
+    let usize_of = |v: u64| usize::try_from(v).map_err(|e| e.to_string());
+
+    let (phoff, phentsize, phnum) =
+        (usize_of(le::<8>(elf, 0x20)?)?, usize_of(le::<2>(elf, 0x36)?)?, le::<2>(elf, 0x38)?);
+    let mut segments = Vec::new();
+    for i in 0..usize_of(phnum)? {
+        let ph = phoff + i * phentsize;
+        if le::<4>(elf, ph)? == 1 {
+            let offset = usize_of(le::<8>(elf, ph + 8)?)?;
+            let (paddr, filesz, memsz) =
+                (le::<8>(elf, ph + 24)?, le::<8>(elf, ph + 32)?, le::<8>(elf, ph + 40)?);
+            if paddr < BZIMAGE_LOAD {
+                return Err(format!("a segment is at {paddr:#x}, below {BZIMAGE_LOAD:#x}"));
+            }
+            segments.push((offset, paddr, filesz, memsz));
+        }
+    }
+    let file_end = segments.iter().map(|s| s.1 + s.2).max().ok_or("the kernel has no segments")?;
+    let mem_end = segments.iter().map(|s| s.1 + s.3).max().unwrap_or(file_end);
+    let mut payload = vec![0; usize_of(file_end - BZIMAGE_LOAD)?.next_multiple_of(16)];
+    for &(offset, paddr, filesz, _) in &segments {
+        let (at, len) = (usize_of(paddr - BZIMAGE_LOAD)?, usize_of(filesz)?);
+        let data = elf.get(offset..offset + len).ok_or("a segment is outside the file")?;
+        payload[at..at + len].copy_from_slice(data);
+    }
+
+    let (shoff, shentsize, shnum, shstrndx) = (
+        usize_of(le::<8>(elf, 0x28)?)?,
+        usize_of(le::<2>(elf, 0x3a)?)?,
+        usize_of(le::<2>(elf, 0x3c)?)?,
+        usize_of(le::<2>(elf, 0x3e)?)?,
+    );
+    let strtab = usize_of(le::<8>(elf, shoff + shstrndx * shentsize + 0x18)?)?;
+    let mut setup = None;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let name = strtab + usize_of(le::<4>(elf, sh)?)?;
+        if elf.get(name..name + 10) == Some(b".rk_setup\0".as_slice()) {
+            let (offset, size) =
+                (usize_of(le::<8>(elf, sh + 0x18)?)?, usize_of(le::<8>(elf, sh + 0x20)?)?);
+            setup = elf.get(offset..offset + size);
+        }
+    }
+    let setup = setup.ok_or("the kernel has no .rk_setup section")?;
+    if setup.len() > BZIMAGE_SETUP_SIZE - 0x200 {
+        return Err(format!(
+            "the setup code is {} bytes, more than {}",
+            BZIMAGE_SETUP_SIZE - 0x200,
+            setup.len()
+        ));
+    }
+
+    let mut image = vec![0; BZIMAGE_SETUP_SIZE];
+    image[..setup.len()].copy_from_slice(setup);
+    image[0x1f1] = BZIMAGE_SETUP_SECTS;
+    put::<4>(&mut image, 0x1f4, payload.len() as u64 / 16); // syssize
+    put::<2>(&mut image, 0x1fa, 0xffff); // vid_mode: normal
+    put::<2>(&mut image, 0x1fe, 0xaa55); // boot_flag
+    image[0x200..0x202].copy_from_slice(&[0xeb, 0x7e]); // jmp to the setup code at 0x280
+    image[0x202..0x206].copy_from_slice(b"HdrS");
+    put::<2>(&mut image, 0x206, 0x020f); // the protocol version 2.15
+    image[0x211] = 0x01; // loadflags: LOADED_HIGH
+    put::<2>(&mut image, 0x212, 0x8000); // setup_move_size
+    put::<4>(&mut image, 0x214, BZIMAGE_LOAD); // code32_start
+    put::<4>(&mut image, 0x22c, 0x7fff_ffff); // initrd_addr_max
+    put::<4>(&mut image, 0x230, 0x20_0000); // kernel_alignment
+    put::<2>(&mut image, 0x236, 0x0001); // xloadflags: XLF_KERNEL_64
+    put::<4>(&mut image, 0x238, 2047); // cmdline_size
+    put::<8>(&mut image, 0x258, BZIMAGE_LOAD); // pref_address
+    put::<4>(&mut image, 0x260, (mem_end - BZIMAGE_LOAD).next_multiple_of(4096)); // init_size
+    // kernel_version: the offset of the version string, less 0x200.
+    let version = format!("rukernel {}\0", env!("CARGO_PKG_VERSION"));
+    let at = BZIMAGE_SETUP_SIZE - 0x200;
+    image[at..at + version.len()].copy_from_slice(version.as_bytes());
+    put::<2>(&mut image, 0x20e, (at - 0x200) as u64);
+    image.extend_from_slice(&payload);
+    Ok(image)
+}
+
+/// Builds the x86-64 kernel and the bzImage, and gives the path of the bzImage.
+fn build_bzimage() -> Result<PathBuf> {
+    let kernel = build_kernel()?;
+    let elf = fs::read(&kernel).map_err(|e| format!("{}: {e}", kernel.display()))?;
+    let path = kernel.with_file_name("bzImage");
+    fs::write(&path, bzimage(&elf)?).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// The QEMU command for the x86-64 kernel. KVM is used when the host has it and this user can open
@@ -437,6 +554,20 @@ fn boot_test() -> Result {
         } else {
             let status = status.map_or(String::from("a timeout"), |s| format!("status {s}"));
             errors.push(format!("boot test {test}: fail with {status}\n{log}"));
+        }
+    }
+    let bzimage = build_bzimage()?;
+    for test in BZIMAGE_TESTS {
+        let cmdline = format!("console=ttyS0 rk.test={test}");
+        let (status, log) = run_with_timeout(qemu_command(&bzimage, &cmdline), BOOT_TEST_TIMEOUT)?;
+        let passed = status == Some(QEMU_PASS)
+            && log.contains("booting with linux")
+            && log.contains(&format!("rk.test={test}: pass"));
+        if passed {
+            println!("boot test {test} with the bzImage: pass");
+        } else {
+            let status = status.map_or(String::from("a timeout"), |s| format!("status {s}"));
+            errors.push(format!("boot test {test} with the bzImage: fail with {status}\n{log}"));
         }
     }
     report("boot tests", errors)

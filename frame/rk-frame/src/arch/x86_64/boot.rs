@@ -1,9 +1,17 @@
-//! The PVH entry point.
+//! The entry points of the kernel image.
 //!
-//! QEMU, Firecracker and Cloud Hypervisor load an ELF kernel directly when it has a
-//! `XEN_ELFNOTE_PHYS32_ENTRY` note, per spec/15-boot-and-platform.md section 15.3. Linux uses the
-//! same entry for the same loaders. The loader starts the CPU in 32 bit protected mode with paging
-//! off, and puts the physical address of a `hvm_start_info` structure in EBX.
+//! The kernel has three entries, per spec/15-boot-and-platform.md section 15.3:
+//!
+//! - The PVH entry. QEMU, Firecracker and Cloud Hypervisor load an ELF kernel directly when it has
+//!   a `XEN_ELFNOTE_PHYS32_ENTRY` note. Linux uses the same entry for the same loaders. The loader
+//!   starts the CPU in 32 bit protected mode with paging off, and puts the physical address of a
+//!   `hvm_start_info` structure in EBX.
+//! - The 32 bit entry of the Linux boot protocol, at the start of the protected mode code of a
+//!   bzImage. The loader puts the physical address of a `boot_params` structure in ESI. The real
+//!   mode setup code in `setup.rs` also comes here.
+//! - The 64 bit entry of the Linux boot protocol, 0x200 bytes after the 32 bit entry. The loader
+//!   starts the CPU in long mode with an identity map, and puts `boot_params` in RSI. The EFI stub
+//!   also comes here.
 //!
 //! The assembly below makes boot page tables that map the first 1 GiB of physical memory two
 //! times: at address 0, and at the kernel base `0xffffffff80000000`. Then it turns on long mode,
@@ -25,10 +33,49 @@ core::arch::global_asm!(
     .quad rk_pvh_start32
     .balign 4
 
+    .section .boot.head, "ax"
+    .code32
+    .global rk_linux_start32
+rk_linux_start32:                   # the 32 bit entry: ESI has boot_params
+    movl %esi, %ebx
+    movl ${linux}, %esi
+    jmp rk_boot32
+
+    .org 0x200
+    .code64
+    .global rk_linux_start64
+rk_linux_start64:                   # the 64 bit entry: RSI has boot_params
+    cli
+    cld
+    movq %rsi, %rbx
+    movl $__bss_start_phys, %edi
+    movl $__bss_end_phys, %ecx
+    subl %edi, %ecx
+    xorl %eax, %eax
+    rep stosb
+    movl %ebx, %edi
+    movl ${linux}, %esi
+    movl $0xc0000080, %ecx          # IA32_EFER
+    rdmsr
+    orl $0x800, %eax                # EFER.NXE. The loader set EFER.LME.
+    wrmsr
+    movq %cr0, %rax
+    orl $0x10000, %eax              # CR0.WP
+    movq %rax, %cr0
+    movl $boot_pml4, %eax
+    movq %rax, %cr3
+    lgdt boot_gdt_ptr
+    movl $boot_entry_stack_top, %esp  # the protocol does not give a stack
+    pushq $0x08
+    pushq $rk_boot64
+    lretq
+
     .section .boot.text, "ax"
     .code32
     .global rk_pvh_start32
 rk_pvh_start32:
+    movl ${pvh}, %esi
+rk_boot32:                          # EBX: the boot structure, ESI: the protocol
     cli
     cld
     movl $__bss_start_phys, %edi    # clear the bss: the loader does not have to clear it
@@ -61,7 +108,8 @@ rk_boot64:
     xorw %ax, %ax
     movw %ax, %fs
     movw %ax, %gs
-    movl %edi, %edi                 # the upper half of RDI is not defined after the mode switch
+    movl %edi, %edi                 # the upper halves are not defined after the mode switch
+    movl %esi, %esi
     movabsq $rk_boot64_high, %rax
     jmp *%rax
 
@@ -72,9 +120,12 @@ boot_gdt:
     .quad 0x00af9a000000ffff        # 0x08: 64 bit code, ring 0
     .quad 0x00cf92000000ffff        # 0x10: data, ring 0
 boot_gdt_end:
+boot_entry_stack:
+    .skip 64
+boot_entry_stack_top:
 boot_gdt_ptr:
     .word boot_gdt_end - boot_gdt - 1
-    .long boot_gdt
+    .quad boot_gdt                  # lgdt reads 4 bytes of it in 32 bit mode and 8 in 64 bit mode
 
     .balign 4096
 boot_pml4:
@@ -108,8 +159,114 @@ boot_stack:
     .skip 65536
 boot_stack_top:
 "#,
+    pvh = const PROTOCOL_PVH,
+    linux = const PROTOCOL_LINUX,
     options(att_syntax)
 );
+
+// The real mode setup code of the bzImage, per Documentation/arch/x86/boot.rst in the Linux tree.
+// `cargo xtask` copies this section to the start of the bzImage and writes the setup header at
+// offset 0x1f1. The section does not go into memory with the kernel, so each address in it is an
+// offset from `rk_setup`. A BIOS loader such as QEMU puts the setup code at a segment boundary,
+// sets DS to that segment and jumps to offset 0x200. The jump there goes to offset 0x280.
+//
+// The code makes `boot_params` at offset 0x8000 of the segment, gets the E820 memory map from the
+// BIOS, goes to 32 bit protected mode and jumps to `code32_start` with ESI at `boot_params`. This
+// global_asm! block is in the same module as the entry code, so the linker keeps it.
+core::arch::global_asm!(
+    r#"
+    .section .rk_setup, "", @progbits
+    .code16
+rk_setup:
+    .skip 0x280
+    cli
+    cld
+    movw %ds, %ax
+    movw %ax, %es
+    movw %ax, %ss
+    movw $0xf000, %sp
+    pushw %ds                       # make CS the same as DS
+    pushw $(1f - rk_setup)
+    lretw
+1:
+    inb $0x92, %al                  # the fast A20 gate
+    orb $0x02, %al
+    andb $0xfe, %al
+    outb %al, $0x92
+
+    movw $0x8000, %di               # clear boot_params
+    xorw %ax, %ax
+    movw $2048, %cx
+    rep stosw
+    movw $0x1f1, %si                # copy the setup header that the loader changed
+    movw $0x81f1, %di
+    movw $(0x290 - 0x1f1), %cx
+    rep movsb
+
+    xorl %ebx, %ebx                 # the E820 memory map
+    xorw %bp, %bp
+    movw $0x82d0, %di
+2:
+    movl $0xe820, %eax
+    movl $0x534d4150, %edx          # "SMAP"
+    movl $20, %ecx
+    int $0x15
+    jc 3f
+    cmpl $0x534d4150, %eax
+    jne 3f
+    incw %bp
+    addw $20, %di
+    testl %ebx, %ebx
+    jz 3f
+    cmpw $128, %bp
+    jb 2b
+3:
+    movw %bp, %ax
+    movb %al, 0x81e8
+
+    xorl %eax, %eax                 # the linear address of the segment
+    movw %ds, %ax
+    sall $4, %eax
+    leal 0x8000(%eax), %esi         # ESI: boot_params
+    addl %eax, rk_setup_gdt_ptr + 2 - rk_setup
+    lgdtl rk_setup_gdt_ptr - rk_setup
+    movl 0x214, %eax                # code32_start
+    movl %eax, rk_setup_pm_ptr - rk_setup
+    movl %cr0, %eax
+    orb $1, %al                     # CR0.PE
+    movl %eax, %cr0
+    movw $0x18, %ax
+    movw %ax, %ds
+    movw %ax, %es
+    movw %ax, %fs
+    movw %ax, %gs
+    movw %ax, %ss
+    xorl %ebx, %ebx
+    xorl %edi, %edi
+    xorl %ebp, %ebp
+    ljmpl *%cs:rk_setup_pm_ptr - rk_setup
+
+    .balign 8
+rk_setup_gdt:
+    .quad 0
+    .quad 0
+    .quad 0x00cf9a000000ffff        # 0x10: 32 bit code, ring 0
+    .quad 0x00cf92000000ffff        # 0x18: data, ring 0
+rk_setup_gdt_end:
+rk_setup_gdt_ptr:
+    .word rk_setup_gdt_end - rk_setup_gdt - 1
+    .long rk_setup_gdt - rk_setup   # the code adds the linear address of the segment
+rk_setup_pm_ptr:
+    .long 0
+    .word 0x10
+    .code64
+"#,
+    options(att_syntax)
+);
+
+/// The entry code gives one of these values to `rk_frame_x86_64_entry`.
+const PROTOCOL_PVH: u32 = 0;
+const PROTOCOL_LINUX: u32 = 1;
 
 /// The value of `hvm_start_info.magic`.
 const PVH_MAGIC: u32 = 0x336e_c578;
@@ -119,11 +276,16 @@ const BOOT_IDENTITY_LIMIT: u64 = 1 << 30;
 
 /// The first Rust code. The assembly above calls it on the boot stack.
 #[unsafe(no_mangle)]
-extern "C" fn rk_frame_x86_64_entry(start_info: u64) -> ! {
+extern "C" fn rk_frame_x86_64_entry(boot: u64, protocol: u32) -> ! {
     super::serial::init();
     super::init_cpu();
-    let mut info = BootInfo::new("pvh");
-    read_start_info(start_info, &mut info);
+    let info = if protocol == PROTOCOL_LINUX {
+        super::boot_params::read(boot)
+    } else {
+        let mut info = BootInfo::new("pvh");
+        read_start_info(boot, &mut info);
+        info
+    };
     crate::mm::frame::init(&info, super::paging::kernel_end_phys());
     super::paging::init(&info);
     super::apic::init();
@@ -132,7 +294,7 @@ extern "C" fn rk_frame_x86_64_entry(start_info: u64) -> ! {
 
 /// Reads one value from physical memory through the boot identity map. Gives `None` for an address
 /// that the map does not cover.
-fn read_phys<T: Copy>(addr: u64) -> Option<T> {
+pub(super) fn read_phys<T: Copy>(addr: u64) -> Option<T> {
     let end = addr.checked_add(size_of::<T>() as u64)?;
     if addr == 0 || end > BOOT_IDENTITY_LIMIT {
         return None;
