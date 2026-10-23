@@ -48,4 +48,37 @@ pub(crate) mod trap {
     pub(crate) fn probe_read_u64(_addr: usize) -> Option<u64> {
         None
     }
+
+    pub(crate) fn probe_writable(_addr: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn kernel_image() -> (usize, usize) {
+        (0, 0)
+    }
+}
+
+/// The page tables. These architectures have none yet, and the frame allocator has no frames, so
+/// no `Frame` or `Mapping` exists.
+pub(crate) mod paging {
+    use crate::mm::PageInfo;
+
+    pub(crate) const VMALLOC_START: usize = 0;
+    pub(crate) const VMALLOC_END: usize = 0;
+
+    pub(crate) fn phys_to_virt(_phys: u64) -> usize {
+        unreachable!("no page tables on this architecture yet")
+    }
+
+    pub(crate) fn map_page(_virt: usize, _phys: u64, _writable: bool) -> Result<(), ()> {
+        Err(())
+    }
+
+    pub(crate) fn unmap_page(_virt: usize) -> Option<u64> {
+        None
+    }
+
+    pub(crate) fn query(_virt: usize) -> Option<PageInfo> {
+        None
+    }
 }

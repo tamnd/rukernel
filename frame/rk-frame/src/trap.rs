@@ -43,3 +43,16 @@ pub struct Fault;
 pub fn probe_read_u64(addr: VirtAddr) -> Result<u64, Fault> {
     imp::trap::probe_read_u64(addr.get()).ok_or(Fault)
 }
+
+/// Tells if the CPU allows a write to an address in the kernel image, and does not change the
+/// memory. Gives `None` for an address outside the kernel image. The self tests use this to check
+/// the page permissions.
+pub fn probe_writable(addr: VirtAddr) -> Option<bool> {
+    let (start, end) = imp::trap::kernel_image();
+    let a = addr.get();
+    // The OR touches 8 bytes, so all 8 must be in the image, and the address must be aligned.
+    if a < start || a.checked_add(8)? > end || !a.is_multiple_of(8) {
+        return None;
+    }
+    Some(imp::trap::probe_writable(a))
+}
