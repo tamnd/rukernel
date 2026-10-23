@@ -177,7 +177,13 @@ pub(crate) fn init(info: &BootInfo) {
         len: 1 << 20,
         kind: MemoryKind::Reserved,
     };
-    for r in core::iter::once(&first_mib).chain(ram) {
+    // The initramfs is in the direct map too, also if the memory map does not give it as RAM.
+    let initrd = info.initrd().map(|(start, len)| crate::boot::MemoryRegion {
+        start,
+        len,
+        kind: MemoryKind::Reserved,
+    });
+    for r in core::iter::once(&first_mib).chain(initrd.as_ref()).chain(ram) {
         // A 2 MiB page that two regions share is written two times with the same value.
         let start = r.start.get() / HUGE_SIZE * HUGE_SIZE;
         let end = (r.start.get() + r.len).div_ceil(HUGE_SIZE) * HUGE_SIZE;

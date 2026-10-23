@@ -390,15 +390,31 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The self tests that `boot-test` runs, each in its own boot.
 const BOOT_TESTS: &[&str] =
-    &["boot", "trap", "mm", "heap", "timer", "syscall", "vm", "task", "fault"];
+    &["boot", "trap", "mm", "heap", "timer", "initramfs", "syscall", "vm", "task", "fault"];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
-const BZIMAGE_TESTS: &[&str] = &["boot", "mm"];
+const BZIMAGE_TESTS: &[&str] = &["boot", "mm", "initramfs"];
 
-/// Builds the x86-64 kernel and gives the path of the ELF image.
+/// Builds the x86-64 kernel and the initramfs of the boot tests, and gives the path of the ELF
+/// image. The initramfs is in the same directory.
 fn build_kernel() -> Result<PathBuf> {
     cargo(&["build", "--package", "rukernel", "--target", "x86_64-unknown-none"])?;
-    Ok(workspace_root().join("target/x86_64-unknown-none/debug/rukernel"))
+    let kernel = workspace_root().join("target/x86_64-unknown-none/debug/rukernel");
+    let initramfs = kernel.with_file_name("initramfs.cpio");
+    fs::write(&initramfs, test_initramfs()).map_err(|e| format!("{}: {e}", initramfs.display()))?;
+    Ok(kernel)
+}
+
+/// The initramfs that the `initramfs` self test reads, per kernel/rukernel/src/selftest.rs.
+fn test_initramfs() -> Vec<u8> {
+    let mut w = rk_vfs::cpio::Writer::new();
+    w.add(b".", 0o040_755, b"");
+    w.add(b"etc", 0o040_755, b"");
+    w.add_raw(100, b"etc/motd", 0o100_644, 2, (0, 0), b"");
+    w.add_raw(100, b"etc/motd.link", 0o100_644, 2, (0, 0), b"rukernel initramfs\n");
+    w.add(b"motd", 0o120_777, b"etc/motd");
+    w.add(b"init", 0o100_755, b"#!/bin/sh\n");
+    w.finish()
 }
 
 /// The physical address where the loader puts the payload of the bzImage, and the kernel runs.
@@ -566,6 +582,8 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
         .arg("-kernel")
         .arg(kernel)
+        .arg("-initrd")
+        .arg(kernel.with_file_name("initramfs.cpio"))
         .args(["-append", cmdline]);
     if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);

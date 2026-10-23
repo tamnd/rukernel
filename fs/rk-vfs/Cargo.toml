@@ -1,0 +1,17 @@
+[package]
+name = "rk-vfs"
+description = "The virtual file system of rukernel: inodes, dentries, mounts, open files and descriptors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 //! The main function and the panic handler.
 
-use crate::selftest;
+use crate::{rootfs, selftest};
 use rk_frame::boot::BootInfo;
 use rk_frame::{arch, println};
 
@@ -37,6 +37,7 @@ fn main(boot: &'static BootInfo) -> ! {
 
     #[cfg(target_arch = "x86_64")]
     rk_sched::init();
+    rootfs::init(boot);
 
     if let Some(test) = param(boot.cmdline(), "rk.test") {
         let passed = selftest::run(test);

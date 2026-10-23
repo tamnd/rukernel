@@ -129,6 +129,24 @@ impl BootInfo {
         self.initrd
     }
 
+    /// The bytes of the initramfs, if the boot loader gave one. The frame allocator reserves its
+    /// frames, so the bytes stay the same for the life of the kernel.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    pub fn initrd_bytes(&self) -> Option<&'static [u8]> {
+        let (start, len) = self.initrd?;
+        let len = usize::try_from(len).ok()?;
+        let virt = crate::arch::imp::paging::phys_to_virt(start.get()) as *const u8;
+        // SAFETY: `frame::init` reserves the frames of the initramfs, so no owner writes them, and
+        // `paging::init` puts them in the direct map, which stays for the life of the kernel.
+        Some(unsafe { core::slice::from_raw_parts(virt, len) })
+    }
+
+    /// The bytes of the initramfs. The other targets have no direct map yet, so they give `None`.
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    pub fn initrd_bytes(&self) -> Option<&'static [u8]> {
+        None
+    }
+
     /// Adds a byte to the command line. Gives `false` when the command line is full.
     pub fn push_cmdline_byte(&mut self, b: u8) -> bool {
         if self.cmdline_len == COMMAND_LINE_SIZE - 1 {
