@@ -53,3 +53,15 @@ cargo test --workspace
 Write the commit subject in the imperative mood. Start with the crate name, for example `rk-mm: batch the COW copy in fork`. Keep the subject at 72 characters or less. In the body, tell what was wrong and why the change is correct.
 
 A pull request contains one change. The CI gate must pass. A maintainer merges with squash or rebase.
+
+## Releases
+
+A maintainer makes a release. The steps are:
+
+1. Change the workspace version in `Cargo.toml`, and the version of each path dependency in `[workspace.dependencies]`. Move the `Unreleased` section of `CHANGELOG.md` to a section for the new version.
+2. Merge that change, then push a tag `vX.Y.Z` on main.
+3. The release workflow runs the gate on the tag. Then it publishes the GitHub release with a source archive and publishes the crates to crates.io.
+
+A patch release `v0.x.y` comes at intervals during a milestone. A minor release `v0.x.0` comes when a milestone is complete.
+
+crates.io limits the rate of publishes. A new crate has a burst of 5 and then 1 each 10 minutes. `.github/scripts/publish-crates.sh` waits and tries again, and it skips each version that is already on crates.io. Thus you can run the job again after a failure.

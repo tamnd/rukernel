@@ -1,7 +1,7 @@
 # The release workflow. A signed tag `vX.Y.Z` on main starts it.
 #
 # The workflow runs the full gate again on the tag, makes a source archive, makes a build provenance
-# attestation for the archive, and publishes a GitHub release. Anybody can verify the archive with
+# attestation for the archive, publishes a GitHub release and publishes the crates to crates.io. Anybody can verify the archive with
 # `gh attestation verify rukernel-X.Y.Z.tar.gz --repo tamnd/rukernel`.
 #
 # The release job uses no cache. A cache that a pull request wrote must not go into a release.
@@ -41,12 +41,18 @@ jobs:
             echo "Cargo.toml has $version and the tag is $TAG"
             exit 1
           fi
+          if grep -A10 '^\[workspace.dependencies\]' Cargo.toml | grep 'version = ' | grep -v "\"$version\""; then
+            echo "each path dependency in [workspace.dependencies] must have version $version"
+            exit 1
+          fi
       - name: install qemu
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends qemu-system-x86
       - name: cargo xtask ci
         run: cargo xtask ci
+      - name: the crates package and build alone
+        run: cargo publish --workspace --dry-run --locked
 
   publish:
     name: archive, attest and publish
@@ -90,3 +96,36 @@ jobs:
             gh release create "$TAG" rukernel-*.tar.gz rukernel-*.tar.gz.sha256 \
               --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "rukernel $TAG"
           fi
+
+  # The crates go to crates.io after the gate passes. The job uses the environment `crates-io`. The
+  # secret CARGO_REGISTRY_TOKEN in that environment is a crates.io token with the publish-new and
+  # publish-update scopes. Without the secret, the job writes a warning and publishes nothing.
+  #
+  # crates.io limits the rate of publishes. The script waits and tries again when crates.io refuses a
+  # publish for the rate, so this job can take some time for new crates.
+  crates:
+    name: publish to crates.io
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: publish the crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::warning::the environment crates-io has no CARGO_REGISTRY_TOKEN, so no crate is published"
+            exit 0
+          fi
+          # Each crate comes after the crates that it depends on.
+          .github/scripts/publish-crates.sh rk-abi rk-frame rk-lib rukernel
