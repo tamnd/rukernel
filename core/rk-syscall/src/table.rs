@@ -1,7 +1,7 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, futex, info, mm, mount, poll, process, ptrace, signal, timer};
+use crate::{fs, futex, info, mm, mount, pidfd, poll, process, ptrace, signal, timer};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
@@ -186,6 +186,12 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::RENAMEAT2 => fs::renameat2(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::GETRANDOM => info::getrandom(cx, a[0], a[1], a[2]),
         nr::STATX => fs::statx(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::CAPGET => info::capget(cx, a[0], a[1]),
+        nr::CAPSET => info::capset(cx, a[0], a[1]),
+        nr::KCMP => process::kcmp(a[0], a[1], a[2], a[3], a[4]),
+        nr::PIDFD_OPEN => pidfd::pidfd_open(cx, a[0], a[1]),
+        nr::PIDFD_SEND_SIGNAL => pidfd::pidfd_send_signal(cx, a[0], a[1], a[2], a[3]),
+        nr::PIDFD_GETFD => pidfd::pidfd_getfd(cx, a[0], a[1], a[2]),
         _ => Err(Errno::ENOSYS),
     }
 }

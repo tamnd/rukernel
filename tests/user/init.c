@@ -1057,6 +1057,79 @@ static void test_clone3(void)
 	pthread_attr_destroy(&a);
 }
 
+static void test_pidfd(void)
+{
+	int fds[2];
+	char c = 0;
+
+	if (pipe(fds) != 0) {
+		check("pipe for pidfd", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		read(fds[0], &c, 1);
+		_exit(7);
+	}
+	int pidfd = syscall(SYS_pidfd_open, pid, 0);
+	check("pidfd_open", pidfd >= 0 && (fcntl(pidfd, F_GETFD) & FD_CLOEXEC));
+	struct pollfd p = {.fd = pidfd, .events = POLLIN};
+	check("poll of a pidfd of a running process gives 0", poll(&p, 1, 0) == 0);
+	write(fds[1], &c, 1);
+	check("poll of a pidfd gives POLLIN at the exit",
+	      poll(&p, 1, 5000) == 1 && (p.revents & POLLIN));
+	siginfo_t info;
+	memset(&info, 0, sizeof(info));
+	check("waitid with P_PIDFD", waitid(P_PIDFD, pidfd, &info, WEXITED) == 0 &&
+					     info.si_pid == pid && info.si_status == 7);
+	close(pidfd);
+	check("pidfd_open of no process gives ESRCH",
+	      syscall(SYS_pidfd_open, 99999, 0) == -1 && errno == ESRCH);
+
+	struct clone_args args;
+	memset(&args, 0, sizeof(args));
+	args.flags = CLONE_PIDFD;
+	args.pidfd = (unsigned long)&pidfd;
+	args.exit_signal = SIGCHLD;
+	pidfd = -1;
+	pid = syscall(SYS_clone3, &args, sizeof(args));
+	if (pid == 0) {
+		read(fds[0], &c, 1);
+		_exit(0);
+	}
+	int status = 0;
+	check("clone3 with CLONE_PIDFD", pid > 0 && pidfd >= 0);
+	check("pidfd_send_signal",
+	      syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0) == 0 &&
+		      waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+		      WTERMSIG(status) == SIGKILL);
+	close(pidfd);
+	close(fds[0]);
+	close(fds[1]);
+
+	int dup1 = dup(1);
+	int null = open("/dev/null", O_RDONLY);
+	long other = syscall(SYS_kcmp, getpid(), getpid(), 0, 1, null);
+	check("kcmp of two descriptors of one file gives 0",
+	      syscall(SYS_kcmp, getpid(), getpid(), 0, 1, dup1) == 0);
+	check("kcmp of two files gives 1 or 2", other == 1 || other == 2);
+	check("kcmp of a bad descriptor gives EBADF",
+	      syscall(SYS_kcmp, getpid(), getpid(), 0, 1, 999) == -1 && errno == EBADF);
+	close(dup1);
+	close(null);
+
+	unsigned int header[2] = {0x20080522, 0};
+	unsigned int data[6];
+	memset(data, 0, sizeof(data));
+	check("capget gives CAP_SYS_ADMIN",
+	      syscall(SYS_capget, header, data) == 0 && (data[0] & (1u << 21)) &&
+		      (data[1] & (1u << 21)) && data[2] == 0);
+	header[0] = 1;
+	check("capget of an unknown version gives EINVAL and version 3",
+	      syscall(SYS_capget, header, data) == -1 && errno == EINVAL &&
+		      header[0] == 0x20080522);
+}
+
 static void test_mount(void)
 {
 	struct statfs st;
@@ -1351,6 +1424,7 @@ int main(int argc, char **argv)
 	test_threads();
 	test_locks();
 	test_clone3();
+	test_pidfd();
 	test_ptrace();
 	test_mount();
 	test_proc();

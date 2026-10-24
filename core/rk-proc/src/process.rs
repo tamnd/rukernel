@@ -1242,6 +1242,8 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         s.zombie = Some(status);
         (core::mem::take(&mut s.children), s.parent.upgrade(), status)
     };
+    // A process file descriptor of the process is now readable.
+    rk_vfs::wait::poll_wake();
     let init = find_process(INIT_PID).filter(|init| !Arc::ptr_eq(init, &process));
     if let Some(init) = &init {
         let zombies = children.iter().any(|c| c.is_zombie());
