@@ -219,6 +219,10 @@ pub struct Status {
     pub umask: u32,
     /// The signals that are pending for the process.
     pub shared_pending: u64,
+    /// The bytes in locked areas.
+    pub locked: u64,
+    /// The bytes in pages that have a frame.
+    pub rss: u64,
 }
 
 /// The text of `/proc/PID/status`. Each process runs as root with all capabilities in R1.
@@ -230,7 +234,7 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         "\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n\
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nNStgid:\t{}\nNSpid:\t{}\n\
          NSpgid:\t{}\nNSsid:\t{}\nKthread:\t0\nVmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB\n\
-         VmRSS:\t       0 kB\nThreads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
+         VmLck:\t{:>8} kB\nVmRSS:\t{:>8} kB\nThreads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
          SigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t0000000000000000\n\
          CapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\n\
          CapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n\
@@ -245,6 +249,8 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         x.tid,
         s.pgid,
         s.sid,
+        x.locked / 1024,
+        x.rss / 1024,
         s.threads,
         s.pending,
         x.shared_pending,
@@ -254,6 +260,74 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
     );
     out.extend_from_slice(text.as_bytes());
     out
+}
+
+/// The values of one area in `/proc/PID/smaps`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SmapsArea {
+    /// The size of the area in bytes.
+    pub size: u64,
+    /// The bytes in pages that have a frame.
+    pub rss: u64,
+    /// The area is anonymous memory.
+    pub anon: bool,
+    /// The area is locked.
+    pub locked: bool,
+}
+
+/// The lines of `/proc/PID/smaps` after the map line of an area, as `show_smap` of Linux gives
+/// them. The counts that rukernel does not keep are 0.
+pub fn smaps_area(out: &mut Vec<u8>, a: &SmapsArea, m: &MapLine) {
+    let kb = |bytes: u64| bytes / 1024;
+    let anon = if a.anon { a.rss } else { 0 };
+    let locked = if a.locked { a.rss } else { 0 };
+    let fields: [(&str, u64); 22] = [
+        ("Size", a.size),
+        ("KernelPageSize", 4096),
+        ("MMUPageSize", 4096),
+        ("Rss", a.rss),
+        ("Pss", a.rss),
+        ("Pss_Dirty", 0),
+        ("Shared_Clean", 0),
+        ("Shared_Dirty", 0),
+        ("Private_Clean", 0),
+        ("Private_Dirty", a.rss),
+        ("Referenced", a.rss),
+        ("Anonymous", anon),
+        ("KSM", 0),
+        ("LazyFree", 0),
+        ("AnonHugePages", 0),
+        ("ShmemPmdMapped", 0),
+        ("FilePmdMapped", 0),
+        ("Shared_Hugetlb", 0),
+        ("Private_Hugetlb", 0),
+        ("Swap", 0),
+        ("SwapPss", 0),
+        ("Locked", locked),
+    ];
+    for (name, value) in fields {
+        let name = format!("{name}:");
+        out.extend_from_slice(format!("{name:<16}{:>8} kB\n", kb(value)).as_bytes());
+    }
+    out.extend_from_slice(b"THPeligible:    0\nVmFlags:");
+    let flags = [
+        (m.read, "rd"),
+        (m.write, "wr"),
+        (m.exec, "ex"),
+        (m.shared, "sh"),
+        (true, "mr"),
+        (true, "mw"),
+        (true, "me"),
+        (m.shared, "ms"),
+        (a.locked, "lo"),
+    ];
+    for (on, name) in flags {
+        if on {
+            out.push(b' ');
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    out.push(b'\n');
 }
 
 /// The text of a number file of `/proc/sys`, with a new line.
@@ -292,6 +366,19 @@ mod tests {
         let mut out = Vec::new();
         escape(&mut out, b"a b\\c");
         assert_eq!(out, b"a\\040b\\134c");
+    }
+
+    #[test]
+    fn smaps_shows_the_resident_and_locked_bytes() {
+        let mut out = Vec::new();
+        let area = SmapsArea { size: 8192, rss: 4096, anon: true, locked: true };
+        let line = MapLine { read: true, write: true, ..MapLine::default() };
+        smaps_area(&mut out, &area, &line);
+        let text = core::str::from_utf8(&out).unwrap_or("");
+        assert!(text.starts_with("Size:                  8 kB\n"));
+        assert!(text.contains("\nRss:                   4 kB\n"));
+        assert!(text.contains("\nLocked:                4 kB\n"));
+        assert!(text.ends_with("VmFlags: rd wr mr mw me lo\n"));
     }
 
     #[test]
@@ -342,7 +429,7 @@ mod tests {
             ..Stat::default()
         };
         let text =
-            String::from_utf8(status(&s, &Status { tid: 6, umask: 0o22, shared_pending: 0 }))
+            String::from_utf8(status(&s, &Status { tid: 6, umask: 0o22, ..Status::default() }))
                 .unwrap();
         assert!(text.starts_with("Name:\tsh\nUmask:\t0022\nState:\tR (running)\nTgid:\t5\n"));
         assert!(text.contains("\nPid:\t6\nPPid:\t1\n"));

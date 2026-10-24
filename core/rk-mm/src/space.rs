@@ -125,6 +125,10 @@ pub struct MmapRequest {
     pub low32: bool,
     /// The area can get write access later. See [`Vma::may_write`].
     pub may_write: bool,
+    /// `MAP_LOCKED`: lock the area, as `mlock` does.
+    pub locked: bool,
+    /// `MAP_POPULATE`: give each page its frame now.
+    pub populate: bool,
     /// The file and the page aligned offset, or `None` for anonymous memory.
     pub file: Option<(FileRef, u64)>,
     /// What the area is for.
@@ -143,6 +147,8 @@ impl MmapRequest {
             noreplace: false,
             low32: false,
             may_write: true,
+            locked: false,
+            populate: false,
             file: None,
             kind: VmaKind::Normal,
         }
@@ -168,6 +174,8 @@ struct State {
     brk_start: usize,
     /// The end of the heap.
     brk: usize,
+    /// `MCL_FUTURE`: lock each new area.
+    lock_future: bool,
 }
 
 /// The address space of one process.
@@ -211,7 +219,7 @@ impl AddressSpace {
     /// Makes an empty address space. Gives `ENOMEM` if no frame is free for the page table.
     pub fn new() -> Result<Self, Errno> {
         let vm = VmSpace::new().ok_or(Errno::ENOMEM)?;
-        let state = State { vmas: VmaSet::new(), brk_start: 0, brk: 0 };
+        let state = State { vmas: VmaSet::new(), brk_start: 0, brk: 0, lock_future: false };
         Ok(Self { vm, state: SpinLock::new(state) })
     }
 
@@ -228,6 +236,21 @@ impl AddressSpace {
     /// Gives a copy of the areas, in address order.
     pub fn areas(&self) -> Vec<Vma<FileRef>> {
         self.state.lock().vmas.iter().cloned().collect()
+    }
+
+    /// Gives a copy of the areas in the page aligned range of `addr..addr + len`, in address
+    /// order. `madvise` uses it.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped.
+    pub fn areas_in(&self, addr: usize, len: usize) -> Result<Vec<Vma<FileRef>>, Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        let st = self.state.lock();
+        if !st.vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        Ok(st.vmas.iter().filter(|v| v.end > start && v.start < end).cloned().collect())
     }
 
     /// Sets the start of the heap. The ELF loader calls it with the end of the program.
@@ -290,15 +313,24 @@ impl AddressSpace {
             }
             None => Backing::Anon,
         };
+        let locked = req.locked || st.lock_future;
         st.vmas.insert(Vma {
             start,
             end: start + len,
             prot: req.prot,
             shared: req.shared,
             may_write: req.may_write,
+            locked,
+            grows_down: false,
             backing,
             kind: req.kind,
         });
+        let populate = req.populate || locked;
+        drop(st);
+        if populate {
+            // A page that cannot get its frame now gets it at the first access, as on Linux.
+            let _ = self.populate(start, start + len);
+        }
         Ok(start)
     }
 
@@ -317,9 +349,9 @@ impl AddressSpace {
     ///
     /// # Errors
     ///
-    /// `EINVAL` if `addr` is not page aligned, `ENOMEM` if a page of the range is not mapped, or
-    /// an error of the file system.
-    pub fn msync(&self, addr: usize, len: usize) -> Result<(), Errno> {
+    /// `EINVAL` if `addr` is not page aligned, `ENOMEM` if a page of the range is not mapped,
+    /// `EBUSY` for `invalidate` on a locked area, or an error of the file system.
+    pub fn msync(&self, addr: usize, len: usize, invalidate: bool) -> Result<(), Errno> {
         if !is_page_aligned(addr) {
             return Err(Errno::EINVAL);
         }
@@ -329,6 +361,9 @@ impl AddressSpace {
         }
         let st = self.state.lock();
         for vma in st.vmas.iter().filter(|v| v.start < end && addr < v.end) {
+            if invalidate && vma.locked {
+                return Err(Errno::EBUSY);
+            }
             write_back(vma, addr, end)?;
         }
         if !st.vmas.covers(addr, end) {
@@ -356,6 +391,118 @@ impl AddressSpace {
         }
         self.unmap_locked(&mut st, addr, end);
         Ok(())
+    }
+
+    /// Gives a frame to each page of `start..end` that has none. A page of an area that allows a
+    /// write gets a frame of its own, so that a later write does not copy it.
+    fn populate(&self, start: usize, end: usize) -> Result<(), Errno> {
+        let mut at = start;
+        while at < end {
+            let access = match self.state.lock().vmas.find(at) {
+                Some(v) if v.prot.write => Access::Write,
+                Some(v) if v.prot.read || v.prot.exec => Access::Read,
+                Some(v) => {
+                    at = v.end;
+                    continue;
+                }
+                None => return Err(Errno::ENOMEM),
+            };
+            self.handle_fault(at, access)?;
+            at += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    /// The page aligned range of `addr..addr + len`, as `mlock` and `mincore` use it.
+    fn lock_range(addr: usize, len: usize) -> Result<(usize, usize), Errno> {
+        let start = addr & !(PAGE_SIZE - 1);
+        let end = len
+            .checked_add(addr - start)
+            .and_then(page_up)
+            .and_then(|l| start.checked_add(l))
+            .filter(|&e| e <= USER_END)
+            .ok_or(Errno::ENOMEM)?;
+        Ok((start, end))
+    }
+
+    /// Locks or unlocks the areas in `addr..addr + len`. A lock gives each page its frame, but
+    /// not with `on_fault`.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped, or if no frame is free.
+    pub fn mlock(&self, addr: usize, len: usize, lock: bool, on_fault: bool) -> Result<(), Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        {
+            let mut st = self.state.lock();
+            if !st.vmas.covers(start, end) {
+                return Err(Errno::ENOMEM);
+            }
+            st.vmas.update_range(start, end, |vma| vma.locked = lock);
+        }
+        if lock && !on_fault {
+            only_enomem(self.populate(start, end))?;
+        }
+        Ok(())
+    }
+
+    /// Locks each area, and with `future` each new area too. A lock gives each page its frame,
+    /// but not with `on_fault`. `mlockall` calls it, and `munlockall` calls it with `lock` false.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if no frame is free.
+    pub fn mlock_all(
+        &self,
+        lock: bool,
+        current: bool,
+        future: bool,
+        on_fault: bool,
+    ) -> Result<(), Errno> {
+        let areas: Vec<(usize, usize)> = {
+            let mut st = self.state.lock();
+            st.lock_future = lock && future;
+            if current || !lock {
+                st.vmas.update_range(0, USER_END, |vma| vma.locked = lock);
+            }
+            st.vmas.iter().map(|v| (v.start, v.end)).collect()
+        };
+        if lock && current && !on_fault {
+            for (start, end) in areas {
+                only_enomem(self.populate(start, end))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The number of bytes in locked areas, the `VmLck` line of `/proc/PID/status`.
+    pub fn locked_bytes(&self) -> usize {
+        self.state.lock().vmas.iter().filter(|v| v.locked).map(Vma::len).sum()
+    }
+
+    /// The number of pages in `start..end` that have a frame.
+    pub fn resident_pages(&self, start: usize, end: usize) -> usize {
+        self.vm.mapped_pages(VirtAddr::new(start), VirtAddr::new(end)).len()
+    }
+
+    /// Gives one byte for each page of `addr..addr + len`: 1 if the page has a frame, else 0.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` if `addr` is not page aligned, and `ENOMEM` if a page of the range is not mapped.
+    pub fn mincore(&self, addr: usize, len: usize) -> Result<Vec<u8>, Errno> {
+        if !is_page_aligned(addr) {
+            return Err(Errno::EINVAL);
+        }
+        let (start, end) = Self::lock_range(addr, len)?;
+        if !self.state.lock().vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        let mut out = alloc::vec![0u8; (end - start) / PAGE_SIZE];
+        for page in self.vm.mapped_pages(VirtAddr::new(start), VirtAddr::new(end)) {
+            out[(page.get() - start) / PAGE_SIZE] = 1;
+        }
+        Ok(out)
     }
 
     /// Changes the size of the area at `addr`, and can move it. Gives the new address.
@@ -511,7 +658,9 @@ impl AddressSpace {
             if st.vmas.overlaps(old_end, new_end) {
                 return st.brk;
             }
-            st.vmas.insert(Vma::anon(old_end, new_end, Prot::RW, VmaKind::Heap));
+            let mut vma = Vma::anon(old_end, new_end, Prot::RW, VmaKind::Heap);
+            vma.locked = st.lock_future;
+            st.vmas.insert(vma);
         } else if new_end < old_end {
             self.unmap_locked(&mut st, new_end, old_end);
         }
@@ -615,7 +764,11 @@ impl AddressSpace {
                 child.vm.map(page, frame, prot).map_err(map_error)?;
             }
         }
-        *child.state.lock() = State { vmas: st.vmas.clone(), brk_start: st.brk_start, brk: st.brk };
+        // The child does not get the locks of the parent, as on Linux.
+        let mut vmas = st.vmas.clone();
+        vmas.update_range(0, USER_END, |vma| vma.locked = false);
+        *child.state.lock() =
+            State { vmas, brk_start: st.brk_start, brk: st.brk, lock_future: false };
         Ok(child)
     }
 
@@ -732,6 +885,15 @@ impl AddressSpace {
             Some((_, p)) if access != Access::Write || p.writable => Ok(()),
             _ => Err(Errno::EFAULT),
         }
+    }
+}
+
+/// Keeps only the `ENOMEM` error of a populate. A page that has another error, such as a file page
+/// past the end of the file, gets the error at its first access, as on Linux.
+fn only_enomem(r: Result<(), Errno>) -> Result<(), Errno> {
+    match r {
+        Err(Errno::ENOMEM) => Err(Errno::ENOMEM),
+        _ => Ok(()),
     }
 }
 
