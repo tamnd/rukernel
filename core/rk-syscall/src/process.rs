@@ -209,7 +209,7 @@ fn wait_child(
     cx: &Cx<'_>,
     target: WaitTarget,
     options: u32,
-) -> Result<Option<(Pid, WaitStatus)>, Errno> {
+) -> Result<Option<(Pid, WaitStatus, u64)>, Errno> {
     let options = WaitOptions {
         exited: options & WEXITED != 0,
         stopped: options & WSTOPPED != 0,
@@ -235,9 +235,9 @@ pub(crate) fn wait4(cx: &Cx<'_>, pid: u64, status: u64, options: u64, rusage: u6
         p => WaitTarget::Pgid(p.unsigned_abs()),
     };
     let found = wait_child(cx, target, options | WEXITED)?;
-    let Some((child, code)) = found else { return Ok(0) };
+    let Some((child, code, ticks)) = found else { return Ok(0) };
     cx.write_opt(status, &code.0)?;
-    cx.write_opt(rusage, &rk_abi::native::types::Rusage::new_zeroed())?;
+    cx.write_opt(rusage, &crate::info::rusage(ticks))?;
     Ok(u64::from(child))
 }
 
@@ -271,15 +271,17 @@ pub(crate) fn waitid(
     };
     // With `WNOHANG` and no child that changed, the fields are 0, as in Linux.
     let mut info = SigInfo::default();
-    if let Some((child, status)) = wait_child(cx, target, options)? {
+    let mut ticks = 0;
+    if let Some((child, status, child_ticks)) = wait_child(cx, target, options)? {
         let (code, value) = status.child_code();
         info = SigInfo::new(SIGCHLD, code, child);
         info.status = value;
+        ticks = child_ticks;
     }
     if infop != 0 {
         cx.write_bytes(infop, &info.to_bytes()[..WAITID_INFO_SIZE])?;
     }
-    cx.write_opt(rusage, &rk_abi::native::types::Rusage::new_zeroed())?;
+    cx.write_opt(rusage, &crate::info::rusage(ticks))?;
     Ok(0)
 }
 

@@ -25,7 +25,7 @@ const MAX_RANDOM: usize = 0x7fff_f000;
 
 /// The nanoseconds since boot, from the timer tick.
 pub(crate) fn uptime_ns() -> u64 {
-    ticks().saturating_mul(NSEC_PER_SEC / HZ)
+    ticks_ns(ticks())
 }
 
 /// The time of `CLOCK_REALTIME`. R1 has no real time clock, so the time starts at the epoch at
@@ -52,8 +52,18 @@ pub(crate) fn timespec(ns: u64) -> KernelTimespec {
     KernelTimespec { tv_sec: (ns / NSEC_PER_SEC) as i64, tv_nsec: (ns % NSEC_PER_SEC) as i64 }
 }
 
-/// Gives the time of `clock` in nanoseconds.
-fn clock_ns(clock: u32) -> Result<u64, Errno> {
+/// The nanoseconds of `ticks` timer ticks.
+pub(crate) fn ticks_ns(ticks: u64) -> u64 {
+    ticks.saturating_mul(NSEC_PER_SEC / HZ)
+}
+
+/// The ticks of `USER_HZ` of `ticks` timer ticks, for `times` and `/proc/PID/stat`.
+pub(crate) fn user_hz(ticks: u64) -> u64 {
+    ticks * USER_HZ / HZ
+}
+
+/// Gives the time of `clock` in nanoseconds, for the calls of `thread`.
+fn clock_ns(thread: &rk_proc::Thread, clock: u32) -> Result<u64, Errno> {
     match clock {
         CLOCK_REALTIME
         | CLOCK_REALTIME_COARSE
@@ -62,21 +72,20 @@ fn clock_ns(clock: u32) -> Result<u64, Errno> {
         | CLOCK_MONOTONIC_RAW
         | CLOCK_MONOTONIC_COARSE
         | CLOCK_BOOTTIME => Ok(uptime_ns()),
-        // R1 does not count the CPU time of each thread, so the CPU clocks give the time since
-        // boot. The time never goes back, as POSIX tells.
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => Ok(uptime_ns()),
+        CLOCK_PROCESS_CPUTIME_ID => Ok(ticks_ns(thread.process().user_ticks())),
+        CLOCK_THREAD_CPUTIME_ID => Ok(ticks_ns(thread.user_ticks())),
         _ => Err(Errno::EINVAL),
     }
 }
 
 pub(crate) fn clock_gettime(cx: &Cx<'_>, clock: u64, tp: u64) -> SysResult {
-    let ns = clock_ns(clock as u32)?;
+    let ns = clock_ns(cx.thread, clock as u32)?;
     cx.write_val(tp, &timespec(ns))?;
     Ok(0)
 }
 
 pub(crate) fn clock_getres(cx: &Cx<'_>, clock: u64, tp: u64) -> SysResult {
-    clock_ns(clock as u32)?;
+    clock_ns(cx.thread, clock as u32)?;
     cx.write_opt(tp, &timespec(NSEC_PER_SEC / HZ))?;
     Ok(0)
 }
@@ -116,9 +125,17 @@ pub(crate) fn clock_nanosleep(
     if matches!(clock, CLOCK_THREAD_CPUTIME_ID) {
         return Err(Errno::EINVAL);
     }
-    let now = clock_ns(clock)?;
+    let now = clock_ns(cx.thread, clock)?;
     let ts: KernelTimespec = cx.read_val(req)?;
-    let want = timespec_ns(&ts)?;
+    let mut want = timespec_ns(&ts)?;
+    if clock == CLOCK_PROCESS_CPUTIME_ID {
+        // The timers do not follow the CPU time yet, so the sleep waits for the rest of the
+        // time on the clock since boot.
+        if flags as u32 & TIMER_ABSTIME != 0 {
+            want = want.saturating_sub(now);
+        }
+        return sleep_relative(cx, uptime_ns().saturating_add(want), rem);
+    }
     if flags as u32 & TIMER_ABSTIME != 0 {
         // The end does not change, so the call can start again with the same arguments.
         if sleep_until(cx.thread, want.div_ceil(NSEC_PER_SEC / HZ)) {
@@ -203,16 +220,30 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
 
 pub(crate) fn getrusage(cx: &Cx<'_>, who: u64, buf: u64) -> SysResult {
     // `RUSAGE_SELF`, `RUSAGE_CHILDREN` and `RUSAGE_THREAD`.
-    if !matches!(who as i32, 0 | -1 | 1) {
-        return Err(Errno::EINVAL);
-    }
-    cx.write_val(buf, &Rusage::new_zeroed())?;
+    let ticks = match who as i32 {
+        0 => cx.process().user_ticks(),
+        -1 => cx.process().child_ticks(),
+        1 => cx.thread.user_ticks(),
+        _ => return Err(Errno::EINVAL),
+    };
+    cx.write_val(buf, &rusage(ticks))?;
     Ok(0)
 }
 
+/// The `struct rusage` of `ticks` timer ticks of user CPU time. The kernel does not count the
+/// other values yet.
+pub(crate) fn rusage(ticks: u64) -> Rusage {
+    let mut r = Rusage::new_zeroed();
+    r.ru_utime = crate::timer::timeval(ticks_ns(ticks));
+    r
+}
+
 pub(crate) fn times(cx: &Cx<'_>, buf: u64) -> SysResult {
-    cx.write_opt(buf, &[0u64; 4])?;
-    Ok(ticks() * USER_HZ / HZ)
+    let process = cx.process();
+    // `tms_utime`, `tms_stime`, `tms_cutime` and `tms_cstime`.
+    let tms = [user_hz(process.user_ticks()), 0, user_hz(process.child_ticks()), 0];
+    cx.write_opt(buf, &tms)?;
+    Ok(user_hz(ticks()))
 }
 
 pub(crate) fn sysinfo(cx: &Cx<'_>, buf: u64) -> SysResult {

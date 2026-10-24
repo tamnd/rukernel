@@ -20,10 +20,12 @@
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/times.h>
 #include <sys/statfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -538,6 +540,92 @@ static void test_stop(void)
 	sigtimedwait(&set, &si, &(struct timespec){0, 0});
 	sigprocmask(SIG_SETMASK, &old, NULL);
 	munmap((void *)stop_counter, 4096);
+}
+
+static long long clock_ms(clockid_t clock)
+{
+	struct timespec ts;
+	clock_gettime(clock, &ts);
+	return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
+}
+
+/* Runs user code until the CPU clock of the process shows ms milliseconds more. */
+static void spin_cpu(long long ms)
+{
+	long long end = clock_ms(CLOCK_PROCESS_CPUTIME_ID) + ms;
+	long long limit = clock_ms(CLOCK_MONOTONIC) + 5000;
+	while (clock_ms(CLOCK_PROCESS_CPUTIME_ID) < end && clock_ms(CLOCK_MONOTONIC) < limit)
+		;
+}
+
+/* Gives the field n (from 1) of /proc/PID/stat, or -1. */
+static long proc_stat_field(pid_t pid, int n)
+{
+	char path[64], buf[512];
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	ssize_t len = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (len <= 0)
+		return -1;
+	buf[len] = 0;
+	char *p = strrchr(buf, ')');
+	for (int i = 2; p && i < n; i++)
+		p = strchr(p + 1, ' ');
+	return p ? strtol(p + 1, NULL, 10) : -1;
+}
+
+static void test_cputime(void)
+{
+	spin_cpu(100);
+	long long cpu = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+	check("the CPU clock of the process counts user time", cpu >= 100);
+	check("the CPU clock of the thread counts user time",
+	      clock_ms(CLOCK_THREAD_CPUTIME_ID) > 0 && clock_ms(CLOCK_THREAD_CPUTIME_ID) <= clock_ms(CLOCK_PROCESS_CPUTIME_ID));
+	usleep(100 * 1000);
+	check("a sleep adds no CPU time", clock_ms(CLOCK_PROCESS_CPUTIME_ID) - cpu < 50);
+
+	struct rusage ru;
+	struct tms tms;
+	check("getrusage gives the user time", getrusage(RUSAGE_SELF, &ru) == 0 && ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000 >= 100);
+	check("times gives the user time", times(&tms) != (clock_t)-1 && tms.tms_utime >= 10);
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	check("/proc/self/stat gives the user time", proc_stat_field(getpid(), 14) >= 10);
+
+	sigset_t vt, oldset, pend;
+	sigemptyset(&vt);
+	sigaddset(&vt, SIGVTALRM);
+	sigprocmask(SIG_BLOCK, &vt, &oldset);
+	struct itimerval itv = {{0, 0}, {0, 50 * 1000}};
+	setitimer(ITIMER_VIRTUAL, &itv, NULL);
+	usleep(200 * 1000);
+	sigpending(&pend);
+	check("ITIMER_VIRTUAL does not count a sleep", !sigismember(&pend, SIGVTALRM));
+	long long start = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
+	long long limit = clock_ms(CLOCK_MONOTONIC) + 5000;
+	do
+		sigpending(&pend);
+	while (!sigismember(&pend, SIGVTALRM) && clock_ms(CLOCK_MONOTONIC) < limit);
+	check("ITIMER_VIRTUAL fires after the CPU time", sigismember(&pend, SIGVTALRM) && clock_ms(CLOCK_PROCESS_CPUTIME_ID) - start >= 40);
+	sigtimedwait(&vt, NULL, &(struct timespec){0, 0});
+	sigprocmask(SIG_SETMASK, &oldset, NULL);
+
+	pid_t pid = fork();
+	if (pid == 0) {
+		spin_cpu(100);
+		_exit(0);
+	}
+	int st;
+	check("wait4 gives the user time of the child",
+	      wait4(pid, &st, 0, &ru) == pid && ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000 >= 100);
+	check("getrusage gives the user time of the children",
+	      getrusage(RUSAGE_CHILDREN, &ru) == 0 && ru.ru_utime.tv_sec * 1000 + ru.ru_utime.tv_usec / 1000 >= 100);
+	check("times and /proc give the user time of the children",
+	      times(&tms) != (clock_t)-1 && tms.tms_cutime >= 10 && proc_stat_field(getpid(), 16) >= 10);
+	umount("/proc");
 }
 
 static void test_signals(void)
@@ -1082,6 +1170,7 @@ int main(int argc, char **argv)
 	test_sigwait();
 	test_timers();
 	test_stop();
+	test_cputime();
 	test_pipes();
 	test_threads();
 	test_locks();

@@ -5,12 +5,16 @@
 //! One kernel task fires the timers. It waits until the earliest deadline and then sends the
 //! signals, so the timer interrupt does not take the locks of the signal queues. The times are in
 //! nanoseconds since boot, and a timer fires at the first tick at or after its time.
+//!
+//! A timer on the CPU clock of a process or a thread is not in the queue of the timer task. The
+//! CPU clock moves only while a thread of the process runs user code, so the thread checks these
+//! timers when it comes back to the kernel with `check_cpu_timers`.
 
 use crate::process::{Process, Thread};
 use crate::signal::SigInfo;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use rk_frame::sync::{Once, SpinLock};
 use rk_frame::task::{TaskOptions, WaitQueue};
 use rk_frame::time::{HZ, ticks};
@@ -27,6 +31,38 @@ const MAX_TIMERS: usize = 4096;
 /// The nanoseconds since boot, from the timer tick.
 pub fn now_ns() -> u64 {
     ticks().saturating_mul(TICK_NS)
+}
+
+/// The clock of a timer.
+pub enum Clock {
+    /// The time since boot, for `CLOCK_REALTIME`, `CLOCK_MONOTONIC` and `ITIMER_REAL`.
+    Boot,
+    /// The CPU time of the process, for `CLOCK_PROCESS_CPUTIME_ID`, `ITIMER_VIRTUAL` and
+    /// `ITIMER_PROF`.
+    ProcessCpu(Weak<Process>),
+    /// The CPU time of the thread, for `CLOCK_THREAD_CPUTIME_ID`.
+    ThreadCpu(Weak<Thread>),
+}
+
+impl Clock {
+    /// The time of the clock in nanoseconds. The CPU clock of a process or a thread that ended
+    /// gives 0.
+    pub fn now(&self) -> u64 {
+        match self {
+            Clock::Boot => now_ns(),
+            Clock::ProcessCpu(p) => p.upgrade().map_or(0, |p| p.user_ticks() * TICK_NS),
+            Clock::ThreadCpu(t) => t.upgrade().map_or(0, |t| t.user_ticks() * TICK_NS),
+        }
+    }
+
+    /// Tells if the clock moves when `thread` runs user code.
+    fn follows(&self, thread: &Thread) -> bool {
+        match self {
+            Clock::Boot => false,
+            Clock::ProcessCpu(p) => core::ptr::eq(p.as_ptr(), Arc::as_ptr(thread.process())),
+            Clock::ThreadCpu(t) => core::ptr::eq(t.as_ptr(), thread),
+        }
+    }
 }
 
 /// Where a timer sends its signal.
@@ -53,6 +89,7 @@ struct TimerState {
 
 /// A timer.
 pub struct Timer {
+    clock: Clock,
     target: Target,
     /// The signal that the timer sends. The timer sets the time fields of the `siginfo`.
     info: SigInfo,
@@ -66,22 +103,38 @@ impl core::fmt::Debug for Timer {
 }
 
 impl Timer {
-    /// Makes a timer that is off. It sends `info` to `target`.
-    pub fn new(target: Target, info: SigInfo) -> Arc<Self> {
-        Arc::new(Self { target, info, state: SpinLock::new(TimerState::default()) })
+    /// Makes a timer on `clock` that is off. It sends `info` to `target`.
+    pub fn new(clock: Clock, target: Target, info: SigInfo) -> Arc<Self> {
+        Arc::new(Self { clock, target, info, state: SpinLock::new(TimerState::default()) })
     }
 
-    /// Sets the timer to fire at `expires` and then after each `interval`. An `expires` of 0
-    /// turns the timer off. Gives the remaining time and the interval before the change.
+    /// The time of the clock of the timer in nanoseconds.
+    pub fn now(&self) -> u64 {
+        self.clock.now()
+    }
+
+    /// Sets the timer to fire at `expires` on its clock and then after each `interval`. An
+    /// `expires` of 0 turns the timer off. Gives the remaining time and the interval before the
+    /// change.
     pub fn arm(self: &Arc<Self>, expires: u64, interval: u64) -> (u64, u64) {
+        let now = self.now();
         let mut s = self.state.lock();
-        let old = s.remaining();
+        let old = s.remaining(now);
         if let Some(key) = s.key.take() {
             QUEUE.lock().remove(&key);
         }
+        let was_on = s.expires != 0;
         s.expires = expires;
         s.interval = if expires == 0 { 0 } else { interval };
-        if expires != 0 {
+        if !matches!(self.clock, Clock::Boot) {
+            if expires != 0 && !was_on {
+                let mut cpu = CPU_TIMERS.lock();
+                cpu.push(self.clone());
+                CPU_COUNT.store(cpu.len(), Ordering::Relaxed);
+            } else if expires == 0 && was_on {
+                remove_cpu_timer(self);
+            }
+        } else if expires != 0 {
             let key = (expires, NEXT_KEY.fetch_add(1, Ordering::Relaxed));
             s.key = Some(key);
             QUEUE.lock().insert(key, self.clone());
@@ -94,7 +147,8 @@ impl Timer {
 
     /// Gives the remaining time and the interval.
     pub fn get(&self) -> (u64, u64) {
-        self.state.lock().remaining()
+        let now = self.now();
+        self.state.lock().remaining(now)
     }
 
     /// The overrun count of the last signal.
@@ -102,24 +156,30 @@ impl Timer {
         self.state.lock().overrun
     }
 
-    /// Fires the timer at `now`: it sends the signal, and puts the timer back in the queue if it
-    /// has an interval.
-    fn fire(self: &Arc<Self>, key: (u64, u64), now: u64) {
+    /// Fires the timer at `now` on its clock: it sends the signal, and puts the timer back in
+    /// the queue if it has an interval. `key` is the key in the queue of the timer task, or
+    /// `None` for a timer on a CPU clock.
+    fn fire(self: &Arc<Self>, key: Option<(u64, u64)>, now: u64) {
         let missed = {
             let mut s = self.state.lock();
-            if s.key != Some(key) {
+            if s.key != key || s.expires == 0 || now < s.expires {
                 return;
             }
             s.key = None;
             let mut missed = 0;
             if s.interval == 0 {
                 s.expires = 0;
+                if key.is_none() {
+                    remove_cpu_timer(self);
+                }
             } else {
                 missed = (now - s.expires) / s.interval;
                 s.expires += (missed + 1) * s.interval;
-                let key = (s.expires, NEXT_KEY.fetch_add(1, Ordering::Relaxed));
-                s.key = Some(key);
-                QUEUE.lock().insert(key, self.clone());
+                if key.is_some() {
+                    let key = (s.expires, NEXT_KEY.fetch_add(1, Ordering::Relaxed));
+                    s.key = Some(key);
+                    QUEUE.lock().insert(key, self.clone());
+                }
             }
             missed
         };
@@ -141,12 +201,36 @@ impl Timer {
 }
 
 impl TimerState {
-    fn remaining(&self) -> (u64, u64) {
+    fn remaining(&self, now: u64) -> (u64, u64) {
         if self.expires == 0 {
             return (0, self.interval);
         }
         // A timer that is over but did not fire yet gives 1 microsecond, as Linux does.
-        (self.expires.saturating_sub(now_ns()).max(1000), self.interval)
+        (self.expires.saturating_sub(now).max(1000), self.interval)
+    }
+}
+
+/// The timers on a CPU clock that are on.
+static CPU_TIMERS: SpinLock<alloc::vec::Vec<Arc<Timer>>> = SpinLock::new(alloc::vec::Vec::new());
+/// The length of `CPU_TIMERS`, so that a thread does not take the lock when no timer is on.
+static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn remove_cpu_timer(timer: &Arc<Timer>) {
+    let mut cpu = CPU_TIMERS.lock();
+    cpu.retain(|t| !Arc::ptr_eq(t, timer));
+    CPU_COUNT.store(cpu.len(), Ordering::Relaxed);
+}
+
+/// Fires the timers on the CPU clocks of `thread` and of its process whose time is over. The
+/// thread calls this after it ran user code, and it holds no lock.
+pub fn check_cpu_timers(thread: &Thread) {
+    if CPU_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let timers: alloc::vec::Vec<Arc<Timer>> =
+        CPU_TIMERS.lock().iter().filter(|t| t.clock.follows(thread)).cloned().collect();
+    for timer in timers {
+        timer.fire(None, timer.now());
     }
 }
 
@@ -224,7 +308,7 @@ fn run() {
             core::mem::replace(&mut *q, later)
         };
         for (key, timer) in expired {
-            timer.fire(key, now);
+            timer.fire(Some(key), now);
         }
         let next = QUEUE.lock().keys().next().map(|k| k.0.div_ceil(TICK_NS));
         let changed = || (EPOCH.load(Ordering::Acquire) != epoch).then_some(());
