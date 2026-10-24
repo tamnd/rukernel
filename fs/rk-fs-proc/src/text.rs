@@ -211,6 +211,7 @@ pub fn state_name(state: u8) -> &'static str {
         b'S' => "S (sleeping)",
         b'D' => "D (disk sleep)",
         b'T' => "T (stopped)",
+        b't' => "t (tracing stop)",
         b'Z' => "Z (zombie)",
         _ => "X (dead)",
     }
@@ -221,6 +222,8 @@ pub fn state_name(state: u8) -> &'static str {
 pub struct Status {
     /// The thread ID.
     pub tid: u32,
+    /// The process ID of the tracer, or 0.
+    pub tracer: u32,
     /// The umask.
     pub umask: u32,
     /// The signals that are pending for the process.
@@ -237,7 +240,7 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
     out.extend_from_slice(&s.comm);
     let kb = s.vsize / 1024;
     let text = format!(
-        "\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t0\n\
+        "\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n\
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nNStgid:\t{}\nNSpid:\t{}\n\
          NSpgid:\t{}\nNSsid:\t{}\nKthread:\t0\nVmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB\n\
          VmLck:\t{:>8} kB\nVmRSS:\t{:>8} kB\nThreads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
@@ -251,6 +254,7 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         s.pid,
         x.tid,
         s.ppid,
+        x.tracer,
         s.pid,
         x.tid,
         s.pgid,
@@ -439,12 +443,15 @@ mod tests {
             threads: 1,
             ..Stat::default()
         };
-        let text =
-            String::from_utf8(status(&s, &Status { tid: 6, umask: 0o22, ..Status::default() }))
-                .unwrap();
+        let text = String::from_utf8(status(
+            &s,
+            &Status { tid: 6, tracer: 3, umask: 0o22, ..Status::default() },
+        ))
+        .unwrap();
         assert!(text.starts_with("Name:\tsh\nUmask:\t0022\nState:\tR (running)\nTgid:\t5\n"));
-        assert!(text.contains("\nPid:\t6\nPPid:\t1\n"));
+        assert!(text.contains("\nPid:\t6\nPPid:\t1\nTracerPid:\t3\n"));
         assert_eq!(state_name(b'Z'), "Z (zombie)");
+        assert_eq!(state_name(b't'), "t (tracing stop)");
     }
 
     #[test]

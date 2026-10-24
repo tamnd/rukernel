@@ -65,6 +65,8 @@ struct Image {
     cmdline: Vec<u8>,
     /// The file of the program, for `/proc/PID/exe`.
     exe: Option<Location>,
+    /// The auxiliary vector, for `/proc/PID/auxv`.
+    auxv: Vec<u8>,
 }
 
 /// The signal state that the threads of a process share: the actions and the queue of the
@@ -122,6 +124,8 @@ pub struct Process {
     /// with the lock of `state`, but it is not in `state`, because a wait for a child checks it
     /// with that lock held.
     stopped: AtomicBool,
+    /// The signal that stopped the process last.
+    stop_signal: AtomicU32,
     /// The threads of a stopped process wait here until `SIGCONT` or `SIGKILL` comes.
     stop_wait: WaitQueue,
     vm: SpinLock<Option<Arc<AddressSpace>>>,
@@ -406,14 +410,20 @@ impl Process {
         self.image.lock().exe.clone()
     }
 
-    /// Sets the arguments and the file of the program, after `execve`.
-    pub fn set_image(&self, argv: &[Vec<u8>], exe: Location) {
+    /// The auxiliary vector that `execve` gave the program, or nothing before the first
+    /// `execve`.
+    pub fn auxv(&self) -> Vec<u8> {
+        self.image.lock().auxv.clone()
+    }
+
+    /// Sets the arguments, the file and the auxiliary vector of the program, after `execve`.
+    pub fn set_image(&self, argv: &[Vec<u8>], exe: Location, auxv: Vec<u8>) {
         let mut cmdline = Vec::new();
         for arg in argv {
             cmdline.extend_from_slice(arg);
             cmdline.push(0);
         }
-        *self.image.lock() = Image { cmdline, exe: Some(exe) };
+        *self.image.lock() = Image { cmdline, exe: Some(exe), auxv };
     }
 
     /// The tick of the timer when the process was made.
@@ -467,6 +477,11 @@ impl Process {
     /// Tells if a stop signal stopped the process.
     pub fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    /// The signal that stopped the process, or `None` if the process is not stopped.
+    pub fn stop_signal(&self) -> Option<u32> {
+        self.is_stopped().then(|| self.stop_signal.load(Ordering::Acquire))
     }
 
     /// The state letter of `/proc/PID/stat`: `Z` for a zombie, `T` for a stopped process, `R` if
@@ -528,6 +543,7 @@ impl Process {
             child_wait: WaitQueue::new(),
             thread_exit: WaitQueue::new(),
             stopped: AtomicBool::new(false),
+            stop_signal: AtomicU32::new(0),
             stop_wait: WaitQueue::new(),
             vm: SpinLock::new(Some(vm)),
             files: SpinLock::new(Some(files)),
@@ -1057,6 +1073,7 @@ pub fn stop_group(thread: &Thread, sig: u32) {
             thread.group_stop.store(sig, Ordering::Release);
             return;
         }
+        process.stop_signal.store(sig, Ordering::Release);
         process.stopped.store(true, Ordering::Release);
         s.report = Some(WaitStatus::stopped(sig));
         for t in &s.threads {

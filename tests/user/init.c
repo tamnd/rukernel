@@ -1236,6 +1236,45 @@ static void test_ptrace(void)
 	      ptrace(PTRACE_CONT, getppid(), 0, 0) == -1 && errno == ESRCH);
 }
 
+/* The files of procfs for ptrace and debuggers. */
+static void test_proc_ptrace(void)
+{
+	char buf[4096], path[64];
+	unsigned long aux[64], pagesz = 0;
+	long word = 0, value = 77;
+	ssize_t n;
+	pid_t pid;
+	int fd, i, status;
+
+	mount("proc", "/proc", "proc", 0, NULL);
+	n = read_file("/proc/self/auxv", (char *)aux, sizeof(aux));
+	for (i = 0; i + 1 < n / 8; i += 2)
+		if (aux[i] == AT_PAGESZ)
+			pagesz = aux[i + 1];
+	check("/proc/self/auxv", n > 0 && n % 16 == 0 && pagesz == getauxval(AT_PAGESZ) && aux[n / 8 - 2] == AT_NULL);
+	fd = open("/proc/self/mem", O_RDWR);
+	check("/proc/self/mem reads", fd >= 0 && pread(fd, &word, sizeof(word), (off_t)&ptrace_word) == 8 &&
+	      word == ptrace_word);
+	check("/proc/self/mem writes", pwrite(fd, &value, sizeof(value), (off_t)&ptrace_word) == 8 && ptrace_word == 77);
+	check("/proc/self/mem gives EIO for no mapping", pread(fd, &word, sizeof(word), 0) == -1 && errno == EIO);
+	close(fd);
+
+	pid = fork();
+	if (pid == 0) {
+		ptrace(PTRACE_TRACEME, 0, 0, 0);
+		raise(SIGSTOP);
+		_exit(0);
+	}
+	trace_wait(pid);
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	n = read_file(path, buf, sizeof(buf));
+	snprintf(path, sizeof(path), "\nTracerPid:\t%d\n", getpid());
+	check("/proc/PID/status of a tracee", n > 0 && strstr(buf, "\nState:\tt (tracing stop)\n") && strstr(buf, path));
+	kill(pid, SIGKILL);
+	waitpid(pid, &status, 0);
+	umount("/proc");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -1315,6 +1354,7 @@ int main(int argc, char **argv)
 	test_ptrace();
 	test_mount();
 	test_proc();
+	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");

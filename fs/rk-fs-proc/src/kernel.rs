@@ -1,7 +1,7 @@
 //! The files of procfs that read the state of the kernel: the root directory, the system files,
 //! `/proc/sys` and the directory of each process.
 
-use crate::node::{FindFn, dir, file, join, link, rw_file};
+use crate::node::{FindFn, data_file, dir, file, join, link, rw_file};
 use crate::text::{self, MapLine, MemInfo, SmapsArea};
 use alloc::boxed::Box;
 use alloc::format;
@@ -287,6 +287,9 @@ fn thread_state(t: &Thread) -> u8 {
     if p.is_zombie() {
         return b'Z';
     }
+    if t.is_trace_stopped() {
+        return b't';
+    }
     if p.is_stopped() {
         return b'T';
     }
@@ -327,9 +330,12 @@ fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
 
 fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
     let s = stat_of(p, t);
+    let threads = p.threads();
+    let thread = t.or_else(|| threads.iter().find(|t| t.tid() == p.pid()).map(|t| &**t));
     let umask = p.fs().map_or(0o022, |fs| fs.lock().umask());
     let x = text::Status {
         tid: t.map_or(p.pid(), Thread::tid),
+        tracer: thread.map_or(0, Thread::tracer_pid),
         umask,
         shared_pending: p.shared_pending().0,
         locked: p.vm().map_or(0, |vm| vm.locked_bytes() as u64),
@@ -338,6 +344,35 @@ fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
     let mut s = s;
     s.pid = p.pid();
     text::status(&s, &x)
+}
+
+/// Reads or writes `len` bytes of the memory of the process `w` at `addr`, one page at a time,
+/// for `/proc/PID/mem`. `f` gets the address and the range of the buffer for each page. The
+/// access stops at the first page that has no mapping, and gives the bytes before it. An access
+/// that has no bytes gives `EIO`, as in Linux.
+fn mem_access(
+    w: &Weak<Process>,
+    addr: u64,
+    len: usize,
+    mut f: impl FnMut(&rk_mm::AddressSpace, usize, core::ops::Range<usize>) -> Result<()>,
+) -> Result<usize> {
+    let vm = alive(w)?.vm().ok_or(Errno::EIO)?;
+    let mut done = 0;
+    while done < len {
+        let Some(at) = usize::try_from(addr).ok().and_then(|a| a.checked_add(done)) else { break };
+        if at >= rk_frame::vm::USER_END {
+            break;
+        }
+        let n = (rk_mm::PAGE_SIZE - at % rk_mm::PAGE_SIZE).min(len - done);
+        if f(&vm, at, done..done + n).is_err() {
+            break;
+        }
+        done += n;
+    }
+    if done == 0 && len != 0 {
+        return Err(Errno::EIO);
+    }
+    Ok(done)
 }
 
 fn maps_of(p: &Process) -> Result<Vec<u8>> {
@@ -503,6 +538,23 @@ fn process_files(
         file(&join(base, b"cmdline"), move || Ok(alive(&p_)?.cmdline())),
     ));
     out.push((b"environ".to_vec(), file(&join(base, b"environ"), || Ok(Vec::new()))));
+    let p_ = w.clone();
+    out.push((b"auxv".to_vec(), file(&join(base, b"auxv"), move || Ok(alive(&p_)?.auxv()))));
+    let p_ = w.clone();
+    let p2 = w.clone();
+    out.push((
+        b"mem".to_vec(),
+        data_file(
+            &join(base, b"mem"),
+            0o600,
+            move |addr, buf| {
+                mem_access(&p_, addr, buf.len(), |vm, at, range| vm.read(at, &mut buf[range]))
+            },
+            move |addr, buf| {
+                mem_access(&p2, addr, buf.len(), |vm, at, range| vm.write_force(at, &buf[range]))
+            },
+        ),
+    ));
     let p_ = w.clone();
     out.push((b"maps".to_vec(), file(&join(base, b"maps"), move || maps_of(&*alive(&p_)?))));
     let p_ = w.clone();

@@ -175,13 +175,13 @@ fn read_headers(inode: &InodeRef) -> Result<ElfHeader, Errno> {
 }
 
 /// Makes the new address space and the initial stack for `args`. `random` gives the 16 bytes of
-/// `AT_RANDOM`. Also gives the file of the program and the arguments, which an interpreter line
-/// changes.
+/// `AT_RANDOM`. Also gives the file of the program, the arguments, which an interpreter line
+/// changes, and the auxiliary vector.
 fn build(
     fs: &FsContext,
     mut args: ExecArgs,
     random: [u8; 16],
-) -> Result<(AddressSpace, ExecImage, Location, Vec<Vec<u8>>), Errno> {
+) -> Result<(AddressSpace, ExecImage, Location, Vec<Vec<u8>>, Vec<u8>), Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
     let (at, header) = loop {
@@ -279,7 +279,7 @@ fn build(
     )?;
     space.write(image.sp, &image.bytes)?;
     let start = interp.map_or(entry, |i| i.bias + i.header.entry as usize);
-    Ok((space, ExecImage { entry: start, sp: image.sp }, at, args.argv))
+    Ok((space, ExecImage { entry: start, sp: image.sp }, at, args.argv, image.auxv))
 }
 
 /// Runs a new program in the process of `thread`. On success the process has the new address
@@ -303,7 +303,7 @@ pub fn exec(
     let fs = process.fs().ok_or(Errno::ESRCH)?;
     let ctx = fs.lock().clone();
     let path = args.path.clone();
-    let (space, image, at, argv) = build(&ctx, args, random)?;
+    let (space, image, at, argv, auxv) = build(&ctx, args, random)?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
     release(thread);
@@ -326,6 +326,6 @@ pub fn exec(
     thread.set_altstack(crate::signal::AltStack::default());
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&path);
     process.set_comm(name);
-    process.set_image(&argv, at);
+    process.set_image(&argv, at, auxv);
     Ok(image)
 }

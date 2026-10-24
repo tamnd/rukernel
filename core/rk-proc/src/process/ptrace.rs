@@ -278,8 +278,8 @@ pub fn attach(
     }
     tracer.state.lock().tracees.push(thread.clone());
     if thread.process.is_stopped() {
-        let sig = thread.process.state.lock().report.and_then(WaitStatus::stop_signal);
-        thread.group_stop.store(sig.unwrap_or(SIGSTOP), core::sync::atomic::Ordering::Release);
+        let sig = thread.process.stop_signal().unwrap_or(SIGSTOP);
+        thread.group_stop.store(sig, core::sync::atomic::Ordering::Release);
         thread.wake();
         // As JOBCTL_TRAPPING of Linux: the next request of the tracer finds the tracee stopped.
         tracer.child_wait.wait_until(|| {
@@ -373,21 +373,28 @@ pub fn resume(tracer: &Process, tid: Pid, how: Resume, sig: u32) -> Result<(), E
             if !pt.seized || stop.status.0 >> 16 != PTRACE_EVENT_STOP as i32 {
                 return Err(Errno::EIO);
             }
-            stop.listening = true;
-            return Ok(());
-        }
-        pt.syscall = how == Resume::Syscall;
-        pt.step = how == Resume::Step;
-        if how == Resume::Step {
-            if stop.regs.regs().rflags & RFLAGS_TF == 0 {
-                stop.regs.regs_mut().rflags |= RFLAGS_TF;
-                pt.forced_tf = true;
+            // A request of `PTRACE_INTERRUPT` or a `SIGCONT` came during the stop, so the tracee
+            // stops again at once, as with `JOBCTL_TRAP_NOTIFY` of Linux.
+            if pt.interrupt {
+                stop.resume = Some(0);
+            } else {
+                stop.listening = true;
+                return Ok(());
             }
         } else {
-            pt.clear_forced_tf(stop);
+            pt.syscall = how == Resume::Syscall;
+            pt.step = how == Resume::Step;
+            if how == Resume::Step {
+                if stop.regs.regs().rflags & RFLAGS_TF == 0 {
+                    stop.regs.regs_mut().rflags |= RFLAGS_TF;
+                    pt.forced_tf = true;
+                }
+            } else {
+                pt.clear_forced_tf(stop);
+            }
+            pt.detached = how == Resume::Detach;
+            stop.resume = Some(sig);
         }
-        pt.detached = how == Resume::Detach;
-        stop.resume = Some(sig);
         Ok(())
     })?;
     if let Some(thread) = tracee(tracer, tid) {
@@ -628,12 +635,18 @@ pub(super) fn group_continued(threads: &[Arc<Thread>]) {
         let woke = {
             let mut guard = t.ptrace.lock();
             match guard.as_mut() {
-                Some(pt) => match pt.stop.as_mut().filter(|s| s.listening) {
-                    Some(stop) => {
+                Some(pt) => match pt.stop.as_mut().filter(|s| s.resume.is_none()) {
+                    Some(stop) if stop.listening => {
                         stop.listening = false;
                         stop.resume = Some(0);
                         pt.interrupt = true;
                         true
+                    }
+                    // A tracee of `PTRACE_SEIZE` stops again when the tracer lets it continue,
+                    // to tell the tracer about the continue.
+                    Some(_) => {
+                        pt.interrupt |= pt.seized;
+                        false
                     }
                     None => false,
                 },
