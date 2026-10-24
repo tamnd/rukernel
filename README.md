@@ -94,6 +94,8 @@ cargo xtask boot-test alpine
 | `fs/rk-vfs/` | The virtual file system: inodes, dentries, mounts, path walks, open files and the cpio reader |
 | `fs/rk-fs-proc/` | procfs, the files of `/proc` that give the state of the kernel and of each process |
 | `fs/rk-fs-tmpfs/` | tmpfs, the file system in memory that holds the initramfs |
+| `net/rk-net/` | The socket layer: the socket operations, the socket files and the common socket options |
+| `net/rk-net-unix/` | Unix sockets: stream, datagram and seqpacket sockets with path and abstract names |
 | `core/rk-proc/` | Processes and threads: process IDs, `fork`, `execve`, `exit` and `wait4` |
 | `core/rk-syscall/` | The system call table and the system calls of R1 |
 | `drv/rk-drv-mem/` | The memory devices: `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom` |

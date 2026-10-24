@@ -158,6 +158,27 @@ const GROUPS: &[Group] = &[
         doc: "The values of the ELF header and the program header.",
     },
     Group {
+        module: "socket",
+        header: "asm/socket.h",
+        prefixes: &["SO_", "SCM_", "SOL_SOCKET"],
+        ty: "u32",
+        doc: "The options of `getsockopt` and `setsockopt` at the level `SOL_SOCKET`, and the types of the control messages.",
+    },
+    Group {
+        module: "sockios",
+        header: "linux/sockios.h",
+        prefixes: &["SIOC"],
+        ty: "u32",
+        doc: "The `ioctl` commands of sockets.",
+    },
+    Group {
+        module: "un",
+        header: "linux/un.h",
+        prefixes: &["UNIX_PATH_MAX"],
+        ty: "u32",
+        doc: "The size of the path of a Unix socket address.",
+    },
+    Group {
         module: "random",
         header: "linux/random.h",
         prefixes: &["GRND_"],

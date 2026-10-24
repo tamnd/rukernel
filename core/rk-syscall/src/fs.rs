@@ -119,6 +119,14 @@ fn write_with(
 
 pub(crate) fn read(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
+    if let Some(sock) = rk_net::socket_of(&file) {
+        return crate::net::read_socket(
+            cx,
+            &file,
+            &*sock,
+            &[Iovec { iov_base: buf, iov_len: count }],
+        );
+    }
     read_with(cx, &file, buf, count, |_, b| file.read(b))
 }
 
@@ -126,6 +134,14 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EBADF);
+    }
+    if let Some(sock) = rk_net::socket_of(&file) {
+        return crate::net::write_socket(
+            cx,
+            &file,
+            &*sock,
+            &[Iovec { iov_base: buf, iov_len: count }],
+        );
     }
     sigpipe(cx, write_with(cx, buf, count, |_, b| file.write(b)))
 }
@@ -187,6 +203,9 @@ pub(crate) fn read_iovecs(
 
 pub(crate) fn readv(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
+    if let Some(sock) = rk_net::socket_of(&file) {
+        return crate::net::read_socket(cx, &file, &*sock, &read_iovecs(cx, iov, count)?);
+    }
     let mut done = 0;
     for v in read_iovecs(cx, iov, count)? {
         if v.iov_len == 0 {
@@ -209,6 +228,9 @@ pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EBADF);
+    }
+    if let Some(sock) = rk_net::socket_of(&file) {
+        return crate::net::write_socket(cx, &file, &*sock, &read_iovecs(cx, iov, count)?);
     }
     let mut done = 0;
     for v in read_iovecs(cx, iov, count)? {

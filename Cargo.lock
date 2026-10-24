@@ -88,6 +88,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-net"
+version = "0.2.3"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-vfs",
+]
+
+[[package]]
+name = "rk-net-unix"
+version = "0.2.3"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-net",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-proc"
 version = "0.2.3"
 dependencies = [
@@ -115,6 +134,8 @@ dependencies = [
  "rk-frame",
  "rk-fs-tmpfs",
  "rk-mm",
+ "rk-net",
+ "rk-net-unix",
  "rk-proc",
  "rk-vfs",
  "zerocopy",

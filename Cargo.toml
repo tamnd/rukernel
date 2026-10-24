@@ -14,6 +14,8 @@ members = [
     "fs/rk-fs-proc",
     "fs/rk-fs-tmpfs",
     "kernel/rukernel",
+    "net/rk-net",
+    "net/rk-net-unix",
     "tools/rk-abigen",
     "xtask",
 ]
@@ -44,6 +46,8 @@ rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.2.3" }
 rk-vfs = { path = "fs/rk-vfs", version = "0.2.3" }
 rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.2.3" }
 rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.2.3" }
+rk-net = { path = "net/rk-net", version = "0.2.3" }
+rk-net-unix = { path = "net/rk-net-unix", version = "0.2.3" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 
 [workspace.lints.rust]
