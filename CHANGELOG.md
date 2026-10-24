@@ -4,6 +4,25 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The `gvisor` boot test runs 20 Unix socket test programs of the gVisor test suite. `tools/gvisor/build.sh` builds them in Docker without Bazel, and `RK_GVISOR` sets their directory. A few tests need user namespaces, network namespaces, PID namespaces or capabilities, and the boot test does not run them until R5.
+- `setsockopt` and `getsockopt` accept `SO_NO_CHECK`.
+- The network device calls of `ioctl`, as `SIOCGIFINDEX`, give `ENODEV` on a socket, because there is no network device yet.
+
+### Changed
+
+- `fork` does not write protect a page again when it is read only already. A process that forks many times is much faster.
+
+### Fixed
+
+- A Unix socket message gets the credentials of the sender only when the sender gives them, or when the sender or the receiver has `SO_PASSCRED`, as in Linux. A message without credentials gives the pid 0 and the IDs 65534 to a receiver with `SO_PASSCRED`. A stream receive does not join the data of messages with different credentials.
+- A socket from `accept` gets `SO_PASSCRED` of the listener. `SO_PEERCRED` gives the credentials of the caller after `listen`, and the pid 0 and the IDs -1 before a connection.
+- A stream receive of 0 bytes waits for data, or gives `EAGAIN` without a wait. If data is there, it takes the files of the first message and leaves the data.
+- `recvmmsg` stops when its time out is over after a message, and writes the time that is left, as Linux does.
+- An edge triggered epoll entry on a Unix socket sees each new message, also when the socket is readable already.
+- An open of a socket through `/proc/PID/fd` gives `ENXIO`, as in Linux.
+
 ## [0.2.6] - 2026-10-24
 
 ### Added

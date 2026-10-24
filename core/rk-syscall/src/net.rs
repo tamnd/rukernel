@@ -599,12 +599,13 @@ pub(crate) fn recvmmsg(
     timeout: u64,
 ) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    if timeout != 0 {
+    // As in Linux, the time is examined only after each message, so a receive can still wait.
+    let end = if timeout == 0 {
+        None
+    } else {
         let t: rk_abi::native::types::KernelTimespec = cx.read_val(timeout)?;
-        if t.tv_sec < 0 || !(0..1_000_000_000).contains(&t.tv_nsec) {
-            return Err(Errno::EINVAL);
-        }
-    }
+        Some(crate::info::uptime_ns().saturating_add(crate::info::timespec_ns(&t)?))
+    };
     let flags = flags as u32;
     let vlen = (vlen as u32 as u64).min(MMSG_MAX);
     let mut done = 0;
@@ -617,6 +618,13 @@ pub(crate) fn recvmmsg(
             Err(_) => break,
         }
         done += 1;
+        if let Some(end) = end {
+            let left = end.saturating_sub(crate::info::uptime_ns());
+            cx.write_val(timeout, &crate::info::timespec(left))?;
+            if left == 0 {
+                break;
+            }
+        }
     }
     Ok(done)
 }

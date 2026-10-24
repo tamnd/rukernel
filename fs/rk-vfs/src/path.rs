@@ -131,7 +131,7 @@ impl<'a> Walk<'a> {
         if self.links > MAX_LINKS {
             return Err(Errno::ELOOP);
         }
-        let target = link.inode().read_link()?;
+        let target = link.inode().follow_link()?;
         self.resolve(dir, &target, true)
     }
 

@@ -1,7 +1,7 @@
 //! The files of procfs that read the state of the kernel: the root directory, the system files,
 //! `/proc/sys` and the directory of each process.
 
-use crate::node::{FindFn, data_file, dir, file, join, link, rw_file};
+use crate::node::{FindFn, data_file, dead_link, dir, file, join, link, rw_file};
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
 use alloc::boxed::Box;
 use alloc::format;
@@ -542,7 +542,13 @@ fn fd_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
                     let perm = 0o100 * u32::from(flags.readable()) * 4
                         + 0o100 * u32::from(flags.writable()) * 2
                         + 0o100;
-                    let node = link(&join(&me, &name), perm, move || Ok(target.clone()));
+                    let path = join(&me, &name);
+                    // A socket cannot open again through its link, as `sock_no_open` of Linux.
+                    let node = if target.starts_with(b"socket:[") {
+                        dead_link(&path, perm, move || Ok(target.clone()), Errno::ENXIO)
+                    } else {
+                        link(&path, perm, move || Ok(target.clone()))
+                    };
                     (name, node)
                 })
                 .collect())

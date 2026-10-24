@@ -406,6 +406,7 @@ const BOOT_TESTS: &[&str] = &[
     "busybox",
     "ltp",
     "kselftest",
+    "gvisor",
     "alpine",
     "debian",
 ];
@@ -876,16 +877,55 @@ const KSELFTEST_SCRIPT: &str = concat!(
     "exit $failed\n",
 );
 
-/// Writes the initramfs of the `kselftest` boot test next to the kernel: BusyBox, the kselftest
-/// programs and the script. Gives `false` if the programs or BusyBox are not there.
-fn build_kselftest_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
-    let (Some(dir), Some(busybox)) = (kselftest_dir(), busybox) else {
+/// The longest time that the `gvisor` boot test can take.
+const GVISOR_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// The directory of the gVisor tests that tools/gvisor/build.sh makes: `RK_GVISOR`, or
+/// target/gvisor.
+fn gvisor_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("RK_GVISOR")
+        .map_or_else(|| workspace_root().join("target/gvisor"), PathBuf::from);
+    dir.join("VERSION").exists().then_some(dir)
+}
+
+/// The script that the `gvisor` boot test runs as init. It runs each gtest program in /gvisor. A
+/// program passes with the exit code 0. The console gets the totals of each program, and the
+/// failed cases and all the output of a program that fails.
+const GVISOR_SCRIPT: &str = concat!(
+    "#!/bin/sh\nexport TMPDIR=/tmp TEST_TMPDIR=/tmp PATH=/bin\n",
+    "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
+    "failed=0\nfor p in /gvisor/*_test; do\n",
+    "    t=${p##*/}\n",
+    // These tests need user namespaces, network namespaces or capabilities, which come in R5.
+    "    $p --gtest_filter=-*SetSocketRecvBufForceAboveMax*:*BindConnectInSubNamespace*:*CredPassDifferentPIDUnprivileged*:*PeerCredAcrossPIDNamespace* > /tmp/gvisor.log 2>&1\n",
+    "    code=$?\n",
+    "    grep -E '^\\[  (PASSED  |SKIPPED )\\] [0-9]' /tmp/gvisor.log | sed \"s/^/gvisor: $t: /\"\n",
+    "    if [ $code = 0 ]; then\n",
+    "        echo \"gvisor: $t: pass\"\n",
+    "    else\n",
+    "        echo \"gvisor: $t: FAIL with $code\"; cat /tmp/gvisor.log; failed=1\n",
+    "    fi\n",
+    "done\n",
+    "exit $failed\n",
+);
+
+/// Writes the initramfs `initramfs-NAME.cpio` of a boot test next to the kernel: BusyBox, the
+/// programs of `dir` in `/NAME`, and `script` as `/NAME/run`. Gives `false` if the programs or
+/// BusyBox are not there.
+fn build_suite_initramfs(
+    kernel: &Path,
+    busybox: Option<&[u8]>,
+    name: &str,
+    dir: Option<PathBuf>,
+    script: &str,
+) -> Result<bool> {
+    let (Some(dir), Some(busybox)) = (dir, busybox) else {
         return Ok(false);
     };
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
-    for d in [&b"bin"[..], b"tmp", b"etc", b"kselftest", b"proc", b"dev"] {
-        w.add(d, 0o040_755, b"");
+    for d in ["bin", "tmp", "etc", name, "proc", "dev"] {
+        w.add(d.as_bytes(), 0o040_755, b"");
     }
     w.add(b"bin/busybox", 0o100_755, busybox);
     for applet in BUSYBOX_APPLETS {
@@ -895,20 +935,20 @@ fn build_kselftest_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bo
     w.add(b"etc/group", 0o100_644, b"root:x:0:\n");
     let mut names = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let name = entry.map_err(|e| e.to_string())?.file_name();
-        let name = name.to_string_lossy().into_owned();
-        if name != "VERSION" {
-            names.push(name);
+        let file = entry.map_err(|e| e.to_string())?.file_name();
+        let file = file.to_string_lossy().into_owned();
+        if file != "VERSION" {
+            names.push(file);
         }
     }
     names.sort();
-    for name in &names {
-        let path = dir.join(name);
+    for file in &names {
+        let path = dir.join(file);
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        w.add(format!("kselftest/{name}").as_bytes(), 0o100_755, &bytes);
+        w.add(format!("{name}/{file}").as_bytes(), 0o100_755, &bytes);
     }
-    w.add(b"kselftest/run", 0o100_755, KSELFTEST_SCRIPT.as_bytes());
-    let path = kernel.with_file_name("initramfs-kselftest.cpio");
+    w.add(format!("{name}/run").as_bytes(), 0o100_755, script.as_bytes());
+    let path = kernel.with_file_name(format!("initramfs-{name}.cpio"));
     fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(true)
 }
@@ -968,9 +1008,12 @@ fn build_kernel() -> Result<PathBuf> {
     if !build_ltp_initramfs(&kernel, busybox.as_deref())? {
         let _ = fs::remove_file(&ltp);
     }
-    let kselftest = kernel.with_file_name("initramfs-kselftest.cpio");
-    if !build_kselftest_initramfs(&kernel, busybox.as_deref())? {
-        let _ = fs::remove_file(&kselftest);
+    let suites =
+        [("kselftest", kselftest_dir(), KSELFTEST_SCRIPT), ("gvisor", gvisor_dir(), GVISOR_SCRIPT)];
+    for (name, dir, script) in suites {
+        if !build_suite_initramfs(&kernel, busybox.as_deref(), name, dir, script)? {
+            let _ = fs::remove_file(kernel.with_file_name(format!("initramfs-{name}.cpio")));
+        }
     }
     for rootfs in ROOTFS {
         if !build_rootfs_initramfs(&kernel, rootfs)? {
@@ -1218,7 +1261,7 @@ fn can_run(kernel: &Path, test: &str) -> bool {
         "init" | "tty" | "smp" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
-        "kselftest" => kernel.with_file_name("initramfs-kselftest.cpio").exists(),
+        "kselftest" | "gvisor" => kernel.with_file_name(format!("initramfs-{test}.cpio")).exists(),
         t if ROOTFS.iter().any(|r| r.name == t) => rootfs_initramfs(kernel, t).exists(),
         _ => true,
     }
@@ -1233,6 +1276,7 @@ fn test_cmdline(test: &str) -> String {
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
+        "gvisor" => String::from("console=ttyS0 rk.test=init rdinit=/gvisor/run"),
         t if ROOTFS.iter().any(|r| r.name == t) => {
             String::from("console=ttyS0 rk.test=init rdinit=/init")
         }
@@ -1242,7 +1286,7 @@ fn test_cmdline(test: &str) -> String {
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "smp" | "busybox" | "ltp" | "kselftest")
+    let test = if matches!(test, "tty" | "smp" | "busybox" | "ltp" | "kselftest" | "gvisor")
         || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"
@@ -1281,9 +1325,10 @@ fn boot_test(names: &[String]) -> Result {
         let (cmd, timeout) = if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), LTP_TIMEOUT)
-        } else if *test == "kselftest" {
-            let initrd = kernel.with_file_name("initramfs-kselftest.cpio");
-            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), KSELFTEST_TIMEOUT)
+        } else if *test == "kselftest" || *test == "gvisor" {
+            let initrd = kernel.with_file_name(format!("initramfs-{test}.cpio"));
+            let timeout = if *test == "gvisor" { GVISOR_TIMEOUT } else { KSELFTEST_TIMEOUT };
+            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), timeout)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
@@ -1294,8 +1339,9 @@ fn boot_test(names: &[String]) -> Result {
         let passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
         if passed {
             println!("boot test {test}: pass");
-            // The kselftest totals show the tests that the kernel skips.
-            for line in log.lines().filter(|l| l.starts_with("kselftest: ")) {
+            // The kselftest and gVisor totals show the tests that the kernel skips.
+            let totals = |l: &&str| l.starts_with("kselftest: ") || l.starts_with("gvisor: ");
+            for line in log.lines().filter(totals) {
                 println!("{line}");
             }
         } else {

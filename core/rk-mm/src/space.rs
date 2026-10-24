@@ -765,7 +765,8 @@ impl AddressSpace {
         for vma in st.vmas.iter() {
             for page in self.vm.mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end)) {
                 let Some((frame, prot)) = self.vm.page(page) else { continue };
-                let prot = if vma.shared {
+                // A page that is read only after an earlier fork needs no change and no flush.
+                let prot = if vma.shared || !prot.writable {
                     prot
                 } else {
                     let ro = PageProt { writable: false, ..prot };
