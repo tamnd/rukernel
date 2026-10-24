@@ -161,7 +161,11 @@ pub(crate) fn pwrite(cx: &Cx<'_>, fd: u64, buf: u64, count: u64, offset: u64) ->
     write_with(cx, buf, count, |done, b| file.write_at(offset + done, b))
 }
 
-fn read_iovecs(cx: &Cx<'_>, iov: u64, count: u64) -> Result<alloc::vec::Vec<Iovec>, Errno> {
+pub(crate) fn read_iovecs(
+    cx: &Cx<'_>,
+    iov: u64,
+    count: u64,
+) -> Result<alloc::vec::Vec<Iovec>, Errno> {
     if count > UIO_MAXIOV {
         return Err(Errno::EINVAL);
     }

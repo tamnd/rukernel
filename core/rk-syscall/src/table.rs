@@ -1,13 +1,13 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, futex, info, mm, mount, poll, process, signal, timer};
+use crate::{fs, futex, info, mm, mount, poll, process, ptrace, signal, timer};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
 /// Handles the system call in the registers of `cx` and puts the return value in them.
 pub(crate) fn dispatch(cx: &mut Cx<'_>) {
-    let number = cx.regs.syscall_number();
+    let number = cx.number;
     let args = cx.regs.syscall_args();
     let ret = match u32::try_from(number) {
         Ok(n) => handle(cx, n, args),
@@ -71,6 +71,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::EXECVE => process::execve(cx, a[0], a[1], a[2]),
         nr::EXIT => process::exit(cx, a[0]),
         nr::WAIT4 => process::wait4(cx, a[0], a[1], a[2], a[3]),
+        nr::PTRACE => ptrace::ptrace(cx, a[0], a[1], a[2], a[3]),
+        nr::PROCESS_VM_READV => ptrace::process_vm_readv(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::PROCESS_VM_WRITEV => ptrace::process_vm_writev(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::WAITID => process::waitid(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::KILL => signal::kill(cx, a[0], a[1]),
         nr::UNAME => info::uname(cx, a[0]),

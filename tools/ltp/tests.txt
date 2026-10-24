@@ -17,6 +17,7 @@
 # V shared memory, and kill13 needs a kernel with UBSAN.
 #
 # waitid10 reads /proc/sys/kernel/core_pattern, and the kernel does not have /proc/sys yet.
+# ptrace02 needs user IDs. ptrace04 and ptrace07 do not apply to x86_64 with this LTP build.
 alarm02
 alarm03
 alarm05
@@ -140,6 +141,14 @@ nanosleep02
 nanosleep04
 pause01
 pause02
+ptrace01
+ptrace03
+ptrace05
+ptrace06
+ptrace08
+ptrace09
+ptrace10
+ptrace11
 rt_sigaction02
 rt_sigaction03
 rt_sigprocmask02

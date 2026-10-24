@@ -26,6 +26,9 @@ pub(crate) struct Cx<'a> {
     pub(crate) regs: &'a mut UserContext,
     /// The status of the thread if the system call ends it.
     pub(crate) exit: Option<WaitStatus>,
+    /// The number of the system call. RAX holds `-ENOSYS` while the call runs, as in Linux, so
+    /// a tracer sees the number in `orig_rax`.
+    pub(crate) number: u64,
 }
 
 /// The user memory of an address space, for the `ioctl` of a file.

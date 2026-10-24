@@ -35,6 +35,8 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 /// A signal killed the child and it made a core dump.
 pub const CLD_DUMPED: i32 = 3;
+/// A traced child stopped.
+pub const CLD_TRAPPED: i32 = 4;
 /// A signal stopped the child.
 pub const CLD_STOPPED: i32 = 5;
 /// `SIGCONT` continued the stopped child.
@@ -51,6 +53,10 @@ pub const FPE_INTDIV: i32 = 1;
 pub const BUS_ADRALN: i32 = 1;
 /// An address that has no data, such as a page of a file mapping past the end of the file.
 pub const BUS_ADRERR: i32 = 2;
+/// A breakpoint, or a single step over a system call.
+pub const TRAP_BRKPT: i32 = 1;
+/// A single step.
+pub const TRAP_TRACE: i32 = 2;
 
 /// The signals that the kernel gives first, because the program caused them. Linux names this
 /// set `SYNCHRONOUS_MASK`.

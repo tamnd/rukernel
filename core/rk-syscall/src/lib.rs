@@ -38,6 +38,8 @@ mod poll;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod process;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod ptrace;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod run;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod signal;
