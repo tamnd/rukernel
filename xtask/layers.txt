@@ -17,6 +17,7 @@ rk-fs-tmpfs 3
 rk-net-unix 3
 rk-drv-mem 3
 rk-drv-tty 3
+rk-drv-virtio 3
 rk-syscall 5
 rukernel  5
 rk-abigen tool

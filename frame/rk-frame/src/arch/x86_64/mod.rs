@@ -7,7 +7,7 @@ mod boot_params;
 pub(crate) mod cpu;
 mod gdt;
 mod idt;
-mod io;
+pub(crate) mod io;
 pub(crate) mod paging;
 pub(crate) mod serial;
 pub(crate) mod smp;

@@ -38,11 +38,11 @@ pub(crate) fn context() -> Option<&'static FsContext> {
     ROOT.get()
 }
 
-/// Makes `/dev` and the device files of the console and the memory devices, if the initramfs did
+/// Makes `/dev` and the device files of the console, the memory devices and the disks, if the initramfs did
 /// not make them. Linux has devtmpfs for this. rukernel gets devtmpfs in a later release.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn make_dev(fs: &FsContext) {
-    use rk_vfs::inode::mode::S_IFCHR;
+    use rk_vfs::inode::mode::{S_IFBLK, S_IFCHR};
 
     let root = fs.root().clone();
     let _ = fs.mkdir(&root, b"/dev", 0o755);
@@ -54,9 +54,14 @@ pub(crate) fn make_dev(fs: &FsContext) {
     for dev in rk_drv_mem::MemDevice::ALL {
         nodes.push((alloc::string::String::from(dev.name()), 0o666, dev.rdev()));
     }
-    for (name, perm, rdev) in nodes {
+    let mut nodes: alloc::vec::Vec<_> =
+        nodes.into_iter().map(|(name, perm, rdev)| (name, S_IFCHR | perm, rdev)).collect();
+    for (name, rdev) in rk_vfs::blockdev::block_devices() {
+        nodes.push((name, S_IFBLK | 0o660, rdev));
+    }
+    for (name, mode, rdev) in nodes {
         let path = alloc::format!("/dev/{name}");
-        match fs.mknod(&root, path.as_bytes(), S_IFCHR | perm, rdev) {
+        match fs.mknod(&root, path.as_bytes(), mode, rdev) {
             Ok(_) | Err(rk_abi::Errno::EEXIST) => {}
             Err(e) => println!("rootfs: cannot make {path}, error {}", e.get()),
         }

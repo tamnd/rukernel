@@ -9,6 +9,7 @@ members = [
     "core/rk-proc",
     "core/rk-syscall",
     "drv/rk-drv-mem",
+    "drv/rk-drv-virtio",
     "drv/rk-drv-tty",
     "fs/rk-vfs",
     "fs/rk-fs-proc",
@@ -42,6 +43,7 @@ rk-sched = { path = "core/rk-sched", version = "0.3.0" }
 rk-proc = { path = "core/rk-proc", version = "0.3.0" }
 rk-syscall = { path = "core/rk-syscall", version = "0.3.0" }
 rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.3.0" }
+rk-drv-virtio = { path = "drv/rk-drv-virtio", version = "0.3.0" }
 rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.3.0" }
 rk-vfs = { path = "fs/rk-vfs", version = "0.3.0" }
 rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.3.0" }

@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+pub mod blockdev;
 pub mod cpio;
 pub mod dentry;
 pub mod device;

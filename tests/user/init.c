@@ -34,6 +34,9 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/times.h>
@@ -1683,6 +1686,57 @@ static void hb_sender(const int *fds, int start)
 	_exit(0);
 }
 
+/* The byte at offset k of the disk of the blk boot test. xtask writes the same pattern. */
+static unsigned char disk_byte(long k)
+{
+	return (unsigned char)(k / 512 * 7 + k % 251);
+}
+
+#define DISK_SIZE (1024 * 1024)
+#define DISK_NOTE_AT (512 * 9 + 100)
+#define DISK_NOTE "rukernel wrote this sector"
+
+static void test_blk(void)
+{
+	int fd = open("/dev/vda", O_RDWR);
+	check("/dev/vda opens", fd >= 0);
+	if (fd < 0)
+		return;
+	struct stat st;
+	check("/dev/vda is a block device with the major 254",
+	      fstat(fd, &st) == 0 && S_ISBLK(st.st_mode) && major(st.st_rdev) == 254 &&
+		      minor(st.st_rdev) == 0);
+	unsigned long long size = 0;
+	check("BLKGETSIZE64 gives the disk size",
+	      ioctl(fd, BLKGETSIZE64, &size) == 0 && size == DISK_SIZE);
+	int ssz = 0;
+	check("BLKSSZGET gives 512", ioctl(fd, BLKSSZGET, &ssz) == 0 && ssz == 512);
+	check("lseek to the end gives the disk size", lseek(fd, 0, SEEK_END) == DISK_SIZE);
+
+	static unsigned char buf[200 * 1024];
+	int ok = pread(fd, buf, 1000, 3000) == 1000;
+	for (int i = 0; ok && i < 1000; i++)
+		ok = buf[i] == disk_byte(3000 + i);
+	check("pread of part of some sectors gives the disk data", ok);
+	ok = pread(fd, buf, sizeof(buf), 4096) == sizeof(buf);
+	for (long i = 0; ok && i < (long)sizeof(buf); i++)
+		ok = buf[i] == disk_byte(4096 + i);
+	check("pread of 200 KiB gives the disk data", ok);
+	check("pread at the end gives 0", pread(fd, buf, 10, DISK_SIZE) == 0);
+
+	ok = pwrite(fd, DISK_NOTE, strlen(DISK_NOTE), DISK_NOTE_AT) == (ssize_t)strlen(DISK_NOTE);
+	check("pwrite to the disk", ok);
+	check("fsync of the disk", fsync(fd) == 0);
+	memset(buf, 0, 1024);
+	ok = pread(fd, buf, 1024, 512 * 9) == 1024 && memcmp(buf + 100, DISK_NOTE, strlen(DISK_NOTE)) == 0;
+	for (int i = 0; ok && i < 100; i++)
+		ok = buf[i] == disk_byte(512 * 9 + i);
+	for (int i = 100 + (int)strlen(DISK_NOTE); ok && i < 1024; i++)
+		ok = buf[i] == disk_byte(512 * 9 + i);
+	check("pread after pwrite gives the new data and keeps the other bytes", ok);
+	close(fd);
+}
+
 static void test_smp(void)
 {
 	cpu_set_t set;
@@ -1778,6 +1832,8 @@ int main(int argc, char **argv)
 		test_tty();
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)
 		test_smp();
+	if (argc > 1 && strcmp(argv[1], "blk") == 0)
+		test_blk();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }

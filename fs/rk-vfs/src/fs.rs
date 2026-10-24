@@ -185,7 +185,11 @@ impl FsContext {
                 let ops = device::open_char(meta.rdev, flags)?;
                 Ok(File::with_ops(ops, Some(at), flags))
             }
-            FileType::BlockDevice | FileType::Fifo | FileType::Socket => Err(Errno::ENXIO),
+            FileType::BlockDevice => {
+                let ops = crate::blockdev::open_block(meta.rdev, flags)?;
+                Ok(File::with_ops(ops, Some(at), flags))
+            }
+            FileType::Fifo | FileType::Socket => Err(Errno::ENXIO),
             FileType::Symlink => Err(Errno::ELOOP),
         }
     }

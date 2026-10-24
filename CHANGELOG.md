@@ -2,6 +2,16 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- A virtio-blk driver in the new crate `rk-drv-virtio`. It uses the modern virtio PCI transport and one split virtqueue, and it waits for each request in a loop. Each disk is a block device `/dev/vda`, `/dev/vdb` and so on, with the major number 254.
+- rk-frame finds the PCI devices through the configuration ports, and maps the memory BARs of a device.
+- A block device file supports `read`, `write`, `pread`, `pwrite`, `lseek` with `SEEK_END`, and the `ioctl` calls `BLKGETSIZE`, `BLKGETSIZE64`, `BLKSSZGET`, `BLKPBSZGET`, `BLKIOMIN`, `BLKIOOPT`, `BLKROGET` and `BLKFLSBUF`.
+- `fsync` and `fdatasync` send a flush to the disk of a block device file.
+- The `blk` boot test starts QEMU with a disk of 1 MiB, reads and writes the disk in the guest, and then checks the data on the host.
+
 ## [0.3.0] - 2026-10-25
 
 ### Added
