@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.98.0"
 license = "GPL-2.0-only"
@@ -34,20 +34,20 @@ publish = true
 # path for all users. crates.io needs the version too. The version here must be the same as the
 # workspace version, and the release gate checks it.
 [workspace.dependencies]
-rk-frame = { path = "frame/rk-frame", version = "0.2.4" }
-rk-abi = { path = "core/rk-abi", version = "0.2.4" }
-rk-lib = { path = "core/rk-lib", version = "0.2.4" }
-rk-mm = { path = "core/rk-mm", version = "0.2.4" }
-rk-sched = { path = "core/rk-sched", version = "0.2.4" }
-rk-proc = { path = "core/rk-proc", version = "0.2.4" }
-rk-syscall = { path = "core/rk-syscall", version = "0.2.4" }
-rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.2.4" }
-rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.2.4" }
-rk-vfs = { path = "fs/rk-vfs", version = "0.2.4" }
-rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.2.4" }
-rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.2.4" }
-rk-net = { path = "net/rk-net", version = "0.2.4" }
-rk-net-unix = { path = "net/rk-net-unix", version = "0.2.4" }
+rk-frame = { path = "frame/rk-frame", version = "0.2.5" }
+rk-abi = { path = "core/rk-abi", version = "0.2.5" }
+rk-lib = { path = "core/rk-lib", version = "0.2.5" }
+rk-mm = { path = "core/rk-mm", version = "0.2.5" }
+rk-sched = { path = "core/rk-sched", version = "0.2.5" }
+rk-proc = { path = "core/rk-proc", version = "0.2.5" }
+rk-syscall = { path = "core/rk-syscall", version = "0.2.5" }
+rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.2.5" }
+rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.2.5" }
+rk-vfs = { path = "fs/rk-vfs", version = "0.2.5" }
+rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.2.5" }
+rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.2.5" }
+rk-net = { path = "net/rk-net", version = "0.2.5" }
+rk-net-unix = { path = "net/rk-net-unix", version = "0.2.5" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 
 [workspace.lints.rust]
