@@ -6,8 +6,9 @@
 
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE};
 use crate::signal::{
-    AltStack, CLD_EXITED, CLD_KILLED, NSIG, Pending, SIG_IGN, SigAction, SigInfo, SigSet,
+    AltStack, CLD_EXITED, CLD_KILLED, NSIG, Pending, SI_TIMER, SIG_IGN, SigAction, SigInfo, SigSet,
 };
+use crate::timer::Timers;
 use crate::wait::{WaitStatus, WaitTarget};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -15,7 +16,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDWAIT, SIGCHLD, SIGKILL};
-use rk_frame::sync::SpinLock;
+use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
@@ -110,6 +111,7 @@ pub struct Process {
     /// The value of `/proc/PID/oom_score_adj`. rukernel has no OOM killer yet.
     oom_score_adj: AtomicI32,
     limits: SpinLock<[Limit; RLIM_NLIMITS]>,
+    timers: SpinLock<Timers>,
 }
 
 impl core::fmt::Debug for Process {
@@ -422,6 +424,11 @@ impl Process {
         self.signals.lock().pending.set()
     }
 
+    /// The interval timers and the POSIX timers of the process.
+    pub fn timers(&self) -> SpinLockGuard<'_, Timers> {
+        self.timers.lock()
+    }
+
     /// The signal that the parent gets when the process ends, or 0.
     pub fn exit_signal(&self) -> u32 {
         self.exit_signal
@@ -467,6 +474,7 @@ impl Process {
                 u64::from(PID_MAX),
                 rk_vfs::fdtable::NR_OPEN_DEFAULT as u64,
             )),
+            timers: SpinLock::new(Timers::default()),
         })
     }
 }
@@ -855,6 +863,30 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     }
 }
 
+/// Sends the signal of a timer to `process`, or to `thread` of that process if it is given. In
+/// `info`, `uid` holds the overrun count. If the last signal of the same POSIX timer is still
+/// pending, the signal only adds its overruns to it. Gives the overrun count of the signal in the
+/// queue.
+pub(crate) fn send_timer_signal(
+    process: &Process,
+    thread: Option<&Arc<Thread>>,
+    info: SigInfo,
+) -> Option<i32> {
+    if info.code == SI_TIMER {
+        let mut shared = process.signals.lock();
+        let more = info.uid.saturating_add(1);
+        let count = match thread {
+            Some(t) => t.signals.lock().pending.add_overrun(info.pid, more),
+            None => shared.pending.add_overrun(info.pid, more),
+        };
+        if count.is_some() {
+            return count;
+        }
+    }
+    deliver(process, thread, info);
+    Some(info.uid as i32)
+}
+
 /// Sends a signal to each thread of `process`, for `kill` and the signals of the terminal.
 pub fn send_signal(process: &Process, info: SigInfo) {
     deliver(process, None, info);
@@ -936,6 +968,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         process.thread_exit.wake_all();
         return;
     }
+    process.timers().clear(false);
     // The task runs on the page table of the address space, so the kernel table goes first.
     VmSpace::deactivate();
     let vm = process.vm.lock().take();

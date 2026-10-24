@@ -1,13 +1,25 @@
-# The LTP tests that the ltp boot test runs, one name on each line. tools/ltp/build.sh builds
-# them. A test that is not in this list does not pass yet, or cannot pass for a reason below.
+# The LTP tests that the ltp boot test runs, one name on each line. tools/ltp/build.sh builds them.
+# A test that is not in this list does not pass yet, or cannot pass for a reason below.
+# tools/ltp/kconfig tells LTP the kernel options of rukernel.
 #
-# clone08 and clone10 use CLONE_THREAD or CLONE_SETTLS, and the clone function of musl refuses
-# them with EINVAL. clone09 needs network name spaces. clone11 needs the kernel configuration.
-# fork13 forks until its run time is over, and fork14 maps 16 TiB and forks after each GiB. They
-# are too slow for the boot test. mremap06 needs fallocate, and mremap07 needs the kernel
-# configuration. msync04 needs a block device. mlock02 needs user IDs, and mincore04 needs a page
-# cache that processes share. setrlimit01 and setrlimit06 need the kernel to enforce the limits,
-# and setrlimit02 needs user IDs. futex_waitv03 needs System V shared memory.
+# clone08 and clone10 use CLONE_THREAD or CLONE_SETTLS, and the clone function of musl refuses them
+# with EINVAL. clone09 needs network name spaces. clone11 needs kernel options that rukernel does
+# not have. fork13 forks until its run time is over, and fork14 maps 16 TiB and forks after each
+# GiB. They are too slow for the boot test. mremap06 needs fallocate, and mremap07 needs kernel
+# options that rukernel does not have. msync04 needs a block device. mlock02 needs user IDs, and
+# mincore04 needs a page cache that processes share. setrlimit01 and setrlimit06 need the kernel to
+# enforce the limits, and setrlimit02 needs user IDs. futex_waitv03 needs System V shared memory.
+#
+# sigwaitinfo01 and sigtimedwait01 wait for an empty set of signals, and the wrappers of musl call
+# the system call again after EINTR, so the tests do not stop. rt_sigsuspend01 reads sa_restorer
+# from the old action, and musl does not give it. timer_settime03 sets a time before the epoch,
+# because CLOCK_REALTIME starts at 0 at boot. tgkill02 needs RLIMIT_SIGPENDING. kill05 needs System
+# V shared memory, and kill13 needs a kernel with UBSAN.
+alarm02
+alarm03
+alarm05
+alarm06
+alarm07
 brk01
 brk02
 clone01
@@ -47,6 +59,8 @@ futex_wake02
 futex_wake03
 futex_wake04
 futex_wake05
+getitimer01
+getitimer02
 getpid01
 getppid01
 getppid02
@@ -55,6 +69,13 @@ getrlimit02
 getrlimit03
 gettid01
 gettid02
+kill02
+kill03
+kill06
+kill08
+kill10
+kill11
+kill12
 madvise01
 madvise02
 madvise03
@@ -107,9 +128,34 @@ munlock02
 munmap01
 munmap03
 munmap04
+pause01
+pause02
+rt_sigqueueinfo01
+rt_sigqueueinfo02
+rt_sigtimedwait01
+setitimer01
+setitimer02
 setrlimit03
 setrlimit04
 setrlimit05
+signal01
+signal02
+signal03
+signal04
+signal05
+signal06
+sigpending02
+sigsuspend01
+sigsuspend02
+sigwait01
+tgkill01
+tgkill03
+timer_create02
+timer_delete01
+timer_delete02
+timer_gettime01
+timer_settime01
+timer_settime02
 wait01
 wait02
 wait401

@@ -43,6 +43,8 @@ mod run;
 mod signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod table;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod timer;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use run::{count, init, spawn_init};

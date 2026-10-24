@@ -756,7 +756,7 @@ fn ltp_tests() -> Result<Vec<String>> {
 /// seconds.
 fn ltp_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
-        "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp LTP_TIMEOUT_MUL=4\n",
+        "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp LTP_TIMEOUT_MUL=4 KCONFIG_PATH=/etc/kconfig\n",
         "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
         "failed=0\nfor t in \\\n",
     ));
@@ -800,6 +800,7 @@ fn build_ltp_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
         b"root:x:0:0:root:/:/bin/sh\nnobody:x:65534:65534:nobody:/:/bin/false\n",
     );
     w.add(b"etc/group", 0o100_644, b"root:x:0:\nnogroup:x:65534:\n");
+    w.add(b"etc/kconfig", 0o100_644, read(&workspace_root().join("tools/ltp/kconfig"))?.as_bytes());
     for t in &tests {
         let path = dir.join(t);
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;

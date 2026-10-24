@@ -511,7 +511,9 @@ fn queue_info(cx: &Cx<'_>, target: Pid, sig: u64, uinfo: u64) -> Result<SigInfo,
 
 pub(crate) fn rt_sigqueueinfo(cx: &Cx<'_>, tgid: u64, sig: u64, uinfo: u64) -> SysResult {
     let info = queue_info(cx, tgid as Pid, sig, uinfo)?;
+    // Linux finds the process from any of its thread IDs, as `kill` does.
     let target = rk_proc::find_process(tgid as Pid)
+        .or_else(|| rk_proc::find_thread(tgid as Pid).map(|t| t.process().clone()))
         .filter(|p| tgid as i32 > 0 && !p.is_zombie())
         .ok_or(Errno::ESRCH)?;
     if sig != 0 {
