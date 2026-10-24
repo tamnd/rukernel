@@ -59,6 +59,11 @@ pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// The time stamp counter at the calibration, which is the time 0 of `nanos`.
 static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+/// The nanoseconds of one cycle of the time stamp counter, times 2^32, or 0 before the
+/// calibration.
+static TSC_MULT: AtomicU64 = AtomicU64::new(0);
+/// The time stamp counter at the last tick.
+static TICK_TSC: AtomicU64 = AtomicU64::new(0);
 
 /// Reads the time stamp counter.
 fn rdtsc() -> u64 {
@@ -77,6 +82,34 @@ pub(crate) fn nanos() -> u64 {
     }
     let delta = rdtsc().saturating_sub(TSC_BASE.load(Ordering::Relaxed));
     (u128::from(delta) * 1_000_000_000 / u128::from(hz)) as u64
+}
+
+/// The nanoseconds of the clock since boot. The value is the time of the tick count, plus the time
+/// of the time stamp counter since the last tick. The second part is always less than one tick,
+/// so the clock does not go back at a tick, and a deadline in ticks comes at the time that the
+/// clock shows. The vDSO calculates the same value from its data page.
+pub(crate) fn clock_ns() -> u64 {
+    loop {
+        let ticks = TICKS.load(Ordering::Acquire);
+        let base = TICK_TSC.load(Ordering::Acquire);
+        let now = rdtsc();
+        if TICKS.load(Ordering::Acquire) == ticks {
+            return clock(ticks, now.saturating_sub(base), TSC_MULT.load(Ordering::Relaxed));
+        }
+    }
+}
+
+/// The clock value from the tick count, the cycles of the time stamp counter since the last tick
+/// and `TSC_MULT`.
+fn clock(ticks: u64, cycles: u64, mult: u64) -> u64 {
+    let tick_ns = 1_000_000_000 / HZ;
+    let part = ((u128::from(cycles) * u128::from(mult)) >> 32).min(u128::from(tick_ns - 1));
+    ticks * tick_ns + part as u64
+}
+
+/// The time stamp counter at the last tick and `TSC_MULT`, for the data page of the vDSO.
+pub(crate) fn tsc_state() -> (u64, u64) {
+    (TICK_TSC.load(Ordering::Relaxed), TSC_MULT.load(Ordering::Relaxed))
 }
 
 fn read_msr(msr: u32) -> u64 {
@@ -184,8 +217,11 @@ fn calibrate() -> u64 {
     let elapsed = u32::MAX - read(REG_TIMER_CURRENT);
     let now = rdtsc();
     write(REG_TIMER_INIT, 0);
-    TSC_HZ.store((now - tsc) * 1000 / CALIBRATE_MS, Ordering::Relaxed);
+    let hz = ((now - tsc) * 1000 / CALIBRATE_MS).max(1);
+    TSC_HZ.store(hz, Ordering::Relaxed);
     TSC_BASE.store(now, Ordering::Relaxed);
+    TICK_TSC.store(now, Ordering::Relaxed);
+    TSC_MULT.store(((1_000_000_000u128 << 32) / u128::from(hz)) as u64, Ordering::Relaxed);
     u64::from(elapsed)
 }
 
@@ -220,7 +256,10 @@ pub(crate) fn init() {
 pub(crate) fn handle(vector: u8) -> bool {
     match vector {
         TIMER_VECTOR => {
-            TICKS.fetch_add(1, Ordering::Relaxed);
+            // `clock_ns` reads the tick count before and after the time stamp counter of the
+            // tick, so the counter must change first.
+            TICK_TSC.store(rdtsc(), Ordering::Release);
+            TICKS.fetch_add(1, Ordering::Release);
             crate::vdso::tick();
             eoi();
         }

@@ -17,7 +17,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use rk_frame::sync::{Once, SpinLock};
 use rk_frame::task::{TaskOptions, WaitQueue};
-use rk_frame::time::{HZ, ticks};
+use rk_frame::time::HZ;
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const TICK_NS: u64 = NSEC_PER_SEC / HZ;
@@ -28,9 +28,9 @@ pub const NR_ITIMERS: usize = 3;
 /// The most POSIX timers of one process.
 const MAX_TIMERS: usize = 4096;
 
-/// The nanoseconds since boot, from the timer tick.
+/// The nanoseconds since boot.
 pub fn now_ns() -> u64 {
-    ticks().saturating_mul(TICK_NS)
+    rk_frame::time::clock_ns()
 }
 
 /// The clock of a timer.

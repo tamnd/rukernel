@@ -20,7 +20,10 @@
 # ptrace02 needs user IDs. ptrace04 and ptrace07 do not apply to x86_64 with this LTP build.
 #
 # epoll_wait05 needs AF_INET sockets. epoll_wait10 polls /proc/mounts for a change of the mounts, and the
-# files of /proc cannot do poll yet. timerfd04 needs time name spaces.
+# files of /proc cannot do poll yet. timerfd04 needs time name spaces. epoll_wait04 of this LTP version
+# allows 1 ms for epoll_wait with a timeout of 0. Under QEMU without KVM, the first call runs kernel
+# code that QEMU did not translate yet, and that can take longer. LTP after this version multiplies
+# the limit by LTP_TIMEOUT_MUL.
 #
 # nice04, setpriority02, sched_setaffinity01, sched_setparam05, sched_setscheduler02 and
 # sched_setscheduler03 need user IDs. sched_setscheduler04 calls sched_getscheduler of musl, which
@@ -63,7 +66,6 @@ epoll_pwait06
 epoll_wait01
 epoll_wait02
 epoll_wait03
-epoll_wait04
 epoll_wait06
 epoll_wait07
 epoll_wait08

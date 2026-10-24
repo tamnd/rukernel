@@ -27,12 +27,12 @@ const SELECT_EX: u32 = POLLPRI;
 
 /// The tick count when `ns` nanoseconds from now are over.
 pub(crate) fn deadline_after(ns: u64) -> u64 {
-    ticks().saturating_add(ns.div_ceil(TICK_NS))
+    crate::info::deadline_after(ns)
 }
 
 /// The nanoseconds until `deadline`, or 0.
 fn left(deadline: u64) -> u64 {
-    deadline.saturating_sub(ticks()).saturating_mul(TICK_NS)
+    deadline.saturating_mul(TICK_NS).saturating_sub(crate::info::uptime_ns())
 }
 
 /// Scans with `scan` until it gives a value, the deadline comes or a signal comes. `scan` gives

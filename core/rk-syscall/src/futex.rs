@@ -33,7 +33,7 @@ use rk_abi::native::futex::{
 use rk_abi::native::types::{KernelTimespec, RobustListHead};
 use rk_frame::sync::SpinLock;
 use rk_frame::task::WaitQueue;
-use rk_frame::time::{HZ, ticks};
+use rk_frame::time::HZ;
 use rk_mm::AddressSpace;
 use rk_proc::Thread;
 
@@ -278,12 +278,10 @@ fn deadline(cx: &Cx<'_>, addr: u64, absolute: bool) -> Result<Option<u64>, Errno
         return Err(Errno::EINVAL);
     }
     let ns = (ts.tv_sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(ts.tv_nsec as u64);
-    let tick_ns = NSEC_PER_SEC / HZ;
-    let ticks_from_boot = |ns: u64| ns.div_ceil(tick_ns);
     Ok(Some(if absolute {
-        ticks_from_boot(ns)
+        ns.div_ceil(NSEC_PER_SEC / HZ)
     } else {
-        ticks().saturating_add(ticks_from_boot(ns))
+        crate::info::deadline_after(ns)
     }))
 }
 

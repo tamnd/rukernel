@@ -23,9 +23,9 @@ pub(crate) const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// The most bytes of one `getrandom`. Linux names it `MAX_RW_COUNT`.
 const MAX_RANDOM: usize = 0x7fff_f000;
 
-/// The nanoseconds since boot, from the timer tick.
+/// The nanoseconds since boot.
 pub(crate) fn uptime_ns() -> u64 {
-    ticks_ns(ticks())
+    rk_frame::time::clock_ns()
 }
 
 /// The time of `CLOCK_REALTIME`. R1 has no real time clock, so the time starts at the epoch at
@@ -43,8 +43,12 @@ pub(crate) fn timespec_ns(ts: &KernelTimespec) -> Result<u64, Errno> {
     Ok((ts.tv_sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(ts.tv_nsec as u64))
 }
 
-/// The timer tick when `ns` nanoseconds from now are over.
+/// The timer tick when `ns` nanoseconds from now are over. A time of 0 gives the current tick, so
+/// a call with no timeout does not wait for the next tick.
 pub(crate) fn deadline_after(ns: u64) -> u64 {
+    if ns == 0 {
+        return ticks();
+    }
     uptime_ns().saturating_add(ns).div_ceil(NSEC_PER_SEC / HZ)
 }
 

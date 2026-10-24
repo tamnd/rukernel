@@ -13,6 +13,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `clock_gettime` and `clock_getres` accept the CPU clocks of `clock_getcpuclockid` and `pthread_getcpuclockid`.
 - The ltp boot test runs 31 more tests, most of them for the scheduling calls. `tools/ltp/build.sh` builds the getpriority, setpriority and nice tests.
 
+### Changed
+
+- The clocks of the system calls and of the vDSO change between two ticks. They add the time of the time stamp counter since the last tick. A time out of 0 in `poll`, `select` and `epoll_wait` does not wait for the next tick.
+- The kernel copies the frames of user pages with `rep movsb`, not one byte at a time. A copy on write of a page is about 30 times faster under QEMU.
+
 ### Fixed
 
 - `tools/ltp/build.sh` makes the LTP archives again after a crash of the compiler, so a failed build does not leave an archive without some objects.
