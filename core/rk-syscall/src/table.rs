@@ -1,7 +1,9 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, futex, info, mm, mount, pidfd, poll, process, ptrace, seccomp, signal, timer};
+use crate::{
+    fs, futex, info, memfd, mm, mount, pidfd, poll, process, ptrace, seccomp, signal, timer,
+};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
@@ -66,6 +68,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETPID => Ok(u64::from(cx.process().pid())),
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::CLONE3 => process::clone3(cx, a[0], a[1]),
+        nr::MEMFD_CREATE => memfd::memfd_create(cx, a[0], a[1]),
+        nr::UNSHARE => process::unshare(cx, a[0]),
         nr::FORK => process::fork(cx),
         nr::VFORK => process::vfork(cx),
         nr::EXECVE => process::execve(cx, a[0], a[1], a[2]),

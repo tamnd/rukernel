@@ -87,6 +87,31 @@ impl FdTable {
         Ok(self.entries[i].replace(FdEntry { file, cloexec }))
     }
 
+    /// Adds `file` at the lowest free descriptor below `limit`, the `RLIMIT_NOFILE` of the
+    /// process that gets the file.
+    pub fn insert_limited(&mut self, file: Arc<File>, cloexec: bool, limit: usize) -> Result<i32> {
+        let free = (0..self.entries.len()).find(|&i| self.entries[i].is_none());
+        if free.unwrap_or(self.entries.len()) >= limit.min(self.limit) {
+            return Err(Errno::EMFILE);
+        }
+        self.insert(file, cloexec)
+    }
+
+    /// Puts `file` at `fd`, as `set` does, if `fd` is below `limit`, the `RLIMIT_NOFILE` of the
+    /// process that gets the file.
+    pub fn set_limited(
+        &mut self,
+        fd: i32,
+        file: Arc<File>,
+        cloexec: bool,
+        limit: usize,
+    ) -> Result<Option<FdEntry>> {
+        if usize::try_from(fd).map_or(true, |i| i >= limit) {
+            return Err(Errno::EBADF);
+        }
+        self.set(fd, file, cloexec)
+    }
+
     /// Removes `fd` and gives its entry.
     pub fn remove(&mut self, fd: i32) -> Result<FdEntry> {
         let entry = usize::try_from(fd)

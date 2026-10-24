@@ -5,6 +5,10 @@
 //! entry, and the action of the filters tells what happens to the call. This is the model of
 //! kernel/seccomp.c of Linux.
 
+mod notify;
+
+pub(crate) use notify::{ioctl as listener_ioctl, listener_of};
+
 use crate::cx::{Cx, SysResult};
 use crate::run::Entry;
 use alloc::sync::Arc;
@@ -15,7 +19,7 @@ use rk_frame::user::UserContext;
 use rk_proc::bpf::{self, INSN_SIZE};
 use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_SECCOMP};
 use rk_proc::seccomp::{
-    Filter, SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
+    Filter, Notify, SECCOMP_MODE_DISABLED, SECCOMP_MODE_FILTER, SECCOMP_MODE_STRICT,
     SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ALLOW, SECCOMP_RET_DATA, SECCOMP_RET_ERRNO,
     SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_THREAD, SECCOMP_RET_LOG, SECCOMP_RET_TRACE,
     SECCOMP_RET_TRAP, SECCOMP_RET_USER_NOTIF, run_filters,
@@ -33,10 +37,17 @@ const SECCOMP_GET_NOTIF_SIZES: u64 = 3;
 const SECCOMP_FILTER_FLAG_TSYNC: u64 = 1 << 0;
 const SECCOMP_FILTER_FLAG_LOG: u64 = 1 << 1;
 const SECCOMP_FILTER_FLAG_SPEC_ALLOW: u64 = 1 << 2;
+const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
+const SECCOMP_FILTER_FLAG_TSYNC_ESRCH: u64 = 1 << 4;
+const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: u64 = 1 << 5;
 
 /// The flags that rukernel accepts.
-const FILTER_FLAGS: u64 =
-    SECCOMP_FILTER_FLAG_TSYNC | SECCOMP_FILTER_FLAG_LOG | SECCOMP_FILTER_FLAG_SPEC_ALLOW;
+const FILTER_FLAGS: u64 = SECCOMP_FILTER_FLAG_TSYNC
+    | SECCOMP_FILTER_FLAG_LOG
+    | SECCOMP_FILTER_FLAG_SPEC_ALLOW
+    | SECCOMP_FILTER_FLAG_NEW_LISTENER
+    | SECCOMP_FILTER_FLAG_TSYNC_ESRCH
+    | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
 
 /// The options of `prctl`.
 pub(crate) const PR_GET_SECCOMP: u64 = 21;
@@ -80,7 +91,7 @@ fn filter(thread: &Arc<Thread>, regs: &mut UserContext, number: u64, recheck: bo
     let nr = number as i32;
     let ip = regs.regs().rip;
     let data = bpf::seccomp_data(nr, AUDIT_ARCH_X86_64, ip, regs.syscall_args());
-    let (ret, _matched) = run_filters(&chain, &data);
+    let (ret, matched) = run_filters(&chain, &data);
     let action = ret & SECCOMP_RET_ACTION_FULL;
     let value = ret & SECCOMP_RET_DATA;
     match action {
@@ -115,8 +126,7 @@ fn filter(thread: &Arc<Thread>, regs: &mut UserContext, number: u64, recheck: bo
             }
             filter(thread, regs, number, true)
         }
-        // rukernel has no listener for the notifications yet, thus the call gives `ENOSYS`.
-        SECCOMP_RET_USER_NOTIF => Entry::Run(NO_SYSCALL),
+        SECCOMP_RET_USER_NOTIF => notify::user_notif(thread, regs, number, &matched, data),
         SECCOMP_RET_LOG | SECCOMP_RET_ALLOW => Entry::Run(number),
         SECCOMP_RET_KILL_THREAD if thread.process().threads().len() > 1 => {
             Entry::ThreadExit(WaitStatus::signaled(SIGSYS, false))
@@ -148,15 +158,60 @@ fn read_prog(cx: &Cx<'_>, addr: u64) -> Result<alloc::vec::Vec<bpf::Insn>, Errno
 }
 
 /// `SECCOMP_SET_MODE_FILTER`: adds a filter to the chain of the thread. All processes of rukernel
-/// run as root, thus the thread does not need the no_new_privs bit.
+/// run as root, thus the thread does not need the no_new_privs bit. With
+/// `SECCOMP_FILTER_FLAG_TSYNC`, each other thread of the process gets the new chain. With
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER`, the call gives the descriptor of a new listener.
 fn set_mode_filter(cx: &Cx<'_>, flags: u64, uprog: u64) -> SysResult {
+    let has = |flag| flags & flag != 0;
     if flags & !FILTER_FLAGS != 0 {
         return Err(Errno::EINVAL);
     }
+    // A thread ID and a descriptor are both positive, thus the caller cannot tell them apart.
+    if has(SECCOMP_FILTER_FLAG_TSYNC)
+        && has(SECCOMP_FILTER_FLAG_NEW_LISTENER)
+        && !has(SECCOMP_FILTER_FLAG_TSYNC_ESRCH)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if has(SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV) && !has(SECCOMP_FILTER_FLAG_NEW_LISTENER) {
+        return Err(Errno::EINVAL);
+    }
     let prog = read_prog(cx, uprog)?;
-    let filter = Filter::new(prog, flags & SECCOMP_FILTER_FLAG_LOG != 0);
-    cx.thread.attach_seccomp_filter(filter)?;
-    Ok(0)
+    let log = has(SECCOMP_FILTER_FLAG_LOG);
+    let notify = has(SECCOMP_FILTER_FLAG_NEW_LISTENER)
+        .then(|| Arc::new(Notify::new(has(SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV))));
+    if notify.is_some() && cx.thread.has_seccomp_listener() {
+        return Err(Errno::EBUSY);
+    }
+    if has(SECCOMP_FILTER_FLAG_TSYNC)
+        && let Some(tid) = cx.thread.seccomp_sync_conflict()
+    {
+        if has(SECCOMP_FILTER_FLAG_TSYNC_ESRCH) {
+            return Err(Errno::ESRCH);
+        }
+        return Ok(u64::from(tid));
+    }
+    // The descriptor comes first, so that a full table does not leave a filter without its
+    // listener.
+    let listener = match &notify {
+        Some(n) => Some(cx.files()?.lock().insert(notify::listener_file(n.clone()), true)?),
+        None => None,
+    };
+    let filter = match notify {
+        Some(n) => Filter::with_listener(prog, log, n),
+        None => Filter::new(prog, log),
+    };
+    if let Err(e) = cx.thread.attach_seccomp_filter(filter) {
+        if let Some(fd) = listener {
+            let old = cx.files()?.lock().remove(fd);
+            drop(old);
+        }
+        return Err(e);
+    }
+    if has(SECCOMP_FILTER_FLAG_TSYNC) {
+        cx.thread.seccomp_sync_threads();
+    }
+    Ok(listener.map_or(0, |fd| fd as u64))
 }
 
 /// Tells if `action` is an action that the kernel knows, for `SECCOMP_GET_ACTION_AVAIL`.

@@ -30,6 +30,8 @@ mod futex;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod info;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod memfd;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod mm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod mount;

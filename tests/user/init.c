@@ -1239,6 +1239,30 @@ static void test_seccomp(void)
 	      syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == -1 && errno == EOPNOTSUPP);
 }
 
+static void test_memfd(void)
+{
+	char buf[64] = {0};
+	char path[32];
+	int fd = (int)syscall(SYS_memfd_create, "rk", MFD_CLOEXEC);
+
+	check("memfd_create", fd >= 0 && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+	check("a memfd keeps its data", write(fd, "data", 4) == 4 && lseek(fd, 0, SEEK_SET) == 0 &&
+	      read(fd, buf, 4) == 4 && !strcmp(buf, "data"));
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+	memset(buf, 0, sizeof(buf));
+	mount("proc", "/proc", "proc", 0, NULL);
+	check("/proc/self/fd shows the name of a memfd",
+	      readlink(path, buf, sizeof(buf) - 1) > 0 && !strncmp(buf, "/memfd:rk", 9));
+	umount("/proc");
+	close(fd);
+	errno = 0;
+	check("memfd_create with an unknown flag gives EINVAL",
+	      syscall(SYS_memfd_create, "rk", 0x100) == -1 && errno == EINVAL);
+	errno = 0;
+	check("unshare of the PID name space gives EINVAL", unshare(CLONE_NEWPID) == -1 && errno == EINVAL);
+	check("unshare of the file table", unshare(CLONE_FILES | CLONE_FS) == 0);
+}
+
 static void test_mount(void)
 {
 	struct statfs st;
@@ -1538,6 +1562,7 @@ int main(int argc, char **argv)
 	test_ptrace();
 	test_mount();
 	test_proc();
+	test_memfd();
 	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();

@@ -14,6 +14,7 @@ rk-abi.workspace = true
 rk-drv-mem.workspace = true
 rk-drv-tty.workspace = true
 rk-frame.workspace = true
+rk-fs-tmpfs.workspace = true
 rk-mm.workspace = true
 rk-proc.workspace = true
 rk-vfs.workspace = true

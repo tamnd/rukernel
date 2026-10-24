@@ -113,6 +113,7 @@ dependencies = [
  "rk-drv-mem",
  "rk-drv-tty",
  "rk-frame",
+ "rk-fs-tmpfs",
  "rk-mm",
  "rk-proc",
  "rk-vfs",

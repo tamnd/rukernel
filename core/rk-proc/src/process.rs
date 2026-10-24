@@ -188,6 +188,23 @@ pub struct Thread {
     seccomp: SpinLock<seccomp::Seccomp>,
     /// The no_new_privs bit of `PR_SET_NO_NEW_PRIVS`.
     no_new_privs: AtomicBool,
+    /// The thread waits, and only a fatal signal stops the wait. `/proc` shows the state `D`.
+    killable_wait: AtomicBool,
+    /// The system call that the thread makes, for `/proc/PID/syscall`.
+    syscall: SpinLock<SyscallInfo>,
+}
+
+/// The system call that a thread makes, as `/proc/PID/syscall` shows it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyscallInfo {
+    /// The number of the call, or -1 if the thread is not in a system call.
+    pub nr: i64,
+    /// The six arguments.
+    pub args: [u64; 6],
+    /// The stack pointer of user mode.
+    pub sp: u64,
+    /// The instruction pointer of user mode.
+    pub pc: u64,
 }
 
 /// The wait of the parent of a `vfork` child. The parent waits until the child calls `execve` or
@@ -361,6 +378,11 @@ impl Process {
     /// The file system context. A zombie has none.
     pub fn fs(&self) -> Option<SharedFs> {
         self.fs.lock().clone()
+    }
+
+    /// Puts a new file system context in the process, for `unshare(CLONE_FS)`.
+    pub fn set_fs(&self, fs: SharedFs) {
+        *self.fs.lock() = Some(fs);
     }
 
     /// Tells if the process ended and waits for its parent.
@@ -648,6 +670,41 @@ impl Thread {
         self.restart.lock().take()
     }
 
+    /// Tells if a fatal signal is pending: the group exits, or a signal that the thread does not
+    /// block has the default action that ends the process. A wait that only a fatal signal stops
+    /// tests this, as `fatal_signal_pending` of Linux does.
+    pub fn fatal_signal_pending(&self) -> bool {
+        if self.is_killed() {
+            return true;
+        }
+        let pending = self.pending().without(self.blocked());
+        let shared = self.process.signals.lock();
+        (1..=crate::signal::NSIG).any(|sig| {
+            pending.contains(sig)
+                && (sig == SIGKILL || shared.actions[sig as usize - 1].is_fatal(sig))
+        }) && !self.is_traced()
+    }
+
+    /// Tells if the thread is in a wait that only a fatal signal stops.
+    pub fn in_killable_wait(&self) -> bool {
+        self.killable_wait.load(Ordering::Acquire)
+    }
+
+    /// Sets or clears the mark of a wait that only a fatal signal stops.
+    pub fn set_killable_wait(&self, on: bool) {
+        self.killable_wait.store(on, Ordering::Release);
+    }
+
+    /// The system call that the thread makes.
+    pub fn syscall_info(&self) -> SyscallInfo {
+        *self.syscall.lock()
+    }
+
+    /// Sets the system call that the thread makes, at the entry and at the exit of each call.
+    pub fn set_syscall_info(&self, info: SyscallInfo) {
+        *self.syscall.lock() = info;
+    }
+
     /// Tells if the thread must stop, because its group exits.
     pub fn is_killed(&self) -> bool {
         self.killed.load(Ordering::Acquire)
@@ -844,6 +901,8 @@ impl Thread {
             seccomp_mode: AtomicU32::new(0),
             seccomp: SpinLock::new(seccomp::Seccomp::default()),
             no_new_privs: AtomicBool::new(false),
+            killable_wait: AtomicBool::new(false),
+            syscall: SpinLock::new(SyscallInfo { nr: -1, ..SyscallInfo::default() }),
         })
     }
 }
@@ -1229,6 +1288,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let thread_status = process.group_exit().unwrap_or(status);
     ptrace::thread_exited(thread, thread_status);
     TABLE.lock().threads.remove(&thread.tid);
+    thread.release_seccomp();
     let last = {
         let mut s = process.state.lock();
         s.threads.retain(|t| t.tid != thread.tid);
