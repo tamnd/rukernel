@@ -332,12 +332,61 @@ static void test_others(void)
 										    ETIMEDOUT);
 }
 
+#define MANY 1000
+
+static pthread_barrier_t many_barrier;
+static int started;
+
+static void *many(void *arg)
+{
+	__atomic_add_fetch(&started, 1, __ATOMIC_SEQ_CST);
+	pthread_barrier_wait(&many_barrier);
+	return arg;
+}
+
+/* Gives the value of the Threads line of /proc/self/status. */
+static int proc_threads(void)
+{
+	char line[256];
+	int n = -1;
+	FILE *f = fopen("/proc/self/status", "r");
+	if (!f)
+		return -1;
+	while (fgets(line, sizeof(line), f))
+		if (sscanf(line, "Threads: %d", &n) == 1)
+			break;
+	fclose(f);
+	return n;
+}
+
+static void test_many(void)
+{
+	static pthread_t t[MANY];
+	int ok = 1;
+
+	pthread_barrier_init(&many_barrier, NULL, MANY + 1);
+	for (long i = 0; i < MANY; i++)
+		ok &= pthread_create(&t[i], NULL, many, (void *)i) == 0;
+	check("1000 threads start", ok);
+	while (__atomic_load_n(&started, __ATOMIC_SEQ_CST) < MANY)
+		sched_yield();
+	check("/proc/self/status counts 1001 threads", proc_threads() == MANY + 1);
+	pthread_barrier_wait(&many_barrier);
+	for (long i = 0; i < MANY; i++) {
+		void *ret;
+		ok &= pthread_join(t[i], &ret) == 0 && ret == (void *)i;
+	}
+	check("1000 threads stop and each gives its value", ok);
+	check("/proc/self/status counts 1 thread", proc_threads() == 1);
+}
+
 int main(void)
 {
 	test_mutexes();
 	test_robust();
 	test_conds();
 	test_others();
+	test_many();
 	printf("nptl: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }

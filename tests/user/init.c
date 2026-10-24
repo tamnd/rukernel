@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <linux/futex.h>
+#include <linux/sched.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -641,6 +642,62 @@ static void test_locks(void)
 	pthread_mutex_unlock(&pi);
 }
 
+#define MANY 1000
+
+static pthread_barrier_t many_barrier;
+
+static void *many(void *arg)
+{
+	pthread_barrier_wait(&many_barrier);
+	return arg;
+}
+
+static void test_clone3(void)
+{
+	struct clone_args args;
+	char big[128];
+
+	memset(&args, 0, sizeof(args));
+	args.exit_signal = SIGCHLD;
+	long pid = syscall(SYS_clone3, &args, sizeof(args));
+	if (pid == 0)
+		_exit(5);
+	int status = 0;
+	check("clone3 makes a child process", pid > 0 && waitpid(pid, &status, 0) == pid &&
+						     WIFEXITED(status) && WEXITSTATUS(status) == 5);
+	check("clone3 with a short struct gives EINVAL",
+	      syscall(SYS_clone3, &args, 32) == -1 && errno == EINVAL);
+	memset(big, 0, sizeof(big));
+	memcpy(big, &args, sizeof(args));
+	big[sizeof(big) - 1] = 1;
+	check("clone3 with an unknown field gives E2BIG",
+	      syscall(SYS_clone3, big, sizeof(big)) == -1 && errno == E2BIG);
+	args.stack_size = 4096;
+	check("clone3 with a stack size and no stack gives EINVAL",
+	      syscall(SYS_clone3, &args, sizeof(args)) == -1 && errno == EINVAL);
+	args.stack_size = 0;
+	args.flags = CLONE_THREAD | CLONE_SIGHAND | CLONE_VM;
+	check("clone3 of a thread with an exit signal gives EINVAL",
+	      syscall(SYS_clone3, &args, sizeof(args)) == -1 && errno == EINVAL);
+
+	pthread_t t[MANY];
+	pthread_attr_t a;
+	int ok = 1;
+	pthread_attr_init(&a);
+	pthread_attr_setstacksize(&a, 16384);
+	pthread_barrier_init(&many_barrier, NULL, MANY + 1);
+	for (long i = 0; i < MANY; i++)
+		ok &= pthread_create(&t[i], &a, many, (void *)i) == 0;
+	check("1000 threads start", ok);
+	pthread_barrier_wait(&many_barrier);
+	for (long i = 0; i < MANY; i++) {
+		void *ret;
+		ok &= pthread_join(t[i], &ret) == 0 && ret == (void *)i;
+	}
+	check("1000 threads stop and each gives its value", ok);
+	pthread_attr_destroy(&a);
+}
+
 static void test_mount(void)
 {
 	struct statfs st;
@@ -757,6 +814,7 @@ int main(int argc, char **argv)
 	test_pipes();
 	test_threads();
 	test_locks();
+	test_clone3();
 	test_mount();
 	test_proc();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)

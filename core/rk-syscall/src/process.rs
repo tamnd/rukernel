@@ -4,14 +4,17 @@ use crate::cx::{Cx, SysResult};
 use crate::run::{random16, start_thread};
 use rk_abi::Errno;
 use rk_abi::native::sched::{
-    CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_FILES, CLONE_FS, CLONE_PARENT,
-    CLONE_PARENT_SETTID, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    CLONE_ARGS_SIZE_VER0, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_CLEAR_SIGHAND,
+    CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_INTO_CGROUP, CLONE_PARENT, CLONE_PARENT_SETTID,
+    CLONE_PIDFD, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
 };
 use rk_abi::native::signal::SIGCHLD;
+use rk_abi::native::types::CloneArgs;
 use rk_abi::native::wait::{WCONTINUED, WNOHANG, WUNTRACED};
 use rk_frame::task::yield_now;
 use rk_proc::exec::{ExecArgs, exec};
 use rk_proc::{ForkShare, Pid, Process, VforkDone, WaitStatus, WaitTarget};
+use zerocopy::FromZeros;
 
 /// The number of signals. Linux names it `_NSIG`.
 const NSIG: u64 = 64;
@@ -44,6 +47,65 @@ pub(crate) fn clone(
     ctid: u64,
     tls: u64,
 ) -> SysResult {
+    let args = CloneArgs {
+        flags: flags & !CSIGNAL,
+        exit_signal: flags & CSIGNAL,
+        stack,
+        parent_tid: ptid,
+        child_tid: ctid,
+        tls,
+        ..CloneArgs::new_zeroed()
+    };
+    // `clone` takes the low 32 bits of the flags. The bits above are only for `clone3`.
+    do_clone(cx, &CloneArgs { flags: args.flags & 0xffff_ffff, ..args }, stack)
+}
+
+/// The largest `struct clone_args` that `clone3` reads. Linux gives `E2BIG` for a larger one.
+const CLONE_ARGS_MAX: u64 = 4096;
+
+/// `clone3`, as `copy_clone_args_from_user` and `clone3_args_valid` of Linux check it. The stack
+/// of `clone3` is the lowest address and a size, and the new thread starts at the top. The PID
+/// file descriptor, the cgroup and `set_tid` are not in R2, so they give `EINVAL`.
+pub(crate) fn clone3(cx: &Cx<'_>, uargs: u64, size: u64) -> SysResult {
+    if size > CLONE_ARGS_MAX {
+        return Err(Errno::E2BIG);
+    }
+    if size < CLONE_ARGS_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    let known = size_of::<CloneArgs>();
+    let mut bytes = alloc::vec![0u8; (size as usize).max(known)];
+    cx.vm()?.read(uargs as usize, &mut bytes[..size as usize])?;
+    if bytes[known..].iter().any(|&b| b != 0) {
+        return Err(Errno::E2BIG);
+    }
+    let args = <CloneArgs as zerocopy::FromBytes>::read_from_bytes(&bytes[..known])
+        .map_err(|_| Errno::EINVAL)?;
+    let flags = args.flags;
+    let unsupported = CLONE_PIDFD | CLONE_INTO_CGROUP;
+    if flags & (CLONE_DETACHED | CSIGNAL | unsupported) != 0
+        || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND) != 0
+        || args.set_tid != 0
+        || args.set_tid_size != 0
+        || args.exit_signal >= NSIG
+        || (flags & CLONE_SIGHAND != 0 && flags & CLONE_CLEAR_SIGHAND != 0)
+        || (flags & (CLONE_THREAD | CLONE_PARENT) != 0 && args.exit_signal != 0)
+        || ((args.stack == 0) != (args.stack_size == 0))
+    {
+        return Err(Errno::EINVAL);
+    }
+    let top = if args.stack == 0 {
+        0
+    } else {
+        args.stack.checked_add(args.stack_size).ok_or(Errno::EINVAL)?
+    };
+    do_clone(cx, &args, top)
+}
+
+/// Makes a new thread or process for `clone` and `clone3`. `stack` is the stack pointer of the
+/// new thread, or 0 for the stack pointer of the caller.
+fn do_clone(cx: &Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
+    let flags = args.flags;
     if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 {
         return Err(Errno::EINVAL);
     }
@@ -57,11 +119,15 @@ pub(crate) fn clone(
             vm: flags & CLONE_VM != 0,
             files: flags & CLONE_FILES != 0,
             fs: flags & CLONE_FS != 0,
-            exit_signal: (flags & CSIGNAL) as u32,
+            exit_signal: args.exit_signal as u32,
             parent: flags & CLONE_PARENT != 0,
         };
         rk_proc::fork(cx.thread, share)?
     };
+    if flags & CLONE_CLEAR_SIGHAND != 0 {
+        // A handler goes back to the default action, and an ignored signal stays ignored.
+        thread.process().reset_actions();
+    }
     let tid = thread.tid();
     let mut regs = *cx.regs;
     regs.set_syscall_return(0);
@@ -69,18 +135,18 @@ pub(crate) fn clone(
         regs.regs_mut().rsp = stack;
     }
     if flags & CLONE_SETTLS != 0 {
-        regs.set_fs_base(tls);
+        regs.set_fs_base(args.tls);
     }
     if flags & CLONE_PARENT_SETTID != 0 {
-        cx.write_val(ptid, &tid)?;
+        cx.write_val(args.parent_tid, &tid)?;
     }
     if flags & CLONE_CHILD_SETTID != 0
         && let Some(vm) = thread.process().vm()
     {
-        vm.write(ctid as usize, &tid.to_ne_bytes())?;
+        vm.write(args.child_tid as usize, &tid.to_ne_bytes())?;
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
-        thread.set_clear_child_tid(ctid as usize);
+        thread.set_clear_child_tid(args.child_tid as usize);
     }
     let vfork = (flags & CLONE_VFORK != 0).then(VforkDone::new);
     if let Some(done) = &vfork {
