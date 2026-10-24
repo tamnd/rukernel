@@ -1,3 +1,4 @@
+use crate::bpf;
 use crate::elf::{self, ElfType, SegmentFlags};
 use crate::signal::{
     AltStack, CLD_EXITED, DefaultAction, Pending, SEGV_MAPERR, SI_QUEUE, SI_USER, SIG_IGN,
@@ -249,4 +250,91 @@ fn altstack_flags() {
     assert!(!s.contains(0x1000) && !s.contains(0x3001));
     assert_eq!(s.flags_at(0x2000), SS_ONSTACK);
     assert_eq!(s.flags_at(0x8000), 0);
+}
+
+/// Makes an instruction.
+const fn insn(code: u16, jt: u8, jf: u8, k: u32) -> bpf::Insn {
+    bpf::Insn { code, jt, jf, k }
+}
+
+/// A filter that gives `ERRNO | 5` for the system call 39 and allows the others.
+const GETPID_ERRNO: [bpf::Insn; 4] = [
+    insn(0x20, 0, 0, 0),
+    insn(0x15, 0, 1, 39),
+    insn(0x06, 0, 0, 0x0005_0005),
+    insn(0x06, 0, 0, 0x7fff_0000),
+];
+
+#[test]
+fn bpf_check_accepts_a_filter() {
+    assert_eq!(bpf::check(&GETPID_ERRNO), Ok(()));
+}
+
+#[test]
+fn bpf_check_rejects_bad_programs() {
+    let ret = insn(0x06, 0, 0, 0);
+    assert_eq!(bpf::check(&[]), Err(Errno::EINVAL));
+    assert_eq!(bpf::check(&vec![ret; bpf::BPF_MAXINSNS + 1]), Err(Errno::EINVAL));
+    // The last instruction is not a return.
+    assert_eq!(bpf::check(&[insn(0x20, 0, 0, 0)]), Err(Errno::EINVAL));
+    // A load that is not aligned, and a load after the end of `seccomp_data`.
+    assert_eq!(bpf::check(&[insn(0x20, 0, 0, 2), ret]), Err(Errno::EINVAL));
+    assert_eq!(bpf::check(&[insn(0x20, 0, 0, 64), ret]), Err(Errno::EINVAL));
+    // A jump after the end.
+    assert_eq!(bpf::check(&[insn(0x15, 1, 0, 0), ret]), Err(Errno::EINVAL));
+    assert_eq!(bpf::check(&[insn(0x05, 0, 0, 1), ret]), Err(Errno::EINVAL));
+    // A division by 0, a shift of 32 and a word of scratch memory after the end.
+    assert_eq!(bpf::check(&[insn(0x34, 0, 0, 0), ret]), Err(Errno::EINVAL));
+    assert_eq!(bpf::check(&[insn(0x64, 0, 0, 32), ret]), Err(Errno::EINVAL));
+    assert_eq!(bpf::check(&[insn(0x02, 0, 0, 16), ret]), Err(Errno::EINVAL));
+    // `BPF_LD | BPF_B | BPF_ABS` and `BPF_ALU | BPF_MOD` are not for `seccomp`.
+    assert_eq!(bpf::check(&[insn(0x30, 0, 0, 0), ret]), Err(Errno::EINVAL));
+    assert_eq!(bpf::check(&[insn(0x94, 0, 0, 3), ret]), Err(Errno::EINVAL));
+}
+
+#[test]
+fn bpf_run_gives_the_action() {
+    let data = |nr: i32| bpf::seccomp_data(nr, 0xc000_003e, 0x1000, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(bpf::run(&GETPID_ERRNO, &data(39)), 0x0005_0005);
+    assert_eq!(bpf::run(&GETPID_ERRNO, &data(0)), 0x7fff_0000);
+    // A = arch; A += 2; mem[3] = A; X = mem[3]; A = X; return A.
+    let prog = [
+        insn(0x20, 0, 0, 4),
+        insn(0x04, 0, 0, 2),
+        insn(0x02, 0, 0, 3),
+        insn(0x61, 0, 0, 3),
+        insn(0x87, 0, 0, 0),
+        insn(0x16, 0, 0, 0),
+    ];
+    assert_eq!(bpf::check(&prog), Ok(()));
+    assert_eq!(bpf::run(&prog, &data(0)), 0xc000_0040);
+    // The low word of the sixth argument, and the length of `seccomp_data`.
+    assert_eq!(bpf::run(&[insn(0x20, 0, 0, 56), insn(0x16, 0, 0, 0)], &data(0)), 6);
+    assert_eq!(bpf::run(&[insn(0x80, 0, 0, 0), insn(0x16, 0, 0, 0)], &data(0)), 64);
+    // A division by X = 0 ends the program with 0.
+    let div = [insn(0x00, 0, 0, 7), insn(0x3c, 0, 0, 0), insn(0x06, 0, 0, 9)];
+    assert_eq!(bpf::run(&div, &data(0)), 0);
+}
+
+#[test]
+fn bpf_insn_bytes() {
+    let i = insn(0x15, 1, 2, 0x1234_5678);
+    assert_eq!(bpf::Insn::from_bytes(&i.to_bytes()), i);
+    assert_eq!(bpf::from_bytes(&[i.to_bytes(), i.to_bytes()].concat()), vec![i, i]);
+}
+
+#[test]
+fn siginfo_of_seccomp_and_of_a_trace_stop() {
+    let info = SigInfo::seccomp(39, 0xc000_003e, 0x40_1000, 5);
+    let b = info.to_bytes();
+    assert_eq!(&b[0..4], &31u32.to_ne_bytes());
+    assert_eq!(&b[4..8], &5i32.to_ne_bytes());
+    assert_eq!(&b[8..12], &1i32.to_ne_bytes());
+    assert_eq!(&b[16..24], &0x40_1000u64.to_ne_bytes());
+    assert_eq!(&b[24..28], &39i32.to_ne_bytes());
+    assert_eq!(&b[28..32], &0xc000_003eu32.to_ne_bytes());
+    assert_eq!(SigInfo::from_bytes(&b), info);
+    // The stop of `PTRACE_EVENT_SECCOMP` holds the ID of the tracee.
+    let stop = SigInfo::new(5, 5 | 7 << 8, 48);
+    assert_eq!(&stop.to_bytes()[16..20], &48u32.to_ne_bytes());
 }

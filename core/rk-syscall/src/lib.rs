@@ -44,6 +44,8 @@ mod ptrace;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod run;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod seccomp;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod table;

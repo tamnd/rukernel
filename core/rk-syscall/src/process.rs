@@ -372,7 +372,8 @@ pub(crate) fn getsid(cx: &Cx<'_>, pid: u64) -> SysResult {
     Ok(u64::from(find(cx, pid)?.sid()))
 }
 
-pub(crate) fn prctl(cx: &Cx<'_>, option: u64, arg2: u64) -> SysResult {
+pub(crate) fn prctl(cx: &Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
+    let arg2 = args[0];
     match option {
         PR_SET_NAME => {
             let name = cx.vm()?.read_cstr(arg2 as usize, 16).or_else(|e| {
@@ -406,7 +407,7 @@ pub(crate) fn prctl(cx: &Cx<'_>, option: u64, arg2: u64) -> SysResult {
             }
             Ok(0)
         }
-        _ => Err(Errno::EINVAL),
+        _ => crate::seccomp::prctl(cx, option, args),
     }
 }
 

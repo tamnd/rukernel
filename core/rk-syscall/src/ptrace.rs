@@ -12,7 +12,9 @@ use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::signal::SIGSTOP;
 use rk_frame::user::{FpuState, USER_END};
-use rk_proc::ptrace::{self, PTRACE_O_MASK, Ptrace, Resume, Stop, StopKind};
+use rk_proc::ptrace::{
+    self, PTRACE_O_MASK, PTRACE_O_SUSPEND_SECCOMP, Ptrace, Resume, Stop, StopKind,
+};
 use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo, SigSet};
 use rk_proc::{Pid, Process, Thread};
 use zerocopy::IntoBytes;
@@ -46,6 +48,8 @@ const PTRACE_INTERRUPT: u64 = 0x4207;
 const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
 const PTRACE_SETSIGMASK: u64 = 0x420b;
+const PTRACE_SECCOMP_GET_FILTER: u64 = 0x420c;
+const PTRACE_SECCOMP_GET_METADATA: u64 = 0x420d;
 const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
 
 /// The register sets of `PTRACE_GETREGSET`, from include/uapi/linux/elf.h.
@@ -86,6 +90,27 @@ const SYSCALL_INFO_EXIT_SIZE: usize = 33;
 /// The largest errno that a system call gives.
 const MAX_ERRNO: i64 = 4095;
 
+/// `SECCOMP_FILTER_FLAG_LOG` in `struct seccomp_metadata`.
+const SECCOMP_FILTER_FLAG_LOG: u64 = 1 << 1;
+
+/// Checks that the tracer can set `PTRACE_O_SUSPEND_SECCOMP`: a tracer in a `seccomp` mode
+/// cannot, as in Linux.
+fn check_suspend_seccomp(cx: &Cx<'_>, options: u64) -> Result<(), Errno> {
+    if options & u64::from(PTRACE_O_SUSPEND_SECCOMP) != 0 && cx.thread.seccomp_mode() != 0 {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// Checks that the tracer can read the filters of a tracee: a tracer in a `seccomp` mode cannot,
+/// as in Linux.
+fn check_seccomp_access(cx: &Cx<'_>) -> Result<(), Errno> {
+    if cx.thread.seccomp_mode() != 0 {
+        return Err(Errno::EACCES);
+    }
+    Ok(())
+}
+
 pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) -> SysResult {
     let pid = pid as u32 as Pid;
     match request {
@@ -100,6 +125,7 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             if addr != 0 || data & !u64::from(PTRACE_O_MASK) != 0 {
                 return Err(Errno::EIO);
             }
+            check_suspend_seccomp(cx, data)?;
             let thread = rk_proc::find_thread(pid).ok_or(Errno::ESRCH)?;
             ptrace::attach(cx.process(), &thread, true, data as u32)?;
             return Ok(0);
@@ -207,6 +233,7 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             if data & !u64::from(PTRACE_O_MASK) != 0 {
                 return Err(Errno::EINVAL);
             }
+            check_suspend_seccomp(cx, data)?;
             ptrace::with_stopped(tracer, pid, |pt, _| {
                 pt.options = data as u32;
                 Ok(())
@@ -250,6 +277,32 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             let thread = ptrace::stopped_tracee(tracer, pid)?;
             thread.set_blocked(SigSet(set));
             Ok(0)
+        }
+        PTRACE_SECCOMP_GET_FILTER => {
+            check_seccomp_access(cx)?;
+            let filter = ptrace::stopped_tracee(tracer, pid)?.seccomp_filter(addr)?;
+            if data != 0 {
+                let bytes: alloc::vec::Vec<u8> =
+                    filter.prog().iter().flat_map(|i| i.to_bytes()).collect();
+                cx.write_bytes(data, &bytes)?;
+            }
+            Ok(filter.prog().len() as u64)
+        }
+        PTRACE_SECCOMP_GET_METADATA => {
+            check_seccomp_access(cx)?;
+            // `struct seccomp_metadata`: the index of the filter, and its flags.
+            let size = (addr as usize).min(16);
+            if size < 8 {
+                return Err(Errno::EINVAL);
+            }
+            let off: u64 = cx.read_val(data)?;
+            let filter = ptrace::stopped_tracee(tracer, pid)?.seccomp_filter(off)?;
+            let flags = if filter.log() { SECCOMP_FILTER_FLAG_LOG } else { 0 };
+            let mut md = [0u8; 16];
+            md[..8].copy_from_slice(&off.to_ne_bytes());
+            md[8..].copy_from_slice(&flags.to_ne_bytes());
+            cx.write_bytes(data, &md[..size])?;
+            Ok(size as u64)
         }
         PTRACE_GET_SYSCALL_INFO => {
             let info = ptrace::with_stopped(tracer, pid, |_, stop| Ok(syscall_info(stop)))?;

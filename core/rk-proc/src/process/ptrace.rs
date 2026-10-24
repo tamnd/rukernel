@@ -28,6 +28,8 @@ pub const PTRACE_EVENT_EXEC: u32 = 4;
 pub const PTRACE_EVENT_VFORK_DONE: u32 = 5;
 /// The tracee ends.
 pub const PTRACE_EVENT_EXIT: u32 = 6;
+/// The stop for `SECCOMP_RET_TRACE`.
+pub const PTRACE_EVENT_SECCOMP: u32 = 7;
 /// The stop of `PTRACE_INTERRUPT`, and the group stop of a tracee of `PTRACE_SEIZE`.
 pub const PTRACE_EVENT_STOP: u32 = 128;
 
@@ -46,7 +48,7 @@ pub const PTRACE_O_TRACEVFORKDONE: u32 = 1 << PTRACE_EVENT_VFORK_DONE;
 /// Stop at the exit.
 pub const PTRACE_O_TRACEEXIT: u32 = 1 << PTRACE_EVENT_EXIT;
 /// Stop at a `SECCOMP_RET_TRACE` filter. rukernel has no seccomp yet.
-pub const PTRACE_O_TRACESECCOMP: u32 = 1 << 7;
+pub const PTRACE_O_TRACESECCOMP: u32 = 1 << PTRACE_EVENT_SECCOMP;
 /// Send `SIGKILL` to the tracee when the tracer ends.
 pub const PTRACE_O_EXITKILL: u32 = 1 << 20;
 /// Do not run the seccomp filters of the tracee.
@@ -242,6 +244,12 @@ impl Thread {
     /// Tells if the tracer asked for a single step.
     pub fn single_stepping(&self) -> bool {
         self.ptrace.lock().as_ref().is_some_and(|p| p.step)
+    }
+
+    /// Tells if the tracer set `PTRACE_O_SUSPEND_SECCOMP`: the `seccomp` mode of the thread does
+    /// not check its system calls.
+    pub fn seccomp_suspended(&self) -> bool {
+        self.ptrace.lock().as_ref().is_some_and(|p| p.options & PTRACE_O_SUSPEND_SECCOMP != 0)
     }
 
     /// Tells if the tracer asked for the stop at `event`.
@@ -465,11 +473,14 @@ pub fn stop(
             return None;
         }
         let sysgood = if pt.options & PTRACE_O_TRACESYSGOOD != 0 { 0x80 } else { 0 };
+        // The signal information of a stop that is not a signal has the ID of the tracee, as
+        // `ptrace_do_notify` of Linux gives it.
+        let tid = thread.tid;
         let (status, info) = match kind {
             StopKind::Signal => (WaitStatus::stopped(sig), info),
             StopKind::Group if pt.seized => {
                 let code = (PTRACE_EVENT_STOP << 8 | sig) as i32;
-                (WaitStatus::trapped(sig, PTRACE_EVENT_STOP), Some(SigInfo::new(sig, code, 0)))
+                (WaitStatus::trapped(sig, PTRACE_EVENT_STOP), Some(SigInfo::new(sig, code, tid)))
             }
             StopKind::Group => (WaitStatus::stopped(sig), None),
             StopKind::SyscallEntry | StopKind::SyscallExit => {
@@ -479,11 +490,11 @@ pub fn stop(
                     EVENTMSG_SYSCALL_EXIT
                 };
                 let code = SIGTRAP | sysgood;
-                (WaitStatus::stopped(code), Some(SigInfo::new(SIGTRAP, code as i32, 0)))
+                (WaitStatus::stopped(code), Some(SigInfo::new(SIGTRAP, code as i32, tid)))
             }
             StopKind::Event(event) => {
                 let code = (event << 8 | SIGTRAP) as i32;
-                (WaitStatus::trapped(SIGTRAP, event), Some(SigInfo::new(SIGTRAP, code, 0)))
+                (WaitStatus::trapped(SIGTRAP, event), Some(SigInfo::new(SIGTRAP, code, tid)))
             }
         };
         pt.stop = Some(Stop {
@@ -528,16 +539,22 @@ pub fn stop(
 }
 
 /// Stops the traced `thread` at the event `event` with the message `message`, if the tracer
-/// asked for the event.
-pub fn event(thread: &Thread, regs: &mut UserContext, orig_rax: u64, event: u32, message: u64) {
+/// asked for the event. Gives what the tracer gave, or `None` if the thread did not stop.
+pub fn event(
+    thread: &Thread,
+    regs: &mut UserContext,
+    orig_rax: u64,
+    event: u32,
+    message: u64,
+) -> Option<Resumed> {
     {
         let mut guard = thread.ptrace.lock();
         match guard.as_mut() {
             Some(pt) if pt.options & (1 << event) != 0 => pt.message = message,
-            _ => return,
+            _ => return None,
         }
     }
-    stop(thread, regs, orig_rax, StopKind::Event(event), SIGTRAP, None);
+    stop(thread, regs, orig_rax, StopKind::Event(event), SIGTRAP, None)
 }
 
 /// The stop of a traced thread after `execve`. `old_tid` was the thread ID before the call.

@@ -194,7 +194,11 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
         match reason {
             ReturnReason::Syscall => {
                 COUNT.fetch_add(1, Ordering::Relaxed);
-                let Some(number) = syscall_entry(thread, regs) else { continue };
+                let number = match syscall_entry(thread, regs) {
+                    Entry::Run(number) => number,
+                    Entry::GroupExit => continue,
+                    Entry::ThreadExit(status) => break status,
+                };
                 if number != NO_SYSCALL {
                     let mut cx = Cx { thread, regs, exit: None, number };
                     table::dispatch(&mut cx);
@@ -228,20 +232,30 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
     }
 }
 
+/// What the entry to a system call gives.
+pub(crate) enum Entry {
+    /// Run the system call with this number, or skip it if the number is `NO_SYSCALL`.
+    Run(u64),
+    /// The group exits.
+    GroupExit,
+    /// The thread exits with this status, for `seccomp`.
+    ThreadExit(WaitStatus),
+}
+
 /// Starts a system call: RAX gets `-ENOSYS`, and a tracer of `PTRACE_SYSCALL` sees the entry and
-/// can change the number. Gives the number, `NO_SYSCALL` if the tracer cancelled the call, or
-/// `None` if the group exits.
-fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Option<u64> {
-    let number = regs.syscall_number();
+/// can change the number. Then the `seccomp` mode of the thread checks the call, as
+/// `syscall_trace_enter` of Linux does.
+fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Entry {
+    let mut number = regs.syscall_number();
     regs.set_syscall_return(Errno::ENOSYS.to_syscall_return() as u64);
-    if !thread.syscall_traced() {
-        return Some(number);
+    if thread.syscall_traced() {
+        let r = ptrace::stop(thread, regs, number, StopKind::SyscallEntry, SIGTRAP, None);
+        if thread.is_killed() {
+            return Entry::GroupExit;
+        }
+        number = r.map_or(number, |r| r.orig_rax);
     }
-    let r = ptrace::stop(thread, regs, number, StopKind::SyscallEntry, SIGTRAP, None);
-    if thread.is_killed() {
-        return None;
-    }
-    Some(r.map_or(number, |r| r.orig_rax))
+    crate::seccomp::check(thread, regs, number)
 }
 
 /// Ends a system call: a tracer of `PTRACE_SYSCALL` sees the return. A thread in a single step

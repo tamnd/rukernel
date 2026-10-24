@@ -57,6 +57,8 @@ pub const BUS_ADRERR: i32 = 2;
 pub const TRAP_BRKPT: i32 = 1;
 /// A single step.
 pub const TRAP_TRACE: i32 = 2;
+/// `SIGSYS` from a filter of `seccomp`.
+pub const SYS_SECCOMP: i32 = 1;
 
 /// The signals that the kernel gives first, because the program caused them. Linux names this
 /// set `SYNCHRONOUS_MASK`.
@@ -209,7 +211,9 @@ pub struct SigInfo {
     pub uid: u32,
     /// The exit code or the signal of the child, for `SIGCHLD`.
     pub status: i32,
-    /// The address of the fault, for a signal that an exception caused.
+    /// The address of the fault, for a signal that an exception caused. For `SIGSYS` from
+    /// `seccomp`, the address of the system call. `status` is then the number of the system
+    /// call, and `uid` is the architecture.
     pub addr: u64,
     /// The `si_value` that `sigqueue` or a timer gives.
     pub value: u64,
@@ -229,9 +233,40 @@ impl SigInfo {
         Self { signo, code, errno: 0, pid: 0, uid: 0, status: 0, addr, value: 0 }
     }
 
-    /// Tells if the union of `siginfo_t` holds the fault address.
+    /// Tells if the union of `siginfo_t` holds the fault address. Only the codes of the faults
+    /// of each signal have this layout, as `siginfo_layout` of Linux tells. The code of a stop
+    /// of `ptrace` is larger, and the union then holds the ID of the tracee.
     const fn is_fault(&self) -> bool {
-        matches!(self.signo, SIGILL | SIGFPE | SIGSEGV | SIGBUS | SIGTRAP) && self.code > 0
+        let limit = match self.signo {
+            SIGILL => 11,
+            SIGFPE => 15,
+            SIGSEGV => 10,
+            SIGBUS => 5,
+            SIGTRAP => 6,
+            _ => 0,
+        };
+        self.code > 0 && self.code <= limit
+    }
+
+    /// The information of `SIGSYS` from `seccomp`: the system call `nr` of the architecture
+    /// `arch` at `ip`, with the data `errno` of the filter, as `force_sig_seccomp` of Linux gives
+    /// it.
+    pub const fn seccomp(nr: i32, arch: u32, ip: u64, errno: i32) -> Self {
+        Self {
+            signo: SIGSYS,
+            code: SYS_SECCOMP,
+            errno,
+            pid: 0,
+            uid: arch,
+            status: nr,
+            addr: ip,
+            value: 0,
+        }
+    }
+
+    /// Tells if the union of `siginfo_t` holds the system call of `seccomp`.
+    const fn is_seccomp(&self) -> bool {
+        self.signo == SIGSYS && self.code == SYS_SECCOMP
     }
 
     /// Tells if the union of `siginfo_t` holds the status of a child.
@@ -249,6 +284,12 @@ impl SigInfo {
         info.errno = word(4) as i32;
         if info.is_fault() {
             info.addr = u64::from_ne_bytes(long);
+            return info;
+        }
+        if info.is_seccomp() {
+            info.addr = u64::from_ne_bytes(long);
+            info.status = word(24) as i32;
+            info.uid = word(28);
             return info;
         }
         info.pid = word(16);
@@ -273,6 +314,10 @@ impl SigInfo {
         b[8..12].copy_from_slice(&self.code.to_ne_bytes());
         if self.is_fault() {
             b[16..24].copy_from_slice(&self.addr.to_ne_bytes());
+        } else if self.is_seccomp() {
+            b[16..24].copy_from_slice(&self.addr.to_ne_bytes());
+            b[24..28].copy_from_slice(&self.status.to_ne_bytes());
+            b[28..32].copy_from_slice(&self.uid.to_ne_bytes());
         } else {
             b[16..20].copy_from_slice(&self.pid.to_ne_bytes());
             b[20..24].copy_from_slice(&self.uid.to_ne_bytes());
