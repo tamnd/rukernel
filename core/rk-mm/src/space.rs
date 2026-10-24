@@ -88,6 +88,9 @@ pub const MMAP_MIN_ADDR: usize = 0x1_0000;
 pub const STACK_TOP: usize = USER_END;
 /// The size of the main stack area. The `RLIMIT_STACK` default of Linux is 8 MiB.
 pub const STACK_SIZE: usize = 8 << 20;
+/// The free bytes that an area that grows down keeps to the area below it. Linux names it
+/// `stack_guard_gap`, and its default is 256 pages.
+const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
 /// The most areas that an address space can have. Linux names it `vm.max_map_count`.
 pub const MAX_MAP_COUNT: usize = 65530;
 /// The range for `MAP_32BIT`, as in Linux on x86-64.
@@ -129,6 +132,8 @@ pub struct MmapRequest {
     pub locked: bool,
     /// `MAP_POPULATE`: give each page its frame now.
     pub populate: bool,
+    /// `MAP_GROWSDOWN`: a fault below the area makes the area larger. See [`Vma::grows_down`].
+    pub grows_down: bool,
     /// The file and the page aligned offset, or `None` for anonymous memory.
     pub file: Option<(FileRef, u64)>,
     /// What the area is for.
@@ -149,6 +154,7 @@ impl MmapRequest {
             may_write: true,
             locked: false,
             populate: false,
+            grows_down: false,
             file: None,
             kind: VmaKind::Normal,
         }
@@ -321,7 +327,7 @@ impl AddressSpace {
             shared: req.shared,
             may_write: req.may_write,
             locked,
-            grows_down: false,
+            grows_down: req.grows_down,
             backing,
             kind: req.kind,
         });
@@ -677,7 +683,12 @@ impl AddressSpace {
     /// file for a page that the file cannot give, such as a page past the end of the file. The
     /// kernel then sends `SIGBUS`.
     pub fn handle_fault(&self, addr: usize, access: Access) -> Result<(), Errno> {
-        let st = self.state.lock();
+        let mut st = self.state.lock();
+        // A fault below an area that grows down makes the area larger, up to the size of the
+        // main stack, as Linux does with the default `RLIMIT_STACK`.
+        if st.vmas.find(addr).is_none() && !st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE) {
+            return Err(Errno::EFAULT);
+        }
         let vma = st.vmas.find(addr).ok_or(Errno::EFAULT)?;
         let allowed = match access {
             Access::Read => vma.prot.read || vma.prot.write || vma.prot.exec,
