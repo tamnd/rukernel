@@ -153,6 +153,16 @@ jobs:
       - name: build the LTP tests
         if: steps.ltp.outputs.cache-hit != 'true'
         run: tools/ltp/build.sh ~/.cache/rk-ltp
+      # tools/kselftest/build.sh builds the kselftest programs in a container. The cache keeps
+      # them until the script changes.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: kselftest
+        with:
+          path: ~/.cache/rk-kselftest
+          key: kselftest-${{ hashFiles('tools/kselftest/build.sh') }}
+      - name: build the kselftest programs
+        if: steps.kselftest.outputs.cache-hit != 'true'
+        run: tools/kselftest/build.sh ~/.cache/rk-kselftest
       # tools/debug/build.sh installs gdb and strace for the alpine boot test.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: debug-tools
@@ -163,7 +173,7 @@ jobs:
         if: steps.debug-tools.outputs.cache-hit != 'true'
         run: tools/debug/build.sh ~/.cache/rk-debug-tools
       - name: boot tests
-        run: RK_LTP="$HOME/.cache/rk-ltp" RK_DEBUG_TOOLS="$HOME/.cache/rk-debug-tools" cargo xtask boot-test
+        run: RK_LTP="$HOME/.cache/rk-ltp" RK_KSELFTEST="$HOME/.cache/rk-kselftest" RK_DEBUG_TOOLS="$HOME/.cache/rk-debug-tools" cargo xtask boot-test
 
   # rk-abigen reads the pinned Linux tree and writes abi/ and core/rk-abi/src/generated/. This job
   # runs it again and fails if the output is not the same as the files in the tree, per
