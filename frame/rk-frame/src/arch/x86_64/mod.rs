@@ -76,9 +76,51 @@ fn interrupt(vector: u8) {
     }
 }
 
+/// Copies of memory that user code can write at the same time, such as the frames of user pages.
+/// One `rep movsb` or `rep stosb` does each copy. The compiler does not know the instruction, so it
+/// cannot assume that the memory does not change, and the CPU copies whole lines when it can.
+pub(crate) mod mem {
+    /// Copies `len` bytes from `src` to `dst`.
+    ///
+    /// # Safety
+    ///
+    /// The two ranges must be valid kernel memory, and they must not overlap.
+    pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) {
+        // SAFETY: the caller gives two valid ranges of `len` bytes. The ABI keeps the direction
+        // flag clear, so the copy goes up.
+        unsafe {
+            core::arch::asm!(
+                "rep movsb",
+                inout("rcx") len => _,
+                inout("rdi") dst => _,
+                inout("rsi") src => _,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Writes `len` zero bytes at `dst`.
+    ///
+    /// # Safety
+    ///
+    /// The range must be valid kernel memory.
+    pub(crate) unsafe fn zero(dst: *mut u8, len: usize) {
+        // SAFETY: as for `copy`.
+        unsafe {
+            core::arch::asm!(
+                "rep stosb",
+                inout("rcx") len => _,
+                inout("rdi") dst => _,
+                in("al") 0u8,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
 /// The timer values that the architecture independent code reads.
 pub(crate) mod timer {
-    pub(crate) use super::apic::{HZ, TICKS, TIMER_HZ, nanos};
+    pub(crate) use super::apic::{HZ, TICKS, TIMER_HZ, clock_ns, nanos, tsc_state};
 }
 
 /// Interrupt control on this CPU.

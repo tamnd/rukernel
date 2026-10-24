@@ -2,7 +2,7 @@
 
 use super::bitmap::FrameBitmap;
 use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
-use crate::arch::imp::paging;
+use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -148,19 +148,17 @@ impl Frame {
     /// Copies bytes from the frame at `offset` to `buf`.
     ///
     /// The frame can be mapped in user address spaces, and user code can write it at the same
-    /// time. Thus the copy reads each byte with a volatile access, and no Rust reference to the
-    /// contents of a frame exists.
+    /// time. Thus the copy uses the copy of the architecture, which the compiler cannot change,
+    /// and no Rust reference to the contents of a frame exists.
     ///
     /// # Panics
     ///
     /// If the bytes are not all in the frame.
     pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) {
         let p = self.byte_ptr(offset, buf.len());
-        for (i, b) in buf.iter_mut().enumerate() {
-            // SAFETY: the frame is mapped in the direct map, and the byte is in the frame. The
-            // read is volatile, as the frame is memory that user code can share.
-            *b = unsafe { p.add(i).read_volatile() };
-        }
+        // SAFETY: the frame is mapped in the direct map, and the bytes are in the frame. `buf` is
+        // not in a frame that this copy writes.
+        unsafe { mem::copy(buf.as_mut_ptr(), p, buf.len()) };
     }
 
     /// Copies `buf` to the frame at `offset`. A frame that is shared through an `Arc` is written
@@ -171,11 +169,9 @@ impl Frame {
     /// If the bytes are not all in the frame.
     pub fn write_bytes(&self, offset: usize, buf: &[u8]) {
         let p = self.byte_ptr(offset, buf.len());
-        for (i, &b) in buf.iter().enumerate() {
-            // SAFETY: as for `read_bytes`. No Rust reference to the contents exists, so the
-            // volatile write cannot change a value that safe code holds.
-            unsafe { p.add(i).write_volatile(b) };
-        }
+        // SAFETY: as for `read_bytes`. No Rust reference to the contents exists, so the write
+        // cannot change a value that safe code holds.
+        unsafe { mem::copy(p, buf.as_ptr(), buf.len()) };
     }
 
     /// Fills `len` bytes at `offset` with zeros.
@@ -185,18 +181,16 @@ impl Frame {
     /// If the bytes are not all in the frame.
     pub fn fill_zero(&self, offset: usize, len: usize) {
         let p = self.byte_ptr(offset, len);
-        for i in 0..len {
-            // SAFETY: as for `write_bytes`.
-            unsafe { p.add(i).write_volatile(0) };
-        }
+        // SAFETY: as for `write_bytes`.
+        unsafe { mem::zero(p, len) };
     }
 
     /// Copies all of `other` to this frame. Copy on write uses this.
     pub fn copy_from(&self, other: &Frame) {
-        let mut buf = [0u8; 512];
-        for offset in (0..PAGE_SIZE).step_by(buf.len()) {
-            other.read_bytes(offset, &mut buf);
-            self.write_bytes(offset, &buf);
+        let (to, from) = (self.byte_ptr(0, PAGE_SIZE), other.byte_ptr(0, PAGE_SIZE));
+        if to != from {
+            // SAFETY: as for `write_bytes`. Two different frames do not overlap.
+            unsafe { mem::copy(to, from, PAGE_SIZE) };
         }
     }
 }

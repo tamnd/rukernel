@@ -64,6 +64,34 @@ pub(crate) mod trap {
     }
 }
 
+/// Copies of memory that user code can write at the same time. These architectures copy one byte
+/// at a time, with volatile accesses.
+pub(crate) mod mem {
+    /// Copies `len` bytes from `src` to `dst`.
+    ///
+    /// # Safety
+    ///
+    /// The two ranges must be valid kernel memory, and they must not overlap.
+    pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) {
+        for i in 0..len {
+            // SAFETY: the caller gives two valid ranges of `len` bytes.
+            unsafe { dst.add(i).write_volatile(src.add(i).read_volatile()) };
+        }
+    }
+
+    /// Writes `len` zero bytes at `dst`.
+    ///
+    /// # Safety
+    ///
+    /// The range must be valid kernel memory.
+    pub(crate) unsafe fn zero(dst: *mut u8, len: usize) {
+        for i in 0..len {
+            // SAFETY: the caller gives a valid range of `len` bytes.
+            unsafe { dst.add(i).write_volatile(0) };
+        }
+    }
+}
+
 /// The page tables. These architectures have none yet, and the frame allocator has no frames, so
 /// no `Frame` or `Mapping` exists.
 pub(crate) mod paging {
@@ -101,6 +129,11 @@ pub(crate) mod timer {
     /// The nanoseconds since boot, from the tick count.
     pub(crate) fn nanos() -> u64 {
         TICKS.load(core::sync::atomic::Ordering::Relaxed) * (1_000_000_000 / HZ)
+    }
+
+    /// The nanoseconds of the clock since boot, from the tick count.
+    pub(crate) fn clock_ns() -> u64 {
+        nanos()
     }
 }
 
