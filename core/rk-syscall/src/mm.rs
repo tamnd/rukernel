@@ -1,18 +1,19 @@
 //! The system calls of memory: `mmap`, `munmap`, `mprotect`, `brk` and `madvise`.
 
 use crate::cx::{Cx, SysResult};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::mman::{
     MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
-    MAP_SHARED_VALIDATE, MAP_TYPE,
+    MAP_SHARED_VALIDATE, MAP_TYPE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC,
+    MS_INVALIDATE, MS_SYNC,
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
-use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
+use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
 use rk_vfs::InodeRef;
 
 /// The flags of `mmap` that `MAP_SHARED_VALIDATE` accepts. Linux names the mask `LEGACY_MAP_MASK`.
@@ -38,13 +39,16 @@ const DEV_ZERO: u64 = rk_vfs::device::makedev(1, 5);
 /// The pages of a regular file, for a file mapping.
 ///
 /// Each page is a copy of the file data, which the first fault reads. All the mappings of the
-/// open file share the copies. In R1 a write through a shared mapping does not go back to the
-/// file. The page cache of R2 replaces this type.
+/// file share the copies. A write through a shared mapping marks the page dirty, and `msync`,
+/// `munmap` and the end of the address space write the dirty pages back. A `read` or `write` of
+/// the file does not see the copies. The page cache of R2 replaces this type.
 struct FilePages {
     inode: InodeRef,
     /// The path of the file when it was first mapped.
     path: Vec<u8>,
     pages: SpinLock<BTreeMap<u64, Arc<Frame>>>,
+    /// The pages that a shared mapping changed. Lock it before `pages`.
+    dirty: SpinLock<BTreeSet<u64>>,
 }
 
 impl MmFile for FilePages {
@@ -52,9 +56,13 @@ impl MmFile for FilePages {
         if let Some(frame) = self.pages.lock().get(&index) {
             return Ok(frame.clone());
         }
+        let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EIO)?;
+        // A page that starts past the end of the file has no data. The fault then sends SIGBUS.
+        if offset >= self.inode.metadata().size {
+            return Err(Errno::EIO);
+        }
         let frame = rk_frame::mm::alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
         let mut buf = vec![0u8; PAGE_SIZE];
-        let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EINVAL)?;
         let mut done = 0;
         while done < PAGE_SIZE {
             let n = self.inode.read_at(offset + done as u64, &mut buf[done..])?;
@@ -72,6 +80,40 @@ impl MmFile for FilePages {
         let meta = self.inode.metadata();
         (meta.dev, meta.ino, self.path.clone())
     }
+
+    fn writes_back(&self) -> bool {
+        true
+    }
+
+    fn dirty(&self, index: u64) {
+        self.dirty.lock().insert(index);
+    }
+
+    fn write_back(&self, first: u64, end: u64) -> Result<(), Errno> {
+        let pages: Vec<(u64, Arc<Frame>)> = {
+            let dirty = self.dirty.lock();
+            let pages = self.pages.lock();
+            dirty.range(first..end).filter_map(|i| Some((*i, pages.get(i)?.clone()))).collect()
+        };
+        // A page past the end of the file does not change the file, as on Linux.
+        let size = self.inode.metadata().size;
+        let mut buf = vec![0u8; PAGE_SIZE];
+        for (index, frame) in pages {
+            let offset = index * PAGE_SIZE as u64;
+            let Some(left) = size.checked_sub(offset).filter(|&l| l > 0) else { break };
+            let len = PAGE_SIZE.min(usize::try_from(left).unwrap_or(PAGE_SIZE));
+            frame.read_bytes(0, &mut buf[..len]);
+            let mut done = 0;
+            while done < len {
+                let n = self.inode.write_at(offset + done as u64, &buf[done..len])?;
+                if n == 0 {
+                    return Err(Errno::EIO);
+                }
+                done += n;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The page cache of the files that a process mapped, so that two mappings of one file share
@@ -87,7 +129,8 @@ fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
     map.entry(key)
         .or_insert_with(|| {
             let pages = SpinLock::new(BTreeMap::new());
-            Arc::new(FilePages { inode: inode.clone(), path, pages })
+            let dirty = SpinLock::new(BTreeSet::new());
+            Arc::new(FilePages { inode: inode.clone(), path, pages, dirty })
         })
         .clone()
 }
@@ -154,6 +197,40 @@ pub(crate) fn mmap(
         kind: VmaKind::Normal,
     };
     Ok(cx.vm()?.mmap(req)? as u64)
+}
+
+pub(crate) fn msync(cx: &Cx<'_>, addr: u64, len: u64, flags: u64) -> SysResult {
+    let flags = flags as u32;
+    if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+        || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC
+    {
+        return Err(Errno::EINVAL);
+    }
+    // MS_ASYNC writes back at once too. MS_INVALIDATE has no work, because the mappings of a
+    // file share one copy of each page.
+    cx.vm()?.msync(addr as usize, len as usize)?;
+    Ok(0)
+}
+
+pub(crate) fn mremap(
+    cx: &Cx<'_>,
+    addr: u64,
+    old_len: u64,
+    new_len: u64,
+    flags: u64,
+    new_addr: u64,
+) -> SysResult {
+    let flags = flags as u32;
+    if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let remap = Remap {
+        may_move: flags & MREMAP_MAYMOVE != 0,
+        fixed: flags & MREMAP_FIXED != 0,
+        dont_unmap: flags & MREMAP_DONTUNMAP != 0,
+        new_addr: new_addr as usize,
+    };
+    Ok(cx.vm()?.mremap(addr as usize, old_len as usize, new_len as usize, remap)? as u64)
 }
 
 pub(crate) fn munmap(cx: &Cx<'_>, addr: u64, len: u64) -> SysResult {

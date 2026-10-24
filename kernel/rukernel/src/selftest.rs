@@ -708,6 +708,50 @@ fn fault_test() -> bool {
         space.write(DATA + 4000, b"hello\0").is_ok()
             && space.read_cstr(DATA + 4000, 64).as_deref() == Ok(&b"hello"[..]),
     );
+    ok &= mremap_checks(&space, &read);
+    ok
+}
+
+/// `mremap` grows an area in place, moves it with its pages, and gives the errors of Linux.
+#[cfg(target_arch = "x86_64")]
+fn mremap_checks(
+    space: &rk_mm::AddressSpace,
+    read: &dyn Fn(&rk_mm::AddressSpace, usize) -> Result<u64, rk_abi::Errno>,
+) -> bool {
+    use rk_abi::Errno;
+    use rk_mm::{MmapRequest, Prot, Remap};
+
+    const AREA: usize = 0x3000_0000;
+    const MOVE: Remap = Remap { may_move: true, fixed: false, dont_unmap: false, new_addr: 0 };
+    let fixed = |addr| MmapRequest { addr, fixed: true, ..MmapRequest::anon(4096, Prot::RW) };
+    let mut ok = check(
+        "an area for mremap",
+        space.mmap(fixed(AREA)).is_ok() && space.write(AREA, &5u64.to_le_bytes()).is_ok(),
+    );
+    ok &= check(
+        "mremap grows the area in place",
+        space.mremap(AREA, 4096, 2 * 4096, Remap::default()) == Ok(AREA)
+            && space.write(AREA + 4096, &[1]).is_ok(),
+    );
+    ok &= check(
+        "mremap without MREMAP_MAYMOVE cannot grow into an area",
+        space.mmap(fixed(AREA + 2 * 4096)).is_ok()
+            && space.mremap(AREA, 2 * 4096, 3 * 4096, Remap::default()) == Err(Errno::ENOMEM),
+    );
+    let moved = space.mremap(AREA, 2 * 4096, 3 * 4096, MOVE);
+    ok &= check(
+        "mremap moves the area with its pages",
+        moved.is_ok_and(|to| to != AREA && read(space, to) == Ok(5))
+            && read(space, AREA) == Err(Errno::EFAULT),
+    );
+    ok &= check(
+        "mremap of an unmapped address fails",
+        space.mremap(AREA, 4096, 4096, MOVE) == Err(Errno::EFAULT),
+    );
+    ok &= check(
+        "mremap of an address that is not aligned fails",
+        space.mremap(AREA + 1, 4096, 4096, MOVE) == Err(Errno::EINVAL),
+    );
     ok
 }
 

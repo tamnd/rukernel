@@ -15,8 +15,8 @@ use rk_frame::user::{ReturnReason, UserContext, UserException};
 use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
 use rk_proc::signal::{
-    BUS_ADRALN, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL, SIG_IGN,
-    SigInfo,
+    BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL,
+    SIG_IGN, SigInfo,
 };
 use rk_proc::{Thread, WaitStatus};
 use rk_vfs::FsContext;
@@ -111,8 +111,7 @@ fn exception_signal(e: &UserException, ip: u64) -> SigInfo {
 
 /// Sends the signal of a user exception to the thread. If the signal ends the process, the
 /// kernel log tells where the fault was.
-fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException) {
-    let info = exception_signal(e, regs.regs().rip);
+fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException, info: SigInfo) {
     let sig = info.signo;
     let process = thread.process();
     let action = process.action(sig);
@@ -129,9 +128,11 @@ fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException) {
     thread.force_signal(info);
 }
 
-/// Handles a page fault of the thread. Gives `false` if the memory manager did not repair it.
-fn page_fault(thread: &Thread, e: &UserException) -> bool {
-    let Some(vm) = thread.process().vm() else { return false };
+/// Handles a page fault of the thread. Gives the signal if the memory manager did not repair it:
+/// `SIGBUS` for a page that has no data, else `SIGSEGV`.
+fn page_fault(thread: &Thread, e: &UserException) -> Option<SigInfo> {
+    let segv = || Some(exception_signal(e, 0));
+    let Some(vm) = thread.process().vm() else { return segv() };
     let access = if e.error & PF_INSTR != 0 {
         Access::Exec
     } else if e.error & PF_WRITE != 0 {
@@ -139,7 +140,11 @@ fn page_fault(thread: &Thread, e: &UserException) -> bool {
     } else {
         Access::Read
     };
-    vm.handle_fault(e.addr as usize, access).is_ok()
+    match vm.handle_fault(e.addr as usize, access) {
+        Ok(()) => None,
+        Err(Errno::EFAULT | Errno::ENOMEM) => segv(),
+        Err(_) => Some(SigInfo::fault(SIGBUS, BUS_ADRERR, e.addr)),
+    }
 }
 
 /// Runs the user thread until it ends.
@@ -170,8 +175,13 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
             }
             ReturnReason::Interrupt => {}
             ReturnReason::Exception(e) => {
-                if !(e.vector == PAGE_FAULT && page_fault(&thread, &e)) {
-                    fault(&thread, &regs, &e);
+                let info = if e.vector == PAGE_FAULT {
+                    page_fault(&thread, &e)
+                } else {
+                    Some(exception_signal(&e, regs.regs().rip))
+                };
+                if let Some(info) = info {
+                    fault(&thread, &regs, &e, info);
                 }
             }
         }
