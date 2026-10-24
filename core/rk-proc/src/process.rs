@@ -122,6 +122,8 @@ pub struct Thread {
     /// The address that `set_tid_address` or `CLONE_CHILD_CLEARTID` gave. At the exit, the kernel
     /// writes 0 there.
     clear_child_tid: AtomicUsize,
+    /// The head of the robust futex list that `set_robust_list` gave, or 0.
+    robust_list: AtomicUsize,
     /// The thread must stop at its next return to the kernel, because its group exits.
     killed: AtomicBool,
     signals: SpinLock<ThreadSignals>,
@@ -508,6 +510,16 @@ impl Thread {
         self.clear_child_tid.store(addr, Ordering::Relaxed);
     }
 
+    /// The address of the head of the robust futex list, or 0.
+    pub fn robust_list(&self) -> usize {
+        self.robust_list.load(Ordering::Relaxed)
+    }
+
+    /// Sets the address of the head of the robust futex list, for `set_robust_list`.
+    pub fn set_robust_list(&self, addr: usize) {
+        self.robust_list.store(addr, Ordering::Relaxed);
+    }
+
     /// Tells if the thread must stop, because its group exits.
     pub fn is_killed(&self) -> bool {
         self.killed.load(Ordering::Acquire)
@@ -622,6 +634,7 @@ impl Thread {
             process,
             task: SpinLock::new(Weak::new()),
             clear_child_tid: AtomicUsize::new(0),
+            robust_list: AtomicUsize::new(0),
             killed: AtomicBool::new(false),
             signals: SpinLock::new(ThreadSignals { blocked, ..ThreadSignals::default() }),
             vfork_done: SpinLock::new(None),

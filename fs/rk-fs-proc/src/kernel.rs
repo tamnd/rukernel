@@ -303,7 +303,8 @@ fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
     text::Stat {
         pid: t.map_or(p.pid(), Thread::tid),
         comm: p.comm(),
-        state: t.map_or_else(|| p.state_letter(), thread_state),
+        // Linux gives the state of the leader for the process, if the leader is there.
+        state: thread.map_or_else(|| p.state_letter(), thread_state),
         ppid: p.ppid(),
         pgid: p.pgid(),
         sid: p.sid(),

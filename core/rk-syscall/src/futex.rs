@@ -8,7 +8,16 @@
 //!
 //! The kernel runs one task at a time and a task in the kernel is not preempted. Thus the test of
 //! the word and the insertion in the queue are atomic for each other task, as `FUTEX_WAIT` must
-//! be. An SMP kernel will need a lock that the waker also takes.
+//! be. The same is true for the read and the write of the word in the priority inheritance
+//! operations. An SMP kernel will need a lock that the waker also takes, and a compare and
+//! exchange on the word.
+//!
+//! The priority inheritance operations give the lock protocol of Linux. They do not change the
+//! priority of the owner, because the scheduler of R1 has no priorities.
+//!
+//! At the exit of a thread, the kernel walks the robust list of the thread. It marks each futex
+//! that the thread holds with `FUTEX_OWNER_DIED`, and wakes one waiter, as `exit_robust_list` of
+//! Linux does.
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::{BTreeMap, VecDeque};
@@ -16,11 +25,12 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::futex::{
-    FUTEX_BITSET_MATCH_ANY, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE,
-    FUTEX_OP_OPARG_SHIFT, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE, FUTEX_WAIT, FUTEX_WAIT_BITSET,
-    FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP,
+    FUTEX_BITSET_MATCH_ANY, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI,
+    FUTEX_LOCK_PI2, FUTEX_OP_OPARG_SHIFT, FUTEX_OWNER_DIED, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
+    FUTEX_TID_MASK, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET,
+    FUTEX_WAITERS, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, ROBUST_LIST_LIMIT,
 };
-use rk_abi::native::types::KernelTimespec;
+use rk_abi::native::types::{KernelTimespec, RobustListHead};
 use rk_frame::sync::SpinLock;
 use rk_frame::task::WaitQueue;
 use rk_frame::time::{HZ, ticks};
@@ -42,8 +52,12 @@ enum Key {
 struct Waiter {
     /// The bits of `FUTEX_WAIT_BITSET`. `FUTEX_WAIT` waits with each bit.
     bitset: u32,
+    /// The thread ID of the task, for the priority inheritance operations.
+    tid: u32,
     /// A wake sets this before it wakes the task.
     woken: AtomicBool,
+    /// `FUTEX_UNLOCK_PI` sets this when it gives the lock to the task.
+    owner: AtomicBool,
     /// The task waits here alone.
     queue: WaitQueue,
 }
@@ -68,6 +82,27 @@ fn read_word(vm: &AddressSpace, addr: usize) -> Result<u32, Errno> {
     let mut b = [0u8; 4];
     vm.read(addr, &mut b)?;
     Ok(u32::from_ne_bytes(b))
+}
+
+fn write_word(vm: &AddressSpace, addr: usize, word: u32) -> Result<(), Errno> {
+    vm.write(addr, &word.to_ne_bytes())
+}
+
+impl Waiter {
+    fn new(tid: u32, bitset: u32) -> Arc<Self> {
+        Arc::new(Self {
+            tid,
+            bitset,
+            woken: AtomicBool::new(false),
+            owner: AtomicBool::new(false),
+            queue: WaitQueue::new(),
+        })
+    }
+}
+
+/// Tells if a task waits on `key`.
+fn has_waiters(key: Key) -> bool {
+    FUTEXES.lock().get(&key).is_some_and(|q| !q.is_empty())
 }
 
 /// Wakes at most `n` waiters of `key` that wait for a bit of `bitset`. Gives the number that it
@@ -110,6 +145,35 @@ fn remove_waiter(waiter: &Arc<Waiter>) {
     }
 }
 
+/// Puts `waiter` in the queue of `key` and waits for a wake. `deadline` is a tick count. A signal
+/// gives `on_signal`. Gives `Ok` if a wake came, also after the timeout or the signal.
+fn sleep(
+    thread: &Thread,
+    key: Key,
+    waiter: &Arc<Waiter>,
+    deadline: Option<u64>,
+    on_signal: Errno,
+) -> Result<(), Errno> {
+    FUTEXES.lock().entry(key).or_default().push_back(waiter.clone());
+    let cond = || {
+        if waiter.woken.load(Ordering::Acquire) {
+            Some(Ok(()))
+        } else if thread.signal_pending() {
+            Some(Err(on_signal))
+        } else {
+            None
+        }
+    };
+    let r = match deadline {
+        Some(d) => waiter.queue.wait_until_timeout(d, cond).unwrap_or(Err(Errno::ETIMEDOUT)),
+        None => waiter.queue.wait_until(cond),
+    };
+    if !waiter.woken.load(Ordering::Acquire) {
+        remove_waiter(waiter);
+    }
+    if waiter.woken.load(Ordering::Acquire) { Ok(()) } else { r }
+}
+
 /// Waits on the futex at `addr` while the word is `val`. `deadline` is a tick count.
 fn wait(
     thread: &Thread,
@@ -124,29 +188,82 @@ fn wait(
     if read_word(vm, addr)? != val {
         return Err(Errno::EAGAIN);
     }
-    let waiter =
-        Arc::new(Waiter { bitset, woken: AtomicBool::new(false), queue: WaitQueue::new() });
-    FUTEXES.lock().entry(key).or_default().push_back(waiter.clone());
-    let cond = || {
-        if waiter.woken.load(Ordering::Acquire) {
-            Some(Ok(0))
-        } else if thread.signal_pending() {
-            // Linux starts a wait with a timeout again through `restart_syscall`. rukernel does
-            // not have it yet, so that wait gives `EINTR`.
-            Some(Err(if deadline.is_some() { Errno::EINTR } else { Errno::ERESTARTSYS }))
-        } else {
-            None
+    // Linux starts a wait with a timeout again through `restart_syscall`. rukernel does not have
+    // it yet, so that wait gives `EINTR`.
+    let on_signal = if deadline.is_some() { Errno::EINTR } else { Errno::ERESTARTSYS };
+    sleep(thread, key, &Waiter::new(thread.tid(), bitset), deadline, on_signal)?;
+    Ok(0)
+}
+
+/// Takes the priority inheritance futex at `addr` for `thread`, as `futex_lock_pi` of Linux does.
+/// The word has the thread ID of the owner. A task that waits sets `FUTEX_WAITERS`, so that the
+/// owner calls `FUTEX_UNLOCK_PI`. With `trylock`, a futex that has an owner gives `EAGAIN`.
+fn lock_pi(
+    thread: &Thread,
+    vm: &Arc<AddressSpace>,
+    addr: usize,
+    private: bool,
+    deadline: Option<u64>,
+    trylock: bool,
+) -> SysResult {
+    let key = key(vm, addr, private)?;
+    let tid = thread.tid();
+    loop {
+        let word = read_word(vm, addr)?;
+        let owner = word & FUTEX_TID_MASK;
+        if owner == tid {
+            return Err(Errno::EDEADLK);
         }
-    };
-    let r = match deadline {
-        Some(d) => waiter.queue.wait_until_timeout(d, cond).unwrap_or(Err(Errno::ETIMEDOUT)),
-        None => waiter.queue.wait_until(cond),
-    };
-    if !waiter.woken.load(Ordering::Acquire) {
-        remove_waiter(&waiter);
+        if owner == 0 {
+            // The futex of a dead owner keeps `FUTEX_OWNER_DIED`, so that the new owner sees it.
+            let waiters = if has_waiters(key) { FUTEX_WAITERS } else { 0 };
+            write_word(vm, addr, tid | (word & FUTEX_OWNER_DIED) | waiters)?;
+            return Ok(0);
+        }
+        if trylock {
+            return Err(Errno::EAGAIN);
+        }
+        if rk_proc::find_thread(owner).is_none() {
+            return Err(Errno::ESRCH);
+        }
+        if word & FUTEX_WAITERS == 0 {
+            write_word(vm, addr, word | FUTEX_WAITERS)?;
+        }
+        let waiter = Waiter::new(tid, FUTEX_BITSET_MATCH_ANY);
+        sleep(thread, key, &waiter, deadline, Errno::ERESTARTNOINTR)?;
+        if waiter.owner.load(Ordering::Acquire) {
+            return Ok(0);
+        }
     }
-    // A wake that came after the timeout or the signal still counts as a wake.
-    if waiter.woken.load(Ordering::Acquire) { Ok(0) } else { r }
+}
+
+/// Releases the priority inheritance futex at `addr`, as `futex_unlock_pi` of Linux does. The
+/// first task that waits becomes the owner.
+fn unlock_pi(thread: &Thread, vm: &Arc<AddressSpace>, addr: usize, private: bool) -> SysResult {
+    let key = key(vm, addr, private)?;
+    let word = read_word(vm, addr)?;
+    if word & FUTEX_TID_MASK != thread.tid() {
+        return Err(Errno::EPERM);
+    }
+    let next = {
+        let mut table = FUTEXES.lock();
+        let next = table.get_mut(&key).and_then(VecDeque::pop_front);
+        let more = table.get(&key).is_some_and(|q| !q.is_empty());
+        if table.get(&key).is_some_and(VecDeque::is_empty) {
+            table.remove(&key);
+        }
+        next.map(|w| (w, more))
+    };
+    let Some((next, more)) = next else {
+        write_word(vm, addr, 0)?;
+        return Ok(0);
+    };
+    let waiters = if more { FUTEX_WAITERS } else { 0 };
+    write_word(vm, addr, next.tid | waiters)?;
+    next.owner.store(true, Ordering::Release);
+    next.woken.store(true, Ordering::Release);
+    next.queue.wake_all();
+    Ok(0)
 }
 
 /// Reads the timeout of a wait and gives its deadline in ticks. `FUTEX_WAIT` has a relative
@@ -223,7 +340,7 @@ pub(crate) fn futex(
     let op = op as u32;
     let cmd = op & FUTEX_CMD_MASK & !FUTEX_PRIVATE_FLAG & !FUTEX_CLOCK_REALTIME;
     let private = op & FUTEX_PRIVATE_FLAG != 0;
-    if op & FUTEX_CLOCK_REALTIME != 0 && !matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
+    if op & FUTEX_CLOCK_REALTIME != 0 && !matches!(cmd, FUTEX_WAIT_BITSET | FUTEX_LOCK_PI2) {
         return Err(Errno::ENOSYS);
     }
     let (val, val3) = (val as u32, val3 as u32);
@@ -286,7 +403,15 @@ pub(crate) fn futex(
             }
             Ok(u64::from(woken))
         }
-        // The priority inheritance operations and `FUTEX_FD` are not in R1.
+        // The timeout of `FUTEX_LOCK_PI` and `FUTEX_LOCK_PI2` is an absolute time.
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => {
+            let deadline = deadline(cx, utime, true)?;
+            lock_pi(cx.thread, &vm, addr, private, deadline, false)
+        }
+        FUTEX_TRYLOCK_PI => lock_pi(cx.thread, &vm, addr, private, None, true),
+        FUTEX_UNLOCK_PI => unlock_pi(cx.thread, &vm, addr, private),
+        // The requeue to a priority inheritance futex and `FUTEX_FD` are not in R2. glibc and
+        // musl do not use them.
         _ => Err(Errno::ENOSYS),
     }
 }
@@ -304,4 +429,84 @@ pub(crate) fn exit_clear_tid(thread: &Thread) {
     {
         wake_key(k, 1, FUTEX_BITSET_MATCH_ANY);
     }
+}
+
+/// Marks the futex at `addr` that the dead thread `tid` holds, as `handle_futex_death` of Linux
+/// does. `pending` tells that the address is the `list_op_pending` of the list.
+fn futex_death(vm: &Arc<AddressSpace>, addr: usize, tid: u32, pi: bool, pending: bool) {
+    let Ok(word) = read_word(vm, addr) else { return };
+    let owner = word & FUTEX_TID_MASK;
+    // The thread released the futex, but it did not wake a waiter before it died.
+    let wake = if pending && !pi && owner == 0 {
+        true
+    } else if owner == tid {
+        if write_word(vm, addr, (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED).is_err() {
+            return;
+        }
+        word & FUTEX_WAITERS != 0
+    } else {
+        false
+    };
+    if wake && let Ok(k) = key(vm, addr, false) {
+        wake_key(k, 1, FUTEX_BITSET_MATCH_ANY);
+    }
+}
+
+/// Walks the robust list of `thread` when it exits or calls `execve`, as `exit_robust_list` of
+/// Linux does. Each entry of the list is in a lock that the thread holds. Bit 0 of an entry tells
+/// that the lock is a priority inheritance futex. A list that is not correct stops the walk.
+pub(crate) fn exit_robust_list(thread: &Thread) {
+    let head = thread.robust_list();
+    if head == 0 {
+        return;
+    }
+    thread.set_robust_list(0);
+    let Some(vm) = thread.process().vm() else { return };
+    let read_u64 = |addr: usize| {
+        let mut b = [0u8; 8];
+        vm.read(addr, &mut b).ok().map(|()| u64::from_ne_bytes(b) as usize)
+    };
+    let mut b = [0u8; size_of::<RobustListHead>()];
+    if vm.read(head, &mut b).is_err() {
+        return;
+    }
+    let Ok(h) = <RobustListHead as zerocopy::FromBytes>::read_from_bytes(&b) else { return };
+    let offset = h.futex_offset as isize;
+    let pending = h.list_op_pending as usize;
+    let futex_addr = |entry: usize| (entry & !1).wrapping_add_signed(offset);
+    let tid = thread.tid();
+    let mut entry = h.list.next as usize;
+    for _ in 0..ROBUST_LIST_LIMIT {
+        if entry & !1 == head {
+            break;
+        }
+        // Read the next entry first, because the futex can be in the same memory.
+        let Some(next) = read_u64(entry & !1) else { break };
+        if entry != pending {
+            futex_death(&vm, futex_addr(entry), tid, entry & 1 != 0, false);
+        }
+        entry = next;
+    }
+    if pending != 0 {
+        futex_death(&vm, futex_addr(pending), tid, pending & 1 != 0, true);
+    }
+}
+
+pub(crate) fn set_robust_list(cx: &Cx<'_>, head: u64, len: u64) -> SysResult {
+    if len != size_of::<RobustListHead>() as u64 {
+        return Err(Errno::EINVAL);
+    }
+    cx.thread.set_robust_list(head as usize);
+    Ok(0)
+}
+
+/// Gives the robust list of the thread `tid`, or of the caller for 0.
+pub(crate) fn get_robust_list(cx: &Cx<'_>, tid: u64, head: u64, len: u64) -> SysResult {
+    let head_addr = match tid as u32 {
+        0 => cx.thread.robust_list(),
+        tid => rk_proc::find_thread(tid).ok_or(Errno::ESRCH)?.robust_list(),
+    };
+    cx.write_val(head, &(head_addr as u64))?;
+    cx.write_val(len, &(size_of::<RobustListHead>() as u64))?;
+    Ok(0)
 }
