@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.2.4] (2026-10-24)
+
+This release is the fourth part of milestone R2. It adds process file descriptors, `seccomp` with classic BPF and user notifications, `memfd_create`, and Unix sockets. The new `kselftest` boot test runs the `seccomp_bpf` test of Linux, and all the tests that apply pass.
+
 ### Added
 
 - `pidfd_open`, `pidfd_send_signal` and `pidfd_getfd`. `poll` of a process file descriptor gives `POLLIN` when the process ended. `clone` and `clone3` accept `CLONE_PIDFD`, and `waitid` accepts `P_PIDFD`.
@@ -319,6 +323,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.2.4]: https://github.com/tamnd/rukernel/releases/tag/v0.2.4
 [0.2.3]: https://github.com/tamnd/rukernel/releases/tag/v0.2.3
 [0.2.2]: https://github.com/tamnd/rukernel/releases/tag/v0.2.2
 [0.2.1]: https://github.com/tamnd/rukernel/releases/tag/v0.2.1
