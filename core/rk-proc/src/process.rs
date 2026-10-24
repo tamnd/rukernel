@@ -9,11 +9,11 @@ use crate::signal::{
     AltStack, NSIG, Pending, SI_TIMER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
 use crate::timer::Timers;
-use crate::wait::{WaitOptions, WaitStatus, WaitTarget};
+use crate::wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDSTOP, SA_NOCLDWAIT, SIGCHLD, SIGCONT, SIGKILL};
 use rk_frame::sync::{SpinLock, SpinLockGuard};
@@ -21,6 +21,8 @@ use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
 use rk_vfs::{FdTable, FsContext, Location};
+
+pub mod ptrace;
 
 /// A process ID or a thread ID.
 pub type Pid = u32;
@@ -52,6 +54,8 @@ struct State {
     /// The last stop or continue of the process that the parent did not take with a wait yet.
     report: Option<WaitStatus>,
     comm: Vec<u8>,
+    /// The threads that this process traces.
+    tracees: Vec<Arc<Thread>>,
 }
 
 /// What `execve` gave the process: the arguments and the file of the program.
@@ -138,6 +142,9 @@ pub struct Process {
     /// The user CPU time in timer ticks of the children that a wait reaped, with their own
     /// reaped children.
     child_ticks: AtomicU64,
+    /// The tracer of the leader thread after the leader ended. The tracer gets the exit of the
+    /// process.
+    leader_tracer: SpinLock<Weak<Process>>,
 }
 
 impl core::fmt::Debug for Process {
@@ -165,6 +172,11 @@ pub struct Thread {
     restart: SpinLock<Option<Restart>>,
     /// The timer ticks that came while the thread ran user code.
     user_ticks: AtomicU64,
+    /// The tracing state, while a tracer traces the thread.
+    ptrace: SpinLock<Option<ptrace::Ptrace>>,
+    /// The signal of a group stop that the traced thread did not take yet, or 0. A thread that
+    /// is not traced waits for `SIGCONT` in the stopped process instead.
+    group_stop: AtomicU32,
 }
 
 /// The wait of the parent of a `vfork` child. The parent waits until the child calls `execve` or
@@ -511,6 +523,7 @@ impl Process {
                 zombie: None,
                 report: None,
                 comm,
+                tracees: Vec::new(),
             }),
             child_wait: WaitQueue::new(),
             thread_exit: WaitQueue::new(),
@@ -532,6 +545,7 @@ impl Process {
             timers: SpinLock::new(Timers::default()),
             dead_ticks: AtomicU64::new(0),
             child_ticks: AtomicU64::new(0),
+            leader_tracer: SpinLock::new(Weak::new()),
         })
     }
 }
@@ -656,20 +670,34 @@ impl Thread {
         SigSet(shared.0 | self.signals.lock().pending.set().0)
     }
 
-    /// Tells if a wait must stop: the group exits, the process stops, or a signal that is not
-    /// blocked is pending.
+    /// Tells if a wait must stop: the group exits, the process stops, a signal that is not
+    /// blocked is pending, or the tracer asks for a stop.
     pub fn signal_pending(&self) -> bool {
-        self.is_killed()
-            || !self.pending().without(self.blocked()).is_empty()
-            || self.process.is_stopped()
+        if self.is_killed() || !self.pending().without(self.blocked()).is_empty() {
+            return true;
+        }
+        if self.is_traced() {
+            self.group_stop.load(Ordering::Acquire) != 0 || self.interrupt_pending()
+        } else {
+            self.process.is_stopped()
+        }
     }
 
-    /// Waits while the process is stopped. The wait ends when `SIGCONT` continues the process or
-    /// the group exits.
+    /// Waits while the process is stopped. The wait ends when `SIGCONT` continues the process,
+    /// the group exits or a tracer traces the thread. A traced thread stops for its tracer
+    /// instead.
     pub fn wait_while_stopped(&self) {
-        self.process
-            .stop_wait
-            .wait_until(|| (!self.process.is_stopped() || self.is_killed()).then_some(()));
+        self.process.stop_wait.wait_until(|| {
+            (!self.process.is_stopped() || self.is_killed() || self.is_traced()).then_some(())
+        });
+    }
+
+    /// Takes the signal of the group stop that the traced thread did not take yet.
+    pub fn take_group_stop(&self) -> Option<u32> {
+        match self.group_stop.swap(0, Ordering::AcqRel) {
+            0 => None,
+            sig => Some(sig),
+        }
     }
 
     /// The alternate signal stack.
@@ -688,32 +716,53 @@ impl Thread {
     /// `SIG_DFL`.
     pub fn dequeue_signal(&self) -> Option<Delivery> {
         loop {
-            let mut shared = self.process.signals.lock();
-            let mut own = self.signals.lock();
-            let blocked = own.blocked;
-            let info = own.pending.take(blocked).or_else(|| shared.pending.take(blocked))?;
-            let sig = info.signo;
-            let action = shared.actions[sig as usize - 1];
-            if action.ignores(sig) {
-                continue;
+            let info = self.next_signal()?;
+            if let Some(delivery) = self.signal_delivery(info) {
+                return Some(delivery);
             }
-            if action.is_fatal(sig) {
-                return Some(Delivery::Fatal(self.process.fatal_status(sig)));
-            }
-            if action.is_stop(sig) {
-                // init does not stop, as Linux does not stop a process with
-                // `SIGNAL_UNKILLABLE`.
-                if self.process.pid == INIT_PID {
-                    continue;
-                }
-                return Some(Delivery::Stop(sig));
-            }
-            if action.flags & u64::from(rk_abi::native::signal::SA_RESETHAND) != 0 {
-                // Linux keeps the flags, the mask and the restorer.
-                shared.actions[sig as usize - 1].handler = SIG_DFL;
-            }
-            return Some(Delivery::Handler(info, action));
         }
+    }
+
+    /// Takes the next signal that the thread does not block, first from its own queue and then
+    /// from the queue of the process. The action does not apply yet: a traced thread stops for
+    /// its tracer first.
+    pub fn next_signal(&self) -> Option<SigInfo> {
+        let mut shared = self.process.signals.lock();
+        let mut own = self.signals.lock();
+        let blocked = own.blocked;
+        own.pending.take(blocked).or_else(|| shared.pending.take(blocked))
+    }
+
+    /// Applies the action of the signal `info` that `next_signal` took. Gives `None` if the
+    /// action discards the signal.
+    pub fn signal_delivery(&self, info: SigInfo) -> Option<Delivery> {
+        let mut shared = self.process.signals.lock();
+        let sig = info.signo;
+        let action = shared.actions[sig as usize - 1];
+        if action.ignores(sig) {
+            return None;
+        }
+        if action.is_fatal(sig) {
+            return Some(Delivery::Fatal(self.process.fatal_status(sig)));
+        }
+        if action.is_stop(sig) {
+            // init does not stop, as Linux does not stop a process with `SIGNAL_UNKILLABLE`.
+            if self.process.pid == INIT_PID {
+                return None;
+            }
+            return Some(Delivery::Stop(sig));
+        }
+        if action.flags & u64::from(rk_abi::native::signal::SA_RESETHAND) != 0 {
+            // Linux keeps the flags, the mask and the restorer.
+            shared.actions[sig as usize - 1].handler = SIG_DFL;
+        }
+        Some(Delivery::Handler(info, action))
+    }
+
+    /// Puts the signal `info` back in the queue of the thread, without a wake. The tracer gives
+    /// a blocked signal this way, and a new tracee gets its first `SIGSTOP`.
+    pub fn requeue_signal(&self, info: SigInfo) {
+        self.signals.lock().pending.push(info);
     }
 
     /// Sets the blocked signals that the thread waits for, for `rt_sigtimedwait`. The empty set
@@ -767,6 +816,8 @@ impl Thread {
             vfork_done: SpinLock::new(None),
             restart: SpinLock::new(None),
             user_ticks: AtomicU64::new(0),
+            ptrace: SpinLock::new(None),
+            group_stop: AtomicU32::new(0),
         })
     }
 }
@@ -795,7 +846,8 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
         files,
         Arc::new(SpinLock::new(fs)),
         [SigAction::default(); NSIG as usize],
-        0,
+        // As in Linux. A tracer of init waits for it as for a child of `fork`.
+        SIGCHLD,
     );
     let thread = Thread::new(pid, process.clone(), SigSet::EMPTY);
     process.state.lock().threads.push(thread.clone());
@@ -940,6 +992,8 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
         Some(t) => alloc::vec![t.clone()],
         None => all,
     };
+    // A tracer sees each signal of its tracee, so the action does not apply yet.
+    let traced = threads.iter().any(|t| t.is_traced());
     let mut shared = process.signals.lock();
     let action = shared.actions[sig as usize - 1];
     let target = threads
@@ -951,7 +1005,8 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
         .cloned();
     // A thread that waits for the signal in `rt_sigtimedwait` takes it, so the action does not
     // apply.
-    let handled = target.as_ref().is_some_and(|t| !t.signals.lock().waiting.contains(sig));
+    let handled =
+        !traced && target.as_ref().is_some_and(|t| !t.signals.lock().waiting.contains(sig));
     if action.ignores(sig) && handled {
         return;
     }
@@ -993,11 +1048,20 @@ pub fn stop_group(thread: &Thread, sig: u32) {
     let process = &thread.process;
     let (others, parent) = {
         let mut s = process.state.lock();
-        if s.group_exit.is_some() || process.is_stopped() {
+        if s.group_exit.is_some() {
+            return;
+        }
+        if process.is_stopped() {
+            // A tracer gave a stop signal to a thread of a stopped process. The thread stops
+            // again for the tracer.
+            thread.group_stop.store(sig, Ordering::Release);
             return;
         }
         process.stopped.store(true, Ordering::Release);
         s.report = Some(WaitStatus::stopped(sig));
+        for t in &s.threads {
+            t.group_stop.store(sig, Ordering::Release);
+        }
         let others: Vec<Arc<Thread>> =
             s.threads.iter().filter(|t| t.tid != thread.tid).cloned().collect();
         (others, s.parent.upgrade())
@@ -1012,16 +1076,20 @@ pub fn stop_group(thread: &Thread, sig: u32) {
 
 /// Continues `process` if it is stopped, and tells the parent.
 fn continue_group(process: &Process) {
-    let parent = {
+    let (parent, threads) = {
         let mut s = process.state.lock();
         if !process.is_stopped() {
             return;
         }
         process.stopped.store(false, Ordering::Release);
         s.report = Some(WaitStatus::CONTINUED);
-        s.parent.upgrade()
+        for t in &s.threads {
+            t.group_stop.store(0, Ordering::Release);
+        }
+        (s.parent.upgrade(), s.threads.clone())
     };
     process.stop_wait.wake_all();
+    ptrace::group_continued(&threads);
     if let Some(parent) = parent {
         notify_stop(process, &parent, WaitStatus::CONTINUED);
     }
@@ -1129,6 +1197,8 @@ pub(crate) fn kill_other_threads(thread: &Thread) {
 pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     thread.release_vfork();
     let process = thread.process.clone();
+    let thread_status = process.group_exit().unwrap_or(status);
+    ptrace::thread_exited(thread, thread_status);
     TABLE.lock().threads.remove(&thread.tid);
     let last = {
         let mut s = process.state.lock();
@@ -1141,6 +1211,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         return;
     }
     process.timers().clear(false);
+    ptrace::release_tracees(&process);
     // The task runs on the page table of the address space, so the kernel table goes first.
     VmSpace::deactivate();
     let vm = process.vm.lock().take();
@@ -1165,6 +1236,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
             init.child_wait.wake_all();
         }
     }
+    ptrace::process_exited(&process, parent.as_ref(), status);
     match parent {
         Some(parent) => {
             if notify_parent(&process, &parent, status) {
@@ -1185,10 +1257,11 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
 }
 
 /// Waits for a child of `process` that matches `target` to end, stop or continue, as `options`
-/// tells, for `wait4` and `waitid`. Gives the ID, the status and the user CPU time in timer ticks
-/// of the child, or `None` with `WNOHANG` if no child changed yet. Without `WNOWAIT`, the wait reaps the child that ended, or
-/// takes the report of the stop or the continue. `interrupted` tells if a signal must stop the
-/// wait.
+/// tells, for `wait4` and `waitid`. The wait also takes the stops and the exits of the threads
+/// that the process traces. Gives the ID, the status and the user CPU time in timer ticks of the
+/// child, or `None` with `WNOHANG` if no child changed yet. Without `WNOWAIT`, the wait reaps the
+/// child that ended, or takes the report of the stop or the continue. `interrupted` tells if a
+/// signal must stop the wait.
 ///
 /// # Errors
 ///
@@ -1198,21 +1271,27 @@ pub fn wait_child(
     target: WaitTarget,
     options: WaitOptions,
     mut interrupted: impl FnMut() -> bool,
-) -> Result<Option<(Pid, WaitStatus, u64)>, Errno> {
+) -> Result<Option<WaitResult>, Errno> {
     process.child_wait.wait_until(|| {
         let mut s = process.state.lock();
+        let mut found = match ptrace::wait_tracee(process, &mut s, target, options) {
+            ptrace::Found::Report(r) => return Some(Ok(Some(r))),
+            ptrace::Found::Waiting => true,
+            ptrace::Found::None => false,
+        };
         let matches = |c: &Arc<Process>| match target {
             WaitTarget::Any => true,
             WaitTarget::Pid(pid) => c.pid == pid,
             WaitTarget::Pgid(pgid) => c.pgid() == pgid,
         };
-        let mut found = false;
         let mut zombie = None;
         for (i, c) in s.children.iter().enumerate() {
             if !matches(c) {
                 continue;
             }
             found = true;
+            // The tracer of a child takes its stops above.
+            let traced = s.tracees.iter().any(|t| Arc::ptr_eq(&t.process, c));
             let mut cs = c.state.lock();
             if let Some(status) = cs.zombie {
                 if options.exited {
@@ -1222,14 +1301,19 @@ pub fn wait_child(
                 continue;
             }
             let report = cs.report.filter(|r| {
-                if r.stop_signal().is_some() { options.stopped } else { options.continued }
+                if r.stop_signal().is_some() {
+                    options.stopped && !traced
+                } else {
+                    options.continued
+                }
             });
             if let Some(status) = report {
                 if !options.nowait {
                     cs.report = None;
                 }
                 drop(cs);
-                return Some(Ok(Some((c.pid, status, c.user_ticks()))));
+                let r = WaitResult { pid: c.pid, status, ticks: c.user_ticks(), trapped: false };
+                return Some(Ok(Some(r)));
             }
         }
         if let Some((i, child, status)) = zombie {
@@ -1238,11 +1322,12 @@ pub fn wait_child(
             let ticks = child.user_ticks() + child.child_ticks();
             if !options.nowait {
                 s.children.remove(i);
+                s.tracees.retain(|t| !Arc::ptr_eq(&t.process, &child));
                 drop(s);
                 process.child_ticks.fetch_add(ticks, Ordering::Relaxed);
                 TABLE.lock().processes.remove(&child.pid);
             }
-            return Some(Ok(Some((child.pid, status, ticks))));
+            return Some(Ok(Some(WaitResult { pid: child.pid, status, ticks, trapped: false })));
         }
         if !found {
             return Some(Err(Errno::ECHILD));

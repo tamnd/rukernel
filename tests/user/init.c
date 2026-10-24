@@ -20,6 +20,9 @@
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/mount.h>
+#include <sys/ptrace.h>
+#include <sys/uio.h>
+#include <sys/user.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -1099,6 +1102,140 @@ static ssize_t read_file(const char *path, char *buf, size_t len)
 	return n;
 }
 
+/* The ptrace checks change these words in the child. */
+static volatile long ptrace_word = 1;
+static const volatile long ptrace_ro_word = 5;
+
+/* Waits for the traced `pid` and gives the status, or -1. */
+static int trace_wait(pid_t pid)
+{
+	int status;
+
+	return waitpid(pid, &status, __WALL) == pid ? status : -1;
+}
+
+static void test_ptrace(void)
+{
+	struct user_regs_struct regs, before;
+	siginfo_t si;
+	unsigned long msg;
+	pid_t pid, child, me = getpid();
+	int status, i, found = 0;
+	long word = 0;
+
+	pid = fork();
+	if (pid == 0) {
+		ptrace(PTRACE_TRACEME, 0, 0, 0);
+		raise(SIGSTOP);
+		pid_t p = getpid();
+		_exit(p == getppid() ? (int)(ptrace_word + ptrace_ro_word) : 1);
+	}
+	status = trace_wait(pid);
+	check("PTRACE_TRACEME stops the child at SIGSTOP", WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+	check("PTRACE_GETSIGINFO", ptrace(PTRACE_GETSIGINFO, pid, 0, &si) == 0 && si.si_signo == SIGSTOP);
+	errno = 0;
+	word = ptrace(PTRACE_PEEKDATA, pid, &ptrace_word, 0);
+	check("PTRACE_PEEKDATA", word == 1 && errno == 0);
+	check("PTRACE_POKEDATA", ptrace(PTRACE_POKEDATA, pid, &ptrace_word, 40) == 0);
+	check("PTRACE_POKETEXT to a read only page", ptrace(PTRACE_POKETEXT, pid, &ptrace_ro_word, 2) == 0 &&
+	      ptrace_ro_word == 5);
+	check("PTRACE_GETREGS", ptrace(PTRACE_GETREGS, pid, 0, &before) == 0 && before.cs == 0x33);
+	check("PTRACE_SINGLESTEP", ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == 0);
+	status = trace_wait(pid);
+	ptrace(PTRACE_GETREGS, pid, 0, &regs);
+	ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+	check("a single step stops with SIGTRAP", WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
+	      si.si_code == TRAP_TRACE && regs.rip != before.rip && !(regs.eflags & 0x100));
+	check("PTRACE_SETOPTIONS", ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXIT) == 0);
+	for (i = 0; i < 20 && !found; i++) {
+		ptrace(PTRACE_SYSCALL, pid, 0, 0);
+		status = trace_wait(pid);
+		if (!WIFSTOPPED(status) || WSTOPSIG(status) != (SIGTRAP | 0x80))
+			break;
+		ptrace(PTRACE_GETREGS, pid, 0, &regs);
+		if (regs.orig_rax == SYS_getpid && regs.rax == (unsigned long)-ENOSYS) {
+			found = 1;
+			regs.orig_rax = SYS_getppid;
+			ptrace(PTRACE_SETREGS, pid, 0, &regs);
+		}
+	}
+	check("PTRACE_SYSCALL stops at the entry to getpid", found);
+	ptrace(PTRACE_SYSCALL, pid, 0, 0);
+	status = trace_wait(pid);
+	ptrace(PTRACE_GETREGS, pid, 0, &regs);
+	check("the tracer changes the system call", WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80) &&
+	      regs.orig_rax == SYS_getppid && regs.rax == (unsigned long)me);
+	ptrace(PTRACE_CONT, pid, 0, 0);
+	status = trace_wait(pid);
+	check("PTRACE_EVENT_EXIT", WIFSTOPPED(status) && status >> 8 == (SIGTRAP | (PTRACE_EVENT_EXIT << 8)) &&
+	      ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg) == 0 && msg == (42 << 8));
+	ptrace(PTRACE_CONT, pid, 0, 0);
+	status = trace_wait(pid);
+	check("the traced child exits", WIFEXITED(status) && WEXITSTATUS(status) == 42);
+
+	/* PTRACE_O_TRACEFORK traces the child of the tracee too. */
+	pid = fork();
+	if (pid == 0) {
+		ptrace(PTRACE_TRACEME, 0, 0, 0);
+		raise(SIGSTOP);
+		child = fork();
+		if (child == 0)
+			_exit(3);
+		_exit(waitpid(child, &status, 0) == child && WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+	}
+	trace_wait(pid);
+	ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACEFORK);
+	ptrace(PTRACE_CONT, pid, 0, 0);
+	status = trace_wait(pid);
+	msg = 0;
+	ptrace(PTRACE_GETEVENTMSG, pid, 0, &msg);
+	check("PTRACE_EVENT_FORK", WIFSTOPPED(status) && status >> 8 == (SIGTRAP | (PTRACE_EVENT_FORK << 8)) && msg > 0);
+	child = msg;
+	status = trace_wait(child);
+	check("the new child stops at SIGSTOP", WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+	ptrace(PTRACE_CONT, child, 0, 0);
+	status = trace_wait(child);
+	check("the tracer sees the exit of the new child", WIFEXITED(status) && WEXITSTATUS(status) == 3);
+	/* The tracee stops for its SIGCHLD before it exits. */
+	for (i = 0; i < 5; i++) {
+		ptrace(PTRACE_CONT, pid, 0, 0);
+		status = trace_wait(pid);
+		if (!WIFSTOPPED(status))
+			break;
+	}
+	check("the parent of the new child reaps it", WIFEXITED(status) && WEXITSTATUS(status) == 3);
+
+	/* PTRACE_ATTACH, PTRACE_SEIZE and PTRACE_INTERRUPT on a child that sleeps. */
+	pid = fork();
+	if (pid == 0) {
+		for (;;)
+			pause();
+	}
+	check("PTRACE_ATTACH", ptrace(PTRACE_ATTACH, pid, 0, 0) == 0);
+	status = trace_wait(pid);
+	check("the attached child stops", WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+	check("PTRACE_ATTACH twice gives EPERM", ptrace(PTRACE_ATTACH, pid, 0, 0) == -1 && errno == EPERM);
+	check("PTRACE_DETACH", ptrace(PTRACE_DETACH, pid, 0, 0) == 0);
+	check("PTRACE_SEIZE", ptrace(PTRACE_SEIZE, pid, 0, PTRACE_O_EXITKILL) == 0);
+	check("PTRACE_INTERRUPT", ptrace(PTRACE_INTERRUPT, pid, 0, 0) == 0);
+	status = trace_wait(pid);
+	check("PTRACE_EVENT_STOP", WIFSTOPPED(status) && status >> 16 == PTRACE_EVENT_STOP);
+	{
+		long remote = 0;
+		struct iovec local_iov = {&remote, sizeof(remote)};
+		struct iovec remote_iov = {(void *)&ptrace_word, sizeof(remote)};
+
+		check("process_vm_readv", syscall(SYS_process_vm_readv, pid, &local_iov, 1, &remote_iov, 1, 0) == 8 &&
+		      remote == 1);
+	}
+	ptrace(PTRACE_DETACH, pid, 0, 0);
+	kill(pid, SIGKILL);
+	status = trace_wait(pid);
+	check("the detached child dies", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+	check("PTRACE_CONT of a process that is not traced gives ESRCH",
+	      ptrace(PTRACE_CONT, getppid(), 0, 0) == -1 && errno == ESRCH);
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -1175,6 +1312,7 @@ int main(int argc, char **argv)
 	test_threads();
 	test_locks();
 	test_clone3();
+	test_ptrace();
 	test_mount();
 	test_proc();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)

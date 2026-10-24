@@ -12,11 +12,12 @@ use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::signal::{
     MINSIGSTKSZ, SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESTORER, SIG_BLOCK, SIG_SETMASK,
-    SIG_UNBLOCK, SIGKILL, SIGSEGV, SIGSTOP,
+    SIG_UNBLOCK, SIGKILL, SIGSEGV, SIGSTOP, SIGTRAP,
 };
 use rk_abi::native::syscalls as nr;
 use rk_abi::native::types::{KernelTimespec, Sigaltstack};
 use rk_frame::user::{FpuState, UserContext};
+use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_STOP, StopKind};
 use rk_proc::signal::{
     AltStack, NSIG, SI_KERNEL, SI_TKILL, SI_USER, SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE,
     SS_ONSTACK, SigAction, SigInfo, SigSet,
@@ -177,26 +178,35 @@ fn restart_with_handler(regs: &mut UserContext, e: Errno, number: u64, flags: u6
 /// Delivers the next signal of `thread` before the return to user mode. `syscall` is the number
 /// of the system call that the thread made, if the return is from one that can restart. Gives
 /// the status of the thread if the signal ends the process. While the process is stopped, the
-/// thread waits here.
+/// thread waits here. A traced thread stops for its tracer here.
 pub(crate) fn deliver(
     thread: &Arc<Thread>,
     regs: &mut UserContext,
-    syscall: Option<u64>,
+    mut syscall: Option<u64>,
 ) -> Option<WaitStatus> {
-    let restart = syscall.and_then(|number| {
-        let e = Errno::from_syscall_return(regs.regs().rax as isize)?;
-        e.is_restart().then_some((e, number))
-    });
     let delivery = loop {
         thread.wait_while_stopped();
         if thread.is_killed() {
             return None;
         }
-        match thread.dequeue_signal() {
+        let delivery = if thread.is_traced() {
+            match traced_signal(thread, regs, &mut syscall) {
+                Some(delivery) => delivery,
+                None => continue,
+            }
+        } else {
+            thread.dequeue_signal()
+        };
+        match delivery {
             Some(Delivery::Stop(sig)) => rk_proc::stop_group(thread, sig),
             delivery => break delivery,
         }
     };
+    // The tracer can change the return value and `orig_rax`, so the check comes after the stops.
+    let restart = syscall.and_then(|number| {
+        let e = Errno::from_syscall_return(regs.regs().rax as isize)?;
+        e.is_restart().then_some((e, number))
+    });
     match delivery {
         // The loop above takes each stop, so `Stop` does not come here.
         None | Some(Delivery::Stop(_)) => {
@@ -233,6 +243,62 @@ pub(crate) fn deliver(
             None
         }
     }
+}
+
+/// Takes the next stop or signal of the traced `thread`, as `get_signal` and `ptrace_signal` of
+/// Linux do: first a group stop, then a `PTRACE_INTERRUPT`, and then the next signal, which the
+/// tracer sees before its action applies. `syscall` is the system call of the thread, which the
+/// tracer can change with `orig_rax`. Gives the delivery of the signal, `Some(None)` if no signal
+/// is pending, or `None` if the loop must look again.
+fn traced_signal(
+    thread: &Arc<Thread>,
+    regs: &mut UserContext,
+    syscall: &mut Option<u64>,
+) -> Option<Option<Delivery>> {
+    let orig = syscall.unwrap_or(NO_SYSCALL);
+    let mut update = |orig_rax: u64| {
+        if syscall.is_some() {
+            *syscall = (orig_rax != NO_SYSCALL).then_some(orig_rax);
+        }
+    };
+    if let Some(sig) = thread.take_group_stop() {
+        if let Some(r) = ptrace::stop(thread, regs, orig, StopKind::Group, sig, None) {
+            update(r.orig_rax);
+        }
+        return None;
+    }
+    if thread.take_interrupt() {
+        let kind = StopKind::Event(PTRACE_EVENT_STOP);
+        if let Some(r) = ptrace::stop(thread, regs, orig, kind, SIGTRAP, None) {
+            update(r.orig_rax);
+        }
+        return None;
+    }
+    let Some(mut info) = thread.next_signal() else { return Some(None) };
+    let tracer = thread.tracer_pid();
+    let Some(r) = ptrace::stop(thread, regs, orig, StopKind::Signal, info.signo, Some(info)) else {
+        // The tracer went away, so the signal has the usual delivery.
+        if !thread.is_killed() {
+            thread.requeue_signal(info);
+        }
+        return None;
+    };
+    update(r.orig_rax);
+    if r.sig == 0 {
+        return None;
+    }
+    if let Some(new) = r.info {
+        info = new;
+    }
+    if r.sig != info.signo {
+        info = SigInfo::new(r.sig, SI_USER, tracer);
+    }
+    if thread.blocked().contains(info.signo) {
+        thread.requeue_signal(info);
+        return None;
+    }
+    // An action that discards the signal makes the loop look again.
+    thread.signal_delivery(info).map(Some)
 }
 
 pub(crate) fn rt_sigreturn(cx: &mut Cx<'_>) -> SysResult {

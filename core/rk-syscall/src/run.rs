@@ -15,9 +15,10 @@ use rk_frame::time::ticks;
 use rk_frame::user::{ReturnReason, UserContext, UserException};
 use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
+use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_EXIT, StopKind};
 use rk_proc::signal::{
     BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL,
-    SIG_IGN, SigInfo,
+    SIG_IGN, SigInfo, TRAP_BRKPT, TRAP_TRACE,
 };
 use rk_proc::{Thread, WaitStatus};
 use rk_vfs::FsContext;
@@ -99,7 +100,9 @@ fn exception_signal(e: &UserException, ip: u64) -> SigInfo {
     match e.vector {
         DIVIDE_ERROR => SigInfo::fault(SIGFPE, FPE_INTDIV, ip),
         X87_FLOATING_POINT | SIMD_FLOATING_POINT => SigInfo::fault(SIGFPE, SI_KERNEL, ip),
-        DEBUG | BREAKPOINT => SigInfo::fault(SIGTRAP, SI_KERNEL, 0),
+        // The trap flag gives the debug exception after one instruction.
+        DEBUG => SigInfo::fault(SIGTRAP, TRAP_TRACE, ip),
+        BREAKPOINT => SigInfo::fault(SIGTRAP, SI_KERNEL, 0),
         INVALID_OPCODE => SigInfo::fault(SIGILL, ILL_ILLOPN, ip),
         ALIGNMENT_CHECK => SigInfo::fault(SIGBUS, BUS_ADRALN, 0),
         PAGE_FAULT => {
@@ -111,12 +114,15 @@ fn exception_signal(e: &UserException, ip: u64) -> SigInfo {
 }
 
 /// Sends the signal of a user exception to the thread. If the signal ends the process, the
-/// kernel log tells where the fault was.
+/// kernel log tells where the fault was. A tracer sees the signal first, so the log does not
+/// tell about a traced thread.
 fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException, info: SigInfo) {
     let sig = info.signo;
     let process = thread.process();
     let action = process.action(sig);
-    if action.handler == SIG_DFL || action.handler == SIG_IGN || thread.blocked().contains(sig) {
+    let fatal =
+        action.handler == SIG_DFL || action.handler == SIG_IGN || thread.blocked().contains(sig);
+    if fatal && !thread.is_traced() {
         println!(
             "{}[{}]: signal {sig} at ip {:#x} addr {:#x} error {:#x}",
             core::str::from_utf8(&process.comm()).unwrap_or("?"),
@@ -150,7 +156,24 @@ fn page_fault(thread: &Thread, e: &UserException) -> Option<SigInfo> {
 
 /// Runs the user thread until it ends.
 fn run(thread: Arc<Thread>, mut regs: UserContext) {
-    let status = loop {
+    let status = 'run: {
+        // A new traced thread stops for its tracer before its first instruction.
+        if let Some(status) = crate::signal::deliver(&thread, &mut regs, None) {
+            break 'run status;
+        }
+        run_loop(&thread, &mut regs)
+    };
+    // The tracer can ask for a stop before the exit, with `PTRACE_O_TRACEEXIT`.
+    ptrace::event(&thread, &mut regs, NO_SYSCALL, PTRACE_EVENT_EXIT, status.0 as u32 as u64);
+    crate::futex::exit_robust_list(&thread);
+    crate::futex::exit_clear_tid(&thread);
+    rk_proc::exit_thread(&thread, status);
+}
+
+/// Runs the user code of the thread and handles each return to the kernel, until the thread
+/// ends. Gives the status of the thread.
+fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
+    loop {
         let process = thread.process();
         if thread.is_killed() {
             break process.group_exit().unwrap_or(WaitStatus::exited(0));
@@ -171,38 +194,65 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
         match reason {
             ReturnReason::Syscall => {
                 COUNT.fetch_add(1, Ordering::Relaxed);
-                let number = regs.syscall_number();
-                let mut cx = Cx { thread: &thread, regs: &mut regs, exit: None };
-                table::dispatch(&mut cx);
-                if let Some(status) = cx.exit {
-                    break status;
+                let Some(number) = syscall_entry(thread, regs) else { continue };
+                if number != NO_SYSCALL {
+                    let mut cx = Cx { thread, regs, exit: None, number };
+                    table::dispatch(&mut cx);
+                    if let Some(status) = cx.exit {
+                        break status;
+                    }
                 }
-                if number != u64::from(nr::RT_SIGRETURN) {
+                syscall_exit(thread, regs, number);
+                if number != u64::from(nr::RT_SIGRETURN) && number != NO_SYSCALL {
                     syscall = Some(number);
                 }
             }
             ReturnReason::Interrupt => {}
             ReturnReason::Exception(e) => {
                 let info = if e.vector == PAGE_FAULT {
-                    page_fault(&thread, &e)
+                    page_fault(thread, &e)
                 } else {
                     Some(exception_signal(&e, regs.regs().rip))
                 };
                 if let Some(info) = info {
-                    fault(&thread, &regs, &e, info);
+                    fault(thread, regs, &e, info);
                 }
             }
         }
         if should_yield() {
             yield_now();
         }
-        if let Some(status) = crate::signal::deliver(&thread, &mut regs, syscall) {
+        if let Some(status) = crate::signal::deliver(thread, regs, syscall) {
             break status;
         }
-    };
-    crate::futex::exit_robust_list(&thread);
-    crate::futex::exit_clear_tid(&thread);
-    rk_proc::exit_thread(&thread, status);
+    }
+}
+
+/// Starts a system call: RAX gets `-ENOSYS`, and a tracer of `PTRACE_SYSCALL` sees the entry and
+/// can change the number. Gives the number, `NO_SYSCALL` if the tracer cancelled the call, or
+/// `None` if the group exits.
+fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Option<u64> {
+    let number = regs.syscall_number();
+    regs.set_syscall_return(Errno::ENOSYS.to_syscall_return() as u64);
+    if !thread.syscall_traced() {
+        return Some(number);
+    }
+    let r = ptrace::stop(thread, regs, number, StopKind::SyscallEntry, SIGTRAP, None);
+    if thread.is_killed() {
+        return None;
+    }
+    Some(r.map_or(number, |r| r.orig_rax))
+}
+
+/// Ends a system call: a tracer of `PTRACE_SYSCALL` sees the return. A thread in a single step
+/// gets `SIGTRAP` instead, because the trap flag stops it only after the next instruction, as
+/// `syscall_exit_work` of Linux does.
+fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
+    if thread.single_stepping() {
+        thread.send_signal(SigInfo::fault(SIGTRAP, TRAP_BRKPT, regs.regs().rip));
+    } else if thread.syscall_traced() {
+        ptrace::stop(thread, regs, number, StopKind::SyscallExit, SIGTRAP, None);
+    }
 }
 
 /// Connects the system calls to the other parts of the kernel: the clock of the VFS time stamps

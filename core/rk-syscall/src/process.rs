@@ -6,7 +6,8 @@ use rk_abi::Errno;
 use rk_abi::native::sched::{
     CLONE_ARGS_SIZE_VER0, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_CLEAR_SIGHAND,
     CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_INTO_CGROUP, CLONE_PARENT, CLONE_PARENT_SETTID,
-    CLONE_PIDFD, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_VFORK, CLONE_VM,
+    CLONE_PIDFD, CLONE_PTRACE, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_UNTRACED,
+    CLONE_VFORK, CLONE_VM,
 };
 use rk_abi::native::signal::SIGCHLD;
 use rk_abi::native::types::CloneArgs;
@@ -15,8 +16,13 @@ use rk_abi::native::wait::{
 };
 use rk_frame::task::yield_now;
 use rk_proc::exec::{ExecArgs, exec};
-use rk_proc::signal::SigInfo;
-use rk_proc::{ForkShare, Pid, Process, VforkDone, WaitOptions, WaitStatus, WaitTarget};
+use rk_proc::ptrace::{
+    self, PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE,
+};
+use rk_proc::signal::{CLD_TRAPPED, SigInfo};
+use rk_proc::{
+    ForkShare, Pid, Process, VforkDone, WaitOptions, WaitResult, WaitStatus, WaitTarget,
+};
 use zerocopy::FromZeros;
 
 /// The number of signals. Linux names it `_NSIG`.
@@ -43,7 +49,7 @@ pub(crate) fn sched_yield() -> SysResult {
 }
 
 pub(crate) fn clone(
-    cx: &Cx<'_>,
+    cx: &mut Cx<'_>,
     flags: u64,
     stack: u64,
     ptid: u64,
@@ -69,7 +75,7 @@ const CLONE_ARGS_MAX: u64 = 4096;
 /// `clone3`, as `copy_clone_args_from_user` and `clone3_args_valid` of Linux check it. The stack
 /// of `clone3` is the lowest address and a size, and the new thread starts at the top. The PID
 /// file descriptor, the cgroup and `set_tid` are not in R2, so they give `EINVAL`.
-pub(crate) fn clone3(cx: &Cx<'_>, uargs: u64, size: u64) -> SysResult {
+pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     if size > CLONE_ARGS_MAX {
         return Err(Errno::E2BIG);
     }
@@ -106,8 +112,9 @@ pub(crate) fn clone3(cx: &Cx<'_>, uargs: u64, size: u64) -> SysResult {
 }
 
 /// Makes a new thread or process for `clone` and `clone3`. `stack` is the stack pointer of the
-/// new thread, or 0 for the stack pointer of the caller.
-fn do_clone(cx: &Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
+/// new thread, or 0 for the stack pointer of the caller. A tracer that asked for the event of the
+/// call traces the new thread too.
+fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     let flags = args.flags;
     if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 {
         return Err(Errno::EINVAL);
@@ -155,21 +162,36 @@ fn do_clone(cx: &Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if let Some(done) = &vfork {
         thread.set_vfork_done(done.clone());
     }
+    let event = if flags & CLONE_VFORK != 0 {
+        PTRACE_EVENT_VFORK
+    } else if args.exit_signal != u64::from(SIGCHLD) {
+        PTRACE_EVENT_CLONE
+    } else {
+        PTRACE_EVENT_FORK
+    };
+    let traced = flags & CLONE_UNTRACED == 0
+        && (cx.thread.trace_event_enabled(event)
+            || (flags & CLONE_PTRACE != 0 && cx.thread.is_traced()));
+    if traced {
+        ptrace::attach_child(cx.thread, &thread);
+    }
     if let Err(e) = start_thread(thread.clone(), regs) {
         rk_proc::exit_thread(&thread, WaitStatus::exited(0));
         return Err(e);
     }
+    ptrace::event(cx.thread, cx.regs, cx.number, event, u64::from(tid));
     if let Some(done) = vfork {
         done.wait();
+        ptrace::event(cx.thread, cx.regs, cx.number, PTRACE_EVENT_VFORK_DONE, u64::from(tid));
     }
     Ok(u64::from(tid))
 }
 
-pub(crate) fn fork(cx: &Cx<'_>) -> SysResult {
+pub(crate) fn fork(cx: &mut Cx<'_>) -> SysResult {
     clone(cx, u64::from(SIGCHLD), 0, 0, 0, 0)
 }
 
-pub(crate) fn vfork(cx: &Cx<'_>) -> SysResult {
+pub(crate) fn vfork(cx: &mut Cx<'_>) -> SysResult {
     clone(cx, CLONE_VM | CLONE_VFORK | u64::from(SIGCHLD), 0, 0, 0, 0)
 }
 
@@ -185,6 +207,9 @@ pub(crate) fn execve(cx: &mut Cx<'_>, path: u64, argv: u64, envp: u64) -> SysRes
         rk_frame::addr::VirtAddr::new(image.entry),
         rk_frame::addr::VirtAddr::new(image.sp),
     );
+    cx.regs.set_syscall_return(0);
+    // rukernel keeps the thread ID in `execve`, so the old ID is the ID of the thread.
+    ptrace::exec_event(cx.thread, cx.regs, cx.number, cx.thread.tid());
     Ok(0)
 }
 
@@ -200,22 +225,23 @@ pub(crate) fn exit_group(cx: &mut Cx<'_>, code: u64) -> SysResult {
     Ok(0)
 }
 
-/// The flags `__WNOTHREAD`, `__WALL` and `__WCLONE` of the waits. rukernel has no clone children
-/// that send no `SIGCHLD`, so the flags change nothing.
+/// The flags `__WNOTHREAD`, `__WALL` and `__WCLONE` of the waits. `__WALL` and `__WCLONE` apply
+/// to the traced threads. rukernel has one wait queue for each process, so `__WNOTHREAD` changes
+/// nothing.
 const WAIT_LINUX_FLAGS: u32 = 0xe000_0000;
+const WALL: u32 = 0x4000_0000;
+const WCLONE: u32 = 0x8000_0000;
 
 /// Waits for a child with `options`, for `wait4` and `waitid`.
-fn wait_child(
-    cx: &Cx<'_>,
-    target: WaitTarget,
-    options: u32,
-) -> Result<Option<(Pid, WaitStatus, u64)>, Errno> {
+fn wait_child(cx: &Cx<'_>, target: WaitTarget, options: u32) -> Result<Option<WaitResult>, Errno> {
     let options = WaitOptions {
         exited: options & WEXITED != 0,
         stopped: options & WSTOPPED != 0,
         continued: options & WCONTINUED != 0,
         nohang: options & WNOHANG != 0,
         nowait: options & WNOWAIT != 0,
+        all: options & WALL != 0,
+        clone: options & WCLONE != 0,
     };
     let thread = cx.thread.clone();
     rk_proc::wait_child(cx.process(), target, options, || thread.signal_pending())
@@ -235,10 +261,10 @@ pub(crate) fn wait4(cx: &Cx<'_>, pid: u64, status: u64, options: u64, rusage: u6
         p => WaitTarget::Pgid(p.unsigned_abs()),
     };
     let found = wait_child(cx, target, options | WEXITED)?;
-    let Some((child, code, ticks)) = found else { return Ok(0) };
-    cx.write_opt(status, &code.0)?;
-    cx.write_opt(rusage, &crate::info::rusage(ticks))?;
-    Ok(u64::from(child))
+    let Some(r) = found else { return Ok(0) };
+    cx.write_opt(status, &r.status.0)?;
+    cx.write_opt(rusage, &crate::info::rusage(r.ticks))?;
+    Ok(u64::from(r.pid))
 }
 
 /// The fields of `siginfo_t` that `waitid` writes: `si_signo`, `si_errno`, `si_code`, `si_pid`,
@@ -272,11 +298,16 @@ pub(crate) fn waitid(
     // With `WNOHANG` and no child that changed, the fields are 0, as in Linux.
     let mut info = SigInfo::default();
     let mut ticks = 0;
-    if let Some((child, status, child_ticks)) = wait_child(cx, target, options)? {
-        let (code, value) = status.child_code();
-        info = SigInfo::new(SIGCHLD, code, child);
+    if let Some(r) = wait_child(cx, target, options)? {
+        let (code, value) = r.status.child_code();
+        info = SigInfo::new(SIGCHLD, code, r.pid);
         info.status = value;
-        ticks = child_ticks;
+        if r.trapped {
+            // The status of a stop of `ptrace` holds the event above the signal.
+            info.code = CLD_TRAPPED;
+            info.status = (r.status.0 >> 8) & 0xffff;
+        }
+        ticks = r.ticks;
     }
     if infop != 0 {
         cx.write_bytes(infop, &info.to_bytes()[..WAITID_INFO_SIZE])?;

@@ -26,6 +26,12 @@ impl WaitStatus {
         Self(((sig & 0xff) << 8) as i32 | 0x7f)
     }
 
+    /// The status of a traced thread that stopped with the signal `sig` and the `ptrace` event
+    /// `event`. The event is in bits 16 to 23.
+    pub const fn trapped(sig: u32, event: u32) -> Self {
+        Self((((event & 0xff) << 16) | ((sig & 0xff) << 8)) as i32 | 0x7f)
+    }
+
     /// The status of a stopped process that `SIGCONT` continued.
     pub const CONTINUED: Self = Self(0xffff);
 
@@ -90,6 +96,23 @@ pub struct WaitOptions {
     pub nohang: bool,
     /// `WNOWAIT`: the child stays, so a later wait can take it again.
     pub nowait: bool,
+    /// `__WALL`: each traced thread, also a thread that is not the leader of its process.
+    pub all: bool,
+    /// `__WCLONE`: only the traced threads that are not the leader of their process.
+    pub clone: bool,
+}
+
+/// A child or a traced thread that a wait found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitResult {
+    /// The process ID of the child, or the thread ID of the traced thread.
+    pub pid: u32,
+    /// The status.
+    pub status: WaitStatus,
+    /// The user CPU time in timer ticks.
+    pub ticks: u64,
+    /// The status is a stop of a traced thread. `waitid` gives `CLD_TRAPPED` for it.
+    pub trapped: bool,
 }
 
 #[cfg(test)]
@@ -117,5 +140,8 @@ mod tests {
         let c = WaitStatus::CONTINUED;
         assert_eq!((c.stop_signal(), c.signal(), c.exit_code()), (None, None, None));
         assert_eq!(c.child_code(), (CLD_CONTINUED, SIGCONT as i32));
+        let t = WaitStatus::trapped(5, 6);
+        assert_eq!(t.0, 0x6057f);
+        assert_eq!(t.stop_signal(), Some(5));
     }
 }

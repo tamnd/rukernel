@@ -821,6 +821,42 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Copies `buf` to user memory at `addr`, also to a private page that is read only, such as
+    /// the code of the program. The page gets a private copy first, so the file and the other
+    /// processes do not see the change. This is the write of `ptrace` with `FOLL_FORCE`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EFAULT` if a byte of the range is not mapped, or is in a shared area that does not
+    /// allow a write, and `ENOMEM` if no frame is free for the copy.
+    pub fn write_force(&self, addr: usize, buf: &[u8]) -> Result<(), Errno> {
+        let mut done = 0;
+        while done < buf.len() {
+            let at = addr + done;
+            let offset = at & (PAGE_SIZE - 1);
+            let len = (PAGE_SIZE - offset).min(buf.len() - done);
+            let chunk = &buf[done..done + len];
+            done += len;
+            if self.write(at, chunk).is_ok() {
+                continue;
+            }
+            self.handle_fault(at, Access::Read)?;
+            let st = self.state.lock();
+            let vma = st.vmas.find(at).ok_or(Errno::EFAULT)?;
+            if vma.shared {
+                return Err(Errno::EFAULT);
+            }
+            let page = VirtAddr::new(at & !(PAGE_SIZE - 1));
+            let (frame, _) = self.vm.page(page).ok_or(Errno::EFAULT)?;
+            let copy = copy_frame(&frame)?;
+            drop(frame);
+            copy.write_bytes(offset, chunk);
+            self.vm.unmap(page);
+            self.vm.map(page, copy, page_prot(vma, true)).map_err(map_error)?;
+        }
+        Ok(())
+    }
+
     /// Fills `len` bytes of user memory at `addr` with zeros.
     ///
     /// # Errors
