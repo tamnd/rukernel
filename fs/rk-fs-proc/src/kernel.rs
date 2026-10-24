@@ -287,6 +287,9 @@ fn thread_state(t: &Thread) -> u8 {
     if p.is_zombie() {
         return b'Z';
     }
+    if p.is_stopped() {
+        return b'T';
+    }
     match t.task() {
         Some(task) if task.is_blocked() => b'S',
         Some(_) => b'R',

@@ -14,6 +14,7 @@ use rk_abi::native::signal::{
     MINSIGSTKSZ, SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESTORER, SIG_BLOCK, SIG_SETMASK,
     SIG_UNBLOCK, SIGKILL, SIGSEGV, SIGSTOP,
 };
+use rk_abi::native::syscalls as nr;
 use rk_abi::native::types::{KernelTimespec, Sigaltstack};
 use rk_frame::user::{FpuState, UserContext};
 use rk_proc::signal::{
@@ -151,15 +152,11 @@ fn setup_frame(
 }
 
 /// Changes the registers of a system call that gave a restart code, when no handler runs: the
-/// call starts again. `restart_syscall` is not there yet, so `ERESTART_RESTARTBLOCK` gives
-/// `EINTR`.
+/// call starts again. After `ERESTART_RESTARTBLOCK`, the thread calls `restart_syscall`, which
+/// continues the call from the state that it kept.
 fn restart_without_handler(regs: &mut UserContext, e: Errno, number: u64) {
-    if e == Errno::ERESTART_RESTARTBLOCK {
-        regs.set_syscall_return(Errno::EINTR.to_syscall_return() as u64);
-        return;
-    }
     let r = regs.regs_mut();
-    r.rax = number;
+    r.rax = if e == Errno::ERESTART_RESTARTBLOCK { u64::from(nr::RESTART_SYSCALL) } else { number };
     r.rip -= SYSCALL_INSN_LEN;
 }
 
@@ -179,7 +176,8 @@ fn restart_with_handler(regs: &mut UserContext, e: Errno, number: u64, flags: u6
 
 /// Delivers the next signal of `thread` before the return to user mode. `syscall` is the number
 /// of the system call that the thread made, if the return is from one that can restart. Gives
-/// the status of the thread if the signal ends the process.
+/// the status of the thread if the signal ends the process. While the process is stopped, the
+/// thread waits here.
 pub(crate) fn deliver(
     thread: &Arc<Thread>,
     regs: &mut UserContext,
@@ -189,8 +187,19 @@ pub(crate) fn deliver(
         let e = Errno::from_syscall_return(regs.regs().rax as isize)?;
         e.is_restart().then_some((e, number))
     });
-    match thread.dequeue_signal() {
-        None => {
+    let delivery = loop {
+        thread.wait_while_stopped();
+        if thread.is_killed() {
+            return None;
+        }
+        match thread.dequeue_signal() {
+            Some(Delivery::Stop(sig)) => rk_proc::stop_group(thread, sig),
+            delivery => break delivery,
+        }
+    };
+    match delivery {
+        // The loop above takes each stop, so `Stop` does not come here.
+        None | Some(Delivery::Stop(_)) => {
             if let Some((e, number)) = restart {
                 restart_without_handler(regs, e, number);
             }
@@ -252,6 +261,8 @@ pub(crate) fn rt_sigreturn(cx: &mut Cx<'_>) -> SysResult {
     regs.set_fpu(fpu);
     *cx.regs = regs;
     cx.thread.set_blocked(SigSet(get(&b, UC_SIGMASK)));
+    // The call that the handler interrupted does not continue, as in Linux.
+    cx.thread.set_restart(None);
     let flags =
         u32::from_ne_bytes([b[UC_STACK + 8], b[UC_STACK + 9], b[UC_STACK + 10], b[UC_STACK + 11]]);
     let stack = AltStack { sp: get(&b, UC_STACK), size: get(&b, UC_STACK + 16), flags };

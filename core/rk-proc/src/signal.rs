@@ -35,6 +35,10 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 /// A signal killed the child and it made a core dump.
 pub const CLD_DUMPED: i32 = 3;
+/// A signal stopped the child.
+pub const CLD_STOPPED: i32 = 5;
+/// `SIGCONT` continued the stopped child.
+pub const CLD_CONTINUED: i32 = 6;
 /// The address has no mapping.
 pub const SEGV_MAPERR: i32 = 1;
 /// The mapping does not permit the access.
@@ -66,6 +70,9 @@ pub struct SigSet(pub u64);
 impl SigSet {
     /// The set with no signal.
     pub const EMPTY: Self = Self(0);
+    /// The signals that stop a process with the default action.
+    pub const STOP: Self =
+        Self(Self::bit(SIGSTOP) | Self::bit(SIGTSTP) | Self::bit(SIGTTIN) | Self::bit(SIGTTOU));
     /// The signals that a thread cannot block: `SIGKILL` and `SIGSTOP`.
     pub const UNBLOCKABLE: Self = Self(Self::bit(SIGKILL) | Self::bit(SIGSTOP));
 
@@ -158,14 +165,21 @@ pub const fn default_action(sig: u32) -> DefaultAction {
 }
 
 impl SigAction {
-    /// Tells if the kernel discards `sig` with this action. R1 has no stopped state, so a stop
-    /// signal with the default action is discarded too.
+    /// Tells if the kernel discards `sig` with this action. `SIGCONT` with the default action
+    /// continues a stopped process when it is sent, and then the kernel discards it.
     pub const fn ignores(&self, sig: u32) -> bool {
         match self.handler {
             SIG_IGN => true,
-            SIG_DFL => !default_action(sig).is_fatal(),
+            SIG_DFL => {
+                matches!(default_action(sig), DefaultAction::Ignore | DefaultAction::Continue)
+            }
             _ => false,
         }
+    }
+
+    /// Tells if `sig` with this action stops the process.
+    pub const fn is_stop(&self, sig: u32) -> bool {
+        self.handler == SIG_DFL && matches!(default_action(sig), DefaultAction::Stop)
     }
 
     /// Tells if `sig` with this action ends the process.

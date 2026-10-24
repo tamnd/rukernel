@@ -185,7 +185,8 @@ fn default_actions() {
     assert_eq!(default_action(SIGRTMIN + 3), DefaultAction::Terminate);
     let dfl = SigAction::default();
     assert!(dfl.is_fatal(SIGINT) && !dfl.ignores(SIGINT));
-    assert!(dfl.ignores(SIGCHLD) && dfl.ignores(SIGTSTP));
+    assert!(dfl.ignores(SIGCHLD) && dfl.ignores(SIGCONT) && !dfl.ignores(SIGTSTP));
+    assert!(dfl.is_stop(SIGTSTP) && !dfl.is_stop(SIGCONT) && !dfl.is_fatal(SIGTSTP));
     let ign = SigAction { handler: SIG_IGN, ..SigAction::default() };
     assert!(ign.ignores(SIGINT) && !ign.is_fatal(SIGINT));
     let handler = SigAction { handler: 0x1000, ..SigAction::default() };

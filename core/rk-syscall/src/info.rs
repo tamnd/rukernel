@@ -3,6 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use rk_abi::Errno;
 use rk_abi::native::random::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
+use rk_abi::native::syscalls as nr;
 use rk_abi::native::time::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW,
     CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME, CLOCK_REALTIME_COARSE, CLOCK_TAI,
@@ -12,6 +13,7 @@ use rk_abi::native::types::{
     KernelOldTimeval, KernelTimespec, NewUtsname, Rlimit64, Rusage, Sysinfo,
 };
 use rk_frame::time::{HZ, ticks};
+use rk_proc::Restart;
 use rk_proc::exec::USER_HZ;
 use rk_proc::limits::{Limit, NR_OPEN, RLIM_NLIMITS, RLIMIT_NOFILE};
 use zerocopy::FromZeros;
@@ -117,16 +119,37 @@ pub(crate) fn clock_nanosleep(
     let now = clock_ns(clock)?;
     let ts: KernelTimespec = cx.read_val(req)?;
     let want = timespec_ns(&ts)?;
-    let end = if flags as u32 & TIMER_ABSTIME != 0 { want } else { now.saturating_add(want) };
-    let tick_ns = NSEC_PER_SEC / HZ;
-    let deadline = end.div_ceil(tick_ns);
-    if sleep_until(cx.thread, deadline) {
-        if flags as u32 & TIMER_ABSTIME == 0 {
-            cx.write_opt(rem, &timespec(end.saturating_sub(uptime_ns())))?;
+    if flags as u32 & TIMER_ABSTIME != 0 {
+        // The end does not change, so the call can start again with the same arguments.
+        if sleep_until(cx.thread, want.div_ceil(NSEC_PER_SEC / HZ)) {
+            return Err(Errno::ERESTARTNOHAND);
         }
-        return Err(Errno::EINTR);
+        return Ok(0);
     }
-    Ok(0)
+    sleep_relative(cx, now.saturating_add(want), rem)
+}
+
+/// Sleeps until `end` in nanoseconds since boot, for a relative `clock_nanosleep`. If a signal
+/// comes first, it writes the rest of the time to `rem`, and keeps the end for
+/// `restart_syscall`, as `hrtimer_nanosleep` of Linux does.
+fn sleep_relative(cx: &Cx<'_>, end: u64, rem: u64) -> SysResult {
+    if !sleep_until(cx.thread, end.div_ceil(NSEC_PER_SEC / HZ)) {
+        return Ok(0);
+    }
+    cx.write_opt(rem, &timespec(end.saturating_sub(uptime_ns())))?;
+    cx.thread.set_restart(Some(Restart { call: nr::CLOCK_NANOSLEEP, args: [end, rem, 0] }));
+    Err(Errno::ERESTART_RESTARTBLOCK)
+}
+
+/// Continues the call that a signal without a handler or a stop interrupted. If there is no
+/// such call, it gives `EINTR`, as `do_no_restart_syscall` of Linux does.
+pub(crate) fn restart_syscall(cx: &Cx<'_>) -> SysResult {
+    match cx.thread.take_restart() {
+        Some(Restart { call, args: [end, rem, _] }) if call == nr::CLOCK_NANOSLEEP => {
+            sleep_relative(cx, end, rem)
+        }
+        _ => Err(Errno::EINTR),
+    }
 }
 
 fn utsname_field(s: &[u8]) -> [u8; 65] {

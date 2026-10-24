@@ -11,10 +11,13 @@
 # enforce the limits, and setrlimit02 needs user IDs. futex_waitv03 needs System V shared memory.
 #
 # sigwaitinfo01 and sigtimedwait01 wait for an empty set of signals, and the wrappers of musl call
-# the system call again after EINTR, so the tests do not stop. rt_sigsuspend01 reads sa_restorer
-# from the old action, and musl does not give it. timer_settime03 sets a time before the epoch,
+# the system call again after EINTR, so the tests do not stop. rt_sigsuspend01, rt_sigaction01 and
+# rt_sigprocmask01 read sa_restorer from the old action, and musl does not give it. timer_settime03 sets a time before the epoch,
 # because CLOCK_REALTIME starts at 0 at boot. tgkill02 needs RLIMIT_SIGPENDING. kill05 needs System
 # V shared memory, and kill13 needs a kernel with UBSAN.
+#
+# clock_gettime01 waits until /proc/self/stat shows CPU time, and the kernel does not count CPU time
+# yet. waitid10 reads /proc/sys/kernel/core_pattern, and the kernel does not have /proc/sys yet.
 alarm02
 alarm03
 alarm05
@@ -22,6 +25,8 @@ alarm06
 alarm07
 brk01
 brk02
+clock_gettime02
+clock_gettime04
 clone01
 clone02
 clone03
@@ -69,6 +74,8 @@ getrlimit02
 getrlimit03
 gettid01
 gettid02
+gettimeofday01
+gettimeofday02
 kill02
 kill03
 kill06
@@ -128,8 +135,14 @@ munlock02
 munmap01
 munmap03
 munmap04
+nanosleep01
+nanosleep02
+nanosleep04
 pause01
 pause02
+rt_sigaction02
+rt_sigaction03
+rt_sigprocmask02
 rt_sigqueueinfo01
 rt_sigqueueinfo02
 rt_sigtimedwait01
@@ -138,6 +151,10 @@ setitimer02
 setrlimit03
 setrlimit04
 setrlimit05
+sigaction01
+sigaction02
+sigaltstack01
+sigaltstack02
 signal01
 signal02
 signal03
@@ -145,6 +162,7 @@ signal04
 signal05
 signal06
 sigpending02
+sigprocmask01
 sigsuspend01
 sigsuspend02
 sigwait01
@@ -161,6 +179,16 @@ wait02
 wait401
 wait402
 wait403
+waitid01
+waitid02
+waitid03
+waitid04
+waitid05
+waitid06
+waitid07
+waitid08
+waitid09
+waitid11
 waitpid01
 waitpid03
 waitpid04
