@@ -75,6 +75,10 @@ struct ThreadSignals {
     /// The mask that `rt_sigsuspend` replaced. The kernel puts it back after the delivery.
     saved_mask: Option<SigSet>,
     altstack: AltStack,
+    /// The blocked signals that the thread waits for in `rt_sigtimedwait`. A signal in this set
+    /// wakes the thread, and its action does not apply. Linux keeps the opposite set in
+    /// `real_blocked`.
+    waiting: SigSet,
 }
 
 /// What the thread must do with the next signal that it takes.
@@ -605,6 +609,22 @@ impl Thread {
         }
     }
 
+    /// Sets the blocked signals that the thread waits for, for `rt_sigtimedwait`. The empty set
+    /// ends the wait.
+    pub fn set_waiting(&self, set: SigSet) {
+        self.signals.lock().waiting = set;
+    }
+
+    /// Takes the next pending signal that is in `set`, first from the queue of the thread and
+    /// then from the queue of the process. The action of the signal does not apply. This is
+    /// the dequeue of `rt_sigtimedwait` and `signalfd`.
+    pub fn take_signal(&self, set: SigSet) -> Option<SigInfo> {
+        let mut shared = self.process.signals.lock();
+        let mut own = self.signals.lock();
+        let others = SigSet(!set.0);
+        own.pending.take(others).or_else(|| shared.pending.take(others))
+    }
+
     /// Sends a signal to this thread, for `tkill`, `tgkill` and the exceptions. See
     /// `send_signal`.
     pub fn send_signal(self: &Arc<Self>, info: SigInfo) {
@@ -803,11 +823,20 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     };
     let mut shared = process.signals.lock();
     let action = shared.actions[sig as usize - 1];
-    let target = threads.iter().find(|t| !t.signals.lock().blocked.contains(sig)).cloned();
-    if action.ignores(sig) && target.is_some() {
+    let target = threads
+        .iter()
+        .find(|t| {
+            let s = t.signals.lock();
+            !s.blocked.contains(sig) || s.waiting.contains(sig)
+        })
+        .cloned();
+    // A thread that waits for the signal in `rt_sigtimedwait` takes it, so the action does not
+    // apply.
+    let handled = target.as_ref().is_some_and(|t| !t.signals.lock().waiting.contains(sig));
+    if action.ignores(sig) && handled {
         return;
     }
-    if action.is_fatal(sig) && target.is_some() {
+    if action.is_fatal(sig) && handled {
         drop(shared);
         kill_group(process, process.fatal_status(sig));
         return;

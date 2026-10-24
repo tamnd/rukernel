@@ -1,7 +1,7 @@
 use crate::elf::{self, ElfType, SegmentFlags};
 use crate::signal::{
-    AltStack, CLD_EXITED, DefaultAction, Pending, SEGV_MAPERR, SI_USER, SIG_IGN, SS_DISABLE,
-    SS_ONSTACK, SigAction, SigInfo, SigSet, default_action,
+    AltStack, CLD_EXITED, DefaultAction, Pending, SEGV_MAPERR, SI_QUEUE, SI_USER, SIG_IGN,
+    SS_DISABLE, SS_ONSTACK, SigAction, SigInfo, SigSet, default_action,
 };
 use crate::stack::{self, StackArgs};
 use alloc::vec;
@@ -215,7 +215,7 @@ fn pending_queue() {
 
 #[test]
 fn siginfo_layout() {
-    use rk_abi::native::signal::{SIGCHLD, SIGSEGV};
+    use rk_abi::native::signal::{SIGCHLD, SIGRTMIN, SIGSEGV};
     let mut chld = SigInfo::new(SIGCHLD, CLD_EXITED, 42);
     chld.status = 3;
     let b = chld.to_bytes();
@@ -228,6 +228,13 @@ fn siginfo_layout() {
     let b = segv.to_bytes();
     assert_eq!(&b[16..24], &0xdead_0000u64.to_ne_bytes());
     assert_eq!(size_of::<SigAction>(), 32);
+    assert_eq!(SigInfo::from_bytes(&chld.to_bytes()), chld);
+    assert_eq!(SigInfo::from_bytes(&segv.to_bytes()), segv);
+    let mut queued = SigInfo::new(SIGRTMIN, SI_QUEUE, 9);
+    queued.value = 0x1234_5678_9abc;
+    let b = queued.to_bytes();
+    assert_eq!(&b[24..32], &0x1234_5678_9abcu64.to_ne_bytes());
+    assert_eq!(SigInfo::from_bytes(&b), queued);
 }
 
 #[test]

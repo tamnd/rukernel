@@ -16,7 +16,7 @@ use rk_proc::exec::USER_HZ;
 use rk_proc::limits::{Limit, NR_OPEN, RLIM_NLIMITS, RLIMIT_NOFILE};
 use zerocopy::FromZeros;
 
-const NSEC_PER_SEC: u64 = 1_000_000_000;
+pub(crate) const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 /// The most bytes of one `getrandom`. Linux names it `MAX_RW_COUNT`.
 const MAX_RANDOM: usize = 0x7fff_f000;
@@ -33,7 +33,20 @@ pub(crate) fn realtime() -> rk_vfs::inode::Timespec {
     rk_vfs::inode::Timespec { sec: (ns / NSEC_PER_SEC) as i64, nsec: (ns % NSEC_PER_SEC) as u32 }
 }
 
-fn timespec(ns: u64) -> KernelTimespec {
+/// Gives the nanoseconds of a `timespec`. Gives `EINVAL` if a field is out of range.
+pub(crate) fn timespec_ns(ts: &KernelTimespec) -> Result<u64, Errno> {
+    if ts.tv_sec < 0 || !(0..NSEC_PER_SEC as i64).contains(&ts.tv_nsec) {
+        return Err(Errno::EINVAL);
+    }
+    Ok((ts.tv_sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(ts.tv_nsec as u64))
+}
+
+/// The timer tick when `ns` nanoseconds from now are over.
+pub(crate) fn deadline_after(ns: u64) -> u64 {
+    uptime_ns().saturating_add(ns).div_ceil(NSEC_PER_SEC / HZ)
+}
+
+pub(crate) fn timespec(ns: u64) -> KernelTimespec {
     KernelTimespec { tv_sec: (ns / NSEC_PER_SEC) as i64, tv_nsec: (ns % NSEC_PER_SEC) as i64 }
 }
 
@@ -103,10 +116,7 @@ pub(crate) fn clock_nanosleep(
     }
     let now = clock_ns(clock)?;
     let ts: KernelTimespec = cx.read_val(req)?;
-    if ts.tv_sec < 0 || !(0..NSEC_PER_SEC as i64).contains(&ts.tv_nsec) {
-        return Err(Errno::EINVAL);
-    }
-    let want = (ts.tv_sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(ts.tv_nsec as u64);
+    let want = timespec_ns(&ts)?;
     let end = if flags as u32 & TIMER_ABSTIME != 0 { want } else { now.saturating_add(want) };
     let tick_ns = NSEC_PER_SEC / HZ;
     let deadline = end.div_ceil(tick_ns);

@@ -272,6 +272,66 @@ static void set_handler(int sig, void (*fn)(int, siginfo_t *, void *), int flags
 	sigaction(sig, &sa, NULL);
 }
 
+static void test_sigwait(void)
+{
+	sigset_t set, old;
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+	sigaddset(&set, SIGUSR2);
+	sigaddset(&set, SIGTERM);
+	sigaddset(&set, SIGRTMIN);
+	sigprocmask(SIG_BLOCK, &set, &old);
+
+	siginfo_t si;
+	raise(SIGUSR1);
+	check("sigwaitinfo takes a pending signal", sigwaitinfo(&set, &si) == SIGUSR1 &&
+	      si.si_signo == SIGUSR1 && si.si_code == SI_TKILL);
+
+	struct timespec zero = {0, 0};
+	check("sigtimedwait with no time gives EAGAIN", sigtimedwait(&set, &si, &zero) == -1 && errno == EAGAIN);
+	struct timespec short_time = {0, 30 * 1000 * 1000};
+	check("sigtimedwait gives EAGAIN at the end of the time",
+	      sigtimedwait(&set, &si, &short_time) == -1 && errno == EAGAIN);
+
+	union sigval v = {.sival_int = 42};
+	check("sigqueue", sigqueue(getpid(), SIGUSR2, v) == 0);
+	check("sigwaitinfo gives the value of sigqueue", sigwaitinfo(&set, &si) == SIGUSR2 &&
+	      si.si_code == SI_QUEUE && si.si_value.sival_int == 42 && si.si_pid == getpid());
+
+	for (int i = 0; i < 3; i++) {
+		v.sival_int = i;
+		sigqueue(getpid(), SIGRTMIN, v);
+	}
+	int order = 1;
+	for (int i = 0; i < 3; i++)
+		order &= sigwaitinfo(&set, &si) == SIGRTMIN && si.si_value.sival_int == i;
+	check("real time signals queue in order", order);
+
+	pid_t pid = fork();
+	if (pid == 0) {
+		struct timespec d = {0, 20 * 1000 * 1000};
+		nanosleep(&d, NULL);
+		kill(getppid(), SIGTERM);
+		_exit(0);
+	}
+	struct timespec long_time = {5, 0};
+	int sig = sigtimedwait(&set, &si, &long_time);
+	check("sigtimedwait takes a blocked fatal signal from a child", sig == SIGTERM && si.si_pid == pid);
+	int status;
+	waitpid(pid, &status, 0);
+
+	siginfo_t fake;
+	memset(&fake, 0, sizeof(fake));
+	fake.si_code = SI_USER;
+	check("rt_sigqueueinfo with SI_USER to another process gives EPERM",
+	      syscall(SYS_rt_sigqueueinfo, 1000000, SIGUSR1, &fake) == -1 && (errno == EPERM || errno == ESRCH));
+	fake.si_code = SI_QUEUE;
+	fake.si_value.sival_int = 7;
+	check("rt_tgsigqueueinfo", syscall(SYS_rt_tgsigqueueinfo, getpid(), gettid(), SIGUSR1, &fake) == 0 &&
+	      sigwaitinfo(&set, &si) == SIGUSR1 && si.si_value.sival_int == 7);
+	sigprocmask(SIG_SETMASK, &old, NULL);
+}
+
 static void test_signals(void)
 {
 	volatile double x = 1.5;
@@ -811,6 +871,7 @@ int main(int argc, char **argv)
 	test_time();
 	test_vdso();
 	test_signals();
+	test_sigwait();
 	test_pipes();
 	test_threads();
 	test_locks();

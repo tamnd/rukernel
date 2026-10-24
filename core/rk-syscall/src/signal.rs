@@ -14,7 +14,7 @@ use rk_abi::native::signal::{
     MINSIGSTKSZ, SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESTORER, SIG_BLOCK, SIG_SETMASK,
     SIG_UNBLOCK, SIGKILL, SIGSEGV, SIGSTOP,
 };
-use rk_abi::native::types::Sigaltstack;
+use rk_abi::native::types::{KernelTimespec, Sigaltstack};
 use rk_frame::user::{FpuState, UserContext};
 use rk_proc::signal::{
     AltStack, NSIG, SI_KERNEL, SI_TKILL, SI_USER, SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE,
@@ -441,4 +441,101 @@ pub(crate) fn tkill(cx: &Cx<'_>, tid: u64, sig: u64) -> SysResult {
 
 pub(crate) fn tgkill(cx: &Cx<'_>, tgid: u64, tid: u64, sig: u64) -> SysResult {
     signal_thread(cx, Some(tgid), tid, sig)
+}
+
+pub(crate) fn rt_sigtimedwait(
+    cx: &Cx<'_>,
+    set: u64,
+    uinfo: u64,
+    timeout: u64,
+    size: u64,
+) -> SysResult {
+    if size != SIGSET_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let set: u64 = cx.read_val(set)?;
+    let set = SigSet(set).without(SigSet::UNBLOCKABLE);
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let ts: KernelTimespec = cx.read_val(timeout)?;
+        Some(crate::info::deadline_after(crate::info::timespec_ns(&ts)?))
+    };
+    let thread = cx.thread;
+    let mut info = thread.take_signal(set);
+    if info.is_none() && deadline != Some(rk_frame::time::ticks()) {
+        // The signals of `set` wake the thread while it waits, as if it did not block them.
+        thread.set_waiting(set);
+        let queue = rk_frame::task::WaitQueue::new();
+        let cond = || match thread.take_signal(set) {
+            Some(i) => Some(Some(i)),
+            None => thread.signal_pending().then_some(None),
+        };
+        info = match deadline {
+            Some(d) => queue.wait_until_timeout(d, cond).flatten(),
+            None => queue.wait_until(cond),
+        };
+        thread.set_waiting(SigSet::EMPTY);
+        // A signal can come after the wait and before the end of the wait set.
+        if info.is_none() {
+            info = thread.take_signal(set);
+        }
+        if info.is_none() && thread.signal_pending() {
+            return Err(Errno::EINTR);
+        }
+    }
+    let info = info.ok_or(Errno::EAGAIN)?;
+    if uinfo != 0 {
+        cx.write_bytes(uinfo, &info.to_bytes())?;
+    }
+    Ok(u64::from(info.signo))
+}
+
+/// Reads the `siginfo_t` of `rt_sigqueueinfo` and `rt_tgsigqueueinfo`. A program can send a
+/// signal with a code that tells that the kernel or `kill` sent it only to itself, as
+/// `do_rt_sigqueueinfo` of Linux tells.
+fn queue_info(cx: &Cx<'_>, target: Pid, sig: u64, uinfo: u64) -> Result<SigInfo, Errno> {
+    if sig > u64::from(NSIG) {
+        return Err(Errno::EINVAL);
+    }
+    let b = cx.read_bytes(uinfo, SIGINFO_SIZE)?;
+    let mut raw = [0u8; SIGINFO_SIZE];
+    raw.copy_from_slice(&b);
+    let mut info = SigInfo::from_bytes(&raw);
+    if (info.code >= 0 || info.code == SI_TKILL) && target != cx.process().pid() {
+        return Err(Errno::EPERM);
+    }
+    info.signo = sig as u32;
+    Ok(info)
+}
+
+pub(crate) fn rt_sigqueueinfo(cx: &Cx<'_>, tgid: u64, sig: u64, uinfo: u64) -> SysResult {
+    let info = queue_info(cx, tgid as Pid, sig, uinfo)?;
+    let target = rk_proc::find_process(tgid as Pid)
+        .filter(|p| tgid as i32 > 0 && !p.is_zombie())
+        .ok_or(Errno::ESRCH)?;
+    if sig != 0 {
+        rk_proc::send_signal(&target, info);
+    }
+    Ok(0)
+}
+
+pub(crate) fn rt_tgsigqueueinfo(
+    cx: &Cx<'_>,
+    tgid: u64,
+    tid: u64,
+    sig: u64,
+    uinfo: u64,
+) -> SysResult {
+    if tid as i32 <= 0 || tgid as i32 <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let info = queue_info(cx, tgid as Pid, sig, uinfo)?;
+    let thread = rk_proc::find_thread(tid as Pid)
+        .filter(|t| t.process().pid() == tgid as Pid)
+        .ok_or(Errno::ESRCH)?;
+    if sig != 0 {
+        thread.send_signal(info);
+    }
+    Ok(0)
 }
