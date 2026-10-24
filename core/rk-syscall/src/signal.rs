@@ -269,7 +269,10 @@ fn traced_signal(
     }
     if thread.take_interrupt() {
         let kind = StopKind::Event(PTRACE_EVENT_STOP);
-        if let Some(r) = ptrace::stop(thread, regs, orig, kind, SIGTRAP, None) {
+        // The stop gives the signal of the group stop while the process is stopped, as
+        // `do_jobctl_trap` of Linux does.
+        let sig = thread.process().stop_signal().unwrap_or(SIGTRAP);
+        if let Some(r) = ptrace::stop(thread, regs, orig, kind, sig, None) {
             update(r.orig_rax);
         }
         return None;

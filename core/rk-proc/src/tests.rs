@@ -145,6 +145,8 @@ fn initial_stack_layout() {
     assert_eq!(word(&img, aux + 48), 15);
     assert_eq!(cstr(&img, top, word(&img, aux + 56)), b"x86_64");
     assert_eq!((word(&img, aux + 64), word(&img, aux + 72)), (0, 0));
+    // The copy for /proc/PID/auxv has the same words.
+    assert_eq!(img.auxv, img.bytes[aux - img.sp..aux - img.sp + 80]);
     // The path is the highest string, below the null pointer at the top.
     assert_eq!(&img.bytes[img.bytes.len() - 8..], &[0; 8]);
 }

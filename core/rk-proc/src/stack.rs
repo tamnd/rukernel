@@ -25,6 +25,8 @@ pub struct StackImage {
     pub sp: usize,
     /// The bytes from `sp` to the top of the stack.
     pub bytes: Vec<u8>,
+    /// The auxiliary vector with its `AT_NULL` entry, as `/proc/PID/auxv` gives it.
+    pub auxv: Vec<u8>,
 }
 
 /// The content of the initial stack.
@@ -117,9 +119,12 @@ pub fn build(top: usize, args: &StackArgs<'_>) -> Result<StackImage, Errno> {
     table.push(0);
     table.extend(envp.iter().map(|&a| a as u64));
     table.push(0);
+    let mut auxv_bytes = Vec::with_capacity(16 * auxv.len());
     for (key, value) in auxv {
         table.push(key);
         table.push(value);
+        auxv_bytes.extend_from_slice(&key.to_le_bytes());
+        auxv_bytes.extend_from_slice(&value.to_le_bytes());
     }
     let mut bytes = vec![0u8; top - sp];
     for (i, word) in table.iter().enumerate() {
@@ -128,5 +133,5 @@ pub fn build(top: usize, args: &StackArgs<'_>) -> Result<StackImage, Errno> {
     for (at, data) in strings {
         bytes[at - sp..at - sp + data.len()].copy_from_slice(data);
     }
-    Ok(StackImage { sp, bytes })
+    Ok(StackImage { sp, bytes, auxv: auxv_bytes })
 }

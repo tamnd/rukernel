@@ -591,6 +591,8 @@ struct Rootfs {
     /// The programs from tests/user that the test compiles with glibc and puts in
     /// /usr/local/bin with the prefix `rk-`.
     glibc_programs: &'static [&'static str],
+    /// The test adds the tree of tools/debug/build.sh, if it is there.
+    debug_tools: bool,
 }
 
 /// The root file systems of the boot tests. The Alpine programs use musl, and the Debian programs
@@ -610,9 +612,25 @@ ls -l /lib/ld-musl-x86_64.so.1
 apk --version
 apk info --no-network | grep -q musl
 echo one two | tr a-z A-Z | grep -q 'ONE TWO'
+if [ -x /usr/bin/gdb ]; then
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    strace -f -o /tmp/strace.log sh -c 'echo one | tr a-z A-Z' | grep -qx ONE
+    grep -q '^[0-9]* *execve(\"/usr/bin/tr\"' /tmp/strace.log
+    grep -q '^[0-9]* *pipe(\\[3, 4\\]) *= 0' /tmp/strace.log
+    grep -q '+++ exited with 0 +++' /tmp/strace.log
+    echo \"alpine: strace traced $(grep -c . /tmp/strace.log) lines\"
+    gdb -batch -nx -ex 'break square' -ex run -ex 'print n' -ex next -ex next -ex delete -ex continue \\
+        /usr/local/bin/rk-count > /tmp/gdb.log 2>&1
+    grep -q 'Breakpoint 1, square (n=1)' /tmp/gdb.log
+    grep -q '^\\$1 = 1$' /tmp/gdb.log
+    grep -q 'count: 14' /tmp/gdb.log
+    grep -q 'exited normally' /tmp/gdb.log || { cat /tmp/gdb.log; exit 1; }
+    echo 'alpine: gdb done'
+fi
 echo 'alpine: done'
 ",
         glibc_programs: &[],
+        debug_tools: true,
     },
     Rootfs {
         name: "debian",
@@ -637,6 +655,7 @@ find /etc -name debian_version | grep -q debian_version
 echo 'debian: done'
 ",
         glibc_programs: &["nptl"],
+        debug_tools: false,
     },
 ];
 
@@ -709,6 +728,18 @@ fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
             compile_c(&cc, &["-pthread"], name, &bin.join(format!("rk-{name}")))?;
         }
     }
+    if let Some(tools) = debug_tools_dir().filter(|_| rootfs.debug_tools) {
+        // `cp -R` keeps the symbolic links of the tree.
+        let status = Command::new("cp")
+            .arg("-pR")
+            .arg(tools.join("root/."))
+            .arg(&root)
+            .status()
+            .map_err(|e| format!("cannot run cp: {e}"))?;
+        if !status.success() {
+            return Err(format!("cp cannot copy {}", tools.display()));
+        }
+    }
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
     add_tree(&mut w, &root, &root)?;
@@ -721,6 +752,14 @@ fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
 /// The path of the initramfs of the root file system boot test `name`.
 fn rootfs_initramfs(kernel: &Path, name: &str) -> PathBuf {
     kernel.with_file_name(format!("initramfs-{name}.cpio"))
+}
+
+/// The directory of gdb, strace and their test program that tools/debug/build.sh makes:
+/// `RK_DEBUG_TOOLS`, or target/debug-tools.
+fn debug_tools_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("RK_DEBUG_TOOLS")
+        .map_or_else(|| workspace_root().join("target/debug-tools"), PathBuf::from);
+    dir.join("VERSION").exists().then_some(dir)
 }
 
 /// The longest time that the `ltp` boot test can take. It runs each test of tools/ltp/tests.txt.

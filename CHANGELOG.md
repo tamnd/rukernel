@@ -12,12 +12,16 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `PTRACE_SINGLESTEP`, `PTRACE_GETSIGINFO`, `PTRACE_SETSIGINFO`, `PTRACE_GETEVENTMSG`, `PTRACE_SETOPTIONS`, `PTRACE_GET_SYSCALL_INFO`, `PTRACE_KILL` and `PTRACE_DETACH`.
 - `process_vm_readv` and `process_vm_writev`.
 - `wait4` accepts `__WALL` and `__WCLONE`, and `waitid` gives `CLD_TRAPPED` for a stop of a tracee.
+- `/proc/PID/mem` reads and writes the memory of a process. `/proc/PID/auxv` gives the auxiliary vector. `/proc/PID/status` gives `TracerPid`, and a stopped tracee has the state `t`.
+- The `alpine` boot test runs strace and gdb, if `tools/debug/build.sh` installed them. strace traces a shell pipeline with `-f`, and gdb sets a breakpoint in a program and steps it.
 - init checks `ptrace` and `process_vm_readv`.
 - The `ltp` boot test runs 191 tests. The new tests are 8 `ptrace` tests.
 
 ### Fixed
 
 - The exit signal of init is now `SIGCHLD`, as in Linux. Before, it was 0.
+- `PTRACE_LISTEN` after `PTRACE_INTERRUPT` or `SIGCONT` now makes the tracee stop again at once, as in Linux. Before, the tracee stayed in the stop, and strace did not continue.
+- A stop of `PTRACE_INTERRUPT` in a stopped process now gives the stop signal, as in Linux.
 
 ## [0.2.2] (2026-10-24)
 

@@ -1,5 +1,6 @@
-//! The three kinds of inode of procfs: a file that makes its text at each read, a symbolic link
-//! that finds its target at each read, and a directory that makes its list at each read.
+//! The kinds of inode of procfs: a file that makes its text at each read, a file that reads and
+//! writes at an offset, a symbolic link that finds its target at each read, and a directory that
+//! makes its list at each read.
 //!
 //! The text of a file is new at each `read`, so a read at an offset sees the text of that moment.
 //! Linux keeps the text of an open file in a `seq_file` buffer. The programs that R1 runs read a
@@ -21,6 +22,10 @@ pub(crate) type ReadFn = Box<dyn Fn() -> Result<Vec<u8>> + Send + Sync>;
 pub(crate) type WriteFn = Box<dyn Fn(&[u8]) -> Result<()> + Send + Sync>;
 /// Makes the entries of a directory.
 pub(crate) type ListFn = Box<dyn Fn() -> Result<Vec<(Vec<u8>, InodeRef)>> + Send + Sync>;
+/// Reads at an offset into a buffer, and gives the number of bytes.
+pub(crate) type ReadAtFn = Box<dyn Fn(u64, &mut [u8]) -> Result<usize> + Send + Sync>;
+/// Writes a buffer at an offset, and gives the number of bytes.
+pub(crate) type WriteAtFn = Box<dyn Fn(u64, &[u8]) -> Result<usize> + Send + Sync>;
 /// Finds one entry of a directory, without the full list.
 pub(crate) type FindFn = Box<dyn Fn(&[u8]) -> Result<InodeRef> + Send + Sync>;
 
@@ -28,9 +33,21 @@ pub(crate) type FindFn = Box<dyn Fn(&[u8]) -> Result<InodeRef> + Send + Sync>;
 const BLOCK_SIZE: u32 = 1024;
 
 enum Kind {
-    File { read: ReadFn, write: Option<WriteFn> },
+    File {
+        read: ReadFn,
+        write: Option<WriteFn>,
+    },
+    /// A file that reads and writes at an offset, as `/proc/PID/mem`.
+    Data {
+        read: ReadAtFn,
+        write: WriteAtFn,
+    },
     Link(ReadFn),
-    Dir { parent: u64, list: ListFn, find: Option<FindFn> },
+    Dir {
+        parent: u64,
+        list: ListFn,
+        find: Option<FindFn>,
+    },
 }
 
 /// An inode of procfs.
@@ -83,6 +100,17 @@ pub(crate) fn rw_file(
     Arc::new(Node { ino: ino(path), perm: 0o644, kind })
 }
 
+/// Makes a file that reads and writes at an offset, with the permission bits `perm`.
+pub(crate) fn data_file(
+    path: &[u8],
+    perm: u32,
+    read: impl Fn(u64, &mut [u8]) -> Result<usize> + Send + Sync + 'static,
+    write: impl Fn(u64, &[u8]) -> Result<usize> + Send + Sync + 'static,
+) -> InodeRef {
+    let kind = Kind::Data { read: Box::new(read), write: Box::new(write) };
+    Arc::new(Node { ino: ino(path), perm, kind })
+}
+
 /// Makes a symbolic link with the permission bits `perm`.
 pub(crate) fn link(
     path: &[u8],
@@ -118,7 +146,7 @@ pub(crate) fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
 impl Inode for Node {
     fn metadata(&self) -> Metadata {
         let (kind, nlink) = match self.kind {
-            Kind::File { .. } => (mode::S_IFREG, 1),
+            Kind::File { .. } | Kind::Data { .. } => (mode::S_IFREG, 1),
             Kind::Link(_) => (mode::S_IFLNK, 1),
             Kind::Dir { .. } => (mode::S_IFDIR, 2),
         };
@@ -145,6 +173,9 @@ impl Inode for Node {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if let Kind::Data { read, .. } = &self.kind {
+            return read(offset, buf);
+        }
         let Kind::File { read, .. } = &self.kind else {
             return Err(if matches!(self.kind, Kind::Dir { .. }) {
                 Errno::EISDIR
@@ -159,8 +190,9 @@ impl Inode for Node {
         Ok(n)
     }
 
-    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         match &self.kind {
+            Kind::Data { write, .. } => write(offset, buf),
             Kind::File { write: Some(write), .. } => {
                 write(buf)?;
                 Ok(buf.len())
@@ -274,6 +306,18 @@ mod tests {
                         ),
                     ),
                     (b"self".to_vec(), link(b"/self", 0o777, || Ok(b"1".to_vec()))),
+                    (
+                        b"data".to_vec(),
+                        data_file(
+                            b"/data",
+                            0o600,
+                            |offset, buf| {
+                                buf.fill(offset as u8);
+                                Ok(buf.len())
+                            },
+                            |offset, _| Ok(offset as usize),
+                        ),
+                    ),
                 ])
             },
             None,
@@ -306,11 +350,21 @@ mod tests {
     }
 
     #[test]
+    fn a_data_file_reads_and_writes_at_the_offset() {
+        let data = tree().lookup(b"data").unwrap();
+        let mut buf = [0u8; 2];
+        assert_eq!(data.read_at(9, &mut buf).unwrap(), 2);
+        assert_eq!(buf, [9, 9]);
+        assert_eq!(data.write_at(7, b"x").unwrap(), 7);
+        assert_eq!(data.metadata().mode, mode::S_IFREG | 0o600);
+    }
+
+    #[test]
     fn a_directory_lists_its_entries() {
         let root = tree();
         let names: Vec<Vec<u8>> =
             (0..).map_while(|pos| root.read_dir(pos).unwrap()).map(|(e, _)| e.name).collect();
-        assert_eq!(names, [&b"."[..], b"..", b"text", b"value", b"self"]);
+        assert_eq!(names, [&b"."[..], b"..", b"text", b"value", b"self", b"data"]);
         assert_eq!(root.metadata().ino, 1);
         assert_eq!(root.lookup(b"nothing").err(), Some(Errno::ENOENT));
         assert_eq!(root.lookup(b"self").unwrap().read_link().unwrap(), b"1");
