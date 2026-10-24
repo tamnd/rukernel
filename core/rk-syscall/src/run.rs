@@ -60,8 +60,10 @@ pub(crate) fn random16() -> [u8; 16] {
 /// Gives `ENOMEM` if no memory is free for the kernel stack.
 pub(crate) fn start_thread(thread: Arc<Thread>, regs: UserContext) -> Result<(), Errno> {
     let run_thread = thread.clone();
+    let (nice, idle) = thread.sched().share();
     let task = TaskOptions::new(move || run(run_thread, regs))
         .data(thread.clone())
+        .nice(nice, idle)
         .spawn()
         .ok_or(Errno::ENOMEM)?;
     thread.set_task(&task);

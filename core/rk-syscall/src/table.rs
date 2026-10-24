@@ -2,8 +2,8 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace, seccomp,
-    signal, signalfd, timer, timerfd,
+    epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace, sched,
+    seccomp, signal, signalfd, timer, timerfd,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -75,6 +75,20 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::WRITEV => fs::writev(cx, a[0], a[1], a[2]),
         nr::ACCESS => fs::faccessat(cx, at_fdcwd(), a[0], a[1], 0),
         nr::SCHED_YIELD => process::sched_yield(),
+        nr::GETPRIORITY => sched::getpriority(cx, a[0], a[1]),
+        nr::SETPRIORITY => sched::setpriority(cx, a[0], a[1], a[2]),
+        nr::SCHED_SETPARAM => sched::sched_setparam(cx, a[0], a[1]),
+        nr::SCHED_GETPARAM => sched::sched_getparam(cx, a[0], a[1]),
+        nr::SCHED_SETSCHEDULER => sched::sched_setscheduler(cx, a[0], a[1], a[2]),
+        nr::SCHED_GETSCHEDULER => sched::sched_getscheduler(cx, a[0]),
+        nr::SCHED_GET_PRIORITY_MAX => sched::sched_get_priority_max(a[0]),
+        nr::SCHED_GET_PRIORITY_MIN => sched::sched_get_priority_min(a[0]),
+        nr::SCHED_RR_GET_INTERVAL => sched::sched_rr_get_interval(cx, a[0], a[1]),
+        nr::SCHED_SETAFFINITY => sched::sched_setaffinity(cx, a[0], a[1], a[2]),
+        nr::SCHED_GETAFFINITY => sched::sched_getaffinity(cx, a[0], a[1], a[2]),
+        nr::SCHED_SETATTR => sched::sched_setattr(cx, a[0], a[1], a[2]),
+        nr::SCHED_GETATTR => sched::sched_getattr(cx, a[0], a[1], a[2], a[3]),
+        nr::GETCPU => sched::getcpu(cx, a[0], a[1]),
         nr::MADVISE => mm::madvise(cx, a[0], a[1], a[2]),
         nr::PAUSE => signal::pause(cx),
         nr::DUP => fs::dup(cx, a[0]),

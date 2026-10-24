@@ -41,12 +41,43 @@ const BLOCKED: u8 = 2;
 /// The task returned from its start function.
 const EXITED: u8 = 3;
 
+/// Why a task goes into the queue of the scheduler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Enqueue {
+    /// The task is new.
+    New,
+    /// The task was blocked, and a `wake` made it runnable.
+    Wake,
+    /// The task gave the CPU, and it can run again.
+    Yield,
+}
+
 /// Chooses the next task to run.
+///
+/// rk-frame calls `put_prev` when the current task stops on the CPU, and `set_next` when a task
+/// comes on the CPU. A yield calls `put_prev` before `enqueue`. The scheduler keeps its values for
+/// each task in the data that `new_data` makes, and `Task::sched_data` gives them.
 pub trait Scheduler: Sync {
+    /// Makes the data of the scheduler for a new task.
+    fn new_data(&self) -> Box<dyn Any + Send + Sync> {
+        Box::new(())
+    }
     /// Adds a task that can run.
-    fn enqueue(&self, task: Arc<Task>);
+    fn enqueue(&self, task: Arc<Task>, why: Enqueue);
     /// Removes the next task to run, if one can run.
     fn dequeue(&self) -> Option<Arc<Task>>;
+    /// The current task stops on the CPU. `sleeping` is true if the task blocked or exited.
+    fn put_prev(&self, _task: &Task, _sleeping: bool) {}
+    /// The task comes on the CPU.
+    fn set_next(&self, _task: &Task) {}
+    /// Tells if the current task must give the CPU to another task. `ran` is the count of timer
+    /// ticks since the task came on the CPU.
+    fn should_yield(&self, _task: &Task, ran: u64) -> bool {
+        ran >= TIME_SLICE
+    }
+    /// Sets the share of the CPU of the task from the nice value `nice`. If `idle` is true, the
+    /// task has the smallest share, as the `SCHED_IDLE` policy of Linux gives.
+    fn set_nice(&self, _task: &Task, _nice: i32, _idle: bool) {}
 }
 
 static SCHEDULER: Once<&'static dyn Scheduler> = Once::new();
@@ -108,6 +139,8 @@ pub struct Task {
     context: UnsafeCell<TaskContext>,
     entry: SpinLock<Option<Entry>>,
     data: Box<dyn Any + Send + Sync>,
+    /// The data of the scheduler, which `Scheduler::new_data` makes at the first use.
+    sched: Once<Box<dyn Any + Send + Sync>>,
     /// `None` for the boot task, which runs on the boot stack.
     _stack: Option<KernelStack>,
 }
@@ -134,12 +167,22 @@ static EXITED_TASK: SpinLock<Option<Arc<Task>>> = SpinLock::new(None);
 pub struct TaskOptions {
     entry: Entry,
     data: Box<dyn Any + Send + Sync>,
+    nice: i32,
+    idle: bool,
 }
 
 impl TaskOptions {
     /// Makes the options of a task that runs `entry`.
     pub fn new(entry: impl FnOnce() + Send + 'static) -> Self {
-        Self { entry: Box::new(entry), data: Box::new(()) }
+        Self { entry: Box::new(entry), data: Box::new(()), nice: 0, idle: false }
+    }
+
+    /// Sets the nice value of the task, and if it has the smallest share of the CPU. See
+    /// `Scheduler::set_nice`.
+    pub fn nice(mut self, nice: i32, idle: bool) -> Self {
+        self.nice = nice;
+        self.idle = idle;
+        self
     }
 
     /// Sets the data of the task, for the higher crates. `Task::data` gives it.
@@ -159,9 +202,11 @@ impl TaskOptions {
             context: UnsafeCell::new(TaskContext::new(stack.top())),
             entry: SpinLock::new(Some(self.entry)),
             data: self.data,
+            sched: Once::new(),
             _stack: Some(stack),
         });
-        scheduler().enqueue(task.clone());
+        scheduler().set_nice(&task, self.nice, self.idle);
+        scheduler().enqueue(task.clone(), Enqueue::New);
         Some(task)
     }
 }
@@ -179,6 +224,7 @@ impl Task {
                     context: UnsafeCell::new(TaskContext::default()),
                     entry: SpinLock::new(None),
                     data: Box::new(()),
+                    sched: Once::new(),
                     _stack: None,
                 })
             })
@@ -193,6 +239,11 @@ impl Task {
     /// The data that `TaskOptions::data` gave.
     pub fn data(&self) -> &(dyn Any + Send + Sync) {
         &*self.data
+    }
+
+    /// The data of the scheduler for the task.
+    pub fn sched_data(&self) -> &(dyn Any + Send + Sync) {
+        &**self.sched.call_once(|| scheduler().new_data())
     }
 
     /// Tells if the task returned from its start function.
@@ -212,7 +263,7 @@ impl Task {
             .compare_exchange(BLOCKED, RUNNABLE, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if woken {
-            scheduler().enqueue(self.clone());
+            scheduler().enqueue(self.clone(), Enqueue::Wake);
         }
         woken
     }
@@ -220,15 +271,22 @@ impl Task {
 
 /// Tells if the current task ran for its time slice since it came on the CPU.
 pub fn should_yield() -> bool {
-    let start = Task::current().start_tick.load(Ordering::Relaxed);
-    crate::time::ticks().wrapping_sub(start) >= TIME_SLICE
+    let current = Task::current();
+    let ran = crate::time::ticks().wrapping_sub(current.start_tick.load(Ordering::Relaxed));
+    scheduler().should_yield(&current, ran)
+}
+
+/// Sets the share of the CPU of `task`. See `Scheduler::set_nice`.
+pub fn set_nice(task: &Task, nice: i32, idle: bool) {
+    scheduler().set_nice(task, nice, idle);
 }
 
 /// Lets the next task run. The current task stays runnable, so it runs again later.
 pub fn yield_now() {
     let current = Task::current();
     current.state.store(RUNNABLE, Ordering::Release);
-    scheduler().enqueue(current);
+    scheduler().put_prev(&current, false);
+    scheduler().enqueue(current, Enqueue::Yield);
     schedule();
 }
 
@@ -268,6 +326,10 @@ impl Drop for IrqOff {
 fn schedule() {
     let _irq = IrqOff::new();
     let current = Task::current();
+    let state = current.state.load(Ordering::Acquire);
+    if state == BLOCKED || state == EXITED {
+        scheduler().put_prev(&current, true);
+    }
     let next = loop {
         if let Some(next) = scheduler().dequeue() {
             break next;
@@ -279,6 +341,7 @@ fn schedule() {
     };
     next.state.store(RUNNING, Ordering::Release);
     next.start_tick.store(crate::time::ticks(), Ordering::Relaxed);
+    scheduler().set_next(&next);
     if Arc::ptr_eq(&current, &next) {
         return;
     }

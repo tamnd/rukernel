@@ -55,6 +55,29 @@ static XAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
 /// The frequency of the APIC timer after the divider, in Hz.
 pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+/// The frequency of the time stamp counter in Hz, or 0 before the calibration.
+static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+/// The time stamp counter at the calibration, which is the time 0 of `nanos`.
+static TSC_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// Reads the time stamp counter.
+fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: `rdtsc` writes only EAX and EDX.
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    (u64::from(hi) << 32) | u64::from(lo)
+}
+
+/// The nanoseconds since the calibration of the timer, from the time stamp counter. Before the
+/// calibration it gives the time of the tick count.
+pub(crate) fn nanos() -> u64 {
+    let hz = TSC_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return TICKS.load(Ordering::Relaxed) * (1_000_000_000 / HZ);
+    }
+    let delta = rdtsc().saturating_sub(TSC_BASE.load(Ordering::Relaxed));
+    (u128::from(delta) * 1_000_000_000 / u128::from(hz)) as u64
+}
 
 fn read_msr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
@@ -137,7 +160,8 @@ fn disable_pic() {
     data2.write(0xff);
 }
 
-/// Measures the APIC timer against PIT channel 2, and gives the timer ticks in `CALIBRATE_MS`.
+/// Measures the APIC timer and the time stamp counter against PIT channel 2. Gives the timer
+/// ticks in `CALIBRATE_MS`, and sets `TSC_HZ`.
 fn calibrate() -> u64 {
     // SAFETY: port 0x61 is the PIT gate and speaker control, and ports 0x42 and 0x43 are PIT
     // channel 2 and the PIT mode register. This module owns them, and the speaker stays off.
@@ -152,12 +176,16 @@ fn calibrate() -> u64 {
     write(REG_LVT_TIMER, LVT_MASKED | u32::from(TIMER_VECTOR));
     ch2.write((latch >> 8) as u8);
     write(REG_TIMER_INIT, u32::MAX);
+    let tsc = rdtsc();
     // Bit 5 of port 0x61 is the output of channel 2. In mode 0 it goes high when the count is 0.
     while gate.read() & 0x20 == 0 {
         core::hint::spin_loop();
     }
     let elapsed = u32::MAX - read(REG_TIMER_CURRENT);
+    let now = rdtsc();
     write(REG_TIMER_INIT, 0);
+    TSC_HZ.store((now - tsc) * 1000 / CALIBRATE_MS, Ordering::Relaxed);
+    TSC_BASE.store(now, Ordering::Relaxed);
     u64::from(elapsed)
 }
 

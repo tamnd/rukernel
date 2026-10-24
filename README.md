@@ -96,7 +96,7 @@ cargo xtask boot-test alpine
 | `frame/rk-frame/` | The only crate that can contain `unsafe` code |
 | `core/rk-abi/` | The typed Linux ABI: error numbers now, generated tables later |
 | `core/rk-lib/` | Safe helpers that all kernel crates use |
-| `core/rk-sched/` | The scheduler: a round robin queue in R1 |
+| `core/rk-sched/` | The scheduler: the fair class with EEVDF |
 | `core/rk-mm/` | The memory manager: areas, page faults, copy on write, `mmap` and `brk` |
 | `fs/rk-vfs/` | The virtual file system: inodes, dentries, mounts, path walks, open files and the cpio reader |
 | `fs/rk-fs-proc/` | procfs, the files of `/proc` that give the state of the kernel and of each process |

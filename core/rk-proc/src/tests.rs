@@ -338,3 +338,31 @@ fn siginfo_of_seccomp_and_of_a_trace_stop() {
     let stop = SigInfo::new(5, 5 | 7 << 8, 48);
     assert_eq!(&stop.to_bytes()[16..20], &48u32.to_ne_bytes());
 }
+
+#[test]
+fn sched_reset_on_fork() {
+    use crate::sched::SchedParams;
+    use rk_abi::native::sched::{SCHED_FIFO, SCHED_IDLE};
+    let rt = SchedParams {
+        policy: SCHED_FIFO as u32,
+        priority: 10,
+        nice: -5,
+        reset_on_fork: true,
+        affinity: 1,
+        ..SchedParams::default()
+    };
+    assert_eq!(rt.share(), (-20, false));
+    let child = rt.forked();
+    assert_eq!(child.policy, 0);
+    assert_eq!(child.priority, 0);
+    assert_eq!(child.nice, 0);
+    assert!(!child.reset_on_fork);
+
+    let fair = SchedParams { nice: -5, reset_on_fork: true, ..SchedParams::default() };
+    assert_eq!(fair.forked().nice, 0);
+    let fair = SchedParams { nice: 7, ..SchedParams::default() };
+    assert_eq!(fair.forked(), fair);
+
+    let idle = SchedParams { policy: SCHED_IDLE as u32, nice: 3, ..SchedParams::default() };
+    assert_eq!(idle.share(), (3, true));
+}

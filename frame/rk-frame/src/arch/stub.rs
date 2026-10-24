@@ -97,6 +97,11 @@ pub(crate) mod timer {
     pub(crate) const HZ: u64 = 250;
     pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+
+    /// The nanoseconds since boot, from the tick count.
+    pub(crate) fn nanos() -> u64 {
+        TICKS.load(core::sync::atomic::Ordering::Relaxed) * (1_000_000_000 / HZ)
+    }
 }
 
 /// Interrupt control. These architectures take no interrupts yet.
