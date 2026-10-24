@@ -10,10 +10,13 @@ use rk_abi::native::sched::{
 };
 use rk_abi::native::signal::SIGCHLD;
 use rk_abi::native::types::CloneArgs;
-use rk_abi::native::wait::{WCONTINUED, WNOHANG, WUNTRACED};
+use rk_abi::native::wait::{
+    P_ALL, P_PGID, P_PID, P_PIDFD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED,
+};
 use rk_frame::task::yield_now;
 use rk_proc::exec::{ExecArgs, exec};
-use rk_proc::{ForkShare, Pid, Process, VforkDone, WaitStatus, WaitTarget};
+use rk_proc::signal::SigInfo;
+use rk_proc::{ForkShare, Pid, Process, VforkDone, WaitOptions, WaitStatus, WaitTarget};
 use zerocopy::FromZeros;
 
 /// The number of signals. Linux names it `_NSIG`.
@@ -197,9 +200,30 @@ pub(crate) fn exit_group(cx: &mut Cx<'_>, code: u64) -> SysResult {
     Ok(0)
 }
 
+/// The flags `__WNOTHREAD`, `__WALL` and `__WCLONE` of the waits. rukernel has no clone children
+/// that send no `SIGCHLD`, so the flags change nothing.
+const WAIT_LINUX_FLAGS: u32 = 0xe000_0000;
+
+/// Waits for a child with `options`, for `wait4` and `waitid`.
+fn wait_child(
+    cx: &Cx<'_>,
+    target: WaitTarget,
+    options: u32,
+) -> Result<Option<(Pid, WaitStatus)>, Errno> {
+    let options = WaitOptions {
+        exited: options & WEXITED != 0,
+        stopped: options & WSTOPPED != 0,
+        continued: options & WCONTINUED != 0,
+        nohang: options & WNOHANG != 0,
+        nowait: options & WNOWAIT != 0,
+    };
+    let thread = cx.thread.clone();
+    rk_proc::wait_child(cx.process(), target, options, || thread.signal_pending())
+}
+
 pub(crate) fn wait4(cx: &Cx<'_>, pid: u64, status: u64, options: u64, rusage: u64) -> SysResult {
     let options = options as u32;
-    if options & !(WNOHANG | WUNTRACED | WCONTINUED | 0xe000_0000) != 0 {
+    if options & !(WNOHANG | WUNTRACED | WCONTINUED | WAIT_LINUX_FLAGS) != 0 {
         return Err(Errno::EINVAL);
     }
     let pid = pid as i32;
@@ -210,14 +234,53 @@ pub(crate) fn wait4(cx: &Cx<'_>, pid: u64, status: u64, options: u64, rusage: u6
         i32::MIN => return Err(Errno::ESRCH),
         p => WaitTarget::Pgid(p.unsigned_abs()),
     };
-    let thread = cx.thread.clone();
-    let found = rk_proc::wait_child(cx.process(), target, options & WNOHANG != 0, true, || {
-        thread.signal_pending()
-    })?;
+    let found = wait_child(cx, target, options | WEXITED)?;
     let Some((child, code)) = found else { return Ok(0) };
     cx.write_opt(status, &code.0)?;
-    cx.write_opt(rusage, &<rk_abi::native::types::Rusage as zerocopy::FromZeros>::new_zeroed())?;
+    cx.write_opt(rusage, &rk_abi::native::types::Rusage::new_zeroed())?;
     Ok(u64::from(child))
+}
+
+/// The fields of `siginfo_t` that `waitid` writes: `si_signo`, `si_errno`, `si_code`, `si_pid`,
+/// `si_uid` and `si_status`.
+const WAITID_INFO_SIZE: usize = 28;
+
+pub(crate) fn waitid(
+    cx: &Cx<'_>,
+    idtype: u64,
+    id: u64,
+    infop: u64,
+    options: u64,
+    rusage: u64,
+) -> SysResult {
+    let options = options as u32;
+    if options & !(WNOHANG | WNOWAIT | WEXITED | WSTOPPED | WCONTINUED | WAIT_LINUX_FLAGS) != 0
+        || options & (WEXITED | WSTOPPED | WCONTINUED) == 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let id = id as i32;
+    let target = match idtype as u32 {
+        P_ALL => WaitTarget::Any,
+        P_PID if id > 0 => WaitTarget::Pid(id as Pid),
+        P_PGID if id == 0 => WaitTarget::Pgid(cx.process().pgid()),
+        P_PGID if id > 0 => WaitTarget::Pgid(id as Pid),
+        // rukernel has no process file descriptors yet, so each descriptor is bad.
+        P_PIDFD => return Err(Errno::EBADF),
+        _ => return Err(Errno::EINVAL),
+    };
+    // With `WNOHANG` and no child that changed, the fields are 0, as in Linux.
+    let mut info = SigInfo::default();
+    if let Some((child, status)) = wait_child(cx, target, options)? {
+        let (code, value) = status.child_code();
+        info = SigInfo::new(SIGCHLD, code, child);
+        info.status = value;
+    }
+    if infop != 0 {
+        cx.write_bytes(infop, &info.to_bytes()[..WAITID_INFO_SIZE])?;
+    }
+    cx.write_opt(rusage, &rk_abi::native::types::Rusage::new_zeroed())?;
+    Ok(0)
 }
 
 pub(crate) fn setpgid(cx: &Cx<'_>, pid: u64, pgid: u64) -> SysResult {

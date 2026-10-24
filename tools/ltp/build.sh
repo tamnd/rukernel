@@ -48,8 +48,9 @@ for d in $LTP_DIRS; do
 		make -C "$dir" -k >/dev/null 2>&1 || make -C "$dir" -k >/dev/null 2>&1 ||
 		echo "ltp: some tests in $d did not build"
 	# The symbols make each test 5 times larger, and the ltp boot test keeps each test in memory.
-	find "$dir" -maxdepth 1 -type f -perm -u+x ! -name "*.sh" \
-		-exec sh -c 'strip -o "/out/${1##*/}" "$1"' sh {} \;
+	for f in $(find "$dir" -maxdepth 1 -type f -perm -u+x ! -name "*.sh"); do
+		strip -o "/out/${f##*/}" "$f"
+	done
 done
 echo "$LTP_TAG" > /out/VERSION
 '

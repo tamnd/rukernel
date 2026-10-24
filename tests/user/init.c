@@ -420,6 +420,126 @@ static void test_timers(void)
 	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
+static volatile long *stop_counter;
+
+static void *stop_spin(void *arg)
+{
+	(void)arg;
+	for (;;)
+		__atomic_fetch_add(stop_counter, 1, __ATOMIC_RELAXED);
+	return NULL;
+}
+
+static char proc_state(pid_t pid)
+{
+	char path[64], buf[256];
+	snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return 0;
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+	char *p = strrchr(buf, ')');
+	return p && p[1] == ' ' ? p[2] : 0;
+}
+
+static void test_stop(void)
+{
+	sigset_t set, old;
+	sigemptyset(&set);
+	sigaddset(&set, SIGCHLD);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	struct timespec wait_time = {2, 0};
+	siginfo_t si;
+	int st;
+
+	stop_counter = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	pid_t pid = fork();
+	if (pid == 0) {
+		pthread_t t;
+		pthread_create(&t, NULL, stop_spin, NULL);
+		for (;;)
+			pause();
+	}
+	while (*stop_counter == 0)
+		sched_yield();
+
+	check("SIGSTOP stops a child", kill(pid, SIGSTOP) == 0 && waitpid(pid, &st, WUNTRACED) == pid &&
+	      WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP);
+	check("the parent gets SIGCHLD with CLD_STOPPED", sigtimedwait(&set, &si, &wait_time) == SIGCHLD &&
+	      si.si_code == CLD_STOPPED && si.si_pid == pid && si.si_status == SIGSTOP);
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	check("/proc gives the state T", proc_state(pid) == 'T');
+	umount("/proc");
+	long count = *stop_counter;
+	usleep(50 * 1000);
+	check("each thread of a stopped process stops", *stop_counter == count);
+	check("waitpid takes the stop only one time", waitpid(pid, &st, WUNTRACED | WNOHANG) == 0);
+
+	check("SIGCONT continues the child", kill(pid, SIGCONT) == 0 && waitpid(pid, &st, WCONTINUED) == pid &&
+	      WIFCONTINUED(st));
+	check("the parent gets SIGCHLD with CLD_CONTINUED", sigtimedwait(&set, &si, &wait_time) == SIGCHLD &&
+	      si.si_code == CLD_CONTINUED && si.si_status == SIGCONT);
+	usleep(50 * 1000);
+	check("the threads run again", *stop_counter != count);
+
+	memset(&si, 0xff, sizeof(si));
+	check("waitid with WNOHANG and no change gives si_pid 0",
+	      waitid(P_PID, pid, &si, WSTOPPED | WNOHANG) == 0 && si.si_pid == 0 && si.si_signo == 0);
+	check("waitid without a type of change gives EINVAL", waitid(P_ALL, 0, &si, WNOHANG) == -1 && errno == EINVAL);
+
+	kill(pid, SIGTSTP);
+	check("waitid with WNOWAIT keeps the stop", waitid(P_PID, pid, &si, WSTOPPED | WNOWAIT) == 0 &&
+	      si.si_signo == SIGCHLD && si.si_code == CLD_STOPPED && si.si_status == SIGTSTP && si.si_pid == pid);
+	check("waitid takes the stop", waitid(P_PID, pid, &si, WSTOPPED) == 0 && si.si_code == CLD_STOPPED);
+	si.si_pid = 1;
+	check("the stop is gone after waitid", waitid(P_PID, pid, &si, WSTOPPED | WNOHANG) == 0 && si.si_pid == 0);
+
+	check("SIGKILL ends a stopped child", kill(pid, SIGKILL) == 0 && waitid(P_PID, pid, &si, WEXITED) == 0 &&
+	      si.si_code == CLD_KILLED && si.si_status == SIGKILL);
+	sigtimedwait(&set, &si, &(struct timespec){0, 0});
+	sigtimedwait(&set, &si, &(struct timespec){0, 0});
+
+	/* A stop and SIGCONT do not end a sleep early, because the kernel continues it with
+	 * restart_syscall. */
+	pid = fork();
+	if (pid == 0) {
+		struct timespec a, b;
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		int r = nanosleep(&(struct timespec){0, 300 * 1000 * 1000}, NULL);
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+		_exit(r == 0 && ms >= 290 ? 0 : 1);
+	}
+	usleep(50 * 1000);
+	kill(pid, SIGSTOP);
+	waitpid(pid, &st, WUNTRACED);
+	kill(pid, SIGCONT);
+	check("nanosleep continues after a stop", waitpid(pid, &st, 0) == pid && WIFEXITED(st) &&
+	      WEXITSTATUS(st) == 0);
+
+	pid = fork();
+	if (pid == 0) {
+		sigset_t tstp;
+		sigemptyset(&tstp);
+		sigaddset(&tstp, SIGTSTP);
+		sigprocmask(SIG_BLOCK, &tstp, NULL);
+		kill(getpid(), SIGTSTP);
+		kill(getpid(), SIGCONT);
+		sigprocmask(SIG_UNBLOCK, &tstp, NULL);
+		_exit(0);
+	}
+	check("SIGCONT discards a pending stop signal", waitpid(pid, &st, WUNTRACED) == pid && WIFEXITED(st));
+	sigtimedwait(&set, &si, &(struct timespec){0, 0});
+	sigtimedwait(&set, &si, &(struct timespec){0, 0});
+	sigprocmask(SIG_SETMASK, &old, NULL);
+	munmap((void *)stop_counter, 4096);
+}
+
 static void test_signals(void)
 {
 	volatile double x = 1.5;
@@ -961,6 +1081,7 @@ int main(int argc, char **argv)
 	test_signals();
 	test_sigwait();
 	test_timers();
+	test_stop();
 	test_pipes();
 	test_threads();
 	test_locks();

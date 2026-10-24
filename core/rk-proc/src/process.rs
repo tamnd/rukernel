@@ -6,16 +6,16 @@
 
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE};
 use crate::signal::{
-    AltStack, CLD_EXITED, CLD_KILLED, NSIG, Pending, SI_TIMER, SIG_IGN, SigAction, SigInfo, SigSet,
+    AltStack, NSIG, Pending, SI_TIMER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
 use crate::timer::Timers;
-use crate::wait::{WaitStatus, WaitTarget};
+use crate::wait::{WaitOptions, WaitStatus, WaitTarget};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use rk_abi::Errno;
-use rk_abi::native::signal::{SA_NOCLDWAIT, SIGCHLD, SIGKILL};
+use rk_abi::native::signal::{SA_NOCLDSTOP, SA_NOCLDWAIT, SIGCHLD, SIGCONT, SIGKILL};
 use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
@@ -49,6 +49,8 @@ struct State {
     group_exit: Option<WaitStatus>,
     /// The status that the parent gets. The process is a zombie when this is set.
     zombie: Option<WaitStatus>,
+    /// The last stop or continue of the process that the parent did not take with a wait yet.
+    report: Option<WaitStatus>,
     comm: Vec<u8>,
 }
 
@@ -89,6 +91,19 @@ pub enum Delivery {
     Handler(SigInfo, SigAction),
     /// End the process with this status.
     Fatal(WaitStatus),
+    /// Stop the process with this signal.
+    Stop(u32),
+}
+
+/// What `restart_syscall` continues: a system call that a signal without a handler or a stop
+/// interrupted, as `struct restart_block` of Linux. `call` is the number of the system call, and
+/// `args` hold its state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Restart {
+    /// The number of the system call.
+    pub call: u32,
+    /// The state of the call, such as the end of a sleep.
+    pub args: [u64; 3],
 }
 
 /// A process: a thread group in the words of Linux.
@@ -99,6 +114,12 @@ pub struct Process {
     child_wait: WaitQueue,
     /// `execve` waits here until the other threads of the process are gone.
     thread_exit: WaitQueue,
+    /// A stop signal stopped the process, and `SIGCONT` did not continue it yet. It changes
+    /// with the lock of `state`, but it is not in `state`, because a wait for a child checks it
+    /// with that lock held.
+    stopped: AtomicBool,
+    /// The threads of a stopped process wait here until `SIGCONT` or `SIGKILL` comes.
+    stop_wait: WaitQueue,
     vm: SpinLock<Option<Arc<AddressSpace>>>,
     files: SpinLock<Option<SharedFiles>>,
     fs: SpinLock<Option<SharedFs>>,
@@ -135,6 +156,8 @@ pub struct Thread {
     signals: SpinLock<ThreadSignals>,
     /// The parent of a `vfork` child waits on this.
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
+    /// The call that `restart_syscall` continues.
+    restart: SpinLock<Option<Restart>>,
 }
 
 /// The wait of the parent of a `vfork` child. The parent waits until the child calls `execve` or
@@ -408,12 +431,20 @@ impl Process {
         WaitStatus::signaled(sig, core)
     }
 
-    /// The state letter of `/proc/PID/stat`: `Z` for a zombie, `R` if a thread runs or can
-    /// run, and `S` if each thread waits.
+    /// Tells if a stop signal stopped the process.
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// The state letter of `/proc/PID/stat`: `Z` for a zombie, `T` for a stopped process, `R` if
+    /// a thread runs or can run, and `S` if each thread waits.
     pub fn state_letter(&self) -> u8 {
         let s = self.state.lock();
         if s.zombie.is_some() {
             return b'Z';
+        }
+        if self.is_stopped() {
+            return b'T';
         }
         let running = s.threads.iter().any(|t| t.task().is_some_and(|task| !task.is_blocked()));
         if running { b'R' } else { b'S' }
@@ -457,10 +488,13 @@ impl Process {
                 sid,
                 group_exit: None,
                 zombie: None,
+                report: None,
                 comm,
             }),
             child_wait: WaitQueue::new(),
             thread_exit: WaitQueue::new(),
+            stopped: AtomicBool::new(false),
+            stop_wait: WaitQueue::new(),
             vm: SpinLock::new(Some(vm)),
             files: SpinLock::new(Some(files)),
             fs: SpinLock::new(Some(fs)),
@@ -532,6 +566,16 @@ impl Thread {
         self.robust_list.store(addr, Ordering::Relaxed);
     }
 
+    /// Keeps the call that `restart_syscall` continues, or removes it with `None`.
+    pub fn set_restart(&self, restart: Option<Restart>) {
+        *self.restart.lock() = restart;
+    }
+
+    /// Takes the call that `restart_syscall` continues.
+    pub fn take_restart(&self) -> Option<Restart> {
+        self.restart.lock().take()
+    }
+
     /// Tells if the thread must stop, because its group exits.
     pub fn is_killed(&self) -> bool {
         self.killed.load(Ordering::Acquire)
@@ -577,9 +621,20 @@ impl Thread {
         SigSet(shared.0 | self.signals.lock().pending.set().0)
     }
 
-    /// Tells if a wait must stop: the group exits, or a signal that is not blocked is pending.
+    /// Tells if a wait must stop: the group exits, the process stops, or a signal that is not
+    /// blocked is pending.
     pub fn signal_pending(&self) -> bool {
-        self.is_killed() || !self.pending().without(self.blocked()).is_empty()
+        self.is_killed()
+            || !self.pending().without(self.blocked()).is_empty()
+            || self.process.is_stopped()
+    }
+
+    /// Waits while the process is stopped. The wait ends when `SIGCONT` continues the process or
+    /// the group exits.
+    pub fn wait_while_stopped(&self) {
+        self.process
+            .stop_wait
+            .wait_until(|| (!self.process.is_stopped() || self.is_killed()).then_some(()));
     }
 
     /// The alternate signal stack.
@@ -594,7 +649,7 @@ impl Thread {
 
     /// Takes the next signal that the thread does not block, first from its own queue and then
     /// from the queue of the process. A signal that its action discards goes away. Gives `None`
-    /// if no signal is ready. For a handler with `SA_RESETHAND`, the action goes back to
+    /// if no signal is ready. For a handler with `SA_RESETHAND`, the handler goes back to
     /// `SIG_DFL`.
     pub fn dequeue_signal(&self) -> Option<Delivery> {
         loop {
@@ -610,8 +665,17 @@ impl Thread {
             if action.is_fatal(sig) {
                 return Some(Delivery::Fatal(self.process.fatal_status(sig)));
             }
+            if action.is_stop(sig) {
+                // init does not stop, as Linux does not stop a process with
+                // `SIGNAL_UNKILLABLE`.
+                if self.process.pid == INIT_PID {
+                    continue;
+                }
+                return Some(Delivery::Stop(sig));
+            }
             if action.flags & u64::from(rk_abi::native::signal::SA_RESETHAND) != 0 {
-                shared.actions[sig as usize - 1] = SigAction::default();
+                // Linux keeps the flags, the mask and the restorer.
+                shared.actions[sig as usize - 1].handler = SIG_DFL;
             }
             return Some(Delivery::Handler(info, action));
         }
@@ -666,6 +730,7 @@ impl Thread {
             killed: AtomicBool::new(false),
             signals: SpinLock::new(ThreadSignals { blocked, ..ThreadSignals::default() }),
             vfork_done: SpinLock::new(None),
+            restart: SpinLock::new(None),
         })
     }
 }
@@ -825,9 +890,19 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
         kill_group(process, WaitStatus::signaled(sig, false));
         return;
     }
+    let all = process.threads();
+    // A stop signal discards each pending `SIGCONT`, and `SIGCONT` discards each pending stop
+    // signal and continues the process, as `prepare_signal` of Linux does. This happens when the
+    // signal is sent, so a handler or a blocked `SIGCONT` continues the process too.
+    if SigSet::STOP.contains(sig) {
+        discard_pending(process, &all, SigSet(SigSet::bit(SIGCONT)));
+    } else if sig == SIGCONT {
+        discard_pending(process, &all, SigSet::STOP);
+        continue_group(process);
+    }
     let threads = match thread {
         Some(t) => alloc::vec![t.clone()],
-        None => process.threads(),
+        None => all,
     };
     let mut shared = process.signals.lock();
     let action = shared.actions[sig as usize - 1];
@@ -861,6 +936,71 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     if let Some(t) = target {
         t.wake();
     }
+}
+
+/// Discards each pending signal of `set` in the queue of `process` and of each of its `threads`.
+fn discard_pending(process: &Process, threads: &[Arc<Thread>], set: SigSet) {
+    let mut shared = process.signals.lock();
+    for sig in 1..=NSIG {
+        if set.contains(sig) {
+            shared.pending.discard(sig);
+            for t in threads {
+                t.signals.lock().pending.discard(sig);
+            }
+        }
+    }
+}
+
+/// Stops the process of `thread` with the stop signal `sig`, and tells the parent. The threads
+/// stop at their next return to the kernel, and wait there until `SIGCONT` comes.
+pub fn stop_group(thread: &Thread, sig: u32) {
+    let process = &thread.process;
+    let (others, parent) = {
+        let mut s = process.state.lock();
+        if s.group_exit.is_some() || process.is_stopped() {
+            return;
+        }
+        process.stopped.store(true, Ordering::Release);
+        s.report = Some(WaitStatus::stopped(sig));
+        let others: Vec<Arc<Thread>> =
+            s.threads.iter().filter(|t| t.tid != thread.tid).cloned().collect();
+        (others, s.parent.upgrade())
+    };
+    for t in others {
+        t.wake();
+    }
+    if let Some(parent) = parent {
+        notify_stop(process, &parent, WaitStatus::stopped(sig));
+    }
+}
+
+/// Continues `process` if it is stopped, and tells the parent.
+fn continue_group(process: &Process) {
+    let parent = {
+        let mut s = process.state.lock();
+        if !process.is_stopped() {
+            return;
+        }
+        process.stopped.store(false, Ordering::Release);
+        s.report = Some(WaitStatus::CONTINUED);
+        s.parent.upgrade()
+    };
+    process.stop_wait.wake_all();
+    if let Some(parent) = parent {
+        notify_stop(process, &parent, WaitStatus::CONTINUED);
+    }
+}
+
+/// Tells the parent that `process` stopped or continued: it sends `SIGCHLD` if the parent did not
+/// set `SA_NOCLDSTOP`, and wakes the waits of the parent.
+fn notify_stop(process: &Process, parent: &Process, status: WaitStatus) {
+    if parent.action(SIGCHLD).flags & u64::from(SA_NOCLDSTOP) == 0 {
+        let (code, value) = status.child_code();
+        let mut info = SigInfo::new(SIGCHLD, code, process.pid);
+        info.status = value;
+        send_signal(parent, info);
+    }
+    parent.child_wait.wake_all();
 }
 
 /// Sends the signal of a timer to `process`, or to `thread` of that process if it is given. In
@@ -908,14 +1048,9 @@ fn notify_parent(process: &Process, parent: &Process, status: WaitStatus) -> boo
         }
     }
     if sig != 0 {
-        let mut info = SigInfo::new(sig, CLD_EXITED, process.pid);
-        match status.signal() {
-            Some(s) => {
-                info.code = CLD_KILLED;
-                info.status = s as i32;
-            }
-            None => info.status = status.exit_code().unwrap_or(0),
-        }
+        let (code, value) = status.child_code();
+        let mut info = SigInfo::new(sig, code, process.pid);
+        info.status = value;
         send_signal(parent, info);
     }
     autoreap
@@ -1012,9 +1147,11 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     }
 }
 
-/// Waits for a child of `process` that matches `target` to end, for `wait4` and `waitid`.
-/// Gives the ID and the status of the child, or `None` with `WNOHANG` if no child ended yet.
-/// `interrupted` tells if a signal must stop the wait.
+/// Waits for a child of `process` that matches `target` to end, stop or continue, as `options`
+/// tells, for `wait4` and `waitid`. Gives the ID and the status of the child, or `None` with
+/// `WNOHANG` if no child changed yet. Without `WNOWAIT`, the wait reaps the child that ended, or
+/// takes the report of the stop or the continue. `interrupted` tells if a signal must stop the
+/// wait.
 ///
 /// # Errors
 ///
@@ -1022,8 +1159,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
 pub fn wait_child(
     process: &Process,
     target: WaitTarget,
-    nohang: bool,
-    reap: bool,
+    options: WaitOptions,
     mut interrupted: impl FnMut() -> bool,
 ) -> Result<Option<(Pid, WaitStatus)>, Errno> {
     process.child_wait.wait_until(|| {
@@ -1040,13 +1176,26 @@ pub fn wait_child(
                 continue;
             }
             found = true;
-            if let Some(status) = c.state.lock().zombie {
-                zombie = Some((i, c.pid, status));
-                break;
+            let mut cs = c.state.lock();
+            if let Some(status) = cs.zombie {
+                if options.exited {
+                    zombie = Some((i, c.pid, status));
+                    break;
+                }
+                continue;
+            }
+            let report = cs.report.filter(|r| {
+                if r.stop_signal().is_some() { options.stopped } else { options.continued }
+            });
+            if let Some(status) = report {
+                if !options.nowait {
+                    cs.report = None;
+                }
+                return Some(Ok(Some((c.pid, status))));
             }
         }
         if let Some((i, pid, status)) = zombie {
-            if reap {
+            if !options.nowait {
                 s.children.remove(i);
                 drop(s);
                 TABLE.lock().processes.remove(&pid);
@@ -1056,7 +1205,7 @@ pub fn wait_child(
         if !found {
             return Some(Err(Errno::ECHILD));
         }
-        if nohang {
+        if options.nohang {
             return Some(Ok(None));
         }
         if interrupted() {
