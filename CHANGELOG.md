@@ -10,6 +10,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `kcmp` for `KCMP_FILE`, `KCMP_VM`, `KCMP_FILES`, `KCMP_FS` and `KCMP_SIGHAND`.
 - `capget` and `capset`. All processes run as root, thus `capget` gives all the capabilities in the effective and permitted sets.
 - init checks the process file descriptors, `kcmp` and `capget`.
+- `seccomp` with filters of classic BPF, and the strict mode. A filter gives the action `SECCOMP_RET_KILL_PROCESS`, `KILL_THREAD`, `TRAP`, `ERRNO`, `TRACE`, `LOG` or `ALLOW`. A child of `fork` or `clone` gets the filters of its parent, and `execve` keeps them. `SECCOMP_RET_USER_NOTIF` gives `ENOSYS`, because rukernel has no listener for the notifications yet.
+- `seccomp` accepts `SECCOMP_SET_MODE_STRICT`, `SECCOMP_SET_MODE_FILTER`, `SECCOMP_GET_ACTION_AVAIL` and `SECCOMP_GET_NOTIF_SIZES`. `prctl` accepts `PR_GET_SECCOMP`, `PR_SET_SECCOMP`, `PR_SET_NO_NEW_PRIVS` and `PR_GET_NO_NEW_PRIVS`.
+- `ptrace` accepts `PTRACE_SECCOMP_GET_FILTER`, `PTRACE_SECCOMP_GET_METADATA` and `PTRACE_O_SUSPEND_SECCOMP`. A tracer with `PTRACE_O_TRACESECCOMP` gets the stop `PTRACE_EVENT_SECCOMP`.
+- init checks `seccomp`.
+
+### Fixed
+
+- The signal information of a stop of `ptrace` that is not a signal now has the ID of the tracee in `si_pid`, as in Linux. Before, `si_pid` was 0, because the kernel wrote the code of the stop with the layout of a fault.
 
 ## [0.2.3] (2026-10-24)
 

@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod bpf;
 pub mod elf;
 pub mod limits;
 pub mod script;
@@ -30,14 +31,14 @@ pub mod timer;
 mod vdso;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub use process::ptrace;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use process::{
     COMM_LEN, Delivery, ForkShare, INIT_PID, PID_MAX, Pid, Process, Restart, SharedFiles, SharedFs,
     Thread, VforkDone, create_init, current_thread, exit_group, exit_thread, find_process,
     find_thread, fork, kill_group, new_thread, processes, send_signal, stop_group, wait_child,
     wait_for_init,
 };
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub use process::{ptrace, seccomp};
 pub use wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
 
 /// The size of a page.

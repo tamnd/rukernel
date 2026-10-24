@@ -23,6 +23,7 @@ use rk_mm::AddressSpace;
 use rk_vfs::{FdTable, FsContext, Location};
 
 pub mod ptrace;
+pub mod seccomp;
 
 /// A process ID or a thread ID.
 pub type Pid = u32;
@@ -181,6 +182,12 @@ pub struct Thread {
     /// The signal of a group stop that the traced thread did not take yet, or 0. A thread that
     /// is not traced waits for `SIGCONT` in the stopped process instead.
     group_stop: AtomicU32,
+    /// The `seccomp` mode, for a fast check at each system call.
+    seccomp_mode: AtomicU32,
+    /// The `seccomp` mode and filters.
+    seccomp: SpinLock<seccomp::Seccomp>,
+    /// The no_new_privs bit of `PR_SET_NO_NEW_PRIVS`.
+    no_new_privs: AtomicBool,
 }
 
 /// The wait of the parent of a `vfork` child. The parent waits until the child calls `execve` or
@@ -834,6 +841,9 @@ impl Thread {
             user_ticks: AtomicU64::new(0),
             ptrace: SpinLock::new(None),
             group_stop: AtomicU32::new(0),
+            seccomp_mode: AtomicU32::new(0),
+            seccomp: SpinLock::new(seccomp::Seccomp::default()),
+            no_new_privs: AtomicBool::new(false),
         })
     }
 }
@@ -931,6 +941,7 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
     *child.limits.lock() = *pp.limits.lock();
     child.set_oom_score_adj(pp.oom_score_adj());
     let thread = Thread::new(pid, child.clone(), parent.blocked());
+    thread.inherit_seccomp(parent);
     child.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
@@ -950,6 +961,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     let mut table = TABLE.lock();
     let tid = alloc_pid(&mut table)?;
     let new = Thread::new(tid, process.clone(), thread.blocked());
+    new.inherit_seccomp(thread);
     table.threads.insert(tid, Arc::downgrade(&new));
     drop(table);
     process.state.lock().threads.push(new.clone());

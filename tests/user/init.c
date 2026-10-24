@@ -9,17 +9,22 @@
 #include <errno.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
 #include <linux/futex.h>
+#include <linux/seccomp.h>
 #include <linux/sched.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
 #include <sys/user.h>
@@ -1130,6 +1135,110 @@ static void test_pidfd(void)
 		      header[0] == 0x20080522);
 }
 
+static volatile int sigsys_nr;
+
+static void on_sigsys(int sig, siginfo_t *info, void *uc)
+{
+	(void)sig;
+	(void)uc;
+	if (info->si_code == SYS_SECCOMP && info->si_arch == AUDIT_ARCH_X86_64)
+		sigsys_nr = info->si_syscall;
+}
+
+/* Installs a filter that gives `action` for the system call `nr` and allows the others. */
+static int seccomp_filter(int nr, unsigned int action)
+{
+	struct sock_filter insns[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, action),
+		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+	};
+	struct sock_fprog prog = {.len = 4, .filter = insns};
+	return syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+}
+
+/* Runs `fn` in a child, and gives the status of the child. */
+static int seccomp_child(int (*fn)(void))
+{
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(fn());
+	waitpid(pid, &status, 0);
+	return status;
+}
+
+static int seccomp_errno_child(void)
+{
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1)
+		return 1;
+	if (seccomp_filter(SYS_getppid, SECCOMP_RET_ERRNO | E2BIG) != 0)
+		return 2;
+	if (prctl(PR_GET_SECCOMP, 0, 0, 0, 0) != 2)
+		return 3;
+	if (syscall(SYS_getppid) != -1 || errno != E2BIG)
+		return 4;
+	/* The filters stay in a child of fork. */
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(syscall(SYS_getppid) == -1 && errno == E2BIG ? 0 : 1);
+	if (waitpid(pid, &status, 0) != pid || status != 0)
+		return 5;
+	/* The filter mode cannot change to the strict mode. */
+	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != -1 || errno != EINVAL)
+		return 6;
+	return getpid() > 0 ? 0 : 7;
+}
+
+static int seccomp_trap_child(void)
+{
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = on_sigsys;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSYS, &sa, NULL);
+	if (seccomp_filter(SYS_getppid, SECCOMP_RET_TRAP) != 0)
+		return 1;
+	syscall(SYS_getppid);
+	return sigsys_nr == SYS_getppid ? 0 : 2;
+}
+
+static int seccomp_kill_child(void)
+{
+	seccomp_filter(SYS_getppid, SECCOMP_RET_KILL_PROCESS);
+	syscall(SYS_getppid);
+	return 0;
+}
+
+static int seccomp_strict_child(void)
+{
+	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT, 0, 0, 0) != 0)
+		return 1;
+	write(1, "", 0);
+	syscall(SYS_getppid);
+	return 0;
+}
+
+static void test_seccomp(void)
+{
+	int status = seccomp_child(seccomp_errno_child);
+	check("seccomp SECCOMP_RET_ERRNO", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	status = seccomp_child(seccomp_trap_child);
+	check("seccomp SECCOMP_RET_TRAP", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	status = seccomp_child(seccomp_kill_child);
+	check("seccomp SECCOMP_RET_KILL_PROCESS", WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS);
+	status = seccomp_child(seccomp_strict_child);
+	check("seccomp strict mode", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+	unsigned int action = SECCOMP_RET_LOG;
+	check("SECCOMP_GET_ACTION_AVAIL",
+	      syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == 0);
+	action = 0x12345678;
+	check("SECCOMP_GET_ACTION_AVAIL of an unknown action",
+	      syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == -1 && errno == EOPNOTSUPP);
+}
+
 static void test_mount(void)
 {
 	struct statfs st;
@@ -1425,6 +1534,7 @@ int main(int argc, char **argv)
 	test_locks();
 	test_clone3();
 	test_pidfd();
+	test_seccomp();
 	test_ptrace();
 	test_mount();
 	test_proc();
