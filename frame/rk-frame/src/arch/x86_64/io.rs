@@ -47,4 +47,22 @@ impl Port {
             asm!("out dx, eax", in("dx") self.0, in("eax") value, options(nomem, nostack, preserves_flags));
         }
     }
+
+    /// Writes two bytes.
+    pub(crate) fn write_u16(self, value: u16) {
+        // SAFETY: as for `read`. `out` does not touch memory or the stack.
+        unsafe {
+            asm!("out dx, ax", in("dx") self.0, in("ax") value, options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    /// Reads four bytes.
+    pub(crate) fn read_u32(self) -> u32 {
+        let value: u32;
+        // SAFETY: as for `read`. `in` does not touch memory or the stack.
+        unsafe {
+            asm!("in eax, dx", out("eax") value, in("dx") self.0, options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
 }

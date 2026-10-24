@@ -403,6 +403,7 @@ const BOOT_TESTS: &[&str] = &[
     "init",
     "tty",
     "smp",
+    "blk",
     "busybox",
     "ltp",
     "kselftest",
@@ -1216,6 +1217,25 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
     qemu_command_with(kernel, &kernel.with_file_name("initramfs.cpio"), cmdline)
 }
 
+/// The size of the disk of the `blk` boot test.
+const BLK_DISK_SIZE: usize = 1 << 20;
+/// The text that the `blk` test writes at `BLK_NOTE_AT`. tests/user/init.c has the same values.
+const BLK_NOTE: &[u8] = b"rukernel wrote this sector";
+const BLK_NOTE_AT: usize = 512 * 9 + 100;
+
+/// Writes the disk of the `blk` boot test. The byte at offset k has a value from k, so that the
+/// guest can check each byte that it reads.
+fn write_blk_disk(path: &Path) -> Result {
+    let data: Vec<u8> = (0..BLK_DISK_SIZE).map(|k| (k / 512 * 7 + k % 251) as u8).collect();
+    fs::write(path, data).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Tells if the guest wrote its text to the disk of the `blk` boot test.
+fn blk_disk_has_note(path: &Path) -> Result<bool> {
+    let data = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    Ok(data.get(BLK_NOTE_AT..BLK_NOTE_AT + BLK_NOTE.len()) == Some(BLK_NOTE))
+}
+
 /// The number of CPUs of the `smp` boot test.
 const SMP_CPUS: &str = "8";
 
@@ -1236,6 +1256,12 @@ fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
         .arg("-initrd")
         .arg(initrd)
         .args(["-append", cmdline]);
+    if cmdline.ends_with("-- blk") {
+        let disk = kernel.with_file_name("blk.img");
+        cmd.arg("-drive")
+            .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
+            .args(["-device", "virtio-blk-pci,drive=disk0"]);
+    }
     if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);
     } else {
@@ -1258,7 +1284,7 @@ fn qemu(args: &[String]) -> Result {
 /// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
-        "init" | "tty" | "smp" => kernel.with_file_name("user-init").exists(),
+        "init" | "tty" | "smp" | "blk" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" | "gvisor" => kernel.with_file_name(format!("initramfs-{test}.cpio")).exists(),
@@ -1273,6 +1299,7 @@ fn test_cmdline(test: &str) -> String {
     match test {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "smp" => String::from("console=ttyS0 rk.test=init -- smp"),
+        "blk" => String::from("console=ttyS0 rk.test=init -- blk"),
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
@@ -1286,7 +1313,7 @@ fn test_cmdline(test: &str) -> String {
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "smp" | "busybox" | "ltp" | "kselftest" | "gvisor")
+    let test = if matches!(test, "tty" | "smp" | "blk" | "busybox" | "ltp" | "kselftest" | "gvisor")
         || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"
@@ -1335,8 +1362,15 @@ fn boot_test(names: &[String]) -> Result {
         } else {
             (qemu_command(&kernel, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
         };
+        if *test == "blk" {
+            write_blk_disk(&kernel.with_file_name("blk.img"))?;
+        }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
-        let passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
+        let mut passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
+        if *test == "blk" && passed && !blk_disk_has_note(&kernel.with_file_name("blk.img"))? {
+            println!("boot test blk: the disk image does not have the data that the guest wrote");
+            passed = false;
+        }
         if passed {
             println!("boot test {test}: pass");
             // The kselftest and gVisor totals show the tests that the kernel skips.

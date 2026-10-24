@@ -69,6 +69,7 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
 
     rk_drv_mem::init();
     rk_drv_tty::init();
+    rk_drv_virtio::init();
     rk_syscall::init();
     let Some(fs) = rootfs::context() else {
         panic!("no root file system");

@@ -61,6 +61,17 @@ pub trait FileOps: Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// The end of the file for `lseek` with `SEEK_END`, for a file whose size is not the size
+    /// of its inode, as a block device.
+    fn end(&self) -> Option<u64> {
+        None
+    }
+
+    /// Writes the data of the file to its device, for `fsync`.
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// The events of `poll` that are true now.
     fn poll(&self, _file: &File) -> u32 {
         events::POLLIN | events::POLLOUT
@@ -323,7 +334,10 @@ impl File {
         let base = match whence {
             Whence::Set => 0,
             Whence::Current => *pos,
-            Whence::End => self.metadata()?.size,
+            Whence::End => match self.ops.end() {
+                Some(end) => end,
+                None => self.metadata()?.size,
+            },
         };
         let new = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
         if new > i64::MAX as u64 {
@@ -331,6 +345,11 @@ impl File {
         }
         *pos = new;
         Ok(new)
+    }
+
+    /// `fsync` and `fdatasync`.
+    pub fn sync(&self) -> Result<()> {
+        self.ops.sync()
     }
 
     /// `ioctl`.

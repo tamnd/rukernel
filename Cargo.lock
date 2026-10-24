@@ -52,6 +52,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-drv-virtio"
+version = "0.3.0"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-frame"
 version = "0.3.0"
 
@@ -156,6 +165,7 @@ dependencies = [
  "rk-abi",
  "rk-drv-mem",
  "rk-drv-tty",
+ "rk-drv-virtio",
  "rk-frame",
  "rk-fs-proc",
  "rk-fs-tmpfs",

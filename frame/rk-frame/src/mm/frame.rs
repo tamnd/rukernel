@@ -244,11 +244,21 @@ pub fn vmap(frame: Frame) -> Result<Mapping, Frame> {
 /// mapping stays for all of the run time.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn vmap_mmio(phys: u64) -> Option<usize> {
-    let virt = NEXT_VMALLOC.fetch_add(2 * PAGE_SIZE, Ordering::Relaxed);
-    if virt >= paging::HEAP_START {
+    vmap_mmio_pages(phys, 1)
+}
+
+/// Maps `pages` pages of device registers from `phys` at a new kernel virtual address and gives
+/// the address. A guard page comes after the mapping. The mapping stays for all of the run time.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vmap_mmio_pages(phys: u64, pages: usize) -> Option<usize> {
+    let size = pages.checked_add(1)?.checked_mul(PAGE_SIZE)?;
+    let virt = NEXT_VMALLOC.fetch_add(size, Ordering::Relaxed);
+    if virt.checked_add(size)? > paging::HEAP_START {
         return None;
     }
-    paging::map_mmio_page(virt, phys).ok()?;
+    for i in 0..pages {
+        paging::map_mmio_page(virt + i * PAGE_SIZE, phys + (i * PAGE_SIZE) as u64).ok()?;
+    }
     Some(virt)
 }
 
