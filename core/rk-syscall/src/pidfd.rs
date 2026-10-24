@@ -24,6 +24,10 @@ struct PidFd {
 }
 
 impl FileOps for PidFd {
+    fn pollable(&self) -> bool {
+        true
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         if self.process.is_zombie() { events::POLLIN } else { 0 }
     }

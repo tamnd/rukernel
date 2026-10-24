@@ -66,6 +66,19 @@ pub trait FileOps: Send + Sync {
         events::POLLIN | events::POLLOUT
     }
 
+    /// Tells if the file has its own `poll`. Only such a file can go in an epoll set. A file
+    /// without it is always ready, as a file of Linux without the `poll` operation.
+    fn pollable(&self) -> bool {
+        false
+    }
+
+    /// A count that goes up at each new event of the file, for an edge triggered epoll entry.
+    /// An entry sees an edge when the count changes, also if the events stay the same. A file
+    /// without the count gives 0, and an entry then sees an edge only when a new event is true.
+    fn event_count(&self) -> u64 {
+        0
+    }
+
     /// The attributes, for `fstat` of a file that has no inode.
     fn metadata(&self) -> Option<Metadata> {
         None
@@ -331,6 +344,16 @@ impl File {
     /// The events of `poll` that are true now.
     pub fn poll(&self) -> u32 {
         self.ops.poll(self)
+    }
+
+    /// Tells if the file has its own `poll`, for `epoll_ctl`.
+    pub fn pollable(&self) -> bool {
+        self.ops.pollable()
+    }
+
+    /// The count of the events of the file, for an edge triggered epoll entry.
+    pub fn event_count(&self) -> u64 {
+        self.ops.event_count()
     }
 
     /// The attributes, for `fstat`.

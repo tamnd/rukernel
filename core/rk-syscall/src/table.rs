@@ -2,7 +2,8 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace, seccomp, signal, timer,
+    epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace, seccomp,
+    signal, signalfd, timer, timerfd,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -33,6 +34,19 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PSELECT6 => poll::pselect6(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::PIPE => poll::pipe(cx, a[0]),
         nr::PIPE2 => poll::pipe2(cx, a[0], a[1]),
+        nr::EPOLL_CREATE => epoll::epoll_create(cx, a[0]),
+        nr::EPOLL_CREATE1 => epoll::epoll_create1(cx, a[0]),
+        nr::EPOLL_CTL => epoll::epoll_ctl(cx, a[0], a[1], a[2], a[3]),
+        nr::EPOLL_WAIT => epoll::epoll_wait(cx, a[0], a[1], a[2], a[3]),
+        nr::EPOLL_PWAIT => epoll::epoll_pwait(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::EPOLL_PWAIT2 => epoll::epoll_pwait2(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::EVENTFD => eventfd::eventfd(cx, a[0]),
+        nr::EVENTFD2 => eventfd::eventfd2(cx, a[0], a[1]),
+        nr::TIMERFD_CREATE => timerfd::timerfd_create(cx, a[0], a[1]),
+        nr::TIMERFD_SETTIME => timerfd::timerfd_settime(cx, a[0], a[1], a[2], a[3]),
+        nr::TIMERFD_GETTIME => timerfd::timerfd_gettime(cx, a[0], a[1]),
+        nr::SIGNALFD => signalfd::signalfd(cx, a[0], a[1], a[2]),
+        nr::SIGNALFD4 => signalfd::signalfd4(cx, a[0], a[1], a[2], a[3]),
         nr::OPEN => fs::openat(cx, at_fdcwd(), a[0], a[1], a[2]),
         nr::CLOSE => fs::close(cx, a[0]),
         nr::STAT => fs::fstatat(cx, at_fdcwd(), a[0], a[1], 0),

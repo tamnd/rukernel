@@ -1114,6 +1114,8 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     if let Some(t) = target {
         t.wake();
     }
+    // A signal file of the process can be ready now.
+    rk_vfs::wait::poll_wake();
 }
 
 /// Discards each pending signal of `set` in the queue of `process` and of each of its `threads`.

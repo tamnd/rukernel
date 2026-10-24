@@ -5,8 +5,8 @@ use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::at::{AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW};
 use rk_abi::native::fcntl::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW,
-    F_SETFD, F_SETFL, F_SETLK, F_SETLKW, FD_CLOEXEC,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETPIPE_SZ, F_OFD_GETLK, F_OFD_SETLK,
+    F_OFD_SETLKW, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETPIPE_SZ, FD_CLOEXEC,
 };
 use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
@@ -445,6 +445,11 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             let keep = file.flags().0 & !(O_APPEND | O_NONBLOCK);
             file.set_status_flags(keep | (arg as u32 & (O_APPEND | O_NONBLOCK)));
             Ok(0)
+        }
+        F_GETPIPE_SZ => Ok(rk_vfs::pipe::pipe_size(&*cx.file(fd)?)? as u64),
+        F_SETPIPE_SZ => {
+            let size = usize::try_from(arg as u32).map_err(|_| Errno::EINVAL)?;
+            Ok(rk_vfs::pipe::set_pipe_size(&*cx.file(fd)?, size)? as u64)
         }
         // A process has no other process that shares its files in R1, so each lock succeeds.
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {

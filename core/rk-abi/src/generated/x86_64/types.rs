@@ -462,6 +462,61 @@ const _: () = {
     assert!(core::mem::offset_of!(EpollEvent, data) == 4);
 };
 
+/// `struct signalfd_siginfo` from `<linux/signalfd.h>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct SignalfdSiginfo {
+    pub ssi_signo: u32,
+    pub ssi_errno: i32,
+    pub ssi_code: i32,
+    pub ssi_pid: u32,
+    pub ssi_uid: u32,
+    pub ssi_fd: i32,
+    pub ssi_tid: u32,
+    pub ssi_band: u32,
+    pub ssi_overrun: u32,
+    pub ssi_trapno: u32,
+    pub ssi_status: i32,
+    pub ssi_int: i32,
+    pub ssi_ptr: u64,
+    pub ssi_utime: u64,
+    pub ssi_stime: u64,
+    pub ssi_addr: u64,
+    pub ssi_addr_lsb: u16,
+    pub __pad2: u16,
+    pub ssi_syscall: i32,
+    pub ssi_call_addr: u64,
+    pub ssi_arch: u32,
+    pub __pad: [u8; 28],
+}
+
+const _: () = {
+    assert!(size_of::<SignalfdSiginfo>() == 128);
+    assert!(align_of::<SignalfdSiginfo>() == 8);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_signo) == 0);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_errno) == 4);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_code) == 8);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_pid) == 12);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_uid) == 16);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_fd) == 20);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_tid) == 24);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_band) == 28);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_overrun) == 32);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_trapno) == 36);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_status) == 40);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_int) == 44);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_ptr) == 48);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_utime) == 56);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_stime) == 64);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_addr) == 72);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_addr_lsb) == 80);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, __pad2) == 82);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_syscall) == 84);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_call_addr) == 88);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, ssi_arch) == 96);
+    assert!(core::mem::offset_of!(SignalfdSiginfo, __pad) == 100);
+};
+
 /// `struct robust_list` from `<linux/futex.h>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]

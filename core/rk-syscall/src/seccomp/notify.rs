@@ -58,6 +58,10 @@ pub(crate) struct Listener {
 }
 
 impl FileOps for Listener {
+    fn pollable(&self) -> bool {
+        true
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         let s = self.notify.lock();
         let mut ev = 0;

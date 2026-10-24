@@ -36,6 +36,7 @@ const STRUCTS: &[(&str, &[&str])] = &[
     ("linux/sched.h", &["clone_args"]),
     ("linux/sched/types.h", &["sched_attr"]),
     ("linux/eventpoll.h", &["epoll_event"]),
+    ("linux/signalfd.h", &["signalfd_siginfo"]),
     ("linux/futex.h", &["robust_list", "robust_list_head", "futex_waitv"]),
     ("linux/openat2.h", &["open_how"]),
     ("linux/sysinfo.h", &["sysinfo"]),

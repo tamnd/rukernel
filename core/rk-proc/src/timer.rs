@@ -73,6 +73,15 @@ pub enum Target {
     Thread(Weak<Thread>),
     /// The timer sends no signal, for `SIGEV_NONE`.
     None,
+    /// The timer tells this object, for a timer file. The object gets the count of intervals
+    /// that are over.
+    Notify(Weak<dyn Expire>),
+}
+
+/// An object that a timer tells when its time is over.
+pub trait Expire: Send + Sync {
+    /// The time of the timer is over `count` times.
+    fn expire(&self, count: u64);
 }
 
 #[derive(Debug, Default)]
@@ -193,6 +202,12 @@ impl Timer {
                 .upgrade()
                 .and_then(|t| crate::process::send_timer_signal(t.process(), Some(&t), info)),
             Target::None => None,
+            Target::Notify(n) => {
+                if let Some(n) = n.upgrade() {
+                    n.expire(missed + 1);
+                }
+                None
+            }
         };
         if let Some(overrun) = overrun {
             self.state.lock().overrun = overrun;

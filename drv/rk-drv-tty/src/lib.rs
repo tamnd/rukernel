@@ -188,6 +188,10 @@ impl FileOps for ConsoleFile {
         Ok(0)
     }
 
+    fn pollable(&self) -> bool {
+        true
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         poll_input();
         let readable = CONSOLE.lock().ldisc.readable();

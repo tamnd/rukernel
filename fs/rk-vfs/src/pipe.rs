@@ -23,6 +23,8 @@ pub const PIPE_SIZE: usize = 65536;
 
 struct State {
     buf: VecDeque<u8>,
+    /// The capacity in bytes. `F_SETPIPE_SZ` changes it.
+    size: usize,
     readers: usize,
     writers: usize,
 }
@@ -33,10 +35,17 @@ struct Pipe {
     /// The readers and the writers wait here.
     wait: WaitQueue,
     ino: u64,
+    /// The count of the events for the read end: data came or each write end closed.
+    read_events: AtomicU64,
+    /// The count of the events for the write end: space came or each read end closed.
+    write_events: AtomicU64,
 }
 
 impl Pipe {
-    fn wake(&self) {
+    /// Wakes the waiters. `readers` tells if the event is for the read end or the write end.
+    fn wake(&self, readers: bool) {
+        let count = if readers { &self.read_events } else { &self.write_events };
+        count.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
         poll_wake();
     }
@@ -59,7 +68,7 @@ impl Drop for PipeEnd {
                 s.readers -= 1;
             }
         }
-        self.pipe.wake();
+        self.pipe.wake(self.write);
     }
 }
 
@@ -101,7 +110,7 @@ impl FileOps for PipeEnd {
             if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
         })?;
         if n > 0 {
-            self.pipe.wake();
+            self.pipe.wake(false);
         }
         Ok(n)
     }
@@ -122,7 +131,7 @@ impl FileOps for PipeEnd {
                 if s.readers == 0 {
                     return Err(Errno::EPIPE);
                 }
-                let space = PIPE_SIZE - s.buf.len();
+                let space = s.size.saturating_sub(s.buf.len());
                 // A small write goes in one piece, so it waits for space for all of it.
                 let need = if rest.len() <= PIPE_BUF { rest.len() } else { 1 };
                 if space >= need {
@@ -135,7 +144,7 @@ impl FileOps for PipeEnd {
             match r {
                 Ok(n) => {
                     done += n;
-                    self.pipe.wake();
+                    self.pipe.wake(true);
                 }
                 Err(e) if done == 0 => return Err(e),
                 Err(_) => break,
@@ -155,11 +164,24 @@ impl FileOps for PipeEnd {
         }
     }
 
+    fn pollable(&self) -> bool {
+        true
+    }
+
+    fn event_count(&self) -> u64 {
+        let count = if self.write { &self.pipe.write_events } else { &self.pipe.read_events };
+        count.load(Ordering::Relaxed)
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         let s = self.pipe.state.lock();
         if self.write {
             let mut ev = 0;
-            if PIPE_SIZE - s.buf.len() >= PIPE_BUF {
+            if s.size.saturating_sub(s.buf.len()) >= PIPE_BUF.min(s.size) {
                 ev |= events::POLLOUT;
             }
             if s.readers == 0 {
@@ -190,15 +212,67 @@ impl FileOps for PipeEnd {
     }
 }
 
+/// The largest capacity of a pipe, the default of `/proc/sys/fs/pipe-max-size` of Linux.
+pub const PIPE_MAX_SIZE: usize = 1 << 20;
+
+const PAGE_SIZE: usize = 4096;
+
+fn end_of(file: &File) -> Result<&PipeEnd> {
+    file.ops().as_any().and_then(|a| a.downcast_ref::<PipeEnd>()).ok_or(Errno::EBADF)
+}
+
+/// The capacity of the pipe of `file`, for `F_GETPIPE_SZ`.
+///
+/// # Errors
+///
+/// Gives `EBADF` if the file is not a pipe.
+pub fn pipe_size(file: &File) -> Result<usize> {
+    Ok(end_of(file)?.pipe.state.lock().size)
+}
+
+/// Sets the capacity of the pipe of `file`, for `F_SETPIPE_SZ`. The size goes up to a power of
+/// two count of pages, as `round_pipe_size` of Linux does. Gives the new capacity.
+///
+/// # Errors
+///
+/// Gives `EBADF` if the file is not a pipe, `EINVAL` for a size that is too large, `EPERM` for
+/// a size above `PIPE_MAX_SIZE`, and `EBUSY` if the pipe holds more data than the new capacity.
+pub fn set_pipe_size(file: &File, size: usize) -> Result<usize> {
+    let end = end_of(file)?;
+    if size > (1 << 31) {
+        return Err(Errno::EINVAL);
+    }
+    let size = size.max(PAGE_SIZE).div_ceil(PAGE_SIZE).next_power_of_two() * PAGE_SIZE;
+    if size > PIPE_MAX_SIZE {
+        return Err(Errno::EPERM);
+    }
+    {
+        let mut s = end.pipe.state.lock();
+        if s.buf.len() > size {
+            return Err(Errno::EBUSY);
+        }
+        s.size = size;
+    }
+    end.pipe.wake(false);
+    Ok(size)
+}
+
 /// Makes a pipe, and gives the read end and the write end. `flags` holds `O_NONBLOCK` for both
 /// files.
 pub fn pipe(flags: u32) -> (Arc<File>, Arc<File>) {
     use rk_abi::native::open::{O_RDONLY, O_WRONLY};
     static NEXT_INO: AtomicU64 = AtomicU64::new(1);
     let pipe = Arc::new(Pipe {
-        state: SpinLock::new(State { buf: VecDeque::new(), readers: 1, writers: 1 }),
+        state: SpinLock::new(State {
+            buf: VecDeque::new(),
+            size: PIPE_SIZE,
+            readers: 1,
+            writers: 1,
+        }),
         wait: WaitQueue::new(),
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+        read_events: AtomicU64::new(0),
+        write_events: AtomicU64::new(0),
     });
     let r = Arc::new(PipeEnd { pipe: pipe.clone(), write: false });
     let w = Arc::new(PipeEnd { pipe, write: true });
