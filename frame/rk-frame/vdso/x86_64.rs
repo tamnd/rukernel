@@ -180,14 +180,19 @@ pub unsafe extern "C" fn __vdso_time(t: *mut i64) -> i64 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __vdso_getcpu(cpu: *mut u32, node: *mut u32) -> i32 {
-    // The kernel runs on one CPU in R1.
+    // The limit of the segment 0x7b has the CPU number and the node number, as in Linux.
+    let p: u32;
+    // SAFETY: `lsl` only reads the GDT entry of the selector and writes the register and ZF.
+    unsafe {
+        core::arch::asm!("lsl {p:e}, {sel:e}", p = out(reg) p, sel = in(reg) 0x7bu32, options(nomem, nostack))
+    };
     if !cpu.is_null() {
         // SAFETY: as in `__vdso_clock_gettime`.
-        unsafe { cpu.write_volatile(0) };
+        unsafe { cpu.write_volatile(p & 0xfff) };
     }
     if !node.is_null() {
         // SAFETY: as in `__vdso_clock_gettime`.
-        unsafe { node.write_volatile(0) };
+        unsafe { node.write_volatile(p >> 12) };
     }
     0
 }

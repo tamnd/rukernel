@@ -20,11 +20,10 @@ use rk_proc::sched::SchedParams;
 use rk_proc::{Thread, find_thread, processes};
 use zerocopy::{FromZeros, IntoBytes};
 
-/// The count of the CPUs. rukernel runs on one CPU.
-const NR_CPUS: u32 = 1;
-
 /// The bits of the CPUs that are online.
-const ONLINE: u64 = (1 << NR_CPUS) - 1;
+fn online() -> u64 {
+    u64::MAX >> (64 - rk_frame::cpu::count().clamp(1, 64))
+}
 
 /// The size of a CPU mask in bytes. Linux names it `cpumask_size()`.
 const MASK_SIZE: usize = 8;
@@ -370,7 +369,7 @@ pub(crate) fn sched_setaffinity(cx: &Cx<'_>, pid: u64, len: u64, mask: u64) -> S
     let mut raw = [0u8; MASK_SIZE];
     raw[..len].copy_from_slice(&cx.read_bytes(mask, len)?);
     let thread = affinity_target(cx, pid)?;
-    let affinity = u64::from_ne_bytes(raw) & ONLINE;
+    let affinity = u64::from_ne_bytes(raw) & online();
     if affinity == 0 {
         return Err(Errno::EINVAL);
     }
@@ -380,17 +379,17 @@ pub(crate) fn sched_setaffinity(cx: &Cx<'_>, pid: u64, len: u64, mask: u64) -> S
 
 pub(crate) fn sched_getaffinity(cx: &Cx<'_>, pid: u64, len: u64, mask: u64) -> SysResult {
     let len = len as u32;
-    if u64::from(len) * 8 < u64::from(NR_CPUS) || len as usize % size_of::<u64>() != 0 {
+    if u64::from(len) * 8 < rk_frame::cpu::count() as u64 || len as usize % size_of::<u64>() != 0 {
         return Err(Errno::EINVAL);
     }
-    let affinity = affinity_target(cx, pid)?.sched().affinity & ONLINE;
+    let affinity = affinity_target(cx, pid)?.sched().affinity & online();
     cx.write_bytes(mask, &affinity.to_ne_bytes())?;
     Ok(MASK_SIZE as u64)
 }
 
-/// `getcpu`: rukernel runs on CPU 0 of node 0.
+/// `getcpu`: the CPU that runs the thread now. Each CPU is in node 0.
 pub(crate) fn getcpu(cx: &Cx<'_>, cpu: u64, node: u64) -> SysResult {
-    cx.write_opt(cpu, &0u32)?;
+    cx.write_opt(cpu, &(rk_frame::cpu::id() as u32))?;
     cx.write_opt(node, &0u32)?;
     Ok(0)
 }

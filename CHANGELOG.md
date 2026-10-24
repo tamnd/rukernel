@@ -12,6 +12,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `getpriority`, `setpriority`, `sched_setscheduler`, `sched_getscheduler`, `sched_setparam`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`, `sched_get_priority_min`, `sched_rr_get_interval`, `sched_setaffinity`, `sched_getaffinity` and `getcpu`. The nice value sets the weight of the thread. A real time policy and `SCHED_DEADLINE` give the largest weight, and `SCHED_IDLE` gives the smallest weight.
 - `clock_gettime` and `clock_getres` accept the CPU clocks of `clock_getcpuclockid` and `pthread_getcpuclockid`.
 - The ltp boot test runs 31 more tests, most of them for the scheduling calls. `tools/ltp/build.sh` builds the getpriority, setpriority and nice tests.
+- The kernel starts each CPU that the ACPI MADT gives, up to 64 CPUs. User code runs on all CPUs at the same time. Kernel code runs on one CPU at a time, under one big kernel lock, as in Linux 2.0. All CPUs use one queue of the scheduler, and a CPU with no task waits in its idle task. The CPUs send interrupts to each other to drop TLB entries and to wake an idle CPU.
+- `sched_getaffinity`, `getcpu`, `__vdso_getcpu`, `/proc/cpuinfo` and `/proc/stat` give each CPU that runs. The GDT of each CPU has the CPU number in the limit of the segment 0x7b, as in Linux.
+- The `smp` boot test runs init with 8 CPUs. Init checks the CPU count and runs a hackbench load of 80 processes that send messages through socket pairs. `RK_SMP` sets the CPU count of `cargo xtask qemu` and of the other boot tests.
 
 ### Changed
 
@@ -20,6 +23,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- The futex calls change the futex word with an atomic compare and exchange, because user code on another CPU can change the word at the same time.
+- The kernel finds the ACPI RSDP in the BIOS area when the PVH loader does not give it.
 - `tools/ltp/build.sh` makes the LTP archives again after a crash of the compiler, so a failed build does not leave an archive without some objects.
 - The `alpine` boot test can copy the debug tools on macOS. A file of the tree now replaces a BusyBox link of the root file system.
 

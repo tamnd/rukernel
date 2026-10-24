@@ -597,8 +597,13 @@ fn read_start_info(addr: u64, info: &mut BootInfo) {
             p += 1;
         }
     }
-    if si.rsdp_paddr != 0 {
-        info.set_rsdp(PhysAddr::new(si.rsdp_paddr));
+    match si.rsdp_paddr {
+        0 => {
+            if let Some(rsdp) = super::boot_params::find_rsdp() {
+                info.set_rsdp(PhysAddr::new(rsdp));
+            }
+        }
+        rsdp => info.set_rsdp(PhysAddr::new(rsdp)),
     }
     if si.nr_modules > 0
         && let Some(m) = read_phys::<ModlistEntry>(si.modlist_paddr)

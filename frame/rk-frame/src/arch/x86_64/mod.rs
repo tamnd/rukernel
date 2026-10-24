@@ -1,13 +1,16 @@
 //! x86-64.
 
+mod acpi;
 pub(crate) mod apic;
 mod boot;
 mod boot_params;
+pub(crate) mod cpu;
 mod gdt;
 mod idt;
 mod io;
 pub(crate) mod paging;
 pub(crate) mod serial;
+pub(crate) mod smp;
 pub(crate) mod task;
 pub(crate) mod trap;
 pub(crate) mod user;
@@ -18,6 +21,9 @@ use io::Port;
 /// `syscall` instruction.
 pub(crate) fn init_cpu() {
     gdt::init();
+    // The GDT load sets GS to 0, so the GS base comes after it. `smp::start_cpus` sets the local
+    // APIC ID of the boot CPU.
+    cpu::init(0, 0);
     idt::init();
     user::init();
 }
@@ -68,7 +74,7 @@ pub fn random_seed() -> u64 {
 
 /// Handles an interrupt from a device or the local APIC.
 fn interrupt(vector: u8) {
-    if !apic::handle(vector) {
+    if !smp::handle(vector) && !apic::handle(vector) {
         crate::console::_print_panic(format_args!(
             "rk-frame: spurious interrupt on vector {vector}\n"
         ));

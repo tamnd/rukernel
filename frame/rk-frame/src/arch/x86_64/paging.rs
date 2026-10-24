@@ -13,6 +13,7 @@
 //! 4 KiB pages, so that each section has its own permissions: text is read only and executable,
 //! rodata is read only, and data and bss are writable. Nothing is writable and executable.
 
+use super::cpu::{self, MAX_CPUS};
 use crate::addr::PAGE_SIZE;
 use crate::boot::{BootInfo, MemoryKind};
 use crate::mm::PageInfo;
@@ -152,7 +153,8 @@ fn map_2m(pml4: u64, virt: usize, phys: u64, flags: u64) -> Result<(), ()> {
     Ok(())
 }
 
-fn flush(virt: usize) {
+/// Drops the TLB entry of `virt` on this CPU.
+pub(crate) fn flush(virt: usize) {
     // SAFETY: invlpg only drops a TLB entry.
     unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
 }
@@ -237,7 +239,16 @@ pub(crate) fn init(info: &BootInfo) {
         );
     }
     DIRECT_MAP.store(true, Ordering::Release);
-    ACTIVE.store(pml4, Ordering::Release);
+    active().store(pml4, Ordering::Release);
+}
+
+/// Copies the kernel half of the kernel table to the top level table at the physical address
+/// `table`.
+pub(crate) fn copy_kernel_half(table: u64) {
+    let kernel = KERNEL_PML4.load(Ordering::Acquire);
+    for i in KERNEL_HALF {
+        write_entry(table, i, read_entry(kernel, i));
+    }
 }
 
 /// Maps one 4 KiB page of the vmalloc range.
@@ -277,6 +288,7 @@ pub(crate) fn unmap_page(virt: usize) -> Option<u64> {
     }
     write_entry(table, i1, 0);
     flush(virt);
+    super::smp::shootdown(0, virt as u64);
     Some(e & ADDR_MASK)
 }
 
@@ -322,24 +334,33 @@ pub(crate) fn query(virt: usize) -> Option<PageInfo> {
 /// below the end of the lower half is not used, as in Linux.
 pub(crate) const USER_END: usize = 0x0000_7fff_ffff_f000;
 
-/// The top level table that CR3 has now.
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
+/// The top level table that CR3 of each CPU has now. Each CPU changes only its own value, with
+/// the big kernel lock or before it runs tasks.
+static ACTIVE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+fn active() -> &'static AtomicU64 {
+    &ACTIVE[cpu::id()]
+}
+
+/// The top level table that CR3 of the CPU `id` has now.
+pub(crate) fn active_on(id: usize) -> u64 {
+    ACTIVE[id].load(Ordering::Acquire)
+}
 
 /// Makes the top level table of a new user address space and gives its physical address. The
 /// user half is empty, and the kernel half has the entries of the kernel table.
 pub(crate) fn new_user_root() -> Option<u64> {
     let root = alloc_table_frame()?;
-    let kernel = KERNEL_PML4.load(Ordering::Acquire);
-    for i in KERNEL_HALF {
-        write_entry(root, i, read_entry(kernel, i));
-    }
+    copy_kernel_half(root);
     Some(root)
 }
 
 /// Gives back the tables of the user half of `root` and `root` itself. The caller removed the
-/// mappings of the pages, and `root` is not active.
+/// mappings of the pages, and `root` is not active on this CPU. Each other CPU that still has
+/// `root` loads the kernel table first.
 pub(crate) fn free_user_root(root: u64) {
-    assert!(ACTIVE.load(Ordering::Acquire) != root, "the address space is active");
+    assert!(active().load(Ordering::Acquire) != root, "the address space is active");
+    super::smp::shootdown(root, super::smp::LEAVE);
     fn free_level(table: u64, level: usize) {
         if level > 1 {
             for i in 0..512 {
@@ -383,11 +404,12 @@ fn user_leaf(root: u64, virt: usize) -> Option<(u64, usize)> {
     Some((table, i1))
 }
 
-/// Drops the TLB entry of `virt` if `root` is active.
+/// Drops the TLB entry of `virt` on each CPU where `root` is active.
 fn flush_user(root: u64, virt: usize) {
-    if ACTIVE.load(Ordering::Acquire) == root {
+    if active().load(Ordering::Acquire) == root {
         flush(virt);
     }
+    super::smp::shootdown(root, virt as u64);
 }
 
 /// The permissions of a user page: readable, writable and executable.
@@ -423,7 +445,7 @@ pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
 /// Loads `root` into CR3. A value of 0 loads the kernel table.
 pub(crate) fn activate(root: u64) {
     let root = if root == 0 { KERNEL_PML4.load(Ordering::Acquire) } else { root };
-    if ACTIVE.swap(root, Ordering::AcqRel) == root {
+    if active().swap(root, Ordering::AcqRel) == root {
         return;
     }
     // SAFETY: `root` is the kernel table or a table from `new_user_root`. Each one has the kernel
@@ -432,7 +454,14 @@ pub(crate) fn activate(root: u64) {
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) };
 }
 
-/// Tells if `root` is in CR3 now.
+/// Tells if `root` is in CR3 of this CPU now.
 pub(crate) fn is_active(root: u64) -> bool {
-    ACTIVE.load(Ordering::Acquire) == root
+    active().load(Ordering::Acquire) == root
+}
+
+/// Loads the kernel table if `root` is in CR3 of this CPU, because `root` goes away.
+pub(crate) fn leave(root: u64) {
+    if is_active(root) {
+        activate(0);
+    }
 }

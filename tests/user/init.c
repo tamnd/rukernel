@@ -2,11 +2,12 @@
  * The init program of the rk.test=init boot test. It is a static ELF file. Each check prints
  * one line. init exits with 0 if each check passes, and with 1 if a check fails. With the
  * argument "tty", init also reads a line from the console and waits for ^C, which the boot test
- * types.
+ * types. With the argument "smp", init also checks the CPU count and runs a hackbench load.
  */
 #define _GNU_SOURCE
 #include <elf.h>
 #include <errno.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stddef.h>
@@ -235,7 +236,7 @@ static void test_vdso(void)
 	long t = 0;
 	check("__vdso_time", vtime(&t) == t && t >= s.tv_sec);
 	unsigned cpu = 7, node = 7;
-	check("__vdso_getcpu", vgetcpu(&cpu, &node) == 0 && cpu == 0 && node == 0);
+	check("__vdso_getcpu", vgetcpu(&cpu, &node) == 0 && cpu < (unsigned)sysconf(_SC_NPROCESSORS_ONLN) && node == 0);
 	struct timespec m;
 	check("clock_gettime of libc", clock_gettime(CLOCK_MONOTONIC, &m) == 0 && timespec_ns(&m) >= timespec_ns(&s));
 }
@@ -1645,6 +1646,105 @@ static void test_tty(void)
 	check("tcsetpgrp back to init", tcsetpgrp(0, getpgrp()) == 0);
 }
 
+/* The load of hackbench in its process mode: each group has HB_FDS senders and HB_FDS receivers,
+ * and each sender writes HB_LOOPS messages of HB_SIZE bytes to each receiver of its group through
+ * a socket pair. */
+#define HB_GROUPS 4
+#define HB_FDS 10
+#define HB_LOOPS 100
+#define HB_SIZE 100
+
+static void hb_receiver(int fd)
+{
+	char buf[HB_SIZE];
+	size_t want = (size_t)HB_FDS * HB_LOOPS * HB_SIZE;
+	while (want > 0) {
+		ssize_t n = read(fd, buf, sizeof(buf));
+		if (n <= 0)
+			_exit(1);
+		want -= (size_t)n;
+	}
+	_exit(0);
+}
+
+static void hb_sender(const int *fds, int start)
+{
+	char buf[HB_SIZE] = {0}, go;
+	if (read(start, &go, 1) != 1)
+		_exit(1);
+	for (int i = 0; i < HB_LOOPS; i++)
+		for (int j = 0; j < HB_FDS; j++)
+			for (size_t done = 0; done < sizeof(buf);) {
+				ssize_t n = write(fds[j], buf + done, sizeof(buf) - done);
+				if (n <= 0)
+					_exit(1);
+				done += (size_t)n;
+			}
+	_exit(0);
+}
+
+static void test_smp(void)
+{
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	int cpus = sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
+	check("sched_getaffinity gives more than one CPU", cpus > 1);
+	check("sysconf gives the CPU count", sysconf(_SC_NPROCESSORS_ONLN) == cpus);
+	unsigned cpu = 99;
+	check("getcpu gives a CPU of the set", syscall(SYS_getcpu, &cpu, NULL, NULL) == 0 &&
+						     (int)cpu < cpus);
+	int vcpu = sched_getcpu();
+	check("sched_getcpu of the vDSO gives a CPU of the set", vcpu >= 0 && vcpu < cpus);
+
+	int start[2];
+	if (pipe(start) != 0) {
+		check("hackbench makes its pipe", 0);
+		return;
+	}
+	int children = 0, ok = 1;
+	for (int g = 0; g < HB_GROUPS && ok; g++) {
+		int wr[HB_FDS];
+		for (int r = 0; r < HB_FDS; r++) {
+			int sv[2];
+			if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+				ok = 0;
+				break;
+			}
+			pid_t pid = fork();
+			if (pid == 0) {
+				close(sv[1]);
+				hb_receiver(sv[0]);
+			}
+			close(sv[0]);
+			wr[r] = sv[1];
+			children += pid > 0;
+			ok &= pid > 0;
+		}
+		for (int s = 0; s < HB_FDS && ok; s++) {
+			pid_t pid = fork();
+			if (pid == 0)
+				hb_sender(wr, start[0]);
+			children += pid > 0;
+			ok &= pid > 0;
+		}
+		for (int r = 0; r < HB_FDS; r++)
+			close(wr[r]);
+	}
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	for (int i = 0; i < HB_GROUPS * HB_FDS; i++)
+		ok &= write(start[1], "g", 1) == 1;
+	close(start[0]);
+	close(start[1]);
+	int status;
+	for (int i = 0; i < children; i++)
+		ok &= wait(&status) > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	printf("init: hackbench with %d groups on %d CPUs takes %ld ms\n", HB_GROUPS, cpus, ms);
+	check("hackbench completes", ok && children == 2 * HB_GROUPS * HB_FDS);
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -1676,6 +1776,8 @@ int main(int argc, char **argv)
 	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
+	if (argc > 1 && strcmp(argv[1], "smp") == 0)
+		test_smp();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }

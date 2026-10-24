@@ -4,8 +4,11 @@
 //! `cs` and `ss`, and a signal frame contains them. The SYSCALL and SYSRET instructions also need
 //! this order, because SYSRET takes the user selectors from the STAR MSR at fixed offsets.
 //!
-//! In R0 there is one CPU, so there is one table. The tables become per CPU in R2.
+//! Each CPU has its own tables, because the CPU writes the busy bit of its TSS descriptor and
+//! each CPU needs its own stacks. The tables of the boot CPU are static, because the boot CPU
+//! loads them before the heap works. The tables of each other CPU are on the heap.
 
+use alloc::alloc::{Layout, alloc_zeroed};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +24,11 @@ pub(crate) const USER_DS: u16 = 0x2b;
 pub(crate) const USER_CS: u16 = 0x33;
 /// The task state segment. It uses two slots.
 const TSS_SELECTOR: u16 = 0x40;
+/// The slot of the segment whose limit is the CPU number and the node number, for `lsl` in the
+/// vDSO. Linux names it `GDT_ENTRY_CPUNODE`, and user code sees the selector `0x7b`.
+const CPUNODE: usize = 15;
+/// The number of slots of the GDT, as in Linux.
+const GDT_ENTRIES: usize = 16;
 
 /// The interrupt stack table slot for a double fault.
 pub(crate) const IST_DOUBLE_FAULT: u8 = 1;
@@ -51,20 +59,20 @@ struct Tss {
 #[repr(C, align(16))]
 struct Stack([u8; IST_STACK_SIZE]);
 
-/// The tables of the boot CPU. The CPU writes the busy bit of the TSS descriptor, so the tables
-/// are in an `UnsafeCell` and Rust never makes a reference to them after the load.
+/// The tables of one CPU. The CPU writes the busy bit of the TSS descriptor, so the tables are in
+/// an `UnsafeCell` and Rust never makes a reference to them after the load.
 struct Tables {
-    gdt: UnsafeCell<[u64; 10]>,
+    gdt: UnsafeCell<[u64; GDT_ENTRIES]>,
     tss: UnsafeCell<Tss>,
     stacks: UnsafeCell<[Stack; 4]>,
 }
 
-// SAFETY: only `init` writes the tables, one time, before the CPU loads them. The `LOADED` flag
-// makes sure of this.
+// SAFETY: only `load` writes the tables, one time, before the CPU loads them. The `LOADED` flag
+// makes sure of this for the static tables, and each other CPU has new tables.
 unsafe impl Sync for Tables {}
 
-static TABLES: Tables = Tables {
-    gdt: UnsafeCell::new([0; 10]),
+static BOOT_TABLES: Tables = Tables {
+    gdt: UnsafeCell::new([0; GDT_ENTRIES]),
     tss: UnsafeCell::new(Tss {
         reserved0: 0,
         rsp: [0; 3],
@@ -95,23 +103,55 @@ pub(crate) fn init() {
     if LOADED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let tss = TABLES.tss.get();
-    let stacks = TABLES.stacks.get().cast::<Stack>();
+    // SAFETY: `LOADED` makes sure that this code runs one time, before the CPU uses the tables.
+    unsafe { load(&BOOT_TABLES, 0) };
+}
+
+/// Makes new tables for the CPU `id`, which is not the boot CPU, and loads them. The tables stay until the
+/// CPU stops, so they are not given back.
+///
+/// # Panics
+///
+/// Panics if no memory is free for the tables.
+pub(crate) fn init_secondary(id: usize) {
+    let layout = Layout::new::<Tables>();
+    // SAFETY: the layout has a size that is not zero.
+    let tables = unsafe { alloc_zeroed(layout) }.cast::<Tables>();
+    assert!(!tables.is_null(), "no memory for the tables of a CPU");
+    // SAFETY: the memory is new, aligned for `Tables` and all zero, which is a valid value of each
+    // field. No other code knows it. The tables are never given back, so they live for all of the
+    // run time.
+    unsafe { load(&*tables, id) };
+}
+
+/// Fills the GDT and the TSS in `tables` for the CPU `id`, loads them and reloads the segment
+/// registers.
+///
+/// # Safety
+///
+/// No CPU uses `tables` yet, and `tables` lives for all of the run time.
+unsafe fn load(tables: &'static Tables, id: usize) {
+    let tss = tables.tss.get();
+    let stacks = tables.stacks.get().cast::<Stack>();
     for (i, slot) in [IST_DOUBLE_FAULT, IST_NMI, IST_MACHINE_CHECK].into_iter().enumerate() {
         // The stack grows down, so the IST entry is the end of the stack.
         let top = stacks.wrapping_add(i + 1) as u64;
-        // SAFETY: `LOADED` makes sure that this code runs one time, before the CPU uses the TSS.
-        // No reference to the TSS exists.
+        // SAFETY: the caller makes sure that no CPU uses the TSS yet. No reference to the TSS
+        // exists.
         unsafe { (*tss).ist[usize::from(slot) - 1] = top };
     }
     let top = stacks.wrapping_add(ENTRY_STACK + 1) as u64;
-    // SAFETY: as above, for RSP0.
-    unsafe { (*tss).rsp[0] = top };
+    // SAFETY: as above, for RSP0 and the I/O map base.
+    unsafe {
+        (*tss).rsp[0] = top;
+        (*tss).iomap_base = size_of::<Tss>() as u16;
+    }
 
     let tss_base = tss as u64;
     let tss_limit = size_of::<Tss>() as u64 - 1;
-    let gdt = TABLES.gdt.get();
-    let entries: [u64; 10] = [
+    let gdt = tables.gdt.get();
+    let mut entries = [0; GDT_ENTRIES];
+    entries[..10].copy_from_slice(&[
         0,
         segment(0x9b, 0xc), // 0x08: 32 bit kernel code
         segment(0x9b, 0xa), // 0x10: 64 bit kernel code
@@ -126,12 +166,17 @@ pub(crate) fn init() {
             | (((tss_limit >> 16) & 0xf) << 48)
             | (((tss_base >> 24) & 0xff) << 56),
         tss_base >> 32,
-    ];
+    ]);
+    // A user data segment with byte granularity. The limit has the CPU number in bits 0 to 11
+    // and the node number, which is 0, in bits 12 to 19, as `vdso_encode_cpunode` of Linux gives.
+    let cpunode = id as u64 & 0xfff;
+    entries[CPUNODE] =
+        (cpunode & 0xffff) | (0xf3 << 40) | (((cpunode >> 16) & 0xf) << 48) | (0x4 << 52);
     // SAFETY: as above, for the GDT.
     unsafe { gdt.write(entries) };
 
-    let ptr = Pointer { limit: (size_of::<[u64; 10]>() - 1) as u16, base: gdt as u64 };
-    // SAFETY: the GDT is static, so it lives for all of the run time. The kernel code and data
+    let ptr = Pointer { limit: (size_of::<[u64; GDT_ENTRIES]>() - 1) as u16, base: gdt as u64 };
+    // SAFETY: the caller makes sure that the GDT lives for all of the run time. The kernel code and data
     // selectors have the same meaning as in the boot GDT, so the code that runs now continues to
     // work. The far return loads CS. The TSS descriptor is valid and not busy.
     unsafe {

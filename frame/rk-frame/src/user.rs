@@ -92,7 +92,11 @@ impl UserContext {
     /// then have the values of the user code at that time. After a system call, the instruction
     /// pointer is after the `syscall` instruction.
     pub fn execute(&mut self) -> ReturnReason {
-        match user::enter(&mut self.regs, &mut self.fpu, self.fs_base) {
+        // User code runs without the kernel lock, so the other CPUs can run kernel code.
+        crate::task::kernel_unlock();
+        let reason = user::enter(&mut self.regs, &mut self.fpu, self.fs_base);
+        crate::task::kernel_lock();
+        match reason {
             user::Return::Syscall => ReturnReason::Syscall,
             user::Return::Interrupt => {
                 crate::task::run_bottom_half();

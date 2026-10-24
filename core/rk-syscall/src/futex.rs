@@ -84,8 +84,11 @@ fn read_word(vm: &AddressSpace, addr: usize) -> Result<u32, Errno> {
     Ok(u32::from_ne_bytes(b))
 }
 
-fn write_word(vm: &AddressSpace, addr: usize, word: u32) -> Result<(), Errno> {
-    vm.write(addr, &word.to_ne_bytes())
+/// Writes `new` to the word at `addr` if it has the value `old`. Gives `false` if the word has
+/// another value. User code on another CPU can change the word at any time, so the kernel does
+/// not write a word that it read before without this check.
+fn replace_word(vm: &AddressSpace, addr: usize, old: u32, new: u32) -> Result<bool, Errno> {
+    Ok(vm.compare_exchange_u32(addr, old, new)? == old)
 }
 
 impl Waiter {
@@ -217,7 +220,9 @@ fn lock_pi(
         if owner == 0 {
             // The futex of a dead owner keeps `FUTEX_OWNER_DIED`, so that the new owner sees it.
             let waiters = if has_waiters(key) { FUTEX_WAITERS } else { 0 };
-            write_word(vm, addr, tid | (word & FUTEX_OWNER_DIED) | waiters)?;
+            if !replace_word(vm, addr, word, tid | (word & FUTEX_OWNER_DIED) | waiters)? {
+                continue;
+            }
             return Ok(0);
         }
         if trylock {
@@ -226,8 +231,8 @@ fn lock_pi(
         if rk_proc::find_thread(owner).is_none() {
             return Err(Errno::ESRCH);
         }
-        if word & FUTEX_WAITERS == 0 {
-            write_word(vm, addr, word | FUTEX_WAITERS)?;
+        if word & FUTEX_WAITERS == 0 && !replace_word(vm, addr, word, word | FUTEX_WAITERS)? {
+            continue;
         }
         let waiter = Waiter::new(tid, FUTEX_BITSET_MATCH_ANY);
         sleep(thread, key, &waiter, deadline, Errno::ERESTARTNOINTR)?;
@@ -254,12 +259,14 @@ fn unlock_pi(thread: &Thread, vm: &Arc<AddressSpace>, addr: usize, private: bool
         }
         next.map(|w| (w, more))
     };
+    // Only the owner changes the word while it has an owner, and the owner is this thread, so
+    // the word cannot change. The check is for a word that user code wrote in a wrong way.
     let Some((next, more)) = next else {
-        write_word(vm, addr, 0)?;
+        replace_word(vm, addr, word, 0)?;
         return Ok(0);
     };
     let waiters = if more { FUTEX_WAITERS } else { 0 };
-    write_word(vm, addr, next.tid | waiters)?;
+    replace_word(vm, addr, word, next.tid | waiters)?;
     next.owner.store(true, Ordering::Release);
     next.woken.store(true, Ordering::Release);
     next.queue.wake_all();
@@ -297,17 +304,22 @@ fn wake_op_update(vm: &AddressSpace, addr: usize, encoded: u32) -> Result<u32, E
         oparg = 1 << oparg;
         op &= !FUTEX_OP_OPARG_SHIFT;
     }
-    let old = read_word(vm, addr)?;
-    let new = match op {
-        0 => oparg,
-        1 => old.wrapping_add(oparg),
-        2 => old | oparg,
-        3 => old & !oparg,
-        4 => old ^ oparg,
-        _ => return Err(Errno::ENOSYS),
-    };
-    vm.write(addr, &new.to_ne_bytes())?;
-    Ok(old)
+    if op > 4 {
+        return Err(Errno::ENOSYS);
+    }
+    loop {
+        let old = read_word(vm, addr)?;
+        let new = match op {
+            0 => oparg,
+            1 => old.wrapping_add(oparg),
+            2 => old | oparg,
+            3 => old & !oparg,
+            _ => old ^ oparg,
+        };
+        if replace_word(vm, addr, old, new)? {
+            return Ok(old);
+        }
+    }
 }
 
 /// Tells if the old value passes the compare of `FUTEX_WAKE_OP`.
@@ -432,19 +444,22 @@ pub(crate) fn exit_clear_tid(thread: &Thread) {
 /// Marks the futex at `addr` that the dead thread `tid` holds, as `handle_futex_death` of Linux
 /// does. `pending` tells that the address is the `list_op_pending` of the list.
 fn futex_death(vm: &Arc<AddressSpace>, addr: usize, tid: u32, pi: bool, pending: bool) {
-    let Ok(word) = read_word(vm, addr) else { return };
+    // A user thread on another CPU can change the word, so the change is a compare and exchange.
+    let word = loop {
+        let Ok(word) = read_word(vm, addr) else { return };
+        if word & FUTEX_TID_MASK != tid {
+            break word;
+        }
+        match replace_word(vm, addr, word, (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED) {
+            Ok(true) => break word,
+            Ok(false) => {}
+            Err(_) => return,
+        }
+    };
     let owner = word & FUTEX_TID_MASK;
     // The thread released the futex, but it did not wake a waiter before it died.
-    let wake = if pending && !pi && owner == 0 {
-        true
-    } else if owner == tid {
-        if write_word(vm, addr, (word & FUTEX_WAITERS) | FUTEX_OWNER_DIED).is_err() {
-            return;
-        }
-        word & FUTEX_WAITERS != 0
-    } else {
-        false
-    };
+    let wake =
+        if pending && !pi && owner == 0 { true } else { owner == tid && word & FUTEX_WAITERS != 0 };
     if wake && let Ok(k) = key(vm, addr, false) {
         wake_key(k, 1, FUTEX_BITSET_MATCH_ANY);
     }

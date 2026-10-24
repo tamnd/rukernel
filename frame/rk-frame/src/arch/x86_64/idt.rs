@@ -138,7 +138,7 @@ struct Pointer {
     base: u64,
 }
 
-/// Fills the IDT and loads it.
+/// Fills the IDT and loads it. All CPUs use the same table.
 pub(crate) fn init() {
     if LOADED.swap(true, Ordering::AcqRel) {
         return;
@@ -156,8 +156,13 @@ pub(crate) fn init() {
         let dpl = if matches!(vector as u8, BREAKPOINT | OVERFLOW) { 3 } else { 0 };
         *gate = Gate::interrupt(stubs + 16 * vector as u64, ist, dpl);
     }
-    // SAFETY: `LOADED` makes sure that this code runs one time, before the CPU loads the table.
+    // SAFETY: `LOADED` makes sure that this code runs one time, before a CPU loads the table.
     unsafe { IDT.0.get().write(gates) };
+    load();
+}
+
+/// Loads the IDT that `init` filled, on a CPU that is not the boot CPU.
+pub(crate) fn load() {
     let ptr = Pointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: IDT.0.get() as u64 };
     // SAFETY: the table is static and each gate points to a stub in `rk_trap_stubs`.
     unsafe { core::arch::asm!("lidt [{}]", in(reg) &raw const ptr, options(readonly, nostack)) };

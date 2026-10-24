@@ -140,13 +140,17 @@ fn uptime() -> (u64, u64) {
 }
 
 fn cpuinfo() -> Vec<u8> {
-    format!(
-        "processor\t: 0\nvendor_id\t: rukernel\nmodel name\t: {} virtual CPU\ncpu MHz\t\t: {}\n\
-         physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\nflags\t\t:\n\n",
-        rk_frame::arch::UNAME_MACHINE,
-        rk_frame::time::timer_frequency() / 1_000_000,
-    )
-    .into_bytes()
+    let n = rk_frame::cpu::count();
+    let mut out = String::new();
+    for i in 0..n {
+        out += &format!(
+            "processor\t: {i}\nvendor_id\t: rukernel\nmodel name\t: {} virtual CPU\ncpu MHz\t\t: {}\n\
+             physical id\t: 0\nsiblings\t: {n}\ncore id\t\t: {i}\ncpu cores\t: {n}\nflags\t\t:\n\n",
+            rk_frame::arch::UNAME_MACHINE,
+            rk_frame::time::timer_frequency() / 1_000_000,
+        );
+    }
+    out.into_bytes()
 }
 
 fn stat() -> Vec<u8> {
@@ -156,11 +160,18 @@ fn stat() -> Vec<u8> {
     // The timer does not tick while the kernel runs, so the time that is not user time is idle.
     let hz = rk_frame::time::HZ;
     let total = rk_frame::time::ticks();
-    let user = rk_proc::user_ticks().min(total);
-    let cpu = format!("{} 0 0 {} 0 0 0 0 0 0", user * USER_HZ / hz, (total - user) * USER_HZ / hz);
+    // The kernel counts the user time of all CPUs together, so each CPU line has an equal part.
+    let n = rk_frame::cpu::count() as u64;
+    let user = rk_proc::user_ticks().min(total * n);
+    let line = |user: u64, idle: u64| {
+        format!("{} 0 0 {} 0 0 0 0 0 0", user * USER_HZ / hz, idle * USER_HZ / hz)
+    };
+    let cpus: String =
+        (0..n).map(|i| format!("cpu{i} {}\n", line(user / n, total - user / n))).collect();
     format!(
-        "cpu  {cpu}\ncpu0 {cpu}\nintr 0\nctxt 0\nbtime {boot}\nprocesses {}\n\
+        "cpu  {}\n{cpus}intr 0\nctxt 0\nbtime {boot}\nprocesses {}\n\
          procs_running {running}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n",
+        line(user, total * n - user),
         all.iter().map(|p| p.pid()).max().unwrap_or(0),
     )
     .into_bytes()

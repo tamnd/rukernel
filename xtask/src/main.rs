@@ -402,6 +402,7 @@ const BOOT_TESTS: &[&str] = &[
     "fault",
     "init",
     "tty",
+    "smp",
     "busybox",
     "ltp",
     "kselftest",
@@ -1172,10 +1173,19 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
     qemu_command_with(kernel, &kernel.with_file_name("initramfs.cpio"), cmdline)
 }
 
-/// The QEMU command for the x86-64 kernel with the initramfs `initrd`.
+/// The number of CPUs of the `smp` boot test.
+const SMP_CPUS: &str = "8";
+
+/// The QEMU command for the x86-64 kernel with the initramfs `initrd`. The machine has one CPU, or
+/// the number of CPUs in `RK_SMP`. The `smp` boot test has `SMP_CPUS` CPUs.
 fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
+    let smp = if cmdline.ends_with("-- smp") {
+        String::from(SMP_CPUS)
+    } else {
+        std::env::var("RK_SMP").unwrap_or_else(|_| String::from("1"))
+    };
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(["-machine", "q35", "-m", "512M", "-smp", "1", "-display", "none"])
+    cmd.args(["-machine", "q35", "-m", "512M", "-smp", &smp, "-display", "none"])
         .args(["-serial", "stdio", "-no-reboot", "-monitor", "none"])
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
         .arg("-kernel")
@@ -1205,7 +1215,7 @@ fn qemu(args: &[String]) -> Result {
 /// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
-        "init" | "tty" => kernel.with_file_name("user-init").exists(),
+        "init" | "tty" | "smp" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" => kernel.with_file_name("initramfs-kselftest.cpio").exists(),
@@ -1219,6 +1229,7 @@ fn can_run(kernel: &Path, test: &str) -> bool {
 fn test_cmdline(test: &str) -> String {
     match test {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
+        "smp" => String::from("console=ttyS0 rk.test=init -- smp"),
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
@@ -1231,7 +1242,7 @@ fn test_cmdline(test: &str) -> String {
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "busybox" | "ltp" | "kselftest")
+    let test = if matches!(test, "tty" | "smp" | "busybox" | "ltp" | "kselftest")
         || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"

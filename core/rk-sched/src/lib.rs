@@ -277,7 +277,7 @@ mod glue {
     /// The entity of the task on this CPU, if it runs and is not `task`.
     fn current_entity(task: &Task) -> Option<Entity> {
         let curr = Task::current();
-        (curr.id() != task.id() && !curr.is_blocked() && !curr.is_exited())
+        (curr.id() != task.id() && !curr.is_idle() && !curr.is_blocked() && !curr.is_exited())
             .then(|| *data(&curr).entity.lock())
     }
 
@@ -329,7 +329,7 @@ mod glue {
 
         fn dequeue(&self) -> Option<Arc<Task>> {
             let curr = Task::current();
-            let running = !curr.is_blocked() && !curr.is_exited();
+            let running = !curr.is_idle() && !curr.is_blocked() && !curr.is_exited();
             let curr = running.then(|| *data(&curr).entity.lock());
             let (task, e) = self.queue.lock().pick(curr.as_ref())?;
             let mut entity = data(&task).entity.lock();

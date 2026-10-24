@@ -35,7 +35,7 @@ impl Default for SchedParams {
             runtime: 0,
             deadline: 0,
             period: 0,
-            affinity: 1,
+            affinity: u64::MAX,
         }
     }
 }
