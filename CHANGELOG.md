@@ -25,6 +25,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The futex calls change the futex word with an atomic compare and exchange, because user code on another CPU can change the word at the same time.
 - The kernel finds the ACPI RSDP in the BIOS area when the PVH loader does not give it.
+- `timer_settime` and `timer_delete` discard the pending signal of the old setting of the timer, as Linux 6.13 does. `timer_getoverrun` gives the overrun count of the last signal that a thread took, and not of the last signal that the timer sent.
 - `tools/ltp/build.sh` makes the LTP archives again after a crash of the compiler, so a failed build does not leave an archive without some objects.
 - The `alpine` boot test can copy the debug tools on macOS. A file of the tree now replaces a BusyBox link of the root file system.
 

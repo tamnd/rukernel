@@ -833,10 +833,26 @@ impl Thread {
     /// from the queue of the process. The action does not apply yet: a traced thread stops for
     /// its tracer first.
     pub fn next_signal(&self) -> Option<SigInfo> {
-        let mut shared = self.process.signals.lock();
-        let mut own = self.signals.lock();
-        let blocked = own.blocked;
-        own.pending.take(blocked).or_else(|| shared.pending.take(blocked))
+        let info = {
+            let mut shared = self.process.signals.lock();
+            let mut own = self.signals.lock();
+            let blocked = own.blocked;
+            own.pending.take(blocked).or_else(|| shared.pending.take(blocked))
+        };
+        self.took_signal(info)
+    }
+
+    /// Keeps the overrun count of a POSIX timer signal that the thread took, for
+    /// `timer_getoverrun`. Linux also sets the count when the thread takes the signal, and not
+    /// when the timer sends it.
+    fn took_signal(&self, info: Option<SigInfo>) -> Option<SigInfo> {
+        if let Some(i) = info
+            && i.code == SI_TIMER
+            && let Some(timer) = self.process.timers().get(i.pid as i32)
+        {
+            timer.set_overrun(i.uid as i32);
+        }
+        info
     }
 
     /// Applies the action of the signal `info` that `next_signal` took. Gives `None` if the
@@ -884,7 +900,9 @@ impl Thread {
         let mut shared = self.process.signals.lock();
         let mut own = self.signals.lock();
         let others = SigSet(!set.0);
-        own.pending.take(others).or_else(|| shared.pending.take(others))
+        let info = own.pending.take(others).or_else(|| shared.pending.take(others));
+        drop((own, shared));
+        self.took_signal(info)
     }
 
     /// Sends a signal to this thread, for `tkill`, `tgkill` and the exceptions. See
@@ -1228,13 +1246,8 @@ fn notify_stop(process: &Process, parent: &Process, status: WaitStatus) {
 
 /// Sends the signal of a timer to `process`, or to `thread` of that process if it is given. In
 /// `info`, `uid` holds the overrun count. If the last signal of the same POSIX timer is still
-/// pending, the signal only adds its overruns to it. Gives the overrun count of the signal in the
-/// queue.
-pub(crate) fn send_timer_signal(
-    process: &Process,
-    thread: Option<&Arc<Thread>>,
-    info: SigInfo,
-) -> Option<i32> {
+/// pending, the signal only adds its overruns to it.
+pub(crate) fn send_timer_signal(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     if info.code == SI_TIMER {
         let mut shared = process.signals.lock();
         let more = info.uid.saturating_add(1);
@@ -1243,11 +1256,20 @@ pub(crate) fn send_timer_signal(
             None => shared.pending.add_overrun(info.pid, more),
         };
         if count.is_some() {
-            return count;
+            return;
         }
     }
     deliver(process, thread, info);
-    Some(info.uid as i32)
+}
+
+/// Discards the pending signal of the POSIX timer `id` of `process`, or of `thread` if it is
+/// given. Linux drops the signal of a timer that is set again or deleted, so that no signal of an
+/// old setting comes after `timer_settime` or `timer_delete`.
+pub(crate) fn discard_timer_signal(process: &Process, thread: Option<&Arc<Thread>>, id: u32) {
+    match thread {
+        Some(t) => t.signals.lock().pending.discard_timer(id),
+        None => process.signals.lock().pending.discard_timer(id),
+    }
 }
 
 /// Sends a signal to each thread of `process`, for `kill` and the signals of the terminal.
