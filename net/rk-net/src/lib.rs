@@ -240,6 +240,10 @@ impl FileOps for SocketFile {
         Ok(0)
     }
 
+    fn pollable(&self) -> bool {
+        true
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         self.socket.poll()
     }

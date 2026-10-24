@@ -24,6 +24,10 @@ pub const UNAME_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC rukernel";
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod cx;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod epoll;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod eventfd;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod fs;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod futex;
@@ -52,9 +56,13 @@ mod seccomp;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod signalfd;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod table;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod timer;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod timerfd;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use run::{count, init, spawn_init};

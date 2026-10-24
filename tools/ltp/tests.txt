@@ -18,6 +18,10 @@
 #
 # waitid10 reads /proc/sys/kernel/core_pattern, and the kernel does not have /proc/sys yet.
 # ptrace02 needs user IDs. ptrace04 and ptrace07 do not apply to x86_64 with this LTP build.
+#
+# epoll_wait05 needs AF_INET sockets. epoll_wait10 polls /proc/mounts for a change of the mounts, and the
+# files of /proc cannot do poll yet. timerfd_settime02 needs sched_getaffinity, and timerfd04 needs
+# time name spaces.
 alarm02
 alarm03
 alarm05
@@ -35,6 +39,47 @@ clone04
 clone05
 clone06
 clone07
+epoll_create01
+epoll_create02
+epoll_create03
+epoll_create1_01
+epoll_create1_02
+epoll_ctl01
+epoll_ctl02
+epoll_ctl03
+epoll_ctl04
+epoll_ctl05
+epoll_ctl06
+epoll_ctl07
+epoll_pwait01
+epoll_pwait02
+epoll_pwait03
+epoll_pwait04
+epoll_pwait05
+epoll_pwait06
+epoll_wait01
+epoll_wait02
+epoll_wait03
+epoll_wait04
+epoll_wait06
+epoll_wait07
+epoll_wait08
+epoll_wait09
+epoll_wait11
+epoll_wait12
+epoll_wait13
+epoll_wait14
+epoll_wait15
+epoll_wait16
+eventfd01
+eventfd02
+eventfd03
+eventfd04
+eventfd05
+eventfd06
+eventfd2_01
+eventfd2_02
+eventfd2_03
 exit01
 exit02
 exit_group01
@@ -170,6 +215,10 @@ signal03
 signal04
 signal05
 signal06
+signalfd01
+signalfd02
+signalfd4_01
+signalfd4_02
 sigpending02
 sigprocmask01
 sigsuspend01
@@ -183,6 +232,11 @@ timer_delete02
 timer_gettime01
 timer_settime01
 timer_settime02
+timerfd01
+timerfd02
+timerfd_create01
+timerfd_gettime01
+timerfd_settime01
 wait01
 wait02
 wait401

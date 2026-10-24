@@ -602,6 +602,99 @@ type = "u64"
 offset = 4
 
 [[struct]]
+name = "signalfd_siginfo"
+size = 128
+align = 8
+[[struct.field]]
+name = "ssi_signo"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "ssi_errno"
+type = "i32"
+offset = 4
+[[struct.field]]
+name = "ssi_code"
+type = "i32"
+offset = 8
+[[struct.field]]
+name = "ssi_pid"
+type = "u32"
+offset = 12
+[[struct.field]]
+name = "ssi_uid"
+type = "u32"
+offset = 16
+[[struct.field]]
+name = "ssi_fd"
+type = "i32"
+offset = 20
+[[struct.field]]
+name = "ssi_tid"
+type = "u32"
+offset = 24
+[[struct.field]]
+name = "ssi_band"
+type = "u32"
+offset = 28
+[[struct.field]]
+name = "ssi_overrun"
+type = "u32"
+offset = 32
+[[struct.field]]
+name = "ssi_trapno"
+type = "u32"
+offset = 36
+[[struct.field]]
+name = "ssi_status"
+type = "i32"
+offset = 40
+[[struct.field]]
+name = "ssi_int"
+type = "i32"
+offset = 44
+[[struct.field]]
+name = "ssi_ptr"
+type = "u64"
+offset = 48
+[[struct.field]]
+name = "ssi_utime"
+type = "u64"
+offset = 56
+[[struct.field]]
+name = "ssi_stime"
+type = "u64"
+offset = 64
+[[struct.field]]
+name = "ssi_addr"
+type = "u64"
+offset = 72
+[[struct.field]]
+name = "ssi_addr_lsb"
+type = "u16"
+offset = 80
+[[struct.field]]
+name = "__pad2"
+type = "u16"
+offset = 82
+[[struct.field]]
+name = "ssi_syscall"
+type = "i32"
+offset = 84
+[[struct.field]]
+name = "ssi_call_addr"
+type = "u64"
+offset = 88
+[[struct.field]]
+name = "ssi_arch"
+type = "u32"
+offset = 96
+[[struct.field]]
+name = "__pad"
+type = "[u8; 28]"
+offset = 100
+
+[[struct]]
 name = "robust_list"
 size = 8
 align = 8

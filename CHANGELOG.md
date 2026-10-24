@@ -4,6 +4,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` and `epoll_pwait2`. An entry can be level triggered or edge triggered, and it accepts `EPOLLONESHOT` and `EPOLLEXCLUSIVE`. An epoll file can watch another epoll file, and `epoll_ctl` refuses a loop and a chain of more than 5 files.
+- `eventfd` and `eventfd2`, with `EFD_SEMAPHORE`.
+- `timerfd_create`, `timerfd_settime` and `timerfd_gettime`, with `TFD_TIMER_ABSTIME` and the `TFD_IOC_SET_TICKS` ioctl.
+- `signalfd` and `signalfd4`. A read gives each pending signal of the set as a `struct signalfd_siginfo`.
+- `fcntl` accepts `F_GETPIPE_SZ` and `F_SETPIPE_SZ`.
+- The ltp boot test runs 50 more tests for epoll, event files, timer files and signal files.
+
 ## [0.2.4] (2026-10-24)
 
 This release is the fourth part of milestone R2. It adds process file descriptors, `seccomp` with classic BPF and user notifications, `memfd_create`, and Unix sockets. The new `kselftest` boot test runs the `seccomp_bpf` test of Linux, and all the tests that apply pass.

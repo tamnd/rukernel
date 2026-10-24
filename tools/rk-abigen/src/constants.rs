@@ -185,6 +185,34 @@ const GROUPS: &[Group] = &[
         ty: "u32",
         doc: "The flags of `getrandom`.",
     },
+    Group {
+        module: "eventpoll",
+        header: "linux/eventpoll.h",
+        prefixes: &["EPOLL"],
+        ty: "u32",
+        doc: "The operations of `epoll_ctl` and the events and flags of an epoll entry.",
+    },
+    Group {
+        module: "eventfd",
+        header: "linux/eventfd.h",
+        prefixes: &["EFD_"],
+        ty: "u32",
+        doc: "The flags of `eventfd2`.",
+    },
+    Group {
+        module: "timerfd",
+        header: "linux/timerfd.h",
+        prefixes: &["TFD_"],
+        ty: "u32",
+        doc: "The flags of `timerfd_create` and `timerfd_settime`, and the `ioctl` of a timer file.",
+    },
+    Group {
+        module: "signalfd",
+        header: "linux/signalfd.h",
+        prefixes: &["SFD_"],
+        ty: "u32",
+        doc: "The flags of `signalfd4`.",
+    },
 ];
 
 /// The probe gives up after this many tries. Each try drops the macros that failed.

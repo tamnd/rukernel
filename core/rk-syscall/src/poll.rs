@@ -26,7 +26,7 @@ const SELECT_OUT: u32 = POLLOUT | POLLERR;
 const SELECT_EX: u32 = POLLPRI;
 
 /// The tick count when `ns` nanoseconds from now are over.
-fn deadline_after(ns: u64) -> u64 {
+pub(crate) fn deadline_after(ns: u64) -> u64 {
     ticks().saturating_add(ns.div_ceil(TICK_NS))
 }
 
@@ -41,7 +41,7 @@ fn left(deadline: u64) -> u64 {
 /// # Errors
 ///
 /// Gives the error of `scan`, or `ERESTARTNOHAND` for a signal.
-fn wait_events<R>(
+pub(crate) fn wait_events<R>(
     cx: &Cx<'_>,
     deadline: Option<u64>,
     mut scan: impl FnMut() -> Result<Option<R>, Errno>,
@@ -64,7 +64,7 @@ fn wait_events<R>(
 }
 
 /// Sets the signal mask of `ppoll` or `pselect6`, and gives the old mask.
-fn set_temp_mask(cx: &Cx<'_>, mask: u64, size: u64) -> Result<Option<SigSet>, Errno> {
+pub(crate) fn set_temp_mask(cx: &Cx<'_>, mask: u64, size: u64) -> Result<Option<SigSet>, Errno> {
     if mask == 0 {
         return Ok(None);
     }
@@ -79,7 +79,7 @@ fn set_temp_mask(cx: &Cx<'_>, mask: u64, size: u64) -> Result<Option<SigSet>, Er
 
 /// Puts back the mask of `set_temp_mask`. If a signal stopped the call, the mask comes back after
 /// the handler starts, so the signal of the temporary mask runs its handler.
-fn restore_mask(cx: &Cx<'_>, old: Option<SigSet>, r: &SysResult) {
+pub(crate) fn restore_mask(cx: &Cx<'_>, old: Option<SigSet>, r: &SysResult) {
     if let Some(old) = old {
         if *r == Err(Errno::ERESTARTNOHAND) {
             cx.thread.set_saved_mask(old);
@@ -90,7 +90,7 @@ fn restore_mask(cx: &Cx<'_>, old: Option<SigSet>, r: &SysResult) {
 }
 
 /// Reads a `timespec` timeout and gives its deadline.
-fn timespec_deadline(cx: &Cx<'_>, tsp: u64) -> Result<Option<u64>, Errno> {
+pub(crate) fn timespec_deadline(cx: &Cx<'_>, tsp: u64) -> Result<Option<u64>, Errno> {
     if tsp == 0 {
         return Ok(None);
     }
