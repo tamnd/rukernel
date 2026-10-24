@@ -2,7 +2,7 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{FindFn, dir, file, join, link, rw_file};
-use crate::text::{self, MapLine, MemInfo};
+use crate::text::{self, MapLine, MemInfo, SmapsArea};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -325,6 +325,8 @@ fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
         tid: t.map_or(p.pid(), Thread::tid),
         umask,
         shared_pending: p.shared_pending().0,
+        locked: p.vm().map_or(0, |vm| vm.locked_bytes() as u64),
+        rss: p.vm().map_or(0, |vm| vm.resident_pages(0, rk_frame::vm::USER_END) as u64 * 4096),
     };
     let mut s = s;
     s.pid = p.pid();
@@ -332,6 +334,15 @@ fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
 }
 
 fn maps_of(p: &Process) -> Result<Vec<u8>> {
+    areas_of(p, false)
+}
+
+fn smaps_of(p: &Process) -> Result<Vec<u8>> {
+    areas_of(p, true)
+}
+
+/// The text of `/proc/PID/maps`, or of `/proc/PID/smaps` with `smaps`.
+fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let Some(vm) = p.vm() else { return Ok(out) };
     for a in vm.areas() {
@@ -357,6 +368,15 @@ fn maps_of(p: &Process) -> Result<Vec<u8>> {
             VmaKind::Normal => {}
         }
         text::map_line(&mut out, &line);
+        if smaps {
+            let area = SmapsArea {
+                size: (a.end - a.start) as u64,
+                rss: vm.resident_pages(a.start, a.end) as u64 * 4096,
+                anon: matches!(a.backing, Backing::Anon),
+                locked: a.locked,
+            };
+            text::smaps_area(&mut out, &area, &line);
+        }
     }
     Ok(out)
 }
@@ -476,6 +496,8 @@ fn process_files(
     out.push((b"environ".to_vec(), file(&join(base, b"environ"), || Ok(Vec::new()))));
     let p_ = w.clone();
     out.push((b"maps".to_vec(), file(&join(base, b"maps"), move || maps_of(&*alive(&p_)?))));
+    let p_ = w.clone();
+    out.push((b"smaps".to_vec(), file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?))));
     let p_ = w.clone();
     out.push((b"mounts".to_vec(), file(&join(base, b"mounts"), move || mounts_of(&*alive(&p_)?))));
     let p_ = w.clone();

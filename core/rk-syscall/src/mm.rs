@@ -7,9 +7,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::mman::{
-    MADV_DONTNEED, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE, MAP_SHARED,
-    MAP_SHARED_VALIDATE, MAP_TYPE, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC,
-    MS_INVALIDATE, MS_SYNC,
+    MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED,
+    MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL,
+    MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE, MADV_RANDOM, MADV_REMOVE,
+    MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
+    MAP_LOCKED, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_TYPE, MCL_CURRENT,
+    MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE,
+    MS_ASYNC, MS_INVALIDATE, MS_SYNC,
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
@@ -193,6 +197,8 @@ pub(crate) fn mmap(
         noreplace: flags & MAP_FIXED_NOREPLACE != 0,
         low32: low32(flags),
         may_write,
+        locked: flags & MAP_LOCKED != 0,
+        populate: flags & MAP_POPULATE != 0,
         file,
         kind: VmaKind::Normal,
     };
@@ -207,8 +213,8 @@ pub(crate) fn msync(cx: &Cx<'_>, addr: u64, len: u64, flags: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     // MS_ASYNC writes back at once too. MS_INVALIDATE has no work, because the mappings of a
-    // file share one copy of each page.
-    cx.vm()?.msync(addr as usize, len as usize)?;
+    // file share one copy of each page. It only fails on a locked area.
+    cx.vm()?.msync(addr as usize, len as usize, flags & MS_INVALIDATE != 0)?;
     Ok(0)
 }
 
@@ -233,6 +239,52 @@ pub(crate) fn mremap(
     Ok(cx.vm()?.mremap(addr as usize, old_len as usize, new_len as usize, remap)? as u64)
 }
 
+pub(crate) fn mlock(cx: &Cx<'_>, addr: u64, len: u64) -> SysResult {
+    cx.vm()?.mlock(addr as usize, len as usize, true, false)?;
+    Ok(0)
+}
+
+pub(crate) fn mlock2(cx: &Cx<'_>, addr: u64, len: u64, flags: u64) -> SysResult {
+    if flags & !u64::from(MLOCK_ONFAULT) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    cx.vm()?.mlock(addr as usize, len as usize, true, flags != 0)?;
+    Ok(0)
+}
+
+pub(crate) fn munlock(cx: &Cx<'_>, addr: u64, len: u64) -> SysResult {
+    cx.vm()?.mlock(addr as usize, len as usize, false, false)?;
+    Ok(0)
+}
+
+pub(crate) fn mlockall(cx: &Cx<'_>, flags: u64) -> SysResult {
+    if flags & !u64::from(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0
+        || flags & u64::from(MCL_CURRENT | MCL_FUTURE) == 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let flags = flags as u32;
+    let vm = cx.vm()?;
+    vm.mlock_all(
+        true,
+        flags & MCL_CURRENT != 0,
+        flags & MCL_FUTURE != 0,
+        flags & MCL_ONFAULT != 0,
+    )?;
+    Ok(0)
+}
+
+pub(crate) fn munlockall(cx: &Cx<'_>) -> SysResult {
+    cx.vm()?.mlock_all(false, true, false, false)?;
+    Ok(0)
+}
+
+pub(crate) fn mincore(cx: &Cx<'_>, addr: u64, len: u64, vec: u64) -> SysResult {
+    let pages = cx.vm()?.mincore(addr as usize, len as usize)?;
+    cx.write_bytes(vec, &pages)?;
+    Ok(0)
+}
+
 pub(crate) fn munmap(cx: &Cx<'_>, addr: u64, len: u64) -> SysResult {
     cx.vm()?.munmap(addr as usize, len as usize)?;
     Ok(0)
@@ -249,13 +301,57 @@ pub(crate) fn brk(cx: &Cx<'_>, addr: u64) -> SysResult {
 }
 
 pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResult {
-    if addr as usize % PAGE_SIZE != 0 {
+    let advice = u32::try_from(advice).map_err(|_| Errno::EINVAL)?;
+    // There is no KSM and no memory failure handler, so `MADV_MERGEABLE`, `MADV_UNMERGEABLE`,
+    // `MADV_HWPOISON` and `MADV_SOFT_OFFLINE` are not known.
+    let known = matches!(
+        advice,
+        MADV_NORMAL
+            | MADV_RANDOM
+            | MADV_SEQUENTIAL
+            | MADV_WILLNEED
+            | MADV_DONTNEED
+            | MADV_FREE
+            | MADV_REMOVE
+            | MADV_DONTFORK
+            | MADV_DOFORK
+            | MADV_HUGEPAGE
+            | MADV_NOHUGEPAGE
+            | MADV_DONTDUMP
+            | MADV_DODUMP
+            | MADV_WIPEONFORK
+            | MADV_KEEPONFORK
+            | MADV_COLD
+            | MADV_PAGEOUT
+            | MADV_POPULATE_READ
+            | MADV_POPULATE_WRITE
+            | MADV_DONTNEED_LOCKED
+    );
+    if !known || addr as usize % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
     }
-    // `MADV_DONTNEED` gives zero pages again for anonymous memory. Each other advice is only a
-    // hint, so it has no effect.
-    if advice as u32 == MADV_DONTNEED && len != 0 {
-        cx.vm()?.fill_zero(addr as usize, len as usize)?;
+    if len == 0 {
+        return Ok(0);
+    }
+    let vm = cx.vm()?;
+    let areas = vm.areas_in(addr as usize, len as usize)?;
+    for vma in &areas {
+        let anon = matches!(vma.backing, rk_mm::Backing::Anon);
+        let bad = match advice {
+            MADV_DONTNEED | MADV_REMOVE => vma.locked,
+            MADV_FREE => vma.locked || vma.shared || !anon,
+            MADV_WIPEONFORK => vma.shared || !anon,
+            _ => false,
+        };
+        if bad || (advice == MADV_REMOVE && !vma.shared) {
+            return Err(Errno::EINVAL);
+        }
+    }
+    // `MADV_DONTNEED` and `MADV_FREE` give zero pages again for anonymous memory. Each other
+    // advice is only a hint, so it has no effect.
+    if matches!(advice, MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE) {
+        let len = (len as usize).next_multiple_of(PAGE_SIZE);
+        vm.fill_zero(addr as usize, len)?;
     }
     Ok(0)
 }

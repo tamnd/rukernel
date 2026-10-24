@@ -84,6 +84,12 @@ pub struct Vma<F> {
     /// The area can get write access. It is false for a shared mapping of a file that is not open
     /// for writing. Linux names it `VM_MAYWRITE`.
     pub may_write: bool,
+    /// `mlock`: the pages of the area stay in memory. Linux names it `VM_LOCKED`. R1 has no swap,
+    /// so the flag only changes the counts that procfs shows.
+    pub locked: bool,
+    /// `MAP_GROWSDOWN`: a fault on the page below the area makes the area larger. Linux names it
+    /// `VM_GROWSDOWN`.
+    pub grows_down: bool,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -93,7 +99,17 @@ pub struct Vma<F> {
 impl<F: Clone> Vma<F> {
     /// Makes an anonymous private area.
     pub fn anon(start: usize, end: usize, prot: Prot, kind: VmaKind) -> Self {
-        Self { start, end, prot, shared: false, may_write: true, backing: Backing::Anon, kind }
+        Self {
+            start,
+            end,
+            prot,
+            shared: false,
+            may_write: true,
+            locked: false,
+            grows_down: false,
+            backing: Backing::Anon,
+            kind,
+        }
     }
 
     /// Cuts the area at `addr`. This area keeps the part below `addr`, and the function gives the
@@ -199,6 +215,33 @@ impl<F: Clone> VmaSet<F> {
         }
     }
 
+    /// Makes the area above `addr` start at the page of `addr`, if the area grows down. The area
+    /// keeps `gap` free bytes to the area below it, and its size stays at or below `max`. Gives
+    /// `true` if the area grew. `addr` is not in an area.
+    pub fn grow_down(&mut self, addr: usize, gap: usize, max: usize) -> bool {
+        let start = addr & !(PAGE_SIZE - 1);
+        let Some((&key, vma)) = self.areas.range(addr..).next() else { return false };
+        if !vma.grows_down || vma.end - start > max {
+            return false;
+        }
+        if let Some((_, below)) = self.areas.range(..addr).next_back()
+            && below.end.saturating_add(gap) > start
+        {
+            return false;
+        }
+        let delta = (vma.start - start) as u64;
+        if matches!(vma.backing, Backing::File { offset, .. } if offset < delta) {
+            return false;
+        }
+        let Some(mut vma) = self.areas.remove(&key) else { return false };
+        if let Backing::File { offset, .. } = &mut vma.backing {
+            *offset -= delta;
+        }
+        vma.start = start;
+        self.areas.insert(start, vma);
+        true
+    }
+
     /// Finds the highest free range of `len` bytes that ends at or below `top` and starts at or
     /// above `bottom`. This is the top down search of Linux.
     pub fn find_gap(&self, len: usize, bottom: usize, top: usize) -> Option<usize> {
@@ -277,6 +320,17 @@ mod tests {
     }
 
     #[test]
+    fn an_area_grows_down_up_to_the_gap() {
+        let mut s = set(&[(10, 20), (300, 310)]);
+        s.update_range(300 * P, 310 * P, |v| v.grows_down = true);
+        assert!(s.grow_down(295 * P + 8, 256 * P, 64 * P));
+        assert_eq!(ranges(&s), [(10, 20), (295, 310)]);
+        assert!(!s.grow_down(275 * P, 256 * P, 64 * P), "the gap to the area below");
+        assert!(!s.grow_down(15 * P + 20 * P, 0, 64 * P), "the size limit");
+        assert!(!s.grow_down(5 * P, 0, 64 * P), "the area does not grow down");
+    }
+
+    #[test]
     fn split_moves_the_file_offset() {
         let mut s = VmaSet::new();
         s.insert(Vma {
@@ -285,6 +339,8 @@ mod tests {
             prot: Prot::RW,
             shared: true,
             may_write: true,
+            locked: false,
+            grows_down: false,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });
