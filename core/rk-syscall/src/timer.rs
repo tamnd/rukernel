@@ -15,7 +15,7 @@ use rk_abi::native::time::{
 };
 use rk_abi::native::types::{KernelItimerspec, KernelOldItimerval, KernelOldTimeval};
 use rk_proc::signal::{NSIG, SI_KERNEL, SI_TIMER, SigInfo};
-use rk_proc::timer::{Target, Timer, now_ns};
+use rk_proc::timer::{Clock, Target, Timer};
 use rk_proc::{Pid, Process};
 use zerocopy::FromZeros;
 
@@ -45,15 +45,15 @@ fn timeval_ns(tv: &KernelOldTimeval) -> Result<u64, Errno> {
         .saturating_add(tv.tv_usec as u64 * NSEC_PER_USEC))
 }
 
-fn timeval(ns: u64) -> KernelOldTimeval {
+pub(crate) fn timeval(ns: u64) -> KernelOldTimeval {
     KernelOldTimeval {
         tv_sec: (ns / NSEC_PER_SEC) as i64,
         tv_usec: (ns % NSEC_PER_SEC).div_ceil(NSEC_PER_USEC) as i64,
     }
 }
 
-/// The interval timer `which` of `process`. The kernel does not count the CPU time of a process
-/// yet, so `ITIMER_VIRTUAL` and `ITIMER_PROF` count the time since they started.
+/// The interval timer `which` of `process`. `ITIMER_VIRTUAL` and `ITIMER_PROF` count the CPU
+/// time of the process. The system time is 0, so the two count the same time.
 fn itimer(process: &Arc<Process>, which: u64) -> Result<Arc<Timer>, Errno> {
     let which = match which as u32 {
         w @ (ITIMER_REAL | ITIMER_VIRTUAL | ITIMER_PROF) => w as usize,
@@ -61,7 +61,12 @@ fn itimer(process: &Arc<Process>, which: u64) -> Result<Arc<Timer>, Errno> {
     };
     let make = || {
         let info = SigInfo::new(ITIMER_SIGNALS[which], SI_KERNEL, 0);
-        Timer::new(Target::Process(Arc::downgrade(process)), info)
+        let clock = if which == ITIMER_REAL as usize {
+            Clock::Boot
+        } else {
+            Clock::ProcessCpu(Arc::downgrade(process))
+        };
+        Timer::new(clock, Target::Process(Arc::downgrade(process)), info)
     };
     Ok(process.timers().itimer(which, make))
 }
@@ -82,7 +87,7 @@ pub(crate) fn setitimer(cx: &Cx<'_>, which: u64, new: u64, old: u64) -> SysResul
     let new = if new == 0 { KernelOldItimerval::new_zeroed() } else { cx.read_val(new)? };
     let value = timeval_ns(&new.it_value)?;
     let interval = timeval_ns(&new.it_interval)?;
-    let expires = if value == 0 { 0 } else { now_ns().saturating_add(value) };
+    let expires = if value == 0 { 0 } else { timer.now().saturating_add(value) };
     let prev = timer.arm(expires, interval);
     cx.write_opt(old, &itimerval(prev))?;
     Ok(0)
@@ -91,7 +96,7 @@ pub(crate) fn setitimer(cx: &Cx<'_>, which: u64, new: u64, old: u64) -> SysResul
 pub(crate) fn alarm(cx: &Cx<'_>, seconds: u64) -> SysResult {
     let timer = itimer(cx.process(), u64::from(ITIMER_REAL))?;
     let seconds = seconds & u64::from(u32::MAX);
-    let expires = if seconds == 0 { 0 } else { now_ns().saturating_add(seconds * NSEC_PER_SEC) };
+    let expires = if seconds == 0 { 0 } else { timer.now().saturating_add(seconds * NSEC_PER_SEC) };
     let (left, _) = timer.arm(expires, 0);
     // The rest rounds to the nearest second, and a rest of less than one second gives 1, as
     // `alarm_setitimer` of Linux does.
@@ -104,18 +109,15 @@ pub(crate) fn alarm(cx: &Cx<'_>, seconds: u64) -> SysResult {
 }
 
 pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysResult {
-    match clock as u32 {
-        CLOCK_REALTIME
-        | CLOCK_MONOTONIC
-        | CLOCK_BOOTTIME
-        | CLOCK_TAI
-        | CLOCK_PROCESS_CPUTIME_ID
-        | CLOCK_THREAD_CPUTIME_ID => {}
+    let process = cx.process();
+    let clock = match clock as u32 {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => Clock::Boot,
+        CLOCK_PROCESS_CPUTIME_ID => Clock::ProcessCpu(Arc::downgrade(process)),
+        CLOCK_THREAD_CPUTIME_ID => Clock::ThreadCpu(Arc::downgrade(cx.thread)),
         // The alarm clocks need a real time clock that can wake the machine.
         CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM => return Err(Errno::EOPNOTSUPP),
         _ => return Err(Errno::EINVAL),
-    }
-    let process = cx.process();
+    };
     let (notify, signo, value, tid) = if sevp == 0 {
         (SIGEV_SIGNAL, SIGALRM, None, 0)
     } else {
@@ -146,7 +148,7 @@ pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysR
         .add(|id| {
             let mut info = SigInfo::new(signo, SI_TIMER, id as u32);
             info.value = value.unwrap_or(id as u64);
-            Timer::new(target, info)
+            Timer::new(clock, target, info)
         })
         .ok_or(Errno::EAGAIN)?;
     if let Err(e) = cx.write_val(idp, &id) {
@@ -173,7 +175,7 @@ pub(crate) fn timer_settime(cx: &Cx<'_>, id: u64, flags: u64, new: u64, old: u64
     let new: KernelItimerspec = cx.read_val(new)?;
     let value = timespec_ns(&new.it_value)?;
     let interval = timespec_ns(&new.it_interval)?;
-    let now = now_ns();
+    let now = timer.now();
     let expires = if value == 0 {
         0
     } else if flags as u32 & TIMER_ABSTIME != 0 {

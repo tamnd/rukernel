@@ -312,6 +312,9 @@ fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
         pgid: p.pgid(),
         sid: p.sid(),
         threads: threads.len(),
+        // Linux gives the time of the thread in the stat of a thread.
+        utime: t.map_or_else(|| p.user_ticks(), Thread::user_ticks) * USER_HZ / rk_frame::time::HZ,
+        cutime: p.child_ticks() * USER_HZ / rk_frame::time::HZ,
         start: p.start_tick() * USER_HZ / rk_frame::time::HZ,
         vsize,
         pending: thread.map_or(0, |t| t.pending().0),

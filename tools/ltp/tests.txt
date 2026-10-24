@@ -16,8 +16,7 @@
 # because CLOCK_REALTIME starts at 0 at boot. tgkill02 needs RLIMIT_SIGPENDING. kill05 needs System
 # V shared memory, and kill13 needs a kernel with UBSAN.
 #
-# clock_gettime01 waits until /proc/self/stat shows CPU time, and the kernel does not count CPU time
-# yet. waitid10 reads /proc/sys/kernel/core_pattern, and the kernel does not have /proc/sys yet.
+# waitid10 reads /proc/sys/kernel/core_pattern, and the kernel does not have /proc/sys yet.
 alarm02
 alarm03
 alarm05
@@ -25,6 +24,7 @@ alarm06
 alarm07
 brk01
 brk02
+clock_gettime01
 clock_gettime02
 clock_gettime04
 clone01

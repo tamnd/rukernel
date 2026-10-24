@@ -13,7 +13,7 @@ use crate::wait::{WaitOptions, WaitStatus, WaitTarget};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDSTOP, SA_NOCLDWAIT, SIGCHLD, SIGCONT, SIGKILL};
 use rk_frame::sync::{SpinLock, SpinLockGuard};
@@ -133,6 +133,11 @@ pub struct Process {
     oom_score_adj: AtomicI32,
     limits: SpinLock<[Limit; RLIM_NLIMITS]>,
     timers: SpinLock<Timers>,
+    /// The user CPU time in timer ticks of the threads that ended.
+    dead_ticks: AtomicU64,
+    /// The user CPU time in timer ticks of the children that a wait reaped, with their own
+    /// reaped children.
+    child_ticks: AtomicU64,
 }
 
 impl core::fmt::Debug for Process {
@@ -158,6 +163,8 @@ pub struct Thread {
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
     /// The call that `restart_syscall` continues.
     restart: SpinLock<Option<Restart>>,
+    /// The timer ticks that came while the thread ran user code.
+    user_ticks: AtomicU64,
 }
 
 /// The wait of the parent of a `vfork` child. The parent waits until the child calls `execve` or
@@ -402,6 +409,20 @@ impl Process {
         self.start_tick
     }
 
+    /// The user CPU time of the process in timer ticks: the time of its threads, and of the
+    /// threads that ended.
+    pub fn user_ticks(&self) -> u64 {
+        let s = self.state.lock();
+        let live: u64 = s.threads.iter().map(|t| t.user_ticks()).sum();
+        live + self.dead_ticks.load(Ordering::Relaxed)
+    }
+
+    /// The user CPU time in timer ticks of the children that a wait reaped, and of their reaped
+    /// children.
+    pub fn child_ticks(&self) -> u64 {
+        self.child_ticks.load(Ordering::Relaxed)
+    }
+
     /// The value of `/proc/PID/oom_score_adj`.
     pub fn oom_score_adj(&self) -> i32 {
         self.oom_score_adj.load(Ordering::Relaxed)
@@ -509,6 +530,8 @@ impl Process {
                 rk_vfs::fdtable::NR_OPEN_DEFAULT as u64,
             )),
             timers: SpinLock::new(Timers::default()),
+            dead_ticks: AtomicU64::new(0),
+            child_ticks: AtomicU64::new(0),
         })
     }
 }
@@ -534,6 +557,18 @@ impl Thread {
     /// The process.
     pub fn process(&self) -> &Arc<Process> {
         &self.process
+    }
+
+    /// The user CPU time of the thread in timer ticks.
+    pub fn user_ticks(&self) -> u64 {
+        self.user_ticks.load(Ordering::Relaxed)
+    }
+
+    /// Adds timer ticks to the user CPU time of the thread. The kernel runs with interrupts
+    /// off, so the timer ticks only while a thread runs user code or the CPU is idle. The ticks
+    /// that come while the thread runs user code are its user time, and the system time is 0.
+    pub fn add_user_ticks(&self, ticks: u64) {
+        self.user_ticks.fetch_add(ticks, Ordering::Relaxed);
     }
 
     /// Tells the thread which task runs it. The code that spawns the task calls this one time.
@@ -731,6 +766,7 @@ impl Thread {
             signals: SpinLock::new(ThreadSignals { blocked, ..ThreadSignals::default() }),
             vfork_done: SpinLock::new(None),
             restart: SpinLock::new(None),
+            user_ticks: AtomicU64::new(0),
         })
     }
 }
@@ -1097,6 +1133,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let last = {
         let mut s = process.state.lock();
         s.threads.retain(|t| t.tid != thread.tid);
+        process.dead_ticks.fetch_add(thread.user_ticks(), Ordering::Relaxed);
         s.threads.is_empty()
     };
     if !last {
@@ -1148,8 +1185,8 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
 }
 
 /// Waits for a child of `process` that matches `target` to end, stop or continue, as `options`
-/// tells, for `wait4` and `waitid`. Gives the ID and the status of the child, or `None` with
-/// `WNOHANG` if no child changed yet. Without `WNOWAIT`, the wait reaps the child that ended, or
+/// tells, for `wait4` and `waitid`. Gives the ID, the status and the user CPU time in timer ticks
+/// of the child, or `None` with `WNOHANG` if no child changed yet. Without `WNOWAIT`, the wait reaps the child that ended, or
 /// takes the report of the stop or the continue. `interrupted` tells if a signal must stop the
 /// wait.
 ///
@@ -1161,7 +1198,7 @@ pub fn wait_child(
     target: WaitTarget,
     options: WaitOptions,
     mut interrupted: impl FnMut() -> bool,
-) -> Result<Option<(Pid, WaitStatus)>, Errno> {
+) -> Result<Option<(Pid, WaitStatus, u64)>, Errno> {
     process.child_wait.wait_until(|| {
         let mut s = process.state.lock();
         let matches = |c: &Arc<Process>| match target {
@@ -1179,7 +1216,7 @@ pub fn wait_child(
             let mut cs = c.state.lock();
             if let Some(status) = cs.zombie {
                 if options.exited {
-                    zombie = Some((i, c.pid, status));
+                    zombie = Some((i, c.clone(), status));
                     break;
                 }
                 continue;
@@ -1191,16 +1228,21 @@ pub fn wait_child(
                 if !options.nowait {
                     cs.report = None;
                 }
-                return Some(Ok(Some((c.pid, status))));
+                drop(cs);
+                return Some(Ok(Some((c.pid, status, c.user_ticks()))));
             }
         }
-        if let Some((i, pid, status)) = zombie {
+        if let Some((i, child, status)) = zombie {
+            // The time of the child includes its reaped children, as in `getrusage` of Linux
+            // with `RUSAGE_BOTH`.
+            let ticks = child.user_ticks() + child.child_ticks();
             if !options.nowait {
                 s.children.remove(i);
                 drop(s);
-                TABLE.lock().processes.remove(&pid);
+                process.child_ticks.fetch_add(ticks, Ordering::Relaxed);
+                TABLE.lock().processes.remove(&child.pid);
             }
-            return Some(Ok(Some((pid, status))));
+            return Some(Ok(Some((child.pid, status, ticks))));
         }
         if !found {
             return Some(Err(Errno::ECHILD));

@@ -11,6 +11,7 @@ use rk_abi::native::syscalls as nr;
 use rk_frame::addr::VirtAddr;
 use rk_frame::println;
 use rk_frame::task::{TaskOptions, should_yield, yield_now};
+use rk_frame::time::ticks;
 use rk_frame::user::{ReturnReason, UserContext, UserException};
 use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
@@ -160,7 +161,14 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
         // The number of a system call that can start again after a signal. `rt_sigreturn` puts
         // back the registers of the frame, so its return value is not a restart code.
         let mut syscall = None;
-        match regs.execute() {
+        let start = ticks();
+        let reason = regs.execute();
+        let user = ticks() - start;
+        if user != 0 {
+            thread.add_user_ticks(user);
+            rk_proc::timer::check_cpu_timers(&thread);
+        }
+        match reason {
             ReturnReason::Syscall => {
                 COUNT.fetch_add(1, Ordering::Relaxed);
                 let number = regs.syscall_number();
