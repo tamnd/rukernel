@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.1.4] (2026-10-24)
+
+This release continues milestone R1. The kernel now has procfs, `vfork`, resource limits, `msync`, `mremap` and a larger LTP boot test.
+
 ### Added
 
 - The `busybox` boot test. The initramfs has a static BusyBox from busybox.net, and the boot test checks its SHA-256. The BusyBox shell runs as init. It runs the pipeline `echo one two | tr a-z A-Z | cat`, then a job in the foreground, and `^C` stops the job. `RK_BUSYBOX` gives the path of a different BusyBox.
@@ -186,6 +190,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.1.4]: https://github.com/tamnd/rukernel/releases/tag/v0.1.4
 [0.1.3]: https://github.com/tamnd/rukernel/releases/tag/v0.1.3
 [0.1.2]: https://github.com/tamnd/rukernel/releases/tag/v0.1.2
 [0.1.1]: https://github.com/tamnd/rukernel/releases/tag/v0.1.1
