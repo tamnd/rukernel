@@ -70,6 +70,12 @@ pub trait FileOps: Send + Sync {
     fn metadata(&self) -> Option<Metadata> {
         None
     }
+
+    /// The operations as `Any`, for a caller that must know the type of the file, for example
+    /// the system calls of a process file descriptor.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
 }
 
 /// The access mode and the status flags of an open file.

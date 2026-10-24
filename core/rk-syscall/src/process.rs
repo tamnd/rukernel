@@ -2,6 +2,7 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::run::{random16, start_thread};
+use alloc::sync::Arc;
 use rk_abi::Errno;
 use rk_abi::native::sched::{
     CLONE_ARGS_SIZE_VER0, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_CLEAR_SIGHAND,
@@ -63,8 +64,14 @@ pub(crate) fn clone(
         parent_tid: ptid,
         child_tid: ctid,
         tls,
+        // `clone` writes the process file descriptor at the place of the parent TID.
+        pidfd: ptid,
         ..CloneArgs::new_zeroed()
     };
+    // The two values go to the same place, so `clone` cannot have both.
+    if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 {
+        return Err(Errno::EINVAL);
+    }
     // `clone` takes the low 32 bits of the flags. The bits above are only for `clone3`.
     do_clone(cx, &CloneArgs { flags: args.flags & 0xffff_ffff, ..args }, stack)
 }
@@ -73,8 +80,8 @@ pub(crate) fn clone(
 const CLONE_ARGS_MAX: u64 = 4096;
 
 /// `clone3`, as `copy_clone_args_from_user` and `clone3_args_valid` of Linux check it. The stack
-/// of `clone3` is the lowest address and a size, and the new thread starts at the top. The PID
-/// file descriptor, the cgroup and `set_tid` are not in R2, so they give `EINVAL`.
+/// of `clone3` is the lowest address and a size, and the new thread starts at the top. The cgroup
+/// and `set_tid` are not in R2, so they give `EINVAL`.
 pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     if size > CLONE_ARGS_MAX {
         return Err(Errno::E2BIG);
@@ -91,7 +98,7 @@ pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     let args = <CloneArgs as zerocopy::FromBytes>::read_from_bytes(&bytes[..known])
         .map_err(|_| Errno::EINVAL)?;
     let flags = args.flags;
-    let unsupported = CLONE_PIDFD | CLONE_INTO_CGROUP;
+    let unsupported = CLONE_INTO_CGROUP;
     if flags & (CLONE_DETACHED | CSIGNAL | unsupported) != 0
         || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND) != 0
         || args.set_tid != 0
@@ -122,6 +129,9 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0 {
         return Err(Errno::EINVAL);
     }
+    if flags & CLONE_PIDFD != 0 && flags & (CLONE_THREAD | CLONE_DETACHED) != 0 {
+        return Err(Errno::EINVAL);
+    }
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread(cx.thread)?
     } else {
@@ -149,6 +159,10 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     }
     if flags & CLONE_PARENT_SETTID != 0 {
         cx.write_val(args.parent_tid, &tid)?;
+    }
+    if flags & CLONE_PIDFD != 0 {
+        let fd = crate::pidfd::open(cx, thread.process().clone(), 0)?;
+        cx.write_val(args.pidfd, &fd)?;
     }
     if flags & CLONE_CHILD_SETTID != 0
         && let Some(vm) = thread.process().vm()
@@ -291,8 +305,7 @@ pub(crate) fn waitid(
         P_PID if id > 0 => WaitTarget::Pid(id as Pid),
         P_PGID if id == 0 => WaitTarget::Pgid(cx.process().pgid()),
         P_PGID if id > 0 => WaitTarget::Pgid(id as Pid),
-        // rukernel has no process file descriptors yet, so each descriptor is bad.
-        P_PIDFD => return Err(Errno::EBADF),
+        P_PIDFD => WaitTarget::Pid(crate::pidfd::process_of(cx, id as u32 as u64)?.pid()),
         _ => return Err(Errno::EINVAL),
     };
     // With `WNOHANG` and no child that changed, the fields are 0, as in Linux.
@@ -411,6 +424,60 @@ pub(crate) fn arch_prctl(cx: &mut Cx<'_>, code: u64, addr: u64) -> SysResult {
             cx.write_val(addr, &base)?;
             Ok(0)
         }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// The `type` values of `kcmp`, from include/uapi/linux/kcmp.h.
+const KCMP_FILE: u64 = 0;
+const KCMP_VM: u64 = 1;
+const KCMP_FILES: u64 = 2;
+const KCMP_FS: u64 = 3;
+const KCMP_SIGHAND: u64 = 4;
+
+/// Gives the result of `kcmp` for two kernel objects: 0 if they are the same object, else 1 or
+/// 2 in an order of the objects.
+fn kcmp_order<T: ?Sized>(a: *const T, b: *const T) -> u64 {
+    let (a, b) = (a.cast::<u8>() as usize, b.cast::<u8>() as usize);
+    match a.cmp(&b) {
+        core::cmp::Ordering::Equal => 0,
+        core::cmp::Ordering::Less => 1,
+        core::cmp::Ordering::Greater => 2,
+    }
+}
+
+/// `kcmp`: tells if two processes share a kernel object. rukernel has no credentials, so each
+/// process can examine each other process.
+pub(crate) fn kcmp(pid1: u64, pid2: u64, kind: u64, idx1: u64, idx2: u64) -> SysResult {
+    let find = |pid: u64| {
+        rk_proc::find_thread(pid as Pid)
+            .map(|t| t.process().clone())
+            .filter(|p| !p.is_zombie())
+            .ok_or(Errno::ESRCH)
+    };
+    let (p1, p2) = (find(pid1)?, find(pid2)?);
+    match kind {
+        KCMP_FILE => {
+            let file = |p: &Process, fd: u64| -> Result<_, Errno> {
+                p.files().ok_or(Errno::EBADF)?.lock().file(fd as i32)
+            };
+            let (f1, f2) = (file(&p1, idx1)?, file(&p2, idx2)?);
+            Ok(kcmp_order(Arc::as_ptr(&f1), Arc::as_ptr(&f2)))
+        }
+        KCMP_VM => {
+            let (v1, v2) = (p1.vm().ok_or(Errno::ESRCH)?, p2.vm().ok_or(Errno::ESRCH)?);
+            Ok(kcmp_order(Arc::as_ptr(&v1), Arc::as_ptr(&v2)))
+        }
+        KCMP_FILES => {
+            let (f1, f2) = (p1.files().ok_or(Errno::ESRCH)?, p2.files().ok_or(Errno::ESRCH)?);
+            Ok(kcmp_order(Arc::as_ptr(&f1), Arc::as_ptr(&f2)))
+        }
+        KCMP_FS => {
+            let (f1, f2) = (p1.fs().ok_or(Errno::ESRCH)?, p2.fs().ok_or(Errno::ESRCH)?);
+            Ok(kcmp_order(Arc::as_ptr(&f1), Arc::as_ptr(&f2)))
+        }
+        // The signal actions belong to the process, so two processes do not share them.
+        KCMP_SIGHAND => Ok(kcmp_order(Arc::as_ptr(&p1), Arc::as_ptr(&p2))),
         _ => Err(Errno::EINVAL),
     }
 }

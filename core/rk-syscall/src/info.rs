@@ -288,3 +288,65 @@ pub(crate) fn getrandom(cx: &Cx<'_>, buf: u64, len: u64, flags: u64) -> SysResul
     }
     Ok(done as u64)
 }
+
+/// The versions of the header of `capget` and `capset`. Version 1 has one set of 32 bits, and
+/// versions 2 and 3 have two sets.
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+/// The highest capability of Linux, `CAP_CHECKPOINT_RESTORE`.
+const CAP_LAST_CAP: u32 = 40;
+
+/// Reads the header of `capget` and `capset`, and gives the number of 32-bit sets of the
+/// version and the process ID. An unknown version writes version 3 into the header, as
+/// `cap_validate_magic` of Linux does.
+fn cap_header(cx: &Cx<'_>, header: u64) -> Result<(usize, i32), Errno> {
+    let [version, pid]: [u32; 2] = cx.read_val(header)?;
+    let sets = match version {
+        LINUX_CAPABILITY_VERSION_1 => 1,
+        LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3 => 2,
+        _ => {
+            cx.write_val(header, &LINUX_CAPABILITY_VERSION_3)?;
+            return Err(Errno::EINVAL);
+        }
+    };
+    Ok((sets, pid as i32))
+}
+
+/// `capget`. rukernel has no credentials: each process runs as root with all the capabilities
+/// in its effective and permitted sets, and none in its inheritable set.
+pub(crate) fn capget(cx: &Cx<'_>, header: u64, data: u64) -> SysResult {
+    let (sets, pid) = match cap_header(cx, header) {
+        Err(Errno::EINVAL) if data == 0 => return Ok(0),
+        r => r?,
+    };
+    if data == 0 {
+        return Ok(0);
+    }
+    if pid < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if pid > 0 && rk_proc::find_thread(pid as rk_proc::Pid).is_none() {
+        return Err(Errno::ESRCH);
+    }
+    let all = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+    let mut out = [0u32; 6];
+    for (i, set) in out.chunks_mut(3).take(sets).enumerate() {
+        let bits = (all >> (32 * i)) as u32;
+        set.copy_from_slice(&[bits, bits, 0]);
+    }
+    let bytes: alloc::vec::Vec<u8> = out[..3 * sets].iter().flat_map(|w| w.to_ne_bytes()).collect();
+    cx.write_bytes(data, &bytes)?;
+    Ok(0)
+}
+
+/// `capset`. rukernel has no credentials, so the call only checks its arguments.
+pub(crate) fn capset(cx: &Cx<'_>, header: u64, data: u64) -> SysResult {
+    let (sets, pid) = cap_header(cx, header)?;
+    if pid != 0 && pid as u32 != cx.process().pid() {
+        return Err(Errno::EPERM);
+    }
+    cx.read_bytes(data, 12 * sets)?;
+    Ok(0)
+}
