@@ -65,6 +65,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::DUP2 => fs::dup2(cx, a[0], a[1]),
         nr::GETPID => Ok(u64::from(cx.process().pid())),
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::CLONE3 => process::clone3(cx, a[0], a[1]),
         nr::FORK => process::fork(cx),
         nr::VFORK => process::vfork(cx),
         nr::EXECVE => process::execve(cx, a[0], a[1], a[2]),
