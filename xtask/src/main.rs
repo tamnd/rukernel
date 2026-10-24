@@ -404,6 +404,8 @@ const BOOT_TESTS: &[&str] = &[
     "tty",
     "busybox",
     "ltp",
+    "alpine",
+    "debian",
 ];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
@@ -509,6 +511,33 @@ fn sha256(path: &Path) -> Result<String> {
     Err(String::from("no sha256sum or shasum for the check of BusyBox"))
 }
 
+/// Downloads `url` with `curl` to `path` if the file is not there, and checks its SHA-256. Gives
+/// `false` if the download failed and the run is not in CI. `name` is the name in the messages,
+/// and `var` is the variable that gives a different file.
+fn download(url: &str, sha: &str, path: &Path, name: &str, var: &str) -> Result<bool> {
+    if !path.exists() {
+        let status = Command::new("curl")
+            .args(["--silent", "--show-error", "--fail", "--location", "--output"])
+            .arg(path)
+            .arg(url)
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            let _ = fs::remove_file(path);
+            if std::env::var_os("CI").is_some() {
+                return Err(format!("cannot download {url}"));
+            }
+            println!("{name}: skipped, the download failed, set {var}");
+            return Ok(false);
+        }
+    }
+    let sum = sha256(path)?;
+    if sum != sha {
+        let _ = fs::remove_file(path);
+        return Err(format!("{}: the SHA-256 is {sum}, not {sha}", path.display()));
+    }
+    Ok(true)
+}
+
 /// Gives the bytes of the static BusyBox. The first run downloads it with `curl` into the
 /// directory `dir`. Gives `None` if there is no BusyBox and the run is not in CI.
 fn busybox(dir: &Path) -> Result<Option<Vec<u8>>> {
@@ -517,27 +546,136 @@ fn busybox(dir: &Path) -> Result<Option<Vec<u8>>> {
         return read(Path::new(&path)).map(Some);
     }
     let path = dir.join("busybox");
-    if !path.exists() {
-        let status = Command::new("curl")
-            .args(["--silent", "--show-error", "--fail", "--location", "--output"])
-            .arg(&path)
-            .arg(BUSYBOX_URL)
-            .status();
-        if !status.is_ok_and(|s| s.success()) {
-            let _ = fs::remove_file(&path);
-            if std::env::var_os("CI").is_some() {
-                return Err(format!("cannot download {BUSYBOX_URL}"));
-            }
-            println!("busybox: skipped, the download failed, set RK_BUSYBOX");
-            return Ok(None);
-        }
-    }
-    let sum = sha256(&path)?;
-    if sum != BUSYBOX_SHA256 {
-        let _ = fs::remove_file(&path);
-        return Err(format!("{}: the SHA-256 is {sum}, not {BUSYBOX_SHA256}", path.display()));
+    if !download(BUSYBOX_URL, BUSYBOX_SHA256, &path, "busybox", "RK_BUSYBOX")? {
+        return Ok(None);
     }
     read(&path).map(Some)
+}
+
+/// A root file system that a boot test downloads and runs. Its programs use a dynamic loader. The
+/// test checks the SHA-256 of the file, and the variable `var` gives the path of a different file.
+struct Rootfs {
+    /// The name of the boot test.
+    name: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+    var: &'static str,
+    /// The script that runs as /init. `set -e` stops it at the first command that fails.
+    init: &'static str,
+}
+
+/// The root file systems of the boot tests. The Alpine programs use musl, and the Debian programs
+/// use glibc.
+const ROOTFS: &[Rootfs] = &[
+    Rootfs {
+        name: "alpine",
+        url: "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.3-x86_64.tar.gz",
+        sha256: "f8e1cafba9b1b283b5d30d06f9885c8d2bc161ffe9083ade8e2e157813a53407",
+        var: "RK_ALPINE",
+        init: "#!/bin/sh
+set -e
+mount -t proc proc /proc
+echo \"alpine: release $(cat /etc/alpine-release)\"
+ls -l /lib/ld-musl-x86_64.so.1
+/lib/ld-musl-x86_64.so.1 --list /bin/busybox
+apk --version
+apk info --no-network | grep -q musl
+echo one two | tr a-z A-Z | grep -q 'ONE TWO'
+echo 'alpine: done'
+",
+    },
+    Rootfs {
+        name: "debian",
+        url: "https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/cee78df586385250331cacba8fd1140133c054e5/trixie/slim/oci/blobs/rootfs.tar.gz",
+        sha256: "f2be67225471500c788ce88c597eb5ea8336e912ad1ca4815650e0281afe2034",
+        var: "RK_DEBIAN",
+        init: "#!/bin/sh
+set -e
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc
+echo \"debian: version $(cat /etc/debian_version)\"
+/lib64/ld-linux-x86-64.so.2 --list /usr/bin/bash
+bash -c 'echo \"debian: bash $BASH_VERSION\"'
+ls -l /usr/lib/x86_64-linux-gnu/libc.so.6
+echo one two | tr a-z A-Z | grep -q 'ONE TWO'
+printf 'b\\na\\n' | sort | head -n 1 | grep -qx a
+dpkg-query -W libc6
+apt-get --version | head -n 1
+perl -e 'print \"debian: perl $]\\n\"'
+find /etc -name debian_version | grep -q debian_version
+echo 'debian: done'
+",
+    },
+];
+
+/// Adds each file under `root` to `w`, with its mode, as a path relative to `root`. A directory
+/// comes before its contents.
+fn add_tree(w: &mut rk_vfs::cpio::Writer, root: &Path, dir: &Path) -> Result {
+    use std::os::unix::fs::PermissionsExt;
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
+        let name = rel.to_string_lossy();
+        let mode = meta.permissions().mode() & 0o7777;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            w.add(name.as_bytes(), 0o120_000 | mode, target.to_string_lossy().as_bytes());
+        } else if meta.is_dir() {
+            w.add(name.as_bytes(), 0o040_000 | mode, b"");
+            add_tree(w, root, &path)?;
+        } else if meta.is_file() {
+            let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            w.add(name.as_bytes(), 0o100_000 | mode, &bytes);
+        }
+    }
+    Ok(())
+}
+
+/// Writes the initramfs of the boot test of `rootfs` next to the kernel: the root file system and
+/// the script of `rootfs.init` as /init. Gives `false` if there is no file for the root file system.
+fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
+    let dir = kernel.parent().ok_or("the kernel path has no directory")?;
+    let tarball = match std::env::var_os(rootfs.var) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let path = dir.join(format!("{}-rootfs.tar.gz", rootfs.name));
+            if !download(rootfs.url, rootfs.sha256, &path, rootfs.name, rootfs.var)? {
+                return Ok(false);
+            }
+            path
+        }
+    };
+    let root = dir.join(format!("{}-root", rootfs.name));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&root)
+        .status()
+        .map_err(|e| format!("cannot run tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar cannot unpack {}", tarball.display()));
+    }
+    let mut w = rk_vfs::cpio::Writer::new();
+    w.add(b".", 0o040_755, b"");
+    add_tree(&mut w, &root, &root)?;
+    w.add(b"init", 0o100_755, rootfs.init.as_bytes());
+    let path = rootfs_initramfs(kernel, rootfs.name);
+    fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// The path of the initramfs of the root file system boot test `name`.
+fn rootfs_initramfs(kernel: &Path, name: &str) -> PathBuf {
+    kernel.with_file_name(format!("initramfs-{name}.cpio"))
 }
 
 /// The longest time that the `ltp` boot test can take. It runs each test of tools/ltp/tests.txt.
@@ -645,6 +783,11 @@ fn build_kernel() -> Result<PathBuf> {
     let ltp = kernel.with_file_name("initramfs-ltp.cpio");
     if !build_ltp_initramfs(&kernel, busybox.as_deref())? {
         let _ = fs::remove_file(&ltp);
+    }
+    for rootfs in ROOTFS {
+        if !build_rootfs_initramfs(&kernel, rootfs)? {
+            let _ = fs::remove_file(rootfs_initramfs(&kernel, rootfs.name));
+        }
     }
     Ok(kernel)
 }
@@ -878,6 +1021,7 @@ fn can_run(kernel: &Path, test: &str) -> bool {
         "init" | "tty" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
+        t if ROOTFS.iter().any(|r| r.name == t) => rootfs_initramfs(kernel, t).exists(),
         _ => true,
     }
 }
@@ -889,13 +1033,21 @@ fn test_cmdline(test: &str) -> String {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
+        t if ROOTFS.iter().any(|r| r.name == t) => {
+            String::from("console=ttyS0 rk.test=init rdinit=/init")
+        }
         _ => format!("console=ttyS0 rk.test={test}"),
     }
 }
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "busybox" | "ltp") { "init" } else { test };
+    let test = if matches!(test, "tty" | "busybox" | "ltp") || ROOTFS.iter().any(|r| r.name == test)
+    {
+        "init"
+    } else {
+        test
+    };
     format!("rk.test={test}: pass")
 }
 
@@ -928,6 +1080,9 @@ fn boot_test(names: &[String]) -> Result {
         let (cmd, timeout) = if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), LTP_TIMEOUT)
+        } else if ROOTFS.iter().any(|r| r.name == *test) {
+            let initrd = rootfs_initramfs(&kernel, test);
+            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
         } else {
             (qemu_command(&kernel, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
         };
