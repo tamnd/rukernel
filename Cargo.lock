@@ -22,18 +22,18 @@ dependencies = [
 
 [[package]]
 name = "rk-abi"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "rk-abigen"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "rk-drv-mem"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -43,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "rk-drv-tty"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -53,7 +53,7 @@ dependencies = [
 
 [[package]]
 name = "rk-drv-virtio"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -62,11 +62,11 @@ dependencies = [
 
 [[package]]
 name = "rk-frame"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "rk-fs-proc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-tmpfs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -86,11 +86,11 @@ dependencies = [
 
 [[package]]
 name = "rk-lib"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "rk-mm"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "rk-net"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "rk-net-unix"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "rk-proc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -128,14 +128,14 @@ dependencies = [
 
 [[package]]
 name = "rk-sched"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-frame",
 ]
 
 [[package]]
 name = "rk-syscall"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-drv-mem",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "rk-vfs"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "rukernel"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-abi",
  "rk-drv-mem",
@@ -195,7 +195,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rk-vfs",
 ]
