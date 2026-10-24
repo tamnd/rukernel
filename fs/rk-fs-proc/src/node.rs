@@ -42,7 +42,8 @@ enum Kind {
         read: ReadAtFn,
         write: WriteAtFn,
     },
-    Link(ReadFn),
+    /// A symbolic link. The error is for a walk that follows the link.
+    Link(ReadFn, Option<Errno>),
     Dir {
         parent: u64,
         list: ListFn,
@@ -117,7 +118,17 @@ pub(crate) fn link(
     perm: u32,
     target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
 ) -> InodeRef {
-    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target)) })
+    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), None) })
+}
+
+/// Makes a symbolic link that a walk cannot follow: the walk gives `error`.
+pub(crate) fn dead_link(
+    path: &[u8],
+    perm: u32,
+    target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
+    error: Errno,
+) -> InodeRef {
+    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), Some(error)) })
 }
 
 /// Makes a directory. `parent` is the path of the parent directory, for `..`. `find` finds one
@@ -147,7 +158,7 @@ impl Inode for Node {
     fn metadata(&self) -> Metadata {
         let (kind, nlink) = match self.kind {
             Kind::File { .. } | Kind::Data { .. } => (mode::S_IFREG, 1),
-            Kind::Link(_) => (mode::S_IFLNK, 1),
+            Kind::Link(..) => (mode::S_IFLNK, 1),
             Kind::Dir { .. } => (mode::S_IFDIR, 2),
         };
         let t = now();
@@ -238,8 +249,15 @@ impl Inode for Node {
 
     fn read_link(&self) -> Result<Vec<u8>> {
         match &self.kind {
-            Kind::Link(target) => target(),
+            Kind::Link(target, _) => target(),
             _ => Err(Errno::EINVAL),
+        }
+    }
+
+    fn follow_link(&self) -> Result<Vec<u8>> {
+        match &self.kind {
+            Kind::Link(_, Some(e)) => Err(*e),
+            _ => self.read_link(),
         }
     }
 
@@ -372,5 +390,14 @@ mod tests {
         assert_eq!(ino(b"/text"), ino(b"/text"));
         assert_ne!(ino(b"/text"), ino(b"/value"));
         assert_eq!(join(b"/1", b"stat"), b"/1/stat");
+    }
+
+    #[test]
+    fn a_dead_link_gives_its_error_to_a_walk() {
+        let node = dead_link(b"/fd/3", 0o700, || Ok(b"socket:[7]".to_vec()), Errno::ENXIO);
+        assert_eq!(node.read_link().unwrap(), b"socket:[7]");
+        assert_eq!(node.follow_link().err(), Some(Errno::ENXIO));
+        let node = link(b"/fd/4", 0o700, || Ok(b"/tmp".to_vec()));
+        assert_eq!(node.follow_link().unwrap(), b"/tmp");
     }
 }

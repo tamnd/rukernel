@@ -252,6 +252,12 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EINVAL)
     }
 
+    /// The target of a symbolic link for a walk that follows it. A link of `/proc/PID/fd` to a
+    /// file that cannot open again gives an error here, as the magic links of Linux.
+    fn follow_link(&self) -> Result<Vec<u8>> {
+        self.read_link()
+    }
+
     /// Gives the entry at the position `pos` of a directory and the position of the next entry,
     /// or `None` at the end. Position 0 is the first entry. The entries `.` and `..` are first.
     fn read_dir(&self, _pos: u64) -> Result<Option<(DirEntry, u64)>> {

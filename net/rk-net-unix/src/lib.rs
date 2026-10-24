@@ -20,7 +20,7 @@ use alloc::format;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -125,7 +125,9 @@ struct Packet {
     /// The address of the sender.
     from: Option<Vec<u8>>,
     rights: Vec<Arc<File>>,
-    cred: Cred,
+    /// The credentials of the sender. A message has them if the sender gave them, or if the
+    /// sender or the receiver had `SO_PASSCRED` at the send, as in Linux.
+    cred: Option<Cred>,
     sender: Weak<Unix>,
 }
 
@@ -182,6 +184,8 @@ pub struct Unix {
     wait: WaitQueue,
     /// The bytes that this socket sent and the receivers did not take.
     inflight: AtomicUsize,
+    /// The count of the wakes, for an edge triggered epoll entry.
+    events: AtomicU64,
     this: Weak<Unix>,
 }
 
@@ -225,6 +229,7 @@ impl Unix {
             }),
             wait: WaitQueue::new(),
             inflight: AtomicUsize::new(0),
+            events: AtomicU64::new(0),
             this: this.clone(),
         }))
     }
@@ -255,6 +260,7 @@ impl Unix {
     }
 
     fn wake(&self) {
+        self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
         poll_wake();
     }
@@ -463,6 +469,12 @@ impl Unix {
         }
     }
 
+    /// Tells if a message to `peer` gets the credentials of the sender: `SO_PASSCRED` is set on
+    /// this socket or on `peer`.
+    fn may_passcred(&self, peer: &Self) -> bool {
+        self.state.lock().passcred || peer.state.lock().passcred
+    }
+
     /// The send of a stream socket: the data goes in pieces into the queue of the peer.
     fn send_stream(&self, msg: Message, nonblock: bool) -> Result<usize> {
         let (peer, timeout, from) = {
@@ -483,7 +495,7 @@ impl Unix {
             let Some(peer) = s.peer.clone() else { return Err(Errno::ENOTCONN) };
             (peer, s.options.sndtimeo, s.addr.clone())
         };
-        let cred = msg.cred.unwrap_or_else(current_cred);
+        let cred = msg.cred.or_else(|| self.may_passcred(&peer).then(current_cred));
         let mut rights = Some(msg.rights);
         let data = msg.data;
         let mut sent = 0;
@@ -593,6 +605,7 @@ impl Unix {
                 return if nonblock { Err(Errno::EAGAIN) } else { Ok(None) };
             }
             let Some(msg) = msg.take() else { return Ok(Some(())) };
+            let cred = msg.cred.or_else(|| (passcred || o.passcred).then(current_cred));
             let from = if Arc::ptr_eq(&other, &me) {
                 o.addr.clone()
             } else {
@@ -603,7 +616,7 @@ impl Unix {
                 read: 0,
                 from,
                 rights: msg.rights,
-                cred: msg.cred.unwrap_or_else(current_cred),
+                cred,
                 sender: self.this.clone(),
             });
             Ok(Some(()))
@@ -646,7 +659,7 @@ impl Unix {
                     len: p.data.len() - skip,
                     addr: p.from.clone(),
                     rights: Vec::new(),
-                    cred: passcred.then_some(p.cred),
+                    cred: passcred.then(|| p.cred.unwrap_or(NO_CRED)),
                     flags: 0,
                 };
                 if r.len > size {
@@ -697,7 +710,9 @@ impl Unix {
                 .max(1) as usize;
             (s.options.rcvtimeo, lowat)
         };
-        let target = if flags & MSG_WAITALL != 0 { len } else { lowat.min(len) };
+        // As in `sock_rcvlowat` of Linux, the target is at least one byte. A receive of 0 bytes
+        // waits until data is in the queue.
+        let target = if flags & MSG_WAITALL != 0 { len } else { lowat.min(len) }.max(1);
         let mut out = Received::default();
         let mut first = true;
         let mut charged: Vec<(Weak<Unix>, usize)> = Vec::new();
@@ -707,6 +722,17 @@ impl Unix {
             let mut skip = if peek && s.peek_off >= 0 { s.peek_off as usize } else { 0 };
             let mut stop = false;
             let mut i = 0;
+            let mut cred = None;
+            // A receive of 0 bytes takes the files of the first message, and leaves its data.
+            if len == 0
+                && !peek
+                && let Some(p) = s.queue.front_mut()
+            {
+                out.addr = p.from.clone();
+                out.cred = passcred.then(|| p.cred.unwrap_or(NO_CRED));
+                out.rights = core::mem::take(&mut p.rights);
+                return Ok(Some(()));
+            }
             while out.data.len() < len && i < s.queue.len() {
                 let p = &mut s.queue[i];
                 let rest = p.rest();
@@ -715,14 +741,16 @@ impl Unix {
                     i += 1;
                     continue;
                 }
-                if !first && passcred && out.cred != Some(p.cred) {
+                // Messages of different writers are not joined, as in Linux.
+                if !first && passcred && cred != p.cred {
                     stop = true;
                     break;
                 }
                 if first {
                     first = false;
                     out.addr = p.from.clone();
-                    out.cred = passcred.then_some(p.cred);
+                    cred = p.cred;
+                    out.cred = passcred.then(|| p.cred.unwrap_or(NO_CRED));
                 }
                 let n = (rest - skip).min(len - out.data.len());
                 let start = p.read + skip;
@@ -758,7 +786,11 @@ impl Unix {
             if peek && s.peek_off >= 0 {
                 s.peek_off = s.peek_off.saturating_add(copied as i32);
             }
-            if copied >= target || stop || (copied > 0 && nonblock) {
+            if copied >= target
+                || stop
+                || (copied > 0 && nonblock)
+                || (len == 0 && !s.queue.is_empty())
+            {
                 return Ok(Some(()));
             }
             if copied == 0
@@ -868,7 +900,9 @@ impl Socket for Unix {
         }
         s.backlog = backlog as usize;
         s.conn = Conn::Listening;
+        // A listener is its own peer, as `init_peercred` in `unix_listen` of Linux.
         s.listen_cred = Some(current_cred());
+        s.peer_cred = s.listen_cred;
         drop(s);
         self.wake();
         Ok(())
@@ -891,6 +925,8 @@ impl Socket for Unix {
                 return Err(Errno::EINVAL);
             }
             if let Some(new) = s.pending.pop_front() {
+                // The new socket gets `SO_PASSCRED` of the listener, as `unix_sock_inherit_flags`.
+                new.state.lock().passcred = s.passcred;
                 return Ok(Some(new));
             }
             if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
@@ -986,7 +1022,8 @@ impl Socket for Unix {
             SO_BINDTODEVICE | SO_PEERGROUPS => Vec::new(),
             SO_PEERSEC => return Err(Errno::ENOPROTOOPT),
             SO_PEERCRED => {
-                let c = s.peer_cred.unwrap_or(NO_CRED);
+                // No peer gives the pid 0 and the IDs -1, as `cred_to_ucred` of Linux.
+                let c = s.peer_cred.unwrap_or(Cred { pid: 0, uid: u32::MAX, gid: u32::MAX });
                 let mut v = c.pid.to_ne_bytes().to_vec();
                 v.extend_from_slice(&c.uid.to_ne_bytes());
                 v.extend_from_slice(&c.gid.to_ne_bytes());
@@ -1027,6 +1064,10 @@ impl Socket for Unix {
         drop(s);
         self.wake();
         Ok(())
+    }
+
+    fn event_count(&self) -> u64 {
+        self.events.load(Ordering::Relaxed)
     }
 
     fn poll(&self) -> u32 {

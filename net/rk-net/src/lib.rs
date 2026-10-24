@@ -24,6 +24,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::ioctls::{FIONREAD, TIOCOUTQ};
 use rk_abi::native::open::O_RDWR;
+use rk_abi::native::sockios::{SIOCGIFNAME, SIOCSIFHWBROADCAST};
 use rk_abi::native::stat::S_IFSOCK;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
@@ -172,6 +173,10 @@ pub trait Socket: Send + Sync {
     fn set_option(&self, level: u32, name: u32, value: &[u8]) -> Result<()>;
     /// The events of `poll`.
     fn poll(&self) -> u32;
+    /// A count that goes up at each wake of the socket, for an edge triggered epoll entry.
+    fn event_count(&self) -> u64 {
+        0
+    }
     /// The count of bytes that a receive can take now, for `FIONREAD`.
     fn readable(&self) -> Result<usize> {
         Ok(0)
@@ -233,6 +238,9 @@ impl FileOps for SocketFile {
         let n = match cmd {
             FIONREAD => self.socket.readable()?,
             TIOCOUTQ => self.socket.unsent()?,
+            // The network device calls of each family, as `dev_ioctl` of Linux. There is no
+            // network device yet.
+            SIOCGIFNAME..=SIOCSIFHWBROADCAST => return Err(Errno::ENODEV),
             _ => return Err(Errno::ENOTTY),
         };
         let n = i32::try_from(n).unwrap_or(i32::MAX);
@@ -246,6 +254,10 @@ impl FileOps for SocketFile {
 
     fn poll(&self, _file: &File) -> u32 {
         self.socket.poll()
+    }
+
+    fn event_count(&self) -> u64 {
+        self.socket.event_count()
     }
 
     fn metadata(&self) -> Option<Metadata> {
