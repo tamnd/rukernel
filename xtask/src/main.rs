@@ -615,6 +615,13 @@ ls -l /lib/ld-musl-x86_64.so.1
 apk --version
 apk info --no-network | grep -q musl
 echo one two | tr a-z A-Z | grep -q 'ONE TWO'
+sleep 100 &
+pid=$!
+until grep -qx sleep /proc/$pid/comm; do :; done
+busybox ps -o pid,ppid,user,stat,rss,args | grep -q \"^ *$pid *1 *root *S *[1-9][0-9]* *sleep 100$\"
+busybox pgrep -x sleep | grep -qx $pid
+busybox top -b -n 1 | grep -q \"^ *$pid *1 *root *S .* sleep 100$\"
+kill $pid
 if [ -x /usr/bin/gdb ]; then
     export PATH=/usr/sbin:/usr/bin:/sbin:/bin
     strace -f -o /tmp/strace.log sh -c 'echo one | tr a-z A-Z' | grep -qx ONE
@@ -629,6 +636,18 @@ if [ -x /usr/bin/gdb ]; then
     grep -q 'count: 14' /tmp/gdb.log
     grep -q 'exited normally' /tmp/gdb.log || { cat /tmp/gdb.log; exit 1; }
     echo 'alpine: gdb done'
+    sleep 100 &
+    pid=$!
+    until grep -qx sleep /proc/$pid/comm; do :; done
+    ps -o pid=,ppid=,user=,stat=,comm=,args= -p $pid | grep -q \"^ *$pid *1 root *S *sleep *sleep 100$\"
+    test \"$(ps -o rss= -p $pid)\" -gt 0
+    pgrep -x sleep | grep -qx $pid
+    pidof sleep | grep -qx $pid
+    top -b -n 1 > /tmp/top.log
+    grep -q '^Tasks: *[0-9]* total' /tmp/top.log
+    awk -v p=$pid '$1 == p && $2 == \"root\" && $6 > 0 && $8 == \"S\" && $12 == \"sleep\"' /tmp/top.log | grep -q .
+    kill $pid
+    echo 'alpine: ps, top and pgrep done'
 fi
 echo 'alpine: done'
 ",
@@ -732,9 +751,10 @@ fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
         }
     }
     if let Some(tools) = debug_tools_dir().filter(|_| rootfs.debug_tools) {
-        // `cp -R` keeps the symbolic links of the tree.
+        // `cp -R` keeps the symbolic links of the tree. With `-f`, a file of the tree replaces a link to
+        // BusyBox, which points to a path outside the tree.
         let status = Command::new("cp")
-            .arg("-pR")
+            .arg("-pRf")
             .arg(tools.join("root/."))
             .arg(&root)
             .status()

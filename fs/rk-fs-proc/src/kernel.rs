@@ -2,7 +2,7 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{FindFn, data_file, dir, file, join, link, rw_file};
-use crate::text::{self, MapLine, MemInfo, SmapsArea};
+use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -153,9 +153,13 @@ fn stat() -> Vec<u8> {
     let all = rk_proc::processes();
     let running = all.iter().filter(|p| p.state_letter() == b'R').count();
     let boot = rk_vfs::now().sec - uptime().0 as i64;
-    let zeros = "0 0 0 0 0 0 0 0 0 0";
+    // The timer does not tick while the kernel runs, so the time that is not user time is idle.
+    let hz = rk_frame::time::HZ;
+    let total = rk_frame::time::ticks();
+    let user = rk_proc::user_ticks().min(total);
+    let cpu = format!("{} 0 0 {} 0 0 0 0 0 0", user * USER_HZ / hz, (total - user) * USER_HZ / hz);
     format!(
-        "cpu  {zeros}\ncpu0 {zeros}\nintr 0\nctxt 0\nbtime {boot}\nprocesses {}\n\
+        "cpu  {cpu}\ncpu0 {cpu}\nintr 0\nctxt 0\nbtime {boot}\nprocesses {}\n\
          procs_running {running}\nprocs_blocked 0\nsoftirq 0 0 0 0 0 0 0 0 0 0 0\n",
         all.iter().map(|p| p.pid()).max().unwrap_or(0),
     )
@@ -343,12 +347,36 @@ fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
         cutime: p.child_ticks() * USER_HZ / rk_frame::time::HZ,
         start: p.start_tick() * USER_HZ / rk_frame::time::HZ,
         vsize,
+        rss: p.vm().map_or(0, |vm| vm.resident_pages(0, rk_frame::vm::USER_END) as u64),
         pending: thread.map_or(0, |t| t.pending().0),
         blocked: thread.map_or(0, |t| t.blocked().0),
         ignored,
         caught,
         exit_signal: p.exit_signal(),
     }
+}
+
+/// The sizes of `/proc/PID/statm`, as `task_statm` of Linux gives them.
+fn statm_of(p: &Process) -> Statm {
+    let mut m = Statm::default();
+    let Some(vm) = p.vm() else { return m };
+    for a in vm.areas() {
+        let pages = ((a.end - a.start) / rk_mm::PAGE_SIZE) as u64;
+        let resident = vm.resident_pages(a.start, a.end) as u64;
+        let file = matches!(a.backing, Backing::File { .. });
+        m.size += pages;
+        m.resident += resident;
+        if file || a.shared {
+            m.shared += resident;
+        }
+        if file && a.prot.exec {
+            m.text += pages;
+        }
+        if (a.prot.write && !a.shared) || a.kind == VmaKind::Stack {
+            m.data += pages;
+        }
+    }
+    m
 }
 
 fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
@@ -600,13 +628,7 @@ fn process_files(
     let p_ = w.clone();
     out.push((
         b"statm".to_vec(),
-        file(&join(base, b"statm"), move || {
-            let p = alive(&p_)?;
-            let pages: usize = p.vm().map_or(0, |vm| {
-                vm.areas().iter().map(|a| (a.end - a.start) / rk_mm::PAGE_SIZE).sum()
-            });
-            Ok(format!("{pages} 0 0 0 0 0 0\n").into_bytes())
-        }),
+        file(&join(base, b"statm"), move || Ok(text::statm(&statm_of(&*alive(&p_)?)))),
     ));
     let p_ = w.clone();
     let p2 = w.clone();

@@ -163,13 +163,13 @@ jobs:
       - name: build the kselftest programs
         if: steps.kselftest.outputs.cache-hit != 'true'
         run: tools/kselftest/build.sh ~/.cache/rk-kselftest
-      # tools/debug/build.sh installs gdb and strace for the alpine boot test.
+      # tools/debug/build.sh installs gdb, strace and procps-ng for the alpine boot test.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: debug-tools
         with:
           path: ~/.cache/rk-debug-tools
           key: debug-tools-${{ hashFiles('tools/debug/build.sh') }}
-      - name: install gdb and strace
+      - name: install gdb, strace and procps-ng
         if: steps.debug-tools.outputs.cache-hit != 'true'
         run: tools/debug/build.sh ~/.cache/rk-debug-tools
       - name: boot tests

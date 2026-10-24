@@ -35,7 +35,7 @@ pub use process::{
     COMM_LEN, Delivery, ForkShare, INIT_PID, PID_MAX, Pid, Process, Restart, SharedFiles, SharedFs,
     SyscallInfo, Thread, VforkDone, create_init, current_thread, exit_group, exit_thread,
     find_process, find_thread, fork, kill_group, new_thread, processes, send_signal, stop_group,
-    wait_child, wait_for_init,
+    user_ticks, wait_child, wait_for_init,
 };
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use process::{ptrace, seccomp};
