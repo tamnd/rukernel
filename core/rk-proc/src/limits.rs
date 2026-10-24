@@ -15,6 +15,9 @@ pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NOFILE: usize = 7;
 /// The value that tells that a resource has no limit.
 pub const RLIM_INFINITY: u64 = u64::MAX;
+/// The highest hard limit of `RLIMIT_NOFILE`. Linux names it `fs.nr_open`, and 1048576 is its
+/// default.
+pub const NR_OPEN: u64 = 1 << 20;
 
 /// The soft and the hard limit of one resource.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

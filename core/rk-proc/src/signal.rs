@@ -41,6 +41,8 @@ pub const ILL_ILLOPN: i32 = 2;
 pub const FPE_INTDIV: i32 = 1;
 /// An address that is not aligned.
 pub const BUS_ADRALN: i32 = 1;
+/// An address that has no data, such as a page of a file mapping past the end of the file.
+pub const BUS_ADRERR: i32 = 2;
 
 /// The signals that the kernel gives first, because the program caused them. Linux names this
 /// set `SYNCHRONOUS_MASK`.

@@ -13,7 +13,7 @@ use rk_abi::native::types::{
 };
 use rk_frame::time::{HZ, ticks};
 use rk_proc::exec::USER_HZ;
-use rk_proc::limits::{Limit, RLIM_NLIMITS};
+use rk_proc::limits::{Limit, NR_OPEN, RLIM_NLIMITS, RLIMIT_NOFILE};
 use zerocopy::FromZeros;
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -153,12 +153,16 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
         if n.rlim_cur > n.rlim_max {
             return Err(Errno::EINVAL);
         }
+        if resource == RLIMIT_NOFILE && n.rlim_max > NR_OPEN {
+            return Err(Errno::EPERM);
+        }
         Some(Limit { cur: n.rlim_cur, max: n.rlim_max })
     };
     let l = process.limit(resource);
     cx.write_opt(old, &Rlimit64 { rlim_cur: l.cur, rlim_max: l.max })?;
     if let Some(n) = new {
-        // Each process runs as root with `CAP_SYS_RESOURCE` in R1, so it can raise the hard limit.
+        // Each process runs as root with `CAP_SYS_RESOURCE` in R1, so it can raise the hard limit
+        // up to the limits above.
         process.set_limit(resource, n);
     }
     Ok(0)

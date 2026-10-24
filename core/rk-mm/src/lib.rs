@@ -21,6 +21,6 @@ mod space;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use space::{
     Access, AddressSpace, FileRef, MAX_MAP_COUNT, MMAP_MIN_ADDR, MMAP_TOP, MmFile, MmapRequest,
-    STACK_SIZE, STACK_TOP,
+    Remap, STACK_SIZE, STACK_TOP,
 };
 pub use vma::{Backing, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet};

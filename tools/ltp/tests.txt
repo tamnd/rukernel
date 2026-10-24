@@ -4,7 +4,9 @@
 # clone08 and clone10 use CLONE_THREAD or CLONE_SETTLS, and the clone function of musl refuses
 # them with EINVAL. clone09 needs network name spaces. clone11 needs the kernel configuration.
 # fork13 forks until its run time is over, and fork14 maps 16 TiB and forks after each GiB. They
-# are too slow for the boot test.
+# are too slow for the boot test. mremap06 needs fallocate, and mremap07 needs the kernel
+# configuration. msync03 needs mlock, and msync04 needs a block device. setrlimit01 and
+# setrlimit06 need the kernel to enforce the limits, and setrlimit02 needs user IDs.
 brk01
 brk02
 clone01
@@ -29,8 +31,12 @@ fork10
 getpid01
 getppid01
 getppid02
+getrlimit01
+getrlimit02
+getrlimit03
 gettid01
 gettid02
+mmap01
 mmap02
 mmap03
 mmap04
@@ -40,10 +46,12 @@ mmap08
 mmap09
 mmap10
 mmap11
+mmap13
 mmap15
 mmap17
 mmap19
 mmap20
+mmap21
 mmap22
 mmap23
 mmap24
@@ -52,9 +60,21 @@ mprotect02
 mprotect03
 mprotect04
 mprotect05
+mremap01
+mremap02
+mremap03
+mremap04
+mremap05
+mremap08
+mremap09
+msync01
+msync02
 munmap01
 munmap03
 munmap04
+setrlimit03
+setrlimit04
+setrlimit05
 wait01
 wait02
 wait401

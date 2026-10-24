@@ -9,7 +9,11 @@
 set -eu
 
 LTP_TAG=20260930
-LTP_DIRS="fork clone exit exit_group wait wait4 waitpid getpid getppid gettid brk mmap munmap mprotect mremap"
+LTP_DIRS="fork clone exit exit_group wait wait4 waitpid getpid getppid gettid brk mmap munmap mprotect mremap
+msync madvise mlock munlock mincore getrlimit setrlimit execve kill signal sigaction rt_sigaction
+sigprocmask rt_sigprocmask sigaltstack pipe pipe2 poll select futex read write open close dup dup2
+dup3 lseek pread pwrite readv writev getdents mkdir unlink rename stat fstat chdir getcwd uname
+nanosleep clock_gettime gettimeofday sched_yield set_tid_address arch_prctl fcntl umask access"
 
 out=${1:?usage: tools/ltp/build.sh OUT_DIR}
 mkdir -p "$out"
