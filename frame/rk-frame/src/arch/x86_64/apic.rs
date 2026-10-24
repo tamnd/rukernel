@@ -193,6 +193,7 @@ pub(crate) fn handle(vector: u8) -> bool {
     match vector {
         TIMER_VECTOR => {
             TICKS.fetch_add(1, Ordering::Relaxed);
+            crate::vdso::tick();
             eoi();
         }
         ERROR_VECTOR => {

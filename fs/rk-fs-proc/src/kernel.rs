@@ -365,6 +365,8 @@ fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
         match a.kind {
             VmaKind::Heap => line.name = b"[heap]".to_vec(),
             VmaKind::Stack => line.name = b"[stack]".to_vec(),
+            VmaKind::Vdso => line.name = b"[vdso]".to_vec(),
+            VmaKind::Vvar => line.name = b"[vvar]".to_vec(),
             VmaKind::Normal => {}
         }
         text::map_line(&mut out, &line);

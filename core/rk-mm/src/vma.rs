@@ -68,6 +68,10 @@ pub enum VmaKind {
     Heap,
     /// The main stack.
     Stack,
+    /// The vDSO.
+    Vdso,
+    /// The data page of the vDSO.
+    Vvar,
 }
 
 /// One virtual memory area.

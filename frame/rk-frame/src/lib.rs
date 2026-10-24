@@ -31,4 +31,6 @@ pub mod trap;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod user;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod vdso;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod vm;
