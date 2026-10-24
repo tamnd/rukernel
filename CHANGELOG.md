@@ -25,6 +25,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A message can carry files with `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS`. `SO_PEERCRED` gives the credentials of the peer, and `SO_PASSCRED` gives the credentials of the sender with each message.
 - `/proc/PID/fd` shows a socket as `socket:[INODE]`.
 - init checks Unix sockets.
+- The `kselftest` boot test runs the `seccomp_bpf` test of the Linux selftests. `tools/kselftest/build.sh` builds the test as a static glibc program. 99 tests pass, and 3 tests skip because rukernel has no PID name spaces.
 
 ### Fixed
 

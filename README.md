@@ -71,6 +71,13 @@ tools/ltp/build.sh target/ltp
 cargo xtask boot-test ltp
 ```
 
+The `kselftest` boot test runs tests from the selftests of Linux. `tools/kselftest/build.sh` builds them as static glibc programs in a Debian container, and needs docker. Now the test runs the `seccomp_bpf` test. It finds the programs in `target/kselftest`, or in the directory that `RK_KSELFTEST` gives:
+
+```
+tools/kselftest/build.sh target/kselftest
+cargo xtask boot-test kselftest
+```
+
 The `alpine` and `debian` boot tests run programs that use a dynamic loader. The `alpine` test uses the Alpine mini root file system, with musl. The `debian` test uses the Debian trixie slim root file system, with glibc. Its script runs bash, coreutils, dpkg, apt and perl, and then `tests/user/nptl.c`, a pthread test that the build compiles with glibc. The build uses `cc` on an x86-64 Linux host, or `zig cc -target x86_64-linux-gnu`, or the command in `RK_GLIBC_CC`. The first run downloads each root file system and checks its SHA-256. `RK_ALPINE` and `RK_DEBIAN` give the path of a different file.
 
 The `alpine` test also runs strace and gdb if `tools/debug/build.sh` installed them. The script needs docker. It installs gdb and strace from Alpine, and builds a small C program with debug information. strace traces a shell pipeline with `-f`, and gdb sets a breakpoint in the program and steps it. The test finds the tools in `target/debug-tools`, or in the directory that `RK_DEBUG_TOOLS` gives:

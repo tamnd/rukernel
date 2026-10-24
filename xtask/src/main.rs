@@ -404,6 +404,7 @@ const BOOT_TESTS: &[&str] = &[
     "tty",
     "busybox",
     "ltp",
+    "kselftest",
     "alpine",
     "debian",
 ];
@@ -518,9 +519,11 @@ fn find_glibc_cc() -> Result<Option<Vec<String>>> {
 const BUSYBOX_URL: &str = "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox";
 const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348";
 
-/// The applets that the `busybox` boot test uses. Each one is a link to /bin/busybox.
+/// The applets that the `busybox` and `kselftest` boot tests use. Each one is a link to
+/// /bin/busybox.
 const BUSYBOX_APPLETS: &[&str] = &[
-    "sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test", "mkdir", "rm", "true", "false", "mount",
+    "sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test", "mkdir", "rm", "true", "false",
+    "mount", "grep", "sed",
 ];
 
 /// Gives the SHA-256 of `path` in hexadecimal, from `sha256sum` or `shasum`.
@@ -817,6 +820,78 @@ fn ltp_script(tests: &[String]) -> String {
     script
 }
 
+/// The longest time that the `kselftest` boot test can take.
+const KSELFTEST_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The directory of the kselftest programs that tools/kselftest/build.sh makes: `RK_KSELFTEST`,
+/// or target/kselftest.
+fn kselftest_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("RK_KSELFTEST")
+        .map_or_else(|| workspace_root().join("target/kselftest"), PathBuf::from);
+    dir.join("VERSION").exists().then_some(dir)
+}
+
+/// The script that the `kselftest` boot test runs as init. It runs each program in /kselftest. A
+/// program passes with the exit code 0, or 4 (`KSFT_SKIP`) when it does not apply. The console
+/// gets the totals of each program, and all the output of a program that fails.
+const KSELFTEST_SCRIPT: &str = concat!(
+    "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin\n",
+    "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
+    "failed=0\nfor p in /kselftest/*; do\n",
+    "    t=${p##*/}\n",
+    "    [ \"$t\" = run ] && continue\n",
+    // The `attached` variant of the URETPROBE tests of seccomp_bpf needs the uprobes of perf,
+    // which rukernel does not have.
+    "    args=\n    [ \"$t\" = seccomp_bpf ] && args='-V attached'\n",
+    "    $p $args > /tmp/kselftest.log 2>&1\n",
+    "    code=$?\n",
+    "    grep -E '^# (Totals|PASSED|FAILED)' /tmp/kselftest.log | sed \"s/^#/kselftest: $t:/\"\n",
+    "    case $code in\n",
+    "    0) echo \"kselftest: $t: pass\" ;;\n",
+    "    4) echo \"kselftest: $t: does not apply\" ;;\n",
+    "    *) echo \"kselftest: $t: FAIL with $code\"; cat /tmp/kselftest.log; failed=1 ;;\n",
+    "    esac\n",
+    "done\n",
+    "exit $failed\n",
+);
+
+/// Writes the initramfs of the `kselftest` boot test next to the kernel: BusyBox, the kselftest
+/// programs and the script. Gives `false` if the programs or BusyBox are not there.
+fn build_kselftest_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
+    let (Some(dir), Some(busybox)) = (kselftest_dir(), busybox) else {
+        return Ok(false);
+    };
+    let mut w = rk_vfs::cpio::Writer::new();
+    w.add(b".", 0o040_755, b"");
+    for d in [&b"bin"[..], b"tmp", b"etc", b"kselftest", b"proc", b"dev"] {
+        w.add(d, 0o040_755, b"");
+    }
+    w.add(b"bin/busybox", 0o100_755, busybox);
+    for applet in BUSYBOX_APPLETS {
+        w.add(format!("bin/{applet}").as_bytes(), 0o120_777, b"busybox");
+    }
+    w.add(b"etc/passwd", 0o100_644, b"root:x:0:0:root:/:/bin/sh\n");
+    w.add(b"etc/group", 0o100_644, b"root:x:0:\n");
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let name = entry.map_err(|e| e.to_string())?.file_name();
+        let name = name.to_string_lossy().into_owned();
+        if name != "VERSION" {
+            names.push(name);
+        }
+    }
+    names.sort();
+    for name in &names {
+        let path = dir.join(name);
+        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        w.add(format!("kselftest/{name}").as_bytes(), 0o100_755, &bytes);
+    }
+    w.add(b"kselftest/run", 0o100_755, KSELFTEST_SCRIPT.as_bytes());
+    let path = kernel.with_file_name("initramfs-kselftest.cpio");
+    fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
 /// Writes the initramfs of the `ltp` boot test next to the kernel: BusyBox, the LTP tests and
 /// the script. Gives `false` if LTP or BusyBox is not there.
 fn build_ltp_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
@@ -871,6 +946,10 @@ fn build_kernel() -> Result<PathBuf> {
     let ltp = kernel.with_file_name("initramfs-ltp.cpio");
     if !build_ltp_initramfs(&kernel, busybox.as_deref())? {
         let _ = fs::remove_file(&ltp);
+    }
+    let kselftest = kernel.with_file_name("initramfs-kselftest.cpio");
+    if !build_kselftest_initramfs(&kernel, busybox.as_deref())? {
+        let _ = fs::remove_file(&kselftest);
     }
     for rootfs in ROOTFS {
         if !build_rootfs_initramfs(&kernel, rootfs)? {
@@ -1109,6 +1188,7 @@ fn can_run(kernel: &Path, test: &str) -> bool {
         "init" | "tty" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
+        "kselftest" => kernel.with_file_name("initramfs-kselftest.cpio").exists(),
         t if ROOTFS.iter().any(|r| r.name == t) => rootfs_initramfs(kernel, t).exists(),
         _ => true,
     }
@@ -1121,6 +1201,7 @@ fn test_cmdline(test: &str) -> String {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
+        "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
         t if ROOTFS.iter().any(|r| r.name == t) => {
             String::from("console=ttyS0 rk.test=init rdinit=/init")
         }
@@ -1130,7 +1211,8 @@ fn test_cmdline(test: &str) -> String {
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "busybox" | "ltp") || ROOTFS.iter().any(|r| r.name == test)
+    let test = if matches!(test, "tty" | "busybox" | "ltp" | "kselftest")
+        || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"
     } else {
@@ -1168,6 +1250,9 @@ fn boot_test(names: &[String]) -> Result {
         let (cmd, timeout) = if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), LTP_TIMEOUT)
+        } else if *test == "kselftest" {
+            let initrd = kernel.with_file_name("initramfs-kselftest.cpio");
+            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), KSELFTEST_TIMEOUT)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
@@ -1178,6 +1263,10 @@ fn boot_test(names: &[String]) -> Result {
         let passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
         if passed {
             println!("boot test {test}: pass");
+            // The kselftest totals show the tests that the kernel skips.
+            for line in log.lines().filter(|l| l.starts_with("kselftest: ")) {
+                println!("{line}");
+            }
         } else {
             let status = status.map_or(String::from("a timeout"), |s| format!("status {s}"));
             errors.push(format!("boot test {test}: fail with {status}\n{log}"));
