@@ -27,9 +27,11 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/user.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -1263,6 +1265,113 @@ static void test_memfd(void)
 	check("unshare of the file table", unshare(CLONE_FILES | CLONE_FS) == 0);
 }
 
+/* Sends the descriptor fd on the socket s with SCM_RIGHTS. */
+static int send_fd(int s, int fd)
+{
+	char data = 'f';
+	struct iovec iov = {.iov_base = &data, .iov_len = 1};
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+	struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.buf, .msg_controllen = sizeof(u.buf)};
+	struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &fd, sizeof(int));
+	return (int)sendmsg(s, &msg, 0);
+}
+
+/* Receives a descriptor from the socket s. Gives -1 if the message has none. */
+static int recv_fd(int s)
+{
+	char data;
+	int fd = -1;
+	struct iovec iov = {.iov_base = &data, .iov_len = 1};
+	union {
+		char buf[CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+	struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.buf, .msg_controllen = sizeof(u.buf)};
+	struct cmsghdr *c;
+
+	if (recvmsg(s, &msg, MSG_CMSG_CLOEXEC) != 1)
+		return -1;
+	c = CMSG_FIRSTHDR(&msg);
+	if (c && c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS)
+		memcpy(&fd, CMSG_DATA(c), sizeof(int));
+	return fd;
+}
+
+static void test_unix(void)
+{
+	int sv[2], fds[2], srv, cli, con, fd;
+	char buf[32] = {0};
+	struct sockaddr_un addr = {.sun_family = AF_UNIX, .sun_path = "/tmp-rk.sock"};
+	struct sockaddr_un got;
+	socklen_t len = sizeof(got);
+	struct ucred cred;
+	struct stat st;
+
+	check("socketpair of SOCK_STREAM", socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0);
+	check("a stream socket moves bytes", write(sv[0], "hello", 5) == 5 && read(sv[1], buf, sizeof(buf)) == 5 &&
+	      !strcmp(buf, "hello"));
+	len = sizeof(cred);
+	check("SO_PEERCRED gives the pid", getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 &&
+	      len == sizeof(cred) && cred.pid == getpid());
+	check("fstat of a socket gives S_IFSOCK", fstat(sv[0], &st) == 0 && S_ISSOCK(st.st_mode));
+	check("pipe for SCM_RIGHTS", pipe(fds) == 0);
+	check("sendmsg with SCM_RIGHTS", send_fd(sv[0], fds[1]) == 1);
+	close(fds[1]);
+	fd = recv_fd(sv[1]);
+	check("recvmsg gives the descriptor", fd >= 0 && (fcntl(fd, F_GETFD) & FD_CLOEXEC));
+	check("the descriptor works", write(fd, "x", 1) == 1 && read(fds[0], buf, 1) == 1 && buf[0] == 'x');
+	close(fd);
+	close(fds[0]);
+	close(sv[1]);
+	errno = 0;
+	check("a write to a closed peer gives EPIPE", send(sv[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+	close(sv[0]);
+
+	check("socketpair of SOCK_SEQPACKET", socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0);
+	memset(buf, 0, sizeof(buf));
+	check("seqpacket keeps the boundaries", write(sv[0], "one", 3) == 3 && write(sv[0], "two", 3) == 3 &&
+	      recv(sv[1], buf, 2, 0) == 2 && recv(sv[1], buf, sizeof(buf), 0) == 3 && !strcmp(buf, "two"));
+	close(sv[0]);
+	close(sv[1]);
+
+	srv = socket(AF_UNIX, SOCK_STREAM, 0);
+	check("bind to a path", srv >= 0 && bind(srv, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+	check("bind makes a socket file", stat(addr.sun_path, &st) == 0 && S_ISSOCK(st.st_mode));
+	check("listen", listen(srv, 4) == 0);
+	cli = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	check("connect to the path", connect(cli, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+	len = sizeof(got);
+	con = accept4(srv, (struct sockaddr *)&got, &len, SOCK_CLOEXEC);
+	check("accept4", con >= 0 && len == sizeof(sa_family_t));
+	len = sizeof(got);
+	check("getpeername gives the path", getpeername(cli, (struct sockaddr *)&got, &len) == 0 &&
+	      !strcmp(got.sun_path, addr.sun_path));
+	memset(buf, 0, sizeof(buf));
+	check("data on the accepted socket", send(cli, "ping", 4, 0) == 4 && recv(con, buf, sizeof(buf), 0) == 4 &&
+	      !strcmp(buf, "ping"));
+	errno = 0;
+	check("an empty nonblocking socket gives EAGAIN", recv(cli, buf, sizeof(buf), 0) == -1 && errno == EAGAIN);
+	errno = 0;
+	cli = socket(AF_UNIX, SOCK_STREAM, 0);
+	check("bind to a used path gives EADDRINUSE",
+	      bind(cli, (struct sockaddr *)&addr, sizeof(addr)) == -1 && errno == EADDRINUSE);
+	close(cli);
+	close(con);
+	close(srv);
+	unlink(addr.sun_path);
+	errno = 0;
+	cli = socket(AF_INET6, SOCK_STREAM, 0);
+	check("an unknown family gives EAFNOSUPPORT", cli == -1 && errno == EAFNOSUPPORT);
+}
+
 static void test_mount(void)
 {
 	struct statfs st;
@@ -1563,6 +1672,7 @@ int main(int argc, char **argv)
 	test_mount();
 	test_proc();
 	test_memfd();
+	test_unix();
 	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();

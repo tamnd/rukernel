@@ -474,6 +474,9 @@ fn fd_target(file: &rk_vfs::File, fs: Option<&rk_vfs::FsContext>) -> Vec<u8> {
         Ok(m) if m.mode & rk_vfs::inode::mode::S_IFMT == rk_vfs::inode::mode::S_IFIFO => {
             format!("pipe:[{}]", m.ino).into_bytes()
         }
+        Ok(m) if m.mode & rk_vfs::inode::mode::S_IFMT == rk_vfs::inode::mode::S_IFSOCK => {
+            format!("socket:[{}]", m.ino).into_bytes()
+        }
         _ => b"anon_inode:[unknown]".to_vec(),
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    fs, futex, info, memfd, mm, mount, pidfd, poll, process, ptrace, seccomp, signal, timer,
+    fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace, seccomp, signal, timer,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -69,6 +69,24 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::CLONE3 => process::clone3(cx, a[0], a[1]),
         nr::MEMFD_CREATE => memfd::memfd_create(cx, a[0], a[1]),
+        nr::SOCKET => net::socket_call(cx, a[0], a[1], a[2]),
+        nr::SOCKETPAIR => net::socketpair(cx, a[0], a[1], a[2], a[3]),
+        nr::BIND => net::bind(cx, a[0], a[1], a[2]),
+        nr::CONNECT => net::connect(cx, a[0], a[1], a[2]),
+        nr::LISTEN => net::listen(cx, a[0], a[1]),
+        nr::ACCEPT => net::accept4(cx, a[0], a[1], a[2], 0),
+        nr::ACCEPT4 => net::accept4(cx, a[0], a[1], a[2], a[3]),
+        nr::GETSOCKNAME => net::getsockname(cx, a[0], a[1], a[2]),
+        nr::GETPEERNAME => net::getpeername(cx, a[0], a[1], a[2]),
+        nr::SENDTO => net::sendto(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::RECVFROM => net::recvfrom(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::SENDMSG => net::sendmsg(cx, a[0], a[1], a[2]),
+        nr::RECVMSG => net::recvmsg(cx, a[0], a[1], a[2]),
+        nr::SENDMMSG => net::sendmmsg(cx, a[0], a[1], a[2], a[3]),
+        nr::RECVMMSG => net::recvmmsg(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::SHUTDOWN => net::shutdown(cx, a[0], a[1]),
+        nr::GETSOCKOPT => net::getsockopt(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::SETSOCKOPT => net::setsockopt(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::UNSHARE => process::unshare(cx, a[0]),
         nr::FORK => process::fork(cx),
         nr::VFORK => process::vfork(cx),

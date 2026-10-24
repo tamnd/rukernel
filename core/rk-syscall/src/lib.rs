@@ -36,6 +36,8 @@ mod mm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod mount;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod net;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod pidfd;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod poll;

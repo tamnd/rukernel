@@ -20,6 +20,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `unshare` for `CLONE_FILES`, `CLONE_FS` and `CLONE_SYSVSEM`. The flags of the name spaces give `EINVAL`, because rukernel has no name spaces yet.
 - `/proc/PID/syscall`. The state of a thread in `/proc/PID/stat` is `D` while it waits for a killable event.
 - init checks `memfd_create` and `unshare`.
+- Unix sockets of the types `SOCK_STREAM`, `SOCK_DGRAM` and `SOCK_SEQPACKET`. A socket can have a path name, an abstract name or no name. The new crates are `rk-net` (the socket layer) and `rk-net-unix` (the Unix family).
+- `socket`, `socketpair`, `bind`, `listen`, `accept`, `accept4`, `connect`, `getsockname`, `getpeername`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `sendmmsg`, `recvmmsg`, `shutdown`, `getsockopt` and `setsockopt`.
+- A message can carry files with `SCM_RIGHTS` and credentials with `SCM_CREDENTIALS`. `SO_PEERCRED` gives the credentials of the peer, and `SO_PASSCRED` gives the credentials of the sender with each message.
+- `/proc/PID/fd` shows a socket as `socket:[INODE]`.
+- init checks Unix sockets.
 
 ### Fixed
 
