@@ -23,6 +23,10 @@ pub const SIG_IGN: u64 = 1;
 pub const SI_USER: i32 = 0;
 /// The kernel sent the signal.
 pub const SI_KERNEL: i32 = 0x80;
+/// `sigqueue` sent the signal.
+pub const SI_QUEUE: i32 = -1;
+/// A POSIX timer sent the signal.
+pub const SI_TIMER: i32 = -2;
 /// `tkill` or `tgkill` sent the signal.
 pub const SI_TKILL: i32 = -6;
 /// The child called `exit`.
@@ -187,6 +191,8 @@ pub struct SigInfo {
     pub status: i32,
     /// The address of the fault, for a signal that an exception caused.
     pub addr: u64,
+    /// The `si_value` that `sigqueue` or a timer gives.
+    pub value: u64,
 }
 
 /// The size of `siginfo_t`.
@@ -195,12 +201,12 @@ pub const SIGINFO_SIZE: usize = 128;
 impl SigInfo {
     /// The information of a signal from `kill`, `tkill` or the kernel.
     pub const fn new(signo: u32, code: i32, pid: u32) -> Self {
-        Self { signo, code, errno: 0, pid, uid: 0, status: 0, addr: 0 }
+        Self { signo, code, errno: 0, pid, uid: 0, status: 0, addr: 0, value: 0 }
     }
 
     /// The information of a signal that an exception caused at `addr`.
     pub const fn fault(signo: u32, code: i32, addr: u64) -> Self {
-        Self { signo, code, errno: 0, pid: 0, uid: 0, status: 0, addr }
+        Self { signo, code, errno: 0, pid: 0, uid: 0, status: 0, addr, value: 0 }
     }
 
     /// Tells if the union of `siginfo_t` holds the fault address.
@@ -208,9 +214,38 @@ impl SigInfo {
         matches!(self.signo, SIGILL | SIGFPE | SIGSEGV | SIGBUS | SIGTRAP) && self.code > 0
     }
 
+    /// Tells if the union of `siginfo_t` holds the status of a child.
+    const fn is_child(&self) -> bool {
+        self.signo == SIGCHLD && self.code > 0
+    }
+
+    /// Reads the `siginfo_t` that a user program gave to `rt_sigqueueinfo`. It is the reverse of
+    /// `to_bytes`.
+    pub fn from_bytes(b: &[u8; SIGINFO_SIZE]) -> Self {
+        let word = |off: usize| u32::from_ne_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]);
+        let mut long = [0u8; 8];
+        long.copy_from_slice(&b[16..24]);
+        let mut info = Self::new(word(0), word(8) as i32, 0);
+        info.errno = word(4) as i32;
+        if info.is_fault() {
+            info.addr = u64::from_ne_bytes(long);
+            return info;
+        }
+        info.pid = word(16);
+        info.uid = word(20);
+        long.copy_from_slice(&b[24..32]);
+        if info.is_child() {
+            info.status = word(24) as i32;
+        } else {
+            info.value = u64::from_ne_bytes(long);
+        }
+        info
+    }
+
     /// Gives the `siginfo_t` of the x86-64 ABI: `si_signo`, `si_errno` and `si_code` at 0, 4 and
-    /// 8, and the union at 16. The union has `si_pid`, `si_uid` and `si_status` at 16, 20 and 24,
-    /// or `si_addr` at 16 for a fault.
+    /// 8, and the union at 16. The union has `si_pid` and `si_uid` at 16 and 20, and then
+    /// `si_status` or `si_value` at 24. For a fault, it has `si_addr` at 16. A timer puts its ID
+    /// and its overrun count in the place of `si_pid` and `si_uid`.
     pub fn to_bytes(&self) -> [u8; SIGINFO_SIZE] {
         let mut b = [0u8; SIGINFO_SIZE];
         b[0..4].copy_from_slice(&self.signo.to_ne_bytes());
@@ -221,7 +256,11 @@ impl SigInfo {
         } else {
             b[16..20].copy_from_slice(&self.pid.to_ne_bytes());
             b[20..24].copy_from_slice(&self.uid.to_ne_bytes());
-            b[24..28].copy_from_slice(&self.status.to_ne_bytes());
+            if self.is_child() {
+                b[24..28].copy_from_slice(&self.status.to_ne_bytes());
+            } else {
+                b[24..32].copy_from_slice(&self.value.to_ne_bytes());
+            }
         }
         b
     }

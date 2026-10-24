@@ -136,6 +136,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SYNC => Ok(0),
         nr::GETTID => Ok(u64::from(cx.thread.tid())),
         nr::TKILL => signal::tkill(cx, a[0], a[1]),
+        nr::RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(cx, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGQUEUEINFO => signal::rt_sigqueueinfo(cx, a[0], a[1], a[2]),
+        nr::RT_TGSIGQUEUEINFO => signal::rt_tgsigqueueinfo(cx, a[0], a[1], a[2], a[3]),
         nr::TIME => info::time(cx, a[0]),
         nr::SET_TID_ADDRESS => {
             cx.thread.set_clear_child_tid(a[0] as usize);
