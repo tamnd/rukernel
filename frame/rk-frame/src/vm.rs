@@ -178,6 +178,25 @@ impl VmSpace {
         })
     }
 
+    /// Writes `new` to the aligned 32 bit word at `addr` if the word has the value `old`, in one
+    /// atomic operation, and gives the value that the word had.
+    ///
+    /// # Errors
+    ///
+    /// Gives the address if the word is not mapped or not writable.
+    pub fn compare_exchange_u32(
+        &self,
+        addr: VirtAddr,
+        old: u32,
+        new: u32,
+    ) -> Result<u32, UserFault> {
+        let mut value = 0;
+        self.copy(addr.get(), 4, true, |frame, offset, _, _| {
+            value = frame.compare_exchange_u32(offset, old, new);
+        })?;
+        Ok(value)
+    }
+
     /// Fills `len` bytes of user memory at `addr` with zeros.
     ///
     /// # Errors

@@ -9,13 +9,21 @@
 //! scheduler of R1 is the round robin queue of rk-sched.
 //!
 //! The kernel runs with interrupts off, so a task in the kernel is not preempted. A task that runs
-//! user code yields when `should_yield` tells that its time slice is over. In R1 there is one CPU.
+//! user code yields when `should_yield` tells that its time slice is over.
+//!
+//! Each CPU runs user code at the same time, but only one CPU at a time runs kernel code. A CPU
+//! holds the kernel lock while it runs kernel code, and releases it when it enters user mode or
+//! waits for an interrupt. This is the big kernel lock of Linux 2.0, and it keeps the code of the
+//! kernel, which was written for one CPU, correct. All CPUs use one queue of the scheduler. Each
+//! CPU has its own current task, and an idle task that runs when no other task can run.
 //!
 //! An interrupt handler takes no lock, so it cannot wake a task. The work that an interrupt starts
 //! runs later as a bottom half, when the kernel is back from the interrupt and holds no lock: in
 //! the idle loop of the scheduler, and after an interrupt in user mode. The bottom half wakes the
 //! tasks whose timeout is over, and then calls each function of `add_bottom_half`.
 
+use crate::arch::imp::cpu::{self, MAX_CPUS};
+use crate::arch::imp::smp;
 use crate::arch::imp::task::{TaskContext, switch};
 use crate::sync::{Once, SpinLock};
 use alloc::alloc::{Layout, alloc, dealloc};
@@ -24,7 +32,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use core::any::Any;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// The size of the kernel stack of a task.
 pub const KERNEL_STACK_SIZE: usize = 32 * 1024;
@@ -40,6 +48,8 @@ const RUNNABLE: u8 = 1;
 const BLOCKED: u8 = 2;
 /// The task returned from its start function.
 const EXITED: u8 = 3;
+/// The task is the idle task of a CPU. It is never in the queue of the scheduler.
+const IDLE: u8 = 4;
 
 /// Why a task goes into the queue of the scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,8 +168,51 @@ impl core::fmt::Debug for Task {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The task on the CPU, or `None` before the first call to `current`.
-static CURRENT: SpinLock<Option<Arc<Task>>> = SpinLock::new(None);
+/// The tasks of one CPU.
+struct PerCpu {
+    /// The task on the CPU, or `None` before the first call to `current`.
+    current: SpinLock<Option<Arc<Task>>>,
+    /// The task that runs when no other task can run.
+    idle: Once<Arc<Task>>,
+}
+
+static CPUS: [PerCpu; MAX_CPUS] =
+    [const { PerCpu { current: SpinLock::new(None), idle: Once::new() } }; MAX_CPUS];
+
+fn this_cpu() -> &'static PerCpu {
+    &CPUS[cpu::id()]
+}
+
+/// The kernel lock. The boot CPU holds it from the start.
+static KERNEL_LOCK: AtomicBool = AtomicBool::new(true);
+
+/// Takes the kernel lock. While the CPU waits, it does the TLB requests of the other CPUs, because
+/// the CPU that holds the lock can wait for them.
+pub(crate) fn kernel_lock() {
+    while KERNEL_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        smp::poll();
+        core::hint::spin_loop();
+    }
+}
+
+/// Releases the kernel lock.
+pub(crate) fn kernel_unlock() {
+    KERNEL_LOCK.store(false, Ordering::Release);
+}
+
+/// The CPUs that wait for an interrupt in their idle task.
+static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Wakes a CPU that waits in its idle task, so that it runs a task from the queue.
+fn kick() {
+    let others = IDLE_MASK.load(Ordering::Acquire) & !(1 << cpu::id());
+    if others != 0 {
+        smp::reschedule(others.trailing_zeros() as usize);
+    }
+}
 /// An exited task that the next task drops after the switch, when its stack is not in use.
 static EXITED_TASK: SpinLock<Option<Arc<Task>>> = SpinLock::new(None);
 
@@ -207,6 +260,7 @@ impl TaskOptions {
         });
         scheduler().set_nice(&task, self.nice, self.idle);
         scheduler().enqueue(task.clone(), Enqueue::New);
+        kick();
         Some(task)
     }
 }
@@ -214,21 +268,21 @@ impl TaskOptions {
 impl Task {
     /// Gives the task on the CPU. The code that runs before the first task is the boot task.
     pub fn current() -> Arc<Task> {
-        let mut current = CURRENT.lock();
-        current
-            .get_or_insert_with(|| {
-                Arc::new(Task {
-                    id: 0,
-                    state: AtomicU8::new(RUNNING),
-                    start_tick: AtomicU64::new(crate::time::ticks()),
-                    context: UnsafeCell::new(TaskContext::default()),
-                    entry: SpinLock::new(None),
-                    data: Box::new(()),
-                    sched: Once::new(),
-                    _stack: None,
-                })
-            })
-            .clone()
+        this_cpu().current.lock().get_or_insert_with(|| Task::on_boot_stack(0, RUNNING)).clone()
+    }
+
+    /// Makes the task of the code that runs on the boot stack of a CPU.
+    fn on_boot_stack(id: u64, state: u8) -> Arc<Task> {
+        Arc::new(Task {
+            id,
+            state: AtomicU8::new(state),
+            start_tick: AtomicU64::new(crate::time::ticks()),
+            context: UnsafeCell::new(TaskContext::default()),
+            entry: SpinLock::new(None),
+            data: Box::new(()),
+            sched: Once::new(),
+            _stack: None,
+        })
     }
 
     /// The number of the task. The boot task has the number 0.
@@ -251,6 +305,11 @@ impl Task {
         self.state.load(Ordering::Acquire) == EXITED
     }
 
+    /// Tells if the task is the idle task of a CPU.
+    pub fn is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == IDLE
+    }
+
     /// Tells if the task waits in a wait queue.
     pub fn is_blocked(&self) -> bool {
         self.state.load(Ordering::Acquire) == BLOCKED
@@ -264,6 +323,7 @@ impl Task {
             .is_ok();
         if woken {
             scheduler().enqueue(self.clone(), Enqueue::Wake);
+            kick();
         }
         woken
     }
@@ -284,6 +344,9 @@ pub fn set_nice(task: &Task, nice: i32, idle: bool) {
 /// Lets the next task run. The current task stays runnable, so it runs again later.
 pub fn yield_now() {
     let current = Task::current();
+    if current.is_idle() {
+        return;
+    }
     current.state.store(RUNNABLE, Ordering::Release);
     scheduler().put_prev(&current, false);
     scheduler().enqueue(current, Enqueue::Yield);
@@ -321,8 +384,8 @@ impl Drop for IrqOff {
     }
 }
 
-/// Switches to the next task from the scheduler. If no task can run, the CPU waits for an
-/// interrupt. The current task is in the queue already if it can run.
+/// Switches to the next task from the scheduler. If no task can run, the CPU switches to its idle
+/// task. The current task is in the queue already if it can run.
 fn schedule() {
     let _irq = IrqOff::new();
     let current = Task::current();
@@ -330,35 +393,80 @@ fn schedule() {
     if state == BLOCKED || state == EXITED {
         scheduler().put_prev(&current, true);
     }
-    let next = loop {
-        if let Some(next) = scheduler().dequeue() {
-            break next;
-        }
-        // No task can run. The bottom half of an interrupt can wake a task.
-        crate::irq::wait();
-        crate::irq::disable();
-        run_bottom_half();
-    };
-    next.state.store(RUNNING, Ordering::Release);
-    next.start_tick.store(crate::time::ticks(), Ordering::Relaxed);
-    scheduler().set_next(&next);
+    let next = scheduler().dequeue().unwrap_or_else(idle_task);
+    if !next.is_idle() {
+        next.state.store(RUNNING, Ordering::Release);
+        next.start_tick.store(crate::time::ticks(), Ordering::Relaxed);
+        scheduler().set_next(&next);
+    }
     if Arc::ptr_eq(&current, &next) {
         return;
     }
     let from = current.context.get();
     let to = next.context.get().cast_const();
-    *CURRENT.lock() = Some(next);
+    *this_cpu().current.lock() = Some(next);
     if current.state.load(Ordering::Acquire) == EXITED {
         *EXITED_TASK.lock() = Some(current);
     } else {
         // The queue, a wait queue or a `wake` holds the current task, so its context lives.
         drop(current);
     }
-    // SAFETY: interrupts are off. `to` is the context of `next`, which `CURRENT` holds, and it is
-    // not on the CPU. `from` is the context of the current task, which `CURRENT` held until now
-    // and which a queue, a wait queue or `EXITED_TASK` holds now.
+    // SAFETY: interrupts are off, and the CPU holds the kernel lock, so no other CPU switches. `to`
+    // is the context of `next`, which the current task of this CPU holds, and it is not on a CPU.
+    // `from` is the context of the current task, which the CPU held until now and which a queue,
+    // a wait queue, the idle task of the CPU or `EXITED_TASK` holds now.
     unsafe { switch(from, to) };
     finish_switch();
+}
+
+/// The idle task of this CPU. The idle task of the boot CPU is new at the first call. The idle task
+/// of another CPU is the code on its boot stack, which `run_secondary` sets.
+fn idle_task() -> Arc<Task> {
+    this_cpu()
+        .idle
+        .call_once(|| {
+            let stack = KernelStack::new().expect("no memory for the idle task");
+            Arc::new(Task {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                state: AtomicU8::new(IDLE),
+                start_tick: AtomicU64::new(0),
+                context: UnsafeCell::new(TaskContext::new(stack.top())),
+                entry: SpinLock::new(Some(Box::new(|| idle_loop()))),
+                data: Box::new(()),
+                sched: Once::new(),
+                _stack: Some(stack),
+            })
+        })
+        .clone()
+}
+
+/// The loop of the idle task: it runs the other tasks, and waits for an interrupt when no task can
+/// run. The bottom half of an interrupt can wake a task.
+fn idle_loop() -> ! {
+    let bit = 1 << cpu::id();
+    loop {
+        run_bottom_half();
+        schedule();
+        // The CPU holds the kernel lock, so a task that is made runnable after this point sees
+        // the CPU in the mask and wakes it. An interrupt that comes before `wait` stays pending,
+        // and `wait` takes it.
+        IDLE_MASK.fetch_or(bit, Ordering::AcqRel);
+        kernel_unlock();
+        crate::irq::wait();
+        crate::irq::disable();
+        kernel_lock();
+        IDLE_MASK.fetch_and(!bit, Ordering::AcqRel);
+    }
+}
+
+/// The first code of a CPU that is not the boot CPU, after the CPU is set up. The code on the
+/// boot stack of the CPU becomes its idle task.
+pub(crate) fn run_secondary() -> ! {
+    kernel_lock();
+    let idle = Task::on_boot_stack(NEXT_ID.fetch_add(1, Ordering::Relaxed), IDLE);
+    this_cpu().idle.call_once(|| idle.clone());
+    *this_cpu().current.lock() = Some(idle);
+    idle_loop()
 }
 
 /// Drops the task that exited before the switch to this task.

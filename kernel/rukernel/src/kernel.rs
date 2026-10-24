@@ -38,7 +38,10 @@ fn main(boot: &'static BootInfo) -> ! {
     println!("timer: {} Hz, tick at {} Hz", rk_frame::time::timer_frequency(), rk_frame::time::HZ);
 
     #[cfg(target_arch = "x86_64")]
-    rk_sched::init();
+    {
+        rk_sched::init();
+        println!("smp: {} CPUs run", rk_frame::cpu::start_all());
+    }
     rootfs::init(boot);
 
     let test = param(boot.cmdline(), "rk.test");

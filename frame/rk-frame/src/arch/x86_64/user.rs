@@ -9,11 +9,12 @@
 //! The kernel does not use `sysret`. The return to user mode is always `iretq`, so a user RIP that
 //! is not canonical cannot make a fault in kernel mode.
 //!
-//! In R0 there is one CPU, so the saved values are in static variables. They become per CPU in R2.
+//! The saved values are in the `Local` value of the CPU, at `%gs:` addresses.
 
+use super::cpu;
 use super::gdt::{KERNEL_CS, USER_CS, USER_DS, USER32_CS};
 use super::trap::{NMI, TrapFrame};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 
 /// The user registers, in the order that the entry code reads and writes them.
 #[repr(C)]
@@ -85,19 +86,6 @@ pub(crate) const RETURN_SYSCALL: u64 = 0;
 pub(crate) const RETURN_INTERRUPT: u64 = 1;
 pub(crate) const RETURN_EXCEPTION: u64 = 2;
 
-/// The kernel stack pointer of `enter`, after it pushes the registers that it must keep.
-#[unsafe(no_mangle)]
-static RK_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-/// The address of the `UserRegs` value of the running user code.
-#[unsafe(no_mangle)]
-static RK_USER_REGS: AtomicU64 = AtomicU64::new(0);
-/// The user stack pointer at a `syscall` instruction, until the entry code saves it.
-#[unsafe(no_mangle)]
-static RK_USER_RSP: AtomicU64 = AtomicU64::new(0);
-
-/// The vector, the error code and CR2 of the last exception in user mode.
-static EXCEPTION: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-
 // The offsets in `UserRegs`: rax 0, rbx 8, rcx 16, rdx 24, rsi 32, rdi 40, rbp 48, rsp 56, r8 64
 // to r15 120, rip 128 and rflags 136.
 core::arch::global_asm!(
@@ -111,8 +99,8 @@ rk_user_enter:                      # rdi: the UserRegs value
     pushq %r13
     pushq %r14
     pushq %r15
-    movq %rsp, RK_KERNEL_RSP(%rip)
-    movq %rdi, RK_USER_REGS(%rip)
+    movq %rsp, %gs:{kernel_rsp}
+    movq %rdi, %gs:{user_regs}
     pushq ${user_ds}                # the iretq frame: ss, rsp, rflags, cs, rip
     pushq 56(%rdi)
     pushq 136(%rdi)
@@ -139,8 +127,8 @@ rk_user_enter:                      # rdi: the UserRegs value
     .global rk_syscall_entry
 rk_syscall_entry:                   # rcx: the user rip, r11: the user rflags
     swapgs
-    movq %rsp, RK_USER_RSP(%rip)
-    movq RK_USER_REGS(%rip), %rsp
+    movq %rsp, %gs:{user_rsp}
+    movq %gs:{user_regs}, %rsp
     movq %rax, 0(%rsp)
     movq %rbx, 8(%rsp)
     movq %rcx, 16(%rsp)
@@ -158,14 +146,14 @@ rk_syscall_entry:                   # rcx: the user rip, r11: the user rflags
     movq %r15, 120(%rsp)
     movq %rcx, 128(%rsp)
     movq %r11, 136(%rsp)
-    movq RK_USER_RSP(%rip), %rax
+    movq %gs:{user_rsp}, %rax
     movq %rax, 56(%rsp)
     movl ${syscall}, %edi
     # Fall through to rk_user_return.
 
     .global rk_user_return
 rk_user_return:                     # rdi: the way back, one of the RETURN_ values
-    movq RK_KERNEL_RSP(%rip), %rsp
+    movq %gs:{kernel_rsp}, %rsp
     movq %rdi, %rax
     popq %r15
     popq %r14
@@ -178,6 +166,9 @@ rk_user_return:                     # rdi: the way back, one of the RETURN_ valu
     user_ds = const USER_DS,
     user_cs = const USER_CS,
     syscall = const RETURN_SYSCALL,
+    kernel_rsp = const cpu::KERNEL_RSP,
+    user_regs = const cpu::USER_REGS,
+    user_rsp = const cpu::USER_RSP,
     options(att_syntax)
 );
 
@@ -310,23 +301,31 @@ pub(crate) fn enter(regs: &mut UserRegs, fpu: &mut FpuState, fs_base: u64) -> Re
     match how {
         RETURN_SYSCALL => Return::Syscall,
         RETURN_INTERRUPT => Return::Interrupt,
-        _ => Return::Exception {
-            vector: EXCEPTION[0].load(Ordering::Relaxed) as u8,
-            error: EXCEPTION[1].load(Ordering::Relaxed),
-            cr2: EXCEPTION[2].load(Ordering::Relaxed),
-        },
+        _ => {
+            let e = &cpu::local().exception;
+            Return::Exception {
+                vector: e[0].load(Ordering::Relaxed) as u8,
+                error: e[1].load(Ordering::Relaxed),
+                cr2: e[2].load(Ordering::Relaxed),
+            }
+        }
     }
 }
 
 /// Handles a trap from user mode. The trap handler calls this when CS of the frame is a user
-/// selector. A non maskable interrupt returns to the user code. Each other trap goes back to the
-/// caller of `enter`.
+/// selector. A non maskable interrupt and an interrupt from another CPU return to the user code.
+/// Each other trap goes back to the caller of `enter`.
 pub(crate) fn trap(frame: &TrapFrame, cr2: u64) {
     let vector = frame.vector as u8;
     if vector == NMI {
         return;
     }
-    let regs = RK_USER_REGS.load(Ordering::Relaxed) as *mut UserRegs;
+    if super::smp::is_ipi(vector) {
+        super::interrupt(vector);
+        return;
+    }
+    let local = cpu::local();
+    let regs = local.user_regs.load(Ordering::Relaxed) as *mut UserRegs;
     let saved = UserRegs {
         rax: frame.rax,
         rbx: frame.rbx,
@@ -354,13 +353,13 @@ pub(crate) fn trap(frame: &TrapFrame, cr2: u64) {
         super::interrupt(vector);
         RETURN_INTERRUPT
     } else {
-        EXCEPTION[0].store(u64::from(vector), Ordering::Relaxed);
-        EXCEPTION[1].store(frame.error, Ordering::Relaxed);
-        EXCEPTION[2].store(cr2, Ordering::Relaxed);
+        local.exception[0].store(u64::from(vector), Ordering::Relaxed);
+        local.exception[1].store(frame.error, Ordering::Relaxed);
+        local.exception[2].store(cr2, Ordering::Relaxed);
         RETURN_EXCEPTION
     };
     // SAFETY: the trap came from user mode, so the code of `enter` waits for the return, and its
-    // stack pointer is in `RK_KERNEL_RSP`. The trap entry code made the swapgs, so GS is the
+    // stack pointer is in the `Local` value of the CPU. The trap entry code made the swapgs, so GS is the
     // kernel GS. The frames of the trap handler are on the entry stack, and nothing in them must
     // be dropped, so it is correct to leave them.
     unsafe { rk_user_return(how) }

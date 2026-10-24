@@ -1,0 +1,28 @@
+//! The CPUs of the machine.
+//!
+//! The boot CPU has the number 0, and the other CPUs have the numbers after it, in the order in
+//! which they start. Only x86-64 starts the other CPUs. The other architectures and the host
+//! build of the unit tests run on one CPU.
+
+/// The number of CPUs that run.
+pub fn count() -> usize {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    return crate::arch::imp::cpu::count();
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    1
+}
+
+/// The number of the CPU that runs this code.
+pub fn id() -> usize {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    return crate::arch::imp::cpu::id();
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    0
+}
+
+/// Starts the other CPUs, and gives the number of CPUs that run. The kernel calls this one time,
+/// after it gives the scheduler.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn start_all() -> usize {
+    crate::arch::imp::smp::start_cpus()
+}

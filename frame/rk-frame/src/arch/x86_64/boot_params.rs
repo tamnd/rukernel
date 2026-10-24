@@ -102,8 +102,8 @@ pub(super) fn read(base: u64) -> BootInfo {
 }
 
 /// Finds the RSDP in the BIOS area, on a 16 byte boundary, as the ACPI specification tells. A
-/// loader on a BIOS machine does not have to give the RSDP.
-fn find_rsdp() -> Option<u64> {
+/// loader on a BIOS machine does not have to give the RSDP, and the PVH loader of QEMU does not.
+pub(super) fn find_rsdp() -> Option<u64> {
     BIOS_ROM.step_by(16).find(|&a| read_phys::<u64>(a) == Some(RSDP_SIGNATURE))
 }
 

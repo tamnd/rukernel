@@ -5,7 +5,7 @@ use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
 use crate::sync::SpinLock;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// The allocator manages physical memory below this address. 64 GiB needs a bitmap of 2 MiB.
 const MAX_PHYS: u64 = 64 << 30;
@@ -159,6 +159,23 @@ impl Frame {
         // SAFETY: the frame is mapped in the direct map, and the bytes are in the frame. `buf` is
         // not in a frame that this copy writes.
         unsafe { mem::copy(buf.as_mut_ptr(), p, buf.len()) };
+    }
+
+    /// Writes `new` to the 32 bit word at `offset` if the word has the value `old`, in one atomic
+    /// operation, and gives the value that the word had. User code on another CPU can change the
+    /// word at the same time, as with a futex.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is not 4 byte aligned or the word is not in the frame.
+    pub fn compare_exchange_u32(&self, offset: usize, old: u32, new: u32) -> u32 {
+        assert!(offset.is_multiple_of(4), "the word at {offset} is not aligned");
+        let p = self.byte_ptr(offset, 4).cast::<u32>();
+        // SAFETY: the word is in the frame, which the direct map has, and it is aligned. The frame
+        // memory is accessed only with copies and atomic operations, so no access to it is a data
+        // race with this atomic operation.
+        let word = unsafe { AtomicU32::from_ptr(p) };
+        word.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).unwrap_or_else(|v| v)
     }
 
     /// Copies `buf` to the frame at `offset`. A frame that is shared through an `Arc` is written

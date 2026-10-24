@@ -821,6 +821,26 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Writes `new` to the aligned 32 bit word at `addr` if the word has the value `old`, in one
+    /// atomic operation, and gives the value that the word had. A page that is read only after
+    /// `fork` is copied first.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EFAULT` if the word is not in an area that allows a write, and `EINVAL` if `addr`
+    /// is not aligned.
+    pub fn compare_exchange_u32(&self, addr: usize, old: u32, new: u32) -> Result<u32, Errno> {
+        if !addr.is_multiple_of(4) {
+            return Err(Errno::EINVAL);
+        }
+        loop {
+            match self.vm.compare_exchange_u32(VirtAddr::new(addr), old, new) {
+                Ok(value) => return Ok(value),
+                Err(UserFault { addr: at, .. }) => self.fault_in(at, Access::Write)?,
+            }
+        }
+    }
+
     /// Copies `buf` to user memory at `addr`, also to a private page that is read only, such as
     /// the code of the program. The page gets a private copy first, so the file and the other
     /// processes do not see the change. This is the write of `ptrace` with `FOLL_FORCE`.

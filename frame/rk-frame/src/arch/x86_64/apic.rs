@@ -4,7 +4,9 @@
 //! The legacy 8259 PIC is moved to vectors 0x20 to 0x2f and masked, so it sends no interrupts.
 //!
 //! The timer of the local APIC runs in periodic mode at `HZ` interrupts each second. Its frequency
-//! is not known, so the boot code measures it against channel 2 of the PIT, as Linux does. The
+//! is not known, so the boot code measures it against channel 2 of the PIT, as Linux does. Each
+//! CPU has a timer, so that user code on each CPU comes back to the kernel at the end of its time
+//! slice. Only the timer of the boot CPU counts the ticks. The
 //! vector numbers are the vector numbers of Linux, per arch/x86/include/asm/irq_vectors.h.
 
 use super::io::Port;
@@ -27,9 +29,12 @@ const APIC_BASE_ADDR: u64 = 0x000f_ffff_ffff_f000;
 
 // The register offsets of the xAPIC. The MSR of the same register in x2APIC mode is
 // `0x800 + offset / 16`.
+const REG_ID: u32 = 0x20;
 const REG_TPR: u32 = 0x80;
 const REG_EOI: u32 = 0xb0;
 const REG_SVR: u32 = 0xf0;
+const REG_ICR_LOW: u32 = 0x300;
+const REG_ICR_HIGH: u32 = 0x310;
 const REG_LVT_TIMER: u32 = 0x320;
 const REG_LVT_ERROR: u32 = 0x370;
 const REG_TIMER_INIT: u32 = 0x380;
@@ -39,6 +44,8 @@ const REG_TIMER_DIVIDE: u32 = 0x3e0;
 const SVR_ENABLE: u32 = 1 << 8;
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_PERIODIC: u32 = 1 << 17;
+/// The delivery status bit of the ICR in xAPIC mode: the APIC did not send the last IPI yet.
+const ICR_PENDING: u32 = 1 << 12;
 /// Divide the bus clock by 16.
 const DIVIDE_BY_16: u32 = 0b0011;
 
@@ -55,6 +62,8 @@ static XAPIC_BASE: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
 /// The frequency of the APIC timer after the divider, in Hz.
 pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
+/// The initial count of the timer for one tick.
+static PERIOD: AtomicU64 = AtomicU64::new(0);
 /// The frequency of the time stamp counter in Hz, or 0 before the calibration.
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// The time stamp counter at the calibration, which is the time 0 of `nanos`.
@@ -239,16 +248,54 @@ pub(crate) fn init() {
             .unwrap_or_else(|| panic!("no mapping for the local APIC"));
         XAPIC_BASE.store(virt, Ordering::Relaxed);
     }
+    enable();
+    let per_ms = (calibrate() / CALIBRATE_MS).max(1);
+    TIMER_HZ.store(per_ms * 1000, Ordering::Relaxed);
+    PERIOD.store((per_ms * 1000 / HZ).clamp(1, u64::from(u32::MAX)), Ordering::Relaxed);
+    start_timer();
+}
+
+/// Sets up the local APIC of a CPU that is not the boot CPU, in the mode of the boot CPU, and
+/// starts its timer. The xAPIC registers of each CPU are at the same address.
+pub(crate) fn init_secondary() {
+    let base = read_msr(IA32_APIC_BASE) | APIC_BASE_ENABLE;
+    let mode = if X2APIC.load(Ordering::Relaxed) { APIC_BASE_X2APIC } else { 0 };
+    write_msr(IA32_APIC_BASE, base | mode);
+    enable();
+    start_timer();
+}
+
+/// Lets the local APIC take interrupts of each priority and report errors.
+fn enable() {
     write(REG_TPR, 0);
     write(REG_LVT_ERROR, u32::from(ERROR_VECTOR));
     write(REG_SVR, SVR_ENABLE | u32::from(SPURIOUS_VECTOR));
+}
 
-    let per_ms = (calibrate() / CALIBRATE_MS).max(1);
-    TIMER_HZ.store(per_ms * 1000, Ordering::Relaxed);
-    let period = (per_ms * 1000 / HZ).clamp(1, u64::from(u32::MAX)) as u32;
+/// Starts the timer in periodic mode at `HZ` interrupts each second.
+fn start_timer() {
     write(REG_TIMER_DIVIDE, DIVIDE_BY_16);
     write(REG_LVT_TIMER, LVT_PERIODIC | u32::from(TIMER_VECTOR));
-    write(REG_TIMER_INIT, period);
+    write(REG_TIMER_INIT, PERIOD.load(Ordering::Relaxed) as u32);
+}
+
+/// The local APIC ID of this CPU.
+pub(crate) fn id() -> u32 {
+    if X2APIC.load(Ordering::Relaxed) { read_msr(0x802) as u32 } else { read(REG_ID) >> 24 }
+}
+
+/// Sends an interrupt to the CPU with the local APIC ID `dest`. `command` is the low half of the
+/// ICR: the vector, the delivery mode and the level.
+pub(crate) fn send_ipi(dest: u32, command: u32) {
+    if X2APIC.load(Ordering::Relaxed) {
+        write_msr(0x800 + REG_ICR_LOW / 16, u64::from(dest) << 32 | u64::from(command));
+    } else {
+        write(REG_ICR_HIGH, dest << 24);
+        write(REG_ICR_LOW, command);
+        while read(REG_ICR_LOW) & ICR_PENDING != 0 {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Handles an interrupt from the local APIC. Gives `false` for a vector that is not an APIC
@@ -256,11 +303,13 @@ pub(crate) fn init() {
 pub(crate) fn handle(vector: u8) -> bool {
     match vector {
         TIMER_VECTOR => {
-            // `clock_ns` reads the tick count before and after the time stamp counter of the
-            // tick, so the counter must change first.
-            TICK_TSC.store(rdtsc(), Ordering::Release);
-            TICKS.fetch_add(1, Ordering::Release);
-            crate::vdso::tick();
+            if super::cpu::id() == 0 {
+                // `clock_ns` reads the tick count before and after the time stamp counter of the
+                // tick, so the counter must change first.
+                TICK_TSC.store(rdtsc(), Ordering::Release);
+                TICKS.fetch_add(1, Ordering::Release);
+                crate::vdso::tick();
+            }
             eoi();
         }
         ERROR_VECTOR => {
