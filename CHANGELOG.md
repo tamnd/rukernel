@@ -10,10 +10,16 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `kcmp` for `KCMP_FILE`, `KCMP_VM`, `KCMP_FILES`, `KCMP_FS` and `KCMP_SIGHAND`.
 - `capget` and `capset`. All processes run as root, thus `capget` gives all the capabilities in the effective and permitted sets.
 - init checks the process file descriptors, `kcmp` and `capget`.
-- `seccomp` with filters of classic BPF, and the strict mode. A filter gives the action `SECCOMP_RET_KILL_PROCESS`, `KILL_THREAD`, `TRAP`, `ERRNO`, `TRACE`, `LOG` or `ALLOW`. A child of `fork` or `clone` gets the filters of its parent, and `execve` keeps them. `SECCOMP_RET_USER_NOTIF` gives `ENOSYS`, because rukernel has no listener for the notifications yet.
+- `seccomp` with filters of classic BPF, and the strict mode. A filter gives the action `SECCOMP_RET_KILL_PROCESS`, `KILL_THREAD`, `TRAP`, `ERRNO`, `TRACE`, `LOG` or `ALLOW`. A child of `fork` or `clone` gets the filters of its parent, and `execve` keeps them.
 - `seccomp` accepts `SECCOMP_SET_MODE_STRICT`, `SECCOMP_SET_MODE_FILTER`, `SECCOMP_GET_ACTION_AVAIL` and `SECCOMP_GET_NOTIF_SIZES`. `prctl` accepts `PR_GET_SECCOMP`, `PR_SET_SECCOMP`, `PR_SET_NO_NEW_PRIVS` and `PR_GET_NO_NEW_PRIVS`.
 - `ptrace` accepts `PTRACE_SECCOMP_GET_FILTER`, `PTRACE_SECCOMP_GET_METADATA` and `PTRACE_O_SUSPEND_SECCOMP`. A tracer with `PTRACE_O_TRACESECCOMP` gets the stop `PTRACE_EVENT_SECCOMP`.
 - init checks `seccomp`.
+- The listener of `seccomp` notifications. `SECCOMP_FILTER_FLAG_NEW_LISTENER` gives a file descriptor, and `SECCOMP_RET_USER_NOTIF` stops the thread until the supervisor sends a reply. The supervisor uses `SECCOMP_IOCTL_NOTIF_RECV`, `SEND`, `ID_VALID`, `ADDFD` and `SET_FLAGS`. `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` makes the wait killable after the supervisor receives the notification.
+- `SECCOMP_FILTER_FLAG_TSYNC` and `SECCOMP_FILTER_FLAG_TSYNC_ESRCH` put the filter on all the threads of the process.
+- `memfd_create`. A memfd is a regular file in a private tmpfs, with no name in the tree.
+- `unshare` for `CLONE_FILES`, `CLONE_FS` and `CLONE_SYSVSEM`. The flags of the name spaces give `EINVAL`, because rukernel has no name spaces yet.
+- `/proc/PID/syscall`. The state of a thread in `/proc/PID/stat` is `D` while it waits for a killable event.
+- init checks `memfd_create` and `unshare`.
 
 ### Fixed
 

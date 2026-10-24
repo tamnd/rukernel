@@ -20,7 +20,7 @@ use rk_proc::signal::{
     BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL,
     SIG_IGN, SigInfo, TRAP_BRKPT, TRAP_TRACE,
 };
-use rk_proc::{Thread, WaitStatus};
+use rk_proc::{SyscallInfo, Thread, WaitStatus};
 use rk_vfs::FsContext;
 
 /// The number of system calls since boot.
@@ -194,12 +194,13 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
         match reason {
             ReturnReason::Syscall => {
                 COUNT.fetch_add(1, Ordering::Relaxed);
-                let number = match syscall_entry(thread, regs) {
-                    Entry::Run(number) => number,
+                let (number, run) = match syscall_entry(thread, regs) {
+                    Entry::Run(number) => (number, number != NO_SYSCALL),
+                    Entry::Skip(number) => (number, false),
                     Entry::GroupExit => continue,
                     Entry::ThreadExit(status) => break status,
                 };
-                if number != NO_SYSCALL {
+                if run {
                     let mut cx = Cx { thread, regs, exit: None, number };
                     table::dispatch(&mut cx);
                     if let Some(status) = cx.exit {
@@ -236,6 +237,9 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
 pub(crate) enum Entry {
     /// Run the system call with this number, or skip it if the number is `NO_SYSCALL`.
     Run(u64),
+    /// Skip the system call with this number. RAX has the return value, and a signal can start
+    /// the call again if the value is a restart code.
+    Skip(u64),
     /// The group exits.
     GroupExit,
     /// The thread exits with this status, for `seccomp`.
@@ -247,6 +251,12 @@ pub(crate) enum Entry {
 /// `syscall_trace_enter` of Linux does.
 fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Entry {
     let mut number = regs.syscall_number();
+    thread.set_syscall_info(SyscallInfo {
+        nr: number as i64,
+        args: regs.syscall_args(),
+        sp: regs.regs().rsp,
+        pc: regs.regs().rip,
+    });
     regs.set_syscall_return(Errno::ENOSYS.to_syscall_return() as u64);
     if thread.syscall_traced() {
         let r = ptrace::stop(thread, regs, number, StopKind::SyscallEntry, SIGTRAP, None);
@@ -262,6 +272,12 @@ fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Entry {
 /// gets `SIGTRAP` instead, because the trap flag stops it only after the next instruction, as
 /// `syscall_exit_work` of Linux does.
 fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
+    thread.set_syscall_info(SyscallInfo {
+        nr: -1,
+        sp: regs.regs().rsp,
+        pc: regs.regs().rip,
+        ..SyscallInfo::default()
+    });
     if thread.single_stepping() {
         thread.send_signal(SigInfo::fault(SIGTRAP, TRAP_BRKPT, regs.regs().rip));
     } else if thread.syscall_traced() {

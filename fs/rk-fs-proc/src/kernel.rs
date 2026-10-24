@@ -294,10 +294,33 @@ fn thread_state(t: &Thread) -> u8 {
         return b'T';
     }
     match t.task() {
+        Some(task) if task.is_blocked() && t.in_killable_wait() => b'D',
         Some(task) if task.is_blocked() => b'S',
         Some(_) => b'R',
         None => b'Z',
     }
+}
+
+/// The text of `/proc/PID/syscall`: `running` for a thread that runs, the number, the arguments,
+/// the stack pointer and the instruction pointer of a thread that waits in a system call, and -1
+/// with the two pointers for a thread that waits outside one.
+fn syscall_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
+    let leader = p.threads().into_iter().find(|t| t.tid() == p.pid());
+    let Some(thread) = t.or(leader.as_deref()) else { return b"running\n".to_vec() };
+    if !thread.task().is_some_and(|task| task.is_blocked()) {
+        return b"running\n".to_vec();
+    }
+    let info = thread.syscall_info();
+    let text = if info.nr < 0 {
+        format!("-1 {:#x} {:#x}\n", info.sp, info.pc)
+    } else {
+        let a = info.args;
+        format!(
+            "{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
+            info.nr, a[0], a[1], a[2], a[3], a[4], a[5], info.sp, info.pc
+        )
+    };
+    text.into_bytes()
 }
 
 fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
@@ -531,6 +554,16 @@ fn process_files(
                 Ok(())
             },
         ),
+    ));
+    let p_ = w.clone();
+    let t_ = t.clone();
+    out.push((
+        b"syscall".to_vec(),
+        file(&join(base, b"syscall"), move || {
+            let p = alive(&p_)?;
+            let t = t_.as_ref().map(alive).transpose()?;
+            Ok(syscall_of(&p, t.as_deref()))
+        }),
     ));
     let p_ = w.clone();
     out.push((

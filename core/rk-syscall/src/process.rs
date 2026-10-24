@@ -6,15 +6,17 @@ use alloc::sync::Arc;
 use rk_abi::Errno;
 use rk_abi::native::sched::{
     CLONE_ARGS_SIZE_VER0, CLONE_CHILD_CLEARTID, CLONE_CHILD_SETTID, CLONE_CLEAR_SIGHAND,
-    CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_INTO_CGROUP, CLONE_PARENT, CLONE_PARENT_SETTID,
-    CLONE_PIDFD, CLONE_PTRACE, CLONE_SETTLS, CLONE_SIGHAND, CLONE_THREAD, CLONE_UNTRACED,
-    CLONE_VFORK, CLONE_VM,
+    CLONE_DETACHED, CLONE_FILES, CLONE_FS, CLONE_INTO_CGROUP, CLONE_NEWCGROUP, CLONE_NEWIPC,
+    CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWTIME, CLONE_NEWUSER, CLONE_NEWUTS,
+    CLONE_PARENT, CLONE_PARENT_SETTID, CLONE_PIDFD, CLONE_PTRACE, CLONE_SETTLS, CLONE_SIGHAND,
+    CLONE_SYSVSEM, CLONE_THREAD, CLONE_UNTRACED, CLONE_VFORK, CLONE_VM,
 };
 use rk_abi::native::signal::SIGCHLD;
 use rk_abi::native::types::CloneArgs;
 use rk_abi::native::wait::{
     P_ALL, P_PGID, P_PID, P_PIDFD, WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WUNTRACED,
 };
+use rk_frame::sync::SpinLock;
 use rk_frame::task::yield_now;
 use rk_proc::exec::{ExecArgs, exec};
 use rk_proc::ptrace::{
@@ -43,6 +45,48 @@ const PR_GET_NAME: u64 = 16;
 /// The `code` values of `arch_prctl`, from arch/x86/include/uapi/asm/prctl.h.
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
+
+/// The flags of `unshare` that make a new namespace. rukernel has no namespaces, thus they give
+/// `EINVAL`, as Linux without `CONFIG_NAMESPACES` gives.
+const CLONE_NEW_ANY: u64 = CLONE_NEWNS
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET
+    | CLONE_NEWTIME;
+
+/// `unshare`: the process gets its own copy of the parts that it shares, as kernel/fork.c of
+/// Linux does.
+pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
+    let known = CLONE_THREAD
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_VM
+        | CLONE_SYSVSEM
+        | CLONE_NEW_ANY;
+    if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let process = cx.process();
+    // A process with more than one thread cannot leave its group, its handlers or its memory.
+    if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && process.threads().len() > 1 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_FILES != 0 {
+        let table = cx.files()?.lock().clone();
+        process.set_files(Arc::new(SpinLock::new(table)));
+    }
+    if flags & CLONE_FS != 0
+        && let Some(fs) = process.fs()
+    {
+        let context = fs.lock().clone();
+        process.set_fs(Arc::new(SpinLock::new(context)));
+    }
+    Ok(0)
+}
 
 pub(crate) fn sched_yield() -> SysResult {
     yield_now();

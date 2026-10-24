@@ -5,12 +5,16 @@
 //! keeps it. Each system call runs all the filters of the chain, and the action with the lowest
 //! value wins. This is the model of kernel/seccomp.c of Linux.
 
-use super::Thread;
+use super::{Pid, Thread};
 use crate::bpf::{self, Insn, SECCOMP_DATA_SIZE};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::Errno;
+use rk_frame::sync::{SpinLock, SpinLockGuard};
+use rk_frame::task::WaitQueue;
+use rk_vfs::file::File;
 
 /// The thread has no `seccomp` mode.
 pub const SECCOMP_MODE_DISABLED: u32 = 0;
@@ -52,12 +56,24 @@ pub struct Filter {
     log: bool,
     /// The filter that was there before this one.
     prev: Option<Arc<Filter>>,
+    /// The notifications of `SECCOMP_RET_USER_NOTIF`, if the filter has a listener.
+    notify: Option<Arc<Notify>>,
 }
 
 impl Filter {
     /// Makes a filter from a program. The caller checked the program with `bpf::check`.
     pub fn new(prog: Vec<Insn>, log: bool) -> Self {
-        Self { prog, log, prev: None }
+        Self { prog, log, prev: None, notify: None }
+    }
+
+    /// Makes a filter with a listener, for `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+    pub fn with_listener(prog: Vec<Insn>, log: bool, notify: Arc<Notify>) -> Self {
+        Self { prog, log, prev: None, notify: Some(notify) }
+    }
+
+    /// The notifications of the filter, if it has a listener.
+    pub fn notify(&self) -> Option<&Arc<Notify>> {
+        self.notify.as_ref()
     }
 
     /// The program of the filter.
@@ -85,6 +101,132 @@ impl Filter {
             f = cur.prev.as_ref();
         }
         false
+    }
+}
+
+impl Drop for Filter {
+    /// No thread and no other filter uses the filter now, thus the listener gets `POLLHUP`.
+    fn drop(&mut self) {
+        if let Some(notify) = &self.notify {
+            notify.orphan();
+        }
+    }
+}
+
+/// The state of one notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotifState {
+    /// The thread waits, and the listener did not receive the notification yet.
+    Init,
+    /// The listener received the notification, and the thread waits for the reply.
+    Sent,
+    /// The listener replied.
+    Replied,
+}
+
+/// A request of `SECCOMP_IOCTL_NOTIF_ADDFD`: the thread that waits adds the file to its table.
+pub struct AddFd {
+    /// The file to add.
+    pub file: Arc<File>,
+    /// The descriptor for `SECCOMP_ADDFD_FLAG_SETFD`, or `None` for the lowest free one.
+    pub fd: Option<i32>,
+    /// The new descriptor gets `FD_CLOEXEC`.
+    pub cloexec: bool,
+    /// `SECCOMP_ADDFD_FLAG_SEND`: the new descriptor is also the reply.
+    pub send: bool,
+    /// The descriptor or the error, after the thread added the file.
+    pub result: SpinLock<Option<Result<i32, Errno>>>,
+}
+
+impl core::fmt::Debug for AddFd {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AddFd")
+            .field("fd", &self.fd)
+            .field("send", &self.send)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One notification of `SECCOMP_RET_USER_NOTIF`.
+#[derive(Debug)]
+pub struct Notif {
+    /// The ID that the listener sees.
+    pub id: u64,
+    /// The thread that made the system call.
+    pub tid: Pid,
+    /// The `seccomp_data` of the call.
+    pub data: [u8; SECCOMP_DATA_SIZE],
+    /// The state.
+    pub state: NotifState,
+    /// The return value of the reply.
+    pub val: i64,
+    /// The error of the reply.
+    pub error: i32,
+    /// The flags of the reply.
+    pub flags: u32,
+    /// The requests of `SECCOMP_IOCTL_NOTIF_ADDFD` that the thread did not do yet.
+    pub addfd: VecDeque<Arc<AddFd>>,
+}
+
+/// The state of the notifications of one filter.
+#[derive(Debug, Default)]
+pub struct NotifyState {
+    /// The ID of the next notification.
+    pub next_id: u64,
+    /// The notifications, in the order that they came.
+    pub list: Vec<Notif>,
+    /// The listener is closed. New notifications give `ENOSYS`.
+    pub closed: bool,
+    /// No thread uses the filter.
+    pub orphaned: bool,
+    /// `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP`.
+    pub sync: bool,
+}
+
+impl NotifyState {
+    /// Gives the notification with the ID `id`.
+    pub fn find(&mut self, id: u64) -> Option<&mut Notif> {
+        self.list.iter_mut().find(|n| n.id == id)
+    }
+}
+
+/// The notifications of a filter with a listener. The filter and the file of the listener both
+/// hold it.
+pub struct Notify {
+    state: SpinLock<NotifyState>,
+    /// `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV`: after the listener received a notification,
+    /// only a fatal signal stops the wait of the thread.
+    pub wait_killable: bool,
+    /// The listener and the threads that wait for a reply wait here.
+    pub wait: WaitQueue,
+}
+
+impl core::fmt::Debug for Notify {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Notify").field("wait_killable", &self.wait_killable).finish_non_exhaustive()
+    }
+}
+
+impl Notify {
+    /// Makes the notifications of a new listener.
+    pub fn new(wait_killable: bool) -> Self {
+        Self { state: SpinLock::new(NotifyState::default()), wait_killable, wait: WaitQueue::new() }
+    }
+
+    /// Locks the state.
+    pub fn lock(&self) -> SpinLockGuard<'_, NotifyState> {
+        self.state.lock()
+    }
+
+    /// Wakes the listener and the threads that wait, and each wait of `poll`.
+    pub fn wake(&self) {
+        self.wait.wake_all();
+        rk_vfs::wait::poll_wake();
+    }
+
+    fn orphan(&self) {
+        self.lock().orphaned = true;
+        self.wake();
     }
 }
 
@@ -139,12 +281,15 @@ impl Thread {
     ///
     /// # Errors
     ///
-    /// Gives `EINVAL` if the thread is in the strict mode, and `ENOMEM` if the chain has too
-    /// many instructions.
+    /// Gives `EINVAL` if the thread is in the strict mode, `EBUSY` if the filter and a filter in
+    /// the chain both have a listener, and `ENOMEM` if the chain has too many instructions.
     pub fn attach_seccomp_filter(&self, mut filter: Filter) -> Result<Arc<Filter>, Errno> {
         let mut s = self.seccomp.lock();
         if s.mode != SECCOMP_MODE_DISABLED && s.mode != SECCOMP_MODE_FILTER {
             return Err(Errno::EINVAL);
+        }
+        if filter.notify.is_some() && self.has_listener(&s) {
+            return Err(Errno::EBUSY);
         }
         let mut total = filter.prog.len();
         let mut walker = s.filter.as_ref();
@@ -161,6 +306,72 @@ impl Thread {
         s.mode = SECCOMP_MODE_FILTER;
         self.seccomp_mode.store(SECCOMP_MODE_FILTER, Ordering::Release);
         Ok(filter)
+    }
+
+    /// Tells if a filter in the chain of the thread has a listener.
+    fn has_listener(&self, s: &Seccomp) -> bool {
+        let mut f = s.filter.as_ref();
+        while let Some(cur) = f {
+            if cur.notify.is_some() {
+                return true;
+            }
+            f = cur.prev.as_ref();
+        }
+        false
+    }
+
+    /// Tells if a filter in the chain of the thread has a listener. A new filter with a listener
+    /// gives `EBUSY` then.
+    pub fn has_seccomp_listener(&self) -> bool {
+        self.has_listener(&self.seccomp.lock())
+    }
+
+    /// Finds a thread of the process that `SECCOMP_FILTER_FLAG_TSYNC` cannot synchronize, as
+    /// `seccomp_can_sync_threads` of Linux does. A thread can get the chain of this thread if it
+    /// has no mode, or if its chain is a part of the chain of this thread. Gives the ID of the
+    /// first thread that cannot.
+    pub fn seccomp_sync_conflict(&self) -> Option<Pid> {
+        let own = self.seccomp().filter;
+        self.process.threads().into_iter().find_map(|t| {
+            if t.tid == self.tid || t.is_killed() {
+                return None;
+            }
+            let s = t.seccomp();
+            let ok = match s.mode {
+                SECCOMP_MODE_DISABLED => true,
+                SECCOMP_MODE_FILTER => match (&s.filter, &own) {
+                    (None, _) => true,
+                    (Some(theirs), Some(own)) => own.is_descendant_of(theirs),
+                    (Some(_), None) => false,
+                },
+                _ => false,
+            };
+            (!ok).then_some(t.tid)
+        })
+    }
+
+    /// Gives the chain of this thread to each other thread of the process, for
+    /// `SECCOMP_FILTER_FLAG_TSYNC`, as `seccomp_sync_threads` of Linux does. The caller checked
+    /// the threads with `seccomp_sync_conflict`.
+    pub fn seccomp_sync_threads(&self) {
+        let own = self.seccomp();
+        let nnp = self.no_new_privs();
+        for t in self.process.threads() {
+            if t.tid == self.tid || t.is_killed() {
+                continue;
+            }
+            t.set_seccomp(Seccomp { mode: SECCOMP_MODE_FILTER, filter: own.filter.clone() });
+            if nnp {
+                t.set_no_new_privs();
+            }
+        }
+    }
+
+    /// Drops the filters of the thread at its exit, so that a listener sees when no thread uses
+    /// its filter, as `seccomp_filter_release` of Linux does.
+    pub(super) fn release_seccomp(&self) {
+        let old = core::mem::take(&mut self.seccomp.lock().filter);
+        drop(old);
     }
 
     /// Gives the filter `n` of the thread, for `PTRACE_SECCOMP_GET_FILTER`. The oldest filter is

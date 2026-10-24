@@ -359,6 +359,9 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         _ => {}
     }
     let file = cx.file(fd)?;
+    if let Some(notify) = crate::seccomp::listener_of(&file) {
+        return crate::seccomp::listener_ioctl(cx, &notify, cmd, arg);
+    }
     let vm = cx.vm()?;
     Ok(file.ioctl(cmd, arg as usize, &UserMem(&vm))? as u64)
 }
