@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.2.5] (2026-10-24)
+
+This release is the fifth part of milestone R2. It adds epoll, event files, timer files and signal files. The ltp boot test runs 50 more tests, and all of them pass.
+
 ### Added
 
 - `epoll_create`, `epoll_create1`, `epoll_ctl`, `epoll_wait`, `epoll_pwait` and `epoll_pwait2`. An entry can be level triggered or edge triggered, and it accepts `EPOLLONESHOT` and `EPOLLEXCLUSIVE`. An epoll file can watch another epoll file, and `epoll_ctl` refuses a loop and a chain of more than 5 files.
@@ -332,6 +336,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.2.5]: https://github.com/tamnd/rukernel/releases/tag/v0.2.5
 [0.2.4]: https://github.com/tamnd/rukernel/releases/tag/v0.2.4
 [0.2.3]: https://github.com/tamnd/rukernel/releases/tag/v0.2.3
 [0.2.2]: https://github.com/tamnd/rukernel/releases/tag/v0.2.2
