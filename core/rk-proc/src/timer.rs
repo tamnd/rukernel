@@ -92,7 +92,7 @@ struct TimerState {
     interval: u64,
     /// The key of the timer in the queue of the timer task, while the timer is on.
     key: Option<(u64, u64)>,
-    /// The overrun count of the last signal, for `timer_getoverrun`.
+    /// The overrun count of the last signal that a thread took, for `timer_getoverrun`.
     overrun: i32,
 }
 
@@ -124,8 +124,23 @@ impl Timer {
 
     /// Sets the timer to fire at `expires` on its clock and then after each `interval`. An
     /// `expires` of 0 turns the timer off. Gives the remaining time and the interval before the
-    /// change.
+    /// change. The pending signal of a POSIX timer from the old setting is discarded.
     pub fn arm(self: &Arc<Self>, expires: u64, interval: u64) -> (u64, u64) {
+        if self.info.code == crate::signal::SI_TIMER {
+            match &self.target {
+                Target::Process(p) => {
+                    if let Some(p) = p.upgrade() {
+                        crate::process::discard_timer_signal(&p, None, self.info.pid);
+                    }
+                }
+                Target::Thread(t) => {
+                    if let Some(t) = t.upgrade() {
+                        crate::process::discard_timer_signal(t.process(), Some(&t), self.info.pid);
+                    }
+                }
+                Target::None | Target::Notify(_) => {}
+            }
+        }
         let now = self.now();
         let mut s = self.state.lock();
         let old = s.remaining(now);
@@ -160,9 +175,14 @@ impl Timer {
         self.state.lock().remaining(now)
     }
 
-    /// The overrun count of the last signal.
+    /// The overrun count of the last signal that a thread took.
     pub fn overrun(&self) -> i32 {
         self.state.lock().overrun
+    }
+
+    /// Sets the overrun count of the last signal that a thread took.
+    pub(crate) fn set_overrun(&self, overrun: i32) {
+        self.state.lock().overrun = overrun;
     }
 
     /// Fires the timer at `now` on its clock: it sends the signal, and puts the timer back in
@@ -194,23 +214,23 @@ impl Timer {
         };
         let mut info = self.info;
         info.uid = u32::try_from(missed).unwrap_or(i32::MAX as u32);
-        let overrun = match &self.target {
+        match &self.target {
             Target::Process(p) => {
-                p.upgrade().and_then(|p| crate::process::send_timer_signal(&p, None, info))
+                if let Some(p) = p.upgrade() {
+                    crate::process::send_timer_signal(&p, None, info);
+                }
             }
-            Target::Thread(t) => t
-                .upgrade()
-                .and_then(|t| crate::process::send_timer_signal(t.process(), Some(&t), info)),
-            Target::None => None,
+            Target::Thread(t) => {
+                if let Some(t) = t.upgrade() {
+                    crate::process::send_timer_signal(t.process(), Some(&t), info);
+                }
+            }
+            Target::None => {}
             Target::Notify(n) => {
                 if let Some(n) = n.upgrade() {
                     n.expire(missed + 1);
                 }
-                None
             }
-        };
-        if let Some(overrun) = overrun {
-            self.state.lock().overrun = overrun;
         }
     }
 }

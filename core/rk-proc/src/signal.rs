@@ -387,6 +387,18 @@ impl Pending {
         Some(info.uid as i32)
     }
 
+    /// Discards the pending signal of the POSIX timer `id`, if there is one.
+    pub fn discard_timer(&mut self, id: u32) {
+        let Some(i) = self.queue.iter().position(|i| i.code == SI_TIMER && i.pid == id) else {
+            return;
+        };
+        if let Some(info) = self.queue.remove(i)
+            && !self.queue.iter().any(|i| i.signo == info.signo)
+        {
+            self.set.remove(info.signo);
+        }
+    }
+
     /// Discards each instance of `sig`.
     pub fn discard(&mut self, sig: u32) {
         self.queue.retain(|i| i.signo != sig);
