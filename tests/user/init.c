@@ -5,6 +5,7 @@
  * types.
  */
 #define _GNU_SOURCE
+#include <elf.h>
 #include <errno.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -16,6 +17,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/auxv.h>
 #include <sys/mount.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -146,6 +148,82 @@ static void test_time(void)
 	clock_gettime(CLOCK_MONOTONIC, &b);
 	long ns = (b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec);
 	check("the clock goes forward in the sleep", ns >= 10 * 1000 * 1000);
+}
+
+/* Finds a function of the vDSO by its name in the dynamic symbols, as parse_vdso.c of Linux
+ * does. It does not look at the versions. */
+static void *vdso_sym(const char *name)
+{
+	char *base = (char *)getauxval(AT_SYSINFO_EHDR);
+	if (!base)
+		return NULL;
+	Elf64_Ehdr *eh = (Elf64_Ehdr *)base;
+	Elf64_Phdr *ph = (Elf64_Phdr *)(base + eh->e_phoff);
+	Elf64_Dyn *dyn = NULL;
+	long load = 0;
+	for (int i = 0; i < eh->e_phnum; i++) {
+		if (ph[i].p_type == PT_LOAD)
+			load = (long)base + ph[i].p_offset - ph[i].p_vaddr;
+		else if (ph[i].p_type == PT_DYNAMIC)
+			dyn = (Elf64_Dyn *)(base + ph[i].p_offset);
+	}
+	if (!dyn)
+		return NULL;
+	Elf64_Sym *sym = NULL;
+	char *str = NULL;
+	Elf64_Word *hash = NULL;
+	for (; dyn->d_tag != DT_NULL; dyn++) {
+		if (dyn->d_tag == DT_SYMTAB)
+			sym = (Elf64_Sym *)(load + dyn->d_un.d_ptr);
+		else if (dyn->d_tag == DT_STRTAB)
+			str = (char *)(load + dyn->d_un.d_ptr);
+		else if (dyn->d_tag == DT_HASH)
+			hash = (Elf64_Word *)(load + dyn->d_un.d_ptr);
+	}
+	if (!sym || !str || !hash)
+		return NULL;
+	for (Elf64_Word i = 0; i < hash[1]; i++)
+		if (sym[i].st_shndx != SHN_UNDEF && !strcmp(str + sym[i].st_name, name))
+			return (void *)(load + sym[i].st_value);
+	return NULL;
+}
+
+static long timespec_ns(const struct timespec *t)
+{
+	return t->tv_sec * 1000000000L + t->tv_nsec;
+}
+
+static void test_vdso(void)
+{
+	int (*vgettime)(clockid_t, struct timespec *) = vdso_sym("__vdso_clock_gettime");
+	int (*vgettimeofday)(struct timeval *, void *) = vdso_sym("__vdso_gettimeofday");
+	long (*vtime)(long *) = vdso_sym("__vdso_time");
+	int (*vgetcpu)(unsigned *, unsigned *) = vdso_sym("__vdso_getcpu");
+	check("the vDSO has its functions", vgettime && vgettimeofday && vtime && vgetcpu &&
+					    vdso_sym("__vdso_clock_getres"));
+	if (!vgettime || !vgettimeofday || !vtime || !vgetcpu)
+		return;
+	struct timespec a, s, b;
+	check("__vdso_clock_gettime", vgettime(CLOCK_MONOTONIC, &a) == 0);
+	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &s);
+	vgettime(CLOCK_MONOTONIC, &b);
+	check("the vDSO time agrees with the system call", timespec_ns(&a) <= timespec_ns(&s) &&
+							   timespec_ns(&s) <= timespec_ns(&b));
+	struct timespec d = { 0, 20 * 1000 * 1000 };
+	nanosleep(&d, NULL);
+	vgettime(CLOCK_REALTIME, &b);
+	check("the vDSO time goes forward in a sleep", timespec_ns(&b) - timespec_ns(&s) >= 10 * 1000 * 1000);
+	check("__vdso_clock_gettime of a CPU clock", vgettime(CLOCK_PROCESS_CPUTIME_ID, &a) == 0);
+	check("__vdso_clock_gettime of a bad clock", vgettime(1000, &a) == -EINVAL);
+	struct timeval tv;
+	syscall(SYS_clock_gettime, CLOCK_REALTIME, &s);
+	check("__vdso_gettimeofday", vgettimeofday(&tv, NULL) == 0 && tv.tv_sec >= s.tv_sec);
+	long t = 0;
+	check("__vdso_time", vtime(&t) == t && t >= s.tv_sec);
+	unsigned cpu = 7, node = 7;
+	check("__vdso_getcpu", vgetcpu(&cpu, &node) == 0 && cpu == 0 && node == 0);
+	struct timespec m;
+	check("clock_gettime of libc", clock_gettime(CLOCK_MONOTONIC, &m) == 0 && timespec_ns(&m) >= timespec_ns(&s));
 }
 
 static volatile sig_atomic_t got_sig, got_code, got_pid, chld_count, on_altstack;
@@ -522,7 +600,8 @@ static void test_proc(void)
 	check("/proc/self/stat", read_file("/proc/self/stat", buf, sizeof(buf)) > 0 && !strncmp(buf, want, strlen(want)));
 	check("/proc/self/status", read_file("/proc/self/status", buf, sizeof(buf)) > 0 && strstr(buf, "\nState:\tR (running)\n"));
 	check("/proc/self/cmdline", read_file("/proc/self/cmdline", buf, sizeof(buf)) > 0 && !strcmp(buf, "/init"));
-	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n"));
+	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n") &&
+						   strstr(buf, "[vvar]\n") && strstr(buf, "[vdso]\n"));
 	check("/proc/mounts", read_file("/proc/mounts", buf, sizeof(buf)) > 0 && strstr(buf, "proc /proc proc rw 0 0\n"));
 	n = readlink("/proc/self/exe", link, sizeof(link) - 1);
 	check("/proc/self/exe", n == 5 && !strncmp(link, "/init", 5));
@@ -572,6 +651,7 @@ int main(int argc, char **argv)
 	test_fork();
 	test_exec();
 	test_time();
+	test_vdso();
 	test_signals();
 	test_pipes();
 	test_threads();

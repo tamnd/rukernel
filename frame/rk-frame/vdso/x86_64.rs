@@ -1,0 +1,170 @@
+//! The vDSO of x86-64. The build script of rk-frame compiles this file to an object and links it
+//! with `vdso.ld` to a shared object. The kernel maps the shared object in each process, with the
+//! data page directly below it. glibc and musl find the functions by name and by the version
+//! `LINUX_2.6`, as on Linux.
+//!
+//! The functions read the time from the data page. The kernel writes the tick count to the page
+//! at each timer tick, so the time is the same as the time of the system calls. A clock that the
+//! data page does not give goes to the system call.
+
+#![no_std]
+#![no_main]
+
+use core::arch::asm;
+use core::panic::PanicInfo;
+
+/// The data page. The layout is private to the kernel and to this file, see
+/// `rk_frame::vdso::Data`.
+#[repr(C)]
+struct Data {
+    ticks: u64,
+    ns_per_tick: u64,
+}
+
+#[repr(C)]
+pub struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[repr(C)]
+pub struct Timeval {
+    tv_sec: i64,
+    tv_usec: i64,
+}
+
+const NSEC_PER_SEC: u64 = 1_000_000_000;
+const PAGE_SIZE: usize = 4096;
+const SYS_CLOCK_GETTIME: usize = 228;
+const SYS_CLOCK_GETRES: usize = 229;
+
+/// The data page, at the page below the first byte of the vDSO.
+fn data() -> *const Data {
+    let base: usize;
+    // SAFETY: the instruction only computes an address. `__ehdr_start` is the ELF header of the
+    // vDSO, at the start of its first page.
+    unsafe {
+        asm!("lea {}, [rip + __ehdr_start]", out(reg) base, options(pure, nomem, nostack));
+    }
+    base.wrapping_sub(PAGE_SIZE) as *const Data
+}
+
+/// The nanoseconds since boot.
+fn now_ns() -> u64 {
+    let d = data();
+    // SAFETY: the kernel maps the data page below the vDSO, and it writes each field with one
+    // aligned store.
+    let ticks = unsafe { core::ptr::addr_of!((*d).ticks).read_volatile() };
+    // SAFETY: as above.
+    let ns_per_tick = unsafe { core::ptr::addr_of!((*d).ns_per_tick).read_volatile() };
+    ticks.wrapping_mul(ns_per_tick)
+}
+
+/// The resolution of the clocks, in nanoseconds.
+fn resolution_ns() -> u64 {
+    let d = data();
+    // SAFETY: as in `now_ns`.
+    unsafe { core::ptr::addr_of!((*d).ns_per_tick).read_volatile() }
+}
+
+/// Tells if the data page gives the clock. These are the clocks that count from the boot in the
+/// kernel too.
+fn known(clock: i32) -> bool {
+    // CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,
+    // CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME and CLOCK_TAI.
+    matches!(clock, 0 | 1 | 4 | 5 | 6 | 7 | 11)
+}
+
+fn syscall2(nr: usize, a: usize, b: usize) -> i32 {
+    let ret: isize;
+    // SAFETY: the system call reads its two arguments and writes only user memory that the
+    // caller gave.
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a,
+            in("rsi") b,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    ret as i32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __vdso_clock_gettime(clock: i32, ts: *mut Timespec) -> i32 {
+    if !known(clock) {
+        return syscall2(SYS_CLOCK_GETTIME, clock as usize, ts as usize);
+    }
+    let ns = now_ns();
+    let value =
+        Timespec { tv_sec: (ns / NSEC_PER_SEC) as i64, tv_nsec: (ns % NSEC_PER_SEC) as i64 };
+    // SAFETY: the caller gives a pointer to a `timespec`. A bad pointer is a fault in the caller,
+    // as on Linux.
+    unsafe { ts.write_volatile(value) };
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __vdso_clock_getres(clock: i32, res: *mut Timespec) -> i32 {
+    if !known(clock) {
+        return syscall2(SYS_CLOCK_GETRES, clock as usize, res as usize);
+    }
+    if !res.is_null() {
+        let ns = resolution_ns();
+        let value =
+            Timespec { tv_sec: (ns / NSEC_PER_SEC) as i64, tv_nsec: (ns % NSEC_PER_SEC) as i64 };
+        // SAFETY: as in `__vdso_clock_gettime`.
+        unsafe { res.write_volatile(value) };
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __vdso_gettimeofday(tv: *mut Timeval, tz: *mut [i32; 2]) -> i32 {
+    if !tv.is_null() {
+        let ns = now_ns();
+        let value = Timeval {
+            tv_sec: (ns / NSEC_PER_SEC) as i64,
+            tv_usec: (ns % NSEC_PER_SEC / 1000) as i64,
+        };
+        // SAFETY: as in `__vdso_clock_gettime`.
+        unsafe { tv.write_volatile(value) };
+    }
+    if !tz.is_null() {
+        // SAFETY: as in `__vdso_clock_gettime`. The kernel has no time zone, as Linux by default.
+        unsafe { tz.write_volatile([0, 0]) };
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __vdso_time(t: *mut i64) -> i64 {
+    let sec = (now_ns() / NSEC_PER_SEC) as i64;
+    if !t.is_null() {
+        // SAFETY: as in `__vdso_clock_gettime`.
+        unsafe { t.write_volatile(sec) };
+    }
+    sec
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __vdso_getcpu(cpu: *mut u32, node: *mut u32) -> i32 {
+    // The kernel runs on one CPU in R1.
+    if !cpu.is_null() {
+        // SAFETY: as in `__vdso_clock_gettime`.
+        unsafe { cpu.write_volatile(0) };
+    }
+    if !node.is_null() {
+        // SAFETY: as in `__vdso_clock_gettime`.
+        unsafe { node.write_volatile(0) };
+    }
+    0
+}
+
+#[panic_handler]
+fn panic(_: &PanicInfo<'_>) -> ! {
+    loop {}
+}

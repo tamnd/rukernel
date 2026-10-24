@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::auxv::{
     AT_BASE, AT_CLKTCK, AT_EGID, AT_ENTRY, AT_EUID, AT_FLAGS, AT_GID, AT_HWCAP, AT_PAGESZ, AT_PHDR,
-    AT_PHENT, AT_PHNUM, AT_SECURE, AT_UID,
+    AT_PHENT, AT_PHNUM, AT_SECURE, AT_SYSINFO_EHDR, AT_UID,
 };
 use rk_mm::{AddressSpace, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind};
 use rk_vfs::{FileType, FsContext, InodeRef, Location};
@@ -245,10 +245,12 @@ fn build(
         ..MmapRequest::anon(STACK_SIZE, Prot::RW)
     };
     space.mmap(stack)?;
+    let vdso = crate::vdso::map(&space)?;
 
     let phdr = main.header.phdr_addr().map_or(0, |a| main.bias + a as usize);
     let entry = main.bias + main.header.entry as usize;
     let auxv = [
+        (u64::from(AT_SYSINFO_EHDR), vdso as u64),
         (u64::from(AT_HWCAP), 0),
         (u64::from(AT_PAGESZ), PAGE_SIZE as u64),
         (u64::from(AT_CLKTCK), USER_HZ),

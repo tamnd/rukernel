@@ -14,3 +14,4 @@ The trusted base of the kernel. It contains the boot code, the trap and interrup
 - Budget: 25,000 lines of code, per spec/02-the-goal.md section 2.4.
 - Rules: each `unsafe` block has a `// SAFETY:` comment, and each block has one unsafe operation. Clippy checks both rules. The interfaces that rk-frame gives to the other crates are safe.
 - Audit: each pull request that changes rk-frame gets a review of each new or changed `unsafe` block against its `// SAFETY:` comment.
+- The vDSO in `frame/rk-frame/vdso` is user code, not kernel code. It is in rk-frame because it reads the data page that rk-frame writes. The same rules and the same audit apply to it.
