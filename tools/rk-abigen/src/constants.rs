@@ -213,6 +213,13 @@ const GROUPS: &[Group] = &[
         ty: "u32",
         doc: "The flags of `signalfd4`.",
     },
+    Group {
+        module: "resource",
+        header: "linux/resource.h",
+        prefixes: &["PRIO_"],
+        ty: "i32",
+        doc: "The targets and the limits of `getpriority` and `setpriority`.",
+    },
 ];
 
 /// The probe gives up after this many tries. Each try drops the macros that failed.

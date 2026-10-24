@@ -18,6 +18,7 @@ pub mod mount;
 pub mod open;
 pub mod poll;
 pub mod random;
+pub mod resource;
 pub mod sched;
 pub mod signal;
 pub mod signalfd;

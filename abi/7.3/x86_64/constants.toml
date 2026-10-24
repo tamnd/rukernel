@@ -1284,3 +1284,11 @@ TFD_IOC_SET_TICKS = 1074287616
 header = "linux/signalfd.h"
 SFD_NONBLOCK = 2048
 SFD_CLOEXEC = 524288
+
+[resource]
+header = "linux/resource.h"
+PRIO_MIN = -20
+PRIO_PROCESS = 0
+PRIO_PGRP = 1
+PRIO_USER = 2
+PRIO_MAX = 20

@@ -8,9 +8,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `/proc/PID/stat` gives the resident set size, and `/proc/PID/statm` gives the resident, shared, text and data sizes. The `cpu` lines of `/proc/stat` give the user time and the idle time.
 - The `alpine` boot test checks the values that `ps`, `top` and `pgrep` of BusyBox show. With the tools of `tools/debug/build.sh`, it also checks `ps`, `top`, `pgrep` and `pidof` of procps-ng.
+- The scheduler uses EEVDF, as Linux does. Each task gets a share of the CPU from its weight, and the task with the earliest virtual deadline runs first. The time of the scheduler comes from the TSC.
+- `getpriority`, `setpriority`, `sched_setscheduler`, `sched_getscheduler`, `sched_setparam`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`, `sched_get_priority_min`, `sched_rr_get_interval`, `sched_setaffinity`, `sched_getaffinity` and `getcpu`. The nice value sets the weight of the thread. A real time policy and `SCHED_DEADLINE` give the largest weight, and `SCHED_IDLE` gives the smallest weight.
+- `clock_gettime` and `clock_getres` accept the CPU clocks of `clock_getcpuclockid` and `pthread_getcpuclockid`.
+- The ltp boot test runs 31 more tests, most of them for the scheduling calls. `tools/ltp/build.sh` builds the getpriority, setpriority and nice tests.
 
 ### Fixed
 
+- `tools/ltp/build.sh` makes the LTP archives again after a crash of the compiler, so a failed build does not leave an archive without some objects.
 - The `alpine` boot test can copy the debug tools on macOS. A file of the tree now replaces a BusyBox link of the root file system.
 
 ## [0.2.5] (2026-10-24)

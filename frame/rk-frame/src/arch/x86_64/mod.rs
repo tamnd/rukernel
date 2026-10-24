@@ -78,7 +78,7 @@ fn interrupt(vector: u8) {
 
 /// The timer values that the architecture independent code reads.
 pub(crate) mod timer {
-    pub(crate) use super::apic::{HZ, TICKS, TIMER_HZ};
+    pub(crate) use super::apic::{HZ, TICKS, TIMER_HZ, nanos};
 }
 
 /// Interrupt control on this CPU.

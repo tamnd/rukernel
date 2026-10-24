@@ -74,8 +74,41 @@ fn clock_ns(thread: &rk_proc::Thread, clock: u32) -> Result<u64, Errno> {
         | CLOCK_BOOTTIME => Ok(uptime_ns()),
         CLOCK_PROCESS_CPUTIME_ID => Ok(ticks_ns(thread.process().user_ticks())),
         CLOCK_THREAD_CPUTIME_ID => Ok(ticks_ns(thread.user_ticks())),
+        c if (c as i32) < 0 => cpu_clock_ns(thread, c as i32),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Gives the time of the CPU clock `clock` of another thread or process, as
+/// `clock_getcpuclockid` and `pthread_getcpuclockid` make it. The clock is `!id << 3`, with 4 for
+/// a thread clock, and the kind of time in the low 2 bits. The kernel counts only the user time,
+/// so each kind gives the same time.
+fn cpu_clock_ns(thread: &rk_proc::Thread, clock: i32) -> Result<u64, Errno> {
+    const PERTHREAD: i32 = 4;
+    const KIND: i32 = 3;
+    if clock & KIND == KIND {
+        return Err(Errno::EINVAL);
+    }
+    let id = !(clock >> 3);
+    if clock & PERTHREAD != 0 {
+        let ticks = match id {
+            0 => thread.user_ticks(),
+            id => {
+                let t = rk_proc::find_thread(id as u32).ok_or(Errno::EINVAL)?;
+                // A thread clock is only for the threads of the same process.
+                if !alloc::sync::Arc::ptr_eq(t.process(), thread.process()) {
+                    return Err(Errno::EINVAL);
+                }
+                t.user_ticks()
+            }
+        };
+        return Ok(ticks_ns(ticks));
+    }
+    let process = match id {
+        0 => thread.process().clone(),
+        id => rk_proc::find_process(id as u32).ok_or(Errno::EINVAL)?,
+    };
+    Ok(ticks_ns(process.user_ticks()))
 }
 
 pub(crate) fn clock_gettime(cx: &Cx<'_>, clock: u64, tp: u64) -> SysResult {
@@ -122,7 +155,9 @@ pub(crate) fn clock_nanosleep(
     rem: u64,
 ) -> SysResult {
     let clock = clock as u32;
-    if matches!(clock, CLOCK_THREAD_CPUTIME_ID) {
+    // A thread clock cannot wait, as in Linux. rukernel does not wait on the CPU clock of another
+    // process yet.
+    if matches!(clock, CLOCK_THREAD_CPUTIME_ID) || (clock as i32) < 0 {
         return Err(Errno::EINVAL);
     }
     let now = clock_ns(cx.thread, clock)?;

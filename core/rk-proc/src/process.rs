@@ -5,6 +5,7 @@
 //! and a process that ends stays as a zombie until its parent reaps it, as in Linux.
 
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE};
+use crate::sched::SchedParams;
 use crate::signal::{
     AltStack, NSIG, Pending, SI_TIMER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
@@ -200,6 +201,8 @@ pub struct Thread {
     killable_wait: AtomicBool,
     /// The system call that the thread makes, for `/proc/PID/syscall`.
     syscall: SpinLock<SyscallInfo>,
+    /// The policy, the priority and the nice value.
+    sched: SpinLock<SchedParams>,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -649,6 +652,20 @@ impl Thread {
         self.task.lock().upgrade()
     }
 
+    /// The scheduling values.
+    pub fn sched(&self) -> SchedParams {
+        *self.sched.lock()
+    }
+
+    /// Sets the scheduling values, and gives the new share of the CPU to the scheduler.
+    pub fn set_sched(&self, params: SchedParams) {
+        *self.sched.lock() = params;
+        if let Some(task) = self.task() {
+            let (nice, idle) = params.share();
+            rk_frame::task::set_nice(&task, nice, idle);
+        }
+    }
+
     /// The address for `clear_child_tid`, or 0.
     pub fn clear_child_tid(&self) -> usize {
         self.clear_child_tid.load(Ordering::Relaxed)
@@ -912,6 +929,7 @@ impl Thread {
             no_new_privs: AtomicBool::new(false),
             killable_wait: AtomicBool::new(false),
             syscall: SpinLock::new(SyscallInfo { nr: -1, ..SyscallInfo::default() }),
+            sched: SpinLock::new(SchedParams::default()),
         })
     }
 }
@@ -1010,6 +1028,7 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
     child.set_oom_score_adj(pp.oom_score_adj());
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     thread.inherit_seccomp(parent);
+    *thread.sched.lock() = parent.sched().forked();
     child.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
@@ -1030,6 +1049,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     let tid = alloc_pid(&mut table)?;
     let new = Thread::new(tid, process.clone(), thread.blocked());
     new.inherit_seccomp(thread);
+    *new.sched.lock() = thread.sched().forked();
     table.threads.insert(tid, Arc::downgrade(&new));
     drop(table);
     process.state.lock().threads.push(new.clone());

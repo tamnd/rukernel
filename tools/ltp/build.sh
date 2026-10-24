@@ -21,7 +21,7 @@ prctl seccomp sched_setaffinity sched_getaffinity sched_getparam sched_setparam 
 sched_setscheduler sched_get_priority_max sched_get_priority_min sched_rr_get_interval
 sched_setattr sched_getattr getcpu rt_sigsuspend sigsuspend rt_sigtimedwait sigpending
 rt_sigqueueinfo tgkill sigwaitinfo sigtimedwait sigwait pause alarm timer_create timer_settime
-timer_gettime timer_delete setitimer getitimer waitid"
+timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority nice"
 
 out=${1:?usage: tools/ltp/build.sh OUT_DIR}
 mkdir -p "$out"
@@ -34,11 +34,14 @@ git clone --quiet --depth 1 --branch "$LTP_TAG" https://github.com/linux-test-pr
 cd /ltp
 make autotools >/dev/null
 ./configure LDFLAGS=-static >/dev/null
-# The compiler can crash under x86-64 emulation on an arm64 host. More serial runs continue the
-# build.
+# The compiler can crash under x86-64 emulation on an arm64 host. More runs continue the build.
+# A crash can leave an archive without some objects, so each run makes the archives again.
 build() {
-	make -C "$1" -j"$(nproc)" >/dev/null 2>&1 || make -C "$1" >/dev/null 2>&1 ||
-		make -C "$1" >/dev/null 2>&1 || make -C "$1" >/dev/null
+	for try in 1 2 3; do
+		make -C "$1" -j"$(nproc)" >/dev/null 2>&1 && return
+		find "$1" -name "*.a" -delete
+	done
+	make -C "$1" >/dev/null
 }
 build lib
 build libs
