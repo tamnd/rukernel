@@ -456,16 +456,20 @@ fn find_user_cc() -> Result<Option<UserCc>> {
 
 /// Compiles the user test program `name` from tests/user to `out`.
 fn compile_user(cc: &UserCc, name: &str, pie: bool, out: &Path) -> Result {
+    compile_c(&cc.command, if pie { cc.pie_flags } else { cc.static_flags }, name, out)
+}
+
+/// Compiles the program `name` from tests/user to `out` with the compiler `command` and `flags`.
+fn compile_c(command: &[String], flags: &[&str], name: &str, out: &Path) -> Result {
     let src = workspace_root().join("tests/user").join(format!("{name}.c"));
-    let flags = if pie { cc.pie_flags } else { cc.static_flags };
-    let status = Command::new(&cc.command[0])
-        .args(&cc.command[1..])
+    let status = Command::new(&command[0])
+        .args(&command[1..])
         .args(flags)
         .args(["-O2", "-s", "-Wall", "-Werror", "-o"])
         .arg(out)
         .arg(&src)
         .status()
-        .map_err(|e| format!("{}: {e}", cc.command[0]))?;
+        .map_err(|e| format!("{}: {e}", command[0]))?;
     if !status.success() {
         return Err(format!("{}: the compiler failed with {status}", src.display()));
     }
@@ -485,6 +489,28 @@ fn build_user(dir: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     compile_user(&cc, "hello", true, &hello)?;
     let read = |p: &Path| fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     Ok(Some((read(&init)?, read(&hello)?)))
+}
+
+/// Finds a C compiler that makes dynamic x86-64 Linux programs with glibc. `RK_GLIBC_CC` gives
+/// the command. On an x86-64 Linux host, `cc` is used. Then `zig cc -target x86_64-linux-gnu` is
+/// tried. CI must have a compiler, so that CI does not skip the `debian` test.
+fn find_glibc_cc() -> Result<Option<Vec<String>>> {
+    if let Ok(cc) = std::env::var("RK_GLIBC_CC") {
+        return Ok(Some(cc.split_whitespace().map(String::from).collect()));
+    }
+    let works = |cmd: &str, arg: &str| {
+        Command::new(cmd).arg(arg).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+    };
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && works("cc", "--version") {
+        return Ok(Some(vec![String::from("cc")]));
+    }
+    if works("zig", "version") {
+        return Ok(Some(["zig", "cc", "-target", "x86_64-linux-gnu"].map(String::from).to_vec()));
+    }
+    if std::env::var_os("CI").is_some() {
+        return Err(String::from("no C compiler for glibc programs, set RK_GLIBC_CC"));
+    }
+    Ok(None)
 }
 
 /// The static BusyBox that the `busybox` boot test runs, from the binaries of busybox.net. The
@@ -562,6 +588,9 @@ struct Rootfs {
     var: &'static str,
     /// The script that runs as /init. `set -e` stops it at the first command that fails.
     init: &'static str,
+    /// The programs from tests/user that the test compiles with glibc and puts in
+    /// /usr/local/bin with the prefix `rk-`.
+    glibc_programs: &'static [&'static str],
 }
 
 /// The root file systems of the boot tests. The Alpine programs use musl, and the Debian programs
@@ -583,6 +612,7 @@ apk info --no-network | grep -q musl
 echo one two | tr a-z A-Z | grep -q 'ONE TWO'
 echo 'alpine: done'
 ",
+        glibc_programs: &[],
     },
     Rootfs {
         name: "debian",
@@ -603,8 +633,10 @@ dpkg-query -W libc6
 apt-get --version | head -n 1
 perl -e 'print \"debian: perl $]\\n\"'
 find /etc -name debian_version | grep -q debian_version
+/usr/local/bin/rk-nptl
 echo 'debian: done'
 ",
+        glibc_programs: &["nptl"],
     },
 ];
 
@@ -638,9 +670,15 @@ fn add_tree(w: &mut rk_vfs::cpio::Writer, root: &Path, dir: &Path) -> Result {
 }
 
 /// Writes the initramfs of the boot test of `rootfs` next to the kernel: the root file system and
-/// the script of `rootfs.init` as /init. Gives `false` if there is no file for the root file system.
+/// the script of `rootfs.init` as /init. Gives `false` if there is no file for the root file
+/// system, or no compiler for its programs.
 fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
     let dir = kernel.parent().ok_or("the kernel path has no directory")?;
+    let glibc_cc = if rootfs.glibc_programs.is_empty() { None } else { find_glibc_cc()? };
+    if !rootfs.glibc_programs.is_empty() && glibc_cc.is_none() {
+        println!("{}: skipped, no C compiler for glibc, set RK_GLIBC_CC", rootfs.name);
+        return Ok(false);
+    }
     let tarball = match std::env::var_os(rootfs.var) {
         Some(path) => PathBuf::from(path),
         None => {
@@ -663,6 +701,13 @@ fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
         .map_err(|e| format!("cannot run tar: {e}"))?;
     if !status.success() {
         return Err(format!("tar cannot unpack {}", tarball.display()));
+    }
+    if let Some(cc) = glibc_cc {
+        let bin = root.join("usr/local/bin");
+        fs::create_dir_all(&bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+        for name in rootfs.glibc_programs {
+            compile_c(&cc, &["-pthread"], name, &bin.join(format!("rk-{name}")))?;
+        }
     }
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
@@ -706,9 +751,12 @@ fn ltp_tests() -> Result<Vec<String>> {
 
 /// The script that the `ltp` boot test runs as init. A test passes with the exit code 0, or 32
 /// (`TCONF`) when the test does not apply. The output of a test that fails goes to the console.
+/// `LTP_TIMEOUT_MUL` makes the timeouts of the tests 4 times longer, because QEMU without KVM is
+/// slow. For example, `futex_cmp_requeue01` forks 1000 waiters, and each waiter stops after 5
+/// seconds.
 fn ltp_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
-        "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp\n",
+        "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp LTP_TIMEOUT_MUL=4\n",
         "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
         "failed=0\nfor t in \\\n",
     ));

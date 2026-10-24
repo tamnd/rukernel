@@ -87,7 +87,7 @@ pub fn spawn_init(
             files.insert(console.clone(), false)?;
         }
     }
-    let image = exec(&thread, ExecArgs { path: path.to_vec(), argv, envp }, random16())?;
+    let image = exec(&thread, ExecArgs { path: path.to_vec(), argv, envp }, random16(), |_| {})?;
     rk_drv_tty::set_console_session(process.pid(), process.pgid());
     start_thread(thread, UserContext::new(VirtAddr::new(image.entry), VirtAddr::new(image.sp)))
 }
@@ -192,6 +192,7 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
             break status;
         }
     };
+    crate::futex::exit_robust_list(&thread);
     crate::futex::exit_clear_tid(&thread);
     rk_proc::exit_thread(&thread, status);
 }

@@ -540,6 +540,107 @@ static void test_threads(void)
 						     WIFEXITED(status) && WEXITSTATUS(status) == 7);
 }
 
+static pthread_mutex_t robust, pi;
+
+static void *lock_and_exit(void *arg)
+{
+	pthread_mutex_lock(arg);
+	return NULL;
+}
+
+static void *add_many_pi(void *arg)
+{
+	for (int i = 0; i < 500; i++) {
+		pthread_mutex_lock(&pi);
+		long v = counter;
+		if (i % 50 == 0)
+			sched_yield();
+		counter = v + 1;
+		pthread_mutex_unlock(&pi);
+	}
+	return arg;
+}
+
+static void *trylock_pi(void *arg)
+{
+	return (void *)(long)pthread_mutex_trylock(&pi);
+}
+
+static void init_mutex(pthread_mutex_t *m, int robust_attr, int protocol, int shared)
+{
+	pthread_mutexattr_t a;
+	pthread_mutexattr_init(&a);
+	pthread_mutexattr_setrobust(&a, robust_attr);
+	pthread_mutexattr_setprotocol(&a, protocol);
+	pthread_mutexattr_setpshared(&a, shared);
+	pthread_mutex_init(m, &a);
+	pthread_mutexattr_destroy(&a);
+}
+
+static void test_locks(void)
+{
+	pthread_t t[4];
+	void *ret;
+
+	init_mutex(&robust, PTHREAD_MUTEX_ROBUST, PTHREAD_PRIO_NONE, PTHREAD_PROCESS_PRIVATE);
+	pthread_create(&t[0], NULL, lock_and_exit, &robust);
+	pthread_join(t[0], NULL);
+	int r = pthread_mutex_lock(&robust);
+	check("a robust mutex of a dead thread gives EOWNERDEAD", r == EOWNERDEAD);
+	pthread_mutex_consistent(&robust);
+	pthread_mutex_unlock(&robust);
+	check("a robust mutex works after pthread_mutex_consistent",
+	      pthread_mutex_lock(&robust) == 0 && pthread_mutex_unlock(&robust) == 0);
+
+	pthread_mutex_t *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+				       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	init_mutex(shared, PTHREAD_MUTEX_ROBUST, PTHREAD_PRIO_NONE, PTHREAD_PROCESS_SHARED);
+	pid_t pid = fork();
+	if (pid == 0) {
+		pthread_mutex_lock(shared);
+		_exit(0);
+	}
+	waitpid(pid, NULL, 0);
+	r = pthread_mutex_lock(shared);
+	check("a robust mutex of a dead process gives EOWNERDEAD", r == EOWNERDEAD);
+	pthread_mutex_consistent(shared);
+	pthread_mutex_unlock(shared);
+	munmap(shared, 4096);
+
+	/* musl gives the kernel its robust list when it locks a shared robust mutex. */
+	struct robust_list_head *head = NULL;
+	size_t len = 0;
+	check("get_robust_list gives the list of the thread",
+	      syscall(SYS_get_robust_list, 0, &head, &len) == 0 && head != NULL &&
+		      len == sizeof(*head));
+	check("set_robust_list checks the length",
+	      syscall(SYS_set_robust_list, head, 1) == -1 && errno == EINVAL);
+
+	init_mutex(&pi, PTHREAD_MUTEX_STALLED, PTHREAD_PRIO_INHERIT, PTHREAD_PROCESS_PRIVATE);
+	counter = 0;
+	for (long i = 0; i < 4; i++)
+		pthread_create(&t[i], NULL, add_many_pi, (void *)i);
+	for (long i = 0; i < 4; i++)
+		pthread_join(t[i], NULL);
+	check("a priority inheritance mutex keeps the counter right", counter == 2000);
+
+	pthread_mutex_lock(&pi);
+	pthread_create(&t[0], NULL, trylock_pi, NULL);
+	pthread_join(t[0], &ret);
+	check("trylock of a priority inheritance mutex gives EBUSY", ret == (void *)EBUSY);
+	pthread_mutex_unlock(&pi);
+
+	pthread_mutex_destroy(&pi);
+	init_mutex(&pi, PTHREAD_MUTEX_ROBUST, PTHREAD_PRIO_INHERIT, PTHREAD_PROCESS_PRIVATE);
+	pthread_create(&t[0], NULL, lock_and_exit, &pi);
+	pthread_join(t[0], NULL);
+	r = pthread_mutex_lock(&pi);
+	check("a robust priority inheritance mutex of a dead thread gives EOWNERDEAD",
+	      r == EOWNERDEAD);
+	pthread_mutex_consistent(&pi);
+	pthread_mutex_unlock(&pi);
+}
+
 static void test_mount(void)
 {
 	struct statfs st;
@@ -655,6 +756,7 @@ int main(int argc, char **argv)
 	test_signals();
 	test_pipes();
 	test_threads();
+	test_locks();
 	test_mount();
 	test_proc();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)

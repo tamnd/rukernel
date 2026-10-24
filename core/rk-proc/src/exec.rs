@@ -284,14 +284,21 @@ fn build(
 
 /// Runs a new program in the process of `thread`. On success the process has the new address
 /// space, the descriptors with `FD_CLOEXEC` are closed and the name of the process is the name of
-/// the file. The caller then starts the thread at the `ExecImage` with new registers.
+/// the file. The caller then starts the thread at the `ExecImage` with new registers. `release`
+/// runs when the exec cannot fail any more, while the old address space is still there, as
+/// `exec_mm_release` of Linux does.
 ///
 /// # Errors
 ///
 /// Gives the error of the lookup of the file, `EACCES` for a file that cannot run, `ENOEXEC` for
 /// a file in a format that the kernel does not know, `E2BIG` for arguments that are too long and
 /// `ENOMEM` if no memory is free. Then the process is as it was.
-pub fn exec(thread: &Thread, args: ExecArgs, random: [u8; 16]) -> Result<ExecImage, Errno> {
+pub fn exec(
+    thread: &Thread,
+    args: ExecArgs,
+    random: [u8; 16],
+    release: fn(&Thread),
+) -> Result<ExecImage, Errno> {
     let process = thread.process();
     let fs = process.fs().ok_or(Errno::ESRCH)?;
     let ctx = fs.lock().clone();
@@ -299,6 +306,7 @@ pub fn exec(thread: &Thread, args: ExecArgs, random: [u8; 16]) -> Result<ExecIma
     let (space, image, at, argv) = build(&ctx, args, random)?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
+    release(thread);
     let space = Arc::new(space);
     space.activate();
     let old = process.replace_vm(space);

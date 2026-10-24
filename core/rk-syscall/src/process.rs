@@ -109,7 +109,9 @@ pub(crate) fn execve(cx: &mut Cx<'_>, path: u64, argv: u64, envp: u64) -> SysRes
     let mut total = 0;
     let argv = cx.read_strings(argv, &mut total)?;
     let envp = cx.read_strings(envp, &mut total)?;
-    let image = exec(cx.thread, ExecArgs { path, argv, envp }, random16())?;
+    // The new program has no robust list. The locks in the list of the old program are dead.
+    let image =
+        exec(cx.thread, ExecArgs { path, argv, envp }, random16(), crate::futex::exit_robust_list)?;
     *cx.regs = rk_frame::user::UserContext::new(
         rk_frame::addr::VirtAddr::new(image.entry),
         rk_frame::addr::VirtAddr::new(image.sp),

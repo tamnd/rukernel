@@ -71,7 +71,7 @@ tools/ltp/build.sh target/ltp
 cargo xtask boot-test ltp
 ```
 
-The `alpine` and `debian` boot tests run programs that use a dynamic loader. The `alpine` test uses the Alpine mini root file system, with musl. The `debian` test uses the Debian trixie slim root file system, with glibc. Its script runs bash, coreutils, dpkg, apt and perl. The first run downloads each root file system and checks its SHA-256. `RK_ALPINE` and `RK_DEBIAN` give the path of a different file.
+The `alpine` and `debian` boot tests run programs that use a dynamic loader. The `alpine` test uses the Alpine mini root file system, with musl. The `debian` test uses the Debian trixie slim root file system, with glibc. Its script runs bash, coreutils, dpkg, apt and perl, and then `tests/user/nptl.c`, a pthread test that the build compiles with glibc. The build uses `cc` on an x86-64 Linux host, or `zig cc -target x86_64-linux-gnu`, or the command in `RK_GLIBC_CC`. The first run downloads each root file system and checks its SHA-256. `RK_ALPINE` and `RK_DEBIAN` give the path of a different file.
 
 ## Repository layout
 
