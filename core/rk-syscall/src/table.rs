@@ -1,7 +1,7 @@
 //! The system call table: each number goes to its handler.
 
 use crate::cx::{Cx, SysResult};
-use crate::{fs, futex, info, mm, mount, poll, process, signal};
+use crate::{fs, futex, info, mm, mount, poll, process, signal, timer};
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
 
@@ -136,6 +136,14 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SYNC => Ok(0),
         nr::GETTID => Ok(u64::from(cx.thread.tid())),
         nr::TKILL => signal::tkill(cx, a[0], a[1]),
+        nr::ALARM => timer::alarm(cx, a[0]),
+        nr::GETITIMER => timer::getitimer(cx, a[0], a[1]),
+        nr::SETITIMER => timer::setitimer(cx, a[0], a[1], a[2]),
+        nr::TIMER_CREATE => timer::timer_create(cx, a[0], a[1], a[2]),
+        nr::TIMER_SETTIME => timer::timer_settime(cx, a[0], a[1], a[2], a[3]),
+        nr::TIMER_GETTIME => timer::timer_gettime(cx, a[0], a[1]),
+        nr::TIMER_GETOVERRUN => timer::timer_getoverrun(cx, a[0]),
+        nr::TIMER_DELETE => timer::timer_delete(cx, a[0]),
         nr::RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(cx, a[0], a[1], a[2], a[3]),
         nr::RT_SIGQUEUEINFO => signal::rt_sigqueueinfo(cx, a[0], a[1], a[2]),
         nr::RT_TGSIGQUEUEINFO => signal::rt_tgsigqueueinfo(cx, a[0], a[1], a[2], a[3]),

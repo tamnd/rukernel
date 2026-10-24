@@ -321,6 +321,8 @@ pub fn exec(
     // The handlers are in the old program, so they go back to the default action. The mask and
     // the pending signals stay, as POSIX tells.
     process.reset_actions();
+    // The POSIX timers go away, and the interval timers stay.
+    process.timers().clear(true);
     thread.set_altstack(crate::signal::AltStack::default());
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&path);
     process.set_comm(name);

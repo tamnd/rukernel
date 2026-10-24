@@ -314,6 +314,14 @@ impl Pending {
         Some(info)
     }
 
+    /// Counts more overruns in the pending signal of the POSIX timer `id`, if there is one, and
+    /// gives the new overrun count. A timer has one signal in the queue at most, as in Linux.
+    pub fn add_overrun(&mut self, id: u32, overrun: u32) -> Option<i32> {
+        let info = self.queue.iter_mut().find(|i| i.code == SI_TIMER && i.pid == id)?;
+        info.uid = info.uid.saturating_add(overrun).min(i32::MAX as u32);
+        Some(info.uid as i32)
+    }
+
     /// Discards each instance of `sig`.
     pub fn discard(&mut self, sig: u32) {
         self.queue.retain(|i| i.signo != sig);

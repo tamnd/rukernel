@@ -25,6 +25,8 @@ pub mod exec;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod process;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod timer;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod vdso;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

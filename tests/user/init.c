@@ -23,6 +23,7 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/statfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -329,6 +330,93 @@ static void test_sigwait(void)
 	fake.si_value.sival_int = 7;
 	check("rt_tgsigqueueinfo", syscall(SYS_rt_tgsigqueueinfo, getpid(), gettid(), SIGUSR1, &fake) == 0 &&
 	      sigwaitinfo(&set, &si) == SIGUSR1 && si.si_value.sival_int == 7);
+	sigprocmask(SIG_SETMASK, &old, NULL);
+}
+
+static void test_timers(void)
+{
+	sigset_t set, old;
+	sigemptyset(&set);
+	sigaddset(&set, SIGALRM);
+	sigaddset(&set, SIGRTMIN);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	siginfo_t si;
+
+	check("alarm with no alarm gives 0", alarm(10) == 0);
+	check("alarm gives the rest of the last alarm", alarm(0) == 10);
+
+	struct itimerval it = {{0, 0}, {1, 0}}, got;
+	check("setitimer", setitimer(ITIMER_REAL, &it, NULL) == 0);
+	check("getitimer gives the rest", getitimer(ITIMER_REAL, &got) == 0 && got.it_value.tv_sec <= 1 &&
+	      (got.it_value.tv_sec > 0 || got.it_value.tv_usec > 0));
+	struct itimerval bad = {{0, 0}, {0, 1000000}};
+	check("setitimer with a bad time gives EINVAL", setitimer(ITIMER_REAL, &bad, NULL) == -1 && errno == EINVAL);
+	check("getitimer with a bad timer gives EINVAL", getitimer(5, &got) == -1 && errno == EINVAL);
+	struct itimerval tick = {{0, 10000}, {0, 10000}};
+	setitimer(ITIMER_REAL, &tick, NULL);
+	int n = 0;
+	for (int i = 0; i < 3; i++)
+		n += sigwaitinfo(&set, &si) == SIGALRM && si.si_code == SI_KERNEL;
+	struct itimerval off = {{0, 0}, {0, 0}};
+	setitimer(ITIMER_REAL, &off, &got);
+	check("ITIMER_REAL with an interval sends SIGALRM again", n == 3 && got.it_interval.tv_usec == 10000);
+
+	pid_t pid = fork();
+	if (pid == 0) {
+		sigprocmask(SIG_SETMASK, &old, NULL);
+		struct itimerval once = {{0, 0}, {0, 20000}};
+		setitimer(ITIMER_REAL, &once, NULL);
+		for (;;)
+			pause();
+	}
+	int status;
+	check("SIGALRM of setitimer ends a child", waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
+	      WTERMSIG(status) == SIGALRM);
+
+	struct sigevent sev;
+	memset(&sev, 0, sizeof(sev));
+	sev.sigev_notify = SIGEV_SIGNAL;
+	sev.sigev_signo = SIGRTMIN;
+	sev.sigev_value.sival_int = 77;
+	timer_t t;
+	check("timer_create", timer_create(CLOCK_MONOTONIC, &sev, &t) == 0);
+	struct itimerspec ts = {{0, 0}, {0, 20 * 1000 * 1000}}, cur;
+	check("timer_settime", timer_settime(t, 0, &ts, NULL) == 0);
+	check("timer_gettime gives the rest", timer_gettime(t, &cur) == 0 && cur.it_value.tv_sec == 0 &&
+	      cur.it_value.tv_nsec > 0);
+	check("a timer sends its signal", sigwaitinfo(&set, &si) == SIGRTMIN && si.si_code == SI_TIMER &&
+	      si.si_value.sival_int == 77);
+	check("timer_gettime of a timer that fired gives 0", timer_gettime(t, &cur) == 0 &&
+	      cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec == 0);
+
+	struct itimerspec fast = {{0, 4 * 1000 * 1000}, {0, 4 * 1000 * 1000}};
+	timer_settime(t, 0, &fast, NULL);
+	struct timespec d = {0, 100 * 1000 * 1000};
+	nanosleep(&d, NULL);
+	int sig = sigwaitinfo(&set, &si);
+	check("a timer counts the signals that it did not send", sig == SIGRTMIN && si.si_overrun > 0 &&
+	      timer_getoverrun(t) > 0);
+	struct itimerspec stop = {{0, 0}, {0, 0}};
+	timer_settime(t, 0, &stop, NULL);
+	check("timer_delete", timer_delete(t) == 0);
+	check("timer_delete of a deleted timer gives EINVAL", syscall(SYS_timer_delete, 0) == -1 && errno == EINVAL);
+	check("timer_create with a bad clock gives EINVAL", timer_create(100, &sev, &t) == -1 && errno == EINVAL);
+
+	memset(&sev, 0, sizeof(sev));
+	sev.sigev_notify = SIGEV_THREAD_ID;
+	sev.sigev_signo = SIGRTMIN;
+	sev.sigev_notify_thread_id = gettid();
+	check("timer_create with SIGEV_THREAD_ID", timer_create(CLOCK_REALTIME, &sev, &t) == 0);
+	struct itimerspec soon = {{0, 0}, {0, 1000 * 1000}};
+	timer_settime(t, 0, &soon, NULL);
+	sigset_t pend;
+	sigemptyset(&pend);
+	for (int i = 0; i < 100 && !sigismember(&pend, SIGRTMIN); i++) {
+		nanosleep(&(struct timespec){0, 2 * 1000 * 1000}, NULL);
+		sigpending(&pend);
+	}
+	check("a timer sends its signal to the thread", sigwaitinfo(&set, &si) == SIGRTMIN && si.si_code == SI_TIMER);
+	timer_delete(t);
 	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
@@ -872,6 +960,7 @@ int main(int argc, char **argv)
 	test_vdso();
 	test_signals();
 	test_sigwait();
+	test_timers();
 	test_pipes();
 	test_threads();
 	test_locks();
