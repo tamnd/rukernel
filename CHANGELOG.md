@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.2.2] (2026-10-24)
+
+This release is the second part of milestone R2. It adds stop and continue, `waitid`, `restart_syscall` and the CPU time of each thread and process. The `ltp` boot test runs 183 LTP tests.
+
 ### Added
 
 - CPU time for each thread and process. The timer ticks that come while a thread runs user code are its user time. The kernel runs with interrupts off, so the system time is 0. The time of the threads that ended stays in the process, and a wait adds the time of the child to its parent.
@@ -265,6 +269,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.2.2]: https://github.com/tamnd/rukernel/releases/tag/v0.2.2
 [0.2.1]: https://github.com/tamnd/rukernel/releases/tag/v0.2.1
 [0.2.0]: https://github.com/tamnd/rukernel/releases/tag/v0.2.0
 [0.1.4]: https://github.com/tamnd/rukernel/releases/tag/v0.1.4
