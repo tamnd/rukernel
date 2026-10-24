@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.2.6] - 2026-10-24
+
 ### Added
 
 - `/proc/PID/stat` gives the resident set size, and `/proc/PID/statm` gives the resident, shared, text and data sizes. The `cpu` lines of `/proc/stat` give the user time and the idle time.
@@ -361,6 +363,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.2.6]: https://github.com/tamnd/rukernel/releases/tag/v0.2.6
 [0.2.5]: https://github.com/tamnd/rukernel/releases/tag/v0.2.5
 [0.2.4]: https://github.com/tamnd/rukernel/releases/tag/v0.2.4
 [0.2.3]: https://github.com/tamnd/rukernel/releases/tag/v0.2.3
