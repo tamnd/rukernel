@@ -4,6 +4,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `/proc/PID/stat` gives the resident set size, and `/proc/PID/statm` gives the resident, shared, text and data sizes. The `cpu` lines of `/proc/stat` give the user time and the idle time.
+- The `alpine` boot test checks the values that `ps`, `top` and `pgrep` of BusyBox show. With the tools of `tools/debug/build.sh`, it also checks `ps`, `top`, `pgrep` and `pidof` of procps-ng.
+
+### Fixed
+
+- The `alpine` boot test can copy the debug tools on macOS. A file of the tree now replaces a BusyBox link of the root file system.
+
 ## [0.2.5] (2026-10-24)
 
 This release is the fifth part of milestone R2. It adds epoll, event files, timer files and signal files. The ltp boot test runs 50 more tests, and all of them pass.

@@ -113,6 +113,14 @@ pub struct Restart {
     pub args: [u64; 3],
 }
 
+/// The user CPU time of all the threads in timer ticks, for the `cpu` line of `/proc/stat`.
+static USER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// The user CPU time of all the threads since boot, in timer ticks.
+pub fn user_ticks() -> u64 {
+    USER_TICKS.load(Ordering::Relaxed)
+}
+
 /// A process: a thread group in the words of Linux.
 pub struct Process {
     pid: Pid,
@@ -627,6 +635,7 @@ impl Thread {
     /// off, so the timer ticks only while a thread runs user code or the CPU is idle. The ticks
     /// that come while the thread runs user code are its user time, and the system time is 0.
     pub fn add_user_ticks(&self, ticks: u64) {
+        USER_TICKS.fetch_add(ticks, Ordering::Relaxed);
         self.user_ticks.fetch_add(ticks, Ordering::Relaxed);
     }
 

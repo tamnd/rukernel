@@ -165,6 +165,8 @@ pub struct Stat {
     pub start: u64,
     /// The size of the address space in bytes.
     pub vsize: u64,
+    /// The number of pages that have a frame.
+    pub rss: u64,
     /// The pending signals.
     pub pending: u64,
     /// The blocked signals.
@@ -183,7 +185,7 @@ pub fn stat(s: &Stat) -> Vec<u8> {
     let mut out = format!("{} (", s.pid).into_bytes();
     out.extend_from_slice(&s.comm);
     let rest = format!(
-        ") {} {} {} {} 0 -1 4194304 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} 0 18446744073709551615 \
+        ") {} {} {} {} 0 -1 4194304 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {} 18446744073709551615 \
          0 0 0 0 0 {} {} {} {} 0 0 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         s.state as char,
         s.ppid,
@@ -194,6 +196,7 @@ pub fn stat(s: &Stat) -> Vec<u8> {
         s.threads,
         s.start,
         s.vsize,
+        s.rss,
         s.pending,
         s.blocked,
         s.ignored,
@@ -202,6 +205,26 @@ pub fn stat(s: &Stat) -> Vec<u8> {
     );
     out.extend_from_slice(rest.as_bytes());
     out
+}
+
+/// The values of `/proc/PID/statm`, in pages.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Statm {
+    /// The size of the address space.
+    pub size: u64,
+    /// The pages that have a frame.
+    pub resident: u64,
+    /// The pages that have a frame and that a file or a shared mapping holds.
+    pub shared: u64,
+    /// The size of the areas of a file that can run.
+    pub text: u64,
+    /// The size of the private areas that can be written, and of the stack.
+    pub data: u64,
+}
+
+/// The text of `/proc/PID/statm`. The fields `lib` and `dt` are 0, as in Linux.
+pub fn statm(m: &Statm) -> Vec<u8> {
+    format!("{} {} {} {} 0 {} 0\n", m.size, m.resident, m.shared, m.text, m.data).into_bytes()
 }
 
 /// The word that `/proc/PID/status` shows after the state letter.
@@ -417,6 +440,7 @@ mod tests {
             threads: 2,
             utime: 3,
             cutime: 4,
+            rss: 5,
             exit_signal: 17,
             ..Stat::default()
         };
@@ -430,6 +454,8 @@ mod tests {
         assert_eq!(fields[11], "3");
         assert_eq!(fields[13], "4");
         assert_eq!(fields[17], "2");
+        // Field 24 is rss.
+        assert_eq!(fields[21], "5");
         assert_eq!(fields[35], "17");
     }
 
@@ -452,6 +478,12 @@ mod tests {
         assert!(text.contains("\nPid:\t6\nPPid:\t1\nTracerPid:\t3\n"));
         assert_eq!(state_name(b'Z'), "Z (zombie)");
         assert_eq!(state_name(b't'), "t (tracing stop)");
+    }
+
+    #[test]
+    fn statm_has_7_fields() {
+        let m = Statm { size: 10, resident: 4, shared: 2, text: 3, data: 5 };
+        assert_eq!(statm(&m), b"10 4 2 3 0 5 0\n");
     }
 
     #[test]
