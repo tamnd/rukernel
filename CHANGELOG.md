@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR` ioctls. They give and change the inode flags as the `FS_XFLAG_*` flags, as `xfs_io` uses them. A project id other than 0 gives `EOPNOTSUPP`, and an extent size hint gives `EINVAL`.
+
 ## [0.3.10] - 2026-10-25
 
 ### Added
