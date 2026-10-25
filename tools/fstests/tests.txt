@@ -1,4 +1,5 @@
 # The fstests tests that the fstests boot test runs on ext4.
+ext4/005
 ext4/054
 generic/001
 generic/002

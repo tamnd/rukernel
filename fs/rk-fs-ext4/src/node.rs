@@ -160,6 +160,62 @@ impl Fs {
         Ok(Some(u64::from(block)).filter(|&b| b != 0))
     }
 
+    /// Reads the block map of the file into runs of blocks that follow each other on the disk,
+    /// and the indirect blocks of the map.
+    pub(crate) fn block_map(&self, raw: &RawInode) -> Result<(Vec<Extent>, Vec<u64>)> {
+        let per = self.sb.block_size / 4;
+        let root = raw.block();
+        let mut runs = Vec::new();
+        let mut tree = Vec::new();
+        let mut lblock = 0;
+        for (i, level) in [(0..12, 0), (12..13, 1), (13..14, 2), (14..15, 3)]
+            .into_iter()
+            .flat_map(|(r, l)| r.map(move |i| (i, l)))
+        {
+            let block = u64::from(u32_at(root, i * 4));
+            self.walk_map(block, level, lblock, &mut runs, &mut tree)?;
+            lblock += per.pow(level);
+        }
+        Ok((runs, tree))
+    }
+
+    /// Adds the blocks under `block`, a block of the level `level` of the map that maps from
+    /// the block `lblock` of the file, to `runs` and `tree`.
+    fn walk_map(
+        &self,
+        block: u64,
+        level: u32,
+        lblock: u64,
+        runs: &mut Vec<Extent>,
+        tree: &mut Vec<u64>,
+    ) -> Result<()> {
+        if block == 0 {
+            return Ok(());
+        }
+        if level > 0 {
+            tree.push(block);
+            let span = (self.sb.block_size / 4).pow(level - 1);
+            let data = self.read_block(block)?;
+            for i in 0..data.len() / 4 {
+                let next = u64::from(u32_at(&data, i * 4));
+                self.walk_map(next, level - 1, lblock + i as u64 * span, runs, tree)?;
+            }
+            return Ok(());
+        }
+        let lblock = u32::try_from(lblock).map_err(|_| Errno::EFBIG)?;
+        match runs.last_mut() {
+            Some(r)
+                if r.end() == u64::from(lblock)
+                    && r.start + u64::from(r.len) == block
+                    && r.len < u32::from(EXTENT_INIT_MAX) =>
+            {
+                r.len += 1
+            }
+            _ => runs.push(Extent { lblock, len: 1, start: block, init: true }),
+        }
+        Ok(())
+    }
+
     /// Reads the data of the file at `offset`, up to the size of the file.
     pub(crate) fn read_data(&self, raw: &RawInode, offset: u64, buf: &mut [u8]) -> Result<usize> {
         if raw.flags() & flags::INLINE_DATA != 0 {
@@ -639,6 +695,54 @@ impl Tx<'_> {
 
     /// Frees the block `block` of a block map, and the blocks under it for an indirect block of
     /// the level `level`.
+    /// Moves the file `ino` from a block map to an extent tree, as `chattr +e`. The tree uses
+    /// the indirect blocks of the map first.
+    fn migrate_to_extents(&mut self, ino: u32, raw: &mut RawInode) -> Result<()> {
+        let (runs, map) = self.fs.block_map(raw)?;
+        raw.set_flags(raw.flags() | flags::EXTENTS);
+        Tx::empty_tree(raw);
+        self.build_tree(ino, raw, &runs, map)
+    }
+
+    /// Moves the file from an extent tree to a block map, as `chattr -e`. As Linux, the tree
+    /// must be only the root, with at most one extent that has data and fits in the 12 direct
+    /// blocks. Other files give `EOPNOTSUPP`.
+    fn migrate_to_block_map(raw: &mut RawInode) -> Result<()> {
+        if u16_at(raw.block(), 0) != EXTENT_MAGIC {
+            return Err(Errno::EUCLEAN);
+        }
+        if u16_at(raw.block(), 6) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let mut entries = [0u32; 12];
+        let mut extents = (0..usize::from(u16_at(raw.block(), 2))).map(|i| {
+            let e = &raw.block()[12 + i * 12..24 + i * 12];
+            (u32_at(e, 0), u16_at(e, 4), u64::from(u16_at(e, 6)) << 32 | u64::from(u32_at(e, 8)))
+        });
+        if let Some((lblock, len, start)) = extents.next() {
+            let (lblock, len) = (lblock as usize, usize::from(len));
+            if len > usize::from(EXTENT_INIT_MAX)
+                || lblock + len > entries.len()
+                || start + len as u64 > u64::from(u32::MAX)
+            {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            for (i, entry) in entries[lblock..lblock + len].iter_mut().enumerate() {
+                *entry = (start + i as u64) as u32;
+            }
+        }
+        if extents.next().is_some() {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let root = raw.block_mut();
+        root.fill(0);
+        for (i, entry) in entries.iter().enumerate() {
+            layout::put32(root, i * 4, *entry);
+        }
+        raw.set_flags(raw.flags() & !flags::EXTENTS);
+        Ok(())
+    }
+
     fn free_map(&mut self, block: u64, level: u32) -> Result<()> {
         if block == 0 {
             return Ok(());
@@ -898,10 +1002,19 @@ impl Inode for Node {
         let mut raw = self.raw();
         let old = raw.flags();
         let changed = (old ^ new) & flags::USER_MODIFIABLE;
-        // The driver cannot move a file between a block map and an extent tree, and has no
-        // names that ignore the case.
-        if changed & (flags::EXTENTS | flags::CASEFOLD) != 0 {
+        // The driver has no names that ignore the case.
+        if changed & flags::CASEFOLD != 0 {
             return Err(Errno::EOPNOTSUPP);
+        }
+        if changed & flags::EXTENTS != 0 {
+            if !matches!(self.kind(), FileType::Regular | FileType::Directory) {
+                return Err(Errno::EINVAL);
+            }
+            if new & flags::EXTENTS != 0 {
+                tx.migrate_to_extents(self.ino, &mut raw)?;
+            } else {
+                Tx::migrate_to_block_map(&mut raw)?;
+            }
         }
         raw.set_flags((old & !flags::USER_MODIFIABLE) | (new & flags::USER_MODIFIABLE));
         touch(&mut raw, false);
@@ -915,23 +1028,7 @@ impl Inode for Node {
         let extents = if raw.flags() & flags::EXTENTS != 0 {
             self.fs.extents(&raw)?.0
         } else {
-            // A file with a block map: the runs of blocks that follow each other on the disk.
-            let mut runs: Vec<Extent> = Vec::new();
-            for lblock in 0..raw.size().div_ceil(bs) {
-                let Some((block, _)) = self.fs.map(&raw, lblock)? else { continue };
-                match runs.last_mut() {
-                    Some(r) if r.end() == lblock && r.start + u64::from(r.len) == block => {
-                        r.len += 1
-                    }
-                    _ => runs.push(Extent {
-                        lblock: lblock as u32,
-                        len: 1,
-                        start: block,
-                        init: true,
-                    }),
-                }
-            }
-            runs
+            self.fs.block_map(&raw)?.0
         };
         Ok(extents
             .iter()

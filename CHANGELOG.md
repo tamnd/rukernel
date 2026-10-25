@@ -13,6 +13,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - An ext4 disk with a block size larger than 4096 does not mount and gives `EINVAL`, as Linux on a page size of 4096. Before, the mount gave `EROFS`, so `mount` tried again read-only, and generic/466 could not write to the disk.
 - `lseek` with `SEEK_DATA` and `SEEK_HOLE` finds the holes of a file from its extents, on ext4 and on an overlay over ext4. An unwritten extent is a hole. Before, all the file was data, and generic/448 did not run.
 - `sync_file_range` is a system call. It checks its arguments like Linux and syncs all the file when a flag is set. Before, it gave ENOSYS, and generic/285 stopped at its eighth test.
+- `chattr +e` and `chattr -e` on ext4. `+e` moves a file or a directory from a block map to an extent tree, and the tree uses the indirect blocks of the map first. `-e` moves a file to a block map, as Linux, only if the tree has at most one extent that has data and fits in the 12 direct blocks. ext4/005 needs it.
 
 ## [0.3.11] - 2026-10-25
 
