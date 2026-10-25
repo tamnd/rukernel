@@ -325,6 +325,7 @@ impl Node {
             size: None,
             atime: Some(m.atime),
             mtime: Some(m.mtime),
+            explicit_times: true,
         })?;
         *slot = Some(upper.clone());
         Ok(upper)

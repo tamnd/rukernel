@@ -1769,6 +1769,12 @@ static void test_iflags(void)
 	check("clearing O_APPEND on an append-only file gives EPERM",
 	      fcntl(ap, F_SETFL, 0) < 0 && errno == EPERM);
 	check("ftruncate of an append-only file gives EPERM", ftruncate(ap, 0) < 0 && errno == EPERM);
+	check("utimensat to the time now works on an append-only file", utimensat(AT_FDCWD, "/tmp/fl", NULL, 0) == 0);
+	{
+		struct timespec ts[2] = { { 1, 0 }, { 1, 0 } };
+		check("utimensat with a time on an append-only file gives EPERM",
+		      utimensat(AT_FDCWD, "/tmp/fl", ts, 0) < 0 && errno == EPERM);
+	}
 	close(ap);
 	flags = 0;
 	check("FS_IOC_SETFLAGS clears the flags", ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0);

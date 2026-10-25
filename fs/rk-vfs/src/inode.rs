@@ -181,6 +181,9 @@ pub struct SetAttr {
     pub atime: Option<Timespec>,
     /// The new modification time.
     pub mtime: Option<Timespec>,
+    /// The caller gave a time that is not the time now, as `ATTR_TIMES_SET` of Linux. An
+    /// append-only file refuses it.
+    pub explicit_times: bool,
 }
 
 /// One entry of a directory.
@@ -428,8 +431,11 @@ pub fn check_fixed(inode: &dyn Inode) -> Result<()> {
 /// Gives `EPERM` if the flags refuse the change.
 pub fn check_set_attr(inode: &dyn Inode, attr: &SetAttr) -> Result<()> {
     let flags = flags_of(inode);
-    let fixed =
-        attr.size.is_some() || attr.mode.is_some() || attr.uid.is_some() || attr.gid.is_some();
+    let fixed = attr.size.is_some()
+        || attr.mode.is_some()
+        || attr.uid.is_some()
+        || attr.gid.is_some()
+        || attr.explicit_times;
     if flags & iflags::IMMUTABLE != 0 || (flags & iflags::APPEND != 0 && fixed) {
         return Err(Errno::EPERM);
     }
