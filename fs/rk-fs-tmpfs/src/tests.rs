@@ -437,3 +437,44 @@ fn immutable_and_append_only_files() {
     assert_eq!(read_file(&fs, &root, b"/a").as_deref(), Ok(&b"xy"[..]));
     fs.remove(&root, b"/a", false).unwrap();
 }
+
+/// The calls that the VFS makes to the copies of the pages of a mapped file.
+struct Pages(rk_frame::sync::SpinLock<Vec<(u8, u64, u64)>>);
+
+impl rk_vfs::mapped::Mapped for Pages {
+    fn wrote(&self, offset: u64, data: &[u8]) {
+        self.0.lock().push((b'w', offset, data.len() as u64));
+    }
+
+    fn changed(&self, start: u64, end: u64) {
+        self.0.lock().push((b'c', start, end));
+    }
+
+    fn sync(&self, start: u64, end: u64) -> Result<()> {
+        self.0.lock().push((b's', start, end));
+        Ok(())
+    }
+}
+
+#[test]
+fn the_pages_of_a_mapped_file_see_each_change() {
+    let (fs, root) = setup();
+    write_file(&fs, &root, b"/m", b"0123456789");
+    let f = fs.open(&root, b"/m", o::O_RDWR, 0).unwrap();
+    let pages = Arc::new(Pages(rk_frame::sync::SpinLock::new(Vec::new())));
+    let mapped: Arc<dyn rk_vfs::mapped::Mapped> = pages.clone();
+    rk_vfs::mapped::register(f.inode().unwrap(), Arc::downgrade(&mapped));
+    assert_eq!(f.write_at(2, b"ab"), Ok(2));
+    assert_eq!(f.write(b"xyz"), Ok(3));
+    let mut buf = [0u8; 4];
+    assert_eq!(f.read_at(1, &mut buf), Ok(4));
+    assert_eq!(f.truncate(5), Ok(()));
+    fs.open(&root, b"/m", o::O_WRONLY | o::O_TRUNC, 0).unwrap();
+    assert_eq!(
+        *pages.0.lock(),
+        [(b'w', 2, 2), (b'w', 0, 3), (b's', 1, 5), (b'c', 5, u64::MAX), (b'c', 0, u64::MAX)]
+    );
+    // The record goes with the pages.
+    drop((mapped, pages));
+    assert_eq!(f.write_at(0, b"q"), Ok(1));
+}

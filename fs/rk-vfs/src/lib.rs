@@ -26,6 +26,7 @@ pub mod fs;
 pub mod fstype;
 pub mod inode;
 pub mod lock;
+pub mod mapped;
 pub mod path;
 pub mod pipe;
 pub mod wait;

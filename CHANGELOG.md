@@ -10,6 +10,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- A file mapping now sees a `write`, a truncate and a `fallocate` of the file at once, and a `read` sees the changes of a shared mapping, as the page cache of Linux gives. Before this change, a mapping kept its old copy of a page until the last mapping went. generic/428 passes.
 - An ext4 mount no longer frees a reserved inode, an inode past the end, or an inode that is not in use when `s_last_orphan` points to it. As Linux, such an inode ends the list of orphans and stays as it is. ext4/038 passes.
 
 ## [0.3.13] - 2026-10-26

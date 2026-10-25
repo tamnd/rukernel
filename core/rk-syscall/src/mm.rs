@@ -44,8 +44,9 @@ const DEV_ZERO: u64 = rk_vfs::device::makedev(1, 5);
 ///
 /// Each page is a copy of the file data, which the first fault reads. All the mappings of the
 /// file share the copies. A write through a shared mapping marks the page dirty, and `msync`,
-/// `munmap` and the end of the address space write the dirty pages back. A `read` or `write` of
-/// the file does not see the copies. The page cache of R2 replaces this type.
+/// `munmap` and the end of the address space write the dirty pages back. The VFS keeps the copies
+/// the same as the file through `rk_vfs::mapped`: a `write` changes them, and a `read` first
+/// writes back the dirty pages.
 pub(crate) struct FilePages {
     inode: InodeRef,
     /// The path of the file when it was first mapped.
@@ -66,16 +67,7 @@ impl MmFile for FilePages {
             return Err(Errno::EIO);
         }
         let frame = rk_frame::mm::alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
-        let mut buf = vec![0u8; PAGE_SIZE];
-        let mut done = 0;
-        while done < PAGE_SIZE {
-            let n = self.inode.read_at(offset + done as u64, &mut buf[done..])?;
-            if n == 0 {
-                break;
-            }
-            done += n;
-        }
-        frame.write_bytes(0, &buf[..done]);
+        frame.write_bytes(0, &self.read_page(offset)?);
         let frame = Arc::new(frame);
         Ok(self.pages.lock().entry(index).or_insert(frame).clone())
     }
@@ -120,6 +112,61 @@ impl MmFile for FilePages {
     }
 }
 
+impl FilePages {
+    /// Reads the page of the file at `offset`. The bytes past the end of the file are zero.
+    fn read_page(&self, offset: u64) -> Result<Vec<u8>, Errno> {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let mut done = 0;
+        while done < PAGE_SIZE {
+            let n = self.inode.read_at(offset + done as u64, &mut buf[done..])?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+        }
+        buf[done..].fill(0);
+        Ok(buf)
+    }
+
+    /// The copies of the pages that have a byte from `start` to `end` of the file.
+    fn copies(&self, start: u64, end: u64) -> Vec<(u64, Arc<Frame>)> {
+        let first = start / PAGE_SIZE as u64;
+        let last = end.div_ceil(PAGE_SIZE as u64);
+        self.pages.lock().range(first..last).map(|(i, f)| (*i, f.clone())).collect()
+    }
+}
+
+impl rk_vfs::mapped::Mapped for FilePages {
+    fn wrote(&self, offset: u64, data: &[u8]) {
+        let end = offset + data.len() as u64;
+        for (index, frame) in self.copies(offset, end) {
+            let page = index * PAGE_SIZE as u64;
+            let from = offset.max(page);
+            let to = end.min(page + PAGE_SIZE as u64);
+            let at = (from - offset) as usize;
+            frame.write_bytes((from - page) as usize, &data[at..at + (to - from) as usize]);
+        }
+    }
+
+    fn changed(&self, start: u64, end: u64) {
+        for (index, frame) in self.copies(start, end) {
+            // A page that the file cannot give becomes zeros. A later access past the end of
+            // the file then gets SIGBUS.
+            let data =
+                self.read_page(index * PAGE_SIZE as u64).unwrap_or_else(|_| vec![0; PAGE_SIZE]);
+            frame.write_bytes(0, &data);
+        }
+    }
+
+    fn sync(&self, start: u64, end: u64) -> Result<(), Errno> {
+        let first = start / PAGE_SIZE as u64;
+        if self.dirty.lock().range(first..end.div_ceil(PAGE_SIZE as u64)).next().is_none() {
+            return Ok(());
+        }
+        self.write_back(first, end.div_ceil(PAGE_SIZE as u64))
+    }
+}
+
 /// The page cache of the files that a process mapped, so that two mappings of one file share
 /// their pages.
 static MAPPED: SpinLock<BTreeMap<usize, Arc<FilePages>>> = SpinLock::new(BTreeMap::new());
@@ -134,7 +181,10 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
         .or_insert_with(|| {
             let pages = SpinLock::new(BTreeMap::new());
             let dirty = SpinLock::new(BTreeSet::new());
-            Arc::new(FilePages { inode: inode.clone(), path, pages, dirty })
+            let pages = Arc::new(FilePages { inode: inode.clone(), path, pages, dirty });
+            let mapped: Arc<dyn rk_vfs::mapped::Mapped> = pages.clone();
+            rk_vfs::mapped::register(inode, Arc::downgrade(&mapped));
+            pages
         })
         .clone()
 }
