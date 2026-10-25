@@ -218,6 +218,7 @@ impl Fs {
 
     /// Reads the data of the file at `offset`, up to the size of the file.
     pub(crate) fn read_data(&self, raw: &RawInode, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.check_shut()?;
         if raw.flags() & flags::INLINE_DATA != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -892,6 +893,10 @@ impl Drop for Node {
 impl Inode for Node {
     fn sync(&self) -> Result<()> {
         self.fs.sync()
+    }
+
+    fn shutdown(&self, flags: u32) -> Result<()> {
+        self.fs.shutdown(flags)
     }
 
     fn metadata(&self) -> Metadata {

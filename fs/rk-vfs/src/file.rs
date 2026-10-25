@@ -280,6 +280,12 @@ impl FileOps for InodeFile {
                 mem.write(arg, &bs.to_ne_bytes())?;
                 Ok(0)
             }
+            FS_IOC_GOINGDOWN => {
+                let mut b = [0u8; 4];
+                mem.read(arg, &mut b)?;
+                inode.shutdown(u32::from_ne_bytes(b))?;
+                Ok(0)
+            }
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
             fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
@@ -291,6 +297,9 @@ impl FileOps for InodeFile {
 const FIBMAP: u32 = 1;
 /// `_IO(0, 2)`. Gives the block size.
 const FIGETBSZ: u32 = 2;
+/// `_IOR('X', 125, __u32)`. Stops the file system, as `EXT4_IOC_SHUTDOWN` and
+/// `XFS_IOC_GOINGDOWN`.
+const FS_IOC_GOINGDOWN: u32 = 0x8004_587d;
 /// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 /// `_IOW('f', 2, long)`.
