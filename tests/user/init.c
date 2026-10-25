@@ -126,6 +126,57 @@ static void test_creds(void)
 	check("init is root after the child", getuid() == 0 && geteuid() == 0);
 }
 
+static void test_perms(void)
+{
+	int fd = open("/tmp/perm.secret", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	close(fd);
+	check("mkdir for the permission test",
+	      mkdir("/tmp/perm.priv", 0700) == 0 && mkdir("/tmp/perm.sticky", 0777) == 0 &&
+		      chmod("/tmp/perm.sticky", 01777) == 0 && mkdir("/tmp/perm.sg", 0777) == 0 &&
+		      chmod("/tmp/perm.sg", 02777) == 0 && chown("/tmp/perm.sg", 0, 50) == 0);
+	fd = open("/tmp/perm.sticky/root", O_WRONLY | O_CREAT, 0666);
+	close(fd);
+	pid_t pid = fork();
+	if (pid == 0) {
+		gid_t groups[1] = {50};
+		failed = 0;
+		struct stat st;
+		check("the permission child becomes a user",
+		      syscall(SYS_setgroups, 1, groups) == 0 &&
+			      syscall(SYS_setresgid, 100, 100, 100) == 0 &&
+			      syscall(SYS_setresuid, 1000, 1000, 1000) == 0);
+		check("open of a file of root with the mode 0600 gives EACCES",
+		      open("/tmp/perm.secret", O_RDONLY) == -1 && errno == EACCES);
+		check("access gives EACCES",
+		      access("/tmp/perm.secret", R_OK) == -1 && errno == EACCES &&
+			      access("/tmp/perm.secret", F_OK) == 0);
+		check("create in a directory of root gives EACCES",
+		      open("/tmp/perm.new", O_WRONLY | O_CREAT, 0644) == -1 && errno == EACCES);
+		check("chdir to a directory without search permission gives EACCES",
+		      chdir("/tmp/perm.priv") == -1 && errno == EACCES);
+		check("a walk through a directory without search permission gives EACCES",
+		      stat("/tmp/perm.priv/x", &st) == -1 && errno == EACCES);
+		fd = open("/tmp/perm.sticky/mine", O_RDWR | O_CREAT, 0);
+		check("open with O_CREAT and the mode 0 can write", fd >= 0 && write(fd, "x", 1) == 1);
+		close(fd);
+		check("a new file has the owner and the group of the process",
+		      stat("/tmp/perm.sticky/mine", &st) == 0 && st.st_uid == 1000 && st.st_gid == 100);
+		check("unlink of a file of root in a sticky directory gives EPERM",
+		      unlink("/tmp/perm.sticky/root") == -1 && errno == EPERM);
+		check("unlink of an own file in a sticky directory", unlink("/tmp/perm.sticky/mine") == 0);
+		check("mknod of a device without CAP_MKNOD gives EPERM",
+		      mknod("/tmp/perm.sticky/null", S_IFCHR | 0666, makedev(1, 3)) == -1 &&
+			      errno == EPERM);
+		check("a directory in a set-group-ID directory gets its group and the bit",
+		      mkdir("/tmp/perm.sg/d", 0755) == 0 && stat("/tmp/perm.sg/d", &st) == 0 &&
+			      st.st_gid == 50 && (st.st_mode & S_ISGID));
+		_exit(failed);
+	}
+	int status;
+	check("the permission child passes",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void test_uname(void)
 {
 	struct utsname u;
@@ -2613,6 +2664,7 @@ int main(int argc, char **argv)
 	test_uname();
 	test_memory();
 	test_files();
+	test_perms();
 	test_devices();
 	test_fork();
 	test_exec();

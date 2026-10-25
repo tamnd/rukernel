@@ -74,14 +74,14 @@ fn read_full(inode: &InodeRef, offset: u64, buf: &mut [u8]) -> Result<usize, Err
     Ok(done)
 }
 
-/// Finds an executable file. Gives `EACCES` for a file that is not a regular file or has no
-/// execute bit.
+/// Finds an executable file. Gives `EACCES` for a file that is not a regular file or that the
+/// process cannot run.
 fn open_exec(fs: &FsContext, path: &[u8]) -> Result<Location, Errno> {
     let at = fs.resolve(fs.cwd(), path, true)?;
-    let meta = at.inode().metadata();
-    if meta.file_type() != Some(FileType::Regular) || meta.mode & 0o111 == 0 {
+    if at.inode().metadata().file_type() != Some(FileType::Regular) {
         return Err(Errno::EACCES);
     }
+    fs.permission(&at, rk_vfs::cred::may::EXEC)?;
     Ok(at)
 }
 
@@ -315,7 +315,8 @@ pub fn exec(
 ) -> Result<ExecImage, Errno> {
     let process = thread.process();
     let fs = process.fs().ok_or(Errno::ESRCH)?;
-    let ctx = fs.lock().clone();
+    let mut ctx = fs.lock().clone();
+    ctx.set_cred(process.cred());
     let path = args.path.clone();
     // A tracer cannot follow a program that gets more rights, so the bits have no effect then.
     let no_setid = thread.no_new_privs() || thread.is_traced();

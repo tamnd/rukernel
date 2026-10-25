@@ -5,8 +5,11 @@
 //! `mkdirat`, `unlinkat`, `renameat2` and the others. The caller gives the start of a relative
 //! path, which is the current directory or the directory of a descriptor.
 //!
-//! In R1 each process runs as root, so the VFS does not examine the permission bits yet.
+//! The context holds the credentials of the process, and the operations check the permission bits
+//! with them, as `inode_permission` of Linux. A copy of the context of a process holds its
+//! credentials at the time of the copy.
 
+use crate::cred::{Cred, cap, may};
 use crate::dentry::{Location, MountNamespace, MountSource};
 use crate::device;
 use crate::file::File;
@@ -24,13 +27,14 @@ pub mod rename_flags {
     pub use rk_abi::native::at::{AT_RENAME_EXCHANGE, AT_RENAME_NOREPLACE, AT_RENAME_WHITEOUT};
 }
 
-/// The name space, the root, the current directory and the umask of a process.
+/// The name space, the root, the current directory, the umask and the credentials of a process.
 #[derive(Clone)]
 pub struct FsContext {
     ns: Arc<MountNamespace>,
     root: Location,
     cwd: Location,
     umask: u32,
+    cred: Arc<Cred>,
 }
 
 impl core::fmt::Debug for FsContext {
@@ -49,7 +53,64 @@ impl FsContext {
     /// directory. The umask is 022, as Linux gives to init.
     pub fn new(ns: Arc<MountNamespace>) -> Self {
         let root = ns.root();
-        Self { ns, cwd: root.clone(), root, umask: 0o022 }
+        Self { ns, cwd: root.clone(), root, umask: 0o022, cred: Arc::new(Cred::root()) }
+    }
+
+    /// The credentials that the checks use.
+    pub fn cred(&self) -> &Arc<Cred> {
+        &self.cred
+    }
+
+    /// Sets the credentials that the checks use.
+    pub fn set_cred(&mut self, cred: Arc<Cred>) {
+        self.cred = cred;
+    }
+
+    /// Checks the access `mask` (the bits of [`may`]) to the file at `at`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EACCES` if the access is not allowed.
+    pub fn permission(&self, at: &Location, mask: u32) -> Result<()> {
+        self.cred.permission(&at.inode().metadata(), mask)
+    }
+
+    /// Checks that the process can make its current directory or its root at `at`: it must be a
+    /// directory that the process can search.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOTDIR` or `EACCES`.
+    pub fn check_dir(&self, at: &Location) -> Result<()> {
+        let meta = at.inode().metadata();
+        if !meta.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        self.cred.permission(&meta, may::EXEC)
+    }
+
+    /// Checks that the process can add or remove a name in the directory `dir`.
+    fn may_change(&self, dir: &Location) -> Result<()> {
+        self.permission(dir, may::WRITE | may::EXEC)
+    }
+
+    /// Gives the new inode `inode` in the directory `dir` the owner and the group of the
+    /// process, as `inode_init_owner` of Linux.
+    fn init_owner(&self, dir: &Location, inode: &InodeRef) -> Result<()> {
+        let meta = inode.metadata();
+        let kind = meta.file_type().ok_or(Errno::EIO)?;
+        let perm = meta.mode & 0o7777;
+        let (uid, gid, new) = self.cred.new_owner(&dir.inode().metadata(), kind, perm);
+        if (uid, gid, new) == (meta.uid, meta.gid, perm) {
+            return Ok(());
+        }
+        let attr = SetAttr {
+            uid: (uid != meta.uid).then_some(uid),
+            gid: (gid != meta.gid).then_some(gid),
+            mode: (new != perm).then_some(new),
+            ..SetAttr::default()
+        };
+        inode.set_attr(&attr)
     }
 
     /// The mount name space.
@@ -78,7 +139,7 @@ impl FsContext {
     }
 
     fn walk(&self) -> Walk<'_> {
-        Walk::new(&self.ns, &self.root)
+        Walk::new(&self.ns, &self.root, &self.cred)
     }
 
     /// Gives the location of `path`, from `start` for a relative path.
@@ -98,9 +159,7 @@ impl FsContext {
 
     /// `fchdir`, and the end of `chdir`.
     pub fn set_cwd(&mut self, at: Location) -> Result<()> {
-        if !at.inode().metadata().is_dir() {
-            return Err(Errno::ENOTDIR);
-        }
+        self.check_dir(&at)?;
         self.cwd = at;
         Ok(())
     }
@@ -108,9 +167,7 @@ impl FsContext {
     /// `chroot`.
     pub fn chroot(&mut self, start: &Location, path: &[u8]) -> Result<()> {
         let at = self.resolve(start, path, true)?;
-        if !at.inode().metadata().is_dir() {
-            return Err(Errno::ENOTDIR);
-        }
+        self.check_dir(&at)?;
         self.root = at;
         Ok(())
     }
@@ -131,6 +188,7 @@ impl FsContext {
             return Err(Errno::EOPNOTSUPP);
         }
         let follow = flags & o::O_NOFOLLOW == 0;
+        let mut created = false;
         let at = if flags & o::O_CREAT != 0 {
             let parent = self.parent(start, path)?;
             if parent.trailing_slash {
@@ -143,10 +201,13 @@ impl FsContext {
                 }
                 Ok(at) => at,
                 Err(e) if e == Errno::ENOENT && !parent.is_dot() => {
+                    self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
                     let perm = perm & mode::PERM_MASK & !self.umask;
                     let inode =
                         parent.dir.inode().create(&parent.name, FileType::Regular, perm, 0)?;
+                    self.init_owner(&parent.dir, &inode)?;
+                    created = true;
                     let dentry = parent.dir.dentry.add_child(&parent.name, inode);
                     Location { mount: parent.dir.mount.clone(), dentry }
                 }
@@ -155,11 +216,17 @@ impl FsContext {
         } else {
             self.resolve(start, path, follow)?
         };
-        self.open_at(at, flags)
+        self.open_inode(at, flags, created)
     }
 
     /// Opens the inode at `at`, after the walk.
     pub fn open_at(&self, at: Location, flags: u32) -> Result<Arc<File>> {
+        self.open_inode(at, flags, false)
+    }
+
+    /// Opens the inode at `at`. An open that made the file does not check the permission bits,
+    /// so that `open` with `O_CREAT` and the mode 0 gives a descriptor that can write.
+    fn open_inode(&self, at: Location, flags: u32, created: bool) -> Result<Arc<File>> {
         let meta = at.inode().metadata();
         let kind = meta.file_type().ok_or(Errno::EIO)?;
         if flags & o::O_PATH != 0 {
@@ -187,8 +254,16 @@ impl FsContext {
                 return Err(Errno::EPERM);
             }
         }
+        if kind == FileType::Directory && (write || flags & o::O_CREAT != 0) {
+            return Err(Errno::EISDIR);
+        }
+        if !created {
+            self.cred.permission(&meta, open_mask(flags))?;
+        }
+        if flags & o::O_NOATIME != 0 && !self.cred.owns(&meta) {
+            return Err(Errno::EPERM);
+        }
         match kind {
-            FileType::Directory if write || flags & o::O_CREAT != 0 => Err(Errno::EISDIR),
             FileType::Regular | FileType::Directory => {
                 if kind == FileType::Regular && write && flags & o::O_TRUNC != 0 {
                     at.inode().set_attr(&SetAttr { size: Some(0), ..SetAttr::default() })?;
@@ -238,8 +313,10 @@ impl FsContext {
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
         }
+        self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         let inode = f(parent.dir.inode(), &parent.name)?;
+        self.init_owner(&parent.dir, &inode)?;
         let dentry = parent.dir.dentry.add_child(&parent.name, inode);
         Ok(Location { mount: parent.dir.mount, dentry })
     }
@@ -261,7 +338,14 @@ impl FsContext {
             return Err(Errno::EINVAL);
         }
         let perm = mode & mode::PERM_MASK & !self.umask;
-        self.make(start, path, |dir, name| dir.create(name, kind, perm, rdev))
+        self.make(start, path, |dir, name| {
+            if matches!(kind, FileType::CharDevice | FileType::BlockDevice)
+                && !self.cred.capable(cap::MKNOD)
+            {
+                return Err(Errno::EPERM);
+            }
+            dir.create(name, kind, perm, rdev)
+        })
     }
 
     /// `symlinkat`.
@@ -284,6 +368,7 @@ impl FsContext {
         if !Arc::ptr_eq(&parent.dir.mount, &old.mount) {
             return Err(Errno::EXDEV);
         }
+        self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         check_fixed(&**old.inode())?;
         parent.dir.inode().link(&parent.name, old.inode())?;
@@ -311,8 +396,10 @@ impl FsContext {
         }
         let at = self.child(&parent)?;
         let is_dir = is_type(at.inode(), FileType::Directory);
-        // The checks of the inode flags of `may_delete` of Linux.
+        // The checks of `may_delete` of Linux.
+        self.may_change(&parent.dir)?;
         check_fixed(&**parent.dir.inode())?;
+        self.cred.check_sticky(&parent.dir.inode().metadata(), &at.inode().metadata())?;
         check_fixed(&**at.inode())?;
         if dir {
             if !is_dir {
@@ -388,13 +475,21 @@ impl FsContext {
         if from_dir && new.dir.dentry.is_under(&from.dentry) {
             return Err(Errno::EINVAL);
         }
-        // The checks of the inode flags of `may_delete` and `may_create` of Linux.
+        // The checks of `may_delete` and `may_create` of Linux. A directory that moves to a new
+        // parent must be writable, because its `..` changes.
+        self.may_change(&old.dir)?;
         check_fixed(&**old.dir.inode())?;
+        self.cred.check_sticky(&old.dir.inode().metadata(), &from.inode().metadata())?;
         check_fixed(&**from.inode())?;
+        self.may_change(&new.dir)?;
         check_immutable(&**new.dir.inode())?;
         if let Some(to) = &to {
             check_fixed(&**new.dir.inode())?;
+            self.cred.check_sticky(&new.dir.inode().metadata(), &to.inode().metadata())?;
             check_fixed(&**to.inode())?;
+        }
+        if from_dir && !Arc::ptr_eq(old.dir.inode(), new.dir.inode()) {
+            self.permission(&from, may::WRITE)?;
         }
         old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);
@@ -418,6 +513,16 @@ impl FsContext {
         let at = self.resolve(start, path, true)?;
         self.ns.mount(root, &at, source).map(drop)
     }
+}
+
+/// The access that an open with `flags` needs, as `ACC_MODE` of Linux. `O_TRUNC` needs write.
+fn open_mask(flags: u32) -> u32 {
+    let mask = match flags & o::O_ACCMODE {
+        o::O_RDONLY => may::READ,
+        o::O_WRONLY => may::WRITE,
+        _ => may::READ | may::WRITE,
+    };
+    if flags & o::O_TRUNC != 0 { mask | may::WRITE } else { mask }
 }
 
 fn is_type(inode: &InodeRef, kind: FileType) -> bool {

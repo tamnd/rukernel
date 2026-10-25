@@ -4,6 +4,7 @@
 //! relative path. It goes through each component, goes down into a mount and up out of a mount,
 //! and follows symbolic links. It stops at the root of the process for `..`, so a `chroot` holds.
 
+use crate::cred::{Cred, may};
 use crate::dentry::{Location, MountNamespace};
 use crate::inode::{FileType, Result};
 use alloc::vec::Vec;
@@ -22,6 +23,7 @@ pub const PATH_MAX: usize = 4096;
 pub struct Walk<'a> {
     ns: &'a MountNamespace,
     root: &'a Location,
+    cred: &'a Cred,
     links: u32,
 }
 
@@ -57,9 +59,20 @@ fn is_dir(at: &Location) -> bool {
 }
 
 impl<'a> Walk<'a> {
-    /// Starts a walk in the name space `ns` for a process with the root `root`.
-    pub fn new(ns: &'a MountNamespace, root: &'a Location) -> Self {
-        Self { ns, root, links: 0 }
+    /// Starts a walk in the name space `ns` for a process with the root `root` and the
+    /// credentials `cred`. The walk needs the search permission on each directory that it goes
+    /// through.
+    pub fn new(ns: &'a MountNamespace, root: &'a Location, cred: &'a Cred) -> Self {
+        Self { ns, root, cred, links: 0 }
+    }
+
+    /// Checks that the walk can look up a name in the directory `at`, as `may_lookup` of Linux.
+    fn may_lookup(&self, at: &Location) -> Result<()> {
+        let meta = at.inode().metadata();
+        if !meta.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        self.cred.permission(&meta, may::EXEC)
     }
 
     /// Gives the location of `path`. A relative path starts at `start`. If `follow` is `false`, a
@@ -117,9 +130,7 @@ impl<'a> Walk<'a> {
         while let Some(part) = rest.pop() {
             at = self.step(&at, &part, &mut rest)?;
         }
-        if !is_dir(&at) {
-            return Err(Errno::ENOTDIR);
-        }
+        self.may_lookup(&at)?;
         if last.len() > NAME_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
@@ -129,9 +140,7 @@ impl<'a> Walk<'a> {
     /// Goes from the directory `at` to the component `part`. For a symbolic link, it adds the
     /// components of the target to `rest` and gives the place where the target starts.
     fn step(&mut self, at: &Location, part: &[u8], rest: &mut Vec<Vec<u8>>) -> Result<Location> {
-        if !is_dir(at) {
-            return Err(Errno::ENOTDIR);
-        }
+        self.may_lookup(at)?;
         match part {
             b"." => Ok(at.clone()),
             b".." => Ok(self.up(at)),

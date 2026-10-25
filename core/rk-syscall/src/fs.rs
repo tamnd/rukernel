@@ -3,7 +3,9 @@
 use crate::cx::{Cx, PATH_MAX, SysResult, UserMem};
 use alloc::vec;
 use rk_abi::Errno;
-use rk_abi::native::at::{AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW};
+use rk_abi::native::at::{
+    AT_EACCESS, AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+};
 use rk_abi::native::fcntl::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETPIPE_SZ, F_OFD_GETLK, F_OFD_SETLK,
     F_OFD_SETLKW, F_RDLCK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETPIPE_SZ, F_UNLCK, F_WRLCK,
@@ -649,15 +651,16 @@ pub(crate) fn getcwd(cx: &Cx<'_>, buf: u64, size: u64) -> SysResult {
 
 pub(crate) fn chdir(cx: &Cx<'_>, path: u64) -> SysResult {
     let path = cx.read_path(path)?;
-    let shared = cx.fs_shared()?;
-    let fs = shared.lock().clone();
+    let fs = cx.fs()?;
     let at = fs.resolve(fs.cwd(), &path, true)?;
-    shared.lock().set_cwd(at)?;
+    fs.check_dir(&at)?;
+    cx.fs_shared()?.lock().set_cwd(at)?;
     Ok(0)
 }
 
 pub(crate) fn fchdir(cx: &Cx<'_>, fd: u64) -> SysResult {
     let at = cx.file(fd)?.location().ok_or(Errno::ENOTDIR)?.clone();
+    cx.fs()?.check_dir(&at)?;
     cx.fs_shared()?.lock().set_cwd(at)?;
     Ok(0)
 }
@@ -812,12 +815,18 @@ pub(crate) fn faccessat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     if mode & !7 != 0 {
         return Err(Errno::EINVAL);
     }
-    let meta = lookup_meta(cx, dirfd, path, flags as u32)?;
-    // The caller is root in R1. Root can read and write each file, and can run a file that has
-    // an execute bit or is a directory.
-    if mode & 1 != 0 && meta.mode & 0o111 == 0 && !meta.is_dir() {
-        return Err(Errno::EACCES);
+    let flags = flags as u32;
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as u32 != 0 {
+        return Err(Errno::EINVAL);
     }
+    let meta = lookup_meta(cx, dirfd, path, flags)?;
+    if mode == 0 {
+        return Ok(0);
+    }
+    // Without `AT_EACCESS`, the check uses the real IDs, as `access_override_creds` of Linux.
+    let cred = cx.process().cred();
+    let cred = if flags & AT_EACCESS as u32 == 0 { cred.for_access() } else { (*cred).clone() };
+    cred.permission(&meta, mode as u32)?;
     Ok(0)
 }
 
@@ -831,6 +840,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     if at.inode().metadata().is_dir() {
         return Err(Errno::EISDIR);
     }
+    fs.permission(&at, rk_vfs::cred::may::WRITE)?;
     let attr = SetAttr { size: Some(size), ..SetAttr::default() };
     rk_vfs::inode::check_set_attr(&**at.inode(), &attr)?;
     at.inode().set_attr(&attr)?;
