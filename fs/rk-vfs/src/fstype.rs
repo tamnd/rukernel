@@ -18,8 +18,11 @@ pub struct FsType {
     pub make: fn(&MountArgs<'_>) -> Result<InodeRef>,
 }
 
+/// Finds the inode of a path, from the current directory of the caller of `mount(2)`.
+pub type LookupFn<'a> = &'a dyn Fn(&[u8]) -> Result<InodeRef>;
+
 /// The arguments of `mount(2)` for the constructor of a file system type.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct MountArgs<'a> {
     /// The data string, which holds the options of the file system.
     pub data: &'a [u8],
@@ -27,6 +30,26 @@ pub struct MountArgs<'a> {
     pub dev: Option<u64>,
     /// `MS_RDONLY`: the file system does not accept changes.
     pub read_only: bool,
+    /// Finds a path of the options, for a file system that uses other directories, as the
+    /// layers of overlayfs. `None` gives `ENOENT` for each path.
+    pub lookup: Option<LookupFn<'a>>,
+}
+
+impl MountArgs<'_> {
+    /// Finds the inode of the path `path` of an option.
+    pub fn lookup(&self, path: &[u8]) -> Result<InodeRef> {
+        self.lookup.ok_or(rk_abi::Errno::ENOENT)?(path)
+    }
+}
+
+impl core::fmt::Debug for MountArgs<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MountArgs")
+            .field("data", &self.data)
+            .field("dev", &self.dev)
+            .field("read_only", &self.read_only)
+            .finish_non_exhaustive()
+    }
 }
 
 static TYPES: SpinLock<Vec<FsType>> = SpinLock::new(Vec::new());

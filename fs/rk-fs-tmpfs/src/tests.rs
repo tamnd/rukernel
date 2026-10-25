@@ -331,15 +331,19 @@ fn descriptor_table() {
 #[test]
 fn mount_options() {
     let root =
-        mount(&MountArgs { data: b"size=1m,mode=700", dev: None, read_only: false }).unwrap();
+        mount(&MountArgs { data: b"size=1m,mode=700", dev: None, read_only: false, lookup: None })
+            .unwrap();
     assert_eq!(root.metadata().mode, mode::S_IFDIR | 0o700);
     assert_eq!(root.fs_magic(), TMPFS_MAGIC);
     assert_eq!(
-        mount(&MountArgs { data: b"", dev: None, read_only: false }).unwrap().metadata().mode,
+        mount(&MountArgs { data: b"", dev: None, read_only: false, lookup: None })
+            .unwrap()
+            .metadata()
+            .mode,
         mode::S_IFDIR | 0o1777
     );
     assert_eq!(
-        mount(&MountArgs { data: b"mode=9", dev: None, read_only: false }).err(),
+        mount(&MountArgs { data: b"mode=9", dev: None, read_only: false, lookup: None }).err(),
         Some(Errno::EINVAL)
     );
 }
