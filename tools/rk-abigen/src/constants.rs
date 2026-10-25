@@ -22,6 +22,9 @@ struct Group {
     header: &'static str,
     /// A macro is in the group if its name starts with one of these prefixes.
     prefixes: &'static [&'static str],
+    /// The constants of a C `enum` in the group. They are not macros, so a prefix does not find
+    /// them.
+    enums: &'static [&'static str],
     /// The Rust type of the constants. Each value must fit in it.
     ty: &'static str,
     /// The first line of the module documentation.
@@ -34,6 +37,7 @@ const GROUPS: &[Group] = &[
         module: "errno",
         header: "asm/errno.h",
         prefixes: &["E"],
+        enums: &[],
         ty: "u16",
         doc: "The error numbers.",
     },
@@ -41,6 +45,7 @@ const GROUPS: &[Group] = &[
         module: "open",
         header: "linux/fcntl.h",
         prefixes: &["O_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags of `open`.",
     },
@@ -48,6 +53,7 @@ const GROUPS: &[Group] = &[
         module: "fcntl",
         header: "linux/fcntl.h",
         prefixes: &["F_", "FD_"],
+        enums: &[],
         // The special descriptors, for example `FD_PIDFS_ROOT`, are less than zero.
         ty: "i32",
         doc: "The commands and flags of `fcntl`, and the special file descriptors.",
@@ -56,6 +62,7 @@ const GROUPS: &[Group] = &[
         module: "dnotify",
         header: "linux/fcntl.h",
         prefixes: &["DN_"],
+        enums: &[],
         ty: "u32",
         doc: "The events of `F_NOTIFY`.",
     },
@@ -63,6 +70,7 @@ const GROUPS: &[Group] = &[
         module: "at",
         header: "linux/fcntl.h",
         prefixes: &["AT_"],
+        enums: &[],
         ty: "i32",
         doc: "The directory file descriptor and the flags of the `*at` calls.",
     },
@@ -70,6 +78,7 @@ const GROUPS: &[Group] = &[
         module: "mman",
         header: "linux/mman.h",
         prefixes: &["PROT_", "MAP_", "MREMAP_", "MS_", "MCL_", "MADV_", "MLOCK_", "PKEY_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags of `mmap`, `mprotect`, `mremap`, `msync`, `mlock` and `madvise`.",
     },
@@ -77,6 +86,7 @@ const GROUPS: &[Group] = &[
         module: "sched",
         header: "linux/sched.h",
         prefixes: &["CLONE_", "CSIGNAL", "SCHED_"],
+        enums: &[],
         ty: "u64",
         doc: "The flags of `clone` and `clone3`, and the scheduler policies.",
     },
@@ -84,6 +94,7 @@ const GROUPS: &[Group] = &[
         module: "signal",
         header: "asm/signal.h",
         prefixes: &["SIG", "SA_", "SS_", "MINSIGSTKSZ"],
+        enums: &[],
         ty: "u32",
         doc: "The signal numbers and the flags of `sigaction` and `sigaltstack`.",
     },
@@ -91,6 +102,7 @@ const GROUPS: &[Group] = &[
         module: "wait",
         header: "linux/wait.h",
         prefixes: &["W", "P_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags and the ID types of `wait4` and `waitid`.",
     },
@@ -98,20 +110,42 @@ const GROUPS: &[Group] = &[
         module: "futex",
         header: "linux/futex.h",
         prefixes: &["FUTEX_", "FUTEX2_", "ROBUST_LIST_"],
+        enums: &[],
         ty: "u32",
         doc: "The operations and flags of `futex`.",
     },
     Group {
         module: "mount",
         header: "linux/mount.h",
-        prefixes: &["MS_", "MNT_"],
+        prefixes: &[
+            "MS_",
+            "MNT_",
+            "FSOPEN_",
+            "FSMOUNT_",
+            "FSPICK_",
+            "MOVE_MOUNT_",
+            "OPEN_TREE_",
+            "MOUNT_ATTR_",
+        ],
+        enums: &[
+            "FSCONFIG_SET_FLAG",
+            "FSCONFIG_SET_STRING",
+            "FSCONFIG_SET_BINARY",
+            "FSCONFIG_SET_PATH",
+            "FSCONFIG_SET_PATH_EMPTY",
+            "FSCONFIG_SET_FD",
+            "FSCONFIG_CMD_CREATE",
+            "FSCONFIG_CMD_RECONFIGURE",
+            "FSCONFIG_CMD_CREATE_EXCL",
+        ],
         ty: "u32",
-        doc: "The flags of `mount` and `umount2`.",
+        doc: "The flags of `mount` and `umount2`, and of the calls of the new mount API.",
     },
     Group {
         module: "time",
         header: "linux/time.h",
         prefixes: &["CLOCK_", "TIMER_", "ITIMER_"],
+        enums: &[],
         ty: "u32",
         doc: "The clock IDs and the timer flags.",
     },
@@ -119,6 +153,7 @@ const GROUPS: &[Group] = &[
         module: "poll",
         header: "asm/poll.h",
         prefixes: &["POLL"],
+        enums: &[],
         ty: "u32",
         doc: "The events of `poll`.",
     },
@@ -126,6 +161,7 @@ const GROUPS: &[Group] = &[
         module: "stat",
         header: "linux/stat.h",
         prefixes: &["S_I", "STATX_"],
+        enums: &[],
         ty: "u32",
         doc: "The file type and mode bits of `st_mode`, and the masks and attributes of `statx`.",
     },
@@ -133,6 +169,7 @@ const GROUPS: &[Group] = &[
         module: "ioctls",
         header: "asm/ioctls.h",
         prefixes: &["TC", "TIOC", "FIO", "FIONREAD", "FIONBIO"],
+        enums: &[],
         ty: "u32",
         doc: "The generic `ioctl` commands of terminals and files.",
     },
@@ -140,6 +177,7 @@ const GROUPS: &[Group] = &[
         module: "termbits",
         header: "asm/termbits.h",
         prefixes: &[""],
+        enums: &[],
         ty: "u32",
         doc: "The flags, the control characters and the speeds of `struct termios`.",
     },
@@ -147,6 +185,7 @@ const GROUPS: &[Group] = &[
         module: "auxv",
         header: "linux/auxvec.h",
         prefixes: &["AT_"],
+        enums: &[],
         ty: "u32",
         doc: "The types of the entries of the auxiliary vector.",
     },
@@ -154,6 +193,7 @@ const GROUPS: &[Group] = &[
         module: "elf",
         header: "linux/elf.h",
         prefixes: &["ET_", "PT_", "PF_", "EM_", "ELFCLASS", "ELFDATA", "EV_", "EI_", "ELFOSABI_"],
+        enums: &[],
         ty: "u32",
         doc: "The values of the ELF header and the program header.",
     },
@@ -161,6 +201,7 @@ const GROUPS: &[Group] = &[
         module: "socket",
         header: "asm/socket.h",
         prefixes: &["SO_", "SCM_", "SOL_SOCKET"],
+        enums: &[],
         ty: "u32",
         doc: "The options of `getsockopt` and `setsockopt` at the level `SOL_SOCKET`, and the types of the control messages.",
     },
@@ -168,6 +209,7 @@ const GROUPS: &[Group] = &[
         module: "sockios",
         header: "linux/sockios.h",
         prefixes: &["SIOC"],
+        enums: &[],
         ty: "u32",
         doc: "The `ioctl` commands of sockets.",
     },
@@ -175,6 +217,7 @@ const GROUPS: &[Group] = &[
         module: "un",
         header: "linux/un.h",
         prefixes: &["UNIX_PATH_MAX"],
+        enums: &[],
         ty: "u32",
         doc: "The size of the path of a Unix socket address.",
     },
@@ -182,6 +225,7 @@ const GROUPS: &[Group] = &[
         module: "random",
         header: "linux/random.h",
         prefixes: &["GRND_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags of `getrandom`.",
     },
@@ -189,6 +233,7 @@ const GROUPS: &[Group] = &[
         module: "eventpoll",
         header: "linux/eventpoll.h",
         prefixes: &["EPOLL"],
+        enums: &[],
         ty: "u32",
         doc: "The operations of `epoll_ctl` and the events and flags of an epoll entry.",
     },
@@ -196,6 +241,7 @@ const GROUPS: &[Group] = &[
         module: "eventfd",
         header: "linux/eventfd.h",
         prefixes: &["EFD_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags of `eventfd2`.",
     },
@@ -203,6 +249,7 @@ const GROUPS: &[Group] = &[
         module: "timerfd",
         header: "linux/timerfd.h",
         prefixes: &["TFD_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags of `timerfd_create` and `timerfd_settime`, and the `ioctl` of a timer file.",
     },
@@ -210,6 +257,7 @@ const GROUPS: &[Group] = &[
         module: "signalfd",
         header: "linux/signalfd.h",
         prefixes: &["SFD_"],
+        enums: &[],
         ty: "u32",
         doc: "The flags of `signalfd4`.",
     },
@@ -217,6 +265,7 @@ const GROUPS: &[Group] = &[
         module: "resource",
         header: "linux/resource.h",
         prefixes: &["PRIO_"],
+        enums: &[],
         ty: "i32",
         doc: "The targets and the limits of `getpriority` and `setpriority`.",
     },
@@ -372,11 +421,22 @@ fn comments(dir: &Path, out: &mut HashMap<String, String>) -> Result {
         }
         let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         for line in text.lines() {
-            let Some(rest) = line.trim_start().strip_prefix('#') else { continue };
-            let Some(rest) = rest.trim_start().strip_prefix("define") else { continue };
-            let rest = rest.trim_start();
+            let line = line.trim_start();
+            // A macro, or a constant of an enum as `NAME = 0, /* text */`.
+            let rest = match line.strip_prefix('#') {
+                Some(rest) => {
+                    let Some(rest) = rest.trim_start().strip_prefix("define") else { continue };
+                    rest.trim_start()
+                }
+                None if line.starts_with(|c: char| c.is_ascii_uppercase()) => line,
+                None => continue,
+            };
+            let is_enum = !line.starts_with('#');
             let name: String =
                 rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if is_enum && !rest[name.len()..].trim_start().starts_with('=') {
+                continue;
+            }
             let Some(start) = rest.find("/*") else { continue };
             let Some(text) = rest[start + 2..].strip_suffix("*/") else { continue };
             let text = text.trim().trim_start_matches(['*', ' ']);
@@ -430,6 +490,7 @@ pub(crate) fn generate(tree: &Path, sysroot_dir: &Path, out: &mut Output) -> Res
                 .keys()
                 .map(String::as_str)
                 .filter(|n| group.prefixes.iter().any(|p| n.starts_with(p)))
+                .chain(group.enums.iter().copied())
                 .collect();
             let values = probe(arch, &sysroot, group.header, &names)?;
             let (min, max) = range(group.ty)?;
@@ -448,8 +509,7 @@ pub(crate) fn generate(tree: &Path, sysroot_dir: &Path, out: &mut Output) -> Res
                         group.header, arch.name, group.ty
                     ));
                 }
-                let body = &all[name];
-                let alias = values.contains_key(body).then(|| body.clone());
+                let alias = all.get(name).filter(|b| values.contains_key(*b)).cloned();
                 constants.push(Constant { name: name.clone(), value: *value, alias });
             }
             constants.sort_by(|a, b| (a.value, &a.name).cmp(&(b.value, &b.name)));

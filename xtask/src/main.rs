@@ -855,6 +855,10 @@ fn debug_tools_dir() -> Option<PathBuf> {
     dir.join("VERSION").exists().then_some(dir)
 }
 
+/// The size of the disk of the `ltp` boot test. The tests that need a device, as the tests of the
+/// new mount API, get it in `LTP_DEV`. LTP asks for 300 MiB.
+const LTP_DISK_SIZE: u64 = 512 << 20;
+
 /// The longest time that the `ltp` boot test can take. It runs each test of tools/ltp/tests.txt.
 const LTP_TIMEOUT: Duration = Duration::from_secs(1200);
 
@@ -889,6 +893,7 @@ fn ltp_tests() -> Result<Vec<String>> {
 fn ltp_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
         "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp LTP_TIMEOUT_MUL=4 KCONFIG_PATH=/etc/kconfig\n",
+        "export LTP_DEV=/dev/vda\n",
         "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
         "failed=0\nfor t in \\\n",
     ));
@@ -1522,7 +1527,14 @@ fn boot_test(names: &[String]) -> Result {
     for test in BOOT_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
         let (mut cmd, timeout) = if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
-            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), LTP_TIMEOUT)
+            let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
+            let disk = kernel.with_file_name("ltp.img");
+            let file = fs::File::create(&disk).map_err(|e| format!("{}: {e}", disk.display()))?;
+            file.set_len(LTP_DISK_SIZE).map_err(|e| format!("{}: {e}", disk.display()))?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=ltp,format=raw,cache=unsafe,file={}", disk.display()))
+                .args(["-device", "virtio-blk-pci,drive=ltp"]);
+            (cmd, LTP_TIMEOUT)
         } else if *test == "kselftest" || *test == "gvisor" {
             let initrd = kernel.with_file_name(format!("initramfs-{test}.cpio"));
             let timeout = if *test == "gvisor" { GVISOR_TIMEOUT } else { KSELFTEST_TIMEOUT };
