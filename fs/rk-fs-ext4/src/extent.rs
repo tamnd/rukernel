@@ -119,9 +119,14 @@ pub(crate) fn put(extents: &mut Vec<Extent>, new: Extent) {
     }
     out.push(new);
     out.sort_by_key(|e| e.lblock);
-    extents.clear();
-    for e in out {
-        if let Some(last) = extents.last_mut()
+    *extents = join(out);
+}
+
+/// Joins the extents of a sorted list that touch in the file and on the disk.
+fn join(sorted: Vec<Extent>) -> Vec<Extent> {
+    let mut out: Vec<Extent> = Vec::with_capacity(sorted.len());
+    for e in sorted {
+        if let Some(last) = out.last_mut()
             && last.end() == u64::from(e.lblock)
             && last.start + u64::from(last.len) == e.start
             && last.init == e.init
@@ -130,8 +135,9 @@ pub(crate) fn put(extents: &mut Vec<Extent>, new: Extent) {
             last.len += e.len;
             continue;
         }
-        extents.push(e);
+        out.push(e);
     }
+    out
 }
 
 /// Removes the blocks from `lblock` to the end of the file from the list. Gives the runs of
@@ -169,6 +175,34 @@ pub(crate) fn remove(extents: &mut Vec<Extent>, first: u64, last: u64) -> Vec<(u
     }
     *extents = out;
     freed
+}
+
+/// Moves the blocks from `lblock` to the end of the file by `by` blocks, for
+/// `FALLOC_FL_COLLAPSE_RANGE` and `FALLOC_FL_INSERT_RANGE`. An extent that has blocks on each
+/// side of `lblock` becomes two extents first, and the extents that touch after the move join. The caller makes sure that no extent moves below
+/// block 0 or onto another extent, and that the last block stays below 2^32.
+pub(crate) fn shift(extents: &[Extent], lblock: u64, by: i64) -> Vec<Extent> {
+    let mut out = Vec::with_capacity(extents.len() + 1);
+    for &e in extents.iter() {
+        if u64::from(e.lblock) < lblock && lblock < e.end() {
+            let keep = (lblock - u64::from(e.lblock)) as u32;
+            out.push(Extent { len: keep, ..e });
+            out.push(Extent {
+                lblock: e.lblock + keep,
+                len: e.len - keep,
+                start: e.start + u64::from(keep),
+                init: e.init,
+            });
+        } else {
+            out.push(e);
+        }
+    }
+    for e in &mut out {
+        if u64::from(e.lblock) >= lblock {
+            e.lblock = (i64::from(e.lblock) + by) as u32;
+        }
+    }
+    join(out)
 }
 
 impl Tx<'_> {

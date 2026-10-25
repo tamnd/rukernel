@@ -407,6 +407,59 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// `FALLOC_FL_COLLAPSE_RANGE` or `FALLOC_FL_INSERT_RANGE` of the file `ino`. A collapse frees
+    /// the blocks of the range and moves the blocks after it down. An insert moves the blocks from
+    /// `offset` up and leaves a hole. Each one changes the size by `len`. The checks are the
+    /// checks of Linux, in its order.
+    fn shift_range(
+        &mut self,
+        ino: u32,
+        raw: &mut RawInode,
+        collapse: bool,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let fs = self.fs;
+        let bs = fs.sb.block_size;
+        if raw.flags() & flags::EXTENTS == 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if !(offset | len).is_multiple_of(bs) {
+            return Err(Errno::EINVAL);
+        }
+        let size = raw.size();
+        let (first, count) = (offset / bs, len / bs);
+        let (mut extents, tree) = fs.extents(raw)?;
+        if collapse {
+            if offset.saturating_add(len) >= size {
+                return Err(Errno::EINVAL);
+            }
+            let mut freed = 0;
+            for (start, n) in extent::remove(&mut extents, first, first + count) {
+                self.free_blocks(start, n)?;
+                freed += n;
+            }
+            raw.set_blocks(raw.blocks().saturating_sub(freed * (bs / 512)));
+            extents = extent::shift(&extents, first + count, -(count as i64));
+            raw.set_size(size - len);
+        } else {
+            let last = extents.last().map_or(0, Extent::end);
+            if size.saturating_add(len).div_ceil(bs) > u64::from(u32::MAX)
+                || last.saturating_add(count) > u64::from(u32::MAX)
+            {
+                return Err(Errno::EFBIG);
+            }
+            if offset >= size {
+                return Err(Errno::EINVAL);
+            }
+            extents = extent::shift(&extents, first, count as i64);
+            raw.set_size(size + len);
+        }
+        self.build_tree(ino, raw, &extents, tree)?;
+        touch(raw, true);
+        Ok(())
+    }
+
     /// `fallocate` of the file `ino`. A new block is an extent that is not initialized. A hole
     /// frees the full blocks of the range, and the parts of blocks at its ends become zeros.
     pub(crate) fn fallocate(
@@ -417,7 +470,12 @@ impl Tx<'_> {
         offset: u64,
         len: u64,
     ) -> Result<()> {
-        use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
+        use rk_vfs::inode::falloc::{
+            COLLAPSE_RANGE, INSERT_RANGE, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE,
+        };
+        if mode & (COLLAPSE_RANGE | INSERT_RANGE) != 0 {
+            return self.shift_range(ino, raw, mode & COLLAPSE_RANGE != 0, offset, len);
+        }
         let fs = self.fs;
         let bs = fs.sb.block_size;
         let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
