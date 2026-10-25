@@ -6,7 +6,7 @@
 //! changes them in all the threads of a process. rukernel keeps them for each process, which gives
 //! the same result for a program that uses the C library.
 
-use crate::inode::Result;
+use crate::inode::{FileType, Metadata, Result, mode};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 
@@ -90,6 +90,16 @@ pub mod secure {
     pub const ALL_BITS: u32 = 0x55;
     /// All the lock bits. Each lock is one bit above the bit that it locks.
     pub const ALL_LOCKS: u32 = ALL_BITS << 1;
+}
+
+/// The access bits of a permission check, `MAY_*` of Linux.
+pub mod may {
+    /// Execute a file, or search a directory.
+    pub const EXEC: u32 = 1;
+    /// Write.
+    pub const WRITE: u32 = 2;
+    /// Read.
+    pub const READ: u32 = 4;
 }
 
 /// The credentials of a process.
@@ -177,6 +187,100 @@ impl Cred {
     /// The group is the file system group or a supplementary group.
     pub fn in_group(&self, gid: u32) -> bool {
         gid == self.fsgid || self.groups.binary_search(&gid).is_ok()
+    }
+
+    /// Checks the access `mask` (the bits of [`may`]) to a file with the attributes `meta`, as
+    /// `generic_permission` of Linux. The owner bits apply to the owner, the group bits to a
+    /// member of the group, and the other bits to the others. `CAP_DAC_OVERRIDE` and
+    /// `CAP_DAC_READ_SEARCH` skip the check.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EACCES` if the access is not allowed.
+    pub fn permission(&self, meta: &Metadata, mask: u32) -> Result<()> {
+        let mask = mask & (may::READ | may::WRITE | may::EXEC);
+        let bits = if self.fsuid == meta.uid {
+            meta.mode >> 6
+        } else if self.in_group(meta.gid) {
+            meta.mode >> 3
+        } else {
+            meta.mode
+        };
+        if bits & mask == mask {
+            return Ok(());
+        }
+        if meta.is_dir() {
+            if (mask & may::WRITE == 0 && self.capable(cap::DAC_READ_SEARCH))
+                || self.capable(cap::DAC_OVERRIDE)
+            {
+                return Ok(());
+            }
+            return Err(Errno::EACCES);
+        }
+        if mask == may::READ && self.capable(cap::DAC_READ_SEARCH) {
+            return Ok(());
+        }
+        // A file runs with `CAP_DAC_OVERRIDE` only if it has an execute bit.
+        if (mask & may::EXEC == 0 || meta.mode & 0o111 != 0) && self.capable(cap::DAC_OVERRIDE) {
+            return Ok(());
+        }
+        Err(Errno::EACCES)
+    }
+
+    /// The process owns the file or has `CAP_FOWNER`, as `inode_owner_or_capable` of Linux.
+    pub fn owns(&self, meta: &Metadata) -> bool {
+        self.fsuid == meta.uid || self.capable(cap::FOWNER)
+    }
+
+    /// Checks that the process can remove or rename the file `child` from the directory `dir`.
+    /// In a sticky directory, only the owner of the file or of the directory can, as
+    /// `check_sticky` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EPERM` if the sticky bit forbids the change.
+    pub fn check_sticky(&self, dir: &Metadata, child: &Metadata) -> Result<()> {
+        if dir.mode & mode::S_ISVTX == 0
+            || self.fsuid == child.uid
+            || self.fsuid == dir.uid
+            || self.capable(cap::FOWNER)
+        {
+            return Ok(());
+        }
+        Err(Errno::EPERM)
+    }
+
+    /// The owner, the group and the permission bits of a new file of the type `kind` in the
+    /// directory `dir`, as `inode_init_owner` and `mode_strip_sgid` of Linux. A file in a
+    /// set-group-ID directory gets the group of the directory, and a new directory there is
+    /// set-group-ID too. A file that is not a directory loses the set-group-ID bit if it has the
+    /// group execute bit and the process is not in the group of the directory.
+    pub fn new_owner(&self, dir: &Metadata, kind: FileType, perm: u32) -> (u32, u32, u32) {
+        let mut perm = perm;
+        let sgid_dir = dir.mode & mode::S_ISGID != 0;
+        if kind == FileType::Directory {
+            if sgid_dir {
+                perm |= mode::S_ISGID;
+            }
+        } else if perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
+            && !self.in_group(dir.gid)
+            && !self.capable(cap::FSETID)
+        {
+            perm &= !mode::S_ISGID;
+        }
+        (self.fsuid, if sgid_dir { dir.gid } else { self.fsgid }, perm)
+    }
+
+    /// The credentials of `access` and `faccessat` without `AT_EACCESS`: the real IDs take the
+    /// place of the file system IDs, and a user other than root has no capabilities.
+    pub fn for_access(&self) -> Self {
+        let mut c = self.clone();
+        c.fsuid = c.uid;
+        c.fsgid = c.gid;
+        if c.securebits & secure::NO_SETUID_FIXUP == 0 {
+            c.cap_effective = if c.uid == 0 { c.cap_permitted } else { 0 };
+        }
+        c
     }
 
     /// The new credentials after `setuid`.
@@ -548,6 +652,14 @@ mod tests {
     use super::*;
     use alloc::vec;
 
+    impl Cred {
+        fn setgroups_unchecked(&self, groups: &[u32]) -> Self {
+            let mut c = self.clone();
+            c.groups = groups.to_vec();
+            c
+        }
+    }
+
     fn user(id: u32) -> Cred {
         Cred::root().setresgid(id, id, id).unwrap().setresuid(id, id, id).unwrap()
     }
@@ -667,6 +779,74 @@ mod tests {
         let (c, _) = Cred::root().setresuid(0, 1000, 1000).unwrap().exec(plain);
         assert_eq!(c.cap_permitted, cap::ALL);
         assert_eq!(c.cap_effective, 0);
+    }
+
+    fn meta(kind: u32, perm: u32, uid: u32, gid: u32) -> Metadata {
+        Metadata { mode: kind | perm, uid, gid, ..Metadata::default() }
+    }
+
+    #[test]
+    fn the_class_of_the_caller_picks_the_bits() {
+        let u = user(1000);
+        let file = meta(mode::S_IFREG, 0o604, 1000, 50);
+        assert_eq!(u.permission(&file, may::READ | may::WRITE), Ok(()));
+        assert_eq!(u.permission(&file, may::EXEC), Err(Errno::EACCES));
+        // The owner bits apply to the owner, even if the other bits allow more.
+        let file = meta(mode::S_IFREG, 0o066, 1000, 50);
+        assert_eq!(u.permission(&file, may::READ), Err(Errno::EACCES));
+        let g = u.setgroups_unchecked(&[50]);
+        let file = meta(mode::S_IFREG, 0o040, 2000, 50);
+        assert_eq!(g.permission(&file, may::READ), Ok(()));
+        assert_eq!(u.permission(&file, may::READ), Err(Errno::EACCES));
+    }
+
+    #[test]
+    fn root_skips_the_bits_but_not_the_execute_bit() {
+        let root = Cred::root();
+        assert_eq!(root.permission(&meta(mode::S_IFREG, 0, 5, 5), may::READ | may::WRITE), Ok(()));
+        assert_eq!(
+            root.permission(&meta(mode::S_IFREG, 0o600, 5, 5), may::EXEC),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(root.permission(&meta(mode::S_IFREG, 0o010, 5, 5), may::EXEC), Ok(()));
+        assert_eq!(root.permission(&meta(mode::S_IFDIR, 0, 5, 5), may::EXEC | may::WRITE), Ok(()));
+        let search = Cred::root().capset(cap::bit(cap::DAC_READ_SEARCH), cap::ALL, 0).unwrap();
+        assert_eq!(search.permission(&meta(mode::S_IFDIR, 0, 5, 5), may::EXEC | may::READ), Ok(()));
+        assert_eq!(
+            search.permission(&meta(mode::S_IFDIR, 0, 5, 5), may::WRITE),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(search.permission(&meta(mode::S_IFREG, 0, 5, 5), may::READ), Ok(()));
+    }
+
+    #[test]
+    fn the_sticky_bit_protects_the_files_of_others() {
+        let u = user(1000);
+        let tmp = meta(mode::S_IFDIR, 0o1777, 0, 0);
+        assert_eq!(u.check_sticky(&tmp, &meta(mode::S_IFREG, 0o644, 2000, 0)), Err(Errno::EPERM));
+        assert_eq!(u.check_sticky(&tmp, &meta(mode::S_IFREG, 0o644, 1000, 0)), Ok(()));
+        assert_eq!(Cred::root().check_sticky(&tmp, &meta(mode::S_IFREG, 0o644, 2000, 0)), Ok(()));
+    }
+
+    #[test]
+    fn a_setgid_directory_gives_its_group() {
+        let u = user(1000);
+        let dir = meta(mode::S_IFDIR, 0o2775, 0, 50);
+        assert_eq!(u.new_owner(&dir, FileType::Directory, 0o755), (1000, 50, 0o2755));
+        assert_eq!(u.new_owner(&dir, FileType::Regular, 0o2755), (1000, 50, 0o755));
+        assert_eq!(Cred::root().new_owner(&dir, FileType::Regular, 0o2755), (0, 50, 0o2755));
+        let plain = meta(mode::S_IFDIR, 0o755, 0, 50);
+        assert_eq!(u.new_owner(&plain, FileType::Regular, 0o644), (1000, 1000, 0o644));
+        assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2744), (1000, 1000, 0o2744));
+        assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2775), (1000, 1000, 0o775));
+    }
+
+    #[test]
+    fn access_uses_the_real_ids() {
+        let c = Cred::root().setresuid(1000, 0, 0).unwrap().for_access();
+        assert_eq!((c.fsuid, c.cap_effective), (1000, 0));
+        let c = Cred::root().setresuid(0, 1000, 1000).unwrap().for_access();
+        assert_eq!((c.fsuid, c.cap_effective), (0, cap::ALL));
     }
 
     #[test]

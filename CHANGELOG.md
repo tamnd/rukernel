@@ -16,6 +16,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `capset` changes the capability sets. The `prctl` options `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`, `PR_GET_KEEPCAPS`, `PR_SET_KEEPCAPS`, `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` and `PR_CAP_AMBIENT` work.
 - An `execve` of a set-user-ID or set-group-ID file changes the effective ID, and an `execve` computes the new capability sets as Linux does for a file without file capabilities. The bits have no effect on a `nosuid` mount, with no_new_privs, or under a tracer. The auxiliary vector gives the IDs and `AT_SECURE`.
 - `/proc/PID/status` shows the IDs, the groups, the capability sets and the no_new_privs bit.
+- The VFS checks the permission bits with the credentials of the process, as `generic_permission` of Linux. A walk needs the search permission on each directory. `open`, `access`, `faccessat2`, `truncate`, `chdir`, `fchdir` and `execve` check the access to the file. A create, a link, a remove and a rename need the write and search permissions on the directory. `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` skip the checks.
+- In a sticky directory, only the owner of a file, the owner of the directory or a process with `CAP_FOWNER` can remove or rename the file.
+- A new file gets the file system user ID of the process as its owner. Its group is the group of the process, or the group of the directory if the directory is set-group-ID. A new directory in a set-group-ID directory is set-group-ID too.
+- `mknod` of a character or block device needs `CAP_MKNOD`. `O_NOATIME` needs the owner of the file or `CAP_FOWNER`.
 
 ### Fixed
 

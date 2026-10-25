@@ -65,10 +65,12 @@ impl Cx<'_> {
         self.process().fs().ok_or(Errno::ESRCH)
     }
 
-    /// A copy of the file system context. A walk uses a copy, so that a walk that blocks does not
-    /// hold the lock.
+    /// A copy of the file system context with the credentials of the process. A walk uses a
+    /// copy, so that a walk that blocks does not hold the lock.
     pub(crate) fn fs(&self) -> Result<FsContext, Errno> {
-        Ok(self.fs_shared()?.lock().clone())
+        let mut fs = self.fs_shared()?.lock().clone();
+        fs.set_cred(self.process().cred());
+        Ok(fs)
     }
 
     /// The open file of `fd`.
