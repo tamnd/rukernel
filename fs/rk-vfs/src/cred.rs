@@ -71,6 +71,8 @@ pub mod cap {
     pub const SYS_PTRACE: u32 = 19;
     /// Do the many administration operations.
     pub const SYS_ADMIN: u32 = 21;
+    /// Lower the nice value and change the priority of each process.
+    pub const SYS_NICE: u32 = 23;
     /// Go past the resource limits.
     pub const SYS_RESOURCE: u32 = 24;
     /// Make a device file.
@@ -79,6 +81,8 @@ pub mod cap {
     pub const SETFCAP: u32 = 31;
     /// Skip the mandatory access control.
     pub const MAC_OVERRIDE: u32 = 32;
+    /// Read and clear the kernel log.
+    pub const SYSLOG: u32 = 34;
     /// The highest capability of Linux, `CAP_CHECKPOINT_RESTORE`.
     pub const LAST: u32 = 40;
     /// All the capabilities.
@@ -395,6 +399,32 @@ impl Cred {
             }
         }
         self.permission(meta, if write { may::WRITE } else { may::READ })
+    }
+
+    /// Tells if the process can send a signal to a process with the credentials `target`, as
+    /// `kill_ok_by_cred` of Linux: its real or effective user ID is the real or saved user ID of
+    /// the target, or it has `CAP_KILL`.
+    pub fn may_kill(&self, target: &Self) -> bool {
+        self.euid == target.suid
+            || self.euid == target.uid
+            || self.uid == target.suid
+            || self.uid == target.uid
+            || self.capable(cap::KILL)
+    }
+
+    /// Tells if the real user and group IDs of the process are all the user and group IDs of
+    /// the target, as the checks of `ptrace` and `prlimit` of Linux want.
+    pub fn same_ids(&self, target: &Self) -> bool {
+        [target.uid, target.euid, target.suid].iter().all(|&id| id == self.uid)
+            && [target.gid, target.egid, target.sgid].iter().all(|&id| id == self.gid)
+    }
+
+    /// Tells if the process can trace a process with the credentials `target`, as
+    /// `__ptrace_may_access` and `cap_ptrace_access_check` of Linux: it has the same IDs and at
+    /// least the permitted capabilities of the target, or it has `CAP_SYS_PTRACE`.
+    pub fn may_ptrace(&self, target: &Self) -> bool {
+        self.capable(cap::SYS_PTRACE)
+            || (self.same_ids(target) && target.cap_permitted & !self.cap_permitted == 0)
     }
 
     /// The credentials of `access` and `faccessat` without `AT_EACCESS`: the real IDs take the
@@ -1023,6 +1053,16 @@ mod tests {
         assert_eq!(u.xattr_permission(&link, b"user.a", true), Err(Errno::EPERM));
         let tmp = meta(mode::S_IFDIR, 0o1777, 0, 0);
         assert_eq!(u.xattr_permission(&tmp, b"user.a", true), Err(Errno::EPERM));
+    }
+
+    #[test]
+    fn signals_and_traces_need_the_same_user() {
+        let (a, b) = (user(1000), user(2000));
+        assert!(a.may_kill(&a) && !a.may_kill(&b) && Cred::root().may_kill(&b));
+        let saved = Cred::root().setresuid(2000, 2000, 1000).unwrap();
+        assert!(a.may_kill(&saved));
+        assert!(a.may_ptrace(&a) && !a.may_ptrace(&b) && !a.may_ptrace(&saved));
+        assert!(!a.may_ptrace(&Cred::root()) && Cred::root().may_ptrace(&a));
     }
 
     #[test]

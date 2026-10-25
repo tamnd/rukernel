@@ -16,8 +16,10 @@ use rk_abi::native::sched::{
     SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR,
 };
 use rk_abi::native::types::SchedAttr;
+use rk_proc::limits::RLIMIT_NICE;
 use rk_proc::sched::SchedParams;
 use rk_proc::{Thread, find_thread, processes};
+use rk_vfs::cred::cap;
 use zerocopy::{FromZeros, IntoBytes};
 
 /// The bits of the CPUs that are online.
@@ -92,9 +94,14 @@ fn prio_targets(cx: &Cx<'_>, which: u64, who: u64) -> Result<Vec<Arc<Thread>>, E
                 .flat_map(|p| p.threads())
                 .collect())
         }
-        // Each process of rukernel has the user ID 0.
-        PRIO_USER if who == 0 => Ok(processes().into_iter().flat_map(|p| p.threads()).collect()),
-        PRIO_USER => Ok(Vec::new()),
+        PRIO_USER => {
+            let uid = if who == 0 { cx.process().cred().uid } else { who as u32 };
+            Ok(processes()
+                .into_iter()
+                .filter(|p| p.cred().uid == uid)
+                .flat_map(|p| p.threads())
+                .collect())
+        }
         _ => Err(Errno::EINVAL),
     }
 }
@@ -113,10 +120,25 @@ pub(crate) fn setpriority(cx: &Cx<'_>, which: u64, who: u64, nice: u64) -> SysRe
     if threads.is_empty() {
         return Err(Errno::ESRCH);
     }
+    let cred = cx.process().cred();
+    let nice_cap = cred.capable(cap::SYS_NICE);
+    // The soft `RLIMIT_NICE` gives the lowest nice value without `CAP_SYS_NICE`, as `can_nice`
+    // of Linux.
+    let floor = 20 - cx.process().limit(RLIMIT_NICE).cur.min(40) as i32;
+    let mut result = Ok(0);
     for thread in threads {
+        let target = thread.process().cred();
+        if target.uid != cred.euid && target.euid != cred.euid && !nice_cap {
+            result = Err(Errno::EPERM);
+            continue;
+        }
+        if nice < thread.sched().nice && nice < floor && !nice_cap {
+            result = Err(Errno::EACCES);
+            continue;
+        }
         thread.set_sched(SchedParams { nice, ..thread.sched() });
     }
-    Ok(0)
+    result
 }
 
 /// Tells if `policy` is a policy that rukernel knows.

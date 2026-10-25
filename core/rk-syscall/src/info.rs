@@ -1,6 +1,7 @@
 //! The system calls of time, limits and system information.
 
 use crate::cx::{Cx, SysResult};
+use alloc::sync::Arc;
 use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::random::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
@@ -17,6 +18,7 @@ use rk_frame::time::{HZ, ticks};
 use rk_proc::Restart;
 use rk_proc::exec::USER_HZ;
 use rk_proc::limits::{Limit, NR_OPEN, RLIM_NLIMITS, RLIMIT_NOFILE};
+use rk_vfs::cred::cap;
 use zerocopy::FromZeros;
 
 pub(crate) const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -258,6 +260,14 @@ pub(crate) fn syslog(cx: &Cx<'_>, action: u64, buf: u64, len: u64) -> SysResult 
     const SIZE_UNREAD: i32 = 9;
     const SIZE_BUFFER: i32 = 10;
     let action = action as i32;
+    // Only the full read and the size are open to each process, as `syslog_action_restricted`
+    // of Linux with `dmesg_restrict` at 0.
+    if action != READ_ALL && action != SIZE_BUFFER {
+        let cred = cx.process().cred();
+        if !cred.capable(cap::SYSLOG) && !cred.capable(cap::SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+    }
     match action {
         CLOSE | OPEN | CONSOLE_OFF | CONSOLE_ON => Ok(0),
         READ | READ_ALL | READ_CLEAR => {
@@ -294,6 +304,14 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
         0 => cx.thread.process().clone(),
         p => rk_proc::find_process(p as u32).ok_or(Errno::ESRCH)?,
     };
+    let cred = cx.process().cred();
+    // Another process must have the IDs of the caller, as `check_prlimit_permission` of Linux.
+    if !Arc::ptr_eq(&process, cx.process())
+        && !cred.same_ids(&process.cred())
+        && !cred.capable(cap::SYS_RESOURCE)
+    {
+        return Err(Errno::EPERM);
+    }
     let new = if new == 0 {
         None
     } else {
@@ -307,10 +325,12 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
         Some(Limit { cur: n.rlim_cur, max: n.rlim_max })
     };
     let l = process.limit(resource);
+    // Only a process with `CAP_SYS_RESOURCE` can raise the hard limit.
+    if new.is_some_and(|n| n.max > l.max) && !cred.capable(cap::SYS_RESOURCE) {
+        return Err(Errno::EPERM);
+    }
     cx.write_opt(old, &Rlimit64 { rlim_cur: l.cur, rlim_max: l.max })?;
     if let Some(n) = new {
-        // Each process runs as root with `CAP_SYS_RESOURCE` in R1, so it can raise the hard limit
-        // up to the limits above.
         process.set_limit(resource, n);
     }
     Ok(0)
