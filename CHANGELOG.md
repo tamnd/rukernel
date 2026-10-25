@@ -10,6 +10,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `FS_IOC_GOINGDOWN` ioctl on ext4, as `EXT4_IOC_SHUTDOWN` of Linux. After it, a change, a read of the data of a file and `fsync` give `EIO`, and nothing goes to the disk again. The unmount leaves the journal, so the next mount replays it as after a crash. `LOGFLUSH` and the default flags first make the changes durable, and `NOLOGFLUSH` loses the changes since the last commit. The fstests that need `_require_scratch_shutdown` can run now.
 - `chattr +e` and `chattr -e` on ext4. `+e` moves a file or a directory from a block map to an extent tree, and the tree uses the indirect blocks of the map first. `-e` moves a file to a block map, as Linux, only if the tree has at most one extent that has data and fits in the 12 direct blocks. ext4/005 needs it.
 - The ext4 mount options `minixdf` and `bsddf`. With `minixdf`, `statfs` counts the blocks of the metadata and of the journal in the count of blocks, as Linux. ext4/042 checks it.
+- The `EXT4_IOC_CHECKPOINT` ioctl. It writes the transactions of the journal to their places and empties the journal. With `EXT4_IOC_CHECKPOINT_FLAG_ZEROOUT` it then writes zeros to the blocks of the log. `EXT4_IOC_CHECKPOINT_FLAG_DISCARD` gives `EOPNOTSUPP`, as the disk does not discard. ext4/050 checks it.
 
 ### Fixed
 

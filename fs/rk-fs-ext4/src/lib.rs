@@ -648,6 +648,38 @@ impl Fs {
         Ok(())
     }
 
+    /// Writes the transactions of the journal to their places and empties the journal, for
+    /// `EXT4_IOC_CHECKPOINT`. `ZEROOUT` then writes zeros to the blocks of the log. A mount
+    /// without a journal gives `ENODEV`, and `DISCARD` gives `EOPNOTSUPP`, as the disk does not
+    /// discard.
+    pub(crate) fn checkpoint(&self, flags: u32) -> Result<()> {
+        use rk_vfs::inode::checkpoint::{DISCARD, DRY_RUN, ZEROOUT};
+        if flags & !(DISCARD | ZEROOUT | DRY_RUN) != 0
+            || flags & (DISCARD | ZEROOUT) == DISCARD | ZEROOUT
+        {
+            return Err(Errno::EINVAL);
+        }
+        let Some(log) = &self.log else { return Err(Errno::ENODEV) };
+        if flags & DISCARD != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if flags & DRY_RUN != 0 {
+            return Ok(());
+        }
+        // The lock waits for a running change, so the commit has only whole changes.
+        let meta = self.meta.lock();
+        self.check_shut()?;
+        self.commit(true);
+        let mut log = log.lock();
+        log.checkpoint(self)?;
+        if flags & ZEROOUT != 0 {
+            log.erase(self)?;
+        }
+        drop(log);
+        drop(meta);
+        Ok(())
+    }
+
     /// Adds the inode `ino` without links to the inodes to free, and frees them if no change
     /// runs. Else the change frees them when it ends.
     fn orphan(&self, ino: u32) {

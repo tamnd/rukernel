@@ -286,6 +286,12 @@ impl FileOps for InodeFile {
                 inode.shutdown(u32::from_ne_bytes(b))?;
                 Ok(0)
             }
+            EXT4_IOC_CHECKPOINT => {
+                let mut b = [0u8; 4];
+                mem.read(arg, &mut b)?;
+                inode.checkpoint(u32::from_ne_bytes(b))?;
+                Ok(0)
+            }
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
             fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
@@ -300,6 +306,8 @@ const FIGETBSZ: u32 = 2;
 /// `_IOR('X', 125, __u32)`. Stops the file system, as `EXT4_IOC_SHUTDOWN` and
 /// `XFS_IOC_GOINGDOWN`.
 const FS_IOC_GOINGDOWN: u32 = 0x8004_587d;
+/// `_IOW('f', 43, __u32)`. Empties the journal of ext4.
+const EXT4_IOC_CHECKPOINT: u32 = 0x4004_662b;
 /// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 /// `_IOW('f', 2, long)`.
