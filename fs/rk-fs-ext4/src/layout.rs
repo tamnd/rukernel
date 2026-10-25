@@ -40,6 +40,73 @@ pub mod incompat {
         FILETYPE | RECOVER | META_BG | EXTENTS | BIT64 | MMP | FLEX_BG | CSUM_SEED | LARGEDIR;
 }
 
+/// The features that are compatible for a read only mount. A kernel that does not know one of
+/// them can mount the disk read only.
+pub mod ro_compat {
+    /// Only some groups have a copy of the superblock.
+    pub const SPARSE_SUPER: u32 = 0x1;
+    /// A file can be larger than 2 GiB.
+    pub const LARGE_FILE: u32 = 0x2;
+    /// The `blocks` field of an inode can count blocks of the file system.
+    pub const HUGE_FILE: u32 = 0x8;
+    /// The group descriptors have a crc16 checksum.
+    pub const GDT_CSUM: u32 = 0x10;
+    /// A directory can have more than 65000 subdirectories.
+    pub const DIR_NLINK: u32 = 0x20;
+    /// The inodes have extra fields after the first 128 bytes.
+    pub const EXTRA_ISIZE: u32 = 0x40;
+    /// The metadata has crc32c checksums.
+    pub const METADATA_CSUM: u32 = 0x400;
+    /// The orphan file has inodes in it.
+    pub const ORPHAN_PRESENT: u32 = 0x1_0000;
+    /// The features that this driver can change.
+    pub const WRITABLE: u32 =
+        SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE | METADATA_CSUM;
+}
+
+/// The flags of a group descriptor.
+pub mod bg {
+    /// The inode bitmap is not on the disk. It has no inode in use.
+    pub const INODE_UNINIT: u16 = 0x1;
+    /// The block bitmap is not on the disk. The driver makes it from the layout.
+    pub const BLOCK_UNINIT: u16 = 0x2;
+}
+
+/// The offsets of the fields of the superblock that the driver changes.
+pub mod sb {
+    /// The low 32 bits of the number of free blocks.
+    pub const FREE_BLOCKS: usize = 0xc;
+    /// The high 32 bits of the number of free blocks.
+    pub const FREE_BLOCKS_HI: usize = 0x158;
+    /// The number of free inodes.
+    pub const FREE_INODES: usize = 0x10;
+    /// The checksum of the superblock.
+    pub const CHECKSUM: usize = 0x3fc;
+}
+
+/// The offsets of the fields of a group descriptor that the driver changes. A field with a
+/// high half has the high half at `HI` past the low half, if the descriptor has 64 bytes.
+pub mod gd {
+    /// The number of free blocks.
+    pub const FREE_BLOCKS: usize = 0xc;
+    /// The number of free inodes.
+    pub const FREE_INODES: usize = 0xe;
+    /// The number of directories.
+    pub const USED_DIRS: usize = 0x10;
+    /// The flags.
+    pub const FLAGS: usize = 0x12;
+    /// The checksum of the block bitmap.
+    pub const BLOCK_BITMAP_CSUM: usize = 0x18;
+    /// The checksum of the inode bitmap.
+    pub const INODE_BITMAP_CSUM: usize = 0x1a;
+    /// The number of inodes at the end of the inode table that were never used.
+    pub const ITABLE_UNUSED: usize = 0x1c;
+    /// The checksum of the descriptor.
+    pub const CHECKSUM: usize = 0x1e;
+    /// The distance from a low half to its high half.
+    pub const HI: usize = 0x20;
+}
+
 /// The flags of an inode.
 pub mod flags {
     /// The directory has an htree index.
@@ -55,6 +122,16 @@ pub mod flags {
 /// Gives the `u16` at `at`.
 pub fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+/// Writes the `u16` `v` at `at`.
+pub fn put16(b: &mut [u8], at: usize, v: u16) {
+    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Writes the `u32` `v` at `at`.
+pub fn put32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
 }
 
 /// Gives the `u32` at `at`.
@@ -93,6 +170,16 @@ pub struct Superblock {
     pub desc_size: u16,
     /// The length of the longest name.
     pub name_max: usize,
+    /// The first inode that is not reserved.
+    pub first_ino: u32,
+    /// The number of blocks after the group descriptors that are kept for a larger file system.
+    pub reserved_gdt_blocks: u16,
+    /// The size of the extra fields of a new inode.
+    pub want_extra_isize: u16,
+    /// The UUID of the file system.
+    pub uuid: [u8; 16],
+    /// The seed of the crc32c checksums, if the superblock has it.
+    pub checksum_seed: u32,
 }
 
 impl Superblock {
@@ -132,6 +219,11 @@ impl Superblock {
             ro_compat: u32_at(b, 0x64),
             desc_size: if bit64 { u16_at(b, 0xfe) } else { 32 },
             name_max: 255,
+            first_ino: if rev == 0 { 11 } else { u32_at(b, 0x54) },
+            reserved_gdt_blocks: u16_at(b, 0xce),
+            want_extra_isize: u16_at(b, 0x15e),
+            uuid: b[0x68..0x78].try_into().map_err(|_| Errno::EINVAL)?,
+            checksum_seed: u32_at(b, 0x270),
         };
         if sb.blocks_per_group == 0
             || sb.inodes_per_group == 0
@@ -150,6 +242,37 @@ impl Superblock {
     pub fn groups(&self) -> u32 {
         let blocks = self.blocks_count - u64::from(self.first_data_block);
         blocks.div_ceil(u64::from(self.blocks_per_group)) as u32
+    }
+
+    /// Tells if the group `group` has a copy of the superblock and of the group descriptors.
+    pub fn has_super(&self, group: u32) -> bool {
+        if self.ro_compat & ro_compat::SPARSE_SUPER == 0 || group <= 1 {
+            return true;
+        }
+        [3, 5, 7].iter().any(|&p| {
+            let mut n = group;
+            while n.is_multiple_of(p) {
+                n /= p;
+            }
+            n == 1
+        })
+    }
+
+    /// The number of blocks of the group descriptors.
+    pub fn gdt_blocks(&self) -> u64 {
+        (u64::from(self.groups()) * u64::from(self.desc_size)).div_ceil(self.block_size)
+    }
+
+    /// The number of blocks of the inode table of one group.
+    pub fn itable_blocks(&self) -> u64 {
+        (u64::from(self.inodes_per_group) * u64::from(self.inode_size)).div_ceil(self.block_size)
+    }
+
+    /// The number of blocks in the group `group`. The last group can be shorter.
+    pub fn blocks_in_group(&self, group: u32) -> u32 {
+        let start =
+            u64::from(self.first_data_block) + u64::from(group) * u64::from(self.blocks_per_group);
+        (self.blocks_count - start).min(u64::from(self.blocks_per_group)) as u32
     }
 }
 
@@ -222,8 +345,67 @@ impl RawInode {
         u64::from(u32_at(&self.0, 0x1c)) | u64::from(u16_at(&self.0, 0x74)) << 32
     }
 
+    /// The generation, for NFS and for the checksums.
+    pub fn generation(&self) -> u32 {
+        u32_at(&self.0, 0x64)
+    }
+
+    /// Changes the type and the permission bits.
+    pub fn set_mode(&mut self, mode: u16) {
+        put16(&mut self.0, 0, mode);
+    }
+
+    /// Changes the owner.
+    pub fn set_uid(&mut self, uid: u32) {
+        put16(&mut self.0, 0x2, uid as u16);
+        put16(&mut self.0, 0x78, (uid >> 16) as u16);
+    }
+
+    /// Changes the group.
+    pub fn set_gid(&mut self, gid: u32) {
+        put16(&mut self.0, 0x18, gid as u16);
+        put16(&mut self.0, 0x7a, (gid >> 16) as u16);
+    }
+
+    /// Changes the size.
+    pub fn set_size(&mut self, size: u64) {
+        put32(&mut self.0, 0x4, size as u32);
+        put32(&mut self.0, 0x6c, (size >> 32) as u32);
+    }
+
+    /// Changes the number of hard links.
+    pub fn set_links(&mut self, links: u16) {
+        put16(&mut self.0, 0x1a, links);
+    }
+
+    /// Changes the flags.
+    pub fn set_flags(&mut self, flags: u32) {
+        put32(&mut self.0, 0x20, flags);
+    }
+
+    /// Changes the number of blocks, in sectors of 512 bytes.
+    pub fn set_blocks(&mut self, blocks: u64) {
+        put32(&mut self.0, 0x1c, blocks as u32);
+        put16(&mut self.0, 0x74, (blocks >> 32) as u16);
+    }
+
+    /// The 60 bytes of `i_block` to change.
+    pub fn block_mut(&mut self) -> &mut [u8] {
+        &mut self.0[0x28..0x28 + 60]
+    }
+
+    /// Changes the time at `at` and, if the inode has them, the nanoseconds and the epoch bits at
+    /// `extra`.
+    pub fn set_time(&mut self, at: usize, extra: usize, sec: i64, nsec: u32) {
+        put32(&mut self.0, at, sec as u32);
+        if self.extra_size() >= extra + 4 - 128 {
+            let epoch = ((sec - i64::from(sec as i32)) >> 32) as u32 & 3;
+            put32(&mut self.0, extra, nsec << 2 | epoch);
+        }
+    }
+
     /// The size of the fields after the first 128 bytes.
-    fn extra_size(&self) -> usize {
+    pub fn extra_size(&self) -> usize {
         if self.0.len() > 128 { usize::from(u16_at(&self.0, 0x80)) } else { 0 }
     }
 

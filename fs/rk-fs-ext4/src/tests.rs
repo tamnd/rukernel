@@ -2,21 +2,43 @@
 //! one group of 64 blocks and 32 inodes of 256 bytes.
 
 use super::*;
+use alloc::format;
 use layout::flags;
-use rk_vfs::{FileType, Inode, Timespec};
+use rk_frame::sync::SpinLock;
+use rk_vfs::{FileType, Inode, SetAttr, Timespec};
 
 const BS: usize = 1024;
 const INODE_TABLE: usize = 5;
 
-/// A disk in memory.
-struct Ram(Vec<u8>);
+/// A disk in memory, which the test can mount again.
+#[derive(Clone)]
+struct Ram(Arc<SpinLock<Vec<u8>>>);
 
 impl Disk for Ram {
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let at = offset as usize;
-        let data = self.0.get(at..at + buf.len()).ok_or(Errno::EIO)?;
+        let img = self.0.lock();
+        let data = img.get(at..at + buf.len()).ok_or(Errno::EIO)?;
         buf.copy_from_slice(data);
         Ok(())
+    }
+
+    fn write(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        let at = offset as usize;
+        let mut img = self.0.lock();
+        img.get_mut(at..at + buf.len()).ok_or(Errno::EIO)?.copy_from_slice(buf);
+        Ok(())
+    }
+}
+
+impl Ram {
+    fn u32_at(&self, at: usize) -> u32 {
+        layout::u32_at(&self.0.lock(), at)
+    }
+
+    /// The free blocks and the free inodes in the superblock.
+    fn free(&self) -> (u32, u32) {
+        (self.u32_at(1024 + 0xc), self.u32_at(1024 + 0x10))
     }
 }
 
@@ -96,6 +118,23 @@ fn image() -> Vec<u8> {
     img.put32(2 * BS, 3);
     img.put32(2 * BS + 4, 4);
     img.put32(2 * BS + 8, INODE_TABLE as u32);
+    // The used blocks: the superblock, the descriptors, the bitmaps, the inode table and the
+    // data. The bit 0 is the block 1. The bits past the last block are set.
+    let used: Vec<usize> = (1..=12).chain([20, 21, 22, 24, 25, 26, 30, 40]).collect();
+    for &b in &used {
+        img.0[3 * BS + (b - 1) / 8] |= 1 << ((b - 1) % 8);
+    }
+    img.0[3 * BS + 63 / 8] |= 0x80;
+    img.0[3 * BS + 8..4 * BS].fill(0xff);
+    for i in 0..15 {
+        img.0[4 * BS + i / 8] |= 1 << (i % 8);
+    }
+    img.0[4 * BS + 4..5 * BS].fill(0xff);
+    img.put32(sb + 0xc, 63 - used.len() as u32);
+    img.put32(sb + 0x10, 32 - 15);
+    img.put16(2 * BS + 0xc, 63 - used.len() as u16);
+    img.put16(2 * BS + 0xe, 32 - 15);
+    img.put16(2 * BS + 0x10, 2);
 
     let root = img.inode(2, 0o40755, BS as u32, 4, flags::EXTENTS);
     img.extents(root, &[(0, 1, 20)]);
@@ -137,7 +176,23 @@ fn image() -> Vec<u8> {
 }
 
 fn open(img: Vec<u8>) -> Result<Arc<Fs>> {
-    Fs::open(7, alloc::boxed::Box::new(Ram(img)))
+    Fs::open(7, alloc::boxed::Box::new(Ram(Arc::new(SpinLock::new(img)))), true)
+}
+
+fn open_rw() -> (Arc<Fs>, Ram) {
+    let ram = Ram(Arc::new(SpinLock::new(image())));
+    (Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap(), ram)
+}
+
+/// Mounts the disk again, to read what the disk has and not what memory has.
+fn again(ram: &Ram) -> Arc<Fs> {
+    Fs::open(7, alloc::boxed::Box::new(ram.clone()), true).unwrap()
+}
+
+fn read_all(inode: &dyn Inode) -> Vec<u8> {
+    let mut buf = vec![0u8; inode.metadata().size as usize];
+    assert_eq!(inode.read_at(0, &mut buf).unwrap(), buf.len());
+    buf
 }
 
 fn names(dir: &dyn Inode) -> Vec<(Vec<u8>, FileType)> {
@@ -223,4 +278,176 @@ fn a_bad_superblock_does_not_mount() {
     let mut img = image();
     img[1024 + 0x62] = 0x01;
     assert_eq!(open(img).err(), Some(Errno::EOPNOTSUPP));
+}
+
+#[test]
+fn a_new_file_keeps_its_data() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"new", FileType::Regular, 0o640, 0).unwrap();
+    let data: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+    assert_eq!(file.write_at(0, &data).unwrap(), 5000);
+    assert_eq!(file.write_at(5000, b"end").unwrap(), 3);
+    assert_eq!(ram.free(), (free.0 - 5, free.1 - 1));
+    assert_eq!(root.create(b"new", FileType::Regular, 0o640, 0).err(), Some(Errno::EEXIST));
+    drop((file, root, fs));
+
+    let fs = again(&ram);
+    let file = fs.root().unwrap().lookup(b"new").unwrap();
+    let meta = file.metadata();
+    assert_eq!((meta.size, meta.mode, meta.nlink, meta.blocks), (5003, 0o100640, 1, 10));
+    let back = read_all(&*file);
+    assert_eq!(&back[..5000], &data[..]);
+    assert_eq!(&back[5000..], b"end");
+}
+
+#[test]
+fn a_write_fills_a_hole_and_the_size_changes() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let hello = root.lookup(b"hello").unwrap();
+    hello.write_at(BS as u64 + 10, b"bb").unwrap();
+    let file = root.create(b"t", FileType::Regular, 0o600, 0).unwrap();
+    file.write_at(0, &vec![b'z'; 3 * BS]).unwrap();
+    file.set_attr(&SetAttr { size: Some(1500), ..SetAttr::default() }).unwrap();
+    file.set_attr(&SetAttr { size: Some(2 * BS as u64 + 1), ..SetAttr::default() }).unwrap();
+    drop((hello, file, root, fs));
+
+    let fs = again(&ram);
+    let root = fs.root().unwrap();
+    let back = read_all(&*root.lookup(b"hello").unwrap());
+    assert!(back[BS..BS + 10].iter().all(|&b| b == 0));
+    assert_eq!(&back[BS + 10..BS + 12], b"bb");
+    assert_eq!(back[2 * BS], b'c');
+    let back = read_all(&*root.lookup(b"t").unwrap());
+    assert_eq!(back.len(), 2 * BS + 1);
+    assert!(back[..1500].iter().all(|&b| b == b'z'));
+    assert!(back[1500..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn unlink_frees_the_blocks_and_the_inode() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(0, &vec![1u8; 4 * BS]).unwrap();
+    root.unlink(b"f").unwrap();
+    // The open file keeps its blocks.
+    assert_ne!(ram.free(), free);
+    assert_eq!(read_all(&*file).len(), 4 * BS);
+    drop(file);
+    assert_eq!(ram.free(), free);
+    root.unlink(b"hello").unwrap();
+    assert_eq!(ram.free(), (free.0 + 2, free.1 + 1));
+    assert_eq!(root.lookup(b"hello").err(), Some(Errno::ENOENT));
+    assert_eq!(root.unlink(b"sub"), Err(Errno::EISDIR));
+}
+
+#[test]
+fn directories_nest_and_count_their_links() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let a = root.create(b"a", FileType::Directory, 0o755, 0).unwrap();
+    let b = a.create(b"b", FileType::Directory, 0o755, 0).unwrap();
+    b.create(b"c", FileType::Regular, 0o644, 0).unwrap();
+    assert_eq!((root.metadata().nlink, a.metadata().nlink, b.metadata().nlink), (5, 3, 2));
+    assert_eq!(a.rmdir(b"b"), Err(Errno::ENOTEMPTY));
+    b.unlink(b"c").unwrap();
+    a.rmdir(b"b").unwrap();
+    assert_eq!(a.metadata().nlink, 2);
+    drop(b);
+    root.rmdir(b"a").unwrap();
+    drop(a);
+    assert_eq!(root.metadata().nlink, 4);
+    assert_eq!(ram.free(), free);
+}
+
+#[test]
+fn rename_moves_files_and_directories() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let sub = root.lookup(b"sub").unwrap();
+    let dir = root.create(b"d", FileType::Directory, 0o755, 0).unwrap();
+    root.rename(b"hello", &sub, b"moved").unwrap();
+    sub.rename(b"old", &sub, b"link").unwrap();
+    root.rename(b"d", &sub, b"d2").unwrap();
+    assert_eq!((root.metadata().nlink, sub.metadata().nlink), (4, 3));
+    let new = sub.create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    new.write_at(0, b"new").unwrap();
+    sub.rename(b"x", &sub, b"moved").unwrap();
+    drop((new, dir, sub, root, fs));
+
+    let fs = again(&ram);
+    let root = fs.root().unwrap();
+    assert_eq!(root.lookup(b"hello").err(), Some(Errno::ENOENT));
+    let sub = root.lookup(b"sub").unwrap();
+    assert_eq!(read_all(&*sub.lookup(b"moved").unwrap()), b"new");
+    assert_eq!(sub.lookup(b"link").unwrap().metadata().size, 13 * BS as u64);
+    let d2 = sub.lookup(b"d2").unwrap();
+    assert!(Arc::ptr_eq(&d2.lookup(b"..").unwrap(), &sub));
+}
+
+#[test]
+fn links_and_symbolic_links_are_made() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let hello = root.lookup(b"hello").unwrap();
+    root.link(b"same", &hello).unwrap();
+    assert_eq!(hello.metadata().nlink, 2);
+    assert_eq!(root.link(b"dir", &root.lookup(b"sub").unwrap()), Err(Errno::EPERM));
+    root.symlink(b"short", b"hello").unwrap();
+    root.symlink(b"long", &[b'y'; 200]).unwrap();
+    drop((hello, root, fs));
+
+    let fs = again(&ram);
+    let root = fs.root().unwrap();
+    assert!(Arc::ptr_eq(&root.lookup(b"same").unwrap(), &root.lookup(b"hello").unwrap()));
+    assert_eq!(root.lookup(b"short").unwrap().read_link().unwrap(), b"hello");
+    assert_eq!(root.lookup(b"long").unwrap().read_link().unwrap(), vec![b'y'; 200]);
+}
+
+#[test]
+fn many_entries_and_extents_grow_the_trees() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    for i in 0..15 {
+        root.create(format!("entry-{i:0>54}").as_bytes(), FileType::Regular, 0o644, 0).unwrap();
+    }
+    assert!(root.metadata().size > BS as u64);
+    // Every second block makes one extent, so the tree has more than 4 extents.
+    let file = root.create(b"sparse", FileType::Regular, 0o644, 0).unwrap();
+    for i in 0..8u64 {
+        file.write_at(i * 2 * BS as u64, &[i as u8 + 1]).unwrap();
+    }
+    drop((file, root, fs));
+
+    let fs = again(&ram);
+    let root = fs.root().unwrap();
+    assert_eq!(names(&*root).len(), 4 + 15 + 1);
+    let back = read_all(&*root.lookup(b"sparse").unwrap());
+    for i in 0..8 {
+        assert_eq!(back[i * 2 * BS], i as u8 + 1);
+    }
+    drop((root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let root = fs.root().unwrap();
+    root.unlink(b"sparse").unwrap();
+    for i in 0..15 {
+        root.unlink(format!("entry-{i:0>54}").as_bytes()).unwrap();
+    }
+    // The directory keeps its new block.
+    assert_eq!(ram.free(), (free.0 - 1, free.1));
+}
+
+#[test]
+fn a_block_map_file_changes_only_in_its_blocks() {
+    let (fs, _ram) = open_rw();
+    let old = fs.root().unwrap().lookup(b"sub").unwrap().lookup(b"old").unwrap();
+    old.write_at(5, b"in").unwrap();
+    assert_eq!(old.write_at(2 * BS as u64, b"hole"), Err(Errno::EOPNOTSUPP));
 }

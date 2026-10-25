@@ -672,6 +672,32 @@ if [ -x /usr/bin/gdb ]; then
     test \"$(readlink /mnt/long)\" = \"$(readlink /tmp/tree/long)\"
     ! touch /mnt/new 2>/dev/null
     echo \"alpine: ext4 read $(find /mnt | wc -l) files\"
+    umount /mnt
+    mount -t ext4 /dev/vdb /mnt
+    echo one > /mnt/new
+    echo two >> /mnt/new
+    test \"$(cat /mnt/new)\" = \"$(printf 'one\\ntwo')\"
+    head -c 200000 /dev/urandom > /tmp/r
+    cp /tmp/r /mnt/r
+    cmp /tmp/r /mnt/r
+    truncate -s 1000 /mnt/r
+    mkdir -p /mnt/d/e
+    mv /mnt/new /mnt/d/e/new
+    ln /mnt/d/e/new /mnt/hard
+    ln -s d/e/new /mnt/soft
+    for i in $(seq 300); do echo $i > /mnt/d/f$i; done
+    rm -r /mnt/many /mnt/etc
+    rm /mnt/d/f7
+    ! rmdir /mnt/d 2>/dev/null
+    umount /mnt
+    e2fsck -fn /dev/vdb
+    mount -t ext4 -o ro /dev/vdb /mnt
+    test \"$(cat /mnt/soft)\" = \"$(printf 'one\\ntwo')\"
+    test \"$(stat -c '%h' /mnt/hard)\" = 2
+    head -c 1000 /tmp/r | cmp - /mnt/r
+    test ! -e /mnt/many -a ! -e /mnt/d/f7 -a -e /mnt/d/f300
+    umount /mnt
+    echo 'alpine: ext4 write done'
 fi
 echo 'alpine: done'
 ",
