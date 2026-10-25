@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_vfs::inode::mode;
+use rk_vfs::inode::{FiemapExtent, mode};
 use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
@@ -319,21 +319,23 @@ impl Tx<'_> {
         result.map(|()| 0)
     }
 
-    /// Changes the size of the file `ino`. The blocks past the new size are freed, and the bytes
-    /// past the size in its last block become zeros.
+    /// Changes the size of the file `ino`. The bytes past the size in its last block become
+    /// zeros. A truncate down or to the same size frees the blocks past the size, also the blocks
+    /// that `fallocate` gave with `FALLOC_FL_KEEP_SIZE`, as Linux. A truncate up keeps them.
     pub(crate) fn truncate(&mut self, ino: u32, raw: &mut RawInode, size: u64) -> Result<()> {
         let fs = self.fs;
         let bs = fs.sb.block_size;
         let old = raw.size();
-        if size == old {
-            return Ok(());
-        }
         if raw.flags() & flags::EXTENTS == 0 {
-            return Err(Errno::EOPNOTSUPP);
+            return if size == old { Ok(()) } else { Err(Errno::EOPNOTSUPP) };
         }
-        if size < old {
+        if size <= old {
             let (mut extents, tree) = fs.extents(raw)?;
-            let freed = extent::cut(&mut extents, size.div_ceil(bs));
+            let last = size.div_ceil(bs);
+            if size == old && extents.iter().all(|e| e.end() <= last) {
+                return Ok(());
+            }
+            let freed = extent::cut(&mut extents, last);
             let mut count = 0;
             for (start, len) in freed {
                 self.free_blocks(start, len)?;
@@ -343,7 +345,8 @@ impl Tx<'_> {
             self.build_tree(ino, raw, &extents, tree)?;
         }
         let at = size.min(old);
-        if !at.is_multiple_of(bs)
+        if size != old
+            && !at.is_multiple_of(bs)
             && let Some((block, true)) = fs.map(raw, at / bs)?
         {
             let zero = vec![0u8; (bs - at % bs) as usize];
@@ -826,6 +829,47 @@ impl Inode for Node {
         let result = tx.write_data(self.ino, &mut raw, offset, buf);
         tx.save(self, raw)?;
         result
+    }
+
+    fn fiemap(&self, start: u64, len: u64) -> Result<Vec<FiemapExtent>> {
+        let raw = self.raw();
+        let bs = self.fs.sb.block_size;
+        let end = start.saturating_add(len);
+        let extents = if raw.flags() & flags::EXTENTS != 0 {
+            self.fs.extents(&raw)?.0
+        } else {
+            // A file with a block map: the runs of blocks that follow each other on the disk.
+            let mut runs: Vec<Extent> = Vec::new();
+            for lblock in 0..raw.size().div_ceil(bs) {
+                let Some((block, _)) = self.fs.map(&raw, lblock)? else { continue };
+                match runs.last_mut() {
+                    Some(r) if r.end() == lblock && r.start + u64::from(r.len) == block => {
+                        r.len += 1
+                    }
+                    _ => runs.push(Extent {
+                        lblock: lblock as u32,
+                        len: 1,
+                        start: block,
+                        init: true,
+                    }),
+                }
+            }
+            runs
+        };
+        Ok(extents
+            .iter()
+            .filter(|e| u64::from(e.lblock) * bs < end && e.end() * bs > start)
+            .map(|e| {
+                // The first extent starts at `start`, as the iomap of Linux maps from there.
+                let skip = (start / bs).saturating_sub(u64::from(e.lblock));
+                FiemapExtent {
+                    logical: (u64::from(e.lblock) + skip) * bs,
+                    physical: (e.start + skip) * bs,
+                    length: (u64::from(e.len) - skip) * bs,
+                    unwritten: !e.init,
+                }
+            })
+            .collect())
     }
 
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
