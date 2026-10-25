@@ -414,6 +414,8 @@ fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
         shared_pending: p.shared_pending().0,
         locked: p.vm().map_or(0, |vm| vm.locked_bytes() as u64),
         rss: p.vm().map_or(0, |vm| vm.resident_pages(0, rk_frame::vm::USER_END) as u64 * 4096),
+        cred: (*p.cred()).clone(),
+        no_new_privs: thread.is_some_and(Thread::no_new_privs),
     };
     let mut s = s;
     s.pid = p.pid();

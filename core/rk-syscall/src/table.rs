@@ -2,8 +2,8 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace,
-    sched, seccomp, shm, signal, signalfd, splice, timer, timerfd, xattr,
+    aio, cred, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process,
+    ptrace, sched, seccomp, shm, signal, signalfd, splice, timer, timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -199,12 +199,22 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETRUSAGE => info::getrusage(cx, a[0], a[1]),
         nr::SYSINFO => info::sysinfo(cx, a[0]),
         nr::TIMES => info::times(cx, a[0]),
-        nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => Ok(0),
-        nr::SETUID | nr::SETGID | nr::SETREUID | nr::SETREGID | nr::SETRESUID | nr::SETRESGID => {
-            Ok(0)
-        }
-        nr::GETRESUID | nr::GETRESGID => info::getresid(cx, a[0], a[1], a[2]),
-        nr::GETGROUPS => Ok(0),
+        nr::GETUID => cred::getuid(cx),
+        nr::GETGID => cred::getgid(cx),
+        nr::GETEUID => cred::geteuid(cx),
+        nr::GETEGID => cred::getegid(cx),
+        nr::SETUID => cred::setuid(cx, a[0]),
+        nr::SETGID => cred::setgid(cx, a[0]),
+        nr::SETREUID => cred::setreuid(cx, a[0], a[1]),
+        nr::SETREGID => cred::setregid(cx, a[0], a[1]),
+        nr::SETRESUID => cred::setresuid(cx, a[0], a[1], a[2]),
+        nr::SETRESGID => cred::setresgid(cx, a[0], a[1], a[2]),
+        nr::GETRESUID => cred::getresid(cx, false, a[0], a[1], a[2]),
+        nr::GETRESGID => cred::getresid(cx, true, a[0], a[1], a[2]),
+        nr::SETFSUID => cred::setfsuid(cx, a[0]),
+        nr::SETFSGID => cred::setfsgid(cx, a[0]),
+        nr::GETGROUPS => cred::getgroups(cx, a[0], a[1]),
+        nr::SETGROUPS => cred::setgroups(cx, a[0], a[1]),
         nr::SETPGID => process::setpgid(cx, a[0], a[1]),
         nr::GETPPID => Ok(u64::from(cx.process().ppid())),
         nr::GETPGRP => Ok(u64::from(cx.process().pgid())),
@@ -293,8 +303,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETRANDOM => info::getrandom(cx, a[0], a[1], a[2]),
         nr::MEMBARRIER => mm::membarrier(cx, a[0], a[1], a[2]),
         nr::STATX => fs::statx(cx, a[0], a[1], a[2], a[3], a[4]),
-        nr::CAPGET => info::capget(cx, a[0], a[1]),
-        nr::CAPSET => info::capset(cx, a[0], a[1]),
+        nr::CAPGET => cred::capget(cx, a[0], a[1]),
+        nr::CAPSET => cred::capset(cx, a[0], a[1]),
         nr::KCMP => process::kcmp(a[0], a[1], a[2], a[3], a[4]),
         nr::PIDFD_OPEN => pidfd::pidfd_open(cx, a[0], a[1]),
         nr::PIDFD_SEND_SIGNAL => pidfd::pidfd_send_signal(cx, a[0], a[1], a[2], a[3]),

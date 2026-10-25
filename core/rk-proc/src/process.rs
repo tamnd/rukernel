@@ -21,6 +21,7 @@ use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
+use rk_vfs::cred::Cred;
 use rk_vfs::{FdTable, FsContext, Location};
 
 pub mod ptrace;
@@ -153,6 +154,8 @@ pub struct Process {
     /// commands that they allow. A new address space has none.
     membarrier: AtomicU32,
     limits: SpinLock<[Limit; RLIM_NLIMITS]>,
+    /// The credentials. A change makes a new copy, so a reader keeps a stable view.
+    cred: SpinLock<Arc<Cred>>,
     timers: SpinLock<Timers>,
     /// The user CPU time in timer ticks of the threads that ended.
     dead_ticks: AtomicU64,
@@ -562,6 +565,29 @@ impl Process {
         self.timers.lock()
     }
 
+    /// The credentials of the process.
+    pub fn cred(&self) -> Arc<Cred> {
+        self.cred.lock().clone()
+    }
+
+    /// Sets the credentials.
+    pub fn set_cred(&self, cred: Cred) {
+        *self.cred.lock() = Arc::new(cred);
+    }
+
+    /// Changes the credentials with `f`, which gives the new credentials from the old. The lock
+    /// stays held, so two changes do not lose one of them.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of `f`.
+    pub fn change_cred(&self, f: impl FnOnce(&Cred) -> Result<Cred, Errno>) -> Result<(), Errno> {
+        let mut cred = self.cred.lock();
+        let new = f(&cred)?;
+        *cred = Arc::new(new);
+        Ok(())
+    }
+
     /// The signal that the parent gets when the process ends, or 0.
     pub fn exit_signal(&self) -> u32 {
         self.exit_signal
@@ -613,6 +639,7 @@ impl Process {
                 u64::from(PID_MAX),
                 rk_vfs::fdtable::NR_OPEN_DEFAULT as u64,
             )),
+            cred: SpinLock::new(Arc::new(Cred::root())),
             timers: SpinLock::new(Timers::default()),
             dead_ticks: AtomicU64::new(0),
             child_ticks: AtomicU64::new(0),
@@ -1058,6 +1085,7 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
     );
     *child.image.lock() = pp.image.lock().clone();
     *child.limits.lock() = *pp.limits.lock();
+    *child.cred.lock() = pp.cred();
     child.set_oom_score_adj(pp.oom_score_adj());
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     thread.inherit_seccomp(parent);
