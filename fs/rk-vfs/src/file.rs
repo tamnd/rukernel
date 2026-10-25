@@ -254,6 +254,32 @@ impl FileOps for InodeFile {
                 inode.set_attr_flags(u32::from_ne_bytes(b))?;
                 Ok(0)
             }
+            FIBMAP => {
+                let mut b = [0u8; 4];
+                mem.read(arg, &mut b)?;
+                let block = i32::from_ne_bytes(b);
+                if block < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let bs = u64::from(inode.metadata().blksize);
+                let at = block as u64 * bs;
+                let extents = inode.fiemap(at, 1).map_err(|_| Errno::EINVAL)?;
+                // A hole and an extent that is not initialized give 0, as Linux.
+                let phys = match extents.first() {
+                    Some(e) if !e.unwritten && e.logical <= at => {
+                        (e.physical + at - e.logical) / bs
+                    }
+                    _ => 0,
+                };
+                let phys = i32::try_from(phys).map_err(|_| Errno::ERANGE)?;
+                mem.write(arg, &phys.to_ne_bytes())?;
+                Ok(0)
+            }
+            FIGETBSZ => {
+                let bs = inode.metadata().blksize as i32;
+                mem.write(arg, &bs.to_ne_bytes())?;
+                Ok(0)
+            }
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
             fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
@@ -261,6 +287,10 @@ impl FileOps for InodeFile {
     }
 }
 
+/// `_IO(0, 1)`. Gives the block of the disk of a block of the file.
+const FIBMAP: u32 = 1;
+/// `_IO(0, 2)`. Gives the block size.
+const FIGETBSZ: u32 = 2;
 /// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 /// `_IOW('f', 2, long)`.
