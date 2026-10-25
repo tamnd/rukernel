@@ -232,6 +232,149 @@ pub(crate) fn readv(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
     Ok(done)
 }
 
+/// The flags of `preadv2` and `pwritev2`, as `RWF_*` of linux/fs.h.
+mod rwf {
+    pub(super) const HIPRI: u64 = 0x1;
+    pub(super) const DSYNC: u64 = 0x2;
+    pub(super) const SYNC: u64 = 0x4;
+    pub(super) const NOWAIT: u64 = 0x8;
+    pub(super) const APPEND: u64 = 0x10;
+    pub(super) const NOAPPEND: u64 = 0x20;
+    pub(super) const ATOMIC: u64 = 0x40;
+    pub(super) const DONTCACHE: u64 = 0x80;
+    /// The flags that Linux knows, as `RWF_SUPPORTED`.
+    pub(super) const KNOWN: u64 =
+        HIPRI | DSYNC | SYNC | NOWAIT | APPEND | NOAPPEND | ATOMIC | DONTCACHE;
+}
+
+/// `preadv`. A 64-bit kernel takes the full offset from the low register, as `pos_from_hilo` of
+/// Linux. An offset of -1 gives `EINVAL`, as each negative offset.
+pub(crate) fn preadv(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, offset: u64) -> SysResult {
+    if (offset as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    preadv2(cx, fd, iov, count, offset, 0)
+}
+
+/// `pwritev`, with the offset of `preadv`.
+pub(crate) fn pwritev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, offset: u64) -> SysResult {
+    if (offset as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    pwritev2(cx, fd, iov, count, offset, 0)
+}
+
+/// `preadv` and `preadv2`. An offset of -1 for `preadv2` reads at the position of the file, as
+/// `readv`. The flags only change the speed, so the read does not use them.
+pub(crate) fn preadv2(
+    cx: &Cx<'_>,
+    fd: u64,
+    iov: u64,
+    count: u64,
+    offset: u64,
+    flags: u64,
+) -> SysResult {
+    // The checks of `do_preadv`, `vfs_readv` and `kiocb_set_rw_flags` of Linux, in its order.
+    if offset as i64 == -1 {
+        check_rw_flags(flags, false)?;
+        return readv(cx, fd, iov, count);
+    }
+    if (offset as i64) < 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.file(fd)?;
+    if !file.ops().seekable() {
+        return Err(Errno::ESPIPE);
+    }
+    check_rw_flags(flags, false)?;
+    let mut done = 0;
+    for v in read_iovecs(cx, iov, count)? {
+        if v.iov_len == 0 {
+            continue;
+        }
+        let at = offset + done;
+        let n = match read_with(cx, &file, v.iov_base, v.iov_len, |d, b| file.read_at(at + d, b)) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        done += n;
+        if n < v.iov_len {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+/// `pwritev` and `pwritev2`. An offset of -1 for `pwritev2` writes at the position of the file,
+/// as `writev`. `RWF_APPEND` writes at the end, and `RWF_DSYNC` and `RWF_SYNC` sync the file
+/// after the write.
+pub(crate) fn pwritev2(
+    cx: &Cx<'_>,
+    fd: u64,
+    iov: u64,
+    count: u64,
+    offset: u64,
+    flags: u64,
+) -> SysResult {
+    if (offset as i64) < -1 {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.file(fd)?;
+    let done = if offset as i64 == -1 {
+        check_rw_flags(flags, true)?;
+        writev(cx, fd, iov, count)?
+    } else {
+        if !file.ops().seekable() {
+            return Err(Errno::ESPIPE);
+        }
+        if !file.flags().writable() {
+            return Err(Errno::EBADF);
+        }
+        check_rw_flags(flags, true)?;
+        let mut offset = offset;
+        if flags & rwf::APPEND != 0 {
+            offset = file.metadata()?.size;
+        }
+        let mut done = 0;
+        for v in read_iovecs(cx, iov, count)? {
+            if v.iov_len == 0 {
+                continue;
+            }
+            let at = offset + done;
+            let n = match write_with(cx, v.iov_base, v.iov_len, |d, b| file.write_at(at + d, b)) {
+                Ok(n) => n,
+                Err(e) if done == 0 => return sigpipe(cx, Err(e)),
+                Err(_) => break,
+            };
+            done += n;
+            if n < v.iov_len {
+                break;
+            }
+        }
+        done
+    };
+    if flags & (rwf::DSYNC | rwf::SYNC) != 0 && done > 0 {
+        file.sync()?;
+    }
+    Ok(done)
+}
+
+/// Checks the flags of `preadv2` or `pwritev2`, as `kiocb_set_rw_flags` of Linux. The file
+/// systems of rukernel have no atomic writes and no uncached I/O.
+fn check_rw_flags(flags: u64, write: bool) -> Result<(), Errno> {
+    if flags & !rwf::KNOWN != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & rwf::ATOMIC != 0 {
+        return Err(if write { Errno::EOPNOTSUPP } else { Errno::EINVAL });
+    }
+    if flags & rwf::DONTCACHE != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
+}
+
 pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
     if !file.flags().writable() {
