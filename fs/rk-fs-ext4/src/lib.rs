@@ -36,6 +36,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use layout::{GroupDesc, RawInode, Superblock, gd, u16_at, u32_at};
 use rk_abi::Errno;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
@@ -128,6 +129,14 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let dev = args.dev.ok_or(Errno::ENOTBLK)?;
     let cache = rk_vfs::blockdev::block_cache(dev).ok_or(Errno::ENXIO)?;
     let fs = Fs::open(dev, alloc::boxed::Box::new(cache), args.read_only)?;
+    // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks.
+    for option in args.data.split(|&c| c == b',') {
+        match option {
+            b"minixdf" => fs.minix_df.store(true, Ordering::Relaxed),
+            b"bsddf" => fs.minix_df.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+    }
     Ok(fs.root()?)
 }
 
@@ -191,6 +200,9 @@ pub struct Fs {
     committed: SpinLock<i64>,
     /// The inodes in memory, so that two lookups of one file give one inode.
     inodes: SpinLock<BTreeMap<u32, Weak<Node>>>,
+    /// The mount option `minixdf`: `statfs` counts the blocks of the metadata in the count of
+    /// blocks.
+    minix_df: AtomicBool,
     this: Weak<Fs>,
 }
 
@@ -273,6 +285,7 @@ impl Fs {
             busy: SpinLock::new(BTreeSet::new()),
             committed: SpinLock::new(rk_vfs::now().sec),
             inodes: SpinLock::new(BTreeMap::new()),
+            minix_df: AtomicBool::new(false),
             this: Weak::new(),
         };
         if journal {
@@ -391,7 +404,8 @@ impl Fs {
     }
 
     /// The counts of the file system for `statfs`, as `ext4_statfs` of Linux gives them. The
-    /// blocks of the metadata and of the journal are not in the count of blocks.
+    /// blocks of the metadata and of the journal are not in the count of blocks, except with
+    /// `minixdf`.
     pub(crate) fn stat(&self) -> rk_vfs::inode::FsStat {
         let sb = &self.sb;
         let meta = self.meta.lock();
@@ -415,6 +429,9 @@ impl Fs {
             && let Ok(raw) = self.read_inode(sb.journal_inum)
         {
             overhead += raw.size() / sb.block_size;
+        }
+        if self.minix_df.load(Ordering::Relaxed) {
+            overhead = 0;
         }
         rk_vfs::inode::FsStat {
             bsize: sb.block_size,
