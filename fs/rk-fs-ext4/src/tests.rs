@@ -599,4 +599,79 @@ mod log {
         img[AT * BS + jsb::MAX_LEN + 3] = 15;
         assert_eq!(open(img).err(), Some(Errno::EUCLEAN));
     }
+
+    /// The image with an empty journal of 23 blocks in the blocks 41 to 63, and without
+    /// `RECOVER`.
+    fn image_with_room() -> Vec<u8> {
+        let mut img = Image(image());
+        let inode = img.inode(8, 0o100600, 23 * BS as u32, 1, flags::EXTENTS);
+        img.extents(inode, &[(0, 23, 41)]);
+        img.put32(1024 + 0xe0, 8);
+        img.put32(1024 + 0x5c, layout::compat::HAS_JOURNAL);
+        for b in 41..=63 {
+            img.0[3 * BS + (b - 1) / 8] |= 1 << ((b - 1) % 8);
+        }
+        let free = layout::u32_at(&img.0, 1024 + 0xc) - 23;
+        img.put32(1024 + 0xc, free);
+        img.put16(2 * BS + 0xc, free as u16);
+        let mut sb = header(4, 0);
+        put_be32(&mut sb, jsb::BLOCK_SIZE, BS as u32);
+        put_be32(&mut sb, jsb::MAX_LEN, 23);
+        put_be32(&mut sb, jsb::FIRST, 1);
+        put_be32(&mut sb, jsb::SEQUENCE, 9);
+        put_be32(&mut sb, jsb::INCOMPAT, feature::REVOKE | feature::CSUM_V3);
+        sb[jsb::UUID..jsb::UUID + 16].copy_from_slice(&UUID);
+        seal(&mut sb, jsb::CHECKSUM, !0);
+        img.0[41 * BS..42 * BS].copy_from_slice(&sb);
+        img.0
+    }
+
+    #[test]
+    fn the_journal_brings_back_the_changes_after_a_crash() {
+        let clean = image_with_room();
+        let ram = Ram(Arc::new(SpinLock::new(clean.clone())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        root.create(b"dir", FileType::Directory, 0o755, 0).unwrap();
+        root.symlink(b"ln", b"hello").unwrap();
+        let live = ram.0.lock().clone();
+        assert_ne!(layout::u32_at(&live, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        let free = ram.free();
+
+        // The crash comes before the blocks go to their places: only the journal is on the
+        // disk. The two changes fit in the log, so no checkpoint wrote them before.
+        let mut crash = clean;
+        crash[41 * BS..].copy_from_slice(&live[41 * BS..]);
+        let incompat = layout::u32_at(&crash, 1024 + 0x60) | layout::incompat::RECOVER;
+        crash[1024 + 0x60..1024 + 0x64].copy_from_slice(&incompat.to_le_bytes());
+        let crashed = Ram(Arc::new(SpinLock::new(crash)));
+        let back = Fs::open(7, alloc::boxed::Box::new(crashed.clone()), true).unwrap();
+        let names: Vec<Vec<u8>> =
+            names(&*back.root().unwrap()).into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&b"dir".to_vec()) && names.contains(&b"ln".to_vec()));
+        assert_eq!(crashed.free(), free);
+        let disk = crashed.0.lock();
+        // The superblock differs only in `RECOVER`, and the test reads its free counts.
+        let diff: Vec<usize> = (2 * BS..41 * BS).filter(|&i| disk[i] != live[i]).collect();
+        assert!(diff.is_empty(), "{diff:?}");
+        drop(disk);
+        drop((root, fs));
+    }
+
+    #[test]
+    fn the_unmount_leaves_a_clean_journal() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        for i in 0..6 {
+            root.create(format!("d{i}").as_bytes(), FileType::Directory, 0o755, 0).unwrap();
+        }
+        assert_ne!(be32(&ram.0.lock(), 41 * BS + jsb::START), 0);
+        drop((root, fs));
+        let disk = ram.0.lock().clone();
+        assert_eq!(layout::u32_at(&disk, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        assert_eq!(be32(&disk, 41 * BS + jsb::START), 0);
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        assert_eq!(names(&*fs.root().unwrap()).len(), 4 + 6);
+    }
 }

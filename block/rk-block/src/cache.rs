@@ -333,6 +333,15 @@ impl<S: Store> PageCache<S> {
         self.store.flush()
     }
 
+    /// Makes the data that the store has durable, without writing the dirty pages.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the store.
+    pub fn flush(&self) -> Result<()> {
+        self.store.flush()
+    }
+
     /// Drops the folios that have a byte from `offset` up to `offset + len`, after a write that
     /// did not go through the cache. Call `write_back` first, because a dirty page goes too.
     pub fn forget(&self, offset: u64, len: u64) {

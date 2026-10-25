@@ -4,10 +4,16 @@
 //! last transaction with a valid commit block, the second pass reads the revoke records, and the
 //! third pass writes the copies to their blocks. A copy that a later revoke record names is not
 //! written. The fields of the journal are big endian.
+//!
+//! The writer puts each change in one transaction. It writes the descriptor blocks, the copies,
+//! the revoke blocks and the commit block, makes them durable, and then writes the blocks to
+//! their places. When the log is full, a checkpoint makes the places durable and marks the log
+//! empty. A freed block that the log has a copy of gets a revoke record, so a replay does not
+//! write the old copy over new data.
 
-use crate::layout::RawInode;
+use crate::layout::{RawInode, flags};
 use crate::{Fs, crc};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -35,6 +41,10 @@ pub(crate) mod feature {
     /// The features that the replay supports.
     pub(crate) const SUPPORTED: u32 = REVOKE | BIT64 | ASYNC_COMMIT | CSUM_V2 | CSUM_V3;
 }
+
+/// The compatible feature of a journal with the crc32 checksums of jbd, which the driver does
+/// not write.
+const COMPAT_CHECKSUM: u32 = 0x1;
 
 /// The flags of a tag.
 mod tag {
@@ -158,7 +168,7 @@ impl<'a> Journal<'a> {
     }
 
     fn write(&self, n: u32, data: &[u8]) -> Result<()> {
-        self.fs.write(self.map(n)? * self.bs as u64, data)
+        self.fs.write_direct(self.map(n)? * self.bs as u64, data)
     }
 
     /// The block of the log after `n`.
@@ -262,7 +272,7 @@ impl<'a> Journal<'a> {
                         if tag.block >= self.fs.sb.blocks_count {
                             return Err(Errno::EUCLEAN);
                         }
-                        self.fs.write(tag.block * self.bs as u64, &data)?;
+                        self.fs.write_direct(tag.block * self.bs as u64, &data)?;
                     }
                 }
                 kind::COMMIT => {
@@ -346,6 +356,295 @@ impl Fs {
             let csum = crc::crc32c(!0, &b[..at]);
             crate::layout::put32(&mut b, at, csum);
         }
-        self.write(crate::layout::SUPERBLOCK_AT, &b)
+        self.write_direct(crate::layout::SUPERBLOCK_AT, &b)
+    }
+}
+
+/// The log that a read and write mount writes. Each change of the file system is one
+/// transaction. The transaction goes to the log and is durable before its blocks go to their
+/// places, so after a crash the next mount replays the log. The log is empty again after a
+/// checkpoint, which makes the blocks of all the transactions durable.
+pub(crate) struct Log {
+    /// The blocks of the disk of the journal, from the block 0 of the journal.
+    blocks: Vec<u64>,
+    bs: usize,
+    sb: Vec<u8>,
+    max_len: u32,
+    first: u32,
+    incompat: u32,
+    seed: u32,
+    /// The block of the log for the next transaction.
+    head: u32,
+    /// The sequence number of the next transaction.
+    seq: u32,
+    /// The blocks of the log that the transactions since the last checkpoint use.
+    used: u32,
+    /// The blocks of the disk that the log has copies of since the last checkpoint.
+    logged: BTreeSet<u64>,
+    /// The freed blocks that the log has copies of, to revoke in the next transaction.
+    revokes: BTreeSet<u64>,
+}
+
+impl Log {
+    /// Reads the journal of the inode `ino`, which must have no transaction to replay.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EROFS` for a journal that the driver cannot write, and the errors of
+    /// `Journal::open`.
+    pub(crate) fn open(fs: &Fs, ino: u32) -> Result<Self> {
+        let j = Journal::open(fs, ino)?;
+        let v2 = be32(&j.sb, 4) == kind::SUPERBLOCK_V2;
+        if (v2 && be32(&j.sb, 0x24) & COMPAT_CHECKSUM != 0) || be32(&j.sb, jsb::START) != 0 {
+            return Err(Errno::EROFS);
+        }
+        let blocks = if j.inode.flags() & flags::EXTENTS != 0 {
+            let (extents, _) = fs.extents(&j.inode)?;
+            let mut blocks = Vec::with_capacity(j.max_len as usize);
+            for n in 0..u64::from(j.max_len) {
+                let e =
+                    crate::extent::find(&extents, n).filter(|e| e.init).ok_or(Errno::EUCLEAN)?;
+                blocks.push(e.start + (n - u64::from(e.lblock)));
+            }
+            blocks
+        } else {
+            (0..j.max_len).map(|n| j.map(n)).collect::<Result<Vec<_>>>()?
+        };
+        Ok(Self {
+            blocks,
+            bs: j.bs,
+            seq: be32(&j.sb, jsb::SEQUENCE),
+            sb: j.sb,
+            max_len: j.max_len,
+            first: j.first,
+            head: j.first,
+            incompat: j.incompat,
+            seed: j.seed,
+            used: 0,
+            logged: BTreeSet::new(),
+            revokes: BTreeSet::new(),
+        })
+    }
+
+    fn csum(&self) -> bool {
+        self.incompat & (feature::CSUM_V2 | feature::CSUM_V3) != 0
+    }
+
+    fn v3(&self) -> bool {
+        self.incompat & feature::CSUM_V3 != 0
+    }
+
+    fn bit64(&self) -> bool {
+        self.incompat & feature::BIT64 != 0
+    }
+
+    fn tag_bytes(&self) -> usize {
+        if self.v3() {
+            return 16;
+        }
+        let size = if self.incompat & feature::CSUM_V2 != 0 { 14 } else { 12 };
+        if self.bit64() { size } else { size - 4 }
+    }
+
+    /// The bytes of a descriptor or a revoke block after the header, without the tail.
+    fn space(&self, header: usize) -> usize {
+        self.bs - header - if self.csum() { 4 } else { 0 }
+    }
+
+    /// The number of tags in one descriptor block. The first tag has the UUID after it.
+    fn tags_per_block(&self) -> usize {
+        (self.space(12) - 16) / self.tag_bytes()
+    }
+
+    fn revokes_per_block(&self) -> usize {
+        self.space(16) / if self.bit64() { 8 } else { 4 }
+    }
+
+    /// The blocks of the log for a transaction with `copies` copies and `revokes` revoke
+    /// records.
+    fn need(&self, copies: usize, revokes: usize) -> u32 {
+        let n = copies
+            + copies.div_ceil(self.tags_per_block())
+            + revokes.div_ceil(self.revokes_per_block())
+            + 1;
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    fn capacity(&self) -> u32 {
+        self.max_len - self.first
+    }
+
+    fn header(&self, kind: u32) -> Vec<u8> {
+        let mut b = vec![0u8; self.bs];
+        put_be32(&mut b, 0, MAGIC);
+        put_be32(&mut b, 4, kind);
+        put_be32(&mut b, 8, self.seq);
+        b
+    }
+
+    /// Writes the checksum in the last 4 bytes of a descriptor or a revoke block.
+    fn seal(&self, b: &mut [u8]) {
+        if self.csum() {
+            let at = b.len() - 4;
+            let csum = crc::crc32c(self.seed, &zeroed(b, at));
+            put_be32(b, at, csum);
+        }
+    }
+
+    /// Writes `data` at the head of the log. Gives the offset on the disk.
+    fn put(&mut self, fs: &Fs, data: &[u8]) -> Result<u64> {
+        let at = self.blocks[self.head as usize] * self.bs as u64;
+        fs.write_direct(at, data)?;
+        self.head = if self.head + 1 >= self.max_len { self.first } else { self.head + 1 };
+        Ok(at)
+    }
+
+    /// Writes the journal superblock with the first transaction at `start`, or 0 for an empty
+    /// log.
+    fn write_sb(&mut self, fs: &Fs, start: u32) -> Result<u64> {
+        put_be32(&mut self.sb, jsb::SEQUENCE, self.seq);
+        put_be32(&mut self.sb, jsb::START, start);
+        if self.csum() {
+            let csum = crc::crc32c(!0, &zeroed(&self.sb[..jsb::SIZE], jsb::CHECKSUM));
+            put_be32(&mut self.sb, jsb::CHECKSUM, csum);
+        }
+        let at = self.blocks[0] * self.bs as u64;
+        fs.write_direct(at, &self.sb)?;
+        Ok(at)
+    }
+
+    /// Makes the blocks of all the transactions durable, and marks the log empty.
+    pub(crate) fn checkpoint(&mut self, fs: &Fs) -> Result<()> {
+        fs.disk.write_back(0, u64::MAX)?;
+        fs.disk.flush()?;
+        let at = self.write_sb(fs, 0)?;
+        fs.disk.write_back(at, self.bs as u64)?;
+        fs.disk.flush()?;
+        self.used = 0;
+        self.logged.clear();
+        self.revokes.clear();
+        Ok(())
+    }
+
+    /// Notes that the blocks from `start` up to `start + count` are free. The log revokes the
+    /// copies that it has of them.
+    pub(crate) fn freed(&mut self, start: u64, count: u64) {
+        if self.logged.range(start..start + count).next().is_none() {
+            return;
+        }
+        let blocks: Vec<u64> = self.logged.range(start..start + count).copied().collect();
+        self.revokes.extend(blocks);
+    }
+
+    /// Notes that the block `block` has metadata again, so the log does not revoke it.
+    pub(crate) fn used_again(&mut self, block: u64) {
+        self.revokes.remove(&block);
+    }
+
+    /// Writes the transaction of `blocks`, makes it durable, and then writes the blocks to
+    /// their places. A transaction larger than the log goes to its places after a checkpoint,
+    /// and a second checkpoint makes it durable.
+    pub(crate) fn commit(&mut self, fs: &Fs, blocks: &BTreeMap<u64, Vec<u8>>) -> Result<()> {
+        let revokes: Vec<u64> = core::mem::take(&mut self.revokes).into_iter().collect();
+        if blocks.is_empty() && revokes.is_empty() {
+            return Ok(());
+        }
+        let need = self.need(blocks.len(), revokes.len());
+        if need > self.capacity() {
+            self.checkpoint(fs)?;
+            for (&block, data) in blocks {
+                fs.write_direct(block * self.bs as u64, data)?;
+            }
+            return self.checkpoint(fs);
+        }
+        if need > self.capacity() - self.used {
+            self.checkpoint(fs)?;
+        }
+        let start = self.head;
+        let mut written = Vec::with_capacity(need as usize + 1);
+        let list: Vec<(&u64, &Vec<u8>)> = blocks.iter().collect();
+        for chunk in list.chunks(self.tags_per_block()) {
+            let mut desc = self.header(kind::DESCRIPTOR);
+            let mut copies = Vec::with_capacity(chunk.len());
+            let mut at = 12;
+            for (i, &(&block, data)) in chunk.iter().enumerate() {
+                let mut copy = data.clone();
+                let mut flags = 0;
+                if be32(&copy, 0) == MAGIC {
+                    copy[..4].fill(0);
+                    flags |= tag::ESCAPE;
+                }
+                if i > 0 {
+                    flags |= tag::SAME_UUID;
+                }
+                if i + 1 == chunk.len() {
+                    flags |= tag::LAST;
+                }
+                let csum = crc::crc32c(crc::crc32c(self.seed, &self.seq.to_be_bytes()), &copy);
+                let t = &mut desc[at..at + self.tag_bytes()];
+                put_be32(t, 0, block as u32);
+                if self.v3() {
+                    put_be32(t, 4, flags);
+                    put_be32(t, 8, (block >> 32) as u32);
+                    put_be32(t, 12, if self.csum() { csum } else { 0 });
+                } else {
+                    let csum16 = if self.csum() { csum as u16 } else { 0 };
+                    t[4..6].copy_from_slice(&csum16.to_be_bytes());
+                    t[6..8].copy_from_slice(&(flags as u16).to_be_bytes());
+                    if self.bit64() {
+                        put_be32(t, 8, (block >> 32) as u32);
+                    }
+                }
+                at += self.tag_bytes();
+                if i == 0 {
+                    desc[at..at + 16].copy_from_slice(&self.sb[jsb::UUID..jsb::UUID + 16]);
+                    at += 16;
+                }
+                copies.push(copy);
+            }
+            self.seal(&mut desc);
+            written.push(self.put(fs, &desc)?);
+            for copy in copies {
+                written.push(self.put(fs, &copy)?);
+            }
+        }
+        let size = if self.bit64() { 8 } else { 4 };
+        for chunk in revokes.chunks(self.revokes_per_block()) {
+            let mut b = self.header(kind::REVOKE);
+            put_be32(&mut b, 12, (16 + chunk.len() * size) as u32);
+            for (i, &block) in chunk.iter().enumerate() {
+                if size == 8 {
+                    put_be32(&mut b, 16 + i * 8, (block >> 32) as u32);
+                    put_be32(&mut b, 20 + i * 8, block as u32);
+                } else {
+                    put_be32(&mut b, 16 + i * 4, block as u32);
+                }
+            }
+            self.seal(&mut b);
+            written.push(self.put(fs, &b)?);
+        }
+        let mut commit = self.header(kind::COMMIT);
+        let now = rk_vfs::now();
+        commit[0x30..0x38].copy_from_slice(&(now.sec as u64).to_be_bytes());
+        put_be32(&mut commit, 0x38, now.nsec);
+        if self.csum() {
+            let csum = crc::crc32c(self.seed, &commit);
+            put_be32(&mut commit, 16, csum);
+        }
+        written.push(self.put(fs, &commit)?);
+        if self.used == 0 {
+            written.push(self.write_sb(fs, start)?);
+        }
+        for at in written {
+            fs.disk.write_back(at, self.bs as u64)?;
+        }
+        fs.disk.flush()?;
+        self.seq = self.seq.wrapping_add(1);
+        self.used += need;
+        for (&block, data) in blocks {
+            self.logged.insert(block);
+            fs.write_direct(block * self.bs as u64, data)?;
+        }
+        Ok(())
     }
 }

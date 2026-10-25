@@ -243,7 +243,7 @@ impl Tx<'_> {
             };
             match found {
                 Some((block, true)) => {
-                    if let Err(e) = fs.write(block * bs + in_block as u64, data) {
+                    if let Err(e) = fs.write_file(raw, block * bs + in_block as u64, data) {
                         result = Err(e);
                         break;
                     }
@@ -251,7 +251,7 @@ impl Tx<'_> {
                 Some((block, false)) => {
                     let mut full = vec![0u8; bs as usize];
                     full[in_block..in_block + n].copy_from_slice(data);
-                    if let Err(e) = fs.write(block * bs, &full) {
+                    if let Err(e) = fs.write_file(raw, block * bs, &full) {
                         result = Err(e);
                         break;
                     }
@@ -285,10 +285,10 @@ impl Tx<'_> {
                     let partial_first = in_block != 0;
                     let partial_last = (lblock + u64::from(got)) * bs > end;
                     if partial_first {
-                        fs.write(start * bs, &zero)?;
+                        fs.write_file(raw, start * bs, &zero)?;
                     }
                     if partial_last && (got > 1 || !partial_first) {
-                        fs.write((start + u64::from(got) - 1) * bs, &zero)?;
+                        fs.write_file(raw, (start + u64::from(got) - 1) * bs, &zero)?;
                     }
                     extent::put(
                         &mut extents,
@@ -342,7 +342,7 @@ impl Tx<'_> {
             && let Some((block, true)) = fs.map(raw, at / bs)?
         {
             let zero = vec![0u8; (bs - at % bs) as usize];
-            fs.write(block * bs + at % bs, &zero)?;
+            fs.write_file(raw, block * bs + at % bs, &zero)?;
         }
         raw.set_size(size);
         Ok(())
