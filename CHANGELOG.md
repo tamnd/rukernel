@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- ext4 mounts a disk with `meta_bg`, which mkfs uses when the group descriptors do not fit after the superblock, for example with `-g 256`. Each meta block group keeps its block of descriptors in its first group, and the bitmap of a new group and `statfs` count those blocks. ext4/058 passes.
+
 ## [0.3.12] - 2026-10-26
 
 ### Added

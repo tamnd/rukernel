@@ -200,6 +200,8 @@ pub struct Superblock {
     pub checksum_seed: u32,
     /// The inode of the journal, or 0.
     pub journal_inum: u32,
+    /// The first meta block group, if the disk has `meta_bg`.
+    pub first_meta_bg: u32,
 }
 
 impl Superblock {
@@ -245,6 +247,7 @@ impl Superblock {
             uuid: b[0x68..0x78].try_into().map_err(|_| Errno::EINVAL)?,
             checksum_seed: u32_at(b, 0x270),
             journal_inum: u32_at(b, 0xe0),
+            first_meta_bg: u32_at(b, 0x104),
         };
         if sb.blocks_per_group == 0
             || sb.inodes_per_group == 0
@@ -282,6 +285,57 @@ impl Superblock {
     /// The number of blocks of the group descriptors.
     pub fn gdt_blocks(&self) -> u64 {
         (u64::from(self.groups()) * u64::from(self.desc_size)).div_ceil(self.block_size)
+    }
+
+    /// The number of group descriptors in one block. With `meta_bg`, this is also the number of
+    /// groups in a meta block group.
+    pub fn descs_per_block(&self) -> u64 {
+        self.block_size / u64::from(self.desc_size)
+    }
+
+    /// Tells if the descriptor block `nr` is in a meta block group, as `meta_bg` puts it.
+    fn in_meta_bg(&self, nr: u64) -> bool {
+        self.incompat & incompat::META_BG != 0 && nr >= u64::from(self.first_meta_bg)
+    }
+
+    /// The block that holds the descriptor block `nr`, as `descriptor_loc` of Linux. Without
+    /// `meta_bg` the descriptors follow the superblock. With `meta_bg` each meta block group has
+    /// its block of descriptors in its first group, after the superblock if the group has one.
+    pub fn desc_block(&self, nr: u64) -> u64 {
+        let first = u64::from(self.first_data_block);
+        if !self.in_meta_bg(nr) {
+            return first + 1 + nr;
+        }
+        let group = nr * self.descs_per_block();
+        let mut has_super = u64::from(self.has_super(group as u32));
+        if self.block_size == 1024 && nr == 0 && first == 0 {
+            has_super += 1;
+        }
+        first + group * u64::from(self.blocks_per_group) + has_super
+    }
+
+    /// The number of blocks at the start of the group `group` for the superblock and the group
+    /// descriptors, as `ext4_num_base_meta_blocks` of Linux.
+    pub fn base_meta_blocks(&self, group: u32) -> u64 {
+        let has_super = self.has_super(group);
+        let nr = u64::from(group) / self.descs_per_block();
+        if !self.in_meta_bg(nr) {
+            if !has_super {
+                return 0;
+            }
+            let gdt = if self.incompat & incompat::META_BG != 0 {
+                u64::from(self.first_meta_bg)
+            } else {
+                self.gdt_blocks()
+            };
+            return 1 + gdt + u64::from(self.reserved_gdt_blocks);
+        }
+        // The first, the second and the last group of a meta block group have a copy of its
+        // descriptor block.
+        let first = nr * self.descs_per_block();
+        let at = u64::from(group) - first;
+        let copy = at <= 1 || at == self.descs_per_block() - 1;
+        u64::from(has_super) + u64::from(copy)
     }
 
     /// The number of blocks of the inode table of one group.
@@ -447,3 +501,55 @@ pub const EXTENT_MAGIC: u16 = 0xf30a;
 
 /// The length of an extent above which the extent is not initialized, and reads give zeros.
 pub const EXTENT_INIT_MAX: u16 = 32768;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A superblock of 4096 blocks of 4 KiB, with 64 byte descriptors and 256 blocks in a group.
+    fn meta_sb(first_meta_bg: u32) -> Superblock {
+        let mut b = alloc::vec![0u8; SUPERBLOCK_SIZE];
+        b[0x38..0x3a].copy_from_slice(&MAGIC.to_le_bytes());
+        b[0x04..0x08].copy_from_slice(&(128u32 * 256).to_le_bytes());
+        b[0x18..0x1c].copy_from_slice(&2u32.to_le_bytes());
+        b[0x20..0x24].copy_from_slice(&256u32.to_le_bytes());
+        b[0x28..0x2c].copy_from_slice(&16u32.to_le_bytes());
+        b[0x4c..0x50].copy_from_slice(&1u32.to_le_bytes());
+        b[0x58..0x5a].copy_from_slice(&256u16.to_le_bytes());
+        b[0x64..0x68].copy_from_slice(&ro_compat::SPARSE_SUPER.to_le_bytes());
+        let incompat = incompat::META_BG | incompat::EXTENTS | incompat::BIT64;
+        b[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+        b[0xfe..0x100].copy_from_slice(&64u16.to_le_bytes());
+        b[0x104..0x108].copy_from_slice(&first_meta_bg.to_le_bytes());
+        Superblock::parse(&b).unwrap()
+    }
+
+    #[test]
+    fn meta_bg_puts_each_descriptor_block_in_its_meta_group() {
+        let sb = meta_sb(0);
+        assert_eq!(sb.descs_per_block(), 64);
+        // The group 0 has the superblock, the group 64 has none.
+        assert_eq!(sb.desc_block(0), 1);
+        assert_eq!(sb.desc_block(1), 64 * 256);
+        assert_eq!(sb.base_meta_blocks(0), 2);
+        assert_eq!(sb.base_meta_blocks(1), 2);
+        assert_eq!(sb.base_meta_blocks(2), 0);
+        assert_eq!(sb.base_meta_blocks(3), 1);
+        assert_eq!(sb.base_meta_blocks(63), 1);
+        assert_eq!(sb.base_meta_blocks(64), 1);
+        assert_eq!(sb.base_meta_blocks(65), 1);
+        assert_eq!(sb.base_meta_blocks(81), 1);
+        assert_eq!(sb.base_meta_blocks(127), 1);
+    }
+
+    #[test]
+    fn the_descriptor_blocks_before_the_first_meta_group_follow_the_superblock() {
+        let sb = meta_sb(1);
+        assert_eq!(sb.desc_block(0), 1);
+        assert_eq!(sb.desc_block(1), 64 * 256);
+        assert_eq!(sb.base_meta_blocks(0), 2);
+        assert_eq!(sb.base_meta_blocks(3), 2);
+        assert_eq!(sb.base_meta_blocks(2), 0);
+        assert_eq!(sb.base_meta_blocks(64), 1);
+    }
+}
