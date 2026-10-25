@@ -236,16 +236,21 @@ pub enum Whence {
     Current,
     /// `SEEK_END`.
     End,
+    /// `SEEK_DATA`, the next data at or after the offset.
+    Data,
+    /// `SEEK_HOLE`, the next hole at or after the offset.
+    Hole,
 }
 
 impl Whence {
-    /// Gives the value of the `whence` argument. `SEEK_DATA` and `SEEK_HOLE` are not supported
-    /// yet, so they give `None`.
+    /// Gives the value of the `whence` argument, or `None` if it is not known.
     pub fn from_raw(whence: u32) -> Option<Self> {
         Some(match whence {
             0 => Self::Set,
             1 => Self::Current,
             2 => Self::End,
+            3 => Self::Data,
+            4 => Self::Hole,
             _ => return None,
         })
     }
@@ -362,16 +367,26 @@ impl File {
         if !self.ops.seekable() {
             return Err(Errno::ESPIPE);
         }
-        let mut pos = self.pos.lock();
-        let base = match whence {
-            Whence::Set => 0,
-            Whence::Current => *pos,
-            Whence::End => match self.ops.end() {
-                Some(end) => end,
-                None => self.metadata()?.size,
-            },
+        let end = || match self.ops.end() {
+            Some(end) => Ok(end),
+            None => self.metadata().map(|m| m.size),
         };
-        let new = base.checked_add_signed(offset).ok_or(Errno::EINVAL)?;
+        let mut pos = self.pos.lock();
+        let new = match whence {
+            Whence::Set => 0u64.checked_add_signed(offset),
+            Whence::Current => pos.checked_add_signed(offset),
+            Whence::End => end()?.checked_add_signed(offset),
+            // As the generic code of Linux, all the file is data and the end is the only hole.
+            Whence::Data | Whence::Hole => {
+                let size = end()?;
+                let at = u64::try_from(offset).map_err(|_| Errno::ENXIO)?;
+                if at >= size {
+                    return Err(Errno::ENXIO);
+                }
+                Some(if whence == Whence::Data { at } else { size })
+            }
+        };
+        let new = new.ok_or(Errno::EINVAL)?;
         if new > i64::MAX as u64 {
             return Err(Errno::EINVAL);
         }

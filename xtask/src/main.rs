@@ -388,6 +388,10 @@ const QEMU_PASS: i32 = 33;
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The longest time that a boot test of a root file system can take. The `alpine` test makes and
+/// checks file systems on two disks, and it is slow on a busy host.
+const ROOTFS_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The self tests that `boot-test` runs, each in its own boot.
 const BOOT_TESTS: &[&str] = &[
     "boot",
@@ -749,6 +753,17 @@ os.removexattr(\"/mnt/r\", \"user.gone\")'
     python3 -c 'import os; assert os.getxattr(\"/mnt/d/e/new\", \"user.large\") == b\"x\" * 700'
     umount /mnt
     echo 'alpine: ext4 xattr done'
+    mkfs.xfs -q -K -p file=/tmp/tree /dev/vdc
+    mount -t xfs -o ro /dev/vdc /mnt
+    diff -r --no-dereference /tmp/tree /mnt
+    cmp /tmp/tree/a/big /mnt/a/b/link
+    test \"$(stat -c '%s %h %a' /mnt/a/big)\" = \"$(stat -c '%s %h %a' /tmp/tree/a/big)\"
+    test \"$(readlink /mnt/long)\" = \"$(readlink /tmp/tree/long)\"
+    test \"$(ls /mnt/many | wc -l)\" = 400
+    test \"$(stat -f -c %T /mnt)\" = xfs
+    ! touch /mnt/new 2>/dev/null
+    echo \"alpine: xfs read $(find /mnt | wc -l) files\"
+    umount /mnt
 fi
 echo 'alpine: done'
 ",
@@ -1441,6 +1456,9 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
 const BLK_DISK_SIZE: usize = 1 << 20;
 /// The size of the disk that the `alpine` test makes an ext4 file system on.
 const EXT4_DISK_SIZE: u64 = 64 << 20;
+/// The size of the disk that the `alpine` test makes an XFS file system on. mkfs.xfs does not make
+/// a file system smaller than 300 MiB.
+const XFS_DISK_SIZE: u64 = 320 << 20;
 /// The text that the `blk` test writes at `BLK_NOTE_AT`. tests/user/init.c has the same values.
 const BLK_NOTE: &[u8] = b"rukernel wrote this sector";
 const BLK_NOTE_AT: usize = 512 * 9 + 100;
@@ -1619,7 +1637,7 @@ fn boot_test(names: &[String]) -> Result {
             (cmd, timeout)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
-            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
+            (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), ROOTFS_TIMEOUT)
         } else {
             (qemu_command(&kernel, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
         };
@@ -1640,6 +1658,13 @@ fn boot_test(names: &[String]) -> Result {
                 // The disk is new for each run, so a flush does not have to reach the host disk.
                 .arg(format!("if=none,id=disk1,format=raw,cache=unsafe,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk1"]);
+            // And it makes an XFS file system on a third disk.
+            let disk = kernel.with_file_name("xfs.img");
+            let file = fs::File::create(&disk).map_err(|e| format!("{}: {e}", disk.display()))?;
+            file.set_len(XFS_DISK_SIZE).map_err(|e| format!("{}: {e}", disk.display()))?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=disk2,format=raw,cache=unsafe,file={}", disk.display()))
+                .args(["-device", "virtio-blk-pci,drive=disk2"]);
         }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
         let mut passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));

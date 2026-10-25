@@ -26,3 +26,11 @@ pub fn id() -> usize {
 pub fn start_all() -> usize {
     crate::arch::imp::smp::start_cpus()
 }
+
+/// Makes each CPU do a full memory barrier, and returns when each CPU did it, for
+/// `membarrier(2)`. The other CPUs get an interrupt.
+pub fn barrier_all() {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    crate::arch::imp::smp::shootdown(0, crate::arch::imp::smp::BARRIER);
+}

@@ -149,6 +149,9 @@ pub struct Process {
     start_tick: u64,
     /// The value of `/proc/PID/oom_score_adj`. rukernel has no OOM killer yet.
     oom_score_adj: AtomicI32,
+    /// The `MEMBARRIER_CMD_REGISTER_*` commands that the process gave, as the bits of the
+    /// commands that they allow. A new address space has none.
+    membarrier: AtomicU32,
     limits: SpinLock<[Limit; RLIM_NLIMITS]>,
     timers: SpinLock<Timers>,
     /// The user CPU time in timer ticks of the threads that ended.
@@ -373,7 +376,18 @@ impl Process {
 
     /// Puts a new address space in the process, for `execve`, and gives the old one.
     pub fn replace_vm(&self, vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
+        self.membarrier.store(0, Ordering::Relaxed);
         self.vm.lock().replace(vm)
+    }
+
+    /// The `membarrier` commands that the registrations of the process allow.
+    pub fn membarrier(&self) -> u32 {
+        self.membarrier.load(Ordering::Relaxed)
+    }
+
+    /// Adds the `membarrier` commands `bits` to the commands that the process can give.
+    pub fn add_membarrier(&self, bits: u32) {
+        self.membarrier.fetch_or(bits, Ordering::Relaxed);
     }
 
     /// The descriptor table. A zombie has none.
@@ -593,6 +607,7 @@ impl Process {
             image: SpinLock::new(Image::default()),
             start_tick: rk_frame::time::ticks(),
             oom_score_adj: AtomicI32::new(0),
+            membarrier: AtomicU32::new(0),
             limits: SpinLock::new(crate::limits::defaults(
                 rk_mm::STACK_SIZE as u64,
                 u64::from(PID_MAX),

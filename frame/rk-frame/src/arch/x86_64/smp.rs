@@ -37,6 +37,9 @@ pub(crate) fn handle(vector: u8) -> bool {
 
 /// The address in `FLUSH_ADDR` that tells each CPU to stop the use of the address space.
 pub(crate) const LEAVE: u64 = u64::MAX;
+/// The address in `FLUSH_ADDR` that tells each CPU to do nothing. The interrupt is a full
+/// memory barrier, which `membarrier(2)` needs.
+pub(crate) const BARRIER: u64 = u64::MAX - 1;
 
 /// One request at a time goes to the other CPUs.
 static FLUSH: SpinLock<()> = SpinLock::new(());
@@ -88,6 +91,8 @@ pub(crate) fn poll() {
     let addr = FLUSH_ADDR.load(Ordering::Relaxed);
     if addr == LEAVE {
         paging::leave(root);
+    } else if addr == BARRIER {
+        core::sync::atomic::fence(Ordering::SeqCst);
     } else {
         paging::flush(addr as usize);
     }

@@ -26,6 +26,7 @@ rk-fs-sys.workspace = true
 rk-fs-overlay.workspace = true
 rk-fs-ext4.workspace = true
 rk-fs-tmpfs.workspace = true
+rk-fs-xfs.workspace = true
 rk-mm.workspace = true
 rk-proc.workspace = true
 rk-sched.workspace = true

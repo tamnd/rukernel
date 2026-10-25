@@ -288,6 +288,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PRLIMIT64 => info::prlimit64(cx, a[0], a[1], a[2], a[3]),
         nr::RENAMEAT2 => fs::renameat2(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::GETRANDOM => info::getrandom(cx, a[0], a[1], a[2]),
+        nr::MEMBARRIER => mm::membarrier(cx, a[0], a[1], a[2]),
         nr::STATX => fs::statx(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::CAPGET => info::capget(cx, a[0], a[1]),
         nr::CAPSET => info::capset(cx, a[0], a[1]),
