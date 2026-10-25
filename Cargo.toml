@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 rust-version = "1.98.0"
 license = "GPL-2.0-only"
@@ -40,26 +40,26 @@ publish = true
 # path for all users. crates.io needs the version too. The version here must be the same as the
 # workspace version, and the release gate checks it.
 [workspace.dependencies]
-rk-frame = { path = "frame/rk-frame", version = "0.3.7" }
-rk-abi = { path = "core/rk-abi", version = "0.3.7" }
-rk-lib = { path = "core/rk-lib", version = "0.3.7" }
-rk-mm = { path = "core/rk-mm", version = "0.3.7" }
-rk-sched = { path = "core/rk-sched", version = "0.3.7" }
-rk-proc = { path = "core/rk-proc", version = "0.3.7" }
-rk-syscall = { path = "core/rk-syscall", version = "0.3.7" }
-rk-block = { path = "block/rk-block", version = "0.3.7" }
-rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.3.7" }
-rk-drv-virtio = { path = "drv/rk-drv-virtio", version = "0.3.7" }
-rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.3.7" }
-rk-vfs = { path = "fs/rk-vfs", version = "0.3.7" }
-rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.3.7" }
-rk-fs-sys = { path = "fs/rk-fs-sys", version = "0.3.7" }
-rk-fs-overlay = { path = "fs/rk-fs-overlay", version = "0.3.7" }
-rk-fs-ext4 = { path = "fs/rk-fs-ext4", version = "0.3.7" }
-rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.3.7" }
-rk-fs-xfs = { path = "fs/rk-fs-xfs", version = "0.3.7" }
-rk-net = { path = "net/rk-net", version = "0.3.7" }
-rk-net-unix = { path = "net/rk-net-unix", version = "0.3.7" }
+rk-frame = { path = "frame/rk-frame", version = "0.3.8" }
+rk-abi = { path = "core/rk-abi", version = "0.3.8" }
+rk-lib = { path = "core/rk-lib", version = "0.3.8" }
+rk-mm = { path = "core/rk-mm", version = "0.3.8" }
+rk-sched = { path = "core/rk-sched", version = "0.3.8" }
+rk-proc = { path = "core/rk-proc", version = "0.3.8" }
+rk-syscall = { path = "core/rk-syscall", version = "0.3.8" }
+rk-block = { path = "block/rk-block", version = "0.3.8" }
+rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.3.8" }
+rk-drv-virtio = { path = "drv/rk-drv-virtio", version = "0.3.8" }
+rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.3.8" }
+rk-vfs = { path = "fs/rk-vfs", version = "0.3.8" }
+rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.3.8" }
+rk-fs-sys = { path = "fs/rk-fs-sys", version = "0.3.8" }
+rk-fs-overlay = { path = "fs/rk-fs-overlay", version = "0.3.8" }
+rk-fs-ext4 = { path = "fs/rk-fs-ext4", version = "0.3.8" }
+rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.3.8" }
+rk-fs-xfs = { path = "fs/rk-fs-xfs", version = "0.3.8" }
+rk-net = { path = "net/rk-net", version = "0.3.8" }
+rk-net-unix = { path = "net/rk-net-unix", version = "0.3.8" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 
 [workspace.lints.rust]
