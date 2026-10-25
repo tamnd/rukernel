@@ -271,6 +271,7 @@ impl FsContext {
             FileType::Regular | FileType::Directory => {
                 if kind == FileType::Regular && write && flags & o::O_TRUNC != 0 {
                     at.inode().set_attr(&SetAttr { size: Some(0), ..SetAttr::default() })?;
+                    crate::mapped::changed(at.inode(), 0, u64::MAX);
                 }
                 Ok(File::open_inode(at, flags))
             }

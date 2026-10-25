@@ -886,6 +886,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
     rk_vfs::inode::check_set_attr(&**at.inode(), &attr)?;
     at.inode().set_attr(&attr)?;
+    rk_vfs::mapped::changed(at.inode(), size, u64::MAX);
     Ok(0)
 }
 

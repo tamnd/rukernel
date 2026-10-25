@@ -201,6 +201,7 @@ impl FileOps for InodeFile {
             return Err(Errno::EISDIR);
         }
         let mut pos = file.pos.lock();
+        crate::mapped::sync(inode, *pos, pos.saturating_add(buf.len() as u64))?;
         let n = inode.read_at(*pos, buf)?;
         *pos += n as u64;
         drop(pos);
@@ -216,6 +217,7 @@ impl FileOps for InodeFile {
             *pos = inode.metadata().size;
         }
         let n = inode.write_at(*pos, buf)?;
+        crate::mapped::wrote(inode, *pos, &buf[..n]);
         *pos += n as u64;
         Ok(n)
     }
@@ -225,6 +227,7 @@ impl FileOps for InodeFile {
         if inode.metadata().is_dir() {
             return Err(Errno::EISDIR);
         }
+        crate::mapped::sync(inode, offset, offset.saturating_add(buf.len() as u64))?;
         let n = inode.read_at(offset, buf)?;
         file.accessed();
         Ok(n)
@@ -233,7 +236,9 @@ impl FileOps for InodeFile {
     fn write_at(&self, file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
         let inode = file.inode.as_ref().ok_or(Errno::EINVAL)?;
         check_immutable(&**inode)?;
-        inode.write_at(offset, buf)
+        let n = inode.write_at(offset, buf)?;
+        crate::mapped::wrote(inode, offset, &buf[..n]);
+        Ok(n)
     }
 
     fn seekable(&self) -> bool {
@@ -740,7 +745,9 @@ impl File {
         let mode = crate::cred::current().write_kill(&inode.metadata());
         let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
         check_set_attr(&**inode, &attr)?;
-        inode.set_attr(&attr)
+        inode.set_attr(&attr)?;
+        crate::mapped::changed(inode, size, u64::MAX);
+        Ok(())
     }
 
     /// `fallocate`. The caller checked the mode, the offset and the length.
@@ -757,7 +764,10 @@ impl File {
         match inode.metadata().file_type() {
             Some(FileType::Regular) => {
                 self.remove_privs()?;
-                inode.fallocate(mode, offset, len)
+                inode.fallocate(mode, offset, len)?;
+                // A collapse or an insert moves the data after the range.
+                crate::mapped::changed(inode, offset, u64::MAX);
+                Ok(())
             }
             Some(FileType::Fifo) => Err(Errno::ESPIPE),
             Some(FileType::Directory) => Err(Errno::EISDIR),
