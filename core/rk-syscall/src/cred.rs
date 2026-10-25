@@ -139,8 +139,7 @@ pub(crate) fn setgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let bytes = cx.read_bytes(list, 4 * size as usize)?;
-    let groups =
-        bytes.chunks_exact(4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let groups = bytes.as_chunks::<4>().0.iter().map(|b| u32::from_ne_bytes(*b)).collect();
     change(cx, |c| c.setgroups(groups))
 }
 

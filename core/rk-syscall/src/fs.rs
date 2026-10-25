@@ -777,14 +777,17 @@ fn change_attr(cx: &Cx<'_>, inode: &rk_vfs::InodeRef, attr: &SetAttr, change: Ch
     let cred = cx.process().cred();
     let meta = inode.metadata();
     if change == Change::Touch && !cred.owns(&meta) {
-        cred.permission(&meta, rk_vfs::cred::may::WRITE)?;
+        cred.inode_permission(&**inode, rk_vfs::cred::may::WRITE)?;
     }
-    let mut attr = attr.clone();
+    let mut attr = *attr;
     cred.setattr_prepare(&meta, &mut attr)?;
     if change == Change::Owner {
         cred.chown_kill(&meta, &mut attr);
     }
     inode.set_attr(&attr)?;
+    if let Some(mode) = attr.mode {
+        rk_vfs::acl::chmod(&**inode, mode)?;
+    }
     Ok(0)
 }
 
@@ -854,14 +857,17 @@ pub(crate) fn faccessat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as u32 != 0 {
         return Err(Errno::EINVAL);
     }
-    let meta = lookup_meta(cx, dirfd, path, flags)?;
+    let (meta, inode) = lookup(cx, dirfd, path, flags)?;
     if mode == 0 {
         return Ok(0);
     }
     // Without `AT_EACCESS`, the check uses the real IDs, as `access_override_creds` of Linux.
     let cred = cx.process().cred();
     let cred = if flags & AT_EACCESS as u32 == 0 { cred.for_access() } else { (*cred).clone() };
-    cred.permission(&meta, mode as u32)?;
+    match inode {
+        Some(inode) => cred.inode_permission(&*inode, mode as u32)?,
+        None => cred.permission(&meta, mode as u32)?,
+    }
     Ok(0)
 }
 

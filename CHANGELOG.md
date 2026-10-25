@@ -28,6 +28,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `PTRACE_ATTACH` and `PTRACE_SEIZE` need the same IDs as the target and its permitted capabilities, or `CAP_SYS_PTRACE`. `PTRACE_O_SUSPEND_SECCOMP` needs `CAP_SYS_ADMIN`.
 - `prlimit64` and `setrlimit` need `CAP_SYS_RESOURCE` to raise a hard limit, and `prlimit64` on another process needs the same IDs. `setpriority` needs `CAP_SYS_NICE` to change a process of another user or to go below the nice value that `RLIMIT_NICE` allows. `PRIO_USER` selects the processes of the user.
 - `mount`, `umount2`, `fsopen`, `fspick`, `fsmount`, `move_mount` and `open_tree` with `OPEN_TREE_CLONE` need `CAP_SYS_ADMIN`. The `syslog` actions other than the full read and the size need `CAP_SYSLOG` or `CAP_SYS_ADMIN`.
+- POSIX ACLs in the `system.posix_acl_access` and `system.posix_acl_default` extended attributes. The permission check uses the named user and group entries and the mask, as Linux. A set of the access ACL changes the mode, and `chmod` changes the ACL. A new file or directory gets the default ACL of its directory in place of the umask, and a new directory also gets it as its default ACL. Only the owner or a process with `CAP_FOWNER` can set an ACL. ext4 keeps the ACLs in the format of Linux on the disk.
 
 ### Fixed
 

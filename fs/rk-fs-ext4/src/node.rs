@@ -1289,7 +1289,8 @@ impl Inode for Node {
 
     fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
         let key = xattr::key(name)?;
-        self.fs.xattrs(&self.raw())?.remove(&key).ok_or(Errno::ENODATA)
+        let value = self.fs.xattrs(&self.raw())?.remove(&key).ok_or(Errno::ENODATA)?;
+        if xattr::is_acl(&key) { xattr::acl_from_disk(&value) } else { Ok(value) }
     }
 
     fn set_xattr(&self, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
@@ -1304,7 +1305,8 @@ impl Inode for Node {
         if flags & XATTR_REPLACE != 0 && !old {
             return Err(Errno::ENODATA);
         }
-        attrs.insert(key, value.to_vec());
+        let value = if xattr::is_acl(&key) { xattr::acl_to_disk(value)? } else { value.to_vec() };
+        attrs.insert(key, value);
         tx.write_xattrs(self.ino, &mut raw, &attrs)?;
         touch(&mut raw, false);
         tx.save(self, raw)

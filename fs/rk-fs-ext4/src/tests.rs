@@ -973,3 +973,28 @@ fn unlink_frees_the_attribute_block() {
     drop(file);
     assert_eq!(ram.free(), free);
 }
+
+#[test]
+fn an_acl_has_the_ext4_format_on_the_disk() {
+    use rk_vfs::acl::{ACCESS, Acl, Entry, UNDEFINED_ID, tag};
+    let (fs, ram) = open_rw();
+    let file = fs.root().unwrap().create(b"acl", FileType::Regular, 0o640, 0).unwrap();
+    let e = |tag, perm, id| Entry { tag, perm, id };
+    let acl = Acl(alloc::vec![
+        e(tag::USER_OBJ, 6, UNDEFINED_ID),
+        e(tag::USER, 4, 1000),
+        e(tag::GROUP_OBJ, 4, UNDEFINED_ID),
+        e(tag::MASK, 4, UNDEFINED_ID),
+        e(tag::OTHER, 0, UNDEFINED_ID),
+    ]);
+    file.set_xattr(ACCESS, &acl.to_xattr(), 0).unwrap();
+    assert_eq!(file.set_xattr(ACCESS, b"bad", 0), Err(Errno::EINVAL));
+    // The disk has the version 1, one entry of 8 bytes and four entries of 4 bytes.
+    let raw = fs.xattrs(&fs.inode(file.metadata().ino as u32).unwrap().raw()).unwrap();
+    let disk = &raw[&(2, Vec::new())];
+    assert_eq!(disk.len(), 4 + 8 + 4 * 4);
+    assert_eq!(&disk[..4], &1u32.to_le_bytes());
+    drop(file);
+    let file = again(&ram).root().unwrap().lookup(b"acl").unwrap();
+    assert_eq!(file.get_xattr(ACCESS).unwrap(), acl.to_xattr());
+}
