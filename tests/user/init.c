@@ -1731,6 +1731,32 @@ static void test_file_locks(void)
 	unlink("/tmp/lk");
 }
 
+static void test_fallocate(void)
+{
+	struct stat st;
+	char buf[4];
+	int fd = open("/tmp/fa", O_RDWR | O_CREAT | O_TRUNC, 0644);
+
+	check("fallocate makes the file larger", fallocate(fd, 0, 0, 8192) == 0 &&
+	      fstat(fd, &st) == 0 && st.st_size == 8192);
+	check("fallocate with FALLOC_FL_KEEP_SIZE keeps the size",
+	      fallocate(fd, FALLOC_FL_KEEP_SIZE, 8192, 4096) == 0 && fstat(fd, &st) == 0 &&
+		      st.st_size == 8192);
+	pwrite(fd, "abcd", 4, 100);
+	check("FALLOC_FL_PUNCH_HOLE makes zeros",
+	      fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 101, 2) == 0 &&
+		      pread(fd, buf, 4, 100) == 4 && memcmp(buf, "a\0\0d", 4) == 0);
+	check("FALLOC_FL_PUNCH_HOLE without FALLOC_FL_KEEP_SIZE gives EOPNOTSUPP",
+	      fallocate(fd, FALLOC_FL_PUNCH_HOLE, 0, 1) < 0 && errno == EOPNOTSUPP);
+	check("fallocate with a length of 0 gives EINVAL", fallocate(fd, 0, 0, 0) < 0 && errno == EINVAL);
+	close(fd);
+	fd = open("/tmp/fa", O_RDONLY);
+	check("fallocate of a file open only for reading gives EBADF",
+	      fallocate(fd, 0, 0, 1) < 0 && errno == EBADF);
+	close(fd);
+	unlink("/tmp/fa");
+}
+
 static void test_fifo(void)
 {
 	struct stat st1, st2;
@@ -2491,6 +2517,7 @@ int main(int argc, char **argv)
 	test_xattr();
 	test_fifo();
 	test_file_locks();
+	test_fallocate();
 	test_syslog();
 	test_membarrier();
 	test_overlay();

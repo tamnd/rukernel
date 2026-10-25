@@ -310,6 +310,37 @@ impl Inode for Node {
         Ok(buf.len())
     }
 
+    fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
+        use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
+        let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
+        if end > MAX_FILE_SIZE {
+            return Err(Errno::EFBIG);
+        }
+        let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+        let end = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
+        // The data is in one buffer, so a range has no blocks of its own to give or to free.
+        match &mut *self.data.lock() {
+            Data::File(d) => {
+                if mode & (PUNCH_HOLE | ZERO_RANGE) != 0 {
+                    let stop = end.min(d.len());
+                    if start < stop {
+                        d[start..stop].fill(0);
+                    }
+                } else if mode & !KEEP_SIZE != 0 {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                if mode & KEEP_SIZE == 0 && d.len() < end {
+                    d.try_reserve(end - d.len()).map_err(|_| Errno::ENOSPC)?;
+                    d.resize(end, 0);
+                }
+            }
+            Data::Dir { .. } => return Err(Errno::EISDIR),
+            _ => return Err(Errno::ENODEV),
+        }
+        self.touch();
+        Ok(())
+    }
+
     fn lookup(&self, name: &[u8]) -> Result<InodeRef> {
         Ok(self.get(name)?)
     }
