@@ -235,6 +235,84 @@ impl FileOps for InodeFile {
     fn seekable(&self) -> bool {
         true
     }
+
+    fn ioctl(&self, file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        let inode = file.inode.as_ref().ok_or(Errno::ENOTTY)?;
+        match cmd {
+            fiemap::FS_IOC_FIEMAP => fiemap::ioctl(inode, arg, mem),
+            _ => Err(Errno::ENOTTY),
+        }
+    }
+}
+
+/// `FS_IOC_FIEMAP`, from `<linux/fiemap.h>`.
+mod fiemap {
+    use super::UserMemory;
+    use crate::inode::{FileType, InodeRef, Result};
+    use rk_abi::Errno;
+
+    /// `_IOWR('f', 11, struct fiemap)`.
+    pub(super) const FS_IOC_FIEMAP: u32 = 0xc020_660b;
+    /// The size of `struct fiemap`, the header.
+    const HEADER: usize = 32;
+    /// The size of `struct fiemap_extent`.
+    const EXTENT: usize = 56;
+    /// `FIEMAP_FLAG_SYNC`: the file is synced first.
+    const FLAG_SYNC: u32 = 0x1;
+    /// `FIEMAP_MAX_EXTENTS`.
+    const MAX_EXTENTS: u32 = u32::MAX / EXTENT as u32;
+    /// `FIEMAP_EXTENT_LAST`.
+    const EXTENT_LAST: u32 = 0x1;
+    /// `FIEMAP_EXTENT_UNWRITTEN`.
+    const EXTENT_UNWRITTEN: u32 = 0x800;
+
+    /// Fills the `struct fiemap` at `arg` with the extents of `inode`, as `ioctl_fiemap` of
+    /// Linux.
+    pub(super) fn ioctl(inode: &InodeRef, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        let mut head = [0u8; HEADER];
+        mem.read(arg, &mut head)?;
+        let u64_at = |o: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&head[o..o + 8]);
+            u64::from_ne_bytes(b)
+        };
+        let u32_at =
+            |o: usize| u32::from_ne_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+        let (start, len, flags, count) = (u64_at(0), u64_at(8), u32_at(16), u32_at(24));
+        if count > MAX_EXTENTS {
+            return Err(Errno::EINVAL);
+        }
+        if flags & !FLAG_SYNC != 0 {
+            // Linux gives back the flags that it does not know.
+            mem.write(arg + 16, &(flags & !FLAG_SYNC).to_ne_bytes())?;
+            return Err(Errno::EBADR);
+        }
+        if len == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if inode.metadata().file_type() != Some(FileType::Regular) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if flags & FLAG_SYNC != 0 {
+            inode.sync()?;
+        }
+        let extents = inode.fiemap(start, len.min(u64::MAX - start))?;
+        let mapped = if count == 0 { extents.len() } else { extents.len().min(count as usize) };
+        for (i, e) in extents.iter().take(count as usize).enumerate() {
+            let mut raw = [0u8; EXTENT];
+            raw[0..8].copy_from_slice(&e.logical.to_ne_bytes());
+            raw[8..16].copy_from_slice(&e.physical.to_ne_bytes());
+            raw[16..24].copy_from_slice(&e.length.to_ne_bytes());
+            let mut f = if e.unwritten { EXTENT_UNWRITTEN } else { 0 };
+            if i + 1 == extents.len() {
+                f |= EXTENT_LAST;
+            }
+            raw[40..44].copy_from_slice(&f.to_ne_bytes());
+            mem.write(arg + HEADER + i * EXTENT, &raw)?;
+        }
+        mem.write(arg + 20, &(mapped as u32).to_ne_bytes())?;
+        Ok(0)
+    }
 }
 
 /// The `whence` of `lseek`.

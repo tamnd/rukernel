@@ -456,6 +456,10 @@ impl Inode for Node {
         self.copy_up()?.write_at(offset, buf)
     }
 
+    fn fiemap(&self, start: u64, len: u64) -> Result<Vec<rk_vfs::inode::FiemapExtent>> {
+        self.real().fiemap(start, len)
+    }
+
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
         self.check_writable()?;
         self.copy_up()?.fallocate(mode, offset, len)

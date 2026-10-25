@@ -190,6 +190,7 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
     ("kernel/version", ""),
+    ("vm/drop_caches", "0"),
     ("vm/max_map_count", "65530"),
     ("vm/min_free_kbytes", "1024"),
     ("vm/mmap_min_addr", "65536"),
@@ -213,6 +214,11 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
 }
 
 fn sysctl_write(name: &'static str, data: &[u8]) {
+    // A write to `drop_caches` removes the clean pages of the block devices. The value stays 0.
+    if name == "vm/drop_caches" {
+        rk_vfs::blockdev::drop_clean_all();
+        return;
+    }
     let mut value = data.to_vec();
     while value.last().is_some_and(u8::is_ascii_whitespace) {
         value.pop();

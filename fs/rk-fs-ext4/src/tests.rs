@@ -363,6 +363,26 @@ fn fallocate_gives_and_frees_blocks() {
 }
 
 #[test]
+fn fiemap_gives_the_extents() {
+    use rk_vfs::inode::falloc::KEEP_SIZE;
+    let (fs, _ram) = open_rw();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(0, &vec![1u8; 2 * BS]).unwrap();
+    file.fallocate(KEEP_SIZE, 4 * BS as u64, BS as u64).unwrap();
+    let all = file.fiemap(0, u64::MAX).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!((all[0].logical, all[0].length, all[0].unwritten), (0, 2 * BS as u64, false));
+    assert_eq!((all[1].logical, all[1].length, all[1].unwritten), (4 * BS as u64, BS as u64, true));
+    assert!(all.iter().all(|e| e.physical != 0 && e.physical % BS as u64 == 0));
+    // The first extent starts at the block of `start`.
+    let part = file.fiemap(BS as u64 + 1, 1).unwrap();
+    assert_eq!(part.len(), 1);
+    assert_eq!((part[0].logical, part[0].length), (BS as u64, BS as u64));
+    assert_eq!(part[0].physical, all[0].physical + BS as u64);
+    assert!(file.fiemap(2 * BS as u64, 2 * BS as u64).unwrap().is_empty());
+}
+
+#[test]
 fn unlink_frees_the_blocks_and_the_inode() {
     let (fs, ram) = open_rw();
     let free = ram.free();

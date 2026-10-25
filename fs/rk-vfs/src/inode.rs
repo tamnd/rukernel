@@ -241,6 +241,12 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 
+    /// Gives the extents of a regular file that have bytes in `start..start + len`, in order,
+    /// for `FS_IOC_FIEMAP`. The default gives `EOPNOTSUPP`.
+    fn fiemap(&self, _start: u64, _len: u64) -> Result<Vec<FiemapExtent>> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
@@ -342,6 +348,19 @@ pub trait Inode: Any + Send + Sync {
     fn fs_magic(&self) -> u64 {
         0
     }
+}
+
+/// One extent of a file for `FS_IOC_FIEMAP`, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FiemapExtent {
+    /// The offset in the file.
+    pub logical: u64,
+    /// The offset on the disk.
+    pub physical: u64,
+    /// The length.
+    pub length: u64,
+    /// The extent has blocks that are not written, and it reads as zeros.
+    pub unwritten: bool,
 }
 
 /// The modes of `fallocate`, from `<linux/falloc.h>`.

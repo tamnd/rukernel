@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_vfs::inode::mode;
+use rk_vfs::inode::{FiemapExtent, mode};
 use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
@@ -826,6 +826,47 @@ impl Inode for Node {
         let result = tx.write_data(self.ino, &mut raw, offset, buf);
         tx.save(self, raw)?;
         result
+    }
+
+    fn fiemap(&self, start: u64, len: u64) -> Result<Vec<FiemapExtent>> {
+        let raw = self.raw();
+        let bs = self.fs.sb.block_size;
+        let end = start.saturating_add(len);
+        let extents = if raw.flags() & flags::EXTENTS != 0 {
+            self.fs.extents(&raw)?.0
+        } else {
+            // A file with a block map: the runs of blocks that follow each other on the disk.
+            let mut runs: Vec<Extent> = Vec::new();
+            for lblock in 0..raw.size().div_ceil(bs) {
+                let Some((block, _)) = self.fs.map(&raw, lblock)? else { continue };
+                match runs.last_mut() {
+                    Some(r) if r.end() == lblock && r.start + u64::from(r.len) == block => {
+                        r.len += 1
+                    }
+                    _ => runs.push(Extent {
+                        lblock: lblock as u32,
+                        len: 1,
+                        start: block,
+                        init: true,
+                    }),
+                }
+            }
+            runs
+        };
+        Ok(extents
+            .iter()
+            .filter(|e| u64::from(e.lblock) * bs < end && e.end() * bs > start)
+            .map(|e| {
+                // The first extent starts at `start`, as the iomap of Linux maps from there.
+                let skip = (start / bs).saturating_sub(u64::from(e.lblock));
+                FiemapExtent {
+                    logical: (u64::from(e.lblock) + skip) * bs,
+                    physical: (e.start + skip) * bs,
+                    length: (u64::from(e.len) - skip) * bs,
+                    unwritten: !e.init,
+                }
+            })
+            .collect())
     }
 
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {

@@ -105,6 +105,16 @@ pub fn sync_all() -> Result<()> {
     result
 }
 
+/// Removes the clean pages of each block device from the cache, for `/proc/sys/vm/drop_caches`.
+/// The dirty pages stay in the cache.
+pub fn drop_clean_all() {
+    let caches: Vec<Arc<DiskCache>> =
+        BLOCK_DEVICES.lock().values().map(|e| e.cache.clone()).collect();
+    for cache in caches {
+        cache.drop_clean();
+    }
+}
+
 /// Gives the name and the device number of each block device.
 pub fn block_devices() -> Vec<(String, u64)> {
     BLOCK_DEVICES.lock().iter().map(|(rdev, e)| (e.name.clone(), *rdev)).collect()
