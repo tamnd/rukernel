@@ -927,4 +927,8 @@ impl Inode for Node {
     fn fs_magic(&self) -> u64 {
         EXT4_MAGIC
     }
+
+    fn fs_stat(&self) -> Option<rk_vfs::inode::FsStat> {
+        Some(self.fs.stat())
+    }
 }

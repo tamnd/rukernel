@@ -147,6 +147,24 @@ impl Metadata {
     }
 }
 
+/// The counts of a file system, as `statfs` gives them. The counts of blocks are in units of
+/// `bsize` bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FsStat {
+    /// The size of a block in bytes.
+    pub bsize: u64,
+    /// The number of blocks for data.
+    pub blocks: u64,
+    /// The number of free blocks.
+    pub bfree: u64,
+    /// The number of free blocks that a user without privileges can use.
+    pub bavail: u64,
+    /// The number of inodes.
+    pub files: u64,
+    /// The number of free inodes.
+    pub ffree: u64,
+}
+
 /// A change of the attributes, as `chmod`, `chown`, `truncate` and `utimensat` give it. A field
 /// with `None` does not change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -273,6 +291,12 @@ pub trait Inode: Any + Send + Sync {
     /// The device of the file system, for a rename or a link across file systems.
     fn fs_id(&self) -> u64 {
         self.metadata().dev
+    }
+
+    /// The counts of the file system, for `statfs`. `None` gives counts of 0, as for a file
+    /// system without a size.
+    fn fs_stat(&self) -> Option<FsStat> {
+        None
     }
 
     /// The magic number of the file system, as `f_type` of `statfs` gives it. The values are in

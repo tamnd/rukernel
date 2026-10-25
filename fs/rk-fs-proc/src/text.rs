@@ -74,6 +74,41 @@ pub fn mount_options(flags: u64) -> String {
     out
 }
 
+/// The fields of a line of `/proc/PID/mountinfo`.
+pub struct MountInfo<'a> {
+    /// The mount ID.
+    pub id: u64,
+    /// The mount ID of the parent mount. The root mount gives its own ID.
+    pub parent: u64,
+    /// The device of the file system, as `st_dev` gives it.
+    pub dev: u64,
+    /// The path of the root of the mount in its file system.
+    pub root: &'a [u8],
+    /// The path of the mount point from the root of the process.
+    pub path: &'a [u8],
+    /// The mount flags.
+    pub flags: u64,
+    /// The type of the file system.
+    pub fstype: &'a str,
+    /// The source of the mount.
+    pub source: &'a [u8],
+}
+
+/// Writes a line of `/proc/PID/mountinfo`, as `show_mountinfo` of Linux does. The line has no
+/// optional fields, because the mounts have no propagation.
+pub fn mountinfo(out: &mut Vec<u8>, m: &MountInfo<'_>) {
+    let major = ((m.dev >> 8) & 0xfff) | ((m.dev >> 32) & !0xfff);
+    let minor = (m.dev & 0xff) | ((m.dev >> 12) & !0xff);
+    out.extend_from_slice(format!("{} {} {major}:{minor} ", m.id, m.parent).as_bytes());
+    escape(out, m.root);
+    out.push(b' ');
+    escape(out, m.path);
+    out.extend_from_slice(format!(" {} - {} ", mount_options(m.flags), m.fstype).as_bytes());
+    escape(out, m.source);
+    let ro = if m.flags as u32 & MS_RDONLY != 0 { "ro" } else { "rw" };
+    out.extend_from_slice(format!(" {ro}\n").as_bytes());
+}
+
 /// Writes `s` for a field of `/proc/mounts`: a space, a tab, a new line and a backslash become
 /// an octal escape, as `mangle` of Linux does.
 pub fn escape(out: &mut Vec<u8>, s: &[u8]) {
@@ -399,6 +434,23 @@ mod tests {
         let mut out = Vec::new();
         escape(&mut out, b"a b\\c");
         assert_eq!(out, b"a\\040b\\134c");
+    }
+
+    #[test]
+    fn mountinfo_has_the_fields_of_linux() {
+        let mut out = Vec::new();
+        let m = MountInfo {
+            id: 7,
+            parent: 1,
+            dev: (254 << 8) | 16,
+            root: b"/",
+            path: b"/mnt",
+            flags: u64::from(MS_NOATIME),
+            fstype: "ext4",
+            source: b"/dev/vdb",
+        };
+        mountinfo(&mut out, &m);
+        assert_eq!(out, b"7 1 254:16 / /mnt rw,noatime - ext4 /dev/vdb rw\n");
     }
 
     #[test]

@@ -504,6 +504,40 @@ fn mounts_of(p: &Process) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn mountinfo_of(p: &Process) -> Result<Vec<u8>> {
+    let fs = p.fs().ok_or(Errno::ESRCH)?.lock().clone();
+    let mut out = Vec::new();
+    for m in fs.namespace().mounts() {
+        let at = Location { mount: m.clone(), dentry: m.root().clone() };
+        let Ok(path) = fs.path_of(&at) else { continue };
+        // The path of the root of the mount in its file system. It is not `/` after `MS_BIND`.
+        let mut root = Vec::new();
+        let mut d = m.root().clone();
+        while let Some(up) = d.parent() {
+            let mut part = Vec::from(&b"/"[..]);
+            part.extend_from_slice(&d.name());
+            root.splice(0..0, part);
+            d = up;
+        }
+        if root.is_empty() {
+            root.push(b'/');
+        }
+        let src = m.source();
+        let info = text::MountInfo {
+            id: m.id(),
+            parent: m.mountpoint().map_or(m.id(), |up| up.mount.id()),
+            dev: m.root().inode().metadata().dev,
+            root: &root,
+            path: &path,
+            flags: src.flags,
+            fstype: src.fstype,
+            source: &src.source,
+        };
+        text::mountinfo(&mut out, &info);
+    }
+    Ok(out)
+}
+
 /// The target of a link in `/proc/PID/fd`.
 fn fd_target(file: &rk_vfs::File, fs: Option<&rk_vfs::FsContext>) -> Vec<u8> {
     if let Some(at) = file.location() {
@@ -642,6 +676,11 @@ fn process_files(
     out.push((b"smaps".to_vec(), file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?))));
     let p_ = w.clone();
     out.push((b"mounts".to_vec(), file(&join(base, b"mounts"), move || mounts_of(&*alive(&p_)?))));
+    let p_ = w.clone();
+    out.push((
+        b"mountinfo".to_vec(),
+        file(&join(base, b"mountinfo"), move || mountinfo_of(&*alive(&p_)?)),
+    ));
     let p_ = w.clone();
     out.push((
         b"statm".to_vec(),
