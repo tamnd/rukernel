@@ -28,6 +28,9 @@
 # nice04, setpriority02, sched_setaffinity01, sched_setparam05, sched_setscheduler02 and
 # sched_setscheduler03 need user IDs. sched_setscheduler04 calls sched_getscheduler of musl, which
 # always gives ENOSYS.
+#
+# fgetxattr02 opens a loop block device, and the kernel has no loop driver. setxattr03 needs the
+# immutable flag of FS_IOC_SETFLAGS.
 alarm02
 alarm03
 alarm05
@@ -313,3 +316,58 @@ move_mount02
 move_mount03
 open_tree01
 open_tree02
+copy_file_range01
+copy_file_range03
+fgetxattr01
+fgetxattr03
+flistxattr01
+flistxattr02
+flistxattr03
+fremovexattr01
+fremovexattr02
+fsetxattr01
+getxattr01
+getxattr02
+lgetxattr01
+lgetxattr02
+listxattr01
+listxattr02
+listxattr03
+llistxattr01
+llistxattr02
+llistxattr03
+lremovexattr01
+posix_fadvise01
+posix_fadvise01_64
+posix_fadvise02
+posix_fadvise02_64
+posix_fadvise03
+posix_fadvise03_64
+posix_fadvise04
+posix_fadvise04_64
+removexattr01
+removexattr02
+sendfile02
+sendfile02_64
+sendfile03
+sendfile03_64
+sendfile04
+sendfile04_64
+sendfile05
+sendfile05_64
+sendfile06
+sendfile06_64
+sendfile07
+sendfile07_64
+sendfile08
+sendfile08_64
+setxattr01
+setxattr02
+splice01
+splice02
+splice03
+splice04
+splice05
+splice07
+splice08
+splice09

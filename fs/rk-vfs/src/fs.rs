@@ -189,7 +189,11 @@ impl FsContext {
                 let ops = crate::blockdev::open_block(meta.rdev, flags)?;
                 Ok(File::with_ops(ops, Some(at), flags))
             }
-            FileType::Fifo | FileType::Socket => Err(Errno::ENXIO),
+            FileType::Fifo => {
+                let ops = crate::pipe::open_fifo(meta.dev, meta.ino, flags)?;
+                Ok(File::with_ops(ops, Some(at), flags))
+            }
+            FileType::Socket => Err(Errno::ENXIO),
             FileType::Symlink => Err(Errno::ELOOP),
         }
     }

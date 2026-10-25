@@ -1624,6 +1624,39 @@ static void test_xattr(void)
 	unlink("/tmp/xa");
 }
 
+static void test_fifo(void)
+{
+	struct stat st1, st2;
+	char buf[8];
+	pid_t pid;
+	int fd, status;
+
+	mkdir("/tmp", 0755);
+	unlink("/tmp/ff");
+	check("mkfifo", mkfifo("/tmp/ff", 0644) == 0);
+	check("a nonblocking open for writing of a FIFO with no reader gives ENXIO",
+	      open("/tmp/ff", O_WRONLY | O_NONBLOCK) < 0 && errno == ENXIO);
+	pid = fork();
+	if (pid == 0) {
+		fd = open("/tmp/ff", O_WRONLY);
+		_exit(fd >= 0 && write(fd, "hi", 2) == 2 ? 0 : 1);
+	}
+	fd = open("/tmp/ff", O_RDONLY);
+	check("an open for reading of a FIFO waits for the writer", fd >= 0);
+	check("a read of a FIFO gives the data of the writer", read(fd, buf, sizeof(buf)) == 2 && memcmp(buf, "hi", 2) == 0);
+	waitpid(pid, &status, 0);
+	check("the writer of the FIFO exits with 0", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("a read of a FIFO with no writer gives the end of the file", read(fd, buf, sizeof(buf)) == 0);
+	fstat(fd, &st1);
+	stat("/tmp/ff", &st2);
+	check("fstat of a FIFO gives the inode of the file", S_ISFIFO(st1.st_mode) && st1.st_ino == st2.st_ino && st1.st_dev == st2.st_dev);
+	close(fd);
+	fd = open("/tmp/ff", O_RDWR);
+	check("an open of a FIFO with O_RDWR does not wait", fd >= 0 && write(fd, "x", 1) == 1 && read(fd, buf, 1) == 1);
+	close(fd);
+	unlink("/tmp/ff");
+}
+
 /* Reads the file at path into buf, and gives the count of bytes, or -1. */
 static int read_small(const char *path, char *buf, int size)
 {
@@ -2280,6 +2313,7 @@ int main(int argc, char **argv)
 	test_atime();
 	test_sysfs();
 	test_xattr();
+	test_fifo();
 	test_proc();
 	test_memfd();
 	test_shm();
