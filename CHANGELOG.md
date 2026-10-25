@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- An ext4 mount no longer frees a reserved inode, an inode past the end, or an inode that is not in use when `s_last_orphan` points to it. As Linux, such an inode ends the list of orphans and stays as it is. ext4/038 passes.
+
 ## [0.3.13] - 2026-10-26
 
 ### Added

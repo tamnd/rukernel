@@ -311,6 +311,13 @@ impl Tx<'_> {
         self.write_sb(0, 1)
     }
 
+    /// Tells if the bitmap has the inode `ino` in use.
+    pub(crate) fn inode_in_use(&self, ino: u32) -> Result<bool> {
+        let ipg = self.fs.sb.inodes_per_group;
+        let bitmap = self.inode_bitmap((ino - 1) / ipg)?;
+        Ok(test_bit(&bitmap, ((ino - 1) % ipg) as usize))
+    }
+
     /// Takes a generation for a new inode.
     pub(crate) fn next_generation(&mut self) -> u32 {
         let g = self.meta.generation;
