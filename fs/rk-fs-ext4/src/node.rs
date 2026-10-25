@@ -319,21 +319,23 @@ impl Tx<'_> {
         result.map(|()| 0)
     }
 
-    /// Changes the size of the file `ino`. The blocks past the new size are freed, and the bytes
-    /// past the size in its last block become zeros.
+    /// Changes the size of the file `ino`. The bytes past the size in its last block become
+    /// zeros. A truncate down or to the same size frees the blocks past the size, also the blocks
+    /// that `fallocate` gave with `FALLOC_FL_KEEP_SIZE`, as Linux. A truncate up keeps them.
     pub(crate) fn truncate(&mut self, ino: u32, raw: &mut RawInode, size: u64) -> Result<()> {
         let fs = self.fs;
         let bs = fs.sb.block_size;
         let old = raw.size();
-        if size == old {
-            return Ok(());
-        }
         if raw.flags() & flags::EXTENTS == 0 {
-            return Err(Errno::EOPNOTSUPP);
+            return if size == old { Ok(()) } else { Err(Errno::EOPNOTSUPP) };
         }
-        if size < old {
+        if size <= old {
             let (mut extents, tree) = fs.extents(raw)?;
-            let freed = extent::cut(&mut extents, size.div_ceil(bs));
+            let last = size.div_ceil(bs);
+            if size == old && extents.iter().all(|e| e.end() <= last) {
+                return Ok(());
+            }
+            let freed = extent::cut(&mut extents, last);
             let mut count = 0;
             for (start, len) in freed {
                 self.free_blocks(start, len)?;
@@ -343,7 +345,8 @@ impl Tx<'_> {
             self.build_tree(ino, raw, &extents, tree)?;
         }
         let at = size.min(old);
-        if !at.is_multiple_of(bs)
+        if size != old
+            && !at.is_multiple_of(bs)
             && let Some((block, true)) = fs.map(raw, at / bs)?
         {
             let zero = vec![0u8; (bs - at % bs) as usize];

@@ -11,6 +11,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `FS_IOC_FIEMAP` ioctl. ext4 gives the extents of a file, and marks the extents that are not initialized as unwritten. A file with a block map gives each run of blocks as one extent. overlayfs passes the call to the real file. Only `FIEMAP_FLAG_SYNC` is accepted. Many fstests use `fiemap` of xfs_io, and did not run before.
 - `/proc/sys/vm/drop_caches`. A write removes the clean pages of the block devices from the cache. The file reads as 0.
 
+### Fixed
+
+- On ext4, a truncate to the same size frees the blocks past the end of the file that `fallocate` gave with `FALLOC_FL_KEEP_SIZE`, as Linux. generic/092 checks it.
+
 ## [0.3.8] - 2026-10-25
 
 ### Added

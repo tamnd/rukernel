@@ -365,7 +365,7 @@ fn fallocate_gives_and_frees_blocks() {
 #[test]
 fn fiemap_gives_the_extents() {
     use rk_vfs::inode::falloc::KEEP_SIZE;
-    let (fs, _ram) = open_rw();
+    let (fs, ram) = open_rw();
     let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
     file.write_at(0, &vec![1u8; 2 * BS]).unwrap();
     file.fallocate(KEEP_SIZE, 4 * BS as u64, BS as u64).unwrap();
@@ -380,6 +380,11 @@ fn fiemap_gives_the_extents() {
     assert_eq!((part[0].logical, part[0].length), (BS as u64, BS as u64));
     assert_eq!(part[0].physical, all[0].physical + BS as u64);
     assert!(file.fiemap(2 * BS as u64, 2 * BS as u64).unwrap().is_empty());
+    // A truncate to the same size frees the blocks past the end of the file.
+    let free = ram.free().0;
+    file.set_attr(&SetAttr { size: Some(2 * BS as u64), ..SetAttr::default() }).unwrap();
+    assert_eq!(ram.free().0, free + 1);
+    assert_eq!(file.fiemap(0, u64::MAX).unwrap().len(), 1);
 }
 
 #[test]
