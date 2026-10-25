@@ -37,6 +37,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/klog.h>
 #include <linux/fs.h>
 #include <linux/aio_abi.h>
 #include <sys/ioctl.h>
@@ -1526,6 +1527,14 @@ static void test_splice(void)
 	      syscall(SYS_splice, p[0], NULL, null, NULL, 4096, 0) == 3);
 	close(null);
 	close(p[0]);
+	check("pipe for a large splice", pipe(p) == 0);
+	ftruncate(in, 100000);
+	off = 0;
+	check("splice to a pipe writes only what fits and does not wait",
+	      syscall(SYS_splice, in, &off, p[1], NULL, 100000, 0) == 65536 && off == 65536);
+	close(p[0]);
+	close(p[1]);
+	ftruncate(in, 8);
 	lseek(in, 1, SEEK_SET);
 	lseek(out, 0, SEEK_SET);
 	check("copy_file_range at the positions copies 3 bytes",
@@ -1623,6 +1632,20 @@ static void test_xattr(void)
 	close(fd);
 	unlink("/tmp/xl");
 	unlink("/tmp/xa");
+}
+
+static void test_syslog(void)
+{
+	static char buf[65536];
+	int n;
+
+	check("syslog gives the size of the kernel log", klogctl(10, NULL, 0) == 65536);
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("syslog reads the boot log with the level and the time", n > 0 && strncmp(buf, "<6>[", 4) == 0 && strstr(buf, "rukernel") != NULL);
+	check("syslog with a bad action gives EINVAL", klogctl(99, NULL, 0) < 0 && errno == EINVAL);
+	check("syslog read with no buffer gives EINVAL", klogctl(3, NULL, 10) < 0 && errno == EINVAL);
+	check("syslog clears the kernel log", klogctl(5, NULL, 0) == 0 && klogctl(3, buf, sizeof(buf)) == 0);
 }
 
 static void test_fifo(void)
@@ -2384,6 +2407,7 @@ int main(int argc, char **argv)
 	test_sysfs();
 	test_xattr();
 	test_fifo();
+	test_syslog();
 	test_overlay();
 	test_proc();
 	test_memfd();

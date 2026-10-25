@@ -8,7 +8,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::vec;
 use rk_abi::Errno;
 use rk_vfs::File;
-use rk_vfs::pipe::pipe_size;
+use rk_vfs::pipe::{PIPE_BUF, pipe_size, pipe_space};
 
 /// The most bytes of one call. Linux names it `MAX_RW_COUNT`.
 const MAX_RW_COUNT: usize = 0x7fff_f000;
@@ -54,7 +54,16 @@ fn copy(
     let mut chunk = vec![0u8; count.min(CHUNK)];
     let mut done = 0usize;
     while done < count {
-        let n = (count - done).min(chunk.len());
+        let mut n = (count - done).min(chunk.len());
+        // A copy into a pipe writes what fits, as Linux. A full pipe waits for space only before
+        // the first byte: a write of up to `PIPE_BUF` bytes waits until all of it fits.
+        if let Ok(space) = pipe_space(output) {
+            match space {
+                0 if done > 0 => break,
+                0 => n = n.min(PIPE_BUF),
+                _ => n = n.min(space),
+            }
+        }
         let read = match in_off {
             Some(off) => input.read_at(off + done as u64, &mut chunk[..n]),
             None => input.read(&mut chunk[..n]),

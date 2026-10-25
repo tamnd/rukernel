@@ -2,6 +2,18 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `syslog(2)` and a kernel log. The text of the kernel goes to a ring of 64 KiB, and each line starts with the level and the time since boot, as on Linux. `dmesg` reads it with `syslog(2)`. The actions that change the console log level do nothing.
+- The `fstests` boot test makes `/dev/fd` and an ext4 file system on the scratch disk, so the overlay tests can run with `RK_FSTESTS_TESTS="-overlay ..."`.
+- The `fstests` boot test shows the output of `check` while the tests run. `RK_FSTESTS_TIMEOUT` gives a shorter time limit, and `RK_FSTESTS_WATCH` shows the state and the system call of each process each minute after a time, to find a test that hangs.
+
+### Fixed
+
+- `splice` and `sendfile` into a pipe write only the data that fits in the pipe, as Linux. Before, a copy that was larger than the free space waited for a reader, and fsstress hung when it spliced a file into its own pipe. This stopped generic/013 and overlay/019.
+
 ## [0.3.7] - 2026-10-25
 
 ### Added

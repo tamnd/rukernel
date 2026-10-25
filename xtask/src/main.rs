@@ -1054,23 +1054,39 @@ fn fstests_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
         "#!/bin/sh\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n",
         "mount -t proc proc /proc\nmount -t tmpfs tmp /tmp\n",
-        "mkfs.ext4 -q -F /dev/vda\n",
+        // bash makes `<(...)` with /dev/fd, which a distribution init makes on Linux.
+        "[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd\n",
+        // The overlay tests do not make the file system under the scratch overlay.
+        "mkfs.ext4 -q -F /dev/vda\nmkfs.ext4 -q -F /dev/vdb\n",
         "cd /var/lib/xfstests\n",
+        "RK_WATCH\n",
         "cat > local.config <<EOF\n",
         "export FSTYP=ext4\n",
         "export TEST_DEV=/dev/vda\nexport TEST_DIR=/test\n",
         "export SCRATCH_DEV=/dev/vdb\nexport SCRATCH_MNT=/scratch\n",
         "EOF\n",
-        "./check",
+        // The output of `check` goes to the console while the tests run, so the log of a
+        // timeout shows the test that did not end.
+        "{ ./check",
     ));
+    // RK_FSTESTS_WATCH gives a time in seconds for a run by hand. After it, the script shows
+    // the state and the system call of each process each minute, to find a test that hangs.
+    let watch = std::env::var("RK_FSTESTS_WATCH").ok().and_then(|s| s.parse::<u64>().ok());
+    let watch = watch.map_or(String::new(), |secs| {
+        format!(
+            "(sleep {secs}; while :; do for p in /proc/[0-9]*; do \
+             echo \"watch: ${{p#/proc/}} $(cat $p/comm) $(cut -d' ' -f3 $p/stat) $(cat $p/syscall)\"; \
+             done; sleep 60; done) 2>/dev/null &"
+        )
+    });
+    script = script.replace("RK_WATCH", &watch);
     for t in tests {
         script.push(' ');
         script.push_str(t);
     }
     script.push_str(concat!(
-        " > /tmp/check.log 2>&1\n",
-        "code=$?\n",
-        "sed 's/^/fstests: /' /tmp/check.log\n",
+        "; echo $? > /tmp/code; } 2>&1 | sed 's/^/fstests: /'\n",
+        "code=$(cat /tmp/code)\n",
         // The difference of the output and the end of the full log of each test that failed.
         "for f in results/*/*.out.bad; do\n",
         "    [ -e \"$f\" ] || continue\n",
@@ -1595,7 +1611,12 @@ fn boot_test(names: &[String]) -> Result {
                     ))
                     .args(["-device", &format!("virtio-blk-pci,drive={name}")]);
             }
-            (cmd, FSTESTS_TIMEOUT)
+            // RK_FSTESTS_TIMEOUT gives a shorter time in seconds for a run by hand.
+            let timeout = std::env::var("RK_FSTESTS_TIMEOUT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map_or(FSTESTS_TIMEOUT, Duration::from_secs);
+            (cmd, timeout)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), BOOT_TEST_TIMEOUT)

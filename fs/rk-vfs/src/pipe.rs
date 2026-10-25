@@ -277,6 +277,17 @@ pub fn pipe_size(file: &File) -> Result<usize> {
     Ok(end_of(file)?.pipe.state.lock().size)
 }
 
+/// The free space in the pipe of `file`. `splice` and `sendfile` write only this much, so a copy
+/// into a full pipe does not wait for all of its data to go in.
+///
+/// # Errors
+///
+/// Gives `EBADF` if the file is not a pipe.
+pub fn pipe_space(file: &File) -> Result<usize> {
+    let s = end_of(file)?.pipe.state.lock();
+    Ok(s.size.saturating_sub(s.buf.len()))
+}
+
 /// Sets the capacity of the pipe of `file`, for `F_SETPIPE_SZ`. The size goes up to a power of
 /// two count of pages, as `round_pipe_size` of Linux does. Gives the new capacity.
 ///
