@@ -42,6 +42,8 @@ struct Attrs {
     atime: Timespec,
     mtime: Timespec,
     ctime: Timespec,
+    /// The inode flags of `FS_IOC_SETFLAGS`.
+    flags: u32,
 }
 
 enum Data {
@@ -136,6 +138,7 @@ impl Node {
                 atime: t,
                 mtime: t,
                 ctime: t,
+                flags: 0,
             }),
             data: SpinLock::new(data),
             xattrs: SpinLock::new(Xattrs::new()),
@@ -308,6 +311,22 @@ impl Inode for Node {
         }
         self.touch();
         Ok(buf.len())
+    }
+
+    fn attr_flags(&self) -> Result<u32> {
+        Ok(self.attrs.lock().flags)
+    }
+
+    fn set_attr_flags(&self, flags: u32) -> Result<()> {
+        use rk_vfs::inode::iflags::{APPEND, IMMUTABLE, NOATIME, NODUMP};
+        // tmpfs keeps only these flags, as `SHMEM_FL_USER_MODIFIABLE` of Linux.
+        if flags & !(IMMUTABLE | APPEND | NODUMP | NOATIME) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let mut attrs = self.attrs.lock();
+        attrs.flags = flags;
+        attrs.ctime = now();
+        Ok(())
     }
 
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {

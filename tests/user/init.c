@@ -1731,6 +1731,41 @@ static void test_file_locks(void)
 	unlink("/tmp/lk");
 }
 
+static void test_iflags(void)
+{
+	int flags = 0, fd, ap;
+
+	mkdir("/tmp", 0755);
+	fd = open("/tmp/fl", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	check("FS_IOC_GETFLAGS gives no flags for a new file", ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 && flags == 0);
+	flags = FS_IMMUTABLE_FL;
+	check("FS_IOC_SETFLAGS sets the immutable flag", ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0);
+	flags = 0;
+	check("FS_IOC_GETFLAGS gives the immutable flag",
+	      ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 && flags == FS_IMMUTABLE_FL);
+	check("a write to an immutable file gives EPERM", write(fd, "x", 1) < 0 && errno == EPERM);
+	check("an open for writing of an immutable file gives EPERM",
+	      open("/tmp/fl", O_WRONLY) < 0 && errno == EPERM);
+	check("unlink of an immutable file gives EPERM", unlink("/tmp/fl") < 0 && errno == EPERM);
+	check("chmod of an immutable file gives EPERM", chmod("/tmp/fl", 0600) < 0 && errno == EPERM);
+	check("setxattr on an immutable file gives EPERM",
+	      setxattr("/tmp/fl", "user.a", "x", 1, 0) < 0 && errno == EPERM);
+	flags = FS_APPEND_FL;
+	check("FS_IOC_SETFLAGS sets the append-only flag", ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0);
+	check("an open of an append-only file without O_APPEND gives EPERM",
+	      open("/tmp/fl", O_WRONLY) < 0 && errno == EPERM);
+	ap = open("/tmp/fl", O_WRONLY | O_APPEND);
+	check("an append-only file accepts an append", ap >= 0 && write(ap, "ab", 2) == 2);
+	check("clearing O_APPEND on an append-only file gives EPERM",
+	      fcntl(ap, F_SETFL, 0) < 0 && errno == EPERM);
+	check("ftruncate of an append-only file gives EPERM", ftruncate(ap, 0) < 0 && errno == EPERM);
+	close(ap);
+	flags = 0;
+	check("FS_IOC_SETFLAGS clears the flags", ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0);
+	close(fd);
+	check("unlink works when the flags are clear", unlink("/tmp/fl") == 0);
+}
+
 static void test_fallocate(void)
 {
 	struct stat st;
@@ -2518,6 +2553,7 @@ int main(int argc, char **argv)
 	test_fifo();
 	test_file_locks();
 	test_fallocate();
+	test_iflags();
 	test_syslog();
 	test_membarrier();
 	test_overlay();

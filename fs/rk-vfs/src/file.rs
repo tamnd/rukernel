@@ -6,7 +6,9 @@
 //! socket give their own operations.
 
 use crate::dentry::Location;
-use crate::inode::{FileType, InodeRef, Metadata, Result, SetAttr};
+use crate::inode::{
+    FileType, InodeRef, Metadata, Result, SetAttr, check_immutable, check_set_attr,
+};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -208,6 +210,7 @@ impl FileOps for InodeFile {
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize> {
         let inode = file.inode.as_ref().ok_or(Errno::EINVAL)?;
+        check_immutable(&**inode)?;
         let mut pos = file.pos.lock();
         if file.flags().append() {
             *pos = inode.metadata().size;
@@ -229,6 +232,7 @@ impl FileOps for InodeFile {
 
     fn write_at(&self, file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
         let inode = file.inode.as_ref().ok_or(Errno::EINVAL)?;
+        check_immutable(&**inode)?;
         inode.write_at(offset, buf)
     }
 
@@ -240,10 +244,29 @@ impl FileOps for InodeFile {
         let inode = file.inode.as_ref().ok_or(Errno::ENOTTY)?;
         match cmd {
             fiemap::FS_IOC_FIEMAP => fiemap::ioctl(inode, arg, mem),
+            FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => {
+                mem.write(arg, &inode.attr_flags()?.to_ne_bytes())?;
+                Ok(0)
+            }
+            FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS => {
+                let mut b = [0u8; 4];
+                mem.read(arg, &mut b)?;
+                inode.set_attr_flags(u32::from_ne_bytes(b))?;
+                Ok(0)
+            }
             _ => Err(Errno::ENOTTY),
         }
     }
 }
+
+/// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
+const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+/// `_IOW('f', 2, long)`.
+const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+/// `_IOR('f', 1, int)`, the command of a 32-bit program.
+const FS_IOC32_GETFLAGS: u32 = 0x8004_6601;
+/// `_IOW('f', 2, int)`.
+const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
 
 /// `FS_IOC_FIEMAP`, from `<linux/fiemap.h>`.
 mod fiemap {
@@ -557,7 +580,9 @@ impl File {
         if !self.flags().writable() || inode.metadata().file_type() != Some(FileType::Regular) {
             return Err(Errno::EINVAL);
         }
-        inode.set_attr(&SetAttr { size: Some(size), ..SetAttr::default() })
+        let attr = SetAttr { size: Some(size), ..SetAttr::default() };
+        check_set_attr(&**inode, &attr)?;
+        inode.set_attr(&attr)
     }
 
     /// `fallocate`. The caller checked the mode, the offset and the length.
@@ -566,6 +591,11 @@ impl File {
             return Err(Errno::EBADF);
         }
         let inode = self.inode.as_ref().ok_or(Errno::ENODEV)?;
+        // An append-only file only takes new blocks, as `vfs_fallocate` of Linux.
+        check_immutable(&**inode)?;
+        if mode & !crate::inode::falloc::KEEP_SIZE != 0 {
+            crate::inode::check_fixed(&**inode)?;
+        }
         match inode.metadata().file_type() {
             Some(FileType::Regular) => inode.fallocate(mode, offset, len),
             Some(FileType::Fifo) => Err(Errno::ESPIPE),

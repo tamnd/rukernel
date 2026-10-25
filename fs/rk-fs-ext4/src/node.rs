@@ -831,6 +831,25 @@ impl Inode for Node {
         result
     }
 
+    fn attr_flags(&self) -> Result<u32> {
+        Ok(self.raw().flags() & flags::USER_VISIBLE)
+    }
+
+    fn set_attr_flags(&self, new: u32) -> Result<()> {
+        let mut tx = self.fs.tx()?;
+        let mut raw = self.raw();
+        let old = raw.flags();
+        let changed = (old ^ new) & flags::USER_MODIFIABLE;
+        // The driver cannot move a file between a block map and an extent tree, and has no
+        // names that ignore the case.
+        if changed & (flags::EXTENTS | flags::CASEFOLD) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        raw.set_flags((old & !flags::USER_MODIFIABLE) | (new & flags::USER_MODIFIABLE));
+        touch(&mut raw, false);
+        tx.save(self, raw)
+    }
+
     fn fiemap(&self, start: u64, len: u64) -> Result<Vec<FiemapExtent>> {
         let raw = self.raw();
         let bs = self.fs.sb.block_size;

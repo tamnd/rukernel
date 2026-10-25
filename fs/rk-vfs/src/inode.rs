@@ -247,6 +247,18 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 
+    /// Gives the inode flags of [`iflags`], for `FS_IOC_GETFLAGS`. The default gives `ENOTTY`, as
+    /// Linux gives for a file system that does not have the ioctl.
+    fn attr_flags(&self) -> Result<u32> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// Sets the inode flags of [`iflags`], for `FS_IOC_SETFLAGS`. A file system gives
+    /// `EOPNOTSUPP` for a flag that it does not keep. The default gives `ENOTTY`.
+    fn set_attr_flags(&self, _flags: u32) -> Result<()> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
@@ -361,6 +373,67 @@ pub struct FiemapExtent {
     pub length: u64,
     /// The extent has blocks that are not written, and it reads as zeros.
     pub unwritten: bool,
+}
+
+/// The inode flags of `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`, from `<linux/fs.h>`. `chattr`
+/// and `lsattr` use them.
+pub mod iflags {
+    /// The changes of the file are written at once.
+    pub const SYNC: u32 = 0x08;
+    /// The file cannot change, and no name can change to or from it.
+    pub const IMMUTABLE: u32 = 0x10;
+    /// The file can only get data at its end.
+    pub const APPEND: u32 = 0x20;
+    /// `dump` does not save the file.
+    pub const NODUMP: u32 = 0x40;
+    /// A read does not change the access time.
+    pub const NOATIME: u32 = 0x80;
+}
+
+/// Gives the inode flags of `inode`, or 0 if its file system does not keep them.
+fn flags_of(inode: &dyn Inode) -> u32 {
+    inode.attr_flags().unwrap_or(0)
+}
+
+/// Gives `EPERM` if `inode` is immutable, for a change of the data, the attributes or the names
+/// of a directory.
+///
+/// # Errors
+///
+/// Gives `EPERM` if the inode has [`iflags::IMMUTABLE`].
+pub fn check_immutable(inode: &dyn Inode) -> Result<()> {
+    if flags_of(inode) & iflags::IMMUTABLE != 0 { Err(Errno::EPERM) } else { Ok(()) }
+}
+
+/// Gives `EPERM` if `inode` is immutable or append-only, for a change that an append-only file
+/// also refuses: an unlink, a rename, a link, a truncate, or a change of the owner, the mode or
+/// an extended attribute.
+///
+/// # Errors
+///
+/// Gives `EPERM` if the inode has [`iflags::IMMUTABLE`] or [`iflags::APPEND`].
+pub fn check_fixed(inode: &dyn Inode) -> Result<()> {
+    if flags_of(inode) & (iflags::IMMUTABLE | iflags::APPEND) != 0 {
+        Err(Errno::EPERM)
+    } else {
+        Ok(())
+    }
+}
+
+/// The checks of the inode flags for a change of attributes, as `notify_change` of Linux. An
+/// immutable file refuses all changes. An append-only file only takes a change of the times.
+///
+/// # Errors
+///
+/// Gives `EPERM` if the flags refuse the change.
+pub fn check_set_attr(inode: &dyn Inode, attr: &SetAttr) -> Result<()> {
+    let flags = flags_of(inode);
+    let fixed =
+        attr.size.is_some() || attr.mode.is_some() || attr.uid.is_some() || attr.gid.is_some();
+    if flags & iflags::IMMUTABLE != 0 || (flags & iflags::APPEND != 0 && fixed) {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
 }
 
 /// The modes of `fallocate`, from `<linux/falloc.h>`.
