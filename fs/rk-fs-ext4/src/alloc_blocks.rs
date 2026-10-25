@@ -70,8 +70,9 @@ impl Tx<'_> {
             }
             put16(d, gd::CHECKSUM, crc);
         }
-        let at = (u64::from(fs.sb.first_data_block) + 1) * fs.sb.block_size
-            + u64::from(group) * size as u64;
+        let per_block = fs.sb.descs_per_block();
+        let at = fs.sb.desc_block(u64::from(group) / per_block) * fs.sb.block_size
+            + (u64::from(group) % per_block) * size as u64;
         fs.write(at, &self.meta.descs[group as usize])
     }
 
@@ -109,11 +110,8 @@ impl Tx<'_> {
         }
         let sb = &fs.sb;
         let mut bitmap = vec![0u8; sb.block_size as usize];
-        if sb.has_super(group) {
-            let used = 1 + sb.gdt_blocks() + u64::from(sb.reserved_gdt_blocks);
-            for bit in 0..used as usize {
-                set_bit(&mut bitmap, bit, true);
-            }
+        for bit in 0..sb.base_meta_blocks(group) as usize {
+            set_bit(&mut bitmap, bit, true);
         }
         let start =
             u64::from(sb.first_data_block) + u64::from(group) * u64::from(sb.blocks_per_group);

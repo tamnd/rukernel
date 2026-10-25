@@ -241,9 +241,6 @@ impl Fs {
         let mut b = vec![0u8; layout::SUPERBLOCK_SIZE];
         disk.read(layout::SUPERBLOCK_AT, &mut b)?;
         let sb = Superblock::parse(&b)?;
-        if sb.incompat & layout::incompat::META_BG != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
         // Linux does not mount a block size larger than the page size.
         if sb.block_size > 4096 {
             return Err(Errno::EINVAL);
@@ -262,8 +259,9 @@ impl Fs {
         let count = sb.groups() as usize;
         let size = usize::from(sb.desc_size);
         let mut table = vec![0u8; count * size];
-        let at = (u64::from(sb.first_data_block) + 1) * sb.block_size;
-        disk.read(at, &mut table)?;
+        for (nr, block) in table.chunks_mut(sb.block_size as usize).enumerate() {
+            disk.read(sb.desc_block(nr as u64) * sb.block_size, block)?;
+        }
         let groups = table.chunks(size).map(|d| GroupDesc::parse(d, sb.desc_size)).collect();
         let descs = table.chunks(size).map(<[u8]>::to_vec).collect();
         let generation = crc::crc32c(csum_seed, &rk_vfs::now().nsec.to_le_bytes());
@@ -430,10 +428,9 @@ impl Fs {
         }
         drop(meta);
         let groups = sb.groups();
-        let supers = (0..groups).filter(|&g| sb.has_super(g)).count() as u64;
-        let mut overhead = u64::from(sb.first_data_block)
-            + supers * (1 + sb.gdt_blocks() + u64::from(sb.reserved_gdt_blocks))
-            + u64::from(groups) * (2 + sb.itable_blocks());
+        let base: u64 = (0..groups).map(|g| sb.base_meta_blocks(g)).sum();
+        let mut overhead =
+            u64::from(sb.first_data_block) + base + u64::from(groups) * (2 + sb.itable_blocks());
         if sb.journal_inum != 0
             && let Ok(raw) = self.read_inode(sb.journal_inum)
         {
