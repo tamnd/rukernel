@@ -10,7 +10,9 @@
 use crate::dentry::{Location, MountNamespace, MountSource};
 use crate::device;
 use crate::file::File;
-use crate::inode::{FileType, InodeRef, Result, SetAttr, mode};
+use crate::inode::{
+    FileType, InodeRef, Result, SetAttr, check_fixed, check_immutable, iflags, mode,
+};
 use crate::path::{Parent, Walk};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -141,6 +143,7 @@ impl FsContext {
                 }
                 Ok(at) => at,
                 Err(e) if e == Errno::ENOENT && !parent.is_dot() => {
+                    check_immutable(&**parent.dir.inode())?;
                     let perm = perm & mode::PERM_MASK & !self.umask;
                     let inode =
                         parent.dir.inode().create(&parent.name, FileType::Regular, perm, 0)?;
@@ -173,6 +176,17 @@ impl FsContext {
             return Err(Errno::ENOTDIR);
         }
         let write = matches!(flags & o::O_ACCMODE, o::O_WRONLY | o::O_RDWR);
+        // The checks of the inode flags of `may_open` of Linux.
+        if matches!(kind, FileType::Regular | FileType::Directory) {
+            let iflags = at.inode().attr_flags().unwrap_or(0);
+            if write && iflags & iflags::IMMUTABLE != 0 {
+                return Err(Errno::EPERM);
+            }
+            let trunc = flags & o::O_TRUNC != 0;
+            if iflags & iflags::APPEND != 0 && ((write && flags & o::O_APPEND == 0) || trunc) {
+                return Err(Errno::EPERM);
+            }
+        }
         match kind {
             FileType::Directory if write || flags & o::O_CREAT != 0 => Err(Errno::EISDIR),
             FileType::Regular | FileType::Directory => {
@@ -224,6 +238,7 @@ impl FsContext {
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
         }
+        check_immutable(&**parent.dir.inode())?;
         let inode = f(parent.dir.inode(), &parent.name)?;
         let dentry = parent.dir.dentry.add_child(&parent.name, inode);
         Ok(Location { mount: parent.dir.mount, dentry })
@@ -269,6 +284,8 @@ impl FsContext {
         if !Arc::ptr_eq(&parent.dir.mount, &old.mount) {
             return Err(Errno::EXDEV);
         }
+        check_immutable(&**parent.dir.inode())?;
+        check_fixed(&**old.inode())?;
         parent.dir.inode().link(&parent.name, old.inode())?;
         parent.dir.dentry.add_child(&parent.name, old.inode().clone());
         Ok(())
@@ -294,6 +311,9 @@ impl FsContext {
         }
         let at = self.child(&parent)?;
         let is_dir = is_type(at.inode(), FileType::Directory);
+        // The checks of the inode flags of `may_delete` of Linux.
+        check_fixed(&**parent.dir.inode())?;
+        check_fixed(&**at.inode())?;
         if dir {
             if !is_dir {
                 return Err(Errno::ENOTDIR);
@@ -343,8 +363,8 @@ impl FsContext {
             return Err(Errno::ENOTDIR);
         }
         let to = self.child(&new);
-        if !absent(&to) {
-            let to = to?;
+        let to = if absent(&to) { None } else { Some(to?) };
+        if let Some(to) = &to {
             if flags & AT_RENAME_NOREPLACE as u32 != 0 {
                 return Err(Errno::EEXIST);
             }
@@ -358,7 +378,7 @@ impl FsContext {
             if !from_dir && to_dir {
                 return Err(Errno::EISDIR);
             }
-            if to.is_mount_root() || self.ns.mounted_on(&to).is_some() {
+            if to.is_mount_root() || self.ns.mounted_on(to).is_some() {
                 return Err(Errno::EBUSY);
             }
         }
@@ -367,6 +387,14 @@ impl FsContext {
         }
         if from_dir && new.dir.dentry.is_under(&from.dentry) {
             return Err(Errno::EINVAL);
+        }
+        // The checks of the inode flags of `may_delete` and `may_create` of Linux.
+        check_fixed(&**old.dir.inode())?;
+        check_fixed(&**from.inode())?;
+        check_immutable(&**new.dir.inode())?;
+        if let Some(to) = &to {
+            check_fixed(&**new.dir.inode())?;
+            check_fixed(&**to.inode())?;
         }
         old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);

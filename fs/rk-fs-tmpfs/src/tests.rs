@@ -404,3 +404,36 @@ fn mount_options() {
         Some(Errno::EINVAL)
     );
 }
+
+#[test]
+fn immutable_and_append_only_files() {
+    use rk_vfs::inode::iflags;
+    let (fs, root) = setup();
+    write_file(&fs, &root, b"/i", b"x");
+    write_file(&fs, &root, b"/a", b"x");
+    let i = fs.resolve(&root, b"/i", true).unwrap();
+    let a = fs.resolve(&root, b"/a", true).unwrap();
+    assert_eq!(i.inode().set_attr_flags(0x1), Err(Errno::EOPNOTSUPP));
+    i.inode().set_attr_flags(iflags::IMMUTABLE).unwrap();
+    a.inode().set_attr_flags(iflags::APPEND).unwrap();
+    assert_eq!(i.inode().attr_flags(), Ok(iflags::IMMUTABLE));
+    assert_eq!(fs.open(&root, b"/i", o::O_WRONLY, 0).err(), Some(Errno::EPERM));
+    assert_eq!(fs.remove(&root, b"/i", false), Err(Errno::EPERM));
+    assert_eq!(fs.rename(&root, b"/i", &root, b"/j", 0), Err(Errno::EPERM));
+    assert_eq!(fs.link(&i, &root, b"/j"), Err(Errno::EPERM));
+    let chmod = SetAttr { mode: Some(0o600), ..SetAttr::default() };
+    assert_eq!(rk_vfs::inode::check_set_attr(&**i.inode(), &chmod), Err(Errno::EPERM));
+    assert_eq!(read_file(&fs, &root, b"/i").as_deref(), Ok(&b"x"[..]));
+    assert_eq!(fs.open(&root, b"/a", o::O_WRONLY, 0).err(), Some(Errno::EPERM));
+    assert_eq!(
+        fs.open(&root, b"/a", o::O_WRONLY | o::O_APPEND | o::O_TRUNC, 0).err(),
+        Some(Errno::EPERM)
+    );
+    let f = fs.open(&root, b"/a", o::O_WRONLY | o::O_APPEND, 0).unwrap();
+    assert_eq!(f.write(b"y"), Ok(1));
+    assert_eq!(f.truncate(0), Err(Errno::EPERM));
+    assert_eq!(fs.remove(&root, b"/a", false), Err(Errno::EPERM));
+    a.inode().set_attr_flags(0).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/a").as_deref(), Ok(&b"xy"[..]));
+    fs.remove(&root, b"/a", false).unwrap();
+}

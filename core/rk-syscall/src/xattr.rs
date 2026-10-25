@@ -82,6 +82,7 @@ fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags:
         return Err(Errno::EOPNOTSUPP);
     };
     check_user(&inode, &name, true)?;
+    rk_vfs::inode::check_fixed(&*inode)?;
     let value = if size == 0 { Vec::new() } else { cx.read_bytes(value, size as usize)? };
     inode.set_xattr(&name, &value, flags as u32)?;
     Ok(0)
@@ -125,6 +126,7 @@ fn remove(target: Target, name: Vec<u8>) -> SysResult {
         return Err(Errno::ENODATA);
     };
     check_user(&inode, &name, true)?;
+    rk_vfs::inode::check_fixed(&*inode)?;
     inode.remove_xattr(&name)?;
     Ok(0)
 }

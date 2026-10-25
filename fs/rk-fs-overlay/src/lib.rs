@@ -460,6 +460,15 @@ impl Inode for Node {
         self.real().fiemap(start, len)
     }
 
+    fn attr_flags(&self) -> Result<u32> {
+        self.real().attr_flags()
+    }
+
+    fn set_attr_flags(&self, flags: u32) -> Result<()> {
+        self.check_writable()?;
+        self.copy_up()?.set_attr_flags(flags)
+    }
+
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
         self.check_writable()?;
         self.copy_up()?.fallocate(mode, offset, len)

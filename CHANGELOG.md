@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS` ioctls, as `lsattr` and `chattr` use them. ext4 keeps the flags in the inode, and tmpfs keeps the immutable, append-only, nodump and noatime flags. overlayfs copies the file up before it sets the flags. An immutable file refuses a write, a truncate, a change of its attributes or extended attributes, a link and an unlink, and an immutable directory refuses a new entry. An append-only file accepts only an open with `O_APPEND`, and `fcntl` cannot clear `O_APPEND` on it.
+
 ## [0.3.9] - 2026-10-25
 
 ### Added

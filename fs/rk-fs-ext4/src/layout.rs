@@ -129,6 +129,12 @@ pub mod flags {
     pub const HUGE_FILE: u32 = 0x4_0000;
     /// The data is in the inode.
     pub const INLINE_DATA: u32 = 0x1000_0000;
+    /// The names of the directory do not depend on the case of the letters.
+    pub const CASEFOLD: u32 = 0x4000_0000;
+    /// The flags that `FS_IOC_GETFLAGS` shows, as `EXT4_FL_USER_VISIBLE` of Linux.
+    pub const USER_VISIBLE: u32 = 0x705B_DFFF;
+    /// The flags that `FS_IOC_SETFLAGS` can change, as `EXT4_FL_USER_MODIFIABLE` of Linux.
+    pub const USER_MODIFIABLE: u32 = 0x604B_C0FF;
 }
 
 /// Gives the `u16` at `at`.

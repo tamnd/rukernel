@@ -489,6 +489,13 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             let file = cx.file(fd)?;
             // Only `O_APPEND` and `O_NONBLOCK` change in R1. Linux also changes `O_ASYNC`,
             // `O_DIRECT` and `O_NOATIME`.
+            // An append-only file keeps `O_APPEND`, as `setfl` of Linux.
+            if arg as u32 & O_APPEND == 0
+                && let Some(inode) = file.inode()
+                && inode.attr_flags().unwrap_or(0) & rk_vfs::inode::iflags::APPEND != 0
+            {
+                return Err(Errno::EPERM);
+            }
             let keep = file.flags().0 & !(O_APPEND | O_NONBLOCK);
             file.set_status_flags(keep | (arg as u32 & (O_APPEND | O_NONBLOCK)));
             Ok(0)
@@ -726,13 +733,17 @@ fn set_attr_at(cx: &Cx<'_>, dirfd: u64, path: u64, follow: bool, attr: &SetAttr)
     let path = cx.read_path(path)?;
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
-    fs.resolve(&start, &path, follow)?.inode().set_attr(attr)?;
+    let at = fs.resolve(&start, &path, follow)?;
+    rk_vfs::inode::check_set_attr(&**at.inode(), attr)?;
+    at.inode().set_attr(attr)?;
     Ok(0)
 }
 
 fn set_attr_fd(cx: &Cx<'_>, fd: u64, attr: &SetAttr) -> SysResult {
     let file = cx.file(fd)?;
-    file.inode().ok_or(Errno::EBADF)?.set_attr(attr)?;
+    let inode = file.inode().ok_or(Errno::EBADF)?;
+    rk_vfs::inode::check_set_attr(&**inode, attr)?;
+    inode.set_attr(attr)?;
     Ok(0)
 }
 
@@ -794,7 +805,9 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     if at.inode().metadata().is_dir() {
         return Err(Errno::EISDIR);
     }
-    at.inode().set_attr(&SetAttr { size: Some(size), ..SetAttr::default() })?;
+    let attr = SetAttr { size: Some(size), ..SetAttr::default() };
+    rk_vfs::inode::check_set_attr(&**at.inode(), &attr)?;
+    at.inode().set_attr(&attr)?;
     Ok(0)
 }
 

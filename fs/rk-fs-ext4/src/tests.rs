@@ -388,6 +388,20 @@ fn fiemap_gives_the_extents() {
 }
 
 #[test]
+fn the_inode_flags_are_kept() {
+    use rk_vfs::inode::iflags::{APPEND, IMMUTABLE, NODUMP};
+    let (fs, ram) = open_rw();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let extents = 0x8_0000;
+    assert_eq!(file.attr_flags(), Ok(extents));
+    // The extent flag does not change, and the user cannot clear it.
+    assert_eq!(file.set_attr_flags(IMMUTABLE), Err(Errno::EOPNOTSUPP));
+    file.set_attr_flags(extents | IMMUTABLE | APPEND | NODUMP).unwrap();
+    let file = again(&ram).root().unwrap().lookup(b"f").unwrap();
+    assert_eq!(file.attr_flags(), Ok(extents | IMMUTABLE | APPEND | NODUMP));
+}
+
+#[test]
 fn unlink_frees_the_blocks_and_the_inode() {
     let (fs, ram) = open_rw();
     let free = ram.free();
