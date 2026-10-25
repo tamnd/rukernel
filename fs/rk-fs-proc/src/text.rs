@@ -9,6 +9,7 @@ use rk_abi::native::mount::{
     MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_RDONLY,
     MS_RELATIME, MS_SYNCHRONOUS,
 };
+use rk_vfs::cred::Cred;
 
 /// The memory counts for `/proc/meminfo`, in KiB.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -290,21 +291,28 @@ pub struct Status {
     pub locked: u64,
     /// The bytes in pages that have a frame.
     pub rss: u64,
+    /// The credentials of the process.
+    pub cred: Cred,
+    /// The thread has no_new_privs.
+    pub no_new_privs: bool,
 }
 
-/// The text of `/proc/PID/status`. Each process runs as root with all capabilities in R1.
+/// The text of `/proc/PID/status`.
 pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
     let mut out = Vec::from(&b"Name:\t"[..]);
     out.extend_from_slice(&s.comm);
     let kb = s.vsize / 1024;
+    let c = &x.cred;
+    let groups: Vec<String> = c.groups.iter().map(|g| format!("{g}")).collect();
+    let groups = groups.join(" ");
     let text = format!(
         "\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\nNStgid:\t{}\nNSpid:\t{}\n\
+         Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nNStgid:\t{}\nNSpid:\t{}\n\
          NSpgid:\t{}\nNSsid:\t{}\nKthread:\t0\nVmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB\n\
          VmLck:\t{:>8} kB\nVmRSS:\t{:>8} kB\nThreads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
-         SigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t0000000000000000\n\
-         CapPrm:\t000001ffffffffff\nCapEff:\t000001ffffffffff\nCapBnd:\t000001ffffffffff\n\
-         CapAmb:\t0000000000000000\nNoNewPrivs:\t0\nSeccomp:\t0\nSeccomp_filters:\t0\n\
+         SigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t{:016x}\n\
+         CapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\n\
+         CapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t0\nSeccomp_filters:\t0\n\
          Cpus_allowed:\t1\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0\n\
          voluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         x.umask,
@@ -313,6 +321,15 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         x.tid,
         s.ppid,
         x.tracer,
+        c.uid,
+        c.euid,
+        c.suid,
+        c.fsuid,
+        c.gid,
+        c.egid,
+        c.sgid,
+        c.fsgid,
+        groups,
         s.pid,
         x.tid,
         s.pgid,
@@ -325,6 +342,12 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         s.blocked,
         s.ignored,
         s.caught,
+        c.cap_inheritable,
+        c.cap_permitted,
+        c.cap_effective,
+        c.cap_bset,
+        c.cap_ambient,
+        u8::from(x.no_new_privs),
     );
     out.extend_from_slice(text.as_bytes());
     out
@@ -528,6 +551,19 @@ mod tests {
         .unwrap();
         assert!(text.starts_with("Name:\tsh\nUmask:\t0022\nState:\tR (running)\nTgid:\t5\n"));
         assert!(text.contains("\nPid:\t6\nPPid:\t1\nTracerPid:\t3\n"));
+        assert!(text.contains("\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\n"));
+        assert!(text.contains("\nCapEff:\t000001ffffffffff\n"));
+        let mut cred = Cred::root().setgroups(alloc::vec![20, 10]).unwrap();
+        cred = cred.setresuid(1000, 1001, 1002).unwrap();
+        let text = String::from_utf8(status(
+            &s,
+            &Status { cred, no_new_privs: true, ..Status::default() },
+        ))
+        .unwrap();
+        assert!(text.contains("\nUid:\t1000\t1001\t1002\t1001\n"));
+        assert!(text.contains("\nGroups:\t10 20\n"));
+        assert!(text.contains("\nCapEff:\t0000000000000000\n"));
+        assert!(text.contains("\nNoNewPrivs:\t1\n"));
         assert_eq!(state_name(b'Z'), "Z (zombie)");
         assert_eq!(state_name(b't'), "t (tracing stop)");
     }

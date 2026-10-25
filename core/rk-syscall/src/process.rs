@@ -451,7 +451,8 @@ pub(crate) fn prctl(cx: &Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
             }
             Ok(0)
         }
-        _ => crate::seccomp::prctl(cx, option, args),
+        _ => crate::cred::prctl(cx, option, args)
+            .unwrap_or_else(|| crate::seccomp::prctl(cx, option, args)),
     }
 }
 

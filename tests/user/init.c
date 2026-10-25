@@ -68,6 +68,64 @@ static void test_ids(void)
 	check("getppid gives 0", getppid() == 0);
 }
 
+/* The credentials change in a child, so init stays root. */
+static void test_creds(void)
+{
+	check("getuid and getegid give 0", getuid() == 0 && getegid() == 0);
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	pid_t pid = fork();
+	if (pid == 0) {
+		failed = 0;
+		unsigned int header[2] = {0x20080522, 0};
+		unsigned int data[6];
+		gid_t groups[2] = {20, 10};
+		gid_t got[4] = {0};
+		check("setgroups as root", syscall(SYS_setgroups, 2, groups) == 0);
+		check("getgroups gives the sorted groups",
+		      syscall(SYS_getgroups, 0, NULL) == 2 && syscall(SYS_getgroups, 4, got) == 2 &&
+			      got[0] == 10 && got[1] == 20);
+		check("getgroups with a small size gives EINVAL",
+		      syscall(SYS_getgroups, 1, got) == -1 && errno == EINVAL);
+		check("PR_CAPBSET_DROP removes CAP_SYS_ADMIN",
+		      prctl(PR_CAPBSET_READ, 21) == 1 && prctl(PR_CAPBSET_DROP, 21) == 0 &&
+			      prctl(PR_CAPBSET_READ, 21) == 0);
+		check("setresgid", syscall(SYS_setresgid, 100, 100, 100) == 0 && getgid() == 100);
+		check("setresuid keeps root in the saved ID",
+		      syscall(SYS_setresuid, 1000, 1000, 0) == 0 && geteuid() == 1000);
+		check("capget gives no effective capabilities after the change",
+		      syscall(SYS_capget, header, data) == 0 && data[0] == 0 && data[1] != 0);
+		check("the saved ID gives root back",
+		      syscall(SYS_setresuid, -1, 0, -1) == 0 && geteuid() == 0 &&
+			      syscall(SYS_capget, header, data) == 0 && data[0] != 0);
+		check("setuid as root sets all the IDs", syscall(SYS_setuid, 1000) == 0);
+		uid_t r, e, sv;
+		check("getresuid gives the new IDs",
+		      syscall(SYS_getresuid, &r, &e, &sv) == 0 && r == 1000 && e == 1000 && sv == 1000);
+		check("setuid back to root gives EPERM", syscall(SYS_setuid, 0) == -1 && errno == EPERM);
+		check("setgroups as a user gives EPERM",
+		      syscall(SYS_setgroups, 0, NULL) == -1 && errno == EPERM);
+		check("capget gives no permitted capabilities",
+		      syscall(SYS_capget, header, data) == 0 && data[0] == 0 && data[1] == 0);
+		check("setfsuid to a strange ID changes nothing",
+		      syscall(SYS_setfsuid, 5) == 1000 && syscall(SYS_setfsuid, -1) == 1000);
+		char buf[2048];
+		int fd = open("/proc/self/status", O_RDONLY);
+		ssize_t n = fd < 0 ? -1 : read(fd, buf, sizeof(buf) - 1);
+		buf[n < 0 ? 0 : n] = 0;
+		check("/proc/self/status shows the IDs",
+		      strstr(buf, "\nUid:\t1000\t1000\t1000\t1000\n") &&
+			      strstr(buf, "\nGid:\t100\t100\t100\t100\n") && strstr(buf, "\nGroups:\t10 20\n"));
+		close(fd);
+		_exit(failed);
+	}
+	int status;
+	check("the credentials child passes",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	umount("/proc");
+	check("init is root after the child", getuid() == 0 && geteuid() == 0);
+}
+
 static void test_uname(void)
 {
 	struct utsname u;
@@ -2551,6 +2609,7 @@ int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	test_ids();
+	test_creds();
 	test_uname();
 	test_memory();
 	test_files();

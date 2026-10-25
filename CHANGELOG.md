@@ -11,6 +11,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `chattr +e` and `chattr -e` on ext4. `+e` moves a file or a directory from a block map to an extent tree, and the tree uses the indirect blocks of the map first. `-e` moves a file to a block map, as Linux, only if the tree has at most one extent that has data and fits in the 12 direct blocks. ext4/005 needs it.
 - The ext4 mount options `minixdf` and `bsddf`. With `minixdf`, `statfs` counts the blocks of the metadata and of the journal in the count of blocks, as Linux. ext4/042 checks it.
 - The `EXT4_IOC_CHECKPOINT` ioctl. It writes the transactions of the journal to their places and empties the journal. With `EXT4_IOC_CHECKPOINT_FLAG_ZEROOUT` it then writes zeros to the blocks of the log. `EXT4_IOC_CHECKPOINT_FLAG_DISCARD` gives `EOPNOTSUPP`, as the disk does not discard. ext4/050 checks it.
+- Each process has credentials: the real, effective, saved and file system user and group IDs, the supplementary groups, and the five capability sets with the securebits. A fork copies them. init is root with all the capabilities.
+- `setuid`, `setgid`, `setreuid`, `setregid`, `setresuid`, `setresgid`, `setfsuid`, `setfsgid` and `setgroups` change the credentials with the rules of Linux. A process that leaves root loses its capabilities, unless it set `PR_SET_KEEPCAPS`. `getgroups` gives the groups.
+- `capset` changes the capability sets. The `prctl` options `PR_CAPBSET_READ`, `PR_CAPBSET_DROP`, `PR_GET_KEEPCAPS`, `PR_SET_KEEPCAPS`, `PR_GET_SECUREBITS`, `PR_SET_SECUREBITS` and `PR_CAP_AMBIENT` work.
+- An `execve` of a set-user-ID or set-group-ID file changes the effective ID, and an `execve` computes the new capability sets as Linux does for a file without file capabilities. The bits have no effect on a `nosuid` mount, with no_new_privs, or under a tracer. The auxiliary vector gives the IDs and `AT_SECURE`.
+- `/proc/PID/status` shows the IDs, the groups, the capability sets and the no_new_privs bit.
 
 ### Fixed
 
