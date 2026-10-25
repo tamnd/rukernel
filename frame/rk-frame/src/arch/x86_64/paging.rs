@@ -73,6 +73,11 @@ pub(crate) fn kernel_image() -> (usize, usize) {
     (sym(&raw const __text_start), sym(&raw const __kernel_end))
 }
 
+/// The virtual address range of the code of the kernel.
+pub(crate) fn kernel_text() -> core::ops::Range<usize> {
+    sym(&raw const __text_start)..sym(&raw const __text_end)
+}
+
 /// The direct map is in use. Before that, the boot identity map is in use.
 static DIRECT_MAP: AtomicBool = AtomicBool::new(false);
 /// The physical address of the top level table of the kernel.

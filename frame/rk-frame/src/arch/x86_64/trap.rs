@@ -173,7 +173,41 @@ extern "C" fn rk_frame_x86_64_trap(frame: *mut TrapFrame) {
         vector,
         frame.error
     ));
+    if from_kernel {
+        print_stack(frame.rsp as usize);
+    }
     panic!("{} in {} mode", name(vector), if from_kernel { "kernel" } else { "user" });
+}
+
+/// Prints the words on the stack at `rsp` that are addresses in the code of the kernel, as the
+/// call trace of Linux with `?` entries. Some of them are old values and not return addresses.
+/// An overflow leaves `rsp` in the unmapped page below the stack, so the scan starts at the next
+/// page if the first read fails.
+fn print_stack(rsp: usize) {
+    const WORDS: usize = crate::task::KERNEL_STACK_SIZE / 8;
+    const MAX: usize = 64;
+    let text = super::paging::kernel_text();
+    let mut addr = rsp & !7;
+    let mut found = 0;
+    crate::console::_print_panic(format_args!("Call trace:\n"));
+    for _ in 0..WORDS {
+        let Some(word) = probe_read_u64(addr) else {
+            let next = (rsp | 0xfff) + 1;
+            if addr >= next {
+                break;
+            }
+            addr = next;
+            continue;
+        };
+        if text.contains(&(word as usize)) {
+            crate::console::_print_panic(format_args!(" ? {word:#018x}\n"));
+            found += 1;
+            if found == MAX {
+                break;
+            }
+        }
+        addr += 8;
+    }
 }
 
 /// Stops at a breakpoint. The trap handler counts it and returns.
