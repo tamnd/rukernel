@@ -254,23 +254,24 @@ impl Fs {
 }
 
 impl Tx<'_> {
-    /// Writes the inode of `node` and keeps `raw` as its inode in memory. An inode that loses
+    /// Writes the inode of `node` and keeps `raw` as its inode in memory. The changes of the save
+    /// also go to `raw`, so a second save of the same copy does not do them again. An inode that loses
     /// its last link goes on the list of orphans. The extra fields of an inode with less than
     /// the file system wants grow first, as `ext4_try_to_expand_extra_isize`.
-    pub(crate) fn save(&mut self, node: &Node, mut raw: RawInode) -> Result<()> {
+    pub(crate) fn save(&mut self, node: &Node, raw: &mut RawInode) -> Result<()> {
         if raw.0.len() > 128
             && raw.extra_size() < self.fs.want_extra_isize()
             && raw.flags() & flags::INLINE_DATA == 0
             && !node.no_expand.load(Ordering::Relaxed)
-            && self.expand_extra_isize(node.ino, &mut raw).is_err()
+            && self.expand_extra_isize(node.ino, raw).is_err()
         {
             node.no_expand.store(true, Ordering::Relaxed);
         }
         if raw.links() == 0 && node.raw.lock().links() != 0 {
-            self.add_orphan(node.ino, &mut raw)?;
+            self.add_orphan(node.ino, raw)?;
         }
-        self.fs.write_inode(node.ino, &mut raw)?;
-        *node.raw.lock() = raw;
+        self.fs.write_inode(node.ino, raw)?;
+        *node.raw.lock() = raw.clone();
         Ok(())
     }
 
@@ -873,14 +874,14 @@ impl Node {
         let mut raw = self.raw();
         raw.set_links(raw.links().saturating_add_signed(delta as i16));
         touch(&mut raw, false);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     /// Sets the times of a directory after a change of its entries.
     fn touch_dir(&self, tx: &mut Tx<'_>) -> Result<()> {
         let mut raw = self.raw();
         touch(&mut raw, true);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     /// Adds the new inode `ino` with `raw` as `name`. If the entry cannot be added, the inode
@@ -891,7 +892,7 @@ impl Node {
         if let Err(e) = tx.add_entry(self, name, ino, kind) {
             let mut raw = node.raw();
             raw.set_links(0);
-            tx.save(&node, raw)?;
+            tx.save(&node, &mut raw)?;
             return Err(e);
         }
         if kind == FileType::Directory {
@@ -971,7 +972,7 @@ impl Inode for Node {
             }
             let result = tx.truncate(self.ino, &mut raw, size);
             touch(&mut raw, true);
-            tx.save(self, raw.clone())?;
+            tx.save(self, &mut raw)?;
             result?;
         }
         if let Some(m) = attr.mode {
@@ -992,14 +993,14 @@ impl Inode for Node {
             raw.set_time(0x10, 0x88, t.sec, t.nsec);
         }
         touch(&mut raw, false);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     fn set_atime(&self, time: Timespec) -> Result<()> {
         let mut tx = self.fs.tx()?;
         let mut raw = self.raw();
         raw.set_time(0x8, 0x8c, time.sec, time.nsec);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -1022,7 +1023,7 @@ impl Inode for Node {
         let mut tx = self.fs.tx()?;
         let mut raw = self.raw();
         let result = tx.write_data(self.ino, &mut raw, offset, buf);
-        tx.save(self, raw)?;
+        tx.save(self, &mut raw)?;
         result
     }
 
@@ -1055,7 +1056,7 @@ impl Inode for Node {
         }
         raw.set_flags((old & !flags::USER_MODIFIABLE) | (new & flags::USER_MODIFIABLE));
         touch(&mut raw, false);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     fn fiemap(&self, start: u64, len: u64) -> Result<Vec<FiemapExtent>> {
@@ -1090,7 +1091,7 @@ impl Inode for Node {
         let mut tx = self.fs.tx()?;
         let mut raw = self.raw();
         let result = tx.fallocate(self.ino, &mut raw, mode, offset, len);
-        tx.save(self, raw)?;
+        tx.save(self, &mut raw)?;
         result
     }
 
@@ -1226,7 +1227,7 @@ impl Inode for Node {
         let mut raw = node.raw();
         raw.set_links(0);
         touch(&mut raw, false);
-        tx.save(&node, raw)?;
+        tx.save(&node, &mut raw)?;
         self.add_links(&mut tx, -1)?;
         self.touch_dir(&mut tx)
     }
@@ -1264,7 +1265,7 @@ impl Inode for Node {
                 let mut raw = victim.raw();
                 raw.set_links(0);
                 touch(&mut raw, false);
-                tx.save(&victim, raw)?;
+                tx.save(&victim, &mut raw)?;
                 to.add_links(&mut tx, -1)?;
             } else {
                 victim.add_links(&mut tx, -1)?;
@@ -1281,7 +1282,7 @@ impl Inode for Node {
         }
         let mut raw = node.raw();
         touch(&mut raw, false);
-        tx.save(&node, raw)?;
+        tx.save(&node, &mut raw)?;
         self.touch_dir(&mut tx)?;
         if moves {
             to.touch_dir(&mut tx)?;
@@ -1337,7 +1338,7 @@ impl Inode for Node {
         attrs.insert(key, value);
         tx.write_xattrs(self.ino, &mut raw, &attrs)?;
         touch(&mut raw, false);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     fn list_xattr(&self) -> Result<Vec<Vec<u8>>> {
@@ -1352,7 +1353,7 @@ impl Inode for Node {
         attrs.remove(&key).ok_or(Errno::ENODATA)?;
         tx.write_xattrs(self.ino, &mut raw, &attrs)?;
         touch(&mut raw, false);
-        tx.save(self, raw)
+        tx.save(self, &mut raw)
     }
 
     fn fs_id(&self) -> u64 {

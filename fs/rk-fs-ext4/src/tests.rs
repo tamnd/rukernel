@@ -1123,9 +1123,12 @@ fn a_change_makes_the_extra_fields_of_an_inode_larger() {
     ram.0.lock()[1024 + 0x15e..1024 + 0x160].copy_from_slice(&64u16.to_le_bytes());
     let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
     let file = fs.root().unwrap().lookup(b"x").unwrap();
-    file.write_at(0, b"aaaa").unwrap();
+    let free = ram.free().0;
+    // A truncate saves the inode two times. The second save does not grow the fields again.
+    file.set_attr(&SetAttr { size: Some(0), ..SetAttr::default() }).unwrap();
     drop((file, fs));
     // The extra fields have 64 bytes, and one attribute moved to a block.
+    assert_eq!(ram.free().0, free - 1);
     let fs = again(&ram);
     let raw = fs.inode(ino).unwrap().raw();
     assert_eq!(raw.extra_size(), 64);

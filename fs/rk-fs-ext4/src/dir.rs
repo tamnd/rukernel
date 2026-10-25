@@ -228,7 +228,7 @@ impl Tx<'_> {
                     }
                     fs.seal(dir.ino, &raw, &mut data);
                     fs.write(block * bs as u64, &data)?;
-                    return self.save(dir, raw);
+                    return self.save(dir, &mut raw);
                 }
                 at += rec;
             }
@@ -238,7 +238,7 @@ impl Tx<'_> {
         fs.seal(dir.ino, &raw, &mut data);
         let size = raw.size();
         let result = self.write_data(dir.ino, &mut raw, size, &data);
-        self.save(dir, raw)?;
+        self.save(dir, &mut raw)?;
         result.map(drop)
     }
 
