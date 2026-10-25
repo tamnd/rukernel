@@ -333,6 +333,58 @@ fn descriptor_table() {
     assert_eq!(t.iter().map(|(fd, _)| fd).collect::<Vec<_>>(), [0, 5]);
 }
 
+/// One test, because the locks of all the tests share one table.
+#[test]
+fn file_locks() {
+    use rk_vfs::lock::{self, LockKind, Owner, RecordLock};
+    let (fs, root) = setup();
+    write_file(&fs, &root, b"/l", b"data");
+    let a = fs.open(&root, b"/l", o::O_RDWR, 0).unwrap();
+    let b = fs.open(&root, b"/l", o::O_RDWR, 0).unwrap();
+    let mut ta = FdTable::new();
+    let tb = FdTable::new();
+    let rec = |owner: usize, kind, start, end| RecordLock {
+        owner: Owner::Posix(owner),
+        kind,
+        start,
+        end,
+        pid: 1,
+    };
+    let w = LockKind::Write;
+    let r = LockKind::Read;
+    assert_eq!(lock::set(&a, rec(ta.owner(), w, 0, 9), Some(w), false), Ok(()));
+    // Another owner conflicts in the range, and not after it.
+    assert_eq!(lock::set(&b, rec(tb.owner(), r, 5, 5), Some(r), false), Err(Errno::EAGAIN));
+    assert_eq!(lock::set(&b, rec(tb.owner(), w, 10, u64::MAX), Some(w), false), Ok(()));
+    let held = lock::test(&b, &rec(tb.owner(), r, 0, 0)).unwrap();
+    assert_eq!(held.map(|h| (h.start, h.end)), Some((0, 9)));
+    // An unlock in the middle splits the lock.
+    assert_eq!(lock::set(&a, rec(ta.owner(), w, 3, 4), None, false), Ok(()));
+    assert_eq!(lock::test(&b, &rec(tb.owner(), w, 3, 4)).unwrap(), None);
+    assert!(lock::test(&b, &rec(tb.owner(), w, 2, 2)).unwrap().is_some());
+    // A close of any descriptor of the file releases the POSIX locks of the table.
+    let fd = ta.insert(a.clone(), false).unwrap();
+    drop(ta.remove(fd));
+    assert_eq!(lock::test(&b, &rec(tb.owner(), w, 0, 9)).unwrap(), None);
+    // An OFD lock conflicts with a POSIX lock and goes away with its file.
+    let c = fs.open(&root, b"/l", o::O_RDWR, 0).unwrap();
+    let ofd = RecordLock { owner: Owner::File(lock::file_id(&c)), ..rec(0, r, 0, 0) };
+    assert_eq!(lock::set(&c, ofd, Some(r), false), Ok(()));
+    assert_eq!(lock::set(&a, rec(ta.owner(), w, 0, 0), Some(w), false), Err(Errno::EAGAIN));
+    drop(c);
+    assert_eq!(lock::set(&a, rec(ta.owner(), w, 0, 0), Some(w), false), Ok(()));
+    drop(ta);
+    drop(tb);
+    // `flock` locks do not conflict with record locks, and a shared lock lets other shared locks.
+    assert_eq!(lock::flock(&a, Some(r), false), Ok(()));
+    assert_eq!(lock::flock(&b, Some(r), false), Ok(()));
+    assert_eq!(lock::flock(&b, Some(w), false), Err(Errno::EWOULDBLOCK));
+    assert_eq!(lock::flock(&a, None, false), Ok(()));
+    assert_eq!(lock::flock(&b, Some(w), false), Ok(()));
+    drop(b);
+    assert_eq!(lock::flock(&a, Some(w), false), Ok(()));
+}
+
 #[test]
 fn mount_options() {
     let root =

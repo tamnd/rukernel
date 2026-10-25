@@ -4,6 +4,7 @@ use crate::file::File;
 use crate::inode::Result;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use rk_abi::Errno;
 
 /// The default of `RLIMIT_NOFILE`, as Linux.
@@ -18,11 +19,35 @@ pub struct FdEntry {
     pub cloexec: bool,
 }
 
+/// The next owner number of a table. The owner of the POSIX record locks is the table, as Linux.
+static NEXT_OWNER: AtomicUsize = AtomicUsize::new(1);
+
 /// The descriptors of a process. `fork` copies the table, and `clone` with `CLONE_FILES` shares it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct FdTable {
     entries: Vec<Option<FdEntry>>,
     limit: usize,
+    owner: usize,
+}
+
+impl Clone for FdTable {
+    /// Copies the descriptors. The copy is a new owner, so it does not get the POSIX locks of
+    /// the table, as `fork` on Linux.
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            limit: self.limit,
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for FdTable {
+    fn drop(&mut self) {
+        for entry in self.entries.iter().flatten() {
+            crate::lock::close_posix(&entry.file, self.owner);
+        }
+    }
 }
 
 impl Default for FdTable {
@@ -33,8 +58,17 @@ impl Default for FdTable {
 
 impl FdTable {
     /// Makes an empty table.
-    pub const fn new() -> Self {
-        Self { entries: Vec::new(), limit: NR_OPEN_DEFAULT }
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            limit: NR_OPEN_DEFAULT,
+            owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// The owner of the POSIX record locks that the process takes through this table.
+    pub fn owner(&self) -> usize {
+        self.owner
     }
 
     /// Gives the entry of `fd`.
@@ -84,7 +118,11 @@ impl FdTable {
         if i >= self.entries.len() {
             self.entries.resize(i + 1, None);
         }
-        Ok(self.entries[i].replace(FdEntry { file, cloexec }))
+        let old = self.entries[i].replace(FdEntry { file, cloexec });
+        if let Some(e) = &old {
+            crate::lock::close_posix(&e.file, self.owner);
+        }
+        Ok(old)
     }
 
     /// Adds `file` at the lowest free descriptor below `limit`, the `RLIMIT_NOFILE` of the
@@ -122,6 +160,7 @@ impl FdTable {
         while self.entries.last().is_some_and(Option::is_none) {
             self.entries.pop();
         }
+        crate::lock::close_posix(&entry.file, self.owner);
         Ok(entry)
     }
 
@@ -143,16 +182,28 @@ impl FdTable {
             if slot.as_ref().is_some_and(|e| e.cloexec)
                 && let Some(entry) = slot.take()
             {
+                crate::lock::close_posix(&entry.file, self.owner);
                 closed.push(entry);
             }
         }
         closed
     }
 
+    /// Copies the table for `execve`. The copy keeps the POSIX locks, as Linux keeps them over
+    /// `execve`, and this table becomes a new owner without locks.
+    pub fn clone_for_exec(&mut self) -> Self {
+        let mut copy = self.clone();
+        core::mem::swap(&mut copy.owner, &mut self.owner);
+        copy
+    }
+
     /// Removes each descriptor in `first..=last`, for `close_range`.
     pub fn remove_range(&mut self, first: usize, last: usize) -> Vec<FdEntry> {
         let end = self.entries.len().min(last.saturating_add(1));
-        let closed = (first..end).filter_map(|i| self.entries[i].take()).collect();
+        let closed: Vec<FdEntry> = (first..end).filter_map(|i| self.entries[i].take()).collect();
+        for e in &closed {
+            crate::lock::close_posix(&e.file, self.owner);
+        }
         while self.entries.last().is_some_and(Option::is_none) {
             self.entries.pop();
         }

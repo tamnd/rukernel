@@ -9,7 +9,7 @@ use crate::dentry::Location;
 use crate::inode::{FileType, InodeRef, Metadata, Result, SetAttr};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::mount;
 use rk_abi::native::open as o;
@@ -171,6 +171,16 @@ pub struct File {
     inode: Option<InodeRef>,
     flags: AtomicU32,
     pos: SpinLock<u64>,
+    /// The file took an OFD lock or a `flock` lock, so its drop must release them.
+    locked: AtomicBool,
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        if self.locked.load(Ordering::Relaxed) {
+            crate::lock::close_file(self);
+        }
+    }
 }
 
 impl core::fmt::Debug for File {
@@ -286,6 +296,7 @@ impl File {
             inode,
             flags: AtomicU32::new(flags & keep),
             pos: SpinLock::new(0),
+            locked: AtomicBool::new(false),
         })
     }
 
@@ -300,6 +311,11 @@ impl File {
         let _ = self.flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
             Some((old & !mask) | (flags & mask))
         });
+    }
+
+    /// Records that the file took a lock, so its drop releases the lock.
+    pub(crate) fn mark_locked(&self) {
+        self.locked.store(true, Ordering::Relaxed);
     }
 
     /// The place of the file in the tree.

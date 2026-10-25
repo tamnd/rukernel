@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/klog.h>
+#include <sys/file.h>
 #include <linux/fs.h>
 #include <linux/aio_abi.h>
 #include <sys/ioctl.h>
@@ -1663,6 +1664,73 @@ static void test_membarrier(void)
 	check("membarrier with a bad command gives EINVAL", syscall(SYS_membarrier, 3, 0, 0) < 0 && errno == EINVAL);
 }
 
+/* Sets a lock of type on the bytes start..start+len-1 of fd with cmd. */
+static int set_lock(int fd, int cmd, short type, off_t start, off_t len)
+{
+	struct flock fl = { .l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = len };
+
+	return fcntl(fd, cmd, &fl);
+}
+
+static void test_file_locks(void)
+{
+	struct flock fl;
+	pid_t pid;
+	int fd, fd2, status;
+
+	mkdir("/tmp", 0755);
+	fd = open("/tmp/lk", O_RDWR | O_CREAT | O_TRUNC, 0644);
+	check("a write lock", set_lock(fd, F_SETLK, F_WRLCK, 0, 10) == 0);
+	pid = fork();
+	if (pid == 0) {
+		int c = open("/tmp/lk", O_RDWR);
+		struct flock g = { .l_type = F_RDLCK, .l_whence = SEEK_SET, .l_start = 5, .l_len = 1 };
+
+		if (set_lock(c, F_SETLK, F_RDLCK, 5, 1) == 0 || errno != EAGAIN)
+			_exit(1);
+		if (fcntl(c, F_GETLK, &g) != 0 || g.l_type != F_WRLCK || g.l_pid != getppid() ||
+		    g.l_start != 0 || g.l_len != 10)
+			_exit(2);
+		if (set_lock(c, F_SETLK, F_WRLCK, 10, 0) != 0)
+			_exit(3);
+		/* The parent closes another descriptor of the file, and that releases its lock. */
+		if (set_lock(c, F_SETLKW, F_WRLCK, 0, 10) != 0)
+			_exit(4);
+		_exit(0);
+	}
+	fd2 = open("/tmp/lk", O_RDONLY);
+	usleep(100000);
+	close(fd2);
+	waitpid(pid, &status, 0);
+	check("a lock of another process conflicts, F_GETLK finds it, and a close releases it",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	memset(&fl, 0, sizeof(fl));
+	fl.l_type = F_WRLCK;
+	check("F_GETLK gives F_UNLCK when the locks of the child went with it",
+	      fcntl(fd, F_GETLK, &fl) == 0 && fl.l_type == F_UNLCK);
+	check("a write lock on a file open only for reading gives EBADF",
+	      (fd2 = open("/tmp/lk", O_RDONLY)) >= 0 && set_lock(fd2, F_SETLK, F_WRLCK, 0, 1) < 0 &&
+		      errno == EBADF);
+	close(fd2);
+
+	fd2 = open("/tmp/lk", O_RDWR);
+	check("an OFD lock", set_lock(fd2, F_OFD_SETLK, F_WRLCK, 100, 1) == 0);
+	check("an OFD lock conflicts with a POSIX lock of the same process",
+	      set_lock(fd, F_SETLK, F_WRLCK, 100, 1) < 0 && errno == EAGAIN);
+	close(fd2);
+	check("the OFD lock goes with its file", set_lock(fd, F_SETLK, F_WRLCK, 100, 1) == 0);
+
+	fd2 = open("/tmp/lk", O_RDWR);
+	check("flock LOCK_EX", flock(fd, LOCK_EX) == 0);
+	check("flock of another open file gives EWOULDBLOCK",
+	      flock(fd2, LOCK_SH | LOCK_NB) < 0 && errno == EWOULDBLOCK);
+	check("flock LOCK_UN", flock(fd, LOCK_UN) == 0 && flock(fd2, LOCK_SH | LOCK_NB) == 0);
+	check("flock with a bad operation gives EINVAL", flock(fd, 0) < 0 && errno == EINVAL);
+	close(fd2);
+	close(fd);
+	unlink("/tmp/lk");
+}
+
 static void test_fifo(void)
 {
 	struct stat st1, st2;
@@ -2422,6 +2490,7 @@ int main(int argc, char **argv)
 	test_sysfs();
 	test_xattr();
 	test_fifo();
+	test_file_locks();
 	test_syslog();
 	test_membarrier();
 	test_overlay();

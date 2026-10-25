@@ -314,7 +314,7 @@ pub fn exec(
     thread.release_vfork();
     if let Some(files) = process.files() {
         // A table that another process shares stays with it, and this process takes a copy.
-        let mut table = files.lock().clone();
+        let mut table = files.lock().clone_for_exec();
         table.close_on_exec();
         process.set_files(Arc::new(rk_frame::sync::SpinLock::new(table)));
     }

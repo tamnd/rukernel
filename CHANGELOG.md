@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Advisory file locks. `fcntl` takes POSIX record locks (`F_GETLK`, `F_SETLK`, `F_SETLKW`) and open file description locks (`F_OFD_GETLK`, `F_OFD_SETLK`, `F_OFD_SETLKW`), and the new `flock(2)` call locks a full file. A POSIX lock belongs to the descriptor table, and a close of any descriptor of the file releases it. An OFD lock and a `flock` lock belong to the open file, and go away when its last descriptor closes. `F_SETLKW` finds a wait that never ends and gives `EDEADLK`. Before, each lock command gave 0 and did nothing.
+
 ## [0.3.8] - 2026-10-25
 
 ### Added
