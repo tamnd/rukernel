@@ -50,15 +50,10 @@ fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     Ok(name)
 }
 
-/// Linux keeps a `user.` attribute only on a regular file, a directory and a socket. A change of
-/// one on another file gives `EPERM`, and a read gives `ENODATA`. Linux 6.17 added the socket.
-fn check_user(inode: &InodeRef, name: &[u8], change: bool) -> Result<(), Errno> {
-    use rk_vfs::FileType::{Directory, Regular, Socket};
-    let kind = inode.metadata().file_type();
-    if name.starts_with(b"user.") && !matches!(kind, Some(Regular | Directory | Socket)) {
-        return Err(if change { Errno::EPERM } else { Errno::ENODATA });
-    }
-    Ok(())
+/// Checks the access of the caller to the attribute `name` of `inode`, with the rules of
+/// `xattr_permission` of Linux. Linux 6.17 added `user.` attributes on a socket.
+fn check(cx: &Cx<'_>, inode: &InodeRef, name: &[u8], change: bool) -> Result<(), Errno> {
+    cx.process().cred().xattr_permission(&inode.metadata(), name, change)
 }
 
 /// Copies `data` to the user buffer at `addr` of `size` bytes. A size of 0 asks for the length.
@@ -81,8 +76,8 @@ fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags:
     let Some(inode) = target else {
         return Err(Errno::EOPNOTSUPP);
     };
-    check_user(&inode, &name, true)?;
     rk_vfs::inode::check_fixed(&*inode)?;
+    check(cx, &inode, &name, true)?;
     let value = if size == 0 { Vec::new() } else { cx.read_bytes(value, size as usize)? };
     inode.set_xattr(&name, &value, flags as u32)?;
     Ok(0)
@@ -104,7 +99,7 @@ fn get(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64) -> Sys
     let Some(inode) = target else {
         return Err(Errno::ENODATA);
     };
-    check_user(&inode, &name, false)?;
+    check(cx, &inode, &name, false)?;
     let data = inode.get_xattr(&name)?;
     give(cx, value, size, &data, XATTR_SIZE_MAX)
 }
@@ -113,20 +108,25 @@ fn list(cx: &Cx<'_>, target: Target, addr: u64, size: u64) -> SysResult {
     let Some(inode) = target else {
         return Ok(0);
     };
+    // Only a process with `CAP_SYS_ADMIN` sees the `trusted.` attributes.
+    let admin = cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN);
     let mut out = Vec::new();
     for name in inode.list_xattr()? {
+        if name.starts_with(b"trusted.") && !admin {
+            continue;
+        }
         out.extend_from_slice(&name);
         out.push(0);
     }
     give(cx, addr, size, &out, XATTR_LIST_MAX)
 }
 
-fn remove(target: Target, name: Vec<u8>) -> SysResult {
+fn remove(cx: &Cx<'_>, target: Target, name: Vec<u8>) -> SysResult {
     let Some(inode) = target else {
         return Err(Errno::ENODATA);
     };
-    check_user(&inode, &name, true)?;
     rk_vfs::inode::check_fixed(&*inode)?;
+    check(cx, &inode, &name, true)?;
     inode.remove_xattr(&name)?;
     Ok(0)
 }
@@ -189,10 +189,10 @@ pub(crate) fn flistxattr(cx: &Cx<'_>, fd: u64, list_addr: u64, size: u64) -> Sys
 
 pub(crate) fn path_removexattr(cx: &Cx<'_>, path: u64, name: u64, follow: bool) -> SysResult {
     let target = path_target(cx, path, follow)?;
-    remove(target, read_name(cx, name)?)
+    remove(cx, target, read_name(cx, name)?)
 }
 
 pub(crate) fn fremovexattr(cx: &Cx<'_>, fd: u64, name: u64) -> SysResult {
     let target = fd_target(cx, fd)?;
-    remove(target, read_name(cx, name)?)
+    remove(cx, target, read_name(cx, name)?)
 }

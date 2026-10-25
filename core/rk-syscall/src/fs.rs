@@ -758,31 +758,65 @@ pub(crate) fn readlinkat(cx: &Cx<'_>, dirfd: u64, path: u64, buf: u64, size: u64
     Ok(n as u64)
 }
 
-fn set_attr_at(cx: &Cx<'_>, dirfd: u64, path: u64, follow: bool, attr: &SetAttr) -> SysResult {
+/// The kind of a change of attributes, for the checks that depend on the call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Change {
+    /// `chmod` and `utimensat` with a time that is not now.
+    Plain,
+    /// `chown`, which clears the set-user-ID bit.
+    Owner,
+    /// `utimensat` that sets both times to now. The owner or a process that can write the file
+    /// can do it.
+    Touch,
+}
+
+/// Checks and makes the change `attr` of the attributes of `inode`, as `notify_change` of
+/// Linux.
+fn change_attr(cx: &Cx<'_>, inode: &rk_vfs::InodeRef, attr: &SetAttr, change: Change) -> SysResult {
+    rk_vfs::inode::check_set_attr(&**inode, attr)?;
+    let cred = cx.process().cred();
+    let meta = inode.metadata();
+    if change == Change::Touch && !cred.owns(&meta) {
+        cred.permission(&meta, rk_vfs::cred::may::WRITE)?;
+    }
+    let mut attr = attr.clone();
+    cred.setattr_prepare(&meta, &mut attr)?;
+    if change == Change::Owner {
+        cred.chown_kill(&meta, &mut attr);
+    }
+    inode.set_attr(&attr)?;
+    Ok(0)
+}
+
+fn set_attr_at(
+    cx: &Cx<'_>,
+    dirfd: u64,
+    path: u64,
+    follow: bool,
+    attr: &SetAttr,
+    change: Change,
+) -> SysResult {
     let path = cx.read_path(path)?;
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let at = fs.resolve(&start, &path, follow)?;
-    rk_vfs::inode::check_set_attr(&**at.inode(), attr)?;
-    at.inode().set_attr(attr)?;
-    Ok(0)
+    change_attr(cx, at.inode(), attr, change)
 }
 
-fn set_attr_fd(cx: &Cx<'_>, fd: u64, attr: &SetAttr) -> SysResult {
+fn set_attr_fd(cx: &Cx<'_>, fd: u64, attr: &SetAttr, change: Change) -> SysResult {
     let file = cx.file(fd)?;
     let inode = file.inode().ok_or(Errno::EBADF)?;
-    rk_vfs::inode::check_set_attr(&**inode, attr)?;
-    inode.set_attr(attr)?;
-    Ok(0)
+    change_attr(cx, inode, attr, change)
 }
 
 pub(crate) fn fchmodat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64) -> SysResult {
     let attr = SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() };
-    set_attr_at(cx, dirfd, path, true, &attr)
+    set_attr_at(cx, dirfd, path, true, &attr, Change::Plain)
 }
 
 pub(crate) fn fchmod(cx: &Cx<'_>, fd: u64, mode: u64) -> SysResult {
-    set_attr_fd(cx, fd, &SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() })
+    let attr = SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() };
+    set_attr_fd(cx, fd, &attr, Change::Plain)
 }
 
 /// The owner of `chown`: -1 keeps the value.
@@ -800,11 +834,12 @@ pub(crate) fn fchownat(
 ) -> SysResult {
     let attr = SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() };
     let follow = flags as u32 & AT_SYMLINK_NOFOLLOW as u32 == 0;
-    set_attr_at(cx, dirfd, path, follow, &attr)
+    set_attr_at(cx, dirfd, path, follow, &attr, Change::Owner)
 }
 
 pub(crate) fn fchown(cx: &Cx<'_>, fd: u64, uid: u64, gid: u64) -> SysResult {
-    set_attr_fd(cx, fd, &SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() })
+    let attr = SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() };
+    set_attr_fd(cx, fd, &attr, Change::Owner)
 }
 
 pub(crate) fn umask(cx: &Cx<'_>, mask: u64) -> SysResult {
@@ -841,7 +876,8 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
         return Err(Errno::EISDIR);
     }
     fs.permission(&at, rk_vfs::cred::may::WRITE)?;
-    let attr = SetAttr { size: Some(size), ..SetAttr::default() };
+    let mode = fs.cred().write_kill(&at.inode().metadata());
+    let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
     rk_vfs::inode::check_set_attr(&**at.inode(), &attr)?;
     at.inode().set_attr(&attr)?;
     Ok(0)
@@ -927,14 +963,20 @@ pub(crate) fn utimensat(cx: &Cx<'_>, dirfd: u64, path: u64, times: u64, flags: u
         };
         (conv(t[0])?, conv(t[1])?)
     };
+    // Both times now is a touch, which the owner or a process that can write the file can do.
+    let change = if atime == Some(now) && mtime == Some(now) && !explicit_times {
+        Change::Touch
+    } else {
+        Change::Plain
+    };
     let attr = SetAttr { atime, mtime, explicit_times, ..SetAttr::default() };
     if path == 0 {
-        return set_attr_fd(cx, dirfd, &attr);
+        return set_attr_fd(cx, dirfd, &attr, change);
     }
     let follow = flags as u32 & AT_SYMLINK_NOFOLLOW as u32 == 0;
     let path_bytes = cx.read_path_opt(path, flags as u32 & AT_EMPTY_PATH as u32 != 0)?;
     if path_bytes.is_empty() {
-        return set_attr_fd(cx, dirfd, &attr);
+        return set_attr_fd(cx, dirfd, &attr, change);
     }
-    set_attr_at(cx, dirfd, path, follow, &attr)
+    set_attr_at(cx, dirfd, path, follow, &attr, change)
 }

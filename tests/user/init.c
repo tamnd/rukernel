@@ -136,6 +136,16 @@ static void test_perms(void)
 		      chmod("/tmp/perm.sg", 02777) == 0 && chown("/tmp/perm.sg", 0, 50) == 0);
 	fd = open("/tmp/perm.sticky/root", O_WRONLY | O_CREAT, 0666);
 	close(fd);
+	chmod("/tmp/perm.sticky/root", 0666);
+	fd = open("/tmp/perm.suid", O_WRONLY | O_CREAT, 0755);
+	close(fd);
+	struct stat sst;
+	check("chown by root clears the set-user-ID bit",
+	      chmod("/tmp/perm.suid", 04755) == 0 && chown("/tmp/perm.suid", 1000, 100) == 0 &&
+		      stat("/tmp/perm.suid", &sst) == 0 && (sst.st_mode & 07777) == 0755);
+	check("chmod by root keeps the set-user-ID bit",
+	      chmod("/tmp/perm.suid", 06755) == 0 && stat("/tmp/perm.suid", &sst) == 0 &&
+		      (sst.st_mode & 07777) == 06755);
 	pid_t pid = fork();
 	if (pid == 0) {
 		gid_t groups[1] = {50};
@@ -170,6 +180,29 @@ static void test_perms(void)
 		check("a directory in a set-group-ID directory gets its group and the bit",
 		      mkdir("/tmp/perm.sg/d", 0755) == 0 && stat("/tmp/perm.sg/d", &st) == 0 &&
 			      st.st_gid == 50 && (st.st_mode & S_ISGID));
+		check("chmod of a file of root gives EPERM",
+		      chmod("/tmp/perm.sticky/root", 0777) == -1 && errno == EPERM);
+		check("chown to another user gives EPERM",
+		      chown("/tmp/perm.suid", 2000, -1) == -1 && errno == EPERM);
+		check("chown to a group of the process", chown("/tmp/perm.sg/d", -1, 100) == 0);
+		check("chown to a group outside the process gives EPERM",
+		      chown("/tmp/perm.sg/d", -1, 7) == -1 && errno == EPERM);
+		struct timespec ts[2] = {{1, 0}, {1, 0}};
+		check("utimensat with a time on a file of root gives EPERM",
+		      utimensat(AT_FDCWD, "/tmp/perm.sticky/root", ts, 0) == -1 && errno == EPERM);
+		check("utimensat to now on a file that the process can write",
+		      utimensat(AT_FDCWD, "/tmp/perm.sticky/root", NULL, 0) == 0);
+		fd = open("/tmp/perm.suid", O_WRONLY);
+		check("a write clears the set-user-ID and set-group-ID bits",
+		      fd >= 0 && write(fd, "x", 1) == 1 && stat("/tmp/perm.suid", &st) == 0 &&
+			      (st.st_mode & 07777) == 0755);
+		close(fd);
+		check("setxattr of a trusted attribute gives EPERM",
+		      syscall(SYS_setxattr, "/tmp/perm.suid", "trusted.a", "v", 1, 0) == -1 &&
+			      errno == EPERM);
+		check("setxattr of a user attribute on a file of root gives EACCES",
+		      syscall(SYS_setxattr, "/tmp/perm.secret", "user.a", "v", 1, 0) == -1 &&
+			      errno == EACCES);
 		_exit(failed);
 	}
 	int status;
