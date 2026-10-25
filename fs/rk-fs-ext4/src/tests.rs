@@ -398,11 +398,45 @@ fn the_inode_flags_are_kept() {
     let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
     let extents = 0x8_0000;
     assert_eq!(file.attr_flags(), Ok(extents));
-    // The extent flag does not change, and the user cannot clear it.
-    assert_eq!(file.set_attr_flags(IMMUTABLE), Err(Errno::EOPNOTSUPP));
     file.set_attr_flags(extents | IMMUTABLE | APPEND | NODUMP).unwrap();
     let file = again(&ram).root().unwrap().lookup(b"f").unwrap();
     assert_eq!(file.attr_flags(), Ok(extents | IMMUTABLE | APPEND | NODUMP));
+}
+
+#[test]
+fn the_extent_flag_moves_the_file() {
+    let extents = 0x8_0000;
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    // A file with one extent in the direct blocks moves to a block map.
+    let file = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(BS as u64, &vec![b'b'; 2 * BS]).unwrap();
+    file.set_attr_flags(0).unwrap();
+    assert_eq!(file.attr_flags(), Ok(0));
+    assert_eq!(read_all(&*again(&ram).root().unwrap().lookup(b"f").unwrap())[BS], b'b');
+    // The block map moves back to an extent tree, and the file can grow again.
+    file.set_attr_flags(extents).unwrap();
+    file.write_at(20 * BS as u64, b"end").unwrap();
+    let back = again(&ram).root().unwrap().lookup(b"f").unwrap();
+    assert_eq!(back.attr_flags(), Ok(extents));
+    assert_eq!(back.fiemap(0, u64::MAX).unwrap().len(), 2);
+    // A file with two extents, or past the direct blocks, does not move.
+    let two = root.create(b"two", FileType::Regular, 0o644, 0).unwrap();
+    two.write_at(0, b"a").unwrap();
+    two.write_at(4 * BS as u64, b"b").unwrap();
+    assert_eq!(two.set_attr_flags(0), Err(Errno::EOPNOTSUPP));
+    let far = root.create(b"far", FileType::Regular, 0o644, 0).unwrap();
+    far.write_at(12 * BS as u64, b"a").unwrap();
+    assert_eq!(far.set_attr_flags(0), Err(Errno::EOPNOTSUPP));
+    // The old file with an indirect block moves to an extent tree, and frees the indirect block.
+    let free = ram.free().0;
+    let old = root.lookup(b"sub").unwrap().lookup(b"old").unwrap();
+    old.set_attr_flags(extents).unwrap();
+    assert_eq!(ram.free().0, free + 1);
+    let old = again(&ram).root().unwrap().lookup(b"sub").unwrap().lookup(b"old").unwrap();
+    let data = read_all(&*old);
+    assert_eq!((data[0], data[13 * BS - 1]), (1, 2));
+    assert_eq!(old.fiemap(0, u64::MAX).unwrap().len(), 2);
 }
 
 #[test]
