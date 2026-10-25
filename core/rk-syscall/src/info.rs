@@ -1,6 +1,7 @@
 //! The system calls of time, limits and system information.
 
 use crate::cx::{Cx, SysResult};
+use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::random::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
 use rk_abi::native::syscalls as nr;
@@ -239,6 +240,51 @@ pub(crate) fn uname(cx: &Cx<'_>, buf: u64) -> SysResult {
     };
     cx.write_val(buf, &u)?;
     Ok(0)
+}
+
+/// `syslog(2)`, the call under `klogctl(3)` and `dmesg`. Linux has it in kernel/printk/printk.c.
+/// The kernel has no console log level, so the actions that change it do nothing.
+pub(crate) fn syslog(cx: &Cx<'_>, action: u64, buf: u64, len: u64) -> SysResult {
+    use rk_frame::console;
+    const CLOSE: i32 = 0;
+    const OPEN: i32 = 1;
+    const READ: i32 = 2;
+    const READ_ALL: i32 = 3;
+    const READ_CLEAR: i32 = 4;
+    const CLEAR: i32 = 5;
+    const CONSOLE_OFF: i32 = 6;
+    const CONSOLE_ON: i32 = 7;
+    const CONSOLE_LEVEL: i32 = 8;
+    const SIZE_UNREAD: i32 = 9;
+    const SIZE_BUFFER: i32 = 10;
+    let action = action as i32;
+    match action {
+        CLOSE | OPEN | CONSOLE_OFF | CONSOLE_ON => Ok(0),
+        READ | READ_ALL | READ_CLEAR => {
+            if buf == 0 || (len as i32) < 0 {
+                return Err(Errno::EINVAL);
+            }
+            let mut out = vec![0u8; (len as usize).min(console::LOG_SIZE)];
+            let n = if action == READ {
+                console::log_read(&mut out)
+            } else {
+                console::log_read_all(&mut out)
+            };
+            cx.write_bytes(buf, &out[..n])?;
+            if action == READ_CLEAR {
+                console::log_clear();
+            }
+            Ok(n as u64)
+        }
+        CLEAR => {
+            console::log_clear();
+            Ok(0)
+        }
+        CONSOLE_LEVEL if (1..=8).contains(&(len as i32)) => Ok(0),
+        SIZE_UNREAD => Ok(console::log_unread() as u64),
+        SIZE_BUFFER => Ok(console::LOG_SIZE as u64),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64) -> SysResult {
