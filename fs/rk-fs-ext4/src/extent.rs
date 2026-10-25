@@ -186,6 +186,7 @@ impl Tx<'_> {
             n = n.div_ceil(per);
             need += n;
         }
+        let had = old.len() as u64;
         let mut pool = old;
         let goal = extents.first().map_or(0, |e| e.start.saturating_sub(1));
         while pool.len() < need {
@@ -229,9 +230,10 @@ impl Tx<'_> {
         for (i, (_, e)) in entries.iter().enumerate() {
             root[12 + i * 12..24 + i * 12].copy_from_slice(e);
         }
+        // i_blocks counts the old tree blocks already, so only the difference changes it.
         let sectors = fs.sb.block_size / 512;
         let blocks = raw.blocks() + need as u64 * sectors;
-        raw.set_blocks(blocks.saturating_sub(spare.len() as u64 * sectors));
+        raw.set_blocks(blocks.saturating_sub(had * sectors));
         Ok(())
     }
 

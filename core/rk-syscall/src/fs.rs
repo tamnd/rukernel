@@ -151,7 +151,7 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
 }
 
 /// Sends `SIGPIPE` to the thread when a write gives `EPIPE`, as `pipe_write` of Linux does.
-fn sigpipe(cx: &Cx<'_>, r: SysResult) -> SysResult {
+pub(crate) fn sigpipe(cx: &Cx<'_>, r: SysResult) -> SysResult {
     if r == Err(Errno::EPIPE) {
         let pid = cx.process().pid();
         cx.thread.send_signal(SigInfo::new(SIGPIPE, SI_USER, pid));

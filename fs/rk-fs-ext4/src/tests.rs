@@ -423,6 +423,8 @@ fn many_entries_and_extents_grow_the_trees() {
     for i in 0..8u64 {
         file.write_at(i * 2 * BS as u64, &[i as u8 + 1]).unwrap();
     }
+    // i_blocks counts the 8 data blocks and the one block of the tree, one time each.
+    assert_eq!(file.metadata().blocks, 9 * (BS as u64 / 512));
     drop((file, root, fs));
 
     let fs = again(&ram);
