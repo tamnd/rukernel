@@ -2606,6 +2606,19 @@ static void test_aio(int fd)
 	for (int k = 0; ok && k < 1024; k++)
 		ok = back[k] == (k < 512 ? 0x5a : 0xa5);
 	check("pread gives the data of the pwritev", ok);
+	memset(bufs[2], 0x3c, 512);
+	struct iovec wv[2] = { { bufs[2], 256 }, { bufs[2] + 256, 256 } };
+	check("pwritev2 with RWF_DSYNC", syscall(SYS_pwritev2, fd, wv, 2, 512 * 100, 0, RWF_DSYNC) == 512);
+	memset(back, 0, sizeof(back));
+	struct iovec rv[2] = { { back, 100 }, { back + 100, 924 } };
+	ok = syscall(SYS_preadv, fd, rv, 2, 512 * 100, 0) == 1024;
+	for (int k = 0; ok && k < 1024; k++)
+		ok = back[k] == (k < 512 ? 0x3c : 0xa5);
+	check("preadv gives the data of the pwritev2", ok);
+	check("preadv with an offset of -1 gives EINVAL",
+	      syscall(SYS_preadv, fd, rv, 2, -1L, 0) == -1 && errno == EINVAL);
+	check("preadv2 with an unknown flag gives EOPNOTSUPP",
+	      syscall(SYS_preadv2, fd, rv, 2, 0, 0, 0x10000) == -1 && errno == EOPNOTSUPP);
 	struct iocb bad = { .aio_lio_opcode = 99, .aio_fildes = fd };
 	struct iocb *bl[1] = { &bad };
 	check("io_submit of an unknown command gives EINVAL",

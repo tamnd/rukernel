@@ -6,6 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- `preadv`, `pwritev`, `preadv2` and `pwritev2`. An offset of -1 for `preadv2` and `pwritev2` uses the position of the file. `RWF_APPEND` writes at the end, and `RWF_DSYNC` and `RWF_SYNC` sync the file after the write. `RWF_ATOMIC` and `RWF_DONTCACHE` give `EOPNOTSUPP`, because no file system of rukernel has them. fsx uses these calls, so generic/091, generic/263 and generic/469 now pass.
 - ext4 makes the extra fields of an inode larger when it changes the inode and the inode has less than `s_want_extra_isize`, as Linux. The attributes that then do not fit in the inode move to its attribute block. If the block has no room, the driver tries `s_min_extra_isize`, and else the inode keeps its size. A new inode gets the size that `ext4_clamp_want_extra_isize` gives. ext4/022 passes.
 
 ### Fixed
