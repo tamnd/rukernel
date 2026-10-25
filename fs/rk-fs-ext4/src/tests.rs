@@ -349,7 +349,7 @@ fn fallocate_gives_and_frees_blocks() {
     file.fallocate(PUNCH_HOLE | KEEP_SIZE, BS as u64 - 1, BS as u64 + 2).unwrap();
     assert_eq!(ram.free().0, free.0 - 2);
     file.fallocate(ZERO_RANGE, 2 * BS as u64 + 5, 5).unwrap();
-    assert_eq!(file.fallocate(0x8, 0, 1), Err(Errno::EOPNOTSUPP));
+    assert_eq!(file.fallocate(0x40, 0, 1), Err(Errno::EOPNOTSUPP));
     drop((file, root, fs));
 
     let fs = again(&ram);
@@ -399,6 +399,34 @@ fn the_inode_flags_are_kept() {
     file.set_attr_flags(extents | IMMUTABLE | APPEND | NODUMP).unwrap();
     let file = again(&ram).root().unwrap().lookup(b"f").unwrap();
     assert_eq!(file.attr_flags(), Ok(extents | IMMUTABLE | APPEND | NODUMP));
+}
+
+#[test]
+fn collapse_and_insert_move_the_blocks() {
+    use rk_vfs::inode::falloc::{COLLAPSE_RANGE, INSERT_RANGE};
+    let (fs, ram) = open_rw();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    for (i, c) in b"abcd".iter().enumerate() {
+        file.write_at((i * BS) as u64, &vec![*c; BS]).unwrap();
+    }
+    let (b, free) = (BS as u64, ram.free().0);
+    assert_eq!(file.fallocate(COLLAPSE_RANGE, 1, b), Err(Errno::EINVAL));
+    assert_eq!(file.fallocate(COLLAPSE_RANGE, 2 * b, 2 * b), Err(Errno::EINVAL));
+    assert_eq!(file.fallocate(INSERT_RANGE, 4 * b, b), Err(Errno::EINVAL));
+    // A collapse of the second block frees it, and the blocks after it move down.
+    file.fallocate(COLLAPSE_RANGE, b, b).unwrap();
+    assert_eq!((file.metadata().size, ram.free().0), (3 * b, free + 1));
+    // An insert before the second block leaves a hole of one block.
+    file.fallocate(INSERT_RANGE, b, b).unwrap();
+    assert_eq!((file.metadata().size, ram.free().0), (4 * b, free + 1));
+    drop((file, fs));
+
+    let fs = again(&ram);
+    let back = read_all(&*fs.root().unwrap().lookup(b"f").unwrap());
+    assert_eq!(back.len(), 4 * BS);
+    let firsts: Vec<u8> = back.chunks(BS).map(|c| c[0]).collect();
+    assert_eq!(firsts, [b'a', 0, b'c', b'd']);
+    assert!(back.chunks(BS).all(|c| c.iter().all(|&x| x == c[0])));
 }
 
 #[test]
