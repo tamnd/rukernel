@@ -5,6 +5,7 @@ use super::*;
 use alloc::format;
 use layout::flags;
 use rk_frame::sync::SpinLock;
+use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 use rk_vfs::{FileType, Inode, SetAttr, Timespec};
 
 const BS: usize = 1024;
@@ -704,4 +705,59 @@ mod log {
         assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
         assert_eq!(ram.free(), free);
     }
+}
+
+#[test]
+fn extended_attributes_stay_after_a_mount() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    file.set_xattr(b"user.small", b"1", 0).unwrap();
+    file.set_xattr(b"trusted.overlay.opaque", b"y", 0).unwrap();
+    file.set_xattr(b"user.empty", b"", 0).unwrap();
+    // The small attributes stay in the inode, so the file has no block.
+    assert_eq!(file.metadata().blocks, 0);
+    assert_eq!(ram.free().0, free.0);
+    assert_eq!(file.set_xattr(b"user.small", b"2", XATTR_CREATE), Err(Errno::EEXIST));
+    assert_eq!(file.set_xattr(b"user.none", b"2", XATTR_REPLACE), Err(Errno::ENODATA));
+    assert_eq!(file.set_xattr(b"other.a", b"2", 0), Err(Errno::EOPNOTSUPP));
+    // A large value goes to a block.
+    file.set_xattr(b"user.large", &[7u8; 300], 0).unwrap();
+    assert_eq!(file.metadata().blocks, (BS / 512) as u64);
+    assert_eq!(ram.free().0, free.0 - 1);
+    drop((file, root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let file = fs.root().unwrap().lookup(b"x").unwrap();
+    assert_eq!(file.get_xattr(b"user.small").unwrap(), b"1");
+    assert_eq!(file.get_xattr(b"trusted.overlay.opaque").unwrap(), b"y");
+    assert_eq!(file.get_xattr(b"user.empty").unwrap(), b"");
+    assert_eq!(file.get_xattr(b"user.large").unwrap(), [7u8; 300]);
+    assert_eq!(file.get_xattr(b"user.none"), Err(Errno::ENODATA));
+    let mut names = file.list_xattr().unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        [&b"trusted.overlay.opaque"[..], b"user.empty", b"user.large", b"user.small"]
+    );
+    // The removal of the large value frees the block.
+    file.remove_xattr(b"user.large").unwrap();
+    assert_eq!(file.remove_xattr(b"user.large"), Err(Errno::ENODATA));
+    assert_eq!(file.metadata().blocks, 0);
+    assert_eq!(ram.free().0, free.0);
+}
+
+#[test]
+fn unlink_frees_the_attribute_block() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    file.set_xattr(b"user.large", &[1u8; 600], 0).unwrap();
+    assert_eq!(file.set_xattr(b"user.huge", &[1u8; BS], 0), Err(Errno::ENOSPC));
+    assert_eq!(ram.free().0, free.0 - 1);
+    root.unlink(b"x").unwrap();
+    drop(file);
+    assert_eq!(ram.free(), free);
 }

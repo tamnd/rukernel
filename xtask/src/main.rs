@@ -730,6 +730,25 @@ if [ -x /usr/bin/gdb ]; then
     ! dumpe2fs -h /dev/vdb 2>/dev/null | grep -q needs_recovery
     e2fsck -fn /dev/vdb
     echo 'alpine: ext4 journal replay done'
+    mount -t ext4 /dev/vdb /mnt
+    python3 -c 'import os
+p = \"/mnt/d/e/new\"
+os.setxattr(p, \"user.small\", b\"1\")
+os.setxattr(p, \"user.large\", b\"x\" * 700)
+os.setxattr(\"/mnt/d\", \"trusted.overlay.opaque\", b\"y\")
+os.setxattr(\"/mnt/r\", \"user.gone\", b\"z\" * 700)
+os.removexattr(\"/mnt/r\", \"user.gone\")'
+    umount /mnt
+    e2fsck -fn /dev/vdb
+    debugfs -R 'ea_list /d/e/new' /dev/vdb 2>/dev/null > /tmp/ea
+    grep -q 'user.small (1) = \"1\"' /tmp/ea || { cat /tmp/ea; exit 1; }
+    grep -q 'user.large (700)' /tmp/ea || { cat /tmp/ea; exit 1; }
+    debugfs -R 'ea_list /d' /dev/vdb 2>/dev/null | grep -q 'trusted.overlay.opaque (1) = \"y\"'
+    ! debugfs -R 'ea_list /r' /dev/vdb 2>/dev/null | grep -q user.gone
+    mount -t ext4 -o ro /dev/vdb /mnt
+    python3 -c 'import os; assert os.getxattr(\"/mnt/d/e/new\", \"user.large\") == b\"x\" * 700'
+    umount /mnt
+    echo 'alpine: ext4 xattr done'
 fi
 echo 'alpine: done'
 ",

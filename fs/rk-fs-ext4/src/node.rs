@@ -3,7 +3,7 @@
 
 use crate::extent::{self, Extent};
 use crate::layout::{self, EXTENT_INIT_MAX, EXTENT_MAGIC, RawInode, flags, u16_at, u32_at};
-use crate::{EXT4_MAGIC, Fs, Tx};
+use crate::{EXT4_MAGIC, Fs, Tx, xattr};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -11,6 +11,7 @@ use core::any::Any;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::mode;
+use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
 use extent::MAX_DEPTH;
@@ -383,6 +384,11 @@ impl Tx<'_> {
             }
             raw.block_mut().fill(0);
         }
+        let acl = raw.file_acl();
+        if acl != 0 {
+            self.put_xattr_block(acl)?;
+            raw.set_file_acl(0);
+        }
         let t = now();
         layout::put32(&mut raw.0, 0x14, t.sec as u32);
         raw.set_size(0);
@@ -500,7 +506,7 @@ impl Tx<'_> {
 
 impl Fs {
     /// The first block of the group of the inode `ino`, where its data goes first.
-    fn goal(&self, ino: u32) -> u64 {
+    pub(crate) fn goal(&self, ino: u32) -> u64 {
         let group = u64::from((ino - 1) / self.sb.inodes_per_group);
         u64::from(self.sb.first_data_block) + group * u64::from(self.sb.blocks_per_group)
     }
@@ -925,6 +931,44 @@ impl Inode for Node {
             return Err(Errno::ENOTDIR);
         }
         self.fs.entry_at(&self.raw(), pos)
+    }
+
+    fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
+        let key = xattr::key(name)?;
+        self.fs.xattrs(&self.raw())?.remove(&key).ok_or(Errno::ENODATA)
+    }
+
+    fn set_xattr(&self, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
+        let key = xattr::key(name)?;
+        let mut tx = self.fs.tx()?;
+        let mut raw = self.raw();
+        let mut attrs = self.fs.xattrs(&raw)?;
+        let old = attrs.contains_key(&key);
+        if flags & XATTR_CREATE != 0 && old {
+            return Err(Errno::EEXIST);
+        }
+        if flags & XATTR_REPLACE != 0 && !old {
+            return Err(Errno::ENODATA);
+        }
+        attrs.insert(key, value.to_vec());
+        tx.write_xattrs(self.ino, &mut raw, &attrs)?;
+        touch(&mut raw, false);
+        tx.save(self, raw)
+    }
+
+    fn list_xattr(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self.fs.xattrs(&self.raw())?.keys().filter_map(xattr::name).collect())
+    }
+
+    fn remove_xattr(&self, name: &[u8]) -> Result<()> {
+        let key = xattr::key(name)?;
+        let mut tx = self.fs.tx()?;
+        let mut raw = self.raw();
+        let mut attrs = self.fs.xattrs(&raw)?;
+        attrs.remove(&key).ok_or(Errno::ENODATA)?;
+        tx.write_xattrs(self.ino, &mut raw, &attrs)?;
+        touch(&mut raw, false);
+        tx.save(self, raw)
     }
 
     fn fs_id(&self) -> u64 {
