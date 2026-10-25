@@ -849,21 +849,23 @@ const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 pub(crate) fn utimensat(cx: &Cx<'_>, dirfd: u64, path: u64, times: u64, flags: u64) -> SysResult {
     let now = rk_vfs::inode::now();
+    let mut explicit_times = false;
     let (atime, mtime) = if times == 0 {
         (Some(now), Some(now))
     } else {
         let t: [rk_abi::native::types::KernelTimespec; 2] = cx.read_val(times)?;
-        let conv = |ts: rk_abi::native::types::KernelTimespec| match ts.tv_nsec {
+        let mut conv = |ts: rk_abi::native::types::KernelTimespec| match ts.tv_nsec {
             UTIME_NOW => Ok(Some(now)),
             UTIME_OMIT => Ok(None),
             n if (0..1_000_000_000).contains(&n) => {
+                explicit_times = true;
                 Ok(Some(Timespec { sec: ts.tv_sec, nsec: n as u32 }))
             }
             _ => Err(Errno::EINVAL),
         };
         (conv(t[0])?, conv(t[1])?)
     };
-    let attr = SetAttr { atime, mtime, ..SetAttr::default() };
+    let attr = SetAttr { atime, mtime, explicit_times, ..SetAttr::default() };
     if path == 0 {
         return set_attr_fd(cx, dirfd, &attr);
     }
