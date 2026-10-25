@@ -6,7 +6,8 @@ use rk_abi::Errno;
 use rk_abi::native::at::{AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW};
 use rk_abi::native::fcntl::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETPIPE_SZ, F_OFD_GETLK, F_OFD_SETLK,
-    F_OFD_SETLKW, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETPIPE_SZ, FD_CLOEXEC,
+    F_OFD_SETLKW, F_RDLCK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETPIPE_SZ, F_UNLCK, F_WRLCK,
+    FD_CLOEXEC,
 };
 use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
 use rk_abi::native::mount::{
@@ -20,6 +21,7 @@ use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimest
 use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::device::{major, minor};
 use rk_vfs::inode::{Metadata, SetAttr, Timespec};
+use rk_vfs::lock::{self, LockKind, Owner, RecordLock};
 use rk_vfs::{File, Location, Whence};
 use zerocopy::FromZeros;
 
@@ -496,13 +498,110 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             let size = usize::try_from(arg as u32).map_err(|_| Errno::EINVAL)?;
             Ok(rk_vfs::pipe::set_pipe_size(&*cx.file(fd)?, size)? as u64)
         }
-        // A process has no other process that shares its files in R1, so each lock succeeds.
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
-            cx.file(fd)?;
-            Ok(0)
+            record_lock(cx, fd, cmd, arg)
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// The size of `struct flock`.
+const FLOCK_SIZE: usize = 32;
+
+/// The record lock commands of `fcntl`. The argument points to a `struct flock`: `l_type` at 0,
+/// `l_whence` at 2, `l_start` at 8, `l_len` at 16 and `l_pid` at 24.
+fn record_lock(cx: &Cx<'_>, fd: u64, cmd: i32, arg: u64) -> SysResult {
+    let (file, table) = {
+        let files = cx.files()?;
+        let table = files.lock();
+        (table.file(fd as i32)?, table.owner())
+    };
+    let raw = cx.read_bytes(arg, FLOCK_SIZE)?;
+    let mut buf = [0u8; FLOCK_SIZE];
+    buf.copy_from_slice(&raw);
+    let i16_at = |o: usize| i16::from_ne_bytes([buf[o], buf[o + 1]]);
+    let i64_at = |o: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[o..o + 8]);
+        i64::from_ne_bytes(b)
+    };
+    let ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    if ofd && i32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let kind = match i32::from(i16_at(0)) {
+        F_RDLCK => Some(LockKind::Read),
+        F_WRLCK => Some(LockKind::Write),
+        F_UNLCK => None,
+        _ => return Err(Errno::EINVAL),
+    };
+    let base = match i16_at(2) {
+        0 => 0,
+        1 => i64::try_from(file.pos()).map_err(|_| Errno::EOVERFLOW)?,
+        2 => i64::try_from(file.metadata()?.size).map_err(|_| Errno::EOVERFLOW)?,
+        _ => return Err(Errno::EINVAL),
+    };
+    let start = base.checked_add(i64_at(8)).ok_or(Errno::EOVERFLOW)?;
+    let len = i64_at(16);
+    // A length of 0 locks to the end of the file, and a negative length locks the bytes before
+    // the start.
+    let (first, end) = match len {
+        0 => (start, u64::MAX),
+        1.. => (start, start.checked_add(len - 1).ok_or(Errno::EOVERFLOW)? as u64),
+        _ => (start.checked_add(len).ok_or(Errno::EINVAL)?, start.wrapping_sub(1) as u64),
+    };
+    let first = u64::try_from(first).map_err(|_| Errno::EINVAL)?;
+    let (owner, pid) = if ofd {
+        (Owner::File(lock::file_id(&file)), -1)
+    } else {
+        (Owner::Posix(table), cx.process().pid() as i32)
+    };
+    let request = RecordLock { owner, kind: LockKind::Read, start: first, end, pid };
+    if matches!(cmd, F_GETLK | F_OFD_GETLK) {
+        let kind = kind.ok_or(Errno::EINVAL)?;
+        let found = lock::test(&file, &RecordLock { kind, ..request })?;
+        let Some(holder) = found else {
+            // No lock conflicts, so only `l_type` changes.
+            cx.write_bytes(arg, &(F_UNLCK as i16).to_ne_bytes())?;
+            return Ok(0);
+        };
+        let held = if holder.kind == LockKind::Write { F_WRLCK } else { F_RDLCK };
+        let len = if holder.end == u64::MAX { 0 } else { holder.end - holder.start + 1 };
+        buf[0..2].copy_from_slice(&(held as i16).to_ne_bytes());
+        buf[2..4].copy_from_slice(&0i16.to_ne_bytes());
+        buf[8..16].copy_from_slice(&(holder.start as i64).to_ne_bytes());
+        buf[16..24].copy_from_slice(&(len as i64).to_ne_bytes());
+        buf[24..28].copy_from_slice(&holder.pid.to_ne_bytes());
+        cx.write_bytes(arg, &buf)?;
+        return Ok(0);
+    }
+    let mode = file.flags();
+    match kind {
+        Some(LockKind::Read) if !mode.readable() => return Err(Errno::EBADF),
+        Some(LockKind::Write) if !mode.writable() => return Err(Errno::EBADF),
+        _ => {}
+    }
+    lock::set(&file, request, kind, matches!(cmd, F_SETLKW | F_OFD_SETLKW))?;
+    Ok(0)
+}
+
+/// The operations of `flock`, from `<sys/file.h>`.
+const LOCK_SH: u32 = 1;
+const LOCK_EX: u32 = 2;
+const LOCK_NB: u32 = 4;
+const LOCK_UN: u32 = 8;
+
+pub(crate) fn flock(cx: &Cx<'_>, fd: u64, op: u64) -> SysResult {
+    let file = cx.file(fd)?;
+    let op = op as u32;
+    let kind = match op & !LOCK_NB {
+        LOCK_SH => Some(LockKind::Read),
+        LOCK_EX => Some(LockKind::Write),
+        LOCK_UN => None,
+        _ => return Err(Errno::EINVAL),
+    };
+    lock::flock(&file, kind, op & LOCK_NB == 0)?;
+    Ok(0)
 }
 
 pub(crate) fn getcwd(cx: &Cx<'_>, buf: u64, size: u64) -> SysResult {

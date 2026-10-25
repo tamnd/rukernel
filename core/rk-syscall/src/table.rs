@@ -139,6 +139,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::UNAME => info::uname(cx, a[0]),
         nr::SYSLOG => info::syslog(cx, a[0], a[1], a[2]),
         nr::FCNTL => fs::fcntl(cx, a[0], a[1], a[2]),
+        nr::FLOCK => fs::flock(cx, a[0], a[1]),
         nr::FSYNC | nr::FDATASYNC => cx.file(a[0]).and_then(|f| f.sync().map(|()| 0)),
         nr::TRUNCATE => fs::truncate(cx, a[0], a[1]),
         nr::FTRUNCATE => fs::ftruncate(cx, a[0], a[1]),
