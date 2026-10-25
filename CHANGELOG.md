@@ -7,6 +7,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - `rk-fs-ext4` replays the jbd2 journal at mount, as `jbd2_journal_recover` of Linux. It supports the revoke records, 64 bit block numbers, and the checksums of `CSUM_V2` and `CSUM_V3`. A transaction with a bad commit block ends the log, and a copy with a bad checksum is not written. A read only mount also replays the journal. Then the driver marks the journal empty and clears `needs_recovery`.
+- `rk-fs-ext4` writes the jbd2 journal. The metadata blocks of each change go to the log in one transaction, with the descriptor, revoke and commit blocks and the checksums of `CSUM_V2` and `CSUM_V3`. When the transaction is durable, the blocks go to their places. The data of regular files does not go to the log, as `data=writeback`. A mount sets `needs_recovery`, and an unmount does a checkpoint, marks the log empty, and clears `needs_recovery`. After a crash, the next mount replays the log, so the disk stays consistent.
+- The `Disk` trait of `rk-fs-ext4` gets `write_back` and `flush`, and `DiskCache` gets `flush`, so a file system can make a write durable before the next one.
+- The `alpine` boot test copies the ext4 disk while it is mounted read and write, and checks that `e2fsck` replays the journal of the copy and finds no error. The test disk uses `cache=unsafe` in QEMU, because a flush on the host is slow and the disk is new for each run.
 - tools/debug/build.sh adds e2fsprogs-extra, which has debugfs, dumpe2fs and tune2fs. The `alpine` boot test writes a transaction with debugfs, mounts the disk, and checks that the kernel replayed it.
 
 ## [0.3.3] - 2026-10-25

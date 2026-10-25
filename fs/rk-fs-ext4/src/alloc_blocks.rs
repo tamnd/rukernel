@@ -233,6 +233,7 @@ impl Tx<'_> {
             self.desc_set(group, gd::FREE_BLOCKS, free);
             self.write_desc(group)?;
             self.write_sb(i64::from(freed), 0)?;
+            self.fs.freed(start, n as u64);
             start += n as u64;
             count -= n as u64;
         }

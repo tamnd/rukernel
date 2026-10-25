@@ -6,12 +6,13 @@
 //! the index blocks look like empty entries. The checksums are not checked on a read.
 //!
 //! A read and write mount changes the bitmaps, the group descriptors, the inodes, the extent trees
-//! and the directories, and it writes the checksums of `metadata_csum` or `uninit_bg`. Each change
-//! goes to the page cache at once, under one lock for the file system, so `sync` makes the disk
-//! consistent. The driver does not write the journal yet, but at mount it replays a journal that
-//! Linux or e2fsprogs left with transactions. A new entry in a directory with an htree
-//! index first changes the directory into a list. A file with a block map can change in its
-//! blocks, but it cannot get new blocks.
+//! and the directories, and it writes the checksums of `metadata_csum` or `uninit_bg`. With a
+//! journal, the metadata blocks of each change go to the journal first, and then to their places,
+//! as `data=writeback` of Linux. The data of a regular file goes to its blocks at once. At mount
+//! the driver replays a journal that Linux, e2fsprogs or a crash left with transactions, and at
+//! unmount it leaves the journal empty. A new entry in a directory with an htree index first
+//! changes the directory into a list. A file with a block map can change in its blocks, but it
+//! cannot get new blocks.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -65,6 +66,25 @@ pub trait Disk: Send + Sync {
     ///
     /// Gives the error of the disk, or `EIO` past the end.
     fn write(&self, offset: u64, buf: &[u8]) -> Result<()>;
+
+    /// Writes the data from `offset` up to `offset + len` that is in a cache to the disk.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the disk.
+    fn write_back(&self, _offset: u64, _len: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// Makes the data that the disk has durable. The writes before it reach the disk before the
+    /// writes after it.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the disk.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl Disk for Arc<rk_vfs::blockdev::DiskCache> {
@@ -80,6 +100,14 @@ impl Disk for Arc<rk_vfs::blockdev::DiskCache> {
             n if n == buf.len() => Ok(()),
             _ => Err(Errno::EIO),
         }
+    }
+
+    fn write_back(&self, offset: u64, len: u64) -> Result<()> {
+        rk_vfs::blockdev::DiskCache::write_back(self, offset, len)
+    }
+
+    fn flush(&self) -> Result<()> {
+        rk_vfs::blockdev::DiskCache::flush(self)
     }
 }
 
@@ -121,12 +149,20 @@ impl Drop for Tx<'_> {
             // The inode stays in use on an error, and fsck finds it.
             let _ = self.release(ino);
         }
+        self.fs.commit();
+    }
+}
+
+impl Drop for Fs {
+    fn drop(&mut self) {
+        // On an error the journal stays, and the next mount replays it.
+        let _ = self.finish();
     }
 }
 
 /// One mounted ext4 file system.
 pub struct Fs {
-    disk: alloc::boxed::Box<dyn Disk>,
+    disk: Arc<dyn Disk>,
     dev: u64,
     sb: Superblock,
     groups: Vec<GroupDesc>,
@@ -137,6 +173,11 @@ pub struct Fs {
     meta: SpinLock<Meta>,
     /// The inodes without a link that no one uses, to free.
     orphans: SpinLock<Vec<u32>>,
+    /// The journal, for a read and write mount of a file system with a journal.
+    log: Option<SpinLock<journal::Log>>,
+    /// The metadata blocks that the running change wrote, which go to the journal when the
+    /// change ends.
+    pending: SpinLock<BTreeMap<u64, Vec<u8>>>,
     /// The inodes in memory, so that two lookups of one file give one inode.
     inodes: SpinLock<BTreeMap<u32, Weak<Node>>>,
     this: Weak<Fs>,
@@ -153,17 +194,21 @@ impl Fs {
     /// is false and the driver can only read the disk. A journal with transactions is replayed
     /// first.
     pub fn open(dev: u64, disk: alloc::boxed::Box<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
-        let fs = Self::load(dev, disk, read_only)?;
-        if fs.sb.incompat & layout::incompat::RECOVER == 0 {
-            return Ok(fs);
+        let disk: Arc<dyn Disk> = Arc::from(disk);
+        let mut fs = Self::load(dev, disk.clone(), read_only)?;
+        if fs.sb.incompat & layout::incompat::RECOVER != 0 {
+            // As Linux, a read only mount also replays the journal.
+            fs.recover()?;
+            drop(fs);
+            fs = Self::load(dev, disk, read_only)?;
         }
-        // As Linux, a read only mount also replays the journal.
-        fs.recover()?;
-        let fs = Arc::try_unwrap(fs).map_err(|_| Errno::EIO)?;
-        Self::load(dev, fs.disk, read_only)
+        if fs.log.is_some() {
+            fs.mark_recover(true)?;
+        }
+        Ok(fs)
     }
 
-    fn load(dev: u64, disk: alloc::boxed::Box<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
+    fn load(dev: u64, disk: Arc<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
         let mut b = vec![0u8; layout::SUPERBLOCK_SIZE];
         disk.read(layout::SUPERBLOCK_AT, &mut b)?;
         let sb = Superblock::parse(&b)?;
@@ -190,17 +235,32 @@ impl Fs {
         let groups = table.chunks(size).map(|d| GroupDesc::parse(d, sb.desc_size)).collect();
         let descs = table.chunks(size).map(<[u8]>::to_vec).collect();
         let generation = crc::crc32c(csum_seed, &rk_vfs::now().nsec.to_le_bytes());
-        Ok(Arc::new_cyclic(|this| Self {
+        // A disk with a journal to replay changes only after the replay.
+        let writable = !read_only && sb.incompat & layout::incompat::RECOVER == 0;
+        let journal = writable && sb.compat & layout::compat::HAS_JOURNAL != 0;
+        if journal && (sb.incompat & layout::incompat::JOURNAL_DEV != 0 || sb.journal_inum == 0) {
+            return Err(Errno::EROFS);
+        }
+        let mut fs = Self {
             disk,
             dev,
             sb,
             groups,
-            writable: !read_only,
+            writable,
             csum_seed,
             meta: SpinLock::new(Meta { sb: b, descs, generation }),
             orphans: SpinLock::new(Vec::new()),
+            log: None,
+            pending: SpinLock::new(BTreeMap::new()),
             inodes: SpinLock::new(BTreeMap::new()),
-            this: this.clone(),
+            this: Weak::new(),
+        };
+        if journal {
+            fs.log = Some(SpinLock::new(journal::Log::open(&fs, fs.sb.journal_inum)?));
+        }
+        Ok(Arc::new_cyclic(|this| {
+            fs.this = this.clone();
+            fs
         }))
     }
 
@@ -227,9 +287,93 @@ impl Fs {
         crc::crc32c(seed, &raw.generation().to_le_bytes())
     }
 
-    /// Writes `buf` at `offset` of the disk.
+    /// Writes the metadata `buf` at `offset` of the disk. With a journal, the blocks wait in
+    /// memory until the change ends.
     fn write(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        let Some(log) = &self.log else { return self.disk.write(offset, buf) };
+        let bs = self.sb.block_size;
+        let mut done = 0;
+        while done < buf.len() {
+            let at = offset + done as u64;
+            let (block, in_block) = (at / bs, (at % bs) as usize);
+            let n = (bs as usize - in_block).min(buf.len() - done);
+            log.lock().used_again(block);
+            let mut data = match self.pending.lock().remove(&block) {
+                Some(data) => data,
+                None if n == bs as usize => vec![0u8; n],
+                None => {
+                    let mut data = vec![0u8; bs as usize];
+                    self.disk.read(block * bs, &mut data)?;
+                    data
+                }
+            };
+            data[in_block..in_block + n].copy_from_slice(&buf[done..done + n]);
+            self.pending.lock().insert(block, data);
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Writes `buf` at `offset` of the disk at once, for the data of a file and for the
+    /// journal.
+    fn write_direct(&self, offset: u64, buf: &[u8]) -> Result<()> {
         self.disk.write(offset, buf)
+    }
+
+    /// Writes the data of the file `raw` at `offset`. The data of a regular file does not go to
+    /// the journal, as `data=writeback` of Linux.
+    fn write_file(&self, raw: &RawInode, offset: u64, buf: &[u8]) -> Result<()> {
+        if u32::from(raw.mode()) & 0o170000 == 0o100000 {
+            self.write_direct(offset, buf)
+        } else {
+            self.write(offset, buf)
+        }
+    }
+
+    /// Ends a change: the blocks that it wrote go to the journal and then to their places. If
+    /// the journal cannot take them, they go to their places at once.
+    fn commit(&self) {
+        let Some(log) = &self.log else { return };
+        let blocks = self.pending.lock().clone();
+        let mut log = log.lock();
+        if log.commit(self, &blocks).is_err() {
+            for (&block, data) in &blocks {
+                let _ = self.write_direct(block * self.sb.block_size, data);
+            }
+        }
+        drop(log);
+        self.pending.lock().clear();
+    }
+
+    /// Notes that the blocks from `start` up to `start + count` are free, so their metadata
+    /// does not go to the disk, and the journal revokes its copies of them.
+    fn freed(&self, start: u64, count: u64) {
+        if let Some(log) = &self.log {
+            let mut pending = self.pending.lock();
+            for block in start..start + count {
+                pending.remove(&block);
+            }
+            drop(pending);
+            log.lock().freed(start, count);
+        }
+    }
+
+    /// Sets or clears `needs_recovery` in the superblock, and makes it durable.
+    fn mark_recover(&self, on: bool) -> Result<()> {
+        let mut meta = self.meta.lock();
+        let b = &mut meta.sb;
+        let mut incompat = layout::u32_at(b, 0x60) & !layout::incompat::RECOVER;
+        if on {
+            incompat |= layout::incompat::RECOVER;
+        }
+        layout::put32(b, 0x60, incompat);
+        if self.metadata_csum() {
+            let csum = crc::crc32c(!0, &b[..layout::sb::CHECKSUM]);
+            layout::put32(b, layout::sb::CHECKSUM, csum);
+        }
+        self.disk.write(layout::SUPERBLOCK_AT, b)?;
+        self.disk.write_back(layout::SUPERBLOCK_AT, b.len() as u64)?;
+        self.disk.flush()
     }
 
     /// The offset of the inode `ino` on the disk.
@@ -277,9 +421,23 @@ impl Fs {
         self.inode(layout::ROOT_INO)
     }
 
-    /// Reads `buf.len()` bytes at `offset` of the disk.
+    /// Reads `buf.len()` bytes at `offset` of the disk, with the blocks that the running change
+    /// wrote.
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        self.disk.read(offset, buf)
+        self.disk.read(offset, buf)?;
+        let pending = self.pending.lock();
+        if pending.is_empty() || buf.is_empty() {
+            return Ok(());
+        }
+        let bs = self.sb.block_size;
+        let end = offset + buf.len() as u64;
+        for (&block, data) in pending.range(offset / bs..end.div_ceil(bs)) {
+            let from = (block * bs).max(offset);
+            let to = ((block + 1) * bs).min(end);
+            buf[(from - offset) as usize..(to - offset) as usize]
+                .copy_from_slice(&data[(from - block * bs) as usize..(to - block * bs) as usize]);
+        }
+        Ok(())
     }
 
     /// Reads the block `block`.
@@ -333,6 +491,14 @@ impl Fs {
         inodes.retain(|_, n| n.strong_count() > 0);
         inodes.insert(ino, Arc::downgrade(&node));
         Ok(node)
+    }
+
+    /// Ends the use of the journal at unmount: the log becomes empty and `needs_recovery` is
+    /// cleared.
+    fn finish(&self) -> Result<()> {
+        let Some(log) = &self.log else { return Ok(()) };
+        log.lock().checkpoint(self)?;
+        self.mark_recover(false)
     }
 
     /// Adds the inode `ino` without links to the inodes to free, and frees them if no change

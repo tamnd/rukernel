@@ -689,7 +689,14 @@ if [ -x /usr/bin/gdb ]; then
     rm -r /mnt/many /mnt/etc
     rm /mnt/d/f7
     ! rmdir /mnt/d 2>/dev/null
+    dumpe2fs -h /dev/vdb 2>/dev/null | grep -q needs_recovery
+    dd if=/dev/vdb of=/tmp/crash.img bs=64k 2>/dev/null
+    e2fsck -fy /tmp/crash.img > /tmp/crash.log 2>&1 || true
+    ! grep -q '? yes' /tmp/crash.log || { cat /tmp/crash.log; exit 1; }
+    e2fsck -fn /tmp/crash.img
+    rm /tmp/crash.img
     umount /mnt
+    ! dumpe2fs -h /dev/vdb 2>/dev/null | grep -q needs_recovery
     e2fsck -fn /dev/vdb
     mount -t ext4 -o ro /dev/vdb /mnt
     test \"$(cat /mnt/soft)\" = \"$(printf 'one\\ntwo')\"
@@ -1442,7 +1449,8 @@ fn boot_test(names: &[String]) -> Result {
             let file = fs::File::create(&disk).map_err(|e| format!("{}: {e}", disk.display()))?;
             file.set_len(EXT4_DISK_SIZE).map_err(|e| format!("{}: {e}", disk.display()))?;
             cmd.arg("-drive")
-                .arg(format!("if=none,id=disk1,format=raw,file={}", disk.display()))
+                // The disk is new for each run, so a flush does not have to reach the host disk.
+                .arg(format!("if=none,id=disk1,format=raw,cache=unsafe,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk1"]);
         }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
