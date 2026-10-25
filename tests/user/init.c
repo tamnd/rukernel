@@ -72,8 +72,11 @@ static void test_ids(void)
 static void test_creds(void)
 {
 	check("getuid and getegid give 0", getuid() == 0 && getegid() == 0);
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
 	pid_t pid = fork();
 	if (pid == 0) {
+		failed = 0;
 		unsigned int header[2] = {0x20080522, 0};
 		unsigned int data[6];
 		gid_t groups[2] = {20, 10};
@@ -119,6 +122,7 @@ static void test_creds(void)
 	int status;
 	check("the credentials child passes",
 	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	umount("/proc");
 	check("init is root after the child", getuid() == 0 && geteuid() == 0);
 }
 
