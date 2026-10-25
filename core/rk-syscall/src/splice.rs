@@ -191,9 +191,8 @@ pub(crate) fn copy_file_range(
     }
     let input = cx.file(in_fd)?;
     let output = cx.file(out_fd)?;
-    if !input.flags().readable() || !output.flags().writable() || output.flags().append() {
-        return Err(Errno::EBADF);
-    }
+    // The checks of `generic_file_rw_checks` of Linux, in its order: the types of the files come
+    // before their modes.
     let in_meta = input.metadata()?;
     let out_meta = output.metadata()?;
     if in_meta.is_dir() || out_meta.is_dir() {
@@ -203,6 +202,9 @@ pub(crate) fn copy_file_range(
         |m: &rk_vfs::inode::Metadata| m.file_type() == Some(rk_vfs::inode::FileType::Regular);
     if !regular(&in_meta) || !regular(&out_meta) {
         return Err(Errno::EINVAL);
+    }
+    if !input.flags().readable() || !output.flags().writable() || output.flags().append() {
+        return Err(Errno::EBADF);
     }
     let in_pos = offset_at(cx, in_off)?;
     let out_pos = offset_at(cx, out_off)?;

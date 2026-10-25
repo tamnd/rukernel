@@ -1762,6 +1762,11 @@ static void test_splice(void)
 	errno = 0;
 	check("copy_file_range with flags gives EINVAL",
 	      syscall(SYS_copy_file_range, in, NULL, out, NULL, 1, 1) == -1 && errno == EINVAL);
+	int dev = open("/dev/null", O_WRONLY | O_APPEND);
+	errno = 0;
+	check("copy_file_range to an append-only device gives EINVAL",
+	      syscall(SYS_copy_file_range, in, NULL, dev, NULL, 1, 0) == -1 && errno == EINVAL);
+	close(dev);
 	check("fadvise64 with a valid advice", syscall(SYS_fadvise64, in, 0, 0, 2) == 0);
 	errno = 0;
 	check("fadvise64 with a bad advice gives EINVAL",
