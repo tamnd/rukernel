@@ -76,6 +76,26 @@ pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     Ok(new(perm))
 }
 
+/// The file system type for `mount -t devtmpfs`.
+pub const DEVTMPFS: rk_vfs::fstype::FsType =
+    rk_vfs::fstype::FsType { name: "devtmpfs", nodev: true, make: mount_devtmpfs };
+
+/// Gives the root of devtmpfs for `mount(2)`. devtmpfs is one tmpfs that each mount shows, as in
+/// Linux. Each mount makes the device files of the new devices in the list of devices, so a
+/// device file that a user removed comes back at the next mount. The options have no effect.
+fn mount_devtmpfs(_args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
+    static ROOT: rk_frame::sync::Once<InodeRef> = rk_frame::sync::Once::new();
+    let root = ROOT.call_once(|| new(0o755)).clone();
+    for d in rk_vfs::device::devices() {
+        let kind = if d.block { FileType::BlockDevice } else { FileType::CharDevice };
+        match root.create(d.name.as_bytes(), kind, d.perm, d.rdev) {
+            Ok(_) | Err(Errno::EEXIST) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(root)
+}
+
 fn parse_octal(v: &[u8]) -> Option<u32> {
     if v.is_empty() || v.len() > 6 {
         return None;

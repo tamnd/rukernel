@@ -53,10 +53,23 @@ struct Entry {
 
 static BLOCK_DEVICES: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::new());
 
-/// Adds the block device `rdev` with the name `name`, for example `vda`.
+/// Adds the block device `rdev` with the name `name`, for example `vda`, and puts it in the list
+/// of devices.
 pub fn register_block(rdev: u64, name: &str, device: Arc<dyn BlockDevice>) {
     let cache = Arc::new(PageCache::new(Arc::new(Queue::new(device))));
     BLOCK_DEVICES.lock().insert(rdev, Entry { name: String::from(name), cache });
+    crate::device::add_device(crate::device::DeviceInfo {
+        name: String::from(name),
+        class: "block",
+        rdev,
+        block: true,
+        perm: 0o660,
+    });
+}
+
+/// Gives the size of the block device `rdev` in sectors of 512 bytes.
+pub fn block_sectors(rdev: u64) -> Option<u64> {
+    block_queue(rdev).map(|q| q.sectors())
 }
 
 /// Gives the queue of the block device `rdev`.
