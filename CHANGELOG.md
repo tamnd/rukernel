@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - Extended attributes: `setxattr`, `getxattr`, `listxattr` and `removexattr`, with the `l` and `f` forms. The `Inode` trait gets `get_xattr`, `set_xattr`, `list_xattr` and `remove_xattr`, and tmpfs keeps the attributes in memory. The calls take the `user.`, `trusted.` and `security.` namespaces, and check the names, the sizes and the flags as Linux. A `user.` attribute is only for a regular file, a directory or a socket, as Linux 6.17.
 - Named FIFOs. An open of a FIFO for read or for write waits until the other end opens, and `O_RDWR` does not wait. An open for write with `O_NONBLOCK` and no reader gives `ENXIO`. All opens of one FIFO share one pipe.
+- overlayfs, in the new crate `rk-fs-overlay`. A mount joins the lower directories of `lowerdir=` and the upper directory of `upperdir=`. The first change of a lower file copies it up, a removal makes a whiteout, and a new directory over a removed one is opaque. A mount without `upperdir=` is read only. A rename of a lower directory gives `EXDEV`, as Linux without `redirect_dir`. `MountArgs` gets `lookup`, so a file system type can find the paths of its options.
 - tools/ltp/build.sh builds the LTP tests of the xattr calls, `sendfile`, `splice`, `copy_file_range` and `posix_fadvise`. 55 of them pass and go in tools/ltp/tests.txt.
 
 ## [0.3.6] - 2026-10-25

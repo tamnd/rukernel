@@ -15,6 +15,7 @@ rk-block  2
 rk-net    2
 rk-fs-proc 3
 rk-fs-sys 3
+rk-fs-overlay 3
 rk-fs-ext4 3
 rk-fs-tmpfs 3
 rk-net-unix 3

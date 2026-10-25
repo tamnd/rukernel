@@ -15,6 +15,7 @@ members = [
     "fs/rk-vfs",
     "fs/rk-fs-proc",
     "fs/rk-fs-sys",
+    "fs/rk-fs-overlay",
     "fs/rk-fs-ext4",
     "fs/rk-fs-tmpfs",
     "kernel/rukernel",
@@ -52,6 +53,7 @@ rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.3.6" }
 rk-vfs = { path = "fs/rk-vfs", version = "0.3.6" }
 rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.3.6" }
 rk-fs-sys = { path = "fs/rk-fs-sys", version = "0.3.6" }
+rk-fs-overlay = { path = "fs/rk-fs-overlay", version = "0.3.6" }
 rk-fs-ext4 = { path = "fs/rk-fs-ext4", version = "0.3.6" }
 rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.3.6" }
 rk-net = { path = "net/rk-net", version = "0.3.6" }

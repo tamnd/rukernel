@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include <elf.h>
+#include <dirent.h>
 #include <errno.h>
 #include <sched.h>
 #include <setjmp.h>
@@ -1672,6 +1673,75 @@ static int read_small(const char *path, char *buf, int size)
 	return n;
 }
 
+/* Writes the string data to a new file at path. */
+static int put_file(const char *path, const char *data)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	int ok;
+
+	if (fd < 0)
+		return -1;
+	ok = write(fd, data, strlen(data)) == (ssize_t)strlen(data);
+	close(fd);
+	return ok ? 0 : -1;
+}
+
+/* Counts the entries of the directory at path, without . and .., or gives -1. */
+static int count_entries(const char *path)
+{
+	DIR *d = opendir(path);
+	struct dirent *e;
+	int n = 0;
+
+	if (!d)
+		return -1;
+	while ((e = readdir(d)))
+		if (strcmp(e->d_name, ".") && strcmp(e->d_name, ".."))
+			n++;
+	closedir(d);
+	return n;
+}
+
+static void test_overlay(void)
+{
+	struct statfs sfs;
+	struct stat st;
+	char buf[32];
+
+	mkdir("/ov", 0755);
+	check("mount a tmpfs for overlayfs", mount("tmpfs", "/ov", "tmpfs", 0, NULL) == 0);
+	mkdir("/ov/lower", 0755);
+	mkdir("/ov/upper", 0755);
+	mkdir("/ov/work", 0755);
+	mkdir("/ov/merged", 0755);
+	mkdir("/ov/lower/d", 0755);
+	put_file("/ov/lower/a", "lower");
+	put_file("/ov/lower/d/x", "x");
+	put_file("/ov/upper/b", "upper");
+	check("mount overlayfs", mount("overlay", "/ov/merged", "overlay", 0,
+				       "lowerdir=/ov/lower,upperdir=/ov/upper,workdir=/ov/work") == 0);
+	check("statfs of overlayfs gives OVERLAYFS_SUPER_MAGIC",
+	      statfs("/ov/merged", &sfs) == 0 && sfs.f_type == 0x794c7630);
+	check("overlayfs joins the layers", count_entries("/ov/merged") == 3);
+	check("overlayfs shows a lower file", read_small("/ov/merged/a", buf, sizeof(buf)) == 5 && strcmp(buf, "lower") == 0);
+	check("a write through overlayfs copies the file up", put_file("/ov/merged/a", "new") == 0 &&
+	      read_small("/ov/upper/a", buf, sizeof(buf)) == 3 && strcmp(buf, "new") == 0 &&
+	      read_small("/ov/lower/a", buf, sizeof(buf)) == 5);
+	check("an unlink through overlayfs makes a whiteout", unlink("/ov/merged/d/x") == 0 &&
+	      stat("/ov/upper/d/x", &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == 0 &&
+	      access("/ov/merged/d/x", F_OK) < 0 && access("/ov/lower/d/x", F_OK) == 0);
+	check("rmdir of an empty joined directory", rmdir("/ov/merged/d") == 0 && access("/ov/merged/d", F_OK) < 0);
+	check("a rename of a lower directory gives EXDEV", mkdir("/ov/lower/e", 0755) == 0 &&
+	      rename("/ov/merged/e", "/ov/merged/f") < 0 && errno == EXDEV);
+	check("umount overlayfs", umount("/ov/merged") == 0);
+	check("an overlay mount without an upper directory is read only",
+	      mount("overlay", "/ov/merged", "overlay", 0, "lowerdir=/ov/upper:/ov/lower") == 0 &&
+	      open("/ov/merged/n", O_WRONLY | O_CREAT, 0644) < 0 && errno == EROFS &&
+	      access("/ov/merged/d", F_OK) < 0 && access("/ov/merged/e", F_OK) == 0);
+	umount("/ov/merged");
+	umount("/ov");
+}
+
 static void test_sysfs(void)
 {
 	struct statfs sfs;
@@ -2314,6 +2384,7 @@ int main(int argc, char **argv)
 	test_sysfs();
 	test_xattr();
 	test_fifo();
+	test_overlay();
 	test_proc();
 	test_memfd();
 	test_shm();

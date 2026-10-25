@@ -161,7 +161,8 @@ fn make(
         }
         Some(meta.rdev)
     };
-    let args = fstype::MountArgs { data, dev, read_only };
+    let lookup = |path: &[u8]| Ok(fs.resolve(fs.cwd(), path, true)?.inode().clone());
+    let args = fstype::MountArgs { data, dev, read_only, lookup: Some(&lookup) };
     (ty.make)(&args)
 }
 

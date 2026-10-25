@@ -1,0 +1,21 @@
+[package]
+name = "rk-fs-overlay"
+description = "overlayfs for rukernel: a file system that joins a writable upper directory and read only lower directories."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+rk-vfs.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rk-fs-tmpfs.workspace = true
