@@ -30,6 +30,7 @@ pub mod layout;
 mod node;
 #[cfg(test)]
 mod tests;
+mod xattr;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
