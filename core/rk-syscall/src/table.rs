@@ -198,7 +198,12 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PRCTL => process::prctl(cx, a[0], [a[1], a[2], a[3], a[4]]),
         nr::SECCOMP => seccomp::seccomp(cx, a[0], a[1], a[2]),
         nr::ARCH_PRCTL => process::arch_prctl(cx, a[0], a[1]),
-        nr::SYNC => Ok(0),
+        nr::SYNC => {
+            // `sync` does not give an error, as in Linux.
+            let _ = rk_vfs::blockdev::sync_all();
+            Ok(0)
+        }
+        nr::SYNCFS => cx.file(a[0]).and_then(|_| rk_vfs::blockdev::sync_all().map(|()| 0)),
         nr::GETTID => Ok(u64::from(cx.thread.tid())),
         nr::TKILL => signal::tkill(cx, a[0], a[1]),
         nr::ALARM => timer::alarm(cx, a[0]),

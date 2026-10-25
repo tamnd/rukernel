@@ -6,13 +6,15 @@
 //! one request, and then the scheduler sends the requests to the device in its order.
 //!
 //! The drivers do each request before they return, so the queue sends all the requests of a batch
-//! before `submit` returns. The schedulers are `mq-deadline`, the default, and `none`.
+//! before `submit` returns. The schedulers are `mq-deadline`, the default, and `none`. The module
+//! `cache` has the page cache, which can be over a queue.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+pub mod cache;
 pub mod deadline;
 
 use alloc::collections::VecDeque;
@@ -298,6 +300,20 @@ impl Queue {
     pub fn flush(&self) -> Result<()> {
         self.stats.lock().flushes += 1;
         self.device.flush()
+    }
+}
+
+impl cache::Store for Arc<Queue> {
+    fn size(&self) -> u64 {
+        self.sectors() * SECTOR_SIZE as u64
+    }
+
+    fn submit(&self, bios: &mut [Bio]) {
+        Queue::submit(self, bios);
+    }
+
+    fn flush(&self) -> Result<()> {
+        Queue::flush(self)
     }
 }
 

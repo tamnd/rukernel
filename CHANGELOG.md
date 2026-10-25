@@ -11,6 +11,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The asynchronous I/O calls `io_setup`, `io_destroy`, `io_submit`, `io_cancel`, `io_getevents` and `io_pgetevents`. `io_submit` supports `IOCB_CMD_PREAD`, `IOCB_CMD_PWRITE`, `IOCB_CMD_PREADV`, `IOCB_CMD_PWRITEV`, `IOCB_CMD_FSYNC` and `IOCB_CMD_FDSYNC`, and `IOCB_FLAG_RESFD`. The reads and the writes of one block device in a call go to the block layer as one batch.
 - The shared memory of System V: `shmget`, `shmat`, `shmdt` and `shmctl` with `IPC_STAT`, `IPC_SET`, `IPC_RMID`, `IPC_INFO`, `SHM_INFO`, `SHM_STAT`, `SHM_LOCK` and `SHM_UNLOCK`.
 - tools/debug/build.sh adds fio. The `alpine` boot test runs fio with libaio and `--verify=crc32c` on a virtio-blk disk.
+- The page cache in `rk-block`. It keeps the data in folios of up to 64 KiB, and each page of a folio is up to date or dirty on its own. A read fills all of its folio in one batch. A write of a whole page does not read the page. The dirty pages go to the disk on `sync`, `syncfs`, `fsync`, `BLKFLSBUF`, and when the dirty data is above 4 MiB. When the cache holds more than 32 MiB, it drops the clean folios that were used least recently.
+- A block device file reads and writes through the page cache. A file with `O_DIRECT` goes to the request queue, and it first writes the dirty pages of its range to the disk.
+- `sync` and `syncfs` write the dirty pages of each disk.
+- The `blk` boot test writes 512 KiB through the page cache, calls `sync`, and then checks the data on the host.
 
 ## [0.3.1] - 2026-10-25
 
