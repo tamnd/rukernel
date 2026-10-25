@@ -144,6 +144,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::TRUNCATE => fs::truncate(cx, a[0], a[1]),
         nr::FTRUNCATE => fs::ftruncate(cx, a[0], a[1]),
         nr::FALLOCATE => fs::fallocate(cx, a[0], a[1], a[2], a[3]),
+        nr::SYNC_FILE_RANGE => fs::sync_file_range(cx, a[0], a[1], a[2], a[3]),
         nr::GETCWD => fs::getcwd(cx, a[0], a[1]),
         nr::CHDIR => fs::chdir(cx, a[0]),
         nr::FCHDIR => fs::fchdir(cx, a[0]),

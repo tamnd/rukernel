@@ -584,14 +584,13 @@ impl File {
             Whence::Set => 0u64.checked_add_signed(offset),
             Whence::Current => pos.checked_add_signed(offset),
             Whence::End => end()?.checked_add_signed(offset),
-            // As the generic code of Linux, all the file is data and the end is the only hole.
             Whence::Data | Whence::Hole => {
                 let size = end()?;
                 let at = u64::try_from(offset).map_err(|_| Errno::ENXIO)?;
                 if at >= size {
                     return Err(Errno::ENXIO);
                 }
-                Some(if whence == Whence::Data { at } else { size })
+                Some(self.seek_extent(at, size, whence == Whence::Data)?)
             }
         };
         let new = new.ok_or(Errno::EINVAL)?;
@@ -600,6 +599,30 @@ impl File {
         }
         *pos = new;
         Ok(new)
+    }
+
+    /// Gives the next data or the next hole at or after `at`, for an offset before `size`. The
+    /// extents of the inode give the holes. An unwritten extent is a hole. Without the extents,
+    /// as the generic code of Linux, all the file is data and the end is the only hole.
+    fn seek_extent(&self, at: u64, size: u64, data: bool) -> Result<u64> {
+        let extents = match self.inode.as_ref().map(|i| i.fiemap(at, u64::MAX - at)) {
+            Some(Ok(extents)) => extents,
+            None | Some(Err(Errno::EOPNOTSUPP)) => return Ok(if data { at } else { size }),
+            Some(Err(e)) => return Err(e),
+        };
+        let mut written = extents.iter().filter(|e| !e.unwritten);
+        if data {
+            let next = written.find(|e| e.logical + e.length > at).map(|e| e.logical.max(at));
+            return next.filter(|&next| next < size).ok_or(Errno::ENXIO);
+        }
+        let mut pos = at;
+        for e in written {
+            if e.logical > pos {
+                break;
+            }
+            pos = pos.max(e.logical + e.length);
+        }
+        Ok(pos.min(size))
     }
 
     /// `fsync` and `fdatasync`. The inode makes its changes durable, and then the file.
