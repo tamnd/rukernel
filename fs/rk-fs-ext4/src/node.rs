@@ -688,13 +688,18 @@ impl Tx<'_> {
     }
 
     /// Frees the orphans that a crash left, at mount, as `ext4_orphan_cleanup`. An orphan that
-    /// has links again leaves the list.
+    /// has links again leaves the list. A reserved inode, an inode past the end, or an inode
+    /// that is not in use ends the list, and the driver does not change it, as Linux.
     pub(crate) fn clean_orphans(&mut self) -> Result<()> {
         let fs = self.fs;
         for _ in 0..fs.inodes_count() {
             let ino = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
             if ino == 0 {
                 break;
+            }
+            if ino < fs.sb.first_ino || ino > fs.inodes_count() || !self.inode_in_use(ino)? {
+                layout::put32(&mut self.meta.sb, layout::sb::LAST_ORPHAN, 0);
+                return self.write_sb(0, 0);
             }
             let mut raw = fs.read_inode(ino)?;
             if raw.links() == 0 {

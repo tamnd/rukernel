@@ -1088,3 +1088,19 @@ fn an_online_resize_adds_a_group() {
     let last = root.create(b"last", FileType::Regular, 0o644, 0).unwrap();
     assert!(last.metadata().ino > 32);
 }
+
+#[test]
+fn a_bad_orphan_ends_the_list_and_stays() {
+    // The inode 2 is reserved, and the inode 20 is not in use.
+    for ino in [2, 5, 20, 99] {
+        let mut img = image();
+        img[1024 + 0xe8..1024 + 0xec].copy_from_slice(&(ino as u32).to_le_bytes());
+        let ram = Ram(Arc::new(SpinLock::new(img)));
+        let free = ram.free();
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        drop(fs);
+        assert_eq!(ram.u32_at(1024 + 0xe8), 0);
+        assert_eq!(ram.free(), free);
+        assert_eq!(again(&ram).root().unwrap().metadata().nlink, 4);
+    }
+}
