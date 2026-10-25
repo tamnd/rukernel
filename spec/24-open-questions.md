@@ -56,17 +56,7 @@ If they would, rukernel builds on OSTD and contributes back. If not, `rk-frame` 
 
 ## 4. Speculative frame references for GUP-fast
 
-**The question.** Linux's lockless `get_user_pages_fast` walks user page tables without locks and takes speculative references on folios that may be freed concurrently, relying on RCU table freeing and on `folio_try_get` failing on a zero count. Can that be expressed with `rk-frame`'s typed frame handles, and can it be verified?
-
-GUP-fast is on the path of direct I/O, io_uring fixed buffers, RDMA, vhost and futexes, so a slower locked walk shows up in storage and network benchmarks.
-
-**The options:**
-
-- a verified speculative reference API in `rk-frame` (preferred);
-- a locked walk with the per VMA lock and accepting the cost;
-- pinning registered buffers ahead of time, which is what io_uring fixed buffers do anyway, and accepting the cost only on unregistered paths.
-
-**Deadline:** R3, measured with `fio` direct I/O.
+**Decided in R3: no speculative references yet.** Direct I/O copies through a kernel buffer, with a page table walk that takes no frame references. Under QEMU with no KVM, fio direct I/O takes about 2.5 ms for each 4 KiB request, and the copy is less than 1% of it. Zero copy direct I/O will pin frames under the per VMA lock, and io_uring fixed buffers pin at registration. The question opens again when `rukernel-bench` shows the locked walk as a red row on hardware (R8). Document 07.13 and the settled decisions of document 00 have the decision and the numbers.
 
 ## 5. BTF shadows for sched_ext
 
