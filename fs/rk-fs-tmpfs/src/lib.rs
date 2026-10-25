@@ -247,6 +247,11 @@ impl Inode for Node {
         Ok(())
     }
 
+    fn set_atime(&self, time: Timespec) -> Result<()> {
+        self.attrs.lock().atime = time;
+        Ok(())
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         match &*self.data.lock() {
             Data::File(d) => {

@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use rk_abi::Errno;
+use rk_abi::native::mount;
 use rk_abi::native::open as o;
 use rk_frame::sync::SpinLock;
 
@@ -190,6 +191,8 @@ impl FileOps for InodeFile {
         let mut pos = file.pos.lock();
         let n = inode.read_at(*pos, buf)?;
         *pos += n as u64;
+        drop(pos);
+        file.accessed();
         Ok(n)
     }
 
@@ -209,7 +212,9 @@ impl FileOps for InodeFile {
         if inode.metadata().is_dir() {
             return Err(Errno::EISDIR);
         }
-        inode.read_at(offset, buf)
+        let n = inode.read_at(offset, buf)?;
+        file.accessed();
+        Ok(n)
     }
 
     fn write_at(&self, file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
@@ -475,7 +480,42 @@ impl File {
             used += len;
             *pos = next;
         }
+        drop(pos);
+        self.accessed();
         Ok(used)
+    }
+
+    /// Updates the access time after a read, with the rules of `atime_needs_update` of Linux.
+    /// A noatime mount, a nodiratime mount for a directory, a read-only mount and `O_NOATIME`
+    /// keep the time. A relatime mount, the default, updates the time only if it is not after
+    /// the modification time or the change time, or if it is one day old. An error is ignored,
+    /// as Linux does.
+    fn accessed(&self) {
+        const DAY: i64 = 24 * 60 * 60;
+        let (Some(location), Some(inode)) = (self.location(), self.inode()) else {
+            return;
+        };
+        if self.flags.load(Ordering::Relaxed) & o::O_NOATIME != 0 {
+            return;
+        }
+        let flags = location.mount.flags() as u32;
+        let meta = inode.metadata();
+        if flags & (mount::MS_NOATIME | mount::MS_RDONLY) != 0
+            || (meta.is_dir() && flags & mount::MS_NODIRATIME != 0)
+        {
+            return;
+        }
+        let now = crate::inode::now();
+        if flags & mount::MS_STRICTATIME == 0
+            && meta.atime > meta.mtime
+            && meta.atime > meta.ctime
+            && now.sec - meta.atime.sec < DAY
+        {
+            return;
+        }
+        if meta.atime != now {
+            let _ = inode.set_atime(now);
+        }
     }
 }
 

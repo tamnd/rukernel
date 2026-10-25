@@ -29,7 +29,7 @@ use rk_abi::native::mount::{
     MOVE_MOUNT_T_AUTOMOUNTS, MOVE_MOUNT_T_EMPTY_PATH, MOVE_MOUNT_T_SYMLINKS, MS_BIND, MS_DIRSYNC,
     MS_MGC_MSK, MS_MGC_VAL, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
     MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SLAVE,
-    MS_SYNCHRONOUS, MS_UNBINDABLE, OPEN_TREE_CLONE,
+    MS_STRICTATIME, MS_SYNCHRONOUS, MS_UNBINDABLE, OPEN_TREE_CLONE,
 };
 use rk_abi::native::open::{O_CLOEXEC, O_PATH, O_RDWR};
 use rk_frame::sync::SpinLock;
@@ -54,6 +54,7 @@ const KEPT: u32 = MS_RDONLY
     | MS_NOATIME
     | MS_NODIRATIME
     | MS_RELATIME
+    | MS_STRICTATIME
     | MS_NOSYMFOLLOW;
 
 /// The most bytes of the data string. Linux copies one page.
@@ -83,7 +84,8 @@ pub(crate) fn mount(
         if !at.is_mount_root() {
             return Err(Errno::EINVAL);
         }
-        at.mount.set_flags(u64::from(flags & KEPT));
+        let old = at.mount.flags() as u32;
+        at.mount.set_flags(u64::from(atime_flags(flags, Some(old)) & KEPT));
         return Ok(0);
     }
     if flags & MS_BIND != 0 {
@@ -113,9 +115,31 @@ pub(crate) fn mount(
         addr => vm.read_cstr(addr as usize, PATH_MAX)?,
     };
     let root = make(&fs, ty, &source, &data, flags & MS_RDONLY != 0)?;
-    let source = MountSource { source, fstype: ty.name, flags: u64::from(flags & KEPT) };
+    let flags = atime_flags(flags, None) & KEPT;
+    let source = MountSource { source, fstype: ty.name, flags: u64::from(flags) };
     ns.mount(root, &at, source)?;
     Ok(0)
+}
+
+/// Sets the atime flags of `mount(2)` as Linux does. A mount is relatime unless it is noatime or
+/// strictatime. A remount that gives no atime flag keeps the atime flags of the mount, in `old`.
+/// The mount keeps `MS_STRICTATIME`, so the VFS can tell a strictatime mount from a mount that the
+/// kernel made with no flags.
+fn atime_flags(flags: u32, old: Option<u32>) -> u32 {
+    let atime = MS_NOATIME | MS_NODIRATIME | MS_RELATIME | MS_STRICTATIME;
+    if let Some(old) = old
+        && flags & atime == 0
+    {
+        return flags | (old & atime);
+    }
+    let mut flags = flags;
+    if flags & MS_NOATIME == 0 {
+        flags |= MS_RELATIME;
+    }
+    if flags & MS_STRICTATIME != 0 {
+        flags &= !(MS_RELATIME | MS_NOATIME);
+    }
+    flags
 }
 
 /// Makes a file system of the type `ty` and gives its root. A file system on a disk has the
@@ -380,7 +404,7 @@ fn attr_flags(attr: u32) -> Result<u32, Errno> {
     let mut flags = match attr & MOUNT_ATTR__ATIME {
         MOUNT_ATTR_RELATIME => MS_RELATIME,
         MOUNT_ATTR_NOATIME => MS_NOATIME,
-        MOUNT_ATTR_STRICTATIME => 0,
+        MOUNT_ATTR_STRICTATIME => MS_STRICTATIME,
         _ => return Err(Errno::EINVAL),
     };
     for (a, ms) in pairs {

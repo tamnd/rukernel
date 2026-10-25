@@ -675,6 +675,13 @@ impl Inode for Node {
         tx.save(self, raw)
     }
 
+    fn set_atime(&self, time: Timespec) -> Result<()> {
+        let mut tx = self.fs.tx()?;
+        let mut raw = self.raw();
+        raw.set_time(0x8, 0x8c, time.sec, time.nsec);
+        tx.save(self, raw)
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         match self.kind() {
             FileType::Regular => self.fs.read_data(&self.raw(), offset, buf),

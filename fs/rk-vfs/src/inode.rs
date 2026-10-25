@@ -215,6 +215,13 @@ pub trait Inode: Any + Send + Sync {
     /// Changes the attributes. A change of the size is for a regular file only.
     fn set_attr(&self, attr: &SetAttr) -> Result<()>;
 
+    /// Sets the access time after a read, and does not change the change time, as
+    /// `touch_atime` of Linux. The default does nothing, for a file system that keeps no access
+    /// time.
+    fn set_atime(&self, _time: Timespec) -> Result<()> {
+        Ok(())
+    }
+
     /// Reads the data of a regular file at `offset`. Gives the number of bytes read, which is 0
     /// at the end of the file.
     fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize> {

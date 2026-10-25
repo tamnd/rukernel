@@ -1485,6 +1485,107 @@ static void test_symlink_chain(void)
 	unlink("/tmp/chain");
 }
 
+/* sendfile, splice and copy_file_range copy data in the kernel. fadvise64 checks its advice. */
+static void test_splice(void)
+{
+	char buf[16] = {0};
+	int in, out, null, p[2];
+	long long off = 2;
+
+	mkdir("/tmp", 0755);
+	in = open("/tmp/sp_in", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	out = open("/tmp/sp_out", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	check("write the source of the copies", write(in, "abcdefgh", 8) == 8);
+	check("sendfile at an offset copies 4 bytes",
+	      syscall(SYS_sendfile, out, in, &off, 4) == 4 && off == 6);
+	check("sendfile at an offset keeps the position", lseek(in, 0, SEEK_CUR) == 8);
+	check("sendfile writes at the position of the output",
+	      pread(out, buf, sizeof(buf), 0) == 4 && memcmp(buf, "cdef", 4) == 0);
+	check("pipe for splice", pipe(p) == 0);
+	off = 0;
+	check("splice from a file to a pipe",
+	      syscall(SYS_splice, in, &off, p[1], NULL, 8, 0) == 8 && off == 8);
+	errno = 0;
+	check("splice with an offset for a pipe gives ESPIPE",
+	      syscall(SYS_splice, p[0], &off, out, NULL, 8, 0) == -1 && errno == ESPIPE);
+	off = 0;
+	check("splice from a pipe to a file",
+	      syscall(SYS_splice, p[0], NULL, out, &off, 8, 0) == 8 && off == 8);
+	memset(buf, 0, sizeof(buf));
+	check("splice writes the data of the pipe",
+	      pread(out, buf, sizeof(buf), 0) == 8 && memcmp(buf, "abcdefgh", 8) == 0);
+	errno = 0;
+	check("splice without a pipe gives EINVAL",
+	      syscall(SYS_splice, in, NULL, out, NULL, 8, 0) == -1 && errno == EINVAL);
+	check("write to the pipe", write(p[1], "xyz", 3) == 3);
+	close(p[1]);
+	null = open("/dev/null", O_WRONLY);
+	check("splice to /dev/null drains the pipe",
+	      syscall(SYS_splice, p[0], NULL, null, NULL, 4096, 0) == 3);
+	close(null);
+	close(p[0]);
+	lseek(in, 1, SEEK_SET);
+	lseek(out, 0, SEEK_SET);
+	check("copy_file_range at the positions copies 3 bytes",
+	      syscall(SYS_copy_file_range, in, NULL, out, NULL, 3, 0) == 3);
+	check("copy_file_range moves the positions",
+	      lseek(in, 0, SEEK_CUR) == 4 && lseek(out, 0, SEEK_CUR) == 3);
+	memset(buf, 0, sizeof(buf));
+	check("copy_file_range writes the data",
+	      pread(out, buf, sizeof(buf), 0) == 8 && memcmp(buf, "bcddefgh", 8) == 0);
+	off = 0;
+	errno = 0;
+	check("copy_file_range of ranges that overlap gives EINVAL",
+	      syscall(SYS_copy_file_range, in, &off, in, NULL, 8, 0) == -1 && errno == EINVAL);
+	errno = 0;
+	check("copy_file_range with flags gives EINVAL",
+	      syscall(SYS_copy_file_range, in, NULL, out, NULL, 1, 1) == -1 && errno == EINVAL);
+	check("fadvise64 with a valid advice", syscall(SYS_fadvise64, in, 0, 0, 2) == 0);
+	errno = 0;
+	check("fadvise64 with a bad advice gives EINVAL",
+	      syscall(SYS_fadvise64, in, 0, 0, 99) == -1 && errno == EINVAL);
+	close(in);
+	close(out);
+	unlink("/tmp/sp_in");
+	unlink("/tmp/sp_out");
+}
+
+/* A read updates the access time with the relatime rules. A noatime mount keeps it. */
+static void test_atime(void)
+{
+	struct timespec old[2] = {{1000, 0}, {2000, 0}};
+	struct stat st1, st2;
+	char buf[4];
+	int fd;
+
+	mkdir("/tmp", 0755);
+	fd = open("/tmp/at", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	check("write a file for atime", write(fd, "abc", 3) == 3);
+	check("utimensat sets an old atime", futimens(fd, old) == 0);
+	check("read for atime", pread(fd, buf, 3, 0) == 3);
+	fstat(fd, &st1);
+	check("a read updates an atime that is before the mtime", st1.st_atime > 2000);
+	check("pread of the file again", pread(fd, buf, 3, 0) == 3);
+	fstat(fd, &st2);
+	check("relatime keeps an atime that is after the mtime and the ctime",
+	      st2.st_atim.tv_sec == st1.st_atim.tv_sec && st2.st_atim.tv_nsec == st1.st_atim.tv_nsec);
+	close(fd);
+	unlink("/tmp/at");
+
+	mkdir("/mnt", 0755);
+	check("mount tmpfs noatime", mount("none", "/mnt", "tmpfs", MS_NOATIME, NULL) == 0);
+	fd = open("/mnt/at", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	check("write a file on a noatime mount", write(fd, "abc", 3) == 3);
+	check("utimensat on a noatime mount", futimens(fd, old) == 0);
+	check("read on a noatime mount", pread(fd, buf, 3, 0) == 3);
+	fstat(fd, &st1);
+	check("a noatime mount keeps the atime", st1.st_atime == 1000);
+	close(fd);
+	unlink("/mnt/at");
+	umount("/mnt");
+	rmdir("/mnt");
+}
+
 /* The calls and the flags of the new mount API, from <linux/mount.h>. */
 #ifndef SYS_fsopen
 #define SYS_open_tree 428
@@ -1770,7 +1871,7 @@ static void test_proc(void)
 	check("/proc/self/cmdline", read_file("/proc/self/cmdline", buf, sizeof(buf)) > 0 && !strcmp(buf, "/init"));
 	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n") &&
 						   strstr(buf, "[vvar]\n") && strstr(buf, "[vdso]\n"));
-	check("/proc/mounts", read_file("/proc/mounts", buf, sizeof(buf)) > 0 && strstr(buf, "proc /proc proc rw 0 0\n"));
+	check("/proc/mounts", read_file("/proc/mounts", buf, sizeof(buf)) > 0 && strstr(buf, "proc /proc proc rw,relatime 0 0\n"));
 	n = readlink("/proc/self/exe", link, sizeof(link) - 1);
 	check("/proc/self/exe", n == 5 && !strncmp(link, "/init", 5));
 	fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
@@ -2085,6 +2186,8 @@ int main(int argc, char **argv)
 	test_mount();
 	test_mount_api();
 	test_symlink_chain();
+	test_splice();
+	test_atime();
 	test_proc();
 	test_memfd();
 	test_shm();

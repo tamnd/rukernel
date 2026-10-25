@@ -166,6 +166,11 @@ impl Mount {
         self.source.lock().clone()
     }
 
+    /// The flags: `MS_RDONLY`, `MS_NOATIME` and the others.
+    pub fn flags(&self) -> u64 {
+        self.source.lock().flags
+    }
+
     /// Sets the flags, for `MS_REMOUNT`.
     pub fn set_flags(&self, flags: u64) {
         self.source.lock().flags = flags;

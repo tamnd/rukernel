@@ -3,7 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use crate::{
     aio, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace,
-    sched, seccomp, shm, signal, signalfd, timer, timerfd,
+    sched, seccomp, shm, signal, signalfd, splice, timer, timerfd,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -290,6 +290,10 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::KCMP => process::kcmp(a[0], a[1], a[2], a[3], a[4]),
         nr::PIDFD_OPEN => pidfd::pidfd_open(cx, a[0], a[1]),
         nr::PIDFD_SEND_SIGNAL => pidfd::pidfd_send_signal(cx, a[0], a[1], a[2], a[3]),
+        nr::SENDFILE => splice::sendfile(cx, a[0], a[1], a[2], a[3]),
+        nr::SPLICE => splice::splice(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::COPY_FILE_RANGE => splice::copy_file_range(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::FADVISE64 => splice::fadvise64(cx, a[0], a[1], a[2], a[3]),
         nr::PIDFD_GETFD => pidfd::pidfd_getfd(cx, a[0], a[1], a[2]),
         _ => Err(Errno::ENOSYS),
     }

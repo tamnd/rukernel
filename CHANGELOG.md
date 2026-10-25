@@ -2,6 +2,18 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `sendfile`, `splice`, `copy_file_range` and `fadvise64`. The copy calls copy through a buffer in the kernel. `splice` needs a pipe on one side, as Linux. `fadvise64` checks its arguments and does nothing else. GNU grep uses `splice` to empty a pipe into `/dev/null`, and it failed with `ENOSYS` in fstests before this change.
+- A read updates the access time of a file, and `getdents64` updates the access time of a directory, with the rules of Linux. A mount is relatime by default, and `noatime`, `nodiratime`, `strictatime`, a read only mount and `O_NOATIME` change the update. A remount without an atime flag keeps the atime flags of the mount. The `Inode` trait gets `set_atime`, which does not change the change time.
+- The `fstests` boot test prints the diff and the end of the full log of each test that fails.
+
+### Fixed
+
+- `rk-fs-ext4` added the blocks of the extent tree to `i_blocks` again each time it wrote the tree, so `e2fsck` found a wrong `i_blocks` after generic/013 of fstests.
+
 ## [0.3.5] - 2026-10-25
 
 ### Added

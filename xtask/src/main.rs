@@ -1016,7 +1016,8 @@ fn fstests_tests() -> Result<Vec<String>> {
 
 /// The script that the `fstests` boot test runs as init. The first disk is the test device and
 /// the second disk is the scratch device. The script makes an ext4 file system on the test device
-/// and runs `check` with `tests`. The output of `check` goes to the console. `check` exits with 0
+/// and runs `check` with `tests`. The output of `check` goes to the console, with the difference
+/// of the output and the end of the full log of each test that fails. `check` exits with 0
 /// when no test fails. A test that does not apply does not fail.
 fn fstests_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
@@ -1039,6 +1040,13 @@ fn fstests_script(tests: &[String]) -> String {
         " > /tmp/check.log 2>&1\n",
         "code=$?\n",
         "sed 's/^/fstests: /' /tmp/check.log\n",
+        // The difference of the output and the end of the full log of each test that failed.
+        "for f in results/*/*.out.bad; do\n",
+        "    [ -e \"$f\" ] || continue\n",
+        "    t=${f#results/}; t=${t%.out.bad}\n",
+        "    diff -u \"tests/$t.out\" \"$f\" | head -n 60\n",
+        "    [ -e \"results/$t.full\" ] && tail -n 40 \"results/$t.full\"\n",
+        "done 2>&1 | sed 's/^/fstests: /'\n",
         "exit $code\n",
     ));
     script
