@@ -203,6 +203,8 @@ pub struct Fs {
     /// The mount option `minixdf`: `statfs` counts the blocks of the metadata in the count of
     /// blocks.
     minix_df: AtomicBool,
+    /// `FS_IOC_GOINGDOWN` stopped the file system. Nothing goes to the disk again.
+    shut: AtomicBool,
     this: Weak<Fs>,
 }
 
@@ -286,6 +288,7 @@ impl Fs {
             committed: SpinLock::new(rk_vfs::now().sec),
             inodes: SpinLock::new(BTreeMap::new()),
             minix_df: AtomicBool::new(false),
+            shut: AtomicBool::new(false),
             this: Weak::new(),
         };
         if journal {
@@ -301,12 +304,14 @@ impl Fs {
     ///
     /// # Errors
     ///
-    /// Gives `EROFS` for a read only mount.
+    /// Gives `EROFS` for a read only mount, and `EIO` after a shutdown.
     pub(crate) fn tx(&self) -> Result<Tx<'_>> {
         if !self.writable {
             return Err(Errno::EROFS);
         }
-        Ok(Tx { fs: self, meta: self.meta.lock() })
+        let meta = self.meta.lock();
+        self.check_shut()?;
+        Ok(Tx { fs: self, meta })
     }
 
     /// Tells if the metadata has crc32c checksums.
@@ -369,6 +374,9 @@ impl Fs {
     /// take the blocks, they go to their places at once.
     fn commit(&self, force: bool) {
         let Some(log) = &self.log else { return };
+        if self.shut.load(Ordering::Relaxed) {
+            return;
+        }
         let now = rk_vfs::now().sec;
         let mut log = log.lock();
         let blocks = {
@@ -392,6 +400,7 @@ impl Fs {
 
     /// Makes all the changes durable, for `fsync` and `sync`.
     pub(crate) fn sync(&self) -> Result<()> {
+        self.check_shut()?;
         if !self.writable {
             return Ok(());
         }
@@ -601,9 +610,42 @@ impl Fs {
     /// cleared.
     fn finish(&self) -> Result<()> {
         let Some(log) = &self.log else { return Ok(()) };
+        // After a shutdown the disk stays as a crash leaves it, and the next mount replays the
+        // journal.
+        if self.shut.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.commit(true);
         log.lock().checkpoint(self)?;
         self.mark_recover(false)
+    }
+
+    /// Gives `EIO` after a shutdown.
+    pub(crate) fn check_shut(&self) -> Result<()> {
+        if self.shut.load(Ordering::Relaxed) { Err(Errno::EIO) } else { Ok(()) }
+    }
+
+    /// Stops the file system for `FS_IOC_GOINGDOWN`. After it, a change, a read of the data of a
+    /// file, and `fsync` give `EIO`, and nothing goes to the disk again. `DEFAULT` and
+    /// `LOGFLUSH` first make the changes durable, and `NOLOGFLUSH` loses the changes since the
+    /// last commit.
+    pub(crate) fn shutdown(&self, flags: u32) -> Result<()> {
+        use rk_vfs::inode::shutdown::{DEFAULT, LOGFLUSH, NOLOGFLUSH};
+        if !matches!(flags, DEFAULT | LOGFLUSH | NOLOGFLUSH) {
+            return Err(Errno::EINVAL);
+        }
+        if self.shut.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if flags != NOLOGFLUSH {
+            // As Linux, an error of the disk does not stop the shutdown.
+            let _ = self.sync();
+        }
+        // The lock waits for a running change, so it does not go to the disk after this.
+        let meta = self.meta.lock();
+        self.shut.store(true, Ordering::Relaxed);
+        drop(meta);
+        Ok(())
     }
 
     /// Adds the inode `ino` without links to the inodes to free, and frees them if no change

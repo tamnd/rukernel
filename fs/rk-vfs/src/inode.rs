@@ -262,6 +262,12 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Stops all the changes of the file system of the inode, as a crash does, for
+    /// `FS_IOC_GOINGDOWN`. `flags` is one of [`shutdown`]. The default gives `ENOTTY`.
+    fn shutdown(&self, _flags: u32) -> Result<()> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
@@ -376,6 +382,16 @@ pub struct FiemapExtent {
     pub length: u64,
     /// The extent has blocks that are not written, and it reads as zeros.
     pub unwritten: bool,
+}
+
+/// The flags of `FS_IOC_GOINGDOWN`, from `<linux/fs.h>`.
+pub mod shutdown {
+    /// Writes all the changes, and then stops.
+    pub const DEFAULT: u32 = 0;
+    /// Writes the changes that the journal has, and then stops.
+    pub const LOGFLUSH: u32 = 1;
+    /// Stops at once. The changes that are not durable are lost.
+    pub const NOLOGFLUSH: u32 = 2;
 }
 
 /// The inode flags of `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`, from `<linux/fs.h>`. `chattr`

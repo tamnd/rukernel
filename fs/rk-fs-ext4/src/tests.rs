@@ -820,6 +820,33 @@ mod log {
     }
 
     #[test]
+    fn a_shutdown_stops_the_changes() {
+        use rk_vfs::inode::shutdown::{LOGFLUSH, NOLOGFLUSH};
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        let kept = root.create(b"kept", FileType::Regular, 0o644, 0).unwrap();
+        kept.write_at(0, b"data").unwrap();
+        root.sync().unwrap();
+        // A change of one block stays in memory until the next commit.
+        kept.set_attr(&SetAttr { mode: Some(0o600), ..SetAttr::default() }).unwrap();
+        assert_eq!(root.shutdown(3), Err(Errno::EINVAL));
+        root.shutdown(NOLOGFLUSH).unwrap();
+        root.shutdown(LOGFLUSH).unwrap();
+        assert_eq!(root.create(b"new", FileType::Regular, 0o644, 0).err(), Some(Errno::EIO));
+        assert_eq!(kept.read_at(0, &mut [0u8; 4]), Err(Errno::EIO));
+        assert_eq!(kept.sync(), Err(Errno::EIO));
+        drop((kept, root, fs));
+        // The unmount leaves the journal, and the mount replays it without the lost change.
+        let disk = ram.0.lock().clone();
+        assert_ne!(layout::u32_at(&disk, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let kept = fs.root().unwrap().lookup(b"kept").unwrap();
+        assert_eq!(read_all(&*kept), b"data");
+        assert_eq!(kept.metadata().mode & 0o777, 0o644);
+    }
+
+    #[test]
     fn the_unmount_leaves_a_clean_journal() {
         let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
         let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
