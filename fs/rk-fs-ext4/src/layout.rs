@@ -64,6 +64,12 @@ pub mod ro_compat {
         SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE | METADATA_CSUM;
 }
 
+/// The compatible features.
+pub mod compat {
+    /// The file system has a journal.
+    pub const HAS_JOURNAL: u32 = 0x4;
+}
+
 /// The flags of a group descriptor.
 pub mod bg {
     /// The inode bitmap is not on the disk. It has no inode in use.
@@ -180,6 +186,8 @@ pub struct Superblock {
     pub uuid: [u8; 16],
     /// The seed of the crc32c checksums, if the superblock has it.
     pub checksum_seed: u32,
+    /// The inode of the journal, or 0.
+    pub journal_inum: u32,
 }
 
 impl Superblock {
@@ -224,6 +232,7 @@ impl Superblock {
             want_extra_isize: u16_at(b, 0x15e),
             uuid: b[0x68..0x78].try_into().map_err(|_| Errno::EINVAL)?,
             checksum_seed: u32_at(b, 0x270),
+            journal_inum: u32_at(b, 0xe0),
         };
         if sb.blocks_per_group == 0
             || sb.inodes_per_group == 0

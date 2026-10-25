@@ -8,7 +8,8 @@
 //! A read and write mount changes the bitmaps, the group descriptors, the inodes, the extent trees
 //! and the directories, and it writes the checksums of `metadata_csum` or `uninit_bg`. Each change
 //! goes to the page cache at once, under one lock for the file system, so `sync` makes the disk
-//! consistent. The driver does not write the journal yet. A new entry in a directory with an htree
+//! consistent. The driver does not write the journal yet, but at mount it replays a journal that
+//! Linux or e2fsprogs left with transactions. A new entry in a directory with an htree
 //! index first changes the directory into a list. A file with a block map can change in its
 //! blocks, but it cannot get new blocks.
 
@@ -21,6 +22,7 @@ mod alloc_blocks;
 pub mod crc;
 mod dir;
 mod extent;
+mod journal;
 pub mod layout;
 mod node;
 #[cfg(test)]
@@ -147,9 +149,21 @@ impl Fs {
     /// # Errors
     ///
     /// Gives the error of the disk, `EINVAL` for a disk without ext4, `EOPNOTSUPP` for a feature
-    /// that the driver does not support, and `EROFS` if `read_only` is false and the driver can
-    /// only read the disk.
+    /// that the driver does not support, `EUCLEAN` for a bad journal, and `EROFS` if `read_only`
+    /// is false and the driver can only read the disk. A journal with transactions is replayed
+    /// first.
     pub fn open(dev: u64, disk: alloc::boxed::Box<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
+        let fs = Self::load(dev, disk, read_only)?;
+        if fs.sb.incompat & layout::incompat::RECOVER == 0 {
+            return Ok(fs);
+        }
+        // As Linux, a read only mount also replays the journal.
+        fs.recover()?;
+        let fs = Arc::try_unwrap(fs).map_err(|_| Errno::EIO)?;
+        Self::load(dev, fs.disk, read_only)
+    }
+
+    fn load(dev: u64, disk: alloc::boxed::Box<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
         let mut b = vec![0u8; layout::SUPERBLOCK_SIZE];
         disk.read(layout::SUPERBLOCK_AT, &mut b)?;
         let sb = Superblock::parse(&b)?;
@@ -157,7 +171,7 @@ impl Fs {
             return Err(Errno::EOPNOTSUPP);
         }
         let can_write = sb.ro_compat & !layout::ro_compat::WRITABLE == 0
-            && sb.incompat & (layout::incompat::RECOVER | layout::incompat::MMP) == 0
+            && sb.incompat & layout::incompat::MMP == 0
             && sb.incompat & layout::incompat::EXTENTS != 0
             && sb.block_size <= 4096;
         if !read_only && !can_write {

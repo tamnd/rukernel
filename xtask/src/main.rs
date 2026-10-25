@@ -698,6 +698,18 @@ if [ -x /usr/bin/gdb ]; then
     test ! -e /mnt/many -a ! -e /mnt/d/f7 -a -e /mnt/d/f300
     umount /mnt
     echo 'alpine: ext4 write done'
+    bs=$(dumpe2fs -h /dev/vdb 2>/dev/null | sed -n 's/^Block size: *//p')
+    blk=$(debugfs -R 'bmap /d/f300 0' /dev/vdb 2>/dev/null)
+    { printf 'abc\\n'; head -c $((bs - 4)) /dev/zero; } > /tmp/jblk
+    printf 'jo\\njw -b %s /tmp/jblk\\njc\\n' $blk > /tmp/j.cmd
+    debugfs -w -f /tmp/j.cmd /dev/vdb >/dev/null 2>&1
+    dumpe2fs -h /dev/vdb 2>/dev/null | grep -q needs_recovery
+    mount -t ext4 -o ro /dev/vdb /mnt
+    test \"$(cat /mnt/d/f300)\" = abc
+    umount /mnt
+    ! dumpe2fs -h /dev/vdb 2>/dev/null | grep -q needs_recovery
+    e2fsck -fn /dev/vdb
+    echo 'alpine: ext4 journal replay done'
 fi
 echo 'alpine: done'
 ",

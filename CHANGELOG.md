@@ -2,6 +2,13 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `rk-fs-ext4` replays the jbd2 journal at mount, as `jbd2_journal_recover` of Linux. It supports the revoke records, 64 bit block numbers, and the checksums of `CSUM_V2` and `CSUM_V3`. A transaction with a bad commit block ends the log, and a copy with a bad checksum is not written. A read only mount also replays the journal. Then the driver marks the journal empty and clears `needs_recovery`.
+- tools/debug/build.sh adds e2fsprogs-extra, which has debugfs, dumpe2fs and tune2fs. The `alpine` boot test writes a transaction with debugfs, mounts the disk, and checks that the kernel replayed it.
+
 ## [0.3.3] - 2026-10-25
 
 ### Added

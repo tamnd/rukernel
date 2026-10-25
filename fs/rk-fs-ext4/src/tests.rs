@@ -451,3 +451,152 @@ fn a_block_map_file_changes_only_in_its_blocks() {
     old.write_at(5, b"in").unwrap();
     assert_eq!(old.write_at(2 * BS as u64, b"hole"), Err(Errno::EOPNOTSUPP));
 }
+
+mod log {
+    use super::*;
+    use crate::journal::{MAGIC, be32, feature, jsb, put_be32};
+
+    /// The journal has 16 blocks from the block 44 of the disk.
+    const AT: usize = 44;
+    const UUID: [u8; 16] = *b"0123456789abcdef";
+
+    fn seed() -> u32 {
+        crc::crc32c(!0, &UUID)
+    }
+
+    fn header(kind: u32, seq: u32) -> Vec<u8> {
+        let mut b = vec![0u8; BS];
+        put_be32(&mut b, 0, MAGIC);
+        put_be32(&mut b, 4, kind);
+        put_be32(&mut b, 8, seq);
+        b
+    }
+
+    fn seal(b: &mut [u8], at: usize, seed: u32) {
+        put_be32(b, at, 0);
+        let csum = crc::crc32c(seed, b);
+        put_be32(b, at, csum);
+    }
+
+    /// A descriptor block with a tag for each `(block, flags, data)`.
+    fn descriptor(seq: u32, tags: &[(u32, u32, &[u8])]) -> Vec<u8> {
+        let mut b = header(1, seq);
+        let mut at = 12;
+        for (i, &(block, flags, data)) in tags.iter().enumerate() {
+            let mut flags = flags | if i == 0 { 0 } else { 2 };
+            if i + 1 == tags.len() {
+                flags |= 8;
+            }
+            put_be32(&mut b, at, block);
+            put_be32(&mut b, at + 4, flags);
+            let csum = crc::crc32c(crc::crc32c(seed(), &seq.to_be_bytes()), data);
+            put_be32(&mut b, at + 12, csum);
+            at += 16;
+            if i == 0 {
+                b[at..at + 16].copy_from_slice(&UUID);
+                at += 16;
+            }
+        }
+        seal(&mut b, BS - 4, seed());
+        b
+    }
+
+    fn commit(seq: u32) -> Vec<u8> {
+        let mut b = header(2, seq);
+        seal(&mut b, 16, seed());
+        b
+    }
+
+    fn revoke(seq: u32, blocks: &[u32]) -> Vec<u8> {
+        let mut b = header(5, seq);
+        put_be32(&mut b, 12, 16 + 4 * blocks.len() as u32);
+        for (i, &block) in blocks.iter().enumerate() {
+            put_be32(&mut b, 16 + 4 * i, block);
+        }
+        seal(&mut b, BS - 4, seed());
+        b
+    }
+
+    /// The image with the journal inode 8, the log blocks `log` from the block 1 of the journal,
+    /// and `RECOVER`.
+    fn image_with(log: &[Vec<u8>]) -> Vec<u8> {
+        let mut img = Image(image());
+        let inode = img.inode(8, 0o100600, 16 * BS as u32, 1, flags::EXTENTS);
+        img.extents(inode, &[(0, 16, AT as u32)]);
+        img.put32(1024 + 0xe0, 8);
+        img.put32(1024 + 0x5c, layout::compat::HAS_JOURNAL);
+        img.put32(
+            1024 + 0x60,
+            layout::incompat::FILETYPE | layout::incompat::EXTENTS | layout::incompat::RECOVER,
+        );
+        let mut sb = header(4, 0);
+        put_be32(&mut sb, jsb::BLOCK_SIZE, BS as u32);
+        put_be32(&mut sb, jsb::MAX_LEN, 16);
+        put_be32(&mut sb, jsb::FIRST, 1);
+        put_be32(&mut sb, jsb::SEQUENCE, 5);
+        put_be32(&mut sb, jsb::START, 1);
+        put_be32(&mut sb, jsb::INCOMPAT, feature::REVOKE | feature::CSUM_V3);
+        sb[jsb::UUID..jsb::UUID + 16].copy_from_slice(&UUID);
+        seal(&mut sb, jsb::CHECKSUM, !0);
+        img.0[AT * BS..(AT + 1) * BS].copy_from_slice(&sb);
+        for (i, b) in log.iter().enumerate() {
+            img.0[(AT + 1 + i) * BS..(AT + 2 + i) * BS].copy_from_slice(b);
+        }
+        img.0
+    }
+
+    #[test]
+    fn the_replay_writes_the_committed_blocks() {
+        let new = vec![b'n'; BS];
+        let mut magic = vec![b'm'; BS];
+        let mut escaped = magic.clone();
+        put_be32(&mut magic, 0, MAGIC);
+        escaped[..4].fill(0);
+        let log = [
+            descriptor(5, &[(22, 0, &new), (24, 0, &new)]),
+            new.clone(),
+            new.clone(),
+            commit(5),
+            revoke(6, &[24]),
+            descriptor(6, &[(30, 1, &escaped)]),
+            escaped.clone(),
+            commit(6),
+            // A transaction without a commit block.
+            descriptor(7, &[(25, 0, &new)]),
+            new.clone(),
+        ];
+        let ram = Ram(Arc::new(SpinLock::new(image_with(&log))));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), true).unwrap();
+        let disk = ram.0.lock();
+        assert_eq!(&disk[22 * BS..23 * BS], &new[..]);
+        assert!(disk[24 * BS..25 * BS].iter().all(|&b| b == b'c'));
+        assert_eq!(&disk[30 * BS..31 * BS], &magic[..]);
+        assert_eq!(disk[25 * BS], 1);
+        assert_eq!(layout::u32_at(&disk, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        assert_eq!(be32(&disk, AT * BS + jsb::START), 0);
+        assert_eq!(be32(&disk, AT * BS + jsb::SEQUENCE), 8);
+        drop(disk);
+        assert_eq!(fs.superblock().incompat & layout::incompat::RECOVER, 0);
+        let mut buf = [0u8; 4];
+        fs.root().unwrap().lookup(b"hello").unwrap().read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"nnnn");
+    }
+
+    #[test]
+    fn a_bad_commit_ends_the_log() {
+        let new = vec![b'n'; BS];
+        let mut bad = commit(5);
+        bad[100] = 1;
+        let log = [descriptor(5, &[(22, 0, &new)]), new.clone(), bad];
+        let ram = Ram(Arc::new(SpinLock::new(image_with(&log))));
+        Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        assert!(ram.0.lock()[22 * BS..23 * BS].iter().all(|&b| b == b'a'));
+    }
+
+    #[test]
+    fn a_bad_journal_superblock_does_not_mount() {
+        let mut img = image_with(&[]);
+        img[AT * BS + jsb::MAX_LEN + 3] = 15;
+        assert_eq!(open(img).err(), Some(Errno::EUCLEAN));
+    }
+}
