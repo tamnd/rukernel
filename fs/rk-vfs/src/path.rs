@@ -68,11 +68,10 @@ impl<'a> Walk<'a> {
 
     /// Checks that the walk can look up a name in the directory `at`, as `may_lookup` of Linux.
     fn may_lookup(&self, at: &Location) -> Result<()> {
-        let meta = at.inode().metadata();
-        if !meta.is_dir() {
+        if !at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        self.cred.permission(&meta, may::EXEC)
+        self.cred.inode_permission(&**at.inode(), may::EXEC)
     }
 
     /// Gives the location of `path`. A relative path starts at `start`. If `follow` is `false`, a

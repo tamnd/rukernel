@@ -6,6 +6,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_vfs::InodeRef;
+use rk_vfs::acl;
 use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 
 /// The longest name of an attribute, without the null byte.
@@ -14,8 +15,7 @@ const XATTR_NAME_MAX: usize = 255;
 const XATTR_SIZE_MAX: usize = 65536;
 /// The largest list of names.
 const XATTR_LIST_MAX: usize = 65536;
-/// The namespaces that the kernel knows. `system.` holds the ACLs, which no file system keeps
-/// yet, so a name in it gives `EOPNOTSUPP`.
+/// The namespaces that the kernel knows. In `system.`, only the names of the ACLs are known.
 const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
 
 /// The file of an attribute call. A file descriptor of a pipe or a socket has no inode.
@@ -44,16 +44,21 @@ fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     if name.is_empty() {
         return Err(Errno::ERANGE);
     }
-    if !NAMESPACES.iter().any(|ns| name.starts_with(ns)) {
+    if !NAMESPACES.iter().any(|ns| name.starts_with(ns)) && !is_acl(&name) {
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(name)
 }
 
+/// The name is the name of an ACL.
+fn is_acl(name: &[u8]) -> bool {
+    name == acl::ACCESS || name == acl::DEFAULT
+}
+
 /// Checks the access of the caller to the attribute `name` of `inode`, with the rules of
 /// `xattr_permission` of Linux. Linux 6.17 added `user.` attributes on a socket.
 fn check(cx: &Cx<'_>, inode: &InodeRef, name: &[u8], change: bool) -> Result<(), Errno> {
-    cx.process().cred().xattr_permission(&inode.metadata(), name, change)
+    cx.process().cred().xattr_permission(&**inode, name, change)
 }
 
 /// Copies `data` to the user buffer at `addr` of `size` bytes. A size of 0 asks for the length.
@@ -79,7 +84,11 @@ fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags:
     rk_vfs::inode::check_fixed(&*inode)?;
     check(cx, &inode, &name, true)?;
     let value = if size == 0 { Vec::new() } else { cx.read_bytes(value, size as usize)? };
-    inode.set_xattr(&name, &value, flags as u32)?;
+    if is_acl(&name) {
+        acl::set(&cx.process().cred(), &*inode, &name, &value, flags as u32)?;
+    } else {
+        inode.set_xattr(&name, &value, flags as u32)?;
+    }
     Ok(0)
 }
 
@@ -127,7 +136,11 @@ fn remove(cx: &Cx<'_>, target: Target, name: Vec<u8>) -> SysResult {
     };
     rk_vfs::inode::check_fixed(&*inode)?;
     check(cx, &inode, &name, true)?;
-    inode.remove_xattr(&name)?;
+    if is_acl(&name) {
+        acl::remove(&cx.process().cred(), &*inode, &name)?;
+    } else {
+        inode.remove_xattr(&name)?;
+    }
     Ok(0)
 }
 

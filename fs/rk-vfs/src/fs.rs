@@ -9,6 +9,7 @@
 //! with them, as `inode_permission` of Linux. A copy of the context of a process holds its
 //! credentials at the time of the copy.
 
+use crate::acl;
 use crate::cred::{Cred, cap, may};
 use crate::dentry::{Location, MountNamespace, MountSource};
 use crate::device;
@@ -72,7 +73,7 @@ impl FsContext {
     ///
     /// Gives `EACCES` if the access is not allowed.
     pub fn permission(&self, at: &Location, mask: u32) -> Result<()> {
-        self.cred.permission(&at.inode().metadata(), mask)
+        self.cred.inode_permission(&**at.inode(), mask)
     }
 
     /// Checks that the process can make its current directory or its root at `at`: it must be a
@@ -82,11 +83,10 @@ impl FsContext {
     ///
     /// Gives `ENOTDIR` or `EACCES`.
     pub fn check_dir(&self, at: &Location) -> Result<()> {
-        let meta = at.inode().metadata();
-        if !meta.is_dir() {
+        if !at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        self.cred.permission(&meta, may::EXEC)
+        self.cred.inode_permission(&**at.inode(), may::EXEC)
     }
 
     /// Checks that the process can add or remove a name in the directory `dir`.
@@ -203,10 +203,14 @@ impl FsContext {
                 Err(e) if e == Errno::ENOENT && !parent.is_dot() => {
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
-                    let perm = perm & mode::PERM_MASK & !self.umask;
-                    let inode =
-                        parent.dir.inode().create(&parent.name, FileType::Regular, perm, 0)?;
+                    let dir = parent.dir.inode();
+                    let (perm, acls) =
+                        acl::create(&**dir, FileType::Regular, perm & mode::PERM_MASK, self.umask);
+                    let inode = dir.create(&parent.name, FileType::Regular, perm, 0)?;
                     self.init_owner(&parent.dir, &inode)?;
+                    if let Some(acls) = acls {
+                        acls.apply(&*inode)?;
+                    }
                     created = true;
                     let dentry = parent.dir.dentry.add_child(&parent.name, inode);
                     Location { mount: parent.dir.mount.clone(), dentry }
@@ -258,7 +262,7 @@ impl FsContext {
             return Err(Errno::EISDIR);
         }
         if !created {
-            self.cred.permission(&meta, open_mask(flags))?;
+            self.cred.inode_permission(&**at.inode(), open_mask(flags))?;
         }
         if flags & o::O_NOATIME != 0 && !self.cred.owns(&meta) {
             return Err(Errno::EPERM);
@@ -302,12 +306,16 @@ impl FsContext {
         if absent(&r) { Ok(false) } else { r.map(|_| true) }
     }
 
-    /// Makes a new inode for `mkdirat`, `mknodat` and `symlinkat`.
+    /// Makes a new inode of the type `kind` for `mkdirat`, `mknodat` and `symlinkat`. `f` gets
+    /// the directory, the name and the permission bits after the umask or the default ACL of the
+    /// directory masks `perm`.
     fn make(
         &self,
         start: &Location,
         path: &[u8],
-        f: impl FnOnce(&InodeRef, &[u8]) -> Result<InodeRef>,
+        kind: FileType,
+        perm: u32,
+        f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
     ) -> Result<Location> {
         let parent = self.parent(start, path)?;
         if parent.is_dot() || self.exists(&parent)? {
@@ -315,16 +323,21 @@ impl FsContext {
         }
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
-        let inode = f(parent.dir.inode(), &parent.name)?;
+        let (perm, acls) = acl::create(&**parent.dir.inode(), kind, perm, self.umask);
+        let inode = f(parent.dir.inode(), &parent.name, perm)?;
         self.init_owner(&parent.dir, &inode)?;
+        if let Some(acls) = acls {
+            acls.apply(&*inode)?;
+        }
         let dentry = parent.dir.dentry.add_child(&parent.name, inode);
         Ok(Location { mount: parent.dir.mount, dentry })
     }
 
     /// `mkdirat`.
     pub fn mkdir(&self, start: &Location, path: &[u8], perm: u32) -> Result<Location> {
-        let perm = perm & 0o1777 & !self.umask;
-        self.make(start, path, |dir, name| dir.create(name, FileType::Directory, perm, 0))
+        self.make(start, path, FileType::Directory, perm & 0o1777, |dir, name, perm| {
+            dir.create(name, FileType::Directory, perm, 0)
+        })
     }
 
     /// `mknodat`. A mode with no file type makes a regular file.
@@ -337,8 +350,7 @@ impl FsContext {
         if matches!(kind, FileType::Directory | FileType::Symlink) {
             return Err(Errno::EINVAL);
         }
-        let perm = mode & mode::PERM_MASK & !self.umask;
-        self.make(start, path, |dir, name| {
+        self.make(start, path, kind, mode & mode::PERM_MASK, |dir, name, perm| {
             if matches!(kind, FileType::CharDevice | FileType::BlockDevice)
                 && !self.cred.capable(cap::MKNOD)
             {
@@ -353,7 +365,7 @@ impl FsContext {
         if target.is_empty() {
             return Err(Errno::ENOENT);
         }
-        self.make(start, path, |dir, name| dir.symlink(name, target))
+        self.make(start, path, FileType::Symlink, 0o777, |dir, name, _| dir.symlink(name, target))
     }
 
     /// `linkat`. `old` is the location of the file, after the walk of the old path.

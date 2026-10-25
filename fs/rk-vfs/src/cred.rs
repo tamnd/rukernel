@@ -6,7 +6,8 @@
 //! changes them in all the threads of a process. rukernel keeps them for each process, which gives
 //! the same result for a program that uses the C library.
 
-use crate::inode::{FileType, Metadata, Result, SetAttr, mode};
+use crate::acl::{self, Acl};
+use crate::inode::{FileType, Inode, Metadata, Result, SetAttr, mode};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -223,21 +224,46 @@ impl Cred {
     /// Checks the access `mask` (the bits of [`may`]) to a file with the attributes `meta`, as
     /// `generic_permission` of Linux. The owner bits apply to the owner, the group bits to a
     /// member of the group, and the other bits to the others. `CAP_DAC_OVERRIDE` and
-    /// `CAP_DAC_READ_SEARCH` skip the check.
+    /// `CAP_DAC_READ_SEARCH` skip the check. This check does not read the ACL of the file. Use
+    /// [`Cred::inode_permission`] for a file that can have one.
     ///
     /// # Errors
     ///
     /// Gives `EACCES` if the access is not allowed.
     pub fn permission(&self, meta: &Metadata, mask: u32) -> Result<()> {
+        self.check(meta, mask, || None)
+    }
+
+    /// Checks the access `mask` to `inode`, as [`Cred::permission`], with the access ACL of the
+    /// inode if it has one.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EACCES` if the access is not allowed, and `EIO` for a damaged ACL.
+    pub fn inode_permission(&self, inode: &dyn Inode, mask: u32) -> Result<()> {
+        self.check(&inode.metadata(), mask, || acl::access(inode))
+    }
+
+    /// The check of [`Cred::permission`]. `acl` gives the access ACL. The ACL applies only to
+    /// a process that does not own the file, and only if the mode has group bits, as
+    /// `acl_permission_check` of Linux.
+    pub(crate) fn check(
+        &self,
+        meta: &Metadata,
+        mask: u32,
+        acl: impl FnOnce() -> Option<Acl>,
+    ) -> Result<()> {
         let mask = mask & (may::READ | may::WRITE | may::EXEC);
-        let bits = if self.fsuid == meta.uid {
-            meta.mode >> 6
+        let allowed = if self.fsuid == meta.uid {
+            (meta.mode >> 6) & mask == mask
+        } else if let Some(acl) = (meta.mode & 0o070 != 0).then(acl).flatten() {
+            acl.permits(self, meta, mask)?
         } else if self.in_group(meta.gid) {
-            meta.mode >> 3
+            (meta.mode >> 3) & mask == mask
         } else {
-            meta.mode
+            meta.mode & mask == mask
         };
-        if bits & mask == mask {
+        if allowed {
             return Ok(());
         }
         if meta.is_dir() {
@@ -377,7 +403,18 @@ impl Cred {
     /// # Errors
     ///
     /// Gives `EPERM` for a change and `ENODATA` for a read that the rules refuse, or `EACCES`.
-    pub fn xattr_permission(&self, meta: &Metadata, name: &[u8], write: bool) -> Result<()> {
+    pub fn xattr_permission(&self, inode: &dyn Inode, name: &[u8], write: bool) -> Result<()> {
+        self.xattr_check(&inode.metadata(), name, write, || acl::access(inode))
+    }
+
+    /// The check of [`Cred::xattr_permission`]. `acl` gives the access ACL of the file.
+    fn xattr_check(
+        &self,
+        meta: &Metadata,
+        name: &[u8],
+        write: bool,
+        acl: impl FnOnce() -> Option<Acl>,
+    ) -> Result<()> {
         let refused = if write { Errno::EPERM } else { Errno::ENODATA };
         if name.starts_with(b"security.") || name.starts_with(b"system.") {
             return Ok(());
@@ -398,7 +435,7 @@ impl Cred {
                 return Err(Errno::EPERM);
             }
         }
-        self.permission(meta, if write { may::WRITE } else { may::READ })
+        self.check(meta, if write { may::WRITE } else { may::READ }, acl)
     }
 
     /// Tells if the process can send a signal to a process with the credentials `target`, as
@@ -1043,16 +1080,16 @@ mod tests {
     fn the_namespaces_of_the_extended_attributes() {
         let u = user(1000);
         let file = meta(mode::S_IFREG, 0o644, 0, 0);
-        assert_eq!(u.xattr_permission(&file, b"trusted.a", false), Err(Errno::ENODATA));
-        assert_eq!(u.xattr_permission(&file, b"trusted.a", true), Err(Errno::EPERM));
-        assert_eq!(Cred::root().xattr_permission(&file, b"trusted.a", true), Ok(()));
-        assert_eq!(u.xattr_permission(&file, b"user.a", false), Ok(()));
-        assert_eq!(u.xattr_permission(&file, b"user.a", true), Err(Errno::EACCES));
-        assert_eq!(u.xattr_permission(&file, b"security.a", true), Ok(()));
+        assert_eq!(u.xattr_check(&file, b"trusted.a", false, || None), Err(Errno::ENODATA));
+        assert_eq!(u.xattr_check(&file, b"trusted.a", true, || None), Err(Errno::EPERM));
+        assert_eq!(Cred::root().xattr_check(&file, b"trusted.a", true, || None), Ok(()));
+        assert_eq!(u.xattr_check(&file, b"user.a", false, || None), Ok(()));
+        assert_eq!(u.xattr_check(&file, b"user.a", true, || None), Err(Errno::EACCES));
+        assert_eq!(u.xattr_check(&file, b"security.a", true, || None), Ok(()));
         let link = meta(mode::S_IFLNK, 0o777, 1000, 0);
-        assert_eq!(u.xattr_permission(&link, b"user.a", true), Err(Errno::EPERM));
+        assert_eq!(u.xattr_check(&link, b"user.a", true, || None), Err(Errno::EPERM));
         let tmp = meta(mode::S_IFDIR, 0o1777, 0, 0);
-        assert_eq!(u.xattr_permission(&tmp, b"user.a", true), Err(Errno::EPERM));
+        assert_eq!(u.xattr_check(&tmp, b"user.a", true, || None), Err(Errno::EPERM));
     }
 
     #[test]

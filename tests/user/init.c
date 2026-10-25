@@ -126,6 +126,49 @@ static void test_creds(void)
 	check("init is root after the child", getuid() == 0 && geteuid() == 0);
 }
 
+/* An ACL in the format of the system.posix_acl_* attributes. */
+struct acl_entry {
+	unsigned short tag, perm;
+	unsigned int id;
+};
+
+struct acl {
+	unsigned int version;
+	struct acl_entry e[5];
+};
+
+static void test_acls(void)
+{
+	/* Root reads and writes, user 1000 reads, the others get nothing. */
+	struct acl access = {2,
+			     {{1, 6, -1}, {2, 4, 1000}, {4, 0, -1}, {0x10, 4, -1}, {0x20, 0, -1}}};
+	struct acl def = {2, {{1, 7, -1}, {4, 5, -1}, {0x20, 0, -1}}};
+	struct stat st;
+	int fd = open("/tmp/perm.acl", O_WRONLY | O_CREAT, 0600);
+	close(fd);
+	check("setxattr of an access ACL sets the group bits to the mask",
+	      setxattr("/tmp/perm.acl", "system.posix_acl_access", &access, sizeof(access), 0) == 0 &&
+		      stat("/tmp/perm.acl", &st) == 0 && (st.st_mode & 0777) == 0640);
+	struct acl got;
+	check("getxattr gives the ACL back",
+	      getxattr("/tmp/perm.acl", "system.posix_acl_access", &got, sizeof(got)) ==
+			      sizeof(access) &&
+		      memcmp(&got, &access, sizeof(access)) == 0);
+	check("a default ACL on a file gives EACCES",
+	      setxattr("/tmp/perm.acl", "system.posix_acl_default", &def, 4 + 3 * 8, 0) == -1 &&
+		      errno == EACCES);
+	mkdir("/tmp/perm.dacl", 0777);
+	check("a new file gets the bits of the default ACL and not the umask",
+	      setxattr("/tmp/perm.dacl", "system.posix_acl_default", &def, 4 + 3 * 8, 0) == 0 &&
+		      (fd = open("/tmp/perm.dacl/f", O_WRONLY | O_CREAT, 0666)) >= 0 &&
+		      fstat(fd, &st) == 0 && (st.st_mode & 0777) == 0640);
+	close(fd);
+	check("a new directory gets the default ACL",
+	      mkdir("/tmp/perm.dacl/d", 0777) == 0 &&
+		      getxattr("/tmp/perm.dacl/d", "system.posix_acl_default", &got, sizeof(got)) ==
+			      4 + 3 * 8);
+}
+
 static void test_perms(void)
 {
 	int fd = open("/tmp/perm.secret", O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -146,6 +189,7 @@ static void test_perms(void)
 	check("chmod by root keeps the set-user-ID bit",
 	      chmod("/tmp/perm.suid", 06755) == 0 && stat("/tmp/perm.suid", &sst) == 0 &&
 		      (sst.st_mode & 07777) == 06755);
+	test_acls();
 	pid_t pid = fork();
 	if (pid == 0) {
 		gid_t groups[1] = {50};
@@ -219,6 +263,14 @@ static void test_perms(void)
 		      setrlimit(RLIMIT_NOFILE, &rl) == -1 && errno == EPERM);
 		check("mount without CAP_SYS_ADMIN gives EPERM",
 		      mount("none", "/tmp", "tmpfs", 0, NULL) == -1 && errno == EPERM);
+		fd = open("/tmp/perm.acl", O_RDONLY);
+		check("a named user entry of an ACL gives read access", fd >= 0);
+		close(fd);
+		check("the ACL refuses a write to the named user",
+		      open("/tmp/perm.acl", O_WRONLY) == -1 && errno == EACCES);
+		check("setxattr of an ACL on a file of root gives EPERM",
+		      setxattr("/tmp/perm.acl", "system.posix_acl_access", "", 0, 0) == -1 &&
+			      errno == EPERM);
 		_exit(failed);
 	}
 	int status;

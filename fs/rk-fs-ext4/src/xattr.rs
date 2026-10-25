@@ -16,6 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_vfs::Result;
+use rk_vfs::acl::{Acl, Entry, UNDEFINED_ID, tag};
 
 /// The magic number of the attributes of an inode and of an attribute block.
 const MAGIC: u32 = 0xea02_0000;
@@ -68,6 +69,59 @@ pub(crate) fn name(key: &Key) -> Option<Vec<u8>> {
     let mut name = prefix.to_vec();
     name.extend_from_slice(&key.1);
     Some(name)
+}
+
+/// The version of an ACL on the disk, `EXT4_ACL_VERSION`.
+const ACL_VERSION: u32 = 1;
+
+/// The key is the key of an ACL.
+pub(crate) fn is_acl(key: &Key) -> bool {
+    key.0 == 2 || key.0 == 3
+}
+
+/// Changes the value of an ACL from the format of the system calls to the format on the disk,
+/// as `ext4_acl_to_disk`. The disk keeps the ID only in the entries of a named user and a named
+/// group, and an entry without an ID has 4 bytes.
+pub(crate) fn acl_to_disk(value: &[u8]) -> Result<Vec<u8>> {
+    let acl = Acl::from_xattr(value)?.ok_or(Errno::EINVAL)?;
+    let mut out = ACL_VERSION.to_le_bytes().to_vec();
+    for e in &acl.0 {
+        out.extend_from_slice(&e.tag.to_le_bytes());
+        out.extend_from_slice(&e.perm.to_le_bytes());
+        if matches!(e.tag, tag::USER | tag::GROUP) {
+            out.extend_from_slice(&e.id.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// Changes the value of an ACL from the format on the disk to the format of the system calls,
+/// as `ext4_acl_from_disk`. A damaged value gives `EIO`.
+pub(crate) fn acl_from_disk(disk: &[u8]) -> Result<Vec<u8>> {
+    if disk.len() < 4 || u32_at(disk, 0) != ACL_VERSION {
+        return Err(Errno::EIO);
+    }
+    let mut entries = Vec::new();
+    let mut at = 4;
+    while at < disk.len() {
+        if at + 4 > disk.len() {
+            return Err(Errno::EIO);
+        }
+        let (tag, perm) = (u16_at(disk, at), u16_at(disk, at + 2));
+        let id = match tag {
+            tag::USER | tag::GROUP if at + 8 <= disk.len() => {
+                at += 8;
+                u32_at(disk, at - 4)
+            }
+            tag::USER_OBJ | tag::GROUP_OBJ | tag::MASK | tag::OTHER => {
+                at += 4;
+                UNDEFINED_ID
+            }
+            _ => return Err(Errno::EIO),
+        };
+        entries.push(Entry { tag, perm, id });
+    }
+    Ok(Acl(entries).to_xattr())
 }
 
 fn pad(n: usize) -> usize {
