@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::mode;
+use rk_vfs::xattr::Xattrs;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
 /// The largest file, as `MAX_LFS_FILESIZE` of Linux on a 64 bit CPU.
@@ -57,6 +58,7 @@ struct Node {
     this: Weak<Node>,
     attrs: SpinLock<Attrs>,
     data: SpinLock<Data>,
+    xattrs: SpinLock<Xattrs>,
 }
 
 /// The magic number of tmpfs, `TMPFS_MAGIC` of `<linux/magic.h>`.
@@ -136,6 +138,7 @@ impl Node {
                 ctime: t,
             }),
             data: SpinLock::new(data),
+            xattrs: SpinLock::new(Xattrs::new()),
         })
     }
 
@@ -421,6 +424,26 @@ impl Inode for Node {
 
     fn fs_id(&self) -> u64 {
         self.fs.dev
+    }
+
+    fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
+        self.xattrs.lock().get(name)
+    }
+
+    fn set_xattr(&self, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
+        self.xattrs.lock().set(name, value, flags)?;
+        self.attrs.lock().ctime = now();
+        Ok(())
+    }
+
+    fn list_xattr(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(self.xattrs.lock().names())
+    }
+
+    fn remove_xattr(&self, name: &[u8]) -> Result<()> {
+        self.xattrs.lock().remove(name)?;
+        self.attrs.lock().ctime = now();
+        Ok(())
     }
 
     fn fs_magic(&self) -> u64 {

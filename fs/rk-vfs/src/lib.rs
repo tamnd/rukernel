@@ -26,6 +26,7 @@ pub mod inode;
 pub mod path;
 pub mod pipe;
 pub mod wait;
+pub mod xattr;
 
 pub use dentry::{Dentry, Location, Mount, MountNamespace, MountSource};
 pub use fdtable::{FdEntry, FdTable};

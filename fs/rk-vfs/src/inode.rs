@@ -295,6 +295,30 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTDIR)
     }
 
+    /// Gives the value of the extended attribute `name`, which has its namespace prefix, for
+    /// example `user.color`. Gives `ENODATA` if the inode does not have the attribute. The
+    /// default is for a file system that keeps no extended attributes.
+    fn get_xattr(&self, _name: &[u8]) -> Result<Vec<u8>> {
+        Err(Errno::ENODATA)
+    }
+
+    /// Sets the extended attribute `name` to `value`. `flags` is 0, `XATTR_CREATE` or
+    /// `XATTR_REPLACE`. `XATTR_CREATE` gives `EEXIST` if the attribute exists, and
+    /// `XATTR_REPLACE` gives `ENODATA` if it does not exist.
+    fn set_xattr(&self, _name: &[u8], _value: &[u8], _flags: u32) -> Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    /// Gives the names of the extended attributes of the inode.
+    fn list_xattr(&self) -> Result<Vec<Vec<u8>>> {
+        Ok(Vec::new())
+    }
+
+    /// Removes the extended attribute `name`. Gives `ENODATA` if the inode does not have it.
+    fn remove_xattr(&self, _name: &[u8]) -> Result<()> {
+        Err(Errno::ENODATA)
+    }
+
     /// The device of the file system, for a rename or a link across file systems.
     fn fs_id(&self) -> u64 {
         self.metadata().dev

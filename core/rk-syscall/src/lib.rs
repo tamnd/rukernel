@@ -71,6 +71,8 @@ mod table;
 mod timer;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod timerfd;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod xattr;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use run::{count, init, spawn_init};
