@@ -860,11 +860,9 @@ pub(crate) fn sync_file_range(
         return Err(Errno::EINVAL);
     }
     let file = cx.file(fd)?;
+    use rk_vfs::FileType::{BlockDevice, Directory, Regular, Symlink};
     let kind = file.metadata()?.file_type();
-    if !matches!(
-        kind,
-        Some(FileType::Regular | FileType::Directory | FileType::Block | FileType::Symlink)
-    ) {
+    if !matches!(kind, Some(Regular | Directory | BlockDevice | Symlink)) {
         return Err(Errno::ESPIPE);
     }
     if flags != 0 {
