@@ -1039,3 +1039,52 @@ fn an_acl_has_the_ext4_format_on_the_disk() {
     let file = again(&ram).root().unwrap().lookup(b"acl").unwrap();
     assert_eq!(file.get_xattr(ACCESS).unwrap(), acl.to_xattr());
 }
+
+#[test]
+fn an_online_resize_makes_the_last_group_longer() {
+    let (fs, ram) = open_rw();
+    ram.0.lock().resize(200 * BS, 0);
+    let (blocks, free) = (fs.stat().blocks, ram.free());
+    assert_eq!(fs.resize(40), Err(Errno::EINVAL));
+    assert_eq!(fs.resize(201), Err(Errno::EINVAL));
+    fs.resize(200).unwrap();
+    assert_eq!(fs.stat().blocks, blocks + 136);
+    assert_eq!(ram.free(), (free.0 + 136, free.1));
+    assert_eq!(ram.u32_at(1024 + 0x4), 200);
+    // The new blocks are free, and a file can use them.
+    let file = fs.root().unwrap().create(b"big", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(0, &[7u8; 100 * BS]).unwrap();
+    drop(file);
+    let fs = again(&ram);
+    assert_eq!(fs.blocks_count(), 200);
+    assert_eq!(read_all(&*fs.root().unwrap().lookup(b"big").unwrap()), [7u8; 100 * BS]);
+}
+
+#[test]
+fn an_online_resize_adds_a_group() {
+    let (fs, ram) = open_rw();
+    let count = 1 + 8192 + 100;
+    ram.0.lock().resize(count * BS, 0);
+    let free = ram.free();
+    fs.resize(count as u64).unwrap();
+    // The new group has a copy of the superblock and of the descriptors, two bitmaps and an
+    // inode table of 8 blocks.
+    let added = (8192 - 63) + (100 - 12);
+    assert_eq!(ram.free(), (free.0 + added, free.1 + 32));
+    assert_eq!(ram.u32_at(1024), 64);
+    let fs = again(&ram);
+    assert_eq!((fs.group_count(), fs.inodes_count()), (2, 64));
+    let desc = fs.group(1).unwrap();
+    assert_eq!((desc.block_bitmap, desc.inode_bitmap, desc.inode_table), (8195, 8196, 8197));
+    // The copy of the superblock in the group 1 tells its group.
+    assert_eq!(layout::u16_at(&ram.0.lock(), 8193 * BS + 0x5a), 1);
+    drop(fs);
+    // Each inode of the group 0 is in use, so a new inode is in the group 1.
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let root = fs.root().unwrap();
+    for i in 0..18 {
+        root.create(format!("f{i}").as_bytes(), FileType::Regular, 0o644, 0).unwrap();
+    }
+    let last = root.create(b"last", FileType::Regular, 0o644, 0).unwrap();
+    assert!(last.metadata().ino > 32);
+}

@@ -236,7 +236,7 @@ impl Fs {
             let out = &mut buf[done..done + n];
             match self.map(raw, at / bs)? {
                 Some((block, true)) => {
-                    if block >= self.sb.blocks_count {
+                    if block >= self.blocks_count() {
                         return Err(Errno::EUCLEAN);
                     }
                     self.read(block * bs + in_block as u64, out)?;
@@ -665,8 +665,8 @@ impl Tx<'_> {
             return self.write_sb(0, 0);
         }
         // A list with a loop or a bad inode ends after one step for each inode.
-        for _ in 0..fs.sb.inodes_count {
-            if at == 0 || at > fs.sb.inodes_count {
+        for _ in 0..fs.inodes_count() {
+            if at == 0 || at > fs.inodes_count() {
                 break;
             }
             let node = fs.inodes.lock().get(&at).and_then(alloc::sync::Weak::upgrade);
@@ -691,7 +691,7 @@ impl Tx<'_> {
     /// has links again leaves the list.
     pub(crate) fn clean_orphans(&mut self) -> Result<()> {
         let fs = self.fs;
-        for _ in 0..fs.sb.inodes_count {
+        for _ in 0..fs.inodes_count() {
             let ino = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
             if ino == 0 {
                 break;
@@ -903,6 +903,10 @@ impl Inode for Node {
 
     fn checkpoint(&self, flags: u32) -> Result<()> {
         self.fs.checkpoint(flags)
+    }
+
+    fn resize(&self, blocks: u64) -> Result<()> {
+        self.fs.resize(blocks)
     }
 
     fn metadata(&self) -> Metadata {

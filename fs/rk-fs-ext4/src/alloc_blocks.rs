@@ -9,7 +9,7 @@ use rk_abi::Errno;
 use rk_vfs::Result;
 
 /// Sets the bits from `from` to the end of `bitmap`, as `ext4_mark_bitmap_end`.
-fn mark_end(bitmap: &mut [u8], from: usize) {
+pub(crate) fn mark_end(bitmap: &mut [u8], from: usize) {
     for bit in from..bitmap.len() * 8 {
         bitmap[bit / 8] |= 1 << (bit % 8);
     }
@@ -19,7 +19,7 @@ fn test_bit(bitmap: &[u8], bit: usize) -> bool {
     bitmap[bit / 8] & (1 << (bit % 8)) != 0
 }
 
-fn set_bit(bitmap: &mut [u8], bit: usize, on: bool) {
+pub(crate) fn set_bit(bitmap: &mut [u8], bit: usize, on: bool) {
     if on {
         bitmap[bit / 8] |= 1 << (bit % 8);
     } else {
@@ -29,14 +29,14 @@ fn set_bit(bitmap: &mut [u8], bit: usize, on: bool) {
 
 impl Tx<'_> {
     /// Gives the field `at` of the descriptor of the group `group`, with its high half.
-    fn desc_get(&self, group: u32, at: usize) -> u32 {
+    pub(crate) fn desc_get(&self, group: u32, at: usize) -> u32 {
         let d = &self.meta.descs[group as usize];
         let hi = if d.len() >= 64 { u32::from(u16_at(d, at + gd::HI)) << 16 } else { 0 };
         u32::from(u16_at(d, at)) | hi
     }
 
     /// Changes the field `at` of the descriptor of the group `group`, with its high half.
-    fn desc_set(&mut self, group: u32, at: usize, v: u32) {
+    pub(crate) fn desc_set(&mut self, group: u32, at: usize, v: u32) {
         let d = &mut self.meta.descs[group as usize];
         put16(d, at, v as u16);
         if d.len() >= 64 {
@@ -53,7 +53,7 @@ impl Tx<'_> {
     }
 
     /// Writes the descriptor of the group `group`, with its checksum.
-    fn write_desc(&mut self, group: u32) -> Result<()> {
+    pub(crate) fn write_desc(&mut self, group: u32) -> Result<()> {
         let fs = self.fs;
         let size = usize::from(fs.sb.desc_size);
         let d = &mut self.meta.descs[group as usize];
@@ -102,9 +102,9 @@ impl Tx<'_> {
 
     /// Gives the block bitmap of the group `group`. A bitmap that is not on the disk is made from
     /// the layout, as `ext4_init_block_bitmap`.
-    fn block_bitmap(&self, group: u32) -> Result<Vec<u8>> {
+    pub(crate) fn block_bitmap(&self, group: u32) -> Result<Vec<u8>> {
         let fs = self.fs;
-        let desc = fs.groups[group as usize];
+        let desc = fs.group(group)?;
         if self.desc_flags(group) & bg::BLOCK_UNINIT == 0 {
             return fs.read_block(desc.block_bitmap);
         }
@@ -115,7 +115,7 @@ impl Tx<'_> {
         }
         let start =
             u64::from(sb.first_data_block) + u64::from(group) * u64::from(sb.blocks_per_group);
-        let end = start + u64::from(sb.blocks_in_group(group));
+        let end = start + u64::from(fs.blocks_in_group(group));
         let own = [
             (desc.block_bitmap, 1),
             (desc.inode_bitmap, 1),
@@ -126,7 +126,7 @@ impl Tx<'_> {
                 set_bit(&mut bitmap, (b - start) as usize, true);
             }
         }
-        mark_end(&mut bitmap, sb.blocks_in_group(group) as usize);
+        mark_end(&mut bitmap, fs.blocks_in_group(group) as usize);
         Ok(bitmap)
     }
 
@@ -134,7 +134,7 @@ impl Tx<'_> {
     fn inode_bitmap(&self, group: u32) -> Result<Vec<u8>> {
         let fs = self.fs;
         if self.desc_flags(group) & bg::INODE_UNINIT == 0 {
-            return fs.read_block(fs.groups[group as usize].inode_bitmap);
+            return fs.read_block(fs.group(group)?.inode_bitmap);
         }
         let mut bitmap = vec![0u8; fs.sb.block_size as usize];
         mark_end(&mut bitmap, fs.sb.inodes_per_group as usize);
@@ -142,9 +142,9 @@ impl Tx<'_> {
     }
 
     /// Writes the block bitmap of the group `group` and sets its checksum in the descriptor.
-    fn write_block_bitmap(&mut self, group: u32, bitmap: &[u8]) -> Result<()> {
+    pub(crate) fn write_block_bitmap(&mut self, group: u32, bitmap: &[u8]) -> Result<()> {
         let fs = self.fs;
-        fs.write(fs.groups[group as usize].block_bitmap * fs.sb.block_size, bitmap)?;
+        fs.write(fs.group(group)?.block_bitmap * fs.sb.block_size, bitmap)?;
         let flags = self.desc_flags(group) & !bg::BLOCK_UNINIT;
         self.set_desc_flags(group, flags);
         if fs.metadata_csum() {
@@ -155,9 +155,9 @@ impl Tx<'_> {
     }
 
     /// Writes the inode bitmap of the group `group` and sets its checksum in the descriptor.
-    fn write_inode_bitmap(&mut self, group: u32, bitmap: &[u8]) -> Result<()> {
+    pub(crate) fn write_inode_bitmap(&mut self, group: u32, bitmap: &[u8]) -> Result<()> {
         let fs = self.fs;
-        fs.write(fs.groups[group as usize].inode_bitmap * fs.sb.block_size, bitmap)?;
+        fs.write(fs.group(group)?.inode_bitmap * fs.sb.block_size, bitmap)?;
         let flags = self.desc_flags(group) & !bg::INODE_UNINIT;
         self.set_desc_flags(group, flags);
         if fs.metadata_csum() {
@@ -176,8 +176,8 @@ impl Tx<'_> {
     pub(crate) fn alloc_blocks(&mut self, goal: u64, want: u32) -> Result<(u64, u32)> {
         let sb = &self.fs.sb;
         let (first, bpg) = (u64::from(sb.first_data_block), u64::from(sb.blocks_per_group));
-        let goal = goal.clamp(first, sb.blocks_count - 1);
-        let groups = sb.groups();
+        let goal = goal.clamp(first, self.fs.blocks_count() - 1);
+        let groups = self.fs.group_count();
         let goal_group = ((goal - first) / bpg) as u32;
         for i in 0..=groups {
             let group = (goal_group + i) % groups;
@@ -185,7 +185,7 @@ impl Tx<'_> {
                 continue;
             }
             let mut bitmap = self.block_bitmap(group)?;
-            let size = self.fs.sb.blocks_in_group(group) as usize;
+            let size = self.fs.blocks_in_group(group) as usize;
             let from = if i == 0 { ((goal - first) % bpg) as usize } else { 0 };
             let base = first + u64::from(group) * bpg;
             let free =
@@ -214,7 +214,7 @@ impl Tx<'_> {
     pub(crate) fn free_blocks(&mut self, mut start: u64, mut count: u64) -> Result<()> {
         let sb = &self.fs.sb;
         let (first, bpg) = (u64::from(sb.first_data_block), u64::from(sb.blocks_per_group));
-        if start < first || start + count > sb.blocks_count {
+        if start < first || start + count > self.fs.blocks_count() {
             return Err(Errno::EUCLEAN);
         }
         while count > 0 {
@@ -249,7 +249,7 @@ impl Tx<'_> {
     /// Gives `ENOSPC` if the file system has no free inode.
     pub(crate) fn alloc_inode(&mut self, near: u32, dir: bool) -> Result<u32> {
         let sb = &self.fs.sb;
-        let (groups, ipg, first_ino) = (sb.groups(), sb.inodes_per_group, sb.first_ino);
+        let (groups, ipg, first_ino) = (self.fs.group_count(), sb.inodes_per_group, sb.first_ino);
         let csum =
             sb.ro_compat & (layout::ro_compat::GDT_CSUM | layout::ro_compat::METADATA_CSUM) != 0;
         let start = near.saturating_sub(1) / ipg;

@@ -269,7 +269,7 @@ impl<'a> Journal<'a> {
                         if tag.flags & tag::ESCAPE != 0 {
                             put_be32(&mut data, 0, MAGIC);
                         }
-                        if tag.block >= self.fs.sb.blocks_count {
+                        if tag.block >= self.fs.blocks_count() {
                             return Err(Errno::EUCLEAN);
                         }
                         self.fs.write_direct(tag.block * self.bs as u64, &data)?;
