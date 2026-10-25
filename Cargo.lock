@@ -93,6 +93,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-fs-sys"
+version = "0.3.5"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-fs-tmpfs"
 version = "0.3.5"
 dependencies = [
@@ -187,6 +196,7 @@ dependencies = [
  "rk-frame",
  "rk-fs-ext4",
  "rk-fs-proc",
+ "rk-fs-sys",
  "rk-fs-tmpfs",
  "rk-mm",
  "rk-proc",

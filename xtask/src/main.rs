@@ -613,6 +613,12 @@ const ROOTFS: &[Rootfs] = &[
         init: "#!/bin/sh
 set -e
 mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs dev /dev
+busybox mdev -s
+test -c /dev/null && test -c /dev/ttyS0
+ls -l /dev/null | grep -q ' 1, *3 '
+echo \"alpine: mdev made $(ls /dev | wc -l) device files\"
 echo \"alpine: release $(cat /etc/alpine-release)\"
 ls -l /lib/ld-musl-x86_64.so.1
 /lib/ld-musl-x86_64.so.1 --list /bin/busybox

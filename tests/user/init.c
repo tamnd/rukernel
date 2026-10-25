@@ -1586,6 +1586,58 @@ static void test_atime(void)
 	rmdir("/mnt");
 }
 
+/* Reads the file at path into buf, and gives the count of bytes, or -1. */
+static int read_small(const char *path, char *buf, int size)
+{
+	int fd = open(path, O_RDONLY);
+	int n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, size - 1);
+	close(fd);
+	if (n >= 0)
+		buf[n] = 0;
+	return n;
+}
+
+static void test_sysfs(void)
+{
+	struct statfs sfs;
+	struct stat st;
+	char buf[128];
+	ssize_t n;
+	int fd;
+
+	mkdir("/sys", 0755);
+	check("mount sysfs", mount("sysfs", "/sys", "sysfs", 0, NULL) == 0);
+	check("statfs of sysfs gives SYSFS_MAGIC", statfs("/sys", &sfs) == 0 && sfs.f_type == 0x62656572);
+	check("sysfs has /sys/class/mem/null/dev",
+	      read_small("/sys/class/mem/null/dev", buf, sizeof(buf)) > 0 && strcmp(buf, "1:3\n") == 0);
+	n = readlink("/sys/dev/char/1:3", buf, sizeof(buf) - 1);
+	check("/sys/dev/char/1:3 links to the device",
+	      n > 0 && (buf[n] = 0, strcmp(buf, "../../devices/virtual/mem/null") == 0));
+	fd = open("/sys/class/mem/null/dev", O_WRONLY);
+	check("a sysfs file does not take a write", write(fd, "1", 1) < 0 && errno == EACCES);
+	close(fd);
+	check("sysfs does not take a new file", mkdir("/sys/new", 0755) < 0 && errno == EPERM);
+	if (stat("/sys/block/vda", &st) == 0) {
+		check("sysfs has the uevent of vda",
+		      read_small("/sys/block/vda/uevent", buf, sizeof(buf)) > 0 &&
+			      strstr(buf, "DEVNAME=vda\nDEVTYPE=disk\n") != NULL);
+		check("sysfs has the size of vda",
+		      read_small("/sys/class/block/vda/size", buf, sizeof(buf)) > 0 && atol(buf) > 0);
+	}
+	umount("/sys");
+
+	mkdir("/mnt", 0755);
+	check("mount devtmpfs", mount("devtmpfs", "/mnt", "devtmpfs", 0, NULL) == 0);
+	check("devtmpfs has /dev/null",
+	      stat("/mnt/null", &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(1, 3));
+	umount("/mnt");
+	rmdir("/mnt");
+}
+
 /* The calls and the flags of the new mount API, from <linux/mount.h>. */
 #ifndef SYS_fsopen
 #define SYS_open_tree 428
@@ -2188,6 +2240,7 @@ int main(int argc, char **argv)
 	test_symlink_chain();
 	test_splice();
 	test_atime();
+	test_sysfs();
 	test_proc();
 	test_memfd();
 	test_shm();
