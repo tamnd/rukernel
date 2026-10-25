@@ -30,6 +30,7 @@ use rk_abi::native::futex::{
     FUTEX_TID_MASK, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET,
     FUTEX_WAITERS, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, ROBUST_LIST_LIMIT,
 };
+use rk_abi::native::time::{CLOCK_MONOTONIC, CLOCK_REALTIME};
 use rk_abi::native::types::{KernelTimespec, RobustListHead};
 use rk_frame::sync::SpinLock;
 use rk_frame::task::WaitQueue;
@@ -274,9 +275,9 @@ fn unlock_pi(thread: &Thread, vm: &Arc<AddressSpace>, addr: usize, private: bool
 }
 
 /// Reads the timeout of a wait and gives its deadline in ticks. `FUTEX_WAIT` has a relative
-/// timeout. `FUTEX_WAIT_BITSET` has an absolute time of the clock, and the clocks of R1 both
-/// count from boot.
-fn deadline(cx: &Cx<'_>, addr: u64, absolute: bool) -> Result<Option<u64>, Errno> {
+/// timeout, and `absolute` is `None`. The other waits have an absolute time of the clock that
+/// `absolute` gives.
+fn deadline(cx: &Cx<'_>, addr: u64, absolute: Option<u32>) -> Result<Option<u64>, Errno> {
     if addr == 0 {
         return Ok(None);
     }
@@ -285,8 +286,8 @@ fn deadline(cx: &Cx<'_>, addr: u64, absolute: bool) -> Result<Option<u64>, Errno
         return Err(Errno::EINVAL);
     }
     let ns = (ts.tv_sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(ts.tv_nsec as u64);
-    Ok(Some(if absolute {
-        ns.div_ceil(NSEC_PER_SEC / HZ)
+    Ok(Some(if let Some(clock) = absolute {
+        crate::info::boot_ns(clock, ns).div_ceil(NSEC_PER_SEC / HZ)
     } else {
         crate::info::deadline_after(ns)
     }))
@@ -349,6 +350,7 @@ pub(crate) fn futex(
 ) -> SysResult {
     let op = op as u32;
     let cmd = op & FUTEX_CMD_MASK & !FUTEX_PRIVATE_FLAG & !FUTEX_CLOCK_REALTIME;
+    let clock = if op & FUTEX_CLOCK_REALTIME != 0 { CLOCK_REALTIME } else { CLOCK_MONOTONIC };
     let private = op & FUTEX_PRIVATE_FLAG != 0;
     if op & FUTEX_CLOCK_REALTIME != 0 && !matches!(cmd, FUTEX_WAIT_BITSET | FUTEX_LOCK_PI2) {
         return Err(Errno::ENOSYS);
@@ -362,7 +364,7 @@ pub(crate) fn futex(
             if bitset == 0 {
                 return Err(Errno::EINVAL);
             }
-            let deadline = deadline(cx, utime, cmd == FUTEX_WAIT_BITSET)?;
+            let deadline = deadline(cx, utime, (cmd == FUTEX_WAIT_BITSET).then_some(clock))?;
             wait(cx.thread, &vm, addr, private, val, deadline, bitset)
         }
         FUTEX_WAKE | FUTEX_WAKE_BITSET => {
@@ -413,9 +415,11 @@ pub(crate) fn futex(
             }
             Ok(u64::from(woken))
         }
-        // The timeout of `FUTEX_LOCK_PI` and `FUTEX_LOCK_PI2` is an absolute time.
+        // The timeout of `FUTEX_LOCK_PI` and `FUTEX_LOCK_PI2` is an absolute time. The clock of
+        // `FUTEX_LOCK_PI` is always `CLOCK_REALTIME`.
         FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => {
-            let deadline = deadline(cx, utime, true)?;
+            let clock = if cmd == FUTEX_LOCK_PI { CLOCK_REALTIME } else { clock };
+            let deadline = deadline(cx, utime, Some(clock))?;
             lock_pi(cx.thread, &vm, addr, private, deadline, false)
         }
         FUTEX_TRYLOCK_PI => lock_pi(cx.thread, &vm, addr, private, None, true),

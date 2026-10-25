@@ -28,10 +28,25 @@ pub(crate) fn uptime_ns() -> u64 {
     rk_frame::time::clock_ns()
 }
 
-/// The time of `CLOCK_REALTIME`. R1 has no real time clock, so the time starts at the epoch at
-/// boot.
+/// The nanoseconds of `CLOCK_REALTIME`. The real time clock of the machine gives the time at boot.
+pub(crate) fn realtime_ns() -> u64 {
+    rk_frame::time::realtime_ns()
+}
+
+/// Gives `true` if `clock` follows the real time, as `CLOCK_REALTIME` does.
+pub(crate) fn is_realtime(clock: u32) -> bool {
+    matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI)
+}
+
+/// Gives the time since boot of the absolute time `ns` of `clock`. The timers of the kernel use
+/// the time since boot.
+pub(crate) fn boot_ns(clock: u32, ns: u64) -> u64 {
+    if is_realtime(clock) { ns.saturating_sub(rk_frame::time::realtime_offset_ns()) } else { ns }
+}
+
+/// The time of `CLOCK_REALTIME`.
 pub(crate) fn realtime() -> rk_vfs::inode::Timespec {
-    let ns = uptime_ns();
+    let ns = realtime_ns();
     rk_vfs::inode::Timespec { sec: (ns / NSEC_PER_SEC) as i64, nsec: (ns % NSEC_PER_SEC) as u32 }
 }
 
@@ -69,13 +84,10 @@ pub(crate) fn user_hz(ticks: u64) -> u64 {
 /// Gives the time of `clock` in nanoseconds, for the calls of `thread`.
 fn clock_ns(thread: &rk_proc::Thread, clock: u32) -> Result<u64, Errno> {
     match clock {
-        CLOCK_REALTIME
-        | CLOCK_REALTIME_COARSE
-        | CLOCK_TAI
-        | CLOCK_MONOTONIC
-        | CLOCK_MONOTONIC_RAW
-        | CLOCK_MONOTONIC_COARSE
-        | CLOCK_BOOTTIME => Ok(uptime_ns()),
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI => Ok(realtime_ns()),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
+            Ok(uptime_ns())
+        }
         CLOCK_PROCESS_CPUTIME_ID => Ok(ticks_ns(thread.process().user_ticks())),
         CLOCK_THREAD_CPUTIME_ID => Ok(ticks_ns(thread.user_ticks())),
         c if (c as i32) < 0 => cpu_clock_ns(thread, c as i32),
@@ -128,7 +140,7 @@ pub(crate) fn clock_getres(cx: &Cx<'_>, clock: u64, tp: u64) -> SysResult {
 }
 
 pub(crate) fn gettimeofday(cx: &Cx<'_>, tv: u64, tz: u64) -> SysResult {
-    let ns = uptime_ns();
+    let ns = realtime_ns();
     let v = KernelOldTimeval {
         tv_sec: (ns / NSEC_PER_SEC) as i64,
         tv_usec: (ns % NSEC_PER_SEC / 1000) as i64,
@@ -139,7 +151,7 @@ pub(crate) fn gettimeofday(cx: &Cx<'_>, tv: u64, tz: u64) -> SysResult {
 }
 
 pub(crate) fn time(cx: &Cx<'_>, tloc: u64) -> SysResult {
-    let sec = uptime_ns() / NSEC_PER_SEC;
+    let sec = realtime_ns() / NSEC_PER_SEC;
     cx.write_opt(tloc, &sec)?;
     Ok(sec)
 }
@@ -177,12 +189,13 @@ pub(crate) fn clock_nanosleep(
     }
     if flags as u32 & TIMER_ABSTIME != 0 {
         // The end does not change, so the call can start again with the same arguments.
-        if sleep_until(cx.thread, want.div_ceil(NSEC_PER_SEC / HZ)) {
+        let end = boot_ns(clock, want);
+        if sleep_until(cx.thread, end.div_ceil(NSEC_PER_SEC / HZ)) {
             return Err(Errno::ERESTARTNOHAND);
         }
         return Ok(0);
     }
-    sleep_relative(cx, now.saturating_add(want), rem)
+    sleep_relative(cx, uptime_ns().saturating_add(want), rem)
 }
 
 /// Sleeps until `end` in nanoseconds since boot, for a relative `clock_nanosleep`. If a signal

@@ -10,6 +10,12 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `/proc/PID/mountinfo`, with the fields of Linux. fstests and `findmnt` read it.
 - `statfs` and `fstatfs` give the block and inode counts of an ext4 file system, and the mount flags of the path as the `ST_*` flags. The `Inode` trait gets `fs_stat` for the counts.
 - `RK_BOOT_LOG` tells `cargo xtask boot-test` to print the full log of a test that passes.
+- The kernel reads the real time clock of the CMOS memory at boot on x86-64, as `mc146818_get_time` of Linux. `CLOCK_REALTIME`, `CLOCK_REALTIME_COARSE`, `CLOCK_TAI`, `gettimeofday`, `time`, the vDSO and the file times count from that time. Before this change, the real time started at 1970 at boot.
+- An absolute time of a real time clock in `clock_nanosleep`, `timer_settime`, `timerfd_settime` and `futex` changes to the time since boot. `FUTEX_LOCK_PI` uses `CLOCK_REALTIME`, and `FUTEX_WAIT_BITSET` and `FUTEX_LOCK_PI2` use it with `FUTEX_CLOCK_REALTIME`, as Linux.
+
+### Fixed
+
+- `e2fsck` reported the orphan list of an ext4 disk as corrupt after generic/001 of fstests. The deletion time of a freed inode was a few seconds after 1970, smaller than the inode count, so e2fsck read it as a link of the orphan list.
 
 ## [0.3.4] - 2026-10-25
 

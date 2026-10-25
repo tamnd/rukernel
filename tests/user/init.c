@@ -231,7 +231,7 @@ static void test_vdso(void)
 							   timespec_ns(&s) <= timespec_ns(&b));
 	struct timespec d = { 0, 20 * 1000 * 1000 };
 	nanosleep(&d, NULL);
-	vgettime(CLOCK_REALTIME, &b);
+	vgettime(CLOCK_MONOTONIC, &b);
 	check("the vDSO time goes forward in a sleep", timespec_ns(&b) - timespec_ns(&s) >= 10 * 1000 * 1000);
 	check("__vdso_clock_gettime of a CPU clock", vgettime(CLOCK_PROCESS_CPUTIME_ID, &a) == 0);
 	check("__vdso_clock_gettime of a bad clock", vgettime(1000, &a) == -EINVAL);
@@ -243,7 +243,10 @@ static void test_vdso(void)
 	unsigned cpu = 7, node = 7;
 	check("__vdso_getcpu", vgetcpu(&cpu, &node) == 0 && cpu < (unsigned)sysconf(_SC_NPROCESSORS_ONLN) && node == 0);
 	struct timespec m;
+	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &s);
 	check("clock_gettime of libc", clock_gettime(CLOCK_MONOTONIC, &m) == 0 && timespec_ns(&m) >= timespec_ns(&s));
+	syscall(SYS_clock_gettime, CLOCK_REALTIME, &s);
+	check("CLOCK_REALTIME is the time of the real time clock", s.tv_sec > 1700000000);
 }
 
 static volatile sig_atomic_t got_sig, got_code, got_pid, chld_count, on_altstack;

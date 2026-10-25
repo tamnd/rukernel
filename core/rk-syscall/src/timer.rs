@@ -110,6 +110,7 @@ pub(crate) fn alarm(cx: &Cx<'_>, seconds: u64) -> SysResult {
 
 pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysResult {
     let process = cx.process();
+    let realtime = crate::info::is_realtime(clock as u32);
     let clock = match clock as u32 {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => Clock::Boot,
         CLOCK_PROCESS_CPUTIME_ID => Clock::ProcessCpu(Arc::downgrade(process)),
@@ -148,7 +149,11 @@ pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysR
         .add(|id| {
             let mut info = SigInfo::new(signo, SI_TIMER, id as u32);
             info.value = value.unwrap_or(id as u64);
-            Timer::new(clock, target, info)
+            if realtime {
+                Timer::new_realtime(target, info)
+            } else {
+                Timer::new(clock, target, info)
+            }
         })
         .ok_or(Errno::EAGAIN)?;
     if let Err(e) = cx.write_val(idp, &id) {
@@ -180,7 +185,11 @@ pub(crate) fn timer_settime(cx: &Cx<'_>, id: u64, flags: u64, new: u64, old: u64
         0
     } else if flags as u32 & TIMER_ABSTIME != 0 {
         // A time in the past fires the timer at once.
-        value.max(1)
+        if timer.is_realtime() {
+            crate::info::boot_ns(CLOCK_REALTIME, value).max(1)
+        } else {
+            value.max(1)
+        }
     } else {
         now.saturating_add(value)
     };

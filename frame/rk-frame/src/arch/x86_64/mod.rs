@@ -9,6 +9,7 @@ mod gdt;
 mod idt;
 pub(crate) mod io;
 pub(crate) mod paging;
+pub(crate) mod rtc;
 pub(crate) mod serial;
 pub(crate) mod smp;
 pub(crate) mod task;

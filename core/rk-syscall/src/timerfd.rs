@@ -121,7 +121,8 @@ pub(crate) fn timerfd_create(cx: &Cx<'_>, clock: u64, flags: u64) -> SysResult {
     if flags & !(TFD_CLOEXEC | TFD_NONBLOCK) != 0 {
         return Err(Errno::EINVAL);
     }
-    // rukernel has one clock, so each clock of a timer file counts the time since boot.
+    // The timer counts the time since boot. A timer of the real time changes an absolute time to
+    // the time since boot.
     match clock as u32 {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_REALTIME_ALARM
         | CLOCK_BOOTTIME_ALARM => {}
@@ -133,7 +134,11 @@ pub(crate) fn timerfd_create(cx: &Cx<'_>, clock: u64, flags: u64) -> SysResult {
         events: AtomicU64::new(0),
     });
     let weak: Weak<dyn Expire> = Arc::downgrade(&ticks) as Weak<dyn Expire>;
-    let timer = Timer::new(Clock::Boot, Target::Notify(weak), SigInfo::new(0, 0, 0));
+    let timer = if matches!(clock as u32, CLOCK_REALTIME | CLOCK_REALTIME_ALARM) {
+        Timer::new_realtime(Target::Notify(weak), SigInfo::new(0, 0, 0))
+    } else {
+        Timer::new(Clock::Boot, Target::Notify(weak), SigInfo::new(0, 0, 0))
+    };
     let file =
         File::with_ops(Arc::new(TimerFd { timer, ticks }), None, O_RDWR | (flags & TFD_NONBLOCK));
     Ok(cx.files()?.lock().insert(file, flags & TFD_CLOEXEC != 0)? as u64)
@@ -170,7 +175,11 @@ pub(crate) fn timerfd_settime(cx: &Cx<'_>, fd: u64, flags: u64, new: u64, old: u
         0
     } else if flags & TFD_TIMER_ABSTIME != 0 {
         // A time in the past fires the timer at once.
-        value.max(1)
+        if tfd.timer.is_realtime() {
+            crate::info::boot_ns(CLOCK_REALTIME, value).max(1)
+        } else {
+            value.max(1)
+        }
     } else {
         tfd.timer.now().saturating_add(value)
     };
