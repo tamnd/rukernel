@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR` ioctls. They give and change the inode flags as the `FS_XFLAG_*` flags, as `xfs_io` uses them. A project id other than 0 gives `EOPNOTSUPP`, and an extent size hint gives `EINVAL`.
 - The `FIBMAP` and `FIGETBSZ` ioctls. `FIBMAP` gives the block of the disk of a block of a file on ext4, and 0 for a hole. generic/519 needs it.
+- `statx` gives the compressed, immutable, append-only and nodump attributes in `stx_attributes`, from the inode flags. generic/424 checks them.
 
 ### Fixed
 

@@ -287,18 +287,31 @@ pub(crate) fn fstat(cx: &Cx<'_>, fd: u64, buf: u64) -> SysResult {
 /// Finds the file of a `*at` call with `AT_EMPTY_PATH` and `AT_SYMLINK_NOFOLLOW`, and gives its
 /// attributes.
 fn lookup_meta(cx: &Cx<'_>, dirfd: u64, path: u64, flags: u32) -> Result<Metadata, Errno> {
+    Ok(lookup(cx, dirfd, path, flags)?.0)
+}
+
+/// Gives the metadata of the file of `stat` and `statx`, and its inode if it has one.
+fn lookup(
+    cx: &Cx<'_>,
+    dirfd: u64,
+    path: u64,
+    flags: u32,
+) -> Result<(Metadata, Option<rk_vfs::InodeRef>), Errno> {
     let empty_ok = flags & AT_EMPTY_PATH as u32 != 0;
     let path = cx.read_path_opt(path, empty_ok)?;
     if path.is_empty() {
         if dirfd as i32 == rk_abi::native::at::AT_FDCWD {
-            return Ok(cx.fs()?.cwd().inode().metadata());
+            let inode = cx.fs()?.cwd().inode().clone();
+            return Ok((inode.metadata(), Some(inode)));
         }
-        return cx.file(dirfd)?.metadata();
+        let file = cx.file(dirfd)?;
+        return Ok((file.metadata()?, file.inode().cloned()));
     }
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let follow = flags & AT_SYMLINK_NOFOLLOW as u32 == 0;
-    Ok(fs.resolve(&start, &path, follow)?.inode().metadata())
+    let inode = fs.resolve(&start, &path, follow)?.inode().clone();
+    Ok((inode.metadata(), Some(inode)))
 }
 
 pub(crate) fn fstatat(cx: &Cx<'_>, dirfd: u64, path: u64, buf: u64, flags: u64) -> SysResult {
@@ -315,9 +328,16 @@ pub(crate) fn statx(
     _mask: u64,
     buf: u64,
 ) -> SysResult {
-    let meta = lookup_meta(cx, dirfd, path, flags as u32)?;
+    let (meta, inode) = lookup(cx, dirfd, path, flags as u32)?;
     let mut s = Statx::new_zeroed();
     s.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
+    // The `STATX_ATTR_*` bits of these flags are the bits of the inode flags.
+    if let Some(Ok(f)) = inode.map(|i| i.attr_flags()) {
+        let known =
+            STATX_ATTR_COMPRESSED | STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP;
+        s.stx_attributes = u64::from(f) & known;
+        s.stx_attributes_mask = known;
+    }
     s.stx_blksize = meta.blksize;
     s.stx_nlink = meta.nlink;
     s.stx_uid = meta.uid;
@@ -336,6 +356,12 @@ pub(crate) fn statx(
     cx.write_val(buf, &s)?;
     Ok(0)
 }
+
+/// The `STATX_ATTR_*` bits of `stx_attributes`, from `<linux/stat.h>`.
+const STATX_ATTR_COMPRESSED: u64 = 0x4;
+const STATX_ATTR_IMMUTABLE: u64 = 0x10;
+const STATX_ATTR_APPEND: u64 = 0x20;
+const STATX_ATTR_NODUMP: u64 = 0x40;
 
 /// The bits of `f_flags` of `statfs`, as `ST_*` of Linux. `ST_VALID` tells that the field is
 /// set.
