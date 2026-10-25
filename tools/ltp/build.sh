@@ -22,7 +22,8 @@ sched_setscheduler sched_get_priority_max sched_get_priority_min sched_rr_get_in
 sched_setattr sched_getattr getcpu rt_sigsuspend sigsuspend rt_sigtimedwait sigpending
 rt_sigqueueinfo tgkill sigwaitinfo sigtimedwait sigwait pause alarm timer_create timer_settime
 timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority nice fsopen fsconfig
-fsmount fspick move_mount open_tree"
+fsmount fspick move_mount open_tree setxattr getxattr listxattr removexattr fsetxattr fgetxattr
+flistxattr fremovexattr lgetxattr llistxattr lremovexattr sendfile splice copy_file_range fadvise"
 
 out=${1:?usage: tools/ltp/build.sh OUT_DIR}
 mkdir -p "$out"
