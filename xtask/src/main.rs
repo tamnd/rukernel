@@ -662,6 +662,12 @@ if [ -x /usr/bin/gdb ]; then
         --rw=randwrite --size=1M --verify=crc32c --thread --output=/tmp/fio.log
     grep -q 'rk: (groupid=0, jobs=1): err= 0' /tmp/fio.log || { cat /tmp/fio.log; exit 1; }
     echo 'alpine: fio done'
+    udevadm info --query=all --name=/dev/vda > /tmp/udev.log 2>&1 || { cat /tmp/udev.log; exit 1; }
+    grep -q '^P: /devices/virtual/block/vda$' /tmp/udev.log
+    grep -q '^E: DEVNAME=/dev/vda$' /tmp/udev.log
+    grep -q '^E: DEVTYPE=disk$' /tmp/udev.log
+    grep -q '^E: SUBSYSTEM=block$' /tmp/udev.log
+    echo 'alpine: udevadm done'
     mkdir -p /tmp/tree/a/b/c /tmp/tree/many /mnt
     cp -a /etc /tmp/tree/etc
     head -c 3000000 /dev/urandom > /tmp/tree/a/big
