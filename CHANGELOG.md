@@ -8,14 +8,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The files `dirty_ratio`, `dirty_background_ratio`, `dirty_bytes`, `dirty_background_bytes`, `dirty_expire_centisecs` and `dirty_writeback_centisecs` in `/proc/sys/vm`. They keep the value that a program writes, but the writeback does not use them yet. generic/460 needs them.
 - The `FS_IOC_GOINGDOWN` ioctl on ext4, as `EXT4_IOC_SHUTDOWN` of Linux. After it, a change, a read of the data of a file and `fsync` give `EIO`, and nothing goes to the disk again. The unmount leaves the journal, so the next mount replays it as after a crash. `LOGFLUSH` and the default flags first make the changes durable, and `NOLOGFLUSH` loses the changes since the last commit. The fstests that need `_require_scratch_shutdown` can run now.
+- `chattr +e` and `chattr -e` on ext4. `+e` moves a file or a directory from a block map to an extent tree, and the tree uses the indirect blocks of the map first. `-e` moves a file to a block map, as Linux, only if the tree has at most one extent that has data and fits in the 12 direct blocks. ext4/005 needs it.
+- The ext4 mount options `minixdf` and `bsddf`. With `minixdf`, `statfs` counts the blocks of the metadata and of the journal in the count of blocks, as Linux. ext4/042 checks it.
 
 ### Fixed
 
 - An ext4 disk with a block size larger than 4096 does not mount and gives `EINVAL`, as Linux on a page size of 4096. Before, the mount gave `EROFS`, so `mount` tried again read-only, and generic/466 could not write to the disk.
 - `lseek` with `SEEK_DATA` and `SEEK_HOLE` finds the holes of a file from its extents, on ext4 and on an overlay over ext4. An unwritten extent is a hole. Before, all the file was data, and generic/448 did not run.
 - `sync_file_range` is a system call. It checks its arguments like Linux and syncs all the file when a flag is set. Before, it gave ENOSYS, and generic/285 stopped at its eighth test.
-- `chattr +e` and `chattr -e` on ext4. `+e` moves a file or a directory from a block map to an extent tree, and the tree uses the indirect blocks of the map first. `-e` moves a file to a block map, as Linux, only if the tree has at most one extent that has data and fits in the 12 direct blocks. ext4/005 needs it.
-- The ext4 mount options `minixdf` and `bsddf`. With `minixdf`, `statfs` counts the blocks of the metadata and of the journal in the count of blocks, as Linux. ext4/042 checks it.
 
 ## [0.3.11] - 2026-10-25
 
