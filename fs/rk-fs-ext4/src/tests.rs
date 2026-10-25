@@ -605,11 +605,52 @@ fn many_entries_and_extents_grow_the_trees() {
 }
 
 #[test]
-fn a_block_map_file_changes_only_in_its_blocks() {
-    let (fs, _ram) = open_rw();
+fn a_block_map_file_grows_and_shrinks() {
+    let (fs, ram) = open_rw();
+    let free = ram.free().0;
     let old = fs.root().unwrap().lookup(b"sub").unwrap().lookup(b"old").unwrap();
     old.write_at(5, b"in").unwrap();
-    assert_eq!(old.write_at(2 * BS as u64, b"hole"), Err(Errno::EOPNOTSUPP));
+    // A hole in the direct blocks takes one block.
+    old.write_at(2 * BS as u64, b"hole").unwrap();
+    assert_eq!(ram.free().0, free - 1);
+    // The block 300 is under the double indirect block, so it also takes two indirect blocks.
+    old.write_at(300 * BS as u64 + 7, b"far").unwrap();
+    assert_eq!(ram.free().0, free - 4);
+    assert_eq!(old.metadata().size, 300 * BS as u64 + 10);
+    drop((old, fs));
+    let old = again(&ram).root().unwrap().lookup(b"sub").unwrap().lookup(b"old").unwrap();
+    let data = read_all(&*old);
+    assert_eq!(&data[5..7], b"in");
+    assert_eq!(&data[2 * BS..2 * BS + 4], b"hole");
+    assert_eq!(&data[300 * BS + 7..], b"far");
+    assert_eq!(data[13 * BS - 1], 2);
+    assert!(data[13 * BS..300 * BS].iter().all(|&b| b == 0));
+    drop(old);
+    // A truncate to one block frees all the blocks but the first, and the indirect blocks.
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let old = fs.root().unwrap().lookup(b"sub").unwrap().lookup(b"old").unwrap();
+    old.set_attr(&SetAttr { size: Some(BS as u64), ..SetAttr::default() }).unwrap();
+    assert_eq!(ram.free().0, free + 2);
+    assert_eq!(old.fiemap(0, u64::MAX).unwrap().len(), 1);
+}
+
+#[test]
+fn a_disk_without_extents_keeps_new_files_in_a_block_map() {
+    let mut img = image();
+    img[1024 + 0x60] &= !(layout::incompat::EXTENTS as u8);
+    let ram = Ram(Arc::new(SpinLock::new(img)));
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let root = fs.root().unwrap();
+    let file = root.create(b"new", FileType::Regular, 0o644, 0).unwrap();
+    let data: Vec<u8> = (0..14 * BS).map(|i| (i % 251) as u8).collect();
+    file.write_at(0, &data).unwrap();
+    assert_eq!(file.attr_flags().unwrap() & flags::EXTENTS, 0);
+    // 14 data blocks and the indirect block for the blocks 12 and 13.
+    assert_eq!(file.metadata().blocks, (15 * BS / 512) as u64);
+    assert_eq!(file.set_attr_flags(flags::EXTENTS), Err(Errno::EINVAL));
+    drop((file, root, fs));
+    let file = again(&ram).root().unwrap().lookup(b"new").unwrap();
+    assert_eq!(read_all(&*file), data);
 }
 
 mod log {
