@@ -12,7 +12,7 @@ use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::signal::{
     MINSIGSTKSZ, SA_NODEFER, SA_ONSTACK, SA_RESTART, SA_RESTORER, SIG_BLOCK, SIG_SETMASK,
-    SIG_UNBLOCK, SIGKILL, SIGSEGV, SIGSTOP, SIGTRAP,
+    SIG_UNBLOCK, SIGCONT, SIGKILL, SIGSEGV, SIGSTOP, SIGTRAP,
 };
 use rk_abi::native::syscalls as nr;
 use rk_abi::native::types::{KernelTimespec, Sigaltstack};
@@ -465,6 +465,37 @@ pub(crate) fn signal_group(pgid: Pid, info: SigInfo) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Checks that the caller can send `sig` to `target`, as `check_kill_permission` of Linux. A
+/// process in the same session can always send `SIGCONT`.
+fn may_signal(cx: &Cx<'_>, target: &Process, sig: u32) -> Result<(), Errno> {
+    let me = cx.process();
+    if me.cred().may_kill(&target.cred()) || (sig == SIGCONT && me.sid() == target.sid()) {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
+/// Sends `info` to each process in the group `pgid` that the caller can signal, as
+/// `__kill_pgrp_info` of Linux. Gives `ESRCH` if the group is empty, and `EPERM` if the caller
+/// can signal no process of it.
+fn kill_group(cx: &Cx<'_>, pgid: Pid, info: SigInfo) -> Result<(), Errno> {
+    let members: alloc::vec::Vec<Arc<Process>> =
+        rk_proc::processes().into_iter().filter(|p| p.pgid() == pgid && !p.is_zombie()).collect();
+    let mut result = Err(Errno::ESRCH);
+    for p in members {
+        match may_signal(cx, &p, info.signo) {
+            Ok(()) => {
+                rk_proc::send_signal(&p, info);
+                result = Ok(());
+            }
+            Err(e) if result.is_err() => result = Err(e),
+            Err(_) => {}
+        }
+    }
+    result
+}
+
 pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
     if sig > u64::from(NSIG) {
         return Err(Errno::EINVAL);
@@ -472,11 +503,16 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
     let me = cx.process();
     let info = SigInfo::new(sig as u32, SI_USER, me.pid());
     match pid as i32 {
-        0 => signal_group(me.pgid(), info)?,
+        0 => kill_group(cx, me.pgid(), info)?,
         -1 => {
+            // A process that the caller cannot signal does not count, as in Linux.
             let mut count = 0;
             for p in rk_proc::processes() {
-                if p.pid() != rk_proc::INIT_PID && p.pid() != me.pid() && !p.is_zombie() {
+                if p.pid() != rk_proc::INIT_PID
+                    && p.pid() != me.pid()
+                    && !p.is_zombie()
+                    && may_signal(cx, &p, info.signo).is_ok()
+                {
                     rk_proc::send_signal(&p, info);
                     count += 1;
                 }
@@ -489,10 +525,11 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
             let target = rk_proc::find_process(p as Pid)
                 .or_else(|| rk_proc::find_thread(p as Pid).map(|t| t.process().clone()))
                 .ok_or(Errno::ESRCH)?;
+            may_signal(cx, &target, info.signo)?;
             rk_proc::send_signal(&target, info);
         }
         i32::MIN => return Err(Errno::ESRCH),
-        p => signal_group(p.unsigned_abs(), info)?,
+        p => kill_group(cx, p.unsigned_abs(), info)?,
     }
     Ok(0)
 }
@@ -509,6 +546,7 @@ fn signal_thread(cx: &Cx<'_>, tgid: Option<u64>, tid: u64, sig: u64) -> SysResul
     if tgid.is_some_and(|g| thread.process().pid() != g as Pid) {
         return Err(Errno::ESRCH);
     }
+    may_signal(cx, thread.process(), sig as u32)?;
     if sig != 0 {
         thread.send_signal(SigInfo::new(sig as u32, SI_TKILL, cx.process().pid()));
     }
@@ -596,6 +634,7 @@ pub(crate) fn rt_sigqueueinfo(cx: &Cx<'_>, tgid: u64, sig: u64, uinfo: u64) -> S
         .or_else(|| rk_proc::find_thread(tgid as Pid).map(|t| t.process().clone()))
         .filter(|p| tgid as i32 > 0 && !p.is_zombie())
         .ok_or(Errno::ESRCH)?;
+    may_signal(cx, &target, sig as u32)?;
     if sig != 0 {
         rk_proc::send_signal(&target, info);
     }
@@ -616,6 +655,7 @@ pub(crate) fn rt_tgsigqueueinfo(
     let thread = rk_proc::find_thread(tid as Pid)
         .filter(|t| t.process().pid() == tgid as Pid)
         .ok_or(Errno::ESRCH)?;
+    may_signal(cx, thread.process(), sig as u32)?;
     if sig != 0 {
         thread.send_signal(info);
     }

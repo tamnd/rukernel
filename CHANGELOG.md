@@ -24,6 +24,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `chmod` clears the set-group-ID bit if the process is not in the group of the file and has no `CAP_FSETID`. `chown` of a file that is not a directory clears the set-user-ID bit, and the set-group-ID bit if the group can run the file.
 - A write, a truncate or an `fallocate` of a regular file by a process without `CAP_FSETID` clears the set-user-ID bit, and the set-group-ID bit if the group can run the file.
 - The `trusted.` extended attributes need `CAP_SYS_ADMIN`, and `listxattr` hides them from other processes. A `user.` attribute needs the read or the write permission on the file, and in a sticky directory only the owner can change one.
+- `kill`, `tkill`, `tgkill`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo` need the same user as the target or `CAP_KILL`, as `check_kill_permission` of Linux. A process can always send `SIGCONT` in its session. `kill` of a group or of all processes skips the processes that the caller cannot signal.
+- `PTRACE_ATTACH` and `PTRACE_SEIZE` need the same IDs as the target and its permitted capabilities, or `CAP_SYS_PTRACE`. `PTRACE_O_SUSPEND_SECCOMP` needs `CAP_SYS_ADMIN`.
+- `prlimit64` and `setrlimit` need `CAP_SYS_RESOURCE` to raise a hard limit, and `prlimit64` on another process needs the same IDs. `setpriority` needs `CAP_SYS_NICE` to change a process of another user or to go below the nice value that `RLIMIT_NICE` allows. `PRIO_USER` selects the processes of the user.
+- `mount`, `umount2`, `fsopen`, `fspick`, `fsmount`, `move_mount` and `open_tree` with `OPEN_TREE_CLONE` need `CAP_SYS_ADMIN`. The `syslog` actions other than the full read and the size need `CAP_SYSLOG` or `CAP_SYS_ADMIN`.
 
 ### Fixed
 

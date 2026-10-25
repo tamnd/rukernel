@@ -63,6 +63,16 @@ const DATA_MAX: usize = 4096;
 /// The propagation types.
 const PROPAGATION: u32 = MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE;
 
+/// Checks that the caller can change the mounts: it needs `CAP_SYS_ADMIN`, as `may_mount` of
+/// Linux.
+fn may_mount(cx: &Cx<'_>) -> Result<(), Errno> {
+    if cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
 pub(crate) fn mount(
     cx: &Cx<'_>,
     source: u64,
@@ -71,6 +81,7 @@ pub(crate) fn mount(
     flags: u64,
     data: u64,
 ) -> SysResult {
+    may_mount(cx)?;
     let mut flags = flags as u32;
     // Old programs put the magic number 0xC0ED in the high 16 bits.
     if flags & MS_MGC_MSK == MS_MGC_VAL {
@@ -172,6 +183,7 @@ pub(crate) fn umount2(cx: &Cx<'_>, target: u64, flags: u64) -> SysResult {
     {
         return Err(Errno::EINVAL);
     }
+    may_mount(cx)?;
     let target = cx.read_path(target)?;
     let fs = cx.fs()?;
     let at = fs.resolve(fs.cwd(), &target, flags & UMOUNT_NOFOLLOW == 0)?;
@@ -246,6 +258,7 @@ fn mount_fd(cx: &Cx<'_>, fs: &FsContext, mount: Arc<Mount>, cloexec: bool) -> Sy
 }
 
 pub(crate) fn fsopen(cx: &Cx<'_>, name: u64, flags: u64) -> SysResult {
+    may_mount(cx)?;
     if flags & !u64::from(FSOPEN_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -261,6 +274,7 @@ pub(crate) fn fspick(cx: &Cx<'_>, dfd: u64, path: u64, flags: u64) -> SysResult 
     if flags & !u64::from(known) != 0 {
         return Err(Errno::EINVAL);
     }
+    may_mount(cx)?;
     let flags = flags as u32;
     let fs = cx.fs()?;
     let empty = flags & FSPICK_EMPTY_PATH != 0;
@@ -420,6 +434,7 @@ pub(crate) fn fsmount(cx: &Cx<'_>, fd: u64, flags: u64, attr: u64) -> SysResult 
     if flags & !u64::from(FSMOUNT_CLOEXEC) != 0 {
         return Err(Errno::EINVAL);
     }
+    may_mount(cx)?;
     let attr = attr_flags(u32::try_from(attr).map_err(|_| Errno::EINVAL)?)?;
     let file = context(cx, fd)?;
     let Some(ctx) = file.ops().as_any().and_then(|a| a.downcast_ref::<FsCtx>()) else {
@@ -448,6 +463,7 @@ pub(crate) fn move_mount(
     to_path: u64,
     flags: u64,
 ) -> SysResult {
+    may_mount(cx)?;
     let known = MOVE_MOUNT_F_SYMLINKS
         | MOVE_MOUNT_F_AUTOMOUNTS
         | MOVE_MOUNT_F_EMPTY_PATH
@@ -500,6 +516,9 @@ pub(crate) fn open_tree(cx: &Cx<'_>, dfd: u64, path: u64, flags: u64) -> SysResu
     let clone = flags & OPEN_TREE_CLONE != 0;
     if flags & AT_RECURSIVE as u32 != 0 && !clone {
         return Err(Errno::EINVAL);
+    }
+    if clone {
+        may_mount(cx)?;
     }
     let fs = cx.fs()?;
     let empty = flags & AT_EMPTY_PATH as u32 != 0;

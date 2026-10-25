@@ -93,10 +93,13 @@ const MAX_ERRNO: i64 = 4095;
 /// `SECCOMP_FILTER_FLAG_LOG` in `struct seccomp_metadata`.
 const SECCOMP_FILTER_FLAG_LOG: u64 = 1 << 1;
 
-/// Checks that the tracer can set `PTRACE_O_SUSPEND_SECCOMP`: a tracer in a `seccomp` mode
-/// cannot, as in Linux.
+/// Checks that the tracer can set `PTRACE_O_SUSPEND_SECCOMP`: it needs `CAP_SYS_ADMIN`, and a
+/// tracer in a `seccomp` mode cannot, as in Linux.
 fn check_suspend_seccomp(cx: &Cx<'_>, options: u64) -> Result<(), Errno> {
-    if options & u64::from(PTRACE_O_SUSPEND_SECCOMP) != 0 && cx.thread.seccomp_mode() != 0 {
+    if options & u64::from(PTRACE_O_SUSPEND_SECCOMP) != 0
+        && (cx.thread.seccomp_mode() != 0
+            || !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN))
+    {
         return Err(Errno::EPERM);
     }
     Ok(())
@@ -111,12 +114,23 @@ fn check_seccomp_access(cx: &Cx<'_>) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Checks that the caller can attach to `thread`, with the rules of `ptrace_may_access` of
+/// Linux.
+fn may_attach(cx: &Cx<'_>, thread: &Thread) -> Result<(), Errno> {
+    if cx.process().cred().may_ptrace(&thread.process().cred()) {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
+}
+
 pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) -> SysResult {
     let pid = pid as u32 as Pid;
     match request {
         PTRACE_TRACEME => return ptrace::trace_me(cx.thread).map(|()| 0),
         PTRACE_ATTACH => {
             let thread = rk_proc::find_thread(pid).ok_or(Errno::ESRCH)?;
+            may_attach(cx, &thread)?;
             ptrace::attach(cx.process(), &thread, false, 0)?;
             thread.send_signal(SigInfo::new(SIGSTOP, SI_USER, cx.process().pid()));
             return Ok(0);
@@ -127,6 +141,7 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             }
             check_suspend_seccomp(cx, data)?;
             let thread = rk_proc::find_thread(pid).ok_or(Errno::ESRCH)?;
+            may_attach(cx, &thread)?;
             ptrace::attach(cx.process(), &thread, true, data as u32)?;
             return Ok(0);
         }

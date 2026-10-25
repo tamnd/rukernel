@@ -13,6 +13,10 @@ pub const RLIMIT_STACK: usize = 3;
 pub const RLIMIT_NPROC: usize = 6;
 /// The number of open files.
 pub const RLIMIT_NOFILE: usize = 7;
+/// The lowest nice value without `CAP_SYS_NICE`, as `20 - limit`.
+pub const RLIMIT_NICE: usize = 13;
+/// The highest real-time priority without `CAP_SYS_NICE`.
+pub const RLIMIT_RTPRIO: usize = 14;
 /// The value that tells that a resource has no limit.
 pub const RLIM_INFINITY: u64 = u64::MAX;
 /// The highest hard limit of `RLIMIT_NOFILE`. Linux names it `fs.nr_open`, and 1048576 is its
@@ -37,6 +41,8 @@ pub fn defaults(stack: u64, nproc: u64, nofile: u64) -> [Limit; RLIM_NLIMITS] {
     limits[RLIMIT_NOFILE] = Limit { cur: nofile, max: 4096 };
     // Linux writes no core file by default.
     limits[RLIMIT_CORE].cur = 0;
+    limits[RLIMIT_NICE] = Limit { cur: 0, max: 0 };
+    limits[RLIMIT_RTPRIO] = Limit { cur: 0, max: 0 };
     limits
 }
 
@@ -48,6 +54,7 @@ mod tests {
     fn the_defaults_are_those_of_linux() {
         let l = defaults(8 << 20, 4_194_304, 1024);
         assert_eq!(l[RLIMIT_CORE], Limit { cur: 0, max: RLIM_INFINITY });
+        assert_eq!(l[RLIMIT_NICE], Limit { cur: 0, max: 0 });
         assert_eq!(l[RLIMIT_STACK].cur, 8 << 20);
         assert_eq!(l[RLIMIT_NOFILE], Limit { cur: 1024, max: 4096 });
         assert_eq!(l[0].cur, RLIM_INFINITY);

@@ -203,6 +203,22 @@ static void test_perms(void)
 		check("setxattr of a user attribute on a file of root gives EACCES",
 		      syscall(SYS_setxattr, "/tmp/perm.secret", "user.a", "v", 1, 0) == -1 &&
 			      errno == EACCES);
+		check("kill of init as a user gives EPERM", kill(1, 0) == -1 && errno == EPERM);
+		check("kill of the process itself", kill(getpid(), 0) == 0);
+		check("ptrace attach to init gives EPERM",
+		      ptrace(PTRACE_ATTACH, 1, 0, 0) == -1 && errno == EPERM);
+		check("a lower nice value without CAP_SYS_NICE gives EACCES",
+		      setpriority(PRIO_PROCESS, 0, -5) == -1 && errno == EACCES &&
+			      setpriority(PRIO_PROCESS, 0, 5) == 0);
+		struct rlimit rl;
+		getrlimit(RLIMIT_NOFILE, &rl);
+		rl.rlim_max--;
+		check("a lower hard limit", setrlimit(RLIMIT_NOFILE, &rl) == 0);
+		rl.rlim_max++;
+		check("a higher hard limit without CAP_SYS_RESOURCE gives EPERM",
+		      setrlimit(RLIMIT_NOFILE, &rl) == -1 && errno == EPERM);
+		check("mount without CAP_SYS_ADMIN gives EPERM",
+		      mount("none", "/tmp", "tmpfs", 0, NULL) == -1 && errno == EPERM);
 		_exit(failed);
 	}
 	int status;
