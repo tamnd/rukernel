@@ -440,6 +440,14 @@ fn the_extent_flag_moves_the_file() {
 }
 
 #[test]
+fn minixdf_counts_all_the_blocks() {
+    let (fs, _ram) = open_rw();
+    assert!(fs.stat().blocks < 64);
+    fs.minix_df.store(true, core::sync::atomic::Ordering::Relaxed);
+    assert_eq!(fs.stat().blocks, 64);
+}
+
+#[test]
 fn collapse_and_insert_move_the_blocks() {
     use rk_vfs::inode::falloc::{COLLAPSE_RANGE, INSERT_RANGE};
     let (fs, ram) = open_rw();
