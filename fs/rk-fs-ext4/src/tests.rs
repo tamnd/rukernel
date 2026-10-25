@@ -279,6 +279,10 @@ fn a_bad_superblock_does_not_mount() {
     let mut img = image();
     img[1024 + 0x62] = 0x01;
     assert_eq!(open(img).err(), Some(Errno::EOPNOTSUPP));
+    // A block size of 8192 is larger than the page size.
+    let mut img = image();
+    img[1024 + 0x18] = 3;
+    assert_eq!(open(img).err(), Some(Errno::EINVAL));
 }
 
 #[test]

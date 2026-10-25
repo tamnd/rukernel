@@ -230,10 +230,13 @@ impl Fs {
         if sb.incompat & layout::incompat::META_BG != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
+        // Linux does not mount a block size larger than the page size.
+        if sb.block_size > 4096 {
+            return Err(Errno::EINVAL);
+        }
         let can_write = sb.ro_compat & !layout::ro_compat::WRITABLE == 0
             && sb.incompat & layout::incompat::MMP == 0
-            && sb.incompat & layout::incompat::EXTENTS != 0
-            && sb.block_size <= 4096;
+            && sb.incompat & layout::incompat::EXTENTS != 0;
         if !read_only && !can_write {
             return Err(Errno::EROFS);
         }
