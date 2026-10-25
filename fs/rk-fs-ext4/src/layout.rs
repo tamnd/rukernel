@@ -80,6 +80,10 @@ pub mod bg {
 
 /// The offsets of the fields of the superblock that the driver changes.
 pub mod sb {
+    /// The low 32 bits of the number of blocks for the superuser only.
+    pub const R_BLOCKS: usize = 0x8;
+    /// The high 32 bits of the number of blocks for the superuser only.
+    pub const R_BLOCKS_HI: usize = 0x154;
     /// The low 32 bits of the number of free blocks.
     pub const FREE_BLOCKS: usize = 0xc;
     /// The high 32 bits of the number of free blocks.

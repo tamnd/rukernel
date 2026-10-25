@@ -9,6 +9,10 @@ use rk_abi::native::fcntl::{
     F_OFD_SETLKW, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETPIPE_SZ, FD_CLOEXEC,
 };
 use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
+use rk_abi::native::mount::{
+    MS_MANDLOCK, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW,
+    MS_RDONLY, MS_RELATIME, MS_SYNCHRONOUS,
+};
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::stat::{STATX_BASIC_STATS, STATX_MNT_ID};
@@ -331,28 +335,69 @@ pub(crate) fn statx(
     Ok(0)
 }
 
-fn statfs_of(meta: &Metadata, magic: u64) -> Statfs {
+/// The bits of `f_flags` of `statfs`, as `ST_*` of Linux. `ST_VALID` tells that the field is
+/// set.
+const ST_VALID: i64 = 0x20;
+const ST_RELATIME: i64 = 0x1000;
+const ST_NOSYMFOLLOW: i64 = 0x2000;
+
+/// The `f_flags` field of `statfs` for a mount with the flags `flags`. The `ST_*` bits are the
+/// `MS_*` bits, except for `ST_RELATIME` and `ST_NOSYMFOLLOW`.
+fn statfs_flags(flags: u64) -> i64 {
+    let flags = flags as u32;
+    let same = MS_RDONLY
+        | MS_NOSUID
+        | MS_NODEV
+        | MS_NOEXEC
+        | MS_SYNCHRONOUS
+        | MS_MANDLOCK
+        | MS_NOATIME
+        | MS_NODIRATIME;
+    let mut out = i64::from(flags & same) | ST_VALID;
+    if flags & MS_RELATIME != 0 {
+        out |= ST_RELATIME;
+    }
+    if flags & MS_NOSYMFOLLOW != 0 {
+        out |= ST_NOSYMFOLLOW;
+    }
+    out
+}
+
+fn statfs_of(meta: &Metadata, inode: Option<&rk_vfs::InodeRef>, flags: i64) -> Statfs {
+    let magic = inode.map_or(0, |i| i.fs_magic());
     let mut s = Statfs::new_zeroed();
     s.f_type = if magic == 0 { TMPFS_MAGIC } else { magic as i64 };
     s.f_bsize = rk_mm::PAGE_SIZE as i64;
     s.f_frsize = rk_mm::PAGE_SIZE as i64;
+    if let Some(st) = inode.and_then(|i| i.fs_stat()) {
+        s.f_bsize = st.bsize as i64;
+        s.f_frsize = st.bsize as i64;
+        s.f_blocks = st.blocks as i64;
+        s.f_bfree = st.bfree as i64;
+        s.f_bavail = st.bavail as i64;
+        s.f_files = st.files as i64;
+        s.f_ffree = st.ffree as i64;
+    }
     s.f_namelen = 255;
     s.f_fsid = KernelFsidT { val: [meta.dev as i32, (meta.dev >> 32) as i32] };
+    s.f_flags = flags;
     s
 }
 
 pub(crate) fn statfs(cx: &Cx<'_>, path: u64, buf: u64) -> SysResult {
     let path = cx.read_path(path)?;
     let fs = cx.fs()?;
-    let inode = fs.resolve(fs.cwd(), &path, true)?.inode().clone();
-    cx.write_val(buf, &statfs_of(&inode.metadata(), inode.fs_magic()))?;
+    let at = fs.resolve(fs.cwd(), &path, true)?;
+    let flags = statfs_flags(at.mount.source().flags);
+    cx.write_val(buf, &statfs_of(&at.inode().metadata(), Some(at.inode()), flags))?;
     Ok(0)
 }
 
 pub(crate) fn fstatfs(cx: &Cx<'_>, fd: u64, buf: u64) -> SysResult {
     let file = cx.file(fd)?;
-    let magic = file.location().map_or(0, |at| at.inode().fs_magic());
-    cx.write_val(buf, &statfs_of(&file.metadata()?, magic))?;
+    let at = file.location();
+    let flags = at.map_or(ST_VALID, |at| statfs_flags(at.mount.source().flags));
+    cx.write_val(buf, &statfs_of(&file.metadata()?, at.map(Location::inode), flags))?;
     Ok(0)
 }
 

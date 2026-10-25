@@ -35,7 +35,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use layout::{GroupDesc, RawInode, Superblock};
+use layout::{GroupDesc, RawInode, Superblock, gd, u16_at, u32_at};
 use rk_abi::Errno;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_vfs::fstype::{FsType, MountArgs};
@@ -384,6 +384,42 @@ impl Fs {
         drop(meta);
         self.disk.write_back(0, u64::MAX)?;
         self.disk.flush()
+    }
+
+    /// The counts of the file system for `statfs`, as `ext4_statfs` of Linux gives them. The
+    /// blocks of the metadata and of the journal are not in the count of blocks.
+    pub(crate) fn stat(&self) -> rk_vfs::inode::FsStat {
+        let sb = &self.sb;
+        let meta = self.meta.lock();
+        let field = |d: &[u8], at: usize| {
+            let hi = if d.len() >= 64 { u64::from(u16_at(d, at + gd::HI)) << 16 } else { 0 };
+            u64::from(u16_at(d, at)) | hi
+        };
+        let bfree: u64 = meta.descs.iter().map(|d| field(d, gd::FREE_BLOCKS)).sum();
+        let ffree: u64 = meta.descs.iter().map(|d| field(d, gd::FREE_INODES)).sum();
+        let mut reserved = u64::from(u32_at(&meta.sb, layout::sb::R_BLOCKS));
+        if sb.incompat & layout::incompat::BIT64 != 0 {
+            reserved |= u64::from(u32_at(&meta.sb, layout::sb::R_BLOCKS_HI)) << 32;
+        }
+        drop(meta);
+        let groups = sb.groups();
+        let supers = (0..groups).filter(|&g| sb.has_super(g)).count() as u64;
+        let mut overhead = u64::from(sb.first_data_block)
+            + supers * (1 + sb.gdt_blocks() + u64::from(sb.reserved_gdt_blocks))
+            + u64::from(groups) * (2 + sb.itable_blocks());
+        if sb.journal_inum != 0
+            && let Ok(raw) = self.read_inode(sb.journal_inum)
+        {
+            overhead += raw.size() / sb.block_size;
+        }
+        rk_vfs::inode::FsStat {
+            bsize: sb.block_size,
+            blocks: sb.blocks_count.saturating_sub(overhead),
+            bfree,
+            bavail: bfree.saturating_sub(reserved),
+            files: u64::from(sb.inodes_count),
+            ffree,
+        }
     }
 
     /// Tells if the block `block` was freed since the last commit.

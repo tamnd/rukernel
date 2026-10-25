@@ -410,6 +410,7 @@ const BOOT_TESTS: &[&str] = &[
     "gvisor",
     "alpine",
     "debian",
+    "fstests",
 ];
 
 /// The self tests that `boot-test` runs again with the bzImage, through the Linux boot protocol.
@@ -976,6 +977,96 @@ const GVISOR_SCRIPT: &str = concat!(
     "exit $failed\n",
 );
 
+/// The longest time that the `fstests` boot test can take.
+const FSTESTS_TIMEOUT: Duration = Duration::from_secs(3600);
+/// The memory of the virtual machine of the `fstests` boot test. The root file system of
+/// tools/fstests/build.sh is near 300 MiB, and the initramfs and the tmpfs each keep a copy.
+const FSTESTS_MEMORY: &str = "3G";
+/// The size of the test disk and of the scratch disk of the `fstests` boot test.
+const FSTESTS_DISK_SIZE: u64 = 2 << 30;
+
+/// The directory of the root file system that tools/fstests/build.sh makes: `RK_FSTESTS`, or
+/// target/fstests.
+fn fstests_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("RK_FSTESTS")
+        .map_or_else(|| workspace_root().join("target/fstests"), PathBuf::from);
+    (dir.join("VERSION").exists() && dir.join("rootfs.tar.gz").exists()).then_some(dir)
+}
+
+/// The arguments of `check` in the `fstests` boot test: the tests of tools/fstests/tests.txt. A
+/// line that starts with `#` is a comment.
+fn fstests_tests() -> Result<Vec<String>> {
+    // RK_FSTESTS_TESTS gives other arguments for a run by hand, for example `-g quick`.
+    if let Ok(list) = std::env::var("RK_FSTESTS_TESTS") {
+        return Ok(list.split_ascii_whitespace().map(String::from).collect());
+    }
+    let text = read(&workspace_root().join("tools/fstests/tests.txt"))?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect())
+}
+
+/// The script that the `fstests` boot test runs as init. The first disk is the test device and
+/// the second disk is the scratch device. The script makes an ext4 file system on the test device
+/// and runs `check` with `tests`. The output of `check` goes to the console. `check` exits with 0
+/// when no test fails. A test that does not apply does not fail.
+fn fstests_script(tests: &[String]) -> String {
+    let mut script = String::from(concat!(
+        "#!/bin/sh\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n",
+        "mount -t proc proc /proc\nmount -t tmpfs tmp /tmp\n",
+        "mkfs.ext4 -q -F /dev/vda\n",
+        "cd /var/lib/xfstests\n",
+        "cat > local.config <<EOF\n",
+        "export FSTYP=ext4\n",
+        "export TEST_DEV=/dev/vda\nexport TEST_DIR=/test\n",
+        "export SCRATCH_DEV=/dev/vdb\nexport SCRATCH_MNT=/scratch\n",
+        "EOF\n",
+        "./check",
+    ));
+    for t in tests {
+        script.push(' ');
+        script.push_str(t);
+    }
+    script.push_str(concat!(
+        " > /tmp/check.log 2>&1\n",
+        "code=$?\n",
+        "sed 's/^/fstests: /' /tmp/check.log\n",
+        "exit $code\n",
+    ));
+    script
+}
+
+/// Writes the initramfs `initramfs-fstests.cpio` next to the kernel: the root file system of
+/// tools/fstests/build.sh and the script of `fstests_script` as /init. Gives `false` if there is
+/// no root file system.
+fn build_fstests_initramfs(kernel: &Path) -> Result<bool> {
+    let Some(fstests) = fstests_dir() else { return Ok(false) };
+    let dir = kernel.parent().ok_or("the kernel path has no directory")?;
+    let root = dir.join("fstests-root");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(fstests.join("rootfs.tar.gz"))
+        .arg("-C")
+        .arg(&root)
+        .status()
+        .map_err(|e| format!("cannot run tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("tar cannot unpack {}", fstests.display()));
+    }
+    let mut w = rk_vfs::cpio::Writer::new();
+    w.add(b".", 0o040_755, b"");
+    add_tree(&mut w, &root, &root)?;
+    w.add(b"init", 0o100_755, fstests_script(&fstests_tests()?).as_bytes());
+    let path = kernel.with_file_name("initramfs-fstests.cpio");
+    fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
 /// Writes the initramfs `initramfs-NAME.cpio` of a boot test next to the kernel: BusyBox, the
 /// programs of `dir` in `/NAME`, and `script` as `/NAME/run`. Gives `false` if the programs or
 /// BusyBox are not there.
@@ -1081,6 +1172,9 @@ fn build_kernel() -> Result<PathBuf> {
         if !build_suite_initramfs(&kernel, busybox.as_deref(), name, dir, script)? {
             let _ = fs::remove_file(kernel.with_file_name(format!("initramfs-{name}.cpio")));
         }
+    }
+    if !build_fstests_initramfs(&kernel)? {
+        let _ = fs::remove_file(kernel.with_file_name("initramfs-fstests.cpio"));
     }
     for rootfs in ROOTFS {
         if !build_rootfs_initramfs(&kernel, rootfs)? {
@@ -1360,7 +1454,9 @@ fn can_run(kernel: &Path, test: &str) -> bool {
         "init" | "tty" | "smp" | "blk" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
-        "kselftest" | "gvisor" => kernel.with_file_name(format!("initramfs-{test}.cpio")).exists(),
+        "kselftest" | "gvisor" | "fstests" => {
+            kernel.with_file_name(format!("initramfs-{test}.cpio")).exists()
+        }
         t if ROOTFS.iter().any(|r| r.name == t) => rootfs_initramfs(kernel, t).exists(),
         _ => true,
     }
@@ -1377,7 +1473,7 @@ fn test_cmdline(test: &str) -> String {
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
         "gvisor" => String::from("console=ttyS0 rk.test=init rdinit=/gvisor/run"),
-        t if ROOTFS.iter().any(|r| r.name == t) => {
+        t if t == "fstests" || ROOTFS.iter().any(|r| r.name == t) => {
             String::from("console=ttyS0 rk.test=init rdinit=/init")
         }
         _ => format!("console=ttyS0 rk.test={test}"),
@@ -1386,8 +1482,10 @@ fn test_cmdline(test: &str) -> String {
 
 /// The line that the kernel prints when the boot test `test` passes.
 fn pass_line(test: &str) -> String {
-    let test = if matches!(test, "tty" | "smp" | "blk" | "busybox" | "ltp" | "kselftest" | "gvisor")
-        || ROOTFS.iter().any(|r| r.name == test)
+    let test = if matches!(
+        test,
+        "tty" | "smp" | "blk" | "busybox" | "ltp" | "kselftest" | "gvisor" | "fstests"
+    ) || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"
     } else {
@@ -1429,6 +1527,24 @@ fn boot_test(names: &[String]) -> Result {
             let initrd = kernel.with_file_name(format!("initramfs-{test}.cpio"));
             let timeout = if *test == "gvisor" { GVISOR_TIMEOUT } else { KSELFTEST_TIMEOUT };
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), timeout)
+        } else if *test == "fstests" {
+            let initrd = kernel.with_file_name("initramfs-fstests.cpio");
+            let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
+            // QEMU uses the last `-m`.
+            cmd.args(["-m", FSTESTS_MEMORY]);
+            for name in ["test", "scratch"] {
+                let disk = kernel.with_file_name(format!("fstests-{name}.img"));
+                let file =
+                    fs::File::create(&disk).map_err(|e| format!("{}: {e}", disk.display()))?;
+                file.set_len(FSTESTS_DISK_SIZE).map_err(|e| format!("{}: {e}", disk.display()))?;
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "if=none,id={name},format=raw,cache=unsafe,file={}",
+                        disk.display()
+                    ))
+                    .args(["-device", &format!("virtio-blk-pci,drive={name}")]);
+            }
+            (cmd, FSTESTS_TIMEOUT)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
@@ -1461,8 +1577,16 @@ fn boot_test(names: &[String]) -> Result {
         }
         if passed {
             println!("boot test {test}: pass");
+            // RK_BOOT_LOG shows all of the log of a test that passes, for a run by hand.
+            if std::env::var_os("RK_BOOT_LOG").is_some() {
+                println!("{log}");
+            }
             // The kselftest and gVisor totals show the tests that the kernel skips.
-            let totals = |l: &&str| l.starts_with("kselftest: ") || l.starts_with("gvisor: ");
+            let totals = |l: &&str| {
+                l.starts_with("kselftest: ")
+                    || l.starts_with("gvisor: ")
+                    || l.starts_with("fstests: ")
+            };
             for line in log.lines().filter(totals) {
                 println!("{line}");
             }

@@ -1,0 +1,2 @@
+# The fstests tests that the fstests boot test runs on ext4.
+generic/001

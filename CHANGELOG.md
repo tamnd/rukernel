@@ -2,6 +2,15 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The `fstests` boot test runs fstests on ext4. tools/fstests/build.sh builds fstests and a Debian root file system for it in a container, and tools/fstests/tests.txt gives the tests that the boot test runs. The test makes ext4 on a test disk and gives a second disk as the scratch disk. The boot test runs only when target/fstests or `RK_FSTESTS` has the root file system.
+- `/proc/PID/mountinfo`, with the fields of Linux. fstests and `findmnt` read it.
+- `statfs` and `fstatfs` give the block and inode counts of an ext4 file system, and the mount flags of the path as the `ST_*` flags. The `Inode` trait gets `fs_stat` for the counts.
+- `RK_BOOT_LOG` tells `cargo xtask boot-test` to print the full log of a test that passes.
+
 ## [0.3.4] - 2026-10-25
 
 ### Added
