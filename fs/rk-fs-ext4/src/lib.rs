@@ -95,27 +95,27 @@ pub trait Disk: Send + Sync {
     }
 }
 
-impl Disk for Arc<rk_vfs::blockdev::DiskCache> {
+impl Disk for rk_vfs::blockdev::MountedDisk {
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
-        match rk_vfs::blockdev::DiskCache::read(self, offset, buf)? {
+        match rk_vfs::blockdev::DiskCache::read(&self.cache, offset, buf)? {
             n if n == buf.len() => Ok(()),
             _ => Err(Errno::EIO),
         }
     }
 
     fn write(&self, offset: u64, buf: &[u8]) -> Result<()> {
-        match rk_vfs::blockdev::DiskCache::write(self, offset, buf)? {
+        match rk_vfs::blockdev::DiskCache::write(&self.cache, offset, buf)? {
             n if n == buf.len() => Ok(()),
             _ => Err(Errno::EIO),
         }
     }
 
     fn write_back(&self, offset: u64, len: u64) -> Result<()> {
-        rk_vfs::blockdev::DiskCache::write_back(self, offset, len)
+        rk_vfs::blockdev::DiskCache::write_back(&self.cache, offset, len)
     }
 
     fn flush(&self) -> Result<()> {
-        rk_vfs::blockdev::DiskCache::flush(self)
+        rk_vfs::blockdev::DiskCache::flush(&self.cache)
     }
 }
 
@@ -125,10 +125,11 @@ impl Disk for Arc<rk_vfs::blockdev::DiskCache> {
 ///
 /// Gives `ENXIO` if the device has no driver, `EINVAL` if the device does not have ext4,
 /// `EOPNOTSUPP` for a feature that the driver does not support, and `EROFS` for a read and write
-/// mount of a disk that the driver can only read.
+/// mount of a disk that the driver can only read. Gives `EBUSY` if a file has the device open
+/// with `O_EXCL`.
 pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let dev = args.dev.ok_or(Errno::ENOTBLK)?;
-    let cache = rk_vfs::blockdev::block_cache(dev).ok_or(Errno::ENXIO)?;
+    let cache = rk_vfs::blockdev::mount_block(dev)?;
     let fs = Fs::open(dev, alloc::boxed::Box::new(cache), args.read_only)?;
     // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks.
     for option in args.data.split(|&c| c == b',') {

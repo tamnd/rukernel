@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_abi::native::open::O_DIRECT;
+use rk_abi::native::open::{O_DIRECT, O_EXCL};
 use rk_block::cache::{PAGE_SIZE, PageCache};
 use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
@@ -57,6 +57,56 @@ pub type DiskCache = PageCache<Arc<Queue>>;
 struct Entry {
     name: String,
     cache: Arc<DiskCache>,
+    /// The count of mounts that use the device.
+    mounts: u32,
+    /// Tells if a file has the device open with `O_EXCL`.
+    exclusive: bool,
+}
+
+/// The holder of an exclusive claim of a block device, as the holder of `bdev_open` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holder {
+    /// A mount of a file system. Two mounts of one device can share it.
+    Mount,
+    /// A file that has the device open with `O_EXCL`. No other holder can share it.
+    File,
+}
+
+/// An exclusive claim of a block device. The claim ends when the value drops.
+#[derive(Debug)]
+pub struct Claim {
+    rdev: u64,
+    holder: Holder,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(e) = BLOCK_DEVICES.lock().get_mut(&self.rdev) {
+            match self.holder {
+                Holder::Mount => e.mounts = e.mounts.saturating_sub(1),
+                Holder::File => e.exclusive = false,
+            }
+        }
+    }
+}
+
+/// Claims the block device `rdev` for `holder`. A mount and an open with `O_EXCL` exclude each
+/// other, so that mkfs, fsck and resize2fs see that a disk is mounted.
+///
+/// # Errors
+///
+/// Gives `ENXIO` if no driver has the number, and `EBUSY` if another holder has the device.
+pub fn claim_block(rdev: u64, holder: Holder) -> Result<Claim> {
+    let mut devices = BLOCK_DEVICES.lock();
+    let e = devices.get_mut(&rdev).ok_or(Errno::ENXIO)?;
+    if e.exclusive || (holder == Holder::File && e.mounts > 0) {
+        return Err(Errno::EBUSY);
+    }
+    match holder {
+        Holder::Mount => e.mounts += 1,
+        Holder::File => e.exclusive = true,
+    }
+    Ok(Claim { rdev, holder })
 }
 
 static BLOCK_DEVICES: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::new());
@@ -65,7 +115,8 @@ static BLOCK_DEVICES: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::n
 /// of devices.
 pub fn register_block(rdev: u64, name: &str, device: Arc<dyn BlockDevice>) {
     let cache = Arc::new(PageCache::new(Arc::new(Queue::new(device))));
-    BLOCK_DEVICES.lock().insert(rdev, Entry { name: String::from(name), cache });
+    let entry = Entry { name: String::from(name), cache, mounts: 0, exclusive: false };
+    BLOCK_DEVICES.lock().insert(rdev, entry);
     crate::device::add_device(crate::device::DeviceInfo {
         name: String::from(name),
         class: "block",
@@ -88,6 +139,25 @@ pub fn block_queue(rdev: u64) -> Option<Arc<Queue>> {
 /// Gives the page cache of the block device `rdev`.
 pub fn block_cache(rdev: u64) -> Option<Arc<DiskCache>> {
     BLOCK_DEVICES.lock().get(&rdev).map(|e| e.cache.clone())
+}
+
+/// The page cache of a block device that a file system has mounted. The device stays claimed
+/// until the file system drops it.
+pub struct MountedDisk {
+    /// The page cache of the device.
+    pub cache: Arc<DiskCache>,
+    _claim: Claim,
+}
+
+/// Claims the block device `rdev` for a mount, and gives its page cache.
+///
+/// # Errors
+///
+/// Gives `ENXIO` if no driver has the number, and `EBUSY` if a file has the device open with
+/// `O_EXCL`.
+pub fn mount_block(rdev: u64) -> Result<MountedDisk> {
+    let cache = block_cache(rdev).ok_or(Errno::ENXIO)?;
+    Ok(MountedDisk { cache, _claim: claim_block(rdev, Holder::Mount)? })
 }
 
 /// Writes the dirty pages of each block device to the disk, and makes them durable, for `sync`.
@@ -120,17 +190,22 @@ pub fn block_devices() -> Vec<(String, u64)> {
     BLOCK_DEVICES.lock().iter().map(|(rdev, e)| (e.name.clone(), *rdev)).collect()
 }
 
-/// Opens the block device `rdev`. Gives `ENXIO` if no driver has the number, as Linux.
-pub fn open_block(rdev: u64, _flags: u32) -> Result<Arc<dyn FileOps>> {
+/// Opens the block device `rdev`. With `O_EXCL` the file claims the device until it closes.
+/// Gives `ENXIO` if no driver has the number, and `EBUSY` for `O_EXCL` if the device is mounted
+/// or open with `O_EXCL`, as Linux.
+pub fn open_block(rdev: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
     let cache = block_cache(rdev).ok_or(Errno::ENXIO)?;
+    let claim = if flags & O_EXCL != 0 { Some(claim_block(rdev, Holder::File)?) } else { None };
     let queue = cache.store().clone();
-    Ok(Arc::new(BlockFile { queue, cache }))
+    Ok(Arc::new(BlockFile { queue, cache, _claim: claim }))
 }
 
 /// The operations of an open block device.
 struct BlockFile {
     queue: Arc<Queue>,
     cache: Arc<DiskCache>,
+    /// The claim of a file with `O_EXCL`.
+    _claim: Option<Claim>,
 }
 
 /// Tells if `file` goes to the queue without the cache.
@@ -373,7 +448,31 @@ mod tests {
     fn file() -> (Arc<Ram>, BlockFile) {
         let ram = Arc::new(Ram(SpinLock::new(vec![7u8; 4 * SECTOR_SIZE])));
         let queue = Arc::new(Queue::new(ram.clone()));
-        (ram, BlockFile { queue: queue.clone(), cache: Arc::new(PageCache::new(queue)) })
+        (
+            ram,
+            BlockFile {
+                queue: queue.clone(),
+                cache: Arc::new(PageCache::new(queue)),
+                _claim: None,
+            },
+        )
+    }
+
+    #[test]
+    fn a_mount_and_an_exclusive_open_exclude_each_other() {
+        let rdev = 0xfe_0f00;
+        register_block(rdev, "claimtest", Arc::new(Ram(SpinLock::new(vec![0u8; SECTOR_SIZE]))));
+        let mount = claim_block(rdev, Holder::Mount).unwrap();
+        let again = claim_block(rdev, Holder::Mount).unwrap();
+        assert_eq!(open_block(rdev, O_EXCL).err(), Some(Errno::EBUSY));
+        assert!(open_block(rdev, 0).is_ok());
+        drop((mount, again));
+        let file = open_block(rdev, O_EXCL).unwrap();
+        assert_eq!(claim_block(rdev, Holder::Mount).err(), Some(Errno::EBUSY));
+        assert_eq!(open_block(rdev, O_EXCL).err(), Some(Errno::EBUSY));
+        drop(file);
+        assert!(claim_block(rdev, Holder::Mount).is_ok());
+        assert_eq!(claim_block(1, Holder::Mount).err(), Some(Errno::ENXIO));
     }
 
     #[test]

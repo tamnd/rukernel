@@ -6,6 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- A mount claims its block device. An `O_EXCL` open of a mounted block device gives `EBUSY`, and a mount of a device that a file has open with `O_EXCL` gives `EBUSY`, as Linux. e2fsprogs use this to find that a disk is mounted.
 - ext4 mounts a disk with `meta_bg`, which mkfs uses when the group descriptors do not fit after the superblock, for example with `-g 256`. Each meta block group keeps its block of descriptors in its first group, and the bitmap of a new group and `statfs` count those blocks. ext4/058 passes.
 - ext4 writes and truncates the files that have a block map, as ext2 and ext3 keep them. A write to a hole gets new blocks and the indirect blocks that the map needs, and a truncate frees the blocks past the size and the indirect blocks that then map nothing. A disk without the `extents` feature mounts for read and write, and its new files have a block map. ext4/044 passes.
 
