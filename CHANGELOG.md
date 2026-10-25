@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The files `dirty_ratio`, `dirty_background_ratio`, `dirty_bytes`, `dirty_background_bytes`, `dirty_expire_centisecs` and `dirty_writeback_centisecs` in `/proc/sys/vm`. They keep the value that a program writes, but the writeback does not use them yet. generic/460 needs them.
+
 ## [0.3.11] - 2026-10-25
 
 ### Added
