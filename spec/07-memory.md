@@ -75,3 +75,25 @@ cgroup v2 `memory.*` in full: `current`, `min`, `low`, `high` with throttling, `
 Buys: the page table walker, frame allocator and TLB shootdown are in `rk-frame` and verified (document 20); everything above them (VMAs, faults, reclaim, cgroups, policies) is safe Rust where a use after free on a folio or a VMA is a compile error. Linux's mm subsystem has a long tail of exactly those bugs, found by syzbot every week.
 
 Costs: Linux's mm uses tricks Rust's ownership model resists, especially `struct page` reference counts manipulated speculatively by GUP fast and by RCU readers (`folio_try_get` on a folio that may be freed and reallocated under you). These are implemented once in `rk-frame` as a small set of primitives (`FrameRef::try_get_rcu`) with their proofs, and the safe layers use them. Whether that small set is enough for everything Linux does with speculative references is the second open question in document 24, and GUP fast is the test case.
+
+## 7.13 GUP fast: the decision for R3
+
+This was open question 4 of document 24, and it was decided in R3. The kernel has no GUP now. A direct read or write copies between the user buffer and a kernel buffer, and the block layer uses the kernel buffer. The copy walks the user page tables with no lock, as `copy_from_user` does, and a fault goes to the fault path. This takes no reference on a user frame, so it needs no speculative reference and no proof for one.
+
+We measured with fio on the alpine boot test, with the `psync` engine on a virtio-blk disk under QEMU with no KVM:
+
+| Job | Direct I/O | Through the page cache |
+|---|---|---|
+| Sequential read, 128 KiB | 160 IOPS, 20.1 MiB/s | 184 IOPS, 23.1 MiB/s |
+| Sequential write, 128 KiB | 147 IOPS, 18.4 MiB/s | 203 IOPS, 25.5 MiB/s |
+| Random read, 4 KiB | 397 IOPS | 1462 IOPS |
+| Random write, 4 KiB | 423 IOPS | 1875 IOPS |
+
+A direct request of 4 KiB takes about 2.5 ms, and the device takes almost all of it. A copy of 4 KiB takes some microseconds, so the copy is less than 1% of the time. Without KVM, the three options of the question cannot show a difference.
+
+The decision:
+
+1. Until zero copy direct I/O comes, the kernel copies, as above.
+2. Zero copy direct I/O pins the user frames with a walk under the per VMA lock (option 2). The per VMA locks come in R4.
+3. io_uring fixed buffers pin their frames when the program registers them (option 3), so their requests do not walk the page tables.
+4. The speculative reference API in `rk-frame` (option 1) is not built until `rukernel-bench` shows the locked walk as a red row on hardware with KVM or on bare metal (R8). Then we measure the three options with fio direct I/O again, and the question opens again with those numbers.
