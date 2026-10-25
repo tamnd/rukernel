@@ -25,6 +25,7 @@ mod alloc_blocks;
 pub mod crc;
 mod dir;
 mod extent;
+mod indirect;
 mod journal;
 pub mod layout;
 mod node;
@@ -246,8 +247,7 @@ impl Fs {
             return Err(Errno::EINVAL);
         }
         let can_write = sb.ro_compat & !layout::ro_compat::WRITABLE == 0
-            && sb.incompat & layout::incompat::MMP == 0
-            && sb.incompat & layout::incompat::EXTENTS != 0;
+            && sb.incompat & layout::incompat::MMP == 0;
         if !read_only && !can_write {
             return Err(Errno::EROFS);
         }

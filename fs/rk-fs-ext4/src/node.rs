@@ -276,19 +276,8 @@ impl Tx<'_> {
         if end.div_ceil(bs) > u64::from(u32::MAX) {
             return Err(Errno::EFBIG);
         }
-        if raw.flags() & flags::EXTENTS == 0 {
-            // A file with a block map can change in its blocks only.
-            for lblock in offset / bs..end.div_ceil(bs) {
-                if fs.map(raw, lblock)?.is_none() {
-                    return Err(Errno::EOPNOTSUPP);
-                }
-            }
-        }
-        let (mut extents, tree) = if raw.flags() & flags::EXTENTS != 0 {
-            fs.extents(raw)?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        let is_map = raw.flags() & flags::EXTENTS == 0;
+        let (mut extents, tree) = if !is_map { fs.extents(raw)? } else { (Vec::new(), Vec::new()) };
         let mut changed = false;
         let mut pos = offset;
         let mut result = Ok(());
@@ -325,17 +314,33 @@ impl Tx<'_> {
                 }
                 None => {
                     let last = end.div_ceil(bs);
-                    let next = extents
-                        .iter()
-                        .map(|e| u64::from(e.lblock))
-                        .find(|&l| l > lblock)
-                        .unwrap_or(last);
+                    let (next, goal) = if is_map {
+                        let mut next = lblock + 1;
+                        while next < last && fs.map(raw, next)?.is_none() {
+                            next += 1;
+                        }
+                        let before = match lblock.checked_sub(1) {
+                            Some(l) => fs.map(raw, l)?.map(|(b, _)| b + 1),
+                            None => None,
+                        };
+                        (next, before.unwrap_or_else(|| fs.goal(ino)))
+                    } else {
+                        let next = extents
+                            .iter()
+                            .map(|e| u64::from(e.lblock))
+                            .find(|&l| l > lblock)
+                            .unwrap_or(last);
+                        let goal = extents
+                            .iter()
+                            .rev()
+                            .find(|e| u64::from(e.lblock) < lblock)
+                            .map_or_else(
+                                || fs.goal(ino),
+                                |e| e.start + (lblock - u64::from(e.lblock)),
+                            );
+                        (next, goal)
+                    };
                     let want = (next.min(last) - lblock).min(u64::from(EXTENT_INIT_MAX)) as u32;
-                    let goal = extents
-                        .iter()
-                        .rev()
-                        .find(|e| u64::from(e.lblock) < lblock)
-                        .map_or_else(|| fs.goal(ino), |e| e.start + (lblock - u64::from(e.lblock)));
                     let (start, got) = match self.alloc_blocks(goal, want) {
                         Ok(run) => run,
                         Err(e) => {
@@ -343,6 +348,13 @@ impl Tx<'_> {
                             break;
                         }
                     };
+                    if is_map && let Err(e) = self.map_blocks(raw, lblock, start, u64::from(got)) {
+                        // The entries that the map got before the error stay, and fsck finds
+                        // them. As Linux, the indirect blocks come before the data blocks.
+                        self.free_blocks(start, u64::from(got))?;
+                        result = Err(e);
+                        break;
+                    }
                     let zero = vec![0u8; bs as usize];
                     let partial_first = in_block != 0;
                     let partial_last = (lblock + u64::from(got)) * bs > end;
@@ -352,12 +364,14 @@ impl Tx<'_> {
                     if partial_last && (got > 1 || !partial_first) {
                         fs.write_file(raw, (start + u64::from(got) - 1) * bs, &zero)?;
                     }
-                    extent::put(
-                        &mut extents,
-                        Extent { lblock: lblock as u32, len: got, start, init: true },
-                    );
+                    if !is_map {
+                        extent::put(
+                            &mut extents,
+                            Extent { lblock: lblock as u32, len: got, start, init: true },
+                        );
+                        changed = true;
+                    }
                     raw.set_blocks(raw.blocks() + u64::from(got) * (bs / 512));
-                    changed = true;
                     continue;
                 }
             }
@@ -383,10 +397,10 @@ impl Tx<'_> {
         let fs = self.fs;
         let bs = fs.sb.block_size;
         let old = raw.size();
-        if raw.flags() & flags::EXTENTS == 0 {
-            return if size == old { Ok(()) } else { Err(Errno::EOPNOTSUPP) };
-        }
-        if size <= old {
+        if size <= old && raw.flags() & flags::EXTENTS == 0 {
+            let freed = self.cut_map(raw, size.div_ceil(bs))?;
+            raw.set_blocks(raw.blocks().saturating_sub(freed * (bs / 512)));
+        } else if size <= old {
             let (mut extents, tree) = fs.extents(raw)?;
             let last = size.div_ceil(bs);
             if size == old && extents.iter().all(|e| e.end() <= last) {
@@ -694,8 +708,6 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Frees the block `block` of a block map, and the blocks under it for an indirect block of
-    /// the level `level`.
     /// Moves the file `ino` from a block map to an extent tree, as `chattr +e`. The tree uses
     /// the indirect blocks of the map first.
     fn migrate_to_extents(&mut self, ino: u32, raw: &mut RawInode) -> Result<()> {
@@ -744,19 +756,6 @@ impl Tx<'_> {
         Ok(())
     }
 
-    fn free_map(&mut self, block: u64, level: u32) -> Result<()> {
-        if block == 0 {
-            return Ok(());
-        }
-        if level > 0 {
-            let data = self.fs.read_block(block)?;
-            for i in 0..data.len() / 4 {
-                self.free_map(u64::from(u32_at(&data, i * 4)), level - 1)?;
-            }
-        }
-        self.free_blocks(block, 1)
-    }
-
     /// Makes a new inode of the type `kind` near the directory `dir`, and writes it.
     fn new_inode(&mut self, dir: u32, kind: FileType, perm: u32) -> Result<(u32, RawInode)> {
         let fs = self.fs;
@@ -777,7 +776,10 @@ impl Tx<'_> {
         if raw.extra_size() >= 0x98 - 128 {
             raw.set_time(0x90, 0x94, t.sec, t.nsec);
         }
-        if matches!(kind, FileType::Regular | FileType::Directory | FileType::Symlink) {
+        // A disk without the `extents` feature keeps the new files in a block map.
+        if matches!(kind, FileType::Regular | FileType::Directory | FileType::Symlink)
+            && fs.sb.incompat & layout::incompat::EXTENTS != 0
+        {
             raw.set_flags(flags::EXTENTS);
             Tx::empty_tree(&mut raw);
         }
@@ -1017,6 +1019,10 @@ impl Inode for Node {
         }
         if changed & flags::EXTENTS != 0 {
             if !matches!(self.kind(), FileType::Regular | FileType::Directory) {
+                return Err(Errno::EINVAL);
+            }
+            // As Linux, a disk without the `extents` feature has no extent trees.
+            if new & flags::EXTENTS != 0 && self.fs.sb.incompat & layout::incompat::EXTENTS == 0 {
                 return Err(Errno::EINVAL);
             }
             if new & flags::EXTENTS != 0 {
