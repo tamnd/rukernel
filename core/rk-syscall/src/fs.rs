@@ -57,7 +57,7 @@ fn statx_time(t: Timespec) -> StatxTimestamp {
 
 /// Reads up to `count` bytes with `f` to user memory at `buf`. A regular file reads in steps
 /// until the count or the end of the file. Another file reads one time.
-fn read_with(
+pub(crate) fn read_with(
     cx: &Cx<'_>,
     file: &File,
     buf: u64,
@@ -86,7 +86,7 @@ fn read_with(
 }
 
 /// Writes up to `count` bytes from user memory at `buf` with `f`.
-fn write_with(
+pub(crate) fn write_with(
     cx: &Cx<'_>,
     buf: u64,
     count: u64,

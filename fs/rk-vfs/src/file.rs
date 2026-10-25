@@ -28,6 +28,20 @@ pub mod events {
     pub use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI};
 }
 
+/// One read or write of a batch. For a write, `buf` has the data. For a read, `buf` has the
+/// length to read, and the read fills it. `result` is the number of bytes.
+#[derive(Debug)]
+pub struct BatchIo {
+    /// The entry is a write.
+    pub write: bool,
+    /// The offset in the file.
+    pub offset: u64,
+    /// The data.
+    pub buf: Vec<u8>,
+    /// The result, after the batch.
+    pub result: Result<usize>,
+}
+
 /// The operations of an open file. The default of each operation gives the error of Linux for a
 /// file that does not have it.
 pub trait FileOps: Send + Sync {
@@ -70,6 +84,19 @@ pub trait FileOps: Send + Sync {
     /// Writes the data of the file to its device, for `fsync`.
     fn sync(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Does a batch of reads and writes at offsets, for `io_submit`. A file that can do the
+    /// entries together, as a block device, does them together. Each entry is done one at a time
+    /// with `read_at` and `write_at` by default.
+    fn rw_batch(&self, file: &File, ios: &mut [BatchIo]) {
+        for io in ios {
+            io.result = if io.write {
+                self.write_at(file, io.offset, &io.buf)
+            } else {
+                self.read_at(file, io.offset, &mut io.buf)
+            };
+        }
     }
 
     /// The events of `poll` that are true now.
@@ -350,6 +377,29 @@ impl File {
     /// `fsync` and `fdatasync`.
     pub fn sync(&self) -> Result<()> {
         self.ops.sync()
+    }
+
+    /// Does a batch of reads and writes at offsets. An entry gets `EBADF` if the file is not open
+    /// for it.
+    pub fn rw_batch(&self, ios: &mut [BatchIo]) {
+        let (readable, writable) = (self.flags().readable(), self.flags().writable());
+        let mut ok = Vec::with_capacity(ios.len());
+        for io in ios.iter_mut() {
+            let allowed = if io.write { writable } else { readable };
+            if !allowed {
+                io.result = Err(Errno::EBADF);
+            }
+            ok.push(allowed);
+        }
+        if ok.iter().all(|&a| a) {
+            self.ops.rw_batch(self, ios);
+        } else {
+            for (io, allowed) in ios.iter_mut().zip(ok) {
+                if allowed {
+                    self.ops.rw_batch(self, core::slice::from_mut(io));
+                }
+            }
+        }
     }
 
     /// `ioctl`.

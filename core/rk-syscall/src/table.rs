@@ -2,8 +2,8 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace, sched,
-    seccomp, signal, signalfd, timer, timerfd,
+    aio, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace,
+    sched, seccomp, shm, signal, signalfd, timer, timerfd,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -42,6 +42,12 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::EPOLL_PWAIT2 => epoll::epoll_pwait2(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::EVENTFD => eventfd::eventfd(cx, a[0]),
         nr::EVENTFD2 => eventfd::eventfd2(cx, a[0], a[1]),
+        nr::IO_SETUP => aio::io_setup(cx, a[0], a[1]),
+        nr::IO_DESTROY => aio::io_destroy(cx, a[0]),
+        nr::IO_SUBMIT => aio::io_submit(cx, a[0], a[1], a[2]),
+        nr::IO_CANCEL => aio::io_cancel(cx, a[0], a[1], a[2]),
+        nr::IO_GETEVENTS => aio::io_getevents(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::IO_PGETEVENTS => aio::io_pgetevents(cx, &a),
         nr::TIMERFD_CREATE => timerfd::timerfd_create(cx, a[0], a[1]),
         nr::TIMERFD_SETTIME => timerfd::timerfd_settime(cx, a[0], a[1], a[2], a[3]),
         nr::TIMERFD_GETTIME => timerfd::timerfd_gettime(cx, a[0], a[1]),
@@ -96,6 +102,10 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETPID => Ok(u64::from(cx.process().pid())),
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::CLONE3 => process::clone3(cx, a[0], a[1]),
+        nr::SHMGET => shm::shmget(cx, a[0], a[1], a[2]),
+        nr::SHMAT => shm::shmat(cx, a[0], a[1], a[2]),
+        nr::SHMDT => shm::shmdt(cx, a[0]),
+        nr::SHMCTL => shm::shmctl(cx, a[0], a[1], a[2]),
         nr::MEMFD_CREATE => memfd::memfd_create(cx, a[0], a[1]),
         nr::SOCKET => net::socket_call(cx, a[0], a[1], a[2]),
         nr::SOCKETPAIR => net::socketpair(cx, a[0], a[1], a[2], a[3]),

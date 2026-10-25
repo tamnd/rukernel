@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs gdb, strace and procps-ng from Alpine, and builds a small test program, in an Alpine container.
+# Installs gdb, strace, procps-ng and fio from Alpine, and builds a small test program, in an Alpine container.
 #
 # Usage: tools/debug/build.sh OUT_DIR
 #
@@ -21,7 +21,7 @@ apk add --no-cache gcc musl-dev >/dev/null
 # The packages and their dependencies go into a new root. The scripts of the packages do not run,
 # because the tree only adds files to the Alpine root file system.
 apk add --quiet --no-cache --no-scripts --root /out/root --initdb --keys-dir /etc/apk/keys \
-	--repositories-file /etc/apk/repositories gdb strace procps-ng
+	--repositories-file /etc/apk/repositories gdb strace procps-ng fio
 rm -rf /out/root/lib/apk /out/root/etc/apk /out/root/var/cache
 # The compiled Python files and ensurepip make the tree 40 percent larger, and gdb does not need
 # them. The boot test keeps the tree in memory.

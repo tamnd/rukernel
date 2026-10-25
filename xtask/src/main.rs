@@ -651,6 +651,10 @@ if [ -x /usr/bin/gdb ]; then
     awk -v p=$pid '$1 == p && $2 == \"root\" && $6 > 0 && $8 == \"S\" && $12 == \"sleep\"' /tmp/top.log | grep -q .
     kill $pid
     echo 'alpine: ps, top and pgrep done'
+    fio --name=rk --filename=/dev/vda --ioengine=libaio --direct=1 --iodepth=8 --bs=4k \\
+        --rw=randwrite --size=1M --verify=crc32c --thread --output=/tmp/fio.log
+    grep -q 'rk: (groupid=0, jobs=1): err= 0' /tmp/fio.log || { cat /tmp/fio.log; exit 1; }
+    echo 'alpine: fio done'
 fi
 echo 'alpine: done'
 ",
@@ -1256,12 +1260,6 @@ fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
         .arg("-initrd")
         .arg(initrd)
         .args(["-append", cmdline]);
-    if cmdline.ends_with("-- blk") {
-        let disk = kernel.with_file_name("blk.img");
-        cmd.arg("-drive")
-            .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
-            .args(["-device", "virtio-blk-pci,drive=disk0"]);
-    }
     if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);
     } else {
@@ -1349,7 +1347,7 @@ fn boot_test(names: &[String]) -> Result {
     let mut errors = Vec::new();
     let named = |t: &&&str| names.is_empty() || names.iter().any(|n| n == **t);
     for test in BOOT_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
-        let (cmd, timeout) = if *test == "ltp" {
+        let (mut cmd, timeout) = if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), LTP_TIMEOUT)
         } else if *test == "kselftest" || *test == "gvisor" {
@@ -1362,8 +1360,13 @@ fn boot_test(names: &[String]) -> Result {
         } else {
             (qemu_command(&kernel, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
         };
-        if *test == "blk" {
-            write_blk_disk(&kernel.with_file_name("blk.img"))?;
+        // The `alpine` test runs fio on the disk.
+        if matches!(*test, "blk" | "alpine") {
+            let disk = kernel.with_file_name("blk.img");
+            write_blk_disk(&disk)?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
+                .args(["-device", "virtio-blk-pci,drive=disk0"]);
         }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
         let mut passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));

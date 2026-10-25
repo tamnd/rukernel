@@ -32,6 +32,14 @@ name = "rk-abigen"
 version = "0.3.1"
 
 [[package]]
+name = "rk-block"
+version = "0.3.1"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+]
+
+[[package]]
 name = "rk-drv-mem"
 version = "0.3.1"
 dependencies = [
@@ -155,6 +163,7 @@ name = "rk-vfs"
 version = "0.3.1"
 dependencies = [
  "rk-abi",
+ "rk-block",
  "rk-frame",
 ]
 

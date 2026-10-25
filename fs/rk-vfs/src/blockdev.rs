@@ -1,10 +1,11 @@
 //! Block devices and their device files.
 //!
-//! A driver gives a `BlockDevice`, which reads and writes whole sectors of 512 bytes. An open
-//! file of the device reads and writes at each byte offset. A part of a sector is read, changed
-//! and written again. There is no page cache yet, so each call goes to the driver.
+//! A driver gives a `BlockDevice`, which reads and writes whole sectors of 512 bytes, and the
+//! block layer puts a queue in front of it. An open file of the device reads and writes at each
+//! byte offset. A part of a sector is read, changed and written again. There is no page cache
+//! yet, so each call goes to the queue.
 
-use crate::file::{File, FileOps, UserMemory};
+use crate::file::{BatchIo, File, FileOps, UserMemory};
 use crate::inode::Result;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -12,10 +13,10 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
 
-/// The size of a sector, the unit of the block layer.
-pub const SECTOR_SIZE: usize = 512;
+pub use rk_block::{BlockDevice, SECTOR_SIZE};
 
 /// The `ioctl` commands of block devices, from `<linux/fs.h>`.
 pub mod ioctl {
@@ -37,40 +38,23 @@ pub mod ioctl {
     pub const BLKGETSIZE64: u32 = 0x8008_1272;
 }
 
-/// The driver of a block device.
-pub trait BlockDevice: Send + Sync {
-    /// The number of sectors.
-    fn sectors(&self) -> u64;
-
-    /// Tells if the device does not accept writes.
-    fn read_only(&self) -> bool {
-        false
-    }
-
-    /// Reads the sectors from `sector` to `buf`. The length of `buf` is a multiple of
-    /// `SECTOR_SIZE`, and the sectors are on the device.
-    fn read(&self, sector: u64, buf: &mut [u8]) -> Result<()>;
-
-    /// Writes `buf` to the sectors from `sector`, with the same rules as `read`.
-    fn write(&self, sector: u64, buf: &[u8]) -> Result<()>;
-
-    /// Makes the data of the completed writes durable.
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
 /// A block device with its name in /dev.
 struct Entry {
     name: String,
-    device: Arc<dyn BlockDevice>,
+    queue: Arc<Queue>,
 }
 
 static BLOCK_DEVICES: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::new());
 
 /// Adds the block device `rdev` with the name `name`, for example `vda`.
 pub fn register_block(rdev: u64, name: &str, device: Arc<dyn BlockDevice>) {
-    BLOCK_DEVICES.lock().insert(rdev, Entry { name: String::from(name), device });
+    let queue = Arc::new(Queue::new(device));
+    BLOCK_DEVICES.lock().insert(rdev, Entry { name: String::from(name), queue });
+}
+
+/// Gives the queue of the block device `rdev`.
+pub fn block_queue(rdev: u64) -> Option<Arc<Queue>> {
+    BLOCK_DEVICES.lock().get(&rdev).map(|e| e.queue.clone())
 }
 
 /// Gives the name and the device number of each block device.
@@ -80,18 +64,18 @@ pub fn block_devices() -> Vec<(String, u64)> {
 
 /// Opens the block device `rdev`. Gives `ENXIO` if no driver has the number, as Linux.
 pub fn open_block(rdev: u64, _flags: u32) -> Result<Arc<dyn FileOps>> {
-    let device = BLOCK_DEVICES.lock().get(&rdev).map(|e| e.device.clone()).ok_or(Errno::ENXIO)?;
-    Ok(Arc::new(BlockFile { device }))
+    let queue = block_queue(rdev).ok_or(Errno::ENXIO)?;
+    Ok(Arc::new(BlockFile { queue }))
 }
 
 /// The operations of an open block device.
 struct BlockFile {
-    device: Arc<dyn BlockDevice>,
+    queue: Arc<Queue>,
 }
 
 impl BlockFile {
     fn size(&self) -> u64 {
-        self.device.sectors() * SECTOR_SIZE as u64
+        self.queue.sectors() * SECTOR_SIZE as u64
     }
 
     /// The sectors from `first` that hold `len` bytes at `offset` in the sector.
@@ -109,14 +93,14 @@ impl BlockFile {
         let len = buf.len().min((size - offset) as usize);
         let (first, count) = Self::span(offset, len);
         let mut sectors = vec![0u8; count * SECTOR_SIZE];
-        self.device.read(first, &mut sectors)?;
+        self.queue.read(first, &mut sectors)?;
         let start = (offset - first * SECTOR_SIZE as u64) as usize;
         buf[..len].copy_from_slice(&sectors[start..start + len]);
         Ok(len)
     }
 
     fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<usize> {
-        if self.device.read_only() {
+        if self.queue.read_only() {
             return Err(Errno::EPERM);
         }
         let size = self.size();
@@ -132,11 +116,26 @@ impl BlockFile {
         let mut sectors = vec![0u8; count * SECTOR_SIZE];
         // A write of part of a sector keeps the other bytes of the sector.
         if start != 0 || !len.is_multiple_of(SECTOR_SIZE) {
-            self.device.read(first, &mut sectors)?;
+            self.queue.read(first, &mut sectors)?;
         }
         sectors[start..start + len].copy_from_slice(&buf[..len]);
-        self.device.write(first, &sectors)?;
+        self.queue.write(first, &sectors)?;
         Ok(len)
+    }
+
+    /// Gives the bio of a batch entry, if the entry is for whole sectors on the device.
+    fn bio(&self, io: &BatchIo) -> Option<Bio> {
+        let sector_size = SECTOR_SIZE as u64;
+        let len = io.buf.len() as u64;
+        if !io.offset.is_multiple_of(sector_size) || !len.is_multiple_of(sector_size) || len == 0 {
+            return None;
+        }
+        if io.offset.checked_add(len).is_none_or(|end| end > self.size()) {
+            return None;
+        }
+        let op = if io.write { Op::Write } else { Op::Read };
+        let data = if io.write { io.buf.clone() } else { vec![0u8; io.buf.len()] };
+        Some(Bio::new(op, io.offset / sector_size, data))
     }
 
     fn put(mem: &dyn UserMemory, arg: usize, bytes: &[u8]) -> Result<usize> {
@@ -170,26 +169,51 @@ impl FileOps for BlockFile {
         true
     }
 
+    /// The entries for whole sectors go to the queue as one batch, so that near entries merge.
+    /// The other entries go one at a time.
+    fn rw_batch(&self, _file: &File, ios: &mut [BatchIo]) {
+        let mut bios = Vec::new();
+        let mut owners = Vec::new();
+        for (i, io) in ios.iter_mut().enumerate() {
+            if let Some(bio) = self.bio(io) {
+                bios.push(bio);
+                owners.push(i);
+            } else if io.write {
+                io.result = self.write_bytes(io.offset, &io.buf);
+            } else {
+                io.result = self.read_bytes(io.offset, &mut io.buf);
+            }
+        }
+        self.queue.submit(&mut bios);
+        for (bio, i) in bios.into_iter().zip(owners) {
+            let io = &mut ios[i];
+            io.result = bio.result.map(|()| io.buf.len());
+            if !io.write && io.result.is_ok() {
+                io.buf = bio.data;
+            }
+        }
+    }
+
     fn end(&self) -> Option<u64> {
         Some(self.size())
     }
 
     fn sync(&self) -> Result<()> {
-        self.device.flush()
+        self.queue.flush()
     }
 
     fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
         match cmd {
             ioctl::BLKGETSIZE64 => Self::put(mem, arg, &self.size().to_ne_bytes()),
-            ioctl::BLKGETSIZE => Self::put(mem, arg, &self.device.sectors().to_ne_bytes()),
+            ioctl::BLKGETSIZE => Self::put(mem, arg, &self.queue.sectors().to_ne_bytes()),
             ioctl::BLKSSZGET | ioctl::BLKPBSZGET | ioctl::BLKIOMIN => {
                 Self::put(mem, arg, &(SECTOR_SIZE as u32).to_ne_bytes())
             }
             ioctl::BLKIOOPT => Self::put(mem, arg, &0u32.to_ne_bytes()),
             ioctl::BLKROGET => {
-                Self::put(mem, arg, &i32::from(self.device.read_only()).to_ne_bytes())
+                Self::put(mem, arg, &i32::from(self.queue.read_only()).to_ne_bytes())
             }
-            ioctl::BLKFLSBUF => self.device.flush().map(|()| 0),
+            ioctl::BLKFLSBUF => self.queue.flush().map(|()| 0),
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -222,7 +246,7 @@ mod tests {
 
     fn file() -> (Arc<Ram>, BlockFile) {
         let ram = Arc::new(Ram(SpinLock::new(vec![7u8; 4 * SECTOR_SIZE])));
-        (ram.clone(), BlockFile { device: ram })
+        (ram.clone(), BlockFile { queue: Arc::new(Queue::new(ram)) })
     }
 
     #[test]

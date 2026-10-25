@@ -22,6 +22,8 @@ pub const UNAME_RELEASE: &str = "7.3.0-rukernel";
 pub const UNAME_VERSION: &str = "#1 SMP PREEMPT_DYNAMIC rukernel";
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod aio;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod cx;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod epoll;
@@ -55,6 +57,8 @@ mod run;
 mod sched;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod seccomp;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod shm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
