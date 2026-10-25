@@ -419,7 +419,16 @@ fn collapse_and_insert_move_the_blocks() {
     // An insert before the second block leaves a hole of one block.
     file.fallocate(INSERT_RANGE, b, b).unwrap();
     assert_eq!((file.metadata().size, ram.free().0), (4 * b, free + 1));
-    drop((file, fs));
+    // An insert and a collapse at the same place give one extent again, as generic/064 checks.
+    let (fs2, _) = open_rw();
+    let g = fs2.root().unwrap().create(b"g", FileType::Regular, 0o644, 0).unwrap();
+    g.write_at(0, &vec![1u8; 2 * BS]).unwrap();
+    assert_eq!(g.fiemap(0, u64::MAX).unwrap().len(), 1);
+    g.fallocate(INSERT_RANGE, BS as u64, BS as u64).unwrap();
+    assert_eq!(g.fiemap(0, u64::MAX).unwrap().len(), 2);
+    g.fallocate(COLLAPSE_RANGE, BS as u64, BS as u64).unwrap();
+    assert_eq!(g.fiemap(0, u64::MAX).unwrap().len(), 1);
+    drop((g, fs2, file, fs));
 
     let fs = again(&ram);
     let back = read_all(&*fs.root().unwrap().lookup(b"f").unwrap());
