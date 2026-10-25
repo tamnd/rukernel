@@ -806,6 +806,30 @@ pub(crate) fn ftruncate(cx: &Cx<'_>, fd: u64, size: u64) -> SysResult {
     Ok(0)
 }
 
+pub(crate) fn fallocate(cx: &Cx<'_>, fd: u64, mode: u64, offset: u64, len: u64) -> SysResult {
+    use rk_vfs::inode::falloc::*;
+    let mode = mode as u32;
+    let (offset, len) = (offset as i64, len as i64);
+    // The checks of `vfs_fallocate` of Linux, in its order.
+    if offset < 0 || len <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let all = KEEP_SIZE | PUNCH_HOLE | COLLAPSE_RANGE | ZERO_RANGE | INSERT_RANGE | UNSHARE_RANGE;
+    if mode & !all != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    match mode & !KEEP_SIZE {
+        0 | ZERO_RANGE | UNSHARE_RANGE => {}
+        PUNCH_HOLE if mode & KEEP_SIZE != 0 => {}
+        COLLAPSE_RANGE | INSERT_RANGE if mode & KEEP_SIZE == 0 => {}
+        COLLAPSE_RANGE | INSERT_RANGE => return Err(Errno::EINVAL),
+        _ => return Err(Errno::EOPNOTSUPP),
+    }
+    let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
+    cx.file(fd)?.fallocate(mode, offset as u64, (end - offset) as u64)?;
+    Ok(0)
+}
+
 /// `UTIME_NOW` and `UTIME_OMIT` of `utimensat`.
 const UTIME_NOW: i64 = (1 << 30) - 1;
 const UTIME_OMIT: i64 = (1 << 30) - 2;

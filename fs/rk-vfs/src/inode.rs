@@ -234,6 +234,13 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EINVAL)
     }
 
+    /// Changes the space of a regular file in `offset..offset + len`, for `fallocate`. `mode` has
+    /// the `FALLOC_FL_*` bits of [`falloc`], and the caller checked them. The default gives
+    /// `EOPNOTSUPP`.
+    fn fallocate(&self, _mode: u32, _offset: u64, _len: u64) -> Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
@@ -335,4 +342,20 @@ pub trait Inode: Any + Send + Sync {
     fn fs_magic(&self) -> u64 {
         0
     }
+}
+
+/// The modes of `fallocate`, from `<linux/falloc.h>`.
+pub mod falloc {
+    /// The size of the file does not change.
+    pub const KEEP_SIZE: u32 = 0x01;
+    /// Frees the blocks of the range. The range reads as zeros after.
+    pub const PUNCH_HOLE: u32 = 0x02;
+    /// Removes the range, and the data after it moves down.
+    pub const COLLAPSE_RANGE: u32 = 0x08;
+    /// The range reads as zeros, and has blocks.
+    pub const ZERO_RANGE: u32 = 0x10;
+    /// Adds a hole at the range, and the data after it moves up.
+    pub const INSERT_RANGE: u32 = 0x20;
+    /// Gives the file its own copy of the blocks that it shares.
+    pub const UNSHARE_RANGE: u32 = 0x40;
 }

@@ -456,6 +456,11 @@ impl Inode for Node {
         self.copy_up()?.write_at(offset, buf)
     }
 
+    fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
+        self.check_writable()?;
+        self.copy_up()?.fallocate(mode, offset, len)
+    }
+
     fn sync(&self) -> Result<()> {
         match self.upper() {
             Some(upper) => upper.sync(),

@@ -328,6 +328,41 @@ fn a_write_fills_a_hole_and_the_size_changes() {
 }
 
 #[test]
+fn fallocate_gives_and_frees_blocks() {
+    use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    // New blocks read as zeros, and the size grows only without KEEP_SIZE.
+    file.fallocate(0, 0, 2 * BS as u64).unwrap();
+    assert_eq!(file.metadata().size, 2 * BS as u64);
+    assert_eq!(ram.free().0, free.0 - 2);
+    file.fallocate(KEEP_SIZE, 2 * BS as u64, BS as u64).unwrap();
+    assert_eq!((file.metadata().size, ram.free().0), (2 * BS as u64, free.0 - 3));
+    assert!(read_all(&*file).iter().all(|&b| b == 0));
+    // A write into a new block keeps the zeros around it.
+    file.write_at(10, b"ab").unwrap();
+    file.write_at(BS as u64, &vec![b'x'; 2 * BS]).unwrap();
+    assert_eq!(ram.free().0, free.0 - 3);
+    // A hole frees the full block, and the parts at its ends become zeros.
+    file.fallocate(PUNCH_HOLE | KEEP_SIZE, BS as u64 - 1, BS as u64 + 2).unwrap();
+    assert_eq!(ram.free().0, free.0 - 2);
+    file.fallocate(ZERO_RANGE, 2 * BS as u64 + 5, 5).unwrap();
+    assert_eq!(file.fallocate(0x8, 0, 1), Err(Errno::EOPNOTSUPP));
+    drop((file, root, fs));
+
+    let fs = again(&ram);
+    let back = read_all(&*fs.root().unwrap().lookup(b"f").unwrap());
+    assert_eq!(back.len(), 3 * BS);
+    assert_eq!(&back[10..12], b"ab");
+    assert!(back[12..2 * BS + 1].iter().all(|&b| b == 0));
+    assert!(back[2 * BS + 1..2 * BS + 5].iter().all(|&b| b == b'x'));
+    assert!(back[2 * BS + 5..2 * BS + 10].iter().all(|&b| b == 0));
+    assert!(back[2 * BS + 10..].iter().all(|&b| b == b'x'));
+}
+
+#[test]
 fn unlink_frees_the_blocks_and_the_inode() {
     let (fs, ram) = open_rw();
     let free = ram.free();

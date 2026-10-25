@@ -353,6 +353,122 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Gives blocks to the holes of the blocks `first..last` of the file, as extents that are
+    /// not initialized, so they read as zeros. Gives `true` if the list changed. On an error the
+    /// list keeps the blocks that it got.
+    fn preallocate(
+        &mut self,
+        ino: u32,
+        raw: &mut RawInode,
+        extents: &mut Vec<Extent>,
+        first: u64,
+        last: u64,
+    ) -> (bool, Result<()>) {
+        let bs = self.fs.sb.block_size;
+        let mut changed = false;
+        let mut lblock = first;
+        while lblock < last {
+            if let Some(e) = extent::find(extents, lblock) {
+                lblock = e.end();
+                continue;
+            }
+            let next =
+                extents.iter().map(|e| u64::from(e.lblock)).find(|&l| l > lblock).unwrap_or(last);
+            let want = (next.min(last) - lblock).min(u64::from(EXTENT_INIT_MAX - 1)) as u32;
+            let goal = extents
+                .iter()
+                .rev()
+                .find(|e| u64::from(e.lblock) < lblock)
+                .map_or_else(|| self.fs.goal(ino), |e| e.start + (lblock - u64::from(e.lblock)));
+            let (start, got) = match self.alloc_blocks(goal, want) {
+                Ok(run) => run,
+                Err(e) => return (changed, Err(e)),
+            };
+            extent::put(extents, Extent { lblock: lblock as u32, len: got, start, init: false });
+            raw.set_blocks(raw.blocks() + u64::from(got) * (bs / 512));
+            changed = true;
+            lblock += u64::from(got);
+        }
+        (changed, Ok(()))
+    }
+
+    /// Writes zeros on the bytes `from..to` of one block of the file, if the block has data.
+    fn zero_part(&self, raw: &RawInode, from: u64, to: u64) -> Result<()> {
+        let bs = self.fs.sb.block_size;
+        if from < to
+            && let Some((block, true)) = self.fs.map(raw, from / bs)?
+        {
+            let zero = vec![0u8; (to - from) as usize];
+            self.fs.write_file(raw, block * bs + from % bs, &zero)?;
+        }
+        Ok(())
+    }
+
+    /// `fallocate` of the file `ino`. A new block is an extent that is not initialized. A hole
+    /// frees the full blocks of the range, and the parts of blocks at its ends become zeros.
+    pub(crate) fn fallocate(
+        &mut self,
+        ino: u32,
+        raw: &mut RawInode,
+        mode: u32,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
+        let fs = self.fs;
+        let bs = fs.sb.block_size;
+        let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
+        if end.div_ceil(bs) > u64::from(u32::MAX) {
+            return Err(Errno::EFBIG);
+        }
+        if mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if raw.flags() & flags::EXTENTS == 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let clear = mode & (PUNCH_HOLE | ZERO_RANGE) != 0;
+        if clear {
+            // The ends of the range in blocks that the range does not fill.
+            let (first_full, last_full) = (offset.div_ceil(bs), end / bs);
+            if first_full > last_full {
+                self.zero_part(raw, offset, end)?;
+            } else {
+                self.zero_part(raw, offset, first_full * bs)?;
+                self.zero_part(raw, last_full * bs, end)?;
+            }
+            if first_full < last_full {
+                let (mut extents, tree) = fs.extents(raw)?;
+                let freed = extent::remove(&mut extents, first_full, last_full);
+                if !freed.is_empty() {
+                    let mut count = 0;
+                    for (start, n) in freed {
+                        self.free_blocks(start, n)?;
+                        count += n;
+                    }
+                    raw.set_blocks(raw.blocks().saturating_sub(count * (bs / 512)));
+                    self.build_tree(ino, raw, &extents, tree)?;
+                }
+            }
+        }
+        if mode & PUNCH_HOLE == 0 {
+            let (mut extents, tree) = fs.extents(raw)?;
+            let (changed, result) =
+                self.preallocate(ino, raw, &mut extents, offset / bs, end.div_ceil(bs));
+            if changed {
+                self.build_tree(ino, raw, &extents, tree)?;
+            }
+            result?;
+            if mode & KEEP_SIZE == 0 && end > raw.size() {
+                raw.set_size(end);
+                touch(raw, true);
+                return Ok(());
+            }
+        }
+        touch(raw, clear);
+        Ok(())
+    }
+
     /// Frees the inode `ino`, which has no link and which no one uses, and its blocks.
     pub(crate) fn release(&mut self, ino: u32) -> Result<()> {
         let fs = self.fs;
@@ -708,6 +824,17 @@ impl Inode for Node {
         let mut tx = self.fs.tx()?;
         let mut raw = self.raw();
         let result = tx.write_data(self.ino, &mut raw, offset, buf);
+        tx.save(self, raw)?;
+        result
+    }
+
+    fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
+        if self.kind() != FileType::Regular {
+            return Err(Errno::ENODEV);
+        }
+        let mut tx = self.fs.tx()?;
+        let mut raw = self.raw();
+        let result = tx.fallocate(self.ino, &mut raw, mode, offset, len);
         tx.save(self, raw)?;
         result
     }

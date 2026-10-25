@@ -482,6 +482,20 @@ impl File {
         inode.set_attr(&SetAttr { size: Some(size), ..SetAttr::default() })
     }
 
+    /// `fallocate`. The caller checked the mode, the offset and the length.
+    pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
+        if !self.flags().writable() {
+            return Err(Errno::EBADF);
+        }
+        let inode = self.inode.as_ref().ok_or(Errno::ENODEV)?;
+        match inode.metadata().file_type() {
+            Some(FileType::Regular) => inode.fallocate(mode, offset, len),
+            Some(FileType::Fifo) => Err(Errno::ESPIPE),
+            Some(FileType::Directory) => Err(Errno::EISDIR),
+            _ => Err(Errno::ENODEV),
+        }
+    }
+
     /// Fills `buf` with `struct linux_dirent64` records from the position of the directory, for
     /// `getdents64`. Gives the number of bytes. A record that does not fit stays for the next
     /// call. Gives `EINVAL` if the first record does not fit.

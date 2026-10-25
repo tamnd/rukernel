@@ -27,7 +27,7 @@ pub(crate) struct Extent {
 }
 
 impl Extent {
-    fn end(&self) -> u64 {
+    pub(crate) fn end(&self) -> u64 {
         u64::from(self.lblock) + u64::from(self.len)
     }
 
@@ -137,20 +137,37 @@ pub(crate) fn put(extents: &mut Vec<Extent>, new: Extent) {
 /// Removes the blocks from `lblock` to the end of the file from the list. Gives the runs of
 /// blocks of the disk that left the list.
 pub(crate) fn cut(extents: &mut Vec<Extent>, lblock: u64) -> Vec<(u64, u64)> {
+    remove(extents, lblock, u64::MAX)
+}
+
+/// Removes the blocks `first..last` of the file from the list. An extent that has blocks on
+/// each side of the range becomes two extents. Gives the runs of blocks of the disk that left
+/// the list.
+pub(crate) fn remove(extents: &mut Vec<Extent>, first: u64, last: u64) -> Vec<(u64, u64)> {
     let mut freed = Vec::new();
-    extents.retain_mut(|e| {
-        if u64::from(e.lblock) >= lblock {
-            freed.push((e.start, u64::from(e.len)));
-            false
-        } else {
-            if e.end() > lblock {
-                let keep = (lblock - u64::from(e.lblock)) as u32;
-                freed.push((e.start + u64::from(keep), u64::from(e.len - keep)));
-                e.len = keep;
-            }
-            true
+    let mut out = Vec::with_capacity(extents.len() + 1);
+    for &e in extents.iter() {
+        let (from, to) = (u64::from(e.lblock).max(first), e.end().min(last));
+        if from >= to {
+            out.push(e);
+            continue;
         }
-    });
+        let skip = from - u64::from(e.lblock);
+        freed.push((e.start + skip, to - from));
+        if skip > 0 {
+            out.push(Extent { len: skip as u32, ..e });
+        }
+        if e.end() > to {
+            let keep = to - u64::from(e.lblock);
+            out.push(Extent {
+                lblock: (u64::from(e.lblock) + keep) as u32,
+                len: (e.end() - to) as u32,
+                start: e.start + keep,
+                init: e.init,
+            });
+        }
+    }
+    *extents = out;
     freed
 }
 
@@ -267,6 +284,16 @@ mod tests {
         assert_eq!(list, [ext(0, 6, 100)]);
         put(&mut list, ext(10, 1, 500));
         assert_eq!(list, [ext(0, 6, 100), ext(10, 1, 500)]);
+    }
+
+    #[test]
+    fn remove_splits_an_extent() {
+        let mut list = vec![ext(0, 10, 100), ext(20, 5, 200)];
+        assert_eq!(remove(&mut list, 3, 22), [(103, 7), (200, 2)]);
+        assert_eq!(list, [ext(0, 3, 100), ext(22, 3, 202)]);
+        assert_eq!(remove(&mut list, 1, 2), [(101, 1)]);
+        assert_eq!(list, [ext(0, 1, 100), ext(2, 1, 102), ext(22, 3, 202)]);
+        assert!(remove(&mut list, 5, 20).is_empty());
     }
 
     #[test]
