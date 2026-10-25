@@ -139,6 +139,7 @@ static void test_perms(void)
 	pid_t pid = fork();
 	if (pid == 0) {
 		gid_t groups[1] = {50};
+		failed = 0;
 		struct stat st;
 		check("the permission child becomes a user",
 		      syscall(SYS_setgroups, 1, groups) == 0 &&
