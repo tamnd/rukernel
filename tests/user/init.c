@@ -1772,6 +1772,10 @@ static void test_iflags(void)
 	close(ap);
 	flags = 0;
 	check("FS_IOC_SETFLAGS clears the flags", ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0);
+	flags = 0;
+	check("FIGETBSZ gives the block size", ioctl(fd, FIGETBSZ, &flags) == 0 && flags == 4096);
+	flags = 0;
+	check("FIBMAP on tmpfs gives EINVAL", ioctl(fd, FIBMAP, &flags) < 0 && errno == EINVAL);
 	close(fd);
 	check("unlink works when the flags are clear", unlink("/tmp/fl") == 0);
 }
