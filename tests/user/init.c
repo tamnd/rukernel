@@ -1800,6 +1800,43 @@ static void test_aio(int fd)
 	      syscall(SYS_io_submit, ctx, 1, list) == -1 && errno == EINVAL);
 }
 
+/* The range that test_cache writes, and the byte at offset k of it. xtask has the same values. */
+#define CACHED_AT (512 * 1024)
+#define CACHED_LEN (512 * 1024)
+static unsigned char cached_byte(long k)
+{
+	return (unsigned char)(k * 13 + k / 4096);
+}
+
+/* Writes 512 KiB through the page cache, and then calls sync. xtask checks the data on the disk. */
+static void test_cache(int fd)
+{
+	static unsigned char buf[CACHED_LEN];
+	int ok;
+
+	for (long k = 0; k < CACHED_LEN; k++)
+		buf[k] = cached_byte(CACHED_AT + k);
+	/* A write of part of a page first, so that the cache reads the other bytes of the page. */
+	ok = pwrite(fd, buf + 1000, 3000, CACHED_AT + 1000) == 3000;
+	ok = ok && pwrite(fd, buf, 1000, CACHED_AT) == 1000;
+	ok = ok && pwrite(fd, buf + 4000, CACHED_LEN - 4000, CACHED_AT + 4000) == CACHED_LEN - 4000;
+	check("pwrite of 512 KiB through the page cache", ok);
+	memset(buf, 0, sizeof(buf));
+	ok = pread(fd, buf, CACHED_LEN, CACHED_AT) == CACHED_LEN;
+	for (long k = 0; ok && k < CACHED_LEN; k++)
+		ok = buf[k] == cached_byte(CACHED_AT + k);
+	check("pread gives the data in the page cache", ok);
+	sync();
+	check("BLKFLSBUF drops the page cache", ioctl(fd, BLKFLSBUF, 0) == 0);
+	memset(buf, 0, sizeof(buf));
+	ok = pread(fd, buf, CACHED_LEN, CACHED_AT) == CACHED_LEN;
+	for (long k = 0; ok && k < CACHED_LEN; k++)
+		ok = buf[k] == cached_byte(CACHED_AT + k);
+	check("pread after sync gives the data from the disk", ok);
+	errno = 0;
+	check("syncfs of a bad descriptor gives EBADF", syncfs(-1) == -1 && errno == EBADF);
+}
+
 static void test_blk(void)
 {
 	int fd = open("/dev/vda", O_RDWR);
@@ -1839,6 +1876,7 @@ static void test_blk(void)
 		ok = buf[i] == disk_byte(512 * 9 + i);
 	check("pread after pwrite gives the new data and keeps the other bytes", ok);
 	test_aio(fd);
+	test_cache(fd);
 	close(fd);
 }
 

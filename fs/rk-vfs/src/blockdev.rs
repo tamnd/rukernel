@@ -1,9 +1,11 @@
 //! Block devices and their device files.
 //!
 //! A driver gives a `BlockDevice`, which reads and writes whole sectors of 512 bytes, and the
-//! block layer puts a queue in front of it. An open file of the device reads and writes at each
-//! byte offset. A part of a sector is read, changed and written again. There is no page cache
-//! yet, so each call goes to the queue.
+//! block layer puts a queue in front of it. Each device has a page cache over its queue. An open
+//! file of the device reads and writes at each byte offset through the cache. A file with
+//! `O_DIRECT` goes to the queue. It first writes the dirty pages of its range to the disk, and a
+//! write then drops the cached pages of its range. A part of a sector is read, changed and written
+//! again.
 
 use crate::file::{BatchIo, File, FileOps, UserMemory};
 use crate::inode::Result;
@@ -13,6 +15,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_abi::native::open::O_DIRECT;
+use rk_block::cache::PageCache;
 use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
 
@@ -38,23 +42,46 @@ pub mod ioctl {
     pub const BLKGETSIZE64: u32 = 0x8008_1272;
 }
 
+/// The page cache of a block device.
+pub type DiskCache = PageCache<Arc<Queue>>;
+
 /// A block device with its name in /dev.
 struct Entry {
     name: String,
-    queue: Arc<Queue>,
+    cache: Arc<DiskCache>,
 }
 
 static BLOCK_DEVICES: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::new());
 
 /// Adds the block device `rdev` with the name `name`, for example `vda`.
 pub fn register_block(rdev: u64, name: &str, device: Arc<dyn BlockDevice>) {
-    let queue = Arc::new(Queue::new(device));
-    BLOCK_DEVICES.lock().insert(rdev, Entry { name: String::from(name), queue });
+    let cache = Arc::new(PageCache::new(Arc::new(Queue::new(device))));
+    BLOCK_DEVICES.lock().insert(rdev, Entry { name: String::from(name), cache });
 }
 
 /// Gives the queue of the block device `rdev`.
 pub fn block_queue(rdev: u64) -> Option<Arc<Queue>> {
-    BLOCK_DEVICES.lock().get(&rdev).map(|e| e.queue.clone())
+    BLOCK_DEVICES.lock().get(&rdev).map(|e| e.cache.store().clone())
+}
+
+/// Gives the page cache of the block device `rdev`.
+pub fn block_cache(rdev: u64) -> Option<Arc<DiskCache>> {
+    BLOCK_DEVICES.lock().get(&rdev).map(|e| e.cache.clone())
+}
+
+/// Writes the dirty pages of each block device to the disk, and makes them durable, for `sync`.
+///
+/// # Errors
+///
+/// Gives the first error of a device. The other devices are written all the same.
+pub fn sync_all() -> Result<()> {
+    let caches: Vec<Arc<DiskCache>> =
+        BLOCK_DEVICES.lock().values().map(|e| e.cache.clone()).collect();
+    let mut result = Ok(());
+    for cache in caches {
+        result = result.and(cache.sync());
+    }
+    result
 }
 
 /// Gives the name and the device number of each block device.
@@ -64,18 +91,46 @@ pub fn block_devices() -> Vec<(String, u64)> {
 
 /// Opens the block device `rdev`. Gives `ENXIO` if no driver has the number, as Linux.
 pub fn open_block(rdev: u64, _flags: u32) -> Result<Arc<dyn FileOps>> {
-    let queue = block_queue(rdev).ok_or(Errno::ENXIO)?;
-    Ok(Arc::new(BlockFile { queue }))
+    let cache = block_cache(rdev).ok_or(Errno::ENXIO)?;
+    let queue = cache.store().clone();
+    Ok(Arc::new(BlockFile { queue, cache }))
 }
 
 /// The operations of an open block device.
 struct BlockFile {
     queue: Arc<Queue>,
+    cache: Arc<DiskCache>,
+}
+
+/// Tells if `file` goes to the queue without the cache.
+fn direct(file: &File) -> bool {
+    file.flags().0 & O_DIRECT != 0
 }
 
 impl BlockFile {
     fn size(&self) -> u64 {
         self.queue.sectors() * SECTOR_SIZE as u64
+    }
+
+    fn read_file(&self, file: &File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        if !direct(file) {
+            return self.cache.read(offset, buf);
+        }
+        self.cache.write_back(offset, buf.len() as u64)?;
+        self.read_bytes(offset, buf)
+    }
+
+    fn write_file(&self, file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
+        if self.queue.read_only() {
+            return Err(Errno::EPERM);
+        }
+        if !direct(file) {
+            return self.cache.write(offset, buf);
+        }
+        self.cache.write_back(offset, buf.len() as u64)?;
+        let r = self.write_bytes(offset, buf);
+        self.cache.forget(offset, buf.len() as u64);
+        r
     }
 
     /// The sectors from `first` that hold `len` bytes at `offset` in the sector.
@@ -146,32 +201,51 @@ impl BlockFile {
 
 impl FileOps for BlockFile {
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
-        let n = self.read_bytes(file.pos(), buf)?;
+        let n = self.read_file(file, file.pos(), buf)?;
         file.set_pos(file.pos() + n as u64);
         Ok(n)
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize> {
-        let n = self.write_bytes(file.pos(), buf)?;
+        let n = self.write_file(file, file.pos(), buf)?;
         file.set_pos(file.pos() + n as u64);
         Ok(n)
     }
 
-    fn read_at(&self, _file: &File, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        self.read_bytes(offset, buf)
+    fn read_at(&self, file: &File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.read_file(file, offset, buf)
     }
 
-    fn write_at(&self, _file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
-        self.write_bytes(offset, buf)
+    fn write_at(&self, file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
+        self.write_file(file, offset, buf)
     }
 
     fn seekable(&self) -> bool {
         true
     }
 
-    /// The entries for whole sectors go to the queue as one batch, so that near entries merge.
-    /// The other entries go one at a time.
-    fn rw_batch(&self, _file: &File, ios: &mut [BatchIo]) {
+    /// Without `O_DIRECT`, each entry goes to the cache. With `O_DIRECT`, the entries for whole
+    /// sectors go to the queue as one batch, so that near entries merge. The other entries go
+    /// one at a time.
+    fn rw_batch(&self, file: &File, ios: &mut [BatchIo]) {
+        if !direct(file) {
+            for io in ios {
+                io.result = if io.write {
+                    self.write_file(file, io.offset, &io.buf)
+                } else {
+                    self.read_file(file, io.offset, &mut io.buf)
+                };
+            }
+            return;
+        }
+        let first = ios.iter().map(|io| io.offset).min().unwrap_or(0);
+        let end = ios.iter().map(|io| io.offset.saturating_add(io.buf.len() as u64)).max();
+        if let Err(e) = self.cache.write_back(first, end.unwrap_or(0).saturating_sub(first)) {
+            for io in ios {
+                io.result = Err(e);
+            }
+            return;
+        }
         let mut bios = Vec::new();
         let mut owners = Vec::new();
         for (i, io) in ios.iter_mut().enumerate() {
@@ -192,6 +266,9 @@ impl FileOps for BlockFile {
                 io.buf = bio.data;
             }
         }
+        for io in ios.iter().filter(|io| io.write) {
+            self.cache.forget(io.offset, io.buf.len() as u64);
+        }
     }
 
     fn end(&self) -> Option<u64> {
@@ -199,7 +276,7 @@ impl FileOps for BlockFile {
     }
 
     fn sync(&self) -> Result<()> {
-        self.queue.flush()
+        self.cache.sync()
     }
 
     fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
@@ -213,7 +290,11 @@ impl FileOps for BlockFile {
             ioctl::BLKROGET => {
                 Self::put(mem, arg, &i32::from(self.queue.read_only()).to_ne_bytes())
             }
-            ioctl::BLKFLSBUF => self.queue.flush().map(|()| 0),
+            ioctl::BLKFLSBUF => {
+                self.cache.sync()?;
+                self.cache.drop_clean();
+                Ok(0)
+            }
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -246,7 +327,8 @@ mod tests {
 
     fn file() -> (Arc<Ram>, BlockFile) {
         let ram = Arc::new(Ram(SpinLock::new(vec![7u8; 4 * SECTOR_SIZE])));
-        (ram.clone(), BlockFile { queue: Arc::new(Queue::new(ram)) })
+        let queue = Arc::new(Queue::new(ram.clone()));
+        (ram, BlockFile { queue: queue.clone(), cache: Arc::new(PageCache::new(queue)) })
     }
 
     #[test]

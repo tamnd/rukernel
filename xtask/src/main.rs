@@ -1226,6 +1226,13 @@ const BLK_DISK_SIZE: usize = 1 << 20;
 /// The text that the `blk` test writes at `BLK_NOTE_AT`. tests/user/init.c has the same values.
 const BLK_NOTE: &[u8] = b"rukernel wrote this sector";
 const BLK_NOTE_AT: usize = 512 * 9 + 100;
+/// The range that the `blk` test writes through the page cache before `sync`, and the byte at
+/// offset k of it.
+const BLK_CACHED_AT: usize = 512 << 10;
+const BLK_CACHED_LEN: usize = 512 << 10;
+fn blk_cached_byte(k: usize) -> u8 {
+    (k * 13 + k / 4096) as u8
+}
 
 /// Writes the disk of the `blk` boot test. The byte at offset k has a value from k, so that the
 /// guest can check each byte that it reads.
@@ -1234,10 +1241,14 @@ fn write_blk_disk(path: &Path) -> Result {
     fs::write(path, data).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// Tells if the guest wrote its text to the disk of the `blk` boot test.
+/// Tells if the guest wrote its text, and the data that it wrote through the page cache, to the
+/// disk of the `blk` boot test.
 fn blk_disk_has_note(path: &Path) -> Result<bool> {
     let data = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    Ok(data.get(BLK_NOTE_AT..BLK_NOTE_AT + BLK_NOTE.len()) == Some(BLK_NOTE))
+    let cached = data.get(BLK_CACHED_AT..BLK_CACHED_AT + BLK_CACHED_LEN).is_some_and(|d| {
+        d.iter().enumerate().all(|(k, &b)| b == blk_cached_byte(BLK_CACHED_AT + k))
+    });
+    Ok(data.get(BLK_NOTE_AT..BLK_NOTE_AT + BLK_NOTE.len()) == Some(BLK_NOTE) && cached)
 }
 
 /// The number of CPUs of the `smp` boot test.
