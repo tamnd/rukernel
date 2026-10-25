@@ -86,7 +86,19 @@ pub(crate) fn mount(
         0 => Vec::from(&b"none"[..]),
         addr => vm.read_cstr(addr as usize, PATH_MAX)?,
     };
-    let root = (ty.make)(&data)?;
+    // A file system on a disk has the block device of the source path.
+    let dev = if ty.nodev {
+        None
+    } else {
+        let path = fs.resolve(fs.cwd(), &source, true)?;
+        let meta = path.inode().metadata();
+        if meta.file_type() != Some(rk_vfs::FileType::BlockDevice) {
+            return Err(Errno::ENOTBLK);
+        }
+        Some(meta.rdev)
+    };
+    let args = fstype::MountArgs { data: &data, dev, read_only: flags & MS_RDONLY != 0 };
+    let root = (ty.make)(&args)?;
     let source = MountSource { source, fstype: ty.name, flags: u64::from(flags & KEPT) };
     ns.mount(root, &at, source)?;
     Ok(0)

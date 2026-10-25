@@ -4,6 +4,7 @@ use super::*;
 use alloc::vec;
 use rk_abi::native::open as o;
 use rk_vfs::cpio;
+use rk_vfs::fstype::MountArgs;
 use rk_vfs::{FdTable, File, FsContext, Location, MountNamespace, MountSource, Whence};
 
 fn setup() -> (FsContext, Location) {
@@ -329,9 +330,16 @@ fn descriptor_table() {
 
 #[test]
 fn mount_options() {
-    let root = mount(b"size=1m,mode=700").unwrap();
+    let root =
+        mount(&MountArgs { data: b"size=1m,mode=700", dev: None, read_only: false }).unwrap();
     assert_eq!(root.metadata().mode, mode::S_IFDIR | 0o700);
     assert_eq!(root.fs_magic(), TMPFS_MAGIC);
-    assert_eq!(mount(b"").unwrap().metadata().mode, mode::S_IFDIR | 0o1777);
-    assert_eq!(mount(b"mode=9").err(), Some(Errno::EINVAL));
+    assert_eq!(
+        mount(&MountArgs { data: b"", dev: None, read_only: false }).unwrap().metadata().mode,
+        mode::S_IFDIR | 0o1777
+    );
+    assert_eq!(
+        mount(&MountArgs { data: b"mode=9", dev: None, read_only: false }).err(),
+        Some(Errno::EINVAL)
+    );
 }

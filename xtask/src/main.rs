@@ -655,6 +655,23 @@ if [ -x /usr/bin/gdb ]; then
         --rw=randwrite --size=1M --verify=crc32c --thread --output=/tmp/fio.log
     grep -q 'rk: (groupid=0, jobs=1): err= 0' /tmp/fio.log || { cat /tmp/fio.log; exit 1; }
     echo 'alpine: fio done'
+    mkdir -p /tmp/tree/a/b/c /tmp/tree/many /mnt
+    cp -a /etc /tmp/tree/etc
+    head -c 3000000 /dev/urandom > /tmp/tree/a/big
+    printf 'small\\n' > /tmp/tree/a/b/c/small
+    ln -s ../big /tmp/tree/a/b/link
+    ln -s $(printf 'x%.0s' $(seq 100)) /tmp/tree/long
+    for i in $(seq 400); do echo $i > /tmp/tree/many/file-$i; done
+    mkfs.ext4 -q -d /tmp/tree /dev/vdb
+    mount -t ext4 -o ro /dev/vdb /mnt
+    test -d /mnt/lost+found
+    mkdir /tmp/tree/lost+found
+    diff -r --no-dereference /tmp/tree /mnt
+    cmp /tmp/tree/a/big /mnt/a/b/link
+    test \"$(stat -c '%s %h' /mnt/a/big)\" = '3000000 1'
+    test \"$(readlink /mnt/long)\" = \"$(readlink /tmp/tree/long)\"
+    ! touch /mnt/new 2>/dev/null
+    echo \"alpine: ext4 read $(find /mnt | wc -l) files\"
 fi
 echo 'alpine: done'
 ",
@@ -1223,6 +1240,8 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
 
 /// The size of the disk of the `blk` boot test.
 const BLK_DISK_SIZE: usize = 1 << 20;
+/// The size of the disk that the `alpine` test makes an ext4 file system on.
+const EXT4_DISK_SIZE: u64 = 64 << 20;
 /// The text that the `blk` test writes at `BLK_NOTE_AT`. tests/user/init.c has the same values.
 const BLK_NOTE: &[u8] = b"rukernel wrote this sector";
 const BLK_NOTE_AT: usize = 512 * 9 + 100;
@@ -1378,6 +1397,15 @@ fn boot_test(names: &[String]) -> Result {
             cmd.arg("-drive")
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
+        }
+        // The `alpine` test makes an ext4 file system on a second disk and mounts it.
+        if *test == "alpine" {
+            let disk = kernel.with_file_name("ext4.img");
+            let file = fs::File::create(&disk).map_err(|e| format!("{}: {e}", disk.display()))?;
+            file.set_len(EXT4_DISK_SIZE).map_err(|e| format!("{}: {e}", disk.display()))?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=disk1,format=raw,file={}", disk.display()))
+                .args(["-device", "virtio-blk-pci,drive=disk1"]);
         }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
         let mut passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
