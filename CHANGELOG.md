@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- Extended attributes: `setxattr`, `getxattr`, `listxattr` and `removexattr`, with the `l` and `f` forms. The `Inode` trait gets `get_xattr`, `set_xattr`, `list_xattr` and `remove_xattr`, and tmpfs keeps the attributes in memory. The calls take the `user.`, `trusted.` and `security.` namespaces, and check the names, the sizes and the flags as Linux. A `user.` attribute is only for a regular file or a directory.
+
 ## [0.3.6] - 2026-10-25
 
 ### Added

@@ -3,7 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use crate::{
     aio, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process, ptrace,
-    sched, seccomp, shm, signal, signalfd, splice, timer, timerfd,
+    sched, seccomp, shm, signal, signalfd, splice, timer, timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -175,15 +175,18 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
             a[2],
             u64::from(rk_abi::native::at::AT_SYMLINK_NOFOLLOW as u32),
         ),
-        nr::LISTXATTR => fs::path_xattr(cx, a[0], true, None),
-        nr::LLISTXATTR => fs::path_xattr(cx, a[0], false, None),
-        nr::FLISTXATTR => fs::fd_xattr(cx, a[0], None),
-        nr::GETXATTR | nr::REMOVEXATTR => fs::path_xattr(cx, a[0], true, Some(Errno::ENODATA)),
-        nr::LGETXATTR | nr::LREMOVEXATTR => fs::path_xattr(cx, a[0], false, Some(Errno::ENODATA)),
-        nr::FGETXATTR | nr::FREMOVEXATTR => fs::fd_xattr(cx, a[0], Some(Errno::ENODATA)),
-        nr::SETXATTR => fs::path_xattr(cx, a[0], true, Some(Errno::EOPNOTSUPP)),
-        nr::LSETXATTR => fs::path_xattr(cx, a[0], false, Some(Errno::EOPNOTSUPP)),
-        nr::FSETXATTR => fs::fd_xattr(cx, a[0], Some(Errno::EOPNOTSUPP)),
+        nr::SETXATTR => xattr::path_setxattr(cx, a[0], a[1], a[2], a[3], a[4], true),
+        nr::LSETXATTR => xattr::path_setxattr(cx, a[0], a[1], a[2], a[3], a[4], false),
+        nr::FSETXATTR => xattr::fsetxattr(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::GETXATTR => xattr::path_getxattr(cx, a[0], a[1], a[2], a[3], true),
+        nr::LGETXATTR => xattr::path_getxattr(cx, a[0], a[1], a[2], a[3], false),
+        nr::FGETXATTR => xattr::fgetxattr(cx, a[0], a[1], a[2], a[3]),
+        nr::LISTXATTR => xattr::path_listxattr(cx, a[0], a[1], a[2], true),
+        nr::LLISTXATTR => xattr::path_listxattr(cx, a[0], a[1], a[2], false),
+        nr::FLISTXATTR => xattr::flistxattr(cx, a[0], a[1], a[2]),
+        nr::REMOVEXATTR => xattr::path_removexattr(cx, a[0], a[1], true),
+        nr::LREMOVEXATTR => xattr::path_removexattr(cx, a[0], a[1], false),
+        nr::FREMOVEXATTR => xattr::fremovexattr(cx, a[0], a[1]),
         nr::FCHOWN => fs::fchown(cx, a[0], a[1], a[2]),
         nr::UMASK => fs::umask(cx, a[0]),
         nr::GETTIMEOFDAY => info::gettimeofday(cx, a[0], a[1]),

@@ -664,21 +664,6 @@ pub(crate) fn fchownat(
     set_attr_at(cx, dirfd, path, follow, &attr)
 }
 
-/// The extended attribute calls on the path `path`. No file system keeps extended attributes
-/// yet. A list is empty, a read or a removal gives `ENODATA`, and a change gives `EOPNOTSUPP`.
-/// The file must be there. The caller gives the error, or `None` for a list.
-pub(crate) fn path_xattr(cx: &Cx<'_>, path: u64, follow: bool, error: Option<Errno>) -> SysResult {
-    let flags = if follow { 0 } else { AT_SYMLINK_NOFOLLOW as u32 };
-    lookup_meta(cx, rk_abi::native::at::AT_FDCWD as i64 as u64, path, flags)?;
-    error.map_or(Ok(0), Err)
-}
-
-/// The extended attribute calls on the file `fd`, as `path_xattr`.
-pub(crate) fn fd_xattr(cx: &Cx<'_>, fd: u64, error: Option<Errno>) -> SysResult {
-    cx.file(fd)?;
-    error.map_or(Ok(0), Err)
-}
-
 pub(crate) fn fchown(cx: &Cx<'_>, fd: u64, uid: u64, gid: u64) -> SysResult {
     set_attr_fd(cx, fd, &SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() })
 }

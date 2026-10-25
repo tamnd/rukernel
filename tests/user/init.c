@@ -45,6 +45,7 @@
 #include <sys/statfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -1586,6 +1587,43 @@ static void test_atime(void)
 	rmdir("/mnt");
 }
 
+static void test_xattr(void)
+{
+	char buf[64];
+	int fd;
+
+	mkdir("/tmp", 0755);
+	fd = open("/tmp/xa", O_CREAT | O_RDWR | O_TRUNC, 0644);
+	check("setxattr makes a user attribute", setxattr("/tmp/xa", "user.color", "blue", 4, 0) == 0);
+	check("getxattr gives the size for a size of 0", getxattr("/tmp/xa", "user.color", NULL, 0) == 4);
+	check("getxattr gives the value",
+	      getxattr("/tmp/xa", "user.color", buf, sizeof(buf)) == 4 && memcmp(buf, "blue", 4) == 0);
+	check("getxattr with a small buffer gives ERANGE",
+	      getxattr("/tmp/xa", "user.color", buf, 2) < 0 && errno == ERANGE);
+	check("XATTR_CREATE of an attribute that exists gives EEXIST",
+	      setxattr("/tmp/xa", "user.color", "red", 3, XATTR_CREATE) < 0 && errno == EEXIST);
+	check("XATTR_REPLACE of a new attribute gives ENODATA",
+	      fsetxattr(fd, "user.size", "1", 1, XATTR_REPLACE) < 0 && errno == ENODATA);
+	check("fsetxattr makes a trusted attribute", fsetxattr(fd, "trusted.t", "", 0, 0) == 0);
+	check("listxattr gives the names",
+	      listxattr("/tmp/xa", buf, sizeof(buf)) == 21 && memcmp(buf, "trusted.t\0user.color\0", 21) == 0);
+	check("flistxattr gives the size for a size of 0", flistxattr(fd, NULL, 0) == 21);
+	check("a name without a namespace gives EOPNOTSUPP",
+	      setxattr("/tmp/xa", "color", "x", 1, 0) < 0 && errno == EOPNOTSUPP);
+	check("an empty name gives ERANGE", getxattr("/tmp/xa", "", buf, sizeof(buf)) < 0 && errno == ERANGE);
+	check("a bad flag gives EINVAL", setxattr("/tmp/xa", "user.a", "x", 1, 4) < 0 && errno == EINVAL);
+	check("removexattr removes the attribute", removexattr("/tmp/xa", "user.color") == 0);
+	check("getxattr of a removed attribute gives ENODATA",
+	      fgetxattr(fd, "user.color", buf, sizeof(buf)) < 0 && errno == ENODATA);
+	symlink("/tmp/xa", "/tmp/xl");
+	check("lsetxattr of a user attribute on a link gives EPERM",
+	      lsetxattr("/tmp/xl", "user.a", "x", 1, 0) < 0 && errno == EPERM);
+	check("getxattr follows the link", getxattr("/tmp/xl", "trusted.t", buf, sizeof(buf)) == 0);
+	close(fd);
+	unlink("/tmp/xl");
+	unlink("/tmp/xa");
+}
+
 /* Reads the file at path into buf, and gives the count of bytes, or -1. */
 static int read_small(const char *path, char *buf, int size)
 {
@@ -2241,6 +2279,7 @@ int main(int argc, char **argv)
 	test_splice();
 	test_atime();
 	test_sysfs();
+	test_xattr();
 	test_proc();
 	test_memfd();
 	test_shm();
