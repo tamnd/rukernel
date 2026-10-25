@@ -374,8 +374,11 @@ impl File {
         Ok(new)
     }
 
-    /// `fsync` and `fdatasync`.
+    /// `fsync` and `fdatasync`. The inode makes its changes durable, and then the file.
     pub fn sync(&self) -> Result<()> {
+        if let Some(inode) = &self.inode {
+            inode.sync()?;
+        }
         self.ops.sync()
     }
 

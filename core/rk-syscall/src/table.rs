@@ -217,10 +217,20 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::ARCH_PRCTL => process::arch_prctl(cx, a[0], a[1]),
         nr::SYNC => {
             // `sync` does not give an error, as in Linux.
+            if let Ok(fs) = cx.fs() {
+                for m in fs.namespace().mounts() {
+                    let _ = m.root().inode().sync();
+                }
+            }
             let _ = rk_vfs::blockdev::sync_all();
             Ok(0)
         }
-        nr::SYNCFS => cx.file(a[0]).and_then(|_| rk_vfs::blockdev::sync_all().map(|()| 0)),
+        nr::SYNCFS => cx.file(a[0]).and_then(|f| {
+            if let Some(inode) = f.inode() {
+                inode.sync()?;
+            }
+            rk_vfs::blockdev::sync_all().map(|()| 0)
+        }),
         nr::GETTID => Ok(u64::from(cx.thread.tid())),
         nr::TKILL => signal::tkill(cx, a[0], a[1]),
         nr::ALARM => timer::alarm(cx, a[0]),

@@ -5,7 +5,7 @@
 //! third pass writes the copies to their blocks. A copy that a later revoke record names is not
 //! written. The fields of the journal are big endian.
 //!
-//! The writer puts each change in one transaction. It writes the descriptor blocks, the copies,
+//! The writer puts the changes since the last commit in one transaction. It writes the descriptor blocks, the copies,
 //! the revoke blocks and the commit block, makes them durable, and then writes the blocks to
 //! their places. When the log is full, a checkpoint makes the places durable and marks the log
 //! empty. A freed block that the log has a copy of gets a revoke record, so a replay does not
@@ -468,6 +468,11 @@ impl Log {
             + revokes.div_ceil(self.revokes_per_block())
             + 1;
         u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
+    /// Tells if a transaction of `copies` copies is a quarter of the log, so it must commit.
+    pub(crate) fn full(&self, copies: usize) -> bool {
+        self.need(copies, self.revokes.len()).saturating_mul(4) >= self.capacity()
     }
 
     fn capacity(&self) -> u32 {
