@@ -18,6 +18,7 @@ rk-fs-sys 3
 rk-fs-overlay 3
 rk-fs-ext4 3
 rk-fs-tmpfs 3
+rk-fs-xfs 3
 rk-net-unix 3
 rk-drv-mem 3
 rk-drv-tty 3

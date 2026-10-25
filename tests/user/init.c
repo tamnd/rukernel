@@ -1648,6 +1648,21 @@ static void test_syslog(void)
 	check("syslog clears the kernel log", klogctl(5, NULL, 0) == 0 && klogctl(3, buf, sizeof(buf)) == 0);
 }
 
+static void test_membarrier(void)
+{
+	long mask = syscall(SYS_membarrier, 0, 0, 0);
+
+	check("membarrier query gives the commands", mask == 0x27f);
+	check("membarrier global", syscall(SYS_membarrier, 1, 0, 0) == 0);
+	check("membarrier private before the registration gives EPERM",
+	      syscall(SYS_membarrier, 8, 0, 0) < 0 && errno == EPERM);
+	check("membarrier registers the private command", syscall(SYS_membarrier, 16, 0, 0) == 0);
+	check("membarrier private", syscall(SYS_membarrier, 8, 0, 0) == 0);
+	check("membarrier gives the registrations", syscall(SYS_membarrier, 512, 0, 0) == 16);
+	check("membarrier with flags gives EINVAL", syscall(SYS_membarrier, 1, 1, 0) < 0 && errno == EINVAL);
+	check("membarrier with a bad command gives EINVAL", syscall(SYS_membarrier, 3, 0, 0) < 0 && errno == EINVAL);
+}
+
 static void test_fifo(void)
 {
 	struct stat st1, st2;
@@ -2408,6 +2423,7 @@ int main(int argc, char **argv)
 	test_xattr();
 	test_fifo();
 	test_syslog();
+	test_membarrier();
 	test_overlay();
 	test_proc();
 	test_memfd();

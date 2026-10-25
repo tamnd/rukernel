@@ -16,7 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::open::O_DIRECT;
-use rk_block::cache::PageCache;
+use rk_block::cache::{PAGE_SIZE, PageCache};
 use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
 
@@ -36,10 +36,18 @@ pub mod ioctl {
     pub const BLKIOMIN: u32 = 0x1278;
     /// Gives the optimal I/O size, as an `unsigned int`.
     pub const BLKIOOPT: u32 = 0x1279;
+    /// Gives the alignment offset, as an `int`.
+    pub const BLKALIGNOFF: u32 = 0x127a;
     /// Gives the physical sector size, as an `unsigned int`.
     pub const BLKPBSZGET: u32 = 0x127b;
+    /// Gives the block size of the device, as an `int`.
+    pub const BLKBSZGET: u32 = 0x8008_1270;
+    /// Sets the block size of the device, from an `int`.
+    pub const BLKBSZSET: u32 = 0x4008_1271;
     /// Gives the size in bytes, as a `u64`.
     pub const BLKGETSIZE64: u32 = 0x8008_1272;
+    /// Gives the sequence number of the disk, as a `u64`.
+    pub const BLKGETDISKSEQ: u32 = 0x8008_1280;
 }
 
 /// The page cache of a block device.
@@ -299,7 +307,21 @@ impl FileOps for BlockFile {
             ioctl::BLKSSZGET | ioctl::BLKPBSZGET | ioctl::BLKIOMIN => {
                 Self::put(mem, arg, &(SECTOR_SIZE as u32).to_ne_bytes())
             }
-            ioctl::BLKIOOPT => Self::put(mem, arg, &0u32.to_ne_bytes()),
+            ioctl::BLKIOOPT | ioctl::BLKALIGNOFF => Self::put(mem, arg, &0u32.to_ne_bytes()),
+            ioctl::BLKBSZGET => Self::put(mem, arg, &(PAGE_SIZE as u32).to_ne_bytes()),
+            ioctl::BLKBSZSET => {
+                // The cache keeps whole pages, so the block size changes nothing. Linux takes a
+                // power of two from the sector size to the page size.
+                let mut b = [0u8; 4];
+                mem.read(arg, &mut b)?;
+                let size = u32::from_ne_bytes(b) as usize;
+                if size.is_power_of_two() && (SECTOR_SIZE..=PAGE_SIZE).contains(&size) {
+                    Ok(0)
+                } else {
+                    Err(Errno::EINVAL)
+                }
+            }
+            ioctl::BLKGETDISKSEQ => Self::put(mem, arg, &1u64.to_ne_bytes()),
             ioctl::BLKROGET => {
                 Self::put(mem, arg, &i32::from(self.queue.read_only()).to_ne_bytes())
             }

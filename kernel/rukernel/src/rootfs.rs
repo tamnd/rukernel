@@ -18,6 +18,9 @@ pub(crate) fn init(boot: &BootInfo) {
     for t in rk_fs_ext4::FS_TYPES {
         rk_vfs::fstype::register(t);
     }
+    for t in rk_fs_xfs::FS_TYPES {
+        rk_vfs::fstype::register(t);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         rk_vfs::fstype::register(rk_fs_proc::FS_TYPE);

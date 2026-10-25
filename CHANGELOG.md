@@ -8,10 +8,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `syslog(2)` and a kernel log. The text of the kernel goes to a ring of 64 KiB, and each line starts with the level and the time since boot, as on Linux. `dmesg` reads it with `syslog(2)`. The actions that change the console log level do nothing.
 - The `fstests` boot test makes `/dev/fd` and an ext4 file system on the scratch disk, so the overlay tests can run with `RK_FSTESTS_TESTS="-overlay ..."`.
+- `membarrier(2)`, with the global, the private and the `SYNC_CORE` commands, their registrations, and `MEMBARRIER_CMD_GET_REGISTRATIONS`. Each command interrupts each other CPU. liburcu needs it, and mkfs.xfs uses liburcu.
+- XFS, in the new crate `rk-fs-xfs`. The driver can only read. It reads the inodes, the extent lists and the extent trees, the short form directories and the data blocks of the larger directories, and the symbolic links, of version 4 and version 5 file systems. A read and write mount gives `EROFS`. The log is not replayed. tools/debug/build.sh adds xfsprogs, and the alpine boot test makes an XFS file system from a tree with `mkfs.xfs -p`, and compares the files with the tree.
 - The `fstests` boot test shows the output of `check` while the tests run. `RK_FSTESTS_TIMEOUT` gives a shorter time limit, and `RK_FSTESTS_WATCH` shows the state and the system call of each process each minute after a time, to find a test that hangs.
 
 ### Fixed
 
+- `lseek` takes `SEEK_DATA` and `SEEK_HOLE`, with the generic rules of Linux: all the file is data, and the end of the file is the only hole. mkfs.xfs uses them to copy the files of a tree.
+- A block device takes `BLKALIGNOFF`, `BLKGETDISKSEQ`, `BLKBSZGET` and `BLKBSZSET`. libblkid needs all its topology ioctls, and without them mkfs.xfs found a sector size of 0. mkfs.xfs sets the block size of the device before it writes.
+- The boot tests of a root file system can take 300 seconds. The alpine test took more than 120 seconds on a busy host.
 - `splice` and `sendfile` into a pipe write only the data that fits in the pipe, as Linux. Before, a copy that was larger than the free space waited for a reader, and fsstress hung when it spliced a file into its own pipe. This stopped generic/013 and overlay/019.
 
 ## [0.3.7] - 2026-10-25

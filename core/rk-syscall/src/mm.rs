@@ -356,3 +356,59 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
     }
     Ok(0)
 }
+
+/// The commands of `membarrier(2)`, `MEMBARRIER_CMD_*`.
+mod membarrier_cmd {
+    pub(super) const QUERY: u64 = 0;
+    pub(super) const GLOBAL: u64 = 1 << 0;
+    pub(super) const GLOBAL_EXPEDITED: u64 = 1 << 1;
+    pub(super) const REGISTER_GLOBAL_EXPEDITED: u64 = 1 << 2;
+    pub(super) const PRIVATE_EXPEDITED: u64 = 1 << 3;
+    pub(super) const REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
+    pub(super) const PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 5;
+    pub(super) const REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 6;
+    pub(super) const GET_REGISTRATIONS: u64 = 1 << 9;
+    /// The commands that `QUERY` gives. The commands for restartable sequences are not there,
+    /// because rukernel has no `rseq(2)`.
+    pub(super) const SUPPORTED: u64 = GLOBAL
+        | GLOBAL_EXPEDITED
+        | REGISTER_GLOBAL_EXPEDITED
+        | PRIVATE_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED
+        | PRIVATE_EXPEDITED_SYNC_CORE
+        | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+        | GET_REGISTRATIONS;
+}
+
+/// `membarrier(2)`: makes each CPU do a full memory barrier. The kernel interrupts each other
+/// CPU, so each command does the same work. A private command needs its registration first, as
+/// Linux. The return from an interrupt makes the CPU fetch the instructions again, so the
+/// commands also do the work of `SYNC_CORE`.
+pub(crate) fn membarrier(cx: &mut Cx<'_>, cmd: u64, flags: u64, _cpu: u64) -> SysResult {
+    use membarrier_cmd::*;
+    if flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let process = cx.process();
+    let registered = u64::from(process.membarrier());
+    match cmd {
+        QUERY => return Ok(SUPPORTED),
+        GET_REGISTRATIONS => return Ok(registered),
+        REGISTER_GLOBAL_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED
+        | REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            process.add_membarrier(cmd as u32);
+            return Ok(0);
+        }
+        PRIVATE_EXPEDITED if registered & REGISTER_PRIVATE_EXPEDITED == 0 => {
+            return Err(Errno::EPERM);
+        }
+        PRIVATE_EXPEDITED_SYNC_CORE if registered & REGISTER_PRIVATE_EXPEDITED_SYNC_CORE == 0 => {
+            return Err(Errno::EPERM);
+        }
+        GLOBAL | GLOBAL_EXPEDITED | PRIVATE_EXPEDITED | PRIVATE_EXPEDITED_SYNC_CORE => {}
+        _ => return Err(Errno::EINVAL),
+    }
+    rk_frame::cpu::barrier_all();
+    Ok(0)
+}

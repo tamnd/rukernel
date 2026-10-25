@@ -58,6 +58,11 @@ fn files_are_written_and_read() {
     assert_eq!(read_file(&fs, &root, b"hello").as_deref(), Ok(&b"hello, world"[..]));
     let f = fs.open(&root, b"/hello", o::O_RDWR, 0).unwrap();
     assert_eq!(f.seek(-5, Whence::End), Ok(7));
+    assert_eq!(f.seek(3, Whence::Data), Ok(3));
+    assert_eq!(f.seek(3, Whence::Hole), Ok(12));
+    assert_eq!(f.seek(12, Whence::Data), Err(Errno::ENXIO));
+    assert_eq!(f.seek(-1, Whence::Hole), Err(Errno::ENXIO));
+    assert_eq!(f.seek(-5, Whence::End), Ok(7));
     assert_eq!(f.write(b"there!"), Ok(6));
     assert_eq!(f.metadata().map(|m| m.size), Ok(13));
     assert_eq!(read_file(&fs, &root, b"/hello").as_deref(), Ok(&b"hello, there!"[..]));
