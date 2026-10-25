@@ -6,7 +6,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
-- Extended attributes: `setxattr`, `getxattr`, `listxattr` and `removexattr`, with the `l` and `f` forms. The `Inode` trait gets `get_xattr`, `set_xattr`, `list_xattr` and `remove_xattr`, and tmpfs keeps the attributes in memory. The calls take the `user.`, `trusted.` and `security.` namespaces, and check the names, the sizes and the flags as Linux. A `user.` attribute is only for a regular file or a directory.
+- Extended attributes: `setxattr`, `getxattr`, `listxattr` and `removexattr`, with the `l` and `f` forms. The `Inode` trait gets `get_xattr`, `set_xattr`, `list_xattr` and `remove_xattr`, and tmpfs keeps the attributes in memory. The calls take the `user.`, `trusted.` and `security.` namespaces, and check the names, the sizes and the flags as Linux. A `user.` attribute is only for a regular file, a directory or a socket, as Linux 6.17.
+- Named FIFOs. An open of a FIFO for read or for write waits until the other end opens, and `O_RDWR` does not wait. An open for write with `O_NONBLOCK` and no reader gives `ENXIO`. All opens of one FIFO share one pipe.
+- tools/ltp/build.sh builds the LTP tests of the xattr calls, `sendfile`, `splice`, `copy_file_range` and `posix_fadvise`. 55 of them pass and go in tools/ltp/tests.txt.
 
 ## [0.3.6] - 2026-10-25
 

@@ -50,14 +50,12 @@ fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
     Ok(name)
 }
 
-/// Linux keeps a `user.` attribute only on a regular file and a directory. A change of one on
-/// another file gives `EPERM`, and a read gives `ENODATA`.
+/// Linux keeps a `user.` attribute only on a regular file, a directory and a socket. A change of
+/// one on another file gives `EPERM`, and a read gives `ENODATA`. Linux 6.17 added the socket.
 fn check_user(inode: &InodeRef, name: &[u8], change: bool) -> Result<(), Errno> {
-    let meta = inode.metadata();
-    if name.starts_with(b"user.")
-        && !meta.is_dir()
-        && meta.file_type() != Some(rk_vfs::FileType::Regular)
-    {
+    use rk_vfs::FileType::{Directory, Regular, Socket};
+    let kind = inode.metadata().file_type();
+    if name.starts_with(b"user.") && !matches!(kind, Some(Regular | Directory | Socket)) {
         return Err(if change { Errno::EPERM } else { Errno::ENODATA });
     }
     Ok(())

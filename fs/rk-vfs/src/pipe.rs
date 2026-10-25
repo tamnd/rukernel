@@ -3,12 +3,16 @@
 //! A read waits until data comes or each write end is closed. A write of up to `PIPE_BUF` bytes
 //! is atomic: it waits until the buffer has space for all of it. A write to a pipe that has no
 //! read end gives `EPIPE`, and the system call layer sends `SIGPIPE`.
+//!
+//! A named pipe, or FIFO, is a pipe that a file of the type `S_IFIFO` names. Each open of the
+//! file gives an end of one pipe, which lives while one end is open. An open for reading waits
+//! for a writer, and an open for writing waits for a reader, as `fifo_open` of Linux.
 
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::{Metadata, Result};
 use crate::wait::{WaitQueue, poll_wake};
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::ioctls::FIONREAD;
@@ -27,6 +31,10 @@ struct State {
     size: usize,
     readers: usize,
     writers: usize,
+    /// The count of the opens of each type, so an open that waits sees an open and a close
+    /// that came before it ran again.
+    reader_opens: u64,
+    writer_opens: u64,
 }
 
 /// The buffer that the two ends share.
@@ -52,23 +60,54 @@ impl Pipe {
 }
 
 /// One end of a pipe. Each end is the operations of one open file. When the file closes, the
-/// end goes away.
+/// end goes away. An open of a FIFO with `O_RDWR` gives an end that reads and writes.
 struct PipeEnd {
     pipe: Arc<Pipe>,
+    read: bool,
     write: bool,
+    /// The end is of a FIFO, so `fstat` gives the attributes of the file of the FIFO.
+    named: bool,
+}
+
+impl PipeEnd {
+    /// Makes an end and counts it in the pipe.
+    fn new(pipe: Arc<Pipe>, read: bool, write: bool, named: bool) -> Self {
+        {
+            let mut s = pipe.state.lock();
+            if read {
+                s.readers += 1;
+                s.reader_opens += 1;
+            }
+            if write {
+                s.writers += 1;
+                s.writer_opens += 1;
+            }
+        }
+        if named {
+            pipe.wake(true);
+            pipe.wake(false);
+        }
+        Self { pipe, read, write, named }
+    }
 }
 
 impl Drop for PipeEnd {
     fn drop(&mut self) {
         {
             let mut s = self.pipe.state.lock();
-            if self.write {
-                s.writers -= 1;
-            } else {
+            if self.read {
                 s.readers -= 1;
             }
+            if self.write {
+                s.writers -= 1;
+            }
         }
-        self.pipe.wake(self.write);
+        if self.read {
+            self.pipe.wake(false);
+        }
+        if self.write {
+            self.pipe.wake(true);
+        }
     }
 }
 
@@ -88,7 +127,7 @@ fn pipe_dev() -> u64 {
 
 impl FileOps for PipeEnd {
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
-        if self.write {
+        if !self.read {
             return Err(Errno::EBADF);
         }
         if buf.is_empty() {
@@ -169,8 +208,14 @@ impl FileOps for PipeEnd {
     }
 
     fn event_count(&self) -> u64 {
-        let count = if self.write { &self.pipe.write_events } else { &self.pipe.read_events };
-        count.load(Ordering::Relaxed)
+        let mut n = 0u64;
+        if self.read {
+            n = n.wrapping_add(self.pipe.read_events.load(Ordering::Relaxed));
+        }
+        if self.write {
+            n = n.wrapping_add(self.pipe.write_events.load(Ordering::Relaxed));
+        }
+        n
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
@@ -179,28 +224,30 @@ impl FileOps for PipeEnd {
 
     fn poll(&self, _file: &File) -> u32 {
         let s = self.pipe.state.lock();
+        let mut ev = 0;
         if self.write {
-            let mut ev = 0;
             if s.size.saturating_sub(s.buf.len()) >= PIPE_BUF.min(s.size) {
                 ev |= events::POLLOUT;
             }
             if s.readers == 0 {
                 ev |= events::POLLERR;
             }
-            ev
-        } else {
-            let mut ev = 0;
+        }
+        if self.read {
             if !s.buf.is_empty() {
                 ev |= events::POLLIN;
             }
             if s.writers == 0 {
                 ev |= events::POLLHUP;
             }
-            ev
         }
+        ev
     }
 
     fn metadata(&self) -> Option<Metadata> {
+        if self.named {
+            return None;
+        }
         Some(Metadata {
             dev: pipe_dev(),
             ino: self.pipe.ino,
@@ -261,22 +308,82 @@ pub fn set_pipe_size(file: &File, size: usize) -> Result<usize> {
 /// files.
 pub fn pipe(flags: u32) -> (Arc<File>, Arc<File>) {
     use rk_abi::native::open::{O_RDONLY, O_WRONLY};
+    let pipe = new_pipe();
+    let r = Arc::new(PipeEnd::new(pipe.clone(), true, false, false));
+    let w = Arc::new(PipeEnd::new(pipe, false, true, false));
+    (File::with_ops(r, None, O_RDONLY | flags), File::with_ops(w, None, O_WRONLY | flags))
+}
+
+/// Makes a pipe with no ends.
+fn new_pipe() -> Arc<Pipe> {
     static NEXT_INO: AtomicU64 = AtomicU64::new(1);
-    let pipe = Arc::new(Pipe {
+    Arc::new(Pipe {
         state: SpinLock::new(State {
             buf: VecDeque::new(),
             size: PIPE_SIZE,
-            readers: 1,
-            writers: 1,
+            readers: 0,
+            writers: 0,
+            reader_opens: 0,
+            writer_opens: 0,
         }),
         wait: WaitQueue::new(),
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
         read_events: AtomicU64::new(0),
         write_events: AtomicU64::new(0),
-    });
-    let r = Arc::new(PipeEnd { pipe: pipe.clone(), write: false });
-    let w = Arc::new(PipeEnd { pipe, write: true });
-    (File::with_ops(r, None, O_RDONLY | flags), File::with_ops(w, None, O_WRONLY | flags))
+    })
+}
+
+/// The pipes of the FIFOs that have an open end, by the device and the inode number of the file.
+static FIFOS: SpinLock<BTreeMap<(u64, u64), Weak<Pipe>>> = SpinLock::new(BTreeMap::new());
+
+/// Opens the FIFO with the device `dev` and the inode number `ino`, with the access mode and
+/// `O_NONBLOCK` in `flags`. An open for reading waits for a writer, and an open for writing waits
+/// for a reader, unless `O_NONBLOCK` is set. An open with `O_RDWR` does not wait.
+///
+/// # Errors
+///
+/// Gives `ENXIO` for an open for writing with `O_NONBLOCK` when the FIFO has no reader, and
+/// `ERESTARTSYS` if a signal stops the wait.
+pub fn open_fifo(dev: u64, ino: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
+    use rk_abi::native::open::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
+    let pipe = {
+        let mut fifos = FIFOS.lock();
+        fifos.retain(|_, p| p.strong_count() > 0);
+        match fifos.get(&(dev, ino)).and_then(Weak::upgrade) {
+            Some(pipe) => pipe,
+            None => {
+                let pipe = new_pipe();
+                fifos.insert((dev, ino), Arc::downgrade(&pipe));
+                pipe
+            }
+        }
+    };
+    let nonblock = flags & O_NONBLOCK != 0;
+    let (read, write) = match flags & O_ACCMODE {
+        O_RDWR => (true, true),
+        O_WRONLY => (false, true),
+        _ => (true, false),
+    };
+    if write && !read && nonblock && pipe.state.lock().readers == 0 {
+        return Err(Errno::ENXIO);
+    }
+    let (readers, writers) = {
+        let s = pipe.state.lock();
+        (s.reader_opens, s.writer_opens)
+    };
+    let end = PipeEnd::new(pipe.clone(), read, write, true);
+    if !nonblock && read != write {
+        pipe.wait.wait_interruptible(|| {
+            let s = pipe.state.lock();
+            let ready = if read {
+                s.writers > 0 || s.writer_opens != writers
+            } else {
+                s.readers > 0 || s.reader_opens != readers
+            };
+            Ok(ready.then_some(()))
+        })?;
+    }
+    Ok(Arc::new(end))
 }
 
 #[cfg(test)]
@@ -317,6 +424,24 @@ mod tests {
         drop(r);
         assert_eq!(w.write(b"x").unwrap_err(), Errno::EPIPE);
         assert_eq!(w.poll(), events::POLLERR);
+    }
+
+    #[test]
+    fn a_fifo_shares_one_pipe_between_its_opens() {
+        use rk_abi::native::open::{O_RDONLY, O_RDWR, O_WRONLY};
+        assert_eq!(open_fifo(9, 1, O_WRONLY | O_NONBLOCK).err(), Some(Errno::ENXIO));
+        let r = File::with_ops(open_fifo(9, 1, O_RDONLY | O_NONBLOCK).unwrap(), None, O_RDONLY);
+        let w = File::with_ops(open_fifo(9, 1, O_WRONLY | O_NONBLOCK).unwrap(), None, O_WRONLY);
+        assert_eq!(w.write(b"abc").unwrap(), 3);
+        let mut buf = [0u8; 4];
+        assert_eq!(r.read(&mut buf).unwrap(), 3);
+        assert!(w.metadata().is_err());
+        let rw = File::with_ops(open_fifo(9, 2, O_RDWR).unwrap(), None, O_RDWR);
+        assert_eq!(rw.write(b"x").unwrap(), 1);
+        assert_eq!(rw.poll(), events::POLLIN | events::POLLOUT);
+        assert_eq!(rw.read(&mut buf).unwrap(), 1);
+        drop((r, w, rw));
+        assert!(FIFOS.lock().values().all(|p| p.strong_count() == 0));
     }
 
     #[test]
