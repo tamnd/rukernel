@@ -1750,6 +1750,13 @@ static void test_iflags(void)
 	fsx.fsx_xflags = FS_XFLAG_IMMUTABLE | FS_XFLAG_NODUMP;
 	check("FS_IOC_FSSETXATTR sets the nodump flag", ioctl(fd, FS_IOC_FSSETXATTR, &fsx) == 0 &&
 	      ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 && flags == (FS_IMMUTABLE_FL | FS_NODUMP_FL));
+	{
+		struct statx stx;
+		check("statx gives the immutable and nodump attributes",
+		      statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) == 0 &&
+		      (stx.stx_attributes & (STATX_ATTR_IMMUTABLE | STATX_ATTR_NODUMP | STATX_ATTR_APPEND)) ==
+		      (STATX_ATTR_IMMUTABLE | STATX_ATTR_NODUMP) && (stx.stx_attributes_mask & STATX_ATTR_APPEND));
+	}
 	fsx.fsx_projid = 1;
 	check("FS_IOC_FSSETXATTR with a project id gives EOPNOTSUPP",
 	      ioctl(fd, FS_IOC_FSSETXATTR, &fsx) < 0 && errno == EOPNOTSUPP);
