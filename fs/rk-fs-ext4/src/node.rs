@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
+use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::{FiemapExtent, mode};
@@ -26,6 +27,9 @@ pub struct Node {
     fs: Arc<Fs>,
     pub(crate) ino: u32,
     raw: SpinLock<RawInode>,
+    /// The extra fields of the inode could not grow, so the driver does not try again, as
+    /// `EXT4_STATE_NO_EXPAND`.
+    no_expand: AtomicBool,
 }
 
 /// Gives the time stamp of the seconds and the nanoseconds of `t`.
@@ -251,8 +255,17 @@ impl Fs {
 
 impl Tx<'_> {
     /// Writes the inode of `node` and keeps `raw` as its inode in memory. An inode that loses
-    /// its last link goes on the list of orphans.
+    /// its last link goes on the list of orphans. The extra fields of an inode with less than
+    /// the file system wants grow first, as `ext4_try_to_expand_extra_isize`.
     pub(crate) fn save(&mut self, node: &Node, mut raw: RawInode) -> Result<()> {
+        if raw.0.len() > 128
+            && raw.extra_size() < self.fs.want_extra_isize()
+            && raw.flags() & flags::INLINE_DATA == 0
+            && !node.no_expand.load(Ordering::Relaxed)
+            && self.expand_extra_isize(node.ino, &mut raw).is_err()
+        {
+            node.no_expand.store(true, Ordering::Relaxed);
+        }
         if raw.links() == 0 && node.raw.lock().links() != 0 {
             self.add_orphan(node.ino, &mut raw)?;
         }
@@ -769,8 +782,8 @@ impl Tx<'_> {
         let size = usize::from(fs.sb.inode_size);
         let mut raw = RawInode(vec![0u8; size]);
         if size > 128 {
-            let extra = fs.sb.want_extra_isize.max(32).min(size as u16 - 128);
-            layout::put16(&mut raw.0, 0x80, extra);
+            let extra = fs.want_extra_isize().min(size - 128);
+            layout::put16(&mut raw.0, 0x80, extra as u16);
         }
         raw.set_mode((kind.mode_bits() | (perm & mode::PERM_MASK)) as u16);
         raw.set_links(if is_dir { 2 } else { 1 });
@@ -803,7 +816,7 @@ impl Fs {
 
 impl Node {
     pub(crate) fn new(fs: Arc<Fs>, ino: u32, raw: RawInode) -> Arc<Self> {
-        Arc::new(Self { fs, ino, raw: SpinLock::new(raw) })
+        Arc::new(Self { fs, ino, raw: SpinLock::new(raw), no_expand: AtomicBool::new(false) })
     }
 
     /// A copy of the inode.

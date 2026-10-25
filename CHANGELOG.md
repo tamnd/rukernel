@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- ext4 makes the extra fields of an inode larger when it changes the inode and the inode has less than `s_want_extra_isize`, as Linux. The attributes that then do not fit in the inode move to its attribute block. If the block has no room, the driver tries `s_min_extra_isize`, and else the inode keeps its size. A new inode gets the size that `ext4_clamp_want_extra_isize` gives. ext4/022 passes.
+
 ### Fixed
 
 - An ext4 mount no longer frees a reserved inode, an inode past the end, or an inode that is not in use when `s_last_orphan` points to it. As Linux, such an inode ends the list of orphans and stays as it is. ext4/038 passes.
