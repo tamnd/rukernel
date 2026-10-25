@@ -12,6 +12,8 @@ pub const SUPERBLOCK_AT: u64 = 1024;
 pub const SUPERBLOCK_SIZE: usize = 1024;
 /// The inode of the root directory.
 pub const ROOT_INO: u32 = 2;
+/// The inode that keeps the reserved blocks for more group descriptors.
+pub const RESIZE_INO: u32 = 7;
 
 /// The incompatible features. A kernel that does not know one of them must not mount the disk.
 pub mod incompat {
@@ -68,6 +70,10 @@ pub mod ro_compat {
 pub mod compat {
     /// The file system has a journal.
     pub const HAS_JOURNAL: u32 = 0x4;
+    /// The inode [`RESIZE_INO`] keeps the reserved blocks for more group descriptors.
+    pub const RESIZE_INODE: u32 = 0x10;
+    /// Only up to two groups past group 0 have a copy of the superblock.
+    pub const SPARSE_SUPER2: u32 = 0x200;
 }
 
 /// The flags of a group descriptor.
@@ -76,10 +82,20 @@ pub mod bg {
     pub const INODE_UNINIT: u16 = 0x1;
     /// The block bitmap is not on the disk. The driver makes it from the layout.
     pub const BLOCK_UNINIT: u16 = 0x2;
+    /// The inode table has only zeros.
+    pub const ITABLE_ZEROED: u16 = 0x4;
 }
 
 /// The offsets of the fields of the superblock that the driver changes.
 pub mod sb {
+    /// The number of inodes.
+    pub const INODES_COUNT: usize = 0x0;
+    /// The low 32 bits of the number of blocks.
+    pub const BLOCKS_COUNT: usize = 0x4;
+    /// The high 32 bits of the number of blocks.
+    pub const BLOCKS_COUNT_HI: usize = 0x150;
+    /// The group of this copy of the superblock.
+    pub const BLOCK_GROUP_NR: usize = 0x5a;
     /// The low 32 bits of the number of blocks for the superuser only.
     pub const R_BLOCKS: usize = 0x8;
     /// The high 32 bits of the number of blocks for the superuser only.
@@ -264,8 +280,18 @@ impl Superblock {
 
     /// The number of block groups.
     pub fn groups(&self) -> u32 {
-        let blocks = self.blocks_count - u64::from(self.first_data_block);
+        self.groups_for(self.blocks_count)
+    }
+
+    /// The number of block groups of a file system with `blocks` blocks.
+    pub fn groups_for(&self, blocks: u64) -> u32 {
+        let blocks = blocks - u64::from(self.first_data_block);
         blocks.div_ceil(u64::from(self.blocks_per_group)) as u32
+    }
+
+    /// The first block of the group `group`.
+    pub fn group_start(&self, group: u32) -> u64 {
+        u64::from(self.first_data_block) + u64::from(group) * u64::from(self.blocks_per_group)
     }
 
     /// Tells if the group `group` has a copy of the superblock and of the group descriptors.
@@ -345,9 +371,12 @@ impl Superblock {
 
     /// The number of blocks in the group `group`. The last group can be shorter.
     pub fn blocks_in_group(&self, group: u32) -> u32 {
-        let start =
-            u64::from(self.first_data_block) + u64::from(group) * u64::from(self.blocks_per_group);
-        (self.blocks_count - start).min(u64::from(self.blocks_per_group)) as u32
+        self.group_size(group, self.blocks_count)
+    }
+
+    /// The number of blocks in the group `group` of a file system with `blocks` blocks.
+    pub fn group_size(&self, group: u32, blocks: u64) -> u32 {
+        (blocks - self.group_start(group)).min(u64::from(self.blocks_per_group)) as u32
     }
 }
 

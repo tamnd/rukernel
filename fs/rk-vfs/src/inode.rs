@@ -275,6 +275,12 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Grows the file system of the inode to `blocks` blocks while it is mounted, for
+    /// `EXT4_IOC_RESIZE_FS`. The default gives `ENOTTY`.
+    fn resize(&self, _blocks: u64) -> Result<()> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {

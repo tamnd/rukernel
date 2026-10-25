@@ -29,6 +29,7 @@ mod indirect;
 mod journal;
 pub mod layout;
 mod node;
+mod resize;
 #[cfg(test)]
 mod tests;
 mod xattr;
@@ -37,7 +38,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use layout::{GroupDesc, RawInode, Superblock, gd, u16_at, u32_at};
 use rk_abi::Errno;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
@@ -181,8 +182,13 @@ impl Drop for Fs {
 pub struct Fs {
     disk: Arc<dyn Disk>,
     dev: u64,
+    /// The superblock as the mount read it. An online resize changes the number of blocks and
+    /// of inodes, so these come from `blocks` and `groups`.
     sb: Superblock,
-    groups: Vec<GroupDesc>,
+    /// The number of blocks.
+    blocks: AtomicU64,
+    /// The block groups. An online resize adds groups at the end.
+    groups: SpinLock<Vec<GroupDesc>>,
     /// The file system can change.
     writable: bool,
     /// The seed of the crc32c checksums, for `metadata_csum`.
@@ -275,8 +281,9 @@ impl Fs {
         let mut fs = Self {
             disk,
             dev,
+            blocks: AtomicU64::new(sb.blocks_count),
             sb,
-            groups,
+            groups: SpinLock::new(groups),
             writable,
             csum_seed,
             meta: SpinLock::new(Meta { sb: b, descs, generation }),
@@ -428,7 +435,7 @@ impl Fs {
             reserved |= u64::from(u32_at(&meta.sb, layout::sb::R_BLOCKS_HI)) << 32;
         }
         drop(meta);
-        let groups = sb.groups();
+        let groups = self.group_count();
         let base: u64 = (0..groups).map(|g| sb.base_meta_blocks(g)).sum();
         let mut overhead =
             u64::from(sb.first_data_block) + base + u64::from(groups) * (2 + sb.itable_blocks());
@@ -442,10 +449,10 @@ impl Fs {
         }
         rk_vfs::inode::FsStat {
             bsize: sb.block_size,
-            blocks: sb.blocks_count.saturating_sub(overhead),
+            blocks: self.blocks_count().saturating_sub(overhead),
             bfree,
             bavail: bfree.saturating_sub(reserved),
-            files: u64::from(sb.inodes_count),
+            files: u64::from(self.inodes_count()),
             ffree,
         }
     }
@@ -489,12 +496,11 @@ impl Fs {
 
     /// The offset of the inode `ino` on the disk.
     fn inode_at(&self, ino: u32) -> Result<u64> {
-        if ino == 0 || ino > self.sb.inodes_count {
+        if ino == 0 {
             return Err(Errno::EIO);
         }
         let index = ino - 1;
-        let group =
-            self.groups.get((index / self.sb.inodes_per_group) as usize).ok_or(Errno::EIO)?;
+        let group = self.group(index / self.sb.inodes_per_group)?;
         let size = u64::from(self.sb.inode_size);
         Ok(group.inode_table * self.sb.block_size
             + u64::from(index % self.sb.inodes_per_group) * size)
@@ -518,7 +524,36 @@ impl Fs {
         self.write(self.inode_at(ino)?, &raw.0)
     }
 
-    /// The superblock.
+    /// The number of blocks.
+    pub(crate) fn blocks_count(&self) -> u64 {
+        self.blocks.load(Ordering::Relaxed)
+    }
+
+    /// The number of block groups.
+    pub(crate) fn group_count(&self) -> u32 {
+        self.groups.lock().len() as u32
+    }
+
+    /// The number of inodes.
+    pub(crate) fn inodes_count(&self) -> u32 {
+        self.group_count() * self.sb.inodes_per_group
+    }
+
+    /// The number of blocks in the group `group`. The last group can be shorter.
+    pub(crate) fn blocks_in_group(&self, group: u32) -> u32 {
+        self.sb.group_size(group, self.blocks_count())
+    }
+
+    /// The descriptor of the group `group`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EIO` for a group past the end.
+    pub(crate) fn group(&self, group: u32) -> Result<GroupDesc> {
+        self.groups.lock().get(group as usize).copied().ok_or(Errno::EIO)
+    }
+
+    /// The superblock as the mount read it.
     pub fn superblock(&self) -> &Superblock {
         &self.sb
     }
@@ -553,7 +588,7 @@ impl Fs {
 
     /// Reads the block `block`.
     fn read_block(&self, block: u64) -> Result<Vec<u8>> {
-        if block >= self.sb.blocks_count {
+        if block >= self.blocks_count() {
             return Err(Errno::EIO);
         }
         let mut buf = vec![0u8; self.sb.block_size as usize];
@@ -563,12 +598,11 @@ impl Fs {
 
     /// Reads the inode `ino` from the inode table.
     fn read_inode(&self, ino: u32) -> Result<RawInode> {
-        if ino == 0 || ino > self.sb.inodes_count {
+        if ino == 0 {
             return Err(Errno::EIO);
         }
         let index = ino - 1;
-        let group =
-            self.groups.get((index / self.sb.inodes_per_group) as usize).ok_or(Errno::EIO)?;
+        let group = self.group(index / self.sb.inodes_per_group)?;
         let size = u64::from(self.sb.inode_size);
         let at = group.inode_table * self.sb.block_size
             + u64::from(index % self.sb.inodes_per_group) * size;
