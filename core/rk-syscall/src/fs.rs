@@ -845,6 +845,34 @@ pub(crate) fn ftruncate(cx: &Cx<'_>, fd: u64, size: u64) -> SysResult {
     Ok(0)
 }
 
+/// Writes back a range of a file. The page cache has no partial write back, so a request with flags
+/// syncs all the file. The checks are those of `ksys_sync_file_range` of Linux, in its order.
+pub(crate) fn sync_file_range(
+    cx: &Cx<'_>,
+    fd: u64,
+    offset: u64,
+    nbytes: u64,
+    flags: u64,
+) -> SysResult {
+    const ALL: u64 = 1 | 2 | 4; // WAIT_BEFORE, WRITE and WAIT_AFTER.
+    let (offset, nbytes) = (offset as i64, nbytes as i64);
+    if flags & !ALL != 0 || offset < 0 || nbytes < 0 || offset.checked_add(nbytes).is_none() {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.file(fd)?;
+    let kind = file.metadata()?.file_type();
+    if !matches!(
+        kind,
+        Some(FileType::Regular | FileType::Directory | FileType::Block | FileType::Symlink)
+    ) {
+        return Err(Errno::ESPIPE);
+    }
+    if flags != 0 {
+        file.sync()?;
+    }
+    Ok(0)
+}
+
 pub(crate) fn fallocate(cx: &Cx<'_>, fd: u64, mode: u64, offset: u64, len: u64) -> SysResult {
     use rk_vfs::inode::falloc::*;
     let mode = mode as u32;
