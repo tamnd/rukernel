@@ -118,6 +118,14 @@ pub(crate) mod paging {
     }
 }
 
+/// The real time clock. These architectures have no real time clock yet.
+pub(crate) mod rtc {
+    /// Gives `None`, because there is no clock.
+    pub(crate) fn read() -> Option<u64> {
+        None
+    }
+}
+
 /// The timer values. These architectures have no timer yet, so the values stay 0.
 pub(crate) mod timer {
     use core::sync::atomic::AtomicU64;

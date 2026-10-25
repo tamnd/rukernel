@@ -25,6 +25,8 @@ const TICK_TSC: usize = 3;
 /// The word of the data page with the nanoseconds of one cycle of the time stamp counter, times
 /// 2^32.
 const TSC_MULT: usize = 4;
+/// The word of the data page with the nanoseconds of `CLOCK_REALTIME` at boot. It does not change.
+const REALTIME_OFFSET: usize = 5;
 
 static DATA: Once<Option<Arc<Frame>>> = Once::new();
 /// The physical address of the data page, or 0 before `data_page` makes it.
@@ -35,6 +37,7 @@ pub fn data_page() -> Option<Arc<Frame>> {
     DATA.call_once(|| {
         let mut frame = alloc_zeroed_frame()?;
         frame.write_u64(NS_PER_TICK, 1_000_000_000 / crate::time::HZ);
+        frame.write_u64(REALTIME_OFFSET, crate::time::realtime_offset_ns());
         DATA_PHYS.store(frame.addr().get(), Ordering::Release);
         tick();
         Some(Arc::new(frame))

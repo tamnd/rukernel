@@ -99,6 +99,9 @@ struct TimerState {
 /// A timer.
 pub struct Timer {
     clock: Clock,
+    /// The timer takes an absolute time of `CLOCK_REALTIME`. The clock of the timer is the clock
+    /// since boot, and the caller changes the absolute time to the time since boot.
+    realtime: bool,
     target: Target,
     /// The signal that the timer sends. The timer sets the time fields of the `siginfo`.
     info: SigInfo,
@@ -114,7 +117,29 @@ impl core::fmt::Debug for Timer {
 impl Timer {
     /// Makes a timer on `clock` that is off. It sends `info` to `target`.
     pub fn new(clock: Clock, target: Target, info: SigInfo) -> Arc<Self> {
-        Arc::new(Self { clock, target, info, state: SpinLock::new(TimerState::default()) })
+        Arc::new(Self {
+            clock,
+            realtime: false,
+            target,
+            info,
+            state: SpinLock::new(TimerState::default()),
+        })
+    }
+
+    /// Makes a timer of `CLOCK_REALTIME` that is off. It sends `info` to `target`.
+    pub fn new_realtime(target: Target, info: SigInfo) -> Arc<Self> {
+        Arc::new(Self {
+            clock: Clock::Boot,
+            realtime: true,
+            target,
+            info,
+            state: SpinLock::new(TimerState::default()),
+        })
+    }
+
+    /// Gives `true` if the timer takes an absolute time of `CLOCK_REALTIME`.
+    pub fn is_realtime(&self) -> bool {
+        self.realtime
     }
 
     /// The time of the clock of the timer in nanoseconds.

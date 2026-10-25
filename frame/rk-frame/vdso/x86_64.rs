@@ -25,6 +25,7 @@ struct Data {
     seq: u64,
     tick_tsc: u64,
     tsc_mult: u64,
+    realtime_offset: u64,
 }
 
 #[repr(C)]
@@ -88,6 +89,21 @@ fn now_ns() -> u64 {
     }
 }
 
+/// The nanoseconds of `CLOCK_REALTIME`. This is the calculation of `realtime_ns` in the kernel.
+fn realtime_ns() -> u64 {
+    let d = data();
+    // SAFETY: as in `now_ns`. The kernel writes the word before it maps the page, and it does not
+    // change it.
+    let offset = unsafe { core::ptr::addr_of!((*d).realtime_offset).read_volatile() };
+    now_ns().wrapping_add(offset)
+}
+
+/// The time of the clock `clock`, which `known` accepts, in nanoseconds.
+fn clock_ns(clock: i32) -> u64 {
+    // CLOCK_REALTIME, CLOCK_REALTIME_COARSE and CLOCK_TAI follow the real time.
+    if matches!(clock, 0 | 5 | 11) { realtime_ns() } else { now_ns() }
+}
+
 /// The resolution of the clocks, in nanoseconds.
 fn resolution_ns() -> u64 {
     let d = data();
@@ -95,8 +111,7 @@ fn resolution_ns() -> u64 {
     unsafe { core::ptr::addr_of!((*d).ns_per_tick).read_volatile() }
 }
 
-/// Tells if the data page gives the clock. These are the clocks that count from the boot in the
-/// kernel too.
+/// Tells if the data page gives the clock.
 fn known(clock: i32) -> bool {
     // CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,
     // CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME and CLOCK_TAI.
@@ -126,7 +141,7 @@ pub unsafe extern "C" fn __vdso_clock_gettime(clock: i32, ts: *mut Timespec) -> 
     if !known(clock) {
         return syscall2(SYS_CLOCK_GETTIME, clock as usize, ts as usize);
     }
-    let ns = now_ns();
+    let ns = clock_ns(clock);
     let value =
         Timespec { tv_sec: (ns / NSEC_PER_SEC) as i64, tv_nsec: (ns % NSEC_PER_SEC) as i64 };
     // SAFETY: the caller gives a pointer to a `timespec`. A bad pointer is a fault in the caller,
@@ -153,7 +168,7 @@ pub unsafe extern "C" fn __vdso_clock_getres(clock: i32, res: *mut Timespec) -> 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __vdso_gettimeofday(tv: *mut Timeval, tz: *mut [i32; 2]) -> i32 {
     if !tv.is_null() {
-        let ns = now_ns();
+        let ns = realtime_ns();
         let value = Timeval {
             tv_sec: (ns / NSEC_PER_SEC) as i64,
             tv_usec: (ns % NSEC_PER_SEC / 1000) as i64,
@@ -170,7 +185,7 @@ pub unsafe extern "C" fn __vdso_gettimeofday(tv: *mut Timeval, tz: *mut [i32; 2]
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __vdso_time(t: *mut i64) -> i64 {
-    let sec = (now_ns() / NSEC_PER_SEC) as i64;
+    let sec = (realtime_ns() / NSEC_PER_SEC) as i64;
     if !t.is_null() {
         // SAFETY: as in `__vdso_clock_gettime`.
         unsafe { t.write_volatile(sec) };

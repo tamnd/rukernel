@@ -19,6 +19,7 @@ pub mod arch;
 pub mod boot;
 pub mod console;
 pub mod cpu;
+pub mod date;
 #[cfg(target_os = "none")]
 pub mod irq;
 pub mod mm;

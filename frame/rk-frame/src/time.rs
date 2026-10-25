@@ -4,6 +4,7 @@
 //! value of Linux, but it starts at 0.
 
 use crate::arch::imp;
+use crate::sync::Once;
 use core::sync::atomic::Ordering;
 
 /// The timer interrupts each second.
@@ -25,6 +26,21 @@ pub fn nanos() -> u64 {
 /// the system calls and of the vDSO use it.
 pub fn clock_ns() -> u64 {
     imp::timer::clock_ns()
+}
+
+/// The nanoseconds of `CLOCK_REALTIME` at boot. The first call reads the real time clock. The
+/// time is 0, the epoch, if the machine has no real time clock or the clock is not valid.
+pub fn realtime_offset_ns() -> u64 {
+    static OFFSET: Once<u64> = Once::new();
+    *OFFSET.call_once(|| {
+        imp::rtc::read()
+            .map_or(0, |sec| sec.saturating_mul(1_000_000_000).saturating_sub(clock_ns()))
+    })
+}
+
+/// The nanoseconds of `CLOCK_REALTIME`: the clock since boot plus the time at boot.
+pub fn realtime_ns() -> u64 {
+    clock_ns().saturating_add(realtime_offset_ns())
 }
 
 /// The frequency of the timer hardware in Hz, as the boot code measured it. It is 0 if there is no
