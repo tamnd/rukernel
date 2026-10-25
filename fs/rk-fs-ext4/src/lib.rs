@@ -524,6 +524,17 @@ impl Fs {
         self.write(self.inode_at(ino)?, &raw.0)
     }
 
+    /// The size of the extra fields of a new inode, as `ext4_clamp_want_extra_isize`. A
+    /// change to an inode with less makes its extra fields larger.
+    pub(crate) fn want_extra_isize(&self) -> usize {
+        let sb = &self.sb;
+        let mut want = 32;
+        if sb.ro_compat & layout::ro_compat::EXTRA_ISIZE != 0 {
+            want = want.max(usize::from(sb.want_extra_isize)).max(usize::from(sb.min_extra_isize));
+        }
+        if 128 + want > usize::from(sb.inode_size) { 32 } else { want }
+    }
+
     /// The number of blocks.
     pub(crate) fn blocks_count(&self) -> u64 {
         self.blocks.load(Ordering::Relaxed)

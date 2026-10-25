@@ -208,6 +208,8 @@ pub struct Superblock {
     pub first_ino: u32,
     /// The number of blocks after the group descriptors that are kept for a larger file system.
     pub reserved_gdt_blocks: u16,
+    /// The size of the extra fields that each inode must have, `s_min_extra_isize`.
+    pub min_extra_isize: u16,
     /// The size of the extra fields of a new inode.
     pub want_extra_isize: u16,
     /// The UUID of the file system.
@@ -259,6 +261,7 @@ impl Superblock {
             name_max: 255,
             first_ino: if rev == 0 { 11 } else { u32_at(b, 0x54) },
             reserved_gdt_blocks: u16_at(b, 0xce),
+            min_extra_isize: u16_at(b, 0x15c),
             want_extra_isize: u16_at(b, 0x15e),
             uuid: b[0x68..0x78].try_into().map_err(|_| Errno::EINVAL)?,
             checksum_seed: u32_at(b, 0x270),

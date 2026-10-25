@@ -270,6 +270,33 @@ impl Tx<'_> {
         fs.write_xattr_block(block, &mut data)
     }
 
+    /// Makes the extra fields of the inode `ino` with `raw` larger, as
+    /// `ext4_expand_extra_isize_ea`. The attributes that then do not fit in the inode go to its
+    /// block. If the block has no room for them, the size `s_min_extra_isize` is tried. The
+    /// caller saves the inode. Gives `ENOSPC` and keeps `raw` if no size fits.
+    pub(crate) fn expand_extra_isize(&mut self, ino: u32, raw: &mut RawInode) -> Result<()> {
+        let fs = self.fs;
+        let attrs = fs.xattrs(raw)?;
+        let old = raw.extra_size();
+        for new in [fs.want_extra_isize(), usize::from(fs.sb.min_extra_isize)] {
+            if new <= old || !new.is_multiple_of(4) || 128 + new > raw.0.len() {
+                continue;
+            }
+            let mut next = raw.clone();
+            next.0[128 + old..128 + new].fill(0);
+            put16(&mut next.0, 0x80, new as u16);
+            match self.write_xattrs(ino, &mut next, &attrs) {
+                Ok(()) => {
+                    *raw = next;
+                    return Ok(());
+                }
+                Err(Errno::ENOSPC) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Errno::ENOSPC)
+    }
+
     /// Writes `attrs` as the extended attributes of the inode `ino` with `raw`. The caller saves
     /// the inode. Gives `ENOSPC` if the attributes do not fit in the inode and one block.
     pub(crate) fn write_xattrs(

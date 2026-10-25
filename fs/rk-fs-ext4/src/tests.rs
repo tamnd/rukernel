@@ -1104,3 +1104,37 @@ fn a_bad_orphan_ends_the_list_and_stays() {
         assert_eq!(again(&ram).root().unwrap().metadata().nlink, 4);
     }
 }
+
+#[test]
+fn a_change_makes_the_extra_fields_of_an_inode_larger() {
+    let mut img = image();
+    img[1024 + 0x64..1024 + 0x68].copy_from_slice(&layout::ro_compat::EXTRA_ISIZE.to_le_bytes());
+    img[1024 + 0x15e..1024 + 0x160].copy_from_slice(&32u16.to_le_bytes());
+    let ram = Ram(Arc::new(SpinLock::new(img)));
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let file = fs.root().unwrap().create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    let ino = file.metadata().ino as u32;
+    for name in [&b"user.a"[..], b"user.b", b"user.c"] {
+        file.set_xattr(name, b"12345678", 0).unwrap();
+    }
+    // The three attributes fit in the inode.
+    assert_eq!(fs.inode(ino).unwrap().raw().file_acl(), 0);
+    drop((file, fs));
+    ram.0.lock()[1024 + 0x15e..1024 + 0x160].copy_from_slice(&64u16.to_le_bytes());
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let file = fs.root().unwrap().lookup(b"x").unwrap();
+    let free = ram.free().0;
+    // A truncate saves the inode two times. The second save does not grow the fields again.
+    file.set_attr(&SetAttr { size: Some(0), ..SetAttr::default() }).unwrap();
+    drop((file, fs));
+    // The extra fields have 64 bytes, and one attribute moved to a block.
+    assert_eq!(ram.free().0, free - 1);
+    let fs = again(&ram);
+    let raw = fs.inode(ino).unwrap().raw();
+    assert_eq!(raw.extra_size(), 64);
+    assert_ne!(raw.file_acl(), 0);
+    let file = fs.root().unwrap().lookup(b"x").unwrap();
+    for name in [&b"user.a"[..], b"user.b", b"user.c"] {
+        assert_eq!(file.get_xattr(name).unwrap(), b"12345678");
+    }
+}
