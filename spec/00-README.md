@@ -47,6 +47,7 @@ These are decided and the rest of the spec builds on them. Reopening one needs a
 - **Personalities in user land first.** Windows through unmodified Wine and Proton, macOS through a Darwin user land. The kernel adds primitives only where measurement shows a win (document 16).
 - **Differential testing against real Linux is the oracle.** The test is not the man page or the standard. It is a real kernel in an identical VM. Where Linux's behaviour is the bug, we match it and record it (document 18).
 - **Stable Rust only.** No nightly features in the shipped kernel. The minimum toolchain moves with Rust's six weekly releases (document 03.9).
+- **Panics abort.** The kernel does not unwind, and a panic stops the machine. A file system or a driver gives an error for bad data and does not panic. Unwinding needs unstable features, so it waits for them (document 03.6, open question 3).
 - **Licences.** The kernel is GPL-2.0-only, the same as Linux. That makes reading Linux's source and porting its algorithms a question of engineering, not of law, and keeps open the option of code flowing in both directions. `rukernel-compat` and `rukernel-bench` are Apache-2.0, like the rucc harnesses. Personality user land components carry their upstream licences (LGPL for Wine, APSL and others for Darwin).
 
 ## The documents

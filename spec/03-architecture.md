@@ -100,7 +100,13 @@ Locks are types and their ordering is checked.
 
 **Allocation is fallible everywhere.** No `Box::new`, no `Vec::push` that aborts. `rk-lib` provides collections whose growth returns `Result`, and Clippy is configured to deny the infallible APIs. Linux returns `ENOMEM` from deep inside syscalls and programs handle it; a kernel that panics instead is not compatible.
 
-**Panics are bugs and are treated as oopses.** A panic in a system call context kills the task with `SIGKILL`, prints an oops in Linux's format to the console (so the tools that parse oopses, from syzbot to the harness in document 18, keep working), taints the kernel, and continues, exactly as Linux does on a `BUG()` in process context. A panic in interrupt context or with a spin lock held halts. `panic = "abort"` is not used for the kernel profile; unwinding is implemented for kernel stacks so that `Drop` runs and locks are released on the way out of an oops, which is something Linux cannot do and which makes an oops much less likely to cascade into a hang.
+**Panics are bugs, and a panic stops the machine.** The kernel builds with `panic = "abort"` and does not unwind. The panic handler prints the message and the location on the console and halts. Under QEMU it exits with a failure status, so a boot test that panics fails. This was open question 3 of document 24, and it was decided in R3:
+
+- The targets `x86_64-unknown-none`, `aarch64-unknown-none` and `riscv64gc-unknown-none-elf` use the `abort` panic strategy, and their `core` and `alloc` come compiled with it. Unwinding needs `-Zbuild-std` to compile them again, and a `no_std` crate also needs the `eh_personality` lang item. Both are unstable, and the kernel uses stable Rust only (document 00). So we cannot build unwinding for `rk-fs-*` and `rk-drv-*` on the pinned toolchain, and we cannot measure its text size and cost there.
+- The error rules make a panic rare. Each fallible function returns `Result`, Clippy warns on `unwrap`, `expect` and `panic!` outside the tests, and a file system checks each value that it reads from the disk and gives `EUCLEAN` or `EIO` for a bad value. The ext4 and XFS drivers do this, so a damaged image fails one request and does not stop the machine.
+- Each boot test run stops on a panic, so each passing run of the boot tests, fstests, LTP and gVisor had no panic.
+
+A panic in interrupt context or with a spin lock held must halt in each design, so the cost of abort is only on the panics in process context. We will open the question again if `build-std` and `eh_personality` become stable, with the measurement that document 24 asks for. Until then, a Rust panic does not print an oops in the format of document 20.
 
 ## 3.7 No Linux modules, but every module
 
