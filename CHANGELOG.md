@@ -10,6 +10,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `mount` gives the device number and the `MS_RDONLY` flag to a file system that needs a block device. It gives `ENOTBLK` if the source is not a block device.
 - The extended attribute calls. No file system keeps extended attributes yet, so a list is empty, a read or a removal gives `ENODATA`, and a change gives `EOPNOTSUPP`.
 - tools/debug/build.sh adds e2fsprogs. The `alpine` boot test makes an ext4 file system with `mkfs.ext4 -d` on a second disk, mounts it read only, and compares the tree with `diff -r`.
+- `rk-fs-ext4` writes ext4. It creates, writes, truncates, links, renames and removes files, directories, symbolic links and device files. It allocates blocks and inodes from the bitmaps, makes the bitmaps of the groups with `BLOCK_UNINIT` and `INODE_UNINIT`, builds the extent trees again, and writes the checksums of `metadata_csum` and `uninit_bg`. An inode without a link stays until its last user closes it. The driver does not write the journal yet, so a crash can leave errors that fsck must repair. A disk with a feature that the driver cannot change, with a journal to replay, or with blocks larger than 4 KiB mounts read only.
+- The `alpine` boot test mounts the ext4 disk read and write, changes files and directories, and then checks the disk with `e2fsck -fn`.
 
 ### Fixed
 

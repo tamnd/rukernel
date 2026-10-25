@@ -1,6 +1,6 @@
 [package]
 name = "rk-fs-ext4"
-description = "ext4 for rukernel: the file system of Linux on disks, mounted read only for now."
+description = "ext4 for rukernel: the file system of Linux on disks."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
