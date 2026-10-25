@@ -634,6 +634,7 @@ mod log {
         let root = fs.root().unwrap();
         root.create(b"dir", FileType::Directory, 0o755, 0).unwrap();
         root.symlink(b"ln", b"hello").unwrap();
+        root.sync().unwrap();
         let live = ram.0.lock().clone();
         assert_ne!(layout::u32_at(&live, 1024 + 0x60) & layout::incompat::RECOVER, 0);
         let free = ram.free();
@@ -666,6 +667,7 @@ mod log {
         for i in 0..6 {
             root.create(format!("d{i}").as_bytes(), FileType::Directory, 0o755, 0).unwrap();
         }
+        // The transaction is a quarter of the log, so it commits without a sync.
         assert_ne!(be32(&ram.0.lock(), 41 * BS + jsb::START), 0);
         drop((root, fs));
         let disk = ram.0.lock().clone();
@@ -673,5 +675,31 @@ mod log {
         assert_eq!(be32(&disk, 41 * BS + jsb::START), 0);
         let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
         assert_eq!(names(&*fs.root().unwrap()).len(), 4 + 6);
+    }
+
+    #[test]
+    fn an_open_file_without_links_is_an_orphan() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let free = ram.free();
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        let file = root.create(b"tmp", FileType::Regular, 0o600, 0).unwrap();
+        file.write_at(0, &vec![b't'; 2 * BS]).unwrap();
+        let ino = file.metadata().ino as u32;
+        root.unlink(b"tmp").unwrap();
+        root.sync().unwrap();
+        assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), ino);
+
+        // A crash now leaves the orphan, and the next mount frees it.
+        let crashed = Ram(Arc::new(SpinLock::new(ram.0.lock().clone())));
+        drop(Fs::open(7, alloc::boxed::Box::new(crashed.clone()), false).unwrap());
+        assert_eq!(crashed.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
+        assert_eq!(crashed.free(), free);
+
+        drop(file);
+        assert_eq!(fs.meta.lock().sb[layout::sb::LAST_ORPHAN], 0);
+        drop((root, fs));
+        assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
+        assert_eq!(ram.free(), free);
     }
 }

@@ -192,8 +192,12 @@ impl Fs {
 }
 
 impl Tx<'_> {
-    /// Writes the inode of `node` and keeps `raw` as its inode in memory.
+    /// Writes the inode of `node` and keeps `raw` as its inode in memory. An inode that loses
+    /// its last link goes on the list of orphans.
     pub(crate) fn save(&mut self, node: &Node, mut raw: RawInode) -> Result<()> {
+        if raw.links() == 0 && node.raw.lock().links() != 0 {
+            self.add_orphan(node.ino, &mut raw)?;
+        }
         self.fs.write_inode(node.ino, &mut raw)?;
         *node.raw.lock() = raw;
         Ok(())
@@ -355,6 +359,7 @@ impl Tx<'_> {
         if raw.links() != 0 {
             return Ok(());
         }
+        self.remove_orphan(ino, &raw)?;
         let kind = kind_of(&raw);
         let has_blocks =
             matches!(kind, FileType::Regular | FileType::Directory | FileType::Symlink)
@@ -384,6 +389,69 @@ impl Tx<'_> {
         raw.set_blocks(0);
         fs.write_inode(ino, &mut raw)?;
         self.free_inode(ino, kind == FileType::Directory)
+    }
+
+    /// Puts the inode `ino` first on the list of orphans, as `ext4_orphan_add`. The list is in
+    /// `s_last_orphan` and in the `i_dtime` of each orphan. After a crash, the mount or fsck frees
+    /// the orphans.
+    fn add_orphan(&mut self, ino: u32, raw: &mut RawInode) -> Result<()> {
+        let head = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
+        layout::put32(&mut raw.0, 0x14, head);
+        layout::put32(&mut self.meta.sb, layout::sb::LAST_ORPHAN, ino);
+        self.write_sb(0, 0)
+    }
+
+    /// Removes the inode `ino` with `raw` from the list of orphans, as `ext4_orphan_del`.
+    pub(crate) fn remove_orphan(&mut self, ino: u32, raw: &RawInode) -> Result<()> {
+        let fs = self.fs;
+        let next = u32_at(&raw.0, 0x14);
+        let mut at = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
+        if at == ino {
+            layout::put32(&mut self.meta.sb, layout::sb::LAST_ORPHAN, next);
+            return self.write_sb(0, 0);
+        }
+        // A list with a loop or a bad inode ends after one step for each inode.
+        for _ in 0..fs.sb.inodes_count {
+            if at == 0 || at > fs.sb.inodes_count {
+                break;
+            }
+            let node = fs.inodes.lock().get(&at).and_then(alloc::sync::Weak::upgrade);
+            let mut prev = match &node {
+                Some(node) => node.raw(),
+                None => fs.read_inode(at)?,
+            };
+            if u32_at(&prev.0, 0x14) == ino {
+                layout::put32(&mut prev.0, 0x14, next);
+                fs.write_inode(at, &mut prev)?;
+                if let Some(node) = node {
+                    *node.raw.lock() = prev;
+                }
+                return Ok(());
+            }
+            at = u32_at(&prev.0, 0x14);
+        }
+        Ok(())
+    }
+
+    /// Frees the orphans that a crash left, at mount, as `ext4_orphan_cleanup`. An orphan that
+    /// has links again leaves the list.
+    pub(crate) fn clean_orphans(&mut self) -> Result<()> {
+        let fs = self.fs;
+        for _ in 0..fs.sb.inodes_count {
+            let ino = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
+            if ino == 0 {
+                break;
+            }
+            let mut raw = fs.read_inode(ino)?;
+            if raw.links() == 0 {
+                self.release(ino)?;
+            } else {
+                self.remove_orphan(ino, &raw)?;
+                layout::put32(&mut raw.0, 0x14, 0);
+                fs.write_inode(ino, &mut raw)?;
+            }
+        }
+        Ok(())
     }
 
     /// Frees the block `block` of a block map, and the blocks under it for an indirect block of
@@ -535,6 +603,10 @@ impl Drop for Node {
 }
 
 impl Inode for Node {
+    fn sync(&self) -> Result<()> {
+        self.fs.sync()
+    }
+
     fn metadata(&self) -> Metadata {
         let raw = self.raw();
         let kind = kind_of(&raw);

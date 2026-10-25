@@ -77,7 +77,7 @@ impl Tx<'_> {
 
     /// Adds `delta` to the free blocks and `inodes` to the free inodes of the superblock, and
     /// writes the superblock with its checksum.
-    fn write_sb(&mut self, blocks: i64, inodes: i64) -> Result<()> {
+    pub(crate) fn write_sb(&mut self, blocks: i64, inodes: i64) -> Result<()> {
         let fs = self.fs;
         let b = &mut self.meta.sb;
         let bit64 = fs.sb.incompat & layout::incompat::BIT64 != 0;
@@ -189,9 +189,12 @@ impl Tx<'_> {
             let mut bitmap = self.block_bitmap(group)?;
             let size = self.fs.sb.blocks_in_group(group) as usize;
             let from = if i == 0 { ((goal - first) % bpg) as usize } else { 0 };
-            let Some(bit) = (from..size).find(|&b| !test_bit(&bitmap, b)) else { continue };
+            let base = first + u64::from(group) * bpg;
+            let free =
+                |bitmap: &[u8], b: usize| !test_bit(bitmap, b) && !self.fs.is_busy(base + b as u64);
+            let Some(bit) = (from..size).find(|&b| free(&bitmap, b)) else { continue };
             let mut got = 0;
-            while got < want as usize && bit + got < size && !test_bit(&bitmap, bit + got) {
+            while got < want as usize && bit + got < size && free(&bitmap, bit + got) {
                 set_bit(&mut bitmap, bit + got, true);
                 got += 1;
             }
@@ -200,7 +203,7 @@ impl Tx<'_> {
             self.desc_set(group, gd::FREE_BLOCKS, free);
             self.write_desc(group)?;
             self.write_sb(-(got as i64), 0)?;
-            return Ok((first + u64::from(group) * bpg + bit as u64, got as u32));
+            return Ok((base + bit as u64, got as u32));
         }
         Err(Errno::ENOSPC)
     }

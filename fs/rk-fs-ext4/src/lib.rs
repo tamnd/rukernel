@@ -7,8 +7,10 @@
 //!
 //! A read and write mount changes the bitmaps, the group descriptors, the inodes, the extent trees
 //! and the directories, and it writes the checksums of `metadata_csum` or `uninit_bg`. With a
-//! journal, the metadata blocks of each change go to the journal first, and then to their places,
-//! as `data=writeback` of Linux. The data of a regular file goes to its blocks at once. At mount
+//! journal, the metadata blocks of the changes go to the journal first, and then to their places,
+//! as `data=writeback` of Linux. A commit collects the changes of up to 5 seconds, and `fsync`
+//! commits at once. An inode without links that a process still uses is on the list of orphans,
+//! so a mount after a crash frees it. The data of a regular file goes to its blocks at once. At mount
 //! the driver replays a journal that Linux, e2fsprogs or a crash left with transactions, and at
 //! unmount it leaves the journal empty. A new entry in a directory with an htree index first
 //! changes the directory into a list. A file with a block map can change in its blocks, but it
@@ -29,7 +31,7 @@ mod node;
 #[cfg(test)]
 mod tests;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -38,6 +40,9 @@ use rk_abi::Errno;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_vfs::fstype::{FsType, MountArgs};
 use rk_vfs::{InodeRef, Result};
+
+/// The longest time that a change waits for its commit, as the `commit=5` default of Linux.
+const COMMIT_SECS: i64 = 5;
 
 pub use node::Node;
 
@@ -149,7 +154,7 @@ impl Drop for Tx<'_> {
             // The inode stays in use on an error, and fsck finds it.
             let _ = self.release(ino);
         }
-        self.fs.commit();
+        self.fs.commit(false);
     }
 }
 
@@ -175,9 +180,14 @@ pub struct Fs {
     orphans: SpinLock<Vec<u32>>,
     /// The journal, for a read and write mount of a file system with a journal.
     log: Option<SpinLock<journal::Log>>,
-    /// The metadata blocks that the running change wrote, which go to the journal when the
-    /// change ends.
+    /// The metadata blocks that the changes since the last commit wrote, which go to the
+    /// journal in the next commit.
     pending: SpinLock<BTreeMap<u64, Vec<u8>>>,
+    /// The blocks that the changes since the last commit freed. They are not used again before
+    /// the commit, because after a crash the old metadata still uses them.
+    busy: SpinLock<BTreeSet<u64>>,
+    /// The time of the last commit, in seconds.
+    committed: SpinLock<i64>,
     /// The inodes in memory, so that two lookups of one file give one inode.
     inodes: SpinLock<BTreeMap<u32, Weak<Node>>>,
     this: Weak<Fs>,
@@ -204,6 +214,10 @@ impl Fs {
         }
         if fs.log.is_some() {
             fs.mark_recover(true)?;
+        }
+        if fs.writable && layout::u32_at(&fs.meta.lock().sb, layout::sb::LAST_ORPHAN) != 0 {
+            // As Linux, the mount goes on if an orphan cannot be freed.
+            let _ = fs.tx()?.clean_orphans();
         }
         Ok(fs)
     }
@@ -252,6 +266,8 @@ impl Fs {
             orphans: SpinLock::new(Vec::new()),
             log: None,
             pending: SpinLock::new(BTreeMap::new()),
+            busy: SpinLock::new(BTreeSet::new()),
+            committed: SpinLock::new(rk_vfs::now().sec),
             inodes: SpinLock::new(BTreeMap::new()),
             this: Weak::new(),
         };
@@ -330,12 +346,22 @@ impl Fs {
         }
     }
 
-    /// Ends a change: the blocks that it wrote go to the journal and then to their places. If
-    /// the journal cannot take them, they go to their places at once.
-    fn commit(&self) {
+    /// Writes the blocks of the changes since the last commit to the journal, and then to their
+    /// places. As Linux, a commit collects the changes of up to `COMMIT_SECS` seconds, or until
+    /// the transaction is a quarter of the log. `force` commits at once. If the journal cannot
+    /// take the blocks, they go to their places at once.
+    fn commit(&self, force: bool) {
         let Some(log) = &self.log else { return };
-        let blocks = self.pending.lock().clone();
+        let now = rk_vfs::now().sec;
         let mut log = log.lock();
+        let blocks = {
+            let pending = self.pending.lock();
+            let due = now.saturating_sub(*self.committed.lock()) >= COMMIT_SECS;
+            if !force && !due && !log.full(pending.len()) {
+                return;
+            }
+            pending.clone()
+        };
         if log.commit(self, &blocks).is_err() {
             for (&block, data) in &blocks {
                 let _ = self.write_direct(block * self.sb.block_size, data);
@@ -343,6 +369,26 @@ impl Fs {
         }
         drop(log);
         self.pending.lock().clear();
+        self.busy.lock().clear();
+        *self.committed.lock() = now;
+    }
+
+    /// Makes all the changes durable, for `fsync` and `sync`.
+    pub(crate) fn sync(&self) -> Result<()> {
+        if !self.writable {
+            return Ok(());
+        }
+        // The lock waits for a running change, so the commit has only whole changes.
+        let meta = self.meta.lock();
+        self.commit(true);
+        drop(meta);
+        self.disk.write_back(0, u64::MAX)?;
+        self.disk.flush()
+    }
+
+    /// Tells if the block `block` was freed since the last commit.
+    pub(crate) fn is_busy(&self, block: u64) -> bool {
+        self.log.is_some() && self.busy.lock().contains(&block)
     }
 
     /// Notes that the blocks from `start` up to `start + count` are free, so their metadata
@@ -354,6 +400,7 @@ impl Fs {
                 pending.remove(&block);
             }
             drop(pending);
+            self.busy.lock().extend(start..start + count);
             log.lock().freed(start, count);
         }
     }
@@ -497,6 +544,7 @@ impl Fs {
     /// cleared.
     fn finish(&self) -> Result<()> {
         let Some(log) = &self.log else { return Ok(()) };
+        self.commit(true);
         log.lock().checkpoint(self)?;
         self.mark_recover(false)
     }

@@ -209,6 +209,12 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EINVAL)
     }
 
+    /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
+    /// changes in one journal can make all of them durable. The default does nothing.
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Finds the inode of `name` in this directory.
     fn lookup(&self, _name: &[u8]) -> Result<InodeRef> {
         Err(Errno::ENOTDIR)

@@ -86,6 +86,8 @@ pub mod sb {
     pub const FREE_BLOCKS_HI: usize = 0x158;
     /// The number of free inodes.
     pub const FREE_INODES: usize = 0x10;
+    /// The first inode of the list of orphans, as `s_last_orphan`.
+    pub const LAST_ORPHAN: usize = 0xe8;
     /// The checksum of the superblock.
     pub const CHECKSUM: usize = 0x3fc;
 }
