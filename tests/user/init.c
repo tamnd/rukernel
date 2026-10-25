@@ -32,10 +32,12 @@
 #include <sys/user.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <linux/fs.h>
+#include <linux/aio_abi.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -1245,6 +1247,47 @@ static void test_seccomp(void)
 	      syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &action) == -1 && errno == EOPNOTSUPP);
 }
 
+/* Checks the shared memory of System V. */
+static void test_shm(void)
+{
+	struct shmid_ds ds;
+	int id = shmget(IPC_PRIVATE, 8192, IPC_CREAT | 0600);
+	char *a = id >= 0 ? shmat(id, NULL, 0) : (char *)-1;
+	char *b = id >= 0 ? shmat(id, NULL, SHM_RDONLY) : (char *)-1;
+	pid_t pid;
+	int status = -1;
+
+	check("shmget and shmat", id >= 0 && a != (char *)-1 && b != (char *)-1 && a != b);
+	if (a == (char *)-1 || b == (char *)-1)
+		return;
+	strcpy(a + 4100, "shared");
+	check("two attaches of a segment share the pages", !strcmp(b + 4100, "shared"));
+	check("IPC_STAT gives the size and the attaches",
+	      shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_segsz == 8192 && ds.shm_nattch == 2 &&
+	      ds.shm_perm.mode == 0600);
+	pid = fork();
+	if (pid == 0) {
+		strcpy(a, "child");
+		_exit(0);
+	}
+	waitpid(pid, &status, 0);
+	check("a child writes to a segment of its parent", status == 0 && !strcmp(b, "child"));
+	errno = 0;
+	check("shmdt of an address in the middle gives EINVAL", shmdt(a + 4096) == -1 && errno == EINVAL);
+	check("shmdt", shmdt(b) == 0 && shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_nattch == 1);
+	check("IPC_RMID keeps an attached segment", shmctl(id, IPC_RMID, NULL) == 0 && !strcmp(a, "child"));
+	check("shmdt of the last attach", shmdt(a) == 0);
+	errno = 0;
+	check("a removed segment is gone", shmctl(id, IPC_STAT, &ds) == -1 && errno == EINVAL);
+	id = shmget(0x726b, 4096, IPC_CREAT | 0600);
+	errno = 0;
+	check("IPC_EXCL with a used key gives EEXIST",
+	      id >= 0 && shmget(0x726b, 4096, IPC_CREAT | IPC_EXCL) == -1 && errno == EEXIST);
+	check("shmget finds a key", shmget(0x726b, 0, 0) == id && shmctl(id, IPC_RMID, NULL) == 0);
+	errno = 0;
+	check("shmget of a missing key gives ENOENT", shmget(0x726b, 4096, 0) == -1 && errno == ENOENT);
+}
+
 static void test_memfd(void)
 {
 	char buf[64] = {0};
@@ -1696,6 +1739,67 @@ static unsigned char disk_byte(long k)
 #define DISK_NOTE_AT (512 * 9 + 100)
 #define DISK_NOTE "rukernel wrote this sector"
 
+/* Reads 8 blocks of 4 KiB with one io_submit, in a mixed order, and writes one block with
+ * IOCB_CMD_PWRITEV. The block layer merges the near reads. */
+static void test_aio(int fd)
+{
+	aio_context_t ctx = 0;
+	check("io_setup makes a context", syscall(SYS_io_setup, 16, &ctx) == 0 && ctx != 0);
+	aio_context_t again = ctx;
+	check("io_setup with a used context ID gives EINVAL",
+	      syscall(SYS_io_setup, 16, &again) == -1 && errno == EINVAL);
+	static unsigned char bufs[8][4096];
+	struct iocb cbs[8], *list[8];
+	static const int order[8] = { 3, 1, 2, 0, 7, 5, 6, 4 };
+	for (int i = 0; i < 8; i++) {
+		int b = order[i];
+		memset(&cbs[i], 0, sizeof(cbs[i]));
+		cbs[i].aio_data = b;
+		cbs[i].aio_lio_opcode = IOCB_CMD_PREAD;
+		cbs[i].aio_fildes = fd;
+		cbs[i].aio_buf = (unsigned long)bufs[b];
+		cbs[i].aio_nbytes = 4096;
+		cbs[i].aio_offset = 65536 + b * 4096;
+		list[i] = &cbs[i];
+	}
+	check("io_submit takes 8 reads", syscall(SYS_io_submit, ctx, 8, list) == 8);
+	struct io_event ev[8];
+	struct timespec ts = { 5, 0 };
+	int n = syscall(SYS_io_getevents, ctx, 8, 8, ev, &ts);
+	int ok = n == 8;
+	for (int i = 0; ok && i < 8; i++)
+		ok = ev[i].res == 4096 && ev[i].obj == (unsigned long)&cbs[i] && ev[i].data == (unsigned)order[i];
+	for (int b = 0; ok && b < 8; b++)
+		for (int k = 0; ok && k < 4096; k++)
+			ok = bufs[b][k] == disk_byte(65536 + b * 4096 + k);
+	check("io_getevents gives 8 events with the disk data", ok);
+	check("io_getevents with no event and a time out of 0 gives 0",
+	      syscall(SYS_io_getevents, ctx, 0, 8, ev, &(struct timespec){ 0, 0 }) == 0);
+
+	memset(bufs[0], 0x5a, 512);
+	memset(bufs[1], 0xa5, 512);
+	struct iovec iov[2] = { { bufs[0], 512 }, { bufs[1], 512 } };
+	struct iocb w = { .aio_lio_opcode = IOCB_CMD_PWRITEV, .aio_fildes = fd,
+			  .aio_buf = (unsigned long)iov, .aio_nbytes = 2, .aio_offset = 512 * 100 };
+	struct iocb s = { .aio_lio_opcode = IOCB_CMD_FSYNC, .aio_fildes = fd };
+	struct iocb *wl[2] = { &w, &s };
+	ok = syscall(SYS_io_submit, ctx, 2, wl) == 2 && syscall(SYS_io_getevents, ctx, 2, 2, ev, NULL) == 2 &&
+	     ev[0].res == 1024 && ev[1].res == 0;
+	check("io_submit of a pwritev and an fsync", ok);
+	unsigned char back[1024];
+	ok = pread(fd, back, 1024, 512 * 100) == 1024;
+	for (int k = 0; ok && k < 1024; k++)
+		ok = back[k] == (k < 512 ? 0x5a : 0xa5);
+	check("pread gives the data of the pwritev", ok);
+	struct iocb bad = { .aio_lio_opcode = 99, .aio_fildes = fd };
+	struct iocb *bl[1] = { &bad };
+	check("io_submit of an unknown command gives EINVAL",
+	      syscall(SYS_io_submit, ctx, 1, bl) == -1 && errno == EINVAL);
+	check("io_destroy", syscall(SYS_io_destroy, ctx) == 0);
+	check("io_submit after io_destroy gives EINVAL",
+	      syscall(SYS_io_submit, ctx, 1, list) == -1 && errno == EINVAL);
+}
+
 static void test_blk(void)
 {
 	int fd = open("/dev/vda", O_RDWR);
@@ -1734,6 +1838,7 @@ static void test_blk(void)
 	for (int i = 100 + (int)strlen(DISK_NOTE); ok && i < 1024; i++)
 		ok = buf[i] == disk_byte(512 * 9 + i);
 	check("pread after pwrite gives the new data and keeps the other bytes", ok);
+	test_aio(fd);
 	close(fd);
 }
 
@@ -1826,6 +1931,7 @@ int main(int argc, char **argv)
 	test_mount();
 	test_proc();
 	test_memfd();
+	test_shm();
 	test_unix();
 	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)

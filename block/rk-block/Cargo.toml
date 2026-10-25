@@ -1,0 +1,17 @@
+[package]
+name = "rk-block"
+description = "The block layer of rukernel: the request queue of each disk, merging and the mq-deadline scheduler."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+
+[lints]
+workspace = true

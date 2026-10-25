@@ -46,7 +46,7 @@ const DEV_ZERO: u64 = rk_vfs::device::makedev(1, 5);
 /// file share the copies. A write through a shared mapping marks the page dirty, and `msync`,
 /// `munmap` and the end of the address space write the dirty pages back. A `read` or `write` of
 /// the file does not see the copies. The page cache of R2 replaces this type.
-struct FilePages {
+pub(crate) struct FilePages {
     inode: InodeRef,
     /// The path of the file when it was first mapped.
     path: Vec<u8>,
@@ -126,7 +126,7 @@ static MAPPED: SpinLock<BTreeMap<usize, Arc<FilePages>>> = SpinLock::new(BTreeMa
 
 /// Gives the pages of `inode`, which has the path `path`. An entry stays while a mapping holds
 /// it.
-fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
+pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
     let key = Arc::as_ptr(inode).cast::<()>() as usize;
     let mut map = MAPPED.lock();
     map.retain(|_, pages| Arc::strong_count(pages) > 1);

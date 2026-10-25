@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "frame/rk-frame",
     "core/rk-abi",
+    "block/rk-block",
     "core/rk-lib",
     "core/rk-mm",
     "core/rk-sched",
@@ -42,6 +43,7 @@ rk-mm = { path = "core/rk-mm", version = "0.3.1" }
 rk-sched = { path = "core/rk-sched", version = "0.3.1" }
 rk-proc = { path = "core/rk-proc", version = "0.3.1" }
 rk-syscall = { path = "core/rk-syscall", version = "0.3.1" }
+rk-block = { path = "block/rk-block", version = "0.3.1" }
 rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.3.1" }
 rk-drv-virtio = { path = "drv/rk-drv-virtio", version = "0.3.1" }
 rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.3.1" }
