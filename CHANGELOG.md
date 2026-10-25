@@ -9,6 +9,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `fstests` boot test runs fstests on ext4. tools/fstests/build.sh builds fstests and a Debian root file system for it in a container, and tools/fstests/tests.txt gives the tests that the boot test runs. The test makes ext4 on a test disk and gives a second disk as the scratch disk. The boot test runs only when target/fstests or `RK_FSTESTS` has the root file system.
 - `/proc/PID/mountinfo`, with the fields of Linux. fstests and `findmnt` read it.
 - `statfs` and `fstatfs` give the block and inode counts of an ext4 file system, and the mount flags of the path as the `ST_*` flags. The `Inode` trait gets `fs_stat` for the counts.
+- The new mount API: `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount` and `open_tree`. A file system context is a file that keeps the options of `fsconfig`. `fsmount` and `open_tree` with `OPEN_TREE_CLONE` give a mount that is not attached, and `move_mount` attaches it. `move_mount` also moves an attached mount, and puts a mount below another mount with `MOVE_MOUNT_BENEATH`. `mount` with `MS_MOVE` moves a mount. The 14 LTP tests of these calls pass.
+- The `ltp` boot test gives the tests a disk in `LTP_DEV`, for the tests that need a device.
+- rk-abigen generates the flags of the new mount API, and the values of an `enum` of the uAPI, as `FSCONFIG_SET_FLAG`.
 - A fault of the kernel prints a call trace: the addresses in the kernel code that are on the stack, as the `?` entries of Linux.
 - `RK_BOOT_LOG` tells `cargo xtask boot-test` to print the full log of a test that passes.
 - The kernel reads the real time clock of the CMOS memory at boot on x86-64, as `mc146818_get_time` of Linux. `CLOCK_REALTIME`, `CLOCK_REALTIME_COARSE`, `CLOCK_TAI`, `gettimeofday`, `time`, the vDSO and the file times count from that time. Before this change, the real time started at 1970 at boot.

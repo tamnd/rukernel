@@ -21,7 +21,8 @@ prctl seccomp sched_setaffinity sched_getaffinity sched_getparam sched_setparam 
 sched_setscheduler sched_get_priority_max sched_get_priority_min sched_rr_get_interval
 sched_setattr sched_getattr getcpu rt_sigsuspend sigsuspend rt_sigtimedwait sigpending
 rt_sigqueueinfo tgkill sigwaitinfo sigtimedwait sigwait pause alarm timer_create timer_settime
-timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority nice"
+timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority nice fsopen fsconfig
+fsmount fspick move_mount open_tree"
 
 out=${1:?usage: tools/ltp/build.sh OUT_DIR}
 mkdir -p "$out"

@@ -1485,6 +1485,86 @@ static void test_symlink_chain(void)
 	unlink("/tmp/chain");
 }
 
+/* The calls and the flags of the new mount API, from <linux/mount.h>. */
+#ifndef SYS_fsopen
+#define SYS_open_tree 428
+#define SYS_move_mount 429
+#define SYS_fsopen 430
+#define SYS_fsconfig 431
+#define SYS_fsmount 432
+#define SYS_fspick 433
+#endif
+#define RK_FSCONFIG_SET_FLAG 0
+#define RK_FSCONFIG_SET_STRING 1
+#define RK_FSCONFIG_CMD_CREATE 6
+#define RK_FSCONFIG_CMD_RECONFIGURE 7
+#define RK_MOUNT_ATTR_NODEV 4
+#define RK_MOVE_MOUNT_F_EMPTY_PATH 4
+#define RK_OPEN_TREE_CLONE 1
+
+static void test_mount_api(void)
+{
+	int fd, mfd, tfd, pfd, f;
+
+	mkdir("/mnt", 0755);
+	mkdir("/mnt2", 0755);
+	errno = 0;
+	check("fsopen of an unknown type gives ENODEV", syscall(SYS_fsopen, "nofs", 0) == -1 && errno == ENODEV);
+	fd = syscall(SYS_fsopen, "tmpfs", 1);
+	check("fsopen", fd >= 0);
+	check("fsconfig FSCONFIG_SET_STRING", syscall(SYS_fsconfig, fd, RK_FSCONFIG_SET_STRING, "mode", "755", 0) == 0);
+	errno = 0;
+	check("fsconfig FSCONFIG_SET_FLAG with a value gives EINVAL",
+	      syscall(SYS_fsconfig, fd, RK_FSCONFIG_SET_FLAG, "ro", "x", 0) == -1 && errno == EINVAL);
+	errno = 0;
+	check("fsconfig with an unknown command gives EOPNOTSUPP",
+	      syscall(SYS_fsconfig, fd, 99, NULL, NULL, 0) == -1 && errno == EOPNOTSUPP);
+	errno = 0;
+	check("fsmount before FSCONFIG_CMD_CREATE gives EINVAL", syscall(SYS_fsmount, fd, 0, 0) == -1 && errno == EINVAL);
+	check("fsconfig FSCONFIG_CMD_CREATE", syscall(SYS_fsconfig, fd, RK_FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0);
+	errno = 0;
+	check("a second FSCONFIG_CMD_CREATE gives EBUSY",
+	      syscall(SYS_fsconfig, fd, RK_FSCONFIG_CMD_CREATE, NULL, NULL, 0) == -1 && errno == EBUSY);
+	mfd = syscall(SYS_fsmount, fd, 1, RK_MOUNT_ATTR_NODEV);
+	check("fsmount", mfd >= 0);
+	f = openat(mfd, "f", O_CREAT | O_RDWR, 0644);
+	check("a file in a mount that is not attached", f >= 0);
+	close(f);
+	check("move_mount attaches the mount of fsmount",
+	      syscall(SYS_move_mount, mfd, "", AT_FDCWD, "/mnt", RK_MOVE_MOUNT_F_EMPTY_PATH) == 0 &&
+		      access("/mnt/f", F_OK) == 0);
+	check("move_mount moves an attached mount",
+	      syscall(SYS_move_mount, AT_FDCWD, "/mnt", AT_FDCWD, "/mnt2", 0) == 0 && access("/mnt/f", F_OK) == -1 &&
+		      access("/mnt2/f", F_OK) == 0);
+	check("mount with MS_MOVE", mount("/mnt2", "/mnt", NULL, MS_MOVE, NULL) == 0 && access("/mnt/f", F_OK) == 0 &&
+					    access("/mnt2/f", F_OK) == -1);
+	mkdir("/mnt/d", 0755);
+	errno = 0;
+	check("move_mount into the same mount gives ELOOP",
+	      syscall(SYS_move_mount, AT_FDCWD, "/mnt", AT_FDCWD, "/mnt/d", 0) == -1 && errno == ELOOP);
+	tfd = syscall(SYS_open_tree, AT_FDCWD, "/mnt", RK_OPEN_TREE_CLONE | O_CLOEXEC);
+	check("open_tree with OPEN_TREE_CLONE", tfd >= 0);
+	check("move_mount attaches the clone of open_tree",
+	      syscall(SYS_move_mount, tfd, "", AT_FDCWD, "/mnt2", RK_MOVE_MOUNT_F_EMPTY_PATH) == 0 &&
+		      access("/mnt2/f", F_OK) == 0);
+	errno = 0;
+	check("fspick of a directory that is not a mount gives EINVAL",
+	      syscall(SYS_fspick, AT_FDCWD, "/mnt/d", 0) == -1 && errno == EINVAL);
+	pfd = syscall(SYS_fspick, AT_FDCWD, "/mnt", 1);
+	check("fspick", pfd >= 0);
+	check("fsconfig FSCONFIG_CMD_RECONFIGURE of fspick",
+	      syscall(SYS_fsconfig, pfd, RK_FSCONFIG_SET_FLAG, "ro", NULL, 0) == 0 &&
+		      syscall(SYS_fsconfig, pfd, RK_FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) == 0);
+	check("umount the clone", umount("/mnt2") == 0);
+	check("umount the mount of fsmount", umount("/mnt") == 0 && access("/mnt/f", F_OK) == -1);
+	close(pfd);
+	close(tfd);
+	close(mfd);
+	close(fd);
+	rmdir("/mnt");
+	rmdir("/mnt2");
+}
+
 /* Reads the file `path` into `buf` and gives the byte count, or -1. */
 static ssize_t read_file(const char *path, char *buf, size_t len)
 {
@@ -2003,6 +2083,7 @@ int main(int argc, char **argv)
 	test_seccomp();
 	test_ptrace();
 	test_mount();
+	test_mount_api();
 	test_symlink_chain();
 	test_proc();
 	test_memfd();

@@ -299,3 +299,17 @@ waitpid10
 waitpid11
 waitpid12
 waitpid13
+fsopen01
+fsopen02
+fsconfig01
+fsconfig02
+fsconfig03
+fsmount01
+fsmount02
+fspick01
+fspick02
+move_mount01
+move_mount02
+move_mount03
+open_tree01
+open_tree02

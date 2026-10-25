@@ -1,30 +1,104 @@
 // rk-abigen generated this file from Linux 7.3, from <linux/mount.h>.
 // Do not edit it. Change rk-abigen and run it again.
 
-//! The flags of `mount` and `umount2`.
+//! The flags of `mount` and `umount2`, and of the calls of the new mount API.
 
+/// Set parameter, supplying no value.
+pub const FSCONFIG_SET_FLAG: u32 = 0;
+/// - Update atime relative to mtime/ctime.
+pub const MOUNT_ATTR_RELATIME: u32 = 0;
+/// Set parameter, supplying a string value.
+pub const FSCONFIG_SET_STRING: u32 = 1;
+/// `FSMOUNT_CLOEXEC` from `<linux/mount.h>`.
+pub const FSMOUNT_CLOEXEC: u32 = 1;
+/// `FSOPEN_CLOEXEC` from `<linux/mount.h>`.
+pub const FSOPEN_CLOEXEC: u32 = 1;
+/// `FSPICK_CLOEXEC` from `<linux/mount.h>`.
+pub const FSPICK_CLOEXEC: u32 = 1;
+/// Mount read-only.
+pub const MOUNT_ATTR_RDONLY: u32 = 1;
+/// Follow symlinks on from path.
+pub const MOVE_MOUNT_F_SYMLINKS: u32 = 1;
 /// Mount read-only.
 pub const MS_RDONLY: u32 = 1;
+/// Clone the target tree and attach the clone.
+pub const OPEN_TREE_CLONE: u32 = 1;
+/// Set parameter, supplying a binary blob value.
+pub const FSCONFIG_SET_BINARY: u32 = 2;
+/// Create the mount in a new mount namespace.
+pub const FSMOUNT_NAMESPACE: u32 = 2;
+/// `FSPICK_SYMLINK_NOFOLLOW` from `<linux/mount.h>`.
+pub const FSPICK_SYMLINK_NOFOLLOW: u32 = 2;
+/// Ignore suid and sgid bits.
+pub const MOUNT_ATTR_NOSUID: u32 = 2;
+/// Follow automounts on from path.
+pub const MOVE_MOUNT_F_AUTOMOUNTS: u32 = 2;
 /// Ignore suid and sgid bits.
 pub const MS_NOSUID: u32 = 2;
+/// Clone the target tree into a new mount namespace.
+pub const OPEN_TREE_NAMESPACE: u32 = 2;
+/// Set parameter, supplying an object by path.
+pub const FSCONFIG_SET_PATH: u32 = 3;
+/// Set parameter, supplying an object by (empty) path.
+pub const FSCONFIG_SET_PATH_EMPTY: u32 = 4;
+/// `FSPICK_NO_AUTOMOUNT` from `<linux/mount.h>`.
+pub const FSPICK_NO_AUTOMOUNT: u32 = 4;
+/// Disallow access to device special files.
+pub const MOUNT_ATTR_NODEV: u32 = 4;
+/// Empty from path permitted.
+pub const MOVE_MOUNT_F_EMPTY_PATH: u32 = 4;
 /// Disallow access to device special files.
 pub const MS_NODEV: u32 = 4;
+/// Set parameter, supplying an object by fd.
+pub const FSCONFIG_SET_FD: u32 = 5;
+/// Create new or reuse existing superblock.
+pub const FSCONFIG_CMD_CREATE: u32 = 6;
+/// Invoke superblock reconfiguration.
+pub const FSCONFIG_CMD_RECONFIGURE: u32 = 7;
+/// Create new superblock, fail if reusing existing superblock.
+pub const FSCONFIG_CMD_CREATE_EXCL: u32 = 8;
+/// `FSPICK_EMPTY_PATH` from `<linux/mount.h>`.
+pub const FSPICK_EMPTY_PATH: u32 = 8;
+/// Disallow program execution.
+pub const MOUNT_ATTR_NOEXEC: u32 = 8;
 /// Disallow program execution.
 pub const MS_NOEXEC: u32 = 8;
+/// - Do not update access times.
+pub const MOUNT_ATTR_NOATIME: u32 = 16;
+/// Follow symlinks on to path.
+pub const MOVE_MOUNT_T_SYMLINKS: u32 = 16;
 /// Writes are synced at once.
 pub const MS_SYNCHRONOUS: u32 = 16;
 /// Sizeof first published struct.
 pub const MNT_ID_REQ_SIZE_VER0: u32 = 24;
 /// Sizeof second published struct.
 pub const MNT_ID_REQ_SIZE_VER1: u32 = 32;
+/// Sizeof first published struct.
+pub const MOUNT_ATTR_SIZE_VER0: u32 = 32;
+/// - Always perform atime updates.
+pub const MOUNT_ATTR_STRICTATIME: u32 = 32;
+/// Follow automounts on to path.
+pub const MOVE_MOUNT_T_AUTOMOUNTS: u32 = 32;
 /// Alter flags of a mounted FS.
 pub const MS_REMOUNT: u32 = 32;
+/// Empty to path permitted.
+pub const MOVE_MOUNT_T_EMPTY_PATH: u32 = 64;
 /// Allow mandatory locks on an FS.
 pub const MS_MANDLOCK: u32 = 64;
+/// Setting on how atime should be updated.
+pub const MOUNT_ATTR__ATIME: u32 = 112;
+/// Do not update directory access times.
+pub const MOUNT_ATTR_NODIRATIME: u32 = 128;
 /// Directory modifications are synchronous.
 pub const MS_DIRSYNC: u32 = 128;
+/// Set sharing group instead.
+pub const MOVE_MOUNT_SET_GROUP: u32 = 0x100;
 /// Do not follow symlinks.
 pub const MS_NOSYMFOLLOW: u32 = 0x100;
+/// Mount beneath top mount.
+pub const MOVE_MOUNT_BENEATH: u32 = 0x200;
+/// `MOVE_MOUNT__MASK` from `<linux/mount.h>`.
+pub const MOVE_MOUNT__MASK: u32 = 0x377;
 /// Do not update access times.
 pub const MS_NOATIME: u32 = 0x400;
 /// Do not update directory access times.
@@ -47,8 +121,12 @@ pub const MS_UNBINDABLE: u32 = 0x2_0000;
 pub const MS_PRIVATE: u32 = 0x4_0000;
 /// Change to slave.
 pub const MS_SLAVE: u32 = 0x8_0000;
+/// Idmap mount to @userns\_fd in struct mount\_attr.
+pub const MOUNT_ATTR_IDMAP: u32 = 0x10_0000;
 /// Change to shared.
 pub const MS_SHARED: u32 = 0x10_0000;
+/// Do not follow symlinks.
+pub const MOUNT_ATTR_NOSYMFOLLOW: u32 = 0x20_0000;
 /// Update atime relative to mtime/ctime.
 pub const MS_RELATIME: u32 = 0x20_0000;
 /// This is a kern\_mount call.
