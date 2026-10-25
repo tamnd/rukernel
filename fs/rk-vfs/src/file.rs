@@ -7,7 +7,7 @@
 
 use crate::dentry::Location;
 use crate::inode::{
-    FileType, InodeRef, Metadata, Result, SetAttr, check_immutable, check_set_attr,
+    FileType, InodeRef, Metadata, Result, SetAttr, check_immutable, check_set_attr, mode,
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -560,11 +560,28 @@ impl File {
         self.ops.read(self, buf)
     }
 
+    /// Clears the set-user-ID and set-group-ID bits of a regular file before a write, as
+    /// `file_remove_privs` of Linux. A process with `CAP_FSETID` keeps them.
+    fn remove_privs(&self) -> Result<()> {
+        let Some(inode) = &self.inode else {
+            return Ok(());
+        };
+        let meta = inode.metadata();
+        if meta.mode & (mode::S_ISUID | mode::S_ISGID) == 0 {
+            return Ok(());
+        }
+        match crate::cred::current().write_kill(&meta) {
+            Some(perm) => inode.set_attr(&SetAttr { mode: Some(perm), ..SetAttr::default() }),
+            None => Ok(()),
+        }
+    }
+
     /// `write`.
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
         if !self.flags().writable() {
             return Err(Errno::EBADF);
         }
+        self.remove_privs()?;
         self.ops.write(self, buf)
     }
 
@@ -581,6 +598,7 @@ impl File {
         if !self.flags().writable() {
             return Err(Errno::EBADF);
         }
+        self.remove_privs()?;
         self.ops.write_at(self, offset, buf)
     }
 
@@ -711,7 +729,8 @@ impl File {
         if !self.flags().writable() || inode.metadata().file_type() != Some(FileType::Regular) {
             return Err(Errno::EINVAL);
         }
-        let attr = SetAttr { size: Some(size), ..SetAttr::default() };
+        let mode = crate::cred::current().write_kill(&inode.metadata());
+        let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
         check_set_attr(&**inode, &attr)?;
         inode.set_attr(&attr)
     }
@@ -728,7 +747,10 @@ impl File {
             crate::inode::check_fixed(&**inode)?;
         }
         match inode.metadata().file_type() {
-            Some(FileType::Regular) => inode.fallocate(mode, offset, len),
+            Some(FileType::Regular) => {
+                self.remove_privs()?;
+                inode.fallocate(mode, offset, len)
+            }
             Some(FileType::Fifo) => Err(Errno::ESPIPE),
             Some(FileType::Directory) => Err(Errno::EISDIR),
             _ => Err(Errno::ENODEV),

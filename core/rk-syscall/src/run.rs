@@ -287,10 +287,11 @@ fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
     }
 }
 
-/// Connects the system calls to the other parts of the kernel: the clock of the VFS time stamps
-/// and the signals of the console. The boot code calls this one time, before `spawn_init`.
+/// Connects the system calls to the other parts of the kernel: the clock of the VFS time stamps,
+/// the credentials of the VFS checks and the signals of the console. The boot code calls this one time, before `spawn_init`.
 pub fn init() {
     rk_vfs::inode::set_clock(crate::info::realtime);
+    rk_vfs::cred::set_current(|| rk_proc::current_thread().map(|t| t.process().cred()));
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });

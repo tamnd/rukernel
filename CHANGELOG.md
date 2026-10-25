@@ -20,6 +20,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - In a sticky directory, only the owner of a file, the owner of the directory or a process with `CAP_FOWNER` can remove or rename the file.
 - A new file gets the file system user ID of the process as its owner. Its group is the group of the process, or the group of the directory if the directory is set-group-ID. A new directory in a set-group-ID directory is set-group-ID too.
 - `mknod` of a character or block device needs `CAP_MKNOD`. `O_NOATIME` needs the owner of the file or `CAP_FOWNER`.
+- `chmod`, `chown` and `utimensat` check the owner rules of Linux. Only the owner or a process with `CAP_FOWNER` can change the mode or set a time that is not now. Only a process with `CAP_CHOWN` can give a file to another user, and the owner can only give it to a group that it is in. To set both times to now, the process must be the owner or be able to write the file.
+- `chmod` clears the set-group-ID bit if the process is not in the group of the file and has no `CAP_FSETID`. `chown` of a file that is not a directory clears the set-user-ID bit, and the set-group-ID bit if the group can run the file.
+- A write, a truncate or an `fallocate` of a regular file by a process without `CAP_FSETID` clears the set-user-ID bit, and the set-group-ID bit if the group can run the file.
+- The `trusted.` extended attributes need `CAP_SYS_ADMIN`, and `listxattr` hides them from other processes. A `user.` attribute needs the read or the write permission on the file, and in a sticky directory only the owner can change one.
 
 ### Fixed
 

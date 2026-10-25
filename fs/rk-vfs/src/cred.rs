@@ -6,9 +6,36 @@
 //! changes them in all the threads of a process. rukernel keeps them for each process, which gives
 //! the same result for a program that uses the C library.
 
-use crate::inode::{FileType, Metadata, Result, mode};
+use crate::inode::{FileType, Metadata, Result, SetAttr, mode};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_frame::sync::Once;
+
+static CURRENT: Once<fn() -> Option<Arc<Cred>>> = Once::new();
+
+/// Gives the VFS the credentials of the process that runs now, for the checks of a write that
+/// has no other way to know them. Only the first call has an effect.
+pub fn set_current(f: fn() -> Option<Arc<Cred>>) {
+    CURRENT.call_once(|| f);
+}
+
+/// The credentials of the process that runs now. Before [`set_current`], and in the kernel
+/// itself, they are those of root.
+pub fn current() -> Arc<Cred> {
+    CURRENT.get().and_then(|f| f()).unwrap_or_else(|| Arc::new(Cred::root()))
+}
+
+/// The bits that a write or a change of the owner clears from the mode of a file, as
+/// `setattr_should_drop_suidgid` of Linux: the set-user-ID bit, and the set-group-ID bit if the
+/// group can run the file.
+fn kill_bits(perm: u32) -> u32 {
+    let mut kill = perm & mode::S_ISUID;
+    if perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010 {
+        kill |= mode::S_ISGID;
+    }
+    kill
+}
 
 /// An ID that a `set*id` call does not change.
 pub const KEEP: u32 = u32::MAX;
@@ -269,6 +296,105 @@ impl Cred {
             perm &= !mode::S_ISGID;
         }
         (self.fsuid, if sgid_dir { dir.gid } else { self.fsgid }, perm)
+    }
+
+    /// Checks a change of the attributes `attr` of a file with the attributes `meta`, as
+    /// `setattr_prepare` of Linux. Only the owner or a process with `CAP_FOWNER` can change the
+    /// mode or set a time that is not now. Only a process with `CAP_CHOWN` can give the file to
+    /// another user, and the owner can only give it to a group that it is in. A new mode loses
+    /// the set-group-ID bit if the process is not in the group of the file and has no
+    /// `CAP_FSETID`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EPERM` if the process cannot make the change.
+    pub fn setattr_prepare(&self, meta: &Metadata, attr: &mut SetAttr) -> Result<()> {
+        let chown = self.capable(cap::CHOWN);
+        if let Some(uid) = attr.uid
+            && !(self.fsuid == meta.uid && uid == meta.uid)
+            && !chown
+        {
+            return Err(Errno::EPERM);
+        }
+        if let Some(gid) = attr.gid
+            && !(self.fsuid == meta.uid && (gid == meta.gid || self.in_group(gid)))
+            && !chown
+        {
+            return Err(Errno::EPERM);
+        }
+        if let Some(perm) = attr.mode {
+            if !self.owns(meta) {
+                return Err(Errno::EPERM);
+            }
+            if !self.in_group(attr.gid.unwrap_or(meta.gid)) && !self.capable(cap::FSETID) {
+                attr.mode = Some(perm & !mode::S_ISGID);
+            }
+        }
+        if attr.explicit_times && !self.owns(meta) {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    /// Adds to `attr` the change of the mode of a `chown` of a file with the attributes `meta`,
+    /// as `chown_common` of Linux. A file that is not a directory loses the set-user-ID bit, and
+    /// the set-group-ID bit if the group can run it or the process may not keep it. Root loses
+    /// them too.
+    pub fn chown_kill(&self, meta: &Metadata, attr: &mut SetAttr) {
+        if meta.is_dir() {
+            return;
+        }
+        let perm = meta.mode & 0o7777;
+        let mut kill = kill_bits(perm);
+        if perm & mode::S_ISGID != 0 && !self.in_group(meta.gid) && !self.capable(cap::FSETID) {
+            kill |= mode::S_ISGID;
+        }
+        if kill != 0 {
+            attr.mode = Some(perm & !kill);
+        }
+    }
+
+    /// The new mode of a regular file with the attributes `meta` after a write or a truncate by
+    /// this process, as `file_remove_privs` of Linux, or `None` if the mode does not change. A
+    /// process with `CAP_FSETID` keeps the bits.
+    pub fn write_kill(&self, meta: &Metadata) -> Option<u32> {
+        let perm = meta.mode & 0o7777;
+        let kill = kill_bits(perm);
+        (kill != 0 && meta.file_type() == Some(FileType::Regular) && !self.capable(cap::FSETID))
+            .then_some(perm & !kill)
+    }
+
+    /// Checks the access to the extended attribute `name` of a file with the attributes `meta`,
+    /// as `xattr_permission` of Linux. A `trusted.` attribute needs `CAP_SYS_ADMIN`. A `user.`
+    /// attribute needs the read or the write permission on the file, and only a regular file, a
+    /// directory and a socket have them. In a sticky directory, only the owner can change one.
+    /// The VFS does not check the `security.` and `system.` attributes.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EPERM` for a change and `ENODATA` for a read that the rules refuse, or `EACCES`.
+    pub fn xattr_permission(&self, meta: &Metadata, name: &[u8], write: bool) -> Result<()> {
+        let refused = if write { Errno::EPERM } else { Errno::ENODATA };
+        if name.starts_with(b"security.") || name.starts_with(b"system.") {
+            return Ok(());
+        }
+        if name.starts_with(b"trusted.") {
+            return if self.capable(cap::SYS_ADMIN) { Ok(()) } else { Err(refused) };
+        }
+        if name.starts_with(b"user.") {
+            let kind = meta.file_type();
+            if !matches!(kind, Some(FileType::Regular | FileType::Directory | FileType::Socket)) {
+                return Err(refused);
+            }
+            if kind == Some(FileType::Directory)
+                && meta.mode & mode::S_ISVTX != 0
+                && write
+                && !self.owns(meta)
+            {
+                return Err(Errno::EPERM);
+            }
+        }
+        self.permission(meta, if write { may::WRITE } else { may::READ })
     }
 
     /// The credentials of `access` and `faccessat` without `AT_EACCESS`: the real IDs take the
@@ -839,6 +965,64 @@ mod tests {
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o644), (1000, 1000, 0o644));
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2744), (1000, 1000, 0o2744));
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2775), (1000, 1000, 0o775));
+    }
+
+    #[test]
+    fn only_the_owner_changes_the_mode_and_root_gives_files_away() {
+        let u = user(1000);
+        let mine = meta(mode::S_IFREG, 0o2755, 1000, 50);
+        let mut attr = SetAttr { mode: Some(0o2755), ..SetAttr::default() };
+        assert_eq!(u.setattr_prepare(&mine, &mut attr), Ok(()));
+        assert_eq!(attr.mode, Some(0o755));
+        let mut attr = SetAttr { mode: Some(0o644), ..SetAttr::default() };
+        assert_eq!(
+            u.setattr_prepare(&meta(mode::S_IFREG, 0o644, 0, 0), &mut attr),
+            Err(Errno::EPERM)
+        );
+        let mut attr = SetAttr { uid: Some(2000), ..SetAttr::default() };
+        assert_eq!(u.setattr_prepare(&mine, &mut attr), Err(Errno::EPERM));
+        let mut attr = SetAttr { uid: Some(1000), gid: Some(1000), ..SetAttr::default() };
+        assert_eq!(u.setattr_prepare(&mine, &mut attr), Ok(()));
+        let mut attr = SetAttr { gid: Some(7), ..SetAttr::default() };
+        assert_eq!(u.setattr_prepare(&mine, &mut attr), Err(Errno::EPERM));
+        let mut attr = SetAttr { uid: Some(2000), gid: Some(7), ..SetAttr::default() };
+        assert_eq!(Cred::root().setattr_prepare(&mine, &mut attr), Ok(()));
+        let mut attr = SetAttr { explicit_times: true, ..SetAttr::default() };
+        assert_eq!(
+            u.setattr_prepare(&meta(mode::S_IFREG, 0o666, 0, 0), &mut attr),
+            Err(Errno::EPERM)
+        );
+    }
+
+    #[test]
+    fn a_write_and_a_chown_clear_the_set_id_bits() {
+        let u = user(1000);
+        let file = meta(mode::S_IFREG, 0o6755, 1000, 1000);
+        assert_eq!(u.write_kill(&file), Some(0o755));
+        assert_eq!(Cred::root().write_kill(&file), None);
+        assert_eq!(u.write_kill(&meta(mode::S_IFREG, 0o2745, 1000, 1000)), None);
+        let mut attr = SetAttr::default();
+        Cred::root().chown_kill(&file, &mut attr);
+        assert_eq!(attr.mode, Some(0o755));
+        let mut attr = SetAttr::default();
+        Cred::root().chown_kill(&meta(mode::S_IFDIR, 0o6755, 0, 0), &mut attr);
+        assert_eq!(attr.mode, None);
+    }
+
+    #[test]
+    fn the_namespaces_of_the_extended_attributes() {
+        let u = user(1000);
+        let file = meta(mode::S_IFREG, 0o644, 0, 0);
+        assert_eq!(u.xattr_permission(&file, b"trusted.a", false), Err(Errno::ENODATA));
+        assert_eq!(u.xattr_permission(&file, b"trusted.a", true), Err(Errno::EPERM));
+        assert_eq!(Cred::root().xattr_permission(&file, b"trusted.a", true), Ok(()));
+        assert_eq!(u.xattr_permission(&file, b"user.a", false), Ok(()));
+        assert_eq!(u.xattr_permission(&file, b"user.a", true), Err(Errno::EACCES));
+        assert_eq!(u.xattr_permission(&file, b"security.a", true), Ok(()));
+        let link = meta(mode::S_IFLNK, 0o777, 1000, 0);
+        assert_eq!(u.xattr_permission(&link, b"user.a", true), Err(Errno::EPERM));
+        let tmp = meta(mode::S_IFDIR, 0o1777, 0, 0);
+        assert_eq!(u.xattr_permission(&tmp, b"user.a", true), Err(Errno::EPERM));
     }
 
     #[test]
