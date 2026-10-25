@@ -52,13 +52,7 @@ If they would, rukernel builds on OSTD and contributes back. If not, `rk-frame` 
 
 ## 3. Kernel unwinding and panic strategy
 
-**The question.** The kernel builds with `panic = "abort"` and no unwinding (document 03.6). Should some subsystems instead use unwinding, catching a Rust panic at a boundary and returning `-EIO` instead of oopsing?
-
-Unwinding would let a buggy file system or driver fail one request instead of killing the machine. That is the Linux behaviour of `BUG` in a file system turning into an oops that kills one process, plus a bit more. It costs code size, needs unwind tables (`gimli`), and requires every lock and RCU guard to be unwind safe.
-
-**What decides it.** A measurement of text size and fault path cost with unwinding enabled for `rk-fs-*` and `rk-drv-*` only, plus a review of how often panics happen in practice in the syzkaller corpus.
-
-**Deadline:** R3, before the first disk file system ships.
+**Decided in R3: abort everywhere.** The kernel targets use the `abort` panic strategy, and unwinding needs `-Zbuild-std` and the `eh_personality` lang item, which are unstable. The kernel uses stable Rust only, so the unwinding option cannot be built or measured on the pinned toolchain. Document 03.6 and the settled decisions of document 00 have the decision and the reasons. The question opens again when those features become stable.
 
 ## 4. Speculative frame references for GUP-fast
 
