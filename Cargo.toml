@@ -14,6 +14,7 @@ members = [
     "drv/rk-drv-tty",
     "fs/rk-vfs",
     "fs/rk-fs-proc",
+    "fs/rk-fs-ext4",
     "fs/rk-fs-tmpfs",
     "kernel/rukernel",
     "net/rk-net",
@@ -49,6 +50,7 @@ rk-drv-virtio = { path = "drv/rk-drv-virtio", version = "0.3.2" }
 rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.3.2" }
 rk-vfs = { path = "fs/rk-vfs", version = "0.3.2" }
 rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.3.2" }
+rk-fs-ext4 = { path = "fs/rk-fs-ext4", version = "0.3.2" }
 rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.3.2" }
 rk-net = { path = "net/rk-net", version = "0.3.2" }
 rk-net-unix = { path = "net/rk-net-unix", version = "0.3.2" }

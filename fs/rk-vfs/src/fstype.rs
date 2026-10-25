@@ -14,9 +14,19 @@ pub struct FsType {
     pub name: &'static str,
     /// Tells if the file system has no block device. `/proc/filesystems` shows `nodev` for it.
     pub nodev: bool,
-    /// Makes a new instance and gives its root directory. The argument is the data string of
-    /// `mount(2)`, which holds the options of the file system.
-    pub make: fn(&[u8]) -> Result<InodeRef>,
+    /// Makes a new instance and gives its root directory.
+    pub make: fn(&MountArgs<'_>) -> Result<InodeRef>,
+}
+
+/// The arguments of `mount(2)` for the constructor of a file system type.
+#[derive(Clone, Copy, Debug)]
+pub struct MountArgs<'a> {
+    /// The data string, which holds the options of the file system.
+    pub data: &'a [u8],
+    /// The block device of the source, for a type that is not `nodev`.
+    pub dev: Option<u64>,
+    /// `MS_RDONLY`: the file system does not accept changes.
+    pub read_only: bool,
 }
 
 static TYPES: SpinLock<Vec<FsType>> = SpinLock::new(Vec::new());

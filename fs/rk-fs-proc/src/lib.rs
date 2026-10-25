@@ -29,12 +29,12 @@ pub const FS_TYPE: FsType = FsType { name: "proc", nodev: true, make: mount };
 
 /// Makes the root of a mount of procfs. procfs takes no options yet, so `data` has no effect.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-fn mount(_data: &[u8]) -> rk_vfs::Result<rk_vfs::InodeRef> {
+fn mount(_args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
     Ok(kernel::root())
 }
 
 /// A host build has no processes, so it has no procfs.
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
-fn mount(_data: &[u8]) -> rk_vfs::Result<rk_vfs::InodeRef> {
+fn mount(_args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
     Err(rk_abi::Errno::ENODEV)
 }

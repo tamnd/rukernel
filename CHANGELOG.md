@@ -2,6 +2,19 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The new crate `rk-fs-ext4` mounts ext4, ext3 and ext2 read only. It reads the superblock, the group descriptors, the inode tables, the extent trees, the block maps and the directories through the page cache of the disk. A change gives `EROFS`. The driver does not replay the journal yet, and it does not check the checksums.
+- `mount` gives the device number and the `MS_RDONLY` flag to a file system that needs a block device. It gives `ENOTBLK` if the source is not a block device.
+- The extended attribute calls. No file system keeps extended attributes yet, so a list is empty, a read or a removal gives `ENODATA`, and a change gives `EOPNOTSUPP`.
+- tools/debug/build.sh adds e2fsprogs. The `alpine` boot test makes an ext4 file system with `mkfs.ext4 -d` on a second disk, mounts it read only, and compares the tree with `diff -r`.
+
+### Fixed
+
+- `lchown` changes the symbolic link and not its target.
+
 ## [0.3.2] - 2026-10-25
 
 ### Added

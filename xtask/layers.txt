@@ -14,6 +14,7 @@ rk-vfs    2
 rk-block  2
 rk-net    2
 rk-fs-proc 3
+rk-fs-ext4 3
 rk-fs-tmpfs 3
 rk-net-unix 3
 rk-drv-mem 3

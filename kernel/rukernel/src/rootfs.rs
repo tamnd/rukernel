@@ -13,6 +13,9 @@ static ROOT: Once<FsContext> = Once::new();
 /// Makes the root tmpfs and unpacks the initramfs into it, if the boot loader gave one.
 pub(crate) fn init(boot: &BootInfo) {
     rk_vfs::fstype::register(rk_fs_tmpfs::FS_TYPE);
+    for t in rk_fs_ext4::FS_TYPES {
+        rk_vfs::fstype::register(t);
+    }
     #[cfg(target_arch = "x86_64")]
     {
         rk_vfs::fstype::register(rk_fs_proc::FS_TYPE);

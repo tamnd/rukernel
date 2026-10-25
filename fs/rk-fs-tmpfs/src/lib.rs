@@ -68,8 +68,8 @@ pub const FS_TYPE: rk_vfs::fstype::FsType =
 
 /// Makes a new tmpfs for `mount(2)`. The option `mode=` gives the permission bits of the root in
 /// octal. The default is 1777, as Linux gives.
-pub fn mount(data: &[u8]) -> Result<InodeRef> {
-    let perm = match rk_vfs::fstype::option(data, b"mode") {
+pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
+    let perm = match rk_vfs::fstype::option(args.data, b"mode") {
         Some(v) => parse_octal(v).ok_or(Errno::EINVAL)?,
         None => 0o1777,
     };
