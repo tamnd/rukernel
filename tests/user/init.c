@@ -1733,6 +1733,7 @@ static void test_file_locks(void)
 
 static void test_iflags(void)
 {
+	struct fsxattr fsx;
 	int flags = 0, fd, ap;
 
 	mkdir("/tmp", 0755);
@@ -1743,6 +1744,15 @@ static void test_iflags(void)
 	flags = 0;
 	check("FS_IOC_GETFLAGS gives the immutable flag",
 	      ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 && flags == FS_IMMUTABLE_FL);
+	memset(&fsx, 0, sizeof(fsx));
+	check("FS_IOC_FSGETXATTR gives the immutable flag",
+	      ioctl(fd, FS_IOC_FSGETXATTR, &fsx) == 0 && fsx.fsx_xflags == FS_XFLAG_IMMUTABLE);
+	fsx.fsx_xflags = FS_XFLAG_IMMUTABLE | FS_XFLAG_NODUMP;
+	check("FS_IOC_FSSETXATTR sets the nodump flag", ioctl(fd, FS_IOC_FSSETXATTR, &fsx) == 0 &&
+	      ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0 && flags == (FS_IMMUTABLE_FL | FS_NODUMP_FL));
+	fsx.fsx_projid = 1;
+	check("FS_IOC_FSSETXATTR with a project id gives EOPNOTSUPP",
+	      ioctl(fd, FS_IOC_FSSETXATTR, &fsx) < 0 && errno == EOPNOTSUPP);
 	check("a write to an immutable file gives EPERM", write(fd, "x", 1) < 0 && errno == EPERM);
 	check("an open for writing of an immutable file gives EPERM",
 	      open("/tmp/fl", O_WRONLY) < 0 && errno == EPERM);

@@ -254,6 +254,8 @@ impl FileOps for InodeFile {
                 inode.set_attr_flags(u32::from_ne_bytes(b))?;
                 Ok(0)
             }
+            fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
+            fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -267,6 +269,65 @@ const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
 const FS_IOC32_GETFLAGS: u32 = 0x8004_6601;
 /// `_IOW('f', 2, int)`.
 const FS_IOC32_SETFLAGS: u32 = 0x4004_6602;
+
+/// `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR`, from `<linux/fs.h>`. They give and change the
+/// inode flags as the `FS_XFLAG_*` flags of XFS.
+mod fsx {
+    use super::UserMemory;
+    use crate::inode::{Inode, Result, iflags};
+    use rk_abi::Errno;
+
+    /// `_IOR('X', 31, struct fsxattr)`.
+    pub(super) const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+    /// `_IOW('X', 32, struct fsxattr)`.
+    pub(super) const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
+    /// The size of `struct fsxattr`.
+    const SIZE: usize = 28;
+    /// `FS_PROJINHERIT_FL`.
+    const PROJINHERIT: u32 = 0x2000_0000;
+    /// The pairs of an inode flag and its `FS_XFLAG_*` flag.
+    const MAP: [(u32, u32); 6] = [
+        (iflags::IMMUTABLE, 0x8),
+        (iflags::APPEND, 0x10),
+        (iflags::SYNC, 0x20),
+        (iflags::NOATIME, 0x40),
+        (iflags::NODUMP, 0x80),
+        (PROJINHERIT, 0x200),
+    ];
+
+    /// Writes the `struct fsxattr` of `inode` at `arg`.
+    pub(super) fn get(inode: &dyn Inode, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        let flags = inode.attr_flags()?;
+        let xflags = MAP.iter().filter(|(f, _)| flags & f != 0).fold(0, |x, (_, b)| x | b);
+        let mut buf = [0u8; SIZE];
+        buf[..4].copy_from_slice(&u32::to_ne_bytes(xflags));
+        mem.write(arg, &buf)?;
+        Ok(0)
+    }
+
+    /// Reads a `struct fsxattr` at `arg` and sets the flags of `inode` from it.
+    pub(super) fn set(inode: &dyn Inode, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        let mut buf = [0u8; SIZE];
+        mem.read(arg, &mut buf)?;
+        let word = |i: usize| u32::from_ne_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+        let (xflags, extsize, projid, cowextsize) = (word(0), word(4), word(12), word(16));
+        if MAP.iter().fold(xflags, |x, (_, b)| x & !b) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        // No file system here has project quotas or extent size hints.
+        if projid != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if extsize != 0 || cowextsize != 0 {
+            return Err(Errno::EINVAL);
+        }
+        // The flags that `FS_XFLAG_*` cannot give stay as they are, as Linux.
+        let common = MAP.iter().fold(0, |f, (i, _)| f | i);
+        let new = MAP.iter().filter(|(_, b)| xflags & b != 0).fold(0, |f, (i, _)| f | i);
+        inode.set_attr_flags((inode.attr_flags()? & !common) | new)?;
+        Ok(0)
+    }
+}
 
 /// `FS_IOC_FIEMAP`, from `<linux/fiemap.h>`.
 mod fiemap {
