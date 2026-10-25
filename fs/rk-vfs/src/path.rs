@@ -43,6 +43,11 @@ impl Parent {
     }
 }
 
+/// The components of `path`, with the first one at the end.
+fn components(path: &[u8]) -> Vec<Vec<u8>> {
+    path.split(|&b| b == b'/').filter(|p| !p.is_empty()).rev().map(<[u8]>::to_vec).collect()
+}
+
 fn is_symlink(at: &Location) -> bool {
     at.inode().metadata().file_type() == Some(FileType::Symlink)
 }
@@ -59,24 +64,36 @@ impl<'a> Walk<'a> {
 
     /// Gives the location of `path`. A relative path starts at `start`. If `follow` is `false`, a
     /// symbolic link as the last component is not followed.
+    ///
+    /// The walk is a loop and not a recursion, so that a chain of `MAX_LINKS` symbolic links
+    /// does not use much of the kernel stack.
     pub fn resolve(&mut self, start: &Location, path: &[u8], follow: bool) -> Result<Location> {
-        let parent = self.resolve_parent(start, path)?;
-        let at = match &parent.name[..] {
-            b"." => parent.dir,
-            b".." => self.up(&parent.dir),
-            name => {
-                let next = self.child(&parent.dir, name)?;
-                if is_symlink(&next) && (follow || parent.trailing_slash) {
-                    self.follow(&parent.dir, &next)?
-                } else {
+        let mut parent = self.resolve_parent(start, path)?;
+        let mut follow = follow;
+        // A path or a link target that ends with `/` must give a directory.
+        let mut must_be_dir = false;
+        loop {
+            let Parent { dir, name, trailing_slash } = parent;
+            must_be_dir |= trailing_slash;
+            let at = match &name[..] {
+                b"." => dir,
+                b".." => self.up(&dir),
+                name => {
+                    let next = self.child(&dir, name)?;
+                    if is_symlink(&next) && (follow || trailing_slash) {
+                        let target = self.link_target(&next)?;
+                        parent = self.resolve_parent(&dir, &target)?;
+                        follow = true;
+                        continue;
+                    }
                     next
                 }
+            };
+            if must_be_dir && !is_dir(&at) {
+                return Err(Errno::ENOTDIR);
             }
-        };
-        if parent.trailing_slash && !is_dir(&at) {
-            return Err(Errno::ENOTDIR);
+            return Ok(at);
         }
-        Ok(at)
     }
 
     /// Gives the directory of the last component of `path` and the last component. The last
@@ -90,12 +107,15 @@ impl<'a> Walk<'a> {
         }
         let mut at = if path[0] == b'/' { self.root.clone() } else { start.clone() };
         let trailing_slash = path.ends_with(b"/");
-        let parts: Vec<&[u8]> = path.split(|&b| b == b'/').filter(|p| !p.is_empty()).collect();
-        let Some((last, dirs)) = parts.split_last() else {
+        // The components that are left, with the next one at the end. A symbolic link adds the
+        // components of its target.
+        let mut rest = components(path);
+        let Some(last) = rest.first().cloned() else {
             return Ok(Parent { dir: at, name: Vec::from(&b"."[..]), trailing_slash: false });
         };
-        for part in dirs {
-            at = self.step(&at, part)?;
+        rest.remove(0);
+        while let Some(part) = rest.pop() {
+            at = self.step(&at, &part, &mut rest)?;
         }
         if !is_dir(&at) {
             return Err(Errno::ENOTDIR);
@@ -103,11 +123,12 @@ impl<'a> Walk<'a> {
         if last.len() > NAME_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
-        Ok(Parent { dir: at, name: last.to_vec(), trailing_slash })
+        Ok(Parent { dir: at, name: last, trailing_slash })
     }
 
-    /// Goes from the directory `at` to the component `part`, and follows a symbolic link.
-    fn step(&mut self, at: &Location, part: &[u8]) -> Result<Location> {
+    /// Goes from the directory `at` to the component `part`. For a symbolic link, it adds the
+    /// components of the target to `rest` and gives the place where the target starts.
+    fn step(&mut self, at: &Location, part: &[u8], rest: &mut Vec<Vec<u8>>) -> Result<Location> {
         if !is_dir(at) {
             return Err(Errno::ENOTDIR);
         }
@@ -119,20 +140,30 @@ impl<'a> Walk<'a> {
                     return Err(Errno::ENAMETOOLONG);
                 }
                 let next = self.child(at, name)?;
-                if is_symlink(&next) { self.follow(at, &next) } else { Ok(next) }
+                if !is_symlink(&next) {
+                    return Ok(next);
+                }
+                let target = self.link_target(&next)?;
+                if target.is_empty() {
+                    return Err(Errno::ENOENT);
+                }
+                if target.len() >= PATH_MAX {
+                    return Err(Errno::ENAMETOOLONG);
+                }
+                rest.extend(components(&target));
+                Ok(if target[0] == b'/' { self.root.clone() } else { at.clone() })
             }
         }
     }
 
-    /// Follows the symbolic link `link` in the directory `dir`. The result can be a link only
-    /// if the target ends in a link that the walk does not follow.
-    fn follow(&mut self, dir: &Location, link: &Location) -> Result<Location> {
+    /// Gives the target of the symbolic link `link`, and counts the link. Gives `ELOOP` after
+    /// `MAX_LINKS` links in one walk.
+    fn link_target(&mut self, link: &Location) -> Result<Vec<u8>> {
         self.links += 1;
         if self.links > MAX_LINKS {
             return Err(Errno::ELOOP);
         }
-        let target = link.inode().follow_link()?;
-        self.resolve(dir, &target, true)
+        link.inode().follow_link()
     }
 
     /// The child `name` of the directory `at`, in the mount that is on top of it.
@@ -156,7 +187,7 @@ impl<'a> Walk<'a> {
                 break;
             }
             match at.mount.mountpoint() {
-                Some(below) => at = below.clone(),
+                Some(below) => at = below,
                 None => return at,
             }
         }
@@ -178,7 +209,7 @@ impl<'a> Walk<'a> {
             if at.is_mount_root() {
                 match at.mount.mountpoint() {
                     Some(below) => {
-                        at = below.clone();
+                        at = below;
                         continue;
                     }
                     None => return Err(Errno::ENOENT),

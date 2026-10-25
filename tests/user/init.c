@@ -1452,6 +1452,39 @@ static void test_mount(void)
 	rmdir("/mnt2");
 }
 
+/* A walk follows 40 symbolic links and gives ELOOP at the next one, as Linux. */
+static void test_symlink_chain(void)
+{
+	char name[32], target[32];
+	int fd, i, ok = 1;
+
+	mkdir("/tmp", 0755);
+	fd = open("/tmp/chain", O_CREAT | O_RDWR, 0644);
+	close(fd);
+	for (i = 0; i <= 40; i++) {
+		snprintf(name, sizeof(name), "/tmp/l%d", i);
+		if (i == 0)
+			snprintf(target, sizeof(target), "chain");
+		else
+			snprintf(target, sizeof(target), "l%d", i - 1);
+		ok &= symlink(target, name) == 0;
+	}
+	check("symlink of a chain of 41 links", ok);
+	fd = open("/tmp/l39", O_RDONLY);
+	check("a walk follows 40 links", fd >= 0);
+	close(fd);
+	errno = 0;
+	check("a walk gives ELOOP at the 41st link", open("/tmp/l40", O_RDONLY) == -1 && errno == ELOOP);
+	errno = 0;
+	check("a directory component gives ELOOP at the 41st link",
+	      open("/tmp/l40/x", O_RDONLY) == -1 && errno == ELOOP);
+	for (i = 0; i <= 40; i++) {
+		snprintf(name, sizeof(name), "/tmp/l%d", i);
+		unlink(name);
+	}
+	unlink("/tmp/chain");
+}
+
 /* Reads the file `path` into `buf` and gives the byte count, or -1. */
 static ssize_t read_file(const char *path, char *buf, size_t len)
 {
@@ -1970,6 +2003,7 @@ int main(int argc, char **argv)
 	test_seccomp();
 	test_ptrace();
 	test_mount();
+	test_symlink_chain();
 	test_proc();
 	test_memfd();
 	test_shm();
