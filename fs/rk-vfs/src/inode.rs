@@ -268,6 +268,13 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Writes the transactions of the journal of the file system of the inode to their places
+    /// and empties the journal, for `EXT4_IOC_CHECKPOINT`. `flags` has the bits of
+    /// [`checkpoint`]. The default gives `ENOTTY`.
+    fn checkpoint(&self, _flags: u32) -> Result<()> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
@@ -382,6 +389,16 @@ pub struct FiemapExtent {
     pub length: u64,
     /// The extent has blocks that are not written, and it reads as zeros.
     pub unwritten: bool,
+}
+
+/// The flags of `EXT4_IOC_CHECKPOINT`, from `<linux/ext4.h>`.
+pub mod checkpoint {
+    /// Discards the blocks of the journal.
+    pub const DISCARD: u32 = 1;
+    /// Writes zeros to the blocks of the journal.
+    pub const ZEROOUT: u32 = 2;
+    /// Only tells if the file system has the ioctl.
+    pub const DRY_RUN: u32 = 4;
 }
 
 /// The flags of `FS_IOC_GOINGDOWN`, from `<linux/fs.h>`.

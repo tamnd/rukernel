@@ -531,6 +531,17 @@ impl Log {
         Ok(())
     }
 
+    /// Writes zeros to the blocks of the log after its superblock. It comes after a checkpoint,
+    /// when the log has no transaction.
+    pub(crate) fn erase(&mut self, fs: &Fs) -> Result<()> {
+        let zero = vec![0u8; self.bs];
+        for &block in self.blocks.iter().skip(1) {
+            fs.write_direct(block * self.bs as u64, &zero)?;
+        }
+        fs.disk.write_back(0, u64::MAX)?;
+        fs.disk.flush()
+    }
+
     /// Notes that the blocks from `start` up to `start + count` are free. The log revokes the
     /// copies that it has of them.
     pub(crate) fn freed(&mut self, start: u64, count: u64) {

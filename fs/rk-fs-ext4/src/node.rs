@@ -899,6 +899,10 @@ impl Inode for Node {
         self.fs.shutdown(flags)
     }
 
+    fn checkpoint(&self, flags: u32) -> Result<()> {
+        self.fs.checkpoint(flags)
+    }
+
     fn metadata(&self) -> Metadata {
         let raw = self.raw();
         let kind = kind_of(&raw);

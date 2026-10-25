@@ -847,6 +847,34 @@ mod log {
     }
 
     #[test]
+    fn a_checkpoint_empties_the_journal() {
+        use rk_vfs::inode::checkpoint::{DISCARD, DRY_RUN, ZEROOUT};
+        let (fs, _ram) = open_rw();
+        assert_eq!(fs.root().unwrap().checkpoint(DRY_RUN), Err(Errno::ENODEV));
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        assert_eq!(root.checkpoint(DISCARD | ZEROOUT), Err(Errno::EINVAL));
+        assert_eq!(root.checkpoint(8), Err(Errno::EINVAL));
+        assert_eq!(root.checkpoint(DISCARD), Err(Errno::EOPNOTSUPP));
+        root.checkpoint(DRY_RUN).unwrap();
+        for i in 0..3 {
+            root.create(format!("d{i}").as_bytes(), FileType::Directory, 0o755, 0).unwrap();
+        }
+        root.sync().unwrap();
+        assert!(ram.0.lock()[42 * BS..64 * BS].iter().any(|&b| b != 0));
+        root.checkpoint(ZEROOUT).unwrap();
+        let disk = ram.0.lock().clone();
+        assert_eq!(be32(&disk, 41 * BS + jsb::START), 0);
+        assert!(disk[42 * BS..64 * BS].iter().all(|&b| b == 0));
+        // The journal takes new transactions after it.
+        root.create(b"after", FileType::Regular, 0o644, 0).unwrap();
+        drop((root, fs));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        assert_eq!(names(&*fs.root().unwrap()).len(), 4 + 3 + 1);
+    }
+
+    #[test]
     fn the_unmount_leaves_a_clean_journal() {
         let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
         let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
