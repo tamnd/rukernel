@@ -13,6 +13,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `utimensat` with a time that is not the time now gives `EPERM` on an append-only file, as Linux. generic/079 checks it.
 
+### Fixed
+
+- `utimensat` with a time that is not the time now gives `EPERM` on an append-only file, as Linux. generic/079 checks it.
+
 ## [0.3.10] - 2026-10-25
 
 ### Added
