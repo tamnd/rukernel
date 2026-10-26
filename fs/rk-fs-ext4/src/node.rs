@@ -691,11 +691,7 @@ impl Tx<'_> {
             }
             raw.block_mut().fill(0);
         }
-        let acl = raw.file_acl();
-        if acl != 0 {
-            self.put_xattr_block(acl)?;
-            raw.set_file_acl(0);
-        }
+        self.release_xattrs(&mut raw)?;
         let t = now();
         layout::put32(&mut raw.0, 0x14, t.sec as u32);
         raw.set_size(0);

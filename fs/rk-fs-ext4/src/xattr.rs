@@ -6,10 +6,15 @@
 //! of the name, for example 1 for `user.`, and the rest of the name. A change writes all the
 //! attributes again: the attributes that fit go in the inode, in the order of their names, and
 //! the others go in the block. A block that other inodes share, which Linux makes, is copied
-//! before a change. A value in its own inode, the `ea_inode` feature, is not supported, so the
-//! driver does not mount such a disk.
+//! before a change.
+//!
+//! With the `ea_inode` feature, a large value is in the data of an inode of its own, and the
+//! entry has the number of that inode. The value inode keeps the hash of the value in its access
+//! time, and the count of the references to it in its change time and in `i_version`. The count
+//! of blocks of the inode with the attribute also counts the blocks of the value, as the quota of
+//! Linux does.
 
-use crate::layout::{RawInode, put16, put32, u16_at, u32_at};
+use crate::layout::{self, RawInode, flags, put16, put32, u16_at, u32_at};
 use crate::{Fs, Tx, crc};
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -29,6 +34,10 @@ const REFCOUNT: usize = 4;
 const CHECKSUM: usize = 16;
 /// The size of an entry without its name.
 const ENTRY: usize = 16;
+/// A value is in an inode of its own if its padded size is more than the block size less this
+/// gap, as `EXT4_XATTR_MIN_LARGE_EA_SIZE`: the header of a block, an entry with a name of 3
+/// bytes, and the 4 zero bytes at the end of the entries.
+const LARGE_GAP: usize = BLOCK_HEADER + 20 + 4;
 
 /// The prefixes of the names with their indexes, as `ext4_xattr_handler_map`. The ACL names have
 /// no rest, so they come before `system.`.
@@ -134,6 +143,32 @@ fn entry_size(len: usize) -> usize {
     pad(ENTRY + len)
 }
 
+/// Where an entry keeps its value.
+enum Stored {
+    /// The value is in the area of the entry.
+    Here(Vec<u8>),
+    /// The value is in the inode, with the size, as the `ea_inode` feature.
+    Inode(u32, usize),
+}
+
+/// The entries of an area, in the order of the area.
+type Entries = Vec<(Key, Stored)>;
+
+/// An attribute to write: the key, the value, and the inode of the value. The inode is `None`
+/// for a value in the entry, and 0 for a value that needs a new inode.
+struct Slot<'a> {
+    key: &'a Key,
+    value: &'a [u8],
+    inode: Option<u32>,
+}
+
+impl Slot<'_> {
+    /// The bytes of the value in the area.
+    fn value_size(&self) -> usize {
+        if self.inode.is_some() { 0 } else { pad(self.value.len()) }
+    }
+}
+
 /// The hash of an entry, as `ext4_xattr_hash_entry`.
 fn hash_entry(name: &[u8], value: &[u8]) -> u32 {
     let mut hash = 0u32;
@@ -149,7 +184,7 @@ fn hash_entry(name: &[u8], value: &[u8]) -> u32 {
 }
 
 /// Reads the entries of `area` from `first`. The values are at their offsets from `base`.
-fn parse(area: &[u8], first: usize, base: usize, out: &mut Attrs) -> Result<()> {
+fn parse(area: &[u8], first: usize, base: usize, out: &mut Entries) -> Result<()> {
     let mut at = first;
     loop {
         if at + 4 > area.len() {
@@ -167,43 +202,65 @@ fn parse(area: &[u8], first: usize, base: usize, out: &mut Attrs) -> Result<()> 
         let inum = u32_at(area, at + 4);
         let size = u32_at(area, at + 8) as usize;
         let name = area.get(at + ENTRY..at + ENTRY + len).ok_or(Errno::EUCLEAN)?;
-        if inum != 0 {
-            return Err(Errno::EOPNOTSUPP);
-        }
-        let value = area.get(base + offs..base + offs + size).ok_or(Errno::EUCLEAN)?;
-        out.insert((index, name.to_vec()), value.to_vec());
+        let stored = if inum != 0 {
+            Stored::Inode(inum, size)
+        } else {
+            Stored::Here(area.get(base + offs..base + offs + size).ok_or(Errno::EUCLEAN)?.to_vec())
+        };
+        out.push(((index, name.to_vec()), stored));
         at += entry_size(len);
     }
 }
 
 /// Tells if the attributes `list` fit in `len` bytes with the entries from `first`.
-fn fits(list: &[(&Key, &Vec<u8>)], first: usize, len: usize) -> bool {
-    let entries: usize = list.iter().map(|(k, _)| entry_size(k.1.len())).sum();
-    let values: usize = list.iter().map(|(_, v)| pad(v.len())).sum();
+fn fits(list: &[&Slot<'_>], first: usize, len: usize) -> bool {
+    let entries: usize = list.iter().map(|s| entry_size(s.key.1.len())).sum();
+    let values: usize = list.iter().map(|s| s.value_size()).sum();
     first + entries + 4 + values <= len
 }
 
 /// Writes the attributes `list` in `area`, which is zero, with the entries from `first`. The
-/// offsets of the values are from `base`. The values go from the end of the area down.
-fn write_entries(area: &mut [u8], first: usize, base: usize, list: &[(&Key, &Vec<u8>)]) {
+/// offsets of the values are from `base`. The values go from the end of the area down. The
+/// hash of a value in an inode is `seed` with the value, as `ext4_xattr_inode_hash`, and the
+/// hash of the entry uses it in place of the value.
+fn write_entries(area: &mut [u8], first: usize, base: usize, list: &[&Slot<'_>], seed: u32) {
     let mut at = first;
     let mut end = area.len();
-    for (key, value) in list {
-        let offs = if value.is_empty() {
+    for slot in list {
+        let (key, value) = (slot.key, slot.value);
+        let offs = if value.is_empty() || slot.inode.is_some() {
             0
         } else {
             end -= pad(value.len());
             area[end..end + value.len()].copy_from_slice(value);
             end - base
         };
+        let hash = match slot.inode {
+            Some(inum) => {
+                put32(area, at + 4, inum);
+                hash_entry(&key.1, &crc::crc32c(seed, value).to_le_bytes())
+            }
+            None => hash_entry(&key.1, value),
+        };
         area[at] = key.1.len() as u8;
         area[at + 1] = key.0;
         put16(area, at + 2, offs as u16);
         put32(area, at + 8, value.len() as u32);
-        put32(area, at + 12, hash_entry(&key.1, value));
+        put32(area, at + 12, hash);
         area[at + ENTRY..at + ENTRY + key.1.len()].copy_from_slice(&key.1);
         at += entry_size(key.1.len());
     }
+}
+
+/// The count of the references to the value inode `raw`, as `ext4_xattr_inode_get_ref`.
+fn ea_refs(raw: &RawInode) -> u64 {
+    u64::from(u32_at(&raw.0, 0xc)) << 32 | u64::from(u32_at(&raw.0, 0x24))
+}
+
+/// Sets the count of the references to the value inode `raw`, as `ext4_xattr_inode_set_ref`.
+fn set_ea_refs(raw: &mut RawInode, refs: u64) {
+    raw.set_time(0xc, 0x84, (refs >> 32) as i64, 0);
+    put32(&mut raw.0, 0x24, refs as u32);
 }
 
 /// The offset in the inode where its attributes start, or `None` if the inode has no room for
@@ -227,13 +284,26 @@ impl RawInode {
 }
 
 impl Fs {
-    /// Reads the extended attributes of the inode `raw`.
-    pub(crate) fn xattrs(&self, raw: &RawInode) -> Result<Attrs> {
-        let mut out = Attrs::new();
+    /// Tells if a value can be in an inode of its own.
+    fn ea_inode(&self) -> bool {
+        self.sb.incompat & layout::incompat::EA_INODE != 0
+    }
+
+    /// The count of 512-byte sectors that a value of `len` bytes in an inode adds to the inode
+    /// with the attribute, as `ext4_xattr_inode_alloc_quota`.
+    fn ea_sectors(&self, len: usize) -> u64 {
+        let bs = self.sb.block_size;
+        (len as u64).div_ceil(bs) * (bs / 512)
+    }
+
+    /// Reads the entries of the extended attributes of the inode `raw`: the entries in the inode,
+    /// and the entries in the block.
+    fn xattr_entries(&self, raw: &RawInode) -> Result<(Entries, Entries)> {
+        let (mut inside, mut outside) = (Entries::new(), Entries::new());
         if let Some(start) = ibody_start(raw)
             && u32_at(&raw.0, start) == MAGIC
         {
-            parse(&raw.0[start..], 4, 4, &mut out)?;
+            parse(&raw.0[start..], 4, 4, &mut inside)?;
         }
         let block = raw.file_acl();
         if block != 0 {
@@ -241,9 +311,44 @@ impl Fs {
             if u32_at(&data, 0) != MAGIC || u32_at(&data, 8) != 1 {
                 return Err(Errno::EUCLEAN);
             }
-            parse(&data, BLOCK_HEADER, 0, &mut out)?;
+            parse(&data, BLOCK_HEADER, 0, &mut outside)?;
+        }
+        let in_inode = inside.iter().chain(&outside).any(|(_, s)| matches!(s, Stored::Inode(..)));
+        if in_inode && !self.ea_inode() {
+            return Err(Errno::EUCLEAN);
+        }
+        Ok((inside, outside))
+    }
+
+    /// Reads the extended attributes of the inode `raw`.
+    pub(crate) fn xattrs(&self, raw: &RawInode) -> Result<Attrs> {
+        let (inside, outside) = self.xattr_entries(raw)?;
+        let mut out = Attrs::new();
+        for (key, stored) in inside.into_iter().chain(outside) {
+            let value = match stored {
+                Stored::Here(value) => value,
+                Stored::Inode(inum, size) => self.ea_value(inum, size)?,
+            };
+            out.insert(key, value);
         }
         Ok(out)
+    }
+
+    /// Reads the value of `size` bytes in the inode `inum`, as `ext4_xattr_inode_get`. An inode
+    /// without `EXT4_EA_INODE_FL` or with another size gives `EUCLEAN`.
+    fn ea_value(&self, inum: u32, size: usize) -> Result<Vec<u8>> {
+        if inum < self.sb.first_ino || inum > self.inodes_count() {
+            return Err(Errno::EUCLEAN);
+        }
+        let raw = self.read_inode(inum)?;
+        if raw.flags() & flags::EA_INODE == 0 || raw.size() != size as u64 {
+            return Err(Errno::EUCLEAN);
+        }
+        let mut value = vec![0u8; size];
+        if self.read_data(&raw, 0, &mut value)? != size {
+            return Err(Errno::EUCLEAN);
+        }
+        Ok(value)
     }
 
     /// Gives the extent of the extended attributes of the inode `ino` with `raw`, as
@@ -287,12 +392,21 @@ impl Fs {
 
 impl Tx<'_> {
     /// Removes the use of the attribute block `block` by one inode. The last use frees the
-    /// block.
-    pub(crate) fn put_xattr_block(&mut self, block: u64) -> Result<()> {
+    /// block, and removes the references of its entries to their value inodes.
+    fn put_xattr_block(&mut self, block: u64) -> Result<()> {
         let fs = self.fs;
         let mut data = fs.read_block(block)?;
         let refs = u32_at(&data, REFCOUNT);
         if u32_at(&data, 0) != MAGIC || refs <= 1 {
+            if fs.ea_inode() && u32_at(&data, 0) == MAGIC {
+                let mut entries = Entries::new();
+                parse(&data, BLOCK_HEADER, 0, &mut entries)?;
+                for (_, stored) in entries {
+                    if let Stored::Inode(inum, _) = stored {
+                        self.change_ea_refs(inum, -1)?;
+                    }
+                }
+            }
             return self.free_blocks(block, 1);
         }
         put32(&mut data, REFCOUNT, refs - 1);
@@ -314,7 +428,7 @@ impl Tx<'_> {
             let mut next = raw.clone();
             next.0[128 + old..128 + new].fill(0);
             put16(&mut next.0, 0x80, new as u16);
-            match self.write_xattrs(ino, &mut next, &attrs) {
+            match self.rewrite_xattrs(ino, raw, &mut next, &attrs) {
                 Ok(()) => {
                     *raw = next;
                     return Ok(());
@@ -328,34 +442,157 @@ impl Tx<'_> {
 
     /// Writes `attrs` as the extended attributes of the inode `ino` with `raw`. The caller saves
     /// the inode. Gives `ENOSPC` if the attributes do not fit in the inode and one block.
+    ///
+    /// With the `ea_inode` feature, a large value goes to an inode of its own, as
+    /// `ext4_xattr_set_handle`. If the attributes do not fit, the largest value in the block
+    /// also goes to an inode of its own, until they fit. A value that has an inode and does not
+    /// change keeps its inode.
     pub(crate) fn write_xattrs(
         &mut self,
         ino: u32,
         raw: &mut RawInode,
         attrs: &Attrs,
     ) -> Result<()> {
+        let old = raw.clone();
+        self.rewrite_xattrs(ino, &old, raw, attrs)
+    }
+
+    /// Writes `attrs` as the extended attributes of the inode `ino` with `raw`, as
+    /// [`Tx::write_xattrs`]. The attributes before the change are in `before`.
+    fn rewrite_xattrs(
+        &mut self,
+        ino: u32,
+        before: &RawInode,
+        raw: &mut RawInode,
+        attrs: &Attrs,
+    ) -> Result<()> {
         let fs = self.fs;
         let bs = fs.sb.block_size as usize;
+        let (old_inside, old_outside) = fs.xattr_entries(before)?;
+        let old = before.file_acl();
+        let shared = old != 0 && u32_at(&fs.read_block(old)?, REFCOUNT) > 1;
+        let mut slots = Vec::new();
+        for (key, value) in attrs {
+            let kept = old_inside.iter().chain(&old_outside).find_map(|(k, s)| match s {
+                Stored::Inode(inum, size) if k == key && *size == value.len() => Some(*inum),
+                _ => None,
+            });
+            let inode = match kept {
+                Some(inum) if fs.ea_value(inum, value.len())? == *value => Some(inum),
+                _ if fs.ea_inode() && pad(value.len()) > bs - LARGE_GAP => Some(0),
+                _ => None,
+            };
+            slots.push(Slot { key, value, inode });
+        }
         let start = ibody_start(raw);
         let room = start.map_or(0, |s| raw.0.len() - s);
-        let mut inside = Vec::new();
-        let mut outside = Vec::new();
-        for attr in attrs {
-            inside.push(attr);
-            if start.is_none() || !fits(&inside, 4, room) {
-                inside.pop();
-                outside.push(attr);
+        let outside_at = loop {
+            let mut inside = Vec::new();
+            let mut outside = Vec::new();
+            for (i, slot) in slots.iter().enumerate() {
+                inside.push(slot);
+                if start.is_none() || !fits(&inside, 4, room) {
+                    inside.pop();
+                    outside.push(i);
+                }
+            }
+            let list: Vec<_> = outside.iter().map(|&i| &slots[i]).collect();
+            if fits(&list, BLOCK_HEADER, bs) {
+                break outside;
+            }
+            let largest = outside
+                .iter()
+                .copied()
+                .filter(|&i| slots[i].inode.is_none() && !slots[i].value.is_empty())
+                .max_by_key(|&i| slots[i].value.len());
+            match largest {
+                Some(i) if fs.ea_inode() => slots[i].inode = Some(0),
+                _ => return Err(Errno::ENOSPC),
+            }
+        };
+        let mut made = Vec::new();
+        for slot in &mut slots {
+            if slot.inode == Some(0) {
+                match self.make_ea_inode(ino, raw, slot.value) {
+                    Ok(inum) => {
+                        slot.inode = Some(inum);
+                        made.push(inum);
+                    }
+                    Err(e) => {
+                        for inum in made {
+                            self.change_ea_refs(inum, 0)?;
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
-        if !fits(&outside, BLOCK_HEADER, bs) {
-            return Err(Errno::ENOSPC);
+        let result = self.write_slots(ino, raw, &slots, &outside_at, shared);
+        // A change of the references frees a value inode without references.
+        let mut refs = BTreeMap::<u32, i64>::new();
+        if result.is_ok() {
+            for slot in &slots {
+                if let Some(inum) = slot.inode {
+                    *refs.entry(inum).or_default() += 1;
+                }
+            }
+            // The entries of a shared block stay, so their references stay.
+            let gone = old_inside.iter().chain(old_outside.iter().filter(|_| !shared));
+            for (_, stored) in gone {
+                if let Stored::Inode(inum, _) = stored {
+                    *refs.entry(*inum).or_default() -= 1;
+                }
+            }
+            let old_sectors: u64 = old_inside
+                .iter()
+                .chain(&old_outside)
+                .filter_map(|(_, s)| match s {
+                    Stored::Inode(_, size) => Some(fs.ea_sectors(*size)),
+                    Stored::Here(_) => None,
+                })
+                .sum();
+            let new_sectors: u64 = slots
+                .iter()
+                .filter(|s| s.inode.is_some())
+                .map(|s| fs.ea_sectors(s.value.len()))
+                .sum();
+            raw.set_blocks((raw.blocks() + new_sectors).saturating_sub(old_sectors));
         }
-        if let Some(start) = start {
+        for inum in made {
+            refs.entry(inum).or_default();
+        }
+        for (inum, delta) in refs {
+            self.change_ea_refs(inum, delta)?;
+        }
+        result
+    }
+
+    /// Writes the attributes `slots` of the inode `ino` with `raw`: the attributes at the
+    /// indexes `outside` go to the block, and the others go in the inode. `shared` tells if the
+    /// old block has other inodes.
+    fn write_slots(
+        &mut self,
+        ino: u32,
+        raw: &mut RawInode,
+        slots: &[Slot<'_>],
+        outside: &[usize],
+        shared: bool,
+    ) -> Result<()> {
+        let fs = self.fs;
+        let bs = fs.sb.block_size as usize;
+        let inside: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !outside.contains(i))
+            .map(|(_, s)| s)
+            .collect();
+        let mut outside: Vec<_> = outside.iter().map(|&i| &slots[i]).collect();
+        if let Some(start) = ibody_start(raw) {
             let area = &mut raw.0[start..];
             area.fill(0);
             if !inside.is_empty() {
                 put32(area, 0, MAGIC);
-                write_entries(area, 4, 4, &inside);
+                write_entries(area, 4, 4, &inside, fs.csum_seed);
             }
         }
         let old = raw.file_acl();
@@ -363,13 +600,18 @@ impl Tx<'_> {
         let sectors = fs.cluster_sectors();
         if outside.is_empty() {
             if old != 0 {
-                self.put_xattr_block(old)?;
+                // The references of the entries of a block that only this inode has are
+                // removed by the caller.
+                if shared {
+                    self.put_xattr_block(old)?
+                } else {
+                    self.free_blocks(old, 1)?
+                }
                 raw.set_file_acl(0);
                 raw.set_blocks(raw.blocks().saturating_sub(sectors));
             }
             return Ok(());
         }
-        let shared = old != 0 && u32_at(&fs.read_block(old)?, REFCOUNT) > 1;
         let block = if old == 0 || shared {
             let (block, _) = self.alloc_blocks(fs.goal(ino), 1)?;
             if shared {
@@ -387,8 +629,10 @@ impl Tx<'_> {
         put32(&mut data, 8, 1);
         // The entries of a block are in the order of `ext4_xattr_find_entry`: the index, the
         // length of the name, and the name.
-        outside.sort_by(|a, b| (a.0.0, a.0.1.len(), &a.0.1).cmp(&(b.0.0, b.0.1.len(), &b.0.1)));
-        write_entries(&mut data, BLOCK_HEADER, 0, &outside);
+        outside.sort_by(|a, b| {
+            (a.key.0, a.key.1.len(), &a.key.1).cmp(&(b.key.0, b.key.1.len(), &b.key.1))
+        });
+        write_entries(&mut data, BLOCK_HEADER, 0, &outside, fs.csum_seed);
         // The hash of the block, as `ext4_xattr_rehash`.
         let mut hash = 0u32;
         let mut at = BLOCK_HEADER;
@@ -400,5 +644,92 @@ impl Tx<'_> {
         fs.write_xattr_block(block, &mut data)?;
         raw.set_file_acl(block);
         Ok(())
+    }
+
+    /// Removes the extended attributes of the inode `raw`, which is freed: the references of
+    /// the entries in the inode to their value inodes, and the use of the block.
+    pub(crate) fn release_xattrs(&mut self, raw: &mut RawInode) -> Result<()> {
+        let fs = self.fs;
+        if fs.ea_inode()
+            && let Some(start) = ibody_start(raw)
+            && u32_at(&raw.0, start) == MAGIC
+        {
+            let mut entries = Entries::new();
+            parse(&raw.0[start..], 4, 4, &mut entries)?;
+            for (_, stored) in entries {
+                if let Stored::Inode(inum, _) = stored {
+                    self.change_ea_refs(inum, -1)?;
+                }
+            }
+        }
+        let block = raw.file_acl();
+        if block != 0 {
+            self.put_xattr_block(block)?;
+            raw.set_file_acl(0);
+        }
+        Ok(())
+    }
+
+    /// Adds `delta` to the count of the references to the value inode `inum`, as
+    /// `ext4_xattr_inode_update_ref`. A count of 0 frees the inode.
+    fn change_ea_refs(&mut self, inum: u32, delta: i64) -> Result<()> {
+        let fs = self.fs;
+        if inum < fs.sb.first_ino || inum > fs.inodes_count() {
+            return Err(Errno::EUCLEAN);
+        }
+        let mut raw = fs.read_inode(inum)?;
+        if raw.flags() & flags::EA_INODE == 0 {
+            return Err(Errno::EUCLEAN);
+        }
+        let refs = ea_refs(&raw).saturating_add_signed(delta);
+        if delta == 0 && refs != 0 {
+            return Ok(());
+        }
+        if refs == 0 {
+            raw.set_links(0);
+            fs.write_inode(inum, &mut raw)?;
+            return self.release(inum);
+        }
+        set_ea_refs(&mut raw, refs);
+        fs.write_inode(inum, &mut raw)
+    }
+
+    /// Makes a new value inode with `value` for the inode `ino` with `raw`, as
+    /// `ext4_xattr_inode_create`. The new inode has no reference.
+    fn make_ea_inode(&mut self, ino: u32, raw: &RawInode, value: &[u8]) -> Result<u32> {
+        let fs = self.fs;
+        let inum = self.alloc_inode(ino, false)?;
+        let size = usize::from(fs.sb.inode_size);
+        let mut new = RawInode(vec![0u8; size]);
+        if size > 128 {
+            put16(&mut new.0, 0x80, fs.want_extra_isize().min(size - 128) as u16);
+        }
+        new.set_mode(0o100600);
+        new.set_uid(raw.uid());
+        new.set_gid(raw.gid());
+        new.set_links(1);
+        put32(&mut new.0, 0x64, self.next_generation());
+        let t = rk_vfs::now();
+        new.set_time(0x10, 0x88, t.sec, t.nsec);
+        if new.extra_size() >= 0x98 - 128 {
+            new.set_time(0x90, 0x94, t.sec, t.nsec);
+        }
+        new.set_flags(flags::EA_INODE);
+        if fs.sb.incompat & layout::incompat::EXTENTS != 0 {
+            new.set_flags(flags::EA_INODE | flags::EXTENTS);
+            Tx::empty_tree(&mut new);
+        }
+        let written = self.write_data(inum, &mut new, 0, value);
+        // The access time keeps the hash of the value.
+        new.set_time(0x8, 0x8c, i64::from(crc::crc32c(fs.csum_seed, value)), 0);
+        set_ea_refs(&mut new, 0);
+        fs.write_inode(inum, &mut new)?;
+        match written {
+            Ok(n) if n == value.len() => Ok(inum),
+            result => {
+                self.change_ea_refs(inum, 0)?;
+                Err(result.err().unwrap_or(Errno::ENOSPC))
+            }
+        }
     }
 }
