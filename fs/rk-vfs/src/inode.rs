@@ -337,6 +337,18 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 
+    /// Makes the file system of the inode read only, or writable again, for a remount. The
+    /// default does nothing.
+    fn set_read_only(&self, _read_only: bool) -> Result<()> {
+        Ok(())
+    }
+
+    /// Tells if the file system of the inode is read only, as `sb_rdonly` of Linux. The default
+    /// is false.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {

@@ -113,6 +113,15 @@ pub fn get_tree(ty: FsType, args: &MountArgs<'_>, mounted: bool) -> Result<Inode
     Ok(root)
 }
 
+/// Records that a remount made the file system of the type `name` on the device `dev` read only
+/// or writable, so that a new mount of the device checks the new state.
+pub fn set_read_only(name: &str, dev: u64, read_only: bool) {
+    let mut supers = SUPERS.lock();
+    for s in supers.iter_mut().filter(|s| s.name == name && s.dev == dev) {
+        s.read_only = read_only;
+    }
+}
+
 /// Gives the value of the option `key=value` in the comma separated data string of `mount(2)`.
 pub fn option<'a>(data: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     data.split(|&b| b == b',').find_map(|opt| {

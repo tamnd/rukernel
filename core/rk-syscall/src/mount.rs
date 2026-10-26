@@ -10,7 +10,8 @@
 //!
 //! `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` change the propagation of a mount,
 //! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. The VFS keeps the flags of a mount for `/proc/self/mounts`, but it does not
-//! enforce `MS_RDONLY`, `MS_NOEXEC` and the other flags yet.
+//! enforce `MS_RDONLY`, `MS_NOEXEC` and the other flags yet. A remount without `MS_BIND` makes
+//! the file system read only or writable, if the file system supports it.
 
 use crate::cx::{Cx, PATH_MAX, SysResult};
 use alloc::sync::Arc;
@@ -95,6 +96,10 @@ pub(crate) fn mount(
         if !at.is_mount_root() {
             return Err(Errno::EINVAL);
         }
+        // A remount without `MS_BIND` also changes the file system, as `do_remount` of Linux.
+        if flags & MS_BIND == 0 {
+            remount_super(&at.mount, at.inode(), flags & MS_RDONLY != 0)?;
+        }
         let old = at.mount.flags() as u32;
         at.mount.set_flags(u64::from(atime_flags(flags, Some(old)) & KEPT));
         return Ok(0);
@@ -135,6 +140,14 @@ pub(crate) fn mount(
     let source = MountSource { source, fstype: ty.name, flags: u64::from(flags) };
     ns.mount(root, &at, source)?;
     Ok(0)
+}
+
+/// Makes the file system of `mount`, with the root `root`, read only or writable again, for a
+/// remount, as `reconfigure_super` of Linux.
+fn remount_super(mount: &Mount, root: &InodeRef, read_only: bool) -> Result<(), Errno> {
+    root.set_read_only(read_only)?;
+    fstype::set_read_only(mount.source().fstype, root.fs_id(), read_only);
+    Ok(())
 }
 
 /// Sets the atime flags of `mount(2)` as Linux does. A mount is relatime unless it is noatime or
@@ -367,6 +380,7 @@ pub(crate) fn fsconfig(
         FSCONFIG_CMD_RECONFIGURE => {
             let mount = ctx.picked.as_ref().ok_or(Errno::EBUSY)?;
             let read_only = ctx.config.lock().read_only;
+            remount_super(mount, mount.root().inode(), read_only)?;
             let flags = mount.source().flags & !u64::from(MS_RDONLY);
             mount.set_flags(flags | if read_only { u64::from(MS_RDONLY) } else { 0 });
         }

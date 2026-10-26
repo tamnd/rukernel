@@ -1115,6 +1115,39 @@ mod log {
     }
 
     #[test]
+    fn a_remount_makes_the_file_system_read_only_and_writable_again() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        let file = root.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        file.write_at(0, b"data").unwrap();
+        root.set_read_only(true).unwrap();
+        // The disk is clean: the journal is empty and a mount needs no replay.
+        let disk = ram.0.lock().clone();
+        assert_eq!(layout::u32_at(&disk, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        assert_eq!(be32(&disk, 41 * BS + jsb::START), 0);
+        assert_eq!(root.create(b"new", FileType::Regular, 0o644, 0).err(), Some(Errno::EROFS));
+        assert_eq!(file.write_at(0, b"x"), Err(Errno::EROFS));
+        assert!(file.is_read_only());
+        assert_eq!(read_all(&*file), b"data");
+        root.set_read_only(true).unwrap();
+        root.freeze(true).unwrap();
+        assert_eq!(root.set_read_only(false), Err(Errno::EBUSY));
+        root.freeze(false).unwrap();
+        root.set_read_only(false).unwrap();
+        assert!(!file.is_read_only());
+        assert_ne!(layout::u32_at(&ram.0.lock(), 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        root.create(b"after", FileType::Regular, 0o644, 0).unwrap();
+        drop((file, root, fs));
+        // A file system that a read only mount made cannot become writable.
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), true).unwrap();
+        let root = fs.root().unwrap();
+        assert!(root.lookup(b"after").is_ok());
+        assert_eq!(root.set_read_only(false), Err(Errno::EROFS));
+        root.set_read_only(true).unwrap();
+    }
+
+    #[test]
     fn a_checkpoint_empties_the_journal() {
         use rk_vfs::inode::checkpoint::{DISCARD, DRY_RUN, ZEROOUT};
         let (fs, _ram) = open_rw();
