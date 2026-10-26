@@ -1887,3 +1887,42 @@ fn fallocate_takes_a_run_of_all_the_blocks_after_a_short_hole() {
     c.fallocate(0, 0, 4 * BS as u64).unwrap();
     assert_eq!(c.fiemap(0, u64::MAX).unwrap().len(), 1);
 }
+
+#[test]
+fn fsmap_gives_the_metadata_the_free_space_and_the_rest() {
+    use fsmap::owner;
+    use rk_vfs::inode::fsmap_owner::{FREE, UNKNOWN};
+    let (fs, _ram) = open_rw();
+    let bs = BS as u64;
+    let map: Vec<(u64, u64, u64)> =
+        fs.fsmap(0).unwrap().iter().map(|r| (r.physical / bs, r.length / bs, r.owner)).collect();
+    let want = [
+        (1, 1, owner::FS),
+        (2, 1, owner::GDT),
+        (3, 1, owner::BLKBM),
+        (4, 1, owner::INOBM),
+        (5, 8, owner::INODES),
+        (13, 7, FREE),
+        (20, 3, UNKNOWN),
+        (23, 1, FREE),
+        (24, 3, UNKNOWN),
+        (27, 3, FREE),
+        (30, 1, UNKNOWN),
+        (31, 9, FREE),
+        (40, 1, UNKNOWN),
+        (41, 23, FREE),
+    ];
+    assert_eq!(map, want);
+    // A read only mount gives the same map.
+    let ro = open(image()).unwrap();
+    let ro: Vec<(u64, u64, u64)> =
+        ro.fsmap(0).unwrap().iter().map(|r| (r.physical / bs, r.length / bs, r.owner)).collect();
+    assert_eq!(ro, want);
+    // A new file takes blocks from the free space.
+    let file = fs.root().unwrap().create(b"new", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(0, &[1u8; 2 * BS]).unwrap();
+    let map = fs.fsmap(0).unwrap();
+    let free: u64 = map.iter().filter(|r| r.owner == FREE).map(|r| r.length / bs).sum();
+    assert_eq!(free, 43 - 2);
+    assert_eq!(map.last().map(|r| r.physical + r.length), Some(64 * bs));
+}

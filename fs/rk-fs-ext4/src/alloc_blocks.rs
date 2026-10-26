@@ -103,31 +103,7 @@ impl Tx<'_> {
     /// Gives the block bitmap of the group `group`. A bitmap that is not on the disk is made from
     /// the layout, as `ext4_init_block_bitmap`.
     pub(crate) fn block_bitmap(&self, group: u32) -> Result<Vec<u8>> {
-        let fs = self.fs;
-        let desc = fs.group(group)?;
-        if self.desc_flags(group) & bg::BLOCK_UNINIT == 0 {
-            return fs.read_block(desc.block_bitmap);
-        }
-        let sb = &fs.sb;
-        let mut bitmap = vec![0u8; sb.block_size as usize];
-        for bit in 0..sb.base_meta_blocks(group) as usize {
-            set_bit(&mut bitmap, bit, true);
-        }
-        let start =
-            u64::from(sb.first_data_block) + u64::from(group) * u64::from(sb.blocks_per_group);
-        let end = start + u64::from(fs.blocks_in_group(group));
-        let own = [
-            (desc.block_bitmap, 1),
-            (desc.inode_bitmap, 1),
-            (desc.inode_table, sb.itable_blocks()),
-        ];
-        for (first, count) in own {
-            for b in (first..first + count).filter(|b| (start..end).contains(b)) {
-                set_bit(&mut bitmap, (b - start) as usize, true);
-            }
-        }
-        mark_end(&mut bitmap, fs.blocks_in_group(group) as usize);
-        Ok(bitmap)
+        self.fs.block_bitmap_of(group, self.desc_flags(group))
     }
 
     /// Gives the inode bitmap of the group `group`.
@@ -359,5 +335,37 @@ impl Tx<'_> {
         let g = self.meta.generation;
         self.meta.generation = g.wrapping_add(1);
         g
+    }
+}
+
+impl crate::Fs {
+    /// Gives the block bitmap of the group `group`, which has the flags `flags` in its
+    /// descriptor. The caller holds the lock of the metadata. A bitmap that is not on the disk is
+    /// made from the layout, as `ext4_init_block_bitmap`.
+    pub(crate) fn block_bitmap_of(&self, group: u32, flags: u16) -> Result<Vec<u8>> {
+        let desc = self.group(group)?;
+        if flags & bg::BLOCK_UNINIT == 0 {
+            return self.read_block(desc.block_bitmap);
+        }
+        let sb = &self.sb;
+        let mut bitmap = vec![0u8; sb.block_size as usize];
+        for bit in 0..sb.base_meta_blocks(group) as usize {
+            set_bit(&mut bitmap, bit, true);
+        }
+        let start =
+            u64::from(sb.first_data_block) + u64::from(group) * u64::from(sb.blocks_per_group);
+        let end = start + u64::from(self.blocks_in_group(group));
+        let own = [
+            (desc.block_bitmap, 1),
+            (desc.inode_bitmap, 1),
+            (desc.inode_table, sb.itable_blocks()),
+        ];
+        for (first, count) in own {
+            for b in (first..first + count).filter(|b| (start..end).contains(b)) {
+                set_bit(&mut bitmap, (b - start) as usize, true);
+            }
+        }
+        mark_end(&mut bitmap, self.blocks_in_group(group) as usize);
+        Ok(bitmap)
     }
 }

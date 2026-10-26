@@ -11,7 +11,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_vfs::inode::{FiemapExtent, fileid, mode};
+use rk_vfs::inode::{FiemapExtent, FsmapRecord, fileid, mode};
 use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
@@ -1015,6 +1015,10 @@ impl Inode for Node {
 
     fn trim(&self, start: u64, len: u64, minlen: u64) -> Result<u64> {
         self.fs.trim(start, len, minlen)
+    }
+
+    fn fsmap(&self, from: u64) -> Result<Vec<FsmapRecord>> {
+        self.fs.fsmap(from)
     }
 
     fn label(&self) -> Result<Vec<u8>> {
