@@ -577,3 +577,126 @@ fn an_unused_node_keeps_its_redirect_and_metacopy_state() {
     assert_eq!(node(&e).redirect.lock().as_deref(), Some(&b"d"[..]));
     assert_eq!(read(&e.lookup(b"x").unwrap()), b"lower x");
 }
+
+/// Gives the layers of [`layers`], where the lower file `a` has the hard link `h`.
+fn linked_layers() -> [InodeRef; 4] {
+    let dirs = layers();
+    let a = dirs[0].lookup(b"a").unwrap();
+    dirs[0].link(b"h", &a).unwrap();
+    dirs
+}
+
+#[test]
+fn a_copy_up_of_a_lower_hard_link_goes_to_the_index() {
+    let [lower, upper, work, data] = linked_layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,index=on";
+    let root = mount_layers(dirs, opts).unwrap();
+    assert_eq!(root.fs_options(), b",lowerdir=/l,upperdir=/u,workdir=/w,index=on,uuid=on");
+    let index = work.lookup(INDEX).unwrap();
+    let a = root.lookup(b"a").unwrap();
+    let h = root.lookup(b"h").unwrap();
+    let ino = a.metadata().ino;
+    h.write_at(0, b"LOWER").unwrap();
+    // The other name shows the copy, with the same inode number and count of links.
+    assert_eq!(read(&a), b"LOWER a");
+    assert_eq!((a.metadata().ino, a.metadata().nlink), (ino, 2));
+    assert_eq!((h.metadata().ino, h.metadata().nlink), (ino, 2));
+    let name = index_name(&lower.lookup(b"a").unwrap()).unwrap();
+    assert!(name.iter().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    let entry = index.lookup(&name).unwrap();
+    assert!(same_inode(&entry, &upper.lookup(b"h").unwrap()));
+    assert_eq!(upper.lookup(b"a").err(), Some(Errno::ENOENT));
+    // The removal of a lower name copies it up first, so the index keeps the count.
+    root.unlink(b"a").unwrap();
+    assert_eq!(h.metadata().nlink, 1);
+    // The upper inode has two links, the index and `h`, and the overlay file has one.
+    assert_eq!(entry.get_xattr(b"trusted.overlay.nlink").as_deref(), Ok(&b"U-1"[..]));
+    root.link(b"n", &h).unwrap();
+    assert_eq!(root.lookup(b"n").unwrap().metadata().nlink, 2);
+    root.unlink(b"n").unwrap();
+    // The removal of the last name removes the entry. The whiteouts share one inode.
+    root.unlink(b"h").unwrap();
+    assert_eq!(index.lookup(&name).err(), Some(Errno::ENOENT));
+    let white = upper.lookup(b"a").unwrap();
+    assert!(is_whiteout(&white));
+    assert!(same_inode(&white, &upper.lookup(b"h").unwrap()));
+    let temps = names(&index);
+    assert_eq!(temps.len(), 1);
+    assert!(temps[0].starts_with(b"#"));
+    assert_eq!(white.metadata().nlink, 3);
+}
+
+#[test]
+fn a_new_mount_finds_the_index_and_cleans_it() {
+    let [lower, upper, work, data] = linked_layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,index=on";
+    let root = mount_layers(dirs, opts).unwrap();
+    root.lookup(b"a").unwrap().write_at(0, b"LOWER").unwrap();
+    drop(root);
+    let index = work.lookup(INDEX).unwrap();
+    // An orphan entry and a temporary file go away in the next mount.
+    let b = lower.lookup(b"b").unwrap();
+    let orphan = file(&index, &index_name(&b).unwrap(), b"");
+    assert!(set_origin_of(&orphan, &b));
+    file(&index, b"#7", b"");
+    let root = mount_layers(dirs, opts).unwrap();
+    assert_eq!(names(&index).len(), 1);
+    let h = root.lookup(b"h").unwrap();
+    assert_eq!(read(&h), b"LOWER a");
+    assert_eq!(h.metadata().nlink, 2);
+    assert_eq!(h.metadata().ino, root.lookup(b"a").unwrap().metadata().ino);
+}
+
+/// Sets the attribute [`ORIGIN`] of `upper` to the file handle of `lower`.
+fn set_origin_of(upper: &InodeRef, lower: &InodeRef) -> bool {
+    upper.set_xattr(b"trusted.overlay.origin", &encode_fh(lower).unwrap(), 0).is_ok()
+}
+
+#[test]
+fn the_index_is_only_for_its_layers() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,index=on";
+    drop(mount_layers(dirs, opts).unwrap());
+    let other = rk_fs_tmpfs::new(0o755);
+    let err = mount_layers([&other, &upper, &work, &data], opts).err();
+    assert_eq!(err, Some(Errno::ESTALE));
+    let upper2 = upper.create(b"u2", FileType::Directory, 0o755, 0).unwrap();
+    let err = mount_layers([&lower, &upper2, &work, &data], opts).err();
+    assert_eq!(err, Some(Errno::ESTALE));
+    // Without the index, the mount does not check the layers.
+    let off = b"lowerdir=/l,upperdir=/u,workdir=/w";
+    assert!(mount_layers([&other, &upper, &work, &data], off).is_ok());
+}
+
+#[test]
+fn an_upper_directory_in_use_gives_ebusy_with_the_index() {
+    let [lower, upper, work, data] = layers();
+    let work2 = upper.create(b"w2", FileType::Directory, 0o755, 0).unwrap();
+    let on = b"lowerdir=/l,upperdir=/u,workdir=/w,index=on";
+    let off = b"lowerdir=/l,upperdir=/u,workdir=/w,index=off";
+    let root = mount_layers([&lower, &upper, &work, &data], on).unwrap();
+    assert_eq!(mount_layers([&lower, &upper, &work2, &data], on).err(), Some(Errno::EBUSY));
+    drop(mount_layers([&lower, &upper, &work2, &data], off).unwrap());
+    drop(root);
+    // The end of the mount frees the directories.
+    drop(mount_layers([&lower, &upper, &work, &data], on).unwrap());
+}
+
+#[test]
+fn a_directory_without_moved_names_loses_the_impure_attribute() {
+    let [lower, upper, work, data] = layers();
+    let root = mount_layers([&lower, &upper, &work, &data], b"lowerdir=/l,upperdir=/u,workdir=/w")
+        .unwrap();
+    let dir = root.create(b"new", FileType::Directory, 0o755, 0).unwrap();
+    root.rename(b"a", &dir, b"a").unwrap();
+    let real = upper.lookup(b"new").unwrap();
+    assert!(real.get_xattr(b"trusted.overlay.impure").is_ok());
+    names(&dir);
+    assert!(real.get_xattr(b"trusted.overlay.impure").is_ok());
+    dir.unlink(b"a").unwrap();
+    names(&dir);
+    assert_eq!(real.get_xattr(b"trusted.overlay.impure").err(), Some(Errno::ENODATA));
+}
