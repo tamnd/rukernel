@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - ext4 keeps the inode before each orphan in memory, as Linux. Before this change, the close of an open file without links walked the list of orphans from its head, so a process that closed many such files used time that grew as the square of their count.
 - `copy_file_range` checks the types of the files before their modes, as `generic_file_rw_checks` of Linux. A copy to a device or a fifo that is open with `O_APPEND` now gives `EINVAL`, not `EBADF`. generic/434 passes.
+- The descriptor table of a process now follows its soft `RLIMIT_NOFILE`, as Linux. Before this change, a process could not open more than 1024 files after a higher `setrlimit`. `poll` and `select` also use the soft limit. generic/488 passes.
 
 ## [0.3.14] - 2026-10-26
 
