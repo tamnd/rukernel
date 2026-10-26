@@ -26,6 +26,9 @@ static NEXT_OWNER: AtomicUsize = AtomicUsize::new(1);
 #[derive(Debug)]
 pub struct FdTable {
     entries: Vec<Option<FdEntry>>,
+    /// No descriptor below it is free, as `next_fd` of Linux, so a new descriptor does not
+    /// walk all the open ones.
+    next_free: usize,
     limit: usize,
     owner: usize,
 }
@@ -36,6 +39,7 @@ impl Clone for FdTable {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
+            next_free: self.next_free,
             limit: self.limit,
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
         }
@@ -61,6 +65,7 @@ impl FdTable {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            next_free: 0,
             limit: NR_OPEN_DEFAULT,
             owner: NEXT_OWNER.fetch_add(1, Ordering::Relaxed),
         }
@@ -97,8 +102,9 @@ impl FdTable {
         if min >= self.limit {
             return Err(Errno::EINVAL);
         }
-        let free = (min..self.entries.len()).find(|&i| self.entries[i].is_none());
-        let fd = free.unwrap_or(self.entries.len().max(min));
+        let start = min.max(self.next_free);
+        let free = (start..self.entries.len()).find(|&i| self.entries[i].is_none());
+        let fd = free.unwrap_or(self.entries.len().max(start));
         if fd >= self.limit {
             return Err(Errno::EMFILE);
         }
@@ -106,6 +112,9 @@ impl FdTable {
             self.entries.resize(fd + 1, None);
         }
         self.entries[fd] = Some(FdEntry { file, cloexec });
+        if min <= self.next_free {
+            self.next_free = fd + 1;
+        }
         Ok(fd as i32)
     }
 
@@ -134,7 +143,7 @@ impl FdTable {
     /// Adds `file` at the lowest free descriptor below `limit`, the `RLIMIT_NOFILE` of the
     /// process that gets the file.
     pub fn insert_limited(&mut self, file: Arc<File>, cloexec: bool, limit: usize) -> Result<i32> {
-        let free = (0..self.entries.len()).find(|&i| self.entries[i].is_none());
+        let free = (self.next_free..self.entries.len()).find(|&i| self.entries[i].is_none());
         if free.unwrap_or(self.entries.len()) >= limit.min(self.limit) {
             return Err(Errno::EMFILE);
         }
@@ -158,11 +167,9 @@ impl FdTable {
 
     /// Removes `fd` and gives its entry.
     pub fn remove(&mut self, fd: i32) -> Result<FdEntry> {
-        let entry = usize::try_from(fd)
-            .ok()
-            .and_then(|i| self.entries.get_mut(i))
-            .and_then(Option::take)
-            .ok_or(Errno::EBADF)?;
+        let i = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let entry = self.entries.get_mut(i).and_then(Option::take).ok_or(Errno::EBADF)?;
+        self.next_free = self.next_free.min(i);
         while self.entries.last().is_some_and(Option::is_none) {
             self.entries.pop();
         }
@@ -184,6 +191,7 @@ impl FdTable {
     /// Removes each descriptor with `FD_CLOEXEC`, for `execve`. Gives the removed entries.
     pub fn close_on_exec(&mut self) -> Vec<FdEntry> {
         let mut closed = Vec::new();
+        self.next_free = 0;
         for slot in &mut self.entries {
             if slot.as_ref().is_some_and(|e| e.cloexec)
                 && let Some(entry) = slot.take()
@@ -207,6 +215,7 @@ impl FdTable {
     pub fn remove_range(&mut self, first: usize, last: usize) -> Vec<FdEntry> {
         let end = self.entries.len().min(last.saturating_add(1));
         let closed: Vec<FdEntry> = (first..end).filter_map(|i| self.entries[i].take()).collect();
+        self.next_free = self.next_free.min(first);
         for e in &closed {
             crate::lock::close_posix(&e.file, self.owner);
         }
