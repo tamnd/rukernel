@@ -29,6 +29,9 @@ pub(crate) type WriteAtFn = Box<dyn Fn(u64, &[u8]) -> Result<usize> + Send + Syn
 /// Finds one entry of a directory, without the full list.
 pub(crate) type FindFn = Box<dyn Fn(&[u8]) -> Result<InodeRef> + Send + Sync>;
 
+/// Gives the place that a walk goes to at a magic link.
+pub(crate) type JumpFn = Box<dyn Fn() -> Result<rk_vfs::Location> + Send + Sync>;
+
 /// The block size that `stat` gives for a proc file, as Linux gives.
 const BLOCK_SIZE: u32 = 1024;
 
@@ -42,13 +45,23 @@ enum Kind {
         read: ReadAtFn,
         write: WriteAtFn,
     },
-    /// A symbolic link. The error is for a walk that follows the link.
-    Link(ReadFn, Option<Errno>),
+    /// A symbolic link, and what a walk does at it.
+    Link(ReadFn, Follow),
     Dir {
         parent: u64,
         list: ListFn,
         find: Option<FindFn>,
     },
+}
+
+/// What a walk does at a symbolic link.
+enum Follow {
+    /// The walk reads the target as a path.
+    Path,
+    /// The walk gives the error.
+    Error(Errno),
+    /// The walk goes to the place, as at a magic link of Linux.
+    Jump(JumpFn),
 }
 
 /// An inode of procfs.
@@ -118,7 +131,7 @@ pub(crate) fn link(
     perm: u32,
     target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
 ) -> InodeRef {
-    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), None) })
+    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), Follow::Path) })
 }
 
 /// Makes a symbolic link that a walk cannot follow: the walk gives `error`.
@@ -128,7 +141,23 @@ pub(crate) fn dead_link(
     target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
     error: Errno,
 ) -> InodeRef {
-    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), Some(error)) })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind: Kind::Link(Box::new(target), Follow::Error(error)),
+    })
+}
+
+/// Makes a magic link: a walk that follows it goes to the place that `jump` gives and does not
+/// read the target as a path.
+pub(crate) fn jump_link(
+    path: &[u8],
+    perm: u32,
+    target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
+    jump: impl Fn() -> Result<rk_vfs::Location> + Send + Sync + 'static,
+) -> InodeRef {
+    let follow = Follow::Jump(Box::new(jump));
+    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), follow) })
 }
 
 /// Makes a directory. `parent` is the path of the parent directory, for `..`. `find` finds one
@@ -256,8 +285,15 @@ impl Inode for Node {
 
     fn follow_link(&self) -> Result<Vec<u8>> {
         match &self.kind {
-            Kind::Link(_, Some(e)) => Err(*e),
+            Kind::Link(_, Follow::Error(e)) => Err(*e),
             _ => self.read_link(),
+        }
+    }
+
+    fn magic_link(&self) -> Option<Result<rk_vfs::Location>> {
+        match &self.kind {
+            Kind::Link(_, Follow::Jump(jump)) => Some(jump()),
+            _ => None,
         }
     }
 
@@ -399,5 +435,9 @@ mod tests {
         assert_eq!(node.follow_link().err(), Some(Errno::ENXIO));
         let node = link(b"/fd/4", 0o700, || Ok(b"/tmp".to_vec()));
         assert_eq!(node.follow_link().unwrap(), b"/tmp");
+        assert!(node.magic_link().is_none());
+        let node = jump_link(b"/fd/5", 0o700, || Ok(b"pipe:[2]".to_vec()), || Err(Errno::ENOENT));
+        assert_eq!(node.read_link().unwrap(), b"pipe:[2]");
+        assert_eq!(node.magic_link().map(|j| j.err()), Some(Some(Errno::ENOENT)));
     }
 }

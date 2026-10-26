@@ -344,6 +344,13 @@ pub trait Inode: Any + Send + Sync {
         self.read_link()
     }
 
+    /// The file that a walk goes to for a magic link of `/proc/PID/fd`, as the jump of the path
+    /// walk of Linux. The walk does not read the target as a path, so the link gives the open file
+    /// also for a pipe and for a file without a name. `None` is for a usual symbolic link.
+    fn magic_link(&self) -> Option<Result<crate::dentry::Location>> {
+        None
+    }
+
     /// Gives the entry at the position `pos` of a directory and the position of the next entry,
     /// or `None` at the end. Position 0 is the first entry. The entries `.` and `..` are first.
     fn read_dir(&self, _pos: u64) -> Result<Option<(DirEntry, u64)>> {

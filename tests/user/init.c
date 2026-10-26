@@ -1533,6 +1533,21 @@ static void test_memfd(void)
 	mount("proc", "/proc", "proc", 0, NULL);
 	check("/proc/self/fd shows the name of a memfd",
 	      readlink(path, buf, sizeof(buf) - 1) > 0 && !strncmp(buf, "/memfd:rk", 9));
+	int again = open(path, O_RDONLY);
+	memset(buf, 0, sizeof(buf));
+	check("an open through /proc/self/fd gives the memfd",
+	      again >= 0 && read(again, buf, 4) == 4 && !strcmp(buf, "data"));
+	close(again);
+	int p[2];
+	check("pipe for /proc/self/fd", pipe(p) == 0);
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", p[0]);
+	again = open(path, O_RDONLY | O_NONBLOCK);
+	memset(buf, 0, sizeof(buf));
+	check("an open through /proc/self/fd gives the same pipe",
+	      again >= 0 && write(p[1], "pipe", 4) == 4 && read(again, buf, 4) == 4 && !strcmp(buf, "pipe"));
+	close(again);
+	close(p[0]);
+	close(p[1]);
 	umount("/proc");
 	close(fd);
 	errno = 0;

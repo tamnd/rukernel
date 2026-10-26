@@ -284,6 +284,10 @@ impl FsContext {
                 Ok(File::with_ops(ops, Some(at), flags))
             }
             FileType::Fifo => {
+                // A pipe that a link of `/proc/PID/fd` gives has no name.
+                if let Some(ops) = crate::pipe::open_pipe_inode(&**at.inode(), flags) {
+                    return Ok(File::with_ops(ops?, None, flags));
+                }
                 let ops = crate::pipe::open_fifo(meta.dev, meta.ino, flags)?;
                 Ok(File::with_ops(ops, Some(at), flags))
             }

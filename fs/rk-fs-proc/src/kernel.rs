@@ -1,7 +1,7 @@
 //! The files of procfs that read the state of the kernel: the root directory, the system files,
 //! `/proc/sys` and the directory of each process.
 
-use crate::node::{FindFn, data_file, dead_link, dir, file, join, link, rw_file};
+use crate::node::{FindFn, data_file, dead_link, dir, file, join, jump_link, link, rw_file};
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
 use alloc::boxed::Box;
 use alloc::format;
@@ -600,8 +600,25 @@ fn fd_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
                         + 0o100;
                     let path = join(&me, &name);
                     // A socket cannot open again through its link, as `sock_no_open` of Linux.
+                    // A walk goes to the open file itself, so a pipe and a file without a name
+                    // open again, as the magic links of Linux.
                     let node = if target.starts_with(b"socket:[") {
                         dead_link(&path, perm, move || Ok(target.clone()), Errno::ENXIO)
+                    } else if file.location().is_some() || target.starts_with(b"pipe:[") {
+                        let file = Arc::downgrade(&file);
+                        jump_link(
+                            &path,
+                            perm,
+                            move || Ok(target.clone()),
+                            move || {
+                                let file = file.upgrade().ok_or(Errno::ENOENT)?;
+                                if let Some(at) = file.location() {
+                                    return Ok(at.clone());
+                                }
+                                let inode = rk_vfs::pipe::pipe_inode(&file).ok_or(Errno::ENOENT)?;
+                                Ok(rk_vfs::Location::detached(inode))
+                            },
+                        )
                     } else {
                         link(&path, perm, move || Ok(target.clone()))
                     };
