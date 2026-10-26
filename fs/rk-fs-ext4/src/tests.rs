@@ -958,6 +958,37 @@ mod log {
         assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
         assert_eq!(ram.free(), free);
     }
+
+    #[test]
+    fn orphans_leave_the_list_in_any_order() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let free = ram.free();
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        let mut files: Vec<_> = (0..4u8)
+            .map(|i| {
+                let name = [b'o', b'0' + i];
+                let file = root.create(&name, FileType::Regular, 0o600, 0).unwrap();
+                root.unlink(&name).unwrap();
+                Some(file)
+            })
+            .collect();
+        let head = files[3].as_ref().unwrap().metadata().ino as u32;
+        assert_eq!(fs.meta.lock().orphan_prev.len(), 4);
+        // The middle, then the tail, then the head, then the last.
+        for i in [1, 0, 3, 2] {
+            drop(files[i].take());
+            if i == 1 {
+                assert_eq!(u32_at(&fs.meta.lock().sb, layout::sb::LAST_ORPHAN), head);
+            }
+        }
+        assert_eq!(u32_at(&fs.meta.lock().sb, layout::sb::LAST_ORPHAN), 0);
+        assert!(fs.meta.lock().orphan_prev.is_empty());
+        drop((root, fs));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        drop(fs);
+        assert_eq!(ram.free(), free);
+    }
 }
 
 #[test]

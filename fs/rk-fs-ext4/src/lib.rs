@@ -151,6 +151,9 @@ pub(crate) struct Meta {
     descs: Vec<Vec<u8>>,
     /// The generation of the next new inode.
     generation: u32,
+    /// The inode before each inode of the list of orphans, or 0 for the superblock, as the list
+    /// of Linux in memory. With it, an inode leaves the list without a walk from the head.
+    orphan_prev: BTreeMap<u32, u32>,
 }
 
 /// A change of the file system. It holds the lock of the file system. When it ends, it frees the
@@ -286,7 +289,7 @@ impl Fs {
             groups: SpinLock::new(groups),
             writable,
             csum_seed,
-            meta: SpinLock::new(Meta { sb: b, descs, generation }),
+            meta: SpinLock::new(Meta { sb: b, descs, generation, orphan_prev: BTreeMap::new() }),
             orphans: SpinLock::new(Vec::new()),
             log: None,
             pending: SpinLock::new(BTreeMap::new()),
