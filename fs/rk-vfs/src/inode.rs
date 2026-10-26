@@ -281,6 +281,13 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Discards the free blocks of the file system of the inode from the byte `start` up to
+    /// `start + len`, in runs of at least `minlen` bytes, for `FITRIM`. Gives the bytes in the
+    /// runs. The default gives `ENOTTY`.
+    fn trim(&self, _start: u64, _len: u64, _minlen: u64) -> Result<u64> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {

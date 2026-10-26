@@ -1265,3 +1265,51 @@ fn a_change_makes_the_extra_fields_of_an_inode_larger() {
         assert_eq!(file.get_xattr(name).unwrap(), b"12345678");
     }
 }
+
+/// A disk that keeps the discards, as bytes.
+struct Discards(Ram, Arc<SpinLock<Vec<(u64, u64)>>>);
+
+impl Disk for Discards {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.0.read(offset, buf)
+    }
+
+    fn write(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.0.write(offset, buf)
+    }
+
+    fn can_discard(&self) -> bool {
+        true
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        self.1.lock().push((offset, len));
+        Ok(())
+    }
+}
+
+#[test]
+fn fitrim_discards_the_runs_of_free_blocks() {
+    let (fs, ram) = open_rw();
+    assert_eq!(fs.trim(0, u64::MAX, 0), Err(Errno::EOPNOTSUPP));
+    drop(fs);
+    let done = Arc::new(SpinLock::new(Vec::new()));
+    let disk = Discards(ram.clone(), done.clone());
+    let fs = Fs::open(7, alloc::boxed::Box::new(disk), false).unwrap();
+    let free = ram.free();
+    let bs = BS as u64;
+    // The free runs of the image are 13 to 19, 23, 27 to 29, 31 to 39 and 41 to 63.
+    assert_eq!(fs.trim(0, u64::MAX, 0), Ok(43 * bs));
+    let runs: Vec<(u64, u64)> = done.lock().iter().map(|&(at, len)| (at / bs, len / bs)).collect();
+    assert_eq!(runs, [(13, 7), (23, 1), (27, 3), (31, 9), (41, 23)]);
+    assert_eq!(ram.free(), free);
+    // A run that is shorter than `minlen` stays, and the range cuts the runs.
+    assert_eq!(fs.trim(0, u64::MAX, 4 * bs), Ok(39 * bs));
+    assert_eq!(fs.trim(14 * bs, 3 * bs, 0), Ok(3 * bs));
+    assert_eq!(fs.trim(0, bs, 0), Ok(0));
+    // A start past the end, a range of less than a block and a `minlen` of more than a group
+    // are not valid.
+    assert_eq!(fs.trim(64 * bs, bs, 0), Err(Errno::EINVAL));
+    assert_eq!(fs.trim(0, bs - 1, 0), Err(Errno::EINVAL));
+    assert_eq!(fs.trim(0, u64::MAX, 8193 * bs), Err(Errno::EINVAL));
+}

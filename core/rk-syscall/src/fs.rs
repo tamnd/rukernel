@@ -649,6 +649,9 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         _ => {}
     }
     let file = cx.file(fd)?;
+    if cmd == rk_vfs::file::FITRIM && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
     if let Some(notify) = crate::seccomp::listener_of(&file) {
         return crate::seccomp::listener_ioctl(cx, &notify, cmd, arg);
     }

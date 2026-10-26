@@ -55,6 +55,16 @@ pub trait BlockDevice: Send + Sync {
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Tells if the device can discard sectors.
+    fn can_discard(&self) -> bool {
+        false
+    }
+
+    /// Tells the device that the `count` sectors from `sector` have no data that is in use.
+    fn discard(&self, _sector: u64, _count: u64) -> Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
 }
 
 /// The operation of a bio.
@@ -301,6 +311,27 @@ impl Queue {
         self.stats.lock().flushes += 1;
         self.device.flush()
     }
+
+    /// Tells if the device can discard sectors.
+    pub fn can_discard(&self) -> bool {
+        self.device.can_discard()
+    }
+
+    /// Discards the `count` sectors from `sector`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EOPNOTSUPP` if the device cannot discard, `EIO` for sectors past the end, or
+    /// `EPERM` for a read only device.
+    pub fn discard(&self, sector: u64, count: u64) -> Result<()> {
+        if self.read_only() {
+            return Err(Errno::EPERM);
+        }
+        if sector.checked_add(count).is_none_or(|e| e > self.sectors()) {
+            return Err(Errno::EIO);
+        }
+        self.device.discard(sector, count)
+    }
 }
 
 impl cache::Store for Arc<Queue> {
@@ -314,6 +345,14 @@ impl cache::Store for Arc<Queue> {
 
     fn flush(&self) -> Result<()> {
         Queue::flush(self)
+    }
+
+    fn can_discard(&self) -> bool {
+        Queue::can_discard(self)
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        Queue::discard(self, offset / SECTOR_SIZE as u64, len / SECTOR_SIZE as u64)
     }
 }
 

@@ -305,6 +305,19 @@ impl FileOps for InodeFile {
                 inode.resize(u64::from_ne_bytes(b))?;
                 Ok(0)
             }
+            FITRIM => {
+                // `struct fstrim_range`: the start, the length and the least length of a run.
+                let mut range = [0u64; 3];
+                for (i, v) in range.iter_mut().enumerate() {
+                    let mut b = [0u8; 8];
+                    mem.read(arg + i * 8, &mut b)?;
+                    *v = u64::from_ne_bytes(b);
+                }
+                let [start, len, minlen] = range;
+                let trimmed = inode.trim(start, len, minlen)?;
+                mem.write(arg + 8, &trimmed.to_ne_bytes())?;
+                Ok(0)
+            }
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
             fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
@@ -323,6 +336,9 @@ const FS_IOC_GOINGDOWN: u32 = 0x8004_587d;
 const EXT4_IOC_CHECKPOINT: u32 = 0x4004_662b;
 /// `_IOW('f', 16, __u64)`. Grows a mounted ext4 file system to a number of blocks.
 const EXT4_IOC_RESIZE_FS: u32 = 0x4008_6610;
+/// `_IOWR('X', 121, struct fstrim_range)`. Discards the free blocks of a file system. The
+/// caller needs `CAP_SYS_ADMIN`.
+pub const FITRIM: u32 = 0xc018_5879;
 /// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 /// `_IOW('f', 2, long)`.
