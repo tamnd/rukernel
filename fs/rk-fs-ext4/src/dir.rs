@@ -309,12 +309,19 @@ impl Tx<'_> {
         let raw = dir.raw();
         let slot = fs.find_entry(&raw, name)?.ok_or(Errno::ENOENT)?;
         let (block, mut data) = fs.dir_block(&raw, slot.lblock)?;
+        let rec = usize::from(u16_at(&data, slot.at + 4));
+        // As `ext4_generic_delete_entry` of Linux, the removed record gets zeros, so the name
+        // does not stay on the disk. A first record keeps its length.
         match slot.prev {
             Some(prev) => {
-                let rec = u16_at(&data, prev + 4) + u16_at(&data, slot.at + 4);
-                put16(&mut data, prev + 4, rec);
+                let joined = u16_at(&data, prev + 4) + rec as u16;
+                put16(&mut data, prev + 4, joined);
+                data[slot.at..slot.at + rec].fill(0);
             }
-            None => put32(&mut data, slot.at, 0),
+            None => {
+                put32(&mut data, slot.at, 0);
+                data[slot.at + 6..slot.at + rec].fill(0);
+            }
         }
         fs.seal(dir.ino, &raw, &mut data);
         fs.write(block * fs.sb.block_size, &data)?;
