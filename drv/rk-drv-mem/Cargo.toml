@@ -1,6 +1,6 @@
 [package]
 name = "rk-drv-mem"
-description = "The memory devices of rukernel: null, zero, full, random and urandom, and the kernel random generator."
+description = "The memory devices of rukernel: null, zero, full, random and urandom, the kernel random generator and kmsg."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

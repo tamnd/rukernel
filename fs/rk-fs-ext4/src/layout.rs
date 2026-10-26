@@ -429,6 +429,9 @@ impl GroupDesc {
     }
 }
 
+/// The last second that an inode with the epoch bits can keep, `EXT4_EXTRA_TIMESTAMP_MAX`.
+pub const EXTRA_TIMESTAMP_MAX: i64 = (1 << 34) - 1 + i32::MIN as i64;
+
 /// An inode as the inode table has it.
 #[derive(Clone, Debug)]
 pub struct RawInode(pub Vec<u8>);
@@ -525,10 +528,14 @@ impl RawInode {
     }
 
     /// Changes the time at `at` and, if the inode has them, the nanoseconds and the epoch bits at
-    /// `extra`.
+    /// `extra`. A time out of the range of the inode becomes the nearest time in the range, as
+    /// `timestamp_truncate` of Linux: the epoch bits give times until the year 2446.
     pub fn set_time(&mut self, at: usize, extra: usize, sec: i64, nsec: u32) {
+        let has_extra = self.extra_size() >= extra + 4 - 128;
+        let max = if has_extra { EXTRA_TIMESTAMP_MAX } else { i64::from(i32::MAX) };
+        let sec = sec.clamp(i64::from(i32::MIN), max);
         put32(&mut self.0, at, sec as u32);
-        if self.extra_size() >= extra + 4 - 128 {
+        if has_extra {
             let epoch = ((sec - i64::from(sec as i32)) >> 32) as u32 & 3;
             put32(&mut self.0, extra, nsec << 2 | epoch);
         }
@@ -606,5 +613,22 @@ mod tests {
         assert_eq!(sb.base_meta_blocks(3), 2);
         assert_eq!(sb.base_meta_blocks(2), 0);
         assert_eq!(sb.base_meta_blocks(64), 1);
+    }
+
+    #[test]
+    fn set_time_keeps_the_time_in_the_range_of_the_inode() {
+        let mut raw = RawInode(alloc::vec![0u8; 256]);
+        raw.0[0x80] = 32;
+        for sec in [i64::from(i32::MIN), 0, EXTRA_TIMESTAMP_MAX / 2, EXTRA_TIMESTAMP_MAX] {
+            raw.set_time(0x10, 0x88, sec, 5);
+            assert_eq!(raw.time(0x10, 0x88), (sec, 5));
+        }
+        raw.set_time(0x10, 0x88, EXTRA_TIMESTAMP_MAX + 1, 0);
+        assert_eq!(raw.time(0x10, 0x88).0, EXTRA_TIMESTAMP_MAX);
+        raw.set_time(0x10, 0x88, i64::from(i32::MIN) - 1, 0);
+        assert_eq!(raw.time(0x10, 0x88).0, i64::from(i32::MIN));
+        let mut small = RawInode(alloc::vec![0u8; 128]);
+        small.set_time(0x10, 0x88, EXTRA_TIMESTAMP_MAX, 0);
+        assert_eq!(small.time(0x10, 0x88).0, i64::from(i32::MAX));
     }
 }

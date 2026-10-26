@@ -4,11 +4,14 @@
 //! `/dev/full`, `/dev/random` and `/dev/urandom`. The two random devices and `getrandom` read the
 //! same ChaCha20 generator. The CPU gives its seed at boot. A write to a random device is
 //! accepted and does not change the generator, as a write without `RNDADDENTROPY` in Linux.
+//! `/dev/kmsg` has the minor number 11, as in Linux.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+
+pub mod kmsg;
 
 use alloc::sync::Arc;
 use rk_abi::Errno;
@@ -126,11 +129,12 @@ impl CharDevice for MemDevice {
     }
 }
 
-/// Adds the memory devices to the table of character devices.
+/// Adds the memory devices and `/dev/kmsg` to the table of character devices.
 pub fn init() {
     for dev in MemDevice::ALL {
         device::register_char(dev.rdev(), Arc::new(dev));
     }
+    kmsg::init();
 }
 
 #[cfg(test)]

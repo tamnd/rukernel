@@ -73,6 +73,12 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// Moves the position for `lseek`, for a file that gives its own meaning to the position, as
+    /// `/dev/kmsg`. `None` uses the `lseek` of the VFS.
+    fn llseek(&self, _file: &File, _offset: i64, _whence: Whence) -> Option<Result<u64>> {
+        None
+    }
+
     /// Runs an `ioctl` command.
     fn ioctl(&self, _file: &File, _cmd: u32, _arg: usize, _mem: &dyn UserMemory) -> Result<usize> {
         Err(Errno::ENOTTY)
@@ -686,6 +692,9 @@ impl File {
     pub fn seek(&self, offset: i64, whence: Whence) -> Result<u64> {
         if self.flags().is_path() {
             return Err(Errno::EBADF);
+        }
+        if let Some(result) = self.ops.llseek(self, offset, whence) {
+            return result;
         }
         if !self.ops.seekable() {
             return Err(Errno::ESPIPE);
