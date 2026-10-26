@@ -2,6 +2,13 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- The device files that the kernel makes in `/dev` now have the mode of the device list, as devtmpfs of Linux gives. Before this change, the umask of init removed the write bits of the group and of the other users, so a user that is not root could not write to `/dev/null`.
+- The files in `/proc/PID` now belong to the effective user and group of the process, as Linux. Before this change, root owned each file, so a process that is not root could not read its own `/proc/self/fd`.
+
 ## [0.3.16] - 2026-10-26
 
 ### Added
