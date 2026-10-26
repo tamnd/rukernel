@@ -2,8 +2,9 @@
 //!
 //! The driver reads and writes the disk through the page cache of the block device. It reads the
 //! superblock, the group descriptors, the inode tables, the extent trees and the block maps of
-//! the files, and the directories. A directory with an htree index is read as a list, because
-//! the index blocks look like empty entries. The checksums are not checked on a read.
+//! the files, and the directories. A lookup in a directory with an htree index uses the index,
+//! and `readdir` reads the directory as a list, because the index blocks look like empty entries.
+//! The checksums are not checked on a read.
 //!
 //! A read and write mount changes the bitmaps, the group descriptors, the inodes, the extent trees
 //! and the directories, and it writes the checksums of `metadata_csum` or `uninit_bg`. With a
@@ -12,9 +13,9 @@
 //! commits at once. An inode without links that a process still uses is on the list of orphans,
 //! so a mount after a crash frees it. The data of a regular file goes to its blocks at once. At mount
 //! the driver replays a journal that Linux, e2fsprogs or a crash left with transactions, and at
-//! unmount it leaves the journal empty. A new entry in a directory with an htree index first
-//! changes the directory into a list. A file with a block map can change in its blocks, but it
-//! cannot get new blocks.
+//! unmount it leaves the journal empty. A new entry in a directory with an htree index keeps the
+//! index correct, and a full directory of one block gets an index, as Linux with `dir_index`. A
+//! file with a block map can change in its blocks, but it cannot get new blocks.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -25,6 +26,7 @@ mod alloc_blocks;
 pub mod crc;
 mod dir;
 mod extent;
+mod htree;
 mod indirect;
 mod journal;
 pub mod layout;

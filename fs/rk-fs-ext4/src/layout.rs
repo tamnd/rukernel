@@ -72,6 +72,8 @@ pub mod compat {
     pub const HAS_JOURNAL: u32 = 0x4;
     /// The inode [`RESIZE_INO`] keeps the reserved blocks for more group descriptors.
     pub const RESIZE_INODE: u32 = 0x10;
+    /// A large directory can have an htree index, `dir_index`.
+    pub const DIR_INDEX: u32 = 0x20;
     /// Only up to two groups past group 0 have a copy of the superblock.
     pub const SPARSE_SUPER2: u32 = 0x200;
 }
@@ -243,6 +245,18 @@ pub struct Superblock {
     pub journal_inum: u32,
     /// The first meta block group, if the disk has `meta_bg`.
     pub first_meta_bg: u32,
+    /// The seed of the hash of the names in an htree index, `s_hash_seed`.
+    pub hash_seed: [u32; 4],
+    /// The hash of a new htree index, `s_def_hash_version`.
+    pub def_hash_version: u8,
+    /// The flags of the superblock, `s_flags`.
+    pub flags: u32,
+}
+
+/// The flags of the superblock.
+pub mod sb_flags {
+    /// The hash of the names reads the bytes as unsigned numbers.
+    pub const UNSIGNED_HASH: u32 = 0x2;
 }
 
 impl Superblock {
@@ -290,6 +304,9 @@ impl Superblock {
             checksum_seed: u32_at(b, 0x270),
             journal_inum: u32_at(b, 0xe0),
             first_meta_bg: u32_at(b, 0x104),
+            hash_seed: [u32_at(b, 0xec), u32_at(b, 0xf0), u32_at(b, 0xf4), u32_at(b, 0xf8)],
+            def_hash_version: b[0xfc],
+            flags: u32_at(b, 0x160),
         };
         if sb.blocks_per_group == 0
             || sb.inodes_per_group == 0

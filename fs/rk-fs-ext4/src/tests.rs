@@ -1445,3 +1445,256 @@ fn a_tmpfile_is_an_orphan_until_a_link() {
     let fs = again(&ram);
     assert_eq!(read_all(&*fs.root().unwrap().lookup(b"kept").unwrap()), b"kept");
 }
+
+mod htree {
+    use super::*;
+    use crate::htree::dirhash;
+
+    /// The seed 01234567-89ab-cdef-0011-223344556677 of `dx_hash -s` of debugfs.
+    const SEED: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x3322_1100, 0x7766_5544];
+
+    #[test]
+    fn the_hash_of_a_name_is_the_hash_of_linux() {
+        // The values are from `debugfs -R "dx_hash -h VERSION -s SEED NAME"` of e2fsprogs 1.47.
+        let long = "café-a-long-name-of-more-than-thirty-two-bytes".as_bytes();
+        let cases: [(u8, &[u8], u32, u32); 9] = [
+            (0, b"hello", 0x3225_2546, 0),
+            (1, b"hello", 0x87d8_61fe, 0x9b29_5f1b),
+            (2, b"hello", 0x6f5b_b1a8, 0x2319_17c2),
+            (0, long, 0x883d_51fe, 0),
+            (1, long, 0x3d36_8cf8, 0x9f76_21ea),
+            (2, long, 0x12c7_0d6e, 0xaf46_33eb),
+            (3, long, 0x7f01_bf16, 0),
+            (4, long, 0x8724_9ad0, 0x312a_db8f),
+            (5, long, 0x908e_49de, 0x0a34_3037),
+        ];
+        for (version, name, hash, minor) in cases {
+            assert_eq!(dirhash(version, &SEED, name), Some((hash, minor)), "version {version}");
+        }
+        // A seed of zeros gives the default seed.
+        assert_eq!(dirhash(1, &[0; 4], b"hello"), Some((0x1746_da32, 0x4200_13b5)));
+        assert_eq!(dirhash(6, &SEED, b"hello"), None);
+    }
+
+    /// The test image with `blocks` blocks, `dir_index`, the seed [`SEED`] and the half MD4
+    /// hash. With `csum`, the image also has `metadata_csum`, and the block of the root ends with
+    /// a checksum record.
+    fn htree_image(blocks: usize, csum: bool) -> Vec<u8> {
+        let mut img = Image(image());
+        img.0.resize(blocks * BS, 0);
+        let sb = 1024;
+        let more = (blocks - 64) as u32;
+        img.put32(sb + 0x4, blocks as u32);
+        img.put32(sb + 0xc, layout::u32_at(&img.0, sb + 0xc) + more);
+        img.put16(2 * BS + 0xc, layout::u16_at(&img.0, 2 * BS + 0xc) + more as u16);
+        for b in 64..blocks {
+            img.0[3 * BS + (b - 1) / 8] &= !(1 << ((b - 1) % 8));
+        }
+        img.put32(sb + 0x5c, layout::compat::DIR_INDEX);
+        for (i, &word) in SEED.iter().enumerate() {
+            img.put32(sb + 0xec + 4 * i, word);
+        }
+        img.0[sb + 0xfc] = 1;
+        if csum {
+            img.put32(sb + 0x64, layout::ro_compat::METADATA_CSUM);
+            let mut at = 20 * BS;
+            loop {
+                let rec = usize::from(layout::u16_at(&img.0, at + 4));
+                if at + rec == 21 * BS {
+                    img.put16(at + 4, (rec - 12) as u16);
+                    break;
+                }
+                at += rec;
+            }
+            img.put16(21 * BS - 12 + 4, 12);
+            img.0[21 * BS - 12 + 7] = 0xde;
+        }
+        img.0
+    }
+
+    /// Checks the index of the directory `ino` as fsck does: the limits, the order of the
+    /// hashes, the hash of each name in its leaf, one use of each block, and the checksums with
+    /// `metadata_csum`. Gives the number of index levels and the names in the leaves.
+    fn check_index(fs: &Fs, ino: u32) -> (u8, Vec<Vec<u8>>) {
+        let raw = fs.read_inode(ino).unwrap();
+        assert_ne!(raw.flags() & flags::INDEX, 0);
+        let csum = fs.metadata_csum();
+        let tail = if csum { 8 } else { 0 };
+        let block = |lblock: u64| fs.read_block(fs.map(&raw, lblock).unwrap().unwrap().0).unwrap();
+        let root = block(0);
+        assert_eq!(layout::u16_at(&root, 16), BS as u16 - 12);
+        assert_eq!((root[28], root[29], root[31]), (1, 8, 0));
+        let levels = root[30];
+        let mut names = Vec::new();
+        let mut used = vec![0];
+        let mut todo = vec![(root, 32, 0, u32::MAX, 0)];
+        while let Some((data, base, lo, hi, depth)) = todo.pop() {
+            let limit = usize::from(layout::u16_at(&data, base));
+            let count = usize::from(layout::u16_at(&data, base + 2));
+            assert_eq!(limit, (BS - base - tail) / 8);
+            assert!(count >= 1 && count <= limit);
+            if csum {
+                let t = base + 8 * limit;
+                let c = crc::crc32c(fs.inode_seed(ino, &raw), &data[..base + 8 * count]);
+                let c = crc::crc32c(crc::crc32c(c, &data[t..t + 4]), &[0; 4]);
+                assert_eq!(layout::u32_at(&data, t + 4), c);
+            }
+            for i in 0..count {
+                let start = if i == 0 { lo } else { layout::u32_at(&data, base + 8 * i) };
+                let end = if i + 1 < count { layout::u32_at(&data, base + 8 * i + 8) } else { hi };
+                assert!(lo <= start && start <= end && end <= hi);
+                let child = u64::from(layout::u32_at(&data, base + 8 * i + 4));
+                assert!(!used.contains(&child));
+                used.push(child);
+                let leaf = block(child);
+                if depth < levels {
+                    assert_eq!(usize::from(layout::u16_at(&leaf, 4)), BS);
+                    todo.push((leaf, 8, start, end, depth + 1));
+                    continue;
+                }
+                if csum {
+                    let c = crc::crc32c(fs.inode_seed(ino, &raw), &leaf[..BS - 12]);
+                    assert_eq!(layout::u32_at(&leaf, BS - 4), c);
+                }
+                let mut at = 0;
+                while at < if csum { BS - 12 } else { BS } {
+                    let rec = usize::from(layout::u16_at(&leaf, at + 4));
+                    let len = usize::from(leaf[at + 6]);
+                    if layout::u32_at(&leaf, at) != 0 {
+                        let name = &leaf[at + 8..at + 8 + len];
+                        let hash = dirhash(1, &SEED, name).unwrap().0;
+                        assert!(start & !1 <= hash && hash <= end & !1);
+                        names.push(name.to_vec());
+                    }
+                    at += rec;
+                }
+            }
+        }
+        assert_eq!(used.len() as u64, raw.size() / BS as u64);
+        (levels, names)
+    }
+
+    fn mount(ram: &Ram) -> Arc<Fs> {
+        Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap()
+    }
+
+    fn short(i: usize) -> Vec<u8> {
+        format!("name-{i:0>40}").into_bytes()
+    }
+
+    #[test]
+    fn a_full_directory_gets_an_index_that_finds_each_name() {
+        let ram = Ram(Arc::new(SpinLock::new(htree_image(1024, false))));
+        let fs = mount(&ram);
+        let big = fs.root().unwrap().create(b"big", FileType::Directory, 0o755, 0).unwrap();
+        let ino = big.metadata().ino as u32;
+        let file = big.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        for i in 0..300 {
+            big.link(&short(i), &file).unwrap();
+        }
+        assert_eq!(big.link(&short(7), &file), Err(Errno::EEXIST));
+        drop((file, big, fs));
+
+        let fs = again(&ram);
+        let (levels, mut names) = check_index(&fs, ino);
+        assert_eq!(levels, 0);
+        names.sort();
+        let mut want: Vec<Vec<u8>> = (0..300).map(short).collect();
+        want.push(b"file".to_vec());
+        want.sort();
+        assert_eq!(names, want);
+        let big = fs.root().unwrap().lookup(b"big").unwrap();
+        assert_eq!(super::names(&*big).len(), 2 + 301);
+        for i in 0..300 {
+            assert!(big.lookup(&short(i)).is_ok());
+        }
+        assert_eq!(big.lookup(b"name-none").err(), Some(Errno::ENOENT));
+        drop((big, fs));
+
+        // Remove some names, and rename others in the directory and to `sub`.
+        let fs = mount(&ram);
+        let root = fs.root().unwrap();
+        let big = root.lookup(b"big").unwrap();
+        for i in (0..300).step_by(3) {
+            big.unlink(&short(i)).unwrap();
+        }
+        for i in (1..300).step_by(3) {
+            big.rename(&short(i), &big, format!("renamed-{i}").as_bytes()).unwrap();
+        }
+        big.rename(&short(2), &root.lookup(b"sub").unwrap(), b"moved").unwrap();
+        drop((big, root, fs));
+
+        let fs = again(&ram);
+        let (_, names) = check_index(&fs, ino);
+        assert_eq!(names.len(), 1 + 100 + 99);
+        let big = fs.root().unwrap().lookup(b"big").unwrap();
+        for i in 0..300 {
+            let found = big.lookup(&short(i)).is_ok();
+            assert_eq!(found, i % 3 == 2 && i != 2);
+            if i % 3 == 1 {
+                assert!(big.lookup(format!("renamed-{i}").as_bytes()).is_ok());
+            }
+        }
+        assert!(fs.root().unwrap().lookup(b"sub").unwrap().lookup(b"moved").is_ok());
+    }
+
+    #[test]
+    fn the_index_gets_a_second_level_with_checksums() {
+        let ram = Ram(Arc::new(SpinLock::new(htree_image(2048, true))));
+        let fs = mount(&ram);
+        let root = fs.root().unwrap();
+        let big = root.create(b"big", FileType::Directory, 0o755, 0).unwrap();
+        let ino = big.metadata().ino as u32;
+        let file = big.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        let long = |i: usize| format!("{i:0>250}").into_bytes();
+        for i in 0..450 {
+            big.link(&long(i), &file).unwrap();
+        }
+        drop((file, big, root, fs));
+
+        let fs = again(&ram);
+        let (levels, names) = check_index(&fs, ino);
+        assert_eq!((levels, names.len()), (1, 451));
+        let big = fs.root().unwrap().lookup(b"big").unwrap();
+        for i in 0..450 {
+            assert!(big.lookup(&long(i)).is_ok());
+        }
+        drop((big, fs));
+
+        // An empty indexed directory can be removed.
+        let fs = mount(&ram);
+        let root = fs.root().unwrap();
+        let big = root.lookup(b"big").unwrap();
+        for i in 0..450 {
+            big.unlink(&long(i)).unwrap();
+        }
+        big.unlink(b"file").unwrap();
+        drop(big);
+        root.rmdir(b"big").unwrap();
+    }
+
+    #[test]
+    fn without_dir_index_an_indexed_directory_becomes_a_list() {
+        let ram = Ram(Arc::new(SpinLock::new(htree_image(1024, false))));
+        let fs = mount(&ram);
+        let big = fs.root().unwrap().create(b"big", FileType::Directory, 0o755, 0).unwrap();
+        let ino = big.metadata().ino as u32;
+        let file = big.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        for i in 0..100 {
+            big.link(&short(i), &file).unwrap();
+        }
+        drop((file, big, fs));
+        check_index(&again(&ram), ino);
+        ram.0.lock()[1024 + 0x5c] = 0;
+        let fs = mount(&ram);
+        let big = fs.root().unwrap().lookup(b"big").unwrap();
+        big.link(b"new", &big.lookup(b"file").unwrap()).unwrap();
+        drop(big);
+        assert_eq!(fs.read_inode(ino).unwrap().flags() & flags::INDEX, 0);
+        let big = fs.root().unwrap().lookup(b"big").unwrap();
+        for i in 0..100 {
+            assert!(big.lookup(&short(i)).is_ok());
+        }
+        assert!(big.lookup(b"new").is_ok());
+    }
+}
