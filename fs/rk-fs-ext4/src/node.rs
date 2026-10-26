@@ -1257,7 +1257,7 @@ impl Inode for Node {
         if !self.is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let (ino, raw) = tx.new_inode(self.ino, FileType::Regular, perm)?;
+        let (ino, raw) = tx.new_inode(self, FileType::Regular, perm)?;
         let node = self.fs.new_node(ino, raw)?;
         // The file goes on the list of orphans, so a crash frees it, as `ext4_tmpfile`.
         let mut raw = node.raw();
