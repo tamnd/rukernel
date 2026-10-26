@@ -742,6 +742,36 @@ impl Fs {
         Ok(())
     }
 
+    /// The label of the file system, for `FS_IOC_GETFSLABEL`.
+    pub(crate) fn label(&self) -> Vec<u8> {
+        use layout::sb::{VOLUME_NAME, VOLUME_NAME_LEN};
+        let meta = self.meta.lock();
+        let field = &meta.sb[VOLUME_NAME..VOLUME_NAME + VOLUME_NAME_LEN];
+        let len = field.iter().position(|&c| c == 0).unwrap_or(VOLUME_NAME_LEN);
+        field[..len].to_vec()
+    }
+
+    /// Changes the label of the file system for `FS_IOC_SETFSLABEL`, as `ext4_ioctl_setlabel`
+    /// of Linux. The new superblock goes to the disk at once, so a read of the device sees it.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` if the label is longer than 16 bytes, `EROFS` for a read only mount, or
+    /// the error of the disk.
+    pub(crate) fn set_label(&self, label: &[u8]) -> Result<()> {
+        use layout::sb::{VOLUME_NAME, VOLUME_NAME_LEN};
+        if label.len() > VOLUME_NAME_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let mut tx = self.tx()?;
+        let field = &mut tx.meta.sb[VOLUME_NAME..VOLUME_NAME + VOLUME_NAME_LEN];
+        field.fill(0);
+        field[..label.len()].copy_from_slice(label);
+        tx.write_sb(0, 0)?;
+        drop(tx);
+        self.sync()
+    }
+
     /// Writes the transactions of the journal to their places and empties the journal, for
     /// `EXT4_IOC_CHECKPOINT`. `ZEROOUT` then writes zeros to the blocks of the log. A mount
     /// without a journal gives `ENODEV`, and `DISCARD` gives `EOPNOTSUPP`, as the disk does not
