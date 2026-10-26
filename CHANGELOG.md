@@ -4,10 +4,16 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `RLIMIT_FSIZE`, the largest file that a process can write, as Linux. A write to a regular file is short at the limit, and a write at or after the limit sends `SIGXFSZ` and gives `EFBIG`. `truncate`, `ftruncate` and `fallocate` without `FALLOC_FL_KEEP_SIZE` that make a file larger than the limit also send `SIGXFSZ` and give `EFBIG`. generic/228 and generic/394 now pass.
+
 ### Fixed
 
 - The device files that the kernel makes in `/dev` now have the mode of the device list, as devtmpfs of Linux gives. Before this change, the umask of init removed the write bits of the group and of the other users, so a user that is not root could not write to `/dev/null`.
 - The files in `/proc/PID` now belong to the effective user and group of the process, as Linux. Before this change, root owned each file, so a process that is not root could not read its own `/proc/self/fd`.
+- A write or a `fallocate` of an ext4 file that takes the last free blocks no longer loses its blocks when the extent tree needs a new block. Before this change, the call gave `ENOSPC` after it marked the data blocks as used, and the extent tree did not point to them, so fsck found an error. Now the call gives back its last blocks until the tree fits, and a write is short. generic/256 now passes.
+- An ext4 allocation that finds no free block now commits the journal and tries again, as ext4 of Linux. Before this change, the blocks that a change freed stayed busy until the next commit, so a write after a truncate could give `ENOSPC` on a disk with free blocks. generic/213 now passes.
 
 ## [0.3.16] - 2026-10-26
 

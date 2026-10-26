@@ -5,6 +5,8 @@
 
 /// The number of resources. Linux names it `RLIM_NLIMITS`.
 pub const RLIM_NLIMITS: usize = 16;
+/// The size of a file that a process writes.
+pub const RLIMIT_FSIZE: usize = 1;
 /// The size of a core file.
 pub const RLIMIT_CORE: usize = 4;
 /// The size of the main stack.

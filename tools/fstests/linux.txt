@@ -8,7 +8,9 @@ ext4/003	fs/ext4/mballoc.c
 ext4/023	fs/ext4/namei.c
 ext4/308	fs/ext4/move_extent.c
 generic/018	fs/ext4/move_extent.c
+generic/228	fs/attr.c fs/ext4/extents.c
 generic/256	fs/ext4/extents.c fs/ext4/mballoc.c
+generic/394	mm/filemap.c fs/attr.c
 generic/569	mm/swapfile.c mm/rmap.c
 generic/633	io_uring/ fs/ext4/inode.c
 cause:shutdown	fs/ext4/ioctl.c

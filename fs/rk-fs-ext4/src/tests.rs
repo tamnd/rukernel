@@ -625,6 +625,60 @@ fn many_entries_and_extents_grow_the_trees() {
 }
 
 #[test]
+fn a_full_disk_gives_back_the_blocks_of_a_tree_that_does_not_fit() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    // Four extents fill the root of the tree.
+    let sparse = root.create(b"sparse", FileType::Regular, 0o644, 0).unwrap();
+    for i in 0..4u64 {
+        sparse.write_at(i * 2 * BS as u64, &[1]).unwrap();
+    }
+    let fill = root.create(b"fill", FileType::Regular, 0o644, 0).unwrap();
+    let mut size = 0;
+    while fill.write_at(size, &[2u8; BS]) == Ok(BS) {
+        size += BS as u64;
+    }
+    // One free block is for the data, and the tree needs one more block for the fifth extent.
+    fill.set_attr(&SetAttr { size: Some(size - BS as u64), ..SetAttr::default() }).unwrap();
+    assert_eq!(sparse.write_at(8 * BS as u64, &[1]), Err(Errno::ENOSPC));
+    assert_eq!(sparse.metadata().blocks, 4 * (BS as u64 / 512));
+    let free = ram.free();
+    drop((sparse, fill, root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    assert_eq!(ram.free(), free);
+    let root = fs.root().unwrap();
+    let fill = root.lookup(b"fill").unwrap();
+    assert_eq!(fill.write_at(size - BS as u64, &[3u8; BS]), Ok(BS));
+}
+
+#[test]
+fn a_full_disk_gives_back_the_blocks_of_fallocate_when_the_tree_does_not_fit() {
+    use rk_vfs::inode::falloc::KEEP_SIZE;
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let sparse = root.create(b"sparse", FileType::Regular, 0o644, 0).unwrap();
+    for i in 0..4u64 {
+        sparse.write_at(i * 2 * BS as u64, &[1]).unwrap();
+    }
+    let fill = root.create(b"fill", FileType::Regular, 0o644, 0).unwrap();
+    let mut size = 0;
+    while fill.write_at(size, &[2u8; BS]) == Ok(BS) {
+        size += BS as u64;
+    }
+    fill.set_attr(&SetAttr { size: Some(size - BS as u64), ..SetAttr::default() }).unwrap();
+    assert_eq!(sparse.fallocate(KEEP_SIZE, 8 * BS as u64, BS as u64), Err(Errno::ENOSPC));
+    assert_eq!(sparse.metadata().blocks, 4 * (BS as u64 / 512));
+    let free = ram.free();
+    drop((sparse, fill, root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    assert_eq!(ram.free(), free);
+    let fill = fs.root().unwrap().lookup(b"fill").unwrap();
+    assert_eq!(fill.write_at(size - BS as u64, &[3u8; BS]), Ok(BS));
+}
+
+#[test]
 fn a_block_map_file_grows_and_shrinks() {
     let (fs, ram) = open_rw();
     let free = ram.free().0;
@@ -933,6 +987,28 @@ mod log {
         drop((root, fs));
         let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
         assert_eq!(names(&*fs.root().unwrap()).len(), 4 + 3 + 1);
+    }
+
+    #[test]
+    fn a_full_disk_commits_to_use_the_blocks_that_a_change_freed() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+        let mut size = 0;
+        while file.write_at(size, &[1u8; BS]) == Ok(BS) {
+            size += BS as u64;
+        }
+        assert!(size > 0);
+        // The freed blocks wait for the next commit, and the write after the truncate needs them.
+        // This small log commits each change at once, so the test keeps the blocks busy as a
+        // large log does.
+        file.set_attr(&SetAttr { size: Some(0), ..SetAttr::default() }).unwrap();
+        fs.busy.lock().extend(0..64);
+        let mut again = 0;
+        while again < size && file.write_at(again, &[2u8; BS]) == Ok(BS) {
+            again += BS as u64;
+        }
+        assert_eq!(again, size);
     }
 
     #[test]
