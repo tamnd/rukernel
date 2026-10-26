@@ -541,5 +541,5 @@ pub(crate) fn open_tree(cx: &Cx<'_>, dfd: u64, path: u64, flags: u64) -> SysResu
         return Ok(cx.files()?.lock().insert(file, cloexec)? as u64);
     }
     // The clone has the mount of `at` only. The mounts below it are not in the clone.
-    mount_fd(cx, &fs, MountNamespace::clone_tree(&at), cloexec)
+    mount_fd(cx, &fs, MountNamespace::clone_tree(&at)?, cloexec)
 }

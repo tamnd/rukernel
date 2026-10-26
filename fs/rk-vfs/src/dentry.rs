@@ -445,12 +445,7 @@ impl MountNamespace {
     /// The new mount is a peer of a shared source, and a slave of the master of a slave source,
     /// as the shared subtrees of Linux.
     pub fn bind(&self, from: &Location, at: &Location) -> Result<Arc<Mount>> {
-        let p = from.mount.propagation();
-        if p.unbindable {
-            return Err(Errno::EINVAL);
-        }
-        let mount = Self::detached(from.dentry.clone(), from.mount.source());
-        mount.set_propagation(Propagation { unbindable: false, ..p });
+        let mount = Self::clone_tree(from)?;
         self.attach(&mount, at)?;
         Ok(mount)
     }
@@ -472,10 +467,18 @@ impl MountNamespace {
         Mount::new(root, source)
     }
 
-    /// Makes a mount of the tree at `from` that is not in a name space, for `open_tree` with
-    /// `OPEN_TREE_CLONE`. The new mount has the source of the mount of `from`.
-    pub fn clone_tree(from: &Location) -> Arc<Mount> {
-        Self::detached(from.dentry.clone(), from.mount.source())
+    /// Makes a mount of the tree at `from` that is not in a name space, for `MS_BIND` and for
+    /// `open_tree` with `OPEN_TREE_CLONE`. The new mount has the source and the propagation of the
+    /// mount of `from`, as `clone_mnt` of Linux. Gives `EINVAL` if the mount of `from` is
+    /// unbindable.
+    pub fn clone_tree(from: &Location) -> Result<Arc<Mount>> {
+        let p = from.mount.propagation();
+        if p.unbindable {
+            return Err(Errno::EINVAL);
+        }
+        let mount = Self::detached(from.dentry.clone(), from.mount.source());
+        mount.set_propagation(p);
+        Ok(mount)
     }
 
     /// Tells if `mount` is in the name space.
