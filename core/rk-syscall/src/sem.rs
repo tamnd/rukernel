@@ -180,7 +180,7 @@ fn pid(cx: &Cx<'_>) -> i32 {
     cx.process().pid() as i32
 }
 
-pub(crate) fn semget(_cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult {
+pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult {
     let key = key as i32;
     let nsems = nsems as i32;
     let flags = flags as u32;
@@ -216,7 +216,17 @@ pub(crate) fn semget(_cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResul
     }
     let id = table.next;
     table.next = table.next.wrapping_add(1) & i32::MAX;
-    let perm = IpcPerm { key, mode: (flags & 0o777) as u16, ..IpcPerm::default() };
+    // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
+    let c = cx.process().cred();
+    let perm = IpcPerm {
+        key,
+        uid: c.euid,
+        gid: c.egid,
+        cuid: c.euid,
+        cgid: c.egid,
+        mode: (flags & 0o777) as u16,
+        ..IpcPerm::default()
+    };
     let set = Set { perm, members: vec![Sem::default(); nsems as usize], otime: 0, ctime: now() };
     table.sets.insert(id, set);
     Ok(id as u64)

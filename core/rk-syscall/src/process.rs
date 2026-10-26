@@ -388,6 +388,7 @@ pub(crate) fn waitid(
     if let Some(r) = wait_child(cx, target, options)? {
         let (code, value) = r.status.child_code();
         info = SigInfo::new(SIGCHLD, code, r.pid);
+        info.uid = r.uid;
         info.status = value;
         if r.trapped {
             // The status of a stop of `ptrace` holds the event above the signal.

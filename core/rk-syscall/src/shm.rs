@@ -229,7 +229,17 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
     let id = table.next;
     table.next = table.next.wrapping_add(1) & i32::MAX;
     let pages = Arc::new(ShmPages { key, id, size, pages: SpinLock::new(BTreeMap::new()) });
-    let perm = IpcPerm { key, mode: (flags & 0o777) as u16, ..IpcPerm::default() };
+    // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
+    let c = cx.process().cred();
+    let perm = IpcPerm {
+        key,
+        uid: c.euid,
+        gid: c.egid,
+        cuid: c.euid,
+        cgid: c.egid,
+        mode: (flags & 0o777) as u16,
+        ..IpcPerm::default()
+    };
     let segment = Segment { pages, perm, atime: 0, dtime: 0, ctime: now(), cpid: pid(cx), lpid: 0 };
     table.segments.insert(id, segment);
     Ok(id as u64)

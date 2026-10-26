@@ -732,6 +732,7 @@ pub(super) fn wait_tracee(
             }
             return Found::Report(WaitResult {
                 pid: t.tid,
+                uid: t.process.cred().uid,
                 status,
                 ticks: t.user_ticks(),
                 trapped: false,
@@ -749,7 +750,14 @@ pub(super) fn wait_tracee(
                     s.tracees.remove(i - 1);
                 }
                 let ticks = t.process.user_ticks() + t.process.child_ticks();
-                return Found::Report(WaitResult { pid: t.tid, status, ticks, trapped: false });
+                let uid = t.process.cred().uid;
+                return Found::Report(WaitResult {
+                    pid: t.tid,
+                    uid,
+                    status,
+                    ticks,
+                    trapped: false,
+                });
             }
         }
         if let Some(stop) = pt.stop.as_mut().filter(|s| s.resume.is_none() && !s.reported) {
@@ -760,6 +768,7 @@ pub(super) fn wait_tracee(
             drop(guard);
             return Found::Report(WaitResult {
                 pid: t.tid,
+                uid: t.process.cred().uid,
                 status,
                 ticks: t.user_ticks(),
                 trapped: true,

@@ -11,6 +11,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - overlayfs keeps the nodes that are not in use, as the unused dentries of Linux. A lookup of the name gives the same node again, with the same inodes of the layers, until a removal through the mount or an eviction. A mount keeps 4096 unused nodes at most and evicts the oldest first. An unlink or a rmdir checks that the upper directory still has the upper file of the node, as `ovl_remove_upper` of Linux, and gives `ESTALE` after a change of the upper directory that is not through the mount. overlay/012 now passes.
+- The credentials of a process now follow Linux in more places. A new file in a directory without the set-group-ID bit keeps its set-group-ID bit, as `mode_strip_sgid` of Linux. A `setresuid` or `setresgid` that changes no ID keeps the file system ID. `setgroups` and `PR_CAPBSET_DROP` give `EPERM` before the checks of their arguments. `SO_PEERCRED` and `SCM_CREDENTIALS` give the effective user and group IDs of the sender, and a sender can only give the IDs and the pid that `scm_check_creds` of Linux allows. `kill`, `tkill`, `tgkill`, `pidfd_send_signal`, `SIGCHLD` and `waitid` give the real user ID of the sender or of the child in `si_uid`. A new shared memory segment or semaphore set gets the effective IDs of the caller as its owner and creator.
 
 ## [0.3.21] - 2026-10-27
 

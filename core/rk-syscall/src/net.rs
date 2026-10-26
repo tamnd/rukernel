@@ -24,6 +24,7 @@ use rk_net_unix::Unix;
 use rk_proc::Pid;
 use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::File;
+use rk_vfs::cred::cap;
 use rk_vfs::inode::mode::{S_IFMT, S_IFSOCK};
 
 /// The size of `struct sockaddr_storage`, the longest address.
@@ -43,10 +44,26 @@ const SEND_MAX: usize = i32::MAX as usize;
 /// The most bytes of the value of `setsockopt` that the kernel reads.
 const OPTION_MAX: usize = 4096;
 
-/// The credentials of the current process, for the socket layer.
+/// The credentials of the current process, for the socket layer. They have the effective user
+/// and group IDs, as `cred_to_ucred` of Linux.
 pub(crate) fn current_cred() -> Cred {
-    let pid = rk_proc::current_thread().map_or(0, |t| t.process().pid() as i32);
-    Cred { pid, uid: 0, gid: 0 }
+    rk_proc::current_thread().map_or(Cred::default(), |t| {
+        let process = t.process();
+        let c = process.cred();
+        Cred { pid: process.pid() as i32, uid: c.euid, gid: c.egid }
+    })
+}
+
+/// Checks the credentials that a sender gives in `SCM_CREDENTIALS`, as `scm_check_creds` of
+/// Linux. The pid must be the pid of the sender, or the sender must have `CAP_SYS_ADMIN`. The
+/// user ID must be the real, effective or saved user ID, or the sender must have `CAP_SETUID`.
+/// The group ID has the same rule with `CAP_SETGID`.
+fn check_scm_cred(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<(), Errno> {
+    let c = cx.process().cred();
+    let pid_ok = pid as u32 == cx.process().pid() || c.capable(cap::SYS_ADMIN);
+    let uid_ok = [c.uid, c.euid, c.suid].contains(&uid) || c.capable(cap::SETUID);
+    let gid_ok = [c.gid, c.egid, c.sgid].contains(&gid) || c.capable(cap::SETGID);
+    if pid_ok && uid_ok && gid_ok { Ok(()) } else { Err(Errno::EPERM) }
 }
 
 /// The length of a control message with `len` bytes of data, as `CMSG_LEN`.
@@ -450,6 +467,7 @@ fn read_control(cx: &Cx<'_>, hdr: &MsgHdr, msg: &mut Message) -> Result<(), Errn
                     if uid == u32::MAX || gid == u32::MAX {
                         return Err(Errno::EINVAL);
                     }
+                    check_scm_cred(cx, pid, uid, gid)?;
                     if rk_proc::find_process(pid as Pid).is_none() {
                         return Err(Errno::ESRCH);
                     }
