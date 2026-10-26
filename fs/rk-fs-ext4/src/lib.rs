@@ -460,6 +460,21 @@ impl Fs {
         }
     }
 
+    /// Runs `op` again after a commit if it gives `ENOSPC` while freed blocks wait for the
+    /// commit, as `ext4_should_retry_alloc` of Linux. The commit makes these blocks free to use.
+    /// `op` starts and ends its own change, so the commit has only whole changes.
+    pub(crate) fn retry_alloc<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        match op() {
+            Err(Errno::ENOSPC) if !self.busy.lock().is_empty() => {
+                let meta = self.meta.lock();
+                self.commit(true);
+                drop(meta);
+                op()
+            }
+            r => r,
+        }
+    }
+
     /// Tells if the block `block` was freed since the last commit.
     pub(crate) fn is_busy(&self, block: u64) -> bool {
         self.log.is_some() && self.busy.lock().contains(&block)

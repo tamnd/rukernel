@@ -1092,11 +1092,13 @@ impl Inode for Node {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut tx = self.fs.tx()?;
-        let mut raw = self.raw();
-        let result = tx.write_data(self.ino, &mut raw, offset, buf);
-        tx.save(self, &mut raw)?;
-        result
+        self.fs.retry_alloc(|| {
+            let mut tx = self.fs.tx()?;
+            let mut raw = self.raw();
+            let result = tx.write_data(self.ino, &mut raw, offset, buf);
+            tx.save(self, &mut raw)?;
+            result
+        })
     }
 
     fn attr_flags(&self) -> Result<u32> {
@@ -1160,11 +1162,13 @@ impl Inode for Node {
         if self.kind() != FileType::Regular {
             return Err(Errno::ENODEV);
         }
-        let mut tx = self.fs.tx()?;
-        let mut raw = self.raw();
-        let result = tx.fallocate(self.ino, &mut raw, mode, offset, len);
-        tx.save(self, &mut raw)?;
-        result
+        self.fs.retry_alloc(|| {
+            let mut tx = self.fs.tx()?;
+            let mut raw = self.raw();
+            let result = tx.fallocate(self.ino, &mut raw, mode, offset, len);
+            tx.save(self, &mut raw)?;
+            result
+        })
     }
 
     fn lookup(&self, name: &[u8]) -> Result<InodeRef> {

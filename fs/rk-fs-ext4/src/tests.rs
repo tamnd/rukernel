@@ -990,6 +990,28 @@ mod log {
     }
 
     #[test]
+    fn a_full_disk_commits_to_use_the_blocks_that_a_change_freed() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+        let mut size = 0;
+        while file.write_at(size, &[1u8; BS]) == Ok(BS) {
+            size += BS as u64;
+        }
+        assert!(size > 0);
+        // The freed blocks wait for the next commit, and the write after the truncate needs them.
+        // This small log commits each change at once, so the test keeps the blocks busy as a
+        // large log does.
+        file.set_attr(&SetAttr { size: Some(0), ..SetAttr::default() }).unwrap();
+        fs.busy.lock().extend(0..64);
+        let mut again = 0;
+        while again < size && file.write_at(again, &[2u8; BS]) == Ok(BS) {
+            again += BS as u64;
+        }
+        assert_eq!(again, size);
+    }
+
+    #[test]
     fn the_unmount_leaves_a_clean_journal() {
         let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
         let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
