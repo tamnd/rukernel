@@ -2087,6 +2087,17 @@ fn bigalloc_fsmap_gives_free_clusters() {
 }
 
 #[test]
+fn bigalloc_has_no_move_extents() {
+    let (fs, _ram) = open_bigalloc(bigalloc_image());
+    let root = fs.unwrap().root().unwrap();
+    let orig = root.create(b"o", FileType::Regular, 0o644, 0).unwrap();
+    let donor = root.create(b"d", FileType::Regular, 0o644, 0).unwrap();
+    orig.write_at(0, &vec![b'o'; BS]).unwrap();
+    donor.write_at(0, &vec![b'd'; BS]).unwrap();
+    assert_eq!(orig.move_extents(&donor, 0, 0, 1), Err(Errno::EOPNOTSUPP));
+}
+
+#[test]
 fn bigalloc_collapse_needs_full_clusters() {
     use rk_vfs::inode::falloc::COLLAPSE_RANGE;
     let (fs, ram) = open_bigalloc(bigalloc_image());

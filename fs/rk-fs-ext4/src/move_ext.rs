@@ -163,7 +163,7 @@ impl Tx<'_> {
     ///
     /// Gives `EINVAL` for the same file, a file that is not regular, an empty file, a donor
     /// file with `S_ISUID` or `S_ISGID`, or a bad range, `EOPNOTSUPP` for a file without an
-    /// extent tree, an encrypted file or a DAX file, `EPERM` for an immutable or append-only
+    /// extent tree, an encrypted file, a DAX file or a file system with `bigalloc`, `EPERM` for an immutable or append-only
     /// donor file, `ENOSPC` if a tree does not fit, or the error of the disk.
     pub(crate) fn move_extents(
         &mut self,
@@ -174,6 +174,10 @@ impl Tx<'_> {
         len: u64,
     ) -> Result<u64> {
         let fs = self.fs;
+        // Linux has no online defragmentation with bigalloc.
+        if fs.sb.cluster_ratio() > 1 {
+            return Err(Errno::EOPNOTSUPP);
+        }
         check(orig_ino, orig, donor_ino, donor)?;
         let len = fs.move_range(orig, donor, orig_start, donor_start, len)?;
         let (old, orig_tree) = fs.extents(orig)?;

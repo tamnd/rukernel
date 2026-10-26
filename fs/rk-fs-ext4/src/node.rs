@@ -509,7 +509,7 @@ impl Tx<'_> {
                 .find(|e| u64::from(e.lblock) < lblock)
                 .map_or_else(|| self.fs.goal(ino), |e| e.start + (lblock - u64::from(e.lblock)));
             // A run of all the blocks keeps the file in one extent. With bigalloc the bitmap has
-            // clusters, so the clusters of the file come first.
+            // clusters, so `alloc_data` puts the blocks in the clusters of the file.
             let run = if self.fs.sb.cluster_ratio() == 1 {
                 let sectors = self.fs.sb.block_size / 512;
                 self.alloc_run(goal, want)
