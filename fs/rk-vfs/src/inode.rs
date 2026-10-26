@@ -479,6 +479,12 @@ pub trait Inode: Any + Send + Sync {
         self.metadata().dev
     }
 
+    /// The id of the file system for `f_fsid` of `statfs`. A file system that shows the files
+    /// of other file systems, as overlayfs, can give another id than the device.
+    fn fs_fsid(&self) -> u64 {
+        self.metadata().dev
+    }
+
     /// The counts of the file system, for `statfs`. `None` gives counts of 0, as for a file
     /// system without a size.
     fn fs_stat(&self) -> Option<FsStat> {
