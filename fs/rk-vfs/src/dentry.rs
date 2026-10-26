@@ -15,6 +15,13 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
+use rk_abi::native::mount::{
+    MOUNT_ATTR__ATIME, MOUNT_ATTR_IDMAP, MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV,
+    MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_NOEXEC, MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSYMFOLLOW,
+    MOUNT_ATTR_RDONLY, MOUNT_ATTR_RELATIME, MOUNT_ATTR_STRICTATIME, MS_NOATIME, MS_NODEV,
+    MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_RELATIME,
+    MS_SHARED, MS_SLAVE, MS_STRICTATIME, MS_UNBINDABLE,
+};
 use rk_frame::sync::SpinLock;
 
 /// A name of an inode.
@@ -175,6 +182,78 @@ pub enum PropagationType {
     Unbindable,
 }
 
+/// A change of the flags and of the propagation of mounts, as `struct mount_attr` of
+/// `mount_setattr` gives it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MountAttr {
+    /// The flags to clear: `MS_RDONLY`, `MS_NOATIME` and the others.
+    pub clear: u64,
+    /// The flags to set. They apply after `clear`.
+    pub set: u64,
+    /// The new propagation, or `None` to keep the propagation.
+    pub propagation: Option<PropagationType>,
+}
+
+/// The `MOUNT_ATTR_*` flags that are bits, and their `MS_*` flags. The atime flags are a value in
+/// `MOUNT_ATTR__ATIME`.
+const ATTR_BITS: [(u32, u32); 6] = [
+    (MOUNT_ATTR_RDONLY, MS_RDONLY),
+    (MOUNT_ATTR_NOSUID, MS_NOSUID),
+    (MOUNT_ATTR_NODEV, MS_NODEV),
+    (MOUNT_ATTR_NOEXEC, MS_NOEXEC),
+    (MOUNT_ATTR_NODIRATIME, MS_NODIRATIME),
+    (MOUNT_ATTR_NOSYMFOLLOW, MS_NOSYMFOLLOW),
+];
+
+/// Gives the `MS_*` flags of the bits of `attr`, as `attr_flags_to_mnt_flags` of Linux.
+fn bit_flags(attr: u64) -> u64 {
+    let flags = ATTR_BITS.iter().filter(|(a, _)| attr & u64::from(*a) != 0);
+    flags.fold(0, |all, (_, ms)| all | u64::from(*ms))
+}
+
+impl MountAttr {
+    /// Gives the change of the `attr_set`, `attr_clr` and `propagation` fields of
+    /// `struct mount_attr`, as `build_mount_kattr` of Linux. Gives `EINVAL` for an unknown flag
+    /// and for more than one propagation type.
+    ///
+    /// The atime flags are a value and not bits. Thus an atime value in `set` needs all of
+    /// `MOUNT_ATTR__ATIME` in `clear`. `MOUNT_ATTR_IDMAP` is a known flag, but it is not in the
+    /// result.
+    pub fn from_user(set: u64, clear: u64, propagation: u64) -> Result<Self> {
+        let propagation = match u32::try_from(propagation).map_err(|_| Errno::EINVAL)? {
+            0 => None,
+            MS_SHARED => Some(PropagationType::Shared),
+            MS_SLAVE => Some(PropagationType::Slave),
+            MS_PRIVATE => Some(PropagationType::Private),
+            MS_UNBINDABLE => Some(PropagationType::Unbindable),
+            _ => return Err(Errno::EINVAL),
+        };
+        let known =
+            ATTR_BITS.iter().fold(MOUNT_ATTR__ATIME | MOUNT_ATTR_IDMAP, |all, (a, _)| all | a);
+        if (set | clear) & !u64::from(known) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let atime = u64::from(MOUNT_ATTR__ATIME);
+        let mut attr = Self { clear: bit_flags(clear), set: bit_flags(set), propagation };
+        if clear & atime != 0 {
+            if clear & atime != atime {
+                return Err(Errno::EINVAL);
+            }
+            // The mount keeps `MS_STRICTATIME`, so a change of the atime value clears it too.
+            attr.clear |= u64::from(MS_RELATIME | MS_NOATIME | MS_STRICTATIME);
+            attr.set |= u64::from(match (set & atime) as u32 {
+                MOUNT_ATTR_RELATIME => MS_RELATIME,
+                MOUNT_ATTR_NOATIME => MS_NOATIME,
+                MOUNT_ATTR_STRICTATIME => MS_STRICTATIME,
+                _ => return Err(Errno::EINVAL),
+            });
+        } else if set & atime != 0 {
+            return Err(Errno::EINVAL);
+        }
+        Ok(attr)
+    }
+}
+
 /// A mounted file system.
 pub struct Mount {
     id: u64,
@@ -284,6 +363,12 @@ impl Mount {
 
     fn namespace(&self) -> Option<Arc<MountNamespace>> {
         self.ns.lock().upgrade()
+    }
+
+    /// Tells if the mount was never in a name space, as a mount that `fsmount` or `open_tree`
+    /// with `OPEN_TREE_CLONE` made and that `move_mount` did not attach yet.
+    pub fn is_detached(&self) -> bool {
+        self.mountpoint().is_none() && self.namespace().is_none()
     }
 }
 
@@ -574,12 +659,37 @@ impl MountNamespace {
         if !at.is_mount_root() || !self.contains(&at.mount) {
             return Err(Errno::EINVAL);
         }
-        let mut tree = Vec::from([at.mount.clone()]);
+        for m in &self.tree(&at.mount, recursive) {
+            m.change_propagation(ty);
+        }
+        Ok(())
+    }
+
+    /// Changes the flags and the propagation of the mount of `at`, and of each mount under it
+    /// if `recursive` is true, for `mount_setattr`. As `do_mount_setattr` of Linux, the mount
+    /// can be in the name space or be a detached mount. Gives `EINVAL` if `at` is not the root
+    /// of the mount, or if the mount is in another name space.
+    pub fn set_attr(&self, at: &Location, attr: MountAttr, recursive: bool) -> Result<()> {
+        if !at.is_mount_root() || !(self.contains(&at.mount) || at.mount.is_detached()) {
+            return Err(Errno::EINVAL);
+        }
+        for m in &self.tree(&at.mount, recursive) {
+            m.set_flags((m.flags() & !attr.clear) | attr.set);
+            if let Some(ty) = attr.propagation {
+                m.change_propagation(ty);
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives `mount`, and each mount of the name space under it if `recursive` is true.
+    fn tree(&self, mount: &Arc<Mount>, recursive: bool) -> Vec<Arc<Mount>> {
+        let mut tree = Vec::from([mount.clone()]);
         if recursive {
             for m in self.mounts() {
                 let mut up = m.mountpoint().map(|p| p.mount);
                 while let Some(u) = up {
-                    if Arc::ptr_eq(&u, &at.mount) {
+                    if Arc::ptr_eq(&u, mount) {
                         tree.push(m.clone());
                         break;
                     }
@@ -587,10 +697,7 @@ impl MountNamespace {
                 }
             }
         }
-        for m in &tree {
-            m.change_propagation(ty);
-        }
-        Ok(())
+        tree
     }
 
     /// Moves the mount of `from` to `at`, for `MS_MOVE` and `move_mount`. `from` is the root of

@@ -1,10 +1,12 @@
 //! `mount` and `umount2`, and the calls of the new mount API: `fsopen`, `fsconfig`, `fsmount`,
-//! `fspick`, `move_mount` and `open_tree`.
+//! `fspick`, `move_mount`, `open_tree` and `mount_setattr`.
 //!
 //! A file system context of the new mount API is a file. `fsconfig` keeps the options in the
 //! file, and `FSCONFIG_CMD_CREATE` makes the file system with the same constructor as `mount`.
 //! `fsmount` and `open_tree` with `OPEN_TREE_CLONE` give an `O_PATH` file of a mount that is not
-//! attached, and `move_mount` attaches it.
+//! attached, and `move_mount` attaches it. `mount_setattr` changes the flags and the propagation
+//! of a mount, and with `AT_RECURSIVE` of the mounts under it. rukernel has no user name spaces,
+//! so `MOUNT_ATTR_IDMAP` cannot make an idmapped mount.
 //!
 //! `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` change the propagation of a mount,
 //! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. The VFS keeps the flags of a mount for `/proc/self/mounts`, but it does not
@@ -22,21 +24,19 @@ use rk_abi::native::mount::{
     FSCONFIG_CMD_CREATE, FSCONFIG_CMD_CREATE_EXCL, FSCONFIG_CMD_RECONFIGURE, FSCONFIG_SET_BINARY,
     FSCONFIG_SET_FD, FSCONFIG_SET_FLAG, FSCONFIG_SET_PATH, FSCONFIG_SET_PATH_EMPTY,
     FSCONFIG_SET_STRING, FSMOUNT_CLOEXEC, FSOPEN_CLOEXEC, FSPICK_CLOEXEC, FSPICK_EMPTY_PATH,
-    FSPICK_NO_AUTOMOUNT, FSPICK_SYMLINK_NOFOLLOW, MOUNT_ATTR__ATIME, MOUNT_ATTR_NOATIME,
-    MOUNT_ATTR_NODEV, MOUNT_ATTR_NODIRATIME, MOUNT_ATTR_NOEXEC, MOUNT_ATTR_NOSUID,
-    MOUNT_ATTR_NOSYMFOLLOW, MOUNT_ATTR_RDONLY, MOUNT_ATTR_RELATIME, MOUNT_ATTR_STRICTATIME,
-    MOVE_MOUNT_BENEATH, MOVE_MOUNT_F_AUTOMOUNTS, MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_F_SYMLINKS,
-    MOVE_MOUNT_T_AUTOMOUNTS, MOVE_MOUNT_T_EMPTY_PATH, MOVE_MOUNT_T_SYMLINKS, MS_BIND, MS_DIRSYNC,
-    MS_MGC_MSK, MS_MGC_VAL, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
-    MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SLAVE,
-    MS_STRICTATIME, MS_SYNCHRONOUS, MS_UNBINDABLE, OPEN_TREE_CLONE,
+    FSPICK_NO_AUTOMOUNT, FSPICK_SYMLINK_NOFOLLOW, MOUNT_ATTR__ATIME, MOUNT_ATTR_IDMAP,
+    MOUNT_ATTR_SIZE_VER0, MOVE_MOUNT_BENEATH, MOVE_MOUNT_F_AUTOMOUNTS, MOVE_MOUNT_F_EMPTY_PATH,
+    MOVE_MOUNT_F_SYMLINKS, MOVE_MOUNT_T_AUTOMOUNTS, MOVE_MOUNT_T_EMPTY_PATH, MOVE_MOUNT_T_SYMLINKS,
+    MS_BIND, MS_DIRSYNC, MS_MGC_MSK, MS_MGC_VAL, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME,
+    MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_RELATIME, MS_REMOUNT,
+    MS_SHARED, MS_SLAVE, MS_STRICTATIME, MS_SYNCHRONOUS, MS_UNBINDABLE, OPEN_TREE_CLONE,
 };
 use rk_abi::native::open::{O_CLOEXEC, O_PATH, O_RDWR};
 use rk_frame::sync::SpinLock;
 use rk_vfs::file::{File, FileOps};
 use rk_vfs::fstype::{self, FsType};
 use rk_vfs::inode::InodeRef;
-use rk_vfs::{FsContext, Location, Mount, MountNamespace, MountSource, PropagationType};
+use rk_vfs::{FsContext, Location, Mount, MountAttr, MountNamespace, MountSource, PropagationType};
 
 /// The flags of `umount2`. They are in `<sys/mount.h>` of the C library, not in the uAPI.
 const MNT_FORCE: u64 = 1;
@@ -414,32 +414,75 @@ fn add_option(data: &mut Vec<u8>, key: &[u8], value: Option<&[u8]>) -> Result<()
     Ok(())
 }
 
-/// Gives the `MS_*` flags of the `MOUNT_ATTR_*` flags of `fsmount`.
+/// Gives the `MS_*` flags of the `MOUNT_ATTR_*` flags of `fsmount`. The flags are the same as
+/// the flags that `mount_setattr` sets, with the atime value, but without `MOUNT_ATTR_IDMAP`.
 fn attr_flags(attr: u32) -> Result<u32, Errno> {
-    let pairs = [
-        (MOUNT_ATTR_RDONLY, MS_RDONLY),
-        (MOUNT_ATTR_NOSUID, MS_NOSUID),
-        (MOUNT_ATTR_NODEV, MS_NODEV),
-        (MOUNT_ATTR_NOEXEC, MS_NOEXEC),
-        (MOUNT_ATTR_NODIRATIME, MS_NODIRATIME),
-        (MOUNT_ATTR_NOSYMFOLLOW, MS_NOSYMFOLLOW),
-    ];
-    let known = pairs.iter().fold(MOUNT_ATTR__ATIME, |all, (a, _)| all | a);
-    if attr & !known != 0 {
+    if attr & MOUNT_ATTR_IDMAP != 0 {
         return Err(Errno::EINVAL);
     }
-    let mut flags = match attr & MOUNT_ATTR__ATIME {
-        MOUNT_ATTR_RELATIME => MS_RELATIME,
-        MOUNT_ATTR_NOATIME => MS_NOATIME,
-        MOUNT_ATTR_STRICTATIME => MS_STRICTATIME,
-        _ => return Err(Errno::EINVAL),
-    };
-    for (a, ms) in pairs {
-        if attr & a != 0 {
-            flags |= ms;
+    let attr = MountAttr::from_user(u64::from(attr), u64::from(MOUNT_ATTR__ATIME), 0)?;
+    Ok(attr.set as u32)
+}
+
+/// `mount_setattr`: changes the flags and the propagation of the mount at a path, and of each
+/// mount under it with `AT_RECURSIVE`, as `do_mount_setattr` of Linux. The mount can be a
+/// detached mount of `fsmount` or `open_tree`.
+///
+/// rukernel has no user name spaces. Thus no descriptor is a user name space, and
+/// `MOUNT_ATTR_IDMAP` in `attr_set` gives `EBADF` or `EINVAL` as Linux gives for such a
+/// descriptor. `MOUNT_ATTR_IDMAP` in `attr_clr` gives `EINVAL`, because a mount that a program can
+/// use cannot lose its idmapping.
+pub(crate) fn mount_setattr(
+    cx: &Cx<'_>,
+    dfd: u64,
+    path: u64,
+    flags: u64,
+    uattr: u64,
+    size: u64,
+) -> SysResult {
+    let flags = flags as u32;
+    let known = (AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT) as u32;
+    if flags & !known != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if size > rk_proc::PAGE_SIZE as u64 {
+        return Err(Errno::E2BIG);
+    }
+    let len = u64::from(MOUNT_ATTR_SIZE_VER0);
+    if size < len {
+        return Err(Errno::EINVAL);
+    }
+    may_mount(cx)?;
+    // A newer program can give a larger structure. The bytes that rukernel does not know must
+    // be 0, as `copy_struct_from_user` of Linux checks.
+    if size > len {
+        let rest = uattr.checked_add(len).ok_or(Errno::EFAULT)?;
+        if cx.read_bytes(rest, (size - len) as usize)?.iter().any(|&b| b != 0) {
+            return Err(Errno::E2BIG);
         }
     }
-    Ok(flags)
+    let [set, clear, propagation, userns_fd]: [u64; 4] = cx.read_val(uattr)?;
+    if set == 0 && clear == 0 && propagation == 0 {
+        return Ok(0);
+    }
+    let attr = MountAttr::from_user(set, clear, propagation)?;
+    let idmap = u64::from(MOUNT_ATTR_IDMAP);
+    if clear & idmap != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if set & idmap != 0 {
+        if userns_fd > i32::MAX as u64 {
+            return Err(Errno::EINVAL);
+        }
+        // The descriptor must be open, and it is not a user name space.
+        cx.file(userns_fd)?;
+        return Err(Errno::EINVAL);
+    }
+    let fs = cx.fs()?;
+    let empty = flags & AT_EMPTY_PATH as u32 != 0;
+    let at = locate(cx, &fs, dfd, path, empty, flags & AT_SYMLINK_NOFOLLOW as u32 == 0)?;
+    fs.namespace().set_attr(&at, attr, flags & AT_RECURSIVE as u32 != 0)?;
+    Ok(0)
 }
 
 pub(crate) fn fsmount(cx: &Cx<'_>, fd: u64, flags: u64, attr: u64) -> SysResult {
