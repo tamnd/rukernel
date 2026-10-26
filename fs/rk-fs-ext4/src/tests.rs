@@ -1018,6 +1018,34 @@ mod log {
     }
 
     #[test]
+    fn a_freeze_leaves_a_clean_disk_until_the_thaw() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        let file = root.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        file.write_at(0, b"data").unwrap();
+        assert_eq!(root.freeze(false), Err(Errno::EINVAL));
+        root.freeze(true).unwrap();
+        assert_eq!(root.freeze(true), Err(Errno::EBUSY));
+        // The disk is clean: the journal is empty and a mount needs no replay.
+        let disk = ram.0.lock().clone();
+        assert_eq!(layout::u32_at(&disk, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        assert_eq!(be32(&disk, 41 * BS + jsb::START), 0);
+        // A read does not wait, and the access time stays.
+        let atime = file.metadata().atime;
+        assert_eq!(read_all(&*file), b"data");
+        file.set_atime(rk_vfs::inode::Timespec { sec: 1, nsec: 0 }).unwrap();
+        assert_eq!(file.metadata().atime, atime);
+        root.freeze(false).unwrap();
+        assert_eq!(root.freeze(false), Err(Errno::EINVAL));
+        assert_ne!(layout::u32_at(&ram.0.lock(), 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        root.create(b"after", FileType::Regular, 0o644, 0).unwrap();
+        drop((file, root, fs));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        assert!(fs.root().unwrap().lookup(b"after").is_ok());
+    }
+
+    #[test]
     fn a_checkpoint_empties_the_journal() {
         use rk_vfs::inode::checkpoint::{DISCARD, DRY_RUN, ZEROOUT};
         let (fs, _ram) = open_rw();

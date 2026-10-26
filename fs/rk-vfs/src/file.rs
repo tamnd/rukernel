@@ -336,6 +336,8 @@ impl FileOps for InodeFile {
                 inode.set_label(&b[..len])?;
                 Ok(0)
             }
+            FIFREEZE => inode.freeze(true).map(|()| 0),
+            FITHAW => inode.freeze(false).map(|()| 0),
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
             fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
@@ -364,6 +366,12 @@ const FS_IOC_GETFSLABEL: u32 = 0x8100_9431;
 /// `_IOW(0x94, 50, char[FSLABEL_MAX])`. Changes the label of a file system. The caller needs
 /// `CAP_SYS_ADMIN`.
 const FS_IOC_SETFSLABEL: u32 = 0x4100_9432;
+/// `_IOWR('X', 119, int)`. Stops the changes of a file system until `FITHAW`. The caller needs
+/// `CAP_SYS_ADMIN`.
+pub const FIFREEZE: u32 = 0xc004_5877;
+/// `_IOWR('X', 120, int)`. Starts the changes of a frozen file system again. The caller needs
+/// `CAP_SYS_ADMIN`.
+pub const FITHAW: u32 = 0xc004_5878;
 /// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 /// `_IOW('f', 2, long)`.

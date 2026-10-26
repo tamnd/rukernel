@@ -1025,6 +1025,10 @@ impl Inode for Node {
         self.fs.set_label(label)
     }
 
+    fn freeze(&self, frozen: bool) -> Result<()> {
+        if frozen { self.fs.freeze() } else { self.fs.thaw() }
+    }
+
     fn metadata(&self) -> Metadata {
         let raw = self.raw();
         let kind = kind_of(&raw);
@@ -1096,6 +1100,11 @@ impl Inode for Node {
     }
 
     fn set_atime(&self, time: Timespec) -> Result<()> {
+        // A read of a frozen file system does not wait, and the access time stays, as
+        // `touch_atime` of Linux.
+        if self.fs.is_frozen() {
+            return Ok(());
+        }
         let mut tx = self.fs.tx()?;
         let mut raw = self.raw();
         raw.set_time(0x8, 0x8c, time.sec, time.nsec);

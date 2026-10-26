@@ -302,6 +302,12 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Stops the changes of the file system of the inode until a thaw, for `FIFREEZE`, or
+    /// starts them again, for `FITHAW`. The default gives `EOPNOTSUPP`.
+    fn freeze(&self, _frozen: bool) -> Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
