@@ -641,6 +641,31 @@ fn rename_moves_files_and_directories() {
 }
 
 #[test]
+fn rename_whiteout_leaves_a_whiteout() {
+    use rk_vfs::inode::mode::S_IFCHR;
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let sub = root.lookup(b"sub").unwrap();
+    let dir = root.create(b"d", FileType::Directory, 0o755, 0).unwrap();
+    root.rename_whiteout(b"hello", &sub, b"moved", (1000, 100)).unwrap();
+    root.rename_whiteout(b"d", &sub, b"d2", (0, 0)).unwrap();
+    assert_eq!((root.metadata().nlink, sub.metadata().nlink), (4, 3));
+    assert_eq!(root.rename_whiteout(b"none", &sub, b"x", (0, 0)), Err(Errno::ENOENT));
+    drop((dir, sub, root, fs));
+
+    let fs = again(&ram);
+    let root = fs.root().unwrap();
+    let meta = root.lookup(b"hello").unwrap().metadata();
+    assert_eq!((meta.mode, meta.rdev, meta.nlink), (S_IFCHR, 0, 1));
+    assert_eq!((meta.uid, meta.gid), (1000, 100));
+    assert_eq!(root.lookup(b"d").unwrap().metadata().mode, S_IFCHR);
+    let sub = root.lookup(b"sub").unwrap();
+    assert_eq!(sub.lookup(b"moved").unwrap().metadata().size, 3000);
+    let d2 = sub.lookup(b"d2").unwrap();
+    assert!(Arc::ptr_eq(&d2.lookup(b"..").unwrap(), &sub));
+}
+
+#[test]
 fn exchange_swaps_a_file_and_a_directory() {
     let (fs, ram) = open_rw();
     let root = fs.root().unwrap();

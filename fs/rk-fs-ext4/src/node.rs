@@ -1024,6 +1024,118 @@ impl Node {
         self.touch_dir(tx)?;
         Ok(node)
     }
+
+    /// Moves `old` of this directory to `new` of `new_dir`, for `rename`. With `whiteout`, a
+    /// whiteout with this owner takes the place of `old` in the same change, as
+    /// `ext4_whiteout_for_rename` of Linux.
+    fn move_entry(
+        &self,
+        old: &[u8],
+        new_dir: &InodeRef,
+        new: &[u8],
+        whiteout: Option<(u32, u32)>,
+    ) -> Result<()> {
+        let to = self.same_fs(new_dir)?;
+        let mut tx = self.fs.tx()?;
+        if !self.is_dir() || !to.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        if new.len() > NAME_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let slot = self.fs.find_entry(&self.raw(), old)?.ok_or(Errno::ENOENT)?;
+        let node = self.fs.inode(slot.ino)?;
+        let moving_dir = node.is_dir();
+        let moves = self.ino != to.ino;
+        let victim = match self.fs.find_entry(&to.raw(), new)? {
+            Some(there) if there.ino == slot.ino => return Ok(()),
+            Some(there) => {
+                let victim = self.fs.inode(there.ino)?;
+                if victim.is_dir() {
+                    if !moving_dir {
+                        return Err(Errno::EISDIR);
+                    }
+                    if !self.fs.is_empty_dir(&victim.raw())? {
+                        return Err(Errno::ENOTEMPTY);
+                    }
+                } else if moving_dir {
+                    return Err(Errno::ENOTDIR);
+                }
+                Some(victim)
+            }
+            None if moving_dir && moves && to.dir_link_max() => return Err(Errno::EMLINK),
+            None => None,
+        };
+        let whiteout = match whiteout {
+            Some((uid, gid)) => {
+                let (ino, mut raw) = tx.new_inode(self, FileType::CharDevice, 0)?;
+                raw.set_uid(uid);
+                raw.set_gid(gid);
+                self.fs.write_inode(ino, &mut raw)?;
+                Some(self.fs.new_node(ino, raw)?)
+            }
+            None => None,
+        };
+        let moved =
+            self.place(&mut tx, (old, new), to, &node, victim.as_deref(), whiteout.as_deref());
+        // A whiteout that did not get its name has no link, and the file system frees it.
+        if let (Err(_), Some(wh)) = (&moved, &whiteout)
+            && self.fs.find_entry(&self.raw(), old).ok().flatten().is_some_and(|e| e.ino != wh.ino)
+        {
+            let mut raw = wh.raw();
+            raw.set_links(0);
+            tx.save(wh, &mut raw)?;
+        }
+        moved
+    }
+
+    /// The changes of `move_entry` after its checks: `node` goes from `old` of this directory to
+    /// `new` of `to`, in the place of `victim`. `whiteout` takes the place of `old` if it is
+    /// given.
+    fn place(
+        &self,
+        tx: &mut Tx<'_>,
+        (old, new): (&[u8], &[u8]),
+        to: &Node,
+        node: &Node,
+        victim: Option<&Node>,
+        whiteout: Option<&Node>,
+    ) -> Result<()> {
+        let moving_dir = node.is_dir();
+        let moves = self.ino != to.ino;
+        if let Some(victim) = victim {
+            tx.remove_entry(to, new)?;
+            if victim.is_dir() {
+                let mut raw = victim.raw();
+                raw.set_links(0);
+                touch(&mut raw, false);
+                tx.save(victim, &mut raw)?;
+                to.add_links(tx, -1)?;
+            } else {
+                victim.add_links(tx, -1)?;
+            }
+        }
+        tx.add_entry(to, new, node.ino, node.kind())?;
+        match whiteout {
+            Some(wh) => tx.set_entry(self, old, wh.ino, FileType::CharDevice)?,
+            None => {
+                tx.remove_entry(self, old)?;
+            }
+        }
+        if moving_dir && moves {
+            tx.set_parent(node, to.ino)?;
+            self.add_links(tx, -1)?;
+            to.add_links(tx, 1)?;
+        }
+        let mut raw = node.raw();
+        touch(&mut raw, false);
+        tx.save(node, &mut raw)?;
+        self.touch_dir(tx)?;
+        if moves {
+            to.touch_dir(tx)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Node {
@@ -1490,61 +1602,17 @@ impl Inode for Node {
     }
 
     fn rename(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
-        let to = self.same_fs(new_dir)?;
-        let mut tx = self.fs.tx()?;
-        if !self.is_dir() || !to.is_dir() {
-            return Err(Errno::ENOTDIR);
-        }
-        if new.len() > NAME_MAX {
-            return Err(Errno::ENAMETOOLONG);
-        }
-        let slot = self.fs.find_entry(&self.raw(), old)?.ok_or(Errno::ENOENT)?;
-        let node = self.fs.inode(slot.ino)?;
-        let moving_dir = node.is_dir();
-        let moves = self.ino != to.ino;
-        if let Some(there) = self.fs.find_entry(&to.raw(), new)? {
-            if there.ino == slot.ino {
-                return Ok(());
-            }
-            let victim = self.fs.inode(there.ino)?;
-            if victim.is_dir() {
-                if !moving_dir {
-                    return Err(Errno::EISDIR);
-                }
-                if !self.fs.is_empty_dir(&victim.raw())? {
-                    return Err(Errno::ENOTEMPTY);
-                }
-            } else if moving_dir {
-                return Err(Errno::ENOTDIR);
-            }
-            tx.remove_entry(to, new)?;
-            if victim.is_dir() {
-                let mut raw = victim.raw();
-                raw.set_links(0);
-                touch(&mut raw, false);
-                tx.save(&victim, &mut raw)?;
-                to.add_links(&mut tx, -1)?;
-            } else {
-                victim.add_links(&mut tx, -1)?;
-            }
-        } else if moving_dir && moves && to.dir_link_max() {
-            return Err(Errno::EMLINK);
-        }
-        tx.add_entry(to, new, node.ino, node.kind())?;
-        tx.remove_entry(self, old)?;
-        if moving_dir && moves {
-            tx.set_parent(&node, to.ino)?;
-            self.add_links(&mut tx, -1)?;
-            to.add_links(&mut tx, 1)?;
-        }
-        let mut raw = node.raw();
-        touch(&mut raw, false);
-        tx.save(&node, &mut raw)?;
-        self.touch_dir(&mut tx)?;
-        if moves {
-            to.touch_dir(&mut tx)?;
-        }
-        Ok(())
+        self.move_entry(old, new_dir, new, None)
+    }
+
+    fn rename_whiteout(
+        &self,
+        old: &[u8],
+        new_dir: &InodeRef,
+        new: &[u8],
+        owner: (u32, u32),
+    ) -> Result<()> {
+        self.move_entry(old, new_dir, new, Some(owner))
     }
 
     fn exchange(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
