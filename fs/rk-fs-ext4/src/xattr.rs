@@ -106,16 +106,20 @@ pub(crate) fn acl_to_disk(value: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Changes the value of an ACL from the format on the disk to the format of the system calls,
-/// as `ext4_acl_from_disk`. A damaged value gives `EIO`.
+/// as `ext4_acl_from_disk` and `ext4_get_acl`. An ACL with no entries gives `ENODATA`, as a file
+/// without an ACL. A damaged value gives `EINVAL`.
 pub(crate) fn acl_from_disk(disk: &[u8]) -> Result<Vec<u8>> {
     if disk.len() < 4 || u32_at(disk, 0) != ACL_VERSION {
-        return Err(Errno::EIO);
+        return Err(Errno::EINVAL);
+    }
+    if disk.len() == 4 {
+        return Err(Errno::ENODATA);
     }
     let mut entries = Vec::new();
     let mut at = 4;
     while at < disk.len() {
         if at + 4 > disk.len() {
-            return Err(Errno::EIO);
+            return Err(Errno::EINVAL);
         }
         let (tag, perm) = (u16_at(disk, at), u16_at(disk, at + 2));
         let id = match tag {
@@ -127,7 +131,7 @@ pub(crate) fn acl_from_disk(disk: &[u8]) -> Result<Vec<u8>> {
                 at += 4;
                 UNDEFINED_ID
             }
-            _ => return Err(Errno::EIO),
+            _ => return Err(Errno::EINVAL),
         };
         entries.push(Entry { tag, perm, id });
     }

@@ -616,6 +616,11 @@ impl Inode for Node {
         self.fs.read_only.load(Ordering::Acquire)
     }
 
+    /// tmpfs has POSIX ACLs, as Linux with `CONFIG_TMPFS_POSIX_ACL`.
+    fn posix_acl(&self) -> bool {
+        true
+    }
+
     fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
         self.xattrs.lock().get(name)
     }

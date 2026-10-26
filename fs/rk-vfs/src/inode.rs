@@ -349,6 +349,13 @@ pub trait Inode: Any + Send + Sync {
         false
     }
 
+    /// Tells if the file system of the inode has POSIX ACLs, as `IS_POSIXACL` of Linux. If it
+    /// does not, the VFS does not read or write the ACLs of the inode, and the umask applies to
+    /// each new file. The default is false.
+    fn posix_acl(&self) -> bool {
+        false
+    }
+
     /// Makes the changes of the inode durable, for `fsync`. A file system that keeps all its
     /// changes in one journal can make all of them durable. The default does nothing.
     fn sync(&self) -> Result<()> {
