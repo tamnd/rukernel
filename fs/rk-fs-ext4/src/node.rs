@@ -954,10 +954,32 @@ impl Node {
         Ok(())
     }
 
-    /// Adds `delta` to the links of this inode, and sets its change time.
+    /// Tells if this directory cannot get one more subdirectory, as `EXT4_DIR_LINK_MAX`. With
+    /// `dir_nlink`, an indexed directory has no limit.
+    fn dir_link_max(&self) -> bool {
+        let raw = self.raw();
+        raw.links() >= LINK_MAX
+            && !(self.fs.sb.ro_compat & layout::ro_compat::DIR_NLINK != 0 && self.fs.is_dx(&raw))
+    }
+
+    /// Adds `delta` to the links of this inode, and sets its change time. A link count of 1 for
+    /// a directory tells that the count of its subdirectories is too large for 16 bits. An
+    /// indexed directory gets this count when it goes past [`LINK_MAX`], and it then keeps it,
+    /// as `ext4_inc_count` and `ext4_dec_count`.
     fn add_links(&self, tx: &mut Tx<'_>, delta: i32) -> Result<()> {
         let mut raw = self.raw();
-        raw.set_links(raw.links().saturating_add_signed(delta as i16));
+        let links = raw.links();
+        let links = if !self.is_dir() {
+            links.saturating_add_signed(delta as i16)
+        } else if delta > 0 {
+            let links = links.saturating_add(1);
+            if self.fs.is_dx(&raw) && (links > LINK_MAX || links == 2) { 1 } else { links }
+        } else if links > 2 {
+            links - 1
+        } else {
+            links
+        };
+        raw.set_links(links);
         touch(&mut raw, false);
         tx.save(self, &mut raw)
     }
@@ -1262,7 +1284,7 @@ impl Inode for Node {
     fn create(&self, name: &[u8], kind: FileType, perm: u32, rdev: u64) -> Result<InodeRef> {
         let mut tx = self.fs.tx()?;
         self.check_new(name)?;
-        if self.raw().links() >= LINK_MAX && kind == FileType::Directory {
+        if kind == FileType::Directory && self.dir_link_max() {
             return Err(Errno::EMLINK);
         }
         let (ino, mut raw) = tx.new_inode(self, kind, perm)?;
@@ -1437,7 +1459,7 @@ impl Inode for Node {
             } else {
                 victim.add_links(&mut tx, -1)?;
             }
-        } else if moving_dir && moves && to.raw().links() >= LINK_MAX {
+        } else if moving_dir && moves && to.dir_link_max() {
             return Err(Errno::EMLINK);
         }
         tx.add_entry(to, new, node.ino, node.kind())?;
@@ -1475,7 +1497,7 @@ impl Inode for Node {
         // parent loses one.
         let links = if moves && first.is_dir() != second.is_dir() {
             let (gains, loses) = if first.is_dir() { (to, self) } else { (self, to) };
-            if gains.raw().links() >= LINK_MAX {
+            if gains.dir_link_max() {
                 return Err(Errno::EMLINK);
             }
             Some((gains, loses))
