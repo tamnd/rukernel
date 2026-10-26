@@ -309,6 +309,8 @@ impl Inode for Node {
             atime: timestamp(raw, 32, bigtime),
             mtime: timestamp(raw, 40, bigtime),
             ctime: timestamp(raw, 48, bigtime),
+            // Only a version 3 inode keeps the creation time.
+            btime: (raw[4] >= 3).then(|| timestamp(raw, 144, bigtime)),
         }
     }
 

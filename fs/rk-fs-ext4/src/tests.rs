@@ -962,6 +962,19 @@ mod log {
     }
 
     #[test]
+    fn a_new_inode_has_a_creation_time() {
+        let (fs, ram) = open_rw();
+        let root = fs.root().unwrap();
+        let file = root.create(b"born", FileType::Regular, 0o644, 0).unwrap();
+        let meta = file.metadata();
+        assert_eq!(meta.btime, Some(meta.ctime));
+        drop((file, root, fs));
+        let fs = again(&ram);
+        let meta = fs.root().unwrap().lookup(b"born").unwrap().metadata();
+        assert_eq!(meta.btime, Some(meta.ctime));
+    }
+
+    #[test]
     fn a_checkpoint_empties_the_journal() {
         use rk_vfs::inode::checkpoint::{DISCARD, DRY_RUN, ZEROOUT};
         let (fs, _ram) = open_rw();
