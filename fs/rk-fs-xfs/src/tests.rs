@@ -261,6 +261,16 @@ fn reads_a_directory_block() {
 }
 
 #[test]
+fn the_file_system_stays_read_only() {
+    let fs = mount(image()).unwrap();
+    let root = fs.root().unwrap();
+    assert!(root.is_read_only());
+    assert_eq!(root.set_read_only(true), Ok(()));
+    assert_eq!(root.set_read_only(false), Err(Errno::EROFS));
+    assert!(root.lookup(b"big").unwrap().is_read_only());
+}
+
+#[test]
 fn reads_links_and_devices() {
     let fs = mount(image()).unwrap();
     let root = fs.root().unwrap();

@@ -181,12 +181,20 @@ pub struct File {
     pos: SpinLock<u64>,
     /// The file took an OFD lock or a `flock` lock, so its drop must release them.
     locked: AtomicBool,
+    /// The file is a regular file that can write, and the mount counts it as a writer, as
+    /// `FMODE_WRITER` of Linux.
+    writer: bool,
 }
 
 impl Drop for File {
     fn drop(&mut self) {
         if self.locked.load(Ordering::Relaxed) {
             crate::lock::close_file(self);
+        }
+        if self.writer
+            && let Some(location) = &self.location
+        {
+            location.mount.remove_writer();
         }
     }
 }
@@ -265,6 +273,7 @@ impl FileOps for InodeFile {
             FS_IOC_SETFLAGS | FS_IOC32_SETFLAGS => {
                 let mut b = [0u8; 4];
                 mem.read(arg, &mut b)?;
+                file.want_write()?;
                 inode.set_attr_flags(u32::from_ne_bytes(b))?;
                 Ok(0)
             }
@@ -315,6 +324,7 @@ impl FileOps for InodeFile {
             EXT4_IOC_RESIZE_FS => {
                 let mut b = [0u8; 8];
                 mem.read(arg, &mut b)?;
+                file.want_write()?;
                 inode.resize(u64::from_ne_bytes(b))?;
                 Ok(0)
             }
@@ -346,13 +356,17 @@ impl FileOps for InodeFile {
                 let mut b = [0u8; FSLABEL_MAX];
                 mem.read(arg, &mut b)?;
                 let len = b.iter().position(|&c| c == 0).unwrap_or(FSLABEL_MAX);
+                file.want_write()?;
                 inode.set_label(&b[..len])?;
                 Ok(0)
             }
             FIFREEZE => inode.freeze(true).map(|()| 0),
             FITHAW => inode.freeze(false).map(|()| 0),
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
-            fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
+            fsx::FS_IOC_FSSETXATTR => {
+                file.want_write()?;
+                fsx::set(&**inode, arg, mem)
+            }
             _ => Err(Errno::ENOTTY),
         }
     }
@@ -836,6 +850,16 @@ impl File {
         // The flags of the call only, as Linux keeps them. `O_CLOEXEC` is a flag of the
         // descriptor.
         let keep = !(o::O_CREAT | o::O_EXCL | o::O_NOCTTY | o::O_TRUNC | o::O_CLOEXEC);
+        // A device file and a pipe do not change the file system, as `special_file` of Linux.
+        let writer = OpenFlags(flags).writable()
+            && inode.as_ref().is_some_and(|i| i.metadata().file_type() == Some(FileType::Regular));
+        let writer = match &location {
+            Some(location) if writer => {
+                location.mount.add_writer();
+                true
+            }
+            _ => false,
+        };
         Arc::new(Self {
             ops,
             location,
@@ -843,7 +867,21 @@ impl File {
             flags: AtomicU32::new(flags & keep),
             pos: SpinLock::new(0),
             locked: AtomicBool::new(false),
+            writer,
         })
+    }
+
+    /// Checks that a change of the file can start, as `mnt_want_write_file` of Linux. A file
+    /// that the mount counts as a writer can always change. A file without a mount can change.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EROFS` if the mount of the file or its file system is read only.
+    pub fn want_write(&self) -> Result<()> {
+        match &self.location {
+            Some(location) if !self.writer => location.mount.want_write(),
+            _ => Ok(()),
+        }
     }
 
     /// The access mode and the status flags.
@@ -1166,8 +1204,8 @@ impl File {
     }
 
     /// Updates the access time after a read, with the rules of `atime_needs_update` of Linux.
-    /// A noatime mount, a nodiratime mount for a directory, a read-only mount and `O_NOATIME`
-    /// keep the time. A relatime mount, the default, updates the time only if it is not after
+    /// A noatime mount, a nodiratime mount for a directory, a read only mount, a read only file
+    /// system and `O_NOATIME` keep the time. A relatime mount, the default, updates the time only if it is not after
     /// the modification time or the change time, or if it is one day old. An error is ignored,
     /// as Linux does.
     fn accessed(&self) {
@@ -1180,7 +1218,8 @@ impl File {
         }
         let flags = location.mount.flags() as u32;
         let meta = inode.metadata();
-        if flags & (mount::MS_NOATIME | mount::MS_RDONLY) != 0
+        if flags & mount::MS_NOATIME != 0
+            || location.mount.is_read_only()
             || (meta.is_dir() && flags & mount::MS_NODIRATIME != 0)
         {
             return;

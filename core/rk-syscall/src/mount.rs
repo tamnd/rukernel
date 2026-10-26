@@ -9,9 +9,17 @@
 //! so `MOUNT_ATTR_IDMAP` cannot make an idmapped mount.
 //!
 //! `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` change the propagation of a mount,
-//! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. The VFS keeps the flags of a mount for `/proc/self/mounts`, but it does not
-//! enforce `MS_RDONLY`, `MS_NOEXEC` and the other flags yet. A remount without `MS_BIND` makes
-//! the file system read only or writable, if the file system supports it.
+//! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. The VFS keeps
+//! the flags of a mount for `/proc/self/mounts`.
+//!
+//! The VFS enforces `MS_RDONLY` of a mount, as `mnt_want_write` of Linux. A change of a name, of
+//! the data or of the attributes of a file on a read only mount gives `EROFS`. A remount with
+//! `MS_BIND` and `MS_RDONLY`, and `mount_setattr` with `MOUNT_ATTR_RDONLY`, make only the mount
+//! read only. A remount without `MS_BIND` also makes the file system read only or writable, if
+//! the file system supports it. A mount or a file system with a file that is open for a write
+//! cannot become read only, and the remount gives `EBUSY`. `execve` enforces `MS_NOSUID`, and
+//! the reads enforce the atime flags. The VFS does not enforce `MS_NOEXEC`, `MS_NODEV` and
+//! `MS_NOSYMFOLLOW` yet.
 
 use crate::cx::{Cx, PATH_MAX, SysResult};
 use alloc::sync::Arc;
@@ -101,7 +109,7 @@ pub(crate) fn mount(
             remount_super(&at.mount, at.inode(), flags & MS_RDONLY != 0)?;
         }
         let old = at.mount.flags() as u32;
-        at.mount.set_flags(u64::from(atime_flags(flags, Some(old)) & KEPT));
+        at.mount.set_flags(u64::from(atime_flags(flags, Some(old)) & KEPT))?;
         return Ok(0);
     }
     if flags & MS_BIND != 0 {
@@ -143,8 +151,12 @@ pub(crate) fn mount(
 }
 
 /// Makes the file system of `mount`, with the root `root`, read only or writable again, for a
-/// remount, as `reconfigure_super` of Linux.
+/// remount, as `reconfigure_super` of Linux. Gives `EBUSY` if the file system becomes read only
+/// and a file of one of its mounts is open for a write.
 fn remount_super(mount: &Mount, root: &InodeRef, read_only: bool) -> Result<(), Errno> {
+    if read_only && !root.is_read_only() && rk_vfs::dentry::fs_has_writers(root) {
+        return Err(Errno::EBUSY);
+    }
     root.set_read_only(read_only)?;
     fstype::set_read_only(mount.source().fstype, root.fs_id(), read_only);
     Ok(())
@@ -382,7 +394,7 @@ pub(crate) fn fsconfig(
             let read_only = ctx.config.lock().read_only;
             remount_super(mount, mount.root().inode(), read_only)?;
             let flags = mount.source().flags & !u64::from(MS_RDONLY);
-            mount.set_flags(flags | if read_only { u64::from(MS_RDONLY) } else { 0 });
+            mount.set_flags(flags | if read_only { u64::from(MS_RDONLY) } else { 0 })?;
         }
         _ => {
             let ty = ctx.ty.ok_or(Errno::EBUSY)?;

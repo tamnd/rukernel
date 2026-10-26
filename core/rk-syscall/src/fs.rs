@@ -1036,12 +1036,16 @@ fn set_attr_at(
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let at = fs.resolve(&start, &path, follow)?;
+    // The mount must be writable before the other checks, as `chmod_common`, `chown_common` and
+    // `vfs_utimes` of Linux.
+    at.mount.want_write()?;
     change_attr(cx, at.inode(), attr, change)
 }
 
 fn set_attr_fd(cx: &Cx<'_>, fd: u64, attr: &SetAttr, change: Change) -> SysResult {
     let file = cx.file(fd)?;
     let inode = file.inode().ok_or(Errno::EBADF)?;
+    file.want_write()?;
     change_attr(cx, inode, attr, change)
 }
 
@@ -1114,6 +1118,8 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     if at.inode().metadata().is_dir() {
         return Err(Errno::EISDIR);
     }
+    // The checks of `vfs_truncate` of Linux, in its order.
+    at.mount.want_write()?;
     fs.permission(&at, rk_vfs::cred::may::WRITE)?;
     fsize_check(cx, &at.inode().metadata(), size)?;
     let mode = fs.cred().write_kill(&at.inode().metadata());
