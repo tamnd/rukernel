@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- `copy_file_range` checks the types of the files before their modes, as `generic_file_rw_checks` of Linux. A copy to a device or a fifo that is open with `O_APPEND` now gives `EINVAL`, not `EBADF`. generic/434 passes.
+
 ## [0.3.14] - 2026-10-26
 
 ### Added
