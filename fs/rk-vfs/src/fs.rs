@@ -214,6 +214,7 @@ impl FsContext {
                     at
                 }
                 Err(e) if e == Errno::ENOENT && !parent.is_dot() => {
+                    parent.dir.mount.want_write()?;
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
                     let dir = parent.dir.inode();
@@ -268,6 +269,7 @@ impl FsContext {
             return Err(Errno::EINVAL);
         }
         let dir = self.resolve(start, path, true)?;
+        dir.mount.want_write()?;
         self.check_dir(&dir)?;
         self.may_change(&dir)?;
         check_immutable(&**dir.inode())?;
@@ -341,13 +343,17 @@ impl FsContext {
         if write && kind == FileType::Regular && at.inode().is_read_only() {
             return Err(Errno::EROFS);
         }
+        // A truncate needs a writable mount before the other checks, as `do_open` of Linux.
+        let trunc = flags & o::O_TRUNC != 0;
+        if trunc && kind == FileType::Regular {
+            at.mount.want_write()?;
+        }
         // The checks of the inode flags of `may_open` of Linux.
         if matches!(kind, FileType::Regular | FileType::Directory) {
             let iflags = at.inode().attr_flags().unwrap_or(0);
             if write && iflags & iflags::IMMUTABLE != 0 {
                 return Err(Errno::EPERM);
             }
-            let trunc = flags & o::O_TRUNC != 0;
             if iflags & iflags::APPEND != 0 && ((write && flags & o::O_APPEND == 0) || trunc) {
                 return Err(Errno::EPERM);
             }
@@ -357,6 +363,11 @@ impl FsContext {
         }
         if !created {
             self.cred.inode_permission(&**at.inode(), open_mask(flags))?;
+        }
+        // A write of a regular file needs a writable mount, as `mnt_get_write_access` in
+        // `do_dentry_open` of Linux.
+        if kind == FileType::Regular && write {
+            at.mount.want_write()?;
         }
         if flags & o::O_NOATIME != 0 && !self.cred.owns(&meta) {
             return Err(Errno::EPERM);
@@ -420,6 +431,8 @@ impl FsContext {
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
         }
+        // As `filename_create` of Linux, a name that exists gives `EEXIST` before `EROFS`.
+        parent.dir.mount.want_write()?;
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         let dir = parent.dir.inode();
@@ -483,6 +496,7 @@ impl FsContext {
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
         }
+        parent.dir.mount.want_write()?;
         if !Arc::ptr_eq(&parent.dir.mount, &old.mount) {
             return Err(Errno::EXDEV);
         }
@@ -505,6 +519,8 @@ impl FsContext {
             b"." | b".." => return Err(Errno::EISDIR),
             _ => {}
         }
+        // `do_rmdir` and `do_unlinkat` of Linux check the mount before the lookup.
+        parent.dir.mount.want_write()?;
         if parent.trailing_slash && !dir {
             // Linux examines the type for the error: a file with a slash is `ENOTDIR`.
             let at = self.child(&parent)?;
@@ -565,10 +581,12 @@ impl FsContext {
         if old.is_dot() || new.is_dot() {
             return Err(Errno::EBUSY);
         }
-        let from = self.child(&old)?;
+        // `do_renameat2` of Linux checks the mounts before the lookup.
         if !Arc::ptr_eq(&old.dir.mount, &new.dir.mount) {
             return Err(Errno::EXDEV);
         }
+        old.dir.mount.want_write()?;
+        let from = self.child(&old)?;
         let from_dir = is_type(from.inode(), FileType::Directory);
         if exchange {
             return self.exchange(&old, &new, &from);

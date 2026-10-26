@@ -21,17 +21,27 @@ const NAMESPACES: [&[u8]; 3] = [b"user.", b"trusted.", b"security."];
 /// The file of an attribute call. A file descriptor of a pipe or a socket has no inode.
 type Target = Option<InodeRef>;
 
-/// Finds the inode of the path at `path`.
-fn path_target(cx: &Cx<'_>, path: u64, follow: bool) -> Result<Target, Errno> {
+/// Finds the inode of the path at `path`. For a `change`, the mount must be writable, as
+/// `mnt_want_write` in `path_setxattr` and `path_removexattr` of Linux.
+fn path_target(cx: &Cx<'_>, path: u64, follow: bool, change: bool) -> Result<Target, Errno> {
     let path = cx.read_path(path)?;
     let fs = cx.fs()?;
     let start = fs.cwd().clone();
-    Ok(Some(fs.resolve(&start, &path, follow)?.inode().clone()))
+    let at = fs.resolve(&start, &path, follow)?;
+    if change {
+        at.mount.want_write()?;
+    }
+    Ok(Some(at.inode().clone()))
 }
 
-/// Finds the inode of the open file `fd`.
-fn fd_target(cx: &Cx<'_>, fd: u64) -> Result<Target, Errno> {
-    Ok(cx.file(fd)?.inode().cloned())
+/// Finds the inode of the open file `fd`. For a `change`, the mount must be writable, as
+/// `mnt_want_write_file` of Linux.
+fn fd_target(cx: &Cx<'_>, fd: u64, change: bool) -> Result<Target, Errno> {
+    let file = cx.file(fd)?;
+    if change {
+        file.want_write()?;
+    }
+    Ok(file.inode().cloned())
 }
 
 /// Reads the name of an attribute. An empty name or a name that is too long gives `ERANGE`, and
@@ -154,7 +164,7 @@ pub(crate) fn path_setxattr(
     follow: bool,
 ) -> SysResult {
     let name = set_args(cx, name, size, flags)?;
-    set(cx, path_target(cx, path, follow)?, name, value, size, flags)
+    set(cx, path_target(cx, path, follow, true)?, name, value, size, flags)
 }
 
 pub(crate) fn fsetxattr(
@@ -166,7 +176,7 @@ pub(crate) fn fsetxattr(
     flags: u64,
 ) -> SysResult {
     let name = set_args(cx, name, size, flags)?;
-    set(cx, fd_target(cx, fd)?, name, value, size, flags)
+    set(cx, fd_target(cx, fd, true)?, name, value, size, flags)
 }
 
 pub(crate) fn path_getxattr(
@@ -177,12 +187,12 @@ pub(crate) fn path_getxattr(
     size: u64,
     follow: bool,
 ) -> SysResult {
-    let target = path_target(cx, path, follow)?;
+    let target = path_target(cx, path, follow, false)?;
     get(cx, target, read_name(cx, name)?, value, size)
 }
 
 pub(crate) fn fgetxattr(cx: &Cx<'_>, fd: u64, name: u64, value: u64, size: u64) -> SysResult {
-    let target = fd_target(cx, fd)?;
+    let target = fd_target(cx, fd, false)?;
     get(cx, target, read_name(cx, name)?, value, size)
 }
 
@@ -193,19 +203,19 @@ pub(crate) fn path_listxattr(
     size: u64,
     follow: bool,
 ) -> SysResult {
-    list(cx, path_target(cx, path, follow)?, list_addr, size)
+    list(cx, path_target(cx, path, follow, false)?, list_addr, size)
 }
 
 pub(crate) fn flistxattr(cx: &Cx<'_>, fd: u64, list_addr: u64, size: u64) -> SysResult {
-    list(cx, fd_target(cx, fd)?, list_addr, size)
+    list(cx, fd_target(cx, fd, false)?, list_addr, size)
 }
 
 pub(crate) fn path_removexattr(cx: &Cx<'_>, path: u64, name: u64, follow: bool) -> SysResult {
-    let target = path_target(cx, path, follow)?;
+    let target = path_target(cx, path, follow, true)?;
     remove(cx, target, read_name(cx, name)?)
 }
 
 pub(crate) fn fremovexattr(cx: &Cx<'_>, fd: u64, name: u64) -> SysResult {
-    let target = fd_target(cx, fd)?;
+    let target = fd_target(cx, fd, true)?;
     remove(cx, target, read_name(cx, name)?)
 }

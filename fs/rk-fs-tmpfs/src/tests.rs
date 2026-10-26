@@ -688,3 +688,149 @@ fn the_pages_of_a_mapped_file_see_each_change() {
     drop((mapped, pages));
     assert_eq!(f.write_at(0, b"q"), Ok(1));
 }
+
+/// Makes a tmpfs at `/a` with the file `f`, the directory `d` and the link `l`, and gives the
+/// root of the mount.
+fn mount_at_a(fs: &FsContext, root: &Location) -> Location {
+    let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
+    fs.mkdir(root, b"/a", 0o755).unwrap();
+    fs.mount(new(0o755), root, b"/a", tmp).unwrap();
+    write_file(fs, root, b"/a/f", b"data");
+    fs.mkdir(root, b"/a/d", 0o755).unwrap();
+    fs.symlink(b"f", root, b"/a/l").unwrap();
+    fs.resolve(root, b"/a", true).unwrap()
+}
+
+/// Checks that each change of a name or of the data under `dir` gives `EROFS`, and that the
+/// checks that come first in Linux still give their errors.
+fn check_read_only(fs: &FsContext, root: &Location, dir: &[u8]) {
+    let path = |name: &str| [dir, name.as_bytes()].concat();
+    let rofs = Some(Errno::EROFS);
+    assert_eq!(fs.open(root, &path("/f"), o::O_WRONLY, 0).err(), rofs);
+    assert_eq!(fs.open(root, &path("/f"), o::O_RDONLY | o::O_TRUNC, 0).err(), rofs);
+    assert_eq!(fs.open(root, &path("/n"), o::O_RDWR | o::O_CREAT, 0o644).err(), rofs);
+    assert_eq!(fs.open(root, &path("/d"), o::O_RDWR | o::O_TMPFILE, 0o644).err(), rofs);
+    assert_eq!(fs.mkdir(root, &path("/x"), 0o755).err(), rofs);
+    assert_eq!(fs.mknod(root, &path("/x"), mode::S_IFIFO | 0o644, 0).err(), rofs);
+    assert_eq!(fs.symlink(b"f", root, &path("/x")).err(), rofs);
+    let f = fs.resolve(root, &path("/f"), true).unwrap();
+    assert_eq!(fs.link(&f, root, &path("/x")).err(), rofs);
+    assert_eq!(fs.remove(root, &path("/f"), false).err(), rofs);
+    assert_eq!(fs.remove(root, &path("/missing"), false).err(), rofs);
+    assert_eq!(fs.remove(root, &path("/d"), true).err(), rofs);
+    assert_eq!(fs.rename(root, &path("/f"), root, &path("/x"), 0).err(), rofs);
+    // A name that exists gives `EEXIST` before `EROFS`, as `filename_create` of Linux.
+    assert_eq!(fs.mkdir(root, &path("/d"), 0o755).err(), Some(Errno::EEXIST));
+    assert_eq!(fs.symlink(b"f", root, &path("/l")).err(), Some(Errno::EEXIST));
+    let excl = o::O_RDWR | o::O_CREAT | o::O_EXCL;
+    assert_eq!(fs.open(root, &path("/f"), excl, 0o644).err(), Some(Errno::EEXIST));
+    // A read and an open of an existing file without a write still work.
+    assert_eq!(read_file(fs, root, &path("/f")).as_deref(), Ok(&b"data"[..]));
+    assert!(fs.open(root, &path("/f"), o::O_RDONLY | o::O_CREAT, 0o644).is_ok());
+    assert_eq!(names(fs, root, dir).len(), 5);
+}
+
+#[test]
+fn a_read_only_mount_refuses_each_change() {
+    use rk_abi::native::mount::MS_RDONLY;
+    let (fs, root) = setup();
+    let a = mount_at_a(&fs, &root);
+    let ro = MountAttr { set: u64::from(MS_RDONLY), ..MountAttr::default() };
+    fs.namespace().set_attr(&a, ro, false).unwrap();
+    assert!(a.mount.is_read_only());
+    assert_eq!(a.mount.want_write(), Err(Errno::EROFS));
+    check_read_only(&fs, &root, b"/a");
+    // The file system stays writable, and the mount above is not read only.
+    assert!(!a.inode().is_read_only());
+    write_file(&fs, &root, b"/b", b"b");
+    a.mount.set_flags(0).unwrap();
+    write_file(&fs, &root, b"/a/f", b"new");
+    fs.remove(&root, b"/a/f", false).unwrap();
+}
+
+#[test]
+fn a_read_only_bind_mount_does_not_change_its_source() {
+    use rk_abi::native::mount::MS_RDONLY;
+    let (fs, root) = setup();
+    mount_at_a(&fs, &root);
+    fs.mkdir(&root, b"/m", 0o755).unwrap();
+    let a = fs.resolve(&root, b"/a", true).unwrap();
+    let m = fs.resolve(&root, b"/m", true).unwrap();
+    let bind = fs.namespace().bind(&a, &m).unwrap();
+    bind.set_flags(u64::from(MS_RDONLY)).unwrap();
+    check_read_only(&fs, &root, b"/m");
+    write_file(&fs, &root, b"/a/f", b"new");
+    assert_eq!(read_file(&fs, &root, b"/m/f").as_deref(), Ok(&b"new"[..]));
+    // A file that is open for a write through the source does not stop the bind mount.
+    let _w = fs.open(&root, b"/a/f", o::O_WRONLY, 0).unwrap();
+    bind.set_flags(0).unwrap();
+    bind.set_flags(u64::from(MS_RDONLY)).unwrap();
+}
+
+#[test]
+fn a_mount_with_a_file_open_for_a_write_does_not_become_read_only() {
+    use rk_abi::native::mount::MS_RDONLY;
+    let (fs, root) = setup();
+    let a = mount_at_a(&fs, &root);
+    let ro = u64::from(MS_RDONLY);
+    let w = fs.open(&root, b"/a/f", o::O_RDWR, 0).unwrap();
+    assert!(a.mount.has_writers());
+    assert!(rk_vfs::dentry::fs_has_writers(a.inode()));
+    assert_eq!(a.mount.set_flags(ro), Err(Errno::EBUSY));
+    let attr = MountAttr { set: ro, ..MountAttr::default() };
+    assert_eq!(fs.namespace().set_attr(&root, attr, true), Err(Errno::EBUSY));
+    assert_eq!(root.mount.flags(), 0);
+    // A file for a read, a directory and an `O_PATH` file are not writers.
+    let _r = fs.open(&root, b"/a/f", o::O_RDONLY, 0).unwrap();
+    let _p = fs.open(&root, b"/a/f", o::O_PATH | o::O_RDWR, 0).unwrap();
+    let _d = fs.open(&root, b"/a/d", o::O_RDONLY | o::O_DIRECTORY, 0).unwrap();
+    drop(w);
+    assert!(!a.mount.has_writers());
+    assert!(!rk_vfs::dentry::fs_has_writers(a.inode()));
+    a.mount.set_flags(ro).unwrap();
+    // A read only mount stays read only without writers.
+    a.mount.set_flags(ro).unwrap();
+}
+
+#[test]
+fn a_read_only_tmpfs_refuses_each_change() {
+    let (fs, root) = setup();
+    let a = mount_at_a(&fs, &root);
+    let f = fs.resolve(&root, b"/a/f", true).unwrap().inode().clone();
+    let atime = f.metadata().atime;
+    a.inode().set_read_only(true).unwrap();
+    assert!(f.is_read_only());
+    assert!(a.mount.is_read_only());
+    check_read_only(&fs, &root, b"/a");
+    let rofs = Err(Errno::EROFS);
+    assert_eq!(f.write_at(0, b"x"), rofs.map(|()| 0));
+    assert_eq!(f.set_attr(&SetAttr { mode: Some(0o600), ..SetAttr::default() }), rofs);
+    assert_eq!(f.set_attr_flags(0), rofs);
+    assert_eq!(f.fallocate(0, 0, 8), rofs);
+    assert_eq!(f.set_xattr(b"user.a", b"v", 0), rofs);
+    assert_eq!(f.remove_xattr(b"user.a"), rofs);
+    let d = a.inode();
+    assert_eq!(d.create(b"n", FileType::Regular, 0o644, 0).err(), rofs.err());
+    assert_eq!(d.tmpfile(0o644).err(), rofs.err());
+    assert_eq!(d.unlink(b"f"), rofs);
+    assert_eq!(d.rmdir(b"d"), rofs);
+    assert_eq!(d.rename(b"f", d, b"g"), rofs);
+    assert_eq!(d.exchange(b"f", d, b"d"), rofs);
+    f.set_atime(Timespec { sec: atime.sec + 100, nsec: 0 }).unwrap();
+    assert_eq!(f.metadata().atime, atime);
+    // A remount for writes makes the file system writable again.
+    a.inode().set_read_only(false).unwrap();
+    assert!(!a.mount.is_read_only());
+    write_file(&fs, &root, b"/a/f", b"new");
+    fs.remove(&root, b"/a/f", false).unwrap();
+}
+
+#[test]
+fn a_read_only_mount_of_tmpfs_is_read_only() {
+    let args = MountArgs { data: b"", dev: None, read_only: true, lookup: None };
+    let root = mount(&args).unwrap();
+    assert!(root.is_read_only());
+    assert_eq!(root.create(b"n", FileType::Regular, 0o644, 0).err(), Some(Errno::EROFS));
+    root.set_read_only(false).unwrap();
+    assert!(root.create(b"n", FileType::Regular, 0o644, 0).is_ok());
+}

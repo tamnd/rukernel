@@ -13,7 +13,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::{fileid, mode};
@@ -33,6 +33,9 @@ struct Fs {
     /// The nodes in use, by inode number, for `open_by_handle_at`. A node leaves the map when
     /// it goes away.
     nodes: SpinLock<BTreeMap<u64, Weak<Node>>>,
+    /// The file system is read only, after a mount with `MS_RDONLY` or a read only remount. A
+    /// change gives `EROFS`.
+    read_only: AtomicBool,
 }
 
 /// The attributes of a node.
@@ -76,13 +79,16 @@ pub const FS_TYPE: rk_vfs::fstype::FsType =
     rk_vfs::fstype::FsType { name: "tmpfs", nodev: true, make: mount };
 
 /// Makes a new tmpfs for `mount(2)`. The option `mode=` gives the permission bits of the root in
-/// octal. The default is 1777, as Linux gives.
+/// octal. The default is 1777, as Linux gives. A mount with `MS_RDONLY` makes an empty file
+/// system that is read only, as Linux.
 pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let perm = match rk_vfs::fstype::option(args.data, b"mode") {
         Some(v) => parse_octal(v).ok_or(Errno::EINVAL)?,
         None => 0o1777,
     };
-    Ok(new(perm))
+    let root = new(perm);
+    root.set_read_only(args.read_only)?;
+    Ok(root)
 }
 
 /// The file system type for `mount -t devtmpfs`.
@@ -97,8 +103,9 @@ fn mount_devtmpfs(_args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let root = ROOT.call_once(|| new(0o755)).clone();
     for d in rk_vfs::device::devices() {
         let kind = if d.block { FileType::BlockDevice } else { FileType::CharDevice };
+        // A read only remount of devtmpfs stops the new device files.
         match root.create(d.name.as_bytes(), kind, d.perm, d.rdev) {
-            Ok(_) | Err(Errno::EEXIST) => {}
+            Ok(_) | Err(Errno::EEXIST | Errno::EROFS) => {}
             Err(e) => return Err(e),
         }
     }
@@ -118,6 +125,7 @@ pub fn new(perm: u32) -> InodeRef {
         dev: rk_vfs::anon_dev(),
         next_ino: AtomicU64::new(1),
         nodes: SpinLock::new(BTreeMap::new()),
+        read_only: AtomicBool::new(false),
     });
     let root = Node::new(&fs, mode::S_IFDIR | (perm & mode::PERM_MASK), 0, Weak::new());
     root.attrs.lock().nlink = 2;
@@ -156,6 +164,11 @@ impl Node {
         });
         fs.nodes.lock().insert(ino, Arc::downgrade(&node));
         node
+    }
+
+    /// Gives `EROFS` if the file system is read only.
+    fn check_rw(&self) -> Result<()> {
+        if self.fs.read_only.load(Ordering::Acquire) { Err(Errno::EROFS) } else { Ok(()) }
     }
 
     fn is_dir(&self) -> bool {
@@ -273,6 +286,7 @@ impl Inode for Node {
     }
 
     fn set_attr(&self, attr: &SetAttr) -> Result<()> {
+        self.check_rw()?;
         if let Some(size) = attr.size {
             if size > MAX_FILE_SIZE {
                 return Err(Errno::EFBIG);
@@ -305,7 +319,10 @@ impl Inode for Node {
     }
 
     fn set_atime(&self, time: Timespec) -> Result<()> {
-        self.attrs.lock().atime = time;
+        // A read only file system keeps the access times, as `atime_needs_update` of Linux.
+        if !self.fs.read_only.load(Ordering::Acquire) {
+            self.attrs.lock().atime = time;
+        }
         Ok(())
     }
 
@@ -323,6 +340,7 @@ impl Inode for Node {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        self.check_rw()?;
         let end = offset.checked_add(buf.len() as u64).ok_or(Errno::EFBIG)?;
         if end > MAX_FILE_SIZE {
             return Err(Errno::EFBIG);
@@ -349,6 +367,7 @@ impl Inode for Node {
     }
 
     fn set_attr_flags(&self, flags: u32) -> Result<()> {
+        self.check_rw()?;
         use rk_vfs::inode::iflags::{APPEND, IMMUTABLE, NOATIME, NODUMP};
         // tmpfs keeps only these flags, as `SHMEM_FL_USER_MODIFIABLE` of Linux.
         if flags & !(IMMUTABLE | APPEND | NODUMP | NOATIME) != 0 {
@@ -361,6 +380,7 @@ impl Inode for Node {
     }
 
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
+        self.check_rw()?;
         use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
         let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
         if end > MAX_FILE_SIZE {
@@ -396,6 +416,7 @@ impl Inode for Node {
     }
 
     fn create(&self, name: &[u8], kind: FileType, perm: u32, rdev: u64) -> Result<InodeRef> {
+        self.check_rw()?;
         if kind == FileType::Symlink {
             return Err(Errno::EINVAL);
         }
@@ -407,6 +428,7 @@ impl Inode for Node {
     }
 
     fn tmpfile(&self, perm: u32) -> Result<InodeRef> {
+        self.check_rw()?;
         if !self.is_dir() {
             return Err(Errno::ENOTDIR);
         }
@@ -416,6 +438,7 @@ impl Inode for Node {
     }
 
     fn symlink(&self, name: &[u8], target: &[u8]) -> Result<InodeRef> {
+        self.check_rw()?;
         let child = Node::new(&self.fs, mode::S_IFLNK | 0o777, 0, Weak::new());
         *child.data.lock() = Data::Symlink(target.to_vec());
         self.insert(name, child.clone())?;
@@ -423,6 +446,7 @@ impl Inode for Node {
     }
 
     fn link(&self, name: &[u8], inode: &InodeRef) -> Result<()> {
+        self.check_rw()?;
         let node = self.same_fs(inode)?;
         if node.is_dir() {
             return Err(Errno::EPERM);
@@ -433,6 +457,7 @@ impl Inode for Node {
     }
 
     fn unlink(&self, name: &[u8]) -> Result<()> {
+        self.check_rw()?;
         let node = self.get(name)?;
         if node.is_dir() {
             return Err(Errno::EISDIR);
@@ -444,6 +469,7 @@ impl Inode for Node {
     }
 
     fn rmdir(&self, name: &[u8]) -> Result<()> {
+        self.check_rw()?;
         let node = self.get(name)?;
         if !node.is_dir() {
             return Err(Errno::ENOTDIR);
@@ -459,6 +485,7 @@ impl Inode for Node {
     }
 
     fn rename(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
+        self.check_rw()?;
         let target_dir = self.same_fs(new_dir)?;
         let node = self.get(old)?;
         let moving_dir = node.is_dir();
@@ -487,6 +514,7 @@ impl Inode for Node {
     }
 
     fn exchange(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
+        self.check_rw()?;
         let target_dir = self.same_fs(new_dir)?;
         let this = self.this.upgrade().ok_or(Errno::ENOENT)?;
         let first = self.get(old)?;
@@ -546,11 +574,23 @@ impl Inode for Node {
         self.fs.dev
     }
 
+    /// Makes the file system read only or writable again, for a remount, as `shmem_reconfigure`
+    /// of Linux. The data stays in memory, so there is nothing to write back.
+    fn set_read_only(&self, read_only: bool) -> Result<()> {
+        self.fs.read_only.store(read_only, Ordering::Release);
+        Ok(())
+    }
+
+    fn is_read_only(&self) -> bool {
+        self.fs.read_only.load(Ordering::Acquire)
+    }
+
     fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
         self.xattrs.lock().get(name)
     }
 
     fn set_xattr(&self, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
+        self.check_rw()?;
         self.xattrs.lock().set(name, value, flags)?;
         self.attrs.lock().ctime = now();
         Ok(())
@@ -561,6 +601,7 @@ impl Inode for Node {
     }
 
     fn remove_xattr(&self, name: &[u8]) -> Result<()> {
+        self.check_rw()?;
         self.xattrs.lock().remove(name)?;
         self.attrs.lock().ctime = now();
         Ok(())

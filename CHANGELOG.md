@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The VFS enforces the read only flag of each mount, as `mnt_want_write` of Linux. A create, a link, a remove, a rename, an open for a write, a truncate, a change of the attributes, of the extended attributes or of the inode flags on a read only mount gives `EROFS`. A read only bind mount does not change its source. A remount to read only gives `EBUSY` when a file on the mount is open for a write. tmpfs supports a `ro` mount and a remount to read only and back, as `shmem_reconfigure` of Linux. xfs stays read only.
+
 ## [0.3.21] - 2026-10-27
 
 ### Added

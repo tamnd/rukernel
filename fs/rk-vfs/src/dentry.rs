@@ -13,7 +13,7 @@ use crate::inode::{InodeRef, Result};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::mount::{
     MOUNT_ATTR__ATIME, MOUNT_ATTR_IDMAP, MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV,
@@ -295,6 +295,9 @@ pub struct Mount {
     propagation: SpinLock<Propagation>,
     /// The name space of the mount. It is empty for a mount that is not attached.
     ns: SpinLock<Weak<MountNamespace>>,
+    /// The number of the open files of the mount that can write, as `mnt_writers` of Linux. A
+    /// mount with writers cannot become read only.
+    writers: AtomicUsize,
 }
 
 impl core::fmt::Debug for Mount {
@@ -312,6 +315,7 @@ impl Mount {
             source: SpinLock::new(source),
             propagation: SpinLock::new(Propagation::default()),
             ns: SpinLock::new(Weak::new()),
+            writers: AtomicUsize::new(0),
         })
     }
 
@@ -340,9 +344,59 @@ impl Mount {
         self.source.lock().flags
     }
 
-    /// Sets the flags, for `MS_REMOUNT`.
-    pub fn set_flags(&self, flags: u64) {
-        self.source.lock().flags = flags;
+    /// Sets the flags, for `MS_REMOUNT` and `mount_setattr`. A mount becomes read only only if
+    /// it has no open file that can write, as `mnt_make_readonly` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EBUSY` if `flags` has `MS_RDONLY`, the mount is writable and a file of the mount
+    /// is open for a write.
+    pub fn set_flags(&self, flags: u64) -> Result<()> {
+        let mut source = self.source.lock();
+        if !self.can_set_flags(source.flags, flags) {
+            return Err(Errno::EBUSY);
+        }
+        source.flags = flags;
+        Ok(())
+    }
+
+    /// Tells if the flags can change from `old` to `new`.
+    fn can_set_flags(&self, old: u64, new: u64) -> bool {
+        let ro = u64::from(MS_RDONLY);
+        old & ro != 0 || new & ro == 0 || !self.has_writers()
+    }
+
+    /// Tells if the mount is read only, as `__mnt_is_readonly` of Linux. The mount has
+    /// `MS_RDONLY`, or its file system is read only.
+    pub fn is_read_only(&self) -> bool {
+        self.flags() & u64::from(MS_RDONLY) != 0 || self.root.inode().is_read_only()
+    }
+
+    /// Checks that a change of the files of the mount can start, as `mnt_want_write` of Linux.
+    /// The VFS calls it before each change of a name, of the data or of the attributes of a
+    /// file. A file that is open for a write does not call it again, because the mount cannot
+    /// become read only while the file is open.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EROFS` if the mount or its file system is read only.
+    pub fn want_write(&self) -> Result<()> {
+        if self.is_read_only() { Err(Errno::EROFS) } else { Ok(()) }
+    }
+
+    /// Tells if a file of the mount is open for a write.
+    pub fn has_writers(&self) -> bool {
+        self.writers.load(Ordering::Acquire) != 0
+    }
+
+    /// Counts a new open file of the mount that can write.
+    pub(crate) fn add_writer(&self) {
+        self.writers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Stops the count of an open file of the mount that can write, after its close.
+    pub(crate) fn remove_writer(&self) {
+        self.writers.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// The propagation of the mount.
@@ -409,6 +463,14 @@ static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
 fn new_group() -> u64 {
     NEXT_GROUP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Tells if a mount of the file system of `root` has a file that is open for a write. A
+/// remount that makes the file system read only gives `EBUSY` then, as
+/// `sb_prepare_remount_readonly` of Linux.
+pub fn fs_has_writers(root: &InodeRef) -> bool {
+    let id = root.fs_id();
+    attached().iter().any(|m| m.has_writers() && m.root.inode().fs_id() == id)
 }
 
 /// The mounts that are in a name space.
@@ -698,13 +760,21 @@ impl MountNamespace {
     /// Changes the flags and the propagation of the mount of `at`, and of each mount under it
     /// if `recursive` is true, for `mount_setattr`. As `do_mount_setattr` of Linux, the mount
     /// can be in the name space or be a detached mount. Gives `EINVAL` if `at` is not the root
-    /// of the mount, or if the mount is in another name space.
+    /// of the mount, or if the mount is in another name space. Gives `EBUSY` if a mount that
+    /// becomes read only has a file that is open for a write.
     pub fn set_attr(&self, at: &Location, attr: MountAttr, recursive: bool) -> Result<()> {
         if !at.is_mount_root() || !(self.contains(&at.mount) || at.mount.is_detached()) {
             return Err(Errno::EINVAL);
         }
-        for m in &self.tree(&at.mount, recursive) {
-            m.set_flags((m.flags() & !attr.clear) | attr.set);
+        let tree = self.tree(&at.mount, recursive);
+        // No mount changes if one of them cannot become read only, as Linux.
+        for m in &tree {
+            if !m.can_set_flags(m.flags(), (m.flags() & !attr.clear) | attr.set) {
+                return Err(Errno::EBUSY);
+            }
+        }
+        for m in &tree {
+            m.set_flags((m.flags() & !attr.clear) | attr.set)?;
             if let Some(ty) = attr.propagation {
                 m.change_propagation(ty);
             }

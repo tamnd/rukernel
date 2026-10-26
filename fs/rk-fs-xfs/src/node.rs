@@ -362,6 +362,15 @@ impl Inode for Node {
         Err(Errno::EROFS)
     }
 
+    /// The driver only reads, so the file system cannot become writable.
+    fn set_read_only(&self, read_only: bool) -> Result<()> {
+        if read_only { Ok(()) } else { Err(Errno::EROFS) }
+    }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
     fn read_link(&self) -> Result<Vec<u8>> {
         if self.kind() != FileType::Symlink {
             return Err(Errno::EINVAL);
