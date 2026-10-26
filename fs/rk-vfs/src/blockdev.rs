@@ -61,6 +61,70 @@ struct Entry {
     mounts: u32,
     /// Tells if a file has the device open with `O_EXCL`.
     exclusive: bool,
+    /// The count of open files and mounts of the device, as `disk_openers` of Linux.
+    opens: u32,
+    /// The driver calls of the device, if the driver has them.
+    ops: Option<Arc<dyn BlockOps>>,
+}
+
+/// The calls of a block driver at an open, at the last close and for its own `ioctl` commands,
+/// as `block_device_operations` of Linux. A mount is an open too.
+pub trait BlockOps: Send + Sync {
+    /// Accepts or refuses a new open of the device.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the driver.
+    fn open(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Tells the driver that the last open file or mount of the device closed.
+    fn release(&self) {}
+
+    /// Does an `ioctl` command that the block layer does not know. `file` is the open device.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOTTY` for an unknown command, or the error of the command.
+    fn ioctl(&self, _file: &File, _cmd: u32, _arg: usize, _mem: &dyn UserMemory) -> Result<usize> {
+        Err(Errno::ENOTTY)
+    }
+}
+
+/// One open file or mount of a block device. The count of opens goes down when the value drops,
+/// and the driver gets `release` at the last close.
+struct Opener {
+    rdev: u64,
+}
+
+impl Opener {
+    /// Asks the driver of `rdev` for a new open, and counts it.
+    fn new(rdev: u64) -> Result<Self> {
+        let ops = BLOCK_DEVICES.lock().get(&rdev).ok_or(Errno::ENXIO)?.ops.clone();
+        if let Some(ops) = ops {
+            ops.open()?;
+        }
+        BLOCK_DEVICES.lock().get_mut(&rdev).ok_or(Errno::ENXIO)?.opens += 1;
+        Ok(Self { rdev })
+    }
+}
+
+impl Drop for Opener {
+    fn drop(&mut self) {
+        let ops = {
+            let mut devices = BLOCK_DEVICES.lock();
+            let Some(e) = devices.get_mut(&self.rdev) else { return };
+            e.opens = e.opens.saturating_sub(1);
+            if e.opens > 0 {
+                return;
+            }
+            e.ops.clone()
+        };
+        if let Some(ops) = ops {
+            ops.release();
+        }
+    }
 }
 
 /// The holder of an exclusive claim of a block device, as the holder of `bdev_open` of Linux.
@@ -114,16 +178,66 @@ static BLOCK_DEVICES: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::n
 /// Adds the block device `rdev` with the name `name`, for example `vda`, and puts it in the list
 /// of devices.
 pub fn register_block(rdev: u64, name: &str, device: Arc<dyn BlockDevice>) {
+    insert_block(rdev, name, device, None);
+    crate::device::add_device(block_info(rdev, name));
+}
+
+/// Adds the block device `rdev` as `register_block` does, with the driver calls `ops`. The driver
+/// can add the device after the boot: the hook of `device::set_node_hook` makes its device file.
+pub fn register_block_ops(
+    rdev: u64,
+    name: &str,
+    device: Arc<dyn BlockDevice>,
+    ops: Arc<dyn BlockOps>,
+) {
+    insert_block(rdev, name, device, Some(ops));
+    crate::device::add_device_node(block_info(rdev, name));
+}
+
+fn insert_block(
+    rdev: u64,
+    name: &str,
+    device: Arc<dyn BlockDevice>,
+    ops: Option<Arc<dyn BlockOps>>,
+) {
     let cache = Arc::new(PageCache::new(Arc::new(Queue::new(device))));
-    let entry = Entry { name: String::from(name), cache, mounts: 0, exclusive: false };
+    let entry =
+        Entry { name: String::from(name), cache, mounts: 0, exclusive: false, opens: 0, ops };
     BLOCK_DEVICES.lock().insert(rdev, entry);
-    crate::device::add_device(crate::device::DeviceInfo {
+}
+
+fn block_info(rdev: u64, name: &str) -> crate::device::DeviceInfo {
+    crate::device::DeviceInfo {
         name: String::from(name),
         class: "block",
         rdev,
         block: true,
         perm: 0o660,
-    });
+    }
+}
+
+/// Removes the block device `rdev` and its device file, as `del_gendisk` of Linux.
+///
+/// # Errors
+///
+/// Gives `ENXIO` if no driver has the number, and `EBUSY` if a file or a mount has the device
+/// open.
+pub fn unregister_block(rdev: u64) -> Result<()> {
+    {
+        let mut devices = BLOCK_DEVICES.lock();
+        let e = devices.get(&rdev).ok_or(Errno::ENXIO)?;
+        if e.opens > 0 || e.mounts > 0 || e.exclusive {
+            return Err(Errno::EBUSY);
+        }
+        devices.remove(&rdev);
+    }
+    crate::device::remove_device(true, rdev);
+    Ok(())
+}
+
+/// Gives the count of open files and mounts of the block device `rdev`.
+pub fn block_openers(rdev: u64) -> u32 {
+    BLOCK_DEVICES.lock().get(&rdev).map_or(0, |e| e.opens)
 }
 
 /// Gives the size of the block device `rdev` in sectors of 512 bytes.
@@ -147,6 +261,7 @@ pub struct MountedDisk {
     /// The page cache of the device.
     pub cache: Arc<DiskCache>,
     _claim: Claim,
+    _opener: Opener,
 }
 
 /// Claims the block device `rdev` for a mount, and gives its page cache.
@@ -157,7 +272,8 @@ pub struct MountedDisk {
 /// `O_EXCL`.
 pub fn mount_block(rdev: u64) -> Result<MountedDisk> {
     let cache = block_cache(rdev).ok_or(Errno::ENXIO)?;
-    Ok(MountedDisk { cache, _claim: claim_block(rdev, Holder::Mount)? })
+    let opener = Opener::new(rdev)?;
+    Ok(MountedDisk { cache, _claim: claim_block(rdev, Holder::Mount)?, _opener: opener })
 }
 
 /// Writes the dirty pages of each block device to the disk, and makes them durable, for `sync`.
@@ -195,17 +311,23 @@ pub fn block_devices() -> Vec<(String, u64)> {
 /// or open with `O_EXCL`, as Linux.
 pub fn open_block(rdev: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
     let cache = block_cache(rdev).ok_or(Errno::ENXIO)?;
+    let ops = BLOCK_DEVICES.lock().get(&rdev).and_then(|e| e.ops.clone());
+    let opener = Opener::new(rdev)?;
     let claim = if flags & O_EXCL != 0 { Some(claim_block(rdev, Holder::File)?) } else { None };
     let queue = cache.store().clone();
-    Ok(Arc::new(BlockFile { queue, cache, _claim: claim }))
+    Ok(Arc::new(BlockFile { queue, cache, ops, _claim: claim, _opener: Some(opener) }))
 }
 
 /// The operations of an open block device.
 struct BlockFile {
     queue: Arc<Queue>,
     cache: Arc<DiskCache>,
+    /// The driver calls of the device.
+    ops: Option<Arc<dyn BlockOps>>,
     /// The claim of a file with `O_EXCL`.
     _claim: Option<Claim>,
+    /// The count of this open. It drops after the claim.
+    _opener: Option<Opener>,
 }
 
 /// Tells if `file` goes to the queue without the cache.
@@ -385,7 +507,7 @@ impl FileOps for BlockFile {
         self.cache.sync()
     }
 
-    fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+    fn ioctl(&self, file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
         match cmd {
             ioctl::BLKGETSIZE64 => Self::put(mem, arg, &self.size().to_ne_bytes()),
             ioctl::BLKGETSIZE => Self::put(mem, arg, &self.queue.sectors().to_ne_bytes()),
@@ -415,7 +537,7 @@ impl FileOps for BlockFile {
                 self.cache.drop_clean();
                 Ok(0)
             }
-            _ => Err(Errno::ENOTTY),
+            _ => self.ops.as_ref().map_or(Err(Errno::ENOTTY), |ops| ops.ioctl(file, cmd, arg, mem)),
         }
     }
 }
@@ -453,7 +575,9 @@ mod tests {
             BlockFile {
                 queue: queue.clone(),
                 cache: Arc::new(PageCache::new(queue)),
+                ops: None,
                 _claim: None,
+                _opener: None,
             },
         )
     }
@@ -473,6 +597,40 @@ mod tests {
         drop(file);
         assert!(claim_block(rdev, Holder::Mount).is_ok());
         assert_eq!(claim_block(1, Holder::Mount).err(), Some(Errno::ENXIO));
+    }
+
+    /// Counts the calls of the driver.
+    struct Counter(SpinLock<(u32, u32)>);
+
+    impl BlockOps for Counter {
+        fn open(&self) -> Result<()> {
+            self.0.lock().0 += 1;
+            Ok(())
+        }
+
+        fn release(&self) {
+            self.0.lock().1 += 1;
+        }
+    }
+
+    #[test]
+    fn the_driver_gets_release_at_the_last_close_only() {
+        let rdev = 0xfe_0f01;
+        let ops = Arc::new(Counter(SpinLock::new((0, 0))));
+        let ram = Arc::new(Ram(SpinLock::new(vec![0u8; SECTOR_SIZE])));
+        register_block_ops(rdev, "opstest", ram, ops.clone());
+        let one = open_block(rdev, 0).unwrap();
+        let mount = mount_block(rdev).unwrap();
+        assert_eq!(block_openers(rdev), 2);
+        assert_eq!(unregister_block(rdev), Err(Errno::EBUSY));
+        drop(one);
+        assert_eq!(*ops.0.lock(), (2, 0));
+        drop(mount);
+        assert_eq!(*ops.0.lock(), (2, 1));
+        assert_eq!(block_openers(rdev), 0);
+        assert_eq!(unregister_block(rdev), Ok(()));
+        assert!(block_cache(rdev).is_none());
+        assert_eq!(unregister_block(rdev), Err(Errno::ENXIO));
     }
 
     #[test]

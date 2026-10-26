@@ -6,6 +6,7 @@
 //!
 //! - `/sys/devices/virtual/CLASS/NAME` is the directory of a device. It has the files `dev` and
 //!   `uevent`, and the link `subsystem`. A block device also has `size`, `ro` and `removable`.
+//!   A loop device with a file also has the directory `loop`, which `losetup` reads.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
 //!
@@ -24,7 +25,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::Once;
-use rk_vfs::blockdev::block_sectors;
+use rk_vfs::blockdev::{block_queue, block_sectors};
 use rk_vfs::device::{DeviceInfo, devices, major, minor};
 use rk_vfs::fstype::{FsType, MountArgs};
 use rk_vfs::inode::mode;
@@ -104,8 +105,12 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     out.push((String::from("dev"), Kind::File(format!("{}\n", numbers(d)).into_bytes())));
     if d.block {
         let size = block_sectors(d.rdev).unwrap_or(0);
+        let ro = block_queue(d.rdev).is_some_and(|q| q.read_only());
+        if rk_vfs::loopdev::sysfs_files(d.rdev).is_some() {
+            out.push((String::from("loop"), Kind::Dir));
+        }
         out.push((String::from("removable"), Kind::File(b"0\n".to_vec())));
-        out.push((String::from("ro"), Kind::File(b"0\n".to_vec())));
+        out.push((String::from("ro"), Kind::File(format!("{}\n", u8::from(ro)).into_bytes())));
         out.push((String::from("size"), Kind::File(format!("{size}\n").into_bytes())));
     }
     let subsystem = format!("../../../../class/{}", d.class);
@@ -148,6 +153,14 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
         }
         ["devices", "virtual", class, name] => {
             device_entries(list.iter().find(|d| d.class == class && d.name == name)?)
+        }
+        ["devices", "virtual", class, name, "loop"] => {
+            let d = list.iter().find(|d| d.class == class && d.name == name && d.block)?;
+            let files = rk_vfs::loopdev::sysfs_files(d.rdev)?;
+            files
+                .into_iter()
+                .map(|(n, text)| (String::from(n), Kind::File(text.into_bytes())))
+                .collect()
         }
         [top] if TOP.contains(&top) => Vec::new(),
         _ => return None,
@@ -354,6 +367,13 @@ mod tests {
             get("devices/virtual/mem/null/subsystem"),
             Kind::Link(b"../../../../class/mem".to_vec())
         );
+    }
+
+    #[test]
+    fn only_a_loop_device_with_a_file_has_the_loop_directory() {
+        assert!(!names("devices/virtual/block/vda").contains(&String::from("loop")));
+        assert_eq!(entries("devices/virtual/block/vda/loop", &list()), None);
+        assert_eq!(get("devices/virtual/block/vda/ro"), Kind::File(b"0\n".to_vec()));
     }
 
     #[test]

@@ -304,4 +304,8 @@ pub fn init() {
     rk_vfs::wait::set_interrupt_check(|| {
         rk_proc::current_thread().is_some_and(|t| t.signal_pending())
     });
+    rk_vfs::loopdev::set_file_lookup(|fd| {
+        let files = rk_proc::current_thread().and_then(|t| t.process().files());
+        files.ok_or(Errno::EBADF)?.lock().file(fd)
+    });
 }

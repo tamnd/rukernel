@@ -49,12 +49,12 @@ pub(crate) fn context() -> Option<&'static FsContext> {
 
 /// Puts the character devices in the list of devices, and makes `/dev` and a device file for
 /// each device in the list, if the initramfs did not make them. devtmpfs and sysfs show the same
-/// list. Linux does not mount devtmpfs on an initramfs, so the kernel makes the files here.
+/// list. Linux does not mount devtmpfs on an initramfs, so the kernel makes the files here. A
+/// device that a driver adds or removes later, as a loop device, gets or loses its file then.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn make_dev(fs: &FsContext) {
     use alloc::string::String;
-    use rk_vfs::device::{DeviceInfo, add_device, devices};
-    use rk_vfs::inode::mode::{S_IFBLK, S_IFCHR};
+    use rk_vfs::device::{DeviceInfo, add_device, devices, register_major};
 
     let tty = [
         ("console", 0o600, rk_drv_tty::CONSOLE_RDEV),
@@ -75,19 +75,43 @@ pub(crate) fn make_dev(fs: &FsContext) {
         block: false,
         perm: 0o644,
     });
+    // The names of `/proc/devices`, as Linux gives them.
+    register_major(false, rk_drv_mem::MEM_MAJOR, "mem");
+    register_major(false, 4, "ttyS");
+    register_major(false, 5, "/dev/tty");
+    register_major(false, 5, "/dev/console");
+    register_major(true, rk_drv_virtio::VIRTBLK_MAJOR, "virtblk");
     let root = fs.root().clone();
     let _ = fs.mkdir(&root, b"/dev", 0o755);
     for d in devices() {
-        let path = alloc::format!("/dev/{}", d.name);
-        let mode = if d.block { S_IFBLK } else { S_IFCHR } | d.perm;
-        // mknod applies the umask, but devtmpfs of Linux does not, so the mode is set again.
-        let attr = rk_vfs::inode::SetAttr { mode: Some(d.perm), ..Default::default() };
-        match fs
-            .mknod(&root, path.as_bytes(), mode, d.rdev)
-            .and_then(|at| at.inode().set_attr(&attr))
-        {
-            Ok(()) | Err(rk_abi::Errno::EEXIST) => {}
-            Err(e) => println!("rootfs: cannot make {path}, error {}", e.get()),
+        make_node(fs, &d);
+    }
+    rk_vfs::device::set_node_hook(|d, change| {
+        let Some(fs) = context() else { return };
+        match change {
+            rk_vfs::device::NodeChange::Add => make_node(fs, d),
+            rk_vfs::device::NodeChange::Remove => {
+                let path = alloc::format!("/dev/{}", d.name);
+                let _ = fs.remove(fs.root(), path.as_bytes(), false);
+            }
         }
+    });
+}
+
+/// Makes the device file of `d` in `/dev`.
+#[cfg(target_arch = "x86_64")]
+fn make_node(fs: &FsContext, d: &rk_vfs::device::DeviceInfo) {
+    use rk_vfs::inode::mode::{S_IFBLK, S_IFCHR};
+
+    let path = alloc::format!("/dev/{}", d.name);
+    let mode = if d.block { S_IFBLK } else { S_IFCHR } | d.perm;
+    // mknod applies the umask, but devtmpfs of Linux does not, so the mode is set again.
+    let attr = rk_vfs::inode::SetAttr { mode: Some(d.perm), ..Default::default() };
+    match fs
+        .mknod(fs.root(), path.as_bytes(), mode, d.rdev)
+        .and_then(|at| at.inode().set_attr(&attr))
+    {
+        Ok(()) | Err(rk_abi::Errno::EEXIST) => {}
+        Err(e) => println!("rootfs: cannot make {path}, error {}", e.get()),
     }
 }
