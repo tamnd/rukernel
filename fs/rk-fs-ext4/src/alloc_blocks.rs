@@ -71,8 +71,9 @@ impl Tx<'_> {
             }
             put16(d, gd::CHECKSUM, crc);
         }
-        let per_block = fs.sb.descs_per_block();
-        let at = fs.sb.desc_block(u64::from(group) / per_block) * fs.sb.block_size
+        let layout = fs.layout();
+        let per_block = layout.descs_per_block();
+        let at = layout.desc_block(u64::from(group) / per_block) * layout.block_size
             + (u64::from(group) % per_block) * size as u64;
         fs.write(at, &self.meta.descs[group as usize])
     }
@@ -454,7 +455,7 @@ impl crate::Fs {
         if flags & bg::BLOCK_UNINIT == 0 {
             return self.read_block(desc.block_bitmap);
         }
-        let sb = &self.sb;
+        let sb = &self.layout();
         let mut bitmap = vec![0u8; sb.block_size as usize];
         let start = sb.group_start(group);
         // The group 0 can start before the superblock, with `bigalloc` and blocks of 1 KiB.

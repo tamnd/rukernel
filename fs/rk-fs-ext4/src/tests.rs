@@ -1532,6 +1532,116 @@ fn an_online_resize_adds_a_group() {
     assert!(last.metadata().ino > 32);
 }
 
+/// The test image with groups of 64 blocks and `sparse_super`, so that a few MiB have more than
+/// one descriptor block. With `resize_inode`, the block 3 is a reserved descriptor block, the block bitmap moves
+/// to the block 50 and the block 51 is the doubly indirect block of the resize inode.
+fn small_groups(resize_inode: bool) -> Vec<u8> {
+    let mut img = Image(image());
+    let sb = 1024;
+    img.put32(sb + 0x20, 64);
+    img.put32(sb + 0x64, layout::ro_compat::SPARSE_SUPER);
+    if resize_inode {
+        img.0.copy_within(3 * BS..4 * BS, 50 * BS);
+        img.0[3 * BS..4 * BS].fill(0);
+        img.0[50 * BS + 49 / 8] |= 1 << (49 % 8);
+        img.0[50 * BS + 50 / 8] |= 1 << (50 % 8);
+        img.put32(2 * BS, 50);
+        let free = layout::u32_at(&img.0, sb + 0xc) - 2;
+        img.put32(sb + 0xc, free);
+        img.put16(2 * BS + 0xc, free as u16);
+        img.put32(sb + 0x5c, layout::compat::RESIZE_INODE);
+        img.put16(sb + 0xce, 1);
+        let resize = img.inode(7, 0o100600, 0, 1, 0);
+        img.put32(resize + 0x1c, 4);
+        img.put32(resize + 0x28 + 13 * 4, 51);
+        img.put32(51 * BS + 4, 3);
+    }
+    img.0
+}
+
+/// Checks that each group has as many free blocks as its bitmap and that the superblock has
+/// their sum, as fsck does.
+fn check_free(fs: &Fs, ram: &Ram) {
+    let mut sum = 0;
+    for group in 0..fs.group_count() {
+        let bitmap = fs.read_block(fs.group(group).unwrap().block_bitmap).unwrap();
+        let free = (0..fs.clusters_in_group(group) as usize)
+            .filter(|&bit| !crate::alloc_blocks::test_bit(&bitmap, bit))
+            .count() as u32;
+        let desc = layout::u16_at(&fs.meta.lock().descs[group as usize], layout::gd::FREE_BLOCKS);
+        assert_eq!(u32::from(desc), free, "group {group}");
+        sum += free;
+    }
+    assert_eq!(ram.free().0, sum);
+}
+
+#[test]
+fn an_online_resize_without_reserved_blocks_changes_to_meta_bg() {
+    let ram = Ram(Arc::new(SpinLock::new(small_groups(false))));
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let count = 1 + 40 * 64;
+    ram.0.lock().resize(count * BS, 0);
+    fs.resize(count as u64).unwrap();
+    drop(fs);
+    let fs = again(&ram);
+    assert_eq!(fs.group_count(), 40);
+    assert_ne!(ram.u32_at(1024 + 0x60) & layout::incompat::META_BG, 0);
+    assert_eq!(ram.u32_at(1024 + 0x104), 1);
+    // The descriptor block of the meta block group 1 is the first block of the group 32. The
+    // group 33 has a copy of it.
+    assert_eq!(ram.u32_at(2049 * BS + 32), 2114);
+    assert_eq!(fs.group(32).unwrap().block_bitmap, 2050);
+    assert_eq!(fs.group(33).unwrap().block_bitmap, 2114);
+    let disk = ram.0.lock();
+    assert_eq!(disk[2049 * BS..2050 * BS], disk[2113 * BS..2114 * BS]);
+    drop(disk);
+    check_free(&fs, &ram);
+}
+
+#[test]
+fn an_online_resize_uses_the_reserved_blocks_and_then_changes_to_meta_bg() {
+    let ram = Ram(Arc::new(SpinLock::new(small_groups(true))));
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    check_free(&fs, &ram);
+    let count = 1 + 40 * 64;
+    ram.0.lock().resize(count * BS, 0);
+    fs.resize(count as u64).unwrap();
+    // The reserved block 3 is the second descriptor block, and the resize inode lets it go.
+    assert_eq!(layout::u16_at(&ram.0.lock(), 1024 + 0xce), 0);
+    assert_eq!(ram.u32_at(51 * BS + 4), 0);
+    assert_eq!(fs.read_inode(7).unwrap().blocks(), 2);
+    assert_eq!(ram.u32_at(3 * BS), 2049);
+    assert_eq!(fs.group(32).unwrap().block_bitmap, 2049);
+    // The group 1 has a copy of both descriptor blocks.
+    assert_eq!(ram.u32_at(67 * BS), 2049);
+    check_free(&again(&ram), &ram);
+
+    // 70 groups need 3 descriptor blocks: the groups up to 64 fill the second block, and then
+    // the file system changes to `meta_bg`.
+    let count = 1 + 70 * 64;
+    ram.0.lock().resize(count * BS, 0);
+    let free = ram.free().0;
+    fs.resize(count as u64).unwrap();
+    drop(fs);
+    let fs = again(&ram);
+    assert_eq!(fs.group_count(), 70);
+    assert_eq!(ram.u32_at(1024 + 0x5c) & layout::compat::RESIZE_INODE, 0);
+    assert_ne!(ram.u32_at(1024 + 0x60) & layout::incompat::META_BG, 0);
+    assert_eq!(ram.u32_at(1024 + 0x104), 2);
+    let resize = fs.read_inode(7).unwrap();
+    assert_eq!((resize.blocks(), layout::u32_at(resize.block(), 13 * 4)), (0, 0));
+    // The groups 40 to 63 are in the second descriptor block, the group 64 starts a meta
+    // block group.
+    assert_eq!(fs.group(63).unwrap().block_bitmap, 1 + 63 * 64);
+    assert_eq!(ram.u32_at(4097 * BS), 4098);
+    assert_eq!(ram.u32_at(4161 * BS), 4098);
+    // The block 51 is free again. Each new group has 2 bitmaps and 8 blocks of inodes. The
+    // group 49 also has a superblock and 2 descriptor blocks, and the groups 64 and 65 have the
+    // descriptor block of their meta block group.
+    assert_eq!(ram.free().0, free + 1 + 23 * 54 + 51 + 2 * 53 + 4 * 54);
+    check_free(&fs, &ram);
+}
+
 #[test]
 fn a_bad_orphan_ends_the_list_and_stays() {
     // The inode 2 is reserved, and the inode 20 is not in use.

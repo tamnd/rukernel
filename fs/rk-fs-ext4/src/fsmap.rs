@@ -84,7 +84,7 @@ impl Fs {
     /// Gives the metadata at fixed places in order, with the next areas of one owner as one
     /// area, as `ext4_getfsmap_find_fixed_metadata` of Linux.
     fn fixed_metadata(&self) -> Result<Vec<Area>> {
-        let sb = &self.sb;
+        let sb = &self.layout();
         let groups = self.group_count();
         let meta_bg = sb.incompat & incompat::META_BG != 0;
         let per_block = sb.descs_per_block();

@@ -1077,6 +1077,8 @@ fn fstests_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
         "#!/bin/sh\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n",
         "mount -t proc proc /proc\nmount -t tmpfs tmp /tmp\n",
+        // resize2fs reads /sys/fs/ext4/features to grow a mounted file system.
+        "mkdir -p /sys\nmount -t sysfs sysfs /sys\n",
         // bash makes `<(...)` with /dev/fd, which a distribution init makes on Linux.
         "[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd\n",
         // The overlay tests do not make the file system under the scratch overlay.
