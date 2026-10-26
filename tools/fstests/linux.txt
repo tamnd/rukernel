@@ -1,0 +1,95 @@
+# The Linux code that each fstests test checks, for the links in the result tables.
+# Each line has a key, a tab and one or more paths in the Linux tree, with a space between them.
+# A key is a test name (generic/256), "cause:" and a part of the cause (cause:shutdown), "group:" and
+# a group of fstests (group:punch), or "suite:" and a suite (suite:ext4). report.py uses the test name
+# first, then the cause, then the first group in the order of this file, then the suite.
+# A path that ends with "/" is a directory. report.py stops if a path is not in the Linux tree.
+ext4/003	fs/ext4/mballoc.c
+ext4/023	fs/ext4/namei.c
+ext4/308	fs/ext4/move_extent.c
+generic/018	fs/ext4/move_extent.c
+generic/256	fs/ext4/extents.c fs/ext4/mballoc.c
+generic/569	mm/swapfile.c mm/rmap.c
+generic/633	io_uring/ fs/ext4/inode.c
+cause:shutdown	fs/ext4/ioctl.c
+cause:encryption	fs/crypto/ fs/ext4/crypto.c
+cause:O_TMPFILE	fs/namei.c fs/ext4/namei.c
+cause:loopback	drivers/block/loop.c
+cause:NFS export	fs/exportfs/expfs.c fs/fhandle.c
+cause:uid_map	kernel/user_namespace.c
+cause:freezing	fs/super.c fs/ext4/super.c
+cause:libaio	fs/aio.c
+cause:mount_setattr	fs/namespace.c
+cause:hugepages	mm/huge_memory.c
+cause:fsmap	fs/ext4/fsmap.c
+cause:fsgqa cannot execute	fs/exec.c
+cause:IO_URING	io_uring/
+cause:ACLs not supported	fs/posix_acl.c fs/ext4/acl.c
+cause:casefold	fs/unicode/ fs/ext4/namei.c
+cause:FSTRIM	fs/ext4/mballoc.c
+cause:/dev/kmsg	kernel/printk/printk.c
+cause:protected_	fs/namei.c
+cause:creation time	fs/stat.c fs/ext4/inode.c
+cause:journal checkpoint	fs/ext4/ioctl.c fs/jbd2/checkpoint.c
+cause:delayed allocation	fs/ext4/inode.c
+cause:chattr +x	fs/ext4/ioctl.c
+cause:fiemap	fs/ioctl.c fs/ext4/extents.c
+cause:label	fs/ext4/ioctl.c
+cause:bigalloc	fs/ext4/mballoc.c
+cause:ea_inode	fs/ext4/xattr.c
+cause:extent flag	fs/ext4/ioctl.c
+cause:filename wipe	fs/ext4/namei.c
+cause:'index'	fs/overlayfs/namei.c fs/overlayfs/copy_up.c
+cause:'redirect_dir'	fs/overlayfs/dir.c
+cause:'uuid'	fs/overlayfs/super.c
+cause:lowerdir+	fs/overlayfs/params.c
+group:shutdown	fs/ext4/ioctl.c
+group:encrypt	fs/crypto/
+group:verity	fs/verity/
+group:io_uring	io_uring/
+group:aio	fs/aio.c
+group:swap	mm/swapfile.c
+group:defrag	fs/ext4/move_extent.c
+group:resize	fs/ext4/resize.c
+group:fsmap	fs/ext4/fsmap.c
+group:dax	fs/dax.c
+group:freeze	fs/super.c
+group:idmapped	fs/mnt_idmapping.c fs/namespace.c
+group:exportfs	fs/exportfs/expfs.c fs/fhandle.c
+group:quota	fs/quota/dquot.c
+group:acl	fs/posix_acl.c fs/ext4/acl.c
+group:attr	fs/xattr.c fs/ext4/xattr.c
+group:copyup	fs/overlayfs/copy_up.c
+group:whiteout	fs/overlayfs/dir.c
+group:redirect	fs/overlayfs/dir.c
+group:metacopy	fs/overlayfs/copy_up.c
+group:xino	fs/overlayfs/inode.c
+group:trim	fs/ext4/mballoc.c
+group:enospc	fs/ext4/mballoc.c fs/ext4/balloc.c
+group:collapse	fs/open.c fs/ext4/extents.c
+group:insert	fs/open.c fs/ext4/extents.c
+group:punch	fs/open.c fs/ext4/extents.c
+group:zero	fs/open.c fs/ext4/extents.c
+group:prealloc	fs/open.c fs/ext4/extents.c
+group:clone	fs/remap_range.c
+group:dedupe	fs/remap_range.c
+group:copy_range	fs/read_write.c
+group:fiemap	fs/ioctl.c fs/ext4/extents.c
+group:seek	fs/read_write.c fs/iomap/seek.c
+group:atomicwrites	fs/read_write.c fs/ext4/inode.c
+group:mmap	mm/filemap.c mm/memory.c
+group:atime	fs/inode.c
+group:rename	fs/namei.c fs/ext4/namei.c
+group:hardlink	fs/namei.c fs/ext4/namei.c
+group:unlink	fs/namei.c fs/ext4/namei.c
+group:dir	fs/namei.c fs/ext4/namei.c
+group:perms	fs/attr.c fs/namei.c
+group:cap	fs/attr.c fs/namei.c
+group:mount	fs/namespace.c
+group:log	fs/jbd2/ fs/ext4/super.c
+group:eio	fs/ext4/inode.c
+group:metadata	fs/ext4/inode.c
+group:rw	fs/read_write.c mm/filemap.c
+suite:ext4	fs/ext4/
+suite:overlay	fs/overlayfs/
+suite:generic	fs/ext4/
