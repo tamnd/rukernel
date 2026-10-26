@@ -119,6 +119,8 @@ pub struct MountInfo<'a> {
     pub source: &'a [u8],
     /// The propagation of the mount.
     pub propagation: rk_vfs::Propagation,
+    /// The options of the file system, each with a comma before it.
+    pub options: &'a [u8],
 }
 
 /// Writes a line of `/proc/PID/mountinfo`, as `show_mountinfo` of Linux does. The optional fields
@@ -144,7 +146,9 @@ pub fn mountinfo(out: &mut Vec<u8>, m: &MountInfo<'_>) {
     out.extend_from_slice(format!(" - {} ", m.fstype).as_bytes());
     escape(out, m.source);
     let ro = if m.flags as u32 & MS_RDONLY != 0 { "ro" } else { "rw" };
-    out.extend_from_slice(format!(" {ro}\n").as_bytes());
+    out.extend_from_slice(format!(" {ro}").as_bytes());
+    out.extend_from_slice(m.options);
+    out.push(b'\n');
 }
 
 /// Writes `s` for a field of `/proc/mounts`: a space, a tab, a new line and a backslash become
@@ -521,6 +525,7 @@ mod tests {
             fstype: "ext4",
             source: b"/dev/vdb",
             propagation: rk_vfs::Propagation::default(),
+            options: b"",
         };
         mountinfo(&mut out, &m);
         assert_eq!(out, b"7 1 254:16 / /mnt rw,noatime - ext4 /dev/vdb rw\n");
@@ -528,6 +533,9 @@ mod tests {
         let propagation = rk_vfs::Propagation { group: 3, master: 2, unbindable: false };
         mountinfo(&mut out, &MountInfo { propagation, ..m });
         assert_eq!(out, b"7 1 254:16 / /mnt rw,noatime shared:3 master:2 - ext4 /dev/vdb rw\n");
+        out.clear();
+        mountinfo(&mut out, &MountInfo { options: b",lowerdir=/l", ..m });
+        assert_eq!(out, b"7 1 254:16 / /mnt rw,noatime - ext4 /dev/vdb rw,lowerdir=/l\n");
     }
 
     #[test]

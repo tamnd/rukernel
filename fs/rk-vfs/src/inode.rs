@@ -490,6 +490,13 @@ pub trait Inode: Any + Send + Sync {
     fn fs_magic(&self) -> u64 {
         0
     }
+
+    /// Gives the options of the file system of the inode for `/proc/PID/mountinfo` and
+    /// `/proc/mounts`, as `show_options` of Linux. Each option has a comma before it, and the
+    /// value has the escapes of the file system. The default is empty.
+    fn fs_options(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// One extent of a file for `FS_IOC_FIEMAP`, in bytes.
