@@ -3,7 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use crate::{
     aio, cred, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process,
-    ptrace, sched, seccomp, shm, signal, signalfd, splice, swap, timer, timerfd, xattr,
+    ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap, timer, timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -106,6 +106,10 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETPID => Ok(u64::from(cx.process().pid())),
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::CLONE3 => process::clone3(cx, a[0], a[1]),
+        nr::SEMGET => sem::semget(cx, a[0], a[1], a[2]),
+        nr::SEMOP => sem::semop(cx, a[0], a[1], a[2]),
+        nr::SEMTIMEDOP => sem::semtimedop(cx, a[0], a[1], a[2], a[3]),
+        nr::SEMCTL => sem::semctl(cx, a[0], a[1], a[2], a[3]),
         nr::SHMGET => shm::shmget(cx, a[0], a[1], a[2]),
         nr::SHMAT => shm::shmat(cx, a[0], a[1], a[2]),
         nr::SHMDT => shm::shmdt(cx, a[0]),

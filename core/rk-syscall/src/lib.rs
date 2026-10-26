@@ -60,6 +60,8 @@ mod sched;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod seccomp;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod sem;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod shm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod signal;
