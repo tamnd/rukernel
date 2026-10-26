@@ -11,6 +11,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- A link of `/proc/PID/fd` is now a magic link, as Linux. A walk that follows it goes to the open file and does not read the target as a path. An open through the link of a pipe gives a new end of the same pipe, and an open through the link of a file without a name gives the file. Before this change, bash could not use `<(...)` and `>(...)`, because the open of `/dev/fd/63` gave `ENOENT`.
 - ext4 keeps the inode before each orphan in memory, as Linux. Before this change, the close of an open file without links walked the list of orphans from its head, so a process that closed many such files used time that grew as the square of their count.
 - `copy_file_range` checks the types of the files before their modes, as `generic_file_rw_checks` of Linux. A copy to a device or a fifo that is open with `O_APPEND` now gives `EINVAL`, not `EBADF`. generic/434 passes.
 - The descriptor table of a process now follows its soft `RLIMIT_NOFILE`, as Linux. Before this change, a process could not open more than 1024 files after a higher `setrlimit`. `poll` and `select` also use the soft limit. generic/488 passes.

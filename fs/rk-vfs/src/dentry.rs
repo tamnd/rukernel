@@ -204,6 +204,18 @@ pub struct Location {
 }
 
 impl Location {
+    /// Makes a location for `inode` in a mount of its own, outside each name space. It is for
+    /// a file without a name, as a pipe, which the internal mounts of Linux hold.
+    pub fn detached(inode: InodeRef) -> Self {
+        let mount = Arc::new(Mount {
+            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
+            root: Dentry::new_root(inode),
+            mountpoint: SpinLock::new(None),
+            source: SpinLock::new(MountSource::rootfs()),
+        });
+        Location { dentry: mount.root.clone(), mount }
+    }
+
     /// The inode.
     pub fn inode(&self) -> &InodeRef {
         self.dentry.inode()

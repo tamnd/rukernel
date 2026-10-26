@@ -9,7 +9,7 @@
 //! for a writer, and an open for writing waits for a reader, as `fifo_open` of Linux.
 
 use crate::file::{File, FileOps, UserMemory, events};
-use crate::inode::{Metadata, Result};
+use crate::inode::{Inode, InodeRef, Metadata, Result, SetAttr};
 use crate::wait::{WaitQueue, poll_wake};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -356,7 +356,6 @@ static FIFOS: SpinLock<BTreeMap<(u64, u64), Weak<Pipe>>> = SpinLock::new(BTreeMa
 /// Gives `ENXIO` for an open for writing with `O_NONBLOCK` when the FIFO has no reader, and
 /// `ERESTARTSYS` if a signal stops the wait.
 pub fn open_fifo(dev: u64, ino: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
-    use rk_abi::native::open::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
     let pipe = {
         let mut fifos = FIFOS.lock();
         fifos.retain(|_, p| p.strong_count() > 0);
@@ -369,6 +368,13 @@ pub fn open_fifo(dev: u64, ino: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
             }
         }
     };
+    open_end(pipe, flags, true)
+}
+
+/// Opens a new end of `pipe`, with the access mode and `O_NONBLOCK` in `flags`, as `fifo_open`
+/// of Linux. `named` is for an end of a FIFO.
+fn open_end(pipe: Arc<Pipe>, flags: u32, named: bool) -> Result<Arc<dyn FileOps>> {
+    use rk_abi::native::open::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
     let nonblock = flags & O_NONBLOCK != 0;
     let (read, write) = match flags & O_ACCMODE {
         O_RDWR => (true, true),
@@ -382,7 +388,7 @@ pub fn open_fifo(dev: u64, ino: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
         let s = pipe.state.lock();
         (s.reader_opens, s.writer_opens)
     };
-    let end = PipeEnd::new(pipe.clone(), read, write, true);
+    let end = PipeEnd::new(pipe.clone(), read, write, named);
     if !nonblock && read != write {
         pipe.wait.wait_interruptible(|| {
             let s = pipe.state.lock();
@@ -395,6 +401,58 @@ pub fn open_fifo(dev: u64, ino: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
         })?;
     }
     Ok(Arc::new(end))
+}
+
+/// The inode of an open pipe, which a walk reaches through a link of `/proc/PID/fd`. An open of
+/// it gives a new end of the same pipe, as an open of the inode of pipefs does on Linux.
+struct PipeInode {
+    pipe: Weak<Pipe>,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+}
+
+impl Inode for PipeInode {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            dev: pipe_dev(),
+            ino: self.ino,
+            mode: S_IFIFO | 0o600,
+            nlink: 1,
+            uid: self.uid,
+            gid: self.gid,
+            blksize: PIPE_BUF as u32,
+            ..Metadata::default()
+        }
+    }
+
+    fn set_attr(&self, _attr: &SetAttr) -> Result<()> {
+        Err(Errno::EPERM)
+    }
+}
+
+/// The inode of the pipe of `file`, or `None` if the file is not a pipe. The inode belongs to the
+/// current file system user, who made the pipe or can see its descriptor.
+pub fn pipe_inode(file: &File) -> Option<InodeRef> {
+    let end = end_of(file).ok()?;
+    let cred = crate::cred::current();
+    Some(Arc::new(PipeInode {
+        pipe: Arc::downgrade(&end.pipe),
+        ino: end.pipe.ino,
+        uid: cred.fsuid,
+        gid: cred.fsgid,
+    }))
+}
+
+/// Opens a new end of the pipe of `inode`, if it is an inode that `pipe_inode` made.
+///
+/// # Errors
+///
+/// Gives `ENOENT` if each end of the pipe is closed, and the errors of `open_fifo`.
+pub(crate) fn open_pipe_inode(inode: &dyn Inode, flags: u32) -> Option<Result<Arc<dyn FileOps>>> {
+    let any: &dyn core::any::Any = inode;
+    let p = any.downcast_ref::<PipeInode>()?;
+    Some(p.pipe.upgrade().ok_or(Errno::ENOENT).and_then(|pipe| open_end(pipe, flags, false)))
 }
 
 #[cfg(test)]

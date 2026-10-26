@@ -93,6 +93,12 @@ impl<'a> Walk<'a> {
                 name => {
                     let next = self.child(&dir, name)?;
                     if is_symlink(&next) && (follow || trailing_slash) {
+                        if let Some(jump) = self.jump(&next)? {
+                            if must_be_dir && !is_dir(&jump) {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            return Ok(jump);
+                        }
                         let target = self.link_target(&next)?;
                         parent = self.resolve_parent(&dir, &target)?;
                         follow = true;
@@ -151,6 +157,9 @@ impl<'a> Walk<'a> {
                 if !is_symlink(&next) {
                     return Ok(next);
                 }
+                if let Some(jump) = self.jump(&next)? {
+                    return Ok(jump);
+                }
                 let target = self.link_target(&next)?;
                 if target.is_empty() {
                     return Err(Errno::ENOENT);
@@ -172,6 +181,17 @@ impl<'a> Walk<'a> {
             return Err(Errno::ELOOP);
         }
         link.inode().follow_link()
+    }
+
+    /// Gives the place of the magic link `link`, or `None` for a usual symbolic link. A magic
+    /// link counts as a link for `ELOOP`.
+    fn jump(&mut self, link: &Location) -> Result<Option<Location>> {
+        let Some(jump) = link.inode().magic_link() else { return Ok(None) };
+        self.links += 1;
+        if self.links > MAX_LINKS {
+            return Err(Errno::ELOOP);
+        }
+        jump.map(Some)
     }
 
     /// The child `name` of the directory `at`, in the mount that is on top of it.
