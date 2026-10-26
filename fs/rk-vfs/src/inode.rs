@@ -315,6 +315,13 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTDIR)
     }
 
+    /// Makes a new regular file without a name in this directory, for `O_TMPFILE`. The file
+    /// has no link, and the file system frees it when no one uses it, unless `link` gives it
+    /// a name. The default gives `EOPNOTSUPP`.
+    fn tmpfile(&self, _perm: u32) -> Result<InodeRef> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Removes the name of a file that is not a directory.
     fn unlink(&self, _name: &[u8]) -> Result<()> {
         Err(Errno::ENOTDIR)

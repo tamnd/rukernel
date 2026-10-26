@@ -1313,3 +1313,28 @@ fn fitrim_discards_the_runs_of_free_blocks() {
     assert_eq!(fs.trim(0, bs - 1, 0), Err(Errno::EINVAL));
     assert_eq!(fs.trim(0, u64::MAX, 8193 * bs), Err(Errno::EINVAL));
 }
+
+#[test]
+fn a_tmpfile_is_an_orphan_until_a_link() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    // A file without a link goes when no one uses it.
+    let gone = root.tmpfile(0o600).unwrap();
+    assert_eq!(gone.metadata().nlink, 0);
+    gone.write_at(0, b"data").unwrap();
+    assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), gone.metadata().ino as u32);
+    drop(gone);
+    assert_eq!(ram.free(), free);
+    assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
+    // A link gives the file a name, and the file leaves the list of orphans.
+    let kept = root.tmpfile(0o600).unwrap();
+    kept.write_at(0, b"kept").unwrap();
+    root.link(b"kept", &kept).unwrap();
+    assert_eq!(kept.metadata().nlink, 1);
+    assert_eq!(ram.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
+    drop((kept, root, fs));
+
+    let fs = again(&ram);
+    assert_eq!(read_all(&*fs.root().unwrap().lookup(b"kept").unwrap()), b"kept");
+}

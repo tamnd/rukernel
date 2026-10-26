@@ -386,6 +386,15 @@ impl Inode for Node {
         Ok(child)
     }
 
+    fn tmpfile(&self, perm: u32) -> Result<InodeRef> {
+        if !self.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let child = Node::new(&self.fs, mode::S_IFREG | (perm & mode::PERM_MASK), 0, Weak::new());
+        child.attrs.lock().nlink = 0;
+        Ok(child)
+    }
+
     fn symlink(&self, name: &[u8], target: &[u8]) -> Result<InodeRef> {
         let child = Node::new(&self.fs, mode::S_IFLNK | 0o777, 0, Weak::new());
         *child.data.lock() = Data::Symlink(target.to_vec());

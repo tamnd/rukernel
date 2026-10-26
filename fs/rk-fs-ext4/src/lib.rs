@@ -39,7 +39,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use layout::{GroupDesc, RawInode, Superblock, gd, u16_at, u32_at};
 use rk_abi::Errno;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
@@ -234,6 +234,8 @@ pub struct Fs {
     committed: SpinLock<i64>,
     /// The inodes in memory, so that two lookups of one file give one inode.
     inodes: SpinLock<BTreeMap<u32, Weak<Node>>>,
+    /// The number of inodes in memory after the last removal of the dead entries.
+    inodes_live: AtomicUsize,
     /// The mount option `minixdf`: `statfs` counts the blocks of the metadata in the count of
     /// blocks.
     minix_df: AtomicBool,
@@ -319,6 +321,7 @@ impl Fs {
             busy: SpinLock::new(BTreeSet::new()),
             committed: SpinLock::new(rk_vfs::now().sec),
             inodes: SpinLock::new(BTreeMap::new()),
+            inodes_live: AtomicUsize::new(0),
             minix_df: AtomicBool::new(false),
             shut: AtomicBool::new(false),
             this: Weak::new(),
@@ -675,8 +678,7 @@ impl Fs {
         }
         let fs = self.this.upgrade().ok_or(Errno::EIO)?;
         let node = Node::new(fs, ino, self.read_inode(ino)?);
-        inodes.retain(|_, n| n.strong_count() > 0);
-        inodes.insert(ino, Arc::downgrade(&node));
+        self.keep_node(&mut inodes, ino, &node);
         Ok(node)
     }
 
@@ -684,10 +686,18 @@ impl Fs {
     fn new_node(&self, ino: u32, raw: RawInode) -> Result<Arc<Node>> {
         let fs = self.this.upgrade().ok_or(Errno::EIO)?;
         let node = Node::new(fs, ino, raw);
-        let mut inodes = self.inodes.lock();
-        inodes.retain(|_, n| n.strong_count() > 0);
-        inodes.insert(ino, Arc::downgrade(&node));
+        self.keep_node(&mut self.inodes.lock(), ino, &node);
         Ok(node)
+    }
+
+    /// Adds `node` to the inodes in memory. The dead entries go when the map has twice the
+    /// entries of the last removal, so a new inode does not walk all the inodes in memory.
+    fn keep_node(&self, inodes: &mut BTreeMap<u32, Weak<Node>>, ino: u32, node: &Arc<Node>) {
+        if inodes.len() >= 2 * self.inodes_live.load(Ordering::Relaxed).max(64) {
+            inodes.retain(|_, n| n.strong_count() > 0);
+            self.inodes_live.store(inodes.len(), Ordering::Relaxed);
+        }
+        inodes.insert(ino, Arc::downgrade(node));
     }
 
     /// Ends the use of the journal at unmount: the log becomes empty and `needs_recovery` is

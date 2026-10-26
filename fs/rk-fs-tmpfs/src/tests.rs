@@ -491,6 +491,20 @@ fn descriptor_table() {
     assert_eq!(t.iter().map(|(fd, _)| fd).collect::<Vec<_>>(), [0, 1, 2, 5]);
     assert_eq!(t.remove_range(1, 4).len(), 2);
     assert_eq!(t.iter().map(|(fd, _)| fd).collect::<Vec<_>>(), [0, 5]);
+    // The lowest free descriptor comes first after each change.
+    assert_eq!(t.insert(file.clone(), false), Ok(1));
+    assert_eq!(t.insert_from(3, file.clone(), false), Ok(3));
+    assert_eq!(t.insert(file.clone(), false), Ok(2));
+    assert_eq!(t.insert(file.clone(), false), Ok(4));
+    assert_eq!(t.insert(file.clone(), false), Ok(6));
+    assert!(t.remove(0).is_ok());
+    assert_eq!(t.insert(file.clone(), false), Ok(0));
+    assert_eq!(t.remove_range(2, 3).len(), 2);
+    assert_eq!(t.insert(file.clone(), false), Ok(2));
+    assert!(t.set_cloexec(1, true).is_ok());
+    assert_eq!(t.close_on_exec().len(), 1);
+    assert_eq!(t.insert(file.clone(), false), Ok(1));
+    assert_eq!(t.insert(file.clone(), false), Ok(3));
 }
 
 /// One test, because the locks of all the tests share one table.
