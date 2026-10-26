@@ -666,39 +666,74 @@ impl Tx<'_> {
         let head = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
         layout::put32(&mut raw.0, 0x14, head);
         layout::put32(&mut self.meta.sb, layout::sb::LAST_ORPHAN, ino);
+        if head != 0 {
+            self.meta.orphan_prev.insert(head, ino);
+        }
+        self.meta.orphan_prev.insert(ino, 0);
         self.write_sb(0, 0)
     }
 
     /// Removes the inode `ino` with `raw` from the list of orphans, as `ext4_orphan_del`.
     pub(crate) fn remove_orphan(&mut self, ino: u32, raw: &RawInode) -> Result<()> {
-        let fs = self.fs;
         let next = u32_at(&raw.0, 0x14);
-        let mut at = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
-        if at == ino {
+        let Some(prev) = self.orphan_prev(ino)? else { return Ok(()) };
+        self.meta.orphan_prev.remove(&ino);
+        if next != 0 {
+            self.meta.orphan_prev.insert(next, prev);
+        }
+        if prev == 0 {
             layout::put32(&mut self.meta.sb, layout::sb::LAST_ORPHAN, next);
             return self.write_sb(0, 0);
         }
+        let fs = self.fs;
+        let node = fs.inodes.lock().get(&prev).and_then(alloc::sync::Weak::upgrade);
+        let mut raw = match &node {
+            Some(node) => node.raw(),
+            None => fs.read_inode(prev)?,
+        };
+        layout::put32(&mut raw.0, 0x14, next);
+        fs.write_inode(prev, &mut raw)?;
+        if let Some(node) = node {
+            *node.raw.lock() = raw;
+        }
+        Ok(())
+    }
+
+    /// The inode before `ino` in the list of orphans, or 0 if `ino` is the head. The map in
+    /// memory gives it if it is correct, and else a walk from the head finds it. Gives `None` if
+    /// `ino` is not on the list.
+    fn orphan_prev(&self, ino: u32) -> Result<Option<u32>> {
+        let fs = self.fs;
+        let read = |at: u32| -> Result<u32> {
+            let node = fs.inodes.lock().get(&at).and_then(alloc::sync::Weak::upgrade);
+            let raw = match &node {
+                Some(node) => node.raw(),
+                None => fs.read_inode(at)?,
+            };
+            Ok(u32_at(&raw.0, 0x14))
+        };
+        let head = u32_at(&self.meta.sb, layout::sb::LAST_ORPHAN);
+        match self.meta.orphan_prev.get(&ino) {
+            Some(0) if head == ino => return Ok(Some(0)),
+            Some(&prev) if prev != 0 && read(prev)? == ino => return Ok(Some(prev)),
+            _ => {}
+        }
+        if head == ino {
+            return Ok(Some(0));
+        }
         // A list with a loop or a bad inode ends after one step for each inode.
+        let mut at = head;
         for _ in 0..fs.inodes_count() {
             if at == 0 || at > fs.inodes_count() {
                 break;
             }
-            let node = fs.inodes.lock().get(&at).and_then(alloc::sync::Weak::upgrade);
-            let mut prev = match &node {
-                Some(node) => node.raw(),
-                None => fs.read_inode(at)?,
-            };
-            if u32_at(&prev.0, 0x14) == ino {
-                layout::put32(&mut prev.0, 0x14, next);
-                fs.write_inode(at, &mut prev)?;
-                if let Some(node) = node {
-                    *node.raw.lock() = prev;
-                }
-                return Ok(());
+            let next = read(at)?;
+            if next == ino {
+                return Ok(Some(at));
             }
-            at = u32_at(&prev.0, 0x14);
+            at = next;
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Frees the orphans that a crash left, at mount, as `ext4_orphan_cleanup`. An orphan that
