@@ -14,6 +14,11 @@
 //!   also comes here.
 //! - The EFI stub, 0x400 bytes after the 32 bit entry. It is the entry point of the PE image.
 //!
+//! The kernel runs at physical address 16 MiB, as `CONFIG_PHYSICAL_START` of Linux. A loader puts
+//! the protected mode code of a bzImage that is not relocatable at 1 MiB, so the 32 bit and the 64
+//! bit entries first move the image to 16 MiB with position independent code. The PVH loader puts
+//! each segment at its physical address. The EFI stub goes to the 64 bit entry in the PE image.
+//!
 //! The assembly below makes boot page tables that map the first 1 GiB of physical memory two
 //! times: at address 0, and at the kernel base `0xffffffff80000000`. Then it turns on long mode,
 //! moves to the kernel base and calls `rk_frame_x86_64_entry`. The identity map is only for the
@@ -38,7 +43,30 @@ core::arch::global_asm!(
     .code32
     .global rk_linux_start32
 rk_linux_start32:                   # the 32 bit entry: ESI has boot_params
+    cli
+    cld
     movl %esi, %ebx
+    leal 0x1e8(%esi), %esp          # the stack is the scratch field of boot_params, as in Linux
+    call 1f
+1:
+    popl %esi
+    subl $(1b - rk_linux_start32), %esi # ESI: the address of the image now
+    movl $__kernel_start_phys, %edi # EDI: the link address of the image
+    movl $__bss_start_phys, %ecx
+    subl %edi, %ecx
+    shrl $2, %ecx
+    cmpl %edi, %esi
+    je 2f
+    ja 3f
+    leal -4(%esi,%ecx,4), %esi      # the image goes up: copy from the end, as the two can overlap
+    leal -4(%edi,%ecx,4), %edi
+    std
+3:
+    rep movsl
+    cld
+    movl $2f, %eax                  # go on in the copy
+    jmp *%eax
+2:
     movl ${linux}, %esi
     jmp rk_boot32
 
@@ -49,6 +77,23 @@ rk_linux_start64:                   # the 64 bit entry: RSI has boot_params
     cli
     cld
     movq %rsi, %rbx
+    leaq rk_linux_start32(%rip), %rsi   # move the image to its link address, as the 32 bit entry
+    movl $__kernel_start_phys, %edi
+    movl $__bss_start_phys, %ecx
+    subl %edi, %ecx
+    shrl $2, %ecx
+    cmpq %rdi, %rsi
+    je 2f
+    ja 3f
+    leaq -4(%rsi,%rcx,4), %rsi
+    leaq -4(%rdi,%rcx,4), %rdi
+    std
+3:
+    rep movsl
+    cld
+    movl $2f, %eax
+    jmp *%rax
+2:
     movl $__bss_start_phys, %edi
     movl $__bss_end_phys, %ecx
     subl %edi, %ecx
@@ -72,8 +117,14 @@ rk_linux_start64:                   # the 64 bit entry: RSI has boot_params
     lretq
 
     # The EFI stub, at the entry point of the PE image. The firmware can load the image at any
-    # address, so the code uses only RIP relative addresses until it jumps to the copy of the
-    # kernel at 1 MiB. The calls use the Microsoft x64 convention of UEFI.
+    # address, so the code uses only RIP relative addresses. It goes to the 64 bit entry in the PE
+    # image, which moves the kernel to 16 MiB. The calls use the Microsoft x64 convention of UEFI.
+    #
+    # The firmware can keep its own boot services data at 16 MiB. OVMF keeps it from 9 MiB to
+    # 23.5 MiB. That memory is free after ExitBootServices, so the stub does not need all of the
+    # pages at 16 MiB. It takes each free page of the kernel range, so that no later allocation is
+    # there. Before ExitBootServices, it makes sure that the memory map has only boot services
+    # memory, free memory and these pages in the kernel range.
     .org 0x400
     .global rk_efi_entry
 rk_efi_entry:                       # RCX: the image handle, RDX: the system table
@@ -88,14 +139,18 @@ rk_efi_entry:                       # RCX: the image handle, RDX: the system tab
     movq %rdx, %r13
     movq 0x60(%r13), %r14           # the boot services
 
-    movq $0x100000, 0x30(%rsp)      # the pages of the kernel, at 1 MiB
+    movl $__kernel_start_phys, %ebx # the free pages of the kernel, from 16 MiB
+    movl $__kernel_end_phys, %ebp
+10:
+    movq %rbx, 0x30(%rsp)
     movl $2, %ecx                   # AllocateAddress
     movl $2, %edx                   # EfiLoaderData
-    movl $__kernel_pages_phys, %r8d
+    movl $1, %r8d
     leaq 0x30(%rsp), %r9
-    call *0x28(%r14)                # AllocatePages
-    testq %rax, %rax
-    jnz 9f
+    call *0x28(%r14)                # AllocatePages. It fails for a page that is not free.
+    addq $0x1000, %rbx
+    cmpq %rbp, %rbx
+    jb 10b
 
     movq $0x3fffffff, 0x30(%rsp)    # the boot data, below the 1 GiB that the boot page tables map
     movl $1, %ecx                   # AllocateMaxAddress
@@ -111,11 +166,6 @@ rk_efi_entry:                       # RCX: the image handle, RDX: the system tab
     xorl %eax, %eax
     rep stosb
 
-    leaq rk_linux_start32(%rip), %rsi   # copy the kernel to 1 MiB
-    movl $0x100000, %edi
-    movl $__bss_start_phys, %ecx
-    subl %edi, %ecx
-    rep movsb
     leaq rk_linux_start32 - 0x1000 + 0x1f1(%rip), %rsi  # the setup header, in the PE headers
     leaq 0x1f1(%r15), %rdi
     movl $0x290 - 0x1f1, %ecx
@@ -229,6 +279,33 @@ rk_efi_entry:                       # RCX: the image handle, RDX: the system tab
     call *0x38(%r14)                # GetMemoryMap
     testq %rax, %rax
     jnz 9f
+    leaq 0x2000(%r15), %rsi         # check the memory map in the kernel range
+    movq 0x38(%rsp), %rdi
+    addq %rsi, %rdi
+11:
+    cmpq %rdi, %rsi
+    jae 13f
+    movq 8(%rsi), %rax              # PhysicalStart
+    cmpq $__kernel_end_phys, %rax
+    jae 12f
+    movq 24(%rsi), %rcx             # NumberOfPages
+    shlq $12, %rcx
+    addq %rax, %rcx
+    cmpq $__kernel_start_phys, %rcx
+    jbe 12f
+    movl (%rsi), %eax               # Type
+    cmpl $2, %eax                   # EfiLoaderData: a page that the stub took
+    je 12f
+    cmpl $3, %eax                   # EfiBootServicesCode
+    je 12f
+    cmpl $4, %eax                   # EfiBootServicesData
+    je 12f
+    cmpl $7, %eax                   # EfiConventionalMemory
+    jne 9f
+12:
+    addq 0x48(%rsp), %rsi
+    jmp 11b
+13:
     movq %r12, %rcx
     movq 0x40(%rsp), %rdx
     call *0xe8(%r14)                # ExitBootServices
@@ -252,8 +329,8 @@ rk_efi_entry:                       # RCX: the image handle, RDX: the system tab
     movl %eax, 0x1d0(%r15)          # efi_memmap
     movq 0x38(%rsp), %rax
     movl %eax, 0x1d4(%r15)          # efi_memmap_size
-    movq %r15, %rsi
-    movl $rk_linux_start64, %eax
+    movq %r15, %rsi                 # the 64 bit entry in the PE image moves the kernel
+    leaq rk_linux_start64(%rip), %rax
     jmp *%rax
 
 9:
@@ -531,7 +608,7 @@ extern "C" fn rk_frame_x86_64_entry(boot: u64, protocol: u32) -> ! {
         read_start_info(boot, &mut info);
         info
     };
-    crate::mm::frame::init(&info, super::paging::kernel_end_phys());
+    crate::mm::frame::init(&info, super::paging::kernel_phys());
     super::paging::init(&info);
     super::apic::init();
     crate::boot::start(info)

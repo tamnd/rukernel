@@ -16,9 +16,10 @@ const LOW_RESERVED: u64 = 1 << 20;
 
 static FRAMES: SpinLock<FrameBitmap<WORDS>> = SpinLock::new(FrameBitmap::new());
 
-/// Adds the usable memory of the memory map to the allocator, and reserves the kernel image and
-/// the initramfs. The boot CPU calls this one time, before the kernel page tables exist.
-pub(crate) fn init(info: &BootInfo, kernel_end_phys: u64) {
+/// Adds the usable memory of the memory map to the allocator, and reserves the kernel image at the
+/// physical addresses `kernel` and the initramfs. The boot CPU calls this one time, before the
+/// kernel page tables exist.
+pub(crate) fn init(info: &BootInfo, kernel: core::ops::Range<u64>) {
     let mut frames = FRAMES.lock();
     for r in info.memory().iter().filter(|r| r.kind == MemoryKind::Usable) {
         // Only whole frames are usable.
@@ -33,7 +34,8 @@ pub(crate) fn init(info: &BootInfo, kernel_end_phys: u64) {
         let e = end.div_ceil(PAGE_SIZE as u64);
         frames.reserve(s as usize, e as usize);
     };
-    reserve(&mut frames, 0, LOW_RESERVED.max(kernel_end_phys));
+    reserve(&mut frames, 0, LOW_RESERVED);
+    reserve(&mut frames, kernel.start, kernel.end);
     if let Some((start, len)) = info.initrd() {
         reserve(&mut frames, start.get(), start.get() + len);
     }

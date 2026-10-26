@@ -33,6 +33,9 @@ pub(crate) const HEAP_START: usize = 0xffff_e500_0000_0000;
 pub(crate) const HEAP_END: usize = 0xffff_e900_0000_0000;
 /// The virtual address of the kernel image at physical address 0.
 pub(crate) const KERNEL_BASE: usize = 0xffff_ffff_8000_0000;
+/// The physical address of the start of the kernel image, with the boot code. x86_64.ld has the
+/// same value. Linux names it `CONFIG_PHYSICAL_START`.
+const KERNEL_PHYS: u64 = 0x100_0000;
 
 /// The boot page tables map physical memory below this address at address 0.
 const BOOT_IDENTITY_LIMIT: u64 = 1 << 30;
@@ -63,9 +66,9 @@ fn sym(s: *const u8) -> usize {
     s as usize
 }
 
-/// The physical address of the end of the kernel image.
-pub(crate) fn kernel_end_phys() -> u64 {
-    (sym(&raw const __kernel_end) - KERNEL_BASE) as u64
+/// The physical address range of the kernel image, with the boot code and the boot page tables.
+pub(crate) fn kernel_phys() -> core::ops::Range<u64> {
+    KERNEL_PHYS..(sym(&raw const __kernel_end) - KERNEL_BASE) as u64
 }
 
 /// The virtual address range of the kernel image.

@@ -1,14 +1,18 @@
 /*
  * The memory layout of the x86-64 kernel image.
  *
- * The boot code and the boot page tables are at physical address 1 MiB, and they run there before
- * paging is on. The rest of the kernel runs at the kernel base 0xffffffff80000000, which the boot
- * page tables map to physical address 0. The loader puts each segment at its physical address.
+ * The kernel runs at physical address 16 MiB, as CONFIG_PHYSICAL_START of Linux. The firmware can
+ * keep its data in the memory below it, and the frame allocator uses that memory. The boot code and
+ * the boot page tables are at the start of the kernel, and they run there before paging is on. The
+ * rest of the kernel runs at the kernel base 0xffffffff80000000, which the boot page tables map to
+ * physical address 0, so its addresses start at 0xffffffff81000000. The loader puts each segment
+ * at its physical address.
  */
 
 ENTRY(rk_pvh_start32)
 
 KERNEL_BASE = 0xffffffff80000000;
+KERNEL_PHYS = 0x1000000;
 
 PHDRS
 {
@@ -21,7 +25,7 @@ PHDRS
 
 SECTIONS
 {
-    . = 0x100000;
+    . = KERNEL_PHYS;
 
     .boot : {
         KEEP(*(.boot.head))
@@ -77,8 +81,9 @@ SECTIONS
     /* The boot code clears the bss before paging is on, so it needs the physical addresses. */
     __bss_start_phys = __bss_start - KERNEL_BASE;
     __bss_end_phys = __bss_end - KERNEL_BASE;
-    /* The EFI stub allocates the pages of the kernel before it copies the kernel. */
-    __kernel_pages_phys = (__kernel_end - KERNEL_BASE - 0x100000) / 4096;
+    /* The entry code moves the kernel to these physical addresses. */
+    __kernel_start_phys = KERNEL_PHYS;
+    __kernel_end_phys = __kernel_end - KERNEL_BASE;
 
     /DISCARD/ : {
         *(.eh_frame .eh_frame_hdr .comment .note.GNU-stack)
