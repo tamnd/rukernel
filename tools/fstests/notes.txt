@@ -1,9 +1,15 @@
 # Notes for the fstests result tables. Each line has a test name, a tab and a note.
 # report.py puts the note in the table. Without a note, the table shows the reason from the log.
 ext4/003	Needs bigalloc, the clusters of more than one block.
-ext4/023	Needs htree directories.
+ext4/023	Passes since #268.
 ext4/308	Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4.
+generic/001	Passes since #268.
+generic/002	Passes since #268.
 generic/004	Passes since #259.
+generic/005	Passes since #268.
+generic/006	Passes since #268.
+generic/011	Passes since #268.
+generic/013	Passes since #268.
 generic/018	Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4.
 generic/128	Passes since #214. Before, /dev/null had the mode 0644 and a user could not write to it.
 generic/256	Passes since the fix of the ext4 full disk leak. Before, a full disk leaked the blocks of a write or of fallocate when the extent tree needed a new block.
