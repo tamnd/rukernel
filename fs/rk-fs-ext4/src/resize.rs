@@ -52,6 +52,12 @@ impl Tx<'_> {
         let bs = sb.block_size;
         let mut probe = vec![0u8; bs as usize];
         fs.disk.read((count - 1) * bs, &mut probe).map_err(|_| Errno::EINVAL)?;
+        // With `bigalloc` the new size becomes whole clusters, as Linux.
+        let bits = sb.cluster_bits;
+        count = count >> bits << bits;
+        if count <= old {
+            return Ok(());
+        }
         let old_groups = fs.group_count();
         let mut groups = sb.groups_for(count);
         let itable = sb.itable_blocks();
@@ -81,8 +87,9 @@ impl Tx<'_> {
 
         // The last group gets the blocks up to the new end, or up to the end of the group.
         let last = old_groups - 1;
-        let (was, now) = (fs.blocks_in_group(last), sb.group_size(last, count));
-        let mut free_blocks = u64::from(now - was);
+        let (was, now) = (fs.clusters_in_group(last), sb.group_clusters(last, count));
+        let mut free_clusters = u64::from(now - was);
+        let mut used_clusters = 0;
         if now > was {
             let mut bitmap = self.block_bitmap(last)?;
             for bit in was as usize..now as usize {
@@ -100,10 +107,10 @@ impl Tx<'_> {
         let zeros = vec![0u8; (ZERO_CHUNK * bs) as usize];
         for group in old_groups..groups {
             let start = sb.group_start(group);
-            let size = u64::from(sb.group_size(group, count));
             let at = start + sb.base_meta_blocks(group);
             let desc = GroupDesc { block_bitmap: at, inode_bitmap: at + 1, inode_table: at + 2 };
-            let used = at + 2 + itable - start;
+            let used = (at + 2 + itable - start).div_ceil(sb.cluster_ratio());
+            let clusters = u64::from(sb.group_clusters(group, count));
             let mut block = desc.inode_table;
             while block < desc.inode_table + itable {
                 let n = ZERO_CHUNK.min(desc.inode_table + itable - block);
@@ -122,7 +129,7 @@ impl Tx<'_> {
             }
             self.meta.descs.push(raw);
             fs.groups.lock().push(desc);
-            self.desc_set(group, gd::FREE_BLOCKS, (size - used) as u32);
+            self.desc_set(group, gd::FREE_BLOCKS, (clusters - used) as u32);
             self.desc_set(group, gd::FREE_INODES, ipg);
             if csum {
                 self.desc_set(group, gd::ITABLE_UNUSED, ipg);
@@ -131,13 +138,14 @@ impl Tx<'_> {
             for bit in 0..used as usize {
                 set_bit(&mut bitmap, bit, true);
             }
-            mark_end(&mut bitmap, size as usize);
+            mark_end(&mut bitmap, clusters as usize);
             self.write_block_bitmap(group, &bitmap)?;
             let mut bitmap = vec![0u8; bs as usize];
             mark_end(&mut bitmap, ipg as usize);
             self.write_inode_bitmap(group, &bitmap)?;
             self.write_desc(group)?;
-            free_blocks += size - used;
+            free_clusters += clusters - used;
+            used_clusters += used;
         }
 
         // The resize inode maps the reserved descriptor blocks of each group with a copy. Each
@@ -156,7 +164,7 @@ impl Tx<'_> {
             }
             if added > 0 {
                 let mut raw = fs.read_inode(layout::RESIZE_INO)?;
-                raw.set_blocks(raw.blocks() + added * (bs / 512));
+                raw.set_blocks(raw.blocks() + added * fs.cluster_sectors());
                 fs.write_inode(layout::RESIZE_INO, &mut raw)?;
             }
         }
@@ -175,8 +183,14 @@ impl Tx<'_> {
             put32(b, layout::sb::BLOCKS_COUNT_HI, (count >> 32) as u32);
         }
         put32(b, layout::sb::INODES_COUNT, groups * ipg);
+        // With `bigalloc` a count of the clusters of the metadata from mkfs gets the new
+        // metadata, as `ext4_add_overhead`.
+        let overhead = u32_at(b, layout::sb::OVERHEAD_CLUSTERS);
+        if bits != 0 && overhead != 0 {
+            put32(b, layout::sb::OVERHEAD_CLUSTERS, overhead + used_clusters as u32);
+        }
         fs.blocks.store(count, Ordering::Relaxed);
-        self.write_sb(free_blocks as i64, i64::from((groups - old_groups) * ipg))?;
+        self.write_sb((free_clusters << bits) as i64, i64::from((groups - old_groups) * ipg))?;
         self.write_backups(groups)
     }
 

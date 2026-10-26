@@ -289,8 +289,9 @@ impl Tx<'_> {
         for (i, (_, e)) in entries.iter().enumerate() {
             root[12 + i * 12..24 + i * 12].copy_from_slice(e);
         }
-        // i_blocks counts the old tree blocks already, so only the difference changes it.
-        let sectors = fs.sb.block_size / 512;
+        // i_blocks counts the old tree blocks already, so only the difference changes it. With
+        // `bigalloc` each block of the tree has a cluster.
+        let sectors = fs.cluster_sectors();
         let blocks = raw.blocks() + need as u64 * sectors;
         raw.set_blocks(blocks.saturating_sub(had * sectors));
         Ok(())

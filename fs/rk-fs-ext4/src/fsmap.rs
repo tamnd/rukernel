@@ -133,7 +133,9 @@ impl Fs {
         let mut runs = Vec::new();
         for group in first_group..self.group_count() {
             let base = self.sb.group_start(group);
-            let size = u64::from(self.blocks_in_group(group));
+            // Each bit of the bitmap is one cluster.
+            let bits = self.sb.cluster_bits;
+            let size = u64::from(self.clusters_in_group(group));
             // The lock stops an allocation in the group while the bitmap is read. A read only
             // or frozen file system also gives its map, so this is not a change.
             let meta = self.meta.lock();
@@ -145,13 +147,16 @@ impl Fs {
             }
             let mut run: Option<u64> = None;
             for bit in 0..=size {
-                let free =
-                    bit < size && !test_bit(&bitmap, bit as usize) && !self.is_busy(base + bit);
+                let free = bit < size
+                    && !test_bit(&bitmap, bit as usize)
+                    && !self.is_busy(base + (bit << bits));
                 match (free, run) {
                     (true, None) => run = Some(bit),
                     (false, Some(first)) => {
                         run = None;
-                        runs.push((base + first, bit - first, fsmap_owner::FREE));
+                        let (at, count) = (first << bits, (bit - first) << bits);
+                        let count = count.min(self.blocks_count().saturating_sub(base + at));
+                        runs.push((base + at, count, fsmap_owner::FREE));
                     }
                     _ => {}
                 }

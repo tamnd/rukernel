@@ -363,7 +363,13 @@ impl Tx<'_> {
                         (next, goal)
                     };
                     let want = (next.min(last) - lblock).min(u64::from(EXTENT_INIT_MAX)) as u32;
-                    let (start, got) = match self.alloc_blocks(goal, want) {
+                    let run = if is_map {
+                        self.alloc_blocks(goal, want)
+                            .map(|(s, g)| (s, g, u64::from(g) * (bs / 512)))
+                    } else {
+                        self.alloc_data(&extents, lblock, want, goal)
+                    };
+                    let (start, got, sectors) = match run {
                         Ok(run) => run,
                         Err(e) => {
                             result = Err(e);
@@ -394,7 +400,7 @@ impl Tx<'_> {
                         runs.push((lblock, start, got));
                         changed = true;
                     }
-                    raw.set_blocks(raw.blocks() + u64::from(got) * (bs / 512));
+                    raw.set_blocks(raw.blocks() + sectors);
                     continue;
                 }
             }
@@ -431,12 +437,8 @@ impl Tx<'_> {
                 return Ok(());
             }
             let freed = extent::cut(&mut extents, last);
-            let mut count = 0;
-            for (start, len) in freed {
-                self.free_blocks(start, len)?;
-                count += len;
-            }
-            raw.set_blocks(raw.blocks().saturating_sub(count * (bs / 512)));
+            let sectors = self.free_data(&extents, &freed)?;
+            raw.set_blocks(raw.blocks().saturating_sub(sectors));
             self.build_tree(ino, raw, &extents, tree)?;
         }
         let at = size.min(old);
@@ -464,15 +466,14 @@ impl Tx<'_> {
         tree: Vec<u64>,
         runs: &mut Vec<(u64, u64, u32)>,
     ) -> Result<Option<u64>> {
-        let sectors = self.fs.sb.block_size / 512;
         let mut lowest = None;
         loop {
             match self.build_tree(ino, raw, extents, tree.clone()) {
                 Err(Errno::ENOSPC) if !runs.is_empty() => {
                     let (lblock, start, got) = runs.pop().ok_or(Errno::EIO)?;
                     extent::remove(extents, lblock, lblock + u64::from(got));
-                    self.free_blocks(start, u64::from(got))?;
-                    raw.set_blocks(raw.blocks().saturating_sub(u64::from(got) * sectors));
+                    let sectors = self.free_data(extents, &[(start, u64::from(got))])?;
+                    raw.set_blocks(raw.blocks().saturating_sub(sectors));
                     lowest = Some(lowest.map_or(lblock, |l: u64| l.min(lblock)));
                 }
                 r => return r.map(|()| lowest),
@@ -492,7 +493,6 @@ impl Tx<'_> {
         first: u64,
         last: u64,
     ) -> (bool, Result<()>) {
-        let bs = self.fs.sb.block_size;
         let mut changed = false;
         let mut lblock = first;
         while lblock < last {
@@ -508,13 +508,22 @@ impl Tx<'_> {
                 .rev()
                 .find(|e| u64::from(e.lblock) < lblock)
                 .map_or_else(|| self.fs.goal(ino), |e| e.start + (lblock - u64::from(e.lblock)));
-            let (start, got) = match self.alloc_run(goal, want) {
+            // A run of all the blocks keeps the file in one extent. With bigalloc the bitmap has
+            // clusters, so `alloc_data` puts the blocks in the clusters of the file.
+            let run = if self.fs.sb.cluster_ratio() == 1 {
+                let sectors = self.fs.sb.block_size / 512;
+                self.alloc_run(goal, want)
+                    .map(|(start, got)| (start, got, u64::from(got) * sectors))
+            } else {
+                self.alloc_data(extents, lblock, want, goal)
+            };
+            let (start, got, sectors) = match run {
                 Ok(run) => run,
                 Err(e) => return (changed, Err(e)),
             };
             extent::put(extents, Extent { lblock: lblock as u32, len: got, start, init: false });
             runs.push((lblock, start, got));
-            raw.set_blocks(raw.blocks() + u64::from(got) * (bs / 512));
+            raw.set_blocks(raw.blocks() + sectors);
             changed = true;
             lblock += u64::from(got);
         }
@@ -550,7 +559,8 @@ impl Tx<'_> {
         if raw.flags() & flags::EXTENTS == 0 {
             return Err(Errno::EOPNOTSUPP);
         }
-        if !(offset | len).is_multiple_of(bs) {
+        // With `bigalloc` the range must have whole clusters, as Linux.
+        if !(offset | len).is_multiple_of(bs << fs.sb.cluster_bits) {
             return Err(Errno::EINVAL);
         }
         let size = raw.size();
@@ -560,12 +570,9 @@ impl Tx<'_> {
             if offset.saturating_add(len) >= size {
                 return Err(Errno::EINVAL);
             }
-            let mut freed = 0;
-            for (start, n) in extent::remove(&mut extents, first, first + count) {
-                self.free_blocks(start, n)?;
-                freed += n;
-            }
-            raw.set_blocks(raw.blocks().saturating_sub(freed * (bs / 512)));
+            let freed = extent::remove(&mut extents, first, first + count);
+            let sectors = self.free_data(&extents, &freed)?;
+            raw.set_blocks(raw.blocks().saturating_sub(sectors));
             extents = extent::shift(&extents, first + count, -(count as i64));
             raw.set_size(size - len);
         } else {
@@ -628,12 +635,8 @@ impl Tx<'_> {
                 let (mut extents, tree) = fs.extents(raw)?;
                 let freed = extent::remove(&mut extents, first_full, last_full);
                 if !freed.is_empty() {
-                    let mut count = 0;
-                    for (start, n) in freed {
-                        self.free_blocks(start, n)?;
-                        count += n;
-                    }
-                    raw.set_blocks(raw.blocks().saturating_sub(count * (bs / 512)));
+                    let sectors = self.free_data(&extents, &freed)?;
+                    raw.set_blocks(raw.blocks().saturating_sub(sectors));
                     self.build_tree(ino, raw, &extents, tree)?;
                 }
             }
@@ -1196,6 +1199,9 @@ impl Inode for Node {
             }
             if new & flags::EXTENTS != 0 {
                 tx.migrate_to_extents(self.ino, &mut raw)?;
+            } else if self.fs.sb.cluster_bits != 0 {
+                // As `ext4_ind_migrate` of Linux, a block map has no clusters.
+                return Err(Errno::EOPNOTSUPP);
             } else {
                 Tx::migrate_to_block_map(&mut raw)?;
             }
