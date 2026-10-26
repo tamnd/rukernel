@@ -372,7 +372,8 @@ pub fn open_fifo(dev: u64, ino: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
 }
 
 /// Opens a new end of `pipe`, with the access mode and `O_NONBLOCK` in `flags`, as `fifo_open`
-/// of Linux. `named` is for an end of a FIFO.
+/// of Linux. `named` is for an end of a FIFO. An open of a pipe without a name does not wait
+/// and does not give `ENXIO`, because the other end can be closed already.
 fn open_end(pipe: Arc<Pipe>, flags: u32, named: bool) -> Result<Arc<dyn FileOps>> {
     use rk_abi::native::open::{O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
     let nonblock = flags & O_NONBLOCK != 0;
@@ -381,7 +382,7 @@ fn open_end(pipe: Arc<Pipe>, flags: u32, named: bool) -> Result<Arc<dyn FileOps>
         O_WRONLY => (false, true),
         _ => (true, false),
     };
-    if write && !read && nonblock && pipe.state.lock().readers == 0 {
+    if named && write && !read && nonblock && pipe.state.lock().readers == 0 {
         return Err(Errno::ENXIO);
     }
     let (readers, writers) = {
@@ -389,7 +390,7 @@ fn open_end(pipe: Arc<Pipe>, flags: u32, named: bool) -> Result<Arc<dyn FileOps>
         (s.reader_opens, s.writer_opens)
     };
     let end = PipeEnd::new(pipe.clone(), read, write, named);
-    if !nonblock && read != write {
+    if named && !nonblock && read != write {
         pipe.wait.wait_interruptible(|| {
             let s = pipe.state.lock();
             let ready = if read {
@@ -459,6 +460,24 @@ pub(crate) fn open_pipe_inode(inode: &dyn Inode, flags: u32) -> Option<Result<Ar
 mod tests {
     use super::*;
     use rk_abi::native::open::O_NONBLOCK;
+
+    #[test]
+    fn an_open_of_the_inode_of_a_pipe_gives_an_end_of_the_same_pipe() {
+        use rk_abi::native::open::{O_RDONLY, O_WRONLY};
+        let (r, w) = pipe(0);
+        let inode = pipe_inode(&r).unwrap();
+        assert_eq!(inode.metadata().ino, r.metadata().unwrap().ino);
+        assert_eq!(w.write(b"ab").unwrap(), 2);
+        drop(w);
+        // The write end is closed, and the open does not wait for a writer.
+        let again = File::with_ops(open_pipe_inode(&*inode, O_RDONLY).unwrap().unwrap(), None, 0);
+        let mut buf = [0u8; 4];
+        assert_eq!(again.read(&mut buf).unwrap(), 2);
+        assert_eq!(again.read(&mut buf).unwrap(), 0);
+        drop(r);
+        drop(again);
+        assert_eq!(open_pipe_inode(&*inode, O_WRONLY).unwrap().err(), Some(Errno::ENOENT));
+    }
 
     #[test]
     fn data_goes_from_the_write_end_to_the_read_end() {
