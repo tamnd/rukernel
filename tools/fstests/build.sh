@@ -49,6 +49,9 @@ apt-get autoremove -qq -y --purge >/dev/null
 apt-get clean
 rm -rf /var/lib/apt/lists/* /usr/share/doc /usr/share/man /usr/share/info /usr/share/locale \
 	/var/log/* /var/cache/debconf/*-old
+# Some tests need the libaio engine of fio and the unshare command. Stop if the cleanup removed them.
+fio --enghelp | grep -qw libaio || { echo "fstests: fio has no libaio engine" >&2; exit 1; }
+unshare --version >/dev/null || { echo "fstests: unshare is missing" >&2; exit 1; }
 mkdir -p /test /scratch
 tar -czf /out/rootfs.tar.gz --one-file-system --exclude=./out -C / .
 echo "$FSTESTS_TAG" > /out/VERSION
