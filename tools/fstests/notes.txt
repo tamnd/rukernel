@@ -4,8 +4,10 @@ ext4/003	Passes since #280.
 ext4/005	Passes since #273.
 ext4/023	Passes since #268.
 ext4/025	Passes since #280.
+ext4/026	Passes since #283.
 ext4/027	Passes since #276.
 ext4/028	Passes since #276.
+ext4/032	Passes since #294.
 ext4/048	Passes since #273.
 ext4/052	Passes since #277.
 ext4/308	Passes since #275.
@@ -18,9 +20,12 @@ generic/011	Passes since #268.
 generic/013	Passes since #268.
 generic/018	Passes since #275.
 generic/128	Passes since #214. Before, /dev/null had the mode 0644 and a user could not write to it.
+generic/130	Passes since #285.
 generic/256	Passes since the fix of the ext4 full disk leak. Before, a full disk leaked the blocks of a write or of fallocate when the extent tree needed a new block.
 generic/260	Passes since #255.
 generic/288	Passes since #255.
+generic/294	Passes since #286.
+generic/306	Passes since #286.
 generic/361	Passes since #269.
 generic/389	Passes since #259.
 generic/402	Passes since #267.
@@ -37,6 +42,7 @@ generic/569	A write to a mapped swap file must give SIGBUS. This needs a reverse
 generic/597	Passes since #254.
 generic/598	Passes since #254.
 generic/607	Passes since #263.
+generic/614	Passes since #290.
 generic/633	Needs io_uring.
 generic/641	Passes since #274.
 generic/683	Passes since #256.
@@ -46,3 +52,14 @@ generic/686	Passes since #256.
 generic/687	Passes since #256.
 generic/696	Passes since #212.
 generic/738	Passes since #265.
+overlay/004	Passes since #289.
+overlay/022	Passes since #289.
+overlay/023	Passes since #289.
+overlay/024	Passes since #289.
+overlay/026	Passes since #289.
+overlay/028	Passes since #289.
+overlay/035	Passes since #289.
+overlay/075	Passes since #289.
+overlay/078	Passes since #289.
+overlay/083	Passes since #289.
+overlay/084	Passes since #289.
