@@ -319,13 +319,26 @@ impl Cred {
             if sgid_dir {
                 perm |= mode::S_ISGID;
             }
-        } else if perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
+        } else {
+            perm = self.strip_sgid(dir, kind, perm);
+        }
+        (self.fsuid, if sgid_dir { dir.gid } else { self.fsgid }, perm)
+    }
+
+    /// Removes the set-group-ID bit from the mode `perm` of a new file in the directory `dir`, as
+    /// `mode_strip_sgid` of Linux. The bit stays on a directory, on a file that is not executable
+    /// by the group, and for a process that is in the group of `dir` or has `CAP_FSETID`. Use
+    /// this before the umask, because the umask can remove the execute bit of the group.
+    pub fn strip_sgid(&self, dir: &Metadata, kind: FileType, perm: u32) -> u32 {
+        if kind != FileType::Directory
+            && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
             && !self.in_group(dir.gid)
             && !self.capable(cap::FSETID)
         {
-            perm &= !mode::S_ISGID;
+            perm & !mode::S_ISGID
+        } else {
+            perm
         }
-        (self.fsuid, if sgid_dir { dir.gid } else { self.fsgid }, perm)
     }
 
     /// Checks a change of the attributes `attr` of a file with the attributes `meta`, as
@@ -1032,6 +1045,9 @@ mod tests {
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o644), (1000, 1000, 0o644));
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2744), (1000, 1000, 0o2744));
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2775), (1000, 1000, 0o775));
+        assert_eq!(u.strip_sgid(&dir, FileType::Regular, 0o2010), 0o10);
+        assert_eq!(u.strip_sgid(&dir, FileType::Directory, 0o2010), 0o2010);
+        assert_eq!(u.strip_sgid(&dir, FileType::Regular, 0o2000), 0o2000);
     }
 
     #[test]

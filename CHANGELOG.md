@@ -12,6 +12,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - A second mount of a block device that has a mounted file system of the same type now gives the same file system, as the super blocks of Linux. Before this change, each mount read the disk again, and the two mounts did not see the changes of the other. A mount that would change the read only state of the file system gives `EBUSY`, as Linux.
+- A new file that a process makes in a set-group-ID directory now loses the set-group-ID bit before the umask, as `vfs_prepare_mode` of Linux. Before this change, a umask that removed the execute bit of the group kept the set-group-ID bit on a file that the process could not make set-group-ID. This applies to `open`, `mkdir` and `mknod`.
+- `clone` with `CLONE_NEWUSER`, `CLONE_NEWPID`, `CLONE_NEWNET` or another namespace type that rukernel does not have now gives `EINVAL`, as `unshare` does. Before this change, `clone` ignored these flags, and a program could not see that the new namespace was not there.
 
 ## [0.3.15] - 2026-10-26
 

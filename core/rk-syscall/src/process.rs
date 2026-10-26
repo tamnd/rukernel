@@ -46,8 +46,8 @@ const PR_GET_NAME: u64 = 16;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 
-/// The flags of `unshare` that make a new namespace of a type that rukernel does not have yet.
-/// They give `EINVAL`, as Linux without the namespace type gives.
+/// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
+/// have yet. They give `EINVAL`, as Linux without the namespace type gives.
 const CLONE_NEW_ANY: u64 = CLONE_NEWCGROUP
     | CLONE_NEWUTS
     | CLONE_NEWIPC
@@ -186,6 +186,9 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     if flags & CLONE_PIDFD != 0 && flags & (CLONE_THREAD | CLONE_DETACHED) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
     }
     // A new mount name space cannot share the file system context. The threads of a process
