@@ -68,6 +68,8 @@ mod signalfd;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod splice;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod swap;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod table;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod timer;

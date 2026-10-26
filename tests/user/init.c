@@ -327,6 +327,10 @@ static void test_files(void)
 	struct stat st;
 	check("fstat", fstat(fd, &st) == 0 && st.st_size == sizeof(data) - 1 && S_ISREG(st.st_mode));
 	check("close", close(fd) == 0);
+	check("swapon of a file without a swap header gives EINVAL",
+	      syscall(SYS_swapon, "/tmp/a", 0) == -1 && errno == EINVAL);
+	check("swapoff of a file that is not a swap area gives EINVAL",
+	      syscall(SYS_swapoff, "/tmp/a") == -1 && errno == EINVAL);
 	check("rename", rename("/tmp/a", "/tmp/b") == 0 && access("/tmp/a", F_OK) != 0);
 	mkdir("/tmp/x", 0755);
 	check("renameat2 with RENAME_EXCHANGE swaps a file and a directory",

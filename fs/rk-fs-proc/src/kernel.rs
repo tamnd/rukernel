@@ -80,7 +80,8 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
         (b"meminfo", || {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
-            text::meminfo(MemInfo { total: f.total as u64 * kb, free: f.free as u64 * kb })
+            let swap = rk_vfs::swap::total_pages() * kb;
+            text::meminfo(MemInfo { total: f.total as u64 * kb, free: f.free as u64 * kb, swap })
                 .into_bytes()
         }),
         (b"cpuinfo", cpuinfo),
@@ -109,7 +110,14 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
             }
             out.into_bytes()
         }),
-        (b"swaps", || b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n".to_vec()),
+        (b"swaps", || {
+            let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
+            let mut out = String::from(text::SWAPS_HEADER);
+            rk_vfs::swap::for_each(|s| {
+                out.push_str(&text::swap_line(&s.path, s.partition, s.pages * kb, 0, s.priority));
+            });
+            out.into_bytes()
+        }),
     ];
     let mut out: Vec<(Vec<u8>, InodeRef)> =
         files.iter().map(|&(name, f)| (name.to_vec(), text_file(&join(b"/", name), f))).collect();

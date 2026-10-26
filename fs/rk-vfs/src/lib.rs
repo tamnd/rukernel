@@ -29,6 +29,7 @@ pub mod lock;
 pub mod mapped;
 pub mod path;
 pub mod pipe;
+pub mod swap;
 pub mod wait;
 pub mod xattr;
 
