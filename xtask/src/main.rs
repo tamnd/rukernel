@@ -735,6 +735,14 @@ if [ -x /usr/bin/gdb ]; then
     e2fsck -fn /dev/vdb
     echo 'alpine: ext4 journal replay done'
     mount -t ext4 /dev/vdb /mnt
+    mkdir -p /tmp/m2
+    mount -t ext4 /dev/vdb /tmp/m2
+    echo same > /mnt/same
+    test \"$(cat /tmp/m2/same)\" = same
+    ! mount -t ext4 -o ro /dev/vdb /tmp/m2 2>/dev/null
+    rm /tmp/m2/same
+    test ! -e /mnt/same
+    umount /tmp/m2
     python3 -c 'import os
 p = \"/mnt/d/e/new\"
 os.setxattr(p, \"user.small\", b\"1\")
