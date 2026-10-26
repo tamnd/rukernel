@@ -211,8 +211,12 @@ impl FsContext {
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
                     let dir = parent.dir.inode();
-                    let (perm, acls) =
-                        acl::create(&**dir, FileType::Regular, perm & mode::PERM_MASK, self.umask);
+                    let perm = self.cred.strip_sgid(
+                        &dir.metadata(),
+                        FileType::Regular,
+                        perm & mode::PERM_MASK,
+                    );
+                    let (perm, acls) = acl::create(&**dir, FileType::Regular, perm, self.umask);
                     let inode = dir.create(&parent.name, FileType::Regular, perm, 0)?;
                     self.init_owner(&parent.dir, &inode)?;
                     if let Some(acls) = acls {
@@ -335,7 +339,9 @@ impl FsContext {
         }
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
-        let (perm, acls) = acl::create(&**parent.dir.inode(), kind, perm, self.umask);
+        let dir = parent.dir.inode();
+        let perm = self.cred.strip_sgid(&dir.metadata(), kind, perm);
+        let (perm, acls) = acl::create(&**dir, kind, perm, self.umask);
         let inode = f(parent.dir.inode(), &parent.name, perm)?;
         self.init_owner(&parent.dir, &inode)?;
         if let Some(acls) = acls {
