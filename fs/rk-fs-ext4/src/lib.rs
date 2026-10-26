@@ -11,9 +11,10 @@
 //! journal, the metadata blocks of the changes go to the journal first, and then to their places,
 //! as `data=writeback` of Linux. A commit collects the changes of up to 5 seconds, and `fsync`
 //! commits at once. An inode without links that a process still uses is on the list of orphans,
-//! so a mount after a crash frees it. The data of a regular file goes to its blocks at once. At mount
-//! the driver replays a journal that Linux, e2fsprogs or a crash left with transactions, and at
-//! unmount it leaves the journal empty. A new entry in a directory with an htree index keeps the
+//! so a mount after a crash frees it. A write to a hole of a regular file with an extent tree
+//! gets its blocks at the writeback, as `delalloc` of Linux, and other data goes to its blocks
+//! at once. At mount the driver replays a journal that Linux, e2fsprogs or a crash left with
+//! transactions, and at unmount it leaves the journal empty. A new entry in a directory with an htree index keeps the
 //! index correct, and a full directory of one block gets an index, as Linux with `dir_index`. A
 //! file with a block map can change in its blocks, but it cannot get new blocks.
 
@@ -24,6 +25,7 @@ extern crate alloc;
 
 mod alloc_blocks;
 pub mod crc;
+mod delalloc;
 mod dir;
 mod extent;
 mod fsmap;
@@ -159,11 +161,15 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let dev = args.dev.ok_or(Errno::ENOTBLK)?;
     let cache = rk_vfs::blockdev::mount_block(dev)?;
     let fs = Fs::open(dev, alloc::boxed::Box::new(cache), args.read_only)?;
+    // As Linux, a mount has the delayed allocation unless `nodelalloc` turns it off.
+    fs.set_delalloc(true);
     // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks.
     for option in args.data.split(|&c| c == b',') {
         match option {
             b"minixdf" => fs.minix_df.store(true, Ordering::Relaxed),
             b"bsddf" => fs.minix_df.store(false, Ordering::Relaxed),
+            b"delalloc" => fs.set_delalloc(true),
+            b"nodelalloc" => fs.set_delalloc(false),
             _ => {}
         }
     }
@@ -203,6 +209,8 @@ impl Drop for Tx<'_> {
 
 impl Drop for Fs {
     fn drop(&mut self) {
+        // On an error the data stays in memory and goes, as Linux.
+        let _ = self.flush_all();
         // On an error the journal stays, and the next mount replays it.
         let _ = self.finish();
     }
@@ -243,6 +251,11 @@ pub struct Fs {
     inodes: SpinLock<BTreeMap<u32, Weak<Node>>>,
     /// The number of inodes in memory after the last removal of the dead entries.
     inodes_live: AtomicUsize,
+    /// A write to a hole of a regular file waits for the writeback to get its blocks, as the
+    /// mount option `delalloc`.
+    delalloc: AtomicBool,
+    /// The data of the writes that wait for the writeback.
+    delayed: SpinLock<delalloc::Delayed>,
     /// The mount option `minixdf`: `statfs` counts the blocks of the metadata in the count of
     /// blocks.
     minix_df: AtomicBool,
@@ -338,6 +351,8 @@ impl Fs {
             committed: SpinLock::new(rk_vfs::now().sec),
             inodes: SpinLock::new(BTreeMap::new()),
             inodes_live: AtomicUsize::new(0),
+            delalloc: AtomicBool::new(false),
+            delayed: SpinLock::new(delalloc::Delayed::default()),
             minix_df: AtomicBool::new(false),
             shut: AtomicBool::new(false),
             frozen: AtomicBool::new(false),
@@ -468,6 +483,7 @@ impl Fs {
         if !self.writable() {
             return Ok(());
         }
+        self.flush_all()?;
         // The lock waits for a running change, so the commit has only whole changes.
         let meta = self.meta.lock();
         self.commit(true);
@@ -486,8 +502,10 @@ impl Fs {
             let hi = if d.len() >= 64 { u64::from(u16_at(d, at + gd::HI)) << 16 } else { 0 };
             u64::from(u16_at(d, at)) | hi
         };
-        let bfree: u64 =
-            meta.descs.iter().map(|d| field(d, gd::FREE_BLOCKS)).sum::<u64>() << sb.cluster_bits;
+        // As Linux, the blocks that the delayed writes keep are not free.
+        let bfree = (meta.descs.iter().map(|d| field(d, gd::FREE_BLOCKS)).sum::<u64>()
+            << sb.cluster_bits)
+            .saturating_sub(self.delayed_count());
         let ffree: u64 = meta.descs.iter().map(|d| field(d, gd::FREE_INODES)).sum();
         let mut reserved = u64::from(u32_at(&meta.sb, layout::sb::R_BLOCKS));
         if sb.incompat & layout::incompat::BIT64 != 0 {
@@ -564,17 +582,38 @@ impl Fs {
 
     /// Runs `op` again after a commit if it gives `ENOSPC` while freed blocks wait for the
     /// commit, as `ext4_should_retry_alloc` of Linux. The commit makes these blocks free to use.
-    /// `op` starts and ends its own change, so the commit has only whole changes.
+    /// `op` starts and ends its own change, so the commit has only whole changes. If delayed
+    /// writes keep blocks, they first go to the disk, so the blocks that they do not use become
+    /// free.
     pub(crate) fn retry_alloc<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
         match op() {
-            Err(Errno::ENOSPC) if !self.busy.lock().is_empty() => {
-                let meta = self.meta.lock();
-                self.commit(true);
-                drop(meta);
-                op()
+            Err(Errno::ENOSPC) if self.delayed_count() != 0 => {
+                self.flush_all()?;
+                self.retry_commit(op)
             }
+            Err(Errno::ENOSPC) if self.commit_busy() => op(),
             r => r,
         }
+    }
+
+    /// Runs `op` again after a commit if it gives `ENOSPC` while freed blocks wait for the
+    /// commit.
+    pub(crate) fn retry_commit<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        match op() {
+            Err(Errno::ENOSPC) if self.commit_busy() => op(),
+            r => r,
+        }
+    }
+
+    /// Commits at once if freed blocks wait for the commit, and tells if it did.
+    fn commit_busy(&self) -> bool {
+        if self.busy.lock().is_empty() {
+            return false;
+        }
+        let meta = self.meta.lock();
+        self.commit(true);
+        drop(meta);
+        true
     }
 
     /// Tells if the block `block` was freed since the last commit.
@@ -959,6 +998,10 @@ impl Fs {
     /// disk.
     pub(crate) fn freeze(&self) -> Result<()> {
         self.check_shut()?;
+        // The delayed writes go to the disk before the freeze, as `sync_filesystem` of Linux.
+        if self.writable {
+            self.flush_all()?;
+        }
         // The lock waits for a running change.
         let meta = self.meta.lock();
         if self.frozen.swap(true, Ordering::AcqRel) {

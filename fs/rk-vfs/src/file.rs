@@ -277,7 +277,13 @@ impl FileOps for InodeFile {
                 }
                 let bs = u64::from(inode.metadata().blksize);
                 let at = block as u64 * bs;
-                let extents = inode.fiemap(at, 1).map_err(|_| Errno::EINVAL)?;
+                let mut extents = inode.fiemap(at, 1).map_err(|_| Errno::EINVAL)?;
+                // A block that waits for the writeback first gets its place, as `ext4_bmap` of
+                // Linux.
+                if extents.first().is_some_and(|e| e.delalloc) {
+                    inode.sync()?;
+                    extents = inode.fiemap(at, 1).map_err(|_| Errno::EINVAL)?;
+                }
                 // A hole and an extent that is not initialized give 0, as Linux.
                 let phys = match extents.first() {
                     Some(e) if !e.unwritten && e.logical <= at => {
@@ -471,6 +477,10 @@ mod fiemap {
     const MAX_EXTENTS: u32 = u32::MAX / EXTENT as u32;
     /// `FIEMAP_EXTENT_LAST`.
     const EXTENT_LAST: u32 = 0x1;
+    /// `FIEMAP_EXTENT_UNKNOWN`: the place of the data on the disk is not known.
+    const EXTENT_UNKNOWN: u32 = 0x2;
+    /// `FIEMAP_EXTENT_DELALLOC`: the data waits for the writeback to get its blocks.
+    const EXTENT_DELALLOC: u32 = 0x4;
     /// `FIEMAP_EXTENT_NOT_ALIGNED`.
     const EXTENT_NOT_ALIGNED: u32 = 0x100;
     /// `FIEMAP_EXTENT_DATA_INLINE`.
@@ -522,6 +532,9 @@ mod fiemap {
             raw[8..16].copy_from_slice(&e.physical.to_ne_bytes());
             raw[16..24].copy_from_slice(&e.length.to_ne_bytes());
             let mut f = if e.unwritten { EXTENT_UNWRITTEN } else { 0 };
+            if e.delalloc {
+                f |= EXTENT_DELALLOC | EXTENT_UNKNOWN;
+            }
             if e.inline {
                 f |= EXTENT_DATA_INLINE | EXTENT_NOT_ALIGNED;
             }

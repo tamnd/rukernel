@@ -367,6 +367,7 @@ impl Fs {
                 length: (raw.0.len() - start) as u64,
                 unwritten: false,
                 inline: true,
+                delalloc: false,
             }));
         }
         let block = raw.file_acl();
@@ -376,6 +377,7 @@ impl Fs {
             length: bs,
             unwritten: false,
             inline: false,
+            delalloc: false,
         }))
     }
 
