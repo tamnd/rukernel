@@ -463,6 +463,27 @@ fn the_extent_flag_moves_the_file() {
 }
 
 #[test]
+fn a_hole_at_the_start_stays_a_hole_in_the_block_map() {
+    // As ext4/005, a write to the hole after `chattr -e` gets a new block, and the data of
+    // the second block stays in its place.
+    let (fs, ram) = open_rw();
+    let free = ram.free().0;
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(BS as u64, &vec![b'b'; BS]).unwrap();
+    file.set_attr_flags(0).unwrap();
+    let first = file.fiemap(0, u64::MAX).unwrap();
+    assert_eq!((first.len(), first[0].logical), (1, BS as u64));
+    file.write_at(0, &vec![b'a'; BS]).unwrap();
+    assert_eq!(file.metadata().blocks, 2 * (BS as u64 / 512));
+    assert_eq!(ram.free().0, free - 2);
+    let back = again(&ram).root().unwrap().lookup(b"f").unwrap();
+    let data = read_all(&*back);
+    assert_eq!((data[0], data[BS - 1], data[BS], data[2 * BS - 1]), (b'a', b'a', b'b', b'b'));
+    let map = back.fiemap(0, u64::MAX).unwrap();
+    assert!(map.iter().any(|e| e.logical == BS as u64 && e.physical == first[0].physical));
+}
+
+#[test]
 fn minixdf_counts_all_the_blocks() {
     let (fs, _ram) = open_rw();
     assert!(fs.stat().blocks < 64);
