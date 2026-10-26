@@ -103,6 +103,8 @@ struct Fs {
     /// Tells if the mount accepts changes. A mount without an upper directory does not, and a
     /// mount that cannot make its work directory does not, as Linux.
     writable: bool,
+    /// The upper layer has POSIX ACLs, so a user can set an ACL through the mount.
+    upper_acl: bool,
     /// Tells if the mount is read only now: it does not accept changes, or a remount made it
     /// read only.
     read_only: AtomicBool,
@@ -486,9 +488,11 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     // The id of a mount with a uuid comes from the uuid, as `uuid_to_fsid` of Linux. Else it
     // is the id of the file system of the real root.
     let fsid = uuid.map_or_else(|| real.fs_fsid(), |u| fold(&u[..8]) ^ fold(&u[8..]));
+    let upper_acl = upper.as_ref().is_some_and(|u| u.posix_acl());
     let fs = Fs {
         dev,
         writable,
+        upper_acl,
         read_only: AtomicBool::new(!writable || args.read_only),
         prefix,
         options: opts.show(),
@@ -614,6 +618,7 @@ pub fn new(lowers: Vec<InodeRef>, upper: Option<InodeRef>) -> Result<InodeRef> {
     let fs = Arc::new(Fs {
         dev: rk_vfs::anon_dev(),
         writable: upper.is_some(),
+        upper_acl: upper.as_ref().is_some_and(|u| u.posix_acl()),
         read_only: AtomicBool::new(upper.is_none()),
         prefix: TRUSTED,
         options: Vec::new(),
@@ -822,6 +827,12 @@ impl Node {
     /// Gives `EROFS` if the mount has no upper directory.
     fn check_writable(&self) -> Result<()> {
         if self.fs.writable { Ok(()) } else { Err(Errno::EROFS) }
+    }
+
+    /// Gives `EOPNOTSUPP` for a change of the ACL `name` if the upper layer has no POSIX ACLs,
+    /// as `ovl_set_acl` of Linux. The check comes before the copy up.
+    fn check_acl(&self, name: &[u8]) -> Result<()> {
+        if acl::is_name(name) && !self.fs.upper_acl { Err(Errno::EOPNOTSUPP) } else { Ok(()) }
     }
 
     /// Finds `name` in the layers of this directory, and gives a new node for it, as
@@ -1063,7 +1074,9 @@ impl Node {
             _ => dir.create(&name, kind, perm, m.rdev)?,
         };
         for attr in lower.list_xattr()? {
-            if self.fs.is_private(&attr) {
+            // An upper layer without POSIX ACLs does not get the ACLs, as `ovl_copy_acl` of
+            // Linux.
+            if self.fs.is_private(&attr) || (acl::is_name(&attr) && !upper.posix_acl()) {
                 continue;
             }
             if let Ok(value) = lower.get_xattr(&attr) {
@@ -1644,23 +1657,33 @@ impl Inode for Node {
         Ok(entries.get(index).map(|e| (e.clone(), pos + 1)))
     }
 
+    /// The ACLs come from the real inode. A layer without POSIX ACLs has none, as `ovl_get_acl`
+    /// of Linux.
     fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
-        self.real().get_xattr(&self.fs.escape(name))
+        let real = self.real();
+        if acl::is_name(name) && !real.posix_acl() {
+            return Err(Errno::ENODATA);
+        }
+        real.get_xattr(&self.fs.escape(name))
     }
 
     fn set_xattr(&self, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
         self.check_writable()?;
+        self.check_acl(name)?;
         let name = self.fs.escape(name);
         self.copy_up()?.set_xattr(&name, value, flags)
     }
 
     fn list_xattr(&self) -> Result<Vec<Vec<u8>>> {
-        let names = self.real().list_xattr()?;
-        Ok(names.iter().filter_map(|n| self.fs.unescape(n)).collect())
+        let real = self.real();
+        let names = real.list_xattr()?;
+        let shown = |n: &&Vec<u8>| acl::listed(&*real, n);
+        Ok(names.iter().filter(shown).filter_map(|n| self.fs.unescape(n)).collect())
     }
 
     fn remove_xattr(&self, name: &[u8]) -> Result<()> {
         self.check_writable()?;
+        self.check_acl(name)?;
         let name = self.fs.escape(name);
         self.real().get_xattr(&name)?;
         self.copy_up()?.remove_xattr(&name)
@@ -1702,6 +1725,11 @@ impl Inode for Node {
 
     fn is_read_only(&self) -> bool {
         self.fs.read_only.load(Ordering::Relaxed)
+    }
+
+    /// overlayfs has POSIX ACLs, as Linux. The ACLs are the ACLs of the layers.
+    fn posix_acl(&self) -> bool {
+        true
     }
 
     fn fs_options(&self) -> Vec<u8> {

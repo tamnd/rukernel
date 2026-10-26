@@ -1191,6 +1191,10 @@ impl Inode for Node {
         !self.fs.writable()
     }
 
+    fn posix_acl(&self) -> bool {
+        self.fs.posix_acl.load(Ordering::Relaxed)
+    }
+
     fn metadata(&self) -> Metadata {
         let raw = self.raw();
         let kind = kind_of(&raw);

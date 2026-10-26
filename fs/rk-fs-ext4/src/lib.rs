@@ -163,13 +163,16 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let fs = Fs::open(dev, alloc::boxed::Box::new(cache), args.read_only)?;
     // As Linux, a mount has the delayed allocation unless `nodelalloc` turns it off.
     fs.set_delalloc(true);
-    // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks.
+    // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks. As Linux, a mount
+    // has POSIX ACLs unless `noacl` turns them off.
     for option in args.data.split(|&c| c == b',') {
         match option {
             b"minixdf" => fs.minix_df.store(true, Ordering::Relaxed),
             b"bsddf" => fs.minix_df.store(false, Ordering::Relaxed),
             b"delalloc" => fs.set_delalloc(true),
             b"nodelalloc" => fs.set_delalloc(false),
+            b"acl" => fs.posix_acl.store(true, Ordering::Relaxed),
+            b"noacl" => fs.posix_acl.store(false, Ordering::Relaxed),
             _ => {}
         }
     }
@@ -263,6 +266,9 @@ pub struct Fs {
     /// The mount option `minixdf`: `statfs` counts the blocks of the metadata in the count of
     /// blocks.
     minix_df: AtomicBool,
+    /// The file system has POSIX ACLs, as the mount option `acl`. The mount option `noacl`
+    /// turns them off.
+    pub(crate) posix_acl: AtomicBool,
     /// `FS_IOC_GOINGDOWN` stopped the file system. Nothing goes to the disk again.
     shut: AtomicBool,
     /// `FIFREEZE` stopped the changes until `FITHAW`.
@@ -359,6 +365,7 @@ impl Fs {
             delalloc: AtomicBool::new(false),
             delayed: SpinLock::new(delalloc::Delayed::default()),
             minix_df: AtomicBool::new(false),
+            posix_acl: AtomicBool::new(true),
             shut: AtomicBool::new(false),
             frozen: AtomicBool::new(false),
             thawed: rk_vfs::wait::WaitQueue::new(),

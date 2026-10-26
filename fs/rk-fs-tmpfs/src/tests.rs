@@ -879,3 +879,58 @@ fn an_open_with_o_trunc_clears_the_set_id_bits() {
     assert_eq!(at.inode().metadata().mode & 0o7777, 0o777);
     assert_eq!(at.inode().metadata().size, 0);
 }
+
+#[test]
+fn an_acl_on_tmpfs_follows_set_posix_acl() {
+    use rk_vfs::acl::{self, ACCESS, Acl, DEFAULT, Entry, UNDEFINED_ID, tag};
+    use rk_vfs::cred::{Cred, cap};
+    let e = |tag, perm, id| Entry { tag, perm, id };
+    let short = |u, g, o| {
+        Acl(vec![
+            e(tag::USER_OBJ, u, UNDEFINED_ID),
+            e(tag::GROUP_OBJ, g, UNDEFINED_ID),
+            e(tag::OTHER, o, UNDEFINED_ID),
+        ])
+    };
+    let named = Acl(vec![
+        e(tag::USER_OBJ, 7, UNDEFINED_ID),
+        e(tag::USER, 6, 1000),
+        e(tag::GROUP_OBJ, 4, UNDEFINED_ID),
+        e(tag::MASK, 6, UNDEFINED_ID),
+        e(tag::OTHER, 0, UNDEFINED_ID),
+    ]);
+    let root = new(0o755);
+    let file = root.create(b"f", FileType::Regular, 0o2644, 0).unwrap();
+    let owner = Cred::root();
+    assert!(file.posix_acl());
+    // The removal of an ACL that the file does not have is not an error.
+    assert_eq!(acl::remove(&owner, &*file, ACCESS), Ok(()));
+    assert_eq!(acl::remove(&owner, &*file, DEFAULT), Ok(()));
+    // An ACL that is the same as the mode only sets the mode.
+    acl::set(&owner, &*file, ACCESS, &short(6, 0, 4).to_xattr()).unwrap();
+    assert_eq!(file.metadata().mode & 0o7777, 0o2604);
+    assert_eq!(acl::get(&*file, ACCESS), Err(Errno::ENODATA));
+    acl::set(&owner, &*file, ACCESS, &named.to_xattr()).unwrap();
+    assert_eq!(file.metadata().mode & 0o7777, 0o2760);
+    assert_eq!(acl::get(&*file, ACCESS), Ok(named.to_xattr()));
+    // A process that is not in the group of the file clears the set-group-ID bit.
+    let no_fsetid = cap::ALL & !cap::bit(cap::FSETID);
+    let user = Cred::root().capset(no_fsetid, cap::ALL, 0).unwrap();
+    let user = user.setresgid(1000, 1000, 1000).unwrap();
+    let mut other = named.clone();
+    other.0[4].perm = 5;
+    acl::set(&user, &*file, ACCESS, &other.to_xattr()).unwrap();
+    assert_eq!(file.metadata().mode & 0o7777, 0o765);
+    // A default ACL on a file gives `EACCES` before the check of the owner, and an invalid ACL
+    // gives `EPERM` to a process that does not own the file.
+    let user = user.setresuid(1000, 1000, 1000).unwrap();
+    assert_eq!(acl::set(&user, &*file, DEFAULT, &named.to_xattr()), Err(Errno::EACCES));
+    let mut bad = named.clone();
+    bad.0.swap(0, 2);
+    assert_eq!(acl::set(&user, &*file, ACCESS, &bad.to_xattr()), Err(Errno::EPERM));
+    assert_eq!(acl::set(&owner, &*file, ACCESS, &bad.to_xattr()), Err(Errno::EINVAL));
+    // An empty value removes the ACL, and the mode stays.
+    acl::set(&owner, &*file, ACCESS, &[]).unwrap();
+    assert_eq!(acl::get(&*file, ACCESS), Err(Errno::ENODATA));
+    assert_eq!(file.metadata().mode & 0o7777, 0o765);
+}

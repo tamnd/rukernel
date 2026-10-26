@@ -62,7 +62,7 @@ fn read_name(cx: &Cx<'_>, addr: u64) -> Result<Vec<u8>, Errno> {
 
 /// The name is the name of an ACL.
 fn is_acl(name: &[u8]) -> bool {
-    name == acl::ACCESS || name == acl::DEFAULT
+    acl::is_name(name)
 }
 
 /// Checks the access of the caller to the attribute `name` of `inode`, with the rules of
@@ -95,7 +95,7 @@ fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags:
     check(cx, &inode, &name, true)?;
     let value = if size == 0 { Vec::new() } else { cx.read_bytes(value, size as usize)? };
     if is_acl(&name) {
-        acl::set(&cx.process().cred(), &*inode, &name, &value, flags as u32)?;
+        acl::set(&cx.process().cred(), &*inode, &name, &value)?;
     } else {
         inode.set_xattr(&name, &value, flags as u32)?;
     }
@@ -119,7 +119,7 @@ fn get(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64) -> Sys
         return Err(Errno::ENODATA);
     };
     check(cx, &inode, &name, false)?;
-    let data = inode.get_xattr(&name)?;
+    let data = if is_acl(&name) { acl::get(&*inode, &name)? } else { inode.get_xattr(&name)? };
     give(cx, value, size, &data, XATTR_SIZE_MAX)
 }
 
@@ -131,7 +131,7 @@ fn list(cx: &Cx<'_>, target: Target, addr: u64, size: u64) -> SysResult {
     let admin = cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN);
     let mut out = Vec::new();
     for name in inode.list_xattr()? {
-        if name.starts_with(b"trusted.") && !admin {
+        if (name.starts_with(b"trusted.") && !admin) || !acl::listed(&*inode, &name) {
             continue;
         }
         out.extend_from_slice(&name);

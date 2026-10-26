@@ -1506,6 +1506,30 @@ fn an_acl_has_the_ext4_format_on_the_disk() {
     drop(file);
     let file = again(&ram).root().unwrap().lookup(b"acl").unwrap();
     assert_eq!(file.get_xattr(ACCESS).unwrap(), acl.to_xattr());
+    // An ACL with no entries is no ACL, and a damaged ACL gives `EINVAL`, as `ext4_get_acl`.
+    assert_eq!(crate::xattr::acl_from_disk(&1u32.to_le_bytes()), Err(Errno::ENODATA));
+    assert_eq!(crate::xattr::acl_from_disk(&2u32.to_le_bytes()), Err(Errno::EINVAL));
+    assert_eq!(crate::xattr::acl_from_disk(&[1, 0, 0, 0, 1, 0]), Err(Errno::EINVAL));
+}
+
+#[test]
+fn the_noacl_option_turns_the_acls_off() {
+    use rk_vfs::acl::{self, ACCESS, Acl, DEFAULT, Entry, UNDEFINED_ID, tag};
+    let (fs, _ram) = open_rw();
+    let root = fs.root().unwrap();
+    assert!(root.posix_acl());
+    let e = |tag, perm| Entry { tag, perm, id: UNDEFINED_ID };
+    let acl = Acl(alloc::vec![e(tag::USER_OBJ, 7), e(tag::GROUP_OBJ, 0), e(tag::OTHER, 0)]);
+    root.set_xattr(DEFAULT, &acl.to_xattr(), 0).unwrap();
+    assert_eq!(acl::create(&*root, FileType::Regular, 0o666, 0o022).0, 0o600);
+    fs.posix_acl.store(false, core::sync::atomic::Ordering::Relaxed);
+    assert!(!root.posix_acl());
+    // The default ACL does not apply, and the umask does, as `IS_POSIXACL` of Linux.
+    assert_eq!(acl::create(&*root, FileType::Regular, 0o666, 0o022).0, 0o644);
+    assert_eq!(acl::get(&*root, DEFAULT), Err(Errno::EOPNOTSUPP));
+    assert!(!acl::listed(&*root, ACCESS));
+    let cred = rk_vfs::cred::Cred::root();
+    assert_eq!(acl::set(&cred, &*root, ACCESS, &acl.to_xattr()), Err(Errno::EOPNOTSUPP));
 }
 
 #[test]

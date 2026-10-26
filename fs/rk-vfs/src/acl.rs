@@ -65,6 +65,21 @@ impl Acl {
     /// Gives `EOPNOTSUPP` for an unknown version, and `EINVAL` for a bad size or an invalid
     /// ACL.
     pub fn from_xattr(value: &[u8]) -> Result<Option<Self>> {
+        let acl = Self::parse(value)?;
+        if let Some(acl) = &acl {
+            acl.valid()?;
+        }
+        Ok(acl)
+    }
+
+    /// Reads an ACL from the value of its attribute, as `posix_acl_from_xattr` of Linux. This
+    /// does not check the order of the entries. Use [`Acl::valid`] for that check.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EOPNOTSUPP` for an unknown version, and `EINVAL` for a bad size, an unknown tag
+    /// or a named entry without an ID.
+    pub fn parse(value: &[u8]) -> Result<Option<Self>> {
         if value.is_empty() {
             return Ok(None);
         }
@@ -90,11 +105,13 @@ impl Acl {
                 tag::USER_OBJ | tag::GROUP_OBJ | tag::MASK | tag::OTHER => UNDEFINED_ID,
                 _ => return Err(Errno::EINVAL),
             };
+            // `make_kuid` of Linux does not map the ID -1.
+            if id == UNDEFINED_ID && matches!(tag, tag::USER | tag::GROUP) {
+                return Err(Errno::EINVAL);
+            }
             entries.push(Entry { tag, perm, id });
         }
-        let acl = Self(entries);
-        acl.valid()?;
-        Ok(Some(acl))
+        Ok(Some(Self(entries)))
     }
 
     /// Gives the value of the attribute of the ACL, as `posix_acl_to_xattr` of Linux.
@@ -253,15 +270,42 @@ impl Acl {
     }
 }
 
-/// Reads the ACL `name` of `inode`. A file without the ACL, a file system without extended
-/// attributes, and a damaged value give `None`.
+/// Reads the ACL `name` of `inode`. A file without the ACL, a file system without POSIX ACLs,
+/// and a damaged value give `None`.
 fn read(inode: &dyn Inode, name: &[u8]) -> Option<Acl> {
+    if !inode.posix_acl() {
+        return None;
+    }
     inode.get_xattr(name).ok().and_then(|v| Acl::from_xattr(&v).ok().flatten())
 }
 
 /// The access ACL of `inode`, if it has one.
 pub fn access(inode: &dyn Inode) -> Option<Acl> {
     read(inode, ACCESS)
+}
+
+/// Gives the value of the ACL `name` of `inode`, for `getxattr`, as `vfs_get_acl` of Linux.
+///
+/// # Errors
+///
+/// Gives `EOPNOTSUPP` if the file system has no POSIX ACLs, and `ENODATA` if the file does not
+/// have the ACL.
+pub fn get(inode: &dyn Inode, name: &[u8]) -> Result<Vec<u8>> {
+    if !inode.posix_acl() {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    inode.get_xattr(name)
+}
+
+/// Tells if `name` is the name of an ACL, as `is_posix_acl_xattr` of Linux.
+pub fn is_name(name: &[u8]) -> bool {
+    name == ACCESS || name == DEFAULT
+}
+
+/// Tells if `listxattr` shows the attribute `name` of `inode`. The names of the ACLs show only
+/// on a file system with POSIX ACLs, as `posix_acl_xattr_list` of Linux.
+pub fn listed(inode: &dyn Inode, name: &[u8]) -> bool {
+    !is_name(name) || inode.posix_acl()
 }
 
 /// Removes the attribute `name`. An attribute that does not exist is not an error.
@@ -272,41 +316,56 @@ fn clear(inode: &dyn Inode, name: &[u8]) -> Result<()> {
     }
 }
 
-/// Sets the ACL `name` of `inode` to `value`, for `setxattr`, as `vfs_set_acl` and
-/// `posix_acl_update_mode` of Linux. Only the owner or a process with `CAP_FOWNER` can set an
-/// ACL. An access ACL also sets the permission bits of the mode, and the file does not keep an
-/// ACL that is the same as the mode. An empty value removes the ACL.
-///
-/// # Errors
-///
-/// Gives `EPERM` if the process does not own the file, `EACCES` for a default ACL on a file
-/// that is not a directory, `EOPNOTSUPP` for a symbolic link, and `EINVAL` for an invalid ACL.
-pub fn set(cred: &Cred, inode: &dyn Inode, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
+/// Checks a change of the ACL `name` of `inode` to `acl`, as `set_posix_acl` of Linux. Gives
+/// `Ok(false)` if there is nothing to do: the removal of a default ACL of a file that is not a
+/// directory.
+fn may_set(cred: &Cred, inode: &dyn Inode, name: &[u8], acl: Option<&Acl>) -> Result<bool> {
     let meta = inode.metadata();
-    if meta.file_type() == Some(FileType::Symlink) {
+    // A symbolic link has no `set_acl` operation in Linux.
+    if !inode.posix_acl() || meta.file_type() == Some(FileType::Symlink) {
         return Err(Errno::EOPNOTSUPP);
     }
-    let acl = Acl::from_xattr(value)?;
+    if name == DEFAULT && !meta.is_dir() {
+        return if acl.is_some() { Err(Errno::EACCES) } else { Ok(false) };
+    }
     if !cred.owns(&meta) {
         return Err(Errno::EPERM);
     }
-    if name == DEFAULT {
-        if !meta.is_dir() {
-            return if acl.is_some() { Err(Errno::EACCES) } else { Ok(()) };
-        }
-        return match acl {
-            Some(acl) => inode.set_xattr(DEFAULT, &acl.to_xattr(), flags),
-            None => clear(inode, DEFAULT),
-        };
+    if let Some(acl) = acl {
+        acl.valid()?;
+    }
+    Ok(true)
+}
+
+/// Sets the ACL `name` of `inode` to `value`, for `setxattr`, as `vfs_set_acl` and
+/// `posix_acl_update_mode` of Linux. Only the owner or a process with `CAP_FOWNER` can set an
+/// ACL. An access ACL also sets the permission bits of the mode, and the file does not keep an
+/// ACL that is the same as the mode. If the process is not in the group of the file and does
+/// not have `CAP_FSETID`, the set-group-ID bit goes. An empty value removes the ACL. As Linux,
+/// the flags `XATTR_CREATE` and `XATTR_REPLACE` do not apply to an ACL.
+///
+/// # Errors
+///
+/// Gives `EOPNOTSUPP` for a file system without POSIX ACLs and for a symbolic link, `EACCES`
+/// for a default ACL on a file that is not a directory, `EPERM` if the process does not own the
+/// file, and `EINVAL` for an invalid ACL.
+pub fn set(cred: &Cred, inode: &dyn Inode, name: &[u8], value: &[u8]) -> Result<()> {
+    let acl = Acl::parse(value)?;
+    if !may_set(cred, inode, name, acl.as_ref())? {
+        return Ok(());
     }
     let Some(acl) = acl else {
-        return clear(inode, ACCESS);
+        return clear(inode, name);
     };
+    if name == DEFAULT {
+        return inode.set_xattr(DEFAULT, &acl.to_xattr(), 0);
+    }
+    let meta = inode.metadata();
     let (bits, equiv) = acl.equiv_mode();
     if equiv {
         clear(inode, ACCESS)?;
     } else {
-        inode.set_xattr(ACCESS, &acl.to_xattr(), flags)?;
+        inode.set_xattr(ACCESS, &acl.to_xattr(), 0)?;
     }
     let mut perm = (meta.mode & 0o7000) | bits;
     if !cred.in_group(meta.gid) && !cred.capable(crate::cred::cap::FSETID) {
@@ -318,16 +377,17 @@ pub fn set(cred: &Cred, inode: &dyn Inode, name: &[u8], value: &[u8], flags: u32
     Ok(())
 }
 
-/// Removes the ACL `name` of `inode`, for `removexattr`. The mode does not change.
+/// Removes the ACL `name` of `inode`, for `removexattr`, as `vfs_remove_acl` of Linux. The mode
+/// does not change. As Linux, a file without the ACL is not an error.
 ///
 /// # Errors
 ///
-/// Gives `EPERM` if the process does not own the file.
+/// Gives the errors of the checks of [`set`].
 pub fn remove(cred: &Cred, inode: &dyn Inode, name: &[u8]) -> Result<()> {
-    if !cred.owns(&inode.metadata()) {
-        return Err(Errno::EPERM);
+    if !may_set(cred, inode, name, None)? {
+        return Ok(());
     }
-    inode.remove_xattr(name)
+    clear(inode, name)
 }
 
 /// Changes the access ACL of `inode` after a `chmod` to the permission bits `perm`, as
@@ -337,7 +397,7 @@ pub fn remove(cred: &Cred, inode: &dyn Inode, name: &[u8]) -> Result<()> {
 ///
 /// Gives the error of the write of the attribute.
 pub fn chmod(inode: &dyn Inode, perm: u32) -> Result<()> {
-    if inode.metadata().file_type() == Some(FileType::Symlink) {
+    if !inode.posix_acl() || inode.metadata().file_type() == Some(FileType::Symlink) {
         return Ok(());
     }
     let Some(mut acl) = access(inode) else {
@@ -359,7 +419,7 @@ pub struct Inherit {
 /// Gives the permission bits of a new file of the type `kind` with the bits `perm` in the
 /// directory `dir`, and the ACLs that the file gets, as `posix_acl_create` of Linux. If the
 /// directory has a default ACL, the ACL masks the bits and the umask does not apply. Else the
-/// umask applies.
+/// umask applies, as on a file system without POSIX ACLs.
 pub fn create(dir: &dyn Inode, kind: FileType, perm: u32, umask: u32) -> (u32, Option<Inherit>) {
     let default = match kind {
         FileType::Symlink => None,
