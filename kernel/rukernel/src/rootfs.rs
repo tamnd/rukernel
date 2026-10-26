@@ -68,6 +68,13 @@ pub(crate) fn make_dev(fs: &FsContext) {
         let name = String::from(dev.name());
         add_device(DeviceInfo { name, class: "mem", rdev: dev.rdev(), block: false, perm: 0o666 });
     }
+    add_device(DeviceInfo {
+        name: String::from("kmsg"),
+        class: "mem",
+        rdev: rk_drv_mem::kmsg::KMSG_RDEV,
+        block: false,
+        perm: 0o644,
+    });
     let root = fs.root().clone();
     let _ = fs.mkdir(&root, b"/dev", 0o755);
     for d in devices() {
