@@ -26,6 +26,7 @@ mod alloc_blocks;
 pub mod crc;
 mod dir;
 mod extent;
+mod fsmap;
 mod htree;
 mod indirect;
 mod journal;

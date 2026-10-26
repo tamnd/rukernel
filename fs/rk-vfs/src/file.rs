@@ -257,6 +257,7 @@ impl FileOps for InodeFile {
         let inode = file.inode.as_ref().ok_or(Errno::ENOTTY)?;
         match cmd {
             fiemap::FS_IOC_FIEMAP => fiemap::ioctl(inode, arg, mem),
+            fsmap::FS_IOC_GETFSMAP => fsmap::ioctl(inode, arg, mem),
             FS_IOC_GETFLAGS | FS_IOC32_GETFLAGS => {
                 mem.write(arg, &inode.attr_flags()?.to_ne_bytes())?;
                 Ok(0)
@@ -532,6 +533,240 @@ mod fiemap {
         }
         mem.write(arg + 20, &(mapped as u32).to_ne_bytes())?;
         Ok(0)
+    }
+}
+
+/// `FS_IOC_GETFSMAP`, from `<linux/fsmap.h>`, as `ext4_ioc_getfsmap` and `ext4_getfsmap` of
+/// Linux. The file system has one device and gives no file offsets.
+mod fsmap {
+    use super::UserMemory;
+    use crate::device::{major, minor};
+    use crate::inode::{FsmapRecord, InodeRef, Result, fsmap_owner};
+    use alloc::vec::Vec;
+    use rk_abi::Errno;
+
+    /// `_IOWR('X', 59, struct fsmap_head)`.
+    pub(super) const FS_IOC_GETFSMAP: u32 = 0xc0c0_583b;
+    /// The size of `struct fsmap_head` with its two keys.
+    const HEADER: usize = 192;
+    /// The offset of the first key in `struct fsmap_head`.
+    const KEYS: usize = 64;
+    /// The size of `struct fsmap`.
+    const RECORD: usize = 64;
+    /// `FMH_OF_DEV_T`: `fmr_device` is a device number.
+    const OF_DEV_T: u32 = 0x1;
+    /// `FMR_OF_SPECIAL_OWNER`: `fmr_owner` is a special owner and not an inode.
+    const OF_SPECIAL_OWNER: u32 = 0x10;
+    /// `FMR_OF_LAST`: the record is the last one.
+    const OF_LAST: u32 = 0x20;
+
+    /// A key of the search, from a `struct fsmap`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(super) struct Key {
+        pub(super) device: u32,
+        pub(super) physical: u64,
+        pub(super) owner: u64,
+        pub(super) offset: u64,
+        pub(super) length: u64,
+        /// The reserved fields are not all zero.
+        pub(super) reserved: bool,
+    }
+
+    impl Key {
+        /// Reads a key from the 64 bytes of a `struct fsmap`.
+        pub(super) fn parse(b: &[u8]) -> Self {
+            let u64_at = |o: usize| {
+                let mut v = [0u8; 8];
+                v.copy_from_slice(&b[o..o + 8]);
+                u64::from_ne_bytes(v)
+            };
+            Self {
+                device: u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                physical: u64_at(8),
+                owner: u64_at(16),
+                offset: u64_at(24),
+                length: u64_at(32),
+                reserved: b[40..RECORD].iter().any(|&c| c != 0),
+            }
+        }
+    }
+
+    /// Gives the device number of `dev` as a 32-bit `dev_t`, as `new_encode_dev` of Linux.
+    fn encode(dev: u64) -> u32 {
+        let (major, minor) = (major(dev), minor(dev));
+        (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12)
+    }
+
+    /// Fills the `struct fsmap_head` at `arg` with the map of the space of the file system of
+    /// `inode`.
+    pub(super) fn ioctl(inode: &InodeRef, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        let mut head = [0u8; HEADER];
+        mem.read(arg, &mut head)?;
+        let u32_at =
+            |o: usize| u32::from_ne_bytes([head[o], head[o + 1], head[o + 2], head[o + 3]]);
+        let (iflags, count) = (u32_at(0), u32_at(8));
+        let low = Key::parse(&head[KEYS..KEYS + RECORD]);
+        let high = Key::parse(&head[KEYS + RECORD..HEADER]);
+        if head[16..KEYS].iter().any(|&c| c != 0) || low.reserved || high.reserved {
+            return Err(Errno::EINVAL);
+        }
+        // The map gives no file offsets, so only the offsets of all zeros or all ones are valid.
+        if low.offset != 0 || (high.offset != 0 && high.offset != u64::MAX) {
+            return Err(Errno::EINVAL);
+        }
+        // No input flags are defined.
+        if iflags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let meta = inode.metadata();
+        let dev = encode(meta.dev);
+        if [low.device, high.device].iter().any(|&d| d != 0 && d != u32::MAX && d != dev) {
+            return Err(Errno::EINVAL);
+        }
+        let bits = meta.blksize.max(1).trailing_zeros();
+        let records = records(inode, dev, bits, &low, &high)?;
+        let entries = if count == 0 {
+            u32::try_from(records.len()).unwrap_or(u32::MAX)
+        } else {
+            let n = records.len().min(count as usize);
+            for (i, r) in records.iter().take(n).enumerate() {
+                let mut flags = OF_SPECIAL_OWNER;
+                if i + 1 == records.len() {
+                    flags |= OF_LAST;
+                }
+                let mut raw = [0u8; RECORD];
+                raw[0..4].copy_from_slice(&dev.to_ne_bytes());
+                raw[4..8].copy_from_slice(&flags.to_ne_bytes());
+                raw[8..16].copy_from_slice(&r.physical.to_ne_bytes());
+                raw[16..24].copy_from_slice(&r.owner.to_ne_bytes());
+                raw[32..40].copy_from_slice(&r.length.to_ne_bytes());
+                mem.write(arg + HEADER + i * RECORD, &raw)?;
+            }
+            n as u32
+        };
+        mem.write(arg + 4, &OF_DEV_T.to_ne_bytes())?;
+        mem.write(arg + 12, &entries.to_ne_bytes())?;
+        Ok(0)
+    }
+
+    /// Gives the records between the keys for the device `dev`, with blocks of `1 << bits`
+    /// bytes.
+    fn records(
+        inode: &InodeRef,
+        dev: u32,
+        bits: u32,
+        low: &Key,
+        high: &Key,
+    ) -> Result<Vec<FsmapRecord>> {
+        // The search starts after the low key, which can be the last record of the call before.
+        let first = (low.physical >> bits).saturating_add(low.length >> bits);
+        let last = high.physical >> bits;
+        if (low.device, first, 0) >= (high.device, last, high.owner) {
+            return Err(Errno::EINVAL);
+        }
+        if low.device > dev || high.device < dev {
+            return Ok(Vec::new());
+        }
+        let first = if dev > low.device { 0 } else { first };
+        let last = if dev == high.device { last } else { u64::MAX };
+        let map = inode.fsmap(first.checked_shl(bits).unwrap_or(u64::MAX))?;
+        Ok(select(&map, bits, first, last))
+    }
+
+    /// Gives the records of `map` that have blocks from `first` to `last`, as bytes. A free or
+    /// unknown area is cut at `first` and at `last`, as Linux.
+    pub(super) fn select(
+        map: &[FsmapRecord],
+        bits: u32,
+        first: u64,
+        last: u64,
+    ) -> Vec<FsmapRecord> {
+        let Some(end) = map.last().map(|r| (r.physical + r.length) >> bits) else {
+            return Vec::new();
+        };
+        let last = last.min(end.saturating_sub(1));
+        if first >= end || last < first {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for r in map {
+            let (mut start, mut stop) = (r.physical >> bits, (r.physical + r.length) >> bits);
+            if stop <= first || start > last {
+                continue;
+            }
+            if r.owner == fsmap_owner::FREE || r.owner == fsmap_owner::UNKNOWN {
+                start = start.max(first);
+                stop = stop.min(last + 1);
+            }
+            out.push(FsmapRecord {
+                physical: start << bits,
+                length: (stop - start) << bits,
+                owner: r.owner,
+            });
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rec(physical: u64, length: u64, owner: u64) -> FsmapRecord {
+            FsmapRecord { physical: physical * 1024, length: length * 1024, owner }
+        }
+
+        /// A map of 20 blocks of 1 KiB: metadata, free space, a file and free space.
+        fn map() -> Vec<FsmapRecord> {
+            let meta = (u64::from(b'X') << 32) | 1;
+            [rec(1, 4, meta), rec(5, 5, fsmap_owner::FREE), rec(10, 3, fsmap_owner::UNKNOWN)]
+                .into_iter()
+                .chain([rec(13, 7, fsmap_owner::FREE)])
+                .collect()
+        }
+
+        #[test]
+        fn all_the_map_is_selected_without_keys() {
+            assert_eq!(select(&map(), 10, 0, u64::MAX), map());
+        }
+
+        #[test]
+        fn the_keys_cut_the_free_and_unknown_areas() {
+            let meta = (u64::from(b'X') << 32) | 1;
+            let got = select(&map(), 10, 3, 11);
+            let want =
+                [rec(1, 4, meta), rec(5, 5, fsmap_owner::FREE), rec(10, 2, fsmap_owner::UNKNOWN)];
+            assert_eq!(got, want);
+            assert_eq!(select(&map(), 10, 7, 15)[0], rec(7, 3, fsmap_owner::FREE));
+            assert_eq!(select(&map(), 10, 7, 15)[2], rec(13, 3, fsmap_owner::FREE));
+        }
+
+        #[test]
+        fn a_low_key_at_the_end_gives_no_records() {
+            assert!(select(&map(), 10, 20, u64::MAX).is_empty());
+            assert!(select(&[], 10, 0, u64::MAX).is_empty());
+            assert!(select(&map(), 10, 6, 5).is_empty());
+        }
+
+        #[test]
+        fn a_key_is_read_from_its_bytes() {
+            let mut b = [0u8; RECORD];
+            b[0..4].copy_from_slice(&7u32.to_ne_bytes());
+            b[8..16].copy_from_slice(&4096u64.to_ne_bytes());
+            b[32..40].copy_from_slice(&1024u64.to_ne_bytes());
+            let key = Key::parse(&b);
+            assert_eq!(
+                (key.device, key.physical, key.length, key.reserved),
+                (7, 4096, 1024, false)
+            );
+            b[56] = 1;
+            assert!(Key::parse(&b).reserved);
+        }
+
+        #[test]
+        fn the_device_has_the_encoding_of_linux() {
+            assert_eq!(encode(crate::device::makedev(8, 3)), 0x803);
+            assert_eq!(encode(crate::device::makedev(259, 0x123)), 0x1_0323 | (0x100 << 12));
+        }
     }
 }
 

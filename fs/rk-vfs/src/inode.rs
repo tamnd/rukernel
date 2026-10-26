@@ -323,6 +323,14 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Gives the map of the space of the file system of the inode, for `FS_IOC_GETFSMAP`. The
+    /// records are in the order of `physical`, they do not overlap, and together they cover the
+    /// file system to its end. The records that end at or before the byte `from` can be left
+    /// out. The default gives `ENOTTY`.
+    fn fsmap(&self, _from: u64) -> Result<Vec<FsmapRecord>> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Stops the changes of the file system of the inode until a thaw, for `FIFREEZE`, or
     /// starts them again, for `FITHAW`. The default gives `EOPNOTSUPP`.
     fn freeze(&self, _frozen: bool) -> Result<()> {
@@ -495,6 +503,26 @@ pub mod fileid {
     pub const INO32_GEN_PARENT: i32 = 2;
     /// The handle does not fit in the buffer.
     pub const INVALID: i32 = 0xff;
+}
+
+/// One area of the disk and its owner for `FS_IOC_GETFSMAP`, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsmapRecord {
+    /// The offset on the disk.
+    pub physical: u64,
+    /// The length.
+    pub length: u64,
+    /// The owner, one of [`fsmap_owner`] or a special owner of the file system.
+    pub owner: u64,
+}
+
+/// The special owners of `<linux/fsmap.h>` that all file systems use. The high 32 bits are the
+/// type and the low 32 bits are the code, as `FMR_OWNER`.
+pub mod fsmap_owner {
+    /// `FMR_OWN_FREE`: free space.
+    pub const FREE: u64 = 1;
+    /// `FMR_OWN_UNKNOWN`: an owner that the file system does not give, for example a file.
+    pub const UNKNOWN: u64 = 2;
 }
 
 /// The flags of `EXT4_IOC_CHECKPOINT`, from `<linux/ext4.h>`.
