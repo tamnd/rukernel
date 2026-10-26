@@ -76,7 +76,7 @@ fn fast_symlink(raw: &RawInode) -> bool {
 }
 
 /// Sets the change time, and the modification time if `modify` is true, to now.
-fn touch(raw: &mut RawInode, modify: bool) {
+pub(crate) fn touch(raw: &mut RawInode, modify: bool) {
     let t = now();
     raw.set_time(0xc, 0x84, t.sec, t.nsec);
     if modify {
@@ -281,8 +281,24 @@ impl Tx<'_> {
     }
 
     /// Writes `buf` at `offset` of the file `ino`, and gives new blocks to the holes. The size
-    /// grows if the data goes past it.
+    /// grows if the data goes past it, and the times change.
     pub(crate) fn write_data(
+        &mut self,
+        ino: u32,
+        raw: &mut RawInode,
+        offset: u64,
+        buf: &[u8],
+    ) -> Result<usize> {
+        let n = self.put_data(ino, raw, offset, buf)?;
+        if n > 0 {
+            touch(raw, true);
+        }
+        Ok(n)
+    }
+
+    /// Writes `buf` as [`Tx::write_data`], but the times do not change, for the writeback of
+    /// delayed writes.
+    pub(crate) fn put_data(
         &mut self,
         ino: u32,
         raw: &mut RawInode,
@@ -414,7 +430,6 @@ impl Tx<'_> {
             raw.set_size(pos);
         }
         if pos > offset {
-            touch(raw, true);
             return Ok((pos - offset) as usize);
         }
         result.map(|()| 0)
@@ -427,6 +442,7 @@ impl Tx<'_> {
         let fs = self.fs;
         let bs = fs.sb.block_size;
         let old = raw.size();
+        self.cut_delayed(ino, size);
         if size <= old && raw.flags() & flags::EXTENTS == 0 {
             let freed = self.cut_map(raw, size.div_ceil(bs))?;
             raw.set_blocks(raw.blocks().saturating_sub(freed * (bs / 512)));
@@ -668,6 +684,7 @@ impl Tx<'_> {
             return Ok(());
         }
         self.remove_orphan(ino, &raw)?;
+        self.drop_delayed(ino);
         let kind = kind_of(&raw);
         let has_blocks =
             matches!(kind, FileType::Regular | FileType::Directory | FileType::Symlink)
@@ -1071,6 +1088,8 @@ impl Inode for Node {
         } else {
             raw.blocks()
         };
+        // As `ext4_getattr` of Linux, the blocks of the delayed writes are in the count.
+        let blocks = blocks + self.fs.delayed_blocks(self.ino) * (bs / 512);
         let rdev = match kind {
             FileType::CharDevice | FileType::BlockDevice => Self::rdev(&raw),
             _ => 0,
@@ -1146,7 +1165,23 @@ impl Inode for Node {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         match self.kind() {
-            FileType::Regular => self.fs.read_data(&self.raw(), offset, buf),
+            FileType::Regular => {
+                // The copy of the delayed data comes before the inode. If the writeback ends
+                // between the two, the copy has the same data as the new blocks.
+                let delayed = self.fs.delayed_data(self.ino, offset, buf.len() as u64);
+                let n = self.fs.read_data(&self.raw(), offset, buf)?;
+                let bs = self.fs.sb.block_size;
+                let end = offset + n as u64;
+                for (lblock, data) in delayed {
+                    let (from, to) = ((lblock * bs).max(offset), ((lblock + 1) * bs).min(end));
+                    if from < to {
+                        let at = (from - lblock * bs) as usize;
+                        buf[(from - offset) as usize..(to - offset) as usize]
+                            .copy_from_slice(&data[at..at + (to - from) as usize]);
+                    }
+                }
+                Ok(n)
+            }
             FileType::Directory => Err(Errno::EISDIR),
             _ => Err(Errno::EINVAL),
         }
@@ -1160,6 +1195,13 @@ impl Inode for Node {
         }
         if buf.is_empty() {
             return Ok(0);
+        }
+        if let Some(n) = self.fs.delay_write(self, offset, buf)? {
+            return Ok(n);
+        }
+        // A write that allocates now first writes back the delayed data of its blocks.
+        if self.fs.has_delayed(self.ino, offset, offset.saturating_add(buf.len() as u64)) {
+            self.fs.flush_delayed(self.ino)?;
         }
         self.fs.retry_alloc(|| {
             let mut tx = self.fs.tx()?;
@@ -1175,6 +1217,10 @@ impl Inode for Node {
     }
 
     fn set_attr_flags(&self, new: u32) -> Result<()> {
+        // A change of the map of the blocks first writes back the delayed data.
+        if (self.raw().flags() ^ new) & flags::EXTENTS != 0 {
+            self.fs.flush_delayed(self.ino)?;
+        }
         let mut tx = self.fs.tx()?;
         let mut raw = self.raw();
         let old = raw.flags();
@@ -1224,7 +1270,7 @@ impl Inode for Node {
         } else {
             self.fs.block_map(&raw)?.0
         };
-        Ok(extents
+        let mut all: Vec<FiemapExtent> = extents
             .iter()
             .filter(|e| u64::from(e.lblock) * bs < end && e.end() * bs > start)
             .map(|e| {
@@ -1236,9 +1282,16 @@ impl Inode for Node {
                     length: (u64::from(e.len) - skip) * bs,
                     unwritten: !e.init,
                     inline: false,
+                    delalloc: false,
                 }
             })
-            .collect())
+            .collect();
+        let delayed = self.fs.delayed_extents(self.ino, start, end);
+        if !delayed.is_empty() {
+            all.extend(delayed);
+            all.sort_unstable_by_key(|e| e.logical);
+        }
+        Ok(all)
     }
 
     fn move_extents(
@@ -1249,6 +1302,8 @@ impl Inode for Node {
         len: u64,
     ) -> Result<u64> {
         let donor = self.same_fs(donor)?;
+        self.fs.flush_delayed(self.ino)?;
+        self.fs.flush_delayed(donor.ino)?;
         self.fs.retry_alloc(|| {
             let mut tx = self.fs.tx()?;
             let (mut orig_raw, mut donor_raw) = (self.raw(), donor.raw());
@@ -1274,6 +1329,9 @@ impl Inode for Node {
         if self.kind() != FileType::Regular {
             return Err(Errno::ENODEV);
         }
+        // The extents change, so the delayed data first gets its blocks, as Linux writes the
+        // pages of the range back first.
+        self.fs.flush_delayed(self.ino)?;
         self.fs.retry_alloc(|| {
             let mut tx = self.fs.tx()?;
             let mut raw = self.raw();

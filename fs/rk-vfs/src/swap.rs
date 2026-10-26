@@ -338,7 +338,7 @@ mod tests {
     }
 
     fn extent(logical: u64, physical: u64, length: u64) -> FiemapExtent {
-        FiemapExtent { logical, physical, length, unwritten: false, inline: false }
+        FiemapExtent { logical, physical, length, unwritten: false, inline: false, delalloc: false }
     }
 
     #[test]

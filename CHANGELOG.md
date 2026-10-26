@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The `ea_inode` feature of ext4, as fs/ext4/xattr.c of Linux. A value of an extended attribute that is larger than a block less 56 bytes, or that does not fit in the inode and the attribute block, goes to the data of an inode of its own, so a value can have up to 64 KiB. The value inode has `EXT4_EA_INODE_FL`, the hash of the value in its access time and the count of its references in its change time and `i_version`. The count of blocks of the file also counts the blocks of its values, as Linux. A value that does not change keeps its inode, and the last reference frees the inode. ext4/026 now passes.
+- Delayed allocation of buffered writes on ext4, as `delalloc` of Linux. A write to a hole of a file with an extent tree keeps its data in memory and keeps free blocks for it. The blocks are allocated at `fsync`, `sync`, a freeze, the unmount, or when the kept data is too large. `stat` counts the kept blocks, `statfs` does not give them as free, and `FS_IOC_FIEMAP` gives them with `FIEMAP_EXTENT_DELALLOC`. A truncate drops the kept blocks past the size, and `fallocate` and `EXT4_IOC_MOVE_EXT` first write back the data. The mount option `nodelalloc` turns it off. generic/614 now passes.
 
 ### Fixed
 

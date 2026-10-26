@@ -148,11 +148,22 @@ impl Tx<'_> {
     /// Allocates up to `want` blocks in a row, at `goal` or after it if it can. Gives the first
     /// block and the number of blocks. With `bigalloc` it allocates whole clusters: the first
     /// block is the first block of a cluster, and the number of blocks is a number of clusters.
+    /// The blocks that the delayed writes keep are not used.
     ///
     /// # Errors
     ///
     /// Gives `ENOSPC` if the file system has no free block.
     pub(crate) fn alloc_blocks(&mut self, goal: u64, want: u32) -> Result<(u64, u32)> {
+        let kept = self.fs.kept_blocks();
+        let want = if kept == 0 {
+            want
+        } else {
+            let free = self.free_count();
+            if free <= kept {
+                return Err(Errno::ENOSPC);
+            }
+            want.min(u32::try_from(free - kept).unwrap_or(u32::MAX))
+        };
         let sb = &self.fs.sb;
         let (first, bpg) = (u64::from(sb.first_data_block), u64::from(sb.blocks_per_group));
         let bits = sb.cluster_bits;

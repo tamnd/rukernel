@@ -512,6 +512,9 @@ pub struct FiemapExtent {
     pub unwritten: bool,
     /// The extent is data in the inode, and it is not aligned to a block.
     pub inline: bool,
+    /// The extent is data that waits for the writeback to get its blocks, so it has no place on
+    /// the disk yet.
+    pub delalloc: bool,
 }
 
 /// The types of a file handle, `enum fid_type` of `<linux/exportfs.h>`.

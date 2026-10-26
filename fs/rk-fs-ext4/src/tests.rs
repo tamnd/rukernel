@@ -2276,3 +2276,135 @@ fn bigalloc_mount_checks_the_superblock() {
     img[1024 + 0x104..1024 + 0x108].copy_from_slice(&842_150_400u32.to_le_bytes());
     assert_eq!(open(img).err(), Some(Errno::EINVAL));
 }
+
+/// Mounts the test image with the delayed allocation, as a mount of Linux.
+fn open_delalloc() -> (Arc<Fs>, Ram) {
+    let (fs, ram) = open_rw();
+    fs.set_delalloc(true);
+    (fs, ram)
+}
+
+#[test]
+fn a_delayed_write_gets_its_blocks_at_the_writeback() {
+    let (fs, ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let (free, bfree) = (ram.free().0, fs.stat().bfree);
+    let data: Vec<u8> = (0..2 * BS + 10).map(|i| i as u8).collect();
+    assert_eq!(file.write_at(0, &data), Ok(data.len()));
+    // The blocks are kept but not allocated. `stat` counts them, and `statfs` does not give
+    // them as free.
+    assert_eq!(ram.free().0, free);
+    assert_eq!(fs.stat().bfree, bfree - 3);
+    assert_eq!(file.metadata().blocks, 3 * (BS as u64 / 512));
+    assert_eq!(read_all(&*file), data);
+    let map = file.fiemap(0, u64::MAX).unwrap();
+    assert_eq!(map.len(), 1);
+    assert_eq!((map[0].logical, map[0].length, map[0].physical), (0, 3 * BS as u64, 0));
+    assert!(map[0].delalloc);
+    // A second write to a kept block changes it and keeps no new block.
+    file.write_at(5, b"xyz").unwrap();
+    assert_eq!(file.metadata().blocks, 3 * (BS as u64 / 512));
+    // `fsync` allocates the blocks and writes the data.
+    file.sync().unwrap();
+    assert_eq!(ram.free().0, free - 3);
+    assert_eq!(fs.stat().bfree, bfree - 3);
+    assert_eq!(file.metadata().blocks, 3 * (BS as u64 / 512));
+    let map = file.fiemap(0, u64::MAX).unwrap();
+    assert_eq!(map.len(), 1);
+    assert!(!map[0].delalloc && map[0].physical != 0);
+    let mut want = data.clone();
+    want[5..8].copy_from_slice(b"xyz");
+    assert_eq!(read_all(&*again(&ram).root().unwrap().lookup(b"f").unwrap()), want);
+}
+
+#[test]
+fn a_truncate_drops_the_delayed_blocks_past_the_size() {
+    let (fs, ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let free = ram.free().0;
+    file.write_at(0, &vec![7u8; 3 * BS]).unwrap();
+    file.set_attr(&SetAttr { size: Some(BS as u64 + 5), ..SetAttr::default() }).unwrap();
+    assert_eq!(file.metadata().blocks, 2 * (BS as u64 / 512));
+    // The bytes past the old size read as zeros after a truncate up.
+    file.set_attr(&SetAttr { size: Some(3 * BS as u64), ..SetAttr::default() }).unwrap();
+    let back = read_all(&*file);
+    assert!(back[..BS + 5].iter().all(|&b| b == 7));
+    assert!(back[BS + 5..].iter().all(|&b| b == 0));
+    file.sync().unwrap();
+    assert_eq!(ram.free().0, free - 2);
+    assert_eq!(read_all(&*again(&ram).root().unwrap().lookup(b"f").unwrap()), back);
+}
+
+#[test]
+fn a_removed_file_drops_its_delayed_blocks() {
+    let (fs, ram) = open_delalloc();
+    let root = fs.root().unwrap();
+    let file = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let (free, bfree) = (ram.free().0, fs.stat().bfree);
+    file.write_at(0, &vec![1u8; 4 * BS]).unwrap();
+    root.unlink(b"f").unwrap();
+    drop(file);
+    assert_eq!(fs.stat().bfree, bfree);
+    fs.sync().unwrap();
+    assert_eq!(ram.free().0, free);
+}
+
+#[test]
+fn a_change_of_the_extents_writes_back_the_delayed_blocks() {
+    use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE};
+    let (fs, ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let free = ram.free().0;
+    file.write_at(0, &vec![3u8; 3 * BS]).unwrap();
+    file.fallocate(PUNCH_HOLE | KEEP_SIZE, BS as u64, BS as u64).unwrap();
+    assert_eq!(ram.free().0, free - 2);
+    assert!(file.fiemap(0, u64::MAX).unwrap().iter().all(|e| !e.delalloc));
+    // A write to holes and kept blocks keeps its blocks.
+    file.write_at(4 * BS as u64, &[4u8; 10]).unwrap();
+    file.write_at(4 * BS as u64 + 10, &[6u8; 10]).unwrap();
+    assert_eq!(ram.free().0, free - 2);
+    // A write over a block with an extent and a kept block first writes back the kept block.
+    file.write_at(2 * BS as u64, &vec![5u8; 2 * BS + 1]).unwrap();
+    assert_eq!(ram.free().0, free - 4);
+    let back = read_all(&*again(&ram).root().unwrap().lookup(b"f").unwrap());
+    assert!(back[..BS].iter().all(|&b| b == 3) && back[BS..2 * BS].iter().all(|&b| b == 0));
+    assert!(back[2 * BS..4 * BS + 1].iter().all(|&b| b == 5));
+    assert!(back[4 * BS + 1..4 * BS + 10].iter().all(|&b| b == 4));
+    assert!(back[4 * BS + 10..].iter().all(|&b| b == 6));
+}
+
+#[test]
+fn a_read_only_remount_writes_back_the_delayed_blocks() {
+    let (fs, _ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(0, &[7u8; 100]).unwrap();
+    assert_eq!(fs.delayed_count(), 1);
+    fs.set_read_only(true).unwrap();
+    assert_eq!(fs.delayed_count(), 0);
+    assert!(file.fiemap(0, u64::MAX).unwrap().iter().all(|e| !e.delalloc));
+    assert!(read_all(&*file).iter().all(|&b| b == 7));
+}
+
+#[test]
+fn the_unmount_writes_back_the_delayed_blocks() {
+    let (fs, ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(BS as u64, &[9u8; 100]).unwrap();
+    drop(file);
+    drop(fs);
+    let back = read_all(&*again(&ram).root().unwrap().lookup(b"f").unwrap());
+    assert_eq!(back.len(), BS + 100);
+    assert!(back[..BS].iter().all(|&b| b == 0) && back[BS..].iter().all(|&b| b == 9));
+}
+
+#[test]
+fn a_delayed_write_on_a_full_disk_allocates_at_once() {
+    let (fs, ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let free = ram.free().0 as usize;
+    // The write cannot keep its blocks, so it allocates what it can, as before.
+    let n = file.write_at(0, &vec![1u8; (free + 4) * BS]).unwrap();
+    assert!(n > 0 && n <= free * BS);
+    assert!(ram.free().0 < free as u32);
+    assert!(file.fiemap(0, u64::MAX).unwrap().iter().all(|e| !e.delalloc));
+}
