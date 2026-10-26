@@ -852,11 +852,12 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Makes a new inode of the type `kind` near the directory `dir`, and writes it.
-    fn new_inode(&mut self, dir: u32, kind: FileType, perm: u32) -> Result<(u32, RawInode)> {
+    /// Makes a new inode of the type `kind` in the directory `dir`, and writes it. The inode gets
+    /// the inherited flags of `dir`, as `__ext4_new_inode` of Linux.
+    fn new_inode(&mut self, dir: &Node, kind: FileType, perm: u32) -> Result<(u32, RawInode)> {
         let fs = self.fs;
         let is_dir = kind == FileType::Directory;
-        let ino = self.alloc_inode(dir, is_dir)?;
+        let ino = self.alloc_inode(dir.ino, is_dir)?;
         let size = usize::from(fs.sb.inode_size);
         let mut raw = RawInode(vec![0u8; size]);
         if size > 128 {
@@ -879,6 +880,13 @@ impl Tx<'_> {
             raw.set_flags(flags::EXTENTS);
             Tx::empty_tree(&mut raw);
         }
+        let inherited = dir.raw.lock().flags() & flags::INHERITED;
+        let inherited = match kind {
+            FileType::Directory => inherited,
+            FileType::Regular => inherited & !flags::DIR_ONLY,
+            _ => inherited & flags::OTHER,
+        };
+        raw.set_flags(raw.flags() | inherited);
         fs.write_inode(ino, &mut raw)?;
         Ok((ino, raw))
     }
@@ -1133,6 +1141,16 @@ impl Inode for Node {
         if changed & flags::CASEFOLD != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
+        // As `dax_compatible` of Linux, the DAX flag cannot go with the flags of
+        // `DAX_MUT_EXCL`. A directory can have both the DAX flag and inline data.
+        let excl = match self.kind() {
+            FileType::Directory => flags::DAX_MUT_EXCL & !flags::INLINE_DATA,
+            _ => flags::DAX_MUT_EXCL,
+        };
+        let next = (old & !flags::USER_MODIFIABLE) | (new & flags::USER_MODIFIABLE);
+        if next & flags::DAX != 0 && old & excl != 0 || next & excl != 0 && old & flags::DAX != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
         if changed & flags::EXTENTS != 0 {
             if !matches!(self.kind(), FileType::Regular | FileType::Directory) {
                 return Err(Errno::EINVAL);
@@ -1147,7 +1165,7 @@ impl Inode for Node {
                 Tx::migrate_to_block_map(&mut raw)?;
             }
         }
-        raw.set_flags((old & !flags::USER_MODIFIABLE) | (new & flags::USER_MODIFIABLE));
+        raw.set_flags(next);
         touch(&mut raw, false);
         tx.save(self, &mut raw)
     }
@@ -1204,7 +1222,7 @@ impl Inode for Node {
         if self.raw().links() >= LINK_MAX && kind == FileType::Directory {
             return Err(Errno::EMLINK);
         }
-        let (ino, mut raw) = tx.new_inode(self.ino, kind, perm)?;
+        let (ino, mut raw) = tx.new_inode(self, kind, perm)?;
         match kind {
             FileType::Directory => {
                 let block = self.fs.new_dir_block(ino, &raw, self.ino);
@@ -1257,7 +1275,7 @@ impl Inode for Node {
         }
         let mut tx = self.fs.tx()?;
         self.check_new(name)?;
-        let (ino, mut raw) = tx.new_inode(self.ino, FileType::Symlink, 0o777)?;
+        let (ino, mut raw) = tx.new_inode(self, FileType::Symlink, 0o777)?;
         if target.len() < 60 {
             raw.set_flags(0);
             let b = raw.block_mut();

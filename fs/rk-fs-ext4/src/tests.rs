@@ -404,6 +404,29 @@ fn the_inode_flags_are_kept() {
 }
 
 #[test]
+fn a_new_inode_gets_the_flags_of_its_directory() {
+    use rk_vfs::inode::iflags::{DAX, NOATIME, SYNC};
+    let extents = 0x8_0000;
+    let (fs, _ram) = open_rw();
+    let dir = fs.root().unwrap().create(b"d", FileType::Directory, 0o755, 0).unwrap();
+    // The DIRSYNC flag goes to the new directories only, and a FIFO gets only NOATIME.
+    let dirsync = 0x1_0000;
+    dir.set_attr_flags(extents | DAX | SYNC | NOATIME | dirsync).unwrap();
+    let file = dir.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    assert_eq!(file.attr_flags(), Ok(extents | DAX | SYNC | NOATIME));
+    let sub = dir.create(b"s", FileType::Directory, 0o755, 0).unwrap();
+    assert_eq!(sub.attr_flags(), Ok(extents | DAX | SYNC | NOATIME | dirsync));
+    let node = dir.create(b"p", FileType::Fifo, 0o644, 0).unwrap();
+    assert_eq!(node.attr_flags(), Ok(NOATIME));
+    // The DAX flag cannot go with the journal data flag.
+    let journal_data = 0x4000;
+    assert_eq!(sub.set_attr_flags(extents | DAX | journal_data), Err(Errno::EOPNOTSUPP));
+    let plain = fs.root().unwrap().create(b"g", FileType::Regular, 0o644, 0).unwrap();
+    plain.set_attr_flags(extents | journal_data).unwrap();
+    assert_eq!(plain.set_attr_flags(extents | journal_data | DAX), Err(Errno::EOPNOTSUPP));
+}
+
+#[test]
 fn the_extent_flag_moves_the_file() {
     let extents = 0x8_0000;
     let (fs, ram) = open_rw();
