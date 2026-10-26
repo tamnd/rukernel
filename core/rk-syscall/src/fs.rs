@@ -17,7 +17,7 @@ use rk_abi::native::mount::{
     MS_RDONLY, MS_RELATIME, MS_SYNCHRONOUS,
 };
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
-use rk_abi::native::signal::SIGPIPE;
+use rk_abi::native::signal::{SIGPIPE, SIGXFSZ};
 use rk_abi::native::stat::{STATX_BASIC_STATS, STATX_MNT_ID};
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
 use rk_proc::signal::{SI_USER, SigInfo};
@@ -151,7 +151,48 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
             &[Iovec { iov_base: buf, iov_len: count }],
         );
     }
+    let count = fsize_count(cx, &file, write_pos(&file), count)?;
     sigpipe(cx, write_with(cx, buf, count, |_, b| file.write(b)))
+}
+
+/// Gives the bytes of a write of `count` bytes at `pos` that `RLIMIT_FSIZE` lets a regular file
+/// take, as `generic_write_check_limits` of Linux. A write that starts at or after the limit sends
+/// `SIGXFSZ` and gives `EFBIG`.
+fn fsize_count(cx: &Cx<'_>, file: &File, pos: u64, count: u64) -> Result<u64, Errno> {
+    let limit = cx.process().limit(rk_proc::limits::RLIMIT_FSIZE).cur;
+    if limit == rk_proc::limits::RLIM_INFINITY || count == 0 || !is_regular(file) {
+        return Ok(count);
+    }
+    if pos >= limit {
+        return Err(xfsz(cx));
+    }
+    Ok(count.min(limit - pos))
+}
+
+/// Checks a new size of a regular file against `RLIMIT_FSIZE`, as `inode_newsize_ok` of Linux. Only
+/// a size that makes the file larger can go above the limit.
+fn fsize_check(cx: &Cx<'_>, meta: &Metadata, size: u64) -> Result<(), Errno> {
+    let limit = cx.process().limit(rk_proc::limits::RLIMIT_FSIZE).cur;
+    if size > meta.size && size > limit && meta.file_type() == Some(rk_vfs::FileType::Regular) {
+        return Err(xfsz(cx));
+    }
+    Ok(())
+}
+
+/// Sends `SIGXFSZ` to the thread and gives `EFBIG`.
+fn xfsz(cx: &Cx<'_>) -> Errno {
+    let pid = cx.process().pid();
+    cx.thread.send_signal(SigInfo::new(SIGXFSZ, SI_USER, pid));
+    Errno::EFBIG
+}
+
+fn is_regular(file: &File) -> bool {
+    file.metadata().is_ok_and(|m| m.file_type() == Some(rk_vfs::FileType::Regular))
+}
+
+/// The position of the next `write` of `file`.
+fn write_pos(file: &File) -> u64 {
+    if file.flags().append() { file.metadata().map_or(0, |m| m.size) } else { file.pos() }
 }
 
 /// Sends `SIGPIPE` to the thread when a write gives `EPIPE`, as `pipe_write` of Linux does.
@@ -182,6 +223,7 @@ pub(crate) fn pwrite(cx: &Cx<'_>, fd: u64, buf: u64, count: u64, offset: u64) ->
     if !file.ops().seekable() {
         return Err(Errno::ESPIPE);
     }
+    let count = fsize_count(cx, &file, offset, count)?;
     write_with(cx, buf, count, |done, b| file.write_at(offset + done, b))
 }
 
@@ -336,19 +378,23 @@ pub(crate) fn pwritev2(
         if flags & rwf::APPEND != 0 {
             offset = file.metadata()?.size;
         }
+        let iovs = read_iovecs(cx, iov, count)?;
+        let total = iovs.iter().map(|v| v.iov_len).sum();
+        let room = fsize_count(cx, &file, offset, total)?;
         let mut done = 0;
-        for v in read_iovecs(cx, iov, count)? {
-            if v.iov_len == 0 {
+        for v in iovs {
+            let len = v.iov_len.min(room - done);
+            if len == 0 {
                 continue;
             }
             let at = offset + done;
-            let n = match write_with(cx, v.iov_base, v.iov_len, |d, b| file.write_at(at + d, b)) {
+            let n = match write_with(cx, v.iov_base, len, |d, b| file.write_at(at + d, b)) {
                 Ok(n) => n,
                 Err(e) if done == 0 => return sigpipe(cx, Err(e)),
                 Err(_) => break,
             };
             done += n;
-            if n < v.iov_len {
+            if n < len {
                 break;
             }
         }
@@ -383,18 +429,22 @@ pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
     if let Some(sock) = rk_net::socket_of(&file) {
         return crate::net::write_socket(cx, &file, &*sock, &read_iovecs(cx, iov, count)?);
     }
+    let iovs = read_iovecs(cx, iov, count)?;
+    let total = iovs.iter().map(|v| v.iov_len).sum();
+    let room = fsize_count(cx, &file, write_pos(&file), total)?;
     let mut done = 0;
-    for v in read_iovecs(cx, iov, count)? {
-        if v.iov_len == 0 {
+    for v in iovs {
+        let len = v.iov_len.min(room - done);
+        if len == 0 {
             continue;
         }
-        let n = match write_with(cx, v.iov_base, v.iov_len, |_, b| file.write(b)) {
+        let n = match write_with(cx, v.iov_base, len, |_, b| file.write(b)) {
             Ok(n) => n,
             Err(e) if done == 0 => return sigpipe(cx, Err(e)),
             Err(_) => break,
         };
         done += n;
-        if n < v.iov_len {
+        if n < len {
             break;
         }
     }
@@ -1025,6 +1075,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
         return Err(Errno::EISDIR);
     }
     fs.permission(&at, rk_vfs::cred::may::WRITE)?;
+    fsize_check(cx, &at.inode().metadata(), size)?;
     let mode = fs.cred().write_kill(&at.inode().metadata());
     let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
     rk_vfs::inode::check_set_attr(&**at.inode(), &attr)?;
@@ -1037,7 +1088,13 @@ pub(crate) fn ftruncate(cx: &Cx<'_>, fd: u64, size: u64) -> SysResult {
     if (size as i64) < 0 {
         return Err(Errno::EINVAL);
     }
-    cx.file(fd)?.truncate(size)?;
+    let file = cx.file(fd)?;
+    if let Ok(meta) = file.metadata()
+        && file.flags().writable()
+    {
+        fsize_check(cx, &meta, size)?;
+    }
+    file.truncate(size)?;
     Ok(0)
 }
 
@@ -1087,7 +1144,12 @@ pub(crate) fn fallocate(cx: &Cx<'_>, fd: u64, mode: u64, offset: u64, len: u64) 
         _ => return Err(Errno::EOPNOTSUPP),
     }
     let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
-    cx.file(fd)?.fallocate(mode, offset as u64, (end - offset) as u64)?;
+    let file = cx.file(fd)?;
+    // A change that can make the file larger checks `RLIMIT_FSIZE`, as ext4 and XFS of Linux do.
+    if mode & KEEP_SIZE == 0 && matches!(mode, 0 | ZERO_RANGE) && file.flags().writable() {
+        fsize_check(cx, &file.metadata()?, end as u64)?;
+    }
+    file.fallocate(mode, offset as u64, (end - offset) as u64)?;
     Ok(0)
 }
 

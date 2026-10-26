@@ -2147,6 +2147,50 @@ static void test_fallocate(void)
 	unlink("/tmp/fa");
 }
 
+static volatile sig_atomic_t got_xfsz;
+
+static void on_xfsz(int sig)
+{
+	got_xfsz = sig;
+}
+
+static void test_fsize(void)
+{
+	struct rlimit rl = { 8192, RLIM_INFINITY };
+	struct stat st;
+	char buf[4096] = { 0 };
+	pid_t pid;
+	int status;
+
+	pid = fork();
+	if (pid == 0) {
+		int fd = open("/tmp/fsz", O_RDWR | O_CREAT | O_TRUNC, 0644);
+
+		failed = 0;
+		signal(SIGXFSZ, on_xfsz);
+		setrlimit(RLIMIT_FSIZE, &rl);
+		check("a write that crosses RLIMIT_FSIZE is short",
+		      pwrite(fd, buf, 4096, 6144) == 2048 && got_xfsz == 0);
+		check("a write at RLIMIT_FSIZE gives EFBIG and sends SIGXFSZ",
+		      pwrite(fd, buf, 1, 8192) == -1 && errno == EFBIG && got_xfsz == SIGXFSZ);
+		got_xfsz = 0;
+		check("ftruncate above RLIMIT_FSIZE gives EFBIG",
+		      ftruncate(fd, 8193) == -1 && errno == EFBIG && got_xfsz == SIGXFSZ);
+		check("ftruncate to a smaller size ignores RLIMIT_FSIZE",
+		      ftruncate(fd, 100) == 0 && fstat(fd, &st) == 0 && st.st_size == 100);
+		got_xfsz = 0;
+		check("fallocate above RLIMIT_FSIZE gives EFBIG",
+		      fallocate(fd, 0, 0, 8193) == -1 && errno == EFBIG && got_xfsz == SIGXFSZ);
+		check("fallocate with FALLOC_FL_KEEP_SIZE ignores RLIMIT_FSIZE",
+		      fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 16384) == 0);
+		close(fd);
+		unlink("/tmp/fsz");
+		_exit(failed);
+	}
+	waitpid(pid, &status, 0);
+	check("the RLIMIT_FSIZE checks of the child pass", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void test_fifo(void)
 {
 	struct stat st1, st2;
@@ -2924,6 +2968,7 @@ int main(int argc, char **argv)
 	test_fifo();
 	test_file_locks();
 	test_fallocate();
+	test_fsize();
 	test_iflags();
 	test_syslog();
 	test_membarrier();
