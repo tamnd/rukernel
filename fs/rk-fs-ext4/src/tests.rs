@@ -1794,3 +1794,96 @@ mod htree {
         assert!(big.lookup(b"new").is_ok());
     }
 }
+
+#[test]
+fn move_extents_swaps_the_blocks_and_keeps_the_data() {
+    use rk_vfs::inode::falloc::KEEP_SIZE;
+    // The block of the disk of each block of the file, and if it has data.
+    let blocks = |inode: &InodeRef| -> Vec<(u64, bool)> {
+        let mut out = Vec::new();
+        for e in inode.fiemap(0, u64::MAX).unwrap() {
+            for i in 0..e.length / BS as u64 {
+                out.push((e.physical / BS as u64 + i, !e.unwritten));
+            }
+        }
+        out
+    };
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let orig = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    // Writes from the end make more than one extent.
+    for (i, c) in b"abcd".iter().enumerate().rev() {
+        orig.write_at((i * BS) as u64, &vec![*c; BS]).unwrap();
+    }
+    orig.fallocate(KEEP_SIZE, 4 * BS as u64, 4 * BS as u64).unwrap();
+    let donor = root.create(b"d", FileType::Regular, 0o600, 0).unwrap();
+    donor.fallocate(0, 0, 8 * BS as u64).unwrap();
+    let (orig_before, donor_before) = (blocks(&orig), blocks(&donor));
+    let first = orig.fiemap(0, u64::MAX).unwrap();
+    let free = ram.free().0;
+    // The blocks past the end of the original file do not move.
+    assert_eq!(orig.move_extents(&donor, 0, 0, 8), Ok(4));
+    assert_eq!(ram.free().0, free);
+    assert_eq!(&read_all(&*orig).chunks(BS).map(|c| c[0]).collect::<Vec<_>>(), b"abcd");
+    let (orig_after, donor_after) = (blocks(&orig), blocks(&donor));
+    // The original file has the blocks of the donor, with data, and the donor has the old
+    // blocks of the original file, with their data.
+    let with_data: Vec<_> = donor_before[..4].iter().map(|&(b, _)| (b, true)).collect();
+    assert_eq!(orig_after[..4], with_data);
+    assert_eq!(orig_after[4..], orig_before[4..]);
+    assert_eq!(donor_after[..4], orig_before[..4]);
+    assert_eq!(donor_after[4..], donor_before[4..]);
+    // A length of 0 from block 0 moves the whole file, as Linux. The same pairs of blocks swap
+    // back, so the first layout comes again.
+    assert_eq!(orig.move_extents(&donor, 0, 0, 0), Ok(4));
+    assert_eq!(orig.fiemap(0, u64::MAX).unwrap(), first);
+    // Blocks without data in both files only swap their extents.
+    orig.set_attr(&SetAttr { size: Some(8 * BS as u64), ..SetAttr::default() }).unwrap();
+    assert_eq!(orig.move_extents(&donor, 4, 4, 4), Ok(4));
+    assert_eq!(blocks(&orig)[4..], donor_before[4..]);
+    assert_eq!(blocks(&donor)[4..], orig_before[4..]);
+    drop((orig, donor, root, fs));
+
+    let fs = again(&ram);
+    let back = read_all(&*fs.root().unwrap().lookup(b"f").unwrap());
+    assert_eq!(&back.chunks(BS).map(|c| c[0]).collect::<Vec<_>>(), b"abcd\0\0\0\0");
+}
+
+#[test]
+fn move_extents_checks_the_files_and_the_range() {
+    let (fs, _ram) = open_rw();
+    let root = fs.root().unwrap();
+    let orig = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    orig.write_at(0, &vec![1u8; 4 * BS]).unwrap();
+    let donor = root.create(b"d", FileType::Regular, 0o644, 0).unwrap();
+    let empty: InodeRef = donor.clone();
+    assert_eq!(orig.move_extents(&empty, 0, 0, 4), Err(Errno::EINVAL));
+    donor.fallocate(0, 0, 4 * BS as u64).unwrap();
+    let dir: InodeRef = root.clone();
+    let same: InodeRef = orig.clone();
+    let donor: InodeRef = donor;
+    assert_eq!(orig.move_extents(&same, 0, 0, 4), Err(Errno::EINVAL));
+    assert_eq!(orig.move_extents(&dir, 0, 0, 4), Err(Errno::EINVAL));
+    // Blocks of 1 KiB: the starts must have the same place in a page of 4 KiB.
+    assert_eq!(orig.move_extents(&donor, 1, 0, 2), Err(Errno::EINVAL));
+    assert_eq!(orig.move_extents(&donor, 4, 4, 2), Err(Errno::EINVAL));
+    assert_eq!(orig.move_extents(&donor, 1, 1, 2), Ok(2));
+    donor.set_attr_flags(flags::EXTENTS | rk_vfs::inode::iflags::APPEND).unwrap();
+    assert_eq!(orig.move_extents(&donor, 0, 0, 4), Err(Errno::EPERM));
+}
+
+#[test]
+fn fallocate_takes_a_run_of_all_the_blocks_after_a_short_hole() {
+    let (fs, _ram) = open_rw();
+    let root = fs.root().unwrap();
+    let a = root.create(b"a", FileType::Regular, 0o644, 0).unwrap();
+    a.write_at(0, &vec![1u8; 2 * BS]).unwrap();
+    let b = root.create(b"b", FileType::Regular, 0o644, 0).unwrap();
+    b.write_at(0, &vec![2u8; BS]).unwrap();
+    drop(a);
+    root.unlink(b"a").unwrap();
+    // The hole of two blocks is too short, so the blocks come from after it.
+    let c = root.create(b"c", FileType::Regular, 0o644, 0).unwrap();
+    c.fallocate(0, 0, 4 * BS as u64).unwrap();
+    assert_eq!(c.fiemap(0, u64::MAX).unwrap().len(), 1);
+}

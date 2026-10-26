@@ -351,6 +351,9 @@ impl FileOps for InodeFile {
     }
 }
 
+/// `_IOWR('f', 15, struct move_extent)`. Swaps the blocks of two ext4 files, for online
+/// defragmentation.
+pub const EXT4_IOC_MOVE_EXT: u32 = 0xc028_660f;
 /// `_IO(0, 1)`. Gives the block of the disk of a block of the file.
 const FIBMAP: u32 = 1;
 /// `_IO(0, 2)`. Gives the block size.
@@ -850,6 +853,34 @@ impl File {
             Some(FileType::Directory) => Err(Errno::EISDIR),
             _ => Err(Errno::ENODEV),
         }
+    }
+
+    /// `EXT4_IOC_MOVE_EXT` on this file with `donor` as the donor file. Gives the number of
+    /// blocks that moved. The checks are those of `ext4_ioctl` of Linux, in its order.
+    pub fn move_extents(
+        &self,
+        donor: &File,
+        orig_start: u64,
+        donor_start: u64,
+        len: u64,
+    ) -> Result<u64> {
+        let inode = self.inode.as_ref().ok_or(Errno::ENOTTY)?;
+        if !self.flags().readable() || !self.flags().writable() || !donor.flags().writable() {
+            return Err(Errno::EBADF);
+        }
+        let other = donor.inode.as_ref().ok_or(Errno::EXDEV)?;
+        if other.fs_id() != inode.fs_id() {
+            return Err(Errno::EXDEV);
+        }
+        crate::swap::check(&**inode)?;
+        crate::swap::check(&**other)?;
+        // The pages that a mapping changed go to the blocks before the blocks swap.
+        crate::mapped::sync(inode, 0, u64::MAX)?;
+        crate::mapped::sync(other, 0, u64::MAX)?;
+        let moved = inode.move_extents(other, orig_start, donor_start, len)?;
+        // The donor has the old data of this file now.
+        crate::mapped::changed(other, 0, u64::MAX);
+        Ok(moved)
     }
 
     /// Fills `buf` with `struct linux_dirent64` records from the position of the directory, for

@@ -259,6 +259,20 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 
+    /// Swaps the blocks `orig_start..orig_start + len` of this regular file with the blocks
+    /// from `donor_start` of the regular file `donor`, for `EXT4_IOC_MOVE_EXT`. The data of this
+    /// file stays the same, but it goes to the blocks of `donor`. Gives the number of blocks
+    /// that moved. The default gives `ENOTTY`.
+    fn move_extents(
+        &self,
+        _donor: &InodeRef,
+        _orig_start: u64,
+        _donor_start: u64,
+        _len: u64,
+    ) -> Result<u64> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Gives the inode flags of [`iflags`], for `FS_IOC_GETFLAGS`. The default gives `ENOTTY`, as
     /// Linux gives for a file system that does not have the ioctl.
     fn attr_flags(&self) -> Result<u32> {
