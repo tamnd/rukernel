@@ -220,11 +220,15 @@ impl Drop for Fs {
 pub struct Fs {
     disk: Arc<dyn Disk>,
     dev: u64,
-    /// The superblock as the mount read it. An online resize changes the number of blocks and
-    /// of inodes, so these come from `blocks` and `groups`.
+    /// The superblock as the mount read it. An online resize changes the number of blocks, of
+    /// inodes and the layout of the groups, so these come from `blocks`, `groups` and `layout`.
     sb: Superblock,
     /// The number of blocks.
     blocks: AtomicU64,
+    /// The layout of the groups: the superblock with the fields that an online resize changes.
+    /// These are the number of blocks, the reserved descriptor blocks, `resize_inode` and
+    /// `meta_bg`.
+    layout: SpinLock<Superblock>,
     /// The block groups. An online resize adds groups at the end.
     groups: SpinLock<Vec<GroupDesc>>,
     /// The file system can change. A remount changes it.
@@ -338,6 +342,7 @@ impl Fs {
             disk,
             dev,
             blocks: AtomicU64::new(sb.blocks_count),
+            layout: SpinLock::new(sb.clone()),
             sb,
             groups: SpinLock::new(groups),
             writable: AtomicBool::new(writable),
@@ -522,7 +527,8 @@ impl Fs {
         } else if bigalloc {
             self.overhead_clusters() << sb.cluster_bits
         } else {
-            let base: u64 = (0..groups).map(|g| sb.base_meta_blocks(g)).sum();
+            let layout = self.layout();
+            let base: u64 = (0..groups).map(|g| layout.base_meta_blocks(g)).sum();
             u64::from(sb.first_data_block) + base + u64::from(groups) * (2 + sb.itable_blocks())
         };
         if !from_mkfs
@@ -550,7 +556,7 @@ impl Fs {
     /// block, a bitmap or an inode table, as `count_overhead` of Linux. One cluster can have
     /// blocks of more than one of them.
     fn overhead_clusters(&self) -> u64 {
-        let sb = &self.sb;
+        let sb = &self.layout();
         let groups = self.groups.lock().clone();
         let mut runs: Vec<(u64, u64)> = Vec::with_capacity(groups.len() * 4);
         for (group, desc) in (0..).zip(&groups) {
@@ -732,6 +738,12 @@ impl Fs {
     /// Gives `EIO` for a group past the end.
     pub(crate) fn group(&self, group: u32) -> Result<GroupDesc> {
         self.groups.lock().get(group as usize).copied().ok_or(Errno::EIO)
+    }
+
+    /// The layout of the groups now. It is the superblock as the mount read it, with the
+    /// changes of an online resize.
+    pub(crate) fn layout(&self) -> Superblock {
+        self.layout.lock().clone()
     }
 
     /// The superblock as the mount read it.

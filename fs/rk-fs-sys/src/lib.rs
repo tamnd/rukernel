@@ -9,6 +9,8 @@
 //!   A loop device with a file also has the directory `loop`, which `losetup` reads.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
+//! - `/sys/fs/ext4/features` has a file for each feature of ext4 that programs look for. The
+//!   online resize of `resize2fs` reads `meta_bg_resize`.
 //!
 //! Linux puts a device of a bus below the directory of the bus. This kernel puts all devices in
 //! `/sys/devices/virtual`. A program that follows the links does not see the difference.
@@ -37,9 +39,14 @@ pub const SYSFS_MAGIC: u64 = 0x6265_6572;
 /// The file system type of sysfs, for `mount -t sysfs`.
 pub const FS_TYPE: FsType = FsType { name: "sysfs", nodev: true, make: mount };
 
-/// The directories at the top of sysfs. Only `block`, `class`, `dev` and `devices` have entries.
+/// The directories at the top of sysfs. Only `block`, `class`, `dev`, `devices` and `fs` have
+/// entries.
 const TOP: [&str; 10] =
     ["block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power"];
+
+/// The files of `/sys/fs/ext4/features`, as Linux. `resize2fs` grows a mounted file system past
+/// its reserved descriptor blocks only if `meta_bg_resize` is there.
+const EXT4_FEATURES: [&str; 1] = ["meta_bg_resize"];
 
 /// The block size that `stat` gives for a sysfs file, as Linux gives.
 const BLOCK_SIZE: u32 = 4096;
@@ -162,6 +169,12 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
                 .map(|(n, text)| (String::from(n), Kind::File(text.into_bytes())))
                 .collect()
         }
+        ["fs"] => dirs(&mut ["ext4"].into_iter()),
+        ["fs", "ext4"] => dirs(&mut ["features"].into_iter()),
+        ["fs", "ext4", "features"] => EXT4_FEATURES
+            .iter()
+            .map(|&n| (String::from(n), Kind::File(b"supported\n".to_vec())))
+            .collect(),
         [top] if TOP.contains(&top) => Vec::new(),
         _ => return None,
     };
@@ -374,6 +387,13 @@ mod tests {
         assert!(!names("devices/virtual/block/vda").contains(&String::from("loop")));
         assert_eq!(entries("devices/virtual/block/vda/loop", &list()), None);
         assert_eq!(get("devices/virtual/block/vda/ro"), Kind::File(b"0\n".to_vec()));
+    }
+
+    #[test]
+    fn ext4_tells_its_features() {
+        assert_eq!(names("fs"), ["ext4"]);
+        assert_eq!(names("fs/ext4/features"), ["meta_bg_resize"]);
+        assert_eq!(get("fs/ext4/features/meta_bg_resize"), Kind::File(b"supported\n".to_vec()));
     }
 
     #[test]

@@ -116,6 +116,14 @@ pub mod sb {
     pub const BLOCKS_COUNT_HI: usize = 0x150;
     /// The group of this copy of the superblock.
     pub const BLOCK_GROUP_NR: usize = 0x5a;
+    /// The compatible features.
+    pub const FEATURE_COMPAT: usize = 0x5c;
+    /// The incompatible features.
+    pub const FEATURE_INCOMPAT: usize = 0x60;
+    /// The number of reserved blocks for more group descriptors, `s_reserved_gdt_blocks`.
+    pub const RESERVED_GDT_BLOCKS: usize = 0xce;
+    /// The first meta block group, `s_first_meta_bg`.
+    pub const FIRST_META_BG: usize = 0x104;
     /// The low 32 bits of the number of blocks for the superuser only.
     pub const R_BLOCKS: usize = 0x8;
     /// The high 32 bits of the number of blocks for the superuser only.
