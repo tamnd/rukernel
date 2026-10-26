@@ -223,6 +223,8 @@ pub(crate) fn pwrite(cx: &Cx<'_>, fd: u64, buf: u64, count: u64, offset: u64) ->
     if !file.ops().seekable() {
         return Err(Errno::ESPIPE);
     }
+    // A file with `O_APPEND` takes the write at the end, as `generic_write_checks` of Linux.
+    let offset = if file.flags().append() { write_pos(&file) } else { offset };
     let count = fsize_count(cx, &file, offset, count)?;
     write_with(cx, buf, count, |done, b| file.write_at(offset + done, b))
 }
@@ -349,8 +351,8 @@ pub(crate) fn preadv2(
 }
 
 /// `pwritev` and `pwritev2`. An offset of -1 for `pwritev2` writes at the position of the file,
-/// as `writev`. `RWF_APPEND` writes at the end, and `RWF_DSYNC` and `RWF_SYNC` sync the file
-/// after the write.
+/// as `writev`. `RWF_APPEND`, or `O_APPEND` without `RWF_NOAPPEND`, writes at the end, and
+/// `RWF_DSYNC` and `RWF_SYNC` sync the file after the write.
 pub(crate) fn pwritev2(
     cx: &Cx<'_>,
     fd: u64,
@@ -375,7 +377,9 @@ pub(crate) fn pwritev2(
         }
         check_rw_flags(flags, true)?;
         let mut offset = offset;
-        if flags & rwf::APPEND != 0 {
+        // `RWF_NOAPPEND` cancels the `O_APPEND` of the file for this write.
+        let append = file.flags().append() && flags & rwf::NOAPPEND == 0;
+        if flags & rwf::APPEND != 0 || append {
             offset = file.metadata()?.size;
         }
         let iovs = read_iovecs(cx, iov, count)?;
