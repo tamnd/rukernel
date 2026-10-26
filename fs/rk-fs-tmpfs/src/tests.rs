@@ -218,6 +218,34 @@ fn rename_exchange_swaps_the_names() {
 }
 
 #[test]
+fn rename_whiteout_leaves_a_whiteout() {
+    use rk_vfs::cred::{Cred, cap};
+    use rk_vfs::fs::rename_flags::{AT_RENAME_EXCHANGE, AT_RENAME_NOREPLACE, AT_RENAME_WHITEOUT};
+    let (mut fs, root) = setup();
+    let whiteout = AT_RENAME_WHITEOUT as u32;
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    fs.mkdir(&root, b"/d", 0o755).unwrap();
+    write_file(&fs, &root, b"/f", b"1");
+    write_file(&fs, &root, b"/g", b"2");
+    fs.rename(&root, b"/f", &root, b"/g", whiteout).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/g").as_deref(), Ok(&b"1"[..]));
+    let meta = fs.resolve(&root, b"/f", false).unwrap().inode().metadata();
+    assert_eq!((meta.mode, meta.rdev, meta.nlink), (mode::S_IFCHR, 0, 1));
+    // A directory moves to a new parent, and the old parent loses its link.
+    let noreplace = whiteout | AT_RENAME_NOREPLACE as u32;
+    fs.rename(&root, b"/d", &root, b"/a/d", noreplace).unwrap();
+    assert_eq!(fs.resolve(&root, b"/a", false).unwrap().inode().metadata().nlink, 3);
+    assert_eq!(fs.resolve(&root, b"/", false).unwrap().inode().metadata().nlink, 3);
+    assert_eq!(fs.resolve(&root, b"/d", false).unwrap().inode().metadata().mode, mode::S_IFCHR);
+    assert_eq!(fs.rename(&root, b"/g", &root, b"/a", noreplace).err(), Some(Errno::EEXIST));
+    let both = whiteout | AT_RENAME_EXCHANGE as u32;
+    assert_eq!(fs.rename(&root, b"/g", &root, b"/f", both).err(), Some(Errno::EINVAL));
+    let all = cap::ALL & !cap::bit(cap::MKNOD);
+    fs.set_cred(Arc::new(Cred::root().capset(all, cap::ALL, 0).unwrap()));
+    assert_eq!(fs.rename(&root, b"/g", &root, b"/h", whiteout).err(), Some(Errno::EPERM));
+}
+
+#[test]
 fn rename_follows_linux() {
     let (fs, root) = setup();
     fs.mkdir(&root, b"/a", 0o755).unwrap();

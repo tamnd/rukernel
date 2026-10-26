@@ -408,6 +408,20 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EINVAL)
     }
 
+    /// Moves `old` of this directory to `new` of `new_dir` as `rename`, and puts a whiteout at
+    /// `old` in the same change, for `RENAME_WHITEOUT`. A whiteout is a character device with the
+    /// device number 0:0 and the mode 0. `owner` is the user and the group of the whiteout. The
+    /// default gives `EINVAL`, as Linux gives for a file system without `RENAME_WHITEOUT`.
+    fn rename_whiteout(
+        &self,
+        _old: &[u8],
+        _new_dir: &InodeRef,
+        _new: &[u8],
+        _owner: (u32, u32),
+    ) -> Result<()> {
+        Err(Errno::EINVAL)
+    }
+
     /// The target of a symbolic link.
     fn read_link(&self) -> Result<Vec<u8>> {
         Err(Errno::EINVAL)

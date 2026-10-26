@@ -575,8 +575,9 @@ impl FsContext {
         if exchange && flags & (AT_RENAME_NOREPLACE | AT_RENAME_WHITEOUT) as u32 != 0 {
             return Err(Errno::EINVAL);
         }
-        if flags & AT_RENAME_WHITEOUT as u32 != 0 {
-            return Err(Errno::EOPNOTSUPP);
+        let whiteout = flags & AT_RENAME_WHITEOUT as u32 != 0;
+        if whiteout && !self.cred.capable(cap::MKNOD) {
+            return Err(Errno::EPERM);
         }
         let old = self.parent(old_start, old_path)?;
         let new = self.parent(new_start, new_path)?;
@@ -636,7 +637,15 @@ impl FsContext {
                 return Err(Errno::EBUSY);
             }
         }
-        old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
+        if whiteout {
+            // The whiteout gets the owner of a new file, as `ext4_whiteout_for_rename` and
+            // `shmem_whiteout` of Linux.
+            let (uid, gid, _) =
+                self.cred.new_owner(&old.dir.inode().metadata(), FileType::CharDevice, 0);
+            old.dir.inode().rename_whiteout(&old.name, new.dir.inode(), &new.name, (uid, gid))?;
+        } else {
+            old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
+        }
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);
         Ok(())
     }

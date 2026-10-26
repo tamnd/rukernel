@@ -251,6 +251,52 @@ impl Node {
             *p = Arc::downgrade(parent);
         }
     }
+
+    /// Moves `old` of this directory to `new` of `new_dir`, for `rename`. With `whiteout`, a
+    /// whiteout with this owner takes the place of `old`, as `shmem_whiteout` of Linux.
+    fn move_entry(
+        &self,
+        old: &[u8],
+        new_dir: &InodeRef,
+        new: &[u8],
+        whiteout: Option<(u32, u32)>,
+    ) -> Result<()> {
+        self.check_rw()?;
+        let target_dir = self.same_fs(new_dir)?;
+        let node = self.get(old)?;
+        let moving_dir = node.is_dir();
+        if let Ok(replaced) = target_dir.get(new) {
+            if replaced.is_dir() {
+                if !replaced.is_empty_dir() {
+                    return Err(Errno::ENOTEMPTY);
+                }
+                target_dir.take(new)?;
+                replaced.add_links(-2);
+                target_dir.add_links(-1);
+            } else {
+                target_dir.take(new)?;
+                replaced.add_links(-1);
+            }
+        }
+        self.take(old)?;
+        if let Some((uid, gid)) = whiteout {
+            let wh = Node::new(&self.fs, mode::S_IFCHR, 0, Weak::new());
+            {
+                let mut a = wh.attrs.lock();
+                a.uid = uid;
+                a.gid = gid;
+            }
+            self.insert(old, wh)?;
+        }
+        if moving_dir {
+            self.add_links(-1);
+            node.set_parent(&target_dir);
+        }
+        self.touch();
+        target_dir.insert(new, node.clone())?;
+        node.attrs.lock().ctime = now();
+        Ok(())
+    }
 }
 
 impl Drop for Node {
@@ -485,32 +531,17 @@ impl Inode for Node {
     }
 
     fn rename(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
-        self.check_rw()?;
-        let target_dir = self.same_fs(new_dir)?;
-        let node = self.get(old)?;
-        let moving_dir = node.is_dir();
-        if let Ok(replaced) = target_dir.get(new) {
-            if replaced.is_dir() {
-                if !replaced.is_empty_dir() {
-                    return Err(Errno::ENOTEMPTY);
-                }
-                target_dir.take(new)?;
-                replaced.add_links(-2);
-                target_dir.add_links(-1);
-            } else {
-                target_dir.take(new)?;
-                replaced.add_links(-1);
-            }
-        }
-        self.take(old)?;
-        if moving_dir {
-            self.add_links(-1);
-            node.set_parent(&target_dir);
-        }
-        self.touch();
-        target_dir.insert(new, node.clone())?;
-        node.attrs.lock().ctime = now();
-        Ok(())
+        self.move_entry(old, new_dir, new, None)
+    }
+
+    fn rename_whiteout(
+        &self,
+        old: &[u8],
+        new_dir: &InodeRef,
+        new: &[u8],
+        owner: (u32, u32),
+    ) -> Result<()> {
+        self.move_entry(old, new_dir, new, Some(owner))
     }
 
     fn exchange(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
