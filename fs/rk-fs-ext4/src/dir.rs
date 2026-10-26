@@ -2,9 +2,11 @@
 //! the type of the file and the name. The records of a block fill the block. With
 //! `metadata_csum`, each block ends with a record of 12 bytes that has the checksum.
 //!
-//! A change keeps a directory a list. A new entry in a directory with an htree index first
-//! changes the index blocks into empty blocks and clears the `INDEX` flag, so the directory is a
-//! list that Linux and fsck read.
+//! A directory of one block that becomes full gets an htree index if the file system has
+//! `dir_index`, as Linux. The `htree` module finds and adds the entries of an indexed directory.
+//! Without `dir_index`, a new entry in a directory with an index first changes the index blocks
+//! into empty blocks and clears the `INDEX` flag, so the directory is a list. `readdir` gives
+//! the entries in the order of the blocks, also with an index.
 
 use crate::layout::{self, RawInode, flags, put16, put32, u16_at, u32_at};
 use crate::node::{Node, entry_code, entry_type};
@@ -20,8 +22,28 @@ const TAIL: usize = 12;
 const TAIL_TYPE: u8 = 0xde;
 
 /// The length of a record for a name of `len` bytes.
-fn rec_len(len: usize) -> usize {
+pub(crate) fn rec_len(len: usize) -> usize {
     (8 + len).next_multiple_of(4)
+}
+
+/// Finds the entry `name` in the block `lblock` of a directory, which has the data `data`.
+pub(crate) fn search_block(data: &[u8], lblock: u64, name: &[u8]) -> Result<Option<Slot>> {
+    let mut at = 0;
+    let mut prev = None;
+    while at + 8 <= data.len() {
+        let rec = usize::from(u16_at(data, at + 4));
+        let name_len = usize::from(data[at + 6]);
+        if rec < 8 || at + rec > data.len() || at + 8 + name_len > data.len() {
+            return Err(Errno::EUCLEAN);
+        }
+        let ino = u32_at(data, at);
+        if ino != 0 && &data[at + 8..at + 8 + name_len] == name {
+            return Ok(Some(Slot { lblock, at, prev, ino }));
+        }
+        prev = Some(at);
+        at += rec;
+    }
+    Ok(None)
 }
 
 /// An entry that a search found.
@@ -38,12 +60,12 @@ pub(crate) struct Slot {
 
 impl Fs {
     /// The length of the checksum record of a block of a directory.
-    fn tail(&self) -> usize {
+    pub(crate) fn tail(&self) -> usize {
         if self.metadata_csum() { TAIL } else { 0 }
     }
 
     /// Reads the block `lblock` of a directory. Gives the block of the disk and the data.
-    fn dir_block(&self, raw: &RawInode, lblock: u64) -> Result<(u64, Vec<u8>)> {
+    pub(crate) fn dir_block(&self, raw: &RawInode, lblock: u64) -> Result<(u64, Vec<u8>)> {
         let Some((block, true)) = self.map(raw, lblock)? else { return Err(Errno::EUCLEAN) };
         Ok((block, self.read_block(block)?))
     }
@@ -86,26 +108,22 @@ impl Fs {
         Ok(None)
     }
 
-    /// Finds the entry `name` in a directory.
+    /// Finds the entry `name` in a directory. A directory with a valid index uses the index,
+    /// except for `.` and `..`, which are in the block 0.
     pub(crate) fn find_entry(&self, raw: &RawInode, name: &[u8]) -> Result<Option<Slot>> {
+        if self.is_dx(raw)
+            && name != b"."
+            && name != b".."
+            && let Some(found) = self.dx_find(raw, name)?
+        {
+            return Ok(found);
+        }
         let bs = self.sb.block_size;
         for lblock in 0..raw.size() / bs {
             let mut data = vec![0u8; bs as usize];
             self.read_data(raw, lblock * bs, &mut data)?;
-            let mut at = 0;
-            let mut prev = None;
-            while at + 8 <= data.len() {
-                let rec = usize::from(u16_at(&data, at + 4));
-                let name_len = usize::from(data[at + 6]);
-                if rec < 8 || at + rec > data.len() || at + 8 + name_len > data.len() {
-                    return Err(Errno::EUCLEAN);
-                }
-                let ino = u32_at(&data, at);
-                if ino != 0 && &data[at + 8..at + 8 + name_len] == name {
-                    return Ok(Some(Slot { lblock, at, prev, ino }));
-                }
-                prev = Some(at);
-                at += rec;
+            if let Some(slot) = search_block(&data, lblock, name)? {
+                return Ok(Some(slot));
             }
         }
         Ok(None)
@@ -124,7 +142,7 @@ impl Fs {
     }
 
     /// Writes the checksum record at the end of the block `data` of the directory `ino`.
-    fn seal(&self, ino: u32, raw: &RawInode, data: &mut [u8]) {
+    pub(crate) fn seal(&self, ino: u32, raw: &RawInode, data: &mut [u8]) {
         if !self.metadata_csum() {
             return;
         }
@@ -153,6 +171,38 @@ impl Fs {
         data[at + 7] =
             if self.sb.incompat & layout::incompat::FILETYPE != 0 { entry_code(kind) } else { 0 };
         data[at + 8..at + 8 + name.len()].copy_from_slice(name);
+    }
+
+    /// Adds the record of `name` to the block `data` of a directory, in the first record with
+    /// room, as `ext4_find_dest_de`. Gives false if the block has no room.
+    pub(crate) fn put_in_block(
+        &self,
+        data: &mut [u8],
+        name: &[u8],
+        ino: u32,
+        kind: FileType,
+    ) -> Result<bool> {
+        let usable = data.len() - self.tail();
+        let need = rec_len(name.len());
+        let mut at = 0;
+        while at < usable {
+            let rec = usize::from(u16_at(data, at + 4));
+            if rec < 8 || at + rec > usable {
+                return Err(Errno::EUCLEAN);
+            }
+            let used = if u32_at(data, at) != 0 { rec_len(usize::from(data[at + 6])) } else { 0 };
+            if rec >= used + need {
+                if used == 0 {
+                    self.put_entry(data, at, rec, ino, name, kind);
+                } else {
+                    put16(data, at + 4, used as u16);
+                    self.put_entry(data, at + used, rec - used, ino, name, kind);
+                }
+                return Ok(true);
+            }
+            at += rec;
+        }
+        Ok(false)
     }
 
     /// Gives the first block of a new directory `ino` with the parent `parent`.
@@ -195,7 +245,7 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Adds the entry `name` for the inode `ino` to the directory `dir`.
+    /// Adds the entry `name` for the inode `ino` to the directory `dir`, as `ext4_add_entry`.
     pub(crate) fn add_entry(
         &mut self,
         dir: &Node,
@@ -203,43 +253,54 @@ impl Tx<'_> {
         ino: u32,
         kind: FileType,
     ) -> Result<()> {
-        let fs = self.fs;
         let mut raw = dir.raw();
-        self.unindex(dir, &mut raw)?;
+        let result = self.add_entry_to(dir, &mut raw, name, ino, kind);
+        self.save(dir, &mut raw)?;
+        result
+    }
+
+    /// Adds the entry `name` to the directory `dir`, which has the inode `raw`. An indexed
+    /// directory adds it with its index. A list adds it to the first block with room, or to a
+    /// new block. A directory of one full block gets an index first.
+    fn add_entry_to(
+        &mut self,
+        dir: &Node,
+        raw: &mut RawInode,
+        name: &[u8],
+        ino: u32,
+        kind: FileType,
+    ) -> Result<()> {
+        let fs = self.fs;
+        // A directory with an index that is not valid becomes a list, and it stays a list.
+        let mut fallback = false;
+        if raw.flags() & flags::INDEX != 0 {
+            if fs.dir_index() && self.dx_add(dir, raw, name, ino, kind)? {
+                return Ok(());
+            }
+            self.unindex(dir, raw)?;
+            fallback = true;
+        }
         let bs = fs.sb.block_size as usize;
-        let usable = bs - fs.tail();
-        let need = rec_len(name.len());
-        for lblock in 0..raw.size() / bs as u64 {
-            let (block, mut data) = fs.dir_block(&raw, lblock)?;
-            let mut at = 0;
-            while at < usable {
-                let rec = usize::from(u16_at(&data, at + 4));
-                if rec < 8 || at + rec > usable {
-                    return Err(Errno::EUCLEAN);
-                }
-                let used =
-                    if u32_at(&data, at) != 0 { rec_len(usize::from(data[at + 6])) } else { 0 };
-                if rec - used >= need {
-                    if used == 0 {
-                        fs.put_entry(&mut data, at, rec, ino, name, kind);
-                    } else {
-                        put16(&mut data, at + 4, used as u16);
-                        fs.put_entry(&mut data, at + used, rec - used, ino, name, kind);
-                    }
-                    fs.seal(dir.ino, &raw, &mut data);
-                    fs.write(block * bs as u64, &data)?;
-                    return self.save(dir, &mut raw);
-                }
-                at += rec;
+        let blocks = raw.size() / bs as u64;
+        for lblock in 0..blocks {
+            let (block, mut data) = fs.dir_block(raw, lblock)?;
+            if fs.put_in_block(&mut data, name, ino, kind)? {
+                fs.seal(dir.ino, raw, &mut data);
+                return fs.write(block * bs as u64, &data);
+            }
+            if blocks == 1
+                && !fallback
+                && fs.dir_index()
+                && self.make_indexed(dir, raw, (block, data), (name, ino, kind))?
+            {
+                return Ok(());
             }
         }
         let mut data = vec![0u8; bs];
-        fs.put_entry(&mut data, 0, usable, ino, name, kind);
-        fs.seal(dir.ino, &raw, &mut data);
+        fs.put_entry(&mut data, 0, bs - fs.tail(), ino, name, kind);
+        fs.seal(dir.ino, raw, &mut data);
         let size = raw.size();
-        let result = self.write_data(dir.ino, &mut raw, size, &data);
-        self.save(dir, &mut raw)?;
-        result.map(drop)
+        self.write_data(dir.ino, raw, size, &data).map(drop)
     }
 
     /// Removes the entry `name` from the directory `dir`. Gives the inode of the entry.
