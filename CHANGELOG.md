@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - `name_to_handle_at` and `open_by_handle_at` on ext4 and tmpfs, as Linux. An ext4 handle has the inode number and the generation, as `FILEID_INO32_GEN`, so it stays valid after a rename and after a new mount. An open by handle needs `CAP_DAC_READ_SEARCH`, and a handle of a removed inode gives `ESTALE`. `statx` now gives the mount ID in `stx_mnt_id`. generic/426, generic/467 and generic/477 now pass.
+- `EXT4_IOC_MOVE_EXT` on ext4, as `ext4_move_extents` of Linux. The ioctl swaps the blocks of a file with the blocks of a donor file for online defragmentation. The data of the file stays the same and goes to the blocks of the donor, and the donor gets the old blocks. If the blocks of both files have no data, only the extents swap. A hole in either file stays. `fallocate` on ext4 now takes a free run of all the blocks after a short free run at the goal, as the mballoc of Linux. ext4/308 and generic/018 now pass.
 
 ### Fixed
 

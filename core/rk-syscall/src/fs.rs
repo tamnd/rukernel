@@ -664,11 +664,32 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     {
         return Err(Errno::EPERM);
     }
+    if cmd == rk_vfs::file::EXT4_IOC_MOVE_EXT {
+        return move_ext(cx, &file, arg);
+    }
     if let Some(notify) = crate::seccomp::listener_of(&file) {
         return crate::seccomp::listener_ioctl(cx, &notify, cmd, arg);
     }
     let vm = cx.vm()?;
     Ok(file.ioctl(cmd, arg as usize, &UserMem(&vm))? as u64)
+}
+
+/// The size of `struct move_extent`: the reserved field and `donor_fd` at 0 and 4, and then
+/// `orig_start`, `donor_start`, `len` and `moved_len` at 8, 16, 24 and 32.
+const MOVE_EXTENT_SIZE: usize = 40;
+
+/// `EXT4_IOC_MOVE_EXT` on `file`. The `moved_len` field of the argument gets the number of
+/// blocks that moved, as `ext4_ioctl` of Linux.
+fn move_ext(cx: &Cx<'_>, file: &File, arg: u64) -> SysResult {
+    let raw = cx.read_bytes(arg, MOVE_EXTENT_SIZE)?;
+    let u64_at = |o: usize| u64::from_ne_bytes(raw[o..o + 8].try_into().unwrap_or_default());
+    let donor_fd = u32::from_ne_bytes(raw[4..8].try_into().unwrap_or_default());
+    let donor = cx.file(u64::from(donor_fd))?;
+    let result = file.move_extents(&donor, u64_at(8), u64_at(16), u64_at(24));
+    let mut out = raw;
+    out[32..40].copy_from_slice(&result.unwrap_or(0).to_ne_bytes());
+    cx.write_bytes(arg, &out)?;
+    result.map(|_| 0)
 }
 
 fn dup_from(cx: &Cx<'_>, fd: u64, min: u64, cloexec: bool) -> SysResult {

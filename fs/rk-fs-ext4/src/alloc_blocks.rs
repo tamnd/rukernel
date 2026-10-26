@@ -206,6 +206,42 @@ impl Tx<'_> {
         Err(Errno::ENOSPC)
     }
 
+    /// Allocates up to `want` blocks in a row as [`Tx::alloc_blocks`], but if the free run at
+    /// `goal` is too short, it first looks for a free run of all `want` blocks after `goal`, as
+    /// the mballoc of Linux does. So the blocks of `fallocate` are in one extent if the file
+    /// system has such a run.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOSPC` if the file system has no free block.
+    pub(crate) fn alloc_run(&mut self, goal: u64, want: u32) -> Result<(u64, u32)> {
+        let sb = &self.fs.sb;
+        let (first, bpg) = (u64::from(sb.first_data_block), u64::from(sb.blocks_per_group));
+        let goal = goal.clamp(first, self.fs.blocks_count() - 1);
+        let groups = self.fs.group_count();
+        let goal_group = ((goal - first) / bpg) as u32;
+        for i in 0..groups {
+            let group = (goal_group + i) % groups;
+            let size = self.fs.blocks_in_group(group) as usize;
+            let need = (want as usize).min(size);
+            if (self.desc_get(group, gd::FREE_BLOCKS) as usize) < need {
+                continue;
+            }
+            let bitmap = self.block_bitmap(group)?;
+            let base = first + u64::from(group) * bpg;
+            let free = |b: usize| !test_bit(&bitmap, b) && !self.fs.is_busy(base + b as u64);
+            let from = if i == 0 { ((goal - first) % bpg) as usize } else { 0 };
+            let mut run = 0;
+            for b in from..size {
+                run = if free(b) { run + 1 } else { 0 };
+                if run == need {
+                    return self.alloc_blocks(base + (b + 1 - run) as u64, want);
+                }
+            }
+        }
+        self.alloc_blocks(goal, want)
+    }
+
     /// Frees `count` blocks from `start`.
     ///
     /// # Errors

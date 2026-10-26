@@ -30,6 +30,7 @@ mod htree;
 mod indirect;
 mod journal;
 pub mod layout;
+mod move_ext;
 mod node;
 mod resize;
 #[cfg(test)]

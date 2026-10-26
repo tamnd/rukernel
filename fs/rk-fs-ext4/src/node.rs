@@ -508,7 +508,7 @@ impl Tx<'_> {
                 .rev()
                 .find(|e| u64::from(e.lblock) < lblock)
                 .map_or_else(|| self.fs.goal(ino), |e| e.start + (lblock - u64::from(e.lblock)));
-            let (start, got) = match self.alloc_blocks(goal, want) {
+            let (start, got) = match self.alloc_run(goal, want) {
                 Ok(run) => run,
                 Err(e) => return (changed, Err(e)),
             };
@@ -1203,6 +1203,31 @@ impl Inode for Node {
                 }
             })
             .collect())
+    }
+
+    fn move_extents(
+        &self,
+        donor: &InodeRef,
+        orig_start: u64,
+        donor_start: u64,
+        len: u64,
+    ) -> Result<u64> {
+        let donor = self.same_fs(donor)?;
+        self.fs.retry_alloc(|| {
+            let mut tx = self.fs.tx()?;
+            let (mut orig_raw, mut donor_raw) = (self.raw(), donor.raw());
+            let moved = tx.move_extents(
+                (self.ino, &mut orig_raw),
+                (donor.ino, &mut donor_raw),
+                orig_start,
+                donor_start,
+                len,
+            );
+            // After an error the trees can be in new blocks, so both inodes go to the disk.
+            tx.save(self, &mut orig_raw)?;
+            tx.save(donor, &mut donor_raw)?;
+            moved
+        })
     }
 
     fn fiemap_xattr(&self) -> Result<Option<FiemapExtent>> {
