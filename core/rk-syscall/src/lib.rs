@@ -32,6 +32,8 @@ mod epoll;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod eventfd;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+mod fhandle;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod fs;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 mod futex;

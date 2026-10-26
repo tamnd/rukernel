@@ -485,28 +485,32 @@ fn lookup_meta(cx: &Cx<'_>, dirfd: u64, path: u64, flags: u32) -> Result<Metadat
     Ok(lookup(cx, dirfd, path, flags)?.0)
 }
 
-/// Gives the metadata of the file of `stat` and `statx`, and its inode if it has one.
+/// Gives the metadata of the file of `stat` and `statx`, its inode if it has one, and the ID of
+/// its mount, or 0 for a file without a mount.
 fn lookup(
     cx: &Cx<'_>,
     dirfd: u64,
     path: u64,
     flags: u32,
-) -> Result<(Metadata, Option<rk_vfs::InodeRef>), Errno> {
+) -> Result<(Metadata, Option<rk_vfs::InodeRef>, u64), Errno> {
     let empty_ok = flags & AT_EMPTY_PATH as u32 != 0;
     let path = cx.read_path_opt(path, empty_ok)?;
     if path.is_empty() {
         if dirfd as i32 == rk_abi::native::at::AT_FDCWD {
-            let inode = cx.fs()?.cwd().inode().clone();
-            return Ok((inode.metadata(), Some(inode)));
+            let fs = cx.fs()?;
+            let inode = fs.cwd().inode().clone();
+            return Ok((inode.metadata(), Some(inode), fs.cwd().mount.id()));
         }
         let file = cx.file(dirfd)?;
-        return Ok((file.metadata()?, file.inode().cloned()));
+        let id = file.location().map_or(0, |at| at.mount.id());
+        return Ok((file.metadata()?, file.inode().cloned(), id));
     }
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let follow = flags & AT_SYMLINK_NOFOLLOW as u32 == 0;
-    let inode = fs.resolve(&start, &path, follow)?.inode().clone();
-    Ok((inode.metadata(), Some(inode)))
+    let at = fs.resolve(&start, &path, follow)?;
+    let inode = at.inode().clone();
+    Ok((inode.metadata(), Some(inode), at.mount.id()))
 }
 
 pub(crate) fn fstatat(cx: &Cx<'_>, dirfd: u64, path: u64, buf: u64, flags: u64) -> SysResult {
@@ -523,9 +527,10 @@ pub(crate) fn statx(
     _mask: u64,
     buf: u64,
 ) -> SysResult {
-    let (meta, inode) = lookup(cx, dirfd, path, flags as u32)?;
+    let (meta, inode, mnt_id) = lookup(cx, dirfd, path, flags as u32)?;
     let mut s = Statx::new_zeroed();
     s.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
+    s.stx_mnt_id = mnt_id;
     // The `STATX_ATTR_*` bits of these flags are the bits of the inode flags.
     if let Some(Ok(f)) = inode.map(|i| i.attr_flags()) {
         let known =
@@ -1060,7 +1065,7 @@ pub(crate) fn faccessat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as u32 != 0 {
         return Err(Errno::EINVAL);
     }
-    let (meta, inode) = lookup(cx, dirfd, path, flags)?;
+    let (meta, inode, _) = lookup(cx, dirfd, path, flags)?;
     if mode == 0 {
         return Ok(0);
     }

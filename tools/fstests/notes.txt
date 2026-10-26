@@ -15,6 +15,7 @@ generic/128	Passes since #214. Before, /dev/null had the mode 0644 and a user co
 generic/256	Passes since the fix of the ext4 full disk leak. Before, a full disk leaked the blocks of a write or of fallocate when the extent tree needed a new block.
 generic/260	Passes since #255.
 generic/288	Passes since #255.
+generic/361	Passes since #269.
 generic/389	Passes since #259.
 generic/402	Passes since #267.
 generic/425	Passes since #266.

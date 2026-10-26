@@ -291,6 +291,33 @@ impl FsContext {
         self.open_inode(at, flags, false)
     }
 
+    /// Finds the file of the file handle of the type `ty` and the words `fid` in the mount of
+    /// `at`, for `open_by_handle_at`, as `handle_to_path` of Linux. The caller must have
+    /// `CAP_DAC_READ_SEARCH`, because the handle skips the permission checks of the directories
+    /// above the file. The dentry of a file that is not the root of the mount has no name in the
+    /// cache, as a dentry with `DCACHE_DISCONNECTED` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EPERM` without `CAP_DAC_READ_SEARCH`, and `ESTALE` if the file system cannot find
+    /// the inode of the handle.
+    pub fn handle_location(&self, at: &Location, ty: i32, fid: &[u32]) -> Result<Location> {
+        if !self.cred.capable(cap::DAC_READ_SEARCH) {
+            return Err(Errno::EPERM);
+        }
+        let root = at.mount.root();
+        let inode = root.inode().inode_by_handle(ty, fid).map_err(|e| match e {
+            Errno::ENOMEM => e,
+            _ => Errno::ESTALE,
+        })?;
+        let dentry = if inode.metadata().ino == root.inode().metadata().ino {
+            root.clone()
+        } else {
+            root.tmp_child(inode, false)
+        };
+        Ok(Location { mount: at.mount.clone(), dentry })
+    }
+
     /// Opens the inode at `at`. An open that made the file does not check the permission bits,
     /// so that `open` with `O_CREAT` and the mode 0 gives a descriptor that can write.
     fn open_inode(&self, at: Location, flags: u32, created: bool) -> Result<Arc<File>> {

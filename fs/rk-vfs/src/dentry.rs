@@ -98,7 +98,8 @@ impl Dentry {
 
     /// Makes the dentry of the new inode `inode` that has no name in this directory, for
     /// `O_TMPFILE`. The name is `#` and the inode number, as `d_tmpfile` of Linux. The dentry is
-    /// not in the cache, so no lookup finds it.
+    /// not in the cache, so no lookup finds it. `open_by_handle_at` also uses it for an inode
+    /// that it found without a path.
     pub fn tmp_child(self: &Arc<Self>, inode: InodeRef, linkable: bool) -> Arc<Dentry> {
         let name = alloc::format!("#{}", inode.metadata().ino);
         Arc::new(Self {

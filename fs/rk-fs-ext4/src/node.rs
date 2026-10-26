@@ -11,7 +11,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_vfs::inode::{FiemapExtent, mode};
+use rk_vfs::inode::{FiemapExtent, fileid, mode};
 use rk_vfs::xattr::{XATTR_CREATE, XATTR_REPLACE};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
@@ -1543,6 +1543,21 @@ impl Inode for Node {
         tx.write_xattrs(self.ino, &mut raw, &attrs)?;
         touch(&mut raw, false);
         tx.save(self, &mut raw)
+    }
+
+    /// The handle has the inode number and the generation, as `generic_encode_ino32_fh` of
+    /// Linux.
+    fn file_handle(&self) -> Option<(i32, Vec<u32>)> {
+        Some((fileid::INO32_GEN, vec![self.ino, self.raw().generation()]))
+    }
+
+    /// Finds the inode of a handle of `FILEID_INO32_GEN`, as `ext4_fh_to_dentry` of Linux.
+    fn inode_by_handle(&self, ty: i32, fid: &[u32]) -> Result<InodeRef> {
+        let &[ino, generation, ..] = fid else { return Err(Errno::ESTALE) };
+        if !matches!(ty, fileid::INO32_GEN | fileid::INO32_GEN_PARENT) {
+            return Err(Errno::ESTALE);
+        }
+        Ok(self.fs.inode_by_handle(ino, generation)?)
     }
 
     fn fs_id(&self) -> u64 {

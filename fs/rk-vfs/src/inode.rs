@@ -422,6 +422,24 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENODATA)
     }
 
+    /// Gives the file handle of the inode, for `name_to_handle_at`: a type of [`fileid`] and the
+    /// words of the handle. `None` tells that the file system cannot find an inode from a
+    /// handle, as a file system of Linux without `s_export_op`. The default gives `None`.
+    fn file_handle(&self) -> Option<(i32, Vec<u32>)> {
+        None
+    }
+
+    /// Finds the inode of the file handle of the type `ty` and the words `fid` in the file
+    /// system of this inode, for `open_by_handle_at`. The inode can have no link if a file keeps
+    /// it open. The default gives `ESTALE`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ESTALE` if the handle is not of this file system or if its inode was removed.
+    fn inode_by_handle(&self, _ty: i32, _fid: &[u32]) -> Result<InodeRef> {
+        Err(Errno::ESTALE)
+    }
+
     /// The device of the file system, for a rename or a link across file systems.
     fn fs_id(&self) -> u64 {
         self.metadata().dev
@@ -453,6 +471,16 @@ pub struct FiemapExtent {
     pub unwritten: bool,
     /// The extent is data in the inode, and it is not aligned to a block.
     pub inline: bool,
+}
+
+/// The types of a file handle, `enum fid_type` of `<linux/exportfs.h>`.
+pub mod fileid {
+    /// The inode number and the generation, in two words of 32 bits.
+    pub const INO32_GEN: i32 = 1;
+    /// The inode number and the generation of the file and of its parent directory.
+    pub const INO32_GEN_PARENT: i32 = 2;
+    /// The handle does not fit in the buffer.
+    pub const INVALID: i32 = 0xff;
 }
 
 /// The flags of `EXT4_IOC_CHECKPOINT`, from `<linux/ext4.h>`.

@@ -697,6 +697,42 @@ impl Fs {
         Ok(node)
     }
 
+    /// Gives the inode `ino` of a file handle with the generation `generation`, as
+    /// `ext4_nfs_get_inode` of Linux. An inode in memory can have no link, because a file keeps
+    /// it open. An inode on the disk without a link was removed. The generation 0 matches each
+    /// inode.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ESTALE` for a reserved inode, an inode that was removed, or another generation,
+    /// and the error of the disk.
+    pub fn inode_by_handle(&self, ino: u32, generation: u32) -> Result<Arc<Node>> {
+        if (ino < self.sb.first_ino && ino != layout::ROOT_INO) || ino > self.inodes_count() {
+            return Err(Errno::ESTALE);
+        }
+        let node = {
+            let mut inodes = self.inodes.lock();
+            match inodes.get(&ino).and_then(Weak::upgrade) {
+                Some(node) => node,
+                None => {
+                    let raw = self.read_inode(ino)?;
+                    // A node without a link becomes an orphan when it goes, so none is made.
+                    if raw.links() == 0 {
+                        return Err(Errno::ESTALE);
+                    }
+                    let fs = self.this.upgrade().ok_or(Errno::EIO)?;
+                    let node = Node::new(fs, ino, raw);
+                    self.keep_node(&mut inodes, ino, &node);
+                    node
+                }
+            }
+        };
+        if generation != 0 && node.raw().generation() != generation {
+            return Err(Errno::ESTALE);
+        }
+        Ok(node)
+    }
+
     /// Adds the new inode `ino` to the inodes in memory.
     fn new_node(&self, ino: u32, raw: RawInode) -> Result<Arc<Node>> {
         let fs = self.this.upgrade().ok_or(Errno::EIO)?;

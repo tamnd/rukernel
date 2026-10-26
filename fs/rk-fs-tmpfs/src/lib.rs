@@ -16,7 +16,7 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_vfs::inode::mode;
+use rk_vfs::inode::{fileid, mode};
 use rk_vfs::xattr::Xattrs;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
@@ -30,6 +30,9 @@ const BLOCK_SIZE: u32 = 4096;
 struct Fs {
     dev: u64,
     next_ino: AtomicU64,
+    /// The nodes in use, by inode number, for `open_by_handle_at`. A node leaves the map when
+    /// it goes away.
+    nodes: SpinLock<BTreeMap<u64, Weak<Node>>>,
 }
 
 /// The attributes of a node.
@@ -111,7 +114,11 @@ fn parse_octal(v: &[u8]) -> Option<u32> {
 
 /// Makes a new tmpfs and gives its root directory, with the permission bits `perm`.
 pub fn new(perm: u32) -> InodeRef {
-    let fs = Arc::new(Fs { dev: rk_vfs::anon_dev(), next_ino: AtomicU64::new(1) });
+    let fs = Arc::new(Fs {
+        dev: rk_vfs::anon_dev(),
+        next_ino: AtomicU64::new(1),
+        nodes: SpinLock::new(BTreeMap::new()),
+    });
     let root = Node::new(&fs, mode::S_IFDIR | (perm & mode::PERM_MASK), 0, Weak::new());
     root.attrs.lock().nlink = 2;
     root
@@ -127,9 +134,10 @@ impl Node {
             _ => Data::Special,
         };
         let nlink = if matches!(data, Data::Dir { .. }) { 2 } else { 1 };
-        Arc::new_cyclic(|this| Node {
+        let ino = fs.next_ino.fetch_add(1, Ordering::Relaxed);
+        let node = Arc::new_cyclic(|this| Node {
             fs: fs.clone(),
-            ino: fs.next_ino.fetch_add(1, Ordering::Relaxed),
+            ino,
             this: this.clone(),
             attrs: SpinLock::new(Attrs {
                 mode,
@@ -145,7 +153,9 @@ impl Node {
             }),
             data: SpinLock::new(data),
             xattrs: SpinLock::new(Xattrs::new()),
-        })
+        });
+        fs.nodes.lock().insert(ino, Arc::downgrade(&node));
+        node
     }
 
     fn is_dir(&self) -> bool {
@@ -227,6 +237,12 @@ impl Node {
         if let Data::Dir { parent: p, .. } = &mut *self.data.lock() {
             *p = Arc::downgrade(parent);
         }
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.fs.nodes.lock().remove(&self.ino);
     }
 }
 
@@ -548,6 +564,24 @@ impl Inode for Node {
         self.xattrs.lock().remove(name)?;
         self.attrs.lock().ctime = now();
         Ok(())
+    }
+
+    /// The handle has the generation, which is always 0, and the inode number in two words, as
+    /// `shmem_encode_fh` of Linux. An inode number is not used again, so the generation is not
+    /// necessary.
+    fn file_handle(&self) -> Option<(i32, Vec<u32>)> {
+        Some((fileid::INO32_GEN, alloc::vec![0, self.ino as u32, (self.ino >> 32) as u32]))
+    }
+
+    /// Finds a node that is in use, as `shmem_fh_to_dentry` of Linux.
+    fn inode_by_handle(&self, ty: i32, fid: &[u32]) -> Result<InodeRef> {
+        let &[0, low, high, ..] = fid else { return Err(Errno::ESTALE) };
+        if ty != fileid::INO32_GEN {
+            return Err(Errno::ESTALE);
+        }
+        let ino = u64::from(high) << 32 | u64::from(low);
+        let node = self.fs.nodes.lock().get(&ino).and_then(Weak::upgrade);
+        Ok(node.ok_or(Errno::ESTALE)?)
     }
 
     fn fs_magic(&self) -> u64 {

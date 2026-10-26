@@ -527,6 +527,31 @@ fn unlink_frees_the_blocks_and_the_inode() {
 }
 
 #[test]
+fn a_file_handle_finds_the_inode_until_the_inode_is_removed() {
+    use rk_vfs::inode::fileid;
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let file = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let (ty, fid) = file.file_handle().unwrap();
+    assert_eq!(ty, fileid::INO32_GEN);
+    assert_eq!(fid[0] as u64, file.metadata().ino);
+    // A new mount reads the inode from the disk.
+    root.sync().unwrap();
+    let found = again(&ram).root().unwrap().inode_by_handle(ty, &fid).unwrap();
+    assert_eq!(found.metadata().ino, file.metadata().ino);
+    // Another generation, a reserved inode and a short handle are stale.
+    let other = [fid[0], fid[1].wrapping_add(1)];
+    assert_eq!(root.inode_by_handle(ty, &other).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(ty, &[1, 0]).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(ty, &fid[..1]).err(), Some(Errno::ESTALE));
+    // An open file without a link stays, and a removed inode is stale.
+    root.unlink(b"f").unwrap();
+    assert!(root.inode_by_handle(ty, &fid).is_ok());
+    drop(file);
+    assert_eq!(root.inode_by_handle(ty, &fid).err(), Some(Errno::ESTALE));
+}
+
+#[test]
 fn directories_nest_and_count_their_links() {
     let (fs, ram) = open_rw();
     let free = ram.free();
