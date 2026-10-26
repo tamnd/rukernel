@@ -612,6 +612,42 @@ fn immutable_and_append_only_files() {
     fs.remove(&root, b"/a", false).unwrap();
 }
 
+#[test]
+fn a_file_handle_opens_the_file_until_it_goes() {
+    use rk_vfs::cred::{Cred, cap};
+    let (mut fs, root) = setup();
+    fs.mkdir(&root, b"/d", 0o755).unwrap();
+    write_file(&fs, &root, b"/d/f", b"data");
+    let dir = fs.resolve(&root, b"/d", true).unwrap();
+    let (ty, fid) = fs.resolve(&root, b"/d/f", true).unwrap().inode().file_handle().unwrap();
+    let (dir_ty, dir_fid) = dir.inode().file_handle().unwrap();
+    // The handle stays valid after a rename.
+    fs.rename(&root, b"/d/f", &root, b"/g", 0).unwrap();
+    let at = fs.handle_location(&root, ty, &fid).unwrap();
+    let f = fs.open_at(at, o::O_RDONLY).unwrap();
+    let mut buf = [0u8; 4];
+    assert_eq!(f.read(&mut buf), Ok(4));
+    assert_eq!(&buf, b"data");
+    // The directory of a handle finds its entries.
+    let at = fs.handle_location(&root, dir_ty, &dir_fid).unwrap();
+    assert!(at.dentry.lookup(b"g").is_err());
+    fs.rename(&root, b"/g", &root, b"/d/g", 0).unwrap();
+    assert!(at.dentry.lookup(b"g").is_ok());
+    // A handle of the root gives the root of the mount.
+    let (root_ty, root_fid) = root.inode().file_handle().unwrap();
+    assert!(fs.handle_location(&root, root_ty, &root_fid).unwrap().is_mount_root());
+    // An open file without a link stays, and a removed file is stale.
+    fs.remove(&root, b"/d/g", false).unwrap();
+    assert!(fs.handle_location(&root, ty, &fid).is_ok());
+    drop(f);
+    assert_eq!(fs.handle_location(&root, ty, &fid).err(), Some(Errno::ESTALE));
+    assert_eq!(fs.handle_location(&root, 2, &dir_fid).err(), Some(Errno::ESTALE));
+    // The caller must have `CAP_DAC_READ_SEARCH`.
+    let all = cap::ALL & !cap::bit(cap::DAC_READ_SEARCH);
+    fs.set_cred(Arc::new(Cred::root().capset(all, cap::ALL, 0).unwrap()));
+    assert_eq!(fs.handle_location(&root, dir_ty, &dir_fid).err(), Some(Errno::EPERM));
+}
+
 /// The calls that the VFS makes to the copies of the pages of a mapped file.
 struct Pages(rk_frame::sync::SpinLock<Vec<(u8, u64, u64)>>);
 

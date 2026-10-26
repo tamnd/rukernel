@@ -2,8 +2,9 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, cred, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process,
-    ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap, timer, timerfd, xattr,
+    aio, cred, epoll, eventfd, fhandle, fs, futex, info, memfd, mm, mount, net, pidfd, poll,
+    process, ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap, timer, timerfd,
+    xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -314,6 +315,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETRANDOM => info::getrandom(cx, a[0], a[1], a[2]),
         nr::MEMBARRIER => mm::membarrier(cx, a[0], a[1], a[2]),
         nr::STATX => fs::statx(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::NAME_TO_HANDLE_AT => fhandle::name_to_handle_at(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::OPEN_BY_HANDLE_AT => fhandle::open_by_handle_at(cx, a[0], a[1], a[2]),
         nr::CAPGET => cred::capget(cx, a[0], a[1]),
         nr::CAPSET => cred::capset(cx, a[0], a[1]),
         nr::KCMP => process::kcmp(a[0], a[1], a[2], a[3], a[4]),
