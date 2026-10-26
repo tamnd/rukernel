@@ -1213,6 +1213,29 @@ fn extended_attributes_stay_after_a_mount() {
 }
 
 #[test]
+fn fiemap_gives_the_extent_of_the_attributes() {
+    let (fs, _ram) = open_rw();
+    let file = fs.root().unwrap().create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    let ino = file.metadata().ino as u32;
+    assert_eq!(file.fiemap_xattr(), Ok(None));
+    // Attributes in the inode give the area after the extra fields.
+    file.set_xattr(b"user.small", b"1", 0).unwrap();
+    let raw = fs.inode(ino).unwrap().raw();
+    let start = 128 + raw.extra_size() as u64;
+    let block = fs.inode_at(ino).unwrap() / BS as u64;
+    let e = file.fiemap_xattr().unwrap().unwrap();
+    assert_eq!((e.logical, e.physical), (0, block * BS as u64 + start));
+    assert_eq!((e.length, e.inline), (raw.0.len() as u64 - start, true));
+    // Attributes in a block only give that block.
+    file.remove_xattr(b"user.small").unwrap();
+    file.set_xattr(b"user.large", &[7u8; 600], 0).unwrap();
+    let acl = fs.inode(ino).unwrap().raw().file_acl();
+    assert_ne!(acl, 0);
+    let e = file.fiemap_xattr().unwrap().unwrap();
+    assert_eq!((e.logical, e.physical, e.length, e.inline), (0, acl * BS as u64, BS as u64, false));
+}
+
+#[test]
 fn unlink_frees_the_attribute_block() {
     let (fs, ram) = open_rw();
     let free = ram.free();

@@ -1199,9 +1199,14 @@ impl Inode for Node {
                     physical: (e.start + skip) * bs,
                     length: (u64::from(e.len) - skip) * bs,
                     unwritten: !e.init,
+                    inline: false,
                 }
             })
             .collect())
+    }
+
+    fn fiemap_xattr(&self) -> Result<Option<FiemapExtent>> {
+        self.fs.xattr_extent(self.ino, &self.raw())
     }
 
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
