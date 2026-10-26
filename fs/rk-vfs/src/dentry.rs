@@ -97,6 +97,23 @@ impl Dentry {
         }
     }
 
+    /// Exchanges the cached children `old` of `self` and `new` of `new_parent`, after a
+    /// `RENAME_EXCHANGE`.
+    pub fn exchange_child(self: &Arc<Self>, old: &[u8], new_parent: &Arc<Dentry>, new: &[u8]) {
+        let first = self.children.lock().remove(old).and_then(|c| c.upgrade());
+        let second = new_parent.children.lock().remove(new).and_then(|c| c.upgrade());
+        if let Some(child) = first {
+            *child.name.lock() = new.to_vec();
+            *child.parent.lock() = Some(new_parent.clone());
+            new_parent.children.lock().insert(new.to_vec(), Arc::downgrade(&child));
+        }
+        if let Some(child) = second {
+            *child.name.lock() = old.to_vec();
+            *child.parent.lock() = Some(self.clone());
+            self.children.lock().insert(old.to_vec(), Arc::downgrade(&child));
+        }
+    }
+
     /// Tells if `self` is `other` or a descendant of `other`.
     pub fn is_under(self: &Arc<Self>, other: &Arc<Dentry>) -> bool {
         let mut at = Some(self.clone());

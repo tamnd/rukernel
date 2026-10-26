@@ -260,6 +260,27 @@ impl Tx<'_> {
         Ok(slot.ino)
     }
 
+    /// Points the existing entry `name` of the directory `dir` to the inode `ino` of the type
+    /// `kind`. The name and the hash of the entry do not change.
+    pub(crate) fn set_entry(
+        &mut self,
+        dir: &Node,
+        name: &[u8],
+        ino: u32,
+        kind: FileType,
+    ) -> Result<()> {
+        let fs = self.fs;
+        let raw = dir.raw();
+        let slot = fs.find_entry(&raw, name)?.ok_or(Errno::ENOENT)?;
+        let (block, mut data) = fs.dir_block(&raw, slot.lblock)?;
+        put32(&mut data, slot.at, ino);
+        if fs.sb.incompat & layout::incompat::FILETYPE != 0 {
+            data[slot.at + 7] = entry_code(kind);
+        }
+        fs.seal(dir.ino, &raw, &mut data);
+        fs.write(block * fs.sb.block_size, &data)
+    }
+
     /// Changes the inode of `..` in the directory `dir` to `parent`.
     pub(crate) fn set_parent(&mut self, dir: &Node, parent: u32) -> Result<()> {
         let fs = self.fs;

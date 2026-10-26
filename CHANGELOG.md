@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `renameat2` with `RENAME_EXCHANGE` on tmpfs and ext4. The two names exchange their files, which can have different types. A directory that moves to the other parent gets a new `..`, and the link counts of the parents change. A file system without the flag gives `EINVAL`, as Linux. generic/025 needs this.
+
 ### Fixed
 
 - ext4 keeps the inode before each orphan in memory, as Linux. Before this change, the close of an open file without links walked the list of orphans from its head, so a process that closed many such files used time that grew as the square of their count.

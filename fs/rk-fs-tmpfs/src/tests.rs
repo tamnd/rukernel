@@ -192,6 +192,29 @@ fn hard_links() {
 }
 
 #[test]
+fn rename_exchange_swaps_the_names() {
+    let (fs, root) = setup();
+    let exchange = rk_vfs::fs::rename_flags::AT_RENAME_EXCHANGE as u32;
+    let noreplace = rk_vfs::fs::rename_flags::AT_RENAME_NOREPLACE as u32;
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    fs.mkdir(&root, b"/a/sub", 0o755).unwrap();
+    write_file(&fs, &root, b"/f", b"1");
+    write_file(&fs, &root, b"/a/g", b"2");
+    fs.rename(&root, b"/f", &root, b"/a/g", exchange).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/f").as_deref(), Ok(&b"2"[..]));
+    assert_eq!(read_file(&fs, &root, b"/a/g").as_deref(), Ok(&b"1"[..]));
+    fs.rename(&root, b"/f", &root, b"/a/sub", exchange).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/a/sub").as_deref(), Ok(&b"2"[..]));
+    assert_eq!(names(&fs, &root, b"/f"), [&b"."[..], b".."]);
+    assert_eq!(fs.rename(&root, b"/f", &root, b"/none", exchange).err(), Some(Errno::ENOENT));
+    let both = exchange | noreplace;
+    assert_eq!(fs.rename(&root, b"/f", &root, b"/a", both).err(), Some(Errno::EINVAL));
+    fs.mkdir(&root, b"/f/in", 0o755).unwrap();
+    assert_eq!(fs.rename(&root, b"/f", &root, b"/f/in", exchange).err(), Some(Errno::EINVAL));
+    assert_eq!(fs.rename(&root, b"/f/in", &root, b"/f", exchange).err(), Some(Errno::EINVAL));
+}
+
+#[test]
 fn rename_follows_linux() {
     let (fs, root) = setup();
     fs.mkdir(&root, b"/a", 0o755).unwrap();

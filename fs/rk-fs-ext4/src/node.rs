@@ -1325,6 +1325,57 @@ impl Inode for Node {
         Ok(())
     }
 
+    fn exchange(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
+        let to = self.same_fs(new_dir)?;
+        let mut tx = self.fs.tx()?;
+        if !self.is_dir() || !to.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let first = self.fs.find_entry(&self.raw(), old)?.ok_or(Errno::ENOENT)?;
+        let second = self.fs.find_entry(&to.raw(), new)?.ok_or(Errno::ENOENT)?;
+        if first.ino == second.ino {
+            return Ok(());
+        }
+        let first = self.fs.inode(first.ino)?;
+        let second = self.fs.inode(second.ino)?;
+        let moves = self.ino != to.ino;
+        // When only one of the two is a directory, its new parent gets a link and the other
+        // parent loses one.
+        let links = if moves && first.is_dir() != second.is_dir() {
+            let (gains, loses) = if first.is_dir() { (to, self) } else { (self, to) };
+            if gains.raw().links() >= LINK_MAX {
+                return Err(Errno::EMLINK);
+            }
+            Some((gains, loses))
+        } else {
+            None
+        };
+        tx.set_entry(self, old, second.ino, second.kind())?;
+        tx.set_entry(to, new, first.ino, first.kind())?;
+        if moves {
+            if first.is_dir() {
+                tx.set_parent(&first, to.ino)?;
+            }
+            if second.is_dir() {
+                tx.set_parent(&second, self.ino)?;
+            }
+        }
+        if let Some((gains, loses)) = links {
+            gains.add_links(&mut tx, 1)?;
+            loses.add_links(&mut tx, -1)?;
+        }
+        for node in [&first, &second] {
+            let mut raw = node.raw();
+            touch(&mut raw, false);
+            tx.save(node, &mut raw)?;
+        }
+        self.touch_dir(&mut tx)?;
+        if moves {
+            to.touch_dir(&mut tx)?;
+        }
+        Ok(())
+    }
+
     fn read_link(&self) -> Result<Vec<u8>> {
         let raw = self.raw();
         if kind_of(&raw) != FileType::Symlink {
