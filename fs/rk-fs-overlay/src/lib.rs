@@ -19,6 +19,12 @@
 //! in the lower layer until a change of the data. A metacopy file can find its data in a
 //! data-only layer through an absolute redirect.
 //!
+//! With `index=on`, a copy up of a lower hard link puts the upper file in the directory `index`
+//! of the work directory, with the file handle of the lower inode as its name. The upper
+//! directory gets a link to it. The other lower hard links of the same lower inode then show
+//! the same upper file, and the attribute `trusted.overlay.nlink` of the upper file keeps the
+//! count of the links of the overlay file.
+//!
 //! The extended attributes of overlayfs have the prefix `trusted.overlay.`, or `user.overlay.`
 //! with the option `userxattr`. A user cannot see them through the mount. A user attribute with
 //! the prefix gets `overlay.` after the prefix in the layer, as the escapes of Linux, so an
@@ -31,7 +37,8 @@ extern crate alloc;
 
 mod params;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::format;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -78,12 +85,20 @@ const ORIGIN: &[u8] = b"origin";
 const IMPURE: &[u8] = b"impure";
 /// The attribute of the upper root with the uuid of the overlay.
 const UUID: &[u8] = b"uuid";
+/// The attribute of an upper file in the index with the count of the links of the overlay file,
+/// as a difference to the count of the links of the upper inode or of the lower inode: `U` or
+/// `L`, then a sign and a number, as `U-1`.
+const NLINK: &[u8] = b"nlink";
+/// The attribute of the index directory with the file handle of the upper root.
+const UPPER: &[u8] = b"upper";
 /// The inode flags that the attribute [`PROTATTR`] keeps.
 const PROT_FLAGS: u32 = iflags::IMMUTABLE | iflags::APPEND;
 /// The inode flags that a copy up gives to the upper inode.
 const COPY_FLAGS: u32 = iflags::SYNC | iflags::NOATIME;
 /// The name of the directory that overlayfs makes in the work directory.
 const WORK: &[u8] = b"work";
+/// The name of the index directory in the work directory, for the option `index`.
+const INDEX: &[u8] = b"index";
 /// The bytes that a copy up moves in one step.
 const CHUNK: usize = 64 * 1024;
 /// The maximum count of the unused nodes that one mount keeps, as the dentries on the LRU list
@@ -95,6 +110,36 @@ const FH_MAGIC: u8 = 0xfb;
 /// the magic number, the size, the flags, the type of the file handle and a uuid of 16 bytes. The
 /// words of the file handle come after it.
 const FH_HEADER: usize = 21;
+
+/// The upper and work directories that a mount uses, as a file system id and an inode number, as
+/// the `I_OVL_INUSE` flag of Linux.
+static IN_USE: SpinLock<BTreeSet<(u64, u64)>> = SpinLock::new(BTreeSet::new());
+
+/// The directories of [`IN_USE`] that one mount holds. The drop releases them.
+#[derive(Default)]
+struct InUse(Vec<(u64, u64)>);
+
+impl InUse {
+    /// Marks the directory `dir` as in use by this mount, as `ovl_inuse_trylock` of Linux.
+    /// Tells if no other mount uses it.
+    fn take(&mut self, dir: &InodeRef) -> bool {
+        let key = (dir.fs_id(), dir.metadata().ino);
+        let free = IN_USE.lock().insert(key);
+        if free {
+            self.0.push(key);
+        }
+        free
+    }
+}
+
+impl Drop for InUse {
+    fn drop(&mut self) {
+        let mut set = IN_USE.lock();
+        for key in &self.0 {
+            set.remove(key);
+        }
+    }
+}
 
 /// One mount of overlayfs.
 struct Fs {
@@ -129,6 +174,25 @@ struct Fs {
     /// numbers of the lower inode. Another upper inode of the same lower inode shows its own
     /// numbers, so two files do not have the same numbers.
     inos: SpinLock<BTreeMap<(u64, u64), (u64, u64)>>,
+    /// The index directory, with the option `index`. A copy up of a lower hard link puts the
+    /// upper file here, with the file handle of the lower inode as the name in hexadecimal. The
+    /// other names of the lower inode then find the upper file, so the hard link stays one file.
+    index: Option<InodeRef>,
+    /// The count of the files that the mount put in the index directory. A node without an upper
+    /// inode looks in the index directory again when the count changes.
+    indexed: AtomicU64,
+    /// The directory for the temporary files: the index directory with the option `index`, or
+    /// else the directory `work` in the work directory.
+    work: Option<InodeRef>,
+    /// The whiteout in [`Fs::work`] with its name, which the new whiteouts link to, as
+    /// `ofs->whiteout` of Linux.
+    whiteout: SpinLock<Option<(Vec<u8>, InodeRef)>>,
+    /// The upper file system cannot link whiteouts, so each whiteout is a new inode.
+    no_shared_whiteout: AtomicBool,
+    /// The number of the next temporary name.
+    temp: AtomicU64,
+    /// The upper and work directories that this mount marks as in use.
+    _in_use: InUse,
 }
 
 impl Fs {
@@ -259,18 +323,7 @@ impl Fs {
     /// as `ovl_set_origin_fh` of Linux. Tells if it set the attribute. A lower file system
     /// without file handles gives no attribute.
     fn set_origin(&self, upper: &InodeRef, lower: &InodeRef) -> Result<bool> {
-        let Some((ty, words)) = lower.file_handle() else { return Ok(false) };
-        let (Ok(ty), Ok(size)) = (u8::try_from(ty), u8::try_from(FH_HEADER + words.len() * 4))
-        else {
-            return Ok(false);
-        };
-        // The uuid has the id of the lower file system in its first 8 bytes.
-        let mut fh = vec![0, FH_MAGIC, size, 0, ty];
-        fh.extend_from_slice(&lower.fs_id().to_le_bytes());
-        fh.extend_from_slice(&[0; 8]);
-        for word in words {
-            fh.extend_from_slice(&word.to_le_bytes());
-        }
+        let Some(fh) = encode_fh(lower) else { return Ok(false) };
         match upper.set_xattr(&self.xattr(ORIGIN), &fh, 0) {
             Ok(()) => Ok(true),
             Err(Errno::EOPNOTSUPP) => Ok(false),
@@ -278,25 +331,181 @@ impl Fs {
         }
     }
 
-    /// Gives the lower inode of the attribute [`ORIGIN`] of `upper`, as `ovl_check_origin` of
-    /// Linux. An attribute that is not valid, a handle of a removed inode and an inode of
-    /// another type give `None`.
-    fn origin(&self, upper: &InodeRef) -> Option<InodeRef> {
-        let fh = upper.get_xattr(&self.xattr(ORIGIN)).ok()?;
-        let valid = fh.len() >= FH_HEADER
-            && fh[..2] == [0, FH_MAGIC]
-            && usize::from(fh[2]) == fh.len()
-            && (fh.len() - FH_HEADER).is_multiple_of(4);
-        if !valid {
+    /// Gives the lower inode of the file handle `fh` in the format of [`ORIGIN`], as
+    /// `ovl_decode_real_fh` of Linux. A handle that is not valid and a handle of a removed inode
+    /// give `None`.
+    fn decode_fh(&self, fh: &[u8]) -> Option<InodeRef> {
+        if !fh_is_valid(fh) {
             return None;
         }
         let id = u64::from_le_bytes(fh[5..13].try_into().ok()?);
         let words: Vec<u32> =
             fh[FH_HEADER..].as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
         let (_, root) = self.roots.iter().find(|(_, root)| root.fs_id() == id)?;
-        let inode = root.inode_by_handle(i32::from(fh[4]), &words).ok()?;
+        root.inode_by_handle(i32::from(fh[4]), &words).ok()
+    }
+
+    /// Gives the lower inode of the attribute [`ORIGIN`] of `upper`, as `ovl_check_origin` of
+    /// Linux. An attribute that is not valid, a handle of a removed inode and an inode of
+    /// another type give `None`.
+    fn origin(&self, upper: &InodeRef) -> Option<InodeRef> {
+        let fh = upper.get_xattr(&self.xattr(ORIGIN)).ok()?;
+        let inode = self.decode_fh(&fh)?;
         let same = inode.metadata().file_type() == upper.metadata().file_type();
         same.then_some(inode)
+    }
+
+    /// Gives the entry of the lower inode `lower` in the index directory, as `ovl_lookup_index`
+    /// of Linux. The entry must be a file of the same type as `lower`, else the lookup gives
+    /// `EIO`. If the node has the upper inode `upper`, the entry must be the same inode, else
+    /// the upper inode is not in the index and the lookup gives `None`.
+    fn lookup_index(&self, lower: &InodeRef, upper: Option<&InodeRef>) -> Result<Option<InodeRef>> {
+        let (Some(dir), Some(name)) = (&self.index, index_name(lower)) else { return Ok(None) };
+        let index = match dir.lookup(&name) {
+            Ok(index) => index,
+            Err(Errno::ENOENT) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // A whiteout in the index tells that all the lower hard links were removed.
+        let kind = index.metadata().file_type();
+        if is_whiteout(&index) || kind != lower.metadata().file_type() {
+            return Err(Errno::EIO);
+        }
+        if upper.is_some_and(|upper| !same_inode(upper, &index)) {
+            return Ok(None);
+        }
+        Ok(Some(index))
+    }
+
+    /// Gives the count of the links of the overlay file of the lower inode `lower` and of the
+    /// upper inode `upper` in the index, from the attribute [`NLINK`], as `ovl_get_nlink` of
+    /// Linux. It can be 0 or less after the removal of the last name. A lower inode with one
+    /// link and an attribute that is not valid give `None`.
+    fn nlink_value(&self, lower: &InodeRef, upper: &InodeRef) -> Option<i64> {
+        let lower_links = lower.metadata().nlink;
+        if lower_links == 1 {
+            return None;
+        }
+        let value = upper.get_xattr(&self.xattr(NLINK)).ok()?;
+        let (&base, diff) = value.split_first()?;
+        let base = match base {
+            b'L' => lower_links,
+            b'U' => upper.metadata().nlink,
+            _ => return None,
+        };
+        if !matches!(diff.first(), Some(b'+' | b'-')) {
+            return None;
+        }
+        let diff: i64 = core::str::from_utf8(diff).ok()?.parse().ok()?;
+        Some(i64::from(base) + diff)
+    }
+
+    /// Gives the count of the links of the overlay file of `lower` and `upper`, or `fallback`
+    /// if [`Fs::nlink_value`] gives no count above 0.
+    fn union_nlink(&self, lower: &InodeRef, upper: &InodeRef, fallback: u32) -> u32 {
+        let value = self.nlink_value(lower, upper).filter(|&n| n > 0);
+        value.and_then(|n| u32::try_from(n).ok()).unwrap_or(fallback)
+    }
+
+    /// Keeps `nlink`, the count of the links of the overlay file, in the attribute [`NLINK`] of
+    /// the upper inode `upper` in the index, as `ovl_set_nlink_upper` of Linux. The value is
+    /// the difference to the count of the links of `upper`, so a change of both counts by the
+    /// same link keeps it correct.
+    fn set_nlink(&self, upper: &InodeRef, nlink: u32) -> Result<()> {
+        let diff = i64::from(nlink) - i64::from(upper.metadata().nlink);
+        upper.set_xattr(&self.xattr(NLINK), format!("U{diff:+}").as_bytes(), 0)
+    }
+
+    /// Gives a new name for a temporary file in [`Fs::work`], as `ovl_lookup_temp` of Linux.
+    fn temp_name(&self) -> Vec<u8> {
+        format!("#{:x}", self.temp.fetch_add(1, Ordering::Relaxed)).into_bytes()
+    }
+
+    /// Makes a temporary file of the type `kind` in [`Fs::work`], and gives its name and inode.
+    fn make_temp(&self, kind: FileType, perm: u32, rdev: u64) -> Result<(Vec<u8>, InodeRef)> {
+        let work = self.work.as_ref().ok_or(Errno::EROFS)?;
+        loop {
+            let name = self.temp_name();
+            match work.create(&name, kind, perm, rdev) {
+                Ok(inode) => return Ok((name, inode)),
+                Err(Errno::EEXIST) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Makes a whiteout of `name` in the upper directory `dir`, as `ovl_whiteout` of Linux. The
+    /// whiteouts are links to one whiteout in [`Fs::work`], so they use one inode. A whiteout
+    /// with too many links gives its place to a new one. If the upper file system cannot link
+    /// the whiteout, each whiteout is a new inode.
+    fn make_whiteout(&self, dir: &InodeRef, name: &[u8]) -> Result<()> {
+        for _ in 0..2 {
+            if self.no_shared_whiteout.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut slot = self.whiteout.lock();
+            let shared = match slot.clone() {
+                Some((_, inode)) => inode,
+                None => match self.make_temp(FileType::CharDevice, 0, 0) {
+                    Ok((temp, inode)) => {
+                        *slot = Some((temp, inode.clone()));
+                        inode
+                    }
+                    Err(_) => break,
+                },
+            };
+            match dir.link(name, &shared) {
+                Ok(()) => return Ok(()),
+                // The temporary whiteout stays in the work directory until the next mount.
+                Err(Errno::EMLINK) => *slot = None,
+                Err(_) => self.no_shared_whiteout.store(true, Ordering::Relaxed),
+            }
+        }
+        dir.create(name, FileType::CharDevice, 0, 0).map(|_| ())
+    }
+
+    /// Removes the entries of the index directory `dir` that are not correct, as
+    /// `ovl_indexdir_cleanup` of Linux. A temporary file goes away. An entry whose lower inode
+    /// is removed or has no overlay file goes away. Another error stops the mount.
+    fn clean_index(&self, dir: &InodeRef) -> Result<()> {
+        for entry in real_entries(dir)? {
+            let index = match dir.lookup(&entry.name) {
+                Ok(index) => index,
+                Err(Errno::ENOENT) => continue,
+                Err(e) => return Err(e),
+            };
+            if entry.name.starts_with(b"#") {
+                remove_tree(dir, &entry.name, &index, 1)?;
+                continue;
+            }
+            match self.verify_index(&entry.name, &index) {
+                Ok(()) => {}
+                Err(Errno::ESTALE | Errno::ENOENT) => remove_tree(dir, &entry.name, &index, 1)?,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the entry `name` of the index directory, which is `index`, as `ovl_verify_index`
+    /// of Linux. The name must be a file handle in hexadecimal. A whiteout and a directory stay.
+    /// The attribute [`ORIGIN`] of the entry must be the same handle, and the lower inode must
+    /// be there, else the check gives `ESTALE`. An entry with one link and no overlay file
+    /// gives `ENOENT`.
+    fn verify_index(&self, name: &[u8], index: &InodeRef) -> Result<()> {
+        let fh = from_hex(name).filter(|fh| fh_is_valid(fh)).ok_or(Errno::EINVAL)?;
+        let m = index.metadata();
+        if is_whiteout(index) || m.is_dir() {
+            return Ok(());
+        }
+        if index.get_xattr(&self.xattr(ORIGIN)).ok().as_deref() != Some(&fh[..]) {
+            return Err(Errno::ESTALE);
+        }
+        let origin = self.decode_fh(&fh).ok_or(Errno::ESTALE)?;
+        if m.nlink == 1 && self.union_nlink(&origin, index, 0) == 0 {
+            return Err(Errno::ENOENT);
+        }
+        Ok(())
     }
 
     /// Sets the attribute [`IMPURE`] of the upper directory `dir`, as `ovl_set_impure` of Linux.
@@ -454,15 +663,19 @@ struct Walk {
 }
 
 /// Makes a new overlayfs for `mount(2)`. The options are `lowerdir=`, or `lowerdir+=` and
-/// `datadir+=`, then `upperdir=`, `workdir=`, `userxattr`, `redirect_dir=`, `metacopy=` and
-/// `uuid=`. The upper directory needs the work directory, as in Linux. The mount makes the
-/// directory `work` in the work directory. If it cannot, the mount does not accept changes, as
-/// Linux.
+/// `datadir+=`, then `upperdir=`, `workdir=`, `userxattr`, `redirect_dir=`, `metacopy=`,
+/// `index=` and `uuid=`. The upper directory needs the work directory, as in Linux. The mount
+/// makes the directory `work` in the work directory. If it cannot, the mount does not accept
+/// changes, as Linux.
+///
+/// An upper or work directory that another mount uses gives `EBUSY` with the option `index`,
+/// as Linux. Without it, the mount continues.
 pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let mut opts = Options::parse(args.data)?;
     let lowers = opts.lowers.iter().map(|p| dir(args, p)).collect::<Result<Vec<_>>>()?;
     let data = opts.data.iter().map(|p| dir(args, p)).collect::<Result<Vec<_>>>()?;
-    let (upper, writable) = match (&opts.upper, &opts.work) {
+    let mut in_use = InUse::default();
+    let (upper, work_dir) = match (&opts.upper, &opts.work) {
         (Some(upper), Some(work)) => {
             let upper = dir(args, upper)?;
             let work = dir(args, work)?;
@@ -471,13 +684,35 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
             if upper.fs_id() != work.fs_id() || upper.fs_magic() == OVERLAYFS_SUPER_MAGIC {
                 return Err(Errno::EINVAL);
             }
-            let writable = make_work(&work).is_ok();
-            (Some(upper), writable)
+            // The upper directory first, then the work directory, as `ovl_get_upper` and
+            // `ovl_get_workdir` of Linux.
+            for dir in [&upper, &work] {
+                if !in_use.take(dir) && opts.index {
+                    return Err(Errno::EBUSY);
+                }
+            }
+            (Some(upper), Some(work))
         }
-        (None, _) => (None, false),
+        (None, _) => (None, None),
         (Some(_), None) => return Err(Errno::EINVAL),
     };
+    let work = work_dir.as_ref().and_then(|w| make_dir(w, WORK, false).ok());
+    let mut writable = work.is_some();
     let prefix = if opts.userxattr { USER } else { TRUSTED };
+    // The option `index` needs an upper directory, as Linux.
+    opts.index &= writable;
+    let mut index = None;
+    if let (true, Some(root), Some(work_dir), Some(lower)) =
+        (opts.index, &upper, &work_dir, lowers.first())
+    {
+        match make_index(prefix, work_dir, root, lower)? {
+            IndexDir::Made(dir) => index = Some(dir),
+            // The layers have no file handles, so the mount continues without the index.
+            IndexDir::NoHandles => opts.index = false,
+            // The mount with no index directory does not accept changes, as Linux.
+            IndexDir::Failed => writable = false,
+        }
+    }
     let dev = rk_vfs::anon_dev();
     let uuid = match &upper {
         Some(root) if writable => init_uuid(root, prefix, &mut opts.uuid, dev),
@@ -503,8 +738,121 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
         fsid,
         inos: SpinLock::new(BTreeMap::new()),
         cache: Cache::default(),
+        // The index directory is also the directory for the temporary files, as Linux.
+        work: index.clone().or(work),
+        index,
+        indexed: AtomicU64::new(0),
+        whiteout: SpinLock::new(None),
+        no_shared_whiteout: AtomicBool::new(false),
+        temp: AtomicU64::new(0),
+        _in_use: in_use,
     };
+    if let Some(dir) = &fs.index {
+        fs.clean_index(dir)?;
+    }
     Node::root(Arc::new(fs), upper)
+}
+
+/// The result of [`make_index`].
+enum IndexDir {
+    /// The index directory.
+    Made(InodeRef),
+    /// A layer has no file handles, so the mount has no index.
+    NoHandles,
+    /// The mount cannot make the index directory.
+    Failed,
+}
+
+/// Makes the index directory `index` in the work directory `work_dir`, or keeps the directory
+/// that is there, as `ovl_get_indexdir` of Linux. The upper root `upper` must have the
+/// attribute [`ORIGIN`] with the file handle of the root `lower` of the top lower layer, and
+/// the index directory must have the attribute [`UPPER`] with the file handle of the upper
+/// root. A new directory gets them. A different handle gives `ESTALE`, because the index is for
+/// other layers.
+fn make_index(
+    prefix: &[u8],
+    work_dir: &InodeRef,
+    upper: &InodeRef,
+    lower: &InodeRef,
+) -> Result<IndexDir> {
+    let (Some(lower_fh), Some(upper_fh)) = (encode_fh(lower), encode_fh(upper)) else {
+        return Ok(IndexDir::NoHandles);
+    };
+    verify_fh(upper, &[prefix, ORIGIN].concat(), &lower_fh)?;
+    let Ok(index) = make_dir(work_dir, INDEX, true) else { return Ok(IndexDir::Failed) };
+    verify_fh(&index, &[prefix, UPPER].concat(), &upper_fh)?;
+    Ok(IndexDir::Made(index))
+}
+
+/// Checks that the attribute `name` of `inode` is the file handle `fh`, as
+/// `ovl_verify_set_fh` of Linux. An inode without the attribute gets it. Another handle gives
+/// `ESTALE`.
+fn verify_fh(inode: &InodeRef, name: &[u8], fh: &[u8]) -> Result<()> {
+    match inode.get_xattr(name) {
+        Ok(value) if value == fh => Ok(()),
+        Ok(_) => Err(Errno::ESTALE),
+        Err(Errno::ENODATA) => inode.set_xattr(name, fh, 0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Gives the file handle of `inode` in the format of the attribute [`ORIGIN`], as
+/// `ovl_encode_real_fh` of Linux, or `None` for a file system without file handles.
+fn encode_fh(inode: &InodeRef) -> Option<Vec<u8>> {
+    let (ty, words) = inode.file_handle()?;
+    let ty = u8::try_from(ty).ok()?;
+    let size = u8::try_from(FH_HEADER + words.len() * 4).ok()?;
+    // The uuid has the id of the file system in its first 8 bytes.
+    let mut fh = vec![0, FH_MAGIC, size, 0, ty];
+    fh.extend_from_slice(&inode.fs_id().to_le_bytes());
+    fh.extend_from_slice(&[0; 8]);
+    for word in words {
+        fh.extend_from_slice(&word.to_le_bytes());
+    }
+    Some(fh)
+}
+
+/// Tells if `fh` has the format of the attribute [`ORIGIN`], as `ovl_check_fb_len` of Linux.
+fn fh_is_valid(fh: &[u8]) -> bool {
+    fh.len() >= FH_HEADER
+        && fh[..2] == [0, FH_MAGIC]
+        && usize::from(fh[2]) == fh.len()
+        && (fh.len() - FH_HEADER).is_multiple_of(4)
+}
+
+/// Gives the name of the entry of the lower inode `lower` in the index directory: its file
+/// handle in lowercase hexadecimal, as `ovl_get_index_name` of Linux.
+fn index_name(lower: &InodeRef) -> Option<Vec<u8>> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let fh = encode_fh(lower)?;
+    Some(
+        fh.iter()
+            .flat_map(|&b| [DIGITS[usize::from(b >> 4)], DIGITS[usize::from(b & 15)]])
+            .collect(),
+    )
+}
+
+/// Gives the bytes of the lowercase hexadecimal name `name`, or `None` if it is not one.
+fn from_hex(name: &[u8]) -> Option<Vec<u8>> {
+    let digit = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let (pairs, rest) = name.as_chunks::<2>();
+    if !rest.is_empty() {
+        return None;
+    }
+    pairs.iter().map(|&[hi, lo]| Some((digit(hi)? << 4) | digit(lo)?)).collect()
+}
+
+/// Tells if `a` and `b` are the same inode.
+fn same_inode(a: &InodeRef, b: &InodeRef) -> bool {
+    if Arc::ptr_eq(a, b) {
+        return true;
+    }
+    let (a, b) = (a.metadata(), b.metadata());
+    (a.dev, a.ino) == (b.dev, b.ino)
 }
 
 /// Gives the 8 bytes of `bytes` as a number, the first byte last.
@@ -564,25 +912,27 @@ fn init_uuid(root: &InodeRef, prefix: &[u8], mode: &mut Uuid, dev: u64) -> Optio
     Some(uuid)
 }
 
-/// Makes the directory `work` in the work directory `work_dir`, with the mode 0 and with no ACL,
-/// as `ovl_workdir_create` of Linux. It first removes an old `work`.
-fn make_work(work_dir: &InodeRef) -> Result<()> {
+/// Makes the directory `name` in the work directory `work_dir`, with the mode 0 and with no ACL,
+/// as `ovl_workdir_create` of Linux, and gives it. It first removes an old `name`. With
+/// `persist`, it keeps an old directory, as for the index directory.
+fn make_dir(work_dir: &InodeRef, name: &[u8], persist: bool) -> Result<InodeRef> {
     // The VFS checks the flags for a change through a system call. The mount changes the work
     // directory directly, so it checks the flags here.
     check_immutable(&**work_dir)?;
-    match work_dir.lookup(WORK) {
-        Ok(old) => remove_tree(work_dir, WORK, &old, 0)?,
+    match work_dir.lookup(name) {
+        Ok(old) if persist && old.metadata().is_dir() => return Ok(old),
+        Ok(old) => remove_tree(work_dir, name, &old, 0)?,
         Err(Errno::ENOENT) => {}
         Err(e) => return Err(e),
     }
-    let work = work_dir.create(WORK, FileType::Directory, 0, 0)?;
+    let dir = work_dir.create(name, FileType::Directory, 0, 0)?;
     for name in [acl::DEFAULT, acl::ACCESS] {
-        match work.remove_xattr(name) {
+        match dir.remove_xattr(name) {
             Ok(()) | Err(Errno::ENODATA | Errno::EOPNOTSUPP) => {}
             Err(e) => return Err(e),
         }
     }
-    Ok(())
+    Ok(dir)
 }
 
 /// Removes `name`, which is `inode`, from `dir`, with its entries. As `ovl_workdir_cleanup` of
@@ -629,6 +979,13 @@ pub fn new(lowers: Vec<InodeRef>, upper: Option<InodeRef>) -> Result<InodeRef> {
         metacopy: false,
         fsid: real.fs_fsid(),
         inos: SpinLock::new(BTreeMap::new()),
+        index: None,
+        indexed: AtomicU64::new(0),
+        work: None,
+        whiteout: SpinLock::new(None),
+        no_shared_whiteout: AtomicBool::new(false),
+        temp: AtomicU64::new(0),
+        _in_use: InUse::default(),
     });
     Node::root(fs, upper)
 }
@@ -664,6 +1021,10 @@ struct Found {
     metacopy: bool,
     /// The lower inode with the data of a regular file.
     lowerdata: Option<InodeRef>,
+    /// The upper inode is the entry of the lower inode in the index directory.
+    indexed: bool,
+    /// The entry of the lower inode in the index directory, for a node without an upper inode.
+    index: Option<InodeRef>,
 }
 
 /// An inode of overlayfs: one name with its inodes in the layers.
@@ -690,6 +1051,13 @@ struct Node {
     /// The lower inode with the data of a regular file. A metacopy file without data in the
     /// data-only layers has `None`.
     lowerdata: Option<InodeRef>,
+    /// The upper inode is the entry of the lower inode in the index directory, so the other
+    /// lower hard links of the lower inode show it too.
+    indexed: AtomicBool,
+    /// For a node without an upper inode, the entry of the lower inode in the index directory,
+    /// which a copy up of another lower hard link made. It is correct while the count
+    /// [`Fs::indexed`] has the first value.
+    index: SpinLock<(u64, Option<InodeRef>)>,
     /// The nodes that a lookup in this directory gave, so a name keeps one node while it is in
     /// use.
     children: SpinLock<BTreeMap<Vec<u8>, Weak<Node>>>,
@@ -708,6 +1076,7 @@ impl Node {
         found: Found,
     ) -> Option<Arc<Node>> {
         let first = found.upper.clone().or_else(|| found.lowers.first().map(|l| l.1.clone()))?;
+        let stamp = fs.indexed.load(Ordering::Acquire);
         Some(Arc::new_cyclic(|this| Node {
             fs: fs.clone(),
             first,
@@ -719,6 +1088,8 @@ impl Node {
             redirect: SpinLock::new(found.redirect),
             metacopy: AtomicBool::new(found.metacopy),
             lowerdata: found.lowerdata,
+            indexed: AtomicBool::new(found.indexed),
+            index: SpinLock::new((stamp, found.index)),
             children: SpinLock::new(BTreeMap::new()),
             unused: SpinLock::new(BTreeMap::new()),
             entries: SpinLock::new(Vec::new()),
@@ -738,6 +1109,9 @@ impl Node {
             redirect: SpinLock::new(saved.redirect),
             metacopy: AtomicBool::new(saved.metacopy),
             lowerdata: saved.lowerdata,
+            indexed: AtomicBool::new(saved.indexed),
+            // The node looks in the index directory again.
+            index: SpinLock::new((u64::MAX, None)),
             children: SpinLock::new(BTreeMap::new()),
             unused: SpinLock::new(saved.unused),
             entries: SpinLock::new(Vec::new()),
@@ -768,9 +1142,48 @@ impl Node {
         self.upper.lock().clone()
     }
 
-    /// The inode that gives the attributes: the upper inode, or else the top lower inode.
+    /// The inode that gives the attributes: the upper inode, the entry in the index directory,
+    /// or else the top lower inode.
     fn real(&self) -> InodeRef {
-        self.upper().unwrap_or_else(|| self.first.clone())
+        self.upper().or_else(|| self.index_inode()).unwrap_or_else(|| self.first.clone())
+    }
+
+    /// Gives the entry of the lower inode in the index directory for a node without an upper
+    /// inode. After a change of the index directory, it looks in it again, so a copy up of
+    /// another lower hard link shows here.
+    fn index_inode(&self) -> Option<InodeRef> {
+        self.fs.index.as_ref()?;
+        let lower = self.top()?;
+        let stamp = self.fs.indexed.load(Ordering::Acquire);
+        let mut slot = self.index.lock();
+        if slot.0 != stamp {
+            let m = lower.metadata();
+            let linked = !m.is_dir() && m.nlink > 1;
+            slot.1 = if linked { self.fs.lookup_index(lower, None).ok().flatten() } else { None };
+            slot.0 = stamp;
+        }
+        slot.1.clone()
+    }
+
+    /// Gives the upper inode in the index directory that keeps the count of the links of the
+    /// overlay file: the upper inode of an indexed node, or the entry of a node without an
+    /// upper inode.
+    fn index_upper(&self) -> Option<InodeRef> {
+        match self.upper() {
+            Some(upper) => self.indexed.load(Ordering::Acquire).then_some(upper),
+            None => self.index_inode(),
+        }
+    }
+
+    /// Tells if a copy up of the file puts it in the index directory, as `ovl_need_index` of
+    /// Linux: the option `index` is on, and the lower inode is a hard link that is not a
+    /// directory.
+    fn needs_index(&self) -> bool {
+        self.fs.index.is_some()
+            && self.top().is_some_and(|lower| {
+                let m = lower.metadata();
+                !m.is_dir() && m.nlink > 1
+            })
     }
 
     /// The top lower inode.
@@ -798,8 +1211,9 @@ impl Node {
     /// Gives the device and the inode number of the node, as `ovl_getattr` of Linux. A copy up
     /// does not change them, so a lock on the file stays the same lock. A node with an upper
     /// inode and a lower inode shows the numbers of the lower inode, so the numbers stay the
-    /// same after a new mount. A lower hard link is not one inode after a copy up, as Linux
-    /// without the `index` feature, so its upper inode shows its own numbers.
+    /// same after a new mount. Without the option `index`, a lower hard link is not one inode
+    /// after a copy up, so its upper inode shows its own numbers. With it, the upper inode in
+    /// the index directory shows the numbers of the lower inode.
     fn identity(&self) -> (u64, u64) {
         let first = self.first.metadata();
         let own = (first.dev, first.ino);
@@ -808,6 +1222,9 @@ impl Node {
         }
         let Some(lower) = self.top() else { return own };
         let m = lower.metadata();
+        if self.indexed.load(Ordering::Acquire) {
+            return (m.dev, m.ino);
+        }
         if !m.is_dir() && m.nlink > 1 {
             return own;
         }
@@ -929,7 +1346,18 @@ impl Node {
         if !walk.is_dir {
             lowers.truncate(1);
         }
-        let found = Found { upper, lowers, redirect, metacopy, lowerdata };
+        let (mut indexed, mut index) = (false, None);
+        if !walk.is_dir
+            && let Some((_, origin)) = lowers.first()
+        {
+            let linked = upper.is_some() || origin.metadata().nlink > 1;
+            let entry = if linked { fs.lookup_index(origin, upper.as_ref())? } else { None };
+            indexed = entry.is_some() && upper.is_some();
+            if upper.is_none() {
+                index = entry;
+            }
+        }
+        let found = Found { upper, lowers, redirect, metacopy, lowerdata, indexed, index };
         Node::new(&self.fs, Some(self.arc()?), name.to_vec(), found).ok_or(Errno::ENOENT)
     }
 
@@ -1026,6 +1454,10 @@ impl Node {
     /// `data` or without the option `metacopy`. Else it gets only the attributes and the
     /// attribute [`METACOPY`], and a later call with `data` copies the data. The upper inode
     /// gets the attribute [`ORIGIN`], and the upper parent gets the attribute [`IMPURE`].
+    ///
+    /// With the option `index`, a lower hard link goes to the index directory first, and the
+    /// upper directory gets a link to it, as `ovl_link_up` of Linux. A copy up of another lower
+    /// hard link of the same lower inode then only makes a link.
     fn copy_up_with(&self, data: bool) -> Result<InodeRef> {
         if let Some(upper) = self.upper() {
             if data && self.is_metacopy() {
@@ -1052,26 +1484,90 @@ impl Node {
             Err(e) => return Err(e),
         }
         let m = lower.metadata();
-        let perm = m.mode & mode::PERM_MASK;
         let kind = m.file_type().ok_or(Errno::EIO)?;
-        let meta = !data && self.fs.metacopy && kind == FileType::Regular;
+        let indexed = self.needs_index();
+        // A file in the index has its data, as Linux.
+        let meta = !data && !indexed && self.fs.metacopy && kind == FileType::Regular;
         // A copy of the data needs the data, so a file without it fails before the change.
         let source = match kind {
             FileType::Regular if !meta => Some(self.data_inode()?),
             _ => None,
         };
         self.fs.set_impure(&dir)?;
+        let upper = if indexed {
+            let index = self.index_copy(&lower, source.as_ref())?;
+            // The new link does not change the count of the links of the overlay file.
+            let nlink = self.fs.union_nlink(&lower, &index, m.nlink);
+            dir.link(&name, &index)?;
+            self.fs.set_nlink(&index, nlink)?;
+            self.indexed.store(true, Ordering::Release);
+            index
+        } else {
+            let upper = self.copy_to(&dir, &name, &lower, meta, source.as_ref())?;
+            // The upper inode shows the numbers of the lower inode, so another upper inode of
+            // the same lower inode must not show them.
+            let u = upper.metadata();
+            self.fs.ino_of((m.dev, m.ino), (u.dev, u.ino));
+            upper
+        };
+        self.metacopy.store(meta, Ordering::Release);
+        *slot = Some(upper.clone());
+        Ok(upper)
+    }
+
+    /// Gives the entry of the lower inode `lower` in the index directory, and makes it if it is
+    /// not there, as `ovl_copy_up_tmpfile` of Linux with an index. A new entry is first a
+    /// temporary file, which gets the data and the attributes, and then gets its name. Its
+    /// attribute [`NLINK`] is the count of the links of the lower inode.
+    fn index_copy(&self, lower: &InodeRef, source: Option<&InodeRef>) -> Result<InodeRef> {
+        let fs = &self.fs;
+        let dir = fs.index.as_ref().ok_or(Errno::EIO)?;
+        let name = index_name(lower).ok_or(Errno::EIO)?;
+        if let Some(index) = fs.lookup_index(lower, None)? {
+            return Ok(index);
+        }
+        let kind = lower.metadata().file_type().ok_or(Errno::EIO)?;
+        let temp = fs.temp_name();
+        let index = self.copy_to(dir, &temp, lower, false, source)?;
+        let done = fs
+            .set_nlink(&index, lower.metadata().nlink)
+            .and_then(|()| dir.rename(&temp, dir, &name));
+        if let Err(e) = done {
+            let _ = dir.unlink(&temp);
+            return Err(e);
+        }
+        fs.indexed.fetch_add(1, Ordering::AcqRel);
+        if index.metadata().file_type() != Some(kind) {
+            return Err(Errno::EIO);
+        }
+        Ok(index)
+    }
+
+    /// Makes `name` in the upper directory `dir` as a copy of the lower inode `lower`, with its
+    /// attributes and the attribute [`ORIGIN`], and gives it. A regular file gets the data of
+    /// `source`, or only the size and the attribute [`METACOPY`] with `meta`.
+    fn copy_to(
+        &self,
+        dir: &InodeRef,
+        name: &[u8],
+        lower: &InodeRef,
+        meta: bool,
+        source: Option<&InodeRef>,
+    ) -> Result<InodeRef> {
+        let m = lower.metadata();
+        let perm = m.mode & mode::PERM_MASK;
+        let kind = m.file_type().ok_or(Errno::EIO)?;
         let upper = match kind {
-            FileType::Symlink => dir.symlink(&name, &lower.read_link()?)?,
+            FileType::Symlink => dir.symlink(name, &lower.read_link()?)?,
             FileType::Regular => {
-                let file = dir.create(&name, kind, perm, 0)?;
-                match &source {
+                let file = dir.create(name, kind, perm, 0)?;
+                match source {
                     Some(source) => copy_data(source, &file, m.size)?,
                     None => file.set_attr(&SetAttr { size: Some(m.size), ..SetAttr::default() })?,
                 }
                 file
             }
-            _ => dir.create(&name, kind, perm, m.rdev)?,
+            _ => dir.create(name, kind, perm, m.rdev)?,
         };
         for attr in lower.list_xattr()? {
             // An upper layer without POSIX ACLs does not get the ACLs, as `ovl_copy_acl` of
@@ -1086,7 +1582,7 @@ impl Node {
         if meta {
             upper.set_xattr(&self.fs.xattr(METACOPY), b"", 0)?;
         }
-        self.fs.set_origin(&upper, &lower)?;
+        self.fs.set_origin(&upper, lower)?;
         let mode = (kind != FileType::Symlink).then_some(perm);
         upper.set_attr(&SetAttr {
             mode,
@@ -1097,14 +1593,50 @@ impl Node {
             mtime: Some(m.mtime),
             explicit_times: true,
         })?;
-        self.copy_flags(&lower, &upper)?;
-        self.metacopy.store(meta, Ordering::Release);
-        // The upper inode shows the numbers of the lower inode, so another upper inode of the
-        // same lower inode must not show them.
-        let u = upper.metadata();
-        self.fs.ino_of((m.dev, m.ino), (u.dev, u.ino));
-        *slot = Some(upper.clone());
+        self.copy_flags(lower, &upper)?;
         Ok(upper)
+    }
+
+    /// Prepares a change of the count of the links of the file, as `ovl_nlink_start` of Linux.
+    /// A lower hard link that needs the index gets a copy up first, so the index keeps the
+    /// count. The count goes to the attribute [`NLINK`] of the upper inode in the index, which
+    /// this gives.
+    fn nlink_start(&self) -> Result<Option<InodeRef>> {
+        if self.fs.index.is_none() || self.is_dir() {
+            return Ok(None);
+        }
+        if self.upper().is_none() && self.needs_index() {
+            self.copy_up()?;
+        }
+        if !self.indexed.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let Some(upper) = self.upper() else { return Ok(None) };
+        self.fs.set_nlink(&upper, self.metadata().nlink)?;
+        Ok(Some(upper))
+    }
+
+    /// Ends a removal of a name of the file with the upper inode `index` in the index, as
+    /// `ovl_nlink_end` and `ovl_cleanup_index` of Linux. After the removal of the last name,
+    /// the entry in the index directory goes away. If the upper inode still has other links,
+    /// the count of the links becomes the count of these links.
+    fn nlink_end(&self, index: &InodeRef) {
+        let fs = &self.fs;
+        let (Some(lower), Some(dir)) = (self.top(), &fs.index) else { return };
+        if fs.nlink_value(lower, index).is_none_or(|n| n > 0) {
+            return;
+        }
+        let links = index.metadata().nlink;
+        if links != 1 {
+            let _ = fs.set_nlink(index, links - 1);
+            return;
+        }
+        let Some(name) = index_name(lower) else { return };
+        if dir.lookup(&name).is_ok_and(|entry| same_inode(&entry, index))
+            && dir.unlink(&name).is_ok()
+        {
+            fs.indexed.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Gives the lower inode with the data of a regular file before a copy up.
@@ -1259,7 +1791,7 @@ impl Node {
     /// name.
     fn white_out(&self, dir: &InodeRef, name: &[u8]) -> Result<()> {
         if self.lower_has(name) {
-            dir.create(name, FileType::CharDevice, 0, 0)?;
+            self.fs.make_whiteout(dir, name)?;
         }
         Ok(())
     }
@@ -1290,6 +1822,7 @@ impl Drop for Node {
                 redirect: self.redirect.lock().take(),
                 metacopy: self.metacopy.load(Ordering::Relaxed),
                 lowerdata: self.lowerdata.take(),
+                indexed: self.indexed.load(Ordering::Relaxed),
                 unused: core::mem::take(&mut *self.unused.lock()),
                 stamp: self.fs.cache.next.fetch_add(1, Ordering::Relaxed),
                 _count: Counted::new(&self.fs),
@@ -1373,6 +1906,7 @@ struct Saved {
     redirect: Option<Vec<u8>>,
     metacopy: bool,
     lowerdata: Option<InodeRef>,
+    indexed: bool,
     unused: BTreeMap<Vec<u8>, Saved>,
     /// The order of the node in the LRU list of the mount.
     stamp: u64,
@@ -1426,6 +1960,10 @@ impl Inode for Node {
                     (m.size.div_ceil(block) * block) >> 9
                 }
             };
+        }
+        // A file in the index has the count of the links of the overlay file, as Linux.
+        if let (Some(index), Some(lower)) = (self.index_upper(), self.top()) {
+            m.nlink = self.fs.union_nlink(lower, &index, m.nlink);
         }
         // A directory joins layers, so it has the device of the mount. Another file shows the
         // device of its layer, as Linux without the `xino` feature.
@@ -1531,6 +2069,7 @@ impl Inode for Node {
         if node.is_metacopy() {
             node.set_redirect(&target, false)?;
         }
+        node.nlink_start()?;
         let (dir, _) = self.prepare_new(name)?;
         dir.link(name, &target)
     }
@@ -1542,11 +2081,15 @@ impl Inode for Node {
             return Err(Errno::EISDIR);
         }
         let dir = self.copy_up()?;
+        let index = node.nlink_start()?;
         Node::check_upper(&dir, name, &node)?;
         if node.upper().is_some() {
             dir.unlink(name)?;
         }
         self.white_out(&dir, name)?;
+        if let Some(index) = index {
+            node.nlink_end(&index);
+        }
         self.forget(name);
         Ok(())
     }
@@ -1582,12 +2125,17 @@ impl Inode for Node {
         let src = node.copy_up()?;
         let from_dir = self.copy_up()?;
         let to_dir = to.copy_up()?;
+        // The file that the rename replaces, with its upper inode in the index.
+        let mut replaced = None;
         match to.child(new) {
             Ok(target) if target.is_dir() => {
                 Node::check_empty(&target)?;
                 if let Some(upper) = target.upper() {
                     self.remove_whiteouts(&upper)?;
                 }
+            }
+            Ok(target) if !Arc::ptr_eq(&target, &node) => {
+                replaced = target.nlink_start()?.map(|index| (target, index));
             }
             Ok(_) | Err(Errno::ENOENT) => {}
             Err(e) => return Err(e),
@@ -1612,6 +2160,9 @@ impl Inode for Node {
             self.fs.set_impure(&to_dir)?;
         }
         self.white_out(&from_dir, old)?;
+        if let Some((target, index)) = replaced {
+            target.nlink_end(&index);
+        }
         self.forget(old);
         to.forget(new);
         *node.place.lock() = (Some(to.clone()), new.to_vec());
@@ -1644,10 +2195,23 @@ impl Inode for Node {
                 !self.lowers.is_empty() || u.get_xattr(&self.fs.xattr(IMPURE)).is_ok()
             });
             if impure {
+                // Tells if a name has the inode number of a lower inode.
+                let mut moved = false;
                 for entry in &mut joined {
                     if let Ok(node) = self.child(&entry.name) {
-                        entry.ino = node.metadata().ino;
+                        let ino = node.metadata().ino;
+                        moved |= ino != entry.ino;
+                        entry.ino = ino;
                     }
+                }
+                // An upper directory without lower directories and without such names is pure
+                // again, so it loses the attribute, as `ovl_dir_read_impure` of Linux.
+                if !moved
+                    && self.lowers.is_empty()
+                    && !self.is_read_only()
+                    && let Some(upper) = self.upper()
+                {
+                    let _ = upper.remove_xattr(&self.fs.xattr(IMPURE));
                 }
             }
             list.extend(joined);

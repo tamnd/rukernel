@@ -76,6 +76,9 @@ pub(crate) struct Options {
     /// attributes.
     pub(crate) metacopy: bool,
     pub(crate) uuid: Uuid,
+    /// The option `index`: a copy up of a lower hard link puts the upper file in the index
+    /// directory, so the other names of the lower inode find it.
+    pub(crate) index: bool,
 }
 
 impl Options {
@@ -83,8 +86,8 @@ impl Options {
     /// Linux. A comma separates the options. In `lowerdir=`, a colon separates the lower
     /// directories, and two colons put the data-only directories after them. A backslash before
     /// a comma or a colon makes it a part of the path. The values of `lowerdir+=` and `datadir+=`
-    /// are paths without escapes. Linux ignores other options, such as `index=off`, when it does
-    /// not have the feature, and so does this file system.
+    /// are paths without escapes. Linux ignores other options, such as `nfs_export=off`, when it
+    /// does not have the feature, and so does this file system.
     pub(crate) fn parse(data: &[u8]) -> Result<Options> {
         let mut out = Options::default();
         // The option `lowerdir=` was given. Then `lowerdir+=` and `datadir+=` are not valid.
@@ -131,6 +134,7 @@ impl Options {
                     out.metacopy = on_off(v)?;
                     set_metacopy = true;
                 }
+                (b"index", Some(v)) => out.index = on_off(v)?,
                 (b"uuid", Some(v)) => {
                     out.uuid = match v {
                         b"on" => Uuid::On,
@@ -233,6 +237,9 @@ impl Options {
         if self.redirect != Redirect::Follow {
             out.extend_from_slice(b",redirect_dir=");
             out.extend_from_slice(self.redirect.name());
+        }
+        if self.index {
+            out.extend_from_slice(b",index=on");
         }
         if self.uuid != Uuid::Auto {
             out.extend_from_slice(b",uuid=");
