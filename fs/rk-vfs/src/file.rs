@@ -389,13 +389,14 @@ mod fsx {
     /// `FS_PROJINHERIT_FL`.
     const PROJINHERIT: u32 = 0x2000_0000;
     /// The pairs of an inode flag and its `FS_XFLAG_*` flag.
-    const MAP: [(u32, u32); 6] = [
+    const MAP: [(u32, u32); 7] = [
         (iflags::IMMUTABLE, 0x8),
         (iflags::APPEND, 0x10),
         (iflags::SYNC, 0x20),
         (iflags::NOATIME, 0x40),
         (iflags::NODUMP, 0x80),
         (PROJINHERIT, 0x200),
+        (iflags::DAX, 0x8000),
     ];
 
     /// Writes the `struct fsxattr` of `inode` at `arg`.

@@ -473,6 +473,8 @@ pub mod iflags {
     pub const NODUMP: u32 = 0x40;
     /// A read does not change the access time.
     pub const NOATIME: u32 = 0x80;
+    /// The file uses direct access to the memory of the device.
+    pub const DAX: u32 = 0x0200_0000;
 }
 
 /// Gives the inode flags of `inode`, or 0 if its file system does not keep them.

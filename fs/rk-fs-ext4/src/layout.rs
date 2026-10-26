@@ -153,9 +153,27 @@ pub mod flags {
     /// The names of the directory do not depend on the case of the letters.
     pub const CASEFOLD: u32 = 0x4000_0000;
     /// The flags that `FS_IOC_GETFLAGS` shows, as `EXT4_FL_USER_VISIBLE` of Linux.
-    pub const USER_VISIBLE: u32 = 0x705B_DFFF;
+    pub const USER_VISIBLE: u32 = 0x725B_DFFF;
     /// The flags that `FS_IOC_SETFLAGS` can change, as `EXT4_FL_USER_MODIFIABLE` of Linux.
-    pub const USER_MODIFIABLE: u32 = 0x604B_C0FF;
+    pub const USER_MODIFIABLE: u32 = 0x624B_C0FF;
+    /// The file uses direct access to the memory of the device.
+    pub const DAX: u32 = 0x0200_0000;
+    /// The data goes to the journal.
+    pub const JOURNAL_DATA: u32 = 0x4000;
+    /// The file is encrypted.
+    pub const ENCRYPT: u32 = 0x800;
+    /// The file has fs-verity.
+    pub const VERITY: u32 = 0x10_0000;
+    /// The flags that a file cannot have together with [`DAX`], as `EXT4_DAX_MUT_EXCL` of Linux.
+    pub const DAX_MUT_EXCL: u32 = VERITY | ENCRYPT | JOURNAL_DATA | INLINE_DATA;
+    /// The flags that a new inode gets from its directory, as `EXT4_FL_INHERITED` of Linux
+    /// without `EXT4_CASEFOLD_FL`, because the driver has no names that ignore the case.
+    pub const INHERITED: u32 = 0x2201_C4CF;
+    /// The flags of a directory that a regular file cannot have, from `EXT4_REG_FLMASK` of Linux.
+    pub const DIR_ONLY: u32 = 0x6003_0000;
+    /// The inherited flags that a file that is not a directory or a regular file can have, as
+    /// `EXT4_OTHER_FLMASK` of Linux.
+    pub const OTHER: u32 = 0xC0;
 }
 
 /// Gives the `u16` at `at`.
