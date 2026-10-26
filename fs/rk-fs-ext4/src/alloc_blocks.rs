@@ -1,6 +1,7 @@
 //! The allocation of blocks and inodes: the bitmaps, the counts of the group descriptors and of
 //! the superblock, and their checksums.
 
+use crate::extent::Extent;
 use crate::layout::{self, bg, gd, put16, put32, u16_at, u32_at};
 use crate::{Tx, crc};
 use alloc::vec;
@@ -101,7 +102,7 @@ impl Tx<'_> {
     }
 
     /// Gives the block bitmap of the group `group`. A bitmap that is not on the disk is made from
-    /// the layout, as `ext4_init_block_bitmap`.
+    /// the layout, as `ext4_init_block_bitmap`. Each bit is one cluster.
     pub(crate) fn block_bitmap(&self, group: u32) -> Result<Vec<u8>> {
         self.fs.block_bitmap_of(group, self.desc_flags(group))
     }
@@ -124,7 +125,8 @@ impl Tx<'_> {
         let flags = self.desc_flags(group) & !bg::BLOCK_UNINIT;
         self.set_desc_flags(group, flags);
         if fs.metadata_csum() {
-            let csum = crc::crc32c(fs.csum_seed, &bitmap[..fs.sb.blocks_per_group as usize / 8]);
+            let len = fs.sb.clusters_per_group as usize / 8;
+            let csum = crc::crc32c(fs.csum_seed, &bitmap[..len]);
             self.desc_set(group, gd::BLOCK_BITMAP_CSUM, csum);
         }
         Ok(())
@@ -144,7 +146,8 @@ impl Tx<'_> {
     }
 
     /// Allocates up to `want` blocks in a row, at `goal` or after it if it can. Gives the first
-    /// block and the number of blocks.
+    /// block and the number of blocks. With `bigalloc` it allocates whole clusters: the first
+    /// block is the first block of a cluster, and the number of blocks is a number of clusters.
     ///
     /// # Errors
     ///
@@ -152,6 +155,8 @@ impl Tx<'_> {
     pub(crate) fn alloc_blocks(&mut self, goal: u64, want: u32) -> Result<(u64, u32)> {
         let sb = &self.fs.sb;
         let (first, bpg) = (u64::from(sb.first_data_block), u64::from(sb.blocks_per_group));
+        let bits = sb.cluster_bits;
+        let want = want.div_ceil(1 << bits).max(1);
         let goal = goal.clamp(first, self.fs.blocks_count() - 1);
         let groups = self.fs.group_count();
         let goal_group = ((goal - first) / bpg) as u32;
@@ -161,12 +166,13 @@ impl Tx<'_> {
                 continue;
             }
             let mut bitmap = self.block_bitmap(group)?;
-            let size = self.fs.blocks_in_group(group) as usize;
-            let from = if i == 0 { ((goal - first) % bpg) as usize } else { 0 };
+            let size = self.fs.clusters_in_group(group) as usize;
+            let from = if i == 0 { (((goal - first) % bpg) >> bits) as usize } else { 0 };
             let base = first + u64::from(group) * bpg;
-            let free =
-                |bitmap: &[u8], b: usize| !test_bit(bitmap, b) && !self.fs.is_busy(base + b as u64);
-            let Some(bit) = (from..size).find(|&b| free(&bitmap, b)) else { continue };
+            let free = |bitmap: &[u8], c: usize| {
+                !test_bit(bitmap, c) && !self.fs.is_busy(base + ((c as u64) << bits))
+            };
+            let Some(bit) = (from..size).find(|&c| free(&bitmap, c)) else { continue };
             let mut got = 0;
             while got < want as usize && bit + got < size && free(&bitmap, bit + got) {
                 set_bit(&mut bitmap, bit + got, true);
@@ -176,8 +182,8 @@ impl Tx<'_> {
             let free = self.desc_get(group, gd::FREE_BLOCKS).saturating_sub(got as u32);
             self.desc_set(group, gd::FREE_BLOCKS, free);
             self.write_desc(group)?;
-            self.write_sb(-(got as i64), 0)?;
-            return Ok((base + bit as u64, got as u32));
+            self.write_sb(-((got as i64) << bits), 0)?;
+            return Ok((base + ((bit as u64) << bits), (got as u32) << bits));
         }
         Err(Errno::ENOSPC)
     }
@@ -218,26 +224,36 @@ impl Tx<'_> {
         self.alloc_blocks(goal, want)
     }
 
-    /// Frees `count` blocks from `start`.
+    /// Frees `count` blocks from `start`. With `bigalloc` it frees each cluster that has one of
+    /// the blocks.
     ///
     /// # Errors
     ///
     /// Gives the error of the disk, or `EUCLEAN` for a block outside the file system.
-    pub(crate) fn free_blocks(&mut self, mut start: u64, mut count: u64) -> Result<()> {
+    pub(crate) fn free_blocks(&mut self, start: u64, count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
         let sb = &self.fs.sb;
         let (first, bpg) = (u64::from(sb.first_data_block), u64::from(sb.blocks_per_group));
+        let bits = sb.cluster_bits;
         if start < first || start + count > self.fs.blocks_count() {
             return Err(Errno::EUCLEAN);
         }
+        // The range grows to whole clusters. A group has whole clusters.
+        let ratio = sb.cluster_ratio();
+        let end = first + (start + count - first).next_multiple_of(ratio);
+        let mut start = first + (start - first) / ratio * ratio;
+        let mut count = end - start;
         while count > 0 {
             let group = ((start - first) / bpg) as u32;
             let bit = ((start - first) % bpg) as usize;
             let n = count.min(bpg - bit as u64) as usize;
             let mut bitmap = self.block_bitmap(group)?;
             let mut freed = 0;
-            for b in bit..bit + n {
-                if test_bit(&bitmap, b) {
-                    set_bit(&mut bitmap, b, false);
+            for c in bit >> bits..(bit + n) >> bits {
+                if test_bit(&bitmap, c) {
+                    set_bit(&mut bitmap, c, false);
                     freed += 1;
                 }
             }
@@ -245,12 +261,92 @@ impl Tx<'_> {
             let free = self.desc_get(group, gd::FREE_BLOCKS) + freed;
             self.desc_set(group, gd::FREE_BLOCKS, free);
             self.write_desc(group)?;
-            self.write_sb(i64::from(freed), 0)?;
+            self.write_sb(i64::from(freed) << bits, 0)?;
             self.fs.freed(start, n as u64);
             start += n as u64;
             count -= n as u64;
         }
         Ok(())
+    }
+
+    /// Gives blocks of the disk to the blocks from `lblock` of a file with the extents
+    /// `extents`, up to `want` blocks, near `goal`. Gives the first block, the number of blocks
+    /// and the number of sectors that the file gets for `i_blocks`.
+    ///
+    /// With `bigalloc` a cluster of the disk has the blocks of one cluster of the file, at the
+    /// same places, as `ext4_ext_map_blocks` of Linux. If a block of the cluster of the file at
+    /// `lblock` has a block of the disk, the blocks come from that cluster and nothing is
+    /// allocated. Else the new clusters stop before the next cluster of the file that has blocks.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOSPC` if the file system has no free block.
+    pub(crate) fn alloc_data(
+        &mut self,
+        extents: &[Extent],
+        lblock: u64,
+        want: u32,
+        goal: u64,
+    ) -> Result<(u64, u32, u64)> {
+        let fs = self.fs;
+        let ratio = fs.sb.cluster_ratio();
+        let sectors = fs.sb.block_size / 512;
+        if ratio == 1 {
+            let (start, got) = self.alloc_blocks(goal, want)?;
+            return Ok((start, got, u64::from(got) * sectors));
+        }
+        let (first, offset) = (lblock / ratio * ratio, lblock % ratio);
+        let left = (first + ratio - lblock) as u32;
+        if let Some(e) =
+            extents.iter().find(|e| u64::from(e.lblock) < first + ratio && e.end() > first)
+        {
+            let at = u64::from(e.lblock).max(first);
+            let block = e.start + (at - u64::from(e.lblock));
+            return Ok((block - block % ratio + offset, want.min(left), 0));
+        }
+        let mut want = u64::from(want);
+        if let Some(next) = extents.iter().map(|e| u64::from(e.lblock)).find(|&l| l > lblock) {
+            want = want.min(next / ratio * ratio - lblock);
+        }
+        let (start, got) = self.alloc_blocks(goal, (offset + want) as u32)?;
+        let used = want.min(u64::from(got) - offset) as u32;
+        Ok((start + offset, used, u64::from(got) * sectors))
+    }
+
+    /// Frees the runs `freed` of blocks of the disk that left a file, which now has the extents
+    /// `kept`. Gives the number of sectors that the file loses from `i_blocks`. With `bigalloc` a
+    /// cluster is freed only if no block of `kept` is in it, as the partial clusters of
+    /// `ext4_ext_remove_space` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the disk.
+    pub(crate) fn free_data(&mut self, kept: &[Extent], freed: &[(u64, u64)]) -> Result<u64> {
+        let fs = self.fs;
+        let ratio = fs.sb.cluster_ratio();
+        let sectors = fs.sb.block_size / 512;
+        if ratio == 1 {
+            let mut count = 0;
+            for &(start, n) in freed {
+                self.free_blocks(start, n)?;
+                count += n;
+            }
+            return Ok(count * sectors);
+        }
+        let in_use = |c: u64| {
+            kept.iter().any(|e| e.start < (c + 1) * ratio && e.start + u64::from(e.len) > c * ratio)
+        };
+        let mut clusters: Vec<u64> = Vec::new();
+        for &(start, n) in freed.iter().filter(|&&(_, n)| n > 0) {
+            let (first, last) = (start / ratio, (start + n - 1) / ratio);
+            clusters.extend((first..=last).filter(|&c| (c != first && c != last) || !in_use(c)));
+        }
+        clusters.sort_unstable();
+        clusters.dedup();
+        for &c in &clusters {
+            self.free_blocks(c * ratio, ratio)?;
+        }
+        Ok(clusters.len() as u64 * ratio * sectors)
     }
 
     /// Allocates an inode, in the group of `near` if it can. `dir` tells if the inode is for a
@@ -341,7 +437,7 @@ impl Tx<'_> {
 impl crate::Fs {
     /// Gives the block bitmap of the group `group`, which has the flags `flags` in its
     /// descriptor. The caller holds the lock of the metadata. A bitmap that is not on the disk is
-    /// made from the layout, as `ext4_init_block_bitmap`.
+    /// made from the layout, as `ext4_init_block_bitmap`. Each bit is one cluster.
     pub(crate) fn block_bitmap_of(&self, group: u32, flags: u16) -> Result<Vec<u8>> {
         let desc = self.group(group)?;
         if flags & bg::BLOCK_UNINIT == 0 {
@@ -349,11 +445,12 @@ impl crate::Fs {
         }
         let sb = &self.sb;
         let mut bitmap = vec![0u8; sb.block_size as usize];
-        for bit in 0..sb.base_meta_blocks(group) as usize {
-            set_bit(&mut bitmap, bit, true);
+        let start = sb.group_start(group);
+        // The group 0 can start before the superblock, with `bigalloc` and blocks of 1 KiB.
+        let lead = if group == 0 { sb.sb_block().saturating_sub(start) } else { 0 };
+        for bit in 0..lead + sb.base_meta_blocks(group) {
+            set_bit(&mut bitmap, (bit >> sb.cluster_bits) as usize, true);
         }
-        let start =
-            u64::from(sb.first_data_block) + u64::from(group) * u64::from(sb.blocks_per_group);
         let end = start + u64::from(self.blocks_in_group(group));
         let own = [
             (desc.block_bitmap, 1),
@@ -362,10 +459,10 @@ impl crate::Fs {
         ];
         for (first, count) in own {
             for b in (first..first + count).filter(|b| (start..end).contains(b)) {
-                set_bit(&mut bitmap, (b - start) as usize, true);
+                set_bit(&mut bitmap, ((b - start) >> sb.cluster_bits) as usize, true);
             }
         }
-        mark_end(&mut bitmap, self.blocks_in_group(group) as usize);
+        mark_end(&mut bitmap, self.clusters_in_group(group) as usize);
         Ok(bitmap)
     }
 }

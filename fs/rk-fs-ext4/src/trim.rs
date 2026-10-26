@@ -27,8 +27,10 @@ impl Fs {
         let first_data = u64::from(sb.first_data_block);
         let per_group = u64::from(sb.blocks_per_group);
         let mut start = start >> bits;
-        let minlen = (minlen >> bits).max(1);
-        if minlen > per_group || start >= max || len < bs {
+        // With `bigalloc` the bits of a bitmap and `minlen` count clusters, as Linux.
+        let cbits = sb.cluster_bits;
+        let minlen = (minlen >> bits).div_ceil(sb.cluster_ratio()).max(1);
+        if minlen > u64::from(sb.clusters_per_group) || start >= max || len < bs {
             return Err(Errno::EINVAL);
         }
         let end = start.saturating_add(len >> bits).saturating_sub(1).min(max - 1);
@@ -45,20 +47,22 @@ impl Fs {
             let tx = self.tx()?;
             let bitmap = tx.block_bitmap(group)?;
             let base = first_data + u64::from(group) * per_group;
-            let from = start.max(base) - base;
-            let to = (end - base).min(u64::from(self.blocks_in_group(group)) - 1);
+            let from = (start.max(base) - base) >> cbits;
+            let to = (end - base).min(u64::from(self.blocks_in_group(group)) - 1) >> cbits;
             let mut run: Option<u64> = None;
             for bit in from..=to + 1 {
-                let free =
-                    bit <= to && !test_bit(&bitmap, bit as usize) && !self.is_busy(base + bit);
+                let free = bit <= to
+                    && !test_bit(&bitmap, bit as usize)
+                    && !self.is_busy(base + (bit << cbits));
                 match (free, run) {
                     (true, None) => run = Some(bit),
                     (false, Some(first)) => {
                         run = None;
                         let count = bit - first;
                         if count >= minlen {
-                            self.disk.discard((base + first) * bs, count * bs)?;
-                            trimmed += count;
+                            let at = base + (first << cbits);
+                            self.disk.discard(at * bs, (count << cbits) * bs)?;
+                            trimmed += count << cbits;
                         }
                     }
                     _ => {}

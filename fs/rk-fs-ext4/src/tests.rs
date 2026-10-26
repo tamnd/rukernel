@@ -1991,3 +1991,137 @@ fn fsmap_gives_the_metadata_the_free_space_and_the_rest() {
     assert_eq!(free, 43 - 2);
     assert_eq!(map.last().map(|r| r.physical + r.length), Some(64 * bs));
 }
+
+/// An image with `bigalloc`: blocks of 1 KiB, clusters of 4 blocks, one group of 256 blocks
+/// (64 clusters) and 32 inodes. The first group starts at block 0, so the descriptors are in the
+/// block 2. The clusters 0 to 3 have the metadata, and the cluster 4 has the root directory.
+fn bigalloc_image() -> Vec<u8> {
+    let mut img = Image(vec![0u8; 256 * BS]);
+    let sb = 1024;
+    img.put32(sb, 32);
+    img.put32(sb + 0x4, 256);
+    img.put32(sb + 0xc, 59 * 4);
+    img.put32(sb + 0x10, 32 - 10);
+    img.put32(sb + 0x14, 0);
+    img.put32(sb + 0x18, 0);
+    img.put32(sb + 0x1c, 2);
+    img.put32(sb + 0x20, 256);
+    img.put32(sb + 0x24, 64);
+    img.put32(sb + 0x28, 32);
+    img.put16(sb + 0x38, layout::MAGIC);
+    img.put32(sb + 0x4c, 1);
+    img.put32(sb + 0x54, 11);
+    img.put16(sb + 0x58, 256);
+    img.put32(sb + 0x60, layout::incompat::FILETYPE | layout::incompat::EXTENTS);
+    img.put32(sb + 0x64, layout::ro_compat::BIGALLOC);
+    img.put32(2 * BS, 3);
+    img.put32(2 * BS + 4, 4);
+    img.put32(2 * BS + 8, INODE_TABLE as u32);
+    img.put16(2 * BS + 0xc, 59);
+    img.put16(2 * BS + 0xe, 32 - 10);
+    img.put16(2 * BS + 0x10, 2);
+    // A bit of the block bitmap is a cluster.
+    img.0[3 * BS] = 0x1f;
+    img.0[3 * BS + 8..4 * BS].fill(0xff);
+    img.0[4 * BS] = 0xff;
+    img.0[4 * BS + 1] = 0x03;
+    img.0[4 * BS + 4..5 * BS].fill(0xff);
+    let root = img.inode(2, 0o40755, BS as u32, 2, flags::EXTENTS);
+    img.put32(root + 0x1c, 8);
+    img.extents(root, &[(0, 1, 16)]);
+    img.dir(16, &[(2, 2, b"."), (2, 2, b"..")]);
+    img.0
+}
+
+fn open_bigalloc(img: Vec<u8>) -> (Result<Arc<Fs>>, Ram) {
+    let ram = Ram(Arc::new(SpinLock::new(img)));
+    (Fs::open(7, alloc::boxed::Box::new(ram.clone()), false), ram)
+}
+
+#[test]
+fn bigalloc_gives_and_frees_clusters() {
+    use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE};
+    let (fs, ram) = open_bigalloc(bigalloc_image());
+    let fs = fs.unwrap();
+    assert_eq!(fs.sb.desc_block(0), 2);
+    // The overhead is the 4 clusters of the metadata.
+    assert_eq!((fs.stat().blocks, fs.stat().bfree), (240, 236));
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    let (b, cluster) = (BS as u64, 4 * BS as u64);
+    // The first block takes a full cluster, and the next block of the cluster uses it.
+    file.write_at(0, &vec![b'a'; BS]).unwrap();
+    assert_eq!((ram.free().0, file.metadata().blocks), (232, 8));
+    file.write_at(b, &vec![b'b'; BS]).unwrap();
+    assert_eq!((ram.free().0, file.metadata().blocks), (232, 8));
+    let map = file.fiemap(0, u64::MAX).unwrap();
+    assert_eq!((map.len(), map[0].length, map[0].physical % cluster), (1, 2 * b, 0));
+    // A block in a new logical cluster is at the same offset in its physical cluster.
+    file.write_at(6 * b, &vec![b'c'; BS]).unwrap();
+    assert_eq!((ram.free().0, file.metadata().blocks), (228, 16));
+    let map = file.fiemap(6 * b, b).unwrap();
+    assert_eq!(map[0].physical % cluster, 2 * b);
+    // A cluster stays while one of its blocks is in use.
+    file.set_attr(&SetAttr { size: Some(b), ..SetAttr::default() }).unwrap();
+    assert_eq!((ram.free().0, file.metadata().blocks), (232, 8));
+    file.fallocate(PUNCH_HOLE | KEEP_SIZE, 0, b).unwrap();
+    assert_eq!((ram.free().0, file.metadata().blocks), (236, 0));
+    drop((file, fs));
+
+    let fs = again(&ram);
+    assert_eq!(fs.stat().bfree, 236);
+    let back = read_all(&*fs.root().unwrap().lookup(b"f").unwrap());
+    assert!(back.len() == BS && back.iter().all(|&x| x == 0));
+}
+
+#[test]
+fn bigalloc_fsmap_gives_free_clusters() {
+    use rk_vfs::inode::fsmap_owner::FREE;
+    let (fs, _ram) = open_bigalloc(bigalloc_image());
+    let fs = fs.unwrap();
+    let (b, cluster) = (BS as u64, 4 * BS as u64);
+    let map = fs.fsmap(0).unwrap();
+    let free: Vec<_> = map.iter().filter(|r| r.owner == FREE).collect();
+    assert!(free.iter().all(|r| r.physical % cluster == 0 && r.length % cluster == 0));
+    assert_eq!(free.iter().map(|r| r.length / b).sum::<u64>(), 236);
+    assert_eq!(map.last().map(|r| r.physical + r.length), Some(256 * b));
+}
+
+#[test]
+fn bigalloc_collapse_needs_full_clusters() {
+    use rk_vfs::inode::falloc::COLLAPSE_RANGE;
+    let (fs, ram) = open_bigalloc(bigalloc_image());
+    let fs = fs.unwrap();
+    let root = fs.root().unwrap();
+    let file = root.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    for (i, c) in b"abcdefgh".iter().enumerate() {
+        file.write_at((i * BS) as u64, &vec![*c; BS]).unwrap();
+    }
+    assert_eq!(ram.free().0, 228);
+    let b = BS as u64;
+    assert_eq!(file.fallocate(COLLAPSE_RANGE, b, b), Err(Errno::EINVAL));
+    file.fallocate(COLLAPSE_RANGE, 0, 4 * b).unwrap();
+    assert_eq!((file.metadata().size, ram.free().0), (4 * b, 232));
+    let firsts: Vec<u8> = read_all(&*file).chunks(BS).map(|c| c[0]).collect();
+    assert_eq!(firsts, *b"efgh");
+    root.unlink(b"f").unwrap();
+    drop((file, root));
+    assert_eq!(ram.free().0, 236);
+}
+
+#[test]
+fn bigalloc_mount_checks_the_superblock() {
+    // Without extents the disk is read only, as Linux.
+    let mut img = bigalloc_image();
+    img[1024 + 0x60] = layout::incompat::FILETYPE as u8;
+    assert_eq!(open_bigalloc(img.clone()).0.err(), Some(Errno::EROFS));
+    assert!(open(img).is_ok());
+    // The clusters per group must agree with the blocks per group.
+    let mut img = bigalloc_image();
+    img[1024 + 0x24] = 32;
+    assert_eq!(open(img).err(), Some(Errno::EINVAL));
+    // `first_meta_bg` cannot be past the descriptor blocks, as ext4/025 checks.
+    let mut img = bigalloc_image();
+    img[1024 + 0x60] |= layout::incompat::META_BG as u8;
+    img[1024 + 0x104..1024 + 0x108].copy_from_slice(&842_150_400u32.to_le_bytes());
+    assert_eq!(open(img).err(), Some(Errno::EINVAL));
+}

@@ -57,13 +57,21 @@ pub mod ro_compat {
     pub const DIR_NLINK: u32 = 0x20;
     /// The inodes have extra fields after the first 128 bytes.
     pub const EXTRA_ISIZE: u32 = 0x40;
+    /// The bitmaps count clusters of blocks and not blocks.
+    pub const BIGALLOC: u32 = 0x200;
     /// The metadata has crc32c checksums.
     pub const METADATA_CSUM: u32 = 0x400;
     /// The orphan file has inodes in it.
     pub const ORPHAN_PRESENT: u32 = 0x1_0000;
     /// The features that this driver can change.
-    pub const WRITABLE: u32 =
-        SPARSE_SUPER | LARGE_FILE | HUGE_FILE | GDT_CSUM | DIR_NLINK | EXTRA_ISIZE | METADATA_CSUM;
+    pub const WRITABLE: u32 = SPARSE_SUPER
+        | LARGE_FILE
+        | HUGE_FILE
+        | GDT_CSUM
+        | DIR_NLINK
+        | EXTRA_ISIZE
+        | BIGALLOC
+        | METADATA_CSUM;
 }
 
 /// The compatible features.
@@ -115,6 +123,9 @@ pub mod sb {
     pub const VOLUME_NAME: usize = 0x78;
     /// The length of the label field, `EXT4_LABEL_MAX`.
     pub const VOLUME_NAME_LEN: usize = 16;
+    /// The number of clusters of the metadata, `s_overhead_clusters`, or 0 if mkfs did not
+    /// count them.
+    pub const OVERHEAD_CLUSTERS: usize = 0x248;
     /// The checksum of the superblock.
     pub const CHECKSUM: usize = 0x3fc;
 }
@@ -215,6 +226,10 @@ pub struct Superblock {
     pub block_size: u64,
     /// The number of blocks in a group.
     pub blocks_per_group: u32,
+    /// The log2 of the number of blocks in a cluster. It is 0 without `bigalloc`.
+    pub cluster_bits: u32,
+    /// The number of clusters in a group, which is the number of bits of a block bitmap.
+    pub clusters_per_group: u32,
     /// The number of inodes in a group.
     pub inodes_per_group: u32,
     /// The size of an inode in the inode table.
@@ -278,6 +293,13 @@ impl Superblock {
         if incompat & !incompat::SUPPORTED != 0 || incompat & incompat::JOURNAL_DEV != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
+        let ro_compat = u32_at(b, 0x64);
+        let bigalloc = ro_compat & ro_compat::BIGALLOC != 0;
+        // Without `bigalloc` a cluster is one block, as Linux.
+        let log_cluster = if bigalloc { u32_at(b, 0x1c) } else { log };
+        if log_cluster < log || log_cluster > 20 {
+            return Err(Errno::EINVAL);
+        }
         let rev = u32_at(b, 0x4c);
         let bit64 = incompat & incompat::BIT64 != 0;
         let hi = |at: usize| if bit64 { u64::from(u32_at(b, at)) << 32 } else { 0 };
@@ -289,11 +311,13 @@ impl Superblock {
             first_data_block: u32_at(b, 0x14),
             block_size: 1024 << log,
             blocks_per_group: u32_at(b, 0x20),
+            cluster_bits: log_cluster - log,
+            clusters_per_group: if bigalloc { u32_at(b, 0x24) } else { u32_at(b, 0x20) },
             inodes_per_group: u32_at(b, 0x28),
             inode_size: if rev == 0 { 128 } else { u16_at(b, 0x58) },
             compat: u32_at(b, 0x5c),
             incompat,
-            ro_compat: u32_at(b, 0x64),
+            ro_compat,
             desc_size: if bit64 { u16_at(b, 0xfe) } else { 32 },
             name_max: 255,
             first_ino: if rev == 0 { 11 } else { u32_at(b, 0x54) },
@@ -309,6 +333,7 @@ impl Superblock {
             flags: u32_at(b, 0x160),
         };
         if sb.blocks_per_group == 0
+            || sb.blocks_count <= u64::from(sb.first_data_block)
             || sb.inodes_per_group == 0
             || sb.inode_size < 128
             || !sb.inode_size.is_power_of_two()
@@ -318,7 +343,32 @@ impl Superblock {
         {
             return Err(Errno::EINVAL);
         }
+        // A bitmap has the clusters of one group in one block, as `ext4_handle_clustersize`.
+        if bigalloc
+            && (u64::from(sb.clusters_per_group) > sb.block_size * 8
+                || !sb.clusters_per_group.is_multiple_of(8)
+                || u64::from(sb.blocks_per_group)
+                    != u64::from(sb.clusters_per_group) << sb.cluster_bits)
+        {
+            return Err(Errno::EINVAL);
+        }
+        // The descriptor blocks before the first meta block group follow the superblock, so
+        // there cannot be more of them than descriptor blocks, as `ext4_group_desc_init`.
+        if sb.incompat & incompat::META_BG != 0 && u64::from(sb.first_meta_bg) > sb.gdt_blocks() {
+            return Err(Errno::EINVAL);
+        }
         Ok(sb)
+    }
+
+    /// The number of blocks in a cluster.
+    pub fn cluster_ratio(&self) -> u64 {
+        1 << self.cluster_bits
+    }
+
+    /// The block of the superblock, as `logical_sb_block` of Linux. The first group can start
+    /// before it: with `bigalloc` and blocks of 1 KiB the first group starts at block 0.
+    pub fn sb_block(&self) -> u64 {
+        SUPERBLOCK_AT / self.block_size
     }
 
     /// The number of block groups.
@@ -373,7 +423,7 @@ impl Superblock {
     pub fn desc_block(&self, nr: u64) -> u64 {
         let first = u64::from(self.first_data_block);
         if !self.in_meta_bg(nr) {
-            return first + 1 + nr;
+            return self.sb_block() + 1 + nr;
         }
         let group = nr * self.descs_per_block();
         let mut has_super = u64::from(self.has_super(group as u32));
@@ -420,6 +470,12 @@ impl Superblock {
     /// The number of blocks in the group `group` of a file system with `blocks` blocks.
     pub fn group_size(&self, group: u32, blocks: u64) -> u32 {
         (blocks - self.group_start(group)).min(u64::from(self.blocks_per_group)) as u32
+    }
+
+    /// The number of clusters in the group `group` of a file system with `blocks` blocks, as
+    /// `ext4_num_clusters_in_group`. A part of a cluster at the end counts as a cluster.
+    pub fn group_clusters(&self, group: u32, blocks: u64) -> u32 {
+        self.group_size(group, blocks).div_ceil(1 << self.cluster_bits)
     }
 }
 

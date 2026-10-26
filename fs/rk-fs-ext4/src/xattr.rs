@@ -359,7 +359,8 @@ impl Tx<'_> {
             }
         }
         let old = raw.file_acl();
-        let sectors = (bs / 512) as u64;
+        // With `bigalloc` the block has a cluster.
+        let sectors = fs.cluster_sectors();
         if outside.is_empty() {
             if old != 0 {
                 self.put_xattr_block(old)?;

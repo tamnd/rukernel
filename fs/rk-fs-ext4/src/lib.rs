@@ -289,8 +289,12 @@ impl Fs {
         if sb.block_size > 4096 {
             return Err(Errno::EINVAL);
         }
+        // As Linux, `bigalloc` needs extents and a first group at block 0 for a change.
+        let bigalloc = sb.ro_compat & layout::ro_compat::BIGALLOC != 0;
         let can_write = sb.ro_compat & !layout::ro_compat::WRITABLE == 0
-            && sb.incompat & layout::incompat::MMP == 0;
+            && sb.incompat & layout::incompat::MMP == 0
+            && (!bigalloc
+                || sb.incompat & layout::incompat::EXTENTS != 0 && sb.first_data_block == 0);
         if !read_only && !can_write {
             return Err(Errno::EROFS);
         }
@@ -474,21 +478,33 @@ impl Fs {
             let hi = if d.len() >= 64 { u64::from(u16_at(d, at + gd::HI)) << 16 } else { 0 };
             u64::from(u16_at(d, at)) | hi
         };
-        let bfree: u64 = meta.descs.iter().map(|d| field(d, gd::FREE_BLOCKS)).sum();
+        let bfree: u64 =
+            meta.descs.iter().map(|d| field(d, gd::FREE_BLOCKS)).sum::<u64>() << sb.cluster_bits;
         let ffree: u64 = meta.descs.iter().map(|d| field(d, gd::FREE_INODES)).sum();
         let mut reserved = u64::from(u32_at(&meta.sb, layout::sb::R_BLOCKS));
         if sb.incompat & layout::incompat::BIT64 != 0 {
             reserved |= u64::from(u32_at(&meta.sb, layout::sb::R_BLOCKS_HI)) << 32;
         }
+        let counted = u64::from(u32_at(&meta.sb, layout::sb::OVERHEAD_CLUSTERS));
         drop(meta);
         let groups = self.group_count();
-        let base: u64 = (0..groups).map(|g| sb.base_meta_blocks(g)).sum();
-        let mut overhead =
-            u64::from(sb.first_data_block) + base + u64::from(groups) * (2 + sb.itable_blocks());
-        if sb.journal_inum != 0
+        // With `bigalloc` the count of mkfs has the journal, as Linux.
+        let bigalloc = sb.cluster_bits != 0;
+        let from_mkfs = bigalloc && counted != 0 && counted <= self.blocks_count();
+        let mut overhead = if from_mkfs {
+            counted << sb.cluster_bits
+        } else if bigalloc {
+            self.overhead_clusters() << sb.cluster_bits
+        } else {
+            let base: u64 = (0..groups).map(|g| sb.base_meta_blocks(g)).sum();
+            u64::from(sb.first_data_block) + base + u64::from(groups) * (2 + sb.itable_blocks())
+        };
+        if !from_mkfs
+            && sb.journal_inum != 0
             && let Ok(raw) = self.read_inode(sb.journal_inum)
         {
-            overhead += raw.size() / sb.block_size;
+            let ratio = sb.cluster_ratio();
+            overhead += (raw.size() / sb.block_size).div_ceil(ratio) * ratio;
         }
         if self.minix_df.load(Ordering::Relaxed) {
             overhead = 0;
@@ -501,6 +517,41 @@ impl Fs {
             files: u64::from(self.inodes_count()),
             ffree,
         }
+    }
+
+    /// The number of clusters of the metadata without the journal, for `statfs` with `bigalloc`
+    /// when mkfs did not count them. These are the clusters that have a superblock, a descriptor
+    /// block, a bitmap or an inode table, as `count_overhead` of Linux. One cluster can have
+    /// blocks of more than one of them.
+    fn overhead_clusters(&self) -> u64 {
+        let sb = &self.sb;
+        let groups = self.groups.lock().clone();
+        let mut runs: Vec<(u64, u64)> = Vec::with_capacity(groups.len() * 4);
+        for (group, desc) in (0..).zip(&groups) {
+            let start = sb.group_start(group);
+            let lead = if group == 0 { sb.sb_block().saturating_sub(start) } else { 0 };
+            let base = sb.base_meta_blocks(group);
+            if lead + base > 0 {
+                runs.push((start, lead + base));
+            }
+            runs.push((desc.block_bitmap, 1));
+            runs.push((desc.inode_bitmap, 1));
+            runs.push((desc.inode_table, sb.itable_blocks()));
+        }
+        // The runs become runs of clusters, and the clusters in more than one run count once.
+        let bits = sb.cluster_bits;
+        let mut clusters: Vec<(u64, u64)> =
+            runs.iter().map(|&(b, n)| (b >> bits, (b + n - 1) >> bits)).collect();
+        clusters.sort_unstable();
+        let (mut count, mut end) = (0, 0);
+        for (first, last) in clusters {
+            let first = first.max(end);
+            if last >= first {
+                count += last - first + 1;
+                end = last + 1;
+            }
+        }
+        count
     }
 
     /// Runs `op` again after a commit if it gives `ENOSPC` while freed blocks wait for the
@@ -614,6 +665,17 @@ impl Fs {
     /// The number of blocks in the group `group`. The last group can be shorter.
     pub(crate) fn blocks_in_group(&self, group: u32) -> u32 {
         self.sb.group_size(group, self.blocks_count())
+    }
+
+    /// The number of clusters in the group `group`, the bits of its block bitmap that are in use.
+    pub(crate) fn clusters_in_group(&self, group: u32) -> u32 {
+        self.sb.group_clusters(group, self.blocks_count())
+    }
+
+    /// The number of sectors of 512 bytes in a cluster, which `i_blocks` counts for a block of
+    /// metadata of a file. Without `bigalloc` a cluster is one block.
+    pub(crate) fn cluster_sectors(&self) -> u64 {
+        (self.sb.block_size / 512) << self.sb.cluster_bits
     }
 
     /// The descriptor of the group `group`.
