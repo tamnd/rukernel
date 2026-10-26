@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- A second mount of a block device that has a mounted file system of the same type now gives the same file system, as the super blocks of Linux. Before this change, each mount read the disk again, and the two mounts did not see the changes of the other. A mount that would change the read only state of the file system gives `EBUSY`, as Linux.
+
 ## [0.3.15] - 2026-10-26
 
 ### Added

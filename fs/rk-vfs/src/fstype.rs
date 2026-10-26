@@ -3,8 +3,10 @@
 //! The kernel registers each type at boot. `mount(2)` finds the type by its name and calls its
 //! constructor, and `/proc/filesystems` shows the list.
 
-use crate::inode::{InodeRef, Result};
+use crate::inode::{Inode, InodeRef, Result};
+use alloc::sync::Weak;
 use alloc::vec::Vec;
+use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 
 /// A file system type.
@@ -38,7 +40,7 @@ pub struct MountArgs<'a> {
 impl MountArgs<'_> {
     /// Finds the inode of the path `path` of an option.
     pub fn lookup(&self, path: &[u8]) -> Result<InodeRef> {
-        self.lookup.ok_or(rk_abi::Errno::ENOENT)?(path)
+        self.lookup.ok_or(Errno::ENOENT)?(path)
     }
 }
 
@@ -69,6 +71,46 @@ pub fn find(name: &[u8]) -> Option<FsType> {
 /// The registered types, in the order of registration.
 pub fn types() -> Vec<FsType> {
     TYPES.lock().clone()
+}
+
+/// A file system on a block device that a mount made, as a super block of Linux.
+struct Super {
+    name: &'static str,
+    dev: u64,
+    read_only: bool,
+    root: Weak<dyn Inode>,
+}
+
+static SUPERS: SpinLock<Vec<Super>> = SpinLock::new(Vec::new());
+
+/// Gives the root of a file system of the type `ty` for `args`. If `mounted` is true and a mount
+/// made a file system of the type on the same device, the root of that file system is the result,
+/// as `sget_fc` of Linux. Two mounts of a device then show the same files. Gives `EBUSY` if the
+/// file system has another read only state than `args`.
+///
+/// # Errors
+///
+/// Gives the error of the constructor of the type.
+pub fn get_tree(ty: FsType, args: &MountArgs<'_>, mounted: bool) -> Result<InodeRef> {
+    let Some(dev) = args.dev.filter(|_| !ty.nodev) else {
+        return (ty.make)(args);
+    };
+    {
+        let mut supers = SUPERS.lock();
+        supers.retain(|s| s.root.strong_count() > 0);
+        if mounted
+            && let Some(s) = supers.iter().find(|s| s.name == ty.name && s.dev == dev)
+            && let Some(root) = s.root.upgrade()
+        {
+            return if s.read_only == args.read_only { Ok(root) } else { Err(Errno::EBUSY) };
+        }
+    }
+    let root = (ty.make)(args)?;
+    let mut supers = SUPERS.lock();
+    supers.retain(|s| !(s.name == ty.name && s.dev == dev));
+    let read_only = args.read_only;
+    supers.push(Super { name: ty.name, dev, read_only, root: alloc::sync::Arc::downgrade(&root) });
+    Ok(root)
 }
 
 /// Gives the value of the option `key=value` in the comma separated data string of `mount(2)`.

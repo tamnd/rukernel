@@ -154,7 +154,8 @@ fn atime_flags(flags: u32, old: Option<u32>) -> u32 {
 }
 
 /// Makes a file system of the type `ty` and gives its root. A file system on a disk has the
-/// block device of the source path.
+/// block device of the source path. If a mount of the name space shows a file system of the type
+/// on the device, the root of that file system is the result, as Linux.
 fn make(
     fs: &FsContext,
     ty: FsType,
@@ -174,7 +175,13 @@ fn make(
     };
     let lookup = |path: &[u8]| Ok(fs.resolve(fs.cwd(), path, true)?.inode().clone());
     let args = fstype::MountArgs { data, dev, read_only, lookup: Some(&lookup) };
-    (ty.make)(&args)
+    let mounted = dev.is_some_and(|dev| {
+        fs.namespace()
+            .mounts()
+            .iter()
+            .any(|m| m.source().fstype == ty.name && m.root().inode().metadata().dev == dev)
+    });
+    fstype::get_tree(ty, &args, mounted)
 }
 
 pub(crate) fn umount2(cx: &Cx<'_>, target: u64, flags: u64) -> SysResult {
