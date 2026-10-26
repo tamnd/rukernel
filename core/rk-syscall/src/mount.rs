@@ -6,8 +6,8 @@
 //! `fsmount` and `open_tree` with `OPEN_TREE_CLONE` give an `O_PATH` file of a mount that is not
 //! attached, and `move_mount` attaches it.
 //!
-//! R1 has one mount name space and no propagation between mounts, so a change of the propagation
-//! type has no effect. The VFS keeps the flags of a mount for `/proc/self/mounts`, but it does not
+//! `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` change the propagation of a mount,
+//! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. The VFS keeps the flags of a mount for `/proc/self/mounts`, but it does not
 //! enforce `MS_RDONLY`, `MS_NOEXEC` and the other flags yet.
 
 use crate::cx::{Cx, PATH_MAX, SysResult};
@@ -28,7 +28,7 @@ use rk_abi::native::mount::{
     MOVE_MOUNT_BENEATH, MOVE_MOUNT_F_AUTOMOUNTS, MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_F_SYMLINKS,
     MOVE_MOUNT_T_AUTOMOUNTS, MOVE_MOUNT_T_EMPTY_PATH, MOVE_MOUNT_T_SYMLINKS, MS_BIND, MS_DIRSYNC,
     MS_MGC_MSK, MS_MGC_VAL, MS_MOVE, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
-    MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SLAVE,
+    MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_REC, MS_RELATIME, MS_REMOUNT, MS_SHARED, MS_SLAVE,
     MS_STRICTATIME, MS_SYNCHRONOUS, MS_UNBINDABLE, OPEN_TREE_CLONE,
 };
 use rk_abi::native::open::{O_CLOEXEC, O_PATH, O_RDWR};
@@ -36,7 +36,7 @@ use rk_frame::sync::SpinLock;
 use rk_vfs::file::{File, FileOps};
 use rk_vfs::fstype::{self, FsType};
 use rk_vfs::inode::InodeRef;
-use rk_vfs::{FsContext, Location, Mount, MountNamespace, MountSource};
+use rk_vfs::{FsContext, Location, Mount, MountNamespace, MountSource, PropagationType};
 
 /// The flags of `umount2`. They are in `<sys/mount.h>` of the C library, not in the uAPI.
 const MNT_FORCE: u64 = 1;
@@ -106,9 +106,14 @@ pub(crate) fn mount(
         return Ok(0);
     }
     if flags & PROPAGATION != 0 {
-        if !at.is_mount_root() || (flags & PROPAGATION).count_ones() != 1 {
-            return Err(Errno::EINVAL);
-        }
+        let ty = match flags & PROPAGATION {
+            MS_SHARED => PropagationType::Shared,
+            MS_SLAVE => PropagationType::Slave,
+            MS_PRIVATE => PropagationType::Private,
+            MS_UNBINDABLE => PropagationType::Unbindable,
+            _ => return Err(Errno::EINVAL),
+        };
+        ns.set_propagation(&at, ty, flags & MS_REC != 0)?;
         return Ok(0);
     }
     if flags & MS_MOVE != 0 {
@@ -536,5 +541,5 @@ pub(crate) fn open_tree(cx: &Cx<'_>, dfd: u64, path: u64, flags: u64) -> SysResu
         return Ok(cx.files()?.lock().insert(file, cloexec)? as u64);
     }
     // The clone has the mount of `at` only. The mounts below it are not in the clone.
-    mount_fd(cx, &fs, MountNamespace::clone_tree(&at), cloexec)
+    mount_fd(cx, &fs, MountNamespace::clone_tree(&at)?, cloexec)
 }

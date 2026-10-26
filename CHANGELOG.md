@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The propagation of mounts, as the shared subtrees of Linux. `mount` with `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` or `MS_UNBINDABLE` changes the propagation of a mount, and `MS_REC` changes the mounts under it too. A mount or an unmount under a shared mount occurs on each peer of the mount and on each slave of the peer group. A bind mount of a shared mount is a peer of the source, and a bind mount of an unbindable mount gives `EINVAL`. `/proc/PID/mountinfo` shows the `shared:`, `master:` and `unbindable` fields.
+
 ### Fixed
 
 - A second mount of a block device that has a mounted file system of the same type now gives the same file system, as the super blocks of Linux. Before this change, each mount read the disk again, and the two mounts did not see the changes of the other. A mount that would change the read only state of the file system gives `EBUSY`, as Linux.

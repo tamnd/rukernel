@@ -5,7 +5,10 @@ use alloc::vec;
 use rk_abi::native::open as o;
 use rk_vfs::cpio;
 use rk_vfs::fstype::MountArgs;
-use rk_vfs::{FdTable, File, FsContext, Location, MountNamespace, MountSource, Whence};
+use rk_vfs::{
+    FdTable, File, FsContext, Location, MountNamespace, MountSource, Propagation, PropagationType,
+    Whence,
+};
 
 fn setup() -> (FsContext, Location) {
     let fs = FsContext::new(MountNamespace::new(new(0o755)));
@@ -287,6 +290,54 @@ fn bind_mounts() {
     assert_eq!(root.absolute_path(), b"/");
     assert_eq!(fs.namespace().mounts().len(), 2);
     assert_eq!(fs.namespace().mounts()[1].source(), MountSource::rootfs());
+}
+
+#[test]
+fn mounts_propagate_to_peers_and_slaves() {
+    let (fs, root) = setup();
+    let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    fs.mkdir(&root, b"/b", 0o755).unwrap();
+    fs.mount(new(0o755), &root, b"/a", tmp.clone()).unwrap();
+    fs.mkdir(&root, b"/a/d", 0o755).unwrap();
+    let ns = fs.namespace().clone();
+    let a = fs.resolve(&root, b"/a", true).unwrap();
+    ns.set_propagation(&a, PropagationType::Shared, false).unwrap();
+    let b = fs.resolve(&root, b"/b", true).unwrap();
+    let mb = ns.bind(&a, &b).unwrap();
+    assert_eq!(mb.propagation(), a.mount.propagation());
+
+    // A mount on a peer shows on the other peer, and an unmount of the copy removes both.
+    fs.mount(new(0o755), &root, b"/a/d", tmp.clone()).unwrap();
+    write_file(&fs, &root, b"/a/d/x", b"x");
+    assert_eq!(read_file(&fs, &root, b"/b/d/x").as_deref(), Ok(&b"x"[..]));
+    let bd = fs.resolve(&root, b"/b/d", true).unwrap();
+    ns.unmount(&bd).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/a/d/x").err(), Some(Errno::ENOENT));
+    assert_eq!(ns.mounts().len(), 3);
+
+    // A slave receives the mounts of its master, and sends none.
+    let b = fs.resolve(&root, b"/b", true).unwrap();
+    ns.set_propagation(&b, PropagationType::Slave, false).unwrap();
+    assert_eq!(b.mount.propagation().master, a.mount.propagation().group);
+    fs.mount(new(0o755), &root, b"/b/d", tmp.clone()).unwrap();
+    write_file(&fs, &root, b"/b/d/y", b"y");
+    assert_eq!(read_file(&fs, &root, b"/a/d/y").err(), Some(Errno::ENOENT));
+    let bd = fs.resolve(&root, b"/b/d", true).unwrap();
+    ns.unmount(&bd).unwrap();
+    fs.mount(new(0o755), &root, b"/a/d", tmp).unwrap();
+    write_file(&fs, &root, b"/a/d/z", b"z");
+    assert_eq!(read_file(&fs, &root, b"/b/d/z").as_deref(), Ok(&b"z"[..]));
+
+    // An unbindable mount cannot be bound, and a private mount has no propagation.
+    ns.set_propagation(&a, PropagationType::Unbindable, false).unwrap();
+    assert_eq!(ns.bind(&a, &root).err(), Some(Errno::EINVAL));
+    ns.set_propagation(&a, PropagationType::Private, false).unwrap();
+    assert_eq!(a.mount.propagation(), Propagation::default());
+    let d = fs.resolve(&root, b"/a/d", true).unwrap();
+    assert_eq!(ns.set_propagation(&d, PropagationType::Shared, true), Ok(()));
+    let f = fs.resolve(&root, b"/a/d/z", true).unwrap();
+    assert_eq!(ns.set_propagation(&f, PropagationType::Shared, false), Err(Errno::EINVAL));
 }
 
 #[test]
