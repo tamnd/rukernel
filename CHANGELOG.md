@@ -11,6 +11,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `FITRIM` on ext4, as Linux. The call discards the runs of free blocks in a range that have at least the length that the caller gives, and gives the bytes of the runs. A block that a change freed before the last commit stays, because the journal can still need it. The call needs `CAP_SYS_ADMIN`, and a disk that cannot discard gives `EOPNOTSUPP`. The virtio-blk driver now uses the discard command of the device, and the block layer passes a discard from a file system to the driver.
 - `O_TMPFILE` on ext4 and tmpfs, as Linux. `open` with `O_TMPFILE` makes a regular file without a name in a directory, and `linkat` with `AT_EMPTY_PATH` or with a link of `/proc/self/fd` gives the file a name. A file of `O_TMPFILE` with `O_EXCL` gets no name. On ext4 the file is on the list of orphans until its first link, so a crash does not keep it. generic/004, generic/389 and generic/531 now run.
 
+### Fixed
+
+- A write, a truncate or a `fallocate` of a regular file by a process that is not in the group of the file now clears the set-group-ID bit, as `file_remove_privs` of Linux. Before this change, the bit stayed when the group could not run the file. generic/683, generic/684, generic/685, generic/686 and generic/687 now pass.
+
 ## [0.3.17] - 2026-10-26
 
 ### Added
