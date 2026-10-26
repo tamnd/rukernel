@@ -14,7 +14,6 @@ use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI}
 use rk_abi::native::types::{KernelOldTimeval, KernelTimespec};
 use rk_frame::time::{HZ, ticks};
 use rk_proc::signal::SigSet;
-use rk_vfs::fdtable::NR_OPEN_DEFAULT;
 use rk_vfs::wait::POLL_WAIT;
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
@@ -130,8 +129,14 @@ fn poll_file(cx: &Cx<'_>, fd: i32, events: u32) -> u32 {
     }
 }
 
+/// The soft `RLIMIT_NOFILE` of the process, the most descriptors that `poll` and `select` take.
+fn nofile(cx: &Cx<'_>) -> usize {
+    let limit = cx.process().limit(rk_proc::limits::RLIMIT_NOFILE).cur;
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
 fn do_poll(cx: &Cx<'_>, fds: u64, nfds: u64, deadline: Option<u64>) -> SysResult {
-    if nfds > NR_OPEN_DEFAULT as u64 {
+    if nfds > nofile(cx) as u64 {
         return Err(Errno::EINVAL);
     }
     let raw = cx.read_bytes(fds, nfds as usize * 8)?;
@@ -204,7 +209,7 @@ fn do_select(cx: &Cx<'_>, nfds: u64, ptrs: [u64; 3], deadline: Option<u64>) -> S
     if n < 0 {
         return Err(Errno::EINVAL);
     }
-    let n = (n as usize).min(NR_OPEN_DEFAULT);
+    let n = (n as usize).min(nofile(cx));
     let words = n.div_ceil(64);
     let sets = FdSets {
         words,

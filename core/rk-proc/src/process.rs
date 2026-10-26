@@ -4,7 +4,7 @@
 //! threads. A `Thread` runs in one kernel task. The parent of a process waits for it with `wait4`,
 //! and a process that ends stays as a zombie until its parent reaps it, as in Linux.
 
-use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE};
+use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE};
 use crate::sched::SchedParams;
 use crate::signal::{
     AltStack, NSIG, Pending, SI_TIMER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
@@ -400,6 +400,8 @@ impl Process {
 
     /// Puts a new descriptor table in the process, for `unshare(CLONE_FILES)` and `execve`.
     pub fn set_files(&self, files: SharedFiles) {
+        let nofile = self.limit(RLIMIT_NOFILE).cur;
+        files.lock().set_limit(usize::try_from(nofile).unwrap_or(usize::MAX));
         *self.files.lock() = Some(files);
     }
 
@@ -517,9 +519,15 @@ impl Process {
         self.limits.lock()[resource]
     }
 
-    /// Sets the limit of `resource`. The caller checks the values.
+    /// Sets the limit of `resource`. The caller checks the values. The soft limit of
+    /// `RLIMIT_NOFILE` also goes to the descriptor table.
     pub fn set_limit(&self, resource: usize, limit: Limit) {
         self.limits.lock()[resource] = limit;
+        if resource == RLIMIT_NOFILE
+            && let Some(files) = self.files()
+        {
+            files.lock().set_limit(usize::try_from(limit.cur).unwrap_or(usize::MAX));
+        }
     }
 
     /// The status of the process when `sig` ends it with the default action. The core dump bit

@@ -66,6 +66,12 @@ impl FdTable {
         }
     }
 
+    /// Sets the number of descriptors that the table gives, the soft `RLIMIT_NOFILE` of the
+    /// process. The descriptors at `limit` or above stay open, as on Linux.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit;
+    }
+
     /// The owner of the POSIX record locks that the process takes through this table.
     pub fn owner(&self) -> usize {
         self.owner

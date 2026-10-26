@@ -261,6 +261,11 @@ static void test_perms(void)
 		rl.rlim_max++;
 		check("a higher hard limit without CAP_SYS_RESOURCE gives EPERM",
 		      setrlimit(RLIMIT_NOFILE, &rl) == -1 && errno == EPERM);
+		rl.rlim_max--;
+		rl.rlim_cur = 2048;
+		fd = setrlimit(RLIMIT_NOFILE, &rl) == 0 ? fcntl(1, F_DUPFD, 1500) : -1;
+		check("a higher soft limit lets the process use a descriptor above 1024", fd >= 1500);
+		close(fd);
 		check("mount without CAP_SYS_ADMIN gives EPERM",
 		      mount("none", "/tmp", "tmpfs", 0, NULL) == -1 && errno == EPERM);
 		fd = open("/tmp/perm.acl", O_RDONLY);
