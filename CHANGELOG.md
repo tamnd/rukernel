@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The `ea_inode` feature of ext4, as fs/ext4/xattr.c of Linux. A value of an extended attribute that is larger than a block less 56 bytes, or that does not fit in the inode and the attribute block, goes to the data of an inode of its own, so a value can have up to 64 KiB. The value inode has `EXT4_EA_INODE_FL`, the hash of the value in its access time and the count of its references in its change time and `i_version`. The count of blocks of the file also counts the blocks of its values, as Linux. A value that does not change keeps its inode, and the last reference frees the inode. ext4/026 now passes.
+
 ## [0.3.20] - 2026-10-27
 
 ### Added

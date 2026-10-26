@@ -33,13 +33,23 @@ pub mod incompat {
     pub const MMP: u32 = 0x100;
     /// The bitmaps and the inode tables of a flex group are together.
     pub const FLEX_BG: u32 = 0x200;
+    /// A large value of an extended attribute can be in an inode of its own.
+    pub const EA_INODE: u32 = 0x400;
     /// The checksum seed is in the superblock.
     pub const CSUM_SEED: u32 = 0x2000;
     /// A directory can have more than 2 GiB of entries, or an htree of 3 levels.
     pub const LARGEDIR: u32 = 0x4000;
     /// The features that this driver supports.
-    pub const SUPPORTED: u32 =
-        FILETYPE | RECOVER | META_BG | EXTENTS | BIT64 | MMP | FLEX_BG | CSUM_SEED | LARGEDIR;
+    pub const SUPPORTED: u32 = FILETYPE
+        | RECOVER
+        | META_BG
+        | EXTENTS
+        | BIT64
+        | MMP
+        | FLEX_BG
+        | EA_INODE
+        | CSUM_SEED
+        | LARGEDIR;
 }
 
 /// The features that are compatible for a read only mount. A kernel that does not know one of
@@ -177,6 +187,8 @@ pub mod flags {
     pub const ENCRYPT: u32 = 0x800;
     /// The file has fs-verity.
     pub const VERITY: u32 = 0x10_0000;
+    /// The inode keeps the value of an extended attribute of other inodes.
+    pub const EA_INODE: u32 = 0x20_0000;
     /// The flags that a file cannot have together with [`DAX`], as `EXT4_DAX_MUT_EXCL` of Linux.
     pub const DAX_MUT_EXCL: u32 = VERITY | ENCRYPT | JOURNAL_DATA | INLINE_DATA;
     /// The flags that a new inode gets from its directory, as `EXT4_FL_INHERITED` of Linux

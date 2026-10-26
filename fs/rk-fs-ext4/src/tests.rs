@@ -1318,6 +1318,113 @@ fn unlink_frees_the_attribute_block() {
     assert_eq!(ram.free(), free);
 }
 
+/// Mounts the image with the `ea_inode` feature for a change.
+fn open_ea_inode() -> (Arc<Fs>, Ram) {
+    let mut img = image();
+    let incompat = layout::u32_at(&img, 1024 + 0x60) | layout::incompat::EA_INODE;
+    img[1024 + 0x60..1024 + 0x64].copy_from_slice(&incompat.to_le_bytes());
+    let ram = Ram(Arc::new(SpinLock::new(img)));
+    (Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap(), ram)
+}
+
+/// The value inode of the first entry in the inode `ino`, or in its block if `block` is true.
+fn value_inode(fs: &Fs, ino: u32, block: bool) -> u32 {
+    let raw = fs.inode(ino).unwrap().raw();
+    if block {
+        u32_at(&fs.read_block(raw.file_acl()).unwrap(), 32 + 4)
+    } else {
+        u32_at(&raw.0, 128 + raw.extra_size() + 4 + 4)
+    }
+}
+
+#[test]
+fn a_large_value_goes_to_an_inode_of_its_own() {
+    let (fs, ram) = open_ea_inode();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    let ino = file.metadata().ino as u32;
+    let value: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+    file.set_xattr(b"user.v", &value, 0).unwrap();
+    // The value has 3 blocks and an inode, and the file counts the blocks of the value.
+    assert_eq!(ram.free(), (free.0 - 3, free.1 - 2));
+    assert_eq!(file.metadata().blocks, 3 * (BS / 512) as u64);
+    let ea = value_inode(&fs, ino, false);
+    let raw = fs.read_inode(ea).unwrap();
+    assert_eq!(raw.flags() & flags::EA_INODE, flags::EA_INODE);
+    assert_eq!((raw.mode(), raw.links(), raw.size()), (0o100600, 1, 3000));
+    assert_eq!(u32_at(&raw.0, 0x8), crc::crc32c(fs.csum_seed, &value));
+    assert_eq!((u32_at(&raw.0, 0xc), u32_at(&raw.0, 0x24)), (0, 1));
+    drop((file, root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let root = fs.root().unwrap();
+    let file = root.lookup(b"x").unwrap();
+    assert_eq!(file.get_xattr(b"user.v").unwrap(), value);
+    // The same value keeps its inode, and a new value gets a new inode.
+    file.set_xattr(b"user.v", &value, 0).unwrap();
+    assert_eq!(value_inode(&fs, ino, false), ea);
+    file.set_xattr(b"user.v", &[5u8; 2000], 0).unwrap();
+    assert_eq!(file.get_xattr(b"user.v").unwrap(), [5u8; 2000]);
+    assert_eq!(ram.free(), (free.0 - 2, free.1 - 2));
+    assert_eq!(file.metadata().blocks, 2 * (BS / 512) as u64);
+    // A small value goes back to the inode with the attribute.
+    file.set_xattr(b"user.v", b"1", 0).unwrap();
+    assert_eq!(ram.free(), (free.0, free.1 - 1));
+    assert_eq!(file.metadata().blocks, 0);
+    file.set_xattr(b"user.v", &value, 0).unwrap();
+    file.remove_xattr(b"user.v").unwrap();
+    assert_eq!(ram.free(), (free.0, free.1 - 1));
+    file.set_xattr(b"user.v", &value, 0).unwrap();
+    root.unlink(b"x").unwrap();
+    drop(file);
+    assert_eq!(ram.free(), free);
+}
+
+#[test]
+fn a_value_that_does_not_fit_in_the_block_goes_to_an_inode() {
+    let (fs, ram) = open_ea_inode();
+    let free = ram.free();
+    let root = fs.root().unwrap();
+    let file = root.create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    let ino = file.metadata().ino as u32;
+    file.set_xattr(b"user.a", &[1u8; 64], 0).unwrap();
+    file.set_xattr(b"user.b", &[2u8; 700], 0).unwrap();
+    file.set_xattr(b"user.c", &[3u8; 600], 0).unwrap();
+    // `user.a` fills the inode. The values of `user.b` and `user.c` do not fit together in the
+    // block, so the larger value goes to an inode, and both entries are in the block.
+    let raw = fs.inode(ino).unwrap().raw();
+    let block = fs.read_block(raw.file_acl()).unwrap();
+    assert_eq!(&block[32 + 16..32 + 17], b"b");
+    assert_ne!(u32_at(&block, 32 + 4), 0);
+    assert_eq!(&block[52 + 16..52 + 17], b"c");
+    assert_eq!(u32_at(&block, 52 + 4), 0);
+    assert_eq!(ram.free(), (free.0 - 2, free.1 - 2));
+    drop((file, root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let root = fs.root().unwrap();
+    let file = root.lookup(b"x").unwrap();
+    assert_eq!(file.get_xattr(b"user.a").unwrap(), [1u8; 64]);
+    assert_eq!(file.get_xattr(b"user.b").unwrap(), [2u8; 700]);
+    assert_eq!(file.get_xattr(b"user.c").unwrap(), [3u8; 600]);
+    let ea = value_inode(&fs, ino, true);
+    assert_eq!(fs.read_inode(ea).unwrap().flags() & flags::EA_INODE, flags::EA_INODE);
+    // The release of the file frees the block and the value inode.
+    root.unlink(b"x").unwrap();
+    drop(file);
+    assert_eq!(ram.free(), free);
+}
+
+#[test]
+fn a_large_value_without_ea_inode_gives_enospc() {
+    let (fs, ram) = open_rw();
+    let free = ram.free();
+    let file = fs.root().unwrap().create(b"x", FileType::Regular, 0o644, 0).unwrap();
+    assert_eq!(file.set_xattr(b"user.v", &[1u8; 3000], 0), Err(Errno::ENOSPC));
+    assert_eq!(ram.free(), (free.0, free.1 - 1));
+}
+
 #[test]
 fn an_acl_has_the_ext4_format_on_the_disk() {
     use rk_vfs::acl::{ACCESS, Acl, Entry, UNDEFINED_ID, tag};
