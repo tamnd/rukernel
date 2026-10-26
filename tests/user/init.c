@@ -328,6 +328,11 @@ static void test_files(void)
 	check("fstat", fstat(fd, &st) == 0 && st.st_size == sizeof(data) - 1 && S_ISREG(st.st_mode));
 	check("close", close(fd) == 0);
 	check("rename", rename("/tmp/a", "/tmp/b") == 0 && access("/tmp/a", F_OK) != 0);
+	mkdir("/tmp/x", 0755);
+	check("renameat2 with RENAME_EXCHANGE swaps a file and a directory",
+	      syscall(SYS_renameat2, AT_FDCWD, "/tmp/b", AT_FDCWD, "/tmp/x", RENAME_EXCHANGE) == 0 &&
+		      stat("/tmp/b", &st) == 0 && S_ISDIR(st.st_mode) && rmdir("/tmp/b") == 0 &&
+		      rename("/tmp/x", "/tmp/b") == 0);
 	check("unlink", unlink("/tmp/b") == 0 && stat("/tmp/b", &st) != 0 && errno == ENOENT);
 	char *map;
 	fd = open("/etc/motd", O_RDONLY);

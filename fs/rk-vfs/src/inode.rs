@@ -325,6 +325,14 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTDIR)
     }
 
+    /// Exchanges `old` of this directory and `new` of `new_dir`, which is in the same file system,
+    /// for `RENAME_EXCHANGE`. The two names exist, and they can have different types. The file
+    /// system changes `..` of a directory that moves to the other parent. The default gives
+    /// `EINVAL`, as Linux gives for a file system without `RENAME_EXCHANGE`.
+    fn exchange(&self, _old: &[u8], _new_dir: &InodeRef, _new: &[u8]) -> Result<()> {
+        Err(Errno::EINVAL)
+    }
+
     /// The target of a symbolic link.
     fn read_link(&self) -> Result<Vec<u8>> {
         Err(Errno::EINVAL)

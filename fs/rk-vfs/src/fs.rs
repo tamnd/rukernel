@@ -446,7 +446,11 @@ impl FsContext {
         if flags & !known != 0 {
             return Err(Errno::EINVAL);
         }
-        if flags & (AT_RENAME_EXCHANGE | AT_RENAME_WHITEOUT) as u32 != 0 {
+        let exchange = flags & AT_RENAME_EXCHANGE as u32 != 0;
+        if exchange && flags & (AT_RENAME_NOREPLACE | AT_RENAME_WHITEOUT) as u32 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags & AT_RENAME_WHITEOUT as u32 != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         let old = self.parent(old_start, old_path)?;
@@ -459,6 +463,9 @@ impl FsContext {
             return Err(Errno::EXDEV);
         }
         let from_dir = is_type(from.inode(), FileType::Directory);
+        if exchange {
+            return self.exchange(&old, &new, &from);
+        }
         if (old.trailing_slash || new.trailing_slash) && !from_dir {
             return Err(Errno::ENOTDIR);
         }
@@ -506,6 +513,50 @@ impl FsContext {
         }
         old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);
+        Ok(())
+    }
+
+    /// The part of `renameat2` for `RENAME_EXCHANGE`, which exchanges `from`, the child of `old`,
+    /// and the child of `new`. The caller examined the flags and the mounts of the parents.
+    fn exchange(&self, old: &Parent, new: &Parent, from: &Location) -> Result<()> {
+        let to = self.child(new)?;
+        let from_dir = is_type(from.inode(), FileType::Directory);
+        let to_dir = is_type(to.inode(), FileType::Directory);
+        if (old.trailing_slash && !from_dir) || (new.trailing_slash && !to_dir) {
+            return Err(Errno::ENOTDIR);
+        }
+        if Arc::ptr_eq(from.inode(), to.inode()) {
+            return Ok(());
+        }
+        for at in [from, &to] {
+            if at.is_mount_root() || self.ns.mounted_on(at).is_some() {
+                return Err(Errno::EBUSY);
+            }
+        }
+        if from_dir && new.dir.dentry.is_under(&from.dentry) {
+            return Err(Errno::EINVAL);
+        }
+        if to_dir && old.dir.dentry.is_under(&to.dentry) {
+            return Err(Errno::EINVAL);
+        }
+        // Each name is deleted from its directory and made in the other, as `may_delete` and
+        // `may_create` of Linux examine for an exchange.
+        for (dir, child) in [(&old.dir, from), (&new.dir, &to)] {
+            self.may_change(dir)?;
+            check_fixed(&**dir.inode())?;
+            self.cred.check_sticky(&dir.inode().metadata(), &child.inode().metadata())?;
+            check_fixed(&**child.inode())?;
+        }
+        if !Arc::ptr_eq(old.dir.inode(), new.dir.inode()) {
+            if from_dir {
+                self.permission(from, may::WRITE)?;
+            }
+            if to_dir {
+                self.permission(&to, may::WRITE)?;
+            }
+        }
+        old.dir.inode().exchange(&old.name, new.dir.inode(), &new.name)?;
+        old.dir.dentry.exchange_child(&old.name, &new.dir.dentry, &new.name);
         Ok(())
     }
 

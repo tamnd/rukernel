@@ -549,6 +549,26 @@ fn rename_moves_files_and_directories() {
 }
 
 #[test]
+fn exchange_swaps_a_file_and_a_directory() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let sub = root.lookup(b"sub").unwrap();
+    let dir = root.create(b"d", FileType::Directory, 0o755, 0).unwrap();
+    assert_eq!((root.metadata().nlink, sub.metadata().nlink), (5, 2));
+    root.exchange(b"d", &sub, b"old").unwrap();
+    assert_eq!((root.metadata().nlink, sub.metadata().nlink), (4, 3));
+    assert_eq!(root.exchange(b"d", &sub, b"none"), Err(Errno::ENOENT));
+    drop((dir, sub, root, fs));
+
+    let fs = again(&ram);
+    let root = fs.root().unwrap();
+    let sub = root.lookup(b"sub").unwrap();
+    assert_eq!(root.lookup(b"d").unwrap().metadata().size, 13 * BS as u64);
+    let d = sub.lookup(b"old").unwrap();
+    assert!(Arc::ptr_eq(&d.lookup(b"..").unwrap(), &sub));
+}
+
+#[test]
 fn links_and_symbolic_links_are_made() {
     let (fs, ram) = open_rw();
     let root = fs.root().unwrap();

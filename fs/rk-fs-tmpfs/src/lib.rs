@@ -205,6 +205,17 @@ impl Node {
         }
     }
 
+    /// Points the existing entry `name` to `child`, without a change of the link counts.
+    fn replace(&self, name: &[u8], child: Arc<Node>) -> Result<()> {
+        match &mut *self.data.lock() {
+            Data::Dir { entries, .. } => {
+                *entries.get_mut(name).ok_or(Errno::ENOENT)? = child;
+                Ok(())
+            }
+            _ => Err(Errno::ENOTDIR),
+        }
+    }
+
     fn is_empty_dir(&self) -> bool {
         matches!(&*self.data.lock(), Data::Dir { entries, .. } if entries.is_empty())
     }
@@ -443,6 +454,36 @@ impl Inode for Node {
         self.touch();
         target_dir.insert(new, node.clone())?;
         node.attrs.lock().ctime = now();
+        Ok(())
+    }
+
+    fn exchange(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
+        let target_dir = self.same_fs(new_dir)?;
+        let this = self.this.upgrade().ok_or(Errno::ENOENT)?;
+        let first = self.get(old)?;
+        let second = target_dir.get(new)?;
+        if Arc::ptr_eq(&first, &second) {
+            return Ok(());
+        }
+        self.replace(old, second.clone())?;
+        target_dir.replace(new, first.clone())?;
+        if !Arc::ptr_eq(&this, &target_dir) {
+            if first.is_dir() {
+                first.set_parent(&target_dir);
+                target_dir.add_links(1);
+                self.add_links(-1);
+            }
+            if second.is_dir() {
+                second.set_parent(&this);
+                self.add_links(1);
+                target_dir.add_links(-1);
+            }
+            target_dir.touch();
+        }
+        self.touch();
+        let t = now();
+        first.attrs.lock().ctime = t;
+        second.attrs.lock().ctime = t;
         Ok(())
     }
 
