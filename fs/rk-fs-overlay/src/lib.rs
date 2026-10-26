@@ -22,12 +22,12 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::fstype::{FsType, MountArgs};
@@ -63,6 +63,9 @@ const COPY_FLAGS: u32 = iflags::SYNC | iflags::NOATIME;
 const WORK: &[u8] = b"work";
 /// The bytes that a copy up moves in one step.
 const CHUNK: usize = 64 * 1024;
+/// The maximum count of the unused nodes that one mount keeps, as the dentries on the LRU list
+/// of Linux.
+const UNUSED_MAX: usize = 4096;
 
 /// One mount of overlayfs.
 struct Fs {
@@ -78,6 +81,8 @@ struct Fs {
     prefix: &'static [u8],
     /// The options of the mount for `/proc/PID/mountinfo`.
     options: Vec<u8>,
+    /// The order of the unused nodes, for the eviction.
+    cache: Cache,
 }
 
 impl Fs {
@@ -303,6 +308,9 @@ struct Node {
     /// The nodes that a lookup in this directory gave, so a name keeps one node while it is in
     /// use.
     children: SpinLock<BTreeMap<Vec<u8>, Weak<Node>>>,
+    /// The children that are not in use, as the unused dentries of Linux. A lookup gives the
+    /// same node again, with the same inodes of the layers, until a removal or an eviction.
+    unused: SpinLock<BTreeMap<Vec<u8>, Saved>>,
     /// The joined entries of the directory, which `read_dir` makes again at position 0.
     entries: SpinLock<Vec<DirEntry>>,
 }
@@ -334,7 +342,14 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     };
     let prefix = if opts.userxattr { USER } else { TRUSTED };
     let read_only = AtomicBool::new(!writable || args.read_only);
-    let fs = Fs { dev: rk_vfs::anon_dev(), writable, read_only, prefix, options: opts.show() };
+    let fs = Fs {
+        dev: rk_vfs::anon_dev(),
+        writable,
+        read_only,
+        prefix,
+        options: opts.show(),
+        cache: Cache::default(),
+    };
     Node::new(&Arc::new(fs), None, Vec::new(), upper, lowers)
         .ok_or(Errno::EINVAL)
         .map(|n| n as InodeRef)
@@ -396,6 +411,7 @@ pub fn new(lowers: Vec<InodeRef>, upper: Option<InodeRef>) -> Result<InodeRef> {
         read_only: AtomicBool::new(upper.is_none()),
         prefix: TRUSTED,
         options: Vec::new(),
+        cache: Cache::default(),
     });
     Ok(Node::new(&fs, None, Vec::new(), upper, lowers).ok_or(Errno::EINVAL)?)
 }
@@ -436,8 +452,31 @@ impl Node {
             upper: SpinLock::new(upper),
             lowers,
             children: SpinLock::new(BTreeMap::new()),
+            unused: SpinLock::new(BTreeMap::new()),
             entries: SpinLock::new(Vec::new()),
         }))
+    }
+
+    /// Makes the node of `name` again from the unused node `saved`.
+    fn restore(self: &Arc<Self>, name: &[u8], saved: Saved) -> Arc<Node> {
+        let node = Arc::new_cyclic(|this| Node {
+            fs: self.fs.clone(),
+            first: saved.first,
+            this: this.clone(),
+            place: SpinLock::new((Some(self.clone()), name.to_vec())),
+            upper: SpinLock::new(saved.upper),
+            lowers: saved.lowers,
+            children: SpinLock::new(BTreeMap::new()),
+            unused: SpinLock::new(saved.unused),
+            entries: SpinLock::new(Vec::new()),
+        });
+        // The unused children of the node can go away again in an eviction.
+        let names: Vec<_> = node.unused.lock().iter().map(|(n, s)| (n.clone(), s.stamp)).collect();
+        let mut lru = self.fs.cache.lru.lock();
+        for (n, stamp) in names {
+            lru.push_back((node.this.clone(), n, stamp));
+        }
+        node
     }
 
     /// Gives the reference to this node. A node is alive while a caller uses it.
@@ -518,12 +557,16 @@ impl Node {
         Node::new(&self.fs, Some(self.arc()?), name.to_vec(), upper, lowers).ok_or(Errno::ENOENT)
     }
 
-    /// Gives the node of `name`, from the nodes in use if one has the name.
+    /// Gives the node of `name`, from the nodes in use or the unused nodes if one has the name.
     fn child(&self, name: &[u8]) -> Result<Arc<Node>> {
         if let Some(node) = self.children.lock().get(name).and_then(Weak::upgrade) {
             return Ok(node);
         }
-        let node = self.find(name)?;
+        let saved = self.unused.lock().remove(name);
+        let node = match saved {
+            Some(saved) => self.arc()?.restore(name, saved),
+            None => self.find(name)?,
+        };
         let mut children = self.children.lock();
         if let Some(old) = children.get(name).and_then(Weak::upgrade) {
             return Ok(old);
@@ -536,6 +579,38 @@ impl Node {
     /// Forgets the node of `name` after a change of the directory.
     fn forget(&self, name: &[u8]) {
         self.children.lock().remove(name);
+        let old = self.unused.lock().remove(name);
+        drop(old);
+    }
+
+    /// Keeps the node `saved` of `name` that is not in use, and evicts the oldest unused nodes
+    /// of the mount if there are too many.
+    fn keep(&self, name: Vec<u8>, saved: Saved) {
+        let stamp = saved.stamp;
+        let old = self.unused.lock().insert(name.clone(), saved);
+        drop(old);
+        self.fs.cache.lru.lock().push_back((self.this.clone(), name, stamp));
+    }
+
+    /// Checks that the node `node` of `name` still has the same inode in the upper directory
+    /// `dir`, as `ovl_remove_upper` and `ovl_remove_and_whiteout` of Linux. A node without an
+    /// upper inode must not have a file in the upper directory. A change of the upper directory
+    /// that is not through the mount gives `ESTALE`.
+    fn check_upper(dir: &InodeRef, name: &[u8], node: &Node) -> Result<()> {
+        let real = match dir.lookup(name) {
+            Ok(i) if !is_whiteout(&i) => Some(i),
+            Ok(_) | Err(Errno::ENOENT) => None,
+            Err(e) => return Err(e),
+        };
+        let same = match (node.upper(), real) {
+            (None, None) => true,
+            (Some(upper), Some(real)) => {
+                let (a, b) = (upper.metadata(), real.metadata());
+                Arc::ptr_eq(&upper, &real) || (a.dev, a.ino) == (b.dev, b.ino)
+            }
+            _ => false,
+        };
+        if same { Ok(()) } else { Err(Errno::ESTALE) }
     }
 
     /// Tells if a lower directory of this directory shows `name`. A removal of such a name needs
@@ -684,6 +759,7 @@ impl Node {
         let parent = Some(self.arc()?);
         let node = Node::new(&self.fs, parent, name.to_vec(), Some(inode), Vec::new())
             .ok_or(Errno::EIO)?;
+        self.forget(name);
         self.children.lock().insert(name.to_vec(), Arc::downgrade(&node));
         Ok(node)
     }
@@ -700,6 +776,122 @@ impl Node {
     /// Checks that the directory node `node` has no entries in the joined view.
     fn check_empty(node: &Node) -> Result<()> {
         if node.joined()?.is_empty() { Ok(()) } else { Err(Errno::ENOTEMPTY) }
+    }
+}
+
+impl Drop for Node {
+    /// Keeps the node in its directory as an unused node, if the directory still gives the node
+    /// for its name, as `dput` of Linux keeps a dentry on the LRU list.
+    fn drop(&mut self) {
+        let (parent, name) = core::mem::take(&mut *self.place.lock());
+        let Some(parent) = parent else { return };
+        {
+            let mut children = parent.children.lock();
+            if !children.get(&name).is_some_and(|w| w.ptr_eq(&self.this)) {
+                return;
+            }
+            children.remove(&name);
+            let saved = Saved {
+                upper: self.upper.lock().take(),
+                first: self.first.clone(),
+                lowers: core::mem::take(&mut self.lowers),
+                unused: core::mem::take(&mut *self.unused.lock()),
+                stamp: self.fs.cache.next.fetch_add(1, Ordering::Relaxed),
+                _count: Counted::new(&self.fs),
+            };
+            // The lock on `children` stops a new node of the name until the node is kept.
+            parent.keep(name, saved);
+        }
+        self.fs.cache.shrink(UNUSED_MAX);
+    }
+}
+
+/// An entry of the LRU list: the directory, the name and the stamp of an unused node.
+type LruEntry = (Weak<Node>, Vec<u8>, u64);
+
+/// The unused nodes of a mount in the order of their use, as the LRU list of dentries of Linux.
+struct Cache {
+    /// The directory, the name and the stamp of each unused node, the oldest first. An entry
+    /// whose node is not unused now is out of date, and the eviction skips it.
+    lru: SpinLock<VecDeque<LruEntry>>,
+    /// The count of the unused nodes of the mount, with the unused nodes in unused directories.
+    count: AtomicUsize,
+    /// The stamp of the next unused node.
+    next: AtomicU64,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Cache {
+            lru: SpinLock::new(VecDeque::new()),
+            count: AtomicUsize::new(0),
+            next: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Cache {
+    /// Evicts the oldest unused nodes until the mount has `max` of them at most. An evicted
+    /// directory takes its unused children with it.
+    fn shrink(&self, max: usize) {
+        while self.count.load(Ordering::Relaxed) > max {
+            let Some((dir, name, stamp)) = self.lru.lock().pop_front() else { break };
+            let Some(dir) = dir.upgrade() else { continue };
+            let victim = {
+                let mut unused = dir.unused.lock();
+                match unused.get(&name) {
+                    Some(s) if s.stamp == stamp => unused.remove(&name),
+                    _ => None,
+                }
+            };
+            drop(victim);
+        }
+        // Removes the entries that are out of date, so that the list does not grow. The check
+        // is not under the lock, because the drop of a directory can add an entry.
+        let old = {
+            let mut lru = self.lru.lock();
+            if lru.len() <= 2 * max.max(16) {
+                return;
+            }
+            core::mem::take(&mut *lru)
+        };
+        let mut valid: VecDeque<_> = old
+            .into_iter()
+            .filter(|(dir, name, stamp)| {
+                dir.upgrade()
+                    .is_some_and(|d| d.unused.lock().get(name).is_some_and(|s| s.stamp == *stamp))
+            })
+            .collect();
+        let mut lru = self.lru.lock();
+        valid.append(&mut lru);
+        *lru = valid;
+    }
+}
+
+/// A node that is not in use: the inodes of its layers and its unused children.
+struct Saved {
+    upper: Option<InodeRef>,
+    first: InodeRef,
+    lowers: Vec<InodeRef>,
+    unused: BTreeMap<Vec<u8>, Saved>,
+    /// The order of the node in the LRU list of the mount.
+    stamp: u64,
+    _count: Counted,
+}
+
+/// One unused node in the count of the mount.
+struct Counted(Arc<Fs>);
+
+impl Counted {
+    fn new(fs: &Arc<Fs>) -> Self {
+        fs.cache.count.fetch_add(1, Ordering::Relaxed);
+        Counted(fs.clone())
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.cache.count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -836,6 +1028,7 @@ impl Inode for Node {
             return Err(Errno::EISDIR);
         }
         let dir = self.copy_up()?;
+        Node::check_upper(&dir, name, &node)?;
         if node.upper().is_some() {
             dir.unlink(name)?;
         }
@@ -852,6 +1045,7 @@ impl Inode for Node {
         }
         Node::check_empty(&node)?;
         let dir = self.copy_up()?;
+        Node::check_upper(&dir, name, &node)?;
         if let Some(upper) = node.upper() {
             self.remove_whiteouts(&upper)?;
             dir.rmdir(name)?;
