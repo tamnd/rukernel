@@ -1,8 +1,15 @@
 # Linux, hardware and tool names that the spelling check reads as mistakes.
 
 [files]
-# The generated ABI has the names of Linux, for example `creat`.
-extend-exclude = ["LICENSE", "abi/", "core/rk-abi/src/generated/"]
+# The generated ABI has the names of Linux, for example `creat`. The fstests tables copy the
+# descriptions of the tests from fstests as they are.
+extend-exclude = [
+    "LICENSE",
+    "abi/",
+    "core/rk-abi/src/generated/",
+    "tools/fstests/ext4.md",
+    "tools/fstests/overlay.md",
+]
 
 [default.extend-words]
 AER = "AER"       # PCIe Advanced Error Reporting
