@@ -23,11 +23,17 @@ const DEVICE_MODERN: u16 = 0x1042;
 const F_RO: u64 = 1 << 5;
 /// The device has the flush command.
 const F_FLUSH: u64 = 1 << 9;
+/// The device has the discard command.
+const F_DISCARD: u64 = 1 << 13;
 
 /// The request types.
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
 const T_FLUSH: u32 = 4;
+const T_DISCARD: u32 = 11;
+
+/// The offset of `max_discard_sectors` in the device configuration.
+const CONFIG_MAX_DISCARD_SECTORS: usize = 36;
 
 /// The status that the device writes for a request that it did.
 const S_OK: u8 = 0;
@@ -47,7 +53,7 @@ pub(crate) fn probe(dev: &PciDevice, index: u32) -> Option<String> {
         return None;
     }
     let t = Transport::new(dev)?;
-    let Some(features) = t.negotiate(F_RO | F_FLUSH) else {
+    let Some(features) = t.negotiate(F_RO | F_FLUSH | F_DISCARD) else {
         t.fail();
         return None;
     };
@@ -59,11 +65,16 @@ pub(crate) fn probe(dev: &PciDevice, index: u32) -> Option<String> {
     let req = alloc_zeroed_frame()?;
     let data = (0..DATA_FRAMES).map(|_| alloc_zeroed_frame()).collect::<Option<Vec<_>>>()?;
     let sectors = t.device_u64(0);
+    let max_discard = match features & F_DISCARD {
+        0 => 0,
+        _ => t.device_u32(CONFIG_MAX_DISCARD_SECTORS),
+    };
     t.add_status(status::DRIVER_OK);
     let disk = VirtioBlk {
         sectors,
         read_only: features & F_RO != 0,
         flush: features & F_FLUSH != 0,
+        max_discard,
         state: SpinLock::new(State { t, queue, req, data }),
     };
     let name = format!("vd{}", char::from(b'a' + index as u8));
@@ -83,6 +94,8 @@ struct VirtioBlk {
     sectors: u64,
     read_only: bool,
     flush: bool,
+    /// The most sectors of one discard request, or 0 if the device cannot discard.
+    max_discard: u32,
     state: SpinLock<State>,
 }
 
@@ -180,6 +193,36 @@ impl BlockDevice for VirtioBlk {
             return Ok(());
         }
         self.state.lock().request(T_FLUSH, 0, 0, 0)
+    }
+
+    fn can_discard(&self) -> bool {
+        self.max_discard != 0
+    }
+
+    fn discard(&self, sector: u64, count: u64) -> Result<()> {
+        if self.max_discard == 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if self.read_only {
+            return Err(Errno::EPERM);
+        }
+        if sector.checked_add(count).is_none_or(|e| e > self.sectors) {
+            return Err(Errno::EIO);
+        }
+        let mut st = self.state.lock();
+        let (mut sector, mut left) = (sector, count);
+        while left > 0 {
+            let n = left.min(u64::from(self.max_discard));
+            // One segment: the sector, the count of sectors and the flags.
+            let mut seg = [0u8; 16];
+            seg[0..8].copy_from_slice(&sector.to_le_bytes());
+            seg[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+            st.data[0].write_bytes(0, &seg);
+            st.request(T_DISCARD, 0, 1, seg.len())?;
+            sector += n;
+            left -= n;
+        }
+        Ok(())
     }
 }
 

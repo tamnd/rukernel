@@ -15,7 +15,7 @@ pub(crate) fn mark_end(bitmap: &mut [u8], from: usize) {
     }
 }
 
-fn test_bit(bitmap: &[u8], bit: usize) -> bool {
+pub(crate) fn test_bit(bitmap: &[u8], bit: usize) -> bool {
     bitmap[bit / 8] & (1 << (bit % 8)) != 0
 }
 

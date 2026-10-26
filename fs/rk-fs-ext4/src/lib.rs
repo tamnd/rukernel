@@ -32,6 +32,7 @@ mod node;
 mod resize;
 #[cfg(test)]
 mod tests;
+mod trim;
 mod xattr;
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -94,6 +95,20 @@ pub trait Disk: Send + Sync {
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Tells if the disk can discard blocks.
+    fn can_discard(&self) -> bool {
+        false
+    }
+
+    /// Tells the disk that the `len` bytes from `offset` have no data that is in use.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EOPNOTSUPP` if the disk cannot discard, or the error of the disk.
+    fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
 }
 
 impl Disk for rk_vfs::blockdev::MountedDisk {
@@ -117,6 +132,14 @@ impl Disk for rk_vfs::blockdev::MountedDisk {
 
     fn flush(&self) -> Result<()> {
         rk_vfs::blockdev::DiskCache::flush(&self.cache)
+    }
+
+    fn can_discard(&self) -> bool {
+        rk_vfs::blockdev::DiskCache::can_discard(&self.cache)
+    }
+
+    fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        rk_vfs::blockdev::DiskCache::discard(&self.cache, offset, len)
     }
 }
 

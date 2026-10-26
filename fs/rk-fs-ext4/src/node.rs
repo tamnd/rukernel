@@ -1000,6 +1000,10 @@ impl Inode for Node {
         self.fs.resize(blocks)
     }
 
+    fn trim(&self, start: u64, len: u64, minlen: u64) -> Result<u64> {
+        self.fs.trim(start, len, minlen)
+    }
+
     fn metadata(&self) -> Metadata {
         let raw = self.raw();
         let kind = kind_of(&raw);

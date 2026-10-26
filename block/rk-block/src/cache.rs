@@ -46,6 +46,20 @@ pub trait Store: Send + Sync {
     ///
     /// Gives the error of the store.
     fn flush(&self) -> Result<()>;
+
+    /// Tells if the store can discard data.
+    fn can_discard(&self) -> bool {
+        false
+    }
+
+    /// Discards the `len` bytes from `offset`. Both are multiples of `SECTOR_SIZE`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EOPNOTSUPP` if the store cannot discard, or the error of the store.
+    fn discard(&self, _offset: u64, _len: u64) -> Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
 }
 
 /// The data of up to `FOLIO_PAGES` pages, from a multiple of `FOLIO_SIZE`.
@@ -340,6 +354,26 @@ impl<S: Store> PageCache<S> {
     /// Gives the error of the store.
     pub fn flush(&self) -> Result<()> {
         self.store.flush()
+    }
+
+    /// Tells if the store can discard data.
+    pub fn can_discard(&self) -> bool {
+        self.store.can_discard()
+    }
+
+    /// Discards the `len` bytes of the store from `offset`. The folios in the cache stay, so
+    /// the caller must not use the data after the discard.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` if `offset` or `len` is not a multiple of `SECTOR_SIZE`, or the error of
+    /// the store.
+    pub fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        let sector = SECTOR_SIZE as u64;
+        if !offset.is_multiple_of(sector) || !len.is_multiple_of(sector) {
+            return Err(Errno::EINVAL);
+        }
+        self.store.discard(offset, len)
     }
 
     /// Drops the folios that have a byte from `offset` up to `offset + len`, after a write that
