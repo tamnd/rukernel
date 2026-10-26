@@ -6,7 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
-- `renameat2` with `RENAME_EXCHANGE` on tmpfs and ext4. The two names exchange their files, which can have different types. A directory that moves to the other parent gets a new `..`, and the link counts of the parents change. A file system without the flag gives `EINVAL`, as Linux. generic/025 needs this.
+- `renameat2` with `RENAME_EXCHANGE` on tmpfs and ext4. The two names exchange their files, which can have different types. A directory that moves to the other parent gets a new `..`, and the link counts of the parents change. A file system without the flag gives `EINVAL`, as Linux. generic/025 passes.
 
 ### Fixed
 
