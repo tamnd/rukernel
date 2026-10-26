@@ -341,6 +341,23 @@ fn mounts_propagate_to_peers_and_slaves() {
 }
 
 #[test]
+fn a_copy_of_the_name_space_has_its_own_mounts() {
+    let (fs, root) = setup();
+    let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    let mut copy = fs.clone();
+    copy.unshare_namespace();
+    let top = copy.root().clone();
+    assert!(!top.same(&root));
+    assert!(copy.namespace().contains(&top.mount));
+    copy.mount(new(0o755), &top, b"/a", tmp).unwrap();
+    write_file(&copy, &top, b"/a/f", b"f");
+    assert_eq!(read_file(&copy, &top, b"/a/f").as_deref(), Ok(&b"f"[..]));
+    assert_eq!(read_file(&fs, &root, b"/a/f").err(), Some(Errno::ENOENT));
+    assert_eq!((fs.namespace().mounts().len(), copy.namespace().mounts().len()), (1, 2));
+}
+
+#[test]
 fn directory_entries() {
     let (fs, root) = setup();
     for name in [&b"/c"[..], b"/a", b"/a-much-longer-name-than-the-buffer-holds"] {

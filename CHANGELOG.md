@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The propagation of mounts, as the shared subtrees of Linux. `mount` with `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` or `MS_UNBINDABLE` changes the propagation of a mount, and `MS_REC` changes the mounts under it too. A mount or an unmount under a shared mount occurs on each peer of the mount and on each slave of the peer group. A bind mount of a shared mount is a peer of the source, and a bind mount of an unbindable mount gives `EINVAL`. `/proc/PID/mountinfo` shows the `shared:`, `master:` and `unbindable` fields.
+- Mount name spaces. `unshare` and `clone` with `CLONE_NEWNS` give the process a copy of each mount, as `copy_mnt_ns` of Linux. A copy of a shared mount is a peer of the mount, so a mount under it shows in both name spaces. The flag needs `CAP_SYS_ADMIN`, and `clone` gives `EINVAL` if it also has `CLONE_FS`.
 
 ### Fixed
 

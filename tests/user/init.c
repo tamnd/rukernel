@@ -1742,6 +1742,42 @@ static void test_mount(void)
 	rmdir("/mnt2");
 }
 
+/*
+ * unshare(CLONE_NEWNS) gives the process a copy of the mounts. A mount under a shared mount shows
+ * in the old name space too, and a mount under a private mount does not.
+ */
+static void test_mount_ns(void)
+{
+	int status = -1;
+	pid_t pid;
+
+	mkdir("/mnt", 0755);
+	check("mount tmpfs for the name spaces", mount("none", "/mnt", "tmpfs", 0, NULL) == 0);
+	mkdir("/mnt/a", 0755);
+	mkdir("/mnt/b", 0755);
+	check("mount --make-shared", mount(NULL, "/mnt", NULL, MS_SHARED, NULL) == 0);
+	pid = fork();
+	if (pid == 0) {
+		int ok = unshare(CLONE_NEWNS) == 0;
+		ok = ok && mount("none", "/mnt/a", "tmpfs", 0, NULL) == 0;
+		ok = ok && mount(NULL, "/mnt", NULL, MS_PRIVATE, NULL) == 0;
+		ok = ok && mount("none", "/mnt/b", "tmpfs", 0, NULL) == 0;
+		ok = ok && close(open("/mnt/a/g", O_CREAT | O_RDWR, 0644)) == 0;
+		ok = ok && close(open("/mnt/b/f", O_CREAT | O_RDWR, 0644)) == 0;
+		_exit(ok ? 0 : 1);
+	}
+	waitpid(pid, &status, 0);
+	check("unshare(CLONE_NEWNS) and mounts in the new name space",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("a mount under a shared mount shows in the old name space", access("/mnt/a/g", F_OK) == 0);
+	errno = 0;
+	check("a mount under a private mount stays in the new name space",
+	      access("/mnt/b/f", F_OK) == -1 && errno == ENOENT);
+	check("umount the copy of the mount", umount("/mnt/a") == 0);
+	check("umount the tmpfs of the name spaces", umount("/mnt") == 0);
+	rmdir("/mnt");
+}
+
 /* A walk follows 40 symbolic links and gives ELOOP at the next one, as Linux. */
 static void test_symlink_chain(void)
 {
@@ -2878,6 +2914,7 @@ int main(int argc, char **argv)
 	test_seccomp();
 	test_ptrace();
 	test_mount();
+	test_mount_ns();
 	test_mount_api();
 	test_symlink_chain();
 	test_splice();

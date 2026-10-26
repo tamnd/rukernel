@@ -46,10 +46,9 @@ const PR_GET_NAME: u64 = 16;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
 
-/// The flags of `unshare` that make a new namespace. rukernel has no namespaces, thus they give
-/// `EINVAL`, as Linux without `CONFIG_NAMESPACES` gives.
-const CLONE_NEW_ANY: u64 = CLONE_NEWNS
-    | CLONE_NEWCGROUP
+/// The flags of `unshare` that make a new namespace of a type that rukernel does not have yet.
+/// They give `EINVAL`, as Linux without the namespace type gives.
+const CLONE_NEW_ANY: u64 = CLONE_NEWCGROUP
     | CLONE_NEWUTS
     | CLONE_NEWIPC
     | CLONE_NEWUSER
@@ -66,11 +65,21 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         | CLONE_SIGHAND
         | CLONE_VM
         | CLONE_SYSVSEM
+        | CLONE_NEWNS
         | CLONE_NEW_ANY;
     if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
     }
     let process = cx.process();
+    // A new mount name space needs `CAP_SYS_ADMIN`, and the process leaves its shared file
+    // system context too, as `unshare_fs` of Linux.
+    let mut flags = flags;
+    if flags & CLONE_NEWNS != 0 {
+        if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        flags |= CLONE_FS;
+    }
     // A process with more than one thread cannot leave its group, its handlers or its memory.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && process.threads().len() > 1 {
         return Err(Errno::EINVAL);
@@ -82,7 +91,10 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_FS != 0
         && let Some(fs) = process.fs()
     {
-        let context = fs.lock().clone();
+        let mut context = fs.lock().clone();
+        if flags & CLONE_NEWNS != 0 {
+            context.unshare_namespace();
+        }
         process.set_fs(Arc::new(SpinLock::new(context)));
     }
     Ok(0)
@@ -176,6 +188,16 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if flags & CLONE_PIDFD != 0 && flags & (CLONE_THREAD | CLONE_DETACHED) != 0 {
         return Err(Errno::EINVAL);
     }
+    // A new mount name space cannot share the file system context. The threads of a process
+    // share one name space in rukernel.
+    if flags & CLONE_NEWNS != 0 {
+        if flags & (CLONE_FS | CLONE_THREAD) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+    }
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread(cx.thread)?
     } else {
@@ -188,6 +210,11 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
         };
         rk_proc::fork(cx.thread, share)?
     };
+    if flags & CLONE_NEWNS != 0
+        && let Some(fs) = thread.process().fs()
+    {
+        fs.lock().unshare_namespace();
+    }
     if flags & CLONE_CLEAR_SIGHAND != 0 {
         // A handler goes back to the default action, and an ignored signal stays ignored.
         thread.process().reset_actions();

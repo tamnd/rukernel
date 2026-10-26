@@ -425,6 +425,44 @@ impl MountNamespace {
         ns
     }
 
+    /// Makes a copy of the name space with a copy of each mount, for `CLONE_NEWNS`, as
+    /// `copy_mnt_ns` of Linux. A copy has the propagation of its mount, so a copy of a shared
+    /// mount is a peer of the mount. `locations` go to the same places in the copy.
+    pub fn copy(&self, locations: &mut [&mut Location]) -> Arc<Self> {
+        let old = self.mounts();
+        let new: Vec<Arc<Mount>> = old
+            .iter()
+            .map(|m| {
+                let copy = Mount::new(m.root.clone(), m.source());
+                copy.set_propagation(m.propagation());
+                copy
+            })
+            .collect();
+        let find = |m: &Arc<Mount>| old.iter().position(|o| Arc::ptr_eq(o, m)).map(|i| &new[i]);
+        for (m, copy) in old.iter().zip(&new) {
+            if let Some(place) = m.mountpoint() {
+                let mount = find(&place.mount).cloned().unwrap_or(place.mount);
+                *copy.mountpoint.lock() = Some(Location { mount, dentry: place.dentry });
+            }
+        }
+        let root = find(&self.root)
+            .cloned()
+            .unwrap_or_else(|| Mount::new(self.root.root.clone(), self.root.source()));
+        for at in locations {
+            if let Some(mount) = find(&at.mount) {
+                at.mount = mount.clone();
+            }
+        }
+        let ns =
+            Arc::new_cyclic(|me| Self { root, mounts: SpinLock::new(new.clone()), me: me.clone() });
+        let mut all = ATTACHED.lock();
+        for m in &new {
+            *m.ns.lock() = ns.me.clone();
+            all.push(Arc::downgrade(m));
+        }
+        ns
+    }
+
     /// The root of the name space.
     pub fn root(&self) -> Location {
         Location { mount: self.root.clone(), dentry: self.root.root.clone() }
