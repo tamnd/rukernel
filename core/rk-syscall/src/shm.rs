@@ -8,7 +8,8 @@
 //! splits counts two times. `IPC_RMID` removes the key at once, and the segment goes when the
 //! last area goes.
 //!
-//! All the processes have the user and the group 0, thus the calls do not check the permissions.
+//! The calls check the permissions of a segment as `ipcperms` of Linux, and only the owner, the
+//! creator or a process with `CAP_SYS_ADMIN` can change or remove a segment.
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
@@ -19,6 +20,7 @@ use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
 use rk_mm::vma::Backing;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
+use rk_vfs::cred::{IpcOwner, cap};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new segment.
@@ -68,6 +70,19 @@ struct IpcPerm {
     pad2: u16,
     pad3: u32,
     unused: [u64; 2],
+}
+
+impl IpcPerm {
+    /// The owner, the creator and the mode, for the permission checks.
+    fn owner(&self) -> IpcOwner {
+        IpcOwner {
+            uid: self.uid,
+            gid: self.gid,
+            cuid: self.cuid,
+            cgid: self.cgid,
+            mode: u32::from(self.mode),
+        }
+    }
 }
 
 /// The state of a segment, as `struct shmid64_ds` of x86-64.
@@ -199,6 +214,7 @@ fn pid(cx: &Cx<'_>) -> i32 {
 pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult {
     let key = key as i32;
     let flags = flags as u32;
+    let c = cx.process().cred();
     let mut table = TABLE.lock();
     table.sweep();
     if key != IPC_PRIVATE {
@@ -206,14 +222,15 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
             .segments
             .iter()
             .find(|(_, s)| s.perm.key == key && s.perm.mode & SHM_DEST == 0)
-            .map(|(id, s)| (*id, s.pages.size));
-        if let Some((id, segsz)) = found {
+            .map(|(id, s)| (*id, s.pages.size, s.perm.owner()));
+        if let Some((id, segsz, owner)) = found {
             if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
                 return Err(Errno::EEXIST);
             }
             if size > segsz {
                 return Err(Errno::EINVAL);
             }
+            c.ipc_permission(&owner, flags & 0o777)?;
             return Ok(id as u64);
         }
         if flags & IPC_CREAT == 0 {
@@ -230,7 +247,6 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
     table.next = table.next.wrapping_add(1) & i32::MAX;
     let pages = Arc::new(ShmPages { key, id, size, pages: SpinLock::new(BTreeMap::new()) });
     // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
-    let c = cx.process().cred();
     let perm = IpcPerm {
         key,
         uid: c.euid,
@@ -257,10 +273,20 @@ pub(crate) fn shmat(cx: &Cx<'_>, id: u64, addr: u64, flags: u64) -> SysResult {
     if flags & SHM_REMAP != 0 && addr == 0 {
         return Err(Errno::EINVAL);
     }
-    let pages = TABLE.lock().get(id as i32)?.pages.clone();
+    let read_only = flags & SHM_RDONLY != 0;
+    let mut access = if read_only { 0o444 } else { 0o666 };
+    if flags & SHM_EXEC != 0 {
+        access |= 0o111;
+    }
+    let c = cx.process().cred();
+    let pages = {
+        let mut table = TABLE.lock();
+        let s = table.get(id as i32)?;
+        c.ipc_permission(&s.perm.owner(), access)?;
+        s.pages.clone()
+    };
     let len = usize::try_from(pages.size.next_multiple_of(PAGE_SIZE as u64))
         .map_err(|_| Errno::ENOMEM)?;
-    let read_only = flags & SHM_RDONLY != 0;
     let prot = Prot { read: true, write: !read_only, exec: flags & SHM_EXEC != 0 };
     let file: Arc<dyn MmFile> = pages;
     let req = MmapRequest {
@@ -317,6 +343,9 @@ pub(crate) fn shmdt(cx: &Cx<'_>, addr: u64) -> SysResult {
 pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
     let cmd = cmd as u32 & !IPC_64;
     let id = id as i32;
+    let c = cx.process().cred();
+    // `IPC_SET` reads the new values before it finds the segment, as Linux.
+    let new: Option<ShmidDs> = if cmd == IPC_SET { Some(cx.read_val(buf)?) } else { None };
     let mut table = TABLE.lock();
     match cmd {
         IPC_INFO => {
@@ -352,17 +381,25 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
             Ok(max as u64)
         }
         IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
-            let ds = table.get(id)?.ds();
+            let s = table.get(id)?;
+            if cmd != SHM_STAT_ANY {
+                c.ipc_permission(&s.perm.owner(), 0o444)?;
+            }
+            let ds = s.ds();
             drop(table);
             cx.write_val(buf, &ds)?;
             Ok(if cmd == IPC_STAT { 0 } else { id as u64 })
         }
         IPC_SET => {
-            table.get(id)?;
-            drop(table);
-            let ds: ShmidDs = cx.read_val(buf)?;
-            let mut table = TABLE.lock();
+            let ds = new.ok_or(Errno::EINVAL)?;
             let s = table.get(id)?;
+            if !c.ipc_owns(&s.perm.owner()) {
+                return Err(Errno::EPERM);
+            }
+            // -1 is not a valid ID, as `ipc_update_perm` of Linux.
+            if ds.perm.uid == u32::MAX || ds.perm.gid == u32::MAX {
+                return Err(Errno::EINVAL);
+            }
             s.perm.uid = ds.perm.uid;
             s.perm.gid = ds.perm.gid;
             s.perm.mode = (s.perm.mode & !0o777) | (ds.perm.mode & 0o777);
@@ -371,6 +408,9 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         }
         IPC_RMID => {
             let s = table.get(id)?;
+            if !c.ipc_owns(&s.perm.owner()) {
+                return Err(Errno::EPERM);
+            }
             s.perm.mode |= SHM_DEST;
             s.perm.key = IPC_PRIVATE;
             table.sweep();
@@ -378,6 +418,10 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         }
         SHM_LOCK | SHM_UNLOCK => {
             let s = table.get(id)?;
+            // Only the owner, the creator or a process with `CAP_IPC_LOCK` can lock a segment.
+            if !c.capable(cap::IPC_LOCK) && c.euid != s.perm.uid && c.euid != s.perm.cuid {
+                return Err(Errno::EPERM);
+            }
             if cmd == SHM_LOCK {
                 s.perm.mode |= SHM_LOCKED;
             } else {

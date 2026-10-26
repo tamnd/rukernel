@@ -834,3 +834,20 @@ fn a_read_only_mount_of_tmpfs_is_read_only() {
     root.set_read_only(false).unwrap();
     assert!(root.create(b"n", FileType::Regular, 0o644, 0).is_ok());
 }
+
+#[test]
+fn an_open_with_o_trunc_clears_the_set_id_bits() {
+    use rk_vfs::cred::Cred;
+    let (mut fs, root) = setup();
+    write_file(&fs, &root, b"/f", b"data");
+    let at = fs.resolve(&root, b"/f", true).unwrap();
+    at.inode().set_attr(&SetAttr { mode: Some(0o6777), ..SetAttr::default() }).unwrap();
+    let user = Cred::root().setresgid(1000, 1000, 1000).unwrap();
+    fs.set_cred(Arc::new(user.setresuid(1000, 1000, 1000).unwrap()));
+    // An open without `O_TRUNC` keeps the bits.
+    fs.open(&root, b"/f", o::O_WRONLY, 0).unwrap();
+    assert_eq!(at.inode().metadata().mode & 0o7777, 0o6777);
+    fs.open(&root, b"/f", o::O_WRONLY | o::O_TRUNC, 0).unwrap();
+    assert_eq!(at.inode().metadata().mode & 0o7777, 0o777);
+    assert_eq!(at.inode().metadata().size, 0);
+}

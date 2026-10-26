@@ -221,6 +221,18 @@ impl Thread {
         pt.as_ref().filter(|p| !p.detached).and_then(|p| p.tracer.upgrade()).map_or(0, |t| t.pid)
     }
 
+    /// Tells if the tracer has `CAP_SYS_PTRACE`, as `ptracer_capable` of Linux. Then an
+    /// `execve` of the thread keeps the effect of the set-user-ID and set-group-ID bits. Linux
+    /// keeps the credentials of the tracer at the time of the attach. rukernel uses the
+    /// credentials of the tracer now.
+    pub fn tracer_capable(&self) -> bool {
+        let tracer = {
+            let pt = self.ptrace.lock();
+            pt.as_ref().filter(|p| !p.detached).and_then(|p| p.tracer.upgrade())
+        };
+        tracer.is_some_and(|t| t.cred().capable(rk_vfs::cred::cap::SYS_PTRACE))
+    }
+
     /// Tells if the thread is in a stop of `ptrace`.
     pub fn is_trace_stopped(&self) -> bool {
         self.ptrace.lock().as_ref().is_some_and(|p| p.stop.is_some_and(|s| s.resume.is_none()))

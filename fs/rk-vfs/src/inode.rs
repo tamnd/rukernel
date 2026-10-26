@@ -183,8 +183,8 @@ pub struct SetAttr {
     pub atime: Option<Timespec>,
     /// The new modification time.
     pub mtime: Option<Timespec>,
-    /// The caller gave a time that is not the time now, as `ATTR_TIMES_SET` of Linux. An
-    /// append-only file refuses it.
+    /// The caller gave the times, and they are not both the time now, as `ATTR_TIMES_SET` of
+    /// Linux. Only the owner can do this change, and an append-only file refuses it.
     pub explicit_times: bool,
 }
 
