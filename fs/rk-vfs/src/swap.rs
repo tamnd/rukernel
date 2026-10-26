@@ -8,7 +8,7 @@
 
 use crate::FileType;
 use crate::file::File;
-use crate::inode::{Inode, InodeRef, Result};
+use crate::inode::{FiemapExtent, Inode, InodeRef, Result};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -132,25 +132,71 @@ pub fn read_header(page: &[u8]) -> Result<u64> {
     Ok(u64::from(last) + 1)
 }
 
-/// The pages of the regular file `inode` that can be in an area of at most `max` pages, as
-/// `iomap_swapfile_activate` of Linux finds them. Each page up to the end must have a block on the
-/// disk. An extent that is allocated but not written is good.
-fn file_pages(inode: &InodeRef, max: u64) -> Result<u64> {
+/// The pages of the regular file `file` that can be in an area of at most `max` pages, as
+/// `iomap_swapfile_activate` of Linux finds them. Each block up to the end must be on the disk,
+/// and an extent that is allocated but not written is good. Only the pages of the disk that the
+/// file fully holds count, so a file without one such page gives `EINVAL`.
+fn file_pages(file: &File, inode: &InodeRef, max: u64) -> Result<u64> {
+    // Linux makes the map of the file durable first.
+    file.sync()?;
     let size = inode.metadata().size / PAGE_SIZE as u64 * PAGE_SIZE as u64;
-    let len = size.min(max.saturating_mul(PAGE_SIZE as u64));
     // A file system without extents cannot hold a swap area.
-    let extents = inode.fiemap(0, len).map_err(|_| Errno::EINVAL)?;
+    let extents = inode.fiemap(0, size).map_err(|_| Errno::EINVAL)?;
+    usable_pages(&extents, size, max)
+}
+
+/// The pages of the disk that the extents of the first `len` bytes of a file fully hold, at most
+/// `max`, as `iomap_swapfile_iter` and `iomap_swapfile_add_extent` of Linux count them. Extents
+/// that are next to each other on the disk join, and each run of the disk then counts only its
+/// pages that are aligned to a page.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a hole, inline data, or no full page.
+fn usable_pages(extents: &[FiemapExtent], len: u64, max: u64) -> Result<u64> {
+    let page = PAGE_SIZE as u64;
+    // The pages of a run of the disk at `start` with `length` bytes.
+    let aligned = |(start, length): (u64, u64)| {
+        let first = start.div_ceil(page);
+        let next = start.saturating_add(length) / page;
+        next.saturating_sub(first)
+    };
     let mut at = 0;
+    let mut run: Option<(u64, u64)> = None;
+    let mut pages: u64 = 0;
     for e in extents {
-        if e.logical > at {
+        if at >= len {
             break;
         }
-        at = at.max(e.logical.saturating_add(e.length));
+        let end = e.logical.saturating_add(e.length).min(len);
+        if end <= at {
+            continue;
+        }
+        if e.logical > at || e.inline {
+            return Err(Errno::EINVAL);
+        }
+        let physical = e.physical + (at - e.logical);
+        let length = end - at;
+        run = match run {
+            Some((start, n)) if start + n == physical => Some((start, n + length)),
+            Some(r) => {
+                pages = pages.saturating_add(aligned(r));
+                Some((physical, length))
+            }
+            None => Some((physical, length)),
+        };
+        at = end;
     }
     if at < len {
         return Err(Errno::EINVAL);
     }
-    Ok(len / PAGE_SIZE as u64)
+    if let Some(r) = run {
+        pages = pages.saturating_add(aligned(r));
+    }
+    if pages == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(pages.min(max))
 }
 
 /// Makes `file`, which `swapon` opened at `path`, an active swap area with the `swapon` flags
@@ -159,8 +205,8 @@ fn file_pages(inode: &InodeRef, max: u64) -> Result<u64> {
 /// # Errors
 ///
 /// Gives `EBUSY` if the file is an active area, `EINVAL` for a file that is not a regular file or
-/// a block device, a bad header, or a file with holes, and `EPERM` if `MAX_SWAPFILES` areas are
-/// active.
+/// a block device, a bad header, a file with holes, or a file without a full page of the disk,
+/// and `EPERM` if `MAX_SWAPFILES` areas are active.
 pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
     let inode = file.inode().ok_or(Errno::EINVAL)?.clone();
     let meta = inode.metadata();
@@ -186,7 +232,7 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
         let size = file.metadata()?.size;
         max.min(size / PAGE_SIZE as u64)
     } else {
-        file_pages(&inode, max)?
+        file_pages(&file, &inode, max)?
     };
     if pages <= 1 {
         return Err(Errno::EINVAL);
@@ -289,5 +335,45 @@ mod tests {
         v2[header::VERSION] = 2;
         assert_eq!(read_header(&v2), Err(Errno::EINVAL));
         assert_eq!(read_header(&[0u8; 100]), Err(Errno::EINVAL));
+    }
+
+    fn extent(logical: u64, physical: u64, length: u64) -> FiemapExtent {
+        FiemapExtent { logical, physical, length, unwritten: false, inline: false }
+    }
+
+    #[test]
+    fn the_aligned_pages_of_the_disk_count() {
+        let p = PAGE_SIZE as u64;
+        assert_eq!(usable_pages(&[extent(0, 4 * p, 10 * p)], 10 * p, 100), Ok(10));
+        assert_eq!(usable_pages(&[extent(0, 4 * p, 10 * p)], 10 * p, 6), Ok(6));
+        // Two extents that are next to each other on the disk join.
+        let joined = [extent(0, p + 1024, p), extent(p, 2 * p + 1024, p)];
+        assert_eq!(usable_pages(&joined, 2 * p, 100), Ok(1));
+        // An extent that is not written is good.
+        let mut unwritten = extent(0, 0, 2 * p);
+        unwritten.unwritten = true;
+        assert_eq!(usable_pages(&[unwritten], 2 * p, 100), Ok(2));
+    }
+
+    #[test]
+    fn a_file_without_a_full_page_of_the_disk_gives_einval() {
+        // As generic/641: blocks of 1024 bytes, and runs of three blocks with a gap between them.
+        let b = 1024;
+        let p = PAGE_SIZE as u64;
+        let runs: Vec<_> =
+            (0..4).map(|i| extent(3 * b * i, 1_000_000 * b + 4 * b * i, 3 * b)).collect();
+        assert_eq!(usable_pages(&runs, 3 * p, 100), Err(Errno::EINVAL));
+        assert_eq!(usable_pages(&[], 0, 100), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn a_hole_or_inline_data_gives_einval() {
+        let p = PAGE_SIZE as u64;
+        let hole = [extent(0, 0, p), extent(2 * p, 2 * p, p)];
+        assert_eq!(usable_pages(&hole, 3 * p, 100), Err(Errno::EINVAL));
+        assert_eq!(usable_pages(&[extent(0, 0, p)], 2 * p, 100), Err(Errno::EINVAL));
+        let mut inline = extent(0, 0, p);
+        inline.inline = true;
+        assert_eq!(usable_pages(&[inline], p, 100), Err(Errno::EINVAL));
     }
 }

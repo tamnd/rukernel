@@ -12,6 +12,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - ext4/005 now passes. `FS_IOC_SETFLAGS` without `EXT4_EXTENTS_FL` already moves a file from an extent tree to a block map, as Linux, and a new unit test checks that a write to a hole at the start of the file after the move gets a new block and does not touch the data after it.
 - ext4 writes zeros over a removed directory entry, as `ext4_generic_delete_entry` of Linux, so the name of a removed file does not stay on the disk. A first record in a block keeps its record length. A new unit test also checks that the change of a directory to an index and the split of a leaf leave no old names, as `make_indexed_dir` and `do_split` of Linux. ext4/048 now passes.
+- `swapon` of a regular file now counts only the pages of the disk that the file fully holds, as `iomap_swapfile_activate` of Linux, and gives `EINVAL` for a file without one such page. Before this change, a small file on ext4 with blocks of 1024 bytes and no aligned page on the disk became an active area. generic/641 now passes.
 
 ## [0.3.19] - 2026-10-27
 
