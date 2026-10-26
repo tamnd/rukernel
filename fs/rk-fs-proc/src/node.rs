@@ -9,6 +9,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use rk_abi::Errno;
 use rk_frame::sync::Once;
 use rk_vfs::inode::mode;
@@ -28,6 +29,9 @@ pub(crate) type ReadAtFn = Box<dyn Fn(u64, &mut [u8]) -> Result<usize> + Send + 
 pub(crate) type WriteAtFn = Box<dyn Fn(u64, &[u8]) -> Result<usize> + Send + Sync>;
 /// Finds one entry of a directory, without the full list.
 pub(crate) type FindFn = Box<dyn Fn(&[u8]) -> Result<InodeRef> + Send + Sync>;
+
+/// Gives the owner and the group of a file.
+pub(crate) type OwnerFn = Box<dyn Fn() -> (u32, u32) + Send + Sync>;
 
 /// Gives the place that a walk goes to at a magic link.
 pub(crate) type JumpFn = Box<dyn Fn() -> Result<rk_vfs::Location> + Send + Sync>;
@@ -69,6 +73,8 @@ pub(crate) struct Node {
     ino: u64,
     perm: u32,
     kind: Kind,
+    /// The owner and the group. Without it, root owns the file.
+    owner: Once<OwnerFn>,
 }
 
 /// The device of procfs. Each mount of procfs shows the same files, so they have one device.
@@ -101,6 +107,7 @@ pub(crate) fn file(
         ino: ino(path),
         perm: 0o444,
         kind: Kind::File { read: Box::new(read), write: None },
+        owner: Once::new(),
     })
 }
 
@@ -111,7 +118,7 @@ pub(crate) fn rw_file(
     write: impl Fn(&[u8]) -> Result<()> + Send + Sync + 'static,
 ) -> InodeRef {
     let kind = Kind::File { read: Box::new(read), write: Some(Box::new(write)) };
-    Arc::new(Node { ino: ino(path), perm: 0o644, kind })
+    Arc::new(Node { ino: ino(path), perm: 0o644, kind, owner: Once::new() })
 }
 
 /// Makes a file that reads and writes at an offset, with the permission bits `perm`.
@@ -122,7 +129,7 @@ pub(crate) fn data_file(
     write: impl Fn(u64, &[u8]) -> Result<usize> + Send + Sync + 'static,
 ) -> InodeRef {
     let kind = Kind::Data { read: Box::new(read), write: Box::new(write) };
-    Arc::new(Node { ino: ino(path), perm, kind })
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new() })
 }
 
 /// Makes a symbolic link with the permission bits `perm`.
@@ -131,7 +138,12 @@ pub(crate) fn link(
     perm: u32,
     target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
 ) -> InodeRef {
-    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), Follow::Path) })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind: Kind::Link(Box::new(target), Follow::Path),
+        owner: Once::new(),
+    })
 }
 
 /// Makes a symbolic link that a walk cannot follow: the walk gives `error`.
@@ -145,6 +157,7 @@ pub(crate) fn dead_link(
         ino: ino(path),
         perm,
         kind: Kind::Link(Box::new(target), Follow::Error(error)),
+        owner: Once::new(),
     })
 }
 
@@ -157,7 +170,12 @@ pub(crate) fn jump_link(
     jump: impl Fn() -> Result<rk_vfs::Location> + Send + Sync + 'static,
 ) -> InodeRef {
     let follow = Follow::Jump(Box::new(jump));
-    Arc::new(Node { ino: ino(path), perm, kind: Kind::Link(Box::new(target), follow) })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind: Kind::Link(Box::new(target), follow),
+        owner: Once::new(),
+    })
 }
 
 /// Makes a directory. `parent` is the path of the parent directory, for `..`. `find` finds one
@@ -170,7 +188,16 @@ pub(crate) fn dir(
     find: Option<FindFn>,
 ) -> InodeRef {
     let kind = Kind::Dir { parent: ino(parent), list: Box::new(list), find };
-    Arc::new(Node { ino: ino(path), perm, kind })
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new() })
+}
+
+/// Gives `node` the owner and the group that `owner` gives at each `stat`, as the files of a
+/// process in Linux have the effective ids of the process. The owner of a node is set one time.
+pub(crate) fn set_owner(node: &InodeRef, owner: impl Fn() -> (u32, u32) + Send + Sync + 'static) {
+    let any: &dyn Any = &**node;
+    if let Some(node) = any.downcast_ref::<Node>() {
+        node.owner.call_once(|| Box::new(owner));
+    }
 }
 
 /// Joins a directory path and a name.
@@ -191,11 +218,14 @@ impl Inode for Node {
             Kind::Dir { .. } => (mode::S_IFDIR, 2),
         };
         let t = now();
+        let (uid, gid) = self.owner.get().map_or((0, 0), |f| f());
         Metadata {
             dev: dev(),
             ino: self.ino,
             mode: kind | self.perm,
             nlink,
+            uid,
+            gid,
             blksize: BLOCK_SIZE,
             atime: t,
             mtime: t,
@@ -426,6 +456,15 @@ mod tests {
         assert_eq!(ino(b"/text"), ino(b"/text"));
         assert_ne!(ino(b"/text"), ino(b"/value"));
         assert_eq!(join(b"/1", b"stat"), b"/1/stat");
+    }
+
+    #[test]
+    fn a_file_has_the_owner_that_it_gets() {
+        let text = file(b"/text", || Ok(Vec::new()));
+        assert_eq!((text.metadata().uid, text.metadata().gid), (0, 0));
+        set_owner(&text, || (1000, 100));
+        set_owner(&text, || (2000, 200));
+        assert_eq!((text.metadata().uid, text.metadata().gid), (1000, 100));
     }
 
     #[test]

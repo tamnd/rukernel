@@ -73,8 +73,13 @@ pub(crate) fn make_dev(fs: &FsContext) {
     for d in devices() {
         let path = alloc::format!("/dev/{}", d.name);
         let mode = if d.block { S_IFBLK } else { S_IFCHR } | d.perm;
-        match fs.mknod(&root, path.as_bytes(), mode, d.rdev) {
-            Ok(_) | Err(rk_abi::Errno::EEXIST) => {}
+        // mknod applies the umask, but devtmpfs of Linux does not, so the mode is set again.
+        let attr = rk_vfs::inode::SetAttr { mode: Some(d.perm), ..Default::default() };
+        match fs
+            .mknod(&root, path.as_bytes(), mode, d.rdev)
+            .and_then(|at| at.inode().set_attr(&attr))
+        {
+            Ok(()) | Err(rk_abi::Errno::EEXIST) => {}
             Err(e) => println!("rootfs: cannot make {path}, error {}", e.get()),
         }
     }

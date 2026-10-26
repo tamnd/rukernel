@@ -1,7 +1,9 @@
 //! The files of procfs that read the state of the kernel: the root directory, the system files,
 //! `/proc/sys` and the directory of each process.
 
-use crate::node::{FindFn, data_file, dead_link, dir, file, join, jump_link, link, rw_file};
+use crate::node::{
+    FindFn, data_file, dead_link, dir, file, join, jump_link, link, rw_file, set_owner,
+};
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
 use alloc::boxed::Box;
 use alloc::format;
@@ -623,7 +625,7 @@ fn fd_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
                     } else {
                         link(&path, perm, move || Ok(target.clone()))
                     };
-                    (name, node)
+                    (name, owned(&w, node))
                 })
                 .collect())
         },
@@ -771,25 +773,40 @@ fn process_files(
         }),
     ));
     out.push((b"fd".to_vec(), fd_dir(w.clone(), base)));
-    out
+    out.into_iter().map(|(name, node)| (name, owned(w, node))).collect()
+}
+
+/// Gives the files of a process the effective user and group of the process, as
+/// `task_dump_owner` of Linux. The files of a process that has ended belong to root.
+fn owned(w: &Weak<Process>, node: InodeRef) -> InodeRef {
+    let w = w.clone();
+    set_owner(&node, move || {
+        w.upgrade().map_or((0, 0), |p| {
+            let cred = p.cred();
+            (cred.euid, cred.egid)
+        })
+    });
+    node
 }
 
 fn process_dir(p: &Arc<Process>) -> InodeRef {
     let w = Arc::downgrade(p);
     let base = format!("/{}", p.pid()).into_bytes();
     let list_base = base.clone();
-    dir(
+    let owner = w.clone();
+    let node = dir(
         &base,
         b"/",
         0o555,
         move || {
             alive(&w)?;
             let mut out = process_files(&w, None, &list_base);
-            out.push((b"task".to_vec(), task_dir(w.clone(), &list_base)));
+            out.push((b"task".to_vec(), owned(&w, task_dir(w.clone(), &list_base))));
             Ok(out)
         },
         None,
-    )
+    );
+    owned(&owner, node)
 }
 
 fn task_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
@@ -806,7 +823,7 @@ fn task_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
                 .map(|t| {
                     let name = format!("{}", t.tid()).into_bytes();
                     let node = thread_dir(t, &join(&me, &name), &me);
-                    (name, node)
+                    (name, owned(&w, node))
                 })
                 .collect())
         },
