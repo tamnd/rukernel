@@ -1793,6 +1793,71 @@ mod htree {
         }
         assert!(big.lookup(b"new").is_ok());
     }
+
+    /// Makes the directory `big` with an index, and sets its link count to `links` on the
+    /// disk. With `dir_nlink`, the image has the feature. Gives the inode of `big`.
+    fn many_links(ram: &Ram, links: u16, dir_nlink: bool) -> u32 {
+        let fs = mount(ram);
+        let big = fs.root().unwrap().create(b"big", FileType::Directory, 0o755, 0).unwrap();
+        let ino = big.metadata().ino as u32;
+        let file = big.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        for i in 0..100 {
+            big.link(&short(i), &file).unwrap();
+        }
+        drop((file, big, fs));
+        let mut img = ram.0.lock();
+        let at = INODE_TABLE * BS + (ino as usize - 1) * 256 + 0x1a;
+        img[at..at + 2].copy_from_slice(&links.to_le_bytes());
+        if dir_nlink {
+            img[1024 + 0x64] |= layout::ro_compat::DIR_NLINK as u8;
+        }
+        ino
+    }
+
+    #[test]
+    fn with_dir_nlink_a_directory_with_too_many_links_has_one() {
+        let ram = Ram(Arc::new(SpinLock::new(htree_image(1024, false))));
+        let ino = many_links(&ram, 64998, true);
+        let fs = mount(&ram);
+        let root: InodeRef = fs.root().unwrap();
+        let big = root.lookup(b"big").unwrap();
+        big.create(b"d0", FileType::Directory, 0o755, 0).unwrap();
+        big.create(b"d1", FileType::Directory, 0o755, 0).unwrap();
+        assert_eq!(big.metadata().nlink, 65000);
+        big.create(b"d2", FileType::Directory, 0o755, 0).unwrap();
+        assert_eq!(big.metadata().nlink, 1);
+        big.create(b"d3", FileType::Directory, 0o755, 0).unwrap();
+        assert_eq!(big.metadata().nlink, 1);
+        // The count stays 1 after a removal and after renames out of and into the directory.
+        big.rmdir(b"d3").unwrap();
+        assert_eq!(big.metadata().nlink, 1);
+        big.rename(b"d2", &root, b"out").unwrap();
+        assert_eq!((big.metadata().nlink, root.metadata().nlink), (1, 6));
+        root.rename(b"out", &big, b"d2").unwrap();
+        big.rename(b"d1", &big, b"d0").unwrap();
+        assert_eq!((big.metadata().nlink, root.metadata().nlink), (1, 5));
+        drop((big, root, fs));
+        assert_eq!(again(&ram).read_inode(ino).unwrap().links(), 1);
+    }
+
+    #[test]
+    fn without_dir_nlink_a_directory_stops_at_the_link_limit() {
+        let ram = Ram(Arc::new(SpinLock::new(htree_image(1024, false))));
+        many_links(&ram, 64999, false);
+        let fs = mount(&ram);
+        let root: InodeRef = fs.root().unwrap();
+        let big = root.lookup(b"big").unwrap();
+        big.create(b"d0", FileType::Directory, 0o755, 0).unwrap();
+        assert_eq!(big.metadata().nlink, 65000);
+        assert_eq!(big.create(b"d1", FileType::Directory, 0o755, 0).err(), Some(Errno::EMLINK));
+        root.create(b"d1", FileType::Directory, 0o755, 0).unwrap();
+        assert_eq!(root.rename(b"d1", &big, b"d1"), Err(Errno::EMLINK));
+        big.create(b"f", FileType::Regular, 0o644, 0).unwrap();
+        big.rmdir(b"d0").unwrap();
+        assert_eq!(big.metadata().nlink, 64999);
+        root.rename(b"d1", &big, b"d1").unwrap();
+        assert_eq!(big.metadata().nlink, 65000);
+    }
 }
 
 #[test]
