@@ -18,7 +18,9 @@ The script reads notes.txt next to it. Each line has a test name, a tab and a no
 shows in the table of the test.
 
 The script writes ext4.md and overlay.md in the directory of --out, by default the directory of
-the script.
+the script. It also writes the status and the work that remains in README.md of that directory,
+between the lines `<!-- report: begin -->` and `<!-- report: end -->`. Do not change the text
+between these lines by hand, because the next run of the script writes it again.
 """
 
 import argparse
@@ -128,27 +130,101 @@ def day(when):
     return datetime.date.fromtimestamp(when).isoformat() if when else "-"
 
 
-def write_table(path, title, intro, names, rk, ref, tests, notes):
+def results(names, rk, ref, notes):
+    """Gives a row for each test: the name, the rukernel status, the Linux status and the cause."""
     rows = []
-    count = {"pass": 0, "fail": 0, "not run": 0, "no result": 0}
     for name in names:
-        desc, _ = describe(tests, name)
         when, status, reason = rk.get(name, (0, "no result", ""))
-        _, ref_status, _ = ref.get(name, (0, "no result", ""))
+        ref_status = ref.get(name, (0, "no result", ""))[1]
+        cause = notes.get(name) or (clean(reason, 90) if reason else "")
+        rows.append((name, when, status, ref_status, cause))
+    return rows
+
+
+def write_table(path, title, intro, rows, tests):
+    count = {"pass": 0, "fail": 0, "not run": 0, "no result": 0}
+    lines = []
+    for name, when, status, ref_status, cause in rows:
         count[status] += 1
-        note = notes.get(name) or clean(reason, 90)
-        rows.append(f"| {name} | {desc} | {ref_status} | {status} | {day(when)} | {note} |")
+        desc, _ = describe(tests, name)
+        lines.append(f"| {name} | {desc} | {ref_status} | {status} | {day(when)} | {cause} |")
     with open(path, "w") as f:
         f.write(f"# {title}\n\n")
+        f.write("report.py makes this file from the logs of the runs. Do not change it by hand.\n\n")
         f.write(intro + "\n\n")
-        total = len(names)
         f.write(
             f"rukernel: {count['pass']} pass, {count['fail']} fail, {count['not run']} not run, "
-            f"and {count['no result']} have no result, of {total} tests.\n\n"
+            f"and {count['no result']} have no result, of {len(rows)} tests.\n\n"
         )
         f.write("| Test | What the test checks | Linux | rukernel | Last run | Note |\n")
         f.write("| --- | --- | --- | --- | --- | --- |\n")
-        f.write("\n".join(rows) + "\n")
+        f.write("\n".join(lines) + "\n")
+
+
+def names_of(tests):
+    """Writes a list of test names as an English list."""
+    if len(tests) == 1:
+        return tests[0]
+    return ", ".join(tests[:-1]) + " and " + tests[-1]
+
+
+def remaining(rows):
+    """Gives the lines of the work that remains: the tests that pass on Linux and do not pass on
+    rukernel, in groups by the cause."""
+    groups = {}
+    for name, _, status, ref_status, cause in rows:
+        if status == "pass" or ref_status != "pass":
+            continue
+        if status == "no result":
+            key = "No result yet"
+        elif cause:
+            key = f"{status.capitalize()}: {cause}"
+        else:
+            key = f"{status.capitalize()}: no reason in the log"
+        groups.setdefault(key, []).append(name)
+    order = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    return [f"- {key.rstrip('.?!')}. {len(tests)}: {names_of(tests)}." for key, tests in order]
+
+
+def write_readme(path, suites, newest):
+    """Writes the status and the work that remains between the marks of README.md."""
+    begin, end = "<!-- report: begin -->", "<!-- report: end -->"
+    with open(path) as f:
+        text = f.read()
+    if begin not in text or end not in text:
+        sys.exit(f"{path} has no report marks")
+    out = [begin, "", f"## Status at {day(newest)}", ""]
+    out.append(
+        "| Suite | Tests | Pass on Linux | Pass on rukernel | Pass on both | Fail on rukernel "
+        "| Not run on rukernel | No result |"
+    )
+    out.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+    for title, rows in suites:
+        c = lambda f: sum(1 for r in rows if f(r))
+        out.append(
+            f"| {title} | {len(rows)} | {c(lambda r: r[3] == 'pass')} "
+            f"| {c(lambda r: r[2] == 'pass')} | {c(lambda r: r[2] == r[3] == 'pass')} "
+            f"| {c(lambda r: r[2] == 'fail')} | {c(lambda r: r[2] == 'not run')} "
+            f"| {c(lambda r: r[2] == 'no result')} |"
+        )
+    out += [
+        "",
+        "The rukernel column of a table has the newest result of each test, and the Last run "
+        "column of the table gives its date. A change after that date can change the result.",
+        "",
+        "## Work that remains",
+        "",
+        "These are the tests that pass on Linux and do not pass on rukernel, in groups by the "
+        "cause. The cause is the note in notes.txt, or else the reason in the log.",
+    ]
+    for title, rows in suites:
+        out += ["", f"### {title}", ""]
+        out += remaining(rows) or ["- None."]
+    out += ["", end]
+    head, rest = text.split(begin, 1)
+    tail = rest.split(end, 1)[1]
+    with open(path, "w") as f:
+        f.write(head + "\n".join(out) + tail)
 
 
 def main():
@@ -174,20 +250,28 @@ def main():
 
     ext4 = sorted((n for n in names if n.split("/")[0] in ("generic", "ext4")), key=key)
     overlay = sorted((n for n in names if n.startswith("overlay/")), key=key)
+    ext4_rows = results(ext4, rk, ref, notes)
+    overlay_rows = results(overlay, rk, ref, notes)
     write_table(
         os.path.join(a.out, "ext4.md"),
         "fstests results on ext4",
         "These are the results of the generic and ext4 tests of fstests on ext4. The Linux column "
         "is the result on the reference kernel, and the rukernel column is the newest result on "
         "rukernel. The README in this directory tells how the tests run.",
-        ext4, rk, ref, a.tests, notes,
+        ext4_rows,
+        a.tests,
     )
     write_table(
         os.path.join(a.out, "overlay.md"),
         "fstests results on overlayfs",
         "These are the results of the overlay tests of fstests. The lower and the upper "
         "directories are on ext4. The README in this directory tells how the tests run.",
-        overlay, rk, ref, a.tests, notes,
+        overlay_rows,
+        a.tests,
+    )
+    newest = max([v[0] for v in rk.values()] + [0])
+    write_readme(
+        os.path.join(a.out, "README.md"), [("ext4", ext4_rows), ("overlay", overlay_rows)], newest
     )
     print(f"ext4: {len(ext4)} tests, overlay: {len(overlay)} tests", file=sys.stderr)
 

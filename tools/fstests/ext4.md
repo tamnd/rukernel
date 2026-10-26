@@ -1,67 +1,69 @@
 # fstests results on ext4
 
+report.py makes this file from the logs of the runs. Do not change it by hand.
+
 These are the results of the generic and ext4 tests of fstests on ext4. The Linux column is the result on the reference kernel, and the rukernel column is the newest result on rukernel. The README in this directory tells how the tests run.
 
 rukernel: 212 pass, 26 fail, 97 not run, and 12 have no result, of 347 tests.
 
 | Test | What the test checks | Linux | rukernel | Last run | Note |
 | --- | --- | --- | --- | --- | --- |
-| ext4/001 | Test fallocate FALLOC_FL_ZERO_RANGE | pass | pass | 2026-10-25 |  |
-| ext4/003 | Regression test for commit: b5b6077 ext4: fix wrong assert in ext4_mb_normalize_request() This testcase checks whether this bug has been fixed. | pass | fail | 2026-10-25 | Needs bigalloc, the clusters of more than one block. |
-| ext4/005 | Test corruption issue in converting file with a hole at the beginning to non-extent based format | pass | not run | 2026-10-25 | Clearing extent flag not supported, old chattr and/or kernel? |
-| ext4/020 | Test partial blocksize defrag integrity issue. | pass | pass | 2026-10-25 |  |
-| ext4/021 | Regression test for commit: 688f869 ext4: Initialize fsync transaction ids in ext4_new_inode() | pass | pass | 2026-10-25 |  |
+| ext4/001 | Test fallocate FALLOC_FL_ZERO_RANGE | pass | pass | 2026-10-26 |  |
+| ext4/003 | Regression test for commit: b5b6077 ext4: fix wrong assert in ext4_mb_normalize_request() This testcase checks whether this bug has been fixed. | pass | fail | 2026-10-26 | Needs bigalloc, the clusters of more than one block. |
+| ext4/005 | Test corruption issue in converting file with a hole at the beginning to non-extent based format | pass | not run | 2026-10-26 | Clearing extent flag not supported, old chattr and/or kernel? |
+| ext4/020 | Test partial blocksize defrag integrity issue. | pass | pass | 2026-10-26 |  |
+| ext4/021 | Regression test for commit: 688f869 ext4: Initialize fsync transaction ids in ext4_new_inode() | pass | pass | 2026-10-26 |  |
 | ext4/022 | Test extending of i_extra_isize code | pass | pass | 2026-10-26 |  |
-| ext4/023 | Ensure that the populate helpers actually /can/ populate a ext4 filesystem with all types of metadata and create an image of the metadata. Check that fsck is ... | pass | fail | 2026-10-25 | Needs htree directories. |
-| ext4/024 | Regression test for 0d06863f903a ("ext4: don't BUG when truncating encrypted inodes on the orphan list"). | no result | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
-| ext4/025 | Regression test for commit: 3a4b77c ("ext4: validate s_first_meta_bg at mount time"). | pass | not run | 2026-10-25 | Kernel doesn't support the ext4 feature(s): bigalloc,meta_bg,^resize_inode |
-| ext4/026 | Test for ea_inode feature in ext4. Without ea_inode feature, an extended attribute in ext4 cannot be larger than the fs block size. ea_inode feature allows ... | pass | not run | 2026-10-25 | Kernel doesn't support the ext4 feature(s): ea_inode |
-| ext4/027 | Check that getfsmap reports the BG metadata we're expecting. | pass | not run | 2026-10-25 | xfs_io fsmap support is missing |
-| ext4/028 | Populate filesystem, check that fsmap -n10000 matches fsmap -n1. | pass | not run | 2026-10-25 | xfs_io fsmap support is missing |
-| ext4/032 | Ext4 online resize tests of small and crucial resizes with bigalloc feature. | pass | not run | 2026-10-25 | This test requires loopback device support |
-| ext4/033 | Test s_inodes_count overflow for huge filesystems. This bug was fixed by commit 4f2f76f75143 ("ext4: Forbid overflowing inode count when resizing".) | no result | not run | 2026-10-25 | This test requires dm zero support |
-| ext4/035 |  | pass | pass | 2026-10-25 |  |
-| ext4/036 | Test truncate orphan inodes when mounting ext4 ext4 used to hit WARNING, this commit fixed the issue | pass | pass | 2026-10-25 |  |
-| ext4/037 | Test mount a needs_recovery partition with noload option. ext4 used to Oops until part of this commit: | pass | pass | 2026-10-25 |  |
+| ext4/023 | Ensure that the populate helpers actually /can/ populate a ext4 filesystem with all types of metadata and create an image of the metadata. Check that fsck is ... | pass | fail | 2026-10-26 | Needs htree directories. |
+| ext4/024 | Regression test for 0d06863f903a ("ext4: don't BUG when truncating encrypted inodes on the orphan list"). | no result | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| ext4/025 | Regression test for commit: 3a4b77c ("ext4: validate s_first_meta_bg at mount time"). | pass | not run | 2026-10-26 | Kernel doesn't support the ext4 feature(s): bigalloc,meta_bg,^resize_inode |
+| ext4/026 | Test for ea_inode feature in ext4. Without ea_inode feature, an extended attribute in ext4 cannot be larger than the fs block size. ea_inode feature allows ... | pass | not run | 2026-10-26 | Kernel doesn't support the ext4 feature(s): ea_inode |
+| ext4/027 | Check that getfsmap reports the BG metadata we're expecting. | pass | not run | 2026-10-26 | xfs_io fsmap support is missing |
+| ext4/028 | Populate filesystem, check that fsmap -n10000 matches fsmap -n1. | pass | not run | 2026-10-26 | xfs_io fsmap support is missing |
+| ext4/032 | Ext4 online resize tests of small and crucial resizes with bigalloc feature. | pass | not run | 2026-10-26 | This test requires loopback device support |
+| ext4/033 | Test s_inodes_count overflow for huge filesystems. This bug was fixed by commit 4f2f76f75143 ("ext4: Forbid overflowing inode count when resizing".) | no result | not run | 2026-10-26 | This test requires dm zero support |
+| ext4/035 |  | pass | pass | 2026-10-26 |  |
+| ext4/036 | Test truncate orphan inodes when mounting ext4 ext4 used to hit WARNING, this commit fixed the issue | pass | pass | 2026-10-26 |  |
+| ext4/037 | Test mount a needs_recovery partition with noload option. ext4 used to Oops until part of this commit: | pass | pass | 2026-10-26 |  |
 | ext4/038 | Regression test for commit: c9eb13a ext4: fix hang when processing corrupted orphaned inode list | pass | pass | 2026-10-26 |  |
-| ext4/042 | Test overhead & df output for extN filesystems | pass | fail | 2026-10-25 | the output is not the expected output |
-| ext4/043 | Test file timestamps are only precise to seconds with 128-byte inodes." | pass | pass | 2026-10-25 |  |
-| ext4/044 | Test file timestamps are precise to nanoseconds with 256-byte inodes | pass | pass | 2026-10-25 |  |
-| ext4/048 | Test wiping of ext4_dir_entry2 data upon file removal, conversion to htree, and splitting of htree nodes | pass | not run | 2026-10-25 | filename wipe not supported |
-| ext4/049 | Regression test for kernel commit a149d2a5cabb (ext4: fix check to prevent false positive report of incorrect used inodes) | pass | pass | 2026-10-25 |  |
-| ext4/050 | Test checkpoint and zeroout of journal via ioctl EXT4_IOC_CHECKPOINT | pass | not run | 2026-10-25 | journal checkpoint ioctl not present on device |
-| ext4/051 | Test that tune2fs doesn't fail after ext4 shutdown Regression test for kernel commit: 4274f516d4bc ext4: recalucate superblock checksum after updating free ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| ext4/052 | Test ext4's large_dir feature | pass | not run | 2026-10-25 | This test requires loopback device support |
-| ext4/054 | Regression test for kernel commit: 1. 0f2f87d51aebc (ext4: prevent partial update of the extent blocks) 2. 9c6e071913792 (ext4: check for inconsistent extents ... | pass | pass | 2026-10-25 |  |
-| ext4/056 |  | pass | pass | 2026-10-25 |  |
-| ext4/058 | Set 256 blocks in a block group, then inject I/O pressure, it will trigger off kernel BUG in ext4_mb_mark_diskspace_used | pass | pass | 2026-10-25 |  |
-| ext4/059 | A regression test for b55c3cd102a6 ("ext4: add reserved GDT blocks check"). Make sure there's not kernel crash, if resize an ext4 which resize_inode feature is ... | pass | pass | 2026-10-25 |  |
-| ext4/271 |  | pass | pass | 2026-10-25 |  |
-| ext4/306 | Test that blocks are available to non-extent files after a resize2fs Regression test for commit: c5c72d8 ext4: fix online resizing for ext3-compat file systems | pass | pass | 2026-10-25 |  |
-| ext4/308 |  | pass | fail | 2026-10-25 | Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4. |
+| ext4/042 | Test overhead & df output for extN filesystems | pass | fail | 2026-10-26 | the output is not the expected output |
+| ext4/043 | Test file timestamps are only precise to seconds with 128-byte inodes." | pass | pass | 2026-10-26 |  |
+| ext4/044 | Test file timestamps are precise to nanoseconds with 256-byte inodes | pass | pass | 2026-10-26 |  |
+| ext4/048 | Test wiping of ext4_dir_entry2 data upon file removal, conversion to htree, and splitting of htree nodes | pass | not run | 2026-10-26 | filename wipe not supported |
+| ext4/049 | Regression test for kernel commit a149d2a5cabb (ext4: fix check to prevent false positive report of incorrect used inodes) | pass | pass | 2026-10-26 |  |
+| ext4/050 | Test checkpoint and zeroout of journal via ioctl EXT4_IOC_CHECKPOINT | pass | not run | 2026-10-26 | journal checkpoint ioctl not present on device |
+| ext4/051 | Test that tune2fs doesn't fail after ext4 shutdown Regression test for kernel commit: 4274f516d4bc ext4: recalucate superblock checksum after updating free ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| ext4/052 | Test ext4's large_dir feature | pass | not run | 2026-10-26 | This test requires loopback device support |
+| ext4/054 | Regression test for kernel commit: 1. 0f2f87d51aebc (ext4: prevent partial update of the extent blocks) 2. 9c6e071913792 (ext4: check for inconsistent extents ... | pass | pass | 2026-10-26 |  |
+| ext4/056 |  | pass | pass | 2026-10-26 |  |
+| ext4/058 | Set 256 blocks in a block group, then inject I/O pressure, it will trigger off kernel BUG in ext4_mb_mark_diskspace_used | pass | pass | 2026-10-26 |  |
+| ext4/059 | A regression test for b55c3cd102a6 ("ext4: add reserved GDT blocks check"). Make sure there's not kernel crash, if resize an ext4 which resize_inode feature is ... | pass | pass | 2026-10-26 |  |
+| ext4/271 |  | pass | pass | 2026-10-26 |  |
+| ext4/306 | Test that blocks are available to non-extent files after a resize2fs Regression test for commit: c5c72d8 ext4: fix online resizing for ext3-compat file systems | pass | pass | 2026-10-26 |  |
+| ext4/308 |  | pass | fail | 2026-10-26 | Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4. |
 | generic/001 | Random file copier to produce chains of identical files so the head and the tail can be diff'd at the end of each iteration. | no result | pass | 2026-10-26 |  |
-| generic/003 | Tests the noatime, relatime, strictatime and nodiratime mount options. There is an extra check for Btrfs to ensure that the access time is never updated on ... | pass | pass | 2026-10-25 |  |
-| generic/004 | Test O_TMPFILE opens, and linking them back into the namespace. | pass | not run | 2026-10-25 | O_TMPFILE is not supported |
-| generic/008 | Makes calls to fallocate zero range and checks tossed ranges | pass | pass | 2026-10-25 |  |
-| generic/009 | Test fallocate FALLOC_FL_ZERO_RANGE | pass | pass | 2026-10-25 |  |
-| generic/012 | Multi collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range functionality over different ... | pass | pass | 2026-10-25 |  |
+| generic/003 | Tests the noatime, relatime, strictatime and nodiratime mount options. There is an extra check for Btrfs to ensure that the access time is never updated on ... | pass | pass | 2026-10-26 |  |
+| generic/004 | Test O_TMPFILE opens, and linking them back into the namespace. | pass | not run | 2026-10-26 | O_TMPFILE is not supported |
+| generic/008 | Makes calls to fallocate zero range and checks tossed ranges | pass | pass | 2026-10-26 |  |
+| generic/009 | Test fallocate FALLOC_FL_ZERO_RANGE | pass | pass | 2026-10-26 |  |
+| generic/012 | Multi collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range functionality over different ... | pass | pass | 2026-10-26 |  |
 | generic/015 | check out-of-space behaviour | pass | pass | 2026-10-26 |  |
-| generic/016 | Delayed allocation multi collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range ... | pass | pass | 2026-10-25 |  |
+| generic/016 | Delayed allocation multi collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range ... | pass | pass | 2026-10-26 |  |
 | generic/018 | Basic defragmentation sanity tests | pass | fail | 2026-10-26 | Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4. |
-| generic/020 | extended attributes | pass | pass | 2026-10-25 |  |
-| generic/021 | Standard collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range functionality over different ... | pass | pass | 2026-10-25 |  |
-| generic/022 | Delayed allocation collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range functionality over ... | pass | pass | 2026-10-25 |  |
+| generic/020 | extended attributes | pass | pass | 2026-10-26 |  |
+| generic/021 | Standard collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range functionality over different ... | pass | pass | 2026-10-26 |  |
+| generic/022 | Delayed allocation collapse range tests This testcase is one of the 4 testcases which tries to test various corner cases for fcollapse range functionality over ... | pass | pass | 2026-10-26 |  |
 | generic/023 | Check renameat2 syscall without flags | pass | pass | 2026-10-26 |  |
 | generic/024 | Check renameat2 syscall with RENAME_NOREPLACE flag | pass | pass | 2026-10-26 |  |
 | generic/025 | Check renameat2 syscall with RENAME_EXCHANGE flag | pass | pass | 2026-10-26 |  |
 | generic/026 | Test out ACL count limits | no result | not run | 2026-10-26 | ext4 does not define maximum ACL count |
-| generic/028 | The following commit introduced a race condition that causes getcwd(2) to return "/" instead of correct path | pass | pass | 2026-10-25 |  |
-| generic/029 | Test mapped writes against truncate down/up to ensure we get the data correctly written. This can expose data corruption bugs on filesystems where the block ... | pass | pass | 2026-10-25 |  |
-| generic/030 | Test mapped writes against remap+truncate down/up to ensure we get the data correctly written. This can expose data corruption bugs on filesystems where the ... | pass | pass | 2026-10-25 |  |
-| generic/031 | Test non-aligned writes against fcollapse to ensure that partial pages are correctly written and aren't left behind causing invalidation or data corruption ... | pass | pass | 2026-10-25 |  |
-| generic/032 | This test implements a data corruption scenario on XFS filesystems with sub-page sized blocks and unwritten extents. Inode lock contention during writeback of ... | fail | pass | 2026-10-25 |  |
-| generic/033 | This test stresses indirect block reservation for delayed allocation extents. XFS reserves extra blocks for deferred allocation of delalloc extents. These ... | pass | pass | 2026-10-25 |  |
-| generic/035 | Check overwriting rename system call | pass | pass | 2026-10-25 |  |
+| generic/028 | The following commit introduced a race condition that causes getcwd(2) to return "/" instead of correct path | pass | pass | 2026-10-26 |  |
+| generic/029 | Test mapped writes against truncate down/up to ensure we get the data correctly written. This can expose data corruption bugs on filesystems where the block ... | pass | pass | 2026-10-26 |  |
+| generic/030 | Test mapped writes against remap+truncate down/up to ensure we get the data correctly written. This can expose data corruption bugs on filesystems where the ... | pass | pass | 2026-10-26 |  |
+| generic/031 | Test non-aligned writes against fcollapse to ensure that partial pages are correctly written and aren't left behind causing invalidation or data corruption ... | pass | pass | 2026-10-26 |  |
+| generic/032 | This test implements a data corruption scenario on XFS filesystems with sub-page sized blocks and unwritten extents. Inode lock contention during writeback of ... | fail | pass | 2026-10-26 |  |
+| generic/033 | This test stresses indirect block reservation for delayed allocation extents. XFS reserves extra blocks for deferred allocation of delalloc extents. These ... | pass | pass | 2026-10-26 |  |
+| generic/035 | Check overwriting rename system call | pass | pass | 2026-10-26 |  |
 | generic/037 |  | pass | no result | - |  |
 | generic/042 | Test stale data exposure via writeback using various file allocation modification commands. The presumption is that such commands result in partial writeback ... | pass | no result | - |  |
 | generic/050 | Check out various mount/remount/unmount scenarious on a read-only blockdev. | pass | no result | - |  |
@@ -80,32 +82,32 @@ rukernel: 212 pass, 26 fail, 97 not run, and 12 have no result, of 347 tests.
 | generic/075 | fsx (non-AIO variant) | pass | no result | - |  |
 | generic/076 | Test blockdev reads in parallel with filesystem reads/writes | pass | no result | - |  |
 | generic/078 | Check renameat2 syscall with RENAME_WHITEOUT flag | pass | no result | - |  |
-| generic/079 | Run the t_immutable test program for immutable/append-only files. | pass | fail | 2026-10-25 | the output is not the expected output |
-| generic/080 | Verify that mtime is updated when writing to mmap-ed pages | pass | pass | 2026-10-25 |  |
-| generic/084 | Test hardlink to unlinked file. | pass | pass | 2026-10-25 |  |
-| generic/086 | This test excercises the problem with unwritten and delayed extents in ext4 extent status tree where we might in some cases lose a block worth of data. Even ... | pass | pass | 2026-10-25 |  |
-| generic/087 |  | pass | fail | 2026-10-25 | the output is not the expected output |
-| generic/088 | test out CAP_DAC_OVERRIDE and CAP_DAC_SEARCH code in xfs_iaccess(ip,mode,cr) | pass | pass | 2026-10-25 |  |
+| generic/079 | Run the t_immutable test program for immutable/append-only files. | pass | fail | 2026-10-26 | the output is not the expected output |
+| generic/080 | Verify that mtime is updated when writing to mmap-ed pages | pass | pass | 2026-10-26 |  |
+| generic/084 | Test hardlink to unlinked file. | pass | pass | 2026-10-26 |  |
+| generic/086 | This test excercises the problem with unwritten and delayed extents in ext4 extent status tree where we might in some cases lose a block worth of data. Even ... | pass | pass | 2026-10-26 |  |
+| generic/087 |  | pass | fail | 2026-10-26 | the output is not the expected output |
+| generic/088 | test out CAP_DAC_OVERRIDE and CAP_DAC_SEARCH code in xfs_iaccess(ip,mode,cr) | pass | pass | 2026-10-26 |  |
 | generic/091 | fsx exercising direct IO -- sub-block sizes and concurrent buffered IO | pass | pass | 2026-10-26 |  |
-| generic/092 | fallocate/truncate tests with FALLOC_FL_KEEP_SIZE option. Verify if the disk space is released after truncating a file to i_size after writing to a portion of ... | pass | pass | 2026-10-25 |  |
-| generic/094 | Run the fiemap (file extent mapping) tester with preallocation enabled | pass | pass | 2026-10-25 |  |
-| generic/095 | Concurrent mixed I/O (buffer I/O, aiodio, mmap, splice) on the same files | pass | not run | 2026-10-25 | fio engine libaio not available |
-| generic/096 | Exercise the situation that cause ext4 to BUG_ON() when we use zero range to zero a range which starts within the isize but ends past the isize but still in ... | pass | pass | 2026-10-25 |  |
-| generic/097 | simple attr tests for EAs: - set - get - list - remove Basic testing. | pass | pass | 2026-10-25 |  |
-| generic/098 |  | pass | pass | 2026-10-25 |  |
+| generic/092 | fallocate/truncate tests with FALLOC_FL_KEEP_SIZE option. Verify if the disk space is released after truncating a file to i_size after writing to a portion of ... | pass | pass | 2026-10-26 |  |
+| generic/094 | Run the fiemap (file extent mapping) tester with preallocation enabled | pass | pass | 2026-10-26 |  |
+| generic/095 | Concurrent mixed I/O (buffer I/O, aiodio, mmap, splice) on the same files | pass | not run | 2026-10-26 | fio engine libaio not available |
+| generic/096 | Exercise the situation that cause ext4 to BUG_ON() when we use zero range to zero a range which starts within the isize but ends past the isize but still in ... | pass | pass | 2026-10-26 |  |
+| generic/097 | simple attr tests for EAs: - set - get - list - remove Basic testing. | pass | pass | 2026-10-26 |  |
+| generic/098 |  | pass | pass | 2026-10-26 |  |
 | generic/099 | Test out ACLs. | pass | pass | 2026-10-26 |  |
-| generic/103 |  | pass | pass | 2026-10-25 |  |
+| generic/103 |  | pass | pass | 2026-10-26 |  |
 | generic/105 | Test fix of bug: 930290 - xfs directory with no exec perm in ACL denies access and breaks CAPP evaluation which pulls out an earlier mod | pass | pass | 2026-10-26 |  |
-| generic/112 | fsx (AIO variant, based on 075) | pass | pass | 2026-10-25 |  |
-| generic/113 | aio-stress | pass | pass | 2026-10-25 |  |
-| generic/114 | Test races while extending past EOF via sub-block AIO writes | pass | pass | 2026-10-25 |  |
-| generic/117 | Attempt to cause filesystem corruption with serial fsstresses doing extended attributes writes - pv 940655 | pass | pass | 2026-10-25 |  |
-| generic/120 | Test noatime mount option. | pass | pass | 2026-10-25 |  |
+| generic/112 | fsx (AIO variant, based on 075) | pass | pass | 2026-10-26 |  |
+| generic/113 | aio-stress | pass | pass | 2026-10-26 |  |
+| generic/114 | Test races while extending past EOF via sub-block AIO writes | pass | pass | 2026-10-26 |  |
+| generic/117 | Attempt to cause filesystem corruption with serial fsstresses doing extended attributes writes - pv 940655 | pass | pass | 2026-10-26 |  |
+| generic/120 | Test noatime mount option. | pass | pass | 2026-10-26 |  |
 | generic/123 |  | pass | pass | 2026-10-26 |  |
-| generic/124 |  | pass | pass | 2026-10-25 |  |
-| generic/126 |  | pass | fail | 2026-10-25 | the output is not the expected output |
+| generic/124 |  | pass | pass | 2026-10-26 |  |
+| generic/126 |  | pass | fail | 2026-10-26 | the output is not the expected output |
 | generic/128 |  | no result | pass | 2026-10-26 | Passes since #214. Before, /dev/null had the mode 0644 and a user could not write to it. |
-| generic/129 |  | pass | pass | 2026-10-25 |  |
+| generic/129 |  | pass | pass | 2026-10-26 |  |
 | generic/130 |  | pass | fail | 2026-10-26 | the output is not the expected output |
 | generic/131 |  | fail | fail | 2026-10-26 | the test stops with an error |
 | generic/135 |  | pass | pass | 2026-10-26 |  |
@@ -144,7 +146,7 @@ rukernel: 212 pass, 26 fail, 97 not run, and 12 have no result, of 347 tests.
 | generic/260 | Purpose of this test is to check FITRIM argument handling to make sure that the argument processing is right and that it does not overflow. | pass | fail | 2026-10-26 | the test stops with an error |
 | generic/263 | fsx exercising direct IO vs sub-block buffered I/O | pass | fail | 2026-10-26 | the test stops with an error |
 | generic/277 | Check if ctime update caused by chattr is written to disk | pass | pass | 2026-10-26 |  |
-| generic/285 | SEEK_DATA/SEEK_HOLE sanity tests. | no result | pass | 2026-10-25 |  |
+| generic/285 | SEEK_DATA/SEEK_HOLE sanity tests. | no result | pass | 2026-10-26 |  |
 | generic/286 | SEEK_DATA/SEEK_HOLE copy tests. | pass | pass | 2026-10-26 |  |
 | generic/288 | This check the FITRIM argument handling in the corner case where length is smaller than block size or zero. | pass | fail | 2026-10-26 | the output is not the expected output |
 | generic/294 | Tests for EEXIST (not EROFS) for inode creations, if we ask to create an already-existing entity on an RO filesystem | pass | fail | 2026-10-26 | the output is not the expected output |
@@ -194,110 +196,110 @@ rukernel: 212 pass, 26 fail, 97 not run, and 12 have no result, of 347 tests.
 | generic/409 | Test mount shared subtrees, verify the bind semantics: | pass | fail | 2026-10-26 | the output is not the expected output |
 | generic/410 | Test mount shared subtrees, verify the state transition when use: --make-shared --make-slave --make-private --make-unbindable | pass | pass | 2026-10-26 |  |
 | generic/411 | This test cover linux commit 7ae8fd0, kernel two mnt_group_id == 0 (no peer)vfsmount as peers. It case kernel dereference a NULL address. | pass | pass | 2026-10-26 |  |
-| generic/412 |  | pass | pass | 2026-10-25 |  |
-| generic/417 | Test orphan inode / unlinked list processing on RO mount & RW transition | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/420 | Verify fallocate(mode=FALLOC_FL_KEEP_SIZE/FALLOC_FL_PUNCH_HOLE) does not alter the file size. | pass | pass | 2026-10-25 |  |
-| generic/422 | Test that a filesystem's implementation of the stat(2) system call reports correct values for the number of blocks allocated for a file when there are delayed ... | pass | pass | 2026-10-25 |  |
-| generic/423 | Test the statx system call | pass | pass | 2026-10-25 |  |
-| generic/424 | Test the statx stx_attribute flags that can be set with chattr | pass | pass | 2026-10-25 |  |
-| generic/425 | Check that FIEMAP produces some output when we require an external block to hold extended attributes. | pass | not run | 2026-10-25 | xfs_io fiemap -a failed (old kernel/wrong fs/bad args?) |
-| generic/426 | Check stale handles pointing to unlinked files and non-stale handles pointing to linked files | pass | not run | 2026-10-25 | ext4 does not support NFS export |
+| generic/412 |  | pass | pass | 2026-10-26 |  |
+| generic/417 | Test orphan inode / unlinked list processing on RO mount & RW transition | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/420 | Verify fallocate(mode=FALLOC_FL_KEEP_SIZE/FALLOC_FL_PUNCH_HOLE) does not alter the file size. | pass | pass | 2026-10-26 |  |
+| generic/422 | Test that a filesystem's implementation of the stat(2) system call reports correct values for the number of blocks allocated for a file when there are delayed ... | pass | pass | 2026-10-26 |  |
+| generic/423 | Test the statx system call | pass | pass | 2026-10-26 |  |
+| generic/424 | Test the statx stx_attribute flags that can be set with chattr | pass | pass | 2026-10-26 |  |
+| generic/425 | Check that FIEMAP produces some output when we require an external block to hold extended attributes. | pass | not run | 2026-10-26 | xfs_io fiemap -a failed (old kernel/wrong fs/bad args?) |
+| generic/426 | Check stale handles pointing to unlinked files and non-stale handles pointing to linked files | pass | not run | 2026-10-26 | ext4 does not support NFS export |
 | generic/427 | Try to trigger a race of free eofblocks and file extending dio writes. A known bug of XFS has been fixed by "e4229d6 xfs: fix eofblocks race with file ... | pass | pass | 2026-10-26 |  |
-| generic/428 | This is a regression test for kernel patch: dax: fix data corruption due to stale mmap reads created by Ross Zwisler <ross.zwisler@linux.intel.com> | pass | pass | 2026-10-25 |  |
-| generic/430 | Tests vfs_copy_file_range(): - Copy a file - Copy beginning of original to new file - Copy middle of original to a new file - Copy end of original to new file ... | pass | pass | 2026-10-25 |  |
-| generic/431 | Tests vfs_copy_file_range(): - Copy a small file - Small copies from various points in the original file | pass | pass | 2026-10-25 |  |
-| generic/432 | Tests vfs_copy_file_range(): - Copy a file - Use copy to swap data at beginning and end - Use copy to swap data in the middle - Use copy to simultaneously ... | pass | pass | 2026-10-25 |  |
-| generic/433 | Tests vfs_copy_file_range(): - Copy a small file - Use copy to swap data at beginning and end - Use copy to swap data in the middle - Use copy to swap data in ... | pass | pass | 2026-10-25 |  |
+| generic/428 | This is a regression test for kernel patch: dax: fix data corruption due to stale mmap reads created by Ross Zwisler <ross.zwisler@linux.intel.com> | pass | pass | 2026-10-26 |  |
+| generic/430 | Tests vfs_copy_file_range(): - Copy a file - Copy beginning of original to new file - Copy middle of original to a new file - Copy end of original to new file ... | pass | pass | 2026-10-26 |  |
+| generic/431 | Tests vfs_copy_file_range(): - Copy a small file - Small copies from various points in the original file | pass | pass | 2026-10-26 |  |
+| generic/432 | Tests vfs_copy_file_range(): - Copy a file - Use copy to swap data at beginning and end - Use copy to swap data in the middle - Use copy to simultaneously ... | pass | pass | 2026-10-26 |  |
+| generic/433 | Tests vfs_copy_file_range(): - Copy a small file - Use copy to swap data at beginning and end - Use copy to swap data in the middle - Use copy to swap data in ... | pass | pass | 2026-10-26 |  |
 | generic/434 | Tests vfs_copy_file_range() error checking | pass | pass | 2026-10-26 |  |
 | generic/436 | More SEEK_DATA/SEEK_HOLE sanity tests. | pass | pass | 2026-10-26 |  |
-| generic/437 | This is a regression test for kernel patches: mm: avoid spurious 'bad pmd' warning messages dax: Fix race between colliding PMD & PTE entries created by Ross ... | pass | pass | 2026-10-25 |  |
-| generic/439 | Test that if we punch a hole in a file, with either a range that goes beyond the file's size or covers a file range that is already a hole, and that if after ... | pass | pass | 2026-10-25 |  |
-| generic/441 | Open a file several times, write to it, fsync on all fds and make sure that they all return 0. Change the device to start throwing errors. Write again on all ... | fail | not run | 2026-10-25 | This test requires dm error support |
-| generic/443 | Takes page fault while writev is iterating over the vectors in the IOV | pass | pass | 2026-10-25 |  |
+| generic/437 | This is a regression test for kernel patches: mm: avoid spurious 'bad pmd' warning messages dax: Fix race between colliding PMD & PTE entries created by Ross ... | pass | pass | 2026-10-26 |  |
+| generic/439 | Test that if we punch a hole in a file, with either a range that goes beyond the file's size or covers a file range that is already a hole, and that if after ... | pass | pass | 2026-10-26 |  |
+| generic/441 | Open a file several times, write to it, fsync on all fds and make sure that they all return 0. Change the device to start throwing errors. Write again on all ... | fail | not run | 2026-10-26 | This test requires dm error support |
+| generic/443 | Takes page fault while writev is iterating over the vectors in the IOV | pass | pass | 2026-10-26 |  |
 | generic/444 | Check if SGID is inherited when creating a subdirectory when the owner is not in the owning group and directory has default ACLs. | pass | pass | 2026-10-26 |  |
 | generic/445 | Another SEEK_DATA/SEEK_HOLE sanity test. | pass | pass | 2026-10-26 |  |
-| generic/446 | Regression test for commit: 04197b3 ("xfs: don't BUG() on mixed direct and mapped I/O") | pass | pass | 2026-10-25 |  |
+| generic/446 | Regression test for commit: 04197b3 ("xfs: don't BUG() on mixed direct and mapped I/O") | pass | pass | 2026-10-26 |  |
 | generic/448 | Check what happens when SEEK_HOLE/SEEK_DATA are fed negative offsets. | pass | pass | 2026-10-26 |  |
 | generic/449 | Fill the device and set as many extended attributes to a file as possible. Then call setfacl on it and, if this fails for lack of space, test that the ... | pass | pass | 2026-10-26 |  |
-| generic/450 | Test read around EOF. If the file offset is at or past the end of file, no bytes are read, and read() returns zero. There was a bug, when DIO read offset is ... | pass | pass | 2026-10-25 |  |
-| generic/451 | Test data integrity when mixing buffered reads and asynchronous direct writes a file. | pass | pass | 2026-10-25 |  |
-| generic/452 | This is a regression test for kernel patch: commit fd96b8da68d3 ("ext4: fix fault handling when mounted with -o dax,ro") created by Ross Zwisler ... | pass | pass | 2026-10-25 |  |
-| generic/453 | Create a directory with multiple filenames that all appear the same (in unicode, anyway) but point to different inodes. In theory all Linux filesystems should ... | pass | pass | 2026-10-25 |  |
-| generic/454 | Create xattrs with multiple keys that all appear the same (in unicode, anyway) but point to different values. In theory all Linux filesystems should allow this ... | pass | pass | 2026-10-25 |  |
+| generic/450 | Test read around EOF. If the file offset is at or past the end of file, no bytes are read, and read() returns zero. There was a bug, when DIO read offset is ... | pass | pass | 2026-10-26 |  |
+| generic/451 | Test data integrity when mixing buffered reads and asynchronous direct writes a file. | pass | pass | 2026-10-26 |  |
+| generic/452 | This is a regression test for kernel patch: commit fd96b8da68d3 ("ext4: fix fault handling when mounted with -o dax,ro") created by Ross Zwisler ... | pass | pass | 2026-10-26 |  |
+| generic/453 | Create a directory with multiple filenames that all appear the same (in unicode, anyway) but point to different inodes. In theory all Linux filesystems should ... | pass | pass | 2026-10-26 |  |
+| generic/454 | Create xattrs with multiple keys that all appear the same (in unicode, anyway) but point to different values. In theory all Linux filesystems should allow this ... | pass | pass | 2026-10-26 |  |
 | generic/460 | Test that XFS reserves reasonable indirect blocks for delalloc and speculative allocation, and doesn't cause any fdblocks corruption. | pass | pass | 2026-10-26 |  |
 | generic/462 | This is a regression test for kernel commit ef947b2 x86, mm: fix gup_pte_range() vs DAX mappings created by Jeffrey Moyer <jmoyer@redhat.com> | no result | not run | 2026-10-26 | /dev/vdb ext4 does not support -o dax |
-| generic/465 | Test i_size is updated properly under dio read/write | pass | pass | 2026-10-25 |  |
+| generic/465 | Test i_size is updated properly under dio read/write | pass | pass | 2026-10-26 |  |
 | generic/466 | Check that high-offset reads and writes work. | pass | pass | 2026-10-26 |  |
-| generic/467 | Check open by file handle. This is a variant of test generic/426 that tests with less files and more use cases: - open directory by file handle - verify ... | pass | not run | 2026-10-25 | ext4 does not support NFS export |
-| generic/468 | This testcase is a fallocate variant of generic/392, it expands to test block preallocation functionality of fallocate. In this case, we are trying to execute ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
+| generic/467 | Check open by file handle. This is a variant of test generic/426 that tests with less files and more use cases: - open directory by file handle - verify ... | pass | not run | 2026-10-26 | ext4 does not support NFS export |
+| generic/468 | This testcase is a fallocate variant of generic/392, it expands to test block preallocation functionality of fallocate. In this case, we are trying to execute ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
 | generic/469 | Test that mmap read doesn't see non-zero data past EOF on truncate down. | pass | pass | 2026-10-26 |  |
-| generic/471 | Test that if names are added to a directory after an opendir(3) call and before a rewinddir(3) call, future readdir(3) calls will return the names. This is ... | pass | pass | 2026-10-25 |  |
+| generic/471 | Test that if names are added to a directory after an opendir(3) call and before a rewinddir(3) call, future readdir(3) calls will return the names. This is ... | pass | pass | 2026-10-26 |  |
 | generic/472 | Test various swapfile activation oddities. | pass | pass | 2026-10-26 |  |
 | generic/473 | Test for the new ranged query functionality in xfs_io's fiemap command. This tests various combinations of hole + data layout being printed. Also the test used ... | no result | pass | 2026-10-25 |  |
-| generic/474 | Inspired by syncfs bug of overlayfs which does not sync dirty inodes in underlying filesystem. | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/477 | Check open by file handle after cycle mount. | pass | not run | 2026-10-25 | ext4 does not support NFS export |
+| generic/474 | Inspired by syncfs bug of overlayfs which does not sync dirty inodes in underlying filesystem. | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/477 | Check open by file handle after cycle mount. | pass | not run | 2026-10-26 | ext4 does not support NFS export |
 | generic/478 | Test OFD lock. fcntl F_OFD_SETLK to set lock, then F_OFD_GETLK to verify we are being given correct advice by kernel. | pass | pass | 2026-10-26 |  |
-| generic/484 | Open a file and write to it and fsync. Then, flip the data device to throw errors, write to it again and do an fdatasync. Then open an O_RDONLY fd on the same ... | fail | not run | 2026-10-25 | This test requires dm error support |
-| generic/485 | Regression test for: 349fa7d6e193 ("ext4: prevent right-shifting extents beyond EXT_MAX_BLOCKS") 7d83fb14258b ("xfs: prevent creating negative-sized file via ... | pass | pass | 2026-10-25 |  |
-| generic/486 | Ensure that we can XATTR_REPLACE a tiny attr into a large attr. Kanda Motohiro <kanda.motohiro@gmail.com> reports that XATTR_REPLACE'ing a single-byte attr ... | pass | pass | 2026-10-25 |  |
+| generic/484 | Open a file and write to it and fsync. Then, flip the data device to throw errors, write to it again and do an fdatasync. Then open an O_RDONLY fd on the same ... | fail | not run | 2026-10-26 | This test requires dm error support |
+| generic/485 | Regression test for: 349fa7d6e193 ("ext4: prevent right-shifting extents beyond EXT_MAX_BLOCKS") 7d83fb14258b ("xfs: prevent creating negative-sized file via ... | pass | pass | 2026-10-26 |  |
+| generic/486 | Ensure that we can XATTR_REPLACE a tiny attr into a large attr. Kanda Motohiro <kanda.motohiro@gmail.com> reports that XATTR_REPLACE'ing a single-byte attr ... | pass | pass | 2026-10-26 |  |
 | generic/488 | Test having many file descriptors referring to deleted files open. Regression test for patch "Btrfs: fix ENOSPC caused by orphan items reservations". | pass | pass | 2026-10-26 |  |
 | generic/490 | Check that SEEK_DATA works properly for offsets in the middle of large holes. This was broken for ext4 with indirect-block based files and this test checks for ... | pass | pass | 2026-10-26 |  |
-| generic/491 | Test first read with freeze right after mount. | pass | not run | 2026-10-25 | ext4 does not support freezing |
-| generic/492 | Test the online filesystem label set/get ioctls | pass | not run | 2026-10-25 | xfs_io label failed (old kernel/wrong fs?) |
+| generic/491 | Test first read with freeze right after mount. | pass | not run | 2026-10-26 | ext4 does not support freezing |
+| generic/492 | Test the online filesystem label set/get ioctls | pass | not run | 2026-10-26 | xfs_io label failed (old kernel/wrong fs?) |
 | generic/494 | Test truncation/hole punching of an active swapfile. | pass | pass | 2026-10-26 |  |
 | generic/495 | Test invalid swap file (with holes) | pass | pass | 2026-10-26 |  |
 | generic/496 | Test various swapfile activation oddities on filesystems that support fallocated swapfiles (for given fs ext4/xfs) | pass | pass | 2026-10-26 |  |
 | generic/497 | Test various swapfile activation oddities, having used fcollapse to create discontiguous ranges in the file. | pass | pass | 2026-10-26 |  |
-| generic/499 | Test a specific sequence of fsx operations that causes an mmap read past eof to return nonzero contents. | pass | fail | 2026-10-25 | the output is not the expected output |
-| generic/503 | This is a regression test for kernel patch: ext4: handle layout changes to pinned DAX mapping | pass | pass | 2026-10-25 |  |
-| generic/505 | This testcase is trying to test recovery flow of generic filesystem, w/ below steps, once uid or gid changes, after we fsync that file, we can expect that ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/507 | This testcase is trying to test recovery flow of generic filesystem, w/ below steps, once i_flags changes, after we fsync that file, we can expect that i_flags ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/508 | This testcase is trying to test recovery flow of generic filesystem, it needs creation time support on specified filesystem. With below steps, once the file is ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/511 | Test a specific sequence of fsx operations that causes an mmap read past eof to return nonzero contents. | pass | fail | 2026-10-25 | the output is not the expected output |
+| generic/499 | Test a specific sequence of fsx operations that causes an mmap read past eof to return nonzero contents. | pass | fail | 2026-10-26 | the output is not the expected output |
+| generic/503 | This is a regression test for kernel patch: ext4: handle layout changes to pinned DAX mapping | pass | pass | 2026-10-26 |  |
+| generic/505 | This testcase is trying to test recovery flow of generic filesystem, w/ below steps, once uid or gid changes, after we fsync that file, we can expect that ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/507 | This testcase is trying to test recovery flow of generic filesystem, w/ below steps, once i_flags changes, after we fsync that file, we can expect that i_flags ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/508 | This testcase is trying to test recovery flow of generic filesystem, it needs creation time support on specified filesystem. With below steps, once the file is ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/511 | Test a specific sequence of fsx operations that causes an mmap read past eof to return nonzero contents. | pass | fail | 2026-10-26 | the output is not the expected output |
 | generic/514 | Ensure that file size resource limits are respected when reflinking. | no result | not run | 2026-10-26 | Reflink not supported by scratch filesystem type: ext4 |
-| generic/519 | Verify if there's physical address overlap returned by FIBMAP, cover: 79b3dbe4adb3 fs: fix iomap_bmap position calculation | pass | pass | 2026-10-25 |  |
-| generic/523 | Check that xattrs can have slashes in their name. | pass | pass | 2026-10-25 |  |
+| generic/519 | Verify if there's physical address overlap returned by FIBMAP, cover: 79b3dbe4adb3 fs: fix iomap_bmap position calculation | pass | pass | 2026-10-26 |  |
+| generic/523 | Check that xattrs can have slashes in their name. | pass | pass | 2026-10-26 |  |
 | generic/524 | Test XFS page writeback code for races with the cached file mapping. XFS caches the file -> block mapping for a full extent once it is initially looked up. The ... | pass | pass | 2026-10-26 |  |
-| generic/528 | Check that statx btime (aka creation time) is plausibly close to when we created a file. A bug caught during code review of xfs patches revealed that there ... | pass | not run | 2026-10-25 | inode creation time not supported by this filesystem |
+| generic/528 | Check that statx btime (aka creation time) is plausibly close to when we created a file. A bug caught during code review of xfs patches revealed that there ... | pass | not run | 2026-10-26 | inode creation time not supported by this filesystem |
 | generic/529 | Regression test for a bug where XFS corrupts memory if the listxattr buffer is a particularly well crafted size on a filesystem that supports posix acls. | pass | pass | 2026-10-26 |  |
-| generic/530 | Stress test creating a lot of unlinked O_TMPFILE files and recovering them after a crash, checking that we don't blow up the filesystem. This is sort of a ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/531 | Stress test creating a lot of unlinked O_TMPFILE files and closing them all at once, checking that we don't blow up the filesystem. This is sort of a ... | pass | not run | 2026-10-25 | O_TMPFILE is not supported |
-| generic/532 | Regression test for a bug where XFS fails to set statx attributes_mask but sets attribute flags anyway, which is fixed by commit 1b9598c8fb99 ("xfs: fix ... | pass | pass | 2026-10-25 |  |
-| generic/533 | Simple attr smoke tests for user EAs, dereived from generic/097. | pass | pass | 2026-10-25 |  |
-| generic/536 | Test a some write patterns for stale data exposure after a crash. XFS is historically susceptible to this problem in the window between delalloc to physical ... | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/537 | Ensure that we can't call fstrim on filesystems mounted norecovery, because FSTRIM implementations use free space metadata to drive the discard requests and we ... | pass | not run | 2026-10-25 | FSTRIM not supported |
-| generic/538 | Non-block-aligned direct AIO write test with an initial truncate i_size. | pass | pass | 2026-10-25 |  |
+| generic/530 | Stress test creating a lot of unlinked O_TMPFILE files and recovering them after a crash, checking that we don't blow up the filesystem. This is sort of a ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/531 | Stress test creating a lot of unlinked O_TMPFILE files and closing them all at once, checking that we don't blow up the filesystem. This is sort of a ... | pass | not run | 2026-10-26 | O_TMPFILE is not supported |
+| generic/532 | Regression test for a bug where XFS fails to set statx attributes_mask but sets attribute flags anyway, which is fixed by commit 1b9598c8fb99 ("xfs: fix ... | pass | pass | 2026-10-26 |  |
+| generic/533 | Simple attr smoke tests for user EAs, dereived from generic/097. | pass | pass | 2026-10-26 |  |
+| generic/536 | Test a some write patterns for stale data exposure after a crash. XFS is historically susceptible to this problem in the window between delalloc to physical ... | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/537 | Ensure that we can't call fstrim on filesystems mounted norecovery, because FSTRIM implementations use free space metadata to drive the discard requests and we ... | pass | not run | 2026-10-26 | FSTRIM not supported |
+| generic/538 | Non-block-aligned direct AIO write test with an initial truncate i_size. | pass | pass | 2026-10-26 |  |
 | generic/539 | Check that SEEK_HOLE can find a punched hole. | pass | pass | 2026-10-26 |  |
 | generic/545 | Check that we can't set the FS_APPEND_FL and FS_IMMUTABLE_FL inode flags without capbility CAP_LINUX_IMMUTABLE | no result | not run | 2026-10-25 | capsh utility required, skipped this test |
-| generic/553 | Check that we cannot copy_file_range() to an immutable file | pass | pass | 2026-10-25 |  |
+| generic/553 | Check that we cannot copy_file_range() to an immutable file | pass | pass | 2026-10-26 |  |
 | generic/554 | Check that we cannot copy_file_range() to a swapfile | pass | pass | 2026-10-26 |  |
-| generic/556 | Test the basic functionality of filesystems with case-insensitive support. | pass | not run | 2026-10-25 | ext4 does not support casefold feature |
+| generic/556 | Test the basic functionality of filesystems with case-insensitive support. | pass | not run | 2026-10-26 | ext4 does not support casefold feature |
 | generic/566 | Regression test for chgrp returning to userspace with ILOCK held after a hard quota error. This causes the filesystem to hang if kernel is not patched. | no result | not run | 2026-10-26 | Quota user tools not installed |
-| generic/567 | Test mapped writes against punch-hole to ensure we get the data correctly written. This can expose data corruption bugs on filesystems where the block size is ... | pass | pass | 2026-10-25 |  |
-| generic/568 | Test that fallocating an unaligned range allocates all blocks touched by that range | pass | pass | 2026-10-25 |  |
+| generic/567 | Test mapped writes against punch-hole to ensure we get the data correctly written. This can expose data corruption bugs on filesystems where the block size is ... | pass | pass | 2026-10-26 |  |
+| generic/568 | Test that fallocating an unaligned range allocates all blocks touched by that range | pass | pass | 2026-10-26 |  |
 | generic/569 | Check that we can't modify a file that's an active swap file. | pass | fail | 2026-10-26 | A write to a mapped swap file must give SIGBUS. This needs a reverse map to write protect the pages. |
-| generic/571 |  | fail | not run | 2026-10-25 | Require fcntl setlease support |
+| generic/571 |  | fail | not run | 2026-10-26 | Require fcntl setlease support |
 | generic/573 | Test access controls on the fs-verity ioctls. FS_IOC_MEASURE_VERITY is allowed on any file, whereas FS_IOC_ENABLE_VERITY requires write access. | no result | not run | 2026-10-26 | fsverity utility required, skipped this test |
 | generic/578 | Make sure that we can handle multiple mmap writers to the same file. | no result | not run | 2026-10-25 | Reflink not supported by test filesystem type: ext4 |
-| generic/580 | Basic test of the fscrypt filesystem-level encryption keyring and v2 encryption policies. | pass | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| generic/580 | Basic test of the fscrypt filesystem-level encryption keyring and v2 encryption policies. | pass | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
 | generic/581 | Test non-root use of the fscrypt filesystem-level encryption keyring and v2 encryption policies. | pass | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
-| generic/582 | Verify ciphertext for v2 encryption policies that use AES-256-XTS to encrypt file contents and AES-256-CTS-CBC to encrypt file names. | pass | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
-| generic/583 | Verify ciphertext for v2 encryption policies that use AES-128-CBC-ESSIV to encrypt file contents and AES-128-CTS-CBC to encrypt file names. | not run | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
-| generic/584 | Verify ciphertext for v2 encryption policies that use Adiantum to encrypt file contents and file names. | not run | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
-| generic/586 | Race an appending aio dio write to the second block of a file while simultaneously fallocating to the first block. Make sure that we end up with a two-block ... | pass | pass | 2026-10-25 |  |
+| generic/582 | Verify ciphertext for v2 encryption policies that use AES-256-XTS to encrypt file contents and AES-256-CTS-CBC to encrypt file names. | pass | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| generic/583 | Verify ciphertext for v2 encryption policies that use AES-128-CBC-ESSIV to encrypt file contents and AES-128-CTS-CBC to encrypt file names. | not run | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| generic/584 | Verify ciphertext for v2 encryption policies that use Adiantum to encrypt file contents and file names. | not run | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| generic/586 | Race an appending aio dio write to the second block of a file while simultaneously fallocating to the first block. Make sure that we end up with a two-block ... | pass | pass | 2026-10-26 |  |
 | generic/587 | Regression test to ensure that dquots are attached to the inode when we're performing unwritten extent conversion after a directio write and the extent mapping ... | no result | not run | 2026-10-26 | Quota user tools not installed |
-| generic/591 | Test using splice() to read from pipes. | pass | pass | 2026-10-25 |  |
-| generic/592 | Verify ciphertext for v2 encryption policies that use the IV_INO_LBLK_64 flag and use AES-256-XTS to encrypt file contents and AES-256-CTS-CBC to encrypt file ... | pass | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| generic/591 | Test using splice() to read from pipes. | pass | pass | 2026-10-26 |  |
+| generic/592 | Verify ciphertext for v2 encryption policies that use the IV_INO_LBLK_64 flag and use AES-256-XTS to encrypt file contents and AES-256-CTS-CBC to encrypt file ... | pass | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
 | generic/597 | Test protected_symlink and protected_hardlink sysctls | pass | not run | 2026-10-26 | fs.protected_symlinks sysctl unavailable |
-| generic/598 | Test protected_regular and protected_fifos sysctls | pass | not run | 2026-10-25 | fs.protected_regular sysctl unavailable |
-| generic/599 | Test data integrity for ro remount. | pass | not run | 2026-10-25 | ext4 does not support shutdown |
-| generic/602 | Verify ciphertext for v2 encryption policies that use the IV_INO_LBLK_32 flag and use AES-256-XTS to encrypt file contents and AES-256-CTS-CBC to encrypt file ... | pass | not run | 2026-10-25 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
-| generic/604 | Evicting dirty inodes can take a long time during umount. Check that a new mount racing with such a delayed umount succeeds. | pass | pass | 2026-10-25 |  |
-| generic/607 | Verify the inheritance behavior of FS_XFLAG_DAX flag in various combinations. 1) New files and directories automatically inherit FS_XFLAG_DAX from their parent ... | pass | not run | 2026-10-25 | xfs_io chattr +x failed (old kernel/wrong fs?) |
-| generic/609 | iomap can call generic_write_sync() if we're O_DSYNC, so write a basic test to exercise O_DSYNC so any unsuspecting file systems will get lockdep warnings if ... | pass | pass | 2026-10-25 |  |
-| generic/610 | Test a fallocate() zero range operation against a large file range for which there are many small extents allocated. Verify the operation does not fail and the ... | pass | pass | 2026-10-25 |  |
-| generic/611 | Verify that metadata won't get corrupted when extended attribute name of size one is set. | pass | pass | 2026-10-25 |  |
-| generic/614 | Test that after doing a memory mapped write to an empty file, a call to stat(2) reports a non-zero number of used blocks. | pass | not run | 2026-10-25 | test requires delayed allocation buffered writes |
+| generic/598 | Test protected_regular and protected_fifos sysctls | pass | not run | 2026-10-26 | fs.protected_regular sysctl unavailable |
+| generic/599 | Test data integrity for ro remount. | pass | not run | 2026-10-26 | ext4 does not support shutdown |
+| generic/602 | Verify ciphertext for v2 encryption policies that use the IV_INO_LBLK_32 flag and use AES-256-XTS to encrypt file contents and AES-256-CTS-CBC to encrypt file ... | pass | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |
+| generic/604 | Evicting dirty inodes can take a long time during umount. Check that a new mount racing with such a delayed umount succeeds. | pass | pass | 2026-10-26 |  |
+| generic/607 | Verify the inheritance behavior of FS_XFLAG_DAX flag in various combinations. 1) New files and directories automatically inherit FS_XFLAG_DAX from their parent ... | pass | not run | 2026-10-26 | xfs_io chattr +x failed (old kernel/wrong fs?) |
+| generic/609 | iomap can call generic_write_sync() if we're O_DSYNC, so write a basic test to exercise O_DSYNC so any unsuspecting file systems will get lockdep warnings if ... | pass | pass | 2026-10-26 |  |
+| generic/610 | Test a fallocate() zero range operation against a large file range for which there are many small extents allocated. Verify the operation does not fail and the ... | pass | pass | 2026-10-26 |  |
+| generic/611 | Verify that metadata won't get corrupted when extended attribute name of size one is set. | pass | pass | 2026-10-26 |  |
+| generic/614 | Test that after doing a memory mapped write to an empty file, a call to stat(2) reports a non-zero number of used blocks. | pass | not run | 2026-10-26 | test requires delayed allocation buffered writes |
 | generic/615 | Test that if we keep overwriting an entire file, either with buffered writes or direct IO writes, the number of used blocks reported by stat(2) is never zero ... | pass | pass | 2026-10-26 |  |
 | generic/618 | Verify that forkoff can be returned as 0 properly if it isn't able to fit inline for XFS. However, this test is fs-neutral and can be done quickly so leave it ... | pass | pass | 2026-10-26 |  |
 | generic/621 | Test for a race condition where a duplicate filename could be created in an encrypted directory while the directory's encryption key was being added ... | pass | not run | 2026-10-26 | kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with ... |

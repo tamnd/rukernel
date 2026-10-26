@@ -1,5 +1,7 @@
 # fstests results on overlayfs
 
+report.py makes this file from the logs of the runs. Do not change it by hand.
+
 These are the results of the overlay tests of fstests. The lower and the upper directories are on ext4. The README in this directory tells how the tests run.
 
 rukernel: 23 pass, 14 fail, 56 not run, and 0 have no result, of 93 tests.
