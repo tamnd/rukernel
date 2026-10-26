@@ -1298,8 +1298,12 @@ fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>, busybox: Option<&[u8]>) -> 
     w.finish()
 }
 
-/// The physical address where the loader puts the payload of the bzImage, and the kernel runs.
+/// The physical address where the loader puts the payload of the bzImage. The bzImage is not
+/// relocatable, so the loader always puts it at 1 MiB.
 const BZIMAGE_LOAD: u64 = 0x10_0000;
+/// The physical address where the kernel runs, as `CONFIG_PHYSICAL_START` of Linux. The entry code
+/// in `boot.rs` moves the payload from `BZIMAGE_LOAD` to this address. x86_64.ld has this value.
+const KERNEL_PHYS: u64 = 0x100_0000;
 /// The size of the setup part of the bzImage: the boot sector and 7 setup sectors.
 const BZIMAGE_SETUP_SECTS: u8 = 7;
 const BZIMAGE_SETUP_SIZE: usize = (BZIMAGE_SETUP_SECTS as usize + 1) * 512;
@@ -1319,7 +1323,7 @@ fn put<const N: usize>(b: &mut [u8], at: usize, v: u64) {
 
 /// Makes a bzImage from the kernel ELF file, per Documentation/arch/x86/boot.rst in the Linux
 /// tree. The setup part is the `.rk_setup` section with the setup header. The payload is the
-/// `PT_LOAD` segments as one flat image from `BZIMAGE_LOAD`.
+/// `PT_LOAD` segments as one flat image from `KERNEL_PHYS`.
 fn bzimage(elf: &[u8]) -> Result<Vec<u8>> {
     if elf.get(..4) != Some(b"\x7fELF".as_slice()) || elf.get(4) != Some(&2) {
         return Err(String::from("the kernel is not an ELF64 file"));
@@ -1335,17 +1339,17 @@ fn bzimage(elf: &[u8]) -> Result<Vec<u8>> {
             let offset = usize_of(le::<8>(elf, ph + 8)?)?;
             let (paddr, filesz, memsz) =
                 (le::<8>(elf, ph + 24)?, le::<8>(elf, ph + 32)?, le::<8>(elf, ph + 40)?);
-            if paddr < BZIMAGE_LOAD {
-                return Err(format!("a segment is at {paddr:#x}, below {BZIMAGE_LOAD:#x}"));
+            if paddr < KERNEL_PHYS {
+                return Err(format!("a segment is at {paddr:#x}, below {KERNEL_PHYS:#x}"));
             }
             segments.push((offset, paddr, filesz, memsz));
         }
     }
     let file_end = segments.iter().map(|s| s.1 + s.2).max().ok_or("the kernel has no segments")?;
     let mem_end = segments.iter().map(|s| s.1 + s.3).max().unwrap_or(file_end);
-    let mut payload = vec![0; usize_of(file_end - BZIMAGE_LOAD)?.next_multiple_of(PE_FILE_ALIGN)];
+    let mut payload = vec![0; usize_of(file_end - KERNEL_PHYS)?.next_multiple_of(PE_FILE_ALIGN)];
     for &(offset, paddr, filesz, _) in &segments {
-        let (at, len) = (usize_of(paddr - BZIMAGE_LOAD)?, usize_of(filesz)?);
+        let (at, len) = (usize_of(paddr - KERNEL_PHYS)?, usize_of(filesz)?);
         let data = elf.get(offset..offset + len).ok_or("a segment is outside the file")?;
         payload[at..at + len].copy_from_slice(data);
     }
@@ -1392,8 +1396,10 @@ fn bzimage(elf: &[u8]) -> Result<Vec<u8>> {
     put::<4>(&mut image, 0x230, 0x20_0000); // kernel_alignment
     put::<2>(&mut image, 0x236, 0x0001); // xloadflags: XLF_KERNEL_64
     put::<4>(&mut image, 0x238, 2047); // cmdline_size
-    put::<8>(&mut image, 0x258, BZIMAGE_LOAD); // pref_address
-    put::<4>(&mut image, 0x260, (mem_end - BZIMAGE_LOAD).next_multiple_of(4096)); // init_size
+    put::<8>(&mut image, 0x258, KERNEL_PHYS); // pref_address
+    // init_size: from the load address to the end of the kernel at `KERNEL_PHYS`, so that a 64 bit
+    // loader maps both copies of the image in its identity map.
+    put::<4>(&mut image, 0x260, (mem_end - BZIMAGE_LOAD).next_multiple_of(4096));
     // kernel_version: the offset of the version string, less 0x200.
     let version = format!("rukernel {}\0", env!("CARGO_PKG_VERSION"));
     let at = BZIMAGE_SETUP_SIZE - 0x200;
