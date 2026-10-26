@@ -191,6 +191,7 @@ fn stat() -> Vec<u8> {
 /// The files of `/proc/sys` and their first values. A write keeps the new text, but the kernel
 /// does not use it yet.
 const SYSCTLS: &[(&str, &str)] = &[
+    ("fs/file-max", ""),
     ("fs/protected_fifos", ""),
     ("fs/protected_hardlinks", ""),
     ("fs/protected_regular", ""),
@@ -244,6 +245,8 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
         "kernel/osrelease" => String::from(info().release),
         "kernel/version" => String::from(info().version),
         "kernel/threads-max" => format!("{}", (rk_frame::mm::frame_stats().total / 32).max(20)),
+        // As `files_maxfiles_init` of Linux: 10 percent of the memory in KiB, and at least 8192.
+        "fs/file-max" => format!("{}", (rk_frame::mm::frame_stats().total * 4 / 10).max(8192)),
         _ => String::from(default),
     };
     format!("{value}\n").into_bytes()
