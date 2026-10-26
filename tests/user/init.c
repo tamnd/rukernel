@@ -33,6 +33,7 @@
 #include <sys/user.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1479,6 +1480,52 @@ static void test_seccomp(void)
 }
 
 /* Checks the shared memory of System V. */
+/* The semaphores of System V. */
+static void test_sem(void)
+{
+	unsigned short vals[2] = {2, 0};
+	struct sembuf op = {.sem_num = 0, .sem_op = -1, .sem_flg = 0};
+	struct timespec ts = {.tv_sec = 0, .tv_nsec = 20000000};
+	struct semid_ds ds;
+	int id = semget(IPC_PRIVATE, 2, IPC_CREAT | 0600);
+
+	check("semget", id >= 0);
+	check("SETALL and GETALL", semctl(id, 0, SETALL, vals) == 0 && semctl(id, 0, GETVAL) == 2 &&
+	      semctl(id, 1, GETVAL) == 0);
+	check("IPC_STAT gives the number of semaphores",
+	      semctl(id, 0, IPC_STAT, &ds) == 0 && ds.sem_nsems == 2 && ds.sem_otime == 0);
+	check("semop takes one", semop(id, &op, 1) == 0 && semctl(id, 0, GETVAL) == 1 &&
+	      semctl(id, 0, GETPID) == getpid());
+	struct sembuf two[2] = {{0, -1, 0}, {1, -1, IPC_NOWAIT}};
+	errno = 0;
+	check("semop does all the operations or none of them",
+	      semop(id, two, 2) == -1 && errno == EAGAIN && semctl(id, 0, GETVAL) == 1);
+	struct sembuf zero = {.sem_num = 0, .sem_op = 0, .sem_flg = 0};
+	errno = 0;
+	check("semtimedop gives EAGAIN at the end of the timeout",
+	      semtimedop(id, &zero, 1, &ts) == -1 && errno == EAGAIN);
+	pid_t child = fork();
+	if (child == 0) {
+		struct sembuf up = {.sem_num = 1, .sem_op = 3, .sem_flg = SEM_UNDO};
+		semop(id, &up, 1);
+		struct sembuf wait = {.sem_num = 0, .sem_op = 0, .sem_flg = 0};
+		_exit(semop(id, &wait, 1) == 0 ? 0 : 1);
+	}
+	struct sembuf take = {.sem_num = 1, .sem_op = -1, .sem_flg = 0};
+	check("semop waits for another process", semop(id, &take, 1) == 0);
+	while (semctl(id, 0, GETZCNT) != 1)
+		sched_yield();
+	check("semop that waits for 0 counts in GETZCNT", semctl(id, 0, GETZCNT) == 1);
+	int status = 0;
+	check("semop wakes the process that waits for 0",
+	      semop(id, &op, 1) == 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0);
+	check("the exit of a process undoes its SEM_UNDO changes", semctl(id, 1, GETVAL) == 0);
+	check("semctl IPC_RMID", semctl(id, 0, IPC_RMID) == 0);
+	errno = 0;
+	check("semop on a removed set gives EINVAL", semop(id, &op, 1) == -1 && errno == EINVAL);
+}
+
 static void test_shm(void)
 {
 	struct shmid_ds ds;
@@ -2847,6 +2894,7 @@ int main(int argc, char **argv)
 	test_proc();
 	test_memfd();
 	test_shm();
+	test_sem();
 	test_unix();
 	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)

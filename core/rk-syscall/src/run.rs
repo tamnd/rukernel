@@ -169,6 +169,11 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
     ptrace::event(&thread, &mut regs, NO_SYSCALL, PTRACE_EVENT_EXIT, status.0 as u32 as u64);
     crate::futex::exit_robust_list(&thread);
     crate::futex::exit_clear_tid(&thread);
+    // The last thread of a process does the changes that `SEM_UNDO` recorded.
+    let process = thread.process();
+    if process.threads().len() <= 1 {
+        crate::sem::exit(process.pid() as i32);
+    }
     rk_proc::exit_thread(&thread, status);
 }
 
