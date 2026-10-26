@@ -318,6 +318,24 @@ impl FileOps for InodeFile {
                 mem.write(arg + 8, &trimmed.to_ne_bytes())?;
                 Ok(0)
             }
+            FS_IOC_GETFSLABEL => {
+                let mut b = [0u8; FSLABEL_MAX];
+                let label = inode.label()?;
+                let n = label.len().min(FSLABEL_MAX - 1);
+                b[..n].copy_from_slice(&label[..n]);
+                mem.write(arg, &b)?;
+                Ok(0)
+            }
+            FS_IOC_SETFSLABEL => {
+                if !crate::cred::current().capable(crate::cred::cap::SYS_ADMIN) {
+                    return Err(Errno::EPERM);
+                }
+                let mut b = [0u8; FSLABEL_MAX];
+                mem.read(arg, &mut b)?;
+                let len = b.iter().position(|&c| c == 0).unwrap_or(FSLABEL_MAX);
+                inode.set_label(&b[..len])?;
+                Ok(0)
+            }
             fsx::FS_IOC_FSGETXATTR => fsx::get(&**inode, arg, mem),
             fsx::FS_IOC_FSSETXATTR => fsx::set(&**inode, arg, mem),
             _ => Err(Errno::ENOTTY),
@@ -339,6 +357,13 @@ const EXT4_IOC_RESIZE_FS: u32 = 0x4008_6610;
 /// `_IOWR('X', 121, struct fstrim_range)`. Discards the free blocks of a file system. The
 /// caller needs `CAP_SYS_ADMIN`.
 pub const FITRIM: u32 = 0xc018_5879;
+/// The size of the label buffer of the label ioctls, `FSLABEL_MAX`.
+const FSLABEL_MAX: usize = 256;
+/// `_IOR(0x94, 49, char[FSLABEL_MAX])`. Gives the label of a file system.
+const FS_IOC_GETFSLABEL: u32 = 0x8100_9431;
+/// `_IOW(0x94, 50, char[FSLABEL_MAX])`. Changes the label of a file system. The caller needs
+/// `CAP_SYS_ADMIN`.
+const FS_IOC_SETFSLABEL: u32 = 0x4100_9432;
 /// `_IOR('f', 1, long)`. The kernel reads and writes an `int`, as Linux.
 const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
 /// `_IOW('f', 2, long)`.

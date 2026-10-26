@@ -270,6 +270,18 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// Gives the label of the file system of the inode, for `FS_IOC_GETFSLABEL`. The default
+    /// gives `ENOTTY`.
+    fn label(&self) -> Result<Vec<u8>> {
+        Err(Errno::ENOTTY)
+    }
+
+    /// Changes the label of the file system of the inode, for `FS_IOC_SETFSLABEL`. The default
+    /// gives `ENOTTY`.
+    fn set_label(&self, _label: &[u8]) -> Result<()> {
+        Err(Errno::ENOTTY)
+    }
+
     /// Writes the transactions of the journal of the file system of the inode to their places
     /// and empties the journal, for `EXT4_IOC_CHECKPOINT`. `flags` has the bits of
     /// [`checkpoint`]. The default gives `ENOTTY`.

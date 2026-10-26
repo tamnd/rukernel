@@ -975,6 +975,26 @@ mod log {
     }
 
     #[test]
+    fn the_label_changes_on_the_disk_at_once() {
+        let ram = Ram(Arc::new(SpinLock::new(image_with_room())));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        let root = fs.root().unwrap();
+        root.set_label(b"label.492").unwrap();
+        assert_eq!(root.label().unwrap(), b"label.492");
+        assert_eq!(&ram.0.lock()[1024 + 0x78..1024 + 0x82], b"label.492\0");
+        root.set_label(&[b'o'; 16]).unwrap();
+        assert_eq!(root.label().unwrap(), [b'o'; 16]);
+        assert_eq!(root.set_label(&[b'o'; 17]), Err(Errno::EINVAL));
+        root.set_label(b"").unwrap();
+        assert_eq!(root.label().unwrap(), b"");
+        root.set_label(b"kept").unwrap();
+        drop((root, fs));
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), true).unwrap();
+        assert_eq!(fs.root().unwrap().label().unwrap(), b"kept");
+        assert_eq!(fs.root().unwrap().set_label(b"x"), Err(Errno::EROFS));
+    }
+
+    #[test]
     fn a_checkpoint_empties_the_journal() {
         use rk_vfs::inode::checkpoint::{DISCARD, DRY_RUN, ZEROOUT};
         let (fs, _ram) = open_rw();

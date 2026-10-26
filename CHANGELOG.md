@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - `statx` gives the creation time of a file in `stx_btime` with `STATX_BTIME` on ext4, tmpfs and XFS, as Linux. An ext4 inode without room for the time and an XFS inode before version 3 do not have it. generic/528 now passes.
+- `FS_IOC_GETFSLABEL` and `FS_IOC_SETFSLABEL` on ext4, as Linux. They read and change the label of a mounted file system. The new label goes to the disk at once, so `blkid` sees it while the file system is mounted. A label longer than 16 bytes gives `EINVAL`, and a change needs `CAP_SYS_ADMIN`. generic/492 now passes.
 
 ## [0.3.18] - 2026-10-27
 

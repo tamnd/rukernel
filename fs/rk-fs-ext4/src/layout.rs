@@ -108,6 +108,11 @@ pub mod sb {
     pub const FREE_INODES: usize = 0x10;
     /// The first inode of the list of orphans, as `s_last_orphan`.
     pub const LAST_ORPHAN: usize = 0xe8;
+    /// The label of the file system, `s_volume_name`. A label shorter than the field ends with
+    /// a zero byte.
+    pub const VOLUME_NAME: usize = 0x78;
+    /// The length of the label field, `EXT4_LABEL_MAX`.
+    pub const VOLUME_NAME_LEN: usize = 16;
     /// The checksum of the superblock.
     pub const CHECKSUM: usize = 0x3fc;
 }

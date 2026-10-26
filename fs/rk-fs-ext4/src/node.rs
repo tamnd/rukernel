@@ -1009,6 +1009,14 @@ impl Inode for Node {
         self.fs.trim(start, len, minlen)
     }
 
+    fn label(&self) -> Result<Vec<u8>> {
+        Ok(self.fs.label())
+    }
+
+    fn set_label(&self, label: &[u8]) -> Result<()> {
+        self.fs.set_label(label)
+    }
+
     fn metadata(&self) -> Metadata {
         let raw = self.raw();
         let kind = kind_of(&raw);
