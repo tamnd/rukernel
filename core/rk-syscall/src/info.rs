@@ -370,6 +370,8 @@ pub(crate) fn sysinfo(cx: &Cx<'_>, buf: u64) -> SysResult {
     s.uptime = (uptime_ns() / NSEC_PER_SEC) as i64;
     s.totalram = frames.total as u64;
     s.freeram = frames.free as u64;
+    s.totalswap = rk_vfs::swap::total_pages();
+    s.freeswap = s.totalswap;
     s.procs = rk_proc::processes().len().min(u16::MAX as usize) as u16;
     s.mem_unit = rk_mm::PAGE_SIZE as u32;
     cx.write_val(buf, &s)?;

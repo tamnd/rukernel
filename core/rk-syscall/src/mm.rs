@@ -225,6 +225,9 @@ pub(crate) fn mmap(
             if !file.flags().readable() || (shared && prot.write && !file.flags().writable()) {
                 return Err(Errno::EACCES);
             }
+            if shared && prot.write {
+                rk_vfs::swap::check(&**inode)?;
+            }
             match meta.file_type() {
                 Some(rk_vfs::FileType::Regular) => {
                     let path =

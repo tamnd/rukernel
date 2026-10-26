@@ -3,7 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use crate::{
     aio, cred, epoll, eventfd, fs, futex, info, memfd, mm, mount, net, pidfd, poll, process,
-    ptrace, sched, seccomp, shm, signal, signalfd, splice, timer, timerfd, xattr,
+    ptrace, sched, seccomp, shm, signal, signalfd, splice, swap, timer, timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -231,6 +231,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::MKNOD => fs::mknodat(cx, at_fdcwd(), a[0], a[1], a[2]),
         nr::STATFS => fs::statfs(cx, a[0], a[1]),
         nr::MOUNT => mount::mount(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::SWAPON => swap::swapon(cx, a[0], a[1]),
+        nr::SWAPOFF => swap::swapoff(cx, a[0]),
         nr::UMOUNT2 => mount::umount2(cx, a[0], a[1]),
         nr::FSOPEN => mount::fsopen(cx, a[0], a[1]),
         nr::FSCONFIG => mount::fsconfig(cx, a[0], a[1], a[2], a[3], a[4]),

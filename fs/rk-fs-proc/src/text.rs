@@ -18,9 +18,11 @@ pub struct MemInfo {
     pub total: u64,
     /// The memory that is free.
     pub free: u64,
+    /// The size of the active swap areas. rukernel does not use them yet, so all of it is free.
+    pub swap: u64,
 }
 
-/// The text of `/proc/meminfo`. R1 has no page cache and no swap, so the other counts are 0.
+/// The text of `/proc/meminfo`. R1 has no page cache, so the other counts are 0.
 pub fn meminfo(m: MemInfo) -> String {
     let rows: [(&str, u64); 21] = [
         ("MemTotal", m.total),
@@ -31,8 +33,8 @@ pub fn meminfo(m: MemInfo) -> String {
         ("SwapCached", 0),
         ("Active", 0),
         ("Inactive", 0),
-        ("SwapTotal", 0),
-        ("SwapFree", 0),
+        ("SwapTotal", m.swap),
+        ("SwapFree", m.swap),
         ("Dirty", 0),
         ("Writeback", 0),
         ("AnonPages", 0),
@@ -50,6 +52,28 @@ pub fn meminfo(m: MemInfo) -> String {
         let unit = if name.starts_with("HugePages_") { "" } else { " kB" };
         let _ = writeln!(out, "{:<16}{value:>8}{unit}", format!("{name}:"));
     }
+    out
+}
+
+/// The first line of `/proc/swaps`.
+pub const SWAPS_HEADER: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+/// A line of `/proc/swaps`, as `swap_show` of Linux. The sizes are in KiB.
+pub fn swap_line(path: &[u8], partition: bool, size: u64, used: u64, priority: i32) -> String {
+    let mut out = String::new();
+    // `seq_file_path` writes a space, a tab, a new line and a backslash in octal.
+    for &b in path {
+        if matches!(b, b' ' | b'\t' | b'\n' | b'\\') {
+            let _ = write!(out, "\\{b:03o}");
+        } else {
+            out.push(char::from(b));
+        }
+    }
+    let pad = 40usize.saturating_sub(out.len()).max(1);
+    let kind = if partition { "partition" } else { "file" };
+    let tab = |n: u64| if n < 10_000_000 { "\t" } else { "" };
+    let _ =
+        writeln!(out, "{:pad$}{kind}\t{size}\t{}{used}\t{}{priority}", "", tab(size), tab(used));
     out
 }
 
@@ -439,12 +463,24 @@ mod tests {
 
     #[test]
     fn meminfo_has_the_format_of_linux() {
-        let text = meminfo(MemInfo { total: 1024, free: 512 });
+        let text = meminfo(MemInfo { total: 1024, free: 512, swap: 0 });
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 21);
         assert_eq!(lines[0], "MemTotal:           1024 kB");
         assert_eq!(lines[2], "MemAvailable:        512 kB");
         assert!(text.contains("\nHugePages_Total:       0\n"));
+    }
+
+    #[test]
+    fn a_swap_line_has_the_format_of_linux() {
+        assert_eq!(
+            swap_line(b"/scratch/swap", false, 2044, 0, -2),
+            "/scratch/swap                           file\t2044\t\t0\t\t-2\n"
+        );
+        assert_eq!(
+            swap_line(b"/a b", true, 10_000_000, 0, 5),
+            "/a\\040b                                 partition\t10000000\t0\t\t5\n"
+        );
     }
 
     #[test]

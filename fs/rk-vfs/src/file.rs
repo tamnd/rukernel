@@ -211,6 +211,7 @@ impl FileOps for InodeFile {
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize> {
         let inode = file.inode.as_ref().ok_or(Errno::EINVAL)?;
+        crate::swap::check(&**inode)?;
         check_immutable(&**inode)?;
         let mut pos = file.pos.lock();
         if file.flags().append() {
@@ -235,6 +236,7 @@ impl FileOps for InodeFile {
 
     fn write_at(&self, file: &File, offset: u64, buf: &[u8]) -> Result<usize> {
         let inode = file.inode.as_ref().ok_or(Errno::EINVAL)?;
+        crate::swap::check(&**inode)?;
         check_immutable(&**inode)?;
         let n = inode.write_at(offset, buf)?;
         crate::mapped::wrote(inode, offset, &buf[..n]);
@@ -758,6 +760,7 @@ impl File {
         let inode = self.inode.as_ref().ok_or(Errno::ENODEV)?;
         // An append-only file only takes new blocks, as `vfs_fallocate` of Linux.
         check_immutable(&**inode)?;
+        crate::swap::check(&**inode)?;
         if mode & !crate::inode::falloc::KEEP_SIZE != 0 {
             crate::inode::check_fixed(&**inode)?;
         }

@@ -206,6 +206,12 @@ pub(crate) fn copy_file_range(
     if !input.flags().readable() || !output.flags().writable() || output.flags().append() {
         return Err(Errno::EBADF);
     }
+    // `generic_copy_file_checks` of Linux: an active swap area is not copied from or to.
+    for file in [&input, &output] {
+        if let Some(inode) = file.inode() {
+            rk_vfs::swap::check(&**inode)?;
+        }
+    }
     let in_pos = offset_at(cx, in_off)?;
     let out_pos = offset_at(cx, out_off)?;
     let in_start = in_pos.unwrap_or_else(|| input.pos());

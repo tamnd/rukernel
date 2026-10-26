@@ -475,7 +475,8 @@ pub fn check_fixed(inode: &dyn Inode) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Gives `EPERM` if the flags refuse the change.
+/// Gives `EPERM` if the flags refuse the change, and `ETXTBSY` for a new size of an active swap
+/// area.
 pub fn check_set_attr(inode: &dyn Inode, attr: &SetAttr) -> Result<()> {
     let flags = flags_of(inode);
     let fixed = attr.size.is_some()
@@ -485,6 +486,10 @@ pub fn check_set_attr(inode: &dyn Inode, attr: &SetAttr) -> Result<()> {
         || attr.explicit_times;
     if flags & iflags::IMMUTABLE != 0 || (flags & iflags::APPEND != 0 && fixed) {
         return Err(Errno::EPERM);
+    }
+    // An active swap area keeps its size.
+    if attr.size.is_some() {
+        crate::swap::check(inode)?;
     }
     Ok(())
 }
