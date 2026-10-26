@@ -87,6 +87,10 @@ pub mod cap {
     pub const SETPCAP: u32 = 8;
     /// Set the immutable and append-only flags of a file.
     pub const LINUX_IMMUTABLE: u32 = 9;
+    /// Lock the shared memory segments of other users.
+    pub const IPC_LOCK: u32 = 14;
+    /// Skip the permission checks of the System V IPC objects.
+    pub const IPC_OWNER: u32 = 15;
     /// Use `chroot`.
     pub const SYS_CHROOT: u32 = 18;
     /// Trace each process.
@@ -155,6 +159,22 @@ pub mod may {
     pub const READ: u32 = 4;
 }
 
+/// The owner, the creator and the mode of a System V IPC object, as `struct kern_ipc_perm` of
+/// Linux.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IpcOwner {
+    /// The user ID of the owner.
+    pub uid: u32,
+    /// The group ID of the owner.
+    pub gid: u32,
+    /// The user ID of the creator.
+    pub cuid: u32,
+    /// The group ID of the creator.
+    pub cgid: u32,
+    /// The permission bits.
+    pub mode: u32,
+}
+
 /// The credentials of a process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cred {
@@ -200,7 +220,7 @@ pub struct ExecFile {
     /// The group of the file.
     pub gid: u32,
     /// The set-user-ID and set-group-ID bits have no effect: the mount has `nosuid`, the process
-    /// has no_new_privs, or a tracer traces it.
+    /// has no_new_privs, or a tracer without `CAP_SYS_PTRACE` traces it.
     pub no_setid: bool,
 }
 
@@ -554,6 +574,37 @@ impl Cred {
             }
         }
         self.check(meta, if write { may::WRITE } else { may::READ }, acl)
+    }
+
+    /// Checks the access `flag` to a System V IPC object, as `ipcperms` of Linux. `flag` has the
+    /// permission bits of the access, for example 0o444 for a read. The owner bits apply if the
+    /// effective user ID is the owner or the creator, the group bits if the process is in the
+    /// group of the owner or of the creator, and the other bits to the others.
+    /// `CAP_IPC_OWNER` skips the check.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EACCES` if the access is not allowed.
+    pub fn ipc_permission(&self, ipc: &IpcOwner, flag: u32) -> Result<()> {
+        let requested = (flag >> 6) | (flag >> 3) | flag;
+        let granted = if self.euid == ipc.cuid || self.euid == ipc.uid {
+            ipc.mode >> 6
+        } else if self.in_group(ipc.cgid) || self.in_group(ipc.gid) {
+            ipc.mode >> 3
+        } else {
+            ipc.mode
+        };
+        if requested & !granted & 0o7 != 0 && !self.capable(cap::IPC_OWNER) {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
+    }
+
+    /// Tells if the process can change or remove a System V IPC object with `IPC_SET` or
+    /// `IPC_RMID`, as `ipcctl_obtain_check` of Linux: its effective user ID is the owner or the
+    /// creator, or it has `CAP_SYS_ADMIN`.
+    pub fn ipc_owns(&self, ipc: &IpcOwner) -> bool {
+        self.euid == ipc.cuid || self.euid == ipc.uid || self.capable(cap::SYS_ADMIN)
     }
 
     /// Tells if the process can send a signal to a process with the credentials `target`, as
@@ -1338,6 +1389,22 @@ mod tests {
         assert_eq!((c.fsuid, c.cap_effective), (1000, 0));
         let c = Cred::root().setresuid(0, 1000, 1000).unwrap().for_access();
         assert_eq!((c.fsuid, c.cap_effective), (0, cap::ALL));
+    }
+
+    #[test]
+    fn ipc_objects_check_the_owner_and_the_creator() {
+        let ipc = IpcOwner { uid: 1000, gid: 50, cuid: 2000, cgid: 60, mode: 0o640 };
+        let (owner, creator, other) = (user(1000), user(2000), user(3000));
+        assert_eq!(owner.ipc_permission(&ipc, 0o666), Ok(()));
+        assert_eq!(creator.ipc_permission(&ipc, 0o600), Ok(()));
+        assert_eq!(other.ipc_permission(&ipc, 0o444), Err(Errno::EACCES));
+        // A member of the group of the creator gets the group bits.
+        let member = other.setgroups_unchecked(&[60]);
+        assert_eq!(member.ipc_permission(&ipc, 0o444), Ok(()));
+        assert_eq!(member.ipc_permission(&ipc, 0o222), Err(Errno::EACCES));
+        assert_eq!(Cred::root().ipc_permission(&ipc, 0o777), Ok(()));
+        assert!(owner.ipc_owns(&ipc) && creator.ipc_owns(&ipc));
+        assert!(!member.ipc_owns(&ipc) && Cred::root().ipc_owns(&ipc));
     }
 
     #[test]

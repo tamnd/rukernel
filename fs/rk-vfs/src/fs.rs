@@ -375,7 +375,9 @@ impl FsContext {
         match kind {
             FileType::Regular | FileType::Directory => {
                 if kind == FileType::Regular && write && flags & o::O_TRUNC != 0 {
-                    at.inode().set_attr(&SetAttr { size: Some(0), ..SetAttr::default() })?;
+                    // The truncate clears the set-ID bits, as `handle_truncate` of Linux.
+                    let mode = if created { None } else { self.cred.write_kill(&meta) };
+                    at.inode().set_attr(&SetAttr { size: Some(0), mode, ..SetAttr::default() })?;
                     crate::mapped::changed(at.inode(), 0, u64::MAX);
                 }
                 Ok(File::open_inode(at, flags))
@@ -596,32 +598,18 @@ impl FsContext {
         }
         let to = self.child(&new);
         let to = if absent(&to) { None } else { Some(to?) };
-        if let Some(to) = &to {
-            if flags & AT_RENAME_NOREPLACE as u32 != 0 {
-                return Err(Errno::EEXIST);
-            }
-            if Arc::ptr_eq(from.inode(), to.inode()) {
-                return Ok(());
-            }
-            let to_dir = is_type(to.inode(), FileType::Directory);
-            if from_dir && !to_dir {
-                return Err(Errno::ENOTDIR);
-            }
-            if !from_dir && to_dir {
-                return Err(Errno::EISDIR);
-            }
-            if to.is_mount_root() || self.ns.mounted_on(to).is_some() {
-                return Err(Errno::EBUSY);
-            }
-        }
-        if from.is_mount_root() || self.ns.mounted_on(&from).is_some() {
-            return Err(Errno::EBUSY);
+        if to.is_some() && flags & AT_RENAME_NOREPLACE as u32 != 0 {
+            return Err(Errno::EEXIST);
         }
         if from_dir && new.dir.dentry.is_under(&from.dentry) {
             return Err(Errno::EINVAL);
         }
-        // The checks of `may_delete` and `may_create` of Linux. A directory that moves to a new
-        // parent must be writable, because its `..` changes.
+        if to.as_ref().is_some_and(|to| Arc::ptr_eq(from.inode(), to.inode())) {
+            return Ok(());
+        }
+        // The checks of `may_delete` and `may_create` of Linux, in their order: the permission
+        // checks come before the checks of the types. A directory that moves to a new parent
+        // must be writable, because its `..` changes.
         self.may_change(&old.dir)?;
         check_fixed(&**old.dir.inode())?;
         self.cred.check_sticky(&old.dir.inode().metadata(), &from.inode().metadata())?;
@@ -632,9 +620,21 @@ impl FsContext {
             check_fixed(&**new.dir.inode())?;
             self.cred.check_sticky(&new.dir.inode().metadata(), &to.inode().metadata())?;
             check_fixed(&**to.inode())?;
+            let to_dir = is_type(to.inode(), FileType::Directory);
+            if from_dir && !to_dir {
+                return Err(Errno::ENOTDIR);
+            }
+            if !from_dir && to_dir {
+                return Err(Errno::EISDIR);
+            }
         }
         if from_dir && !Arc::ptr_eq(old.dir.inode(), new.dir.inode()) {
             self.permission(&from, may::WRITE)?;
+        }
+        for at in [Some(&from), to.as_ref()].into_iter().flatten() {
+            if at.is_mount_root() || self.ns.mounted_on(at).is_some() {
+                return Err(Errno::EBUSY);
+            }
         }
         old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);

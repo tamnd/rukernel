@@ -994,7 +994,7 @@ pub(crate) fn readlinkat(cx: &Cx<'_>, dirfd: u64, path: u64, buf: u64, size: u64
 /// The kind of a change of attributes, for the checks that depend on the call.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Change {
-    /// `chmod` and `utimensat` with a time that is not now.
+    /// `chmod`, and `utimensat` with times that are not both now.
     Plain,
     /// `chown`, which clears the set-user-ID bit.
     Owner,
@@ -1115,8 +1115,12 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     let path = cx.read_path(path)?;
     let fs = cx.fs()?;
     let at = fs.resolve(fs.cwd(), &path, true)?;
-    if at.inode().metadata().is_dir() {
-        return Err(Errno::EISDIR);
+    // A directory gives `EISDIR` and another file that is not a regular file `EINVAL`, as
+    // `vfs_truncate` of Linux.
+    match at.inode().metadata().file_type() {
+        Some(rk_vfs::FileType::Regular) => {}
+        Some(rk_vfs::FileType::Directory) => return Err(Errno::EISDIR),
+        _ => return Err(Errno::EINVAL),
     }
     // The checks of `vfs_truncate` of Linux, in its order.
     at.mount.want_write()?;
@@ -1205,28 +1209,28 @@ const UTIME_OMIT: i64 = (1 << 30) - 2;
 
 pub(crate) fn utimensat(cx: &Cx<'_>, dirfd: u64, path: u64, times: u64, flags: u64) -> SysResult {
     let now = rk_vfs::inode::now();
-    let mut explicit_times = false;
-    let (atime, mtime) = if times == 0 {
-        (Some(now), Some(now))
+    let (atime, mtime, explicit_times) = if times == 0 {
+        (Some(now), Some(now), false)
     } else {
         let t: [rk_abi::native::types::KernelTimespec; 2] = cx.read_val(times)?;
-        let mut conv = |ts: rk_abi::native::types::KernelTimespec| match ts.tv_nsec {
+        // Linux does nothing and does not look at the path when it omits both times.
+        if t[0].tv_nsec == UTIME_OMIT && t[1].tv_nsec == UTIME_OMIT {
+            return Ok(0);
+        }
+        let conv = |ts: rk_abi::native::types::KernelTimespec| match ts.tv_nsec {
             UTIME_NOW => Ok(Some(now)),
             UTIME_OMIT => Ok(None),
             n if (0..1_000_000_000).contains(&n) => {
-                explicit_times = true;
                 Ok(Some(Timespec { sec: ts.tv_sec, nsec: n as u32 }))
             }
             _ => Err(Errno::EINVAL),
         };
-        (conv(t[0])?, conv(t[1])?)
+        // Times that are not both now need the owner, as `ATTR_TIMES_SET` of `vfs_utimes`.
+        let both_now = t[0].tv_nsec == UTIME_NOW && t[1].tv_nsec == UTIME_NOW;
+        (conv(t[0])?, conv(t[1])?, !both_now)
     };
     // Both times now is a touch, which the owner or a process that can write the file can do.
-    let change = if atime == Some(now) && mtime == Some(now) && !explicit_times {
-        Change::Touch
-    } else {
-        Change::Plain
-    };
+    let change = if explicit_times { Change::Plain } else { Change::Touch };
     let attr = SetAttr { atime, mtime, explicit_times, ..SetAttr::default() };
     if path == 0 {
         return set_attr_fd(cx, dirfd, &attr, change);

@@ -7,7 +7,8 @@
 //! An operation with `SEM_UNDO` records the opposite change for the process. When the process
 //! ends, the kernel does the recorded changes, as `exit_sem` of Linux.
 //!
-//! The calls do not check the permissions, as the calls of the shared memory.
+//! The calls check the permissions of a set as `ipcperms` of Linux, and only the owner, the
+//! creator or a process with `CAP_SYS_ADMIN` can change or remove a set.
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
@@ -16,6 +17,7 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::WaitQueue;
+use rk_vfs::cred::IpcOwner;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new set.
@@ -67,6 +69,19 @@ struct IpcPerm {
     pad2: u16,
     pad3: u32,
     unused: [u64; 2],
+}
+
+impl IpcPerm {
+    /// The owner, the creator and the mode, for the permission checks.
+    fn owner(&self) -> IpcOwner {
+        IpcOwner {
+            uid: self.uid,
+            gid: self.gid,
+            cuid: self.cuid,
+            cgid: self.cgid,
+            mode: u32::from(self.mode),
+        }
+    }
 }
 
 /// The state of a set, as `struct semid64_ds` of x86-64.
@@ -187,20 +202,22 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
     if !(0..=SEMMSL).contains(&nsems) {
         return Err(Errno::EINVAL);
     }
+    let c = cx.process().cred();
     let mut table = TABLE.lock();
     if key != IPC_PRIVATE {
         let found = table
             .sets
             .iter()
             .find(|(_, s)| s.perm.key == key)
-            .map(|(id, s)| (*id, s.members.len()));
-        if let Some((id, len)) = found {
+            .map(|(id, s)| (*id, s.members.len(), s.perm.owner()));
+        if let Some((id, len, owner)) = found {
             if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
                 return Err(Errno::EEXIST);
             }
             if nsems as usize > len {
                 return Err(Errno::EINVAL);
             }
+            c.ipc_permission(&owner, flags & 0o777)?;
             return Ok(id as u64);
         }
         if flags & IPC_CREAT == 0 {
@@ -217,7 +234,6 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
     let id = table.next;
     table.next = table.next.wrapping_add(1) & i32::MAX;
     // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
-    let c = cx.process().cred();
     let perm = IpcPerm {
         key,
         uid: c.euid,
@@ -318,12 +334,17 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
     let ops: Vec<SemBuf> =
         bytes.chunks_exact(size).filter_map(|c| SemBuf::read_from_bytes(c).ok()).collect();
     let pid = pid(cx);
+    // An operation that changes a value needs the write permission, and a wait for 0 needs the
+    // read permission.
+    let access = if ops.iter().any(|s| s.op != 0) { 0o222 } else { 0o444 };
+    let c = cx.process().cred();
     {
         let mut table = TABLE.lock();
         let set = table.get(id)?;
         if ops.iter().any(|s| usize::from(s.num) >= set.members.len()) {
             return Err(Errno::EFBIG);
         }
+        c.ipc_permission(&set.perm.owner(), access)?;
     }
     let thread = cx.thread;
     // The semaphore that the task waits for, so the end of the wait takes the count away.
@@ -384,6 +405,13 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
     let cmd = cmd as u32 & !IPC_64;
     let id = id as i32;
     let num = num as i32;
+    let c = cx.process().cred();
+    // `IPC_SET` reads the new values before it finds the set, as Linux.
+    let new: Option<SemidDs> = if cmd == IPC_SET { Some(cx.read_val(arg)?) } else { None };
+    // `SETVAL` checks the value first.
+    if cmd == SETVAL && !(0..=SEMVMX).contains(&(arg as i32)) {
+        return Err(Errno::ERANGE);
+    }
     let mut table = TABLE.lock();
     match cmd {
         IPC_INFO | SEM_INFO => {
@@ -409,17 +437,25 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             Ok(max as u64)
         }
         IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
-            let ds = table.get(id)?.ds();
+            let s = table.get(id)?;
+            if cmd != SEM_STAT_ANY {
+                c.ipc_permission(&s.perm.owner(), 0o444)?;
+            }
+            let ds = s.ds();
             drop(table);
             cx.write_val(arg, &ds)?;
             Ok(if cmd == IPC_STAT { 0 } else { id as u64 })
         }
         IPC_SET => {
-            table.get(id)?;
-            drop(table);
-            let ds: SemidDs = cx.read_val(arg)?;
-            let mut table = TABLE.lock();
+            let ds = new.ok_or(Errno::EINVAL)?;
             let s = table.get(id)?;
+            if !c.ipc_owns(&s.perm.owner()) {
+                return Err(Errno::EPERM);
+            }
+            // -1 is not a valid ID, as `ipc_update_perm` of Linux.
+            if ds.perm.uid == u32::MAX || ds.perm.gid == u32::MAX {
+                return Err(Errno::EINVAL);
+            }
             s.perm.uid = ds.perm.uid;
             s.perm.gid = ds.perm.gid;
             s.perm.mode = (s.perm.mode & !0o777) | (ds.perm.mode & 0o777);
@@ -427,7 +463,9 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             Ok(0)
         }
         IPC_RMID => {
-            table.get(id)?;
+            if !c.ipc_owns(&table.get(id)?.perm.owner()) {
+                return Err(Errno::EPERM);
+            }
             table.sets.remove(&id);
             table.undo.retain(|(_, set), _| *set != id);
             drop(table);
@@ -437,6 +475,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
         }
         GETVAL | GETPID | GETNCNT | GETZCNT => {
             let s = table.get(id)?;
+            c.ipc_permission(&s.perm.owner(), 0o444)?;
             let sem =
                 usize::try_from(num).ok().and_then(|n| s.members.get(n)).ok_or(Errno::EINVAL)?;
             Ok(match cmd {
@@ -447,7 +486,9 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             })
         }
         GETALL => {
-            let vals: Vec<u16> = table.get(id)?.members.iter().map(|s| s.val as u16).collect();
+            let s = table.get(id)?;
+            c.ipc_permission(&s.perm.owner(), 0o444)?;
+            let vals: Vec<u16> = s.members.iter().map(|s| s.val as u16).collect();
             drop(table);
             cx.write_bytes(arg, vals.as_bytes())?;
             Ok(0)
@@ -457,9 +498,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             let s = table.get(id)?;
             let n =
                 usize::try_from(num).ok().filter(|&n| n < s.members.len()).ok_or(Errno::EINVAL)?;
-            if !(0..=SEMVMX).contains(&val) {
-                return Err(Errno::ERANGE);
-            }
+            c.ipc_permission(&s.perm.owner(), 0o222)?;
             s.members[n].val = val;
             s.members[n].pid = pid(cx);
             s.ctime = now();
@@ -469,7 +508,9 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             Ok(0)
         }
         SETALL => {
-            let len = table.get(id)?.members.len();
+            let s = table.get(id)?;
+            c.ipc_permission(&s.perm.owner(), 0o222)?;
+            let len = s.members.len();
             drop(table);
             let bytes = cx.read_bytes(arg, len * 2)?;
             let vals: Vec<u16> =

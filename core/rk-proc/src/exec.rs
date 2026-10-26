@@ -319,7 +319,8 @@ pub fn exec(
     ctx.set_cred(process.cred());
     let path = args.path.clone();
     // A tracer cannot follow a program that gets more rights, so the bits have no effect then.
-    let no_setid = thread.no_new_privs() || thread.is_traced();
+    // A tracer with `CAP_SYS_PTRACE` can, as `cap_bprm_creds_from_file` of Linux.
+    let no_setid = thread.no_new_privs() || (thread.is_traced() && !thread.tracer_capable());
     let (space, image, at, argv, auxv, cred) =
         build(&ctx, args, random, &process.cred(), no_setid)?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
