@@ -395,24 +395,9 @@ impl Tx<'_> {
             }
             pos += n as u64;
         }
-        // The tree can need a new block when the data took the last free blocks. Then the write
-        // gives back its last runs until the tree fits, and it is a short write, as Linux keeps
-        // blocks for the tree before it gives the data blocks.
-        while changed {
-            match self.build_tree(ino, raw, &extents, tree.clone()) {
-                Err(Errno::ENOSPC) if !runs.is_empty() => {
-                    let (lblock, start, got) = runs.pop().ok_or(Errno::EIO)?;
-                    extent::remove(&mut extents, lblock, lblock + u64::from(got));
-                    self.free_blocks(start, u64::from(got))?;
-                    raw.set_blocks(raw.blocks().saturating_sub(u64::from(got) * (bs / 512)));
-                    pos = pos.min(lblock * bs);
-                    result = Err(Errno::ENOSPC);
-                }
-                r => {
-                    r?;
-                    changed = false;
-                }
-            }
+        if changed && let Some(lblock) = self.fit_tree(ino, raw, &mut extents, tree, &mut runs)? {
+            pos = pos.min(lblock * bs);
+            result = Err(Errno::ENOSPC);
         }
         if pos > raw.size() {
             raw.set_size(pos);
@@ -461,14 +446,44 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Builds the extent tree of the inode `ino` from `extents`. The tree can need a new block
+    /// when the data took the last free blocks. Then this gives back the last runs of `runs`, the
+    /// new runs of the operation as (first block, disk block, count), until the tree fits, as
+    /// Linux keeps blocks for the tree before it gives the data blocks. It gives the lowest first
+    /// block that it gave back, or `None` if all the runs stay.
+    fn fit_tree(
+        &mut self,
+        ino: u32,
+        raw: &mut RawInode,
+        extents: &mut Vec<Extent>,
+        tree: Vec<u64>,
+        runs: &mut Vec<(u64, u64, u32)>,
+    ) -> Result<Option<u64>> {
+        let sectors = self.fs.sb.block_size / 512;
+        let mut lowest = None;
+        loop {
+            match self.build_tree(ino, raw, extents, tree.clone()) {
+                Err(Errno::ENOSPC) if !runs.is_empty() => {
+                    let (lblock, start, got) = runs.pop().ok_or(Errno::EIO)?;
+                    extent::remove(extents, lblock, lblock + u64::from(got));
+                    self.free_blocks(start, u64::from(got))?;
+                    raw.set_blocks(raw.blocks().saturating_sub(u64::from(got) * sectors));
+                    lowest = Some(lowest.map_or(lblock, |l: u64| l.min(lblock)));
+                }
+                r => return r.map(|()| lowest),
+            }
+        }
+    }
+
     /// Gives blocks to the holes of the blocks `first..last` of the file, as extents that are
     /// not initialized, so they read as zeros. Gives `true` if the list changed. On an error the
-    /// list keeps the blocks that it got.
+    /// list keeps the blocks that it got. `runs` gets each new run.
     fn preallocate(
         &mut self,
         ino: u32,
         raw: &mut RawInode,
         extents: &mut Vec<Extent>,
+        runs: &mut Vec<(u64, u64, u32)>,
         first: u64,
         last: u64,
     ) -> (bool, Result<()>) {
@@ -493,6 +508,7 @@ impl Tx<'_> {
                 Err(e) => return (changed, Err(e)),
             };
             extent::put(extents, Extent { lblock: lblock as u32, len: got, start, init: false });
+            runs.push((lblock, start, got));
             raw.set_blocks(raw.blocks() + u64::from(got) * (bs / 512));
             changed = true;
             lblock += u64::from(got);
@@ -619,10 +635,11 @@ impl Tx<'_> {
         }
         if mode & PUNCH_HOLE == 0 {
             let (mut extents, tree) = fs.extents(raw)?;
-            let (changed, result) =
-                self.preallocate(ino, raw, &mut extents, offset / bs, end.div_ceil(bs));
-            if changed {
-                self.build_tree(ino, raw, &extents, tree)?;
+            let mut runs = Vec::new();
+            let (changed, mut result) =
+                self.preallocate(ino, raw, &mut extents, &mut runs, offset / bs, end.div_ceil(bs));
+            if changed && self.fit_tree(ino, raw, &mut extents, tree, &mut runs)?.is_some() {
+                result = Err(Errno::ENOSPC);
             }
             result?;
             if mode & KEEP_SIZE == 0 && end > raw.size() {
