@@ -10,6 +10,7 @@ generic/256	Passes since the fix of the ext4 full disk leak. Before, a full disk
 generic/260	Passes since #255.
 generic/288	Passes since #255.
 generic/389	Passes since #259.
+generic/402	Passes since #267.
 generic/425	Passes since #266.
 generic/491	Passes since #265.
 generic/492	Passes since #262.
