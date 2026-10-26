@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The VFS enforces the read only flag of each mount, as `mnt_want_write` of Linux. A create, a link, a remove, a rename, an open for a write, a truncate, a change of the attributes, of the extended attributes or of the inode flags on a read only mount gives `EROFS`. A read only bind mount does not change its source. A remount to read only gives `EBUSY` when a file on the mount is open for a write. tmpfs supports a `ro` mount and a remount to read only and back, as `shmem_reconfigure` of Linux. xfs stays read only.
 
+### Fixed
+
+- overlayfs keeps the nodes that are not in use, as the unused dentries of Linux. A lookup of the name gives the same node again, with the same inodes of the layers, until a removal through the mount or an eviction. A mount keeps 4096 unused nodes at most and evicts the oldest first. An unlink or a rmdir checks that the upper directory still has the upper file of the node, as `ovl_remove_upper` of Linux, and gives `ESTALE` after a change of the upper directory that is not through the mount. overlay/012 now passes.
+
 ## [0.3.21] - 2026-10-27
 
 ### Added

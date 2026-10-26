@@ -253,3 +253,63 @@ fn a_copy_up_keeps_the_inode_number_and_the_flags() {
     a.set_attr_flags(0).unwrap();
     assert_eq!(real.get_xattr(b"trusted.overlay.protattr").err(), Some(Errno::ENODATA));
 }
+
+/// Gives the node of the overlay inode `inode`.
+fn node(inode: &InodeRef) -> &Node {
+    let any: &dyn Any = &**inode;
+    any.downcast_ref::<Node>().unwrap()
+}
+
+#[test]
+fn a_removal_after_a_change_of_the_upper_file_gives_estale() {
+    let (lower, upper, root) = setup();
+    lower.create(b"t", FileType::Directory, 0o755, 0).unwrap();
+    root.rmdir(b"t").unwrap();
+    drop(root.create(b"t", FileType::Regular, 0o644, 0).unwrap());
+    // The unused node keeps the upper file, so the lower directory does not show again.
+    upper.unlink(b"t").unwrap();
+    assert!(!root.lookup(b"t").unwrap().metadata().is_dir());
+    assert_eq!(root.unlink(b"t"), Err(Errno::ESTALE));
+    // A new upper file is also a change.
+    lower.create(b"e", FileType::Directory, 0o755, 0).unwrap();
+    drop(root.lookup(b"e").unwrap());
+    upper.create(b"e", FileType::Directory, 0o755, 0).unwrap();
+    assert_eq!(root.rmdir(b"e"), Err(Errno::ESTALE));
+    // A removal through the mount stays correct.
+    root.unlink(b"a").unwrap();
+    assert_eq!(root.lookup(b"a").err(), Some(Errno::ENOENT));
+}
+
+#[test]
+fn an_unused_node_stays_until_an_eviction() {
+    let (_, _, root) = setup();
+    for i in 0..10u8 {
+        drop(file(&root, &[b'f', b'0' + i], b""));
+    }
+    let fs = &node(&root).fs;
+    assert_eq!(fs.cache.count.load(Ordering::Relaxed), 10);
+    let ino = root.lookup(b"f9").unwrap().metadata().ino;
+    assert_eq!(root.lookup(b"f9").unwrap().metadata().ino, ino);
+    fs.cache.shrink(3);
+    assert_eq!(fs.cache.count.load(Ordering::Relaxed), 3);
+    let kept: Vec<_> = node(&root).unused.lock().keys().cloned().collect();
+    assert_eq!(kept, [&b"f7"[..], b"f8", b"f9"]);
+    // An evicted name is found again in the layers.
+    assert_eq!(root.lookup(b"f0").unwrap().metadata().size, 0);
+}
+
+#[test]
+fn an_unused_directory_keeps_its_unused_children() {
+    let (_, upper, root) = setup();
+    let d = root.lookup(b"d").unwrap();
+    drop(file(&d, b"n", b"new"));
+    drop(d);
+    let n = Arc::downgrade(&upper.lookup(b"d").unwrap().lookup(b"n").unwrap());
+    upper.lookup(b"d").unwrap().unlink(b"n").unwrap();
+    // The unused node of `d/n` keeps the upper file.
+    assert!(n.strong_count() > 0);
+    assert_eq!(root.lookup(b"d").unwrap().unlink(b"n"), Err(Errno::ESTALE));
+    // The mount does not keep its unused nodes after the last use of its root.
+    drop(root);
+    assert_eq!(n.strong_count(), 0);
+}
