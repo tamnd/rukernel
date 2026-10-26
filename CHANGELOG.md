@@ -8,6 +8,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `name_to_handle_at` and `open_by_handle_at` on ext4 and tmpfs, as Linux. An ext4 handle has the inode number and the generation, as `FILEID_INO32_GEN`, so it stays valid after a rename and after a new mount. An open by handle needs `CAP_DAC_READ_SEARCH`, and a handle of a removed inode gives `ESTALE`. `statx` now gives the mount ID in `stx_mnt_id`. generic/426, generic/467 and generic/477 now pass.
 
+### Fixed
+
+- ext4/005 now passes. `FS_IOC_SETFLAGS` without `EXT4_EXTENTS_FL` already moves a file from an extent tree to a block map, as Linux, and a new unit test checks that a write to a hole at the start of the file after the move gets a new block and does not touch the data after it.
+- ext4 writes zeros over a removed directory entry, as `ext4_generic_delete_entry` of Linux, so the name of a removed file does not stay on the disk. A first record in a block keeps its record length. A new unit test also checks that the change of a directory to an index and the split of a leaf leave no old names, as `make_indexed_dir` and `do_split` of Linux. ext4/048 now passes.
+
 ## [0.3.19] - 2026-10-27
 
 ### Added

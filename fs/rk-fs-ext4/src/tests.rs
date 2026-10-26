@@ -463,6 +463,27 @@ fn the_extent_flag_moves_the_file() {
 }
 
 #[test]
+fn a_hole_at_the_start_stays_a_hole_in_the_block_map() {
+    // As ext4/005, a write to the hole after `chattr -e` gets a new block, and the data of
+    // the second block stays in its place.
+    let (fs, ram) = open_rw();
+    let free = ram.free().0;
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(BS as u64, &vec![b'b'; BS]).unwrap();
+    file.set_attr_flags(0).unwrap();
+    let first = file.fiemap(0, u64::MAX).unwrap();
+    assert_eq!((first.len(), first[0].logical), (1, BS as u64));
+    file.write_at(0, &vec![b'a'; BS]).unwrap();
+    assert_eq!(file.metadata().blocks, 2 * (BS as u64 / 512));
+    assert_eq!(ram.free().0, free - 2);
+    let back = again(&ram).root().unwrap().lookup(b"f").unwrap();
+    let data = read_all(&*back);
+    assert_eq!((data[0], data[BS - 1], data[BS], data[2 * BS - 1]), (b'a', b'a', b'b', b'b'));
+    let map = back.fiemap(0, u64::MAX).unwrap();
+    assert!(map.iter().any(|e| e.logical == BS as u64 && e.physical == first[0].physical));
+}
+
+#[test]
 fn minixdf_counts_all_the_blocks() {
     let (fs, _ram) = open_rw();
     assert!(fs.stat().blocks < 64);
@@ -549,6 +570,29 @@ fn a_file_handle_finds_the_inode_until_the_inode_is_removed() {
     assert!(root.inode_by_handle(ty, &fid).is_ok());
     drop(file);
     assert_eq!(root.inode_by_handle(ty, &fid).err(), Some(Errno::ESTALE));
+}
+
+#[test]
+fn a_removed_entry_leaves_no_name_on_the_disk() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    let dir = root.create(b"d", FileType::Directory, 0o755, 0).unwrap();
+    // Links with records of 72 bytes fill the first block, so the second block starts with an
+    // entry.
+    let keep = dir.create(b"keep", FileType::Regular, 0o644, 0).unwrap();
+    let name = |i: usize| format!("wipe-{i:0>58}").into_bytes();
+    for i in 0..20 {
+        dir.link(&name(i), &keep).unwrap();
+    }
+    for i in 0..20 {
+        dir.unlink(&name(i)).unwrap();
+    }
+    let disk = ram.0.lock().clone();
+    assert!(!disk.windows(5).any(|w| w == b"wipe-"));
+    assert!(disk.windows(4).any(|w| w == b"keep"));
+    drop(disk);
+    let back = again(&ram).root().unwrap().lookup(b"d").unwrap();
+    assert_eq!(names(&*back).len(), 3);
 }
 
 #[test]
@@ -1661,6 +1705,33 @@ mod htree {
             }
         }
         assert!(fs.root().unwrap().lookup(b"sub").unwrap().lookup(b"moved").is_ok());
+    }
+
+    #[test]
+    fn the_moved_entries_leave_no_old_names() {
+        // As ext4/048, the change to an index and each split of a leaf leave zeros where the
+        // moved entries were, so each name is on the disk only once.
+        let ram = Ram(Arc::new(SpinLock::new(htree_image(1024, false))));
+        let fs = mount(&ram);
+        let big = fs.root().unwrap().create(b"big", FileType::Directory, 0o755, 0).unwrap();
+        let ino = big.metadata().ino as u32;
+        let file = big.create(b"file", FileType::Regular, 0o644, 0).unwrap();
+        for i in 0..300 {
+            big.link(&short(i), &file).unwrap();
+        }
+        drop((file, big, fs));
+        let fs = again(&ram);
+        assert_eq!(check_index(&fs, ino).1.len(), 301);
+        let disk = ram.0.lock().clone();
+        let mut found: Vec<&[u8]> = disk
+            .windows(5)
+            .enumerate()
+            .filter(|(_, w)| *w == b"name-")
+            .map(|(at, _)| &disk[at..at + 45])
+            .collect();
+        found.sort_unstable();
+        let want: Vec<Vec<u8>> = (0..300).map(short).collect();
+        assert_eq!(found, want.iter().map(Vec::as_slice).collect::<Vec<_>>());
     }
 
     #[test]
