@@ -554,8 +554,10 @@ fn mounts_of(p: &Process) -> Result<Vec<u8>> {
         out.push(b' ');
         text::escape(&mut out, &path);
         out.extend_from_slice(
-            format!(" {} {} 0 0\n", src.fstype, text::mount_options(src.flags)).as_bytes(),
+            format!(" {} {}", src.fstype, text::mount_options(src.flags)).as_bytes(),
         );
+        out.extend_from_slice(&m.root().inode().fs_options());
+        out.extend_from_slice(b" 0 0\n");
     }
     Ok(out)
 }
@@ -589,6 +591,7 @@ fn mountinfo_of(p: &Process) -> Result<Vec<u8>> {
             fstype: src.fstype,
             source: &src.source,
             propagation: m.propagation(),
+            options: &m.root().inode().fs_options(),
         };
         text::mountinfo(&mut out, &info);
     }

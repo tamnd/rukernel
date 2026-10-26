@@ -101,7 +101,8 @@ fn a_new_directory_over_a_removed_one_is_opaque() {
     assert_eq!(root.lookup(b"d").err(), Some(Errno::ENOENT));
     let d = root.create(b"d", FileType::Directory, 0o755, 0).unwrap();
     assert!(names(&d).is_empty());
-    assert!(is_opaque(&upper.lookup(b"d").unwrap()));
+    let opaque = upper.lookup(b"d").unwrap().get_xattr(b"trusted.overlay.opaque");
+    assert_eq!(opaque.as_deref(), Ok(&b"y"[..]));
     assert_eq!(d.list_xattr(), Ok(Vec::new()));
 }
 
@@ -147,4 +148,108 @@ fn the_mount_options_are_checked() {
     assert_eq!(mount(&args(b"upperdir=/u,workdir=/w")).err(), Some(Errno::EINVAL));
     assert_eq!(mount(&args(b"lowerdir=/l,upperdir=/u")).err(), Some(Errno::EINVAL));
     assert_eq!(mount(&args(b"lowerdir=/l::/m")).err(), Some(Errno::EINVAL));
+}
+
+/// Gives a mount of `data`, where each path is a directory of a tmpfs, the same for each path.
+fn mount_on(dir: &InodeRef, data: &[u8]) -> Result<InodeRef> {
+    let lookup = |_: &[u8]| Ok(dir.clone());
+    mount(&MountArgs { data, dev: None, read_only: false, lookup: Some(&lookup) })
+}
+
+#[test]
+fn the_options_can_have_escaped_commas_and_colons() {
+    let opts = Options::parse(br"lowerdir=/a\:b:/c\,d,upperdir=/u x,workdir=/w,index=off").unwrap();
+    assert_eq!(opts.lowers, [&b"/a:b"[..], b"/c,d"]);
+    assert_eq!(opts.upper.as_deref(), Some(&b"/u x"[..]));
+    assert!(!opts.userxattr);
+    assert_eq!(opts.show(), br",lowerdir=/a\072b:/c\054d,upperdir=/u\040x,workdir=/w");
+    assert!(Options::parse(b"lowerdir=/l,userxattr").unwrap().userxattr);
+}
+
+#[test]
+fn the_mount_makes_a_clean_work_directory() {
+    let dir = rk_fs_tmpfs::new(0o755);
+    let old = dir.create(WORK, FileType::Directory, 0o755, 0).unwrap();
+    old.create(b"foo", FileType::Directory, 0o755, 0).unwrap();
+    let root = mount_on(&dir, b"lowerdir=/l,upperdir=/u,workdir=/w").unwrap();
+    let work = dir.lookup(WORK).unwrap();
+    assert!(names(&work).is_empty());
+    assert_eq!(work.metadata().mode & mode::PERM_MASK, 0);
+    assert!(!root.is_read_only());
+    assert_eq!(root.fs_options(), b",lowerdir=/l,upperdir=/u,workdir=/w");
+    root.set_read_only(true).unwrap();
+    assert!(root.is_read_only());
+    root.set_read_only(false).unwrap();
+}
+
+#[test]
+fn a_mount_without_a_work_directory_is_read_only() {
+    let dir = rk_fs_tmpfs::new(0o755);
+    dir.set_attr_flags(iflags::IMMUTABLE).unwrap();
+    let root = mount_on(&dir, b"lowerdir=/l,upperdir=/u,workdir=/w").unwrap();
+    assert!(root.is_read_only());
+    assert_eq!(root.set_read_only(false), Err(Errno::EROFS));
+    assert_eq!(root.create(b"n", FileType::Regular, 0o644, 0).err(), Some(Errno::EROFS));
+    assert!(mount_on(&dir, b"lowerdir=/l").unwrap().is_read_only());
+}
+
+#[test]
+fn the_upper_directory_cannot_be_on_overlayfs() {
+    let (_, _, root) = setup();
+    let data = b"lowerdir=/l,upperdir=/u,workdir=/w";
+    assert_eq!(mount_on(&root, data).err(), Some(Errno::EINVAL));
+    assert!(mount_on(&root, b"lowerdir=/l").is_ok());
+}
+
+#[test]
+fn the_attributes_of_overlayfs_are_escaped() {
+    let (_, upper, root) = setup();
+    let c = root.create(b"c", FileType::Regular, 0o644, 0).unwrap();
+    c.set_xattr(b"trusted.overlay.opaque", b"y", 0).unwrap();
+    let real = upper.lookup(b"c").unwrap();
+    assert_eq!(real.get_xattr(b"trusted.overlay.overlay.opaque").as_deref(), Ok(&b"y"[..]));
+    assert_eq!(real.get_xattr(b"trusted.overlay.opaque").err(), Some(Errno::ENODATA));
+    assert_eq!(c.get_xattr(b"trusted.overlay.opaque").as_deref(), Ok(&b"y"[..]));
+    real.set_xattr(b"trusted.overlay.origin", b"o", 0).unwrap();
+    assert_eq!(c.list_xattr(), Ok(vec![b"trusted.overlay.opaque".to_vec()]));
+}
+
+#[test]
+fn a_regular_file_can_be_a_whiteout() {
+    let top = rk_fs_tmpfs::new(0o755);
+    let bottom = rk_fs_tmpfs::new(0o755);
+    file(&bottom, b"hidden", b"x");
+    file(&bottom, b"regular", b"x");
+    let w = file(&top, b"hidden", b"");
+    w.set_xattr(b"user.overlay.whiteout", b"y", 0).unwrap();
+    top.set_xattr(b"user.overlay.opaque", b"x", 0).unwrap();
+    // The attributes have the prefix `trusted.overlay.` without the option `userxattr`.
+    let root = new(vec![top.clone(), bottom.clone()], None).unwrap();
+    assert_eq!(names(&root), [&b"hidden"[..], b"regular"]);
+    let lookup = |path: &[u8]| Ok(if path == b"/t" { top.clone() } else { bottom.clone() });
+    let data = b"lowerdir=/t:/b,userxattr";
+    let root = mount(&MountArgs { data, dev: None, read_only: false, lookup: Some(&lookup) });
+    let root = root.unwrap();
+    assert_eq!(names(&root), [&b"regular"[..]]);
+    assert_eq!(root.lookup(b"hidden").err(), Some(Errno::ENOENT));
+}
+
+#[test]
+fn a_copy_up_keeps_the_inode_number_and_the_flags() {
+    let (lower, upper, root) = setup();
+    let a = root.lookup(b"a").unwrap();
+    let ino = a.metadata().ino;
+    lower.lookup(b"a").unwrap().set_attr_flags(iflags::APPEND | iflags::NOATIME).unwrap();
+    a.set_xattr(b"user.x", b"1", 0).unwrap();
+    assert_eq!(a.metadata().ino, ino);
+    let real = upper.lookup(b"a").unwrap();
+    // The upper inode does not get the append-only flag, so the mount can change it.
+    assert_eq!(real.attr_flags(), Ok(iflags::NOATIME));
+    assert_eq!(real.get_xattr(b"trusted.overlay.protattr").as_deref(), Ok(&b"a"[..]));
+    assert_eq!(a.attr_flags(), Ok(iflags::APPEND | iflags::NOATIME));
+    a.set_attr_flags(iflags::IMMUTABLE).unwrap();
+    assert_eq!(real.attr_flags(), Ok(0));
+    assert_eq!(a.attr_flags(), Ok(iflags::IMMUTABLE));
+    a.set_attr_flags(0).unwrap();
+    assert_eq!(real.get_xattr(b"trusted.overlay.protattr").err(), Some(Errno::ENODATA));
 }
