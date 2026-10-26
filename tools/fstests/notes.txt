@@ -6,6 +6,11 @@ ext4/308	Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4.
 generic/018	Needs EXT4_IOC_MOVE_EXT, the online defragmentation of ext4.
 generic/128	Passes since #214. Before, /dev/null had the mode 0644 and a user could not write to it.
 generic/256	Passes since the fix of the ext4 full disk leak. Before, a full disk leaked the blocks of a write or of fallocate when the extent tree needed a new block.
+generic/260	Passes since #255.
+generic/288	Passes since #255.
+generic/537	Passes since #255.
 generic/569	A write to a mapped swap file must give SIGBUS. This needs a reverse map to write protect the pages.
+generic/597	Passes since #254.
+generic/598	Passes since #254.
 generic/633	Needs io_uring.
 generic/696	Passes since #212.

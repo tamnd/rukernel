@@ -496,11 +496,15 @@ impl Cred {
     }
 
     /// The new mode of a regular file with the attributes `meta` after a write or a truncate by
-    /// this process, as `file_remove_privs` of Linux, or `None` if the mode does not change. A
+    /// this process, as `file_remove_privs` of Linux, or `None` if the mode does not change. The
+    /// set-group-ID bit goes if the group can run the file or the process is not in the group. A
     /// process with `CAP_FSETID` keeps the bits.
     pub fn write_kill(&self, meta: &Metadata) -> Option<u32> {
         let perm = meta.mode & 0o7777;
-        let kill = kill_bits(perm);
+        let mut kill = kill_bits(perm);
+        if perm & mode::S_ISGID != 0 && !self.in_group(meta.gid) {
+            kill |= mode::S_ISGID;
+        }
         (kill != 0 && meta.file_type() == Some(FileType::Regular) && !self.capable(cap::FSETID))
             .then_some(perm & !kill)
     }
@@ -1212,6 +1216,8 @@ mod tests {
         assert_eq!(u.write_kill(&file), Some(0o755));
         assert_eq!(Cred::root().write_kill(&file), None);
         assert_eq!(u.write_kill(&meta(mode::S_IFREG, 0o2745, 1000, 1000)), None);
+        // A process that is not in the group of the file clears the bit too.
+        assert_eq!(u.write_kill(&meta(mode::S_IFREG, 0o6666, 0, 0)), Some(0o666));
         let mut attr = SetAttr::default();
         Cred::root().chown_kill(&file, &mut attr);
         assert_eq!(attr.mode, Some(0o755));
