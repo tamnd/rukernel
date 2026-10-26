@@ -41,6 +41,7 @@
 #include <sys/klog.h>
 #include <sys/file.h>
 #include <linux/fs.h>
+#include <linux/loop.h>
 #include <linux/aio_abi.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -2376,6 +2377,41 @@ static void test_sysfs(void)
 	rmdir("/mnt");
 }
 
+/* A loop device over a file of 4 KiB: its size, its data, its status and its device file. */
+static void test_loop(void)
+{
+	struct loop_info64 info;
+	char data[4096], buf[512], path[32];
+	unsigned long long size = 0;
+	int ctl, file, dev, n;
+
+	for (n = 0; n < (int)sizeof(data); n++)
+		data[n] = (char)(n % 251);
+	file = open("/loopfile", O_RDWR | O_CREAT | O_TRUNC, 0644);
+	check("make the file of the loop device", file >= 0 && write(file, data, sizeof(data)) == sizeof(data));
+	ctl = open("/dev/loop-control", O_RDWR);
+	n = ctl >= 0 ? ioctl(ctl, LOOP_CTL_GET_FREE) : -1;
+	check("LOOP_CTL_GET_FREE gives a device", n >= 0);
+	snprintf(path, sizeof(path), "/dev/loop%d", n);
+	dev = open(path, O_RDWR);
+	check("LOOP_SET_FD", dev >= 0 && ioctl(dev, LOOP_SET_FD, file) == 0);
+	check("the loop device has the size of the file",
+	      ioctl(dev, BLKGETSIZE64, &size) == 0 && size == sizeof(data));
+	check("the loop device reads the file",
+	      pread(dev, buf, sizeof(buf), 512) == sizeof(buf) && memcmp(buf, data + 512, sizeof(buf)) == 0);
+	check("LOOP_GET_STATUS64", ioctl(dev, LOOP_GET_STATUS64, &info) == 0 && (int)info.lo_number == n);
+	check("LOOP_SET_FD on a used device gives EBUSY", ioctl(dev, LOOP_SET_FD, file) < 0 && errno == EBUSY);
+	check("LOOP_CLR_FD", ioctl(dev, LOOP_CLR_FD, 0) == 0);
+	close(dev);
+	close(file);
+	unlink("/loopfile");
+	check("LOOP_CTL_ADD makes /dev/loop200",
+	      ioctl(ctl, LOOP_CTL_ADD, 200) == 200 && access("/dev/loop200", F_OK) == 0);
+	check("LOOP_CTL_REMOVE removes /dev/loop200",
+	      ioctl(ctl, LOOP_CTL_REMOVE, 200) == 0 && access("/dev/loop200", F_OK) < 0);
+	close(ctl);
+}
+
 /* The calls and the flags of the new mount API, from <linux/mount.h>. */
 #ifndef SYS_fsopen
 #define SYS_open_tree 428
@@ -3037,6 +3073,7 @@ int main(int argc, char **argv)
 	test_splice();
 	test_atime();
 	test_sysfs();
+	test_loop();
 	test_xattr();
 	test_fifo();
 	test_file_locks();

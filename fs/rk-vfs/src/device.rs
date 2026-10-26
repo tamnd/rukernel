@@ -14,7 +14,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_frame::sync::SpinLock;
+use rk_frame::sync::{Once, SpinLock};
 
 /// Makes a device number from the major and the minor number, in the encoding of Linux that
 /// `st_rdev` uses.
@@ -83,6 +83,75 @@ pub fn devices() -> Vec<DeviceInfo> {
     DEVICES.lock().clone()
 }
 
+/// A change in the list of devices, for the hook of [`set_node_hook`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeChange {
+    /// A driver added the device.
+    Add,
+    /// A driver removed the device.
+    Remove,
+}
+
+static NODE_HOOK: Once<fn(&DeviceInfo, NodeChange)> = Once::new();
+
+/// Sets the function that makes and removes the device files of the devices that a driver adds
+/// or removes after the boot, as devtmpfs of Linux does. Only the first call has an effect.
+pub fn set_node_hook(hook: fn(&DeviceInfo, NodeChange)) {
+    NODE_HOOK.call_once(|| hook);
+}
+
+/// Adds a device to the list after the boot, and makes its device file with the hook of
+/// [`set_node_hook`].
+pub fn add_device_node(info: DeviceInfo) {
+    add_device(info.clone());
+    if let Some(hook) = NODE_HOOK.get() {
+        hook(&info, NodeChange::Add);
+    }
+}
+
+/// Removes the device `rdev` of the type `block` from the list, and removes its device file
+/// with the hook of [`set_node_hook`].
+pub fn remove_device(block: bool, rdev: u64) {
+    let gone: Vec<DeviceInfo> = {
+        let mut devices = DEVICES.lock();
+        let gone = devices.iter().filter(|d| d.block == block && d.rdev == rdev).cloned().collect();
+        devices.retain(|d| d.block != block || d.rdev != rdev);
+        gone
+    };
+    if let Some(hook) = NODE_HOOK.get() {
+        for d in &gone {
+            hook(d, NodeChange::Remove);
+        }
+    }
+}
+
+/// The names of the major numbers, as `register_blkdev` and `register_chrdev` of Linux keep them.
+static MAJORS: SpinLock<Vec<(bool, u32, &'static str)>> = SpinLock::new(Vec::new());
+
+/// Gives the major number `major` the name `name` in `/proc/devices`. `block` tells if the number
+/// is for block devices.
+pub fn register_major(block: bool, major: u32, name: &'static str) {
+    let mut majors = MAJORS.lock();
+    if !majors.contains(&(block, major, name)) {
+        majors.push((block, major, name));
+    }
+}
+
+/// Gives the text of `/proc/devices`: the character majors, and then the block majors.
+pub fn proc_devices() -> String {
+    let mut majors = MAJORS.lock().clone();
+    majors.sort_by_key(|&(block, major, _)| (block, major));
+    let mut out = String::from("Character devices:\n");
+    for &(_, major, name) in majors.iter().filter(|m| !m.0) {
+        out.push_str(&alloc::format!("{major:3} {name}\n"));
+    }
+    out.push_str("\nBlock devices:\n");
+    for &(_, major, name) in majors.iter().filter(|m| m.0) {
+        out.push_str(&alloc::format!("{major:3} {name}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +179,21 @@ mod tests {
         let names: Vec<String> =
             devices().into_iter().filter(|d| d.class == "test").map(|d| d.name).collect();
         assert_eq!(names, ["disk", "two"]);
+        remove_device(true, makedev(250, 1));
+        let names: Vec<String> =
+            devices().into_iter().filter(|d| d.class == "test").map(|d| d.name).collect();
+        assert_eq!(names, ["two"]);
+    }
+
+    #[test]
+    fn proc_devices_has_the_character_majors_and_then_the_block_majors() {
+        register_major(true, 251, "testblk");
+        register_major(false, 250, "testchr");
+        register_major(false, 250, "testchr");
+        let text = proc_devices();
+        let (chars, blocks) = text.split_once("\nBlock devices:\n").unwrap();
+        assert!(chars.starts_with("Character devices:\n"));
+        assert_eq!(chars.matches("250 testchr\n").count(), 1);
+        assert!(blocks.contains("251 testblk\n"));
     }
 }

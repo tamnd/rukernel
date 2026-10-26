@@ -79,7 +79,7 @@ fn text_file(path: &[u8], f: fn() -> Vec<u8>) -> InodeRef {
 }
 
 fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
-    let files: [(&[u8], fn() -> Vec<u8>); 9] = [
+    let files: [(&[u8], fn() -> Vec<u8>); 10] = [
         (b"meminfo", || {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
@@ -104,6 +104,7 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
             format!("Linux version {} (rukernel) {}\n", i.release, i.version).into_bytes()
         }),
         (b"cmdline", || format!("{}\n", info().cmdline).into_bytes()),
+        (b"devices", || rk_vfs::device::proc_devices().into_bytes()),
         (b"filesystems", || {
             let mut out = String::new();
             for t in rk_vfs::fstype::types() {
