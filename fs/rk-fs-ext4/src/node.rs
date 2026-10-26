@@ -267,8 +267,13 @@ impl Tx<'_> {
         {
             node.no_expand.store(true, Ordering::Relaxed);
         }
-        if raw.links() == 0 && node.raw.lock().links() != 0 {
+        let links = node.raw.lock().links();
+        if raw.links() == 0 && links != 0 {
             self.add_orphan(node.ino, raw)?;
+        } else if raw.links() != 0 && links == 0 {
+            // The first link of a file of `O_TMPFILE`, as `ext4_link` of Linux.
+            self.remove_orphan(node.ino, raw)?;
+            layout::put32(&mut raw.0, 0x14, 0);
         }
         self.fs.write_inode(node.ino, raw)?;
         *node.raw.lock() = raw.clone();
@@ -1219,6 +1224,20 @@ impl Inode for Node {
         Ok(self.attach(&mut tx, name, ino, raw)?)
     }
 
+    fn tmpfile(&self, perm: u32) -> Result<InodeRef> {
+        let mut tx = self.fs.tx()?;
+        if !self.is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        let (ino, raw) = tx.new_inode(self.ino, FileType::Regular, perm)?;
+        let node = self.fs.new_node(ino, raw)?;
+        // The file goes on the list of orphans, so a crash frees it, as `ext4_tmpfile`.
+        let mut raw = node.raw();
+        raw.set_links(0);
+        tx.save(&node, &mut raw)?;
+        Ok(node)
+    }
+
     fn symlink(&self, name: &[u8], target: &[u8]) -> Result<InodeRef> {
         if target.is_empty() {
             return Err(Errno::ENOENT);
@@ -1257,11 +1276,8 @@ impl Inode for Node {
         if target.is_dir() {
             return Err(Errno::EPERM);
         }
-        let links = target.raw().links();
-        if links == 0 {
-            return Err(Errno::ENOENT);
-        }
-        if links >= LINK_MAX {
+        // The VFS gives `ENOENT` for a file without links that is not from `O_TMPFILE`.
+        if target.raw().links() >= LINK_MAX {
             return Err(Errno::EMLINK);
         }
         tx.add_entry(self, name, target.ino, target.kind())?;

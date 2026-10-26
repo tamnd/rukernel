@@ -2154,6 +2154,37 @@ static void on_xfsz(int sig)
 	got_xfsz = sig;
 }
 
+static void test_tmpfile(void)
+{
+	char path[64], buf[8] = { 0 };
+	struct stat st;
+	int fd, ex;
+
+	check("O_TMPFILE without write access gives EINVAL",
+	      open("/tmp", O_TMPFILE | O_RDONLY, 0600) == -1 && errno == EINVAL);
+	check("O_TMPFILE on a file gives ENOTDIR",
+	      open("/proc/self/exe", O_TMPFILE | O_RDWR, 0600) == -1 && errno == ENOTDIR);
+	fd = open("/tmp", O_TMPFILE | O_RDWR, 0600);
+	check("O_TMPFILE makes a file without a link",
+	      fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0);
+	check("a file of O_TMPFILE keeps its data", write(fd, "tmp", 3) == 3);
+	check("linkat with AT_EMPTY_PATH gives the file a name",
+	      linkat(fd, "", AT_FDCWD, "/tmp/tmpf", AT_EMPTY_PATH) == 0 &&
+	      fstat(fd, &st) == 0 && st.st_nlink == 1);
+	close(fd);
+	fd = open("/tmp/tmpf", O_RDONLY);
+	check("the linked file has the data", fd >= 0 && read(fd, buf, sizeof(buf)) == 3 &&
+	      memcmp(buf, "tmp", 3) == 0);
+	close(fd);
+	unlink("/tmp/tmpf");
+	ex = open("/tmp", O_TMPFILE | O_EXCL | O_WRONLY, 0600);
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", ex);
+	check("a file of O_TMPFILE with O_EXCL gets no link",
+	      ex >= 0 && linkat(AT_FDCWD, path, AT_FDCWD, "/tmp/tmpx", AT_SYMLINK_FOLLOW) == -1 &&
+	      errno == ENOENT);
+	close(ex);
+}
+
 static void test_fsize(void)
 {
 	struct rlimit rl = { 8192, RLIM_INFINITY };
@@ -3011,6 +3042,7 @@ int main(int argc, char **argv)
 	test_file_locks();
 	test_fallocate();
 	test_fsize();
+	test_tmpfile();
 	test_iflags();
 	test_syslog();
 	test_membarrier();

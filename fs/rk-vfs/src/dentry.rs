@@ -13,7 +13,7 @@ use crate::inode::{InodeRef, Result};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::mount::{
     MOUNT_ATTR__ATIME, MOUNT_ATTR_IDMAP, MOUNT_ATTR_NOATIME, MOUNT_ATTR_NODEV,
@@ -31,6 +31,9 @@ pub struct Dentry {
     inode: InodeRef,
     /// The children that a lookup found. A child that no one uses goes away.
     children: SpinLock<BTreeMap<Vec<u8>, Weak<Dentry>>>,
+    /// The inode has no link, and `linkat` can give it one, as `I_LINKABLE` of Linux. It is
+    /// for a file of `O_TMPFILE` without `O_EXCL`.
+    linkable: AtomicBool,
 }
 
 impl core::fmt::Debug for Dentry {
@@ -50,6 +53,7 @@ impl Dentry {
             parent: SpinLock::new(None),
             inode,
             children: SpinLock::new(BTreeMap::new()),
+            linkable: AtomicBool::new(false),
         })
     }
 
@@ -84,11 +88,36 @@ impl Dentry {
             parent: SpinLock::new(Some(self.clone())),
             inode,
             children: SpinLock::new(BTreeMap::new()),
+            linkable: AtomicBool::new(false),
         });
         let mut children = self.children.lock();
         children.retain(|_, c| c.strong_count() > 0);
         children.insert(name.to_vec(), Arc::downgrade(&child));
         child
+    }
+
+    /// Makes the dentry of the new inode `inode` that has no name in this directory, for
+    /// `O_TMPFILE`. The name is `#` and the inode number, as `d_tmpfile` of Linux. The dentry is
+    /// not in the cache, so no lookup finds it.
+    pub fn tmp_child(self: &Arc<Self>, inode: InodeRef, linkable: bool) -> Arc<Dentry> {
+        let name = alloc::format!("#{}", inode.metadata().ino);
+        Arc::new(Self {
+            name: SpinLock::new(name.into_bytes()),
+            parent: SpinLock::new(Some(self.clone())),
+            inode,
+            children: SpinLock::new(BTreeMap::new()),
+            linkable: AtomicBool::new(linkable),
+        })
+    }
+
+    /// Tells if `linkat` can give a link to the inode, which has no link.
+    pub fn linkable(&self) -> bool {
+        self.linkable.load(Ordering::Relaxed)
+    }
+
+    /// Ends the right of `linkat` to give a link to the inode, after the first link.
+    pub(crate) fn clear_linkable(&self) {
+        self.linkable.store(false, Ordering::Relaxed);
     }
 
     /// Removes the child `name` from the cache, after an unlink or a rmdir.

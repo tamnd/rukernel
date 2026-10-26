@@ -192,7 +192,7 @@ impl FsContext {
     /// `openat`. `perm` is the mode of a new file.
     pub fn open(&self, start: &Location, path: &[u8], flags: u32, perm: u32) -> Result<Arc<File>> {
         if flags & o::O_TMPFILE == o::O_TMPFILE {
-            return Err(Errno::EOPNOTSUPP);
+            return self.open_tmpfile(start, path, flags, perm);
         }
         let follow = flags & o::O_NOFOLLOW == 0;
         let mut created = false;
@@ -250,6 +250,40 @@ impl FsContext {
         let regular = protected::get(&protected::REGULAR);
         let fifos = protected::get(&protected::FIFOS);
         self.cred.may_create_in_sticky(regular, fifos, &dir.inode().metadata(), &meta)
+    }
+
+    /// `openat` with `O_TMPFILE`: a new regular file without a name in the directory `path`, as
+    /// `do_tmpfile` and `vfs_tmpfile` of Linux. Without `O_EXCL`, `linkat` can give the file a
+    /// name.
+    fn open_tmpfile(
+        &self,
+        start: &Location,
+        path: &[u8],
+        flags: u32,
+        perm: u32,
+    ) -> Result<Arc<File>> {
+        // `O_TMPFILE` has `O_DIRECTORY`, and it does not go with `O_CREAT`.
+        let write = matches!(flags & o::O_ACCMODE, o::O_WRONLY | o::O_RDWR);
+        if !write || flags & o::O_CREAT != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let dir = self.resolve(start, path, true)?;
+        self.check_dir(&dir)?;
+        self.may_change(&dir)?;
+        check_immutable(&**dir.inode())?;
+        let parent = dir.inode();
+        let perm =
+            self.cred.strip_sgid(&parent.metadata(), FileType::Regular, perm & mode::PERM_MASK);
+        let (perm, acls) = acl::create(&**parent, FileType::Regular, perm, self.umask);
+        let inode = parent.tmpfile(perm)?;
+        self.init_owner(&dir, &inode)?;
+        if let Some(acls) = acls {
+            acls.apply(&*inode)?;
+        }
+        let dentry = dir.dentry.tmp_child(inode, flags & o::O_EXCL == 0);
+        let at = Location { mount: dir.mount.clone(), dentry };
+        let flags = flags & !(o::O_TMPFILE | o::O_EXCL);
+        self.open_inode(at, flags, true)
     }
 
     /// Opens the inode at `at`, after the walk.
@@ -406,8 +440,13 @@ impl FsContext {
 
     /// `linkat`. `old` is the location of the file, after the walk of the old path.
     pub fn link(&self, old: &Location, start: &Location, path: &[u8]) -> Result<()> {
-        if old.inode().metadata().is_dir() {
+        let meta = old.inode().metadata();
+        if meta.is_dir() {
             return Err(Errno::EPERM);
+        }
+        // A file without a link gets one only from `O_TMPFILE`, as `vfs_link` of Linux.
+        if meta.nlink == 0 && !old.dentry.linkable() {
+            return Err(Errno::ENOENT);
         }
         let parent = self.parent(start, path)?;
         if parent.is_dot() || self.exists(&parent)? {
@@ -421,6 +460,7 @@ impl FsContext {
         check_immutable(&**parent.dir.inode())?;
         check_fixed(&**old.inode())?;
         parent.dir.inode().link(&parent.name, old.inode())?;
+        old.dentry.clear_linkable();
         parent.dir.dentry.add_child(&parent.name, old.inode().clone());
         Ok(())
     }
