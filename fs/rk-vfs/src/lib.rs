@@ -34,7 +34,7 @@ pub mod wait;
 pub mod xattr;
 
 pub use dentry::{
-    Dentry, Location, Mount, MountNamespace, MountSource, Propagation, PropagationType,
+    Dentry, Location, Mount, MountAttr, MountNamespace, MountSource, Propagation, PropagationType,
 };
 pub use fdtable::{FdEntry, FdTable};
 pub use file::{File, FileOps, OpenFlags, UserMemory, Whence};

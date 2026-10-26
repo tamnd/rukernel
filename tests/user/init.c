@@ -2358,13 +2358,28 @@ static void test_sysfs(void)
 #define RK_FSCONFIG_SET_STRING 1
 #define RK_FSCONFIG_CMD_CREATE 6
 #define RK_FSCONFIG_CMD_RECONFIGURE 7
+#ifndef SYS_mount_setattr
+#define SYS_mount_setattr 442
+#endif
+#define RK_MOUNT_ATTR_RDONLY 1
+#define RK_MOUNT_ATTR_NOSUID 2
 #define RK_MOUNT_ATTR_NODEV 4
+#define RK_MOUNT_ATTR_NOATIME 0x10
+#define RK_ST_RDONLY 1
+#define RK_ST_NOSUID 2
 #define RK_MOVE_MOUNT_F_EMPTY_PATH 4
 #define RK_OPEN_TREE_CLONE 1
+
+/* The struct mount_attr of mount_setattr. */
+struct rk_mount_attr {
+	unsigned long long attr_set, attr_clr, propagation, userns_fd;
+};
 
 static void test_mount_api(void)
 {
 	int fd, mfd, tfd, pfd, f;
+	struct rk_mount_attr attr = { RK_MOUNT_ATTR_RDONLY | RK_MOUNT_ATTR_NOSUID, 0, 0, 0 };
+	struct statfs sfs;
 
 	mkdir("/mnt", 0755);
 	mkdir("/mnt2", 0755);
@@ -2415,6 +2430,19 @@ static void test_mount_api(void)
 	check("fsconfig FSCONFIG_CMD_RECONFIGURE of fspick",
 	      syscall(SYS_fsconfig, pfd, RK_FSCONFIG_SET_FLAG, "ro", NULL, 0) == 0 &&
 		      syscall(SYS_fsconfig, pfd, RK_FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) == 0);
+	check("mount_setattr sets MOUNT_ATTR_RDONLY and MOUNT_ATTR_NOSUID",
+	      syscall(SYS_mount_setattr, AT_FDCWD, "/mnt2", 0, &attr, sizeof(attr)) == 0 && statfs("/mnt2", &sfs) == 0 &&
+		      (sfs.f_flags & RK_ST_RDONLY) && (sfs.f_flags & RK_ST_NOSUID));
+	attr.attr_set = 0;
+	attr.attr_clr = RK_MOUNT_ATTR_RDONLY;
+	check("mount_setattr clears MOUNT_ATTR_RDONLY",
+	      syscall(SYS_mount_setattr, AT_FDCWD, "/mnt2", 0, &attr, sizeof(attr)) == 0 && statfs("/mnt2", &sfs) == 0 &&
+		      !(sfs.f_flags & RK_ST_RDONLY) && (sfs.f_flags & RK_ST_NOSUID));
+	attr.attr_set = RK_MOUNT_ATTR_NOATIME;
+	attr.attr_clr = 0;
+	errno = 0;
+	check("mount_setattr of an atime value without MOUNT_ATTR__ATIME gives EINVAL",
+	      syscall(SYS_mount_setattr, AT_FDCWD, "/mnt2", 0, &attr, sizeof(attr)) == -1 && errno == EINVAL);
 	check("umount the clone", umount("/mnt2") == 0);
 	check("umount the mount of fsmount", umount("/mnt") == 0 && access("/mnt/f", F_OK) == -1);
 	close(pfd);

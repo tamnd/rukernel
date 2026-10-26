@@ -244,6 +244,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::FSPICK => mount::fspick(cx, a[0], a[1], a[2]),
         nr::MOVE_MOUNT => mount::move_mount(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::OPEN_TREE => mount::open_tree(cx, a[0], a[1], a[2]),
+        nr::MOUNT_SETATTR => mount::mount_setattr(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::FSTATFS => fs::fstatfs(cx, a[0], a[1]),
         nr::PRCTL => process::prctl(cx, a[0], [a[1], a[2], a[3], a[4]]),
         nr::SECCOMP => seccomp::seccomp(cx, a[0], a[1], a[2]),

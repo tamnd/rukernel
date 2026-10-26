@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The sysctls `fs.protected_symlinks`, `fs.protected_hardlinks`, `fs.protected_regular` and `fs.protected_fifos`, as Linux. With them, the path walk does not follow a symbolic link of another user in a sticky directory that all can write, `link` gives `EPERM` for a file that the process does not own and cannot read and write, and `open` with `O_CREAT` gives `EACCES` for a file or a FIFO of another user in a sticky directory. Each one is 0 by default, as Linux. generic/597 and generic/598 now pass.
+- `mount_setattr`, as Linux. The call sets and clears the flags of a mount (`MOUNT_ATTR_RDONLY`, `MOUNT_ATTR_NOSUID`, `MOUNT_ATTR_NODEV`, `MOUNT_ATTR_NOEXEC`, the atime value, `MOUNT_ATTR_NODIRATIME` and `MOUNT_ATTR_NOSYMFOLLOW`) and changes its propagation. With `AT_RECURSIVE`, it also changes the mounts under the mount. The mount can be a detached mount of `fsmount` or `open_tree`. rukernel has no user namespaces yet, so `MOUNT_ATTR_IDMAP` gives `EINVAL` and the kernel cannot make an idmapped mount. generic/644, generic/689, generic/698 and generic/699 now find the call, but they do not run because they need idmapped mounts.
 
 ## [0.3.17] - 2026-10-26
 

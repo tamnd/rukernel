@@ -6,8 +6,8 @@ use rk_abi::native::open as o;
 use rk_vfs::cpio;
 use rk_vfs::fstype::MountArgs;
 use rk_vfs::{
-    FdTable, File, FsContext, Location, MountNamespace, MountSource, Propagation, PropagationType,
-    Whence,
+    FdTable, File, FsContext, Location, MountAttr, MountNamespace, MountSource, Propagation,
+    PropagationType, Whence,
 };
 
 fn setup() -> (FsContext, Location) {
@@ -338,6 +338,75 @@ fn mounts_propagate_to_peers_and_slaves() {
     assert_eq!(ns.set_propagation(&d, PropagationType::Shared, true), Ok(()));
     let f = fs.resolve(&root, b"/a/d/z", true).unwrap();
     assert_eq!(ns.set_propagation(&f, PropagationType::Shared, false), Err(Errno::EINVAL));
+}
+
+#[test]
+fn mount_setattr_changes_the_flags_and_the_propagation() {
+    use rk_abi::native::mount::{MS_NOEXEC, MS_NOSUID, MS_RDONLY};
+    let (fs, root) = setup();
+    let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    fs.mount(new(0o755), &root, b"/a", tmp.clone()).unwrap();
+    fs.mkdir(&root, b"/a/d", 0o755).unwrap();
+    fs.mount(new(0o755), &root, b"/a/d", tmp.clone()).unwrap();
+    let ns = fs.namespace().clone();
+    let a = fs.resolve(&root, b"/a", true).unwrap();
+    let d = fs.resolve(&root, b"/a/d", true).unwrap();
+    let (ro, nosuid, noexec) = (u64::from(MS_RDONLY), u64::from(MS_NOSUID), u64::from(MS_NOEXEC));
+
+    // Without the recursive flag, only the mount of the path changes.
+    let attr = MountAttr { set: ro | nosuid, ..MountAttr::default() };
+    ns.set_attr(&a, attr, false).unwrap();
+    assert_eq!((a.mount.flags(), d.mount.flags()), (ro | nosuid, 0));
+
+    // The clear applies before the set, and the recursive flag changes the mounts below.
+    let attr = MountAttr { clear: ro, set: noexec, propagation: Some(PropagationType::Shared) };
+    ns.set_attr(&a, attr, true).unwrap();
+    assert_eq!((a.mount.flags(), d.mount.flags()), (nosuid | noexec, noexec));
+    assert_ne!(a.mount.propagation().group, 0);
+    assert_ne!(d.mount.propagation().group, 0);
+
+    // The path must be the root of a mount of the name space, or of a detached mount.
+    fs.mkdir(&root, b"/a/e", 0o755).unwrap();
+    let e = fs.resolve(&root, b"/a/e", true).unwrap();
+    assert_eq!(ns.set_attr(&e, attr, false), Err(Errno::EINVAL));
+    let detached = MountNamespace::clone_tree(&d).unwrap();
+    assert!(detached.is_detached());
+    let at = Location { dentry: detached.root().clone(), mount: detached.clone() };
+    ns.set_attr(&at, MountAttr { set: ro, ..MountAttr::default() }, true).unwrap();
+    assert_eq!(detached.flags(), noexec | ro);
+    let mut copy = fs.clone();
+    copy.unshare_namespace();
+    assert!(!d.mount.is_detached());
+    assert_eq!(copy.namespace().set_attr(&d, attr, false), Err(Errno::EINVAL));
+}
+
+#[test]
+fn mount_attr_follows_build_mount_kattr() {
+    use rk_abi::native::mount::*;
+    let ms = u64::from;
+    let ro = ms(MOUNT_ATTR_RDONLY);
+    let atime = ms(MOUNT_ATTR__ATIME);
+    let attr = MountAttr::from_user(ro, ms(MOUNT_ATTR_NOSUID), ms(MS_SLAVE)).unwrap();
+    assert_eq!((attr.set, attr.clear), (ms(MS_RDONLY), ms(MS_NOSUID)));
+    assert_eq!(attr.propagation, Some(PropagationType::Slave));
+
+    // An atime value needs all of `MOUNT_ATTR__ATIME` in the clear flags.
+    let noatime = ms(MOUNT_ATTR_NOATIME);
+    assert_eq!(MountAttr::from_user(noatime, 0, 0), Err(Errno::EINVAL));
+    assert_eq!(MountAttr::from_user(noatime, noatime, 0), Err(Errno::EINVAL));
+    let attr = MountAttr::from_user(noatime, atime, 0).unwrap();
+    assert_eq!(attr.set, ms(MS_NOATIME));
+    assert_eq!(attr.clear, ms(MS_RELATIME | MS_NOATIME | MS_STRICTATIME));
+    assert_eq!(MountAttr::from_user(0, atime, 0).unwrap().set, ms(MS_RELATIME));
+    assert_eq!(MountAttr::from_user(atime, atime, 0), Err(Errno::EINVAL));
+
+    // Unknown flags and more than one propagation type give `EINVAL`.
+    assert_eq!(MountAttr::from_user(1 << 40, 0, 0), Err(Errno::EINVAL));
+    assert_eq!(MountAttr::from_user(0, 0, ms(MS_SHARED | MS_PRIVATE)), Err(Errno::EINVAL));
+    assert_eq!(MountAttr::from_user(0, 0, ms(MS_REC)), Err(Errno::EINVAL));
+    let idmap = ms(MOUNT_ATTR_IDMAP);
+    assert_eq!(MountAttr::from_user(idmap, 0, 0), Ok(MountAttr::default()));
 }
 
 #[test]
