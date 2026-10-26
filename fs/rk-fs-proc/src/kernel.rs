@@ -10,6 +10,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 use rk_mm::{Backing, VmaKind};
@@ -190,6 +191,10 @@ fn stat() -> Vec<u8> {
 /// The files of `/proc/sys` and their first values. A write keeps the new text, but the kernel
 /// does not use it yet.
 const SYSCTLS: &[(&str, &str)] = &[
+    ("fs/protected_fifos", ""),
+    ("fs/protected_hardlinks", ""),
+    ("fs/protected_regular", ""),
+    ("fs/protected_symlinks", ""),
     ("kernel/hostname", "(none)"),
     ("kernel/ngroups_max", "65536"),
     ("kernel/osrelease", ""),
@@ -216,7 +221,22 @@ const SYSCTLS: &[(&str, &str)] = &[
 
 static SYSCTL_VALUES: SpinLock<Vec<(&'static str, Vec<u8>)>> = SpinLock::new(Vec::new());
 
+/// The `fs.protected_*` sysctl of `name`, which the VFS reads, and its largest value.
+fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
+    use rk_vfs::cred::protected::{FIFOS, HARDLINKS, REGULAR, SYMLINKS};
+    match name {
+        "fs/protected_fifos" => Some((&FIFOS, 2)),
+        "fs/protected_hardlinks" => Some((&HARDLINKS, 1)),
+        "fs/protected_regular" => Some((&REGULAR, 2)),
+        "fs/protected_symlinks" => Some((&SYMLINKS, 1)),
+        _ => None,
+    }
+}
+
 fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
+    if let Some((v, _)) = protected(name) {
+        return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
+    }
     if let Some((_, v)) = SYSCTL_VALUES.lock().iter().find(|(n, _)| *n == name) {
         return v.clone();
     }
@@ -229,11 +249,21 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     format!("{value}\n").into_bytes()
 }
 
-fn sysctl_write(name: &'static str, data: &[u8]) {
+fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
+    // A value out of the range gives `EINVAL`, as `proc_dointvec_minmax` of Linux.
+    if let Some((v, max)) = protected(name) {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let n: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+        if n > max {
+            return Err(Errno::EINVAL);
+        }
+        v.store(n, Ordering::Relaxed);
+        return Ok(());
+    }
     // A write to `drop_caches` removes the clean pages of the block devices. The value stays 0.
     if name == "vm/drop_caches" {
         rk_vfs::blockdev::drop_clean_all();
-        return;
+        return Ok(());
     }
     let mut value = data.to_vec();
     while value.last().is_some_and(u8::is_ascii_whitespace) {
@@ -243,6 +273,7 @@ fn sysctl_write(name: &'static str, data: &[u8]) {
     let mut values = SYSCTL_VALUES.lock();
     values.retain(|(n, _)| *n != name);
     values.push((name, value));
+    Ok(())
 }
 
 fn sys_dir() -> InodeRef {
@@ -285,10 +316,7 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
                         let node = rw_file(
                             fpath.as_bytes(),
                             move || Ok(sysctl_read(name, default)),
-                            move |data| {
-                                sysctl_write(name, data);
-                                Ok(())
-                            },
+                            move |data| sysctl_write(name, data),
                         );
                         out.push((rest.as_bytes().to_vec(), node));
                     }

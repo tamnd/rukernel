@@ -4,7 +4,7 @@
 //! relative path. It goes through each component, goes down into a mount and up out of a mount,
 //! and follows symbolic links. It stops at the root of the process for `..`, so a `chroot` holds.
 
-use crate::cred::{Cred, may};
+use crate::cred::{Cred, may, protected};
 use crate::dentry::{Location, MountNamespace};
 use crate::inode::{FileType, Result};
 use alloc::vec::Vec;
@@ -99,7 +99,7 @@ impl<'a> Walk<'a> {
                             }
                             return Ok(jump);
                         }
-                        let target = self.link_target(&next)?;
+                        let target = self.link_target(&dir, &next)?;
                         parent = self.resolve_parent(&dir, &target)?;
                         follow = true;
                         continue;
@@ -160,7 +160,7 @@ impl<'a> Walk<'a> {
                 if let Some(jump) = self.jump(&next)? {
                     return Ok(jump);
                 }
-                let target = self.link_target(&next)?;
+                let target = self.link_target(at, &next)?;
                 if target.is_empty() {
                     return Err(Errno::ENOENT);
                 }
@@ -173,13 +173,16 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Gives the target of the symbolic link `link`, and counts the link. Gives `ELOOP` after
-    /// `MAX_LINKS` links in one walk.
-    fn link_target(&mut self, link: &Location) -> Result<Vec<u8>> {
+    /// Gives the target of the symbolic link `link` in the directory `dir`, and counts the link.
+    /// Gives `ELOOP` after `MAX_LINKS` links in one walk, and `EACCES` if
+    /// `fs.protected_symlinks` forbids the follow.
+    fn link_target(&mut self, dir: &Location, link: &Location) -> Result<Vec<u8>> {
         self.links += 1;
         if self.links > MAX_LINKS {
             return Err(Errno::ELOOP);
         }
+        let level = protected::get(&protected::SYMLINKS);
+        self.cred.may_follow_link(level, &dir.inode().metadata(), &link.inode().metadata())?;
         link.inode().follow_link()
     }
 
