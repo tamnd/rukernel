@@ -615,7 +615,8 @@ fn statfs_of(meta: &Metadata, inode: Option<&rk_vfs::InodeRef>, flags: i64) -> S
         s.f_ffree = st.ffree as i64;
     }
     s.f_namelen = 255;
-    s.f_fsid = KernelFsidT { val: [meta.dev as i32, (meta.dev >> 32) as i32] };
+    let fsid = inode.map_or(meta.dev, |i| i.fs_fsid());
+    s.f_fsid = KernelFsidT { val: [fsid as i32, (fsid >> 32) as i32] };
     s.f_flags = flags;
     s
 }

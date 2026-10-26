@@ -147,7 +147,12 @@ fn the_mount_options_are_checked() {
     assert!(mount(&args(b"lowerdir=/l:/m,upperdir=/u,workdir=/w")).is_ok());
     assert_eq!(mount(&args(b"upperdir=/u,workdir=/w")).err(), Some(Errno::EINVAL));
     assert_eq!(mount(&args(b"lowerdir=/l,upperdir=/u")).err(), Some(Errno::EINVAL));
-    assert_eq!(mount(&args(b"lowerdir=/l::/m")).err(), Some(Errno::EINVAL));
+    assert!(mount(&args(b"lowerdir=/l::/m")).is_ok());
+    assert_eq!(mount(&args(b"lowerdir=::/m")).err(), Some(Errno::EINVAL));
+    assert_eq!(mount(&args(b"lowerdir=/l::/m:/n")).err(), Some(Errno::EINVAL));
+    assert_eq!(mount(&args(b"lowerdir=/l,redirect_dir=bad")).err(), Some(Errno::EINVAL));
+    let data = b"lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=follow,metacopy=on";
+    assert_eq!(mount(&args(data)).err(), Some(Errno::EINVAL));
 }
 
 /// Gives a mount of `data`, where each path is a directory of a tmpfs, the same for each path.
@@ -176,7 +181,8 @@ fn the_mount_makes_a_clean_work_directory() {
     assert!(names(&work).is_empty());
     assert_eq!(work.metadata().mode & mode::PERM_MASK, 0);
     assert!(!root.is_read_only());
-    assert_eq!(root.fs_options(), b",lowerdir=/l,upperdir=/u,workdir=/w");
+    // The first mount of a new overlay makes a uuid.
+    assert_eq!(root.fs_options(), b",lowerdir=/l,upperdir=/u,workdir=/w,uuid=on");
     root.set_read_only(true).unwrap();
     assert!(root.is_read_only());
     root.set_read_only(false).unwrap();
@@ -312,4 +318,262 @@ fn an_unused_directory_keeps_its_unused_children() {
     // The mount does not keep its unused nodes after the last use of its root.
     drop(root);
     assert_eq!(n.strong_count(), 0);
+}
+
+/// Gives a mount of `data`, where `/l` is `lower`, `/u` is `upper`, `/w` is `work`, and another
+/// path is `data`.
+fn mount_layers(dirs: [&InodeRef; 4], data: &[u8]) -> Result<InodeRef> {
+    let [lower, upper, work, other] = dirs;
+    let lookup = |path: &[u8]| {
+        Ok(match path {
+            b"/l" => lower.clone(),
+            b"/u" => upper.clone(),
+            b"/w" => work.clone(),
+            _ => other.clone(),
+        })
+    };
+    mount(&MountArgs { data, dev: None, read_only: false, lookup: Some(&lookup) })
+}
+
+/// Gives a lower directory, an upper directory, a work directory and a data directory. The
+/// upper and the work directories are on one tmpfs. The lower directory has the file `a`, the
+/// directory `d` with the file `d/x`, and the file `b`.
+fn layers() -> [InodeRef; 4] {
+    let (lower, _, _) = setup();
+    let fs = rk_fs_tmpfs::new(0o755);
+    let upper = fs.create(b"u", FileType::Directory, 0o755, 0).unwrap();
+    let work = fs.create(b"w", FileType::Directory, 0o755, 0).unwrap();
+    [lower, upper, work, rk_fs_tmpfs::new(0o755)]
+}
+
+#[test]
+fn a_rename_of_a_merged_directory_sets_a_redirect() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let root = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w").unwrap();
+    assert_eq!(root.rename(b"d", &root, b"e").err(), Some(Errno::EXDEV));
+    drop(root);
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=on";
+    let root = mount_layers(dirs, opts).unwrap();
+    let ino = root.lookup(b"d").unwrap().metadata().ino;
+    root.rename(b"d", &root, b"e").unwrap();
+    let redirect = upper.lookup(b"e").unwrap().get_xattr(b"trusted.overlay.redirect");
+    assert_eq!(redirect.as_deref(), Ok(&b"d"[..]));
+    assert_eq!(root.lookup(b"d").err(), Some(Errno::ENOENT));
+    assert_eq!(read(&root.lookup(b"e").unwrap().lookup(b"x").unwrap()), b"lower x");
+    // A new directory in a merged directory is opaque with the feature.
+    let f = root.create(b"f", FileType::Directory, 0o755, 0).unwrap();
+    let opaque = upper.lookup(b"f").unwrap().get_xattr(b"trusted.overlay.opaque");
+    assert_eq!(opaque.as_deref(), Ok(&b"y"[..]));
+    // A move to another directory gets an absolute redirect.
+    root.rename(b"e", &f, b"g").unwrap();
+    let g = upper.lookup(b"f").unwrap().lookup(b"g").unwrap();
+    assert_eq!(g.get_xattr(b"trusted.overlay.redirect").as_deref(), Ok(&b"/d"[..]));
+    drop((f, root));
+    // A new mount follows the redirects and keeps the inode number.
+    let root = mount_layers(dirs, opts).unwrap();
+    let g = root.lookup(b"f").unwrap().lookup(b"g").unwrap();
+    assert_eq!(names(&g), [&b"x"[..]]);
+    assert_eq!(read(&g.lookup(b"x").unwrap()), b"lower x");
+    assert_eq!(g.metadata().ino, ino);
+    assert_eq!(root.lookup(b"d").err(), Some(Errno::ENOENT));
+    // A mount with `redirect_dir=nofollow` refuses the redirect below a merged directory.
+    drop((g, root));
+    root_redirect(&upper);
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=nofollow";
+    let root = mount_layers(dirs, opts).unwrap();
+    assert_eq!(root.lookup(b"h").err(), Some(Errno::EPERM));
+}
+
+/// Makes the directory `h` with a redirect to `d` in the upper root `upper`.
+fn root_redirect(upper: &InodeRef) {
+    let h = upper.create(b"h", FileType::Directory, 0o755, 0).unwrap();
+    h.set_xattr(b"trusted.overlay.redirect", b"d", 0).unwrap();
+}
+
+#[test]
+fn an_absolute_redirect_below_an_opaque_directory_is_followed() {
+    let [lower, upper, _, _] = layers();
+    let mid = upper.create(b"m", FileType::Directory, 0o755, 0).unwrap();
+    let o = mid.create(b"o", FileType::Directory, 0o755, 0).unwrap();
+    o.set_xattr(b"trusted.overlay.opaque", b"y", 0).unwrap();
+    let r = o.create(b"r", FileType::Directory, 0o755, 0).unwrap();
+    r.set_xattr(b"trusted.overlay.redirect", b"/d", 0).unwrap();
+    let lookup = |path: &[u8]| Ok(if path == b"/m" { upper.clone() } else { lower.clone() });
+    let data = b"lowerdir=/m:/l,redirect_dir=follow";
+    let root = mount(&MountArgs { data, dev: None, read_only: false, lookup: Some(&lookup) });
+    let r = root.unwrap().lookup(b"m").unwrap().lookup(b"o").unwrap().lookup(b"r").unwrap();
+    assert_eq!(names(&r), [&b"x"[..]]);
+}
+
+#[test]
+fn a_metacopy_copy_up_copies_the_data_later() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,metacopy=on";
+    let root = mount_layers(dirs, opts).unwrap();
+    let want = b",lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=on,uuid=on,metacopy=on";
+    assert_eq!(root.fs_options(), want);
+    let a = root.lookup(b"a").unwrap();
+    let ino = a.metadata().ino;
+    a.set_attr(&SetAttr { mode: Some(0o600), ..SetAttr::default() }).unwrap();
+    let real = upper.lookup(b"a").unwrap();
+    assert_eq!(real.get_xattr(b"trusted.overlay.metacopy").as_deref(), Ok(&b""[..]));
+    assert!(real.get_xattr(b"trusted.overlay.origin").is_ok());
+    assert!(upper.get_xattr(b"trusted.overlay.impure").is_ok());
+    assert_eq!(real.metadata().size, 7);
+    assert_eq!(read(&real), [0; 7]);
+    assert_eq!(read(&a), b"lower a");
+    assert_eq!(a.list_xattr(), Ok(Vec::new()));
+    drop((a, root));
+    // A new mount finds the data in the lower layer.
+    let root = mount_layers(dirs, opts).unwrap();
+    let a = root.lookup(b"a").unwrap();
+    assert_eq!(read(&a), b"lower a");
+    assert_eq!(a.metadata().ino, ino);
+    a.write_at(0, b"L").unwrap();
+    assert_eq!(read(&real), b"Lower a");
+    assert_eq!(real.get_xattr(b"trusted.overlay.metacopy").err(), Some(Errno::ENODATA));
+    // A metacopy file moves with a redirect.
+    let chmod = SetAttr { mode: Some(0o600), ..SetAttr::default() };
+    root.lookup(b"b").unwrap().set_attr(&chmod).unwrap();
+    let d = root.lookup(b"d").unwrap();
+    root.rename(b"b", &d, b"c").unwrap();
+    let c = upper.lookup(b"d").unwrap().lookup(b"c").unwrap();
+    assert_eq!(c.get_xattr(b"trusted.overlay.redirect").as_deref(), Ok(&b"/b"[..]));
+    drop((a, d, root));
+    let root = mount_layers(dirs, opts).unwrap();
+    assert_eq!(read(&root.lookup(b"d").unwrap().lookup(b"c").unwrap()), b"lower b");
+}
+
+#[test]
+fn a_metacopy_file_finds_its_data_in_a_data_only_layer() {
+    let [lower, _, work, data] = layers();
+    let sub = data.create(b"sub", FileType::Directory, 0o755, 0).unwrap();
+    file(&sub, b"f", b"data");
+    for (name, redirect) in [(&b"m"[..], &b"/sub/f"[..]), (b"rel", b"f"), (b"lazy", b"/sub/g")] {
+        let m = file(&lower, name, b"");
+        m.set_attr(&SetAttr { size: Some(4), ..SetAttr::default() }).unwrap();
+        m.set_xattr(b"trusted.overlay.metacopy", b"", 0).unwrap();
+        m.set_xattr(b"trusted.overlay.redirect", redirect, 0).unwrap();
+    }
+    file(&lower, b"plain", b"").set_xattr(b"trusted.overlay.metacopy", b"", 0).unwrap();
+    let dirs = [&lower, &work, &work, &data];
+    // Without `metacopy=on`, the lookup does not follow the metacopy file.
+    let root = mount_layers(dirs, b"lowerdir=/l::/d").unwrap();
+    assert_eq!(root.lookup(b"m").err(), Some(Errno::EIO));
+    let root = mount_layers(dirs, b"lowerdir=/l::/d,metacopy=on").unwrap();
+    let m = root.lookup(b"m").unwrap();
+    assert_eq!(read(&m), b"data");
+    assert_eq!(m.metadata().size, 4);
+    assert_eq!(root.lookup(b"rel").err(), Some(Errno::EIO));
+    assert_eq!(root.lookup(b"plain").err(), Some(Errno::EIO));
+    // A file without its data has the attributes but no data.
+    let lazy = root.lookup(b"lazy").unwrap();
+    assert_eq!(lazy.metadata().size, 4);
+    assert_eq!(lazy.read_at(0, &mut [0; 4]), Err(Errno::ENOENT));
+    // The data-only layers do not show their names.
+    assert_eq!(root.lookup(b"sub").err(), Some(Errno::ENOENT));
+}
+
+#[test]
+fn the_added_layers_are_checked() {
+    let data = b"lowerdir+=/a b,lowerdir+=/c:d,datadir+=/e,redirect_dir=follow";
+    let opts = Options::parse(data).unwrap();
+    assert_eq!(opts.lowers, [&b"/a b"[..], b"/c:d"]);
+    assert_eq!(opts.data, [&b"/e"[..]]);
+    assert_eq!(opts.show(), br",lowerdir+=/a\040b,lowerdir+=/c:d,datadir+=/e,redirect_dir=on");
+    let opts = Options::parse(b"lowerdir=/a::/b::/c").unwrap();
+    assert_eq!(opts.data, [&b"/b"[..], b"/c"]);
+    assert_eq!(opts.show(), b",lowerdir=/a::/b::/c,redirect_dir=on");
+    for data in [
+        &b"lowerdir=/a,lowerdir+=/b"[..],
+        b"lowerdir=/a,datadir+=/b",
+        b"datadir+=/a,lowerdir+=/b",
+        b"datadir+=/a",
+        b"lowerdir+=",
+    ] {
+        assert_eq!(Options::parse(data).err(), Some(Errno::EINVAL));
+    }
+    // A later `lowerdir=` replaces the added layers.
+    let opts = Options::parse(b"lowerdir+=/a,datadir+=/b,lowerdir=/c").unwrap();
+    assert_eq!((opts.lowers, opts.data, opts.added), (vec![b"/c".to_vec()], Vec::new(), false));
+}
+
+#[test]
+fn the_uuid_gives_the_fsid() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let real = upper.fs_fsid();
+    upper.create(b"d", FileType::Directory, 0o755, 0).unwrap();
+    let root = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w,uuid=null").unwrap();
+    assert_eq!(root.lookup(b"d").unwrap().fs_fsid(), real);
+    // The lookup of a merged directory marks the root as impure, so the overlay is old.
+    assert!(upper.get_xattr(b"trusted.overlay.impure").is_ok());
+    let root = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w").unwrap();
+    assert_eq!(root.fs_fsid(), real);
+    assert_eq!(root.fs_options(), b",lowerdir=/l,upperdir=/u,workdir=/w,uuid=null");
+    let root = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w,uuid=on").unwrap();
+    let unique = root.fs_fsid();
+    assert_ne!(unique, real);
+    assert_eq!(upper.get_xattr(b"trusted.overlay.uuid").map(|u| u.len()), Ok(16));
+    let root = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w").unwrap();
+    assert_eq!(root.fs_fsid(), unique);
+    assert_eq!(root.fs_options(), b",lowerdir=/l,upperdir=/u,workdir=/w");
+    let root = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w,uuid=off").unwrap();
+    assert_eq!(root.fs_fsid(), real);
+    let root = mount_layers(dirs, b"lowerdir=/u:/l,uuid=on").unwrap();
+    assert_eq!(root.fs_fsid(), real);
+}
+
+#[test]
+fn a_copy_up_keeps_the_inode_number_after_a_new_mount() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w";
+    let root = mount_layers(dirs, opts).unwrap();
+    let ino = root.lookup(b"a").unwrap().metadata().ino;
+    let d = root.lookup(b"d").unwrap();
+    let x = d.lookup(b"x").unwrap();
+    let xino = x.metadata().ino;
+    x.set_attr(&SetAttr { mode: Some(0o600), ..SetAttr::default() }).unwrap();
+    root.rename(b"a", &d, b"a").unwrap();
+    drop((x, d, root));
+    let root = mount_layers(dirs, opts).unwrap();
+    let d = root.lookup(b"d").unwrap();
+    assert_eq!(d.lookup(b"a").unwrap().metadata().ino, ino);
+    assert_eq!(d.lookup(b"x").unwrap().metadata().ino, xino);
+    // The entries of a merged directory have the inode numbers of `stat`.
+    let entries = real_entries(&d).unwrap();
+    let a = entries.iter().find(|e| e.name == b"a").unwrap();
+    assert_eq!(a.ino, ino);
+}
+
+#[test]
+fn an_unused_node_keeps_its_redirect_and_metacopy_state() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,redirect_dir=on,metacopy=on";
+    let root = mount_layers(dirs, opts).unwrap();
+    let chmod = SetAttr { mode: Some(0o600), ..SetAttr::default() };
+    let a = root.lookup(b"a").unwrap();
+    let ino = a.metadata().ino;
+    a.set_attr(&chmod).unwrap();
+    drop(a);
+    root.rename(b"d", &root, b"e").unwrap();
+    // The lookups give the unused nodes again, with the same state.
+    let count = node(&root).fs.cache.count.load(Ordering::Relaxed);
+    assert!(count >= 2);
+    let a = root.lookup(b"a").unwrap();
+    assert!(node(&a).is_metacopy());
+    assert_eq!(read(&a), b"lower a");
+    assert_eq!(a.metadata().ino, ino);
+    a.write_at(0, b"L").unwrap();
+    drop(a);
+    let a = root.lookup(b"a").unwrap();
+    assert!(!node(&a).is_metacopy());
+    assert_eq!(read(&a), b"Lower a");
+    let e = root.lookup(b"e").unwrap();
+    assert_eq!(node(&e).redirect.lock().as_deref(), Some(&b"d"[..]));
+    assert_eq!(read(&e.lookup(b"x").unwrap()), b"lower x");
 }
