@@ -2163,7 +2163,7 @@ static void test_tmpfile(void)
 	check("O_TMPFILE without write access gives EINVAL",
 	      open("/tmp", O_TMPFILE | O_RDONLY, 0600) == -1 && errno == EINVAL);
 	check("O_TMPFILE on a file gives ENOTDIR",
-	      open("/proc/self/exe", O_TMPFILE | O_RDWR, 0600) == -1 && errno == ENOTDIR);
+	      open("/init", O_TMPFILE | O_RDWR, 0600) == -1 && errno == ENOTDIR);
 	fd = open("/tmp", O_TMPFILE | O_RDWR, 0600);
 	check("O_TMPFILE makes a file without a link",
 	      fd >= 0 && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 0);
