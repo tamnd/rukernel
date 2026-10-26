@@ -18,7 +18,7 @@ use rk_abi::native::mount::{
 };
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::{SIGPIPE, SIGXFSZ};
-use rk_abi::native::stat::{STATX_BASIC_STATS, STATX_MNT_ID};
+use rk_abi::native::stat::{STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID};
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
 use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::device::{major, minor};
@@ -544,6 +544,10 @@ pub(crate) fn statx(
     s.stx_atime = statx_time(meta.atime);
     s.stx_ctime = statx_time(meta.ctime);
     s.stx_mtime = statx_time(meta.mtime);
+    if let Some(btime) = meta.btime {
+        s.stx_mask |= STATX_BTIME;
+        s.stx_btime = statx_time(btime);
+    }
     s.stx_rdev_major = major(meta.rdev);
     s.stx_rdev_minor = minor(meta.rdev);
     s.stx_dev_major = major(meta.dev);

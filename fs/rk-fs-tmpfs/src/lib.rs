@@ -42,6 +42,8 @@ struct Attrs {
     atime: Timespec,
     mtime: Timespec,
     ctime: Timespec,
+    /// The time when the node was made.
+    btime: Timespec,
     /// The inode flags of `FS_IOC_SETFLAGS`.
     flags: u32,
 }
@@ -138,6 +140,7 @@ impl Node {
                 atime: t,
                 mtime: t,
                 ctime: t,
+                btime: t,
                 flags: 0,
             }),
             data: SpinLock::new(data),
@@ -249,6 +252,7 @@ impl Inode for Node {
             atime: a.atime,
             mtime: a.mtime,
             ctime: a.ctime,
+            btime: Some(a.btime),
         }
     }
 

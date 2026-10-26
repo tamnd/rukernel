@@ -133,6 +133,8 @@ pub struct Metadata {
     pub mtime: Timespec,
     /// The time of the last change of the inode.
     pub ctime: Timespec,
+    /// The time when the inode was made, for `statx`, if the file system keeps it.
+    pub btime: Option<Timespec>,
 }
 
 impl Metadata {

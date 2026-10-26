@@ -1036,6 +1036,8 @@ impl Inode for Node {
             atime: timespec(raw.time(0x8, 0x8c)),
             mtime: timespec(raw.time(0x10, 0x88)),
             ctime: timespec(raw.time(0xc, 0x84)),
+            // An inode with too few extra fields has no creation time, as Linux.
+            btime: (raw.extra_size() >= 0x94 - 128).then(|| timespec(raw.time(0x90, 0x94))),
         }
     }
 

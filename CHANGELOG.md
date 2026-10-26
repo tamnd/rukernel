@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `statx` gives the creation time of a file in `stx_btime` with `STATX_BTIME` on ext4, tmpfs and XFS, as Linux. An ext4 inode without room for the time and an XFS inode before version 3 do not have it. generic/528 now passes.
+
 ## [0.3.18] - 2026-10-27
 
 ### Added
