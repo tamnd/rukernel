@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The device files that the kernel makes in `/dev` now have the mode of the device list, as devtmpfs of Linux gives. Before this change, the umask of init removed the write bits of the group and of the other users, so a user that is not root could not write to `/dev/null`.
 - The files in `/proc/PID` now belong to the effective user and group of the process, as Linux. Before this change, root owned each file, so a process that is not root could not read its own `/proc/self/fd`.
+- A write to an ext4 file that takes the last free blocks no longer loses its blocks when the extent tree needs a new block. Before this change, the write gave `ENOSPC` after it marked the data blocks as used, and the extent tree did not point to them, so fsck found an error. Now the write gives back its last blocks until the tree fits, and it is a short write.
 
 ## [0.3.16] - 2026-10-26
 

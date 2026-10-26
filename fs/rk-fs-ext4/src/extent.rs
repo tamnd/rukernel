@@ -241,8 +241,16 @@ impl Tx<'_> {
         let mut pool = old;
         let goal = extents.first().map_or(0, |e| e.start.saturating_sub(1));
         while pool.len() < need {
-            let (b, _) = self.alloc_blocks(goal, 1)?;
-            pool.push(b);
+            match self.alloc_blocks(goal, 1) {
+                Ok((b, _)) => pool.push(b),
+                Err(e) => {
+                    // The old tree stays, so give back only the new blocks.
+                    for &b in pool.get(had as usize..).unwrap_or_default() {
+                        self.free_blocks(b, 1)?;
+                    }
+                    return Err(e);
+                }
+            }
         }
         let spare = pool.split_off(need);
         for &b in &spare {

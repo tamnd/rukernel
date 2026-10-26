@@ -293,6 +293,9 @@ impl Tx<'_> {
         let is_map = raw.flags() & flags::EXTENTS == 0;
         let (mut extents, tree) = if !is_map { fs.extents(raw)? } else { (Vec::new(), Vec::new()) };
         let mut changed = false;
+        // The runs of blocks that this write gave to the file, as (first block, disk block,
+        // count), for a tree that does not fit on a full disk.
+        let mut runs: Vec<(u64, u64, u32)> = Vec::new();
         let mut pos = offset;
         let mut result = Ok(());
         while pos < end {
@@ -383,6 +386,7 @@ impl Tx<'_> {
                             &mut extents,
                             Extent { lblock: lblock as u32, len: got, start, init: true },
                         );
+                        runs.push((lblock, start, got));
                         changed = true;
                     }
                     raw.set_blocks(raw.blocks() + u64::from(got) * (bs / 512));
@@ -391,8 +395,24 @@ impl Tx<'_> {
             }
             pos += n as u64;
         }
-        if changed {
-            self.build_tree(ino, raw, &extents, tree)?;
+        // The tree can need a new block when the data took the last free blocks. Then the write
+        // gives back its last runs until the tree fits, and it is a short write, as Linux keeps
+        // blocks for the tree before it gives the data blocks.
+        while changed {
+            match self.build_tree(ino, raw, &extents, tree.clone()) {
+                Err(Errno::ENOSPC) if !runs.is_empty() => {
+                    let (lblock, start, got) = runs.pop().ok_or(Errno::EIO)?;
+                    extent::remove(&mut extents, lblock, lblock + u64::from(got));
+                    self.free_blocks(start, u64::from(got))?;
+                    raw.set_blocks(raw.blocks().saturating_sub(u64::from(got) * (bs / 512)));
+                    pos = pos.min(lblock * bs);
+                    result = Err(Errno::ENOSPC);
+                }
+                r => {
+                    r?;
+                    changed = false;
+                }
+            }
         }
         if pos > raw.size() {
             raw.set_size(pos);

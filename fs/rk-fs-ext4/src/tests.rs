@@ -625,6 +625,34 @@ fn many_entries_and_extents_grow_the_trees() {
 }
 
 #[test]
+fn a_full_disk_gives_back_the_blocks_of_a_tree_that_does_not_fit() {
+    let (fs, ram) = open_rw();
+    let root = fs.root().unwrap();
+    // Four extents fill the root of the tree.
+    let sparse = root.create(b"sparse", FileType::Regular, 0o644, 0).unwrap();
+    for i in 0..4u64 {
+        sparse.write_at(i * 2 * BS as u64, &[1]).unwrap();
+    }
+    let fill = root.create(b"fill", FileType::Regular, 0o644, 0).unwrap();
+    let mut size = 0;
+    while fill.write_at(size, &[2u8; BS]) == Ok(BS) {
+        size += BS as u64;
+    }
+    // One free block is for the data, and the tree needs one more block for the fifth extent.
+    fill.set_attr(&SetAttr { size: Some(size - BS as u64), ..SetAttr::default() }).unwrap();
+    assert_eq!(sparse.write_at(8 * BS as u64, &[1]), Err(Errno::ENOSPC));
+    assert_eq!(sparse.metadata().blocks, 4 * (BS as u64 / 512));
+    let free = ram.free();
+    drop((sparse, fill, root, fs));
+
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    assert_eq!(ram.free(), free);
+    let root = fs.root().unwrap();
+    let fill = root.lookup(b"fill").unwrap();
+    assert_eq!(fill.write_at(size - BS as u64, &[3u8; BS]), Ok(BS));
+}
+
+#[test]
 fn a_block_map_file_grows_and_shrinks() {
     let (fs, ram) = open_rw();
     let free = ram.free().0;
