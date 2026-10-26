@@ -10,7 +10,7 @@
 //! credentials at the time of the copy.
 
 use crate::acl;
-use crate::cred::{Cred, cap, may};
+use crate::cred::{Cred, cap, may, protected};
 use crate::dentry::{Location, MountNamespace, MountSource};
 use crate::device;
 use crate::file::File;
@@ -204,9 +204,15 @@ impl FsContext {
             match self.child(&parent) {
                 Ok(_) if flags & o::O_EXCL != 0 => return Err(Errno::EEXIST),
                 Ok(at) if follow && is_type(at.inode(), FileType::Symlink) => {
-                    self.resolve(&parent.dir, &parent.name, true)?
+                    let at = self.resolve(&parent.dir, &parent.name, true)?;
+                    let dir = self.walk().up(&at);
+                    self.check_create_in_sticky(&dir, &at)?;
+                    at
                 }
-                Ok(at) => at,
+                Ok(at) => {
+                    self.check_create_in_sticky(&parent.dir, &at)?;
+                    at
+                }
                 Err(e) if e == Errno::ENOENT && !parent.is_dot() => {
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
@@ -232,6 +238,18 @@ impl FsContext {
             self.resolve(start, path, follow)?
         };
         self.open_inode(at, flags, created)
+    }
+
+    /// The check of `fs.protected_regular` and `fs.protected_fifos` for an `open` with
+    /// `O_CREAT` of the file `at` that is already in `dir`. A directory gives `EISDIR` later.
+    fn check_create_in_sticky(&self, dir: &Location, at: &Location) -> Result<()> {
+        let meta = at.inode().metadata();
+        if meta.is_dir() {
+            return Ok(());
+        }
+        let regular = protected::get(&protected::REGULAR);
+        let fifos = protected::get(&protected::FIFOS);
+        self.cred.may_create_in_sticky(regular, fifos, &dir.inode().metadata(), &meta)
     }
 
     /// Opens the inode at `at`, after the walk.
@@ -398,6 +416,7 @@ impl FsContext {
         if !Arc::ptr_eq(&parent.dir.mount, &old.mount) {
             return Err(Errno::EXDEV);
         }
+        self.cred.may_link(protected::get(&protected::HARDLINKS), &**old.inode())?;
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         check_fixed(&**old.inode())?;

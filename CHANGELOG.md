@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The sysctls `fs.protected_symlinks`, `fs.protected_hardlinks`, `fs.protected_regular` and `fs.protected_fifos`, as Linux. With them, the path walk does not follow a symbolic link of another user in a sticky directory that all can write, `link` gives `EPERM` for a file that the process does not own and cannot read and write, and `open` with `O_CREAT` gives `EACCES` for a file or a FIFO of another user in a sticky directory. Each one is 0 by default, as Linux. generic/597 and generic/598 now pass.
+
 ## [0.3.17] - 2026-10-26
 
 ### Added

@@ -2636,6 +2636,20 @@ static void test_proc(void)
 	fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
 	check("/proc/sys/kernel/pid_max", fd >= 0 && read(fd, buf, sizeof(buf)) == 8 && !strncmp(buf, "4194304\n", 8));
 	close(fd);
+	mkdir("/tmp/sticky", 0777);
+	chmod("/tmp/sticky", 01777);
+	symlink("/proc/self/exe", "/tmp/sticky/link");
+	lchown("/tmp/sticky/link", 1000, 1000);
+	check("fs.protected_symlinks above 1 gives EINVAL",
+	      put_file("/proc/sys/fs/protected_symlinks", "2") == -1 && errno == EINVAL);
+	check("fs.protected_symlinks refuses a link of another user in a sticky directory",
+	      put_file("/proc/sys/fs/protected_symlinks", "1") == 0 &&
+		      access("/tmp/sticky/link", F_OK) == -1 && errno == EACCES);
+	check("fs.protected_symlinks of 0 follows the link",
+	      put_file("/proc/sys/fs/protected_symlinks", "0") == 0 &&
+		      access("/tmp/sticky/link", F_OK) == 0);
+	unlink("/tmp/sticky/link");
+	rmdir("/tmp/sticky");
 	fd = open("/proc/self/oom_score_adj", O_WRONLY);
 	check("write /proc/self/oom_score_adj", fd >= 0 && write(fd, "-500\n", 5) == 5);
 	close(fd);

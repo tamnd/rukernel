@@ -13,6 +13,27 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::Once;
 
+/// The `fs.protected_*` sysctls of Linux, which guard the files in sticky directories that other
+/// users can write. Each one is 0, the default of Linux, until a write to `/proc/sys/fs` changes
+/// it.
+pub mod protected {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    /// `fs.protected_symlinks`: 0 or 1.
+    pub static SYMLINKS: AtomicU32 = AtomicU32::new(0);
+    /// `fs.protected_hardlinks`: 0 or 1.
+    pub static HARDLINKS: AtomicU32 = AtomicU32::new(0);
+    /// `fs.protected_regular`: 0, 1 or 2.
+    pub static REGULAR: AtomicU32 = AtomicU32::new(0);
+    /// `fs.protected_fifos`: 0, 1 or 2.
+    pub static FIFOS: AtomicU32 = AtomicU32::new(0);
+
+    /// The value of a sysctl.
+    pub fn get(v: &AtomicU32) -> u32 {
+        v.load(Ordering::Relaxed)
+    }
+}
+
 static CURRENT: Once<fn() -> Option<Arc<Cred>>> = Once::new();
 
 /// Gives the VFS the credentials of the process that runs now, for the checks of a write that
@@ -305,6 +326,83 @@ impl Cred {
             return Ok(());
         }
         Err(Errno::EPERM)
+    }
+
+    /// Checks that the walk can follow the symbolic link `link` in the directory `dir`, as
+    /// `may_follow_link` of Linux. With `level` 1 (`fs.protected_symlinks`), a link in a sticky
+    /// directory that all can write is followed only by the owner of the link, or if the owner
+    /// of the directory owns the link.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EACCES` if the protection forbids the follow.
+    pub fn may_follow_link(&self, level: u32, dir: &Metadata, link: &Metadata) -> Result<()> {
+        const STICKY_ALL: u32 = mode::S_ISVTX | 0o002;
+        if level == 0
+            || self.fsuid == link.uid
+            || dir.mode & STICKY_ALL != STICKY_ALL
+            || dir.uid == link.uid
+        {
+            return Ok(());
+        }
+        Err(Errno::EACCES)
+    }
+
+    /// Checks that the process can make a hard link to `inode`, as `may_linkat` of Linux. With
+    /// `level` 1 (`fs.protected_hardlinks`), the process must own the file, or the file must be
+    /// a regular file that is not set-user-ID, not set-group-ID with the group execute bit, and
+    /// that the process can read and write.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EPERM` if the protection forbids the link.
+    pub fn may_link(&self, level: u32, inode: &dyn Inode) -> Result<()> {
+        let meta = inode.metadata();
+        if level == 0 || self.owns(&meta) {
+            return Ok(());
+        }
+        let safe = meta.file_type() == Some(FileType::Regular)
+            && meta.mode & mode::S_ISUID == 0
+            && meta.mode & (mode::S_ISGID | 0o010) != (mode::S_ISGID | 0o010)
+            && self.inode_permission(inode, may::READ | may::WRITE).is_ok();
+        if safe { Ok(()) } else { Err(Errno::EPERM) }
+    }
+
+    /// Checks an `open` with `O_CREAT` of the file `child` that is already in the directory
+    /// `dir`, as `may_create_in_sticky` of Linux. `regular` and `fifos` are the levels of
+    /// `fs.protected_regular` and `fs.protected_fifos`. In a sticky directory, a file of another
+    /// user that the owner of the directory does not own is refused at level 1 if all can write
+    /// the directory, and at level 2 also if the group can write it.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EACCES` if the protection forbids the open.
+    pub fn may_create_in_sticky(
+        &self,
+        regular: u32,
+        fifos: u32,
+        dir: &Metadata,
+        child: &Metadata,
+    ) -> Result<()> {
+        let kind = child.file_type();
+        if dir.mode & mode::S_ISVTX == 0
+            || (kind == Some(FileType::Regular) && regular == 0)
+            || (kind == Some(FileType::Fifo) && fifos == 0)
+            || child.uid == dir.uid
+            || child.uid == self.fsuid
+        {
+            return Ok(());
+        }
+        if dir.mode & 0o002 != 0 {
+            return Err(Errno::EACCES);
+        }
+        if dir.mode & 0o020 != 0
+            && ((kind == Some(FileType::Fifo) && fifos >= 2)
+                || (kind == Some(FileType::Regular) && regular >= 2))
+        {
+            return Err(Errno::EACCES);
+        }
+        Ok(())
     }
 
     /// The owner, the group and the permission bits of a new file of the type `kind` in the
@@ -1023,6 +1121,36 @@ mod tests {
             Err(Errno::EACCES)
         );
         assert_eq!(search.permission(&meta(mode::S_IFREG, 0, 5, 5), may::READ), Ok(()));
+    }
+
+    #[test]
+    fn protected_symlinks_refuses_a_link_of_another_user_in_a_sticky_directory() {
+        let u = user(1000);
+        let tmp = meta(mode::S_IFDIR, mode::S_ISVTX | 0o777, 3000, 0);
+        let link = meta(mode::S_IFLNK, 0o777, 2000, 0);
+        assert_eq!(u.may_follow_link(0, &tmp, &link), Ok(()));
+        assert_eq!(u.may_follow_link(1, &tmp, &link), Err(Errno::EACCES));
+        assert_eq!(u.may_follow_link(1, &tmp, &meta(mode::S_IFLNK, 0o777, 1000, 0)), Ok(()));
+        assert_eq!(u.may_follow_link(1, &tmp, &meta(mode::S_IFLNK, 0o777, 3000, 0)), Ok(()));
+        let shut = meta(mode::S_IFDIR, mode::S_ISVTX | 0o775, 3000, 0);
+        assert_eq!(u.may_follow_link(1, &shut, &link), Ok(()));
+    }
+
+    #[test]
+    fn protected_regular_refuses_an_open_with_o_creat_of_a_file_of_another_user() {
+        let u = user(1000);
+        let all = meta(mode::S_IFDIR, mode::S_ISVTX | 0o777, 3000, 0);
+        let group = meta(mode::S_IFDIR, mode::S_ISVTX | 0o775, 3000, 0);
+        let file = meta(mode::S_IFREG, 0o666, 2000, 0);
+        let fifo = meta(mode::S_IFIFO, 0o666, 2000, 0);
+        assert_eq!(u.may_create_in_sticky(0, 0, &all, &file), Ok(()));
+        assert_eq!(u.may_create_in_sticky(1, 0, &all, &file), Err(Errno::EACCES));
+        assert_eq!(u.may_create_in_sticky(1, 0, &group, &file), Ok(()));
+        assert_eq!(u.may_create_in_sticky(2, 0, &group, &file), Err(Errno::EACCES));
+        assert_eq!(u.may_create_in_sticky(2, 0, &group, &fifo), Ok(()));
+        assert_eq!(u.may_create_in_sticky(0, 2, &group, &fifo), Err(Errno::EACCES));
+        let own = meta(mode::S_IFREG, 0o666, 1000, 0);
+        assert_eq!(u.may_create_in_sticky(2, 2, &all, &own), Ok(()));
     }
 
     #[test]
