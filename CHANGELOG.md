@@ -6,7 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
-- The semaphores of System V: `semget`, `semop`, `semtimedop` and `semctl`. `semop` does all its operations or none of them, and waits until a change of the set lets them go on. A signal stops the wait with `EINTR`. An operation with `SEM_UNDO` records the opposite change, and the kernel does it when the process ends. The t_ofd_locks program of generic/478 uses these calls.
+- The semaphores of System V: `semget`, `semop`, `semtimedop` and `semctl`. `semop` does all its operations or none of them, and waits until a change of the set lets them go on. A signal stops the wait with `EINTR`. An operation with `SEM_UNDO` records the opposite change, and the kernel does it when the process ends. The t_ofd_locks program of generic/478 uses these calls, and generic/478 now passes.
 - `renameat2` with `RENAME_EXCHANGE` on tmpfs and ext4. The two names exchange their files, which can have different types. A directory that moves to the other parent gets a new `..`, and the link counts of the parents change. A file system without the flag gives `EINVAL`, as Linux. generic/025 passes.
 - `swapon` and `swapoff`. `swapon` reads the header of `mkswap` and makes sure that each page of a swap file has a block on the disk, as Linux. A file with holes gives `EINVAL`. While a file is an active swap area, a write, a truncate, a `fallocate`, a `copy_file_range` and a shared writable mapping of the file give `ETXTBSY`. `/proc/swaps`, `/proc/meminfo` and `sysinfo` show the active areas. rukernel does not move pages to a swap area yet.
 
