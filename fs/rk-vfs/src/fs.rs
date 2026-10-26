@@ -164,6 +164,13 @@ impl FsContext {
         Ok(())
     }
 
+    /// Puts the context in a copy of its mount name space, for `CLONE_NEWNS`. The root and the
+    /// current directory go to the copies of their mounts.
+    pub fn unshare_namespace(&mut self) {
+        let ns = self.ns.copy(&mut [&mut self.root, &mut self.cwd]);
+        self.ns = ns;
+    }
+
     /// `chroot`.
     pub fn chroot(&mut self, start: &Location, path: &[u8]) -> Result<()> {
         let at = self.resolve(start, path, true)?;
