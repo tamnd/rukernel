@@ -117,10 +117,12 @@ pub struct MountInfo<'a> {
     pub fstype: &'a str,
     /// The source of the mount.
     pub source: &'a [u8],
+    /// The propagation of the mount.
+    pub propagation: rk_vfs::Propagation,
 }
 
-/// Writes a line of `/proc/PID/mountinfo`, as `show_mountinfo` of Linux does. The line has no
-/// optional fields, because the mounts have no propagation.
+/// Writes a line of `/proc/PID/mountinfo`, as `show_mountinfo` of Linux does. The optional fields
+/// show the peer group of a shared mount, the master of a slave and `unbindable`.
 pub fn mountinfo(out: &mut Vec<u8>, m: &MountInfo<'_>) {
     let major = ((m.dev >> 8) & 0xfff) | ((m.dev >> 32) & !0xfff);
     let minor = (m.dev & 0xff) | ((m.dev >> 12) & !0xff);
@@ -128,7 +130,18 @@ pub fn mountinfo(out: &mut Vec<u8>, m: &MountInfo<'_>) {
     escape(out, m.root);
     out.push(b' ');
     escape(out, m.path);
-    out.extend_from_slice(format!(" {} - {} ", mount_options(m.flags), m.fstype).as_bytes());
+    out.extend_from_slice(format!(" {}", mount_options(m.flags)).as_bytes());
+    let p = m.propagation;
+    if p.group != 0 {
+        out.extend_from_slice(format!(" shared:{}", p.group).as_bytes());
+    }
+    if p.master != 0 {
+        out.extend_from_slice(format!(" master:{}", p.master).as_bytes());
+    }
+    if p.unbindable {
+        out.extend_from_slice(b" unbindable");
+    }
+    out.extend_from_slice(format!(" - {} ", m.fstype).as_bytes());
     escape(out, m.source);
     let ro = if m.flags as u32 & MS_RDONLY != 0 { "ro" } else { "rw" };
     out.extend_from_slice(format!(" {ro}\n").as_bytes());
@@ -507,9 +520,14 @@ mod tests {
             flags: u64::from(MS_NOATIME),
             fstype: "ext4",
             source: b"/dev/vdb",
+            propagation: rk_vfs::Propagation::default(),
         };
         mountinfo(&mut out, &m);
         assert_eq!(out, b"7 1 254:16 / /mnt rw,noatime - ext4 /dev/vdb rw\n");
+        out.clear();
+        let propagation = rk_vfs::Propagation { group: 3, master: 2, unbindable: false };
+        mountinfo(&mut out, &MountInfo { propagation, ..m });
+        assert_eq!(out, b"7 1 254:16 / /mnt rw,noatime shared:3 master:2 - ext4 /dev/vdb rw\n");
     }
 
     #[test]

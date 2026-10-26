@@ -33,7 +33,9 @@ pub mod swap;
 pub mod wait;
 pub mod xattr;
 
-pub use dentry::{Dentry, Location, Mount, MountNamespace, MountSource};
+pub use dentry::{
+    Dentry, Location, Mount, MountNamespace, MountSource, Propagation, PropagationType,
+};
 pub use fdtable::{FdEntry, FdTable};
 pub use file::{File, FileOps, OpenFlags, UserMemory, Whence};
 pub use fs::FsContext;

@@ -4,9 +4,13 @@
 //! tree that the VFS keeps while a process uses a name, so `getcwd` and `..` work after a rename.
 //! A `Mount` puts the root of a file system on a dentry of another mount. A `Location` is a mount
 //! and a dentry in it, as `struct path` of Linux.
+//!
+//! A mount can be shared, a slave, private or unbindable, as the shared subtrees of Linux. The
+//! shared mounts of a peer group send their mount and unmount events to each other, and to the
+//! mounts that are slaves of the group.
 
 use crate::inode::{InodeRef, Result};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -146,6 +150,31 @@ impl MountSource {
     }
 }
 
+/// The propagation of a mount, as the peer group and the master of a mount of Linux.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Propagation {
+    /// The peer group of a shared mount, or 0 if the mount is not shared.
+    pub group: u64,
+    /// The peer group that sends its events to the mount, or 0 if the mount is not a slave.
+    pub master: u64,
+    /// The mount cannot be the source of a bind mount.
+    pub unbindable: bool,
+}
+
+/// A change of the propagation of a mount, as `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and
+/// `MS_UNBINDABLE` of `mount(2)` give.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropagationType {
+    /// The mount sends its events to its peers and receives their events.
+    Shared,
+    /// The mount receives the events of its old peer group or master, and sends no events.
+    Slave,
+    /// The mount sends and receives no events.
+    Private,
+    /// The mount is private and cannot be the source of a bind mount.
+    Unbindable,
+}
+
 /// A mounted file system.
 pub struct Mount {
     id: u64,
@@ -154,6 +183,9 @@ pub struct Mount {
     /// `fsmount` or `open_tree` made and that is not attached yet.
     mountpoint: SpinLock<Option<Location>>,
     source: SpinLock<MountSource>,
+    propagation: SpinLock<Propagation>,
+    /// The name space of the mount. It is empty for a mount that is not attached.
+    ns: SpinLock<Weak<MountNamespace>>,
 }
 
 impl core::fmt::Debug for Mount {
@@ -163,6 +195,17 @@ impl core::fmt::Debug for Mount {
 }
 
 impl Mount {
+    fn new(root: Arc<Dentry>, source: MountSource) -> Arc<Self> {
+        Arc::new(Self {
+            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
+            root,
+            mountpoint: SpinLock::new(None),
+            source: SpinLock::new(source),
+            propagation: SpinLock::new(Propagation::default()),
+            ns: SpinLock::new(Weak::new()),
+        })
+    }
+
     /// The mount ID, as `/proc/self/mountinfo` shows it.
     pub fn id(&self) -> u64 {
         self.id
@@ -192,6 +235,109 @@ impl Mount {
     pub fn set_flags(&self, flags: u64) {
         self.source.lock().flags = flags;
     }
+
+    /// The propagation of the mount.
+    pub fn propagation(&self) -> Propagation {
+        *self.propagation.lock()
+    }
+
+    fn set_propagation(&self, p: Propagation) {
+        *self.propagation.lock() = p;
+    }
+
+    /// Changes the propagation to `ty`, as `change_mnt_propagation` of Linux.
+    fn change_propagation(self: &Arc<Self>, ty: PropagationType) {
+        let mut p = self.propagation();
+        if ty == PropagationType::Shared {
+            if p.group == 0 {
+                p.group = new_group();
+            }
+            p.unbindable = false;
+            self.set_propagation(p);
+            return;
+        }
+        // The mount leaves its peer group, as `do_make_slave` of Linux. If the group has other
+        // peers, the mount becomes their slave. Else the slaves of the group go to the master of
+        // the mount.
+        if p.group != 0 {
+            let all = attached();
+            let peers =
+                all.iter().any(|m| !Arc::ptr_eq(m, self) && m.propagation().group == p.group);
+            if peers {
+                p.master = p.group;
+            } else {
+                for m in all.iter().filter(|m| m.propagation().master == p.group) {
+                    let mut q = m.propagation();
+                    q.master = p.master;
+                    m.set_propagation(q);
+                }
+            }
+            p.group = 0;
+        }
+        match ty {
+            PropagationType::Private => (p.master, p.unbindable) = (0, false),
+            PropagationType::Unbindable => (p.master, p.unbindable) = (0, true),
+            _ => {}
+        }
+        self.set_propagation(p);
+    }
+
+    fn namespace(&self) -> Option<Arc<MountNamespace>> {
+        self.ns.lock().upgrade()
+    }
+}
+
+/// The mounts of each name space, for the propagation between name spaces.
+static ATTACHED: SpinLock<Vec<Weak<Mount>>> = SpinLock::new(Vec::new());
+
+static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
+
+fn new_group() -> u64 {
+    NEXT_GROUP.fetch_add(1, Ordering::Relaxed)
+}
+
+/// The mounts that are in a name space.
+fn attached() -> Vec<Arc<Mount>> {
+    let mut all = ATTACHED.lock();
+    all.retain(|m| m.strong_count() > 0);
+    all.iter().filter_map(Weak::upgrade).collect()
+}
+
+/// The mounts that receive the events of `from`, which is shared, with the propagation of the
+/// copy of a new mount on each of them, as `propagate_mnt` of Linux. A copy on a peer of `from`
+/// is in the peer group `group`. A copy on a slave is a slave of the group of the copies that its
+/// master gets. A copy on a peer group that is a slave goes in a new peer group, if `copies` is
+/// true.
+fn receivers(from: &Arc<Mount>, group: u64, copies: bool) -> Vec<(Arc<Mount>, Propagation)> {
+    let all = attached();
+    let mut out = Vec::new();
+    let start = from.propagation().group;
+    if start == 0 {
+        return out;
+    }
+    let mut seen = BTreeSet::from([start]);
+    let mut todo = alloc::vec![(start, group, 0)];
+    while let Some((g, copy_group, copy_master)) = todo.pop() {
+        for m in &all {
+            let p = m.propagation();
+            if p.group == g {
+                if !Arc::ptr_eq(m, from) {
+                    let copy =
+                        Propagation { group: copy_group, master: copy_master, unbindable: false };
+                    out.push((m.clone(), copy));
+                }
+            } else if p.master == g {
+                if p.group == 0 {
+                    let copy = Propagation { group: 0, master: copy_group, unbindable: false };
+                    out.push((m.clone(), copy));
+                } else if seen.insert(p.group) {
+                    let next = if copies { new_group() } else { 0 };
+                    todo.push((p.group, next, copy_group));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// A mount and a dentry in it.
@@ -207,12 +353,7 @@ impl Location {
     /// Makes a location for `inode` in a mount of its own, outside each name space. It is for
     /// a file without a name, as a pipe, which the internal mounts of Linux hold.
     pub fn detached(inode: InodeRef) -> Self {
-        let mount = Arc::new(Mount {
-            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
-            root: Dentry::new_root(inode),
-            mountpoint: SpinLock::new(None),
-            source: SpinLock::new(MountSource::rootfs()),
-        });
+        let mount = Mount::new(Dentry::new_root(inode), MountSource::rootfs());
         Location { dentry: mount.root.clone(), mount }
     }
 
@@ -265,6 +406,7 @@ impl Location {
 pub struct MountNamespace {
     root: Arc<Mount>,
     mounts: SpinLock<Vec<Arc<Mount>>>,
+    me: Weak<MountNamespace>,
 }
 
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
@@ -272,13 +414,15 @@ static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 impl MountNamespace {
     /// Makes a name space with the root `root`. The root mount has the source `rootfs`.
     pub fn new(root: InodeRef) -> Arc<Self> {
-        let mount = Arc::new(Mount {
-            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
-            root: Dentry::new_root(root),
-            mountpoint: SpinLock::new(None),
-            source: SpinLock::new(MountSource::rootfs()),
+        let mount = Mount::new(Dentry::new_root(root), MountSource::rootfs());
+        let ns = Arc::new_cyclic(|me| Self {
+            root: mount.clone(),
+            mounts: SpinLock::new(Vec::from([mount.clone()])),
+            me: me.clone(),
         });
-        Arc::new(Self { root: mount.clone(), mounts: SpinLock::new(Vec::from([mount])) })
+        *mount.ns.lock() = ns.me.clone();
+        ATTACHED.lock().push(Arc::downgrade(&mount));
+        ns
     }
 
     /// The root of the name space.
@@ -295,9 +439,20 @@ impl MountNamespace {
     }
 
     /// Mounts the tree at `from` on `at`, for `MS_BIND`. The new mount has the source of the
-    /// mount of `from`. A file can be mounted on a file, and a directory on a directory.
+    /// mount of `from`. A file can be mounted on a file, and a directory on a directory. Gives
+    /// `EINVAL` if the mount of `from` is unbindable.
+    ///
+    /// The new mount is a peer of a shared source, and a slave of the master of a slave source,
+    /// as the shared subtrees of Linux.
     pub fn bind(&self, from: &Location, at: &Location) -> Result<Arc<Mount>> {
-        self.mount_dentry(from.dentry.clone(), at, from.mount.source())
+        let p = from.mount.propagation();
+        if p.unbindable {
+            return Err(Errno::EINVAL);
+        }
+        let mount = Self::detached(from.dentry.clone(), from.mount.source());
+        mount.set_propagation(Propagation { unbindable: false, ..p });
+        self.attach(&mount, at)?;
+        Ok(mount)
     }
 
     fn mount_dentry(
@@ -314,12 +469,7 @@ impl MountNamespace {
     /// Makes a mount of the tree at `root` that is not in a name space, for `fsmount` and
     /// `open_tree`. `attach` puts it in a name space.
     pub fn detached(root: Arc<Dentry>, source: MountSource) -> Arc<Mount> {
-        Arc::new(Mount {
-            id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
-            root,
-            mountpoint: SpinLock::new(None),
-            source: SpinLock::new(source),
-        })
+        Mount::new(root, source)
     }
 
     /// Makes a mount of the tree at `from` that is not in a name space, for `open_tree` with
@@ -335,16 +485,70 @@ impl MountNamespace {
 
     /// Puts the mount `mount`, which is not in a name space, on `at`. A file can be mounted on a
     /// file, and a directory on a directory. Gives `EINVAL` if the mount is in a name space.
+    ///
+    /// If the mount of `at` is shared, the mount becomes shared, and each mount that receives
+    /// the events of the mount of `at` gets a copy of the mount at the same place.
     pub fn attach(&self, mount: &Arc<Mount>, at: &Location) -> Result<()> {
         if mount.root.inode().metadata().is_dir() != at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
-        let mut mounts = self.mounts.lock();
-        if mount.mountpoint().is_some() || mounts.iter().any(|m| Arc::ptr_eq(m, mount)) {
+        if mount.mountpoint().is_some() || self.contains(mount) {
             return Err(Errno::EINVAL);
         }
+        let mut p = mount.propagation();
+        let shared = at.mount.propagation().group != 0;
+        if shared && p.group == 0 {
+            p.group = new_group();
+            mount.set_propagation(p);
+        }
+        let targets = if shared { receivers(&at.mount, p.group, true) } else { Vec::new() };
+        self.attach_one(mount, at);
+        for (m, copy_p) in targets {
+            let Some(ns) = m.namespace() else { continue };
+            if !at.dentry.is_under(&m.root) {
+                continue;
+            }
+            let copy = Mount::new(mount.root.clone(), mount.source());
+            copy.set_propagation(copy_p);
+            ns.attach_one(&copy, &Location { mount: m, dentry: at.dentry.clone() });
+        }
+        Ok(())
+    }
+
+    fn attach_one(&self, mount: &Arc<Mount>, at: &Location) {
         *mount.mountpoint.lock() = Some(at.clone());
-        mounts.push(mount.clone());
+        *mount.ns.lock() = self.me.clone();
+        self.mounts.lock().push(mount.clone());
+        ATTACHED.lock().push(Arc::downgrade(mount));
+    }
+
+    /// Changes the propagation of the mount of `at` to `ty`, and of each mount under it if
+    /// `recursive` is true. Gives `EINVAL` if `at` is not the root of a mount of the name space.
+    pub fn set_propagation(
+        &self,
+        at: &Location,
+        ty: PropagationType,
+        recursive: bool,
+    ) -> Result<()> {
+        if !at.is_mount_root() || !self.contains(&at.mount) {
+            return Err(Errno::EINVAL);
+        }
+        let mut tree = Vec::from([at.mount.clone()]);
+        if recursive {
+            for m in self.mounts() {
+                let mut up = m.mountpoint().map(|p| p.mount);
+                while let Some(u) = up {
+                    if Arc::ptr_eq(&u, &at.mount) {
+                        tree.push(m.clone());
+                        break;
+                    }
+                    up = u.mountpoint().map(|p| p.mount);
+                }
+            }
+        }
+        for m in &tree {
+            m.change_propagation(ty);
+        }
         Ok(())
     }
 
@@ -412,18 +616,43 @@ impl MountNamespace {
 
     /// Removes the mount on `at`, which is the root of the mount. Gives `EBUSY` if another mount
     /// is on the mount, and `EINVAL` if `at` is not the root of a mount.
+    ///
+    /// If the parent mount is shared, each mount that receives its events loses the copy of the
+    /// mount at the same place, if no mount is on the copy, as `propagate_umount` of Linux.
     pub fn unmount(&self, at: &Location) -> Result<()> {
-        if !at.is_mount_root() || at.mount.mountpoint().is_none() {
+        let Some(place) = at.mount.mountpoint().filter(|_| at.is_mount_root()) else {
             return Err(Errno::EINVAL);
-        }
-        let mut mounts = self.mounts.lock();
-        let busy =
-            mounts.iter().any(|m| m.mountpoint().is_some_and(|p| Arc::ptr_eq(&p.mount, &at.mount)));
-        if busy {
+        };
+        if !self.remove(&at.mount) {
             return Err(Errno::EBUSY);
         }
-        mounts.retain(|m| !Arc::ptr_eq(m, &at.mount));
+        for (m, _) in receivers(&place.mount, 0, false) {
+            let Some(ns) = m.namespace() else { continue };
+            let on = Location { mount: m, dentry: place.dentry.clone() };
+            if let Some(copy) = ns.mounted_on(&on)
+                && Arc::ptr_eq(&copy.root, &at.mount.root)
+            {
+                ns.remove(&copy);
+            }
+        }
         Ok(())
+    }
+
+    /// Removes `mount` from the name space, if no mount is on it. Tells if it removed it.
+    fn remove(&self, mount: &Arc<Mount>) -> bool {
+        {
+            let mut mounts = self.mounts.lock();
+            let busy =
+                mounts.iter().any(|m| m.mountpoint().is_some_and(|p| Arc::ptr_eq(&p.mount, mount)));
+            if busy {
+                return false;
+            }
+            mounts.retain(|m| !Arc::ptr_eq(m, mount));
+        }
+        mount.change_propagation(PropagationType::Private);
+        *mount.ns.lock() = Weak::new();
+        ATTACHED.lock().retain(|m| !core::ptr::eq(m.as_ptr(), Arc::as_ptr(mount)));
+        true
     }
 
     /// The last mount on `at`, if a mount is on it.

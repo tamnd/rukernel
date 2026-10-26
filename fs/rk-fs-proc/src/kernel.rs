@@ -554,6 +554,7 @@ fn mountinfo_of(p: &Process) -> Result<Vec<u8>> {
             flags: src.flags,
             fstype: src.fstype,
             source: &src.source,
+            propagation: m.propagation(),
         };
         text::mountinfo(&mut out, &info);
     }
