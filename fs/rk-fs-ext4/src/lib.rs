@@ -241,6 +241,10 @@ pub struct Fs {
     minix_df: AtomicBool,
     /// `FS_IOC_GOINGDOWN` stopped the file system. Nothing goes to the disk again.
     shut: AtomicBool,
+    /// `FIFREEZE` stopped the changes until `FITHAW`.
+    frozen: AtomicBool,
+    /// The changes that wait for `FITHAW`.
+    thawed: rk_vfs::wait::WaitQueue,
     this: Weak<Fs>,
 }
 
@@ -324,6 +328,8 @@ impl Fs {
             inodes_live: AtomicUsize::new(0),
             minix_df: AtomicBool::new(false),
             shut: AtomicBool::new(false),
+            frozen: AtomicBool::new(false),
+            thawed: rk_vfs::wait::WaitQueue::new(),
             this: Weak::new(),
         };
         if journal {
@@ -335,7 +341,7 @@ impl Fs {
         }))
     }
 
-    /// Starts a change of the file system.
+    /// Starts a change of the file system. On a frozen file system it waits for the thaw.
     ///
     /// # Errors
     ///
@@ -344,7 +350,14 @@ impl Fs {
         if !self.writable {
             return Err(Errno::EROFS);
         }
-        let meta = self.meta.lock();
+        let meta = loop {
+            self.thawed.wait_until(|| (!self.frozen.load(Ordering::Acquire)).then_some(()));
+            let meta = self.meta.lock();
+            // A freeze can come between the wait and the lock.
+            if !self.frozen.load(Ordering::Acquire) {
+                break meta;
+            }
+        };
         self.check_shut()?;
         Ok(Tx { fs: self, meta })
     }
@@ -770,6 +783,75 @@ impl Fs {
         tx.write_sb(0, 0)?;
         drop(tx);
         self.sync()
+    }
+
+    /// Tells if `FIFREEZE` stopped the changes.
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    /// Stops the changes for `FIFREEZE`, as `freeze_super` and `ext4_freeze` of Linux. The
+    /// changes before the freeze go to their places on the disk and the journal becomes empty,
+    /// so the disk is clean until the thaw. A change after the freeze waits for the thaw.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EBUSY` if the file system is frozen, `EIO` after a shutdown, or the error of the
+    /// disk.
+    pub(crate) fn freeze(&self) -> Result<()> {
+        self.check_shut()?;
+        // The lock waits for a running change.
+        let meta = self.meta.lock();
+        if self.frozen.swap(true, Ordering::AcqRel) {
+            return Err(Errno::EBUSY);
+        }
+        drop(meta);
+        if !self.writable {
+            return Ok(());
+        }
+        let result = self.flush_frozen();
+        if result.is_err() {
+            self.thaw_now();
+        }
+        result
+    }
+
+    /// Writes all the changes and empties the journal of a frozen file system.
+    fn flush_frozen(&self) -> Result<()> {
+        let meta = self.meta.lock();
+        self.commit(true);
+        if let Some(log) = &self.log {
+            log.lock().checkpoint(self)?;
+            drop(meta);
+            self.mark_recover(false)?;
+        } else {
+            drop(meta);
+        }
+        self.disk.write_back(0, u64::MAX)?;
+        self.disk.flush()
+    }
+
+    /// Starts the changes again for `FITHAW`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` if the file system is not frozen, or the error of the disk.
+    pub(crate) fn thaw(&self) -> Result<()> {
+        if !self.is_frozen() {
+            return Err(Errno::EINVAL);
+        }
+        let result = if self.writable && self.log.is_some() && !self.shut.load(Ordering::Relaxed) {
+            self.mark_recover(true)
+        } else {
+            Ok(())
+        };
+        self.thaw_now();
+        result
+    }
+
+    fn thaw_now(&self) {
+        self.frozen.store(false, Ordering::Release);
+        self.thawed.wake_all();
     }
 
     /// Writes the transactions of the journal to their places and empties the journal, for

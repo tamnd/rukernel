@@ -9,6 +9,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `statx` gives the creation time of a file in `stx_btime` with `STATX_BTIME` on ext4, tmpfs and XFS, as Linux. An ext4 inode without room for the time and an XFS inode before version 3 do not have it. generic/528 now passes.
 - `FS_IOC_GETFSLABEL` and `FS_IOC_SETFSLABEL` on ext4, as Linux. They read and change the label of a mounted file system. The new label goes to the disk at once, so `blkid` sees it while the file system is mounted. A label longer than 16 bytes gives `EINVAL`, and a change needs `CAP_SYS_ADMIN`. generic/492 now passes.
 - The DAX flag of ext4, as Linux. `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR` show and change it as `FS_XFLAG_DAX`, and `FS_IOC_SETFLAGS` changes it as `FS_DAX_FL`. A new inode gets the inherited flags of its directory, as `__ext4_new_inode` of Linux, so a new file in a directory with the DAX flag also has the flag. The kernel does not use direct access, so the flag changes nothing else. generic/607 now passes.
+- `FIFREEZE` and `FITHAW` on ext4, as Linux. A freeze writes all the changes to their places on the disk and empties the journal, so the disk is clean. A change after the freeze waits for the thaw, and a read does not change the access time. The caller needs `CAP_SYS_ADMIN`. generic/491 and generic/738 now pass.
 
 ## [0.3.18] - 2026-10-27
 
