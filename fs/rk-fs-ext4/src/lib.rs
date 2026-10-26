@@ -950,6 +950,10 @@ impl Fs {
     /// after a shutdown, or the error of the disk.
     pub(crate) fn set_read_only(&self, read_only: bool) -> Result<()> {
         self.check_shut()?;
+        // The delayed writes go to the disk before the file system becomes read only.
+        if read_only && self.writable() {
+            self.flush_all()?;
+        }
         // The lock waits for a running change.
         let meta = self.meta.lock();
         if self.is_frozen() {
@@ -999,7 +1003,7 @@ impl Fs {
     pub(crate) fn freeze(&self) -> Result<()> {
         self.check_shut()?;
         // The delayed writes go to the disk before the freeze, as `sync_filesystem` of Linux.
-        if self.writable {
+        if self.writable() {
             self.flush_all()?;
         }
         // The lock waits for a running change.

@@ -58,7 +58,7 @@ impl Fs {
     /// `nodelalloc`. The kept blocks are not clusters, so a file system with `bigalloc` does
     /// not use the delayed allocation.
     pub(crate) fn set_delalloc(&self, on: bool) {
-        let on = on && self.writable && self.sb.cluster_ratio() == 1;
+        let on = on && self.writable() && self.sb.cluster_ratio() == 1;
         self.delalloc.store(on, Ordering::Relaxed);
     }
 

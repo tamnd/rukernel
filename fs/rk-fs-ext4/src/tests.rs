@@ -2374,6 +2374,18 @@ fn a_change_of_the_extents_writes_back_the_delayed_blocks() {
 }
 
 #[test]
+fn a_read_only_remount_writes_back_the_delayed_blocks() {
+    let (fs, _ram) = open_delalloc();
+    let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
+    file.write_at(0, &[7u8; 100]).unwrap();
+    assert_eq!(fs.delayed_count(), 1);
+    fs.set_read_only(true).unwrap();
+    assert_eq!(fs.delayed_count(), 0);
+    assert!(file.fiemap(0, u64::MAX).unwrap().iter().all(|e| !e.delalloc));
+    assert!(read_all(&*file).iter().all(|&b| b == 7));
+}
+
+#[test]
 fn the_unmount_writes_back_the_delayed_blocks() {
     let (fs, ram) = open_delalloc();
     let file = fs.root().unwrap().create(b"f", FileType::Regular, 0o644, 0).unwrap();
