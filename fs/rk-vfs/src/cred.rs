@@ -425,10 +425,13 @@ impl Cred {
 
     /// Removes the set-group-ID bit from the mode `perm` of a new file in the directory `dir`, as
     /// `mode_strip_sgid` of Linux. The bit stays on a directory, on a file that is not executable
-    /// by the group, and for a process that is in the group of `dir` or has `CAP_FSETID`. Use
-    /// this before the umask, because the umask can remove the execute bit of the group.
+    /// by the group, in a directory without the set-group-ID bit, and for a process that is in
+    /// the group of `dir` or has `CAP_FSETID`. In a directory without the bit, the file gets the
+    /// file system group of the process, thus the bit is safe. Use this before the umask, because
+    /// the umask can remove the execute bit of the group.
     pub fn strip_sgid(&self, dir: &Metadata, kind: FileType, perm: u32) -> u32 {
         if kind != FileType::Directory
+            && dir.mode & mode::S_ISGID != 0
             && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
             && !self.in_group(dir.gid)
             && !self.capable(cap::FSETID)
@@ -641,12 +644,19 @@ impl Cred {
         Ok(new)
     }
 
-    /// The new credentials after `setresuid`.
+    /// The new credentials after `setresuid`. A call that changes no ID keeps the file system
+    /// user ID, as `__sys_setresuid` of Linux.
     ///
     /// # Errors
     ///
     /// Gives `EPERM` if the caller has no `CAP_SETUID` and an ID is not one of its three IDs.
     pub fn setresuid(&self, ruid: u32, euid: u32, suid: u32) -> Result<Self> {
+        if (ruid == KEEP || ruid == self.uid)
+            && (euid == KEEP || (euid == self.euid && euid == self.fsuid))
+            && (suid == KEEP || suid == self.suid)
+        {
+            return Ok(self.clone());
+        }
         let old = [self.uid, self.euid, self.suid];
         if !self.capable(cap::SETUID)
             && [ruid, euid, suid].iter().any(|id| *id != KEEP && !old.contains(id))
@@ -732,12 +742,19 @@ impl Cred {
         Ok(new)
     }
 
-    /// The new credentials after `setresgid`.
+    /// The new credentials after `setresgid`. A call that changes no ID keeps the file system
+    /// group ID, as `__sys_setresgid` of Linux.
     ///
     /// # Errors
     ///
     /// Gives `EPERM` if the caller has no `CAP_SETGID` and an ID is not one of its three IDs.
     pub fn setresgid(&self, rgid: u32, egid: u32, sgid: u32) -> Result<Self> {
+        if (rgid == KEEP || rgid == self.gid)
+            && (egid == KEEP || (egid == self.egid && egid == self.fsgid))
+            && (sgid == KEEP || sgid == self.sgid)
+        {
+            return Ok(self.clone());
+        }
         let old = [self.gid, self.egid, self.sgid];
         if !self.capable(cap::SETGID)
             && [rgid, egid, sgid].iter().any(|id| *id != KEEP && !old.contains(id))
@@ -850,12 +867,13 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Gives `EINVAL` for an unknown capability, or `EPERM` without `CAP_SETPCAP`.
+    /// Gives `EPERM` without `CAP_SETPCAP`, or `EINVAL` for an unknown capability. Linux does
+    /// the checks in this order.
     pub fn drop_bset(&self, c: u64) -> Result<Self> {
-        let c = valid_cap(c)?;
         if !self.capable(cap::SETPCAP) {
             return Err(Errno::EPERM);
         }
+        let c = valid_cap(c)?;
         let mut new = self.clone();
         new.cap_bset &= !cap::bit(c);
         Ok(new)
@@ -1012,6 +1030,47 @@ mod tests {
     }
 
     #[test]
+    fn the_group_calls_follow_the_user_calls() {
+        let c = Cred::root().setgid(50).unwrap();
+        assert_eq!((c.gid, c.egid, c.sgid, c.fsgid), (50, 50, 50, 50));
+        assert_eq!(user(1000).setresgid(KEEP, KEEP, 60), Err(Errno::EPERM));
+        let c = Cred::root().setresgid(10, 20, 30).unwrap().setresuid(1000, 1000, 1000).unwrap();
+        assert_eq!(c.setgid(30).map(|n| (n.gid, n.egid, n.sgid, n.fsgid)), Ok((10, 30, 30, 30)));
+        assert_eq!(c.setgid(40), Err(Errno::EPERM));
+        assert_eq!(c.setregid(KEEP, 30).map(|n| (n.gid, n.egid, n.sgid)), Ok((10, 30, 30)));
+        assert_eq!(c.setregid(30, KEEP), Err(Errno::EPERM));
+        assert_eq!(c.setregid(20, KEEP).map(|n| (n.gid, n.egid, n.sgid)), Ok((20, 20, 20)));
+        assert_eq!(c.setresgid(30, 10, 20).map(|n| (n.gid, n.egid, n.sgid)), Ok((30, 10, 20)));
+        assert_eq!(c.setresgid(KEEP, 40, KEEP), Err(Errno::EPERM));
+        assert_eq!(c.setfsgid(30).map(|n| n.fsgid), Some(30));
+        assert!(c.setfsgid(40).is_none());
+        assert_eq!(c.setgid(KEEP), Err(Errno::EINVAL));
+        assert_eq!(c.setuid(KEEP), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn a_setresuid_that_changes_nothing_keeps_the_file_system_id() {
+        let c = Cred::root().setresuid(1000, 1000, 0).unwrap().setfsuid(0).unwrap();
+        assert_eq!((c.euid, c.fsuid), (1000, 0));
+        assert_eq!(c.setresuid(KEEP, KEEP, KEEP).map(|n| n.fsuid), Ok(0));
+        assert_eq!(c.setresuid(1000, KEEP, 0).map(|n| n.fsuid), Ok(0));
+        assert_eq!(c.setresuid(KEEP, 1000, KEEP).map(|n| n.fsuid), Ok(1000));
+        let g = Cred::root().setresgid(10, 10, 10).unwrap().setfsgid(0).unwrap();
+        assert_eq!(g.setresgid(KEEP, KEEP, KEEP).map(|n| n.fsgid), Ok(0));
+        assert_eq!(g.setresgid(KEEP, 10, KEEP).map(|n| n.fsgid), Ok(10));
+    }
+
+    #[test]
+    fn the_bounding_set_drop_checks_the_capability_first() {
+        assert_eq!(user(1000).drop_bset(u64::from(cap::LAST + 1)), Err(Errno::EPERM));
+        assert_eq!(Cred::root().drop_bset(u64::from(cap::LAST + 1)), Err(Errno::EINVAL));
+        let c = Cred::root().drop_bset(u64::from(cap::SYS_ADMIN)).unwrap();
+        assert_eq!(c.cap_bset, cap::ALL & !cap::bit(cap::SYS_ADMIN));
+        let file = ExecFile { mode: 0o755, uid: 0, gid: 0, no_setid: false };
+        assert!(!c.exec(file).0.capable(cap::SYS_ADMIN));
+    }
+
+    #[test]
     fn setfsuid_moves_the_file_capabilities() {
         let c = Cred::root().setfsuid(1000).unwrap();
         assert_eq!(c.fsuid, 1000);
@@ -1073,6 +1132,26 @@ mod tests {
         let (c, secure) = user(1000).exec(ExecFile { no_setid: true, ..file });
         assert_eq!((c.euid, c.cap_permitted), (1000, 0));
         assert!(!secure);
+    }
+
+    #[test]
+    fn exec_keeps_the_ambient_set_and_applies_the_setgid_bit() {
+        let kill = cap::bit(cap::KILL);
+        let c = Cred::root().capset(cap::ALL, cap::ALL, kill).unwrap();
+        let c = c.set_ambient(u64::from(cap::KILL), true).unwrap();
+        let c = c.set_keepcaps(1).unwrap().setresuid(1000, 1000, 1000).unwrap();
+        let c = c.set_ambient(u64::from(cap::KILL), true).unwrap();
+        let plain = ExecFile { mode: 0o755, uid: 0, gid: 0, no_setid: false };
+        let (n, secure) = c.exec(plain);
+        assert_eq!((n.cap_permitted, n.cap_effective, n.cap_ambient), (kill, kill, kill));
+        assert_eq!(n.securebits & secure::KEEP_CAPS, 0);
+        assert!(!secure);
+        let (n, secure) = c.exec(ExecFile { mode: 0o2755, gid: 50, ..plain });
+        assert_eq!((n.gid, n.egid, n.sgid, n.fsgid), (0, 50, 50, 50));
+        assert_eq!((n.cap_permitted, n.cap_ambient), (0, 0));
+        assert!(secure);
+        let (n, _) = c.exec(ExecFile { mode: 0o2745, gid: 50, ..plain });
+        assert_eq!(n.egid, 0);
     }
 
     #[test]
@@ -1176,7 +1255,8 @@ mod tests {
         let plain = meta(mode::S_IFDIR, 0o755, 0, 50);
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o644), (1000, 1000, 0o644));
         assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2744), (1000, 1000, 0o2744));
-        assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2775), (1000, 1000, 0o775));
+        assert_eq!(u.new_owner(&plain, FileType::Regular, 0o2775), (1000, 1000, 0o2775));
+        assert_eq!(u.strip_sgid(&plain, FileType::Regular, 0o2010), 0o2010);
         assert_eq!(u.strip_sgid(&dir, FileType::Regular, 0o2010), 0o10);
         assert_eq!(u.strip_sgid(&dir, FileType::Directory, 0o2010), 0o2010);
         assert_eq!(u.strip_sgid(&dir, FileType::Regular, 0o2000), 0o2000);

@@ -92,7 +92,9 @@ pub(crate) fn pidfd_send_signal(
         return Err(Errno::ESRCH);
     }
     let info = if uinfo == 0 {
-        SigInfo::new(sig as u32, SI_USER, cx.process().pid())
+        let mut info = SigInfo::new(sig as u32, SI_USER, cx.process().pid());
+        info.uid = cx.process().cred().uid;
+        info
     } else {
         let b = cx.read_bytes(uinfo, SIGINFO_SIZE)?;
         let mut raw = [0u8; SIGINFO_SIZE];

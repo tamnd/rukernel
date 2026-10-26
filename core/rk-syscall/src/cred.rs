@@ -132,8 +132,12 @@ pub(crate) fn getgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
     Ok(n as u64)
 }
 
-/// `setgroups`.
+/// `setgroups`. As Linux, the check of `CAP_SETGID` comes before the checks of the size and of
+/// the list.
 pub(crate) fn setgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
+    if !cred(cx).capable(cap::SETGID) {
+        return Err(Errno::EPERM);
+    }
     let size = size as i32;
     if size < 0 || size as usize > NGROUPS_MAX {
         return Err(Errno::EINVAL);

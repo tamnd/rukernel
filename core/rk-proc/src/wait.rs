@@ -107,6 +107,8 @@ pub struct WaitOptions {
 pub struct WaitResult {
     /// The process ID of the child, or the thread ID of the traced thread.
     pub pid: u32,
+    /// The real user ID of the child, for `si_uid` of `waitid`.
+    pub uid: u32,
     /// The status.
     pub status: WaitStatus,
     /// The user CPU time in timer ticks.

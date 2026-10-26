@@ -501,7 +501,8 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let me = cx.process();
-    let info = SigInfo::new(sig as u32, SI_USER, me.pid());
+    let mut info = SigInfo::new(sig as u32, SI_USER, me.pid());
+    info.uid = me.cred().uid;
     match pid as i32 {
         0 => kill_group(cx, me.pgid(), info)?,
         -1 => {
@@ -548,7 +549,9 @@ fn signal_thread(cx: &Cx<'_>, tgid: Option<u64>, tid: u64, sig: u64) -> SysResul
     }
     may_signal(cx, thread.process(), sig as u32)?;
     if sig != 0 {
-        thread.send_signal(SigInfo::new(sig as u32, SI_TKILL, cx.process().pid()));
+        let mut info = SigInfo::new(sig as u32, SI_TKILL, cx.process().pid());
+        info.uid = cx.process().cred().uid;
+        thread.send_signal(info);
     }
     Ok(0)
 }

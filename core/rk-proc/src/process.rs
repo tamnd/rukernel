@@ -1289,6 +1289,7 @@ fn notify_stop(process: &Process, parent: &Process, status: WaitStatus) {
     if parent.action(SIGCHLD).flags & u64::from(SA_NOCLDSTOP) == 0 {
         let (code, value) = status.child_code();
         let mut info = SigInfo::new(SIGCHLD, code, process.pid);
+        info.uid = process.cred().uid;
         info.status = value;
         send_signal(parent, info);
     }
@@ -1346,6 +1347,7 @@ fn notify_parent(process: &Process, parent: &Process, status: WaitStatus) -> boo
     if sig != 0 {
         let (code, value) = status.child_code();
         let mut info = SigInfo::new(sig, code, process.pid);
+        info.uid = process.cred().uid;
         info.status = value;
         send_signal(parent, info);
     }
@@ -1507,7 +1509,9 @@ pub fn wait_child(
                     cs.report = None;
                 }
                 drop(cs);
-                let r = WaitResult { pid: c.pid, status, ticks: c.user_ticks(), trapped: false };
+                let uid = c.cred().uid;
+                let r =
+                    WaitResult { pid: c.pid, uid, status, ticks: c.user_ticks(), trapped: false };
                 return Some(Ok(Some(r)));
             }
         }
@@ -1522,7 +1526,14 @@ pub fn wait_child(
                 process.child_ticks.fetch_add(ticks, Ordering::Relaxed);
                 TABLE.lock().processes.remove(&child.pid);
             }
-            return Some(Ok(Some(WaitResult { pid: child.pid, status, ticks, trapped: false })));
+            let uid = child.cred().uid;
+            return Some(Ok(Some(WaitResult {
+                pid: child.pid,
+                uid,
+                status,
+                ticks,
+                trapped: false,
+            })));
         }
         if !found {
             return Some(Err(Errno::ECHILD));
