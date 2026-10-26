@@ -455,10 +455,16 @@ mod fiemap {
     const EXTENT: usize = 56;
     /// `FIEMAP_FLAG_SYNC`: the file is synced first.
     const FLAG_SYNC: u32 = 0x1;
+    /// `FIEMAP_FLAG_XATTR`: the extents of the extended attributes are given.
+    const FLAG_XATTR: u32 = 0x2;
     /// `FIEMAP_MAX_EXTENTS`.
     const MAX_EXTENTS: u32 = u32::MAX / EXTENT as u32;
     /// `FIEMAP_EXTENT_LAST`.
     const EXTENT_LAST: u32 = 0x1;
+    /// `FIEMAP_EXTENT_NOT_ALIGNED`.
+    const EXTENT_NOT_ALIGNED: u32 = 0x100;
+    /// `FIEMAP_EXTENT_DATA_INLINE`.
+    const EXTENT_DATA_INLINE: u32 = 0x200;
     /// `FIEMAP_EXTENT_UNWRITTEN`.
     const EXTENT_UNWRITTEN: u32 = 0x800;
 
@@ -478,9 +484,10 @@ mod fiemap {
         if count > MAX_EXTENTS {
             return Err(Errno::EINVAL);
         }
-        if flags & !FLAG_SYNC != 0 {
+        let known = FLAG_SYNC | FLAG_XATTR;
+        if flags & !known != 0 {
             // Linux gives back the flags that it does not know.
-            mem.write(arg + 16, &(flags & !FLAG_SYNC).to_ne_bytes())?;
+            mem.write(arg + 16, &(flags & !known).to_ne_bytes())?;
             return Err(Errno::EBADR);
         }
         if len == 0 {
@@ -492,7 +499,12 @@ mod fiemap {
         if flags & FLAG_SYNC != 0 {
             inode.sync()?;
         }
-        let extents = inode.fiemap(start, len.min(u64::MAX - start))?;
+        let extents = if flags & FLAG_XATTR != 0 {
+            // As the iomap of Linux, a `start` past the end of the extent gives no extent.
+            inode.fiemap_xattr()?.filter(|e| start < e.length).into_iter().collect()
+        } else {
+            inode.fiemap(start, len.min(u64::MAX - start))?
+        };
         let mapped = if count == 0 { extents.len() } else { extents.len().min(count as usize) };
         for (i, e) in extents.iter().take(count as usize).enumerate() {
             let mut raw = [0u8; EXTENT];
@@ -500,6 +512,9 @@ mod fiemap {
             raw[8..16].copy_from_slice(&e.physical.to_ne_bytes());
             raw[16..24].copy_from_slice(&e.length.to_ne_bytes());
             let mut f = if e.unwritten { EXTENT_UNWRITTEN } else { 0 };
+            if e.inline {
+                f |= EXTENT_DATA_INLINE | EXTENT_NOT_ALIGNED;
+            }
             if i + 1 == extents.len() {
                 f |= EXTENT_LAST;
             }

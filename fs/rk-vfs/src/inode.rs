@@ -252,6 +252,13 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 
+    /// Gives the extent that keeps the extended attributes, or `None` if there is no such
+    /// extent, for `FS_IOC_FIEMAP` with `FIEMAP_FLAG_XATTR`. The extent starts at the logical
+    /// offset 0. The default gives `EOPNOTSUPP`.
+    fn fiemap_xattr(&self) -> Result<Option<FiemapExtent>> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Gives the inode flags of [`iflags`], for `FS_IOC_GETFLAGS`. The default gives `ENOTTY`, as
     /// Linux gives for a file system that does not have the ioctl.
     fn attr_flags(&self) -> Result<u32> {
@@ -444,6 +451,8 @@ pub struct FiemapExtent {
     pub length: u64,
     /// The extent has blocks that are not written, and it reads as zeros.
     pub unwritten: bool,
+    /// The extent is data in the inode, and it is not aligned to a block.
+    pub inline: bool,
 }
 
 /// The flags of `EXT4_IOC_CHECKPOINT`, from `<linux/ext4.h>`.

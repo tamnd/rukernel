@@ -461,6 +461,10 @@ impl Inode for Node {
         self.real().fiemap(start, len)
     }
 
+    fn fiemap_xattr(&self) -> Result<Option<rk_vfs::inode::FiemapExtent>> {
+        self.real().fiemap_xattr()
+    }
+
     fn attr_flags(&self) -> Result<u32> {
         self.real().attr_flags()
     }

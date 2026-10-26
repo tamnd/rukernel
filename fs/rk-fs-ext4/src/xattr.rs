@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_vfs::Result;
 use rk_vfs::acl::{Acl, Entry, UNDEFINED_ID, tag};
+use rk_vfs::inode::FiemapExtent;
 
 /// The magic number of the attributes of an inode and of an attribute block.
 const MAGIC: u32 = 0xea02_0000;
@@ -243,6 +244,34 @@ impl Fs {
             parse(&data, BLOCK_HEADER, 0, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// Gives the extent of the extended attributes of the inode `ino` with `raw`, as
+    /// `ext4_iomap_xattr_fiemap`. Attributes in the inode give the area after the extra fields,
+    /// and else the attribute block gives one block. As Linux, the address of the area is from
+    /// the start of the block of the inode, without the offset of the inode in that block.
+    pub(crate) fn xattr_extent(&self, ino: u32, raw: &RawInode) -> Result<Option<FiemapExtent>> {
+        let bs = self.sb.block_size;
+        if let Some(start) = ibody_start(raw)
+            && u32_at(&raw.0, start) == MAGIC
+        {
+            let block = self.inode_at(ino)? / bs;
+            return Ok(Some(FiemapExtent {
+                logical: 0,
+                physical: block * bs + start as u64,
+                length: (raw.0.len() - start) as u64,
+                unwritten: false,
+                inline: true,
+            }));
+        }
+        let block = raw.file_acl();
+        Ok((block != 0).then_some(FiemapExtent {
+            logical: 0,
+            physical: block * bs,
+            length: bs,
+            unwritten: false,
+            inline: false,
+        }))
     }
 
     /// Writes the attribute block `data` at `block`, with its checksum.
