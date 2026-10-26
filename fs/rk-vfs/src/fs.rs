@@ -337,6 +337,10 @@ impl FsContext {
             return Err(Errno::ENOTDIR);
         }
         let write = matches!(flags & o::O_ACCMODE, o::O_WRONLY | o::O_RDWR);
+        // A read only file system does not open a file for a write, as `sb_permission` of Linux.
+        if write && kind == FileType::Regular && at.inode().is_read_only() {
+            return Err(Errno::EROFS);
+        }
         // The checks of the inode flags of `may_open` of Linux.
         if matches!(kind, FileType::Regular | FileType::Directory) {
             let iflags = at.inode().attr_flags().unwrap_or(0);

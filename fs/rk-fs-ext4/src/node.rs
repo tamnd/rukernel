@@ -1011,7 +1011,7 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        if self.fs.writable && self.raw.lock().links() == 0 {
+        if self.fs.writable() && self.raw.lock().links() == 0 {
             self.fs.orphan(self.ino);
         }
     }
@@ -1052,6 +1052,14 @@ impl Inode for Node {
 
     fn freeze(&self, frozen: bool) -> Result<()> {
         if frozen { self.fs.freeze() } else { self.fs.thaw() }
+    }
+
+    fn set_read_only(&self, read_only: bool) -> Result<()> {
+        self.fs.set_read_only(read_only)
+    }
+
+    fn is_read_only(&self) -> bool {
+        !self.fs.writable()
     }
 
     fn metadata(&self) -> Metadata {

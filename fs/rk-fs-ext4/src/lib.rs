@@ -219,8 +219,11 @@ pub struct Fs {
     blocks: AtomicU64,
     /// The block groups. An online resize adds groups at the end.
     groups: SpinLock<Vec<GroupDesc>>,
-    /// The file system can change.
-    writable: bool,
+    /// The file system can change. A remount changes it.
+    writable: AtomicBool,
+    /// The mount was a read and write mount, so a remount can make the file system writable
+    /// again.
+    rw_mount: bool,
     /// The seed of the crc32c checksums, for `metadata_csum`.
     csum_seed: u32,
     meta: SpinLock<Meta>,
@@ -274,7 +277,7 @@ impl Fs {
         if fs.log.is_some() {
             fs.mark_recover(true)?;
         }
-        if fs.writable && layout::u32_at(&fs.meta.lock().sb, layout::sb::LAST_ORPHAN) != 0 {
+        if fs.writable() && layout::u32_at(&fs.meta.lock().sb, layout::sb::LAST_ORPHAN) != 0 {
             // As Linux, the mount goes on if an orphan cannot be freed.
             let _ = fs.tx()?.clean_orphans();
         }
@@ -324,7 +327,8 @@ impl Fs {
             blocks: AtomicU64::new(sb.blocks_count),
             sb,
             groups: SpinLock::new(groups),
-            writable,
+            writable: AtomicBool::new(writable),
+            rw_mount: writable,
             csum_seed,
             meta: SpinLock::new(Meta { sb: b, descs, generation, orphan_prev: BTreeMap::new() }),
             orphans: SpinLock::new(Vec::new()),
@@ -355,7 +359,7 @@ impl Fs {
     ///
     /// Gives `EROFS` for a read only mount, and `EIO` after a shutdown.
     pub(crate) fn tx(&self) -> Result<Tx<'_>> {
-        if !self.writable {
+        if !self.writable() {
             return Err(Errno::EROFS);
         }
         let meta = loop {
@@ -366,6 +370,10 @@ impl Fs {
                 break meta;
             }
         };
+        // A remount can make the file system read only between the check and the lock.
+        if !self.writable() {
+            return Err(Errno::EROFS);
+        }
         self.check_shut()?;
         Ok(Tx { fs: self, meta })
     }
@@ -457,7 +465,7 @@ impl Fs {
     /// Makes all the changes durable, for `fsync` and `sync`.
     pub(crate) fn sync(&self) -> Result<()> {
         self.check_shut()?;
-        if !self.writable {
+        if !self.writable() {
             return Ok(());
         }
         // The lock waits for a running change, so the commit has only whole changes.
@@ -820,8 +828,8 @@ impl Fs {
     fn finish(&self) -> Result<()> {
         let Some(log) = &self.log else { return Ok(()) };
         // After a shutdown the disk stays as a crash leaves it, and the next mount replays the
-        // journal.
-        if self.shut.load(Ordering::Relaxed) {
+        // journal. A remount to read only already emptied the journal.
+        if self.shut.load(Ordering::Relaxed) || !self.writable() {
             return Ok(());
         }
         self.commit(true);
@@ -887,6 +895,55 @@ impl Fs {
         self.sync()
     }
 
+    /// Tells if the file system can change.
+    pub(crate) fn writable(&self) -> bool {
+        self.writable.load(Ordering::Acquire)
+    }
+
+    /// Makes the file system read only or writable again for a remount, as `ext4_reconfigure`
+    /// of Linux. Before the file system becomes read only, all the changes go to their places on
+    /// the disk and the journal becomes empty, so the disk is clean. A file system that a read
+    /// only mount made stays read only, because the driver did not open its journal.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EBUSY` if the file system is frozen, `EROFS` if it cannot become writable, `EIO`
+    /// after a shutdown, or the error of the disk.
+    pub(crate) fn set_read_only(&self, read_only: bool) -> Result<()> {
+        self.check_shut()?;
+        // The lock waits for a running change.
+        let meta = self.meta.lock();
+        if self.is_frozen() {
+            return Err(Errno::EBUSY);
+        }
+        if read_only == !self.writable() {
+            return Ok(());
+        }
+        if !read_only {
+            if !self.rw_mount {
+                return Err(Errno::EROFS);
+            }
+            drop(meta);
+            if self.log.is_some() {
+                self.mark_recover(true)?;
+            }
+            self.writable.store(true, Ordering::Release);
+            return Ok(());
+        }
+        // A change that starts after this gives `EROFS`.
+        self.writable.store(false, Ordering::Release);
+        self.commit(true);
+        if let Some(log) = &self.log {
+            log.lock().checkpoint(self)?;
+            drop(meta);
+            self.mark_recover(false)?;
+        } else {
+            drop(meta);
+        }
+        self.disk.write_back(0, u64::MAX)?;
+        self.disk.flush()
+    }
+
     /// Tells if `FIFREEZE` stopped the changes.
     pub(crate) fn is_frozen(&self) -> bool {
         self.frozen.load(Ordering::Acquire)
@@ -908,7 +965,7 @@ impl Fs {
             return Err(Errno::EBUSY);
         }
         drop(meta);
-        if !self.writable {
+        if !self.writable() {
             return Ok(());
         }
         let result = self.flush_frozen();
@@ -942,7 +999,8 @@ impl Fs {
         if !self.is_frozen() {
             return Err(Errno::EINVAL);
         }
-        let result = if self.writable && self.log.is_some() && !self.shut.load(Ordering::Relaxed) {
+        let result = if self.writable() && self.log.is_some() && !self.shut.load(Ordering::Relaxed)
+        {
             self.mark_recover(true)
         } else {
             Ok(())
