@@ -201,6 +201,17 @@ impl FsContext {
         Ok(())
     }
 
+    /// Moves the root and the current directory that are at `old` to `new`, after `pivot_root`,
+    /// as `chroot_fs_refs` of Linux. A root or a current directory at another place stays.
+    pub fn pivot(&mut self, old: &Location, new: &Location) {
+        if self.root.same(old) {
+            self.root = new.clone();
+        }
+        if self.cwd.same(old) {
+            self.cwd = new.clone();
+        }
+    }
+
     /// `getcwd`.
     pub fn getcwd(&self) -> Result<Vec<u8>> {
         self.walk().path_of(&self.cwd)
@@ -347,11 +358,16 @@ impl FsContext {
     /// so that `open` with `O_CREAT` and the mode 0 gives a descriptor that can write.
     fn open_inode(&self, at: Location, flags: u32, created: bool) -> Result<Arc<File>> {
         let file = self.open_file(at, flags, created)?;
-        // As `fsnotify_open` of Linux. A file of `O_PATH` has no events.
+        // As `fsnotify_open_perm` and `fsnotify_open` of Linux. A file of `O_PATH` has no
+        // events. A file that a group denies closes without an event.
         if !file.flags().is_path()
             && let Some(at) = file.location()
         {
-            crate::notify::open(at);
+            if let Err(e) = crate::notify::open_perm(at, false) {
+                file.set_nonotify();
+                return Err(e);
+            }
+            crate::notify::open(at, false);
         }
         Ok(file)
     }

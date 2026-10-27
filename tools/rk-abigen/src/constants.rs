@@ -126,6 +126,8 @@ const GROUPS: &[Group] = &[
             "MOVE_MOUNT_",
             "OPEN_TREE_",
             "MOUNT_ATTR_",
+            "STATMOUNT_",
+            "LISTMOUNT_",
         ],
         enums: &[
             "FSCONFIG_SET_FLAG",
@@ -140,6 +142,23 @@ const GROUPS: &[Group] = &[
         ],
         ty: "u32",
         doc: "The flags of `mount` and `umount2`, and of the calls of the new mount API.",
+    },
+    Group {
+        module: "lsmt",
+        header: "linux/mount.h",
+        prefixes: &["LSMT_"],
+        enums: &[],
+        // `LSMT_ROOT` is the largest 64 bit value.
+        ty: "u64",
+        doc: "The special mount IDs of `listmount`.",
+    },
+    Group {
+        module: "fanotify",
+        header: "linux/fanotify.h",
+        prefixes: &["FAN_", "FANOTIFY_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The events, the flags and the responses of `fanotify_init` and `fanotify_mark`.",
     },
     Group {
         module: "time",

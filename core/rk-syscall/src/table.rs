@@ -2,9 +2,9 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, cred, epoll, eventfd, fhandle, fs, futex, info, inotify, memfd, mm, mount, mqueue, msg,
-    net, pidfd, poll, process, ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap,
-    timer, timerfd, xattr,
+    aio, cred, epoll, eventfd, fanotify, fhandle, fs, futex, info, inotify, memfd, mm, mount,
+    mqueue, msg, net, pidfd, poll, process, ptrace, sched, seccomp, sem, shm, signal, signalfd,
+    splice, statmount, swap, timer, timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -293,6 +293,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::MOVE_MOUNT => mount::move_mount(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::OPEN_TREE => mount::open_tree(cx, a[0], a[1], a[2]),
         nr::MOUNT_SETATTR => mount::mount_setattr(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::PIVOT_ROOT => mount::pivot_root(cx, a[0], a[1]),
+        nr::STATMOUNT => statmount::statmount(cx, a[0], a[1], a[2], a[3]),
+        nr::LISTMOUNT => statmount::listmount(cx, a[0], a[1], a[2], a[3]),
         nr::FSTATFS => fs::fstatfs(cx, a[0], a[1]),
         nr::PRCTL => process::prctl(cx, a[0], [a[1], a[2], a[3], a[4]]),
         nr::SECCOMP => seccomp::seccomp(cx, a[0], a[1], a[2]),
@@ -365,6 +368,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::INOTIFY_INIT1 => inotify::inotify_init1(cx, a[0]),
         nr::INOTIFY_ADD_WATCH => inotify::inotify_add_watch(cx, a[0], a[1], a[2]),
         nr::INOTIFY_RM_WATCH => inotify::inotify_rm_watch(cx, a[0], a[1]),
+        nr::FANOTIFY_INIT => fanotify::fanotify_init(cx, a[0], a[1]),
+        nr::FANOTIFY_MARK => fanotify::fanotify_mark(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::FACCESSAT => fs::faccessat(cx, a[0], a[1], a[2], 0),
         nr::FACCESSAT2 => fs::faccessat(cx, a[0], a[1], a[2], a[3]),
         nr::SET_ROBUST_LIST => futex::set_robust_list(cx, a[0], a[1]),

@@ -17,8 +17,8 @@ use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
 use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_EXIT, StopKind};
 use rk_proc::signal::{
-    BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL,
-    SIG_IGN, SigInfo, TRAP_BRKPT, TRAP_TRACE,
+    BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, POLL_MSG, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL,
+    SIG_DFL, SIG_IGN, SigInfo, TRAP_BRKPT, TRAP_TRACE,
 };
 use rk_proc::{SyscallInfo, Thread, WaitStatus};
 use rk_vfs::FsContext;
@@ -282,6 +282,28 @@ fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
     }
 }
 
+/// Sends the signal of the open file `file` to its owner for an event of the descriptor `fd`, as
+/// `send_sigio` of Linux with `POLL_MSG`. Without a signal of `F_SETSIG`, the owner gets `SIGIO`.
+/// A negative owner is a process group.
+fn send_sigio(file: &rk_vfs::file::File, fd: i32) {
+    use rk_abi::native::poll::{POLLIN, POLLMSG, POLLRDNORM};
+    let owner = file.owner();
+    if owner == 0 {
+        return;
+    }
+    let info = match file.signum() {
+        0 => SigInfo::new(rk_abi::native::signal::SIGIO, SI_KERNEL, 0),
+        sig => SigInfo::poll(sig, POLL_MSG, u64::from(POLLIN | POLLRDNORM | POLLMSG), fd),
+    };
+    if owner > 0 {
+        if let Some(process) = rk_proc::find_process(owner as u32) {
+            rk_proc::send_signal(&process, info);
+        }
+    } else {
+        let _ = crate::signal::signal_group(owner.unsigned_abs(), info);
+    }
+}
+
 /// Connects the system calls to the other parts of the kernel: the clock of the VFS time stamps,
 /// the credentials of the VFS checks and the signals of the console. The boot code calls this one time, before `spawn_init`.
 pub fn init() {
@@ -296,6 +318,17 @@ pub fn init() {
     rk_net_unix::init();
     rk_vfs::wait::set_interrupt_check(|| {
         rk_proc::current_thread().is_some_and(|t| t.signal_pending())
+    });
+    rk_vfs::notify::dnotify::set_sigio(send_sigio);
+    rk_vfs::notify::fanotify::set_hooks(rk_vfs::notify::fanotify::Hooks {
+        install: |file, cloexec| {
+            let files = rk_proc::current_thread().and_then(|t| t.process().files());
+            files.ok_or(Errno::EMFILE)?.lock().insert(file, cloexec)
+        },
+        current: || {
+            rk_proc::current_thread().map_or((0, 0), |t| (t.process().pid() as i32, t.tid() as i32))
+        },
+        fatal: || rk_proc::current_thread().is_some_and(|t| t.fatal_signal_pending()),
     });
     rk_vfs::loopdev::set_file_lookup(|fd| {
         let files = rk_proc::current_thread().and_then(|t| t.process().files());

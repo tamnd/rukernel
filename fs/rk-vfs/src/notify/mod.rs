@@ -6,18 +6,22 @@
 //! attributes, a create, a remove, a rename and an unmount. A hook gives the event to each mark of
 //! the inode, and to each mark of the parent directory that wants the events of its children.
 //!
-//! The marks do not depend on inotify, so fanotify and dnotify can be other groups later. A
-//! global count of the marks lets each hook return at once when no group has a mark, which is
-//! the usual case.
+//! The marks do not depend on inotify: dnotify and fanotify are other groups. An inotify mark and
+//! a dnotify mark are on an inode. A fanotify mark can also be on a mount or on a file system,
+//! and fanotify gets the events of an open file with their path, as `FSNOTIFY_EVENT_PATH` of
+//! Linux. A global count of the marks lets each hook return at once when no group has a mark,
+//! which is the usual case.
 //!
 //! The constants are the `FS_*` values of include/linux/fsnotify_backend.h, which are the same as
 //! the `IN_*` values of include/uapi/linux/inotify.h.
 
+pub mod dnotify;
+pub mod fanotify;
 pub mod inotify;
 pub mod queue;
 
-use crate::dentry::{Dentry, Location};
-use crate::inode::{InodeRef, SetAttr};
+use crate::dentry::{Dentry, Location, Mount};
+use crate::inode::{InodeRef, Result, SetAttr};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -50,17 +54,31 @@ pub mod mask {
     pub const DELETE_SELF: u32 = 0x400;
     /// The watched file moved.
     pub const MOVE_SELF: u32 = 0x800;
+    /// The file was opened to run it, `FS_OPEN_EXEC`.
+    pub const OPEN_EXEC: u32 = 0x1000;
     /// The file system of the file was unmounted.
     pub const UNMOUNT: u32 = 0x2000;
     /// The queue of the group overflowed.
     pub const Q_OVERFLOW: u32 = 0x4000;
     /// The mark went away, `IN_IGNORED`.
     pub const IGNORED: u32 = 0x8000;
+    /// A permission event before an open, `FS_OPEN_PERM`.
+    pub const OPEN_PERM: u32 = 0x1_0000;
+    /// A permission event before a read, `FS_ACCESS_PERM`.
+    pub const ACCESS_PERM: u32 = 0x2_0000;
+    /// A permission event before an open to run the file, `FS_OPEN_EXEC_PERM`.
+    pub const OPEN_EXEC_PERM: u32 = 0x4_0000;
+    /// The permission events.
+    pub const PERM_EVENTS: u32 = OPEN_PERM | ACCESS_PERM | OPEN_EXEC_PERM;
     /// Only the events after the child is unlinked, `IN_EXCL_UNLINK`: a mark with it does not
     /// get the events of a file that has no name.
     pub const EXCL_UNLINK: u32 = 0x0400_0000;
     /// The mark of a directory wants the events of its children.
     pub const EVENT_ON_CHILD: u32 = 0x0800_0000;
+    /// A file moved in its directory, `FS_RENAME`. Only dnotify uses it here.
+    pub const RENAME: u32 = 0x1000_0000;
+    /// The dnotify entry stays after its first event, `FS_DN_MULTISHOT`.
+    pub const DN_MULTISHOT: u32 = 0x2000_0000;
     /// The subject of the event is a directory.
     pub const ISDIR: u32 = 0x4000_0000;
     /// The mark goes away after its first event, `IN_ONESHOT`.
@@ -81,13 +99,78 @@ pub trait Group: Send + Sync {
 
     /// The mark goes away, as `freeing_mark` of Linux. inotify queues `IN_IGNORED` here.
     fn freeing_mark(&self, mark: &Arc<Mark>);
+
+    /// Tells if the group gets the events of an open file with their path, as fanotify. Such a
+    /// group gets its events from `handle_path` and not from `handle_event`.
+    fn wants_paths(&self) -> bool {
+        false
+    }
+
+    /// The order of the group for the events of a path: a group with a higher value gets the
+    /// event first, as the priority of a fanotify class in Linux.
+    fn priority(&self) -> u32 {
+        0
+    }
+
+    /// Takes the event `mask` of the file at `at`. `marks` are the marks of the group that the
+    /// event found. An error of a permission event stops the operation, as
+    /// `fanotify_handle_event` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the answer to a permission event.
+    fn handle_path(&self, at: &Location, mask: u32, marks: &[(Found, Arc<Mark>)]) -> Result<()> {
+        let _ = (at, mask, marks);
+        Ok(())
+    }
 }
 
-/// A mark of a group on an inode, as `struct fsnotify_mark` of Linux.
+/// The object of a mark, as the connector types of Linux.
+#[derive(Clone)]
+pub enum Object {
+    /// An inode.
+    Inode(InodeRef),
+    /// A mount.
+    Mount(Arc<Mount>),
+    /// A file system, by its ID.
+    Fs(u64),
+}
+
+impl Object {
+    fn key(&self) -> (u8, usize) {
+        match self {
+            Self::Inode(inode) => (0, key(inode)),
+            Self::Mount(mount) => (1, Arc::as_ptr(mount) as usize),
+            Self::Fs(id) => (2, *id as usize),
+        }
+    }
+
+    /// Tells if `self` and `other` are the same object.
+    pub fn same(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+/// The place of a mark that an event of a path found, as the iterator types of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// The mark is on the inode of the file.
+    Inode,
+    /// The mark is on the parent directory of the file.
+    Parent,
+    /// The mark is on the mount of the file.
+    Mount,
+    /// The mark is on the file system of the file.
+    Fs,
+}
+
+/// A mark of a group on an object, as `struct fsnotify_mark` of Linux.
 pub struct Mark {
     group: Arc<dyn Group>,
-    inode: InodeRef,
+    object: Object,
     mask: AtomicU32,
+    ignore: AtomicU32,
+    flags: AtomicU32,
     id: i32,
     alive: AtomicBool,
 }
@@ -108,9 +191,37 @@ impl Mark {
         self.id
     }
 
-    /// The inode of the mark.
-    pub fn inode(&self) -> &InodeRef {
-        &self.inode
+    /// The events that the mark ignores, the ignore mask of fanotify.
+    pub fn ignore(&self) -> u32 {
+        self.ignore.load(Ordering::Relaxed)
+    }
+
+    /// Changes the events that the mark ignores.
+    pub fn set_ignore(&self, ignore: u32) {
+        self.ignore.store(ignore, Ordering::Relaxed);
+    }
+
+    /// The flags of the group for the mark, as `FSNOTIFY_MARK_FLAG_*` of Linux.
+    pub fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// Changes the flags of the group for the mark.
+    pub fn set_flags(&self, flags: u32) {
+        self.flags.store(flags, Ordering::Relaxed);
+    }
+
+    /// The inode of the mark, if the mark is on an inode.
+    pub fn inode(&self) -> Option<&InodeRef> {
+        match &self.object {
+            Object::Inode(inode) => Some(inode),
+            _ => None,
+        }
+    }
+
+    /// The object of the mark.
+    pub fn object(&self) -> &Object {
+        &self.object
     }
 
     /// Tells if the mark is still on its inode.
@@ -119,12 +230,18 @@ impl Mark {
     }
 }
 
-/// The marks of each inode, by the address of the inode. A mark holds its inode, so the address
-/// stays the same while the inode has marks.
-static MARKS: SpinLock<BTreeMap<usize, Vec<Arc<Mark>>>> = SpinLock::new(BTreeMap::new());
+/// The marks of each object, by the kind and the address of the object. A mark holds its inode
+/// or its mount, so the address stays the same while the object has marks.
+static MARKS: SpinLock<MarkMap> = SpinLock::new(BTreeMap::new());
+
+/// A map from the kind and the address of an object to the marks of the object.
+type MarkMap = BTreeMap<(u8, usize), Vec<Arc<Mark>>>;
 
 /// The number of marks, so that a hook returns at once when there are none.
 static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of marks of the groups that get the events of a path.
+static PATH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// The cookie of the last rename, as `fsnotify_get_cookie` of Linux.
 static COOKIE: AtomicU32 = AtomicU32::new(0);
@@ -140,16 +257,34 @@ fn none() -> bool {
 /// Puts a new mark of `group` on `inode` with the events `mask` and the number `id`, as
 /// `fsnotify_add_inode_mark` of Linux.
 pub fn add_mark(group: Arc<dyn Group>, inode: &InodeRef, mask: u32, id: i32) -> Arc<Mark> {
+    add_object_mark(group, Object::Inode(inode.clone()), mask, id)
+}
+
+/// Puts a new mark of `group` on `object` with the events `mask` and the number `id`, as
+/// `fsnotify_add_mark` of Linux.
+pub fn add_object_mark(group: Arc<dyn Group>, object: Object, mask: u32, id: i32) -> Arc<Mark> {
+    let paths = group.wants_paths();
+    let k = object.key();
     let mark = Arc::new(Mark {
         group,
-        inode: inode.clone(),
+        object,
         mask: AtomicU32::new(mask),
+        ignore: AtomicU32::new(0),
+        flags: AtomicU32::new(0),
         id,
         alive: AtomicBool::new(true),
     });
-    MARKS.lock().entry(key(inode)).or_default().push(mark.clone());
+    MARKS.lock().entry(k).or_default().push(mark.clone());
     COUNT.fetch_add(1, Ordering::AcqRel);
+    if paths {
+        PATH_COUNT.fetch_add(1, Ordering::AcqRel);
+    }
     mark
+}
+
+/// The marks on `object`.
+pub fn object_marks(object: &Object) -> Vec<Arc<Mark>> {
+    MARKS.lock().get(&object.key()).cloned().unwrap_or_default()
 }
 
 /// Removes `mark` from its inode and tells its group, as `fsnotify_destroy_mark` of Linux. The
@@ -160,7 +295,7 @@ pub fn destroy_mark(mark: &Arc<Mark>) {
     }
     {
         let mut marks = MARKS.lock();
-        let k = key(&mark.inode);
+        let k = mark.object.key();
         if let Some(list) = marks.get_mut(&k) {
             list.retain(|m| !Arc::ptr_eq(m, mark));
             if list.is_empty() {
@@ -169,13 +304,55 @@ pub fn destroy_mark(mark: &Arc<Mark>) {
         }
     }
     COUNT.fetch_sub(1, Ordering::AcqRel);
+    if mark.group.wants_paths() {
+        PATH_COUNT.fetch_sub(1, Ordering::AcqRel);
+    }
     mark.group.freeing_mark(mark);
 }
 
 /// The marks of `inode`. The lock is free when the groups get the events, so a group can remove
 /// a mark.
 fn marks_of(inode: &InodeRef) -> Vec<Arc<Mark>> {
-    MARKS.lock().get(&key(inode)).cloned().unwrap_or_default()
+    MARKS.lock().get(&(0, key(inode))).cloned().unwrap_or_default()
+}
+
+/// Gives the event `mask` of the file at `at` to the groups that get the events of a path, as
+/// `fsnotify` of Linux with `FSNOTIFY_EVENT_PATH`. Each group gets its marks on the inode, on the
+/// parent, on the mount and on the file system together, so it can join their masks.
+fn path_event(at: &Location, mask: u32) -> Result<()> {
+    if PATH_COUNT.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let inode = at.inode();
+    let mut found: Vec<(Found, Arc<Mark>)> = Vec::new();
+    {
+        let marks = MARKS.lock();
+        let mut add = |kind: Found, k: (u8, usize)| {
+            for m in marks.get(&k).into_iter().flatten() {
+                if m.group.wants_paths() {
+                    found.push((kind, m.clone()));
+                }
+            }
+        };
+        add(Found::Inode, (0, key(inode)));
+        if let Some(parent) = at.dentry.parent()
+            && !Arc::ptr_eq(&parent, &at.dentry)
+        {
+            add(Found::Parent, (0, key(parent.inode())));
+        }
+        add(Found::Mount, (1, Arc::as_ptr(&at.mount) as usize));
+        add(Found::Fs, (2, inode.fs_id() as usize));
+    }
+    let mask = mask | dir_bit(inode);
+    found.sort_by_key(|(_, m)| core::cmp::Reverse(m.group.priority()));
+    while let Some((_, first)) = found.first() {
+        let group = first.group.clone();
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            found.into_iter().partition(|(_, m)| Arc::ptr_eq(&m.group, &group));
+        found = rest;
+        group.handle_path(at, mask, &mine)?;
+    }
+    Ok(())
 }
 
 /// Gives the event to the marks of `to`. `child` is the dentry of the subject for an event
@@ -190,6 +367,9 @@ fn send(
     data: Option<&Dentry>,
 ) {
     for mark in marks_of(to) {
+        if mark.group.wants_paths() {
+            continue;
+        }
         let wants = mark.mask();
         if on_child && wants & mask::EVENT_ON_CHILD == 0 {
             continue;
@@ -256,25 +436,72 @@ fn file_event(location: Option<&Location>, inode: Option<&InodeRef>, mask: u32) 
     }
 }
 
+/// The events of an open file: an access, a modification, an open and a close. Only these
+/// events have the path that fanotify needs.
+fn open_file_event(location: Option<&Location>, inode: Option<&InodeRef>, mask: u32) {
+    if none() {
+        return;
+    }
+    match (location, inode) {
+        (Some(at), _) => {
+            dentry_event(&at.dentry, mask);
+            let _ = path_event(at, mask);
+        }
+        (None, Some(inode)) => inode_event(inode, mask),
+        (None, None) => {}
+    }
+}
+
+/// The permission events before an open of the file at `at`, as `fsnotify_open_perm` of Linux.
+/// `exec` tells that the open is to run the file.
+///
+/// # Errors
+///
+/// Gives `EPERM` or the error of the answer if a group denies the open.
+pub fn open_perm(at: &Location, exec: bool) -> Result<()> {
+    if none() {
+        return Ok(());
+    }
+    if exec {
+        path_event(at, mask::OPEN_EXEC_PERM)?;
+    }
+    path_event(at, mask::OPEN_PERM)
+}
+
+/// The permission event before a read of the file at `at`, as `fsnotify_file_area_perm` of
+/// Linux.
+///
+/// # Errors
+///
+/// Gives `EPERM` or the error of the answer if a group denies the read.
+pub fn access_perm(at: &Location) -> Result<()> {
+    if none() {
+        return Ok(());
+    }
+    path_event(at, mask::ACCESS_PERM)
+}
+
 /// A read of a file, as `fsnotify_access` of Linux.
 pub fn access(location: Option<&Location>, inode: Option<&InodeRef>) {
-    file_event(location, inode, mask::ACCESS);
+    open_file_event(location, inode, mask::ACCESS);
 }
 
 /// A write of a file, as `fsnotify_modify` of Linux.
 pub fn modify(location: Option<&Location>, inode: Option<&InodeRef>) {
-    file_event(location, inode, mask::MODIFY);
+    open_file_event(location, inode, mask::MODIFY);
 }
 
-/// An open of a file, as `fsnotify_open` of Linux. A file of `O_PATH` has no events.
-pub fn open(at: &Location) {
-    file_event(Some(at), None, mask::OPEN);
+/// An open of a file, as `fsnotify_open` of Linux. A file of `O_PATH` has no events. `exec` tells
+/// that the open is to run the file.
+pub fn open(at: &Location, exec: bool) {
+    let m = if exec { mask::OPEN | mask::OPEN_EXEC } else { mask::OPEN };
+    open_file_event(Some(at), None, m);
 }
 
 /// The last close of a file, as `fsnotify_close` of Linux.
 pub fn close(location: Option<&Location>, inode: Option<&InodeRef>, write: bool) {
     let mask = if write { mask::CLOSE_WRITE } else { mask::CLOSE_NOWRITE };
-    file_event(location, inode, mask);
+    open_file_event(location, inode, mask);
 }
 
 /// The events of a change of the attributes, as `fsnotify_change` of Linux: the owner and the
@@ -373,6 +600,11 @@ pub fn rename(
     }
     let cookie = COOKIE.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
     let isdir = dir_bit(moved);
+    // The event with the two names. Only dnotify takes it, and only for a move in one
+    // directory, as `fsnotify_handle_event` of Linux.
+    if Arc::ptr_eq(old_dir, new_dir) {
+        name_event(old_dir, mask::RENAME | isdir, old_name, 0);
+    }
     name_event(old_dir, mask::MOVED_FROM | isdir, old_name, cookie);
     name_event(new_dir, mask::MOVED_TO | isdir, new_name, cookie);
     if let Some(target) = target {
@@ -385,7 +617,7 @@ pub fn rename(
 }
 
 /// The unmount of the file system `fs_id`: each mark of its inodes gets `IN_UNMOUNT` and goes
-/// away, as `fsnotify_sb_delete` of Linux.
+/// away, and the marks on the file system go away, as `fsnotify_sb_delete` of Linux.
 pub fn unmount(fs_id: u64) {
     if none() {
         return;
@@ -393,7 +625,12 @@ pub fn unmount(fs_id: u64) {
     let marks: Vec<Arc<Mark>> = MARKS.lock().values().flatten().cloned().collect();
     let mut gone = Vec::new();
     for mark in marks {
-        if mark.inode.fs_id() == fs_id {
+        let on_fs = match &mark.object {
+            Object::Inode(inode) => inode.fs_id() == fs_id,
+            Object::Mount(_) => false,
+            Object::Fs(id) => *id == fs_id,
+        };
+        if on_fs {
             gone.push(mark);
         }
     }

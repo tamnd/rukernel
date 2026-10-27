@@ -642,6 +642,189 @@ type = "u64"
 offset = 80
 
 [[struct]]
+name = "statmount"
+size = 512
+align = 8
+[[struct.field]]
+name = "size"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "mnt_opts"
+type = "u32"
+offset = 4
+[[struct.field]]
+name = "mask"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "sb_dev_major"
+type = "u32"
+offset = 16
+[[struct.field]]
+name = "sb_dev_minor"
+type = "u32"
+offset = 20
+[[struct.field]]
+name = "sb_magic"
+type = "u64"
+offset = 24
+[[struct.field]]
+name = "sb_flags"
+type = "u32"
+offset = 32
+[[struct.field]]
+name = "fs_type"
+type = "u32"
+offset = 36
+[[struct.field]]
+name = "mnt_id"
+type = "u64"
+offset = 40
+[[struct.field]]
+name = "mnt_parent_id"
+type = "u64"
+offset = 48
+[[struct.field]]
+name = "mnt_id_old"
+type = "u32"
+offset = 56
+[[struct.field]]
+name = "mnt_parent_id_old"
+type = "u32"
+offset = 60
+[[struct.field]]
+name = "mnt_attr"
+type = "u64"
+offset = 64
+[[struct.field]]
+name = "mnt_propagation"
+type = "u64"
+offset = 72
+[[struct.field]]
+name = "mnt_peer_group"
+type = "u64"
+offset = 80
+[[struct.field]]
+name = "mnt_master"
+type = "u64"
+offset = 88
+[[struct.field]]
+name = "propagate_from"
+type = "u64"
+offset = 96
+[[struct.field]]
+name = "mnt_root"
+type = "u32"
+offset = 104
+[[struct.field]]
+name = "mnt_point"
+type = "u32"
+offset = 108
+[[struct.field]]
+name = "mnt_ns_id"
+type = "u64"
+offset = 112
+[[struct.field]]
+name = "fs_subtype"
+type = "u32"
+offset = 120
+[[struct.field]]
+name = "sb_source"
+type = "u32"
+offset = 124
+[[struct.field]]
+name = "opt_num"
+type = "u32"
+offset = 128
+[[struct.field]]
+name = "opt_array"
+type = "u32"
+offset = 132
+[[struct.field]]
+name = "opt_sec_num"
+type = "u32"
+offset = 136
+[[struct.field]]
+name = "opt_sec_array"
+type = "u32"
+offset = 140
+[[struct.field]]
+name = "supported_mask"
+type = "u64"
+offset = 144
+[[struct.field]]
+name = "mnt_uidmap_num"
+type = "u32"
+offset = 152
+[[struct.field]]
+name = "mnt_uidmap"
+type = "u32"
+offset = 156
+[[struct.field]]
+name = "mnt_gidmap_num"
+type = "u32"
+offset = 160
+[[struct.field]]
+name = "mnt_gidmap"
+type = "u32"
+offset = 164
+[[struct.field]]
+name = "__spare2"
+type = "[u64; 43]"
+offset = 168
+[[struct.field]]
+name = "str"
+type = "[u8; 0]"
+offset = 512
+
+[[struct]]
+name = "fanotify_event_metadata"
+size = 24
+align = 8
+[[struct.field]]
+name = "event_len"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "vers"
+type = "u8"
+offset = 4
+[[struct.field]]
+name = "reserved"
+type = "u8"
+offset = 5
+[[struct.field]]
+name = "metadata_len"
+type = "u16"
+offset = 6
+[[struct.field]]
+name = "mask"
+type = "u64"
+offset = 8
+[[struct.field]]
+name = "fd"
+type = "i32"
+offset = 16
+[[struct.field]]
+name = "pid"
+type = "i32"
+offset = 20
+
+[[struct]]
+name = "fanotify_response"
+size = 8
+align = 4
+[[struct.field]]
+name = "fd"
+type = "i32"
+offset = 0
+[[struct.field]]
+name = "response"
+type = "u32"
+offset = 4
+
+[[struct]]
 name = "sched_attr"
 size = 56
 align = 8

@@ -10,9 +10,9 @@ use rk_abi::native::at::{
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use rk_abi::native::fcntl::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETPIPE_SZ, F_OFD_GETLK, F_OFD_SETLK,
-    F_OFD_SETLKW, F_RDLCK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW, F_SETPIPE_SZ, F_UNLCK, F_WRLCK,
-    FD_CLOEXEC,
+    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETOWN, F_GETPIPE_SZ, F_GETSIG,
+    F_NOTIFY, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW, F_RDLCK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
+    F_SETOWN, F_SETPIPE_SZ, F_SETSIG, F_UNLCK, F_WRLCK, FD_CLOEXEC,
 };
 use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
 use rk_abi::native::mount::{
@@ -21,7 +21,9 @@ use rk_abi::native::mount::{
 };
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::{SIGPIPE, SIGXFSZ};
-use rk_abi::native::stat::{STATX__RESERVED, STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID};
+use rk_abi::native::stat::{
+    STATX__RESERVED, STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID, STATX_MNT_ID_UNIQUE,
+};
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
 use rk_frame::sync::SpinLock;
 use rk_proc::signal::{SI_USER, SigInfo};
@@ -707,8 +709,15 @@ pub(crate) fn statx(
     }
     let (meta, inode, mnt_id) = lookup(cx, dirfd, path, flags)?;
     let mut s = Statx::new_zeroed();
-    s.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
-    s.stx_mnt_id = mnt_id;
+    // The unique ID if the caller asks for it, else the ID of mountinfo, as `vfs_statx_path` of
+    // Linux.
+    if mask as u32 & STATX_MNT_ID_UNIQUE != 0 {
+        s.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID_UNIQUE;
+        s.stx_mnt_id = rk_vfs::dentry::UNIQUE_ID_OFFSET + mnt_id;
+    } else {
+        s.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
+        s.stx_mnt_id = mnt_id;
+    }
     // The `STATX_ATTR_*` bits of these flags are the bits of the inode flags.
     if let Some(Ok(f)) = inode.map(|i| i.attr_flags()) {
         let known =
@@ -773,10 +782,18 @@ fn statfs_flags(flags: u64) -> i64 {
     out
 }
 
+/// The magic number of the file system of `inode`, as `f_type` of `statfs`. A file system
+/// without one gives the number of tmpfs.
+pub(crate) fn fs_magic(inode: Option<&rk_vfs::InodeRef>) -> u64 {
+    match inode.map_or(0, |i| i.fs_magic()) {
+        0 => TMPFS_MAGIC as u64,
+        magic => magic,
+    }
+}
+
 fn statfs_of(meta: &Metadata, inode: Option<&rk_vfs::InodeRef>, flags: i64) -> Statfs {
-    let magic = inode.map_or(0, |i| i.fs_magic());
     let mut s = Statfs::new_zeroed();
-    s.f_type = if magic == 0 { TMPFS_MAGIC } else { magic as i64 };
+    s.f_type = fs_magic(inode) as i64;
     s.f_bsize = rk_mm::PAGE_SIZE as i64;
     s.f_frsize = rk_mm::PAGE_SIZE as i64;
     if let Some(st) = inode.and_then(|i| i.fs_stat()) {
@@ -944,6 +961,41 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             record_lock(cx, fd, cmd, arg)
+        }
+        // The owner of the signals of the file: a process, or a process group if it is
+        // negative, as `f_setown` of Linux.
+        F_SETOWN => {
+            let file = cx.file(fd)?;
+            let who = arg as i32;
+            if who == i32::MIN {
+                return Err(Errno::EINVAL);
+            }
+            if who > 0 && rk_proc::find_process(who as u32).is_none() {
+                return Err(Errno::ESRCH);
+            }
+            file.set_owner(who);
+            Ok(0)
+        }
+        F_GETOWN => Ok(i64::from(cx.file(fd)?.owner()) as u64),
+        F_SETSIG => {
+            let file = cx.file(fd)?;
+            let sig = arg as u32;
+            if sig > rk_proc::signal::NSIG {
+                return Err(Errno::EINVAL);
+            }
+            file.set_signum(sig);
+            Ok(0)
+        }
+        F_GETSIG => Ok(u64::from(cx.file(fd)?.signum())),
+        F_NOTIFY => {
+            let (file, owner) = {
+                let files = cx.files()?;
+                let table = files.lock();
+                (table.file(fd as i32)?, table.owner())
+            };
+            let tgid = cx.process().pid() as i32;
+            rk_vfs::notify::dnotify::fcntl(&file, fd as i32, owner, arg as u32, tgid)?;
+            Ok(0)
         }
         _ => Err(Errno::EINVAL),
     }

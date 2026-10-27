@@ -59,6 +59,10 @@ pub const TRAP_BRKPT: i32 = 1;
 pub const TRAP_TRACE: i32 = 2;
 /// `SIGSYS` from a filter of `seccomp`.
 pub const SYS_SECCOMP: i32 = 1;
+/// Input message available, for the signal of a file with `F_SETSIG`.
+pub const POLL_MSG: i32 = 3;
+/// The highest `si_code` of the signal of a file, `NSIGPOLL` of Linux.
+const NSIGPOLL: i32 = 6;
 
 /// The signals that the kernel gives first, because the program caused them. Linux names this
 /// set `SYNCHRONOUS_MASK`.
@@ -274,6 +278,23 @@ impl SigInfo {
         self.signo == SIGCHLD && self.code > 0
     }
 
+    /// The information of the signal of a file: the events `band` of the descriptor `fd`, as
+    /// `send_sigio_to_task` of Linux gives it. `band` is in `addr`, and `fd` is in `status`.
+    pub const fn poll(signo: u32, code: i32, band: u64, fd: i32) -> Self {
+        Self { signo, code, errno: 0, pid: 0, uid: 0, status: fd, addr: band, value: 0 }
+    }
+
+    /// Tells if the union of `siginfo_t` holds `si_band` and `si_fd`, as `SIL_POLL` of
+    /// `siginfo_layout` of Linux.
+    const fn is_poll(&self) -> bool {
+        self.code > 0
+            && self.code <= NSIGPOLL
+            && !self.is_fault()
+            && !self.is_seccomp()
+            && !self.is_child()
+            && !matches!(self.signo, SIGILL | SIGFPE | SIGSEGV | SIGBUS | SIGTRAP | SIGSYS)
+    }
+
     /// Reads the `siginfo_t` that a user program gave to `rt_sigqueueinfo`. It is the reverse of
     /// `to_bytes`.
     pub fn from_bytes(b: &[u8; SIGINFO_SIZE]) -> Self {
@@ -292,6 +313,11 @@ impl SigInfo {
             info.uid = word(28);
             return info;
         }
+        if info.is_poll() {
+            info.addr = u64::from_ne_bytes(long);
+            info.status = word(24) as i32;
+            return info;
+        }
         info.pid = word(16);
         info.uid = word(20);
         long.copy_from_slice(&b[24..32]);
@@ -305,7 +331,8 @@ impl SigInfo {
 
     /// Gives the `siginfo_t` of the x86-64 ABI: `si_signo`, `si_errno` and `si_code` at 0, 4 and
     /// 8, and the union at 16. The union has `si_pid` and `si_uid` at 16 and 20, and then
-    /// `si_status` or `si_value` at 24. For a fault, it has `si_addr` at 16. A timer puts its ID
+    /// `si_status` or `si_value` at 24. For a fault, it has `si_addr` at 16. For the signal of a
+    /// file, it has `si_band` at 16 and `si_fd` at 24. A timer puts its ID
     /// and its overrun count in the place of `si_pid` and `si_uid`.
     pub fn to_bytes(&self) -> [u8; SIGINFO_SIZE] {
         let mut b = [0u8; SIGINFO_SIZE];
@@ -318,6 +345,9 @@ impl SigInfo {
             b[16..24].copy_from_slice(&self.addr.to_ne_bytes());
             b[24..28].copy_from_slice(&self.status.to_ne_bytes());
             b[28..32].copy_from_slice(&self.uid.to_ne_bytes());
+        } else if self.is_poll() {
+            b[16..24].copy_from_slice(&self.addr.to_ne_bytes());
+            b[24..28].copy_from_slice(&self.status.to_ne_bytes());
         } else {
             b[16..20].copy_from_slice(&self.pid.to_ne_bytes());
             b[20..24].copy_from_slice(&self.uid.to_ne_bytes());

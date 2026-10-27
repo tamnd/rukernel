@@ -11,7 +11,7 @@ use crate::inode::{
 };
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::mount;
 use rk_abi::native::open as o;
@@ -194,6 +194,14 @@ pub struct File {
     /// The file is a regular file that can write, and the mount counts it as a writer, as
     /// `FMODE_WRITER` of Linux.
     writer: bool,
+    /// The file gives no events, as `FMODE_NONOTIFY` of Linux. fanotify opens its event files
+    /// so, and a file that a permission event denied closes so.
+    nonotify: AtomicBool,
+    /// The process that gets the signals of the file, as `f_owner` of Linux. A negative value is
+    /// a process group, and 0 is no owner.
+    owner: AtomicI32,
+    /// The signal of `F_SETSIG`. 0 is `SIGIO`.
+    signum: AtomicU32,
 }
 
 impl Drop for File {
@@ -203,7 +211,7 @@ impl Drop for File {
         }
         // The last close, as `fsnotify_close` in `__fput` of Linux.
         let flags = self.flags();
-        if !flags.is_path() {
+        if !flags.is_path() && !self.nonotify() {
             crate::notify::close(self.location.as_ref(), self.inode.as_ref(), flags.writable());
         }
         if self.writer
@@ -885,6 +893,9 @@ impl File {
             pos: SpinLock::new(0),
             locked: AtomicBool::new(false),
             writer,
+            nonotify: AtomicBool::new(false),
+            owner: AtomicI32::new(0),
+            signum: AtomicU32::new(0),
         })
     }
 
@@ -912,6 +923,36 @@ impl File {
         let _ = self.flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
             Some((old & !mask) | (flags & mask))
         });
+    }
+
+    /// Tells if the file gives no events.
+    pub fn nonotify(&self) -> bool {
+        self.nonotify.load(Ordering::Relaxed)
+    }
+
+    /// Stops the events of the file, as `FMODE_NONOTIFY` of Linux.
+    pub fn set_nonotify(&self) {
+        self.nonotify.store(true, Ordering::Relaxed);
+    }
+
+    /// The owner of the file for the signals: a process ID, a negative process group ID, or 0.
+    pub fn owner(&self) -> i32 {
+        self.owner.load(Ordering::Relaxed)
+    }
+
+    /// Sets the owner of the file for the signals, for `F_SETOWN`.
+    pub fn set_owner(&self, owner: i32) {
+        self.owner.store(owner, Ordering::Relaxed);
+    }
+
+    /// The signal of `F_SETSIG`. 0 is `SIGIO`.
+    pub fn signum(&self) -> u32 {
+        self.signum.load(Ordering::Relaxed)
+    }
+
+    /// Sets the signal of the file, for `F_SETSIG`.
+    pub fn set_signum(&self, sig: u32) {
+        self.signum.store(sig, Ordering::Relaxed);
     }
 
     /// Records that the file took a lock, so its drop releases the lock.
@@ -949,21 +990,31 @@ impl File {
         if !self.flags().readable() {
             return Err(Errno::EBADF);
         }
+        self.access_perm()?;
         let n = self.ops.read(self, buf)?;
         self.notify_access(n);
         Ok(n)
     }
 
+    /// The permission event before a read, as `fsnotify_file_area_perm` in `rw_verify_area` of
+    /// Linux.
+    fn access_perm(&self) -> Result<()> {
+        match &self.location {
+            Some(at) if !self.nonotify() => crate::notify::access_perm(at),
+            _ => Ok(()),
+        }
+    }
+
     /// The event of a read of `n` bytes, as `fsnotify_access` in `vfs_read` of Linux.
     fn notify_access(&self, n: usize) {
-        if n > 0 {
+        if n > 0 && !self.nonotify() {
             crate::notify::access(self.location.as_ref(), self.inode.as_ref());
         }
     }
 
     /// The event of a write of `n` bytes, as `fsnotify_modify` in `vfs_write` of Linux.
     fn notify_modify(&self, n: usize) {
-        if n > 0 {
+        if n > 0 && !self.nonotify() {
             crate::notify::modify(self.location.as_ref(), self.inode.as_ref());
         }
     }
@@ -1000,6 +1051,7 @@ impl File {
         if !self.flags().readable() {
             return Err(Errno::EBADF);
         }
+        self.access_perm()?;
         let n = self.ops.read_at(self, offset, buf)?;
         self.notify_access(n);
         Ok(n)
@@ -1237,6 +1289,7 @@ impl File {
         if self.flags().is_path() {
             return Err(Errno::EBADF);
         }
+        self.access_perm()?;
         let mut pos = self.pos.lock();
         let mut used = 0;
         while let Some((entry, next)) = inode.read_dir(*pos)? {
@@ -1261,7 +1314,9 @@ impl File {
         drop(pos);
         self.accessed();
         // As `iterate_dir` of Linux.
-        crate::notify::access(self.location.as_ref(), self.inode.as_ref());
+        if !self.nonotify() {
+            crate::notify::access(self.location.as_ref(), self.inode.as_ref());
+        }
         Ok(used)
     }
 

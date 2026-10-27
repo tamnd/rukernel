@@ -171,6 +171,23 @@ impl Dentry {
         }
     }
 
+    /// The path of the dentry from the root of its file system, as `show_path` of Linux shows
+    /// the root of a mount. The root gives `/`.
+    pub fn fs_path(self: &Arc<Self>) -> Vec<u8> {
+        let mut path = Vec::new();
+        let mut d = self.clone();
+        while let Some(up) = d.parent() {
+            let mut part = Vec::from(&b"/"[..]);
+            part.extend_from_slice(&d.name());
+            path.splice(0..0, part);
+            d = up;
+        }
+        if path.is_empty() {
+            path.push(b'/');
+        }
+        path
+    }
+
     /// Tells if `self` is `other` or a descendant of `other`.
     pub fn is_under(self: &Arc<Self>, other: &Arc<Dentry>) -> bool {
         let mut at = Some(self.clone());
@@ -340,6 +357,18 @@ impl Mount {
         self.id
     }
 
+    /// The unique mount ID of `statx` with `STATX_MNT_ID_UNIQUE`, `statmount` and `listmount`,
+    /// as `mnt_id_unique` of Linux.
+    pub fn unique_id(&self) -> u64 {
+        UNIQUE_ID_OFFSET + self.id
+    }
+
+    /// The mount that the mount is on, or `None` for the root mount of a name space and for a
+    /// mount that is not attached.
+    pub fn parent(&self) -> Option<Arc<Mount>> {
+        self.mountpoint().map(|p| p.mount)
+    }
+
     /// The root dentry of the file system.
     pub fn root(&self) -> &Arc<Dentry> {
         &self.root
@@ -472,6 +501,10 @@ impl Mount {
     }
 }
 
+/// The unique mount IDs start after this value, as `MNT_UNIQUE_ID_OFFSET` of Linux. rukernel
+/// does not use a mount ID again, so the unique ID of a mount is its ID plus this value.
+pub const UNIQUE_ID_OFFSET: u64 = 1 << 31;
+
 /// The mounts of each name space, for the propagation between name spaces.
 static ATTACHED: SpinLock<Vec<Weak<Mount>>> = SpinLock::new(Vec::new());
 
@@ -558,6 +591,19 @@ impl Location {
     /// Tells if both locations are the same.
     pub fn same(&self, other: &Location) -> bool {
         Arc::ptr_eq(&self.mount, &other.mount) && Arc::ptr_eq(&self.dentry, &other.dentry)
+    }
+
+    /// Tells if the location is `root` or under it in the tree of the mounts, as
+    /// `is_path_reachable` of Linux.
+    pub fn is_reachable_from(&self, root: &Location) -> bool {
+        let mut at = self.clone();
+        while !Arc::ptr_eq(&at.mount, &root.mount) {
+            match at.mount.mountpoint() {
+                Some(up) => at = up,
+                None => return false,
+            }
+        }
+        at.dentry.is_under(&root.dentry)
     }
 
     /// Tells if the location is the root of its mount.
@@ -923,6 +969,80 @@ impl MountNamespace {
         *mount.ns.lock() = Weak::new();
         ATTACHED.lock().retain(|m| !core::ptr::eq(m.as_ptr(), Arc::as_ptr(mount)));
         true
+    }
+
+    /// Makes the mount of `new` the root mount of the process and puts the mount of `root`,
+    /// the old root, on `old`, for `pivot_root`, as `path_pivot_root` of Linux. `root` is the
+    /// root of the process. The caller changes the root and the current directory of the
+    /// processes that use `root`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` if a mount is not in the name space, if the mount of `old`, the parent of
+    /// the mount of `new` or the parent of the mount of `root` is shared, if `root` or `new` is
+    /// not the root of a mount that is on another mount, or if `new` is not under `root` or
+    /// `old` is not under `new`. Gives `ENOENT` if `new` was removed, and `EBUSY` if `new` or
+    /// `old` is on the mount of `root`.
+    pub fn pivot_root(&self, new: &Location, old: &Location, root: &Location) -> Result<()> {
+        let (new_mnt, root_mnt, old_mnt) = (&new.mount, &root.mount, &old.mount);
+        if !self.contains(root_mnt) || !self.contains(new_mnt) {
+            return Err(Errno::EINVAL);
+        }
+        let shared = |m: Option<Arc<Mount>>| m.is_some_and(|m| m.propagation().group != 0);
+        if shared(Some(old_mnt.clone())) || shared(new_mnt.parent()) || shared(root_mnt.parent()) {
+            return Err(Errno::EINVAL);
+        }
+        if new.dentry.unlinked() {
+            return Err(Errno::ENOENT);
+        }
+        if Arc::ptr_eq(new_mnt, root_mnt) || Arc::ptr_eq(old_mnt, root_mnt) {
+            return Err(Errno::EBUSY);
+        }
+        // The root mount of the name space has no parent. Linux 7.3 puts the initramfs on
+        // nullfs, so its root has a parent. Here the root mount cannot move yet.
+        let Some(root_place) = root_mnt.mountpoint().filter(|_| root.is_mount_root()) else {
+            return Err(Errno::EINVAL);
+        };
+        if !new.is_mount_root() || new_mnt.mountpoint().is_none() {
+            return Err(Errno::EINVAL);
+        }
+        if !old.is_reachable_from(new) || !new.is_reachable_from(root) {
+            return Err(Errno::EINVAL);
+        }
+        let mut mounts = self.mounts.lock();
+        *new_mnt.mountpoint.lock() = Some(root_place);
+        *root_mnt.mountpoint.lock() = Some(old.clone());
+        // The last mount on a place hides the others, so both mounts go to the end.
+        mounts.retain(|m| !Arc::ptr_eq(m, new_mnt) && !Arc::ptr_eq(m, root_mnt));
+        mounts.push(new_mnt.clone());
+        mounts.push(root_mnt.clone());
+        Ok(())
+    }
+
+    /// The peer group of the name space that sends its events to the slave `mount`, and that
+    /// has a peer under `root`, as `get_dominating_id` of Linux. Gives 0 if there is none.
+    pub fn propagate_from(&self, mount: &Arc<Mount>, root: &Location) -> u64 {
+        let all = attached();
+        let mut group = mount.propagation().master;
+        let mut seen = BTreeSet::new();
+        while group != 0 && seen.insert(group) {
+            let peers: Vec<&Arc<Mount>> =
+                all.iter().filter(|m| m.propagation().group == group).collect();
+            let under = |m: &&Arc<Mount>| {
+                let at = Location { mount: (*m).clone(), dentry: m.root.clone() };
+                self.contains(m) && at.is_reachable_from(root)
+            };
+            if peers.iter().any(under) {
+                return group;
+            }
+            group = peers.iter().map(|m| m.propagation().master).find(|&g| g != 0).unwrap_or(0);
+        }
+        0
+    }
+
+    /// The mount of the name space with the unique ID `id`, as `lookup_mnt_in_ns` of Linux.
+    pub fn find_unique(&self, id: u64) -> Option<Arc<Mount>> {
+        self.mounts.lock().iter().find(|m| m.unique_id() == id).cloned()
     }
 
     /// The last mount on `at`, if a mount is on it.

@@ -229,8 +229,39 @@ pub(crate) fn umount2(cx: &Cx<'_>, target: u64, flags: u64) -> SysResult {
     may_mount(cx)?;
     let target = cx.read_path(target)?;
     let fs = cx.fs()?;
-    let at = fs.resolve(fs.cwd(), &target, flags & UMOUNT_NOFOLLOW == 0)?;
+    let mut at = fs.resolve(fs.cwd(), &target, flags & UMOUNT_NOFOLLOW == 0)?;
+    // The lookup goes to the last mount on the place, also for `/`, as `LOOKUP_MOUNTPOINT` of
+    // Linux does.
+    while let Some(mount) = fs.namespace().mounted_on(&at) {
+        at = Location { dentry: mount.root().clone(), mount };
+    }
     fs.namespace().unmount(&at)?;
+    Ok(0)
+}
+
+/// `pivot_root`, as `path_pivot_root` of Linux: the mount of `new_root` becomes the root mount
+/// of the process, and the old root mount goes on `put_old`. The root and the current directory
+/// of each process that is at the old root go to `new_root`.
+pub(crate) fn pivot_root(cx: &Cx<'_>, new_root: u64, put_old: u64) -> SysResult {
+    let new_root = cx.read_path(new_root)?;
+    let put_old = cx.read_path(put_old)?;
+    let fs = cx.fs()?;
+    let new = fs.resolve(fs.cwd(), &new_root, true)?;
+    if !new.inode().metadata().is_dir() {
+        return Err(Errno::ENOTDIR);
+    }
+    let old = fs.resolve(fs.cwd(), &put_old, true)?;
+    if !old.inode().metadata().is_dir() {
+        return Err(Errno::ENOTDIR);
+    }
+    may_mount(cx)?;
+    let root = fs.root().clone();
+    fs.namespace().pivot_root(&new, &old, &root)?;
+    for p in rk_proc::processes() {
+        if let Some(shared) = p.fs() {
+            shared.lock().pivot(&root, &new);
+        }
+    }
     Ok(0)
 }
 
