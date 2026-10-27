@@ -1,7 +1,8 @@
 //! Operations that each architecture does in a different way.
 //!
-//! The code for the hardware is in one module for each architecture. Only x86-64 boots in milestone
-//! R0. The arm64 and riscv64 modules park the CPU until their milestones, per spec/22-milestones.md.
+//! The code for the hardware is in one module for each architecture. x86-64 boots since milestone
+//! R0. arm64 boots to the console and the timer tick on QEMU virt from milestone R4. The riscv64
+//! module parks the CPU until its milestone, per spec/22-milestones.md.
 
 /// The name of the architecture, as `uname -m` gives it on Linux.
 #[cfg(target_arch = "x86_64")]
@@ -18,9 +19,14 @@ pub(crate) mod x86_64;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) use x86_64 as imp;
 
-#[cfg(all(target_os = "none", not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) mod aarch64;
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) use aarch64 as imp;
+
+#[cfg(all(target_os = "none", target_arch = "riscv64"))]
 pub(crate) mod stub;
-#[cfg(all(target_os = "none", not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "none", target_arch = "riscv64"))]
 pub(crate) use stub as imp;
 
 #[cfg(target_os = "none")]

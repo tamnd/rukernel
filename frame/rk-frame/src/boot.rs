@@ -131,7 +131,7 @@ impl BootInfo {
 
     /// The bytes of the initramfs, if the boot loader gave one. The frame allocator reserves its
     /// frames, so the bytes stay the same for the life of the kernel.
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn initrd_bytes(&self) -> Option<&'static [u8]> {
         let (start, len) = self.initrd?;
         let len = usize::try_from(len).ok()?;
@@ -142,7 +142,7 @@ impl BootInfo {
     }
 
     /// The bytes of the initramfs. The other targets have no direct map yet, so they give `None`.
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     pub fn initrd_bytes(&self) -> Option<&'static [u8]> {
         None
     }
@@ -196,13 +196,13 @@ impl BootInfo {
     }
 }
 
-// Only x86-64 has an entry point now. The other architectures get one later.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+// Only x86-64 and arm64 have an entry point now. riscv64 gets one later.
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 static BOOT_INFO: crate::sync::Once<BootInfo> = crate::sync::Once::new();
 
 /// Keeps the boot information and calls the main function of the kernel. The entry code of each
 /// architecture calls this function one time, on the boot CPU.
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(crate) fn start(info: BootInfo) -> ! {
     let info = BOOT_INFO.call_once(|| info);
     unsafe extern "Rust" {

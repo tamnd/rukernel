@@ -14,5 +14,13 @@ fn main() {
         println!("cargo:rustc-link-arg-bins=-no-pie");
         println!("cargo:rerun-if-changed=src/arch/x86_64.ld");
     }
+    if os == "none" && arch == "aarch64" {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+        println!("cargo:rustc-link-arg-bins=-T{dir}/src/arch/aarch64.ld");
+        // The boot assembly loads some absolute addresses from literals, and no code applies
+        // dynamic relocations, so the image is not position independent.
+        println!("cargo:rustc-link-arg-bins=-no-pie");
+        println!("cargo:rerun-if-changed=src/arch/aarch64.ld");
+    }
     println!("cargo:rerun-if-changed=build.rs");
 }

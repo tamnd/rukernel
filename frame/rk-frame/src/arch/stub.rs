@@ -1,19 +1,9 @@
 //! The entry point for the architectures that do not boot yet.
 //!
-//! arm64 boots in milestone R4 and riscv64 in milestone R8, per spec/22-milestones.md. Until then,
-//! the kernel links for these targets and the entry point stops the CPU. Thus the build checks the
-//! architecture independent code on all three targets.
+//! riscv64 boots in milestone R8, per spec/22-milestones.md. Until then, the kernel links for this
+//! target and the entry point stops the CPU. Thus the build checks the architecture independent
+//! code on all three targets.
 
-#[cfg(target_arch = "aarch64")]
-core::arch::global_asm!(
-    ".section .text._start, \"ax\"",
-    ".global _start",
-    "_start:",
-    "1: wfi",
-    "b 1b",
-);
-
-#[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(
     ".section .text._start, \"ax\"",
     ".global _start",
@@ -39,6 +29,17 @@ pub fn qemu_exit(_code: u32) -> ! {
 /// constant.
 pub fn random_seed() -> u64 {
     0x9e37_79b9_7f4a_7c15
+}
+
+/// The console. These architectures have no console yet, so the text is lost.
+pub(crate) mod console {
+    pub(crate) fn write_bytes(_bytes: &[u8]) {}
+
+    pub(crate) fn write_raw(_bytes: &[u8]) {}
+
+    pub(crate) fn try_read() -> Option<u8> {
+        None
+    }
 }
 
 /// The trap counters and functions. These architectures have no trap handler yet.
