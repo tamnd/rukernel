@@ -2,9 +2,9 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, cred, epoll, eventfd, fhandle, fs, futex, info, memfd, mm, mount, net, pidfd, poll,
-    process, ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap, timer, timerfd,
-    xattr,
+    aio, cred, epoll, eventfd, fhandle, fs, futex, info, memfd, mm, mount, mqueue, msg, net, pidfd,
+    poll, process, ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap, timer,
+    timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -132,6 +132,16 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SHMAT => shm::shmat(cx, a[0], a[1], a[2]),
         nr::SHMDT => shm::shmdt(cx, a[0]),
         nr::SHMCTL => shm::shmctl(cx, a[0], a[1], a[2]),
+        nr::MSGGET => msg::msgget(cx, a[0], a[1]),
+        nr::MSGSND => msg::msgsnd(cx, a[0], a[1], a[2], a[3]),
+        nr::MSGRCV => msg::msgrcv(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::MSGCTL => msg::msgctl(cx, a[0], a[1], a[2]),
+        nr::MQ_OPEN => mqueue::mq_open(cx, a[0], a[1], a[2], a[3]),
+        nr::MQ_UNLINK => mqueue::mq_unlink(cx, a[0]),
+        nr::MQ_TIMEDSEND => mqueue::mq_timedsend(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::MQ_TIMEDRECEIVE => mqueue::mq_timedreceive(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::MQ_NOTIFY => mqueue::mq_notify(cx, a[0], a[1]),
+        nr::MQ_GETSETATTR => mqueue::mq_getsetattr(cx, a[0], a[1], a[2]),
         nr::MEMFD_CREATE => memfd::memfd_create(cx, a[0], a[1]),
         nr::SOCKET => net::socket_call(cx, a[0], a[1], a[2]),
         nr::SOCKETPAIR => net::socketpair(cx, a[0], a[1], a[2], a[3]),

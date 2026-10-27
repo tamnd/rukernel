@@ -25,6 +25,7 @@ pub mod file;
 pub mod fs;
 pub mod fstype;
 pub mod inode;
+pub mod ipc;
 pub mod lock;
 pub mod loopdev;
 pub mod mapped;

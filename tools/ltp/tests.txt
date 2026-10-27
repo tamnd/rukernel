@@ -31,6 +31,10 @@
 #
 # fgetxattr02 opens a loop block device, and the kernel has no loop driver. setxattr03 needs the
 # immutable flag of FS_IOC_SETFLAGS.
+#
+# mq_open01 expects EINVAL for the name "", which the mq_open of glibc gives. musl calls the
+# kernel, and Linux gives ENOENT, as rukernel does. msgctl05 needs the time_high fields of
+# msqid64_ds, which the x86_64 headers of musl do not have. msgstress01 runs for minutes.
 alarm02
 alarm03
 alarm05
@@ -337,6 +341,34 @@ llistxattr01
 llistxattr02
 llistxattr03
 lremovexattr01
+mq_notify01
+mq_notify02
+mq_notify03
+mq_timedreceive01
+mq_timedsend01
+mq_unlink01
+msgctl01
+msgctl02
+msgctl03
+msgctl04
+msgctl06
+msgctl12
+msgget01
+msgget02
+msgget03
+msgget04
+msgget05
+msgrcv01
+msgrcv02
+msgrcv03
+msgrcv05
+msgrcv06
+msgrcv07
+msgrcv08
+msgsnd01
+msgsnd02
+msgsnd05
+msgsnd06
 posix_fadvise01
 posix_fadvise01_64
 posix_fadvise02
@@ -363,6 +395,8 @@ sendfile08
 sendfile08_64
 setxattr01
 setxattr02
+shmget05
+shmget06
 splice01
 splice02
 splice03

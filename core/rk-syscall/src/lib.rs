@@ -46,6 +46,10 @@ mod mm;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod mount;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod mqueue;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod msg;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod net;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod pidfd;

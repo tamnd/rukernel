@@ -118,8 +118,12 @@ impl FdTable {
         Ok(fd as i32)
     }
 
-    /// Adds `file` at the lowest free descriptor.
+    /// Adds `file` at the lowest free descriptor. A limit of 0 gives `EMFILE`, as on Linux, and
+    /// not the `EINVAL` of `insert_from`.
     pub fn insert(&mut self, file: Arc<File>, cloexec: bool) -> Result<i32> {
+        if self.limit == 0 {
+            return Err(Errno::EMFILE);
+        }
         self.insert_from(0, file, cloexec)
     }
 

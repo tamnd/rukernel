@@ -33,6 +33,7 @@
 #include <sys/user.h>
 #include <sys/resource.h>
 #include <sys/select.h>
+#include <sys/msg.h>
 #include <sys/sem.h>
 #include <sys/epoll.h>
 #include <sys/shm.h>
@@ -52,6 +53,7 @@
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <mqueue.h>
 #include <termios.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -1542,6 +1544,168 @@ static void test_sem(void)
 	check("semctl IPC_RMID", semctl(id, 0, IPC_RMID) == 0);
 	errno = 0;
 	check("semop on a removed set gives EINVAL", semop(id, &op, 1) == -1 && errno == EINVAL);
+}
+
+static void test_msg(void)
+{
+	struct {
+		long mtype;
+		char text[16];
+	} m;
+	struct msqid_ds ds;
+	int id = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+
+	check("msgget", id >= 0);
+	m.mtype = 2;
+	strcpy(m.text, "two");
+	check("msgsnd type 2", msgsnd(id, &m, 4, 0) == 0);
+	m.mtype = 1;
+	strcpy(m.text, "one");
+	check("msgsnd type 1", msgsnd(id, &m, 4, 0) == 0);
+	check("IPC_STAT counts the messages and the bytes",
+	      msgctl(id, IPC_STAT, &ds) == 0 && ds.msg_qnum == 2 && ds.msg_cbytes == 8 &&
+		      ds.msg_lspid == getpid());
+	memset(&m, 0, sizeof(m));
+	check("msgrcv selects the type", msgrcv(id, &m, sizeof(m.text), 1, 0) == 4 &&
+						 m.mtype == 1 && strcmp(m.text, "one") == 0);
+	errno = 0;
+	check("msgrcv MSG_NOERROR is off: E2BIG", msgrcv(id, &m, 2, 0, 0) == -1 && errno == E2BIG);
+	check("msgrcv MSG_NOERROR cuts the message",
+	      msgrcv(id, &m, 2, 0, MSG_NOERROR) == 2 && m.mtype == 2);
+	errno = 0;
+	check("msgrcv IPC_NOWAIT on an empty queue gives ENOMSG",
+	      msgrcv(id, &m, sizeof(m.text), 0, IPC_NOWAIT) == -1 && errno == ENOMSG);
+	pid_t child = fork();
+	if (child == 0) {
+		m.mtype = 7;
+		_exit(msgsnd(id, &m, 1, 0) == 0 ? 0 : 1);
+	}
+	int status = 0;
+	check("msgrcv waits for a message from another process",
+	      msgrcv(id, &m, sizeof(m.text), 7, 0) == 1 && waitpid(child, &status, 0) == child &&
+		      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("msgctl IPC_RMID", msgctl(id, IPC_RMID, NULL) == 0);
+	errno = 0;
+	check("msgsnd on a removed queue gives EINVAL", msgsnd(id, &m, 1, 0) == -1 && errno == EINVAL);
+	char buf[64] = {0};
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	int fd = open("/proc/sys/kernel/msgmnb", O_RDONLY);
+	check("/proc/sys/kernel/msgmnb", fd >= 0 && read(fd, buf, sizeof(buf)) > 0 &&
+						 strcmp(buf, "16384\n") == 0);
+	close(fd);
+	fd = open("/proc/sysvipc/msg", O_RDONLY);
+	check("/proc/sysvipc/msg", fd >= 0 && read(fd, buf, sizeof(buf)) > 0 &&
+					   strncmp(buf, "       key", 10) == 0);
+	close(fd);
+	umount("/proc");
+}
+
+static volatile int mq_signals;
+
+static void mq_signal(int sig, siginfo_t *info, void *ctx)
+{
+	(void)ctx;
+	if (sig == SIGUSR1 && info->si_code == SI_MESGQ && info->si_value.sival_int == 42)
+		mq_signals++;
+}
+
+static volatile int mq_thread_calls;
+
+static void mq_thread(union sigval v)
+{
+	if (v.sival_int == 43)
+		mq_thread_calls++;
+}
+
+static void test_mqueue(void)
+{
+	struct mq_attr attr = {.mq_maxmsg = 2, .mq_msgsize = 16};
+	char buf[16];
+	unsigned prio = 0;
+
+	mq_unlink("/rk-test");
+	mqd_t q = mq_open("/rk-test", O_RDWR | O_CREAT | O_EXCL, 0600, &attr);
+	check("mq_open", q >= 0);
+	errno = 0;
+	check("mq_open O_EXCL gives EEXIST",
+	      mq_open("/rk-test", O_RDWR | O_CREAT | O_EXCL, 0600, &attr) == -1 && errno == EEXIST);
+	check("mq_send low", mq_send(q, "low", 3, 1) == 0);
+	check("mq_send high", mq_send(q, "high", 4, 9) == 0);
+	struct pollfd p = {.fd = q, .events = POLLIN | POLLOUT};
+	check("poll on a full queue", poll(&p, 1, 0) == 1 && p.revents == POLLIN);
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += 20000000;
+	if (ts.tv_nsec >= 1000000000) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000;
+	}
+	errno = 0;
+	check("mq_timedsend on a full queue gives ETIMEDOUT",
+	      mq_timedsend(q, "x", 1, 0, &ts) == -1 && errno == ETIMEDOUT);
+	errno = 0;
+	check("mq_receive with a small buffer gives EMSGSIZE",
+	      mq_receive(q, buf, 8, NULL) == -1 && errno == EMSGSIZE);
+	check("mq_receive gives the highest priority first",
+	      mq_receive(q, buf, sizeof(buf), &prio) == 4 && prio == 9 && memcmp(buf, "high", 4) == 0);
+	check("mq_receive low", mq_receive(q, buf, sizeof(buf), &prio) == 3 && prio == 1);
+	struct mq_attr got;
+	struct mq_attr nb = {.mq_flags = O_NONBLOCK};
+	check("mq_setattr O_NONBLOCK", mq_setattr(q, &nb, &got) == 0 && got.mq_flags == 0 &&
+					       got.mq_maxmsg == 2 && got.mq_msgsize == 16);
+	errno = 0;
+	check("mq_receive O_NONBLOCK gives EAGAIN",
+	      mq_receive(q, buf, sizeof(buf), NULL) == -1 && errno == EAGAIN);
+
+	struct sigaction sa = {.sa_sigaction = mq_signal, .sa_flags = SA_SIGINFO};
+	struct sigaction old;
+	sigaction(SIGUSR1, &sa, &old);
+	struct sigevent ev = {.sigev_notify = SIGEV_SIGNAL, .sigev_signo = SIGUSR1};
+	ev.sigev_value.sival_int = 42;
+	check("mq_notify SIGEV_SIGNAL", mq_notify(q, &ev) == 0);
+	errno = 0;
+	check("a second mq_notify gives EBUSY", mq_notify(q, &ev) == -1 && errno == EBUSY);
+	char status[80] = {0};
+	check("a read of the queue gives the status",
+	      read(q, status, sizeof(status) - 1) == 60 && strstr(status, "SIGNO:10") != NULL);
+	mq_send(q, "s", 1, 0);
+	check("mq_notify sends the signal", mq_signals == 1);
+	mq_receive(q, buf, sizeof(buf), NULL);
+	mq_send(q, "s", 1, 0);
+	check("the notification is for one message only", mq_signals == 1);
+	mq_receive(q, buf, sizeof(buf), NULL);
+	sigaction(SIGUSR1, &old, NULL);
+
+	struct sigevent tev = {.sigev_notify = SIGEV_THREAD, .sigev_notify_function = mq_thread};
+	tev.sigev_value.sival_int = 43;
+	check("mq_notify SIGEV_THREAD", mq_notify(q, &tev) == 0);
+	mq_send(q, "t", 1, 0);
+	for (int i = 0; i < 1000 && mq_thread_calls == 0; i++)
+		sched_yield();
+	check("mq_notify SIGEV_THREAD calls the function", mq_thread_calls == 1);
+	mq_close(q);
+	check("mq_unlink", mq_unlink("/rk-test") == 0);
+	errno = 0;
+	check("mq_unlink of a removed queue gives ENOENT", mq_unlink("/rk-test") == -1 && errno == ENOENT);
+	mkdir("/dev/mqueue", 0755);
+	struct stat st;
+	check("mount mqueue", mount("mqueue", "/dev/mqueue", "mqueue", 0, NULL) == 0 &&
+				      stat("/dev/mqueue", &st) == 0 && (st.st_mode & 07777) == 01777);
+	q = mq_open("/rk-vis", O_RDWR | O_CREAT, 0600, NULL);
+	check("a queue is a file of the mount",
+	      stat("/dev/mqueue/rk-vis", &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 80);
+	mq_close(q);
+	mq_unlink("/rk-vis");
+	umount("/dev/mqueue");
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	int fd = open("/proc/sys/fs/mqueue/msg_max", O_RDONLY);
+	memset(buf, 0, sizeof(buf));
+	check("/proc/sys/fs/mqueue/msg_max",
+	      fd >= 0 && read(fd, buf, sizeof(buf)) > 0 && strcmp(buf, "10\n") == 0);
+	close(fd);
+	umount("/proc");
 }
 
 static void test_shm(void)
@@ -3680,6 +3844,8 @@ int main(int argc, char **argv)
 	test_memfd();
 	test_shm();
 	test_sem();
+	test_msg();
+	test_mqueue();
 	test_unix();
 	test_proc_ptrace();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)

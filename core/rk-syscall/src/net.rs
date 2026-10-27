@@ -163,6 +163,8 @@ fn new_socket(
             }
             Ok(rk_net_inet::new_socket(proto))
         }
+        // Only the socket that `mq_notify` of musl needs for `SIGEV_THREAD`.
+        crate::mqueue::AF_NETLINK => crate::mqueue::netlink_socket(kind, protocol),
         _ => Err(Errno::EAFNOSUPPORT),
     }
 }
