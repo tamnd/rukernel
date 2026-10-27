@@ -34,6 +34,7 @@ pub(crate) fn swapon(cx: &Cx<'_>, path: u64, flags: u64) -> SysResult {
     let file = fs.open(fs.cwd(), &path, open, 0)?;
     let name = file.location().map_or(path, rk_vfs::Location::absolute_path);
     rk_vfs::swap::activate(file, name, flags)?;
+    rk_mm::tunables::set_swap_pages(rk_vfs::swap::total_pages() as usize);
     Ok(0)
 }
 
@@ -44,5 +45,6 @@ pub(crate) fn swapoff(cx: &Cx<'_>, path: u64) -> SysResult {
     let fs = cx.fs()?;
     let at = fs.resolve(fs.cwd(), &path, true)?;
     rk_vfs::swap::deactivate(at.inode())?;
+    rk_mm::tunables::set_swap_pages(rk_vfs::swap::total_pages() as usize);
     Ok(0)
 }

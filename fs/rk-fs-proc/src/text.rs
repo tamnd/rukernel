@@ -20,11 +20,17 @@ pub struct MemInfo {
     pub free: u64,
     /// The size of the active swap areas. rukernel does not use them yet, so all of it is free.
     pub swap: u64,
+    /// The commit limit of `vm.overcommit_memory` 2.
+    pub commit_limit: u64,
+    /// The memory that the address spaces can write without a new mapping.
+    pub committed: u64,
+    /// The memory in transparent huge pages.
+    pub anon_huge: u64,
 }
 
 /// The text of `/proc/meminfo`. R1 has no page cache, so the other counts are 0.
 pub fn meminfo(m: MemInfo) -> String {
-    let rows: [(&str, u64); 21] = [
+    let rows: [(&str, u64); 25] = [
         ("MemTotal", m.total),
         ("MemFree", m.free),
         ("MemAvailable", m.free),
@@ -41,10 +47,14 @@ pub fn meminfo(m: MemInfo) -> String {
         ("Mapped", 0),
         ("Shmem", 0),
         ("Slab", 0),
-        ("CommitLimit", m.total),
-        ("Committed_AS", m.total - m.free),
+        ("CommitLimit", m.commit_limit),
+        ("Committed_AS", m.committed),
         ("VmallocTotal", 34_359_738_367),
+        ("AnonHugePages", m.anon_huge),
         ("HugePages_Total", 0),
+        ("HugePages_Free", 0),
+        ("HugePages_Rsvd", 0),
+        ("HugePages_Surp", 0),
         ("Hugepagesize", 2048),
     ];
     let mut out = String::new();
@@ -513,9 +523,19 @@ mod tests {
 
     #[test]
     fn meminfo_has_the_format_of_linux() {
-        let text = meminfo(MemInfo { total: 1024, free: 512, swap: 0 });
+        let m = MemInfo {
+            total: 1024,
+            free: 512,
+            swap: 0,
+            commit_limit: 512,
+            committed: 100,
+            anon_huge: 2048,
+        };
+        let text = meminfo(m);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 21);
+        assert_eq!(lines.len(), 25);
+        assert!(text.contains("\nCommitted_AS:        100 kB\n"));
+        assert!(text.contains("\nAnonHugePages:      2048 kB\n"));
         assert_eq!(lines[0], "MemTotal:           1024 kB");
         assert_eq!(lines[2], "MemAvailable:        512 kB");
         assert!(text.contains("\nHugePages_Total:       0\n"));

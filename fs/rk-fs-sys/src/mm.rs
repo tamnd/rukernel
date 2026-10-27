@@ -1,6 +1,7 @@
-//! The directory `/sys/kernel/mm`. It has the directory `ksm` with the files of Kernel Samepage
-//! Merging, as mm/ksm.c of Linux. A read of a file gives the value of that moment, and a write to
-//! a file that a write can change goes to `rk_mm::ksm`.
+//! The directory `/sys/kernel/mm`. It has the directory `transparent_hugepage`, which lib.rs
+//! makes, and the directory `ksm` with the files of Kernel Samepage Merging, as mm/ksm.c of Linux.
+//! A read of a file gives the value of that moment, and a write to a file that a write can change
+//! goes to `rk_mm::ksm`.
 
 use crate::Kind;
 use alloc::string::String;
@@ -14,7 +15,10 @@ const KSM_DIR: &str = "kernel/mm/ksm/";
 /// `kernel/mm`. Gives `None` if no directory has the path.
 pub(crate) fn entries(rest: &[&str]) -> Option<Vec<(String, Kind)>> {
     match rest {
-        [] => Some(Vec::from([(String::from("ksm"), Kind::Dir)])),
+        [] => Some(Vec::from([
+            (String::from("ksm"), Kind::Dir),
+            (String::from("transparent_hugepage"), Kind::Dir),
+        ])),
         ["ksm"] => Some(
             rk_mm::ksm::sysfs_files()
                 .into_iter()

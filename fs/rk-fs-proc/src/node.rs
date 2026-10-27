@@ -2,16 +2,17 @@
 //! writes at an offset, a symbolic link that finds its target at each read, and a directory that
 //! makes its list at each read.
 //!
-//! The text of a file is new at each `read`, so a read at an offset sees the text of that moment.
-//! Linux keeps the text of an open file in a `seq_file` buffer. The programs that R1 runs read a
-//! proc file in one call, or do not depend on the difference.
+//! A read at offset 0 makes the text of a file again. A read at a larger offset uses the text of
+//! the last read at offset 0, until a read gets to the end of the text, as the `seq_file` buffer
+//! of Linux. A program that reads a long file, as `/proc/PID/maps` with many areas, in small parts
+//! then takes a time that grows with the size and not with the square of the size.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use rk_abi::Errno;
-use rk_frame::sync::Once;
+use rk_frame::sync::{Once, SpinLock};
 use rk_vfs::inode::mode;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, now};
 
@@ -43,6 +44,8 @@ enum Kind {
     File {
         read: ReadFn,
         write: Option<WriteFn>,
+        /// The text of the last read at offset 0, while a reader has not got to its end.
+        text: SpinLock<Option<Arc<Vec<u8>>>>,
     },
     /// A file that reads and writes at an offset, as `/proc/PID/mem`.
     Data {
@@ -106,7 +109,7 @@ pub(crate) fn file(
     Arc::new(Node {
         ino: ino(path),
         perm: 0o444,
-        kind: Kind::File { read: Box::new(read), write: None },
+        kind: Kind::File { read: Box::new(read), write: None, text: SpinLock::new(None) },
         owner: Once::new(),
     })
 }
@@ -117,7 +120,11 @@ pub(crate) fn rw_file(
     read: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
     write: impl Fn(&[u8]) -> Result<()> + Send + Sync + 'static,
 ) -> InodeRef {
-    let kind = Kind::File { read: Box::new(read), write: Some(Box::new(write)) };
+    let kind = Kind::File {
+        read: Box::new(read),
+        write: Some(Box::new(write)),
+        text: SpinLock::new(None),
+    };
     Arc::new(Node { ino: ino(path), perm: 0o644, kind, owner: Once::new() })
 }
 
@@ -246,17 +253,23 @@ impl Inode for Node {
         if let Kind::Data { read, .. } = &self.kind {
             return read(offset, buf);
         }
-        let Kind::File { read, .. } = &self.kind else {
+        let Kind::File { read, text: kept, .. } = &self.kind else {
             return Err(if matches!(self.kind, Kind::Dir { .. }) {
                 Errno::EISDIR
             } else {
                 Errno::EINVAL
             });
         };
-        let text = read()?;
+        let last = if offset == 0 { None } else { kept.lock().clone() };
+        let text = match last {
+            Some(text) => text,
+            None => Arc::new(read()?),
+        };
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(text.len());
         let n = buf.len().min(text.len() - start);
         buf[..n].copy_from_slice(&text[start..start + n]);
+        // Keep the text for the next part, or let it go at the end.
+        *kept.lock() = (start + n < text.len()).then_some(text);
         Ok(n)
     }
 
@@ -421,6 +434,26 @@ mod tests {
         assert_eq!(text.metadata().mode, mode::S_IFREG | 0o444);
         assert_eq!(text.fs_magic(), PROC_SUPER_MAGIC);
         assert_eq!(text.lookup(b"x").err(), Some(Errno::ENOTDIR));
+    }
+
+    #[test]
+    fn a_read_in_parts_sees_the_text_of_the_first_part() {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        let calls = Arc::new(AtomicU8::new(0));
+        let c = calls.clone();
+        let node = file(b"/count", move || {
+            let n = c.fetch_add(1, Ordering::Relaxed);
+            Ok(alloc::vec![b'0' + n; 4])
+        });
+        let mut buf = [0u8; 2];
+        assert_eq!(node.read_at(0, &mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"00");
+        // The second part comes from the same text, and the end lets the text go.
+        assert_eq!(node.read_at(2, &mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"00");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(node.read_at(0, &mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"11");
     }
 
     #[test]

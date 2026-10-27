@@ -85,6 +85,10 @@ while IFS='	' read -r tag cmd; do
     dog=$!
     wait $pid
     code=$?
+    # A test that stops early can leave the strict overcommit policy with a limit of 0, and then
+    # this shell cannot fork. The shell writes the defaults back without a fork.
+    echo 0 > /proc/sys/vm/overcommit_memory
+    echo 50 > /proc/sys/vm/overcommit_ratio
     kill $dog 2>/dev/null
     wait $dog 2>/dev/null
     # The processes that the test left behind.

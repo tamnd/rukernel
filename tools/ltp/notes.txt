@@ -11,6 +11,7 @@ ksm04_1	The test needs a NUMA system with a node that has memory and CPUs. ruker
 ksm06	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 ksm06_1	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 ksm06_2	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
+<<<<<<< HEAD
 asapi_01	The test wants getprotobyname("hopopt") to give 0. The LTP build links musl, and the protocol table of musl is built in and has "ip" for 0, so this check fails on Linux with musl too. The other checks of asapi_01 pass.
 fork13	The test runs for 600 s (.runtime = 600), and it forks until the time ends. The runner limit is 240 s, so the runner stops it. It is not a hang: the after kernel did 146018 forks in the time.
 hackbench01	The test sends 20 M socket messages (50 groups x 20 senders x 20 receivers x 1000 messages). Under QEMU without KVM this takes more than the time limit. A smaller run (hackbench 5 process 100) passes.
@@ -19,3 +20,16 @@ shm_test01	The test calls sched_yield for each byte of a map of up to 4 MB, abou
 starvation	The test calibrates its runtime from the speed of the machine. Under QEMU without KVM it asks for about 9 min, more than the 240 s limit of the runner. starvation -l 20000 passes.
 preadv203	On ext2 the test passes: RWF_NOWAIT gives EAGAIN when a page is not in the cache. On tmpfs the test fails, because tmpfs pages are always in memory and a read never gives EAGAIN.
 preadv203_64	The same as preadv203: ext2 passes, tmpfs fails, because tmpfs pages are always in memory.
+=======
+mmapstress02	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
+mmapstress03	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
+mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
+mmapstress08	Uses sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
+overcommit_memory02	With -R 0 the commit limit is 0 (no swap), and the test then reads the sysctl back with fopen. musl malloc needs a new mmap for the FILE, which the strict policy refuses, so the test gives TBROK instead of the TCONF that it gives with glibc.
+thp02	LTP needs /sys/kernel/mm/hugepages, which only hugetlbfs makes, and rukernel has no hugetlbfs (TCONF). The test passes on rukernel when the directory is there (#365), but the directory makes the tests that mount hugetlbfs, as cpuset02, give TBROK.
+thp04	LTP needs /sys/kernel/mm/hugepages to find the size of a huge page, and only hugetlbfs makes it (TCONF). The test passes on rukernel when the directory is there (#365).
+vma02	Needs NUMA and mbind (#322) (TCONF).
+vma03	Needs mmap2, which only a 32 bit kernel has (TCONF on x86_64).
+vma04	Needs NUMA and mbind (#322) (TCONF).
+vma05	Needs gdb in the guest, which the LTP image does not have (TCONF).
+>>>>>>> 475b165 (Add transparent huge pages, the overcommit policy and the vm tunables (#365))

@@ -74,6 +74,19 @@ pub enum VmaKind {
     Vvar,
 }
 
+/// The advice of `madvise` for huge pages in an area.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HugeAdvice {
+    /// No advice. The area gets huge pages if the policy is `always`.
+    #[default]
+    None,
+    /// `MADV_HUGEPAGE`: the area gets huge pages if the policy is not `never`. Linux names it
+    /// `VM_HUGEPAGE`.
+    Huge,
+    /// `MADV_NOHUGEPAGE`: the area gets no huge pages. Linux names it `VM_NOHUGEPAGE`.
+    NoHuge,
+}
+
 /// One virtual memory area.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vma<F> {
@@ -96,6 +109,10 @@ pub struct Vma<F> {
     pub grows_down: bool,
     /// `MADV_MERGEABLE`: KSM can merge the pages of the area. Linux names it `VM_MERGEABLE`.
     pub mergeable: bool,
+    /// The advice of `madvise` for huge pages.
+    pub huge: HugeAdvice,
+    /// The pages of the area are in the commit count. Linux names it `VM_ACCOUNT`.
+    pub account: bool,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -114,6 +131,8 @@ impl<F: Clone> Vma<F> {
             locked: false,
             grows_down: false,
             mergeable: false,
+            huge: HugeAdvice::None,
+            account: false,
             backing: Backing::Anon,
             kind,
         }
@@ -147,6 +166,18 @@ impl<F: Clone> Vma<F> {
 #[derive(Clone, Debug)]
 pub struct VmaSet<F> {
     areas: BTreeMap<usize, Vma<F>>,
+    /// What the last `find_gap` learned: each free range in `addr..top` is shorter than `len`.
+    /// The next search for `len` bytes or more below `top` can start at `addr`. Linux had the
+    /// same cache as `free_area_cache` and `cached_hole_size`.
+    gap_hint: Option<GapHint>,
+}
+
+/// See [`VmaSet::gap_hint`].
+#[derive(Clone, Copy, Debug)]
+struct GapHint {
+    top: usize,
+    addr: usize,
+    len: usize,
 }
 
 impl<F: Clone> Default for VmaSet<F> {
@@ -158,7 +189,7 @@ impl<F: Clone> Default for VmaSet<F> {
 impl<F: Clone> VmaSet<F> {
     /// Makes an empty set.
     pub const fn new() -> Self {
-        Self { areas: BTreeMap::new() }
+        Self { areas: BTreeMap::new(), gap_hint: None }
     }
 
     /// Gives the area that contains `addr`.
@@ -219,6 +250,9 @@ impl<F: Clone> VmaSet<F> {
             && a.prot == b.prot
             && a.may_write == b.may_write
             && a.locked == b.locked
+            && a.mergeable == b.mergeable
+            && a.huge == b.huge
+            && a.account == b.account
             && a.kind == b.kind;
         if !same {
             return false;
@@ -245,6 +279,8 @@ impl<F: Clone> VmaSet<F> {
 
     /// Removes the parts of each area in `start..end`, and gives them in address order.
     pub fn remove_range(&mut self, start: usize, end: usize) -> Vec<Vma<F>> {
+        // The free ranges become larger, so the hint is not true now.
+        self.gap_hint = None;
         self.split_at_edges(start, end);
         let keys: Vec<usize> = self.areas.range(start..end).map(|(&k, _)| k).collect();
         keys.into_iter().filter_map(|k| self.areas.remove(&k)).collect()
@@ -299,16 +335,25 @@ impl<F: Clone> VmaSet<F> {
 
     /// Finds the highest free range of `len` bytes that ends at or below `top` and starts at or
     /// above `bottom`. This is the top down search of Linux.
-    pub fn find_gap(&self, len: usize, bottom: usize, top: usize) -> Option<usize> {
-        let mut end = top;
-        for (_, vma) in self.areas.range(..top).rev() {
+    ///
+    /// The search starts below the free range that the last search found, if that search was for
+    /// the same `top` and for `len` bytes or less. So a run of `mmap` calls takes O(log n) for each
+    /// call, not O(n).
+    pub fn find_gap(&mut self, len: usize, bottom: usize, top: usize) -> Option<usize> {
+        let mut end = match self.gap_hint {
+            Some(h) if h.top == top && h.len <= len => h.addr,
+            _ => top,
+        };
+        for (_, vma) in self.areas.range(..end).rev() {
             if vma.end <= end && end - vma.end >= len {
                 break;
             }
             end = end.min(vma.start);
         }
-        let start = end.checked_sub(len)?;
-        (start >= bottom).then_some(start)
+        let start = end.checked_sub(len).filter(|&s| s >= bottom)?;
+        // Each free range above `end` and below `top` is shorter than `len`.
+        self.gap_hint = Some(GapHint { top, addr: end, len });
+        Some(start)
     }
 
     /// The areas in address order.
@@ -408,6 +453,8 @@ mod tests {
             locked: false,
             grows_down: false,
             mergeable: false,
+            huge: HugeAdvice::None,
+            account: false,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });
@@ -431,12 +478,27 @@ mod tests {
 
     #[test]
     fn the_gap_search_is_top_down() {
-        let s = set(&[(90, 100), (70, 85)]);
+        let mut s = set(&[(90, 100), (70, 85)]);
         assert_eq!(s.find_gap(5 * P, 0, 100 * P), Some(85 * P));
         assert_eq!(s.find_gap(6 * P, 0, 100 * P), Some(64 * P));
         assert_eq!(s.find_gap(10 * P, 0, 110 * P), Some(100 * P));
         assert_eq!(s.find_gap(80 * P, 0, 100 * P), None);
         assert_eq!(s.find_gap(10 * P, 65 * P, 100 * P), None);
+    }
+
+    #[test]
+    fn the_gap_search_starts_below_the_last_gap() {
+        let mut s = set(&[(90, 100)]);
+        for want in (0..20).map(|i| 89 - i) {
+            let at = s.find_gap(P, 0, 100 * P);
+            assert_eq!(at, Some(want * P));
+            s.insert(Vma::anon(want * P, (want + 1) * P, Prot::RW, VmaKind::Normal));
+        }
+        // A removal makes a free range above the hint, and the next search finds it.
+        s.remove_range(95 * P, 96 * P);
+        assert_eq!(s.find_gap(P, 0, 100 * P), Some(95 * P));
+        // A search that does not fill its range keeps the range for the next search.
+        assert_eq!(s.find_gap(P, 0, 100 * P), Some(95 * P));
     }
 
     #[test]

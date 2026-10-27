@@ -111,6 +111,21 @@ pub fn alloc_zeroed_frame() -> Option<Frame> {
     Some(frame)
 }
 
+/// The number of 4 KiB frames in a 2 MiB huge page.
+pub const HUGE_FRAMES: usize = 512;
+
+/// Takes `HUGE_FRAMES` zeroed frames in a row. The first frame is 2 MiB aligned, so the frames can
+/// be mapped as one huge page. Gives `None` if no such run is free.
+pub fn alloc_huge_frames() -> Option<alloc::vec::Vec<Frame>> {
+    let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
+    let frames = (first..first + HUGE_FRAMES).map(|f| {
+        let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0 };
+        frame.zero();
+        frame
+    });
+    Some(frames.collect())
+}
+
 impl Frame {
     /// The number of 8 byte words in a frame.
     pub const WORDS: usize = PAGE_SIZE / 8;

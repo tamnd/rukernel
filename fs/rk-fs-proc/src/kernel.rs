@@ -84,8 +84,16 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
             let swap = rk_vfs::swap::total_pages() * kb;
-            text::meminfo(MemInfo { total: f.total as u64 * kb, free: f.free as u64 * kb, swap })
-                .into_bytes()
+            let pages = |n: usize| n as u64 * kb;
+            text::meminfo(MemInfo {
+                total: pages(f.total),
+                free: pages(f.free),
+                swap,
+                commit_limit: pages(rk_mm::tunables::commit_limit(f.total)),
+                committed: pages(rk_mm::tunables::committed_pages()),
+                anon_huge: rk_frame::vm::huge_pages_mapped() as u64 * 2048,
+            })
+            .into_bytes()
         }),
         (b"cpuinfo", cpuinfo),
         (b"uptime", || {
@@ -294,11 +302,14 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("vm/dirty_ratio", "20"),
     ("vm/dirty_writeback_centisecs", "500"),
     ("vm/drop_caches", "0"),
-    ("vm/max_map_count", "65530"),
-    ("vm/min_free_kbytes", "1024"),
+    ("vm/max_map_count", ""),
+    ("vm/min_free_kbytes", ""),
     ("vm/mmap_min_addr", "65536"),
-    ("vm/overcommit_memory", "0"),
-    ("vm/overcommit_ratio", "50"),
+    ("vm/nr_hugepages", "0"),
+    ("vm/overcommit_kbytes", ""),
+    ("vm/overcommit_memory", ""),
+    ("vm/overcommit_ratio", ""),
+    ("vm/panic_on_oom", "0"),
 ];
 
 /// The sysctl of the groups that can make an ICMP echo socket. rk-net keeps the value.
@@ -338,6 +349,25 @@ fn key_limit(name: &str) -> Option<(&'static AtomicU32, u32)> {
     }
 }
 
+/// The functions that read and write the `vm.*` sysctl of `name` that the memory manager keeps.
+/// The write function gives `None` for a value out of its range.
+fn vm_tunable(name: &str) -> Option<(fn() -> usize, fn(usize) -> Option<()>)> {
+    use rk_mm::tunables as t;
+    fn total() -> usize {
+        rk_frame::mm::frame_stats().total
+    }
+    Some(match name {
+        "vm/max_map_count" => (t::max_map_count, |v| Some(t::set_max_map_count(v))),
+        "vm/min_free_kbytes" => {
+            (|| t::min_free_kbytes(total()), |v| Some(t::set_min_free_kbytes(v)))
+        }
+        "vm/overcommit_kbytes" => (t::overcommit_kbytes, |v| Some(t::set_overcommit_kbytes(v))),
+        "vm/overcommit_memory" => (t::overcommit_memory, t::set_overcommit_memory),
+        "vm/overcommit_ratio" => (t::overcommit_ratio, |v| Some(t::set_overcommit_ratio(v))),
+        _ => return None,
+    })
+}
+
 /// The function that reads the UTS name of the sysctl `name`, for `kernel/hostname` and
 /// `kernel/domainname`.
 fn uts_name(name: &str) -> Option<fn() -> rk_proc::uts::Field> {
@@ -354,6 +384,9 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     }
     if let Some((v, _)) = protected(name).or_else(|| key_limit(name)) {
         return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
+    }
+    if let Some((get, _)) = vm_tunable(name) {
+        return format!("{}\n", get()).into_bytes();
     }
     if name == PING_GROUP_RANGE {
         let (low, high) = rk_net::sysctl::ping_group_range();
@@ -402,6 +435,22 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         }
         v.store(n, Ordering::Relaxed);
+        return Ok(());
+    }
+    // A value from 0 to `INT_MAX`, as `proc_dointvec_minmax` of Linux.
+    if let Some((_, set)) = vm_tunable(name) {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let n: usize = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+        if n > i32::MAX as usize {
+            return Err(Errno::EINVAL);
+        }
+        return set(n).ok_or(Errno::EINVAL);
+    }
+    // The kernel has no pool of huge pages for hugetlbfs, so the pool stays empty after a write,
+    // as on Linux when no huge page is free.
+    if name == "vm/nr_hugepages" {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        text.trim().parse::<u64>().map_err(|_| Errno::EINVAL)?;
         return Ok(());
     }
     // Two group IDs, as `ipv4_ping_group_range` of Linux.
