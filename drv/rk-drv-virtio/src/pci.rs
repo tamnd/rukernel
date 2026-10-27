@@ -176,6 +176,16 @@ impl Transport {
         self.notify.write_u16(at, index);
     }
 
+    /// Reads the byte at `offset` of the configuration of the device.
+    pub(crate) fn device_u8(&self, offset: usize) -> u8 {
+        self.device.read_u8(offset)
+    }
+
+    /// Reads the 16 bit field at `offset` of the configuration of the device.
+    pub(crate) fn device_u16(&self, offset: usize) -> u16 {
+        self.device.read_u16(offset)
+    }
+
     /// Reads the 32 bit field at `offset` of the configuration of the device.
     pub(crate) fn device_u32(&self, offset: usize) -> u32 {
         self.device.read_u32(offset)

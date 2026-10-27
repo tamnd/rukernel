@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- A virtio-net driver and the network device layer (#328). The driver negotiates `VIRTIO_NET_F_MAC`, `VIRTIO_NET_F_STATUS` and `VIRTIO_F_VERSION_1`, reads the MAC address, and keeps a receive queue and a transmit queue of 64 buffers each. rk-net has the packet buffer `NetBuf` with headroom for the headers, the network devices with a name, an interface index, the MAC address, the MTU, the flags and the statistics of Linux, and the loopback device `lo` with the interface index 1. A virtio-net device gets the name `eth0`, `eth1` and so on, and the kernel prints its name and its MAC address at boot. The drivers poll and do not use interrupts yet. The boot test `net` sends an ARP request to the gateway of the user network of QEMU and receives the reply. rk-abigen now extracts the constants of `<linux/if_ether.h>`.
+
 ## [0.4.0] - 2026-10-27
 
 ### Fixed

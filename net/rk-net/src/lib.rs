@@ -6,13 +6,20 @@
 //! the addresses, the data and the control messages between user memory and the kernel, thus a
 //! family works only with kernel buffers. Linux has the same split in net/socket.c and the
 //! `proto_ops` of each family.
+//!
+//! The crate also has the parts below the sockets that each protocol shares: the packet buffer
+//! in `buf`, the network devices in `dev`, and the Ethernet and ARP formats.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+pub mod arp;
+pub mod buf;
 pub mod consts;
+pub mod dev;
+pub mod ether;
 mod options;
 
 pub use options::{Options, Timeout};
@@ -314,3 +321,5 @@ pub fn wait_for<R>(
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_dev;

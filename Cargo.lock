@@ -65,6 +65,7 @@ version = "0.4.0"
 dependencies = [
  "rk-abi",
  "rk-frame",
+ "rk-net",
  "rk-vfs",
 ]
 
@@ -220,6 +221,7 @@ dependencies = [
  "rk-fs-tmpfs",
  "rk-fs-xfs",
  "rk-mm",
+ "rk-net",
  "rk-proc",
  "rk-sched",
  "rk-syscall",

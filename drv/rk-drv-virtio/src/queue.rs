@@ -1,4 +1,5 @@
-//! A split virtqueue that does one request at a time.
+//! A split virtqueue. `run` does one request at a time and waits for it. The other functions
+//! let a driver keep many buffers in the queue and take them back without a wait.
 
 use crate::pci::{QueueAddrs, Transport};
 use crate::ring;
@@ -58,6 +59,53 @@ impl Queue {
         usize::from(self.size)
     }
 
+    /// The number of descriptors.
+    pub(crate) fn size(&self) -> u16 {
+        self.size
+    }
+
+    /// Writes the descriptor `id` for the buffer `b`. If `next` is `Some`, the chain continues
+    /// at that descriptor.
+    pub(crate) fn set_descriptor(&mut self, id: u16, b: Buffer, next: Option<u16>) {
+        let mut flags = if b.device_writes { ring::DESC_F_WRITE } else { 0 };
+        if next.is_some() {
+            flags |= ring::DESC_F_NEXT;
+        }
+        let d = ring::descriptor(b.addr, b.len, flags, next.unwrap_or(0));
+        self.desc.write_bytes(ring::descriptor_offset(id), &d);
+    }
+
+    /// Puts the chain that starts at the descriptor `id` in the available ring. The device sees
+    /// it after the next `kick`.
+    pub(crate) fn push_avail(&mut self, id: u16) {
+        self.avail
+            .write_bytes(ring::avail_entry_offset(self.avail_idx, self.size), &id.to_le_bytes());
+        self.avail_idx = self.avail_idx.wrapping_add(1);
+    }
+
+    /// Gives the new entries of the available ring to the device and tells the device.
+    pub(crate) fn kick(&mut self, t: &Transport) {
+        // The device must see the descriptors and the entries before the new index.
+        fence(Ordering::SeqCst);
+        self.avail.write_bytes(ring::IDX_OFFSET, &self.avail_idx.to_le_bytes());
+        fence(Ordering::SeqCst);
+        t.notify(self.notify_at, self.index);
+    }
+
+    /// Takes the next entry of the used ring, if the device put one there. Gives the first
+    /// descriptor of the chain and the number of bytes that the device wrote.
+    pub(crate) fn pop_used(&mut self) -> Option<(u32, u32)> {
+        if read_u16(&self.used, ring::IDX_OFFSET) == self.used_idx {
+            return None;
+        }
+        // The driver reads the entry and the buffers only after it sees the new index.
+        fence(Ordering::SeqCst);
+        let mut entry = [0u8; 8];
+        self.used.read_bytes(ring::used_entry_offset(self.used_idx, self.size), &mut entry);
+        self.used_idx = self.used_idx.wrapping_add(1);
+        Some(ring::parse_used_entry(entry))
+    }
+
     /// Gives the buffers of one request to the device and waits until the device is done.
     /// Gives the number of bytes that the device wrote.
     ///
@@ -68,31 +116,17 @@ impl Queue {
         assert!(!buffers.is_empty() && buffers.len() <= self.max_buffers(), "bad request");
         // One request at a time, so the chain always starts at descriptor 0.
         for (i, b) in buffers.iter().enumerate() {
-            let last = i + 1 == buffers.len();
-            let mut flags = if b.device_writes { ring::DESC_F_WRITE } else { 0 };
-            if !last {
-                flags |= ring::DESC_F_NEXT;
-            }
             let i = i as u16;
-            let d = ring::descriptor(b.addr, b.len, flags, if last { 0 } else { i + 1 });
-            self.desc.write_bytes(ring::descriptor_offset(i), &d);
+            let next = (usize::from(i) + 1 < buffers.len()).then_some(i + 1);
+            self.set_descriptor(i, *b, next);
         }
-        self.avail
-            .write_bytes(ring::avail_entry_offset(self.avail_idx, self.size), &0u16.to_le_bytes());
-        self.avail_idx = self.avail_idx.wrapping_add(1);
-        // The device must see the descriptors and the entry before the new index.
-        fence(Ordering::SeqCst);
-        self.avail.write_bytes(ring::IDX_OFFSET, &self.avail_idx.to_le_bytes());
-        fence(Ordering::SeqCst);
-        t.notify(self.notify_at, self.index);
-        while read_u16(&self.used, ring::IDX_OFFSET) == self.used_idx {
+        self.push_avail(0);
+        self.kick(t);
+        loop {
+            if let Some((_, len)) = self.pop_used() {
+                return len;
+            }
             core::hint::spin_loop();
         }
-        // The driver reads the entry and the buffers only after it sees the new index.
-        fence(Ordering::SeqCst);
-        let mut entry = [0u8; 8];
-        self.used.read_bytes(ring::used_entry_offset(self.used_idx, self.size), &mut entry);
-        self.used_idx = self.used_idx.wrapping_add(1);
-        u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]])
     }
 }
