@@ -259,15 +259,16 @@ pub struct Fs {
     groups: SpinLock<Vec<GroupDesc>>,
     /// The file system can change. A remount changes it.
     writable: AtomicBool,
-    /// The mount was a read and write mount, so a remount can make the file system writable
-    /// again.
+    /// A remount can make the file system writable. A read only mount can also become writable
+    /// if the driver can change the disk and the journal is empty, as Linux.
     rw_mount: bool,
     /// The seed of the crc32c checksums, for `metadata_csum`.
     csum_seed: u32,
     meta: SpinLock<Meta>,
     /// The inodes without a link that no one uses, to free.
     orphans: SpinLock<Vec<u32>>,
-    /// The journal, for a read and write mount of a file system with a journal.
+    /// The journal of a file system with a journal that is empty or replayed. A read only mount
+    /// also has it, for a remount that makes the file system writable.
     log: Option<SpinLock<journal::Log>>,
     /// The metadata blocks that the changes since the last commit wrote, which go to the
     /// journal in the next commit.
@@ -340,16 +341,40 @@ impl Fs {
             // As Linux, a read only mount also replays the journal.
             fs.recover()?;
             drop(fs);
+            fs = Self::load(dev, disk.clone(), read_only)?;
+        }
+        if read_only && replay == Replay::Do && fs.has_orphans() {
+            // As `ext4_orphan_cleanup` of Linux, a read only mount also frees the orphans that a
+            // crash left. The file system is writable for the cleanup only, and the drop empties
+            // the journal. On an error the orphans stay, and the mount goes on. A read only device
+            // or a journal that the mount did not replay keeps the orphans.
+            drop(fs);
+            if let Ok(rw) = Self::load(dev, disk.clone(), false) {
+                let _ = rw.clean_orphans_now();
+            }
             fs = Self::load(dev, disk, read_only)?;
         }
-        if fs.log.is_some() {
+        if fs.writable() && fs.log.is_some() {
             fs.mark_recover(true)?;
         }
-        if fs.writable() && layout::u32_at(&fs.meta.lock().sb, layout::sb::LAST_ORPHAN) != 0 {
+        if fs.writable() && fs.has_orphans() {
             // As Linux, the mount goes on if an orphan cannot be freed.
             let _ = fs.tx()?.clean_orphans();
         }
         Ok(fs)
+    }
+
+    /// Tells if the superblock has a list of orphans.
+    fn has_orphans(&self) -> bool {
+        layout::u32_at(&self.meta.lock().sb, layout::sb::LAST_ORPHAN) != 0
+    }
+
+    /// Frees the orphans of a file system that `load` made writable, for a read only mount.
+    fn clean_orphans_now(&self) -> Result<()> {
+        if self.log.is_some() {
+            self.mark_recover(true)?;
+        }
+        self.tx()?.clean_orphans()
     }
 
     fn load(dev: u64, disk: Arc<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
@@ -384,9 +409,11 @@ impl Fs {
         let descs = table.chunks(size).map(<[u8]>::to_vec).collect();
         let generation = crc::crc32c(csum_seed, &rk_vfs::now().nsec.to_le_bytes());
         // A disk with a journal to replay changes only after the replay.
-        let writable = !read_only && sb.incompat & layout::incompat::RECOVER == 0;
-        let journal = writable && sb.compat & layout::compat::HAS_JOURNAL != 0;
-        if journal && (sb.incompat & layout::incompat::JOURNAL_DEV != 0 || sb.journal_inum == 0) {
+        let clean = can_write && sb.incompat & layout::incompat::RECOVER == 0;
+        let writable = !read_only && clean;
+        let has_journal = sb.compat & layout::compat::HAS_JOURNAL != 0;
+        let inner = sb.incompat & layout::incompat::JOURNAL_DEV == 0 && sb.journal_inum != 0;
+        if writable && has_journal && !inner {
             return Err(Errno::EROFS);
         }
         let mut fs = Self {
@@ -416,9 +443,15 @@ impl Fs {
             thawed: rk_vfs::wait::WaitQueue::new(),
             this: Weak::new(),
         };
-        if journal {
-            fs.log = Some(SpinLock::new(journal::Log::open(&fs, fs.sb.journal_inum)?));
+        if clean && has_journal && inner {
+            // A read only mount does not fail for a bad journal. It only stays read only.
+            match journal::Log::open(&fs, fs.sb.journal_inum) {
+                Ok(log) => fs.log = Some(SpinLock::new(log)),
+                Err(e) if writable => return Err(e),
+                Err(_) => {}
+            }
         }
+        fs.rw_mount = clean && (!has_journal || fs.log.is_some());
         Ok(Arc::new_cyclic(|this| {
             fs.this = this.clone();
             fs
@@ -1005,8 +1038,8 @@ impl Fs {
 
     /// Makes the file system read only or writable again for a remount, as `ext4_reconfigure`
     /// of Linux. Before the file system becomes read only, all the changes go to their places on
-    /// the disk and the journal becomes empty, so the disk is clean. A file system that a read
-    /// only mount made stays read only, because the driver did not open its journal.
+    /// the disk and the journal becomes empty, so the disk is clean. A read only mount of a disk
+    /// that the driver cannot change, or with a journal that it did not replay, stays read only.
     ///
     /// # Errors
     ///
@@ -1140,7 +1173,8 @@ impl Fs {
         if flags & DISCARD != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
-        if flags & DRY_RUN != 0 {
+        // A read only file system has an empty journal, and does not write.
+        if flags & DRY_RUN != 0 || !self.writable() {
             return Ok(());
         }
         // The lock waits for a running change, so the commit has only whole changes.

@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- A read only mount of ext4 now frees the orphan inodes that a crash left, as `ext4_orphan_cleanup` of Linux. Before, the orphans stayed until a read write mount. A read only mount of ext4 now also opens the journal, so a remount can make the file system writable, as Linux. Before, the remount gave `EROFS`. A write to a file with `O_SYNC` or `O_DSYNC`, or to an inode with the flag `S_SYNC`, now puts the data and the new size in the journal before it returns, as `generic_write_sync` of Linux. This applies to `write`, `pwrite`, `writev`, `pwritev2` and the writes of AIO, also with `O_DIRECT`. generic/417 and generic/737 now pass (#310).
+
 ## [0.3.22] - 2026-10-27
 
 ### Added
