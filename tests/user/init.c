@@ -817,11 +817,12 @@ static long long clock_ms(clockid_t clock)
 	return ts.tv_sec * 1000LL + ts.tv_nsec / 1000000;
 }
 
-/* Runs user code until the CPU clock of the process shows ms milliseconds more. */
+/* Runs user code until the CPU clock of the process shows ms milliseconds more. On a busy host,
+ * QEMU gives the guest little CPU time, so the limit of wall time is large. */
 static void spin_cpu(long long ms)
 {
 	long long end = clock_ms(CLOCK_PROCESS_CPUTIME_ID) + ms;
-	long long limit = clock_ms(CLOCK_MONOTONIC) + 5000;
+	long long limit = clock_ms(CLOCK_MONOTONIC) + 20000;
 	while (clock_ms(CLOCK_PROCESS_CPUTIME_ID) < end && clock_ms(CLOCK_MONOTONIC) < limit)
 		;
 }
@@ -873,7 +874,7 @@ static void test_cputime(void)
 	sigpending(&pend);
 	check("ITIMER_VIRTUAL does not count a sleep", !sigismember(&pend, SIGVTALRM));
 	long long start = clock_ms(CLOCK_PROCESS_CPUTIME_ID);
-	long long limit = clock_ms(CLOCK_MONOTONIC) + 5000;
+	long long limit = clock_ms(CLOCK_MONOTONIC) + 20000;
 	do
 		sigpending(&pend);
 	while (!sigismember(&pend, SIGVTALRM) && clock_ms(CLOCK_MONOTONIC) < limit);

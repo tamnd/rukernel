@@ -11,6 +11,9 @@
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
 //! - `/sys/fs/ext4/features` has a file for each feature of ext4 that programs look for. The
 //!   online resize of `resize2fs` reads `meta_bg_resize`.
+//! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
+//!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
+//!   `statistics`. `/sys/class/net/NAME` is a link to it.
 //!
 //! Linux puts a device of a bus below the directory of the bus. This kernel puts all devices in
 //! `/sys/devices/virtual`. A program that follows the links does not see the difference.
@@ -27,6 +30,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::Once;
+use rk_net::consts::{IFF_DORMANT, IFF_LOWER_UP, IFF_RUNNING};
+use rk_net::dev::NetDevice;
 use rk_vfs::blockdev::{block_queue, block_sectors};
 use rk_vfs::device::{DeviceInfo, devices, major, minor};
 use rk_vfs::fstype::{FsType, MountArgs};
@@ -101,6 +106,84 @@ fn numbers(d: &DeviceInfo) -> String {
     format!("{}:{}", major(d.rdev), minor(d.rdev))
 }
 
+/// The class of the network interfaces.
+const NET: &str = "net";
+
+/// The names of the states of `operstate`, by `IF_OPER_*`, as `operstates` of Linux.
+const OPERSTATES: [&str; 7] =
+    ["unknown", "notpresent", "down", "lowerlayerdown", "testing", "dormant", "up"];
+
+/// The files of the directory `statistics` of an interface, as `netstat_attrs` of Linux. The
+/// device layer does not keep the counters that are not in `Stats`, so they are 0.
+fn net_statistics(d: &NetDevice) -> Vec<(String, Kind)> {
+    let s = d.stats();
+    let values = [
+        ("collisions", 0),
+        ("multicast", 0),
+        ("rx_bytes", s.rx_bytes),
+        ("rx_compressed", 0),
+        ("rx_crc_errors", 0),
+        ("rx_dropped", s.rx_dropped),
+        ("rx_errors", s.rx_errors),
+        ("rx_fifo_errors", 0),
+        ("rx_frame_errors", 0),
+        ("rx_length_errors", 0),
+        ("rx_missed_errors", 0),
+        ("rx_nohandler", 0),
+        ("rx_over_errors", 0),
+        ("rx_packets", s.rx_packets),
+        ("tx_aborted_errors", 0),
+        ("tx_bytes", s.tx_bytes),
+        ("tx_carrier_errors", 0),
+        ("tx_compressed", 0),
+        ("tx_dropped", s.tx_dropped),
+        ("tx_errors", s.tx_errors),
+        ("tx_fifo_errors", 0),
+        ("tx_heartbeat_errors", 0),
+        ("tx_packets", s.tx_packets),
+        ("tx_window_errors", 0),
+    ];
+    values
+        .iter()
+        .map(|(n, v)| (String::from(*n), Kind::File(format!("{v}\n").into_bytes())))
+        .collect()
+}
+
+/// The files and links in the directory of the network interface `d`, as `net_class_attrs` of
+/// Linux. `flags` has the flags of the device without the flags of the state of the link, as
+/// `dev->flags`. `carrier` is there only when the interface is up, because Linux gives
+/// `EINVAL` for a read of it on an interface that is down.
+fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
+    let file = |name: &str, text: String| (String::from(name), Kind::File(text.into_bytes()));
+    let flags = d.flags() & !(IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT);
+    let index = d.ifindex();
+    let mut out = Vec::from([
+        file("addr_assign_type", String::from("0\n")),
+        file("addr_len", format!("{}\n", d.mac().0.len())),
+        file("address", format!("{}\n", d.mac())),
+        file("broadcast", format!("{}\n", d.broadcast())),
+    ]);
+    if d.is_up() {
+        out.push(file("carrier", format!("{}\n", u8::from(d.carrier()))));
+    }
+    out.extend([
+        file("dev_id", String::from("0x0\n")),
+        file("dev_port", String::from("0\n")),
+        file("dormant", String::from("0\n")),
+        file("flags", format!("{flags:#x}\n")),
+        file("ifindex", format!("{index}\n")),
+        file("iflink", format!("{index}\n")),
+        file("mtu", format!("{}\n", d.mtu())),
+        file("operstate", format!("{}\n", OPERSTATES[usize::from(d.operstate()).min(6)])),
+        (String::from("statistics"), Kind::Dir),
+        (String::from("subsystem"), Kind::Link(b"../../../../class/net".to_vec())),
+        file("tx_queue_len", format!("{}\n", d.txqlen())),
+        file("type", format!("{}\n", d.kind().arphrd())),
+        file("uevent", format!("INTERFACE={}\nIFINDEX={index}\n", d.name())),
+    ]);
+    out
+}
+
 /// The files and links in the directory of the device `d`.
 fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     let mut uevent =
@@ -129,7 +212,10 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
 /// The entries of the directory at `path`, from the list of devices `list`. Gives `None` if no
 /// directory has the path.
 fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
-    let classes: BTreeSet<&str> = list.iter().map(|d| d.class).collect();
+    let mut classes: BTreeSet<&str> = list.iter().map(|d| d.class).collect();
+    classes.insert(NET);
+    let net = rk_net::dev::devices();
+    let net_dev = |name: &str| net.iter().find(|d| d.name() == name).cloned();
     let parts: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
     let dirs = |names: &mut dyn Iterator<Item = &str>| -> Vec<(String, Kind)> {
         names.map(|n| (String::from(n), Kind::Dir)).collect()
@@ -143,6 +229,16 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
             list.iter().filter(|d| d.block).map(|d| (d.name.clone(), to_device("../", d))).collect()
         }
         ["class"] | ["devices", "virtual"] => dirs(&mut classes.iter().copied()),
+        ["class", NET] => net
+            .iter()
+            .map(|d| {
+                let to = format!("../../devices/virtual/{NET}/{}", d.name());
+                (d.name(), Kind::Link(to.into_bytes()))
+            })
+            .collect(),
+        ["devices", "virtual", NET] => net.iter().map(|d| (d.name(), Kind::Dir)).collect(),
+        ["devices", "virtual", NET, name] => net_entries(&*net_dev(name)?),
+        ["devices", "virtual", NET, name, "statistics"] => net_statistics(&*net_dev(name)?),
         ["class", class] => list
             .iter()
             .filter(|d| d.class == class)
@@ -346,10 +442,22 @@ mod tests {
     }
 
     #[test]
+    fn an_interface_has_the_files_of_linux() {
+        rk_net::dev::init();
+        assert_eq!(get("class/net/lo"), Kind::Link(b"../../devices/virtual/net/lo".to_vec()));
+        assert!(names("devices/virtual").contains(&String::from("net")));
+        let lo = "devices/virtual/net/lo";
+        assert_eq!(get(&format!("{lo}/mtu")), Kind::File(b"65536\n".to_vec()));
+        assert_eq!(get(&format!("{lo}/type")), Kind::File(b"772\n".to_vec()));
+        assert_eq!(get(&format!("{lo}/address")), Kind::File(b"00:00:00:00:00:00\n".to_vec()));
+        assert!(names(&format!("{lo}/statistics")).contains(&String::from("rx_bytes")));
+    }
+
+    #[test]
     fn the_top_has_the_directories_of_linux() {
         assert_eq!(names(""), TOP);
-        assert_eq!(names("class"), ["block", "mem", "tty"]);
-        assert_eq!(names("devices/virtual"), ["block", "mem", "tty"]);
+        assert_eq!(names("class"), ["block", "mem", "net", "tty"]);
+        assert_eq!(names("devices/virtual"), ["block", "mem", "net", "tty"]);
         assert!(names("bus").is_empty());
         assert!(entries("nothing", &list()).is_none());
         assert!(entries("devices/virtual/disk", &list()).is_none());

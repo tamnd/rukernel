@@ -229,6 +229,51 @@ pub struct Conn {
     error: Option<Errno>,
     /// The segments to send.
     out: Vec<Seg>,
+    /// The segments that went out again since the last `take_retransmits`.
+    retransmits: u32,
+}
+
+/// The timer of a line of /proc/net/tcp, as `timer_active` of `get_tcp4_sock` in Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcTimer {
+    /// No timer runs.
+    None = 0,
+    /// The retransmission timer.
+    Retransmit = 1,
+    /// The keepalive timer.
+    Keepalive = 2,
+    /// The end of TIME-WAIT.
+    TimeWait = 3,
+    /// The persist timer, `ICSK_TIME_PROBE0` of Linux.
+    Probe = 4,
+}
+
+/// The values of a connection for a line of /proc/net/tcp, as `get_tcp4_sock` of Linux. The
+/// times are in milliseconds.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcInfo {
+    /// The bytes that the peer did not acknowledge, `write_seq - snd_una`.
+    pub tx_queue: u32,
+    /// The bytes that the program did not read, `rcv_nxt - copied_seq`.
+    pub rx_queue: u32,
+    /// The timer that runs.
+    pub timer: ProcTimer,
+    /// The time until the timer expires.
+    pub timer_left: u64,
+    /// The retransmissions since the last ACK of new data, `icsk_retransmits`.
+    pub retransmits: u32,
+    /// The probes without an answer, `icsk_probes_out`.
+    pub probes: u32,
+    /// The retransmission timeout.
+    pub rto: u32,
+    /// The timeout of the delayed ACK, or 0 before the first data.
+    pub ato: u32,
+    /// The segments that get a quick ACK.
+    pub quick: u32,
+    /// The congestion window in segments.
+    pub cwnd: u32,
+    /// The slow start threshold in segments.
+    pub ssthresh: u32,
 }
 
 /// The segment that answers `seg` when no connection takes it, as `tcp_v4_send_reset` of
@@ -308,6 +353,7 @@ impl Conn {
             was_open: false,
             error: None,
             out: Vec::new(),
+            retransmits: 0,
         }
     }
 
@@ -406,6 +452,41 @@ impl Conn {
     /// The smoothed round trip time in milliseconds.
     pub fn srtt(&self) -> u32 {
         self.srtt >> 3
+    }
+
+    /// The values for a line of /proc/net/tcp at the time `now`.
+    pub fn proc_info(&self, now: u64) -> ProcInfo {
+        let (timer, at) = if let Some(t) = self.wait_at.filter(|_| self.state == State::TimeWait) {
+            (ProcTimer::TimeWait, t)
+        } else if let Some(t) = self.rto_at {
+            (ProcTimer::Retransmit, t)
+        } else if let Some(t) = self.persist_at {
+            (ProcTimer::Probe, t)
+        } else if let Some(t) = self.keep_at {
+            (ProcTimer::Keepalive, t)
+        } else {
+            (ProcTimer::None, now)
+        };
+        let data_came = self.rcv_nxt.wrapping_sub(self.irs) > 1 + u32::from(self.fin_rcvd);
+        ProcInfo {
+            tx_queue: self.sndq.len() as u32,
+            rx_queue: self.rcvq.len() as u32,
+            timer,
+            timer_left: at.saturating_sub(now),
+            retransmits: self.retries,
+            probes: self.probes,
+            rto: self.rto(),
+            ato: if data_came { DELACK as u32 } else { 0 },
+            quick: self.quick,
+            cwnd: self.cc.cwnd,
+            ssthresh: self.cc.ssthresh,
+        }
+    }
+
+    /// The segments that went out again since the last call, for `RetransSegs` of
+    /// /proc/net/snmp.
+    pub fn take_retransmits(&mut self) -> u32 {
+        core::mem::take(&mut self.retransmits)
     }
 
     /// The bytes that the program can read.
@@ -783,6 +864,7 @@ impl Conn {
         // Karn's rule: a retransmitted segment gives no sample.
         self.rtt_seq = None;
         self.rto_at = Some(now + u64::from(self.rto()));
+        self.retransmits += 1;
         self.push(s);
     }
 
@@ -847,6 +929,7 @@ impl Conn {
                 self.retries += 1;
                 self.backoff += 1;
                 self.rtt_seq = None;
+                self.retransmits += 1;
                 self.send_syn(self.state == State::SynRcvd);
                 self.rto_at = Some(now + u64::from(self.rto()));
             }

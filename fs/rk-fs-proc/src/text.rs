@@ -332,10 +332,31 @@ pub struct Status {
     pub locked: u64,
     /// The bytes in pages that have a frame.
     pub rss: u64,
+    /// The sizes of the kinds of memory, for the lines `RssAnon` to `VmLib`.
+    pub mem: MemSizes,
     /// The credentials of the process.
     pub cred: Cred,
     /// The thread has no_new_privs.
     pub no_new_privs: bool,
+}
+
+/// The sizes of the kinds of memory of a process in bytes, as `task_mem` of Linux.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemSizes {
+    /// The pages with a frame in private areas without a file.
+    pub rss_anon: u64,
+    /// The pages with a frame in areas of a file.
+    pub rss_file: u64,
+    /// The pages with a frame in shared areas without a file.
+    pub rss_shmem: u64,
+    /// The private areas that can be written, without the stack, `data_vm` of Linux.
+    pub data: u64,
+    /// The stack, `stack_vm`.
+    pub stack: u64,
+    /// The code of the program.
+    pub exe: u64,
+    /// The other areas that can run and cannot be written, as the code of the libraries.
+    pub lib: u64,
 }
 
 /// The text of `/proc/PID/status`.
@@ -343,6 +364,8 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
     let mut out = Vec::from(&b"Name:\t"[..]);
     out.extend_from_slice(&s.comm);
     let kb = s.vsize / 1024;
+    let rss = x.rss / 1024;
+    let m = &x.mem;
     let c = &x.cred;
     let groups: Vec<String> = c.groups.iter().map(|g| format!("{g}")).collect();
     let groups = groups.join(" ");
@@ -350,7 +373,11 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         "\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n\
          Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nNStgid:\t{}\nNSpid:\t{}\n\
          NSpgid:\t{}\nNSsid:\t{}\nKthread:\t0\nVmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB\n\
-         VmLck:\t{:>8} kB\nVmRSS:\t{:>8} kB\nThreads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
+         VmLck:\t{:>8} kB\nVmPin:\t       0 kB\nVmHWM:\t{rss:>8} kB\nVmRSS:\t{rss:>8} kB\n\
+         RssAnon:\t{:>8} kB\nRssFile:\t{:>8} kB\nRssShmem:\t{:>8} kB\nVmData:\t{:>8} kB\n\
+         VmStk:\t{:>8} kB\nVmExe:\t{:>8} kB\nVmLib:\t{:>8} kB\nVmPTE:\t       0 kB\n\
+         VmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\nCoreDumping:\t0\nTHP_enabled:\t0\n\
+         Threads:\t{}\nSigQ:\t0/31\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n\
          SigBlk:\t{:016x}\nSigIgn:\t{:016x}\nSigCgt:\t{:016x}\nCapInh:\t{:016x}\n\
          CapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\n\
          CapAmb:\t{:016x}\nNoNewPrivs:\t{}\nSeccomp:\t0\nSeccomp_filters:\t0\n\
@@ -376,7 +403,13 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         s.pgid,
         s.sid,
         x.locked / 1024,
-        x.rss / 1024,
+        m.rss_anon / 1024,
+        m.rss_file / 1024,
+        m.rss_shmem / 1024,
+        m.data / 1024,
+        m.stack / 1024,
+        m.exe / 1024,
+        m.lib / 1024,
         s.threads,
         s.pending,
         x.shared_pending,
@@ -615,6 +648,12 @@ mod tests {
         assert!(text.contains("\nPid:\t6\nPPid:\t1\nTracerPid:\t3\n"));
         assert!(text.contains("\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t64\nGroups:\t\n"));
         assert!(text.contains("\nCapEff:\t000001ffffffffff\n"));
+        let mem = MemSizes { data: 8192, stack: 4096, ..MemSizes::default() };
+        let text =
+            String::from_utf8(status(&s, &Status { rss: 4096, mem, ..Status::default() })).unwrap();
+        assert!(text.contains("\nVmHWM:\t       4 kB\nVmRSS:\t       4 kB\nRssAnon:\t"));
+        assert!(text.contains("\nVmData:\t       8 kB\nVmStk:\t       4 kB\nVmExe:\t"));
+        assert!(text.contains("\nVmSwap:\t       0 kB\nHugetlbPages:\t       0 kB\n"));
         let mut cred = Cred::root().setgroups(alloc::vec![20, 10]).unwrap();
         cred = cred.setresuid(1000, 1001, 1002).unwrap();
         let text = String::from_utf8(status(

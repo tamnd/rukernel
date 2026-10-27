@@ -17,6 +17,7 @@ extern crate alloc;
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -60,6 +61,60 @@ enum Key {
 
 /// The bound sockets.
 static NAMES: SpinLock<BTreeMap<Key, Weak<Unix>>> = SpinLock::new(BTreeMap::new());
+/// All the sockets, by their inode number, for /proc/net/unix.
+static ALL: SpinLock<BTreeMap<u64, Weak<Unix>>> = SpinLock::new(BTreeMap::new());
+
+/// `__SO_ACCEPTCON` of linux/net.h, the flag of a listening socket in /proc/net/unix. The value
+/// is written by hand because rk-abigen does not take linux/net.h yet.
+const SO_ACCEPTCON: u32 = 1 << 16;
+/// `SS_UNCONNECTED` of `enum socket_state` in linux/net.h, written by hand as `SO_ACCEPTCON`.
+const SS_UNCONNECTED: u32 = 1;
+/// `SS_CONNECTED` of `enum socket_state` in linux/net.h.
+const SS_CONNECTED: u32 = 3;
+
+/// Adds /proc/net/unix. The boot code calls this one time.
+pub fn init() {
+    rk_net::procfs::register("unix", show);
+}
+
+/// The text of /proc/net/unix, as `unix_seq_show` of Linux. The address of a socket shows as 0,
+/// as Linux shows it with `kernel.kptr_restrict`.
+pub fn show() -> String {
+    let mut out = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
+    let all: Vec<Arc<Unix>> = ALL.lock().values().filter_map(Weak::upgrade).collect();
+    for u in all {
+        let s = u.state.lock();
+        if s.closed {
+            continue;
+        }
+        let flags = if s.conn == Conn::Listening { SO_ACCEPTCON } else { 0 };
+        let connected = s.conn == Conn::Connected || (u.kind == SOCK_DGRAM && s.peer.is_some());
+        let st = if connected { SS_CONNECTED } else { SS_UNCONNECTED };
+        out.push_str(&format!(
+            "0000000000000000: {:08X} {:08X} {flags:08X} {:04X} {st:02X} {:5}",
+            2 + u32::from(connected),
+            0,
+            u.kind,
+            u.ino
+        ));
+        if let Some(path) = s.addr.as_ref().and_then(|a| a.get(SUN_PATH..)) {
+            out.push(' ');
+            match path.split_first() {
+                // An abstract name starts with `@`, and each 0 in it shows as `@`.
+                Some((0, name)) => {
+                    out.push('@');
+                    out.extend(name.iter().map(|&b| if b == 0 { '@' } else { char::from(b) }));
+                }
+                _ => {
+                    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+                    out.push_str(&String::from_utf8_lossy(&path[..end]));
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
 
 /// A name from the address of a call.
 enum Name {
@@ -189,6 +244,12 @@ pub struct Unix {
     this: Weak<Unix>,
 }
 
+impl Drop for Unix {
+    fn drop(&mut self) {
+        ALL.lock().remove(&self.ino);
+    }
+}
+
 /// The counter of the names that `bind` gives to a socket with no name.
 static AUTOBIND: AtomicU32 = AtomicU32::new(0);
 
@@ -204,7 +265,7 @@ impl Unix {
             SOCK_RAW => SOCK_DGRAM,
             _ => return Err(Errno::ESOCKTNOSUPPORT),
         };
-        Ok(Arc::new_cyclic(|this| Self {
+        let sock = Arc::new_cyclic(|this| Self {
             kind,
             ino: rk_net::next_ino(),
             state: SpinLock::new(State {
@@ -231,7 +292,9 @@ impl Unix {
             inflight: AtomicUsize::new(0),
             events: AtomicU64::new(0),
             this: this.clone(),
-        }))
+        });
+        ALL.lock().insert(sock.ino, Arc::downgrade(&sock));
+        Ok(sock)
     }
 
     /// Makes two sockets of the type `kind` that are connected, for `socketpair`.

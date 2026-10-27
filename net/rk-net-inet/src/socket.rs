@@ -14,7 +14,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::inet::{
     IP_HDRINCL, IP_MTU_DISCOVER, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
@@ -132,10 +132,32 @@ struct State {
     closed: bool,
 }
 
+/// A socket of /proc/net/udp, /proc/net/icmp or /proc/net/raw.
+pub(crate) struct SockLine {
+    /// The local address, and the port, the echo identifier or the protocol.
+    pub local: (Addr, u16),
+    /// The address and the port of the peer, or `0.0.0.0:0`.
+    pub remote: (Addr, u16),
+    /// The socket has a peer: the state `TCP_ESTABLISHED`, else `TCP_CLOSE`.
+    pub connected: bool,
+    /// The bytes that the receive queue costs.
+    pub rx_queue: usize,
+    /// The owner.
+    pub uid: u32,
+    /// The inode number.
+    pub ino: u64,
+    /// The datagrams that the socket dropped.
+    pub drops: u32,
+}
+
 /// A datagram socket of IPv4.
 pub struct Dgram {
     proto: Proto,
     ino: u64,
+    /// The owner, the file system user ID of the creator as `sk_uid` of Linux.
+    uid: u32,
+    /// The datagrams that the socket dropped, `sk_drops` of Linux.
+    drops: AtomicU32,
     state: SpinLock<State>,
     wait: WaitQueue,
     events: AtomicU64,
@@ -156,6 +178,8 @@ impl Dgram {
         let sock = Arc::new(Self {
             proto,
             ino: rk_net::next_ino(),
+            uid: rk_vfs::cred::current().fsuid,
+            drops: AtomicU32::new(0),
             state: SpinLock::new(State {
                 local: ipv4::ANY,
                 port: 0,
@@ -187,6 +211,34 @@ impl Dgram {
     /// The kind of the socket.
     pub fn proto(&self) -> Proto {
         self.proto
+    }
+
+    /// The values for a line of /proc/net/udp, /proc/net/icmp or /proc/net/raw, or `None` if
+    /// the socket is not in the table of its protocol: a closed socket, or a UDP or echo socket
+    /// without a port.
+    pub(crate) fn proc_line(&self) -> Option<SockLine> {
+        let s = self.state.lock();
+        let port = match self.proto {
+            Proto::Raw(p) => u16::from(p),
+            _ if s.port == 0 => return None,
+            _ => s.port,
+        };
+        if s.closed {
+            return None;
+        }
+        let remote = match (self.proto, s.remote) {
+            (Proto::Raw(_), Some((a, _))) => (a, 0),
+            (_, r) => r.unwrap_or((ipv4::ANY, 0)),
+        };
+        Some(SockLine {
+            local: (s.local, port),
+            remote,
+            connected: s.remote.is_some(),
+            rx_queue: s.queued,
+            uid: self.uid,
+            ino: self.ino,
+            drops: self.drops.load(Ordering::Relaxed),
+        })
     }
 
     fn ports(&self) -> Option<&'static SpinLock<Ports>> {
@@ -222,6 +274,7 @@ impl Dgram {
     pub(crate) fn deliver(&self, src: Addr, port: u16, data: Vec<u8>) -> bool {
         let mut s = self.state.lock();
         if s.closed || s.shut_rd || s.queued > s.options.rcvbuf as usize {
+            self.drops.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         s.queued += data.len() + OVERHEAD;
@@ -318,7 +371,9 @@ impl Dgram {
                 d.extend_from_slice(data);
                 let check = checksum::udp(src, dst, &d);
                 d[6..8].copy_from_slice(&check.to_be_bytes());
-                stack::output(&next, &self.out(s, src, dst, PROTO_UDP), &d)
+                stack::output(&next, &self.out(s, src, dst, PROTO_UDP), &d)?;
+                stack::count(&stack::COUNTERS.udp_out);
+                Ok(())
             }
             Proto::Ping => {
                 // The message is an echo request with its ICMP header, as `ping_v4_sendmsg`.

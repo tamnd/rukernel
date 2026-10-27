@@ -293,6 +293,7 @@ pub fn init() {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });
     rk_net::set_cred_source(crate::net::current_cred);
+    rk_net_unix::init();
     rk_vfs::wait::set_interrupt_check(|| {
         rk_proc::current_thread().is_some_and(|t| t.signal_pending())
     });

@@ -26,6 +26,31 @@ use rk_vfs::inode::Result;
 /// A lifetime without an end, `INFINITY_LIFE_TIME` of Linux.
 pub const INFINITY: u32 = u32::MAX;
 
+// The metrics of a route, the `RTAX_*` enum of include/uapi/linux/rtnetlink.h. rk-abigen does
+// not give the values of this enum, so they are written by hand.
+/// The metric of the MTU of the path, `RTAX_MTU`.
+pub const RTAX_MTU: u16 = 2;
+/// The metric of the window, `RTAX_WINDOW`.
+pub const RTAX_WINDOW: u16 = 3;
+/// The metric of the round trip time, `RTAX_RTT`, in units of 1/8 ms.
+pub const RTAX_RTT: u16 = 4;
+/// The metric of the advertised MSS, `RTAX_ADVMSS`.
+pub const RTAX_ADVMSS: u16 = 8;
+/// The metric of the hop limit, `RTAX_HOPLIMIT`.
+pub const RTAX_HOPLIMIT: u16 = 10;
+/// The metric of the features, `RTAX_FEATURES`.
+pub const RTAX_FEATURES: u16 = 12;
+/// The metric of the congestion control, `RTAX_CC_ALGO`. Its value is a name.
+pub const RTAX_CC_ALGO: u16 = 16;
+/// The last metric, `RTAX_MAX`.
+pub const RTAX_MAX: u16 = 17;
+/// The features of `RTAX_FEATURES` that a route can have, `RTAX_FEATURE_MASK` of Linux.
+pub const RTAX_FEATURE_MASK: u32 = 0x1f;
+
+/// The metrics of a route, as `fib_metrics` of Linux: the value of `RTAX_n` is at `n - 1`, and
+/// 0 means no value.
+pub type Metrics = [u32; RTAX_MAX as usize];
+
 /// An address of an interface, as `struct in_ifaddr` of Linux.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IfAddr {
@@ -143,6 +168,8 @@ pub struct Route {
     pub ifindex: u32,
     /// The flags of the next hop, `RTNH_F_*`.
     pub flags: u32,
+    /// The metrics.
+    pub metrics: Metrics,
 }
 
 impl Route {
@@ -162,6 +189,7 @@ impl Route {
             gateway,
             ifindex,
             flags: 0,
+            metrics: [0; RTAX_MAX as usize],
         }
     }
 
@@ -430,6 +458,7 @@ impl Table {
                 gateway: None,
                 ifindex: link.ifindex,
                 flags: 0,
+                metrics: [0; RTAX_MAX as usize],
             };
             out.push(magic(RTN_LOCAL, a.local, 32, 0));
             if !link.up {
@@ -688,7 +717,25 @@ impl Table {
     /// Gives `ENETUNREACH` if no route matches, and the error of a route of the type
     /// `unreachable`, `prohibit` or `blackhole`.
     pub fn lookup(&self, dst: Addr) -> Result<Next> {
-        let r = self.fib_lookup(dst, RT_SCOPE_UNIVERSE as u8, 0).ok_or(Errno::ENETUNREACH)?;
+        self.lookup_route(dst, 0).map(|(n, _)| n)
+    }
+
+    /// Finds the route to `dst` through the interface `oif` if it is not 0, as `lookup`. Gives
+    /// the route of the table too, or `None` for a destination on the link of `oif` without a
+    /// route, as the `make_route` case of `ip_route_output_key_hash_rcu` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// As `lookup`.
+    pub fn lookup_route(&self, dst: Addr, oif: u32) -> Result<(Next, Option<&Route>)> {
+        let Some(r) = self.fib_lookup(dst, RT_SCOPE_UNIVERSE as u8, oif) else {
+            if oif == 0 {
+                return Err(Errno::ENETUNREACH);
+            }
+            let src = self.select_addr(oif, ipv4::ANY, RT_SCOPE_LINK as u8).unwrap_or(ipv4::ANY);
+            let next = Next { ifindex: oif, hop: dst, src, local: false, broadcast: false };
+            return Ok((next, None));
+        };
         if let Some(e) = r.error() {
             return Err(e);
         }
@@ -696,7 +743,7 @@ impl Table {
         if kind == RTN_LOCAL {
             let ifindex = if self.loopback != 0 { self.loopback } else { r.ifindex };
             let src = r.prefsrc.unwrap_or(dst);
-            return Ok(Next { ifindex, hop: dst, src, local: true, broadcast: false });
+            return Ok((Next { ifindex, hop: dst, src, local: true, broadcast: false }, Some(r)));
         }
         let hop = r.gateway.unwrap_or(dst);
         let src = match r.prefsrc {
@@ -708,7 +755,7 @@ impl Table {
             }
         };
         let broadcast = kind == RTN_BROADCAST || self.is_broadcast(dst);
-        Ok(Next { ifindex: r.ifindex, hop, src, local: false, broadcast })
+        Ok((Next { ifindex: r.ifindex, hop, src, local: false, broadcast }, Some(r)))
     }
 
     /// The scope `nowhere`, for a `Match` that takes each scope.

@@ -4,7 +4,7 @@
 
 use crate::fib;
 use crate::ipv4::{self, Addr};
-use crate::route::{IfAddr, Match, Route};
+use crate::route::{IfAddr, Match, RTAX_ADVMSS, RTAX_RTT, RTAX_WINDOW, Route};
 use crate::stack::ROUTES;
 use alloc::string::String;
 use rk_abi::Errno;
@@ -19,7 +19,8 @@ use rk_abi::native::sockios::{
     SIOCSIFNETMASK, SIOCSIFPFLAGS,
 };
 use rk_net::consts::{
-    AF_INET, IFF_BROADCAST, IFF_POINTOPOINT, IFF_UP, IFNAMSIZ, RTF_GATEWAY, RTF_HOST, RTF_REJECT,
+    AF_INET, IFF_BROADCAST, IFF_POINTOPOINT, IFF_UP, IFNAMSIZ, RTF_GATEWAY, RTF_HOST, RTF_IRTT,
+    RTF_MTU, RTF_REJECT, RTF_WINDOW,
 };
 use rk_net::dev::{self, NetDevice};
 use rk_net::ioctl::{IfReq, net_admin};
@@ -232,8 +233,7 @@ fn sockaddr_at(b: &[u8], at: usize) -> (u16, Addr) {
     (u16::from_ne_bytes([b[at], b[at + 1]]), [b[at + 4], b[at + 5], b[at + 6], b[at + 7]])
 }
 
-/// `SIOCADDRT` and `SIOCDELRT`, as `ip_rt_ioctl` and `rtentry_to_fib_config` of Linux. The
-/// metrics of `RTF_MTU`, `RTF_WINDOW` and `RTF_IRTT` are not kept.
+/// `SIOCADDRT` and `SIOCDELRT`, as `ip_rt_ioctl` and `rtentry_to_fib_config` of Linux.
 fn rt_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
     let mut rt = [0u8; RTENTRY_LEN];
     mem.read(arg, &mut rt).map_err(|_| Errno::EFAULT)?;
@@ -248,6 +248,7 @@ fn rt_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
     let mut dev_ptr = [0u8; 8];
     dev_ptr.copy_from_slice(&rt[88..96]);
     let dev_ptr = u64::from_ne_bytes(dev_ptr) as usize;
+    let ulong_at = |at: usize| u64::from_ne_bytes(rt[at..at + 8].try_into().unwrap_or([0; 8]));
     if u32::from(dst_family) != AF_INET {
         return Err(Errno::EAFNOSUPPORT);
     }
@@ -296,6 +297,18 @@ fn rt_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
         }
     }
     r.table = RT_TABLE_MAIN;
+    // The metrics of `rt_mtu`, `rt_window` and `rt_irtt`, with the limit of `ip_metrics_convert`
+    // on the MSS. Linux keeps the low 32 bits.
+    let m = &mut r.metrics;
+    if flags & RTF_MTU != 0 {
+        m[usize::from(RTAX_ADVMSS - 1)] = (ulong_at(96) as u32).wrapping_sub(40).min(65535 - 40);
+    }
+    if flags & RTF_WINDOW != 0 {
+        m[usize::from(RTAX_WINDOW - 1)] = ulong_at(104) as u32;
+    }
+    if flags & RTF_IRTT != 0 {
+        m[usize::from(RTAX_RTT - 1)] = u32::from(u16::from_ne_bytes([rt[112], rt[113]])) << 3;
+    }
     if !add {
         let m = Match {
             table: r.table,

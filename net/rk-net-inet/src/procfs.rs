@@ -1,10 +1,14 @@
 //! The IPv4 files of /proc/net: `route` as `fib_route_seq_show` in net/ipv4/fib_trie.c, `arp`
-//! as `arp_seq_show` in net/ipv4/arp.c, and `snmp` as `snmp_seq_show` in net/ipv4/proc.c.
+//! as `arp_seq_show` in net/ipv4/arp.c, `snmp` and `netstat` as net/ipv4/proc.c, and the socket
+//! tables `tcp`, `udp`, `raw` and `icmp` as net/ipv4/tcp_ipv4.c, udp.c, raw.c and ping.c.
 
 use crate::neigh::Nud;
+use crate::route::{RTAX_ADVMSS, RTAX_RTT, RTAX_WINDOW};
+use crate::socket::{Proto, SockLine};
 use crate::stack::{self, COUNTERS, ROUTES};
 use alloc::format;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::native::rtnetlink::{
     RT_TABLE_MAIN, RTN_BROADCAST, RTN_MULTICAST, RTN_PROHIBIT, RTN_UNREACHABLE,
@@ -18,6 +22,186 @@ pub(crate) fn init() {
     rk_net::procfs::register("route", show_route);
     rk_net::procfs::register("arp", show_arp);
     rk_net::procfs::register("snmp", show_snmp);
+    rk_net::procfs::register("netstat", show_netstat);
+    rk_net::procfs::register("tcp", show_tcp);
+    rk_net::procfs::register("udp", show_udp);
+    rk_net::procfs::register("raw", show_raw);
+    rk_net::procfs::register("icmp", show_icmp);
+}
+
+/// The text of a pointer of `%pK`, as Linux shows it with `kernel.kptr_restrict`.
+const POINTER: &str = "0000000000000000";
+
+/// A time in milliseconds in the unit of `clock_t`, as `jiffies_to_clock_t` of Linux.
+fn clock_t(ms: u64) -> u64 {
+    ms / (1000 / USER_HZ)
+}
+
+/// The ticks of `clock_t` in one second, `USER_HZ` of Linux.
+const USER_HZ: u64 = 100;
+
+/// The width of a line of /proc/net/tcp without its newline, `TMPSZ - 1` of Linux.
+const TCP_WIDTH: usize = 149;
+
+/// The text of /proc/net/tcp, as `tcp4_seq_show` of Linux.
+pub(crate) fn show_tcp() -> String {
+    let mut out = format!(
+        "{:<w$}\n",
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
+         timeout inode",
+        w = TCP_WIDTH
+    );
+    for (i, l) in crate::tcp::proc_lines().iter().enumerate() {
+        let addrs = format!(
+            "{i:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X}",
+            hex(l.local.0),
+            l.local.1,
+            hex(l.remote.0),
+            l.remote.1,
+            l.state
+        );
+        let line = match &l.info {
+            // A listening socket, with the values of a new socket: the initial RTO of one
+            // second, a window of 10 segments and no queue of TCP Fast Open.
+            None => format!(
+                "{addrs} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 1 {POINTER} {} 0 0 10 0",
+                0,
+                l.accept_queue,
+                l.uid,
+                0,
+                l.ino,
+                clock_t(u64::from(crate::tcp::conn::RTO_INIT)),
+            ),
+            // A connection that waits for its last ACK is a request of Linux, without an inode.
+            Some(c) if l.state == 3 => format!(
+                "{addrs} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {POINTER}",
+                0,
+                0,
+                1,
+                clock_t(c.timer_left),
+                c.retransmits,
+                l.uid,
+                0,
+                0,
+                0,
+            ),
+            Some(c) if l.state == 6 => format!(
+                "{addrs} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {POINTER}",
+                0,
+                0,
+                3,
+                clock_t(c.timer_left),
+                0,
+                0,
+                0,
+                0,
+                1,
+            ),
+            Some(c) => {
+                let ssthresh = if c.ssthresh >= crate::tcp::cc::INFINITE_SSTHRESH {
+                    -1
+                } else {
+                    i64::from(c.ssthresh)
+                };
+                format!(
+                    "{addrs} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} 1 {POINTER} {} {} {} \
+                     {} {}",
+                    c.tx_queue,
+                    c.rx_queue,
+                    c.timer as u8,
+                    clock_t(c.timer_left),
+                    c.retransmits,
+                    l.uid,
+                    c.probes,
+                    l.ino,
+                    clock_t(u64::from(c.rto)),
+                    clock_t(u64::from(c.ato)),
+                    c.quick << 1,
+                    c.cwnd,
+                    ssthresh,
+                )
+            }
+        };
+        out.push_str(&format!("{line:<w$}\n", w = TCP_WIDTH));
+    }
+    out
+}
+
+/// The width of a line of /proc/net/udp and /proc/net/icmp without its newline.
+const UDP_WIDTH: usize = 127;
+
+/// The buckets of the table of the UDP ports, `UDP_HTABLE_SIZE_MIN` of Linux. The bucket of a
+/// socket is the first number of its line.
+const UDP_BUCKETS: u16 = 256;
+/// The buckets of the table of the echo sockets, `PING_HTABLE_SIZE` of Linux.
+const PING_BUCKETS: u16 = 64;
+
+/// The datagram sockets of the kind `kind`, with their bucket in the table of Linux, in the
+/// order of the buckets.
+fn dgram_lines(kind: fn(Proto) -> bool, buckets: u16) -> Vec<(u16, SockLine)> {
+    let mut lines: Vec<(u16, SockLine)> = stack::dgram_sockets()
+        .iter()
+        .filter(|s| kind(s.proto()))
+        .filter_map(|s| s.proc_line())
+        .map(|l| (l.local.1 % buckets, l))
+        .collect();
+    lines.sort_by_key(|(b, l)| (*b, l.ino));
+    lines
+}
+
+/// A line of a datagram socket, as `udp4_format_sock` and `raw_sock_seq_show` of Linux,
+/// without the bucket. The state is `TCP_ESTABLISHED` for a socket with a peer, else
+/// `TCP_CLOSE`. A send does not wait in a queue, so `tx_queue` is 0.
+fn dgram_line(l: &SockLine) -> String {
+    format!(
+        "{:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 2 \
+         {POINTER} {}",
+        hex(l.local.0),
+        l.local.1,
+        hex(l.remote.0),
+        l.remote.1,
+        if l.connected { 1 } else { 7 },
+        0,
+        l.rx_queue,
+        l.uid,
+        0,
+        l.ino,
+        l.drops
+    )
+}
+
+/// The header of /proc/net/udp, /proc/net/icmp and /proc/net/raw after the column `sl`.
+const DGRAM_HEADER: &str = "local_address rem_address   st tx_queue rx_queue tr tm->when \
+                            retrnsmt   uid  timeout inode ref pointer drops";
+
+/// The text of /proc/net/udp or /proc/net/icmp, as `udp4_seq_show` and `ping_v4_seq_show` of
+/// Linux.
+fn show_udp_like(sl: &str, kind: fn(Proto) -> bool, buckets: u16) -> String {
+    let mut out = format!("{:<w$}\n", format!("{sl}{DGRAM_HEADER}"), w = UDP_WIDTH);
+    for (b, l) in dgram_lines(kind, buckets) {
+        out.push_str(&format!("{:<w$}\n", format!("{b:5}: {}", dgram_line(&l)), w = UDP_WIDTH));
+    }
+    out
+}
+
+/// The text of /proc/net/udp.
+pub(crate) fn show_udp() -> String {
+    show_udp_like("   sl  ", |p| p == Proto::Udp, UDP_BUCKETS)
+}
+
+/// The text of /proc/net/icmp: the ICMP echo sockets.
+pub(crate) fn show_icmp() -> String {
+    show_udp_like("  sl  ", |p| p == Proto::Ping, PING_BUCKETS)
+}
+
+/// The text of /proc/net/raw, as `raw_seq_show` of Linux. The bucket is the protocol, and the
+/// lines have no padding.
+pub(crate) fn show_raw() -> String {
+    let mut out = format!("  sl  {DGRAM_HEADER}\n");
+    for (b, l) in dgram_lines(|p| matches!(p, Proto::Raw(_)), 256) {
+        out.push_str(&format!("{b:4}: {}\n", dgram_line(&l)));
+    }
+    out
 }
 
 /// The width of a line of /proc/net/route without its newline. Linux pads each line with spaces.
@@ -34,7 +218,7 @@ fn hex(a: [u8; 4]) -> u32 {
 }
 
 /// The text of /proc/net/route: the routes of the main table, without the broadcast and
-/// multicast routes. The kernel does not keep the metrics, so MTU, window and IRTT are 0.
+/// multicast routes. MTU, window and IRTT come from the metrics of the route.
 pub(crate) fn show_route() -> String {
     let mut out = format!(
         "{:<w$}\n",
@@ -57,14 +241,19 @@ pub(crate) fn show_route() -> String {
             flags |= RTF_HOST;
         }
         flags |= RTF_UP;
+        let metric = |ty: u16| r.metrics[usize::from(ty - 1)];
+        let advmss = metric(RTAX_ADVMSS);
         let line = format!(
-            "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
+            "{}\t{:08X}\t{:08X}\t{:04X}\t0\t0\t{}\t{:08X}\t{}\t{}\t{}",
             dev_name(r.ifindex),
             hex(r.dst),
             hex(r.gateway.unwrap_or_default()),
             flags,
             r.priority as i32,
             hex(mask),
+            if advmss != 0 { advmss + 40 } else { 0 },
+            metric(RTAX_WINDOW),
+            metric(RTAX_RTT) >> 3,
         );
         out.push_str(&format!("{line:<w$}\n", w = ROUTE_WIDTH));
     }
@@ -109,6 +298,193 @@ fn table(out: &mut String, name: &str, fields: &[(&str, i64)]) {
     out.push('\n');
 }
 
+/// Adds the `IcmpMsg` lines, as `icmpmsg_put` of Linux: the types with a count that is not 0,
+/// at most 16 in a line.
+fn icmp_msg(out: &mut String) {
+    let k = &COUNTERS;
+    let counts = k.icmp_in_type.iter().chain(&k.icmp_out_type).enumerate();
+    let found: Vec<(String, i64)> = counts
+        .map(|(i, a)| (i, a.load(Ordering::Relaxed) as i64))
+        .filter(|(_, v)| *v != 0)
+        .map(|(i, v)| {
+            let dir = if i >= 256 { "Out" } else { "In" };
+            (format!("{dir}Type{}", i % 256), v)
+        })
+        .collect();
+    for chunk in found.chunks(16) {
+        let fields: Vec<(&str, i64)> = chunk.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        table(out, "IcmpMsg", &fields);
+    }
+}
+
+/// The fields of the `TcpExt` line of /proc/net/netstat, as `snmp4_net_list` of Linux.
+const TCP_EXT: &[&str] = &[
+    "SyncookiesSent",
+    "SyncookiesRecv",
+    "SyncookiesFailed",
+    "EmbryonicRsts",
+    "PruneCalled",
+    "RcvPruned",
+    "OfoPruned",
+    "OutOfWindowIcmps",
+    "LockDroppedIcmps",
+    "ArpFilter",
+    "TW",
+    "TWRecycled",
+    "TWKilled",
+    "PAWSActive",
+    "PAWSEstab",
+    "DelayedACKs",
+    "DelayedACKLocked",
+    "DelayedACKLost",
+    "ListenOverflows",
+    "ListenDrops",
+    "TCPHPHits",
+    "TCPPureAcks",
+    "TCPHPAcks",
+    "TCPRenoRecovery",
+    "TCPSackRecovery",
+    "TCPSACKReneging",
+    "TCPSACKReorder",
+    "TCPRenoReorder",
+    "TCPTSReorder",
+    "TCPFullUndo",
+    "TCPPartialUndo",
+    "TCPDSACKUndo",
+    "TCPLossUndo",
+    "TCPLostRetransmit",
+    "TCPRenoFailures",
+    "TCPSackFailures",
+    "TCPLossFailures",
+    "TCPFastRetrans",
+    "TCPSlowStartRetrans",
+    "TCPTimeouts",
+    "TCPLossProbes",
+    "TCPLossProbeRecovery",
+    "TCPRenoRecoveryFail",
+    "TCPSackRecoveryFail",
+    "TCPRcvCollapsed",
+    "TCPBacklogCoalesce",
+    "TCPDSACKOldSent",
+    "TCPDSACKOfoSent",
+    "TCPDSACKRecv",
+    "TCPDSACKOfoRecv",
+    "TCPAbortOnData",
+    "TCPAbortOnClose",
+    "TCPAbortOnMemory",
+    "TCPAbortOnTimeout",
+    "TCPAbortOnLinger",
+    "TCPAbortFailed",
+    "TCPMemoryPressures",
+    "TCPMemoryPressuresChrono",
+    "TCPSACKDiscard",
+    "TCPDSACKIgnoredOld",
+    "TCPDSACKIgnoredNoUndo",
+    "TCPSpuriousRTOs",
+    "TCPMD5NotFound",
+    "TCPMD5Unexpected",
+    "TCPMD5Failure",
+    "TCPSackShifted",
+    "TCPSackMerged",
+    "TCPSackShiftFallback",
+    "TCPBacklogDrop",
+    "PFMemallocDrop",
+    "TCPMinTTLDrop",
+    "TCPDeferAcceptDrop",
+    "IPReversePathFilter",
+    "TCPTimeWaitOverflow",
+    "TCPReqQFullDoCookies",
+    "TCPReqQFullDrop",
+    "TCPRetransFail",
+    "TCPRcvCoalesce",
+    "TCPOFOQueue",
+    "TCPOFODrop",
+    "TCPOFOMerge",
+    "TCPChallengeACK",
+    "TCPSYNChallenge",
+    "TCPFastOpenActive",
+    "TCPFastOpenActiveFail",
+    "TCPFastOpenPassive",
+    "TCPFastOpenPassiveFail",
+    "TCPFastOpenListenOverflow",
+    "TCPFastOpenCookieReqd",
+    "TCPFastOpenBlackhole",
+    "TCPSpuriousRtxHostQueues",
+    "BusyPollRxPackets",
+    "TCPAutoCorking",
+    "TCPFromZeroWindowAdv",
+    "TCPToZeroWindowAdv",
+    "TCPWantZeroWindowAdv",
+    "TCPSynRetrans",
+    "TCPOrigDataSent",
+    "TCPHystartTrainDetect",
+    "TCPHystartTrainCwnd",
+    "TCPHystartDelayDetect",
+    "TCPHystartDelayCwnd",
+    "TCPACKSkippedSynRecv",
+    "TCPACKSkippedPAWS",
+    "TCPACKSkippedSeq",
+    "TCPACKSkippedFinWait2",
+    "TCPACKSkippedTimeWait",
+    "TCPACKSkippedChallenge",
+    "TCPWinProbe",
+    "TCPKeepAlive",
+    "TCPMTUPFail",
+    "TCPMTUPSuccess",
+    "TCPDelivered",
+    "TCPDeliveredCE",
+    "TCPAckCompressed",
+    "TCPZeroWindowDrop",
+    "TCPRcvQDrop",
+    "TCPWqueueTooBig",
+    "TCPFastOpenPassiveAltKey",
+    "TcpTimeoutRehash",
+    "TcpDuplicateDataRehash",
+    "TCPDSACKRecvSegs",
+    "TCPDSACKIgnoredDubious",
+    "TCPMigrateReqSuccess",
+    "TCPMigrateReqFailure",
+    "TCPPLBRehash",
+    "TCPAORequired",
+    "TCPAOBad",
+    "TCPAOKeyNotFound",
+    "TCPAOGood",
+    "TCPAODroppedIcmps",
+];
+
+/// The fields of the `IpExt` line of /proc/net/netstat, as `snmp4_ipextstats_list` of Linux.
+const IP_EXT: &[&str] = &[
+    "InNoRoutes",
+    "InTruncatedPkts",
+    "InMcastPkts",
+    "OutMcastPkts",
+    "InBcastPkts",
+    "OutBcastPkts",
+    "InOctets",
+    "OutOctets",
+    "InMcastOctets",
+    "OutMcastOctets",
+    "InBcastOctets",
+    "OutBcastOctets",
+    "InCsumErrors",
+    "InNoECTPkts",
+    "InECT1Pkts",
+    "InECT0Pkts",
+    "InCEPkts",
+    "ReasmOverlaps",
+];
+
+/// The text of /proc/net/netstat, as `netstat_seq_show` of Linux. The stack does not keep these
+/// counters, so they are 0. rukernel has no MPTCP, so the file has no `MPTcpExt` line.
+pub(crate) fn show_netstat() -> String {
+    let mut out = String::new();
+    let fields: Vec<(&str, i64)> = TCP_EXT.iter().map(|&n| (n, 0)).collect();
+    table(&mut out, "TcpExt", &fields);
+    let fields: Vec<(&str, i64)> = IP_EXT.iter().map(|&n| (n, 0)).collect();
+    table(&mut out, "IpExt", &fields);
+    out
+}
+
 /// The text of /proc/net/snmp. The stack keeps only some of the counters, and the others are 0.
 /// `Forwarding` is 2 because the stack does not forward, and the TCP constants are the values
 /// of Linux: the RTO algorithm 1 (other), 200 ms and 120 s, and no limit of connections.
@@ -126,9 +502,9 @@ pub(crate) fn show_snmp() -> String {
             ("InHdrErrors", c(&k.ip_in_hdr_errors)),
             ("InAddrErrors", c(&k.ip_in_addr_errors)),
             ("ForwDatagrams", 0),
-            ("InUnknownProtos", 0),
+            ("InUnknownProtos", c(&k.ip_in_unknown_protos)),
             ("InDiscards", 0),
-            ("InDelivers", 0),
+            ("InDelivers", c(&k.ip_in_delivers)),
             ("OutRequests", c(&k.ip_out)),
             ("OutDiscards", 0),
             ("OutNoRoutes", 0),
@@ -142,39 +518,34 @@ pub(crate) fn show_snmp() -> String {
             ("OutTransmits", c(&k.ip_out)),
         ],
     );
-    let icmp = [
-        "InMsgs",
-        "InErrors",
-        "InCsumErrors",
-        "InDestUnreachs",
-        "InTimeExcds",
-        "InParmProbs",
-        "InSrcQuenchs",
-        "InRedirects",
-        "InEchos",
-        "InEchoReps",
-        "InTimestamps",
-        "InTimestampReps",
-        "InAddrMasks",
-        "InAddrMaskReps",
-        "OutMsgs",
-        "OutErrors",
-        "OutRateLimitGlobal",
-        "OutRateLimitHost",
-        "OutDestUnreachs",
-        "OutTimeExcds",
-        "OutParmProbs",
-        "OutSrcQuenchs",
-        "OutRedirects",
-        "OutEchos",
-        "OutEchoReps",
-        "OutTimestamps",
-        "OutTimestampReps",
-        "OutAddrMasks",
-        "OutAddrMaskReps",
+    // The types of the `Icmp` line, as `icmpmibmap` of Linux.
+    let types = [
+        ("DestUnreachs", 3),
+        ("TimeExcds", 11),
+        ("ParmProbs", 12),
+        ("SrcQuenchs", 4),
+        ("Redirects", 5),
+        ("Echos", 8),
+        ("EchoReps", 0),
+        ("Timestamps", 13),
+        ("TimestampReps", 14),
+        ("AddrMasks", 17),
+        ("AddrMaskReps", 18),
     ];
-    let icmp: alloc::vec::Vec<(&str, i64)> = icmp.iter().map(|&n| (n, 0)).collect();
+    let mut icmp: Vec<(String, i64)> = Vec::from([
+        (String::from("InMsgs"), c(&k.icmp_in)),
+        (String::from("InErrors"), c(&k.icmp_in_errors)),
+        (String::from("InCsumErrors"), c(&k.icmp_in_csum_errors)),
+    ]);
+    icmp.extend(types.iter().map(|(n, t)| (format!("In{n}"), c(&k.icmp_in_type[*t]))));
+    for n in ["OutMsgs", "OutErrors", "OutRateLimitGlobal", "OutRateLimitHost"] {
+        let v = if n == "OutMsgs" { c(&k.icmp_out) } else { 0 };
+        icmp.push((String::from(n), v));
+    }
+    icmp.extend(types.iter().map(|(n, t)| (format!("Out{n}"), c(&k.icmp_out_type[*t]))));
+    let icmp: Vec<(&str, i64)> = icmp.iter().map(|(n, v)| (n.as_str(), *v)).collect();
     table(&mut out, "Icmp", &icmp);
+    icmp_msg(&mut out);
     table(
         &mut out,
         "Tcp",
@@ -183,34 +554,41 @@ pub(crate) fn show_snmp() -> String {
             ("RtoMin", 200),
             ("RtoMax", 120_000),
             ("MaxConn", -1),
-            ("ActiveOpens", 0),
-            ("PassiveOpens", 0),
-            ("AttemptFails", 0),
-            ("EstabResets", 0),
-            ("CurrEstab", 0),
-            ("InSegs", 0),
-            ("OutSegs", 0),
-            ("RetransSegs", 0),
-            ("InErrs", 0),
-            ("OutRsts", 0),
-            ("InCsumErrors", 0),
+            ("ActiveOpens", c(&k.tcp_active_opens)),
+            ("PassiveOpens", c(&k.tcp_passive_opens)),
+            ("AttemptFails", c(&k.tcp_attempt_fails)),
+            ("EstabResets", c(&k.tcp_estab_resets)),
+            ("CurrEstab", crate::tcp::curr_estab() as i64),
+            ("InSegs", c(&k.tcp_in_segs)),
+            ("OutSegs", c(&k.tcp_out_segs)),
+            ("RetransSegs", c(&k.tcp_retrans_segs)),
+            ("InErrs", c(&k.tcp_in_errs)),
+            ("OutRsts", c(&k.tcp_out_rsts)),
+            ("InCsumErrors", c(&k.tcp_in_csum_errors)),
         ],
     );
-    let udp = |in_: i64, no_ports: i64, errors: i64, rcvbuf: i64| {
+    let udp = |v: [i64; 6]| {
         [
-            ("InDatagrams", in_),
-            ("NoPorts", no_ports),
-            ("InErrors", errors),
-            ("OutDatagrams", 0),
-            ("RcvbufErrors", rcvbuf),
+            ("InDatagrams", v[0]),
+            ("NoPorts", v[1]),
+            ("InErrors", v[2]),
+            ("OutDatagrams", v[3]),
+            ("RcvbufErrors", v[4]),
             ("SndbufErrors", 0),
-            ("InCsumErrors", 0),
+            ("InCsumErrors", v[5]),
             ("IgnoredMulti", 0),
             ("MemErrors", 0),
         ]
     };
-    let u = udp(c(&k.udp_in), c(&k.udp_no_ports), c(&k.udp_in_errors), c(&k.udp_rcvbuf_errors));
+    let u = udp([
+        c(&k.udp_in),
+        c(&k.udp_no_ports),
+        c(&k.udp_in_errors),
+        c(&k.udp_out),
+        c(&k.udp_rcvbuf_errors),
+        c(&k.udp_in_csum_errors),
+    ]);
     table(&mut out, "Udp", &u);
-    table(&mut out, "UdpLite", &udp(0, 0, 0, 0));
+    table(&mut out, "UdpLite", &udp([0; 6]));
     out
 }

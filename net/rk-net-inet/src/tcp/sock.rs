@@ -11,12 +11,12 @@
 //! it holds no lock while it sends a segment. A received segment does not start a poll.
 
 use super::cc::Algo;
-use super::conn::{Config, Conn, DEFAULT_MSS, State};
+use super::conn::{Config, Conn, DEFAULT_MSS, ProcInfo, State};
 use super::seg::{self, ACK, RST, SYN, Seg};
 use crate::ipv4::{self, Addr, Header, PROTO_TCP};
 use crate::ports::{self, Binding, Ports};
 use crate::sockaddr;
-use crate::stack::{self, Out};
+use crate::stack::{self, COUNTERS, Out};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -136,6 +136,11 @@ struct Inner {
     algo: Algo,
     shut_rd: bool,
     shut_wr: bool,
+    /// The owner, the file system user ID of the creator as `sk_uid` of Linux. A connection of
+    /// a listening socket has the owner of the listening socket.
+    uid: u32,
+    /// The state at the last `collect`, for the counters of /proc/net/snmp.
+    counted: State,
 }
 
 impl Inner {
@@ -166,6 +171,8 @@ impl Inner {
             algo: Algo::Cubic,
             shut_rd: false,
             shut_wr: false,
+            uid: rk_vfs::cred::current().fsuid,
+            counted: State::Closed,
         }
     }
 
@@ -262,8 +269,32 @@ struct Tx {
     reuse: bool,
 }
 
+/// Counts a change of the state of a connection, as `tcp_set_state`, `tcp_done` and
+/// `tcp_connect` of Linux.
+fn count_change(before: State, after: State) {
+    if before == after {
+        return;
+    }
+    let k = &COUNTERS;
+    match (before, after) {
+        (State::Closed, State::SynSent) => add(&k.tcp_active_opens, 1),
+        (State::SynRcvd, a) if a != State::Closed => add(&k.tcp_passive_opens, 1),
+        (State::SynSent | State::SynRcvd, State::Closed) => add(&k.tcp_attempt_fails, 1),
+        (State::Established | State::CloseWait, State::Closed) => add(&k.tcp_estab_resets, 1),
+        _ => {}
+    }
+}
+
+fn add(c: &AtomicU64, n: u64) {
+    c.fetch_add(n, Ordering::Relaxed);
+}
+
 /// Sends the segment `seg` of the connection `key`.
 fn transmit(key: &Key, ttl: u8, tos: u8, seg: &Seg) {
+    add(&COUNTERS.tcp_out_segs, 1);
+    if seg.has(RST) {
+        add(&COUNTERS.tcp_out_rsts, 1);
+    }
     let &(src, sport, dst, dport) = key;
     let Ok(next) = stack::route(dst) else { return };
     let bytes = seg.encode(sport, dport, src, dst);
@@ -288,7 +319,17 @@ pub(crate) fn input(h: &Header, tcp: &[u8], broadcast: bool) {
     if broadcast {
         return;
     }
-    let Some((sport, dport, seg)) = seg::parse(tcp, h.src, h.dst) else { return };
+    let Some((sport, dport, seg)) = seg::parse(tcp, h.src, h.dst) else {
+        // A segment shorter than its header goes without a count, as `tcp_v4_rcv` of Linux.
+        if tcp.len() >= seg::HLEN {
+            add(&COUNTERS.tcp_in_errs, 1);
+            if !seg::checksum_ok(tcp, h.src, h.dst) {
+                add(&COUNTERS.tcp_in_csum_errors, 1);
+            }
+        }
+        return;
+    };
+    add(&COUNTERS.tcp_in_segs, 1);
     let key = (h.dst, dport, h.src, sport);
     let found = ESTAB.lock().get(&key).cloned();
     if let Some(sock) = found {
@@ -330,6 +371,82 @@ pub(crate) fn tick() {
     }
 }
 
+/// The state numbers of Linux in include/net/tcp_states.h, which is not in the uAPI.
+fn linux_state(state: State) -> u8 {
+    match state {
+        State::Established => 1,
+        State::SynSent => 2,
+        State::SynRcvd => 3,
+        State::FinWait1 => 4,
+        State::FinWait2 => 5,
+        State::TimeWait => 6,
+        State::Closed => 7,
+        State::CloseWait => 8,
+        State::LastAck => 9,
+        State::Closing => 11,
+    }
+}
+
+/// `TCP_LISTEN` of include/net/tcp_states.h.
+pub(crate) const LISTEN_STATE: u8 = 10;
+
+/// A socket of /proc/net/tcp.
+pub(crate) struct ProcLine {
+    /// The local address and port.
+    pub local: (Addr, u16),
+    /// The remote address and port, or `0.0.0.0:0`.
+    pub remote: (Addr, u16),
+    /// The state number of Linux.
+    pub state: u8,
+    /// The owner.
+    pub uid: u32,
+    /// The inode number of the socket.
+    pub ino: u64,
+    /// The connections that wait for `accept`, for a listening socket.
+    pub accept_queue: u32,
+    /// The values of the connection. A listening socket has none.
+    pub info: Option<ProcInfo>,
+}
+
+/// The sockets of /proc/net/tcp: the listening sockets, then the connections, as the order of
+/// `tcp_seq_next` in Linux. A socket that is only bound is not there.
+pub(crate) fn proc_lines() -> Vec<ProcLine> {
+    let now = stack::now_ms();
+    let listening: Vec<Arc<Stream>> =
+        LISTEN.lock().values().flatten().map(|(_, s)| s.clone()).collect();
+    let conns: Vec<Arc<Stream>> = ESTAB.lock().values().cloned().collect();
+    let mut out = Vec::new();
+    for sock in listening.iter().chain(&conns) {
+        let s = sock.state.lock();
+        let (state, info) = match (&s.listen, &s.conn) {
+            (Some(_), _) => (LISTEN_STATE, None),
+            (None, Some(c)) if c.state() != State::Closed => {
+                (linux_state(c.state()), Some(c.proc_info(now)))
+            }
+            _ => continue,
+        };
+        out.push(ProcLine {
+            local: (s.local, s.port),
+            remote: s.remote.unwrap_or((ipv4::ANY, 0)),
+            state,
+            uid: s.uid,
+            ino: sock.ino,
+            accept_queue: s.listen.as_ref().map_or(0, |l| l.queue.len() as u32),
+            info,
+        });
+    }
+    out
+}
+
+/// The connections in the state ESTABLISHED or CLOSE-WAIT, for `CurrEstab` of /proc/net/snmp.
+pub(crate) fn curr_estab() -> u64 {
+    let conns: Vec<Arc<Stream>> = ESTAB.lock().values().cloned().collect();
+    conns
+        .iter()
+        .filter(|c| matches!(c.state.lock().state(), State::Established | State::CloseWait))
+        .count() as u64
+}
+
 /// A TCP socket.
 pub struct Stream {
     ino: u64,
@@ -365,6 +482,10 @@ impl Stream {
     fn collect(&self, s: &mut Inner) -> Tx {
         let segs = s.conn.as_mut().map(Conn::take_output).unwrap_or_default();
         let state = s.state();
+        let retransmits = s.conn.as_mut().map_or(0, Conn::take_retransmits);
+        add(&COUNTERS.tcp_retrans_segs, u64::from(retransmits));
+        count_change(s.counted, state);
+        s.counted = state;
         let unhash = state == State::Closed && s.hashed;
         if unhash {
             s.hashed = false;
@@ -509,6 +630,7 @@ impl Stream {
             c.keepcnt = s.keepcnt;
             c.syn_retries = s.syn_retries;
             c.algo = s.algo;
+            c.uid = s.uid;
             c.conn = Some(Conn::accept(&c.config(remote), seg, now));
             c.tune(now);
             (Stream::with(c), s.reuse())

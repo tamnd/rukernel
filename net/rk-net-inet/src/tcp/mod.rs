@@ -10,4 +10,4 @@ pub mod seg;
 mod sock;
 
 pub use sock::Stream;
-pub(crate) use sock::{input, tick};
+pub(crate) use sock::{curr_estab, input, proc_lines, tick};

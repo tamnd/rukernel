@@ -1705,8 +1705,9 @@ fn pass_line(test: &str) -> String {
 
 /// The commands of the `netcfg` test. The shell sets up the interface of the user network of
 /// QEMU without `ip=`, through rtnetlink (`ip`) and the interface ioctls (`ifconfig`, `route`).
-/// Then it pings the gateway and reads the files of /proc/net. The shell exits with 0 only if
-/// all of the commands pass.
+/// Then it pings the gateway, looks up routes, and reads the files of /proc/net, the socket
+/// tables and /sys/class/net. The line editor of BusyBox takes at most 1024 bytes, so the
+/// commands are in two lines. The shell exits with 0 only if all of the commands pass.
 const NETCFG_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
 && ip link set lo up && ip link set eth0 up \
 && ip addr add 10.0.2.15/24 dev eth0 && ip route add default via 10.0.2.2 \
@@ -1714,10 +1715,28 @@ const NETCFG_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
 && ip addr add 10.0.2.16/24 dev eth0 && ip addr del 10.0.2.16/24 dev eth0 \
 && ifconfig && ifconfig eth0 mtu 1400 && ifconfig eth0 | grep -q MTU:1400 \
 && ifconfig eth0:1 10.0.3.1 netmask 255.255.255.0 && ifconfig eth0:1 down \
-&& route add -net 10.9.0.0 netmask 255.255.0.0 gw 10.0.2.2 && route -n \
+&& route add -net 10.9.0.0 netmask 255.255.0.0 gw 10.0.2.2 mss 1400 window 8192 irtt 10 \
+&& route -n && ip route show 10.9.0.0/16 && cat /proc/net/route \
+&& grep -q '^eth0.0000090A.*0000FFFF.1400.8192.10 ' /proc/net/route \
 && route del -net 10.9.0.0 netmask 255.255.0.0 && ! ip route | grep -q 10.9.0.0 \
 && ping -c 1 10.0.2.2 && ip neigh && ls /proc/net \
-&& cat /proc/net/dev /proc/net/route /proc/net/arp /proc/net/snmp && exit 0; exit 1\n";
+&& cat /proc/net/dev /proc/net/route /proc/net/arp /proc/net/snmp /proc/net/netstat \
+&& grep -q '^Icmp: [1-9]' /proc/net/snmp && echo 'netcfg: first'' part' || exit 1\n";
+
+/// The second line of the `netcfg` test, after the text of `NETCFG_SCRIPT` that ends the first.
+const NETCFG_SCRIPT2: &[u8] =
+    b"ip route get 10.0.2.2 && ip route get 1.1.1.1 | grep -q 'via 10.0.2.2' \
+&& ip route get 127.0.0.1 | grep -q '^local' \
+&& { busybox tcpsvd 0 5555 true </dev/null & } && { busybox udpsvd 0 5556 true </dev/null & } \
+&& { for i in 1 2 3 4 5 6 7 8 9 10; do grep -q :15B4 /proc/net/udp && break; sleep 1; done; } \
+&& cat /proc/net/tcp /proc/net/udp /proc/net/raw /proc/net/icmp /proc/net/unix \
+&& grep -q ': 00000000:15B3 00000000:0000 0A ' /proc/net/tcp \
+&& grep -q ': 00000000:15B4 00000000:0000 07 ' /proc/net/udp \
+&& grep -q '^Num       RefCount Protocol Flags    Type St Inode Path' /proc/net/unix \
+&& mkdir -p /sys && mount -t sysfs sysfs /sys && ls /sys/class/net /sys/class/net/eth0 \
+&& cat /sys/class/net/eth0/address /sys/class/net/eth0/operstate \
+&& grep -q 1400 /sys/class/net/eth0/mtu && cat /sys/class/net/lo/statistics/rx_packets \
+&& grep VmData /proc/self/status && exit 0; exit 1\n";
 
 /// The input of a boot test. When the log has the text of an entry, the test writes the bytes of
 /// the entry to the serial port. The `tty` test types a line and then `^C`.
@@ -1733,7 +1752,7 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("TICK", b"\x03"),
             ("TICK", b"test $? = 130; exit $?\n"),
         ],
-        "netcfg" => &[("/ # ", NETCFG_SCRIPT)],
+        "netcfg" => &[("/ # ", NETCFG_SCRIPT), ("netcfg: first part", NETCFG_SCRIPT2)],
         _ => &[],
     }
 }

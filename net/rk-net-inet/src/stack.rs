@@ -41,8 +41,7 @@ static SOCKETS: SpinLock<BTreeMap<u64, Weak<Dgram>>> = SpinLock::new(BTreeMap::n
 /// The identification of the next packet.
 static IP_ID: AtomicU16 = AtomicU16::new(1);
 
-/// The counters of the stack, as the `Ip`, `Icmp` and `Udp` lines of /proc/net/snmp.
-#[derive(Default)]
+/// The counters of the stack, as the lines of /proc/net/snmp.
 pub struct Counters {
     /// The IPv4 packets that the stack received.
     pub ip_in: AtomicU64,
@@ -52,6 +51,10 @@ pub struct Counters {
     pub ip_reasm_fails: AtomicU64,
     /// The packets to an address that is not local. The stack does not forward.
     pub ip_in_addr_errors: AtomicU64,
+    /// The IPv4 packets that went to a protocol or a raw socket.
+    pub ip_in_delivers: AtomicU64,
+    /// The IPv4 packets of a protocol without a handler or a raw socket.
+    pub ip_in_unknown_protos: AtomicU64,
     /// The IPv4 packets that the stack sent.
     pub ip_out: AtomicU64,
     /// The datagrams that a UDP socket took.
@@ -62,6 +65,42 @@ pub struct Counters {
     pub udp_in_errors: AtomicU64,
     /// The datagrams that a full receive buffer dropped.
     pub udp_rcvbuf_errors: AtomicU64,
+    /// The datagrams with a bad checksum. `udp_in_errors` counts them too.
+    pub udp_in_csum_errors: AtomicU64,
+    /// The datagrams that the UDP sockets sent.
+    pub udp_out: AtomicU64,
+    /// The ICMP messages that the stack received.
+    pub icmp_in: AtomicU64,
+    /// The ICMP messages that were too short or had a bad checksum.
+    pub icmp_in_errors: AtomicU64,
+    /// The ICMP messages with a bad checksum. `icmp_in_errors` counts them too.
+    pub icmp_in_csum_errors: AtomicU64,
+    /// The ICMP messages that the stack sent.
+    pub icmp_out: AtomicU64,
+    /// The received ICMP messages by type, as `icmpmsg_statistics` of Linux.
+    pub icmp_in_type: [AtomicU64; 256],
+    /// The sent ICMP messages by type.
+    pub icmp_out_type: [AtomicU64; 256],
+    /// The connections that went to SYN-SENT.
+    pub tcp_active_opens: AtomicU64,
+    /// The connections that went from SYN-RECEIVED to an open state.
+    pub tcp_passive_opens: AtomicU64,
+    /// The connections that went from SYN-SENT or SYN-RECEIVED to CLOSED.
+    pub tcp_attempt_fails: AtomicU64,
+    /// The connections that went from ESTABLISHED or CLOSE-WAIT to CLOSED.
+    pub tcp_estab_resets: AtomicU64,
+    /// The TCP segments that the stack received.
+    pub tcp_in_segs: AtomicU64,
+    /// The TCP segments that the stack sent.
+    pub tcp_out_segs: AtomicU64,
+    /// The TCP segments that went out again.
+    pub tcp_retrans_segs: AtomicU64,
+    /// The TCP segments with a bad header or checksum.
+    pub tcp_in_errs: AtomicU64,
+    /// The TCP segments with a bad checksum. `tcp_in_errs` counts them too.
+    pub tcp_in_csum_errors: AtomicU64,
+    /// The TCP segments with RST that the stack sent.
+    pub tcp_out_rsts: AtomicU64,
 }
 
 /// The counters.
@@ -69,15 +108,36 @@ pub static COUNTERS: Counters = Counters {
     ip_in: AtomicU64::new(0),
     ip_in_hdr_errors: AtomicU64::new(0),
     ip_reasm_fails: AtomicU64::new(0),
+    ip_in_delivers: AtomicU64::new(0),
+    ip_in_unknown_protos: AtomicU64::new(0),
     ip_in_addr_errors: AtomicU64::new(0),
     ip_out: AtomicU64::new(0),
     udp_in: AtomicU64::new(0),
     udp_no_ports: AtomicU64::new(0),
     udp_in_errors: AtomicU64::new(0),
     udp_rcvbuf_errors: AtomicU64::new(0),
+    udp_in_csum_errors: AtomicU64::new(0),
+    udp_out: AtomicU64::new(0),
+    icmp_in: AtomicU64::new(0),
+    icmp_in_errors: AtomicU64::new(0),
+    icmp_in_csum_errors: AtomicU64::new(0),
+    icmp_out: AtomicU64::new(0),
+    icmp_in_type: [const { AtomicU64::new(0) }; 256],
+    icmp_out_type: [const { AtomicU64::new(0) }; 256],
+    tcp_active_opens: AtomicU64::new(0),
+    tcp_passive_opens: AtomicU64::new(0),
+    tcp_attempt_fails: AtomicU64::new(0),
+    tcp_estab_resets: AtomicU64::new(0),
+    tcp_in_segs: AtomicU64::new(0),
+    tcp_out_segs: AtomicU64::new(0),
+    tcp_retrans_segs: AtomicU64::new(0),
+    tcp_in_errs: AtomicU64::new(0),
+    tcp_in_csum_errors: AtomicU64::new(0),
+    tcp_out_rsts: AtomicU64::new(0),
 };
 
-fn count(c: &AtomicU64) {
+/// Adds one to the counter `c`.
+pub(crate) fn count(c: &AtomicU64) {
     c.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -101,6 +161,11 @@ pub(crate) fn add_socket(id: u64, sock: &Arc<Dgram>) {
 /// Removes a socket from the table of the open sockets.
 pub(crate) fn remove_socket(id: u64) {
     SOCKETS.lock().remove(&id);
+}
+
+/// The open datagram sockets, by their inode number.
+pub(crate) fn dgram_sockets() -> Vec<Arc<Dgram>> {
+    SOCKETS.lock().values().filter_map(Weak::upgrade).collect()
 }
 
 fn socket(id: u64) -> Option<Arc<Dgram>> {
@@ -186,7 +251,18 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
     let mut buf = NetBuf::new(HEADROOM, HLEN + payload.len());
     buf.extend_from_slice(&header.to_bytes());
     buf.extend_from_slice(payload);
+    if out.protocol == PROTO_ICMP {
+        count_icmp_out(payload);
+    }
     transmit(&dev, next, buf)
+}
+
+/// Counts an ICMP message that goes out, as `icmp_out_count` of Linux.
+fn count_icmp_out(msg: &[u8]) {
+    if let Some(&t) = msg.first() {
+        count(&COUNTERS.icmp_out);
+        count(&COUNTERS.icmp_out_type[usize::from(t)]);
+    }
 }
 
 /// Sends a packet that has its IPv4 header, for a raw socket with `IP_HDRINCL`.
@@ -194,6 +270,11 @@ pub(crate) fn output_raw(next: &route::Next, packet: &[u8]) -> Result<()> {
     let dev = dev::by_index(next.ifindex).ok_or(Errno::ENETUNREACH)?;
     if packet.len() > dev.mtu() as usize {
         return Err(Errno::EMSGSIZE);
+    }
+    if let Some(h) = Header::parse_loose(packet)
+        && h.protocol == PROTO_ICMP
+    {
+        count_icmp_out(packet.get(h.hlen..).unwrap_or_default());
     }
     transmit(&dev, next, NetBuf::from_slice(packet))
 }
@@ -319,6 +400,13 @@ fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
     }
     let packet = frame.data();
     let payload = &packet[h.hlen..];
+    // `ip_protocol_deliver_rcu` counts a packet with a handler or a raw socket as delivered.
+    let known = matches!(h.protocol, PROTO_ICMP | PROTO_UDP | PROTO_TCP);
+    if known || !raw.is_empty() {
+        count(&COUNTERS.ip_in_delivers);
+    } else {
+        count(&COUNTERS.ip_in_unknown_protos);
+    }
     match h.protocol {
         PROTO_ICMP => icmp_input(&h, payload, broadcast),
         PROTO_UDP => udp_input(&h, packet, broadcast),
@@ -347,9 +435,15 @@ fn icmp_errno(kind: u8, code: u8) -> (Errno, bool) {
 
 /// Takes an ICMP message, as `icmp_rcv` of Linux.
 fn icmp_input(h: &Header, msg: &[u8], broadcast: bool) {
-    if msg.len() < 8 || checksum::checksum(msg) != 0 {
-        return;
+    count(&COUNTERS.icmp_in);
+    if msg.len() < 8 {
+        return count(&COUNTERS.icmp_in_errors);
     }
+    if checksum::checksum(msg) != 0 {
+        count(&COUNTERS.icmp_in_csum_errors);
+        return count(&COUNTERS.icmp_in_errors);
+    }
+    count(&COUNTERS.icmp_in_type[usize::from(msg[0])]);
     match msg[0] {
         // Linux ignores an echo request to a broadcast address by default, as
         // `net.ipv4.icmp_echo_ignore_broadcasts`.
@@ -443,6 +537,7 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool) {
     if u.check != 0
         && checksum::fold(checksum::add(checksum::pseudo(h.src, h.dst, PROTO_UDP, u.len), d)) != 0
     {
+        count(&COUNTERS.udp_in_csum_errors);
         return count(&COUNTERS.udp_in_errors);
     }
     let Some(sock) = find_socket(&UDP_PORTS, u.dst, h.dst, h.src, u.src) else {

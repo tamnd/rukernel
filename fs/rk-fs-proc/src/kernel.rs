@@ -547,6 +547,48 @@ fn statm_of(p: &Process) -> Statm {
     m
 }
 
+/// The sizes of the kinds of memory of `p`, as `task_mem` and the `vm_stat_account` of Linux:
+/// a private area that can be written is data, an area that can run and cannot be written is
+/// code. The code of the first such area of a file is the code of the program, and the rest is
+/// the code of the libraries.
+fn mem_sizes(p: &Process) -> text::MemSizes {
+    let mut m = text::MemSizes::default();
+    let Some(vm) = p.vm() else { return m };
+    let page = rk_mm::PAGE_SIZE as u64;
+    let mut exe_file = None;
+    for a in vm.areas() {
+        let size = (a.end - a.start) as u64;
+        let resident = vm.resident_pages(a.start, a.end) as u64 * page;
+        let file = match &a.backing {
+            Backing::File { file, .. } => {
+                let (dev, ino, _) = file.name();
+                Some((dev, ino))
+            }
+            _ => None,
+        };
+        match (&file, a.shared) {
+            (Some(_), _) => m.rss_file += resident,
+            (None, true) => m.rss_shmem += resident,
+            (None, false) => m.rss_anon += resident,
+        }
+        if a.kind == VmaKind::Stack {
+            m.stack += size;
+        } else if a.prot.write && !a.shared {
+            m.data += size;
+        } else if a.prot.exec && !a.prot.write {
+            if exe_file.is_none() && file.is_some() {
+                exe_file.clone_from(&file);
+            }
+            if file.is_some() && file == exe_file {
+                m.exe += size;
+            } else {
+                m.lib += size;
+            }
+        }
+    }
+    m
+}
+
 fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
     let s = stat_of(p, t);
     let threads = p.threads();
@@ -559,6 +601,7 @@ fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
         shared_pending: p.shared_pending().0,
         locked: p.vm().map_or(0, |vm| vm.locked_bytes() as u64),
         rss: p.vm().map_or(0, |vm| vm.resident_pages(0, rk_frame::vm::USER_END) as u64 * 4096),
+        mem: mem_sizes(p),
         cred: (*p.cred()).clone(),
         no_new_privs: thread.is_some_and(Thread::no_new_privs),
     };
