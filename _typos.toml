@@ -33,3 +33,5 @@ exportfs = "exportfs" # the NFS export code of Linux and the group of fstests
 IIF = "IIF"       # RTA_IIF of rtnetlink, the input interface of a route
 OIF = "OIF"       # RTA_OIF of rtnetlink, the output interface of a route
 Parm = "Parm"     # InParmProbs of /proc/net/snmp, the ICMP parameter problems
+Ofo = "Ofo"       # OfoPruned of /proc/net/netstat, the out of order queue of TCP
+ECT = "ECT"       # InECT0Pkts of /proc/net/netstat, the ECN capable transport

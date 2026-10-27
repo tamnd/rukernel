@@ -124,8 +124,7 @@ impl Seg {
 /// segment, a bad offset or a bad checksum.
 pub fn parse(tcp: &[u8], src: Addr, dst: Addr) -> Option<(u16, u16, Seg)> {
     let h = tcp.get(..HLEN)?;
-    let len = u16::try_from(tcp.len()).ok()?;
-    if checksum::fold(checksum::add(checksum::pseudo(src, dst, PROTO_TCP, len), tcp)) != 0 {
+    if !checksum_ok(tcp, src, dst) {
         return None;
     }
     let off = usize::from(h[12] >> 4) * 4;
@@ -145,6 +144,12 @@ pub fn parse(tcp: &[u8], src: Addr, dst: Addr) -> Option<(u16, u16, Seg)> {
         options(&tcp[HLEN..off], &mut seg);
     }
     Some((u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[2], h[3]]), seg))
+}
+
+/// Tells if the checksum of the segment `tcp` from `src` to `dst` is right.
+pub fn checksum_ok(tcp: &[u8], src: Addr, dst: Addr) -> bool {
+    let Ok(len) = u16::try_from(tcp.len()) else { return false };
+    checksum::fold(checksum::add(checksum::pseudo(src, dst, PROTO_TCP, len), tcp)) == 0
 }
 
 /// Reads the options of a SYN. An option that is not known or not valid is skipped.

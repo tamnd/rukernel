@@ -150,7 +150,7 @@ pub const RTF_GATEWAY: u32 = 0x2;
 /// The route goes to one host.
 pub const RTF_HOST: u32 = 0x4;
 /// The route has an MTU.
-pub const RTF_MTU: u32 = 0x20;
+pub const RTF_MTU: u32 = 0x40;
 /// The route has a window size.
 pub const RTF_WINDOW: u32 = 0x80;
 /// The route has an initial round trip time.

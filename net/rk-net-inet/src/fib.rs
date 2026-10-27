@@ -6,7 +6,7 @@
 //! after the lock is free, because a socket that gets a message takes its own lock.
 
 use crate::ipv4::{self, Addr};
-use crate::route::{Changes, IfAddr, Link, Match, Route};
+use crate::route::{Changes, IfAddr, Link, Match, Metrics, Route};
 use crate::stack::{self, ROUTES};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -18,9 +18,9 @@ use rk_abi::native::if_addr::{
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL};
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RTA_DST,
-    RTA_GATEWAY, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELADDR, RTM_DELROUTE,
-    RTM_NEWADDR, RTM_NEWROUTE, RTN_ANYCAST, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST,
-    RTN_NAT, RTN_PROHIBIT, RTN_THROW, RTN_UNICAST, RTN_UNREACHABLE, RTN_XRESOLVE,
+    RTA_GATEWAY, RTA_METRICS, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELADDR,
+    RTM_DELROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_ANYCAST, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL,
+    RTN_MULTICAST, RTN_NAT, RTN_PROHIBIT, RTN_THROW, RTN_UNICAST, RTN_UNREACHABLE, RTN_XRESOLVE,
     RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV4_ROUTE,
 };
 use rk_net::consts::{AF_INET, IFNAMSIZ};
@@ -126,6 +126,7 @@ pub fn fill_route(r: &Route, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<
     if r.priority != 0 {
         b.u32(RTA_PRIORITY as u16, r.priority);
     }
+    put_metrics(&mut b, &r.metrics);
     if let Some(s) = r.prefsrc {
         b.put(RTA_PREFSRC as u16, &s);
     }
@@ -136,6 +137,22 @@ pub fn fill_route(r: &Route, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<
         b.u32(RTA_OIF as u16, r.ifindex);
     }
     b.finish()
+}
+
+/// Adds the metrics that are not 0 in an `RTA_METRICS` attribute, as `rtnetlink_put_metrics`
+/// of Linux. A route without metrics gets no attribute.
+pub(crate) fn put_metrics(b: &mut Builder, m: &Metrics) {
+    let at = b.nest(RTA_METRICS as u16);
+    let mut any = false;
+    for (ty, v) in (1u16..).zip(m.iter()).filter(|(_, v)| **v != 0) {
+        b.u32(ty, *v);
+        any = true;
+    }
+    if any {
+        b.end_nest(at);
+    } else {
+        b.truncate(at);
+    }
 }
 
 /// Sends the notification of an address to `RTNLGRP_IPV4_IFADDR`, as `rtmsg_ifa` of Linux.

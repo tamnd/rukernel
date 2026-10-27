@@ -4,8 +4,18 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The socket tables /proc/net/tcp, /proc/net/udp, /proc/net/raw, /proc/net/icmp and /proc/net/unix, and /proc/net/netstat, in the format of Linux (#355). The lines have the state, the queues, the timer, the uid and the inode of each socket.
+- Real ICMP, TCP and IP counters in /proc/net/snmp (#355): the `Icmp` and `IcmpMsg` lines, `ActiveOpens`, `PassiveOpens`, `AttemptFails`, `EstabResets`, `CurrEstab`, `InSegs`, `OutSegs`, `RetransSegs`, `InErrs`, `OutRsts` and `InCsumErrors` of TCP, `OutDatagrams` and `InCsumErrors` of UDP, and `InDelivers` and `InUnknownProtos` of IP.
+- The directory /sys/class/net with a link for each interface to /sys/devices/virtual/net/NAME, which has `address`, `mtu`, `flags`, `operstate`, `carrier`, `ifindex`, `type`, the other attribute files of Linux and the `statistics` directory (#355).
+- `RTM_GETROUTE` for one destination, as `inet_rtm_getroute` of Linux, so `ip route get` works (#355). The reply has the source address, the gateway, the output interface and the uid, and `RTM_F_FIB_MATCH` gives the route of the table.
+- Route metrics (#355): `SIOCADDRT` keeps the MTU, the window and the initial RTT of `route add ... mss window irtt`, `RTM_NEWROUTE` keeps `RTA_METRICS`, and /proc/net/route and the rtnetlink messages show them.
+- The lines `VmData`, `VmStk`, `VmExe`, `VmLib`, `VmPTE`, `VmSwap`, `VmPin`, `VmHWM`, `RssAnon`, `RssFile`, `RssShmem`, `HugetlbPages`, `CoreDumping` and `THP_enabled` in /proc/PID/status (#355).
+
 ### Fixed
 
+- `RTF_MTU` had the value of `RTF_MODIFIED` (0x20). It is now 0x40, as in linux/route.h (#355).
 - The x86_64 timer interrupt now counts each tick period that passed since the last tick, as `tick_do_update_jiffies64` of Linux (#346). The local APIC keeps only one pending timer interrupt, so a kernel path that ran longer than one tick with interrupts off lost ticks. The clock and all timeouts then ran slow, and the `sleep` watchdog of `tools/ltp/run.py` did not stop the test in time.
 - The x86_64 boot code now measures the time stamp counter against the PIT 8 times and keeps the shortest measure, as `pit_hpet_ptimer_calibrate_cpu` of Linux (#346). Before, one measure under QEMU without KVM on a busy host gave 4.5 times the true frequency. The clock then ran at a fifth of the true speed, so hackbench02 and shm_test01 of LTP stopped the guest past the time limit of `run.py`.
 
