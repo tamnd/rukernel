@@ -12,12 +12,15 @@
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::WaitQueue;
 use rk_vfs::cred::IpcOwner;
+use rk_vfs::ipc::SEM_NEXT_ID;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new set.
@@ -246,8 +249,9 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
     if table.sets.len() >= SEMMNI || used + nsems as usize > SEMMNS as usize {
         return Err(Errno::ENOSPC);
     }
-    let id = table.next;
-    table.next = table.next.wrapping_add(1) & i32::MAX;
+    let next = table.next;
+    let id = rk_vfs::ipc::alloc_id(&SEM_NEXT_ID, next, |id| table.sets.contains_key(&id));
+    table.next = id.wrapping_add(1) & i32::MAX;
     // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
     let perm = IpcPerm {
         key,
@@ -575,4 +579,28 @@ pub(crate) fn exit(pid: i32) {
     }
     drop(table);
     WAIT.wake_all();
+}
+
+/// The text of `/proc/sysvipc/sem`, as `sysvipc_sem_proc_show` of Linux.
+pub(crate) fn proc_text() -> Vec<u8> {
+    let mut out = String::from(
+        "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
+    );
+    for (id, s) in &TABLE.lock().sets {
+        let p = &s.perm;
+        out.push_str(&format!(
+            "{:10} {:10}  {:4o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",
+            p.key,
+            id,
+            p.mode,
+            s.members.len(),
+            p.uid,
+            p.gid,
+            p.cuid,
+            p.cgid,
+            s.otime,
+            s.ctime,
+        ));
+    }
+    out.into_bytes()
 }

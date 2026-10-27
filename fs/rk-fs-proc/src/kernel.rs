@@ -141,7 +141,27 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
         }),
     ));
     out.push((b"sys".to_vec(), sys_dir()));
+    out.push((b"sysvipc".to_vec(), sysvipc_dir()));
     out
+}
+
+/// The directory `/proc/sysvipc`, with the System V objects of each kind.
+fn sysvipc_dir() -> InodeRef {
+    dir(
+        b"/sysvipc",
+        b"/",
+        0o555,
+        || {
+            Ok(rk_vfs::ipc::SYSVIPC_FILES
+                .iter()
+                .map(|&name| {
+                    let path = join(b"/sysvipc", name.as_bytes());
+                    (name.as_bytes().to_vec(), file(&path, move || Ok(rk_vfs::ipc::sysvipc(name))))
+                })
+                .collect())
+        },
+        None,
+    )
 }
 
 /// The seconds and the hundredths of a second since boot.
@@ -251,6 +271,9 @@ fn uts_name(name: &str) -> Option<fn() -> rk_proc::uts::Field> {
 }
 
 fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
+    if let Some(t) = rk_vfs::ipc::sysctl(name) {
+        return format!("{}\n", t.get()).into_bytes();
+    }
     if let Some((v, _)) = protected(name) {
         return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
     }
@@ -278,6 +301,11 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
 }
 
 fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
+    // The limits of the IPC objects, which the system calls read.
+    if let Some(t) = rk_vfs::ipc::sysctl(name) {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        return t.set(text.trim().parse().map_err(|_| Errno::EINVAL)?);
+    }
     // A value out of the range gives `EINVAL`, as `proc_dointvec_minmax` of Linux.
     if let Some((v, max)) = protected(name) {
         let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
@@ -344,7 +372,8 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
         0o555,
         move || {
             let mut out: Vec<(Vec<u8>, InodeRef)> = Vec::new();
-            for &(name, default) in SYSCTLS {
+            let ipc = rk_vfs::ipc::SYSCTL_NAMES.iter().map(|&n| (n, ""));
+            for (name, default) in SYSCTLS.iter().copied().chain(ipc) {
                 let rest = if prefix.is_empty() {
                     name
                 } else {

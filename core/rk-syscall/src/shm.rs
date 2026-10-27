@@ -13,6 +13,8 @@
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -21,6 +23,7 @@ use rk_frame::sync::SpinLock;
 use rk_mm::vma::Backing;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
 use rk_vfs::cred::{IpcOwner, cap};
+use rk_vfs::ipc::SHM_NEXT_ID;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new segment.
@@ -243,8 +246,9 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
     if table.segments.len() as u64 >= SHMMNI {
         return Err(Errno::ENOSPC);
     }
-    let id = table.next;
-    table.next = table.next.wrapping_add(1) & i32::MAX;
+    let next = table.next;
+    let id = rk_vfs::ipc::alloc_id(&SHM_NEXT_ID, next, |id| table.segments.contains_key(&id));
+    table.next = id.wrapping_add(1) & i32::MAX;
     let pages = Arc::new(ShmPages { key, id, size, pages: SpinLock::new(BTreeMap::new()) });
     // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
     let perm = IpcPerm {
@@ -431,4 +435,40 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// The text of `/proc/sysvipc/shm`, as `sysvipc_shm_proc_show` of Linux. The pages of a segment
+/// are never on the swap device.
+pub(crate) fn proc_text() -> Vec<u8> {
+    let mut out = String::from(
+        "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  \
+         cgid      atime      dtime      ctime                   rss                  swap\n",
+    );
+    let mut table = TABLE.lock();
+    table.sweep();
+    for (id, s) in &table.segments {
+        let p = &s.perm;
+        let rss = s.pages.pages.lock().len() as u64 * PAGE_SIZE as u64;
+        out.push_str(&format!(
+            "{:10} {:10}  {:4o} {:21} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:21} \
+             {:21}\n",
+            p.key,
+            id,
+            p.mode,
+            s.pages.size,
+            s.cpid,
+            s.lpid,
+            s.nattch(),
+            p.uid,
+            p.gid,
+            p.cuid,
+            p.cgid,
+            s.atime,
+            s.dtime,
+            s.ctime,
+            rss,
+            0,
+        ));
+    }
+    out.into_bytes()
 }
