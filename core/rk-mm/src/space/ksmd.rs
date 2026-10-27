@@ -66,7 +66,8 @@ fn eligible(vma: &Vma<super::FileRef>, merge_any: bool) -> bool {
 }
 
 impl AddressSpace {
-    fn ksm_any(&self) -> bool {
+    /// Tells if `PR_SET_MEMORY_MERGE` makes each private area of this address space mergeable.
+    pub(super) fn ksm_any(&self) -> bool {
         self.ksm.merge_any.load(Ordering::Relaxed)
     }
 }
@@ -96,8 +97,12 @@ impl Pages for Spaces {
         let any = sp.ksm_any();
         let mut pages = Vec::new();
         for vma in st.vmas.iter().filter(|v| eligible(v, any)) {
-            let found = sp.vm.mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
-            pages.extend(found.into_iter().map(|a| a.get()));
+            // A large area needs a large list. When memory is short, the scan tries again later
+            // and the kernel does not panic.
+            if !sp.vm.try_mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end), &mut pages)
+            {
+                return Areas::Busy;
+            }
         }
         drop(st);
         Areas::Pages(pages)

@@ -27,6 +27,7 @@ mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOM
 mmapstress08	Uses sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 overcommit_memory02	With -R 0 the commit limit is 0 (no swap), and the test then reads the sysctl back with fopen. musl malloc needs a new mmap for the FILE, which the strict policy refuses, so the test gives TBROK instead of the TCONF that it gives with glibc.
 thp02	LTP needs /sys/kernel/mm/hugepages, which only hugetlbfs makes, and rukernel has no hugetlbfs (TCONF). The test passes on rukernel when the directory is there (#365), but the directory makes the tests that mount hugetlbfs, as cpuset02, give TBROK.
+thp03	LTP needs /sys/kernel/mm/hugepages, which only hugetlbfs makes, and rukernel has no hugetlbfs (TCONF), as thp02.
 thp04	LTP needs /sys/kernel/mm/hugepages to find the size of a huge page, and only hugetlbfs makes it (TCONF). The test passes on rukernel when the directory is there (#365).
 vma02	Needs NUMA and mbind (#322) (TCONF).
 vma03	Needs mmap2, which only a 32 bit kernel has (TCONF on x86_64).

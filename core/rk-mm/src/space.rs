@@ -589,7 +589,7 @@ impl AddressSpace {
 
     /// The number of pages in `start..end` that have a frame.
     pub fn resident_pages(&self, start: usize, end: usize) -> usize {
-        self.vm.mapped_pages(VirtAddr::new(start), VirtAddr::new(end)).len()
+        self.vm.pages_in(VirtAddr::new(start), VirtAddr::new(end))
     }
 
     /// Gives one byte for each page of `addr..addr + len`: 1 if the page has a frame, else 0.
@@ -882,8 +882,8 @@ impl AddressSpace {
     }
 
     /// Maps a huge page at the 2 MiB range of `page`, if the policy and the area allow it. The
-    /// area is private anonymous memory, the range is all in the area, and no page of the range
-    /// has a frame. Gives `false` if the page needs a 4 KiB frame.
+    /// area is private anonymous memory that KSM does not merge, the range is all in the area, and
+    /// no page of the range has a frame. Gives `false` if the page needs a 4 KiB frame.
     fn map_huge(&self, vma: &Vma<FileRef>, page: usize) -> bool {
         let allowed = match tunables::thp_enabled() {
             ThpMode::Always => vma.huge != HugeAdvice::NoHuge,
@@ -891,8 +891,11 @@ impl AddressSpace {
             ThpMode::Never => false,
         };
         let block = page & !(HUGE_PAGE_SIZE - 1);
-        // A memory cgroup charges each page, so its pages stay 4 KiB pages.
+        // A memory cgroup charges each page, so its pages stay 4 KiB pages. KSM merges 4 KiB
+        // pages, so a mergeable area also gets 4 KiB pages, and `ksmd` does not split blocks.
         if !allowed
+            || vma.mergeable
+            || self.ksm_any()
             || vma.shared
             || !matches!(vma.backing, Backing::Anon)
             || block < vma.start
@@ -902,7 +905,7 @@ impl AddressSpace {
             return false;
         }
         let range = (VirtAddr::new(block), VirtAddr::new(block + HUGE_PAGE_SIZE));
-        if !self.vm.mapped_pages(range.0, range.1).is_empty() {
+        if self.vm.pages_in(range.0, range.1) != 0 {
             return false;
         }
         let stats = frame_stats();

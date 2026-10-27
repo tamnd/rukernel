@@ -195,31 +195,42 @@ impl VmSpace {
     /// huge page that is in part in the range is split first.
     pub fn unmap_range(&self, start: VirtAddr, end: VirtAddr) {
         let (start, end) = (start.get(), end.get());
-        let mut gone = Vec::new();
-        let mut inner = self.inner.lock();
-        let root = inner.root;
+        // The frames go after the lock, as the frames that `unmap` gives. They go in batches of
+        // the pages of one huge page, so a large range needs no large list when memory is short.
+        let batch = HUGE_FRAMES;
+        let mut gone = Vec::with_capacity(batch);
         let first = start & !(HUGE_PAGE_SIZE - 1);
-        let blocks: Vec<(usize, u64)> =
-            inner.huge.range(first..end).map(|(&b, &t)| (b, t)).collect();
-        for (block, table) in blocks {
+        let mut inner = self.inner.lock();
+        while let Some((&block, &table)) = inner.huge.range(first..end).next() {
             if block >= start && block + HUGE_PAGE_SIZE <= end {
                 inner.huge.remove(&block);
-                paging::user_unmap_huge(root, block, table);
+                paging::user_unmap_huge(inner.root, block, table);
                 HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
                 while let Some((&a, _)) = inner.pages.range(block..block + HUGE_PAGE_SIZE).next() {
                     gone.extend(inner.pages.remove(&a));
                 }
+                drop(inner);
+                gone.clear();
+                inner = self.inner.lock();
             } else {
                 inner.split(block);
             }
         }
-        while let Some((&a, _)) = inner.pages.range(start..end).next() {
-            gone.extend(inner.pages.remove(&a));
-            paging::user_unmap(root, a);
+        loop {
+            let root = inner.root;
+            while gone.len() < batch {
+                let Some((&a, _)) = inner.pages.range(start..end).next() else { break };
+                gone.extend(inner.pages.remove(&a));
+                paging::user_unmap(root, a);
+            }
+            let done = gone.len() < batch;
+            drop(inner);
+            gone.clear();
+            if done {
+                return;
+            }
+            inner = self.inner.lock();
         }
-        drop(inner);
-        // The frames go after the lock, as the frames that `unmap` gives.
-        drop(gone);
     }
 
     /// Removes the page at `addr` and gives its frame.
@@ -261,6 +272,24 @@ impl VmSpace {
     pub fn mapped_pages(&self, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VirtAddr> {
         let inner = self.inner.lock();
         inner.pages.range(start.get()..end.get()).map(|(&a, _)| VirtAddr::new(a)).collect()
+    }
+
+    /// The number of mapped pages in `start..end`. It allocates no memory, so the OOM killer can
+    /// use it.
+    pub fn pages_in(&self, start: VirtAddr, end: VirtAddr) -> usize {
+        self.inner.lock().pages.range(start.get()..end.get()).count()
+    }
+
+    /// Adds the page addresses in `start..end` that are mapped to `out`, in order. Gives `false`
+    /// and adds nothing if the kernel heap has no memory for them.
+    pub fn try_mapped_pages(&self, start: VirtAddr, end: VirtAddr, out: &mut Vec<usize>) -> bool {
+        let inner = self.inner.lock();
+        let pages = inner.pages.range(start.get()..end.get());
+        if out.try_reserve(pages.clone().count()).is_err() {
+            return false;
+        }
+        out.extend(pages.map(|(&a, _)| a));
+        true
     }
 
     /// The number of mapped pages.
