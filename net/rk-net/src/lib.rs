@@ -102,6 +102,9 @@ pub struct Received {
     pub cred: Option<Cred>,
     /// The flags for `msg_flags`: `MSG_TRUNC` and `MSG_EOR`.
     pub flags: u32,
+    /// The control messages of the family, as `put_cmsg` of Linux: the level, the type and the
+    /// data of each message, in order.
+    pub control: Vec<(u32, u32, Vec<u8>)>,
 }
 
 /// The identity of a file in the tree, for a socket that has a path as its name.

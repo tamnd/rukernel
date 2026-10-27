@@ -57,6 +57,8 @@ mkdir -p /dev/shm
 mount -t tmpfs shm /dev/shm
 mount -t tmpfs tmp /tmp
 [ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
+# The tests of IPv6 and the sockets send to ::1 and 127.0.0.1, as on a system where lo is up.
+ip link set lo up 2>/dev/null
 if ! mount -t ext4 -o ro /dev/vdb /ltp; then
     echo "ltp-error: cannot mount the LTP image"
     exit 1
@@ -181,6 +183,8 @@ class Batch:
             ("etc/group", 0o100644,
              b"root:x:0:\nbin:x:1:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\n"),
             ("etc/hosts", 0o100644, b"127.0.0.1 localhost\n::1 localhost\n"),
+            # getaddrinfo_01 looks up the echo service, as in the netbase files of a distribution.
+            ("etc/services", 0o100644, b"echo\t7/tcp\necho\t7/udp\n"),
         ]
         path = os.path.join(self.dir, "initrd.cpio")
         with open(path, "wb") as f:

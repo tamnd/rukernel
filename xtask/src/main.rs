@@ -412,6 +412,7 @@ const BOOT_TESTS: &[&str] = &[
     "net",
     "inet",
     "netcfg",
+    "inet6",
     "busybox",
     "ltp",
     "kselftest",
@@ -1580,7 +1581,7 @@ fn qemu(args: &[String]) -> Result {
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
         "init" | "tty" | "smp" | "blk" | "inet" => kernel.with_file_name("user-init").exists(),
-        "busybox" | "netcfg" => kernel.with_file_name("busybox-ready").exists(),
+        "busybox" | "netcfg" | "inet6" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" | "gvisor" | "fstests" => {
             kernel.with_file_name(format!("initramfs-{test}.cpio")).exists()
@@ -1669,7 +1670,9 @@ fn test_cmdline(test: &str) -> String {
         "inet" => {
             String::from("console=ttyS0 rk.test=init ip=10.0.2.15::10.0.2.2:255.255.255.0 -- inet")
         }
-        "busybox" | "netcfg" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
+        "busybox" | "netcfg" | "inet6" => {
+            String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i")
+        }
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
         "gvisor" => String::from("console=ttyS0 rk.test=init rdinit=/gvisor/run"),
@@ -1689,6 +1692,7 @@ fn pass_line(test: &str) -> String {
             | "blk"
             | "inet"
             | "netcfg"
+            | "inet6"
             | "busybox"
             | "ltp"
             | "kselftest"
@@ -1738,6 +1742,47 @@ const NETCFG_SCRIPT2: &[u8] =
 && grep -q 1400 /sys/class/net/eth0/mtu && cat /sys/class/net/lo/statistics/rx_packets \
 && grep VmData /proc/self/status && exit 0; exit 1\n";
 
+/// The commands of the `inet6` test. The shell brings up lo and the interface of the user network
+/// of QEMU, and checks the address `::1` and the link local address that the kernel makes from
+/// the MAC address. It pings `::1`, waits for the address that the router advertisement of QEMU
+/// gives (SLAAC), and pings the router on the link local address and on the global address.
+const INET6_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
+&& ip link set lo up && ip link set eth0 up && ip -6 addr && ip -6 route \
+&& ip -6 addr show dev lo | grep -q 'inet6 ::1/128 scope host' \
+&& ip -6 addr show dev eth0 | grep -q 'inet6 fe80::5054:ff:fe12:3456/64 scope link' \
+&& busybox ping6 -c 1 ::1 \
+&& { for i in 1 2 3 4 5 6 7 8 9 10; do ip -6 addr | grep -q fec0:: && break; sleep 1; done; } \
+&& { for i in 1 2 3 4 5 6 7 8 9 10; do ip -6 route | grep -q ^default && break; sleep 1; done; } \
+&& ip -6 addr && ip -6 route && ip -6 route show table local \
+&& ip -6 addr show dev eth0 | grep -q 'inet6 fec0::5054:ff:fe12:3456/64 scope site' \
+&& ip -6 route | grep -q '^default via fe80::2 dev eth0' \
+&& busybox ping6 -c 1 fe80::2%eth0 && busybox ping6 -c 1 fec0::2 && ip -6 neigh \
+&& ip -6 route get fec0::2 | grep -q 'dev eth0' \
+&& echo 'inet6: first'' part' || exit 1\n";
+
+/// The second line of the `inet6` test. It adds and deletes an address and a route through
+/// rtnetlink, and reads the IPv6 files of /proc/net.
+const INET6_SCRIPT2: &[u8] = b"ip -6 addr add 2001:db8:1::5/64 dev eth0 \
+&& ip -6 addr show dev eth0 | grep -q 2001:db8:1::5/64 && busybox ping6 -c 1 2001:db8:1::5 \
+&& ip -6 addr del 2001:db8:1::5/64 dev eth0 && ! ip -6 addr | grep -q 2001:db8:1:: \
+&& ip -6 route add 2001:db8:9::/48 via fe80::2 dev eth0 \
+&& ip -6 route | grep -q '^2001:db8:9::/48 via fe80::2 dev eth0' \
+&& ip -6 route del 2001:db8:9::/48 via fe80::2 dev eth0 && ! ip -6 route | grep -q 2001:db8:9:: \
+&& cat /proc/net/if_inet6 /proc/net/ipv6_route /proc/net/snmp6 \
+&& grep -q '^00000000000000000000000000000001 01 80 10 80 *lo$' /proc/net/if_inet6 \
+&& grep -q '^fe80000000000000505400fffe123456 02 40 20 ' /proc/net/if_inet6 \
+&& grep -q '^Icmp6InEchoReplies[[:space:]]*[1-9]' /proc/net/snmp6 \
+&& echo 'inet6: second'' part' || exit 1\n";
+
+/// The third line of the `inet6` test. It runs a TCP server and a UDP server on `::` and finds
+/// them in /proc/net/tcp6 and /proc/net/udp6. A TCP client connects to the server on `::1`.
+const INET6_SCRIPT3: &[u8] = b"{ busybox tcpsvd :: 5557 echo v6ok </dev/null & } && { busybox udpsvd :: 5558 true </dev/null & } \
+&& { for i in 1 2 3 4 5 6 7 8 9 10; do grep -q :15B6 /proc/net/udp6 && break; sleep 1; done; } \
+&& cat /proc/net/tcp6 /proc/net/udp6 /proc/net/raw6 \
+&& grep -q ': 0*:15B5 0*:0000 0A ' /proc/net/tcp6 \
+&& grep -q ': 0*:15B6 0*:0000 07 ' /proc/net/udp6 \
+&& busybox nc -w 3 ::1 5557 </dev/null | grep -q v6ok && exit 0; exit 1\n";
+
 /// The input of a boot test. When the log has the text of an entry, the test writes the bytes of
 /// the entry to the serial port. The `tty` test types a line and then `^C`.
 fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
@@ -1753,6 +1798,11 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("TICK", b"test $? = 130; exit $?\n"),
         ],
         "netcfg" => &[("/ # ", NETCFG_SCRIPT), ("netcfg: first part", NETCFG_SCRIPT2)],
+        "inet6" => &[
+            ("/ # ", INET6_SCRIPT),
+            ("inet6: first part", INET6_SCRIPT2),
+            ("inet6: second part", INET6_SCRIPT3),
+        ],
         _ => &[],
     }
 }
@@ -1840,8 +1890,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         }
         // The `net` test sends an ARP request to the gateway of the user network of QEMU. The
         // `inet` test pings the gateway and asks the DNS server of QEMU. The `netcfg` test sets up
-        // the network with BusyBox.
-        if matches!(*test, "net" | "inet" | "netcfg") {
+        // the network with BusyBox. The `inet6` test uses the IPv6 network of QEMU: the prefix
+        // fec0::/64 and the router fec0::2.
+        if matches!(*test, "net" | "inet" | "netcfg" | "inet6") {
             cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.

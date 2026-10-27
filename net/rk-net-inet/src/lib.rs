@@ -1,10 +1,15 @@
-//! The IPv4 stack: ARP neighbours, IPv4, the routes, ICMP, TCP, and the UDP, ICMP echo and raw
-//! sockets, as net/ipv4 of Linux.
+//! The IPv4 and IPv6 stack: ARP neighbours, IPv4, the routes, ICMP, TCP, and the UDP, ICMP echo
+//! and raw sockets, as net/ipv4 of Linux, and IPv6 with neighbour discovery, the addresses and
+//! the routes of IPv6, and ICMPv6, as net/ipv6 of Linux.
 //!
 //! The pure parts are in their own modules, so that the host tests can run them: the checksum,
 //! the headers, the neighbour table, the route table, the port table and the parser of `ip=`.
 //! The module `stack` has the global tables and the paths of the packets, `socket` has the
-//! datagram sockets, and `tcp` has TCP.
+//! datagram sockets, and `tcp` has TCP. The sockets of both families share the code: they keep
+//! IPv4 addresses as IPv4-mapped IPv6 addresses (`ip`). The module `stack6` has the paths of the
+//! IPv6 packets, neighbour discovery and ICMPv6, `route6` has the addresses and the routes of
+//! IPv6, and `addrconf` gives the devices their addresses and has the rtnetlink messages of
+//! `AF_INET6`.
 //!
 //! The drivers do not use interrupts yet. A bottom half of the kernel calls `poll`, which takes
 //! the received frames of each device and runs the timers of the neighbour table. The bottom half
@@ -17,22 +22,27 @@
 
 extern crate alloc;
 
+mod addrconf;
 pub mod checksum;
 pub mod config;
 pub mod fib;
 mod ioctl;
+pub mod ip;
 pub mod ipv4;
+pub mod ipv6;
 pub mod neigh;
 pub mod ports;
 mod procfs;
 pub mod route;
+pub mod route6;
 mod rtnl;
 pub mod sockaddr;
 mod socket;
 mod stack;
+mod stack6;
 pub mod tcp;
 
-pub use socket::{Dgram, Proto, classify, new_socket};
+pub use socket::{Dgram, Proto, classify, classify6, new_socket, new_socket6};
 pub use stack::{COUNTERS, Counters, poll, receive};
 pub use tcp::Stream;
 
@@ -49,13 +59,16 @@ use rk_vfs::inode::Result;
 pub fn init() {
     rk_net::netlink::init();
     rtnl::init();
+    addrconf::init();
     procfs::init();
     rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af);
     rk_net::ioctl::set_ifconf(fib::ifconf);
     dev::add_notifier(fib::event);
+    dev::add_notifier(addrconf::event);
     if let Some(lo) = dev::by_name("lo") {
         if lo.is_up() {
             fib::event(&lo, Event::Up);
+            addrconf::event(&lo, Event::Up);
         } else {
             lo.set_up(true);
         }

@@ -2,7 +2,8 @@
 //! sequence numbers, and the checksum, as `struct tcphdr` and `tcp_parse_options` of Linux.
 
 use crate::checksum;
-use crate::ipv4::{Addr, PROTO_TCP};
+use crate::ip::Ip;
+use crate::ipv4::PROTO_TCP;
 use alloc::vec::Vec;
 
 /// The length of a header without options.
@@ -91,7 +92,7 @@ impl Seg {
 
     /// The bytes of the segment with the ports `sport` and `dport` and the checksum for the
     /// addresses `src` and `dst`.
-    pub fn encode(&self, sport: u16, dport: u16, src: Addr, dst: Addr) -> Vec<u8> {
+    pub fn encode(&self, sport: u16, dport: u16, src: &Ip, dst: &Ip) -> Vec<u8> {
         let mut opts = Vec::new();
         if let Some(mss) = self.mss {
             opts.extend_from_slice(&[OPT_MSS, 4]);
@@ -112,17 +113,16 @@ impl Seg {
         b.extend_from_slice(&[0, 0, 0, 0]);
         b.extend_from_slice(&opts);
         b.extend_from_slice(&self.data);
-        let len = u16::try_from(b.len()).unwrap_or(u16::MAX);
-        let sum = checksum::fold(checksum::add(checksum::pseudo(src, dst, PROTO_TCP, len), &b));
+        let sum = checksum::upper(src, dst, PROTO_TCP, &b);
         b[16..18].copy_from_slice(&sum.to_be_bytes());
         b
     }
 }
 
-/// Reads the segment `tcp` (the header and the data) from `src` to `dst`, as `tcp_v4_rcv` of
-/// Linux. Gives the source port, the destination port and the segment, or `None` for a short
+/// Reads the segment `tcp` (the header and the data) from `src` to `dst`, as `tcp_v4_rcv` and
+/// `tcp_v6_rcv` of Linux. Gives the source port, the destination port and the segment, or `None` for a short
 /// segment, a bad offset or a bad checksum.
-pub fn parse(tcp: &[u8], src: Addr, dst: Addr) -> Option<(u16, u16, Seg)> {
+pub fn parse(tcp: &[u8], src: &Ip, dst: &Ip) -> Option<(u16, u16, Seg)> {
     let h = tcp.get(..HLEN)?;
     if !checksum_ok(tcp, src, dst) {
         return None;
@@ -147,9 +147,8 @@ pub fn parse(tcp: &[u8], src: Addr, dst: Addr) -> Option<(u16, u16, Seg)> {
 }
 
 /// Tells if the checksum of the segment `tcp` from `src` to `dst` is right.
-pub fn checksum_ok(tcp: &[u8], src: Addr, dst: Addr) -> bool {
-    let Ok(len) = u16::try_from(tcp.len()) else { return false };
-    checksum::fold(checksum::add(checksum::pseudo(src, dst, PROTO_TCP, len), tcp)) == 0
+pub fn checksum_ok(tcp: &[u8], src: &Ip, dst: &Ip) -> bool {
+    u16::try_from(tcp.len()).is_ok() && checksum::upper(src, dst, PROTO_TCP, tcp) == 0
 }
 
 /// Reads the options of a SYN. An option that is not known or not valid is skipped.

@@ -35,3 +35,4 @@ OIF = "OIF"       # RTA_OIF of rtnetlink, the output interface of a route
 Parm = "Parm"     # InParmProbs of /proc/net/snmp, the ICMP parameter problems
 Ofo = "Ofo"       # OfoPruned of /proc/net/netstat, the out of order queue of TCP
 ECT = "ECT"       # InECT0Pkts of /proc/net/netstat, the ECN capable transport
+ND = "ND"         # ND_OPT_* of IPv6 neighbour discovery, RFC 4861

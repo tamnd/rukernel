@@ -235,6 +235,11 @@ impl<'a> Attrs<'a> {
         self.get(ty).map(|d| d.first_chunk::<4>().copied().ok_or(Errno::ERANGE)).transpose()
     }
 
+    /// The attribute `ty` as an IPv6 address.
+    pub fn addr6(&self, ty: u32) -> Result<Option<[u8; 16]>> {
+        self.get(ty).map(|d| d.first_chunk::<16>().copied().ok_or(Errno::ERANGE)).transpose()
+    }
+
     /// The attribute `ty` as a string: the bytes up to the first NUL byte.
     pub fn str(&self, ty: u32) -> Option<&'a [u8]> {
         self.get(ty).map(|d| d.split(|&c| c == 0).next().unwrap_or(d))

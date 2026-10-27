@@ -1,5 +1,7 @@
-//! The TCP sockets and the glue between the state machine of `conn` and IPv4, as
-//! net/ipv4/tcp_ipv4.c, af_inet.c and inet_connection_sock.c of Linux.
+//! The TCP sockets and the glue between the state machine of `conn` and IP, as
+//! net/ipv4/tcp_ipv4.c, net/ipv6/tcp_ipv6.c, af_inet.c and inet_connection_sock.c of Linux.
+//! The addresses are `ip::Ip`, thus one table has the connections of both families, and an
+//! `AF_INET6` socket without `IPV6_V6ONLY` takes IPv4 connections too.
 //!
 //! The table `ESTAB` finds the connection of a segment by its four addresses and ports. It holds
 //! a strong reference, so that a connection that the program closed lives until its end, as an
@@ -13,17 +15,21 @@
 use super::cc::Algo;
 use super::conn::{Config, Conn, DEFAULT_MSS, ProcInfo, State};
 use super::seg::{self, ACK, RST, SYN, Seg};
-use crate::ipv4::{self, Addr, Header, PROTO_TCP};
+use crate::ip::{self, Ip};
+use crate::ipv4::{self, PROTO_TCP};
+use crate::ipv6;
 use crate::ports::{self, Binding, Ports};
 use crate::sockaddr;
-use crate::stack::{self, COUNTERS, Out};
+use crate::stack::{self, COUNTERS};
+use crate::stack6::{self, Out6};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
-use rk_abi::native::inet::{IP_TOS, IP_TTL, IPPROTO_IP, IPPROTO_TCP};
+use rk_abi::native::in6::{IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY};
+use rk_abi::native::inet::{IP_TOS, IP_TTL, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP};
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -38,10 +44,9 @@ use rk_abi::native::tcp::{
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
-    AF_INET, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_WAITALL, SHUT_RD, SHUT_RDWR,
-    SHUT_WR, SOCK_STREAM,
+    AF_INET, AF_INET6, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_WAITALL, SHUT_RD,
+    SHUT_RDWR, SHUT_WR, SOCK_STREAM,
 };
-use rk_net::dev;
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
@@ -49,12 +54,12 @@ use rk_vfs::wait::{WaitQueue, poll_wake};
 
 /// The four addresses and ports of a connection: the local address and port, then the remote
 /// address and port.
-type Key = (Addr, u16, Addr, u16);
+type Key = (Ip, u16, Ip, u16);
 
 /// The connections, by their four addresses and ports.
 static ESTAB: SpinLock<BTreeMap<Key, Arc<Stream>>> = SpinLock::new(BTreeMap::new());
-/// The listening sockets on one port, with their local address.
-type Listeners = Vec<(Addr, Arc<Stream>)>;
+/// The listening sockets on one port, with their local address and `IPV6_V6ONLY`.
+type Listeners = Vec<(Ip, bool, Arc<Stream>)>;
 
 /// The listening sockets, by their port.
 static LISTEN: SpinLock<BTreeMap<u16, Listeners>> = SpinLock::new(BTreeMap::new());
@@ -71,6 +76,8 @@ const MIN_MAXSEG: i32 = 88;
 const CA_NAME_MAX: usize = 16;
 /// The bytes of the IPv4 header and the TCP header without options.
 const HEADERS: u32 = 40;
+/// The bytes of the IPv6 header and the TCP header without options.
+const HEADERS6: u32 = 60;
 
 /// A new initial sequence number, as `secure_tcp_seq` of Linux without the hash: a counter and
 /// a clock of 4 microseconds.
@@ -105,9 +112,19 @@ struct Listener {
 }
 
 struct Inner {
-    local: Addr,
+    /// `AF_INET` or `AF_INET6`.
+    family: u32,
+    local: Ip,
     port: u16,
-    remote: Option<(Addr, u16)>,
+    remote: Option<(Ip, u16)>,
+    /// The interface of a link local address, from the scope ID, or 0.
+    oif: u32,
+    /// `IPV6_V6ONLY`.
+    v6only: bool,
+    /// `IPV6_UNICAST_HOPS`, or `None` for the default.
+    hops: Option<u8>,
+    /// `IPV6_TCLASS`.
+    tclass: u8,
     /// The socket has a binding in `PORTS`.
     bound: bool,
     /// The connection is in `ESTAB`.
@@ -144,11 +161,16 @@ struct Inner {
 }
 
 impl Inner {
-    fn new() -> Self {
+    fn new(family: u32) -> Self {
         Self {
-            local: ipv4::ANY,
+            family,
+            local: if family == AF_INET6 { ip::ANY } else { ip::V4_ANY },
             port: 0,
             remote: None,
+            oif: 0,
+            v6only: false,
+            hops: None,
+            tclass: 0,
             bound: false,
             hashed: false,
             tw_reuse: false,
@@ -188,15 +210,33 @@ impl Inner {
         self.ttl.unwrap_or(ipv4::DEFAULT_TTL)
     }
 
+    /// The wildcard address of the family of the socket.
+    fn any(&self) -> Ip {
+        if self.family == AF_INET6 { ip::ANY } else { ip::V4_ANY }
+    }
+
+    /// The time to live or the hop limit, and the type of service or the traffic class, of a
+    /// packet of the connection: an IPv4 connection uses the options of IPv4.
+    fn ip_options(&self) -> (u8, u8) {
+        match self.remote {
+            Some((a, _)) if ip::v4(&a).is_none() => {
+                (self.hops.unwrap_or(ipv6::DEFAULT_HOPS), self.tclass)
+            }
+            _ => (self.ttl(), self.tos),
+        }
+    }
+
     /// The parameters of a new connection to `dst`.
-    fn config(&self, dst: Addr) -> Config {
+    fn config(&self, dst: &Ip) -> Config {
+        let headers = if ip::v4(dst).is_some() { HEADERS } else { HEADERS6 };
         // The largest segment fits in the MTU of the route, as `tcp_mtu_to_mss` of Linux.
-        let mtu = stack::route(dst)
+        let mtu = stack6::path(dst, self.oif)
             .ok()
-            .and_then(|n| dev::by_index(n.ifindex))
-            .map_or(DEFAULT_MSS + HEADERS, |d| d.mtu());
+            .map(|p| p.mtu)
+            .filter(|&m| m != 0)
+            .unwrap_or(DEFAULT_MSS + headers);
         // A packet has at most 65535 bytes, also on the loopback device with its MTU of 65536.
-        let mut mss = mtu.min(ipv4::MAX_LEN as u32).saturating_sub(HEADERS);
+        let mut mss = mtu.min(ipv4::MAX_LEN as u32).saturating_sub(headers);
         if self.maxseg != 0 {
             mss = mss.min(self.maxseg);
         }
@@ -249,7 +289,7 @@ impl Inner {
     }
 
     fn key(&self) -> Key {
-        let (a, p) = self.remote.unwrap_or((ipv4::ANY, 0));
+        let (a, p) = self.remote.unwrap_or((self.any(), 0));
         (self.local, self.port, a, p)
     }
 }
@@ -259,6 +299,8 @@ impl Inner {
 struct Tx {
     segs: Vec<Seg>,
     key: Key,
+    /// The interface of a link local peer, or 0.
+    oif: u32,
     ttl: u8,
     tos: u8,
     /// Remove the connection from `ESTAB`.
@@ -289,61 +331,62 @@ fn add(c: &AtomicU64, n: u64) {
     c.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Sends the segment `seg` of the connection `key`.
-fn transmit(key: &Key, ttl: u8, tos: u8, seg: &Seg) {
+/// Sends the segment `seg` of the connection `key` on the interface `oif` or on the route.
+fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, seg: &Seg) {
     add(&COUNTERS.tcp_out_segs, 1);
     if seg.has(RST) {
         add(&COUNTERS.tcp_out_rsts, 1);
     }
     let &(src, sport, dst, dport) = key;
-    let Ok(next) = stack::route(dst) else { return };
-    let bytes = seg.encode(sport, dport, src, dst);
-    let out = Out { src, dst, protocol: PROTO_TCP, ttl, tos };
+    let bytes = seg.encode(sport, dport, &src, &dst);
+    let out = Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos };
     // A lost segment is like a segment that the network lost: the timers send it again.
-    let _ = stack::output(&next, &out, &bytes);
+    let _ = stack6::output_ip(&out, oif, &bytes);
 }
 
 /// The listening socket for a segment to `dst` and `port`. A socket with the address `dst`
-/// wins over a socket with `0.0.0.0`.
-fn listener(port: u16, dst: Addr) -> Option<Arc<Stream>> {
+/// wins over a wildcard socket, and an IPv4 wildcard wins over `::`, as `compute_score`.
+fn listener(port: u16, dst: &Ip) -> Option<Arc<Stream>> {
     let table = LISTEN.lock();
     let list = table.get(&port)?;
     list.iter()
-        .find(|(a, _)| *a == dst)
-        .or_else(|| list.iter().find(|(a, _)| *a == ipv4::ANY))
-        .map(|(_, s)| s.clone())
+        .find(|(a, _, _)| a == dst)
+        .or_else(|| list.iter().find(|(a, _, _)| *a == ip::V4_ANY && ip::v4(dst).is_some()))
+        .or_else(|| list.iter().find(|(a, v6only, _)| ip::takes(a, *v6only, dst)))
+        .map(|(_, _, s)| s.clone())
 }
 
-/// Takes a TCP segment, as `tcp_v4_rcv` of Linux. `tcp` has the header and the data.
-pub(crate) fn input(h: &Header, tcp: &[u8], broadcast: bool) {
+/// Takes a TCP segment, as `tcp_v4_rcv` and `tcp_v6_rcv` of Linux. `tcp` has the header and
+/// the data. An IPv4 packet has IPv4-mapped addresses.
+pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool) {
     if broadcast {
         return;
     }
-    let Some((sport, dport, seg)) = seg::parse(tcp, h.src, h.dst) else {
+    let Some((sport, dport, seg)) = seg::parse(tcp, &src, &dst) else {
         // A segment shorter than its header goes without a count, as `tcp_v4_rcv` of Linux.
         if tcp.len() >= seg::HLEN {
             add(&COUNTERS.tcp_in_errs, 1);
-            if !seg::checksum_ok(tcp, h.src, h.dst) {
+            if !seg::checksum_ok(tcp, &src, &dst) {
                 add(&COUNTERS.tcp_in_csum_errors, 1);
             }
         }
         return;
     };
     add(&COUNTERS.tcp_in_segs, 1);
-    let key = (h.dst, dport, h.src, sport);
+    let key = (dst, dport, src, sport);
     let found = ESTAB.lock().get(&key).cloned();
     if let Some(sock) = found {
         sock.segment(seg);
         return;
     }
-    if let Some(l) = listener(dport, h.dst)
+    if let Some(l) = listener(dport, &dst)
         && l.syn(&key, &seg)
     {
         return;
     }
     // No socket: an RST, as `tcp_v4_send_reset`.
     if let Some(rst) = super::conn::reset_for(&seg) {
-        transmit(&key, ipv4::DEFAULT_TTL, 0, &rst);
+        transmit(&key, 0, ipv4::DEFAULT_TTL, 0, &rst);
     }
 }
 
@@ -392,10 +435,12 @@ pub(crate) const LISTEN_STATE: u8 = 10;
 
 /// A socket of /proc/net/tcp.
 pub(crate) struct ProcLine {
+    /// The family of the socket.
+    pub family: u32,
     /// The local address and port.
-    pub local: (Addr, u16),
-    /// The remote address and port, or `0.0.0.0:0`.
-    pub remote: (Addr, u16),
+    pub local: (Ip, u16),
+    /// The remote address and port, or the wildcard and 0.
+    pub remote: (Ip, u16),
     /// The state number of Linux.
     pub state: u8,
     /// The owner.
@@ -413,7 +458,7 @@ pub(crate) struct ProcLine {
 pub(crate) fn proc_lines() -> Vec<ProcLine> {
     let now = stack::now_ms();
     let listening: Vec<Arc<Stream>> =
-        LISTEN.lock().values().flatten().map(|(_, s)| s.clone()).collect();
+        LISTEN.lock().values().flatten().map(|(_, _, s)| s.clone()).collect();
     let conns: Vec<Arc<Stream>> = ESTAB.lock().values().cloned().collect();
     let mut out = Vec::new();
     for sock in listening.iter().chain(&conns) {
@@ -426,8 +471,9 @@ pub(crate) fn proc_lines() -> Vec<ProcLine> {
             _ => continue,
         };
         out.push(ProcLine {
+            family: s.family,
             local: (s.local, s.port),
-            remote: s.remote.unwrap_or((ipv4::ANY, 0)),
+            remote: s.remote.unwrap_or((s.any(), 0)),
             state,
             uid: s.uid,
             ino: sock.ino,
@@ -449,6 +495,8 @@ pub(crate) fn curr_estab() -> u64 {
 
 /// A TCP socket.
 pub struct Stream {
+    /// `AF_INET` or `AF_INET6`.
+    family: u32,
     ino: u64,
     me: Weak<Stream>,
     state: SpinLock<Inner>,
@@ -459,11 +507,17 @@ pub struct Stream {
 impl Stream {
     /// Makes a socket.
     pub fn new() -> Arc<Self> {
-        Self::with(Inner::new())
+        Self::with(Inner::new(AF_INET))
+    }
+
+    /// Makes an `AF_INET6` socket.
+    pub fn new6() -> Arc<Self> {
+        Self::with(Inner::new(AF_INET6))
     }
 
     fn with(inner: Inner) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
+            family: inner.family,
             ino: rk_net::next_ino(),
             me: me.clone(),
             state: SpinLock::new(inner),
@@ -498,7 +552,8 @@ impl Stream {
         if reuse {
             s.tw_reuse = true;
         }
-        Tx { segs, key: s.key(), ttl: s.ttl(), tos: s.tos, unhash, unbind, reuse }
+        let (ttl, tos) = s.ip_options();
+        Tx { segs, key: s.key(), oif: s.oif, ttl, tos, unhash, unbind, reuse }
     }
 
     /// Does the work of `collect` without the lock, and wakes the waiters.
@@ -508,7 +563,7 @@ impl Stream {
             PORTS.lock().set_reuse(port, self.ino, true);
         }
         for seg in &tx.segs {
-            transmit(&tx.key, tx.ttl, tx.tos, seg);
+            transmit(&tx.key, tx.oif, tx.ttl, tx.tos, seg);
         }
         if tx.unhash {
             let removed = {
@@ -599,7 +654,7 @@ impl Stream {
         }
         let now = stack::now_ms();
         let &(local, port, remote, rport) = key;
-        let (child, reuse) = {
+        let (child, reuse, v6only) = {
             let s = self.state.lock();
             let Some(l) = &s.listen else { return false };
             // A full queue drops the SYN, and the peer sends it again, as
@@ -607,7 +662,11 @@ impl Stream {
             if s.orphan || l.queue.len() > l.backlog {
                 return true;
             }
-            let mut c = Inner::new();
+            let mut c = Inner::new(s.family);
+            c.v6only = s.v6only;
+            c.hops = s.hops;
+            c.tclass = s.tclass;
+            c.oif = s.oif;
             c.local = local;
             c.port = port;
             c.remote = Some((remote, rport));
@@ -631,9 +690,9 @@ impl Stream {
             c.syn_retries = s.syn_retries;
             c.algo = s.algo;
             c.uid = s.uid;
-            c.conn = Some(Conn::accept(&c.config(remote), seg, now));
+            c.conn = Some(Conn::accept(&c.config(&remote), seg, now));
             c.tune(now);
-            (Stream::with(c), s.reuse())
+            (Stream::with(c), s.reuse(), s.v6only)
         };
         {
             let mut table = ESTAB.lock();
@@ -642,7 +701,7 @@ impl Stream {
             }
             table.insert(*key, child.clone());
         }
-        PORTS.lock().add(port, Binding { addr: local, reuse, id: child.ino });
+        PORTS.lock().add(port, Binding { addr: local, reuse, id: child.ino, v6only });
         let tx = child.collect(&mut child.state.lock());
         child.flush(tx);
         true
@@ -651,7 +710,7 @@ impl Stream {
     /// Gives the socket a port if it has none, as `inet_autobind` of Linux.
     fn autobind(&self, s: &mut Inner) -> Result<()> {
         if s.port == 0 {
-            let b = Binding { addr: s.local, reuse: s.reuse(), id: self.ino };
+            let b = Binding { addr: s.local, reuse: s.reuse(), id: self.ino, v6only: s.v6only };
             s.port = PORTS.lock().bind(0, b)?;
             s.bound = true;
         }
@@ -665,7 +724,7 @@ impl Stream {
         {
             let mut table = LISTEN.lock();
             if let Some(list) = table.get_mut(&s.port) {
-                list.retain(|(_, sock)| sock.ino != self.ino);
+                list.retain(|(_, _, sock)| sock.ino != self.ino);
                 if list.is_empty() {
                     table.remove(&s.port);
                 }
@@ -801,7 +860,7 @@ fn received(data: Vec<u8>) -> Received {
 
 impl Socket for Stream {
     fn family(&self) -> u32 {
-        AF_INET
+        self.family
     }
 
     fn kind(&self) -> u32 {
@@ -817,28 +876,72 @@ impl Socket for Stream {
     }
 
     fn bind(&self, _paths: &dyn PathOps, addr: &[u8]) -> Result<()> {
-        let (addr, port) = sockaddr::parse_bind(addr)?;
-        if addr != ipv4::ANY && !stack::ROUTES.lock().is_local(addr) {
-            return Err(Errno::EADDRNOTAVAIL);
-        }
+        let (addr, port, scope) = sockaddr::parse_bind_in(self.family, addr)?;
         let mut s = self.state.lock();
+        let mut v6only = s.v6only;
+        let mut oif = s.oif;
+        match ip::v4(&addr) {
+            Some(_) if self.family == AF_INET6 && s.v6only => return Err(Errno::EINVAL),
+            Some(a4) => {
+                if a4 != ipv4::ANY && !stack::ROUTES.lock().is_local(a4) {
+                    return Err(Errno::EADDRNOTAVAIL);
+                }
+            }
+            None if addr == ip::ANY => {}
+            None => {
+                if ipv6::needs_scope(&addr) {
+                    if scope != 0 {
+                        oif = scope;
+                    }
+                    if oif == 0 {
+                        return Err(Errno::EINVAL);
+                    }
+                }
+                let ok = stack6::ROUTES6
+                    .lock()
+                    .addrs()
+                    .iter()
+                    .any(|a| a.addr == addr && (!ipv6::needs_scope(&addr) || a.ifindex == oif));
+                if !ok {
+                    return Err(Errno::EADDRNOTAVAIL);
+                }
+                // A socket on an IPv6 address takes no IPv4 connections, as `__inet6_bind`.
+                v6only = true;
+            }
+        }
         if s.port != 0 || s.state() != State::Closed {
             return Err(Errno::EINVAL);
         }
-        let b = Binding { addr, reuse: s.reuse(), id: self.ino };
+        let b = Binding { addr, reuse: s.reuse(), id: self.ino, v6only };
         s.port = PORTS.lock().bind(port, b)?;
         s.bound = true;
         s.local = addr;
+        s.v6only = v6only;
+        s.oif = oif;
         Ok(())
     }
 
     fn connect(&self, _paths: &dyn PathOps, addr: &[u8], nonblock: bool) -> Result<()> {
-        let Some((dst, dport)) = sockaddr::parse_connect(addr)? else {
+        // An IPv6 socket connects only to `AF_INET6` addresses, as `tcp_v6_connect`.
+        if self.family == AF_INET6
+            && addr.first_chunk::<2>().is_some_and(|f| u32::from(u16::from_ne_bytes(*f)) == AF_INET)
+        {
+            return Err(if addr.len() < sockaddr::RFC2133 {
+                Errno::EINVAL
+            } else {
+                Errno::EAFNOSUPPORT
+            });
+        }
+        let Some((dst, dport, scope)) = sockaddr::parse_connect_in(self.family, addr)? else {
             self.disconnect();
             return Ok(());
         };
-        // A destination of 0.0.0.0 is the local host, as Linux.
-        let dst = if dst == ipv4::ANY { ipv4::LOOPBACK } else { dst };
+        // A destination of 0.0.0.0 or `::` is the local host, as Linux.
+        let dst = match ip::v4(&dst) {
+            Some(ipv4::ANY) => ip::mapped(ipv4::LOOPBACK),
+            None if dst == ip::ANY => ip::LOOPBACK,
+            _ => dst,
+        };
         let now = stack::now_ms();
         let tx = {
             let mut s = self.state.lock();
@@ -853,8 +956,20 @@ impl Socket for Stream {
             if s.listen.is_some() || s.state() != State::Closed {
                 return Err(Errno::EISCONN);
             }
-            let next = stack::route(dst)?;
-            if s.local == ipv4::ANY {
+            let mapped = ip::v4(&dst).is_some();
+            // An IPv6 socket reaches an IPv4 peer only as a dual stack socket.
+            let local6 = ip::v4(&s.local).is_none() && s.local != ip::ANY;
+            if mapped && (s.v6only || local6) {
+                return Err(Errno::ENETUNREACH);
+            }
+            if !mapped && ip::v4(&s.local).is_some() {
+                return Err(Errno::ENETUNREACH);
+            }
+            if ipv6::needs_scope(&dst) && scope != 0 {
+                s.oif = scope;
+            }
+            let next = stack6::path(&dst, s.oif)?;
+            if ip::is_any(&s.local) {
                 s.local = next.src;
                 if s.bound {
                     PORTS.lock().set_addr(s.port, self.ino, next.src);
@@ -874,7 +989,7 @@ impl Socket for Stream {
             s.remote = Some((dst, dport));
             s.shut_rd = false;
             s.shut_wr = false;
-            s.conn = Some(Conn::new(&s.config(dst)));
+            s.conn = Some(Conn::new(&s.config(&dst)));
             s.tune(now);
             if let Some(c) = s.conn.as_mut() {
                 c.connect(now);
@@ -905,7 +1020,7 @@ impl Socket for Stream {
         if s.port == 0 {
             self.autobind(&mut s)?;
         } else {
-            let b = Binding { addr: s.local, reuse: s.reuse(), id: self.ino };
+            let b = Binding { addr: s.local, reuse: s.reuse(), id: self.ino, v6only: s.v6only };
             if !PORTS.lock().is_free(s.port, &b) {
                 return Err(Errno::EADDRINUSE);
             }
@@ -915,7 +1030,7 @@ impl Socket for Stream {
         s.conn = None;
         s.listen = Some(Listener { backlog, queue: VecDeque::new() });
         let Some(me) = self.me.upgrade() else { return Err(Errno::EBADF) };
-        LISTEN.lock().entry(s.port).or_default().push((s.local, me));
+        LISTEN.lock().entry(s.port).or_default().push((s.local, s.v6only, me));
         Ok(())
     }
 
@@ -1080,7 +1195,8 @@ impl Socket for Stream {
 
     fn name(&self) -> Vec<u8> {
         let s = self.state.lock();
-        sockaddr::make(s.local, s.port)
+        let scope = stack6::scope_of(&s.local, s.oif);
+        sockaddr::make_in(self.family, &s.local, s.port, scope)
     }
 
     fn peer_name(&self) -> Result<Vec<u8>> {
@@ -1089,7 +1205,7 @@ impl Socket for Stream {
             return Err(Errno::ENOTCONN);
         }
         let (a, p) = s.remote.ok_or(Errno::ENOTCONN)?;
-        Ok(sockaddr::make(a, p))
+        Ok(sockaddr::make_in(self.family, &a, p, stack6::scope_of(&a, s.oif)))
     }
 
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
@@ -1097,7 +1213,7 @@ impl Socket for Stream {
         match level {
             SOL_SOCKET => Ok(match name {
                 SO_TYPE => int(SOCK_STREAM as i32),
-                SO_DOMAIN => int(AF_INET as i32),
+                SO_DOMAIN => int(self.family as i32),
                 SO_PROTOCOL => int(IPPROTO_TCP as i32),
                 SO_ERROR => {
                     let e = s.conn.as_mut().and_then(Conn::take_error);
@@ -1111,6 +1227,12 @@ impl Socket for Stream {
             IPPROTO_IP => Ok(match name {
                 IP_TTL => int(i32::from(s.ttl())),
                 IP_TOS => int(i32::from(s.tos)),
+                _ => return Err(Errno::ENOPROTOOPT),
+            }),
+            IPPROTO_IPV6 if self.family == AF_INET6 => Ok(match name {
+                IPV6_V6ONLY => int(i32::from(s.v6only)),
+                IPV6_UNICAST_HOPS => int(i32::from(s.hops.unwrap_or(ipv6::DEFAULT_HOPS))),
+                IPV6_TCLASS => int(i32::from(s.tclass)),
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
             IPPROTO_TCP => Ok(match name {
@@ -1182,6 +1304,29 @@ impl Socket for Stream {
                             };
                         }
                         IP_TOS => s.tos = v as u8,
+                        _ => return Err(Errno::ENOPROTOOPT),
+                    }
+                }
+                IPPROTO_IPV6 if self.family == AF_INET6 => {
+                    let v = int_of(value)?;
+                    match name {
+                        // A bound socket keeps its family, as `do_ipv6_setsockopt`.
+                        IPV6_V6ONLY if s.port != 0 => return Err(Errno::EINVAL),
+                        IPV6_V6ONLY => s.v6only = v != 0,
+                        IPV6_UNICAST_HOPS => {
+                            s.hops = match v {
+                                -1 => None,
+                                0..=255 => Some(v as u8),
+                                _ => return Err(Errno::EINVAL),
+                            };
+                        }
+                        IPV6_TCLASS => {
+                            s.tclass = match v {
+                                -1 => 0,
+                                0..=255 => v as u8,
+                                _ => return Err(Errno::EINVAL),
+                            };
+                        }
                         _ => return Err(Errno::ENOPROTOOPT),
                     }
                 }

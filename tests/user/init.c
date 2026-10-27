@@ -1895,7 +1895,8 @@ static void test_unix(void)
 	close(srv);
 	unlink(addr.sun_path);
 	errno = 0;
-	cli = socket(AF_INET6, SOCK_STREAM, 0);
+	/* Linux removed DECnet in 6.1, so the family is unknown. */
+	cli = socket(AF_DECnet, SOCK_STREAM, 0);
 	check("an unknown family gives EAFNOSUPPORT", cli == -1 && errno == EAFNOSUPPORT);
 }
 
