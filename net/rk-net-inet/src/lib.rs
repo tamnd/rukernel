@@ -1,16 +1,16 @@
-//! The IPv4 stack: ARP neighbours, IPv4, the routes, ICMP, and the UDP, ICMP echo and raw
+//! The IPv4 stack: ARP neighbours, IPv4, the routes, ICMP, TCP, and the UDP, ICMP echo and raw
 //! sockets, as net/ipv4 of Linux.
 //!
 //! The pure parts are in their own modules, so that the host tests can run them: the checksum,
 //! the headers, the neighbour table, the route table, the port table and the parser of `ip=`.
-//! The module `stack` has the global tables and the paths of the packets, and `socket` has the
-//! sockets.
+//! The module `stack` has the global tables and the paths of the packets, `socket` has the
+//! datagram sockets, and `tcp` has TCP.
 //!
 //! The drivers do not use interrupts yet. A bottom half of the kernel calls `poll`, which takes
 //! the received frames of each device and runs the timers of the neighbour table. The bottom half
 //! runs in the idle loop and after each interrupt in user mode, thus at least at each tick of the
-//! timer when a process runs. A send also calls `poll`, so that a packet on the loopback device
-//! arrives before the send returns, as on Linux.
+//! timer when a process runs. The poll also runs the timers of TCP. A send also calls `poll`, so
+//! that a packet on the loopback device arrives before the send returns, as on Linux.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -26,9 +26,11 @@ pub mod route;
 pub mod sockaddr;
 mod socket;
 mod stack;
+pub mod tcp;
 
-pub use socket::{Dgram, Proto, classify};
+pub use socket::{Dgram, Proto, classify, new_socket};
 pub use stack::{COUNTERS, Counters, add_addr, add_route, poll, receive};
+pub use tcp::Stream;
 
 use alloc::string::String;
 use rk_abi::Errno;

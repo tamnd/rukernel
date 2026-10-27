@@ -10,7 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::at::AT_FDCWD;
-use rk_abi::native::inet::IPPROTO_UDP;
+use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::SOL_SOCKET;
@@ -161,7 +161,7 @@ fn new_socket(
                 }
                 _ => {}
             }
-            Ok(rk_net_inet::Dgram::new(proto))
+            Ok(rk_net_inet::new_socket(proto))
         }
         _ => Err(Errno::EAFNOSUPPORT),
     }
@@ -239,10 +239,10 @@ fn write_addr(cx: &Cx<'_>, addr: u64, lenp: u64, value: &[u8]) -> Result<(), Err
 pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let (_, sock) = socket(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
-    // A UDP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and its
-    // sysctl `net.ipv4.ip_unprivileged_port_start`.
+    // A UDP or TCP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and
+    // its sysctl `net.ipv4.ip_unprivileged_port_start`.
     if sock.family() == AF_INET
-        && sock.protocol() == IPPROTO_UDP
+        && matches!(sock.protocol(), IPPROTO_UDP | IPPROTO_TCP)
         && rk_net_inet::sockaddr::port_of(&addr).is_some_and(|p| p != 0 && p < 1024)
         && !cx.process().cred().capable(cap::NET_BIND_SERVICE)
     {

@@ -1,6 +1,6 @@
 [package]
 name = "rk-net-inet"
-description = "The IPv4 stack of rukernel: IPv4, ARP neighbours, routes, ICMP and UDP sockets."
+description = "The IPv4 stack of rukernel: IPv4, ARP neighbours, routes, ICMP, UDP and TCP sockets."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

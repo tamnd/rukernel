@@ -1559,6 +1559,74 @@ fn can_run(kernel: &Path, test: &str) -> bool {
     }
 }
 
+/// The size of the data that the `inet` test sends in each direction over TCP.
+const TCP_BYTES: usize = 1 << 20;
+
+/// The byte `i` of the data of the TCP test. Pattern 0 goes from the guest to the host, and
+/// pattern 1 goes back. `tcp_pattern` of tests/user/init.c gives the same bytes.
+fn tcp_pattern(i: usize, b: u8) -> u8 {
+    if b == 1 { (i * 13 + (i >> 8) + 5) as u8 } else { (i * 7 + (i >> 10)) as u8 }
+}
+
+/// The 64-bit FNV-1a hash, as `fnv` of tests/user/init.c.
+fn fnv(mut h: u64, data: &[u8]) -> u64 {
+    for &b in data {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// The TCP server on the host for the `inet` test. It accepts one connection from the guest,
+/// reads to the end of the stream and checks the data. Then it sends the hash of the data in 8
+/// bytes (little endian) and 1 MiB of pattern 1.
+struct TcpServer {
+    /// The port of the server on 127.0.0.1. The guest connects to 10.0.2.2 and this port.
+    port: u16,
+    /// The result of the thread of the server.
+    done: std::sync::mpsc::Receiver<Result>,
+}
+
+impl TcpServer {
+    /// Starts the server on a free port.
+    fn start() -> Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::serve(&listener));
+        });
+        Ok(Self { port, done })
+    }
+
+    /// Serves one connection.
+    fn serve(listener: &std::net::TcpListener) -> Result {
+        let (mut conn, _) = listener.accept().map_err(|e| format!("accept: {e}"))?;
+        conn.set_read_timeout(Some(BOOT_TEST_TIMEOUT)).map_err(|e| e.to_string())?;
+        let mut data = Vec::new();
+        conn.read_to_end(&mut data).map_err(|e| format!("read: {e}"))?;
+        if data.len() != TCP_BYTES {
+            return Err(format!("got {} bytes, not {TCP_BYTES}", data.len()));
+        }
+        if let Some(i) = data.iter().enumerate().position(|(i, &b)| b != tcp_pattern(i, 0)) {
+            return Err(format!("byte {i} is not correct"));
+        }
+        let sum = fnv(0xcbf2_9ce4_8422_2325, &data);
+        let reply: Vec<u8> = (0..TCP_BYTES).map(|i| tcp_pattern(i, 1)).collect();
+        conn.write_all(&sum.to_le_bytes()).map_err(|e| format!("write: {e}"))?;
+        conn.write_all(&reply).map_err(|e| format!("write: {e}"))?;
+        Ok(())
+    }
+
+    /// The result of the server. The guest is done, so the server is done or it did not get a
+    /// connection.
+    fn result(self) -> Result {
+        match self.done.recv_timeout(Duration::from_secs(5)) {
+            Ok(r) => r,
+            Err(_) => Err(String::from("no connection from the guest")),
+        }
+    }
+}
+
 /// The command line of a boot test. The `tty` test runs init with the argument `tty`, which is
 /// after `--`, as Linux gives the arguments of init.
 fn test_cmdline(test: &str) -> String {
@@ -1637,6 +1705,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
     let kernel = build_kernel()?;
     let named = |t: &&&str| names.is_empty() || names.iter().any(|n| n == **t);
     for test in BOOT_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
+        // The `inet` test connects to a TCP server on the host. The guest gets the port on the
+        // command line of init.
+        let server = if *test == "inet" { Some(TcpServer::start()?) } else { None };
         let (mut cmd, timeout) = if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
             let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
@@ -1677,6 +1748,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), ROOTFS_TIMEOUT)
+        } else if let Some(server) = &server {
+            let cmdline = format!("{} {}", test_cmdline(test), server.port);
+            (qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)
         } else {
             (qemu_command(&kernel, &test_cmdline(test)), BOOT_TEST_TIMEOUT)
         };
@@ -1714,6 +1788,13 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         let mut passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
         if *test == "blk" && passed && !blk_disk_has_note(&kernel.with_file_name("blk.img"))? {
             println!("boot test blk: the disk image does not have the data that the guest wrote");
+            passed = false;
+        }
+        if passed
+            && let Some(server) = server
+            && let Err(e) = server.result()
+        {
+            println!("boot test {test}: the TCP server on the host: {e}");
             passed = false;
         }
         if passed {

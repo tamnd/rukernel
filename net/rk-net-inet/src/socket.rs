@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::inet::{
     IP_HDRINCL, IP_MTU_DISCOVER, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
-    IPPROTO_ICMP, IPPROTO_IP, IPPROTO_RAW, IPPROTO_UDP,
+    IPPROTO_ICMP, IPPROTO_IP, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_UDP,
 };
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -30,7 +30,7 @@ use rk_abi::native::socket::{
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
     AF_INET, ICMP_ECHO, ICMP_FILTER, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC,
-    SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOL_RAW,
+    SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_RAW,
 };
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::inode::Result;
@@ -45,6 +45,8 @@ pub enum Proto {
     Ping,
     /// A raw socket of an IP protocol.
     Raw(u8),
+    /// A TCP socket, `SOCK_STREAM`. `new_socket` makes a `Stream` for it.
+    Tcp,
 }
 
 /// The first protocol number that Linux does not have, `IPPROTO_MAX`.
@@ -57,8 +59,7 @@ const IPPROTO_MAX: u32 = 263;
 /// # Errors
 ///
 /// Gives `EINVAL` for a protocol out of the range, `EPROTONOSUPPORT` for a protocol that the
-/// type does not have, and `ESOCKTNOSUPPORT` for a type that IPv4 does not have. A stream socket
-/// gives `EPROTONOSUPPORT`, because there is no TCP yet.
+/// type does not have, and `ESOCKTNOSUPPORT` for a type that IPv4 does not have.
 pub fn classify(kind: u32, protocol: u32) -> Result<Proto> {
     if protocol >= IPPROTO_MAX {
         return Err(Errno::EINVAL);
@@ -73,8 +74,19 @@ pub fn classify(kind: u32, protocol: u32) -> Result<Proto> {
             Ok(p) if p != 0 => Ok(Proto::Raw(p)),
             _ => Err(Errno::EPROTONOSUPPORT),
         },
-        rk_net::consts::SOCK_STREAM => Err(Errno::EPROTONOSUPPORT),
+        SOCK_STREAM => match protocol {
+            0 | IPPROTO_TCP => Ok(Proto::Tcp),
+            _ => Err(Errno::EPROTONOSUPPORT),
+        },
         _ => Err(Errno::ESOCKTNOSUPPORT),
+    }
+}
+
+/// Makes a socket of the kind `proto`: a `Stream` for TCP and a `Dgram` for the others.
+pub fn new_socket(proto: Proto) -> Arc<dyn Socket> {
+    match proto {
+        Proto::Tcp => crate::tcp::Stream::new(),
+        _ => Dgram::new(proto),
     }
 }
 
@@ -138,7 +150,7 @@ fn int_of(value: &[u8]) -> Result<i32> {
 }
 
 impl Dgram {
-    /// Makes a socket of the kind `proto`.
+    /// Makes a socket of the kind `proto`. A `Dgram` of the kind `Proto::Tcp` takes no data.
     pub fn new(proto: Proto) -> Arc<Self> {
         let sock = Arc::new(Self {
             proto,
@@ -180,7 +192,7 @@ impl Dgram {
         match self.proto {
             Proto::Udp => Some(&UDP_PORTS),
             Proto::Ping => Some(&PING_PORTS),
-            Proto::Raw(_) => None,
+            Proto::Raw(_) | Proto::Tcp => None,
         }
     }
 
@@ -336,6 +348,7 @@ impl Dgram {
                 let src = if s.local == ipv4::ANY { next.src } else { s.local };
                 stack::output(&next, &self.out(s, src, dst, protocol), data)
             }
+            Proto::Tcp => Err(Errno::EOPNOTSUPP),
         }
     }
 
@@ -383,6 +396,7 @@ impl Socket for Dgram {
         match self.proto {
             Proto::Udp | Proto::Ping => SOCK_DGRAM,
             Proto::Raw(_) => SOCK_RAW,
+            Proto::Tcp => SOCK_STREAM,
         }
     }
 
@@ -391,6 +405,7 @@ impl Socket for Dgram {
             Proto::Udp => IPPROTO_UDP,
             Proto::Ping => IPPROTO_ICMP,
             Proto::Raw(p) => u32::from(p),
+            Proto::Tcp => IPPROTO_TCP,
         }
     }
 
