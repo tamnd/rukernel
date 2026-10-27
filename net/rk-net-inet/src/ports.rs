@@ -2,9 +2,12 @@
 //! net/ipv4/udp.c of Linux.
 //!
 //! Two sockets can have the same port if their addresses do not overlap, or if both set
-//! `SO_REUSEADDR`. The address `0.0.0.0` overlaps each address.
+//! `SO_REUSEADDR`. The address `0.0.0.0` overlaps each IPv4 address, and `::` overlaps each
+//! address unless the socket has `IPV6_V6ONLY`. The table has one key for both families: an
+//! IPv4 address is an IPv4-mapped address.
 
-use crate::ipv4::{self, Addr};
+use crate::ip::{self, Ip};
+use crate::ipv4::Addr;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
@@ -16,12 +19,21 @@ pub const EPHEMERAL: RangeInclusive<u16> = 32768..=60999;
 /// A socket on a port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Binding {
-    /// The local address, or `0.0.0.0` for each address.
-    pub addr: Addr,
+    /// The local address, `::` or `0.0.0.0` for each address.
+    pub addr: Ip,
     /// Tells if the socket set `SO_REUSEADDR`.
     pub reuse: bool,
     /// The ID of the socket.
     pub id: u64,
+    /// The socket takes only IPv6 packets, `IPV6_V6ONLY`.
+    pub v6only: bool,
+}
+
+impl Binding {
+    /// The binding of an IPv4 socket to `addr`.
+    pub fn v4(addr: Addr, reuse: bool, id: u64) -> Self {
+        Self { addr: ip::mapped(addr), reuse, id, v6only: false }
+    }
 }
 
 /// The bound ports.
@@ -42,10 +54,9 @@ impl Ports {
     /// Tells if `b` can bind the port `port`.
     fn free(&self, port: u16, b: &Binding) -> bool {
         self.ports.get(&port).is_none_or(|list| {
-            list.iter().filter(|o| o.id != b.id).all(|o| {
-                let overlap = o.addr == b.addr || o.addr == ipv4::ANY || b.addr == ipv4::ANY;
-                !overlap || (o.reuse && b.reuse)
-            })
+            list.iter()
+                .filter(|o| o.id != b.id)
+                .all(|o| !ip::overlap(&o.addr, o.v6only, &b.addr, b.v6only) || (o.reuse && b.reuse))
         })
     }
 
@@ -103,8 +114,8 @@ impl Ports {
     }
 
     /// Changes the address of the socket `id` on `port`, for `connect` on a socket that has the
-    /// address `0.0.0.0`.
-    pub fn set_addr(&mut self, port: u16, id: u64, addr: Addr) {
+    /// address `0.0.0.0` or `::`.
+    pub fn set_addr(&mut self, port: u16, id: u64, addr: Ip) {
         if let Some(b) = self.ports.get_mut(&port).and_then(|l| l.iter_mut().find(|b| b.id == id)) {
             b.addr = addr;
         }
@@ -121,14 +132,14 @@ impl Ports {
     }
 
     /// The sockets on `port` that take a packet to `dst`: the sockets with the address `dst`
-    /// and the sockets with `0.0.0.0`. The first have priority.
-    pub fn find(&self, port: u16, dst: Addr) -> Vec<Binding> {
+    /// and the sockets with a wildcard address. The first have priority.
+    pub fn find(&self, port: u16, dst: Ip) -> Vec<Binding> {
         let mut found: Vec<Binding> = self
             .ports
             .get(&port)
-            .map(|l| l.iter().filter(|b| b.addr == dst || b.addr == ipv4::ANY).copied().collect())
+            .map(|l| l.iter().filter(|b| ip::takes(&b.addr, b.v6only, &dst)).copied().collect())
             .unwrap_or_default();
-        found.sort_by_key(|b| b.addr == ipv4::ANY);
+        found.sort_by_key(|b| ip::is_any(&b.addr));
         found
     }
 }

@@ -11,3 +11,4 @@ ksm04_1	The test needs a NUMA system with a node that has memory and CPUs. ruker
 ksm06	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 ksm06_1	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 ksm06_2	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
+asapi_01	The test wants getprotobyname("hopopt") to give 0. The LTP build links musl, and the protocol table of musl is built in and has "ip" for 0, so this check fails on Linux with musl too. The other checks of asapi_01 pass.

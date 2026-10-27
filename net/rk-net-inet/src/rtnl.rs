@@ -2,13 +2,15 @@
 //! parts of net/ipv4/devinet.c, net/ipv4/fib_frontend.c and net/core/neighbour.c of Linux.
 
 use crate::fib::{self, IFADDR_LEN, RTMSG_LEN};
+use crate::ip::{self, Ip};
 use crate::ipv4;
-use crate::neigh::Nud;
+use crate::neigh::{Info, Nud};
 use crate::route::{
     INFINITY, IfAddr, Match, Metrics, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK, RTAX_FEATURES,
     RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
 };
 use crate::stack::{self, ROUTES};
+use crate::stack6;
 use alloc::string::String;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -29,7 +31,7 @@ use rk_abi::native::rtnetlink::{
     RTM_GETADDR, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE,
     RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
 };
-use rk_net::consts::{AF_INET, IFNAMSIZ};
+use rk_net::consts::{AF_INET, AF_INET6, IFNAMSIZ};
 use rk_net::dev;
 use rk_net::netlink::msg::{Attrs, Builder, attrs};
 use rk_net::netlink::{self, Request};
@@ -220,7 +222,7 @@ fn dump_addrs(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
 
 /// The metrics of an `RTA_METRICS` attribute, as `ip_metrics_convert` of Linux. The kernel
 /// has no choice of the congestion control for each route, so it skips `RTAX_CC_ALGO`.
-fn to_metrics(b: &[u8]) -> Result<Metrics> {
+pub(crate) fn to_metrics(b: &[u8]) -> Result<Metrics> {
     let mut m = [0; RTAX_MAX as usize];
     for (ty, v) in attrs(b) {
         if ty == 0 || ty == RTAX_CC_ALGO {
@@ -482,7 +484,8 @@ fn dump_routes(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-/// The dump of `RTM_GETNEIGH`, as `neigh_dump_info` of Linux with the table of ARP.
+/// The dump of `RTM_GETNEIGH`, as `neigh_dump_info` of Linux with the table of ARP and the
+/// table of neighbour discovery.
 fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     let p = req.payload();
     let family = p.first().copied().unwrap_or(0);
@@ -518,13 +521,20 @@ fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     } else if p.len() >= NDMSG_LEN {
         proxy = u32::from(p[10]) == NTF_PROXY;
     }
-    if proxy || (family != 0 && family != AF_INET as u8) {
+    if proxy {
         return Ok(Vec::new());
     }
-    Ok(stack::neighbours()
+    let mut all: Vec<(u8, Info<Ip>)> = Vec::new();
+    if family == 0 || family == AF_INET as u8 {
+        all.extend(stack::neighbours().into_iter().map(|n| (AF_INET as u8, n.map(ip::mapped))));
+    }
+    if family == 0 || family == AF_INET6 as u8 {
+        all.extend(stack6::neighbours().into_iter().map(|n| (AF_INET6 as u8, n)));
+    }
+    Ok(all
         .iter()
-        .filter(|n| ifindex == 0 || n.ifindex == ifindex)
-        .map(|n| {
+        .filter(|(_, n)| ifindex == 0 || n.ifindex == ifindex)
+        .map(|(af, n)| {
             let mut b = Builder::new(RTM_NEWNEIGH as u16, flags as u16, req.hdr.seq, req.portid);
             let state = match n.state {
                 Nud::Incomplete => NUD_INCOMPLETE,
@@ -532,12 +542,15 @@ fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
                 Nud::Stale => NUD_STALE,
             };
             let mut h = [0u8; NDMSG_LEN];
-            h[0] = AF_INET as u8;
+            h[0] = *af;
             h[4..8].copy_from_slice(&n.ifindex.to_ne_bytes());
             h[8..10].copy_from_slice(&(state as u16).to_ne_bytes());
             h[11] = RTN_UNICAST as u8;
             b.fixed(&h);
-            b.put(NDA_DST as u16, &n.addr);
+            match ip::v4(&n.addr) {
+                Some(a) if *af == AF_INET as u8 => b.put(NDA_DST as u16, &a),
+                _ => b.put(NDA_DST as u16, &n.addr),
+            };
             if let Some(mac) = n.mac {
                 b.put(NDA_LLADDR as u16, &mac.0);
             }

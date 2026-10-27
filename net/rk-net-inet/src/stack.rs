@@ -1,9 +1,11 @@
 //! The global state of the stack and the paths of the packets: the input of the frames, ARP,
-//! IPv4, ICMP and the input of UDP, and the output of IPv4 through the neighbour table.
+//! IPv4, ICMP and the input of UDP, and the output of IPv4 through the neighbour table. The
+//! module `stack6` has the paths of IPv6.
 //!
 //! Each table has its own lock, and the code holds at most one of them at a time. No lock is
 //! held while a device sends a frame or while a socket takes a datagram.
 
+use crate::ip::{self, Ip};
 use crate::ipv4::{
     self, Addr, Bad, HLEN, Header, PROTO_ICMP, PROTO_TCP, PROTO_UDP, UDP_HLEN, UdpHeader,
 };
@@ -15,10 +17,11 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use rk_abi::Errno;
-use rk_abi::native::if_ether::{ETH_P_ARP, ETH_P_IP};
+use rk_abi::native::if_ether::{ETH_P_ARP, ETH_P_IP, ETH_P_IPV6};
 use rk_frame::sync::SpinLock;
 use rk_net::arp::ArpPacket;
 use rk_net::buf::{HEADROOM, NetBuf};
+use rk_net::consts::AF_INET;
 use rk_net::consts::{
     ARPOP_REPLY, ARPOP_REQUEST, ICMP_DEST_UNREACH, ICMP_ECHO, ICMP_ECHOREPLY, ICMP_FRAG_NEEDED,
     ICMP_HOST_UNREACH, ICMP_NET_UNREACH, ICMP_PARAMETERPROB, ICMP_PORT_UNREACH, ICMP_PROT_UNREACH,
@@ -172,19 +175,20 @@ fn socket(id: u64) -> Option<Arc<Dgram>> {
     SOCKETS.lock().get(&id)?.upgrade()
 }
 
-/// The raw sockets of the protocol `protocol`.
-fn raw_sockets(protocol: u8) -> Vec<Arc<Dgram>> {
+/// The raw sockets of the family `family` and the protocol `protocol`.
+pub(crate) fn raw_sockets(family: u32, protocol: u8) -> Vec<Arc<Dgram>> {
     let all: Vec<Arc<Dgram>> = SOCKETS.lock().values().filter_map(Weak::upgrade).collect();
-    all.into_iter().filter(|s| s.proto() == Proto::Raw(protocol)).collect()
+    all.into_iter().filter(|s| s.family() == family && s.proto() == Proto::Raw(protocol)).collect()
 }
 
 /// The UDP socket that `id`, `src` and `sport` name in the ports table `table`: a socket on
-/// the port `port` for `dst`, with no peer or the peer `src` and `sport`.
-fn find_socket(
+/// the port `port` for `dst`, with no peer or the peer `src` and `sport`. The addresses of an
+/// IPv4 packet are IPv4-mapped.
+pub(crate) fn find_socket(
     table: &SpinLock<Ports>,
     port: u16,
-    dst: Addr,
-    src: Addr,
+    dst: Ip,
+    src: Ip,
     sport: u16,
 ) -> Option<Arc<Dgram>> {
     let found = table.lock().find(port, dst);
@@ -193,8 +197,8 @@ fn find_socket(
     let mut best: Option<(u32, Arc<Dgram>)> = None;
     for b in found {
         let Some(sock) = socket(b.id) else { continue };
-        let Some(score) = sock.score(src, sport) else { continue };
-        let score = score + u32::from(b.addr != ipv4::ANY);
+        let Some(score) = sock.score(&src, sport) else { continue };
+        let score = score + u32::from(!ip::is_any(&b.addr));
         if best.as_ref().is_none_or(|(s, _)| score > *s) {
             best = Some((score, sock));
         }
@@ -335,6 +339,7 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
     match u32::from(eth.ethertype) {
         ETH_P_ARP => arp_input(dev, frame.data()),
         ETH_P_IP => ip_input(dev, frame),
+        ETH_P_IPV6 => crate::stack6::input(dev, frame),
         _ => {}
     }
 }
@@ -394,7 +399,7 @@ fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
     if !local && !broadcast {
         return count(&COUNTERS.ip_in_addr_errors);
     }
-    let raw = raw_sockets(h.protocol);
+    let raw = raw_sockets(AF_INET, h.protocol);
     for sock in &raw {
         sock.deliver_raw(&h, frame.data());
     }
@@ -410,7 +415,7 @@ fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
     match h.protocol {
         PROTO_ICMP => icmp_input(&h, payload, broadcast),
         PROTO_UDP => udp_input(&h, packet, broadcast),
-        PROTO_TCP => crate::tcp::input(&h, payload, broadcast),
+        PROTO_TCP => crate::tcp::input(ip::mapped(h.src), ip::mapped(h.dst), payload, broadcast),
         _ if raw.is_empty() && !broadcast => {
             icmp_error(&h, packet, ICMP_DEST_UNREACH, ICMP_PROT_UNREACH);
         }
@@ -457,8 +462,10 @@ fn icmp_input(h: &Header, msg: &[u8], broadcast: bool) {
         }
         ICMP_ECHOREPLY => {
             let id = u16::from_be_bytes([msg[4], msg[5]]);
-            if let Some(sock) = find_socket(&PING_PORTS, id, h.dst, h.src, 0) {
-                sock.deliver(h.src, 0, msg.to_vec());
+            if let Some(sock) =
+                find_socket(&PING_PORTS, id, ip::mapped(h.dst), ip::mapped(h.src), 0)
+            {
+                sock.deliver(ip::mapped(h.src), 0, 0, msg.to_vec(), None);
             }
         }
         ICMP_DEST_UNREACH | ICMP_TIME_EXCEEDED | ICMP_PARAMETERPROB => {
@@ -478,16 +485,16 @@ fn icmp_unreach(kind: u8, code: u8, inner: &[u8]) {
         PROTO_UDP => {
             let sport = u16::from_be_bytes([l4[0], l4[1]]);
             let dport = u16::from_be_bytes([l4[2], l4[3]]);
-            find_socket(&UDP_PORTS, sport, ih.src, ih.dst, dport)
+            find_socket(&UDP_PORTS, sport, ip::mapped(ih.src), ip::mapped(ih.dst), dport)
         }
         PROTO_ICMP if l4[0] == ICMP_ECHO => {
             let id = u16::from_be_bytes([l4[4], l4[5]]);
-            find_socket(&PING_PORTS, id, ih.src, ih.dst, 0)
+            find_socket(&PING_PORTS, id, ip::mapped(ih.src), ip::mapped(ih.dst), 0)
         }
         _ => None,
     };
     if let Some(sock) = sock {
-        sock.icmp_error(err, hard, ih.dst);
+        sock.icmp_error(err, hard, ip::mapped(ih.dst));
     }
 }
 
@@ -540,14 +547,15 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool) {
         count(&COUNTERS.udp_in_csum_errors);
         return count(&COUNTERS.udp_in_errors);
     }
-    let Some(sock) = find_socket(&UDP_PORTS, u.dst, h.dst, h.src, u.src) else {
+    let found = find_socket(&UDP_PORTS, u.dst, ip::mapped(h.dst), ip::mapped(h.src), u.src);
+    let Some(sock) = found else {
         count(&COUNTERS.udp_no_ports);
         if !broadcast {
             icmp_error(h, packet, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH);
         }
         return;
     };
-    if sock.deliver(h.src, u.src, d[UDP_HLEN..].to_vec()) {
+    if sock.deliver(ip::mapped(h.src), 0, u.src, d[UDP_HLEN..].to_vec(), None) {
         count(&COUNTERS.udp_in);
     } else {
         count(&COUNTERS.udp_rcvbuf_errors);
@@ -603,5 +611,6 @@ fn poll_locked() {
             solicit(&d, addr);
         }
     }
+    crate::stack6::tick();
     POLLING.store(false, Ordering::Release);
 }

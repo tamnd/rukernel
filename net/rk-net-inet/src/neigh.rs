@@ -1,5 +1,6 @@
-//! The neighbour table of IPv4 over Ethernet, as net/core/neighbour.c and net/ipv4/arp.c of
-//! Linux, with fewer states.
+//! The neighbour table of IPv4 and IPv6 over Ethernet, as net/core/neighbour.c, net/ipv4/arp.c
+//! and net/ipv6/ndisc.c of Linux, with fewer states. The type `A` of the address is `Addr` for
+//! ARP and `Ip` for neighbour discovery.
 //!
 //! An entry is `Incomplete` while the table waits for an ARP reply. It keeps the packets to
 //! that address until the reply comes. The table sends a request each `RETRANS_MS`, at most
@@ -28,7 +29,7 @@ pub const GC_MS: u64 = 60_000;
 pub const QUEUE_LEN: usize = 8;
 
 /// The key of an entry: the interface index and the address.
-pub type Key = (u32, Addr);
+pub type Key<A = Addr> = (u32, A);
 
 enum State<P> {
     Incomplete { queue: VecDeque<P>, probes: u32, next: u64 },
@@ -54,11 +55,11 @@ pub enum Nud {
 
 /// An entry of the table, for a dump of `RTM_GETNEIGH` and for /proc/net/arp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Info {
+pub struct Info<A = Addr> {
     /// The interface index.
     pub ifindex: u32,
     /// The address.
-    pub addr: Addr,
+    pub addr: A,
     /// The hardware address, if the table knows it.
     pub mac: Option<MacAddr>,
     /// The state.
@@ -71,6 +72,22 @@ pub struct Info {
     pub used: u64,
     /// The time since the last change, in milliseconds.
     pub updated: u64,
+}
+
+impl<A> Info<A> {
+    /// The entry with the address that `f` gives, as an IPv4 address in an IPv6 one.
+    pub fn map<B>(self, f: impl FnOnce(A) -> B) -> Info<B> {
+        Info {
+            ifindex: self.ifindex,
+            addr: f(self.addr),
+            mac: self.mac,
+            state: self.state,
+            probes: self.probes,
+            confirmed: self.confirmed,
+            used: self.used,
+            updated: self.updated,
+        }
+    }
 }
 
 /// What the caller must do after `resolve`.
@@ -93,20 +110,20 @@ pub enum Resolve<P> {
     },
 }
 
-/// The neighbour table. `P` is the type of a packet that waits.
-pub struct Table<P> {
-    entries: BTreeMap<Key, Entry<P>>,
+/// The neighbour table. `P` is the type of a packet that waits, and `A` the type of an address.
+pub struct Table<P, A = Addr> {
+    entries: BTreeMap<Key<A>, Entry<P>>,
     /// The packets that the table dropped: a full queue, or no reply.
     pub dropped: u64,
 }
 
-impl<P> Default for Table<P> {
+impl<P, A: Copy + Ord> Default for Table<P, A> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<P> Table<P> {
+impl<P, A: Copy + Ord> Table<P, A> {
     /// An empty table.
     pub const fn new() -> Self {
         Self { entries: BTreeMap::new(), dropped: 0 }
@@ -116,7 +133,7 @@ impl<P> Table<P> {
     /// A known address gives `Resolve::Send`. An entry that is older than `REACHABLE_MS` gives
     /// the address too, with a request. An unknown address makes an `Incomplete` entry that
     /// keeps the packet.
-    pub fn resolve(&mut self, key: Key, now: u64, packet: P) -> Resolve<P> {
+    pub fn resolve(&mut self, key: Key<A>, now: u64, packet: P) -> Resolve<P> {
         let entry = self.entries.entry(key).or_insert_with(|| Entry {
             state: State::Incomplete { queue: VecDeque::new(), probes: 0, next: now },
             used: now,
@@ -149,7 +166,7 @@ impl<P> Table<P> {
     }
 
     /// The hardware address of `key`, if the table knows it.
-    pub fn lookup(&self, key: Key) -> Option<MacAddr> {
+    pub fn lookup(&self, key: Key<A>) -> Option<MacAddr> {
         match self.entries.get(&key)?.state {
             State::Reachable { mac, .. } => Some(mac),
             State::Incomplete { .. } => None,
@@ -159,7 +176,7 @@ impl<P> Table<P> {
     /// Records that `key` has the address `mac`, from an ARP packet, as `neigh_update` of
     /// Linux. If `create` is false, only an entry that exists changes. Gives the packets that
     /// waited for the address, for the caller to send.
-    pub fn update(&mut self, key: Key, mac: MacAddr, now: u64, create: bool) -> Vec<P> {
+    pub fn update(&mut self, key: Key<A>, mac: MacAddr, now: u64, create: bool) -> Vec<P> {
         let reachable = State::Reachable { mac, confirmed: now };
         match self.entries.get_mut(&key) {
             Some(entry) => {
@@ -181,7 +198,7 @@ impl<P> Table<P> {
     /// Runs the timers, as `neigh_timer_handler` of Linux. Gives the keys that need a new
     /// request. An entry with `MAX_PROBES` requests and no reply goes away with its packets,
     /// and an entry that nobody used for `GC_MS` goes away too.
-    pub fn tick(&mut self, now: u64) -> Vec<Key> {
+    pub fn tick(&mut self, now: u64) -> Vec<Key<A>> {
         let mut probes = Vec::new();
         let mut dropped = 0;
         self.entries.retain(|key, entry| match &mut entry.state {
@@ -215,7 +232,7 @@ impl<P> Table<P> {
     }
 
     /// The entries at the time `now`, by interface and address.
-    pub fn entries(&self, now: u64) -> Vec<Info> {
+    pub fn entries(&self, now: u64) -> Vec<Info<A>> {
         let ago = |t: u64| now.saturating_sub(t);
         self.entries
             .iter()

@@ -41,3 +41,21 @@ pub fn udp(src: [u8; 4], dst: [u8; 4], udp: &[u8]) -> u16 {
     let sum = fold(add(pseudo(src, dst, crate::ipv4::PROTO_UDP, len), udp));
     if sum == 0 { 0xffff } else { sum }
 }
+
+/// The sum of the pseudo header of RFC 8200 for an upper layer packet of `len` bytes, as
+/// `csum_ipv6_magic` of Linux. Two IPv4-mapped addresses give the pseudo header of IPv4, for
+/// the packets of a dual stack socket.
+pub fn pseudo_ip(src: &crate::ip::Ip, dst: &crate::ip::Ip, protocol: u8, len: u32) -> u32 {
+    if let (Some(s), Some(d)) = (crate::ip::v4(src), crate::ip::v4(dst)) {
+        return pseudo(s, d, protocol, len as u16);
+    }
+    let sum = add(add(0, src), dst);
+    // The length is a field of 32 bits: its two words go in the sum.
+    sum + (len >> 16) + (len & 0xffff) + u32::from(protocol)
+}
+
+/// The checksum of the upper layer packet `data` from `src` to `dst`, with the pseudo header
+/// of `pseudo_ip`.
+pub fn upper(src: &crate::ip::Ip, dst: &crate::ip::Ip, protocol: u8, data: &[u8]) -> u16 {
+    fold(add(pseudo_ip(src, dst, protocol, data.len() as u32), data))
+}

@@ -16,7 +16,7 @@ use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::SOL_SOCKET;
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
-    AF_INET, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC,
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC,
     MSG_WAITFORONE, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC, SOCK_NONBLOCK,
     SOCK_STREAM, SOCK_TYPE_MASK, SOMAXCONN,
 };
@@ -143,10 +143,14 @@ fn new_socket(
             rk_net_unix::check_protocol(protocol)?;
             Ok(Unix::new(kind)?)
         }
-        AF_INET => {
+        family @ (AF_INET | AF_INET6) => {
             // A protocol below 0 or past `IPPROTO_MAX` gives `EINVAL`, as `inet_create` of Linux.
             let protocol = u32::try_from(protocol as i32).map_err(|_| Errno::EINVAL)?;
-            let proto = rk_net_inet::classify(kind, protocol)?;
+            let proto = if family == AF_INET6 {
+                rk_net_inet::classify6(kind, protocol)?
+            } else {
+                rk_net_inet::classify(kind, protocol)?
+            };
             let process = cx.process();
             let cred = process.cred();
             match proto {
@@ -160,6 +164,9 @@ fn new_socket(
                     }
                 }
                 _ => {}
+            }
+            if family == AF_INET6 {
+                return Ok(rk_net_inet::new_socket6(proto));
             }
             Ok(rk_net_inet::new_socket(proto))
         }
@@ -245,7 +252,7 @@ pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let addr = read_addr(cx, addr, len)?;
     // A UDP or TCP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and
     // its sysctl `net.ipv4.ip_unprivileged_port_start`.
-    if sock.family() == AF_INET
+    if matches!(sock.family(), AF_INET | AF_INET6)
         && matches!(sock.protocol(), IPPROTO_UDP | IPPROTO_TCP)
         && rk_net_inet::sockaddr::port_of(&addr).is_some_and(|p| p != 0 && p < 1024)
         && !cx.process().cred().capable(cap::NET_BIND_SERVICE)
@@ -530,7 +537,7 @@ fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(
     let mut space = if hdr.control == 0 { 0 } else { hdr.controllen as usize };
     let mut out: Vec<u8> = Vec::new();
     let mut ctrunc = 0;
-    let put = |out: &mut Vec<u8>, space: &mut usize, kind: u32, data: &[u8]| -> bool {
+    let put = |out: &mut Vec<u8>, space: &mut usize, level: u32, kind: u32, data: &[u8]| -> bool {
         if *space < CMSGHDR_SIZE {
             return false;
         }
@@ -539,7 +546,7 @@ fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(
         len = len.min(*space);
         let mut m = vec![0u8; len];
         m[..8].copy_from_slice(&(len as u64).to_ne_bytes());
-        m[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+        m[8..12].copy_from_slice(&level.to_ne_bytes());
         m[12..16].copy_from_slice(&kind.to_ne_bytes());
         m[CMSGHDR_SIZE..].copy_from_slice(&data[..len - CMSGHDR_SIZE]);
         out.extend_from_slice(&m);
@@ -548,12 +555,19 @@ fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(
         *space -= step;
         full
     };
+    // The messages of the protocol come first, as `ip6_datagram_recv_ctl` runs before
+    // `scm_recv` in Linux.
+    for (level, kind, data) in &r.control {
+        if !put(&mut out, &mut space, *level, *kind, data) {
+            ctrunc = MSG_CTRUNC;
+        }
+    }
     if let Some(c) = r.cred {
         let mut v = Vec::with_capacity(UCRED_SIZE);
         v.extend_from_slice(&c.pid.to_ne_bytes());
         v.extend_from_slice(&c.uid.to_ne_bytes());
         v.extend_from_slice(&c.gid.to_ne_bytes());
-        if !put(&mut out, &mut space, SCM_CREDENTIALS, &v) {
+        if !put(&mut out, &mut space, SOL_SOCKET, SCM_CREDENTIALS, &v) {
             ctrunc = MSG_CTRUNC;
         }
     }
@@ -573,7 +587,7 @@ fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(
             ctrunc = MSG_CTRUNC;
         }
         if !fds.is_empty() {
-            put(&mut out, &mut space, SCM_RIGHTS, &fds);
+            put(&mut out, &mut space, SOL_SOCKET, SCM_RIGHTS, &fds);
         }
     }
     if !out.is_empty() {

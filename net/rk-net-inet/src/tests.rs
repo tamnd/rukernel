@@ -1,4 +1,5 @@
 use crate::config::{self, IpConfig};
+use crate::ip::{self, Ip};
 use crate::ipv4::Addr;
 use crate::ipv4::{self, Bad, DF, Header, MF, UdpHeader};
 use crate::neigh::{self, Resolve};
@@ -175,7 +176,7 @@ fn neighbour_times_out() {
 #[test]
 fn ports_ephemeral_and_conflicts() {
     let mut p = Ports::new(EPHEMERAL);
-    let any = |id, reuse| Binding { addr: ipv4::ANY, reuse, id };
+    let any = |id, reuse| Binding::v4(ipv4::ANY, reuse, id);
     let a = p.bind(0, any(1, false)).unwrap();
     let b = p.bind(0, any(2, false)).unwrap();
     assert!(EPHEMERAL.contains(&a) && EPHEMERAL.contains(&b));
@@ -183,11 +184,11 @@ fn ports_ephemeral_and_conflicts() {
     assert_eq!(p.bind(5000, any(3, false)), Ok(5000));
     assert_eq!(p.bind(5000, any(4, false)), Err(Errno::EADDRINUSE));
     // A specific address overlaps 0.0.0.0.
-    let lo = Binding { addr: ipv4::LOOPBACK, reuse: false, id: 5 };
+    let lo = Binding::v4(ipv4::LOOPBACK, false, 5);
     assert_eq!(p.bind(5000, lo), Err(Errno::EADDRINUSE));
     // Two different specific addresses do not overlap.
     assert_eq!(p.bind(6000, lo), Ok(6000));
-    assert_eq!(p.bind(6000, Binding { addr: [10, 0, 2, 15], reuse: false, id: 6 }), Ok(6000));
+    assert_eq!(p.bind(6000, Binding::v4([10, 0, 2, 15], false, 6)), Ok(6000));
     // `SO_REUSEADDR` on both sockets shares the port.
     assert_eq!(p.bind(7000, any(7, true)), Ok(7000));
     assert_eq!(p.bind(7000, any(8, true)), Ok(7000));
@@ -200,23 +201,23 @@ fn ports_ephemeral_and_conflicts() {
 #[test]
 fn ports_find_prefers_specific() {
     let mut p = Ports::new(EPHEMERAL);
-    p.bind(53, Binding { addr: ipv4::ANY, reuse: true, id: 1 }).unwrap();
-    p.bind(53, Binding { addr: ipv4::LOOPBACK, reuse: true, id: 2 }).unwrap();
-    let ids: Vec<u64> = p.find(53, ipv4::LOOPBACK).iter().map(|b| b.id).collect();
+    p.bind(53, Binding::v4(ipv4::ANY, true, 1)).unwrap();
+    p.bind(53, Binding::v4(ipv4::LOOPBACK, true, 2)).unwrap();
+    let ids: Vec<u64> = p.find(53, ip::mapped(ipv4::LOOPBACK)).iter().map(|b| b.id).collect();
     assert_eq!(ids, vec![2, 1]);
-    let ids: Vec<u64> = p.find(53, [10, 0, 2, 15]).iter().map(|b| b.id).collect();
+    let ids: Vec<u64> = p.find(53, ip::mapped([10, 0, 2, 15])).iter().map(|b| b.id).collect();
     assert_eq!(ids, vec![1]);
-    p.set_addr(53, 1, [10, 0, 2, 15]);
-    assert!(p.find(53, [10, 0, 2, 16]).is_empty());
+    p.set_addr(53, 1, ip::mapped([10, 0, 2, 15]));
+    assert!(p.find(53, ip::mapped([10, 0, 2, 16])).is_empty());
 }
 
 #[test]
 fn ports_run_out() {
     let mut p = Ports::new(100..=102);
     for id in 0..3 {
-        p.bind(0, Binding { addr: ipv4::ANY, reuse: false, id }).unwrap();
+        p.bind(0, Binding::v4(ipv4::ANY, false, id)).unwrap();
     }
-    assert_eq!(p.bind(0, Binding { addr: ipv4::ANY, reuse: false, id: 9 }), Err(Errno::EADDRINUSE));
+    assert_eq!(p.bind(0, Binding::v4(ipv4::ANY, false, 9)), Err(Errno::EADDRINUSE));
 }
 
 const LO: Link = Link { ifindex: 1, up: true, loopback: true };
@@ -502,6 +503,7 @@ fn loopback_sockets() {
     assert!(p.recv(100, 0, true).is_ok());
 
     tcp_loopback();
+    ipv6_loopback();
 }
 
 fn tcp_send(s: &crate::Stream, data: &[u8]) -> Result<usize, Errno> {
@@ -615,4 +617,227 @@ fn tcp_loopback() {
     m.set_option(SOL_SOCKET, SO_REUSEADDR, &int(1)).unwrap();
     assert_eq!(m.bind(&NoPaths, &sockaddr::make(lo, port)), Ok(()));
     m.release();
+}
+
+/// An IPv6 address from its eight groups.
+fn v6(g: [u16; 8]) -> Ip {
+    let mut a = [0; 16];
+    for (i, w) in g.iter().enumerate() {
+        a[2 * i..2 * i + 2].copy_from_slice(&w.to_be_bytes());
+    }
+    a
+}
+
+#[test]
+fn mapped_addresses() {
+    let m = ip::mapped([10, 0, 2, 15]);
+    assert_eq!(ip::v4(&m), Some([10, 0, 2, 15]));
+    assert_eq!(ip::v4(&ip::LOOPBACK), None);
+    assert!(ip::is_any(&ip::ANY) && ip::is_any(&ip::V4_ANY));
+    // `::` takes IPv4 only without `IPV6_V6ONLY`.
+    assert!(ip::takes(&ip::ANY, false, &m));
+    assert!(!ip::takes(&ip::ANY, true, &m));
+    assert!(ip::takes(&ip::ANY, true, &ip::LOOPBACK));
+    assert!(!ip::takes(&ip::V4_ANY, false, &ip::LOOPBACK));
+    assert!(ip::overlap(&ip::ANY, false, &ip::V4_ANY, false));
+    assert!(!ip::overlap(&ip::ANY, true, &ip::V4_ANY, false));
+}
+
+#[test]
+fn ports_dual_stack() {
+    let mut p = Ports::new(EPHEMERAL);
+    let six = |addr, id, v6only| Binding { addr, reuse: false, id, v6only };
+    p.bind(80, six(ip::ANY, 1, false)).unwrap();
+    // A dual stack socket on `::` has the port for IPv4 too.
+    assert_eq!(p.bind(80, Binding::v4(ipv4::ANY, false, 2)), Err(Errno::EADDRINUSE));
+    p.bind(81, six(ip::ANY, 3, true)).unwrap();
+    assert_eq!(p.bind(81, Binding::v4(ipv4::ANY, false, 4)), Ok(81));
+    assert_eq!(p.bind(81, six(ip::LOOPBACK, 5, true)), Err(Errno::EADDRINUSE));
+    let ids: Vec<u64> = p.find(81, ip::mapped(ipv4::LOOPBACK)).iter().map(|b| b.id).collect();
+    assert_eq!(ids, vec![4]);
+    let ids: Vec<u64> = p.find(81, ip::LOOPBACK).iter().map(|b| b.id).collect();
+    assert_eq!(ids, vec![3]);
+}
+
+#[test]
+fn ipv6_checksum_and_header() {
+    let (src, dst) = (ip::LOOPBACK, ip::LOOPBACK);
+    let mut udp = vec![0x12, 0x34, 0, 53, 0, 10, 0, 0, b'h', b'i'];
+    let sum = checksum::upper(&src, &dst, 17, &udp);
+    udp[6..8].copy_from_slice(&sum.to_be_bytes());
+    assert_eq!(checksum::upper(&src, &dst, 17, &udp), 0);
+    // Two IPv4-mapped addresses use the pseudo header of IPv4.
+    let (a, b) = ([127, 0, 0, 1], [127, 0, 0, 1]);
+    assert_eq!(
+        checksum::upper(&ip::mapped(a), &ip::mapped(b), 17, &udp[..8]),
+        checksum::fold(checksum::add(checksum::pseudo(a, b, 17, 8), &udp[..8]))
+    );
+    let h = crate::ipv6::Header::new(v6([0xfe80, 0, 0, 0, 0, 0, 0, 1]), ip::LOOPBACK, 58, 8);
+    let mut pkt = h.to_bytes().to_vec();
+    pkt.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+    let r = crate::ipv6::Header::parse(&pkt).unwrap();
+    assert_eq!((r.src, r.dst, r.protocol, r.l4), (h.src, h.dst, 58, 40));
+    assert_eq!(crate::ipv6::Header::parse(&pkt[..44]), Err(crate::ipv6::Bad::Length));
+}
+
+#[test]
+fn ipv6_addresses_and_routes() {
+    use crate::route6::{Addr6, Route6, Table6};
+    let mut t = Table6::new();
+    t.set_loopback(1);
+    t.insert_addr(Addr6::new(1, ip::LOOPBACK, 128)).unwrap();
+    let mac = MacAddr([0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+    let ll = crate::ipv6::link_local(crate::ipv6::eui64(mac));
+    assert_eq!(ll, v6([0xfe80, 0, 0, 0, 0x5054, 0xff, 0xfe12, 0x3456]));
+    t.insert_addr(Addr6::new(2, ll, 64)).unwrap();
+    let site = v6([0xfec0, 0, 0, 0, 0, 0, 0, 0x0f]);
+    t.insert_addr(Addr6::new(2, site, 64)).unwrap();
+    assert_eq!(t.insert_addr(Addr6::new(2, site, 64)).err(), Some(Errno::EEXIST));
+    // A local address goes on the loopback device.
+    let n = t.lookup(&site, 0).unwrap();
+    assert_eq!((n.ifindex, n.local), (1, true));
+    // The prefix route reaches the link, with the address of the same scope as the source.
+    let peer = v6([0xfec0, 0, 0, 0, 0, 0, 0, 2]);
+    let n = t.lookup(&peer, 0).unwrap();
+    assert_eq!((n.ifindex, n.hop, n.src), (2, peer, site));
+    let n = t.lookup(&v6([0xfe80, 0, 0, 0, 0, 0, 0, 2]), 2).unwrap();
+    assert_eq!(n.src, ll);
+    assert_eq!(t.lookup(&v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), 0).err(), Some(Errno::ENETUNREACH));
+    // A default route through a router.
+    let gw = v6([0xfe80, 0, 0, 0, 0, 0, 0, 2]);
+    t.insert_route(Route6::new(ip::ANY, 0, Some(gw), 2), NLM_F_CREATE).unwrap();
+    let n = t.lookup(&v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), 0).unwrap();
+    assert_eq!((n.ifindex, n.hop), (2, gw));
+    let (gone, _) = t.link_down(2);
+    assert_eq!(gone.len(), 2);
+    assert!(t.lookup(&peer, 0).is_err());
+}
+
+#[test]
+fn sockaddr_in6() {
+    use rk_net::consts::{AF_INET, AF_INET6};
+    let a = sockaddr::make_in(AF_INET6, &ip::LOOPBACK, 53, 0);
+    assert_eq!(a.len(), sockaddr::LEN6);
+    assert_eq!(sockaddr::parse_bind_in(AF_INET6, &a), Ok((ip::LOOPBACK, 53, 0)));
+    assert_eq!(sockaddr::parse_connect_in(AF_INET6, &a[..20]), Err(Errno::EINVAL));
+    assert_eq!(sockaddr::parse_send_in(AF_INET6, &a[..24]), Ok(Some((ip::LOOPBACK, 53, 0))));
+    let mut ll = a.clone();
+    ll[8..24].copy_from_slice(&v6([0xfe80, 0, 0, 0, 0, 0, 0, 2]));
+    ll[24..28].copy_from_slice(&2u32.to_ne_bytes());
+    assert_eq!(sockaddr::parse_bind_in(AF_INET6, &ll).map(|a| a.2), Ok(2));
+    // An IPv4 socket gives a `sockaddr_in` with the IPv4 address of a mapped address.
+    let four = sockaddr::make_in(AF_INET, &ip::mapped([127, 0, 0, 1]), 53, 0);
+    assert_eq!(four, sockaddr::make([127, 0, 0, 1], 53));
+}
+
+fn send6(s: &Dgram, to: Option<(Ip, u16)>, data: &[u8]) -> Result<usize, Errno> {
+    use rk_net::consts::AF_INET6;
+    let msg = Message {
+        data: data.to_vec(),
+        addr: to.map(|(a, p)| sockaddr::make_in(AF_INET6, &a, p, 0)),
+        ..Message::default()
+    };
+    s.send(&NoPaths, msg, 0, true)
+}
+
+/// UDP, ICMPv6 echo, raw sockets and TCP of IPv6 over the loopback device. The
+/// `loopback_sockets` test calls this, because the tables are global.
+fn ipv6_loopback() {
+    use crate::{Stream, ipv6};
+    use rk_abi::native::in6::{
+        IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_V6ONLY,
+    };
+    use rk_abi::native::inet::IPPROTO_IPV6;
+    use rk_net::consts::AF_INET6;
+    let lo = ip::LOOPBACK;
+    let name = |a: &[u8]| sockaddr::parse_bind_in(AF_INET6, a).unwrap();
+    let make = |a: &Ip, p| sockaddr::make_in(AF_INET6, a, p, 0);
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+
+    // UDP of IPv6.
+    let a = Dgram::new6(Proto::Udp);
+    let b = Dgram::new6(Proto::Udp);
+    a.bind(&NoPaths, &make(&lo, 0)).unwrap();
+    let port = name(&a.name()).1;
+    assert_eq!(a.get_option(IPPROTO_IPV6, IPV6_V6ONLY), Ok(int(1)));
+    assert_eq!(send6(&b, Some((lo, port)), b"six"), Ok(3));
+    let r = a.recv(100, 0, true).unwrap();
+    assert_eq!(r.data, b"six");
+    assert_eq!(r.addr.map(|a| name(&a)), Some((lo, name(&b.name()).1, 0)));
+    assert!(r.control.is_empty());
+    // A bound socket keeps `IPV6_V6ONLY`.
+    assert_eq!(a.set_option(IPPROTO_IPV6, IPV6_V6ONLY, &int(0)), Err(Errno::EINVAL));
+    // The control messages of `IPV6_RECVPKTINFO` and `IPV6_RECVHOPLIMIT`, in the order of Linux.
+    a.set_option(IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &int(1)).unwrap();
+    a.set_option(IPPROTO_IPV6, IPV6_RECVPKTINFO, &int(1)).unwrap();
+    send6(&b, Some((lo, port)), b"cm").unwrap();
+    let r = a.recv(100, 0, true).unwrap();
+    let mut info = lo.to_vec();
+    info.extend_from_slice(&1u32.to_ne_bytes());
+    let hops = int(i32::from(ipv6::DEFAULT_HOPS));
+    let want = [(IPPROTO_IPV6, IPV6_PKTINFO, info), (IPPROTO_IPV6, IPV6_HOPLIMIT, hops)];
+    assert_eq!(r.control, want);
+
+    // A dual stack socket on `::` takes IPv4 datagrams with a mapped source.
+    let d = Dgram::new6(Proto::Udp);
+    d.bind(&NoPaths, &make(&ip::ANY, 0)).unwrap();
+    let dport = name(&d.name()).1;
+    let four = Dgram::new(Proto::Udp);
+    assert_eq!(send(&four, Some((ipv4::LOOPBACK, dport)), b"v4"), Ok(2));
+    let r = d.recv(100, 0, true).unwrap();
+    assert_eq!(r.data, b"v4");
+    let src = name(&r.addr.unwrap()).0;
+    assert_eq!(src, ip::mapped(ipv4::LOOPBACK));
+    // It answers to the mapped address with IPv4.
+    assert_eq!(send6(&d, Some((src, sockaddr::parse_bind(&four.name()).unwrap().1)), b"re"), Ok(2));
+    assert_eq!(four.recv(100, 0, true).unwrap().data, b"re");
+    // A socket with `IPV6_V6ONLY` does not reach IPv4.
+    let o = Dgram::new6(Proto::Udp);
+    o.set_option(IPPROTO_IPV6, IPV6_V6ONLY, &int(1)).unwrap();
+    assert_eq!(send6(&o, Some((src, 9)), b"x"), Err(Errno::ENETUNREACH));
+
+    // ICMPv6 echo: the stack answers, and the reply has the identifier of the socket.
+    let p = Dgram::new6(Proto::Ping);
+    let req = [128, 0, 0, 0, 0, 0, 0, 1, b'p', b'i', b'n', b'g'];
+    assert_eq!(send6(&p, Some((lo, 0)), &req), Ok(12));
+    let r = p.recv(100, 0, true).unwrap();
+    assert_eq!(r.data[0], 129);
+    assert_eq!(u16::from_be_bytes([r.data[4], r.data[5]]), name(&p.name()).1);
+    assert_eq!(&r.data[6..], &[0, 1, b'p', b'i', b'n', b'g']);
+    assert_eq!(send6(&p, Some((lo, 0)), &[8, 0, 0, 0, 0, 0, 0, 0]), Err(Errno::EINVAL));
+
+    // A raw ICMPv6 socket sees the payload without the IPv6 header, and its filter drops the
+    // echo replies.
+    let raw = Dgram::new6(Proto::Raw(58));
+    let mut filter = [0u8; 32];
+    filter[16..20].copy_from_slice(&(1u32 << (129 - 128)).to_ne_bytes());
+    raw.set_option(58, 1, &filter).unwrap();
+    send6(&p, Some((lo, 0)), &req).unwrap();
+    let r = raw.recv(200, 0, true).unwrap();
+    assert_eq!(r.data[0], 128);
+    assert_eq!(raw.recv(200, 0, true).err(), Some(Errno::EAGAIN));
+    assert!(p.recv(100, 0, true).is_ok());
+
+    // TCP of IPv6, and an IPv4 connection to a dual stack listener.
+    let l = Stream::new6();
+    l.bind(&NoPaths, &make(&ip::ANY, 0)).unwrap();
+    let port = name(&l.name()).1;
+    l.listen(4).unwrap();
+    let c = Stream::new6();
+    assert_eq!(c.connect(&NoPaths, &make(&lo, port), true), Err(Errno::EINPROGRESS));
+    assert_eq!(c.connect(&NoPaths, &make(&lo, port), true), Ok(()));
+    let s = l.accept(true).unwrap();
+    let s = s.as_any().downcast_ref::<Stream>().unwrap();
+    assert_eq!(s.peer_name(), Ok(c.name()));
+    assert_eq!(tcp_send(&c, b"tcp6"), Ok(4));
+    assert_eq!(tcp_read(s, 4), b"tcp6");
+    let c4 = Stream::new();
+    let _ = c4.connect(&NoPaths, &sockaddr::make(ipv4::LOOPBACK, port), true);
+    let s4 = l.accept(true).unwrap();
+    assert_eq!(name(&s4.peer_name().unwrap()).0, ip::mapped(ipv4::LOOPBACK));
+    c.release();
+    s.release();
+    c4.release();
+    s4.release();
+    l.release();
 }

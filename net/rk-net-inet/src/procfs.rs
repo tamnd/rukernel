@@ -1,19 +1,27 @@
 //! The IPv4 files of /proc/net: `route` as `fib_route_seq_show` in net/ipv4/fib_trie.c, `arp`
 //! as `arp_seq_show` in net/ipv4/arp.c, `snmp` and `netstat` as net/ipv4/proc.c, and the socket
 //! tables `tcp`, `udp`, `raw` and `icmp` as net/ipv4/tcp_ipv4.c, udp.c, raw.c and ping.c.
+//!
+//! The IPv6 files: `if_inet6` as `if6_seq_show` in net/ipv6/addrconf.c, `ipv6_route` as
+//! `ipv6_route_native_seq_show` in net/ipv6/ip6_fib.c, `snmp6` as net/ipv6/proc.c, and the
+//! socket tables `tcp6`, `udp6`, `raw6` and `icmp6`. A table of IPv4 has only the `AF_INET`
+//! sockets, and a table of IPv6 only the `AF_INET6` sockets, as Linux.
 
+use crate::ip::Ip;
 use crate::neigh::Nud;
 use crate::route::{RTAX_ADVMSS, RTAX_RTT, RTAX_WINDOW};
 use crate::socket::{Proto, SockLine};
 use crate::stack::{self, COUNTERS, ROUTES};
+use crate::stack6::{COUNTERS6, ROUTES6};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::native::rtnetlink::{
-    RT_TABLE_MAIN, RTN_BROADCAST, RTN_MULTICAST, RTN_PROHIBIT, RTN_UNREACHABLE,
+    RT_TABLE_MAIN, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_PROHIBIT,
+    RTN_UNREACHABLE,
 };
-use rk_net::consts::{ATF_COM, RTF_GATEWAY, RTF_HOST, RTF_REJECT, RTF_UP};
+use rk_net::consts::{AF_INET, AF_INET6, ATF_COM, RTF_GATEWAY, RTF_HOST, RTF_REJECT, RTF_UP};
 use rk_net::dev;
 use rk_net::ether::MacAddr;
 
@@ -27,6 +35,13 @@ pub(crate) fn init() {
     rk_net::procfs::register("udp", show_udp);
     rk_net::procfs::register("raw", show_raw);
     rk_net::procfs::register("icmp", show_icmp);
+    rk_net::procfs::register("if_inet6", show_if_inet6);
+    rk_net::procfs::register("ipv6_route", show_ipv6_route);
+    rk_net::procfs::register("snmp6", show_snmp6);
+    rk_net::procfs::register("tcp6", show_tcp6);
+    rk_net::procfs::register("udp6", show_udp6);
+    rk_net::procfs::register("raw6", show_raw6);
+    rk_net::procfs::register("icmp6", show_icmp6);
 }
 
 /// The text of a pointer of `%pK`, as Linux shows it with `kernel.kptr_restrict`.
@@ -45,18 +60,29 @@ const TCP_WIDTH: usize = 149;
 
 /// The text of /proc/net/tcp, as `tcp4_seq_show` of Linux.
 pub(crate) fn show_tcp() -> String {
-    let mut out = format!(
+    let header = format!(
         "{:<w$}\n",
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
          timeout inode",
         w = TCP_WIDTH
     );
-    for (i, l) in crate::tcp::proc_lines().iter().enumerate() {
+    show_tcp_family(AF_INET, header)
+}
+
+/// The text of /proc/net/tcp6, as `tcp6_seq_show` of Linux. The lines have no padding.
+pub(crate) fn show_tcp6() -> String {
+    show_tcp_family(AF_INET6, format!("  sl  {SOCK6_HEADER} timeout inode\n"))
+}
+
+/// The text of /proc/net/tcp or /proc/net/tcp6: the sockets of the family `family`.
+fn show_tcp_family(family: u32, mut out: String) -> String {
+    let lines = crate::tcp::proc_lines();
+    for (i, l) in lines.iter().filter(|l| l.family == family).enumerate() {
         let addrs = format!(
-            "{i:4}: {:08X}:{:04X} {:08X}:{:04X} {:02X}",
-            hex(l.local.0),
+            "{i:4}: {}:{:04X} {}:{:04X} {:02X}",
+            addr_hex(family, &l.local.0),
             l.local.1,
-            hex(l.remote.0),
+            addr_hex(family, &l.remote.0),
             l.remote.1,
             l.state
         );
@@ -122,9 +148,26 @@ pub(crate) fn show_tcp() -> String {
                 )
             }
         };
-        out.push_str(&format!("{line:<w$}\n", w = TCP_WIDTH));
+        if family == AF_INET {
+            out.push_str(&format!("{line:<w$}\n", w = TCP_WIDTH));
+        } else {
+            out.push_str(&format!("{line}\n"));
+        }
     }
     out
+}
+
+/// The header of the IPv6 socket tables after the column `sl`, up to the column `uid`.
+const SOCK6_HEADER: &str = "local_address                         remote_address                        \
+                            st tx_queue rx_queue tr tm->when retrnsmt   uid ";
+
+/// An address of a socket in the form of a socket table: `%08X` of the IPv4 address, or four
+/// times `%08X` of the IPv6 address, each on a `__be32` as Linux.
+fn addr_hex(family: u32, a: &Ip) -> String {
+    if family == AF_INET {
+        return format!("{:08X}", hex(crate::ip::v4(a).unwrap_or([0; 4])));
+    }
+    a.as_chunks::<4>().0.iter().map(|w| format!("{:08X}", hex(*w))).collect()
 }
 
 /// The width of a line of /proc/net/udp and /proc/net/icmp without its newline.
@@ -138,10 +181,10 @@ const PING_BUCKETS: u16 = 64;
 
 /// The datagram sockets of the kind `kind`, with their bucket in the table of Linux, in the
 /// order of the buckets.
-fn dgram_lines(kind: fn(Proto) -> bool, buckets: u16) -> Vec<(u16, SockLine)> {
+fn dgram_lines(family: u32, kind: fn(Proto) -> bool, buckets: u16) -> Vec<(u16, SockLine)> {
     let mut lines: Vec<(u16, SockLine)> = stack::dgram_sockets()
         .iter()
-        .filter(|s| kind(s.proto()))
+        .filter(|s| s.family() == family && kind(s.proto()))
         .filter_map(|s| s.proc_line())
         .map(|l| (l.local.1 % buckets, l))
         .collect();
@@ -154,11 +197,11 @@ fn dgram_lines(kind: fn(Proto) -> bool, buckets: u16) -> Vec<(u16, SockLine)> {
 /// `TCP_CLOSE`. A send does not wait in a queue, so `tx_queue` is 0.
 fn dgram_line(l: &SockLine) -> String {
     format!(
-        "{:08X}:{:04X} {:08X}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 2 \
+        "{}:{:04X} {}:{:04X} {:02X} {:08X}:{:08X} 00:00000000 00000000 {:5} {:8} {} 2 \
          {POINTER} {}",
-        hex(l.local.0),
+        addr_hex(l.family, &l.local.0),
         l.local.1,
-        hex(l.remote.0),
+        addr_hex(l.family, &l.remote.0),
         l.remote.1,
         if l.connected { 1 } else { 7 },
         0,
@@ -178,7 +221,7 @@ const DGRAM_HEADER: &str = "local_address rem_address   st tx_queue rx_queue tr 
 /// Linux.
 fn show_udp_like(sl: &str, kind: fn(Proto) -> bool, buckets: u16) -> String {
     let mut out = format!("{:<w$}\n", format!("{sl}{DGRAM_HEADER}"), w = UDP_WIDTH);
-    for (b, l) in dgram_lines(kind, buckets) {
+    for (b, l) in dgram_lines(AF_INET, kind, buckets) {
         out.push_str(&format!("{:<w$}\n", format!("{b:5}: {}", dgram_line(&l)), w = UDP_WIDTH));
     }
     out
@@ -198,8 +241,217 @@ pub(crate) fn show_icmp() -> String {
 /// lines have no padding.
 pub(crate) fn show_raw() -> String {
     let mut out = format!("  sl  {DGRAM_HEADER}\n");
-    for (b, l) in dgram_lines(|p| matches!(p, Proto::Raw(_)), 256) {
+    for (b, l) in dgram_lines(AF_INET, |p| matches!(p, Proto::Raw(_)), 256) {
         out.push_str(&format!("{b:4}: {}\n", dgram_line(&l)));
+    }
+    out
+}
+
+/// The text of a datagram table of IPv6, as `ip6_dgram_sock_seq_show` of Linux.
+fn show_dgram6(kind: fn(Proto) -> bool, buckets: u16) -> String {
+    let mut out = format!("  sl  {SOCK6_HEADER} timeout inode ref pointer drops\n");
+    for (b, l) in dgram_lines(AF_INET6, kind, buckets) {
+        out.push_str(&format!("{b:5}: {}\n", dgram_line(&l)));
+    }
+    out
+}
+
+/// The text of /proc/net/udp6.
+pub(crate) fn show_udp6() -> String {
+    show_dgram6(|p| p == Proto::Udp, UDP_BUCKETS)
+}
+
+/// The text of /proc/net/raw6.
+pub(crate) fn show_raw6() -> String {
+    show_dgram6(|p| matches!(p, Proto::Raw(_)), 256)
+}
+
+/// The text of /proc/net/icmp6: the ICMPv6 echo sockets.
+pub(crate) fn show_icmp6() -> String {
+    show_dgram6(|p| p == Proto::Ping, PING_BUCKETS)
+}
+
+/// An IPv6 address as 32 hex digits, as `%pi6` of Linux.
+fn hex6(a: &Ip) -> String {
+    a.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The text of /proc/net/if_inet6: the address, the interface index, the prefix length, the
+/// scope, the flags and the interface name.
+pub(crate) fn show_if_inet6() -> String {
+    let mut out = String::new();
+    for a in ROUTES6.lock().addrs() {
+        out.push_str(&format!(
+            "{} {:02x} {:02x} {:02x} {:02x} {:>8}\n",
+            hex6(&a.addr),
+            a.ifindex,
+            a.prefix,
+            crate::ipv6::scope(&a.addr),
+            a.flags & 0xff,
+            dev_name(a.ifindex)
+        ));
+    }
+    out
+}
+
+/// The flags of /proc/net/ipv6_route from include/uapi/linux/ipv6_route.h, which rk-abigen does
+/// not give: `RTF_DEFAULT`, `RTF_ADDRCONF`, `RTF_PREFIX_RT`, `RTF_NONEXTHOP` and
+/// `RTF_EXPIRES`.
+const RTF_DEFAULT: u32 = 0x0001_0000;
+const RTF_ADDRCONF: u32 = 0x0004_0000;
+const RTF_PREFIX_RT: u32 = 0x0008_0000;
+const RTF_NONEXTHOP: u32 = 0x0020_0000;
+const RTF_EXPIRES: u32 = 0x0040_0000;
+
+/// The text of /proc/net/ipv6_route: the routes of all tables, as
+/// `ipv6_route_native_seq_show`. The reference count and the use count are 0, and a reject
+/// route has the device `lo`.
+pub(crate) fn show_ipv6_route() -> String {
+    let mut out = String::new();
+    for r in ROUTES6.lock().routes() {
+        let mut flags = RTF_UP;
+        if r.gateway.is_some() {
+            flags |= RTF_GATEWAY;
+        }
+        if r.prefix == 128 {
+            flags |= RTF_HOST;
+        }
+        if r.kind == RTN_UNREACHABLE as u8
+            || r.kind == RTN_PROHIBIT as u8
+            || r.kind == RTN_BLACKHOLE as u8
+        {
+            flags |= RTF_REJECT;
+        }
+        if r.addrconf {
+            flags |= RTF_ADDRCONF | if r.gateway.is_some() { RTF_DEFAULT } else { RTF_PREFIX_RT };
+        }
+        if r.expires.is_some() {
+            flags |= RTF_EXPIRES;
+        }
+        if r.kind == RTN_LOCAL as u8 {
+            flags |= RTF_NONEXTHOP;
+        }
+        let dev = if flags & RTF_REJECT != 0 { String::from("lo") } else { dev_name(r.ifindex) };
+        out.push_str(&format!(
+            "{} {:02x} {} 00 {} {:08x} {:08x} {:08x} {:08x} {:>8}\n",
+            hex6(&r.dst),
+            r.prefix,
+            hex6(&crate::ip::ANY),
+            hex6(&r.gateway.unwrap_or(crate::ip::ANY)),
+            r.priority,
+            0,
+            0,
+            flags,
+            dev
+        ));
+    }
+    out
+}
+
+/// The names of the ICMPv6 types of /proc/net/snmp6, `icmp6type2name` of Linux.
+const ICMP6_NAMES: [(usize, &str); 15] = [
+    (1, "DestUnreachs"),
+    (2, "PktTooBigs"),
+    (3, "TimeExcds"),
+    (4, "ParmProblems"),
+    (128, "Echos"),
+    (129, "EchoReplies"),
+    (130, "GroupMembQueries"),
+    (131, "GroupMembResponses"),
+    (132, "GroupMembReductions"),
+    (133, "RouterSolicits"),
+    (134, "RouterAdvertisements"),
+    (135, "NeighborSolicits"),
+    (136, "NeighborAdvertisements"),
+    (137, "Redirects"),
+    (143, "MLDv2Reports"),
+];
+
+/// The text of /proc/net/snmp6, as `snmp6_seq_show` of Linux: one counter on each line. The
+/// stack keeps only some of the counters, and the others are 0.
+pub(crate) fn show_snmp6() -> String {
+    let c = |a: &core::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    let k = &COUNTERS6;
+    let mut out = String::new();
+    let mut line = |name: &str, v: u64| out.push_str(&format!("{name:<32}\t{v}\n"));
+    let ip = [
+        ("InReceives", c(&k.in_receives)),
+        ("InHdrErrors", c(&k.in_hdr_errors)),
+        ("InTooBigErrors", 0),
+        ("InNoRoutes", 0),
+        ("InAddrErrors", c(&k.in_addr_errors)),
+        ("InUnknownProtos", c(&k.in_unknown_protos)),
+        ("InTruncatedPkts", c(&k.in_truncated)),
+        ("InDiscards", 0),
+        ("InDelivers", c(&k.in_delivers)),
+        ("OutForwDatagrams", 0),
+        ("OutRequests", c(&k.out_requests)),
+        ("OutDiscards", 0),
+        ("OutNoRoutes", c(&k.out_no_routes)),
+        ("ReasmTimeout", 0),
+        ("ReasmReqds", 0),
+        ("ReasmOKs", 0),
+        ("ReasmFails", c(&k.reasm_fails)),
+        ("FragOKs", 0),
+        ("FragFails", 0),
+        ("FragCreates", 0),
+        ("InMcastPkts", c(&k.in_mcast)),
+        ("OutMcastPkts", c(&k.out_mcast)),
+        ("InOctets", c(&k.in_octets)),
+        ("OutOctets", c(&k.out_octets)),
+        ("InMcastOctets", c(&k.in_mcast_octets)),
+        ("OutMcastOctets", c(&k.out_mcast_octets)),
+        ("InBcastOctets", 0),
+        ("OutBcastOctets", 0),
+        ("InNoECTPkts", c(&k.in_receives)),
+        ("InECT1Pkts", 0),
+        ("InECT0Pkts", 0),
+        ("InCEPkts", 0),
+        ("OutTransmits", c(&k.out_transmits)),
+    ];
+    for (n, v) in ip {
+        line(&format!("Ip6{n}"), v);
+    }
+    let icmp = [
+        ("InMsgs", c(&k.icmp_in)),
+        ("InErrors", c(&k.icmp_in_errors)),
+        ("OutMsgs", c(&k.icmp_out)),
+        ("OutErrors", c(&k.icmp_out_errors)),
+        ("InCsumErrors", c(&k.icmp_in_csum_errors)),
+        ("OutRateLimitHost", 0),
+    ];
+    for (n, v) in icmp {
+        line(&format!("Icmp6{n}"), v);
+    }
+    for (dir, types) in [("In", &k.icmp_in_type), ("Out", &k.icmp_out_type)] {
+        for (t, n) in ICMP6_NAMES {
+            line(&format!("Icmp6{dir}{n}"), c(&types[t]));
+        }
+    }
+    for (dir, types) in [("In", &k.icmp_in_type), ("Out", &k.icmp_out_type)] {
+        for (t, v) in types.iter().enumerate() {
+            let v = c(v);
+            if v != 0 {
+                line(&format!("Icmp6{dir}Type{t}"), v);
+            }
+        }
+    }
+    let udp = [
+        ("InDatagrams", c(&k.udp_in)),
+        ("NoPorts", c(&k.udp_no_ports)),
+        ("InErrors", c(&k.udp_in_errors)),
+        ("OutDatagrams", c(&k.udp_out)),
+        ("RcvbufErrors", c(&k.udp_rcvbuf_errors)),
+        ("SndbufErrors", 0),
+        ("InCsumErrors", c(&k.udp_in_csum_errors)),
+        ("IgnoredMulti", 0),
+        ("MemErrors", 0),
+    ];
+    for (n, v) in udp {
+        line(&format!("Udp6{n}"), v);
+    }
+    for (n, _) in udp {
+        line(&format!("UdpLite6{n}"), 0);
     }
     out
 }

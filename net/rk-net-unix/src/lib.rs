@@ -724,6 +724,7 @@ impl Unix {
                     rights: Vec::new(),
                     cred: passcred.then(|| p.cred.unwrap_or(NO_CRED)),
                     flags: 0,
+                    control: Vec::new(),
                 };
                 if r.len > size {
                     r.flags |= MSG_TRUNC;

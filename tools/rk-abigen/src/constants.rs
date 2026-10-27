@@ -498,6 +498,22 @@ const GROUPS: &[Group] = &[
         doc: "The IP protocol numbers, the options of the level `IPPROTO_IP` and the special IPv4 addresses.",
     },
     Group {
+        module: "in6",
+        header: "linux/in6.h",
+        prefixes: &["IPV6_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The options of the level `IPPROTO_IPV6` and the fields of the IPv6 flow information.",
+    },
+    Group {
+        module: "icmpv6",
+        header: "linux/icmpv6.h",
+        prefixes: &["ICMPV6_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The types and the codes of ICMPv6 messages and the socket option `ICMPV6_FILTER`.",
+    },
+    Group {
         module: "tcp",
         header: "linux/tcp.h",
         prefixes: &["TCP_"],

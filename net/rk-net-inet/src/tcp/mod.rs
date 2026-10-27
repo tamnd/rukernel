@@ -1,4 +1,4 @@
-//! TCP, as net/ipv4/tcp*.c of Linux.
+//! TCP, as net/ipv4/tcp*.c and net/ipv6/tcp_ipv6.c of Linux.
 //!
 //! The module `seg` has the header, `conn` has the state machine of one connection, and `cc`
 //! has the congestion control. These three do no I/O, so that the host tests drive them. The
