@@ -391,6 +391,7 @@ pub fn exec(
         process.set_comm(name);
     }
     process.set_cred(cred);
+    thread.exec_keys();
     process.set_image(&argv, at, auxv);
     Ok(image)
 }

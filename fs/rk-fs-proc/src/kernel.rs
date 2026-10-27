@@ -79,7 +79,7 @@ fn text_file(path: &[u8], f: fn() -> Vec<u8>) -> InodeRef {
 }
 
 fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
-    let files: [(&[u8], fn() -> Vec<u8>); 10] = [
+    let files: [(&[u8], fn() -> Vec<u8>); 12] = [
         (b"meminfo", || {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
@@ -105,6 +105,11 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
         }),
         (b"cmdline", || format!("{}\n", info().cmdline).into_bytes()),
         (b"devices", || rk_vfs::device::proc_devices().into_bytes()),
+        (b"keys", || {
+            rk_proc::current_thread()
+                .map_or_else(Vec::new, |t| t.with_keys(rk_proc::keys::keys_text))
+        }),
+        (b"key-users", rk_proc::keys::key_users_text),
         (b"filesystems", || {
             let mut out = String::new();
             for t in rk_vfs::fstype::types() {
@@ -223,6 +228,11 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/protected_symlinks", ""),
     ("kernel/domainname", ""),
     ("kernel/hostname", ""),
+    ("kernel/keys/gc_delay", ""),
+    ("kernel/keys/maxbytes", ""),
+    ("kernel/keys/maxkeys", ""),
+    ("kernel/keys/root_maxbytes", ""),
+    ("kernel/keys/root_maxkeys", ""),
     ("kernel/ngroups_max", "65536"),
     ("kernel/osrelease", ""),
     ("kernel/ostype", "Linux"),
@@ -271,6 +281,19 @@ fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
     }
 }
 
+/// The `kernel.keys.*` sysctl of `name`, which the key service reads, and its smallest value.
+fn key_limit(name: &str) -> Option<(&'static AtomicU32, u32)> {
+    use rk_proc::keys::{GC_DELAY, MAXBYTES, MAXKEYS, ROOT_MAXBYTES, ROOT_MAXKEYS};
+    match name {
+        "kernel/keys/gc_delay" => Some((&GC_DELAY, 0)),
+        "kernel/keys/maxbytes" => Some((&MAXBYTES, 1)),
+        "kernel/keys/maxkeys" => Some((&MAXKEYS, 1)),
+        "kernel/keys/root_maxbytes" => Some((&ROOT_MAXBYTES, 1)),
+        "kernel/keys/root_maxkeys" => Some((&ROOT_MAXKEYS, 1)),
+        _ => None,
+    }
+}
+
 /// The function that reads the UTS name of the sysctl `name`, for `kernel/hostname` and
 /// `kernel/domainname`.
 fn uts_name(name: &str) -> Option<fn() -> rk_proc::uts::Field> {
@@ -285,7 +308,7 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some(t) = rk_vfs::ipc::sysctl(name) {
         return format!("{}\n", t.get()).into_bytes();
     }
-    if let Some((v, _)) = protected(name) {
+    if let Some((v, _)) = protected(name).or_else(|| key_limit(name)) {
         return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
     }
     if name == PING_GROUP_RANGE {
@@ -322,6 +345,16 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
         let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
         let n: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
         if n > max {
+            return Err(Errno::EINVAL);
+        }
+        v.store(n, Ordering::Relaxed);
+        return Ok(());
+    }
+    // A value from the smallest value to `INT_MAX`, as `proc_dointvec_minmax` of Linux.
+    if let Some((v, min)) = key_limit(name) {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let n: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+        if n < min || n > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
         v.store(n, Ordering::Relaxed);
