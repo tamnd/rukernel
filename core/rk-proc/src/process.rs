@@ -707,12 +707,14 @@ impl Thread {
         *self.sched.lock()
     }
 
-    /// Sets the scheduling values, and gives the new share of the CPU to the scheduler.
+    /// Sets the scheduling values, and gives the new share of the CPU and the CPU mask to the
+    /// scheduler.
     pub fn set_sched(&self, params: SchedParams) {
         *self.sched.lock() = params;
         if let Some(task) = self.task() {
             let (nice, idle) = params.share();
             rk_frame::task::set_nice(&task, nice, idle);
+            rk_frame::task::set_affinity(&task, params.affinity);
         }
     }
 

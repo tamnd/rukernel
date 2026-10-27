@@ -6,7 +6,7 @@
 //!
 //! rk-frame does not choose which task runs next. A higher crate gives a `Scheduler` with
 //! `inject_scheduler`, and rk-frame calls it when the current task yields, blocks or exits. The
-//! scheduler of R1 is the round robin queue of rk-sched.
+//! scheduler is the fair class of rk-sched.
 //!
 //! The kernel runs with interrupts off, so a task in the kernel is not preempted. A task that runs
 //! user code yields when `should_yield` tells that its time slice is over.
@@ -14,8 +14,9 @@
 //! Each CPU runs user code at the same time, but only one CPU at a time runs kernel code. A CPU
 //! holds the kernel lock while it runs kernel code, and releases it when it enters user mode or
 //! waits for an interrupt. This is the big kernel lock of Linux 2.0, and it keeps the code of the
-//! kernel, which was written for one CPU, correct. All CPUs use one queue of the scheduler. Each
-//! CPU has its own current task, and an idle task that runs when no other task can run.
+//! kernel, which was written for one CPU, correct. The scheduler can keep a queue for each CPU, and
+//! tells which CPU gets a task that becomes runnable. Each CPU has its own current task, and an
+//! idle task that runs when no other task can run.
 //!
 //! An interrupt handler takes no lock, so it cannot wake a task. The work that an interrupt starts
 //! runs later as a bottom half, when the kernel is back from the interrupt and holds no lock: in
@@ -66,14 +67,17 @@ pub enum Enqueue {
 ///
 /// rk-frame calls `put_prev` when the current task stops on the CPU, and `set_next` when a task
 /// comes on the CPU. A yield calls `put_prev` before `enqueue`. The scheduler keeps its values for
-/// each task in the data that `new_data` makes, and `Task::sched_data` gives them.
+/// each task in the data that `new_data` makes, and `Task::sched_data` gives them. The scheduler
+/// can keep a queue for each CPU. `dequeue` then takes a task from the queue of the CPU that calls
+/// it.
 pub trait Scheduler: Sync {
     /// Makes the data of the scheduler for a new task.
     fn new_data(&self) -> Box<dyn Any + Send + Sync> {
         Box::new(())
     }
-    /// Adds a task that can run.
-    fn enqueue(&self, task: Arc<Task>, why: Enqueue);
+    /// Adds a task that can run. Gives the CPU whose queue has the task now, so that rk-frame
+    /// wakes that CPU if it is idle.
+    fn enqueue(&self, task: Arc<Task>, why: Enqueue) -> usize;
     /// Removes the next task to run, if one can run.
     fn dequeue(&self) -> Option<Arc<Task>>;
     /// The current task stops on the CPU. `sleeping` is true if the task blocked or exited.
@@ -88,6 +92,11 @@ pub trait Scheduler: Sync {
     /// Sets the share of the CPU of the task from the nice value `nice`. If `idle` is true, the
     /// task has the smallest share, as the `SCHED_IDLE` policy of Linux gives.
     fn set_nice(&self, _task: &Task, _nice: i32, _idle: bool) {}
+    /// Sets the CPUs that the task can use, one bit for each CPU, as `sched_setaffinity` of
+    /// Linux. If the task moves to the queue of another CPU, gives that CPU.
+    fn set_affinity(&self, _task: &Task, _mask: u64) -> Option<usize> {
+        None
+    }
 }
 
 static SCHEDULER: Once<&'static dyn Scheduler> = Once::new();
@@ -206,11 +215,10 @@ pub(crate) fn kernel_unlock() {
 /// The CPUs that wait for an interrupt in their idle task.
 static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 
-/// Wakes a CPU that waits in its idle task, so that it runs a task from the queue.
-fn kick() {
-    let others = IDLE_MASK.load(Ordering::Acquire) & !(1 << cpu::id());
-    if others != 0 {
-        smp::reschedule(others.trailing_zeros() as usize);
+/// Wakes the CPU `id` if it waits in its idle task, so that it runs a task from its queue.
+fn kick(id: usize) {
+    if id != cpu::id() && id < 64 && IDLE_MASK.load(Ordering::Acquire) & 1 << id != 0 {
+        smp::reschedule(id);
     }
 }
 /// An exited task that the next task drops after the switch, when its stack is not in use.
@@ -222,12 +230,19 @@ pub struct TaskOptions {
     data: Box<dyn Any + Send + Sync>,
     nice: i32,
     idle: bool,
+    affinity: u64,
 }
 
 impl TaskOptions {
     /// Makes the options of a task that runs `entry`.
     pub fn new(entry: impl FnOnce() + Send + 'static) -> Self {
-        Self { entry: Box::new(entry), data: Box::new(()), nice: 0, idle: false }
+        Self {
+            entry: Box::new(entry),
+            data: Box::new(()),
+            nice: 0,
+            idle: false,
+            affinity: u64::MAX,
+        }
     }
 
     /// Sets the nice value of the task, and if it has the smallest share of the CPU. See
@@ -235,6 +250,12 @@ impl TaskOptions {
     pub fn nice(mut self, nice: i32, idle: bool) -> Self {
         self.nice = nice;
         self.idle = idle;
+        self
+    }
+
+    /// Sets the CPUs that the task can use. See `Scheduler::set_affinity`.
+    pub fn affinity(mut self, mask: u64) -> Self {
+        self.affinity = mask;
         self
     }
 
@@ -259,8 +280,8 @@ impl TaskOptions {
             _stack: Some(stack),
         });
         scheduler().set_nice(&task, self.nice, self.idle);
-        scheduler().enqueue(task.clone(), Enqueue::New);
-        kick();
+        scheduler().set_affinity(&task, self.affinity);
+        kick(scheduler().enqueue(task.clone(), Enqueue::New));
         Some(task)
     }
 }
@@ -322,8 +343,7 @@ impl Task {
             .compare_exchange(BLOCKED, RUNNABLE, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
         if woken {
-            scheduler().enqueue(self.clone(), Enqueue::Wake);
-            kick();
+            kick(scheduler().enqueue(self.clone(), Enqueue::Wake));
         }
         woken
     }
@@ -341,6 +361,13 @@ pub fn set_nice(task: &Task, nice: i32, idle: bool) {
     scheduler().set_nice(task, nice, idle);
 }
 
+/// Sets the CPUs that `task` can use. See `Scheduler::set_affinity`.
+pub fn set_affinity(task: &Task, mask: u64) {
+    if let Some(id) = scheduler().set_affinity(task, mask) {
+        kick(id);
+    }
+}
+
 /// Lets the next task run. The current task stays runnable, so it runs again later.
 pub fn yield_now() {
     let current = Task::current();
@@ -349,7 +376,7 @@ pub fn yield_now() {
     }
     current.state.store(RUNNABLE, Ordering::Release);
     scheduler().put_prev(&current, false);
-    scheduler().enqueue(current, Enqueue::Yield);
+    kick(scheduler().enqueue(current, Enqueue::Yield));
     schedule();
 }
 

@@ -4,6 +4,9 @@
 //! which they start. Only x86-64 starts the other CPUs. The other architectures and the host
 //! build of the unit tests run on one CPU.
 
+/// The largest number of CPUs. A CPU mask of the scheduler has one bit for each CPU in a `u64`.
+pub const MAX_CPUS: usize = 64;
+
 /// The number of CPUs that run.
 pub fn count() -> usize {
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
