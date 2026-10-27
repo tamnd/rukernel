@@ -238,6 +238,14 @@ const GROUPS: &[Group] = &[
         doc: "The IP protocol numbers, the options of the level `IPPROTO_IP` and the special IPv4 addresses.",
     },
     Group {
+        module: "tcp",
+        header: "linux/tcp.h",
+        prefixes: &["TCP_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The options of the level `IPPROTO_TCP`.",
+    },
+    Group {
         module: "random",
         header: "linux/random.h",
         prefixes: &["GRND_"],

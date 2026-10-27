@@ -28,6 +28,7 @@ pub mod socket;
 pub mod sockios;
 pub mod stat;
 pub mod syscalls;
+pub mod tcp;
 pub mod termbits;
 pub mod time;
 pub mod timerfd;

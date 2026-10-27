@@ -55,6 +55,7 @@
 #include <termios.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -3299,12 +3300,260 @@ static void test_inet_lo(void)
 	close(b);
 }
 
-static void test_inet(void)
+/* The TCP test moves 1 MiB each way. The client sends pattern A and then shuts down its side.
+ * The server answers with the FNV-1a hash of the bytes that it got, then 1 MiB of pattern B.
+ * xtask runs the same server on the host. */
+#define TCP_BYTES (1 << 20)
+
+static unsigned char tcp_pattern(unsigned long i, int b)
+{
+	return b ? (unsigned char)(i * 13 + (i >> 8) + 5) : (unsigned char)(i * 7 + (i >> 10));
+}
+
+static unsigned long long fnv(unsigned long long h, const unsigned char *p, long n)
+{
+	for (long i = 0; i < n; i++)
+		h = (h ^ p[i]) * 0x100000001b3ULL;
+	return h;
+}
+
+#define FNV_INIT 0xcbf29ce484222325ULL
+
+/* The hash of the first n bytes of a pattern. */
+static unsigned long long pattern_fnv(int b, unsigned long n)
+{
+	unsigned long long h = FNV_INIT;
+	for (unsigned long i = 0; i < n; i++) {
+		unsigned char c = tcp_pattern(i, b);
+		h = fnv(h, &c, 1);
+	}
+	return h;
+}
+
+/* Writes n bytes of a pattern in blocks of different sizes. */
+static int tcp_write_pattern(int fd, int b, unsigned long n)
+{
+	static unsigned char buf[65536];
+	unsigned long off = 0;
+	for (int k = 0; off < n; k++) {
+		unsigned long len = 1000 + (k * 7919) % 60000;
+		if (len > n - off)
+			len = n - off;
+		for (unsigned long i = 0; i < len; i++)
+			buf[i] = tcp_pattern(off + i, b);
+		long w = write(fd, buf, len);
+		if (w <= 0)
+			return -1;
+		off += w;
+	}
+	return 0;
+}
+
+/* Reads to the end of the stream, or n bytes, and gives the count. h gets the hash. */
+static long tcp_read_all(int fd, long n, unsigned long long *h)
+{
+	static unsigned char buf[50000];
+	long total = 0;
+	*h = FNV_INIT;
+	while (total < n) {
+		long want = n - total < (long)sizeof(buf) ? n - total : (long)sizeof(buf);
+		long r = read(fd, buf, want);
+		if (r <= 0)
+			return r < 0 ? -1 : total;
+		*h = fnv(*h, buf, r);
+		total += r;
+	}
+	return total;
+}
+
+/* Reads exactly n bytes. */
+static int read_exact(int fd, void *p, long n)
+{
+	long got = 0;
+	while (got < n) {
+		long r = read(fd, (char *)p + got, n - got);
+		if (r <= 0)
+			return -1;
+		got += r;
+	}
+	return 0;
+}
+
+/* The client side: gives 0 if the peer got the data and the reply is right. */
+static int tcp_client(int fd, const char *who)
+{
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	if (tcp_write_pattern(fd, 0, TCP_BYTES) < 0)
+		return 1;
+	if (shutdown(fd, SHUT_WR) < 0)
+		return 2;
+	unsigned long long sum, h;
+	if (read_exact(fd, &sum, sizeof(sum)) < 0)
+		return 3;
+	long n = tcp_read_all(fd, TCP_BYTES + 1, &h);
+	long us = elapsed_us(&t0);
+	printf("init: inet: tcp %s: sent 1 MiB, got %ld bytes in %ld us\n", who, n, us);
+	if (sum != pattern_fnv(0, TCP_BYTES))
+		return 4;
+	if (n != TCP_BYTES || h != pattern_fnv(1, TCP_BYTES))
+		return 5;
+	return 0;
+}
+
+/* The server side, for one connection. */
+static int tcp_server(int fd)
+{
+	unsigned long long h;
+	long n = tcp_read_all(fd, TCP_BYTES + 1, &h);
+	if (n != TCP_BYTES)
+		return 1;
+	if (write(fd, &h, sizeof(h)) != sizeof(h))
+		return 2;
+	if (tcp_write_pattern(fd, 1, TCP_BYTES) < 0)
+		return 3;
+	return 0;
+}
+
+static void test_tcp_lo(void)
+{
+	int l = socket(AF_INET, SOCK_STREAM, 0), one = 1;
+	struct sockaddr_in lo = inet_addr4(INADDR_LOOPBACK, 0), an;
+	socklen_t len = sizeof(an);
+	setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	check("tcp: bind and listen on 127.0.0.1",
+	      bind(l, (struct sockaddr *)&lo, sizeof(lo)) == 0 && listen(l, 8) == 0 &&
+		      getsockname(l, (struct sockaddr *)&an, &len) == 0 && an.sin_port != 0);
+	int val = 0;
+	len = sizeof(val);
+	check("tcp: SO_ACCEPTCONN", getsockopt(l, SOL_SOCKET, SO_ACCEPTCONN, &val, &len) == 0 && val == 1);
+
+	/* A nonblocking connect gives EINPROGRESS, then the socket is writable and SO_ERROR is 0. */
+	int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	errno = 0;
+	check("tcp: nonblocking connect gives EINPROGRESS",
+	      connect(c, (struct sockaddr *)&an, sizeof(an)) == -1 && errno == EINPROGRESS);
+	struct pollfd p = { .fd = c, .events = POLLOUT };
+	val = -1;
+	len = sizeof(val);
+	check("tcp: the socket becomes writable with SO_ERROR 0",
+	      poll(&p, 1, 2000) == 1 && (p.revents & POLLOUT) &&
+		      getsockopt(c, SOL_SOCKET, SO_ERROR, &val, &len) == 0 && val == 0);
+	int ep = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = l };
+	epoll_ctl(ep, EPOLL_CTL_ADD, l, &ev);
+	check("tcp: epoll sees the connection on the listener", epoll_wait(ep, &ev, 1, 1000) == 1);
+	struct sockaddr_in peer;
+	len = sizeof(peer);
+	int a = accept4(l, (struct sockaddr *)&peer, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+	struct sockaddr_in cn;
+	socklen_t cl = sizeof(cn);
+	getsockname(c, (struct sockaddr *)&cn, &cl);
+	check("tcp: accept4 gives the address of the peer", a >= 0 && peer.sin_port == cn.sin_port &&
+							       (fcntl(a, F_GETFL) & O_NONBLOCK));
+	errno = 0;
+	char buf[16];
+	check("tcp: recv on an empty connection gives EAGAIN",
+	      recv(a, buf, sizeof(buf), 0) == -1 && errno == EAGAIN);
+	val = 1;
+	setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val));
+	val = 0;
+	len = sizeof(val);
+	check("tcp: TCP_NODELAY", getsockopt(c, IPPROTO_TCP, TCP_NODELAY, &val, &len) == 0 && val == 1);
+	char cc[16] = "";
+	len = sizeof(cc);
+	check("tcp: TCP_CONGESTION is cubic",
+	      getsockopt(c, IPPROTO_TCP, TCP_CONGESTION, cc, &len) == 0 && strcmp(cc, "cubic") == 0);
+	send(c, "hello", 5, 0);
+	p.fd = a;
+	p.events = POLLIN;
+	poll(&p, 1, 1000);
+	check("tcp: MSG_PEEK leaves the data", recv(a, buf, 3, MSG_PEEK) == 3 && recv(a, buf, 16, 0) == 5 &&
+						     memcmp(buf, "hello", 5) == 0);
+	/* A half close: the peer reads the end of the data and can still send. */
+	shutdown(c, SHUT_WR);
+	p.events = POLLIN | POLLRDHUP;
+	poll(&p, 1, 1000);
+	check("tcp: the peer reads the end after SHUT_WR",
+	      (p.revents & POLLRDHUP) && recv(a, buf, sizeof(buf), 0) == 0);
+	errno = 0;
+	check("tcp: send after SHUT_WR gives EPIPE",
+	      send(c, "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+	check("tcp: the half closed peer still sends", send(a, "bye", 3, 0) == 3);
+	p.fd = c;
+	poll(&p, 1, 1000);
+	check("tcp: and the data arrives", recv(c, buf, sizeof(buf), 0) == 3);
+	close(c);
+	close(a);
+
+	/* A close with unread data sends an RST. */
+	c = socket(AF_INET, SOCK_STREAM, 0);
+	connect(c, (struct sockaddr *)&an, sizeof(an));
+	a = accept(l, NULL, NULL);
+	send(a, "unread", 6, 0);
+	p.fd = c;
+	p.events = POLLIN;
+	poll(&p, 1, 1000);
+	close(c);
+	p.fd = a;
+	poll(&p, 1, 1000);
+	errno = 0;
+	check("tcp: a close with unread data resets the peer",
+	      recv(a, buf, sizeof(buf), 0) == -1 && errno == ECONNRESET);
+	close(a);
+
+	/* No listener: ECONNREFUSED. */
+	int d = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in closed = inet_addr4(INADDR_LOOPBACK, 9);
+	errno = 0;
+	check("tcp: connect to a closed port gives ECONNREFUSED",
+	      connect(d, (struct sockaddr *)&closed, sizeof(closed)) == -1 && errno == ECONNREFUSED);
+	close(d);
+
+	/* 1 MiB each way between two processes. */
+	pid_t pid = fork();
+	if (pid == 0) {
+		int s = socket(AF_INET, SOCK_STREAM, 0);
+		if (connect(s, (struct sockaddr *)&an, sizeof(an)) < 0)
+			_exit(10);
+		_exit(tcp_client(s, "lo"));
+	}
+	int s = accept(l, NULL, NULL);
+	int r = s >= 0 ? tcp_server(s) : 9;
+	close(s);
+	int status = -1;
+	waitpid(pid, &status, 0);
+	printf("init: inet: tcp lo: server %d, client status %d\n", r, status);
+	check("tcp: 1 MiB each way over lo", r == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(ep);
+	close(l);
+}
+
+/* Connects to the server of xtask on the host, at 10.0.2.2 and the port of the command line. */
+static void test_tcp_host(int port)
+{
+	if (port <= 0) {
+		printf("init: inet: tcp host: no port\n");
+		return;
+	}
+	int s = socket(AF_INET, SOCK_STREAM, 0);
+	struct sockaddr_in host = inet_addr4(0x0a000202, port);
+	int c = connect(s, (struct sockaddr *)&host, sizeof(host));
+	int r = c == 0 ? tcp_client(s, "host") : -errno;
+	printf("init: inet: tcp host: connect %d, result %d\n", c, r);
+	check("tcp: 1 MiB each way with the host", r == 0);
+	close(s);
+}
+
+static void test_inet(int port)
 {
 	test_inet_ping();
 	test_inet_dns();
 	test_inet_lo();
+	test_tcp_lo();
+	test_tcp_host(port);
 }
+
 
 int main(int argc, char **argv)
 {
@@ -3363,7 +3612,7 @@ int main(int argc, char **argv)
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)
 		test_blk();
 	if (argc > 1 && strcmp(argv[1], "inet") == 0)
-		test_inet();
+		test_inet(argc > 2 ? atoi(argv[2]) : 0);
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }

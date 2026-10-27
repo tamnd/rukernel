@@ -42,7 +42,7 @@ impl Ports {
     /// Tells if `b` can bind the port `port`.
     fn free(&self, port: u16, b: &Binding) -> bool {
         self.ports.get(&port).is_none_or(|list| {
-            list.iter().all(|o| {
+            list.iter().filter(|o| o.id != b.id).all(|o| {
                 let overlap = o.addr == b.addr || o.addr == ipv4::ANY || b.addr == ipv4::ANY;
                 !overlap || (o.reuse && b.reuse)
             })
@@ -81,6 +81,25 @@ impl Ports {
             }
         }
         Err(Errno::EADDRINUSE)
+    }
+
+    /// Tells if `b` can have `port`, beside the binding of `b.id` itself. A TCP socket checks
+    /// this before `listen`.
+    pub fn is_free(&self, port: u16, b: &Binding) -> bool {
+        self.free(port, b)
+    }
+
+    /// Adds `b` to `port` without the check, for a TCP connection that a listening socket made.
+    pub fn add(&mut self, port: u16, b: Binding) {
+        self.ports.entry(port).or_default().push(b);
+    }
+
+    /// Changes the flag `reuse` of the socket `id` on `port`. A listening TCP socket clears it,
+    /// so that no other socket binds the port.
+    pub fn set_reuse(&mut self, port: u16, id: u64, reuse: bool) {
+        if let Some(b) = self.ports.get_mut(&port).and_then(|l| l.iter_mut().find(|b| b.id == id)) {
+            b.reuse = reuse;
+        }
     }
 
     /// Changes the address of the socket `id` on `port`, for `connect` on a socket that has the

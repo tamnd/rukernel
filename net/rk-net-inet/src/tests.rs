@@ -295,7 +295,9 @@ fn socket_kinds() {
     assert_eq!(classify(SOCK_RAW, IPPROTO_ICMP), Ok(Proto::Raw(1)));
     assert_eq!(classify(SOCK_RAW, 0), Err(Errno::EPROTONOSUPPORT));
     assert_eq!(classify(SOCK_DGRAM, 6), Err(Errno::EPROTONOSUPPORT));
-    assert_eq!(classify(SOCK_STREAM, 0), Err(Errno::EPROTONOSUPPORT));
+    assert_eq!(classify(SOCK_STREAM, 0), Ok(Proto::Tcp));
+    assert_eq!(classify(SOCK_STREAM, 6), Ok(Proto::Tcp));
+    assert_eq!(classify(SOCK_STREAM, IPPROTO_UDP), Err(Errno::EPROTONOSUPPORT));
     assert_eq!(classify(SOCK_SEQPACKET, 0), Err(Errno::ESOCKTNOSUPPORT));
     assert_eq!(classify(SOCK_DGRAM, 1000), Err(Errno::EINVAL));
 }
@@ -383,4 +385,119 @@ fn loopback_sockets() {
     let r = raw.recv(200, 0, true).unwrap();
     assert_eq!(r.data[20], ICMP_ECHOREPLY);
     assert!(p.recv(100, 0, true).is_ok());
+
+    tcp_loopback();
+}
+
+fn tcp_send(s: &crate::Stream, data: &[u8]) -> Result<usize, Errno> {
+    s.send(&NoPaths, Message { data: data.to_vec(), ..Message::default() }, 0, true)
+}
+
+/// Reads until `n` bytes came or nothing more comes.
+fn tcp_read(s: &crate::Stream, n: usize) -> Vec<u8> {
+    let mut got = Vec::new();
+    while got.len() < n {
+        match s.recv(n - got.len(), 0, true) {
+            Ok(r) if !r.data.is_empty() => got.extend_from_slice(&r.data),
+            _ => break,
+        }
+    }
+    got
+}
+
+/// TCP over the loopback device. The `loopback_sockets` test calls this, because the tables are
+/// global. The host has no clock, so the timers do not run.
+fn tcp_loopback() {
+    use crate::Stream;
+    use rk_abi::native::poll::{POLLHUP, POLLIN, POLLOUT, POLLRDHUP};
+    use rk_abi::native::socket::{SO_ERROR, SO_LINGER, SO_REUSEADDR, SOL_SOCKET};
+    use rk_net::consts::{MSG_WAITALL, SHUT_WR};
+    let lo = ipv4::LOOPBACK;
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+
+    let l = Stream::new();
+    l.bind(&NoPaths, &sockaddr::make(lo, 0)).unwrap();
+    let port = sockaddr::parse_bind(&l.name()).unwrap().1;
+    l.listen(4).unwrap();
+    assert_eq!(l.get_option(SOL_SOCKET, rk_abi::native::socket::SO_ACCEPTCONN), Ok(int(1)));
+    // A listening socket keeps its port, also from a socket with `SO_REUSEADDR`.
+    let other = Stream::new();
+    other.set_option(SOL_SOCKET, SO_REUSEADDR, &int(1)).unwrap();
+    assert_eq!(other.bind(&NoPaths, &sockaddr::make(lo, port)), Err(Errno::EADDRINUSE));
+    assert_eq!(l.accept(true).err(), Some(Errno::EAGAIN));
+
+    // A new socket is writable and hung up, as Linux.
+    let c = Stream::new();
+    assert_eq!(c.poll() & (POLLOUT | POLLHUP | POLLIN), POLLOUT | POLLHUP);
+    assert_eq!(c.recv(10, 0, true).err(), Some(Errno::ENOTCONN));
+    assert_eq!(tcp_send(&c, b"x"), Err(Errno::EPIPE));
+    assert_eq!(c.connect(&NoPaths, &sockaddr::make(lo, port), true), Err(Errno::EINPROGRESS));
+    assert_eq!(c.get_option(SOL_SOCKET, SO_ERROR), Ok(int(0)));
+    assert_eq!(c.connect(&NoPaths, &sockaddr::make(lo, port), true), Ok(()));
+    assert_eq!(c.connect(&NoPaths, &sockaddr::make(lo, port), true), Err(Errno::EISCONN));
+    assert_ne!(l.poll() & POLLIN, 0);
+    let a = l.accept(true).unwrap();
+    let a = a.as_any().downcast_ref::<Stream>().unwrap();
+    assert_eq!(a.peer_name(), Ok(c.name()));
+    assert_eq!(c.peer_name(), Ok(a.name()));
+    assert_eq!(c.poll() & (POLLOUT | POLLHUP | POLLIN), POLLOUT);
+
+    // Bulk data with a check of each byte.
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    assert_eq!(tcp_send(&c, &data), Ok(data.len()));
+    assert_eq!(tcp_read(a, data.len()), data);
+    assert_eq!(a.recv(10, 0, true).err(), Some(Errno::EAGAIN));
+
+    // `MSG_PEEK` leaves the data, and `MSG_WAITALL` without a wait gives what is there.
+    tcp_send(a, b"12345").unwrap();
+    assert_eq!(c.recv(3, MSG_PEEK, true).unwrap().data, b"123");
+    assert_eq!(c.readable(), Ok(5));
+    assert_eq!(c.recv(10, MSG_WAITALL, true).unwrap().data, b"12345");
+
+    // A half close: the peer reads the end, and it can still send.
+    c.shutdown(SHUT_WR).unwrap();
+    assert_eq!(tcp_send(&c, b"x"), Err(Errno::EPIPE));
+    assert_eq!(a.recv(10, 0, true).unwrap().data, b"");
+    assert_ne!(a.poll() & POLLRDHUP, 0);
+    tcp_send(a, b"bye").unwrap();
+    assert_eq!(c.recv(10, 0, true).unwrap().data, b"bye");
+    a.release();
+    assert_eq!(c.recv(10, 0, true).unwrap().data, b"");
+    assert_ne!(c.poll() & POLLHUP, 0);
+    c.release();
+
+    // No listener: an RST, and `ECONNREFUSED`.
+    let d = Stream::new();
+    assert_eq!(d.connect(&NoPaths, &sockaddr::make(lo, 9), true), Err(Errno::EINPROGRESS));
+    assert_eq!(d.connect(&NoPaths, &sockaddr::make(lo, 9), true), Err(Errno::ECONNREFUSED));
+    d.release();
+
+    // A close with data that the program did not read sends an RST.
+    let e = Stream::new();
+    let _ = e.connect(&NoPaths, &sockaddr::make(lo, port), true);
+    let f = l.accept(true).unwrap();
+    tcp_send(&e, b"unread").unwrap();
+    f.release();
+    assert_eq!(e.recv(10, 0, true).err(), Some(Errno::ECONNRESET));
+    assert_eq!(e.recv(10, 0, true).unwrap().data, b"");
+    assert_eq!(tcp_send(&e, b"x"), Err(Errno::EPIPE));
+    e.release();
+
+    // `SO_LINGER` with 0 also sends an RST.
+    let g = Stream::new();
+    let _ = g.connect(&NoPaths, &sockaddr::make(lo, port), true);
+    let h = l.accept(true).unwrap();
+    let mut linger = int(1);
+    linger.extend_from_slice(&int(0));
+    g.set_option(SOL_SOCKET, SO_LINGER, &linger).unwrap();
+    g.release();
+    assert_eq!(h.recv(10, 0, true).err(), Some(Errno::ECONNRESET));
+    h.release();
+
+    // A closed listener frees its port.
+    l.release();
+    let m = Stream::new();
+    m.set_option(SOL_SOCKET, SO_REUSEADDR, &int(1)).unwrap();
+    assert_eq!(m.bind(&NoPaths, &sockaddr::make(lo, port)), Ok(()));
+    m.release();
 }

@@ -4,7 +4,9 @@
 //! Each table has its own lock, and the code holds at most one of them at a time. No lock is
 //! held while a device sends a frame or while a socket takes a datagram.
 
-use crate::ipv4::{self, Addr, Bad, HLEN, Header, PROTO_ICMP, PROTO_UDP, UDP_HLEN, UdpHeader};
+use crate::ipv4::{
+    self, Addr, Bad, HLEN, Header, PROTO_ICMP, PROTO_TCP, PROTO_UDP, UDP_HLEN, UdpHeader,
+};
 use crate::ports::{self, Ports};
 use crate::socket::{Dgram, Proto};
 use crate::{checksum, neigh, route};
@@ -343,6 +345,7 @@ fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
     match h.protocol {
         PROTO_ICMP => icmp_input(&h, payload, broadcast),
         PROTO_UDP => udp_input(&h, packet, broadcast),
+        PROTO_TCP => crate::tcp::input(&h, payload, broadcast),
         _ if raw.is_empty() && !broadcast => {
             icmp_error(&h, packet, ICMP_DEST_UNREACH, ICMP_PROT_UNREACH);
         }
@@ -518,6 +521,7 @@ fn poll_locked() {
             break;
         }
     }
+    crate::tcp::tick();
     let probes = {
         let mut neigh = NEIGH.lock();
         if neigh.is_empty() { Vec::new() } else { neigh.tick(now_ms()) }

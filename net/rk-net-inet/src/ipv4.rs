@@ -7,6 +7,8 @@ use crate::checksum;
 pub const HLEN: usize = 20;
 /// The protocol number of ICMP.
 pub const PROTO_ICMP: u8 = 1;
+/// The protocol number of TCP.
+pub const PROTO_TCP: u8 = 6;
 /// The protocol number of UDP.
 pub const PROTO_UDP: u8 = 17;
 /// The default time to live, `net.ipv4.ip_default_ttl` of Linux.
