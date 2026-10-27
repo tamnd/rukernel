@@ -152,13 +152,19 @@ pub(crate) fn mount(
 
 /// Makes the file system of `mount`, with the root `root`, read only or writable again, for a
 /// remount, as `reconfigure_super` of Linux. Gives `EBUSY` if the file system becomes read only
-/// and a file of one of its mounts is open for a write.
+/// and a file of one of its mounts is open for a write, and `EACCES` if it becomes writable on a
+/// read only device.
 fn remount_super(mount: &Mount, root: &InodeRef, read_only: bool) -> Result<(), Errno> {
+    let ty = mount.source().fstype;
+    let on_disk = fstype::find(ty.as_bytes()).is_some_and(|t| !t.nodev);
+    if !read_only && on_disk && rk_vfs::blockdev::block_read_only(root.metadata().dev) {
+        return Err(Errno::EACCES);
+    }
     if read_only && !root.is_read_only() && rk_vfs::dentry::fs_has_writers(root) {
         return Err(Errno::EBUSY);
     }
     root.set_read_only(read_only)?;
-    fstype::set_read_only(mount.source().fstype, root.fs_id(), read_only);
+    fstype::set_read_only(ty, root.fs_id(), read_only);
     Ok(())
 }
 

@@ -21,6 +21,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use deadline::{Deadline, Dir, Request};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
@@ -149,6 +150,8 @@ pub struct Queue {
     device: Arc<dyn BlockDevice>,
     pending: SpinLock<Pending>,
     stats: SpinLock<Stats>,
+    /// `BLKROSET` made the device read only, as `bd_read_only` of Linux.
+    read_only: AtomicBool,
 }
 
 impl Queue {
@@ -158,6 +161,7 @@ impl Queue {
             device,
             pending: SpinLock::new(Pending::Deadline(Deadline::new(MAX_SECTORS))),
             stats: SpinLock::new(Stats::default()),
+            read_only: AtomicBool::new(false),
         }
     }
 
@@ -166,9 +170,16 @@ impl Queue {
         self.device.sectors()
     }
 
-    /// Tells if the device does not accept writes.
+    /// Tells if the device does not accept writes: the driver can only read it, or `BLKROSET`
+    /// made it read only, as `bdev_read_only` of Linux.
     pub fn read_only(&self) -> bool {
-        self.device.read_only()
+        self.device.read_only() || self.read_only.load(Ordering::Relaxed)
+    }
+
+    /// Makes the device read only or writable again, for `BLKROSET`. A device that the driver
+    /// can only read stays read only.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only.store(read_only, Ordering::Relaxed);
     }
 
     /// The counts of the device.
@@ -402,6 +413,20 @@ mod tests {
         let data = (0..64 * SECTOR_SIZE).map(|i| (i / SECTOR_SIZE) as u8).collect();
         let ram = Arc::new(Ram { data: SpinLock::new(data), requests: SpinLock::new(Vec::new()) });
         (ram.clone(), Queue::new(ram))
+    }
+
+    #[test]
+    fn a_read_only_queue_refuses_writes_until_it_is_writable() {
+        let (ram, q) = queue();
+        q.set_read_only(true);
+        assert!(q.read_only());
+        let mut bios = [Bio::new(Op::Write, 1, vec![0xaa; SECTOR_SIZE])];
+        q.submit(&mut bios);
+        assert_eq!(bios[0].result, Err(Errno::EPERM));
+        assert!(ram.requests.lock().is_empty());
+        q.set_read_only(false);
+        q.submit(&mut bios);
+        assert_eq!(bios[0].result, Ok(()));
     }
 
     #[test]
