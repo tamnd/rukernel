@@ -8,7 +8,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// The most CPUs that the kernel uses. A mask of the CPUs fits in a `u64`.
-pub(crate) const MAX_CPUS: usize = 64;
+pub(crate) const MAX_CPUS: usize = crate::cpu::MAX_CPUS;
 
 /// The offsets of the fields of `Local`, for the entry code.
 pub(crate) const KERNEL_RSP: usize = 0;

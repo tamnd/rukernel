@@ -2994,6 +2994,26 @@ static void test_smp(void)
 	int vcpu = sched_getcpu();
 	check("sched_getcpu of the vDSO gives a CPU of the set", vcpu >= 0 && vcpu < cpus);
 
+	/* sched_setaffinity moves the thread to the CPU of the new mask, and a child of fork gets
+	 * the mask of its parent. */
+	int moved = cpus > 1;
+	for (int c = 0; c < cpus && moved; c++) {
+		cpu_set_t one;
+		CPU_ZERO(&one);
+		CPU_SET(c, &one);
+		moved = sched_setaffinity(0, sizeof(one), &one) == 0 && sched_getcpu() == c &&
+			syscall(SYS_getcpu, &cpu, NULL, NULL) == 0 && (int)cpu == c;
+	}
+	check("sched_setaffinity moves the thread to the CPU of the mask", moved);
+	pid_t pinned = fork();
+	if (pinned == 0)
+		_exit(sched_getcpu() == cpus - 1 ? 0 : 1);
+	int pstatus = 0;
+	check("a child of fork runs on the CPU of the mask of its parent",
+	      pinned > 0 && waitpid(pinned, &pstatus, 0) == pinned && WIFEXITED(pstatus) &&
+		      WEXITSTATUS(pstatus) == 0);
+	sched_setaffinity(0, sizeof(set), &set);
+
 	int start[2];
 	if (pipe(start) != 0) {
 		check("hackbench makes its pipe", 0);
