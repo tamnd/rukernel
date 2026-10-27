@@ -1728,7 +1728,8 @@ const NETCFG_SCRIPT2: &[u8] =
     b"ip route get 10.0.2.2 && ip route get 1.1.1.1 | grep -q 'via 10.0.2.2' \
 && ip route get 127.0.0.1 | grep -q '^local' \
 && { busybox tcpsvd 0 5555 true </dev/null & } && { busybox udpsvd 0 5556 true </dev/null & } \
-&& sleep 1 && cat /proc/net/tcp /proc/net/udp /proc/net/raw /proc/net/icmp /proc/net/unix \
+&& { for i in 1 2 3 4 5 6 7 8 9 10; do grep -q :15B4 /proc/net/udp && break; sleep 1; done; } \
+&& cat /proc/net/tcp /proc/net/udp /proc/net/raw /proc/net/icmp /proc/net/unix \
 && grep -q ': 00000000:15B3 00000000:0000 0A ' /proc/net/tcp \
 && grep -q ': 00000000:15B4 00000000:0000 07 ' /proc/net/udp \
 && grep -q '^Num       RefCount Protocol Flags    Type St Inode Path' /proc/net/unix \

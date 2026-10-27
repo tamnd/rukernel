@@ -15,6 +15,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- The boot tests `init` and `netcfg` failed at times on a busy host after #346, because `sleep` and the time limits now follow wall time (#355). The `netcfg` test waits up to 10 s for its servers, and the CPU time checks of `init` wait up to 20 s.
 - `RTF_MTU` had the value of `RTF_MODIFIED` (0x20). It is now 0x40, as in linux/route.h (#355).
 - The x86_64 timer interrupt now counts each tick period that passed since the last tick, as `tick_do_update_jiffies64` of Linux (#346). The local APIC keeps only one pending timer interrupt, so a kernel path that ran longer than one tick with interrupts off lost ticks. The clock and all timeouts then ran slow, and the `sleep` watchdog of `tools/ltp/run.py` did not stop the test in time.
 - The x86_64 boot code now measures the time stamp counter against the PIT 8 times and keeps the shortest measure, as `pit_hpet_ptimer_calibrate_cpu` of Linux (#346). Before, one measure under QEMU without KVM on a busy host gave 4.5 times the true frequency. The clock then ran at a fifth of the true speed, so hackbench02 and shm_test01 of LTP stopped the guest past the time limit of `run.py`.
