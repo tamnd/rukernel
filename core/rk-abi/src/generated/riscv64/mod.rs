@@ -13,6 +13,7 @@ pub mod eventpoll;
 pub mod fcntl;
 pub mod futex;
 pub mod if_ether;
+pub mod inet;
 pub mod ioctls;
 pub mod mman;
 pub mod mount;

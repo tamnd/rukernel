@@ -410,6 +410,7 @@ const BOOT_TESTS: &[&str] = &[
     "smp",
     "blk",
     "net",
+    "inet",
     "busybox",
     "ltp",
     "kselftest",
@@ -1547,7 +1548,7 @@ fn qemu(args: &[String]) -> Result {
 /// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
-        "init" | "tty" | "smp" | "blk" => kernel.with_file_name("user-init").exists(),
+        "init" | "tty" | "smp" | "blk" | "inet" => kernel.with_file_name("user-init").exists(),
         "busybox" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" | "gvisor" | "fstests" => {
@@ -1565,6 +1566,10 @@ fn test_cmdline(test: &str) -> String {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "smp" => String::from("console=ttyS0 rk.test=init -- smp"),
         "blk" => String::from("console=ttyS0 rk.test=init -- blk"),
+        // The address, the netmask and the gateway of the user network of QEMU.
+        "inet" => {
+            String::from("console=ttyS0 rk.test=init ip=10.0.2.15::10.0.2.2:255.255.255.0 -- inet")
+        }
         "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
@@ -1580,7 +1585,7 @@ fn test_cmdline(test: &str) -> String {
 fn pass_line(test: &str) -> String {
     let test = if matches!(
         test,
-        "tty" | "smp" | "blk" | "busybox" | "ltp" | "kselftest" | "gvisor" | "fstests"
+        "tty" | "smp" | "blk" | "inet" | "busybox" | "ltp" | "kselftest" | "gvisor" | "fstests"
     ) || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"
@@ -1683,8 +1688,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
         }
-        // The `net` test sends an ARP request to the gateway of the user network of QEMU.
-        if *test == "net" {
+        // The `net` test sends an ARP request to the gateway of the user network of QEMU. The
+        // `inet` test pings the gateway and asks the DNS server of QEMU.
+        if matches!(*test, "net" | "inet") {
             cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.

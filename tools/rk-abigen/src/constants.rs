@@ -230,6 +230,14 @@ const GROUPS: &[Group] = &[
         doc: "The sizes of an Ethernet frame and the protocol IDs of the Ethernet header.",
     },
     Group {
+        module: "inet",
+        header: "linux/in.h",
+        prefixes: &["IPPROTO_", "IP_", "INADDR_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The IP protocol numbers, the options of the level `IPPROTO_IP` and the special IPv4 addresses.",
+    },
+    Group {
         module: "random",
         header: "linux/random.h",
         prefixes: &["GRND_"],

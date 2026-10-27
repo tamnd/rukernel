@@ -34,6 +34,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/sem.h>
+#include <sys/epoll.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -52,6 +53,8 @@
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <termios.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -3040,6 +3043,249 @@ static void test_smp(void)
 	check("hackbench completes", ok && children == 2 * HB_GROUPS * HB_FDS);
 }
 
+/* The Internet checksum of RFC 1071. */
+static unsigned short inet_sum(const void *data, int len)
+{
+	const unsigned char *p = data;
+	unsigned long sum = 0;
+	for (int i = 0; i + 1 < len; i += 2)
+		sum += (p[i] << 8) | p[i + 1];
+	if (len & 1)
+		sum += p[len - 1] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return htons(~sum & 0xffff);
+}
+
+static struct sockaddr_in inet_addr4(unsigned long addr, int port)
+{
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+	a.sin_addr.s_addr = htonl(addr);
+	return a;
+}
+
+/* Waits at most ms milliseconds for a datagram on fd. */
+static long recv_wait(int fd, void *buf, int len, struct sockaddr_in *from, int ms)
+{
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	if (poll(&p, 1, ms) != 1)
+		return -1;
+	socklen_t fl = sizeof(*from);
+	return recvfrom(fd, buf, len, 0, (struct sockaddr *)from, &fl);
+}
+
+static long elapsed_us(const struct timespec *t0)
+{
+	struct timespec t1;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	return (t1.tv_sec - t0->tv_sec) * 1000000 + (t1.tv_nsec - t0->tv_nsec) / 1000;
+}
+
+/* Sends three echo requests to 10.0.2.2 on the raw socket fd, as ping, and gives the count of
+ * replies. A raw socket gets each ICMP packet with its IP header. */
+static int ping_raw(int fd)
+{
+	struct sockaddr_in gw = inet_addr4(0x0a000202, 0);
+	int replies = 0;
+	for (int seq = 1; seq <= 3; seq++) {
+		unsigned char req[64] = { 8, 0, 0, 0, 0x12, 0x34, 0, seq };
+		for (int i = 8; i < 64; i++)
+			req[i] = i;
+		unsigned short sum = inet_sum(req, sizeof(req));
+		memcpy(req + 2, &sum, 2);
+		struct timespec t0;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		if (sendto(fd, req, sizeof(req), 0, (struct sockaddr *)&gw, sizeof(gw)) != sizeof(req))
+			continue;
+		for (;;) {
+			unsigned char buf[256];
+			struct sockaddr_in from;
+			long n = recv_wait(fd, buf, sizeof(buf), &from, 2000);
+			if (n < 0)
+				break;
+			int hl = (buf[0] & 0xf) * 4;
+			if (n < hl + 8 || buf[hl] != 0 || buf[hl + 4] != 0x12 || buf[hl + 5] != 0x34 ||
+			    buf[hl + 7] != seq)
+				continue;
+			printf("init: inet: %ld bytes from %s: icmp_seq=%d ttl=%d time=%ld us\n", n - hl,
+			       inet_ntoa(from.sin_addr), seq, buf[8], elapsed_us(&t0));
+			replies++;
+			break;
+		}
+	}
+	return replies;
+}
+
+static int write_text(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	long n = write(fd, text, strlen(text));
+	close(fd);
+	return n == (long)strlen(text) ? 0 : -1;
+}
+
+static void test_inet_ping(void)
+{
+	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	check("a raw ICMP socket opens", fd >= 0);
+	if (fd >= 0) {
+		check("ping 10.0.2.2 on a raw socket gets replies", ping_raw(fd) >= 2);
+		close(fd);
+	}
+
+	errno = 0;
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+	check("an ICMP echo socket needs a group in ping_group_range", fd == -1 && errno == EACCES);
+	mount("proc", "/proc", "proc", 0, NULL);
+	const char *range = "/proc/sys/net/ipv4/ping_group_range";
+	char text[64] = { 0 };
+	int rfd = open(range, O_RDONLY);
+	check("ping_group_range is 1 0", rfd >= 0 && read(rfd, text, sizeof(text) - 1) > 0 &&
+						 strcmp(text, "1\t0\n") == 0);
+	close(rfd);
+	check("ping_group_range takes 0 2147483647", write_text(range, "0 2147483647\n") == 0);
+	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+	check("an ICMP echo socket opens", fd >= 0);
+	if (fd >= 0) {
+		struct sockaddr_in gw = inet_addr4(0x0a000202, 0), from, me;
+		unsigned char req[16] = { 8, 0, 0, 0, 0, 0, 0, 7, 'r', 'u', 'k', 'e', 'r', 'n', 'e', 'l' };
+		long n = -1;
+		for (int i = 0; i < 3 && n < 0; i++) {
+			sendto(fd, req, sizeof(req), 0, (struct sockaddr *)&gw, sizeof(gw));
+			n = recv_wait(fd, text, sizeof(text), &from, 2000);
+		}
+		socklen_t ml = sizeof(me);
+		getsockname(fd, (struct sockaddr *)&me, &ml);
+		unsigned char *r = (unsigned char *)text;
+		printf("init: inet: echo socket: %ld bytes from %s, type %d, id %d\n", n,
+		       inet_ntoa(from.sin_addr), n > 0 ? r[0] : -1, ntohs(me.sin_port));
+		check("ping 10.0.2.2 on an echo socket gets a reply with the socket id",
+		      n == 16 && r[0] == 0 && memcmp(r + 4, &me.sin_port, 2) == 0 &&
+			      memcmp(r + 8, "rukernel", 8) == 0);
+		close(fd);
+	}
+	write_text(range, "1 0");
+	umount("/proc");
+}
+
+static void test_inet_dns(void)
+{
+	/* A query for the A record of example.com, with recursion. */
+	static const unsigned char query[] = { 0xbe, 0xef, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 7,
+					       'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0,
+					       0, 1, 0, 1 };
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	check("a UDP socket opens", fd >= 0);
+	struct sockaddr_in dns = inet_addr4(0x0a000203, 53), from, me;
+	check("connect to 10.0.2.3:53", connect(fd, (struct sockaddr *)&dns, sizeof(dns)) == 0);
+	socklen_t ml = sizeof(me);
+	check("getsockname gives 10.0.2.15 and an ephemeral port",
+	      getsockname(fd, (struct sockaddr *)&me, &ml) == 0 &&
+		      me.sin_addr.s_addr == htonl(0x0a00020f) && ntohs(me.sin_port) >= 32768);
+	unsigned char buf[512];
+	long n = -1;
+	for (int i = 0; i < 3 && n < 0; i++) {
+		if (send(fd, query, sizeof(query), 0) != sizeof(query))
+			break;
+		n = recv_wait(fd, buf, sizeof(buf), &from, 3000);
+	}
+	int ok = n >= 12 && buf[0] == 0xbe && buf[1] == 0xef && (buf[2] & 0x80);
+	if (ok)
+		printf("init: inet: DNS reply from %s:%d, %ld bytes, rcode %d, %d answers\n",
+		       inet_ntoa(from.sin_addr), ntohs(from.sin_port), n, buf[3] & 0xf,
+		       (buf[6] << 8) | buf[7]);
+	check("a DNS query to 10.0.2.3:53 gets a reply", ok);
+	close(fd);
+}
+
+static void test_inet_lo(void)
+{
+	int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+	struct sockaddr_in lo = inet_addr4(INADDR_LOOPBACK, 0), an, from;
+	socklen_t len = sizeof(an);
+	check("bind to 127.0.0.1 port 0 gives an ephemeral port",
+	      bind(a, (struct sockaddr *)&lo, sizeof(lo)) == 0 &&
+		      getsockname(a, (struct sockaddr *)&an, &len) == 0 && ntohs(an.sin_port) >= 32768);
+	errno = 0;
+	check("a second bind to the port gives EADDRINUSE",
+	      bind(b, (struct sockaddr *)&an, sizeof(an)) == -1 && errno == EADDRINUSE);
+
+	int ep = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = a };
+	epoll_ctl(ep, EPOLL_CTL_ADD, a, &ev);
+	check("sendto over lo", sendto(b, "ping", 4, 0, (struct sockaddr *)&an, sizeof(an)) == 4);
+	check("epoll sees the datagram", epoll_wait(ep, &ev, 1, 1000) == 1 && ev.data.fd == a);
+	char buf[64];
+	len = sizeof(from);
+	struct sockaddr_in bn;
+	socklen_t bl = sizeof(bn);
+	getsockname(b, (struct sockaddr *)&bn, &bl);
+	long n = recvfrom(a, buf, sizeof(buf), 0, (struct sockaddr *)&from, &len);
+	printf("init: inet: lo: %ld bytes from %s:%d\n", n, inet_ntoa(from.sin_addr),
+	       ntohs(from.sin_port));
+	check("recvfrom gives the data and the sender", n == 4 && memcmp(buf, "ping", 4) == 0 &&
+								 from.sin_port == bn.sin_port &&
+								 from.sin_addr.s_addr == lo.sin_addr.s_addr);
+
+	struct iovec iov[2] = { { "pi", 2 }, { "ng!", 3 } };
+	struct msghdr mh = { .msg_name = &an, .msg_namelen = sizeof(an), .msg_iov = iov, .msg_iovlen = 2 };
+	check("sendmsg over lo", sendmsg(b, &mh, 0) == 5);
+	char small[3];
+	struct iovec riov = { small, sizeof(small) };
+	struct msghdr rh = { .msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &riov, .msg_iovlen = 1 };
+	n = recvmsg(a, &rh, 0);
+	check("recvmsg truncates with MSG_TRUNC", n == 3 && (rh.msg_flags & MSG_TRUNC) &&
+							  rh.msg_namelen == sizeof(from) &&
+							  memcmp(small, "pin", 3) == 0);
+	errno = 0;
+	check("recv on an empty socket gives EAGAIN", recv(b, buf, sizeof(buf), 0) == -1 && errno == EAGAIN);
+
+	/* A connected socket gets ECONNREFUSED from the ICMP error for a port without a socket. */
+	int c = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in closed = inet_addr4(INADDR_LOOPBACK, 9), peer;
+	check("connect to 127.0.0.1:9", connect(c, (struct sockaddr *)&closed, sizeof(closed)) == 0);
+	len = sizeof(peer);
+	check("getpeername gives the peer", getpeername(c, (struct sockaddr *)&peer, &len) == 0 &&
+						     peer.sin_port == htons(9));
+	send(c, "x", 1, 0);
+	errno = 0;
+	check("a datagram to a closed port gives ECONNREFUSED",
+	      recv(c, buf, sizeof(buf), MSG_DONTWAIT) == -1 && errno == ECONNREFUSED);
+	close(c);
+
+	int one = 1, r1 = socket(AF_INET, SOCK_DGRAM, 0), r2 = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in fixed = inet_addr4(INADDR_ANY, 5353);
+	setsockopt(r1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	setsockopt(r2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	check("SO_REUSEADDR shares a port",
+	      bind(r1, (struct sockaddr *)&fixed, sizeof(fixed)) == 0 &&
+		      bind(r2, (struct sockaddr *)&fixed, sizeof(fixed)) == 0);
+	close(r1);
+	close(r2);
+
+	int size = 4096;
+	socklen_t sl = sizeof(size);
+	setsockopt(a, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+	check("SO_RCVBUF doubles the value", getsockopt(a, SOL_SOCKET, SO_RCVBUF, &size, &sl) == 0 &&
+						   size == 8192);
+	struct sockaddr_in bcast = inet_addr4(0x0a0002ff, 9);
+	errno = 0;
+	check("a broadcast without SO_BROADCAST gives EACCES",
+	      sendto(b, "x", 1, 0, (struct sockaddr *)&bcast, sizeof(bcast)) == -1 && errno == EACCES);
+	close(ep);
+	close(a);
+	close(b);
+}
+
+static void test_inet(void)
+{
+	test_inet_ping();
+	test_inet_dns();
+	test_inet_lo();
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -3096,6 +3342,8 @@ int main(int argc, char **argv)
 		test_smp();
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)
 		test_blk();
+	if (argc > 1 && strcmp(argv[1], "inet") == 0)
+		test_inet();
 	printf("init: %s\n", failed ? "a check failed" : "each check passed");
 	return failed;
 }

@@ -10,16 +10,18 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::at::AT_FDCWD;
+use rk_abi::native::inet::IPPROTO_UDP;
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::SOL_SOCKET;
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
-    AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC, MSG_WAITFORONE,
+    AF_INET, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC, MSG_WAITFORONE,
     SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM,
     SOCK_TYPE_MASK, SOMAXCONN,
 };
 use rk_net::{Cred, Message, NodeId, PathOps, Received, Socket};
+use rk_net_inet::Proto as InetProto;
 use rk_net_unix::Unix;
 use rk_proc::Pid;
 use rk_proc::signal::{SI_USER, SigInfo};
@@ -129,12 +131,40 @@ fn split_type(kind: u64) -> Result<(u32, u32), Errno> {
 }
 
 /// Makes a socket of the family `domain`.
-fn new_socket(domain: u64, kind: u32, protocol: u64) -> Result<Arc<Unix>, Errno> {
-    if domain != u64::from(AF_UNIX) {
-        return Err(Errno::EAFNOSUPPORT);
+fn new_socket(
+    cx: &Cx<'_>,
+    domain: u64,
+    kind: u32,
+    protocol: u64,
+) -> Result<Arc<dyn Socket>, Errno> {
+    match u32::try_from(domain).unwrap_or(u32::MAX) {
+        AF_UNIX => {
+            let protocol = u32::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
+            rk_net_unix::check_protocol(protocol)?;
+            Ok(Unix::new(kind)?)
+        }
+        AF_INET => {
+            // A protocol below 0 or past `IPPROTO_MAX` gives `EINVAL`, as `inet_create` of Linux.
+            let protocol = u32::try_from(protocol as i32).map_err(|_| Errno::EINVAL)?;
+            let proto = rk_net_inet::classify(kind, protocol)?;
+            let process = cx.process();
+            let cred = process.cred();
+            match proto {
+                InetProto::Raw(_) if !cred.capable(cap::NET_RAW) => return Err(Errno::EPERM),
+                // An echo socket needs a group in `net.ipv4.ping_group_range`, as
+                // `ping_init_sock` of Linux.
+                InetProto::Ping => {
+                    let groups = core::iter::once(cred.egid).chain(cred.groups.iter().copied());
+                    if !rk_net::sysctl::ping_group_allowed(groups) {
+                        return Err(Errno::EACCES);
+                    }
+                }
+                _ => {}
+            }
+            Ok(rk_net_inet::Dgram::new(proto))
+        }
+        _ => Err(Errno::EAFNOSUPPORT),
     }
-    rk_net_unix::check_protocol(u32::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?)?;
-    Unix::new(kind)
 }
 
 /// Adds the file of `sock` to the descriptor table.
@@ -145,7 +175,7 @@ fn install(cx: &Cx<'_>, sock: Arc<dyn Socket>, flags: u32) -> Result<i32, Errno>
 
 pub(crate) fn socket_call(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64) -> SysResult {
     let (kind, flags) = split_type(kind)?;
-    let sock = new_socket(domain, kind, protocol)?;
+    let sock = new_socket(cx, domain, kind, protocol)?;
     Ok(install(cx, sock, flags)? as u64)
 }
 
@@ -209,6 +239,15 @@ fn write_addr(cx: &Cx<'_>, addr: u64, lenp: u64, value: &[u8]) -> Result<(), Err
 pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let (_, sock) = socket(cx, fd)?;
     let addr = read_addr(cx, addr, len)?;
+    // A UDP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and its
+    // sysctl `net.ipv4.ip_unprivileged_port_start`.
+    if sock.family() == AF_INET
+        && sock.protocol() == IPPROTO_UDP
+        && rk_net_inet::sockaddr::port_of(&addr).is_some_and(|p| p != 0 && p < 1024)
+        && !cx.process().cred().capable(cap::NET_BIND_SERVICE)
+    {
+        return Err(Errno::EACCES);
+    }
     sock.bind(&Paths { cx }, &addr)?;
     Ok(0)
 }
