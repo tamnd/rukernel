@@ -79,6 +79,9 @@ pub(crate) struct Options {
     /// The option `index`: a copy up of a lower hard link puts the upper file in the index
     /// directory, so the other names of the lower inode find it.
     pub(crate) index: bool,
+    /// The option `nfs_export`: `name_to_handle_at` gives file handles of the overlay, and
+    /// `open_by_handle_at` finds the files of these handles. It needs the option `index`.
+    pub(crate) nfs_export: bool,
 }
 
 impl Options {
@@ -86,13 +89,14 @@ impl Options {
     /// Linux. A comma separates the options. In `lowerdir=`, a colon separates the lower
     /// directories, and two colons put the data-only directories after them. A backslash before
     /// a comma or a colon makes it a part of the path. The values of `lowerdir+=` and `datadir+=`
-    /// are paths without escapes. Linux ignores other options, such as `nfs_export=off`, when it
-    /// does not have the feature, and so does this file system.
+    /// are paths without escapes. Linux ignores other options, such as `xino=off`, when it does
+    /// not have the feature, and so does this file system.
     pub(crate) fn parse(data: &[u8]) -> Result<Options> {
         let mut out = Options::default();
         // The option `lowerdir=` was given. Then `lowerdir+=` and `datadir+=` are not valid.
         let mut lowerdir = false;
         let (mut set_redirect, mut set_metacopy) = (false, false);
+        let (mut set_index, mut set_nfs_export) = (false, false);
         for opt in split_escaped(data, b',') {
             let (key, value) = match opt.iter().position(|&b| b == b'=') {
                 Some(i) => (&opt[..i], Some(&opt[i + 1..])),
@@ -134,7 +138,14 @@ impl Options {
                     out.metacopy = on_off(v)?;
                     set_metacopy = true;
                 }
-                (b"index", Some(v)) => out.index = on_off(v)?,
+                (b"index", Some(v)) => {
+                    out.index = on_off(v)?;
+                    set_index = true;
+                }
+                (b"nfs_export", Some(v)) => {
+                    out.nfs_export = on_off(v)?;
+                    set_nfs_export = true;
+                }
                 (b"uuid", Some(v)) => {
                     out.uuid = match v {
                         b"on" => Uuid::On,
@@ -164,6 +175,36 @@ impl Options {
                 out.metacopy = false;
             } else {
                 out.redirect = Redirect::On;
+            }
+        }
+        // The index is kept in the work directory, so a mount without an upper directory has
+        // none.
+        if out.upper.is_none() {
+            out.index = false;
+            set_index = false;
+        }
+        // The decode of a file handle needs the index. A mount without an upper directory has
+        // no index, so it needs lower layers without redirects.
+        if out.nfs_export && !out.index {
+            if out.upper.is_none() && out.redirect != Redirect::NoFollow {
+                out.nfs_export = false;
+            } else if set_nfs_export && set_index {
+                return Err(Errno::EINVAL);
+            } else if set_index {
+                out.nfs_export = false;
+            } else {
+                out.index = out.upper.is_some();
+            }
+        }
+        // A metacopy file has no entry in the index, so a decode cannot find its upper inode.
+        if out.nfs_export && out.metacopy {
+            if set_nfs_export && set_metacopy {
+                return Err(Errno::EINVAL);
+            }
+            if set_metacopy {
+                out.nfs_export = false;
+            } else {
+                out.metacopy = false;
             }
         }
         // The uuid is kept in the upper root.
@@ -244,6 +285,9 @@ impl Options {
         if self.uuid != Uuid::Auto {
             out.extend_from_slice(b",uuid=");
             out.extend_from_slice(self.uuid.name());
+        }
+        if self.nfs_export {
+            out.extend_from_slice(b",nfs_export=on");
         }
         if self.metacopy {
             out.extend_from_slice(b",metacopy=on");

@@ -700,3 +700,119 @@ fn a_directory_without_moved_names_loses_the_impure_attribute() {
     names(&dir);
     assert_eq!(real.get_xattr(b"trusted.overlay.impure").err(), Some(Errno::ENODATA));
 }
+
+#[test]
+fn a_user_file_handle_has_the_format_of_linux() {
+    let fh = encode_fh(&rk_fs_tmpfs::new(0o755)).unwrap();
+    let words = fh_to_words(&fh);
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    // Three bytes of padding come before the handle, and zeros after it.
+    assert_eq!(bytes.len(), (fh.len() + 3).next_multiple_of(4));
+    assert_eq!(bytes[..3], [0, 0, 0]);
+    assert_eq!(bytes[3..3 + fh.len()], fh[..]);
+    assert!(bytes[3 + fh.len()..].iter().all(|&b| b == 0));
+    assert_eq!(words_to_fh(FILEID_V1, &words).as_deref(), Some(&fh[..]));
+    // The old type has no padding before the handle.
+    let mut old = fh.clone();
+    old.resize(fh.len().next_multiple_of(4), 0);
+    let old: Vec<u32> = old.as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)).collect();
+    assert_eq!(words_to_fh(FILEID_V0, &old).as_deref(), Some(&fh[..]));
+    // A short handle, a handle of another type and a handle of another byte order fail.
+    assert_eq!(words_to_fh(FILEID_V1, &[]), None);
+    assert_eq!(words_to_fh(FILEID_V0, &old[..1]), None);
+    assert_eq!(words_to_fh(FILEID_V1, &words[..words.len() - 1]), None);
+    assert_eq!(words_to_fh(1, &words), None);
+    let flagged = |flags: u8| {
+        let mut fh = fh.clone();
+        fh[3] = flags;
+        words_to_fh(FILEID_V1, &fh_to_words(&fh))
+    };
+    assert_eq!(flagged(1), None);
+    assert_eq!(flagged(8), None);
+    assert!(flagged(3).is_some());
+    assert!(flagged(FH_UPPER).is_some());
+}
+
+#[test]
+fn the_option_nfs_export_needs_the_index_and_no_metacopy() {
+    let parse = |data: &[u8]| Options::parse(data).map(|o| (o.nfs_export, o.index, o.metacopy));
+    let upper = b"lowerdir=/l,upperdir=/u,workdir=/w,";
+    let with = |opts: &[u8]| parse(&[&upper[..], opts].concat());
+    assert_eq!(with(b"nfs_export=on"), Ok((true, true, false)));
+    assert_eq!(with(b"nfs_export=on,index=off"), Err(Errno::EINVAL));
+    assert_eq!(with(b"index=off,nfs_export=on"), Err(Errno::EINVAL));
+    assert_eq!(with(b"nfs_export=on,metacopy=on"), Err(Errno::EINVAL));
+    assert_eq!(with(b"nfs_export=off,index=off"), Ok((false, false, false)));
+    // A mount without an upper directory has no index, and needs a lookup without redirects.
+    assert_eq!(parse(b"lowerdir=/l,nfs_export=on"), Ok((false, false, false)));
+    let lower = b"lowerdir=/l,redirect_dir=nofollow,nfs_export=on";
+    assert_eq!(parse(lower), Ok((true, false, false)));
+    let show = Options::parse(&[&upper[..], b"nfs_export=on,uuid=off"].concat()).unwrap().show();
+    assert_eq!(show, b",lowerdir=/l,upperdir=/u,workdir=/w,index=on,uuid=off,nfs_export=on");
+}
+
+/// Gives the file handle of `inode` for a user, and checks its type.
+fn user_handle(inode: &InodeRef) -> Vec<u32> {
+    let (ty, words) = inode.file_handle().unwrap();
+    assert_eq!(ty, FILEID_V1);
+    words
+}
+
+#[test]
+fn a_file_handle_finds_the_file_after_a_new_mount() {
+    let [lower, upper, work, data] = layers();
+    let dirs = [&lower, &upper, &work, &data];
+    let plain = mount_layers(dirs, b"lowerdir=/l,upperdir=/u,workdir=/w").unwrap();
+    assert_eq!(plain.file_handle(), None);
+    drop(plain);
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,nfs_export=on";
+    let root = mount_layers(dirs, opts).unwrap();
+    let a = root.lookup(b"a").unwrap();
+    let c = root.create(b"c", FileType::Regular, 0o644, 0).unwrap();
+    c.write_at(0, b"upper c").unwrap();
+    let (root_fh, a_fh, c_fh) = (user_handle(&root), user_handle(&a), user_handle(&c));
+    let index = work.lookup(INDEX).unwrap();
+    drop((a, c));
+    drop(root);
+    let root = mount_layers(dirs, opts).unwrap();
+    assert!(same_inode(&root.inode_by_handle(FILEID_V1, &root_fh).unwrap(), &root));
+    assert_eq!(read(&root.inode_by_handle(FILEID_V1, &c_fh).unwrap()), b"upper c");
+    // A lower file without a parent goes only to the index on a change.
+    let a = root.inode_by_handle(FILEID_V1, &a_fh).unwrap();
+    assert_eq!(a.metadata().ino, root.lookup(b"a").unwrap().metadata().ino);
+    a.write_at(0, b"LOWER").unwrap();
+    assert_eq!(upper.lookup(b"a").err(), Some(Errno::ENOENT));
+    let name = index_name(&lower.lookup(b"a").unwrap()).unwrap();
+    assert_eq!(read(&index.lookup(&name).unwrap()), b"LOWER a");
+    assert_eq!(read(&root.lookup(b"a").unwrap()), b"LOWER a");
+    assert_eq!(root.lookup(b"a").unwrap().metadata().nlink, 1);
+    // The removal of the last name makes the entry a whiteout, so the handle is stale.
+    drop(a);
+    root.unlink(b"a").unwrap();
+    assert!(is_whiteout(&index.lookup(&name).unwrap()));
+    assert_eq!(root.inode_by_handle(FILEID_V1, &a_fh).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(FILEID_V0, &a_fh).err(), Some(Errno::ESTALE));
+}
+
+#[test]
+fn a_copy_up_of_a_directory_makes_an_entry_in_the_index() {
+    let [lower, upper, work, data] = layers();
+    let opts = b"lowerdir=/l,upperdir=/u,workdir=/w,nfs_export=on";
+    let root = mount_layers([&lower, &upper, &work, &data], opts).unwrap();
+    let d = root.lookup(b"d").unwrap();
+    d.unlink(b"x").unwrap();
+    let index = work.lookup(INDEX).unwrap();
+    let name = index_name(&lower.lookup(b"d").unwrap()).unwrap();
+    let entry = index.lookup(&name).unwrap();
+    assert!(entry.metadata().is_dir());
+    let fh = encode_fh(&upper.lookup(b"d").unwrap()).unwrap();
+    assert_eq!(entry.get_xattr(b"trusted.overlay.upper"), Ok(fh));
+    // The handle of an indexed directory is the handle of the lower directory.
+    let words = user_handle(&d);
+    let lower_fh = encode_fh(&lower.lookup(b"d").unwrap()).unwrap();
+    assert_eq!(words_to_fh(FILEID_V1, &words), Some(lower_fh));
+    drop(d);
+    root.rmdir(b"d").unwrap();
+    assert!(is_whiteout(&index.lookup(&name).unwrap()));
+    assert_eq!(root.inode_by_handle(FILEID_V1, &words).err(), Some(Errno::ESTALE));
+}
