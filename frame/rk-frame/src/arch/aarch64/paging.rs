@@ -578,6 +578,79 @@ pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
     }
 }
 
+/// The size of a block at level 2.
+const BLOCK_SIZE: usize = 2 << 20;
+
+/// Maps the 2 MiB block at `phys` at `virt` in `root` with one level 2 block descriptor. Gives the
+/// physical address of a level 3 table that `user_split_huge` and `user_unmap_huge` use later. If
+/// the range has a level 3 table already, it is that table, else it is a new one. Gives `Err` if
+/// no frame is free for a table. The caller makes sure that `virt` and `phys` are 2 MiB aligned
+/// and that no 4 KiB page is mapped in the range.
+pub(crate) fn user_map_huge(root: u64, virt: usize, phys: u64, prot: UserProt) -> Result<u64, ()> {
+    assert!(virt + BLOCK_SIZE <= USER_END, "{virt:#x} is not in the user half");
+    let e = walk(root, 0, 2, virt, &mut alloc_table_frame).ok_or(())?;
+    let old = e.load(Ordering::Relaxed);
+    let table = if old & VALID != 0 {
+        assert!(old & TABLE != 0, "a huge page is mapped at {virt:#x} already");
+        old & ADDR_MASK
+    } else {
+        alloc_table_frame().ok_or(())?
+    };
+    let flags = user_flags(prot.0, prot.1, prot.2);
+    assert!(flags & VALID != 0, "a huge page must allow an access");
+    if prot.2 {
+        for i in 0..BLOCK_SIZE / 4096 {
+            sync_icache(phys + (i * 4096) as u64);
+        }
+    }
+    // Break before make: the walker must not see the table and the block at the same time.
+    e.store(0, Ordering::Relaxed);
+    flush_user(virt);
+    e.store(phys | (flags & !TABLE), Ordering::Relaxed);
+    flush_user(virt);
+    Ok(table)
+}
+
+/// Gives the level 2 entry of the block at `virt` in `root`.
+fn user_block(root: u64, virt: usize) -> &'static AtomicU64 {
+    let e = walk(root, 0, 2, virt, &mut || None);
+    let e = e.unwrap_or_else(|| panic!("no huge page is mapped at {virt:#x}"));
+    let value = e.load(Ordering::Relaxed);
+    assert!(value & VALID != 0 && value & TABLE == 0, "no huge page is mapped at {virt:#x}");
+    e
+}
+
+/// Changes the block at `virt` in `root` to 512 pages of 4 KiB with the same frames and
+/// permissions. `table` is the table that `user_map_huge` gave.
+pub(crate) fn user_split_huge(root: u64, virt: usize, table: u64) {
+    let e = user_block(root, virt);
+    let value = e.load(Ordering::Relaxed);
+    let phys = value & ADDR_MASK;
+    let flags = (value & !ADDR_MASK) | TABLE;
+    for i in 0..512 {
+        entry(table, i).store((phys + (i * 4096) as u64) | flags, Ordering::Relaxed);
+    }
+    e.store(0, Ordering::Relaxed);
+    flush_user(virt);
+    sync_tables();
+    e.store(table | VALID | TABLE, Ordering::Relaxed);
+    flush_user(virt);
+}
+
+/// Removes the block at `virt` in `root`. `table` is the table that `user_map_huge` gave. It
+/// becomes an empty level 3 table of `root`, so `free_user_root` frees it.
+pub(crate) fn user_unmap_huge(root: u64, virt: usize, table: u64) {
+    let e = user_block(root, virt);
+    e.store(0, Ordering::Relaxed);
+    flush_user(virt);
+    for i in 0..512 {
+        entry(table, i).store(0, Ordering::Relaxed);
+    }
+    sync_tables();
+    e.store(table | VALID | TABLE, Ordering::Relaxed);
+    flush_user(virt);
+}
+
 /// Loads `root` in TTBR0. A value of 0 loads the empty table.
 pub(crate) fn activate(root: u64) {
     if active().swap(root, Ordering::AcqRel) == root {

@@ -143,6 +143,8 @@ fn page_fault(
         Ok(()) => None,
         // The OOM killer of a memory cgroup frees memory, and the fault tries again.
         Err(Errno::ENOMEM) if rk_proc::cgroup::memcg_oom(thread) => None,
+        // The OOM killer of the system frees memory, and the fault tries again.
+        Err(Errno::ENOMEM) if rk_proc::cgroup::system_oom(thread) => None,
         Err(Errno::EFAULT | Errno::ENOMEM) => segv(),
         Err(_) => Some(SigInfo::fault(SIGBUS, BUS_ADRERR, addr)),
     }

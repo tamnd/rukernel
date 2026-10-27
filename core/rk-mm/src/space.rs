@@ -4,16 +4,19 @@
 //! first access, in `handle_fault`. A private page that two address spaces share after `fork` is
 //! read only in both, and the first write copies it. This is copy on write.
 
-use crate::vma::{Backing, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up};
+use crate::tunables::{self, OVERCOMMIT_NEVER, ThpMode};
+use crate::vma::{
+    Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up,
+};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
-use rk_frame::mm::{Frame, alloc_zeroed_frame};
+use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
 use rk_frame::sync::SpinLock;
-use rk_frame::vm::{MapError, PageProt, USER_END, UserFault, VmSpace};
+use rk_frame::vm::{HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
 
 pub(crate) mod ksmd;
 
@@ -94,8 +97,6 @@ pub const STACK_SIZE: usize = 8 << 20;
 /// The free bytes that an area that grows down keeps to the area below it. Linux names it
 /// `stack_guard_gap`, and its default is 256 pages.
 const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
-/// The most areas that an address space can have. Linux names it `vm.max_map_count`.
-pub const MAX_MAP_COUNT: usize = 65530;
 /// The range for `MAP_32BIT`, as in Linux on x86-64.
 const LOW32: (usize, usize) = (0x4000_0000, 0x8000_0000);
 /// The top of the `mmap` area. Linux puts it a gap of 128 MiB below the stack.
@@ -141,6 +142,8 @@ pub struct MmapRequest {
     pub file: Option<(FileRef, u64)>,
     /// What the area is for.
     pub kind: VmaKind,
+    /// `MAP_NORESERVE`: the pages are not in the commit count, but with `vm.overcommit_memory` 2.
+    pub noreserve: bool,
 }
 
 impl MmapRequest {
@@ -160,6 +163,7 @@ impl MmapRequest {
             grows_down: false,
             file: None,
             kind: VmaKind::Normal,
+            noreserve: false,
         }
     }
 }
@@ -226,7 +230,33 @@ impl Drop for AddressSpace {
         for vma in st.vmas.iter() {
             let _ = write_back(vma, vma.start, vma.end);
         }
+        uncharge_commit(accounted(st.vmas.iter()));
     }
+}
+
+/// The pages of memory.
+fn total_pages() -> usize {
+    frame_stats().total
+}
+
+/// Adds `len` bytes to the commit count, or gives `ENOMEM` if the overcommit policy does not
+/// allow it.
+fn charge_commit(len: usize) -> Result<(), Errno> {
+    if len == 0 || tunables::charge(len / PAGE_SIZE, total_pages()) {
+        Ok(())
+    } else {
+        Err(Errno::ENOMEM)
+    }
+}
+
+/// Removes `len` bytes from the commit count.
+fn uncharge_commit(len: usize) {
+    tunables::uncharge(len / PAGE_SIZE);
+}
+
+/// The bytes of the areas that are in the commit count.
+fn accounted<'a>(vmas: impl Iterator<Item = &'a Vma<FileRef>>) -> usize {
+    vmas.filter(|v| v.account).map(Vma::len).sum()
 }
 
 impl AddressSpace {
@@ -318,12 +348,12 @@ impl AddressSpace {
                 }
                 self.unmap_locked(&mut st, req.addr, req.addr + len);
             }
-            if st.vmas.len() >= MAX_MAP_COUNT {
+            if st.vmas.len() > tunables::max_map_count() {
                 return Err(Errno::ENOMEM);
             }
             req.addr
         } else {
-            if st.vmas.len() >= MAX_MAP_COUNT {
+            if st.vmas.len() > tunables::max_map_count() {
                 return Err(Errno::ENOMEM);
             }
             let (bottom, top) = if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, MMAP_TOP) };
@@ -335,6 +365,13 @@ impl AddressSpace {
                 && !st.vmas.overlaps(hint, hint + len);
             if hint_ok { hint } else { st.vmas.find_gap(len, bottom, top).ok_or(Errno::ENOMEM)? }
         };
+        // As `accountable_mapping` of Linux: a private writable area and a shared anonymous area
+        // are in the commit count. `MAP_NORESERVE` has no effect with `vm.overcommit_memory` 2.
+        let account = !(req.noreserve && tunables::overcommit_memory() != OVERCOMMIT_NEVER)
+            && if req.shared { req.file.is_none() } else { req.prot.write };
+        if account {
+            charge_commit(len)?;
+        }
         let backing = match req.file {
             Some((file, offset)) => Backing::File { file, offset },
             None if req.shared => {
@@ -353,6 +390,8 @@ impl AddressSpace {
             locked,
             grows_down: req.grows_down,
             mergeable: false,
+            huge: HugeAdvice::None,
+            account,
             backing,
             kind: req.kind,
         });
@@ -367,8 +406,9 @@ impl AddressSpace {
 
     fn unmap_locked(&self, st: &mut State, start: usize, end: usize) {
         for vma in st.vmas.remove_range(start, end) {
-            for page in self.vm.mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end)) {
-                self.vm.unmap(page);
+            self.vm.unmap_range(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
+            if vma.account {
+                uncharge_commit(vma.len());
             }
             // munmap has no error for a failed write back, as on Linux.
             let _ = write_back(&vma, vma.start, vma.end);
@@ -415,7 +455,7 @@ impl AddressSpace {
             .filter(|&e| len != 0 && is_page_aligned(addr) && e <= USER_END)
             .ok_or(Errno::EINVAL)?;
         let mut st = self.state.lock();
-        if st.vmas.len() >= MAX_MAP_COUNT
+        if st.vmas.len() >= tunables::max_map_count()
             && st.vmas.find(addr).is_some_and(|vma| vma.start < addr && end < vma.end)
         {
             return Err(Errno::ENOMEM);
@@ -549,7 +589,7 @@ impl AddressSpace {
 
     /// The number of pages in `start..end` that have a frame.
     pub fn resident_pages(&self, start: usize, end: usize) -> usize {
-        self.vm.mapped_pages(VirtAddr::new(start), VirtAddr::new(end)).len()
+        self.vm.pages_in(VirtAddr::new(start), VirtAddr::new(end))
     }
 
     /// Gives one byte for each page of `addr..addr + len`: 1 if the page has a frame, else 0.
@@ -618,6 +658,9 @@ impl AddressSpace {
             && end == addr + old_len
             && !st.vmas.overlaps(end, new_end)
         {
+            if st.vmas.find(addr).is_some_and(|v| v.account) {
+                charge_commit(new_len - old_len)?;
+            }
             st.vmas.update_range(addr, end, |vma| vma.end = new_end);
             return Ok(addr);
         }
@@ -652,6 +695,15 @@ impl AddressSpace {
         to: usize,
         dont_unmap: bool,
     ) -> Result<usize, Errno> {
+        // The new area is in the commit count, and the old area stays in it if it stays.
+        if st.vmas.find(addr).is_some_and(|v| v.account) {
+            let removed = if old_len == 0 || dont_unmap { 0 } else { old_len };
+            if new_len > removed {
+                charge_commit(new_len - removed)?;
+            } else {
+                uncharge_commit(removed - new_len);
+            }
+        }
         let mut vma = match st.vmas.find(addr) {
             Some(v) if old_len == 0 => {
                 let mut copy = v.clone();
@@ -701,7 +753,20 @@ impl AddressSpace {
         if prot.write && st.vmas.iter().any(|v| v.start < end && addr < v.end && !v.may_write) {
             return Err(Errno::EACCES);
         }
-        st.vmas.update_range(addr, end, |vma| vma.prot = prot);
+        // A private area that gets write access goes in the commit count, as in Linux.
+        if prot.write {
+            let more: usize = st
+                .vmas
+                .iter()
+                .filter(|v| v.start < end && addr < v.end && !v.shared && !v.account)
+                .map(|v| v.end.min(end) - v.start.max(addr))
+                .sum();
+            charge_commit(more)?;
+        }
+        st.vmas.update_range(addr, end, |vma| {
+            vma.prot = prot;
+            vma.account |= prot.write && !vma.shared;
+        });
         for page in self.vm.mapped_pages(VirtAddr::new(addr), VirtAddr::new(end)) {
             let Some(vma) = st.vmas.find(page.get()) else { continue };
             // A private page that gets write access stays read only, and the next write fault
@@ -722,11 +787,12 @@ impl AddressSpace {
             return st.brk;
         }
         if new_end > old_end {
-            if st.vmas.overlaps(old_end, new_end) {
+            if st.vmas.overlaps(old_end, new_end) || charge_commit(new_end - old_end).is_err() {
                 return st.brk;
             }
             let mut vma = Vma::anon(old_end, new_end, Prot::RW, VmaKind::Heap);
             vma.locked = st.lock_future;
+            vma.account = true;
             st.vmas.insert_merged(vma);
         } else if new_end < old_end {
             self.unmap_locked(&mut st, new_end, old_end);
@@ -763,6 +829,8 @@ impl AddressSpace {
         let at = VirtAddr::new(page);
         let write = access == Access::Write;
         match self.vm.page(at) {
+            // The first write to a range of an anonymous area can get a huge page.
+            None if write && self.map_huge(vma, page) => Ok(()),
             None => {
                 let (frame, exclusive) = match &vma.backing {
                     Backing::Anon => (anon_frame(self.memcg())?, true),
@@ -813,6 +881,72 @@ impl AddressSpace {
         }
     }
 
+    /// Maps a huge page at the 2 MiB range of `page`, if the policy and the area allow it. The
+    /// area is private anonymous memory that KSM does not merge, the range is all in the area, and
+    /// no page of the range has a frame. Gives `false` if the page needs a 4 KiB frame.
+    fn map_huge(&self, vma: &Vma<FileRef>, page: usize) -> bool {
+        let allowed = match tunables::thp_enabled() {
+            ThpMode::Always => vma.huge != HugeAdvice::NoHuge,
+            ThpMode::Madvise => vma.huge == HugeAdvice::Huge,
+            ThpMode::Never => false,
+        };
+        let block = page & !(HUGE_PAGE_SIZE - 1);
+        // A memory cgroup charges each page, so its pages stay 4 KiB pages. KSM merges 4 KiB
+        // pages, so a mergeable area also gets 4 KiB pages, and `ksmd` does not split blocks.
+        if !allowed
+            || vma.mergeable
+            || self.ksm_any()
+            || vma.shared
+            || !matches!(vma.backing, Backing::Anon)
+            || block < vma.start
+            || block + HUGE_PAGE_SIZE > vma.end
+            || self.memcg() != 0
+        {
+            return false;
+        }
+        let range = (VirtAddr::new(block), VirtAddr::new(block + HUGE_PAGE_SIZE));
+        if self.vm.pages_in(range.0, range.1) != 0 {
+            return false;
+        }
+        let stats = frame_stats();
+        if stats.free < HUGE_FRAMES + tunables::reserve_pages(stats.total) {
+            return false;
+        }
+        let Some(frames) = alloc_huge_frames() else { return false };
+        let frames = frames.into_iter().map(Arc::new).collect();
+        self.vm.map_huge(range.0, frames, page_prot(vma, true)).is_ok()
+    }
+
+    /// Sets the advice for huge pages of the areas in `addr..addr + len`, for `MADV_HUGEPAGE`
+    /// and `MADV_NOHUGEPAGE`. The pages that the areas have do not change.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped.
+    pub fn set_huge_advice(
+        &self,
+        addr: usize,
+        len: usize,
+        advice: HugeAdvice,
+    ) -> Result<(), Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        let mut st = self.state.lock();
+        if !st.vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        st.vmas.update_range(start, end, |vma| vma.huge = advice);
+        Ok(())
+    }
+
+    /// Removes the frames of the pages in `addr..addr + len`, for `MADV_DONTNEED`. The next
+    /// access to a page of anonymous memory gives zeros, and the next access to a page of a file
+    /// gives the page of the file again.
+    pub fn discard(&self, addr: usize, len: usize) {
+        let Ok((start, end)) = Self::lock_range(addr, len) else { return };
+        let _st = self.state.lock();
+        self.vm.unmap_range(VirtAddr::new(start), VirtAddr::new(end));
+    }
+
     /// Makes the address space of a child of `fork`. A shared area maps the same frames. A
     /// private area maps the same frames read only in both address spaces, so the first write in
     /// either one copies the page.
@@ -837,9 +971,15 @@ impl AddressSpace {
                 child.vm.map(page, frame, prot).map_err(map_error)?;
             }
         }
+        // The private areas of the child go in the commit count. The memory of a shared area is
+        // in the count one time.
+        charge_commit(accounted(st.vmas.iter().filter(|v| !v.shared)))?;
         // The child does not get the locks of the parent, as on Linux.
         let mut vmas = st.vmas.clone();
-        vmas.update_range(0, USER_END, |vma| vma.locked = false);
+        vmas.update_range(0, USER_END, |vma| {
+            vma.locked = false;
+            vma.account &= !vma.shared;
+        });
         *child.state.lock() =
             State { vmas, brk_start: st.brk_start, brk: st.brk, lock_future: false };
         Ok(child)
@@ -1057,13 +1197,21 @@ fn charged(frame: Option<Frame>, memcg: u32) -> Result<Arc<Frame>, Errno> {
     Ok(Arc::new(frame))
 }
 
+/// Tells if user memory can take a frame now.
+fn above_reserve() -> Result<(), Errno> {
+    let stats = frame_stats();
+    if stats.free > tunables::reserve_pages(stats.total) { Ok(()) } else { Err(Errno::ENOMEM) }
+}
+
 /// A new anonymous page with zeros, charged to the memory cgroup `memcg`.
 fn anon_frame(memcg: u32) -> Result<Arc<Frame>, Errno> {
+    above_reserve()?;
     charged(alloc_zeroed_frame(), memcg)
 }
 
 /// A copy of `from` for copy on write, charged to the memory cgroup `memcg`.
 fn copy_frame(from: &Frame, memcg: u32) -> Result<Arc<Frame>, Errno> {
+    above_reserve()?;
     let frame = charged(rk_frame::mm::alloc_frame(), memcg)?;
     frame.copy_from(from);
     Ok(frame)

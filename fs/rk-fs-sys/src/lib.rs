@@ -14,6 +14,10 @@
 //!   online resize of `resize2fs` reads `meta_bg_resize`.
 //! - `/sys/kernel/mm/ksm` has the files of Kernel Samepage Merging. A write to some of them
 //!   changes the settings of KSM.
+//! - `/sys/kernel/mm/transparent_hugepage` has the policy for huge pages. `enabled` and `defrag`
+//!   take a write, as in Linux. The kernel has no hugetlbfs, so `/sys/kernel/mm/hugepages` is
+//!   not there, as in Linux without `CONFIG_HUGETLBFS`. LTP looks for that directory to know if
+//!   it can mount hugetlbfs.
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
 //!   `statistics`. `/sys/class/net/NAME` is a link to it.
@@ -49,14 +53,48 @@ pub const SYSFS_MAGIC: u64 = 0x6265_6572;
 /// The file system type of sysfs, for `mount -t sysfs`.
 pub const FS_TYPE: FsType = FsType { name: "sysfs", nodev: true, make: mount };
 
-/// The directories at the top of sysfs. Only `block`, `class`, `dev`, `devices`, `fs` and
-/// `kernel` have entries.
+/// The directories at the top of sysfs. Only `block`, `class`, `dev`, `devices`, `fs` and `kernel`
+/// have entries.
 const TOP: [&str; 10] =
     ["block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power"];
 
 /// The files of `/sys/fs/ext4/features`, as Linux. `resize2fs` grows a mounted file system past
 /// its reserved descriptor blocks only if `meta_bg_resize` is there.
 const EXT4_FEATURES: [&str; 1] = ["meta_bg_resize"];
+
+/// The size of a huge page that one PMD entry maps, `HPAGE_PMD_SIZE` of Linux.
+const HPAGE_PMD_SIZE: usize = 2 << 20;
+
+/// The path of the directory of the policy for transparent huge pages.
+const THP_DIR: &str = "kernel/mm/transparent_hugepage";
+
+/// The files of `/sys/kernel/mm/transparent_hugepage`, with their text.
+fn thp_entries() -> Vec<(String, Kind)> {
+    let file = |name: &str, text: String| (String::from(name), Kind::File(text.into_bytes()));
+    Vec::from([
+        file("defrag", rk_mm::tunables::show_thp_defrag()),
+        file("enabled", rk_mm::tunables::show_thp_enabled()),
+        file("hpage_pmd_size", format!("{HPAGE_PMD_SIZE}\n")),
+        file("shmem_enabled", String::from("always within_size advise [never] deny force\n")),
+        file("use_zero_page", String::from("1\n")),
+    ])
+}
+
+/// Writes the file at `path`, if it is a file that takes a write. Gives `EACCES` for a file that
+/// does not take a write, and `EINVAL` for a value that the file does not know.
+fn write_file(path: &str, text: &[u8]) -> Result<()> {
+    let set = match path.strip_prefix(THP_DIR) {
+        Some("/enabled") => rk_mm::tunables::set_thp_enabled,
+        Some("/defrag") => rk_mm::tunables::set_thp_defrag,
+        _ => return Err(Errno::EACCES),
+    };
+    set(text).ok_or(Errno::EINVAL)
+}
+
+/// Tells if the file at `path` takes a write.
+fn writable(path: &str) -> bool {
+    path.strip_prefix(THP_DIR).is_some_and(|f| f == "/enabled" || f == "/defrag")
+}
 
 /// The block size that `stat` gives for a sysfs file, as Linux gives.
 const BLOCK_SIZE: u32 = 4096;
@@ -284,6 +322,7 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
             .map(|&n| (String::from(n), Kind::File(b"supported\n".to_vec())))
             .collect(),
         ["kernel"] => dirs(&mut ["mm"].into_iter()),
+        ["kernel", "mm", "transparent_hugepage"] => thp_entries(),
         ["kernel", "mm", ref rest @ ..] => mm::entries(rest)?,
         [top] if TOP.contains(&top) => Vec::new(),
         _ => return None,
@@ -315,6 +354,7 @@ impl Inode for Node {
     fn metadata(&self) -> Metadata {
         let (kind, perm, nlink, size) = match &self.kind {
             Kind::Dir => (mode::S_IFDIR, 0o755, 2, 0),
+            Kind::File(_) if writable(&self.path) => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
             Kind::File(_) | Kind::Ksm { writable: false } => {
                 (mode::S_IFREG, 0o444, 1, BLOCK_SIZE as u64)
             }
@@ -363,7 +403,8 @@ impl Inode for Node {
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
         match self.kind {
             Kind::Ksm { writable: true } => mm::write(&self.path, buf),
-            Kind::File(_) | Kind::Ksm { .. } => Err(Errno::EACCES),
+            Kind::File(_) => write_file(&self.path, buf).map(|()| buf.len()),
+            Kind::Ksm { .. } => Err(Errno::EACCES),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -531,7 +572,7 @@ mod tests {
     #[test]
     fn ksm_has_the_files_of_linux() {
         assert_eq!(names("kernel"), ["mm"]);
-        assert_eq!(names("kernel/mm"), ["ksm"]);
+        assert_eq!(names("kernel/mm"), ["ksm", "transparent_hugepage"]);
         let files = names("kernel/mm/ksm");
         for f in ["run", "pages_to_scan", "sleep_millisecs", "full_scans", "pages_shared"] {
             assert!(files.contains(&String::from(f)), "{f}");
@@ -550,6 +591,20 @@ mod tests {
             kind: Kind::Ksm { writable: false },
         };
         assert_eq!(shared.write_at(0, b"1").unwrap_err(), Errno::EACCES);
+    }
+
+    #[test]
+    fn the_policy_for_huge_pages_takes_a_write() {
+        assert_eq!(
+            get("kernel/mm/transparent_hugepage/hpage_pmd_size"),
+            Kind::File(b"2097152\n".to_vec())
+        );
+        let enabled = Node { path: format!("{THP_DIR}/enabled"), kind: Kind::File(Vec::new()) };
+        assert_eq!(enabled.metadata().mode, mode::S_IFREG | 0o644);
+        assert_eq!(enabled.write_at(0, b"sometimes\n").unwrap_err(), Errno::EINVAL);
+        assert_eq!(enabled.write_at(0, b"madvise\n").unwrap(), 8);
+        assert_eq!(rk_mm::tunables::show_thp_enabled(), "always [madvise] never\n");
+        enabled.write_at(0, b"always").unwrap();
     }
 
     #[test]

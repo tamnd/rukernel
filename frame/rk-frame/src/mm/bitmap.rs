@@ -71,6 +71,20 @@ impl<const WORDS: usize> FrameBitmap<WORDS> {
         Some(w * 64 + b)
     }
 
+    /// Takes `1 << order` free frames in a row, where the first frame number is a multiple of
+    /// `1 << order` and `order` is 6 or more. The search starts at the top, so that the frames
+    /// that `alloc` takes from the bottom do not break the runs. Gives the first frame.
+    pub(crate) fn alloc_run(&mut self, order: u32) -> Option<usize> {
+        let words = (1usize << order) / 64;
+        assert!(words > 0, "a run of order {order} is shorter than a word");
+        let run = (0..WORDS / words)
+            .rev()
+            .find(|&r| self.bits[r * words..(r + 1) * words].iter().all(|&w| w == u64::MAX))?;
+        self.bits[run * words..(run + 1) * words].fill(0);
+        self.free -= words * 64;
+        Some(run * words * 64)
+    }
+
     /// Gives back a frame that `alloc` gave.
     ///
     /// # Panics
@@ -156,6 +170,21 @@ mod tests {
             bm.free(f);
         }
         assert_eq!(bm.free_count(), 128);
+    }
+
+    #[test]
+    fn alloc_run_takes_an_aligned_free_run() {
+        let mut bm = FrameBitmap::<32>::new();
+        bm.add_free(100, 1100);
+        // The run at 512 is the only aligned run of 512 free frames.
+        assert_eq!(bm.alloc_run(9), Some(512));
+        assert_eq!(bm.free_count(), 1000 - 512);
+        assert_eq!(bm.alloc_run(9), None);
+        for f in 512..1024 {
+            bm.free(f);
+        }
+        assert_eq!(bm.free_count(), 1000);
+        assert_eq!(bm.alloc(), Some(100));
     }
 
     #[test]

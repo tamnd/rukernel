@@ -373,7 +373,8 @@ pub(crate) fn free_user_root(root: u64) {
         if level > 1 {
             for i in 0..512 {
                 let e = read_entry(table, i);
-                if e & PRESENT != 0 {
+                // A huge page is a frame of user memory, not a table.
+                if e & PRESENT != 0 && e & HUGE == 0 {
                     free_level(e & ADDR_MASK, level - 1);
                 }
             }
@@ -404,7 +405,7 @@ fn user_leaf(root: u64, virt: usize) -> Option<(u64, usize)> {
     let mut table = root;
     for i in [i4, i3, i2] {
         let e = read_entry(table, i);
-        if e & PRESENT == 0 {
+        if e & PRESENT == 0 || e & HUGE != 0 {
             return None;
         }
         table = e & ADDR_MASK;
@@ -448,6 +449,68 @@ pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
         write_entry(table, i, phys | user_flags(prot.0, prot.1, prot.2));
         flush_user(root, virt);
     }
+}
+
+/// Maps the 2 MiB page at `phys` at `virt` in `root` with one huge entry. Gives the physical
+/// address of a last level table that `user_split_huge` and `user_unmap_huge` use later. If the
+/// range has a last level table already, it is that table, else it is a new one. Gives `Err` if no
+/// frame is free for a table. The caller makes sure that `virt` and `phys` are 2 MiB aligned and
+/// that no 4 KiB page is mapped in the range.
+pub(crate) fn user_map_huge(root: u64, virt: usize, phys: u64, prot: UserProt) -> Result<u64, ()> {
+    assert!(virt + HUGE_SIZE as usize <= USER_END, "{virt:#x} is not in the user half");
+    let [i4, i3, i2, _] = indexes(virt);
+    let pdpt = next_table(root, i4, USER)?;
+    let pd = next_table(pdpt, i3, USER)?;
+    let e = read_entry(pd, i2);
+    let table = if e & PRESENT != 0 {
+        assert!(e & HUGE == 0, "a huge page is mapped at {virt:#x} already");
+        e & ADDR_MASK
+    } else {
+        alloc_table_frame().ok_or(())?
+    };
+    let flags = user_flags(prot.0, prot.1, prot.2);
+    assert!(flags & PRESENT != 0, "a huge page must allow an access");
+    write_entry(pd, i2, phys | flags | HUGE);
+    flush_user(root, virt);
+    Ok(table)
+}
+
+/// Gives the huge entry for `virt` in `root`, as the table, the index and the value.
+fn user_huge_entry(root: u64, virt: usize) -> (u64, usize, u64) {
+    let [i4, i3, i2, _] = indexes(virt);
+    let mut table = root;
+    for i in [i4, i3] {
+        let e = read_entry(table, i);
+        assert!(e & PRESENT != 0, "no huge page is mapped at {virt:#x}");
+        table = e & ADDR_MASK;
+    }
+    let e = read_entry(table, i2);
+    assert!(e & PRESENT != 0 && e & HUGE != 0, "no huge page is mapped at {virt:#x}");
+    (table, i2, e)
+}
+
+/// Changes the huge page at `virt` in `root` to 512 pages of 4 KiB with the same frames and
+/// permissions. `table` is the table that `user_map_huge` gave.
+pub(crate) fn user_split_huge(root: u64, virt: usize, table: u64) {
+    let (pd, i2, e) = user_huge_entry(root, virt);
+    let phys = e & ADDR_MASK;
+    let flags = e & !ADDR_MASK & !HUGE;
+    for i in 0..512 {
+        write_entry(table, i, (phys + (i * PAGE_SIZE) as u64) | flags);
+    }
+    write_entry(pd, i2, table | PRESENT | WRITABLE | USER);
+    flush_user(root, virt);
+}
+
+/// Removes the huge page at `virt` in `root`. `table` is the table that `user_map_huge` gave. It
+/// becomes an empty last level table of `root`, so `free_user_root` frees it.
+pub(crate) fn user_unmap_huge(root: u64, virt: usize, table: u64) {
+    let (pd, i2, _) = user_huge_entry(root, virt);
+    for i in 0..512 {
+        write_entry(table, i, 0);
+    }
+    write_entry(pd, i2, table | PRESENT | WRITABLE | USER);
+    flush_user(root, virt);
 }
 
 /// Loads `root` into CR3. A value of 0 loads the kernel table.

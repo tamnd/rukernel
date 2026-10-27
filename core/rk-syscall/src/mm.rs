@@ -11,14 +11,14 @@ use rk_abi::native::mman::{
     MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_MERGEABLE,
     MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
     MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL, MADV_UNMERGEABLE, MADV_WILLNEED, MADV_WIPEONFORK,
-    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_POPULATE,
-    MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_TYPE, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT,
-    MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE,
-    MS_SYNC,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NORESERVE,
+    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_TYPE, MCL_CURRENT, MCL_FUTURE,
+    MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC,
+    MS_INVALIDATE, MS_SYNC,
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
-use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
+use rk_mm::{HugeAdvice, MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
 use rk_proc::limits::RLIMIT_MEMLOCK;
 use rk_vfs::InodeRef;
 use rk_vfs::cred::cap;
@@ -267,6 +267,7 @@ pub(crate) fn mmap(
         grows_down: flags & MAP_GROWSDOWN != 0,
         file,
         kind: VmaKind::Normal,
+        noreserve: flags & MAP_NORESERVE != 0,
     };
     Ok(cx.vm()?.mmap(req)? as u64)
 }
@@ -439,11 +440,14 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
         rk_mm::ksm::madvise(&vm, addr as usize, end, advice == MADV_MERGEABLE)?;
         return Ok(0);
     }
-    // `MADV_DONTNEED` and `MADV_FREE` give zero pages again for anonymous memory. Each other
-    // advice is only a hint, so it has no effect.
-    if matches!(advice, MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE) {
-        let len = (len as usize).next_multiple_of(PAGE_SIZE);
-        vm.fill_zero(addr as usize, len)?;
+    // `MADV_DONTNEED` and `MADV_FREE` remove the frames, so anonymous memory gives zero pages
+    // again. The advice for huge pages goes in the areas. Each other advice is only a hint, so it
+    // has no effect.
+    match advice {
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE => vm.discard(addr as usize, len as usize),
+        MADV_HUGEPAGE => vm.set_huge_advice(addr as usize, len as usize, HugeAdvice::Huge)?,
+        MADV_NOHUGEPAGE => vm.set_huge_advice(addr as usize, len as usize, HugeAdvice::NoHuge)?,
+        _ => {}
     }
     Ok(0)
 }

@@ -127,8 +127,10 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     let blocking = match rk_cgroup::charge_page(memcg) {
         Ok(()) => {
             rk_cgroup::uncharge_page(memcg);
-            // A page was freed since the fault, so the fault can try again.
-            return true;
+            // The cgroup has room. If the system has free memory, a page was freed since the
+            // fault, so the fault can try again. If not, the OOM killer of the system must act.
+            let stats = rk_frame::mm::frame_stats();
+            return stats.free > rk_mm::tunables::reserve_pages(stats.total);
         }
         Err(id) => id,
     };
@@ -148,6 +150,37 @@ pub fn memcg_oom(thread: &Thread) -> bool {
     }
     rk_cgroup::psi_change(cg, |c| c.memstall = c.memstall.saturating_sub(1));
     victim.is_some()
+}
+
+/// Handles a page fault of `thread` that did not get a page because the free memory of the
+/// system is short. The OOM killer of the system kills the process with the most resident pages,
+/// with the bias of its `oom_score_adj`, as `out_of_memory` of Linux, and the thread waits for its
+/// end, so that the fault can try again. The init process is never the victim. Gives `false` if
+/// no process can be killed.
+pub fn system_oom(thread: &Thread) -> bool {
+    let total = rk_frame::mm::frame_stats().total as i64;
+    let badness = |p: &Arc<Process>| size(p) as i64 + i64::from(p.oom_score_adj()) * total / 1000;
+    let victim = processes()
+        .into_iter()
+        .filter(|p| p.pid() != 1 && !p.is_zombie() && p.group_exit().is_none())
+        .filter(|p| p.oom_score_adj() > -1000 && p.vm().is_some())
+        .max_by_key(badness);
+    let Some(victim) = victim else { return false };
+    rk_frame::println!(
+        "Out of memory: Killed process {} ({})",
+        victim.pid(),
+        core::str::from_utf8(&victim.comm()).unwrap_or("?")
+    );
+    kill_group(&victim, WaitStatus::signaled(SIGKILL, false));
+    if !Arc::ptr_eq(&victim, thread.process()) {
+        // The memory of the victim is free when its address space goes. Nothing wakes this
+        // queue, so the thread looks again at each tick, for one second at most.
+        let deadline = rk_frame::time::ticks() + rk_frame::time::HZ;
+        while rk_frame::time::ticks() < deadline && !thread.is_killed() && victim.vm().is_some() {
+            THROTTLE.wait_until_timeout(rk_frame::time::ticks() + 1, || None::<()>);
+        }
+    }
+    true
 }
 
 /// Kills processes in the subtree of `id` until its memory use is below `memory.max`, after a

@@ -8,6 +8,12 @@
 //! spaces can map the same frame, after `fork` or for a `MAP_SHARED` mapping, and a file can keep
 //! the frame in its page cache. A frame goes back to the allocator when the last `Arc` goes.
 //!
+//! A run of 512 frames that is 2 MiB aligned can be mapped at a 2 MiB aligned address with one
+//! huge entry, as the transparent huge pages of Linux. Each frame of the run is still a page of the
+//! address space. A change to one page of the run splits the huge entry into a last level table
+//! first. The table for the split is made when the huge page is mapped, as the deposited table of
+//! Linux, so a split cannot fail.
+//!
 //! The kernel reads and writes user memory with `read` and `write`. These functions walk the page
 //! table in software and copy through the direct map, so they work on an address space that is not
 //! active too. A page that is not mapped gives a `UserFault`. The memory manager handles the fault
@@ -15,13 +21,28 @@
 
 use crate::addr::{PAGE_SIZE, VirtAddr};
 use crate::arch::imp::paging;
-use crate::mm::Frame;
+use crate::mm::frame::free_frame_phys;
+use crate::mm::{Frame, HUGE_FRAMES};
 use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// The end of the user half of the address space. Each user address is below it.
 pub const USER_END: usize = paging::USER_END;
+
+/// The size of a huge page.
+pub const HUGE_PAGE_SIZE: usize = HUGE_FRAMES * PAGE_SIZE;
+
+/// The number of huge pages that the address spaces map now.
+static HUGE_MAPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The number of huge pages that the address spaces map now. /proc/meminfo shows it as
+/// `AnonHugePages`.
+pub fn huge_pages_mapped() -> usize {
+    HUGE_MAPPED.load(Ordering::Relaxed)
+}
 
 /// The permissions of a user page. A page that allows no access keeps its frame, but each access
 /// to it is a page fault. On x86-64, a page that allows a write or an instruction fetch can also
@@ -75,6 +96,19 @@ struct Inner {
     root: u64,
     /// The frame and the permissions at each mapped page address.
     pages: BTreeMap<usize, (Arc<Frame>, PageProt)>,
+    /// The address of each huge page, and the last level table for its split.
+    huge: BTreeMap<usize, u64>,
+}
+
+impl Inner {
+    /// Changes the huge page that contains `addr`, if there is one, to 4 KiB pages.
+    fn split(&mut self, addr: usize) {
+        let block = addr & !(HUGE_PAGE_SIZE - 1);
+        if let Some(table) = self.huge.remove(&block) {
+            paging::user_split_huge(self.root, block, table);
+            HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The page table of one user address space.
@@ -86,7 +120,8 @@ impl VmSpace {
     /// Makes an empty address space. Gives `None` if no frame is free for the top level table.
     pub fn new() -> Option<Self> {
         let root = paging::new_user_root()?;
-        Some(Self { inner: SpinLock::new(Inner { root, pages: BTreeMap::new() }) })
+        let inner = Inner { root, pages: BTreeMap::new(), huge: BTreeMap::new() };
+        Some(Self { inner: SpinLock::new(inner) })
     }
 
     /// Maps `frame` at the user address `addr`.
@@ -110,9 +145,101 @@ impl VmSpace {
         Ok(())
     }
 
+    /// Maps the run of `HUGE_FRAMES` frames in `frames` at `addr` with one huge entry.
+    ///
+    /// # Errors
+    ///
+    /// Gives an error if `addr` is not 2 MiB aligned or not in the user half, if a page is mapped
+    /// in the range already, or if no frame is free for a page table.
+    ///
+    /// # Panics
+    ///
+    /// If `frames` is not a run that `alloc_huge_frames` gave.
+    pub fn map_huge(
+        &self,
+        addr: VirtAddr,
+        frames: Vec<Arc<Frame>>,
+        prot: PageProt,
+    ) -> Result<(), MapError> {
+        let a = addr.get();
+        if !a.is_multiple_of(HUGE_PAGE_SIZE)
+            || a.checked_add(HUGE_PAGE_SIZE).is_none_or(|e| e > USER_END)
+        {
+            return Err(MapError::BadAddress);
+        }
+        let first = frames[0].addr().get();
+        assert!(frames.len() == HUGE_FRAMES && first.is_multiple_of(HUGE_PAGE_SIZE as u64));
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.addr().get(), first + (i * PAGE_SIZE) as u64, "the frames are not a run");
+        }
+        let mut inner = self.inner.lock();
+        if inner.pages.range(a..a + HUGE_PAGE_SIZE).next().is_some() {
+            return Err(MapError::Mapped);
+        }
+        let table = paging::user_map_huge(inner.root, a, first, prot.bits())
+            .map_err(|()| MapError::NoMemory)?;
+        inner.huge.insert(a, table);
+        HUGE_MAPPED.fetch_add(1, Ordering::Relaxed);
+        for (i, f) in frames.into_iter().enumerate() {
+            inner.pages.insert(a + i * PAGE_SIZE, (f, prot));
+        }
+        Ok(())
+    }
+
+    /// The number of huge pages that are mapped.
+    pub fn huge_count(&self) -> usize {
+        self.inner.lock().huge.len()
+    }
+
+    /// Removes the pages in `start..end`. A huge page that is all in the range goes as one, and a
+    /// huge page that is in part in the range is split first.
+    pub fn unmap_range(&self, start: VirtAddr, end: VirtAddr) {
+        let (start, end) = (start.get(), end.get());
+        // The frames go after the lock, as the frames that `unmap` gives. They go in batches of
+        // the pages of one huge page, so a large range needs no large list when memory is short.
+        let batch = HUGE_FRAMES;
+        let mut gone = Vec::with_capacity(batch);
+        let first = start & !(HUGE_PAGE_SIZE - 1);
+        let mut inner = self.inner.lock();
+        while let Some((&block, &table)) = inner.huge.range(first..end).next() {
+            if block >= start && block + HUGE_PAGE_SIZE <= end {
+                inner.huge.remove(&block);
+                paging::user_unmap_huge(inner.root, block, table);
+                HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
+                while let Some((&a, _)) = inner.pages.range(block..block + HUGE_PAGE_SIZE).next() {
+                    gone.extend(inner.pages.remove(&a));
+                }
+                drop(inner);
+                gone.clear();
+                inner = self.inner.lock();
+            } else {
+                inner.split(block);
+            }
+        }
+        loop {
+            let root = inner.root;
+            while gone.len() < batch {
+                let Some((&a, _)) = inner.pages.range(start..end).next() else { break };
+                gone.extend(inner.pages.remove(&a));
+                paging::user_unmap(root, a);
+            }
+            let done = gone.len() < batch;
+            drop(inner);
+            gone.clear();
+            if done {
+                return;
+            }
+            inner = self.inner.lock();
+        }
+    }
+
     /// Removes the page at `addr` and gives its frame.
     pub fn unmap(&self, addr: VirtAddr) -> Option<Arc<Frame>> {
         let mut inner = self.inner.lock();
+        if !inner.pages.contains_key(&addr.get()) {
+            return None;
+        }
+        inner.split(addr.get());
         let (frame, _) = inner.pages.remove(&addr.get())?;
         paging::user_unmap(inner.root, addr.get());
         Some(frame)
@@ -122,6 +249,13 @@ impl VmSpace {
     pub fn protect(&self, addr: VirtAddr, prot: PageProt) -> bool {
         let mut inner = self.inner.lock();
         let root = inner.root;
+        let block = addr.get() & !(HUGE_PAGE_SIZE - 1);
+        match inner.pages.get(&addr.get()) {
+            None => return false,
+            // A huge page stays whole when its permissions do not change.
+            Some((_, old)) if *old == prot && inner.huge.contains_key(&block) => return true,
+            Some(_) => inner.split(block),
+        }
         let Some((frame, old)) = inner.pages.get_mut(&addr.get()) else { return false };
         *old = prot;
         paging::user_protect(root, addr.get(), frame.addr().get(), prot.bits());
@@ -138,6 +272,24 @@ impl VmSpace {
     pub fn mapped_pages(&self, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VirtAddr> {
         let inner = self.inner.lock();
         inner.pages.range(start.get()..end.get()).map(|(&a, _)| VirtAddr::new(a)).collect()
+    }
+
+    /// The number of mapped pages in `start..end`. It allocates no memory, so the OOM killer can
+    /// use it.
+    pub fn pages_in(&self, start: VirtAddr, end: VirtAddr) -> usize {
+        self.inner.lock().pages.range(start.get()..end.get()).count()
+    }
+
+    /// Adds the page addresses in `start..end` that are mapped to `out`, in order. Gives `false`
+    /// and adds nothing if the kernel heap has no memory for them.
+    pub fn try_mapped_pages(&self, start: VirtAddr, end: VirtAddr, out: &mut Vec<usize>) -> bool {
+        let inner = self.inner.lock();
+        let pages = inner.pages.range(start.get()..end.get());
+        if out.try_reserve(pages.clone().count()).is_err() {
+            return false;
+        }
+        out.extend(pages.map(|(&a, _)| a));
+        true
     }
 
     /// The number of mapped pages.
@@ -245,6 +397,11 @@ impl Drop for VmSpace {
             paging::activate(0);
         }
         paging::free_user_root(inner.root);
+        // `free_user_root` does not see the tables for the splits of the huge pages.
+        for &table in inner.huge.values() {
+            free_frame_phys(table);
+        }
+        HUGE_MAPPED.fetch_sub(inner.huge.len(), Ordering::Relaxed);
         // The frames go when `pages` is dropped, after the tables that map them are gone.
     }
 }
