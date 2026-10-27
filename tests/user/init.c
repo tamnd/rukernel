@@ -59,6 +59,15 @@
 #include <time.h>
 #include <unistd.h>
 
+/* The names of the machine for uname and seccomp. */
+#if defined(__aarch64__)
+#define UNAME_MACHINE "aarch64"
+#define AUDIT_ARCH_NATIVE AUDIT_ARCH_AARCH64
+#else
+#define UNAME_MACHINE "x86_64"
+#define AUDIT_ARCH_NATIVE AUDIT_ARCH_X86_64
+#endif
+
 static int failed;
 
 static void check(const char *name, int ok)
@@ -293,7 +302,7 @@ static void test_uname(void)
 {
 	struct utsname u;
 	check("uname", uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 &&
-			       strcmp(u.machine, "x86_64") == 0);
+			       strcmp(u.machine, UNAME_MACHINE) == 0);
 }
 
 static void test_memory(void)
@@ -449,6 +458,10 @@ static long timespec_ns(const struct timespec *t)
 
 static void test_vdso(void)
 {
+#if defined(__aarch64__)
+	/* TODO(#329): rk has no vDSO on arm64 yet. */
+	return;
+#endif
 	int (*vgettime)(clockid_t, struct timespec *) = vdso_sym("__vdso_clock_gettime");
 	int (*vgettimeofday)(struct timeval *, void *) = vdso_sym("__vdso_gettimeofday");
 	long (*vtime)(long *) = vdso_sym("__vdso_time");
@@ -1386,7 +1399,7 @@ static void on_sigsys(int sig, siginfo_t *info, void *uc)
 {
 	(void)sig;
 	(void)uc;
-	if (info->si_code == SYS_SECCOMP && info->si_arch == AUDIT_ARCH_X86_64)
+	if (info->si_code == SYS_SECCOMP && info->si_arch == AUDIT_ARCH_NATIVE)
 		sigsys_nr = info->si_syscall;
 }
 
@@ -2551,6 +2564,67 @@ static int trace_wait(pid_t pid)
 	return waitpid(pid, &status, __WALL) == pid ? status : -1;
 }
 
+#if defined(__aarch64__)
+/* arm64 has no PTRACE_GETREGS, so the test uses the register sets, as strace does. */
+static long get_regs(pid_t pid, struct user_regs_struct *regs)
+{
+	struct iovec iov = { regs, sizeof(*regs) };
+	return ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+}
+static int syscall_nr(pid_t pid)
+{
+	int nr = -1;
+	struct iovec iov = { &nr, sizeof(nr) };
+	ptrace(PTRACE_GETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov);
+	return nr;
+}
+static void set_syscall_nr(pid_t pid, int nr)
+{
+	struct iovec iov = { &nr, sizeof(nr) };
+	ptrace(PTRACE_SETREGSET, pid, (void *)NT_ARM_SYSTEM_CALL, &iov);
+}
+/* The op of struct ptrace_syscall_info: 1 at the entry to a system call. */
+static int at_syscall_entry(pid_t pid)
+{
+	unsigned char info[88] = { 0 };
+	return ptrace(0x420e, pid, (void *)sizeof(info), info) > 0 && info[0] == 1;
+}
+#define REG_PC(r) ((r).pc)
+#define REG_RET(r) ((r).regs[0])
+#define STEP_FLAG (1UL << 21)
+#define REG_FLAGS(r) ((r).pstate)
+#define USER_MODE(r) (((r).pstate & 0xf) == 0)
+#else
+static long get_regs(pid_t pid, struct user_regs_struct *regs)
+{
+	return ptrace(PTRACE_GETREGS, pid, 0, regs);
+}
+static int syscall_nr(pid_t pid)
+{
+	struct user_regs_struct regs;
+	get_regs(pid, &regs);
+	return (int)regs.orig_rax;
+}
+static void set_syscall_nr(pid_t pid, int nr)
+{
+	struct user_regs_struct regs;
+	get_regs(pid, &regs);
+	regs.orig_rax = nr;
+	ptrace(PTRACE_SETREGS, pid, 0, &regs);
+}
+static int at_syscall_entry(pid_t pid)
+{
+	struct user_regs_struct regs;
+	get_regs(pid, &regs);
+	return regs.rax == (unsigned long)-ENOSYS;
+}
+#define REG_PC(r) ((r).rip)
+#define REG_RET(r) ((r).rax)
+#define STEP_FLAG 0x100UL
+#define REG_FLAGS(r) ((r).eflags)
+#define USER_MODE(r) ((r).cs == 0x33)
+#endif
+
 static void test_ptrace(void)
 {
 	struct user_regs_struct regs, before;
@@ -2576,32 +2650,30 @@ static void test_ptrace(void)
 	check("PTRACE_POKEDATA", ptrace(PTRACE_POKEDATA, pid, &ptrace_word, 40) == 0);
 	check("PTRACE_POKETEXT to a read only page", ptrace(PTRACE_POKETEXT, pid, &ptrace_ro_word, 2) == 0 &&
 	      ptrace_ro_word == 5);
-	check("PTRACE_GETREGS", ptrace(PTRACE_GETREGS, pid, 0, &before) == 0 && before.cs == 0x33);
+	check("PTRACE_GETREGS", get_regs(pid, &before) == 0 && USER_MODE(before));
 	check("PTRACE_SINGLESTEP", ptrace(PTRACE_SINGLESTEP, pid, 0, 0) == 0);
 	status = trace_wait(pid);
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
+	get_regs(pid, &regs);
 	ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
 	check("a single step stops with SIGTRAP", WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP &&
-	      si.si_code == TRAP_TRACE && regs.rip != before.rip && !(regs.eflags & 0x100));
+	      si.si_code == TRAP_TRACE && REG_PC(regs) != REG_PC(before) && !(REG_FLAGS(regs) & STEP_FLAG));
 	check("PTRACE_SETOPTIONS", ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXIT) == 0);
 	for (i = 0; i < 20 && !found; i++) {
 		ptrace(PTRACE_SYSCALL, pid, 0, 0);
 		status = trace_wait(pid);
 		if (!WIFSTOPPED(status) || WSTOPSIG(status) != (SIGTRAP | 0x80))
 			break;
-		ptrace(PTRACE_GETREGS, pid, 0, &regs);
-		if (regs.orig_rax == SYS_getpid && regs.rax == (unsigned long)-ENOSYS) {
+		if (syscall_nr(pid) == SYS_getpid && at_syscall_entry(pid)) {
 			found = 1;
-			regs.orig_rax = SYS_getppid;
-			ptrace(PTRACE_SETREGS, pid, 0, &regs);
+			set_syscall_nr(pid, SYS_getppid);
 		}
 	}
 	check("PTRACE_SYSCALL stops at the entry to getpid", found);
 	ptrace(PTRACE_SYSCALL, pid, 0, 0);
 	status = trace_wait(pid);
-	ptrace(PTRACE_GETREGS, pid, 0, &regs);
+	get_regs(pid, &regs);
 	check("the tracer changes the system call", WIFSTOPPED(status) && WSTOPSIG(status) == (SIGTRAP | 0x80) &&
-	      regs.orig_rax == SYS_getppid && regs.rax == (unsigned long)me);
+	      syscall_nr(pid) == SYS_getppid && REG_RET(regs) == (unsigned long)me);
 	ptrace(PTRACE_CONT, pid, 0, 0);
 	status = trace_wait(pid);
 	check("PTRACE_EVENT_EXIT", WIFSTOPPED(status) && status >> 8 == (SIGTRAP | (PTRACE_EVENT_EXIT << 8)) &&
@@ -2727,8 +2799,13 @@ static void test_proc(void)
 	check("/proc/self/stat", read_file("/proc/self/stat", buf, sizeof(buf)) > 0 && !strncmp(buf, want, strlen(want)));
 	check("/proc/self/status", read_file("/proc/self/status", buf, sizeof(buf)) > 0 && strstr(buf, "\nState:\tR (running)\n"));
 	check("/proc/self/cmdline", read_file("/proc/self/cmdline", buf, sizeof(buf)) > 0 && !strcmp(buf, "/init"));
+	#if defined(__aarch64__)
+	/* TODO(#329): rk has no vDSO on arm64 yet, so the maps have no [vvar] and no [vdso]. */
+	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n"));
+#else
 	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n") &&
 						   strstr(buf, "[vvar]\n") && strstr(buf, "[vdso]\n"));
+#endif
 	check("/proc/mounts", read_file("/proc/mounts", buf, sizeof(buf)) > 0 && strstr(buf, "proc /proc proc rw,relatime 0 0\n"));
 	n = readlink("/proc/self/exe", link, sizeof(link) - 1);
 	check("/proc/self/exe", n == 5 && !strncmp(link, "/init", 5));

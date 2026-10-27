@@ -93,6 +93,7 @@ pub(crate) fn setitimer(cx: &Cx<'_>, which: u64, new: u64, old: u64) -> SysResul
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn alarm(cx: &Cx<'_>, seconds: u64) -> SysResult {
     let timer = itimer(cx.process(), u64::from(ITIMER_REAL))?;
     let seconds = seconds & u64::from(u32::MAX);

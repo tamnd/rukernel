@@ -258,11 +258,47 @@ pub(crate) fn init() {
     wrmsr(IA32_EFER, rdmsr(IA32_EFER) | EFER_SCE);
 }
 
+/// The trap flag of RFLAGS.
+pub(crate) const STEP_FLAG: u64 = 1 << 8;
+
+/// `AUDIT_ARCH_X86_64`.
+pub(crate) const AUDIT_ARCH: u32 = 0xc000_003e;
+
 /// How the CPU came back from user mode.
 pub(crate) enum Return {
     Syscall,
     Interrupt,
     Exception { vector: u8, error: u64, cr2: u64 },
+}
+
+/// Gives the kind of a user exception from the vector, the error code and CR2.
+pub(crate) fn classify(vector: u8, error: u64, cr2: u64) -> crate::user::ExceptionKind {
+    use super::trap::{BREAKPOINT, DEBUG, DIVIDE_ERROR, INVALID_OPCODE, PAGE_FAULT};
+    use crate::user::{ExceptionKind, FaultAccess};
+    /// The vectors of the x87 error, the alignment check and the SIMD error.
+    const X87_ERROR: u8 = 16;
+    const ALIGNMENT_CHECK: u8 = 17;
+    const SIMD_ERROR: u8 = 19;
+    match vector {
+        PAGE_FAULT => {
+            // The error code bits: P (bit 0), W/R (bit 1) and I/D (bit 4).
+            let access = if error & 0x10 != 0 {
+                FaultAccess::Exec
+            } else if error & 0x2 != 0 {
+                FaultAccess::Write
+            } else {
+                FaultAccess::Read
+            };
+            ExceptionKind::PageFault { addr: cr2, access, present: error & 1 != 0 }
+        }
+        DIVIDE_ERROR => ExceptionKind::DivideError,
+        X87_ERROR | SIMD_ERROR => ExceptionKind::FloatingPoint,
+        DEBUG => ExceptionKind::SingleStep,
+        BREAKPOINT => ExceptionKind::Breakpoint,
+        INVALID_OPCODE => ExceptionKind::IllegalInstruction,
+        ALIGNMENT_CHECK => ExceptionKind::Alignment { addr: 0 },
+        _ => ExceptionKind::Other,
+    }
 }
 
 /// Runs user code with the registers `regs`, the FPU state `fpu` and the FS base `fs_base`, until

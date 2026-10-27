@@ -37,26 +37,26 @@ const UIO_MAXIOV: u64 = 1024;
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
 fn stat_of(m: &Metadata) -> Stat {
-    Stat {
-        st_dev: m.dev,
-        st_ino: m.ino,
-        st_nlink: u64::from(m.nlink),
-        st_mode: m.mode,
-        st_uid: m.uid,
-        st_gid: m.gid,
-        __pad0: 0,
-        st_rdev: m.rdev,
-        st_size: m.size as i64,
-        st_blksize: i64::from(m.blksize),
-        st_blocks: m.blocks as i64,
-        st_atime: m.atime.sec as u64,
-        st_atime_nsec: u64::from(m.atime.nsec),
-        st_mtime: m.mtime.sec as u64,
-        st_mtime_nsec: u64::from(m.mtime.nsec),
-        st_ctime: m.ctime.sec as u64,
-        st_ctime_nsec: u64::from(m.ctime.nsec),
-        __unused: [0; 3],
-    }
+    // The layout of `struct stat` is not the same on each architecture, so the casts go to the
+    // type of the field.
+    let mut st = Stat::new_zeroed();
+    st.st_dev = m.dev;
+    st.st_ino = m.ino;
+    st.st_nlink = m.nlink as _;
+    st.st_mode = m.mode;
+    st.st_uid = m.uid;
+    st.st_gid = m.gid;
+    st.st_rdev = m.rdev;
+    st.st_size = m.size as i64;
+    st.st_blksize = m.blksize as _;
+    st.st_blocks = m.blocks as i64;
+    st.st_atime = m.atime.sec as _;
+    st.st_atime_nsec = u64::from(m.atime.nsec);
+    st.st_mtime = m.mtime.sec as _;
+    st.st_mtime_nsec = u64::from(m.mtime.nsec);
+    st.st_ctime = m.ctime.sec as _;
+    st.st_ctime_nsec = u64::from(m.ctime.nsec);
+    st
 }
 
 fn statx_time(t: Timespec) -> StatxTimestamp {
@@ -720,6 +720,7 @@ pub(crate) fn dup(cx: &Cx<'_>, fd: u64) -> SysResult {
     dup_from(cx, fd, 0, false)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn dup2(cx: &Cx<'_>, old: u64, new: u64) -> SysResult {
     if old as i32 == new as i32 {
         cx.file(old)?;

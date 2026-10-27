@@ -29,18 +29,24 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
     match n {
         nr::READ => fs::read(cx, a[0], a[1], a[2]),
         nr::WRITE => fs::write(cx, a[0], a[1], a[2]),
+        #[cfg(target_arch = "x86_64")]
         nr::POLL => poll::poll(cx, a[0], a[1], a[2]),
         nr::PPOLL => poll::ppoll(cx, a[0], a[1], a[2], a[3], a[4]),
+        #[cfg(target_arch = "x86_64")]
         nr::SELECT => poll::select(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::PSELECT6 => poll::pselect6(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        #[cfg(target_arch = "x86_64")]
         nr::PIPE => poll::pipe(cx, a[0]),
         nr::PIPE2 => poll::pipe2(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::EPOLL_CREATE => epoll::epoll_create(cx, a[0]),
         nr::EPOLL_CREATE1 => epoll::epoll_create1(cx, a[0]),
         nr::EPOLL_CTL => epoll::epoll_ctl(cx, a[0], a[1], a[2], a[3]),
+        #[cfg(target_arch = "x86_64")]
         nr::EPOLL_WAIT => epoll::epoll_wait(cx, a[0], a[1], a[2], a[3]),
         nr::EPOLL_PWAIT => epoll::epoll_pwait(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::EPOLL_PWAIT2 => epoll::epoll_pwait2(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        #[cfg(target_arch = "x86_64")]
         nr::EVENTFD => eventfd::eventfd(cx, a[0]),
         nr::EVENTFD2 => eventfd::eventfd2(cx, a[0], a[1]),
         nr::IO_SETUP => aio::io_setup(cx, a[0], a[1]),
@@ -52,12 +58,16 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::TIMERFD_CREATE => timerfd::timerfd_create(cx, a[0], a[1]),
         nr::TIMERFD_SETTIME => timerfd::timerfd_settime(cx, a[0], a[1], a[2], a[3]),
         nr::TIMERFD_GETTIME => timerfd::timerfd_gettime(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::SIGNALFD => signalfd::signalfd(cx, a[0], a[1], a[2]),
         nr::SIGNALFD4 => signalfd::signalfd4(cx, a[0], a[1], a[2], a[3]),
+        #[cfg(target_arch = "x86_64")]
         nr::OPEN => fs::openat(cx, at_fdcwd(), a[0], a[1], a[2]),
         nr::CLOSE => fs::close(cx, a[0]),
+        #[cfg(target_arch = "x86_64")]
         nr::STAT => fs::fstatat(cx, at_fdcwd(), a[0], a[1], 0),
         nr::FSTAT => fs::fstat(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::LSTAT => fs::fstatat(cx, at_fdcwd(), a[0], a[1], symlink_nofollow()),
         nr::LSEEK => fs::lseek(cx, a[0], a[1], a[2]),
         nr::MMAP => mm::mmap(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
@@ -84,6 +94,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PWRITEV => fs::pwritev(cx, a[0], a[1], a[2], a[3]),
         nr::PREADV2 => fs::preadv2(cx, a[0], a[1], a[2], a[3], a[5]),
         nr::PWRITEV2 => fs::pwritev2(cx, a[0], a[1], a[2], a[3], a[5]),
+        #[cfg(target_arch = "x86_64")]
         nr::ACCESS => fs::faccessat(cx, at_fdcwd(), a[0], a[1], 0),
         nr::SCHED_YIELD => process::sched_yield(),
         nr::GETPRIORITY => sched::getpriority(cx, a[0], a[1]),
@@ -101,11 +112,17 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SCHED_GETATTR => sched::sched_getattr(cx, a[0], a[1], a[2], a[3]),
         nr::GETCPU => sched::getcpu(cx, a[0], a[1]),
         nr::MADVISE => mm::madvise(cx, a[0], a[1], a[2]),
+        #[cfg(target_arch = "x86_64")]
         nr::PAUSE => signal::pause(cx),
         nr::DUP => fs::dup(cx, a[0]),
+        #[cfg(target_arch = "x86_64")]
         nr::DUP2 => fs::dup2(cx, a[0], a[1]),
         nr::GETPID => Ok(u64::from(cx.process().pid())),
+        #[cfg(target_arch = "x86_64")]
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
+        // arm64 has the order of `CONFIG_CLONE_BACKWARDS`: the TLS comes before the child TID.
+        #[cfg(target_arch = "aarch64")]
+        nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[4], a[3]),
         nr::CLONE3 => process::clone3(cx, a[0], a[1]),
         nr::SEMGET => sem::semget(cx, a[0], a[1], a[2]),
         nr::SEMOP => sem::semop(cx, a[0], a[1], a[2]),
@@ -135,7 +152,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETSOCKOPT => net::getsockopt(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::SETSOCKOPT => net::setsockopt(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::UNSHARE => process::unshare(cx, a[0]),
+        #[cfg(target_arch = "x86_64")]
         nr::FORK => process::fork(cx),
+        #[cfg(target_arch = "x86_64")]
         nr::VFORK => process::vfork(cx),
         nr::EXECVE => process::execve(cx, a[0], a[1], a[2]),
         nr::EXIT => process::exit(cx, a[0]),
@@ -157,11 +176,15 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETCWD => fs::getcwd(cx, a[0], a[1]),
         nr::CHDIR => fs::chdir(cx, a[0]),
         nr::FCHDIR => fs::fchdir(cx, a[0]),
+        #[cfg(target_arch = "x86_64")]
         nr::RENAME => fs::renameat2(cx, at_fdcwd(), a[0], at_fdcwd(), a[1], 0),
+        #[cfg(target_arch = "x86_64")]
         nr::MKDIR => fs::mkdirat(cx, at_fdcwd(), a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::RMDIR => {
             fs::unlinkat(cx, at_fdcwd(), a[0], u64::from(rk_abi::native::at::AT_REMOVEDIR as u32))
         }
+        #[cfg(target_arch = "x86_64")]
         nr::CREAT => fs::openat(
             cx,
             at_fdcwd(),
@@ -173,13 +196,20 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
             ),
             a[1],
         ),
+        #[cfg(target_arch = "x86_64")]
         nr::LINK => fs::linkat(cx, at_fdcwd(), a[0], at_fdcwd(), a[1], 0),
+        #[cfg(target_arch = "x86_64")]
         nr::UNLINK => fs::unlinkat(cx, at_fdcwd(), a[0], 0),
+        #[cfg(target_arch = "x86_64")]
         nr::SYMLINK => fs::symlinkat(cx, a[0], at_fdcwd(), a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::READLINK => fs::readlinkat(cx, at_fdcwd(), a[0], a[1], a[2]),
+        #[cfg(target_arch = "x86_64")]
         nr::CHMOD => fs::fchmodat(cx, at_fdcwd(), a[0], a[1]),
         nr::FCHMOD => fs::fchmod(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::CHOWN => fs::fchownat(cx, at_fdcwd(), a[0], a[1], a[2], 0),
+        #[cfg(target_arch = "x86_64")]
         nr::LCHOWN => fs::fchownat(
             cx,
             at_fdcwd(),
@@ -226,6 +256,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SETGROUPS => cred::setgroups(cx, a[0], a[1]),
         nr::SETPGID => process::setpgid(cx, a[0], a[1]),
         nr::GETPPID => Ok(u64::from(cx.process().ppid())),
+        #[cfg(target_arch = "x86_64")]
         nr::GETPGRP => Ok(u64::from(cx.process().pgid())),
         nr::SETSID => cx.process().set_sid().map(u64::from),
         nr::GETPGID => process::getpgid(cx, a[0]),
@@ -233,6 +264,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SIGALTSTACK => signal::sigaltstack(cx, a[0], a[1]),
         nr::RT_SIGPENDING => signal::rt_sigpending(cx, a[0], a[1]),
         nr::RT_SIGSUSPEND => signal::rt_sigsuspend(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::MKNOD => fs::mknodat(cx, at_fdcwd(), a[0], a[1], a[2]),
         nr::STATFS => fs::statfs(cx, a[0], a[1]),
         nr::MOUNT => mount::mount(cx, a[0], a[1], a[2], a[3], a[4]),
@@ -249,6 +281,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::FSTATFS => fs::fstatfs(cx, a[0], a[1]),
         nr::PRCTL => process::prctl(cx, a[0], [a[1], a[2], a[3], a[4]]),
         nr::SECCOMP => seccomp::seccomp(cx, a[0], a[1], a[2]),
+        #[cfg(target_arch = "x86_64")]
         nr::ARCH_PRCTL => process::arch_prctl(cx, a[0], a[1]),
         nr::SYNC => {
             // `sync` does not give an error, as in Linux.
@@ -268,6 +301,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         }),
         nr::GETTID => Ok(u64::from(cx.thread.tid())),
         nr::TKILL => signal::tkill(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
         nr::ALARM => timer::alarm(cx, a[0]),
         nr::GETITIMER => timer::getitimer(cx, a[0], a[1]),
         nr::SETITIMER => timer::setitimer(cx, a[0], a[1], a[2]),
@@ -279,6 +313,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::RT_SIGTIMEDWAIT => signal::rt_sigtimedwait(cx, a[0], a[1], a[2], a[3]),
         nr::RT_SIGQUEUEINFO => signal::rt_sigqueueinfo(cx, a[0], a[1], a[2]),
         nr::RT_TGSIGQUEUEINFO => signal::rt_tgsigqueueinfo(cx, a[0], a[1], a[2], a[3]),
+        #[cfg(target_arch = "x86_64")]
         nr::TIME => info::time(cx, a[0]),
         nr::SET_TID_ADDRESS => {
             cx.thread.set_clear_child_tid(a[0] as usize);
@@ -332,11 +367,13 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
 }
 
 /// `AT_FDCWD` as a register value.
+#[cfg(target_arch = "x86_64")]
 fn at_fdcwd() -> u64 {
     rk_abi::native::at::AT_FDCWD as i64 as u64
 }
 
 /// `AT_SYMLINK_NOFOLLOW` as a register value.
+#[cfg(target_arch = "x86_64")]
 fn symlink_nofollow() -> u64 {
     rk_abi::native::at::AT_SYMLINK_NOFOLLOW as u64
 }

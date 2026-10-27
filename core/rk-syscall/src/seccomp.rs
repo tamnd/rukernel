@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use rk_abi::Errno;
 use rk_abi::native::signal::{SIGKILL, SIGSYS};
 use rk_abi::native::syscalls as nr;
-use rk_frame::user::UserContext;
+use rk_frame::user::{AUDIT_ARCH, UserContext};
 use rk_proc::bpf::{self, INSN_SIZE};
 use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_SECCOMP};
 use rk_proc::seccomp::{
@@ -55,9 +55,6 @@ pub(crate) const PR_SET_SECCOMP: u64 = 22;
 pub(crate) const PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub(crate) const PR_GET_NO_NEW_PRIVS: u64 = 39;
 
-/// `AUDIT_ARCH_X86_64`: the architecture in `seccomp_data`.
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-
 /// The highest error number that `SECCOMP_RET_ERRNO` gives.
 const MAX_ERRNO: u32 = 4095;
 
@@ -89,8 +86,8 @@ pub(crate) fn check(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) -
 fn filter(thread: &Arc<Thread>, regs: &mut UserContext, number: u64, recheck: bool) -> Entry {
     let Some(chain) = thread.seccomp().filter else { return Entry::Run(number) };
     let nr = number as i32;
-    let ip = regs.regs().rip;
-    let data = bpf::seccomp_data(nr, AUDIT_ARCH_X86_64, ip, regs.syscall_args());
+    let ip = regs.pc();
+    let data = bpf::seccomp_data(nr, AUDIT_ARCH, ip, regs.syscall_args());
     let (ret, matched) = run_filters(&chain, &data);
     let action = ret & SECCOMP_RET_ACTION_FULL;
     let value = ret & SECCOMP_RET_DATA;
@@ -103,7 +100,7 @@ fn filter(thread: &Arc<Thread>, regs: &mut UserContext, number: u64, recheck: bo
             // The return value is the number of the call again, as `syscall_rollback` of Linux
             // makes it, and the handler of `SIGSYS` sees it.
             regs.set_syscall_return(number);
-            thread.force_signal(SigInfo::seccomp(nr, AUDIT_ARCH_X86_64, ip, value as i32));
+            thread.force_signal(SigInfo::seccomp(nr, AUDIT_ARCH, ip, value as i32));
             Entry::Run(NO_SYSCALL)
         }
         SECCOMP_RET_TRACE => {

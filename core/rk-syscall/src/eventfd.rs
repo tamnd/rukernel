@@ -120,6 +120,7 @@ pub(crate) fn eventfd2(cx: &Cx<'_>, count: u64, flags: u64) -> SysResult {
     Ok(cx.files()?.lock().insert(file, flags & EFD_CLOEXEC != 0)? as u64)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn eventfd(cx: &Cx<'_>, count: u64) -> SysResult {
     eventfd2(cx, count, 0)
 }

@@ -85,6 +85,7 @@ impl IpcPerm {
 }
 
 /// The state of a set, as `struct semid64_ds` of x86-64.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 struct SemidDs {
@@ -93,6 +94,20 @@ struct SemidDs {
     unused1: u64,
     ctime: i64,
     unused2: u64,
+    nsems: u64,
+    unused3: u64,
+    unused4: u64,
+}
+
+/// The state of a set, as the generic `struct semid64_ds` of Linux, which arm64 uses. It has no
+/// padding after the times.
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+struct SemidDs {
+    perm: IpcPerm,
+    otime: i64,
+    ctime: i64,
     nsems: u64,
     unused3: u64,
     unused4: u64,

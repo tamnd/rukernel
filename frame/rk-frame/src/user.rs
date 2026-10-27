@@ -7,7 +7,8 @@
 //! The user code runs in the address space that is active. The kernel activates the `VmSpace` of
 //! the process before it calls `execute`.
 //!
-//! Only x86-64 has user mode in R0. arm64 gets it in R4 and riscv64 in R8.
+//! x86-64 and arm64 have user mode. riscv64 gets it in R8. The accessors of `UserContext` hide
+//! the registers of the architecture, so the kernel crates need no arch cfg.
 
 use crate::addr::VirtAddr;
 use crate::arch::imp::{paging, user};
@@ -16,6 +17,14 @@ pub use user::{FpuState, UserRegs};
 
 /// The end of the user half of the address space. Each user address is below it.
 pub const USER_END: usize = paging::USER_END;
+
+/// The bit of the flags register that makes the CPU stop after one user instruction: the trap
+/// flag TF on x86-64, and the software step bit SS of PSTATE on arm64.
+pub const STEP_FLAG: u64 = user::STEP_FLAG;
+
+/// The `AUDIT_ARCH_*` value of the architecture, from include/uapi/linux/audit.h, for
+/// `seccomp_data` and `ptrace`.
+pub const AUDIT_ARCH: u32 = user::AUDIT_ARCH;
 
 /// Why `UserContext::execute` returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,22 +48,73 @@ pub struct UserException {
     pub addr: u64,
 }
 
-/// The registers of one user thread: the general registers, the x87 and SSE state, and the FS
-/// base, which holds the thread pointer on x86-64.
+/// The access that caused a page fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultAccess {
+    /// A read of data.
+    Read,
+    /// A write of data.
+    Write,
+    /// An instruction fetch.
+    Exec,
+}
+
+/// The kind of a user exception, the same on each architecture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExceptionKind {
+    /// A page fault at `addr`. `present` tells that the page is mapped, so the access is not
+    /// allowed.
+    PageFault {
+        /// The address of the access.
+        addr: u64,
+        /// The kind of access.
+        access: FaultAccess,
+        /// The page is mapped.
+        present: bool,
+    },
+    /// An integer division by zero, or an overflow of a division.
+    DivideError,
+    /// An exception of the floating point unit.
+    FloatingPoint,
+    /// A single step trap.
+    SingleStep,
+    /// A breakpoint instruction.
+    Breakpoint,
+    /// An instruction that the CPU does not know, or that user mode cannot use.
+    IllegalInstruction,
+    /// An access that is not aligned.
+    Alignment {
+        /// The address of the access, or 0 if the CPU does not give it.
+        addr: u64,
+    },
+    /// Another exception, for example a general protection fault.
+    Other,
+}
+
+impl UserException {
+    /// The kind of the exception.
+    pub fn kind(&self) -> ExceptionKind {
+        user::classify(self.vector, self.error, self.addr)
+    }
+}
+
+/// The registers of one user thread: the general registers, the FP and SIMD state, and the thread
+/// pointer. The thread pointer is the FS base on x86-64 and TPIDR_EL0 on arm64.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UserContext {
     regs: UserRegs,
     fpu: FpuState,
-    fs_base: u64,
+    tls: u64,
 }
 
 impl UserContext {
     /// Makes a context that starts at `entry` with the stack pointer `stack`. The other registers
     /// are 0.
     pub fn new(entry: VirtAddr, stack: VirtAddr) -> Self {
-        let regs =
-            UserRegs { rip: entry.get() as u64, rsp: stack.get() as u64, ..UserRegs::default() };
-        Self { regs, ..Self::default() }
+        let mut context = Self::default();
+        context.set_pc(entry.get() as u64);
+        context.set_sp(stack.get() as u64);
+        context
     }
 
     /// The registers.
@@ -67,25 +127,100 @@ impl UserContext {
         &mut self.regs
     }
 
-    /// The x87 and SSE state.
+    /// The FP and SIMD state: the x87 and SSE state on x86-64, v0 to v31, FPSR and FPCR on arm64.
     pub fn fpu(&self) -> &FpuState {
         &self.fpu
     }
 
-    /// Sets the x87 and SSE state, for a signal handler and `rt_sigreturn`.
+    /// Sets the FP and SIMD state, for a signal handler and `rt_sigreturn`.
     pub fn set_fpu(&mut self, fpu: FpuState) {
         self.fpu = fpu;
     }
 
-    /// The FS base. `arch_prctl(ARCH_GET_FS)` gives it.
-    pub fn fs_base(&self) -> u64 {
-        self.fs_base
+    /// The thread pointer: the FS base on x86-64, which `arch_prctl(ARCH_GET_FS)` gives, and
+    /// TPIDR_EL0 on arm64.
+    pub fn tls(&self) -> u64 {
+        self.tls
     }
 
-    /// Sets the FS base, for `arch_prctl(ARCH_SET_FS)`. The kernel loads it at the next entry to
-    /// user mode. A value that is not canonical makes the entry load 0.
+    /// Sets the thread pointer, for `arch_prctl(ARCH_SET_FS)` or the `CLONE_SETTLS` flag. The
+    /// kernel loads it at the next entry to user mode. On x86-64, a value that is not canonical
+    /// makes the entry load 0.
+    pub fn set_tls(&mut self, value: u64) {
+        self.tls = value;
+    }
+
+    /// The FS base. `arch_prctl(ARCH_GET_FS)` gives it.
+    #[cfg(target_arch = "x86_64")]
+    pub fn fs_base(&self) -> u64 {
+        self.tls
+    }
+
+    /// Sets the FS base, for `arch_prctl(ARCH_SET_FS)`.
+    #[cfg(target_arch = "x86_64")]
     pub fn set_fs_base(&mut self, value: u64) {
-        self.fs_base = value;
+        self.tls = value;
+    }
+
+    /// The flags register: RFLAGS on x86-64, PSTATE on arm64. `ptrace` shows it to the tracer.
+    pub fn flags(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return self.regs.rflags;
+        #[cfg(target_arch = "aarch64")]
+        return self.regs.pstate;
+    }
+
+    /// Sets the flags register. The entry to user mode clears the bits that user code cannot
+    /// have.
+    pub fn set_flags(&mut self, value: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.regs.rflags = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.regs.pstate = value;
+        }
+    }
+
+    /// The address of the next user instruction.
+    pub fn pc(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return self.regs.rip;
+        #[cfg(target_arch = "aarch64")]
+        return self.regs.pc;
+    }
+
+    /// Sets the address of the next user instruction.
+    pub fn set_pc(&mut self, value: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.regs.rip = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.regs.pc = value;
+        }
+    }
+
+    /// The user stack pointer.
+    pub fn sp(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return self.regs.rsp;
+        #[cfg(target_arch = "aarch64")]
+        return self.regs.sp;
+    }
+
+    /// Sets the user stack pointer.
+    pub fn set_sp(&mut self, value: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.regs.rsp = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.regs.sp = value;
+        }
     }
 
     /// Runs the user code until it comes back to the kernel, and gives the reason. The registers
@@ -94,7 +229,10 @@ impl UserContext {
     pub fn execute(&mut self) -> ReturnReason {
         // User code runs without the kernel lock, so the other CPUs can run kernel code.
         crate::task::kernel_unlock();
-        let reason = user::enter(&mut self.regs, &mut self.fpu, self.fs_base);
+        #[cfg(target_arch = "x86_64")]
+        let reason = user::enter(&mut self.regs, &mut self.fpu, self.tls);
+        #[cfg(target_arch = "aarch64")]
+        let reason = user::enter(&mut self.regs, &mut self.fpu, &mut self.tls);
         crate::task::kernel_lock();
         match reason {
             user::Return::Syscall => ReturnReason::Syscall,
@@ -108,19 +246,67 @@ impl UserContext {
         }
     }
 
-    /// The system call number.
+    /// The system call number: rax on x86-64, x8 on arm64.
     pub fn syscall_number(&self) -> u64 {
-        self.regs.rax
+        #[cfg(target_arch = "x86_64")]
+        return self.regs.rax;
+        #[cfg(target_arch = "aarch64")]
+        return self.regs.syscall_number();
     }
 
     /// The six system call arguments, in the order of the Linux ABI.
     pub fn syscall_args(&self) -> [u64; 6] {
-        let r = &self.regs;
-        [r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9]
+        #[cfg(target_arch = "x86_64")]
+        {
+            let r = &self.regs;
+            [r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9]
+        }
+        #[cfg(target_arch = "aarch64")]
+        self.regs.syscall_args()
+    }
+
+    /// The return value of the last system call, or the value that `set_syscall_return` set.
+    pub fn syscall_return(&self) -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        return self.regs.rax;
+        #[cfg(target_arch = "aarch64")]
+        return self.regs.syscall_return();
+    }
+
+    /// Sets the return register at the entry to a system call to `value`, before a tracer sees
+    /// the registers, as the entry code of Linux does. x86-64 puts it in RAX. On arm64, x0 keeps
+    /// the first argument for the tracer, and only the call with the number -1 gets `value`.
+    pub fn set_entry_return(&mut self, value: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.regs.rax = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if self.regs.syscall_number() == u64::MAX {
+            self.regs.set_syscall_return(value);
+        }
     }
 
     /// Sets the return value of the system call.
     pub fn set_syscall_return(&mut self, value: u64) {
-        self.regs.rax = value;
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.regs.rax = value;
+        }
+        #[cfg(target_arch = "aarch64")]
+        self.regs.set_syscall_return(value);
+    }
+
+    /// Makes the thread make the system call `number` again when it goes back to user mode, with
+    /// the same arguments. The kernel calls this after a system call that a signal stopped.
+    pub fn restart_syscall(&mut self, number: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // The `syscall` instruction is two bytes long.
+            self.regs.rax = number;
+            self.regs.rip = self.regs.rip.wrapping_sub(2);
+        }
+        #[cfg(target_arch = "aarch64")]
+        self.regs.restart_syscall(number);
     }
 }

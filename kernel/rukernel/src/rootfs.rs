@@ -21,7 +21,7 @@ pub(crate) fn init(boot: &BootInfo) {
     for t in rk_fs_xfs::FS_TYPES {
         rk_vfs::fstype::register(t);
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         rk_vfs::fstype::register(rk_fs_proc::FS_TYPE);
         rk_vfs::fstype::register(rk_fs_sys::FS_TYPE);
@@ -51,7 +51,7 @@ pub(crate) fn context() -> Option<&'static FsContext> {
 /// each device in the list, if the initramfs did not make them. devtmpfs and sysfs show the same
 /// list. Linux does not mount devtmpfs on an initramfs, so the kernel makes the files here. A
 /// device that a driver adds or removes later, as a loop device, gets or loses its file then.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn make_dev(fs: &FsContext) {
     use alloc::string::String;
     use rk_vfs::device::{DeviceInfo, add_device, devices, register_major};
@@ -99,7 +99,7 @@ pub(crate) fn make_dev(fs: &FsContext) {
 }
 
 /// Makes the device file of `d` in `/dev`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn make_node(fs: &FsContext, d: &rk_vfs::device::DeviceInfo) {
     use rk_vfs::inode::mode::{S_IFBLK, S_IFCHR};
 

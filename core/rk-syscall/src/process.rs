@@ -43,7 +43,9 @@ const PR_SET_NAME: u64 = 15;
 const PR_GET_NAME: u64 = 16;
 
 /// The `code` values of `arch_prctl`, from arch/x86/include/uapi/asm/prctl.h.
+#[cfg(target_arch = "x86_64")]
 const ARCH_SET_FS: u64 = 0x1002;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_FS: u64 = 0x1003;
 
 /// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
@@ -226,10 +228,10 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     let mut regs = *cx.regs;
     regs.set_syscall_return(0);
     if stack != 0 {
-        regs.regs_mut().rsp = stack;
+        regs.set_sp(stack);
     }
     if flags & CLONE_SETTLS != 0 {
-        regs.set_fs_base(args.tls);
+        regs.set_tls(args.tls);
     }
     if flags & CLONE_PARENT_SETTID != 0 {
         cx.write_val(args.parent_tid, &tid)?;
@@ -275,10 +277,12 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     Ok(u64::from(tid))
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn fork(cx: &mut Cx<'_>) -> SysResult {
     clone(cx, u64::from(SIGCHLD), 0, 0, 0, 0)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn vfork(cx: &mut Cx<'_>) -> SysResult {
     clone(cx, CLONE_VM | CLONE_VFORK | u64::from(SIGCHLD), 0, 0, 0, 0)
 }
@@ -487,6 +491,7 @@ pub(crate) fn prctl(cx: &Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn arch_prctl(cx: &mut Cx<'_>, code: u64, addr: u64) -> SysResult {
     match code {
         ARCH_SET_FS => {

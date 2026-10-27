@@ -11,7 +11,9 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI};
-use rk_abi::native::types::{KernelOldTimeval, KernelTimespec};
+#[cfg(target_arch = "x86_64")]
+use rk_abi::native::types::KernelOldTimeval;
+use rk_abi::native::types::KernelTimespec;
 use rk_frame::time::{HZ, ticks};
 use rk_proc::signal::SigSet;
 use rk_vfs::wait::POLL_WAIT;
@@ -162,6 +164,7 @@ fn do_poll(cx: &Cx<'_>, fds: u64, nfds: u64, deadline: Option<u64>) -> SysResult
     Ok(revents.iter().filter(|&&r| r != 0).count() as u64)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn poll(cx: &Cx<'_>, fds: u64, nfds: u64, timeout: u64) -> SysResult {
     let ms = timeout as i32;
     let deadline = (ms >= 0).then(|| deadline_after(ms as u64 * 1_000_000));
@@ -252,6 +255,7 @@ fn do_select(cx: &Cx<'_>, nfds: u64, ptrs: [u64; 3], deadline: Option<u64>) -> S
     Ok(count)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn select(cx: &Cx<'_>, nfds: u64, inp: u64, outp: u64, exp: u64, tvp: u64) -> SysResult {
     let deadline = if tvp == 0 {
         None
@@ -328,6 +332,7 @@ pub(crate) fn pipe2(cx: &Cx<'_>, fds: u64, flags: u64) -> SysResult {
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn pipe(cx: &Cx<'_>, fds: u64) -> SysResult {
     pipe2(cx, fds, 0)
 }

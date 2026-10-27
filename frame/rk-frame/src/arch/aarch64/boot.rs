@@ -231,6 +231,88 @@ rk_aarch64_high:
 8:  wfi
     b       8b
 
+    // The entry of the other CPUs, from PSCI `CPU_ON`, with the MMU off and the number of the CPU
+    // in x0. The boot page tables are in place, so the CPU turns the MMU on with them as the boot
+    // CPU did, and calls `rk_frame_aarch64_secondary_entry` on the stack in `rk_ap_stacks`.
+    .global rk_aarch64_secondary
+rk_aarch64_secondary:
+    mov     x19, x0
+    mrs     x1, CurrentEL
+    cmp     x1, #(2 << 2)
+    b.ne    1f
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1
+    mrs     x1, cnthctl_el2
+    orr     x1, x1, #3
+    msr     cnthctl_el2, x1
+    msr     cntvoff_el2, xzr
+    mov     x1, #0x33ff
+    msr     cptr_el2, x1
+    msr     hstr_el2, xzr
+    ldr     x1, ={sctlr_off}
+    msr     sctlr_el1, x1
+    mov     x1, #0x3c5
+    msr     spsr_el2, x1
+    adr     x1, 1f
+    msr     elr_el2, x1
+    eret
+1:  ldr     x1, ={sctlr_off}
+    msr     sctlr_el1, x1
+    isb
+    mov     x1, #(3 << 20)
+    msr     cpacr_el1, x1
+    isb
+    ldr     x1, ={mair}
+    msr     mair_el1, x1
+    ldr     x1, ={tcr}
+    mrs     x2, id_aa64mmfr0_el1
+    and     x2, x2, #7
+    cmp     x2, #5
+    mov     x3, #5
+    csel    x2, x3, x2, hi
+    bfi     x1, x2, #32, #3
+    msr     tcr_el1, x1
+    adrp    x1, rk_boot_id_l0
+    msr     ttbr0_el1, x1
+    adrp    x1, rk_boot_k_l0
+    msr     ttbr1_el1, x1
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    ldr     x1, ={sctlr_on}
+    msr     sctlr_el1, x1
+    isb
+    ic      iallu
+    dsb     nsh
+    isb
+    ldr     x1, =rk_aarch64_secondary_high
+    br      x1
+
+rk_aarch64_secondary_high:
+    mrs     x1, tcr_el1
+    orr     x1, x1, #{epd0}
+    msr     tcr_el1, x1
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    msr     spsel, #1
+    adrp    x1, rk_ap_stacks
+    add     x1, x1, :lo12:rk_ap_stacks
+    ldr     x1, [x1, x19, lsl #3]
+    mov     sp, x1
+    adrp    x1, rk_aarch64_vectors
+    add     x1, x1, :lo12:rk_aarch64_vectors
+    msr     vbar_el1, x1
+    isb
+    mov     x0, x19
+    mov     x29, xzr
+    mov     x30, xzr
+    bl      rk_frame_aarch64_secondary_entry
+2:  wfi
+    b       2b
+
     // Puts a 1 GiB block for the physical address x6 in the level 1 table x2, with the
     // attributes x5. The index is bits 38 to 30, so the address must be below 512 GiB.
 rk_aarch64_map_gib:
@@ -304,6 +386,7 @@ rk_boot_stack_top:
 /// physical addresses of the device tree and of the image.
 #[unsafe(no_mangle)]
 extern "C" fn rk_frame_aarch64_entry(dtb: u64, image: u64) -> ! {
+    super::cpu::init(0);
     paging::set_kernel_phys(image);
     let mut info = BootInfo::new("linux");
     let platform = match read_device_tree(dtb, &mut info) {
@@ -313,9 +396,46 @@ extern "C" fn rk_frame_aarch64_entry(dtb: u64, image: u64) -> ! {
     super::set_psci_smc(platform.psci_smc);
     crate::mm::frame::init(&info, paging::kernel_phys());
     paging::init(&info);
+    paging::init_cpu();
+    use_devices(&platform, &info);
+    super::smp::set_cpus(&platform.cpus[..platform.cpu_count]);
     super::gic::init();
     super::timer::init();
+    super::user::init_cpu();
     crate::boot::start(info)
+}
+
+/// Points the drivers at the devices of the device tree. A device that the device tree does not
+/// give, or that the kernel cannot map, stays at the address of QEMU `virt`.
+fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
+    let map = |phys: u64, len: u64| {
+        let virt = paging::map_device(phys, len, info);
+        if virt.is_none() {
+            crate::println!("aarch64: cannot map the device at {phys:#x}");
+        }
+        virt
+    };
+    if let Some(base) = platform.uart.and_then(|p| map(p, 0x1000)) {
+        super::pl011::set_base(base);
+    }
+    if platform.gic_v3 && platform.gic.is_none() {
+        crate::println!("aarch64: the GICv3 is not supported, the kernel uses the GICv2 of virt");
+    }
+    if let Some((d, c)) = platform.gic
+        && let (Some(d), Some(c)) = (map(d, 0x1000), map(c, 0x2000))
+    {
+        super::gic::set_base(d, c);
+    }
+    if let Some(intid) = platform.timer_intid {
+        super::timer::set_intid(intid);
+    }
+    if let Some(base) = platform.rtc.and_then(|p| map(p, 0x1000)) {
+        super::rtc::set_base(base);
+    }
+    // TODO(#329): the PCI code of arm64 maps the ECAM with `paging::map_device` and scans it.
+    if let Some((ecam, len)) = platform.pci_ecam {
+        crate::println!("aarch64: PCI ECAM at {ecam:#x}, {} MiB", len >> 20);
+    }
 }
 
 /// Reads the device tree through the boot direct map, which maps the 2 MiB after its start.

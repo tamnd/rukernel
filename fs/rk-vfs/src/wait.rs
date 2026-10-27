@@ -12,7 +12,7 @@ use rk_frame::sync::SpinLock;
 
 /// A queue of tasks that wait for a change of a file.
 pub struct WaitQueue {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     inner: rk_frame::task::WaitQueue,
 }
 
@@ -20,18 +20,18 @@ impl WaitQueue {
     /// Makes an empty queue.
     pub const fn new() -> Self {
         Self {
-            #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+            #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
             inner: rk_frame::task::WaitQueue::new(),
         }
     }
 
     /// Blocks the current task until `cond` gives a value, and gives the value.
     pub fn wait_until<R>(&self, cond: impl FnMut() -> Option<R>) -> R {
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             self.inner.wait_until(cond)
         }
-        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         {
             let mut cond = cond;
             loop {
@@ -50,11 +50,11 @@ impl WaitQueue {
         deadline: u64,
         cond: impl FnMut() -> Option<R>,
     ) -> Option<R> {
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             self.inner.wait_until_timeout(deadline, cond)
         }
-        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
         {
             let _ = deadline;
             let mut cond = cond;
@@ -79,7 +79,7 @@ impl WaitQueue {
 
     /// Wakes each task that waits.
     pub fn wake_all(&self) {
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
         self.inner.wake_all();
     }
 }

@@ -17,14 +17,14 @@ const FRAME_SIZE: usize = 800;
 /// The registers that the entry code saves.
 #[repr(C)]
 pub(crate) struct TrapFrame {
-    x: [u64; 31],
-    elr: u64,
-    spsr: u64,
+    pub(crate) x: [u64; 31],
+    pub(crate) elr: u64,
+    pub(crate) spsr: u64,
     /// The index of the vector table entry.
     kind: u64,
-    fpsr: u64,
-    fpcr: u64,
-    q: [u128; 32],
+    pub(crate) fpsr: u64,
+    pub(crate) fpcr: u64,
+    pub(crate) q: [u128; 32],
 }
 
 const _: () = assert!(size_of::<TrapFrame>() == FRAME_SIZE);
@@ -32,6 +32,11 @@ const _: () = assert!(size_of::<TrapFrame>() == FRAME_SIZE);
 /// The entries of the vector table for EL1 with SP_EL1.
 const EL1_SYNC: u64 = 4;
 const EL1_IRQ: u64 = 5;
+/// The entries of the vector table for EL0 in AArch64.
+const EL0_SYNC: u64 = 8;
+const EL0_IRQ: u64 = 9;
+const EL0_FIQ: u64 = 10;
+const EL0_SERROR: u64 = 11;
 
 /// The exception classes of ESR_EL1 that the handler knows.
 const EC_IABT_EL1: u64 = 0x21;
@@ -223,6 +228,8 @@ extern "C" fn rk_frame_aarch64_trap(frame: *mut TrapFrame) {
     match frame.kind {
         EL1_IRQ => super::interrupt(),
         EL1_SYNC => sync(frame),
+        EL0_IRQ | EL0_FIQ => super::user::trap(frame, 0, 0, true),
+        EL0_SYNC | EL0_SERROR => super::user::trap(frame, read_esr(), read_far(), false),
         _ => oops(frame, read_esr()),
     }
 }

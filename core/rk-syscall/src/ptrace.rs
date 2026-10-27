@@ -1,20 +1,28 @@
 //! `ptrace`, `process_vm_readv` and `process_vm_writev`.
 //!
 //! The tracer reads and changes the registers and the memory of a stopped tracee, and tells it
-//! how to continue. The stops and the waits are in `rk_proc::ptrace`. The requests and the layout
-//! of `struct user_regs_struct` are those of kernel/ptrace.c and arch/x86/kernel/ptrace.c of
-//! Linux.
+//! how to continue. The stops and the waits are in `rk_proc::ptrace`. The requests are those of
+//! kernel/ptrace.c of Linux. The layout of the registers is in the module `regs`, one file for each
+//! architecture.
+
+#[cfg(target_arch = "aarch64")]
+#[path = "ptrace/aarch64.rs"]
+mod regs;
+#[cfg(target_arch = "x86_64")]
+#[path = "ptrace/x86_64.rs"]
+mod regs;
 
 use crate::cx::{Cx, SysResult};
 use crate::fs::read_iovecs;
 use alloc::sync::Arc;
 use alloc::vec;
+use regs::{NREGS, get_regs, set_regs};
+#[cfg(target_arch = "x86_64")]
+use regs::{peek_user, poke_user};
 use rk_abi::Errno;
 use rk_abi::native::signal::SIGSTOP;
-use rk_frame::user::{FpuState, USER_END};
-use rk_proc::ptrace::{
-    self, PTRACE_O_MASK, PTRACE_O_SUSPEND_SECCOMP, Ptrace, Resume, Stop, StopKind,
-};
+use rk_frame::user::FpuState;
+use rk_proc::ptrace::{self, PTRACE_O_MASK, PTRACE_O_SUSPEND_SECCOMP, Resume, Stop, StopKind};
 use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo, SigSet};
 use rk_proc::{Pid, Process, Thread};
 use zerocopy::IntoBytes;
@@ -23,16 +31,22 @@ use zerocopy::IntoBytes;
 const PTRACE_TRACEME: u64 = 0;
 const PTRACE_PEEKTEXT: u64 = 1;
 const PTRACE_PEEKDATA: u64 = 2;
+#[cfg(target_arch = "x86_64")]
 const PTRACE_PEEKUSR: u64 = 3;
 const PTRACE_POKETEXT: u64 = 4;
 const PTRACE_POKEDATA: u64 = 5;
+#[cfg(target_arch = "x86_64")]
 const PTRACE_POKEUSR: u64 = 6;
 const PTRACE_CONT: u64 = 7;
 const PTRACE_KILL: u64 = 8;
 const PTRACE_SINGLESTEP: u64 = 9;
+#[cfg(target_arch = "x86_64")]
 const PTRACE_GETREGS: u64 = 12;
+#[cfg(target_arch = "x86_64")]
 const PTRACE_SETREGS: u64 = 13;
+#[cfg(target_arch = "x86_64")]
 const PTRACE_GETFPREGS: u64 = 14;
+#[cfg(target_arch = "x86_64")]
 const PTRACE_SETFPREGS: u64 = 15;
 const PTRACE_ATTACH: u64 = 16;
 const PTRACE_DETACH: u64 = 17;
@@ -55,34 +69,14 @@ const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
 /// The register sets of `PTRACE_GETREGSET`, from include/uapi/linux/elf.h.
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
-
-/// The number of words in `struct user_regs_struct`.
-const NREGS: usize = 27;
-/// The size of `struct user`, and the offset of `u_debugreg` in it.
-const USER_SIZE: u64 = 912;
-const USER_DEBUGREG: u64 = 848;
-
-/// The words of `struct user_regs_struct`.
-const R_ORIG_RAX: usize = 15;
-const R_CS: usize = 17;
-const R_EFLAGS: usize = 18;
-const R_SS: usize = 20;
-const R_FS_BASE: usize = 21;
-const R_GS_BASE: usize = 22;
-
-/// The user code and data segments of x86-64.
-const USER_CS: u64 = 0x33;
-const USER_DS: u64 = 0x2b;
-
-/// The flags that the tracer can change, as `FLAG_MASK` of Linux: CF, PF, AF, ZF, SF, TF, DF,
-/// OF, RF and AC.
-const FLAG_MASK: u64 = 0x50dd5;
+/// The number of the system call of an arm64 tracee, as an `int`.
+#[cfg(target_arch = "aarch64")]
+const NT_ARM_SYSTEM_CALL: u64 = 0x404;
 
 /// `struct ptrace_syscall_info`: the operations, the architecture and the sizes.
 const SYSCALL_INFO_NONE: u8 = 0;
 const SYSCALL_INFO_ENTRY: u8 = 1;
 const SYSCALL_INFO_EXIT: u8 = 2;
-const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const SYSCALL_INFO_HEADER: usize = 24;
 const SYSCALL_INFO_ENTRY_SIZE: usize = 80;
 const SYSCALL_INFO_EXIT_SIZE: usize = 33;
@@ -176,30 +170,42 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             vm.write_force(addr as usize, &data.to_ne_bytes()).map_err(|_| Errno::EIO)?;
             Ok(0)
         }
+        // arm64 has no such request, as in Linux.
+        #[cfg(target_arch = "x86_64")]
         PTRACE_PEEKUSR => {
             let word = ptrace::with_stopped(tracer, pid, |pt, stop| peek_user(pt, stop, addr))?;
             cx.write_val(data, &word)?;
             Ok(0)
         }
+        // arm64 has no such request, as in Linux.
+        #[cfg(target_arch = "x86_64")]
         PTRACE_POKEUSR => {
             ptrace::with_stopped(tracer, pid, |pt, stop| poke_user(pt, stop, addr, data))?;
             Ok(0)
         }
+        // arm64 has no such request, as in Linux.
+        #[cfg(target_arch = "x86_64")]
         PTRACE_GETREGS => {
             let regs = ptrace::with_stopped(tracer, pid, |pt, stop| Ok(get_regs(pt, stop)))?;
             cx.write_val(data, &regs)?;
             Ok(0)
         }
+        // arm64 has no such request, as in Linux.
+        #[cfg(target_arch = "x86_64")]
         PTRACE_SETREGS => {
             let regs: [u64; NREGS] = cx.read_val(data)?;
             ptrace::with_stopped(tracer, pid, |pt, stop| set_regs(pt, stop, &regs))?;
             Ok(0)
         }
+        // arm64 has no such request, as in Linux.
+        #[cfg(target_arch = "x86_64")]
         PTRACE_GETFPREGS => {
             let fpu = ptrace::with_stopped(tracer, pid, |_, stop| Ok(*stop.regs.fpu().as_bytes()))?;
             cx.write_bytes(data, &fpu)?;
             Ok(0)
         }
+        // arm64 has no such request, as in Linux.
+        #[cfg(target_arch = "x86_64")]
         PTRACE_SETFPREGS => {
             let fpu: [u8; FpuState::SIZE] = cx.read_val(data)?;
             ptrace::with_stopped(tracer, pid, |_, stop| {
@@ -213,6 +219,8 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             let bytes = ptrace::with_stopped(tracer, pid, |pt, stop| match addr {
                 NT_PRSTATUS => Ok(get_regs(pt, stop).as_bytes().to_vec()),
                 NT_PRFPREG => Ok(stop.regs.fpu().as_bytes().to_vec()),
+                #[cfg(target_arch = "aarch64")]
+                NT_ARM_SYSTEM_CALL => Ok((stop.orig_rax as i32).to_ne_bytes().to_vec()),
                 _ => Err(Errno::EINVAL),
             })?;
             let len = bytes.len().min(iov.iov_len as usize);
@@ -225,11 +233,21 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
             let size = match addr {
                 NT_PRSTATUS => NREGS * 8,
                 NT_PRFPREG => FpuState::SIZE,
+                #[cfg(target_arch = "aarch64")]
+                NT_ARM_SYSTEM_CALL => 4,
                 _ => return Err(Errno::EINVAL),
             };
             let len = size.min(iov.iov_len as usize);
             let new = cx.read_bytes(iov.iov_base, len)?;
             ptrace::with_stopped(tracer, pid, |pt, stop| {
+                #[cfg(target_arch = "aarch64")]
+                if addr == NT_ARM_SYSTEM_CALL {
+                    let mut b = [0u8; 4];
+                    b[..len].copy_from_slice(&new);
+                    // The number -1 skips the call, as `NO_SYSCALL` does.
+                    stop.orig_rax = i64::from(i32::from_ne_bytes(b)) as u64;
+                    return Ok(());
+                }
                 if addr == NT_PRSTATUS {
                     let mut regs = get_regs(pt, stop);
                     regs.as_mut_bytes()[..len].copy_from_slice(&new);
@@ -336,150 +354,17 @@ fn tracee_vm(tracer: &Process, pid: Pid) -> Result<Arc<rk_mm::AddressSpace>, Err
     thread.process().vm().ok_or(Errno::ESRCH)
 }
 
-/// Gives `struct user_regs_struct` of the stopped tracee.
-fn get_regs(pt: &Ptrace, stop: &Stop) -> [u64; NREGS] {
-    let r = stop.regs.regs();
-    [
-        r.r15,
-        r.r14,
-        r.r13,
-        r.r12,
-        r.rbp,
-        r.rbx,
-        r.r11,
-        r.r10,
-        r.r9,
-        r.r8,
-        r.rax,
-        r.rcx,
-        r.rdx,
-        r.rsi,
-        r.rdi,
-        stop.orig_rax,
-        r.rip,
-        USER_CS,
-        pt.flags(stop),
-        r.rsp,
-        USER_DS,
-        stop.regs.fs_base(),
-        0,
-        0,
-        0,
-        0,
-        0,
-    ]
-}
-
-/// Tells if `addr` is a canonical address. The return to user mode with a bad address in RIP
-/// or the FS base faults in the kernel.
-fn canonical(addr: u64) -> bool {
-    ((addr as i64) << 16) >> 16 == addr as i64
-}
-
-/// Sets the word `i` of `struct user_regs_struct` of the stopped tracee to `value`, as `putreg`
-/// of Linux does. rukernel has one code segment, one data segment and no GS base for user mode,
-/// so a write to them changes nothing.
-fn set_reg(pt: &mut Ptrace, stop: &mut Stop, i: usize, value: u64) -> Result<(), Errno> {
-    match i {
-        R_ORIG_RAX => stop.orig_rax = value,
-        R_EFLAGS => pt.set_flags(stop, value, FLAG_MASK),
-        R_FS_BASE => {
-            if value >= USER_END as u64 {
-                return Err(Errno::EIO);
-            }
-            stop.regs.set_fs_base(value);
-        }
-        R_CS | R_SS | R_GS_BASE => {}
-        i if i > R_GS_BASE => {}
-        _ => {
-            let r = stop.regs.regs_mut();
-            let field = match i {
-                0 => &mut r.r15,
-                1 => &mut r.r14,
-                2 => &mut r.r13,
-                3 => &mut r.r12,
-                4 => &mut r.rbp,
-                5 => &mut r.rbx,
-                6 => &mut r.r11,
-                7 => &mut r.r10,
-                8 => &mut r.r9,
-                9 => &mut r.r8,
-                10 => &mut r.rax,
-                11 => &mut r.rcx,
-                12 => &mut r.rdx,
-                13 => &mut r.rsi,
-                14 => &mut r.rdi,
-                16 => {
-                    if !canonical(value) {
-                        return Err(Errno::EIO);
-                    }
-                    &mut r.rip
-                }
-                _ => &mut r.rsp,
-            };
-            *field = value;
-        }
-    }
-    Ok(())
-}
-
-/// Sets `struct user_regs_struct` of the stopped tracee, for `PTRACE_SETREGS`.
-fn set_regs(pt: &mut Ptrace, stop: &mut Stop, regs: &[u64; NREGS]) -> Result<(), Errno> {
-    if !canonical(regs[16]) || regs[R_FS_BASE] >= USER_END as u64 {
-        return Err(Errno::EIO);
-    }
-    for (i, &value) in regs.iter().enumerate() {
-        set_reg(pt, stop, i, value)?;
-    }
-    Ok(())
-}
-
-/// Reads the word at `addr` of `struct user`, for `PTRACE_PEEKUSR`.
-fn peek_user(pt: &mut Ptrace, stop: &mut Stop, addr: u64) -> Result<u64, Errno> {
-    if !addr.is_multiple_of(8) || addr >= USER_SIZE {
-        return Err(Errno::EIO);
-    }
-    let i = (addr / 8) as usize;
-    if i < NREGS {
-        return Ok(get_regs(pt, stop)[i]);
-    }
-    Ok(addr.checked_sub(USER_DEBUGREG).map_or(0, |off| pt.debugreg[(off / 8) as usize]))
-}
-
-/// Writes the word at `addr` of `struct user`, for `PTRACE_POKEUSR`. The address of a breakpoint
-/// in DR0 to DR3 must be in user space, else the write gives `EINVAL`. DR4 and DR5 do not exist
-/// and give `EIO`. The other words of `struct user` do not change.
-fn poke_user(pt: &mut Ptrace, stop: &mut Stop, addr: u64, value: u64) -> Result<(), Errno> {
-    if !addr.is_multiple_of(8) || addr >= USER_SIZE {
-        return Err(Errno::EIO);
-    }
-    let i = (addr / 8) as usize;
-    if i < NREGS {
-        return set_reg(pt, stop, i, value);
-    }
-    let Some(n) = addr.checked_sub(USER_DEBUGREG).map(|off| (off / 8) as usize) else {
-        return Ok(());
-    };
-    match n {
-        0..=3 if value >= USER_END as u64 => Err(Errno::EINVAL),
-        4 | 5 => Err(Errno::EIO),
-        _ => {
-            pt.debugreg[n] = value;
-            Ok(())
-        }
-    }
-}
-
 /// Gives `struct ptrace_syscall_info` of the stopped tracee and its size.
 fn syscall_info(stop: &Stop) -> ([u8; SYSCALL_INFO_ENTRY_SIZE], usize) {
-    let r = stop.regs.regs();
+    let r = &stop.regs;
     let mut b = [0u8; SYSCALL_INFO_ENTRY_SIZE];
-    b[4..8].copy_from_slice(&AUDIT_ARCH_X86_64.to_ne_bytes());
-    b[8..16].copy_from_slice(&r.rip.to_ne_bytes());
-    b[16..24].copy_from_slice(&r.rsp.to_ne_bytes());
+    b[4..8].copy_from_slice(&rk_frame::user::AUDIT_ARCH.to_ne_bytes());
+    b[8..16].copy_from_slice(&r.pc().to_ne_bytes());
+    b[16..24].copy_from_slice(&r.sp().to_ne_bytes());
     let (op, size) = match stop.kind {
         StopKind::SyscallEntry => {
-            let args = [stop.orig_rax, r.rdi, r.rsi, r.rdx, r.r10, r.r8, r.r9];
+            let a = r.syscall_args();
+            let args = [stop.orig_rax, a[0], a[1], a[2], a[3], a[4], a[5]];
             for (i, a) in args.iter().enumerate() {
                 let at = SYSCALL_INFO_HEADER + i * 8;
                 b[at..at + 8].copy_from_slice(&a.to_ne_bytes());
@@ -487,7 +372,7 @@ fn syscall_info(stop: &Stop) -> ([u8; SYSCALL_INFO_ENTRY_SIZE], usize) {
             (SYSCALL_INFO_ENTRY, SYSCALL_INFO_ENTRY_SIZE)
         }
         StopKind::SyscallExit => {
-            let rval = r.rax as i64;
+            let rval = r.syscall_return() as i64;
             b[24..32].copy_from_slice(&rval.to_ne_bytes());
             b[32] = u8::from((-MAX_ERRNO..0).contains(&rval));
             (SYSCALL_INFO_EXIT, SYSCALL_INFO_EXIT_SIZE)

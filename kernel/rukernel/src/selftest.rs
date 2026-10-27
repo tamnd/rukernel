@@ -3,7 +3,7 @@
 //! `rk.test=NAME` on the command line runs one test and stops the virtual machine with the result.
 //! `cargo xtask boot-test` boots the kernel one time for each test.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_frame::addr::VirtAddr;
@@ -21,13 +21,13 @@ pub(crate) fn run(name: &str) -> bool {
         "heap" => heap_test(),
         "timer" => timer_test(),
         "initramfs" => initramfs_test(),
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         "syscall" => syscall_test(),
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         "vm" => vm_test(),
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         "task" => task_test(),
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         "fault" => fault_test(),
         #[cfg(target_arch = "x86_64")]
         "net" => net_test(),
@@ -45,15 +45,81 @@ fn check(what: &str, ok: bool) -> bool {
 }
 
 /// The permissions of the user pages of the tests.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const RX: rk_frame::vm::PageProt =
     rk_frame::vm::PageProt { readable: true, writable: false, executable: true };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const RW: rk_frame::vm::PageProt =
     rk_frame::vm::PageProt { readable: true, writable: true, executable: false };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const RO: rk_frame::vm::PageProt =
     rk_frame::vm::PageProt { readable: true, writable: false, executable: false };
+
+/// The register where the user programs of the tests put a result: RBX on x86-64, x19 on arm64.
+#[cfg(target_arch = "x86_64")]
+fn result_reg(ctx: &rk_frame::user::UserContext) -> u64 {
+    ctx.regs().rbx
+}
+#[cfg(target_arch = "aarch64")]
+fn result_reg(ctx: &rk_frame::user::UserContext) -> u64 {
+    ctx.regs().x[19]
+}
+
+/// The register where the syscall program counts the numbers: R12 on x86-64, x20 on arm64.
+#[cfg(target_arch = "x86_64")]
+fn counter_reg(ctx: &rk_frame::user::UserContext) -> u64 {
+    ctx.regs().r12
+}
+#[cfg(target_arch = "aarch64")]
+fn counter_reg(ctx: &rk_frame::user::UserContext) -> u64 {
+    ctx.regs().x[20]
+}
+
+/// The register where the FPU program puts the word at the thread pointer: RCX on x86-64, x21 on
+/// arm64.
+#[cfg(target_arch = "x86_64")]
+fn tls_reg(ctx: &rk_frame::user::UserContext) -> u64 {
+    ctx.regs().rcx
+}
+#[cfg(target_arch = "aarch64")]
+fn tls_reg(ctx: &rk_frame::user::UserContext) -> u64 {
+    ctx.regs().x[21]
+}
+
+/// The distance from the end of a program to the program counter when it stops at its last
+/// instruction, a breakpoint. `int3` gives the address after it, and `brk` gives its own address.
+#[cfg(target_arch = "x86_64")]
+const BREAK_PC_FROM_END: usize = 0;
+#[cfg(target_arch = "aarch64")]
+const BREAK_PC_FROM_END: usize = 4;
+
+/// Tells if the user program stopped at a breakpoint instruction.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn is_breakpoint(e: &rk_frame::user::UserException) -> bool {
+    e.kind() == rk_frame::user::ExceptionKind::Breakpoint
+}
+
+/// Makes the bytes of an arm64 program from its instructions.
+#[cfg(target_arch = "aarch64")]
+const fn arm64_code<const N: usize>(words: &[u32]) -> [u8; N] {
+    let mut bytes = [0u8; N];
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i].to_le_bytes();
+        bytes[4 * i] = w[0];
+        bytes[4 * i + 1] = w[1];
+        bytes[4 * i + 2] = w[2];
+        bytes[4 * i + 3] = w[3];
+        i += 1;
+    }
+    bytes
+}
+
+/// The instruction that fills the free space of a code page: `int3` on x86-64, `brk #0` on arm64.
+#[cfg(target_arch = "x86_64")]
+const BREAK_FILL: [u8; 4] = [0xcc; 4];
+#[cfg(target_arch = "aarch64")]
+const BREAK_FILL: [u8; 4] = 0xd420_0000_u32.to_le_bytes();
 
 /// An address that is canonical and has no mapping. A read from it is a page fault.
 const UNMAPPED: usize = 0xffff_c000_0000_0000;
@@ -275,7 +341,43 @@ const SYSCALL_PROGRAM: [u8; 31] = [
 #[cfg(target_arch = "x86_64")]
 const SYSCALL_PROGRAM_LIMIT: usize = 24;
 
+/// The user program of the syscall test on arm64. It makes each system call number from 0 to the
+/// end of the table, and counts the returns that are not `-ENOSYS` in x19. Then it stops with
+/// `brk`.
+#[cfg(target_arch = "aarch64")]
+const SYSCALL_PROGRAM: [u8; 48] = arm64_code(&[
+    0xd280_0014, // mov x20, #0
+    0xd280_0013, // mov x19, #0
+    0xaa14_03e8, // 1: mov x8, x20
+    0xd400_0001, // svc #0
+    0xb100_981f, // cmn x0, #38
+    0x5400_0040, // b.eq 2f
+    0x9100_0673, // add x19, x19, #1
+    0x9100_0694, // 2: add x20, x20, #1
+    0x5280_0009, // mov w9, #NR_SYSCALLS
+    0xeb09_029f, // cmp x20, x9
+    0x54ff_ff03, // b.lo 1b
+    0xd420_0000, // brk #0
+]);
+
+/// Gives the syscall program with the number of system calls in it.
 #[cfg(target_arch = "x86_64")]
+fn syscall_program(count: u32) -> [u8; SYSCALL_PROGRAM.len()] {
+    let mut program = SYSCALL_PROGRAM;
+    program[SYSCALL_PROGRAM_LIMIT..SYSCALL_PROGRAM_LIMIT + 4].copy_from_slice(&count.to_le_bytes());
+    program
+}
+
+/// Gives the syscall program with the number of system calls in the `mov w9` instruction at
+/// offset 32. The immediate value is in bits 5 to 20.
+#[cfg(target_arch = "aarch64")]
+fn syscall_program(count: u32) -> [u8; SYSCALL_PROGRAM.len()] {
+    let mut program = SYSCALL_PROGRAM;
+    program[32..36].copy_from_slice(&(0x5280_0009 | (count & 0xffff) << 5).to_le_bytes());
+    program
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn syscall_test() -> bool {
     use crate::syscall;
     use rk_abi::native::syscalls::NR_SYSCALLS;
@@ -284,11 +386,8 @@ fn syscall_test() -> bool {
 
     const CODE: usize = 0x40_0000;
     const STACK: usize = 0x7fff_ffff_e000;
-    const BREAKPOINT: u8 = 3;
 
-    let mut program = SYSCALL_PROGRAM;
-    let limit = (NR_SYSCALLS as u32).to_le_bytes();
-    program[SYSCALL_PROGRAM_LIMIT..SYSCALL_PROGRAM_LIMIT + 4].copy_from_slice(&limit);
+    let program = syscall_program(NR_SYSCALLS as u32);
     let (Some(mut code), Some(mut stack)) = (mm::alloc_frame(), mm::alloc_frame()) else {
         return check("two frames for the user pages", false);
     };
@@ -341,14 +440,14 @@ fn syscall_test() -> bool {
     let calls = syscall::count() - start;
     println!("rk.test: {calls} system calls, {interrupts} interrupts in user mode");
     ok &= check(
-        "the program stops at its int3",
-        reason.is_some_and(|e| e.vector == BREAKPOINT)
-            && ctx.regs().rip == (CODE + SYSCALL_PROGRAM.len()) as u64,
+        "the program stops at its breakpoint",
+        reason.is_some_and(|e| is_breakpoint(&e))
+            && ctx.pc() == (CODE + SYSCALL_PROGRAM.len() - BREAK_PC_FROM_END) as u64,
     );
     ok &= check("each system call number is made", calls == NR_SYSCALLS as u64);
     ok &= check(
         "each number gives -ENOSYS",
-        ctx.regs().r12 == NR_SYSCALLS as u64 && ctx.regs().rbx == 0,
+        counter_reg(&ctx) == NR_SYSCALLS as u64 && result_reg(&ctx) == 0,
     );
     ok &= check("interrupts are off again", !irq::enabled());
     VmSpace::deactivate();
@@ -376,7 +475,33 @@ const FPU_PROGRAM_B: [u8; 15] = [
     0x66, 0x48, 0x0f, 0x6e, 0xc0, // movq xmm0, rax
 ];
 
-#[cfg(target_arch = "x86_64")]
+/// The user programs of the FPU test on arm64. Program A puts a value in d0, makes a system call,
+/// copies d0 to x19 and reads the word at TPIDR_EL0 into x21. Program B puts another value in d0.
+#[cfg(target_arch = "aarch64")]
+const FPU_PROGRAM_A: [u8; 44] = arm64_code(&[
+    0xd28e_f100, // mov x0, #0x7788
+    0xf2aa_acc0, // movk x0, #0x5566, lsl #16
+    0xf2c6_6880, // movk x0, #0x3344, lsl #32
+    0xf2e2_2440, // movk x0, #0x1122, lsl #48
+    0x9e67_0000, // fmov d0, x0
+    0xd280_1588, // mov x8, #172 (getpid)
+    0xd400_0001, // svc #0
+    0x9e66_0013, // fmov x19, d0
+    0xd53b_d049, // mrs x9, tpidr_el0
+    0xf940_0135, // ldr x21, [x9]
+    0xd420_0000, // brk #0
+]);
+#[cfg(target_arch = "aarch64")]
+const FPU_PROGRAM_B: [u8; 24] = arm64_code(&[
+    0xd293_3320, // mov x0, #0x9999
+    0xf2b3_3320, // movk x0, #0x9999, lsl #16
+    0xf2d3_3320, // movk x0, #0x9999, lsl #32
+    0xf2f3_3320, // movk x0, #0x9999, lsl #48
+    0x9e67_0000, // fmov d0, x0
+    0xd420_0000, // brk #0
+]);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn fpu_test() -> bool {
     use crate::syscall;
     use rk_frame::user::{ReturnReason, UserContext};
@@ -386,14 +511,16 @@ fn fpu_test() -> bool {
     const B_OFFSET: usize = 0x80;
     const DATA: usize = 0x60_0000;
     const STACK: usize = 0x7fff_fffd_e000;
-    const INT3: u8 = 0xcc;
 
     let (Some(mut code), Some(mut data), Some(stack)) =
         (mm::alloc_frame(), mm::alloc_frame(), mm::alloc_frame())
     else {
         return check("three frames for the FPU test", false);
     };
-    let mut bytes = [INT3; 4096];
+    let mut bytes = [0u8; 4096];
+    for chunk in bytes.chunks_mut(4) {
+        chunk.copy_from_slice(&BREAK_FILL);
+    }
     bytes[..FPU_PROGRAM_A.len()].copy_from_slice(&FPU_PROGRAM_A);
     bytes[B_OFFSET..B_OFFSET + FPU_PROGRAM_B.len()].copy_from_slice(&FPU_PROGRAM_B);
     for (i, chunk) in bytes.chunks(8).enumerate() {
@@ -415,7 +542,7 @@ fn fpu_test() -> bool {
     space.activate();
 
     let mut a = UserContext::new(VirtAddr::new(CODE), VirtAddr::new(STACK + 4096));
-    a.set_fs_base((DATA + 16) as u64);
+    a.set_tls((DATA + 16) as u64);
     let mut b = UserContext::new(VirtAddr::new(CODE + B_OFFSET), VirtAddr::new(STACK + 4096));
     let run = |ctx: &mut UserContext| loop {
         match ctx.execute() {
@@ -425,11 +552,17 @@ fn fpu_test() -> bool {
     };
     ok &= check("program A makes a system call", run(&mut a) == ReturnReason::Syscall);
     syscall::dispatch(&mut a);
-    ok &= check("program B stops at its int3", matches!(run(&mut b), ReturnReason::Exception(_)));
-    ok &= check("program A stops at its int3", matches!(run(&mut a), ReturnReason::Exception(_)));
-    ok &= check("XMM0 of program A is kept", a.regs().rbx == 0x1122_3344_5566_7788);
-    ok &= check("the FS base of program A is used", a.regs().rcx == 0xfeed_f00d);
-    ok &= check("the SSE state of the two programs is different", a.fpu() != b.fpu());
+    ok &= check(
+        "program B stops at its breakpoint",
+        matches!(run(&mut b), ReturnReason::Exception(_)),
+    );
+    ok &= check(
+        "program A stops at its breakpoint",
+        matches!(run(&mut a), ReturnReason::Exception(_)),
+    );
+    ok &= check("the SIMD register of program A is kept", result_reg(&a) == 0x1122_3344_5566_7788);
+    ok &= check("the thread pointer of program A is used", tls_reg(&a) == 0xfeed_f00d);
+    ok &= check("the FP state of the two programs is different", a.fpu() != b.fpu());
     VmSpace::deactivate();
     ok
 }
@@ -441,9 +574,17 @@ const VM_PROGRAM: [u8; 9] = [
     0xcc, // int3
 ];
 
+/// The user program of the address space test on arm64: it reads the word at `VM_DATA` into x19.
+#[cfg(target_arch = "aarch64")]
+const VM_PROGRAM: [u8; 12] = arm64_code(&[
+    0xd2a0_0c09, // mov x9, #0x600000
+    0xf940_0133, // ldr x19, [x9]
+    0xd420_0000, // brk #0
+]);
+
 /// Two address spaces map the same code frame and different data frames at the same addresses.
 /// Each program reads its own data. When the address spaces go, each frame goes back.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn vm_test() -> bool {
     use rk_frame::user::{ReturnReason, UserContext};
     use rk_frame::vm::{UserFault, VmSpace};
@@ -506,10 +647,10 @@ fn vm_test() -> bool {
             }
         };
         ok &= check(
-            "the program stops at its int3",
-            matches!(reason, ReturnReason::Exception(e) if e.vector == 3),
+            "the program stops at its breakpoint",
+            matches!(reason, ReturnReason::Exception(e) if is_breakpoint(&e)),
         );
-        *value = ctx.regs().rbx;
+        *value = result_reg(&ctx);
         // The address space is active when it goes, so the drop loads the kernel table.
         drop(space);
     }
@@ -523,7 +664,7 @@ fn vm_test() -> bool {
 
 /// Three tasks take turns, a task waits in a wait queue for another task, and the stacks of the
 /// exited tasks go back to the heap.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn task_test() -> bool {
     use alloc::vec::Vec;
     use rk_frame::sync::SpinLock;
@@ -534,6 +675,9 @@ fn task_test() -> bool {
     static VALUE: AtomicU64 = AtomicU64::new(0);
 
     let heap_before = mm::heap_stats().in_use;
+    // The log has room for each entry, so the first push of a task takes no more time than the
+    // other pushes. The fair scheduler charges the time that a task runs.
+    LOG.lock().reserve(16);
     let mut tasks = Vec::new();
     for n in 1..=3u64 {
         let task = TaskOptions::new(move || {
@@ -556,7 +700,17 @@ fn task_test() -> bool {
     }
     let log = core::mem::take(&mut *LOG.lock());
     println!("rk.test: the tasks ran in the order {log:?}");
-    ok &= check("the tasks take turns", log == [10, 20, 30, 11, 21, 31, 12, 22, 32]);
+    // The fair scheduler charges the time that each task runs. Without KVM, an interrupt can make
+    // one turn much longer, and then the other tasks can run more turns first. So the check is
+    // the first turn of each task in the order of the spawns, and the order of the turns of each
+    // task.
+    let turns = |n: u64| log.iter().filter(|&&v| v / 10 == n).copied().collect::<Vec<_>>();
+    ok &= check(
+        "the tasks take turns",
+        log.len() == 9
+            && log[..3] == [10, 20, 30]
+            && (1..=3).all(|n| turns(n) == [n * 10, n * 10 + 1, n * 10 + 2]),
+    );
     ok &= check("the boot task is the current task", Task::current().id() == 0);
 
     let waiter = TaskOptions::new(|| {
@@ -602,18 +756,30 @@ const FAULT_PROGRAM: [u8; 33] = [
     0xcc, // int3
 ];
 
+/// The user program of the fault test on arm64, as `FAULT_PROGRAM` of x86-64.
+#[cfg(target_arch = "aarch64")]
+const FAULT_PROGRAM: [u8; 32] = arm64_code(&[
+    0xd2a2_0009, // mov x9, #0x10000000
+    0xd280_002a, // mov x10, #1
+    0xf900_012a, // str x10, [x9]
+    0x9140_052b, // add x11, x9, #0x1000
+    0xf900_016a, // str x10, [x11]
+    0x9140_092c, // add x12, x9, #0x2000
+    0xf940_0193, // ldr x19, [x12]
+    0xd420_0000, // brk #0
+]);
+
 /// A user program gets its pages at the first access, and `fork`, copy on write, `munmap`,
 /// `mprotect` and `brk` change the address space as Linux does.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn fault_test() -> bool {
     use rk_abi::Errno;
-    use rk_frame::user::{ReturnReason, UserContext};
+    use rk_frame::user::{ExceptionKind, FaultAccess, ReturnReason, UserContext};
     use rk_mm::{Access, AddressSpace, MmapRequest, Prot};
 
     const CODE: usize = 0x40_0000;
     const DATA: usize = 0x1000_0000;
     const HEAP: usize = 0x80_0000;
-    const PAGE_FAULT: u8 = 14;
     const RX: Prot = Prot { read: true, write: false, exec: true };
     const RO: Prot = Prot { read: true, write: false, exec: false };
 
@@ -638,23 +804,27 @@ fn fault_test() -> bool {
     let reason = loop {
         match ctx.execute() {
             ReturnReason::Interrupt => {}
-            ReturnReason::Exception(e) if e.vector == PAGE_FAULT => {
-                faults += 1;
-                let access = if e.error & 2 != 0 { Access::Write } else { Access::Read };
-                if space.handle_fault(e.addr as usize, access).is_err() {
-                    break None;
+            ReturnReason::Exception(e) => match e.kind() {
+                ExceptionKind::PageFault { addr, access, .. } => {
+                    faults += 1;
+                    let access =
+                        if access == FaultAccess::Write { Access::Write } else { Access::Read };
+                    if space.handle_fault(addr as usize, access).is_err() {
+                        break None;
+                    }
                 }
-            }
+                _ => break Some(ReturnReason::Exception(e)),
+            },
             other => break Some(other),
         }
     };
     rk_frame::vm::VmSpace::deactivate();
     ok &= check(
-        "the program stops at its int3",
-        matches!(reason, Some(ReturnReason::Exception(e)) if e.vector == 3),
+        "the program stops at its breakpoint",
+        matches!(reason, Some(ReturnReason::Exception(e)) if is_breakpoint(&e)),
     );
     ok &= check("each data page is one fault", faults == 3);
-    ok &= check("a new page reads as zero", ctx.regs().rbx == 0);
+    ok &= check("a new page reads as zero", result_reg(&ctx) == 0);
     let read = |s: &AddressSpace, addr| {
         let mut b = [0u8; 8];
         s.read(addr, &mut b).map(|()| u64::from_le_bytes(b))
@@ -715,7 +885,7 @@ fn fault_test() -> bool {
 }
 
 /// `mremap` grows an area in place, moves it with its pages, and gives the errors of Linux.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn mremap_checks(
     space: &rk_mm::AddressSpace,
     read: &dyn Fn(&rk_mm::AddressSpace, usize) -> Result<u64, rk_abi::Errno>,

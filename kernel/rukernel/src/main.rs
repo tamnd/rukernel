@@ -19,7 +19,7 @@ mod kernel;
 mod rootfs;
 #[cfg(target_os = "none")]
 mod selftest;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod syscall;
 
 #[cfg(not(target_os = "none"))]
