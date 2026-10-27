@@ -7,8 +7,9 @@
 use crate::cx::{Cx, SysResult};
 use crate::info::{timespec, timespec_ns};
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::open::O_RDWR;
 use rk_abi::native::time::{
@@ -31,6 +32,36 @@ struct Ticks {
     wait: WaitQueue,
     /// The count of the expirations, for an edge triggered epoll entry.
     events: AtomicU64,
+    /// The timer has an absolute time of `CLOCK_REALTIME` and `TFD_TIMER_CANCEL_ON_SET`.
+    might_cancel: AtomicBool,
+    /// The real time changed after `timerfd_settime` with `TFD_TIMER_CANCEL_ON_SET`. The next
+    /// read gives `ECANCELED`.
+    canceled: AtomicBool,
+}
+
+/// The timer files that have `TFD_TIMER_CANCEL_ON_SET`.
+static CANCEL_LIST: SpinLock<Vec<Weak<Ticks>>> = SpinLock::new(Vec::new());
+
+/// Tells each timer file with `TFD_TIMER_CANCEL_ON_SET` that the real time changed, as
+/// `timerfd_clock_was_set` of Linux does. The file becomes readable, and the read gives
+/// `ECANCELED`.
+pub(crate) fn clock_was_set() {
+    let list: Vec<Arc<Ticks>> = {
+        let mut list = CANCEL_LIST.lock();
+        list.retain(|t| t.strong_count() > 0);
+        list.iter().filter_map(Weak::upgrade).collect()
+    };
+    for ticks in list {
+        if ticks.might_cancel.load(Ordering::Relaxed)
+            && !ticks.canceled.swap(true, Ordering::Relaxed)
+        {
+            {
+                let mut c = ticks.count.lock();
+                *c = c.saturating_add(1);
+            }
+            ticks.wake();
+        }
+    }
 }
 
 impl Ticks {
@@ -71,6 +102,10 @@ impl FileOps for TimerFd {
         let nonblock = file.flags().nonblock();
         let value = self.ticks.wait.wait_interruptible(|| {
             let mut count = self.ticks.count.lock();
+            if self.ticks.canceled.swap(false, Ordering::Relaxed) {
+                *count = 0;
+                return Err(Errno::ECANCELED);
+            }
             match *count {
                 0 if nonblock => Err(Errno::EAGAIN),
                 0 => Ok(None),
@@ -132,6 +167,8 @@ pub(crate) fn timerfd_create(cx: &Cx<'_>, clock: u64, flags: u64) -> SysResult {
         count: SpinLock::new(0),
         wait: WaitQueue::new(),
         events: AtomicU64::new(0),
+        might_cancel: AtomicBool::new(false),
+        canceled: AtomicBool::new(false),
     });
     let weak: Weak<dyn Expire> = Arc::downgrade(&ticks) as Weak<dyn Expire>;
     let timer = if matches!(clock as u32, CLOCK_REALTIME | CLOCK_REALTIME_ALARM) {
@@ -183,8 +220,21 @@ pub(crate) fn timerfd_settime(cx: &Cx<'_>, fd: u64, flags: u64, new: u64, old: u
     } else {
         tfd.timer.now().saturating_add(value)
     };
+    let abs = flags & TFD_TIMER_ABSTIME != 0;
+    let cancel = abs && flags & TFD_TIMER_CANCEL_ON_SET != 0 && tfd.timer.is_realtime();
+    {
+        let mut list = CANCEL_LIST.lock();
+        list.retain(|t| {
+            t.strong_count() > 0 && !core::ptr::eq(t.as_ptr(), Arc::as_ptr(&tfd.ticks))
+        });
+        if cancel {
+            list.push(Arc::downgrade(&tfd.ticks));
+        }
+    }
+    tfd.ticks.might_cancel.store(cancel, Ordering::Relaxed);
+    tfd.ticks.canceled.store(false, Ordering::Relaxed);
     *tfd.ticks.count.lock() = 0;
-    let prev = tfd.timer.arm(expires, interval);
+    let prev = tfd.timer.arm_abs(expires, interval, abs);
     cx.write_opt(old, &itimerspec(prev))?;
     Ok(0)
 }

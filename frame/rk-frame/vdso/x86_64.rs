@@ -64,8 +64,9 @@ fn rdtsc() -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
-/// The nanoseconds since boot. This is the calculation of `clock_ns` in the kernel.
-fn now_ns() -> u64 {
+/// The nanoseconds since boot and the offset of `CLOCK_REALTIME`. This is the calculation of
+/// `clock_ns` in the kernel. The two values come from the same version of the page.
+fn now_and_offset() -> (u64, u64) {
     let d = data();
     // SAFETY: the kernel maps the data page below the vDSO, and it writes each field with one
     // aligned store. The sequence count tells if the kernel changed the page between the reads.
@@ -77,25 +78,28 @@ fn now_ns() -> u64 {
             let ns_per_tick = core::ptr::addr_of!((*d).ns_per_tick).read_volatile();
             let base = core::ptr::addr_of!((*d).tick_tsc).read_volatile();
             let mult = core::ptr::addr_of!((*d).tsc_mult).read_volatile();
+            let offset = core::ptr::addr_of!((*d).realtime_offset).read_volatile();
             let now = rdtsc();
             compiler_fence(Ordering::SeqCst);
             if seq & 1 == 0 && core::ptr::addr_of!((*d).seq).read_volatile() == seq {
                 let cycles = now.saturating_sub(base);
                 let part = ((u128::from(cycles) * u128::from(mult)) >> 32)
                     .min(u128::from(ns_per_tick.saturating_sub(1)));
-                return ticks.wrapping_mul(ns_per_tick).wrapping_add(part as u64);
+                return (ticks.wrapping_mul(ns_per_tick).wrapping_add(part as u64), offset);
             }
         }
     }
 }
 
+/// The nanoseconds since boot.
+fn now_ns() -> u64 {
+    now_and_offset().0
+}
+
 /// The nanoseconds of `CLOCK_REALTIME`. This is the calculation of `realtime_ns` in the kernel.
 fn realtime_ns() -> u64 {
-    let d = data();
-    // SAFETY: as in `now_ns`. The kernel writes the word before it maps the page, and it does not
-    // change it.
-    let offset = unsafe { core::ptr::addr_of!((*d).realtime_offset).read_volatile() };
-    now_ns().wrapping_add(offset)
+    let (now, offset) = now_and_offset();
+    now.wrapping_add(offset)
 }
 
 /// The time of the clock `clock`, which `known` accepts, in nanoseconds.

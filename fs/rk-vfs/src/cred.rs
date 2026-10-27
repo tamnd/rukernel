@@ -105,6 +105,8 @@ pub mod cap {
     pub const SYS_NICE: u32 = 23;
     /// Go past the resource limits.
     pub const SYS_RESOURCE: u32 = 24;
+    /// Set the system clock and the NTP state.
+    pub const SYS_TIME: u32 = 25;
     /// Make a device file.
     pub const MKNOD: u32 = 27;
     /// Set the capabilities of a file.

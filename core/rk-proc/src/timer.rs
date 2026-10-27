@@ -94,6 +94,8 @@ struct TimerState {
     key: Option<(u64, u64)>,
     /// The overrun count of the last signal that a thread took, for `timer_getoverrun`.
     overrun: i32,
+    /// The timer of `CLOCK_REALTIME` has an absolute time, so a clock set moves its time.
+    abs: bool,
 }
 
 /// A timer.
@@ -151,6 +153,12 @@ impl Timer {
     /// `expires` of 0 turns the timer off. Gives the remaining time and the interval before the
     /// change. The pending signal of a POSIX timer from the old setting is discarded.
     pub fn arm(self: &Arc<Self>, expires: u64, interval: u64) -> (u64, u64) {
+        self.arm_abs(expires, interval, false)
+    }
+
+    /// Sets the timer as `arm` does. With `abs`, a timer of `CLOCK_REALTIME` has an absolute time,
+    /// and `clock_was_set` moves the time when the real time changes.
+    pub fn arm_abs(self: &Arc<Self>, expires: u64, interval: u64, abs: bool) -> (u64, u64) {
         if self.info.code == crate::signal::SI_TIMER {
             match &self.target {
                 Target::Process(p) => {
@@ -173,6 +181,7 @@ impl Timer {
             QUEUE.lock().remove(&key);
         }
         let was_on = s.expires != 0;
+        s.abs = abs && self.realtime;
         s.expires = expires;
         s.interval = if expires == 0 { 0 } else { interval };
         if !matches!(self.clock, Clock::Boot) {
@@ -355,6 +364,31 @@ fn start() {
     STARTED.call_once(|| {
         let _ = TaskOptions::new(run).spawn();
     });
+}
+
+/// Moves the time of each timer of `CLOCK_REALTIME` with an absolute time after a clock set. The
+/// offset of the real time to the clock since boot grew by `delta` nanoseconds, so the time since
+/// boot of each absolute time is `delta` less. A time that is now in the past fires the timer.
+pub fn clock_was_set(delta: i64) {
+    // The lock of a timer comes before the lock of the queue, as in `arm`.
+    let timers: alloc::vec::Vec<Arc<Timer>> =
+        QUEUE.lock().values().filter(|t| t.realtime).cloned().collect();
+    for timer in timers {
+        let mut s = timer.state.lock();
+        let Some(old) = s.key else { continue };
+        if !s.abs {
+            continue;
+        }
+        let expires = (i128::from(s.expires) - i128::from(delta)).clamp(1, i128::from(u64::MAX));
+        s.expires = expires as u64;
+        let key = (s.expires, NEXT_KEY.fetch_add(1, Ordering::Relaxed));
+        s.key = Some(key);
+        let mut q = QUEUE.lock();
+        q.remove(&old);
+        q.insert(key, timer.clone());
+    }
+    EPOCH.fetch_add(1, Ordering::Release);
+    WAKE.wake_all();
 }
 
 /// The timer task.

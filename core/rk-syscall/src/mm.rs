@@ -18,7 +18,9 @@ use rk_abi::native::mman::{
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
+use rk_proc::limits::RLIMIT_MEMLOCK;
 use rk_vfs::InodeRef;
+use rk_vfs::cred::cap;
 
 /// The flags of `mmap` that `MAP_SHARED_VALIDATE` accepts. Linux names the mask `LEGACY_MAP_MASK`.
 /// It has the map type, `MAP_FIXED`, `MAP_ANONYMOUS`, `MAP_32BIT`, `MAP_GROWSDOWN`,
@@ -302,8 +304,24 @@ pub(crate) fn mremap(
     Ok(cx.vm()?.mremap(addr as usize, old_len as usize, new_len as usize, remap)? as u64)
 }
 
+/// The most locked bytes of the caller, as `can_do_mlock` of Linux checks them: `None` if the
+/// caller has `CAP_IPC_LOCK`. Gives `EPERM` if `RLIMIT_MEMLOCK` is 0 and the caller does not have
+/// the capability.
+fn lock_limit(cx: &Cx<'_>) -> Result<Option<usize>, Errno> {
+    if cx.process().cred().capable(cap::IPC_LOCK) {
+        return Ok(None);
+    }
+    let limit = cx.process().limit(RLIMIT_MEMLOCK).cur;
+    if limit == 0 {
+        return Err(Errno::EPERM);
+    }
+    // The limit counts whole pages, as Linux does.
+    Ok(Some(usize::try_from(limit).unwrap_or(usize::MAX) & !(PAGE_SIZE - 1)))
+}
+
 pub(crate) fn mlock(cx: &Cx<'_>, addr: u64, len: u64) -> SysResult {
-    cx.vm()?.mlock(addr as usize, len as usize, true, false)?;
+    let limit = lock_limit(cx)?;
+    cx.vm()?.mlock(addr as usize, len as usize, true, false, limit)?;
     Ok(0)
 }
 
@@ -311,12 +329,13 @@ pub(crate) fn mlock2(cx: &Cx<'_>, addr: u64, len: u64, flags: u64) -> SysResult 
     if flags & !u64::from(MLOCK_ONFAULT) != 0 {
         return Err(Errno::EINVAL);
     }
-    cx.vm()?.mlock(addr as usize, len as usize, true, flags != 0)?;
+    let limit = lock_limit(cx)?;
+    cx.vm()?.mlock(addr as usize, len as usize, true, flags != 0, limit)?;
     Ok(0)
 }
 
 pub(crate) fn munlock(cx: &Cx<'_>, addr: u64, len: u64) -> SysResult {
-    cx.vm()?.mlock(addr as usize, len as usize, false, false)?;
+    cx.vm()?.mlock(addr as usize, len as usize, false, false, None)?;
     Ok(0)
 }
 
@@ -327,18 +346,20 @@ pub(crate) fn mlockall(cx: &Cx<'_>, flags: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let flags = flags as u32;
+    let limit = lock_limit(cx)?;
     let vm = cx.vm()?;
     vm.mlock_all(
         true,
         flags & MCL_CURRENT != 0,
         flags & MCL_FUTURE != 0,
         flags & MCL_ONFAULT != 0,
+        limit,
     )?;
     Ok(0)
 }
 
 pub(crate) fn munlockall(cx: &Cx<'_>) -> SysResult {
-    cx.vm()?.mlock_all(false, true, false, false)?;
+    cx.vm()?.mlock_all(false, true, false, false, None)?;
     Ok(0)
 }
 

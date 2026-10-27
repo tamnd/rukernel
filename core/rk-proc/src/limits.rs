@@ -15,6 +15,10 @@ pub const RLIMIT_STACK: usize = 3;
 pub const RLIMIT_NPROC: usize = 6;
 /// The number of open files.
 pub const RLIMIT_NOFILE: usize = 7;
+/// The bytes of memory that a process can lock.
+pub const RLIMIT_MEMLOCK: usize = 8;
+/// The default of `RLIMIT_MEMLOCK`, `MLOCK_LIMIT` of Linux: 8 MiB.
+pub const MLOCK_LIMIT: u64 = 8 << 20;
 /// The lowest nice value without `CAP_SYS_NICE`, as `20 - limit`.
 pub const RLIMIT_NICE: usize = 13;
 /// The highest real-time priority without `CAP_SYS_NICE`.
@@ -43,6 +47,7 @@ pub fn defaults(stack: u64, nproc: u64, nofile: u64) -> [Limit; RLIM_NLIMITS] {
     limits[RLIMIT_NOFILE] = Limit { cur: nofile, max: 4096 };
     // Linux writes no core file by default.
     limits[RLIMIT_CORE].cur = 0;
+    limits[RLIMIT_MEMLOCK] = Limit { cur: MLOCK_LIMIT, max: MLOCK_LIMIT };
     limits[RLIMIT_NICE] = Limit { cur: 0, max: 0 };
     limits[RLIMIT_RTPRIO] = Limit { cur: 0, max: 0 };
     limits
@@ -57,6 +62,7 @@ mod tests {
         let l = defaults(8 << 20, 4_194_304, 1024);
         assert_eq!(l[RLIMIT_CORE], Limit { cur: 0, max: RLIM_INFINITY });
         assert_eq!(l[RLIMIT_NICE], Limit { cur: 0, max: 0 });
+        assert_eq!(l[RLIMIT_MEMLOCK], Limit { cur: 8 << 20, max: 8 << 20 });
         assert_eq!(l[RLIMIT_STACK].cur, 8 << 20);
         assert_eq!(l[RLIMIT_NOFILE], Limit { cur: 1024, max: 4096 });
         assert_eq!(l[0].cur, RLIM_INFINITY);

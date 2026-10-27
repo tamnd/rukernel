@@ -16,7 +16,7 @@ use rk_abi::native::sched::{
     SCHED_NORMAL, SCHED_RESET_ON_FORK, SCHED_RR,
 };
 use rk_abi::native::types::SchedAttr;
-use rk_proc::limits::RLIMIT_NICE;
+use rk_proc::limits::{RLIMIT_NICE, RLIMIT_RTPRIO};
 use rk_proc::sched::SchedParams;
 use rk_proc::{Thread, find_thread, processes};
 use rk_vfs::cred::cap;
@@ -164,9 +164,49 @@ fn valid_deadline(attr: &SchedAttr) -> bool {
     (DL_PERIOD_MIN..=DL_PERIOD_MAX).contains(&period)
 }
 
+/// Checks that the caller `cred` can give `policy` and the values of `attr` to `thread`, as
+/// `user_check_sched_setscheduler` of Linux does. A change that needs a privilege needs
+/// `CAP_SYS_NICE`.
+fn check_permission(
+    cred: &rk_vfs::cred::Cred,
+    thread: &Thread,
+    policy: u64,
+    attr: &SchedAttr,
+    reset_on_fork: bool,
+) -> Result<(), Errno> {
+    let old = thread.sched();
+    let process = thread.process();
+    let limit = |r| process.limit(r).cur;
+    // A nice value `n` needs an `RLIMIT_NICE` of `20 - n` or more.
+    let nice_ok = |nice: i32| u64::try_from(20 - nice).is_ok_and(|n| n <= limit(RLIMIT_NICE));
+    let rt = matches!(policy, SCHED_FIFO | SCHED_RR);
+    let old_priority = if old.is_rt() { old.priority } else { 0 };
+    let target = process.cred();
+    let needs_priv = (matches!(policy, SCHED_NORMAL | SCHED_BATCH)
+        && attr.sched_nice < old.nice
+        && !nice_ok(attr.sched_nice))
+        || (rt && u64::from(old.policy) != policy && limit(RLIMIT_RTPRIO) == 0)
+        || (rt
+            && attr.sched_priority > old_priority
+            && u64::from(attr.sched_priority) > limit(RLIMIT_RTPRIO))
+        || policy == SCHED_DEADLINE
+        || (u64::from(old.policy) == SCHED_IDLE && policy != SCHED_IDLE && !nice_ok(old.nice))
+        || (cred.euid != target.euid && cred.euid != target.uid)
+        || (old.reset_on_fork && !reset_on_fork);
+    if needs_priv && !cred.capable(cap::SYS_NICE) {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
 /// Sets the policy and its values from `attr`, as `__sched_setscheduler` of Linux does.
-/// `policy` is `KEEP_POLICY` to keep the policy of the thread.
-fn set_scheduler(thread: &Thread, policy: i64, attr: &SchedAttr) -> Result<(), Errno> {
+/// `policy` is `KEEP_POLICY` to keep the policy of the thread. `cred` is the caller.
+fn set_scheduler(
+    cred: &rk_vfs::cred::Cred,
+    thread: &Thread,
+    policy: i64,
+    attr: &SchedAttr,
+) -> Result<(), Errno> {
     let old = thread.sched();
     let (policy, reset_on_fork) = if policy == KEEP_POLICY {
         (u64::from(old.policy), old.reset_on_fork)
@@ -187,6 +227,7 @@ fn set_scheduler(thread: &Thread, policy: i64, attr: &SchedAttr) -> Result<(), E
     if policy == SCHED_DEADLINE && !valid_deadline(attr) {
         return Err(Errno::EINVAL);
     }
+    check_permission(cred, thread, policy, attr, reset_on_fork)?;
     // rukernel has no utilization clamps. Linux without `CONFIG_UCLAMP_TASK` gives this error.
     if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP != 0 {
         return Err(Errno::EOPNOTSUPP);
@@ -255,7 +296,7 @@ fn setscheduler(cx: &Cx<'_>, pid: u64, policy: i64, param: u64) -> SysResult {
     attr.sched_runtime = 0;
     attr.sched_deadline = 0;
     attr.sched_period = 0;
-    set_scheduler(&thread, policy, &attr)?;
+    set_scheduler(&cx.process().cred(), &thread, policy, &attr)?;
     Ok(0)
 }
 
@@ -340,7 +381,7 @@ pub(crate) fn sched_setattr(cx: &Cx<'_>, pid: u64, uattr: u64, flags: u64) -> Sy
         attr.sched_deadline = now.sched_deadline;
         attr.sched_period = now.sched_period;
     }
-    set_scheduler(&thread, policy, &attr)?;
+    set_scheduler(&cx.process().cred(), &thread, policy, &attr)?;
     Ok(0)
 }
 

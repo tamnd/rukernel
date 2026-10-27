@@ -341,6 +341,104 @@ type = "KernelOldTimeval"
 offset = 16
 
 [[struct]]
+name = "__kernel_timex_timeval"
+size = 16
+align = 8
+[[struct.field]]
+name = "tv_sec"
+type = "i64"
+offset = 0
+[[struct.field]]
+name = "tv_usec"
+type = "i64"
+offset = 8
+
+[[struct]]
+name = "__kernel_timex"
+size = 208
+align = 8
+[[struct.field]]
+name = "modes"
+type = "u32"
+offset = 0
+[[struct.field]]
+name = "offset"
+type = "i64"
+offset = 8
+[[struct.field]]
+name = "freq"
+type = "i64"
+offset = 16
+[[struct.field]]
+name = "maxerror"
+type = "i64"
+offset = 24
+[[struct.field]]
+name = "esterror"
+type = "i64"
+offset = 32
+[[struct.field]]
+name = "status"
+type = "i32"
+offset = 40
+[[struct.field]]
+name = "constant"
+type = "i64"
+offset = 48
+[[struct.field]]
+name = "precision"
+type = "i64"
+offset = 56
+[[struct.field]]
+name = "tolerance"
+type = "i64"
+offset = 64
+[[struct.field]]
+name = "time"
+type = "KernelTimexTimeval"
+offset = 72
+[[struct.field]]
+name = "tick"
+type = "i64"
+offset = 88
+[[struct.field]]
+name = "ppsfreq"
+type = "i64"
+offset = 96
+[[struct.field]]
+name = "jitter"
+type = "i64"
+offset = 104
+[[struct.field]]
+name = "shift"
+type = "i32"
+offset = 112
+[[struct.field]]
+name = "stabil"
+type = "i64"
+offset = 120
+[[struct.field]]
+name = "jitcnt"
+type = "i64"
+offset = 128
+[[struct.field]]
+name = "calcnt"
+type = "i64"
+offset = 136
+[[struct.field]]
+name = "errcnt"
+type = "i64"
+offset = 144
+[[struct.field]]
+name = "stbcnt"
+type = "i64"
+offset = 152
+[[struct.field]]
+name = "tai"
+type = "i32"
+offset = 160
+
+[[struct]]
 name = "iovec"
 size = 16
 align = 8
