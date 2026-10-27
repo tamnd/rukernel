@@ -29,6 +29,8 @@ pub(crate) fn run(name: &str) -> bool {
         "task" => task_test(),
         #[cfg(target_arch = "x86_64")]
         "fault" => fault_test(),
+        #[cfg(target_arch = "x86_64")]
+        "net" => net_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -784,5 +786,83 @@ fn initramfs_test() -> bool {
             .is_ok_and(|m| m.mode & 0o111 != 0),
     );
     ok &= check("/missing is not there", fs.resolve(fs.root(), b"/missing", true).is_err());
+    ok
+}
+
+/// The address of the guest and of the gateway in the user network of QEMU.
+#[cfg(target_arch = "x86_64")]
+const QEMU_GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+#[cfg(target_arch = "x86_64")]
+const QEMU_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+
+/// The kernel finds the virtio-net device of the user network of QEMU, sends an ARP request for
+/// the gateway and receives the reply. The loopback device gives back a frame.
+#[cfg(target_arch = "x86_64")]
+fn net_test() -> bool {
+    use rk_abi::native::if_ether::ETH_P_ARP;
+    use rk_net::arp::ArpPacket;
+    use rk_net::buf::NetBuf;
+    use rk_net::dev;
+    use rk_net::ether::{EthHeader, MacAddr};
+
+    dev::init();
+    rk_drv_virtio::init();
+    let mut ok = true;
+    if let Some(lo) = dev::by_name("lo") {
+        ok &= check("lo has the interface index 1", lo.ifindex() == 1);
+        lo.set_up(true);
+        let sent = ArpPacket::request(MacAddr::ZERO, [127, 0, 0, 1], [127, 0, 0, 1])
+            .to_frame(MacAddr::ZERO);
+        let ok_tx = lo.transmit(sent.clone()).is_ok();
+        let mut back = None;
+        lo.poll(8, &mut |_, b| back = Some(b));
+        ok &= check(
+            "lo gives back the frame",
+            ok_tx && back.is_some_and(|b: NetBuf| b.data() == sent.data()),
+        );
+    } else {
+        ok &= check("lo is there", false);
+    }
+    let Some(eth) = dev::by_name("eth0") else {
+        return check("eth0 is there", false);
+    };
+    ok &= check("eth0 has a MAC address", eth.mac() != MacAddr::ZERO && !eth.mac().is_multicast());
+    eth.set_up(true);
+    ok &= check("the link of eth0 is up", eth.flags() & rk_net::consts::IFF_RUNNING != 0);
+
+    // The user network of QEMU answers an ARP request for the gateway. A frame can be lost, so
+    // the request goes again after each wait of 200 ms, five times at most.
+    let request = ArpPacket::request(eth.mac(), QEMU_GUEST_IP, QEMU_GATEWAY_IP);
+    let mut reply = None;
+    for _ in 0..5 {
+        if eth.transmit(request.to_frame(MacAddr::BROADCAST)).is_err() {
+            break;
+        }
+        let deadline = time::nanos() + 200_000_000;
+        while reply.is_none() && time::nanos() < deadline {
+            eth.poll(16, &mut |_, mut frame| {
+                let is_arp = EthHeader::pull(&mut frame).is_some_and(|h| {
+                    u32::from(h.ethertype) == ETH_P_ARP && h.dst == request.sender_mac
+                });
+                let p = ArpPacket::parse(frame.data()).filter(|_| is_arp);
+                if let Some(p) = p.filter(|p| p.is_reply() && p.sender_ip == QEMU_GATEWAY_IP) {
+                    reply = Some(p);
+                }
+            });
+            core::hint::spin_loop();
+        }
+        if reply.is_some() {
+            break;
+        }
+    }
+    let stats = eth.stats();
+    println!("rk.test: eth0 sent {} frames and received {}", stats.tx_packets, stats.rx_packets);
+    match reply {
+        Some(p) => {
+            println!("rk.test: ARP reply: 10.0.2.2 is at {}", p.sender_mac);
+            ok &= check("the gateway answers the ARP request", p.target_ip == QEMU_GUEST_IP);
+        }
+        None => ok &= check("the gateway answers the ARP request", false),
+    }
     ok
 }

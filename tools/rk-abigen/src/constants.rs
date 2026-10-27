@@ -222,6 +222,14 @@ const GROUPS: &[Group] = &[
         doc: "The size of the path of a Unix socket address.",
     },
     Group {
+        module: "if_ether",
+        header: "linux/if_ether.h",
+        prefixes: &["ETH_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The sizes of an Ethernet frame and the protocol IDs of the Ethernet header.",
+    },
+    Group {
         module: "random",
         header: "linux/random.h",
         prefixes: &["GRND_"],
@@ -449,10 +457,11 @@ fn comments(dir: &Path, out: &mut HashMap<String, String>) -> Result {
 }
 
 /// Makes a line of documentation from a header comment. Markdown must not read a link or a tag in
-/// it.
+/// it. A run of spaces and tabs becomes one space, because clippy does not allow tabs in
+/// documentation.
 fn doc_line(text: &str) -> String {
     let mut s = String::new();
-    for c in text.chars() {
+    for c in text.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
         if matches!(c, '[' | ']' | '<' | '>' | '`' | '*' | '_' | '\\') {
             s.push('\\');
         }
@@ -622,5 +631,6 @@ mod tests {
     #[test]
     fn doc_line_escapes_markdown() {
         assert_eq!(doc_line("no such [file] <dir>"), "No such \\[file\\] \\<dir\\>.");
+        assert_eq!(doc_line("packet\t\t[ note ]"), "Packet \\[ note \\].");
     }
 }

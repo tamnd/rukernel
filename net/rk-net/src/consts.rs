@@ -1,4 +1,4 @@
-//! The constants of the socket calls that the uAPI headers do not export.
+//! The constants of the socket calls and of the network devices that rk-abigen does not extract.
 //!
 //! Linux defines the families, the types, the flags of the messages and the types of the control
 //! messages in include/linux/socket.h and include/linux/net.h, which are not uAPI headers. Thus
@@ -76,3 +76,31 @@ pub const SCM_MAX_FD: usize = 253;
 
 /// The largest backlog of `listen`, the default of `net.core.somaxconn`.
 pub const SOMAXCONN: u32 = 4096;
+
+// linux/if.h and linux/if_arp.h are uAPI headers, but they include <sys/socket.h> of the C
+// library. The probe of rk-abigen compiles without the C library, so it cannot extract them. The
+// values below are the values of Linux 7.3.
+
+/// The flags of a network device, from `enum net_device_flags`: the administrator set the device
+/// up.
+pub const IFF_UP: u32 = 0x1;
+/// The device has a broadcast address.
+pub const IFF_BROADCAST: u32 = 0x2;
+/// The device is a loopback device.
+pub const IFF_LOOPBACK: u32 = 0x8;
+/// The device is up and has a link.
+pub const IFF_RUNNING: u32 = 0x40;
+/// The device can send multicast packets.
+pub const IFF_MULTICAST: u32 = 0x1000;
+/// The link of the device is up.
+pub const IFF_LOWER_UP: u32 = 0x1_0000;
+
+/// The hardware types of `struct sockaddr_ll` and of `ARPHRD_*` in linux/if_arp.h: Ethernet.
+pub const ARPHRD_ETHER: u16 = 1;
+/// The loopback device.
+pub const ARPHRD_LOOPBACK: u16 = 772;
+
+/// The ARP operations: a request.
+pub const ARPOP_REQUEST: u16 = 1;
+/// A reply.
+pub const ARPOP_REPLY: u16 = 2;

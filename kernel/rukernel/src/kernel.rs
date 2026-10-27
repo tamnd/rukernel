@@ -69,6 +69,7 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
 
     rk_drv_mem::init();
     rk_drv_tty::init();
+    rk_net::dev::init();
     rk_drv_virtio::init();
     rk_syscall::init();
     rk_vfs::loopdev::init();

@@ -408,6 +408,7 @@ const BOOT_TESTS: &[&str] = &[
     "tty",
     "smp",
     "blk",
+    "net",
     "busybox",
     "ltp",
     "kselftest",
@@ -1664,6 +1665,10 @@ fn boot_test(names: &[String]) -> Result {
             cmd.arg("-drive")
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
+        }
+        // The `net` test sends an ARP request to the gateway of the user network of QEMU.
+        if *test == "net" {
+            cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.
         if *test == "alpine" {
