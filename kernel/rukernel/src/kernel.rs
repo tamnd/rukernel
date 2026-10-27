@@ -71,6 +71,13 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     rk_drv_tty::init();
     rk_net::dev::init();
     rk_drv_virtio::init();
+    rk_net_inet::init();
+    if let Some(ip) = param(boot.cmdline(), "ip") {
+        match rk_net_inet::configure(ip) {
+            Ok(dev) => println!("inet: {dev} configured from ip={ip}"),
+            Err(e) => println!("inet: ip={ip} not used, error {}", e.get()),
+        }
+    }
     rk_syscall::init();
     rk_vfs::loopdev::init();
     let Some(fs) = rootfs::context() else {

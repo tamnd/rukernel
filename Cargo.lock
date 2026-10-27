@@ -99,6 +99,7 @@ dependencies = [
  "rk-abi",
  "rk-frame",
  "rk-mm",
+ "rk-net",
  "rk-proc",
  "rk-vfs",
 ]
@@ -152,6 +153,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-net-inet"
+version = "0.4.0"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-net",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-net-unix"
 version = "0.4.0"
 dependencies = [
@@ -190,6 +201,7 @@ dependencies = [
  "rk-fs-tmpfs",
  "rk-mm",
  "rk-net",
+ "rk-net-inet",
  "rk-net-unix",
  "rk-proc",
  "rk-vfs",
@@ -222,6 +234,7 @@ dependencies = [
  "rk-fs-xfs",
  "rk-mm",
  "rk-net",
+ "rk-net-inet",
  "rk-proc",
  "rk-sched",
  "rk-syscall",

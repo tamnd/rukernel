@@ -21,6 +21,7 @@ pub mod consts;
 pub mod dev;
 pub mod ether;
 mod options;
+pub mod sysctl;
 
 pub use options::{Options, Timeout};
 

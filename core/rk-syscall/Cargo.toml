@@ -17,6 +17,7 @@ rk-frame.workspace = true
 rk-fs-tmpfs.workspace = true
 rk-mm.workspace = true
 rk-net.workspace = true
+rk-net-inet.workspace = true
 rk-net-unix.workspace = true
 rk-proc.workspace = true
 rk-vfs.workspace = true

@@ -104,3 +104,34 @@ pub const ARPHRD_LOOPBACK: u16 = 772;
 pub const ARPOP_REQUEST: u16 = 1;
 /// A reply.
 pub const ARPOP_REPLY: u16 = 2;
+
+// linux/icmp.h is a uAPI header, but it includes linux/if.h, which includes <sys/socket.h> of
+// the C library. Thus rk-abigen cannot extract it, and the values below are the values of Linux
+// 7.3.
+
+/// The ICMP types: an echo reply.
+pub const ICMP_ECHOREPLY: u8 = 0;
+/// The destination cannot be reached.
+pub const ICMP_DEST_UNREACH: u8 = 3;
+/// An echo request.
+pub const ICMP_ECHO: u8 = 8;
+/// The time to live of the packet is over.
+pub const ICMP_TIME_EXCEEDED: u8 = 11;
+/// A bad parameter in the header.
+pub const ICMP_PARAMETERPROB: u8 = 12;
+
+/// The codes of `ICMP_DEST_UNREACH`: the network cannot be reached.
+pub const ICMP_NET_UNREACH: u8 = 0;
+/// The host cannot be reached.
+pub const ICMP_HOST_UNREACH: u8 = 1;
+/// The protocol cannot be reached.
+pub const ICMP_PROT_UNREACH: u8 = 2;
+/// The port cannot be reached.
+pub const ICMP_PORT_UNREACH: u8 = 3;
+/// The packet must be fragmented, but it has the flag "do not fragment".
+pub const ICMP_FRAG_NEEDED: u8 = 4;
+
+/// The option of the level `SOL_RAW` for a raw ICMP socket: a mask of the ICMP types to drop.
+pub const ICMP_FILTER: u32 = 1;
+/// The level of the options of raw sockets, from include/linux/socket.h.
+pub const SOL_RAW: u32 = 255;

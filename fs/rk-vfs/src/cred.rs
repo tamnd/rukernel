@@ -87,6 +87,10 @@ pub mod cap {
     pub const SETPCAP: u32 = 8;
     /// Set the immutable and append-only flags of a file.
     pub const LINUX_IMMUTABLE: u32 = 9;
+    /// Bind a socket to a port below 1024.
+    pub const NET_BIND_SERVICE: u32 = 10;
+    /// Use raw sockets.
+    pub const NET_RAW: u32 = 13;
     /// Lock the shared memory segments of other users.
     pub const IPC_LOCK: u32 = 14;
     /// Skip the permission checks of the System V IPC objects.

@@ -207,6 +207,7 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
     ("kernel/version", ""),
+    ("net/ipv4/ping_group_range", ""),
     ("vm/dirty_background_bytes", "0"),
     ("vm/dirty_background_ratio", "10"),
     ("vm/dirty_bytes", "0"),
@@ -220,6 +221,9 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("vm/overcommit_memory", "0"),
     ("vm/overcommit_ratio", "50"),
 ];
+
+/// The sysctl of the groups that can make an ICMP echo socket. rk-net keeps the value.
+const PING_GROUP_RANGE: &str = "net/ipv4/ping_group_range";
 
 static SYSCTL_VALUES: SpinLock<Vec<(&'static str, Vec<u8>)>> = SpinLock::new(Vec::new());
 
@@ -238,6 +242,10 @@ fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
 fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some((v, _)) = protected(name) {
         return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
+    }
+    if name == PING_GROUP_RANGE {
+        let (low, high) = rk_net::sysctl::ping_group_range();
+        return format!("{low}\t{high}\n").into_bytes();
     }
     if let Some((_, v)) = SYSCTL_VALUES.lock().iter().find(|(n, _)| *n == name) {
         return v.clone();
@@ -263,6 +271,16 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
         }
         v.store(n, Ordering::Relaxed);
         return Ok(());
+    }
+    // Two group IDs, as `ipv4_ping_group_range` of Linux.
+    if name == PING_GROUP_RANGE {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let mut words = text.split_ascii_whitespace().map(str::parse::<u32>);
+        let (Some(Ok(low)), Some(Ok(high)), None) = (words.next(), words.next(), words.next())
+        else {
+            return Err(Errno::EINVAL);
+        };
+        return rk_net::sysctl::set_ping_group_range(low, high).ok_or(Errno::EINVAL);
     }
     // A write to `drop_caches` removes the clean pages of the block devices. The value stays 0.
     if name == "vm/drop_caches" {

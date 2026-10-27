@@ -21,6 +21,7 @@ members = [
     "fs/rk-fs-xfs",
     "kernel/rukernel",
     "net/rk-net",
+    "net/rk-net-inet",
     "net/rk-net-unix",
     "tools/rk-abigen",
     "xtask",
@@ -59,6 +60,7 @@ rk-fs-ext4 = { path = "fs/rk-fs-ext4", version = "0.4.0" }
 rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.4.0" }
 rk-fs-xfs = { path = "fs/rk-fs-xfs", version = "0.4.0" }
 rk-net = { path = "net/rk-net", version = "0.4.0" }
+rk-net-inet = { path = "net/rk-net-inet", version = "0.4.0" }
 rk-net-unix = { path = "net/rk-net-unix", version = "0.4.0" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 
