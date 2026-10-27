@@ -7,6 +7,7 @@ members = [
     "core/rk-lib",
     "core/rk-mm",
     "core/rk-sched",
+    "core/rk-cgroup",
     "core/rk-proc",
     "core/rk-syscall",
     "drv/rk-drv-mem",
@@ -15,6 +16,7 @@ members = [
     "fs/rk-vfs",
     "fs/rk-fs-proc",
     "fs/rk-fs-sys",
+    "fs/rk-fs-cgroup",
     "fs/rk-fs-overlay",
     "fs/rk-fs-ext4",
     "fs/rk-fs-tmpfs",
@@ -46,6 +48,7 @@ rk-abi = { path = "core/rk-abi", version = "0.4.1" }
 rk-lib = { path = "core/rk-lib", version = "0.4.1" }
 rk-mm = { path = "core/rk-mm", version = "0.4.1" }
 rk-sched = { path = "core/rk-sched", version = "0.4.1" }
+rk-cgroup = { path = "core/rk-cgroup", version = "0.4.1" }
 rk-proc = { path = "core/rk-proc", version = "0.4.1" }
 rk-syscall = { path = "core/rk-syscall", version = "0.4.1" }
 rk-block = { path = "block/rk-block", version = "0.4.1" }
@@ -55,6 +58,7 @@ rk-drv-tty = { path = "drv/rk-drv-tty", version = "0.4.1" }
 rk-vfs = { path = "fs/rk-vfs", version = "0.4.1" }
 rk-fs-proc = { path = "fs/rk-fs-proc", version = "0.4.1" }
 rk-fs-sys = { path = "fs/rk-fs-sys", version = "0.4.1" }
+rk-fs-cgroup = { path = "fs/rk-fs-cgroup", version = "0.4.1" }
 rk-fs-overlay = { path = "fs/rk-fs-overlay", version = "0.4.1" }
 rk-fs-ext4 = { path = "fs/rk-fs-ext4", version = "0.4.1" }
 rk-fs-tmpfs = { path = "fs/rk-fs-tmpfs", version = "0.4.1" }

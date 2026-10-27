@@ -279,7 +279,7 @@ mod glue {
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use core::any::Any;
-    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use rk_frame::cpu::{self, MAX_CPUS};
     use rk_frame::sync::SpinLock;
     use rk_frame::task::{Enqueue, Scheduler, Task};
@@ -296,22 +296,60 @@ mod glue {
         cpu: AtomicUsize,
         /// The CPUs that the task can use, one bit for each CPU.
         affinity: AtomicU64,
+        /// The cgroup of the task, or 0 for a task of the kernel.
+        group: AtomicU32,
+        /// The weight of the nice value, before the cgroup changes it.
+        base_weight: AtomicU64,
+        /// The task counts as runnable in the pressure of its cgroup.
+        psi_runnable: AtomicBool,
     }
 
     fn data(task: &Task) -> &TaskData {
         task.sched_data().downcast_ref::<TaskData>().expect("the data of the fair class")
     }
 
-    /// Adds the run time since the last charge to `task`. Gives `true` if the task used its
-    /// slice, and the entity after the charge.
+    /// Adds the run time since the last charge to `task` and to its cgroup. Gives `true` if
+    /// the task used its slice, and the entity after the charge.
     fn charge(task: &Task) -> (bool, Entity) {
         let now = rk_frame::time::nanos();
         let d = data(task);
-        let mut start = d.exec_start.lock();
-        let ran = now.saturating_sub(*start);
-        *start = now;
+        let ran = {
+            let mut start = d.exec_start.lock();
+            let ran = now.saturating_sub(*start);
+            *start = now;
+            ran
+        };
+        let group = d.group.load(Ordering::Relaxed);
+        let base = d.base_weight.load(Ordering::Relaxed);
+        if group != 0 {
+            rk_cgroup::charge_cpu(group, ran);
+        }
+        // A task of the kernel or of the root cgroup keeps its weight.
+        let weight =
+            if group == 0 || group == rk_cgroup::ROOT { base } else { group_weight(base, group) };
         let mut e = d.entity.lock();
+        // The task runs, so it is not in a queue, and its weight can change.
+        e.weight = weight;
         (e.charge(ran), *e)
+    }
+
+    /// The weight of a task with the weight `base` in the cgroup `group`: `cpu.weight` of the
+    /// cgroup changes it.
+    fn group_weight(base: u64, group: u32) -> u64 {
+        let f = u128::from(rk_cgroup::weight_factor(group));
+        let w = u128::from(base) * f / u128::from(rk_cgroup::WEIGHT_UNIT);
+        u64::try_from(w).unwrap_or(u64::MAX).max(WEIGHT_IDLE.min(base))
+    }
+
+    /// Changes the pressure counts of the cgroup `group` by `runnable` and `oncpu`.
+    fn psi(group: u32, runnable: i32, oncpu: i32) {
+        if group == 0 || (runnable == 0 && oncpu == 0) {
+            return;
+        }
+        rk_cgroup::psi_change(group, |c| {
+            c.runnable = c.runnable.saturating_add_signed(runnable);
+            c.oncpu = c.oncpu.saturating_add_signed(oncpu);
+        });
     }
 
     /// The run queue of one CPU.
@@ -322,11 +360,14 @@ mod glue {
         curr: Option<(u64, Entity)>,
         /// The time of the next periodic balance, in nanoseconds.
         next_balance: u64,
+        /// The number and the cgroup of the task that counts as on the CPU in the pressure of
+        /// its cgroup.
+        psi_curr: Option<(u64, u32)>,
     }
 
     impl Rq {
         const fn new() -> Self {
-            Self { queue: Eevdf::new(), curr: None, next_balance: 0 }
+            Self { queue: Eevdf::new(), curr: None, next_balance: 0, psi_curr: None }
         }
 
         fn load(&self) -> Load {
@@ -439,12 +480,18 @@ mod glue {
                 exec_start: SpinLock::new(0),
                 cpu: AtomicUsize::new(cpu::id()),
                 affinity: AtomicU64::new(u64::MAX),
+                group: AtomicU32::new(0),
+                base_weight: AtomicU64::new(weight_of(0)),
+                psi_runnable: AtomicBool::new(false),
             })
         }
 
         fn enqueue(&self, task: Arc<Task>, why: Enqueue) -> usize {
             let this = cpu::id();
             let d = data(&task);
+            if why != Enqueue::Yield && !d.psi_runnable.swap(true, Ordering::Relaxed) {
+                psi(d.group.load(Ordering::Relaxed), 1, 0);
+            }
             let mut e = *d.entity.lock();
             if why == Enqueue::Yield {
                 if balance::allows(d.affinity.load(Ordering::Relaxed), this) {
@@ -476,7 +523,15 @@ mod glue {
             if empty {
                 self.balance(this);
             }
-            let (task, e) = self.rqs[this].lock().queue.pick(curr.as_ref())?;
+            let picked = self.rqs[this].lock().queue.pick(curr.as_ref());
+            let Some((task, e)) = picked else {
+                // The CPU becomes idle.
+                let old = self.rqs[this].lock().psi_curr.take();
+                if let Some((_, group)) = old {
+                    psi(group, 0, -1);
+                }
+                return None;
+            };
             let mut entity = data(&task).entity.lock();
             // `set_nice` can change the weight while the task is in the queue.
             *entity = Entity { weight: entity.weight, ..e };
@@ -486,13 +541,22 @@ mod glue {
 
         fn put_prev(&self, task: &Task, sleeping: bool) {
             charge(task);
-            let mut e = data(task).entity.lock();
-            let mut rq = self.rqs[cpu::id()].lock();
-            rq.queue.update_min(Some(&e));
-            if sleeping {
-                rq.queue.save_lag(&mut e, TICK_NS);
-            }
-            rq.curr = None;
+            let d = data(task);
+            let old = {
+                let mut e = d.entity.lock();
+                let mut rq = self.rqs[cpu::id()].lock();
+                rq.queue.update_min(Some(&e));
+                if sleeping {
+                    rq.queue.save_lag(&mut e, TICK_NS);
+                }
+                rq.curr = None;
+                rq.psi_curr.take_if(|(id, _)| *id == task.id())
+            };
+            let oncpu = if old.is_some() { -1 } else { 0 };
+            let runnable =
+                if sleeping && d.psi_runnable.swap(false, Ordering::Relaxed) { -1 } else { 0 };
+            let group = old.map_or(d.group.load(Ordering::Relaxed), |(_, g)| g);
+            psi(group, runnable, oncpu);
         }
 
         fn set_next(&self, task: &Task) {
@@ -501,7 +565,20 @@ mod glue {
             *d.exec_start.lock() = rk_frame::time::nanos();
             d.cpu.store(this, Ordering::Relaxed);
             let e = *d.entity.lock();
-            self.rqs[this].lock().curr = Some((task.id(), e));
+            let group = d.group.load(Ordering::Relaxed);
+            let old = {
+                let mut rq = self.rqs[this].lock();
+                rq.curr = Some((task.id(), e));
+                rq.psi_curr.replace((task.id(), group))
+            };
+            match old {
+                Some((id, _)) if id == task.id() => {}
+                Some((_, g)) => {
+                    psi(g, 0, -1);
+                    psi(group, 0, 1);
+                }
+                None => psi(group, 0, 1),
+            }
         }
 
         fn should_yield(&self, task: &Task, _ran: u64) -> bool {
@@ -530,7 +607,38 @@ mod glue {
         }
 
         fn set_nice(&self, task: &Task, nice: i32, idle: bool) {
-            data(task).entity.lock().weight = if idle { WEIGHT_IDLE } else { weight_of(nice) };
+            let d = data(task);
+            let base = if idle { WEIGHT_IDLE } else { weight_of(nice) };
+            d.base_weight.store(base, Ordering::Relaxed);
+            let group = d.group.load(Ordering::Relaxed);
+            let weight = if group == 0 || group == rk_cgroup::ROOT {
+                base
+            } else {
+                group_weight(base, group)
+            };
+            d.entity.lock().weight = weight;
+        }
+
+        fn set_group(&self, task: &Task, group: u32) {
+            let d = data(task);
+            let old = d.group.swap(group, Ordering::Relaxed);
+            if old == group {
+                return;
+            }
+            let runnable = i32::from(d.psi_runnable.load(Ordering::Relaxed));
+            let cpu = d.cpu.load(Ordering::Relaxed);
+            let oncpu = {
+                let mut rq = self.rqs[cpu].lock();
+                match &mut rq.psi_curr {
+                    Some((id, g)) if *id == task.id() => {
+                        *g = group;
+                        1
+                    }
+                    _ => 0,
+                }
+            };
+            psi(old, -runnable, -oncpu);
+            psi(group, runnable, oncpu);
         }
 
         fn set_affinity(&self, task: &Task, mask: u64) -> Option<usize> {

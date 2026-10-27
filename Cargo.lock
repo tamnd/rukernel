@@ -40,6 +40,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-cgroup"
+version = "0.4.2"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+]
+
+[[package]]
 name = "rk-drv-mem"
 version = "0.4.2"
 dependencies = [
@@ -74,6 +82,17 @@ name = "rk-frame"
 version = "0.4.2"
 
 [[package]]
+name = "rk-fs-cgroup"
+version = "0.4.2"
+dependencies = [
+ "rk-abi",
+ "rk-cgroup",
+ "rk-frame",
+ "rk-proc",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-fs-ext4"
 version = "0.4.2"
 dependencies = [
@@ -97,6 +116,7 @@ name = "rk-fs-proc"
 version = "0.4.2"
 dependencies = [
  "rk-abi",
+ "rk-cgroup",
  "rk-frame",
  "rk-mm",
  "rk-net",
@@ -141,6 +161,7 @@ name = "rk-mm"
 version = "0.4.2"
 dependencies = [
  "rk-abi",
+ "rk-cgroup",
  "rk-frame",
 ]
 
@@ -178,6 +199,7 @@ name = "rk-proc"
 version = "0.4.2"
 dependencies = [
  "rk-abi",
+ "rk-cgroup",
  "rk-frame",
  "rk-mm",
  "rk-vfs",
@@ -188,6 +210,7 @@ dependencies = [
 name = "rk-sched"
 version = "0.4.2"
 dependencies = [
+ "rk-cgroup",
  "rk-frame",
 ]
 
@@ -196,9 +219,11 @@ name = "rk-syscall"
 version = "0.4.2"
 dependencies = [
  "rk-abi",
+ "rk-cgroup",
  "rk-drv-mem",
  "rk-drv-tty",
  "rk-frame",
+ "rk-fs-cgroup",
  "rk-fs-tmpfs",
  "rk-mm",
  "rk-net",
@@ -223,10 +248,12 @@ name = "rukernel"
 version = "0.4.2"
 dependencies = [
  "rk-abi",
+ "rk-cgroup",
  "rk-drv-mem",
  "rk-drv-tty",
  "rk-drv-virtio",
  "rk-frame",
+ "rk-fs-cgroup",
  "rk-fs-ext4",
  "rk-fs-overlay",
  "rk-fs-proc",

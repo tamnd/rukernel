@@ -148,6 +148,50 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
     ));
     out.push((b"sys".to_vec(), sys_dir()));
     out.push((b"sysvipc".to_vec(), sysvipc_dir()));
+    out.push((
+        b"cgroups".to_vec(),
+        text_file(b"/cgroups", || rk_cgroup::with(|h| h.proc_cgroups()).into_bytes()),
+    ));
+    out.push((b"pressure".to_vec(), pressure_dir()));
+    out
+}
+
+/// The directory `/proc/pressure`: the pressure of the CPU, the memory and the I/O of the
+/// system, from the root cgroup.
+fn pressure_dir() -> InodeRef {
+    dir(
+        b"/pressure",
+        b"/",
+        0o555,
+        || {
+            let files: [(&[u8], fn() -> Vec<u8>); 3] = [
+                (b"cpu", || pressure(rk_cgroup::psi::CPU)),
+                (b"memory", || pressure(rk_cgroup::psi::MEMORY)),
+                (b"io", || pressure(rk_cgroup::psi::IO)),
+            ];
+            Ok(files
+                .iter()
+                .map(|&(name, f)| (name.to_vec(), text_file(&join(b"/pressure", name), f)))
+                .collect())
+        },
+        None,
+    )
+}
+
+/// The text of a file of `/proc/pressure` for the resource `r`.
+fn pressure(r: usize) -> Vec<u8> {
+    let t = rk_cgroup::now();
+    rk_cgroup::with(|h| h.psi_show(rk_cgroup::ROOT, r, t)).unwrap_or_default().into_bytes()
+}
+
+/// The text of `/proc/PID/cgroup`: the path of the cgroup of `p` from the root of the cgroup
+/// namespace of the caller, as cgroup v2 of Linux shows it.
+fn cgroup_of(p: &Process) -> Vec<u8> {
+    let ns = rk_proc::current_thread().map_or(0, |t| t.process().cgroup_ns());
+    let path = rk_cgroup::with(|h| h.path_from(p.cgroup(), h.namespace_root(ns)));
+    let mut out = b"0::".to_vec();
+    out.extend_from_slice(&path);
+    out.push(b'\n');
     out
 }
 
@@ -988,6 +1032,11 @@ fn process_files(
     out.push((
         b"statm".to_vec(),
         file(&join(base, b"statm"), move || Ok(text::statm(&statm_of(&*alive(&p_)?)))),
+    ));
+    let p_ = w.clone();
+    out.push((
+        b"cgroup".to_vec(),
+        file(&join(base, b"cgroup"), move || Ok(cgroup_of(&*alive(&p_)?))),
     ));
     let p_ = w.clone();
     let p2 = w.clone();

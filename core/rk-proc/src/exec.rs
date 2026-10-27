@@ -222,6 +222,7 @@ fn build(
     random: [u8; 16],
     cred: &Cred,
     no_setid: bool,
+    memcg: u32,
 ) -> Result<(AddressSpace, ExecImage, Location, Vec<Vec<u8>>, Vec<u8>, Cred), Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
@@ -268,6 +269,8 @@ fn build(
     let (cred, secure) = cred.exec(file);
 
     let space = AddressSpace::new()?;
+    // The pages of the new program go to the memory cgroup of the process.
+    space.set_memcg(memcg);
     let interp = match header.interp {
         Some((offset, len)) => {
             let mut name = vec![0u8; len as usize];
@@ -364,7 +367,7 @@ pub fn exec(
     // A tracer with `CAP_SYS_PTRACE` can, as `cap_bprm_creds_from_file` of Linux.
     let no_setid = thread.no_new_privs() || (thread.is_traced() && !thread.tracer_capable());
     let (space, image, at, argv, auxv, cred) =
-        build(&ctx, args, random, &process.cred(), no_setid)?;
+        build(&ctx, args, random, &process.cred(), no_setid, process.memcg())?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
     release(thread);

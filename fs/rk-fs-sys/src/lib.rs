@@ -9,6 +9,7 @@
 //!   A loop device with a file also has the directory `loop`, which `losetup` reads.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
+//! - `/sys/fs/cgroup` is an empty directory, where cgroup2 is mounted.
 //! - `/sys/fs/ext4/features` has a file for each feature of ext4 that programs look for. The
 //!   online resize of `resize2fs` reads `meta_bg_resize`.
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
@@ -265,7 +266,9 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
                 .map(|(n, text)| (String::from(n), Kind::File(text.into_bytes())))
                 .collect()
         }
-        ["fs"] => dirs(&mut ["ext4"].into_iter()),
+        // `/sys/fs/cgroup` is the place where the init system mounts cgroup2.
+        ["fs"] => dirs(&mut ["cgroup", "ext4"].into_iter()),
+        ["fs", "cgroup"] => Vec::new(),
         ["fs", "ext4"] => dirs(&mut ["features"].into_iter()),
         ["fs", "ext4", "features"] => EXT4_FEATURES
             .iter()
@@ -499,7 +502,8 @@ mod tests {
 
     #[test]
     fn ext4_tells_its_features() {
-        assert_eq!(names("fs"), ["ext4"]);
+        assert_eq!(names("fs"), ["cgroup", "ext4"]);
+        assert!(names("fs/cgroup").is_empty());
         assert_eq!(names("fs/ext4/features"), ["meta_bg_resize"]);
         assert_eq!(get("fs/ext4/features/meta_bg_resize"), Kind::File(b"supported\n".to_vec()));
     }

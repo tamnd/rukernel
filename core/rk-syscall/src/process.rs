@@ -50,13 +50,8 @@ const ARCH_GET_FS: u64 = 0x1003;
 
 /// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
 /// have yet. They give `EINVAL`, as Linux without the namespace type gives.
-const CLONE_NEW_ANY: u64 = CLONE_NEWCGROUP
-    | CLONE_NEWUTS
-    | CLONE_NEWIPC
-    | CLONE_NEWUSER
-    | CLONE_NEWPID
-    | CLONE_NEWNET
-    | CLONE_NEWTIME;
+const CLONE_NEW_ANY: u64 =
+    CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWTIME;
 
 /// `unshare`: the process gets its own copy of the parts that it shares, as kernel/fork.c of
 /// Linux does.
@@ -68,6 +63,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         | CLONE_VM
         | CLONE_SYSVSEM
         | CLONE_NEWNS
+        | CLONE_NEWCGROUP
         | CLONE_NEW_ANY;
     if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
@@ -81,6 +77,9 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
             return Err(Errno::EPERM);
         }
         flags |= CLONE_FS;
+    }
+    if flags & CLONE_NEWCGROUP != 0 {
+        new_cgroup_ns(process)?;
     }
     // A process with more than one thread cannot leave its group, its handlers or its memory.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && process.threads().len() > 1 {
@@ -137,9 +136,35 @@ pub(crate) fn clone(
 /// The largest `struct clone_args` that `clone3` reads. Linux gives `E2BIG` for a larger one.
 const CLONE_ARGS_MAX: u64 = 4096;
 
+/// Puts `process` in a new cgroup namespace with its cgroup as the root, for `CLONE_NEWCGROUP`.
+///
+/// # Errors
+///
+/// `EPERM` without `CAP_SYS_ADMIN`.
+fn new_cgroup_ns(process: &Process) -> Result<(), Errno> {
+    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let root = process.cgroup();
+    let ns = rk_cgroup::with(|h| h.new_namespace(root));
+    process.set_cgroup_ns(ns);
+    Ok(())
+}
+
+/// The cgroup of the directory that `fd` opens, for `CLONE_INTO_CGROUP`.
+///
+/// # Errors
+///
+/// `EBADF` for a descriptor that is not open, and `EINVAL` if it is not a directory of cgroup2.
+fn cgroup_of_fd(cx: &Cx<'_>, fd: u64) -> Result<u32, Errno> {
+    let fd = i32::try_from(fd).map_err(|_| Errno::EBADF)?;
+    let file = cx.file(fd as u64)?;
+    file.inode().and_then(rk_fs_cgroup::cgroup_of).ok_or(Errno::EINVAL)
+}
+
 /// `clone3`, as `copy_clone_args_from_user` and `clone3_args_valid` of Linux check it. The stack
-/// of `clone3` is the lowest address and a size, and the new thread starts at the top. The cgroup
-/// and `set_tid` are not in R2, so they give `EINVAL`.
+/// of `clone3` is the lowest address and a size, and the new thread starts at the top. `set_tid`
+/// is not in R2, so it gives `EINVAL`.
 pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     if size > CLONE_ARGS_MAX {
         return Err(Errno::E2BIG);
@@ -156,9 +181,9 @@ pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     let args = <CloneArgs as zerocopy::FromBytes>::read_from_bytes(&bytes[..known])
         .map_err(|_| Errno::EINVAL)?;
     let flags = args.flags;
-    let unsupported = CLONE_INTO_CGROUP;
-    if flags & (CLONE_DETACHED | CSIGNAL | unsupported) != 0
-        || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND) != 0
+    if flags & (CLONE_DETACHED | CSIGNAL) != 0
+        || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
+        || (flags & CLONE_INTO_CGROUP != 0 && flags & CLONE_THREAD != 0)
         || args.set_tid != 0
         || args.set_tid_size != 0
         || args.exit_signal >= NSIG
@@ -193,6 +218,11 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
     }
+    if flags & CLONE_NEWCGROUP != 0 && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let cgroup =
+        if flags & CLONE_INTO_CGROUP != 0 { Some(cgroup_of_fd(cx, args.cgroup)?) } else { None };
     // A new mount name space cannot share the file system context. The threads of a process
     // share one name space in rukernel.
     if flags & CLONE_NEWNS != 0 {
@@ -212,6 +242,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
             fs: flags & CLONE_FS != 0,
             exit_signal: args.exit_signal as u32,
             parent: flags & CLONE_PARENT != 0,
+            cgroup,
         };
         rk_proc::fork(cx.thread, share)?
     };
@@ -219,6 +250,11 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
         && let Some(fs) = thread.process().fs()
     {
         fs.lock().unshare_namespace();
+    }
+    if flags & CLONE_NEWCGROUP != 0 {
+        let process = thread.process();
+        let ns = rk_cgroup::with(|h| h.new_namespace(process.cgroup()));
+        process.set_cgroup_ns(ns);
     }
     if flags & CLONE_CLEAR_SIGHAND != 0 {
         // A handler goes back to the default action, and an ignored signal stays ignored.

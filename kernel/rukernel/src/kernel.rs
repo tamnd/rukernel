@@ -41,6 +41,10 @@ fn main(boot: &'static BootInfo) -> ! {
     {
         rk_sched::init();
         println!("smp: {} CPUs run", rk_frame::cpu::start_all());
+        // A free frame gives its charge back to its memory cgroup, and the root cpuset has the
+        // CPUs that run.
+        rk_frame::mm::set_uncharge_hook(rk_cgroup::uncharge_page);
+        rk_cgroup::set_online_cpus(rk_frame::cpu::count());
     }
     rootfs::init(boot);
 

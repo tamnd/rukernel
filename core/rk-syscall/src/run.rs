@@ -50,7 +50,8 @@ pub(crate) fn start_thread(thread: Arc<Thread>, regs: UserContext) -> Result<(),
     let task = TaskOptions::new(move || run(run_thread, regs))
         .data(thread.clone())
         .nice(nice, idle)
-        .affinity(sched.affinity)
+        .affinity(thread.allowed_cpus())
+        .group(thread.process().cgroup())
         .spawn()
         .ok_or(Errno::ENOMEM)?;
     thread.set_task(&task);
@@ -140,6 +141,8 @@ fn page_fault(
     };
     match vm.handle_fault(addr as usize, access) {
         Ok(()) => None,
+        // The OOM killer of a memory cgroup frees memory, and the fault tries again.
+        Err(Errno::ENOMEM) if rk_proc::cgroup::memcg_oom(thread) => None,
         Err(Errno::EFAULT | Errno::ENOMEM) => segv(),
         Err(_) => Some(SigInfo::fault(SIGBUS, BUS_ADRERR, addr)),
     }
@@ -171,6 +174,12 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
 fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
     loop {
         let process = thread.process();
+        if thread.is_killed() {
+            break process.group_exit().unwrap_or(WaitStatus::exited(0));
+        }
+        // A thread of a frozen cgroup, or of a cgroup without CPU quota, waits here.
+        rk_proc::cgroup::wait_frozen(thread);
+        rk_proc::cgroup::wait_throttled(thread);
         if thread.is_killed() {
             break process.group_exit().unwrap_or(WaitStatus::exited(0));
         }

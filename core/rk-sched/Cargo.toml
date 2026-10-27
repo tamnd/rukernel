@@ -10,6 +10,7 @@ authors.workspace = true
 publish.workspace = true
 
 [dependencies]
+rk-cgroup.workspace = true
 rk-frame.workspace = true
 
 [lints]
