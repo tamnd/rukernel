@@ -367,6 +367,42 @@ fn fallocate_gives_and_frees_blocks() {
 }
 
 #[test]
+fn a_file_that_grows_gives_zeros_past_the_old_size() {
+    use rk_vfs::inode::falloc::KEEP_SIZE;
+    let bs = BS as u64;
+    for delalloc in [false, true] {
+        let (fs, ram) = if delalloc { open_delalloc() } else { open_rw() };
+        let root = fs.root().unwrap();
+        // Each file ends 16 bytes before the end of its first block, and the disk has old data
+        // there, as after a crash. Each change makes the file grow past the old data.
+        for name in [&b"append"[..], b"near", b"truncate", b"falloc", b"keep"] {
+            let file = root.create(name, FileType::Regular, 0o644, 0).unwrap();
+            file.write_at(0, &vec![b'z'; BS]).unwrap();
+            file.sync().unwrap();
+            file.set_attr(&SetAttr { size: Some(bs - 16), ..SetAttr::default() }).unwrap();
+            let at = file.fiemap(0, bs).unwrap()[0].physical as usize;
+            ram.0.lock()[at..at + BS].fill(0x5a);
+            match name {
+                b"append" => assert_eq!(file.write_at(bs, b"new"), Ok(3)),
+                b"near" => assert_eq!(file.write_at(bs - 8, b"new"), Ok(3)),
+                b"truncate" => {
+                    file.set_attr(&SetAttr { size: Some(2 * bs), ..SetAttr::default() }).unwrap();
+                }
+                b"falloc" => file.fallocate(0, bs, bs).unwrap(),
+                _ => file.fallocate(KEEP_SIZE, bs, bs).unwrap(),
+            }
+            // A change with KEEP_SIZE does not make the file grow, and the old data stays.
+            let want = if name == b"keep" { 0x5a } else { 0 };
+            let gap = if name == b"near" { BS - 16..BS - 8 } else { BS - 16..BS };
+            assert!(ram.0.lock()[at + gap.start..at + gap.end].iter().all(|&b| b == want));
+            if name != b"keep" {
+                assert!(read_all(&*file)[gap].iter().all(|&b| b == 0));
+            }
+        }
+    }
+}
+
+#[test]
 fn fiemap_gives_the_extents() {
     use rk_vfs::inode::falloc::KEEP_SIZE;
     let (fs, ram) = open_rw();

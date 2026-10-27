@@ -151,6 +151,9 @@ impl Fs {
         if extents.iter().any(|e| u64::from(e.lblock) <= last && e.end() > first) {
             return Ok(None);
         }
+        // The delayed blocks are zeros past the size, but the last block on the disk can have
+        // old data there.
+        tx.zero_eof(&raw, offset)?;
         let mut d = self.delayed.lock();
         let new = match d.files.get(&node.ino) {
             Some(file) => (first..=last).filter(|l| !file.contains_key(l)).count() as u64,

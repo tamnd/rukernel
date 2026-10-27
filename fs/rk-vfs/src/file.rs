@@ -231,6 +231,7 @@ impl FileOps for InodeFile {
         if file.flags().append() {
             *pos = inode.metadata().size;
         }
+        crate::mapped::extend(inode, pos.saturating_add(buf.len() as u64));
         let n = inode.write_at(*pos, buf)?;
         crate::mapped::wrote(inode, *pos, &buf[..n]);
         *pos += n as u64;
@@ -252,6 +253,7 @@ impl FileOps for InodeFile {
         let inode = file.inode.as_ref().ok_or(Errno::EINVAL)?;
         crate::swap::check(&**inode)?;
         check_immutable(&**inode)?;
+        crate::mapped::extend(inode, offset.saturating_add(buf.len() as u64));
         let n = inode.write_at(offset, buf)?;
         crate::mapped::wrote(inode, offset, &buf[..n]);
         Ok(n)
@@ -1110,6 +1112,7 @@ impl File {
         let mode = crate::cred::current().write_kill(&inode.metadata());
         let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
         check_set_attr(&**inode, &attr)?;
+        crate::mapped::extend(inode, size);
         inode.set_attr(&attr)?;
         crate::mapped::changed(inode, size, u64::MAX);
         Ok(())
@@ -1130,6 +1133,9 @@ impl File {
         match inode.metadata().file_type() {
             Some(FileType::Regular) => {
                 self.remove_privs()?;
+                if mode & crate::inode::falloc::KEEP_SIZE == 0 {
+                    crate::mapped::extend(inode, offset.saturating_add(len));
+                }
                 inode.fallocate(mode, offset, len)?;
                 // A collapse or an insert moves the data after the range.
                 crate::mapped::changed(inode, offset, u64::MAX);

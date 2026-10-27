@@ -688,6 +688,10 @@ impl rk_vfs::mapped::Mapped for Pages {
         self.0.lock().push((b'c', start, end));
     }
 
+    fn zero(&self, start: u64, end: u64) {
+        self.0.lock().push((b'z', start, end));
+    }
+
     fn sync(&self, start: u64, end: u64) -> Result<()> {
         self.0.lock().push((b's', start, end));
         Ok(())
@@ -711,6 +715,25 @@ fn the_pages_of_a_mapped_file_see_each_change() {
     assert_eq!(
         *pages.0.lock(),
         [(b'w', 2, 2), (b'w', 0, 3), (b's', 1, 5), (b'c', 5, u64::MAX), (b'c', 0, u64::MAX)]
+    );
+    // A change that makes the file grow first makes the bytes past the old end zeros, as
+    // `pagecache_isize_extended` of Linux.
+    pages.0.lock().clear();
+    assert_eq!(f.write_at(4, b"ab"), Ok(2));
+    assert_eq!(f.truncate(10), Ok(()));
+    assert_eq!(f.fallocate(0, 8, 8), Ok(()));
+    assert_eq!(f.fallocate(rk_vfs::inode::falloc::KEEP_SIZE, 16, 8), Ok(()));
+    assert_eq!(
+        *pages.0.lock(),
+        [
+            (b'z', 0, 6),
+            (b'w', 4, 2),
+            (b'z', 6, 10),
+            (b'c', 10, u64::MAX),
+            (b'z', 10, 16),
+            (b'c', 8, u64::MAX),
+            (b'c', 16, u64::MAX)
+        ]
     );
     // The record goes with the pages.
     drop((mapped, pages));

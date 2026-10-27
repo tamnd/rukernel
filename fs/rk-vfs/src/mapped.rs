@@ -3,7 +3,8 @@
 //! A file mapping keeps a copy of each page of the file that it uses. The VFS keeps these copies
 //! the same as the file, as the page cache of Linux does for `read`, `write` and a mapping. A
 //! write copies its data to the pages, a truncate and a `fallocate` read the changed pages again,
-//! and a read first writes back the pages that the mapping changed.
+//! and a read first writes back the pages that the mapping changed. When the file grows, the
+//! bytes of the pages past the old end of the file become zeros.
 
 use crate::inode::InodeRef;
 use crate::inode::Result;
@@ -18,6 +19,9 @@ pub trait Mapped: Send + Sync {
 
     /// Reads again the pages that have a byte from `start` to `end` of the file.
     fn changed(&self, start: u64, end: u64);
+
+    /// Makes the bytes of the pages from `start` to `end` of the file zeros.
+    fn zero(&self, start: u64, end: u64);
 
     /// Writes back the changed pages that have a byte from `start` to `end` of the file.
     ///
@@ -61,6 +65,18 @@ pub fn wrote(inode: &InodeRef, offset: u64, data: &[u8]) {
 pub fn changed(inode: &InodeRef, start: u64, end: u64) {
     if let Some(pages) = find(inode) {
         pages.changed(start, end);
+    }
+}
+
+/// Makes the bytes of the mapped pages of `inode` past its size zeros, before the size grows to
+/// `size`, as `pagecache_isize_extended` of Linux. A store of the mapping past the end of the file
+/// then does not show in the file.
+pub fn extend(inode: &InodeRef, size: u64) {
+    if let Some(pages) = find(inode) {
+        let old = inode.metadata().size;
+        if size > old {
+            pages.zero(old, size);
+        }
     }
 }
 
