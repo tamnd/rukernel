@@ -20,7 +20,10 @@ pub mod buf;
 pub mod consts;
 pub mod dev;
 pub mod ether;
+pub mod ioctl;
+pub mod netlink;
 mod options;
+pub mod procfs;
 pub mod sysctl;
 
 pub use options::{Options, Timeout};
@@ -32,7 +35,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::ioctls::{FIONREAD, TIOCOUTQ};
 use rk_abi::native::open::O_RDWR;
-use rk_abi::native::sockios::{SIOCGIFNAME, SIOCSIFHWBROADCAST};
+use rk_abi::native::sockios::SIOCGIFCONF;
 use rk_abi::native::stat::S_IFSOCK;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
@@ -193,6 +196,12 @@ pub trait Socket: Send + Sync {
     fn unsent(&self) -> Result<usize> {
         Ok(0)
     }
+    /// The ioctls of the family, as the `ioctl` of `proto_ops` of Linux. Gives `None` for a call
+    /// that the family does not take, as `ENOIOCTLCMD`: the socket file then tries the calls of
+    /// the network devices.
+    fn ioctl(&self, _cmd: u32, _arg: usize, _mem: &dyn UserMemory) -> Option<Result<usize>> {
+        None
+    }
     /// Closes the socket. The file calls this when it closes.
     fn release(&self) {}
     /// The socket as `Any`, for the operations of one family.
@@ -243,12 +252,18 @@ impl FileOps for SocketFile {
     }
 
     fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        // The order of `sock_ioctl` and `sock_do_ioctl` of Linux: the list of the interfaces,
+        // then the family, then the calls of the network devices.
+        if cmd == SIOCGIFCONF {
+            return ioctl::ifconf(arg, mem);
+        }
+        if let Some(r) = self.socket.ioctl(cmd, arg, mem) {
+            return r;
+        }
         let n = match cmd {
             FIONREAD => self.socket.readable()?,
             TIOCOUTQ => self.socket.unsent()?,
-            // The network device calls of each family, as `dev_ioctl` of Linux. There is no
-            // network device yet.
-            SIOCGIFNAME..=SIOCSIFHWBROADCAST => return Err(Errno::ENODEV),
+            c if ioctl::is_socket_cmd(c) => return ioctl::dev_ioctl(cmd, arg, mem),
             _ => return Err(Errno::ENOTTY),
         };
         let n = i32::try_from(n).unwrap_or(i32::MAX);
@@ -319,6 +334,10 @@ pub fn wait_for<R>(
     });
     r.unwrap_or(Err(Errno::EAGAIN))
 }
+
+/// Serializes the host tests that change the global devices.
+#[cfg(test)]
+static TEST_DEVICES: rk_frame::sync::SpinLock<()> = rk_frame::sync::SpinLock::new(());
 
 #[cfg(test)]
 mod tests;

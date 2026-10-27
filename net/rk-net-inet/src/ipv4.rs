@@ -52,6 +52,11 @@ pub fn same_net(a: Addr, b: Addr, len: u8) -> bool {
     (u32::from_be_bytes(a) ^ u32::from_be_bytes(b)) & mask(len) == 0
 }
 
+/// The first `len` bits of `a`, with the other bits zero.
+pub fn prefix(a: Addr, len: u8) -> Addr {
+    (u32::from_be_bytes(a) & mask(len)).to_be_bytes()
+}
+
 /// The reasons that the input drops a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bad {

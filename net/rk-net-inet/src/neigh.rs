@@ -38,6 +38,39 @@ enum State<P> {
 struct Entry<P> {
     state: State<P>,
     used: u64,
+    updated: u64,
+}
+
+/// The state of an entry, `NUD_*` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nud {
+    /// The table waits for a reply, `NUD_INCOMPLETE`.
+    Incomplete,
+    /// A reply came in the last `REACHABLE_MS`, `NUD_REACHABLE`.
+    Reachable,
+    /// The reply is older than `REACHABLE_MS`, `NUD_STALE`.
+    Stale,
+}
+
+/// An entry of the table, for a dump of `RTM_GETNEIGH` and for /proc/net/arp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Info {
+    /// The interface index.
+    pub ifindex: u32,
+    /// The address.
+    pub addr: Addr,
+    /// The hardware address, if the table knows it.
+    pub mac: Option<MacAddr>,
+    /// The state.
+    pub state: Nud,
+    /// The count of requests without a reply.
+    pub probes: u32,
+    /// The time since the last reply, in milliseconds.
+    pub confirmed: u64,
+    /// The time since the last use, in milliseconds.
+    pub used: u64,
+    /// The time since the last change, in milliseconds.
+    pub updated: u64,
 }
 
 /// What the caller must do after `resolve`.
@@ -87,6 +120,7 @@ impl<P> Table<P> {
         let entry = self.entries.entry(key).or_insert_with(|| Entry {
             state: State::Incomplete { queue: VecDeque::new(), probes: 0, next: now },
             used: now,
+            updated: now,
         });
         entry.used = now;
         match &mut entry.state {
@@ -128,13 +162,16 @@ impl<P> Table<P> {
     pub fn update(&mut self, key: Key, mac: MacAddr, now: u64, create: bool) -> Vec<P> {
         let reachable = State::Reachable { mac, confirmed: now };
         match self.entries.get_mut(&key) {
-            Some(entry) => match core::mem::replace(&mut entry.state, reachable) {
-                State::Incomplete { queue, .. } => queue.into(),
-                State::Reachable { .. } => Vec::new(),
-            },
+            Some(entry) => {
+                entry.updated = now;
+                match core::mem::replace(&mut entry.state, reachable) {
+                    State::Incomplete { queue, .. } => queue.into(),
+                    State::Reachable { .. } => Vec::new(),
+                }
+            }
             None => {
                 if create {
-                    self.entries.insert(key, Entry { state: reachable, used: now });
+                    self.entries.insert(key, Entry { state: reachable, used: now, updated: now });
                 }
                 Vec::new()
             }
@@ -175,6 +212,37 @@ impl<P> Table<P> {
     /// Removes the entries of an interface.
     pub fn flush(&mut self, ifindex: u32) {
         self.entries.retain(|(i, _), _| *i != ifindex);
+    }
+
+    /// The entries at the time `now`, by interface and address.
+    pub fn entries(&self, now: u64) -> Vec<Info> {
+        let ago = |t: u64| now.saturating_sub(t);
+        self.entries
+            .iter()
+            .map(|(&(ifindex, addr), e)| {
+                let (mac, state, probes, confirmed) = match &e.state {
+                    State::Incomplete { probes, .. } => (None, Nud::Incomplete, *probes, e.updated),
+                    State::Reachable { mac, confirmed } => {
+                        let state = if ago(*confirmed) < REACHABLE_MS {
+                            Nud::Reachable
+                        } else {
+                            Nud::Stale
+                        };
+                        (Some(*mac), state, 0, *confirmed)
+                    }
+                };
+                Info {
+                    ifindex,
+                    addr,
+                    mac,
+                    state,
+                    probes,
+                    confirmed: ago(confirmed),
+                    used: ago(e.used),
+                    updated: ago(e.updated),
+                }
+            })
+            .collect()
     }
 
     /// The count of entries.

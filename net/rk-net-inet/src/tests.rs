@@ -1,14 +1,20 @@
 use crate::config::{self, IpConfig};
+use crate::ipv4::Addr;
 use crate::ipv4::{self, Bad, DF, Header, MF, UdpHeader};
 use crate::neigh::{self, Resolve};
 use crate::ports::{Binding, EPHEMERAL, Ports};
-use crate::route::{IfAddr, Route, Table};
+use crate::route::{IfAddr, Link, Match, Route, Table};
 use crate::{Dgram, Proto, checksum, classify, sockaddr};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::inet::{IPPROTO_ICMP, IPPROTO_UDP};
+use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE};
+use rk_abi::native::rtnetlink::{
+    RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RT_TABLE_LOCAL, RT_TABLE_MAIN, RTN_BROADCAST,
+    RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL,
+};
 use rk_net::consts::{
     ICMP_ECHO, ICMP_ECHOREPLY, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET,
     SOCK_STREAM,
@@ -213,11 +219,22 @@ fn ports_run_out() {
     assert_eq!(p.bind(0, Binding { addr: ipv4::ANY, reuse: false, id: 9 }), Err(Errno::EADDRINUSE));
 }
 
+const LO: Link = Link { ifindex: 1, up: true, loopback: true };
+const ETH: Link = Link { ifindex: 2, up: true, loopback: false };
+
 fn qemu_table() -> Table {
     let mut t = Table::new();
-    t.add_addr(IfAddr { ifindex: 1, addr: ipv4::LOOPBACK, prefix: 8, loopback: true });
-    t.add_addr(IfAddr { ifindex: 2, addr: [10, 0, 2, 15], prefix: 24, loopback: false });
-    t.add_route(Route { dst: ipv4::ANY, prefix: 0, gateway: Some([10, 0, 2, 2]), ifindex: 2 });
+    t.set_loopback(1);
+    let mut lo = IfAddr::new(1, ipv4::LOOPBACK, 8, "lo");
+    lo.scope = RT_SCOPE_HOST as u8;
+    t.insert_addr(lo).unwrap();
+    t.sync_link(LO);
+    let mut eth = IfAddr::new(2, [10, 0, 2, 15], 24, "eth0");
+    eth.broadcast = eth.default_broadcast();
+    t.insert_addr(eth).unwrap();
+    t.sync_link(ETH);
+    let gw = Route::new(ipv4::ANY, 0, Some([10, 0, 2, 2]), 2);
+    t.insert_route(gw, NLM_F_CREATE).unwrap();
     t
 }
 
@@ -232,14 +249,112 @@ fn routes() {
     let n = t.lookup([10, 0, 2, 15]).unwrap();
     assert_eq!((n.ifindex, n.local), (1, true));
     let n = t.lookup([127, 1, 2, 3]).unwrap();
-    assert_eq!((n.ifindex, n.src), (1, [127, 1, 2, 3]));
+    assert_eq!((n.ifindex, n.src, n.local), (1, ipv4::LOOPBACK, true));
     assert!(t.lookup([10, 0, 2, 255]).unwrap().broadcast);
     assert!(t.is_broadcast(ipv4::BROADCAST));
     assert!(!t.is_local([10, 0, 2, 16]));
     // Without the default route, a far address has no route.
     let mut t = Table::new();
-    t.add_addr(IfAddr { ifindex: 2, addr: [10, 0, 2, 15], prefix: 24, loopback: false });
-    assert!(t.lookup([8, 8, 8, 8]).is_none());
+    t.insert_addr(IfAddr::new(2, [10, 0, 2, 15], 24, "eth0")).unwrap();
+    t.sync_link(ETH);
+    assert_eq!(t.lookup([8, 8, 8, 8]), Err(Errno::ENETUNREACH));
+}
+
+/// The routes of the kernel for the addresses, in the order of `ip route show table all`.
+#[test]
+fn kernel_routes() {
+    let t = qemu_table();
+    let got: Vec<(u32, Addr, u8, u8, u8)> =
+        t.routes().iter().map(|r| (r.table, r.dst, r.prefix, r.kind, r.scope)).collect();
+    let (main, local) = (RT_TABLE_MAIN, RT_TABLE_LOCAL);
+    let (uni, loc, bc) = (RTN_UNICAST as u8, RTN_LOCAL as u8, RTN_BROADCAST as u8);
+    let (univ, link, host) = (RT_SCOPE_UNIVERSE as u8, RT_SCOPE_LINK as u8, RT_SCOPE_HOST as u8);
+    assert_eq!(
+        got,
+        vec![
+            (main, [0, 0, 0, 0], 0, uni, univ),
+            (main, [10, 0, 2, 0], 24, uni, link),
+            (local, [10, 0, 2, 15], 32, loc, host),
+            (local, [10, 0, 2, 255], 32, bc, link),
+            (local, [127, 0, 0, 0], 8, loc, host),
+            (local, [127, 0, 0, 1], 32, loc, host),
+            (local, [127, 255, 255, 255], 32, bc, link),
+        ]
+    );
+    let r = &t.routes()[1];
+    assert_eq!((r.protocol, r.prefsrc, r.ifindex), (RTPROT_KERNEL as u8, Some([10, 0, 2, 15]), 2));
+}
+
+#[test]
+fn addresses_and_link_state() {
+    let mut t = qemu_table();
+    // A second address in the subnet is secondary and adds only its local route.
+    t.insert_addr(IfAddr::new(2, [10, 0, 2, 16], 24, "eth0")).unwrap();
+    let c = t.sync_link(ETH);
+    assert_eq!(c.added.len(), 1);
+    assert_eq!(c.added[0].prefsrc, Some([10, 0, 2, 15]));
+    assert!(t.addrs_of(2).nth(1).unwrap().is_secondary());
+    assert_eq!(t.insert_addr(IfAddr::new(2, [10, 0, 2, 16], 24, "eth0")), Err(Errno::EEXIST));
+    // A link that goes down keeps only its local routes.
+    t.link_down(2);
+    assert!(t.routes().iter().filter(|r| r.ifindex == 2).all(|r| r.scope == RT_SCOPE_HOST as u8));
+    assert_eq!(t.lookup([8, 8, 8, 8]), Err(Errno::ENETUNREACH));
+    // The removal of the primary address takes the secondary address and all routes with it.
+    let removed = t.remove_addr(t.addrs().iter().position(|a| a.local == [10, 0, 2, 15]).unwrap());
+    assert_eq!(removed.len(), 2);
+    assert_eq!(removed[1].local, [10, 0, 2, 15]);
+    t.sync_link(Link { up: false, ..ETH });
+    assert!(t.routes().iter().all(|r| r.ifindex != 2));
+}
+
+#[test]
+fn insert_and_delete_routes() {
+    let mut t = qemu_table();
+    let r = Route::new([192, 168, 0, 0], 16, Some([10, 0, 2, 3]), 2);
+    assert_eq!(
+        t.insert_route(r.clone(), NLM_F_CREATE | NLM_F_EXCL),
+        Ok(Some(NLM_F_CREATE | NLM_F_EXCL))
+    );
+    assert_eq!(t.insert_route(r.clone(), NLM_F_CREATE | NLM_F_EXCL), Err(Errno::EEXIST));
+    assert_eq!(t.insert_route(r.clone(), NLM_F_CREATE), Err(Errno::EEXIST));
+    assert_eq!(t.insert_route(r.clone(), NLM_F_REPLACE), Ok(None));
+    let other = Route { gateway: Some([10, 0, 2, 4]), ..r.clone() };
+    assert_eq!(t.insert_route(other.clone(), 0), Err(Errno::ENOENT));
+    assert_eq!(t.insert_route(other.clone(), NLM_F_REPLACE), Ok(Some(NLM_F_REPLACE)));
+    assert_eq!(t.lookup([192, 168, 1, 1]).unwrap().hop, [10, 0, 2, 4]);
+    let mut m = Match {
+        table: RT_TABLE_MAIN,
+        dst: [192, 168, 0, 0],
+        prefix: 16,
+        gateway: Some([10, 0, 2, 3]),
+        ..Match::default()
+    };
+    assert_eq!(t.delete_route(&m), Err(Errno::ESRCH));
+    m.gateway = None;
+    assert_eq!(t.delete_route(&m).unwrap(), other);
+    m.table = 100;
+    assert_eq!(t.delete_route(&m), Err(Errno::ESRCH));
+    // A gateway must be on a link, and a route of the scope `host` has no gateway.
+    let up = |i: u32| (i <= 2).then_some(true);
+    let far = Route::new(ipv4::ANY, 0, Some([192, 0, 2, 1]), 0);
+    assert_eq!(t.check_nexthop(&far, up), Err(Errno::ENETUNREACH));
+    let near = Route::new(ipv4::ANY, 0, Some([10, 0, 2, 9]), 0);
+    assert_eq!(t.check_nexthop(&near, up), Ok(2));
+    let host = Route { scope: RT_SCOPE_HOST as u8, ..near };
+    assert_eq!(t.check_nexthop(&host, up), Err(Errno::EINVAL));
+    assert_eq!(t.check_nexthop(&Route::new([1, 0, 0, 0], 8, None, 7), up), Err(Errno::ENODEV));
+}
+
+#[test]
+fn neighbour_entries() {
+    let mut n: neigh::Table<u32> = neigh::Table::new();
+    let _ = n.resolve((2, [10, 0, 2, 2]), 0, 1);
+    n.update((2, [10, 0, 2, 3]), MacAddr([2, 0, 0, 0, 0, 1]), 0, true);
+    let e = n.entries(neigh::REACHABLE_MS + 5);
+    assert_eq!(e.len(), 2);
+    assert_eq!((e[0].state, e[0].mac, e[0].probes), (neigh::Nud::Incomplete, None, 1));
+    assert_eq!(e[1].state, neigh::Nud::Stale);
+    assert_eq!(e[1].confirmed, neigh::REACHABLE_MS + 5);
 }
 
 #[test]

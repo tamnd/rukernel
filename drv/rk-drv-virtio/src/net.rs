@@ -10,6 +10,8 @@ use crate::net_hdr::{self, NetHdr};
 use crate::pci::{Transport, status};
 use crate::queue::{Buffer, Queue};
 use crate::ring::Slots;
+use alloc::format;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -75,8 +77,9 @@ impl Ring {
     }
 }
 
-/// Starts the driver for the network device number `index`, and registers the device.
-pub(crate) fn probe(dev: &PciDevice, index: u32) -> Option<Arc<NetDevice>> {
+/// Starts the driver for the network device number `index`, and registers the device. `bus` is
+/// the number of the device among all virtio devices, as the name `virtioN` of Linux.
+pub(crate) fn probe(dev: &PciDevice, index: u32, bus: u32) -> Option<Arc<NetDevice>> {
     let t = Transport::new(dev)?;
     let Some(features) = t.negotiate(F_MAC | F_STATUS) else {
         t.fail();
@@ -100,6 +103,7 @@ pub(crate) fn probe(dev: &PciDevice, index: u32) -> Option<Arc<NetDevice>> {
     rx.queue.kick(&t);
     let driver = VirtioNet {
         mac,
+        bus,
         status: features & F_STATUS != 0,
         t,
         rx: SpinLock::new(rx),
@@ -111,6 +115,8 @@ pub(crate) fn probe(dev: &PciDevice, index: u32) -> Option<Arc<NetDevice>> {
 /// A virtio-net device.
 struct VirtioNet {
     mac: MacAddr,
+    /// The number of the device on the virtio bus.
+    bus: u32,
     /// The device has the status of the link.
     status: bool,
     t: Transport,
@@ -125,6 +131,10 @@ impl NetDriver for VirtioNet {
 
     fn mac(&self) -> MacAddr {
         self.mac
+    }
+
+    fn parent(&self) -> Option<(String, &'static str)> {
+        Some((format!("virtio{}", self.bus), "virtio"))
     }
 
     fn link_up(&self) -> bool {

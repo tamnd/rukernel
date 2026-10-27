@@ -411,6 +411,7 @@ const BOOT_TESTS: &[&str] = &[
     "blk",
     "net",
     "inet",
+    "netcfg",
     "busybox",
     "ltp",
     "kselftest",
@@ -564,7 +565,7 @@ const BUSYBOX_SHA256: &str = "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34
 /// /bin/busybox.
 const BUSYBOX_APPLETS: &[&str] = &[
     "sh", "echo", "tr", "sleep", "cat", "wc", "ls", "test", "mkdir", "rm", "true", "false",
-    "mount", "grep", "sed",
+    "mount", "grep", "sed", "ip", "ifconfig", "route", "ping",
 ];
 
 /// Gives the SHA-256 of `path` in hexadecimal, from `sha256sum` or `shasum`.
@@ -1579,7 +1580,7 @@ fn qemu(args: &[String]) -> Result {
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
         "init" | "tty" | "smp" | "blk" | "inet" => kernel.with_file_name("user-init").exists(),
-        "busybox" => kernel.with_file_name("busybox-ready").exists(),
+        "busybox" | "netcfg" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" | "gvisor" | "fstests" => {
             kernel.with_file_name(format!("initramfs-{test}.cpio")).exists()
@@ -1668,7 +1669,7 @@ fn test_cmdline(test: &str) -> String {
         "inet" => {
             String::from("console=ttyS0 rk.test=init ip=10.0.2.15::10.0.2.2:255.255.255.0 -- inet")
         }
-        "busybox" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
+        "busybox" | "netcfg" => String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i"),
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
         "gvisor" => String::from("console=ttyS0 rk.test=init rdinit=/gvisor/run"),
@@ -1683,7 +1684,16 @@ fn test_cmdline(test: &str) -> String {
 fn pass_line(test: &str) -> String {
     let test = if matches!(
         test,
-        "tty" | "smp" | "blk" | "inet" | "busybox" | "ltp" | "kselftest" | "gvisor" | "fstests"
+        "tty"
+            | "smp"
+            | "blk"
+            | "inet"
+            | "netcfg"
+            | "busybox"
+            | "ltp"
+            | "kselftest"
+            | "gvisor"
+            | "fstests"
     ) || ROOTFS.iter().any(|r| r.name == test)
     {
         "init"
@@ -1692,6 +1702,22 @@ fn pass_line(test: &str) -> String {
     };
     format!("rk.test={test}: pass")
 }
+
+/// The commands of the `netcfg` test. The shell sets up the interface of the user network of
+/// QEMU without `ip=`, through rtnetlink (`ip`) and the interface ioctls (`ifconfig`, `route`).
+/// Then it pings the gateway and reads the files of /proc/net. The shell exits with 0 only if
+/// all of the commands pass.
+const NETCFG_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
+&& ip link set lo up && ip link set eth0 up \
+&& ip addr add 10.0.2.15/24 dev eth0 && ip route add default via 10.0.2.2 \
+&& ip link && ip addr && ip route && ip route show table local \
+&& ip addr add 10.0.2.16/24 dev eth0 && ip addr del 10.0.2.16/24 dev eth0 \
+&& ifconfig && ifconfig eth0 mtu 1400 && ifconfig eth0 | grep -q MTU:1400 \
+&& ifconfig eth0:1 10.0.3.1 netmask 255.255.255.0 && ifconfig eth0:1 down \
+&& route add -net 10.9.0.0 netmask 255.255.0.0 gw 10.0.2.2 && route -n \
+&& route del -net 10.9.0.0 netmask 255.255.0.0 && ! ip route | grep -q 10.9.0.0 \
+&& ping -c 1 10.0.2.2 && ip neigh && ls /proc/net \
+&& cat /proc/net/dev /proc/net/route /proc/net/arp /proc/net/snmp && exit 0; exit 1\n";
 
 /// The input of a boot test. When the log has the text of an entry, the test writes the bytes of
 /// the entry to the serial port. The `tty` test types a line and then `^C`.
@@ -1707,6 +1733,7 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("TICK", b"\x03"),
             ("TICK", b"test $? = 130; exit $?\n"),
         ],
+        "netcfg" => &[("/ # ", NETCFG_SCRIPT)],
         _ => &[],
     }
 }
@@ -1793,8 +1820,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
         }
         // The `net` test sends an ARP request to the gateway of the user network of QEMU. The
-        // `inet` test pings the gateway and asks the DNS server of QEMU.
-        if matches!(*test, "net" | "inet") {
+        // `inet` test pings the gateway and asks the DNS server of QEMU. The `netcfg` test sets up
+        // the network with BusyBox.
+        if matches!(*test, "net" | "inet" | "netcfg") {
             cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.

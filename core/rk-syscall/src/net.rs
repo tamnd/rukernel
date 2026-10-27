@@ -16,9 +16,9 @@ use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::SOL_SOCKET;
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
-    AF_INET, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC, MSG_WAITFORONE,
-    SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC, SOCK_NONBLOCK, SOCK_STREAM,
-    SOCK_TYPE_MASK, SOMAXCONN,
+    AF_INET, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC,
+    MSG_WAITFORONE, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC, SOCK_NONBLOCK,
+    SOCK_STREAM, SOCK_TYPE_MASK, SOMAXCONN,
 };
 use rk_net::{Cred, Message, NodeId, PathOps, Received, Socket};
 use rk_net_inet::Proto as InetProto;
@@ -163,8 +163,10 @@ fn new_socket(
             }
             Ok(rk_net_inet::new_socket(proto))
         }
-        // Only the socket that `mq_notify` of musl needs for `SIGEV_THREAD`.
-        crate::mqueue::AF_NETLINK => crate::mqueue::netlink_socket(kind, protocol),
+        AF_NETLINK => {
+            let protocol = u32::try_from(protocol as i32).map_err(|_| Errno::EPROTONOSUPPORT)?;
+            Ok(rk_net::netlink::NetlinkSocket::new(kind, protocol)?)
+        }
         _ => Err(Errno::EAFNOSUPPORT),
     }
 }

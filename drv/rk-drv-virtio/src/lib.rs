@@ -45,14 +45,15 @@ pub const VIRTBLK_MAJOR: u32 = 254;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn init() {
     let (mut disks, mut nics) = (0u32, 0u32);
-    for dev in rk_frame::pci::devices().iter().filter(|d| d.vendor_id() == VIRTIO_VENDOR) {
+    let virtio = rk_frame::pci::devices().iter().filter(|d| d.vendor_id() == VIRTIO_VENDOR);
+    for (bus, dev) in (0u32..).zip(virtio) {
         if blk::is_blk(dev) {
             if let Some(name) = blk::probe(dev, disks) {
                 rk_frame::println!("virtio: {name} on PCI {:?}", dev.address());
                 disks += 1;
             }
         } else if net::is_net(dev) {
-            if let Some(nic) = net::probe(dev, nics) {
+            if let Some(nic) = net::probe(dev, nics, bus) {
                 rk_frame::println!(
                     "virtio: {} on PCI {:?}, MAC {}",
                     nic.name(),

@@ -33,6 +33,7 @@ use rk_net::consts::{
     SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_RAW,
 };
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
+use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
 use rk_vfs::wait::{WaitQueue, poll_wake};
 
@@ -692,6 +693,10 @@ impl Socket for Dgram {
         s.queue.clear();
         drop(s);
         stack::remove_socket(self.ino);
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Option<Result<usize>> {
+        crate::ioctl::inet_ioctl(cmd, arg, mem)
     }
 
     fn as_any(&self) -> &dyn Any {

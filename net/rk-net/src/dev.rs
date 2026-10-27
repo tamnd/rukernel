@@ -8,8 +8,10 @@
 
 use crate::buf::NetBuf;
 use crate::consts::{
-    ARPHRD_ETHER, ARPHRD_LOOPBACK, IFF_BROADCAST, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST,
-    IFF_RUNNING, IFF_UP,
+    ARPHRD_ETHER, ARPHRD_LOOPBACK, IF_OPER_DOWN, IF_OPER_LOWERLAYERDOWN, IF_OPER_UNKNOWN,
+    IF_OPER_UP, IFF_ALLMULTI, IFF_AUTOMEDIA, IFF_BROADCAST, IFF_DEBUG, IFF_DORMANT, IFF_DYNAMIC,
+    IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP, IFF_NOTRAILERS, IFF_PORTSEL, IFF_PROMISC,
+    IFF_RUNNING, IFF_UP, IFNAMSIZ,
 };
 use crate::ether::{HLEN, MacAddr};
 use alloc::collections::VecDeque;
@@ -17,7 +19,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::ETH_DATA_LEN;
 use rk_frame::sync::SpinLock;
@@ -41,7 +43,7 @@ impl LinkKind {
         }
     }
 
-    /// The flags that do not change: what the device can do.
+    /// The flags of a new device, as `ether_setup` and `loopback_setup` of Linux set them.
     fn base_flags(self) -> u32 {
         match self {
             Self::Ether => IFF_BROADCAST | IFF_MULTICAST,
@@ -64,9 +66,23 @@ pub trait NetDriver: Send + Sync {
         ETH_DATA_LEN
     }
 
+    /// The smallest MTU, as `dev->min_mtu` of Linux.
+    fn min_mtu(&self) -> u32 {
+        match self.kind() {
+            LinkKind::Ether => ETH_MIN_MTU,
+            LinkKind::Loopback => 0,
+        }
+    }
+
     /// Tells if the link is up, as `netif_carrier_ok` of Linux.
     fn link_up(&self) -> bool {
         true
+    }
+
+    /// The name of the parent device and of its bus, as `IFLA_PARENT_DEV_NAME` and
+    /// `IFLA_PARENT_DEV_BUS_NAME` of Linux give them. For example `virtio0` and `virtio`.
+    fn parent(&self) -> Option<(String, &'static str)> {
+        None
     }
 
     /// Sends one frame. Gives `ENOBUFS` if the queue of the device is full.
@@ -113,22 +129,113 @@ fn add(c: &AtomicU64, n: usize) {
     c.fetch_add(n as u64, Ordering::Relaxed);
 }
 
+/// The smallest MTU of an Ethernet device, `ETH_MIN_MTU` of Linux.
+const ETH_MIN_MTU: u32 = 68;
+
+/// The flags that `dev_change_flags` of Linux takes from the caller.
+const SETTABLE: u32 = IFF_DEBUG
+    | IFF_NOTRAILERS
+    | IFF_NOARP
+    | IFF_DYNAMIC
+    | IFF_MULTICAST
+    | IFF_PORTSEL
+    | IFF_AUTOMEDIA;
+
+/// The default length of the transmit queue, `DEFAULT_TX_QUEUE_LEN` of Linux.
+pub const TX_QUEUE_LEN: u32 = 1000;
+
+/// A change of a device, for the functions of `add_notifier`. Linux has the same events in
+/// `enum netdev_cmd`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The device is now up, as `NETDEV_UP`.
+    Up,
+    /// The device is now down, as `NETDEV_DOWN`.
+    Down,
+    /// The flags in the value changed, as `__dev_notify_flags`.
+    Flags(u32),
+    /// The MTU changed, as `NETDEV_CHANGEMTU`.
+    Mtu,
+    /// The name changed, as `NETDEV_CHANGENAME`.
+    Name,
+}
+
+/// A function that gets the changes of each device, as a `notifier_block` of Linux.
+pub type Notifier = fn(&NetDevice, Event);
+
+/// The functions that get the changes of each device.
+static NOTIFIERS: SpinLock<Vec<Notifier>> = SpinLock::new(Vec::new());
+
+/// Adds a function that gets each change of each device, as `register_netdevice_notifier` of
+/// Linux. The function runs without a lock of the device layer.
+pub fn add_notifier(f: Notifier) {
+    NOTIFIERS.lock().push(f);
+}
+
+fn notify(dev: &NetDevice, event: Event) {
+    let list = NOTIFIERS.lock().clone();
+    for f in list {
+        f(dev, event);
+    }
+}
+
 /// A registered network device.
 pub struct NetDevice {
-    name: String,
+    name: SpinLock<String>,
     ifindex: u32,
     kind: LinkKind,
-    /// The flags that the administrator sets. Only `IFF_UP` is used now.
-    admin: AtomicU32,
+    /// The flags of the device, as `dev->flags` of Linux, without `IFF_RUNNING` and
+    /// `IFF_LOWER_UP`.
+    dflags: AtomicU32,
+    /// The flags `IFF_PROMISC` and `IFF_ALLMULTI` that the administrator set, as `dev->gflags`.
+    gflags: AtomicU32,
     mtu: AtomicU32,
+    txqlen: AtomicU32,
+    /// The device was up one time, thus it has its queue discipline.
+    activated: AtomicBool,
     counters: Counters,
     driver: Arc<dyn NetDriver>,
 }
 
+/// Tells if `name` is a valid name of a device, as `dev_valid_name` of Linux.
+pub fn valid_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() < IFNAMSIZ
+        && name != b"."
+        && name != b".."
+        && name.iter().all(|&c| c != b'/' && c != b':' && !c.is_ascii_whitespace() && c != 0)
+}
+
 impl NetDevice {
     /// The name, for example `eth0`.
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn name(&self) -> String {
+        self.name.lock().clone()
+    }
+
+    /// Changes the name, as `dev_change_name` of Linux. Gives `EINVAL` for a bad name, `EBUSY`
+    /// if the device is up, and `EEXIST` if another device has the name.
+    pub fn set_name(&self, name: &[u8]) -> Result<()> {
+        if self.name.lock().as_bytes() == name {
+            return Ok(());
+        }
+        if !valid_name(name) {
+            return Err(Errno::EINVAL);
+        }
+        let Ok(name) = core::str::from_utf8(name) else {
+            return Err(Errno::EINVAL);
+        };
+        if self.is_up() {
+            return Err(Errno::EBUSY);
+        }
+        {
+            let devices = DEVICES.lock();
+            if devices.iter().any(|d| *d.name.lock() == name) {
+                return Err(Errno::EEXIST);
+            }
+            *self.name.lock() = String::from(name);
+        }
+        notify(self, Event::Name);
+        Ok(())
     }
 
     /// The interface index. The loopback device has the index 1.
@@ -151,40 +258,152 @@ impl NetDevice {
         self.mtu.load(Ordering::Relaxed)
     }
 
-    /// Sets the MTU. Gives `EINVAL` if the driver cannot send frames of this size.
+    /// The length of the transmit queue, as `dev->tx_queue_len` of Linux.
+    pub fn txqlen(&self) -> u32 {
+        self.txqlen.load(Ordering::Relaxed)
+    }
+
+    /// Sets the length of the transmit queue. The drivers do not use it.
+    pub fn set_txqlen(&self, len: u32) {
+        self.txqlen.store(len, Ordering::Relaxed);
+    }
+
+    /// The smallest MTU.
+    pub fn min_mtu(&self) -> u32 {
+        self.driver.min_mtu()
+    }
+
+    /// The largest MTU. The loopback device has 0, which is no limit on Linux, but the device
+    /// cannot send more than its MTU of 64 KiB.
+    pub fn max_mtu(&self) -> u32 {
+        match self.kind {
+            LinkKind::Loopback => 0,
+            LinkKind::Ether => self.driver.mtu(),
+        }
+    }
+
+    /// Sets the MTU, as `dev_set_mtu` of Linux. Gives `EINVAL` if the MTU is out of the range
+    /// of the device.
     pub fn set_mtu(&self, mtu: u32) -> Result<()> {
-        if mtu == 0 || mtu > self.driver.mtu() {
+        if mtu == self.mtu() {
+            return Ok(());
+        }
+        let max = self.max_mtu();
+        if mtu < self.min_mtu() || (max > 0 && mtu > max) || mtu > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
         self.mtu.store(mtu, Ordering::Relaxed);
+        notify(self, Event::Mtu);
         Ok(())
     }
 
     /// Tells if the administrator set the device up.
     pub fn is_up(&self) -> bool {
-        self.admin.load(Ordering::Relaxed) & IFF_UP != 0
+        self.dflags.load(Ordering::Relaxed) & IFF_UP != 0
     }
 
     /// Sets the device up or down, as `dev_open` and `dev_close` of Linux. A new device is down.
     pub fn set_up(&self, up: bool) {
-        if up {
-            self.admin.fetch_or(IFF_UP, Ordering::Relaxed);
+        let flags = self.flags() & !IFF_UP;
+        // A change of only `IFF_UP` cannot fail.
+        let _ = self.change_flags(if up { flags | IFF_UP } else { flags });
+    }
+
+    /// Changes the flags, as `dev_change_flags` of Linux. The caller can change `IFF_UP`,
+    /// `IFF_PROMISC`, `IFF_ALLMULTI` and the flags in `SETTABLE`. The other flags in `flags` do
+    /// nothing.
+    pub fn change_flags(&self, flags: u32) -> Result<()> {
+        let old = self.dflags.load(Ordering::Relaxed);
+        let old_g = self.gflags.load(Ordering::Relaxed);
+        let mut new = (flags & SETTABLE) | (old & !SETTABLE);
+        if (old ^ flags) & IFF_UP != 0 {
+            new = (new & !IFF_UP) | (flags & IFF_UP);
+            if flags & IFF_UP != 0 {
+                self.activated.store(true, Ordering::Relaxed);
+            }
+        }
+        let g = flags & (IFF_PROMISC | IFF_ALLMULTI);
+        self.dflags.store((new & !(IFF_PROMISC | IFF_ALLMULTI)) | g, Ordering::Relaxed);
+        self.gflags.store(g, Ordering::Relaxed);
+        let changes = (old ^ new) | (old_g ^ g);
+        if changes & IFF_UP != 0 {
+            notify(self, if new & IFF_UP != 0 { Event::Up } else { Event::Down });
+        }
+        if changes != 0 {
+            notify(self, Event::Flags(changes));
+        }
+        Ok(())
+    }
+
+    /// The flags, as `netif_get_flags` of Linux: the flags of the device, and `IFF_RUNNING` and
+    /// `IFF_LOWER_UP` when the device is up and the link is up.
+    pub fn flags(&self) -> u32 {
+        let mut flags = self.dflags.load(Ordering::Relaxed)
+            & !(IFF_PROMISC | IFF_ALLMULTI | IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT);
+        flags |= self.gflags.load(Ordering::Relaxed);
+        if flags & IFF_UP != 0 && self.driver.link_up() {
+            flags |= IFF_RUNNING | IFF_LOWER_UP;
+        }
+        flags
+    }
+
+    /// The count of users of the promiscuous mode, as `dev->promiscuity` of Linux.
+    pub fn promiscuity(&self) -> u32 {
+        u32::from(self.gflags.load(Ordering::Relaxed) & IFF_PROMISC != 0)
+    }
+
+    /// The count of users of the all-multicast mode, as `dev->allmulti` of Linux.
+    pub fn allmulti(&self) -> u32 {
+        u32::from(self.gflags.load(Ordering::Relaxed) & IFF_ALLMULTI != 0)
+    }
+
+    /// Tells if the link has a carrier, as `netif_carrier_ok` of Linux.
+    pub fn carrier(&self) -> bool {
+        self.driver.link_up()
+    }
+
+    /// The count of carrier changes since the registration. A driver sets the carrier on one
+    /// time when it starts.
+    pub fn carrier_up_count(&self) -> u32 {
+        u32::from(self.kind == LinkKind::Ether && self.carrier())
+    }
+
+    /// The state of the link for RFC 2863, `IF_OPER_*`, as `rfc2863_policy` of Linux. The
+    /// loopback device does not tell its carrier, thus its state is unknown when it is up.
+    pub fn operstate(&self) -> u8 {
+        if !self.is_up() {
+            IF_OPER_DOWN
+        } else if self.kind == LinkKind::Loopback {
+            IF_OPER_UNKNOWN
+        } else if self.carrier() {
+            IF_OPER_UP
         } else {
-            self.admin.fetch_and(!IFF_UP, Ordering::Relaxed);
+            IF_OPER_LOWERLAYERDOWN
         }
     }
 
-    /// The flags, as `dev_get_flags` of Linux: the flags of the administrator, the flags of the
-    /// kind, and `IFF_RUNNING` and `IFF_LOWER_UP` when the link is up.
-    pub fn flags(&self) -> u32 {
-        let mut flags = self.admin.load(Ordering::Relaxed) | self.kind.base_flags();
-        if self.driver.link_up() {
-            flags |= IFF_LOWER_UP;
-            if flags & IFF_UP != 0 {
-                flags |= IFF_RUNNING;
-            }
+    /// The name of the queue discipline. A device that was never up has `noop`.
+    pub fn qdisc(&self) -> &'static str {
+        if !self.activated.load(Ordering::Relaxed) {
+            "noop"
+        } else if self.kind == LinkKind::Loopback {
+            "noqueue"
+        } else {
+            "pfifo_fast"
         }
-        flags
+    }
+
+    /// The broadcast hardware address.
+    pub fn broadcast(&self) -> MacAddr {
+        match self.kind {
+            LinkKind::Ether => MacAddr::BROADCAST,
+            LinkKind::Loopback => MacAddr::ZERO,
+        }
+    }
+
+    /// The parent device and its bus.
+    pub fn parent(&self) -> Option<(String, &'static str)> {
+        self.driver.parent()
     }
 
     /// The statistics.
@@ -262,7 +481,7 @@ static DEVICES: SpinLock<Vec<Arc<NetDevice>>> = SpinLock::new(Vec::new());
 pub fn register(driver: Arc<dyn NetDriver>) -> Result<Arc<NetDevice>> {
     let mut devices = DEVICES.lock();
     let kind = driver.kind();
-    let taken = |name: &str| devices.iter().any(|d| d.name == name);
+    let taken = |name: &str| devices.iter().any(|d| *d.name.lock() == name);
     let name = match kind {
         LinkKind::Loopback if taken("lo") => return Err(Errno::EEXIST),
         LinkKind::Loopback => String::from("lo"),
@@ -273,11 +492,14 @@ pub fn register(driver: Arc<dyn NetDriver>) -> Result<Arc<NetDevice>> {
     };
     let ifindex = devices.iter().map(|d| d.ifindex).max().unwrap_or(0) + 1;
     let dev = Arc::new(NetDevice {
-        name,
+        name: SpinLock::new(name),
         ifindex,
         kind,
-        admin: AtomicU32::new(0),
+        dflags: AtomicU32::new(kind.base_flags()),
+        gflags: AtomicU32::new(0),
         mtu: AtomicU32::new(driver.mtu()),
+        txqlen: AtomicU32::new(TX_QUEUE_LEN),
+        activated: AtomicBool::new(false),
         counters: Counters::default(),
         driver,
     });
@@ -287,7 +509,7 @@ pub fn register(driver: Arc<dyn NetDriver>) -> Result<Arc<NetDevice>> {
 
 /// Finds a device by its name.
 pub fn by_name(name: &str) -> Option<Arc<NetDevice>> {
-    DEVICES.lock().iter().find(|d| d.name == name).cloned()
+    DEVICES.lock().iter().find(|d| *d.name.lock() == name).cloned()
 }
 
 /// Finds a device by its interface index.

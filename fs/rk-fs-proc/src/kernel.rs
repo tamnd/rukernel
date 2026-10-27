@@ -126,6 +126,7 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
     let mut out: Vec<(Vec<u8>, InodeRef)> =
         files.iter().map(|&(name, f)| (name.to_vec(), text_file(&join(b"/", name), f))).collect();
     out.push((b"mounts".to_vec(), link(b"/mounts", 0o777, || Ok(b"self/mounts".to_vec()))));
+    out.push((b"net".to_vec(), link(b"/net", 0o777, || Ok(b"self/net".to_vec()))));
     out.push((
         b"self".to_vec(),
         link(b"/self", 0o777, || {
@@ -351,6 +352,24 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
     values.retain(|(n, _)| *n != name);
     values.push((name, value));
     Ok(())
+}
+
+/// The directory `net` of a process, with the files that the network stack registers in
+/// `rk_net::procfs`. The kernel has one network namespace, so each process shows the same files.
+fn net_dir(base: &[u8]) -> InodeRef {
+    let path = join(base, b"net");
+    let list_path = path.clone();
+    let list = move || {
+        Ok(rk_net::procfs::files()
+            .into_iter()
+            .map(|(name, show)| {
+                let node =
+                    file(&join(&list_path, name.as_bytes()), move || Ok(show().into_bytes()));
+                (name.as_bytes().to_vec(), node)
+            })
+            .collect())
+    };
+    dir(&path, base, 0o555, list, None)
 }
 
 fn sys_dir() -> InodeRef {
@@ -827,6 +846,7 @@ fn process_files(
     out.push((b"smaps".to_vec(), file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?))));
     let p_ = w.clone();
     out.push((b"mounts".to_vec(), file(&join(base, b"mounts"), move || mounts_of(&*alive(&p_)?))));
+    out.push((b"net".to_vec(), net_dir(base)));
     let p_ = w.clone();
     out.push((
         b"mountinfo".to_vec(),
