@@ -130,6 +130,7 @@ version = "0.4.3"
 dependencies = [
  "rk-abi",
  "rk-frame",
+ "rk-mm",
  "rk-net",
  "rk-vfs",
 ]

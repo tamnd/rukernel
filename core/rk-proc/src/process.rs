@@ -406,7 +406,11 @@ impl Process {
     pub fn replace_vm(&self, vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
         self.membarrier.store(0, Ordering::Relaxed);
         vm.set_memcg(self.memcg());
-        self.vm.lock().replace(vm)
+        let old = self.vm.lock().replace(vm.clone());
+        if let Some(old) = &old {
+            rk_mm::ksm::exec(old, &vm);
+        }
+        old
     }
 
     /// The cgroup of the process.
@@ -1212,7 +1216,13 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
 fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Thread>, Errno> {
     let pp = &parent.process;
     let vm = pp.vm().ok_or(Errno::ESRCH)?;
-    let vm = if share.vm { vm } else { Arc::new(vm.fork()?) };
+    let vm = if share.vm {
+        vm
+    } else {
+        let child = Arc::new(vm.fork()?);
+        rk_mm::ksm::fork(&vm, &child);
+        child
+    };
     let files = pp.files().ok_or(Errno::ESRCH)?;
     let files = if share.files { files } else { Arc::new(SpinLock::new(files.lock().clone())) };
     let fs = pp.fs().ok_or(Errno::ESRCH)?;

@@ -12,6 +12,8 @@
 //! - `/sys/fs/cgroup` is an empty directory, where cgroup2 is mounted.
 //! - `/sys/fs/ext4/features` has a file for each feature of ext4 that programs look for. The
 //!   online resize of `resize2fs` reads `meta_bg_resize`.
+//! - `/sys/kernel/mm/ksm` has the files of Kernel Samepage Merging. A write to some of them
+//!   changes the settings of KSM.
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
 //!   `statistics`. `/sys/class/net/NAME` is a link to it.
@@ -23,6 +25,8 @@
 #![forbid(unsafe_code)]
 
 extern crate alloc;
+
+mod mm;
 
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -45,8 +49,8 @@ pub const SYSFS_MAGIC: u64 = 0x6265_6572;
 /// The file system type of sysfs, for `mount -t sysfs`.
 pub const FS_TYPE: FsType = FsType { name: "sysfs", nodev: true, make: mount };
 
-/// The directories at the top of sysfs. Only `block`, `class`, `dev`, `devices` and `fs` have
-/// entries.
+/// The directories at the top of sysfs. Only `block`, `class`, `dev`, `devices`, `fs` and
+/// `kernel` have entries.
 const TOP: [&str; 10] =
     ["block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power"];
 
@@ -68,6 +72,11 @@ enum Kind {
     Dir,
     File(Vec<u8>),
     Link(Vec<u8>),
+    /// A file of KSM. A read gives the value of that moment. `writable` tells that a write can
+    /// change it.
+    Ksm {
+        writable: bool,
+    },
 }
 
 /// An inode of sysfs. `path` is the path from the root, without a `/` at the start.
@@ -274,6 +283,8 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
             .iter()
             .map(|&n| (String::from(n), Kind::File(b"supported\n".to_vec())))
             .collect(),
+        ["kernel"] => dirs(&mut ["mm"].into_iter()),
+        ["kernel", "mm", ref rest @ ..] => mm::entries(rest)?,
         [top] if TOP.contains(&top) => Vec::new(),
         _ => return None,
     };
@@ -304,7 +315,10 @@ impl Inode for Node {
     fn metadata(&self) -> Metadata {
         let (kind, perm, nlink, size) = match &self.kind {
             Kind::Dir => (mode::S_IFDIR, 0o755, 2, 0),
-            Kind::File(_) => (mode::S_IFREG, 0o444, 1, BLOCK_SIZE as u64),
+            Kind::File(_) | Kind::Ksm { writable: false } => {
+                (mode::S_IFREG, 0o444, 1, BLOCK_SIZE as u64)
+            }
+            Kind::Ksm { writable: true } => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
             Kind::Link(target) => (mode::S_IFLNK, 0o777, 1, target.len() as u64),
         };
         let t = now();
@@ -330,8 +344,13 @@ impl Inode for Node {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let live;
         let text = match &self.kind {
             Kind::File(text) => text,
+            Kind::Ksm { .. } => {
+                live = mm::read(&self.path);
+                &live
+            }
             Kind::Dir => return Err(Errno::EISDIR),
             Kind::Link(_) => return Err(Errno::EINVAL),
         };
@@ -341,9 +360,10 @@ impl Inode for Node {
         Ok(n)
     }
 
-    fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<usize> {
+    fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
         match self.kind {
-            Kind::File(_) => Err(Errno::EACCES),
+            Kind::Ksm { writable: true } => mm::write(&self.path, buf),
+            Kind::File(_) | Kind::Ksm { .. } => Err(Errno::EACCES),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -401,7 +421,7 @@ impl Inode for Node {
                 };
                 let kind = match kind {
                     Kind::Dir => FileType::Directory,
-                    Kind::File(_) => FileType::Regular,
+                    Kind::File(_) | Kind::Ksm { .. } => FileType::Regular,
                     Kind::Link(_) => FileType::Symlink,
                 };
                 DirEntry { ino: ino(&self.child_path(&name)), kind, name: name.into_bytes() }
@@ -506,6 +526,30 @@ mod tests {
         assert!(names("fs/cgroup").is_empty());
         assert_eq!(names("fs/ext4/features"), ["meta_bg_resize"]);
         assert_eq!(get("fs/ext4/features/meta_bg_resize"), Kind::File(b"supported\n".to_vec()));
+    }
+
+    #[test]
+    fn ksm_has_the_files_of_linux() {
+        assert_eq!(names("kernel"), ["mm"]);
+        assert_eq!(names("kernel/mm"), ["ksm"]);
+        let files = names("kernel/mm/ksm");
+        for f in ["run", "pages_to_scan", "sleep_millisecs", "full_scans", "pages_shared"] {
+            assert!(files.contains(&String::from(f)), "{f}");
+        }
+        assert_eq!(get("kernel/mm/ksm/run"), Kind::Ksm { writable: true });
+        assert_eq!(get("kernel/mm/ksm/pages_shared"), Kind::Ksm { writable: false });
+        let run =
+            Node { path: String::from("kernel/mm/ksm/run"), kind: Kind::Ksm { writable: true } };
+        assert_eq!(run.metadata().mode, mode::S_IFREG | 0o644);
+        let mut buf = [0u8; 8];
+        assert_eq!(run.read_at(0, &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"0\n");
+        assert_eq!(run.write_at(0, b"7").unwrap_err(), Errno::EINVAL);
+        let shared = Node {
+            path: String::from("kernel/mm/ksm/pages_shared"),
+            kind: Kind::Ksm { writable: false },
+        };
+        assert_eq!(shared.write_at(0, b"1").unwrap_err(), Errno::EACCES);
     }
 
     #[test]

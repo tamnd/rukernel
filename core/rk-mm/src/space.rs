@@ -15,6 +15,8 @@ use rk_frame::mm::{Frame, alloc_zeroed_frame};
 use rk_frame::sync::SpinLock;
 use rk_frame::vm::{MapError, PageProt, USER_END, UserFault, VmSpace};
 
+pub(crate) mod ksmd;
+
 /// A file that a process can map. rk-vfs implements it, so rk-mm does not depend on rk-vfs, per
 /// spec/23-package-layout.md section 23.2.
 pub trait MmFile: Send + Sync {
@@ -191,6 +193,8 @@ pub struct AddressSpace {
     state: SpinLock<State>,
     /// The memory cgroup that the new anonymous pages are charged to, or 0 for none.
     memcg: AtomicU32,
+    /// The data of KSM.
+    ksm: ksmd::MmKsm,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -216,6 +220,7 @@ fn page_prot(vma: &Vma<FileRef>, exclusive: bool) -> PageProt {
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
+        ksmd::exit(self);
         // The process ended or called execve. Its shared file mappings go back to their files.
         let st = self.state.lock();
         for vma in st.vmas.iter() {
@@ -229,7 +234,12 @@ impl AddressSpace {
     pub fn new() -> Result<Self, Errno> {
         let vm = VmSpace::new().ok_or(Errno::ENOMEM)?;
         let state = State { vmas: VmaSet::new(), brk_start: 0, brk: 0, lock_future: false };
-        Ok(Self { vm, state: SpinLock::new(state), memcg: AtomicU32::new(0) })
+        Ok(Self {
+            vm,
+            state: SpinLock::new(state),
+            memcg: AtomicU32::new(0),
+            ksm: ksmd::MmKsm::default(),
+        })
     }
 
     /// Sets the memory cgroup that the new anonymous pages are charged to. The pages that the
@@ -342,6 +352,7 @@ impl AddressSpace {
             may_write: req.may_write,
             locked,
             grows_down: req.grows_down,
+            mergeable: false,
             backing,
             kind: req.kind,
         });

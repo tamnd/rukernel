@@ -1056,6 +1056,21 @@ fn process_files(
         ),
     ));
     out.push((b"oom_score".to_vec(), file(&join(base, b"oom_score"), || Ok(b"0\n".to_vec()))));
+    // The files of KSM are empty for a process without an address space, as in Linux.
+    let p_ = w.clone();
+    out.push((
+        b"ksm_stat".to_vec(),
+        file(&join(base, b"ksm_stat"), move || {
+            Ok(alive(&p_)?.vm().map(|vm| rk_mm::ksm::stat(&vm)).unwrap_or_default())
+        }),
+    ));
+    let p_ = w.clone();
+    out.push((
+        b"ksm_merging_pages".to_vec(),
+        file(&join(base, b"ksm_merging_pages"), move || {
+            Ok(alive(&p_)?.vm().map(|vm| rk_mm::ksm::merging_pages(&vm)).unwrap_or_default())
+        }),
+    ));
     let p_ = w.clone();
     let p_j = w.clone();
     out.push((
