@@ -8,12 +8,13 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::mman::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED,
-    MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_NOHUGEPAGE, MADV_NORMAL,
-    MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE, MADV_RANDOM, MADV_REMOVE,
-    MADV_SEQUENTIAL, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE,
-    MAP_GROWSDOWN, MAP_LOCKED, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE,
-    MAP_TYPE, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED,
-    MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
+    MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_MERGEABLE,
+    MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
+    MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL, MADV_UNMERGEABLE, MADV_WILLNEED, MADV_WIPEONFORK,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_POPULATE,
+    MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_TYPE, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT,
+    MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE,
+    MS_SYNC,
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
@@ -386,8 +387,8 @@ pub(crate) fn brk(cx: &Cx<'_>, addr: u64) -> SysResult {
 
 pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResult {
     let advice = u32::try_from(advice).map_err(|_| Errno::EINVAL)?;
-    // There is no KSM and no memory failure handler, so `MADV_MERGEABLE`, `MADV_UNMERGEABLE`,
-    // `MADV_HWPOISON` and `MADV_SOFT_OFFLINE` are not known.
+    // There is no memory failure handler, so `MADV_HWPOISON` and `MADV_SOFT_OFFLINE` are not
+    // known.
     let known = matches!(
         advice,
         MADV_NORMAL
@@ -410,6 +411,8 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
             | MADV_POPULATE_READ
             | MADV_POPULATE_WRITE
             | MADV_DONTNEED_LOCKED
+            | MADV_MERGEABLE
+            | MADV_UNMERGEABLE
     );
     if !known || addr as usize % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
@@ -430,6 +433,11 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
         if bad || (advice == MADV_REMOVE && !vma.shared) {
             return Err(Errno::EINVAL);
         }
+    }
+    if matches!(advice, MADV_MERGEABLE | MADV_UNMERGEABLE) {
+        let end = (addr as usize).saturating_add(len as usize).next_multiple_of(PAGE_SIZE);
+        rk_mm::ksm::madvise(&vm, addr as usize, end, advice == MADV_MERGEABLE)?;
+        return Ok(0);
     }
     // `MADV_DONTNEED` and `MADV_FREE` give zero pages again for anonymous memory. Each other
     // advice is only a hint, so it has no effect.

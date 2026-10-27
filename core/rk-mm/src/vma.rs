@@ -94,6 +94,8 @@ pub struct Vma<F> {
     /// `MAP_GROWSDOWN`: a fault on the page below the area makes the area larger. Linux names it
     /// `VM_GROWSDOWN`.
     pub grows_down: bool,
+    /// `MADV_MERGEABLE`: KSM can merge the pages of the area. Linux names it `VM_MERGEABLE`.
+    pub mergeable: bool,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -111,6 +113,7 @@ impl<F: Clone> Vma<F> {
             may_write: true,
             locked: false,
             grows_down: false,
+            mergeable: false,
             backing: Backing::Anon,
             kind,
         }
@@ -345,6 +348,7 @@ mod tests {
             may_write: true,
             locked: false,
             grows_down: false,
+            mergeable: false,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });

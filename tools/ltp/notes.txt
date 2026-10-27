@@ -4,3 +4,10 @@
 # runtest file before it, as net.ipv6:ping601, when two runtest files have the same name.
 cachestat03	Needs hugetlbfs, which rukernel does not have (TCONF).
 fanotify05	The test makes 3 x 16385 files on ext2. Under QEMU without KVM on a busy host, this can take more than the time limit of the test (172 s, TBROK). It passes when the host is less busy.
+ksm02	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
+ksm02_1	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
+ksm04	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
+ksm04_1	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
+ksm06	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
+ksm06_1	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
+ksm06_2	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).

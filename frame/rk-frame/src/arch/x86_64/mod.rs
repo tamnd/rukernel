@@ -84,7 +84,7 @@ fn interrupt(vector: u8) {
 }
 
 /// Copies of memory that user code can write at the same time, such as the frames of user pages.
-/// One `rep movsb` or `rep stosb` does each copy. The compiler does not know the instruction, so it
+/// A `rep movs` or a `rep stos` does each copy. The compiler does not know the instruction, so it
 /// cannot assume that the memory does not change, and the CPU copies whole lines when it can.
 pub(crate) mod mem {
     /// Copies `len` bytes from `src` to `dst`.
@@ -93,12 +93,18 @@ pub(crate) mod mem {
     ///
     /// The two ranges must be valid kernel memory, and they must not overlap.
     pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) {
+        // A `rep movsq` copies the words, and a `rep movsb` copies the rest. QEMU without KVM does
+        // each step of a `rep` alone, so a copy of words is 8 times faster there than a copy of
+        // bytes.
         // SAFETY: the caller gives two valid ranges of `len` bytes. The ABI keeps the direction
         // flag clear, so the copy goes up.
         unsafe {
             core::arch::asm!(
+                "rep movsq",
+                "mov rcx, {rest}",
                 "rep movsb",
-                inout("rcx") len => _,
+                rest = in(reg) len % 8,
+                inout("rcx") len / 8 => _,
                 inout("rdi") dst => _,
                 inout("rsi") src => _,
                 options(nostack, preserves_flags),
@@ -112,13 +118,17 @@ pub(crate) mod mem {
     ///
     /// The range must be valid kernel memory.
     pub(crate) unsafe fn zero(dst: *mut u8, len: usize) {
+        // As in `copy`, a `rep stosq` writes the words, and a `rep stosb` writes the rest.
         // SAFETY: as for `copy`.
         unsafe {
             core::arch::asm!(
+                "rep stosq",
+                "mov rcx, {rest}",
                 "rep stosb",
-                inout("rcx") len => _,
+                rest = in(reg) len % 8,
+                inout("rcx") len / 8 => _,
                 inout("rdi") dst => _,
-                in("al") 0u8,
+                in("rax") 0u64,
                 options(nostack, preserves_flags),
             );
         }

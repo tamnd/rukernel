@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod ksm;
 pub mod vma;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
