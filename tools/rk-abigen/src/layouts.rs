@@ -35,6 +35,8 @@ const STRUCTS: &[(&str, &[&str])] = &[
     ("linux/resource.h", &["rlimit", "rlimit64", "rusage"]),
     ("asm/poll.h", &["pollfd"]),
     ("linux/sched.h", &["clone_args"]),
+    ("linux/mount.h", &["statmount"]),
+    ("linux/fanotify.h", &["fanotify_event_metadata", "fanotify_response"]),
     ("linux/sched/types.h", &["sched_attr"]),
     ("linux/eventpoll.h", &["epoll_event"]),
     ("linux/signalfd.h", &["signalfd_siginfo"]),
@@ -98,10 +100,15 @@ fn parse_type(c: &str) -> Result<Type> {
         && let Some(i) = c.find('[')
     {
         let base = parse_type(c[..i].trim())?;
+        // A flexible array member, for example `char str[]` at the end of `struct statmount`,
+        // has no size. It is an array of 0 elements in Rust.
         let dims = c[i..]
             .split(']')
             .filter(|s| !s.is_empty())
-            .map(|s| s.trim_start_matches('[').parse::<usize>())
+            .map(|s| match s.trim_start_matches('[') {
+                "" => Ok(0),
+                n => n.parse::<usize>(),
+            })
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| format!("bad array type {c}"))?;
         return Ok(Type::Array(Box::new(base), dims));

@@ -19,6 +19,13 @@ pub struct FdEntry {
     pub cloexec: bool,
 }
 
+/// The work of the close of a descriptor of `file` in the table `owner`, as Linux does it: the
+/// POSIX locks of the table on the file go, and so does the dnotify entry.
+fn on_close(file: &Arc<File>, owner: usize) {
+    crate::lock::close_posix(file, owner);
+    crate::notify::dnotify::flush(file, owner);
+}
+
 /// The next owner number of a table. The owner of the POSIX record locks is the table, as Linux.
 static NEXT_OWNER: AtomicUsize = AtomicUsize::new(1);
 
@@ -49,7 +56,7 @@ impl Clone for FdTable {
 impl Drop for FdTable {
     fn drop(&mut self) {
         for entry in self.entries.iter().flatten() {
-            crate::lock::close_posix(&entry.file, self.owner);
+            on_close(&entry.file, self.owner);
         }
     }
 }
@@ -139,7 +146,7 @@ impl FdTable {
         }
         let old = self.entries[i].replace(FdEntry { file, cloexec });
         if let Some(e) = &old {
-            crate::lock::close_posix(&e.file, self.owner);
+            on_close(&e.file, self.owner);
         }
         Ok(old)
     }
@@ -177,7 +184,7 @@ impl FdTable {
         while self.entries.last().is_some_and(Option::is_none) {
             self.entries.pop();
         }
-        crate::lock::close_posix(&entry.file, self.owner);
+        on_close(&entry.file, self.owner);
         Ok(entry)
     }
 
@@ -200,7 +207,7 @@ impl FdTable {
             if slot.as_ref().is_some_and(|e| e.cloexec)
                 && let Some(entry) = slot.take()
             {
-                crate::lock::close_posix(&entry.file, self.owner);
+                on_close(&entry.file, self.owner);
                 closed.push(entry);
             }
         }
@@ -221,7 +228,7 @@ impl FdTable {
         let closed: Vec<FdEntry> = (first..end).filter_map(|i| self.entries[i].take()).collect();
         self.next_free = self.next_free.min(first);
         for e in &closed {
-            crate::lock::close_posix(&e.file, self.owner);
+            on_close(&e.file, self.owner);
         }
         while self.entries.last().is_some_and(Option::is_none) {
             self.entries.pop();

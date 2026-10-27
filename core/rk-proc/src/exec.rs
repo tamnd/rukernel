@@ -114,6 +114,10 @@ fn open_exec_at(
         return Err(Errno::EACCES);
     }
     fs.permission(&at, rk_vfs::cred::may::EXEC)?;
+    // The open of the file to run has the events of an open with `__FMODE_EXEC`, as
+    // `do_open_execat` of Linux.
+    rk_vfs::notify::open_perm(&at, true)?;
+    rk_vfs::notify::open(&at, true);
     Ok(at)
 }
 

@@ -113,6 +113,8 @@ pub mod cap {
     pub const SYS_TIME: u32 = 25;
     /// Make a device file.
     pub const MKNOD: u32 = 27;
+    /// Write records to the audit log of the kernel.
+    pub const AUDIT_WRITE: u32 = 29;
     /// Set the capabilities of a file.
     pub const SETFCAP: u32 = 31;
     /// Skip the mandatory access control.

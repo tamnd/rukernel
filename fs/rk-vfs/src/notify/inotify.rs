@@ -123,7 +123,9 @@ impl Inotify {
             new |= mask::EVENT_ON_CHILD;
         }
         let mut st = self.state.lock();
-        if let Some(mark) = st.watches.values().find(|m| Arc::ptr_eq(m.inode(), inode)) {
+        if let Some(mark) =
+            st.watches.values().find(|m| m.inode().is_some_and(|i| Arc::ptr_eq(i, inode)))
+        {
             if arg & flags::MASK_CREATE != 0 {
                 return Err(Errno::EEXIST);
             }
@@ -171,7 +173,8 @@ impl Inotify {
         let marks: Vec<Arc<Mark>> = self.state.lock().watches.values().cloned().collect();
         let mut out = Vec::new();
         for mark in marks {
-            let meta = mark.inode().metadata();
+            let Some(inode) = mark.inode() else { continue };
+            let meta = inode.metadata();
             out.extend_from_slice(
                 format!(
                     "inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0\n",

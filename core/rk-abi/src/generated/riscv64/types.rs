@@ -490,6 +490,123 @@ const _: () = {
     assert!(core::mem::offset_of!(CloneArgs, cgroup) == 80);
 };
 
+/// `struct statmount` from `<linux/mount.h>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct Statmount {
+    pub size: u32,
+    pub mnt_opts: u32,
+    pub mask: u64,
+    pub sb_dev_major: u32,
+    pub sb_dev_minor: u32,
+    pub sb_magic: u64,
+    pub sb_flags: u32,
+    pub fs_type: u32,
+    pub mnt_id: u64,
+    pub mnt_parent_id: u64,
+    pub mnt_id_old: u32,
+    pub mnt_parent_id_old: u32,
+    pub mnt_attr: u64,
+    pub mnt_propagation: u64,
+    pub mnt_peer_group: u64,
+    pub mnt_master: u64,
+    pub propagate_from: u64,
+    pub mnt_root: u32,
+    pub mnt_point: u32,
+    pub mnt_ns_id: u64,
+    pub fs_subtype: u32,
+    pub sb_source: u32,
+    pub opt_num: u32,
+    pub opt_array: u32,
+    pub opt_sec_num: u32,
+    pub opt_sec_array: u32,
+    pub supported_mask: u64,
+    pub mnt_uidmap_num: u32,
+    pub mnt_uidmap: u32,
+    pub mnt_gidmap_num: u32,
+    pub mnt_gidmap: u32,
+    pub __spare2: [u64; 43],
+    pub str: [u8; 0],
+}
+
+const _: () = {
+    assert!(size_of::<Statmount>() == 512);
+    assert!(align_of::<Statmount>() == 8);
+    assert!(core::mem::offset_of!(Statmount, size) == 0);
+    assert!(core::mem::offset_of!(Statmount, mnt_opts) == 4);
+    assert!(core::mem::offset_of!(Statmount, mask) == 8);
+    assert!(core::mem::offset_of!(Statmount, sb_dev_major) == 16);
+    assert!(core::mem::offset_of!(Statmount, sb_dev_minor) == 20);
+    assert!(core::mem::offset_of!(Statmount, sb_magic) == 24);
+    assert!(core::mem::offset_of!(Statmount, sb_flags) == 32);
+    assert!(core::mem::offset_of!(Statmount, fs_type) == 36);
+    assert!(core::mem::offset_of!(Statmount, mnt_id) == 40);
+    assert!(core::mem::offset_of!(Statmount, mnt_parent_id) == 48);
+    assert!(core::mem::offset_of!(Statmount, mnt_id_old) == 56);
+    assert!(core::mem::offset_of!(Statmount, mnt_parent_id_old) == 60);
+    assert!(core::mem::offset_of!(Statmount, mnt_attr) == 64);
+    assert!(core::mem::offset_of!(Statmount, mnt_propagation) == 72);
+    assert!(core::mem::offset_of!(Statmount, mnt_peer_group) == 80);
+    assert!(core::mem::offset_of!(Statmount, mnt_master) == 88);
+    assert!(core::mem::offset_of!(Statmount, propagate_from) == 96);
+    assert!(core::mem::offset_of!(Statmount, mnt_root) == 104);
+    assert!(core::mem::offset_of!(Statmount, mnt_point) == 108);
+    assert!(core::mem::offset_of!(Statmount, mnt_ns_id) == 112);
+    assert!(core::mem::offset_of!(Statmount, fs_subtype) == 120);
+    assert!(core::mem::offset_of!(Statmount, sb_source) == 124);
+    assert!(core::mem::offset_of!(Statmount, opt_num) == 128);
+    assert!(core::mem::offset_of!(Statmount, opt_array) == 132);
+    assert!(core::mem::offset_of!(Statmount, opt_sec_num) == 136);
+    assert!(core::mem::offset_of!(Statmount, opt_sec_array) == 140);
+    assert!(core::mem::offset_of!(Statmount, supported_mask) == 144);
+    assert!(core::mem::offset_of!(Statmount, mnt_uidmap_num) == 152);
+    assert!(core::mem::offset_of!(Statmount, mnt_uidmap) == 156);
+    assert!(core::mem::offset_of!(Statmount, mnt_gidmap_num) == 160);
+    assert!(core::mem::offset_of!(Statmount, mnt_gidmap) == 164);
+    assert!(core::mem::offset_of!(Statmount, __spare2) == 168);
+    assert!(core::mem::offset_of!(Statmount, str) == 512);
+};
+
+/// `struct fanotify_event_metadata` from `<linux/fanotify.h>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct FanotifyEventMetadata {
+    pub event_len: u32,
+    pub vers: u8,
+    pub reserved: u8,
+    pub metadata_len: u16,
+    pub mask: u64,
+    pub fd: i32,
+    pub pid: i32,
+}
+
+const _: () = {
+    assert!(size_of::<FanotifyEventMetadata>() == 24);
+    assert!(align_of::<FanotifyEventMetadata>() == 8);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, event_len) == 0);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, vers) == 4);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, reserved) == 5);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, metadata_len) == 6);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, mask) == 8);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, fd) == 16);
+    assert!(core::mem::offset_of!(FanotifyEventMetadata, pid) == 20);
+};
+
+/// `struct fanotify_response` from `<linux/fanotify.h>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct FanotifyResponse {
+    pub fd: i32,
+    pub response: u32,
+}
+
+const _: () = {
+    assert!(size_of::<FanotifyResponse>() == 8);
+    assert!(align_of::<FanotifyResponse>() == 4);
+    assert!(core::mem::offset_of!(FanotifyResponse, fd) == 0);
+    assert!(core::mem::offset_of!(FanotifyResponse, response) == 4);
+};
+
 /// `struct sched_attr` from `<linux/sched/types.h>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
