@@ -90,7 +90,8 @@ static SUPERS: SpinLock<Vec<Super>> = SpinLock::new(Vec::new());
 ///
 /// # Errors
 ///
-/// Gives the error of the constructor of the type.
+/// Gives `EACCES` for a new read and write file system on a read only device, or the error of
+/// the constructor of the type.
 pub fn get_tree(ty: FsType, args: &MountArgs<'_>, mounted: bool) -> Result<InodeRef> {
     let Some(dev) = args.dev.filter(|_| !ty.nodev) else {
         return (ty.make)(args);
@@ -104,6 +105,11 @@ pub fn get_tree(ty: FsType, args: &MountArgs<'_>, mounted: bool) -> Result<Inode
         {
             return if s.read_only == args.read_only { Ok(root) } else { Err(Errno::EBUSY) };
         }
+    }
+    // As `setup_bdev_super` of Linux, a read and write mount of a read only device gives
+    // `EACCES`, and `mount(8)` then tries again with `MS_RDONLY`.
+    if !args.read_only && crate::blockdev::block_read_only(dev) {
+        return Err(Errno::EACCES);
     }
     let root = (ty.make)(args)?;
     let mut supers = SUPERS.lock();

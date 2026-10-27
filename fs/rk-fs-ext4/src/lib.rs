@@ -155,12 +155,23 @@ impl Disk for rk_vfs::blockdev::MountedDisk {
 ///
 /// Gives `ENXIO` if the device has no driver, `EINVAL` if the device does not have ext4,
 /// `EOPNOTSUPP` for a feature that the driver does not support, and `EROFS` for a read and write
-/// mount of a disk that the driver can only read. Gives `EBUSY` if a file has the device open
-/// with `O_EXCL`.
+/// mount of a disk that the driver can only read or for a journal to replay on a read only
+/// device. Gives `EINVAL` for `norecovery` with a journal to replay and a read and write mount,
+/// and `EBUSY` if a file has the device open with `O_EXCL`.
 pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     let dev = args.dev.ok_or(Errno::ENOTBLK)?;
     let cache = rk_vfs::blockdev::mount_block(dev)?;
-    let fs = Fs::open(dev, alloc::boxed::Box::new(cache), args.read_only)?;
+    // As Linux, `norecovery` and `noload` leave the journal as it is, and a read only device
+    // cannot replay it.
+    let norecovery = args.data.split(|&c| c == b',').any(|o| o == b"norecovery" || o == b"noload");
+    let replay = if norecovery {
+        Replay::Skip
+    } else if rk_vfs::blockdev::block_read_only(dev) {
+        Replay::Refuse
+    } else {
+        Replay::Do
+    };
+    let fs = Fs::open_with(dev, alloc::boxed::Box::new(cache), args.read_only, replay)?;
     // As Linux, a mount has the delayed allocation unless `nodelalloc` turns it off.
     fs.set_delalloc(true);
     // The last of `minixdf` and `bsddf` sets how `statfs` counts the blocks. As Linux, a mount
@@ -177,6 +188,18 @@ pub fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
         }
     }
     Ok(fs.root()?)
+}
+
+/// What a mount does with a journal that has transactions to replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replay {
+    /// The mount replays the journal.
+    Do,
+    /// The mount does not replay the journal, as the mount option `norecovery`. A read and write
+    /// mount then gives `EINVAL`.
+    Skip,
+    /// The device is read only, so the mount gives `EROFS`, as `ext4_load_journal` of Linux.
+    Refuse,
 }
 
 /// The metadata that a change of the file system changes, under the lock of the file system.
@@ -289,9 +312,31 @@ impl Fs {
     /// is false and the driver can only read the disk. A journal with transactions is replayed
     /// first.
     pub fn open(dev: u64, disk: alloc::boxed::Box<dyn Disk>, read_only: bool) -> Result<Arc<Self>> {
+        Self::open_with(dev, disk, read_only, Replay::Do)
+    }
+
+    /// Opens the file system as `open` does, and does `replay` with a journal that has
+    /// transactions.
+    ///
+    /// # Errors
+    ///
+    /// Gives the errors of `open`, and for a journal with transactions `EINVAL` for `Skip` with a
+    /// read and write mount, and `EROFS` for `Refuse`.
+    pub fn open_with(
+        dev: u64,
+        disk: alloc::boxed::Box<dyn Disk>,
+        read_only: bool,
+        replay: Replay,
+    ) -> Result<Arc<Self>> {
         let disk: Arc<dyn Disk> = Arc::from(disk);
         let mut fs = Self::load(dev, disk.clone(), read_only)?;
-        if fs.sb.incompat & layout::incompat::RECOVER != 0 {
+        let recover = fs.sb.incompat & layout::incompat::RECOVER != 0;
+        match replay {
+            Replay::Skip if recover && !read_only => return Err(Errno::EINVAL),
+            Replay::Refuse if recover => return Err(Errno::EROFS),
+            _ => {}
+        }
+        if recover && replay == Replay::Do {
             // As Linux, a read only mount also replays the journal.
             fs.recover()?;
             drop(fs);

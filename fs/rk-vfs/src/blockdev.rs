@@ -24,6 +24,8 @@ pub use rk_block::{BlockDevice, SECTOR_SIZE};
 
 /// The `ioctl` commands of block devices, from `<linux/fs.h>`.
 pub mod ioctl {
+    /// Makes the device read only, from an `int` that is not 0, or writable again.
+    pub const BLKROSET: u32 = 0x125d;
     /// Gives 1 if the device is read only.
     pub const BLKROGET: u32 = 0x125e;
     /// Gives the size in sectors, as an `unsigned long`.
@@ -248,6 +250,12 @@ pub fn block_sectors(rdev: u64) -> Option<u64> {
 /// Gives the queue of the block device `rdev`.
 pub fn block_queue(rdev: u64) -> Option<Arc<Queue>> {
     BLOCK_DEVICES.lock().get(&rdev).map(|e| e.cache.store().clone())
+}
+
+/// Tells if the block device `rdev` does not accept writes, as `bdev_read_only` of Linux. A
+/// number without a driver gives false.
+pub fn block_read_only(rdev: u64) -> bool {
+    block_queue(rdev).is_some_and(|q| q.read_only())
 }
 
 /// Gives the page cache of the block device `rdev`.
@@ -529,6 +537,16 @@ impl FileOps for BlockFile {
                 }
             }
             ioctl::BLKGETDISKSEQ => Self::put(mem, arg, &1u64.to_ne_bytes()),
+            ioctl::BLKROSET => {
+                // As `blkdev_roset` of Linux, it needs `CAP_SYS_ADMIN`.
+                if !crate::cred::current().capable(crate::cred::cap::SYS_ADMIN) {
+                    return Err(Errno::EACCES);
+                }
+                let mut b = [0u8; 4];
+                mem.read(arg, &mut b)?;
+                self.queue.set_read_only(i32::from_ne_bytes(b) != 0);
+                Ok(0)
+            }
             ioctl::BLKROGET => {
                 Self::put(mem, arg, &i32::from(self.queue.read_only()).to_ne_bytes())
             }
@@ -596,6 +614,10 @@ mod tests {
         assert_eq!(open_block(rdev, O_EXCL).err(), Some(Errno::EBUSY));
         drop(file);
         assert!(claim_block(rdev, Holder::Mount).is_ok());
+        assert!(!block_read_only(rdev));
+        block_queue(rdev).unwrap().set_read_only(true);
+        assert!(block_read_only(rdev));
+        assert!(!block_read_only(1));
         assert_eq!(claim_block(1, Holder::Mount).err(), Some(Errno::ENXIO));
     }
 

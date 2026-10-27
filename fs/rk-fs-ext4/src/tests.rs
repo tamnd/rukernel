@@ -1011,6 +1011,23 @@ mod log {
     }
 
     #[test]
+    fn norecovery_and_a_read_only_device_leave_the_journal() {
+        let new = vec![b'n'; BS];
+        let log = [descriptor(5, &[(22, 0, &new)]), new.clone(), commit(5)];
+        let img = image_with(&log);
+        let ram = Ram(Arc::new(SpinLock::new(img.clone())));
+        let open = |read_only, replay| {
+            Fs::open_with(7, alloc::boxed::Box::new(ram.clone()), read_only, replay).err()
+        };
+        assert_eq!(open(true, Replay::Refuse), Some(Errno::EROFS));
+        assert_eq!(open(false, Replay::Skip), Some(Errno::EINVAL));
+        assert_eq!(open(true, Replay::Skip), None);
+        assert!(*ram.0.lock() == img);
+        assert_eq!(open(true, Replay::Do), None);
+        assert_eq!(&ram.0.lock()[22 * BS..23 * BS], &new[..]);
+    }
+
+    #[test]
     fn a_bad_commit_ends_the_log() {
         let new = vec![b'n'; BS];
         let mut bad = commit(5);
