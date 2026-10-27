@@ -5,14 +5,13 @@
 //! and removes the mapping when it is dropped. No safe function gives a raw address that the
 //! caller can write through.
 
-// Only x86-64 has a boot path in R0. On the other targets, the boot code that fills the allocator
-// is not there.
+// riscv64 has no boot path yet, so the boot code that fills the allocator is not there.
 #[cfg(any(test, target_os = "none"))]
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 pub(crate) mod bitmap;
 
 #[cfg(target_os = "none")]
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 pub(crate) mod frame;
 #[cfg(target_os = "none")]
 mod heap;

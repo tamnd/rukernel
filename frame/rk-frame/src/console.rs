@@ -274,12 +274,12 @@ pub fn log_emit(prio: u16, text: &[u8]) {
     let _guard = CONSOLE.lock();
     LOG.lock().emit(prio, now_ns(), text);
     let text = text.strip_suffix(b"\n").unwrap_or(text);
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(target_os = "none")]
     {
-        crate::arch::x86_64::serial::write_bytes(text);
-        crate::arch::x86_64::serial::write_bytes(b"\n");
+        crate::arch::imp::console::write_bytes(text);
+        crate::arch::imp::console::write_bytes(b"\n");
     }
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(target_os = "none"))]
     let _ = text;
 }
 
@@ -321,9 +321,9 @@ impl Write for Console {
         if let Some(mut log) = LOG.try_lock() {
             log.write(s, now_ns());
         }
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-        crate::arch::x86_64::serial::write_bytes(s.as_bytes());
-        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        #[cfg(target_os = "none")]
+        crate::arch::imp::console::write_bytes(s.as_bytes());
+        #[cfg(not(target_os = "none"))]
         let _ = s;
         Ok(())
     }
@@ -356,18 +356,18 @@ pub fn _print_panic(args: fmt::Arguments<'_>) {
 /// of the tty layer uses this function for the output of user programs.
 pub fn write_bytes(bytes: &[u8]) {
     let _guard = CONSOLE.lock();
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    crate::arch::x86_64::serial::write_raw(bytes);
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(target_os = "none")]
+    crate::arch::imp::console::write_raw(bytes);
+    #[cfg(not(target_os = "none"))]
     let _ = bytes;
 }
 
 /// Reads one byte from the console, if a byte came. The console is polled until the tty layer
 /// gets the interrupt of the serial port.
 pub fn try_read_byte() -> Option<u8> {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    return crate::arch::x86_64::serial::try_read();
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(target_os = "none")]
+    return crate::arch::imp::console::try_read();
+    #[cfg(not(target_os = "none"))]
     None
 }
 

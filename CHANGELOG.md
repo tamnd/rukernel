@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - A virtio-net driver and the network device layer (#328). The driver negotiates `VIRTIO_NET_F_MAC`, `VIRTIO_NET_F_STATUS` and `VIRTIO_F_VERSION_1`, reads the MAC address, and keeps a receive queue and a transmit queue of 64 buffers each. rk-net has the packet buffer `NetBuf` with headroom for the headers, the network devices with a name, an interface index, the MAC address, the MTU, the flags and the statistics of Linux, and the loopback device `lo` with the interface index 1. A virtio-net device gets the name `eth0`, `eth1` and so on, and the kernel prints its name and its MAC address at boot. The drivers poll and do not use interrupts yet. The boot test `net` sends an ARP request to the gateway of the user network of QEMU and receives the reply. rk-abigen now extracts the constants of `<linux/if_ether.h>`.
+- The kernel boots on arm64 to the console on the QEMU `virt` machine. The image is a Linux arm64 `Image`, which QEMU `-kernel`, U-Boot `booti` and GRUB load. The boot code drops from EL2 to EL1, turns the MMU on with the kernel at `KERNEL_BASE` and a direct map, and reads the memory, the command line and the initrd from the device tree. The exception vectors print an oops for an unexpected exception. The PL011 UART is the console, and the virtual timer gives the tick through a GICv2. `cargo xtask boot-test aarch64` runs the `boot`, `trap`, `mm`, `heap` and `timer` self tests on `qemu-system-aarch64 -M virt` (#329).
 
 ## [0.4.0] - 2026-10-27
 

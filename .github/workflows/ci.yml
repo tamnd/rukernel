@@ -139,10 +139,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: boot
-      - name: install qemu, ovmf and musl
+      - name: install qemu for x86-64 and arm64, ovmf and musl
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends qemu-system-x86 ovmf musl-tools
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-system-arm ovmf musl-tools
       # tools/ltp/build.sh builds the LTP tests in a container. The cache keeps them until the
       # script changes.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

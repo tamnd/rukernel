@@ -47,7 +47,8 @@ fn main() -> ExitCode {
              style    the prose has no em dashes, no en dashes and no horizontal rules\n\
              targets  the kernel crates build for the three bare metal targets\n\
              qemu     boot the x86-64 kernel in QEMU, with the arguments as the command line\n\
-             boot-test  boot the x86-64 kernel in QEMU and check the self tests, or only the named tests\n\
+             boot-test  boot the kernel in QEMU and check the self tests, or only the named tests;\n\
+                        `aarch64` names the arm64 tests on QEMU virt\n\
              abi      run rk-abigen on the pinned Linux tree and check that the output is in the tree\n\
              ci       all of the above except qemu and abi, and fmt, clippy, test and doc",
         )),
@@ -1607,12 +1608,28 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
     }
 }
 
+/// Runs the boot tests. With no names, it runs all of the x86-64 tests and then the arm64 tests.
+/// The name `aarch64` selects the arm64 tests, and the other names select x86-64 tests.
 fn boot_test(names: &[String]) -> Result {
-    if let Some(name) = names.iter().find(|n| !BOOT_TESTS.contains(&n.as_str())) {
+    if let Some(name) = names.iter().find(|n| *n != "aarch64" && !BOOT_TESTS.contains(&n.as_str()))
+    {
         return Err(format!("{name}: no such boot test"));
     }
-    let kernel = build_kernel()?;
+    let arm = names.iter().any(|n| n == "aarch64");
+    let x86: Vec<String> = names.iter().filter(|n| *n != "aarch64").cloned().collect();
     let mut errors = Vec::new();
+    if !arm || !x86.is_empty() {
+        x86_boot_tests(&x86, &mut errors)?;
+    }
+    if arm || names.is_empty() {
+        aarch64_boot_tests(&mut errors)?;
+    }
+    report("boot tests", errors)
+}
+
+/// Runs the x86-64 boot tests with the names, or all of them, and adds the failures to `errors`.
+fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
+    let kernel = build_kernel()?;
     let named = |t: &&&str| names.is_empty() || names.iter().any(|n| n == **t);
     for test in BOOT_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
         let (mut cmd, timeout) = if *test == "ltp" {
@@ -1748,7 +1765,88 @@ fn boot_test(names: &[String]) -> Result {
         }
         None => println!("boot tests with UEFI: skipped, no OVMF firmware, set RK_OVMF"),
     }
-    report("boot tests", errors)
+    Ok(())
+}
+
+/// The self tests that `boot-test aarch64` runs on the QEMU `virt` machine, each in its own boot.
+/// The `boot` test shows the first console line, and the `timer` test waits for timer ticks.
+const AARCH64_TESTS: &[&str] = &["boot", "trap", "mm", "heap", "timer"];
+
+/// The offset and the value of the magic number in the header of a Linux arm64 `Image`, per
+/// Documentation/arch/arm64/booting.rst of Linux.
+const IMAGE_MAGIC_AT: usize = 0x38;
+const IMAGE_MAGIC: u64 = 0x644d_5241;
+
+/// Makes a Linux arm64 `Image` from the kernel ELF file. The physical address of each segment is
+/// its offset in the image, and the bss is not in the file.
+fn arm64_image(elf: &[u8]) -> Result<Vec<u8>> {
+    if elf.get(..4) != Some(b"\x7fELF".as_slice()) || elf.get(4) != Some(&2) {
+        return Err(String::from("the kernel is not an ELF64 file"));
+    }
+    let usize_of = |v: u64| usize::try_from(v).map_err(|e| e.to_string());
+    let (phoff, phentsize, phnum) =
+        (usize_of(le::<8>(elf, 0x20)?)?, usize_of(le::<2>(elf, 0x36)?)?, le::<2>(elf, 0x38)?);
+    let mut image = Vec::new();
+    for i in 0..usize_of(phnum)? {
+        let ph = phoff + i * phentsize;
+        if le::<4>(elf, ph)? != 1 {
+            continue;
+        }
+        let offset = usize_of(le::<8>(elf, ph + 8)?)?;
+        let (at, len) = (usize_of(le::<8>(elf, ph + 24)?)?, usize_of(le::<8>(elf, ph + 32)?)?);
+        let data = elf.get(offset..offset + len).ok_or("a segment is outside the file")?;
+        if image.len() < at + len {
+            image.resize(at + len, 0);
+        }
+        image[at..at + len].copy_from_slice(data);
+    }
+    if le::<4>(&image, IMAGE_MAGIC_AT)? != IMAGE_MAGIC {
+        return Err(String::from("the kernel does not start with an arm64 Image header"));
+    }
+    Ok(image)
+}
+
+/// Builds the arm64 kernel and runs `AARCH64_TESTS` on `qemu-system-aarch64 -M virt`, and adds
+/// the failures to `errors`. Without QEMU for arm64, the tests are skipped, except in CI.
+fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
+    let qemu = "qemu-system-aarch64";
+    if Command::new(qemu).arg("--version").stdout(Stdio::null()).status().is_err() {
+        if std::env::var_os("CI").is_some() {
+            return Err(format!("no {qemu} for the arm64 boot tests, install qemu-system-arm"));
+        }
+        println!("boot tests on arm64: skipped, no {qemu}");
+        return Ok(());
+    }
+    cargo(&["build", "--package", "rukernel", "--target", "aarch64-unknown-none"])?;
+    let elf_path = workspace_root().join("target/aarch64-unknown-none/debug/rukernel");
+    let elf = fs::read(&elf_path).map_err(|e| format!("{}: {e}", elf_path.display()))?;
+    let image = elf_path.with_file_name("Image");
+    fs::write(&image, arm64_image(&elf)?).map_err(|e| format!("{}: {e}", image.display()))?;
+    for test in AARCH64_TESTS {
+        let mut cmd = Command::new(qemu);
+        cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M"])
+            .args(["-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot"])
+            .arg("-kernel")
+            .arg(&image)
+            .arg("-append")
+            .arg(format!("console=ttyAMA0 rk.test={test}"));
+        // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
+        // gives the result.
+        let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, &[])?;
+        let passed = status == Some(0)
+            && log.contains("aarch64 booting with linux")
+            && log.contains(&pass_line(test));
+        if passed {
+            println!("boot test {test} on arm64: pass");
+            if std::env::var_os("RK_BOOT_LOG").is_some() {
+                println!("{log}");
+            }
+        } else {
+            let status = status.map_or(String::from("a timeout"), |s| format!("status {s}"));
+            errors.push(format!("boot test {test} on arm64: fail with {status}\n{log}"));
+        }
+    }
+    Ok(())
 }
 
 /// The places where a package puts the OVMF firmware: Homebrew, Debian and Ubuntu, and Fedora.

@@ -20,6 +20,8 @@ pub mod boot;
 pub mod console;
 pub mod cpu;
 pub mod date;
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) mod fdt;
 #[cfg(target_os = "none")]
 pub mod irq;
 pub mod mm;

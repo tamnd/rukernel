@@ -125,6 +125,11 @@ pub(crate) mod mem {
     }
 }
 
+/// The early console that the architecture independent code writes to: COM1.
+pub(crate) mod console {
+    pub(crate) use super::serial::{try_read, write_bytes, write_raw};
+}
+
 /// The timer values that the architecture independent code reads.
 pub(crate) mod timer {
     pub(crate) use super::apic::{HZ, TICKS, TIMER_HZ, clock_ns, nanos, tsc_state};
