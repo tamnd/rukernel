@@ -30,3 +30,6 @@ IST = "IST"       # the x86-64 Interrupt Stack Table
 controllen = "controllen" # msg_controllen of struct msghdr
 BA = "BA"         # BARs, PCI base address registers, split by the checker
 exportfs = "exportfs" # the NFS export code of Linux and the group of fstests
+IIF = "IIF"       # RTA_IIF of rtnetlink, the input interface of a route
+OIF = "OIF"       # RTA_OIF of rtnetlink, the output interface of a route
+Parm = "Parm"     # InParmProbs of /proc/net/snmp, the ICMP parameter problems

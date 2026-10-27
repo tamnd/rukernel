@@ -140,16 +140,17 @@ impl NetDriver for Sink {
 // The devices are global, so one test does all of the checks of the registration.
 #[test]
 fn devices_get_names_indexes_and_counts() {
+    let _serial = crate::TEST_DEVICES.lock();
     dev::init();
     dev::init();
     let lo = dev::by_name("lo").unwrap();
     assert_eq!((lo.ifindex(), lo.kind(), lo.mtu()), (1, LinkKind::Loopback, 65536));
-    assert_eq!(lo.flags(), IFF_LOOPBACK | IFF_LOWER_UP);
+    assert_eq!(lo.flags(), IFF_LOOPBACK);
     let sink = Arc::new(Sink::default());
     let eth0 = dev::register(sink.clone()).unwrap();
     let eth1 = dev::register(Arc::new(Sink::default())).unwrap();
-    assert_eq!((eth0.name(), eth0.ifindex()), ("eth0", 2));
-    assert_eq!((eth1.name(), eth1.ifindex()), ("eth1", 3));
+    assert_eq!((eth0.name().as_str(), eth0.ifindex()), ("eth0", 2));
+    assert_eq!((eth1.name().as_str(), eth1.ifindex()), ("eth1", 3));
     assert_eq!(dev::by_index(3).unwrap().name(), "eth1");
     assert_eq!(dev::devices().len(), 3);
     assert_eq!(dev::register(Arc::new(dev::Loopback::default())).err(), Some(Errno::EEXIST));

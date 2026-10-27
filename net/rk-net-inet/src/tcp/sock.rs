@@ -43,6 +43,7 @@ use rk_net::consts::{
 };
 use rk_net::dev;
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
+use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
 use rk_vfs::wait::{WaitQueue, poll_wake};
 
@@ -1184,6 +1185,10 @@ impl Socket for Stream {
             c.abort_orphan();
         }
         stack::poll_now();
+    }
+
+    fn ioctl(&self, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Option<Result<usize>> {
+        crate::ioctl::inet_ioctl(cmd, arg, mem)
     }
 
     fn as_any(&self) -> &dyn Any {

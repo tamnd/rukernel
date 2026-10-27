@@ -13,12 +13,12 @@
 //! `mq_notify` registers one process that the kernel tells when a message comes to an empty
 //! queue that no receiver waits for. `SIGEV_SIGNAL` sends a signal with `SI_MESGQ`. For
 //! `SIGEV_THREAD`, musl makes a thread that waits on an `AF_NETLINK` socket, and the kernel puts
-//! a cookie of 32 bytes on that socket. rukernel has only this part of netlink: a socket that
-//! the kernel can put a message on, as `NotifySock`.
+//! a cookie of 32 bytes on that socket with `NetlinkSocket::send_from_kernel`, as
+//! `netlink_sendskb` of Linux does.
 
 use crate::cx::{Cx, SysResult};
 use crate::info::NSEC_PER_SEC;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -31,7 +31,8 @@ use rk_abi::native::time::CLOCK_REALTIME;
 use rk_abi::native::types::KernelTimespec;
 use rk_frame::sync::{Once, SpinLock};
 use rk_frame::time::HZ;
-use rk_net::{Message, PathOps, Received, Socket};
+use rk_net::Socket;
+use rk_net::netlink::NetlinkSocket;
 use rk_proc::Process;
 use rk_proc::signal::{NSIG, SigInfo};
 use rk_vfs::cred::{Cred, cap, may};
@@ -70,12 +71,6 @@ const SIGEV_NOTIFY: usize = 12;
 const NOTIFY_COOKIE_LEN: usize = 32;
 const NOTIFY_WOKENUP: u8 = 1;
 const NOTIFY_REMOVED: u8 = 2;
-/// The family and the largest protocol of netlink.
-pub(crate) const AF_NETLINK: u32 = 16;
-const NETLINK_MAX_LINKS: u32 = 32;
-const SOCK_RAW: u32 = 3;
-const SOCK_DGRAM: u32 = 2;
-const SOL_SOCKET: u32 = 1;
 
 /// The attributes of a queue, as `struct mq_attr`.
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -92,7 +87,7 @@ struct MqAttr {
 enum NotifyKind {
     None,
     Signal { signo: u32, value: u64 },
-    Thread { sock: Arc<NotifyQueue>, cookie: [u8; NOTIFY_COOKIE_LEN] },
+    Thread { sock: Arc<dyn Socket>, cookie: [u8; NOTIFY_COOKIE_LEN] },
 }
 
 /// The registration of `mq_notify`.
@@ -116,7 +111,7 @@ impl Notify {
     fn remove(self) {
         if let NotifyKind::Thread { sock, mut cookie } = self.kind {
             cookie[NOTIFY_COOKIE_LEN - 1] = NOTIFY_REMOVED;
-            sock.push(cookie.to_vec());
+            send_cookie(&sock, &cookie);
         }
     }
 }
@@ -590,7 +585,7 @@ fn notify(s: &mut MqState, pid: u32, uid: u32) {
         }
         NotifyKind::Thread { sock, mut cookie } => {
             cookie[NOTIFY_COOKIE_LEN - 1] = NOTIFY_WOKENUP;
-            sock.push(cookie.to_vec());
+            send_cookie(&sock, &cookie);
         }
     }
 }
@@ -737,11 +732,9 @@ pub(crate) fn mq_notify(cx: &Cx<'_>, fd: u64, sevp: u64) -> SysResult {
                 cookie.copy_from_slice(&cx.read_bytes(value, NOTIFY_COOKIE_LEN)?);
                 let file = cx.file(u64::from(signo)).map_err(|_| Errno::EBADF)?;
                 let sock = rk_net::socket_of(&file).ok_or(Errno::ENOTSOCK)?;
-                let sock = sock
-                    .as_any()
-                    .downcast_ref::<NotifySock>()
-                    .map(|s| s.queue.clone())
-                    .ok_or(Errno::EINVAL)?;
+                if sock.as_any().downcast_ref::<NetlinkSocket>().is_none() {
+                    return Err(Errno::EINVAL);
+                }
                 NotifyKind::Thread { sock, cookie }
             }
             _ => return Err(Errno::EINVAL),
@@ -799,122 +792,9 @@ pub(crate) fn mq_getsetattr(cx: &Cx<'_>, fd: u64, new: u64, old: u64) -> SysResu
     Ok(0)
 }
 
-/// The messages that the kernel put on a netlink socket of `mq_notify`.
-struct NotifyQueue {
-    msgs: SpinLock<VecDeque<Vec<u8>>>,
-    wait: WaitQueue,
-    events: AtomicU64,
-}
-
-impl NotifyQueue {
-    fn push(&self, msg: Vec<u8>) {
-        self.msgs.lock().push_back(msg);
-        self.events.fetch_add(1, Ordering::Relaxed);
-        self.wait.wake_all();
-        poll_wake();
-    }
-}
-
-/// An `AF_NETLINK` socket. It only receives the cookies of `mq_notify`.
-struct NotifySock {
-    kind: u32,
-    protocol: u32,
-    ino: u64,
-    queue: Arc<NotifyQueue>,
-    options: SpinLock<rk_net::Options>,
-}
-
-/// Makes an `AF_NETLINK` socket, as `netlink_create` of Linux checks it.
-pub(crate) fn netlink_socket(kind: u32, protocol: u64) -> Result<Arc<dyn Socket>> {
-    if kind != SOCK_RAW && kind != SOCK_DGRAM {
-        return Err(Errno::ESOCKTNOSUPPORT);
-    }
-    let protocol = u32::try_from(protocol as i32).map_err(|_| Errno::EPROTONOSUPPORT)?;
-    if protocol >= NETLINK_MAX_LINKS {
-        return Err(Errno::EPROTONOSUPPORT);
-    }
-    let queue = Arc::new(NotifyQueue {
-        msgs: SpinLock::new(VecDeque::new()),
-        wait: WaitQueue::new(),
-        events: AtomicU64::new(0),
-    });
-    Ok(Arc::new(NotifySock {
-        kind,
-        protocol,
-        ino: rk_net::next_ino(),
-        queue,
-        options: SpinLock::new(rk_net::Options::default()),
-    }))
-}
-
-impl Socket for NotifySock {
-    fn family(&self) -> u32 {
-        AF_NETLINK
-    }
-
-    fn kind(&self) -> u32 {
-        self.kind
-    }
-
-    fn protocol(&self) -> u32 {
-        self.protocol
-    }
-
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-
-    fn bind(&self, _paths: &dyn PathOps, _addr: &[u8]) -> Result<()> {
-        Ok(())
-    }
-
-    fn send(&self, _paths: &dyn PathOps, _msg: Message, _flags: u32, _nb: bool) -> Result<usize> {
-        Err(Errno::EOPNOTSUPP)
-    }
-
-    fn recv(&self, len: usize, _flags: u32, nonblock: bool) -> Result<Received> {
-        let msg =
-            self.queue.wait.wait_interruptible(|| match self.queue.msgs.lock().pop_front() {
-                Some(m) => Ok(Some(m)),
-                None if nonblock => Err(Errno::EAGAIN),
-                None => Ok(None),
-            })?;
-        let full = msg.len();
-        let mut data = msg;
-        data.truncate(len);
-        Ok(Received { data, len: full, ..Received::default() })
-    }
-
-    /// The address is a `struct sockaddr_nl` with the port 0 and no groups.
-    fn name(&self) -> Vec<u8> {
-        let mut addr = alloc::vec![0u8; 12];
-        addr[..2].copy_from_slice(&(AF_NETLINK as u16).to_ne_bytes());
-        addr
-    }
-
-    fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
-        if level != SOL_SOCKET {
-            return Err(Errno::ENOPROTOOPT);
-        }
-        self.options.lock().get(name)
-    }
-
-    fn set_option(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
-        if level != SOL_SOCKET {
-            return Err(Errno::ENOPROTOOPT);
-        }
-        self.options.lock().set(name, value)
-    }
-
-    fn poll(&self) -> u32 {
-        if self.queue.msgs.lock().is_empty() { 0 } else { events::POLLIN | POLLRDNORM }
-    }
-
-    fn event_count(&self) -> u64 {
-        self.queue.events.load(Ordering::Relaxed)
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
+/// Puts the cookie of `mq_notify` on the netlink socket of the thread of `SIGEV_THREAD`.
+fn send_cookie(sock: &Arc<dyn Socket>, cookie: &[u8; NOTIFY_COOKIE_LEN]) {
+    if let Some(sock) = sock.as_any().downcast_ref::<NetlinkSocket>() {
+        sock.send_from_kernel(cookie.to_vec());
     }
 }

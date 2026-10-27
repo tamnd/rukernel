@@ -89,6 +89,10 @@ pub mod cap {
     pub const LINUX_IMMUTABLE: u32 = 9;
     /// Bind a socket to a port below 1024.
     pub const NET_BIND_SERVICE: u32 = 10;
+    /// Send broadcast packets and listen to the multicast messages of each network namespace.
+    pub const NET_BROADCAST: u32 = 11;
+    /// Change the network devices, the addresses and the routes.
+    pub const NET_ADMIN: u32 = 12;
     /// Use raw sockets.
     pub const NET_RAW: u32 = 13;
     /// Lock the shared memory segments of other users.

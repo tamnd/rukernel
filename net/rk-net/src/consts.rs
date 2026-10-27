@@ -13,6 +13,8 @@ pub const AF_UNIX: u32 = 1;
 pub const AF_INET: u32 = 2;
 /// IPv6.
 pub const AF_INET6: u32 = 10;
+/// Netlink sockets.
+pub const AF_NETLINK: u32 = 16;
 /// The first family number that Linux does not have.
 pub const AF_MAX: u32 = 46;
 
@@ -86,19 +88,86 @@ pub const SOMAXCONN: u32 = 4096;
 pub const IFF_UP: u32 = 0x1;
 /// The device has a broadcast address.
 pub const IFF_BROADCAST: u32 = 0x2;
+/// The administrator turned on the debug messages of the driver.
+pub const IFF_DEBUG: u32 = 0x4;
 /// The device is a loopback device.
 pub const IFF_LOOPBACK: u32 = 0x8;
+/// The device is a point to point link.
+pub const IFF_POINTOPOINT: u32 = 0x10;
+/// Not used. The administrator can set it.
+pub const IFF_NOTRAILERS: u32 = 0x20;
 /// The device is up and has a link.
 pub const IFF_RUNNING: u32 = 0x40;
+/// The device does not use ARP.
+pub const IFF_NOARP: u32 = 0x80;
+/// The device receives all packets.
+pub const IFF_PROMISC: u32 = 0x100;
+/// The device receives all multicast packets.
+pub const IFF_ALLMULTI: u32 = 0x200;
+/// The master of a load balancing group.
+pub const IFF_MASTER: u32 = 0x400;
+/// A slave of a load balancing group.
+pub const IFF_SLAVE: u32 = 0x800;
 /// The device can send multicast packets.
 pub const IFF_MULTICAST: u32 = 0x1000;
+/// The device can select the type of its media.
+pub const IFF_PORTSEL: u32 = 0x2000;
+/// The device selects the type of its media itself.
+pub const IFF_AUTOMEDIA: u32 = 0x4000;
+/// The addresses of the device change when it goes down.
+pub const IFF_DYNAMIC: u32 = 0x8000;
 /// The link of the device is up.
 pub const IFF_LOWER_UP: u32 = 0x1_0000;
+/// The device waits for an external event.
+pub const IFF_DORMANT: u32 = 0x2_0000;
+/// The device echoes the sent packets.
+pub const IFF_ECHO: u32 = 0x4_0000;
+
+/// The size of the name of a network device with its NUL byte.
+pub const IFNAMSIZ: usize = 16;
+
+/// The operational states of RFC 2863, from linux/if.h: the state is not known.
+pub const IF_OPER_UNKNOWN: u8 = 0;
+/// The device is not there.
+pub const IF_OPER_NOTPRESENT: u8 = 1;
+/// The device is down.
+pub const IF_OPER_DOWN: u8 = 2;
+/// A lower device is down.
+pub const IF_OPER_LOWERLAYERDOWN: u8 = 3;
+/// The device is in a test mode.
+pub const IF_OPER_TESTING: u8 = 4;
+/// The device waits for an external event.
+pub const IF_OPER_DORMANT: u8 = 5;
+/// The device is up.
+pub const IF_OPER_UP: u8 = 6;
+
+// linux/route.h includes <sys/socket.h> through linux/if.h, so rk-abigen cannot extract it.
+
+/// The flags of `struct rtentry` for `SIOCADDRT` and of /proc/net/route: the route is usable.
+pub const RTF_UP: u32 = 0x1;
+/// The route goes through a gateway.
+pub const RTF_GATEWAY: u32 = 0x2;
+/// The route goes to one host.
+pub const RTF_HOST: u32 = 0x4;
+/// The route has an MTU.
+pub const RTF_MTU: u32 = 0x20;
+/// The route has a window size.
+pub const RTF_WINDOW: u32 = 0x80;
+/// The route has an initial round trip time.
+pub const RTF_IRTT: u32 = 0x100;
+/// The route rejects the packets.
+pub const RTF_REJECT: u32 = 0x200;
+
+/// The level of the options of netlink sockets, from include/linux/socket.h.
+pub const SOL_NETLINK: u32 = 270;
 
 /// The hardware types of `struct sockaddr_ll` and of `ARPHRD_*` in linux/if_arp.h: Ethernet.
 pub const ARPHRD_ETHER: u16 = 1;
 /// The loopback device.
 pub const ARPHRD_LOOPBACK: u16 = 772;
+/// The flag of an ARP entry with a known hardware address, `ATF_COM` of linux/if_arp.h, for
+/// /proc/net/arp. The value is written by hand, as the values of `ARPHRD_*`.
+pub const ATF_COM: u32 = 0x02;
 
 /// The ARP operations: a request.
 pub const ARPOP_REQUEST: u16 = 1;

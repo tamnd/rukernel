@@ -137,40 +137,20 @@ fn find_socket(
     best.map(|(_, s)| s)
 }
 
-/// Sets the address of an interface, as `ip addr add`. The loopback device gets all of its
-/// subnet as local addresses.
-pub fn add_addr(ifindex: u32, addr: Addr, prefix: u8) -> Result<()> {
-    let dev = dev::by_index(ifindex).ok_or(Errno::ENODEV)?;
-    if prefix > 32 {
-        return Err(Errno::EINVAL);
-    }
-    let loopback = dev.kind() == LinkKind::Loopback;
-    ROUTES.lock().add_addr(route::IfAddr { ifindex, addr, prefix, loopback });
-    Ok(())
-}
-
-/// Adds a route, as `ip route add`. A gateway must be in a connected subnet.
-pub fn add_route(dst: Addr, prefix: u8, gateway: Option<Addr>, ifindex: u32) -> Result<()> {
-    if prefix > 32 || dev::by_index(ifindex).is_none() {
-        return Err(Errno::EINVAL);
-    }
-    let mut routes = ROUTES.lock();
-    if let Some(gw) = gateway {
-        let on_link = routes
-            .addrs()
-            .iter()
-            .any(|a| a.ifindex == ifindex && ipv4::same_net(a.addr, gw, a.prefix));
-        if !on_link {
-            return Err(Errno::ENETUNREACH);
-        }
-    }
-    routes.add_route(route::Route { dst, prefix, gateway, ifindex });
-    Ok(())
-}
-
-/// Finds the route to `dst`. Gives `ENETUNREACH` if no route matches.
+/// Finds the route to `dst`, as `ip_route_output_key` of Linux.
 pub(crate) fn route(dst: Addr) -> Result<route::Next> {
-    ROUTES.lock().lookup(dst).ok_or(Errno::ENETUNREACH)
+    ROUTES.lock().lookup(dst)
+}
+
+/// Removes the neighbours of an interface, as `arp_ifdown` of Linux.
+pub(crate) fn flush_neigh(ifindex: u32) {
+    NEIGH.lock().flush(ifindex);
+}
+
+/// The neighbours: the interface, the address, the hardware address if the entry is valid,
+/// the probes and the times since the confirmation, the use and the update in milliseconds.
+pub(crate) fn neighbours() -> Vec<neigh::Info> {
+    NEIGH.lock().entries(now_ms())
 }
 
 /// The Ethernet multicast address of an IPv4 multicast address, as `ip_eth_mc_map` of Linux.
@@ -288,10 +268,7 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
     if ipv4::is_multicast(p.target_ip) || ipv4::is_loopback(p.target_ip) {
         return;
     }
-    let ours = {
-        let routes = ROUTES.lock();
-        routes.addrs().iter().any(|a| !a.loopback && a.addr == p.target_ip)
-    };
+    let ours = { ROUTES.lock().is_local(p.target_ip) };
     // A probe for duplicate addresses has the sender 0.0.0.0, and it does not go in the table.
     if p.sender_ip != ipv4::ANY && !p.sender_mac.is_multicast() {
         let key = (dev.ifindex(), p.sender_ip);
