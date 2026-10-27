@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.3] - 2026-10-27
+
 ### Added
 
 - The socket tables /proc/net/tcp, /proc/net/udp, /proc/net/raw, /proc/net/icmp and /proc/net/unix, and /proc/net/netstat, in the format of Linux (#355). The lines have the state, the queues, the timer, the uid and the inode of each socket.
@@ -772,6 +774,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.3]: https://github.com/tamnd/rukernel/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tamnd/rukernel/releases/tag/v0.4.2
 [0.4.1]: https://github.com/tamnd/rukernel/releases/tag/v0.4.1
 [0.4.0]: https://github.com/tamnd/rukernel/releases/tag/v0.4.0
