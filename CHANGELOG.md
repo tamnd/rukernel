@@ -2,7 +2,9 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
-## [0.4.1] - 2026-10-27
+## Unreleased
+
+## [0.4.2] - 2026-10-27
 
 ### Added
 
@@ -15,6 +17,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - inotify and a small fsnotify layer in rk-vfs (#343). The layer keeps the marks of each inode, and the hooks in the VFS send the events of create, unlink, rmdir, rename with a cookie, open, close for write and for read, modify, attrib, access, xattr, delete self, move self and unmount. fanotify and dnotify can use the same hooks later. `inotify_init`, `inotify_init1` with `IN_NONBLOCK` and `IN_CLOEXEC`, `inotify_add_watch` with `IN_ONLYDIR`, `IN_DONT_FOLLOW`, `IN_EXCL_UNLINK`, `IN_MASK_ADD`, `IN_MASK_CREATE` and `IN_ONESHOT`, and `inotify_rm_watch` with `IN_IGNORED` work as on Linux. The queue merges an event with the same last event and takes one `IN_Q_OVERFLOW` event when it is full. The descriptor works with `read`, `FIONREAD`, poll and epoll. The sysctls `fs.inotify.max_queued_events`, `max_user_instances` and `max_user_watches` set the limits, and `/proc/PID/fdinfo` shows the watches. The queue has tests on the host.
 - `chroot` with `CAP_SYS_CHROOT`, `close_range` with `CLOSE_RANGE_CLOEXEC` and `CLOSE_RANGE_UNSHARE`, and `fchmodat2` with `AT_SYMLINK_NOFOLLOW` and `AT_EMPTY_PATH` (#343). `/proc/PID/fdinfo/FD` shows the position, the flags, the mount ID and the inode of a descriptor.
 - `execveat` with a directory descriptor, `AT_EMPTY_PATH` and `AT_SYMLINK_NOFOLLOW`, `openat2` with `struct open_how` and the flags `RESOLVE_NO_XDEV`, `RESOLVE_NO_MAGICLINKS`, `RESOLVE_NO_SYMLINKS`, `RESOLVE_BENEATH`, `RESOLVE_IN_ROOT` and `RESOLVE_CACHED`, and `cachestat` (#343).
+
+### Fixed
+
+- Permission and argument checks that LTP showed as missing (#344): `RLIMIT_MEMLOCK` (8 MiB by default) for `mlock`, `mlock2` and `mlockall` without `CAP_IPC_LOCK`, the checks of `sched_setscheduler` and `sched_setparam` for a process without `CAP_SYS_NICE`, `EINVAL` for unknown flags of `statx`, and `readlinkat` with an empty path.
+
+## [0.4.1] - 2026-10-27
+
+### Added
+
 - TCP in rk-net-inet (#337). A pure state machine has the states of RFC 9293, the retransmission timer of RFC 6298, Nagle, delayed ACK, keepalive, TIME_WAIT, the window scale option and the MSS option. Congestion control is CUBIC with slow start and fast recovery, in its own module with tests of its growth. The socket layer gives the errors of Linux (`ECONNREFUSED`, `ETIMEDOUT`, `ECONNRESET`, `EPIPE` with `SIGPIPE`, `EINPROGRESS` with `SO_ERROR`, `EAGAIN`), `SO_REUSEADDR`, `SO_LINGER` with a zero time, `TCP_NODELAY`, `TCP_CORK`, `TCP_MAXSEG`, the keepalive options and `TCP_CONGESTION`, `MSG_PEEK`, `MSG_WAITALL` and `MSG_DONTWAIT`, `shutdown`, the listen backlog, `accept` and `accept4`, and the readiness of poll and epoll. The boot test `inet` moves 1 MiB in each direction over `lo` between two processes, and 1 MiB in each direction with a TCP server that xtask starts on the host.
 - A virtio-net driver and the network device layer (#328). The driver negotiates `VIRTIO_NET_F_MAC`, `VIRTIO_NET_F_STATUS` and `VIRTIO_F_VERSION_1`, reads the MAC address, and keeps a receive queue and a transmit queue of 64 buffers each. rk-net has the packet buffer `NetBuf` with headroom for the headers, the network devices with a name, an interface index, the MAC address, the MTU, the flags and the statistics of Linux, and the loopback device `lo` with the interface index 1. A virtio-net device gets the name `eth0`, `eth1` and so on, and the kernel prints its name and its MAC address at boot. The drivers poll and do not use interrupts yet. The boot test `net` sends an ARP request to the gateway of the user network of QEMU and receives the reply. rk-abigen now extracts the constants of `<linux/if_ether.h>`.
 - The kernel boots on arm64 to the console on the QEMU `virt` machine. The image is a Linux arm64 `Image`, which QEMU `-kernel`, U-Boot `booti` and GRUB load. The boot code drops from EL2 to EL1, turns the MMU on with the kernel at `KERNEL_BASE` and a direct map, and reads the memory, the command line and the initrd from the device tree. The exception vectors print an oops for an unexpected exception. The PL011 UART is the console, and the virtual timer gives the tick through a GICv2. `cargo xtask boot-test aarch64` runs the `boot`, `trap`, `mm`, `heap` and `timer` self tests on `qemu-system-aarch64 -M virt` (#329).
@@ -22,10 +33,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The fair class of rk-sched now has a run queue for each CPU. Each queue keeps its tasks in an AVL tree keyed by the virtual deadline, with the lowest virtual run time of each subtree, so the EEVDF pick takes O(log n) time, as `pick_eevdf` of Linux. Before, one queue for all CPUs found the next task with a scan. A task that wakes goes to an idle CPU or to the CPU where it ran last, and keeps its lag on the new queue. A CPU that becomes idle pulls a task from the busiest queue, and a busy CPU evens out the queues every 4 ms. The scheduler now obeys the CPU mask of `sched_setaffinity`: a thread moves to a CPU of the mask, and a new thread gets the mask of its parent (#330).
 - `tools/ltp` measures rukernel against the LTP groups `syscalls`, `mm`, `sched` and `net` (#321). `build.sh --full` builds the groups with musl and records the tests that do not build. `run.py` boots the kernel in QEMU with batches of tests. It kills a test that runs for more than its time limit, and boots the kernel again after a panic or a hang. `report.py` and `update.sh` make `README.md`, with the number of tests that pass in each group and the causes of the failures, and a file with the result of each test for each group. The `ltp` boot test does not change.
 - arm64 runs tasks, user mode and system calls (#335). The kernel switches tasks with the callee saved registers and d8 to d15. User programs run at EL0 with their own TTBR0 tables and enter the kernel with `svc`, with the rk-abi numbers of arm64. An abort at EL0 goes to the fault handler of rk-mm. Signals use the arm64 `rt_sigframe` with the `fpsimd_context` record, and `rt_sigreturn` restores it. The boot CPU starts the other CPUs with PSCI `CPU_ON`, and each CPU has its own data, its GIC CPU interface and SGIs for the interrupts between CPUs. ptrace on arm64 has the `NT_PRSTATUS` and `NT_ARM_SYSTEM_CALL` register sets, and seccomp uses `AUDIT_ARCH_AARCH64`. The syscall table keeps the old x86-64 calls such as `open` and `fork` out of the arm64 build. `cargo xtask boot-test aarch64` runs the user tests `init` and `smp` when `RK_USER_CC_AARCH64` or `aarch64-linux-musl-gcc` gives an aarch64 musl compiler.
-
-### Fixed
-
-- Permission and argument checks that LTP showed as missing (#344): `RLIMIT_MEMLOCK` (8 MiB by default) for `mlock`, `mlock2` and `mlockall` without `CAP_IPC_LOCK`, the checks of `sched_setscheduler` and `sched_setparam` for a process without `CAP_SYS_NICE`, `EINVAL` for unknown flags of `statx`, and `readlinkat` with an empty path.
 
 ## [0.4.0] - 2026-10-27
 
@@ -742,6 +749,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.2]: https://github.com/tamnd/rukernel/releases/tag/v0.4.2
 [0.4.1]: https://github.com/tamnd/rukernel/releases/tag/v0.4.1
 [0.4.0]: https://github.com/tamnd/rukernel/releases/tag/v0.4.0
 [0.3.22]: https://github.com/tamnd/rukernel/releases/tag/v0.3.22
