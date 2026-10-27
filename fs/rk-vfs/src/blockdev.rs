@@ -55,6 +55,8 @@ pub mod ioctl {
 /// The page cache of a block device.
 pub type DiskCache = PageCache<Arc<Queue>>;
 
+pub use rk_block::cache::without_wait;
+
 /// A block device with its name in /dev.
 struct Entry {
     name: String,

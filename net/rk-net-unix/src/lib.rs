@@ -41,7 +41,7 @@ use rk_net::{
 };
 use rk_vfs::File;
 use rk_vfs::inode::Result;
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The offset of `sun_path` in `struct sockaddr_un`.
 const SUN_PATH: usize = 2;
@@ -236,7 +236,7 @@ pub struct Unix {
     state: SpinLock<State>,
     /// The tasks that wait for a change of the socket wait here: a receive for a message, a
     /// send for space, `accept` for a connection and `connect` for space in the backlog.
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     /// The bytes that this socket sent and the receivers did not take.
     inflight: AtomicUsize,
     /// The count of the wakes, for an edge triggered epoll entry.
@@ -288,7 +288,7 @@ impl Unix {
                 peek_off: -1,
                 options: Options::default(),
             }),
-            wait: WaitQueue::new(),
+            wait: Arc::new(WaitQueue::new()),
             inflight: AtomicUsize::new(0),
             events: AtomicU64::new(0),
             this: this.clone(),
@@ -325,7 +325,6 @@ impl Unix {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     fn sndbuf(&self) -> usize {
@@ -1132,6 +1131,17 @@ impl Socket for Unix {
 
     fn event_count(&self) -> u64 {
         self.events.load(Ordering::Relaxed)
+    }
+
+    fn poll_wait(&self, table: &mut PollTable) {
+        table.add(&self.wait);
+        // A datagram socket can write when the queue of its peer has space, as
+        // `unix_dgram_poll` of Linux waits on the peer too.
+        if self.kind != SOCK_STREAM
+            && let Some(peer) = self.state.lock().peer.clone()
+        {
+            table.add(&peer.wait);
+        }
     }
 
     fn poll(&self) -> u32 {

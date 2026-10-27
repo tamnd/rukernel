@@ -374,7 +374,7 @@ fn getevents(cx: &Cx<'_>, id: u64, min_nr: u64, nr: u64, events: u64, timeout: u
         let n = (nr as usize).min(q.len());
         Some(q.drain(..n).collect::<Vec<_>>())
     };
-    let list = match wait_events(cx, deadline, || Ok(grab(min_nr))) {
+    let list = match wait_events(cx, deadline, |_| Ok(grab(min_nr))) {
         Ok(Some(list)) => list,
         Ok(None) => grab(0).unwrap_or_default(),
         Err(Errno::ERESTARTNOHAND) => match grab(1) {

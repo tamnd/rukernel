@@ -1,8 +1,8 @@
 //! The system calls that wait for the events of more than one file: `poll`, `ppoll`, `select` and
 //! `pselect6`, and `pipe` and `pipe2`.
 //!
-//! A wait scans each file with its `poll` operation. If no file is ready, the task waits on the
-//! poll queue of rk-vfs until a file has a new event, a signal comes or the time is over. Then it
+//! A wait scans each file with its `poll` operation. If no file is ready, the task waits in the
+//! queue of each file until a file has a new event, a signal comes or the time is over. Then it
 //! scans again, as `do_poll` and `do_select` of fs/select.c do.
 
 use crate::cx::{Cx, SysResult};
@@ -16,7 +16,7 @@ use rk_abi::native::types::KernelOldTimeval;
 use rk_abi::native::types::KernelTimespec;
 use rk_frame::time::{HZ, ticks};
 use rk_proc::signal::SigSet;
-use rk_vfs::wait::POLL_WAIT;
+use rk_vfs::wait::{PollTable, poll_wait_until};
 
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 const TICK_NS: u64 = NSEC_PER_SEC / HZ;
@@ -37,7 +37,8 @@ fn left(deadline: u64) -> u64 {
 }
 
 /// Scans with `scan` until it gives a value, the deadline comes or a signal comes. `scan` gives
-/// `None` if no file is ready. Gives `None` at the deadline.
+/// `None` if no file is ready. When `scan` gets a table, it adds the queues of each file that it
+/// tests with `File::poll_wait`. Gives `None` at the deadline.
 ///
 /// # Errors
 ///
@@ -45,23 +46,19 @@ fn left(deadline: u64) -> u64 {
 pub(crate) fn wait_events<R>(
     cx: &Cx<'_>,
     deadline: Option<u64>,
-    mut scan: impl FnMut() -> Result<Option<R>, Errno>,
+    mut scan: impl FnMut(Option<&mut PollTable>) -> Result<Option<R>, Errno>,
 ) -> Result<Option<R>, Errno> {
-    if let Some(r) = scan()? {
-        return Ok(Some(r));
-    }
     if deadline.is_some_and(|d| d <= ticks()) {
-        return Ok(None);
+        return scan(None);
     }
     let thread = cx.thread;
-    POLL_WAIT
-        .wait_until_timeout(deadline.unwrap_or(u64::MAX), || match scan() {
-            Ok(Some(r)) => Some(Ok(Some(r))),
-            Err(e) => Some(Err(e)),
-            Ok(None) if thread.signal_pending() => Some(Err(Errno::ERESTARTNOHAND)),
-            Ok(None) => None,
-        })
-        .unwrap_or(Ok(None))
+    poll_wait_until(deadline.unwrap_or(u64::MAX), |table| match scan(table) {
+        Ok(Some(r)) => Some(Ok(Some(r))),
+        Err(e) => Some(Err(e)),
+        Ok(None) if thread.signal_pending() => Some(Err(Errno::ERESTARTNOHAND)),
+        Ok(None) => None,
+    })
+    .unwrap_or(Ok(None))
 }
 
 /// Sets the signal mask of `ppoll` or `pselect6`, and gives the old mask.
@@ -123,10 +120,15 @@ struct PollFd {
 }
 
 /// The events of `file` that `poll` reports for `events`. `POLLERR` and `POLLHUP` are always
-/// reported.
-fn poll_file(cx: &Cx<'_>, fd: i32, events: u32) -> u32 {
+/// reported. Adds the queues of the file to `table`.
+fn poll_file(cx: &Cx<'_>, fd: i32, events: u32, table: Option<&mut PollTable>) -> u32 {
     match cx.files().and_then(|f| f.lock().file(fd)) {
-        Ok(file) => file.poll() & (events | POLLERR | POLLHUP),
+        Ok(file) => {
+            if let Some(table) = table {
+                file.poll_wait(table);
+            }
+            file.poll() & (events | POLLERR | POLLHUP)
+        }
         Err(_) => POLLNVAL,
     }
 }
@@ -149,10 +151,10 @@ fn do_poll(cx: &Cx<'_>, fds: u64, nfds: u64, deadline: Option<u64>) -> SysResult
             events: u32::from(u16::from_ne_bytes([c[4], c[5]])),
         })
         .collect();
-    let scan = || {
+    let scan = |mut table: Option<&mut PollTable>| {
         let revents: Vec<u32> = entries
             .iter()
-            .map(|e| if e.fd < 0 { 0 } else { poll_file(cx, e.fd, e.events) })
+            .map(|e| if e.fd < 0 { 0 } else { poll_file(cx, e.fd, e.events, table.as_deref_mut()) })
             .collect();
         let ready = revents.iter().filter(|&&r| r != 0).count();
         Ok((ready > 0).then_some(revents))
@@ -223,7 +225,7 @@ fn do_select(cx: &Cx<'_>, nfds: u64, ptrs: [u64; 3], deadline: Option<u64>) -> S
         ],
     };
     let want = [SELECT_IN, SELECT_OUT, SELECT_EX];
-    let scan = || {
+    let scan = |mut table: Option<&mut PollTable>| {
         let mut out = [vec![0u64; sets.words], vec![0u64; sets.words], vec![0u64; sets.words]];
         let mut count = 0u64;
         for fd in 0..n {
@@ -235,6 +237,9 @@ fn do_select(cx: &Cx<'_>, nfds: u64, ptrs: [u64; 3], deadline: Option<u64>) -> S
                 continue;
             }
             let file = cx.files()?.lock().file(fd as i32)?;
+            if let Some(table) = table.as_deref_mut() {
+                file.poll_wait(table);
+            }
             let ev = file.poll();
             for k in asked {
                 if ev & want[k] != 0 {

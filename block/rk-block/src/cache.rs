@@ -12,6 +12,9 @@
 //!
 //! When the cache holds more than `CACHE_LIMIT` bytes, it drops the clean folios that were used
 //! least recently.
+//!
+//! A read in `without_wait` does not read from the store. If a page that it needs is not up to
+//! date, it gives `EAGAIN`, as a read with `IOCB_NOWAIT` in `filemap_read` of Linux.
 
 use crate::{Bio, Op, Result, SECTOR_SIZE};
 use alloc::collections::BTreeMap;
@@ -125,6 +128,40 @@ struct Inner {
     clock: u64,
 }
 
+/// The tasks that read in `without_wait` now, by the number of the task.
+static NOWAIT: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+/// The number of the current task. On the host there are no tasks.
+fn task_id() -> u64 {
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        rk_frame::task::Task::current().id()
+    }
+    #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    {
+        0
+    }
+}
+
+/// Runs `f`, and each read of a cache in it that must read from the store gives `EAGAIN`. This
+/// is the read of `preadv2` with `RWF_NOWAIT`.
+pub fn without_wait<R>(f: impl FnOnce() -> R) -> R {
+    let id = task_id();
+    NOWAIT.lock().push(id);
+    let value = f();
+    let mut tasks = NOWAIT.lock();
+    if let Some(n) = tasks.iter().position(|&t| t == id) {
+        tasks.swap_remove(n);
+    }
+    value
+}
+
+/// Tells if the current task reads in `without_wait`.
+fn no_wait() -> bool {
+    let tasks = NOWAIT.lock();
+    !tasks.is_empty() && tasks.contains(&task_id())
+}
+
 /// The page cache of one store.
 pub struct PageCache<S> {
     store: S,
@@ -183,6 +220,9 @@ impl<S: Store> PageCache<S> {
         if missing == 0 {
             return Ok(());
         }
+        if no_wait() {
+            return Err(Errno::EAGAIN);
+        }
         let base = index * (FOLIO_SIZE / SECTOR_SIZE) as u64;
         let runs = folio.runs(missing);
         let mut bios: Vec<Bio> = runs
@@ -236,10 +276,13 @@ impl<S: Store> PageCache<S> {
         }
         let len = buf.len().min((size - offset) as usize);
         let mut inner = self.inner.lock();
+        let no_wait = no_wait();
         Self::each(offset, len, |index, start, end, done| {
-            // A read fills all the folio, as a small readahead.
+            // A read fills all the folio, as a small readahead. A read that does not wait needs
+            // only its own pages.
             let folio = self.folio(&mut inner, index);
-            let mask = folio.mask(0, folio.data.len());
+            let mask =
+                if no_wait { folio.mask(start, end) } else { folio.mask(0, folio.data.len()) };
             self.fill(&mut inner, index, mask)?;
             let folio = self.folio(&mut inner, index);
             buf[done..done + end - start].copy_from_slice(&folio.data[start..end]);

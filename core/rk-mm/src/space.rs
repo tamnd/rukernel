@@ -344,7 +344,7 @@ impl AddressSpace {
             None => Backing::Anon,
         };
         let locked = req.locked || st.lock_future;
-        st.vmas.insert(Vma {
+        st.vmas.insert_merged(Vma {
             start,
             end: start + len,
             prot: req.prot,
@@ -727,7 +727,7 @@ impl AddressSpace {
             }
             let mut vma = Vma::anon(old_end, new_end, Prot::RW, VmaKind::Heap);
             vma.locked = st.lock_future;
-            st.vmas.insert(vma);
+            st.vmas.insert_merged(vma);
         } else if new_end < old_end {
             self.unmap_locked(&mut st, new_end, old_end);
         }

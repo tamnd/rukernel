@@ -645,6 +645,46 @@ impl WaitQueue {
     }
 }
 
+/// Blocks the current task in each queue of `queues` until a wake of one of them or until the
+/// tick count is at `deadline`. This is the wait of `poll` on the queues of more than one file, as
+/// `poll_schedule_timeout` of Linux. The task tests `cond` after it is in the queues, so a wake
+/// that comes after the last test of the caller is not lost. If `cond` gives a value, the task does
+/// not block and the function gives the value. Else it gives `None` after the wake, and the caller
+/// tests its condition again. A deadline of `u64::MAX` is no deadline.
+pub fn wait_any<R>(
+    queues: &[&WaitQueue],
+    deadline: u64,
+    cond: impl FnOnce() -> Option<R>,
+) -> Option<R> {
+    let current = Task::current();
+    let key = (deadline, current.id);
+    if deadline != u64::MAX {
+        TIMERS.lock().insert(key, Arc::downgrade(&current));
+    }
+    current.state.store(BLOCKED, Ordering::Release);
+    for queue in queues {
+        queue.waiters.lock().push_back(current.clone());
+    }
+    let value = cond();
+    if value.is_some() || crate::time::ticks() >= deadline {
+        if current.state.swap(RUNNING, Ordering::AcqRel) == RUNNABLE {
+            // A wake made the task runnable, as in `wait_until`.
+            current.state.store(RUNNABLE, Ordering::Release);
+            schedule();
+        }
+    } else {
+        block();
+    }
+    // A wake takes the task from one queue only, so the task leaves the other queues here.
+    for queue in queues {
+        queue.waiters.lock().retain(|t| !Arc::ptr_eq(t, &current));
+    }
+    if deadline != u64::MAX {
+        TIMERS.lock().remove(&key);
+    }
+    value
+}
+
 impl Default for WaitQueue {
     fn default() -> Self {
         Self::new()

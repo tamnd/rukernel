@@ -14,7 +14,7 @@ use rk_abi::native::open::O_RDWR;
 use rk_frame::sync::SpinLock;
 use rk_vfs::file::{File, FileOps, events};
 use rk_vfs::inode::Result;
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The largest value of the counter.
 const MAX: u64 = u64::MAX - 1;
@@ -23,7 +23,7 @@ const MAX: u64 = u64::MAX - 1;
 struct EventFd {
     count: SpinLock<u64>,
     semaphore: bool,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     /// The count of the changes of the counter, for an edge triggered epoll entry.
     events: AtomicU64,
 }
@@ -32,7 +32,6 @@ impl EventFd {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 }
 
@@ -81,6 +80,10 @@ impl FileOps for EventFd {
         Ok(8)
     }
 
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.wait);
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         let count = *self.count.lock();
         let mut ev = 0;
@@ -113,7 +116,7 @@ pub(crate) fn eventfd2(cx: &Cx<'_>, count: u64, flags: u64) -> SysResult {
     let ops = EventFd {
         count: SpinLock::new(u64::from(count as u32)),
         semaphore: flags & EFD_SEMAPHORE != 0,
-        wait: WaitQueue::new(),
+        wait: Arc::new(WaitQueue::new()),
         events: AtomicU64::new(0),
     };
     let file = File::with_ops(Arc::new(ops), None, O_RDWR | (flags & EFD_NONBLOCK));

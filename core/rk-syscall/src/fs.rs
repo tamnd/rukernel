@@ -325,7 +325,9 @@ pub(crate) fn pwritev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, offset: u64) -
 }
 
 /// `preadv` and `preadv2`. An offset of -1 for `preadv2` reads at the position of the file, as
-/// `readv`. The flags only change the speed, so the read does not use them.
+/// `readv`. With `RWF_NOWAIT`, a read of data that is not in the page cache gives `EAGAIN`, or the
+/// bytes before such data, as `filemap_read` of Linux. The other flags only change the speed, so
+/// the read does not use them.
 pub(crate) fn preadv2(
     cx: &Cx<'_>,
     fd: u64,
@@ -347,13 +349,21 @@ pub(crate) fn preadv2(
         return Err(Errno::ESPIPE);
     }
     check_rw_flags(flags, false)?;
+    let nowait = flags & rwf::NOWAIT != 0;
+    let read_at = |at: u64, b: &mut [u8]| {
+        if nowait {
+            rk_vfs::blockdev::without_wait(|| file.read_at(at, b))
+        } else {
+            file.read_at(at, b)
+        }
+    };
     let mut done = 0;
     for v in read_iovecs(cx, iov, count)? {
         if v.iov_len == 0 {
             continue;
         }
         let at = offset + done;
-        let n = match read_with(cx, &file, v.iov_base, v.iov_len, |d, b| file.read_at(at + d, b)) {
+        let n = match read_with(cx, &file, v.iov_base, v.iov_len, |d, b| read_at(at + d, b)) {
             Ok(n) => n,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,

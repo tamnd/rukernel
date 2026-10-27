@@ -45,7 +45,7 @@ use rk_vfs::ipc::{
     MQ_HARD_MSG_MAX, MQ_HARD_MSGSIZE_MAX, MQ_MSG_DEFAULT, MQ_MSG_MAX, MQ_MSGSIZE_DEFAULT,
     MQ_MSGSIZE_MAX, MQ_QUEUES_MAX, PrioQueue,
 };
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 use rk_vfs::{Dentry, Location, Mount, MountNamespace, MountSource};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -134,7 +134,7 @@ struct MqState {
 struct MqInode {
     ino: u64,
     state: SpinLock<MqState>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     /// The count of the changes, for an edge triggered epoll entry.
     events: AtomicU64,
 }
@@ -156,7 +156,7 @@ impl MqInode {
                 mtime: now,
                 ctime: now,
             }),
-            wait: WaitQueue::new(),
+            wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
         })
     }
@@ -164,7 +164,6 @@ impl MqInode {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     /// The line of status that a read gives, as `mqueue_read_file` of Linux.
@@ -423,6 +422,10 @@ impl FileOps for MqFile {
         let n = self.queue.read_at(pos, buf)?;
         file.set_pos(pos + n as u64);
         Ok(n)
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.queue.wait);
     }
 
     fn poll(&self, _file: &File) -> u32 {

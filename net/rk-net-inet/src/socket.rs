@@ -54,7 +54,7 @@ use rk_net::consts::{
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The control messages of a received IPv6 datagram that the flags of `s` ask for, in the order
 /// of `ip6_datagram_recv_ctl` of Linux.
@@ -286,7 +286,7 @@ pub struct Dgram {
     /// The datagrams that the socket dropped, `sk_drops` of Linux.
     drops: AtomicU32,
     state: SpinLock<State>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     events: AtomicU64,
 }
 
@@ -349,7 +349,7 @@ impl Dgram {
                 shut_wr: false,
                 closed: false,
             }),
-            wait: WaitQueue::default(),
+            wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
         });
         stack::add_socket(sock.ino, &sock);
@@ -411,7 +411,6 @@ impl Dgram {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     /// The score of the socket for a packet from `src` and `sport`, or `None` if the socket
@@ -1204,6 +1203,10 @@ impl Socket for Dgram {
         drop(s);
         self.wake();
         Ok(())
+    }
+
+    fn poll_wait(&self, table: &mut PollTable) {
+        table.add(&self.wait);
     }
 
     fn poll(&self) -> u32 {

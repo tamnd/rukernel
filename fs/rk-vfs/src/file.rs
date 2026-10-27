@@ -9,6 +9,7 @@ use crate::dentry::Location;
 use crate::inode::{
     FileType, InodeRef, Metadata, Result, SetAttr, check_immutable, check_set_attr, mode,
 };
+use crate::wait::PollTable;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -118,6 +119,11 @@ pub trait FileOps: Send + Sync {
     fn pollable(&self) -> bool {
         false
     }
+
+    /// Adds to `table` the queues that a new event of the file wakes, as `poll_wait` of Linux. A
+    /// file that adds no queue makes the wait use `POLL_WAIT`, and it must call `poll_wake` at a
+    /// new event.
+    fn poll_wait(&self, _file: &File, _table: &mut PollTable) {}
 
     /// A count that goes up at each new event of the file, for an edge triggered epoll entry.
     /// An entry sees an edge when the count changes, also if the events stay the same. A file
@@ -1187,6 +1193,16 @@ impl File {
     /// Tells if the file has its own `poll`, for `epoll_ctl`.
     pub fn pollable(&self) -> bool {
         self.ops.pollable()
+    }
+
+    /// Adds to `table` the queues that a new event of the file wakes. If the file adds no queue,
+    /// the table gets `POLL_WAIT`.
+    pub fn poll_wait(&self, table: &mut PollTable) {
+        let adds = table.adds;
+        self.ops.poll_wait(self, table);
+        if table.adds == adds {
+            table.add_static(&crate::wait::POLL_WAIT);
+        }
     }
 
     /// The count of the events of the file, for an edge triggered epoll entry.
