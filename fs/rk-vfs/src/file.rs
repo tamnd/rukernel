@@ -136,6 +136,11 @@ pub trait FileOps: Send + Sync {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }
+
+    /// The lines of `/proc/PID/fdinfo` after the common lines, as `show_fdinfo` of Linux.
+    fn fdinfo(&self, _file: &File) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// The access mode and the status flags of an open file.
@@ -195,6 +200,11 @@ impl Drop for File {
     fn drop(&mut self) {
         if self.locked.load(Ordering::Relaxed) {
             crate::lock::close_file(self);
+        }
+        // The last close, as `fsnotify_close` in `__fput` of Linux.
+        let flags = self.flags();
+        if !flags.is_path() {
+            crate::notify::close(self.location.as_ref(), self.inode.as_ref(), flags.writable());
         }
         if self.writer
             && let Some(location) = &self.location
@@ -939,7 +949,23 @@ impl File {
         if !self.flags().readable() {
             return Err(Errno::EBADF);
         }
-        self.ops.read(self, buf)
+        let n = self.ops.read(self, buf)?;
+        self.notify_access(n);
+        Ok(n)
+    }
+
+    /// The event of a read of `n` bytes, as `fsnotify_access` in `vfs_read` of Linux.
+    fn notify_access(&self, n: usize) {
+        if n > 0 {
+            crate::notify::access(self.location.as_ref(), self.inode.as_ref());
+        }
+    }
+
+    /// The event of a write of `n` bytes, as `fsnotify_modify` in `vfs_write` of Linux.
+    fn notify_modify(&self, n: usize) {
+        if n > 0 {
+            crate::notify::modify(self.location.as_ref(), self.inode.as_ref());
+        }
     }
 
     /// Clears the set-user-ID and set-group-ID bits of a regular file before a write, as
@@ -964,7 +990,9 @@ impl File {
             return Err(Errno::EBADF);
         }
         self.remove_privs()?;
-        self.ops.write(self, buf)
+        let n = self.ops.write(self, buf)?;
+        self.notify_modify(n);
+        Ok(n)
     }
 
     /// `pread64`.
@@ -972,7 +1000,9 @@ impl File {
         if !self.flags().readable() {
             return Err(Errno::EBADF);
         }
-        self.ops.read_at(self, offset, buf)
+        let n = self.ops.read_at(self, offset, buf)?;
+        self.notify_access(n);
+        Ok(n)
     }
 
     /// `pwrite64`.
@@ -981,7 +1011,9 @@ impl File {
             return Err(Errno::EBADF);
         }
         self.remove_privs()?;
-        self.ops.write_at(self, offset, buf)
+        let n = self.ops.write_at(self, offset, buf)?;
+        self.notify_modify(n);
+        Ok(n)
     }
 
     /// `lseek`. Gives the new position.
@@ -1110,6 +1142,11 @@ impl File {
         self.ops.event_count()
     }
 
+    /// The lines of `/proc/PID/fdinfo` that the type of the file adds.
+    pub fn fdinfo(&self) -> Vec<u8> {
+        self.ops.fdinfo(self)
+    }
+
     /// The attributes, for `fstat`.
     pub fn metadata(&self) -> Result<Metadata> {
         match (&self.inode, self.ops.metadata()) {
@@ -1131,6 +1168,7 @@ impl File {
         crate::mapped::extend(inode, size);
         inode.set_attr(&attr)?;
         crate::mapped::changed(inode, size, u64::MAX);
+        crate::notify::change(self.location.as_ref(), inode, &attr);
         Ok(())
     }
 
@@ -1222,6 +1260,8 @@ impl File {
         }
         drop(pos);
         self.accessed();
+        // As `iterate_dir` of Linux.
+        crate::notify::access(self.location.as_ref(), self.inode.as_ref());
         Ok(used)
     }
 

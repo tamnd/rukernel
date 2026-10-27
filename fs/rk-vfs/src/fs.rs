@@ -17,7 +17,7 @@ use crate::file::File;
 use crate::inode::{
     FileType, InodeRef, Result, SetAttr, check_fixed, check_immutable, iflags, mode,
 };
-use crate::path::{Parent, Walk};
+use crate::path::{Parent, Walk, resolve};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -36,6 +36,8 @@ pub struct FsContext {
     cwd: Location,
     umask: u32,
     cred: Arc<Cred>,
+    /// The `RESOLVE_*` flags of the walks, for `openat2`.
+    resolve: u32,
 }
 
 impl core::fmt::Debug for FsContext {
@@ -54,7 +56,7 @@ impl FsContext {
     /// directory. The umask is 022, as Linux gives to init.
     pub fn new(ns: Arc<MountNamespace>) -> Self {
         let root = ns.root();
-        Self { ns, cwd: root.clone(), root, umask: 0o022, cred: Arc::new(Cred::root()) }
+        Self { ns, cwd: root.clone(), root, umask: 0o022, cred: Arc::new(Cred::root()), resolve: 0 }
     }
 
     /// The credentials that the checks use.
@@ -139,7 +141,17 @@ impl FsContext {
     }
 
     fn walk(&self) -> Walk<'_> {
-        Walk::new(&self.ns, &self.root, &self.cred)
+        Walk::new(&self.ns, &self.root, &self.cred).with_flags(self.resolve)
+    }
+
+    /// Limits the walks of the context with the `RESOLVE_*` flags `flags` of `openat2`, as
+    /// `path_init` of Linux. With `RESOLVE_BENEATH` or `RESOLVE_IN_ROOT`, `start` is the root of
+    /// the walks. The context is a copy for one call.
+    pub fn set_resolve(&mut self, start: &Location, flags: u32) {
+        if flags & (resolve::BENEATH | resolve::IN_ROOT) != 0 {
+            self.root = start.clone();
+        }
+        self.resolve = flags;
     }
 
     /// Gives the location of `path`, from `start` for a relative path.
@@ -171,9 +183,19 @@ impl FsContext {
         self.ns = ns;
     }
 
-    /// `chroot`.
+    /// `chroot`, without the check of `CAP_SYS_CHROOT`.
     pub fn chroot(&mut self, start: &Location, path: &[u8]) -> Result<()> {
         let at = self.resolve(start, path, true)?;
+        self.set_root(at)
+    }
+
+    /// The end of `chroot`: `at` is the new root, as `set_fs_root` of Linux. A walk does not go
+    /// above it with `..`. The caller checked `CAP_SYS_CHROOT`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOTDIR` or `EACCES`.
+    pub fn set_root(&mut self, at: Location) -> Result<()> {
         self.check_dir(&at)?;
         self.root = at;
         Ok(())
@@ -231,6 +253,7 @@ impl FsContext {
                     }
                     created = true;
                     let dentry = parent.dir.dentry.add_child(&parent.name, inode);
+                    crate::notify::create(parent.dir.inode(), &dentry);
                     Location { mount: parent.dir.mount.clone(), dentry }
                 }
                 Err(e) => return Err(e),
@@ -323,6 +346,18 @@ impl FsContext {
     /// Opens the inode at `at`. An open that made the file does not check the permission bits,
     /// so that `open` with `O_CREAT` and the mode 0 gives a descriptor that can write.
     fn open_inode(&self, at: Location, flags: u32, created: bool) -> Result<Arc<File>> {
+        let file = self.open_file(at, flags, created)?;
+        // As `fsnotify_open` of Linux. A file of `O_PATH` has no events.
+        if !file.flags().is_path()
+            && let Some(at) = file.location()
+        {
+            crate::notify::open(at);
+        }
+        Ok(file)
+    }
+
+    /// The part of `open_inode` that makes the open file.
+    fn open_file(&self, at: Location, flags: u32, created: bool) -> Result<Arc<File>> {
         let meta = at.inode().metadata();
         let kind = meta.file_type().ok_or(Errno::EIO)?;
         if flags & o::O_PATH != 0 {
@@ -377,8 +412,13 @@ impl FsContext {
                 if kind == FileType::Regular && write && flags & o::O_TRUNC != 0 {
                     // The truncate clears the set-ID bits, as `handle_truncate` of Linux.
                     let mode = if created { None } else { self.cred.write_kill(&meta) };
-                    at.inode().set_attr(&SetAttr { size: Some(0), mode, ..SetAttr::default() })?;
+                    let attr = SetAttr { size: Some(0), mode, ..SetAttr::default() };
+                    at.inode().set_attr(&attr)?;
                     crate::mapped::changed(at.inode(), 0, u64::MAX);
+                    // As `do_open` of Linux, a new file has no truncate and no event of it.
+                    if !created {
+                        crate::notify::change(Some(&at), at.inode(), &attr);
+                    }
                 }
                 Ok(File::open_inode(at, flags))
             }
@@ -446,6 +486,7 @@ impl FsContext {
             acls.apply(&*inode)?;
         }
         let dentry = parent.dir.dentry.add_child(&parent.name, inode);
+        crate::notify::create(parent.dir.inode(), &dentry);
         Ok(Location { mount: parent.dir.mount, dentry })
     }
 
@@ -509,6 +550,7 @@ impl FsContext {
         parent.dir.inode().link(&parent.name, old.inode())?;
         old.dentry.clear_linkable();
         parent.dir.dentry.add_child(&parent.name, old.inode().clone());
+        crate::notify::link(parent.dir.inode(), &parent.name, old.inode());
         Ok(())
     }
 
@@ -554,6 +596,8 @@ impl FsContext {
             parent.dir.inode().unlink(&parent.name)?;
         }
         parent.dir.dentry.forget_child(&parent.name);
+        at.dentry.set_unlinked();
+        crate::notify::remove(parent.dir.inode(), &parent.name, at.inode(), dir);
         Ok(())
     }
 
@@ -647,6 +691,18 @@ impl FsContext {
             old.dir.inode().rename(&old.name, new.dir.inode(), &new.name)?;
         }
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);
+        if let Some(to) = &to {
+            to.dentry.set_unlinked();
+        }
+        let target = to.as_ref().map(Location::inode);
+        crate::notify::rename(
+            old.dir.inode(),
+            &old.name,
+            new.dir.inode(),
+            &new.name,
+            from.inode(),
+            target,
+        );
         Ok(())
     }
 
@@ -691,6 +747,10 @@ impl FsContext {
         }
         old.dir.inode().exchange(&old.name, new.dir.inode(), &new.name)?;
         old.dir.dentry.exchange_child(&old.name, &new.dir.dentry, &new.name);
+        // As `vfs_rename` of Linux, each file of an exchange moves.
+        let (old_dir, new_dir) = (old.dir.inode(), new.dir.inode());
+        crate::notify::rename(old_dir, &old.name, new_dir, &new.name, from.inode(), None);
+        crate::notify::rename(new_dir, &new.name, old_dir, &old.name, to.inode(), None);
         Ok(())
     }
 

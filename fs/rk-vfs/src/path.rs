@@ -7,8 +7,27 @@
 use crate::cred::{Cred, may, protected};
 use crate::dentry::{Location, MountNamespace};
 use crate::inode::{FileType, Result};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+
+/// The `RESOLVE_*` flags of `openat2`, as include/uapi/linux/openat2.h of Linux.
+pub mod resolve {
+    /// The walk does not cross a mount.
+    pub const NO_XDEV: u32 = 0x01;
+    /// The walk does not follow a magic link of `/proc`.
+    pub const NO_MAGICLINKS: u32 = 0x02;
+    /// The walk does not follow a symbolic link.
+    pub const NO_SYMLINKS: u32 = 0x04;
+    /// The walk stays under the start directory. An escape gives `EXDEV`.
+    pub const BENEATH: u32 = 0x08;
+    /// The start directory is the root of the walk, as a `chroot`.
+    pub const IN_ROOT: u32 = 0x10;
+    /// The walk uses only the dentry cache.
+    pub const CACHED: u32 = 0x20;
+    /// All the flags.
+    pub const ALL: u32 = NO_XDEV | NO_MAGICLINKS | NO_SYMLINKS | BENEATH | IN_ROOT | CACHED;
+}
 
 /// The number of symbolic links that one walk follows before it gives `ELOOP`, as Linux.
 pub const MAX_LINKS: u32 = 40;
@@ -25,6 +44,8 @@ pub struct Walk<'a> {
     root: &'a Location,
     cred: &'a Cred,
     links: u32,
+    /// The `RESOLVE_*` flags. With `BENEATH` or `IN_ROOT`, `root` is the start directory.
+    flags: u32,
 }
 
 /// The last component of a path and the directory that holds it.
@@ -63,7 +84,44 @@ impl<'a> Walk<'a> {
     /// credentials `cred`. The walk needs the search permission on each directory that it goes
     /// through.
     pub fn new(ns: &'a MountNamespace, root: &'a Location, cred: &'a Cred) -> Self {
-        Self { ns, root, cred, links: 0 }
+        Self { ns, root, cred, links: 0, flags: 0 }
+    }
+
+    /// Sets the `RESOLVE_*` flags of `openat2`, as `LOOKUP_NO_XDEV` and the other scope flags
+    /// of Linux.
+    pub fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Checks a jump to the root for an absolute path or an absolute link target from `at`, as
+    /// the jump to the root in fs/namei.c of Linux.
+    fn jump_root(&self, at: &Location) -> Result<Location> {
+        if self.flags & resolve::BENEATH != 0 {
+            return Err(Errno::EXDEV);
+        }
+        if self.flags & resolve::NO_XDEV != 0 && !Arc::ptr_eq(&at.mount, &self.root.mount) {
+            return Err(Errno::EXDEV);
+        }
+        Ok(self.root.clone())
+    }
+
+    /// Checks that the walk can follow a symbolic link, as `pick_link` of Linux.
+    fn may_follow(&self) -> Result<()> {
+        if self.flags & resolve::NO_SYMLINKS != 0 { Err(Errno::ELOOP) } else { Ok(()) }
+    }
+
+    /// Goes to the parent of `at` for `..`, as `follow_dotdot` of Linux. `BENEATH` gives
+    /// `EXDEV` at the start directory, and `NO_XDEV` gives `EXDEV` out of a mount.
+    fn dotdot(&self, at: &Location) -> Result<Location> {
+        if self.flags & resolve::BENEATH != 0 && at.same(self.root) {
+            return Err(Errno::EXDEV);
+        }
+        let up = self.up(at);
+        if self.flags & resolve::NO_XDEV != 0 && !Arc::ptr_eq(&up.mount, &at.mount) {
+            return Err(Errno::EXDEV);
+        }
+        Ok(up)
     }
 
     /// Checks that the walk can look up a name in the directory `at`, as `may_lookup` of Linux.
@@ -89,11 +147,12 @@ impl<'a> Walk<'a> {
             must_be_dir |= trailing_slash;
             let at = match &name[..] {
                 b"." => dir,
-                b".." => self.up(&dir),
+                b".." => self.dotdot(&dir)?,
                 name => {
                     let next = self.child(&dir, name)?;
                     if is_symlink(&next) && (follow || trailing_slash) {
-                        if let Some(jump) = self.jump(&next)? {
+                        self.may_follow()?;
+                        if let Some(jump) = self.jump(&dir, &next)? {
                             if must_be_dir && !is_dir(&jump) {
                                 return Err(Errno::ENOTDIR);
                             }
@@ -123,7 +182,7 @@ impl<'a> Walk<'a> {
         if path.len() >= PATH_MAX {
             return Err(Errno::ENAMETOOLONG);
         }
-        let mut at = if path[0] == b'/' { self.root.clone() } else { start.clone() };
+        let mut at = if path[0] == b'/' { self.jump_root(start)? } else { start.clone() };
         let trailing_slash = path.ends_with(b"/");
         // The components that are left, with the next one at the end. A symbolic link adds the
         // components of its target.
@@ -148,7 +207,7 @@ impl<'a> Walk<'a> {
         self.may_lookup(at)?;
         match part {
             b"." => Ok(at.clone()),
-            b".." => Ok(self.up(at)),
+            b".." => self.dotdot(at),
             name => {
                 if name.len() > NAME_MAX {
                     return Err(Errno::ENAMETOOLONG);
@@ -157,7 +216,8 @@ impl<'a> Walk<'a> {
                 if !is_symlink(&next) {
                     return Ok(next);
                 }
-                if let Some(jump) = self.jump(&next)? {
+                self.may_follow()?;
+                if let Some(jump) = self.jump(at, &next)? {
                     return Ok(jump);
                 }
                 let target = self.link_target(at, &next)?;
@@ -168,7 +228,7 @@ impl<'a> Walk<'a> {
                     return Err(Errno::ENAMETOOLONG);
                 }
                 rest.extend(components(&target));
-                Ok(if target[0] == b'/' { self.root.clone() } else { at.clone() })
+                if target[0] == b'/' { self.jump_root(at) } else { Ok(at.clone()) }
             }
         }
     }
@@ -186,15 +246,26 @@ impl<'a> Walk<'a> {
         link.inode().follow_link()
     }
 
-    /// Gives the place of the magic link `link`, or `None` for a usual symbolic link. A magic
-    /// link counts as a link for `ELOOP`.
-    fn jump(&mut self, link: &Location) -> Result<Option<Location>> {
+    /// Gives the place of the magic link `link` in `dir`, or `None` for a usual symbolic link.
+    /// A magic link counts as a link for `ELOOP`. The checks of the `RESOLVE_*` flags are the
+    /// checks of `pick_link` and of the jump of a magic link in fs/namei.c of Linux.
+    fn jump(&mut self, dir: &Location, link: &Location) -> Result<Option<Location>> {
         let Some(jump) = link.inode().magic_link() else { return Ok(None) };
+        if self.flags & resolve::NO_MAGICLINKS != 0 {
+            return Err(Errno::ELOOP);
+        }
         self.links += 1;
         if self.links > MAX_LINKS {
             return Err(Errno::ELOOP);
         }
-        jump.map(Some)
+        let jump = jump?;
+        if self.flags & resolve::NO_XDEV != 0 && !Arc::ptr_eq(&jump.mount, &dir.mount) {
+            return Err(Errno::EXDEV);
+        }
+        if self.flags & (resolve::BENEATH | resolve::IN_ROOT) != 0 {
+            return Err(Errno::EXDEV);
+        }
+        Ok(Some(jump))
     }
 
     /// The child `name` of the directory `at`, in the mount that is on top of it.
@@ -202,6 +273,9 @@ impl<'a> Walk<'a> {
         let dentry = at.dentry.lookup(name)?;
         let mut next = Location { mount: at.mount.clone(), dentry };
         while let Some(mount) = self.ns.mounted_on(&next) {
+            if self.flags & resolve::NO_XDEV != 0 {
+                return Err(Errno::EXDEV);
+            }
             next = Location { dentry: mount.root().clone(), mount };
         }
         Ok(next)

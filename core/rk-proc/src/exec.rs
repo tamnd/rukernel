@@ -51,6 +51,20 @@ pub struct ExecArgs {
     pub argv: Vec<Vec<u8>>,
     /// The environment.
     pub envp: Vec<Vec<u8>>,
+    /// Where a relative path starts, for `execveat`. `None` is the working directory. An empty
+    /// path is this file itself, as `AT_EMPTY_PATH` of Linux.
+    pub start: Option<Location>,
+    /// The lookup follows a symbolic link at the end of the path. `execveat` with
+    /// `AT_SYMLINK_NOFOLLOW` clears it, and then a link gives `ELOOP`, as Linux.
+    pub follow: bool,
+}
+
+impl ExecArgs {
+    /// The arguments of `execve`: the path starts at the working directory and the lookup
+    /// follows symbolic links.
+    pub fn new(path: Vec<u8>, argv: Vec<Vec<u8>>, envp: Vec<Vec<u8>>) -> Self {
+        Self { path, argv, envp, start: None, follow: true }
+    }
 }
 
 /// The ELF machine of this architecture.
@@ -77,7 +91,25 @@ fn read_full(inode: &InodeRef, offset: u64, buf: &mut [u8]) -> Result<usize, Err
 /// Finds an executable file. Gives `EACCES` for a file that is not a regular file or that the
 /// process cannot run.
 fn open_exec(fs: &FsContext, path: &[u8]) -> Result<Location, Errno> {
-    let at = fs.resolve(fs.cwd(), path, true)?;
+    open_exec_at(fs, None, path, true)
+}
+
+/// Finds an executable file from `start`, as `do_open_execat` of Linux. An empty path is
+/// `start` itself.
+fn open_exec_at(
+    fs: &FsContext,
+    start: Option<&Location>,
+    path: &[u8],
+    follow: bool,
+) -> Result<Location, Errno> {
+    let at = match start {
+        Some(start) if path.is_empty() => start.clone(),
+        Some(start) => fs.resolve(start, path, follow)?,
+        None => fs.resolve(fs.cwd(), path, follow)?,
+    };
+    if !follow && at.inode().metadata().file_type() == Some(FileType::Symlink) {
+        return Err(Errno::ELOOP);
+    }
     if at.inode().metadata().file_type() != Some(FileType::Regular) {
         return Err(Errno::EACCES);
     }
@@ -189,8 +221,14 @@ fn build(
 ) -> Result<(AddressSpace, ExecImage, Location, Vec<Vec<u8>>, Vec<u8>, Cred), Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
+    // The first lookup uses the start and the flags of `execveat`. An interpreter of a script
+    // is a path from the working directory, as Linux.
+    let mut first = Some((args.start.take(), args.follow));
     let (at, header) = loop {
-        let at = open_exec(fs, &path)?;
+        let at = match first.take() {
+            Some((start, follow)) => open_exec_at(fs, start.as_ref(), &path, follow)?,
+            None => open_exec(fs, &path)?,
+        };
         let mut head = [0u8; SCRIPT_LINE];
         let n = read_full(at.inode(), 0, &mut head)?;
         if head[..n].starts_with(b"#!") {
@@ -344,7 +382,10 @@ pub fn exec(
     process.timers().clear(true);
     thread.set_altstack(crate::signal::AltStack::default());
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&path);
-    process.set_comm(name);
+    // `execveat` with `AT_EMPTY_PATH` has no name, so the process keeps its name.
+    if !name.is_empty() {
+        process.set_comm(name);
+    }
     process.set_cred(cred);
     process.set_image(&argv, at, auxv);
     Ok(image)

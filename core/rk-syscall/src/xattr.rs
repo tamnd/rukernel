@@ -99,6 +99,8 @@ fn set(cx: &Cx<'_>, target: Target, name: Vec<u8>, value: u64, size: u64, flags:
     } else {
         inode.set_xattr(&name, &value, flags as u32)?;
     }
+    // As `fsnotify_xattr` of Linux.
+    rk_vfs::notify::xattr(None, &inode);
     Ok(0)
 }
 
@@ -151,6 +153,7 @@ fn remove(cx: &Cx<'_>, target: Target, name: Vec<u8>) -> SysResult {
     } else {
         inode.remove_xattr(&name)?;
     }
+    rk_vfs::notify::xattr(None, &inode);
     Ok(0)
 }
 
