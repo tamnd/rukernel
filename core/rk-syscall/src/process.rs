@@ -293,14 +293,63 @@ pub(crate) fn execve(cx: &mut Cx<'_>, path: u64, argv: u64, envp: u64) -> SysRes
     let argv = cx.read_strings(argv, &mut total)?;
     let envp = cx.read_strings(envp, &mut total)?;
     // The new program has no robust list. The locks in the list of the old program are dead.
-    let image =
-        exec(cx.thread, ExecArgs { path, argv, envp }, random16(), crate::futex::exit_robust_list)?;
+    let image = exec(
+        cx.thread,
+        ExecArgs::new(path, argv, envp),
+        random16(),
+        crate::futex::exit_robust_list,
+    )?;
     *cx.regs = rk_frame::user::UserContext::new(
         rk_frame::addr::VirtAddr::new(image.entry),
         rk_frame::addr::VirtAddr::new(image.sp),
     );
     cx.regs.set_syscall_return(0);
     // rukernel keeps the thread ID in `execve`, so the old ID is the ID of the thread.
+    ptrace::exec_event(cx.thread, cx.regs, cx.number, cx.thread.tid());
+    Ok(0)
+}
+
+/// `execveat`, as `do_execveat_common` of Linux. The path starts at `dirfd`, `AT_EMPTY_PATH`
+/// runs the file of `dirfd` and `AT_SYMLINK_NOFOLLOW` gives `ELOOP` for a symbolic link.
+pub(crate) fn execveat(
+    cx: &mut Cx<'_>,
+    dirfd: u64,
+    path: u64,
+    argv: u64,
+    envp: u64,
+    flags: u64,
+) -> SysResult {
+    use rk_abi::native::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
+    let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
+    if flags & !(AT_EMPTY_PATH as u32 | AT_SYMLINK_NOFOLLOW as u32) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let path = cx.read_path_opt(path, flags & AT_EMPTY_PATH as u32 != 0)?;
+    let cwd = dirfd as i32 == rk_abi::native::at::AT_FDCWD;
+    let start = if path.is_empty() && cwd {
+        Some(cx.fs()?.cwd().clone())
+    } else if path.first() == Some(&b'/') || cwd {
+        None
+    } else {
+        let file = cx.file(dirfd)?;
+        let at = file.location().ok_or(Errno::EACCES)?.clone();
+        if !path.is_empty() && !at.inode().metadata().is_dir() {
+            return Err(Errno::ENOTDIR);
+        }
+        Some(at)
+    };
+    let mut total = 0;
+    let argv = cx.read_strings(argv, &mut total)?;
+    let envp = cx.read_strings(envp, &mut total)?;
+    let mut args = ExecArgs::new(path, argv, envp);
+    args.start = start;
+    args.follow = flags & AT_SYMLINK_NOFOLLOW as u32 == 0;
+    let image = exec(cx.thread, args, random16(), crate::futex::exit_robust_list)?;
+    *cx.regs = rk_frame::user::UserContext::new(
+        rk_frame::addr::VirtAddr::new(image.entry),
+        rk_frame::addr::VirtAddr::new(image.sp),
+    );
+    cx.regs.set_syscall_return(0);
     ptrace::exec_event(cx.thread, cx.regs, cx.number, cx.thread.tid());
     Ok(0)
 }

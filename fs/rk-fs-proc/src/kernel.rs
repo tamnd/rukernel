@@ -214,6 +214,9 @@ fn stat() -> Vec<u8> {
 /// does not use it yet.
 const SYSCTLS: &[(&str, &str)] = &[
     ("fs/file-max", ""),
+    ("fs/inotify/max_queued_events", ""),
+    ("fs/inotify/max_user_instances", ""),
+    ("fs/inotify/max_user_watches", ""),
     ("fs/protected_fifos", ""),
     ("fs/protected_hardlinks", ""),
     ("fs/protected_regular", ""),
@@ -249,10 +252,17 @@ const PING_GROUP_RANGE: &str = "net/ipv4/ping_group_range";
 
 static SYSCTL_VALUES: SpinLock<Vec<(&'static str, Vec<u8>)>> = SpinLock::new(Vec::new());
 
-/// The `fs.protected_*` sysctl of `name`, which the VFS reads, and its largest value.
+/// The sysctl of `name` that the VFS reads, `fs.protected_*` and `fs.inotify.*`, and its largest
+/// value.
 fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
     use rk_vfs::cred::protected::{FIFOS, HARDLINKS, REGULAR, SYMLINKS};
+    use rk_vfs::notify::inotify::{MAX_QUEUED_EVENTS, MAX_USER_INSTANCES, MAX_USER_WATCHES};
+    // The inotify limits go from 0 to `INT_MAX`, as `inotify_table` of Linux.
+    const INT_MAX: u32 = i32::MAX as u32;
     match name {
+        "fs/inotify/max_queued_events" => Some((&MAX_QUEUED_EVENTS, INT_MAX)),
+        "fs/inotify/max_user_instances" => Some((&MAX_USER_INSTANCES, INT_MAX)),
+        "fs/inotify/max_user_watches" => Some((&MAX_USER_WATCHES, INT_MAX)),
         "fs/protected_fifos" => Some((&FIFOS, 2)),
         "fs/protected_hardlinks" => Some((&HARDLINKS, 1)),
         "fs/protected_regular" => Some((&REGULAR, 2)),
@@ -761,6 +771,52 @@ fn fd_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
     )
 }
 
+/// The text of `/proc/PID/fdinfo/FD`, as `seq_show` in fs/proc/fd.c of Linux.
+fn fdinfo_text(p: &Process, fd: i32) -> Result<Vec<u8>> {
+    let files = p.files().ok_or(Errno::ESRCH)?;
+    let (file, cloexec) = {
+        let files = files.lock();
+        let entry = files.get(fd).map_err(|_| Errno::ENOENT)?;
+        (entry.file.clone(), entry.cloexec)
+    };
+    let mut flags = file.flags().0;
+    if cloexec {
+        flags |= rk_abi::native::open::O_CLOEXEC;
+    }
+    let mnt_id = file.location().map_or(0, |at| at.mount.id());
+    let ino = file.metadata().map_or(0, |m| m.ino);
+    let mut out =
+        format!("pos:\t{}\nflags:\t0{flags:o}\nmnt_id:\t{mnt_id}\nino:\t{ino}\n", file.pos())
+            .into_bytes();
+    out.extend_from_slice(&file.fdinfo());
+    Ok(out)
+}
+
+fn fdinfo_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
+    let path = join(base, b"fdinfo");
+    let me = path.clone();
+    dir(
+        &path,
+        base,
+        0o500,
+        move || {
+            let p = alive(&w)?;
+            let files = p.files().ok_or(Errno::ESRCH)?;
+            let fds: Vec<i32> = files.lock().iter().map(|(fd, _)| fd).collect();
+            Ok(fds
+                .into_iter()
+                .map(|fd| {
+                    let name = format!("{fd}").into_bytes();
+                    let w = w.clone();
+                    let node = file(&join(&me, &name), move || fdinfo_text(&*alive(&w)?, fd));
+                    (name, node)
+                })
+                .collect())
+        },
+        None,
+    )
+}
+
 /// The files of a process directory, from the process `w`. `t` is the thread of a directory in
 /// `task`, or `None` for the directory of the process.
 fn process_files(
@@ -876,14 +932,22 @@ fn process_files(
     ));
     out.push((b"oom_score".to_vec(), file(&join(base, b"oom_score"), || Ok(b"0\n".to_vec()))));
     let p_ = w.clone();
+    let p_j = w.clone();
     out.push((
         b"exe".to_vec(),
-        link(&join(base, b"exe"), 0o777, move || {
-            let p = alive(&p_)?;
-            let exe = p.exe().ok_or(Errno::ENOENT)?;
-            let fs = p.fs().map(|fs| fs.lock().clone());
-            Ok(fs.and_then(|fs| fs.path_of(&exe).ok()).unwrap_or_else(|| exe.absolute_path()))
-        }),
+        // A magic link, as `proc_exe_link` of Linux: a walk goes to the file itself, and
+        // `RESOLVE_NO_MAGICLINKS` stops it.
+        jump_link(
+            &join(base, b"exe"),
+            0o777,
+            move || {
+                let p = alive(&p_)?;
+                let exe = p.exe().ok_or(Errno::ENOENT)?;
+                let fs = p.fs().map(|fs| fs.lock().clone());
+                Ok(fs.and_then(|fs| fs.path_of(&exe).ok()).unwrap_or_else(|| exe.absolute_path()))
+            },
+            move || alive(&p_j)?.exe().ok_or(Errno::ENOENT),
+        ),
     ));
     let p_ = w.clone();
     out.push((
@@ -902,6 +966,7 @@ fn process_files(
         }),
     ));
     out.push((b"fd".to_vec(), fd_dir(w.clone(), base)));
+    out.push((b"fdinfo".to_vec(), fdinfo_dir(w.clone(), base)));
     out.into_iter().map(|(name, node)| (name, owned(w, node))).collect()
 }
 

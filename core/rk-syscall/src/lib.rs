@@ -40,6 +40,8 @@ mod futex;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod info;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod inotify;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod memfd;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod mm;

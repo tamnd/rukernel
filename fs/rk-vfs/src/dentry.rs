@@ -34,6 +34,8 @@ pub struct Dentry {
     /// The inode has no link, and `linkat` can give it one, as `I_LINKABLE` of Linux. It is
     /// for a file of `O_TMPFILE` without `O_EXCL`.
     linkable: AtomicBool,
+    /// The name was removed, as `d_unlinked` of Linux, for `IN_EXCL_UNLINK`.
+    unlinked: AtomicBool,
 }
 
 impl core::fmt::Debug for Dentry {
@@ -54,6 +56,7 @@ impl Dentry {
             inode,
             children: SpinLock::new(BTreeMap::new()),
             linkable: AtomicBool::new(false),
+            unlinked: AtomicBool::new(false),
         })
     }
 
@@ -89,6 +92,7 @@ impl Dentry {
             inode,
             children: SpinLock::new(BTreeMap::new()),
             linkable: AtomicBool::new(false),
+            unlinked: AtomicBool::new(false),
         });
         let mut children = self.children.lock();
         children.retain(|_, c| c.strong_count() > 0);
@@ -108,6 +112,7 @@ impl Dentry {
             inode,
             children: SpinLock::new(BTreeMap::new()),
             linkable: AtomicBool::new(linkable),
+            unlinked: AtomicBool::new(false),
         })
     }
 
@@ -119,6 +124,17 @@ impl Dentry {
     /// Ends the right of `linkat` to give a link to the inode, after the first link.
     pub(crate) fn clear_linkable(&self) {
         self.linkable.store(false, Ordering::Relaxed);
+    }
+
+    /// Tells if the name of the dentry was removed.
+    pub fn unlinked(&self) -> bool {
+        self.unlinked.load(Ordering::Relaxed)
+    }
+
+    /// Records that the name of the dentry was removed, after an unlink, a rmdir or a rename
+    /// that replaced it.
+    pub(crate) fn set_unlinked(&self) {
+        self.unlinked.store(true, Ordering::Relaxed);
     }
 
     /// Removes the child `name` from the cache, after an unlink or a rmdir.
@@ -882,6 +898,12 @@ impl MountNamespace {
             {
                 ns.remove(&copy);
             }
+        }
+        // The last mount of the file system went, as `fsnotify_sb_delete` of Linux.
+        let root = at.mount.root().inode();
+        let id = root.fs_id();
+        if !attached().iter().any(|m| m.root.inode().fs_id() == id) {
+            crate::notify::unmount(id);
         }
         Ok(())
     }

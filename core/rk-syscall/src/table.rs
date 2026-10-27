@@ -2,9 +2,9 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, cred, epoll, eventfd, fhandle, fs, futex, info, memfd, mm, mount, mqueue, msg, net, pidfd,
-    poll, process, ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap, timer,
-    timerfd, xattr,
+    aio, cred, epoll, eventfd, fhandle, fs, futex, info, inotify, memfd, mm, mount, mqueue, msg,
+    net, pidfd, poll, process, ptrace, sched, seccomp, sem, shm, signal, signalfd, splice, swap,
+    timer, timerfd, xattr,
 };
 use rk_abi::Errno;
 use rk_abi::native::syscalls as nr;
@@ -167,6 +167,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         #[cfg(target_arch = "x86_64")]
         nr::VFORK => process::vfork(cx),
         nr::EXECVE => process::execve(cx, a[0], a[1], a[2]),
+        nr::EXECVEAT => process::execveat(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::EXIT => process::exit(cx, a[0]),
         nr::WAIT4 => process::wait4(cx, a[0], a[1], a[2], a[3]),
         nr::PTRACE => ptrace::ptrace(cx, a[0], a[1], a[2], a[3]),
@@ -344,6 +345,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::EXIT_GROUP => process::exit_group(cx, a[0]),
         nr::TGKILL => signal::tgkill(cx, a[0], a[1], a[2]),
         nr::OPENAT => fs::openat(cx, a[0], a[1], a[2], a[3]),
+        nr::OPENAT2 => fs::openat2(cx, a[0], a[1], a[2], a[3]),
         nr::MKDIRAT => fs::mkdirat(cx, a[0], a[1], a[2]),
         nr::MKNODAT => fs::mknodat(cx, a[0], a[1], a[2], a[3]),
         nr::FCHOWNAT => fs::fchownat(cx, a[0], a[1], a[2], a[3], a[4]),
@@ -354,6 +356,15 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SYMLINKAT => fs::symlinkat(cx, a[0], a[1], a[2]),
         nr::READLINKAT => fs::readlinkat(cx, a[0], a[1], a[2], a[3]),
         nr::FCHMODAT => fs::fchmodat(cx, a[0], a[1], a[2]),
+        nr::FCHMODAT2 => fs::fchmodat2(cx, a[0], a[1], a[2], a[3]),
+        nr::CLOSE_RANGE => fs::close_range(cx, a[0], a[1], a[2]),
+        nr::CACHESTAT => fs::cachestat(cx, a[0], a[1], a[2], a[3]),
+        nr::CHROOT => fs::chroot(cx, a[0]),
+        #[cfg(target_arch = "x86_64")]
+        nr::INOTIFY_INIT => inotify::inotify_init(cx),
+        nr::INOTIFY_INIT1 => inotify::inotify_init1(cx, a[0]),
+        nr::INOTIFY_ADD_WATCH => inotify::inotify_add_watch(cx, a[0], a[1], a[2]),
+        nr::INOTIFY_RM_WATCH => inotify::inotify_rm_watch(cx, a[0], a[1]),
         nr::FACCESSAT => fs::faccessat(cx, a[0], a[1], a[2], 0),
         nr::FACCESSAT2 => fs::faccessat(cx, a[0], a[1], a[2], a[3]),
         nr::SET_ROBUST_LIST => futex::set_robust_list(cx, a[0], a[1]),

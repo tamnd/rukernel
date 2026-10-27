@@ -1,7 +1,9 @@
 //! The system calls of files, descriptors and paths.
 
 use crate::cx::{Cx, PATH_MAX, SysResult, UserMem};
+use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::at::{
     AT_EACCESS, AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_STATX_SYNC_TYPE,
@@ -21,6 +23,7 @@ use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::{SIGPIPE, SIGXFSZ};
 use rk_abi::native::stat::{STATX__RESERVED, STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID};
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
+use rk_frame::sync::SpinLock;
 use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::device::{major, minor};
 use rk_vfs::inode::{Metadata, SetAttr, Timespec};
@@ -477,9 +480,161 @@ pub(crate) fn openat(cx: &Cx<'_>, dirfd: u64, path: u64, flags: u64, mode: u64) 
     Ok(fd as u64)
 }
 
+/// The size of the first `struct open_how` of `openat2`, as `OPEN_HOW_SIZE_VER0` of Linux.
+const OPEN_HOW_SIZE: usize = 24;
+/// The flags that `openat2` takes, as `VALID_OPEN_FLAGS` of Linux on x86_64.
+const VALID_OPEN_FLAGS: u64 = 0x7f_ffc3;
+/// The flags that go with `O_PATH` in `openat2`, as `O_PATH_FLAGS` of Linux.
+const O_PATH_FLAGS: u64 = 0x1_0000 | 0x2_0000 | 0x8_0000 | 0x20_0000;
+/// `O_CREAT` and `__O_TMPFILE`: the flags that make a file and use the mode.
+const WILL_CREATE: u64 = 0x40 | 0x40_0000;
+
+/// `openat2`, as `do_sys_openat2` and `build_open_flags` of Linux. Unlike `openat`, it checks
+/// each flag and the mode, and the `RESOLVE_*` flags limit the walk.
+pub(crate) fn openat2(cx: &Cx<'_>, dirfd: u64, path: u64, how: u64, size: u64) -> SysResult {
+    use rk_vfs::path::resolve;
+    let size = size as usize;
+    if size < OPEN_HOW_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    if size > rk_mm::PAGE_SIZE {
+        return Err(Errno::E2BIG);
+    }
+    // As `copy_struct_from_user`: the bytes after the known fields must be zero.
+    let raw = cx.read_bytes(how, size)?;
+    if raw[OPEN_HOW_SIZE..].iter().any(|&b| b != 0) {
+        return Err(Errno::E2BIG);
+    }
+    let word = |i: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&raw[i * 8..i * 8 + 8]);
+        u64::from_ne_bytes(b)
+    };
+    let (flags, mode, res) = (word(0), word(1), word(2));
+    if flags & !VALID_OPEN_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & WILL_CREATE != 0 {
+        if mode & !0o7777 != 0 {
+            return Err(Errno::EINVAL);
+        }
+    } else if mode != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if res & !u64::from(resolve::ALL) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let res = res as u32;
+    if res & resolve::BENEATH != 0 && res & resolve::IN_ROOT != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & u64::from(rk_abi::native::open::O_PATH) != 0 && flags & !O_PATH_FLAGS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // `RESOLVE_CACHED` cannot make or truncate a file, as Linux.
+    if res & resolve::CACHED != 0 && flags & (WILL_CREATE | 0x200) != 0 {
+        return Err(Errno::EAGAIN);
+    }
+    let path = cx.read_path(path)?;
+    let mut fs = cx.fs()?;
+    let start = if dirfd as i32 == rk_abi::native::at::AT_FDCWD {
+        fs.cwd().clone()
+    } else {
+        let file = cx.files()?.lock().file(dirfd as i32)?;
+        let at = file.location().ok_or(Errno::ENOTDIR)?.clone();
+        // A scoped walk needs a directory as its root, even for an absolute path.
+        if (path.first() != Some(&b'/') || res & (resolve::BENEATH | resolve::IN_ROOT) != 0)
+            && !at.inode().metadata().is_dir()
+        {
+            return Err(Errno::ENOTDIR);
+        }
+        at
+    };
+    fs.set_resolve(&start, res);
+    let flags = flags as u32;
+    let file = fs.open(&start, &path, flags, mode as u32)?;
+    let fd = cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)?;
+    Ok(fd as u64)
+}
+
+/// `cachestat`, as mm/filemap.c of Linux. The files of rukernel are in memory, so each page of
+/// the data of a regular file in the range is in the cache, and no page is dirty, under
+/// writeback or evicted. Other files have no pages in the cache.
+pub(crate) fn cachestat(cx: &Cx<'_>, fd: u64, range: u64, out: u64, flags: u64) -> SysResult {
+    let file = cx.file(fd)?;
+    // As `fdget` of Linux: an `O_PATH` descriptor is not a file for the call.
+    if file.flags().is_path() {
+        return Err(Errno::EBADF);
+    }
+    if flags as u32 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    // `struct cachestat_range`: the offset and the length. A length of 0 goes to the end.
+    let range: [u64; 2] = cx.read_val(range)?;
+    let page = rk_mm::PAGE_SIZE as u64;
+    let mut cached = 0u64;
+    if let Some(inode) = file.inode() {
+        let meta = inode.metadata();
+        if meta.file_type() == Some(rk_vfs::inode::FileType::Regular) && meta.size > 0 {
+            let pages = meta.size.div_ceil(page);
+            let first = range[0] / page;
+            let last =
+                if range[1] == 0 { u64::MAX } else { range[0].saturating_add(range[1] - 1) / page };
+            if first < pages {
+                cached = last.min(pages - 1) - first + 1;
+            }
+        }
+    }
+    // `struct cachestat`: cached, dirty, writeback, evicted and recently evicted pages.
+    cx.write_val(out, &[cached, 0, 0, 0, 0])?;
+    Ok(0)
+}
+
 pub(crate) fn close(cx: &Cx<'_>, fd: u64) -> SysResult {
     let entry = cx.files()?.lock().remove(fd as i32)?;
     drop(entry);
+    Ok(0)
+}
+
+/// `close_range` flag: the call works on a private copy of the table, as Linux.
+const CLOSE_RANGE_UNSHARE: u32 = 1 << 1;
+/// `close_range` flag: the call sets `FD_CLOEXEC` and does not close, as Linux.
+const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+
+/// `close_range`, as `__close_range` of Linux. The closed files drop after the table lock is
+/// released, because the release of a file can sleep.
+pub(crate) fn close_range(cx: &Cx<'_>, first: u64, last: u64, flags: u64) -> SysResult {
+    let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
+    if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (first, last) = (first as u32, last as u32);
+    if first > last {
+        return Err(Errno::EINVAL);
+    }
+    if flags & CLOSE_RANGE_UNSHARE != 0 {
+        // As `unshare_fd` in `__close_range`: the process takes its own copy of the table.
+        let table = cx.files()?.lock().clone();
+        cx.process().set_files(Arc::new(SpinLock::new(table)));
+    }
+    let files = cx.files()?;
+    let closed = {
+        let mut table = files.lock();
+        if flags & CLOSE_RANGE_CLOEXEC != 0 {
+            let fds: Vec<i32> = table
+                .iter()
+                .map(|(fd, _)| fd)
+                .filter(|&fd| (first..=last).contains(&(fd as u32)))
+                .collect();
+            for fd in fds {
+                table.set_cloexec(fd, true)?;
+            }
+            Vec::new()
+        } else {
+            table.remove_range(first as usize, last as usize)
+        }
+    };
+    drop(closed);
     Ok(0)
 }
 
@@ -912,6 +1067,20 @@ pub(crate) fn chdir(cx: &Cx<'_>, path: u64) -> SysResult {
     Ok(0)
 }
 
+/// `chroot`, as `ksys_chroot` of Linux: the walk, the search permission, then
+/// `CAP_SYS_CHROOT`.
+pub(crate) fn chroot(cx: &Cx<'_>, path: u64) -> SysResult {
+    let path = cx.read_path(path)?;
+    let fs = cx.fs()?;
+    let at = fs.resolve(fs.cwd(), &path, true)?;
+    fs.check_dir(&at)?;
+    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_CHROOT) {
+        return Err(Errno::EPERM);
+    }
+    cx.fs_shared()?.lock().set_root(at)?;
+    Ok(0)
+}
+
 pub(crate) fn fchdir(cx: &Cx<'_>, fd: u64) -> SysResult {
     let at = cx.file(fd)?.location().ok_or(Errno::ENOTDIR)?.clone();
     cx.fs()?.check_dir(&at)?;
@@ -1040,7 +1209,13 @@ enum Change {
 
 /// Checks and makes the change `attr` of the attributes of `inode`, as `notify_change` of
 /// Linux.
-fn change_attr(cx: &Cx<'_>, inode: &rk_vfs::InodeRef, attr: &SetAttr, change: Change) -> SysResult {
+fn change_attr(
+    cx: &Cx<'_>,
+    at: Option<&rk_vfs::Location>,
+    inode: &rk_vfs::InodeRef,
+    attr: &SetAttr,
+    change: Change,
+) -> SysResult {
     rk_vfs::inode::check_set_attr(&**inode, attr)?;
     let cred = cx.process().cred();
     let meta = inode.metadata();
@@ -1056,6 +1231,8 @@ fn change_attr(cx: &Cx<'_>, inode: &rk_vfs::InodeRef, attr: &SetAttr, change: Ch
     if let Some(mode) = attr.mode {
         rk_vfs::acl::chmod(&**inode, mode)?;
     }
+    // As `fsnotify_change` in `notify_change` of Linux.
+    rk_vfs::notify::change(at, inode, &attr);
     Ok(0)
 }
 
@@ -1074,19 +1251,42 @@ fn set_attr_at(
     // The mount must be writable before the other checks, as `chmod_common`, `chown_common` and
     // `vfs_utimes` of Linux.
     at.mount.want_write()?;
-    change_attr(cx, at.inode(), attr, change)
+    change_attr(cx, Some(&at), at.inode(), attr, change)
 }
 
 fn set_attr_fd(cx: &Cx<'_>, fd: u64, attr: &SetAttr, change: Change) -> SysResult {
     let file = cx.file(fd)?;
     let inode = file.inode().ok_or(Errno::EBADF)?;
     file.want_write()?;
-    change_attr(cx, inode, attr, change)
+    change_attr(cx, file.location(), inode, attr, change)
 }
 
 pub(crate) fn fchmodat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64) -> SysResult {
     let attr = SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() };
     set_attr_at(cx, dirfd, path, true, &attr, Change::Plain)
+}
+
+/// `fchmodat2`, as `do_fchmodat` of Linux 6.6. `AT_EMPTY_PATH` with an empty path changes
+/// `dirfd`. A symbolic link has no mode of its own, so `AT_SYMLINK_NOFOLLOW` on a link gives
+/// `EOPNOTSUPP`, as `notify_change` of Linux.
+pub(crate) fn fchmodat2(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u64) -> SysResult {
+    let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
+    if flags & !(AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let attr = SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() };
+    let path = cx.read_path_opt(path, flags & AT_EMPTY_PATH as u32 != 0)?;
+    if path.is_empty() {
+        return set_attr_fd(cx, dirfd, &attr, Change::Plain);
+    }
+    let fs = cx.fs()?;
+    let start = cx.dir_start(&fs, dirfd, &path)?;
+    let at = fs.resolve(&start, &path, flags & AT_SYMLINK_NOFOLLOW as u32 == 0)?;
+    at.mount.want_write()?;
+    if at.inode().metadata().file_type() == Some(rk_vfs::inode::FileType::Symlink) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    change_attr(cx, Some(&at), at.inode(), &attr, Change::Plain)
 }
 
 pub(crate) fn fchmod(cx: &Cx<'_>, fd: u64, mode: u64) -> SysResult {
@@ -1167,6 +1367,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     rk_vfs::mapped::extend(at.inode(), size);
     at.inode().set_attr(&attr)?;
     rk_vfs::mapped::changed(at.inode(), size, u64::MAX);
+    rk_vfs::notify::change(Some(&at), at.inode(), &attr);
     Ok(0)
 }
 

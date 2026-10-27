@@ -2,3 +2,11 @@
 # report.py puts the note in the table, and the note gives the cause of the test in the work that
 # remains. Without a note, the table shows the reason from the log. A test name can have the
 # runtest file before it, as net.ipv6:ping601, when two runtest files have the same name.
+cachestat03	Needs hugetlbfs, which rukernel does not have (TCONF).
+listmount01	listmount (458) does not exist (TCONF).
+listmount02	listmount (458) does not exist (TCONF).
+listmount03	listmount (458) does not exist (TCONF).
+listmount04	listmount (458) does not exist (TCONF).
+statmount08	statmount (457) does not exist (TCONF).
+pivot_root01	pivot_root does not exist (ENOSYS).
+inotify09	The test runs for 270 s, more than the default --timeout of 240. It passes with --timeout 400.

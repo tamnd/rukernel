@@ -78,7 +78,7 @@ pub fn spawn_init(
             files.insert(console.clone(), false)?;
         }
     }
-    let image = exec(&thread, ExecArgs { path: path.to_vec(), argv, envp }, random16(), |_| {})?;
+    let image = exec(&thread, ExecArgs::new(path.to_vec(), argv, envp), random16(), |_| {})?;
     rk_drv_tty::set_console_session(process.pid(), process.pgid());
     start_thread(thread, UserContext::new(VirtAddr::new(image.entry), VirtAddr::new(image.sp)))
 }
