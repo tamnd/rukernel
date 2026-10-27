@@ -10,6 +10,7 @@ use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_ONSTACK, SA_RESTORER, SIGSEGV};
 use rk_frame::user::{FpuState, UserContext};
+use rk_mm::VmaKind;
 use rk_proc::Thread;
 use rk_proc::signal::{
     AltStack, SI_KERNEL, SIGINFO_SIZE, SS_AUTODISARM, SigAction, SigInfo, SigSet,
@@ -95,12 +96,15 @@ pub(super) fn setup_frame(
     action: &SigAction,
     mask: SigSet,
 ) -> Result<(), Errno> {
-    // The restorer is in the vDSO on Linux when `SA_RESTORER` is not set. rk has no arm64 vDSO
-    // yet, so the C library must give the restorer.
-    if action.flags & u64::from(SA_RESTORER) == 0 {
-        return Err(Errno::EFAULT);
-    }
     let vm = thread.process().vm().ok_or(Errno::EFAULT)?;
+    // Without `SA_RESTORER` the handler returns to `__kernel_rt_sigreturn` of the vDSO, as on
+    // Linux.
+    let restorer = if action.flags & u64::from(SA_RESTORER) != 0 {
+        action.restorer
+    } else {
+        let vdso = vm.find_kind(VmaKind::Vdso).ok_or(Errno::EFAULT)?;
+        (vdso + rk_frame::vdso::SIGRETURN) as u64
+    };
     let user_sp = regs.sp();
     let alt = thread.altstack();
     let mut sp = user_sp;
@@ -140,7 +144,7 @@ pub(super) fn setup_frame(
     r.x[1] = frame;
     r.x[2] = frame + SIGINFO_SIZE as u64;
     r.x[29] = record;
-    r.x[30] = action.restorer;
+    r.x[30] = restorer;
     r.sp = frame;
     r.pc = action.handler;
     // The handler starts with a clean FP and SIMD state, as `fpsimd_signal_preserve_current_state`

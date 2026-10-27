@@ -298,6 +298,12 @@ impl AddressSpace {
         self.state.lock().vmas.iter().cloned().collect()
     }
 
+    /// Gives the start of the first area of the kind `kind`, or `None` if there is none. The
+    /// signal code of arm64 finds the vDSO with it.
+    pub fn find_kind(&self, kind: VmaKind) -> Option<usize> {
+        self.state.lock().vmas.iter().find(|v| v.kind == kind).map(|v| v.start)
+    }
+
     /// Gives a copy of the areas in the page aligned range of `addr..addr + len`, in address
     /// order. `madvise` uses it.
     ///

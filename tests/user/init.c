@@ -3,6 +3,7 @@
  * one line. init exits with 0 if each check passes, and with 1 if a check fails. With the
  * argument "tty", init also reads a line from the console and waits for ^C, which the boot test
  * types. With the argument "smp", init also checks the CPU count and runs a hackbench load.
+ * With the first argument "only", init runs only the checks of the next argument.
  */
 #define _GNU_SOURCE
 #include <elf.h>
@@ -462,12 +463,45 @@ static long timespec_ns(const struct timespec *t)
 	return t->tv_sec * 1000000000L + t->tv_nsec;
 }
 
+#if defined(__aarch64__)
+static volatile int vdso_signal_seen;
+
+static void vdso_signal_handler(int sig)
+{
+	vdso_signal_seen = sig;
+}
+
+/* A signal handler without SA_RESTORER returns through __kernel_rt_sigreturn of the vDSO, as on
+ * Linux. musl always gives SA_RESTORER, so the test calls rt_sigaction directly. */
+static void test_vdso_sigreturn(void)
+{
+	struct {
+		void (*handler)(int);
+		unsigned long flags;
+		void (*restorer)(void);
+		unsigned long mask;
+	} act = { vdso_signal_handler, 0, NULL, 0 }, old;
+	check("rt_sigaction without SA_RESTORER", syscall(SYS_rt_sigaction, SIGUSR2, &act, &old, 8) == 0);
+	vdso_signal_seen = 0;
+	kill(getpid(), SIGUSR2);
+	check("a handler returns through __kernel_rt_sigreturn", vdso_signal_seen == SIGUSR2);
+	syscall(SYS_rt_sigaction, SIGUSR2, &old, NULL, 8);
+}
+#endif
+
 static void test_vdso(void)
 {
+	/* arm64 has the time functions under the names __kernel_*, and no time or getcpu, as on
+	 * Linux. */
 #if defined(__aarch64__)
-	/* TODO(#329): rk has no vDSO on arm64 yet. */
-	return;
-#endif
+	int (*vgettime)(clockid_t, struct timespec *) = vdso_sym("__kernel_clock_gettime");
+	int (*vgettimeofday)(struct timeval *, void *) = vdso_sym("__kernel_gettimeofday");
+	check("the vDSO has its functions", vgettime && vgettimeofday && vdso_sym("__kernel_clock_getres") &&
+					    vdso_sym("__kernel_rt_sigreturn"));
+	if (!vgettime || !vgettimeofday)
+		return;
+	test_vdso_sigreturn();
+#else
 	int (*vgettime)(clockid_t, struct timespec *) = vdso_sym("__vdso_clock_gettime");
 	int (*vgettimeofday)(struct timeval *, void *) = vdso_sym("__vdso_gettimeofday");
 	long (*vtime)(long *) = vdso_sym("__vdso_time");
@@ -476,6 +510,7 @@ static void test_vdso(void)
 					    vdso_sym("__vdso_clock_getres"));
 	if (!vgettime || !vgettimeofday || !vtime || !vgetcpu)
 		return;
+#endif
 	struct timespec a, s, b;
 	check("__vdso_clock_gettime", vgettime(CLOCK_MONOTONIC, &a) == 0);
 	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &s);
@@ -491,10 +526,12 @@ static void test_vdso(void)
 	struct timeval tv;
 	syscall(SYS_clock_gettime, CLOCK_REALTIME, &s);
 	check("__vdso_gettimeofday", vgettimeofday(&tv, NULL) == 0 && tv.tv_sec >= s.tv_sec);
+#if !defined(__aarch64__)
 	long t = 0;
 	check("__vdso_time", vtime(&t) == t && t >= s.tv_sec);
 	unsigned cpu = 7, node = 7;
 	check("__vdso_getcpu", vgetcpu(&cpu, &node) == 0 && cpu < (unsigned)sysconf(_SC_NPROCESSORS_ONLN) && node == 0);
+#endif
 	struct timespec m;
 	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &s);
 	check("clock_gettime of libc", clock_gettime(CLOCK_MONOTONIC, &m) == 0 && timespec_ns(&m) >= timespec_ns(&s));
@@ -2969,13 +3006,8 @@ static void test_proc(void)
 	check("/proc/self/stat", read_file("/proc/self/stat", buf, sizeof(buf)) > 0 && !strncmp(buf, want, strlen(want)));
 	check("/proc/self/status", read_file("/proc/self/status", buf, sizeof(buf)) > 0 && strstr(buf, "\nState:\tR (running)\n"));
 	check("/proc/self/cmdline", read_file("/proc/self/cmdline", buf, sizeof(buf)) > 0 && !strcmp(buf, "/init"));
-	#if defined(__aarch64__)
-	/* TODO(#329): rk has no vDSO on arm64 yet, so the maps have no [vvar] and no [vdso]. */
-	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n"));
-#else
 	check("/proc/self/maps names the stack", read_file("/proc/self/maps", buf, sizeof(buf)) > 0 && strstr(buf, "[stack]\n") &&
 						   strstr(buf, "[vvar]\n") && strstr(buf, "[vdso]\n"));
-#endif
 	check("/proc/mounts", read_file("/proc/mounts", buf, sizeof(buf)) > 0 && strstr(buf, "proc /proc proc rw,relatime 0 0\n"));
 	n = readlink("/proc/self/exe", link, sizeof(link) - 1);
 	check("/proc/self/exe", n == 5 && !strncmp(link, "/init", 5));
@@ -3406,6 +3438,8 @@ static void test_inet_ping(void)
 	errno = 0;
 	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	check("an ICMP echo socket needs a group in ping_group_range", fd == -1 && errno == EACCES);
+	/* With the argument "only", the general checks did not make /proc. */
+	mkdir("/proc", 0555);
 	mount("proc", "/proc", "proc", 0, NULL);
 	const char *range = "/proc/sys/net/ipv4/ping_group_range";
 	char text[64] = { 0 };
@@ -4009,9 +4043,9 @@ static void test_cgroup(void)
 	umount("/proc");
 }
 
-int main(int argc, char **argv)
+/* Runs the general checks, which each boot of init runs without the argument "only". */
+static void test_all(void)
 {
-	setvbuf(stdout, NULL, _IONBF, 0);
 	test_ids();
 	test_creds();
 	test_uname();
@@ -4062,6 +4096,22 @@ int main(int argc, char **argv)
 	test_unix();
 	test_proc_ptrace();
 	test_cgroup();
+}
+
+int main(int argc, char **argv)
+{
+	setvbuf(stdout, NULL, _IONBF, 0);
+	/*
+	 * With the first argument "only", init does not run the general checks. It runs only the
+	 * checks of the next argument. The arm64 boot tests use this, because QEMU emulates each
+	 * arm64 instruction and the general checks take a long time.
+	 */
+	if (argc > 1 && strcmp(argv[1], "only") == 0) {
+		argc--;
+		argv++;
+	} else {
+		test_all();
+	}
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)

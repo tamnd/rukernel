@@ -1,6 +1,6 @@
 [package]
 name = "rk-drv-virtio"
-description = "The virtio drivers of rukernel: the PCI transport, the split virtqueue, virtio-blk and virtio-net."
+description = "The virtio drivers of rukernel: the PCI and MMIO transports, the split virtqueue, virtio-blk and virtio-net."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

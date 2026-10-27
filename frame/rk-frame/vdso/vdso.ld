@@ -1,5 +1,6 @@
 /* The layout of the vDSO, as in arch/x86/entry/vdso/vdso-layout.lds.S of Linux. All of the vDSO
- * is in one page aligned segment that can be read and run. The data page is the page below it. */
+ * is in one page aligned segment that can be read and run. The data page is the page below it.
+ * The file `x86_64.ver` or `aarch64.ver` gives the symbols and their version. */
 
 SECTIONS
 {
@@ -27,17 +28,4 @@ PHDRS
     text            PT_LOAD         FLAGS(5) FILEHDR PHDRS;
     dynamic         PT_DYNAMIC      FLAGS(4);
     eh_frame_hdr    PT_GNU_EH_FRAME;
-}
-
-VERSION
-{
-    LINUX_2.6 {
-    global:
-        __vdso_clock_gettime;
-        __vdso_clock_getres;
-        __vdso_gettimeofday;
-        __vdso_time;
-        __vdso_getcpu;
-    local: *;
-    };
 }

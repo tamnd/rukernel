@@ -172,6 +172,14 @@ jobs:
       - name: install gdb, strace and procps-ng
         if: steps.debug-tools.outputs.cache-hit != 'true'
         run: tools/debug/build.sh ~/.cache/rk-debug-tools
+      # The arm64 user tests need a C compiler that makes arm64 programs with musl. Ubuntu has no
+      # such package, so the job uses `zig cc`, which `cargo xtask boot-test` finds on the PATH.
+      - name: install zig for the arm64 user programs
+        run: |
+          curl --silent --show-error --fail --location --output /tmp/zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          echo "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  /tmp/zig.tar.xz" | sha256sum --check
+          tar --extract --xz --file /tmp/zig.tar.xz --directory "$HOME"
+          echo "$HOME/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
       - name: boot tests
         run: RK_LTP="$HOME/.cache/rk-ltp" RK_KSELFTEST="$HOME/.cache/rk-kselftest" RK_DEBUG_TOOLS="$HOME/.cache/rk-debug-tools" cargo xtask boot-test
 

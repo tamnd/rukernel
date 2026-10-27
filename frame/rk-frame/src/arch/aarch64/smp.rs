@@ -187,7 +187,7 @@ pub(crate) fn start_cpus() -> usize {
     let (list, n) = *CPUS.lock();
     for &mpidr in list[..n].iter().filter(|&&m| m != me) {
         let id = cpu::count();
-        if id >= cpu::MAX_CPUS || id >= gic::MAX_CPUS {
+        if id >= cpu::MAX_CPUS || id >= gic::max_cpus() {
             break;
         }
         if !start_cpu(id, mpidr) {
