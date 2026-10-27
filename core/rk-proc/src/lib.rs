@@ -16,10 +16,12 @@ extern crate alloc;
 pub mod bpf;
 pub mod elf;
 pub mod limits;
+pub mod ntp;
 pub mod sched;
 pub mod script;
 pub mod signal;
 pub mod stack;
+pub mod uts;
 pub mod wait;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]

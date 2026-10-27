@@ -150,6 +150,23 @@ const GROUPS: &[Group] = &[
         doc: "The clock IDs and the timer flags.",
     },
     Group {
+        module: "timex",
+        header: "linux/timex.h",
+        prefixes: &["ADJ_", "STA_", "TIME_"],
+        enums: &[],
+        ty: "u32",
+        doc: "The modes, the status bits and the clock states of `adjtimex` and `clock_adjtime`.",
+    },
+    Group {
+        module: "keyctl",
+        header: "linux/keyctl.h",
+        prefixes: &["KEYCTL_", "KEY_SPEC_", "KEY_REQKEY_DEFL_"],
+        enums: &[],
+        // The special key ring IDs are less than zero.
+        ty: "i32",
+        doc: "The operations of `keyctl`, the special key ring IDs and the default key rings.",
+    },
+    Group {
         module: "poll",
         header: "asm/poll.h",
         prefixes: &["POLL"],

@@ -197,7 +197,8 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/protected_hardlinks", ""),
     ("fs/protected_regular", ""),
     ("fs/protected_symlinks", ""),
-    ("kernel/hostname", "(none)"),
+    ("kernel/domainname", ""),
+    ("kernel/hostname", ""),
     ("kernel/ngroups_max", "65536"),
     ("kernel/osrelease", ""),
     ("kernel/ostype", "Linux"),
@@ -239,6 +240,16 @@ fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
     }
 }
 
+/// The function that reads the UTS name of the sysctl `name`, for `kernel/hostname` and
+/// `kernel/domainname`.
+fn uts_name(name: &str) -> Option<fn() -> rk_proc::uts::Field> {
+    match name {
+        "kernel/hostname" => Some(rk_proc::uts::hostname),
+        "kernel/domainname" => Some(rk_proc::uts::domainname),
+        _ => None,
+    }
+}
+
 fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some((v, _)) = protected(name) {
         return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
@@ -246,6 +257,11 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if name == PING_GROUP_RANGE {
         let (low, high) = rk_net::sysctl::ping_group_range();
         return format!("{low}\t{high}\n").into_bytes();
+    }
+    if let Some(f) = uts_name(name) {
+        let mut v = rk_proc::uts::bytes(&f()).to_vec();
+        v.push(b'\n');
+        return v;
     }
     if let Some((_, v)) = SYSCTL_VALUES.lock().iter().find(|(n, _)| *n == name) {
         return v.clone();
@@ -281,6 +297,17 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         };
         return rk_net::sysctl::set_ping_group_range(low, high).ok_or(Errno::EINVAL);
+    }
+    // A name ends at a newline, and only the first 64 bytes count, as `proc_dostring` of Linux.
+    if uts_name(name).is_some() {
+        let end = data.iter().position(|&b| b == b'\n' || b == 0).unwrap_or(data.len());
+        let text = &data[..end.min(rk_proc::uts::NAME_MAX)];
+        if name == "kernel/hostname" {
+            rk_proc::uts::set_hostname(text);
+        } else {
+            rk_proc::uts::set_domainname(text);
+        }
+        return Ok(());
     }
     // A write to `drop_caches` removes the clean pages of the block devices. The value stays 0.
     if name == "vm/drop_caches" {

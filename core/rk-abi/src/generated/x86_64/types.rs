@@ -255,6 +255,76 @@ const _: () = {
     assert!(core::mem::offset_of!(KernelOldItimerval, it_value) == 16);
 };
 
+/// `struct __kernel_timex_timeval`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct KernelTimexTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+const _: () = {
+    assert!(size_of::<KernelTimexTimeval>() == 16);
+    assert!(align_of::<KernelTimexTimeval>() == 8);
+    assert!(core::mem::offset_of!(KernelTimexTimeval, tv_sec) == 0);
+    assert!(core::mem::offset_of!(KernelTimexTimeval, tv_usec) == 8);
+};
+
+/// `struct __kernel_timex` from `<linux/timex.h>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct KernelTimex {
+    pub modes: u32,
+    _pad0: [u8; 4],
+    pub offset: i64,
+    pub freq: i64,
+    pub maxerror: i64,
+    pub esterror: i64,
+    pub status: i32,
+    _pad1: [u8; 4],
+    pub constant: i64,
+    pub precision: i64,
+    pub tolerance: i64,
+    pub time: KernelTimexTimeval,
+    pub tick: i64,
+    pub ppsfreq: i64,
+    pub jitter: i64,
+    pub shift: i32,
+    _pad2: [u8; 4],
+    pub stabil: i64,
+    pub jitcnt: i64,
+    pub calcnt: i64,
+    pub errcnt: i64,
+    pub stbcnt: i64,
+    pub tai: i32,
+    _pad3: [u8; 44],
+}
+
+const _: () = {
+    assert!(size_of::<KernelTimex>() == 208);
+    assert!(align_of::<KernelTimex>() == 8);
+    assert!(core::mem::offset_of!(KernelTimex, modes) == 0);
+    assert!(core::mem::offset_of!(KernelTimex, offset) == 8);
+    assert!(core::mem::offset_of!(KernelTimex, freq) == 16);
+    assert!(core::mem::offset_of!(KernelTimex, maxerror) == 24);
+    assert!(core::mem::offset_of!(KernelTimex, esterror) == 32);
+    assert!(core::mem::offset_of!(KernelTimex, status) == 40);
+    assert!(core::mem::offset_of!(KernelTimex, constant) == 48);
+    assert!(core::mem::offset_of!(KernelTimex, precision) == 56);
+    assert!(core::mem::offset_of!(KernelTimex, tolerance) == 64);
+    assert!(core::mem::offset_of!(KernelTimex, time) == 72);
+    assert!(core::mem::offset_of!(KernelTimex, tick) == 88);
+    assert!(core::mem::offset_of!(KernelTimex, ppsfreq) == 96);
+    assert!(core::mem::offset_of!(KernelTimex, jitter) == 104);
+    assert!(core::mem::offset_of!(KernelTimex, shift) == 112);
+    assert!(core::mem::offset_of!(KernelTimex, stabil) == 120);
+    assert!(core::mem::offset_of!(KernelTimex, jitcnt) == 128);
+    assert!(core::mem::offset_of!(KernelTimex, calcnt) == 136);
+    assert!(core::mem::offset_of!(KernelTimex, errcnt) == 144);
+    assert!(core::mem::offset_of!(KernelTimex, stbcnt) == 152);
+    assert!(core::mem::offset_of!(KernelTimex, tai) == 160);
+};
+
 /// `struct iovec` from `<linux/uio.h>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]

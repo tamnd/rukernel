@@ -4,7 +4,8 @@ use crate::cx::{Cx, PATH_MAX, SysResult, UserMem};
 use alloc::vec;
 use rk_abi::Errno;
 use rk_abi::native::at::{
-    AT_EACCESS, AT_EMPTY_PATH, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
+    AT_EACCESS, AT_EMPTY_PATH, AT_NO_AUTOMOUNT, AT_REMOVEDIR, AT_STATX_SYNC_TYPE,
+    AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use rk_abi::native::fcntl::{
     F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETPIPE_SZ, F_OFD_GETLK, F_OFD_SETLK,
@@ -18,7 +19,7 @@ use rk_abi::native::mount::{
 };
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::{SIGPIPE, SIGXFSZ};
-use rk_abi::native::stat::{STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID};
+use rk_abi::native::stat::{STATX__RESERVED, STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID};
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
 use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::device::{major, minor};
@@ -539,10 +540,17 @@ pub(crate) fn statx(
     dirfd: u64,
     path: u64,
     flags: u64,
-    _mask: u64,
+    mask: u64,
     buf: u64,
 ) -> SysResult {
-    let (meta, inode, mnt_id) = lookup(cx, dirfd, path, flags as u32)?;
+    // The checks of `do_statx` and `vfs_statx` of Linux, before the lookup.
+    let flags = flags as u32;
+    let sync = AT_STATX_SYNC_TYPE as u32;
+    let valid = AT_SYMLINK_NOFOLLOW as u32 | AT_NO_AUTOMOUNT as u32 | AT_EMPTY_PATH as u32 | sync;
+    if flags & sync == sync || mask as u32 & STATX__RESERVED != 0 || flags & !valid != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (meta, inode, mnt_id) = lookup(cx, dirfd, path, flags)?;
     let mut s = Statx::new_zeroed();
     s.stx_mask = STATX_BASIC_STATS | STATX_MNT_ID;
     s.stx_mnt_id = mnt_id;
@@ -995,10 +1003,24 @@ pub(crate) fn readlinkat(cx: &Cx<'_>, dirfd: u64, path: u64, buf: u64, size: u64
     if (size as i64) <= 0 {
         return Err(Errno::EINVAL);
     }
-    let path = cx.read_path(path)?;
-    let fs = cx.fs()?;
-    let start = cx.dir_start(&fs, dirfd, &path)?;
-    let target = fs.read_link(&start, &path)?;
+    let path = cx.read_path_opt(path, true)?;
+    let target = if path.is_empty() {
+        // An empty path is the file of `dirfd`, as with `LOOKUP_EMPTY` of Linux. A file that is
+        // not a symbolic link gives `ENOENT`.
+        let inode = if dirfd as i32 == rk_abi::native::at::AT_FDCWD {
+            Some(cx.fs()?.cwd().inode().clone())
+        } else {
+            cx.file(dirfd)?.inode().cloned()
+        };
+        let inode = inode
+            .filter(|i| i.metadata().file_type() == Some(rk_vfs::inode::FileType::Symlink))
+            .ok_or(Errno::ENOENT)?;
+        inode.read_link()?
+    } else {
+        let fs = cx.fs()?;
+        let start = cx.dir_start(&fs, dirfd, &path)?;
+        fs.read_link(&start, &path)?
+    };
     let n = target.len().min(size as usize).min(PATH_MAX);
     cx.write_bytes(buf, &target[..n])?;
     Ok(n as u64)

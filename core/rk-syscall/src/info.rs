@@ -3,6 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
 use alloc::vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::random::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
 use rk_abi::native::syscalls as nr;
@@ -12,8 +13,9 @@ use rk_abi::native::time::{
     CLOCK_THREAD_CPUTIME_ID, TIMER_ABSTIME,
 };
 use rk_abi::native::types::{
-    KernelOldTimeval, KernelTimespec, NewUtsname, Rlimit64, Rusage, Sysinfo,
+    KernelOldTimeval, KernelTimespec, KernelTimex, NewUtsname, Rlimit64, Rusage, Sysinfo,
 };
+use rk_frame::sync::SpinLock;
 use rk_frame::time::{HZ, ticks};
 use rk_proc::Restart;
 use rk_proc::exec::USER_HZ;
@@ -44,7 +46,49 @@ pub(crate) fn is_realtime(clock: u32) -> bool {
 /// Gives the time since boot of the absolute time `ns` of `clock`. The timers of the kernel use
 /// the time since boot.
 pub(crate) fn boot_ns(clock: u32, ns: u64) -> u64 {
-    if is_realtime(clock) { ns.saturating_sub(rk_frame::time::realtime_offset_ns()) } else { ns }
+    if !is_realtime(clock) {
+        return ns;
+    }
+    // The offset wraps: a clock set to a time before the time since boot makes it less than 0.
+    let offset = rk_frame::time::realtime_offset_ns() as i64;
+    (i128::from(ns) - i128::from(offset)).clamp(0, i128::from(u64::MAX)) as u64
+}
+
+/// The count of the clock sets. A sleep to an absolute time of `CLOCK_REALTIME` waits until it
+/// changes, and then computes its end again.
+static CLOCK_SETS: AtomicU64 = AtomicU64::new(0);
+/// The threads that sleep to an absolute time of `CLOCK_REALTIME`.
+static CLOCK_SET_WAIT: rk_frame::task::WaitQueue = rk_frame::task::WaitQueue::new();
+/// The time zone of `settimeofday`: the minutes west of Greenwich in the high half and the type
+/// of the daylight saving time in the low half.
+static TIMEZONE: AtomicU64 = AtomicU64::new(0);
+/// The largest second of a clock set, `TIME_SETTOD_SEC_MAX`: `KTIME_SEC_MAX` less 30 years of
+/// time since boot.
+const SETTOD_SEC_MAX: i64 = i64::MAX / NSEC_PER_SEC as i64 - 30 * 365 * 86400;
+
+/// Sets `CLOCK_REALTIME` to `ns`, as `do_settimeofday64` of Linux does. The absolute timers of the
+/// real time move, the timer files with `TFD_TIMER_CANCEL_ON_SET` see the change, and the sleeps
+/// to an absolute real time compute their end again.
+fn set_realtime(ns: u64) {
+    let delta = rk_frame::time::set_realtime_ns(ns) as i64;
+    rk_proc::timer::clock_was_set(delta);
+    crate::timerfd::clock_was_set();
+    CLOCK_SETS.fetch_add(1, Ordering::Release);
+    CLOCK_SET_WAIT.wake_all();
+}
+
+/// Checks the time of a clock set and the permission of the caller, as `do_sys_settimeofday64` of
+/// Linux does, and sets the clock.
+fn settime(cx: &Cx<'_>, ts: &KernelTimespec) -> Result<(), Errno> {
+    if !(0..SETTOD_SEC_MAX).contains(&ts.tv_sec) || !(0..NSEC_PER_SEC as i64).contains(&ts.tv_nsec)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if !cx.process().cred().capable(cap::SYS_TIME) {
+        return Err(Errno::EPERM);
+    }
+    set_realtime(timespec_ns(ts)?);
+    Ok(())
 }
 
 /// The time of `CLOCK_REALTIME`.
@@ -149,8 +193,97 @@ pub(crate) fn gettimeofday(cx: &Cx<'_>, tv: u64, tz: u64) -> SysResult {
         tv_usec: (ns % NSEC_PER_SEC / 1000) as i64,
     };
     cx.write_opt(tv, &v)?;
-    cx.write_opt(tz, &[0i32; 2])?;
+    let zone = TIMEZONE.load(Ordering::Relaxed);
+    cx.write_opt(tz, &[(zone >> 32) as i32, zone as i32])?;
     Ok(0)
+}
+
+pub(crate) fn clock_settime(cx: &Cx<'_>, clock: u64, tp: u64) -> SysResult {
+    // Only `CLOCK_REALTIME` can be set. A CPU clock of another thread or process gives `EPERM`
+    // after its checks, as `posix_cpu_clock_set` does.
+    let clock = clock as u32;
+    let cpu = (clock as i32) < 0;
+    if cpu {
+        cpu_clock_ns(cx.thread, clock as i32)?;
+    } else if clock != CLOCK_REALTIME {
+        return Err(Errno::EINVAL);
+    }
+    let ts: KernelTimespec = cx.read_val(tp)?;
+    if cpu {
+        return Err(Errno::EPERM);
+    }
+    settime(cx, &ts)?;
+    Ok(0)
+}
+
+pub(crate) fn settimeofday(cx: &Cx<'_>, tv: u64, tz: u64) -> SysResult {
+    let ts = if tv == 0 {
+        None
+    } else {
+        let v: KernelOldTimeval = cx.read_val(tv)?;
+        if !(0..=1_000_000).contains(&v.tv_usec) {
+            return Err(Errno::EINVAL);
+        }
+        Some(KernelTimespec { tv_sec: v.tv_sec, tv_nsec: v.tv_usec * 1000 })
+    };
+    let zone = if tz == 0 { None } else { Some(cx.read_val::<[i32; 2]>(tz)?) };
+    if let Some(ts) = &ts
+        && (!(0..SETTOD_SEC_MAX).contains(&ts.tv_sec) || ts.tv_nsec >= NSEC_PER_SEC as i64)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if !cx.process().cred().capable(cap::SYS_TIME) {
+        return Err(Errno::EPERM);
+    }
+    if let Some([west, dst]) = zone {
+        if !(-15 * 60..=15 * 60).contains(&west) {
+            return Err(Errno::EINVAL);
+        }
+        TIMEZONE.store((u64::from(west as u32) << 32) | u64::from(dst as u32), Ordering::Relaxed);
+    }
+    if let Some(ts) = ts {
+        settime(cx, &ts)?;
+    }
+    Ok(0)
+}
+
+/// The NTP state of the kernel.
+static NTP: SpinLock<rk_proc::ntp::Ntp> = SpinLock::new(rk_proc::ntp::Ntp::new());
+
+/// Does `adjtimex` on the `struct timex` at `buf`, as `do_adjtimex` of Linux does.
+fn do_adjtimex(cx: &Cx<'_>, buf: u64) -> SysResult {
+    let mut tx: KernelTimex = cx.read_val(buf)?;
+    rk_proc::ntp::validate(&tx, cx.process().cred().capable(cap::SYS_TIME))?;
+    if let Some(step) = rk_proc::ntp::set_offset_ns(&tx) {
+        let now = i128::from(realtime_ns()) + i128::from(step);
+        let max = i128::from(SETTOD_SEC_MAX) * i128::from(NSEC_PER_SEC);
+        if !(0..max).contains(&now) {
+            return Err(Errno::EINVAL);
+        }
+        set_realtime(now as u64);
+    }
+    let state = NTP.lock().adjtimex(&mut tx, realtime_ns());
+    cx.write_val(buf, &tx)?;
+    Ok(state as u64)
+}
+
+pub(crate) fn adjtimex(cx: &Cx<'_>, buf: u64) -> SysResult {
+    do_adjtimex(cx, buf)
+}
+
+pub(crate) fn clock_adjtime(cx: &Cx<'_>, clock: u64, buf: u64) -> SysResult {
+    // Only `CLOCK_REALTIME` has an NTP state. The other clocks that exist give `EOPNOTSUPP`.
+    match clock as u32 {
+        CLOCK_REALTIME => do_adjtimex(cx, buf),
+        c if (c as i32) < 0 => {
+            cpu_clock_ns(cx.thread, c as i32)?;
+            Err(Errno::EOPNOTSUPP)
+        }
+        c => {
+            clock_ns(cx.thread, c)?;
+            Err(Errno::EOPNOTSUPP)
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -192,12 +325,27 @@ pub(crate) fn clock_nanosleep(
         return sleep_relative(cx, uptime_ns().saturating_add(want), rem);
     }
     if flags as u32 & TIMER_ABSTIME != 0 {
-        // The end does not change, so the call can start again with the same arguments.
-        let end = boot_ns(clock, want);
-        if sleep_until(cx.thread, end.div_ceil(NSEC_PER_SEC / HZ)) {
-            return Err(Errno::ERESTARTNOHAND);
+        // The end does not change, so the call can start again with the same arguments. A clock
+        // set moves the end of a sleep to a time of the real time, so the sleep computes it
+        // again after each clock set.
+        loop {
+            let sets = CLOCK_SETS.load(Ordering::Acquire);
+            let end = boot_ns(clock, want).div_ceil(NSEC_PER_SEC / HZ);
+            let woke = CLOCK_SET_WAIT.wait_until_timeout(end, || {
+                if cx.thread.signal_pending() {
+                    Some(true)
+                } else if is_realtime(clock) && CLOCK_SETS.load(Ordering::Acquire) != sets {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            match woke {
+                Some(true) => return Err(Errno::ERESTARTNOHAND),
+                Some(false) => continue,
+                None => return Ok(0),
+            }
         }
-        return Ok(0);
     }
     sleep_relative(cx, uptime_ns().saturating_add(want), rem)
 }
@@ -235,13 +383,38 @@ fn utsname_field(s: &[u8]) -> [u8; 65] {
 pub(crate) fn uname(cx: &Cx<'_>, buf: u64) -> SysResult {
     let u = NewUtsname {
         sysname: utsname_field(b"Linux"),
-        nodename: utsname_field(b"rukernel"),
+        nodename: rk_proc::uts::hostname(),
         release: utsname_field(crate::UNAME_RELEASE.as_bytes()),
         version: utsname_field(crate::UNAME_VERSION.as_bytes()),
         machine: utsname_field(rk_frame::arch::UNAME_MACHINE.as_bytes()),
-        domainname: utsname_field(b"(none)"),
+        domainname: rk_proc::uts::domainname(),
     };
     cx.write_val(buf, &u)?;
+    Ok(0)
+}
+
+/// Reads the new name of `sethostname` or `setdomainname`, as Linux does: the permission comes
+/// first, then the length, then the copy.
+fn read_uts_name(cx: &Cx<'_>, name: u64, len: u64) -> Result<alloc::vec::Vec<u8>, Errno> {
+    if !cx.process().cred().capable(cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let len = len as i32;
+    if !(0..=rk_proc::uts::NAME_MAX as i32).contains(&len) {
+        return Err(Errno::EINVAL);
+    }
+    cx.read_bytes(name, len as usize)
+}
+
+pub(crate) fn sethostname(cx: &Cx<'_>, name: u64, len: u64) -> SysResult {
+    let name = read_uts_name(cx, name, len)?;
+    rk_proc::uts::set_hostname(&name);
+    Ok(0)
+}
+
+pub(crate) fn setdomainname(cx: &Cx<'_>, name: u64, len: u64) -> SysResult {
+    let name = read_uts_name(cx, name, len)?;
+    rk_proc::uts::set_domainname(&name);
     Ok(0)
 }
 

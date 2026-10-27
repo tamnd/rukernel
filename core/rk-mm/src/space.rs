@@ -432,15 +432,42 @@ impl AddressSpace {
     }
 
     /// Locks or unlocks the areas in `addr..addr + len`. A lock gives each page its frame, but
-    /// not with `on_fault`.
+    /// not with `on_fault`. `limit` is the most locked bytes of the space, `RLIMIT_MEMLOCK`, or
+    /// `None` if the caller has `CAP_IPC_LOCK`.
     ///
     /// # Errors
     ///
-    /// `ENOMEM` if a page of the range is not mapped, or if no frame is free.
-    pub fn mlock(&self, addr: usize, len: usize, lock: bool, on_fault: bool) -> Result<(), Errno> {
+    /// `ENOMEM` if a page of the range is not mapped, if the lock goes above `limit`, or if no
+    /// frame is free.
+    pub fn mlock(
+        &self,
+        addr: usize,
+        len: usize,
+        lock: bool,
+        on_fault: bool,
+        limit: Option<usize>,
+    ) -> Result<(), Errno> {
         let (start, end) = Self::lock_range(addr, len)?;
         {
             let mut st = self.state.lock();
+            if let Some(limit) = limit.filter(|_| lock) {
+                // As `do_mlock` of Linux: the pages that are locked already in the range do not
+                // count again.
+                let locked: usize = st.vmas.iter().filter(|v| v.locked).map(Vma::len).sum();
+                let mut want = locked.saturating_add(end - start);
+                if want > limit {
+                    let again: usize = st
+                        .vmas
+                        .iter()
+                        .filter(|v| v.locked)
+                        .map(|v| v.end.min(end).saturating_sub(v.start.max(start)))
+                        .sum();
+                    want -= again;
+                }
+                if want > limit {
+                    return Err(Errno::ENOMEM);
+                }
+            }
             if !st.vmas.covers(start, end) {
                 return Err(Errno::ENOMEM);
             }
@@ -454,19 +481,28 @@ impl AddressSpace {
 
     /// Locks each area, and with `future` each new area too. A lock gives each page its frame,
     /// but not with `on_fault`. `mlockall` calls it, and `munlockall` calls it with `lock` false.
+    /// `limit` is the most locked bytes of the space, `RLIMIT_MEMLOCK`, or `None` if the caller
+    /// has `CAP_IPC_LOCK`.
     ///
     /// # Errors
     ///
-    /// `ENOMEM` if no frame is free.
+    /// `ENOMEM` if the areas with `current` are larger than `limit`, or if no frame is free.
     pub fn mlock_all(
         &self,
         lock: bool,
         current: bool,
         future: bool,
         on_fault: bool,
+        limit: Option<usize>,
     ) -> Result<(), Errno> {
         let areas: Vec<(usize, usize)> = {
             let mut st = self.state.lock();
+            if lock
+                && current
+                && limit.is_some_and(|l| st.vmas.iter().map(Vma::len).sum::<usize>() > l)
+            {
+                return Err(Errno::ENOMEM);
+            }
             st.lock_future = lock && future;
             if current || !lock {
                 st.vmas.update_range(0, USER_END, |vma| vma.locked = lock);

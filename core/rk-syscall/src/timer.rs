@@ -194,7 +194,7 @@ pub(crate) fn timer_settime(cx: &Cx<'_>, id: u64, flags: u64, new: u64, old: u64
     } else {
         now.saturating_add(value)
     };
-    let prev = timer.arm(expires, interval);
+    let prev = timer.arm_abs(expires, interval, flags as u32 & TIMER_ABSTIME != 0);
     cx.write_opt(old, &itimerspec(prev))?;
     Ok(0)
 }

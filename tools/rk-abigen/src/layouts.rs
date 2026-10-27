@@ -29,6 +29,7 @@ const STRUCTS: &[(&str, &[&str])] = &[
             "__kernel_old_itimerval",
         ],
     ),
+    ("linux/timex.h", &["__kernel_timex"]),
     ("linux/uio.h", &["iovec"]),
     ("linux/utsname.h", &["new_utsname"]),
     ("linux/resource.h", &["rlimit", "rlimit64", "rusage"]),
@@ -156,6 +157,11 @@ fn parse_dump(text: &str) -> Result<BTreeMap<String, Layout>> {
                 continue;
             }
             let bad = || format!("struct {name}: bad layout line: {line}");
+            // An unnamed bit field, for example `int :32;` at the end of `struct timex`, only
+            // reserves space. The gap gets a padding field as each other gap does.
+            if offset.contains(':') && !rest.trim().contains(' ') {
+                continue;
+            }
             if offset.contains(':') {
                 return Err(format!("struct {name}: a bit field is not supported: {line}"));
             }
