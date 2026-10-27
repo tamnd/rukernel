@@ -1,0 +1,4 @@
+# Notes for the LTP result tables. Each line has a test name, a tab and a note.
+# report.py puts the note in the table, and the note gives the cause of the test in the work that
+# remains. Without a note, the table shows the reason from the log. A test name can have the
+# runtest file before it, as net.ipv6:ping601, when two runtest files have the same name.

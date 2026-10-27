@@ -94,6 +94,16 @@ cargo xtask boot-test fstests
 
 `tools/fstests/README.md` has the status of fstests on rukernel: the tests that pass, the tests that fail, and the features that the remaining tests need. `tools/fstests/ext4.md` and `tools/fstests/overlay.md` have the result and the description of each test.
 
+The LTP groups `syscalls`, `mm`, `sched` and `net` run outside of the boot tests, because they take a long time. `tools/ltp/build.sh --full` builds them as static musl programs in a container, and needs docker. `tools/ltp/run.py` boots the kernel in QEMU with batches of tests, with a time limit for each test, and records each result. `tools/ltp/update.sh` makes the result files again from the logs:
+
+```
+tools/ltp/build.sh --full ~/rkltp
+tools/ltp/run.py --kernel rukernel --ltp ~/rkltp/ltp --busybox busybox --jobs 2 syscalls mm sched net
+tools/ltp/update.sh
+```
+
+`tools/ltp/README.md` has the status of LTP on rukernel and the causes of the failures. `tools/ltp/syscalls.md`, `tools/ltp/mm.md`, `tools/ltp/sched.md` and `tools/ltp/net.md` have the result and the description of each test.
+
 The `alpine` and `debian` boot tests run programs that use a dynamic loader. The `alpine` test uses the Alpine mini root file system, with musl. The `debian` test uses the Debian trixie slim root file system, with glibc. Its script runs bash, coreutils, dpkg, apt and perl, and then `tests/user/nptl.c`, a pthread test that the build compiles with glibc. The build uses `cc` on an x86-64 Linux host, or `zig cc -target x86_64-linux-gnu`, or the command in `RK_GLIBC_CC`. The first run downloads each root file system and checks its SHA-256. `RK_ALPINE` and `RK_DEBIAN` give the path of a different file.
 
 The `alpine` test runs `ps`, `top` and `pgrep` of BusyBox on a `sleep` process and checks the values that they show. The test also runs strace, gdb and procps-ng if `tools/debug/build.sh` installed them. The script needs docker. It installs gdb, strace and procps-ng from Alpine, and builds a small C program with debug information. strace traces a shell pipeline with `-f`, and gdb sets a breakpoint in the program and steps it. `ps`, `top`, `pgrep` and `pidof` of procps-ng show the `sleep` process. The test finds the tools in `target/debug-tools`, or in the directory that `RK_DEBUG_TOOLS` gives:

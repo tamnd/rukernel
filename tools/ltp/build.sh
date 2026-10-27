@@ -2,10 +2,17 @@
 # Builds the LTP tests of rukernel as static musl programs, in an Alpine container.
 #
 # Usage: tools/ltp/build.sh OUT_DIR
+#        tools/ltp/build.sh --full OUT_DIR
 #
-# The script needs docker. It builds the LTP release in LTP_TAG, and only the test directories in
-# LTP_DIRS. The test programs go to OUT_DIR. `cargo xtask boot-test` finds them in target/ltp, or
-# in the directory that RK_LTP gives.
+# The script needs docker. It builds the LTP release in LTP_TAG.
+#
+# Without --full, it builds only the test directories in LTP_DIRS, and the test programs go to
+# OUT_DIR. `cargo xtask boot-test` finds them in target/ltp, or in the directory that RK_LTP gives.
+#
+# With --full, it builds all of LTP and installs it in OUT_DIR/ltp, as LTP installs itself in
+# /opt/ltp. tools/ltp/run.py runs the runtest files of this tree. OUT_DIR/notbuilt.txt has the
+# tests of the syscalls, mm, sched and net groups that have no program, because the program did
+# not build with musl. OUT_DIR/src.tar.gz has the C and shell sources of the tests for report.py.
 set -eu
 
 LTP_TAG=20260930
@@ -25,17 +32,66 @@ timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority ni
 fsmount fspick move_mount open_tree setxattr getxattr listxattr removexattr fsetxattr fgetxattr
 flistxattr fremovexattr lgetxattr llistxattr lremovexattr sendfile splice copy_file_range fadvise"
 
-out=${1:?usage: tools/ltp/build.sh OUT_DIR}
+# The runtest files of the groups that the R4 exit uses. net.* is each runtest/net.* file.
+LTP_GROUPS="syscalls mm sched net.*"
+
+full=0
+if [ "${1:-}" = "--full" ]; then
+	full=1
+	shift
+fi
+out=${1:?usage: tools/ltp/build.sh [--full] OUT_DIR}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 
 docker run --rm --platform linux/amd64 -v "$out:/out" -e LTP_TAG="$LTP_TAG" -e LTP_DIRS="$LTP_DIRS" \
-	alpine:3.20 sh -euc '
+	-e LTP_GROUPS="$LTP_GROUPS" -e FULL="$full" alpine:3.20 sh -euc '
+# The libraries are for the tests that use them. configure links with -static, so it uses a
+# library only if the library has a static archive. Without it, the test only reports TCONF.
 apk add --no-cache build-base autoconf automake linux-headers pkgconf bash git >/dev/null
+if [ "$FULL" = 1 ]; then
+	apk add --no-cache libaio-dev libcap-dev libcap-static numactl-dev keyutils-dev acl-dev \
+		acl-static libtirpc-dev libtirpc-static libmnl-dev libmnl-static >/dev/null 2>&1 ||
+		echo "ltp: some libraries are not there"
+fi
 git clone --quiet --depth 1 --branch "$LTP_TAG" https://github.com/linux-test-project/ltp /ltp
 cd /ltp
 make autotools >/dev/null
-./configure LDFLAGS=-static >/dev/null
+./configure --prefix=/opt/ltp LDFLAGS=-static >/dev/null
+if [ "$FULL" = 1 ]; then
+	# A test that does not build does not stop the build. notbuilt.txt below records it. The
+	# Makefile of a directory with subdirectories stops at the first subdirectory that fails, also
+	# with -k, so the script runs make in each directory of tests.
+	{
+		make -C lib -j"$(nproc)" && make -C libs -k -j"$(nproc)"
+		make -C testcases/lib -k -j"$(nproc)"
+		dirs=$(find testcases -name Makefile -exec grep -l generic_leaf_target {} + | xargs -n1 dirname)
+		echo "$dirs" | xargs -P"$(nproc)" -I{} make -C {} -k
+		make -k
+		echo "$dirs" | xargs -I{} make -C {} -k install
+		# testcases/lib has the shell library (tst_test.sh, tst_net.sh) and its helper programs.
+		make -C testcases/lib -k install
+		make -k install
+	} >/out/build.log 2>&1 || true
+	rm -rf /out/ltp
+	mv /opt/ltp /out/ltp
+	# report.py reads the description of each test from its source.
+	git ls-files "testcases/*.c" "testcases/*.sh" | tar -czf /out/src.tar.gz -T -
+	# The symbols make the tree 5 times larger. strip fails on a script, and that is correct.
+	find /out/ltp -type f -perm -u+x -exec strip {} + 2>/dev/null || true
+	cd /out/ltp
+	for g in $LTP_GROUPS; do
+		for f in runtest/$g; do
+			grep -v "^#" "$f" | while read -r tag cmd _; do
+				# A command that starts with a variable is a shell command.
+				case $cmd in "" | *=*) continue ;; esac
+				[ -e "testcases/bin/$cmd" ] || echo "${f#runtest/} $tag $cmd"
+			done
+		done
+	done > /out/notbuilt.txt
+	echo "$LTP_TAG" > /out/VERSION
+	exit 0
+fi
 # The compiler can crash under x86-64 emulation on an arm64 host. More runs continue the build.
 # A crash can leave an archive without some objects, so each run makes the archives again.
 build() {
