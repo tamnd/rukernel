@@ -39,6 +39,7 @@ use rk_abi::native::sockios::SIOCGIFCONF;
 use rk_abi::native::stat::S_IFSOCK;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
+use rk_vfs::wait::PollTable;
 use rk_vfs::wait::{WaitQueue, interrupted};
 use rk_vfs::{File, FileOps, Metadata, UserMemory};
 
@@ -187,6 +188,9 @@ pub trait Socket: Send + Sync {
     fn set_option(&self, level: u32, name: u32, value: &[u8]) -> Result<()>;
     /// The events of `poll`.
     fn poll(&self) -> u32;
+    /// Adds to `table` the queues that a new event of the socket wakes, as `poll_wait` of Linux.
+    /// A socket that adds no queue makes the wait use `POLL_WAIT`.
+    fn poll_wait(&self, _table: &mut PollTable) {}
     /// A count that goes up at each wake of the socket, for an edge triggered epoll entry.
     fn event_count(&self) -> u64 {
         0
@@ -276,6 +280,10 @@ impl FileOps for SocketFile {
 
     fn pollable(&self) -> bool {
         true
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        self.socket.poll_wait(table);
     }
 
     fn poll(&self, _file: &File) -> u32 {

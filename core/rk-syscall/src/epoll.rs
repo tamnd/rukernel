@@ -3,8 +3,8 @@
 //!
 //! An epoll file holds a set of entries. Each entry is one open file and the events that the
 //! program wants. A wait scans the entries with the `poll` operation of each file, as `poll`
-//! does, and waits on the poll queue of rk-vfs if no entry is ready. Linux puts an entry on a
-//! ready list when its file wakes the entry. rukernel has no such callback, so an entry with
+//! does, and waits in the queue of each file of the set if no entry is ready. Linux puts an entry
+//! on a ready list when its file wakes the entry. rukernel has no such callback, so an entry with
 //! `EPOLLET` keeps the last events and the event count of its file, and it sees an edge when a
 //! new event is true or the count changes. An entry that a wait gave goes to the end of the set,
 //! so that each ready entry comes in turn. This is the model of fs/eventpoll.c of Linux.
@@ -23,6 +23,7 @@ use rk_abi::native::open::O_RDWR;
 use rk_abi::native::types::EpollEvent;
 use rk_frame::sync::SpinLock;
 use rk_vfs::file::{File, FileOps};
+use rk_vfs::wait::{PollTable, WaitQueue};
 use zerocopy::FromZeros;
 
 /// Makes an `epoll_event`. The padding of the struct is not the same on each architecture.
@@ -150,12 +151,17 @@ struct Epoll {
     items: SpinLock<Vec<Item>>,
     /// The epoll files that hold this one, for the check of the levels.
     parents: SpinLock<Vec<Weak<File>>>,
+    /// The queue that a change of the set wakes.
+    wait: Arc<WaitQueue>,
 }
 
 impl Epoll {
     /// Gives the ready entries, at most `max`. An entry that the wait gives goes to the end of
-    /// the set.
-    fn collect(&self, max: usize) -> Vec<EpollEvent> {
+    /// the set. Adds the queue of the set and the queues of the files that it tests to `table`.
+    fn collect(&self, max: usize, mut table: Option<&mut PollTable>) -> Vec<EpollEvent> {
+        if let Some(table) = table.as_deref_mut() {
+            table.add(&self.wait);
+        }
         let mut out = Vec::new();
         let mut items = self.items.lock();
         items.retain(|i| i.file.strong_count() > 0);
@@ -165,6 +171,9 @@ impl Epoll {
                 break;
             }
             let Some(file) = item.file.upgrade() else { continue };
+            if let Some(table) = table.as_deref_mut() {
+                file.poll_wait(table);
+            }
             if let Some(events) = item.scan(&file) {
                 out.push(epoll_event(events, item.data));
                 given.push(n);
@@ -219,6 +228,15 @@ impl FileOps for Epoll {
         true
     }
 
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.wait);
+        let files: Vec<Arc<File>> =
+            self.items.lock().iter().filter_map(|i| i.file.upgrade()).collect();
+        for file in files {
+            file.poll_wait(table);
+        }
+    }
+
     fn as_any(&self) -> Option<&dyn Any> {
         Some(self)
     }
@@ -237,7 +255,11 @@ pub(crate) fn epoll_create1(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & !EPOLL_CLOEXEC != 0 {
         return Err(Errno::EINVAL);
     }
-    let ops = Epoll { items: SpinLock::new(Vec::new()), parents: SpinLock::new(Vec::new()) };
+    let ops = Epoll {
+        items: SpinLock::new(Vec::new()),
+        parents: SpinLock::new(Vec::new()),
+        wait: Arc::new(WaitQueue::new()),
+    };
     let file = File::with_ops(Arc::new(ops), None, O_RDWR);
     Ok(cx.files()?.lock().insert(file, flags & EPOLL_CLOEXEC != 0)? as u64)
 }
@@ -340,7 +362,7 @@ pub(crate) fn epoll_ctl(cx: &Cx<'_>, epfd: u64, op: u64, fd: u64, event: u64) ->
         }
         _ => return Err(Errno::EINVAL),
     }
-    rk_vfs::wait::poll_wake();
+    ep.wait.wake_all();
     Ok(0)
 }
 
@@ -353,8 +375,8 @@ fn do_wait(cx: &Cx<'_>, epfd: u64, events: u64, max: u64, deadline: Option<u64>)
     let file = epoll_file(cx, epfd)?;
     let ep = epoll_of(&file).ok_or(Errno::EINVAL)?;
     let max = max as usize;
-    let scan = || {
-        let out = ep.collect(max);
+    let scan = |table: Option<&mut PollTable>| {
+        let out = ep.collect(max, table);
         Ok((!out.is_empty()).then_some(out))
     };
     let out = wait_events(cx, deadline, scan)?.unwrap_or_default();

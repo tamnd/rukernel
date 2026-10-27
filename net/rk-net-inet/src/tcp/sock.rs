@@ -50,7 +50,7 @@ use rk_net::consts::{
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The four addresses and ports of a connection: the local address and port, then the remote
 /// address and port.
@@ -500,7 +500,7 @@ pub struct Stream {
     ino: u64,
     me: Weak<Stream>,
     state: SpinLock<Inner>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     events: AtomicU64,
 }
 
@@ -521,7 +521,7 @@ impl Stream {
             ino: rk_net::next_ino(),
             me: me.clone(),
             state: SpinLock::new(inner),
-            wait: WaitQueue::default(),
+            wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
         })
     }
@@ -529,7 +529,6 @@ impl Stream {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     /// Takes the work of a change of the connection. The caller holds the lock.
@@ -1371,6 +1370,10 @@ impl Socket for Stream {
         };
         self.flush(tx);
         Ok(())
+    }
+
+    fn poll_wait(&self, table: &mut PollTable) {
+        table.add(&self.wait);
     }
 
     fn poll(&self) -> u32 {

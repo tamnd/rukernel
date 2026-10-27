@@ -10,7 +10,7 @@
 
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::{Inode, InodeRef, Metadata, Result, SetAttr};
-use crate::wait::{WaitQueue, poll_wake};
+use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -41,7 +41,7 @@ struct State {
 struct Pipe {
     state: SpinLock<State>,
     /// The readers and the writers wait here.
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     ino: u64,
     /// The count of the events for the read end: data came or each write end closed.
     read_events: AtomicU64,
@@ -55,7 +55,6 @@ impl Pipe {
         let count = if readers { &self.read_events } else { &self.write_events };
         count.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 }
 
@@ -222,6 +221,10 @@ impl FileOps for PipeEnd {
         Some(self)
     }
 
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.pipe.wait);
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         let s = self.pipe.state.lock();
         let mut ev = 0;
@@ -337,7 +340,7 @@ fn new_pipe() -> Arc<Pipe> {
             reader_opens: 0,
             writer_opens: 0,
         }),
-        wait: WaitQueue::new(),
+        wait: Arc::new(WaitQueue::new()),
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
         read_events: AtomicU64::new(0),
         write_events: AtomicU64::new(0),

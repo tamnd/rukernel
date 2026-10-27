@@ -41,7 +41,7 @@ use rk_abi::native::socket::{
 use rk_frame::sync::SpinLock;
 use rk_vfs::cred::{self, cap};
 use rk_vfs::inode::Result;
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The size of `struct sockaddr_nl`.
 pub const ADDR_LEN: usize = 12;
@@ -123,7 +123,7 @@ pub struct NetlinkSocket {
     portid: AtomicU32,
     bound: AtomicBool,
     state: SpinLock<State>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     events: AtomicU64,
 }
 
@@ -216,7 +216,7 @@ impl NetlinkSocket {
                 flags: 0,
                 options: Options::default(),
             }),
-            wait: WaitQueue::new(),
+            wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
         });
         let mut list = SOCKETS.lock();
@@ -233,7 +233,6 @@ impl NetlinkSocket {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     /// Binds the socket to `portid`, as `netlink_insert` of Linux. Gives `EADDRINUSE` if
@@ -672,6 +671,10 @@ impl Socket for NetlinkSocket {
             s.flags &= !flag;
         }
         Ok(())
+    }
+
+    fn poll_wait(&self, table: &mut PollTable) {
+        table.add(&self.wait);
     }
 
     fn poll(&self) -> u32 {

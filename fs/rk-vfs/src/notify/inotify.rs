@@ -11,7 +11,7 @@ use super::queue::{Added, Event, Queue};
 use super::{Group, Mark, add_mark, destroy_mark, mask};
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::{InodeRef, Result};
-use crate::wait::{WaitQueue, poll_wake};
+use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::sync::{Arc, Weak};
@@ -84,7 +84,7 @@ struct State {
 pub struct Inotify {
     me: Weak<Inotify>,
     state: SpinLock<State>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     events: AtomicU64,
     /// The user that the instance and its watches count for.
     uid: u32,
@@ -94,7 +94,6 @@ impl Inotify {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     fn queue(&self, event: Event, merge: bool) {
@@ -282,7 +281,7 @@ impl InotifyFile {
                 last_wd: 0,
                 closed: false,
             }),
-            wait: WaitQueue::new(),
+            wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
             uid,
         });
@@ -336,6 +335,10 @@ impl FileOps for InotifyFile {
         let bytes = self.group.state.lock().queue.bytes() as i32;
         mem.write(arg, &bytes.to_ne_bytes())?;
         Ok(0)
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.group.wait);
     }
 
     fn poll(&self, _file: &File) -> u32 {

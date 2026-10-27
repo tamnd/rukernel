@@ -13,7 +13,7 @@ use super::{Found, Group, Mark, Object, add_object_mark, destroy_mark, mask};
 use crate::dentry::Location;
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::Result;
-use crate::wait::{WaitQueue, poll_wake};
+use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::sync::{Arc, Weak};
@@ -166,7 +166,7 @@ pub struct Fanotify {
     max_events: usize,
     state: SpinLock<State>,
     /// The readers wait here.
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     /// The tasks with a permission event wait here.
     access_wait: WaitQueue,
     events: AtomicU64,
@@ -225,7 +225,6 @@ impl Fanotify {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 
     /// Joins the event with an event of the same file in the queue, as `fanotify_merge` of
@@ -608,7 +607,7 @@ impl FanotifyFile {
                 marks: Vec::new(),
                 closed: false,
             }),
-            wait: WaitQueue::new(),
+            wait: Arc::new(WaitQueue::new()),
             access_wait: WaitQueue::new(),
             events: AtomicU64::new(0),
         });
@@ -763,6 +762,10 @@ impl FileOps for FanotifyFile {
         let bytes = (self.group.state.lock().queue.len() * META_LEN) as i32;
         mem.write(arg, &bytes.to_ne_bytes())?;
         Ok(0)
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.group.wait);
     }
 
     fn poll(&self, _file: &File) -> u32 {

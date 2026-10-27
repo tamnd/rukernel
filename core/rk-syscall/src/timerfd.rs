@@ -24,12 +24,12 @@ use rk_proc::signal::SigInfo;
 use rk_proc::timer::{Clock, Expire, Target, Timer};
 use rk_vfs::file::{File, FileOps, UserMemory, events};
 use rk_vfs::inode::Result;
-use rk_vfs::wait::{WaitQueue, poll_wake};
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The count of the expirations that no read took yet.
 struct Ticks {
     count: SpinLock<u64>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
     /// The count of the expirations, for an edge triggered epoll entry.
     events: AtomicU64,
     /// The timer has an absolute time of `CLOCK_REALTIME` and `TFD_TIMER_CANCEL_ON_SET`.
@@ -68,7 +68,6 @@ impl Ticks {
     fn wake(&self) {
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
-        poll_wake();
     }
 }
 
@@ -134,6 +133,10 @@ impl FileOps for TimerFd {
         Ok(0)
     }
 
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.ticks.wait);
+    }
+
     fn poll(&self, _file: &File) -> u32 {
         if *self.ticks.count.lock() > 0 { events::POLLIN } else { 0 }
     }
@@ -165,7 +168,7 @@ pub(crate) fn timerfd_create(cx: &Cx<'_>, clock: u64, flags: u64) -> SysResult {
     }
     let ticks = Arc::new(Ticks {
         count: SpinLock::new(0),
-        wait: WaitQueue::new(),
+        wait: Arc::new(WaitQueue::new()),
         events: AtomicU64::new(0),
         might_cancel: AtomicBool::new(false),
         canceled: AtomicBool::new(false),

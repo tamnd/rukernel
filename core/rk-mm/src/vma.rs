@@ -183,6 +183,54 @@ impl<F: Clone> VmaSet<F> {
         self.areas.insert(vma.start, vma);
     }
 
+    /// Adds an area, and joins it to an area next to it that has the same attributes, as
+    /// `vma_merge` in Linux. Only private anonymous areas join. A process that maps many anonymous
+    /// areas one after the other then has one area, so `fork` does not copy each of them.
+    ///
+    /// # Panics
+    ///
+    /// If the area is empty, is not page aligned or overlaps an area of the set.
+    pub fn insert_merged(&mut self, vma: Vma<F>) {
+        let start = vma.start;
+        self.insert(vma);
+        let mut key = start;
+        if let Some((&below, _)) = self.areas.range(..start).next_back()
+            && self.join(below, start)
+        {
+            key = below;
+        }
+        if let Some(end) = self.areas.get(&key).map(|v| v.end) {
+            self.join(key, end);
+        }
+    }
+
+    /// Joins the area at `upper` to the area at `lower`, if they touch and can join. Gives
+    /// `true` if they joined.
+    fn join(&mut self, lower: usize, upper: usize) -> bool {
+        let (Some(a), Some(b)) = (self.areas.get(&lower), self.areas.get(&upper)) else {
+            return false;
+        };
+        let same = a.end == b.start
+            && matches!((&a.backing, &b.backing), (Backing::Anon, Backing::Anon))
+            && !a.shared
+            && !b.shared
+            && !a.grows_down
+            && !b.grows_down
+            && a.prot == b.prot
+            && a.may_write == b.may_write
+            && a.locked == b.locked
+            && a.kind == b.kind;
+        if !same {
+            return false;
+        }
+        let end = b.end;
+        self.areas.remove(&upper);
+        if let Some(a) = self.areas.get_mut(&lower) {
+            a.end = end;
+        }
+        true
+    }
+
     /// Makes `start` and `end` the edges of areas, if an area contains them.
     fn split_at_edges(&mut self, start: usize, end: usize) {
         for at in [start, end] {
@@ -295,6 +343,17 @@ mod tests {
 
     fn ranges(s: &VmaSet<u32>) -> Vec<(usize, usize)> {
         s.iter().map(|v| (v.start / P, v.end / P)).collect()
+    }
+
+    #[test]
+    fn anonymous_areas_join() {
+        let mut s = set(&[(10, 20)]);
+        s.insert_merged(Vma::anon(20 * P, 30 * P, Prot::RW, VmaKind::Normal));
+        s.insert_merged(Vma::anon(5 * P, 10 * P, Prot::RW, VmaKind::Normal));
+        assert_eq!(ranges(&s), [(5, 30)]);
+        s.insert_merged(Vma::anon(30 * P, 40 * P, Prot::default(), VmaKind::Normal));
+        s.insert_merged(Vma::anon(40 * P, 50 * P, Prot::RW, VmaKind::Heap));
+        assert_eq!(ranges(&s), [(5, 30), (30, 40), (40, 50)]);
     }
 
     #[test]

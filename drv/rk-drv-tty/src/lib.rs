@@ -29,6 +29,7 @@ use rk_abi::native::types::{Termios, Winsize};
 use rk_frame::sync::SpinLock;
 use rk_vfs::device::{self, CharDevice, makedev};
 use rk_vfs::inode::Result;
+use rk_vfs::wait::PollTable;
 use rk_vfs::{File, FileOps, UserMemory, WaitQueue};
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -106,7 +107,6 @@ pub fn poll_input() {
     }
     if received {
         INPUT_WAIT.wake_all();
-        rk_vfs::wait::poll_wake();
     }
     let handler = *SIGNAL.lock();
     if let Some(send) = handler {
@@ -190,6 +190,10 @@ impl FileOps for ConsoleFile {
 
     fn pollable(&self) -> bool {
         true
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add_static(&INPUT_WAIT);
     }
 
     fn poll(&self, _file: &File) -> u32 {

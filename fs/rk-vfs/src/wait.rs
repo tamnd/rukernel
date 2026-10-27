@@ -1,12 +1,17 @@
 //! The waits of the file operations.
 //!
-//! A read of a pipe or a terminal waits until data comes, and a signal can stop the wait. `poll`
-//! and `select` wait on `POLL_WAIT`, and a file with a new event calls `poll_wake`. The
-//! process layer gives the check of the signals with `set_interrupt_check`. The queue blocks the
-//! task on the kernel of x86-64. On the other targets of R1 and on the host there are no tasks, so
-//! the queue tests the condition again in a loop.
+//! A read of a pipe or a terminal waits until data comes, and a signal can stop the wait. Each
+//! file has its own queue. `poll`, `select` and `epoll_wait` put the task in the queue of each file
+//! that they test, with a `PollTable`, as `poll_wait` of Linux does. So a new event of a file wakes
+//! only the tasks that wait for that file. A file that has no queue makes the wait use
+//! `POLL_WAIT`, and such a file calls `poll_wake` at a new event. The process layer gives the check
+//! of the signals with `set_interrupt_check`. The queue blocks the task on the kernel of x86-64. On
+//! the other targets of R1 and on the host there are no tasks, so the queue tests the condition
+//! again in a loop.
 
 use crate::inode::Result;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 
@@ -90,13 +95,109 @@ impl Default for WaitQueue {
     }
 }
 
-/// The queue of `poll` and `select`. A wait for the events of more than one file waits here, and
-/// each file that has a new event wakes it.
+/// The queue of the files that have no queue of their own. A wait of `poll` on such a file waits
+/// here, and the file calls `poll_wake` at a new event.
 pub static POLL_WAIT: WaitQueue = WaitQueue::new();
 
-/// Wakes the tasks in `poll` and `select`, because a file has a new event.
+/// Wakes the tasks in `poll` and `select` that wait for a file with no queue of its own, because
+/// such a file has a new event.
 pub fn poll_wake() {
     POLL_WAIT.wake_all();
+}
+
+/// The queues that a wait of `poll`, `select` or `epoll_wait` blocks in, as `poll_table` of Linux.
+/// The `poll_wait` operation of each file adds the queues that its events wake.
+#[derive(Default)]
+pub struct PollTable {
+    queues: Vec<QueueRef>,
+    /// The number of calls of `add` and `add_static`, also for a queue that the table has
+    /// already.
+    pub(crate) adds: usize,
+}
+
+/// A queue in a `PollTable`. The table holds the queue of a file, so the queue lives while the
+/// task is in it, also if the file closes.
+enum QueueRef {
+    Shared(Arc<WaitQueue>),
+    Static(&'static WaitQueue),
+}
+
+impl QueueRef {
+    fn get(&self) -> &WaitQueue {
+        match self {
+            Self::Shared(q) => q,
+            Self::Static(q) => q,
+        }
+    }
+}
+
+impl PollTable {
+    /// Makes an empty table.
+    pub const fn new() -> Self {
+        Self { queues: Vec::new(), adds: 0 }
+    }
+
+    fn push(&mut self, queue: &WaitQueue, make: impl FnOnce() -> QueueRef) {
+        self.adds += 1;
+        if !self.queues.iter().any(|q| core::ptr::eq(q.get(), queue)) {
+            self.queues.push(make());
+        }
+    }
+
+    /// Adds a queue of a file. A queue that the table has already is not added again.
+    pub fn add(&mut self, queue: &Arc<WaitQueue>) {
+        self.push(queue, || QueueRef::Shared(queue.clone()));
+    }
+
+    /// Adds a queue that lives for each time, as the queue of a device.
+    pub fn add_static(&mut self, queue: &'static WaitQueue) {
+        self.push(queue, || QueueRef::Static(queue));
+    }
+
+    /// The number of queues in the table.
+    pub fn len(&self) -> usize {
+        self.queues.len()
+    }
+
+    /// Tells if the table has no queue.
+    pub fn is_empty(&self) -> bool {
+        self.queues.is_empty()
+    }
+}
+
+/// Blocks the current task until `scan` gives a value, or the tick count is at `deadline`, and
+/// gives the value. Gives `None` at the deadline. A deadline of `u64::MAX` is no deadline.
+///
+/// `scan` tests the files. When it gets a table, it adds the queues of each file that it tests.
+/// The task blocks in each queue of the table, so a new event of one of the files wakes it, as
+/// `do_poll` of Linux. On the host there is no clock, so `scan` is tested one time.
+pub fn poll_wait_until<R>(
+    deadline: u64,
+    mut scan: impl FnMut(Option<&mut PollTable>) -> Option<R>,
+) -> Option<R> {
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    loop {
+        let mut table = PollTable::new();
+        if let Some(value) = scan(Some(&mut table)) {
+            return Some(value);
+        }
+        if rk_frame::time::ticks() >= deadline {
+            return None;
+        }
+        if table.is_empty() {
+            table.add_static(&POLL_WAIT);
+        }
+        let queues: Vec<&rk_frame::task::WaitQueue> =
+            table.queues.iter().map(|q| &q.get().inner).collect();
+        if let Some(value) = rk_frame::task::wait_any(&queues, deadline, || scan(None)) {
+            return Some(value);
+        }
+    }
+    #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    {
+        let _ = deadline;
+        scan(None)
+    }
 }
 
 /// The check of the process layer: it tells if a signal must stop the wait of the current task.
