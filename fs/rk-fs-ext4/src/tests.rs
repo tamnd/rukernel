@@ -1217,12 +1217,26 @@ mod log {
         assert_ne!(layout::u32_at(&ram.0.lock(), 1024 + 0x60) & layout::incompat::RECOVER, 0);
         root.create(b"after", FileType::Regular, 0o644, 0).unwrap();
         drop((file, root, fs));
-        // A file system that a read only mount made cannot become writable.
+        // A file system that a read only mount made can become writable, as Linux.
         let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), true).unwrap();
         let root = fs.root().unwrap();
         assert!(root.lookup(b"after").is_ok());
-        assert_eq!(root.set_read_only(false), Err(Errno::EROFS));
-        root.set_read_only(true).unwrap();
+        assert_eq!(layout::u32_at(&ram.0.lock(), 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        root.set_read_only(false).unwrap();
+        assert_ne!(layout::u32_at(&ram.0.lock(), 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        root.create(b"rw", FileType::Regular, 0o644, 0).unwrap();
+        drop((root, fs));
+        let disk = ram.0.lock().clone();
+        assert_eq!(layout::u32_at(&disk, 1024 + 0x60) & layout::incompat::RECOVER, 0);
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), true).unwrap();
+        assert!(fs.root().unwrap().lookup(b"rw").is_ok());
+        // A journal that the mount did not replay keeps the file system read only.
+        let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+        fs.root().unwrap().create(b"tx", FileType::Regular, 0o644, 0).unwrap();
+        let crashed = Ram(Arc::new(SpinLock::new(ram.0.lock().clone())));
+        drop(fs);
+        let ro = Fs::open_with(7, alloc::boxed::Box::new(crashed), true, crate::Replay::Skip);
+        assert_eq!(ro.unwrap().root().unwrap().set_read_only(false), Err(Errno::EROFS));
     }
 
     #[test]
@@ -1311,6 +1325,20 @@ mod log {
         drop(Fs::open(7, alloc::boxed::Box::new(crashed.clone()), false).unwrap());
         assert_eq!(crashed.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
         assert_eq!(crashed.free(), free);
+        // A read only mount also frees it, as Linux, and leaves a clean journal.
+        let crashed = Ram(Arc::new(SpinLock::new(ram.0.lock().clone())));
+        let ro = Fs::open(7, alloc::boxed::Box::new(crashed.clone()), true).unwrap();
+        assert!(!ro.writable());
+        assert_eq!(crashed.u32_at(1024 + layout::sb::LAST_ORPHAN), 0);
+        assert_eq!(crashed.u32_at(1024 + 0x60) & layout::incompat::RECOVER, 0);
+        assert_eq!(crashed.free(), free);
+        drop(ro);
+        // A read only mount with `norecovery` does not write, so the orphan stays.
+        let crashed = Ram(Arc::new(SpinLock::new(ram.0.lock().clone())));
+        let ro =
+            Fs::open_with(7, alloc::boxed::Box::new(crashed.clone()), true, crate::Replay::Skip);
+        drop(ro.unwrap());
+        assert_eq!(crashed.u32_at(1024 + layout::sb::LAST_ORPHAN), ino);
 
         drop(file);
         assert_eq!(fs.meta.lock().sb[layout::sb::LAST_ORPHAN], 0);

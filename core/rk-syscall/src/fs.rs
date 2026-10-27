@@ -152,7 +152,17 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
         );
     }
     let count = fsize_count(cx, &file, write_pos(&file), count)?;
-    sigpipe(cx, write_with(cx, buf, count, |_, b| file.write(b)))
+    sigpipe(cx, write_sync(&file, write_with(cx, buf, count, |_, b| file.write(b))))
+}
+
+/// Makes a write that wrote some bytes durable for `O_SYNC`, `O_DSYNC` and `S_SYNC`, as
+/// `generic_write_sync` of Linux. An error of the sync replaces the count.
+pub(crate) fn write_sync(file: &File, r: SysResult) -> SysResult {
+    let done = r?;
+    if done > 0 {
+        file.write_sync()?;
+    }
+    Ok(done)
 }
 
 /// Gives the bytes of a write of `count` bytes at `pos` that `RLIMIT_FSIZE` lets a regular file
@@ -226,7 +236,7 @@ pub(crate) fn pwrite(cx: &Cx<'_>, fd: u64, buf: u64, count: u64, offset: u64) ->
     // A file with `O_APPEND` takes the write at the end, as `generic_write_checks` of Linux.
     let offset = if file.flags().append() { write_pos(&file) } else { offset };
     let count = fsize_count(cx, &file, offset, count)?;
-    write_with(cx, buf, count, |done, b| file.write_at(offset + done, b))
+    write_sync(&file, write_with(cx, buf, count, |done, b| file.write_at(offset + done, b)))
 }
 
 pub(crate) fn read_iovecs(
@@ -406,8 +416,9 @@ pub(crate) fn pwritev2(
     };
     if flags & (rwf::DSYNC | rwf::SYNC) != 0 && done > 0 {
         file.sync()?;
+        return Ok(done);
     }
-    Ok(done)
+    write_sync(&file, Ok(done))
 }
 
 /// Checks the flags of `preadv2` or `pwritev2`, as `kiocb_set_rw_flags` of Linux. The file
@@ -452,7 +463,7 @@ pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
             break;
         }
     }
-    Ok(done)
+    write_sync(&file, Ok(done))
 }
 
 pub(crate) fn openat(cx: &Cx<'_>, dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {

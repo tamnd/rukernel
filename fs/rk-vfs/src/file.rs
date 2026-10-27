@@ -170,6 +170,11 @@ impl OpenFlags {
     pub fn nonblock(self) -> bool {
         self.0 & o::O_NONBLOCK != 0
     }
+
+    /// `O_DSYNC`, which `O_SYNC` also has.
+    pub fn dsync(self) -> bool {
+        self.0 & o::O_DSYNC != 0
+    }
 }
 
 /// An open file description.
@@ -1046,6 +1051,17 @@ impl File {
             inode.sync()?;
         }
         self.ops.sync()
+    }
+
+    /// Makes a write durable before it returns when the file has `O_DSYNC` or `O_SYNC`, or the
+    /// inode has the flag `S_SYNC`, as `generic_write_sync` of Linux. The new data and the new
+    /// size go to the journal, so a crash after the write keeps them.
+    pub fn write_sync(&self) -> Result<()> {
+        let flag = self.inode.as_ref().map_or(0, |i| i.attr_flags().unwrap_or(0));
+        if self.flags().dsync() || flag & crate::inode::iflags::SYNC != 0 {
+            self.sync()?;
+        }
+        Ok(())
     }
 
     /// Does a batch of reads and writes at offsets. An entry gets `EBADF` if the file is not open

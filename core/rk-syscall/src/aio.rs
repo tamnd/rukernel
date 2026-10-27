@@ -260,7 +260,8 @@ fn run(cx: &Cx<'_>, items: &[Item]) -> Vec<SysResult> {
                 i += 1;
             }
             Work::Rw { file, write, offset, iov } if !small(item) => {
-                results.push(run_large(cx, file, *write, *offset, iov));
+                let r = run_large(cx, file, *write, *offset, iov);
+                results.push(if *write { crate::fs::write_sync(file, r) } else { r });
                 i += 1;
             }
             Work::Rw { file, .. } => {
@@ -300,7 +301,7 @@ fn run(cx: &Cx<'_>, items: &[Item]) -> Vec<SysResult> {
                     let Work::Rw { iov, .. } = &group[k].work else { unreachable!() };
                     out[k] = match io.result {
                         Ok(n) if !io.write => scatter(cx, iov, &io.buf[..n]).map(|()| n as u64),
-                        Ok(n) => Ok(n as u64),
+                        Ok(n) => crate::fs::write_sync(file, Ok(n as u64)),
                         Err(e) => Err(e),
                     };
                 }
