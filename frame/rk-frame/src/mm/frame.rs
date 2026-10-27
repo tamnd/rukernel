@@ -4,7 +4,7 @@ use super::bitmap::FrameBitmap;
 use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
-use crate::sync::SpinLock;
+use crate::sync::{Once, SpinLock};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 /// The allocator manages physical memory below this address. 64 GiB needs a bitmap of 2 MiB.
@@ -85,12 +85,23 @@ pub fn frame_stats() -> FrameStats {
 #[derive(Debug)]
 pub struct Frame {
     phys: u64,
+    /// The memory cgroup that the page is charged to, or 0.
+    memcg: u32,
+}
+
+/// The function that removes the charge of a frame from its memory cgroup.
+static UNCHARGE: Once<fn(u32)> = Once::new();
+
+/// Sets the function that removes the charge of a frame from its memory cgroup, when a frame with
+/// a cgroup goes back to the allocator. Only the first call has an effect.
+pub fn set_uncharge_hook(f: fn(u32)) {
+    UNCHARGE.call_once(|| f);
 }
 
 /// Takes a free frame. The contents of the frame are not defined.
 pub fn alloc_frame() -> Option<Frame> {
     let frame = FRAMES.lock().alloc()?;
-    Some(Frame { phys: (frame * PAGE_SIZE) as u64 })
+    Some(Frame { phys: (frame * PAGE_SIZE) as u64, memcg: 0 })
 }
 
 /// Takes a free frame and fills it with zeros.
@@ -103,6 +114,12 @@ pub fn alloc_zeroed_frame() -> Option<Frame> {
 impl Frame {
     /// The number of 8 byte words in a frame.
     pub const WORDS: usize = PAGE_SIZE / 8;
+
+    /// Marks the frame as charged to the memory cgroup `memcg`. The charge goes away with the
+    /// frame, through the function of `set_uncharge_hook`.
+    pub fn set_memcg(&mut self, memcg: u32) {
+        self.memcg = memcg;
+    }
 
     /// The physical address of the frame.
     pub fn addr(&self) -> PhysAddr {
@@ -216,6 +233,11 @@ impl Frame {
 
 impl Drop for Frame {
     fn drop(&mut self) {
+        if self.memcg != 0
+            && let Some(f) = UNCHARGE.get()
+        {
+            f(self.memcg);
+        }
         FRAMES.lock().free(self.phys as usize / PAGE_SIZE);
     }
 }

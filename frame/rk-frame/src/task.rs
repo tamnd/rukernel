@@ -97,6 +97,9 @@ pub trait Scheduler: Sync {
     fn set_affinity(&self, _task: &Task, _mask: u64) -> Option<usize> {
         None
     }
+    /// Puts the task in the group `group`, the cgroup of its thread. The scheduler charges the
+    /// run time of the task to the group, and the group can change the share of the task.
+    fn set_group(&self, _task: &Task, _group: u32) {}
 }
 
 static SCHEDULER: Once<&'static dyn Scheduler> = Once::new();
@@ -231,6 +234,7 @@ pub struct TaskOptions {
     nice: i32,
     idle: bool,
     affinity: u64,
+    group: u32,
 }
 
 impl TaskOptions {
@@ -242,6 +246,7 @@ impl TaskOptions {
             nice: 0,
             idle: false,
             affinity: u64::MAX,
+            group: 0,
         }
     }
 
@@ -256,6 +261,12 @@ impl TaskOptions {
     /// Sets the CPUs that the task can use. See `Scheduler::set_affinity`.
     pub fn affinity(mut self, mask: u64) -> Self {
         self.affinity = mask;
+        self
+    }
+
+    /// Sets the group of the task. See `Scheduler::set_group`.
+    pub fn group(mut self, group: u32) -> Self {
+        self.group = group;
         self
     }
 
@@ -279,6 +290,7 @@ impl TaskOptions {
             sched: Once::new(),
             _stack: Some(stack),
         });
+        scheduler().set_group(&task, self.group);
         scheduler().set_nice(&task, self.nice, self.idle);
         scheduler().set_affinity(&task, self.affinity);
         kick(scheduler().enqueue(task.clone(), Enqueue::New));
@@ -366,6 +378,11 @@ pub fn set_affinity(task: &Task, mask: u64) {
     if let Some(id) = scheduler().set_affinity(task, mask) {
         kick(id);
     }
+}
+
+/// Puts `task` in the group `group`. See `Scheduler::set_group`.
+pub fn set_group(task: &Task, group: u32) {
+    scheduler().set_group(task, group);
 }
 
 /// Lets the next task run. The current task stays runnable, so it runs again later.

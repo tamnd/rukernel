@@ -25,6 +25,7 @@ pub(crate) fn init(boot: &BootInfo) {
     {
         rk_vfs::fstype::register(rk_fs_proc::FS_TYPE);
         rk_vfs::fstype::register(rk_fs_sys::FS_TYPE);
+        rk_vfs::fstype::register(rk_fs_cgroup::FS_TYPE);
         rk_fs_proc::set_kernel_info(rk_fs_proc::KernelInfo {
             release: rk_syscall::UNAME_RELEASE,
             version: rk_syscall::UNAME_VERSION,

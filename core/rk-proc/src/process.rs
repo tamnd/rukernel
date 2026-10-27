@@ -166,6 +166,10 @@ pub struct Process {
     /// The tracer of the leader thread after the leader ended. The tracer gets the exit of the
     /// process.
     leader_tracer: SpinLock<Weak<Process>>,
+    /// The cgroup of the process. All the threads of a process are in one cgroup.
+    cgroup: AtomicU32,
+    /// The cgroup namespace of the process, or 0 for the namespace of the system.
+    cgns: AtomicU32,
     /// The process keyring and the session keyring.
     keys: SpinLock<ProcessKeys>,
 }
@@ -401,7 +405,43 @@ impl Process {
     /// Puts a new address space in the process, for `execve`, and gives the old one.
     pub fn replace_vm(&self, vm: Arc<AddressSpace>) -> Option<Arc<AddressSpace>> {
         self.membarrier.store(0, Ordering::Relaxed);
+        vm.set_memcg(self.memcg());
         self.vm.lock().replace(vm)
+    }
+
+    /// The cgroup of the process.
+    pub fn cgroup(&self) -> u32 {
+        self.cgroup.load(Ordering::Relaxed)
+    }
+
+    /// The memory cgroup that the new pages of the process go to, or 0 for no charge. The pages
+    /// of the root cgroup have no charge, as in Linux.
+    pub fn memcg(&self) -> u32 {
+        let cg = self.cgroup();
+        if cg == rk_cgroup::ROOT { 0 } else { cg }
+    }
+
+    /// Moves the process to the cgroup `to` in the hierarchy, and gives its threads. The lock of
+    /// the state keeps the number of threads stable during the move.
+    pub(crate) fn move_cgroup(&self, to: u32) -> Result<Vec<Arc<Thread>>, Errno> {
+        let s = self.state.lock();
+        if s.threads.is_empty() {
+            return Err(Errno::ESRCH);
+        }
+        let from = self.cgroup();
+        rk_cgroup::with(|h| h.migrate(from, to, s.threads.len() as u64))?;
+        self.cgroup.store(to, Ordering::Relaxed);
+        Ok(s.threads.clone())
+    }
+
+    /// The cgroup namespace of the process, or 0 for the namespace of the system.
+    pub fn cgroup_ns(&self) -> u32 {
+        self.cgns.load(Ordering::Relaxed)
+    }
+
+    /// Puts the process in the cgroup namespace `ns`, for `CLONE_NEWCGROUP` and `setns`.
+    pub fn set_cgroup_ns(&self, ns: u32) {
+        self.cgns.store(ns, Ordering::Relaxed);
     }
 
     /// The `membarrier` commands that the registrations of the process allow.
@@ -674,6 +714,8 @@ impl Process {
             child_ticks: AtomicU64::new(0),
             leader_tracer: SpinLock::new(Weak::new()),
             keys: SpinLock::new(ProcessKeys::default()),
+            cgroup: AtomicU32::new(rk_cgroup::ROOT),
+            cgns: AtomicU32::new(0),
         })
     }
 }
@@ -773,6 +815,18 @@ impl Thread {
         self.task.lock().upgrade()
     }
 
+    /// The CPUs that the thread can run on: its affinity mask and the CPUs of the cpuset of its
+    /// cgroup. If the two have no CPU in common, the cpuset wins, as in Linux.
+    pub fn allowed_cpus(&self) -> u64 {
+        let affinity = self.sched().affinity;
+        let cpus = rk_cgroup::with(|h| h.effective_cpus(self.process.cgroup()));
+        match cpus {
+            0 => affinity,
+            c if affinity & c == 0 => c,
+            c => affinity & c,
+        }
+    }
+
     /// The scheduling values.
     pub fn sched(&self) -> SchedParams {
         *self.sched.lock()
@@ -785,7 +839,7 @@ impl Thread {
         if let Some(task) = self.task() {
             let (nice, idle) = params.share();
             rk_frame::task::set_nice(&task, nice, idle);
-            rk_frame::task::set_affinity(&task, params.affinity);
+            rk_frame::task::set_affinity(&task, self.allowed_cpus());
         }
     }
 
@@ -1107,6 +1161,10 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
     process.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&process));
     table.threads.insert(pid, Arc::downgrade(&thread));
+    drop(table);
+    // The root cgroup has no limits, so the charge cannot fail.
+    let _ = rk_cgroup::charge_thread(rk_cgroup::ROOT);
+    rk_cgroup::with(|h| h.add_process(rk_cgroup::ROOT));
     Ok(thread)
 }
 
@@ -1124,6 +1182,8 @@ pub struct ForkShare {
     /// `CLONE_PARENT`: the child gets the parent of the caller, and the exit signal of the
     /// caller.
     pub parent: bool,
+    /// `CLONE_INTO_CGROUP`: the cgroup of the child. `None` gives the cgroup of the caller.
+    pub cgroup: Option<u32>,
 }
 
 /// Makes a child process of the process of `parent`, for `fork` and `clone` without
@@ -1131,8 +1191,25 @@ pub struct ForkShare {
 ///
 /// # Errors
 ///
-/// Gives `ENOMEM` if no memory is free, or `EAGAIN` if no process ID is free.
+/// Gives `ENOMEM` if no memory is free, or `EAGAIN` if no process ID is free or the `pids.max`
+/// of a cgroup does not allow one more thread. `CLONE_INTO_CGROUP` gives the errors of
+/// `Hierarchy::can_attach`.
 pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
+    let pp = &parent.process;
+    let cgroup = share.cgroup.unwrap_or_else(|| pp.cgroup());
+    if share.cgroup.is_some() {
+        rk_cgroup::with(|h| h.can_attach(cgroup))?;
+    }
+    rk_cgroup::charge_thread(cgroup)?;
+    let child = fork_charged(parent, share, cgroup);
+    if child.is_err() {
+        rk_cgroup::uncharge_thread(cgroup);
+    }
+    child
+}
+
+/// Does the work of `fork` after the charge of the new thread to `cgroup`.
+fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Thread>, Errno> {
     let pp = &parent.process;
     let vm = pp.vm().ok_or(Errno::ESRCH)?;
     let vm = if share.vm { vm } else { Arc::new(vm.fork()?) };
@@ -1171,6 +1248,13 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
     // The child shares the session keyring. It has no thread keyring and no process keyring.
     child.keys.lock().session = pp.keys.lock().session.clone();
     child.set_oom_score_adj(pp.oom_score_adj());
+    child.cgroup.store(cgroup, Ordering::Relaxed);
+    child.set_cgroup_ns(pp.cgroup_ns());
+    if !share.vm
+        && let Some(vm) = child.vm()
+    {
+        vm.set_memcg(child.memcg());
+    }
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     thread.inherit_seccomp(parent);
     *thread.sched.lock() = parent.sched().forked();
@@ -1179,6 +1263,7 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
     drop(table);
+    rk_cgroup::with(|h| h.add_process(cgroup));
     owner.state.lock().children.push(child);
     Ok(thread)
 }
@@ -1188,11 +1273,21 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
 ///
 /// # Errors
 ///
-/// Gives `EAGAIN` if no thread ID is free.
+/// Gives `EAGAIN` if no thread ID is free or the `pids.max` of a cgroup does not allow one more
+/// thread.
 pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     let process = thread.process.clone();
+    let cgroup = process.cgroup();
+    rk_cgroup::charge_thread(cgroup)?;
     let mut table = TABLE.lock();
-    let tid = alloc_pid(&mut table)?;
+    let tid = match alloc_pid(&mut table) {
+        Ok(tid) => tid,
+        Err(e) => {
+            drop(table);
+            rk_cgroup::uncharge_thread(cgroup);
+            return Err(e);
+        }
+    };
     let new = Thread::new(tid, process.clone(), thread.blocked());
     new.inherit_seccomp(thread);
     *new.sched.lock() = thread.sched().forked();
@@ -1485,7 +1580,17 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         let mut s = process.state.lock();
         s.threads.retain(|t| t.tid != thread.tid);
         process.dead_ticks.fetch_add(thread.user_ticks(), Ordering::Relaxed);
-        s.threads.is_empty()
+        // The thread leaves its cgroup with the lock held, so a move of the process counts the
+        // threads that stay.
+        let cgroup = process.cgroup();
+        let last = s.threads.is_empty();
+        rk_cgroup::with(|h| {
+            h.uncharge_pids(cgroup, 1);
+            if last {
+                h.remove_process(cgroup);
+            }
+        });
+        last
     };
     if !last {
         process.thread_exit.wake_all();

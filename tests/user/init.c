@@ -70,6 +70,10 @@
 #define AUDIT_ARCH_NATIVE AUDIT_ARCH_X86_64
 #endif
 
+#ifndef CLONE_INTO_CGROUP
+#define CLONE_INTO_CGROUP 0x200000000ULL
+#endif
+
 static int failed;
 
 static void check(const char *name, int ok)
@@ -3797,6 +3801,213 @@ static void test_inet(int port)
 }
 
 
+/* Writes the text `s` to the file `path`. Gives 0, or -1 with errno set. */
+static int cg_write(const char *path, const char *s)
+{
+	int fd = open(path, O_WRONLY);
+	ssize_t n;
+	int e;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, s, strlen(s));
+	e = errno;
+	close(fd);
+	errno = e;
+	return n == (ssize_t)strlen(s) ? 0 : -1;
+}
+
+/* Makes a child that moves to the cgroup `cg` and calls `fn`. The child exits with the value of
+ * `fn`, or 100 if the move fails. Gives the pid of the child. */
+static pid_t cgroup_child(const char *cg, int (*fn)(void))
+{
+	char path[64];
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		snprintf(path, sizeof(path), "%s/cgroup.procs", cg);
+		_exit(cg_write(path, "0") == 0 ? fn() : 100);
+	}
+	return pid;
+}
+
+/* Gives the exit status of the child `pid`, or -1. */
+static int wait_status(pid_t pid)
+{
+	int status;
+
+	if (pid < 0 || waitpid(pid, &status, 0) != pid)
+		return -1;
+	return status;
+}
+
+static int cg_fork_twice(void)
+{
+	pid_t pid = fork();
+
+	if (pid == 0)
+		_exit(0);
+	if (pid > 0) {
+		waitpid(pid, NULL, 0);
+		return 1;
+	}
+	return errno == EAGAIN ? 0 : 2;
+}
+
+static int cg_busy(void)
+{
+	struct timespec a, b;
+
+	clock_gettime(CLOCK_MONOTONIC, &a);
+	do
+		clock_gettime(CLOCK_MONOTONIC, &b);
+	while ((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) < 1000000000L);
+	return 0;
+}
+
+static int cg_eat(void)
+{
+	size_t len = 32 << 20;
+	char *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (p == MAP_FAILED)
+		return 2;
+	for (size_t i = 0; i < len; i += 4096)
+		p[i] = 1;
+	return 0;
+}
+
+static int cg_spin(void)
+{
+	for (;;)
+		;
+	return 0;
+}
+
+static int cg_unshare(void)
+{
+	char buf[64];
+
+	if (unshare(CLONE_NEWCGROUP) != 0)
+		return 2;
+	return read_file("/proc/self/cgroup", buf, sizeof(buf)) > 0 && strcmp(buf, "0::/\n") == 0 ? 0 : 3;
+}
+
+/* Reads the number after `key` in the file `path`, or -1. */
+static long cg_value(const char *path, const char *key)
+{
+	char buf[1024];
+	char *p;
+
+	if (read_file(path, buf, sizeof(buf)) <= 0 || (p = strstr(buf, key)) == NULL)
+		return -1;
+	return atol(p + strlen(key));
+}
+
+static void test_cgroup(void)
+{
+	struct statfs sfs;
+	struct clone_args args;
+	char buf[512], want[64];
+	pid_t pid;
+	int status, fd;
+
+	mount("proc", "/proc", "proc", 0, NULL);
+	mkdir("/cg", 0755);
+	check("mount cgroup2", mount("none", "/cg", "cgroup2", 0, NULL) == 0);
+	check("statfs of cgroup2 gives CGROUP2_SUPER_MAGIC", statfs("/cg", &sfs) == 0 && sfs.f_type == 0x63677270);
+	check("the root has the controllers", read_file("/cg/cgroup.controllers", buf, sizeof(buf)) > 0 &&
+						      strcmp(buf, "cpuset cpu memory pids\n") == 0);
+	check("/proc/self/cgroup is the root", read_file("/proc/self/cgroup", buf, sizeof(buf)) > 0 &&
+						       strcmp(buf, "0::/\n") == 0);
+	check("/proc/cgroups has memory", read_file("/proc/cgroups", buf, sizeof(buf)) > 0 &&
+						  strstr(buf, "\nmemory\t0\t") != NULL);
+	check("/proc/pressure/cpu has the averages",
+	      read_file("/proc/pressure/cpu", buf, sizeof(buf)) > 0 && strncmp(buf, "some avg10=", 11) == 0 &&
+		      strstr(buf, "\nfull avg10=") != NULL);
+	check("cgroup.subtree_control enables controllers",
+	      cg_write("/cg/cgroup.subtree_control", "+cpu +memory +pids") == 0);
+	check("mkdir makes a cgroup", mkdir("/cg/t", 0755) == 0 && mkdir("/cg/t/a", 0755) == 0);
+	check("a child cgroup has memory.max", access("/cg/t/memory.max", F_OK) == 0);
+	check("cpu.weight takes a value", cg_write("/cg/t/cpu.weight", "200") == 0 &&
+						  read_file("/cg/t/cpu.weight", buf, sizeof(buf)) > 0 &&
+						  strcmp(buf, "200\n") == 0);
+
+	pid = fork();
+	if (pid == 0)
+		for (;;)
+			pause();
+	snprintf(want, sizeof(want), "%d", pid);
+	check("cgroup.procs moves a process", cg_write("/cg/t/cgroup.procs", want) == 0);
+	strcat(want, "\n");
+	check("cgroup.procs lists the process", read_file("/cg/t/cgroup.procs", buf, sizeof(buf)) > 0 &&
+							strcmp(buf, want) == 0);
+	snprintf(want, sizeof(want), "/proc/%d/cgroup", pid);
+	check("/proc/PID/cgroup gives the path", read_file(want, buf, sizeof(buf)) > 0 && strcmp(buf, "0::/t\n") == 0);
+	check("cgroup.events tells populated", cg_value("/cg/t/cgroup.events", "populated ") == 1);
+	check("rmdir of a cgroup with a process gives EBUSY", rmdir("/cg/t/a") == 0 && rmdir("/cg/t") == -1 &&
+								      errno == EBUSY);
+	mkdir("/cg/t/a", 0755);
+	check("no internal processes: subtree_control gives EBUSY",
+	      cg_write("/cg/t/cgroup.subtree_control", "+pids") == -1 && errno == EBUSY);
+	kill(pid, SIGKILL);
+	wait_status(pid);
+	check("cgroup.events tells empty", cg_value("/cg/t/cgroup.events", "populated ") == 0);
+	check("cgroup.subtree_control of an empty cgroup",
+	      cg_write("/cg/t/cgroup.subtree_control", "+cpu +memory +pids") == 0);
+	check("no internal processes: cgroup.procs gives EBUSY",
+	      cg_write("/cg/t/cgroup.procs", "1") == -1 && errno == EBUSY);
+
+	cg_write("/cg/t/a/pids.max", "1");
+	status = wait_status(cgroup_child("/cg/t/a", cg_fork_twice));
+	check("pids.max gives EAGAIN", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("pids.events counts the limit", cg_value("/cg/t/a/pids.events", "max ") >= 1);
+	cg_write("/cg/t/a/pids.max", "max");
+
+	cg_write("/cg/t/a/cpu.max", "10000 100000");
+	status = wait_status(cgroup_child("/cg/t/a", cg_busy));
+	long usage = cg_value("/cg/t/a/cpu.stat", "usage_usec ");
+	check("cpu.max limits a busy loop", WIFEXITED(status) && WEXITSTATUS(status) == 0 && usage > 0 &&
+						    usage < 500000 &&
+						    cg_value("/cg/t/a/cpu.stat", "nr_throttled ") > 0);
+	check("cpu.pressure counts the throttle", cg_value("/cg/t/a/cpu.pressure", "total=") > 0);
+	cg_write("/cg/t/a/cpu.max", "max");
+
+	check("memory.max takes a size", cg_write("/cg/t/a/memory.max", "4M") == 0);
+	status = wait_status(cgroup_child("/cg/t/a", cg_eat));
+	check("memory.max gives an OOM kill", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL &&
+						      cg_value("/cg/t/a/memory.events", "oom_kill ") >= 1);
+	cg_write("/cg/t/a/memory.max", "max");
+
+	pid = cgroup_child("/cg/t/a", cg_spin);
+	usleep(100000);
+	check("cgroup.freeze freezes", cg_write("/cg/t/a/cgroup.freeze", "1") == 0 &&
+					       cg_value("/cg/t/a/cgroup.events", "frozen ") == 1);
+	cg_write("/cg/t/a/cgroup.freeze", "0");
+	check("cgroup.kill kills the processes", cg_write("/cg/t/a/cgroup.kill", "1") == 0 &&
+							 (status = wait_status(pid), WIFSIGNALED(status)) &&
+							 WTERMSIG(status) == SIGKILL);
+
+	fd = open("/cg/t/a", O_RDONLY | O_DIRECTORY);
+	memset(&args, 0, sizeof(args));
+	args.flags = CLONE_INTO_CGROUP;
+	args.exit_signal = SIGCHLD;
+	args.cgroup = fd;
+	pid = syscall(SYS_clone3, &args, sizeof(args));
+	if (pid == 0)
+		_exit(read_file("/proc/self/cgroup", buf, sizeof(buf)) > 0 && strcmp(buf, "0::/t/a\n") == 0 ? 0 : 1);
+	status = wait_status(pid);
+	check("clone3 with CLONE_INTO_CGROUP", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(fd);
+	status = wait_status(cgroup_child("/cg/t/a", cg_unshare));
+	check("CLONE_NEWCGROUP makes the cgroup the root", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	check("rmdir removes the cgroups", rmdir("/cg/t/a") == 0 && rmdir("/cg/t") == 0);
+	umount("/cg");
+	rmdir("/cg");
+	umount("/proc");
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
@@ -3849,6 +4060,7 @@ int main(int argc, char **argv)
 	test_mqueue();
 	test_unix();
 	test_proc_ptrace();
+	test_cgroup();
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)

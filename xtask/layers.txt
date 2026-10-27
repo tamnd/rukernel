@@ -8,6 +8,7 @@ rk-frame  0
 rk-abi    0
 rk-lib    0
 rk-sched  1
+rk-cgroup 1
 rk-mm     1
 rk-proc   2
 rk-vfs    2
@@ -15,6 +16,7 @@ rk-block  2
 rk-net    2
 rk-fs-proc 3
 rk-fs-sys 3
+rk-fs-cgroup 3
 rk-fs-overlay 3
 rk-fs-ext4 3
 rk-fs-tmpfs 3

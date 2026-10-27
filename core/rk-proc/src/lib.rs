@@ -26,6 +26,8 @@ pub mod uts;
 pub mod wait;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod cgroup;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod exec;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod process;

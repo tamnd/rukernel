@@ -8,6 +8,7 @@ use crate::vma::{Backing, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{Frame, alloc_zeroed_frame};
@@ -72,7 +73,7 @@ impl MmFile for SharedAnon {
         if let Some(frame) = pages.get(&index) {
             return Ok(frame.clone());
         }
-        let frame = anon_frame()?;
+        let frame = anon_frame(0)?;
         pages.insert(index, frame.clone());
         Ok(frame)
     }
@@ -188,6 +189,8 @@ struct State {
 pub struct AddressSpace {
     vm: VmSpace,
     state: SpinLock<State>,
+    /// The memory cgroup that the new anonymous pages are charged to, or 0 for none.
+    memcg: AtomicU32,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -226,7 +229,18 @@ impl AddressSpace {
     pub fn new() -> Result<Self, Errno> {
         let vm = VmSpace::new().ok_or(Errno::ENOMEM)?;
         let state = State { vmas: VmaSet::new(), brk_start: 0, brk: 0, lock_future: false };
-        Ok(Self { vm, state: SpinLock::new(state) })
+        Ok(Self { vm, state: SpinLock::new(state), memcg: AtomicU32::new(0) })
+    }
+
+    /// Sets the memory cgroup that the new anonymous pages are charged to. The pages that the
+    /// space has keep their charge, as in Linux.
+    pub fn set_memcg(&self, memcg: u32) {
+        self.memcg.store(memcg, Ordering::Relaxed);
+    }
+
+    /// The memory cgroup of the new anonymous pages.
+    pub fn memcg(&self) -> u32 {
+        self.memcg.load(Ordering::Relaxed)
     }
 
     /// The page table.
@@ -740,7 +754,7 @@ impl AddressSpace {
         match self.vm.page(at) {
             None => {
                 let (frame, exclusive) = match &vma.backing {
-                    Backing::Anon => (anon_frame()?, true),
+                    Backing::Anon => (anon_frame(self.memcg())?, true),
                     Backing::File { file, offset } => {
                         let index = file_index(vma, *offset, page);
                         let frame = file.page(index)?;
@@ -752,7 +766,7 @@ impl AddressSpace {
                         } else if !write {
                             (frame, false)
                         } else {
-                            (copy_frame(&frame)?, true)
+                            (copy_frame(&frame, self.memcg())?, true)
                         }
                     }
                 };
@@ -780,7 +794,7 @@ impl AddressSpace {
                     self.vm.protect(at, page_prot(vma, true));
                     return Ok(());
                 }
-                let copy = copy_frame(&frame)?;
+                let copy = copy_frame(&frame, self.memcg())?;
                 drop(frame);
                 self.vm.unmap(at);
                 self.vm.map(at, copy, page_prot(vma, true)).map_err(map_error)
@@ -905,7 +919,7 @@ impl AddressSpace {
             }
             let page = VirtAddr::new(at & !(PAGE_SIZE - 1));
             let (frame, _) = self.vm.page(page).ok_or(Errno::EFAULT)?;
-            let copy = copy_frame(&frame)?;
+            let copy = copy_frame(&frame, self.memcg())?;
             drop(frame);
             copy.write_bytes(offset, chunk);
             self.vm.unmap(page);
@@ -1021,12 +1035,25 @@ fn write_back(vma: &Vma<FileRef>, start: usize, end: usize) -> Result<(), Errno>
     }
 }
 
-fn anon_frame() -> Result<Arc<Frame>, Errno> {
-    alloc_zeroed_frame().map(Arc::new).ok_or(Errno::ENOMEM)
+/// Charges a page to the memory cgroup `memcg`, and marks `frame` with the charge. A frame that
+/// is not there or a charge past the limit gives `ENOMEM`.
+fn charged(frame: Option<Frame>, memcg: u32) -> Result<Arc<Frame>, Errno> {
+    let mut frame = frame.ok_or(Errno::ENOMEM)?;
+    if memcg != 0 {
+        rk_cgroup::charge_page(memcg).map_err(|_| Errno::ENOMEM)?;
+        frame.set_memcg(memcg);
+    }
+    Ok(Arc::new(frame))
 }
 
-fn copy_frame(from: &Frame) -> Result<Arc<Frame>, Errno> {
-    let frame = rk_frame::mm::alloc_frame().ok_or(Errno::ENOMEM)?;
+/// A new anonymous page with zeros, charged to the memory cgroup `memcg`.
+fn anon_frame(memcg: u32) -> Result<Arc<Frame>, Errno> {
+    charged(alloc_zeroed_frame(), memcg)
+}
+
+/// A copy of `from` for copy on write, charged to the memory cgroup `memcg`.
+fn copy_frame(from: &Frame, memcg: u32) -> Result<Arc<Frame>, Errno> {
+    let frame = charged(rk_frame::mm::alloc_frame(), memcg)?;
     frame.copy_from(from);
-    Ok(Arc::new(frame))
+    Ok(frame)
 }
