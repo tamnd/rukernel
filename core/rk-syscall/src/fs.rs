@@ -1130,6 +1130,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     let mode = fs.cred().write_kill(&at.inode().metadata());
     let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
     rk_vfs::inode::check_set_attr(&**at.inode(), &attr)?;
+    rk_vfs::mapped::extend(at.inode(), size);
     at.inode().set_attr(&attr)?;
     rk_vfs::mapped::changed(at.inode(), size, u64::MAX);
     Ok(0)

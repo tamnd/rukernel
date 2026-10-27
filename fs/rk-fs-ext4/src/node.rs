@@ -311,6 +311,7 @@ impl Tx<'_> {
         if end.div_ceil(bs) > u64::from(u32::MAX) {
             return Err(Errno::EFBIG);
         }
+        self.zero_eof(raw, offset)?;
         let is_map = raw.flags() & flags::EXTENTS == 0;
         let (mut extents, tree) = if !is_map { fs.extents(raw)? } else { (Vec::new(), Vec::new()) };
         let mut changed = false;
@@ -558,6 +559,17 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Writes zeros on the bytes past the size of the file in its last block, before the size
+    /// grows to `size`, as `ext4_block_zero_eof` of Linux. The disk can have old data there, and
+    /// the file must not show it.
+    pub(crate) fn zero_eof(&self, raw: &RawInode, size: u64) -> Result<()> {
+        if raw.flags() & flags::INLINE_DATA != 0 {
+            return Ok(());
+        }
+        let old = raw.size();
+        self.zero_part(raw, old, size.min(old.next_multiple_of(self.fs.sb.block_size)))
+    }
+
     /// `FALLOC_FL_COLLAPSE_RANGE` or `FALLOC_FL_INSERT_RANGE` of the file `ino`. A collapse frees
     /// the blocks of the range and moves the blocks after it down. An insert moves the blocks from
     /// `offset` up and leaves a hole. Each one changes the size by `len`. The checks are the
@@ -667,6 +679,7 @@ impl Tx<'_> {
             }
             result?;
             if mode & KEEP_SIZE == 0 && end > raw.size() {
+                self.zero_eof(raw, end)?;
                 raw.set_size(end);
                 touch(raw, true);
                 return Ok(());

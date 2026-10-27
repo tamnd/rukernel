@@ -158,6 +158,15 @@ impl rk_vfs::mapped::Mapped for FilePages {
         }
     }
 
+    fn zero(&self, start: u64, end: u64) {
+        for (index, frame) in self.copies(start, end) {
+            let page = index * PAGE_SIZE as u64;
+            let from = start.max(page);
+            let to = end.min(page + PAGE_SIZE as u64);
+            frame.write_bytes((from - page) as usize, &vec![0u8; (to - from) as usize]);
+        }
+    }
+
     fn sync(&self, start: u64, end: u64) -> Result<(), Errno> {
         let first = start / PAGE_SIZE as u64;
         if self.dirty.lock().range(first..end.div_ceil(PAGE_SIZE as u64)).next().is_none() {
