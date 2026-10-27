@@ -4,6 +4,7 @@
 //! threads. A `Thread` runs in one kernel task. The parent of a process waits for it with `wait4`,
 //! and a process that ends stays as a zombie until its parent reaps it, as in Linux.
 
+use crate::keys::{self, Key, Slot};
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE};
 use crate::sched::SchedParams;
 use crate::signal::{
@@ -165,6 +166,24 @@ pub struct Process {
     /// The tracer of the leader thread after the leader ended. The tracer gets the exit of the
     /// process.
     leader_tracer: SpinLock<Weak<Process>>,
+    /// The process keyring and the session keyring.
+    keys: SpinLock<ProcessKeys>,
+}
+
+/// The keyrings of a process.
+#[derive(Default)]
+struct ProcessKeys {
+    process: Option<Arc<Key>>,
+    session: Option<Arc<Key>>,
+}
+
+/// The keyrings of a thread.
+#[derive(Default)]
+struct ThreadKeys {
+    /// The thread keyring.
+    ring: Option<Arc<Key>>,
+    /// The default keyring of `request_key`, a `KEY_REQKEY_DEFL_*` value.
+    reqkey: u8,
 }
 
 impl core::fmt::Debug for Process {
@@ -209,6 +228,8 @@ pub struct Thread {
     syscall: SpinLock<SyscallInfo>,
     /// The policy, the priority and the nice value.
     sched: SpinLock<SchedParams>,
+    /// The thread keyring and the default keyring of `request_key`.
+    keys: SpinLock<ThreadKeys>,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -652,7 +673,57 @@ impl Process {
             dead_ticks: AtomicU64::new(0),
             child_ticks: AtomicU64::new(0),
             leader_tracer: SpinLock::new(Weak::new()),
+            keys: SpinLock::new(ProcessKeys::default()),
         })
+    }
+}
+
+impl keys::Owner for Thread {
+    fn ring(&self, slot: Slot) -> Option<Arc<Key>> {
+        match slot {
+            Slot::Thread => self.keys.lock().ring.clone(),
+            Slot::Process => self.process.keys.lock().process.clone(),
+            Slot::Session => self.process.keys.lock().session.clone(),
+        }
+    }
+
+    fn set_ring(&self, slot: Slot, ring: Arc<Key>, replace: bool) -> Arc<Key> {
+        let put = |r: &mut Option<Arc<Key>>| {
+            let old = if replace || r.is_none() { r.replace(ring) } else { None };
+            (r.clone().expect("the slot has a keyring"), old)
+        };
+        // The old keyring goes after the lock.
+        let (now, _old) = match slot {
+            Slot::Thread => put(&mut self.keys.lock().ring),
+            Slot::Process => put(&mut self.process.keys.lock().process),
+            Slot::Session => put(&mut self.process.keys.lock().session),
+        };
+        now
+    }
+
+    fn reqkey(&self) -> u8 {
+        self.keys.lock().reqkey
+    }
+
+    fn set_reqkey(&self, value: u8) {
+        self.keys.lock().reqkey = value;
+    }
+}
+
+impl Thread {
+    /// Runs `f` with the context of a key operation of the thread: the credentials of the
+    /// process, the real time and the keyrings.
+    pub fn with_keys<R>(&self, f: impl FnOnce(&keys::Caller<'_>) -> R) -> R {
+        let cred = self.process.cred();
+        let now = rk_frame::time::realtime_ns() / 1_000_000_000;
+        f(&keys::Caller { cred: &cred, now, owner: self })
+    }
+
+    /// Drops the thread keyring and the process keyring, as `execve` does.
+    pub(crate) fn exec_keys(&self) {
+        let ring = self.keys.lock().ring.take();
+        let process = self.process.keys.lock().process.take();
+        drop((ring, process));
     }
 }
 
@@ -1000,6 +1071,7 @@ impl Thread {
             killable_wait: AtomicBool::new(false),
             syscall: SpinLock::new(SyscallInfo { nr: -1, ..SyscallInfo::default() }),
             sched: SpinLock::new(SchedParams::default()),
+            keys: SpinLock::new(ThreadKeys::default()),
         })
     }
 }
@@ -1096,10 +1168,13 @@ pub fn fork(parent: &Thread, share: ForkShare) -> Result<Arc<Thread>, Errno> {
     *child.image.lock() = pp.image.lock().clone();
     *child.limits.lock() = *pp.limits.lock();
     *child.cred.lock() = pp.cred();
+    // The child shares the session keyring. It has no thread keyring and no process keyring.
+    child.keys.lock().session = pp.keys.lock().session.clone();
     child.set_oom_score_adj(pp.oom_score_adj());
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     thread.inherit_seccomp(parent);
     *thread.sched.lock() = parent.sched().forked();
+    thread.keys.lock().reqkey = parent.keys.lock().reqkey;
     child.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
@@ -1123,6 +1198,15 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     *new.sched.lock() = thread.sched().forked();
     table.threads.insert(tid, Arc::downgrade(&new));
     drop(table);
+    // A thread with a thread keyring gives a new empty one to the new thread, as Linux does.
+    let reqkey = {
+        let k = thread.keys.lock();
+        (k.ring.is_some(), k.reqkey)
+    };
+    if reqkey.0 {
+        new.keys.lock().ring = keys::new_thread_ring(&process.cred());
+    }
+    new.keys.lock().reqkey = reqkey.1;
     process.state.lock().threads.push(new.clone());
     Ok(new)
 }

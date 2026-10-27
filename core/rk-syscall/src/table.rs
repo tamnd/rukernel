@@ -2,7 +2,7 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, cred, epoll, eventfd, fanotify, fhandle, fs, futex, info, inotify, memfd, mm, mount,
+    aio, cred, epoll, eventfd, fanotify, fhandle, fs, futex, info, inotify, keys, memfd, mm, mount,
     mqueue, msg, net, pidfd, poll, process, ptrace, sched, seccomp, sem, shm, signal, signalfd,
     splice, statmount, swap, timer, timerfd, xattr,
 };
@@ -380,6 +380,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PRLIMIT64 => info::prlimit64(cx, a[0], a[1], a[2], a[3]),
         nr::RENAMEAT2 => fs::renameat2(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::GETRANDOM => info::getrandom(cx, a[0], a[1], a[2]),
+        nr::ADD_KEY => keys::add_key(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::REQUEST_KEY => keys::request_key(cx, a[0], a[1], a[2], a[3]),
+        nr::KEYCTL => keys::keyctl(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::MEMBARRIER => mm::membarrier(cx, a[0], a[1], a[2]),
         nr::STATX => fs::statx(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::NAME_TO_HANDLE_AT => fhandle::name_to_handle_at(cx, a[0], a[1], a[2], a[3], a[4]),

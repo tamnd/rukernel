@@ -15,6 +15,7 @@ extern crate alloc;
 
 pub mod bpf;
 pub mod elf;
+pub mod keys;
 pub mod limits;
 pub mod ntp;
 pub mod sched;
