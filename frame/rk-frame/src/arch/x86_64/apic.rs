@@ -53,6 +53,8 @@ const DIVIDE_BY_16: u32 = 0b0011;
 const PIT_HZ: u64 = 1_193_182;
 /// The time of the calibration, in milliseconds.
 const CALIBRATE_MS: u64 = 10;
+/// The measures of the calibration. The calibration keeps the shortest.
+const CALIBRATE_TRIES: u32 = 8;
 
 /// The local APIC is in x2APIC mode.
 static X2APIC: AtomicBool = AtomicBool::new(false);
@@ -114,6 +116,24 @@ fn clock(ticks: u64, cycles: u64, mult: u64) -> u64 {
     let tick_ns = 1_000_000_000 / HZ;
     let part = ((u128::from(cycles) * u128::from(mult)) >> 32).min(u128::from(tick_ns - 1));
     ticks * tick_ns + part as u64
+}
+
+/// The ticks at a timer interrupt, and the new time stamp counter of the last tick. `last` is the
+/// counter of the last tick, `now` is the counter now and `period` is the cycles of one tick, or 0
+/// before the calibration.
+///
+/// The kernel runs with interrupts off, so the interrupt of a tick can wait, and the APIC keeps
+/// only one interrupt of the timer. The ticks of that time are lost, and a kernel that is busy
+/// sees a clock that is too slow and timeouts that do not come. Thus the tick count adds each
+/// period that passed, as `tick_do_update_jiffies64` of Linux does. The counter of the last tick
+/// moves by whole periods, but not past `now`, so a timer that is a little faster than the counter
+/// does not move it into the future.
+fn advance(last: u64, now: u64, period: u64) -> (u64, u64) {
+    if period == 0 {
+        return (1, now);
+    }
+    let ticks = (now.saturating_sub(last) / period).max(1);
+    (ticks, last.saturating_add(ticks * period).min(now))
 }
 
 /// The time stamp counter at the last tick and `TSC_MULT`, for the data page of the vDSO.
@@ -204,7 +224,32 @@ fn disable_pic() {
 
 /// Measures the APIC timer and the time stamp counter against PIT channel 2. Gives the timer
 /// ticks in `CALIBRATE_MS`, and sets `TSC_HZ`.
+///
+/// A host that stops the virtual CPU during a measure makes the measure too long, and a time stamp
+/// counter that seems too fast makes the clock and the tick count slow. Under QEMU without KVM on
+/// a busy host, one measure gave 4.5 times the true frequency. Thus the calibration measures
+/// `CALIBRATE_TRIES` times and keeps the measure with the fewest cycles, as
+/// `pit_hpet_ptimer_calibrate_cpu` of Linux keeps the lowest of its tries.
 fn calibrate() -> u64 {
+    let (mut cycles, mut elapsed) = measure();
+    for _ in 1..CALIBRATE_TRIES {
+        let (c, e) = measure();
+        if c < cycles {
+            (cycles, elapsed) = (c, e);
+        }
+    }
+    let now = rdtsc();
+    let hz = (cycles * 1000 / CALIBRATE_MS).max(1);
+    TSC_HZ.store(hz, Ordering::Relaxed);
+    TSC_BASE.store(now, Ordering::Relaxed);
+    TICK_TSC.store(now, Ordering::Relaxed);
+    TSC_MULT.store(((1_000_000_000u128 << 32) / u128::from(hz)) as u64, Ordering::Relaxed);
+    elapsed
+}
+
+/// Measures `CALIBRATE_MS` once against PIT channel 2. Gives the cycles of the time stamp counter
+/// and the ticks of the APIC timer in that time.
+fn measure() -> (u64, u64) {
     // SAFETY: port 0x61 is the PIT gate and speaker control, and ports 0x42 and 0x43 are PIT
     // channel 2 and the PIT mode register. This module owns them, and the speaker stays off.
     let (gate, ch2, mode) = unsafe { (Port::new(0x61), Port::new(0x42), Port::new(0x43)) };
@@ -216,9 +261,11 @@ fn calibrate() -> u64 {
     ch2.write(latch as u8);
     write(REG_TIMER_DIVIDE, DIVIDE_BY_16);
     write(REG_LVT_TIMER, LVT_MASKED | u32::from(TIMER_VECTOR));
-    ch2.write((latch >> 8) as u8);
     write(REG_TIMER_INIT, u32::MAX);
     let tsc = rdtsc();
+    // The high byte starts the count. The APIC timer and the time stamp counter start first, so a
+    // stop of the CPU at any point makes the measure longer and never shorter.
+    ch2.write((latch >> 8) as u8);
     // Bit 5 of port 0x61 is the output of channel 2. In mode 0 it goes high when the count is 0.
     while gate.read() & 0x20 == 0 {
         core::hint::spin_loop();
@@ -226,12 +273,7 @@ fn calibrate() -> u64 {
     let elapsed = u32::MAX - read(REG_TIMER_CURRENT);
     let now = rdtsc();
     write(REG_TIMER_INIT, 0);
-    let hz = ((now - tsc) * 1000 / CALIBRATE_MS).max(1);
-    TSC_HZ.store(hz, Ordering::Relaxed);
-    TSC_BASE.store(now, Ordering::Relaxed);
-    TICK_TSC.store(now, Ordering::Relaxed);
-    TSC_MULT.store(((1_000_000_000u128 << 32) / u128::from(hz)) as u64, Ordering::Relaxed);
-    u64::from(elapsed)
+    (now.saturating_sub(tsc), u64::from(elapsed))
 }
 
 /// Sets up the local APIC of the boot CPU and starts the timer. Interrupts stay off. The kernel
@@ -304,10 +346,12 @@ pub(crate) fn handle(vector: u8) -> bool {
     match vector {
         TIMER_VECTOR => {
             if super::cpu::id() == 0 {
+                let period = TSC_HZ.load(Ordering::Relaxed) / HZ;
+                let (ticks, base) = advance(TICK_TSC.load(Ordering::Relaxed), rdtsc(), period);
                 // `clock_ns` reads the tick count before and after the time stamp counter of the
                 // tick, so the counter must change first.
-                TICK_TSC.store(rdtsc(), Ordering::Release);
-                TICKS.fetch_add(1, Ordering::Release);
+                TICK_TSC.store(base, Ordering::Release);
+                TICKS.fetch_add(ticks, Ordering::Release);
                 crate::vdso::tick();
             }
             eoi();
