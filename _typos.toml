@@ -2,13 +2,17 @@
 
 [files]
 # The generated ABI has the names of Linux, for example `creat`. The fstests tables copy the
-# descriptions of the tests from fstests as they are.
+# descriptions of the tests from fstests as they are, and the LTP tables copy them from LTP.
 extend-exclude = [
     "LICENSE",
     "abi/",
     "core/rk-abi/src/generated/",
     "tools/fstests/ext4.md",
     "tools/fstests/overlay.md",
+    "tools/ltp/syscalls.md",
+    "tools/ltp/mm.md",
+    "tools/ltp/sched.md",
+    "tools/ltp/net.md",
 ]
 
 [default.extend-words]
