@@ -61,7 +61,7 @@ const EVENTMSG_SYSCALL_ENTRY: u64 = 1;
 const EVENTMSG_SYSCALL_EXIT: u64 = 2;
 
 /// The trap flag of RFLAGS. The CPU stops after one instruction when it is set.
-const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_TF: u64 = rk_frame::user::STEP_FLAG;
 
 /// The value of `orig_rax` when the tracee is not in a system call.
 pub const NO_SYSCALL: u64 = u64::MAX;
@@ -156,7 +156,7 @@ impl Ptrace {
     /// The flags of the stopped tracee as the tracer sees them. The trap flag that the kernel set
     /// for a single step is not there, as `get_flags` of Linux gives it.
     pub fn flags(&self, stop: &Stop) -> u64 {
-        let flags = stop.regs.regs().rflags;
+        let flags = stop.regs.flags();
         if self.forced_tf { flags & !RFLAGS_TF } else { flags }
     }
 
@@ -170,14 +170,15 @@ impl Ptrace {
         } else if self.forced_tf {
             value |= RFLAGS_TF;
         }
-        let r = stop.regs.regs_mut();
-        r.rflags = (r.rflags & !mask) | value;
+        let flags = stop.regs.flags();
+        stop.regs.set_flags((flags & !mask) | value);
     }
 
     /// Clears the trap flag in the registers of `stop` if the kernel set it for a single step.
     fn clear_forced_tf(&mut self, stop: &mut Stop) {
         if self.forced_tf {
-            stop.regs.regs_mut().rflags &= !RFLAGS_TF;
+            let flags = stop.regs.flags();
+            stop.regs.set_flags(flags & !RFLAGS_TF);
             self.forced_tf = false;
         }
     }
@@ -405,8 +406,9 @@ pub fn resume(tracer: &Process, tid: Pid, how: Resume, sig: u32) -> Result<(), E
             pt.syscall = how == Resume::Syscall;
             pt.step = how == Resume::Step;
             if how == Resume::Step {
-                if stop.regs.regs().rflags & RFLAGS_TF == 0 {
-                    stop.regs.regs_mut().rflags |= RFLAGS_TF;
+                let flags = stop.regs.flags();
+                if flags & RFLAGS_TF == 0 {
+                    stop.regs.set_flags(flags | RFLAGS_TF);
                     pt.forced_tf = true;
                 }
             } else {

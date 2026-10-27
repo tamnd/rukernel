@@ -35,12 +35,15 @@ fn pages() -> Option<&'static (Arc<Pages>, Arc<Pages>)> {
 }
 
 /// Maps the data page and the vDSO directly above it, at an address that `mmap` chooses. Gives
-/// the address of the vDSO, the value of `AT_SYSINFO_EHDR`.
+/// the address of the vDSO, the value of `AT_SYSINFO_EHDR`, or 0 if the architecture has no vDSO.
 ///
 /// # Errors
 ///
 /// Gives `ENOMEM` if no frame or no address range is free.
 pub(crate) fn map(space: &AddressSpace) -> Result<usize, Errno> {
+    if IMAGE.is_empty() {
+        return Ok(0);
+    }
     let (image, data) = pages().ok_or(Errno::ENOMEM)?;
     let len = image.0.len() * PAGE_SIZE;
     let read = Prot { read: true, write: false, exec: false };

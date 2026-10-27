@@ -2,15 +2,19 @@
 //!
 //! The kernel boots from a Linux arm64 `Image` on the QEMU `virt` machine. It runs at EL1 with the
 //! MMU on. The console is the PL011 UART, the interrupt controller is a GICv2, and the tick comes
-//! from the virtual timer of the generic timer. QEMU `virt` puts these devices at fixed addresses.
-//! TODO(#329): read the addresses from the device tree, as Linux does, and support GICv3.
+//! from the virtual timer of the generic timer. The device tree gives the addresses, and the
+//! addresses of QEMU `virt` are the fallback. TODO(#329): support GICv3.
 
 pub(crate) mod boot;
+pub(crate) mod cpu;
 pub(crate) mod gic;
 pub(crate) mod paging;
 pub(crate) mod pl011;
+pub(crate) mod smp;
+pub(crate) mod task;
 pub(crate) mod timer;
 pub(crate) mod trap;
+pub(crate) mod user;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -18,8 +22,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 fn interrupt() {
     let iar = gic::ack();
     let id = iar & 0x3ff;
-    if id == timer::INTID {
+    if id == timer::intid() {
         timer::tick();
+        gic::eoi(iar);
+    } else if id == smp::SGI_CALL {
+        smp::poll();
+        gic::eoi(iar);
+    } else if id == smp::SGI_RESCHEDULE {
         gic::eoi(iar);
     } else if id >= gic::SPURIOUS {
         // A spurious interrupt has no end of interrupt.
@@ -30,7 +39,7 @@ fn interrupt() {
 }
 
 /// Tells if PSCI calls use `smc`. Else they use `hvc`, as on QEMU `virt` without EL3.
-static PSCI_SMC: AtomicBool = AtomicBool::new(false);
+pub(crate) static PSCI_SMC: AtomicBool = AtomicBool::new(false);
 
 /// Sets the PSCI call method, from the `/psci` node of the device tree.
 fn set_psci_smc(smc: bool) {
@@ -168,19 +177,27 @@ pub(crate) mod irq {
     }
 }
 
-/// The real time clock: the PL031 of QEMU `virt`. TODO(#329): read the address from the device
-/// tree.
+/// The real time clock: a PL031, at the address that the device tree gives, else at the address
+/// of QEMU `virt`.
 pub(crate) mod rtc {
     use super::paging::MMIO_BASE;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The data register, which counts the seconds since the epoch.
-    const RTCDR: usize = MMIO_BASE + 0x0901_0000;
+    /// The virtual address of the data register, which counts the seconds since the epoch.
+    static RTCDR: AtomicUsize = AtomicUsize::new(MMIO_BASE + 0x0901_0000);
+
+    /// Uses the PL031 at the virtual address `base`, from the device tree.
+    pub(crate) fn set_base(base: usize) {
+        RTCDR.store(base, Ordering::Relaxed);
+    }
 
     /// Gives the seconds since the epoch.
     pub(crate) fn read() -> Option<u64> {
-        // SAFETY: the boot code maps the first GiB of physical memory as device memory at
-        // `MMIO_BASE`, and the PL031 of QEMU `virt` is in it. The read has no side effect.
-        let secs = unsafe { (RTCDR as *const u32).read_volatile() };
+        let addr = RTCDR.load(Ordering::Relaxed);
+        // SAFETY: the page tables map the PL031 registers as device memory at this address: the
+        // boot window of `MMIO_BASE` or a mapping of `paging::map_device`. The read has no side
+        // effect.
+        let secs = unsafe { (addr as *const u32).read_volatile() };
         (secs != 0).then_some(u64::from(secs))
     }
 }

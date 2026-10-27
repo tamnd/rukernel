@@ -4,9 +4,9 @@ use crate::{rootfs, selftest};
 use rk_frame::boot::BootInfo;
 use rk_frame::{arch, println};
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use rk_syscall::UNAME_RELEASE;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const UNAME_RELEASE: &str = "7.3.0-rukernel";
 
 /// The exit code for a passed self test. QEMU exits with the status 33.
@@ -37,7 +37,7 @@ fn main(boot: &'static BootInfo) -> ! {
     println!("memory: {} of {} frames free", frames.free, frames.total);
     println!("timer: {} Hz, tick at {} Hz", rk_frame::time::timer_frequency(), rk_frame::time::HZ);
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         rk_sched::init();
         println!("smp: {} CPUs run", rk_frame::cpu::start_all());
@@ -51,9 +51,9 @@ fn main(boot: &'static BootInfo) -> ! {
         arch::qemu_exit(if passed { EXIT_PASS } else { EXIT_FAIL });
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     run_init(boot, test.is_some());
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         println!("rukernel: no user mode on this architecture yet, the CPU stops");
         arch::halt_forever()
@@ -62,7 +62,7 @@ fn main(boot: &'static BootInfo) -> ! {
 
 /// Starts init and waits for it to end. Linux stops with a panic when init ends, and so does
 /// rukernel. With `rk.test=init`, the test passes if init exits with the code 0.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     use alloc::vec;
     use alloc::vec::Vec;
@@ -70,6 +70,9 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     rk_drv_mem::init();
     rk_drv_tty::init();
     rk_net::dev::init();
+    // The virtio devices of arm64 are on the MMIO transport or on a PCI host bridge of the
+    // device tree, and rukernel has neither yet.
+    #[cfg(target_arch = "x86_64")]
     rk_drv_virtio::init();
     rk_net_inet::init();
     if let Some(ip) = param(boot.cmdline(), "ip") {
@@ -111,7 +114,7 @@ fn param<'a>(cmdline: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Gives the words after `--` on the command line.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn init_args(cmdline: &str) -> impl Iterator<Item = &str> {
     cmdline.split_ascii_whitespace().skip_while(|w| *w != "--").skip(1)
 }

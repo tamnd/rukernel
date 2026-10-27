@@ -13,9 +13,16 @@
 //!
 //! The boot assembly makes the first tables, in boot.rs. `init` puts the direct map of all RAM in
 //! place of the small direct map of the boot path.
+//!
+//! TTBR0 holds the user half. Each user address space has its own top level table. With no user
+//! address space, TTBR0 has an empty table, as `reserved_pg_dir` of Linux. The user pages are not
+//! global and all address spaces use ASID 0, so a CPU drops the user entries of its TLB when it
+//! loads another table.
 
+use super::cpu::{self, MAX_CPUS};
 use crate::boot::BootInfo;
 use crate::mm::PageInfo;
+use crate::mm::frame::{alloc_table_frame, free_frame_phys};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -42,6 +49,8 @@ const VALID: u64 = 1 << 0;
 const TABLE: u64 = 1 << 1;
 /// Index 1 of MAIR_EL1: device memory.
 const ATTR_DEVICE: u64 = 1 << 2;
+/// The page is not global: its TLB entries belong to one ASID.
+const NG: u64 = 1 << 11;
 /// EL0 can use the page.
 const AP_USER: u64 = 1 << 6;
 /// The page is read only.
@@ -121,6 +130,11 @@ pub(crate) fn kernel_image() -> (usize, usize) {
 /// The physical address of a static in the kernel image.
 fn image_phys(virt: usize) -> u64 {
     (virt - KERNEL_BASE) as u64 + KERNEL_PHYS.load(Ordering::Relaxed)
+}
+
+/// The physical address of an address in the kernel image, for the start address of a CPU.
+pub(crate) fn kernel_virt_to_phys(virt: usize) -> u64 {
+    image_phys(virt)
 }
 
 /// The virtual address of a physical address in the direct map.
@@ -274,11 +288,48 @@ pub(crate) fn init(info: &BootInfo) {
     sync_tables();
 }
 
+/// The size of the device window that the boot path maps at `MMIO_BASE`.
+const BOOT_MMIO_SIZE: u64 = 1 << 30;
+
+/// Maps the device registers at the physical range `phys..phys + len` as device memory in the
+/// window at `MMIO_BASE`, and gives the virtual address of `phys`. The boot path maps the first
+/// 1 GiB. Other ranges get 2 MiB blocks. A range at or above 512 GiB, or a block that holds RAM,
+/// gives `None`. The boot CPU calls this after `frame::init` and `init`.
+pub(crate) fn map_device(phys: u64, len: u64, info: &BootInfo) -> Option<usize> {
+    const MIB2: u64 = 2 << 20;
+    let end = phys.checked_add(len.max(1))?;
+    if end > DIRECT_MAP_SIZE {
+        return None;
+    }
+    if end <= BOOT_MMIO_SIZE {
+        return Some(MMIO_BASE + phys as usize);
+    }
+    let start = (phys & !(MIB2 - 1)).max(BOOT_MMIO_SIZE);
+    let end = end.next_multiple_of(MIB2);
+    // A device block must not hold RAM: the two mappings would have attributes that differ.
+    let ram = info.memory().iter().any(|r| r.start.get() < end && start < r.start.get() + r.len);
+    if ram {
+        return None;
+    }
+    let _guard = TABLES.lock();
+    let mut a = start;
+    while a < end {
+        let virt = MMIO_BASE + a as usize;
+        let e = walk(root(), 0, 2, virt, &mut alloc_table_frame)?;
+        if e.load(Ordering::Relaxed) & VALID == 0 {
+            e.store(a | BLOCK_DEVICE, Ordering::Relaxed);
+        }
+        a += MIB2;
+    }
+    sync_tables();
+    Some(MMIO_BASE + phys as usize)
+}
+
 /// Maps one 4 KiB page of the vmalloc range.
 pub(crate) fn map_page(virt: usize, phys: u64, writable: bool) -> Result<(), ()> {
     assert!((VMALLOC_START..HEAP_END).contains(&virt), "{virt:#x} is not in the vmalloc range");
     let _guard = TABLES.lock();
-    let e = walk(root(), 0, 3, virt, &mut crate::mm::frame::alloc_table_frame).ok_or(())?;
+    let e = walk(root(), 0, 3, virt, &mut alloc_table_frame).ok_or(())?;
     if e.load(Ordering::Relaxed) & VALID != 0 {
         return Err(());
     }
@@ -305,7 +356,7 @@ pub(crate) fn unmap_page(virt: usize) -> Option<u64> {
 
 /// Walks the kernel page tables for one virtual address.
 pub(crate) fn query(virt: usize) -> Option<PageInfo> {
-    // The boot path turned off the walks of TTBR0, so the lower half has no mapping.
+    // The kernel tables do not map the lower half. User address spaces map it in TTBR0.
     if virt < PAGE_OFFSET {
         return None;
     }
@@ -332,4 +383,217 @@ pub(crate) fn query(virt: usize) -> Option<PageInfo> {
         });
     }
     None
+}
+
+/// The end of the user half of the address space. Linux names it `TASK_SIZE`. TTBR0 maps 48 bits.
+/// The last page below the end is not used, as on x86-64.
+pub(crate) const USER_END: usize = 0x0000_ffff_ffff_f000;
+
+/// The empty top level table that TTBR0 has when no user address space is active.
+#[repr(C, align(4096))]
+struct EmptyTable([u64; 512]);
+
+static EMPTY: EmptyTable = EmptyTable([0; 512]);
+
+/// The physical address of the empty table.
+fn empty_root() -> u64 {
+    image_phys(core::ptr::from_ref(&EMPTY) as usize)
+}
+
+/// The user table that TTBR0 of each CPU has now, or 0 for the empty table. Each CPU changes
+/// only its own value.
+static ACTIVE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+fn active() -> &'static AtomicU64 {
+    &ACTIVE[cpu::id()]
+}
+
+/// The user table that TTBR0 of the CPU `id` has now, or 0.
+pub(crate) fn active_on(id: usize) -> u64 {
+    ACTIVE[id].load(Ordering::Acquire)
+}
+
+/// Loads `root` in TTBR0 and drops the user entries of the TLB of this CPU.
+fn load_ttbr0(root: u64) {
+    // SAFETY: `root` is the empty table or a table from `new_user_root`, which maps only user
+    // pages. The kernel runs from TTBR1, so its code, stack and data stay mapped. The TLB
+    // invalidation drops the entries of ASID 0, which are the entries of the old table.
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {root}",
+            "isb",
+            "tlbi aside1, xzr",
+            "dsb nsh",
+            "isb",
+            root = in(reg) root,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Turns on the walks of TTBR0 with the empty table. Each CPU calls this one time, after the boot
+/// path turned the walks off.
+pub(crate) fn init_cpu() {
+    load_ttbr0(empty_root());
+    // SAFETY: TTBR0 has the empty table, so the walks find no mapping. The change of TCR_EL1 does
+    // not change the kernel half.
+    unsafe {
+        core::arch::asm!(
+            "mrs {t}, tcr_el1",
+            "bic {t}, {t}, #{epd0}",
+            "msr tcr_el1, {t}",
+            "isb",
+            t = out(reg) _,
+            epd0 = const TCR_EPD0,
+            options(nostack, preserves_flags),
+        );
+    }
+    active().store(0, Ordering::Release);
+}
+
+/// Makes the top level table of a new user address space and gives its physical address.
+pub(crate) fn new_user_root() -> Option<u64> {
+    alloc_table_frame()
+}
+
+/// Gives back the tables of `root` and `root` itself. The caller removed the mappings of the
+/// pages, and `root` is not active on this CPU. Each other CPU that still has `root` loads the
+/// empty table first.
+pub(crate) fn free_user_root(root: u64) {
+    assert!(active().load(Ordering::Acquire) != root, "the address space is active");
+    super::smp::shootdown(root, super::smp::LEAVE);
+    fn free_level(table: u64, level: usize) {
+        if level < 3 {
+            for i in 0..512 {
+                let e = entry(table, i).load(Ordering::Relaxed);
+                if e & VALID != 0 && e & TABLE != 0 {
+                    free_level(e & ADDR_MASK, level + 1);
+                }
+            }
+        }
+        free_frame_phys(table);
+    }
+    free_level(root, 0);
+}
+
+/// The descriptor bits of a user page. A page that allows no access is not valid, so each access
+/// to it is a fault. EL0 cannot have a page that it can write but not read, so a writable page is
+/// readable too. EL1 never executes a user page.
+fn user_flags(readable: bool, writable: bool, executable: bool) -> u64 {
+    if !(readable || writable || executable) {
+        return 0;
+    }
+    VALID
+        | TABLE
+        | AF
+        | SH_INNER
+        | NG
+        | AP_USER
+        | PXN
+        | if writable { 0 } else { AP_RO }
+        | if executable { 0 } else { UXN }
+}
+
+/// Drops the TLB entries of the user page `virt` on each CPU. The TLB invalidation goes to each
+/// CPU of the inner shareable domain, so no interrupt is needed.
+fn flush_user(virt: usize) {
+    let arg = (virt >> 12) & ((1 << 44) - 1);
+    // SAFETY: the TLB invalidation and the barriers change no memory. The ASID field is 0.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vae1is, {}",
+            "dsb ish",
+            "isb",
+            in(reg) arg,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// The permissions of a user page: readable, writable and executable.
+pub(crate) type UserProt = (bool, bool, bool);
+
+/// Maps one 4 KiB page at `virt` in the user address space `root`. Gives `Err` if no frame is free
+/// for a page table. The caller makes sure that `virt` is page aligned, below `USER_END` and not
+/// mapped.
+pub(crate) fn user_map(root: u64, virt: usize, phys: u64, prot: UserProt) -> Result<(), ()> {
+    assert!(virt < USER_END, "{virt:#x} is not in the user half");
+    let e = walk(root, 0, 3, virt, &mut alloc_table_frame).ok_or(())?;
+    if prot.2 {
+        sync_icache(phys);
+    }
+    e.store(phys | user_flags(prot.0, prot.1, prot.2), Ordering::Relaxed);
+    flush_user(virt);
+    Ok(())
+}
+
+/// Makes the instruction fetches see the data in the frame at `phys`, as `__sync_icache_dcache` of
+/// Linux does before it maps an executable page. The kernel writes code through the direct map, and
+/// the instruction cache of arm64 is not coherent with the data cache. CTR_EL0.IDC and CTR_EL0.DIC
+/// tell that a step is not needed.
+fn sync_icache(phys: u64) {
+    let ctr: u64;
+    // SAFETY: reading CTR_EL0 has no side effect.
+    unsafe { core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    let start = phys_to_virt(phys);
+    let end = start + 4096;
+    if ctr & (1 << 28) == 0 {
+        let line = 4 << (ctr >> 16 & 0xf);
+        for addr in (start..end).step_by(line) {
+            // SAFETY: the clean writes dirty lines of the page to the point of unification. The
+            // page is mapped in the direct map, and its data does not change.
+            unsafe { core::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack)) };
+        }
+    }
+    // SAFETY: the barrier changes no memory.
+    unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+    if ctr & (1 << 29) == 0 {
+        let line = 4 << (ctr & 0xf);
+        for addr in (start..end).step_by(line) {
+            // SAFETY: the invalidation removes lines from the instruction cache only.
+            unsafe { core::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack)) };
+        }
+        // SAFETY: the barrier changes no memory.
+        unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+    }
+}
+
+/// Removes the mapping of one 4 KiB page at `virt` in `root`.
+pub(crate) fn user_unmap(root: u64, virt: usize) {
+    if let Some(e) = walk(root, 0, 3, virt, &mut || None) {
+        e.store(0, Ordering::Relaxed);
+        flush_user(virt);
+    }
+}
+
+/// Changes the permissions of the page at `virt` in `root`, which maps `phys`.
+pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
+    if let Some(e) = walk(root, 0, 3, virt, &mut || None) {
+        if prot.2 {
+            sync_icache(phys);
+        }
+        e.store(phys | user_flags(prot.0, prot.1, prot.2), Ordering::Relaxed);
+        flush_user(virt);
+    }
+}
+
+/// Loads `root` in TTBR0. A value of 0 loads the empty table.
+pub(crate) fn activate(root: u64) {
+    if active().swap(root, Ordering::AcqRel) == root {
+        return;
+    }
+    load_ttbr0(if root == 0 { empty_root() } else { root });
+}
+
+/// Tells if `root` is in TTBR0 of this CPU now.
+pub(crate) fn is_active(root: u64) -> bool {
+    active().load(Ordering::Acquire) == root
+}
+
+/// Loads the empty table if `root` is in TTBR0 of this CPU, because `root` goes away.
+pub(crate) fn leave(root: u64) {
+    if is_active(root) {
+        activate(0);
+    }
 }

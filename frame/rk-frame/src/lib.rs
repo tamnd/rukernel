@@ -28,15 +28,18 @@ pub mod mm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod pci;
 pub mod sync;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod task;
 #[cfg(target_os = "none")]
 pub mod time;
 #[cfg(target_os = "none")]
 pub mod trap;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod user;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod vdso;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[path = "arch/aarch64/vdso.rs"]
+pub mod vdso;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod vm;

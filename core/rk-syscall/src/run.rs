@@ -12,7 +12,7 @@ use rk_frame::addr::VirtAddr;
 use rk_frame::println;
 use rk_frame::task::{TaskOptions, should_yield, yield_now};
 use rk_frame::time::ticks;
-use rk_frame::user::{ReturnReason, UserContext, UserException};
+use rk_frame::user::{ExceptionKind, FaultAccess, ReturnReason, UserContext, UserException};
 use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
 use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_EXIT, StopKind};
@@ -30,21 +30,6 @@ static COUNT: AtomicU64 = AtomicU64::new(0);
 pub fn count() -> u64 {
     COUNT.load(Ordering::Relaxed)
 }
-
-/// The vectors of the x86-64 exceptions that a user program can cause.
-const DIVIDE_ERROR: u8 = 0;
-const DEBUG: u8 = 1;
-const BREAKPOINT: u8 = 3;
-const INVALID_OPCODE: u8 = 6;
-const PAGE_FAULT: u8 = 14;
-const X87_FLOATING_POINT: u8 = 16;
-const ALIGNMENT_CHECK: u8 = 17;
-const SIMD_FLOATING_POINT: u8 = 19;
-
-/// The bits of the error code of a page fault.
-const PF_PRESENT: u64 = 1 << 0;
-const PF_WRITE: u64 = 1 << 1;
-const PF_INSTR: u64 = 1 << 4;
 
 /// Gives 16 random bytes for `AT_RANDOM`.
 pub(crate) fn random16() -> [u8; 16] {
@@ -99,21 +84,20 @@ pub fn spawn_init(
 }
 
 /// Gives the signal of a user exception at `ip`, as the trap handlers of
-/// arch/x86/kernel/traps.c give it.
+/// arch/x86/kernel/traps.c and arch/arm64/kernel/traps.c give it.
 fn exception_signal(e: &UserException, ip: u64) -> SigInfo {
-    match e.vector {
-        DIVIDE_ERROR => SigInfo::fault(SIGFPE, FPE_INTDIV, ip),
-        X87_FLOATING_POINT | SIMD_FLOATING_POINT => SigInfo::fault(SIGFPE, SI_KERNEL, ip),
+    match e.kind() {
+        ExceptionKind::DivideError => SigInfo::fault(SIGFPE, FPE_INTDIV, ip),
+        ExceptionKind::FloatingPoint => SigInfo::fault(SIGFPE, SI_KERNEL, ip),
         // The trap flag gives the debug exception after one instruction.
-        DEBUG => SigInfo::fault(SIGTRAP, TRAP_TRACE, ip),
-        BREAKPOINT => SigInfo::fault(SIGTRAP, SI_KERNEL, 0),
-        INVALID_OPCODE => SigInfo::fault(SIGILL, ILL_ILLOPN, ip),
-        ALIGNMENT_CHECK => SigInfo::fault(SIGBUS, BUS_ADRALN, 0),
-        PAGE_FAULT => {
-            let code = if e.error & PF_PRESENT != 0 { SEGV_ACCERR } else { SEGV_MAPERR };
-            SigInfo::fault(SIGSEGV, code, e.addr)
+        ExceptionKind::SingleStep => SigInfo::fault(SIGTRAP, TRAP_TRACE, ip),
+        ExceptionKind::Breakpoint => SigInfo::fault(SIGTRAP, SI_KERNEL, 0),
+        ExceptionKind::IllegalInstruction => SigInfo::fault(SIGILL, ILL_ILLOPN, ip),
+        ExceptionKind::Alignment { addr } => SigInfo::fault(SIGBUS, BUS_ADRALN, addr),
+        ExceptionKind::PageFault { addr, present, .. } => {
+            SigInfo::fault(SIGSEGV, if present { SEGV_ACCERR } else { SEGV_MAPERR }, addr)
         }
-        _ => SigInfo::fault(SIGSEGV, SI_KERNEL, 0),
+        ExceptionKind::Other => SigInfo::fault(SIGSEGV, SI_KERNEL, 0),
     }
 }
 
@@ -131,7 +115,7 @@ fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException, info: SigI
             "{}[{}]: signal {sig} at ip {:#x} addr {:#x} error {:#x}",
             core::str::from_utf8(&process.comm()).unwrap_or("?"),
             thread.tid(),
-            regs.regs().rip,
+            regs.pc(),
             e.addr,
             e.error
         );
@@ -141,20 +125,23 @@ fn fault(thread: &Arc<Thread>, regs: &UserContext, e: &UserException, info: SigI
 
 /// Handles a page fault of the thread. Gives the signal if the memory manager did not repair it:
 /// `SIGBUS` for a page that has no data, else `SIGSEGV`.
-fn page_fault(thread: &Thread, e: &UserException) -> Option<SigInfo> {
+fn page_fault(
+    thread: &Thread,
+    e: &UserException,
+    addr: u64,
+    access: FaultAccess,
+) -> Option<SigInfo> {
     let segv = || Some(exception_signal(e, 0));
     let Some(vm) = thread.process().vm() else { return segv() };
-    let access = if e.error & PF_INSTR != 0 {
-        Access::Exec
-    } else if e.error & PF_WRITE != 0 {
-        Access::Write
-    } else {
-        Access::Read
+    let access = match access {
+        FaultAccess::Exec => Access::Exec,
+        FaultAccess::Write => Access::Write,
+        FaultAccess::Read => Access::Read,
     };
-    match vm.handle_fault(e.addr as usize, access) {
+    match vm.handle_fault(addr as usize, access) {
         Ok(()) => None,
         Err(Errno::EFAULT | Errno::ENOMEM) => segv(),
-        Err(_) => Some(SigInfo::fault(SIGBUS, BUS_ADRERR, e.addr)),
+        Err(_) => Some(SigInfo::fault(SIGBUS, BUS_ADRERR, addr)),
     }
 }
 
@@ -223,10 +210,11 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
             }
             ReturnReason::Interrupt => {}
             ReturnReason::Exception(e) => {
-                let info = if e.vector == PAGE_FAULT {
-                    page_fault(thread, &e)
-                } else {
-                    Some(exception_signal(&e, regs.regs().rip))
+                let info = match e.kind() {
+                    ExceptionKind::PageFault { addr, access, .. } => {
+                        page_fault(thread, &e, addr, access)
+                    }
+                    _ => Some(exception_signal(&e, regs.pc())),
                 };
                 if let Some(info) = info {
                     fault(thread, regs, &e, info);
@@ -246,8 +234,8 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
 pub(crate) enum Entry {
     /// Run the system call with this number, or skip it if the number is `NO_SYSCALL`.
     Run(u64),
-    /// Skip the system call with this number. RAX has the return value, and a signal can start
-    /// the call again if the value is a restart code.
+    /// Skip the system call with this number. The return register has the return value, and a
+    /// signal can start the call again if the value is a restart code.
     Skip(u64),
     /// The group exits.
     GroupExit,
@@ -255,18 +243,18 @@ pub(crate) enum Entry {
     ThreadExit(WaitStatus),
 }
 
-/// Starts a system call: RAX gets `-ENOSYS`, and a tracer of `PTRACE_SYSCALL` sees the entry and
-/// can change the number. Then the `seccomp` mode of the thread checks the call, as
-/// `syscall_trace_enter` of Linux does.
+/// Starts a system call: the return register gets `-ENOSYS` as `set_entry_return` tells, and a
+/// tracer of `PTRACE_SYSCALL` sees the entry and can change the number. Then the `seccomp` mode of
+/// the thread checks the call, as `syscall_trace_enter` of Linux does.
 fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Entry {
     let mut number = regs.syscall_number();
     thread.set_syscall_info(SyscallInfo {
         nr: number as i64,
         args: regs.syscall_args(),
-        sp: regs.regs().rsp,
-        pc: regs.regs().rip,
+        sp: regs.sp(),
+        pc: regs.pc(),
     });
-    regs.set_syscall_return(Errno::ENOSYS.to_syscall_return() as u64);
+    regs.set_entry_return(Errno::ENOSYS.to_syscall_return() as u64);
     if thread.syscall_traced() {
         let r = ptrace::stop(thread, regs, number, StopKind::SyscallEntry, SIGTRAP, None);
         if thread.is_killed() {
@@ -283,12 +271,12 @@ fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Entry {
 fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
     thread.set_syscall_info(SyscallInfo {
         nr: -1,
-        sp: regs.regs().rsp,
-        pc: regs.regs().rip,
+        sp: regs.sp(),
+        pc: regs.pc(),
         ..SyscallInfo::default()
     });
     if thread.single_stepping() {
-        thread.send_signal(SigInfo::fault(SIGTRAP, TRAP_BRKPT, regs.regs().rip));
+        thread.send_signal(SigInfo::fault(SIGTRAP, TRAP_BRKPT, regs.pc()));
     } else if thread.syscall_traced() {
         ptrace::stop(thread, regs, number, StopKind::SyscallExit, SIGTRAP, None);
     }

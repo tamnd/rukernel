@@ -15,10 +15,10 @@ extern crate alloc;
 
 pub mod vma;
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod space;
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use space::{
     Access, AddressSpace, FileRef, MAX_MAP_COUNT, MMAP_MIN_ADDR, MMAP_TOP, MmFile, MmapRequest,
     Remap, STACK_SIZE, STACK_TOP,

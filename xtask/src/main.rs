@@ -466,6 +466,36 @@ fn find_user_cc() -> Result<Option<UserCc>> {
     Ok(None)
 }
 
+/// Finds a C compiler that makes arm64 Linux programs with musl, for the arm64 `init` and `smp`
+/// tests. `RK_USER_CC_AARCH64` gives the command, for example `aarch64-linux-musl-gcc`, `zig cc
+/// -target aarch64-linux-musl`, or a script that runs the gcc of Alpine for arm64 in a container.
+/// Then `aarch64-linux-musl-gcc` and `zig` are tried. Without a compiler, the tests are skipped.
+fn find_user_cc_aarch64() -> Option<UserCc> {
+    let works = |cmd: &str, arg: &str| {
+        Command::new(cmd).arg(arg).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+    };
+    let make = |command: Vec<String>| {
+        let is_zig = command.first().is_some_and(|c| c.ends_with("zig"));
+        UserCc {
+            command,
+            static_flags: &["-static"],
+            pie_flags: if is_zig { &["-static", "-fPIE"] } else { &["-static-pie", "-fPIE"] },
+        }
+    };
+    if let Ok(cc) = std::env::var("RK_USER_CC_AARCH64") {
+        return Some(make(cc.split_whitespace().map(String::from).collect()));
+    }
+    if works("aarch64-linux-musl-gcc", "--version") {
+        return Some(make(vec![String::from("aarch64-linux-musl-gcc")]));
+    }
+    if works("zig", "version") {
+        return Some(make(
+            ["zig", "cc", "-target", "aarch64-linux-musl"].map(String::from).to_vec(),
+        ));
+    }
+    None
+}
+
 /// Compiles the user test program `name` from tests/user to `out`.
 fn compile_user(cc: &UserCc, name: &str, pie: bool, out: &Path) -> Result {
     compile_c(&cc.command, if pie { cc.pie_flags } else { cc.static_flags }, name, out)
@@ -1856,8 +1886,21 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
 }
 
 /// The self tests that `boot-test aarch64` runs on the QEMU `virt` machine, each in its own boot.
-/// The `boot` test shows the first console line, and the `timer` test waits for timer ticks.
-const AARCH64_TESTS: &[&str] = &["boot", "trap", "mm", "heap", "timer"];
+/// The `boot` test shows the first console line and starts `AARCH64_SMP_CPUS` CPUs, and the
+/// `timer` test waits for timer ticks.
+const AARCH64_TESTS: &[&str] =
+    &["boot", "trap", "mm", "heap", "timer", "task", "syscall", "vm", "fault"];
+
+/// The tests that `boot-test aarch64` runs with the user programs of tests/user in the initramfs,
+/// as the x86-64 tests of the same names. They need `find_user_cc_aarch64`.
+const AARCH64_USER_TESTS: &[&str] = &["init", "smp"];
+
+/// The time limit of each test of `AARCH64_USER_TESTS`. QEMU emulates each instruction, and the
+/// `smp` test takes about 13 minutes on an x86-64 host with 4 emulated CPUs.
+const AARCH64_USER_TIMEOUT: Duration = Duration::from_secs(1500);
+
+/// The number of CPUs of the arm64 `boot` test. The other arm64 tests have one CPU.
+const AARCH64_SMP_CPUS: &str = "4";
 
 /// The offset and the value of the magic number in the header of a Linux arm64 `Image`, per
 /// Documentation/arch/arm64/booting.rst of Linux.
@@ -1893,8 +1936,27 @@ fn arm64_image(elf: &[u8]) -> Result<Vec<u8>> {
     Ok(image)
 }
 
-/// Builds the arm64 kernel and runs `AARCH64_TESTS` on `qemu-system-aarch64 -M virt`, and adds
-/// the failures to `errors`. Without QEMU for arm64, the tests are skipped, except in CI.
+/// Builds the arm64 user programs of tests/user and the initramfs of the `init` test next to the
+/// kernel `elf`. Gives the path of the initramfs, or `None` if there is no arm64 C compiler.
+fn aarch64_initramfs(elf: &Path) -> Result<Option<PathBuf>> {
+    let Some(cc) = find_user_cc_aarch64() else {
+        println!("user programs on arm64: skipped, no C compiler, set RK_USER_CC_AARCH64");
+        return Ok(None);
+    };
+    let (init, hello) = (elf.with_file_name("user-init"), elf.with_file_name("user-hello"));
+    compile_user(&cc, "init", false, &init)?;
+    compile_user(&cc, "hello", true, &hello)?;
+    let read = |p: &Path| fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
+    let initrd = elf.with_file_name("initramfs.cpio");
+    let user = (read(&init)?, read(&hello)?);
+    fs::write(&initrd, test_initramfs(Some(&user), None))
+        .map_err(|e| format!("{}: {e}", initrd.display()))?;
+    Ok(Some(initrd))
+}
+
+/// Builds the arm64 kernel and runs `AARCH64_TESTS`, and `AARCH64_USER_TESTS` with a C compiler,
+/// on `qemu-system-aarch64 -M virt`, and adds the failures to `errors`. Without QEMU for arm64,
+/// the tests are skipped, except in CI.
 fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
     let qemu = "qemu-system-aarch64";
     if Command::new(qemu).arg("--version").stdout(Stdio::null()).status().is_err() {
@@ -1909,19 +1971,30 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
     let elf = fs::read(&elf_path).map_err(|e| format!("{}: {e}", elf_path.display()))?;
     let image = elf_path.with_file_name("Image");
     fs::write(&image, arm64_image(&elf)?).map_err(|e| format!("{}: {e}", image.display()))?;
-    for test in AARCH64_TESTS {
+    let initrd = aarch64_initramfs(&elf_path)?;
+    let user_tests = if initrd.is_some() { AARCH64_USER_TESTS } else { &[] };
+    for test in AARCH64_TESTS.iter().chain(user_tests) {
+        let smp = if matches!(*test, "boot" | "smp") { AARCH64_SMP_CPUS } else { "1" };
+        let cmdline = test_cmdline(test).replace("console=ttyS0", "console=ttyAMA0");
         let mut cmd = Command::new(qemu);
-        cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M"])
+        cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-smp", smp])
             .args(["-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot"])
             .arg("-kernel")
             .arg(&image)
             .arg("-append")
-            .arg(format!("console=ttyAMA0 rk.test={test}"));
+            .arg(cmdline);
+        if let Some(initrd) = initrd.as_ref().filter(|_| user_tests.contains(test)) {
+            cmd.arg("-initrd").arg(initrd);
+        }
         // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
         // gives the result.
-        let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, &[])?;
+        // QEMU emulates each arm64 instruction on an x86-64 host, so init has more time.
+        let timeout =
+            if user_tests.contains(test) { AARCH64_USER_TIMEOUT } else { BOOT_TEST_TIMEOUT };
+        let (status, log) = run_with_timeout(cmd, timeout, &[])?;
         let passed = status == Some(0)
             && log.contains("aarch64 booting with linux")
+            && log.contains(&format!("smp: {smp} CPUs run"))
             && log.contains(&pass_line(test));
         if passed {
             println!("boot test {test} on arm64: pass");

@@ -120,6 +120,7 @@ pub(crate) fn signalfd4(cx: &Cx<'_>, fd: u64, mask: u64, size: u64, flags: u64) 
     Ok(cx.files()?.lock().insert(file, flags & SFD_CLOEXEC != 0)? as u64)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn signalfd(cx: &Cx<'_>, fd: u64, mask: u64, size: u64) -> SysResult {
     signalfd4(cx, fd, mask, size, 0)
 }

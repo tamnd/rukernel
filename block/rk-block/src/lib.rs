@@ -369,11 +369,11 @@ impl cache::Store for Arc<Queue> {
 
 /// The time for the deadlines, in nanoseconds since boot. On the host there is no clock.
 fn now() -> u64 {
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         rk_frame::time::clock_ns()
     }
-    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
     {
         0
     }

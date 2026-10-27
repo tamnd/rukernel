@@ -1,8 +1,10 @@
 //! The flattened device tree, per the Devicetree Specification v0.4 chapter 5.
 //!
 //! The boot loader of arm64 gives the device tree, per spec/15-boot-and-platform.md section 15.4.
-//! The boot path reads the memory, the reserved memory, the command line, the initramfs and the
-//! PSCI method from it. The full binding set comes later.
+//! The boot path reads the memory, the reserved memory, the command line, the initramfs, the PSCI
+//! method, the CPUs and the addresses of the devices that rk-frame drives from it: the PL011 UART,
+//! the GICv2, the interrupt of the virtual timer, the PL031 RTC and the ECAM of a generic PCI host.
+//! The full binding set comes later.
 
 use crate::addr::PhysAddr;
 use crate::boot::{BootInfo, MemoryKind};
@@ -23,11 +25,114 @@ const MAX_DEPTH: usize = 16;
 /// The most memory ranges and reserved ranges that the boot path keeps.
 const MAX_RANGES: usize = 32;
 
-/// What the boot path needs from the device tree, apart from the `BootInfo`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The most CPUs that the boot path keeps from the `/cpus` node.
+pub(crate) const MAX_CPUS: usize = 64;
+
+/// What the boot path needs from the device tree, apart from the `BootInfo`. A device that the
+/// device tree does not give is `None`, and the caller uses the address of QEMU `virt` then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Platform {
     /// The PSCI calls use `smc`. Without this, they use `hvc`.
     pub(crate) psci_smc: bool,
+    /// The physical address of the PL011 UART.
+    pub(crate) uart: Option<u64>,
+    /// The physical addresses of the GICv2 distributor and CPU interface.
+    pub(crate) gic: Option<(u64, u64)>,
+    /// The device tree has a GICv3, which the kernel does not drive yet.
+    pub(crate) gic_v3: bool,
+    /// The interrupt number of the virtual timer of EL1.
+    pub(crate) timer_intid: Option<u32>,
+    /// The physical address of the PL031 RTC.
+    pub(crate) rtc: Option<u64>,
+    /// The physical address and the size of the ECAM of a generic PCI host.
+    pub(crate) pci_ecam: Option<(u64, u64)>,
+    /// The MPIDR affinity of each CPU, in the order of the device tree. The first `cpu_count` are
+    /// valid.
+    pub(crate) cpus: [u64; MAX_CPUS],
+    /// The number of CPUs in `cpus`.
+    pub(crate) cpu_count: usize,
+}
+
+impl Default for Platform {
+    fn default() -> Self {
+        Self {
+            psci_smc: false,
+            uart: None,
+            gic: None,
+            gic_v3: false,
+            timer_intid: None,
+            rtc: None,
+            pci_ecam: None,
+            cpus: [0; MAX_CPUS],
+            cpu_count: 0,
+        }
+    }
+}
+
+/// The properties of a node at depth 1 that tell which device it is and where.
+#[derive(Clone, Copy, Default)]
+struct Node<'a> {
+    name: &'a str,
+    compatible: &'a [u8],
+    reg: &'a [u8],
+    interrupts: &'a [u8],
+    status: &'a [u8],
+}
+
+impl Node<'_> {
+    /// Tells if `name` is one of the strings of the `compatible` property.
+    fn is(&self, name: &str) -> bool {
+        self.compatible.split(|&b| b == 0).any(|c| c == name.as_bytes())
+    }
+
+    /// Tells if the device is on. A node with no `status` is on.
+    fn enabled(&self) -> bool {
+        self.status.is_empty()
+            || self.status.starts_with(b"okay")
+            || self.status.starts_with(b"ok\0")
+    }
+
+    /// The address and the size of entry `n` of `reg`.
+    fn reg(&self, n: usize, addr_cells: u32, size_cells: u32) -> Option<(u64, u64)> {
+        let at = n * 4 * (addr_cells + size_cells) as usize;
+        let start = cells(self.reg, at, addr_cells)?;
+        let len = if size_cells == 0 {
+            0
+        } else {
+            cells(self.reg, at + 4 * addr_cells as usize, size_cells)?
+        };
+        Some((start, len))
+    }
+
+    /// Keeps the device of this node in `platform`, if rk-frame drives it.
+    fn finish(&self, platform: &mut Platform, addr_cells: u32, size_cells: u32) {
+        if self.name.is_empty() || !self.enabled() {
+            return;
+        }
+        let first = self.reg(0, addr_cells, size_cells);
+        if self.is("arm,pl011") && platform.uart.is_none() {
+            platform.uart = first.map(|r| r.0);
+        } else if self.is("arm,pl031") && platform.rtc.is_none() {
+            platform.rtc = first.map(|r| r.0);
+        } else if self.is("pci-host-ecam-generic") && platform.pci_ecam.is_none() {
+            platform.pci_ecam = first;
+        } else if self.is("arm,gic-v3") {
+            platform.gic_v3 = true;
+        } else if self.is("arm,cortex-a15-gic") || self.is("arm,gic-400") {
+            if let (Some(d), Some(c)) = (first, self.reg(1, addr_cells, size_cells)) {
+                platform.gic = Some((d.0, c.0));
+            }
+        } else if self.is("arm,armv8-timer") || self.is("arm,armv7-timer") {
+            // The interrupts are the secure physical, the physical, the virtual and the
+            // hypervisor timers, with three cells each: the kind, the number and the flags. A
+            // PPI number starts at 16.
+            let kind = be32(self.interrupts, 24);
+            let number = be32(self.interrupts, 28);
+            if let (Some(1), Some(n)) = (kind, number) {
+                platform.timer_intid = Some(n + 16);
+            }
+        }
+    }
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
@@ -156,35 +261,61 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
     let mut platform = Platform::default();
     let mut ram = Ranges::new();
     let (mut addr_cells, mut size_cells) = (2, 1);
+    let mut cpu_cells = 1;
     let (mut initrd_start, mut initrd_end) = (None, None);
     let number = |v: &[u8]| cells(v, 0, (v.len() / 4) as u32);
-    walk(structs, strings, |depth, node, prop, value| match (depth, prop) {
-        // The properties of a node come before its children, so the cells are known before the
-        // memory nodes.
-        (0, "#address-cells") => addr_cells = be32(value, 0).unwrap_or(2),
-        (0, "#size-cells") => size_cells = be32(value, 0).unwrap_or(1),
-        (1, "reg") if node == "memory" || node.starts_with("memory@") => {
-            let stride = 4 * (addr_cells + size_cells) as usize;
-            for at in (0..value.len()).step_by(stride.max(4)) {
-                let start = cells(value, at, addr_cells);
-                let len = cells(value, at + 4 * addr_cells as usize, size_cells);
-                if let (Some(start), Some(len)) = (start, len) {
-                    ram.push(start, len);
+    // The properties of one node come together, before its children. So a node at depth 1 is
+    // complete when a property of another node at depth 1 comes.
+    let mut node = Node::default();
+    walk(structs, strings, |depth, name, prop, value| {
+        if depth == 1 && !core::ptr::eq(name, node.name) {
+            node.finish(&mut platform, addr_cells, size_cells);
+            node = Node { name, ..Node::default() };
+        }
+        match (depth, prop) {
+            (1, "compatible") => node.compatible = value,
+            (1, "reg") => node.reg = value,
+            (1, "interrupts") => node.interrupts = value,
+            (1, "status") => node.status = value,
+            (1, "#address-cells") if name == "cpus" => cpu_cells = be32(value, 0).unwrap_or(1),
+            (2, "reg") if name.starts_with("cpu@") && platform.cpu_count < MAX_CPUS => {
+                if let Some(id) = cells(value, 0, cpu_cells) {
+                    platform.cpus[platform.cpu_count] = id;
+                    platform.cpu_count += 1;
                 }
             }
+            _ => {}
         }
-        (1, "bootargs") if node == "chosen" => {
-            for &b in value.iter().take_while(|&&b| b != 0) {
-                if !info.push_cmdline_byte(b) {
-                    break;
+        let node = name;
+        match (depth, prop) {
+            // The properties of a node come before its children, so the cells are known before the
+            // memory nodes.
+            (0, "#address-cells") => addr_cells = be32(value, 0).unwrap_or(2),
+            (0, "#size-cells") => size_cells = be32(value, 0).unwrap_or(1),
+            (1, "reg") if node == "memory" || node.starts_with("memory@") => {
+                let stride = 4 * (addr_cells + size_cells) as usize;
+                for at in (0..value.len()).step_by(stride.max(4)) {
+                    let start = cells(value, at, addr_cells);
+                    let len = cells(value, at + 4 * addr_cells as usize, size_cells);
+                    if let (Some(start), Some(len)) = (start, len) {
+                        ram.push(start, len);
+                    }
                 }
             }
+            (1, "bootargs") if node == "chosen" => {
+                for &b in value.iter().take_while(|&&b| b != 0) {
+                    if !info.push_cmdline_byte(b) {
+                        break;
+                    }
+                }
+            }
+            (1, "linux,initrd-start") if node == "chosen" => initrd_start = number(value),
+            (1, "linux,initrd-end") if node == "chosen" => initrd_end = number(value),
+            (1, "method") if node == "psci" => platform.psci_smc = value.starts_with(b"smc"),
+            _ => {}
         }
-        (1, "linux,initrd-start") if node == "chosen" => initrd_start = number(value),
-        (1, "linux,initrd-end") if node == "chosen" => initrd_end = number(value),
-        (1, "method") if node == "psci" => platform.psci_smc = value.starts_with(b"smc"),
-        _ => {}
     })?;
+    node.finish(&mut platform, addr_cells, size_cells);
     if let (Some(start), Some(end)) = (initrd_start, initrd_end) {
         info.set_initrd(PhysAddr::new(start), end.saturating_sub(start));
     }
@@ -333,6 +464,78 @@ mod tests {
                 region(0x5000_0000 + dtb_len, 0x1000_0000 - dtb_len, MemoryKind::Usable),
             ]
         );
+    }
+
+    #[test]
+    fn reads_the_devices_and_cpus() {
+        let mut b = Builder::default();
+        b.begin("");
+        b.prop("#address-cells", &be(&[2]));
+        b.prop("#size-cells", &be(&[2]));
+        b.begin("cpus");
+        b.prop("#address-cells", &be(&[1]));
+        b.prop("#size-cells", &be(&[0]));
+        for id in [0, 1] {
+            b.begin(if id == 0 { "cpu@0" } else { "cpu@1" });
+            b.prop("device_type", b"cpu\0");
+            b.prop("reg", &be(&[id]));
+            b.end();
+        }
+        b.end();
+        b.begin("pl011@9040000");
+        b.prop("status", b"disabled\0");
+        b.prop("compatible", b"arm,pl011\0arm,primecell\0");
+        b.prop("reg", &be(&[0, 0x0904_0000, 0, 0x1000]));
+        b.end();
+        b.begin("pl011@9000000");
+        b.prop("reg", &be(&[0, 0x0900_0000, 0, 0x1000]));
+        b.prop("compatible", b"arm,pl011\0arm,primecell\0");
+        b.end();
+        b.begin("intc@8000000");
+        b.prop("compatible", b"arm,cortex-a15-gic\0");
+        b.prop("reg", &be(&[0, 0x0800_0000, 0, 0x1_0000, 0, 0x0801_0000, 0, 0x1_0000]));
+        b.begin("v2m@8020000");
+        b.prop("compatible", b"arm,gic-v2m-frame\0");
+        b.prop("reg", &be(&[0, 0x0802_0000, 0, 0x1000]));
+        b.end();
+        b.end();
+        b.begin("timer");
+        b.prop("compatible", b"arm,armv8-timer\0arm,armv7-timer\0");
+        b.prop("interrupts", &be(&[1, 13, 0xf04, 1, 14, 0xf04, 1, 11, 0xf04, 1, 10, 0xf04]));
+        b.end();
+        b.begin("pl031@9010000");
+        b.prop("compatible", b"arm,pl031\0arm,primecell\0");
+        b.prop("reg", &be(&[0, 0x0901_0000, 0, 0x1000]));
+        b.end();
+        b.begin("pcie@10000000");
+        b.prop("compatible", b"pci-host-ecam-generic\0");
+        b.prop("reg", &be(&[0x40, 0x1000_0000, 0, 0x1000_0000]));
+        b.end();
+        b.end();
+        let blob = b.finish(&[]);
+        let mut info = BootInfo::new("test");
+        let p = read(&blob, 0x5000_0000, &mut info).unwrap();
+        assert_eq!(p.uart, Some(0x0900_0000));
+        assert_eq!(p.gic, Some((0x0800_0000, 0x0801_0000)));
+        assert!(!p.gic_v3);
+        assert_eq!(p.timer_intid, Some(27));
+        assert_eq!(p.rtc, Some(0x0901_0000));
+        assert_eq!(p.pci_ecam, Some((0x40_1000_0000, 0x1000_0000)));
+        assert_eq!(&p.cpus[..p.cpu_count], &[0, 1]);
+    }
+
+    #[test]
+    fn a_tree_with_no_devices_gives_none() {
+        let mut b = Builder::default();
+        b.begin("");
+        b.prop("#address-cells", &be(&[2]));
+        b.begin("chosen");
+        b.end();
+        b.end();
+        let blob = b.finish(&[]);
+        let mut info = BootInfo::new("test");
+        let p = read(&blob, 0, &mut info).unwrap();
+        assert_eq!(p, Platform::default());
     }
 
     #[test]

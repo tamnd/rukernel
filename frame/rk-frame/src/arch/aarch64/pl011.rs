@@ -5,10 +5,17 @@
 //! console is polled.
 
 use super::paging::MMIO_BASE;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// The UART of QEMU virt, in the device window of the boot page tables.
+/// The virtual address of the UART. It starts as the UART of QEMU virt, in the device window of
+/// the boot page tables, so the console works before the device tree is read.
 // TODO: read the address from `/chosen/stdout-path` of the device tree.
-const BASE: usize = MMIO_BASE + 0x0900_0000;
+static BASE: AtomicUsize = AtomicUsize::new(MMIO_BASE + 0x0900_0000);
+
+/// Uses the UART at the virtual address `base`, from the device tree.
+pub(crate) fn set_base(base: usize) {
+    BASE.store(base, Ordering::Relaxed);
+}
 
 /// The data register.
 const DR: usize = 0x00;
@@ -20,14 +27,14 @@ const FR_RXFE: u32 = 1 << 4;
 const FR_TXFF: u32 = 1 << 5;
 
 fn read(reg: usize) -> u32 {
-    // SAFETY: the boot page tables map the UART registers as device memory at `BASE`, and rk-frame
+    // SAFETY: the page tables map the UART registers as device memory at `BASE`, and rk-frame
     // owns the UART. A read of the flag or data register changes no memory.
-    unsafe { ((BASE + reg) as *const u32).read_volatile() }
+    unsafe { ((BASE.load(Ordering::Relaxed) + reg) as *const u32).read_volatile() }
 }
 
 fn write(reg: usize, value: u32) {
     // SAFETY: as for `read`. A write to the data register sends one byte.
-    unsafe { ((BASE + reg) as *mut u32).write_volatile(value) };
+    unsafe { ((BASE.load(Ordering::Relaxed) + reg) as *mut u32).write_volatile(value) };
 }
 
 fn put(b: u8) {

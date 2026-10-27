@@ -272,7 +272,7 @@ impl<T> Default for Eevdf<T> {
     }
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod glue {
     use super::balance::{self, BALANCE_INTERVAL, Load};
     use super::{Eevdf, Entity, WEIGHT_IDLE, weight_of};
@@ -557,7 +557,7 @@ mod glue {
     }
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use glue::{Fair, init};
 
 #[cfg(test)]

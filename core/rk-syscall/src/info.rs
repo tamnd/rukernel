@@ -153,6 +153,7 @@ pub(crate) fn gettimeofday(cx: &Cx<'_>, tv: u64, tz: u64) -> SysResult {
     Ok(0)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn time(cx: &Cx<'_>, tloc: u64) -> SysResult {
     let sec = realtime_ns() / NSEC_PER_SEC;
     cx.write_opt(tloc, &sec)?;

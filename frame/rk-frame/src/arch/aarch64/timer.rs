@@ -3,15 +3,25 @@
 //! The kernel uses the virtual timer of EL1, as Linux does in a guest. The virtual counter gives
 //! the clock, and the timer interrupts `HZ` times each second.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The timer interrupts each second.
 pub(crate) const HZ: u64 = 250;
 const NS_PER_TICK: u64 = 1_000_000_000 / HZ;
 
-/// The interrupt of the virtual timer: PPI 11.
-// TODO: read it from the `timer` node of the device tree.
-pub(crate) const INTID: u32 = 27;
+/// The interrupt of the virtual timer. It is PPI 11 on QEMU virt, and the `timer` node of the
+/// device tree can change it.
+static INTID: AtomicU32 = AtomicU32::new(27);
+
+/// Uses the interrupt `intid` for the timer, from the device tree.
+pub(crate) fn set_intid(intid: u32) {
+    INTID.store(intid, Ordering::Relaxed);
+}
+
+/// The interrupt of the virtual timer.
+pub(crate) fn intid() -> u32 {
+    INTID.load(Ordering::Relaxed)
+}
 
 /// The timer interrupts since boot.
 pub(crate) static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -62,17 +72,27 @@ pub(crate) fn init() {
     let now = counter();
     BOOT_COUNT.store(now, Ordering::Relaxed);
     TICK_COUNT.store(now, Ordering::Relaxed);
+    init_cpu();
+}
+
+/// Starts the timer of this CPU. Each CPU has its own timer and its own PPI.
+pub(crate) fn init_cpu() {
+    let freq = TIMER_HZ.load(Ordering::Relaxed);
     if freq == 0 {
         return;
     }
-    super::gic::enable(INTID);
+    super::gic::enable(intid());
     arm(freq);
 }
 
-/// Handles the timer interrupt.
+/// Handles the timer interrupt. Each CPU gets one, and the boot CPU counts the ticks.
 pub(crate) fn tick() {
-    TICK_COUNT.store(counter(), Ordering::Release);
-    TICKS.fetch_add(1, Ordering::Release);
+    if super::cpu::id() == 0 {
+        // `clock_ns` reads the tick count before and after the counter of the tick, so the counter
+        // must change first.
+        TICK_COUNT.store(counter(), Ordering::Release);
+        TICKS.fetch_add(1, Ordering::Release);
+    }
     arm(TIMER_HZ.load(Ordering::Relaxed));
 }
 

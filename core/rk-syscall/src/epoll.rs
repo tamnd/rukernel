@@ -23,6 +23,15 @@ use rk_abi::native::open::O_RDWR;
 use rk_abi::native::types::EpollEvent;
 use rk_frame::sync::SpinLock;
 use rk_vfs::file::{File, FileOps};
+use zerocopy::FromZeros;
+
+/// Makes an `epoll_event`. The padding of the struct is not the same on each architecture.
+fn epoll_event(events: u32, data: u64) -> EpollEvent {
+    let mut e = EpollEvent::new_zeroed();
+    e.events = events;
+    e.data = data;
+    e
+}
 
 /// The most levels of epoll files in epoll files, as `EP_MAX_NESTS` of Linux.
 const MAX_NESTS: usize = 4;
@@ -157,7 +166,7 @@ impl Epoll {
             }
             let Some(file) = item.file.upgrade() else { continue };
             if let Some(events) = item.scan(&file) {
-                out.push(EpollEvent { events, data: item.data });
+                out.push(epoll_event(events, item.data));
                 given.push(n);
             }
         }
@@ -233,6 +242,7 @@ pub(crate) fn epoll_create1(cx: &Cx<'_>, flags: u64) -> SysResult {
     Ok(cx.files()?.lock().insert(file, flags & EPOLL_CLOEXEC != 0)? as u64)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn epoll_create(cx: &Cx<'_>, size: u64) -> SysResult {
     if size as i32 <= 0 {
         return Err(Errno::EINVAL);
@@ -255,8 +265,7 @@ fn epoll_file(cx: &Cx<'_>, epfd: u64) -> core::result::Result<Arc<File>, Errno> 
 pub(crate) fn epoll_ctl(cx: &Cx<'_>, epfd: u64, op: u64, fd: u64, event: u64) -> SysResult {
     let op = op as u32;
     let has_event = op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD;
-    let wanted: EpollEvent =
-        if has_event { cx.read_val(event)? } else { EpollEvent { events: 0, data: 0 } };
+    let wanted: EpollEvent = if has_event { cx.read_val(event)? } else { epoll_event(0, 0) };
     let ep_file = cx.file(epfd)?;
     let file = cx.file(fd)?;
     if ep_file.flags().is_path() || file.flags().is_path() {
@@ -369,6 +378,7 @@ fn no_restart(r: SysResult) -> SysResult {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn epoll_wait(cx: &Cx<'_>, epfd: u64, events: u64, max: u64, timeout: u64) -> SysResult {
     no_restart(do_wait(cx, epfd, events, max, ms_deadline(timeout)))
 }
