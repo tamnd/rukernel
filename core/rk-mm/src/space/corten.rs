@@ -52,6 +52,8 @@ fn same_area(a: &Vma<FileRef>, b: &Vma<FileRef>) -> bool {
         && a.huge == b.huge
         && a.account == b.account
         && a.hugetlb == b.hugetlb
+        && a.dont_fork == b.dont_fork
+        && a.wipe_on_fork == b.wipe_on_fork
         && a.kind == b.kind
 }
 
