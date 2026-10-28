@@ -4,12 +4,14 @@
 //! MMU on. The console is the PL011 UART, the interrupt controller is a GICv2 or a GICv3, and the
 //! tick comes from the virtual timer of the generic timer. The device tree gives the addresses,
 //! and the addresses of QEMU `virt` are the fallback. The virtio devices are on virtio-mmio or on
-//! the PCI bus of the generic ECAM host, and their SPIs wake the drivers. User programs get a vDSO
+//! the PCI bus of the generic ECAM host, and their SPIs, or the LPIs of their MSI-X messages through
+//! the GICv3 ITS, wake the drivers. User programs get a vDSO
 //! with the time calls and `__kernel_rt_sigreturn`.
 
 pub(crate) mod boot;
 pub(crate) mod cpu;
 pub(crate) mod gic;
+pub(crate) mod its;
 pub(crate) mod paging;
 pub(crate) mod pl011;
 pub(crate) mod smp;
@@ -23,14 +25,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Handles an interrupt from the GIC. The trap handler calls this with interrupts off.
 fn interrupt() {
     let iar = gic::ack();
-    let id = iar & 0x3ff;
+    let id = gic::intid(iar);
     if id == timer::intid() {
         timer::tick();
         gic::eoi(iar);
     } else if id == smp::SGI_CALL {
         smp::poll();
         gic::eoi(iar);
-    } else if id == smp::SGI_RESCHEDULE {
+    } else if id == smp::SGI_RESCHEDULE || its::handle(id) {
         gic::eoi(iar);
     } else if gic::is_device(id) {
         gic::device_interrupt(id);

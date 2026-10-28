@@ -62,7 +62,6 @@ impl IoMem {
     }
 
     /// The kernel virtual address of the range.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn base(&self) -> usize {
         self.virt
     }

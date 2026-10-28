@@ -10,6 +10,7 @@ extend-exclude = [
     "tools/fstests/ext4.md",
     "tools/fstests/overlay.md",
     "tools/ltp/syscalls.md",
+    "tools/ltp/*-aarch64.md",
     "tools/ltp/mm.md",
     "tools/ltp/sched.md",
     "tools/ltp/net.md",
@@ -37,3 +38,4 @@ Ofo = "Ofo"       # OfoPruned of /proc/net/netstat, the out of order queue of TC
 ECT = "ECT"       # InECT0Pkts of /proc/net/netstat, the ECN capable transport
 ND = "ND"         # ND_OPT_* of IPv6 neighbour discovery, RFC 4861
 prefered = "prefered" # temp_prefered_lft, the IPv6 sysctl of Linux
+TRANSLATER = "TRANSLATER" # GITS_TRANSLATER, the MSI doorbell register of the Arm GICv3 ITS

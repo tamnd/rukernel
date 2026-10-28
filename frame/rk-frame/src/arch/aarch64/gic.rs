@@ -8,7 +8,7 @@
 //! A GICv2 has a memory mapped CPU interface. A GICv3 has a redistributor for each CPU, in a
 //! region of memory, and a CPU interface of system registers, as drivers/irqchip/irq-gic-v3.c of
 //! Linux. The device tree tells which GIC the machine has. Without a device tree, the kernel uses
-//! the GICv2 of QEMU `virt`.
+//! the GICv2 of QEMU `virt`. The LPIs of a GICv3 come from its ITS, which its.rs drives.
 
 use super::paging::MMIO_BASE;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -18,10 +18,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 static GICD_BASE: AtomicUsize = AtomicUsize::new(MMIO_BASE + 0x0800_0000);
 static GICC_BASE: AtomicUsize = AtomicUsize::new(MMIO_BASE + 0x0801_0000);
 
-/// The GIC is a GICv3. Then `GICR_BASE` and `GICR_LEN` give the redistributor region.
+/// The GIC is a GICv3. Then `GICR_BASE` and `GICR_LEN` give the redistributor region, and
+/// `GICR_PHYS` its physical address.
 static V3: AtomicBool = AtomicBool::new(false);
 static GICR_BASE: AtomicUsize = AtomicUsize::new(0);
 static GICR_LEN: AtomicUsize = AtomicUsize::new(0);
+static GICR_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Uses the GICv2 distributor and CPU interface at these virtual addresses, from the device tree.
 pub(crate) fn set_base(gicd: usize, gicc: usize) {
@@ -30,10 +32,11 @@ pub(crate) fn set_base(gicd: usize, gicc: usize) {
 }
 
 /// Uses the GICv3 distributor and the redistributor region of `len` bytes at these virtual
-/// addresses, from the device tree.
-pub(crate) fn set_base_v3(gicd: usize, gicr: usize, len: usize) {
+/// addresses, from the device tree. `gicr_phys` is the physical address of the region.
+pub(crate) fn set_base_v3(gicd: usize, gicr: usize, len: usize, gicr_phys: u64) {
     GICD_BASE.store(gicd, Ordering::Relaxed);
     GICR_BASE.store(gicr, Ordering::Relaxed);
+    GICR_PHYS.store(gicr_phys, Ordering::Relaxed);
     GICR_LEN.store(len, Ordering::Relaxed);
     V3.store(true, Ordering::Relaxed);
 }
@@ -46,11 +49,12 @@ fn gicc() -> usize {
     GICC_BASE.load(Ordering::Relaxed)
 }
 
-fn v3() -> bool {
+pub(crate) fn v3() -> bool {
     V3.load(Ordering::Relaxed)
 }
 
 const GICD_CTLR: usize = 0x000;
+const GICD_TYPER: usize = 0x004;
 const GICD_IGROUPR: usize = 0x080;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
@@ -87,28 +91,28 @@ const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 pub(crate) const SPURIOUS: u32 = 1020;
 
 /// The priority of each interrupt that the kernel enables. A lower value is a higher priority.
-const PRIORITY: u8 = 0xa0;
+pub(crate) const PRIORITY: u8 = 0xa0;
 
 /// The priority mask of each CPU. All priorities below the mask go to the CPU.
 const PRIORITY_MASK: u64 = 0xf0;
 
-fn read(addr: usize) -> u32 {
+pub(crate) fn read(addr: usize) -> u32 {
     // SAFETY: the page tables map the GIC registers as device memory, and rk-frame owns the
     // GIC. The registers have no effect on memory.
     unsafe { (addr as *const u32).read_volatile() }
 }
 
-fn read64(addr: usize) -> u64 {
+pub(crate) fn read64(addr: usize) -> u64 {
     // SAFETY: as for `read`.
     unsafe { (addr as *const u64).read_volatile() }
 }
 
-fn write(addr: usize, value: u32) {
+pub(crate) fn write(addr: usize, value: u32) {
     // SAFETY: as for `read`.
     unsafe { (addr as *mut u32).write_volatile(value) };
 }
 
-fn write64(addr: usize, value: u64) {
+pub(crate) fn write64(addr: usize, value: u64) {
     // SAFETY: as for `read`.
     unsafe { (addr as *mut u64).write_volatile(value) };
 }
@@ -247,11 +251,25 @@ fn init_cpu_v3() {
     // ICC_SRE_EL1: use the system registers.
     let sre = mrs!("s3_0_c12_c12_5");
     msr!("s3_0_c12_c12_5", sre | 1);
+    super::its::init_cpu(id);
 }
 
 /// The redistributor of this CPU.
 fn redistributor() -> usize {
     REDISTRIBUTORS.get(super::cpu::id()).map_or(0, |r| r.load(Ordering::Relaxed))
+}
+
+/// The virtual and the physical address of the redistributor of the CPU `id`, or `None` if the
+/// CPU did not start or the GIC is not a GICv3.
+pub(crate) fn redistributor_of(id: usize) -> Option<(usize, u64)> {
+    let rd = REDISTRIBUTORS.get(id)?.load(Ordering::Relaxed);
+    let at = rd.checked_sub(GICR_BASE.load(Ordering::Relaxed))?;
+    (rd != 0).then(|| (rd, GICR_PHYS.load(Ordering::Relaxed) + at as u64))
+}
+
+/// The `GICD_TYPER` register: the number of interrupt ID bits and the support of LPIs.
+pub(crate) fn typer() -> u32 {
+    read(gicd() + GICD_TYPER)
 }
 
 /// Sends the SGI `sgi` to the CPU `id`.
@@ -293,15 +311,21 @@ pub(crate) fn enable(intid: u32) {
     write(gicd() + GICD_ISENABLER + n / 32 * 4, bit);
 }
 
-/// Takes the pending interrupt with the highest priority. Gives the value for `eoi`. Its low 10
-/// bits are the interrupt number.
+/// Takes the pending interrupt with the highest priority. Gives the value for `eoi`. `intid`
+/// gives the interrupt number from it.
 pub(crate) fn ack() -> u32 {
     if v3() {
-        // ICC_IAR1_EL1. The interrupt number has 24 bits, and the kernel uses fewer than 1020.
+        // ICC_IAR1_EL1.
         mrs!("s3_0_c12_c12_0") as u32
     } else {
         read(gicc() + GICC_IAR)
     }
+}
+
+/// The interrupt number of a value from `ack`: 24 bits on a GICv3, for the LPIs, and 10 bits on
+/// a GICv2.
+pub(crate) fn intid(iar: u32) -> u32 {
+    if v3() { iar & 0xff_ffff } else { iar & 0x3ff }
 }
 
 /// Tells the GIC that the handler of an interrupt from `ack` is done.
@@ -369,25 +393,37 @@ pub(crate) fn device_interrupt(intid: u32) {
 
 /// Tells if the device line `intid` came since the last `take_device`.
 pub(crate) fn fired(intid: u32) -> bool {
+    if intid >= super::its::FIRST_LPI {
+        return super::its::fired(intid);
+    }
     let (_, fired, b) = bit(intid);
     fired.load(Ordering::Acquire) & b != 0
 }
 
 /// Tells if the device line `intid` came since the last call, and clears the flag.
 pub(crate) fn take_device(intid: u32) -> bool {
+    if intid >= super::its::FIRST_LPI {
+        return super::its::take(intid);
+    }
     let (_, fired, b) = bit(intid);
     fired.fetch_and(!b, Ordering::AcqRel) & b != 0
 }
 
 /// Turns the device line `intid` on again.
 pub(crate) fn unmask_device(intid: u32) {
-    if is_device(intid) {
+    if intid >= super::its::FIRST_LPI {
+        super::its::unmask(intid);
+    } else if is_device(intid) {
         write(gicd() + GICD_ISENABLER + intid as usize / 32 * 4, 1 << (intid % 32));
     }
 }
 
 /// Sends the device line `intid` to this CPU.
 pub(crate) fn route_here(intid: u32) {
+    if intid >= super::its::FIRST_LPI {
+        super::its::route_here(intid);
+        return;
+    }
     if !is_device(intid) {
         return;
     }

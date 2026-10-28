@@ -216,6 +216,15 @@ impl PciTransport {
         }
     }
 
+    /// The kind of the interrupt of the device, for the log: MSI-X, INTx, or none.
+    pub(crate) fn irq_kind(&self) -> &'static str {
+        match self.irq {
+            Irq::Msix(_) => "MSI-X",
+            Irq::Intx(..) => "INTx",
+            Irq::None => "no interrupt",
+        }
+    }
+
     /// Tells the device that the driver saw its interrupt. For the INTx line, the read of the
     /// ISR status byte clears it, and the device then lowers the line.
     pub(crate) fn ack_interrupt(&self) {

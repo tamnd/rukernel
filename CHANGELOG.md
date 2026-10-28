@@ -2,6 +2,14 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- MSI-X on arm64 through the GICv3 ITS, as drivers/irqchip/irq-gic-v3-its.c of Linux (#424). The kernel finds the ITS and the `msi-map` of the PCI host in the device tree, turns on the LPIs of each redistributor and maps each MSI-X vector to an LPI with `MAPD` and `MAPTI`. The virtio-pci devices on the QEMU `virt` machine use MSI-X when the machine has an ITS, and INTx when it has none.
+- PCI bridges and the buses after bus 0 on arm64, as `pci_scan_bridge` of Linux (#424). The scan gives the bus numbers and the memory windows of each bridge, and the INTx pin of a device behind a bridge goes through the swizzle of each bridge. The arm64 boot tests run `blk` and `inet` with virtio-pci on bus 0 and behind a `pcie-root-port`.
+- tools/ltp/syscalls-aarch64.md, the baseline of the LTP syscalls group on the arm64 kernel (#424). `report.py --arch aarch64` and `RK_LTP_ARCH=aarch64 tools/ltp/update.sh` make it from the runs of `run.py --arch aarch64`.
+
 ## [0.4.10] - 2026-10-29
 
 ### Added

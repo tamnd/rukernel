@@ -284,6 +284,12 @@ tools/ltp/update.sh
 
 The test server is `server3` by default. Set `RK_LTP_HOST` to use a different server, and `RK_LTP_DIR` to use a different directory on it. The directory has the output of `build.sh --full` and the batches of `run.py` in `runs`.
 
+`syscalls-aarch64.md` has the results of the syscalls group on the arm64 kernel, from the runs of `run.py --arch aarch64` in `~/rkltp-arm64` on the test server. `RK_LTP_ARCH=aarch64` makes `update.sh` give `--arch aarch64` to `report.py`. Then `report.py` writes `GROUP-aarch64.md` for each group with results, and it does not change this file:
+
+```sh
+RK_LTP_DIR=rkltp-arm64 RK_LTP_ARCH=aarch64 tools/ltp/update.sh
+```
+
 `report.py` can also run on logs that are on this computer:
 
 ```sh

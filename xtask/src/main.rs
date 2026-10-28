@@ -2079,8 +2079,8 @@ const AARCH64_TESTS: &[&str] =
 /// The tests that `boot-test aarch64` runs with the user programs of tests/user in the initramfs,
 /// as the x86-64 tests of the same names. They need `find_user_cc_aarch64`. The `busybox` test
 /// also needs an arm64 BusyBox from `RK_BUSYBOX_AARCH64`, which tools/busybox/build.sh makes. The
-/// `blk` and `inet` tests run two times: with the virtio-mmio devices of the `virt` machine, and
-/// with virtio-pci devices on the PCI bus of the ECAM host.
+/// `blk` and `inet` tests also run with virtio-pci devices on the PCI bus of the ECAM host, see
+/// `AARCH64_PCI_RUNS`.
 const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "inet", "busybox"];
 
 /// The time limit of each test of `AARCH64_USER_TESTS`. QEMU emulates each instruction, and the
@@ -2106,6 +2106,28 @@ const AARCH64_BUSYBOX_INPUT: &[(&str, &[u8])] = &[
     ("ONE TWO", b"sh -c 'while :; do echo T\"ICK\"; sleep 1; done'\n"),
     ("TICK", b"\x03"),
     ("TICK", b"test $? = 130; exit $?\n"),
+];
+
+/// How a virtio-pci device of an arm64 test is on the PCI bus.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArmPci {
+    /// The test uses the virtio-mmio devices.
+    No,
+    /// On bus 0, with MSI-X through the GICv3 ITS.
+    Bus0,
+    /// Behind a PCIe root port on bus 1, with MSI-X through the ITS.
+    Bridge,
+    /// Behind a PCIe root port on bus 1, with no MSI-X vectors on the device, so with the INTx
+    /// pin through the port. The root port needs the ITS for its own MSI-X capability.
+    BridgeIntx,
+}
+
+/// The runs of the arm64 user tests with virtio-pci devices.
+const AARCH64_PCI_RUNS: &[(&str, ArmPci)] = &[
+    ("blk", ArmPci::Bus0),
+    ("inet", ArmPci::Bus0),
+    ("blk", ArmPci::BridgeIntx),
+    ("inet", ArmPci::Bridge),
 ];
 
 /// The number of CPUs of the arm64 `boot` test. The other arm64 tests have one CPU.
@@ -2199,11 +2221,13 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
     };
     // The tests run with a GICv3, and the `boot` test also runs with a GICv2. The device tests
     // also run with virtio-pci devices.
-    let pci_runs =
-        user_tests.iter().filter(|t| matches!(**t, "blk" | "inet")).map(|t| (*t, "3", true));
-    let runs = [("boot", "2", false)]
+    let pci_runs = AARCH64_PCI_RUNS
+        .iter()
+        .filter(|(t, _)| user_tests.contains(t))
+        .map(|(t, pci)| (*t, "3", *pci));
+    let runs = [("boot", "2", ArmPci::No)]
         .into_iter()
-        .chain(AARCH64_TESTS.iter().chain(&user_tests).map(|t| (*t, "3", false)))
+        .chain(AARCH64_TESTS.iter().chain(&user_tests).map(|t| (*t, "3", ArmPci::No)))
         .chain(pci_runs);
     // RK_AARCH64_TESTS gives a list of test names with commas, for a run by hand.
     let only = std::env::var("RK_AARCH64_TESTS").ok();
@@ -2212,13 +2236,22 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         let test = &test;
         let name = match (gic, pci) {
             ("2", _) => format!("{test} with GICv2"),
-            (_, true) => format!("{test} with virtio-pci"),
+            (_, ArmPci::Bus0) => format!("{test} with virtio-pci"),
+            (_, ArmPci::Bridge) => format!("{test} with virtio-pci behind a bridge"),
+            (_, ArmPci::BridgeIntx) => format!("{test} with virtio-pci INTx behind a bridge"),
             _ => String::from(*test),
         };
-        let (blk_device, net_device) = if pci {
-            ("virtio-blk-pci", "virtio-net-pci")
-        } else {
+        let (blk_device, net_device) = if pci == ArmPci::No {
             ("virtio-blk-device", "virtio-net-device")
+        } else {
+            ("virtio-blk-pci", "virtio-net-pci")
+        };
+        // A device behind the bridge is on the bus of the root port. A device with `vectors=0` has
+        // no MSI-X capability, so it uses its INTx pin.
+        let bus = match pci {
+            ArmPci::Bridge => ",bus=rp0",
+            ArmPci::BridgeIntx => ",bus=rp0,vectors=0",
+            _ => "",
         };
         let smp = if matches!(*test, "boot" | "smp") { AARCH64_SMP_CPUS } else { "1" };
         // The `inet` test connects to a TCP server on the host, as on x86-64.
@@ -2228,7 +2261,11 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             cmdline = format!("{cmdline} {}", server.port);
         }
         let mut cmd = Command::new(qemu);
-        let machine = format!("virt,gic-version={gic}");
+        let machine = if gic == "3" {
+            String::from("virt,gic-version=3,its=on")
+        } else {
+            format!("virt,gic-version={gic}")
+        };
         cmd.args(["-M", &machine, "-cpu", "cortex-a72", "-m", "512M", "-smp", smp])
             .args(["-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot"])
             // The kernel drives the modern (version 2) virtio-mmio devices only.
@@ -2240,16 +2277,25 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         if let Some((initrd, _)) = initrd.as_ref().filter(|_| user_tests.contains(test)) {
             cmd.arg("-initrd").arg(initrd);
         }
+        // The `virt` machine has a virtio-net-pci device by default. The PCI runs remove it, so
+        // that the device of the test is the first device on bus 0.
+        if pci != ArmPci::No {
+            cmd.args(["-nic", "none"]);
+        }
+        if matches!(pci, ArmPci::Bridge | ArmPci::BridgeIntx) {
+            cmd.args(["-device", "pcie-root-port,id=rp0,bus=pcie.0,chassis=1,slot=1"]);
+        }
         if *test == "blk" {
             let disk = elf_path.with_file_name("blk.img");
             write_blk_disk(&disk)?;
             cmd.arg("-drive")
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .arg("-device")
-                .arg(format!("{blk_device},drive=disk0"));
+                .arg(format!("{blk_device},drive=disk0{bus}"));
         }
         if *test == "inet" {
-            cmd.args(["-netdev", "user,id=n0", "-device", &format!("{net_device},netdev=n0")]);
+            let device = format!("{net_device},netdev=n0{bus}");
+            cmd.args(["-netdev", "user,id=n0", "-device", &device]);
         }
         // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
         // gives the result.
@@ -2262,6 +2308,21 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             && log.contains("aarch64 booting with linux")
             && log.contains(&format!("smp: {smp} CPUs run"))
             && log.contains(&pass_line(test));
+        // The driver tells the bus of the device and the kind of its interrupt.
+        let device = if *test == "blk" { "vda" } else { "eth0" };
+        let probe = match pci {
+            ArmPci::No => None,
+            ArmPci::Bus0 => Some((0, 1, "MSI-X")),
+            ArmPci::Bridge => Some((1, 0, "MSI-X")),
+            ArmPci::BridgeIntx => Some((1, 0, "INTx")),
+        }
+        .map(|(bus, slot, kind)| {
+            format!("{device} on PCI PciAddress {{ bus: {bus}, device: {slot}, function: 0 }} with {kind}")
+        });
+        if let Some(probe) = probe.filter(|p| passed && !log.contains(p.as_str())) {
+            println!("boot test {name} on arm64: the log does not have \"{probe}\"");
+            passed = false;
+        }
         if *test == "blk" && passed && !blk_disk_has_note(&elf_path.with_file_name("blk.img"))? {
             println!("boot test blk on arm64: the disk image does not have the data of the guest");
             passed = false;

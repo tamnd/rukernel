@@ -22,8 +22,8 @@ pub fn wait() {
     imp::irq::wait();
 }
 
-/// The interrupt line of a device: an SPI of the GIC on arm64, and the vector of an MSI-X table
-/// entry on x86-64. The handler of the line turns the line off and keeps a flag that the line
+/// The interrupt line of a device: an SPI of the GIC or the LPI of an MSI-X table entry on arm64,
+/// and the vector of an MSI-X table entry on x86-64. The handler of the line turns the line off and keeps a flag that the line
 /// came, because a handler takes no lock and cannot reach the device. The driver tests the flag
 /// with `take`, tells the device that the interrupt is handled, and turns the line on again with
 /// `unmask`. Between the two, a level triggered line does not come again and again.
@@ -38,6 +38,15 @@ impl Line {
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn new(intid: u32, edge: bool) -> Option<Self> {
         imp::gic::enable_device(intid, edge).then_some(Self { intid })
+    }
+
+    /// Makes the line of the MSI-X table entry at the virtual address `entry` of the function with
+    /// the device ID `device` of the GICv3 ITS, with a free LPI, and turns it on. The line goes to
+    /// the boot CPU until a `wait` on another CPU. Gives `None` if the machine has no ITS, or if no
+    /// LPI is free.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn msix(entry: usize, device: u32) -> Option<Self> {
+        imp::its::alloc(entry, device).map(|intid| Self { intid })
     }
 
     /// Makes the line of the MSI-X table entry at the virtual address `entry`, with a free vector,
