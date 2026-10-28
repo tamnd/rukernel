@@ -1101,6 +1101,8 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
     let admin = rk_proc::current_thread()
         .is_some_and(|t| t.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN));
     let first = offset / ENTRY as u64;
+    let areas: Vec<(usize, usize)> = vm.areas().iter().map(|a| (a.start, a.end)).collect();
+    let zero = rk_mm::ksm::zero_phys();
     let mut done = 0;
     for (i, out) in buf.chunks_exact_mut(ENTRY).enumerate() {
         let Some(addr) = usize::try_from(first + i as u64)
@@ -1110,22 +1112,44 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
         else {
             break;
         };
-        let mut entry = 0;
+        let mut page = procmap::PageFacts::default();
         if let Some((frame, _)) = vm.vm().page(rk_frame::addr::VirtAddr::new(addr)) {
-            entry = procmap::PM_PRESENT;
-            if admin {
-                entry |= (frame.addr().get() / rk_mm::PAGE_SIZE as u64) & procmap::PM_PFN_MASK;
-            }
+            let phys = frame.addr().get();
+            page.present = true;
+            page.pfn = admin.then_some(phys / rk_mm::PAGE_SIZE as u64);
+            page.zero = zero == Some(phys);
             // A page of a file or of shared memory is not anonymous. A private area of a file
             // maps the page of the file until the first write makes an anonymous copy.
-            if !frame.is_anon() {
-                entry |= procmap::PM_FILE;
-            }
+            page.file = !frame.is_anon();
+            // Each mapping holds one reference, and so do `frame`, the page cache of a file and
+            // the stable tree of KSM. The count of the mappings is the map count of Linux.
+            let ksm = rk_frame::mm::phys_is_ksm(frame.addr());
+            let others = 1 + usize::from(page.file) + usize::from(ksm);
+            page.exclusive = Arc::strong_count(&frame) == 1 + others;
         }
-        out.copy_from_slice(&entry.to_ne_bytes());
+        // A page outside the areas has no soft-dirty bit, as `pagemap_pte_hole` of Linux.
+        let i = areas.partition_point(|&(_, end)| end <= addr);
+        if areas.get(i).is_some_and(|&(start, _)| start <= addr) {
+            page.soft_dirty = vm.soft_dirty(addr, page.present);
+        }
+        out.copy_from_slice(&procmap::pagemap_entry(&page).to_ne_bytes());
         done += ENTRY;
     }
     Ok(done)
+}
+
+/// Does a write to `/proc/PID/clear_refs`, as `clear_refs_write` in fs/proc/task_mmu.c of Linux.
+/// The process keeps no referenced bits, so 1, 2 and 3 do nothing.
+fn clear_refs_write(p: &Process, data: &[u8]) -> Result<usize> {
+    let what = procmap::parse_clear_refs(data)?;
+    if let Some(vm) = p.vm() {
+        match what {
+            procmap::ClearRefs::Referenced => {}
+            procmap::ClearRefs::SoftDirty => vm.clear_soft_dirty(),
+            procmap::ClearRefs::Hiwater => vm.reset_hiwater(),
+        }
+    }
+    Ok(data.len())
 }
 
 /// The largest page frame number of `/proc/kpageflags`. It gives the address bits of the
@@ -1133,14 +1157,15 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
 const KPAGEFLAGS_PFNS: u64 = 1 << 40;
 
 /// Reads the entries of `/proc/kpageflags` from `offset`, one `u64` for each page frame, as
-/// `kpageflags_read` in fs/proc/page.c of Linux. Only the anonymous pages of the processes and the
-/// pages of mapped files have flags.
+/// `kpageflags_read` in fs/proc/page.c of Linux. Only the anonymous pages of the processes, the
+/// pages of mapped files, the huge pages and the page of zeros of KSM have flags.
 fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
     const ENTRY: usize = 8;
     if offset % ENTRY as u64 != 0 || buf.len() % ENTRY != 0 {
         return Err(Errno::EINVAL);
     }
     let first = offset / ENTRY as u64;
+    let zero = rk_mm::ksm::zero_phys();
     let mut done = 0;
     for (i, out) in buf.chunks_exact_mut(ENTRY).enumerate() {
         let pfn = first + i as u64;
@@ -1148,16 +1173,22 @@ fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
             break;
         }
         let phys = pfn * rk_mm::PAGE_SIZE as u64;
-        let flags = if rk_frame::mm::phys_is_anon(rk_frame::addr::PhysAddr::new(phys)) {
-            procmap::KPF_ANON_PAGE
-        } else {
-            match rk_vfs::mapped::frame_dirty(phys) {
-                Some(true) => procmap::KPF_FILE_PAGE | procmap::KPF_DIRTY,
-                Some(false) => procmap::KPF_FILE_PAGE,
-                None => 0,
-            }
+        let at = rk_frame::addr::PhysAddr::new(phys);
+        let anon = rk_frame::mm::phys_is_anon(at);
+        let head = phys.is_multiple_of(rk_frame::vm::HUGE_PAGE_SIZE as u64);
+        let huge = rk_frame::mm::phys_huge(at).map(|kind| match kind {
+            rk_frame::mm::HugeKind::Thp => (procmap::Compound::Thp, head),
+            rk_frame::mm::HugeKind::Hugetlb => (procmap::Compound::Hugetlb, head),
+            rk_frame::mm::HugeKind::HugetlbFree => (procmap::Compound::HugetlbFree, head),
+        });
+        let frame = procmap::FrameFacts {
+            zero: zero == Some(phys),
+            anon,
+            ksm: rk_frame::mm::phys_is_ksm(at),
+            file: if anon { None } else { rk_vfs::mapped::frame_dirty(phys) },
+            huge,
         };
-        out.copy_from_slice(&flags.to_ne_bytes());
+        out.copy_from_slice(&procmap::page_flags(&frame).to_ne_bytes());
         done += ENTRY;
     }
     Ok(done)
@@ -1525,6 +1556,16 @@ fn process_files(
             0o400,
             move |offset, buf| pagemap_read(&*alive(&p_)?, offset, buf),
             |_, _| Err(Errno::EINVAL),
+        ),
+    ));
+    let p_ = w.clone();
+    out.push((
+        b"clear_refs".to_vec(),
+        data_file(
+            &join(base, b"clear_refs"),
+            0o200,
+            |_, _| Err(Errno::EINVAL),
+            move |_, data| clear_refs_write(&*alive(&p_)?, data),
         ),
     ));
     let p_ = w.clone();

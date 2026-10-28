@@ -5,7 +5,7 @@ use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
 use crate::sync::{Once, SpinLock};
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// The allocator manages physical memory below this address. 64 GiB needs a bitmap of 2 MiB.
 const MAX_PHYS: u64 = 64 << 30;
@@ -104,16 +104,71 @@ pub struct Frame {
 /// Linux. `/proc/kpageflags` reads the bit of a page frame number without the `Frame`.
 static ANON: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
 
-/// The word of `ANON` and the bit in it of the frame at the physical address `phys`.
-fn anon_bit(phys: u64) -> Option<(&'static AtomicU64, u64)> {
+/// The frames that KSM merged, one bit for each frame, as `PAGE_MAPPING_KSM` of Linux.
+static KSM: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
+
+/// The word of the bitmap `map` and the bit in it of the frame at the physical address `phys`.
+fn mark_bit(map: &'static [AtomicU64; WORDS], phys: u64) -> Option<(&'static AtomicU64, u64)> {
     let frame = usize::try_from(phys / PAGE_SIZE as u64).ok()?;
-    Some((ANON.get(frame / 64)?, 1 << (frame % 64)))
+    Some((map.get(frame / 64)?, 1 << (frame % 64)))
+}
+
+/// Tells if the bitmap `map` has the frame at the physical address `phys`.
+fn has_mark(map: &'static [AtomicU64; WORDS], phys: u64) -> bool {
+    mark_bit(map, phys).is_some_and(|(word, bit)| word.load(Ordering::Relaxed) & bit != 0)
 }
 
 /// Tells if the frame at the physical address `phys` holds anonymous memory of a process, for
 /// `/proc/kpageflags`. See [`Frame::set_anon`].
 pub fn phys_is_anon(phys: PhysAddr) -> bool {
-    anon_bit(phys.get()).is_some_and(|(word, bit)| word.load(Ordering::Relaxed) & bit != 0)
+    has_mark(&ANON, phys.get())
+}
+
+/// Tells if KSM merged the frame at the physical address `phys`, for `/proc/kpageflags`. See
+/// [`Frame::set_ksm`].
+pub fn phys_is_ksm(phys: PhysAddr) -> bool {
+    has_mark(&KSM, phys.get())
+}
+
+/// The kind of a run of `HUGE_FRAMES` frames, for the compound page flags of `/proc/kpageflags`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HugeKind {
+    /// A transparent huge page that [`alloc_huge_frames`] gave, as `folio_test_large_rmappable`
+    /// of Linux. The first frame that goes back ends the mark, as a split of the folio does.
+    Thp,
+    /// A huge page of the pool of hugetlbfs that is free in the pool, as `folio_test_hugetlb`.
+    HugetlbFree,
+    /// A huge page of the pool of hugetlbfs that a mapping or a file uses.
+    Hugetlb,
+}
+
+/// The kind of each run of `HUGE_FRAMES` frames, by the index of the run: 0 for a run that is not
+/// a huge page, or 1 + the index of the [`HugeKind`].
+static RUN_KIND: [AtomicU8; RUNS] = [const { AtomicU8::new(0) }; RUNS];
+
+fn set_run_kind(first: usize, kind: Option<HugeKind>) {
+    let v = match kind {
+        None => 0,
+        Some(HugeKind::Thp) => 1,
+        Some(HugeKind::HugetlbFree) => 2,
+        Some(HugeKind::Hugetlb) => 3,
+    };
+    if let Some(slot) = RUN_KIND.get(first / HUGE_FRAMES) {
+        slot.store(v, Ordering::Relaxed);
+    }
+}
+
+/// Tells if the frame at the physical address `phys` is a part of a huge page, and of which kind,
+/// for `/proc/kpageflags`. The frame at the 2 MiB aligned address is the head of the huge page,
+/// and the other frames are its tail.
+pub fn phys_huge(phys: PhysAddr) -> Option<HugeKind> {
+    let frame = usize::try_from(phys.get() / PAGE_SIZE as u64).ok()?;
+    match RUN_KIND.get(frame / HUGE_FRAMES)?.load(Ordering::Relaxed) {
+        1 => Some(HugeKind::Thp),
+        2 => Some(HugeKind::HugetlbFree),
+        3 => Some(HugeKind::Hugetlb),
+        _ => None,
+    }
 }
 
 /// The function that removes the charge of a frame from its memory cgroup.
@@ -145,6 +200,7 @@ pub const HUGE_FRAMES: usize = 512;
 /// be mapped as one huge page. Gives `None` if no such run is free.
 pub fn alloc_huge_frames() -> Option<alloc::vec::Vec<Frame>> {
     let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
+    set_run_kind(first, Some(HugeKind::Thp));
     let frames = (first..first + HUGE_FRAMES).map(|f| {
         let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0, pooled: false };
         frame.zero();
@@ -187,6 +243,7 @@ impl HugeRun {
     /// free.
     pub fn alloc() -> Option<Self> {
         let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
+        set_run_kind(first, Some(HugeKind::HugetlbFree));
         Some(Self { first })
     }
 
@@ -201,6 +258,7 @@ impl HugeRun {
         let first = self.first;
         core::mem::forget(self);
         RETURNED[first / HUGE_FRAMES].store(0, Ordering::Relaxed);
+        set_run_kind(first, Some(HugeKind::Hugetlb));
         let frames = (first..first + HUGE_FRAMES).map(|f| {
             let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0, pooled: true };
             frame.zero();
@@ -212,6 +270,7 @@ impl HugeRun {
 
 impl Drop for HugeRun {
     fn drop(&mut self) {
+        set_run_kind(self.first, None);
         let mut frames = FRAMES.lock();
         for f in self.first..self.first + HUGE_FRAMES {
             frames.free(f);
@@ -233,7 +292,15 @@ impl Frame {
     /// sets `PageAnon`. A page of a file or of shared memory does not have the mark. The mark goes
     /// away when the frame goes back.
     pub fn set_anon(&self) {
-        if let Some((word, bit)) = anon_bit(self.phys) {
+        if let Some((word, bit)) = mark_bit(&ANON, self.phys) {
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Marks the frame as a page that KSM merged, as `folio_set_stable_node` of Linux. The mark
+    /// goes away when the frame goes back.
+    pub fn set_ksm(&self) {
+        if let Some((word, bit)) = mark_bit(&KSM, self.phys) {
             word.fetch_or(bit, Ordering::Relaxed);
         }
     }
@@ -390,20 +457,27 @@ impl Drop for Frame {
         {
             f(self.memcg);
         }
-        if let Some((word, bit)) = anon_bit(self.phys) {
-            word.fetch_and(!bit, Ordering::Relaxed);
+        for map in [&ANON, &KSM] {
+            if let Some((word, bit)) = mark_bit(map, self.phys) {
+                word.fetch_and(!bit, Ordering::Relaxed);
+            }
         }
         let frame = self.phys as usize / PAGE_SIZE;
+        let first = frame & !(HUGE_FRAMES - 1);
         if self.pooled {
-            let first = frame & !(HUGE_FRAMES - 1);
             let back = RETURNED[first / HUGE_FRAMES].fetch_add(1, Ordering::AcqRel) + 1;
             if usize::from(back) == HUGE_FRAMES {
+                set_run_kind(first, Some(HugeKind::HugetlbFree));
                 let run = HugeRun { first };
                 if let Some(f) = HUGE_RETURN.get() {
                     f(run);
                 }
             }
             return;
+        }
+        // The first frame of a transparent huge page that goes back ends the huge page.
+        if let Some(slot) = RUN_KIND.get(first / HUGE_FRAMES) {
+            let _ = slot.compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed);
         }
         FRAMES.lock().free(frame);
     }

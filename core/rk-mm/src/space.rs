@@ -5,12 +5,13 @@
 //! read only in both, and the first write copies it. This is copy on write.
 
 use crate::hugetlb::{HPAGE_SIZE, Subpool};
+use crate::softdirty::SoftDirty;
 use crate::tunables::{self, OVERCOMMIT_NEVER, ThpMode};
 use crate::vma::{
     Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use rk_abi::Errno;
@@ -49,8 +50,10 @@ pub trait MmFile: Send + Sync {
         false
     }
 
-    /// Records that a shared mapping changed the page `index`.
-    fn dirty(&self, _index: u64) {}
+    /// Records that a shared mapping changed the page `index`. The page is writable at `map` now,
+    /// and the file keeps `map` so that [`WriteMap::mkclean`] makes the page read only again
+    /// before a write back, as `folio_mkclean` of Linux.
+    fn dirty(&self, _index: u64, _map: WriteMap) {}
 
     /// Tells if the page `index` of the file is in memory, for `mincore` of a page that has no
     /// frame in the page table, as `mincore_page` in mm/mincore.c of Linux.
@@ -87,6 +90,38 @@ pub trait MmFile: Send + Sync {
 
 /// A file in an area.
 pub type FileRef = Arc<dyn MmFile>;
+
+/// A page of a shared file mapping that a write fault made writable, as an entry of the reverse
+/// map of Linux. A file keeps one for each writer of a dirty page, so the write back finds the
+/// mappings with no search of the address spaces.
+#[derive(Clone)]
+pub struct WriteMap {
+    /// The page table of the mapping. The entry does not keep the address space alive.
+    vm: Weak<VmSpace>,
+    /// The address of the page.
+    addr: usize,
+}
+
+impl WriteMap {
+    /// Makes the page read only if it still maps `frame`, as `page_mkclean_one` of Linux. The next
+    /// write to the page is a fault that calls [`MmFile::dirty`] again. Gives `true` if the page
+    /// changed.
+    pub fn mkclean(&self, frame: &Frame) -> bool {
+        self.vm
+            .upgrade()
+            .is_some_and(|vm| vm.write_protect_frame(VirtAddr::new(self.addr), frame.addr().get()))
+    }
+
+    /// Tells if the address space of the mapping is still there.
+    pub fn alive(&self) -> bool {
+        self.vm.strong_count() > 0
+    }
+
+    /// Tells if `self` and `other` are the same page of the same address space.
+    pub fn same(&self, other: &Self) -> bool {
+        self.addr == other.addr && Weak::ptr_eq(&self.vm, &other.vm)
+    }
+}
 
 /// Two files are the same if they are the same object, so that two areas of one file can merge.
 impl PartialEq for dyn MmFile {
@@ -251,8 +286,11 @@ type StateLock = corten::Corten;
 
 /// The address space of one process.
 pub struct AddressSpace {
-    vm: VmSpace,
+    vm: Arc<VmSpace>,
     state: StateLock,
+    /// The soft-dirty state of the pages, as `CONFIG_MEM_SOFT_DIRTY` of Linux. Its lock comes after
+    /// the lock of the areas, and no other lock comes after it.
+    soft: SpinLock<SoftDirty>,
     /// The memory cgroup that the new anonymous pages are charged to, or 0 for none.
     memcg: AtomicU32,
     /// The data of KSM.
@@ -364,8 +402,9 @@ impl AddressSpace {
     /// Makes an address space with the page table `vm` and the areas of `state`.
     fn with_state(vm: VmSpace, state: StateLock) -> Self {
         Self {
-            vm,
+            vm: Arc::new(vm),
             state,
+            soft: SpinLock::new(SoftDirty::new()),
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
             huge_resv: SpinLock::new(BTreeMap::new()),
@@ -448,6 +487,18 @@ impl AddressSpace {
     /// `EINVAL` for a bad address or length, `EEXIST` for `MAP_FIXED_NOREPLACE` on a mapping, and
     /// `ENOMEM` when no range is free or a fixed range goes past the end of user space.
     pub fn mmap(&self, req: MmapRequest) -> Result<usize, Errno> {
+        let hugetlb =
+            req.hugetlb || req.file.as_ref().is_some_and(|(f, _)| f.huge_file().is_some());
+        let align = if hugetlb { HPAGE_SIZE } else { PAGE_SIZE };
+        let len = req.len.checked_next_multiple_of(align).unwrap_or(0);
+        let start = self.mmap_area(req)?;
+        // A new mapping is soft-dirty, as the flag `VM_SOFTDIRTY` of a new area of Linux.
+        self.soft.lock().mapped(start, start.saturating_add(len));
+        Ok(start)
+    }
+
+    /// `mmap` without the soft-dirty state.
+    fn mmap_area(&self, req: MmapRequest) -> Result<usize, Errno> {
         if req.len == 0 {
             return Err(Errno::EINVAL);
         }
@@ -681,16 +732,8 @@ impl AddressSpace {
             if invalidate && vma.locked {
                 return Err(Errno::EBUSY);
             }
-            // The pages become read only again, so the next write marks them dirty, as
-            // `folio_mkclean` of Linux does before the write back. This address space is the
-            // only one that changes.
-            if matches!(&vma.backing, Backing::File { file, .. } if vma.shared && file.writes_back())
-            {
-                let from = VirtAddr::new(addr.max(vma.start));
-                for page in self.vm.mapped_pages(from, VirtAddr::new(end.min(vma.end))) {
-                    self.vm.protect(page, page_prot(vma, false));
-                }
-            }
+            // The write back makes the pages read only in each address space that wrote them, so
+            // the next write marks them dirty again, as `folio_mkclean` of Linux.
             write_back(vma, addr, end)?;
         }
         if !st.vmas.covers(addr, end) {
@@ -975,6 +1018,7 @@ impl AddressSpace {
             }
             st.vmas.update_range(addr, end, |vma| vma.end = new_end);
             st.vmas.merge_range(addr, new_end);
+            self.soft.lock().mapped(end, new_end);
             return Ok(addr);
         }
         if !remap.may_move {
@@ -1032,8 +1076,13 @@ impl AddressSpace {
                 st.vmas.remove_range(addr, addr + old_len).pop().ok_or(Errno::EFAULT)?
             }
         };
+        // A writable page of a file that writes back becomes read only, as the file knows the old
+        // address only. The next write marks it dirty at the new address.
+        let tracked =
+            vma.shared && matches!(&vma.backing, Backing::File { file, .. } if file.writes_back());
         for page in self.vm.mapped_pages(VirtAddr::new(addr), VirtAddr::new(addr + old_len)) {
-            let Some((frame, prot)) = self.vm.page(page) else { continue };
+            let Some((frame, mut prot)) = self.vm.page(page) else { continue };
+            prot.writable &= !tracked;
             self.vm.unmap(page);
             let off = page.get() - addr;
             if off < new_len {
@@ -1046,6 +1095,8 @@ impl AddressSpace {
         vma.start = to;
         vma.end = to + new_len;
         st.vmas.insert_merged(vma);
+        // The pages that move are soft-dirty, as `move_soft_dirty_pte` of Linux.
+        self.soft.lock().mapped(to, to + new_len);
         Ok(to)
     }
 
@@ -1096,7 +1147,7 @@ impl AddressSpace {
             let Some(vma) = st.vmas.find(a).filter(|_| a >= next) else { continue };
             // A private page that gets write access stays read only, and the next write fault
             // makes it writable if this address space is its only user.
-            let new = page_prot(vma, false);
+            let new = self.soft_prot(a, page_prot(vma, false));
             // A huge page that is all in the range keeps one entry.
             if a.is_multiple_of(HUGE_PAGE_SIZE)
                 && a + HUGE_PAGE_SIZE <= end.min(vma.end)
@@ -1131,6 +1182,7 @@ impl AddressSpace {
             vma.locked = st.lock_future;
             vma.account = true;
             st.vmas.insert_merged(vma);
+            self.soft.lock().mapped(old_end, new_end);
         } else if new_end < old_end {
             self.unmap_locked(&mut st, new_end, old_end);
         }
@@ -1170,6 +1222,31 @@ impl AddressSpace {
     /// Handles a page fault at `addr` in `vma`, the area that has the address. The caller holds
     /// the lock of the area.
     fn fault_area(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Result<(), Errno> {
+        self.fault_page(vma, addr, access)?;
+        let mut soft = self.soft.lock();
+        if !soft.tracking() {
+            return Ok(());
+        }
+        // A huge page has one soft-dirty state, as the entry of a PMD of Linux.
+        let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
+        let (start, end) = if self.vm.is_huge(page) {
+            let block = addr & !(HUGE_PAGE_SIZE - 1);
+            (block, block + HUGE_PAGE_SIZE)
+        } else {
+            (page.get(), page.get() + PAGE_SIZE)
+        };
+        if access == Access::Write {
+            soft.wrote(start, end);
+        } else if soft.any_clean(start, end) {
+            // A read fault can map a writable page. A clean page stays read only, so the first
+            // write is a fault that marks it.
+            self.vm.write_protect(VirtAddr::new(start), VirtAddr::new(end));
+        }
+        Ok(())
+    }
+
+    /// `fault_area` without the soft-dirty state.
+    fn fault_page(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Result<(), Errno> {
         let allowed = match access {
             Access::Read => vma.prot.read || vma.prot.write || vma.prot.exec,
             Access::Write => vma.prot.write,
@@ -1192,6 +1269,7 @@ impl AddressSpace {
             // The first write to a range of an anonymous area can get a huge page.
             None if write && self.map_huge(vma, page) => Ok(()),
             None => {
+                let mut dirty = None;
                 let (frame, exclusive) = match &vma.backing {
                     Backing::Anon => (anon_frame(self.memcg())?, true),
                     Backing::File { file, offset } => {
@@ -1199,7 +1277,7 @@ impl AddressSpace {
                         let frame = file.page(index)?;
                         if vma.shared {
                             if write {
-                                file.dirty(index);
+                                dirty = Some((file, index));
                             }
                             (frame, write)
                         } else if !write {
@@ -1209,7 +1287,13 @@ impl AddressSpace {
                         }
                     }
                 };
-                self.vm.map(at, frame, page_prot(vma, exclusive)).map_err(map_error)
+                self.vm.map(at, frame, page_prot(vma, exclusive)).map_err(map_error)?;
+                // The page is dirty after it is writable, so a write back that runs between the
+                // two steps cannot make the page clean and leave it writable.
+                if let Some((file, index)) = dirty {
+                    file.dirty(index, self.write_map(page));
+                }
+                Ok(())
             }
             Some((frame, prot)) => {
                 if !write || prot.writable {
@@ -1218,11 +1302,11 @@ impl AddressSpace {
                 }
                 // The first write to a page of a shared file mapping.
                 if vma.shared {
-                    if let Backing::File { file, offset } = &vma.backing {
-                        file.dirty(file_index(vma, *offset, page));
-                    }
                     drop(frame);
                     self.vm.protect(at, page_prot(vma, true));
+                    if let Backing::File { file, offset } = &vma.backing {
+                        file.dirty(file_index(vma, *offset, page), self.write_map(page));
+                    }
                     return Ok(());
                 }
                 // A write to a private page that is read only: copy on write. The page table and
@@ -1325,6 +1409,10 @@ impl AddressSpace {
             && let Some(resv) = resv
         {
             self.huge_resv.lock().insert(block, resv);
+        }
+        // A private huge page is anonymous memory, as `hugetlb_add_new_anon_rmap` of Linux.
+        if let Ok(frames) = &page {
+            frames.iter().for_each(|f| f.set_anon());
         }
         page
     }
@@ -1475,10 +1563,72 @@ impl AddressSpace {
     ///
     /// Gives `ENOMEM` if no frame is free for a page table.
     pub fn fork(&self) -> Result<Self, Errno> {
+        let soft = self.soft.lock().clone();
         #[cfg(feature = "corten")]
-        return self.corten_fork();
+        let child = self.corten_fork()?;
         #[cfg(not(feature = "corten"))]
-        self.vma_fork()
+        let child = self.vma_fork()?;
+        *child.soft.lock() = soft;
+        // A file that writes back does not know the pages of the child, so they become read only,
+        // and the first write of the child marks them dirty.
+        let st = child.state.lock();
+        for vma in st.vmas.iter().filter(|v| v.shared) {
+            if matches!(&vma.backing, Backing::File { file, .. } if file.writes_back()) {
+                child.vm.write_protect(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
+            }
+        }
+        drop(st);
+        Ok(child)
+    }
+
+    /// The entry of the reverse map for the page at `page` of this address space.
+    fn write_map(&self, page: usize) -> WriteMap {
+        WriteMap { vm: Arc::downgrade(&self.vm), addr: page }
+    }
+
+    /// Takes away the write access of `prot` if the page at `addr` is clean in the soft-dirty
+    /// state, so that the next write is a fault that marks it. For a page of a huge page, each
+    /// page of the huge page counts.
+    fn soft_prot(&self, addr: usize, mut prot: PageProt) -> PageProt {
+        if prot.writable {
+            let soft = self.soft.lock();
+            if soft.tracking() {
+                let block = addr & !(HUGE_PAGE_SIZE - 1);
+                let (start, end) = if self.vm.is_huge(VirtAddr::new(addr)) {
+                    (block, block + HUGE_PAGE_SIZE)
+                } else {
+                    (addr, addr + PAGE_SIZE)
+                };
+                prot.writable = !soft.any_clean(start, end);
+            }
+        }
+        prot
+    }
+
+    /// Makes all the pages of the address space clean in the soft-dirty state, as a write of 4 to
+    /// `/proc/PID/clear_refs` of Linux. The pages become read only, so the next write to a page is
+    /// a fault that marks it soft-dirty.
+    pub fn clear_soft_dirty(&self) {
+        let st = self.state.lock();
+        let ranges: Vec<(usize, usize)> = st.vmas.iter().map(|v| (v.start, v.end)).collect();
+        // The faults hold the lock of the areas, so no fault runs between the two steps.
+        self.soft.lock().clear(ranges.iter().copied());
+        for (start, end) in ranges {
+            self.vm.write_protect(VirtAddr::new(start), VirtAddr::new(end));
+        }
+        drop(st);
+    }
+
+    /// Tells if the page at `addr` is soft-dirty. `present` tells that the page has a frame. See
+    /// [`crate::softdirty::SoftDirty::is_dirty`].
+    pub fn soft_dirty(&self, addr: usize, present: bool) -> bool {
+        self.soft.lock().is_dirty(addr, present)
+    }
+
+    /// Sets the high water mark of the pages with a frame to the pages that have a frame now, as a
+    /// write of 5 to `/proc/PID/clear_refs` of Linux.
+    pub fn reset_hiwater(&self) {
+        self.hiwater.store(self.page_count(), Ordering::Relaxed);
     }
 
     /// `fork` of the VMA backend. It copies the list of areas.

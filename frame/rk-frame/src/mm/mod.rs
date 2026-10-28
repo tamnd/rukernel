@@ -17,9 +17,9 @@ pub(crate) mod frame;
 pub(crate) mod heap;
 #[cfg(target_os = "none")]
 pub use frame::{
-    Frame, FrameStats, HUGE_FRAMES, HugeRun, Mapping, PageInfo, alloc_frame, alloc_huge_frames,
-    alloc_zeroed_frame, frame_stats, phys_is_anon, query, set_huge_return_hook, set_uncharge_hook,
-    translate, vmap,
+    Frame, FrameStats, HUGE_FRAMES, HugeKind, HugeRun, Mapping, PageInfo, alloc_frame,
+    alloc_huge_frames, alloc_zeroed_frame, frame_stats, phys_huge, phys_is_anon, phys_is_ksm,
+    query, set_huge_return_hook, set_uncharge_hook, translate, vmap,
 };
 #[cfg(target_os = "none")]
 pub use heap::{HeapStats, heap_stats};

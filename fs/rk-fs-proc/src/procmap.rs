@@ -37,6 +37,12 @@ pub(crate) const PM_PRESENT: u64 = 1 << 63;
 pub(crate) const PM_FILE: u64 = 1 << 61;
 /// The bits of the page frame number in an entry of `/proc/PID/pagemap`.
 pub(crate) const PM_PFN_MASK: u64 = (1 << 55) - 1;
+/// The bit of an entry of `/proc/PID/pagemap` for a page that a write changed after the last
+/// write of 4 to `/proc/PID/clear_refs`, `PM_SOFT_DIRTY` of Linux.
+pub(crate) const PM_SOFT_DIRTY: u64 = 1 << 55;
+/// The bit of an entry of `/proc/PID/pagemap` for a page that only one mapping maps,
+/// `PM_MMAP_EXCLUSIVE` of Linux.
+pub(crate) const PM_MMAP_EXCLUSIVE: u64 = 1 << 56;
 
 /// `KPF_UPTODATE` of `/proc/kpageflags`.
 pub(crate) const KPF_UPTODATE: u64 = 1 << 3;
@@ -49,7 +55,21 @@ pub(crate) const KPF_MMAP: u64 = 1 << 11;
 /// `KPF_ANON` of `/proc/kpageflags`.
 pub(crate) const KPF_ANON: u64 = 1 << 12;
 /// `KPF_SWAPBACKED` of `/proc/kpageflags`.
-pub(crate) const KPF_SWAPBACKED: u64 = 1 << 23;
+pub(crate) const KPF_SWAPBACKED: u64 = 1 << 14;
+/// `KPF_COMPOUND_HEAD` of `/proc/kpageflags`: the first page of a huge page.
+pub(crate) const KPF_COMPOUND_HEAD: u64 = 1 << 15;
+/// `KPF_COMPOUND_TAIL` of `/proc/kpageflags`: a page of a huge page after the first.
+pub(crate) const KPF_COMPOUND_TAIL: u64 = 1 << 16;
+/// `KPF_HUGE` of `/proc/kpageflags`: a page of hugetlbfs.
+pub(crate) const KPF_HUGE: u64 = 1 << 17;
+/// `KPF_KSM` of `/proc/kpageflags`: a page that KSM merged.
+pub(crate) const KPF_KSM: u64 = 1 << 21;
+/// `KPF_THP` of `/proc/kpageflags`: a page of a transparent huge page.
+pub(crate) const KPF_THP: u64 = 1 << 22;
+/// `KPF_ZERO_PAGE` of `/proc/kpageflags`: the page of zeros.
+pub(crate) const KPF_ZERO_PAGE: u64 = 1 << 24;
+/// `KPF_RESERVED` of `/proc/kpageflags`, a flag of the kernel that `PG_reserved` gives.
+pub(crate) const KPF_RESERVED: u64 = 1 << 32;
 
 /// The flags of a mapped page of a file in `/proc/kpageflags`. `KPF_DIRTY` comes in addition when
 /// a mapping changed the page after the last write back.
@@ -58,6 +78,131 @@ pub(crate) const KPF_FILE_PAGE: u64 = KPF_UPTODATE | KPF_LRU | KPF_MMAP;
 /// fs/proc/page.c of Linux gives them for a page that `do_anonymous_page` or a copy on write
 /// made. The dirty state of such a page is in the page table, so `KPF_DIRTY` is not there.
 pub(crate) const KPF_ANON_PAGE: u64 = KPF_FILE_PAGE | KPF_ANON | KPF_SWAPBACKED;
+
+/// The kind of a huge page that a frame is a part of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Compound {
+    /// A transparent huge page.
+    Thp,
+    /// A page of hugetlbfs that a mapping or a file uses.
+    Hugetlb,
+    /// A page of hugetlbfs that is free in the pool.
+    HugetlbFree,
+}
+
+/// The facts about a frame that give its entry of `/proc/kpageflags`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameFacts {
+    /// The frame is the page of zeros of KSM.
+    pub zero: bool,
+    /// The frame holds anonymous memory of a process.
+    pub anon: bool,
+    /// KSM merged the frame.
+    pub ksm: bool,
+    /// The frame is the copy of a page of a mapped file, and the page is dirty or not.
+    pub file: Option<bool>,
+    /// The frame is a part of a huge page of the kind, and it is the first page or not.
+    pub huge: Option<(Compound, bool)>,
+}
+
+/// The entry of `/proc/kpageflags` of a frame, as `stable_page_flags` in fs/proc/page.c of Linux
+/// gives it for the same page.
+pub(crate) fn page_flags(f: &FrameFacts) -> u64 {
+    if f.zero {
+        return KPF_ZERO_PAGE | KPF_RESERVED;
+    }
+    let part = |head: bool| if head { KPF_COMPOUND_HEAD } else { KPF_COMPOUND_TAIL };
+    match f.huge {
+        // A free page of the pool has only the flags of its compound page.
+        Some((Compound::HugetlbFree, head)) => return KPF_HUGE | part(head),
+        // A page of hugetlbfs is not on the LRU lists and is not swap backed. A page of a file
+        // is dirty, as `hugetlb_add_to_page_cache` of Linux marks it.
+        Some((Compound::Hugetlb, head)) => {
+            let kind = if f.anon { KPF_ANON } else { KPF_DIRTY };
+            return KPF_UPTODATE | KPF_MMAP | KPF_HUGE | part(head) | kind;
+        }
+        _ => {}
+    }
+    let mut u = if f.anon {
+        // A KSM page is dirty, as `try_to_merge_one_page` of Linux marks it.
+        KPF_ANON_PAGE | if f.ksm { KPF_KSM | KPF_DIRTY } else { 0 }
+    } else {
+        match f.file {
+            Some(true) => KPF_FILE_PAGE | KPF_DIRTY,
+            Some(false) => KPF_FILE_PAGE,
+            None => return 0,
+        }
+    };
+    if let Some((Compound::Thp, head)) = f.huge {
+        u |= KPF_THP | part(head);
+    }
+    u
+}
+
+/// The facts about a page of a process that give its entry of `/proc/PID/pagemap`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PageFacts {
+    /// The page has a frame.
+    pub present: bool,
+    /// The page frame number, if the caller can see it.
+    pub pfn: Option<u64>,
+    /// The frame is the page of zeros, which `vm_normal_page` of Linux does not give.
+    pub zero: bool,
+    /// The frame is not anonymous memory.
+    pub file: bool,
+    /// Only this mapping maps the frame.
+    pub exclusive: bool,
+    /// The page is soft-dirty.
+    pub soft_dirty: bool,
+}
+
+/// The entry of `/proc/PID/pagemap` of a page, as `pte_to_pagemap_entry` in fs/proc/task_mmu.c of
+/// Linux.
+pub(crate) fn pagemap_entry(p: &PageFacts) -> u64 {
+    let mut entry = if p.soft_dirty { PM_SOFT_DIRTY } else { 0 };
+    if !p.present {
+        return entry;
+    }
+    entry |= PM_PRESENT | p.pfn.map_or(0, |pfn| pfn & PM_PFN_MASK);
+    // The page of zeros is not a normal page, so it has no file bit and no exclusive bit.
+    if !p.zero {
+        if p.file {
+            entry |= PM_FILE;
+        }
+        if p.exclusive {
+            entry |= PM_MMAP_EXCLUSIVE;
+        }
+    }
+    entry
+}
+
+/// What a write to `/proc/PID/clear_refs` does, as `clear_refs_write` in fs/proc/task_mmu.c of
+/// Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClearRefs {
+    /// 1, 2 and 3 clear the referenced bits, which this kernel does not keep.
+    Referenced,
+    /// 4 makes all the pages clean in the soft-dirty state.
+    SoftDirty,
+    /// 5 sets the high water mark of the resident pages to the resident pages now.
+    Hiwater,
+}
+
+/// Parses the number that a write to `/proc/PID/clear_refs` gives, as `kstrtoint` of Linux after
+/// `strstrip`.
+///
+/// # Errors
+///
+/// `EINVAL` for a value that is not a number from 1 to 5.
+pub(crate) fn parse_clear_refs(data: &[u8]) -> Result<ClearRefs, Errno> {
+    let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    match text.trim().parse::<i32>().map_err(|_| Errno::EINVAL)? {
+        1..=3 => Ok(ClearRefs::Referenced),
+        4 => Ok(ClearRefs::SoftDirty),
+        5 => Ok(ClearRefs::Hiwater),
+        _ => Err(Errno::EINVAL),
+    }
+}
 
 /// The fields of an area that a query looks at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -221,8 +366,57 @@ mod tests {
     #[test]
     fn page_flags_match_linux() {
         // The bits of include/uapi/linux/kernel-page-flags.h of Linux.
-        assert_eq!(KPF_ANON_PAGE, 0x80_1828);
+        assert_eq!(KPF_ANON_PAGE, 0x5828);
         assert_eq!(KPF_FILE_PAGE | KPF_DIRTY, 0x838);
+        assert_eq!(KPF_COMPOUND_HEAD | KPF_COMPOUND_TAIL | KPF_HUGE, 0x3_8000);
+        assert_eq!(KPF_KSM | KPF_THP | KPF_ZERO_PAGE, 0x160_0000);
+        assert_eq!(PM_SOFT_DIRTY | PM_MMAP_EXCLUSIVE, 0x0180_0000_0000_0000);
+    }
+
+    #[test]
+    fn page_flags_as_linux() {
+        let anon = FrameFacts { anon: true, ..FrameFacts::default() };
+        assert_eq!(page_flags(&FrameFacts::default()), 0);
+        assert_eq!(page_flags(&anon), 0x5828);
+        assert_eq!(page_flags(&FrameFacts { ksm: true, ..anon }), 0x20_5838);
+        let zero = FrameFacts { zero: true, ..FrameFacts::default() };
+        assert_eq!(page_flags(&zero), (1 << 32) | (1 << 24));
+        let file = FrameFacts { file: Some(true), ..FrameFacts::default() };
+        assert_eq!(page_flags(&file), 0x838);
+        let thp = FrameFacts { huge: Some((Compound::Thp, true)), ..anon };
+        assert_eq!(page_flags(&thp), 0x40_d828);
+        let tail = FrameFacts { huge: Some((Compound::Thp, false)), ..anon };
+        assert_eq!(page_flags(&tail), 0x41_5828);
+        let huge = FrameFacts { huge: Some((Compound::Hugetlb, true)), ..anon };
+        assert_eq!(page_flags(&huge), 0x2_9808);
+        let shared = FrameFacts { huge: Some((Compound::Hugetlb, false)), ..FrameFacts::default() };
+        assert_eq!(page_flags(&shared), 0x3_0818);
+        let free =
+            FrameFacts { huge: Some((Compound::HugetlbFree, true)), ..FrameFacts::default() };
+        assert_eq!(page_flags(&free), 0x2_8000);
+    }
+
+    #[test]
+    fn pagemap_entry_as_linux() {
+        assert_eq!(pagemap_entry(&PageFacts::default()), 0);
+        let hole = PageFacts { soft_dirty: true, ..PageFacts::default() };
+        assert_eq!(pagemap_entry(&hole), PM_SOFT_DIRTY);
+        let anon = PageFacts { present: true, pfn: Some(0x1234), exclusive: true, ..hole };
+        assert_eq!(pagemap_entry(&anon), PM_PRESENT | PM_SOFT_DIRTY | PM_MMAP_EXCLUSIVE | 0x1234);
+        let file = PageFacts { present: true, file: true, ..PageFacts::default() };
+        assert_eq!(pagemap_entry(&file), PM_PRESENT | PM_FILE);
+        let zero = PageFacts { zero: true, exclusive: true, ..file };
+        assert_eq!(pagemap_entry(&zero), PM_PRESENT);
+    }
+
+    #[test]
+    fn clear_refs_values() {
+        assert_eq!(parse_clear_refs(b"4\n"), Ok(ClearRefs::SoftDirty));
+        assert_eq!(parse_clear_refs(b"1"), Ok(ClearRefs::Referenced));
+        assert_eq!(parse_clear_refs(b"5"), Ok(ClearRefs::Hiwater));
+        assert_eq!(parse_clear_refs(b"6"), Err(Errno::EINVAL));
+        assert_eq!(parse_clear_refs(b"0"), Err(Errno::EINVAL));
+        assert_eq!(parse_clear_refs(b"x"), Err(Errno::EINVAL));
     }
 
     #[test]

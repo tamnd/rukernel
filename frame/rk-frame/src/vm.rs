@@ -481,6 +481,63 @@ impl VmSpace {
         true
     }
 
+    /// Makes the pages in `start..end` read only, as `mkclean` and the clear of soft-dirty of Linux.
+    /// The next write to a page then faults. A huge page that is all in the range stays whole, and
+    /// a writable huge page that is in part in the range is split first. One TLB flush is for all
+    /// the 4 KiB pages.
+    pub fn write_protect(&self, start: VirtAddr, end: VirtAddr) {
+        let (start, end) = (start.get(), end.get());
+        let first = start & !(HUGE_PAGE_SIZE - 1);
+        let mut inner = self.inner.lock();
+        let root = inner.root;
+        let mut next = first;
+        while let Some((&block, huge)) = inner.huge.range(next..end).next() {
+            next = block + HUGE_PAGE_SIZE;
+            if !huge.prot.writable {
+                continue;
+            }
+            if block >= start && next <= end {
+                let huge = inner.huge.get_mut(&block).expect("the huge page is in the map");
+                huge.prot.writable = false;
+                let (phys, bits) = (huge.frames[0].addr().get(), huge.prot.bits());
+                paging::user_protect_huge(root, block, phys, bits);
+            } else {
+                inner.split(block);
+            }
+        }
+        let ro = inner.pages.range_mut(start..end).filter(|(_, (_, p))| p.writable);
+        paging::user_protect_many(
+            root,
+            ro.map(|(&a, (f, p))| {
+                p.writable = false;
+                (a, f.addr().get(), p.bits())
+            }),
+        );
+    }
+
+    /// Makes the page at `addr` read only if it maps the frame at the physical address `phys` and
+    /// is writable, as `page_mkclean_one` of Linux. A huge page is split first. Gives `true` if the
+    /// page changed.
+    pub fn write_protect_frame(&self, addr: VirtAddr, phys: u64) -> bool {
+        let mut inner = self.inner.lock();
+        let root = inner.root;
+        match inner.get(addr.get()) {
+            Some((frame, prot)) if prot.writable && frame.addr().get() == phys => {}
+            _ => return false,
+        }
+        inner.split(addr.get());
+        let Some((_, prot)) = inner.pages.get_mut(&addr.get()) else { return false };
+        prot.writable = false;
+        let bits = prot.bits();
+        paging::user_protect(root, addr.get(), phys, bits);
+        true
+    }
+
+    /// Tells if the page at `addr` is a part of a huge page that is mapped whole.
+    pub fn is_huge(&self, addr: VirtAddr) -> bool {
+        self.inner.lock().huge.contains_key(&(addr.get() & !(HUGE_PAGE_SIZE - 1)))
+    }
+
     /// Gives the frame and the permissions of the page that contains `addr`.
     pub fn page(&self, addr: VirtAddr) -> Option<(Arc<Frame>, PageProt)> {
         let page = addr.get() & !(PAGE_SIZE - 1);

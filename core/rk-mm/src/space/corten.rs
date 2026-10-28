@@ -583,7 +583,7 @@ impl AddressSpace {
                 }
                 // A private page that gets write access stays read only, and the next write
                 // fault makes it writable if this address space is its only user.
-                let new = page_prot(&vma, false);
+                let new = self.soft_prot(a, page_prot(&vma, false));
                 // A huge page that is all in the range keeps one entry.
                 if a.is_multiple_of(HUGE_PAGE_SIZE)
                     && a + HUGE_PAGE_SIZE <= vma.end
@@ -620,6 +620,7 @@ impl AddressSpace {
             vma.account = true;
             self.state.set(&mut range, old_end, new_end, Some(Arc::new(vma)));
             reserve(&mut self.state.va.lock(), old_end, new_end);
+            self.soft.lock().mapped(old_end, new_end);
         } else if new_end < old_end {
             let (lo, hi) = window(new_end, old_end);
             let mut range = self.state.tree.lock(lo, hi);

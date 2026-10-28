@@ -399,6 +399,9 @@ static int touch_in_child(volatile char *p)
 	return WIFSIGNALED(status) ? WTERMSIG(status) : 0;
 }
 
+static unsigned long long pagemap_entry(const void *addr);
+static unsigned long long kpageflags_pfn(unsigned long long pfn);
+
 /* `size=` and `min_size=` of hugetlbfs, as the subpool of mm/hugetlb.c of Linux (#392). */
 static void test_hugetlbfs(void)
 {
@@ -441,8 +444,16 @@ static void test_hugetlbfs(void)
 	      m != MAP_FAILED && meminfo("HugePages_Rsvd:") == 2 &&
 		      mmap(NULL, huge, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED);
 	if (m != MAP_FAILED) {
+		/* KPF_HUGE (17), KPF_ANON (12), KPF_COMPOUND_HEAD (15) and KPF_COMPOUND_TAIL (16) (#430). */
+		const unsigned long long khuge = 1ULL << 17, kanon = 1ULL << 12, khead = 1ULL << 15, ktail = 1ULL << 16;
 		m[0] = 1;
+		unsigned long long pfn = pagemap_entry(m) & ((1ULL << 55) - 1);
+		unsigned long long head = kpageflags_pfn(pfn), tail = kpageflags_pfn(pfn + 1);
+		check("kpageflags: a private hugetlb page is anonymous and huge",
+		      pfn != 0 && (head & (khuge | kanon | khead | ktail)) == (khuge | kanon | khead) &&
+			      (tail & (khuge | kanon | khead | ktail)) == (khuge | kanon | ktail));
 		munmap(m, 2 * huge);
+		check("kpageflags: a free page of the hugetlb pool is huge only", kpageflags_pfn(pfn) == (khuge | khead));
 	}
 	check("the private pages go back to the mount",
 	      meminfo("HugePages_Rsvd:") == 1 && meminfo("HugePages_Free:") == 4);
@@ -3452,10 +3463,10 @@ static unsigned long long pagemap_entry(const void *addr)
 	return entry;
 }
 
-/* Gives the entry of /proc/kpageflags for the page at `addr`, or 0. */
-static unsigned long long kpageflags_entry(const void *addr)
+/* Gives the entry of /proc/kpageflags for the page frame `pfn`, or 0. */
+static unsigned long long kpageflags_pfn(unsigned long long pfn)
 {
-	unsigned long long flags = 0, pfn = pagemap_entry(addr) & ((1ULL << 55) - 1);
+	unsigned long long flags = 0;
 	int fd = open("/proc/kpageflags", O_RDONLY);
 	if (fd < 0)
 		return 0;
@@ -3463,6 +3474,108 @@ static unsigned long long kpageflags_entry(const void *addr)
 		flags = 0;
 	close(fd);
 	return flags;
+}
+
+/* Gives the entry of /proc/kpageflags for the page at `addr`, or 0. */
+static unsigned long long kpageflags_entry(const void *addr)
+{
+	return kpageflags_pfn(pagemap_entry(addr) & ((1ULL << 55) - 1));
+}
+
+/*
+ * PM_SOFT_DIRTY (55) and PM_MMAP_EXCLUSIVE (56) of /proc/PID/pagemap, the clear of soft-dirty
+ * with a write of 4 to /proc/PID/clear_refs, and the THP flags of /proc/kpageflags (#430).
+ */
+static void test_soft_dirty(void)
+{
+	const unsigned long long soft = 1ULL << 55, excl = 1ULL << 56;
+	char *m = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m == MAP_FAILED) {
+		check("mmap for soft-dirty", 0);
+		return;
+	}
+	m[0] = 1;
+	check("pagemap: a new page is soft-dirty and exclusive", (pagemap_entry(m) & (soft | excl)) == (soft | excl));
+	check("clear_refs: 9 gives EINVAL", write_text("/proc/self/clear_refs", "9") != 0);
+	check("clear_refs: 4 clears soft-dirty",
+	      write_text("/proc/self/clear_refs", "4") == 0 && (pagemap_entry(m) & soft) == 0 &&
+		      (pagemap_entry(m + 4096) & soft) == 0);
+	check("pagemap: a read keeps the page clean", m[0] == 1 && m[4096] == 0 && (pagemap_entry(m + 4096) & soft) == 0);
+	m[0] = 2;
+	m[4096] = 2;
+	check("pagemap: a write after the clear makes the page soft-dirty",
+	      (pagemap_entry(m) & soft) != 0 && (pagemap_entry(m + 4096) & soft) != 0);
+	write_text("/proc/self/clear_refs", "4");
+	char *n = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	check("pagemap: a new mapping is soft-dirty", n != MAP_FAILED && (pagemap_entry(n) & soft) != 0);
+	if (n != MAP_FAILED)
+		munmap(n, 4096);
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit((pagemap_entry(m) & excl) == 0 && (pagemap_entry(m) & soft) == 0 ? 0 : 1);
+	check("pagemap: a page that fork shares is not exclusive",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("pagemap: the page is exclusive again after the child", (pagemap_entry(m) & excl) != 0);
+	munmap(m, 2 * 4096);
+
+	/* A transparent huge page: KPF_THP (22), KPF_COMPOUND_HEAD (15) and KPF_COMPOUND_TAIL (16). */
+	const unsigned long long thp = 1ULL << 22, head = 1ULL << 15, tail = 1ULL << 16;
+	char *r = mmap(NULL, 4 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (r == MAP_FAILED)
+		return;
+	char *h = (char *)(((unsigned long)r + (2 << 20) - 1) & ~((2UL << 20) - 1));
+	madvise(h, 2 << 20, MADV_HUGEPAGE);
+	h[0] = 1;
+	unsigned long long f0 = kpageflags_entry(h), f1 = kpageflags_entry(h + 4096);
+	check("kpageflags: a transparent huge page has KPF_THP and the compound flags",
+	      (f0 & (thp | head | tail)) == (thp | head) && (f1 & (thp | head | tail)) == (thp | tail));
+	munmap(r, 4 << 20);
+}
+
+/*
+ * A write back makes the page read only in each process that wrote it, as folio_mkclean of
+ * Linux, so the next write of any process marks the page dirty again (#430).
+ */
+static void test_mkclean(void)
+{
+	const unsigned long long dirty = 1ULL << 4;
+	int fd = open("/tmp/mkclean", O_CREAT | O_RDWR | O_TRUNC, 0600);
+	char *s = MAP_FAILED, c = 0;
+	int go[2], done[2];
+	if (fd >= 0 && ftruncate(fd, 4096) == 0)
+		s = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (s == MAP_FAILED || pipe(go) != 0 || pipe(done) != 0) {
+		check("mmap for mkclean", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		/* The child writes after the parent, and its msync writes back the page of both. */
+		read(go[0], &c, 1);
+		s[1] = 'b';
+		int ok = msync(s, 4096, MS_SYNC) == 0;
+		write(done[1], &c, 1);
+		_exit(ok ? 0 : 1);
+	}
+	s[0] = 'a';
+	write(go[1], &c, 1);
+	read(done[0], &c, 1);
+	int status = 0;
+	check("msync of another process", waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("kpageflags: the msync of another process makes the page clean", (kpageflags_entry(s) & dirty) == 0);
+	s[2] = 'c';
+	check("kpageflags: a write after the msync of another process makes the page dirty",
+	      (kpageflags_entry(s) & dirty) != 0);
+	char buf[4] = {0};
+	check("msync writes the page", msync(s, 4096, MS_SYNC) == 0 && pread(fd, buf, 3, 0) == 3 && memcmp(buf, "abc", 3) == 0);
+	munmap(s, 4096);
+	close(fd);
+	close(go[0]);
+	close(go[1]);
+	close(done[0]);
+	close(done[1]);
+	unlink("/tmp/mkclean");
 }
 
 /*
@@ -3506,6 +3619,8 @@ static void test_pagemap(void)
 	if (fd >= 0)
 		close(fd);
 	unlink("/tmp/pagemap");
+	test_soft_dirty();
+	test_mkclean();
 }
 
 static void test_proc(void)
