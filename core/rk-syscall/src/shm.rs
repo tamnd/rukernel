@@ -198,6 +198,22 @@ impl MmFile for ShmPages {
         let path = alloc::format!("/SYSV{:08x} (deleted)", self.key as u32);
         (0, self.id as u64, path.into_bytes())
     }
+
+    /// A new map of the segment needs the segment in the table, as `__shm_open` in ipc/shm.c
+    /// of Linux. A removed segment that only the caller holds goes now, as `shm_close`.
+    fn reopen(&self) -> Result<(), Errno> {
+        let mut table = TABLE.lock();
+        let Some(s) = table.segments.get(&self.id) else { return Err(Errno::EINVAL) };
+        if !core::ptr::eq(Arc::as_ptr(&s.pages), self) {
+            return Err(Errno::EINVAL);
+        }
+        // `nattch` counts the reference of the caller.
+        if s.perm.mode & SHM_DEST != 0 && s.nattch() <= 1 {
+            table.segments.remove(&self.id);
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
 }
 
 /// A segment in the table.

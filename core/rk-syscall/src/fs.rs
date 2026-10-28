@@ -25,12 +25,14 @@ use rk_abi::native::mount::{
 use rk_abi::native::open::{O_APPEND, O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::{SIGPIPE, SIGXFSZ};
 use rk_abi::native::stat::{
-    STATX__RESERVED, STATX_BASIC_STATS, STATX_BTIME, STATX_MNT_ID, STATX_MNT_ID_UNIQUE,
+    STATX__RESERVED, STATX_BASIC_STATS, STATX_BTIME, STATX_DIOALIGN, STATX_MNT_ID,
+    STATX_MNT_ID_UNIQUE,
 };
 use rk_abi::native::types::{Iovec, KernelFsidT, Stat, Statfs, Statx, StatxTimestamp};
 use rk_frame::sync::SpinLock;
 use rk_proc::signal::{SI_USER, SigInfo};
 use rk_vfs::device::{major, minor};
+use rk_vfs::file::O_ASYNC;
 use rk_vfs::inode::{Metadata, SetAttr, Timespec};
 use rk_vfs::lock::{self, LockKind, Owner, RecordLock};
 use rk_vfs::{File, Location, Whence};
@@ -758,9 +760,14 @@ pub(crate) fn statx(
         s.stx_mnt_id = mnt_id;
     }
     // The `STATX_ATTR_*` bits of these flags are the bits of the inode flags.
-    if let Some(Ok(f)) = inode.map(|i| i.attr_flags()) {
+    // The mask is the bits that the file system keeps, as the `getattr` of each file system of
+    // Linux sets it.
+    if let Some(inode) = &inode
+        && let Ok(f) = inode.attr_flags()
+    {
         let known =
-            STATX_ATTR_COMPRESSED | STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP;
+            (STATX_ATTR_COMPRESSED | STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP)
+                & u64::from(inode.statx_attributes_mask());
         s.stx_attributes = u64::from(f) & known;
         s.stx_attributes_mask = known;
     }
@@ -778,6 +785,16 @@ pub(crate) fn statx(
     if let Some(btime) = meta.btime {
         s.stx_mask |= STATX_BTIME;
         s.stx_btime = statx_time(btime);
+    }
+    // The alignment of a direct I/O on a block device, as `bdev_statx` in block/bdev.c of
+    // Linux: the memory to `dma_alignment + 1`, and the offset to the logical block size.
+    if mask as u32 & STATX_DIOALIGN != 0
+        && meta.file_type() == Some(rk_vfs::FileType::BlockDevice)
+        && rk_vfs::blockdev::block_queue(meta.rdev).is_some()
+    {
+        s.stx_mask |= STATX_DIOALIGN;
+        s.stx_dio_mem_align = rk_vfs::blockdev::SECTOR_SIZE as u32;
+        s.stx_dio_offset_align = rk_vfs::blockdev::SECTOR_SIZE as u32;
     }
     s.stx_rdev_major = major(meta.rdev);
     s.stx_rdev_minor = minor(meta.rdev);
@@ -1023,8 +1040,8 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         F_GETFL => Ok(u64::from(cx.file(fd)?.flags().0)),
         F_SETFL => {
             let file = cx.file(fd)?;
-            // Only `O_APPEND` and `O_NONBLOCK` change in R1. Linux also changes `O_ASYNC`,
-            // `O_DIRECT` and `O_NOATIME`.
+            // `O_APPEND`, `O_NONBLOCK` and `O_ASYNC` change. Linux also changes `O_DIRECT` and
+            // `O_NOATIME`.
             // An append-only file keeps `O_APPEND`, as `setfl` of Linux.
             if arg as u32 & O_APPEND == 0
                 && let Some(inode) = file.inode()
@@ -1032,8 +1049,14 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             {
                 return Err(Errno::EPERM);
             }
-            let keep = file.flags().0 & !(O_APPEND | O_NONBLOCK);
-            file.set_status_flags(keep | (arg as u32 & (O_APPEND | O_NONBLOCK)));
+            // A change of `O_ASYNC` turns the signal of the file on or off, as `setfl` of Linux
+            // (fs/fcntl.c).
+            if (arg as u32 ^ file.flags().0) & O_ASYNC != 0 {
+                file.fasync(fd as i32, arg as u32 & O_ASYNC != 0)?;
+            }
+            let mask = O_APPEND | O_NONBLOCK | O_ASYNC;
+            let keep = file.flags().0 & !mask;
+            file.set_status_flags(keep | (arg as u32 & mask));
             Ok(0)
         }
         F_GETPIPE_SZ => Ok(rk_vfs::pipe::pipe_size(&*cx.file(fd)?)? as u64),

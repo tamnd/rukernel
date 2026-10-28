@@ -2490,6 +2490,10 @@ impl Inode for Node {
         }
     }
 
+    fn statx_attributes_mask(&self) -> u32 {
+        self.real().statx_attributes_mask()
+    }
+
     fn set_attr_flags(&self, flags: u32) -> Result<()> {
         self.check_writable()?;
         let upper = self.copy_up()?;

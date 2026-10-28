@@ -93,3 +93,7 @@ hugemmap32	The test needs gigantic huge pages (1 GiB). rukernel has only 2 MiB h
 hugemmap34	The test is only for ppc and ppc64 (TCONF on x86_64).
 hugemmap35	The test is only for aarch64 (TCONF on x86_64).
 hugeshmat04	The test needs 2048 MB MemAvailable. The LTP VM has less memory (TCONF).
+mq_open01	The case with the name "" wants EINVAL. glibc gives EINVAL in mq_open for a name without a "/" at the start, but musl gives the name to the kernel. Linux then gives ENOENT for the empty name (getname), and rukernel gives ENOENT as Linux does. The other cases pass.
+ioctl01	The test opens a pseudo terminal with openpty. rukernel has no pty driver, /dev/ptmx and devpts yet, so the setup fails (TBROK). A pty driver is the follow-up work.
+statx11	The test needs the field stx_dio_mem_align in struct statx of the libc at build time. The musl of the LTP build does not have it, so the test gives TCONF. The kernel gives STATX_DIOALIGN for a block device, as Linux.
+setsockopt11	The test repeats its check (fill all free memory, then read a pipe) for up to 300 s (.runtime = 300). On a busy host this can take more than the 240 s limit of the runner, and the runner stops it. It is not a hang: with --timeout 400 the test passes.

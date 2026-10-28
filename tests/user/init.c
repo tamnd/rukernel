@@ -332,6 +332,28 @@ static void test_memory(void)
 	check("brk", cur > 0 && syscall(SYS_brk, cur + 8192) == cur + 8192);
 	((volatile char *)cur)[8191] = 1;
 	check("brk again with the old end", syscall(SYS_brk, cur) == cur);
+	/* MADV_GUARD_INSTALL (102) and MADV_WIPEONFORK (18), as mm/madvise.c of Linux (#385). */
+	m = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m != MAP_FAILED) {
+		m[4096] = 7;
+		check("madvise MADV_WIPEONFORK", madvise(m + 4096, 4096, 18) == 0);
+		check("madvise MADV_GUARD_INSTALL", madvise(m, 4096, 102) == 0);
+		int status = 0;
+		pid_t pid = fork();
+		if (pid == 0)
+			_exit(m[4096] == 0 ? 0 : 1);
+		check("the child of fork has zero pages in a MADV_WIPEONFORK area",
+		      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		pid = fork();
+		if (pid == 0) {
+			*(volatile char *)m = 1;
+			_exit(0);
+		}
+		check("an access to a guard page gives SIGSEGV",
+		      waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+		check("the parent keeps the data of a MADV_WIPEONFORK area", m[4096] == 7);
+		munmap(m, 2 * 4096);
+	}
 }
 
 static void test_files(void)
@@ -381,6 +403,28 @@ static void test_devices(void)
 	check("/dev/null", fd >= 0 && write(fd, buf, sizeof(buf)) == sizeof(buf));
 	close(fd);
 	check("isatty of the console", isatty(1));
+	/* RNDGETENTCNT, as random_ioctl in drivers/char/random.c of Linux (#385). */
+	int bits = -1;
+	fd = open("/dev/urandom", O_RDONLY);
+	check("RNDGETENTCNT on /dev/urandom", fd >= 0 && ioctl(fd, 0x80045200, &bits) == 0 && bits > 0);
+	close(fd);
+	/* O_ASYNC on a pipe sends SIGIO to the owner, as kill_fasync of Linux (#385). */
+	int pfd[2];
+	sigset_t set, old;
+	sigemptyset(&set);
+	sigaddset(&set, SIGIO);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	if (pipe(pfd) == 0) {
+		struct timespec zero = { 0, 0 };
+		check("fcntl F_SETFL O_ASYNC on a pipe",
+		      fcntl(pfd[0], F_SETOWN, getpid()) == 0 && fcntl(pfd[0], F_SETFL, O_ASYNC) == 0 &&
+			      (fcntl(pfd[0], F_GETFL) & O_ASYNC));
+		check("a write to a pipe with O_ASYNC sends SIGIO",
+		      write(pfd[1], "x", 1) == 1 && sigtimedwait(&set, NULL, &zero) == SIGIO);
+		close(pfd[0]);
+		close(pfd[1]);
+	}
+	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
 static void test_fork(void)
@@ -408,6 +452,9 @@ static void test_exec(void)
 	check("execve of a static pie", waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
 						WEXITSTATUS(status) == 7);
 	check("execve of a missing file", execve("/missing", NULL, NULL) == -1 && errno == ENOENT);
+	/* A program that runs cannot be opened for write, as deny_write_access of Linux (#385). */
+	int tfd = open("/init", O_WRONLY);
+	check("open for write of the running program gives ETXTBSY", tfd == -1 && errno == ETXTBSY);
 }
 
 static void test_time(void)
@@ -2360,6 +2407,9 @@ static void test_iflags(void)
 		check("statx gives the immutable and nodump attributes",
 		      statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) == 0 &&
 		      (stx.stx_attributes & (imm | nodump | app)) == (imm | nodump) && (stx.stx_attributes_mask & app));
+		/* STATX_ATTR_COMPRESSED: tmpfs does not keep it, as shmem_getattr of Linux. */
+		check("statx on tmpfs has no compressed attribute in the mask",
+		      statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) == 0 && !(stx.stx_attributes_mask & 0x4));
 	}
 	fsx.fsx_projid = 1;
 	check("FS_IOC_FSSETXATTR with a project id gives EOPNOTSUPP",

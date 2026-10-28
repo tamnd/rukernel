@@ -141,7 +141,7 @@ pub(crate) fn rw_file(
 
 /// Makes a file with the permission bits `perm` whose open files have the operations that
 /// `open` makes. `read` gives the text for a read of the inode without an open file.
-#[cfg_attr(test, expect(dead_code, reason = "only the pressure files of the kernel use it"))]
+#[cfg_attr(test, expect(dead_code, reason = "only the files of the kernel module use it"))]
 pub(crate) fn ops_file(
     path: &[u8],
     perm: u32,

@@ -9,17 +9,18 @@ use rk_abi::Errno;
 use rk_abi::native::fcntl::{F_SEAL_FUTURE_WRITE, F_SEAL_WRITE};
 use rk_abi::native::mman::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED,
-    MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_MERGEABLE,
-    MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
-    MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL, MADV_UNMERGEABLE, MADV_WILLNEED, MADV_WIPEONFORK,
-    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGE_SHIFT, MAP_HUGETLB,
-    MAP_LOCKED, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE,
-    MAP_TYPE, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED,
+    MADV_DONTNEED_LOCKED, MADV_FREE, MADV_GUARD_INSTALL, MADV_GUARD_REMOVE, MADV_HUGEPAGE,
+    MADV_KEEPONFORK, MADV_MERGEABLE, MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT,
+    MADV_POPULATE_READ, MADV_POPULATE_WRITE, MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL,
+    MADV_UNMERGEABLE, MADV_WILLNEED, MADV_WIPEONFORK, MAP_ANONYMOUS, MAP_FIXED,
+    MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGE_SHIFT, MAP_HUGETLB, MAP_LOCKED, MAP_NONBLOCK,
+    MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_TYPE,
+    MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED,
     MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
-use rk_mm::{HugeAdvice, MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
+use rk_mm::{Backing, HugeAdvice, MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
 use rk_proc::limits::RLIMIT_MEMLOCK;
 use rk_vfs::InodeRef;
 use rk_vfs::cred::cap;
@@ -87,6 +88,10 @@ impl MmFile for FilePages {
 
     fn dirty(&self, index: u64) {
         self.dirty.lock().insert(index);
+    }
+
+    fn cached(&self, index: u64) -> bool {
+        self.pages.lock().contains_key(&index)
     }
 
     fn write_back(&self, first: u64, end: u64) -> Result<(), Errno> {
@@ -242,6 +247,10 @@ impl MmFile for SharedWrite {
 
     fn dirty(&self, index: u64) {
         self.pages.dirty(index);
+    }
+
+    fn cached(&self, index: u64) -> bool {
+        self.pages.cached(index)
     }
 
     fn write_back(&self, first: u64, end: u64) -> Result<(), Errno> {
@@ -407,6 +416,83 @@ pub(crate) fn mremap(
     Ok(cx.vm()?.mremap(addr as usize, old_len as usize, new_len as usize, remap)? as u64)
 }
 
+/// `remap_file_pages`. Linux has no nonlinear mappings now. It maps the file of the shared area
+/// again at the range, from the page `pgoff` of the file, as `remap_file_pages` in mm/mmap.c of
+/// Linux.
+///
+/// # Errors
+///
+/// `EINVAL` for a `prot` that is not 0, a range that wraps, or a range that is not in one shared
+/// mapping of a file.
+pub(crate) fn remap_file_pages(
+    cx: &Cx<'_>,
+    start: u64,
+    size: u64,
+    prot: u64,
+    pgoff: u64,
+    flags: u64,
+) -> SysResult {
+    if prot != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let page = PAGE_SIZE as u64;
+    let (start, size) = (start & !(page - 1), size & !(page - 1));
+    let end = start.checked_add(size).filter(|&end| end > start).ok_or(Errno::EINVAL)?;
+    pgoff.checked_add(size / page).ok_or(Errno::EINVAL)?;
+    let offset = pgoff.checked_mul(page).ok_or(Errno::EINVAL)?;
+    let (start, end) = (
+        usize::try_from(start).map_err(|_| Errno::EINVAL)?,
+        usize::try_from(end).map_err(|_| Errno::EINVAL)?,
+    );
+    let vm = cx.vm()?;
+    // The range is in one shared area of a file, or in areas next to it with the same file and
+    // the same flags.
+    let areas = vm.areas_in(start, end - start).map_err(|_| Errno::EINVAL)?;
+    let first = areas.first().ok_or(Errno::EINVAL)?;
+    let Backing::File { file, .. } = &first.backing else { return Err(Errno::EINVAL) };
+    if !first.shared {
+        return Err(Errno::EINVAL);
+    }
+    let same = |v: &rk_mm::Vma<rk_mm::FileRef>| {
+        matches!(&v.backing, Backing::File { file: f, .. } if Arc::ptr_eq(f, file))
+            && v.prot == first.prot
+            && v.shared
+            && v.may_write == first.may_write
+            && v.locked == first.locked
+    };
+    if !areas.iter().all(same) {
+        return Err(Errno::EINVAL);
+    }
+    let (prot, may_write, locked, hugetlb) =
+        (first.prot, first.may_write, first.locked, first.hugetlb);
+    let file = file.clone();
+    drop(areas);
+    // The old map goes first, and the file can refuse the new map: a System V segment that
+    // `IPC_RMID` removed goes with its last map, as `do_mmap` and `shm_mmap` of Linux.
+    vm.munmap(start, end - start)?;
+    file.reopen()?;
+    // The new mapping has the access of the area, and `MAP_NONBLOCK` stops the populate.
+    let req = MmapRequest {
+        addr: start,
+        len: end - start,
+        prot,
+        shared: true,
+        fixed: true,
+        noreplace: false,
+        low32: false,
+        may_write,
+        locked,
+        populate: flags as u32 & MAP_NONBLOCK == 0,
+        grows_down: false,
+        file: Some((file, offset)),
+        kind: VmaKind::Normal,
+        noreserve: false,
+        hugetlb,
+    };
+    vm.mmap(req)?;
+    Ok(0)
+}
+
 /// The most locked bytes of the caller, as `can_do_mlock` of Linux checks them: `None` if the
 /// caller has `CAP_IPC_LOCK`. Gives `EPERM` if `RLIMIT_MEMLOCK` is 0 and the caller does not have
 /// the capability.
@@ -515,6 +601,8 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
             | MADV_DONTNEED_LOCKED
             | MADV_MERGEABLE
             | MADV_UNMERGEABLE
+            | MADV_GUARD_INSTALL
+            | MADV_GUARD_REMOVE
     );
     if !known || addr as usize % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
@@ -542,12 +630,19 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
         return Ok(0);
     }
     // `MADV_DONTNEED` and `MADV_FREE` remove the frames, so anonymous memory gives zero pages
-    // again. The advice for huge pages goes in the areas. Each other advice is only a hint, so it
-    // has no effect.
+    // again. The advice for huge pages and for `fork` goes in the areas, as `madvise_update_vma`
+    // of Linux. Each other advice is only a hint, so it has no effect.
+    let (addr, len) = (addr as usize, len as usize);
     match advice {
-        MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE => vm.discard(addr as usize, len as usize),
-        MADV_HUGEPAGE => vm.set_huge_advice(addr as usize, len as usize, HugeAdvice::Huge)?,
-        MADV_NOHUGEPAGE => vm.set_huge_advice(addr as usize, len as usize, HugeAdvice::NoHuge)?,
+        MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE => vm.discard(addr, len),
+        MADV_HUGEPAGE => vm.set_huge_advice(addr, len, HugeAdvice::Huge)?,
+        MADV_NOHUGEPAGE => vm.set_huge_advice(addr, len, HugeAdvice::NoHuge)?,
+        MADV_DONTFORK => vm.set_fork_advice(addr, len, Some(true), None)?,
+        MADV_DOFORK => vm.set_fork_advice(addr, len, Some(false), None)?,
+        MADV_WIPEONFORK => vm.set_fork_advice(addr, len, None, Some(true))?,
+        MADV_KEEPONFORK => vm.set_fork_advice(addr, len, None, Some(false))?,
+        MADV_GUARD_INSTALL => vm.guard_install(addr, len)?,
+        MADV_GUARD_REMOVE => vm.guard_remove(addr, len)?,
         _ => {}
     }
     Ok(0)

@@ -21,6 +21,7 @@ use rk_abi::native::auxv::{
 use rk_abi::native::mount::{MS_NOEXEC, MS_NOSUID};
 use rk_mm::{AddressSpace, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind};
 use rk_vfs::cred::{Cred, ExecFile};
+use rk_vfs::file::DenyWrite;
 use rk_vfs::{FileType, FsContext, InodeRef, Location};
 
 /// The most interpreters in a chain of `#!` scripts. Linux names it `BINPRM_MAX_RECURSION`.
@@ -216,6 +217,10 @@ fn read_headers(inode: &InodeRef) -> Result<ElfHeader, Errno> {
     elf::parse(&ehdr, &phdrs, MACHINE)
 }
 
+/// What `build` gives: the address space, the start of the program, the file of the program
+/// with the denial of its write, the arguments, the auxiliary vector and the credentials.
+type Built = (AddressSpace, ExecImage, (Location, DenyWrite), Vec<Vec<u8>>, Vec<u8>, Cred);
+
 /// Makes the new address space and the initial stack for `args`. `random` gives the 16 bytes of
 /// `AT_RANDOM`. Also gives the file of the program, the arguments, which an interpreter line
 /// changes, the auxiliary vector and the new credentials. With `no_setid`, the set-user-ID and
@@ -227,7 +232,7 @@ fn build(
     cred: &Cred,
     no_setid: bool,
     memcg: u32,
-) -> Result<(AddressSpace, ExecImage, Location, Vec<Vec<u8>>, Vec<u8>, Cred), Errno> {
+) -> Result<Built, Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
     // The first lookup uses the start and the flags of `execveat`. An interpreter of a script
@@ -262,6 +267,9 @@ fn build(
         let header = read_headers(at.inode())?;
         break (at, header);
     };
+    // A file that is open for a write does not run, and a write of the file of the program
+    // fails while it runs, as `exe_file_deny_write_access` in `do_open_execat` of Linux.
+    let deny = rk_vfs::file::DenyWrite::new(at.inode())?;
 
     let meta = at.inode().metadata();
     let file = ExecFile {
@@ -342,7 +350,7 @@ fn build(
     )?;
     space.write(image.sp, &image.bytes)?;
     let start = interp.map_or(entry, |i| i.bias + i.header.entry as usize);
-    Ok((space, ExecImage { entry: start, sp: image.sp }, at, args.argv, image.auxv, cred))
+    Ok((space, ExecImage { entry: start, sp: image.sp }, (at, deny), args.argv, image.auxv, cred))
 }
 
 /// Runs a new program in the process of `thread`. On success the process has the new address
@@ -376,7 +384,7 @@ pub fn exec(
     // A tracer cannot follow a program that gets more rights, so the bits have no effect then.
     // A tracer with `CAP_SYS_PTRACE` can, as `cap_bprm_creds_from_file` of Linux.
     let no_setid = thread.no_new_privs() || (thread.is_traced() && !thread.tracer_capable());
-    let (space, image, at, argv, auxv, cred) =
+    let (space, image, (at, deny), argv, auxv, cred) =
         build(&ctx, args, random, &process.cred(), no_setid, process.memcg())?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
@@ -406,6 +414,6 @@ pub fn exec(
     }
     process.set_cred(cred);
     thread.exec_keys();
-    process.set_image(&argv, at, auxv);
+    process.set_image(&argv, at, auxv, deny);
     Ok(image)
 }

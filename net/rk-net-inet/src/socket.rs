@@ -32,8 +32,8 @@ use rk_abi::native::in6::{
     IPV6_MULTICAST_LOOP, IPV6_PKTINFO, IPV6_PMTUDISC_OMIT, IPV6_RECVDSTOPTS, IPV6_RECVERR,
     IPV6_RECVERR_RFC4884, IPV6_RECVFRAGSIZE, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
     IPV6_RECVORIGDSTADDR, IPV6_RECVPATHMTU, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS,
-    IPV6_ROUTER_ALERT_ISOLATE, IPV6_TCLASS, IPV6_TRANSPARENT, IPV6_UNICAST_HOPS, IPV6_UNICAST_IF,
-    IPV6_V6ONLY,
+    IPV6_ROUTER_ALERT_ISOLATE, IPV6_RTHDR, IPV6_TCLASS, IPV6_TRANSPARENT, IPV6_UNICAST_HOPS,
+    IPV6_UNICAST_IF, IPV6_V6ONLY,
 };
 use rk_abi::native::inet::{
     IP_HDRINCL, IP_MTU_DISCOVER, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
@@ -256,6 +256,64 @@ struct State {
     /// The datagram of `MSG_MORE` that waits for more data: the address, the port and the
     /// scope of the first send, and the data, as `pending` of `struct udp_sock` of Linux.
     corked: Option<(Ip, u16, u32, Vec<u8>)>,
+    /// `UDP_CORK`: each send adds its data to one datagram, as `MSG_MORE`.
+    cork: bool,
+    /// `IPV6_RTHDR`: the routing header that the program set. The stack keeps it for
+    /// `getsockopt`, but does not put it in the packets yet.
+    rthdr: Option<Vec<u8>>,
+}
+
+/// `UDP_CORK` of include/uapi/linux/udp.h.
+const UDP_CORK: u32 = 1;
+/// `IPV6_SRCRT_TYPE_2` of include/uapi/linux/ipv6.h: the routing header of Mobile IPv6.
+const SRCRT_TYPE_2: u8 = 2;
+/// `IPV6_SRCRT_TYPE_4` of include/uapi/linux/ipv6.h: the segment routing header.
+const SRCRT_TYPE_4: u8 = 4;
+
+/// Checks a segment routing header of `len` bytes, as `seg6_validate_srh` in net/ipv6/seg6.c of
+/// Linux: the length, the segment counts and the TLVs after the segments.
+fn valid_srh(h: &[u8]) -> bool {
+    let len = h.len();
+    if h.len() < 8 || h[2] != SRCRT_TYPE_4 || (usize::from(h[1]) + 1) * 8 != len {
+        return false;
+    }
+    let (left, first) = (usize::from(h[3]), usize::from(h[4]));
+    if left > first || first + 1 > usize::from(h[1]) / 2 {
+        return false;
+    }
+    let mut off = 8 + (first + 1) * 16;
+    if off > len {
+        return false;
+    }
+    // Each TLV has a type, a length and the data.
+    while off < len {
+        if len - off < 2 {
+            return false;
+        }
+        off += 2 + usize::from(h[off + 1]);
+        if off > len {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks the value of `IPV6_RTHDR`, as `ipv6_set_opt_hdr` in net/ipv6/ipv6_sockglue.c of
+/// Linux. An empty value removes the header. Gives `None` for a header that is not correct.
+fn rthdr_of(value: &[u8]) -> Option<Option<Vec<u8>>> {
+    if value.is_empty() {
+        return Some(None);
+    }
+    let len = value.len();
+    if len < 2 || len & 7 != 0 || len > 8 * 255 || (usize::from(value[1]) + 1) * 8 > len {
+        return None;
+    }
+    let ok = match value.get(2) {
+        Some(&SRCRT_TYPE_2) => value[1] == 2 && value.get(3) == Some(&1),
+        Some(&SRCRT_TYPE_4) => valid_srh(value),
+        _ => false,
+    };
+    ok.then(|| Some(value.to_vec()))
 }
 
 /// A socket of /proc/net/udp, /proc/net/icmp or /proc/net/raw.
@@ -352,6 +410,8 @@ impl Dgram {
                 shut_wr: false,
                 closed: false,
                 corked: None,
+                cork: false,
+                rthdr: None,
             }),
             wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
@@ -751,6 +811,9 @@ impl Dgram {
     /// `do_rawv6_getsockopt` of Linux.
     fn get_option6(&self, s: &State, name: u32) -> Result<Vec<u8>> {
         let raw = matches!(self.proto, Proto::Raw(_));
+        if name == IPV6_RTHDR {
+            return Ok(s.rthdr.clone().unwrap_or_default());
+        }
         Ok(int(match name {
             IPV6_V6ONLY => i32::from(s.v6only),
             IPV6_UNICAST_HOPS => i32::from(s.hops.unwrap_or(ipv6::DEFAULT_HOPS)),
@@ -810,6 +873,10 @@ impl Dgram {
     /// Sets an option of the level `IPPROTO_IPV6`, as `do_ipv6_setsockopt` and
     /// `do_rawv6_setsockopt` of Linux.
     fn set_option6(&self, s: &mut State, name: u32, value: &[u8]) -> Result<()> {
+        if name == IPV6_RTHDR {
+            s.rthdr = rthdr_of(value).ok_or(Errno::EINVAL)?;
+            return Ok(());
+        }
         let v = int_of(value)?;
         let raw = matches!(self.proto, Proto::Raw(_));
         let hops = |v: i32| if (-1..=255).contains(&v) { Ok(v) } else { Err(Errno::EINVAL) };
@@ -1006,12 +1073,13 @@ impl Socket for Dgram {
             if s.shut_wr {
                 return Err(Errno::EPIPE);
             }
-            // A UDP send with `MSG_MORE` adds its data to one datagram, and the next send
+            // A UDP send with `MSG_MORE` or `UDP_CORK` adds its data to one datagram, and the next send
             // without it sends the datagram to the address of the first send, as
             // `udp_sendmsg` of Linux.
+            let more = flags & MSG_MORE != 0 || s.cork;
             if let Some((dst, port, scope, mut data)) = s.corked.take() {
                 data.extend_from_slice(&msg.data);
-                if flags & MSG_MORE != 0 {
+                if more {
                     s.corked = Some((dst, port, scope, data));
                     return Ok(msg.data.len());
                 }
@@ -1022,7 +1090,7 @@ impl Socket for Dgram {
                     None if matches!(self.proto, Proto::Raw(_)) && s.hdrincl => (self.any(), 0, 0),
                     None => return Err(Errno::EDESTADDRREQ),
                 };
-                if flags & MSG_MORE != 0 && self.proto == Proto::Udp {
+                if more && self.proto == Proto::Udp {
                     s.corked = Some((dst, port, scope, msg.data.clone()));
                     return Ok(msg.data.len());
                 }
@@ -1151,6 +1219,9 @@ impl Socket for Dgram {
             // An IPv4 socket gives the other levels to `ip_getsockopt` of Linux, which gives
             // `EOPNOTSUPP`. The level of the transport protocol and IPv6 give `ENOPROTOOPT`.
             IPPROTO_TCP if self.proto == Proto::Tcp => Err(Errno::ENOPROTOOPT),
+            IPPROTO_UDP if self.proto == Proto::Udp && name == UDP_CORK => {
+                Ok(int(i32::from(s.cork)))
+            }
             IPPROTO_UDP if self.proto == Proto::Udp => Err(Errno::ENOPROTOOPT),
             _ if self.family == AF_INET6 => Err(Errno::ENOPROTOOPT),
             _ => Err(Errno::EOPNOTSUPP),
@@ -1199,6 +1270,16 @@ impl Socket for Dgram {
                 }
             }
             IPPROTO_IPV6 if self.family == AF_INET6 => self.set_option6(&mut s, name, value)?,
+            IPPROTO_UDP if self.proto == Proto::Udp && name == UDP_CORK => {
+                s.cork = int_of(value)? != 0;
+                // The end of the cork sends the datagram that waits, as
+                // `udp_lib_setsockopt` in net/ipv4/udp.c of Linux. An error goes nowhere.
+                if !s.cork
+                    && let Some((dst, port, scope, data)) = s.corked.take()
+                {
+                    let _ = self.send_to(&mut s, dst, port, scope, &data);
+                }
+            }
             SOL_RAW if self.family == AF_INET6 && name == IPV6_CHECKSUM => {
                 self.set_option6(&mut s, name, value)?;
             }

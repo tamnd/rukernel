@@ -48,6 +48,23 @@ pub trait MmFile: Send + Sync {
     /// Records that a shared mapping changed the page `index`.
     fn dirty(&self, _index: u64) {}
 
+    /// Tells if the page `index` of the file is in memory, for `mincore` of a page that has no
+    /// frame in the page table, as `mincore_page` in mm/mincore.c of Linux.
+    fn cached(&self, _index: u64) -> bool {
+        false
+    }
+
+    /// Checks that a new map of the file can start, as the `mmap` of the file in Linux.
+    /// `remap_file_pages` calls it after it removed the old map, and holds one reference to the
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the file, as `EINVAL` for a removed System V segment.
+    fn reopen(&self) -> Result<(), Errno> {
+        Ok(())
+    }
+
     /// Writes the changed pages from `first` up to `end` back to the file.
     ///
     /// # Errors
@@ -93,6 +110,10 @@ impl MmFile for SharedAnon {
 
     fn name(&self) -> (u64, u64, Vec<u8>) {
         (0, 0, b"/dev/zero (deleted)".to_vec())
+    }
+
+    fn cached(&self, index: u64) -> bool {
+        self.pages.lock().contains_key(&index)
     }
 }
 
@@ -202,6 +223,9 @@ struct State {
     brk: usize,
     /// `MCL_FUTURE`: lock each new area.
     lock_future: bool,
+    /// The guard pages of `MADV_GUARD_INSTALL`, by address. An access to such a page gives
+    /// `SIGSEGV`, as a guard marker in the page table of Linux (mm/madvise.c).
+    guards: BTreeSet<usize>,
 }
 
 /// The address space of one process.
@@ -286,7 +310,13 @@ impl AddressSpace {
 
     /// Makes an address space with no areas that uses the page table `vm`.
     fn with_vm(vm: VmSpace) -> Self {
-        let state = State { vmas: VmaSet::new(), brk_start: 0, brk: 0, lock_future: false };
+        let state = State {
+            vmas: VmaSet::new(),
+            brk_start: 0,
+            brk: 0,
+            lock_future: false,
+            guards: BTreeSet::new(),
+        };
         Self {
             vm,
             state: SpinLock::new(state),
@@ -452,6 +482,8 @@ impl AddressSpace {
             huge: HugeAdvice::None,
             account,
             hugetlb,
+            dont_fork: false,
+            wipe_on_fork: false,
             backing,
             kind: req.kind,
         });
@@ -541,6 +573,7 @@ impl AddressSpace {
     }
 
     fn unmap_locked(&self, st: &mut State, start: usize, end: usize) {
+        Self::remove_guards(st, start, end);
         for vma in st.vmas.remove_range(start, end) {
             if vma.hugetlb && !vma.shared {
                 self.unreserve_private(vma.start, vma.end);
@@ -744,7 +777,9 @@ impl AddressSpace {
         self.vm.pages_in(VirtAddr::new(start), VirtAddr::new(end))
     }
 
-    /// Gives one byte for each page of `addr..addr + len`: 1 if the page has a frame, else 0.
+    /// Gives one byte for each page of `addr..addr + len`: 1 if the page has a frame, else 0. A
+    /// page of a file without a frame here is 1 if the file has the page in memory, as
+    /// `mincore_unmapped_range` of Linux.
     ///
     /// # Errors
     ///
@@ -754,10 +789,20 @@ impl AddressSpace {
             return Err(Errno::EINVAL);
         }
         let (start, end) = Self::lock_range(addr, len)?;
-        if !self.state.lock().vmas.covers(start, end) {
+        let st = self.state.lock();
+        if !st.vmas.covers(start, end) {
             return Err(Errno::ENOMEM);
         }
         let mut out = alloc::vec![0u8; (end - start) / PAGE_SIZE];
+        for vma in st.vmas.iter().filter(|v| v.start < end && start < v.end) {
+            let Backing::File { file, offset } = &vma.backing else { continue };
+            for page in (start.max(vma.start)..end.min(vma.end)).step_by(PAGE_SIZE) {
+                if file.cached(file_index(vma, *offset, page)) {
+                    out[(page - start) / PAGE_SIZE] = 1;
+                }
+            }
+        }
+        drop(st);
         for page in self.vm.mapped_pages(VirtAddr::new(start), VirtAddr::new(end)) {
             out[(page.get() - start) / PAGE_SIZE] = 1;
         }
@@ -869,7 +914,11 @@ impl AddressSpace {
                 copy.start = addr;
                 copy
             }
-            _ => st.vmas.remove_range(addr, addr + old_len).pop().ok_or(Errno::EFAULT)?,
+            _ => {
+                // The guard pages do not move with the area.
+                Self::remove_guards(st, addr, addr + old_len);
+                st.vmas.remove_range(addr, addr + old_len).pop().ok_or(Errno::EFAULT)?
+            }
         };
         for page in self.vm.mapped_pages(VirtAddr::new(addr), VirtAddr::new(addr + old_len)) {
             let Some((frame, prot)) = self.vm.page(page) else { continue };
@@ -987,6 +1036,10 @@ impl AddressSpace {
             return Err(Errno::EFAULT);
         }
         let vma = st.vmas.find(addr).ok_or(Errno::EFAULT)?;
+        // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
+        if !st.guards.is_empty() && st.guards.contains(&(addr & !(PAGE_SIZE - 1))) {
+            return Err(Errno::EFAULT);
+        }
         let allowed = match access {
             Access::Read => vma.prot.read || vma.prot.write || vma.prot.exec,
             Access::Write => vma.prot.write,
@@ -1269,24 +1322,121 @@ impl AddressSpace {
     /// Gives `ENOMEM` if no frame is free for a page table.
     pub fn fork(&self) -> Result<Self, Errno> {
         let st = self.state.lock();
+        // An area of `MADV_DONTFORK` does not go to the child, and an area of `MADV_WIPEONFORK`
+        // goes without its pages, as `dup_mmap` in kernel/fork.c of Linux.
+        let copied = |v: &&Vma<FileRef>| !v.dont_fork && !v.wipe_on_fork;
         let areas: Vec<ForkArea> = st
             .vmas
             .iter()
+            .filter(copied)
             .map(|v| ForkArea { start: v.start, end: v.end, shared: v.shared })
             .collect();
         let child = Self::with_vm(self.vm.fork(&areas).map_err(map_error)?);
         // The private areas of the child go in the commit count. The memory of a shared area is
         // in the count one time.
-        charge_commit(accounted(st.vmas.iter().filter(|v| !v.shared)))?;
+        charge_commit(accounted(st.vmas.iter().filter(|v| !v.shared && !v.dont_fork)))?;
         // The child does not get the locks of the parent, as on Linux.
         let mut vmas = st.vmas.clone();
+        let skipped: Vec<(usize, usize)> =
+            st.vmas.iter().filter(|v| v.dont_fork).map(|v| (v.start, v.end)).collect();
+        for (start, end) in skipped {
+            vmas.remove_range(start, end);
+        }
         vmas.update_range(0, USER_END, |vma| {
             vma.locked = false;
             vma.account &= !vma.shared;
         });
+        // The guard pages of the areas with their pages go to the child, as the guard markers
+        // that `copy_page_range` of Linux copies.
+        let guards = if st.guards.is_empty() {
+            BTreeSet::new()
+        } else {
+            let keep = |&&g: &&usize| st.vmas.find(g).is_some_and(|v| copied(&v));
+            st.guards.iter().filter(keep).copied().collect()
+        };
         *child.state.lock() =
-            State { vmas, brk_start: st.brk_start, brk: st.brk, lock_future: false };
+            State { vmas, brk_start: st.brk_start, brk: st.brk, lock_future: false, guards };
         Ok(child)
+    }
+
+    /// Removes the guard pages in `start..end`.
+    fn remove_guards(st: &mut State, start: usize, end: usize) {
+        if !st.guards.is_empty() {
+            let inside: Vec<usize> = st.guards.range(start..end).copied().collect();
+            for g in inside {
+                st.guards.remove(&g);
+            }
+        }
+    }
+
+    /// Sets the fork advice of the areas in `addr..addr + len`: `MADV_DONTFORK` and
+    /// `MADV_DOFORK` with `dont_fork`, `MADV_WIPEONFORK` and `MADV_KEEPONFORK` with `wipe`.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped.
+    pub fn set_fork_advice(
+        &self,
+        addr: usize,
+        len: usize,
+        dont_fork: Option<bool>,
+        wipe: Option<bool>,
+    ) -> Result<(), Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        let mut st = self.state.lock();
+        if !st.vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        st.vmas.update_range(start, end, |vma| {
+            if let Some(on) = dont_fork {
+                vma.dont_fork = on;
+            }
+            if let Some(on) = wipe {
+                vma.wipe_on_fork = on;
+            }
+        });
+        Ok(())
+    }
+
+    /// Makes the pages in `addr..addr + len` guard pages, for `MADV_GUARD_INSTALL`, as
+    /// `madvise_guard_install` in mm/madvise.c of Linux. The frames of the pages go away, and an
+    /// access to a page gives `SIGSEGV` until `MADV_GUARD_REMOVE`.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped, and `EINVAL` for a locked area or an area
+    /// of hugetlbfs.
+    pub fn guard_install(&self, addr: usize, len: usize) -> Result<(), Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        let mut st = self.state.lock();
+        if !st.vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        if st.vmas.iter().any(|v| v.start < end && start < v.end && (v.locked || v.hugetlb)) {
+            return Err(Errno::EINVAL);
+        }
+        self.vm.unmap_range(VirtAddr::new(start), VirtAddr::new(end));
+        st.guards.extend((start..end).step_by(PAGE_SIZE));
+        Ok(())
+    }
+
+    /// Removes the guard pages in `addr..addr + len`, for `MADV_GUARD_REMOVE`. The next access to
+    /// a page gives a new page, as `madvise_guard_remove` in mm/madvise.c of Linux.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped, and `EINVAL` for an area of hugetlbfs.
+    pub fn guard_remove(&self, addr: usize, len: usize) -> Result<(), Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        let mut st = self.state.lock();
+        if !st.vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        if st.vmas.iter().any(|v| v.start < end && start < v.end && v.hugetlb) {
+            return Err(Errno::EINVAL);
+        }
+        Self::remove_guards(&mut st, start, end);
+        Ok(())
     }
 
     /// Copies user memory at `addr` to `buf`. A page that is not there yet gets its frame.

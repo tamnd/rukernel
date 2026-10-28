@@ -12,7 +12,7 @@
 //! file gives an end of one pipe, which lives while one end is open. An open for reading waits
 //! for a writer, and an open for writing waits for a reader, as `fifo_open` of Linux.
 
-use crate::file::{File, FileOps, UserMemory, events};
+use crate::file::{FasyncList, File, FileOps, UserMemory, events, poll_code};
 use crate::inode::{Inode, InodeRef, Metadata, Result, SetAttr};
 use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::{BTreeMap, VecDeque};
@@ -56,14 +56,29 @@ struct Pipe {
     read_events: AtomicU64,
     /// The count of the events for the write end: space came or each read end closed.
     write_events: AtomicU64,
+    /// The read ends with `O_ASYNC`, which get a signal when data comes.
+    fasync_readers: FasyncList,
+    /// The write ends with `O_ASYNC`, which get a signal when space comes.
+    fasync_writers: FasyncList,
 }
 
 impl Pipe {
     /// Wakes the waiters. `readers` tells if the event is for the read end or the write end.
-    fn wake(&self, readers: bool) {
+    fn wake_only(&self, readers: bool) {
         let count = if readers { &self.read_events } else { &self.write_events };
         count.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
+    }
+
+    /// Wakes the waiters and sends the signal to the ends with `O_ASYNC`, as `pipe_read`,
+    /// `pipe_write` and `pipe_release` of Linux do with `kill_fasync`.
+    fn wake(&self, readers: bool) {
+        self.wake_only(readers);
+        if readers {
+            self.fasync_readers.kill(poll_code::POLL_IN);
+        } else {
+            self.fasync_writers.kill(poll_code::POLL_OUT);
+        }
     }
 }
 
@@ -92,8 +107,8 @@ impl PipeEnd {
             }
         }
         if named {
-            pipe.wake(true);
-            pipe.wake(false);
+            pipe.wake_only(true);
+            pipe.wake_only(false);
         }
         Self { pipe, read, write, named }
     }
@@ -235,6 +250,17 @@ impl FileOps for PipeEnd {
         }
     }
 
+    /// Adds the file to the lists of the ends of its access mode, as `pipe_fasync` of Linux.
+    fn fasync(&self, file: &Arc<File>, fd: i32, on: bool) -> Result<()> {
+        if self.read {
+            self.pipe.fasync_readers.helper(file, fd, on);
+        }
+        if self.write {
+            self.pipe.fasync_writers.helper(file, fd, on);
+        }
+        Ok(())
+    }
+
     fn pollable(&self) -> bool {
         true
     }
@@ -360,7 +386,7 @@ pub fn set_pipe_size(file: &File, size: usize) -> Result<usize> {
         }
         s.size = size;
     }
-    end.pipe.wake(false);
+    end.pipe.wake_only(false);
     Ok(size)
 }
 
@@ -483,6 +509,8 @@ fn new_pipe() -> Arc<Pipe> {
         ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
         read_events: AtomicU64::new(0),
         write_events: AtomicU64::new(0),
+        fasync_readers: FasyncList::new(),
+        fasync_writers: FasyncList::new(),
     })
 }
 

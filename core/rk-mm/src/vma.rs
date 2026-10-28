@@ -117,6 +117,11 @@ pub struct Vma<F> {
     /// hugetlbfs. Its start, its end and the edges of each change are 2 MiB aligned, and each page
     /// fault maps a huge page. Linux names it `VM_HUGETLB`.
     pub hugetlb: bool,
+    /// `MADV_DONTFORK`: a child of `fork` does not get the area. Linux names it `VM_DONTCOPY`.
+    pub dont_fork: bool,
+    /// `MADV_WIPEONFORK`: a child of `fork` gets the area without its pages, so each page is
+    /// zero there. Linux names it `VM_WIPEONFORK`.
+    pub wipe_on_fork: bool,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -138,6 +143,8 @@ impl<F: Clone> Vma<F> {
             huge: HugeAdvice::None,
             account: false,
             hugetlb: false,
+            dont_fork: false,
+            wipe_on_fork: false,
             backing: Backing::Anon,
             kind,
         }
@@ -259,6 +266,8 @@ impl<F: Clone> VmaSet<F> {
             && a.huge == b.huge
             && a.account == b.account
             && a.hugetlb == b.hugetlb
+            && a.dont_fork == b.dont_fork
+            && a.wipe_on_fork == b.wipe_on_fork
             && a.kind == b.kind;
         if !same {
             return false;
@@ -475,6 +484,8 @@ mod tests {
             huge: HugeAdvice::None,
             account: false,
             hugetlb: false,
+            dont_fork: false,
+            wipe_on_fork: false,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });

@@ -11,7 +11,7 @@ use crate::inode::{
 };
 use crate::wait::PollTable;
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use rk_abi::Errno;
@@ -31,6 +31,61 @@ pub trait UserMemory {
 /// The events of `poll`.
 pub mod events {
     pub use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI};
+}
+
+/// The reasons of the signal of a file with `O_ASYNC`, the `si_code` of the signal, as
+/// include/uapi/asm-generic/siginfo.h of Linux.
+pub mod poll_code {
+    /// Data came.
+    pub const POLL_IN: i32 = 1;
+    /// Space came for output.
+    pub const POLL_OUT: i32 = 2;
+    /// A message came.
+    pub const POLL_MSG: i32 = 3;
+}
+
+/// The open files that get a signal at an event of an object, with the descriptor that set
+/// `O_ASYNC`, as the list of `struct fasync_struct` of Linux (fs/fcntl.c). The list holds weak
+/// references, so a closed file goes away from it.
+pub struct FasyncList(SpinLock<Vec<(Weak<File>, i32)>>);
+
+impl FasyncList {
+    /// Makes an empty list.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(SpinLock::new(Vec::new()))
+    }
+
+    /// Adds `file` with the descriptor `fd` to the list, or removes it, as `fasync_helper` of
+    /// Linux. A file that is in the list already gets the new descriptor.
+    pub fn helper(&self, file: &Arc<File>, fd: i32, on: bool) {
+        let mut list = self.0.lock();
+        list.retain(|(f, _)| f.strong_count() > 0 && !core::ptr::eq(f.as_ptr(), Arc::as_ptr(file)));
+        if on {
+            list.push((Arc::downgrade(file), fd));
+        }
+    }
+
+    /// Sends the signal of each file in the list to its owner, with the reason `code` of
+    /// [`poll_code`], as `kill_fasync` of Linux.
+    pub fn kill(&self, code: i32) {
+        let files: Vec<(Arc<File>, i32)> = {
+            let list = self.0.lock();
+            if list.is_empty() {
+                return;
+            }
+            list.iter().filter_map(|(f, fd)| f.upgrade().map(|f| (f, *fd))).collect()
+        };
+        for (file, fd) in &files {
+            crate::notify::dnotify::sigio(file, *fd, code);
+        }
+    }
+}
+
+impl Default for FasyncList {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// One read or write of a batch. For a write, `buf` has the data. For a read, `buf` has the
@@ -110,6 +165,13 @@ pub trait FileOps: Send + Sync {
         }
     }
 
+    /// Adds the file to the list of the files that get a signal at an event, or removes it, for
+    /// `O_ASYNC`, as the `fasync` operation of Linux. `fd` is the descriptor of the signal. A
+    /// file without the operation keeps the flag and sends no signal.
+    fn fasync(&self, _file: &Arc<File>, _fd: i32, _on: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// The events of `poll` that are true now.
     fn poll(&self, _file: &File) -> u32 {
         events::POLLIN | events::POLLOUT
@@ -154,9 +216,14 @@ pub trait FileOps: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenFlags(pub u32);
 
+/// The flag that sends a signal at an event of the file, `O_ASYNC` of
+/// include/uapi/asm-generic/fcntl.h. It is the same on each architecture, and the generated ABI
+/// does not have it.
+pub const O_ASYNC: u32 = 0o20000;
+
 impl OpenFlags {
     /// The flags that `fcntl(F_SETFL)` can change.
-    pub const SETFL_MASK: u32 = o::O_APPEND | o::O_NONBLOCK | o::O_DIRECT | o::O_NOATIME;
+    pub const SETFL_MASK: u32 = o::O_APPEND | o::O_NONBLOCK | o::O_DIRECT | o::O_NOATIME | O_ASYNC;
 
     /// Tells if the file can be read.
     pub fn readable(self) -> bool {
@@ -224,6 +291,72 @@ static INODE_WRITERS: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap:
 /// The key of `inode` in `INODE_WRITERS`.
 fn inode_key(inode: &InodeRef) -> usize {
     Arc::as_ptr(inode).cast::<u8>() as usize
+}
+
+/// The number of the running programs of each regular inode, which deny a write of the inode, as
+/// a negative `i_writecount` of Linux. The key is the address of the inode, as in
+/// `INODE_WRITERS`.
+static INODE_DENIED: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap::new());
+
+/// Gives `ETXTBSY` if a running program denies a write of `inode`, as `get_write_access` of
+/// Linux. An open for a write and a truncate of the file of a running program fail so.
+///
+/// # Errors
+///
+/// Gives `ETXTBSY` if a program runs from the inode.
+pub fn check_write_access(inode: &dyn crate::inode::Inode) -> Result<()> {
+    let key = core::ptr::from_ref(inode).cast::<u8>() as usize;
+    if INODE_DENIED.lock().contains_key(&key) { Err(Errno::ETXTBSY) } else { Ok(()) }
+}
+
+/// The denial of a write of the file of a running program, as `exe_file_deny_write_access` of
+/// Linux (fs/exec.c). The denial ends when the last value drops. A clone is the denial of one more
+/// process, as `dup_mm_exe_file` in kernel/fork.c of Linux.
+pub struct DenyWrite(InodeRef);
+
+impl DenyWrite {
+    /// Denies a write of `inode`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ETXTBSY` if a file that can write the inode is open, as `deny_write_access` of
+    /// Linux.
+    pub fn new(inode: &InodeRef) -> Result<Self> {
+        let key = inode_key(inode);
+        let writers = INODE_WRITERS.lock();
+        if writers.contains_key(&key) {
+            return Err(Errno::ETXTBSY);
+        }
+        *INODE_DENIED.lock().entry(key).or_insert(0) += 1;
+        drop(writers);
+        Ok(Self(inode.clone()))
+    }
+}
+
+impl Clone for DenyWrite {
+    fn clone(&self) -> Self {
+        *INODE_DENIED.lock().entry(inode_key(&self.0)).or_insert(0) += 1;
+        Self(self.0.clone())
+    }
+}
+
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        let mut denied = INODE_DENIED.lock();
+        let key = inode_key(&self.0);
+        if let Some(count) = denied.get_mut(&key) {
+            *count -= 1;
+            if *count == 0 {
+                denied.remove(&key);
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for DenyWrite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DenyWrite")
+    }
 }
 
 /// The number of open files that can write the inode `inode`. A value that is not 0 is
@@ -1274,6 +1407,15 @@ impl File {
             return Err(Errno::EBADF);
         }
         self.ops.ioctl(self, cmd, arg, mem)
+    }
+
+    /// Turns the signal of the file at an event on or off, for `O_ASYNC` of `fcntl(F_SETFL)`.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error of the operation of the file.
+    pub fn fasync(self: &Arc<Self>, fd: i32, on: bool) -> Result<()> {
+        self.ops.fasync(self, fd, on)
     }
 
     /// The events of `poll` that are true now.
