@@ -18,8 +18,13 @@
 //! read only. A remount without `MS_BIND` also makes the file system read only or writable, if
 //! the file system supports it. A mount or a file system with a file that is open for a write
 //! cannot become read only, and the remount gives `EBUSY`. `execve` enforces `MS_NOSUID`, and
-//! the reads enforce the atime flags. The VFS does not enforce `MS_NOEXEC`, `MS_NODEV` and
-//! `MS_NOSYMFOLLOW` yet.
+//! the reads enforce the atime flags. `execve` gives `EACCES` for a file on a mount with
+//! `MS_NOEXEC`, an open of a device on a mount with `MS_NODEV` gives `EACCES`, and the walk gives
+//! `ELOOP` for a symbolic link on a mount with `MS_NOSYMFOLLOW`. `mmap` does not enforce
+//! `MS_NOEXEC` yet.
+//!
+//! `umount2` gives `EBUSY` for a mount with an open file, unless `MNT_DETACH` is set. The working
+//! directory of a process does not make a mount busy.
 
 use crate::cx::{Cx, PATH_MAX, SysResult};
 use alloc::sync::Arc;
@@ -99,6 +104,11 @@ pub(crate) fn mount(
     let target = cx.read_path(target)?;
     let fs = cx.fs()?;
     let at = fs.resolve(fs.cwd(), &target, true)?;
+    // A magic link of `/proc` can give a symbolic link, and nothing goes on one, as
+    // `cant_mount` of Linux.
+    if at.inode().metadata().file_type() == Some(rk_vfs::FileType::Symlink) {
+        return Err(Errno::ENOENT);
+    }
     let ns = fs.namespace();
     if flags & MS_REMOUNT != 0 {
         if !at.is_mount_root() {
@@ -136,14 +146,25 @@ pub(crate) fn mount(
         return Ok(0);
     }
     let vm = cx.vm()?;
-    let name = if fstype == 0 { Vec::new() } else { vm.read_cstr(fstype as usize, PATH_MAX)? };
+    // A new mount needs a type, as `do_new_mount` of Linux.
+    if fstype == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = vm.read_cstr(fstype as usize, PATH_MAX)?;
     let ty = fstype::find(&name).ok_or(Errno::ENODEV)?;
     let data = if data == 0 { Vec::new() } else { vm.read_cstr(data as usize, DATA_MAX)? };
     let source = match source {
+        // A file system on a device needs a source, as `get_tree_bdev` of Linux.
+        0 if !ty.nodev => return Err(Errno::EINVAL),
         0 => Vec::from(&b"none"[..]),
         addr => vm.read_cstr(addr as usize, PATH_MAX)?,
     };
     let root = make(&fs, ty, &source, &data, flags & MS_RDONLY != 0)?;
+    // The same file system does not go again on the root of its mount, as `do_add_mount` of
+    // Linux.
+    if at.is_mount_root() && at.inode().fs_id() == root.fs_id() {
+        return Err(Errno::EBUSY);
+    }
     let flags = atime_flags(flags, None) & KEPT;
     let source = MountSource { source, fstype: ty.name, flags: u64::from(flags) };
     ns.mount(root, &at, source)?;
@@ -234,6 +255,18 @@ pub(crate) fn umount2(cx: &Cx<'_>, target: u64, flags: u64) -> SysResult {
     // Linux does.
     while let Some(mount) = fs.namespace().mounted_on(&at) {
         at = Location { dentry: mount.root().clone(), mount };
+    }
+    if !at.is_mount_root() {
+        return Err(Errno::EINVAL);
+    }
+    // An open file keeps the mount, as `propagate_mount_busy` of Linux.
+    if flags & MNT_DETACH == 0 && at.mount.open_files() != 0 {
+        return Err(Errno::EBUSY);
+    }
+    // The first `MNT_EXPIRE` marks the mount, and the next one removes it if no walk went into
+    // the mount after the mark, as `do_umount` of Linux.
+    if flags & MNT_EXPIRE != 0 && !at.mount.expire() {
+        return Err(Errno::EAGAIN);
     }
     fs.namespace().unmount(&at)?;
     Ok(0)

@@ -295,7 +295,7 @@ fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
 
 /// Sends the signal of the open file `file` to its owner for an event of the descriptor `fd`, as
 /// `send_sigio` of Linux with `POLL_MSG`. Without a signal of `F_SETSIG`, the owner gets `SIGIO`.
-/// A negative owner is a process group.
+/// A negative owner is a process group. The owner of `F_OWNER_TID` is a thread.
 fn send_sigio(file: &rk_vfs::file::File, fd: i32) {
     use rk_abi::native::poll::{POLLIN, POLLMSG, POLLRDNORM};
     let owner = file.owner();
@@ -306,7 +306,11 @@ fn send_sigio(file: &rk_vfs::file::File, fd: i32) {
         0 => SigInfo::new(rk_abi::native::signal::SIGIO, SI_KERNEL, 0),
         sig => SigInfo::poll(sig, POLL_MSG, u64::from(POLLIN | POLLRDNORM | POLLMSG), fd),
     };
-    if owner > 0 {
+    if file.owner_is_thread() {
+        if let Some(thread) = rk_proc::find_thread(owner as u32) {
+            thread.send_signal(info);
+        }
+    } else if owner > 0 {
         if let Some(process) = rk_proc::find_process(owner as u32) {
             rk_proc::send_signal(&process, info);
         }

@@ -18,7 +18,7 @@ use rk_abi::native::auxv::{
     AT_BASE, AT_CLKTCK, AT_EGID, AT_ENTRY, AT_EUID, AT_FLAGS, AT_GID, AT_HWCAP, AT_PAGESZ, AT_PHDR,
     AT_PHENT, AT_PHNUM, AT_SECURE, AT_SYSINFO_EHDR, AT_UID,
 };
-use rk_abi::native::mount::MS_NOSUID;
+use rk_abi::native::mount::{MS_NOEXEC, MS_NOSUID};
 use rk_mm::{AddressSpace, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind};
 use rk_vfs::cred::{Cred, ExecFile};
 use rk_vfs::{FileType, FsContext, InodeRef, Location};
@@ -114,6 +114,10 @@ fn open_exec_at(
         return Err(Errno::EACCES);
     }
     fs.permission(&at, rk_vfs::cred::may::EXEC)?;
+    // A mount with `MS_NOEXEC` does not run its files, as `path_noexec` of Linux.
+    if at.mount.flags() & u64::from(MS_NOEXEC) != 0 {
+        return Err(Errno::EACCES);
+    }
     // The open of the file to run has the events of an open with `__FMODE_EXEC`, as
     // `do_open_execat` of Linux.
     rk_vfs::notify::open_perm(&at, true)?;

@@ -113,6 +113,8 @@ pub mod cap {
     pub const SYS_TIME: u32 = 25;
     /// Make a device file.
     pub const MKNOD: u32 = 27;
+    /// Take a lease on a file of another user.
+    pub const LEASE: u32 = 28;
     /// Write records to the audit log of the kernel.
     pub const AUDIT_WRITE: u32 = 29;
     /// Set the capabilities of a file.

@@ -957,3 +957,59 @@ fn an_acl_on_tmpfs_follows_set_posix_acl() {
     assert_eq!(acl::get(&*file, ACCESS), Err(Errno::ENODATA));
     assert_eq!(file.metadata().mode & 0o7777, 0o765);
 }
+
+#[test]
+fn a_file_keeps_only_the_pages_that_it_writes() {
+    use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
+    let (fs, root) = setup();
+    let f = fs.open(&root, b"/s", o::O_RDWR | o::O_CREAT, 0o644).unwrap();
+    // A write past 4 GiB takes one page, as in `open12` of LTP.
+    let far = 1u64 << 32;
+    assert_eq!(f.write_at(far + 4090, b"0123456789"), Ok(10));
+    let m = f.metadata().unwrap();
+    assert_eq!((m.size, m.blocks), (far + 4100, 16));
+    let mut buf = [1u8; 8];
+    assert_eq!(f.read_at(far + 4086, &mut buf), Ok(8));
+    assert_eq!(&buf, b"\0\0\0\x000123");
+    assert_eq!(f.seek(0, Whence::Data), Ok(far));
+    assert_eq!(f.seek(0, Whence::Hole), Ok(0));
+    assert_eq!(f.seek(far as i64 + 10, Whence::Hole), Ok(far + 4100));
+    // A hole in the middle frees the full pages, and makes the rest zeros.
+    assert_eq!(f.fallocate(0, 0, 4 * 4096), Ok(()));
+    assert_eq!(f.write_at(0, &[7u8; 4 * 4096]), Ok(4 * 4096));
+    assert_eq!(f.fallocate(PUNCH_HOLE | KEEP_SIZE, 100, 2 * 4096), Ok(()));
+    assert_eq!(f.metadata().unwrap().blocks, 8 * 3 + 16);
+    assert_eq!(f.read_at(96, &mut buf), Ok(8));
+    assert_eq!(buf, [7, 7, 7, 7, 0, 0, 0, 0]);
+    assert_eq!(f.seek(0, Whence::Hole), Ok(4096));
+    assert_eq!(f.seek(4096, Whence::Data), Ok(2 * 4096));
+    assert_eq!(f.fallocate(ZERO_RANGE, 0, 1), Err(Errno::EOPNOTSUPP));
+    // A smaller size frees the pages past the end, and zeros the end of the last page.
+    assert_eq!(f.truncate(10), Ok(()));
+    assert_eq!(f.metadata().unwrap().blocks, 8);
+    assert_eq!(f.truncate(20), Ok(()));
+    let mut buf = [1u8; 20];
+    assert_eq!(f.read_at(0, &mut buf), Ok(20));
+    assert_eq!(buf[9..], [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn the_size_option_limits_the_data() {
+    let args = MountArgs { data: b"size=8k", dev: None, read_only: false, lookup: None };
+    let fs = FsContext::new(MountNamespace::new(mount(&args).unwrap()));
+    let root = fs.root().clone();
+    let f = fs.open(&root, b"/a", o::O_RDWR | o::O_CREAT, 0o644).unwrap();
+    assert_eq!(f.write_at(0, &[1u8; 3 * 4096]), Ok(2 * 4096));
+    assert_eq!(f.write_at(2 * 4096, b"x"), Err(Errno::ENOSPC));
+    assert_eq!(f.fallocate(0, 3 * 4096, 2 * 4096), Err(Errno::ENOSPC));
+    assert_eq!(f.metadata().unwrap().blocks, 16);
+    // A hole gives the pages back.
+    assert_eq!(f.fallocate(rk_vfs::inode::falloc::PUNCH_HOLE | 1, 0, 4096), Ok(()));
+    assert_eq!(f.write_at(2 * 4096, b"x"), Ok(1));
+    // A smaller size gives the pages back too.
+    assert_eq!(f.truncate(0), Ok(()));
+    let g = fs.open(&root, b"/b", o::O_RDWR | o::O_CREAT, 0o644).unwrap();
+    assert_eq!(g.write_at(0, &[1u8; 2 * 4096]), Ok(2 * 4096));
+    let bad = MountArgs { data: b"size=1x", dev: None, read_only: false, lookup: None };
+    assert!(mount(&bad).is_err());
+}

@@ -8,6 +8,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
+use rk_abi::native::fcntl::F_SEAL_EXEC;
 use rk_abi::native::open::{O_LARGEFILE, O_RDWR};
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::FileType;
@@ -49,7 +50,16 @@ pub(crate) fn memfd_create(cx: &Cx<'_>, name: u64, flags: u64) -> SysResult {
     let root = root();
     let mut temp = Vec::from(&b"memfd."[..]);
     temp.extend_from_slice(alloc::format!("{}", NEXT.fetch_add(1, Ordering::Relaxed)).as_bytes());
-    let inode = root.inode().create(&temp, FileType::Regular, 0o777, 0)?;
+    // `MFD_NOEXEC_SEAL` gives a file without the execute bits and with `F_SEAL_EXEC`, and
+    // `MFD_ALLOW_SEALING` removes `F_SEAL_SEAL`, as `memfd_alloc_file` of Linux.
+    let noexec = flags & MFD_NOEXEC_SEAL != 0;
+    let inode =
+        root.inode().create(&temp, FileType::Regular, if noexec { 0o666 } else { 0o777 }, 0)?;
+    if noexec {
+        inode.set_seals(F_SEAL_EXEC as u32)?;
+    } else if flags & MFD_ALLOW_SEALING != 0 {
+        inode.set_seals(0)?;
+    }
     let mut shown = Vec::from(&b"memfd:"[..]);
     shown.extend_from_slice(&name);
     let dentry = root.dentry.add_child(&shown, inode);

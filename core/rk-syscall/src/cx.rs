@@ -78,6 +78,16 @@ impl Cx<'_> {
         self.files()?.lock().file(fd as i32)
     }
 
+    /// The open file of `fd`, as `fdget` of Linux: an `O_PATH` descriptor gives `EBADF`, because
+    /// it is not a file for the calls that use the data or the attributes of the file.
+    pub(crate) fn fdget(&self, fd: u64) -> Result<Arc<File>, Errno> {
+        let file = self.file(fd)?;
+        if file.flags().is_path() {
+            return Err(Errno::EBADF);
+        }
+        Ok(file)
+    }
+
     /// The start of a walk for the `*at` calls: the current directory for `AT_FDCWD`, or the
     /// directory of `dirfd`. The path is not examined, so the caller gives an absolute path to
     /// skip the check of `dirfd`.

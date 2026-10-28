@@ -10,9 +10,12 @@ use rk_abi::native::at::{
     AT_SYMLINK_FOLLOW, AT_SYMLINK_NOFOLLOW,
 };
 use rk_abi::native::fcntl::{
-    F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_GETLK, F_GETOWN, F_GETPIPE_SZ, F_GETSIG,
-    F_NOTIFY, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW, F_RDLCK, F_SETFD, F_SETFL, F_SETLK, F_SETLKW,
-    F_SETOWN, F_SETPIPE_SZ, F_SETSIG, F_UNLCK, F_WRLCK, FD_CLOEXEC,
+    F_ADD_SEALS, F_CREATED_QUERY, F_DUPFD, F_DUPFD_CLOEXEC, F_GET_SEALS, F_GETFD, F_GETFL,
+    F_GETLEASE, F_GETLK, F_GETOWN, F_GETOWN_EX, F_GETPIPE_SZ, F_GETSIG, F_NOTIFY, F_OFD_GETLK,
+    F_OFD_SETLK, F_OFD_SETLKW, F_OWNER_PGRP, F_OWNER_PID, F_OWNER_TID, F_RDLCK, F_SEAL_EXEC,
+    F_SEAL_FUTURE_WRITE, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE, F_SETFD, F_SETFL,
+    F_SETLEASE, F_SETLK, F_SETLKW, F_SETOWN, F_SETOWN_EX, F_SETPIPE_SZ, F_SETSIG, F_UNLCK, F_WRLCK,
+    FD_CLOEXEC,
 };
 use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
 use rk_abi::native::mount::{
@@ -573,11 +576,7 @@ pub(crate) fn openat2(cx: &Cx<'_>, dirfd: u64, path: u64, how: u64, size: u64) -
 /// the data of a regular file in the range is in the cache, and no page is dirty, under
 /// writeback or evicted. Other files have no pages in the cache.
 pub(crate) fn cachestat(cx: &Cx<'_>, fd: u64, range: u64, out: u64, flags: u64) -> SysResult {
-    let file = cx.file(fd)?;
-    // As `fdget` of Linux: an `O_PATH` descriptor is not a file for the call.
-    if file.flags().is_path() {
-        return Err(Errno::EBADF);
-    }
+    let file = cx.fdget(fd)?;
     if flags as u32 != 0 {
         return Err(Errno::EINVAL);
     }
@@ -676,27 +675,46 @@ fn lookup(
     path: u64,
     flags: u32,
 ) -> Result<(Metadata, Option<rk_vfs::InodeRef>, u64), Errno> {
+    let (meta, inode, at) = lookup_at(cx, dirfd, path, flags)?;
+    Ok((meta, inode, at.map_or(0, |at| at.mount.id())))
+}
+
+/// Gives the metadata of the file of a `*at` call, its inode if it has one, and its location if
+/// it has one.
+fn lookup_at(
+    cx: &Cx<'_>,
+    dirfd: u64,
+    path: u64,
+    flags: u32,
+) -> Result<(Metadata, Option<rk_vfs::InodeRef>, Option<Location>), Errno> {
     let empty_ok = flags & AT_EMPTY_PATH as u32 != 0;
     let path = cx.read_path_opt(path, empty_ok)?;
     if path.is_empty() {
         if dirfd as i32 == rk_abi::native::at::AT_FDCWD {
             let fs = cx.fs()?;
             let inode = fs.cwd().inode().clone();
-            return Ok((inode.metadata(), Some(inode), fs.cwd().mount.id()));
+            return Ok((inode.metadata(), Some(inode), Some(fs.cwd().clone())));
         }
         let file = cx.file(dirfd)?;
-        let id = file.location().map_or(0, |at| at.mount.id());
-        return Ok((file.metadata()?, file.inode().cloned(), id));
+        return Ok((file.metadata()?, file.inode().cloned(), file.location().cloned()));
     }
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let follow = flags & AT_SYMLINK_NOFOLLOW as u32 == 0;
     let at = fs.resolve(&start, &path, follow)?;
     let inode = at.inode().clone();
-    Ok((inode.metadata(), Some(inode), at.mount.id()))
+    Ok((inode.metadata(), Some(inode), Some(at)))
 }
 
 pub(crate) fn fstatat(cx: &Cx<'_>, dirfd: u64, path: u64, buf: u64, flags: u64) -> SysResult {
+    // The flags of `vfs_fstatat` of Linux.
+    let valid = AT_SYMLINK_NOFOLLOW as u32
+        | AT_NO_AUTOMOUNT as u32
+        | AT_EMPTY_PATH as u32
+        | AT_STATX_SYNC_TYPE as u32;
+    if flags & !u64::from(valid) != 0 {
+        return Err(Errno::EINVAL);
+    }
     let meta = lookup_meta(cx, dirfd, path, flags as u32)?;
     cx.write_val(buf, &stat_of(&meta))?;
     Ok(0)
@@ -864,6 +882,9 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         _ => {}
     }
     let file = cx.file(fd)?;
+    if matches!(cmd, FICLONE | FICLONERANGE) {
+        return clone_range(cx, &file, cmd, arg);
+    }
     use rk_vfs::file::{FIFREEZE, FITHAW, FITRIM};
     if matches!(cmd, FITRIM | FIFREEZE | FITHAW)
         && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN)
@@ -878,6 +899,39 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     }
     let vm = cx.vm()?;
     Ok(file.ioctl(cmd, arg as usize, &UserMem(&vm))? as u64)
+}
+
+/// `FICLONE` of `<linux/fs.h>`.
+const FICLONE: u32 = 0x4004_9409;
+/// `FICLONERANGE` of `<linux/fs.h>`.
+const FICLONERANGE: u32 = 0x4020_940d;
+
+/// `FICLONE` and `FICLONERANGE` on `file`. No file system shares blocks between
+/// files, so after the checks of `vfs_clone_file_range` of Linux, in its order, the result is
+/// `EOPNOTSUPP`, as for a file system without `remap_file_range`.
+fn clone_range(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> SysResult {
+    let src_fd = match cmd {
+        FICLONE => arg,
+        // `struct file_clone_range` starts with `src_fd` as an `__s64`.
+        _ => u64::from(cx.read_val::<i64>(arg)? as i32 as u32),
+    };
+    let src = cx.fdget(src_fd)?;
+    let (src_meta, dst_meta) = (src.metadata()?, file.metadata()?);
+    let src_fs = src.inode().map(|i| i.fs_id());
+    if src_fs != file.inode().map(|i| i.fs_id()) {
+        return Err(Errno::EXDEV);
+    }
+    if src_meta.is_dir() || dst_meta.is_dir() {
+        return Err(Errno::EISDIR);
+    }
+    let regular = |m: &rk_vfs::inode::Metadata| m.file_type() == Some(rk_vfs::FileType::Regular);
+    if !regular(&src_meta) || !regular(&dst_meta) {
+        return Err(Errno::EINVAL);
+    }
+    if !src.flags().readable() || !file.flags().writable() || file.flags().append() {
+        return Err(Errno::EBADF);
+    }
+    Err(Errno::EOPNOTSUPP)
 }
 
 /// The size of `struct move_extent`: the reserved field and `donor_fd` at 0 and 4, and then
@@ -936,6 +990,10 @@ pub(crate) fn dup3(cx: &Cx<'_>, old: u64, new: u64, flags: u64) -> SysResult {
 
 pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     let cmd = cmd as i32;
+    // A file of `O_PATH` takes only these commands, as `check_fcntl_cmd` of Linux.
+    if !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
+        cx.fdget(fd)?;
+    }
     match cmd {
         F_DUPFD => dup_from(cx, fd, arg, false),
         F_DUPFD_CLOEXEC => dup_from(cx, fd, arg, true),
@@ -997,6 +1055,57 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             Ok(0)
         }
         F_GETSIG => Ok(u64::from(cx.file(fd)?.signum())),
+        F_GETOWN_EX => {
+            let file = cx.file(fd)?;
+            let owner = file.owner();
+            let (kind, pid) = if file.owner_is_thread() {
+                (F_OWNER_TID, owner)
+            } else if owner < 0 {
+                (F_OWNER_PGRP, -owner)
+            } else {
+                (F_OWNER_PID, owner)
+            };
+            let mut buf = [0u8; 8];
+            buf[..4].copy_from_slice(&kind.to_ne_bytes());
+            buf[4..].copy_from_slice(&pid.to_ne_bytes());
+            cx.write_bytes(arg, &buf)?;
+            Ok(0)
+        }
+        F_SETOWN_EX => {
+            let file = cx.file(fd)?;
+            let raw = cx.read_bytes(arg, 8)?;
+            let kind = i32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let pid = i32::from_ne_bytes([raw[4], raw[5], raw[6], raw[7]]);
+            if pid < 0 {
+                return Err(Errno::EINVAL);
+            }
+            match kind {
+                F_OWNER_TID => {
+                    if pid > 0 && rk_proc::find_thread(pid as u32).is_none() {
+                        return Err(Errno::ESRCH);
+                    }
+                    file.set_owner_thread(pid);
+                }
+                F_OWNER_PID => {
+                    if pid > 0 && rk_proc::find_process(pid as u32).is_none() {
+                        return Err(Errno::ESRCH);
+                    }
+                    file.set_owner(pid);
+                }
+                F_OWNER_PGRP => file.set_owner(-pid),
+                _ => return Err(Errno::EINVAL),
+            }
+            Ok(0)
+        }
+        F_SETLEASE => set_lease(cx, &*cx.file(fd)?, arg as i32),
+        F_GETLEASE => Ok(cx.file(fd)?.lease() as u64),
+        F_CREATED_QUERY => Ok(u64::from(cx.file(fd)?.created())),
+        F_ADD_SEALS => add_seals(&*cx.file(fd)?, arg as u32),
+        F_GET_SEALS => {
+            let file = cx.file(fd)?;
+            let inode = file.inode().ok_or(Errno::EINVAL)?;
+            Ok(u64::from(inode.seals().ok_or(Errno::EINVAL)?))
+        }
         F_NOTIFY => {
             let (file, owner) = {
                 let files = cx.files()?;
@@ -1009,6 +1118,64 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// `F_SETLEASE`: a lease of the type `kind` on the regular file `file`, as `fcntl_setlease` of
+/// Linux. A read lease needs a file that no open file can write. A write lease needs a file that
+/// only `file` can write. R1 does not break a lease when a conflicting open comes.
+fn set_lease(cx: &Cx<'_>, file: &File, kind: i32) -> SysResult {
+    let inode = file.inode().ok_or(Errno::EINVAL)?;
+    let meta = inode.metadata();
+    let cred = cx.process().cred();
+    if meta.uid != cred.fsuid && !cred.capable(rk_vfs::cred::cap::LEASE) {
+        return Err(Errno::EACCES);
+    }
+    if meta.file_type() != Some(rk_vfs::inode::FileType::Regular) {
+        return Err(Errno::EINVAL);
+    }
+    let writers = rk_vfs::file::open_for_write(inode);
+    let own = usize::from(file.flags().writable());
+    match kind {
+        F_RDLCK if writers != 0 => return Err(Errno::EAGAIN),
+        F_WRLCK if writers != own => return Err(Errno::EAGAIN),
+        F_RDLCK | F_WRLCK | F_UNLCK => {}
+        _ => return Err(Errno::EINVAL),
+    }
+    file.set_lease(kind);
+    Ok(0)
+}
+
+/// All the seals of `F_ADD_SEALS`.
+const ALL_SEALS: u32 =
+    (F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE | F_SEAL_EXEC)
+        as u32;
+
+/// `F_ADD_SEALS`: adds the seals `seals` to the file of `file`, as `memfd_add_seals` of Linux.
+fn add_seals(file: &File, seals: u32) -> SysResult {
+    if !file.flags().writable() {
+        return Err(Errno::EPERM);
+    }
+    if seals & !ALL_SEALS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let inode = file.inode().ok_or(Errno::EINVAL)?;
+    let old = inode.seals().ok_or(Errno::EINVAL)?;
+    if old & F_SEAL_SEAL as u32 != 0 {
+        return Err(Errno::EPERM);
+    }
+    let mut seals = seals;
+    // A shared mapping that can write blocks `F_SEAL_WRITE`, as `mapping_deny_writable`.
+    if seals & F_SEAL_WRITE as u32 != 0
+        && old & F_SEAL_WRITE as u32 == 0
+        && crate::mm::writably_mapped(inode)
+    {
+        return Err(Errno::EBUSY);
+    }
+    if seals & F_SEAL_EXEC as u32 != 0 && inode.metadata().mode & 0o111 != 0 {
+        seals |= (F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) as u32;
+    }
+    inode.set_seals(old | seals)?;
+    Ok(0)
 }
 
 /// The size of `struct flock`.
@@ -1279,8 +1446,13 @@ fn change_attr(
     change: Change,
 ) -> SysResult {
     rk_vfs::inode::check_set_attr(&**inode, attr)?;
-    let cred = cx.process().cred();
     let meta = inode.metadata();
+    // A symbolic link has no mode of its own, as `notify_change` of Linux. A path through a
+    // `/proc/PID/fd` link of an `O_PATH` file can reach the link itself.
+    if attr.mode.is_some() && meta.file_type() == Some(rk_vfs::inode::FileType::Symlink) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let cred = cx.process().cred();
     if change == Change::Touch && !cred.owns(&meta) {
         cred.inode_permission(&**inode, rk_vfs::cred::may::WRITE)?;
     }
@@ -1316,8 +1488,10 @@ fn set_attr_at(
     change_attr(cx, Some(&at), at.inode(), attr, change)
 }
 
-fn set_attr_fd(cx: &Cx<'_>, fd: u64, attr: &SetAttr, change: Change) -> SysResult {
-    let file = cx.file(fd)?;
+/// Changes the attributes of the open file `fd`. `raw` allows an `O_PATH` descriptor, as the
+/// calls with `AT_EMPTY_PATH` of Linux, which find the file with a path walk.
+fn set_attr_fd(cx: &Cx<'_>, fd: u64, raw: bool, attr: &SetAttr, change: Change) -> SysResult {
+    let file = if raw { cx.file(fd)? } else { cx.fdget(fd)? };
     let inode = file.inode().ok_or(Errno::EBADF)?;
     file.want_write()?;
     change_attr(cx, file.location(), inode, attr, change)
@@ -1339,21 +1513,18 @@ pub(crate) fn fchmodat2(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     let attr = SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() };
     let path = cx.read_path_opt(path, flags & AT_EMPTY_PATH as u32 != 0)?;
     if path.is_empty() {
-        return set_attr_fd(cx, dirfd, &attr, Change::Plain);
+        return set_attr_fd(cx, dirfd, true, &attr, Change::Plain);
     }
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let at = fs.resolve(&start, &path, flags & AT_SYMLINK_NOFOLLOW as u32 == 0)?;
     at.mount.want_write()?;
-    if at.inode().metadata().file_type() == Some(rk_vfs::inode::FileType::Symlink) {
-        return Err(Errno::EOPNOTSUPP);
-    }
     change_attr(cx, Some(&at), at.inode(), &attr, Change::Plain)
 }
 
 pub(crate) fn fchmod(cx: &Cx<'_>, fd: u64, mode: u64) -> SysResult {
     let attr = SetAttr { mode: Some(mode as u32 & 0o7777), ..SetAttr::default() };
-    set_attr_fd(cx, fd, &attr, Change::Plain)
+    set_attr_fd(cx, fd, false, &attr, Change::Plain)
 }
 
 /// The owner of `chown`: -1 keeps the value.
@@ -1369,14 +1540,22 @@ pub(crate) fn fchownat(
     gid: u64,
     flags: u64,
 ) -> SysResult {
+    // As `do_fchownat` of Linux.
+    let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
+    if flags & !(AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0 {
+        return Err(Errno::EINVAL);
+    }
     let attr = SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() };
-    let follow = flags as u32 & AT_SYMLINK_NOFOLLOW as u32 == 0;
+    if flags & AT_EMPTY_PATH as u32 != 0 && cx.read_path_opt(path, true)?.is_empty() {
+        return set_attr_fd(cx, dirfd, true, &attr, Change::Owner);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW as u32 == 0;
     set_attr_at(cx, dirfd, path, follow, &attr, Change::Owner)
 }
 
 pub(crate) fn fchown(cx: &Cx<'_>, fd: u64, uid: u64, gid: u64) -> SysResult {
     let attr = SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() };
-    set_attr_fd(cx, fd, &attr, Change::Owner)
+    set_attr_fd(cx, fd, false, &attr, Change::Owner)
 }
 
 pub(crate) fn umask(cx: &Cx<'_>, mask: u64) -> SysResult {
@@ -1391,9 +1570,20 @@ pub(crate) fn faccessat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) as u32 != 0 {
         return Err(Errno::EINVAL);
     }
-    let (meta, inode, _) = lookup(cx, dirfd, path, flags)?;
+    let (meta, inode, at) = lookup_at(cx, dirfd, path, flags)?;
     if mode == 0 {
         return Ok(0);
+    }
+    // A write to a regular file, a directory or a symbolic link of a read only file system gives
+    // `EROFS`, before the check of the mode bits, as `sb_permission` of Linux. A special file
+    // stays writable.
+    let special = !matches!(
+        meta.file_type(),
+        Some(rk_vfs::FileType::Regular | rk_vfs::FileType::Directory | rk_vfs::FileType::Symlink)
+    );
+    let write = mode as u32 & rk_vfs::cred::may::WRITE != 0;
+    if write && !special && inode.as_ref().is_some_and(|inode| inode.is_read_only()) {
+        return Err(Errno::EROFS);
     }
     // Without `AT_EACCESS`, the check uses the real IDs, as `access_override_creds` of Linux.
     let cred = cx.process().cred();
@@ -1401,6 +1591,10 @@ pub(crate) fn faccessat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64, flags: u6
     match inode {
         Some(inode) => cred.inode_permission(&*inode, mode as u32)?,
         None => cred.permission(&meta, mode as u32)?,
+    }
+    // SuS v2 wants `EROFS` for a read only mount too, as `do_faccessat` of Linux.
+    if write && !special && at.is_some_and(|at| at.mount.is_read_only()) {
+        return Err(Errno::EROFS);
     }
     Ok(0)
 }
@@ -1444,6 +1638,19 @@ pub(crate) fn ftruncate(cx: &Cx<'_>, fd: u64, size: u64) -> SysResult {
         fsize_check(cx, &meta, size)?;
     }
     file.truncate(size)?;
+    Ok(0)
+}
+
+/// `fsync` and `fdatasync`. A pipe, a socket, a FIFO or a character device has no `fsync` operation
+/// in Linux, so `vfs_fsync_range` gives `EINVAL` for it.
+pub(crate) fn fsync(cx: &Cx<'_>, fd: u64) -> SysResult {
+    let file = cx.fdget(fd)?;
+    use rk_vfs::FileType::{BlockDevice, Directory, Regular, Symlink};
+    let kind = file.metadata().ok().and_then(|m| m.file_type());
+    if !matches!(kind, Some(Regular | Directory | BlockDevice | Symlink)) {
+        return Err(Errno::EINVAL);
+    }
+    file.sync()?;
     Ok(0)
 }
 
@@ -1531,13 +1738,21 @@ pub(crate) fn utimensat(cx: &Cx<'_>, dirfd: u64, path: u64, times: u64, flags: u
     // Both times now is a touch, which the owner or a process that can write the file can do.
     let change = if explicit_times { Change::Plain } else { Change::Touch };
     let attr = SetAttr { atime, mtime, explicit_times, ..SetAttr::default() };
-    if path == 0 {
-        return set_attr_fd(cx, dirfd, &attr, change);
+    // A null path changes the open file `dirfd`, as `do_utimes` of Linux. With `AT_FDCWD`, the
+    // null path goes to the walk and gives `EFAULT`.
+    if path == 0 && dirfd as i32 != rk_abi::native::at::AT_FDCWD {
+        if flags != 0 {
+            return Err(Errno::EINVAL);
+        }
+        return set_attr_fd(cx, dirfd, false, &attr, change);
+    }
+    if flags & !u64::from(AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0 {
+        return Err(Errno::EINVAL);
     }
     let follow = flags as u32 & AT_SYMLINK_NOFOLLOW as u32 == 0;
     let path_bytes = cx.read_path_opt(path, flags as u32 & AT_EMPTY_PATH as u32 != 0)?;
     if path_bytes.is_empty() {
-        return set_attr_fd(cx, dirfd, &attr, change);
+        return set_attr_fd(cx, dirfd, true, &attr, change);
     }
     set_attr_at(cx, dirfd, path, follow, &attr, change)
 }

@@ -331,6 +331,13 @@ pub struct Mount {
     /// The number of the open files of the mount that can write, as `mnt_writers` of Linux. A
     /// mount with writers cannot become read only.
     writers: AtomicUsize,
+    /// The number of the open files of the mount. A mount with open files is busy for `umount2`.
+    opens: AtomicUsize,
+    /// The number of walks that went into the mount. `MNT_EXPIRE` uses it.
+    entries: AtomicU64,
+    /// The mark of `MNT_EXPIRE`, as `mnt_expiry_mark` of Linux: 0 for no mark, or 1 more than
+    /// the value of `entries` at the time of the mark.
+    expiry: AtomicU64,
 }
 
 impl core::fmt::Debug for Mount {
@@ -349,6 +356,9 @@ impl Mount {
             propagation: SpinLock::new(Propagation::default()),
             ns: SpinLock::new(Weak::new()),
             writers: AtomicUsize::new(0),
+            opens: AtomicUsize::new(0),
+            entries: AtomicU64::new(0),
+            expiry: AtomicU64::new(0),
         })
     }
 
@@ -442,6 +452,34 @@ impl Mount {
     /// Stops the count of an open file of the mount that can write, after its close.
     pub(crate) fn remove_writer(&self) {
         self.writers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Counts an open file of the mount.
+    pub(crate) fn add_open(&self) {
+        self.opens.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Stops the count of an open file of the mount, after its close.
+    pub(crate) fn remove_open(&self) {
+        self.opens.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// The number of the open files of the mount.
+    pub fn open_files(&self) -> usize {
+        self.opens.load(Ordering::Acquire)
+    }
+
+    /// Records that a walk went into the mount. This clears the mark of `MNT_EXPIRE`.
+    pub(crate) fn enter(&self) {
+        self.entries.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Marks the mount for `MNT_EXPIRE`. Tells if the mount had the mark and only the walk of
+    /// the caller went into the mount after the mark, so the mount can go.
+    pub fn expire(&self) -> bool {
+        let now = self.entries.load(Ordering::Acquire);
+        let mark = self.expiry.swap(now + 1, Ordering::AcqRel);
+        mark != 0 && now <= mark
     }
 
     /// The propagation of the mount.

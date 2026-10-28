@@ -37,7 +37,7 @@ fn path_target(cx: &Cx<'_>, path: u64, follow: bool, change: bool) -> Result<Tar
 /// Finds the inode of the open file `fd`. For a `change`, the mount must be writable, as
 /// `mnt_want_write_file` of Linux.
 fn fd_target(cx: &Cx<'_>, fd: u64, change: bool) -> Result<Target, Errno> {
-    let file = cx.file(fd)?;
+    let file = cx.fdget(fd)?;
     if change {
         file.want_write()?;
     }

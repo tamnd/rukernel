@@ -10,6 +10,7 @@ use crate::inode::{
     FileType, InodeRef, Metadata, Result, SetAttr, check_immutable, check_set_attr, mode,
 };
 use crate::wait::PollTable;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -208,6 +209,27 @@ pub struct File {
     owner: AtomicI32,
     /// The signal of `F_SETSIG`. 0 is `SIGIO`.
     signum: AtomicU32,
+    /// The owner of `F_SETOWN_EX` is a thread, as `F_OWNER_TID` of Linux.
+    owner_tid: AtomicBool,
+    /// The open made the file, as `FMODE_CREATED` of Linux.
+    created: AtomicBool,
+    /// The lease of `F_SETLEASE`: `F_RDLCK`, `F_WRLCK` or `F_UNLCK`.
+    lease: AtomicI32,
+}
+
+/// The number of open files that can write each regular inode, as `i_writecount` of Linux. The
+/// key is the address of the inode.
+static INODE_WRITERS: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap::new());
+
+/// The key of `inode` in `INODE_WRITERS`.
+fn inode_key(inode: &InodeRef) -> usize {
+    Arc::as_ptr(inode).cast::<u8>() as usize
+}
+
+/// The number of open files that can write the inode `inode`. A value that is not 0 is
+/// `inode_is_open_for_write` of Linux.
+pub fn open_for_write(inode: &InodeRef) -> usize {
+    INODE_WRITERS.lock().get(&inode_key(inode)).copied().unwrap_or(0)
 }
 
 impl Drop for File {
@@ -224,6 +246,21 @@ impl Drop for File {
             && let Some(location) = &self.location
         {
             location.mount.remove_writer();
+        }
+        if let Some(location) = &self.location {
+            location.mount.remove_open();
+        }
+        if self.writer
+            && let Some(inode) = &self.inode
+        {
+            let mut writers = INODE_WRITERS.lock();
+            let key = inode_key(inode);
+            if let Some(count) = writers.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    writers.remove(&key);
+                }
+            }
         }
     }
 }
@@ -891,6 +928,12 @@ impl File {
             }
             _ => false,
         };
+        if let Some(location) = &location {
+            location.mount.add_open();
+        }
+        if writer && let Some(inode) = &inode {
+            *INODE_WRITERS.lock().entry(inode_key(inode)).or_insert(0) += 1;
+        }
         Arc::new(Self {
             ops,
             location,
@@ -902,6 +945,9 @@ impl File {
             nonotify: AtomicBool::new(false),
             owner: AtomicI32::new(0),
             signum: AtomicU32::new(0),
+            owner_tid: AtomicBool::new(false),
+            created: AtomicBool::new(false),
+            lease: AtomicI32::new(rk_abi::native::fcntl::F_UNLCK),
         })
     }
 
@@ -949,6 +995,38 @@ impl File {
     /// Sets the owner of the file for the signals, for `F_SETOWN`.
     pub fn set_owner(&self, owner: i32) {
         self.owner.store(owner, Ordering::Relaxed);
+        self.owner_tid.store(false, Ordering::Relaxed);
+    }
+
+    /// Tells if the owner of the file is a thread, as `F_OWNER_TID` of Linux.
+    pub fn owner_is_thread(&self) -> bool {
+        self.owner_tid.load(Ordering::Relaxed)
+    }
+
+    /// Sets the owner of the file to the thread `tid`, for `F_SETOWN_EX` with `F_OWNER_TID`.
+    pub fn set_owner_thread(&self, tid: i32) {
+        self.owner.store(tid, Ordering::Relaxed);
+        self.owner_tid.store(true, Ordering::Relaxed);
+    }
+
+    /// Tells if the open of the file made it, for `F_CREATED_QUERY`.
+    pub fn created(&self) -> bool {
+        self.created.load(Ordering::Relaxed)
+    }
+
+    /// Records that the open of the file made it.
+    pub fn set_created(&self) {
+        self.created.store(true, Ordering::Relaxed);
+    }
+
+    /// The lease of the file, for `F_GETLEASE`: `F_RDLCK`, `F_WRLCK` or `F_UNLCK`.
+    pub fn lease(&self) -> i32 {
+        self.lease.load(Ordering::Relaxed)
+    }
+
+    /// Sets the lease of the file, for `F_SETLEASE`. The caller examined the conflicts.
+    pub fn set_lease(&self, kind: i32) {
+        self.lease.store(kind, Ordering::Relaxed);
     }
 
     /// The signal of `F_SETSIG`. 0 is `SIGIO`.
@@ -1111,10 +1189,16 @@ impl File {
         Ok(new)
     }
 
-    /// Gives the next data or the next hole at or after `at`, for an offset before `size`. The
-    /// extents of the inode give the holes. An unwritten extent is a hole. Without the extents,
+    /// Gives the next data or the next hole at or after `at`, for an offset before `size`. A file
+    /// system that keeps its holes in memory gives them itself. Else the extents of the inode
+    /// give the holes. An unwritten extent is a hole. Without the extents,
     /// as the generic code of Linux, all the file is data and the end is the only hole.
     fn seek_extent(&self, at: u64, size: u64, data: bool) -> Result<u64> {
+        match self.inode.as_ref().map(|i| i.seek_hole_data(at, data)) {
+            Some(Ok(pos)) => return Ok(pos),
+            None | Some(Err(Errno::EOPNOTSUPP)) => {}
+            Some(Err(e)) => return Err(e),
+        }
         let extents = match self.inode.as_ref().map(|i| i.fiemap(at, u64::MAX - at)) {
             Some(Ok(extents)) => extents,
             None | Some(Err(Errno::EOPNOTSUPP)) => return Ok(if data { at } else { size }),
@@ -1306,6 +1390,13 @@ impl File {
             return Err(Errno::EBADF);
         }
         self.access_perm()?;
+        // A directory that `rmdir` or a rename removed gives `ENOENT`, as `IS_DEADDIR` in
+        // `iterate_dir` of Linux.
+        if self.location.as_ref().is_some_and(|at| at.dentry.unlinked())
+            && inode.metadata().is_dir()
+        {
+            return Err(Errno::ENOENT);
+        }
         let mut pos = self.pos.lock();
         let mut used = 0;
         while let Some((entry, next)) = inode.read_dir(*pos)? {
