@@ -322,6 +322,7 @@ pub fn init() {
     crate::mqueue::register();
     rk_vfs::inode::set_clock(crate::info::realtime);
     rk_vfs::cred::set_current(|| rk_proc::current_thread().map(|t| t.process().cred()));
+    rk_vfs::blockdev::set_account(rk_proc::cgroup::io_account);
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });

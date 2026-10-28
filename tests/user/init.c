@@ -3912,6 +3912,13 @@ static int cg_eat(void)
 	return 0;
 }
 
+static int cg_sleep(void)
+{
+	for (;;)
+		pause();
+	return 0;
+}
+
 static int cg_spin(void)
 {
 	for (;;)
@@ -3939,12 +3946,219 @@ static long cg_value(const char *path, const char *key)
 	return atol(p + strlen(key));
 }
 
+/* Gives the events of `poll` on `fd` for `events` after at most `ms` milliseconds, or 0. */
+static int poll_events(int fd, short events, int ms)
+{
+	struct pollfd p = { .fd = fd, .events = events };
+
+	return poll(&p, 1, ms) == 1 ? p.revents : 0;
+}
+
+/* The file of the cgroup namespace of init, for cg_setns. */
+static int cg_ns_fd = -1;
+
+/* Leaves the cgroup namespace and joins it again with setns, with a namespace file and with a
+ * process file descriptor of the parent. */
+static int cg_setns(void)
+{
+	char buf[64], mine[64], parent[64];
+	ssize_t n;
+	int pidfd;
+
+	if (unshare(CLONE_NEWCGROUP) != 0)
+		return 2;
+	if (read_file("/proc/self/cgroup", buf, sizeof(buf)) <= 0 || strcmp(buf, "0::/\n") != 0)
+		return 3;
+	if (setns(cg_ns_fd, CLONE_NEWNET) != -1 || errno != EINVAL)
+		return 4;
+	if (setns(cg_ns_fd, CLONE_NEWCGROUP) != 0)
+		return 5;
+	if (read_file("/proc/self/cgroup", buf, sizeof(buf)) <= 0 || strcmp(buf, "0::/t/a\n") != 0)
+		return 6;
+	if (unshare(CLONE_NEWCGROUP) != 0)
+		return 7;
+	pidfd = syscall(SYS_pidfd_open, getppid(), 0);
+	if (pidfd < 0 || setns(pidfd, CLONE_NEWCGROUP) != 0)
+		return 8;
+	snprintf(buf, sizeof(buf), "/proc/%d/ns/cgroup", getppid());
+	n = readlink(buf, parent, sizeof(parent) - 1);
+	if (n <= 0)
+		return 9;
+	parent[n] = 0;
+	n = readlink("/proc/self/ns/cgroup", mine, sizeof(mine) - 1);
+	if (n <= 0)
+		return 10;
+	mine[n] = 0;
+	return strcmp(mine, parent) == 0 ? 0 : 11;
+}
+
+/* Reads the last 64 KiB of /dev/vda and writes the same bytes back, so the disk does not
+ * change. */
+static int cg_io(void)
+{
+	static char b[65536];
+	int fd = open("/dev/vda", O_RDWR);
+	off_t at = fd < 0 ? -1 : lseek(fd, 0, SEEK_END) - (off_t)sizeof(b);
+
+	if (at < 0)
+		return 2;
+	if (pread(fd, b, sizeof(b), at) != (ssize_t)sizeof(b))
+		return 3;
+	if (pwrite(fd, b, sizeof(b), at) != (ssize_t)sizeof(b) || fsync(fd) != 0)
+		return 4;
+	close(fd);
+	return 0;
+}
+
+/* Gives the value of `key` in the line of the device 254:0 in io.stat of the cgroup `cg`, or
+ * -1. */
+static long cg_io_value(const char *cg, const char *key)
+{
+	char path[64], buf[1024];
+	char *line, *p;
+
+	snprintf(path, sizeof(path), "%s/io.stat", cg);
+	if (read_file(path, buf, sizeof(buf)) <= 0 || (line = strstr(buf, "254:0 ")) == NULL ||
+	    (p = strstr(line, key)) == NULL)
+		return -1;
+	return atol(p + strlen(key));
+}
+
+/* Checks the io controller: io.stat, io.max and io.weight. */
+static void test_cgroup_io(void)
+{
+	char buf[256];
+	long long start;
+	int status;
+
+	check("cgroup.subtree_control enables io", cg_write("/cg/cgroup.subtree_control", "+io") == 0 &&
+							   access("/cg/t/io.max", F_OK) == 0);
+	check("io.max of a device that does not exist gives ENODEV",
+	      cg_write("/cg/t/io.max", "1:99 wbps=1") == -1 && errno == ENODEV);
+	check("io.weight takes a weight", cg_write("/cg/t/io.weight", "default 50") == 0 &&
+						  read_file("/cg/t/io.weight", buf, sizeof(buf)) > 0 &&
+						  strcmp(buf, "default 50\n") == 0);
+	check("io.weight refuses 0", cg_write("/cg/t/io.weight", "0") == -1 && errno == EINVAL);
+	/* The disk is only in the boot test blk. */
+	if (access("/dev/vda", F_OK) != 0)
+		return;
+	long before = cg_io_value("/cg/t", "wbytes=");
+	status = wait_status(cgroup_child("/cg/t/a", cg_io));
+	check("io.stat counts the writes of the cgroup", WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+								 cg_io_value("/cg/t", "wbytes=") >= before + 65536 &&
+								 cg_io_value("/cg/t", "wios=") > 0 &&
+								 cg_io_value("/cg", "wbytes=") >= 65536);
+	check("io.max takes a limit", cg_write("/cg/t/io.max", "254:0 wbps=65536") == 0 &&
+					      read_file("/cg/t/io.max", buf, sizeof(buf)) > 0 &&
+					      strcmp(buf, "254:0 rbps=max wbps=65536 riops=max wiops=max\n") == 0);
+	start = clock_ms(CLOCK_MONOTONIC);
+	status = wait_status(cgroup_child("/cg/t/a", cg_io));
+	check("io.max slows the writes of the cgroup", WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+							       clock_ms(CLOCK_MONOTONIC) - start >= 900 &&
+							       cg_value("/cg/t/io.pressure", "total=") > 0);
+	check("io.max takes max", cg_write("/cg/t/io.max", "254:0 wbps=max") == 0 &&
+					  read_file("/cg/t/io.max", buf, sizeof(buf)) == 0);
+}
+
+/* The errno that the write of cg_lesser_euid must give: 0 for a write that works. */
+static int cg_lesser_want;
+
+/* Opens cgroup.procs of /cg/t/d/y as the user nobody and writes it as root, as cgroup_core01 of
+ * LTP. The check uses the credentials of the open, so the write needs a nobody that can write
+ * cgroup.procs of the common parent /cg/t/d. */
+static int cg_lesser_euid(void)
+{
+	int fd;
+
+	if (seteuid(65534) != 0)
+		return 2;
+	fd = open("/cg/t/d/y/cgroup.procs", O_RDWR);
+	if (seteuid(0) != 0 || fd < 0)
+		return 3;
+	if (cg_lesser_want == 0)
+		return write(fd, "0", 1) == 1 ? 0 : 4;
+	return write(fd, "0", 1) == -1 && errno == cg_lesser_want ? 0 : 5;
+}
+
+/* Opens cgroup.procs of /cg/t/d/y in a new cgroup namespace at /cg/t/d/x, as cgroup_core02 of
+ * LTP. With nsdelegate, y is outside the namespace, so a write gives ENOENT. The namespace can
+ * write cgroup.procs of its root, but not the other files of its root. */
+static int cg_lesser_ns(void)
+{
+	int fd;
+
+	if (unshare(CLONE_NEWCGROUP) != 0)
+		return 2;
+	fd = open("/cg/t/d/y/cgroup.procs", O_RDWR);
+	if (fd < 0)
+		return 3;
+	if (write(fd, "0", 1) != -1 || errno != ENOENT)
+		return 4;
+	if (cg_write("/cg/t/d/x/cgroup.max.depth", "5") != -1 || errno != EPERM)
+		return 5;
+	return cg_write("/cg/t/d/x/cgroup.procs", "0") == 0 ? 0 : 6;
+}
+
+/* Makes the cgroup /cg/t/d/z as the user nobody. */
+static int cg_mkdir_nobody(void)
+{
+	return seteuid(65534) == 0 && mkdir("/cg/t/d/z", 0755) == 0 ? 0 : 2;
+}
+
+/* Checks the delegation of cgroups: chown, the credentials of the open of cgroup.procs, a cgroup
+ * that a user makes, and the mount option nsdelegate. */
+static void test_cgroup_delegation(void)
+{
+	struct stat st;
+	char buf[4096];
+	int status;
+
+	check("mkdir makes the cgroups of a delegation", mkdir("/cg/t/d", 0755) == 0 && mkdir("/cg/t/d/x", 0755) == 0 &&
+								mkdir("/cg/t/d/y", 0755) == 0);
+	check("chown changes the owner of a cgroup file",
+	      chown("/cg/t/d/x/cgroup.procs", 65534, -1) == 0 && chown("/cg/t/d/y/cgroup.procs", 65534, -1) == 0 &&
+		      stat("/cg/t/d/y/cgroup.procs", &st) == 0 && st.st_uid == 65534 &&
+		      stat("/cg/t/d/y/cgroup.threads", &st) == 0 && st.st_uid == 0);
+	cg_lesser_want = EACCES;
+	status = wait_status(cgroup_child("/cg/t/d/x", cg_lesser_euid));
+	check("a write of cgroup.procs uses the credentials of the open", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	cg_lesser_want = 0;
+	check("the owner of cgroup.procs of the common parent can move a process",
+	      chown("/cg/t/d/cgroup.procs", 65534, -1) == 0 &&
+		      (status = wait_status(cgroup_child("/cg/t/d/x", cg_lesser_euid)), WIFEXITED(status)) &&
+		      WEXITSTATUS(status) == 0);
+	check("a cgroup belongs to the user that makes it",
+	      chown("/cg/t/d", 65534, -1) == 0 &&
+		      (status = wait_status(cgroup_child("/cg/t/d/x", cg_mkdir_nobody)), WIFEXITED(status)) &&
+		      WEXITSTATUS(status) == 0 && stat("/cg/t/d/z", &st) == 0 && st.st_uid == 65534 &&
+		      stat("/cg/t/d/z/cgroup.procs", &st) == 0 && st.st_uid == 65534);
+
+	mkdir("/cgd", 0755);
+	check("cgroup2 takes nsdelegate", mount("none", "/cgd", "cgroup2", 0, "nsdelegate") == 0 &&
+						  read_file("/proc/self/mounts", buf, sizeof(buf)) > 0 &&
+						  strstr(buf, ",nsdelegate") != NULL);
+	status = wait_status(cgroup_child("/cg/t/d/x", cg_lesser_ns));
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("cg_lesser_ns: status %#x\n", status);
+	check("nsdelegate makes a cgroup namespace a boundary", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	umount("/cgd");
+	check("a mount without nsdelegate clears it", mount("none", "/cgd", "cgroup2", 0, NULL) == 0 &&
+							   (status = wait_status(cgroup_child("/cg/t/d/x", cg_lesser_ns)),
+							    WIFEXITED(status)) &&
+							   WEXITSTATUS(status) == 4);
+	umount("/cgd");
+	rmdir("/cgd");
+	check("rmdir removes the cgroups of a delegation", rmdir("/cg/t/d/z") == 0 && rmdir("/cg/t/d/y") == 0 &&
+								  rmdir("/cg/t/d/x") == 0 && rmdir("/cg/t/d") == 0);
+}
+
 static void test_cgroup(void)
 {
 	struct statfs sfs;
 	struct clone_args args;
 	char buf[512], want[64];
 	pid_t pid;
+	ssize_t n;
 	int status, fd;
 
 	mount("proc", "/proc", "proc", 0, NULL);
@@ -3952,7 +4166,7 @@ static void test_cgroup(void)
 	check("mount cgroup2", mount("none", "/cg", "cgroup2", 0, NULL) == 0);
 	check("statfs of cgroup2 gives CGROUP2_SUPER_MAGIC", statfs("/cg", &sfs) == 0 && sfs.f_type == 0x63677270);
 	check("the root has the controllers", read_file("/cg/cgroup.controllers", buf, sizeof(buf)) > 0 &&
-						      strcmp(buf, "cpuset cpu memory pids\n") == 0);
+						      strcmp(buf, "cpuset cpu io memory pids\n") == 0);
 	check("/proc/self/cgroup is the root", read_file("/proc/self/cgroup", buf, sizeof(buf)) > 0 &&
 						       strcmp(buf, "0::/\n") == 0);
 	check("/proc/cgroups has memory", read_file("/proc/cgroups", buf, sizeof(buf)) > 0 &&
@@ -4012,13 +4226,81 @@ static void test_cgroup(void)
 	status = wait_status(cgroup_child("/cg/t/a", cg_eat));
 	check("memory.max gives an OOM kill", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL &&
 						      cg_value("/cg/t/a/memory.events", "oom_kill ") >= 1);
+	status = wait_status(cgroup_child("/cg/t/a", cg_eat));
+	check("memory.events counts the OOM kill of the process", cg_value("/cg/t/a/memory.events.local", "oom_kill ") >= 2);
+	check("memory.oom.group takes 1", cg_write("/cg/t/a/memory.oom.group", "1") == 0);
+	pid = cgroup_child("/cg/t/a", cg_sleep);
+	usleep(50000);
+	status = wait_status(cgroup_child("/cg/t/a", cg_eat));
+	check("memory.oom.group kills the whole cgroup", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL &&
+								 (status = wait_status(pid), WIFSIGNALED(status)) &&
+								 WTERMSIG(status) == SIGKILL &&
+								 cg_value("/cg/t/a/memory.events", "oom_group_kill ") >= 1);
+	cg_write("/cg/t/a/memory.oom.group", "0");
 	cg_write("/cg/t/a/memory.max", "max");
+
+	check("memory.high takes a size", cg_write("/cg/t/a/memory.high", "4M") == 0);
+	pid = cgroup_child("/cg/t/a", cg_eat);
+	for (int i = 0; i < 100; i++) {
+		if (cg_value("/cg/t/a/memory.events", "high ") > 0 && cg_value("/cg/t/a/memory.pressure", "total=") > 0)
+			break;
+		usleep(100000);
+	}
+	check("memory.high slows a process over the limit",
+	      waitpid(pid, &status, WNOHANG) == 0 && cg_value("/cg/t/a/memory.events", "high ") > 0 &&
+		      cg_value("/cg/t/a/memory.pressure", "total=") > 0);
+	cg_write("/cg/t/a/memory.high", "max");
+	status = wait_status(pid);
+	check("the process goes on after memory.high goes up", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	fd = open("/cg/t/a/cpu.pressure", O_RDWR);
+	check("a pressure file without a trigger polls POLLERR",
+	      (poll_events(fd, POLLPRI, 0) & (POLLERR | POLLPRI)) == (POLLERR | POLLPRI));
+	check("a write of a pressure file makes a trigger", write(fd, "some 50000 1000000", 18) == 18);
+	check("a second trigger on the file gives EBUSY", write(fd, "some 50000 1000000", 18) == -1 && errno == EBUSY);
+	check("a trigger needs a valid window", cg_write("/cg/t/a/memory.pressure", "some 50000 100") == -1 &&
+							errno == EINVAL);
+	check("a trigger without an event does not poll POLLPRI", !(poll_events(fd, POLLPRI, 0) & POLLPRI));
+	cg_write("/cg/t/a/cpu.max", "10000 100000");
+	pid = cgroup_child("/cg/t/a", cg_busy);
+	check("a stall polls POLLPRI on the trigger", poll_events(fd, POLLPRI, 3000) & POLLPRI);
+	wait_status(pid);
+	cg_write("/cg/t/a/cpu.max", "max");
+	close(fd);
+	fd = open("/proc/pressure/memory", O_RDWR);
+	check("/proc/pressure takes a trigger", fd >= 0 && write(fd, "full 100000 2000000", 19) == 19 &&
+							!(poll_events(fd, POLLPRI, 0) & POLLERR));
+	close(fd);
 
 	pid = cgroup_child("/cg/t/a", cg_spin);
 	usleep(100000);
-	check("cgroup.freeze freezes", cg_write("/cg/t/a/cgroup.freeze", "1") == 0 &&
-					       cg_value("/cg/t/a/cgroup.events", "frozen ") == 1);
+	fd = open("/cg/t/a/cgroup.events", O_RDONLY);
+	check("poll of cgroup.events before a read sees an event", poll_events(fd, POLLPRI, 0) & POLLPRI);
+	read(fd, buf, sizeof(buf));
+	check("poll of cgroup.events after a read waits", !(poll_events(fd, POLLPRI, 0) & POLLPRI));
+	check("cgroup.freeze takes 1", cg_write("/cg/t/a/cgroup.freeze", "1") == 0);
+	check("poll of cgroup.events sees the freeze", poll_events(fd, POLLPRI, 3000) & POLLPRI);
+	check("cgroup.events tells frozen", cg_value("/cg/t/a/cgroup.events", "frozen ") == 1);
+	check("a new cgroup in a frozen cgroup is frozen",
+	      mkdir("/cg/t/a/b", 0755) == 0 && cg_value("/cg/t/a/b/cgroup.events", "frozen ") == 1 &&
+		      cg_value("/cg/t/a/b/cgroup.freeze", "") == 0 && rmdir("/cg/t/a/b") == 0);
+	snprintf(want, sizeof(want), "/proc/%d/stat", pid);
+	{
+		long before = 0, after = 0;
+		char *p;
+
+		if (read_file(want, buf, sizeof(buf)) > 0 && (p = strrchr(buf, ')')) != NULL)
+			sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %ld", &before);
+		usleep(200000);
+		if (read_file(want, buf, sizeof(buf)) > 0 && (p = strrchr(buf, ')')) != NULL)
+			sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %ld", &after);
+		check("a frozen process does not run", before > 0 && after == before);
+	}
+	read(fd, buf, sizeof(buf));
 	cg_write("/cg/t/a/cgroup.freeze", "0");
+	check("cgroup.events tells thawed", cg_value("/cg/t/a/cgroup.events", "frozen ") == 0 &&
+						    poll_events(fd, POLLPRI, 0) & POLLPRI);
+	close(fd);
 	check("cgroup.kill kills the processes", cg_write("/cg/t/a/cgroup.kill", "1") == 0 &&
 							 (status = wait_status(pid), WIFSIGNALED(status)) &&
 							 WTERMSIG(status) == SIGKILL);
@@ -4036,7 +4318,21 @@ static void test_cgroup(void)
 	close(fd);
 	status = wait_status(cgroup_child("/cg/t/a", cg_unshare));
 	check("CLONE_NEWCGROUP makes the cgroup the root", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	n = readlink("/proc/self/ns/cgroup", buf, sizeof(buf) - 1);
+	check("/proc/self/ns/cgroup links to the namespace", n > 0 && (buf[n] = 0, strcmp(buf, "cgroup:[4026531835]") == 0));
+	cg_ns_fd = open("/proc/self/ns/cgroup", O_RDONLY);
+	check("setns takes a file of a namespace", cg_ns_fd >= 0 && setns(cg_ns_fd, CLONE_NEWCGROUP) == 0);
+	check("setns of a file that is not a namespace gives EINVAL",
+	      (fd = open("/proc/self/cgroup", O_RDONLY)) >= 0 && setns(fd, 0) == -1 && errno == EINVAL);
+	close(fd);
+	status = wait_status(cgroup_child("/cg/t/a", cg_setns));
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("cg_setns: status %#x\n", status);
+	check("setns joins a cgroup namespace", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(cg_ns_fd);
 
+	test_cgroup_io();
+	test_cgroup_delegation();
 	check("rmdir removes the cgroups", rmdir("/cg/t/a") == 0 && rmdir("/cg/t") == 0);
 	umount("/cg");
 	rmdir("/cg");

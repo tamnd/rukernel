@@ -53,7 +53,7 @@ fn the_limits_of_the_hierarchy_hold() {
 fn subtree_control_gives_the_controllers_to_the_children() {
     let mut h = Hierarchy::new(0, 1);
     let a = h.mkdir(ROOT, b"a", 0).unwrap();
-    assert_eq!(h.read(ROOT, "cgroup.controllers", 0).unwrap(), "cpuset cpu memory pids\n");
+    assert_eq!(h.read(ROOT, "cgroup.controllers", 0).unwrap(), "cpuset cpu io memory pids\n");
     assert_eq!(h.read(a, "cgroup.controllers", 0).unwrap(), "\n");
     assert!(!names(&h, a).contains(&"pids.max"));
     h.write(ROOT, "cgroup.subtree_control", b"+pids +memory", 0).unwrap();
@@ -338,4 +338,109 @@ fn a_trigger_fires_once_in_a_window() {
     // A new window.
     assert!(!s.check(SEC + SEC / 2, 310_000_000));
     assert!(s.check(SEC + SEC / 2 + 1, 500_000_000));
+}
+
+#[test]
+fn a_cgroup_is_frozen_when_each_thread_waits() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    h.add_process(b);
+    h.charge_pids(b, 2).unwrap();
+    let seq = h.event_seq(a, "cgroup.events").unwrap();
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 0\n");
+    h.write(a, "cgroup.freeze", b"1", 0).unwrap();
+    assert!(h.frozen(b));
+    // The threads of `b` did not stop yet.
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 0\n");
+    h.thread_frozen(b, true);
+    assert_eq!(h.read(b, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 0\n");
+    h.thread_frozen(b, true);
+    assert_eq!(h.read(b, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 1\n");
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 1\n");
+    assert!(h.event_seq(a, "cgroup.events").unwrap() > seq);
+    assert!(h.take_notify());
+    assert!(!h.take_notify());
+    // A thaw makes the cgroups not frozen at once.
+    h.write(a, "cgroup.freeze", b"0", 0).unwrap();
+    assert!(!h.frozen(b));
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 0\n");
+    assert_eq!(h.event_seq(a, "cgroup.procs"), None);
+}
+
+#[test]
+fn memory_high_makes_a_delay_that_grows_with_the_use() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "memory.high", b"1M", 0).unwrap();
+    h.charge_memory(a, 1 << 20).unwrap();
+    assert_eq!(h.high_delay(a), 0);
+    // A small part over the limit gives no wait.
+    h.charge_memory(a, PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), 0);
+    // Twice the limit gives the longest wait.
+    h.charge_memory(a, (1 << 20) - PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), HIGH_DELAY_MAX);
+    // The wait is for the pages that the cgroup charged since the last wait.
+    assert_eq!(h.high_delay(a), 0);
+    h.charge_memory(a, PAGE_SIZE).unwrap();
+    assert_eq!(h.high_delay(a), HIGH_DELAY_MAX / HIGH_BATCH);
+    let events = h.read(a, "memory.events", 0).unwrap();
+    assert!(events.starts_with("low 0\nhigh "), "{events}");
+}
+
+#[test]
+fn memory_oom_group_gives_the_highest_group() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    assert_eq!(h.oom_group(b, ROOT), None);
+    h.write(b, "memory.oom.group", b"1", 0).unwrap();
+    assert_eq!(h.oom_group(b, ROOT), Some(b));
+    h.write(a, "memory.oom.group", b"1", 0).unwrap();
+    assert_eq!(h.oom_group(b, ROOT), Some(a));
+    // A group above the cgroup of the OOM does not count.
+    assert_eq!(h.oom_group(b, b), Some(b));
+    h.count_oom_group_kill(a);
+    assert!(h.read(a, "memory.events", 0).unwrap().ends_with("oom_group_kill 1\n"));
+}
+
+#[test]
+fn io_stat_counts_the_subtree_and_io_max_gives_a_delay() {
+    let mut h = Hierarchy::new(0, 0b1);
+    h.write(ROOT, "cgroup.subtree_control", b"+io", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let dev = io::makedev(253, 0);
+    assert_eq!(io::parse_dev("253:0"), Ok(dev));
+    assert_eq!(h.charge_io(a, dev, false, 4096, 1, 0), 0);
+    assert_eq!(h.charge_io(a, dev, true, 8192, 2, 0), 0);
+    let line = "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0\n";
+    assert_eq!(h.read(a, "io.stat", 0).unwrap(), line);
+    assert_eq!(h.read(ROOT, "io.stat", 0).unwrap(), line);
+    assert!(!names(&h, ROOT).contains(&"io.max"));
+
+    h.write(a, "io.max", b"253:0 wbps=1048576 riops=10", 0).unwrap();
+    assert_eq!(h.read(a, "io.max", 0).unwrap(), "253:0 rbps=max wbps=1048576 riops=10 wiops=max\n");
+    // 1 MiB at 1 MiB/s takes a second, and the next MiB waits one more second.
+    assert_eq!(h.charge_io(a, dev, true, 1 << 20, 1, SEC), SEC);
+    assert_eq!(h.charge_io(a, dev, true, 1 << 20, 1, SEC), 2 * SEC);
+    // A read of 1 bio at 10 IOPS takes 100 ms.
+    assert_eq!(h.charge_io(a, dev, false, 512, 1, SEC), SEC / 10);
+    assert_eq!(h.write(a, "io.max", b"253:0 wbps=0", 0), Err(Errno::ERANGE));
+    assert_eq!(h.write(a, "io.max", b"253:0 xbps=1", 0), Err(Errno::EINVAL));
+    h.write(a, "io.max", b"253:0 wbps=max riops=max", 0).unwrap();
+    assert_eq!(h.read(a, "io.max", 0).unwrap(), "");
+    assert_eq!(h.charge_io(a, dev, true, 1 << 20, 1, SEC), 0);
+
+    assert_eq!(h.read(a, "io.weight", 0).unwrap(), "default 100\n");
+    h.write(a, "io.weight", b"default 200", 0).unwrap();
+    h.write(a, "io.weight", b"253:0 50", 0).unwrap();
+    assert_eq!(h.read(a, "io.weight", 0).unwrap(), "default 200\n253:0 50\n");
+    h.write(a, "io.weight", b"253:0 default", 0).unwrap();
+    h.write(a, "io.weight", b"300", 0).unwrap();
+    assert_eq!(h.read(a, "io.weight", 0).unwrap(), "default 300\n");
+    assert_eq!(h.write(a, "io.weight", b"0", 0), Err(Errno::EINVAL));
 }

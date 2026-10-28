@@ -20,7 +20,7 @@ use rk_block::cache::{PAGE_SIZE, PageCache};
 use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
 
-pub use rk_block::{BlockDevice, SECTOR_SIZE};
+pub use rk_block::{BlockDevice, SECTOR_SIZE, set_account};
 
 /// The `ioctl` commands of block devices, from `<linux/fs.h>`.
 pub mod ioctl {
@@ -204,7 +204,9 @@ fn insert_block(
     device: Arc<dyn BlockDevice>,
     ops: Option<Arc<dyn BlockOps>>,
 ) {
-    let cache = Arc::new(PageCache::new(Arc::new(Queue::new(device))));
+    let queue = Arc::new(Queue::new(device));
+    queue.set_dev(rdev);
+    let cache = Arc::new(PageCache::new(queue));
     let entry =
         Entry { name: String::from(name), cache, mounts: 0, exclusive: false, opens: 0, ops };
     BLOCK_DEVICES.lock().insert(rdev, entry);

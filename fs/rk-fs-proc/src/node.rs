@@ -31,6 +31,9 @@ pub(crate) type WriteAtFn = Box<dyn Fn(u64, &[u8]) -> Result<usize> + Send + Syn
 /// Finds one entry of a directory, without the full list.
 pub(crate) type FindFn = Box<dyn Fn(&[u8]) -> Result<InodeRef> + Send + Sync>;
 
+/// Makes the operations of an open file, for a file that keeps a state for each open file.
+pub(crate) type OpenFn = Box<dyn Fn() -> Option<Arc<dyn rk_vfs::file::FileOps>> + Send + Sync>;
+
 /// Gives the owner and the group of a file.
 pub(crate) type OwnerFn = Box<dyn Fn() -> (u32, u32) + Send + Sync>;
 
@@ -46,6 +49,8 @@ enum Kind {
         write: Option<WriteFn>,
         /// The text of the last read at offset 0, while a reader has not got to its end.
         text: SpinLock<Option<Arc<Vec<u8>>>>,
+        /// The operations of an open file. Without them, the file uses the inode.
+        open: Option<OpenFn>,
     },
     /// A file that reads and writes at an offset, as `/proc/PID/mem`.
     Data {
@@ -109,7 +114,12 @@ pub(crate) fn file(
     Arc::new(Node {
         ino: ino(path),
         perm: 0o444,
-        kind: Kind::File { read: Box::new(read), write: None, text: SpinLock::new(None) },
+        kind: Kind::File {
+            read: Box::new(read),
+            write: None,
+            text: SpinLock::new(None),
+            open: None,
+        },
         owner: Once::new(),
     })
 }
@@ -124,8 +134,27 @@ pub(crate) fn rw_file(
         read: Box::new(read),
         write: Some(Box::new(write)),
         text: SpinLock::new(None),
+        open: None,
     };
     Arc::new(Node { ino: ino(path), perm: 0o644, kind, owner: Once::new() })
+}
+
+/// Makes a file with the permission bits `perm` whose open files have the operations that
+/// `open` makes. `read` gives the text for a read of the inode without an open file.
+#[cfg_attr(test, expect(dead_code, reason = "only the pressure files of the kernel use it"))]
+pub(crate) fn ops_file(
+    path: &[u8],
+    perm: u32,
+    read: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
+    open: impl Fn() -> Option<Arc<dyn rk_vfs::file::FileOps>> + Send + Sync + 'static,
+) -> InodeRef {
+    let kind = Kind::File {
+        read: Box::new(read),
+        write: None,
+        text: SpinLock::new(None),
+        open: Some(Box::new(open)),
+    };
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new() })
 }
 
 /// Makes a file that reads and writes at an offset, with the permission bits `perm`.
@@ -283,6 +312,11 @@ impl Inode for Node {
             Kind::File { write: None, .. } => Err(Errno::EIO),
             _ => Err(Errno::EINVAL),
         }
+    }
+
+    fn open_file(&self, _flags: u32) -> Option<Result<Arc<dyn rk_vfs::file::FileOps>>> {
+        let Kind::File { open: Some(open), .. } = &self.kind else { return None };
+        open().map(Ok)
     }
 
     fn lookup(&self, name: &[u8]) -> Result<InodeRef> {

@@ -436,6 +436,11 @@ impl FsContext {
                         crate::notify::change(Some(&at), at.inode(), &attr);
                     }
                 }
+                if kind == FileType::Regular
+                    && let Some(ops) = at.inode().open_file(flags)
+                {
+                    return Ok(File::with_ops(ops?, Some(at), flags));
+                }
                 Ok(File::open_inode(at, flags))
             }
             FileType::CharDevice => {

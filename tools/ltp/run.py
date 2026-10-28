@@ -57,6 +57,8 @@ mkdir -p /dev/shm
 mount -t tmpfs shm /dev/shm
 mount -t tmpfs tmp /tmp
 [ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
+# systemd mounts cgroup2 with nsdelegate, and the cgroup tests of LTP use the mount that they find.
+mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup 2>/dev/null
 # The tests of IPv6 and the sockets send to ::1 and 127.0.0.1, as on a system where lo is up.
 ip link set lo up 2>/dev/null
 if ! mount -t ext4 -o ro /dev/vdb /ltp; then

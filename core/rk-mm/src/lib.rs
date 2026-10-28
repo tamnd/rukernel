@@ -26,3 +26,8 @@ pub use space::{
     STACK_TOP,
 };
 pub use vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet};
+
+/// The free frames that a page of a process cannot take. The kernel keeps them for its heap and
+/// for its own work when the memory is short, so that the OOM killer can run. A fault that finds
+/// fewer free frames gives `ENOMEM`, as the min watermark of Linux.
+pub const USER_RESERVE: usize = 256;

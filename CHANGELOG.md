@@ -2,6 +2,23 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The cgroup v2 freezer and the notification of cgroup events, as kernel/cgroup/freezer.c of Linux (#366). A write of 1 to `cgroup.freeze` stops each thread of the cgroup and of its descendants at its next return to user mode, and a new child cgroup of a frozen cgroup is frozen too. `cgroup.events` tells `frozen 1` when each thread waits, and `poll` of `cgroup.events` and `cgroup.freeze` gives `POLLPRI` and `POLLERR` when a value changes after the last read.
+- PSI triggers, as kernel/sched/psi.c of Linux (#366). A write of `some|full STALL WINDOW` (in microseconds) to a `*.pressure` file or to a /proc/pressure file makes a trigger for the open file. A timer checks the stall time in each window, and `poll` gives `POLLPRI` when the stall time is more than the threshold. A second trigger on the same file gives `EBUSY`, a file without a trigger polls `POLLERR`, and a process without `CAP_SYS_RESOURCE` must use a window that is a multiple of 2 seconds.
+- `setns` for cgroup name spaces and the link /proc/PID/ns/cgroup (#366). The link gives `cgroup:[INODE]` and opens a file of the name space file system (`NSFS_MAGIC`). `setns` takes this file or a pidfd with `CLONE_NEWCGROUP` and needs `CAP_SYS_ADMIN`. The other name space types give `EINVAL`.
+- `memory.high` throttles a cgroup, as `mem_cgroup_handle_over_high` of Linux (#366). A task that charges pages past `memory.high` waits at its next return to user mode for a time that grows with the square of the overage (at most 2 seconds), and the wait counts as a memory stall in PSI. `memory.events` counts `high`.
+- `memory.oom.group` (#366). An OOM kill in a cgroup with `memory.oom.group` 1 kills each process of the highest such cgroup, and `memory.events` counts `oom_group_kill`.
+- The cgroup v2 io controller, as block/blk-cgroup.c and block/blk-throttle.c of Linux (#366). `io.stat` counts the bytes and the bios of each block device for a cgroup and its descendants. `io.max` limits `rbps`, `wbps`, `riops` and `wiops` of a device, and a task over a limit waits at its next return to user mode. The wait counts as an I/O stall in PSI. `io.weight` keeps its values but has no effect yet. A device that does not exist gives `ENODEV`.
+- Delegation of cgroups, as kernel/cgroup/cgroup.c of Linux (#366). `chown` and `chmod` change the owner and the mode of a cgroup directory or file, and a new cgroup belongs to the fsuid and the fsgid of its creator. A write to `cgroup.procs` or `cgroup.threads` uses the credentials of the open, and the opener must be able to write `cgroup.procs` of the common ancestor (else `EACCES`). The `nsdelegate` mount option makes cgroup name spaces a delegation boundary: a move out of the name space gives `ENOENT`, and a write to the files of the name space root gives `EPERM`.
+- tools/ltp/run.py mounts cgroup2 with `nsdelegate` at /sys/fs/cgroup (#366).
+
+### Changed
+
+- The OOM killer of the system waits for a victim that is still on its way out before it kills another process, as Linux does for a task with `TIF_MEMDIE` (#366). A page of a process cannot take the last 256 free frames, so the kernel keeps memory for its heap and for the OOM killer. The OOM killer measures a process without a list of its pages.
+
 ## [0.4.4] - 2026-10-28
 
 ### Added
