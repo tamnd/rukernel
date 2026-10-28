@@ -1235,6 +1235,13 @@ static void test_pipes(void)
 	      syscall(SYS_preadv2, p[0], &nv, 1, -1L, -1L, RWF_NOWAIT) == 3);
 	close(p[0]);
 	close(p[1]);
+	int nf = open("/tmp/nowait", O_RDWR | O_CREAT | O_TRUNC, 0644);
+	check("preadv2 with RWF_NOWAIT of a tmpfs file gives EOPNOTSUPP",
+	      nf >= 0 && syscall(SYS_preadv2, nf, &nv, 1, 0L, 0L, RWF_NOWAIT) == -1 && errno == EOPNOTSUPP);
+	check("pwritev2 with RWF_NOWAIT of a tmpfs file gives EOPNOTSUPP",
+	      syscall(SYS_pwritev2, nf, &nv, 1, 0L, 0L, RWF_NOWAIT) == -1 && errno == EOPNOTSUPP);
+	close(nf);
+	unlink("/tmp/nowait");
 
 	check("pipe2 with O_NONBLOCK", pipe2(p, O_NONBLOCK | O_CLOEXEC) == 0);
 	check("an empty pipe gives EAGAIN", read(p[0], buf, 1) == -1 && errno == EAGAIN);

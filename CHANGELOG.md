@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The Unix 98 pseudo terminals: /dev/ptmx and the file system devpts, as drivers/tty/pty.c and fs/devpts/inode.c of Linux (#403). `ioctl` has `TIOCGPTN`, `TIOCSPTLCK`, `TIOCGPTLCK`, `TIOCPKT`, `TIOCGPKT`, `TIOCGETD`, `TIOCSETD` (only `N_TTY`) and the terminal commands (`TCGETS`, `TCGETA`, `TCSETS*`, `TCSETA*`, `TIOCGWINSZ`, `TIOCSWINSZ`, `FIONREAD` and others) on both sides of the pair. musl `openpty` works, and LTP ioctl01 passes.
 - `setsockopt` with `IPV6_ADDRFORM` changes a connected UDP socket of `AF_INET6` with an IPv4 peer into an `AF_INET` socket, as net/ipv6/ipv6_sockglue.c of Linux (#403).
+- EEVDF wakeup preemption, as `check_preempt_wakeup_fair` of Linux with `RUN_TO_PARITY` (#408). A task that wakes, or a new task, takes the CPU from the current task when the current task is not eligible or has used its slice, and the wakeup has an earlier deadline. A wakeup for another CPU sends a reschedule IPI to that CPU.
 
 ### Fixed
 
@@ -17,6 +18,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The reservations of `min_size=` of a hugetlbfs mount count one time (#392). A reservation or a page of a file takes one of the reservations of the mount first, and the mount reserves its pages again when the files give them back. Before, a mapping reserved new pages in the pool in addition to the ones of the mount.
 - On x86-64 with KVM or on hardware, the removal of a huge page drops only the TLB entry of the huge page (#392). Under QEMU without KVM, which the kernel finds with the hypervisor leaf of CPUID, it still drops all the TLB entries of user pages.
 - On arm64, the copy of a page for copy on write moves 128 bytes in each step of the loop with the SIMD registers (#392).
+- A new kernel log record wakes the readers of /dev/kmsg that wait in `poll` or `read`, as `wake_up_klogd` of Linux (#408). A bottom half wakes the wait queue, so `printk` does not take the lock of the queue.
+- `preadv2` and `pwritev2` with `RWF_NOWAIT` on a tmpfs file give `EOPNOTSUPP`, as Linux, where tmpfs does not set `FMODE_NOWAIT` (#408).
+- The free of a large kernel heap block sends one TLB shootdown for the range, not one for each page (#408).
 
 ## [0.4.7] - 2026-10-28
 

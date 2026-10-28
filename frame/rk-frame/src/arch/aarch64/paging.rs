@@ -20,6 +20,7 @@
 //! loads another table.
 
 use super::cpu::{self, MAX_CPUS};
+use crate::addr::PAGE_SIZE;
 use crate::boot::BootInfo;
 use crate::mm::PageInfo;
 use crate::mm::frame::{alloc_table_frame, free_frame_phys};
@@ -352,6 +353,48 @@ pub(crate) fn unmap_page(virt: usize) -> Option<u64> {
     e.store(0, Ordering::Relaxed);
     flush(virt);
     Some(value & ADDR_MASK)
+}
+
+/// Removes the mappings of `pages` 4 KiB pages of the heap range from `virt`, with one barrier for
+/// the range, as `flush_tlb_kernel_range` of Linux. Then `free` gets the physical address of each
+/// page that was mapped. The TLB invalidations go to each CPU, so no interrupt is needed. The heap
+/// does not use an address again, so no map comes between the two steps.
+pub(crate) fn unmap_pages(virt: usize, pages: usize, free: &mut dyn FnMut(u64)) {
+    if pages == 0 {
+        return;
+    }
+    let end = virt + pages * PAGE_SIZE;
+    assert!(HEAP_START <= virt && end <= HEAP_END, "{virt:#x} is not in the heap range");
+    let _guard = TABLES.lock();
+    // First the entries lose their valid bit and keep the address, so that each CPU stops the use
+    // of the pages before the frames go back.
+    for at in (virt..end).step_by(PAGE_SIZE) {
+        if let Some(e) = walk(root(), 0, 3, at, &mut || None) {
+            let value = e.load(Ordering::Relaxed);
+            if value & VALID != 0 {
+                e.store(value & !VALID, Ordering::Relaxed);
+            }
+        }
+    }
+    // SAFETY: the TLB invalidations and the barriers change no memory.
+    unsafe { core::arch::asm!("dsb ishst", options(nostack, preserves_flags)) };
+    for at in (virt..end).step_by(PAGE_SIZE) {
+        let arg = (at >> 12) & ((1 << 44) - 1);
+        // SAFETY: as above.
+        unsafe {
+            core::arch::asm!("tlbi vaae1is, {}", in(reg) arg, options(nostack, preserves_flags));
+        }
+    }
+    // SAFETY: as above.
+    unsafe { core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags)) };
+    for at in (virt..end).step_by(PAGE_SIZE) {
+        if let Some(e) = walk(root(), 0, 3, at, &mut || None) {
+            let value = e.swap(0, Ordering::Relaxed);
+            if value != 0 {
+                free(value & ADDR_MASK);
+            }
+        }
+    }
 }
 
 /// Walks the kernel page tables for one virtual address.

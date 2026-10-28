@@ -314,6 +314,55 @@ pub(crate) fn unmap_page(virt: usize) -> Option<u64> {
     Some(e & ADDR_MASK)
 }
 
+/// The last level table and the index of the entry of `virt` in the kernel tables, if the tables
+/// on the way are there. The caller holds the `TABLES` lock.
+fn kernel_leaf(virt: usize) -> Option<(u64, usize)> {
+    let mut table = KERNEL_PML4.load(Ordering::Acquire);
+    let [i4, i3, i2, i1] = indexes(virt);
+    for i in [i4, i3, i2] {
+        let e = read_entry(table, i);
+        if e & PRESENT == 0 || e & HUGE != 0 {
+            return None;
+        }
+        table = e & ADDR_MASK;
+    }
+    Some((table, i1))
+}
+
+/// Removes the mappings of `pages` 4 KiB pages of the heap range from `virt`, with one TLB
+/// shootdown for the range, as `flush_tlb_kernel_range` of Linux. Then `free` gets the physical
+/// address of each page that was mapped. The heap does not use an address again, so no map comes
+/// between the two steps.
+pub(crate) fn unmap_pages(virt: usize, pages: usize, free: &mut dyn FnMut(u64)) {
+    if pages == 0 {
+        return;
+    }
+    let end = virt + pages * PAGE_SIZE;
+    assert!(HEAP_START <= virt && end <= HEAP_END, "{virt:#x} is not in the heap range");
+    let _guard = TABLES.lock();
+    // First the entries lose their present bit and keep the address, so that each CPU stops the
+    // use of the pages before the frames go back.
+    for at in (virt..end).step_by(PAGE_SIZE) {
+        if let Some((table, i)) = kernel_leaf(at) {
+            let e = read_entry(table, i);
+            if e & PRESENT != 0 {
+                write_entry(table, i, e & !PRESENT);
+                flush(at);
+            }
+        }
+    }
+    super::smp::shootdown_range(0, virt as u64, pages as u64);
+    for at in (virt..end).step_by(PAGE_SIZE) {
+        if let Some((table, i)) = kernel_leaf(at) {
+            let e = read_entry(table, i);
+            if e != 0 {
+                write_entry(table, i, 0);
+                free(e & ADDR_MASK);
+            }
+        }
+    }
+}
+
 /// Walks the kernel page tables for one virtual address.
 pub(crate) fn query(virt: usize) -> Option<PageInfo> {
     let pml4 = KERNEL_PML4.load(Ordering::Acquire);

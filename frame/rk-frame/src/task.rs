@@ -196,10 +196,14 @@ struct PerCpu {
     current: SpinLock<Option<Arc<Task>>>,
     /// The task that runs when no other task can run.
     idle: Once<Arc<Task>>,
+    /// The scheduler asks the task on the CPU to call `Scheduler::should_yield` before the next
+    /// tick, as `TIF_NEED_RESCHED` of Linux.
+    resched: AtomicBool,
 }
 
-static CPUS: [PerCpu; MAX_CPUS] =
-    [const { PerCpu { current: SpinLock::new(None), idle: Once::new() } }; MAX_CPUS];
+static CPUS: [PerCpu; MAX_CPUS] = [const {
+    PerCpu { current: SpinLock::new(None), idle: Once::new(), resched: AtomicBool::new(false) }
+}; MAX_CPUS];
 
 fn this_cpu() -> &'static PerCpu {
     &CPUS[cpu::id()]
@@ -423,17 +427,31 @@ impl Task {
 /// the next tick.
 pub fn should_yield() -> bool {
     let now = crate::time::ticks();
+    let this = this_cpu();
     // The first check does not copy the `Arc` of the task.
-    let check = this_cpu().current.lock().as_ref().is_none_or(|current| {
-        current.yield_tick.swap(now, Ordering::Relaxed) != now
-            || current.resched.swap(false, Ordering::Relaxed)
-    });
+    let check = this.resched.swap(false, Ordering::Relaxed)
+        || this.current.lock().as_ref().is_none_or(|current| {
+            current.yield_tick.swap(now, Ordering::Relaxed) != now
+                || current.resched.swap(false, Ordering::Relaxed)
+        });
     if !check {
         return false;
     }
     let current = Task::current();
     let ran = now.wrapping_sub(current.start_tick.load(Ordering::Relaxed));
     scheduler().should_yield(&current, ran)
+}
+
+/// Asks the task on the CPU `id` to call `Scheduler::should_yield` before the next tick, as
+/// `resched_curr` of Linux. The scheduler calls it when a task that wakes takes the CPU from the
+/// task that runs. Another CPU gets an interrupt, so that a task in user mode comes back to the
+/// kernel at once.
+pub fn resched_cpu(id: usize) {
+    let Some(target) = CPUS.get(id) else { return };
+    target.resched.store(true, Ordering::Release);
+    if id != cpu::id() {
+        smp::reschedule(id);
+    }
 }
 
 /// Sets the share of the CPU of `task`. See `Scheduler::set_nice`.

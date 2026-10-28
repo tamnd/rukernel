@@ -132,13 +132,10 @@ fn alloc_large(layout: Layout) -> *mut u8 {
     start as *mut u8
 }
 
-/// Removes the first `pages` pages at `start` and gives their frames back.
+/// Removes the first `pages` pages at `start` and gives their frames back. The other CPUs drop
+/// the TLB entries of the range in one request, not one for each page.
 fn unmap_large(start: usize, pages: usize) {
-    for i in 0..pages {
-        if let Some(phys) = paging::unmap_page(start + i * PAGE_SIZE) {
-            free_frame_phys(phys);
-        }
-    }
+    paging::unmap_pages(start, pages, &mut free_frame_phys);
 }
 
 /// The global allocator of the kernel.

@@ -10,6 +10,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLPRI, POLLRDNORM};
 use rk_frame::console::{self, LogRecord};
@@ -32,8 +33,26 @@ const DEFAULT_LEVEL: u32 = 4;
 const LOG_USER: u32 = 1;
 
 /// The readers and the waits of `poll` that wait for a new record. A write to `/dev/kmsg` wakes
-/// them. The text of `print!` cannot wake them, so a reader also looks at the log at each tick.
+/// them, and `wake_readers` wakes them after a record of the kernel. A reader also looks at the
+/// log at each tick, so that a signal stops its wait.
 static WAIT: WaitQueue = WaitQueue::new();
+
+/// The sequence number of the next record of the log when `wake_readers` last looked.
+static WOKEN: AtomicU64 = AtomicU64::new(0);
+
+/// Wakes the readers and the waits of `poll` if the kernel log has a new record, as
+/// `wake_up_klogd` of Linux. The code that prints a record can hold any lock, so it cannot wake
+/// them. The bottom half calls this function after the interrupts, as the `irq_work` of Linux.
+#[cfg_attr(
+    not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
+fn wake_readers() {
+    let next = console::log_next_seq();
+    if WOKEN.swap(next, Ordering::Relaxed) != next {
+        WAIT.wake_all();
+    }
+}
 
 /// Gives the facility and the level of a write, and the text of the record, as `devkmsg_write`.
 /// The text stops at a null byte, as the `%s` of Linux.
@@ -190,6 +209,9 @@ impl CharDevice for Kmsg {
 /// Adds `/dev/kmsg` to the table of character devices.
 pub(crate) fn init() {
     device::register_char(KMSG_RDEV, Arc::new(Kmsg));
+    WOKEN.store(console::log_next_seq(), Ordering::Relaxed);
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    rk_frame::task::add_bottom_half(wake_readers);
 }
 
 #[cfg(test)]
@@ -204,6 +226,15 @@ mod tests {
         assert_eq!(parse(b"<>empty"), (8, &b"empty"[..]));
         assert_eq!(parse(b"<4 no"), (12, &b"<4 no"[..]));
         assert_eq!(parse(b"text\0more"), (12, &b"text"[..]));
+    }
+
+    #[test]
+    fn a_kernel_record_wakes_the_readers() {
+        wake_readers();
+        let before = WOKEN.load(Ordering::Relaxed);
+        console::log_emit(14, b"a record of the kernel");
+        wake_readers();
+        assert!(WOKEN.load(Ordering::Relaxed) > before);
     }
 
     #[test]

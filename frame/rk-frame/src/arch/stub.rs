@@ -124,6 +124,8 @@ pub(crate) mod paging {
         None
     }
 
+    pub(crate) fn unmap_pages(_virt: usize, _pages: usize, _free: &mut dyn FnMut(u64)) {}
+
     pub(crate) fn query(_virt: usize) -> Option<PageInfo> {
         None
     }

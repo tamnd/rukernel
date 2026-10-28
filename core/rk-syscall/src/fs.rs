@@ -350,7 +350,7 @@ pub(crate) fn preadv2(
 ) -> SysResult {
     // The checks of `do_preadv`, `vfs_readv` and `kiocb_set_rw_flags` of Linux, in its order.
     if offset as i64 == -1 {
-        check_rw_flags(flags, false)?;
+        check_rw_flags(&*cx.file(fd)?, flags, false)?;
         return readv_with(cx, fd, iov, count, flags & rwf::NOWAIT != 0);
     }
     if (offset as i64) < 0 {
@@ -360,7 +360,7 @@ pub(crate) fn preadv2(
     if !file.ops().seekable() {
         return Err(Errno::ESPIPE);
     }
-    check_rw_flags(flags, false)?;
+    check_rw_flags(&file, flags, false)?;
     let nowait = flags & rwf::NOWAIT != 0;
     let read_at = |at: u64, b: &mut [u8]| {
         if nowait {
@@ -404,7 +404,7 @@ pub(crate) fn pwritev2(
     }
     let file = cx.file(fd)?;
     let done = if offset as i64 == -1 {
-        check_rw_flags(flags, true)?;
+        check_rw_flags(&file, flags, true)?;
         writev(cx, fd, iov, count)?
     } else {
         if !file.ops().seekable() {
@@ -413,7 +413,7 @@ pub(crate) fn pwritev2(
         if !file.flags().writable() {
             return Err(Errno::EBADF);
         }
-        check_rw_flags(flags, true)?;
+        check_rw_flags(&file, flags, true)?;
         let mut offset = offset;
         // `RWF_NOAPPEND` cancels the `O_APPEND` of the file for this write.
         let append = file.flags().append() && flags & rwf::NOAPPEND == 0;
@@ -449,10 +449,13 @@ pub(crate) fn pwritev2(
     write_sync(&file, Ok(done))
 }
 
-/// Checks the flags of `preadv2` or `pwritev2`, as `kiocb_set_rw_flags` of Linux. The file
-/// systems of rukernel have no atomic writes and no uncached I/O.
-fn check_rw_flags(flags: u64, write: bool) -> Result<(), Errno> {
+/// Checks the flags of `preadv2` or `pwritev2` for `file`, as `kiocb_set_rw_flags` of Linux. The
+/// file systems of rukernel have no atomic writes and no uncached I/O.
+fn check_rw_flags(file: &File, flags: u64, write: bool) -> Result<(), Errno> {
     if flags & !rwf::KNOWN != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if flags & rwf::NOWAIT != 0 && !takes_nowait(file) {
         return Err(Errno::EOPNOTSUPP);
     }
     if flags & rwf::ATOMIC != 0 {
@@ -462,6 +465,16 @@ fn check_rw_flags(flags: u64, write: bool) -> Result<(), Errno> {
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(())
+}
+
+/// Tells if `file` takes `RWF_NOWAIT`, as the `FMODE_NOWAIT` of Linux. `shmem_file_open` of Linux
+/// does not set it, so a regular file of tmpfs does not take it. The test preadv203 of LTP then
+/// skips tmpfs, before it writes 124 MB into a tmpfs of 32 MB.
+fn takes_nowait(file: &File) -> bool {
+    file.inode().is_none_or(|inode| {
+        fs_magic(Some(inode)) != TMPFS_MAGIC as u64
+            || inode.metadata().file_type() != Some(rk_vfs::FileType::Regular)
+    })
 }
 
 pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {

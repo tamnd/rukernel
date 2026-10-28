@@ -12,12 +12,13 @@ ksm06_1	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_acr
 ksm06_2	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 asapi_01	The test wants getprotobyname("hopopt") to give 0. The LTP build links musl, and the protocol table of musl is built in and has "ip" for 0, so this check fails on Linux with musl too. The other checks of asapi_01 pass.
 fork13	The test runs for 600 s (.runtime = 600), and it forks until the time ends. The runner limit is 240 s, so the runner stops it. It is not a hang: the after kernel did 146018 forks in the time.
+fork14	The test maps 1 GiB 16384 times. With 1 GiB of memory or less, the overcommit check refuses each map, as on Linux, and the test gives TCONF. Before, the maps were allowed and the test did not stop in the time limit.
 hackbench01	The test sends 20 M socket messages (50 groups x 20 senders x 20 receivers x 1000 messages). Under QEMU without KVM this takes more than the time limit. A smaller run (hackbench 5 process 100) passes.
 hackbench02	The test sends about 8 M socket messages. Under QEMU without KVM this takes more than the time limit. A smaller run passes.
 shm_test01	The test calls sched_yield for each byte of a map of up to 4 MB, about 40 M system calls. Under QEMU without KVM this takes more than the time limit. shm_test -l 1 -t 2 also takes more than 240 s.
-starvation	The test calibrates its runtime from the speed of the machine. Under QEMU without KVM it asks for about 9 min, more than the 240 s limit of the runner. starvation -l 20000 passes.
-preadv203	On ext2 the test passes: RWF_NOWAIT gives EAGAIN when a page is not in the cache. On tmpfs the test fails, because tmpfs pages are always in memory and a read never gives EAGAIN.
-preadv203_64	The same as preadv203: ext2 passes, tmpfs fails, because tmpfs pages are always in memory.
+starvation	The test calibrates its runtime from the speed of the machine. Under QEMU without KVM it asks for about 6 to 9 min, more than the 240 s limit of the runner. Before #408 the woken thread did not get the CPU in time, and the test did not stop in its own time limit (TBROK). With the EEVDF wakeup preemption of #408, the test passes in about 7 min with --timeout 900.
+preadv203	Since #408, RWF_NOWAIT on tmpfs gives EOPNOTSUPP, as on Linux, and the test gives TCONF on tmpfs before its writes. On ext2 the test passes when a read with RWF_NOWAIT finds a page that is not in the cache and gets EAGAIN. In some runs no read gets EAGAIN, and the test fails.
+preadv203_64	The same as preadv203: TCONF on tmpfs, and ext2 passes when a read gets EAGAIN.
 mmapstress02	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress03	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.

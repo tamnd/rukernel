@@ -394,3 +394,50 @@ fn the_periodic_balance_evens_out_the_queues() {
     assert_eq!(nr.iter().sum::<usize>(), 12);
     assert!(nr.iter().all(|&n| n == 3), "{nr:?}");
 }
+
+#[test]
+fn a_task_that_wakes_runs_when_the_current_task_reaches_parity() {
+    // The current task ran alone, so it is at the average and keeps the CPU to the end of its
+    // slice: a task that wakes with no lag does not stop it.
+    let mut q = Eevdf::new();
+    let curr = entity(10_000_000, 10_000_000 + BASE_SLICE);
+    let mut woken = Entity { lag: 0, ..Entity::default() };
+    q.place(&mut woken, Some(&curr), false);
+    q.push('w', woken);
+    assert!(!q.wakeup_preempt(&curr, &woken));
+    // A task that slept with lag is before the average, so the current task is not eligible
+    // now and the task that wakes takes the CPU.
+    let mut q = Eevdf::new();
+    let mut woken = Entity { lag: 1_000_000, ..Entity::default() };
+    q.place(&mut woken, Some(&curr), false);
+    q.push('w', woken);
+    assert!(q.wakeup_preempt(&curr, &woken));
+}
+
+#[test]
+fn a_task_that_wakes_waits_when_it_is_not_eligible() {
+    // The task that wakes ran more than the average before it slept, so it waits, also when the
+    // current task is past the average because a heavy task waits in the queue.
+    let mut q = Eevdf::new();
+    q.push('a', Entity { weight: 10 * NICE_0_WEIGHT, ..entity(0, BASE_SLICE) });
+    let curr = entity(2_000_000, 2_000_000 + BASE_SLICE);
+    let mut woken = Entity { lag: -3_000_000, ..Entity::default() };
+    q.place(&mut woken, Some(&curr), false);
+    q.push('w', woken);
+    assert!(q.avg_vruntime(Some(&curr)) < curr.vruntime);
+    assert!(!q.wakeup_preempt(&curr, &woken));
+}
+
+#[test]
+fn a_task_that_wakes_runs_when_the_current_task_used_its_slice() {
+    let mut q = Eevdf::new();
+    let curr = entity(BASE_SLICE, BASE_SLICE);
+    let mut woken = Entity { lag: 0, ..Entity::default() };
+    q.place(&mut woken, Some(&curr), false);
+    // The current task is at the average and its deadline is over, so it has no protection, but
+    // its deadline is earlier than the deadline of the task that wakes.
+    q.push('w', woken);
+    assert!(!q.wakeup_preempt(&curr, &woken));
+    let early = Entity { deadline: BASE_SLICE - 1, ..woken };
+    assert!(q.wakeup_preempt(&curr, &early));
+}

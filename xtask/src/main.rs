@@ -1558,7 +1558,9 @@ fn blk_disk_has_note(path: &Path) -> Result<bool> {
 ///
 /// The kernel has one lock, so more CPUs make it slower on a host with few free CPUs. On a host
 /// with 6 CPUs and a load of 7 to 10, the `smp` test took 322 s with 8 CPUs and 112 s with 4
-/// CPUs (#396). With 4 CPUs, the test still runs tasks on several CPUs at the same time.
+/// CPUs (#396). After the wakeup preemption of #408, the test took 267 s with 8 CPUs and 219 s with
+/// 4 CPUs on the same host, so 8 CPUs are still slower. With 4 CPUs, the test still runs tasks on
+/// several CPUs at the same time.
 const SMP_CPUS: &str = "4";
 
 /// The QEMU command for the x86-64 kernel with the initramfs `initrd`. The machine has one CPU, or

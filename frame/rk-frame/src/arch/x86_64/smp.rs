@@ -10,6 +10,7 @@
 //! a CPU that waits for an interrupt.
 
 use super::{apic, cpu, paging};
+use crate::addr::PAGE_SIZE;
 use crate::sync::SpinLock;
 use alloc::alloc::{Layout, alloc};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -49,6 +50,8 @@ static FLUSH: SpinLock<()> = SpinLock::new(());
 static FLUSH_ROOT: AtomicU64 = AtomicU64::new(0);
 /// The page of the request, or `LEAVE`.
 static FLUSH_ADDR: AtomicU64 = AtomicU64::new(0);
+/// The number of pages from `FLUSH_ADDR` that the request drops.
+static FLUSH_PAGES: AtomicU64 = AtomicU64::new(1);
 /// The CPUs that did not do the request yet.
 static PENDING: AtomicU64 = AtomicU64::new(0);
 
@@ -57,6 +60,14 @@ static PENDING: AtomicU64 = AtomicU64::new(0);
 /// each CPU that uses `root` to load the kernel page table. The function returns when each of
 /// these CPUs did it.
 pub(crate) fn shootdown(root: u64, addr: u64) {
+    shootdown_range(root, addr, 1);
+}
+
+/// Tells each other CPU that uses the address space `root` to drop the TLB entries of `pages`
+/// pages from `addr`, with one interrupt for the range, as `flush_tlb_kernel_range` of Linux. A
+/// special `addr` such as `LEAVE` does its request one time. The function returns when each of
+/// these CPUs did it.
+pub(crate) fn shootdown_range(root: u64, addr: u64, pages: u64) {
     let me = cpu::id();
     let mask = (0..cpu::count())
         .filter(|&c| c != me && (root == 0 || paging::active_on(c) == root))
@@ -73,6 +84,7 @@ pub(crate) fn shootdown(root: u64, addr: u64) {
     };
     FLUSH_ROOT.store(root, Ordering::Relaxed);
     FLUSH_ADDR.store(addr, Ordering::Relaxed);
+    FLUSH_PAGES.store(pages, Ordering::Relaxed);
     PENDING.store(mask, Ordering::Release);
     for c in (0..cpu::count()).filter(|c| mask & 1 << c != 0) {
         apic::send_ipi(cpu::apic_id(c), u32::from(CALL_VECTOR));
@@ -98,7 +110,10 @@ pub(crate) fn poll() {
     } else if addr == FLUSH_ALL {
         paging::flush_user_all();
     } else {
-        paging::flush(addr as usize);
+        let pages = FLUSH_PAGES.load(Ordering::Relaxed);
+        for i in 0..pages {
+            paging::flush((addr + i * PAGE_SIZE as u64) as usize);
+        }
     }
     PENDING.fetch_and(!bit, Ordering::Release);
 }
