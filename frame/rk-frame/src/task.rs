@@ -208,21 +208,61 @@ fn this_cpu() -> &'static PerCpu {
 /// The kernel lock. The boot CPU holds it from the start.
 static KERNEL_LOCK: AtomicBool = AtomicBool::new(true);
 
+/// The CPUs that wait for an interrupt in `kernel_lock`.
+static LOCK_WAITERS: AtomicU64 = AtomicU64::new(0);
+
+/// The tries of `kernel_lock` before the CPU waits for an interrupt. A short spin takes a lock
+/// that is free again soon without an interrupt. On TCG with 4 CPUs on a busy host, hackbench took
+/// 235 s with a spin only, 123 s with 4096 tries and 70 s with 64 tries (#396).
+const LOCK_SPINS: u32 = 1 << 6;
+
 /// Takes the kernel lock. While the CPU waits, it does the TLB requests of the other CPUs, because
 /// the CPU that holds the lock can wait for them.
+///
+/// After `LOCK_SPINS` tries, the CPU waits for an interrupt, and `kernel_unlock` sends one. In a
+/// virtual machine, a spin uses a CPU of the host. When the host has fewer free CPUs than the
+/// machine, for example on a busy host, the spin of a CPU can stop the host from running the CPU
+/// that holds the lock, and the kernel becomes very slow. The callers hold no lock and no state,
+/// as the idle loop, so the interrupt handlers can run during the wait.
 pub(crate) fn kernel_lock() {
+    let mut tries = 0;
     while KERNEL_LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         smp::poll();
-        core::hint::spin_loop();
+        if tries < LOCK_SPINS {
+            tries += 1;
+            core::hint::spin_loop();
+            continue;
+        }
+        let bit = 1u64 << cpu::id();
+        // The order of the bit and the test is the order of the release and the test of
+        // `kernel_unlock`, so one of the two CPUs sees the other.
+        LOCK_WAITERS.fetch_or(bit, Ordering::SeqCst);
+        if KERNEL_LOCK.load(Ordering::SeqCst) {
+            let enabled = crate::irq::enabled();
+            // An interrupt that comes before `wait` stays pending, and `wait` takes it.
+            crate::irq::wait();
+            if !enabled {
+                crate::irq::disable();
+            }
+        }
+        LOCK_WAITERS.fetch_and(!bit, Ordering::SeqCst);
     }
 }
 
-/// Releases the kernel lock.
+/// Releases the kernel lock, and wakes a CPU that waits for it.
 pub(crate) fn kernel_unlock() {
-    KERNEL_LOCK.store(false, Ordering::Release);
+    KERNEL_LOCK.store(false, Ordering::SeqCst);
+    let waiters = LOCK_WAITERS.load(Ordering::SeqCst);
+    if waiters != 0 {
+        // Each release wakes the next CPU after this one, so each CPU gets its turn. The timer
+        // interrupt also wakes each CPU at each tick.
+        let me = cpu::id() as u32;
+        let next = waiters.rotate_right(me + 1).trailing_zeros();
+        smp::reschedule(((me + 1 + next) % 64) as usize);
+    }
 }
 
 /// The CPUs that wait for an interrupt in their idle task.

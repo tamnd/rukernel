@@ -241,14 +241,24 @@ impl UserContext {
     /// then have the values of the user code at that time. After a system call, the instruction
     /// pointer is after the `syscall` instruction.
     pub fn execute(&mut self) -> ReturnReason {
+        self.execute_timed().0
+    }
+
+    /// Runs the user code as `execute` does, and also gives the nanoseconds in user mode. The
+    /// time does not include the wait for the kernel lock and the bottom half after the return,
+    /// because they are kernel work: on a machine with many CPUs, the wait for the lock can be
+    /// long.
+    pub fn execute_timed(&mut self) -> (ReturnReason, u64) {
         // User code runs without the kernel lock, so the other CPUs can run kernel code.
         crate::task::kernel_unlock();
+        let start = crate::time::nanos();
         #[cfg(target_arch = "x86_64")]
         let reason = user::enter(&mut self.regs, &mut self.fpu, self.tls, self.no_tsc);
         #[cfg(target_arch = "aarch64")]
         let reason = user::enter(&mut self.regs, &mut self.fpu, &mut self.tls);
+        let ns = crate::time::nanos().saturating_sub(start);
         crate::task::kernel_lock();
-        match reason {
+        let reason = match reason {
             user::Return::Syscall => ReturnReason::Syscall,
             user::Return::Interrupt => {
                 crate::task::run_bottom_half();
@@ -257,7 +267,8 @@ impl UserContext {
             user::Return::Exception { vector, error, cr2 } => {
                 ReturnReason::Exception(UserException { vector, error, addr: cr2 })
             }
-        }
+        };
+        (reason, ns)
     }
 
     /// The system call number: rax on x86-64, x8 on arm64.

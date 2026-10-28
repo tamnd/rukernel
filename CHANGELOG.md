@@ -35,6 +35,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `open` for write and `truncate` of a program that runs give `ETXTBSY`, and `execve` of a file that is open for write gives `ETXTBSY`, as `deny_write_access` of Linux (#385).
 - `connect` with `AF_UNSPEC` on a TCP socket frees the port and the address that `bind` did not set, as `tcp_disconnect` of Linux (#385).
 - `mincore` marks a page of a shared map as resident when the page is in the page cache, also when the process did not touch it (#385).
+- The user CPU time of a thread does not count the wait for the kernel lock and the bottom half of an interrupt, and one run of user code counts at most one tick, as the tick sampling of Linux (#396). Before, the time when the host did not run the virtual CPU was user time, so on a busy host a sleep added CPU time and `ITIMER_VIRTUAL` fired too early.
+- A CPU that waits for the kernel lock spins 64 times and then waits for an interrupt, and the CPU that releases the lock wakes it (#396). Before, the waiting CPUs used the CPUs of the host, and the CPU that held the lock ran slowly. hackbench on 4 CPUs on a busy TCG host goes from 235 s to 70 s.
+- A read of a Unix socket wakes the writers only when at most a quarter of the send buffer is in use, as `unix_write_space` of Linux (#396). Before, each read woke each writer, and hackbench on 2 CPUs took 95 s, now 36 s.
+- The `smp` boot test runs with 4 CPUs, not 8, and the boot tests of init have a limit of 300 s, not 120 s (#396). The `smp` test has a limit of 600 s. On a busy host, the `smp` test took 322 s with 8 CPUs.
+- The init check of a file lock of another process waits for the child through a pipe, not for a fixed time, so it passes on a busy host (#396).
 
 ## [0.4.6] - 2026-10-28
 
