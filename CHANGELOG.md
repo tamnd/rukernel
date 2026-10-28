@@ -2,6 +2,18 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- PCI on arm64 through the generic ECAM host of the device tree (#380). The frame assigns the memory BARs from the windows of `ranges`, as `pci_assign_unassigned_resources` of Linux, and finds the INTx line of each device in `interrupt-map`. virtio-blk and virtio-net work on virtio-pci on QEMU `virt`, and the arm64 `blk` and `inet` boot tests also run with virtio-pci.
+- Device interrupts on arm64 (#380). The GIC turns on the SPI of each virtio device, from the device tree or from `interrupt-map`. A request of virtio-blk waits with `wfi` for the interrupt, and the interrupt of virtio-net wakes an idle CPU.
+- tools/busybox/build.sh builds a static arm64 BusyBox in an arm64 Alpine container, for `RK_BUSYBOX_AARCH64` and the arm64 `busybox` boot test (#380).
+
+### Fixed
+
+- On arm64, `mem::copy` and `mem::zero` move 16 bytes with each instruction, not 1 byte (#380). They copy user pages and clear frames, so the arm64 boot tests run faster.
+
 ## [0.4.6] - 2026-10-28
 
 ### Added

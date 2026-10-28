@@ -3,8 +3,11 @@
 //! The device has one receive queue and one transmit queue. Each buffer is one frame with the
 //! header of virtio-net and then the Ethernet frame. The driver keeps all of the receive buffers
 //! in the receive queue, and gives each buffer back to the device after it copies the frame out.
-//! The driver does not use interrupts: `poll` reads the used ring of the receive queue, and
-//! `transmit` takes back the sent buffers from the used ring of the transmit queue.
+//! `poll` reads the used ring of the receive queue, and `transmit` takes back the sent buffers from
+//! the used ring of the transmit queue. The network layer calls `poll` from a bottom half. The
+//! interrupt of the device only wakes an idle CPU, so the bottom half runs soon after a frame
+//! comes. `poll` tells the device that the driver saw the interrupt before it reads the ring, so a
+//! frame that comes later raises the line again.
 
 use crate::net_hdr::{self, NetHdr};
 use crate::queue::{Buffer, Queue};
@@ -154,6 +157,7 @@ impl NetDriver for VirtioNet {
     }
 
     fn poll(&self, budget: usize, deliver: &mut dyn FnMut(NetBuf)) -> usize {
+        self.t.handle_interrupt();
         let mut frames = Vec::new();
         {
             let mut rx = self.rx.lock();

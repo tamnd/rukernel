@@ -1,16 +1,18 @@
 //! The virtio drivers of rukernel.
 //!
-//! On x86-64 a virtio device is a PCI function of the vendor 0x1AF4. The driver uses the modern
-//! PCI transport of virtio 1.0: the capabilities of the function give the BAR ranges of the common
-//! configuration, the notification registers and the configuration of the device. On arm64 the
-//! device tree gives the virtio MMIO devices, and the driver uses the modern MMIO transport. Each
-//! queue is a split virtqueue in three frames: the descriptor table, the available ring and the
-//! used ring.
+//! A virtio device on PCI is a function of the vendor 0x1AF4. The driver uses the modern PCI
+//! transport of virtio 1.0: the capabilities of the function give the BAR ranges of the common
+//! configuration, the notification registers, the ISR status and the configuration of the device.
+//! On arm64 the device tree also gives the virtio MMIO devices, and the driver uses the modern MMIO
+//! transport for them. Each queue is a split virtqueue in three frames: the descriptor table, the
+//! available ring and the used ring.
 //!
-//! The drivers do not use interrupts yet. A request of virtio-blk waits for the device in a loop
-//! that reads the used ring. The kernel does not preempt a task in the kernel, so the queue of a
-//! disk does one request at a time under a lock. virtio-net keeps many buffers in its queues, and
-//! the network device layer polls the device for received frames.
+//! A request of virtio-blk waits for the device in a loop that reads the used ring. The kernel
+//! does not preempt a task in the kernel, so the queue of a disk does one request at a time under
+//! a lock. virtio-net keeps many buffers in its queues, and the network device layer polls the
+//! device for received frames. On arm64 the interrupt of the device (an SPI of the GIC) wakes the
+//! wait of virtio-blk and an idle CPU. x86-64 has no device interrupts yet, so there the drivers
+//! only poll.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -36,7 +38,7 @@ mod blk;
 mod mmio;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod net;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod pci;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod queue;
@@ -88,40 +90,49 @@ impl Probe {
     }
 }
 
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+impl Probe {
+    /// Starts a driver for each virtio device on the PCI bus. `bus` is the number of the first
+    /// device among all virtio devices, and the call gives the number after the last device.
+    fn pci(&mut self, mut bus: u32) -> u32 {
+        let virtio = rk_frame::pci::devices().iter().filter(|d| d.vendor_id() == VIRTIO_VENDOR);
+        for dev in virtio {
+            let this = bus;
+            bus += 1;
+            let Some(id) = pci::device_type(dev) else { continue };
+            if !matches!(id, DEVICE_BLK | DEVICE_NET) {
+                continue;
+            }
+            if let Some(t) = pci::PciTransport::new(dev) {
+                let place = format_args!("PCI {:?}", dev.address());
+                self.add(id, transport::Transport::Pci(t), this, place);
+            }
+        }
+        bus
+    }
+}
+
 /// Finds the virtio devices on the PCI bus and starts a driver for each device that rukernel
 /// knows. A disk gets the name `vda`, `vdb` and so on, in the order of the bus. A network device
 /// gets the name `eth0`, `eth1` and so on from the network device layer, so the kernel calls
 /// `rk_net::dev::init` first to give the loopback device the first index.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn init() {
-    let mut probe = Probe::default();
-    let virtio = rk_frame::pci::devices().iter().filter(|d| d.vendor_id() == VIRTIO_VENDOR);
-    for (bus, dev) in (0u32..).zip(virtio) {
-        let Some(id) = pci::device_type(dev) else { continue };
-        if !matches!(id, DEVICE_BLK | DEVICE_NET) {
-            continue;
-        }
-        if let Some(t) = pci::PciTransport::new(dev) {
-            probe.add(
-                id,
-                transport::Transport::Pci(t),
-                bus,
-                format_args!("PCI {:?}", dev.address()),
-            );
-        }
-    }
+    Probe::default().pci(0);
 }
 
 /// Finds the virtio MMIO devices of the device tree and starts a driver for each device that
 /// rukernel knows, as `init` on x86-64 does for the PCI bus. The devices are in the order of the
-/// device tree, as Linux finds them.
+/// device tree, as Linux finds them. Then the call does the same for the virtio devices on the PCI
+/// bus of the ECAM host, and the names continue after the MMIO devices.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub fn init() {
     let mut probe = Probe::default();
     let mut bus = 0u32;
     for dev in rk_frame::iomem::virtio_mmio_devices() {
-        let Some((id, t)) = dev.map().and_then(|regs| mmio::MmioTransport::new(regs, dev.phys()))
-        else {
+        let Some(regs) = dev.map() else { continue };
+        // A transport without a device does not get its line.
+        let Some((id, t)) = mmio::MmioTransport::new(regs, dev.phys(), || dev.irq()) else {
             continue;
         };
         if matches!(id, DEVICE_BLK | DEVICE_NET) {
@@ -134,4 +145,5 @@ pub fn init() {
         }
         bus += 1;
     }
+    probe.pci(bus);
 }

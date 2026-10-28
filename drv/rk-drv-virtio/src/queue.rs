@@ -1,5 +1,6 @@
-//! A split virtqueue. `run` does one request at a time and waits for it. The other functions
-//! let a driver keep many buffers in the queue and take them back without a wait.
+//! A split virtqueue. `run` does one request at a time and waits for it, with the interrupt of the
+//! device when it has one. The other functions let a driver keep many buffers in the queue and take
+//! them back without a wait.
 
 use crate::ring;
 use crate::transport::{QueueAddrs, Transport};
@@ -120,9 +121,15 @@ impl Queue {
         self.kick(t);
         loop {
             if let Some((_, len)) = self.pop_used() {
+                // The device can raise the line for this request after the last test.
+                t.handle_interrupt();
                 return len;
             }
-            core::hint::spin_loop();
+            // The line wakes the wait. When the line came, the driver reads the ring again
+            // before it waits.
+            if !t.handle_interrupt() {
+                t.wait();
+            }
         }
     }
 }

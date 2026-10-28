@@ -3,8 +3,9 @@
 //! The boot loader of arm64 gives the device tree, per spec/15-boot-and-platform.md section 15.4.
 //! The boot path reads the memory, the reserved memory, the command line, the initramfs, the PSCI
 //! method, the CPUs and the addresses of the devices that rk-frame drives from it: the PL011 UART,
-//! the GICv2, the interrupt of the virtual timer, the PL031 RTC and the ECAM of a generic PCI host.
-//! It also keeps the virtio MMIO devices for the virtio drivers.
+//! the GICv2, the interrupt of the virtual timer, the PL031 RTC and the ECAM of a generic PCI host,
+//! with its memory windows and the interrupts of its INTx pins. It also keeps the virtio MMIO
+//! devices and their interrupts for the virtio drivers.
 //! The full binding set comes later.
 
 use crate::addr::PhysAddr;
@@ -32,6 +33,31 @@ pub(crate) const MAX_CPUS: usize = 64;
 /// The most virtio MMIO devices that the boot path keeps. QEMU `virt` has 32.
 pub(crate) const MAX_VIRTIO_MMIO: usize = 32;
 
+/// The most entries of the `interrupt-map` of the PCI host that the boot path keeps. QEMU `virt`
+/// has 16: four pins of four slots.
+pub(crate) const MAX_PCI_INTX: usize = 32;
+
+/// An interrupt of the GIC: the interrupt number and the trigger.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Irq {
+    /// The interrupt number. An SPI starts at 32 and a PPI at 16.
+    pub(crate) intid: u32,
+    /// The interrupt is edge triggered. Else it is level triggered.
+    pub(crate) edge: bool,
+}
+
+/// One entry of the `interrupt-map` of the PCI host: the INTx pin of a slot and its interrupt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PciIntx {
+    /// The first cell of the PCI address of the slot, after the mask: the bus, the device and the
+    /// function.
+    pub(crate) addr: u32,
+    /// The pin: 1 to 4 for INTA to INTD.
+    pub(crate) pin: u32,
+    /// The interrupt of the pin.
+    pub(crate) irq: Irq,
+}
+
 /// What the boot path needs from the device tree, apart from the `BootInfo`. A device that the
 /// device tree does not give is `None`, and the caller uses the address of QEMU `virt` then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,14 +77,25 @@ pub(crate) struct Platform {
     pub(crate) rtc: Option<u64>,
     /// The physical address and the size of the ECAM of a generic PCI host.
     pub(crate) pci_ecam: Option<(u64, u64)>,
+    /// The 32 bit memory window of the PCI host, as the address and the size. The CPU and the PCI
+    /// bus see the window at the same address. A window at other addresses is not kept.
+    pub(crate) pci_mem: Option<(u64, u64)>,
+    /// The 64 bit memory window of the PCI host, as `pci_mem`.
+    pub(crate) pci_mem64: Option<(u64, u64)>,
+    /// The masks of the PCI address and of the pin for `pci_intx`.
+    pub(crate) pci_intx_mask: (u32, u32),
+    /// The interrupts of the INTx pins of the PCI host. The first `pci_intx_count` are valid.
+    pub(crate) pci_intx: [PciIntx; MAX_PCI_INTX],
+    /// The number of entries in `pci_intx`.
+    pub(crate) pci_intx_count: usize,
     /// The MPIDR affinity of each CPU, in the order of the device tree. The first `cpu_count` are
     /// valid.
     pub(crate) cpus: [u64; MAX_CPUS],
     /// The number of CPUs in `cpus`.
     pub(crate) cpu_count: usize,
-    /// The physical address and the size of each virtio MMIO device, in the order of the device
-    /// tree. The first `virtio_mmio_count` are valid.
-    pub(crate) virtio_mmio: [(u64, u64); MAX_VIRTIO_MMIO],
+    /// The physical address, the size and the interrupt of each virtio MMIO device, in the order
+    /// of the device tree. The first `virtio_mmio_count` are valid.
+    pub(crate) virtio_mmio: [(u64, u64, Option<Irq>); MAX_VIRTIO_MMIO],
     /// The number of devices in `virtio_mmio`.
     pub(crate) virtio_mmio_count: usize,
 }
@@ -73,9 +110,14 @@ impl Default for Platform {
             timer_intid: None,
             rtc: None,
             pci_ecam: None,
+            pci_mem: None,
+            pci_mem64: None,
+            pci_intx_mask: (0, 0),
+            pci_intx: [PciIntx::default(); MAX_PCI_INTX],
+            pci_intx_count: 0,
             cpus: [0; MAX_CPUS],
             cpu_count: 0,
-            virtio_mmio: [(0, 0); MAX_VIRTIO_MMIO],
+            virtio_mmio: [(0, 0, None); MAX_VIRTIO_MMIO],
             virtio_mmio_count: 0,
         }
     }
@@ -89,9 +131,29 @@ struct Node<'a> {
     reg: &'a [u8],
     interrupts: &'a [u8],
     status: &'a [u8],
+    ranges: &'a [u8],
+    interrupt_map: &'a [u8],
+    interrupt_map_mask: &'a [u8],
+    /// The `#address-cells`, `#size-cells` and `#interrupt-cells` of the children of the node.
+    address_cells: Option<u32>,
+    size_cells: Option<u32>,
+    interrupt_cells: Option<u32>,
 }
 
-impl Node<'_> {
+/// The parts of the device tree that the boot path reads after the walk, because they need the
+/// properties of a node that can come later.
+#[derive(Default)]
+struct Later<'a> {
+    /// The `interrupt-map` and `interrupt-map-mask` of the PCI host, and the cells of its PCI
+    /// addresses and of its interrupts.
+    pci_map: &'a [u8],
+    pci_map_mask: &'a [u8],
+    pci_cells: (u32, u32),
+    /// The `#address-cells` and `#interrupt-cells` of the GIC.
+    gic_cells: (u32, u32),
+}
+
+impl<'a> Node<'a> {
     /// Tells if `name` is one of the strings of the `compatible` property.
     fn is(&self, name: &str) -> bool {
         self.compatible.split(|&b| b == 0).any(|c| c == name.as_bytes())
@@ -117,7 +179,13 @@ impl Node<'_> {
     }
 
     /// Keeps the device of this node in `platform`, if rk-frame drives it.
-    fn finish(&self, platform: &mut Platform, addr_cells: u32, size_cells: u32) {
+    fn finish(
+        &self,
+        platform: &mut Platform,
+        later: &mut Later<'a>,
+        addr_cells: u32,
+        size_cells: u32,
+    ) {
         if self.name.is_empty() || !self.enabled() {
             return;
         }
@@ -128,19 +196,26 @@ impl Node<'_> {
             platform.rtc = first.map(|r| r.0);
         } else if self.is("virtio,mmio") {
             if let Some(r) = first.filter(|_| platform.virtio_mmio_count < MAX_VIRTIO_MMIO) {
-                platform.virtio_mmio[platform.virtio_mmio_count] = r;
+                platform.virtio_mmio[platform.virtio_mmio_count] =
+                    (r.0, r.1, gic_irq(self.interrupts, 0));
                 platform.virtio_mmio_count += 1;
             }
         } else if self.is("pci-host-ecam-generic") && platform.pci_ecam.is_none() {
             platform.pci_ecam = first;
+            self.pci_windows(platform, addr_cells);
+            later.pci_map = self.interrupt_map;
+            later.pci_map_mask = self.interrupt_map_mask;
+            later.pci_cells = (self.address_cells.unwrap_or(3), self.interrupt_cells.unwrap_or(1));
         } else if self.is("arm,gic-v3") {
             if let (Some(d), Some(r)) = (first, self.reg(1, addr_cells, size_cells)) {
                 platform.gic_v3 = Some((d.0, r.0, r.1));
             }
+            later.gic_cells = (self.address_cells.unwrap_or(0), self.interrupt_cells.unwrap_or(3));
         } else if self.is("arm,cortex-a15-gic") || self.is("arm,gic-400") {
             if let (Some(d), Some(c)) = (first, self.reg(1, addr_cells, size_cells)) {
                 platform.gic = Some((d.0, c.0));
             }
+            later.gic_cells = (self.address_cells.unwrap_or(0), self.interrupt_cells.unwrap_or(3));
         } else if self.is("arm,armv8-timer") || self.is("arm,armv7-timer") {
             // The interrupts are the secure physical, the physical, the virtual and the
             // hypervisor timers, with three cells each: the kind, the number and the flags. A
@@ -152,6 +227,78 @@ impl Node<'_> {
             }
         }
     }
+
+    /// Keeps the memory windows of the `ranges` of a PCI host. An entry has the PCI address in
+    /// `#address-cells` of the node (3), the CPU address in `parent_cells`, and the size in
+    /// `#size-cells` of the node (2). Bits 24 and 25 of the first cell give the space: 2 for 32
+    /// bit memory and 3 for 64 bit memory.
+    fn pci_windows(&self, platform: &mut Platform, parent_cells: u32) {
+        let (child, size) = (self.address_cells.unwrap_or(3), self.size_cells.unwrap_or(2));
+        if child != 3 {
+            return;
+        }
+        let stride = 4 * (child + parent_cells + size) as usize;
+        for at in (0..self.ranges.len()).step_by(stride.max(4)) {
+            let (Some(hi), Some(pci), Some(cpu), Some(len)) = (
+                be32(self.ranges, at),
+                cells(self.ranges, at + 4, 2),
+                cells(self.ranges, at + 12, parent_cells),
+                cells(self.ranges, at + 4 * (child + parent_cells) as usize, size),
+            ) else {
+                break;
+            };
+            if pci != cpu || len == 0 {
+                continue;
+            }
+            match hi >> 24 & 3 {
+                2 if platform.pci_mem.is_none() => platform.pci_mem = Some((cpu, len)),
+                3 if platform.pci_mem64.is_none() => platform.pci_mem64 = Some((cpu, len)),
+                _ => {}
+            }
+        }
+    }
+}
+
+impl Later<'_> {
+    /// Reads the `interrupt-map` of the PCI host into `platform`. An entry has the PCI address
+    /// and the pin, the phandle of the GIC, the address of the GIC in its `#address-cells`, and
+    /// the interrupt of the GIC in its `#interrupt-cells` (3). The boot path takes the GIC as the
+    /// parent of each entry, as on QEMU `virt`.
+    fn finish(&self, platform: &mut Platform) {
+        let (addr, intr) = self.pci_cells;
+        let (gic_addr, gic_intr) = self.gic_cells;
+        if addr != 3 || intr != 1 || gic_intr != 3 {
+            return;
+        }
+        platform.pci_intx_mask =
+            (be32(self.pci_map_mask, 0).unwrap_or(0), be32(self.pci_map_mask, 12).unwrap_or(0));
+        let stride = 4 * (addr + intr + 1 + gic_addr + gic_intr) as usize;
+        for at in (0..self.pci_map.len()).step_by(stride) {
+            if platform.pci_intx_count == MAX_PCI_INTX {
+                break;
+            }
+            let spec = at + 4 * (addr + intr + 1 + gic_addr) as usize;
+            let (Some(hi), Some(pin), Some(irq)) =
+                (be32(self.pci_map, at), be32(self.pci_map, at + 12), gic_irq(self.pci_map, spec))
+            else {
+                break;
+            };
+            platform.pci_intx[platform.pci_intx_count] = PciIntx { addr: hi, pin, irq };
+            platform.pci_intx_count += 1;
+        }
+    }
+}
+
+/// Reads the interrupt of three cells at `at` of `b`: the kind (0 for an SPI, 1 for a PPI), the
+/// number and the flags. Bits 0 to 3 of the flags are 1 or 2 for an edge, and 4 or 8 for a level.
+fn gic_irq(b: &[u8], at: usize) -> Option<Irq> {
+    let (kind, number, flags) = (be32(b, at)?, be32(b, at + 4)?, be32(b, at + 8)?);
+    let intid = match kind {
+        0 => number.checked_add(32)?,
+        1 => number.checked_add(16)?,
+        _ => return None,
+    };
+    Some(Irq { intid, edge: matches!(flags & 0xf, 1 | 2) })
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
@@ -286,9 +433,10 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
     // The properties of one node come together, before its children. So a node at depth 1 is
     // complete when a property of another node at depth 1 comes.
     let mut node = Node::default();
+    let mut later = Later::default();
     walk(structs, strings, |depth, name, prop, value| {
         if depth == 1 && !core::ptr::eq(name, node.name) {
-            node.finish(&mut platform, addr_cells, size_cells);
+            node.finish(&mut platform, &mut later, addr_cells, size_cells);
             node = Node { name, ..Node::default() };
         }
         match (depth, prop) {
@@ -296,6 +444,15 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
             (1, "reg") => node.reg = value,
             (1, "interrupts") => node.interrupts = value,
             (1, "status") => node.status = value,
+            (1, "ranges") => node.ranges = value,
+            (1, "interrupt-map") => node.interrupt_map = value,
+            (1, "interrupt-map-mask") => node.interrupt_map_mask = value,
+            (1, "#address-cells") => node.address_cells = be32(value, 0),
+            (1, "#size-cells") => node.size_cells = be32(value, 0),
+            (1, "#interrupt-cells") => node.interrupt_cells = be32(value, 0),
+            _ => {}
+        }
+        match (depth, prop) {
             (1, "#address-cells") if name == "cpus" => cpu_cells = be32(value, 0).unwrap_or(1),
             (2, "reg") if name.starts_with("cpu@") && platform.cpu_count < MAX_CPUS => {
                 if let Some(id) = cells(value, 0, cpu_cells) {
@@ -334,7 +491,8 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
             _ => {}
         }
     })?;
-    node.finish(&mut platform, addr_cells, size_cells);
+    node.finish(&mut platform, &mut later, addr_cells, size_cells);
+    later.finish(&mut platform);
     if let (Some(start), Some(end)) = (initrd_start, initrd_end) {
         info.set_initrd(PhysAddr::new(start), end.saturating_sub(start));
     }
@@ -510,7 +668,49 @@ mod tests {
         b.prop("reg", &be(&[0, 0x0900_0000, 0, 0x1000]));
         b.prop("compatible", b"arm,pl011\0arm,primecell\0");
         b.end();
+        // The PCI host comes before the GIC, as on QEMU `virt`, so its interrupt map is read
+        // after the walk.
+        b.begin("pcie@10000000");
+        b.prop("interrupt-map-mask", &be(&[0x1800, 0, 0, 7]));
+        b.prop(
+            "interrupt-map",
+            &be(&[0, 0, 0, 1, 0x8002, 0, 0, 0, 3, 4, 0x800, 0, 0, 1, 0x8002, 0, 0, 0, 4, 4]),
+        );
+        b.prop("#interrupt-cells", &be(&[1]));
+        b.prop(
+            "ranges",
+            &be(&[
+                0x100_0000,
+                0,
+                0,
+                0,
+                0x3eff_0000,
+                0,
+                0x1_0000,
+                0x200_0000,
+                0,
+                0x1000_0000,
+                0,
+                0x1000_0000,
+                0,
+                0x2eff_0000,
+                0x300_0000,
+                0x80,
+                0,
+                0x80,
+                0,
+                0x80,
+                0,
+            ]),
+        );
+        b.prop("reg", &be(&[0x40, 0x1000_0000, 0, 0x1000_0000]));
+        b.prop("#size-cells", &be(&[2]));
+        b.prop("#address-cells", &be(&[3]));
+        b.prop("compatible", b"pci-host-ecam-generic\0");
+        b.end();
         b.begin("intc@8000000");
+        b.prop("#address-cells", &be(&[2]));
+        b.prop("#interrupt-cells", &be(&[3]));
         b.prop("compatible", b"arm,cortex-a15-gic\0");
         b.prop("reg", &be(&[0, 0x0800_0000, 0, 0x1_0000, 0, 0x0801_0000, 0, 0x1_0000]));
         b.begin("v2m@8020000");
@@ -533,10 +733,6 @@ mod tests {
             b.prop("reg", &be(&[0, at, 0, 0x200]));
             b.end();
         }
-        b.begin("pcie@10000000");
-        b.prop("compatible", b"pci-host-ecam-generic\0");
-        b.prop("reg", &be(&[0x40, 0x1000_0000, 0, 0x1000_0000]));
-        b.end();
         b.end();
         let blob = b.finish(&[]);
         let mut info = BootInfo::new("test");
@@ -548,9 +744,21 @@ mod tests {
         assert_eq!(p.rtc, Some(0x0901_0000));
         assert_eq!(p.pci_ecam, Some((0x40_1000_0000, 0x1000_0000)));
         assert_eq!(&p.cpus[..p.cpu_count], &[0, 1]);
+        let irq = Some(Irq { intid: 48, edge: true });
         assert_eq!(
             &p.virtio_mmio[..p.virtio_mmio_count],
-            &[(0x0a00_0200, 0x200), (0x0a00_0000, 0x200)]
+            &[(0x0a00_0200, 0x200, irq), (0x0a00_0000, 0x200, irq)]
+        );
+        assert_eq!(p.pci_mem, Some((0x1000_0000, 0x2eff_0000)));
+        assert_eq!(p.pci_mem64, Some((0x80_0000_0000, 0x80_0000_0000)));
+        assert_eq!(p.pci_intx_mask, (0x1800, 7));
+        let level = |intid| Irq { intid, edge: false };
+        assert_eq!(
+            &p.pci_intx[..p.pci_intx_count],
+            &[
+                PciIntx { addr: 0, pin: 1, irq: level(35) },
+                PciIntx { addr: 0x800, pin: 1, irq: level(36) }
+            ]
         );
     }
 

@@ -1,12 +1,13 @@
 //! The modern virtio PCI transport, from section 4.1 of the virtio 1.2 specification.
 
 use crate::transport::{QueueAddrs, status};
-use rk_frame::pci::{IoMem, PciDevice};
+use rk_frame::pci::{IoMem, Line, PciDevice};
 
 /// The capability ID of the vendor specific capabilities that virtio uses.
 const CAP_VENDOR: u8 = 0x09;
 const CFG_COMMON: u8 = 1;
 const CFG_NOTIFY: u8 = 2;
+const CFG_ISR: u8 = 3;
 const CFG_DEVICE: u8 = 4;
 
 /// The registers of the common configuration.
@@ -64,13 +65,15 @@ pub(crate) struct PciTransport {
     notify: IoMem,
     notify_multiplier: u32,
     device: IoMem,
+    /// The ISR status byte and the INTx line, when the device has both.
+    isr: Option<(IoMem, Line)>,
 }
 
 impl PciTransport {
     /// Finds the configuration structures of the device, maps them and resets the device. Gives
     /// `None` if the device does not have the modern transport.
     pub(crate) fn new(dev: &PciDevice) -> Option<Self> {
-        let (mut common, mut notify, mut device) = (None, None, None);
+        let (mut common, mut notify, mut device, mut isr) = (None, None, None, None);
         let mut notify_multiplier = 0;
         for (id, at) in dev.capabilities() {
             if id != CAP_VENDOR {
@@ -90,6 +93,7 @@ impl PciTransport {
                     notify_multiplier = dev.read_config(at + 16);
                 }
                 CFG_DEVICE if device.is_none() => device = Some(place),
+                CFG_ISR if isr.is_none() => isr = Some(place),
                 _ => {}
             }
         }
@@ -99,7 +103,11 @@ impl PciTransport {
             return None;
         }
         dev.enable();
-        let t = Self { common, notify: map(notify?)?, notify_multiplier, device: map(device?)? };
+        // The driver does not use MSI-X, so the device raises its INTx line. A read of the ISR
+        // status byte lowers the line.
+        let isr = isr.and_then(map).zip(dev.irq());
+        let (notify, device) = (map(notify?)?, map(device?)?);
+        let t = Self { common, notify, notify_multiplier, device, isr };
         t.common.write_u8(common::DEVICE_STATUS, 0);
         // The device gives 0 when the reset is done.
         while t.common.read_u8(common::DEVICE_STATUS) != 0 {
@@ -165,6 +173,19 @@ impl PciTransport {
     /// `enable_queue` gave.
     pub(crate) fn notify(&self, at: usize, index: u16) {
         self.notify.write_u16(at, index);
+    }
+
+    /// The interrupt line of the device.
+    pub(crate) fn irq(&self) -> Option<Line> {
+        self.isr.as_ref().map(|(_, line)| *line)
+    }
+
+    /// Tells the device that the driver saw its interrupt. The read of the ISR status byte
+    /// clears it, and the device then lowers the line.
+    pub(crate) fn ack_interrupt(&self) {
+        if let Some((isr, _)) = &self.isr {
+            isr.read_u8(0);
+        }
     }
 
     /// Reads the byte at `offset` of the configuration of the device.

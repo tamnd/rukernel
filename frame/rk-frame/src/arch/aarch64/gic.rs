@@ -1,7 +1,9 @@
 //! The GICv2 and GICv3 interrupt controllers.
 //!
 //! The boot CPU turns on the distributor, and each CPU turns on its own CPU interface. The timer
-//! interrupt and the SGIs between CPUs are on now. The interrupts of the devices come later.
+//! interrupt and the SGIs between CPUs are on. A driver turns on the SPI of its device through
+//! `irq::Line`. The handler of a device SPI turns the SPI off and keeps a flag, and the driver
+//! turns the SPI on again after it told the device that the interrupt is handled.
 //!
 //! A GICv2 has a memory mapped CPU interface. A GICv3 has a redistributor for each CPU, in a
 //! region of memory, and a CPU interface of system registers, as drivers/irqchip/irq-gic-v3.c of
@@ -9,7 +11,7 @@
 //! the GICv2 of QEMU `virt`.
 
 use super::paging::MMIO_BASE;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// The virtual addresses of the distributor and of the GICv2 CPU interface. They start as the GIC
 /// of QEMU virt, in the device window of the boot page tables. The device tree can change them.
@@ -51,8 +53,10 @@ fn v3() -> bool {
 const GICD_CTLR: usize = 0x000;
 const GICD_IGROUPR: usize = 0x080;
 const GICD_ISENABLER: usize = 0x100;
+const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
+const GICD_ICFGR: usize = 0xc00;
 const GICD_SGIR: usize = 0xf00;
 const GICD_IROUTER: usize = 0x6000;
 const GICC_CTLR: usize = 0x000;
@@ -307,5 +311,91 @@ pub(crate) fn eoi(iar: u32) {
         msr!("s3_0_c12_c12_1", u64::from(iar));
     } else {
         write(gicc() + GICC_EOIR, iar);
+    }
+}
+
+/// The first SPI, and the end of the interrupt numbers that `irq::Line` takes.
+const FIRST_SPI: u32 = 32;
+const END_SPI: u32 = SPURIOUS;
+
+/// A bit for each interrupt number below 1024: the SPIs that are device lines, and the lines that
+/// came since the last `take_device`.
+static DEVICE: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+static FIRED: [AtomicU32; 32] = [const { AtomicU32::new(0) }; 32];
+
+fn bit(intid: u32) -> (&'static AtomicU32, &'static AtomicU32, u32) {
+    let n = intid as usize;
+    (&DEVICE[n / 32 % 32], &FIRED[n / 32 % 32], 1 << (n % 32))
+}
+
+/// Makes the SPI `intid` a device line with the trigger of the device tree and turns it on. Gives
+/// `false` if `intid` is not an SPI.
+pub(crate) fn enable_device(intid: u32, edge: bool) -> bool {
+    if !(FIRST_SPI..END_SPI).contains(&intid) {
+        return false;
+    }
+    let (device, _, b) = bit(intid);
+    let n = intid as usize;
+    // The trigger can change only while the SPI is off. Bit 1 of the two bits of each SPI is the
+    // edge trigger.
+    write(gicd() + GICD_ICENABLER + n / 32 * 4, b);
+    let cfg = gicd() + GICD_ICFGR + n / 16 * 4;
+    let shift = n % 16 * 2 + 1;
+    let value = read(cfg) & !(1 << shift);
+    write(cfg, value | u32::from(edge) << shift);
+    if !v3() {
+        // A GICv2 sends an SPI to the CPU interfaces of its target byte, and the byte is 0 at
+        // the reset. `enable` sets the target of a GICv3.
+        let boot = TARGETS.first().map_or(0, |t| t.load(Ordering::Relaxed));
+        write_u8(gicd() + GICD_ITARGETSR + n, boot as u8);
+    }
+    device.fetch_or(b, Ordering::Relaxed);
+    enable(intid);
+    true
+}
+
+/// Tells if the SPI `intid` is a device line.
+pub(crate) fn is_device(intid: u32) -> bool {
+    let (device, _, b) = bit(intid);
+    (FIRST_SPI..END_SPI).contains(&intid) && device.load(Ordering::Relaxed) & b != 0
+}
+
+/// The handler of a device line: turns the SPI off and sets its flag. It takes no lock.
+pub(crate) fn device_interrupt(intid: u32) {
+    let (_, fired, b) = bit(intid);
+    write(gicd() + GICD_ICENABLER + intid as usize / 32 * 4, b);
+    fired.fetch_or(b, Ordering::AcqRel);
+}
+
+/// Tells if the device line `intid` came since the last `take_device`.
+pub(crate) fn fired(intid: u32) -> bool {
+    let (_, fired, b) = bit(intid);
+    fired.load(Ordering::Acquire) & b != 0
+}
+
+/// Tells if the device line `intid` came since the last call, and clears the flag.
+pub(crate) fn take_device(intid: u32) -> bool {
+    let (_, fired, b) = bit(intid);
+    fired.fetch_and(!b, Ordering::AcqRel) & b != 0
+}
+
+/// Turns the device line `intid` on again.
+pub(crate) fn unmask_device(intid: u32) {
+    if is_device(intid) {
+        write(gicd() + GICD_ISENABLER + intid as usize / 32 * 4, 1 << (intid % 32));
+    }
+}
+
+/// Sends the device line `intid` to this CPU.
+pub(crate) fn route_here(intid: u32) {
+    if !is_device(intid) {
+        return;
+    }
+    let n = intid as usize;
+    let target = TARGETS.get(super::cpu::id()).map_or(0, |t| t.load(Ordering::Relaxed));
+    if v3() {
+        write64(gicd() + GICD_IROUTER + n * 8, target & 0xff_00ff_ffff);
+    } else {
+        write_u8(gicd() + GICD_ITARGETSR + n, target as u8);
     }
 }

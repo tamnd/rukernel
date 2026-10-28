@@ -3,8 +3,9 @@
 //! The kernel boots from a Linux arm64 `Image` on the QEMU `virt` machine. It runs at EL1 with the
 //! MMU on. The console is the PL011 UART, the interrupt controller is a GICv2 or a GICv3, and the
 //! tick comes from the virtual timer of the generic timer. The device tree gives the addresses,
-//! and the addresses of QEMU `virt` are the fallback. The virtio devices are on virtio-mmio. User
-//! programs get a vDSO with the time calls and `__kernel_rt_sigreturn`.
+//! and the addresses of QEMU `virt` are the fallback. The virtio devices are on virtio-mmio or on
+//! the PCI bus of the generic ECAM host, and their SPIs wake the drivers. User programs get a vDSO
+//! with the time calls and `__kernel_rt_sigreturn`.
 
 pub(crate) mod boot;
 pub(crate) mod cpu;
@@ -30,6 +31,9 @@ fn interrupt() {
         smp::poll();
         gic::eoi(iar);
     } else if id == smp::SGI_RESCHEDULE {
+        gic::eoi(iar);
+    } else if gic::is_device(id) {
+        gic::device_interrupt(id);
         gic::eoi(iar);
     } else if id >= gic::SPURIOUS {
         // A spurious interrupt has no end of interrupt.
@@ -117,8 +121,12 @@ pub fn random_seed() -> u64 {
     count.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-/// Copies of memory that user code can write at the same time. These copy one byte at a time,
-/// with volatile accesses. TODO(#329): use a faster copy when arm64 has user mode.
+/// Copies of memory that user code can write at the same time, such as the frames of user pages.
+/// The assembly copies 16 bytes with each `ldp` and `stp`, then the rest with one word and single
+/// bytes. The compiler does not know the instructions, so it cannot assume that the memory does
+/// not change. QEMU emulates each instruction alone, so a copy of pairs of words is about 16 times
+/// faster there than a copy of bytes. The MMU allows accesses that are not aligned to normal
+/// memory, because SCTLR_EL1.A is clear.
 pub(crate) mod mem {
     /// Copies `len` bytes from `src` to `dst`.
     ///
@@ -126,11 +134,34 @@ pub(crate) mod mem {
     ///
     /// The two ranges must be valid kernel memory, and they must not overlap.
     pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) {
-        for i in 0..len {
-            // SAFETY: the caller gives a valid range of `len` bytes at `src`.
-            let byte = unsafe { src.wrapping_add(i).read_volatile() };
-            // SAFETY: the caller gives a valid range of `len` bytes at `dst`.
-            unsafe { dst.wrapping_add(i).write_volatile(byte) };
+        // SAFETY: the caller gives two valid ranges of `len` bytes. The loops stop at the end of
+        // the ranges: `pairs` blocks of 16 bytes, then one word if bit 3 of `rest` is set, then the
+        // bytes of the low 3 bits of `rest`.
+        unsafe {
+            core::arch::asm!(
+                "cbz {pairs}, 2f",
+                "1: ldp {a}, {b}, [{src}], #16",
+                "stp {a}, {b}, [{dst}], #16",
+                "subs {pairs}, {pairs}, #1",
+                "b.ne 1b",
+                "2: tbz {rest}, #3, 3f",
+                "ldr {a}, [{src}], #8",
+                "str {a}, [{dst}], #8",
+                "3: and {rest}, {rest}, #7",
+                "cbz {rest}, 5f",
+                "4: ldrb {a:w}, [{src}], #1",
+                "strb {a:w}, [{dst}], #1",
+                "subs {rest}, {rest}, #1",
+                "b.ne 4b",
+                "5:",
+                pairs = inout(reg) len / 16 => _,
+                rest = inout(reg) len % 16 => _,
+                src = inout(reg) src => _,
+                dst = inout(reg) dst => _,
+                a = out(reg) _,
+                b = out(reg) _,
+                options(nostack),
+            );
         }
     }
 
@@ -140,9 +171,28 @@ pub(crate) mod mem {
     ///
     /// The range must be valid kernel memory.
     pub(crate) unsafe fn zero(dst: *mut u8, len: usize) {
-        for i in 0..len {
-            // SAFETY: the caller gives a valid range of `len` bytes.
-            unsafe { dst.wrapping_add(i).write_volatile(0) };
+        // As in `copy`, an `stp` of the zero register writes 16 bytes, then the rest is one word
+        // and single bytes.
+        // SAFETY: as for `copy`.
+        unsafe {
+            core::arch::asm!(
+                "cbz {pairs}, 2f",
+                "1: stp xzr, xzr, [{dst}], #16",
+                "subs {pairs}, {pairs}, #1",
+                "b.ne 1b",
+                "2: tbz {rest}, #3, 3f",
+                "str xzr, [{dst}], #8",
+                "3: and {rest}, {rest}, #7",
+                "cbz {rest}, 5f",
+                "4: strb wzr, [{dst}], #1",
+                "subs {rest}, {rest}, #1",
+                "b.ne 4b",
+                "5:",
+                pairs = inout(reg) len / 16 => _,
+                rest = inout(reg) len % 16 => _,
+                dst = inout(reg) dst => _,
+                options(nostack),
+            );
         }
     }
 }

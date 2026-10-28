@@ -435,11 +435,13 @@ fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
         super::rtc::set_base(base);
     }
     crate::iomem::virtio_mmio::set(&platform.virtio_mmio[..platform.virtio_mmio_count]);
-    // TODO(#348): the PCI code of arm64 maps the ECAM with `paging::map_device`, scans it and
-    // assigns the BARs, because no firmware assigns them before `-kernel`. The virtio devices
-    // come from virtio-mmio until then.
+    // The scan of the PCI bus comes later, at the first `pci::devices`. It assigns the BARs,
+    // because no firmware assigns them before `-kernel`.
     if let Some((ecam, len)) = platform.pci_ecam {
-        crate::println!("aarch64: PCI ECAM at {ecam:#x}, {} MiB", len >> 20);
+        match (map(ecam, len), usize::try_from(len)) {
+            (Some(virt), Ok(len)) => crate::pci::set_host(platform, virt, len),
+            _ => crate::println!("aarch64: cannot use the PCI ECAM at {ecam:#x}"),
+        }
     }
 }
 
