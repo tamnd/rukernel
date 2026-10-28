@@ -167,7 +167,13 @@ pub struct Queue {
     read_only: AtomicBool,
     /// The device number, for the charges of the io controller.
     dev: AtomicU64,
+    /// The read-ahead size in pages, as `ra_pages` of the `backing_dev_info` of Linux.
+    /// `BLKRASET` changes it.
+    ra_pages: AtomicU64,
 }
+
+/// The default read-ahead size in pages, 128 KiB, as `VM_READAHEAD_PAGES` of Linux.
+pub const READAHEAD_PAGES: u64 = 32;
 
 impl Queue {
     /// Makes the queue of `device` with the scheduler `mq-deadline`.
@@ -178,7 +184,18 @@ impl Queue {
             stats: SpinLock::new(Stats::default()),
             read_only: AtomicBool::new(false),
             dev: AtomicU64::new(0),
+            ra_pages: AtomicU64::new(READAHEAD_PAGES),
         }
+    }
+
+    /// The read-ahead size in pages, for `BLKRAGET` and `read_ahead_kb` of sysfs.
+    pub fn ra_pages(&self) -> u64 {
+        self.ra_pages.load(Ordering::Relaxed)
+    }
+
+    /// Sets the read-ahead size in pages, for `BLKRASET`.
+    pub fn set_ra_pages(&self, pages: u64) {
+        self.ra_pages.store(pages, Ordering::Relaxed);
     }
 
     /// Sets the device number of the queue. The charges of the io controller use it.

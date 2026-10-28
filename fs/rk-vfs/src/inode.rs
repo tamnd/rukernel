@@ -287,6 +287,14 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::ENOTTY)
     }
 
+    /// The `STATX_ATTR_*` bits that the file system keeps, for `stx_attributes_mask` of
+    /// `statx`. These bits are the same as the bits of [`iflags`]. The default is the mask of
+    /// `ext4_getattr` of Linux for the flags that it has: compressed, immutable, append-only and
+    /// no dump.
+    fn statx_attributes_mask(&self) -> u32 {
+        iflags::COMPR | iflags::IMMUTABLE | iflags::APPEND | iflags::NODUMP
+    }
+
     /// Sets the inode flags of [`iflags`], for `FS_IOC_SETFLAGS`. A file system gives
     /// `EOPNOTSUPP` for a flag that it does not keep. The default gives `ENOTTY`.
     fn set_attr_flags(&self, _flags: u32) -> Result<()> {
@@ -625,6 +633,8 @@ pub mod shutdown {
 /// The inode flags of `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`, from `<linux/fs.h>`. `chattr`
 /// and `lsattr` use them.
 pub mod iflags {
+    /// The file system compresses the file.
+    pub const COMPR: u32 = 0x04;
     /// The changes of the file are written at once.
     pub const SYNC: u32 = 0x08;
     /// The file cannot change, and no name can change to or from it.
@@ -675,7 +685,7 @@ pub fn check_fixed(inode: &dyn Inode) -> Result<()> {
 /// # Errors
 ///
 /// Gives `EPERM` if the flags refuse the change, and `ETXTBSY` for a new size of an active swap
-/// area.
+/// area or of the file of a running program.
 pub fn check_set_attr(inode: &dyn Inode, attr: &SetAttr) -> Result<()> {
     let flags = flags_of(inode);
     let fixed = attr.size.is_some()
@@ -686,9 +696,11 @@ pub fn check_set_attr(inode: &dyn Inode, attr: &SetAttr) -> Result<()> {
     if flags & iflags::IMMUTABLE != 0 || (flags & iflags::APPEND != 0 && fixed) {
         return Err(Errno::EPERM);
     }
-    // An active swap area keeps its size.
+    // An active swap area and the file of a running program keep their size, as
+    // `get_write_access` in `vfs_truncate` of Linux.
     if attr.size.is_some() {
         crate::swap::check(inode)?;
+        crate::file::check_write_access(inode)?;
     }
     Ok(())
 }

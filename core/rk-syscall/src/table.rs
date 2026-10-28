@@ -81,6 +81,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::MUNLOCKALL => mm::munlockall(cx),
         nr::MINCORE => mm::mincore(cx, a[0], a[1], a[2]),
         nr::MREMAP => mm::mremap(cx, a[0], a[1], a[2], a[3], a[4]),
+        nr::REMAP_FILE_PAGES => mm::remap_file_pages(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::BRK => mm::brk(cx, a[0]),
         nr::RT_SIGACTION => signal::rt_sigaction(cx, a[0], a[1], a[2], a[3]),
         nr::RT_SIGPROCMASK => signal::rt_sigprocmask(cx, a[0], a[1], a[2], a[3]),

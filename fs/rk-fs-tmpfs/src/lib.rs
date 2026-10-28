@@ -482,6 +482,12 @@ impl Inode for Node {
         Ok(self.attrs.lock().flags)
     }
 
+    fn statx_attributes_mask(&self) -> u32 {
+        // tmpfs has no compressed flag, as `shmem_getattr` of Linux.
+        use rk_vfs::inode::iflags::{APPEND, IMMUTABLE, NODUMP};
+        APPEND | IMMUTABLE | NODUMP
+    }
+
     fn set_attr_flags(&self, flags: u32) -> Result<()> {
         self.check_rw()?;
         use rk_vfs::inode::iflags::{APPEND, IMMUTABLE, NOATIME, NODUMP};

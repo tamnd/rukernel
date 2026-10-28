@@ -3,7 +3,8 @@
 //! The devices have the major number 1, as drivers/char/mem.c in Linux: `/dev/null`, `/dev/zero`,
 //! `/dev/full`, `/dev/random` and `/dev/urandom`. The two random devices and `getrandom` read the
 //! same ChaCha20 generator. The CPU gives its seed at boot. A write to a random device is
-//! accepted and does not change the generator, as a write without `RNDADDENTROPY` in Linux.
+//! accepted and does not change the generator, as a write without `RNDADDENTROPY` in Linux. The
+//! generator is ready from the boot, so the entropy count is always full.
 //! `/dev/kmsg` has the minor number 11, as in Linux.
 
 #![no_std]
@@ -18,6 +19,7 @@ use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_lib::chacha::ChaChaRng;
 use rk_vfs::device::{self, CharDevice, makedev};
+use rk_vfs::file::UserMemory;
 use rk_vfs::inode::Result;
 use rk_vfs::{File, FileOps};
 
@@ -120,6 +122,73 @@ impl FileOps for MemDevice {
 
     fn poll(&self, _file: &File) -> u32 {
         rk_abi::native::poll::POLLIN | rk_abi::native::poll::POLLOUT
+    }
+
+    fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        if !matches!(self, Self::Random | Self::Urandom) {
+            return Err(Errno::ENOTTY);
+        }
+        random_ioctl(cmd, arg, mem)
+    }
+}
+
+/// The entropy count of the input pool in bits. The generator is ready at boot, so the count is
+/// always full, as `input_pool.init_bits` of Linux after the initialization.
+pub const ENTROPY_BITS: u32 = 256;
+
+/// The `ioctl` commands of the random devices, from `<linux/random.h>`.
+mod rnd {
+    /// Gives the entropy count, as an `int`.
+    pub(crate) const RNDGETENTCNT: u32 = 0x8004_5200;
+    /// Adds to the entropy count.
+    pub(crate) const RNDADDTOENTCNT: u32 = 0x4004_5201;
+    /// Adds bytes to the pool, from a `struct rand_pool_info`.
+    pub(crate) const RNDADDENTROPY: u32 = 0x4008_5203;
+    /// Sets the entropy count to 0.
+    pub(crate) const RNDZAPENTCNT: u32 = 0x5204;
+    /// Clears the pool. Linux takes it as `RNDZAPENTCNT`.
+    pub(crate) const RNDCLEARPOOL: u32 = 0x5206;
+    /// Seeds the generator again.
+    pub(crate) const RNDRESEEDCRNG: u32 = 0x5207;
+}
+
+/// The `ioctl` of `/dev/random` and `/dev/urandom`, as `random_ioctl` in drivers/char/random.c of
+/// Linux. The count stays full, so the commands that change it only check the capability.
+fn random_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+    let admin = || rk_vfs::cred::current().capable(rk_vfs::cred::cap::SYS_ADMIN);
+    match cmd {
+        rnd::RNDGETENTCNT => {
+            mem.write(arg, &ENTROPY_BITS.to_ne_bytes())?;
+            Ok(0)
+        }
+        rnd::RNDADDTOENTCNT | rnd::RNDZAPENTCNT | rnd::RNDCLEARPOOL | rnd::RNDRESEEDCRNG => {
+            if !admin() {
+                return Err(Errno::EPERM);
+            }
+            Ok(0)
+        }
+        rnd::RNDADDENTROPY => {
+            if !admin() {
+                return Err(Errno::EPERM);
+            }
+            // `struct rand_pool_info`: the entropy count, the size of the buffer and the buffer.
+            let mut head = [0u8; 8];
+            mem.read(arg, &mut head)?;
+            let count = i32::from_ne_bytes([head[0], head[1], head[2], head[3]]);
+            let size = i32::from_ne_bytes([head[4], head[5], head[6], head[7]]);
+            if count < 0 || size < 0 {
+                return Err(Errno::EINVAL);
+            }
+            let mut buf = alloc::vec![0u8; (size as usize).min(1 << 20)];
+            mem.read(arg + 8, &mut buf)?;
+            for chunk in buf.chunks(8) {
+                let mut word = [0u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                add_randomness(u64::from_ne_bytes(word));
+            }
+            Ok(0)
+        }
+        _ => Err(Errno::EINVAL),
     }
 }
 

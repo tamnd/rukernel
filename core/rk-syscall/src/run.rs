@@ -17,8 +17,8 @@ use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
 use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_EXIT, StopKind};
 use rk_proc::signal::{
-    BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, POLL_MSG, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL,
-    SIG_DFL, SIG_IGN, SigInfo, TRAP_BRKPT, TRAP_TRACE,
+    BUS_ADRALN, BUS_ADRERR, FPE_INTDIV, ILL_ILLOPN, SEGV_ACCERR, SEGV_MAPERR, SI_KERNEL, SIG_DFL,
+    SIG_IGN, SigInfo, TRAP_BRKPT, TRAP_TRACE,
 };
 use rk_proc::{SyscallInfo, Thread, WaitStatus};
 use rk_vfs::FsContext;
@@ -287,17 +287,24 @@ fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
 }
 
 /// Sends the signal of the open file `file` to its owner for an event of the descriptor `fd`, as
-/// `send_sigio` of Linux with `POLL_MSG`. Without a signal of `F_SETSIG`, the owner gets `SIGIO`.
-/// A negative owner is a process group. The owner of `F_OWNER_TID` is a thread.
-fn send_sigio(file: &rk_vfs::file::File, fd: i32) {
-    use rk_abi::native::poll::{POLLIN, POLLMSG, POLLRDNORM};
+/// `send_sigio` of Linux (fs/fcntl.c). `code` is the reason, `POLL_IN`, `POLL_OUT` or `POLL_MSG`.
+/// Without a signal of `F_SETSIG`, the owner gets `SIGIO`. A negative owner is a process group.
+/// The owner of `F_OWNER_TID` is a thread.
+fn send_sigio(file: &rk_vfs::file::File, fd: i32, code: i32) {
+    use rk_abi::native::poll::{POLLIN, POLLMSG, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
     let owner = file.owner();
     if owner == 0 {
         return;
     }
+    // The events of each reason, as `band_table` of Linux.
+    let band = if code == rk_vfs::file::poll_code::POLL_OUT {
+        POLLOUT | POLLWRNORM | POLLWRBAND
+    } else {
+        POLLIN | POLLRDNORM | POLLMSG
+    };
     let info = match file.signum() {
         0 => SigInfo::new(rk_abi::native::signal::SIGIO, SI_KERNEL, 0),
-        sig => SigInfo::poll(sig, POLL_MSG, u64::from(POLLIN | POLLRDNORM | POLLMSG), fd),
+        sig => SigInfo::poll(sig, code, u64::from(band), fd),
     };
     if file.owner_is_thread() {
         if let Some(thread) = rk_proc::find_thread(owner as u32) {

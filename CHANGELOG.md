@@ -9,6 +9,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - PCI on arm64 through the generic ECAM host of the device tree (#380). The frame assigns the memory BARs from the windows of `ranges`, as `pci_assign_unassigned_resources` of Linux, and finds the INTx line of each device in `interrupt-map`. virtio-blk and virtio-net work on virtio-pci on QEMU `virt`, and the arm64 `blk` and `inet` boot tests also run with virtio-pci.
 - Device interrupts on arm64 (#380). The GIC turns on the SPI of each virtio device, from the device tree or from `interrupt-map`. A request of virtio-blk waits with `wfi` for the interrupt, and the interrupt of virtio-net wakes an idle CPU.
 - tools/busybox/build.sh builds a static arm64 BusyBox in an arm64 Alpine container, for `RK_BUSYBOX_AARCH64` and the arm64 `busybox` boot test (#380).
+- `remap_file_pages`, as mm/mmap.c of Linux (#385). It maps the pages of a shared file map again at a new offset, with a new `mmap` with `MAP_FIXED` over the range.
+- `madvise` with `MADV_GUARD_INSTALL` and `MADV_GUARD_REMOVE`, as mm/madvise.c of Linux (#385). An access to a guard page gives `SIGSEGV`, and `fork` keeps the guard pages.
+- `madvise` with `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK` and `MADV_KEEPONFORK` change `fork` (#385). The child of `fork` does not get a `MADV_DONTFORK` area, and gets a `MADV_WIPEONFORK` area with zero pages.
+- `fcntl` with `F_SETFL` turns `O_ASYNC` on and off, and a pipe sends `SIGIO` or the signal of `F_SETSIG` to the owner when it has data or space, as `kill_fasync` of Linux (#385).
+- `setsockopt` with `IPV6_ADDRFORM` changes a TCP connection of an `AF_INET6` socket to an IPv4 peer into an `AF_INET` socket, as net/ipv6/ipv6_sockglue.c of Linux (#385).
+- `setsockopt` with `IPV6_RTHDR` on an IPv6 datagram socket checks and keeps a routing header of type 2 or 4, and `UDP_CORK` collects the sends in one datagram (#385). The stack does not put the routing header in the packets yet.
+- The `ioctl` commands `RNDGETENTCNT`, `RNDADDTOENTCNT`, `RNDADDENTROPY`, `RNDZAPENTCNT`, `RNDCLEARPOOL` and `RNDRESEEDCRNG` of /dev/random and /dev/urandom, and the sysctls `kernel.random.entropy_avail` and `kernel.random.poolsize` (#385).
+- The block device `ioctl` commands `BLKRAGET`, `BLKRASET`, `BLKFRAGET` and `BLKFRASET`, and the directory /sys/block/DEV/queue (#385).
+- `poll` on /proc/PID/mounts gives `POLLERR | POLLPRI` after a mount or an unmount in the namespace, as `mounts_poll` of Linux (#385).
 
 ### Fixed
 
@@ -21,6 +30,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The system call path loads the address space and checks for a reschedule without a reference count change, and records the system call information under one lock (#394).
 - `sched_yield` returns at once when no other task can run on the CPU (#394). The `yield` benchmark goes from 5.55 to 0.62 times Linux.
 - `fork` copies the page tables one last level table at a time, with one TLB flush for each area that becomes read only, and copies the page map of the parent in one pass (#394). The `fork_big` benchmark goes from 78.6 ms to 17.7 ms in tools/bench/results.md. Copy on write, the transparent huge pages and the hugetlb pages work as before.
+- `statx` gives `STATX_ATTR_COMPRESSED` and the other attributes in `stx_attributes_mask` only when the file system keeps them, and gives `STATX_DIOALIGN` for a block device (#385).
+- `open` for write and `truncate` of a program that runs give `ETXTBSY`, and `execve` of a file that is open for write gives `ETXTBSY`, as `deny_write_access` of Linux (#385).
+- `connect` with `AF_UNSPEC` on a TCP socket frees the port and the address that `bind` did not set, as `tcp_disconnect` of Linux (#385).
+- `mincore` marks a page of a shared map as resident when the page is in the page cache, also when the process did not touch it (#385).
 
 ## [0.4.6] - 2026-10-28
 

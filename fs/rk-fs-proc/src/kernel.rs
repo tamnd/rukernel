@@ -10,7 +10,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 use rk_mm::{Backing, VmaKind};
@@ -363,6 +363,10 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/pid_max", "4194304"),
     // The console, default, smallest and boot log levels, as `console_printk` of Linux.
     ("kernel/printk", "4\t4\t1\t7"),
+    // The generator is ready at boot, so the entropy count is full, as `input_pool.init_bits`
+    // of Linux. The two files only give text.
+    ("kernel/random/entropy_avail", "256"),
+    ("kernel/random/poolsize", "256"),
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
     ("kernel/version", ""),
@@ -391,6 +395,9 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("vm/overcommit_ratio", ""),
     ("vm/panic_on_oom", "0"),
 ];
+
+/// The sysctls that only give text, with the mode 0444 of Linux.
+const READ_ONLY_SYSCTLS: &[&str] = &["kernel/random/entropy_avail", "kernel/random/poolsize"];
 
 /// The sysctl of the groups that can make an ICMP echo socket. rk-net keeps the value.
 const PING_GROUP_RANGE: &str = "net/ipv4/ping_group_range";
@@ -654,11 +661,12 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
                     }
                     None => {
                         let fpath = format!("{list_path}/{rest}");
-                        let node = rw_file(
-                            fpath.as_bytes(),
-                            move || Ok(sysctl_read(name, default)),
-                            move |data| sysctl_write(name, data),
-                        );
+                        let read = move || Ok(sysctl_read(name, default));
+                        let node = if READ_ONLY_SYSCTLS.contains(&name) {
+                            file(fpath.as_bytes(), read)
+                        } else {
+                            rw_file(fpath.as_bytes(), read, move |data| sysctl_write(name, data))
+                        };
                         out.push((rest.as_bytes().to_vec(), node));
                     }
                 }
@@ -921,6 +929,62 @@ fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// An open file of `/proc/PID/mounts`. It reads the text of its inode, and has an event of
+/// `POLLPRI` and `POLLERR` when the mounts of the name space change, as `mounts_poll` in
+/// fs/proc_namespace.c of Linux.
+struct MountsFile {
+    ns: Arc<rk_vfs::MountNamespace>,
+    /// The count of the changes that `poll` saw last.
+    seen: AtomicU64,
+}
+
+impl MountsFile {
+    /// Opens the file for the name space of `p`. The changes before the open have no event.
+    fn open(p: &Process) -> Option<Arc<dyn rk_vfs::file::FileOps>> {
+        let ns = p.fs()?.lock().namespace().clone();
+        Some(Arc::new(Self { seen: AtomicU64::new(ns.event()), ns }))
+    }
+}
+
+impl rk_vfs::file::FileOps for MountsFile {
+    fn read(&self, file: &rk_vfs::file::File, buf: &mut [u8]) -> Result<usize> {
+        let pos = file.pos();
+        let n = file.inode().ok_or(Errno::EINVAL)?.read_at(pos, buf)?;
+        file.set_pos(pos + n as u64);
+        Ok(n)
+    }
+
+    fn read_at(&self, file: &rk_vfs::file::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        file.inode().ok_or(Errno::EINVAL)?.read_at(offset, buf)
+    }
+
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn poll(&self, _file: &rk_vfs::file::File) -> u32 {
+        use rk_abi::native::poll::{POLLERR, POLLIN, POLLPRI, POLLRDNORM};
+        let event = self.ns.event();
+        if self.seen.swap(event, Ordering::Relaxed) == event {
+            POLLIN | POLLRDNORM
+        } else {
+            POLLIN | POLLRDNORM | POLLERR | POLLPRI
+        }
+    }
+
+    fn pollable(&self) -> bool {
+        true
+    }
+
+    fn poll_wait(&self, _file: &rk_vfs::file::File, table: &mut rk_vfs::wait::PollTable) {
+        table.add_static(rk_vfs::MountNamespace::poll_queue());
+    }
+
+    fn event_count(&self) -> u64 {
+        self.ns.event()
+    }
 }
 
 fn mounts_of(p: &Process) -> Result<Vec<u8>> {
@@ -1215,8 +1279,16 @@ fn process_files(
     out.push((b"maps".to_vec(), file(&join(base, b"maps"), move || maps_of(&*alive(&p_)?))));
     let p_ = w.clone();
     out.push((b"smaps".to_vec(), file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?))));
-    let p_ = w.clone();
-    out.push((b"mounts".to_vec(), file(&join(base, b"mounts"), move || mounts_of(&*alive(&p_)?))));
+    let (p_, p2) = (w.clone(), w.clone());
+    out.push((
+        b"mounts".to_vec(),
+        ops_file(
+            &join(base, b"mounts"),
+            0o444,
+            move || mounts_of(&*alive(&p_)?),
+            move || MountsFile::open(&*p2.upgrade()?),
+        ),
+    ));
     out.push((b"net".to_vec(), net_dir(base)));
     let p_ = w.clone();
     out.push((

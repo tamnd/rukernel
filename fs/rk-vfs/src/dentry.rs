@@ -10,6 +10,7 @@
 //! mounts that are slaves of the group.
 
 use crate::inode::{InodeRef, Result};
+use crate::wait::WaitQueue;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -684,7 +685,13 @@ pub struct MountNamespace {
     root: Arc<Mount>,
     mounts: SpinLock<Vec<Arc<Mount>>>,
     me: Weak<MountNamespace>,
+    /// The count of the changes of the mounts, as `event` of `struct mnt_namespace` of Linux.
+    event: AtomicU64,
 }
+
+/// The waits of `poll` on `/proc/PID/mounts` wait here for a change of the mounts of a name
+/// space, as `poll` of `struct mnt_namespace` of Linux. One queue serves each name space.
+static NS_POLL: WaitQueue = WaitQueue::new();
 
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -696,6 +703,7 @@ impl MountNamespace {
             root: mount.clone(),
             mounts: SpinLock::new(Vec::from([mount.clone()])),
             me: me.clone(),
+            event: AtomicU64::new(0),
         });
         *mount.ns.lock() = ns.me.clone();
         ATTACHED.lock().push(Arc::downgrade(&mount));
@@ -730,8 +738,12 @@ impl MountNamespace {
                 at.mount = mount.clone();
             }
         }
-        let ns =
-            Arc::new_cyclic(|me| Self { root, mounts: SpinLock::new(new.clone()), me: me.clone() });
+        let ns = Arc::new_cyclic(|me| Self {
+            root,
+            mounts: SpinLock::new(new.clone()),
+            me: me.clone(),
+            event: AtomicU64::new(0),
+        });
         let mut all = ATTACHED.lock();
         for m in &new {
             *m.ns.lock() = ns.me.clone();
@@ -838,6 +850,25 @@ impl MountNamespace {
         *mount.ns.lock() = self.me.clone();
         self.mounts.lock().push(mount.clone());
         ATTACHED.lock().push(Arc::downgrade(mount));
+        self.touch();
+    }
+
+    /// Counts a change of the mounts and wakes the waits of `poll`, as `touch_mnt_namespace` of
+    /// Linux.
+    fn touch(&self) {
+        self.event.fetch_add(1, Ordering::Relaxed);
+        NS_POLL.wake_all();
+    }
+
+    /// The count of the changes of the mounts. A file of `/proc/PID/mounts` has an event of
+    /// `POLLPRI` when the count changes, as `mounts_poll` of Linux.
+    pub fn event(&self) -> u64 {
+        self.event.load(Ordering::Relaxed)
+    }
+
+    /// The queue that a change of the mounts of a name space wakes.
+    pub fn poll_queue() -> &'static WaitQueue {
+        &NS_POLL
     }
 
     /// Changes the propagation of the mount of `at` to `ty`, and of each mount under it if
@@ -924,6 +955,8 @@ impl MountNamespace {
         // The last mount on a place hides the others, so the moved mount goes to the end.
         mounts.retain(|m| !Arc::ptr_eq(m, mount));
         mounts.push(mount.clone());
+        drop(mounts);
+        self.touch();
         Ok(())
     }
 
@@ -959,6 +992,8 @@ impl MountNamespace {
         *top.mountpoint.lock() =
             Some(Location { mount: mount.clone(), dentry: mount.root.clone() });
         mounts.insert(index, mount.clone());
+        drop(mounts);
+        self.touch();
         Ok(())
     }
 
@@ -1003,6 +1038,7 @@ impl MountNamespace {
             }
             mounts.retain(|m| !Arc::ptr_eq(m, mount));
         }
+        self.touch();
         mount.change_propagation(PropagationType::Private);
         *mount.ns.lock() = Weak::new();
         ATTACHED.lock().retain(|m| !core::ptr::eq(m.as_ptr(), Arc::as_ptr(mount)));
@@ -1054,6 +1090,8 @@ impl MountNamespace {
         mounts.retain(|m| !Arc::ptr_eq(m, new_mnt) && !Arc::ptr_eq(m, root_mnt));
         mounts.push(new_mnt.clone());
         mounts.push(root_mnt.clone());
+        drop(mounts);
+        self.touch();
         Ok(())
     }
 

@@ -440,6 +440,9 @@ impl FsContext {
         // `do_dentry_open` of Linux.
         if kind == FileType::Regular && write {
             at.mount.want_write()?;
+            // The file of a running program does not open for a write, as `get_write_access` in
+            // `do_dentry_open` of Linux.
+            crate::file::check_write_access(&**at.inode())?;
         }
         if flags & o::O_NOATIME != 0 && !self.cred.owns(&meta) {
             return Err(Errno::EPERM);

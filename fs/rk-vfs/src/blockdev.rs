@@ -20,7 +20,7 @@ use rk_block::cache::{PAGE_SIZE, PageCache};
 use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
 
-pub use rk_block::{BlockDevice, SECTOR_SIZE, set_account};
+pub use rk_block::{BlockDevice, READAHEAD_PAGES, SECTOR_SIZE, set_account};
 
 /// The `ioctl` commands of block devices, from `<linux/fs.h>`.
 pub mod ioctl {
@@ -32,6 +32,14 @@ pub mod ioctl {
     pub const BLKGETSIZE: u32 = 0x1260;
     /// Writes the cached data of the device to the device.
     pub const BLKFLSBUF: u32 = 0x1261;
+    /// Sets the read-ahead size in sectors, from an `unsigned long`.
+    pub const BLKRASET: u32 = 0x1262;
+    /// Gives the read-ahead size in sectors, as a `long`.
+    pub const BLKRAGET: u32 = 0x1263;
+    /// Sets the read-ahead size of the file system in sectors. Linux takes it as `BLKRASET`.
+    pub const BLKFRASET: u32 = 0x1264;
+    /// Gives the read-ahead size of the file system in sectors. Linux gives it as `BLKRAGET`.
+    pub const BLKFRAGET: u32 = 0x1265;
     /// Gives the logical sector size, as an `int`.
     pub const BLKSSZGET: u32 = 0x1268;
     /// Gives the minimum I/O size, as an `unsigned int`.
@@ -539,6 +547,22 @@ impl FileOps for BlockFile {
                 } else {
                     Err(Errno::EINVAL)
                 }
+            }
+            // The read-ahead size of the device, in sectors of 512 bytes, as
+            // `blkdev_common_ioctl` in block/ioctl.c of Linux. The size is kept in pages.
+            ioctl::BLKRAGET | ioctl::BLKFRAGET => {
+                if arg == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                let sectors = self.queue.ra_pages() * PAGE_SIZE as u64 / SECTOR_SIZE as u64;
+                Self::put(mem, arg, &sectors.to_ne_bytes())
+            }
+            ioctl::BLKRASET | ioctl::BLKFRASET => {
+                if !crate::cred::current().capable(crate::cred::cap::SYS_ADMIN) {
+                    return Err(Errno::EACCES);
+                }
+                self.queue.set_ra_pages(arg as u64 * SECTOR_SIZE as u64 / PAGE_SIZE as u64);
+                Ok(0)
             }
             ioctl::BLKGETDISKSEQ => Self::put(mem, arg, &1u64.to_ne_bytes()),
             ioctl::BLKROSET => {

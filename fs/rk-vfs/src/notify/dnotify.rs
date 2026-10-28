@@ -42,12 +42,20 @@ struct Dnotify {
 static GROUP: Once<Arc<Dnotify>> = Once::new();
 
 /// The function that sends the signal of a file to its owner.
-static SIGIO: Once<fn(&File, i32)> = Once::new();
+static SIGIO: Once<fn(&File, i32, i32)> = Once::new();
 
 /// Gives the VFS the function that sends the signal of the open file to its owner, with the
-/// descriptor, as `send_sigio` of Linux with `POLL_MSG`. Only the first call has an effect.
-pub fn set_sigio(f: fn(&File, i32)) {
+/// descriptor and the reason of [`crate::file::poll_code`], as `send_sigio` of Linux. Only the
+/// first call has an effect.
+pub fn set_sigio(f: fn(&File, i32, i32)) {
     SIGIO.call_once(|| f);
+}
+
+/// Sends the signal of `file` to its owner, with the descriptor `fd` and the reason `code`.
+pub(crate) fn sigio(file: &File, fd: i32, code: i32) {
+    if let Some(f) = SIGIO.get() {
+        f(file, fd, code);
+    }
 }
 
 fn group() -> &'static Arc<Dnotify> {
@@ -177,10 +185,9 @@ impl Group for Dnotify {
             });
             recalc(dir);
         }
-        let Some(sigio) = SIGIO.get() else { return };
         for (file, fd) in send {
             if let Some(file) = file.upgrade() {
-                sigio(&file, fd);
+                sigio(&file, fd, crate::file::poll_code::POLL_MSG);
             }
         }
     }

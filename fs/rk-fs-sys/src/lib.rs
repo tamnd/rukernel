@@ -5,7 +5,8 @@
 //! follows Linux, because udev, mdev and the C libraries read it:
 //!
 //! - `/sys/devices/virtual/CLASS/NAME` is the directory of a device. It has the files `dev` and
-//!   `uevent`, and the link `subsystem`. A block device also has `size`, `ro` and `removable`.
+//!   `uevent`, and the link `subsystem`. A block device also has `size`, `ro`, `removable` and
+//!   the directory `queue` with the limits of the queue.
 //!   A loop device with a file also has the directory `loop`, which `losetup` reads.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
@@ -248,6 +249,7 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
         if rk_vfs::loopdev::sysfs_files(d.rdev).is_some() {
             out.push((String::from("loop"), Kind::Dir));
         }
+        out.push((String::from("queue"), Kind::Dir));
         out.push((String::from("removable"), Kind::File(b"0\n".to_vec())));
         out.push((String::from("ro"), Kind::File(format!("{}\n", u8::from(ro)).into_bytes())));
         out.push((String::from("size"), Kind::File(format!("{size}\n").into_bytes())));
@@ -256,6 +258,25 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     out.push((String::from("subsystem"), Kind::Link(subsystem.into_bytes())));
     out.push((String::from("uevent"), Kind::File(uevent.into_bytes())));
     out
+}
+
+/// The files of the directory `queue` of the block device `d`, as block/blk-sysfs.c of Linux.
+/// The sizes of a block are those of the queue: sectors of 512 bytes. The memory of a direct I/O
+/// must be aligned to 512 bytes, the default `dma_alignment` of Linux.
+fn queue_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
+    let file = |name: &str, text: String| (String::from(name), Kind::File(text.into_bytes()));
+    let ra_pages = block_queue(d.rdev).map_or(rk_vfs::blockdev::READAHEAD_PAGES, |q| q.ra_pages());
+    let sector = rk_vfs::blockdev::SECTOR_SIZE;
+    alloc::vec![
+        file("dma_alignment", format!("{}\n", sector - 1)),
+        file("hw_sector_size", format!("{sector}\n")),
+        file("logical_block_size", format!("{sector}\n")),
+        file("minimum_io_size", format!("{sector}\n")),
+        file("optimal_io_size", String::from("0\n")),
+        file("physical_block_size", format!("{sector}\n")),
+        file("read_ahead_kb", format!("{}\n", ra_pages * 4)),
+        file("rotational", String::from("0\n")),
+    ]
 }
 
 /// The entries of the directory at `path`, from the list of devices `list`. Gives `None` if no
@@ -305,6 +326,9 @@ fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
         }
         ["devices", "virtual", class, name] => {
             device_entries(list.iter().find(|d| d.class == class && d.name == name)?)
+        }
+        ["devices", "virtual", class, name, "queue"] => {
+            queue_entries(list.iter().find(|d| d.class == class && d.name == name && d.block)?)
         }
         ["devices", "virtual", class, name, "loop"] => {
             let d = list.iter().find(|d| d.class == class && d.name == name && d.block)?;
@@ -547,7 +571,15 @@ mod tests {
         );
         assert_eq!(
             names("devices/virtual/block/vda"),
-            ["dev", "removable", "ro", "size", "subsystem", "uevent"]
+            ["dev", "queue", "removable", "ro", "size", "subsystem", "uevent"]
+        );
+        assert_eq!(
+            get("devices/virtual/block/vda/queue/logical_block_size"),
+            Kind::File(b"512\n".to_vec())
+        );
+        assert_eq!(
+            get("devices/virtual/block/vda/queue/dma_alignment"),
+            Kind::File(b"511\n".to_vec())
         );
         assert_eq!(
             get("devices/virtual/mem/null/subsystem"),

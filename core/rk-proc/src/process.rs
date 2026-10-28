@@ -73,6 +73,8 @@ struct Image {
     exe: Option<Location>,
     /// The auxiliary vector, for `/proc/PID/auxv`.
     auxv: Vec<u8>,
+    /// The denial of a write of the file of the program, while the program runs.
+    deny: Option<rk_vfs::file::DenyWrite>,
 }
 
 /// The signal state that the threads of a process share: the actions and the queue of the
@@ -642,13 +644,24 @@ impl Process {
     }
 
     /// Sets the arguments, the file and the auxiliary vector of the program, after `execve`.
-    pub fn set_image(&self, argv: &[Vec<u8>], exe: Location, auxv: Vec<u8>) {
+    /// `deny` denies a write of the file while the program runs.
+    pub fn set_image(
+        &self,
+        argv: &[Vec<u8>],
+        exe: Location,
+        auxv: Vec<u8>,
+        deny: rk_vfs::file::DenyWrite,
+    ) {
         let mut cmdline = Vec::new();
         for arg in argv {
             cmdline.extend_from_slice(arg);
             cmdline.push(0);
         }
-        *self.image.lock() = Image { cmdline, exe: Some(exe), auxv };
+        let old = core::mem::replace(
+            &mut *self.image.lock(),
+            Image { cmdline, exe: Some(exe), auxv, deny: Some(deny) },
+        );
+        drop(old);
     }
 
     /// The tick of the timer when the process was made.
@@ -1886,7 +1899,10 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let files = process.files.lock().take();
     let fs = process.fs.lock().take();
     let net = process.net.lock().take();
-    drop((vm, files, fs, net));
+    // The program does not run now, so its file can take a write, as `set_mm_exe_file` with
+    // no file in `exit_mmap` of Linux.
+    let deny = process.image.lock().deny.take();
+    drop((vm, files, fs, net, deny));
 
     let (children, parent, status) = {
         let mut s = process.state.lock();
