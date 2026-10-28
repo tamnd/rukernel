@@ -1776,6 +1776,7 @@ const INET6_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
 && busybox ping6 -c 1 ::1 \
 && { for i in 1 2 3 4 5 6 7 8 9 10; do ip -6 addr | grep -q fec0:: && break; sleep 1; done; } \
 && { for i in 1 2 3 4 5 6 7 8 9 10; do ip -6 route | grep -q ^default && break; sleep 1; done; } \
+&& { for i in 1 2 3 4 5; do ip -6 addr | grep -q tentative || break; sleep 1; done; } \
 && ip -6 addr && ip -6 route && ip -6 route show table local \
 && ip -6 addr show dev eth0 | grep -q 'inet6 fec0::5054:ff:fe12:3456/64 scope site' \
 && ip -6 route | grep -q '^default via fe80::2 dev eth0' \
@@ -1784,9 +1785,12 @@ const INET6_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
 && echo 'inet6: first'' part' || exit 1\n";
 
 /// The second line of the `inet6` test. It adds and deletes an address and a route through
-/// rtnetlink, and reads the IPv6 files of /proc/net.
+/// rtnetlink, and reads the IPv6 files of /proc/net. A new address is `tentative` until duplicate
+/// address detection ends, so the shell waits before it pings the address.
 const INET6_SCRIPT2: &[u8] = b"ip -6 addr add 2001:db8:1::5/64 dev eth0 \
-&& ip -6 addr show dev eth0 | grep -q 2001:db8:1::5/64 && busybox ping6 -c 1 2001:db8:1::5 \
+&& ip -6 addr show dev eth0 | grep -q 'inet6 2001:db8:1::5/64 .*tentative' \
+&& { for i in 1 2 3 4 5; do ip -6 addr | grep -q tentative || break; sleep 1; done; } \
+&& busybox ping6 -c 1 2001:db8:1::5 \
 && ip -6 addr del 2001:db8:1::5/64 dev eth0 && ! ip -6 addr | grep -q 2001:db8:1:: \
 && ip -6 route add 2001:db8:9::/48 via fe80::2 dev eth0 \
 && ip -6 route | grep -q '^2001:db8:9::/48 via fe80::2 dev eth0' \
@@ -1822,13 +1826,16 @@ const NETNS_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc && ip l
 && echo 'netns: first'' part' || exit 1\n";
 
 /// The second line of the `netns` test. It gives addresses to the two ends and pings across the
-/// pair with IPv4 and IPv6. The first namespace cannot reach the addresses.
+/// pair with IPv4 and IPv6, after duplicate address detection of the IPv6 addresses. The first
+/// namespace cannot reach the addresses.
 const NETNS_SCRIPT2: &[u8] = b"$N $A ip link set lo up && $N $A ip link set va up \
 && $N $B ip link set lo up && $N $B ip link set veth0 up \
 && $N $A ip addr add 10.9.0.1/24 dev va && $N $B ip addr add 10.9.0.2/24 dev veth0 \
 && $N $A ip -6 addr add fd00::1/64 dev va && $N $B ip -6 addr add fd00::2/64 dev veth0 \
 && $N $A ip addr && $N $A ip route && $N $B ip -6 route \
 && $N $A ping -c 1 10.9.0.2 && $N $B ping -c 1 10.9.0.1 \
+&& { for i in 1 2 3 4 5; do $N $A ip -6 addr | grep -q tentative || break; sleep 1; done; } \
+&& { for i in 1 2 3 4 5; do $N $B ip -6 addr | grep -q tentative || break; sleep 1; done; } \
 && $N $A busybox ping6 -c 1 fd00::2 && $N $B busybox ping6 -c 1 fd00::1 \
 && $N $A ip neigh && $N $A cat /proc/net/dev /proc/net/route /proc/net/snmp \
 && $N $A grep -q '^Icmp: [1-9]' /proc/net/snmp && ! grep -q va /proc/net/dev \

@@ -28,6 +28,7 @@ mod options;
 pub mod packet;
 pub mod procfs;
 pub mod sysctl;
+pub mod tun;
 pub mod veth;
 
 pub use options::{Options, Timeout};

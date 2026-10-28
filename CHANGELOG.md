@@ -2,6 +2,21 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- TUN and TAP devices on /dev/net/tun, as drivers/net/tun.c of Linux (#410). `ioctl` has `TUNSETIFF`, `TUNGETIFF`, `TUNGETFEATURES`, `TUNSETPERSIST`, `TUNSETOWNER`, `TUNSETGROUP`, `TUNSETLINK`, `TUNSETOFFLOAD`, `TUNSETTXFILTER`, `TUNGETSNDBUF`, `TUNSETSNDBUF`, the `vnet` header commands and `TUNSETCARRIER`. The files read and write packets with the `tun_pi` header and the `virtio_net_hdr` header.
+- `AF_PACKET` sockets get the frames that a device receives and, for `ETH_P_ALL`, the frames that it sends, with `sockaddr_ll`, `MSG_PEEK`, `MSG_TRUNC`, `poll` and `PACKET_ADD_MEMBERSHIP` (#410).
+- rtnetlink sends `RTM_NEWNSID` and `RTM_DELNSID` to the `RTNLGRP_NSID` group, and `RTM_GETNSID` takes `NETNSA_TARGET_NSID` and gives `NETNSA_CURRENT_NSID` (#410).
+- IPv6 duplicate address detection, as net/ipv6/addrconf.c of Linux (#410). A new address is `tentative` until the probes end, and a conflict marks it `dadfailed`. The interface sends an MLDv2 report when it joins the solicited node group of an address.
+- tools/ltp/build-ip.sh builds a static iproute2 `ip` for the LTP image (#410).
+- devtmpfs and /sys/class make the nodes of devices with a directory in the name, as /dev/net/tun (#410).
+
+### Fixed
+
+- /proc/net/unix shows only the sockets of the network name space of the reader (#410).
+
 ## [0.4.8] - 2026-10-28
 
 ### Added

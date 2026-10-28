@@ -69,6 +69,7 @@ pub fn init() {
     dev::add_notifier(addrconf::event);
     rk_net::sysctl::add_hook(addrconf::sysctl_hook);
     rk_net::ns::add_ops(ns_init, ns_exit);
+    dev::set_rx_kick(stack::poll_now);
     if let Some(lo) = dev::by_name("lo") {
         if lo.is_up() {
             fib::event(&lo, Event::Up);

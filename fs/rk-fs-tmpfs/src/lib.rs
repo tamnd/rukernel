@@ -129,13 +129,31 @@ fn mount_devtmpfs(_args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let root = ROOT.call_once(|| new(0o755)).clone();
     for d in rk_vfs::device::devices() {
         let kind = if d.block { FileType::BlockDevice } else { FileType::CharDevice };
+        // A name with a directory, as `net/tun`, gets its directories first.
+        let (dir, name) = match d.name.rsplit_once('/') {
+            Some((dirs, name)) => (make_dirs(&root, dirs)?, name),
+            None => (root.clone(), d.name.as_str()),
+        };
         // A read only remount of devtmpfs stops the new device files.
-        match root.create(d.name.as_bytes(), kind, d.perm, d.rdev) {
+        match dir.create(name.as_bytes(), kind, d.perm, d.rdev) {
             Ok(_) | Err(Errno::EEXIST | Errno::EROFS) => {}
             Err(e) => return Err(e),
         }
     }
     Ok(root)
+}
+
+/// Makes the directories `path` below `root` if they are not there, and gives the last one.
+fn make_dirs(root: &InodeRef, path: &str) -> Result<InodeRef> {
+    let mut dir = root.clone();
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        dir = match dir.create(part.as_bytes(), FileType::Directory, 0o755, 0) {
+            Ok(d) => d,
+            Err(Errno::EEXIST | Errno::EROFS) => dir.lookup(part.as_bytes())?,
+            Err(e) => return Err(e),
+        };
+    }
+    Ok(dir)
 }
 
 /// Parses a number with an optional suffix `k`, `m`, `g`, `t`, `p` or `e`, as `memparse` of

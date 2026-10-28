@@ -74,6 +74,7 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     rk_drv_mem::init();
     rk_drv_tty::init();
     rk_net::dev::init();
+    rk_net::tun::init();
     rk_drv_virtio::init();
     rk_net_inet::init();
     if let Some(ip) = param(boot.cmdline(), "ip") {

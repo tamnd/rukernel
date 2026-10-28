@@ -2,9 +2,11 @@
 //! UDP over IPv6, and the output of IPv6 through the neighbour table, as net/ipv6/ip6_input.c,
 //! ip6_output.c, icmp.c, ndisc.c and udp.c of Linux.
 //!
-//! The stack has no fragments, no duplicate address detection and no multicast listener
-//! discovery. An Ethernet device sends router solicitations when it goes up, and a router
-//! advertisement gives the default route and the global address of the device (SLAAC).
+//! The stack has no fragments. An Ethernet device sends router solicitations when it goes up,
+//! and a router advertisement gives the default route and the global address of the device
+//! (SLAAC). A new address goes through duplicate address detection, and the device sends an
+//! MLDv2 report when it joins the solicited node group of the address. The stack does not answer
+//! the queries of MLD.
 //!
 //! The locks are the same as in `stack`: the code holds at most one table lock at a time, and
 //! the notifications of rtnetlink go out after the lock is free.
@@ -33,6 +35,7 @@ use rk_abi::native::icmpv6::{
     ICMPV6_POLICY_FAIL, ICMPV6_PORT_UNREACH, ICMPV6_REJECT_ROUTE, ICMPV6_TIME_EXCEED,
     ICMPV6_UNK_NEXTHDR,
 };
+use rk_abi::native::if_addr::IFA_F_TENTATIVE;
 use rk_abi::native::if_ether::ETH_P_IPV6;
 use rk_abi::native::rtnetlink::RTPROT_RA;
 use rk_frame::sync::SpinLock;
@@ -54,6 +57,28 @@ static SOLICIT: PerNet<SpinLock<BTreeMap<u32, (u32, u64)>>> =
     PerNet::new(|| SpinLock::new(BTreeMap::new()));
 /// The time of the next check of the lifetimes of the addresses and routes.
 static NEXT_EXPIRE: PerNet<AtomicU64> = PerNet::new(|| AtomicU64::new(0));
+/// The addresses in duplicate address detection.
+static DAD: PerNet<SpinLock<Vec<Dad>>> = PerNet::new(|| SpinLock::new(Vec::new()));
+
+/// An address in duplicate address detection: the interface, the address, the probes that are
+/// left to send and the time of the next step in milliseconds.
+struct Dad {
+    ifindex: u32,
+    addr: Ip,
+    probes: u32,
+    next: u64,
+}
+
+/// The time between two probes, `RETRANS_TIMER` of Linux, in milliseconds.
+const RETRANS_TIMER_MS: u64 = 1000;
+/// The group of the MLDv2 routers, `ff02::16`.
+const ALL_MLDV2_ROUTERS: Ip = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x16];
+/// The ICMPv6 type of an MLDv2 report, `ICMPV6_MLD2_REPORT`.
+const MLD2_REPORT: u8 = 143;
+/// The record of a join, `MLD2_CHANGE_TO_EXCLUDE`.
+const MLD2_CHANGE_TO_EXCLUDE: u8 = 4;
+/// The next header of the hop-by-hop options, `NEXTHDR_HOP`.
+const NEXT_HOP: u8 = 0;
 
 /// The count of router solicitations, `rtr_solicits` of Linux.
 const RTR_SOLICITS: u32 = 3;
@@ -345,7 +370,8 @@ fn ether(dev: &NetDevice, dst: MacAddr) -> EthHeader {
 fn transmit(dev: &NetDevice, next: &Next6, mut buf: NetBuf) -> Result<()> {
     count(&COUNTERS6.out_transmits);
     add(&COUNTERS6.out_octets, buf.len());
-    if dev.kind() == LinkKind::Loopback {
+    // A TUN device has no link header and no neighbours, as the loopback device.
+    if matches!(dev.kind(), LinkKind::Loopback | LinkKind::Tun) {
         ether(dev, MacAddr::ZERO).push(&mut buf);
         return dev.transmit(buf);
     }
@@ -424,6 +450,89 @@ fn solicit(dev: &NetDevice, target: &Ip) {
     msg.extend_from_slice(target);
     put_link_option(&mut msg, ND_OPT_SOURCE_LL_ADDR, dev);
     send_ndisc(dev, &src, &dst, ipv6::multicast_mac(&dst), msg);
+}
+
+/// Sends a probe of duplicate address detection for `target`, as `addrconf_dad_work` of Linux:
+/// a neighbour solicitation from `::` to the solicited node group, without a link address.
+fn send_dad(dev: &NetDevice, target: &Ip) {
+    let dst = ipv6::solicited_node(target);
+    let mut msg = Vec::with_capacity(24);
+    msg.extend_from_slice(&[NDISC_NEIGHBOUR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
+    msg.extend_from_slice(target);
+    send_ndisc(dev, &ip::ANY, &dst, ipv6::multicast_mac(&dst), msg);
+}
+
+/// Starts the duplicate address detection of `addr` on `ifindex`. The first probe goes out at
+/// the next poll. A detection that runs for the address goes on.
+pub(crate) fn start_dad(ifindex: u32, addr: Ip) {
+    let probes = rk_net::sysctl::conf(
+        rk_net::sysctl::Family::Ipv6,
+        rk_net::sysctl::Scope::Dev(ifindex),
+        "dad_transmits",
+    );
+    let mut d = DAD.lock();
+    if d.iter().any(|x| x.ifindex == ifindex && x.addr == addr) {
+        return;
+    }
+    d.push(Dad { ifindex, addr, probes: probes.max(1) as u32, next: now_ms() });
+}
+
+/// Tells if `addr` on `ifindex` is in duplicate address detection, and stops the detection
+/// as a failure if it is, as `addrconf_dad_failure` of Linux.
+fn dad_conflict(ifindex: u32, addr: &Ip) -> bool {
+    let found = {
+        let mut d = DAD.lock();
+        let before = d.len();
+        d.retain(|x| !(x.ifindex == ifindex && x.addr == *addr));
+        d.len() != before
+    };
+    if found {
+        addrconf::dad_done(ifindex, addr, true);
+    }
+    found
+}
+
+/// Sends an MLDv2 report that the device joins `group`, as `igmp6_send` of Linux. The packet
+/// has the router alert option and the hop limit 1. The source is a link local address, or
+/// `::` if the device has none yet, as RFC 3590 allows.
+fn send_mld_join(dev: &NetDevice, group: &Ip) {
+    let ifindex = dev.ifindex();
+    let src = ROUTES6
+        .lock()
+        .addrs_of(ifindex)
+        .find(|a| ipv6::is_link_local(&a.addr) && a.flags & IFA_F_TENTATIVE == 0)
+        .map_or(ip::ANY, |a| a.addr);
+    let mut msg = Vec::with_capacity(28);
+    msg.extend_from_slice(&[MLD2_REPORT, 0, 0, 0, 0, 0, 0, 1]);
+    msg.extend_from_slice(&[MLD2_CHANGE_TO_EXCLUDE, 0, 0, 0]);
+    msg.extend_from_slice(group);
+    let dst = ALL_MLDV2_ROUTERS;
+    let sum = checksum::upper(&src, &dst, PROTO_ICMPV6, &msg);
+    msg[2..4].copy_from_slice(&sum.to_be_bytes());
+    // The hop-by-hop header: the router alert option for MLD, then two bytes of padding.
+    let hop = [PROTO_ICMPV6, 0, 5, 2, 0, 0, 1, 0];
+    let mut h = Header::new(src, dst, NEXT_HOP, hop.len() + msg.len());
+    h.hops = 1;
+    let mut buf = NetBuf::new(HEADROOM, HLEN + hop.len() + msg.len());
+    buf.extend_from_slice(&h.to_bytes());
+    buf.extend_from_slice(&hop);
+    buf.extend_from_slice(&msg);
+    count_icmp_out(&msg);
+    count(&COUNTERS6.out_requests);
+    count(&COUNTERS6.out_transmits);
+    count(&COUNTERS6.out_mcast);
+    ether(dev, ipv6::multicast_mac(&dst)).push(&mut buf);
+    // A lost report is like a lost frame. A router asks again with a query.
+    let _ = dev.transmit(buf);
+}
+
+/// Joins the solicited node group of the address `addr` on `dev`, as `addrconf_join_solict` of
+/// Linux, and sends the MLD report. The loopback device and a TUN device send no report.
+pub(crate) fn join(dev: &NetDevice, addr: &Ip) {
+    if dev.kind() != LinkKind::Ether || ipv6::is_multicast(addr) {
+        return;
+    }
+    send_mld_join(dev, &ipv6::solicited_node(addr));
 }
 
 /// Sends a router solicitation on `dev`, as `ndisc_send_rs` of Linux. Without a link local
@@ -648,11 +757,23 @@ fn ndisc_ns(dev: &NetDevice, h: &Header, msg: &[u8]) {
         return;
     }
     let ifindex = dev.ifindex();
-    let ours = ROUTES6.lock().addrs_of(ifindex).any(|a| a.addr == target);
+    let (ours, tentative) = {
+        let t = ROUTES6.lock();
+        let a = t.addrs_of(ifindex).find(|a| a.addr == target);
+        (a.is_some(), a.is_some_and(|a| a.flags & IFA_F_TENTATIVE != 0))
+    };
     let slla = link_option(&msg[24..], ND_OPT_SOURCE_LL_ADDR);
     // A probe of duplicate address detection has the source `::` and no link address.
     let dad = h.src == ip::ANY;
     if dad && slla.is_some() {
+        return;
+    }
+    // A tentative address answers nothing. A probe of another node for it is a conflict, as
+    // `ndisc_recv_ns` of Linux.
+    if tentative {
+        if dad {
+            dad_conflict(ifindex, &target);
+        }
         return;
     }
     if let Some(mac) = slla {
@@ -684,6 +805,10 @@ fn ndisc_na(dev: &NetDevice, h: &Header, msg: &[u8]) {
     }
     let Ok(target) = <Ip>::try_from(&msg[8..24]) else { return };
     if ipv6::is_multicast(&target) {
+        return;
+    }
+    // Another node has the address that is in detection, as `ndisc_recv_na` of Linux.
+    if dad_conflict(dev.ifindex(), &target) {
         return;
     }
     if let Some(mac) = link_option(&msg[24..], ND_OPT_TARGET_LL_ADDR) {
@@ -821,10 +946,46 @@ pub(crate) fn tick() {
             send_rs(&d);
         }
     }
+    dad_tick(now);
     // The lifetimes count in seconds, thus one check each second is enough.
     if NEXT_EXPIRE.load(Ordering::Relaxed) <= now {
         NEXT_EXPIRE.store(now + 1000, Ordering::Relaxed);
         addrconf::expire(now);
+    }
+}
+
+/// Sends the probes of duplicate address detection that are due, and ends the detections
+/// without an answer, as `addrconf_dad_work` of Linux.
+fn dad_tick(now: u64) {
+    let (probes, done) = {
+        let mut d = DAD.lock();
+        if d.is_empty() {
+            return;
+        }
+        let (mut probes, mut done) = (Vec::new(), Vec::new());
+        d.retain_mut(|x| {
+            if x.next > now {
+                return true;
+            }
+            if x.probes == 0 {
+                done.push((x.ifindex, x.addr));
+                return false;
+            }
+            x.probes -= 1;
+            x.next = now + RETRANS_TIMER_MS;
+            probes.push((x.ifindex, x.addr));
+            true
+        });
+        (probes, done)
+    };
+    for (ifindex, addr) in probes {
+        match dev::by_index(ifindex).filter(|d| d.is_up()) {
+            Some(d) => send_dad(&d, &addr),
+            None => DAD.lock().retain(|x| !(x.ifindex == ifindex && x.addr == addr)),
+        }
+    }
+    for (ifindex, addr) in done {
+        addrconf::dad_done(ifindex, &addr, false);
     }
 }
 
@@ -834,5 +995,6 @@ pub(crate) fn ns_exit() {
     NEIGH6.reset();
     SOLICIT.reset();
     NEXT_EXPIRE.reset();
+    DAD.reset();
     COUNTERS6.reset();
 }

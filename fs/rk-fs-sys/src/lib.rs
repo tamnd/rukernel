@@ -263,6 +263,12 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
     out
 }
 
+/// The name of the device `d` in sysfs: the last part of its path in `/dev`, as `tun` for
+/// `net/tun`.
+fn node_name(d: &DeviceInfo) -> &str {
+    d.name.rsplit('/').next().unwrap_or(&d.name)
+}
+
 /// The files and links in the directory of the device `d`.
 fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     let mut uevent =
@@ -325,13 +331,15 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         names.map(|n| (String::from(n), Kind::Dir)).collect()
     };
     let to_device = |up: &str, d: &DeviceInfo| {
-        Kind::Link(format!("{up}devices/virtual/{}/{}", d.class, d.name).into_bytes())
+        Kind::Link(format!("{up}devices/virtual/{}/{}", d.class, node_name(d)).into_bytes())
     };
     let out = match parts[..] {
         [] => dirs(&mut TOP.iter().copied()),
-        ["block"] => {
-            list.iter().filter(|d| d.block).map(|d| (d.name.clone(), to_device("../", d))).collect()
-        }
+        ["block"] => list
+            .iter()
+            .filter(|d| d.block)
+            .map(|d| (String::from(node_name(d)), to_device("../", d)))
+            .collect(),
         ["class"] | ["devices", "virtual"] => dirs(&mut classes.iter().copied()),
         ["class", NET] => net
             .iter()
@@ -346,7 +354,7 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         ["class", class] => list
             .iter()
             .filter(|d| d.class == class)
-            .map(|d| (d.name.clone(), to_device("../../", d)))
+            .map(|d| (String::from(node_name(d)), to_device("../../", d)))
             .collect(),
         ["dev"] => dirs(&mut ["block", "char"].into_iter()),
         ["dev", kind @ ("block" | "char")] => list
@@ -355,17 +363,19 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
             .map(|d| (numbers(d), to_device("../../", d)))
             .collect(),
         ["devices"] => dirs(&mut ["virtual"].into_iter()),
-        ["devices", "virtual", class] if classes.contains(class) => {
-            list.iter().filter(|d| d.class == class).map(|d| (d.name.clone(), Kind::Dir)).collect()
-        }
+        ["devices", "virtual", class] if classes.contains(class) => list
+            .iter()
+            .filter(|d| d.class == class)
+            .map(|d| (String::from(node_name(d)), Kind::Dir))
+            .collect(),
         ["devices", "virtual", class, name] => {
-            device_entries(list.iter().find(|d| d.class == class && d.name == name)?)
+            device_entries(list.iter().find(|d| d.class == class && node_name(d) == name)?)
         }
-        ["devices", "virtual", class, name, "queue"] => {
-            queue_entries(list.iter().find(|d| d.class == class && d.name == name && d.block)?)
-        }
+        ["devices", "virtual", class, name, "queue"] => queue_entries(
+            list.iter().find(|d| d.class == class && node_name(d) == name && d.block)?,
+        ),
         ["devices", "virtual", class, name, "loop"] => {
-            let d = list.iter().find(|d| d.class == class && d.name == name && d.block)?;
+            let d = list.iter().find(|d| d.class == class && node_name(d) == name && d.block)?;
             let files = rk_vfs::loopdev::sysfs_files(d.rdev)?;
             files
                 .into_iter()
