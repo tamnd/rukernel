@@ -394,6 +394,10 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// can take more than `BOOT_TEST_TIMEOUT` (#396).
 const INIT_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// The longest time that the `smp` boot test can take. It runs the init checks on `SMP_CPUS` CPUs,
+/// and on a busy host it can take more than 300 s, because all kernel code runs under one lock.
+const SMP_TEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The longest time that a boot test of a root file system can take. The `alpine` test makes and
 /// checks file systems on two disks, and it is slow on a busy host.
 const ROOTFS_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1935,7 +1939,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             (qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)
         } else {
             let cmdline = test_cmdline(test);
-            let timeout = if cmdline.contains("rk.test=init") {
+            let timeout = if *test == "smp" {
+                SMP_TEST_TIMEOUT
+            } else if cmdline.contains("rk.test=init") {
                 INIT_TEST_TIMEOUT
             } else {
                 BOOT_TEST_TIMEOUT
