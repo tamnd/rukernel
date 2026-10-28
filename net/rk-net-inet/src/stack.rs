@@ -506,9 +506,10 @@ fn icmp_input(h: &Header, msg: &[u8], broadcast: bool) {
     }
     count(&COUNTERS.icmp_in_type[usize::from(msg[0])]);
     match msg[0] {
-        // Linux ignores an echo request to a broadcast address by default, as
+        // `icmp_echo` of Linux ignores a request for `net.ipv4.icmp_echo_ignore_all`. The stack
+        // ignores each request to a broadcast address, as the default of
         // `net.ipv4.icmp_echo_ignore_broadcasts`.
-        ICMP_ECHO if !broadcast => {
+        ICMP_ECHO if !broadcast && rk_net::sysctl::ipv4("icmp_echo_ignore_all") == 0 => {
             let mut reply = msg.to_vec();
             reply[0] = ICMP_ECHOREPLY;
             reply[2..4].fill(0);
@@ -557,7 +558,7 @@ fn icmp_unreach(kind: u8, code: u8, inner: &[u8]) {
 /// Sends an ICMP message from `src` to `dst`.
 fn send_icmp(src: Addr, dst: Addr, tos: u8, msg: &[u8]) {
     let Ok(next) = route(dst) else { return };
-    let out = Out { src, dst, protocol: PROTO_ICMP, ttl: ipv4::DEFAULT_TTL, tos };
+    let out = Out { src, dst, protocol: PROTO_ICMP, ttl: rk_net::sysctl::default_ttl(), tos };
     // An ICMP message that the stack makes is not for a socket, and a lost one is not an error.
     let _ = output(&next, &out, msg);
 }

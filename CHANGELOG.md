@@ -19,6 +19,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The block device `ioctl` commands `BLKRAGET`, `BLKRASET`, `BLKFRAGET` and `BLKFRASET`, and the directory /sys/block/DEV/queue (#385).
 - `poll` on /proc/PID/mounts gives `POLLERR | POLLPRI` after a mount or an unmount in the namespace, as `mounts_poll` of Linux (#385).
 - The CortenMM experiment, an address space backend of rk-mm behind the `corten` feature (#323). The status of each page is in a tree with the shape of the page table, and each node of the tree has its own lock. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range, and the other calls lock the whole tree. The default kernel keeps the VMA backend. `RK_KERNEL_FEATURES=corten cargo xtask boot-test` boots the new backend. The benchmarks `fault_mt` and `mmap_mt` of tools/bench run the page fault and `mmap` in one thread per CPU, and `run.py --reuse-linux` boots only rukernel. tools/bench/cortenmm.md has the results.
+- Each namespace has its own /proc/sys/net, as on Linux (#390). It has the per-namespace sysctls of net.core, net.ipv4, net.ipv6 and net.unix, and the files of net.ipv4.conf and net.ipv6.conf for all, default and each device, with `disable_ipv6`, `accept_dad`, `accept_ra` and `forwarding`. `disable_ipv6` removes the IPv6 addresses of a device, and `ip_default_ttl` and `icmp_echo_ignore_all` change the IPv4 stack.
+- The `dummy` network device, for `ip link add NAME type dummy` (#390).
+- Packet sockets of the family `AF_PACKET`, for `SOCK_RAW` and `SOCK_DGRAM` (#390). They send frames and give the ioctls of the devices. They do not receive frames yet.
+- `RTM_NEWNSID` and `RTM_GETNSID`, and `IFLA_LINK_NETNSID` for a veth pair with its ends in two namespaces (#390).
 
 ### Fixed
 
@@ -40,6 +44,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A read of a Unix socket wakes the writers only when at most a quarter of the send buffer is in use, as `unix_write_space` of Linux (#396). Before, each read woke each writer, and hackbench on 2 CPUs took 95 s, now 36 s.
 - The `smp` boot test runs with 4 CPUs, not 8, and the boot tests of init have a limit of 300 s, not 120 s (#396). The `smp` test has a limit of 600 s. On a busy host, the `smp` test took 322 s with 8 CPUs.
 - The init check of a file lock of another process waits for the child through a pipe, not for a fixed time, so it passes on a busy host (#396).
+- `setns` and `unshare` of the network namespace change the calling thread only, not the whole process, as on Linux (#390).
+- A sysfs mount shows the network devices of the namespace that mounted it, as on Linux (#390). A new namespace can mount sysfs again on /sys.
+- Each network namespace has its own abstract Unix socket names (#390).
 
 ## [0.4.6] - 2026-10-28
 

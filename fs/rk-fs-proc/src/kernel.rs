@@ -215,8 +215,9 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
 
 /// The directory `/proc/PID/ns`: a magic link for each namespace of the process that has a file,
 /// as `fs/proc/namespaces.c` of Linux. The link shows `KIND:[INODE]`, and a walk goes to the
-/// file of the namespace, which `setns` takes.
-fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
+/// file of the namespace, which `setns` takes. `t` is the thread of a directory in `task`: each
+/// thread has its own network namespace.
+fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
     use rk_vfs::nsfs::{NsInode, NsKind, link_text};
     /// The entries: rukernel makes no PID or time namespace for the children, so the
     /// `*_for_children` links name the namespace of the process.
@@ -243,16 +244,27 @@ fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
                 .iter()
                 .map(|&(name, kind)| {
                     let (p_, p_j) = (w.clone(), w.clone());
+                    let (t_, t_j) = (t.clone(), t.clone());
                     let link = jump_link(
                         &join(&path_, name),
                         0o777,
-                        move || Ok(link_text(kind, rk_proc::ns::ns_id(&*alive(&p_)?, kind)?)),
+                        move || {
+                            let p = alive(&p_)?;
+                            let id = match (kind, &t_) {
+                                (NsKind::Net, Some(t)) => alive(t)?.net_ns().id(),
+                                _ => rk_proc::ns::ns_id(&p, kind)?,
+                            };
+                            Ok(link_text(kind, id))
+                        },
                         move || {
                             let p = alive(&p_j)?;
                             let node = match kind {
                                 // The file keeps the network namespace, as on Linux.
                                 NsKind::Net => {
-                                    let net = p.net_ns();
+                                    let net = match &t_j {
+                                        Some(t) => alive(t)?.net_ns(),
+                                        None => p.net_ns(),
+                                    };
                                     NsInode::with_hold(kind, net.id(), net)
                                 }
                                 _ => NsInode::new(kind, rk_proc::ns::ns_id(&p, kind)?),
@@ -370,11 +382,6 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
     ("kernel/version", ""),
-    // The tag of an IPv4 device, which no part of the kernel reads.
-    ("net/ipv4/conf/all/tag", "0"),
-    ("net/ipv4/conf/default/tag", "0"),
-    ("net/ipv4/conf/lo/tag", "0"),
-    ("net/ipv4/ping_group_range", ""),
     ("vm/dirty_background_bytes", "0"),
     ("vm/dirty_background_ratio", "10"),
     ("vm/dirty_bytes", "0"),
@@ -398,9 +405,6 @@ const SYSCTLS: &[(&str, &str)] = &[
 
 /// The sysctls that only give text, with the mode 0444 of Linux.
 const READ_ONLY_SYSCTLS: &[&str] = &["kernel/random/entropy_avail", "kernel/random/poolsize"];
-
-/// The sysctl of the groups that can make an ICMP echo socket. rk-net keeps the value.
-const PING_GROUP_RANGE: &str = "net/ipv4/ping_group_range";
 
 static SYSCTL_VALUES: SpinLock<Vec<(&'static str, Vec<u8>)>> = SpinLock::new(Vec::new());
 
@@ -493,10 +497,6 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some((get, _)) = vm_tunable(name) {
         return format!("{}\n", get()).into_bytes();
     }
-    if name == PING_GROUP_RANGE {
-        let (low, high) = rk_net::sysctl::ping_group_range();
-        return format!("{low}\t{high}\n").into_bytes();
-    }
     if let Some(f) = uts_name(name) {
         let mut v = rk_proc::uts::bytes(&f()).to_vec();
         v.push(b'\n');
@@ -563,16 +563,6 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         }
         return set(n).ok_or(Errno::EINVAL);
-    }
-    // Two group IDs, as `ipv4_ping_group_range` of Linux.
-    if name == PING_GROUP_RANGE {
-        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-        let mut words = text.split_ascii_whitespace().map(str::parse::<u32>);
-        let (Some(Ok(low)), Some(Ok(high)), None) = (words.next(), words.next(), words.next())
-        else {
-            return Err(Errno::EINVAL);
-        };
-        return rk_net::sysctl::set_ping_group_range(low, high).ok_or(Errno::EINVAL);
     }
     // A name ends at a newline, and only the first 64 bytes count, as `proc_dostring` of Linux.
     if uts_name(name).is_some() {
@@ -642,6 +632,9 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
         0o555,
         move || {
             let mut out: Vec<(Vec<u8>, InodeRef)> = Vec::new();
+            if prefix.is_empty() {
+                out.push((b"net".to_vec(), sys_net_dir(String::new())));
+            }
             let ipc = rk_vfs::ipc::SYSCTL_NAMES.iter().map(|&n| (n, ""));
             for (name, default) in SYSCTLS.iter().copied().chain(ipc) {
                 let rest = if prefix.is_empty() {
@@ -672,6 +665,45 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
                 }
             }
             Ok(out)
+        },
+        None,
+    )
+}
+
+/// The directory `/proc/sys/net/<path>`, with the values of `rk_net::sysctl`. The entries are
+/// the ones of the network namespace of the reader, as `net_ctl_header_lookup` of Linux.
+fn sys_net_dir(path: String) -> InodeRef {
+    let full = if path.is_empty() { String::from("/sys/net") } else { format!("/sys/net/{path}") };
+    let parent = String::from(&full[..full.rfind('/').unwrap_or(0)]);
+    let list_path = full.clone();
+    dir(
+        full.as_bytes(),
+        parent.as_bytes(),
+        0o555,
+        move || {
+            let entries = rk_net::sysctl::list(&path).ok_or(Errno::ENOENT)?;
+            Ok(entries
+                .into_iter()
+                .map(|(name, kind)| {
+                    let sub = if path.is_empty() { name.clone() } else { format!("{path}/{name}") };
+                    let fpath = format!("{list_path}/{name}");
+                    let node = match kind {
+                        rk_net::sysctl::Entry::Dir => sys_net_dir(sub),
+                        rk_net::sysctl::Entry::File(true) => {
+                            let w = sub.clone();
+                            rw_file(
+                                fpath.as_bytes(),
+                                move || rk_net::sysctl::read(&sub),
+                                move |data| rk_net::sysctl::write(&w, data),
+                            )
+                        }
+                        rk_net::sysctl::Entry::File(false) => {
+                            file(fpath.as_bytes(), move || rk_net::sysctl::read(&sub))
+                        }
+                    };
+                    (name.into_bytes(), node)
+                })
+                .collect())
         },
         None,
     )
@@ -1305,7 +1337,7 @@ fn process_files(
         b"cgroup".to_vec(),
         file(&join(base, b"cgroup"), move || Ok(cgroup_of(&*alive(&p_)?))),
     ));
-    out.push((b"ns".to_vec(), ns_dir(base, w.clone())));
+    out.push((b"ns".to_vec(), ns_dir(base, w.clone(), t.clone())));
     let p_ = w.clone();
     let p2 = w.clone();
     out.push((

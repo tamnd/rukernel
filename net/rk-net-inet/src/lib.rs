@@ -66,6 +66,7 @@ pub fn init() {
     rk_net::ioctl::set_ifconf(fib::ifconf);
     dev::add_notifier(fib::event);
     dev::add_notifier(addrconf::event);
+    rk_net::sysctl::add_hook(addrconf::sysctl_hook);
     rk_net::ns::add_ops(ns_init, ns_exit);
     if let Some(lo) = dev::by_name("lo") {
         if lo.is_up() {

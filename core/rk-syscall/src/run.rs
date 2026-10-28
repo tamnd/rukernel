@@ -317,9 +317,13 @@ fn send_sigio(file: &rk_vfs::file::File, fd: i32, code: i32) {
     }
 }
 
-/// The network namespace of the process `pid`, for `IFLA_NET_NS_PID`.
+/// The network namespace of the thread `pid`, for `IFLA_NET_NS_PID`, as `get_net_ns_by_pid` of
+/// Linux takes the task with the ID.
 fn net_ns_of_pid(pid: i32) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
     let pid = u32::try_from(pid).map_err(|_| Errno::ESRCH)?;
+    if let Some(t) = rk_proc::find_thread(pid) {
+        return Ok(t.net_ns());
+    }
     Ok(rk_proc::find_process(pid).ok_or(Errno::ESRCH)?.net_ns())
 }
 
@@ -345,7 +349,7 @@ pub fn init() {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });
     rk_net::set_cred_source(crate::net::current_cred);
-    rk_net::ns::set_source(|| rk_proc::current_thread().and_then(|t| t.process().net_ns_opt()));
+    rk_net::ns::set_source(|| rk_proc::current_thread().and_then(|t| t.net_ns_opt()));
     rk_net::ns::set_resolver(rk_net::ns::Resolver { by_pid: net_ns_of_pid, by_fd: net_ns_of_fd });
     rk_net_unix::init();
     rk_vfs::wait::set_interrupt_check(|| {

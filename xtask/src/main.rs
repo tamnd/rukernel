@@ -1833,7 +1833,16 @@ const NETNS_SCRIPT2: &[u8] = b"$N $A ip link set lo up && $N $A ip link set va u
 && ! ip route | grep -q 10.9.0 && ! ping -c 1 -W 1 10.9.0.2 \
 && echo 'netns: second'' part' || exit 1\n";
 
-/// The third line of the `netns` test. When the two processes end, the namespaces go, and the
+/// The third line of the `netns` test. The sysctls of /proc/sys/net and a dummy device are in
+/// one namespace only.
+const NETNS_SCRIPT_SYSCTL: &[u8] = b"$N $A cat /proc/sys/net/ipv6/conf/va/disable_ipv6 \
+&& ! test -e /proc/sys/net/ipv6/conf/va \
+&& $N $A sh -c 'echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_all' \
+&& ! $N $B ping -c 1 -W 1 10.9.0.1 && grep -q 0 /proc/sys/net/ipv4/icmp_echo_ignore_all \
+&& $N $A ip link add d0 type dummy && $N $A ip link show d0 && ! ip link show d0 \
+&& echo 'netns: third'' part' || exit 1\n";
+
+/// The last line of the `netns` test. When the two processes end, the namespaces go, and the
 /// veth pair goes with them.
 const NETNS_SCRIPT3: &[u8] = b"kill $A $B; wait; sleep 1; ip link \
 && ! ip link | grep -q veth && test \"$(ip link | grep -c mtu)\" = 1 && exit 0; exit 1\n";
@@ -1856,7 +1865,8 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
         "netns" => &[
             ("/ # ", NETNS_SCRIPT),
             ("netns: first part", NETNS_SCRIPT2),
-            ("netns: second part", NETNS_SCRIPT3),
+            ("netns: second part", NETNS_SCRIPT_SYSCTL),
+            ("netns: third part", NETNS_SCRIPT3),
         ],
         "inet6" => &[
             ("/ # ", INET6_SCRIPT),

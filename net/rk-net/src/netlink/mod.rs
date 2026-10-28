@@ -11,6 +11,7 @@
 
 pub mod link;
 pub mod msg;
+pub mod nsid;
 
 use crate::consts::{
     AF_NETLINK, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOL_NETLINK,
@@ -872,6 +873,7 @@ pub fn init() {
         }
     }
     link::init();
+    nsid::init();
 }
 
 /// The result of a message to the kernel.

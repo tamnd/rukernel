@@ -117,9 +117,9 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && process.threads().len() > 1 {
         return Err(Errno::EINVAL);
     }
-    // The namespace goes to all the threads of the process. Linux gives it only to the caller.
+    // Only the caller gets the new namespace, as `switch_task_namespaces` of Linux.
     if flags & CLONE_NEWNET != 0 {
-        process.set_net_ns(new_net_ns(process)?);
+        cx.thread.set_net_ns(new_net_ns(process)?);
     }
     if flags & CLONE_FILES != 0 {
         let table = cx.files()?.lock().clone();
@@ -187,17 +187,17 @@ fn new_cgroup_ns(process: &Process) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Puts `process` in the network namespace `ns`, as `netns_install` of Linux. The namespace goes
-/// to all the threads of the process.
+/// Puts the calling thread in the network namespace `ns`, as `netns_install` of Linux. The other
+/// threads of the process keep their namespace.
 ///
 /// # Errors
 ///
 /// `EPERM` without `CAP_SYS_ADMIN`.
-fn join_net_ns(process: &Process, ns: Arc<rk_net::ns::NetNs>) -> Result<(), Errno> {
-    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+fn join_net_ns(cx: &Cx<'_>, ns: Arc<rk_net::ns::NetNs>) -> Result<(), Errno> {
+    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    process.set_net_ns(ns);
+    cx.thread.set_net_ns(ns);
     Ok(())
 }
 
@@ -232,7 +232,7 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
             rk_vfs::nsfs::NsKind::Cgroup => join_cgroup_ns(process, id)?,
             // The file keeps the namespace, so the search finds it.
             rk_vfs::nsfs::NsKind::Net => {
-                join_net_ns(process, rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?)?;
+                join_net_ns(cx, rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?)?;
             }
             kind => crate::ns::install(cx, process, kind, id)?,
         }
@@ -260,7 +260,7 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
         join_cgroup_ns(process, target.cgroup_ns())?;
     }
     if nstype & CLONE_NEWNET != 0 {
-        join_net_ns(process, target.net_ns())?;
+        join_net_ns(cx, target.net_ns())?;
     }
     Ok(0)
 }
@@ -347,15 +347,8 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
             return Err(Errno::EPERM);
         }
     }
-    // The threads of a process share one network namespace in rukernel.
-    let net = if flags & CLONE_NEWNET != 0 {
-        if flags & CLONE_THREAD != 0 {
-            return Err(Errno::EINVAL);
-        }
-        Some(new_net_ns(cx.process())?)
-    } else {
-        None
-    };
+    // A new thread can have its own network namespace, as on Linux.
+    let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cx.process())?) } else { None };
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread(cx.thread)?
     } else {
@@ -375,7 +368,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
         fs.lock().unshare_namespace();
     }
     if let Some(net) = net {
-        thread.process().set_net_ns(net);
+        thread.set_net_ns(net);
     }
     if flags & CLONE_NEWCGROUP != 0 {
         let process = thread.process();

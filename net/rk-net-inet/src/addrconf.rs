@@ -36,6 +36,7 @@ use rk_net::consts::AF_INET6;
 use rk_net::dev::{self, Event, LinkKind, NetDevice};
 use rk_net::netlink::msg::{Attrs, Builder, attrs};
 use rk_net::netlink::{self, Origin, Request};
+use rk_net::sysctl::{Family, Scope};
 use rk_vfs::inode::Result;
 
 /// The last attribute of an address, `IFA_MAX` of Linux.
@@ -193,6 +194,10 @@ pub(crate) fn add_addr(mut a: Addr6, origin: Origin) -> Result<()> {
     if dev::by_index(a.ifindex).is_none() {
         return Err(Errno::ENODEV);
     }
+    // `ipv6_add_addr` of Linux gives `EACCES` when `disable_ipv6` is set on the device.
+    if rk_net::sysctl::ipv6_disabled(a.ifindex) {
+        return Err(Errno::EACCES);
+    }
     let now = now_cs();
     a.tstamp = now;
     a.cstamp = now;
@@ -313,6 +318,8 @@ pub(crate) fn expire(now_ms: u64) {
 pub(crate) fn event(d: &NetDevice, e: Event) {
     let ifindex = d.ifindex();
     match e {
+        // `addrconf_notify` of Linux does nothing for a device with `disable_ipv6`.
+        Event::Up if rk_net::sysctl::ipv6_disabled(ifindex) => {}
         Event::Up => {
             let loopback = d.kind() == LinkKind::Loopback;
             if loopback {
@@ -344,6 +351,19 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
 }
 
 /// Checks the attributes of an address against `ifa_ipv6_policy` of Linux.
+/// Takes a write of `net.ipv6.conf.DEV.disable_ipv6`, as `dev_disable_change` of Linux. The
+/// device loses its addresses and routes when IPv6 goes off, and it gets them again when IPv6
+/// comes on and the device is up.
+pub(crate) fn sysctl_hook(f: Family, scope: Scope, name: &'static str, value: i32) {
+    let (Family::Ipv6, Scope::Dev(ifindex), "disable_ipv6") = (f, scope, name) else { return };
+    let Some(d) = dev::by_index(ifindex) else { return };
+    if value != 0 {
+        event(&d, Event::Down);
+    } else if d.is_up() {
+        event(&d, Event::Up);
+    }
+}
+
 fn check_addr_policy(a: &Attrs<'_>) -> Result<()> {
     for ty in [IFA_LOCAL, IFA_ADDRESS] {
         a.addr6(ty)?;

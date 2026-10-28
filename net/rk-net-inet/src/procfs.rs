@@ -749,7 +749,7 @@ pub(crate) fn show_snmp() -> String {
         "Ip",
         &[
             ("Forwarding", 2),
-            ("DefaultTTL", i64::from(crate::ipv4::DEFAULT_TTL)),
+            ("DefaultTTL", i64::from(rk_net::sysctl::default_ttl())),
             ("InReceives", c(&k.ip_in)),
             ("InHdrErrors", c(&k.ip_in_hdr_errors)),
             ("InAddrErrors", c(&k.ip_in_addr_errors)),

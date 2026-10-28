@@ -135,7 +135,7 @@ fn split_type(kind: u64) -> Result<(u32, u32), Errno> {
 }
 
 /// Makes a socket of the family `domain`. A socket of a family with a namespace stays in the
-/// network namespace of the process, as `sock_create` of Linux takes `current->nsproxy->net_ns`.
+/// network namespace of the thread, as `sock_create` of Linux takes `current->nsproxy->net_ns`.
 fn new_socket(
     cx: &Cx<'_>,
     domain: u64,
@@ -154,7 +154,7 @@ fn new_socket(
     if domain == AF_UNIX {
         return family_socket(cx, domain, kind, protocol);
     }
-    let net = cx.process().net_ns();
+    let net = cx.thread.net_ns();
     let sock = {
         let _in = rk_net::ns::enter(&net);
         family_socket(cx, domain, kind, protocol)?
@@ -201,6 +201,14 @@ fn family_socket(
                 return Ok(rk_net_inet::new_socket6(proto));
             }
             Ok(rk_net_inet::new_socket(proto))
+        }
+        // A packet socket needs `CAP_NET_RAW`, as `packet_create` of Linux.
+        rk_net::packet::AF_PACKET => {
+            if !cx.process().cred().capable(cap::NET_RAW) {
+                return Err(Errno::EPERM);
+            }
+            let protocol = u32::try_from(protocol).map_err(|_| Errno::EINVAL)?;
+            Ok(rk_net::packet::PacketSocket::new(kind, protocol)?)
         }
         AF_NETLINK => {
             let protocol = u32::try_from(protocol as i32).map_err(|_| Errno::EPROTONOSUPPORT)?;

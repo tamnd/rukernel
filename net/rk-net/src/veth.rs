@@ -34,7 +34,7 @@ pub struct Veth {
 }
 
 /// A random hardware address with the local bit set, as `eth_hw_addr_random` of Linux.
-fn random_mac() -> MacAddr {
+pub(crate) fn random_mac() -> MacAddr {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let mut x = rk_frame::arch::random_seed() ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
