@@ -41,6 +41,7 @@ use rk_vfs::cred::{Cred, cap, may};
 use rk_vfs::file::{File, FileOps};
 use rk_vfs::fstype::{FsType, MountArgs};
 use rk_vfs::inode::mode;
+use rk_vfs::wait::{PollTable, WaitQueue};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, now};
 
 /// The magic number of cgroup2, `CGROUP2_SUPER_MAGIC` of `<linux/magic.h>`.
@@ -67,6 +68,15 @@ const _: () = assert!(FILES.len() < CREATOR as usize);
 /// root.
 static NS_DELEGATE: AtomicBool = AtomicBool::new(false);
 
+/// The waits of `poll` on `cgroup.events` and the other files with events wait here. A change of
+/// such a file wakes them.
+static EVENTS: WaitQueue = WaitQueue::new();
+
+/// Wakes the waits of `poll` on the files with events. rk-cgroup calls it after a change.
+fn wake_events() {
+    EVENTS.wake_all();
+}
+
 /// The owner and the mode that `chown` and `chmod` gave, and the owner of each cgroup that a
 /// process that is not root made, by inode number. Other inodes belong to root.
 static ATTRS: SpinLock<BTreeMap<u64, Attr>> = SpinLock::new(BTreeMap::new());
@@ -89,7 +99,7 @@ const DELEGATABLE: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.subtre
 /// it or clears it, as `apply_cgroup_root_flags` of Linux. cgroup2 takes the other options of
 /// Linux, but they have no effect here.
 fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
-    rk_cgroup::set_notify(rk_vfs::wait::poll_wake);
+    rk_cgroup::set_notify(wake_events);
     let (ns, root) = procs::namespace();
     if ns == 0 {
         let on = args.data.split(|&b| b == b',').any(|o| o == b"nsdelegate");
@@ -572,6 +582,13 @@ impl FileOps for OpenFile {
         true
     }
 
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        match &*self.trigger.lock() {
+            Some(t) => table.add(&t.wait),
+            None => table.add_static(&EVENTS),
+        }
+    }
+
     fn event_count(&self) -> u64 {
         match &*self.trigger.lock() {
             Some(t) => t.events.load(Ordering::Relaxed),
@@ -590,6 +607,8 @@ pub(crate) struct PsiTrigger {
     event: AtomicBool,
     /// The count of events, for an edge triggered epoll entry.
     events: AtomicU64,
+    /// The waits of `poll` on the file of the trigger wait here.
+    wait: Arc<WaitQueue>,
     timer: Once<procs::TriggerTimer>,
 }
 
@@ -604,6 +623,7 @@ impl PsiTrigger {
             state: SpinLock::new(TriggerState::new(trigger, resource, now, total)),
             event: AtomicBool::new(false),
             events: AtomicU64::new(0),
+            wait: Arc::new(WaitQueue::new()),
             timer: Once::new(),
         });
         // The timer checks the trigger ten times in each window.
@@ -624,7 +644,7 @@ impl PsiTrigger {
         if self.state.lock().check(now, total) {
             self.event.store(true, Ordering::Relaxed);
             self.events.fetch_add(1, Ordering::Relaxed);
-            rk_vfs::wait::poll_wake();
+            self.wait.wake_all();
         }
     }
 

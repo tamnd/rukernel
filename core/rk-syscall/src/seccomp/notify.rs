@@ -21,6 +21,7 @@ use rk_proc::limits::RLIMIT_NOFILE;
 use rk_proc::ptrace::NO_SYSCALL;
 use rk_proc::seccomp::{AddFd, Filter, Notif, NotifState, Notify};
 use rk_vfs::file::{File, FileOps, events};
+use rk_vfs::wait::PollTable;
 
 /// The commands of `ioctl` on a listener.
 const SECCOMP_IOCTL_NOTIF_RECV: u32 = 0xc050_2100;
@@ -60,6 +61,10 @@ pub(crate) struct Listener {
 impl FileOps for Listener {
     fn pollable(&self) -> bool {
         true
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(&self.notify.poll);
     }
 
     fn poll(&self, _file: &File) -> u32 {

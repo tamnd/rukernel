@@ -16,7 +16,7 @@ use rk_frame::sync::SpinLock;
 use rk_proc::signal::{SI_TIMER, SYS_SECCOMP, SigInfo, SigSet};
 use rk_vfs::file::{File, FileOps, events};
 use rk_vfs::inode::Result;
-use rk_vfs::wait::POLL_WAIT;
+use rk_vfs::wait::PollTable;
 use zerocopy::{FromZeros, IntoBytes};
 
 /// The size of `struct signalfd_siginfo`.
@@ -68,11 +68,13 @@ impl FileOps for SignalFd {
         }
         let thread = rk_proc::current_thread().ok_or(Errno::EINVAL)?;
         let mask = self.mask();
-        let nonblock = file.flags().nonblock();
-        let first = POLL_WAIT.wait_interruptible(|| match thread.take_signal(mask) {
-            Some(info) => Ok(Some(info)),
-            None if nonblock => Err(Errno::EAGAIN),
-            None => Ok(None),
+        let nonblock = file.nonblock();
+        let first = thread.process().signal_poll().wait_interruptible(|| {
+            match thread.take_signal(mask) {
+                Some(info) => Ok(Some(info)),
+                None if nonblock => Err(Errno::EAGAIN),
+                None => Ok(None),
+            }
         })?;
         buf[..SIZE].copy_from_slice(siginfo(&first).as_bytes());
         let mut n = 1;
@@ -82,6 +84,13 @@ impl FileOps for SignalFd {
             n += 1;
         }
         Ok(n * SIZE)
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        // As `signalfd_poll` of Linux, the file tests the signals of the task that polls it.
+        if let Some(t) = rk_proc::current_thread() {
+            table.add(t.process().signal_poll());
+        }
     }
 
     fn poll(&self, _file: &File) -> u32 {
@@ -112,7 +121,7 @@ pub(crate) fn signalfd4(cx: &Cx<'_>, fd: u64, mask: u64, size: u64, flags: u64) 
         let sfd =
             file.ops().as_any().and_then(|a| a.downcast_ref::<SignalFd>()).ok_or(Errno::EINVAL)?;
         *sfd.mask.lock() = set;
-        rk_vfs::wait::poll_wake();
+        cx.thread.process().signal_poll().wake_all();
         return Ok(fd as u64);
     }
     let ops = SignalFd { mask: SpinLock::new(set) };

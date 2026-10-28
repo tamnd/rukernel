@@ -12,6 +12,7 @@ use rk_abi::native::open::{O_EXCL, O_NONBLOCK, O_RDWR};
 use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo};
 use rk_proc::{Pid, Process};
 use rk_vfs::file::{File, FileOps, events};
+use rk_vfs::wait::PollTable;
 
 /// `PIDFD_NONBLOCK`: a wait for the process does not block.
 const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
@@ -26,6 +27,10 @@ struct PidFd {
 impl FileOps for PidFd {
     fn pollable(&self) -> bool {
         true
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add(self.process.exit_poll());
     }
 
     fn poll(&self, _file: &File) -> u32 {

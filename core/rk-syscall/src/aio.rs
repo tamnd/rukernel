@@ -23,6 +23,7 @@ use rk_frame::sync::SpinLock;
 use rk_mm::{AddressSpace, MmapRequest, PAGE_SIZE, Prot};
 use rk_vfs::File;
 use rk_vfs::file::BatchIo;
+use rk_vfs::wait::{PollTable, WaitQueue};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The commands of a request.
@@ -78,6 +79,8 @@ struct Context {
     /// The most events that can wait.
     nr: u64,
     events: SpinLock<VecDeque<IoEvent>>,
+    /// `io_getevents` waits here for new events, as `kioctx.wait` of Linux.
+    wait: Arc<WaitQueue>,
 }
 
 /// The contexts by ID.
@@ -116,6 +119,7 @@ pub(crate) fn io_setup(cx: &Cx<'_>, nr: u64, idp: u64) -> SysResult {
         owner: Arc::downgrade(&vm),
         nr: u64::from(nr),
         events: SpinLock::new(VecDeque::new()),
+        wait: Arc::new(WaitQueue::new()),
     };
     contexts.insert(id, Arc::new(ctx));
     Ok(0)
@@ -352,7 +356,7 @@ pub(crate) fn io_submit(cx: &Cx<'_>, id: u64, nr: u64, iocbpp: u64) -> SysResult
             crate::eventfd::signal(efd);
         }
     }
-    rk_vfs::wait::poll_wake();
+    ctx.wait.wake_all();
     match (items.len(), error) {
         (0, Some(e)) => Err(e),
         (n, _) => Ok(n as u64),
@@ -374,7 +378,13 @@ fn getevents(cx: &Cx<'_>, id: u64, min_nr: u64, nr: u64, events: u64, timeout: u
         let n = (nr as usize).min(q.len());
         Some(q.drain(..n).collect::<Vec<_>>())
     };
-    let list = match wait_events(cx, deadline, |_| Ok(grab(min_nr))) {
+    let scan = |table: Option<&mut PollTable>| {
+        if let Some(table) = table {
+            table.add(&ctx.wait);
+        }
+        Ok(grab(min_nr))
+    };
+    let list = match wait_events(cx, deadline, scan) {
         Ok(Some(list)) => list,
         Ok(None) => grab(0).unwrap_or_default(),
         Err(Errno::ERESTARTNOHAND) => match grab(1) {

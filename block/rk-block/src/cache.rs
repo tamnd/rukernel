@@ -157,7 +157,7 @@ pub fn without_wait<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Tells if the current task reads in `without_wait`.
-fn no_wait() -> bool {
+pub fn no_wait() -> bool {
     let tasks = NOWAIT.lock();
     !tasks.is_empty() && tasks.contains(&task_id())
 }

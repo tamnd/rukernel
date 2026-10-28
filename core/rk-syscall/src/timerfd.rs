@@ -98,7 +98,7 @@ impl FileOps for TimerFd {
         if buf.len() < 8 {
             return Err(Errno::EINVAL);
         }
-        let nonblock = file.flags().nonblock();
+        let nonblock = file.nonblock();
         let value = self.ticks.wait.wait_interruptible(|| {
             let mut count = self.ticks.count.lock();
             if self.ticks.canceled.swap(false, Ordering::Relaxed) {

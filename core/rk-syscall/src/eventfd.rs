@@ -40,7 +40,7 @@ impl FileOps for EventFd {
         if buf.len() < 8 {
             return Err(Errno::EINVAL);
         }
-        let nonblock = file.flags().nonblock();
+        let nonblock = file.nonblock();
         let value = self.wait.wait_interruptible(|| {
             let mut count = self.count.lock();
             if *count == 0 {

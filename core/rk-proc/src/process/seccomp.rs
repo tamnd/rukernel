@@ -199,6 +199,8 @@ pub struct Notify {
     pub wait_killable: bool,
     /// The listener and the threads that wait for a reply wait here.
     pub wait: WaitQueue,
+    /// The waits of `poll` on the file of the listener wait here.
+    pub poll: Arc<rk_vfs::wait::WaitQueue>,
 }
 
 impl core::fmt::Debug for Notify {
@@ -210,7 +212,12 @@ impl core::fmt::Debug for Notify {
 impl Notify {
     /// Makes the notifications of a new listener.
     pub fn new(wait_killable: bool) -> Self {
-        Self { state: SpinLock::new(NotifyState::default()), wait_killable, wait: WaitQueue::new() }
+        Self {
+            state: SpinLock::new(NotifyState::default()),
+            wait_killable,
+            wait: WaitQueue::new(),
+            poll: Arc::new(rk_vfs::wait::WaitQueue::new()),
+        }
     }
 
     /// Locks the state.
@@ -221,7 +228,7 @@ impl Notify {
     /// Wakes the listener and the threads that wait, and each wait of `poll`.
     pub fn wake(&self) {
         self.wait.wake_all();
-        rk_vfs::wait::poll_wake();
+        self.poll.wake_all();
     }
 
     fn orphan(&self) {

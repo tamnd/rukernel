@@ -670,6 +670,11 @@ static void test_timers(void)
 		n += sigwaitinfo(&set, &si) == SIGALRM && si.si_code == SI_KERNEL;
 	struct itimerval off = {{0, 0}, {0, 0}};
 	setitimer(ITIMER_REAL, &off, &got);
+	/* The timer can send one more SIGALRM before it stops. */
+	sigset_t alrm;
+	sigemptyset(&alrm);
+	sigaddset(&alrm, SIGALRM);
+	sigtimedwait(&alrm, NULL, &(struct timespec){0, 0});
 	check("ITIMER_REAL with an interval sends SIGALRM again", n == 3 && got.it_interval.tv_usec == 10000);
 
 	pid_t pid = fork();
@@ -691,10 +696,13 @@ static void test_timers(void)
 	sev.sigev_value.sival_int = 77;
 	timer_t t;
 	check("timer_create", timer_create(CLOCK_MONOTONIC, &sev, &t) == 0);
-	struct itimerspec ts = {{0, 0}, {0, 20 * 1000 * 1000}}, cur;
+	/* A long timer, so that it does not fire before timer_gettime on a busy host. */
+	struct itimerspec ts = {{0, 0}, {10, 0}}, cur;
 	check("timer_settime", timer_settime(t, 0, &ts, NULL) == 0);
-	check("timer_gettime gives the rest", timer_gettime(t, &cur) == 0 && cur.it_value.tv_sec == 0 &&
-	      cur.it_value.tv_nsec > 0);
+	check("timer_gettime gives the rest", timer_gettime(t, &cur) == 0 && cur.it_value.tv_sec <= 10 &&
+	      (cur.it_value.tv_sec > 0 || cur.it_value.tv_nsec > 0));
+	ts.it_value = (struct timespec){0, 20 * 1000 * 1000};
+	timer_settime(t, 0, &ts, NULL);
 	check("a timer sends its signal", sigwaitinfo(&set, &si) == SIGRTMIN && si.si_code == SI_TIMER &&
 	      si.si_value.sival_int == 77);
 	check("timer_gettime of a timer that fired gives 0", timer_gettime(t, &cur) == 0 &&
@@ -997,15 +1005,19 @@ static void test_signals(void)
 	got_sig = 0;
 	pid = fork();
 	if (pid == 0) {
-		struct timespec d = {0, 20 * 1000 * 1000};
-		nanosleep(&d, NULL);
-		kill(getppid(), SIGUSR1);
-		_exit(0);
+		/* The parent can start its nanosleep after the first signal, so send it again. */
+		for (;;) {
+			struct timespec d = {0, 20 * 1000 * 1000};
+			nanosleep(&d, NULL);
+			kill(getppid(), SIGUSR1);
+		}
 	}
 	struct timespec d = {5, 0};
 	r = nanosleep(&d, NULL);
-	check("a signal stops nanosleep", r == -1 && errno == EINTR && got_sig == SIGUSR1);
+	int nerr = errno;
+	kill(pid, SIGKILL);
 	waitpid(pid, &status, 0);
+	check("a signal stops nanosleep", r == -1 && nerr == EINTR && got_sig == SIGUSR1);
 
 	set_handler(SIGSEGV, on_segv, 0);
 	if (sigsetjmp(segv_env, 1) == 0)
@@ -1058,6 +1070,16 @@ static void test_pipes(void)
 	int status = 0;
 	waitpid(pid, &status, 0);
 	close(p[0]);
+
+	check("pipe for RWF_NOWAIT", pipe(p) == 0);
+	struct iovec nv = { buf, sizeof(buf) };
+	check("preadv2 with RWF_NOWAIT of an empty pipe gives EAGAIN",
+	      syscall(SYS_preadv2, p[0], &nv, 1, -1L, -1L, RWF_NOWAIT) == -1 && errno == EAGAIN);
+	write(p[1], "abc", 3);
+	check("preadv2 with RWF_NOWAIT reads the data of a pipe",
+	      syscall(SYS_preadv2, p[0], &nv, 1, -1L, -1L, RWF_NOWAIT) == 3);
+	close(p[0]);
+	close(p[1]);
 
 	check("pipe2 with O_NONBLOCK", pipe2(p, O_NONBLOCK | O_CLOEXEC) == 0);
 	check("an empty pipe gives EAGAIN", read(p[0], buf, 1) == -1 && errno == EAGAIN);
@@ -1362,6 +1384,32 @@ static void test_clone3(void)
 	}
 	check("1000 threads stop and each gives its value", ok);
 	pthread_attr_destroy(&a);
+}
+
+/* A signal to the process wakes a poll of its signal file. */
+static void test_signalfd_poll(void)
+{
+	sigset_t set, old;
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR2);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	int sfd = syscall(SYS_signalfd4, -1, &set, 8, 0);
+	check("signalfd4", sfd >= 0);
+	struct pollfd p = { .fd = sfd, .events = POLLIN };
+	check("poll of a signal file with no signal gives 0", poll(&p, 1, 0) == 0);
+	pid_t pid = fork();
+	if (pid == 0) {
+		nanosleep(&(struct timespec){0, 20 * 1000 * 1000}, NULL);
+		kill(getppid(), SIGUSR2);
+		_exit(0);
+	}
+	check("a signal wakes a poll of a signal file", poll(&p, 1, 5000) == 1 && (p.revents & POLLIN));
+	char info[128];
+	check("read of a signal file after poll", read(sfd, info, sizeof(info)) == sizeof(info) &&
+						    *(unsigned *)info == SIGUSR2);
+	waitpid(pid, NULL, 0);
+	close(sfd);
+	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
 static void test_pidfd(void)
@@ -2126,6 +2174,9 @@ static void test_atime(void)
 	fd = open("/tmp/at", O_CREAT | O_RDWR | O_TRUNC, 0644);
 	check("write a file for atime", write(fd, "abc", 3) == 3);
 	check("utimensat sets an old atime", futimens(fd, old) == 0);
+	/* futimens sets the ctime. The clock must move past it, else the atime of the read is the
+	 * same as the ctime and the next read updates it again. */
+	nanosleep(&(struct timespec){0, 10 * 1000 * 1000}, NULL);
 	check("read for atime", pread(fd, buf, 3, 0) == 3);
 	fstat(fd, &st1);
 	check("a read updates an atime that is before the mtime", st1.st_atime > 2000);
@@ -4364,6 +4415,7 @@ static void test_all(void)
 	test_locks();
 	test_clone3();
 	test_pidfd();
+	test_signalfd_poll();
 	test_seccomp();
 	test_ptrace();
 	test_mount();

@@ -122,8 +122,8 @@ pub trait FileOps: Send + Sync {
     }
 
     /// Adds to `table` the queues that a new event of the file wakes, as `poll_wait` of Linux. A
-    /// file that adds no queue makes the wait use `POLL_WAIT`, and it must call `poll_wake` at a
-    /// new event.
+    /// file whose events can change while a task waits must add a queue, and wake it at a new
+    /// event. A file that adds no queue has events that do not change.
     fn poll_wait(&self, _file: &File, _table: &mut PollTable) {}
 
     /// A count that goes up at each new event of the file, for an edge triggered epoll entry.
@@ -969,6 +969,13 @@ impl File {
         OpenFlags(self.flags.load(Ordering::Relaxed))
     }
 
+    /// Tells if a read must not block: the file has `O_NONBLOCK`, or the read is in
+    /// `blockdev::without_wait`, as a read of `preadv2` with `RWF_NOWAIT`. This is the test of
+    /// `O_NONBLOCK` and `IOCB_NOWAIT` in the reads of Linux.
+    pub fn nonblock(&self) -> bool {
+        self.flags().nonblock() || crate::blockdev::no_wait()
+    }
+
     /// Changes the status flags, for `fcntl(F_SETFL)`. The other flags do not change.
     pub fn set_status_flags(&self, flags: u32) {
         let mask = OpenFlags::SETFL_MASK;
@@ -1279,14 +1286,9 @@ impl File {
         self.ops.pollable()
     }
 
-    /// Adds to `table` the queues that a new event of the file wakes. If the file adds no queue,
-    /// the table gets `POLL_WAIT`.
+    /// Adds to `table` the queues that a new event of the file wakes.
     pub fn poll_wait(&self, table: &mut PollTable) {
-        let adds = table.adds;
         self.ops.poll_wait(self, table);
-        if table.adds == adds {
-            table.add_static(&crate::wait::POLL_WAIT);
-        }
     }
 
     /// The count of the events of the file, for an edge triggered epoll entry.

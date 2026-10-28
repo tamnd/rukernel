@@ -137,12 +137,8 @@ pub(crate) fn write_with(
 pub(crate) fn read(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
     if let Some(sock) = rk_net::socket_of(&file) {
-        return crate::net::read_socket(
-            cx,
-            &file,
-            &*sock,
-            &[Iovec { iov_base: buf, iov_len: count }],
-        );
+        let iov = [Iovec { iov_base: buf, iov_len: count }];
+        return crate::net::read_socket(cx, &*sock, &iov, file.nonblock());
     }
     read_with(cx, &file, buf, count, |_, b| file.read(b))
 }
@@ -273,16 +269,26 @@ pub(crate) fn read_iovecs(
 }
 
 pub(crate) fn readv(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
+    readv_with(cx, fd, iov, count, false)
+}
+
+/// `readv`. With `nowait`, each read of the file is in `blockdev::without_wait`, for `preadv2`
+/// with `RWF_NOWAIT`. The copy to user memory is not in it, so a fault there can wait.
+fn readv_with(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, nowait: bool) -> SysResult {
     let file = cx.file(fd)?;
     if let Some(sock) = rk_net::socket_of(&file) {
-        return crate::net::read_socket(cx, &file, &*sock, &read_iovecs(cx, iov, count)?);
+        let iovs = read_iovecs(cx, iov, count)?;
+        return crate::net::read_socket(cx, &*sock, &iovs, nowait || file.nonblock());
     }
+    let read = |b: &mut [u8]| {
+        if nowait { rk_vfs::blockdev::without_wait(|| file.read(b)) } else { file.read(b) }
+    };
     let mut done = 0;
     for v in read_iovecs(cx, iov, count)? {
         if v.iov_len == 0 {
             continue;
         }
-        let n = match read_with(cx, &file, v.iov_base, v.iov_len, |_, b| file.read(b)) {
+        let n = match read_with(cx, &file, v.iov_base, v.iov_len, |_, b| read(b)) {
             Ok(n) => n,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
@@ -329,8 +335,9 @@ pub(crate) fn pwritev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, offset: u64) -
 
 /// `preadv` and `preadv2`. An offset of -1 for `preadv2` reads at the position of the file, as
 /// `readv`. With `RWF_NOWAIT`, a read of data that is not in the page cache gives `EAGAIN`, or the
-/// bytes before such data, as `filemap_read` of Linux. The other flags only change the speed, so
-/// the read does not use them.
+/// bytes before such data, as `filemap_read` of Linux. A read of a pipe, a socket or another file
+/// that waits for data gives `EAGAIN` as with `O_NONBLOCK`. The other flags only change the speed,
+/// so the read does not use them.
 pub(crate) fn preadv2(
     cx: &Cx<'_>,
     fd: u64,
@@ -342,7 +349,7 @@ pub(crate) fn preadv2(
     // The checks of `do_preadv`, `vfs_readv` and `kiocb_set_rw_flags` of Linux, in its order.
     if offset as i64 == -1 {
         check_rw_flags(flags, false)?;
-        return readv(cx, fd, iov, count);
+        return readv_with(cx, fd, iov, count, flags & rwf::NOWAIT != 0);
     }
     if (offset as i64) < 0 {
         return Err(Errno::EINVAL);
