@@ -32,6 +32,9 @@ const VALID_FLAGS: u64 = 0x3f;
 
 /// The present bit of an entry of `/proc/PID/pagemap`, `PM_PRESENT` of Linux.
 pub(crate) const PM_PRESENT: u64 = 1 << 63;
+/// The bit of an entry of `/proc/PID/pagemap` for a page that is not present and has an entry of
+/// the page table, as a guard marker, `PM_SWAP` of Linux.
+pub(crate) const PM_SWAP: u64 = 1 << 62;
 /// The bit of an entry of `/proc/PID/pagemap` for a page of a file or of shared memory,
 /// `PM_FILE` of Linux.
 pub(crate) const PM_FILE: u64 = 1 << 61;
@@ -43,6 +46,9 @@ pub(crate) const PM_SOFT_DIRTY: u64 = 1 << 55;
 /// The bit of an entry of `/proc/PID/pagemap` for a page that only one mapping maps,
 /// `PM_MMAP_EXCLUSIVE` of Linux.
 pub(crate) const PM_MMAP_EXCLUSIVE: u64 = 1 << 56;
+/// The bit of an entry of `/proc/PID/pagemap` for a guard page of `MADV_GUARD_INSTALL`,
+/// `PM_GUARD_REGION` of Linux.
+pub(crate) const PM_GUARD_REGION: u64 = 1 << 58;
 
 /// `KPF_UPTODATE` of `/proc/kpageflags`.
 pub(crate) const KPF_UPTODATE: u64 = 1 << 3;
@@ -103,6 +109,9 @@ pub(crate) struct FrameFacts {
     pub file: Option<bool>,
     /// The frame is a part of a huge page of the kind, and it is the first page or not.
     pub huge: Option<(Compound, bool)>,
+    /// A page table entry of a process maps a frame of the huge page of hugetlbfs, as
+    /// `folio_mapped` of Linux.
+    pub huge_mapped: bool,
 }
 
 /// The entry of `/proc/kpageflags` of a frame, as `stable_page_flags` in fs/proc/page.c of Linux
@@ -116,10 +125,12 @@ pub(crate) fn page_flags(f: &FrameFacts) -> u64 {
         // A free page of the pool has only the flags of its compound page.
         Some((Compound::HugetlbFree, head)) => return KPF_HUGE | part(head),
         // A page of hugetlbfs is not on the LRU lists and is not swap backed. A page of a file
-        // is dirty, as `hugetlb_add_to_page_cache` of Linux marks it.
+        // is dirty, as `hugetlb_add_to_page_cache` of Linux marks it. A page of a file that no
+        // process maps has no `KPF_MMAP`.
         Some((Compound::Hugetlb, head)) => {
             let kind = if f.anon { KPF_ANON } else { KPF_DIRTY };
-            return KPF_UPTODATE | KPF_MMAP | KPF_HUGE | part(head) | kind;
+            let mmap = if f.huge_mapped { KPF_MMAP } else { 0 };
+            return KPF_UPTODATE | mmap | KPF_HUGE | part(head) | kind;
         }
         _ => {}
     }
@@ -154,6 +165,8 @@ pub(crate) struct PageFacts {
     pub exclusive: bool,
     /// The page is soft-dirty.
     pub soft_dirty: bool,
+    /// The page is a guard page of `MADV_GUARD_INSTALL`. Such a page has no frame.
+    pub guard: bool,
 }
 
 /// The entry of `/proc/PID/pagemap` of a page, as `pte_to_pagemap_entry` in fs/proc/task_mmu.c of
@@ -161,6 +174,10 @@ pub(crate) struct PageFacts {
 pub(crate) fn pagemap_entry(p: &PageFacts) -> u64 {
     let mut entry = if p.soft_dirty { PM_SOFT_DIRTY } else { 0 };
     if !p.present {
+        // A guard marker is an entry that is not present. Its swap type and offset are 0 here.
+        if p.guard {
+            entry |= PM_SWAP | PM_GUARD_REGION;
+        }
         return entry;
     }
     entry |= PM_PRESENT | p.pfn.map_or(0, |pfn| pfn & PM_PFN_MASK);
@@ -371,6 +388,7 @@ mod tests {
         assert_eq!(KPF_COMPOUND_HEAD | KPF_COMPOUND_TAIL | KPF_HUGE, 0x3_8000);
         assert_eq!(KPF_KSM | KPF_THP | KPF_ZERO_PAGE, 0x160_0000);
         assert_eq!(PM_SOFT_DIRTY | PM_MMAP_EXCLUSIVE, 0x0180_0000_0000_0000);
+        assert_eq!(PM_SWAP | PM_GUARD_REGION, 0x4400_0000_0000_0000);
     }
 
     #[test]
@@ -387,10 +405,17 @@ mod tests {
         assert_eq!(page_flags(&thp), 0x40_d828);
         let tail = FrameFacts { huge: Some((Compound::Thp, false)), ..anon };
         assert_eq!(page_flags(&tail), 0x41_5828);
-        let huge = FrameFacts { huge: Some((Compound::Hugetlb, true)), ..anon };
+        let huge = FrameFacts { huge: Some((Compound::Hugetlb, true)), huge_mapped: true, ..anon };
         assert_eq!(page_flags(&huge), 0x2_9808);
-        let shared = FrameFacts { huge: Some((Compound::Hugetlb, false)), ..FrameFacts::default() };
+        let shared = FrameFacts {
+            huge: Some((Compound::Hugetlb, false)),
+            huge_mapped: true,
+            ..FrameFacts::default()
+        };
         assert_eq!(page_flags(&shared), 0x3_0818);
+        // A page of a file of hugetlbfs that no process maps has no `KPF_MMAP`.
+        let cached = FrameFacts { huge_mapped: false, ..shared };
+        assert_eq!(page_flags(&cached), 0x3_0018);
         let free =
             FrameFacts { huge: Some((Compound::HugetlbFree, true)), ..FrameFacts::default() };
         assert_eq!(page_flags(&free), 0x2_8000);
@@ -407,6 +432,9 @@ mod tests {
         assert_eq!(pagemap_entry(&file), PM_PRESENT | PM_FILE);
         let zero = PageFacts { zero: true, exclusive: true, ..file };
         assert_eq!(pagemap_entry(&zero), PM_PRESENT);
+        let guard = PageFacts { guard: true, ..PageFacts::default() };
+        assert_eq!(pagemap_entry(&guard), PM_SWAP | PM_GUARD_REGION);
+        assert_eq!(pagemap_entry(&PageFacts { soft_dirty: true, ..guard }), 0x4480_0000_0000_0000);
     }
 
     #[test]

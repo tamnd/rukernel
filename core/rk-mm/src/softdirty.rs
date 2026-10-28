@@ -86,6 +86,41 @@ impl SoftDirty {
         }
     }
 
+    /// Records that the area at `old` grew down to `start`, as `expand_downwards` of Linux. The
+    /// area keeps its state, so the new pages are clean if the area is clean. A fault then marks
+    /// each page that a write changes.
+    pub fn grew(&mut self, start: usize, old: usize) {
+        let Some((&s, &e)) = self.clean.range(..=old).next_back().filter(|&(_, &e)| old < e) else {
+            return;
+        };
+        if s <= start {
+            return;
+        }
+        self.clean.remove(&s);
+        // A range before `start` can reach the new range.
+        match self.clean.range(..s).next_back() {
+            Some((&below, &end)) if end >= start => {
+                self.clean.insert(below, e);
+            }
+            _ => {
+                self.clean.insert(start, e);
+            }
+        }
+    }
+
+    /// Records that the pages in `start..end` lost their frames, as the zap of the page table
+    /// entries of Linux removes their soft-dirty bits. A page there then has only the state of
+    /// its area until a write marks it again.
+    pub fn unmapped(&mut self, start: usize, end: usize) {
+        if self.written.range(start..end).next().is_none() {
+            return;
+        }
+        let gone: alloc::vec::Vec<usize> = self.written.range(start..end).copied().collect();
+        for page in gone {
+            self.written.remove(&page);
+        }
+    }
+
     /// Records a write to the pages in `start..end`, as the soft-dirty bit that a write fault sets
     /// in a page table entry of Linux.
     pub fn wrote(&mut self, start: usize, end: usize) {
@@ -181,6 +216,43 @@ mod tests {
         s.mapped(0, 0x100_000);
         assert!(!s.tracking());
         assert!(s.is_dirty(0x10_000, false));
+    }
+
+    #[test]
+    fn stack_growth_is_clean() {
+        let mut s = SoftDirty::new();
+        s.clear([(0x10_000, 0x20_000), (0x40_000, 0x50_000)]);
+        s.grew(0x3c_000, 0x40_000);
+        assert!(!s.is_dirty(0x3c_000, false));
+        assert!(!s.is_dirty(0x3f_000, true));
+        assert!(s.is_dirty(0x3b_000, false));
+        assert_eq!(s.clean.get(&0x3c_000), Some(&0x50_000));
+        // A write marks the new page as any other page.
+        s.wrote(0x3c_000, 0x3d_000);
+        assert!(s.is_dirty(0x3c_000, true));
+        // The growth of an area that a new map made soft-dirty stays soft-dirty.
+        s.mapped(0x60_000, 0x70_000);
+        s.grew(0x5c_000, 0x60_000);
+        assert!(s.is_dirty(0x5c_000, false));
+        // The new range joins a clean range below it.
+        s.grew(0x20_000, 0x3c_000);
+        assert_eq!(s.clean.get(&0x10_000), Some(&0x50_000));
+        assert_eq!(s.clean.len(), 1);
+    }
+
+    #[test]
+    fn unmap_clears_the_written_pages() {
+        let mut s = SoftDirty::new();
+        s.clear([(0x10_000, 0x20_000)]);
+        s.wrote(0x11_000, 0x13_000);
+        s.unmapped(0x12_000, 0x20_000);
+        assert!(s.is_dirty(0x11_000, true));
+        // A page that comes back after the unmap is clean until a write.
+        assert!(!s.is_dirty(0x12_000, true));
+        assert!(s.any_clean(0x12_000, 0x13_000));
+        s.unmapped(0, 0x100_000);
+        assert!(s.written.is_empty());
+        assert!(s.tracking());
     }
 
     #[test]

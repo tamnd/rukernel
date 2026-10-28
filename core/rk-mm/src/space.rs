@@ -920,10 +920,12 @@ impl AddressSpace {
     }
 
     /// Removes the pages in `start..end` from the page table. The count of pages before the
-    /// removal goes into the high water mark.
+    /// removal goes into the high water mark. The pages lose their soft-dirty state, as the zap
+    /// of the page table entries of Linux (`zap_pte_range` in mm/memory.c).
     fn unmap_pages(&self, start: VirtAddr, end: VirtAddr) {
         self.hiwater.fetch_max(self.page_count(), Ordering::Relaxed);
         self.vm.unmap_range(start, end);
+        self.soft.lock().unmapped(start.get(), end.get());
     }
 
     /// The number of pages in `start..end` that have a frame.
@@ -1089,6 +1091,8 @@ impl AddressSpace {
                 self.vm.map(VirtAddr::new(to + off), frame, prot).map_err(map_error)?;
             }
         }
+        // The old pages have no entries now, as `move_ptes` of Linux.
+        self.soft.lock().unmapped(addr, addr + old_len);
         if dont_unmap {
             st.vmas.insert_merged(Vma { start: addr, end: addr + old_len, ..vma.clone() });
         }
@@ -1206,9 +1210,8 @@ impl AddressSpace {
             let mut st = self.state.lock();
             // A fault below an area that grows down makes the area larger, up to the size of the
             // main stack, as Linux does with the default `RLIMIT_STACK`.
-            if st.vmas.find(addr).is_none() && !st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE)
-            {
-                return Err(Errno::EFAULT);
+            if st.vmas.find(addr).is_none() {
+                self.grow_stack(&mut st, addr)?;
             }
             let vma = st.vmas.find(addr).ok_or(Errno::EFAULT)?;
             // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
@@ -1217,6 +1220,18 @@ impl AddressSpace {
             }
             self.fault_area(vma, addr, access)
         }
+    }
+
+    /// Makes the area above `addr` grow down to the page of `addr`. The new pages keep the
+    /// soft-dirty state of the area, as `expand_downwards` of Linux keeps `VM_SOFTDIRTY`.
+    ///
+    /// # Errors
+    ///
+    /// `EFAULT` if no area grows down to `addr`.
+    fn grow_stack(&self, st: &mut State, addr: usize) -> Result<(), Errno> {
+        let old = st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE).ok_or(Errno::EFAULT)?;
+        self.soft.lock().grew(addr & !(PAGE_SIZE - 1), old);
+        Ok(())
     }
 
     /// Handles a page fault at `addr` in `vma`, the area that has the address. The caller holds
@@ -1732,6 +1747,19 @@ impl AddressSpace {
         self.unmap_pages(VirtAddr::new(start), VirtAddr::new(end));
         st.guards.extend((start..end).step_by(PAGE_SIZE));
         Ok(())
+    }
+
+    /// Tells if the page at `addr` is a guard page of `MADV_GUARD_INSTALL`, for `PM_GUARD_REGION`
+    /// of `/proc/PID/pagemap`.
+    pub fn is_guard(&self, addr: usize) -> bool {
+        let page = addr & !(PAGE_SIZE - 1);
+        #[cfg(feature = "corten")]
+        return self.corten_is_guard(page);
+        #[cfg(not(feature = "corten"))]
+        {
+            let st = self.state.lock();
+            !st.guards.is_empty() && st.guards.contains(&page)
+        }
     }
 
     /// Removes the guard pages in `addr..addr + len`, for `MADV_GUARD_REMOVE`. The next access to

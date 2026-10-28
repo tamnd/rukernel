@@ -306,29 +306,30 @@ impl<F: Clone> VmaSet<F> {
 
     /// Makes the area above `addr` start at the page of `addr`, if the area grows down. The area
     /// keeps `gap` free bytes to the area below it, and its size stays at or below `max`. Gives
-    /// `true` if the area grew. `addr` is not in an area.
-    pub fn grow_down(&mut self, addr: usize, gap: usize, max: usize) -> bool {
+    /// the old start of the area if the area grew. `addr` is not in an area.
+    pub fn grow_down(&mut self, addr: usize, gap: usize, max: usize) -> Option<usize> {
         let start = addr & !(PAGE_SIZE - 1);
-        let Some((&key, vma)) = self.areas.range(addr..).next() else { return false };
+        let (&key, vma) = self.areas.range(addr..).next()?;
         if !vma.grows_down || vma.end - start > max {
-            return false;
+            return None;
         }
         if let Some((_, below)) = self.areas.range(..addr).next_back()
             && below.end.saturating_add(gap) > start
         {
-            return false;
+            return None;
         }
         let delta = (vma.start - start) as u64;
         if matches!(vma.backing, Backing::File { offset, .. } if offset < delta) {
-            return false;
+            return None;
         }
-        let Some(mut vma) = self.areas.remove(&key) else { return false };
+        let mut vma = self.areas.remove(&key)?;
         if let Backing::File { offset, .. } = &mut vma.backing {
             *offset -= delta;
         }
+        let old = vma.start;
         vma.start = start;
         self.areas.insert(start, vma);
-        true
+        Some(old)
     }
 
     /// Finds the highest free range of `len` bytes that ends at or below `top` and starts at or
@@ -545,11 +546,11 @@ mod tests {
     fn an_area_grows_down_up_to_the_gap() {
         let mut s = set(&[(10, 20), (300, 310)]);
         s.update_range(300 * P, 310 * P, |v| v.grows_down = true);
-        assert!(s.grow_down(295 * P + 8, 256 * P, 64 * P));
+        assert_eq!(s.grow_down(295 * P + 8, 256 * P, 64 * P), Some(300 * P));
         assert_eq!(ranges(&s), [(10, 20), (295, 310)]);
-        assert!(!s.grow_down(275 * P, 256 * P, 64 * P), "the gap to the area below");
-        assert!(!s.grow_down(15 * P + 20 * P, 0, 64 * P), "the size limit");
-        assert!(!s.grow_down(5 * P, 0, 64 * P), "the area does not grow down");
+        assert_eq!(s.grow_down(275 * P, 256 * P, 64 * P), None, "the gap to the area below");
+        assert_eq!(s.grow_down(15 * P + 20 * P, 0, 64 * P), None, "the size limit");
+        assert_eq!(s.grow_down(5 * P, 0, 64 * P), None, "the area does not grow down");
     }
 
     #[test]

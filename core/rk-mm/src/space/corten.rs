@@ -10,9 +10,8 @@
 //! the same status is one area.
 
 use super::{
-    Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, STACK_GUARD_GAP,
-    STACK_SIZE, SharedAnon, State, charge_commit, map_error, page_prot, uncharge_commit,
-    write_back,
+    Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, SharedAnon, State,
+    charge_commit, map_error, page_prot, uncharge_commit, write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
 use crate::pttree::{RangeLock, TREE_END, Tree};
@@ -365,11 +364,15 @@ impl AddressSpace {
             // A fault below an area that grows down makes the area larger. This is rare, so it
             // locks the whole space.
             let mut st = self.state.lock();
-            if st.vmas.find(addr).is_none() && !st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE)
-            {
-                return Err(Errno::EFAULT);
+            if st.vmas.find(addr).is_none() {
+                self.grow_stack(&mut st, addr)?;
             }
         }
+    }
+
+    /// Tells if the page at `page` is a guard page.
+    pub(super) fn corten_is_guard(&self, page: usize) -> bool {
+        self.state.guards.lock().contains(&page)
     }
 
     /// Gives the area of the page at `addr`, clipped to its 2 MiB block.

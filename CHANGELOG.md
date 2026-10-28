@@ -13,6 +13,13 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The IPv6 stack answers MLD queries of version 1 and 2 after a random delay, and `IPV6_JOIN_GROUP`, `IPV6_LEAVE_GROUP`, `MCAST_JOIN_GROUP` and `MCAST_LEAVE_GROUP` send MLD reports, as mcast.c of Linux (#429). After an MLDv1 query, or with `force_mld_version` 1, the stack sends MLDv1 reports and done messages.
 - A TUN device gets a link local address with a random interface identifier when it goes up, as addrconf.c of Linux (#429).
 - Optimistic duplicate address detection, as RFC 4429 and addrconf.c of Linux (#429). With `optimistic_dad`, the link local and SLAAC addresses are optimistic, and a program can add an optimistic address. An optimistic address is a source address after the preferred ones, or before them with `use_optimistic`. The first probe of an address that is not optimistic comes after a random delay of up to `router_solicitation_delay`.
+- `/proc/PID/pagemap` gives `PM_GUARD_REGION` (bit 58) and `PM_SWAP` for a guard page of `MADV_GUARD_INSTALL`, as task_mmu.c of Linux (#444).
+
+### Fixed
+
+- `/proc/PID/pagemap` gives `PM_MMAP_EXCLUSIVE` from the map count of the frame, not from the reference count, as task_mmu.c of Linux (#444). A page that two mappings of a shared file map is not exclusive.
+- An unmap clears the soft-dirty state of its pages, and the pages of stack growth keep the soft-dirty state of the area, as Linux (#444).
+- `/proc/kpageflags` gives `KPF_MMAP` for a hugetlb page only while a process maps it, as fs/proc/page.c of Linux (#444).
 
 ## [0.4.10] - 2026-10-29
 

@@ -1121,11 +1121,12 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
             // A page of a file or of shared memory is not anonymous. A private area of a file
             // maps the page of the file until the first write makes an anonymous copy.
             page.file = !frame.is_anon();
-            // Each mapping holds one reference, and so do `frame`, the page cache of a file and
-            // the stable tree of KSM. The count of the mappings is the map count of Linux.
-            let ksm = rk_frame::mm::phys_is_ksm(frame.addr());
-            let others = 1 + usize::from(page.file) + usize::from(ksm);
-            page.exclusive = Arc::strong_count(&frame) == 1 + others;
+            // The map count of the frame counts the page table entries that map it, and not the
+            // page cache or KSM, as `folio_precise_page_mapcount` of Linux.
+            page.exclusive = frame.map_count() == 1;
+        } else {
+            // A guard page has a marker in place of a frame, as `pte_to_pagemap_entry` of Linux.
+            page.guard = vm.is_guard(addr);
         }
         // A page outside the areas has no soft-dirty bit, as `pagemap_pte_hole` of Linux.
         let i = areas.partition_point(|&(_, end)| end <= addr);
@@ -1187,6 +1188,7 @@ fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
             ksm: rk_frame::mm::phys_is_ksm(at),
             file: if anon { None } else { rk_vfs::mapped::frame_dirty(phys) },
             huge,
+            huge_mapped: rk_frame::mm::phys_huge_mapped(at),
         };
         out.copy_from_slice(&procmap::page_flags(&frame).to_ne_bytes());
         done += ENTRY;

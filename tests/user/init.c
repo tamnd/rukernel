@@ -430,6 +430,18 @@ static void test_hugetlbfs(void)
 		      touch_in_child(m + 2 * huge) == SIGBUS);
 		munmap(m, 3 * huge);
 	}
+	/* KPF_MMAP (11) only while a process maps the page, as folio_mapped in fs/proc/page.c (#444). */
+	m = mmap(NULL, huge, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (m != MAP_FAILED) {
+		const unsigned long long kmmap = 1ULL << 11, khuge = 1ULL << 17;
+		m[0] = 1;
+		unsigned long long pfn = pagemap_entry(m) & ((1ULL << 55) - 1);
+		check("kpageflags: a mapped page of hugetlbfs has KPF_MMAP",
+		      pfn != 0 && (kpageflags_pfn(pfn) & (kmmap | khuge)) == (kmmap | khuge));
+		munmap(m, huge);
+		check("kpageflags: a page of hugetlbfs that no process maps has no KPF_MMAP",
+		      (kpageflags_pfn(pfn) & (kmmap | khuge)) == khuge);
+	}
 	close(fd);
 	unlink("/huge/f");
 	check("the pages of a file of hugetlbfs go back to the reservation of min_size=",
@@ -3517,7 +3529,67 @@ static void test_soft_dirty(void)
 	check("pagemap: a page that fork shares is not exclusive",
 	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	check("pagemap: the page is exclusive again after the child", (pagemap_entry(m) & excl) != 0);
+
+	/* An unmap clears the soft-dirty bit of the page, as zap_pte_range of Linux (#444). */
+	write_text("/proc/self/clear_refs", "4");
+	m[0] = 3;
+	check("pagemap: MADV_DONTNEED clears the soft-dirty bit of a page",
+	      (pagemap_entry(m) & soft) != 0 && madvise(m, 4096, MADV_DONTNEED) == 0 && m[0] == 0 &&
+		      (pagemap_entry(m) & soft) == 0);
 	munmap(m, 2 * 4096);
+
+	/* The pages of stack growth keep the soft-dirty state of the area, as expand_downwards (#444). */
+	char *hole = mmap(NULL, 2 << 20, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	char *g = MAP_FAILED;
+	if (hole != MAP_FAILED) {
+		munmap(hole, 2 << 20);
+		g = mmap(hole + (2 << 20) - 4096, 4096, PROT_READ | PROT_WRITE,
+			 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_GROWSDOWN, -1, 0);
+	}
+	if (g != MAP_FAILED) {
+		write_text("/proc/self/clear_refs", "4");
+		g[-3 * 4096] = 1;
+		check("pagemap: a write below a MAP_GROWSDOWN area marks only the written page",
+		      (pagemap_entry(g - 3 * 4096) & soft) != 0 && (pagemap_entry(g - 2 * 4096) & soft) == 0 &&
+			      (pagemap_entry(g - 4096) & soft) == 0 && (pagemap_entry(g) & soft) == 0);
+		munmap(g - 3 * 4096, 4 * 4096);
+	}
+
+	/* PM_GUARD_REGION (58) and PM_SWAP (62) for a guard page of MADV_GUARD_INSTALL (#444). */
+	const unsigned long long guard = 1ULL << 58, swap = 1ULL << 62;
+	m = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m != MAP_FAILED) {
+		m[0] = 1;
+		m[4096] = 1;
+		check("pagemap: a guard page has PM_GUARD_REGION",
+		      madvise(m, 4096, 102) == 0 && (pagemap_entry(m) & (guard | swap | (1ULL << 63))) == (guard | swap) &&
+			      (pagemap_entry(m + 4096) & guard) == 0);
+		check("pagemap: MADV_GUARD_REMOVE clears PM_GUARD_REGION",
+		      madvise(m, 4096, 103) == 0 && (pagemap_entry(m) & (guard | swap)) == 0);
+		munmap(m, 2 * 4096);
+	}
+
+	/* PM_MMAP_EXCLUSIVE counts the mappings of the page, not the page cache (#444). */
+	int fd = open("/tmp/excl", O_CREAT | O_RDWR | O_TRUNC, 0600);
+	char *a = MAP_FAILED, *b = MAP_FAILED;
+	if (fd >= 0 && ftruncate(fd, 4096) == 0) {
+		a = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		b = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	}
+	if (a != MAP_FAILED && b != MAP_FAILED) {
+		a[0] = 1;
+		check("pagemap: a page of a file with one mapping is exclusive", (pagemap_entry(a) & excl) != 0);
+		check("pagemap: a page of a file with two mappings is not exclusive",
+		      b[0] == 1 && (pagemap_entry(a) & excl) == 0 && (pagemap_entry(b) & excl) == 0);
+		munmap(b, 4096);
+		check("pagemap: the page is exclusive again after the munmap", (pagemap_entry(a) & excl) != 0);
+		munmap(a, 4096);
+	} else {
+		check("mmap of /tmp/excl", 0);
+	}
+	if (fd >= 0)
+		close(fd);
+	unlink("/tmp/excl");
 
 	/* A transparent huge page: KPF_THP (22), KPF_COMPOUND_HEAD (15) and KPF_COMPOUND_TAIL (16). */
 	const unsigned long long thp = 1ULL << 22, head = 1ULL << 15, tail = 1ULL << 16;
