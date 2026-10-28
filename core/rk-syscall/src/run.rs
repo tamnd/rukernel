@@ -11,7 +11,6 @@ use rk_abi::native::syscalls as nr;
 use rk_frame::addr::VirtAddr;
 use rk_frame::println;
 use rk_frame::task::{TaskOptions, should_yield, yield_now};
-use rk_frame::time::nanos;
 use rk_frame::user::{ExceptionKind, FaultAccess, ReturnReason, UserContext, UserException};
 use rk_mm::Access;
 use rk_proc::exec::{ExecArgs, exec};
@@ -190,9 +189,8 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
         // The number of a system call that can start again after a signal. `rt_sigreturn` puts
         // back the registers of the frame, so its return value is not a restart code.
         let mut syscall = None;
-        let start = nanos();
-        let reason = regs.execute();
-        if thread.add_user_ns(nanos().saturating_sub(start)) != 0 {
+        let (reason, user_ns) = regs.execute_timed();
+        if thread.add_user_ns(user_ns) != 0 {
             rk_proc::timer::check_cpu_timers(&thread);
             rk_proc::timer::check_cpu_limit(&thread);
         }

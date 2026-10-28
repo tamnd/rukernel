@@ -332,10 +332,17 @@ impl Unix {
     }
 
     /// Takes the bytes of `n` from the count of the sender, because the receiver took them.
+    ///
+    /// As `unix_write_space` of Linux, the sender wakes only when at most a quarter of its send
+    /// buffer is in use, the same test as POLLOUT. A wake for each read wakes all the writers of
+    /// a full socket for each small read, and each writer then finds too little space and sleeps
+    /// again. With hackbench, this made each system call cost about 1 ms on TCG.
     fn uncharge(sender: &Weak<Unix>, n: usize) {
         if let Some(sender) = sender.upgrade() {
-            sender.inflight.fetch_sub(n, Ordering::Relaxed);
-            sender.wake();
+            let used = sender.inflight.fetch_sub(n, Ordering::Relaxed).saturating_sub(n);
+            if used * 4 <= sender.sndbuf() {
+                sender.wake();
+            }
         }
     }
 

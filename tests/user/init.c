@@ -2331,6 +2331,11 @@ static void test_file_locks(void)
 	mkdir("/tmp", 0755);
 	fd = open("/tmp/lk", O_RDWR | O_CREAT | O_TRUNC, 0644);
 	check("a write lock", set_lock(fd, F_SETLK, F_WRLCK, 0, 10) == 0);
+	/* The child tells the parent through the pipe when it found the conflict. A fixed sleep of
+	 * the parent is not enough: on a busy host the child can start after the close. */
+	int ready[2];
+	if (pipe(ready) != 0)
+		ready[0] = ready[1] = -1;
 	pid = fork();
 	if (pid == 0) {
 		int c = open("/tmp/lk", O_RDWR);
@@ -2343,12 +2348,18 @@ static void test_file_locks(void)
 			_exit(2);
 		if (set_lock(c, F_SETLK, F_WRLCK, 10, 0) != 0)
 			_exit(3);
+		write(ready[1], "r", 1);
 		/* The parent closes another descriptor of the file, and that releases its lock. */
 		if (set_lock(c, F_SETLKW, F_WRLCK, 0, 10) != 0)
 			_exit(4);
 		_exit(0);
 	}
 	fd2 = open("/tmp/lk", O_RDONLY);
+	/* The read also returns when the child exits early. */
+	close(ready[1]);
+	char r;
+	read(ready[0], &r, 1);
+	close(ready[0]);
 	usleep(100000);
 	close(fd2);
 	waitpid(pid, &status, 0);

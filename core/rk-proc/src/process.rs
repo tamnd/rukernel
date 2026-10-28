@@ -977,9 +977,15 @@ impl Thread {
     /// the clock around the user code, not from the ticks that the timer interrupt counts: the
     /// kernel runs with interrupts off, so a tick that falls due in the kernel or in a wake from
     /// idle comes at the next entry to user mode, and is not user time. The system time is 0.
+    ///
+    /// The periodic timer interrupt stops the user code at the next tick at the latest, so one
+    /// time in user mode is at most one tick. A longer time is the time when the host did not run
+    /// the virtual CPU, for example on a busy host with QEMU TCG, and the clock moved on. Thus
+    /// `ns` counts at most one tick, as the tick sampling of Linux counts one tick for one
+    /// interrupt. Without the limit, a sleep can add CPU time, and `ITIMER_VIRTUAL` fires early.
     pub fn add_user_ns(&self, ns: u64) -> u64 {
         let tick_ns = 1_000_000_000 / rk_frame::time::HZ;
-        let total = self.user_rest.load(Ordering::Relaxed) + ns;
+        let total = self.user_rest.load(Ordering::Relaxed) + ns.min(tick_ns);
         self.user_rest.store(total % tick_ns, Ordering::Relaxed);
         let ticks = total / tick_ns;
         if ticks != 0 {
