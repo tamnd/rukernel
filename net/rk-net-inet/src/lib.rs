@@ -65,6 +65,7 @@ pub fn init() {
     rk_net::ioctl::set_ifconf(fib::ifconf);
     dev::add_notifier(fib::event);
     dev::add_notifier(addrconf::event);
+    rk_net::ns::add_ops(ns_init, ns_exit);
     if let Some(lo) = dev::by_name("lo") {
         if lo.is_up() {
             fib::event(&lo, Event::Up);
@@ -75,6 +76,18 @@ pub fn init() {
     }
     #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     rk_frame::task::add_bottom_half(poll);
+}
+
+/// Makes the parts of IPv4 and IPv6 of a new namespace. The tables come at the first use, and
+/// the loopback device gets its addresses when it goes up.
+fn ns_init() {}
+
+/// Clears the tables of a namespace that stops, as the `exit` of the `pernet_operations` of
+/// IPv4 and IPv6 in Linux.
+fn ns_exit() {
+    tcp::ns_exit();
+    stack6::ns_exit();
+    stack::ns_exit();
 }
 
 /// Configures an Ethernet device from the value of `ip=` on the kernel command line, as

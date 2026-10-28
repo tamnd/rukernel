@@ -338,7 +338,8 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
             stack6::flush_neigh(ifindex);
             stack6::stop_solicit(ifindex);
         }
-        Event::Flags(_) | Event::Mtu | Event::Name => {}
+        // The device is down before it goes, so it has no address or route.
+        Event::Flags(_) | Event::Mtu | Event::Name | Event::Register | Event::Unregister => {}
     }
 }
 

@@ -39,6 +39,11 @@ impl<T> SpinLock<T> {
         SpinLockGuard { lock: self }
     }
 
+    /// Gives the value and drops the lock. The caller owns the lock, so no other CPU holds it.
+    pub fn into_inner(self) -> T {
+        self.value.into_inner()
+    }
+
     /// Takes the lock if it is free.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         self.locked

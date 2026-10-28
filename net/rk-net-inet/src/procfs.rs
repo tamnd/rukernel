@@ -554,7 +554,7 @@ fn table(out: &mut String, name: &str, fields: &[(&str, i64)]) {
 /// at most 16 in a line.
 fn icmp_msg(out: &mut String) {
     let k = &COUNTERS;
-    let counts = k.icmp_in_type.iter().chain(&k.icmp_out_type).enumerate();
+    let counts = k.icmp_in_type.iter().chain(k.icmp_out_type.iter()).enumerate();
     let found: Vec<(String, i64)> = counts
         .map(|(i, a)| (i, a.load(Ordering::Relaxed) as i64))
         .filter(|(_, v)| *v != 0)

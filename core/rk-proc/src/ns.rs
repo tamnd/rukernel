@@ -65,6 +65,7 @@ pub fn ns_id(process: &Process, kind: NsKind) -> Result<u32, Errno> {
             mnt_id(&ns)
         }
         NsKind::Cgroup => process.cgroup_ns(),
+        NsKind::Net => process.net_ns().id(),
         _ => 0,
     })
 }

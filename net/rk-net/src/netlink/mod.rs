@@ -128,7 +128,8 @@ pub struct NetlinkSocket {
 }
 
 /// The netlink sockets, for the port IDs and for the multicast groups.
-static SOCKETS: SpinLock<Vec<Weak<NetlinkSocket>>> = SpinLock::new(Vec::new());
+static SOCKETS: crate::ns::PerNet<SpinLock<Vec<Weak<NetlinkSocket>>>> =
+    crate::ns::PerNet::new(|| SpinLock::new(Vec::new()));
 
 fn sockets() -> Vec<Arc<NetlinkSocket>> {
     SOCKETS.lock().iter().filter_map(Weak::upgrade).collect()

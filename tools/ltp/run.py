@@ -61,6 +61,11 @@ mount -t tmpfs tmp /tmp
 mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup 2>/dev/null
 # The tests of IPv6 and the sockets send to ::1 and 127.0.0.1, as on a system where lo is up.
 ip link set lo up 2>/dev/null
+# The drivers that are in the kernel, for tst_require_drivers. rukernel has no modules.
+m=/lib/modules/$(uname -r)
+mkdir -p $m /var/run/netns
+echo kernel/drivers/net/veth.ko > $m/modules.builtin
+: > $m/modules.dep
 if ! mount -t ext4 -o ro /dev/vdb /ltp; then
     echo "ltp-error: cannot mount the LTP image"
     exit 1
@@ -177,6 +182,10 @@ class Batch:
         lst = "".join(f"{tag}\t{cmd}\n" for _, tag, cmd in tests)
         entries = [(".", 0o040755, b"")]
         entries += [(d, 0o040755, b"") for d in ("bin", "etc", "tmp", "proc", "sys", "dev", "ltp")]
+        if self.a.ip:
+            # The `ip` of iproute2 is in /bin, before the applet of BusyBox in /sbin.
+            with open(self.a.ip, "rb") as f:
+                entries.append(("bin/ip", 0o100755, f.read()))
         entries += [
             ("bin/busybox", 0o100755, busybox),
             ("bin/sh", 0o120777, b"busybox"),
@@ -299,6 +308,8 @@ def main():
     p.add_argument("--busybox", required=True, help="a static BusyBox program")
     p.add_argument("--out", default="runs", help="the directory of the batches")
     p.add_argument("--image", help="the ext4 image of the LTP tree (OUT/ltp.img)")
+    p.add_argument("--ip", help="a static `ip` program of iproute2, for the tests of the network "
+                   "that need veth and netns")
     p.add_argument("--batch", type=int, default=60, help="the number of tests in a batch")
     p.add_argument("--jobs", type=int, default=2, help="the number of QEMU at the same time")
     p.add_argument("--timeout", type=int, default=240, help="the time limit of a test in seconds")
@@ -316,6 +327,7 @@ def main():
     a.out = os.path.abspath(a.out)
     a.kernel = os.path.abspath(a.kernel)
     a.busybox = os.path.abspath(a.busybox)
+    a.ip = a.ip and os.path.abspath(a.ip)
     os.makedirs(a.out, exist_ok=True)
     a.image = os.path.abspath(a.image or os.path.join(a.out, "ltp.img"))
     make_image(a.ltp, a.image)

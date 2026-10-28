@@ -14,12 +14,13 @@ use crate::consts::{
     IFF_RUNNING, IFF_UP, IFNAMSIZ,
 };
 use crate::ether::{HLEN, MacAddr};
+use crate::ns::{self, NetNs};
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::ETH_DATA_LEN;
 use rk_frame::sync::SpinLock;
@@ -61,9 +62,25 @@ pub trait NetDriver: Send + Sync {
     /// The hardware address.
     fn mac(&self) -> MacAddr;
 
-    /// The largest payload of a frame after the link header.
+    /// The largest payload of a frame after the link header, which is the MTU of a new device.
     fn mtu(&self) -> u32 {
         ETH_DATA_LEN
+    }
+
+    /// The largest MTU, as `dev->max_mtu` of Linux.
+    fn max_mtu(&self) -> u32 {
+        self.mtu()
+    }
+
+    /// The kind of a virtual device for `IFLA_INFO_KIND`, as the `kind` of `rtnl_link_ops` of
+    /// Linux. It is also the prefix of the name. A virtual device goes away with its namespace.
+    fn link_kind(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The other end of a pair of devices, for `IFLA_LINK`. The two ends go away together.
+    fn peer(&self) -> Option<Arc<NetDevice>> {
+        None
     }
 
     /// The smallest MTU, as `dev->min_mtu` of Linux.
@@ -158,6 +175,10 @@ pub enum Event {
     Mtu,
     /// The name changed, as `NETDEV_CHANGENAME`.
     Name,
+    /// The device is now in the namespace, as `NETDEV_REGISTER`.
+    Register,
+    /// The device goes away from the namespace, as `NETDEV_UNREGISTER`. It is down.
+    Unregister,
 }
 
 /// A function that gets the changes of each device, as a `notifier_block` of Linux.
@@ -172,7 +193,9 @@ pub fn add_notifier(f: Notifier) {
     NOTIFIERS.lock().push(f);
 }
 
+/// Gives `event` of `dev` to each notifier, in the namespace of the device.
 fn notify(dev: &NetDevice, event: Event) {
+    let _in = ns::enter_index(dev.net());
     let list = NOTIFIERS.lock().clone();
     for f in list {
         f(dev, event);
@@ -182,7 +205,9 @@ fn notify(dev: &NetDevice, event: Event) {
 /// A registered network device.
 pub struct NetDevice {
     name: SpinLock<String>,
-    ifindex: u32,
+    ifindex: AtomicU32,
+    /// The index of the namespace, as `dev_net` of Linux.
+    net: AtomicUsize,
     kind: LinkKind,
     /// The flags of the device, as `dev->flags` of Linux, without `IFF_RUNNING` and
     /// `IFF_LOWER_UP`.
@@ -229,7 +254,7 @@ impl NetDevice {
         }
         {
             let devices = DEVICES.lock();
-            if devices.iter().any(|d| *d.name.lock() == name) {
+            if devices.iter().any(|d| d.net() == self.net() && *d.name.lock() == name) {
                 return Err(Errno::EEXIST);
             }
             *self.name.lock() = String::from(name);
@@ -238,9 +263,30 @@ impl NetDevice {
         Ok(())
     }
 
-    /// The interface index. The loopback device has the index 1.
+    /// The interface index. The loopback device has the index 1. Each namespace has its own
+    /// indexes.
     pub fn ifindex(&self) -> u32 {
-        self.ifindex
+        self.ifindex.load(Ordering::Relaxed)
+    }
+
+    /// The index of the namespace of the device.
+    pub fn net(&self) -> usize {
+        self.net.load(Ordering::Relaxed)
+    }
+
+    /// The kind of a virtual device, for `IFLA_INFO_KIND`.
+    pub fn link_kind(&self) -> Option<&'static str> {
+        self.driver.link_kind()
+    }
+
+    /// The other end of a pair of devices.
+    pub fn peer(&self) -> Option<Arc<NetDevice>> {
+        self.driver.peer()
+    }
+
+    /// The driver.
+    pub fn driver(&self) -> &Arc<dyn NetDriver> {
+        &self.driver
     }
 
     /// The kind of the link.
@@ -278,7 +324,7 @@ impl NetDevice {
     pub fn max_mtu(&self) -> u32 {
         match self.kind {
             LinkKind::Loopback => 0,
-            LinkKind::Ether => self.driver.mtu(),
+            LinkKind::Ether => self.driver.max_mtu(),
         }
     }
 
@@ -466,65 +512,197 @@ impl NetDevice {
             }
             add(&self.counters.rx_packets, 1);
             add(&self.counters.rx_bytes, frame.len());
-            frame.ifindex = self.ifindex;
+            frame.ifindex = self.ifindex();
             deliver(self, frame);
         })
     }
 }
 
-/// The registered devices, in the order of their interface index.
+/// The registered devices of all namespaces, in the order of their registration.
 static DEVICES: SpinLock<Vec<Arc<NetDevice>>> = SpinLock::new(Vec::new());
 
-/// Registers a device and gives it. The loopback device gets the name `lo`, and an Ethernet
-/// device gets `ethN` with the lowest free `N`, as `dev_alloc_name` of Linux. The interface index
-/// is one more than the largest index in use. Gives `EEXIST` for a second loopback device.
+/// The lowest free interface index of the namespace `net`, as `dev_index_reserve` of Linux. The
+/// index is one more than the largest index in use.
+fn new_index(devices: &[Arc<NetDevice>], net: usize) -> u32 {
+    devices.iter().filter(|d| d.net() == net).map(|d| d.ifindex()).max().unwrap_or(0) + 1
+}
+
+/// Registers a device in the current namespace and gives it. The loopback device gets the name
+/// `lo`, and an Ethernet device gets `ethN` with the lowest free `N`, as `dev_alloc_name` of
+/// Linux. The interface index is one more than the largest index in use. Gives `EEXIST` for a
+/// second loopback device.
 pub fn register(driver: Arc<dyn NetDriver>) -> Result<Arc<NetDevice>> {
-    let mut devices = DEVICES.lock();
-    let kind = driver.kind();
-    let taken = |name: &str| devices.iter().any(|d| *d.name.lock() == name);
-    let name = match kind {
-        LinkKind::Loopback if taken("lo") => return Err(Errno::EEXIST),
-        LinkKind::Loopback => String::from("lo"),
-        LinkKind::Ether => match (0..).map(|n| format!("eth{n}")).find(|n| !taken(n)) {
-            Some(name) => name,
-            None => return Err(Errno::ENFILE),
-        },
+    register_named(driver, None)
+}
+
+/// Registers a device in the current namespace with the name `name`, as `register_netdevice` of
+/// Linux. Without a name, a virtual device gets its kind and the lowest free number, as `vethN`.
+/// Gives `EEXIST` if the name is in use, and `EINVAL` for a bad name.
+pub fn register_named(driver: Arc<dyn NetDriver>, name: Option<&[u8]>) -> Result<Arc<NetDevice>> {
+    let net = ns::current_index();
+    let dev = {
+        let mut devices = DEVICES.lock();
+        let kind = driver.kind();
+        let taken = |name: &str| devices.iter().any(|d| d.net() == net && *d.name.lock() == name);
+        let name = match (kind, name) {
+            (LinkKind::Loopback, _) if taken("lo") => return Err(Errno::EEXIST),
+            (LinkKind::Loopback, _) => String::from("lo"),
+            (LinkKind::Ether, Some(name)) => {
+                let name = core::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
+                if !valid_name(name.as_bytes()) {
+                    return Err(Errno::EINVAL);
+                }
+                if taken(name) {
+                    return Err(Errno::EEXIST);
+                }
+                String::from(name)
+            }
+            (LinkKind::Ether, None) => {
+                let prefix = driver.link_kind().unwrap_or("eth");
+                match (0..).map(|n| format!("{prefix}{n}")).find(|n| !taken(n)) {
+                    Some(name) => name,
+                    None => return Err(Errno::ENFILE),
+                }
+            }
+        };
+        let ifindex = new_index(&devices, net);
+        let dev = Arc::new(NetDevice {
+            name: SpinLock::new(name),
+            ifindex: AtomicU32::new(ifindex),
+            net: AtomicUsize::new(net),
+            kind,
+            dflags: AtomicU32::new(kind.base_flags()),
+            gflags: AtomicU32::new(0),
+            mtu: AtomicU32::new(driver.mtu()),
+            txqlen: AtomicU32::new(TX_QUEUE_LEN),
+            activated: AtomicBool::new(false),
+            counters: Counters::default(),
+            driver,
+        });
+        devices.push(dev.clone());
+        dev
     };
-    let ifindex = devices.iter().map(|d| d.ifindex).max().unwrap_or(0) + 1;
-    let dev = Arc::new(NetDevice {
-        name: SpinLock::new(name),
-        ifindex,
-        kind,
-        dflags: AtomicU32::new(kind.base_flags()),
-        gflags: AtomicU32::new(0),
-        mtu: AtomicU32::new(driver.mtu()),
-        txqlen: AtomicU32::new(TX_QUEUE_LEN),
-        activated: AtomicBool::new(false),
-        counters: Counters::default(),
-        driver,
-    });
-    devices.push(dev.clone());
+    notify(&dev, Event::Register);
     Ok(dev)
 }
 
-/// Finds a device by its name.
+/// Tells if `dev` is registered.
+fn registered(dev: &NetDevice) -> bool {
+    DEVICES.lock().iter().any(|d| core::ptr::eq(&**d, dev))
+}
+
+/// Removes a device, as `unregister_netdevice` of Linux. The device goes down first. The other
+/// end of a pair goes too.
+pub fn unregister(dev: &Arc<NetDevice>) {
+    if !registered(dev) {
+        return;
+    }
+    dev.set_up(false);
+    notify(dev, Event::Unregister);
+    DEVICES.lock().retain(|d| !Arc::ptr_eq(d, dev));
+    if let Some(peer) = dev.peer() {
+        unregister(&peer);
+    }
+}
+
+/// Moves a device to the namespace `to`, as `__dev_change_net_namespace` of Linux. The device
+/// goes down, and it keeps its index if the index is free in `to`. Gives `EINVAL` for the
+/// loopback device, and `EEXIST` if `to` has a device with the same name.
+pub fn move_to(dev: &Arc<NetDevice>, to: &NetNs) -> Result<()> {
+    if dev.kind == LinkKind::Loopback {
+        return Err(Errno::EINVAL);
+    }
+    let net = to.index();
+    if dev.net() == net {
+        return Ok(());
+    }
+    {
+        let devices = DEVICES.lock();
+        let name = dev.name();
+        if devices.iter().any(|d| d.net() == net && *d.name.lock() == name) {
+            return Err(Errno::EEXIST);
+        }
+    }
+    dev.set_up(false);
+    notify(dev, Event::Unregister);
+    {
+        let devices = DEVICES.lock();
+        let index = dev.ifindex();
+        if devices.iter().any(|d| d.net() == net && d.ifindex() == index) {
+            dev.ifindex.store(new_index(&devices, net), Ordering::Relaxed);
+        }
+        dev.net.store(net, Ordering::Relaxed);
+    }
+    notify(dev, Event::Register);
+    Ok(())
+}
+
+/// Finds a device of the current namespace by its name.
 pub fn by_name(name: &str) -> Option<Arc<NetDevice>> {
-    DEVICES.lock().iter().find(|d| *d.name.lock() == name).cloned()
+    let net = ns::current_index();
+    DEVICES.lock().iter().find(|d| d.net() == net && *d.name.lock() == name).cloned()
 }
 
-/// Finds a device by its interface index.
+/// Finds a device of the current namespace by its interface index.
 pub fn by_index(ifindex: u32) -> Option<Arc<NetDevice>> {
-    DEVICES.lock().iter().find(|d| d.ifindex == ifindex).cloned()
+    let net = ns::current_index();
+    DEVICES.lock().iter().find(|d| d.net() == net && d.ifindex() == ifindex).cloned()
 }
 
-/// All registered devices.
+/// The devices of the current namespace, in the order of their interface index.
 pub fn devices() -> Vec<Arc<NetDevice>> {
+    let net = ns::current_index();
+    let mut list: Vec<_> = DEVICES.lock().iter().filter(|d| d.net() == net).cloned().collect();
+    list.sort_by_key(|d| d.ifindex());
+    list
+}
+
+/// The devices of all namespaces, for the poll of the devices.
+pub fn all_devices() -> Vec<Arc<NetDevice>> {
     DEVICES.lock().clone()
+}
+
+/// Makes the loopback device of a new namespace, as `loopback_net_init` of Linux. The device is
+/// down.
+fn ns_init() {
+    // Only a second loopback device gives an error, and a new namespace has none.
+    let _ = register(Arc::new(Loopback::default()));
+}
+
+/// Takes the devices out of a namespace that stops, as `default_device_exit_batch` of Linux. A
+/// virtual device and the loopback device go away. The other devices go back to the first
+/// namespace.
+fn ns_exit() {
+    let net = ns::current_index();
+    let init = ns::init_ns();
+    let list: Vec<_> = DEVICES.lock().iter().filter(|d| d.net() == net).cloned().collect();
+    for dev in list {
+        if dev.kind == LinkKind::Loopback || dev.link_kind().is_some() {
+            unregister(&dev);
+        } else if move_to(&dev, &init).is_err() {
+            // The first namespace has a device with the same name, as on Linux, which then
+            // gives the device the name `devN`.
+            let name = (0..).map(|n| format!("dev{n}")).find(|n| by_name_in(0, n).is_none());
+            if let Some(name) = name {
+                *dev.name.lock() = name;
+            }
+            let _ = move_to(&dev, &init);
+        }
+    }
+}
+
+/// Finds a device of the namespace `net` by its name.
+fn by_name_in(net: usize, name: &str) -> Option<Arc<NetDevice>> {
+    DEVICES.lock().iter().find(|d| d.net() == net && *d.name.lock() == name).cloned()
 }
 
 /// Registers the loopback device, so that it gets the interface index 1 as on Linux. The kernel
 /// calls this before it starts the drivers. A second call does nothing.
 pub fn init() {
+    static OPS: AtomicBool = AtomicBool::new(false);
+    if !OPS.swap(true, Ordering::Relaxed) {
+        ns::add_device_ops(ns_init, ns_exit);
+    }
     if by_name("lo").is_none() {
         // Only a second loopback device gives an error, and a race of two calls at boot is not
         // possible, so the result is not needed.

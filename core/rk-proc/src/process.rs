@@ -22,6 +22,7 @@ use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
+use rk_net::ns::NetNs;
 use rk_vfs::cred::Cred;
 use rk_vfs::{FdTable, FsContext, Location};
 
@@ -186,6 +187,8 @@ pub struct Process {
     cgroup: AtomicU32,
     /// The cgroup namespace of the process, or 0 for the namespace of the system.
     cgns: AtomicU32,
+    /// The network namespace of the process, or `None` for the first namespace.
+    net: SpinLock<Option<Arc<NetNs>>>,
     /// The process keyring and the session keyring.
     keys: SpinLock<ProcessKeys>,
 }
@@ -486,6 +489,26 @@ impl Process {
     /// The cgroup namespace of the process, or 0 for the namespace of the system.
     pub fn cgroup_ns(&self) -> u32 {
         self.cgns.load(Ordering::Relaxed)
+    }
+
+    /// The network namespace of the process, as `nsproxy->net_ns` of Linux.
+    pub fn net_ns(&self) -> Arc<NetNs> {
+        self.net.lock().clone().unwrap_or_else(rk_net::ns::init_ns)
+    }
+
+    /// The network namespace of the process, or `None` for the first namespace.
+    pub fn net_ns_opt(&self) -> Option<Arc<NetNs>> {
+        self.net.lock().clone()
+    }
+
+    /// Puts the process in the network namespace `ns`, for `CLONE_NEWNET` and `setns`.
+    pub fn set_net_ns(&self, ns: Arc<NetNs>) {
+        let old = {
+            let mut net = self.net.lock();
+            core::mem::replace(&mut *net, if ns.is_init() { None } else { Some(ns) })
+        };
+        // The old namespace can stop here, so the lock is free.
+        drop(old);
     }
 
     /// Puts the process in the cgroup namespace `ns`, for `CLONE_NEWCGROUP` and `setns`.
@@ -819,6 +842,7 @@ impl Process {
             keys: SpinLock::new(ProcessKeys::default()),
             cgroup: AtomicU32::new(rk_cgroup::ROOT),
             cgns: AtomicU32::new(0),
+            net: SpinLock::new(None),
         })
     }
 }
@@ -1414,6 +1438,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     child.set_thp_disable(pp.thp_disable());
     child.cgroup.store(cgroup, Ordering::Relaxed);
     child.set_cgroup_ns(pp.cgroup_ns());
+    *child.net.lock() = pp.net_ns_opt();
     if !share.vm
         && let Some(vm) = child.vm()
     {
@@ -1772,7 +1797,8 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     }
     let files = process.files.lock().take();
     let fs = process.fs.lock().take();
-    drop((vm, files, fs));
+    let net = process.net.lock().take();
+    drop((vm, files, fs, net));
 
     let (children, parent, status) = {
         let mut s = process.state.lock();
