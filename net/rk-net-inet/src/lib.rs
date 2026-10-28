@@ -73,7 +73,7 @@ pub fn init() {
             lo.set_up(true);
         }
     }
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     rk_frame::task::add_bottom_half(poll);
 }
 

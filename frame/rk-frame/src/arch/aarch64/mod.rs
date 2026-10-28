@@ -1,9 +1,10 @@
 //! The arm64 code of the frame.
 //!
 //! The kernel boots from a Linux arm64 `Image` on the QEMU `virt` machine. It runs at EL1 with the
-//! MMU on. The console is the PL011 UART, the interrupt controller is a GICv2, and the tick comes
-//! from the virtual timer of the generic timer. The device tree gives the addresses, and the
-//! addresses of QEMU `virt` are the fallback. TODO(#329): support GICv3.
+//! MMU on. The console is the PL011 UART, the interrupt controller is a GICv2 or a GICv3, and the
+//! tick comes from the virtual timer of the generic timer. The device tree gives the addresses,
+//! and the addresses of QEMU `virt` are the fallback. The virtio devices are on virtio-mmio. User
+//! programs get a vDSO with the time calls and `__kernel_rt_sigreturn`.
 
 pub(crate) mod boot;
 pub(crate) mod cpu;

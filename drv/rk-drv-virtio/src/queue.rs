@@ -1,8 +1,8 @@
 //! A split virtqueue. `run` does one request at a time and waits for it. The other functions
 //! let a driver keep many buffers in the queue and take them back without a wait.
 
-use crate::pci::{QueueAddrs, Transport};
 use crate::ring;
+use crate::transport::{QueueAddrs, Transport};
 use core::sync::atomic::{Ordering, fence};
 use rk_frame::mm::{Frame, alloc_zeroed_frame};
 
@@ -28,12 +28,6 @@ pub(crate) struct Queue {
     avail_idx: u16,
     /// The value of the field `idx` of the used ring after the last request.
     used_idx: u16,
-}
-
-fn read_u16(frame: &Frame, offset: usize) -> u16 {
-    let mut b = [0u8; 2];
-    frame.read_bytes(offset, &mut b);
-    u16::from_le_bytes(b)
 }
 
 impl Queue {
@@ -87,7 +81,9 @@ impl Queue {
     pub(crate) fn kick(&mut self, t: &Transport) {
         // The device must see the descriptors and the entries before the new index.
         fence(Ordering::SeqCst);
-        self.avail.write_bytes(ring::IDX_OFFSET, &self.avail_idx.to_le_bytes());
+        // The index is one 16 bit store, so the device does not see half of a new index. The
+        // architectures of the kernel are little endian, as the ring.
+        self.avail.store_u16(ring::IDX_OFFSET, self.avail_idx);
         fence(Ordering::SeqCst);
         t.notify(self.notify_at, self.index);
     }
@@ -95,7 +91,7 @@ impl Queue {
     /// Takes the next entry of the used ring, if the device put one there. Gives the first
     /// descriptor of the chain and the number of bytes that the device wrote.
     pub(crate) fn pop_used(&mut self) -> Option<(u32, u32)> {
-        if read_u16(&self.used, ring::IDX_OFFSET) == self.used_idx {
+        if self.used.load_u16(ring::IDX_OFFSET) == self.used_idx {
             return None;
         }
         // The driver reads the entry and the buffers only after it sees the new index.

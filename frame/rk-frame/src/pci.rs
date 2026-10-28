@@ -16,6 +16,8 @@ use crate::boot::MemoryKind;
 use crate::sync::{Once, SpinLock};
 use alloc::vec::Vec;
 
+pub use crate::iomem::IoMem;
+
 /// The address register and the data register of the configuration space. The lock keeps the
 /// two accesses of one read together.
 static CONFIG: SpinLock<()> = SpinLock::new(());
@@ -244,70 +246,7 @@ impl PciDevice {
         let in_page = (start - page) as usize;
         let pages = (in_page + len).div_ceil(PAGE_SIZE);
         let virt = crate::mm::frame::vmap_mmio_pages(page, pages)?;
-        Some(IoMem { virt: virt + in_page, len })
+        // SAFETY: the pages map the registers of the BAR without cache, and they are not RAM.
+        Some(unsafe { IoMem::new(virt + in_page, len) })
     }
-}
-
-/// A range of device registers that is mapped in the kernel. The mapping stays for all of the
-/// run time. Each access is volatile and checks that it is in the range.
-#[derive(Debug)]
-pub struct IoMem {
-    virt: usize,
-    len: usize,
-}
-
-macro_rules! io_access {
-    ($read:ident, $write:ident, $t:ty) => {
-        /// Reads the register at `offset`.
-        ///
-        /// # Panics
-        ///
-        /// If the register is not in the range or is not aligned.
-        pub fn $read(&self, offset: usize) -> $t {
-            let p = self.ptr::<$t>(offset);
-            // SAFETY: `ptr` checks that the register is in the mapped range and aligned. The range
-            // is device memory that is mapped without cache, and no Rust reference to it exists.
-            unsafe { p.read_volatile() }
-        }
-
-        /// Writes the register at `offset`.
-        ///
-        /// # Panics
-        ///
-        /// If the register is not in the range or is not aligned.
-        pub fn $write(&self, offset: usize, value: $t) {
-            let p = self.ptr::<$t>(offset);
-            // SAFETY: as for the read. The range is not RAM, so the write does not change memory
-            // that the kernel uses.
-            unsafe { p.write_volatile(value) }
-        }
-    };
-}
-
-impl IoMem {
-    /// The length of the range in bytes.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Tells if the range is empty. A mapped range is never empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn ptr<T>(&self, offset: usize) -> *mut T {
-        let size = size_of::<T>();
-        assert!(
-            offset.checked_add(size).is_some_and(|end| end <= self.len),
-            "{size} bytes at {offset} are outside the registers"
-        );
-        let addr = self.virt + offset;
-        assert!(addr.is_multiple_of(size), "the register at {offset} is not aligned");
-        addr as *mut T
-    }
-
-    io_access!(read_u8, write_u8, u8);
-    io_access!(read_u16, write_u16, u16);
-    io_access!(read_u32, write_u32, u32);
-    io_access!(read_u64, write_u64, u64);
 }

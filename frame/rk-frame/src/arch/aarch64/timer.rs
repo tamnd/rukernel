@@ -1,7 +1,8 @@
 //! The generic timer: the clock and the timer tick.
 //!
 //! The kernel uses the virtual timer of EL1, as Linux does in a guest. The virtual counter gives
-//! the clock, and the timer interrupts `HZ` times each second.
+//! the clock, and the timer interrupts `HZ` times each second. User code can read the virtual
+//! counter, so the vDSO calculates the clock from it.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -31,6 +32,8 @@ pub(crate) static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// The counter at boot.
 static BOOT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// The nanoseconds of one cycle of the counter, times 2^32. The clock and the vDSO use it.
+static COUNTER_MULT: AtomicU64 = AtomicU64::new(0);
 
 fn counter() -> u64 {
     let value: u64;
@@ -69,14 +72,27 @@ fn arm(freq: u64) {
 pub(crate) fn init() {
     let freq = frequency();
     TIMER_HZ.store(freq, Ordering::Relaxed);
+    if freq != 0 {
+        COUNTER_MULT
+            .store(((1_000_000_000u128 << 32) / u128::from(freq)) as u64, Ordering::Relaxed);
+    }
     let now = counter();
     BOOT_COUNT.store(now, Ordering::Relaxed);
     TICK_COUNT.store(now, Ordering::Relaxed);
     init_cpu();
 }
 
-/// Starts the timer of this CPU. Each CPU has its own timer and its own PPI.
+/// The bit of CNTKCTL_EL1 that lets user code read the virtual counter.
+const CNTKCTL_EL0VCTEN: u64 = 1 << 1;
+
+/// Starts the timer of this CPU. Each CPU has its own timer and its own PPI. User code on the CPU
+/// can read the virtual counter, for the vDSO, as on Linux.
 pub(crate) fn init_cpu() {
+    // SAFETY: CNTKCTL_EL1 controls only the access of EL0 to the timer. The value lets EL0 read
+    // the virtual counter and nothing more.
+    unsafe {
+        core::arch::asm!("msr cntkctl_el1, {}", "isb", in(reg) CNTKCTL_EL0VCTEN, options(nomem, nostack));
+    }
     let freq = TIMER_HZ.load(Ordering::Relaxed);
     if freq == 0 {
         return;
@@ -92,6 +108,7 @@ pub(crate) fn tick() {
         // must change first.
         TICK_COUNT.store(counter(), Ordering::Release);
         TICKS.fetch_add(1, Ordering::Release);
+        crate::vdso::tick();
     }
     arm(TIMER_HZ.load(Ordering::Relaxed));
 }
@@ -110,16 +127,23 @@ pub(crate) fn nanos() -> u64 {
 }
 
 /// The nanoseconds of the clock since boot. The value is in the same tick as the tick count, so a
-/// deadline in ticks is not before the time on the clock.
+/// deadline in ticks is not before the time on the clock. The vDSO calculates the same value from
+/// its data page.
 pub(crate) fn clock_ns() -> u64 {
-    let freq = TIMER_HZ.load(Ordering::Relaxed);
+    let mult = COUNTER_MULT.load(Ordering::Relaxed);
     loop {
         let ticks = TICKS.load(Ordering::Acquire);
         let base = TICK_COUNT.load(Ordering::Acquire);
         let now = counter();
         if TICKS.load(Ordering::Acquire) == ticks {
-            let part = if freq == 0 { 0 } else { to_ns(now.saturating_sub(base), freq) };
-            return ticks * NS_PER_TICK + part.min(NS_PER_TICK - 1);
+            let cycles = u128::from(now.saturating_sub(base));
+            let part = ((cycles * u128::from(mult)) >> 32).min(u128::from(NS_PER_TICK - 1));
+            return ticks * NS_PER_TICK + part as u64;
         }
     }
+}
+
+/// The counter at the last tick and `COUNTER_MULT`, for the data page of the vDSO.
+pub(crate) fn counter_state() -> (u64, u64) {
+    (TICK_COUNT.load(Ordering::Relaxed), COUNTER_MULT.load(Ordering::Relaxed))
 }

@@ -22,6 +22,8 @@ pub mod cpu;
 pub mod date;
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) mod fdt;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod iomem;
 #[cfg(target_os = "none")]
 pub mod irq;
 pub mod mm;
@@ -36,10 +38,7 @@ pub mod time;
 pub mod trap;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod user;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub mod vdso;
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-#[path = "arch/aarch64/vdso.rs"]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod vdso;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod vm;

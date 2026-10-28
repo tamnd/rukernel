@@ -4,6 +4,7 @@
 //! The boot path reads the memory, the reserved memory, the command line, the initramfs, the PSCI
 //! method, the CPUs and the addresses of the devices that rk-frame drives from it: the PL011 UART,
 //! the GICv2, the interrupt of the virtual timer, the PL031 RTC and the ECAM of a generic PCI host.
+//! It also keeps the virtio MMIO devices for the virtio drivers.
 //! The full binding set comes later.
 
 use crate::addr::PhysAddr;
@@ -28,6 +29,9 @@ const MAX_RANGES: usize = 32;
 /// The most CPUs that the boot path keeps from the `/cpus` node.
 pub(crate) const MAX_CPUS: usize = 64;
 
+/// The most virtio MMIO devices that the boot path keeps. QEMU `virt` has 32.
+pub(crate) const MAX_VIRTIO_MMIO: usize = 32;
+
 /// What the boot path needs from the device tree, apart from the `BootInfo`. A device that the
 /// device tree does not give is `None`, and the caller uses the address of QEMU `virt` then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,8 +42,9 @@ pub(crate) struct Platform {
     pub(crate) uart: Option<u64>,
     /// The physical addresses of the GICv2 distributor and CPU interface.
     pub(crate) gic: Option<(u64, u64)>,
-    /// The device tree has a GICv3, which the kernel does not drive yet.
-    pub(crate) gic_v3: bool,
+    /// The physical addresses of the GICv3 distributor and of the redistributor region, and the
+    /// length of the region.
+    pub(crate) gic_v3: Option<(u64, u64, u64)>,
     /// The interrupt number of the virtual timer of EL1.
     pub(crate) timer_intid: Option<u32>,
     /// The physical address of the PL031 RTC.
@@ -51,6 +56,11 @@ pub(crate) struct Platform {
     pub(crate) cpus: [u64; MAX_CPUS],
     /// The number of CPUs in `cpus`.
     pub(crate) cpu_count: usize,
+    /// The physical address and the size of each virtio MMIO device, in the order of the device
+    /// tree. The first `virtio_mmio_count` are valid.
+    pub(crate) virtio_mmio: [(u64, u64); MAX_VIRTIO_MMIO],
+    /// The number of devices in `virtio_mmio`.
+    pub(crate) virtio_mmio_count: usize,
 }
 
 impl Default for Platform {
@@ -59,12 +69,14 @@ impl Default for Platform {
             psci_smc: false,
             uart: None,
             gic: None,
-            gic_v3: false,
+            gic_v3: None,
             timer_intid: None,
             rtc: None,
             pci_ecam: None,
             cpus: [0; MAX_CPUS],
             cpu_count: 0,
+            virtio_mmio: [(0, 0); MAX_VIRTIO_MMIO],
+            virtio_mmio_count: 0,
         }
     }
 }
@@ -114,10 +126,17 @@ impl Node<'_> {
             platform.uart = first.map(|r| r.0);
         } else if self.is("arm,pl031") && platform.rtc.is_none() {
             platform.rtc = first.map(|r| r.0);
+        } else if self.is("virtio,mmio") {
+            if let Some(r) = first.filter(|_| platform.virtio_mmio_count < MAX_VIRTIO_MMIO) {
+                platform.virtio_mmio[platform.virtio_mmio_count] = r;
+                platform.virtio_mmio_count += 1;
+            }
         } else if self.is("pci-host-ecam-generic") && platform.pci_ecam.is_none() {
             platform.pci_ecam = first;
         } else if self.is("arm,gic-v3") {
-            platform.gic_v3 = true;
+            if let (Some(d), Some(r)) = (first, self.reg(1, addr_cells, size_cells)) {
+                platform.gic_v3 = Some((d.0, r.0, r.1));
+            }
         } else if self.is("arm,cortex-a15-gic") || self.is("arm,gic-400") {
             if let (Some(d), Some(c)) = (first, self.reg(1, addr_cells, size_cells)) {
                 platform.gic = Some((d.0, c.0));
@@ -507,6 +526,13 @@ mod tests {
         b.prop("compatible", b"arm,pl031\0arm,primecell\0");
         b.prop("reg", &be(&[0, 0x0901_0000, 0, 0x1000]));
         b.end();
+        for at in [0x0a00_0200u32, 0x0a00_0000] {
+            b.begin(if at == 0x0a00_0000 { "virtio_mmio@a000000" } else { "virtio_mmio@a000200" });
+            b.prop("interrupts", &be(&[0, 0x10, 1]));
+            b.prop("compatible", b"virtio,mmio\0");
+            b.prop("reg", &be(&[0, at, 0, 0x200]));
+            b.end();
+        }
         b.begin("pcie@10000000");
         b.prop("compatible", b"pci-host-ecam-generic\0");
         b.prop("reg", &be(&[0x40, 0x1000_0000, 0, 0x1000_0000]));
@@ -517,11 +543,15 @@ mod tests {
         let p = read(&blob, 0x5000_0000, &mut info).unwrap();
         assert_eq!(p.uart, Some(0x0900_0000));
         assert_eq!(p.gic, Some((0x0800_0000, 0x0801_0000)));
-        assert!(!p.gic_v3);
+        assert_eq!(p.gic_v3, None);
         assert_eq!(p.timer_intid, Some(27));
         assert_eq!(p.rtc, Some(0x0901_0000));
         assert_eq!(p.pci_ecam, Some((0x40_1000_0000, 0x1000_0000)));
         assert_eq!(&p.cpus[..p.cpu_count], &[0, 1]);
+        assert_eq!(
+            &p.virtio_mmio[..p.virtio_mmio_count],
+            &[(0x0a00_0200, 0x200), (0x0a00_0000, 0x200)]
+        );
     }
 
     #[test]

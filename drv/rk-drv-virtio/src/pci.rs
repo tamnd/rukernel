@@ -1,5 +1,6 @@
 //! The modern virtio PCI transport, from section 4.1 of the virtio 1.2 specification.
 
+use crate::transport::{QueueAddrs, status};
 use rk_frame::pci::{IoMem, PciDevice};
 
 /// The capability ID of the vendor specific capabilities that virtio uses.
@@ -28,17 +29,23 @@ mod common {
     pub(crate) const LEN: usize = 0x38;
 }
 
-/// The bits of the device status.
-pub(crate) mod status {
-    pub(crate) const ACKNOWLEDGE: u8 = 1;
-    pub(crate) const DRIVER: u8 = 2;
-    pub(crate) const DRIVER_OK: u8 = 4;
-    pub(crate) const FEATURES_OK: u8 = 8;
-    pub(crate) const FAILED: u8 = 0x80;
-}
+/// The PCI device ID of a transitional virtio-net device and of a transitional virtio-blk device.
+/// A modern device has the ID 0x1040 plus the virtio device ID.
+const DEVICE_TRANSITIONAL_NET: u16 = 0x1000;
+const DEVICE_TRANSITIONAL_BLK: u16 = 0x1001;
+const DEVICE_MODERN_BASE: u16 = 0x1040;
 
-/// The feature bit that tells that the device is a virtio 1.0 device.
-pub(crate) const F_VERSION_1: u64 = 1 << 32;
+/// Gives the virtio device ID of the PCI function, or `None` if it is not a virtio device.
+pub(crate) fn device_type(dev: &PciDevice) -> Option<u32> {
+    if dev.vendor_id() != crate::VIRTIO_VENDOR {
+        return None;
+    }
+    match dev.device_id() {
+        DEVICE_TRANSITIONAL_NET => Some(crate::DEVICE_NET),
+        DEVICE_TRANSITIONAL_BLK => Some(crate::DEVICE_BLK),
+        id => id.checked_sub(DEVICE_MODERN_BASE).filter(|&n| n < 0x40).map(u32::from),
+    }
+}
 
 /// The value of an MSI-X vector register for no vector.
 const NO_VECTOR: u16 = 0xffff;
@@ -52,21 +59,14 @@ struct Place {
 }
 
 /// A virtio device on the PCI bus, after the reset.
-pub(crate) struct Transport {
+pub(crate) struct PciTransport {
     common: IoMem,
     notify: IoMem,
     notify_multiplier: u32,
     device: IoMem,
 }
 
-/// The physical addresses of the three parts of a queue.
-pub(crate) struct QueueAddrs {
-    pub(crate) desc: u64,
-    pub(crate) avail: u64,
-    pub(crate) used: u64,
-}
-
-impl Transport {
+impl PciTransport {
     /// Finds the configuration structures of the device, maps them and resets the device. Gives
     /// `None` if the device does not have the modern transport.
     pub(crate) fn new(dev: &PciDevice) -> Option<Self> {
@@ -106,39 +106,30 @@ impl Transport {
             core::hint::spin_loop();
         }
         t.common.write_u16(common::MSIX_CONFIG, NO_VECTOR);
-        t.add_status(status::ACKNOWLEDGE | status::DRIVER);
+        t.set_status(status::ACKNOWLEDGE | status::DRIVER);
         Some(t)
     }
 
-    /// Sets the bits `bits` in the device status.
-    pub(crate) fn add_status(&self, bits: u8) {
-        let s = self.common.read_u8(common::DEVICE_STATUS);
-        self.common.write_u8(common::DEVICE_STATUS, s | bits);
+    /// Reads the device status.
+    pub(crate) fn status(&self) -> u8 {
+        self.common.read_u8(common::DEVICE_STATUS)
     }
 
-    /// Tells the device that the driver failed.
-    pub(crate) fn fail(&self) {
-        self.add_status(status::FAILED);
+    /// Writes the device status.
+    pub(crate) fn set_status(&self, value: u8) {
+        self.common.write_u8(common::DEVICE_STATUS, value);
     }
 
-    /// Takes the features of `wanted` that the device has. Gives the features, or `None` if the
-    /// device does not take them or does not have `F_VERSION_1`.
-    pub(crate) fn negotiate(&self, wanted: u64) -> Option<u64> {
-        let mut offered = 0u64;
-        for half in 0..2u32 {
-            self.common.write_u32(common::DEVICE_FEATURE_SELECT, half);
-            offered |= u64::from(self.common.read_u32(common::DEVICE_FEATURE)) << (32 * half);
-        }
-        let features = offered & (wanted | F_VERSION_1);
-        if features & F_VERSION_1 == 0 {
-            return None;
-        }
-        for half in 0..2u32 {
-            self.common.write_u32(common::DRIVER_FEATURE_SELECT, half);
-            self.common.write_u32(common::DRIVER_FEATURE, (features >> (32 * half)) as u32);
-        }
-        self.add_status(status::FEATURES_OK);
-        (self.common.read_u8(common::DEVICE_STATUS) & status::FEATURES_OK != 0).then_some(features)
+    /// Reads the half `half` of the features of the device: bits 0 to 31 or bits 32 to 63.
+    pub(crate) fn device_features(&self, half: u32) -> u32 {
+        self.common.write_u32(common::DEVICE_FEATURE_SELECT, half);
+        self.common.read_u32(common::DEVICE_FEATURE)
+    }
+
+    /// Writes the half `half` of the features of the driver.
+    pub(crate) fn set_driver_features(&self, half: u32, value: u32) {
+        self.common.write_u32(common::DRIVER_FEATURE_SELECT, half);
+        self.common.write_u32(common::DRIVER_FEATURE, value);
     }
 
     /// Gives the largest size of the queue `index`, or 0 if the queue is not there.
@@ -189,11 +180,5 @@ impl Transport {
     /// Reads the 32 bit field at `offset` of the configuration of the device.
     pub(crate) fn device_u32(&self, offset: usize) -> u32 {
         self.device.read_u32(offset)
-    }
-
-    /// Reads the 64 bit field at `offset` of the configuration of the device, as two 32 bit
-    /// reads.
-    pub(crate) fn device_u64(&self, offset: usize) -> u64 {
-        u64::from(self.device_u32(offset)) | (u64::from(self.device_u32(offset + 4)) << 32)
     }
 }

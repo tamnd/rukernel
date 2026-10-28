@@ -468,8 +468,7 @@ fn find_user_cc() -> Result<Option<UserCc>> {
     Ok(None)
 }
 
-/// Finds a C compiler that makes arm64 Linux programs with musl, for the arm64 `init` and `smp`
-/// tests. `RK_USER_CC_AARCH64` gives the command, for example `aarch64-linux-musl-gcc`, `zig cc
+/// Finds a C compiler that makes arm64 Linux programs with musl, for the arm64 user tests. `RK_USER_CC_AARCH64` gives the command, for example `aarch64-linux-musl-gcc`, `zig cc
 /// -target aarch64-linux-musl`, or a script that runs the gcc of Alpine for arm64 in a container.
 /// Then `aarch64-linux-musl-gcc` and `zig` are tried. Without a compiler, the tests are skipped.
 fn find_user_cc_aarch64() -> Option<UserCc> {
@@ -1990,12 +1989,35 @@ const AARCH64_TESTS: &[&str] =
     &["boot", "trap", "mm", "heap", "timer", "task", "syscall", "vm", "fault"];
 
 /// The tests that `boot-test aarch64` runs with the user programs of tests/user in the initramfs,
-/// as the x86-64 tests of the same names. They need `find_user_cc_aarch64`.
-const AARCH64_USER_TESTS: &[&str] = &["init", "smp"];
+/// as the x86-64 tests of the same names. They need `find_user_cc_aarch64`. The `busybox` test
+/// also needs an arm64 BusyBox from `RK_BUSYBOX_AARCH64`. The `blk` and `inet` tests use the
+/// virtio-mmio devices of the `virt` machine.
+const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "inet", "busybox"];
 
 /// The time limit of each test of `AARCH64_USER_TESTS`. QEMU emulates each instruction, and the
-/// `smp` test takes about 13 minutes on an x86-64 host with 4 emulated CPUs.
+/// `init` test runs all of the general checks of init.
 const AARCH64_USER_TIMEOUT: Duration = Duration::from_secs(1500);
+
+/// The command line of the arm64 boot test `test`. The `smp`, `blk` and `inet` tests give init
+/// the argument `only`, so that init does not run the general checks again. The `init` test runs
+/// them.
+fn aarch64_cmdline(test: &str) -> String {
+    let cmdline = test_cmdline(test).replace("console=ttyS0", "console=ttyAMA0");
+    if matches!(test, "smp" | "blk" | "inet") {
+        cmdline.replace(" -- ", " -- only ")
+    } else {
+        cmdline
+    }
+}
+
+/// The input of the arm64 `busybox` test, as `test_input("busybox")`. The BusyBox of Alpine shows
+/// the prompt `~ # ` in the root directory, not `/ # `.
+const AARCH64_BUSYBOX_INPUT: &[(&str, &[u8])] = &[
+    ("~ # ", b"echo one two | tr a-z A-Z | cat\n"),
+    ("ONE TWO", b"sh -c 'while :; do echo T\"ICK\"; sleep 1; done'\n"),
+    ("TICK", b"\x03"),
+    ("TICK", b"test $? = 130; exit $?\n"),
+];
 
 /// The number of CPUs of the arm64 `boot` test. The other arm64 tests have one CPU.
 const AARCH64_SMP_CPUS: &str = "4";
@@ -2034,9 +2056,11 @@ fn arm64_image(elf: &[u8]) -> Result<Vec<u8>> {
     Ok(image)
 }
 
-/// Builds the arm64 user programs of tests/user and the initramfs of the `init` test next to the
-/// kernel `elf`. Gives the path of the initramfs, or `None` if there is no arm64 C compiler.
-fn aarch64_initramfs(elf: &Path) -> Result<Option<PathBuf>> {
+/// Builds the arm64 user programs of tests/user and the initramfs of the user tests next to the
+/// kernel `elf`. The initramfs has the arm64 BusyBox from `RK_BUSYBOX_AARCH64` if the variable is
+/// set. Gives the path of the initramfs and whether it has BusyBox, or `None` if there is no arm64
+/// C compiler.
+fn aarch64_initramfs(elf: &Path) -> Result<Option<(PathBuf, bool)>> {
     let Some(cc) = find_user_cc_aarch64() else {
         println!("user programs on arm64: skipped, no C compiler, set RK_USER_CC_AARCH64");
         return Ok(None);
@@ -2047,9 +2071,13 @@ fn aarch64_initramfs(elf: &Path) -> Result<Option<PathBuf>> {
     let read = |p: &Path| fs::read(p).map_err(|e| format!("{}: {e}", p.display()));
     let initrd = elf.with_file_name("initramfs.cpio");
     let user = (read(&init)?, read(&hello)?);
-    fs::write(&initrd, test_initramfs(Some(&user), None))
+    let busybox = match std::env::var_os("RK_BUSYBOX_AARCH64") {
+        Some(path) => Some(read(Path::new(&path))?),
+        None => None,
+    };
+    fs::write(&initrd, test_initramfs(Some(&user), busybox.as_deref()))
         .map_err(|e| format!("{}: {e}", initrd.display()))?;
-    Ok(Some(initrd))
+    Ok(Some((initrd, busybox.is_some())))
 }
 
 /// Builds the arm64 kernel and runs `AARCH64_TESTS`, and `AARCH64_USER_TESTS` with a C compiler,
@@ -2070,38 +2098,86 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
     let image = elf_path.with_file_name("Image");
     fs::write(&image, arm64_image(&elf)?).map_err(|e| format!("{}: {e}", image.display()))?;
     let initrd = aarch64_initramfs(&elf_path)?;
-    let user_tests = if initrd.is_some() { AARCH64_USER_TESTS } else { &[] };
-    for test in AARCH64_TESTS.iter().chain(user_tests) {
+    let has_busybox = initrd.as_ref().is_some_and(|(_, b)| *b);
+    if initrd.is_some() && !has_busybox {
+        println!("boot test busybox on arm64: skipped, set RK_BUSYBOX_AARCH64");
+    }
+    let user_tests: Vec<&str> = match &initrd {
+        Some(_) => {
+            AARCH64_USER_TESTS.iter().copied().filter(|t| *t != "busybox" || has_busybox).collect()
+        }
+        None => Vec::new(),
+    };
+    // The tests run with a GICv3, and the `boot` test also runs with a GICv2.
+    let runs = [("boot", "2")]
+        .into_iter()
+        .chain(AARCH64_TESTS.iter().chain(&user_tests).map(|t| (*t, "3")));
+    // RK_AARCH64_TESTS gives a list of test names with commas, for a run by hand.
+    let only = std::env::var("RK_AARCH64_TESTS").ok();
+    let selected = |t: &str| only.as_deref().is_none_or(|o| o.split(',').any(|n| n == t));
+    for (test, gic) in runs.filter(|(t, _)| selected(t)) {
+        let test = &test;
+        let name = if gic == "2" { format!("{test} with GICv2") } else { String::from(*test) };
         let smp = if matches!(*test, "boot" | "smp") { AARCH64_SMP_CPUS } else { "1" };
-        let cmdline = test_cmdline(test).replace("console=ttyS0", "console=ttyAMA0");
+        // The `inet` test connects to a TCP server on the host, as on x86-64.
+        let server = if *test == "inet" { Some(TcpServer::start()?) } else { None };
+        let mut cmdline = aarch64_cmdline(test);
+        if let Some(server) = &server {
+            cmdline = format!("{cmdline} {}", server.port);
+        }
         let mut cmd = Command::new(qemu);
-        cmd.args(["-M", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-smp", smp])
+        let machine = format!("virt,gic-version={gic}");
+        cmd.args(["-M", &machine, "-cpu", "cortex-a72", "-m", "512M", "-smp", smp])
             .args(["-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot"])
+            // The kernel drives the modern (version 2) virtio-mmio devices only.
+            .args(["-global", "virtio-mmio.force-legacy=false"])
             .arg("-kernel")
             .arg(&image)
             .arg("-append")
             .arg(cmdline);
-        if let Some(initrd) = initrd.as_ref().filter(|_| user_tests.contains(test)) {
+        if let Some((initrd, _)) = initrd.as_ref().filter(|_| user_tests.contains(test)) {
             cmd.arg("-initrd").arg(initrd);
+        }
+        if *test == "blk" {
+            let disk = elf_path.with_file_name("blk.img");
+            write_blk_disk(&disk)?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
+                .args(["-device", "virtio-blk-device,drive=disk0"]);
+        }
+        if *test == "inet" {
+            cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0"]);
         }
         // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
         // gives the result.
         // QEMU emulates each arm64 instruction on an x86-64 host, so init has more time.
         let timeout =
             if user_tests.contains(test) { AARCH64_USER_TIMEOUT } else { BOOT_TEST_TIMEOUT };
-        let (status, log) = run_with_timeout(cmd, timeout, &[])?;
-        let passed = status == Some(0)
+        let input = if *test == "busybox" { AARCH64_BUSYBOX_INPUT } else { test_input(test) };
+        let (status, log) = run_with_timeout(cmd, timeout, input)?;
+        let mut passed = status == Some(0)
             && log.contains("aarch64 booting with linux")
             && log.contains(&format!("smp: {smp} CPUs run"))
             && log.contains(&pass_line(test));
+        if *test == "blk" && passed && !blk_disk_has_note(&elf_path.with_file_name("blk.img"))? {
+            println!("boot test blk on arm64: the disk image does not have the data of the guest");
+            passed = false;
+        }
+        if passed
+            && let Some(server) = server
+            && let Err(e) = server.result()
+        {
+            println!("boot test {name} on arm64: the TCP server on the host: {e}");
+            passed = false;
+        }
         if passed {
-            println!("boot test {test} on arm64: pass");
+            println!("boot test {name} on arm64: pass");
             if std::env::var_os("RK_BOOT_LOG").is_some() {
                 println!("{log}");
             }
         } else {
             let status = status.map_or(String::from("a timeout"), |s| format!("status {s}"));
-            errors.push(format!("boot test {test} on arm64: fail with {status}\n{log}"));
+            errors.push(format!("boot test {name} on arm64: fail with {status}\n{log}"));
         }
     }
     Ok(())

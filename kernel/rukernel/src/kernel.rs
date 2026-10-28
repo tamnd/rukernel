@@ -74,9 +74,6 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     rk_drv_mem::init();
     rk_drv_tty::init();
     rk_net::dev::init();
-    // The virtio devices of arm64 are on the MMIO transport or on a PCI host bridge of the
-    // device tree, and rukernel has neither yet.
-    #[cfg(target_arch = "x86_64")]
     rk_drv_virtio::init();
     rk_net_inet::init();
     if let Some(ip) = param(boot.cmdline(), "ip") {

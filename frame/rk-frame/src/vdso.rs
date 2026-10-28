@@ -1,9 +1,10 @@
 //! The vDSO and its data page, per spec/05-processes-signals-exec.md section 5.4.
 //!
-//! The build script links the vDSO from `vdso/x86_64.rs`. The kernel maps the data page and the
-//! vDSO in each process, with the data page directly below the vDSO. The timer interrupt writes
-//! the tick count and the time stamp counter of the tick to the data page, so the time in the
-//! vDSO is the same as the time of the system calls.
+//! The build script links the vDSO from `vdso/x86_64.rs` or `vdso/aarch64.rs`. The kernel maps the
+//! data page and the vDSO in each process, with the data page directly below the vDSO. The timer
+//! interrupt writes the tick count and the counter of the tick to the data page, so the time in
+//! the vDSO is the same as the time of the system calls. The counter is the time stamp counter on
+//! x86-64 and the virtual counter of the generic timer on arm64.
 
 use crate::arch::imp::paging;
 use crate::mm::{Frame, alloc_zeroed_frame};
@@ -14,17 +15,21 @@ use core::sync::atomic::{AtomicU64, Ordering, compiler_fence};
 /// The vDSO, a shared object.
 pub static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vdso.so"));
 
+/// The offset of `__kernel_rt_sigreturn` in the vDSO, the return of a signal handler without
+/// `SA_RESTORER`.
+#[cfg(target_arch = "aarch64")]
+pub const SIGRETURN: usize = include!(concat!(env!("OUT_DIR"), "/vdso_sigreturn.rs"));
+
 /// The word of the data page with the tick count.
 const TICKS: usize = 0;
 /// The word of the data page with the nanoseconds of one tick.
 const NS_PER_TICK: usize = 1;
 /// The word of the data page with the sequence count. It is odd while the kernel writes the page.
 const SEQ: usize = 2;
-/// The word of the data page with the time stamp counter at the last tick.
-const TICK_TSC: usize = 3;
-/// The word of the data page with the nanoseconds of one cycle of the time stamp counter, times
-/// 2^32.
-const TSC_MULT: usize = 4;
+/// The word of the data page with the counter at the last tick.
+const TICK_COUNTER: usize = 3;
+/// The word of the data page with the nanoseconds of one cycle of the counter, times 2^32.
+const COUNTER_MULT: usize = 4;
 /// The word of the data page with the nanoseconds of `CLOCK_REALTIME` at boot. A clock set changes
 /// it.
 const REALTIME_OFFSET: usize = 5;
@@ -49,11 +54,11 @@ pub fn data_page() -> Option<Arc<Frame>> {
     .clone()
 }
 
-/// Writes the tick count and the time stamp counter of the tick to the data page. The timer
-/// interrupt calls it after each tick.
+/// Writes the tick count and the counter of the tick to the data page. The timer interrupt calls
+/// it after each tick.
 pub(crate) fn tick() {
-    let (tick_tsc, mult) = crate::arch::imp::timer::tsc_state();
-    write(&[(TICKS, crate::time::ticks()), (TICK_TSC, tick_tsc), (TSC_MULT, mult)]);
+    let (tick_counter, mult) = crate::arch::imp::timer::counter_state();
+    write(&[(TICKS, crate::time::ticks()), (TICK_COUNTER, tick_counter), (COUNTER_MULT, mult)]);
 }
 
 /// Writes the new offset of `CLOCK_REALTIME` to the data page, after a clock set.
@@ -75,19 +80,21 @@ fn write(words: &[(usize, u64)]) {
     }
     let page = paging::phys_to_virt(phys) as *mut u64;
     let _guard = WRITER.lock();
-    // SAFETY: the data page lives in `DATA` until the kernel stops, and the direct map maps it.
-    // `WRITER` lets one CPU at a time write the page. A user process maps it read only. The
-    // sequence count is odd while the other words change, so the vDSO reads them again if it
-    // sees an odd count or a changed count.
-    unsafe {
-        let seq = page.wrapping_add(SEQ);
-        let count = seq.read_volatile();
-        seq.write_volatile(count.wrapping_add(1));
-        compiler_fence(Ordering::SeqCst);
-        for &(index, value) in words {
-            page.wrapping_add(index).write_volatile(value);
-        }
-        compiler_fence(Ordering::SeqCst);
-        seq.write_volatile(count.wrapping_add(2));
+    // The data page lives in `DATA` until the kernel stops, and the direct map maps it. `WRITER`
+    // lets one CPU at a time write the page. A user process maps it read only. The sequence count
+    // is odd while the other words change, so the vDSO reads them again if it sees an odd count
+    // or a changed count.
+    let seq = page.wrapping_add(SEQ);
+    // SAFETY: as above.
+    let count = unsafe { seq.read_volatile() };
+    // SAFETY: as above.
+    unsafe { seq.write_volatile(count.wrapping_add(1)) };
+    compiler_fence(Ordering::SeqCst);
+    for &(index, value) in words {
+        // SAFETY: as above. Each index is a word of the page.
+        unsafe { page.wrapping_add(index).write_volatile(value) };
     }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: as above.
+    unsafe { seq.write_volatile(count.wrapping_add(2)) };
 }

@@ -1,0 +1,10 @@
+/* The symbols of the arm64 vDSO and their version, as in arch/arm64/kernel/vdso/vdso.lds.S of
+ * Linux. */
+LINUX_2.6.39 {
+global:
+    __kernel_rt_sigreturn;
+    __kernel_gettimeofday;
+    __kernel_clock_gettime;
+    __kernel_clock_getres;
+local: *;
+};

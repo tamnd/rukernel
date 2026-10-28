@@ -1,7 +1,7 @@
 //! virtio-blk, from section 5.2 of the virtio 1.2 specification.
 
-use crate::pci::{Transport, status};
 use crate::queue::{Buffer, Queue};
+use crate::transport::{Transport, status};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -9,15 +9,10 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::addr::PAGE_SIZE;
 use rk_frame::mm::{Frame, alloc_zeroed_frame};
-use rk_frame::pci::PciDevice;
 use rk_frame::sync::SpinLock;
 use rk_vfs::blockdev::{BlockDevice, SECTOR_SIZE, register_block};
 use rk_vfs::device::makedev;
 use rk_vfs::inode::Result;
-
-/// The device ID of a transitional virtio-blk device and of a modern one.
-const DEVICE_TRANSITIONAL: u16 = 0x1001;
-const DEVICE_MODERN: u16 = 0x1042;
 
 /// The device does not take writes.
 const F_RO: u64 = 1 << 5;
@@ -42,17 +37,13 @@ const S_OK: u8 = 0;
 const DATA_FRAMES: usize = 16;
 const SECTORS_PER_FRAME: usize = PAGE_SIZE / SECTOR_SIZE;
 
-/// Tells if the PCI function is a virtio-blk device.
-pub(crate) fn is_blk(dev: &PciDevice) -> bool {
-    matches!(dev.device_id(), DEVICE_TRANSITIONAL | DEVICE_MODERN)
-}
-
-/// Starts the driver for the disk number `index`, and gives the name of the disk.
-pub(crate) fn probe(dev: &PciDevice, index: u32) -> Option<String> {
+/// Starts the driver for the disk number `index` on the transport `t`, and gives the name of the
+/// disk.
+pub(crate) fn probe(t: Transport, index: u32) -> Option<String> {
     if index >= 26 {
+        t.fail();
         return None;
     }
-    let t = Transport::new(dev)?;
     let Some(features) = t.negotiate(F_RO | F_FLUSH | F_DISCARD) else {
         t.fail();
         return None;

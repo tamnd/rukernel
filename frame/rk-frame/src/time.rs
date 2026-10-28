@@ -56,7 +56,7 @@ pub fn set_realtime_ns(ns: u64) -> u64 {
     let old = realtime_offset_ns();
     let offset = ns.wrapping_sub(clock_ns());
     OFFSET.store(offset, Ordering::Relaxed);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     crate::vdso::set_realtime_offset(offset);
     offset.wrapping_sub(old)
 }

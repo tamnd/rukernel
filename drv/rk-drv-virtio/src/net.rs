@@ -7,9 +7,9 @@
 //! `transmit` takes back the sent buffers from the used ring of the transmit queue.
 
 use crate::net_hdr::{self, NetHdr};
-use crate::pci::{Transport, status};
 use crate::queue::{Buffer, Queue};
 use crate::ring::Slots;
+use crate::transport::{Transport, status};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -17,16 +17,11 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::addr::PAGE_SIZE;
 use rk_frame::mm::{Frame, alloc_zeroed_frame};
-use rk_frame::pci::PciDevice;
 use rk_frame::sync::SpinLock;
 use rk_net::buf::NetBuf;
 use rk_net::dev::{LinkKind, NetDevice, NetDriver, register};
 use rk_net::ether::MacAddr;
 use rk_vfs::inode::Result;
-
-/// The device ID of a transitional virtio-net device and of a modern one.
-const DEVICE_TRANSITIONAL: u16 = 0x1000;
-const DEVICE_MODERN: u16 = 0x1041;
 
 /// The device has a MAC address in its configuration.
 const F_MAC: u64 = 1 << 5;
@@ -47,11 +42,6 @@ const TX_QUEUE: u16 = 1;
 const MAX_BUFFERS: u16 = 64;
 /// The length of a buffer: one frame, which holds the header and the largest Ethernet frame.
 const BUF_LEN: usize = PAGE_SIZE;
-
-/// Tells if the PCI function is a virtio-net device.
-pub(crate) fn is_net(dev: &PciDevice) -> bool {
-    matches!(dev.device_id(), DEVICE_TRANSITIONAL | DEVICE_MODERN)
-}
 
 /// One queue and its buffers. The buffer of the descriptor `id` is `bufs[id]`.
 struct Ring {
@@ -77,10 +67,10 @@ impl Ring {
     }
 }
 
-/// Starts the driver for the network device number `index`, and registers the device. `bus` is
-/// the number of the device among all virtio devices, as the name `virtioN` of Linux.
-pub(crate) fn probe(dev: &PciDevice, index: u32, bus: u32) -> Option<Arc<NetDevice>> {
-    let t = Transport::new(dev)?;
+/// Starts the driver for the network device number `index` on the transport `t`, and registers
+/// the device. `bus` is the number of the device among all virtio devices, as the name `virtioN`
+/// of Linux.
+pub(crate) fn probe(t: Transport, index: u32, bus: u32) -> Option<Arc<NetDevice>> {
     let Some(features) = t.negotiate(F_MAC | F_STATUS) else {
         t.fail();
         return None;

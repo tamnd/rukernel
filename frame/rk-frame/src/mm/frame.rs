@@ -5,7 +5,7 @@ use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
 use crate::sync::{Once, SpinLock};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 /// The allocator manages physical memory below this address. 64 GiB needs a bitmap of 2 MiB.
 const MAX_PHYS: u64 = 64 << 30;
@@ -210,6 +210,35 @@ impl Frame {
         // race with this atomic operation.
         let word = unsafe { AtomicU32::from_ptr(p) };
         word.compare_exchange(old, new, Ordering::SeqCst, Ordering::SeqCst).unwrap_or_else(|v| v)
+    }
+
+    /// Reads the 16 bit word at `offset` in one access, with acquire order. A device can write
+    /// the word at the same time, as the index of a virtio ring. A copy of bytes can see half of
+    /// a new value.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is not 2 byte aligned or the word is not in the frame.
+    pub fn load_u16(&self, offset: usize) -> u16 {
+        assert!(offset.is_multiple_of(2), "the word at {offset} is not aligned");
+        let p = self.byte_ptr(offset, 2).cast::<u16>();
+        // SAFETY: as for `compare_exchange_u32`.
+        let word = unsafe { AtomicU16::from_ptr(p) };
+        word.load(Ordering::Acquire)
+    }
+
+    /// Writes the 16 bit word at `offset` in one access, with release order, so that a device
+    /// that reads the word sees the old value or the new value.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is not 2 byte aligned or the word is not in the frame.
+    pub fn store_u16(&self, offset: usize, value: u16) {
+        assert!(offset.is_multiple_of(2), "the word at {offset} is not aligned");
+        let p = self.byte_ptr(offset, 2).cast::<u16>();
+        // SAFETY: as for `compare_exchange_u32`.
+        let word = unsafe { AtomicU16::from_ptr(p) };
+        word.store(value, Ordering::Release);
     }
 
     /// Copies `buf` to the frame at `offset`. A frame that is shared through an `Arc` is written

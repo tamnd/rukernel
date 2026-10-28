@@ -418,10 +418,12 @@ fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
     if let Some(base) = platform.uart.and_then(|p| map(p, 0x1000)) {
         super::pl011::set_base(base);
     }
-    if platform.gic_v3 && platform.gic.is_none() {
-        crate::println!("aarch64: the GICv3 is not supported, the kernel uses the GICv2 of virt");
-    }
-    if let Some((d, c)) = platform.gic
+    if let Some((d, r, len)) = platform.gic_v3 {
+        match (map(d, 0x1_0000), map(r, len), usize::try_from(len)) {
+            (Some(d), Some(r), Ok(len)) => super::gic::set_base_v3(d, r, len),
+            _ => crate::println!("aarch64: cannot use the GICv3"),
+        }
+    } else if let Some((d, c)) = platform.gic
         && let (Some(d), Some(c)) = (map(d, 0x1000), map(c, 0x2000))
     {
         super::gic::set_base(d, c);
@@ -432,7 +434,10 @@ fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
     if let Some(base) = platform.rtc.and_then(|p| map(p, 0x1000)) {
         super::rtc::set_base(base);
     }
-    // TODO(#329): the PCI code of arm64 maps the ECAM with `paging::map_device` and scans it.
+    crate::iomem::virtio_mmio::set(&platform.virtio_mmio[..platform.virtio_mmio_count]);
+    // TODO(#348): the PCI code of arm64 maps the ECAM with `paging::map_device`, scans it and
+    // assigns the BARs, because no firmware assigns them before `-kernel`. The virtio devices
+    // come from virtio-mmio until then.
     if let Some((ecam, len)) = platform.pci_ecam {
         crate::println!("aarch64: PCI ECAM at {ecam:#x}, {} MiB", len >> 20);
     }
