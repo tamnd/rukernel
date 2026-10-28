@@ -13,6 +13,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - On arm64, `mem::copy` and `mem::zero` move 16 bytes with each instruction, not 1 byte (#380). They copy user pages and clear frames, so the arm64 boot tests run faster.
+- On x86-64, a system call returns to user mode with `sysretq` when the registers allow it, as on Linux (#394). The return after an interrupt, an exception or a signal frame still uses `iretq`.
+- On x86-64, the kernel keeps the FS base and the CR4.TSD bit of each CPU in a cache and writes them only when they change (#394).
+- On x86-64, the FPU state is saved only when the user code used the FPU, with CR0.TS and the `#NM` trap, as the old lazy FPU of Linux (#394). The CPU registers keep the state of the thread that ran last, so a thread that runs again on the same CPU does not load it. CR0.TS is set only when the registers hold the state of the thread that runs, so the LazyFP attack (CVE-2018-3665) cannot read the state of another thread.
+- The return to user mode checks one flag for the signal work, as `TIF_SIGPENDING` of Linux, and one flag for a traced thread, so a system call without a signal takes no signal lock and no ptrace lock (#394).
+- The return to user mode checks the cgroup freezer, `memory.high` and the CPU and I/O limits only when a cgroup has such a limit (#394).
+- The system call path loads the address space and checks for a reschedule without a reference count change, and records the system call information under one lock (#394).
+- `sched_yield` returns at once when no other task can run on the CPU (#394). The `yield` benchmark goes from 5.55 to 0.62 times Linux.
+- `fork` copies the page tables one last level table at a time, with one TLB flush for each area that becomes read only, and copies the page map of the parent in one pass (#394). The `fork_big` benchmark goes from 78.6 ms to 17.7 ms in tools/bench/results.md. Copy on write, the transparent huge pages and the hugetlb pages work as before.
 
 ## [0.4.6] - 2026-10-28
 

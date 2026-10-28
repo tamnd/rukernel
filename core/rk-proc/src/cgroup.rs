@@ -93,6 +93,17 @@ pub fn freeze_changed(id: CgId) {
     }
 }
 
+/// Keeps `thread` waiting while its cgroup is frozen or over a limit, before the return to user
+/// mode: `wait_frozen` and then `wait_throttled`. When no cgroup is frozen, over `memory.high` or
+/// has a CPU quota, and the thread has no wait for `io.max`, this returns after a few loads.
+pub fn wait_limits(thread: &Thread) {
+    if !rk_cgroup::any_limit() && !thread.has_io_delay() {
+        return;
+    }
+    wait_frozen(thread);
+    wait_throttled(thread);
+}
+
 /// Keeps `thread` waiting while its cgroup is frozen, as the freezer of Linux
 /// (`do_freezer_trap`). The thread counts as frozen in its cgroup while it waits, so that
 /// `cgroup.events` tells when the whole cgroup is frozen. A kill ends the wait.

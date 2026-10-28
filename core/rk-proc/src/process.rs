@@ -235,6 +235,13 @@ pub struct Thread {
     /// The thread must stop at its next return to the kernel, because its group exits.
     killed: AtomicBool,
     signals: SpinLock<ThreadSignals>,
+    /// A signal came to the thread or to its process, or the mask of the thread changed, after
+    /// the last full check of `take_signal_work`. The return to user mode looks at the queues
+    /// only when this is set, as `TIF_SIGPENDING` of Linux.
+    signal_work: AtomicBool,
+    /// A tracer attached to the thread one time. The checks of the tracing state take the lock
+    /// only when this is set.
+    ptraced: AtomicBool,
     /// The parent of a `vfork` child waits on this.
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
     /// The call that `restart_syscall` continues.
@@ -436,6 +443,13 @@ impl Process {
     /// The address space. A zombie has none.
     pub fn vm(&self) -> Option<Arc<AddressSpace>> {
         self.vm.lock().clone()
+    }
+
+    /// Loads the page table of the address space on this CPU, before the return to user mode.
+    /// Gives false if the process has no address space. This does not copy the `Arc`.
+    pub fn activate_vm(&self) -> bool {
+        let vm = self.vm.lock();
+        vm.as_ref().inspect(|vm| vm.activate()).is_some()
     }
 
     /// Puts a new address space in the process, for `execve`, and gives the old one.
@@ -973,6 +987,11 @@ impl Thread {
         self.io_delay.swap(0, Ordering::Relaxed)
     }
 
+    /// Tells if the thread must wait for `io.max` before it goes back to user mode.
+    pub fn has_io_delay(&self) -> bool {
+        self.io_delay.load(Ordering::Relaxed) != 0
+    }
+
     /// Tells the thread which task runs it. The code that spawns the task calls this one time.
     pub fn set_task(&self, task: &Arc<Task>) {
         *self.task.lock() = Arc::downgrade(task);
@@ -1076,6 +1095,15 @@ impl Thread {
         *self.syscall.lock() = info;
     }
 
+    /// Tells that the thread left its system call, at the stack pointer `sp` and the instruction
+    /// pointer `pc`. The arguments stay, but they have no meaning after this.
+    pub fn set_syscall_exit(&self, sp: u64, pc: u64) {
+        let mut info = self.syscall.lock();
+        info.nr = -1;
+        info.sp = sp;
+        info.pc = pc;
+    }
+
     /// Tells if the thread must stop, because its group exits.
     pub fn is_killed(&self) -> bool {
         self.killed.load(Ordering::Acquire)
@@ -1103,11 +1131,33 @@ impl Thread {
     /// Sets the signals that the thread blocks. `SIGKILL` and `SIGSTOP` stay unblocked.
     pub fn set_blocked(&self, set: SigSet) {
         self.signals.lock().blocked = set.without(SigSet::UNBLOCKABLE);
+        self.note_signal_work();
     }
 
     /// Keeps `mask` to put back after the next delivery, for `rt_sigsuspend`.
     pub fn set_saved_mask(&self, mask: SigSet) {
         self.signals.lock().saved_mask = Some(mask);
+        self.note_signal_work();
+    }
+
+    /// Tells the return to user mode that it must look at the signals of the thread. The callers
+    /// change the queues or the mask with the lock first, so a later look sees the change.
+    fn note_signal_work(&self) {
+        self.signal_work.store(true, Ordering::Release);
+    }
+
+    /// Tells if the return to user mode must do the full check of the signals: a signal or a
+    /// change of the mask came after the last check, the group exits, the process is stopped, or
+    /// a tracer traces the thread. This clears the mark of the signals, so the caller must do the
+    /// full check when this gives true. When this gives false, no signal is pending that the
+    /// thread does not block, and the thread has no saved mask.
+    pub fn take_signal_work(&self) -> bool {
+        // The swap reads the last mark, so the change of the queue before it is visible to the
+        // full check after it.
+        self.signal_work.swap(false, Ordering::AcqRel)
+            | self.is_killed()
+            | self.process.is_stopped()
+            | self.is_traced()
     }
 
     /// Takes the mask that `rt_sigsuspend` replaced.
@@ -1235,6 +1285,7 @@ impl Thread {
     /// a blocked signal this way, and a new tracee gets its first `SIGSTOP`.
     pub fn requeue_signal(&self, info: SigInfo) {
         self.signals.lock().pending.push(info);
+        self.note_signal_work();
     }
 
     /// Sets the blocked signals that the thread waits for, for `rt_sigtimedwait`. The empty set
@@ -1287,6 +1338,8 @@ impl Thread {
             robust_list: AtomicUsize::new(0),
             killed: AtomicBool::new(false),
             signals: SpinLock::new(ThreadSignals { blocked, ..ThreadSignals::default() }),
+            signal_work: AtomicBool::new(true),
+            ptraced: AtomicBool::new(false),
             vfork_done: SpinLock::new(None),
             restart: SpinLock::new(None),
             user_ticks: AtomicU64::new(0),
@@ -1613,6 +1666,9 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
         }
     }
     drop(shared);
+    for t in &threads {
+        t.note_signal_work();
+    }
     if let Some(t) = target {
         t.wake();
     }

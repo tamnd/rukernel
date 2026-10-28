@@ -476,6 +476,48 @@ pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
     }
 }
 
+/// Maps 4 KiB pages in `root` as `user_map` does, but with no TLB flush. `pages` gives the
+/// address, the frame and the permissions of each page, in address order. `root` is a new
+/// address space that no CPU has loaded, as the child of `fork`. One walk finds the last level
+/// table for all the pages in it. Gives `Err` if no frame is free for a page table.
+pub(crate) fn user_map_new(
+    root: u64,
+    pages: impl Iterator<Item = (usize, u64, UserProt)>,
+) -> Result<(), ()> {
+    debug_assert!(active().load(Ordering::Acquire) != root, "the address space is active");
+    let mut leaf = (usize::MAX, 0);
+    for (virt, phys, prot) in pages {
+        assert!(virt < USER_END, "{virt:#x} is not in the user half");
+        let block = virt & !(HUGE_SIZE as usize - 1);
+        if leaf.0 != block {
+            leaf = (block, leaf_table(root, virt, USER)?);
+        }
+        write_entry(leaf.1, indexes(virt)[3], phys | user_flags(prot.0, prot.1, prot.2));
+    }
+    Ok(())
+}
+
+/// Changes the permissions of 4 KiB pages in `root` as `user_protect` does. `pages` gives the
+/// address, the frame and the new permissions of each page, in address order. One walk finds the
+/// last level table for all the pages in it, and one TLB flush at the end is for all the pages.
+pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u64, UserProt)>) {
+    let mut leaf = (usize::MAX, None);
+    let mut changed = false;
+    for (virt, phys, prot) in pages {
+        let block = virt & !(HUGE_SIZE as usize - 1);
+        if leaf.0 != block {
+            leaf = (block, user_leaf(root, virt).map(|(table, _)| table));
+        }
+        if let Some(table) = leaf.1 {
+            write_entry(table, indexes(virt)[3], phys | user_flags(prot.0, prot.1, prot.2));
+            changed = true;
+        }
+    }
+    if changed {
+        flush_user_block(root);
+    }
+}
+
 /// Maps the 2 MiB page at `phys` at `virt` in `root` with one huge entry. Gives the physical
 /// address of a last level table that `user_split_huge` and `user_unmap_huge` use later. If the
 /// range has a last level table already, it is that table, else it is a new one. Gives `Err` if no

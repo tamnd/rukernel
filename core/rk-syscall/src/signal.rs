@@ -76,6 +76,16 @@ pub(crate) fn deliver(
     regs: &mut UserContext,
     mut syscall: Option<u64>,
 ) -> Option<WaitStatus> {
+    // The usual case: no signal, no stop and no tracer. Only a restart code needs work then.
+    if !thread.take_signal_work() {
+        if let Some(number) = syscall
+            && let Some(e) = Errno::from_syscall_return(regs.syscall_return() as isize)
+            && e.is_restart()
+        {
+            restart_without_handler(regs, e, number);
+        }
+        return None;
+    }
     let delivery = loop {
         thread.wait_while_stopped();
         if thread.is_killed() {

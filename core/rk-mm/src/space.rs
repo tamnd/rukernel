@@ -17,7 +17,7 @@ use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
 use rk_frame::sync::SpinLock;
-use rk_frame::vm::{HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
+use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
 
 pub(crate) mod hugetlb;
 pub(crate) mod ksmd;
@@ -281,15 +281,19 @@ fn accounted<'a>(vmas: impl Iterator<Item = &'a Vma<FileRef>>) -> usize {
 impl AddressSpace {
     /// Makes an empty address space. Gives `ENOMEM` if no frame is free for the page table.
     pub fn new() -> Result<Self, Errno> {
-        let vm = VmSpace::new().ok_or(Errno::ENOMEM)?;
+        Ok(Self::with_vm(VmSpace::new().ok_or(Errno::ENOMEM)?))
+    }
+
+    /// Makes an address space with no areas that uses the page table `vm`.
+    fn with_vm(vm: VmSpace) -> Self {
         let state = State { vmas: VmaSet::new(), brk_start: 0, brk: 0, lock_future: false };
-        Ok(Self {
+        Self {
             vm,
             state: SpinLock::new(state),
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
             huge_resv: SpinLock::new(BTreeSet::new()),
-        })
+        }
     }
 
     /// Sets the memory cgroup that the new anonymous pages are charged to. The pages that the
@@ -1264,33 +1268,13 @@ impl AddressSpace {
     ///
     /// Gives `ENOMEM` if no frame is free for a page table.
     pub fn fork(&self) -> Result<Self, Errno> {
-        let child = Self::new()?;
         let st = self.state.lock();
-        for vma in st.vmas.iter() {
-            let mut next = 0;
-            for page in self.vm.mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end)) {
-                if page.get() < next {
-                    continue;
-                }
-                if page.get().is_multiple_of(HUGE_PAGE_SIZE)
-                    && page.get() + HUGE_PAGE_SIZE <= vma.end
-                    && self.fork_huge(&child, vma, page)?
-                {
-                    next = page.get() + HUGE_PAGE_SIZE;
-                    continue;
-                }
-                let Some((frame, prot)) = self.vm.page(page) else { continue };
-                // A page that is read only after an earlier fork needs no change and no flush.
-                let prot = if vma.shared || !prot.writable {
-                    prot
-                } else {
-                    let ro = PageProt { writable: false, ..prot };
-                    self.vm.protect(page, ro);
-                    ro
-                };
-                child.vm.map(page, frame, prot).map_err(map_error)?;
-            }
-        }
+        let areas: Vec<ForkArea> = st
+            .vmas
+            .iter()
+            .map(|v| ForkArea { start: v.start, end: v.end, shared: v.shared })
+            .collect();
+        let child = Self::with_vm(self.vm.fork(&areas).map_err(map_error)?);
         // The private areas of the child go in the commit count. The memory of a shared area is
         // in the count one time.
         charge_commit(accounted(st.vmas.iter().filter(|v| !v.shared)))?;
@@ -1303,24 +1287,6 @@ impl AddressSpace {
         *child.state.lock() =
             State { vmas, brk_start: st.brk_start, brk: st.brk, lock_future: false };
         Ok(child)
-    }
-
-    /// Maps the huge page at `block` in the child of `fork`, read only in both spaces for a
-    /// private area. Gives `false` if no huge page is mapped there.
-    fn fork_huge(&self, child: &Self, vma: &Vma<FileRef>, block: VirtAddr) -> Result<bool, Errno> {
-        let Some((frames, prot)) = self.vm.huge_block(block) else { return Ok(false) };
-        let ro =
-            if vma.shared || !prot.writable { prot } else { PageProt { writable: false, ..prot } };
-        if ro != prot && !self.vm.protect_huge(block, ro) {
-            return Ok(false);
-        }
-        let mapped = if vma.hugetlb {
-            child.vm.map_hugetlb(block, frames, ro)
-        } else {
-            child.vm.map_huge(block, frames, ro)
-        };
-        mapped.map_err(map_error)?;
-        Ok(true)
     }
 
     /// Copies user memory at `addr` to `buf`. A page that is not there yet gets its frame.

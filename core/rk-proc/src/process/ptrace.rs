@@ -11,6 +11,7 @@ use super::{Pid, Process, State, Thread, kill_group, send_signal};
 use crate::signal::{CLD_TRAPPED, SigInfo};
 use crate::wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
 use alloc::sync::{Arc, Weak};
+use core::sync::atomic::Ordering;
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDSTOP, SIGCHLD, SIGKILL, SIGSTOP, SIGTRAP};
 use rk_frame::task::WaitQueue;
@@ -213,7 +214,8 @@ pub enum Resume {
 impl Thread {
     /// Tells if a tracer traces the thread.
     pub fn is_traced(&self) -> bool {
-        self.ptrace.lock().as_ref().is_some_and(|p| !p.detached)
+        self.ptraced.load(Ordering::Acquire)
+            && self.ptrace.lock().as_ref().is_some_and(|p| !p.detached)
     }
 
     /// The process ID of the tracer, or 0, for `/proc/PID/status`.
@@ -251,18 +253,24 @@ impl Thread {
 
     /// Tells if the tracer asked for the stops at the system calls.
     pub fn syscall_traced(&self) -> bool {
-        self.ptrace.lock().as_ref().is_some_and(|p| p.syscall)
+        self.ptraced.load(Ordering::Acquire)
+            && self.ptrace.lock().as_ref().is_some_and(|p| p.syscall)
     }
 
     /// Tells if the tracer asked for a single step.
     pub fn single_stepping(&self) -> bool {
-        self.ptrace.lock().as_ref().is_some_and(|p| p.step)
+        self.ptraced.load(Ordering::Acquire) && self.ptrace.lock().as_ref().is_some_and(|p| p.step)
     }
 
     /// Tells if the tracer set `PTRACE_O_SUSPEND_SECCOMP`: the `seccomp` mode of the thread does
     /// not check its system calls.
     pub fn seccomp_suspended(&self) -> bool {
-        self.ptrace.lock().as_ref().is_some_and(|p| p.options & PTRACE_O_SUSPEND_SECCOMP != 0)
+        self.ptraced.load(Ordering::Acquire)
+            && self
+                .ptrace
+                .lock()
+                .as_ref()
+                .is_some_and(|p| p.options & PTRACE_O_SUSPEND_SECCOMP != 0)
     }
 
     /// Tells if the tracer asked for the stop at `event`.
@@ -296,11 +304,12 @@ pub fn attach(
             None => {}
         }
         *guard = Some(new);
+        thread.ptraced.store(true, Ordering::Release);
     }
     tracer.state.lock().tracees.push(thread.clone());
     if thread.process.is_stopped() {
         let sig = thread.process.stop_signal().unwrap_or(SIGSTOP);
-        thread.group_stop.store(sig, core::sync::atomic::Ordering::Release);
+        thread.group_stop.store(sig, Ordering::Release);
         thread.wake();
         // As JOBCTL_TRAPPING of Linux: the next request of the tracer finds the tracee stopped.
         tracer.child_wait.wait_until(|| {
@@ -339,6 +348,7 @@ pub fn attach_child(parent: &Thread, child: &Arc<Thread>) {
     let mut pt = Ptrace::new(&tracer, seized, options);
     pt.interrupt = seized;
     *child.ptrace.lock() = Some(pt);
+    child.ptraced.store(true, Ordering::Release);
     tracer.state.lock().tracees.push(child.clone());
     if !seized {
         child.requeue_signal(SigInfo::new(SIGSTOP, crate::signal::SI_USER, 0));
