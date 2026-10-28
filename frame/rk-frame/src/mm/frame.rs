@@ -338,8 +338,9 @@ impl Frame {
     pub fn copy_from(&self, other: &Frame) {
         let (to, from) = (self.byte_ptr(0, PAGE_SIZE), other.byte_ptr(0, PAGE_SIZE));
         if to != from {
-            // SAFETY: as for `write_bytes`. Two different frames do not overlap.
-            unsafe { mem::copy(to, from, PAGE_SIZE) };
+            // SAFETY: as for `write_bytes`. Two different frames do not overlap, and a frame is
+            // page aligned.
+            unsafe { mem::copy_page(to, from) };
         }
     }
 }

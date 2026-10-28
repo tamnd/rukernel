@@ -80,6 +80,16 @@ pub(crate) mod mem {
         }
     }
 
+    /// Copies the page of 4 KiB at `src` to the page at `dst`.
+    ///
+    /// # Safety
+    ///
+    /// The two pages must be valid kernel memory, and they must not overlap.
+    pub(crate) unsafe fn copy_page(dst: *mut u8, src: *const u8) {
+        // SAFETY: as for `copy`.
+        unsafe { copy(dst, src, 4096) };
+    }
+
     /// Writes `len` zero bytes at `dst`.
     ///
     /// # Safety

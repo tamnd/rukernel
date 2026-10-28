@@ -192,6 +192,159 @@ impl<P> Pool<P> {
     }
 }
 
+/// The counters of the pages of one mount of hugetlbfs, as `struct hugepage_subpool` of Linux.
+///
+/// `used` has the reservations and the pages of the files of the mount, and `size=` limits it.
+/// `min_size=` reserves pages in the pool when the mount is made. A reservation or a page of a
+/// file takes one of these pages first, so the pool does not count it a second time. `rsv` is the
+/// number of reservations in the pool that the mount keeps and that no file uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubpoolCounts {
+    /// The most pages, from `size=`. `max_hpages`.
+    pub max: Option<u64>,
+    /// The pages that the mount reserves, from `min_size=`. `min_hpages`.
+    pub min: u64,
+    /// The reservations and the pages of the files. `used_hpages`.
+    pub used: u64,
+    /// The reservations in the pool that the mount keeps for its files. `rsv_hpages`.
+    pub rsv: u64,
+}
+
+impl SubpoolCounts {
+    /// Takes `n` pages, as `hugepage_subpool_get_pages` of Linux. Gives the number of these pages
+    /// that need a new reservation in the pool, because the mount does not keep one for them. Gives
+    /// `None` and changes nothing if `size=` does not allow the pages.
+    pub fn get(&mut self, n: u64) -> Option<u64> {
+        if self.max.is_some_and(|max| self.used + n > max) {
+            return None;
+        }
+        self.used += n;
+        let kept = n.min(self.rsv);
+        self.rsv -= kept;
+        Some(n - kept)
+    }
+
+    /// Gives back `n` pages, as `hugepage_subpool_put_pages` of Linux. Gives the number of these
+    /// pages that the mount keeps as a reservation, because it has fewer than `min_size=`.
+    pub fn put(&mut self, n: u64) -> u64 {
+        self.used = self.used.saturating_sub(n);
+        let room = self.min.saturating_sub(self.used).saturating_sub(self.rsv);
+        let kept = n.min(room);
+        self.rsv += kept;
+        kept
+    }
+}
+
+/// The pages of one mount of hugetlbfs, with the lock. Each file of the mount has it. A file of a
+/// `SHM_HUGETLB` segment or of a `MAP_HUGETLB` mapping has none, and has no limit.
+pub struct Subpool {
+    counts: rk_frame::sync::SpinLock<SubpoolCounts>,
+}
+
+impl core::fmt::Debug for Subpool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.counts().fmt(f)
+    }
+}
+
+impl Subpool {
+    /// Makes the counters of a new mount with `size=` of `max` pages and `min_size=` of `min`
+    /// pages. The `min` pages are reserved in the pool now, as `hugetlbfs_fill_super` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if the pool does not have the `min` pages.
+    pub fn new(
+        max: Option<u64>,
+        min: Option<u64>,
+    ) -> Result<alloc::sync::Arc<Self>, rk_abi::Errno> {
+        let min = min.unwrap_or(0);
+        reserve(usize::try_from(min).map_err(|_| rk_abi::Errno::ENOMEM)?)?;
+        let counts = SubpoolCounts { max, min, used: 0, rsv: min };
+        Ok(alloc::sync::Arc::new(Self { counts: rk_frame::sync::SpinLock::new(counts) }))
+    }
+
+    /// Makes the counters of a mount without `size=` and `min_size=`.
+    pub fn unlimited() -> alloc::sync::Arc<Self> {
+        let counts = rk_frame::sync::SpinLock::new(SubpoolCounts::default());
+        alloc::sync::Arc::new(Self { counts })
+    }
+
+    /// The counters.
+    pub fn counts(&self) -> SubpoolCounts {
+        *self.counts.lock()
+    }
+
+    /// Takes `n` pages for new reservations of a mapping. Each of the pages then has a reservation
+    /// in the pool: one that the mount kept, or a new one.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if `size=` does not allow the pages or the pool does not have them, as
+    /// `hugetlb_reserve_pages` of Linux. Then nothing changes.
+    pub fn reserve(&self, n: u64) -> Result<(), rk_abi::Errno> {
+        let mut c = self.counts.lock();
+        let before = *c;
+        let new = c.get(n).ok_or(rk_abi::Errno::ENOMEM)?;
+        if let Err(e) = reserve(new as usize) {
+            *c = before;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Takes one page for a fault or for `fallocate` at an index that has no reservation, as
+    /// `alloc_hugetlb_folio` of Linux. Gives `true` if the page uses a reservation that the mount
+    /// kept, so the page must come from the reserved pages of the pool.
+    ///
+    /// # Errors
+    ///
+    /// `ENOSPC` if `size=` does not allow one more page. A fault then sends `SIGBUS`.
+    pub fn charge(&self) -> Result<bool, rk_abi::Errno> {
+        Ok(self.counts.lock().get(1).ok_or(rk_abi::Errno::ENOSPC)? == 0)
+    }
+
+    /// Undoes a `charge` that gave `reserved`, after the pool had no page for it.
+    pub fn uncharge(&self, reserved: bool) {
+        let mut c = self.counts.lock();
+        c.used = c.used.saturating_sub(1);
+        if reserved {
+            c.rsv += 1;
+        }
+    }
+
+    /// Gives back `n` reservations that no page used. The mount keeps the ones that it needs for
+    /// `min_size=`, and the others leave the pool.
+    pub fn unreserve(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut c = self.counts.lock();
+        let kept = c.put(n);
+        unreserve((n - kept) as usize);
+    }
+
+    /// Gives back `n` pages that the files freed. The mount reserves again the ones that it needs
+    /// for `min_size=`, as `free_huge_folio` of Linux. If the pool does not have them now, the mount
+    /// keeps fewer reservations.
+    pub fn release(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut c = self.counts.lock();
+        let kept = c.put(n);
+        if kept != 0 && reserve(kept as usize).is_err() {
+            c.rsv -= kept;
+        }
+    }
+}
+
+impl Drop for Subpool {
+    fn drop(&mut self) {
+        unreserve(self.counts.lock().rsv as usize);
+    }
+}
+
 /// The counters of the pool. The host has no pool, so they are all 0 there.
 #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 pub fn counts() -> Counts {
@@ -362,6 +515,37 @@ mod tests {
         pool.set_persistent(1, memory(&mut mem));
         let want = Counts { total: 1, surplus: 0, overcommit: 2, ..Counts::default() };
         assert_eq!(pool.counts(), want);
+    }
+
+    #[test]
+    fn size_limits_the_pages_of_a_mount() {
+        let mut c = SubpoolCounts { max: Some(3), ..SubpoolCounts::default() };
+        assert_eq!(c.get(2), Some(2));
+        assert_eq!(c.get(2), None);
+        assert_eq!(c.used, 2);
+        assert_eq!(c.get(1), Some(1));
+        assert_eq!(c.get(1), None);
+        assert_eq!(c.put(1), 0);
+        assert_eq!(c.get(1), Some(1));
+    }
+
+    #[test]
+    fn min_size_reservations_count_one_time() {
+        // `min_size=` of 2 pages: the mount made 2 reservations in the pool.
+        let mut c = SubpoolCounts { min: 2, rsv: 2, ..SubpoolCounts::default() };
+        // A mapping of 3 pages uses the 2 reservations of the mount and needs only 1 more.
+        assert_eq!(c.get(3), Some(1));
+        assert_eq!((c.used, c.rsv), (3, 0));
+        // The mapping goes. The mount keeps 2 of the 3 reservations, and 1 leaves the pool.
+        assert_eq!(c.put(3), 2);
+        assert_eq!((c.used, c.rsv), (0, 2));
+        // The faults of pages without a reservation use the reservations of the mount first.
+        assert_eq!(c.get(1), Some(0));
+        assert_eq!(c.get(1), Some(0));
+        assert_eq!(c.get(1), Some(1));
+        assert_eq!(c.put(1), 0);
+        assert_eq!(c.put(2), 2);
+        assert_eq!((c.used, c.rsv), (0, 2));
     }
 
     #[test]

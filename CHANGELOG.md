@@ -13,6 +13,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The IPv6 datagram sockets put the routing header of `IPV6_RTHDR` in the packets that they send, as `ipv6_push_nfrag_opts` of Linux (#403). The packet goes to the first address of the route, and the UDP checksum uses the final destination.
 - tools/ltp gives setsockopt11 a limit of 420 seconds, because the test runs for 300 seconds (#403).
+- `size=` of a hugetlbfs mount limits the pages that a page fault adds, as the subpool of Linux (#392). Before, only `fallocate` checked it. A fault past the limit gives `SIGBUS`, and a shared mapping whose reservations go past the limit gives `ENOMEM`. `statfs` counts the reservations as used blocks, as on Linux.
+- The reservations of `min_size=` of a hugetlbfs mount count one time (#392). A reservation or a page of a file takes one of the reservations of the mount first, and the mount reserves its pages again when the files give them back. Before, a mapping reserved new pages in the pool in addition to the ones of the mount.
+- On x86-64 with KVM or on hardware, the removal of a huge page drops only the TLB entry of the huge page (#392). Under QEMU without KVM, which the kernel finds with the hypervisor leaf of CPUID, it still drops all the TLB entries of user pages.
+- On arm64, the copy of a page for copy on write moves 128 bytes in each step of the loop with the SIMD registers (#392).
 
 ## [0.4.7] - 2026-10-28
 

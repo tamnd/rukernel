@@ -435,15 +435,25 @@ fn flush_user(root: u64, virt: usize) {
     super::smp::shootdown(root, virt as u64);
 }
 
-/// Drops all the TLB entries of user pages on each CPU where `root` is active, after a huge page
-/// goes away. One `invlpg` is enough for the CPU, but QEMU without KVM then can keep the code
-/// that it translated from other pages of the huge page, and run the old code at an address that
-/// has no page now.
+/// Drops all the TLB entries of user pages on each CPU where `root` is active.
 fn flush_user_block(root: u64) {
     if active().load(Ordering::Acquire) == root {
         flush_user_all();
     }
     super::smp::shootdown(root, super::smp::FLUSH_ALL);
+}
+
+/// Drops the TLB entries of the huge page at `virt` on each CPU where `root` is active, after the
+/// huge page goes away. One `invlpg` drops the entry of the whole huge page on a CPU and on KVM.
+/// QEMU without KVM then can keep the code that it translated from the other 4 KiB pages of the
+/// huge page, and run the old code at an address that has no page now. Thus all the entries of
+/// user pages go there.
+fn flush_user_huge(root: u64, virt: usize) {
+    if super::under_tcg() {
+        flush_user_block(root);
+    } else {
+        flush_user(root, virt);
+    }
 }
 
 /// The permissions of a user page: readable, writable and executable.
@@ -587,7 +597,7 @@ pub(crate) fn user_unmap_huge(root: u64, virt: usize, table: u64) {
         write_entry(table, i, 0);
     }
     write_entry(pd, i2, table | PRESENT | WRITABLE | USER);
-    flush_user_block(root);
+    flush_user_huge(root, virt);
 }
 
 /// Loads `root` into CR3. A value of 0 loads the kernel table.
