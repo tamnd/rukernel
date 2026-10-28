@@ -895,6 +895,19 @@ fn fault_test() -> bool {
         space.write(DATA + 4000, b"hello\0").is_ok()
             && space.read_cstr(DATA + 4000, 64).as_deref() == Ok(&b"hello"[..]),
     );
+    let mut long = [b'a'; 301];
+    long[300] = 0;
+    ok &= check(
+        "a string longer than one read chunk is read whole",
+        space.write(DATA + 200, &long).is_ok()
+            && space.read_cstr(DATA + 200, 4096).as_deref() == Ok(&long[..300])
+            && space.read_cstr(DATA + 200, 300) == Err(Errno::ENAMETOOLONG),
+    );
+    ok &= check(
+        "a string that runs into an unmapped page is a bad address",
+        space.write(DATA + 4000, &[b'x'; 96]).is_ok()
+            && space.read_cstr(DATA + 4000, 4096) == Err(Errno::EFAULT),
+    );
     ok &= mremap_checks(&space, &read);
     ok
 }

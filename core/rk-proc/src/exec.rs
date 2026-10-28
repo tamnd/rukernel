@@ -19,7 +19,8 @@ use rk_abi::native::auxv::{
     AT_PHENT, AT_PHNUM, AT_SECURE, AT_SYSINFO_EHDR, AT_UID,
 };
 use rk_abi::native::mount::{MS_NOEXEC, MS_NOSUID};
-use rk_frame::mm::{Frame, alloc_zeroed_frame};
+use rk_frame::mm::{Frame, alloc_frame};
+use rk_frame::sync::Once;
 use rk_mm::{
     AddressSpace, FileRef, MmFile, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind,
 };
@@ -146,34 +147,81 @@ fn open_exec_at(
     Ok(at)
 }
 
-/// The pages of one segment of an ELF file, for a private file mapping of the segment. Each page
-/// is a new copy of the file data, which the first fault reads. The bytes of the file after the
-/// segment data are zero, as `padzero` of fs/binfmt_elf.c gives them, so the last page of the data
-/// starts the zero memory of the segment. `/proc/PID/maps` shows the name of the file.
+/// The size of the buffer that `Segment::page` reads the file data through.
+const PAGE_CHUNK: usize = 1024;
+
+/// The function that gives the shared pages of a file, which all the mappings of the file use.
+static FILE_PAGES: Once<fn(&InodeRef, Vec<u8>) -> FileRef> = Once::new();
+
+/// Sets the function that gives the shared pages of a file, as the page cache of Linux. A program
+/// then uses the same frames as the other programs that run the file, and a fault does not copy
+/// the file data. Only the first call has an effect.
+pub fn set_file_pages_hook(f: fn(&InodeRef, Vec<u8>) -> FileRef) {
+    FILE_PAGES.call_once(|| f);
+}
+
+/// The pages of one segment of an ELF file, for a private file mapping of the segment. A page that
+/// has only file data is the shared page of the file, as Linux maps the page cache, and a write
+/// copies it. The other page is a new copy of the file data, which the first fault reads. The
+/// bytes of the file after the segment data are zero, as `padzero` of fs/binfmt_elf.c gives them,
+/// so the last page of the data starts the zero memory of the segment. `/proc/PID/maps` shows the
+/// name of the file.
 struct Segment {
     inode: InodeRef,
     /// The path of the file, for `/proc/PID/maps`.
     path: Vec<u8>,
     /// The offset in the file after the data of the segment.
     limit: u64,
+    /// The shared pages of the file, if the kernel set them with `set_file_pages_hook`.
+    shared: Option<FileRef>,
+}
+
+impl Segment {
+    /// Makes the pages of the segment of the file `inode` at `path` that ends at `limit`.
+    fn new(inode: &InodeRef, path: Vec<u8>, limit: u64) -> Self {
+        let shared = FILE_PAGES.get().map(|f| f(inode, path.clone()));
+        Segment { inode: inode.clone(), path, limit, shared }
+    }
+
+    /// The shared pages of the file, if the page `index` has only file data.
+    fn shared(&self, index: u64) -> Option<&FileRef> {
+        let end = index.checked_add(1)?.checked_mul(PAGE_SIZE as u64)?;
+        self.shared.as_ref().filter(|_| end <= self.limit)
+    }
 }
 
 impl MmFile for Segment {
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
-        let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EIO)?;
-        let frame = alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
-        let len = self.limit.saturating_sub(offset).min(PAGE_SIZE as u64) as usize;
-        if len != 0 {
-            let mut buf = vec![0u8; len];
-            let n = read_full(&self.inode, offset, &mut buf)?;
-            frame.write_bytes(0, &buf[..n]);
+        if let Some(shared) = self.shared(index) {
+            return shared.page(index);
         }
+        let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EIO)?;
+        // Each exec faults in many pages, so the page is filled once: the file data goes to the
+        // frame through a small buffer, and only the bytes after the data are set to zero.
+        let frame = alloc_frame().ok_or(Errno::ENOMEM)?;
+        let len = self.limit.saturating_sub(offset).min(PAGE_SIZE as u64) as usize;
+        let mut buf = [0u8; PAGE_CHUNK];
+        let mut done = 0;
+        while done < len {
+            let want = (len - done).min(PAGE_CHUNK);
+            let n = read_full(&self.inode, offset + done as u64, &mut buf[..want])?;
+            frame.write_bytes(done, &buf[..n]);
+            done += n;
+            if n < want {
+                break;
+            }
+        }
+        frame.fill_zero(done, PAGE_SIZE - done);
         Ok(Arc::new(frame))
     }
 
     fn name(&self) -> (u64, u64, Vec<u8>) {
         let meta = self.inode.metadata();
         (meta.dev, meta.ino, self.path.clone())
+    }
+
+    fn cached(&self, index: u64) -> bool {
+        self.shared(index).is_some_and(|shared| shared.cached(index))
     }
 }
 
@@ -227,11 +275,8 @@ fn load_elf(
         let data_end = (bias as u64 + seg.vaddr + seg.filesz).div_ceil(page) * page;
         let aligned = seg.vaddr % page == seg.offset % page;
         if aligned && start >= mapped_end && seg.filesz != 0 {
-            let file: FileRef = Arc::new(Segment {
-                inode: inode.clone(),
-                path: at.absolute_path(),
-                limit: seg.offset + seg.filesz,
-            });
+            let file: FileRef =
+                Arc::new(Segment::new(inode, at.absolute_path(), seg.offset + seg.filesz));
             let data_end = data_end as usize;
             let req = MmapRequest {
                 addr: start,
