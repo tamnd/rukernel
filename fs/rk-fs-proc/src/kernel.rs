@@ -1100,7 +1100,6 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
     let Some(vm) = p.vm() else { return Ok(0) };
     let admin = rk_proc::current_thread()
         .is_some_and(|t| t.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN));
-    let areas = vm.areas();
     let first = offset / ENTRY as u64;
     let mut done = 0;
     for (i, out) in buf.chunks_exact_mut(ENTRY).enumerate() {
@@ -1118,11 +1117,8 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
                 entry |= (frame.addr().get() / rk_mm::PAGE_SIZE as u64) & procmap::PM_PFN_MASK;
             }
             // A page of a file or of shared memory is not anonymous. A private area of a file
-            // that the process can write has copies, which are anonymous.
-            let i = areas.partition_point(|a| a.end <= addr);
-            if let Some(a) = areas.get(i).filter(|a| a.start <= addr)
-                && (a.shared || (matches!(a.backing, Backing::File { .. }) && !a.prot.write))
-            {
+            // maps the page of the file until the first write makes an anonymous copy.
+            if !frame.is_anon() {
                 entry |= procmap::PM_FILE;
             }
         }
@@ -1137,7 +1133,8 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
 const KPAGEFLAGS_PFNS: u64 = 1 << 40;
 
 /// Reads the entries of `/proc/kpageflags` from `offset`, one `u64` for each page frame, as
-/// `kpageflags_read` in fs/proc/page.c of Linux. Only the pages of mapped files have flags.
+/// `kpageflags_read` in fs/proc/page.c of Linux. Only the anonymous pages of the processes and the
+/// pages of mapped files have flags.
 fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
     const ENTRY: usize = 8;
     if offset % ENTRY as u64 != 0 || buf.len() % ENTRY != 0 {
@@ -1150,12 +1147,15 @@ fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
         if pfn >= KPAGEFLAGS_PFNS {
             break;
         }
-        let flags = match rk_vfs::mapped::frame_dirty(pfn * rk_mm::PAGE_SIZE as u64) {
-            Some(dirty) => {
-                let base = procmap::KPF_UPTODATE | procmap::KPF_LRU | procmap::KPF_MMAP;
-                if dirty { base | procmap::KPF_DIRTY } else { base }
+        let phys = pfn * rk_mm::PAGE_SIZE as u64;
+        let flags = if rk_frame::mm::phys_is_anon(rk_frame::addr::PhysAddr::new(phys)) {
+            procmap::KPF_ANON_PAGE
+        } else {
+            match rk_vfs::mapped::frame_dirty(phys) {
+                Some(true) => procmap::KPF_FILE_PAGE | procmap::KPF_DIRTY,
+                Some(false) => procmap::KPF_FILE_PAGE,
+                None => 0,
             }
-            None => 0,
         };
         out.copy_from_slice(&flags.to_ne_bytes());
         done += ENTRY;

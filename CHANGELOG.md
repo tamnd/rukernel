@@ -12,10 +12,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - IPv6 duplicate address detection, as net/ipv6/addrconf.c of Linux (#410). A new address is `tentative` until the probes end, and a conflict marks it `dadfailed`. The interface sends an MLDv2 report when it joins the solicited node group of an address.
 - tools/ltp/build-ip.sh builds a static iproute2 `ip` for the LTP image (#410).
 - devtmpfs and /sys/class make the nodes of devices with a directory in the name, as /dev/net/tun (#410).
+- /proc/kpageflags gives `KPF_ANON`, `KPF_SWAPBACKED`, `KPF_UPTODATE`, `KPF_LRU` and `KPF_MMAP` for the anonymous pages of the processes, as fs/proc/page.c of Linux (#421). Each frame of anonymous memory has a mark, as `PageAnon` of Linux.
 
 ### Fixed
 
 - /proc/net/unix shows only the sockets of the network name space of the reader (#410).
+- The file bit of /proc/PID/pagemap comes from the page itself, as fs/proc/task_mmu.c of Linux (#421). A page of a private file mapping has the bit until the first write makes an anonymous copy, also when the mapping can be written.
+- The page cache of a mapped file keeps the clean or dirty state of each page, and /proc/kpageflags and `msync` use it in place of the sets of dirty and clean pages of the file (#421). A write back makes the pages clean when no shared mapping can write the file.
+- tools/ltp/run.py records the LTP tree of an image in `IMAGE.tree`, and stops when `--image` and `--ltp` do not agree (#421). It does not make a shared image again from another tree.
 
 ## [0.4.8] - 2026-10-28
 

@@ -3221,6 +3221,75 @@ static void test_proc_ptrace(void)
 	umount("/proc");
 }
 
+/* Gives the entry of /proc/self/pagemap for `addr`, or 0. */
+static unsigned long long pagemap_entry(const void *addr)
+{
+	unsigned long long entry = 0;
+	int fd = open("/proc/self/pagemap", O_RDONLY);
+	if (fd < 0)
+		return 0;
+	if (pread(fd, &entry, sizeof(entry), (unsigned long)addr / 4096 * sizeof(entry)) != sizeof(entry))
+		entry = 0;
+	close(fd);
+	return entry;
+}
+
+/* Gives the entry of /proc/kpageflags for the page at `addr`, or 0. */
+static unsigned long long kpageflags_entry(const void *addr)
+{
+	unsigned long long flags = 0, pfn = pagemap_entry(addr) & ((1ULL << 55) - 1);
+	int fd = open("/proc/kpageflags", O_RDONLY);
+	if (fd < 0)
+		return 0;
+	if (pread(fd, &flags, sizeof(flags), pfn * sizeof(flags)) != sizeof(flags))
+		flags = 0;
+	close(fd);
+	return flags;
+}
+
+/*
+ * The file bit (61) of /proc/PID/pagemap comes from the page, and /proc/kpageflags gives KPF_ANON
+ * (12) for an anonymous page, as fs/proc/task_mmu.c and fs/proc/page.c of Linux (#421).
+ */
+static void test_pagemap(void)
+{
+	const unsigned long long file = 1ULL << 61, anon = 1ULL << 12, dirty = 1ULL << 4;
+	char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (m != MAP_FAILED) {
+		m[0] = 1;
+		check("pagemap: an anonymous page has no file bit", (pagemap_entry(m) & ((1ULL << 63) | file)) == 1ULL << 63);
+		check("kpageflags: an anonymous page has KPF_ANON", (kpageflags_entry(m) & anon) != 0);
+		munmap(m, 4096);
+	}
+	int fd = open("/init", O_RDONLY);
+	char *f = fd < 0 ? MAP_FAILED : mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (fd >= 0)
+		close(fd);
+	check("mmap of /init that can be written", f != MAP_FAILED);
+	if (f != MAP_FAILED) {
+		check("pagemap: a page of a private file mapping has the file bit", f[0] == 0x7f && (pagemap_entry(f) & file) != 0);
+		check("kpageflags: a page of a file has no KPF_ANON", (kpageflags_entry(f) & anon) == 0);
+		f[1] = 'X';
+		check("pagemap: the copy of a written page has no file bit", (pagemap_entry(f) & file) == 0);
+		check("kpageflags: the copy of a written page has KPF_ANON", (kpageflags_entry(f) & anon) != 0);
+		munmap(f, 4096);
+	}
+	fd = open("/tmp/pagemap", O_CREAT | O_RDWR | O_TRUNC, 0600);
+	char *s = MAP_FAILED;
+	if (fd >= 0 && ftruncate(fd, 4096) == 0)
+		s = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (s != MAP_FAILED) {
+		s[0] = 1;
+		check("kpageflags: a written page of a shared mapping is dirty", (kpageflags_entry(s) & (dirty | anon)) == dirty);
+		check("msync of a shared mapping", msync(s, 4096, MS_SYNC) == 0);
+		check("kpageflags: msync makes the page clean", (kpageflags_entry(s) & dirty) == 0);
+		munmap(s, 4096);
+	}
+	if (fd >= 0)
+		close(fd);
+	unlink("/tmp/pagemap");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -3264,6 +3333,7 @@ static void test_proc(void)
 	check("read /proc/self/oom_score_adj", read_file("/proc/self/oom_score_adj", buf, sizeof(buf)) == 5 && !strcmp(buf, "-500\n"));
 	errno = 0;
 	check("/proc/self/nothing gives ENOENT", open("/proc/self/nothing", O_RDONLY) == -1 && errno == ENOENT);
+	test_pagemap();
 	check("umount proc", umount("/proc") == 0);
 }
 
