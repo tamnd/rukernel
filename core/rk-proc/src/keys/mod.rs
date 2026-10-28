@@ -18,6 +18,11 @@
 //! makes link, unlink and move one operation at a time, so the cycle check stays true. The table of
 //! serial numbers and the table of quotas are the last locks: the code takes no other lock while
 //! it holds one of them, and drops no key there.
+//!
+//! The life of a key: as in Linux, a key is dead when its count of references goes to zero. The
+//! data of a key is in a [`KeyData`] that the [`Key`] holds. The table of serial numbers holds
+//! the data, but no reference to the key. Thus a walk of all the keys, as `/proc/keys` and the
+//! garbage collector, keeps no key alive, and a lookup by serial does not find a dead key.
 
 mod ctl;
 mod text;
@@ -212,8 +217,16 @@ struct State {
     quota_bytes: u32,
 }
 
-/// A key or a keyring.
+/// A key or a keyring. A reference to it keeps the key alive. When the last reference goes, the
+/// key is dead: its quota and its links go, and a lookup does not find it.
 pub struct Key {
+    data: Arc<KeyData>,
+}
+
+/// The data of a key. A walk of all the keys holds the data, but no reference to the [`Key`].
+pub struct KeyData {
+    /// The key while it is alive.
+    this: Weak<Key>,
     serial: i32,
     kind: Kind,
     desc: Vec<u8>,
@@ -232,6 +245,14 @@ impl core::fmt::Debug for Key {
     }
 }
 
+impl core::ops::Deref for Key {
+    type Target = KeyData;
+
+    fn deref(&self) -> &KeyData {
+        &self.data
+    }
+}
+
 impl Key {
     /// The serial number.
     pub fn serial(&self) -> i32 {
@@ -247,7 +268,9 @@ impl Key {
     pub fn desc(&self) -> &[u8] {
         &self.desc
     }
+}
 
+impl KeyData {
     fn is_keyring(&self) -> bool {
         self.kind == Kind::Keyring
     }
@@ -270,18 +293,28 @@ impl Key {
     /// A copy of the links of a keyring. The links to invalidated keys leave the keyring here,
     /// as the garbage collector of Linux removes them.
     fn links(&self) -> Vec<Arc<Key>> {
+        self.prune();
+        self.state.lock().links.clone()
+    }
+
+    /// Removes the links to invalidated keys from a keyring.
+    fn prune(&self) {
         let mut s = self.state.lock();
         if !s.links.iter().any(|k| k.is_invalidated()) {
-            return s.links.clone();
+            return;
         }
         let (live, dead): (Vec<_>, Vec<_>) =
             core::mem::take(&mut s.links).into_iter().partition(|k| !k.is_invalidated());
         uncharge(&mut s, dead.len() as u32 * LINK_BYTES);
-        s.links = live.clone();
+        s.links = live;
         drop(s);
         // The dead keys can lose their last reference here, after the lock.
         drop(dead);
-        live
+    }
+
+    /// The count of references to the key. It is 0 for a dead key.
+    fn usage(&self) -> usize {
+        self.this.strong_count()
     }
 
     fn is_invalidated(&self) -> bool {
@@ -295,7 +328,7 @@ impl Drop for Key {
             let mut s = self.state.lock();
             (s.uid, s.quota_bytes, core::mem::take(&mut s.links))
         };
-        SERIALS.lock().remove(&self.serial);
+        let data = SERIALS.lock().remove(&self.serial);
         {
             let mut users = USERS.lock();
             if let Some(u) = users.get_mut(&uid) {
@@ -310,6 +343,7 @@ impl Drop for Key {
         }
         // The links can hold the last reference of other keys, so they go after the locks.
         drop(links);
+        drop(data);
     }
 }
 
@@ -326,8 +360,9 @@ pub struct Usage {
     pub qnbytes: u32,
 }
 
-/// The keys by serial number. A missing reference is a key that goes away.
-static SERIALS: SpinLock<BTreeMap<i32, Weak<Key>>> = SpinLock::new(BTreeMap::new());
+/// The data of the keys by serial number. `None` is a serial number for a key that the code
+/// makes. A key leaves the table when it is dead.
+static SERIALS: SpinLock<BTreeMap<i32, Option<Arc<KeyData>>>> = SpinLock::new(BTreeMap::new());
 /// The key use of each user that has keys.
 static USERS: SpinLock<BTreeMap<u32, Usage>> = SpinLock::new(BTreeMap::new());
 /// The user keyring and the user session keyring of a user.
@@ -455,7 +490,7 @@ fn alloc(
         loop {
             let s = (random() as u32 >> 1) as i32;
             if s >= 3 && s != i32::MAX && !serials.contains_key(&s) {
-                serials.insert(s, Weak::new());
+                serials.insert(s, None);
                 break s;
             }
         }
@@ -464,26 +499,29 @@ fn alloc(
         Some((e, at)) => (Some(e), at),
         None => (None, 0),
     };
-    let key = Arc::new(Key {
-        serial,
-        kind,
-        desc: desc.to_vec(),
-        uid_ring,
-        invalidated: AtomicBool::new(false),
-        state: SpinLock::new(State {
-            uid,
-            gid,
-            perm,
-            revoked: false,
-            negative,
-            expiry,
-            payload,
-            links: Vec::new(),
-            restricted: false,
-            quota_bytes: bytes,
+    let key = Arc::new_cyclic(|this| Key {
+        data: Arc::new(KeyData {
+            this: this.clone(),
+            serial,
+            kind,
+            desc: desc.to_vec(),
+            uid_ring,
+            invalidated: AtomicBool::new(false),
+            state: SpinLock::new(State {
+                uid,
+                gid,
+                perm,
+                revoked: false,
+                negative,
+                expiry,
+                payload,
+                links: Vec::new(),
+                restricted: false,
+                quota_bytes: bytes,
+            }),
         }),
     });
-    SERIALS.lock().insert(serial, Arc::downgrade(&key));
+    SERIALS.lock().insert(serial, Some(key.data.clone()));
     Ok(key)
 }
 
@@ -493,9 +531,9 @@ fn kernel_ring(desc: &[u8], uid: u32, gid: u32, perm: u32) -> Result<Arc<Key>, E
 }
 
 /// The key with the serial number `serial`. An invalidated key is gone, as the garbage collector
-/// of Linux removes it at once.
+/// of Linux removes it at once. A dead key is gone too.
 fn find(serial: i32) -> Option<Arc<Key>> {
-    let key = SERIALS.lock().get(&serial).and_then(Weak::upgrade)?;
+    let key = SERIALS.lock().get(&serial)?.as_ref()?.this.upgrade()?;
     if key.is_invalidated() { None } else { Some(key) }
 }
 
@@ -559,7 +597,7 @@ pub struct KeyRef {
 }
 
 /// Checks that the caller has the permissions `mask` on `key`, as `key_task_permission`.
-fn permission(cx: &Caller<'_>, key: &Key, possessed: bool, mask: u32) -> Result<(), Errno> {
+fn permission(cx: &Caller<'_>, key: &KeyData, possessed: bool, mask: u32) -> Result<(), Errno> {
     let (uid, gid, perm) = {
         let s = key.state.lock();
         (s.uid, s.gid, s.perm)
@@ -585,7 +623,7 @@ fn permission(cx: &Caller<'_>, key: &Key, possessed: bool, mask: u32) -> Result<
 struct Search<'a> {
     cx: &'a Caller<'a>,
     /// This one key, for the check of possession.
-    target: Option<&'a Arc<Key>>,
+    target: Option<&'a KeyData>,
     kind: Kind,
     desc: &'a [u8],
     /// Skip the revoked, invalidated, expired and negative keys, with their errors.
@@ -599,7 +637,7 @@ struct Search<'a> {
 impl Search<'_> {
     fn matches(&self, key: &Arc<Key>) -> bool {
         match self.target {
-            Some(t) => Arc::ptr_eq(t, key),
+            Some(t) => core::ptr::eq(t, &***key),
             None => key.kind == self.kind && key.desc == self.desc,
         }
     }
@@ -859,7 +897,7 @@ pub fn lookup(cx: &Caller<'_>, id: i32, flags: u32, need: Need) -> Result<KeyRef
 }
 
 /// The caller can find `key` from its keyrings, with the search permission.
-fn is_possessed(cx: &Caller<'_>, key: &Arc<Key>) -> bool {
+fn is_possessed(cx: &Caller<'_>, key: &KeyData) -> bool {
     let s = Search {
         cx,
         target: Some(key),
@@ -963,17 +1001,18 @@ fn remove_link(ring: &Arc<Key>, key: &Arc<Key>) -> Result<(), Errno> {
     Ok(())
 }
 
+/// The data of all the keys, in the order of the serial numbers. The copy keeps no key alive, so
+/// a walk can use it and a key that loses its last reference is dead at once, as in Linux.
+fn all_keys() -> Vec<Arc<KeyData>> {
+    SERIALS.lock().values().flatten().cloned().collect()
+}
+
 /// Removes the links to invalidated keys from all the keyrings, as the garbage collector.
 fn collect() {
-    let rings: Vec<Arc<Key>> = {
-        let serials = SERIALS.lock();
-        serials.values().filter_map(Weak::upgrade).collect::<Vec<_>>()
-    };
     // The keys can lose their last reference here, so the lock of the table is not held.
-    for r in rings.iter().filter(|r| r.is_keyring()) {
-        let _ = r.links();
+    for r in all_keys().iter().filter(|r| r.is_keyring()) {
+        r.prune();
     }
-    drop(rings);
 }
 
 /// Makes a thread keyring for a new thread of `cred`, as `copy_creds` does for `CLONE_THREAD`
