@@ -1,8 +1,9 @@
 //! The text of `/proc/keys` and `/proc/key-users`.
 
-use super::{Caller, Key, NO_GID, POS, SERIALS, VIEW, all_usage, is_possessed, limits, permission};
+use super::{
+    Caller, KeyData, NO_GID, POS, VIEW, all_keys, all_usage, is_possessed, limits, permission,
+};
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Write;
 
@@ -33,9 +34,10 @@ fn timeout(expiry: u64, now: u64) -> String {
 }
 
 /// Writes the line of `key` to `out`.
-fn key_line(out: &mut String, key: &Arc<Key>, now: u64) {
-    let links = if key.is_keyring() { key.links().len() } else { 0 };
+fn key_line(out: &mut String, key: &KeyData, now: u64) {
     let s = key.state.lock();
+    // The count takes no reference to the linked keys.
+    let links = s.links.iter().filter(|k| !k.is_invalidated()).count();
     let flag = |on: bool, c: char| if on { c } else { '-' };
     let gid = if s.gid == NO_GID { OVERFLOW_ID } else { s.gid };
     let _ = write!(
@@ -47,8 +49,7 @@ fn key_line(out: &mut String, key: &Arc<Key>, now: u64) {
         flag(s.revoked, 'R'),
         flag(s.negative.is_some(), 'N'),
         flag(key.is_invalidated(), 'i'),
-        // The references of the tables and of the copy here do not count.
-        Arc::strong_count(key) - 1,
+        key.usage(),
         timeout(s.expiry, now),
         s.perm,
         s.uid as i32,
@@ -73,9 +74,10 @@ fn key_line(out: &mut String, key: &Arc<Key>, now: u64) {
 /// The text of `/proc/keys`: a line for each key that the caller can view, in the order of the
 /// serial numbers.
 pub fn keys_text(cx: &Caller<'_>) -> Vec<u8> {
-    let all: Vec<Arc<Key>> = SERIALS.lock().values().filter_map(Weak::upgrade).collect();
     let mut out = String::new();
-    for key in all.iter().filter(|k| !k.is_invalidated()) {
+    // The walk keeps no key alive, as the walk of Linux under the RCU lock. A dead key is not in
+    // the text.
+    for key in all_keys().iter().filter(|k| !k.is_invalidated() && k.usage() != 0) {
         // The search for possession is necessary only if the possessor can view the key.
         let pos_view = key.state.lock().perm & (VIEW << POS) != 0;
         let possessed = pos_view && is_possessed(cx, key);
@@ -83,8 +85,6 @@ pub fn keys_text(cx: &Caller<'_>) -> Vec<u8> {
             key_line(&mut out, key, cx.now);
         }
     }
-    // The keys can lose their last reference here, out of the lock of the table.
-    drop(all);
     out.into_bytes()
 }
 

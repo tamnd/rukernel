@@ -43,6 +43,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A read of a cgroupfs directory no longer skips entries when an `rmdir` happens between two reads (#384). Each entry keeps its place in the listing (a file by its index, a child cgroup by its ID), so `find -depth -exec rmdir` removes a whole tree. Before, the LTP cgroup_fj tests left their directory behind (`EBUSY`).
 - A fork, an exit, `mkdir` and `rmdir` no longer make the kernel compute `cgroup.events` again for each cgroup (#384). The kernel computes the events again only when a cgroup gets its first task or loses its last one, or while a cgroup is frozen. Before, these calls got slower with each cgroup, and the creation of 10000 cgroups took more than 20 minutes under QEMU without KVM. Now it takes about 5 minutes.
 - The timer of a pressure trigger starts on its own clock (#399). Before, it started at the time of the counter, which can be ahead of the clock of the timers when ticks are late, so on a busy host the timer did not fire during the stall and the arm64 init check "a stall polls POLLPRI on the trigger" failed.
+- A key is dead when its last reference goes, as in Linux (#419). The walks of `/proc/keys`, the find of a session keyring by name and the garbage collector hold the data of each key but no reference to it. Before, a walk kept a key alive for a short time after its last link went, and a lookup by serial could still find it. The test lock of the walks is gone.
 
 ## [0.4.7] - 2026-10-28
 

@@ -4,12 +4,12 @@
 
 use super::{
     Caller, Kind, LINK, LINK_LOCK, LOOKUP_CREATE, LOOKUP_PARTIAL, NEGATIVE_TIMEOUT, NO_GID, Need,
-    Quota, READ, SEARCH, SERIALS, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE,
-    abort_link, alloc, begin_link, check_cycle, collect, commit_link, insert_link, limits, lookup,
+    Quota, READ, SEARCH, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE, abort_link,
+    all_keys, alloc, begin_link, check_cycle, collect, commit_link, insert_link, limits, lookup,
     permission, process_ring, remove_link, set_payload, thread_ring, uncharge, user_rings,
 };
 use super::{GRP_ALL, Key, OTH_ALL, POS_ALL, USR_ALL};
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::Errno;
@@ -248,19 +248,18 @@ pub fn join_session(cx: &Caller<'_>, name: Option<&[u8]>) -> Result<i32, Errno> 
 /// A keyring with the description `name` that the caller can search, as
 /// `find_keyring_by_name`. The user keyrings are not in the search.
 fn find_by_name(cx: &Caller<'_>, name: &[u8]) -> Option<Arc<Key>> {
-    let all: Vec<Arc<Key>> = SERIALS.lock().values().filter_map(Weak::upgrade).collect();
-    let found = all.iter().find(|k| {
-        k.is_keyring()
-            && !k.uid_ring
-            && k.desc == name
-            && !k.is_invalidated()
-            && !k.state.lock().revoked
-            && permission(cx, k, false, SEARCH).is_ok()
-    });
-    let found = found.cloned();
-    // The other keys can lose their last reference here, out of the lock of the table.
-    drop(all);
-    found
+    // The walk takes a reference only to the key that it gives. A dead key does not give one.
+    all_keys()
+        .iter()
+        .filter(|k| {
+            k.is_keyring()
+                && !k.uid_ring
+                && k.desc == name
+                && !k.is_invalidated()
+                && !k.state.lock().revoked
+                && permission(cx, k, false, SEARCH).is_ok()
+        })
+        .find_map(|k| k.this.upgrade())
 }
 
 /// Changes the payload of a key, as `KEYCTL_UPDATE`.
