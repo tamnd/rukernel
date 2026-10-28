@@ -173,6 +173,10 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
 /// Runs the user code of the thread and handles each return to the kernel, until the thread
 /// ends. Gives the status of the thread.
 fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
+    // The CPU time of the task at the last return from user code. The CPU time of the task from
+    // there to the next entry to user code is system time.
+    let task = rk_frame::task::Task::current();
+    let mut kernel_from = task.cpu_ns();
     loop {
         let process = thread.process();
         if thread.is_killed() {
@@ -189,7 +193,9 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
         // The number of a system call that can start again after a signal. `rt_sigreturn` puts
         // back the registers of the frame, so its return value is not a restart code.
         let mut syscall = None;
+        thread.add_sys_ns(task.cpu_ns().saturating_sub(kernel_from));
         let (reason, user_ns) = regs.execute_timed();
+        kernel_from = task.cpu_ns();
         if thread.add_user_ns(user_ns) != 0 {
             rk_proc::timer::check_cpu_timers(&thread);
             rk_proc::timer::check_cpu_limit(&thread);

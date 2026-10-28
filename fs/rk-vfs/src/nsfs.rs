@@ -121,6 +121,16 @@ impl NsInode {
     pub fn ino(kind: NsKind, id: u32) -> u64 {
         if id == 0 { kind.init_ino() } else { kind.base() + u64::from(id) }
     }
+
+    /// The ID of the namespace of the kind `kind` with the inode number `ino`, or `None` if no
+    /// namespace of the kind can have the number. It is the inverse of `ino`.
+    pub fn id_of(kind: NsKind, ino: u64) -> Option<u32> {
+        if ino == kind.init_ino() {
+            return Some(0);
+        }
+        let id = u32::try_from(ino.checked_sub(kind.base())?).ok()?;
+        (id != 0).then_some(id)
+    }
 }
 
 /// The text of the link to the namespace `id` of the kind `kind`, as `cgroup:[4026531835]`.
@@ -162,5 +172,19 @@ impl Inode for NsInode {
 
     fn fs_magic(&self) -> u64 {
         NSFS_MAGIC
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_of_is_the_inverse_of_ino() {
+        for id in [0, 1, 7, 1000] {
+            assert_eq!(NsInode::id_of(NsKind::Mnt, NsInode::ino(NsKind::Mnt, id)), Some(id));
+        }
+        assert_eq!(NsInode::id_of(NsKind::Mnt, 4_026_531_832), Some(0));
+        assert_eq!(NsInode::id_of(NsKind::Mnt, 12), None);
     }
 }

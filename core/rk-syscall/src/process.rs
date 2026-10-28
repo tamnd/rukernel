@@ -572,7 +572,7 @@ pub(crate) fn wait4(cx: &Cx<'_>, pid: u64, status: u64, options: u64, rusage: u6
     let found = wait_child(cx, target, options | WEXITED)?;
     let Some(r) = found else { return Ok(0) };
     cx.write_opt(status, &r.status.0)?;
-    cx.write_opt(rusage, &crate::info::rusage(r.ticks))?;
+    cx.write_opt(rusage, &crate::info::rusage(r.ticks, r.sys_ticks))?;
     Ok(u64::from(r.pid))
 }
 
@@ -613,7 +613,7 @@ pub(crate) fn waitid(
     };
     // With `WNOHANG` and no child that changed, the fields are 0, as in Linux.
     let mut info = SigInfo::default();
-    let mut ticks = 0;
+    let mut ticks = (0, 0);
     let options = if nonblock { options | WNOHANG } else { options };
     let result = wait_child(cx, target, options)?;
     if result.is_none() && nonblock {
@@ -629,12 +629,12 @@ pub(crate) fn waitid(
             info.code = CLD_TRAPPED;
             info.status = (r.status.0 >> 8) & 0xffff;
         }
-        ticks = r.ticks;
+        ticks = (r.ticks, r.sys_ticks);
     }
     if infop != 0 {
         cx.write_bytes(infop, &info.to_bytes()[..WAITID_INFO_SIZE])?;
     }
-    cx.write_opt(rusage, &crate::info::rusage(ticks))?;
+    cx.write_opt(rusage, &crate::info::rusage(ticks.0, ticks.1))?;
     Ok(0)
 }
 

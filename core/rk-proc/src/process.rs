@@ -177,6 +177,11 @@ pub struct Process {
     /// The user CPU time in timer ticks of the children that a wait reaped, with their own
     /// reaped children.
     child_ticks: AtomicU64,
+    /// The system CPU time in timer ticks of the threads that ended.
+    dead_sys_ticks: AtomicU64,
+    /// The system CPU time in timer ticks of the children that a wait reaped, with their own
+    /// reaped children.
+    child_sys_ticks: AtomicU64,
     /// The largest resident set in pages of the address spaces that the process left, at an
     /// `execve` or the exit, as `signal_struct.maxrss` of Linux.
     maxrss: AtomicU64,
@@ -250,6 +255,10 @@ pub struct Thread {
     user_ticks: AtomicU64,
     /// The user CPU time of the thread in nanoseconds that is not yet a whole tick.
     user_rest: AtomicU64,
+    /// The system CPU time of the thread in whole timer ticks.
+    sys_ticks: AtomicU64,
+    /// The system CPU time of the thread in nanoseconds that is not yet a whole tick.
+    sys_rest: AtomicU64,
     /// The time in nanoseconds that the thread must wait for `io.max` of its cgroup before it
     /// goes back to user mode.
     io_delay: AtomicU64,
@@ -470,14 +479,14 @@ impl Process {
     /// Keeps the resident set of `vm` in the largest resident set of the process, before the
     /// process leaves `vm`, as `setmax_mm_hiwater_rss` of Linux.
     fn note_rss(&self, vm: &AddressSpace) {
-        self.maxrss.fetch_max(vm.page_count() as u64, Ordering::Relaxed);
+        self.maxrss.fetch_max(vm.hiwater_pages() as u64, Ordering::Relaxed);
     }
 
     /// The largest resident set of the process in KiB, for `ru_maxrss` of `RUSAGE_SELF`, as
-    /// `getrusage` in kernel/sys.c of Linux. Linux takes the high water mark of the address
-    /// space. rukernel takes the resident set now, so a set that got smaller does not count.
+    /// `getrusage` in kernel/sys.c of Linux: the high water mark of the address space now, and of
+    /// the address spaces that the process left.
     pub fn maxrss_kb(&self) -> u64 {
-        let now = self.vm().map_or(0, |vm| vm.page_count() as u64);
+        let now = self.vm().map_or(0, |vm| vm.hiwater_pages() as u64);
         self.maxrss.load(Ordering::Relaxed).max(now) * (rk_mm::PAGE_SIZE as u64 / 1024)
     }
 
@@ -671,6 +680,20 @@ impl Process {
     /// children.
     pub fn child_ticks(&self) -> u64 {
         self.child_ticks.load(Ordering::Relaxed)
+    }
+
+    /// The system CPU time of the process in timer ticks: the time of its threads, and of the
+    /// threads that ended.
+    pub fn sys_ticks(&self) -> u64 {
+        let s = self.state.lock();
+        let live: u64 = s.threads.iter().map(|t| t.sys_ticks()).sum();
+        live + self.dead_sys_ticks.load(Ordering::Relaxed)
+    }
+
+    /// The system CPU time in timer ticks of the children that a wait reaped, and of their
+    /// reaped children.
+    pub fn child_sys_ticks(&self) -> u64 {
+        self.child_sys_ticks.load(Ordering::Relaxed)
     }
 
     /// The personality, as `personality(0xffffffff)` gives it.
@@ -872,6 +895,8 @@ impl Process {
             timers: SpinLock::new(Timers::default()),
             dead_ticks: AtomicU64::new(0),
             child_ticks: AtomicU64::new(0),
+            dead_sys_ticks: AtomicU64::new(0),
+            child_sys_ticks: AtomicU64::new(0),
             maxrss: AtomicU64::new(0),
             cmaxrss: AtomicU64::new(0),
             leader_tracer: SpinLock::new(Weak::new()),
@@ -965,13 +990,15 @@ impl Thread {
     /// number of whole ticks that this adds. Only the thread itself calls it. The time comes from
     /// the clock around the user code, not from the ticks that the timer interrupt counts: the
     /// kernel runs with interrupts off, so a tick that falls due in the kernel or in a wake from
-    /// idle comes at the next entry to user mode, and is not user time. The system time is 0.
+    /// idle comes at the next entry to user mode, and is not user time.
     ///
     /// The periodic timer interrupt stops the user code at the next tick at the latest, so one
     /// time in user mode is at most one tick. A longer time is the time when the host did not run
     /// the virtual CPU, for example on a busy host with QEMU TCG, and the clock moved on. Thus
     /// `ns` counts at most one tick, as the tick sampling of Linux counts one tick for one
     /// interrupt. Without the limit, a sleep can add CPU time, and `ITIMER_VIRTUAL` fires early.
+    ///
+    /// `add_sys_ns` counts the system time.
     pub fn add_user_ns(&self, ns: u64) -> u64 {
         let tick_ns = 1_000_000_000 / rk_frame::time::HZ;
         let total = self.user_rest.load(Ordering::Relaxed) + ns.min(tick_ns);
@@ -982,6 +1009,25 @@ impl Thread {
             self.user_ticks.fetch_add(ticks, Ordering::Relaxed);
         }
         ticks
+    }
+
+    /// The system CPU time of the thread in timer ticks.
+    pub fn sys_ticks(&self) -> u64 {
+        self.sys_ticks.load(Ordering::Relaxed)
+    }
+
+    /// Adds `ns` nanoseconds of kernel code to the system CPU time of the thread. Only the thread
+    /// itself calls it. The time is the time of the task of the thread on the CPU between two
+    /// runs of user code, so a sleep in the kernel does not count. As in `add_user_ns`, one call
+    /// counts at most one tick, because the host can stop the virtual CPU for a long time.
+    pub fn add_sys_ns(&self, ns: u64) {
+        let tick_ns = 1_000_000_000 / rk_frame::time::HZ;
+        let total = self.sys_rest.load(Ordering::Relaxed) + ns.min(tick_ns);
+        self.sys_rest.store(total % tick_ns, Ordering::Relaxed);
+        let ticks = total / tick_ns;
+        if ticks != 0 {
+            self.sys_ticks.fetch_add(ticks, Ordering::Relaxed);
+        }
     }
 
     /// Adds `ns` nanoseconds to the wait of the thread for `io.max`. The longest delay counts,
@@ -1352,6 +1398,8 @@ impl Thread {
             restart: SpinLock::new(None),
             user_ticks: AtomicU64::new(0),
             user_rest: AtomicU64::new(0),
+            sys_ticks: AtomicU64::new(0),
+            sys_rest: AtomicU64::new(0),
             io_delay: AtomicU64::new(0),
             ptrace: SpinLock::new(None),
             group_stop: AtomicU32::new(0),
@@ -1891,6 +1939,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         let mut s = process.state.lock();
         s.threads.retain(|t| t.tid != thread.tid);
         process.dead_ticks.fetch_add(thread.user_ticks(), Ordering::Relaxed);
+        process.dead_sys_ticks.fetch_add(thread.sys_ticks(), Ordering::Relaxed);
         // The thread leaves its cgroup with the lock held, so a move of the process counts the
         // threads that stay.
         let cgroup = process.cgroup();
@@ -2030,8 +2079,14 @@ pub fn wait_child(
                 }
                 drop(cs);
                 let uid = c.cred().uid;
-                let r =
-                    WaitResult { pid: c.pid, uid, status, ticks: c.user_ticks(), trapped: false };
+                let r = WaitResult {
+                    pid: c.pid,
+                    uid,
+                    status,
+                    ticks: c.user_ticks(),
+                    sys_ticks: c.sys_ticks(),
+                    trapped: false,
+                };
                 return Some(Ok(Some(r)));
             }
         }
@@ -2039,11 +2094,13 @@ pub fn wait_child(
             // The time of the child includes its reaped children, as in `getrusage` of Linux
             // with `RUSAGE_BOTH`.
             let ticks = child.user_ticks() + child.child_ticks();
+            let sys_ticks = child.sys_ticks() + child.child_sys_ticks();
             if !options.nowait {
                 s.children.remove(i);
                 s.tracees.retain(|t| !Arc::ptr_eq(&t.process, &child));
                 drop(s);
                 process.child_ticks.fetch_add(ticks, Ordering::Relaxed);
+                process.child_sys_ticks.fetch_add(sys_ticks, Ordering::Relaxed);
                 // As `wait_task_zombie` in kernel/exit.c of Linux.
                 let rss = child.maxrss.load(Ordering::Relaxed);
                 let rss = rss.max(child.cmaxrss.load(Ordering::Relaxed));
@@ -2056,6 +2113,7 @@ pub fn wait_child(
                 uid,
                 status,
                 ticks,
+                sys_ticks,
                 trapped: false,
             })));
         }

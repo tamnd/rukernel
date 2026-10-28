@@ -4,6 +4,7 @@
 use crate::node::{
     FindFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file, set_owner,
 };
+use crate::procmap;
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
 use alloc::boxed::Box;
 use alloc::format;
@@ -13,7 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
-use rk_mm::{Backing, VmaKind};
+use rk_mm::{Backing, FileRef, Vma, VmaKind};
 use rk_proc::exec::USER_HZ;
 use rk_proc::signal::{NSIG, SIG_IGN};
 use rk_proc::{Pid, Process, Thread};
@@ -154,6 +155,10 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
             let t = rk_proc::current_thread().ok_or(Errno::ENOENT)?;
             Ok(format!("{}/task/{}", t.process().pid(), t.tid()).into_bytes())
         }),
+    ));
+    out.push((
+        b"kpageflags".to_vec(),
+        data_file(b"/kpageflags", 0o400, kpageflags_read, |_, _| Err(Errno::EINVAL)),
     ));
     out.push((b"sys".to_vec(), sys_dir()));
     out.push((b"sysvipc".to_vec(), sysvipc_dir()));
@@ -786,7 +791,9 @@ fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
         threads: threads.len(),
         // Linux gives the time of the thread in the stat of a thread.
         utime: t.map_or_else(|| p.user_ticks(), Thread::user_ticks) * USER_HZ / rk_frame::time::HZ,
+        stime: t.map_or_else(|| p.sys_ticks(), Thread::sys_ticks) * USER_HZ / rk_frame::time::HZ,
         cutime: p.child_ticks() * USER_HZ / rk_frame::time::HZ,
+        cstime: p.child_sys_ticks() * USER_HZ / rk_frame::time::HZ,
         start: p.start_tick() * USER_HZ / rk_frame::time::HZ,
         vsize,
         rss: p.vm().map_or(0, |vm| vm.resident_pages(0, rk_frame::vm::USER_END) as u64),
@@ -921,34 +928,40 @@ fn smaps_of(p: &Process) -> Result<Vec<u8>> {
     areas_of(p, true)
 }
 
+/// The line of `/proc/PID/maps` for the area `a`.
+fn map_line_of(a: &Vma<FileRef>) -> MapLine {
+    let mut line = MapLine {
+        start: a.start,
+        end: a.end,
+        read: a.prot.read,
+        write: a.prot.write,
+        exec: a.prot.exec,
+        shared: a.shared,
+        ..MapLine::default()
+    };
+    if let Backing::File { file, offset } = &a.backing {
+        let (dev, ino, path) = file.name();
+        line.offset = *offset;
+        line.dev = dev;
+        line.ino = ino;
+        line.name = path;
+    }
+    match a.kind {
+        VmaKind::Heap => line.name = b"[heap]".to_vec(),
+        VmaKind::Stack => line.name = b"[stack]".to_vec(),
+        VmaKind::Vdso => line.name = b"[vdso]".to_vec(),
+        VmaKind::Vvar => line.name = b"[vvar]".to_vec(),
+        VmaKind::Normal => {}
+    }
+    line
+}
+
 /// The text of `/proc/PID/maps`, or of `/proc/PID/smaps` with `smaps`.
 fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let Some(vm) = p.vm() else { return Ok(out) };
     for a in vm.areas() {
-        let mut line = MapLine {
-            start: a.start,
-            end: a.end,
-            read: a.prot.read,
-            write: a.prot.write,
-            exec: a.prot.exec,
-            shared: a.shared,
-            ..MapLine::default()
-        };
-        if let Backing::File { file, offset } = &a.backing {
-            let (dev, ino, path) = file.name();
-            line.offset = *offset;
-            line.dev = dev;
-            line.ino = ino;
-            line.name = path;
-        }
-        match a.kind {
-            VmaKind::Heap => line.name = b"[heap]".to_vec(),
-            VmaKind::Stack => line.name = b"[stack]".to_vec(),
-            VmaKind::Vdso => line.name = b"[vdso]".to_vec(),
-            VmaKind::Vvar => line.name = b"[vvar]".to_vec(),
-            VmaKind::Normal => {}
-        }
+        let line = map_line_of(&a);
         text::map_line(&mut out, &line);
         if smaps {
             let area = SmapsArea {
@@ -961,6 +974,193 @@ fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// An open file of `/proc/PID/maps`. It reads the text of its inode, and answers the ioctl
+/// `PROCMAP_QUERY`, as `procfs_procmap_ioctl` in fs/proc/task_mmu.c of Linux.
+struct MapsFile {
+    p: Weak<Process>,
+}
+
+impl rk_vfs::file::FileOps for MapsFile {
+    fn read(&self, file: &rk_vfs::file::File, buf: &mut [u8]) -> Result<usize> {
+        let pos = file.pos();
+        let n = file.inode().ok_or(Errno::EINVAL)?.read_at(pos, buf)?;
+        file.set_pos(pos + n as u64);
+        Ok(n)
+    }
+
+    fn read_at(&self, file: &rk_vfs::file::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        file.inode().ok_or(Errno::EINVAL)?.read_at(offset, buf)
+    }
+
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn ioctl(
+        &self,
+        _file: &rk_vfs::file::File,
+        cmd: u32,
+        arg: usize,
+        mem: &dyn rk_vfs::file::UserMemory,
+    ) -> Result<usize> {
+        if cmd != procmap::PROCMAP_QUERY {
+            return Err(Errno::ENOTTY);
+        }
+        procmap_query(&*alive(&self.p)?, arg, mem)?;
+        Ok(0)
+    }
+}
+
+/// Does the ioctl `PROCMAP_QUERY` for the structure at `arg`, as `do_procmap_query` of Linux.
+fn procmap_query(p: &Process, arg: usize, mem: &dyn rk_vfs::file::UserMemory) -> Result<()> {
+    use procmap::{Answer, Area, QUERY_SIZE, Query};
+    let mut word = [0u8; 8];
+    mem.read(arg, &mut word)?;
+    let size = u64::from_ne_bytes(word);
+    if size > rk_mm::PAGE_SIZE as u64 {
+        return Err(Errno::E2BIG);
+    }
+    let size = size as usize;
+    let mut raw = [0u8; QUERY_SIZE];
+    let known = size.min(QUERY_SIZE);
+    mem.read(arg, &mut raw[..known])?;
+    // A newer structure is good only if its new fields are zero, as `copy_struct_from_user`.
+    let mut at = QUERY_SIZE;
+    while at < size {
+        let n = (size - at).min(word.len());
+        mem.read(arg + at, &mut word[..n])?;
+        if word[..n].iter().any(|&b| b != 0) {
+            return Err(Errno::E2BIG);
+        }
+        at += n;
+    }
+    let q = Query::parse(&raw)?;
+    let vm = p.vm().ok_or(Errno::ESRCH)?;
+    let areas = vm.areas();
+    let list: Vec<Area> = areas
+        .iter()
+        .map(|a| {
+            let mut flags = 0;
+            for (on, bit) in [
+                (a.prot.read, procmap::VMA_READABLE),
+                (a.prot.write, procmap::VMA_WRITABLE),
+                (a.prot.exec, procmap::VMA_EXECUTABLE),
+                (a.shared, procmap::VMA_SHARED),
+            ] {
+                if on {
+                    flags |= bit;
+                }
+            }
+            let file = matches!(a.backing, Backing::File { .. })
+                && !matches!(a.kind, VmaKind::Vdso | VmaKind::Vvar);
+            Area { start: a.start as u64, end: a.end as u64, flags, file }
+        })
+        .collect();
+    let i = procmap::find(&list, &q)?;
+    let area = &list[i];
+    let line = map_line_of(&areas[i]);
+    let mut answer = Answer {
+        start: area.start,
+        end: area.end,
+        flags: area.flags,
+        page_size: if areas[i].hugetlb { rk_mm::hugetlb::HPAGE_SIZE } else { rk_mm::PAGE_SIZE }
+            as u64,
+        ..Answer::default()
+    };
+    if area.file {
+        answer.offset = line.offset;
+        answer.inode = line.ino;
+        answer.major = rk_vfs::device::major(line.dev);
+        answer.minor = rk_vfs::device::minor(line.dev);
+    }
+    if q.name_size != 0 && !line.name.is_empty() {
+        let len = u32::try_from(line.name.len() + 1).map_err(|_| Errno::ENAMETOOLONG)?;
+        if len > q.name_size {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let mut name = line.name;
+        name.push(0);
+        mem.write(q.name_addr as usize, &name)?;
+        answer.name_size = len;
+    }
+    let out = procmap::encode(&q, &answer);
+    mem.write(arg, &out[..known])
+}
+
+/// Reads the entries of `/proc/PID/pagemap` from `offset`, one `u64` for each page, as
+/// `pagemap_read` in fs/proc/task_mmu.c of Linux. Only a caller with `CAP_SYS_ADMIN` sees the
+/// page frame numbers. Other callers see 0 in their place.
+fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    const ENTRY: usize = 8;
+    if offset % ENTRY as u64 != 0 || buf.len() % ENTRY != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let Some(vm) = p.vm() else { return Ok(0) };
+    let admin = rk_proc::current_thread()
+        .is_some_and(|t| t.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN));
+    let areas = vm.areas();
+    let first = offset / ENTRY as u64;
+    let mut done = 0;
+    for (i, out) in buf.chunks_exact_mut(ENTRY).enumerate() {
+        let Some(addr) = usize::try_from(first + i as u64)
+            .ok()
+            .and_then(|page| page.checked_mul(rk_mm::PAGE_SIZE))
+            .filter(|&a| a < rk_frame::vm::USER_END)
+        else {
+            break;
+        };
+        let mut entry = 0;
+        if let Some((frame, _)) = vm.vm().page(rk_frame::addr::VirtAddr::new(addr)) {
+            entry = procmap::PM_PRESENT;
+            if admin {
+                entry |= (frame.addr().get() / rk_mm::PAGE_SIZE as u64) & procmap::PM_PFN_MASK;
+            }
+            // A page of a file or of shared memory is not anonymous. A private area of a file
+            // that the process can write has copies, which are anonymous.
+            let i = areas.partition_point(|a| a.end <= addr);
+            if let Some(a) = areas.get(i).filter(|a| a.start <= addr)
+                && (a.shared || (matches!(a.backing, Backing::File { .. }) && !a.prot.write))
+            {
+                entry |= procmap::PM_FILE;
+            }
+        }
+        out.copy_from_slice(&entry.to_ne_bytes());
+        done += ENTRY;
+    }
+    Ok(done)
+}
+
+/// The largest page frame number of `/proc/kpageflags`. It gives the address bits of the
+/// physical memory that the kernel can have.
+const KPAGEFLAGS_PFNS: u64 = 1 << 40;
+
+/// Reads the entries of `/proc/kpageflags` from `offset`, one `u64` for each page frame, as
+/// `kpageflags_read` in fs/proc/page.c of Linux. Only the pages of mapped files have flags.
+fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
+    const ENTRY: usize = 8;
+    if offset % ENTRY as u64 != 0 || buf.len() % ENTRY != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let first = offset / ENTRY as u64;
+    let mut done = 0;
+    for (i, out) in buf.chunks_exact_mut(ENTRY).enumerate() {
+        let pfn = first + i as u64;
+        if pfn >= KPAGEFLAGS_PFNS {
+            break;
+        }
+        let flags = match rk_vfs::mapped::frame_dirty(pfn * rk_mm::PAGE_SIZE as u64) {
+            Some(dirty) => {
+                let base = procmap::KPF_UPTODATE | procmap::KPF_LRU | procmap::KPF_MMAP;
+                if dirty { base | procmap::KPF_DIRTY } else { base }
+            }
+            None => 0,
+        };
+        out.copy_from_slice(&flags.to_ne_bytes());
+        done += ENTRY;
+    }
+    Ok(done)
 }
 
 /// An open file of `/proc/PID/mounts`. It reads the text of its inode, and has an event of
@@ -1307,8 +1507,26 @@ fn process_files(
             },
         ),
     ));
+    let (p_, p2) = (w.clone(), w.clone());
+    out.push((
+        b"maps".to_vec(),
+        ops_file(
+            &join(base, b"maps"),
+            0o444,
+            move || maps_of(&*alive(&p_)?),
+            move || Some(Arc::new(MapsFile { p: p2.clone() })),
+        ),
+    ));
     let p_ = w.clone();
-    out.push((b"maps".to_vec(), file(&join(base, b"maps"), move || maps_of(&*alive(&p_)?))));
+    out.push((
+        b"pagemap".to_vec(),
+        data_file(
+            &join(base, b"pagemap"),
+            0o400,
+            move |offset, buf| pagemap_read(&*alive(&p_)?, offset, buf),
+            |_, _| Err(Errno::EINVAL),
+        ),
+    ));
     let p_ = w.clone();
     out.push((b"smaps".to_vec(), file(&join(base, b"smaps"), move || smaps_of(&*alive(&p_)?))));
     let (p_, p2) = (w.clone(), w.clone());

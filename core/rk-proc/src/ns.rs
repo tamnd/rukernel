@@ -29,8 +29,8 @@ fn init_mnt() -> &'static Weak<MountNamespace> {
     })
 }
 
-/// The ID of the mount namespace `ns`.
-fn mnt_id(ns: &Arc<MountNamespace>) -> u32 {
+/// The ID of the mount namespace `ns`. The first mount namespace has the ID 0.
+pub fn mnt_id(ns: &Arc<MountNamespace>) -> u32 {
     if core::ptr::eq(init_mnt().as_ptr(), Arc::as_ptr(ns)) {
         return 0;
     }

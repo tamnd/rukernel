@@ -250,8 +250,12 @@ pub struct Stat {
     pub threads: usize,
     /// The user CPU time in ticks of `USER_HZ`.
     pub utime: u64,
+    /// The system CPU time in ticks of `USER_HZ`.
+    pub stime: u64,
     /// The user CPU time of the reaped children in ticks of `USER_HZ`.
     pub cutime: u64,
+    /// The system CPU time of the reaped children in ticks of `USER_HZ`.
+    pub cstime: u64,
     /// The start time in ticks of `USER_HZ` after boot.
     pub start: u64,
     /// The size of the address space in bytes.
@@ -276,14 +280,16 @@ pub fn stat(s: &Stat) -> Vec<u8> {
     let mut out = format!("{} (", s.pid).into_bytes();
     out.extend_from_slice(&s.comm);
     let rest = format!(
-        ") {} {} {} {} 0 -1 4194304 0 0 0 0 {} 0 {} 0 20 0 {} 0 {} {} {} 18446744073709551615 \
+        ") {} {} {} {} 0 -1 4194304 0 0 0 0 {} {} {} {} 20 0 {} 0 {} {} {} 18446744073709551615 \
          0 0 0 0 0 {} {} {} {} 0 0 0 {} 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         s.state as char,
         s.ppid,
         s.pgid,
         s.sid,
         s.utime,
+        s.stime,
         s.cutime,
+        s.cstime,
         s.threads,
         s.start,
         s.vsize,
@@ -635,7 +641,9 @@ mod tests {
             sid: 1,
             threads: 2,
             utime: 3,
+            stime: 6,
             cutime: 4,
+            cstime: 8,
             rss: 5,
             exit_signal: 17,
             ..Stat::default()
@@ -646,9 +654,11 @@ mod tests {
         let rest = &text[text.rfind(')').unwrap() + 2..];
         let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
         assert_eq!(fields.len() + 2, 52);
-        // Field 14 is utime, and field 16 is cutime.
+        // Fields 14 to 17 are utime, stime, cutime and cstime.
         assert_eq!(fields[11], "3");
+        assert_eq!(fields[12], "6");
         assert_eq!(fields[13], "4");
+        assert_eq!(fields[14], "8");
         assert_eq!(fields[17], "2");
         // Field 24 is rss.
         assert_eq!(fields[21], "5");

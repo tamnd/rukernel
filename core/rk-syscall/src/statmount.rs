@@ -4,9 +4,10 @@
 //! unique IDs of the mounts under a mount, in the order of the IDs. `statmount` gives the fields of
 //! `struct statmount` for one mount, and the strings that the mask asks for after the structure.
 //!
-//! rukernel has no name space files in `/proc/PID/ns` and no name space IDs yet. Thus a request
-//! for another name space gives `EBADF` for a bad descriptor, `EINVAL` for another descriptor and
-//! `ENOENT` for a name space ID, and `STATMOUNT_MNT_NS_ID` gives nothing.
+//! The ID of a mount name space is the inode number of its file in `/proc/PID/ns`, as
+//! `NS_GET_MNTNS_ID` gives it. A request can give the ID of another mount name space. A request
+//! for a name space by a descriptor gives `EBADF` for a bad descriptor and `EINVAL` for another
+//! descriptor.
 
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
@@ -20,13 +21,14 @@ use rk_abi::native::mount::{
     MS_DIRSYNC, MS_LAZYTIME, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID,
     MS_NOSYMFOLLOW, MS_PRIVATE, MS_RDONLY, MS_RELATIME, MS_SHARED, MS_SLAVE, MS_SYNCHRONOUS,
     MS_UNBINDABLE, STATMOUNT_BY_FD, STATMOUNT_FS_SUBTYPE, STATMOUNT_FS_TYPE, STATMOUNT_MNT_BASIC,
-    STATMOUNT_MNT_GIDMAP, STATMOUNT_MNT_OPTS, STATMOUNT_MNT_POINT, STATMOUNT_MNT_ROOT,
-    STATMOUNT_MNT_UIDMAP, STATMOUNT_OPT_ARRAY, STATMOUNT_OPT_SEC_ARRAY, STATMOUNT_PROPAGATE_FROM,
-    STATMOUNT_SB_BASIC, STATMOUNT_SB_SOURCE, STATMOUNT_SUPPORTED_MASK,
+    STATMOUNT_MNT_GIDMAP, STATMOUNT_MNT_NS_ID, STATMOUNT_MNT_OPTS, STATMOUNT_MNT_POINT,
+    STATMOUNT_MNT_ROOT, STATMOUNT_MNT_UIDMAP, STATMOUNT_OPT_ARRAY, STATMOUNT_OPT_SEC_ARRAY,
+    STATMOUNT_PROPAGATE_FROM, STATMOUNT_SB_BASIC, STATMOUNT_SB_SOURCE, STATMOUNT_SUPPORTED_MASK,
 };
 use rk_abi::native::types::Statmount;
 use rk_vfs::dentry::{Location, Mount, MountNamespace, UNIQUE_ID_OFFSET};
 use rk_vfs::device::{major, minor};
+use rk_vfs::nsfs::{NsInode, NsKind};
 use rk_vfs::{FsContext, cred::cap};
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -39,8 +41,8 @@ const LIST_MAX: u64 = 1_000_000;
 /// The size of `struct statmount` without the strings.
 const SM_SIZE: usize = size_of::<Statmount>();
 
-/// The flags of the mask that this kernel gives, `STATMOUNT_SUPPORTED` of Linux without the
-/// name space ID and the ID maps.
+/// The flags of the mask that this kernel gives, `STATMOUNT_SUPPORTED` of Linux without the ID
+/// maps.
 const SUPPORTED: u32 = STATMOUNT_SB_BASIC
     | STATMOUNT_MNT_BASIC
     | STATMOUNT_PROPAGATE_FROM
@@ -52,6 +54,7 @@ const SUPPORTED: u32 = STATMOUNT_SB_BASIC
     | STATMOUNT_SB_SOURCE
     | STATMOUNT_OPT_ARRAY
     | STATMOUNT_OPT_SEC_ARRAY
+    | STATMOUNT_MNT_NS_ID
     | STATMOUNT_SUPPORTED_MASK;
 
 /// The flags of the mask that give a string, `STATMOUNT_STRING_REQ` of Linux.
@@ -110,11 +113,16 @@ fn read_request(cx: &Cx<'_>, addr: u64, by_fd: bool) -> Result<Request, Errno> {
     Ok(req)
 }
 
-/// The name space of the request, as `grab_requested_mnt_ns` of Linux. Only the name space of
-/// the caller can be found yet.
+/// The name space of the request, as `grab_requested_mnt_ns` of Linux. Another name space than
+/// the name space of the caller needs `CAP_SYS_ADMIN`.
 fn namespace(cx: &Cx<'_>, fs: &FsContext, req: &Request) -> Result<Arc<MountNamespace>, Errno> {
     if req.mnt_ns_id != 0 {
-        return Err(Errno::ENOENT);
+        let id = NsInode::id_of(NsKind::Mnt, req.mnt_ns_id).ok_or(Errno::ENOENT)?;
+        let ns = rk_proc::ns::mnt_ns(id).ok_or(Errno::ENOENT)?;
+        if !Arc::ptr_eq(&ns, fs.namespace()) && !cx.process().cred().capable(cap::SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        return Ok(ns);
     }
     if req.fd != 0 {
         cx.file(u64::from(req.fd))?;
@@ -279,18 +287,21 @@ pub(crate) fn statmount(cx: &Cx<'_>, req: u64, buf: u64, bufsize: u64, flags: u6
     if mask & u64::from(STRING_REQ) != 0 && bufsize == SM_SIZE {
         return Err(Errno::EOVERFLOW);
     }
-    let ns = fs.namespace().clone();
+    let mut ns = Some(fs.namespace().clone());
     let mount = if by_fd {
         let file = cx.file(u64::from(req.fd))?;
         let mount = file.location().ok_or(Errno::EINVAL)?.mount.clone();
-        if !ns.contains(&mount) {
-            mask &= !u64::from(STATMOUNT_MNT_POINT);
+        if !ns.as_ref().is_some_and(|ns| ns.contains(&mount)) {
+            // A mount of another name space has no path and no name space ID here.
+            mask &= !u64::from(STATMOUNT_MNT_POINT | STATMOUNT_MNT_NS_ID);
+            ns = None;
         }
         mount
     } else {
-        let ns = namespace(cx, &fs, &req)?;
-        let mount = ns.find_unique(req.mnt_id).ok_or(Errno::ENOENT)?;
+        let found = namespace(cx, &fs, &req)?;
+        let mount = found.find_unique(req.mnt_id).ok_or(Errno::ENOENT)?;
         may_see(cx, &fs, &top(&mount))?;
+        ns = Some(found);
         mount
     };
     let mut st = Stat { sm: Statmount::new_zeroed(), strings: Vec::new(), bufsize };
@@ -325,7 +336,7 @@ pub(crate) fn statmount(cx: &Cx<'_>, req: u64, buf: u64, bufsize: u64, flags: u6
     if has(STATMOUNT_PROPAGATE_FROM) {
         st.sm.mask |= u64::from(STATMOUNT_PROPAGATE_FROM);
         if mount.propagation().master != 0 {
-            st.sm.propagate_from = ns.propagate_from(&mount, fs.root());
+            st.sm.propagate_from = fs.namespace().propagate_from(&mount, fs.root());
         }
     }
     if has(STATMOUNT_FS_TYPE)
@@ -364,6 +375,12 @@ pub(crate) fn statmount(cx: &Cx<'_>, req: u64, buf: u64, bufsize: u64, flags: u6
         && let Some(at) = st.string(STATMOUNT_SB_SOURCE, &source.source)?
     {
         st.sm.sb_source = at;
+    }
+    if has(STATMOUNT_MNT_NS_ID)
+        && let Some(ns) = &ns
+    {
+        st.sm.mask |= u64::from(STATMOUNT_MNT_NS_ID);
+        st.sm.mnt_ns_id = NsInode::ino(NsKind::Mnt, rk_proc::ns::mnt_id(ns));
     }
     if has(STATMOUNT_SUPPORTED_MASK) {
         st.sm.mask |= u64::from(STATMOUNT_SUPPORTED_MASK);

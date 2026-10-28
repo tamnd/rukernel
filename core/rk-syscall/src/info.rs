@@ -597,30 +597,36 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
 pub(crate) fn getrusage(cx: &Cx<'_>, who: u64, buf: u64) -> SysResult {
     // `RUSAGE_SELF`, `RUSAGE_CHILDREN` and `RUSAGE_THREAD`.
     let process = cx.process();
-    let (ticks, maxrss) = match who as i32 {
-        0 => (process.user_ticks(), process.maxrss_kb()),
-        -1 => (process.child_ticks(), process.child_maxrss_kb()),
-        1 => (cx.thread.user_ticks(), process.maxrss_kb()),
+    let (ticks, sys_ticks, maxrss) = match who as i32 {
+        0 => (process.user_ticks(), process.sys_ticks(), process.maxrss_kb()),
+        -1 => (process.child_ticks(), process.child_sys_ticks(), process.child_maxrss_kb()),
+        1 => (cx.thread.user_ticks(), cx.thread.sys_ticks(), process.maxrss_kb()),
         _ => return Err(Errno::EINVAL),
     };
-    let mut r = rusage(ticks);
+    let mut r = rusage(ticks, sys_ticks);
     r.ru_maxrss = maxrss as i64;
     cx.write_val(buf, &r)?;
     Ok(0)
 }
 
-/// The `struct rusage` of `ticks` timer ticks of user CPU time. The kernel does not count the
-/// other values yet.
-pub(crate) fn rusage(ticks: u64) -> Rusage {
+/// The `struct rusage` of `ticks` timer ticks of user CPU time and `sys_ticks` timer ticks of
+/// system CPU time. The kernel does not count the other values yet.
+pub(crate) fn rusage(ticks: u64, sys_ticks: u64) -> Rusage {
     let mut r = Rusage::new_zeroed();
     r.ru_utime = crate::timer::timeval(ticks_ns(ticks));
+    r.ru_stime = crate::timer::timeval(ticks_ns(sys_ticks));
     r
 }
 
 pub(crate) fn times(cx: &Cx<'_>, buf: u64) -> SysResult {
     let process = cx.process();
     // `tms_utime`, `tms_stime`, `tms_cutime` and `tms_cstime`.
-    let tms = [user_hz(process.user_ticks()), 0, user_hz(process.child_ticks()), 0];
+    let tms = [
+        user_hz(process.user_ticks()),
+        user_hz(process.sys_ticks()),
+        user_hz(process.child_ticks()),
+        user_hz(process.child_sys_ticks()),
+    ];
     cx.write_opt(buf, &tms)?;
     Ok(user_hz(ticks()))
 }

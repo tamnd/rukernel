@@ -19,7 +19,10 @@ use rk_abi::native::auxv::{
     AT_PHENT, AT_PHNUM, AT_SECURE, AT_SYSINFO_EHDR, AT_UID,
 };
 use rk_abi::native::mount::{MS_NOEXEC, MS_NOSUID};
-use rk_mm::{AddressSpace, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind};
+use rk_frame::mm::{Frame, alloc_zeroed_frame};
+use rk_mm::{
+    AddressSpace, FileRef, MmFile, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind,
+};
 use rk_vfs::cred::{Cred, ExecFile};
 use rk_vfs::file::DenyWrite;
 use rk_vfs::{FileType, FsContext, InodeRef, Location};
@@ -126,6 +129,37 @@ fn open_exec_at(
     Ok(at)
 }
 
+/// The pages of one segment of an ELF file, for a private file mapping of the segment. Each page
+/// is a new copy of the file data, which the first fault reads. The bytes of the file after the
+/// segment data are zero, as `padzero` of fs/binfmt_elf.c gives them, so the last page of the data
+/// starts the zero memory of the segment. `/proc/PID/maps` shows the name of the file.
+struct Segment {
+    inode: InodeRef,
+    /// The path of the file, for `/proc/PID/maps`.
+    path: Vec<u8>,
+    /// The offset in the file after the data of the segment.
+    limit: u64,
+}
+
+impl MmFile for Segment {
+    fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
+        let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EIO)?;
+        let frame = alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
+        let len = self.limit.saturating_sub(offset).min(PAGE_SIZE as u64) as usize;
+        if len != 0 {
+            let mut buf = vec![0u8; len];
+            let n = read_full(&self.inode, offset, &mut buf)?;
+            frame.write_bytes(0, &buf[..n]);
+        }
+        Ok(Arc::new(frame))
+    }
+
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        let meta = self.inode.metadata();
+        (meta.dev, meta.ino, self.path.clone())
+    }
+}
+
 /// The result of the load of one ELF file.
 struct Loaded {
     bias: usize,
@@ -133,14 +167,20 @@ struct Loaded {
     end: usize,
 }
 
-/// Loads the segments of `inode` in `space`. A `Dyn` file goes at `base`, or at an address that
-/// the address space chooses if `base` is `None`.
+/// Loads the segments of the file `at` in `space`. A `Dyn` file goes at `base`, or at an address
+/// that the address space chooses if `base` is `None`.
+///
+/// A segment is a private mapping of the file, as `elf_map` of Linux, and anonymous memory after
+/// the data of the file, so `/proc/PID/maps` shows the file. A segment whose address and offset
+/// do not agree in the page, or whose first page is in the previous segment, is anonymous memory
+/// with a copy of the data.
 fn load_elf(
     space: &AddressSpace,
-    inode: &InodeRef,
+    at: &Location,
     header: ElfHeader,
     base: Option<usize>,
 ) -> Result<Loaded, Errno> {
+    let inode = at.inode();
     let (low, high) = header.span();
     let size = usize::try_from(high - low).map_err(|_| Errno::ENOMEM)?;
     let bias = match header.kind {
@@ -167,6 +207,33 @@ fn load_elf(
         let start = (bias as u64 + seg.vaddr) / page * page;
         let end = (bias as u64 + seg.vaddr + seg.memsz).div_ceil(page) * page;
         let (start, end) = (start as usize, end as usize);
+        let data_end = (bias as u64 + seg.vaddr + seg.filesz).div_ceil(page) * page;
+        let aligned = seg.vaddr % page == seg.offset % page;
+        if aligned && start >= mapped_end && seg.filesz != 0 {
+            let file: FileRef = Arc::new(Segment {
+                inode: inode.clone(),
+                path: at.absolute_path(),
+                limit: seg.offset + seg.filesz,
+            });
+            let data_end = data_end as usize;
+            let req = MmapRequest {
+                addr: start,
+                fixed: true,
+                file: Some((file, seg.offset / page * page)),
+                ..MmapRequest::anon(data_end - start, Prot::RW)
+            };
+            space.mmap(req)?;
+            if data_end < end {
+                let req = MmapRequest {
+                    addr: data_end,
+                    fixed: true,
+                    ..MmapRequest::anon(end - data_end, Prot::RW)
+                };
+                space.mmap(req)?;
+            }
+            mapped_end = end;
+            continue;
+        }
         // Two segments can share a page. The page is mapped one time.
         let map_start = start.max(mapped_end);
         if map_start < end {
@@ -302,9 +369,9 @@ fn build(
         }
         None => None,
     };
-    let main = load_elf(&space, at.inode(), header, Some(ET_DYN_BASE))?;
+    let main = load_elf(&space, &at, header, Some(ET_DYN_BASE))?;
     let interp = match interp {
-        Some((iat, ih)) => Some(load_elf(&space, iat.inode(), ih, None)?),
+        Some((iat, ih)) => Some(load_elf(&space, &iat, ih, None)?),
         None => None,
     };
     space.set_brk_start(main.end.div_ceil(PAGE_SIZE) * PAGE_SIZE);

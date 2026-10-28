@@ -12,7 +12,7 @@ use crate::vma::{
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
@@ -249,6 +249,8 @@ pub struct AddressSpace {
     /// The 2 MiB blocks of the private hugetlb areas that have a reservation and no page yet. A
     /// child of `fork` does not get them, as on Linux.
     huge_resv: SpinLock<BTreeSet<usize>>,
+    /// The largest number of pages with a frame before an unmap, as `hiwater_rss` of Linux.
+    hiwater: AtomicUsize,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -333,6 +335,7 @@ impl AddressSpace {
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
             huge_resv: SpinLock::new(BTreeSet::new()),
+            hiwater: AtomicUsize::new(0),
         }
     }
 
@@ -592,7 +595,7 @@ impl AddressSpace {
             if vma.hugetlb && !vma.shared {
                 self.unreserve_private(vma.start, vma.end);
             }
-            self.vm.unmap_range(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
+            self.unmap_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
             if vma.account {
                 uncharge_commit(vma.len());
             }
@@ -620,6 +623,16 @@ impl AddressSpace {
         for vma in st.vmas.iter().filter(|v| v.start < end && addr < v.end) {
             if invalidate && vma.locked {
                 return Err(Errno::EBUSY);
+            }
+            // The pages become read only again, so the next write marks them dirty, as
+            // `folio_mkclean` of Linux does before the write back. This address space is the
+            // only one that changes.
+            if matches!(&vma.backing, Backing::File { file, .. } if vma.shared && file.writes_back())
+            {
+                let from = VirtAddr::new(addr.max(vma.start));
+                for page in self.vm.mapped_pages(from, VirtAddr::new(end.min(vma.end))) {
+                    self.vm.protect(page, page_prot(vma, false));
+                }
             }
             write_back(vma, addr, end)?;
         }
@@ -797,6 +810,20 @@ impl AddressSpace {
     /// OOM killer can use it when the memory is short.
     pub fn page_count(&self) -> usize {
         self.vm.page_count()
+    }
+
+    /// The largest number of pages of the address space that had a frame, as `get_mm_hiwater_rss`
+    /// of Linux. The space keeps the count before each unmap of a range, so the pages of an area
+    /// that `munmap` or `madvise` removed count.
+    pub fn hiwater_pages(&self) -> usize {
+        self.hiwater.load(Ordering::Relaxed).max(self.page_count())
+    }
+
+    /// Removes the pages in `start..end` from the page table. The count of pages before the
+    /// removal goes into the high water mark.
+    fn unmap_pages(&self, start: VirtAddr, end: VirtAddr) {
+        self.hiwater.fetch_max(self.page_count(), Ordering::Relaxed);
+        self.vm.unmap_range(start, end);
     }
 
     /// The number of pages in `start..end` that have a frame.
@@ -1184,7 +1211,7 @@ impl AddressSpace {
             }
             let copy = self.take_huge(block, Some(&frames))?;
             drop(frames);
-            self.vm.unmap_range(at, VirtAddr::new(block + HPAGE_SIZE));
+            self.unmap_pages(at, VirtAddr::new(block + HPAGE_SIZE));
             self.vm.map_hugetlb(at, copy, page_prot(vma, true)).map_err(map_error)?;
             return Ok(true);
         }
@@ -1250,7 +1277,7 @@ impl AddressSpace {
         }
         let Some(copy) = hugetlb::copy_thp(&frames, self.memcg()) else { return false };
         drop(frames);
-        self.vm.unmap_range(at, VirtAddr::new(block + HUGE_PAGE_SIZE));
+        self.unmap_pages(at, VirtAddr::new(block + HUGE_PAGE_SIZE));
         self.vm.map_huge(at, copy, page_prot(vma, true)).is_ok()
     }
 
@@ -1324,7 +1351,7 @@ impl AddressSpace {
                 to &= !(HPAGE_SIZE - 1);
             }
             if from < to {
-                self.vm.unmap_range(VirtAddr::new(from), VirtAddr::new(to));
+                self.unmap_pages(VirtAddr::new(from), VirtAddr::new(to));
             }
         }
     }
@@ -1353,7 +1380,7 @@ impl AddressSpace {
             if lo < hi {
                 let start = vma.start + (lo - offset) as usize;
                 let stop = vma.start + (hi - offset) as usize;
-                self.vm.unmap_range(VirtAddr::new(start), VirtAddr::new(stop));
+                self.unmap_pages(VirtAddr::new(start), VirtAddr::new(stop));
             }
         }
     }
@@ -1460,7 +1487,7 @@ impl AddressSpace {
         if st.vmas.iter().any(|v| v.start < end && start < v.end && (v.locked || v.hugetlb)) {
             return Err(Errno::EINVAL);
         }
-        self.vm.unmap_range(VirtAddr::new(start), VirtAddr::new(end));
+        self.unmap_pages(VirtAddr::new(start), VirtAddr::new(end));
         st.guards.extend((start..end).step_by(PAGE_SIZE));
         Ok(())
     }

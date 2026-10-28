@@ -59,6 +59,10 @@ pub(crate) struct FilePages {
     pages: SpinLock<BTreeMap<u64, Arc<Frame>>>,
     /// The pages that a shared mapping changed. Lock it before `pages`.
     dirty: SpinLock<BTreeSet<u64>>,
+    /// The pages of `dirty` that a write back wrote, and that no write fault changed after it.
+    /// The pages stay in `dirty`, because a mapping in another address space can still write
+    /// them without a fault. `/proc/kpageflags` shows these pages as clean.
+    clean: SpinLock<BTreeSet<u64>>,
 }
 
 impl MmFile for FilePages {
@@ -88,6 +92,7 @@ impl MmFile for FilePages {
 
     fn dirty(&self, index: u64) {
         self.dirty.lock().insert(index);
+        self.clean.lock().remove(&index);
     }
 
     fn cached(&self, index: u64) -> bool {
@@ -116,6 +121,7 @@ impl MmFile for FilePages {
                 }
                 done += n;
             }
+            self.clean.lock().insert(index);
         }
         Ok(())
     }
@@ -183,6 +189,12 @@ impl rk_vfs::mapped::Mapped for FilePages {
         }
         self.write_back(first, end.div_ceil(PAGE_SIZE as u64))
     }
+
+    fn frame_dirty(&self, phys: u64) -> Option<bool> {
+        let index = *self.pages.lock().iter().find(|(_, f)| f.addr().get() == phys)?.0;
+        let dirty = self.dirty.lock().contains(&index);
+        Some(dirty && !self.clean.lock().contains(&index))
+    }
 }
 
 /// The page cache of the files that a process mapped, so that two mappings of one file share
@@ -199,7 +211,8 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
         .or_insert_with(|| {
             let pages = SpinLock::new(BTreeMap::new());
             let dirty = SpinLock::new(BTreeSet::new());
-            let pages = Arc::new(FilePages { inode: inode.clone(), path, pages, dirty });
+            let clean = SpinLock::new(BTreeSet::new());
+            let pages = Arc::new(FilePages { inode: inode.clone(), path, pages, dirty, clean });
             let mapped: Arc<dyn rk_vfs::mapped::Mapped> = pages.clone();
             rk_vfs::mapped::register(inode, Arc::downgrade(&mapped));
             pages
