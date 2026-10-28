@@ -420,8 +420,14 @@ fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
     }
     if let Some((d, r, len)) = platform.gic_v3 {
         match (map(d, 0x1_0000), map(r, len), usize::try_from(len)) {
-            (Some(d), Some(r), Ok(len)) => super::gic::set_base_v3(d, r, len),
+            (Some(d), Some(rv), Ok(n)) => super::gic::set_base_v3(d, rv, n, r),
             _ => crate::println!("aarch64: cannot use the GICv3"),
+        }
+        // The ITS has two frames of 64 KiB: the controls, and the translation register.
+        if let Some(its) = platform.gic_its
+            && let Some(virt) = map(its, 0x2_0000)
+        {
+            super::its::set_base(virt, its);
         }
     } else if let Some((d, c)) = platform.gic
         && let (Some(d), Some(c)) = (map(d, 0x1000), map(c, 0x2000))

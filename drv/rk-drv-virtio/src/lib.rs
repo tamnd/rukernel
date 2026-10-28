@@ -105,7 +105,8 @@ impl Probe {
                 continue;
             }
             if let Some(t) = pci::PciTransport::new(dev) {
-                let place = format_args!("PCI {:?}", dev.address());
+                let kind = t.irq_kind();
+                let place = format_args!("PCI {:?} with {kind}", dev.address());
                 self.add(id, transport::Transport::Pci(t), this, place);
             }
         }

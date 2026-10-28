@@ -53,6 +53,20 @@ pub(crate) fn alloc_table_frame() -> Option<u64> {
     Some(phys)
 }
 
+/// Takes `1 << order` frames in a row, aligned to their size, fills them with zeros and gives the
+/// physical address of the first. The tables of a device that reads memory, as the tables of the
+/// GICv3 ITS, use this function. They are never given back.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn alloc_table_run(order: u32) -> Option<u64> {
+    let first = FRAMES.lock().alloc_run(order)?;
+    let phys = (first * PAGE_SIZE) as u64;
+    let virt = paging::phys_to_virt(phys) as *mut u8;
+    // SAFETY: the allocator gave these frames to no other owner, and the direct map maps them
+    // writable.
+    unsafe { core::ptr::write_bytes(virt, 0, PAGE_SIZE << order) };
+    Some(phys)
+}
+
 /// Takes one frame and gives its physical address. The heap uses this function. It owns the
 /// frame until it gives it back with `free_frame_phys`.
 pub(crate) fn alloc_frame_phys() -> Option<u64> {

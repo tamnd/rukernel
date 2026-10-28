@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Makes the LTP result tables from the logs of the runs of run.py.
 
-Usage: tools/ltp/report.py --logs DIR --src DIR [--notbuilt FILE] [--out DIR]
+Usage: tools/ltp/report.py --logs DIR --src DIR [--notbuilt FILE] [--out DIR] [--arch ARCH]
 
 DIR of --logs has one directory for each batch of run.py, with the name RUNTEST-NNN. Each batch
 directory has the file `log`, the serial output of the virtual machine, and the file `tests`, the
@@ -24,6 +24,9 @@ when a path of linux.txt is not in it.
 The script writes syscalls.md, mm.md, sched.md, net.md and pty.md in the directory of --out, by
 default the directory of the script. It also writes the status and the work that remains in
 README.md of that directory, between the lines `<!-- report: begin -->` and `<!-- report: end -->`.
+
+--arch aarch64 is for the logs of `run.py --arch aarch64`. The script then writes GROUP-aarch64.md
+for each group with results, as syscalls-aarch64.md, and does not change README.md.
 """
 
 import argparse
@@ -443,7 +446,7 @@ def result_text(row):
     return row["status"]
 
 
-def write_table(path, group, rows, tag, linux):
+def write_table(path, group, rows, tag, linux, arch="x86_64"):
     count = {s: 0 for s in ORDER}
     for r in rows:
         count[r["status"]] += 1
@@ -458,7 +461,8 @@ def write_table(path, group, rows, tag, linux):
         )
     parts = [f"{count[s]} {s}" for s in ORDER if count[s]]
     with open(path, "w") as f:
-        f.write(f"# {TITLES[group]}\n\n")
+        on = " on arm64" if arch == "aarch64" else ""
+        f.write(f"# {TITLES[group]}{on}\n\n")
         f.write("report.py makes this file from the logs of the runs. Do not change it by hand.\n\n")
         if net:
             f.write(
@@ -467,8 +471,8 @@ def write_table(path, group, rows, tag, linux):
             )
         else:
             f.write(
-                f"These are the results of the tests of runtest/{group} of LTP {tag} on rukernel. "
-                "The README in this directory tells how the tests run.\n\n"
+                f"These are the results of the tests of runtest/{group} of LTP {tag} on rukernel"
+                f"{on}. The README in this directory tells how the tests run.\n\n"
             )
         f.write(
             f"The Linux code column links to the code of Linux {linux} that the test checks. The "
@@ -651,6 +655,8 @@ def main():
     p.add_argument("--src", required=True, help="the testcases directory of the LTP source")
     p.add_argument("--notbuilt")
     p.add_argument("--out", default=HERE)
+    p.add_argument("--arch", choices=["x86_64", "aarch64"], default="x86_64",
+                   help="the architecture of the runs of run.py")
     a = p.parse_args()
 
     results, tests = read_logs(a.logs)
@@ -664,12 +670,18 @@ def main():
     # The order of the tests in a table is the order of the runtest files.
     keys = list(dict.fromkeys(list(tests) + list(results) + sorted(notbuilt)))
     out = []
+    suffix = "-aarch64" if a.arch == "aarch64" else ""
     for group in GROUPS:
+        # The arm64 runs are for some groups only, so a group without results has no file.
+        if a.arch == "aarch64" and not any(group_of(k[0]) == group for k in results):
+            continue
         gkeys = [k for k in keys if group_of(k[0]) == group]
         rows = rows_of(gkeys, results, tests, notbuilt, notes, a.src, index, code)
-        write_table(os.path.join(a.out, f"{group}.md"), group, rows, tag, linux)
+        write_table(os.path.join(a.out, f"{group}{suffix}.md"), group, rows, tag, linux, a.arch)
         out.append((group, rows))
         print(f"{group}: {len(rows)} tests", file=sys.stderr)
+    if a.arch == "aarch64":
+        return
     newest = max([v[0] for v in results.values()] + [0])
     write_readme(os.path.join(a.out, "README.md"), out, newest, tag, linux)
 

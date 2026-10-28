@@ -72,11 +72,13 @@ impl<const WORDS: usize> FrameBitmap<WORDS> {
     }
 
     /// Takes `1 << order` free frames in a row, where the first frame number is a multiple of
-    /// `1 << order` and `order` is 6 or more. The search starts at the top, so that the frames
-    /// that `alloc` takes from the bottom do not break the runs. Gives the first frame.
+    /// `1 << order`. The search starts at the top, so that the frames that `alloc` takes from the
+    /// bottom do not break the runs. Gives the first frame.
     pub(crate) fn alloc_run(&mut self, order: u32) -> Option<usize> {
+        if order < 6 {
+            return self.alloc_short_run(order);
+        }
         let words = (1usize << order) / 64;
-        assert!(words > 0, "a run of order {order} is shorter than a word");
         let run = (0..WORDS / words)
             .rev()
             .find(|&r| self.bits[r * words..(r + 1) * words].iter().all(|&w| w == u64::MAX))?;
@@ -101,6 +103,24 @@ impl<const WORDS: usize> FrameBitmap<WORDS> {
                 self.bits[w] &= !(mask << shift);
                 self.free -= n;
                 return Some(w * 64 + shift);
+            }
+        }
+        None
+    }
+
+    /// `alloc_run` for a run in one word.
+    fn alloc_short_run(&mut self, order: u32) -> Option<usize> {
+        let len = 1usize << order;
+        let mask = if len == 64 { u64::MAX } else { (1u64 << len) - 1 };
+        for w in (0..WORDS).rev() {
+            let word = self.bits[w];
+            if word == 0 {
+                continue;
+            }
+            if let Some(at) = (0..64).step_by(len).rev().find(|&at| word >> at & mask == mask) {
+                self.bits[w] &= !(mask << at);
+                self.free -= len;
+                return Some(w * 64 + at);
             }
         }
         None
@@ -224,6 +244,18 @@ mod tests {
             bm.free(f);
         }
         assert_eq!(bm.alloc_small_run(2), Some(4));
+    }
+
+    #[test]
+    fn alloc_run_takes_a_short_aligned_run() {
+        let mut bm = FrameBitmap::<2>::new();
+        bm.add_free(3, 40);
+        // The highest aligned run of 16 free frames is at 16, and the next is lower.
+        assert_eq!(bm.alloc_run(4), Some(16));
+        assert_eq!(bm.alloc_run(4), None);
+        assert_eq!(bm.alloc_run(2), Some(36));
+        assert_eq!(bm.alloc_run(0), Some(35));
+        assert_eq!(bm.free_count(), 37 - 16 - 4 - 1);
     }
 
     #[test]
