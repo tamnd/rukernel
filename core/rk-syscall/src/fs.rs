@@ -469,12 +469,16 @@ fn check_rw_flags(file: &File, flags: u64, write: bool) -> Result<(), Errno> {
 
 /// Tells if `file` takes `RWF_NOWAIT`, as the `FMODE_NOWAIT` of Linux. `shmem_file_open` of Linux
 /// does not set it, so a regular file of tmpfs does not take it. The test preadv203 of LTP then
-/// skips tmpfs, before it writes 124 MB into a tmpfs of 32 MB.
+/// skips tmpfs, before it writes 124 MB into a tmpfs of 32 MB. The ext2 driver of Linux
+/// (fs/ext2/file.c) does not set it either, so a regular file of a mount of type ext2 does not
+/// take it. ext3 and ext4 use the ext4 driver of Linux, which sets it.
 fn takes_nowait(file: &File) -> bool {
-    file.inode().is_none_or(|inode| {
-        fs_magic(Some(inode)) != TMPFS_MAGIC as u64
-            || inode.metadata().file_type() != Some(rk_vfs::FileType::Regular)
-    })
+    let Some(inode) = file.inode() else { return true };
+    if inode.metadata().file_type() != Some(rk_vfs::FileType::Regular) {
+        return true;
+    }
+    fs_magic(Some(inode)) != TMPFS_MAGIC as u64
+        && file.location().is_none_or(|at| at.mount.source().fstype != "ext2")
 }
 
 pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {

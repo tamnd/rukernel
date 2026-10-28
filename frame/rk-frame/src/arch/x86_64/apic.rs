@@ -86,13 +86,21 @@ fn rdtsc() -> u64 {
 
 /// The nanoseconds since the calibration of the timer, from the time stamp counter. Before the
 /// calibration it gives the time of the tick count.
+///
+/// The kernel reads this clock a few times in each system call and each task switch, so it
+/// multiplies by `TSC_MULT` and shifts, as `cycles_2_ns` of Linux. A division of 128 bits is a
+/// slow function call, more so under QEMU without KVM.
 pub(crate) fn nanos() -> u64 {
-    let hz = TSC_HZ.load(Ordering::Relaxed);
-    if hz == 0 {
+    let mult = TSC_MULT.load(Ordering::Relaxed);
+    if mult == 0 {
         return TICKS.load(Ordering::Relaxed) * (1_000_000_000 / HZ);
     }
-    let delta = rdtsc().saturating_sub(TSC_BASE.load(Ordering::Relaxed));
-    (u128::from(delta) * 1_000_000_000 / u128::from(hz)) as u64
+    cycles_to_ns(rdtsc().saturating_sub(TSC_BASE.load(Ordering::Relaxed)), mult)
+}
+
+/// The nanoseconds of `cycles` of the time stamp counter, with `mult` as in `TSC_MULT`.
+fn cycles_to_ns(cycles: u64, mult: u64) -> u64 {
+    ((u128::from(cycles) * u128::from(mult)) >> 32) as u64
 }
 
 /// The nanoseconds of the clock since boot. The value is the time of the tick count, plus the time

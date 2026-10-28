@@ -48,8 +48,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # The time limits in seconds of the tests that run longer than --timeout by design, when it is
 # smaller. setsockopt11 repeats its check for up to 300 s (.runtime = 300), and a busy host does
-# not complete the 64 rounds in that time.
-LIMITS = {"setsockopt11": 420}
+# not complete the 64 rounds in that time. starvation sends 1 million signals. Its runtime is the
+# time of a busy loop of 120 million rounds in microseconds divided by 1000. Under QEMU without KVM
+# that is 650 s to 1150 s, as the load of the host changes, and the test can use all of it.
+LIMITS = {"setsockopt11": 420, "starvation": 1800}
 
 # The script that runs as init. It reads the tests from /tests, one test on each line: the tag,
 # the time limit of the test in seconds and the command, with a tab between them.

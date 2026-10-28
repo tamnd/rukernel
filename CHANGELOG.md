@@ -27,6 +27,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The page cache of a mapped file keeps the clean or dirty state of each page, and /proc/kpageflags and `msync` use it in place of the sets of dirty and clean pages of the file (#421). A write back makes the pages clean when no shared mapping can write the file.
 - tools/ltp/run.py records the LTP tree of an image in `IMAGE.tree`, and stops when `--image` and `--ltp` do not agree (#421). It does not make a shared image again from another tree.
 - A read of the master of a pseudo terminal before the first open of the slave gives `EIO`, as Linux (#413). It waited before.
+- A regular file on a mount of type ext2 does not take `RWF_NOWAIT`, and `preadv2` and `pwritev2` with it give `EOPNOTSUPP`, as Linux, where fs/ext2/file.c does not set `FMODE_NOWAIT` (#417). LTP preadv203 and preadv203_64 then give TCONF on ext2, as on Linux.
+- The task switch and the system call are faster. The walk of the pressure counts up the cgroup tree does not allocate, and the x86_64 clock multiplies and shifts instead of a division of 128 bits (#417).
+- The LTP runner gives starvation 1800 s, because the test can run for 650 s to 1150 s under QEMU without KVM by design (#417).
 
 ## [0.4.8] - 2026-10-28
 
