@@ -320,6 +320,22 @@ fn send_sigio(file: &rk_vfs::file::File, fd: i32) {
     }
 }
 
+/// The network namespace of the process `pid`, for `IFLA_NET_NS_PID`.
+fn net_ns_of_pid(pid: i32) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
+    let pid = u32::try_from(pid).map_err(|_| Errno::ESRCH)?;
+    Ok(rk_proc::find_process(pid).ok_or(Errno::ESRCH)?.net_ns())
+}
+
+/// The network namespace of the file `fd` of the current process, for `IFLA_NET_NS_FD`.
+fn net_ns_of_fd(fd: i32) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
+    let files = rk_proc::current_thread().and_then(|t| t.process().files()).ok_or(Errno::EBADF)?;
+    let file = files.lock().file(fd)?;
+    match file.inode().and_then(rk_vfs::nsfs::ns_of) {
+        Some((rk_vfs::nsfs::NsKind::Net, id)) => rk_net::ns::by_id(id).ok_or(Errno::EINVAL),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 /// Connects the system calls to the other parts of the kernel: the clock of the VFS time stamps,
 /// the credentials of the VFS checks and the signals of the console. The boot code calls this one time, before `spawn_init`.
 pub fn init() {
@@ -332,6 +348,8 @@ pub fn init() {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });
     rk_net::set_cred_source(crate::net::current_cred);
+    rk_net::ns::set_source(|| rk_proc::current_thread().and_then(|t| t.process().net_ns_opt()));
+    rk_net::ns::set_resolver(rk_net::ns::Resolver { by_pid: net_ns_of_pid, by_fd: net_ns_of_fd });
     rk_net_unix::init();
     rk_vfs::wait::set_interrupt_check(|| {
         rk_proc::current_thread().is_some_and(|t| t.signal_pending())

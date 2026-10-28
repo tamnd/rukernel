@@ -20,8 +20,9 @@ use crate::ipv6::{
 use crate::route::INFINITY;
 use crate::route6::{Next6, PRIO_ADDRCONF, Route6, Table6};
 use crate::socket::Info6;
-use crate::stack::{self, PING_PORTS, UDP_PORTS, count, now_ms};
+use crate::stack::{self, PING_PORTS, UDP_PORTS, count, icmp_types, now_ms};
 use crate::{addrconf, checksum, neigh};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -39,17 +40,20 @@ use rk_net::buf::{HEADROOM, NetBuf};
 use rk_net::consts::AF_INET6;
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::ether::{EthHeader, MacAddr};
+use rk_net::ns::PerNet;
 use rk_vfs::inode::Result;
 
 /// The IPv6 addresses and routes.
-pub(crate) static ROUTES6: SpinLock<Table6> = SpinLock::new(Table6::new());
+pub(crate) static ROUTES6: PerNet<SpinLock<Table6>> = PerNet::new(|| SpinLock::new(Table6::new()));
 /// The neighbour table of IPv6. A packet that waits has its IPv6 header and no link header.
-static NEIGH6: SpinLock<neigh::Table<NetBuf, Ip>> = SpinLock::new(neigh::Table::new());
+static NEIGH6: PerNet<SpinLock<neigh::Table<NetBuf, Ip>>> =
+    PerNet::new(|| SpinLock::new(neigh::Table::new()));
 /// The devices that send router solicitations: the count that went out and the time of the
 /// next one in milliseconds.
-static SOLICIT: SpinLock<BTreeMap<u32, (u32, u64)>> = SpinLock::new(BTreeMap::new());
+static SOLICIT: PerNet<SpinLock<BTreeMap<u32, (u32, u64)>>> =
+    PerNet::new(|| SpinLock::new(BTreeMap::new()));
 /// The time of the next check of the lifetimes of the addresses and routes.
-static NEXT_EXPIRE: AtomicU64 = AtomicU64::new(0);
+static NEXT_EXPIRE: PerNet<AtomicU64> = PerNet::new(|| AtomicU64::new(0));
 
 /// The count of router solicitations, `rtr_solicits` of Linux.
 const RTR_SOLICITS: u32 = 3;
@@ -110,9 +114,9 @@ pub(crate) struct Counters6 {
     /// The ICMPv6 messages that could not go out.
     pub icmp_out_errors: AtomicU64,
     /// The received ICMPv6 messages by type.
-    pub icmp_in_type: [AtomicU64; 256],
+    pub icmp_in_type: Box<[AtomicU64]>,
     /// The sent ICMPv6 messages by type.
-    pub icmp_out_type: [AtomicU64; 256],
+    pub icmp_out_type: Box<[AtomicU64]>,
     /// The datagrams that a UDP socket took.
     pub udp_in: AtomicU64,
     /// The datagrams to a port without a socket.
@@ -127,38 +131,81 @@ pub(crate) struct Counters6 {
     pub udp_out: AtomicU64,
 }
 
+impl rk_net::ns::Clear for Counters6 {
+    fn clear(&self, _fresh: Self) {
+        self.in_receives.store(0, Ordering::Relaxed);
+        self.in_hdr_errors.store(0, Ordering::Relaxed);
+        self.in_addr_errors.store(0, Ordering::Relaxed);
+        self.in_unknown_protos.store(0, Ordering::Relaxed);
+        self.in_truncated.store(0, Ordering::Relaxed);
+        self.in_delivers.store(0, Ordering::Relaxed);
+        self.out_requests.store(0, Ordering::Relaxed);
+        self.out_no_routes.store(0, Ordering::Relaxed);
+        self.reasm_fails.store(0, Ordering::Relaxed);
+        self.in_mcast.store(0, Ordering::Relaxed);
+        self.out_mcast.store(0, Ordering::Relaxed);
+        self.in_octets.store(0, Ordering::Relaxed);
+        self.out_octets.store(0, Ordering::Relaxed);
+        self.in_mcast_octets.store(0, Ordering::Relaxed);
+        self.out_mcast_octets.store(0, Ordering::Relaxed);
+        self.out_transmits.store(0, Ordering::Relaxed);
+        self.icmp_in.store(0, Ordering::Relaxed);
+        self.icmp_in_errors.store(0, Ordering::Relaxed);
+        self.icmp_in_csum_errors.store(0, Ordering::Relaxed);
+        self.icmp_out.store(0, Ordering::Relaxed);
+        self.icmp_out_errors.store(0, Ordering::Relaxed);
+        for c in self.icmp_in_type.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in self.icmp_out_type.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        self.udp_in.store(0, Ordering::Relaxed);
+        self.udp_no_ports.store(0, Ordering::Relaxed);
+        self.udp_in_errors.store(0, Ordering::Relaxed);
+        self.udp_rcvbuf_errors.store(0, Ordering::Relaxed);
+        self.udp_in_csum_errors.store(0, Ordering::Relaxed);
+        self.udp_out.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The counters of IPv6.
-pub(crate) static COUNTERS6: Counters6 = Counters6 {
-    in_receives: AtomicU64::new(0),
-    in_hdr_errors: AtomicU64::new(0),
-    in_addr_errors: AtomicU64::new(0),
-    in_unknown_protos: AtomicU64::new(0),
-    in_truncated: AtomicU64::new(0),
-    in_delivers: AtomicU64::new(0),
-    out_requests: AtomicU64::new(0),
-    out_no_routes: AtomicU64::new(0),
-    reasm_fails: AtomicU64::new(0),
-    in_mcast: AtomicU64::new(0),
-    out_mcast: AtomicU64::new(0),
-    in_octets: AtomicU64::new(0),
-    out_octets: AtomicU64::new(0),
-    in_mcast_octets: AtomicU64::new(0),
-    out_mcast_octets: AtomicU64::new(0),
-    out_transmits: AtomicU64::new(0),
-    icmp_in: AtomicU64::new(0),
-    icmp_in_errors: AtomicU64::new(0),
-    icmp_in_csum_errors: AtomicU64::new(0),
-    icmp_out: AtomicU64::new(0),
-    icmp_out_errors: AtomicU64::new(0),
-    icmp_in_type: [const { AtomicU64::new(0) }; 256],
-    icmp_out_type: [const { AtomicU64::new(0) }; 256],
-    udp_in: AtomicU64::new(0),
-    udp_no_ports: AtomicU64::new(0),
-    udp_in_errors: AtomicU64::new(0),
-    udp_rcvbuf_errors: AtomicU64::new(0),
-    udp_in_csum_errors: AtomicU64::new(0),
-    udp_out: AtomicU64::new(0),
-};
+pub(crate) static COUNTERS6: PerNet<Counters6> = PerNet::new(new_counters6);
+
+/// The counters of a new namespace.
+fn new_counters6() -> Counters6 {
+    Counters6 {
+        in_receives: AtomicU64::new(0),
+        in_hdr_errors: AtomicU64::new(0),
+        in_addr_errors: AtomicU64::new(0),
+        in_unknown_protos: AtomicU64::new(0),
+        in_truncated: AtomicU64::new(0),
+        in_delivers: AtomicU64::new(0),
+        out_requests: AtomicU64::new(0),
+        out_no_routes: AtomicU64::new(0),
+        reasm_fails: AtomicU64::new(0),
+        in_mcast: AtomicU64::new(0),
+        out_mcast: AtomicU64::new(0),
+        in_octets: AtomicU64::new(0),
+        out_octets: AtomicU64::new(0),
+        in_mcast_octets: AtomicU64::new(0),
+        out_mcast_octets: AtomicU64::new(0),
+        out_transmits: AtomicU64::new(0),
+        icmp_in: AtomicU64::new(0),
+        icmp_in_errors: AtomicU64::new(0),
+        icmp_in_csum_errors: AtomicU64::new(0),
+        icmp_out: AtomicU64::new(0),
+        icmp_out_errors: AtomicU64::new(0),
+        icmp_in_type: icmp_types(),
+        icmp_out_type: icmp_types(),
+        udp_in: AtomicU64::new(0),
+        udp_no_ports: AtomicU64::new(0),
+        udp_in_errors: AtomicU64::new(0),
+        udp_rcvbuf_errors: AtomicU64::new(0),
+        udp_in_csum_errors: AtomicU64::new(0),
+        udp_out: AtomicU64::new(0),
+    }
+}
 
 fn add(c: &AtomicU64, n: usize) {
     c.fetch_add(n as u64, Ordering::Relaxed);
@@ -766,4 +813,13 @@ pub(crate) fn tick() {
         NEXT_EXPIRE.store(now + 1000, Ordering::Relaxed);
         addrconf::expire(now);
     }
+}
+
+/// Clears the tables of IPv6 of a namespace that stops.
+pub(crate) fn ns_exit() {
+    ROUTES6.reset();
+    NEIGH6.reset();
+    SOLICIT.reset();
+    NEXT_EXPIRE.reset();
+    COUNTERS6.reset();
 }

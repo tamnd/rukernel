@@ -394,7 +394,21 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
                 notify_addr(a, RTM_NEWADDR, Origin::KERNEL);
             }
         }
-        Event::Flags(_) | Event::Mtu => {}
+        Event::Unregister => {
+            // The device goes away, so its addresses and routes go too, as
+            // `inetdev_destroy` and `fib_disable_ip` of Linux.
+            let gone: Vec<IfAddr> = {
+                let mut t = ROUTES.lock();
+                let gone = t.addrs_of(ifindex).cloned().collect();
+                t.remove_iface(ifindex);
+                gone
+            };
+            for a in gone.iter().rev() {
+                notify_addr(a, RTM_DELADDR, Origin::KERNEL);
+            }
+            stack::flush_neigh(ifindex);
+        }
+        Event::Flags(_) | Event::Mtu | Event::Register => {}
     }
 }
 

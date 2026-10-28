@@ -413,6 +413,7 @@ const BOOT_TESTS: &[&str] = &[
     "inet",
     "netcfg",
     "inet6",
+    "netns",
     "busybox",
     "ltp",
     "kselftest",
@@ -1580,7 +1581,7 @@ fn qemu(args: &[String]) -> Result {
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
         "init" | "tty" | "smp" | "blk" | "inet" => kernel.with_file_name("user-init").exists(),
-        "busybox" | "netcfg" | "inet6" => kernel.with_file_name("busybox-ready").exists(),
+        "busybox" | "netcfg" | "inet6" | "netns" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" | "gvisor" | "fstests" => {
             kernel.with_file_name(format!("initramfs-{test}.cpio")).exists()
@@ -1669,7 +1670,7 @@ fn test_cmdline(test: &str) -> String {
         "inet" => {
             String::from("console=ttyS0 rk.test=init ip=10.0.2.15::10.0.2.2:255.255.255.0 -- inet")
         }
-        "busybox" | "netcfg" | "inet6" => {
+        "busybox" | "netcfg" | "inet6" | "netns" => {
             String::from("console=ttyS0 rk.test=init rdinit=/bin/sh -- -i")
         }
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
@@ -1692,6 +1693,7 @@ fn pass_line(test: &str) -> String {
             | "inet"
             | "netcfg"
             | "inet6"
+            | "netns"
             | "busybox"
             | "ltp"
             | "kselftest"
@@ -1782,6 +1784,40 @@ const INET6_SCRIPT3: &[u8] = b"{ busybox tcpsvd :: 5557 echo v6ok </dev/null & }
 && grep -q ': 0*:15B6 0*:0000 07 ' /proc/net/udp6 \
 && busybox nc -w 3 ::1 5557 </dev/null | grep -q v6ok && exit 0; exit 1\n";
 
+/// The commands of the `netns` test. The shell starts two processes, each in a new network
+/// namespace, and checks their files in /proc/PID/ns. It makes a veth pair and moves one end into
+/// each namespace. Then the network of one namespace must not show in the other.
+const NETNS_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc && ip link set lo up \
+&& { busybox unshare -n sleep 1000 & } && A=$! && { busybox unshare -n sleep 1000 & } && B=$! \
+&& sleep 1 && N='busybox nsenter -n -t' && busybox readlink /proc/$A/ns/net \
+&& busybox readlink /proc/$A/ns/net | grep -q '^net:\\[[0-9]*\\]$' \
+&& test \"$(busybox readlink /proc/$A/ns/net)\" != \"$(busybox readlink /proc/self/ns/net)\" \
+&& test \"$(busybox readlink /proc/$A/ns/net)\" != \"$(busybox readlink /proc/$B/ns/net)\" \
+&& ip link add va type veth && ip link && ip link show veth0 \
+&& ip link set va netns $A && ip link set veth0 netns $B && ip link && ! ip link | grep -q veth \
+&& $N $A ip link && $N $A ip link show va && ! $N $A ip link show veth0 \
+&& $N $B ip link show veth0 && ! $N $B ip link show va \
+&& echo 'netns: first'' part' || exit 1\n";
+
+/// The second line of the `netns` test. It gives addresses to the two ends and pings across the
+/// pair with IPv4 and IPv6. The first namespace cannot reach the addresses.
+const NETNS_SCRIPT2: &[u8] = b"$N $A ip link set lo up && $N $A ip link set va up \
+&& $N $B ip link set lo up && $N $B ip link set veth0 up \
+&& $N $A ip addr add 10.9.0.1/24 dev va && $N $B ip addr add 10.9.0.2/24 dev veth0 \
+&& $N $A ip -6 addr add fd00::1/64 dev va && $N $B ip -6 addr add fd00::2/64 dev veth0 \
+&& $N $A ip addr && $N $A ip route && $N $B ip -6 route \
+&& $N $A ping -c 1 10.9.0.2 && $N $B ping -c 1 10.9.0.1 \
+&& $N $A busybox ping6 -c 1 fd00::2 && $N $B busybox ping6 -c 1 fd00::1 \
+&& $N $A ip neigh && $N $A cat /proc/net/dev /proc/net/route /proc/net/snmp \
+&& $N $A grep -q '^Icmp: [1-9]' /proc/net/snmp && ! grep -q va /proc/net/dev \
+&& ! ip route | grep -q 10.9.0 && ! ping -c 1 -W 1 10.9.0.2 \
+&& echo 'netns: second'' part' || exit 1\n";
+
+/// The third line of the `netns` test. When the two processes end, the namespaces go, and the
+/// veth pair goes with them.
+const NETNS_SCRIPT3: &[u8] = b"kill $A $B; wait; sleep 1; ip link \
+&& ! ip link | grep -q veth && test \"$(ip link | grep -c mtu)\" = 1 && exit 0; exit 1\n";
+
 /// The input of a boot test. When the log has the text of an entry, the test writes the bytes of
 /// the entry to the serial port. The `tty` test types a line and then `^C`.
 fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
@@ -1797,6 +1833,11 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("TICK", b"test $? = 130; exit $?\n"),
         ],
         "netcfg" => &[("/ # ", NETCFG_SCRIPT), ("netcfg: first part", NETCFG_SCRIPT2)],
+        "netns" => &[
+            ("/ # ", NETNS_SCRIPT),
+            ("netns: first part", NETNS_SCRIPT2),
+            ("netns: second part", NETNS_SCRIPT3),
+        ],
         "inet6" => &[
             ("/ # ", INET6_SCRIPT),
             ("inet6: first part", INET6_SCRIPT2),

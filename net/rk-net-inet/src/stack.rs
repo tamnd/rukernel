@@ -12,6 +12,7 @@ use crate::ipv4::{
 use crate::ports::{self, Ports};
 use crate::socket::{Dgram, Proto};
 use crate::{checksum, neigh, route};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -29,18 +30,24 @@ use rk_net::consts::{
 };
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::ether::{EthHeader, MacAddr};
+use rk_net::ns::PerNet;
 use rk_vfs::inode::Result;
 
 /// The addresses and the routes.
-pub(crate) static ROUTES: SpinLock<route::Table> = SpinLock::new(route::Table::new());
+pub(crate) static ROUTES: PerNet<SpinLock<route::Table>> =
+    PerNet::new(|| SpinLock::new(route::Table::new()));
 /// The neighbour table. A packet that waits has its IPv4 header and no link header.
-static NEIGH: SpinLock<neigh::Table<NetBuf>> = SpinLock::new(neigh::Table::new());
+static NEIGH: PerNet<SpinLock<neigh::Table<NetBuf>>> =
+    PerNet::new(|| SpinLock::new(neigh::Table::new()));
 /// The ports of the UDP sockets.
-pub(crate) static UDP_PORTS: SpinLock<Ports> = SpinLock::new(Ports::new(ports::EPHEMERAL));
+pub(crate) static UDP_PORTS: PerNet<SpinLock<Ports>> =
+    PerNet::new(|| SpinLock::new(Ports::new(ports::EPHEMERAL)));
 /// The identifiers of the ICMP echo sockets, as `ping_table` of Linux.
-pub(crate) static PING_PORTS: SpinLock<Ports> = SpinLock::new(Ports::new(1..=u16::MAX));
+pub(crate) static PING_PORTS: PerNet<SpinLock<Ports>> =
+    PerNet::new(|| SpinLock::new(Ports::new(1..=u16::MAX)));
 /// The open sockets, by their ID.
-static SOCKETS: SpinLock<BTreeMap<u64, Weak<Dgram>>> = SpinLock::new(BTreeMap::new());
+static SOCKETS: PerNet<SpinLock<BTreeMap<u64, Weak<Dgram>>>> =
+    PerNet::new(|| SpinLock::new(BTreeMap::new()));
 /// The identification of the next packet.
 static IP_ID: AtomicU16 = AtomicU16::new(1);
 
@@ -81,9 +88,9 @@ pub struct Counters {
     /// The ICMP messages that the stack sent.
     pub icmp_out: AtomicU64,
     /// The received ICMP messages by type, as `icmpmsg_statistics` of Linux.
-    pub icmp_in_type: [AtomicU64; 256],
+    pub icmp_in_type: Box<[AtomicU64]>,
     /// The sent ICMP messages by type.
-    pub icmp_out_type: [AtomicU64; 256],
+    pub icmp_out_type: Box<[AtomicU64]>,
     /// The connections that went to SYN-SENT.
     pub tcp_active_opens: AtomicU64,
     /// The connections that went from SYN-RECEIVED to an open state.
@@ -106,38 +113,87 @@ pub struct Counters {
     pub tcp_out_rsts: AtomicU64,
 }
 
+impl rk_net::ns::Clear for Counters {
+    fn clear(&self, _fresh: Self) {
+        self.ip_in.store(0, Ordering::Relaxed);
+        self.ip_in_hdr_errors.store(0, Ordering::Relaxed);
+        self.ip_reasm_fails.store(0, Ordering::Relaxed);
+        self.ip_in_addr_errors.store(0, Ordering::Relaxed);
+        self.ip_in_delivers.store(0, Ordering::Relaxed);
+        self.ip_in_unknown_protos.store(0, Ordering::Relaxed);
+        self.ip_out.store(0, Ordering::Relaxed);
+        self.udp_in.store(0, Ordering::Relaxed);
+        self.udp_no_ports.store(0, Ordering::Relaxed);
+        self.udp_in_errors.store(0, Ordering::Relaxed);
+        self.udp_rcvbuf_errors.store(0, Ordering::Relaxed);
+        self.udp_in_csum_errors.store(0, Ordering::Relaxed);
+        self.udp_out.store(0, Ordering::Relaxed);
+        self.icmp_in.store(0, Ordering::Relaxed);
+        self.icmp_in_errors.store(0, Ordering::Relaxed);
+        self.icmp_in_csum_errors.store(0, Ordering::Relaxed);
+        self.icmp_out.store(0, Ordering::Relaxed);
+        for c in self.icmp_in_type.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for c in self.icmp_out_type.iter() {
+            c.store(0, Ordering::Relaxed);
+        }
+        self.tcp_active_opens.store(0, Ordering::Relaxed);
+        self.tcp_passive_opens.store(0, Ordering::Relaxed);
+        self.tcp_attempt_fails.store(0, Ordering::Relaxed);
+        self.tcp_estab_resets.store(0, Ordering::Relaxed);
+        self.tcp_in_segs.store(0, Ordering::Relaxed);
+        self.tcp_out_segs.store(0, Ordering::Relaxed);
+        self.tcp_retrans_segs.store(0, Ordering::Relaxed);
+        self.tcp_in_errs.store(0, Ordering::Relaxed);
+        self.tcp_in_csum_errors.store(0, Ordering::Relaxed);
+        self.tcp_out_rsts.store(0, Ordering::Relaxed);
+    }
+}
+
 /// The counters.
-pub static COUNTERS: Counters = Counters {
-    ip_in: AtomicU64::new(0),
-    ip_in_hdr_errors: AtomicU64::new(0),
-    ip_reasm_fails: AtomicU64::new(0),
-    ip_in_delivers: AtomicU64::new(0),
-    ip_in_unknown_protos: AtomicU64::new(0),
-    ip_in_addr_errors: AtomicU64::new(0),
-    ip_out: AtomicU64::new(0),
-    udp_in: AtomicU64::new(0),
-    udp_no_ports: AtomicU64::new(0),
-    udp_in_errors: AtomicU64::new(0),
-    udp_rcvbuf_errors: AtomicU64::new(0),
-    udp_in_csum_errors: AtomicU64::new(0),
-    udp_out: AtomicU64::new(0),
-    icmp_in: AtomicU64::new(0),
-    icmp_in_errors: AtomicU64::new(0),
-    icmp_in_csum_errors: AtomicU64::new(0),
-    icmp_out: AtomicU64::new(0),
-    icmp_in_type: [const { AtomicU64::new(0) }; 256],
-    icmp_out_type: [const { AtomicU64::new(0) }; 256],
-    tcp_active_opens: AtomicU64::new(0),
-    tcp_passive_opens: AtomicU64::new(0),
-    tcp_attempt_fails: AtomicU64::new(0),
-    tcp_estab_resets: AtomicU64::new(0),
-    tcp_in_segs: AtomicU64::new(0),
-    tcp_out_segs: AtomicU64::new(0),
-    tcp_retrans_segs: AtomicU64::new(0),
-    tcp_in_errs: AtomicU64::new(0),
-    tcp_in_csum_errors: AtomicU64::new(0),
-    tcp_out_rsts: AtomicU64::new(0),
-};
+pub static COUNTERS: PerNet<Counters> = PerNet::new(new_counters);
+
+/// A counter for each of the 256 types of ICMP. The counters are on the heap, so that a new
+/// namespace does not make 4 KiB of them on the small stack of the kernel.
+pub(crate) fn icmp_types() -> Box<[AtomicU64]> {
+    (0..256).map(|_| AtomicU64::new(0)).collect()
+}
+
+/// The counters of a new namespace.
+fn new_counters() -> Counters {
+    Counters {
+        ip_in: AtomicU64::new(0),
+        ip_in_hdr_errors: AtomicU64::new(0),
+        ip_reasm_fails: AtomicU64::new(0),
+        ip_in_delivers: AtomicU64::new(0),
+        ip_in_unknown_protos: AtomicU64::new(0),
+        ip_in_addr_errors: AtomicU64::new(0),
+        ip_out: AtomicU64::new(0),
+        udp_in: AtomicU64::new(0),
+        udp_no_ports: AtomicU64::new(0),
+        udp_in_errors: AtomicU64::new(0),
+        udp_rcvbuf_errors: AtomicU64::new(0),
+        udp_in_csum_errors: AtomicU64::new(0),
+        udp_out: AtomicU64::new(0),
+        icmp_in: AtomicU64::new(0),
+        icmp_in_errors: AtomicU64::new(0),
+        icmp_in_csum_errors: AtomicU64::new(0),
+        icmp_out: AtomicU64::new(0),
+        icmp_in_type: icmp_types(),
+        icmp_out_type: icmp_types(),
+        tcp_active_opens: AtomicU64::new(0),
+        tcp_passive_opens: AtomicU64::new(0),
+        tcp_attempt_fails: AtomicU64::new(0),
+        tcp_estab_resets: AtomicU64::new(0),
+        tcp_in_segs: AtomicU64::new(0),
+        tcp_out_segs: AtomicU64::new(0),
+        tcp_retrans_segs: AtomicU64::new(0),
+        tcp_in_errs: AtomicU64::new(0),
+        tcp_in_csum_errors: AtomicU64::new(0),
+        tcp_out_rsts: AtomicU64::new(0),
+    }
+}
 
 /// Adds one to the counter `c`.
 pub(crate) fn count(c: &AtomicU64) {
@@ -570,14 +626,38 @@ const BUDGET: usize = 64;
 /// The most rounds of one `poll`.
 const ROUNDS: usize = 16;
 
+/// The time of the end of the last poll of the bottom half and the time that it took, in
+/// nanoseconds.
+#[cfg(target_os = "none")]
+static LAST_POLL: SpinLock<(u64, u64)> = SpinLock::new((0, 0));
+
 /// Takes the received frames of each device and runs the timers of the neighbour table, as the
 /// `NET_RX` softirq of Linux. The bottom half of the kernel calls this. If a poll runs on another
 /// CPU, this call does nothing.
+///
+/// The bottom half runs after each interrupt. When the host is slow, a poll can take longer than
+/// one tick of the clock, and then a task gets no time between two polls. So a poll does not start
+/// until the time after the last poll is as long as the time of the last poll, and the poll takes
+/// at most half of the time of the CPU. Linux moves such work to `ksoftirqd`.
 pub fn poll() {
+    #[cfg(target_os = "none")]
+    let start = {
+        let start = rk_frame::time::nanos();
+        let (end, took) = *LAST_POLL.lock();
+        if start.saturating_sub(end) < took {
+            return;
+        }
+        start
+    };
     if POLLING.swap(true, Ordering::Acquire) {
         return;
     }
     poll_locked();
+    #[cfg(target_os = "none")]
+    {
+        let end = rk_frame::time::nanos();
+        *LAST_POLL.lock() = (end, end.saturating_sub(start));
+    }
 }
 
 /// Polls as `poll`, but waits for a poll on another CPU to end first. A send calls this, so
@@ -590,17 +670,46 @@ pub(crate) fn poll_now() {
     poll_locked();
 }
 
+/// The time of the next run of the timers of the namespaces other than the first one.
+static NEXT_TIMERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The shortest time between two runs of the timers of the other namespaces, in milliseconds.
+/// Each run of the timers of a namespace costs time. When the poll takes longer than one tick of
+/// the clock, a task can get no time to run, because the poll runs after each interrupt.
+const TIMER_INTERVAL_MS: u64 = 10;
+
 fn poll_locked() {
-    let devices = dev::devices();
+    // A device gives its frames to the stack of its namespace.
+    let devices = dev::all_devices();
     for _ in 0..ROUNDS {
         let mut n = 0;
         for d in devices.iter().filter(|d| d.is_up()) {
+            let _in = rk_net::ns::enter_index(d.net());
             n += d.poll(BUDGET, &mut |d, frame| receive(d, frame));
         }
         if n == 0 {
             break;
         }
     }
+    // The timers of the first namespace run at each poll, as before. The timers of the other
+    // namespaces run at most one time in each interval.
+    {
+        let _in = rk_net::ns::enter_index(0);
+        timers();
+    }
+    let now = now_ms();
+    if rk_net::ns::count() > 1 && NEXT_TIMERS.load(Ordering::Relaxed) <= now {
+        NEXT_TIMERS.store(now + TIMER_INTERVAL_MS, Ordering::Relaxed);
+        for index in rk_net::ns::indices().into_iter().skip(1) {
+            let _in = rk_net::ns::enter_index(index);
+            timers();
+        }
+    }
+    POLLING.store(false, Ordering::Release);
+}
+
+/// Runs the timers of TCP, of the neighbour tables and of IPv6 in the current namespace.
+fn timers() {
     crate::tcp::tick();
     let probes = {
         let mut neigh = NEIGH.lock();
@@ -612,5 +721,14 @@ fn poll_locked() {
         }
     }
     crate::stack6::tick();
-    POLLING.store(false, Ordering::Release);
+}
+
+/// Clears the tables of IPv4 of a namespace that stops.
+pub(crate) fn ns_exit() {
+    ROUTES.reset();
+    NEIGH.reset();
+    UDP_PORTS.reset();
+    PING_PORTS.reset();
+    SOCKETS.reset();
+    COUNTERS.reset();
 }

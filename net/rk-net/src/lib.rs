@@ -22,9 +22,11 @@ pub mod dev;
 pub mod ether;
 pub mod ioctl;
 pub mod netlink;
+pub mod ns;
 mod options;
 pub mod procfs;
 pub mod sysctl;
+pub mod veth;
 
 pub use options::{Options, Timeout};
 
@@ -211,6 +213,10 @@ pub trait Socket: Send + Sync {
     }
     /// Closes the socket. The file calls this when it closes.
     fn release(&self) {}
+    /// The network namespace of the socket, if the socket has one.
+    fn netns(&self) -> Option<&Arc<ns::NetNs>> {
+        None
+    }
     /// The socket as `Any`, for the operations of one family.
     fn as_any(&self) -> &dyn Any;
 }
@@ -260,7 +266,9 @@ impl FileOps for SocketFile {
 
     fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
         // The order of `sock_ioctl` and `sock_do_ioctl` of Linux: the list of the interfaces,
-        // then the family, then the calls of the network devices.
+        // then the family, then the calls of the network devices. The calls of the devices use
+        // the namespace of the socket.
+        let _in = self.socket.netns().map(|n| ns::enter(n));
         if cmd == SIOCGIFCONF {
             return ioctl::ifconf(arg, mem);
         }
@@ -354,3 +362,5 @@ static TEST_DEVICES: rk_frame::sync::SpinLock<()> = rk_frame::sync::SpinLock::ne
 mod tests;
 #[cfg(test)]
 mod tests_dev;
+#[cfg(test)]
+mod tests_ns;

@@ -219,10 +219,11 @@ fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
     use rk_vfs::nsfs::{NsInode, NsKind, link_text};
     /// The entries: rukernel makes no PID or time namespace for the children, so the
     /// `*_for_children` links name the namespace of the process.
-    const ENTRIES: [(&[u8], NsKind); 9] = [
+    const ENTRIES: [(&[u8], NsKind); 10] = [
         (b"cgroup", NsKind::Cgroup),
         (b"ipc", NsKind::Ipc),
         (b"mnt", NsKind::Mnt),
+        (b"net", NsKind::Net),
         (b"pid", NsKind::Pid),
         (b"pid_for_children", NsKind::Pid),
         (b"time", NsKind::Time),
@@ -246,8 +247,16 @@ fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
                         0o777,
                         move || Ok(link_text(kind, rk_proc::ns::ns_id(&*alive(&p_)?, kind)?)),
                         move || {
-                            let id = rk_proc::ns::ns_id(&*alive(&p_j)?, kind)?;
-                            Ok(rk_vfs::Location::detached(NsInode::new(kind, id)))
+                            let p = alive(&p_j)?;
+                            let node = match kind {
+                                // The file keeps the network namespace, as on Linux.
+                                NsKind::Net => {
+                                    let net = p.net_ns();
+                                    NsInode::with_hold(kind, net.id(), net)
+                                }
+                                _ => NsInode::new(kind, rk_proc::ns::ns_id(&p, kind)?),
+                            };
+                            Ok(rk_vfs::Location::detached(node))
                         },
                     );
                     (name.to_vec(), owned(&w, link))

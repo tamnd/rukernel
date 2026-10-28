@@ -15,6 +15,7 @@ rk-frame.workspace = true
 rk-mm.workspace = true
 rk-vfs.workspace = true
 rk-cgroup.workspace = true
+rk-net.workspace = true
 zerocopy.workspace = true
 
 [lints]

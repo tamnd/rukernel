@@ -204,6 +204,7 @@ dependencies = [
  "rk-cgroup",
  "rk-frame",
  "rk-mm",
+ "rk-net",
  "rk-vfs",
  "zerocopy",
 ]

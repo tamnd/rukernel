@@ -32,6 +32,8 @@ pub enum NsKind {
     User,
     /// A UTS namespace. rukernel has only the first one.
     Uts,
+    /// A network namespace.
+    Net,
 }
 
 impl NsKind {
@@ -45,6 +47,7 @@ impl NsKind {
             Self::Time => "time",
             Self::User => "user",
             Self::Uts => "uts",
+            Self::Net => "net",
         }
     }
 
@@ -58,6 +61,7 @@ impl NsKind {
             Self::Time => sched::CLONE_NEWTIME,
             Self::User => sched::CLONE_NEWUSER,
             Self::Uts => sched::CLONE_NEWUTS,
+            Self::Net => sched::CLONE_NEWNET,
         }
     }
 
@@ -71,6 +75,7 @@ impl NsKind {
             Self::Cgroup => 0xEFFF_FFFB,
             Self::Time => 0xEFFF_FFFA,
             Self::Mnt => 0xEFFF_FFF8,
+            Self::Net => 0xEFFF_FFF9,
         }
     }
 
@@ -79,6 +84,7 @@ impl NsKind {
         match self {
             Self::Cgroup => 0xF000_0000,
             Self::Mnt => 0xF100_0000,
+            Self::Net => 0xF800_0000,
             // The other kinds have only the first namespace.
             _ => 0xF200_0000,
         }
@@ -89,13 +95,26 @@ impl NsKind {
 pub struct NsInode {
     kind: NsKind,
     id: u32,
+    /// The namespace, for a kind whose namespace stops when the last reference goes. An open
+    /// file or a bind mount of the inode then keeps the namespace, as `ns_common` of Linux.
+    _hold: Option<Arc<dyn core::any::Any + Send + Sync>>,
 }
 
 impl NsInode {
     /// Makes the inode of the namespace `id` of the kind `kind`. The ID 0 is the first namespace
     /// of the kind.
     pub fn new(kind: NsKind, id: u32) -> Arc<Self> {
-        Arc::new(Self { kind, id })
+        Arc::new(Self { kind, id, _hold: None })
+    }
+
+    /// Makes the inode of the namespace `id` of the kind `kind`, which keeps the namespace `ns`
+    /// while the inode exists.
+    pub fn with_hold(
+        kind: NsKind,
+        id: u32,
+        ns: Arc<dyn core::any::Any + Send + Sync>,
+    ) -> Arc<Self> {
+        Arc::new(Self { kind, id, _hold: Some(ns) })
     }
 
     /// The inode number of the namespace.

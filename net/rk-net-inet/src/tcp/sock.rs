@@ -47,6 +47,7 @@ use rk_net::consts::{
     AF_INET, AF_INET6, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_WAITALL,
     SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_STREAM,
 };
+use rk_net::ns::PerNet;
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
@@ -57,14 +58,16 @@ use rk_vfs::wait::{PollTable, WaitQueue};
 type Key = (Ip, u16, Ip, u16);
 
 /// The connections, by their four addresses and ports.
-static ESTAB: SpinLock<BTreeMap<Key, Arc<Stream>>> = SpinLock::new(BTreeMap::new());
+static ESTAB: PerNet<SpinLock<BTreeMap<Key, Arc<Stream>>>> =
+    PerNet::new(|| SpinLock::new(BTreeMap::new()));
 /// The listening sockets on one port, with their local address and `IPV6_V6ONLY`.
 type Listeners = Vec<(Ip, bool, Arc<Stream>)>;
 
 /// The listening sockets, by their port.
-static LISTEN: SpinLock<BTreeMap<u16, Listeners>> = SpinLock::new(BTreeMap::new());
+static LISTEN: PerNet<SpinLock<BTreeMap<u16, Listeners>>> =
+    PerNet::new(|| SpinLock::new(BTreeMap::new()));
 /// The bound ports of the TCP sockets.
-static PORTS: SpinLock<Ports> = SpinLock::new(Ports::new(ports::EPHEMERAL));
+static PORTS: PerNet<SpinLock<Ports>> = PerNet::new(|| SpinLock::new(Ports::new(ports::EPHEMERAL)));
 /// The part of the initial sequence numbers that changes with each connection.
 static ISS: AtomicU32 = AtomicU32::new(0x1234_5678);
 
@@ -1515,4 +1518,11 @@ fn group_req(value: &[u8]) -> Result<(u32, [u8; 4])> {
         return Err(Errno::EINVAL);
     }
     Ok((index, group))
+}
+
+/// Clears the tables of TCP of a namespace that stops.
+pub(crate) fn ns_exit() {
+    ESTAB.reset();
+    LISTEN.reset();
+    PORTS.reset();
 }
