@@ -124,25 +124,32 @@ impl rk_vfs::UserMemory for Mem {
 
 #[test]
 fn pseudo_terminal_pair() {
-    use crate::pty::{open_ptmx, open_slave, slave_exists};
+    use crate::pty::{open_ptmx, open_slave, test_instance};
     use rk_abi::Errno;
     use rk_abi::native::ioctls::{
         TCGETA, TCGETS, TIOCGETD, TIOCGPTN, TIOCGWINSZ, TIOCSETD, TIOCSPTLCK, TIOCSWINSZ,
     };
-    use rk_abi::native::open::O_NONBLOCK;
+    use rk_abi::native::open::{O_NOCTTY, O_NONBLOCK};
     use rk_vfs::File;
 
+    let root = test_instance(b"").unwrap();
+    let exists = |index: u32| root.lookup(alloc::format!("{index}").as_bytes()).is_ok();
     let mem = Mem(core::cell::RefCell::new([0; 256]));
-    let master = open_ptmx().unwrap();
+    let master = open_ptmx(&root).unwrap();
     let mf = File::with_ops(master.clone(), None, O_NONBLOCK);
     // musl `openpty`: `TIOCSPTLCK` with 0, `TIOCGPTN`, and then the open of the slave.
     assert_eq!(master.ioctl(&mf, TIOCGPTN, BASE, &mem), Ok(0));
     let index = mem.int() as u32;
-    assert!(slave_exists(index));
-    assert_eq!(open_slave(index).err(), Some(Errno::EIO));
+    // Each instance of devpts has its own numbers.
+    assert_eq!(index, 0);
+    assert!(exists(index));
+    assert_eq!(open_slave(&root, index, O_NOCTTY).err(), Some(Errno::EIO));
+    // A read of the master before the first open of the slave gives `EIO`.
+    let mut buf = [0u8; 32];
+    assert_eq!(master.read(&mf, &mut buf), Err(Errno::EIO));
     mem.set_int(0);
     assert_eq!(master.ioctl(&mf, TIOCSPTLCK, BASE, &mem), Ok(0));
-    let slave = open_slave(index).unwrap();
+    let slave = open_slave(&root, index, O_NOCTTY).unwrap();
     let sf = File::with_ops(slave.clone(), None, O_NONBLOCK);
 
     // The ioctls of LTP ioctl01: a bad pointer gives `EFAULT`, a bad command gives `ENOTTY`.
@@ -164,7 +171,6 @@ fn pseudo_terminal_pair() {
     assert_eq!(&mem.0.borrow()[..4], &[24, 0, 80, 0]);
 
     // The master writes a line: the slave reads it, and the echo goes back to the master.
-    let mut buf = [0u8; 32];
     assert_eq!(slave.read(&sf, &mut buf), Err(Errno::EAGAIN));
     assert_eq!(master.write(&mf, b"hi\n"), Ok(3));
     assert_eq!(slave.read(&sf, &mut buf), Ok(3));
@@ -182,13 +188,158 @@ fn pseudo_terminal_pair() {
     drop(slave);
     assert_eq!(master.read(&mf, &mut buf), Err(Errno::EIO));
     // A new open of the slave works again.
-    let slave = open_slave(index).unwrap();
+    let slave = open_slave(&root, index, O_NOCTTY).unwrap();
     let sf = File::with_ops(slave.clone(), None, O_NONBLOCK);
     // After the close of the master, the slave file goes away and the slave hangs up.
     drop(mf);
     drop(master);
-    assert!(!slave_exists(index));
-    assert_eq!(open_slave(index).err(), Some(Errno::ENXIO));
+    assert!(!exists(index));
+    assert_eq!(open_slave(&root, index, O_NOCTTY).err(), Some(Errno::ENXIO));
     assert_eq!(slave.read(&sf, &mut buf), Ok(0));
     assert_eq!(slave.write(&sf, b"x"), Err(Errno::EIO));
+    assert_eq!(slave.ioctl(&sf, TCGETS, BASE, &mem), Err(Errno::EIO));
+}
+
+/// The process of the hook of `set_caller_hook` in the tests: the process ID, the process group
+/// and the session.
+static CALLER: [core::sync::atomic::AtomicU32; 3] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 3];
+
+fn test_caller() -> crate::Caller {
+    use core::sync::atomic::Ordering::Relaxed;
+    crate::Caller {
+        pid: CALLER[0].load(Relaxed),
+        pgid: CALLER[1].load(Relaxed),
+        sid: CALLER[2].load(Relaxed),
+    }
+}
+
+fn set_caller(pid: u32, pgid: u32, sid: u32) {
+    use core::sync::atomic::Ordering::Relaxed;
+    for (a, v) in CALLER.iter().zip([pid, pgid, sid]) {
+        a.store(v, Relaxed);
+    }
+}
+
+#[test]
+fn pseudo_terminal_hang_up() {
+    use crate::pty::{open_ptmx, open_slave, test_instance};
+    use rk_abi::Errno;
+    use rk_abi::native::ioctls::{TCGETS, TIOCGPTPEER, TIOCSPGRP, TIOCSPTLCK, TIOCVHANGUP};
+    use rk_abi::native::open::{O_NOCTTY, O_NONBLOCK};
+    use rk_abi::native::poll::{POLLERR, POLLHUP};
+    use rk_vfs::File;
+
+    let root = test_instance(b"newinstance").unwrap();
+    let mem = Mem(core::cell::RefCell::new([0; 256]));
+    let master = open_ptmx(&root).unwrap();
+    let mf = File::with_ops(master.clone(), None, O_NONBLOCK);
+    mem.set_int(0);
+    assert_eq!(master.ioctl(&mf, TIOCSPTLCK, BASE, &mem), Ok(0));
+    let slave = open_slave(&root, 0, O_NOCTTY).unwrap();
+    let sf = File::with_ops(slave.clone(), None, O_NONBLOCK);
+    // Only the master has a peer.
+    assert_eq!(slave.ioctl(&sf, TIOCGPTPEER, 0, &mem), Err(Errno::EIO));
+
+    // `TIOCVHANGUP` on the slave hangs up each open file of the slave. A new open works.
+    assert_eq!(slave.ioctl(&sf, TIOCVHANGUP, 0, &mem), Ok(0));
+    let mut buf = [0u8; 8];
+    assert_eq!(master.write(&mf, b"x\n"), Ok(2));
+    assert_eq!(slave.read(&sf, &mut buf), Ok(0));
+    assert_eq!(slave.write(&sf, b"x"), Err(Errno::EIO));
+    assert_eq!(slave.ioctl(&sf, TCGETS, BASE, &mem), Err(Errno::EIO));
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ENOTTY));
+    assert_eq!(slave.poll(&sf) & (POLLHUP | POLLERR), POLLHUP | POLLERR);
+    let again = open_slave(&root, 0, O_NOCTTY).unwrap();
+    let af = File::with_ops(again.clone(), None, O_NONBLOCK);
+    assert_eq!(again.write(&af, b"ok"), Ok(2));
+    drop((sf, slave, af, again));
+
+    // `TIOCVHANGUP` on the master hangs up the master. The slave goes at the close.
+    assert_eq!(master.ioctl(&mf, TIOCVHANGUP, 0, &mem), Ok(0));
+    assert_eq!(master.read(&mf, &mut buf), Ok(0));
+    assert_eq!(master.write(&mf, b"x"), Err(Errno::EIO));
+    assert_eq!(master.ioctl(&mf, TCGETS, BASE, &mem), Err(Errno::EIO));
+    assert!(root.lookup(b"0").is_ok());
+    drop((mf, master));
+    assert!(root.lookup(b"0").is_err());
+}
+
+#[test]
+fn pseudo_terminal_controlling_terminal() {
+    use crate::pty::{open_ptmx, open_slave, test_instance};
+    use rk_abi::Errno;
+    use rk_abi::native::ioctls::{TIOCGPGRP, TIOCGSID, TIOCNOTTY, TIOCSCTTY, TIOCSPTLCK};
+    use rk_abi::native::open::{O_NOCTTY, O_NONBLOCK};
+    use rk_vfs::File;
+
+    crate::set_caller_hook(test_caller);
+    let root = test_instance(b"").unwrap();
+    let mem = Mem(core::cell::RefCell::new([0; 256]));
+    let master = open_ptmx(&root).unwrap();
+    let mf = File::with_ops(master.clone(), None, O_NONBLOCK);
+    mem.set_int(0);
+    assert_eq!(master.ioctl(&mf, TIOCSPTLCK, BASE, &mem), Ok(0));
+    let slave = open_slave(&root, 0, O_NOCTTY).unwrap();
+    let sf = File::with_ops(slave.clone(), None, O_NONBLOCK);
+
+    // A process that is not a session leader cannot take a controlling terminal.
+    set_caller(901, 900, 900);
+    assert_eq!(slave.ioctl(&sf, TIOCSCTTY, 0, &mem), Err(Errno::EPERM));
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
+    // The session leader takes it, through the master too.
+    set_caller(900, 900, 900);
+    assert_eq!(master.ioctl(&mf, TIOCSCTTY, 0, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCSCTTY, 0, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), 900);
+    assert_eq!(master.ioctl(&mf, TIOCGSID, BASE, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCGPGRP, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), 900);
+    // A process of another session gets `ENOTTY` for the session of the slave.
+    set_caller(905, 905, 905);
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
+    // The slave of another session needs the argument 1 and `CAP_SYS_ADMIN`.
+    assert_eq!(slave.ioctl(&sf, TIOCSCTTY, 0, &mem), Err(Errno::EPERM));
+    assert_eq!(slave.ioctl(&sf, TIOCSCTTY, 1, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), 905);
+    // `TIOCNOTTY`: the master is never the controlling terminal.
+    assert_eq!(master.ioctl(&mf, TIOCNOTTY, 0, &mem), Err(Errno::ENOTTY));
+    assert_eq!(slave.ioctl(&sf, TIOCNOTTY, 0, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
+    assert_eq!(master.ioctl(&mf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
+
+    // An open without `O_NOCTTY` by a session leader without a controlling terminal makes the
+    // slave its controlling terminal. The exit of the leader ends it.
+    set_caller(910, 910, 910);
+    let other = open_slave(&root, 0, 0).unwrap();
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), 910);
+    crate::session_leader_exit(910);
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
+    drop(other);
+    set_caller(0, 0, 0);
+}
+
+#[test]
+fn devpts_options() {
+    use crate::pty::{open_ptmx, test_instance, test_options};
+    use rk_abi::Errno;
+
+    assert_eq!(test_options(b""), Ok((None, None, 0o600, 0, 1 << 20)));
+    assert_eq!(
+        test_options(b"newinstance,gid=5,mode=620,ptmxmode=666,max=2,rw"),
+        Ok((None, Some(5), 0o620, 0o666, 2))
+    );
+    for bad in [&b"max=0"[..], b"mode=9", b"uid", b"newinstance=1", b"bad", b"uid=4294967295"] {
+        assert_eq!(test_options(bad), Err(Errno::EINVAL));
+    }
+    // The option `max` limits the pairs of the instance. The `ptmx` file has `ptmxmode`.
+    let root = test_instance(b"max=1,ptmxmode=0666").unwrap();
+    assert_eq!(root.lookup(b"ptmx").unwrap().metadata().mode & 0o7777, 0o666);
+    let first = open_ptmx(&root).unwrap();
+    assert_eq!(open_ptmx(&root).err(), Some(Errno::ENOSPC));
+    drop(first);
+    assert!(open_ptmx(&root).is_ok());
 }

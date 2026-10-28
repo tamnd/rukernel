@@ -10,31 +10,37 @@
 //! and to the master. The `termios` and the window size of a pair are those of the slave, and
 //! the ioctls of the master change them, as `tty_mode_ioctl` of Linux with `tty->link`.
 //!
-//! There is one devpts instance. Each mount of devpts shows it, as the mount option `newinstance`
-//! was not given.
+//! Each mount of devpts is a new instance, as `get_tree_nodev` of Linux. An instance has its
+//! own slaves and its own numbers, and the option `newinstance` has no effect. An open of
+//! `/dev/ptmx` uses the instance on `pts` in the same directory, as `devpts_acquire`, and an
+//! open of the `ptmx` file of devpts uses its own instance. The open of a slave finds the pair
+//! through the file in devpts, as `devpts_get_priv`, so a slave device file out of devpts does
+//! not open.
 
-use crate::{Tty, send_signals};
+use crate::{Tty, admin, caller, send_signals, session_has_tty};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::ioctls::{
     FIONREAD, TCFLSH, TCGETA, TCGETS, TCSBRK, TCSBRKP, TCSETA, TCSETAF, TCSETAW, TCSETS, TCSETSF,
-    TCSETSW, TCXONC, TIOCGETD, TIOCGPGRP, TIOCGPKT, TIOCGPTLCK, TIOCGPTN, TIOCGSID, TIOCGWINSZ,
-    TIOCNOTTY, TIOCOUTQ, TIOCPKT, TIOCPKT_DATA, TIOCSCTTY, TIOCSETD, TIOCSPGRP, TIOCSPTLCK,
-    TIOCSWINSZ,
+    TCSETSW, TCXONC, TIOCGETD, TIOCGPGRP, TIOCGPKT, TIOCGPTLCK, TIOCGPTN, TIOCGPTPEER, TIOCGSID,
+    TIOCGWINSZ, TIOCNOTTY, TIOCOUTQ, TIOCPKT, TIOCPKT_DATA, TIOCSCTTY, TIOCSETD, TIOCSPGRP,
+    TIOCSPTLCK, TIOCSWINSZ, TIOCVHANGUP,
 };
-use rk_abi::native::poll::{POLLHUP, POLLIN, POLLOUT};
-use rk_abi::native::signal::SIGWINCH;
+use rk_abi::native::open::{O_CLOEXEC, O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC};
+use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
+use rk_abi::native::signal::{SIGCONT, SIGHUP, SIGWINCH};
 use rk_abi::native::termbits::{TCIFLUSH, TCIOFLUSH, TCOFLUSH};
 use rk_abi::native::types::{Termio, Termios, Winsize};
-use rk_frame::sync::{Once, SpinLock};
-use rk_vfs::device::{self, CharDevice, makedev};
+use rk_frame::sync::SpinLock;
+use rk_vfs::device::{self, CharDevice, makedev, minor};
 use rk_vfs::fstype::{FsType, MountArgs};
-use rk_vfs::inode::{FileType, InodeRef, Result};
+use rk_vfs::inode::{FileType, Inode, InodeRef, Result, SetAttr};
 use rk_vfs::wait::PollTable;
-use rk_vfs::{File, FileOps, UserMemory, WaitQueue};
+use rk_vfs::{File, FileOps, Location, Mount, UserMemory, WaitQueue};
 use zerocopy::{FromZeros, IntoBytes};
 
 /// The device number of `/dev/ptmx`.
@@ -47,25 +53,148 @@ pub const MAX_PAIRS: u32 = 4096;
 /// the TTY port of the master.
 const MASTER_BUF: usize = 64 * 1024;
 /// The permission bits of a slave file, the default `mode=0600` of devpts.
-const SLAVE_PERM: u32 = 0o600;
+const DEFAULT_MODE: u32 = 0o600;
+/// The most slaves of one instance, `NR_UNIX98_PTY_MAX` of Linux, the default and the limit of
+/// the option `max`.
+const NR_MAX: u32 = 1 << 20;
 
 /// The file system type for `mount -t devpts`.
 pub const DEVPTS: FsType = FsType { name: "devpts", nodev: true, make: mount_devpts };
 
-/// The root directory of devpts.
-fn devpts_root() -> &'static InodeRef {
-    static ROOT: Once<InodeRef> = Once::new();
-    ROOT.call_once(|| {
-        let root = rk_fs_tmpfs::new(0o755);
-        // devpts has its own `ptmx` with the mode 0, as `mknod_ptmx` of Linux.
-        let _ = root.create(b"ptmx", FileType::CharDevice, 0, PTMX_RDEV);
-        root
-    })
+/// The options of a mount of devpts, as `struct pts_mount_opts` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Options {
+    /// The owner of a new slave file, or `None` for the file system user of the caller.
+    uid: Option<u32>,
+    /// The group of a new slave file, or `None` for the file system group of the caller.
+    gid: Option<u32>,
+    /// The permission bits of a new slave file.
+    mode: u32,
+    /// The permission bits of the `ptmx` file of devpts.
+    ptmxmode: u32,
+    /// The most slaves at the same time. The numbers are below it.
+    max: u32,
 }
 
-/// Gives the root of devpts for `mount(2)`. The options have no effect.
-fn mount_devpts(_args: &MountArgs<'_>) -> Result<InodeRef> {
-    Ok(devpts_root().clone())
+impl Default for Options {
+    fn default() -> Self {
+        Self { uid: None, gid: None, mode: DEFAULT_MODE, ptmxmode: 0, max: NR_MAX }
+    }
+}
+
+/// The flags of the super block that the options of each file system can have, as
+/// `vfs_parse_sb_flag` of Linux.
+const SB_FLAGS: [&[u8]; 10] = [
+    b"ro",
+    b"rw",
+    b"sync",
+    b"async",
+    b"dirsync",
+    b"lazytime",
+    b"nolazytime",
+    b"mand",
+    b"nomand",
+    b"silent",
+];
+
+/// Reads the options of a mount of devpts, as `devpts_parse_param` of Linux. An unknown option
+/// or a bad value gives `EINVAL`.
+fn parse_options(data: &[u8]) -> Result<Options> {
+    let mut opts = Options::default();
+    let data = data.split(|&b| b == 0).next().unwrap_or(&[]);
+    for opt in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
+        let (key, value) = match opt.iter().position(|&b| b == b'=') {
+            Some(i) => (&opt[..i], Some(&opt[i + 1..])),
+            None => (opt, None),
+        };
+        let number = |radix: u32| -> Result<u32> {
+            let v = core::str::from_utf8(value.ok_or(Errno::EINVAL)?).map_err(|_| Errno::EINVAL)?;
+            u32::from_str_radix(v, radix).map_err(|_| Errno::EINVAL)
+        };
+        match key {
+            b"uid" | b"gid" => {
+                // `(uid_t)-1` is not a valid ID, as `make_kuid`.
+                let id = Some(number(10)?).filter(|&id| id != u32::MAX).ok_or(Errno::EINVAL)?;
+                if key == b"uid" {
+                    opts.uid = id.into();
+                } else {
+                    opts.gid = id.into();
+                }
+            }
+            b"mode" => opts.mode = number(8)? & 0o7777,
+            b"ptmxmode" => opts.ptmxmode = number(8)? & 0o7777,
+            b"max" => {
+                let max = number(10)?;
+                if max == 0 || max > NR_MAX {
+                    return Err(Errno::EINVAL);
+                }
+                opts.max = max;
+            }
+            b"newinstance" if value.is_none() => {}
+            k if value.is_none() && SB_FLAGS.contains(&k) => {}
+            _ => return Err(Errno::EINVAL),
+        }
+    }
+    Ok(opts)
+}
+
+/// An instance of devpts, as `struct pts_fs_info` of Linux.
+struct Instance {
+    /// The root directory. The mounts hold it.
+    root: Weak<dyn Inode>,
+    /// The options of the mount.
+    opts: Options,
+    /// The pairs, by their number.
+    pairs: SpinLock<BTreeMap<u32, Arc<Pair>>>,
+}
+
+/// The instances of devpts, by the device number of their file system. An instance stays while
+/// a mount holds its root or while it has a pair.
+static INSTANCES: SpinLock<BTreeMap<u64, Arc<Instance>>> = SpinLock::new(BTreeMap::new());
+
+/// The number of pairs in all the instances.
+static NR_PAIRS: AtomicU32 = AtomicU32::new(0);
+
+/// Makes a new instance of devpts with the options `opts`, and gives its root.
+fn new_instance(opts: Options) -> Result<InodeRef> {
+    let root = rk_fs_tmpfs::new(0o755);
+    // devpts has its own `ptmx`, with the mode 0 by default, as `mknod_ptmx` of Linux.
+    root.create(b"ptmx", FileType::CharDevice, opts.ptmxmode, PTMX_RDEV)?;
+    let inst =
+        Instance { root: Arc::downgrade(&root), opts, pairs: SpinLock::new(BTreeMap::new()) };
+    let mut all = INSTANCES.lock();
+    all.retain(|_, i| i.root.strong_count() > 0 || !i.pairs.lock().is_empty());
+    all.insert(root.metadata().dev, Arc::new(inst));
+    Ok(root)
+}
+
+/// Gives the root of a new instance of devpts for `mount(2)`.
+fn mount_devpts(args: &MountArgs<'_>) -> Result<InodeRef> {
+    new_instance(parse_options(args.data)?)
+}
+
+/// The instance of devpts of the file system with the device number `dev`.
+fn instance(dev: u64) -> Option<Arc<Instance>> {
+    INSTANCES.lock().get(&dev).cloned()
+}
+
+/// The instance of devpts and its mount for an open of the `ptmx` file at `at`, as
+/// `devpts_acquire` of Linux. The `ptmx` file of devpts uses its own instance. Another file uses
+/// the instance on `pts` in its directory. Gives `ENOENT` if `pts` is not there, and `ENODEV` if
+/// `pts` has no devpts on it.
+fn ptmx_instance(at: &Location) -> Result<(Arc<Instance>, Arc<Mount>)> {
+    if let Some(inst) = instance(at.inode().metadata().dev) {
+        return Ok((inst, at.mount.clone()));
+    }
+    let parent = at.dentry.parent().ok_or(Errno::ENOENT)?;
+    parent.lookup(b"pts").map_err(|_| Errno::ENOENT)?;
+    let pts = at.sibling_mount(b"pts").ok_or(Errno::ENODEV)?;
+    // The mount must show the root of devpts, as `devpts_ptmx_path`.
+    let inst = instance(pts.inode().metadata().dev).ok_or(Errno::ENODEV)?;
+    if !pts.is_mount_root() || inst.root.upgrade().is_none_or(|r| !Arc::ptr_eq(&r, pts.inode())) {
+        return Err(Errno::ENODEV);
+    }
+    Ok((inst, pts.mount))
 }
 
 /// The state of a pair.
@@ -82,34 +211,44 @@ struct PairState {
     master_open: bool,
     /// The number of open files of the slave.
     slave_opens: usize,
-    /// The slave was open and each of its files is closed now, `TTY_OTHER_CLOSED` of the master.
+    /// No file of the slave is open, `TTY_OTHER_CLOSED` of the master. It is true before the
+    /// first open of the slave too.
     slave_closed: bool,
+    /// The number of hang ups of the slave. A slave file of an older hang up is hung up.
+    slave_hangups: u64,
 }
 
 /// A pair of a master and a slave.
 struct Pair {
     index: u32,
+    /// The instance of devpts of the pair.
+    inst: Arc<Instance>,
     state: SpinLock<PairState>,
     /// The readers and the writers of both sides wait here.
     wait: Arc<WaitQueue>,
 }
-
-/// The pairs, by their index.
-static PAIRS: SpinLock<BTreeMap<u32, Arc<Pair>>> = SpinLock::new(BTreeMap::new());
 
 /// The name of the slave file of `index` in devpts.
 fn slave_name(index: u32) -> Vec<u8> {
     format!("{index}").into_bytes()
 }
 
-/// Makes a new pair, as `ptmx_open` of Linux. Gives `ENOSPC` when there are `MAX_PAIRS` pairs.
-fn open_pair() -> Result<Arc<Pair>> {
+/// Makes a new pair in `inst`, as `ptmx_open` of Linux. Gives `ENOSPC` when there are
+/// `MAX_PAIRS` pairs, or when `inst` has no free number below its option `max`.
+fn open_pair(inst: &Arc<Instance>) -> Result<Arc<Pair>> {
+    NR_PAIRS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_PAIRS).then_some(n + 1))
+        .map_err(|_| Errno::ENOSPC)?;
     let pair = {
-        let mut pairs = PAIRS.lock();
-        // The smallest free index, as the IDA of devpts.
-        let index = (0..MAX_PAIRS).find(|i| !pairs.contains_key(i)).ok_or(Errno::ENOSPC)?;
+        let mut pairs = inst.pairs.lock();
+        // The smallest free number, as the IDA of devpts.
+        let Some(index) = (0..inst.opts.max).find(|i| !pairs.contains_key(i)) else {
+            NR_PAIRS.fetch_sub(1, Ordering::AcqRel);
+            return Err(Errno::ENOSPC);
+        };
         let pair = Arc::new(Pair {
             index,
+            inst: inst.clone(),
             state: SpinLock::new(PairState {
                 tty: Tty::new(),
                 to_master: VecDeque::new(),
@@ -117,31 +256,85 @@ fn open_pair() -> Result<Arc<Pair>> {
                 packet: false,
                 master_open: true,
                 slave_opens: 0,
-                slave_closed: false,
+                slave_closed: true,
+                slave_hangups: 0,
             }),
             wait: Arc::new(WaitQueue::new()),
         });
         pairs.insert(index, pair.clone());
         pair
     };
-    let rdev = makedev(SLAVE_MAJOR, pair.index);
-    device::register_char(rdev, Arc::new(SlaveDevice { index: pair.index }));
-    let name = slave_name(pair.index);
-    if let Err(e) = devpts_root().create(&name, FileType::CharDevice, SLAVE_PERM, rdev) {
+    if let Err(e) = make_slave_file(&pair) {
         close_master(&pair);
         return Err(e);
     }
     Ok(pair)
 }
 
+/// Makes the slave file of `pair` in devpts, as `devpts_pty_new` of Linux.
+fn make_slave_file(pair: &Pair) -> Result<()> {
+    let Some(root) = pair.inst.root.upgrade() else { return Ok(()) };
+    let opts = &pair.inst.opts;
+    let rdev = makedev(SLAVE_MAJOR, pair.index);
+    let node = root.create(&slave_name(pair.index), FileType::CharDevice, opts.mode, rdev)?;
+    let cred = rk_vfs::cred::current();
+    let attr = SetAttr {
+        uid: Some(opts.uid.unwrap_or(cred.fsuid)),
+        gid: Some(opts.gid.unwrap_or(cred.fsgid)),
+        ..SetAttr::default()
+    };
+    node.set_attr(&attr)
+}
+
 /// Removes the pair after the close of the master, as `pty_close` and `devpts_pty_kill` of
 /// Linux. The open files of the slave stay, and they get a hang up.
 fn close_master(pair: &Pair) {
     pair.state.lock().master_open = false;
-    let _ = devpts_root().unlink(&slave_name(pair.index));
-    device::unregister_char(makedev(SLAVE_MAJOR, pair.index));
-    PAIRS.lock().remove(&pair.index);
+    if let Some(root) = pair.inst.root.upgrade() {
+        let _ = root.unlink(&slave_name(pair.index));
+    }
+    pair.inst.pairs.lock().remove(&pair.index);
+    NR_PAIRS.fetch_sub(1, Ordering::AcqRel);
     pair.wait.wake_all();
+}
+
+/// Each pair of each instance of devpts.
+fn all_pairs() -> Vec<Arc<Pair>> {
+    let all = INSTANCES.lock();
+    all.values().flat_map(|i| i.pairs.lock().values().cloned().collect::<Vec<_>>()).collect()
+}
+
+/// Tells if a slave has the session `sid`.
+pub(crate) fn slave_has_session(sid: u32) -> bool {
+    all_pairs().iter().any(|p| p.state.lock().tty.sid == sid)
+}
+
+/// Takes the session `sid` from the slave that has it, after the exit of the session leader.
+/// Gives `SIGHUP` for the foreground process group, as `disassociate_ctty(1)` of Linux.
+pub(crate) fn end_session(sid: u32) -> Vec<(u32, u32)> {
+    let mut signals = Vec::new();
+    if sid == 0 {
+        return signals;
+    }
+    for pair in all_pairs() {
+        let mut st = pair.state.lock();
+        if st.tty.sid == sid {
+            signals.push((st.tty.pgrp, SIGHUP));
+            st.tty.sid = 0;
+            st.tty.pgrp = 0;
+        }
+    }
+    signals
+}
+
+/// Opens the slave that has the session `sid`, for `/dev/tty`. Gives `None` if no slave has
+/// it.
+pub(crate) fn open_ctty(sid: u32, flags: u32) -> Option<Result<Arc<dyn FileOps>>> {
+    if sid == 0 {
+        return None;
+    }
+    let pair = all_pairs().into_iter().find(|p| p.state.lock().tty.sid == sid)?;
+    Some(open_slave_file(&pair, flags | O_NOCTTY))
 }
 
 /// Gives the input `data` to the line discipline of the slave, as a write to the master. The
@@ -162,18 +355,78 @@ fn receive(st: &mut PairState, data: &[u8]) -> Vec<(u32, u32)> {
     signals
 }
 
+/// `TIOCSCTTY` on the pair: the slave becomes the controlling terminal of the session of the
+/// caller, as `tiocsctty` of Linux. The caller must be a session leader without a controlling
+/// terminal. A slave of another session needs `arg` 1 and `CAP_SYS_ADMIN`, and then the other
+/// session loses it. A file that is not open for a read needs `CAP_SYS_ADMIN`.
+fn set_ctty(pair: &Pair, file: &File, arg: usize) -> Result<usize> {
+    let c = caller();
+    let admin = admin();
+    // The search takes the locks of the terminals, so it comes before the lock of the pair.
+    let has_tty = session_has_tty(c.sid);
+    let mut st = pair.state.lock();
+    if c.leader() && st.tty.sid == c.sid {
+        return Ok(0);
+    }
+    if !c.leader() || has_tty {
+        return Err(Errno::EPERM);
+    }
+    if st.tty.sid != 0 && !(arg == 1 && admin) {
+        return Err(Errno::EPERM);
+    }
+    if !file.flags().readable() && !admin {
+        return Err(Errno::EPERM);
+    }
+    st.tty.sid = c.sid;
+    st.tty.pgrp = c.pgid;
+    Ok(0)
+}
+
+/// `TIOCNOTTY` on the pair, as `tiocnotty` of Linux. Only the slave can be the controlling
+/// terminal of the caller, else the result is `ENOTTY`. For a session leader the foreground
+/// process group gets `SIGHUP` and `SIGCONT`, and the slave has no session after it.
+fn no_ctty(pair: &Pair, master: bool) -> Result<usize> {
+    let c = caller();
+    let signals = {
+        let mut st = pair.state.lock();
+        if master || c.sid == 0 || st.tty.sid != c.sid {
+            return Err(Errno::ENOTTY);
+        }
+        if !c.leader() {
+            return Ok(0);
+        }
+        let pgrp = core::mem::take(&mut st.tty.pgrp);
+        st.tty.sid = 0;
+        alloc::vec![(pgrp, SIGHUP), (pgrp, SIGCONT)]
+    };
+    send_signals(signals);
+    Ok(0)
+}
+
 /// Runs an ioctl of the terminal on the pair, from either side. Gives `None` for a command that
 /// the terminal does not have. `master` tells the side of `TCFLSH` and `FIONREAD`.
 fn tty_ioctl(
     pair: &Pair,
     master: bool,
+    file: &File,
     cmd: u32,
     arg: usize,
     mem: &dyn UserMemory,
 ) -> Option<Result<usize>> {
+    match cmd {
+        TIOCSCTTY => return Some(set_ctty(pair, file, arg)),
+        TIOCNOTTY => return Some(no_ctty(pair, master)),
+        _ => {}
+    }
+    // On the slave, the process group and the session are only for a process of the session
+    // of the slave, as `tiocgpgrp` and `tiocgsid` of Linux.
+    let sid = caller().sid;
     let mut signals = Vec::new();
     let r = (|| {
         let mut st = pair.state.lock();
+        if matches!(cmd, TIOCGPGRP | TIOCGSID) && !master && (sid == 0 || st.tty.sid != sid) {
+            return Err(Errno::ENOTTY);
+        }
         match cmd {
             TCGETS => mem.write(arg, st.tty.ldisc.termios().as_bytes())?,
             TCSETS | TCSETSW | TCSETSF => {
@@ -250,7 +503,9 @@ fn tty_ioctl(
                     return Err(Errno::EINVAL);
                 }
             }
-            TIOCSCTTY | TIOCNOTTY | TCSBRK | TCSBRKP | TCXONC => {}
+            TCSBRK | TCSBRKP | TCXONC => {}
+            // Only the master has a peer, as `ptm_open_peer` of Linux.
+            TIOCGPTPEER => return Err(Errno::EIO),
             _ => return Ok(None),
         }
         Ok(Some(0))
@@ -292,9 +547,27 @@ fn read_int(mem: &dyn UserMemory, arg: usize) -> Result<i32> {
     Ok(i32::from_ne_bytes(v))
 }
 
+/// The poll events of a file after a hang up, as `hung_up_tty_poll` of Linux. After a hang up a
+/// read gives the end of the file, and a write gives `EIO`.
+const HUNG_POLL: u32 = POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDNORM | POLLWRNORM;
+
+/// The result of an ioctl after a hang up, as `hung_up_tty_ioctl` of Linux.
+fn hung_ioctl(cmd: u32) -> Result<usize> {
+    Err(if cmd == TIOCSPGRP { Errno::ENOTTY } else { Errno::EIO })
+}
+
+/// `TIOCVHANGUP` needs `CAP_SYS_ADMIN`, as `tty_ioctl` of Linux.
+fn check_vhangup() -> Result<()> {
+    if admin() { Ok(()) } else { Err(Errno::EPERM) }
+}
+
 /// The open file of the master, an open file of `/dev/ptmx`.
 struct MasterFile {
     pair: Arc<Pair>,
+    /// The mount of devpts of the pair, for `TIOCGPTPEER`.
+    mount: Option<Arc<Mount>>,
+    /// `TIOCVHANGUP` hung up the master.
+    hung: AtomicBool,
 }
 
 impl Drop for MasterFile {
@@ -303,10 +576,19 @@ impl Drop for MasterFile {
     }
 }
 
+impl MasterFile {
+    fn hung(&self) -> bool {
+        self.hung.load(Ordering::Acquire)
+    }
+}
+
 impl FileOps for MasterFile {
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
         let pair = &self.pair;
         let n = pair.wait.wait_interruptible(|| {
+            if self.hung() {
+                return Ok(Some(0));
+            }
             let mut st = pair.state.lock();
             if buf.is_empty() {
                 return Ok(Some(0));
@@ -323,8 +605,8 @@ impl FileOps for MasterFile {
                 }
                 return Ok(Some(n + skip));
             }
-            // The slave hung up: the data is all read, as `n_tty_read` with
-            // `TTY_OTHER_CLOSED`.
+            // No slave file is open, before the first open of the slave or after the last
+            // close: the data is all read, as `n_tty_read` with `TTY_OTHER_CLOSED`.
             if st.slave_closed {
                 return Err(Errno::EIO);
             }
@@ -338,6 +620,9 @@ impl FileOps for MasterFile {
     }
 
     fn write(&self, _file: &File, buf: &[u8]) -> Result<usize> {
+        if self.hung() {
+            return Err(Errno::EIO);
+        }
         let signals = {
             let mut st = self.pair.state.lock();
             receive(&mut st, buf)
@@ -347,7 +632,10 @@ impl FileOps for MasterFile {
         Ok(buf.len())
     }
 
-    fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+    fn ioctl(&self, file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        if self.hung() {
+            return hung_ioctl(cmd);
+        }
         let pair = &self.pair;
         match cmd {
             TIOCGPTN => mem.write(arg, &pair.index.to_ne_bytes())?,
@@ -367,7 +655,16 @@ impl FileOps for MasterFile {
                 let v = i32::from(pair.state.lock().packet);
                 mem.write(arg, &v.to_ne_bytes())?;
             }
-            _ => return tty_ioctl(pair, true, cmd, arg, mem).unwrap_or(Err(Errno::ENOTTY)),
+            // The hang up of the master, as `tty_vhangup`. The slave stays until the close of
+            // the master.
+            TIOCVHANGUP => {
+                check_vhangup()?;
+                self.hung.store(true, Ordering::Release);
+                pair.wait.wake_all();
+            }
+            _ => {
+                return tty_ioctl(pair, true, file, cmd, arg, mem).unwrap_or(Err(Errno::ENOTTY));
+            }
         }
         Ok(0)
     }
@@ -381,6 +678,9 @@ impl FileOps for MasterFile {
     }
 
     fn poll(&self, _file: &File) -> u32 {
+        if self.hung() {
+            return HUNG_POLL;
+        }
         let st = self.pair.state.lock();
         let mut events = POLLOUT;
         if !st.to_master.is_empty() {
@@ -391,11 +691,25 @@ impl FileOps for MasterFile {
         }
         events
     }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 /// The open file of a slave.
 struct SlaveFile {
     pair: Arc<Pair>,
+    /// The number of hang ups of the slave at the open.
+    hangups: u64,
+}
+
+impl SlaveFile {
+    /// Tells if the file is hung up: the master is closed, or the slave had a hang up after the
+    /// open.
+    fn hung(&self, st: &PairState) -> bool {
+        !st.master_open || st.slave_hangups != self.hangups
+    }
 }
 
 impl Drop for SlaveFile {
@@ -416,12 +730,12 @@ impl FileOps for SlaveFile {
         let pair = &self.pair;
         let n = pair.wait.wait_interruptible(|| {
             let mut st = pair.state.lock();
+            // A read after the hang up gives the end of the file, as `hung_up_tty_read`.
+            if self.hung(&st) {
+                return Ok(Some(0));
+            }
             if st.tty.ldisc.readable() || buf.is_empty() {
                 return Ok(Some(st.tty.ldisc.read(buf)));
-            }
-            // A read after the hang up gives the end of the file, as `hung_up_tty_read`.
-            if !st.master_open {
-                return Ok(Some(0));
             }
             if file.nonblock() {
                 return Err(Errno::EAGAIN);
@@ -436,7 +750,7 @@ impl FileOps for SlaveFile {
         let pair = &self.pair;
         pair.wait.wait_interruptible(|| {
             let mut st = pair.state.lock();
-            if !st.master_open {
+            if self.hung(&st) {
                 return Err(Errno::EIO);
             }
             if st.to_master.len() < MASTER_BUF {
@@ -454,8 +768,26 @@ impl FileOps for SlaveFile {
         Ok(buf.len())
     }
 
-    fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
-        tty_ioctl(&self.pair, false, cmd, arg, mem).unwrap_or(Err(Errno::ENOTTY))
+    fn ioctl(&self, file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
+        let pair = &self.pair;
+        if self.hung(&pair.state.lock()) {
+            return hung_ioctl(cmd);
+        }
+        if cmd == TIOCVHANGUP {
+            // The hang up of the slave, as `tty_vhangup`: each open file of the slave is hung
+            // up, and the slave has no session after it. A new open of the slave works.
+            check_vhangup()?;
+            {
+                let mut st = pair.state.lock();
+                st.slave_hangups += 1;
+                st.tty.sid = 0;
+                st.tty.pgrp = 0;
+                st.tty.ldisc.flush_input();
+            }
+            pair.wait.wake_all();
+            return Ok(0);
+        }
+        tty_ioctl(pair, false, file, cmd, arg, mem).unwrap_or(Err(Errno::ENOTTY))
     }
 
     fn pollable(&self) -> bool {
@@ -468,8 +800,8 @@ impl FileOps for SlaveFile {
 
     fn poll(&self, _file: &File) -> u32 {
         let st = self.pair.state.lock();
-        if !st.master_open {
-            return POLLIN | POLLOUT | POLLHUP;
+        if self.hung(&st) {
+            return HUNG_POLL;
         }
         let mut events = 0;
         if st.tty.ldisc.readable() {
@@ -482,52 +814,126 @@ impl FileOps for SlaveFile {
     }
 }
 
-/// The driver of `/dev/ptmx`.
+/// Opens the slave of `pair` with the open flags `flags`, as `pty_open` of Linux. A locked slave
+/// and a slave without its master give `EIO`. Without `O_NOCTTY`, the slave becomes the
+/// controlling terminal of a session leader without one, as `tty_open_proc_set_tty`.
+fn open_slave_file(pair: &Arc<Pair>, flags: u32) -> Result<Arc<dyn FileOps>> {
+    let c = caller();
+    let ctty = flags & O_NOCTTY == 0 && c.leader() && !session_has_tty(c.sid);
+    let mut st = pair.state.lock();
+    if st.locked || !st.master_open {
+        return Err(Errno::EIO);
+    }
+    st.slave_opens += 1;
+    st.slave_closed = false;
+    if ctty && st.tty.sid == 0 {
+        st.tty.sid = c.sid;
+        st.tty.pgrp = c.pgid;
+    }
+    let hangups = st.slave_hangups;
+    drop(st);
+    Ok(Arc::new(SlaveFile { pair: pair.clone(), hangups }))
+}
+
+/// Opens the slave of the master file `file` with the open flags `flags`, for `TIOCGPTPEER`, as
+/// `ptm_open_peer` of Linux. The new file has the slave file of devpts as its location. Gives
+/// `None` if `file` is not a master.
+pub fn open_peer(file: &File, flags: u32) -> Option<Result<Arc<File>>> {
+    let master = file.ops().as_any()?.downcast_ref::<MasterFile>()?;
+    Some((|| {
+        if master.hung() {
+            return Err(Errno::EIO);
+        }
+        let pair = &master.pair;
+        let location = match &master.mount {
+            Some(mount) => {
+                let dentry = mount.root().lookup(&slave_name(pair.index))?;
+                Some(Location { mount: mount.clone(), dentry })
+            }
+            None => None,
+        };
+        let ops = open_slave_file(pair, flags)?;
+        // The flags of the open file, as `do_dentry_open` of Linux. `O_CLOEXEC` is a flag of
+        // the file descriptor.
+        let flags = flags & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC);
+        Ok(File::with_ops(ops, location, flags))
+    })())
+}
+
+/// The driver of `/dev/ptmx` and of the `ptmx` file of each instance of devpts.
 struct PtmxDevice;
 
 impl CharDevice for PtmxDevice {
+    /// Without the device file there is no instance of devpts, and the open fails as
+    /// `devpts_acquire` of Linux without `pts`.
     fn open(&self, _flags: u32) -> Result<Arc<dyn FileOps>> {
-        Ok(Arc::new(MasterFile { pair: open_pair()? }))
+        Err(Errno::ENODEV)
+    }
+
+    fn open_at(&self, at: &Location, _flags: u32) -> Result<Arc<dyn FileOps>> {
+        let (inst, mount) = ptmx_instance(at)?;
+        let master: Arc<dyn FileOps> = open_master(&inst, Some(mount))?;
+        Ok(master)
     }
 }
 
-/// The driver of the slave of one pair.
-struct SlaveDevice {
-    index: u32,
+/// Opens a new master in `inst`.
+fn open_master(inst: &Arc<Instance>, mount: Option<Arc<Mount>>) -> Result<Arc<MasterFile>> {
+    Ok(Arc::new(MasterFile { pair: open_pair(inst)?, mount, hung: AtomicBool::new(false) }))
 }
+
+/// The driver of the slaves, the major number `SLAVE_MAJOR`. A slave opens only through its file
+/// in devpts, as `pts_unix98_lookup` of Linux, else the open gives `EIO`.
+struct SlaveDevice;
 
 impl CharDevice for SlaveDevice {
     fn open(&self, _flags: u32) -> Result<Arc<dyn FileOps>> {
-        let pair = PAIRS.lock().get(&self.index).cloned().ok_or(Errno::EIO)?;
-        {
-            let mut st = pair.state.lock();
-            // A locked slave does not open, as `pty_unix98_install` and `tty_open`.
-            if st.locked || !st.master_open {
-                return Err(Errno::EIO);
-            }
-            st.slave_opens += 1;
-            st.slave_closed = false;
-        }
-        Ok(Arc::new(SlaveFile { pair }))
+        Err(Errno::EIO)
+    }
+
+    fn open_at(&self, at: &Location, flags: u32) -> Result<Arc<dyn FileOps>> {
+        let meta = at.inode().metadata();
+        let inst = instance(meta.dev).ok_or(Errno::EIO)?;
+        let pair = inst.pairs.lock().get(&minor(meta.rdev)).cloned().ok_or(Errno::EIO)?;
+        open_slave_file(&pair, flags)
     }
 }
 
-/// Adds `/dev/ptmx` to the table of character devices.
+/// Adds `/dev/ptmx` and the slaves to the table of character devices.
 pub fn init() {
     device::register_char(PTMX_RDEV, Arc::new(PtmxDevice));
+    device::register_char_major(SLAVE_MAJOR, Arc::new(SlaveDevice));
 }
 
+/// A new instance of devpts for a test, with the mount options `data`. The root holds it.
 #[cfg(test)]
-pub(crate) fn open_ptmx() -> Result<Arc<dyn FileOps>> {
-    PtmxDevice.open(0)
+pub(crate) fn test_instance(data: &[u8]) -> Result<InodeRef> {
+    new_instance(parse_options(data)?)
 }
 
+/// Opens a new master in the instance of devpts of `root`.
 #[cfg(test)]
-pub(crate) fn open_slave(index: u32) -> Result<Arc<dyn FileOps>> {
-    device::open_char(makedev(SLAVE_MAJOR, index), 0)
+pub(crate) fn open_ptmx(root: &InodeRef) -> Result<Arc<dyn FileOps>> {
+    let inst = instance(root.metadata().dev).ok_or(Errno::ENODEV)?;
+    let master: Arc<dyn FileOps> = open_master(&inst, None)?;
+    Ok(master)
 }
 
+/// Opens the slave `index` of the instance of devpts of `root`.
 #[cfg(test)]
-pub(crate) fn slave_exists(index: u32) -> bool {
-    devpts_root().lookup(&slave_name(index)).is_ok()
+pub(crate) fn open_slave(root: &InodeRef, index: u32, flags: u32) -> Result<Arc<dyn FileOps>> {
+    let inst = instance(root.metadata().dev).ok_or(Errno::ENODEV)?;
+    let pair = inst.pairs.lock().get(&index).cloned().ok_or(Errno::ENXIO)?;
+    open_slave_file(&pair, flags)
+}
+
+/// The options of a mount of devpts as a tuple, for a test: uid, gid, mode, ptmxmode and max.
+#[cfg(test)]
+pub(crate) type TestOptions = (Option<u32>, Option<u32>, u32, u32, u32);
+
+/// The options of a mount of devpts, for a test.
+#[cfg(test)]
+pub(crate) fn test_options(data: &[u8]) -> Result<TestOptions> {
+    let o = parse_options(data)?;
+    Ok((o.uid, o.gid, o.mode, o.ptmxmode, o.max))
 }

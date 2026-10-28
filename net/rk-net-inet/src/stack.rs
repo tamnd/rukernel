@@ -436,7 +436,7 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
 
 /// Takes an IPv4 packet, as `ip_rcv` and `ip_local_deliver` of Linux. The stack does not
 /// forward, and it drops the fragments.
-fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
+pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
     count(&COUNTERS.ip_in);
     let h = match Header::parse(frame.data()) {
         Ok(h) => h,

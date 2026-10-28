@@ -645,6 +645,20 @@ impl Location {
         at.dentry.is_under(&root.dentry)
     }
 
+    /// The top mount on the sibling `name` of the location, as `path_pts` of Linux finds `pts`
+    /// next to `/dev/ptmx`. Gives `None` if the sibling is not there or has no mount on it.
+    pub fn sibling_mount(&self, name: &[u8]) -> Option<Location> {
+        let ns = self.mount.namespace()?;
+        let dentry = self.dentry.parent()?.lookup(name).ok()?;
+        let mut at = Location { mount: self.mount.clone(), dentry };
+        let mut found = false;
+        while let Some(mount) = ns.mounted_on(&at) {
+            at = Location { dentry: mount.root.clone(), mount };
+            found = true;
+        }
+        found.then_some(at)
+    }
+
     /// Tells if the location is the root of its mount.
     pub fn is_mount_root(&self) -> bool {
         Arc::ptr_eq(&self.dentry, &self.mount.root)

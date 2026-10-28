@@ -519,6 +519,8 @@ static void test_pty(void)
 	if (m < 0)
 		return;
 	check("TIOCSPTLCK and TIOCGPTN", ioctl(m, TIOCSPTLCK, &lock) == 0 && ioctl(m, TIOCGPTN, &n) == 0 && n >= 0);
+	char c;
+	check("pty master read before the slave opens gives EIO", read(m, &c, 1) == -1 && errno == EIO);
 	char name[32];
 	snprintf(name, sizeof(name), "/dev/pts/%d", n);
 	int s = open(name, O_RDWR | O_NOCTTY);
@@ -530,6 +532,42 @@ static void test_pty(void)
 	check("pty master to slave", write(m, "hi\n", 3) == 3 && read(s, buf, sizeof(buf)) == 3 && memcmp(buf, "hi\n", 3) == 0);
 	check("pty echo", read(m, buf, sizeof(buf)) == 4 && memcmp(buf, "hi\r\n", 4) == 0);
 	check("pty slave to master", write(s, "ok", 2) == 2 && read(m, buf, sizeof(buf)) == 2 && memcmp(buf, "ok", 2) == 0);
+	/* TIOCGPTPEER opens the slave of the master, and gives EIO on another tty (#413). */
+	int p = ioctl(m, TIOCGPTPEER, O_RDWR | O_NOCTTY);
+	struct stat ps, ss;
+	check("TIOCGPTPEER opens the slave", p >= 0 && fstat(p, &ps) == 0 && fstat(s, &ss) == 0 && ps.st_rdev == ss.st_rdev);
+	check("TIOCGPTPEER on the slave gives EIO", ioctl(s, TIOCGPTPEER, O_RDWR) == -1 && errno == EIO);
+	close(p);
+	/* A session leader without a controlling terminal gets the slave as its controlling terminal (#413). */
+	pid_t pid = fork();
+	if (pid == 0) {
+		pid_t sid = 0;
+		if (setsid() != getpid())
+			_exit(1);
+		int t = open(name, O_RDWR);
+		if (t < 0 || ioctl(t, TIOCGSID, &sid) != 0 || sid != getpid())
+			_exit(2);
+		int tty = open("/dev/tty", O_RDWR);
+		if (tty < 0 || ioctl(tty, TIOCGSID, &sid) != 0 || sid != getpid())
+			_exit(3);
+		/* TIOCNOTTY of a session leader sends SIGHUP to the foreground group, as Linux. */
+		signal(SIGHUP, SIG_IGN);
+		if (ioctl(t, TIOCNOTTY) != 0 || ioctl(t, TIOCGSID, &sid) != -1 || errno != ENOTTY)
+			_exit(4);
+		if (ioctl(t, TIOCSCTTY, 0) != 0 || ioctl(t, TIOCGSID, &sid) != 0 || sid != getpid())
+			_exit(5);
+		/* The SIGHUP at the exit of the leader does not change its exit status. */
+		signal(SIGHUP, SIG_DFL);
+		_exit(0);
+	}
+	int status = -1;
+	check("open of a pty slave sets the controlling terminal", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/* TIOCVHANGUP hangs up the open files of the slave (#413). */
+	int h = open(name, O_RDWR | O_NOCTTY);
+	check("TIOCVHANGUP on the pty slave", h >= 0 && ioctl(h, TIOCVHANGUP, 0) == 0);
+	check("read after TIOCVHANGUP gives 0", read(h, buf, 1) == 0 && read(s, buf, 1) == 0);
+	check("write after TIOCVHANGUP gives EIO", write(s, "x", 1) == -1 && errno == EIO);
+	close(h);
 	close(s);
 	check("pty master read after the slave closes gives EIO", read(m, buf, 1) == -1 && errno == EIO);
 	close(m);

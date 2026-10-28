@@ -7,6 +7,10 @@
 //! R1 has no I/O APIC, so the serial port has no interrupt. The driver reads the serial port in
 //! the bottom half of rk-frame instead, after each interrupt. The timer interrupts 250 times each
 //! second, so the input comes in at most 4 ms, and `^C` stops a program that does not read.
+//!
+//! A terminal has a session, the session of the processes that have it as their controlling
+//! terminal. A session has at most one controlling terminal, so the controlling terminal of a
+//! process is the terminal with the session of the process.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -22,7 +26,7 @@ use ldisc::LineDiscipline;
 use rk_abi::Errno;
 use rk_abi::native::ioctls::{
     FIONREAD, TCFLSH, TCGETS, TCSBRK, TCSBRKP, TCSETS, TCSETSF, TCSETSW, TCXONC, TIOCGPGRP,
-    TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
+    TIOCGPTPEER, TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
 };
 use rk_abi::native::poll::{POLLIN, POLLOUT};
 use rk_abi::native::termbits::{TCIFLUSH, TCIOFLUSH};
@@ -90,6 +94,59 @@ fn send_signals(signals: Vec<(u32, u32)>) {
             }
         }
     }
+}
+
+/// The process that runs a terminal operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Caller {
+    /// The process ID.
+    pub pid: u32,
+    /// The process group ID.
+    pub pgid: u32,
+    /// The session ID.
+    pub sid: u32,
+}
+
+impl Caller {
+    /// Tells if the process is the leader of its session.
+    fn leader(&self) -> bool {
+        self.pid != 0 && self.pid == self.sid
+    }
+}
+
+/// The function that gives the process that runs now. The process layer sets it.
+static CALLER: SpinLock<Option<fn() -> Caller>> = SpinLock::new(None);
+
+/// Sets the function that gives the process that runs now, for the controlling terminal.
+pub fn set_caller_hook(f: fn() -> Caller) {
+    *CALLER.lock() = Some(f);
+}
+
+/// The process that runs now. Without the hook it is the kernel, which has no session.
+fn caller() -> Caller {
+    let hook = *CALLER.lock();
+    hook.map_or_else(Caller::default, |f| f())
+}
+
+/// Tells if the process that runs now has `CAP_SYS_ADMIN`.
+fn admin() -> bool {
+    rk_vfs::cred::current().capable(rk_vfs::cred::cap::SYS_ADMIN)
+}
+
+/// Tells if the session `sid` has a controlling terminal.
+fn session_has_tty(sid: u32) -> bool {
+    if sid == 0 {
+        return false;
+    }
+    let console = CONSOLE.lock().sid;
+    console == sid || pty::slave_has_session(sid)
+}
+
+/// Ends the controlling terminal of the session `sid` after the exit of its leader, as
+/// `disassociate_ctty(1)` of Linux for a pseudo terminal: the foreground process group gets
+/// `SIGHUP`, and the terminal has no session after it. The console stays with its session.
+pub fn session_leader_exit(sid: u32) {
+    send_signals(pty::end_session(sid));
 }
 
 /// The readers of the console wait here for input.
@@ -199,6 +256,8 @@ impl FileOps for ConsoleFile {
                 }
             }
             TIOCSCTTY | TIOCNOTTY | TCSBRK | TCSBRKP | TCXONC => {}
+            // Only the master of a pseudo terminal has a peer, as `ptm_open_peer` of Linux.
+            TIOCGPTPEER => return Err(Errno::EIO),
             _ => return Err(Errno::ENOTTY),
         }
         Ok(0)
@@ -227,12 +286,27 @@ impl CharDevice for ConsoleDevice {
     }
 }
 
+/// The driver of `/dev/tty`, the controlling terminal of the caller, as
+/// `tty_open_current_tty` of Linux. A process without a pseudo terminal as its controlling
+/// terminal gets the console.
+struct CurrentTtyDevice;
+
+impl CharDevice for CurrentTtyDevice {
+    fn open(&self, flags: u32) -> Result<Arc<dyn FileOps>> {
+        match pty::open_ctty(caller().sid, flags) {
+            Some(ops) => ops,
+            None => Ok(Arc::new(ConsoleFile)),
+        }
+    }
+}
+
 /// Adds the console devices and `/dev/ptmx` to the table of character devices, and adds
 /// `poll_input` to the bottom half.
 pub fn init() {
-    for rdev in [TTY_RDEV, CONSOLE_RDEV, TTYS0_RDEV] {
+    for rdev in [CONSOLE_RDEV, TTYS0_RDEV] {
         device::register_char(rdev, Arc::new(ConsoleDevice));
     }
+    device::register_char(TTY_RDEV, Arc::new(CurrentTtyDevice));
     pty::init();
     #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     rk_frame::task::add_bottom_half(poll_input);
