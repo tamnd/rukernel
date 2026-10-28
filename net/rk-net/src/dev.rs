@@ -9,10 +9,10 @@
 
 use crate::buf::NetBuf;
 use crate::consts::{
-    ARPHRD_ETHER, ARPHRD_LOOPBACK, IF_OPER_DOWN, IF_OPER_LOWERLAYERDOWN, IF_OPER_UNKNOWN,
-    IF_OPER_UP, IFF_ALLMULTI, IFF_AUTOMEDIA, IFF_BROADCAST, IFF_DEBUG, IFF_DORMANT, IFF_DYNAMIC,
-    IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP, IFF_NOTRAILERS, IFF_PORTSEL, IFF_PROMISC,
-    IFF_RUNNING, IFF_UP, IFNAMSIZ,
+    ARPHRD_ETHER, ARPHRD_LOOPBACK, ARPHRD_NONE, IF_OPER_DOWN, IF_OPER_LOWERLAYERDOWN,
+    IF_OPER_UNKNOWN, IF_OPER_UP, IFF_ALLMULTI, IFF_AUTOMEDIA, IFF_BROADCAST, IFF_DEBUG,
+    IFF_DORMANT, IFF_DYNAMIC, IFF_LOOPBACK, IFF_LOWER_UP, IFF_MULTICAST, IFF_NOARP, IFF_NOTRAILERS,
+    IFF_POINTOPOINT, IFF_PORTSEL, IFF_PROMISC, IFF_RUNNING, IFF_UP, IFNAMSIZ,
 };
 use crate::ether::{HLEN, MacAddr};
 use crate::ns::{self, NetNs};
@@ -34,6 +34,9 @@ pub enum LinkKind {
     Ether,
     /// The loopback device `lo`.
     Loopback,
+    /// A TUN device, which has no link header. A frame inside the kernel still starts with an
+    /// Ethernet header with zero addresses, as on the loopback device.
+    Tun,
 }
 
 impl LinkKind {
@@ -42,6 +45,7 @@ impl LinkKind {
         match self {
             Self::Ether => ARPHRD_ETHER,
             Self::Loopback => ARPHRD_LOOPBACK,
+            Self::Tun => ARPHRD_NONE,
         }
     }
 
@@ -50,6 +54,7 @@ impl LinkKind {
         match self {
             Self::Ether => IFF_BROADCAST | IFF_MULTICAST,
             Self::Loopback => IFF_LOOPBACK,
+            Self::Tun => IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST,
         }
     }
 }
@@ -87,7 +92,7 @@ pub trait NetDriver: Send + Sync {
     /// The smallest MTU, as `dev->min_mtu` of Linux.
     fn min_mtu(&self) -> u32 {
         match self.kind() {
-            LinkKind::Ether => ETH_MIN_MTU,
+            LinkKind::Ether | LinkKind::Tun => ETH_MIN_MTU,
             LinkKind::Loopback => 0,
         }
     }
@@ -325,7 +330,7 @@ impl NetDevice {
     pub fn max_mtu(&self) -> u32 {
         match self.kind {
             LinkKind::Loopback => 0,
-            LinkKind::Ether => self.driver.max_mtu(),
+            LinkKind::Ether | LinkKind::Tun => self.driver.max_mtu(),
         }
     }
 
@@ -444,7 +449,7 @@ impl NetDevice {
     pub fn broadcast(&self) -> MacAddr {
         match self.kind {
             LinkKind::Ether => MacAddr::BROADCAST,
-            LinkKind::Loopback => MacAddr::ZERO,
+            LinkKind::Loopback | LinkKind::Tun => MacAddr::ZERO,
         }
     }
 
@@ -472,6 +477,12 @@ impl NetDevice {
     /// Sends a frame that starts with the link header. Gives `ENETDOWN` if the device is down,
     /// and `EMSGSIZE` if the payload is larger than the MTU.
     pub fn transmit(&self, frame: NetBuf) -> Result<()> {
+        self.transmit_from(frame, 0)
+    }
+
+    /// Sends a frame as `transmit`, for the packet socket with the inode number `skip`. That
+    /// socket does not get a copy of its own frame, as `skb->sk` of Linux.
+    pub fn transmit_from(&self, frame: NetBuf, skip: u64) -> Result<()> {
         if !self.is_up() {
             add(&self.counters.tx_dropped, 1);
             return Err(Errno::ENETDOWN);
@@ -481,6 +492,7 @@ impl NetDevice {
             return Err(Errno::EMSGSIZE);
         }
         let len = frame.len();
+        crate::packet::tap(self, &frame, crate::packet::Direction::Out(skip));
         match self.driver.transmit(frame) {
             Ok(()) => {
                 add(&self.counters.tx_packets, 1);
@@ -514,8 +526,26 @@ impl NetDevice {
             add(&self.counters.rx_packets, 1);
             add(&self.counters.rx_bytes, frame.len());
             frame.ifindex = self.ifindex();
+            crate::packet::tap(self, &frame, crate::packet::Direction::In);
             deliver(self, frame);
         })
+    }
+}
+
+/// The function that polls the devices now, which the stack sets.
+static RX_KICK: SpinLock<Option<fn()>> = SpinLock::new(None);
+
+/// Sets the function that polls the devices now. The IPv4 stack sets it at boot.
+pub fn set_rx_kick(f: fn()) {
+    *RX_KICK.lock() = Some(f);
+}
+
+/// Polls the devices now, as a driver that has a new received frame does with `napi_schedule`
+/// of Linux. A TUN device calls this after a write.
+pub fn kick_rx() {
+    let f = *RX_KICK.lock();
+    if let Some(f) = f {
+        f();
     }
 }
 
@@ -548,7 +578,7 @@ pub fn register_named(driver: Arc<dyn NetDriver>, name: Option<&[u8]>) -> Result
         let name = match (kind, name) {
             (LinkKind::Loopback, _) if taken("lo") => return Err(Errno::EEXIST),
             (LinkKind::Loopback, _) => String::from("lo"),
-            (LinkKind::Ether, Some(name)) => {
+            (LinkKind::Ether | LinkKind::Tun, Some(name)) => {
                 let name = core::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
                 if !valid_name(name.as_bytes()) {
                     return Err(Errno::EINVAL);
@@ -558,7 +588,7 @@ pub fn register_named(driver: Arc<dyn NetDriver>, name: Option<&[u8]>) -> Result
                 }
                 String::from(name)
             }
-            (LinkKind::Ether, None) => {
+            (LinkKind::Ether | LinkKind::Tun, None) => {
                 let prefix = driver.link_kind().unwrap_or("eth");
                 match (0..).map(|n| format!("{prefix}{n}")).find(|n| !taken(n)) {
                     Some(name) => name,
@@ -608,9 +638,10 @@ pub fn unregister(dev: &Arc<NetDevice>) {
 
 /// Moves a device to the namespace `to`, as `__dev_change_net_namespace` of Linux. The device
 /// goes down, and it keeps its index if the index is free in `to`. Gives `EINVAL` for the
-/// loopback device, and `EEXIST` if `to` has a device with the same name.
+/// loopback device and for a TUN or TAP device, which have `NETIF_F_NETNS_LOCAL` on Linux, and
+/// `EEXIST` if `to` has a device with the same name.
 pub fn move_to(dev: &Arc<NetDevice>, to: &NetNs) -> Result<()> {
-    if dev.kind == LinkKind::Loopback {
+    if dev.kind == LinkKind::Loopback || dev.link_kind() == Some(crate::tun::KIND) {
         return Err(Errno::EINVAL);
     }
     let net = to.index();

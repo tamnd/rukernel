@@ -59,6 +59,8 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <net/if.h>
+#include <netpacket/packet.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -4044,11 +4046,120 @@ static void test_tcp_host(int port)
 	close(s);
 }
 
+#define RK_ETH_P_ALL 0x0003
+#define RK_TUNSETIFF _IOW('T', 202, int)
+#define RK_IFF_TUN 0x0001
+#define RK_IFF_NO_PI 0x1000
+
+/* An AF_PACKET socket on lo gets the frames of a datagram over lo. */
+static void test_packet_lo(void)
+{
+	int p = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(RK_ETH_P_ALL));
+	check("an AF_PACKET socket opens", p >= 0);
+	if (p < 0)
+		return;
+	struct sockaddr_ll ll = { .sll_family = AF_PACKET, .sll_protocol = htons(RK_ETH_P_ALL),
+				  .sll_ifindex = if_nametoindex("lo") };
+	check("an AF_PACKET socket binds to lo", bind(p, (struct sockaddr *)&ll, sizeof(ll)) == 0);
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in to = inet_addr4(INADDR_LOOPBACK, 9);
+	sendto(u, "rkpkt", 5, 0, (struct sockaddr *)&to, sizeof(to));
+	int found = 0, frames = 0;
+	for (;;) {
+		struct pollfd pf = { .fd = p, .events = POLLIN };
+		if (poll(&pf, 1, 1000) != 1)
+			break;
+		unsigned char buf[256];
+		struct sockaddr_ll from;
+		socklen_t fl = sizeof(from);
+		long n = recvfrom(p, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
+		if (n < 0)
+			break;
+		frames++;
+		/* An Ethernet header, an IPv4 header of 20 bytes and a UDP header come first. */
+		if (n == 14 + 20 + 8 + 5 && buf[12] == 8 && buf[13] == 0 && from.sll_family == AF_PACKET &&
+		    memcmp(buf + 42, "rkpkt", 5) == 0)
+			found++;
+		if (found == 2)
+			break;
+	}
+	printf("init: inet: packet: %d frames on lo, %d with the datagram\n", frames, found);
+	check("an AF_PACKET socket gets the datagram out and in on lo", found == 2);
+	close(u);
+	close(p);
+}
+
+/* Makes a TUN device, sends a datagram through it, and writes an echo request into it. The
+ * stack must send the echo reply back to the TUN file. */
+static void test_tun(void)
+{
+	int t = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+	check("/dev/net/tun opens", t >= 0);
+	if (t < 0)
+		return;
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, "rktun%d");
+	ifr.ifr_flags = RK_IFF_TUN | RK_IFF_NO_PI;
+	check("TUNSETIFF makes rktun0", ioctl(t, RK_TUNSETIFF, &ifr) == 0 &&
+						strcmp(ifr.ifr_name, "rktun0") == 0);
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in a = inet_addr4(0x0a090901, 0);
+	memcpy(&ifr.ifr_addr, &a, sizeof(a));
+	int r = ioctl(s, SIOCSIFADDR, &ifr);
+	a = inet_addr4(0xffffff00, 0);
+	memcpy(&ifr.ifr_netmask, &a, sizeof(a));
+	r |= ioctl(s, SIOCSIFNETMASK, &ifr);
+	r |= ioctl(s, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags |= IFF_UP;
+	r |= ioctl(s, SIOCSIFFLAGS, &ifr);
+	check("rktun0 gets 10.9.9.1/24 and goes up", r == 0);
+
+	struct sockaddr_in peer = inet_addr4(0x0a090902, 9);
+	sendto(s, "rktun", 5, 0, (struct sockaddr *)&peer, sizeof(peer));
+	unsigned char buf[256];
+	long n = -1;
+	for (int i = 0; i < 10; i++) {
+		struct pollfd pf = { .fd = t, .events = POLLIN };
+		if (poll(&pf, 1, 1000) != 1)
+			break;
+		n = read(t, buf, sizeof(buf));
+		if (n == 20 + 8 + 5 && buf[0] == 0x45)
+			break;
+	}
+	printf("init: inet: tun: read %ld bytes\n", n);
+	check("a TUN file reads the datagram as an IPv4 packet",
+	      n == 33 && buf[9] == IPPROTO_UDP && memcmp(buf + 28, "rktun", 5) == 0);
+
+	/* An echo request from 10.9.9.2 to 10.9.9.1. */
+	unsigned char req[28] = { 0x45, 0, 0, 28, 0, 1, 0, 0, 64, IPPROTO_ICMP, 0, 0,
+				  10, 9, 9, 2, 10, 9, 9, 1, 8, 0, 0, 0, 0x56, 0x78, 0, 1 };
+	unsigned short sum = inet_sum(req, 20);
+	memcpy(req + 10, &sum, 2);
+	sum = inet_sum(req + 20, 8);
+	memcpy(req + 22, &sum, 2);
+	check("a TUN file takes a packet", write(t, req, sizeof(req)) == sizeof(req));
+	int reply = 0;
+	for (int i = 0; i < 10 && !reply; i++) {
+		struct pollfd pf = { .fd = t, .events = POLLIN };
+		if (poll(&pf, 1, 1000) != 1)
+			break;
+		n = read(t, buf, sizeof(buf));
+		reply = n == 28 && buf[9] == IPPROTO_ICMP && buf[20] == 0 && buf[24] == 0x56 &&
+			memcmp(buf + 16, req + 12, 4) == 0;
+	}
+	check("the stack replies to an echo request through the TUN device", reply);
+	close(s);
+	close(t);
+	check("rktun0 goes away when the file closes", if_nametoindex("rktun0") == 0);
+}
+
 static void test_inet(int port)
 {
 	test_inet_ping();
 	test_inet_dns();
 	test_inet_lo();
+	test_packet_lo();
+	test_tun();
 	test_tcp_lo();
 	test_tcp_host(port);
 }

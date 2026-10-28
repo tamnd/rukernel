@@ -80,10 +80,13 @@ pub fn init() {
 }
 
 /// The text of /proc/net/unix, as `unix_seq_show` of Linux. The address of a socket shows as 0,
-/// as Linux shows it with `kernel.kptr_restrict`.
+/// as Linux shows it with `kernel.kptr_restrict`. The file shows only the sockets of the network
+/// namespace of the reader, as `unix_get_first` of Linux, which checks `sock_net`.
 pub fn show() -> String {
     let mut out = String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
-    let all: Vec<Arc<Unix>> = ALL.lock().values().filter_map(Weak::upgrade).collect();
+    let net = rk_net::ns::current().id();
+    let all: Vec<Arc<Unix>> =
+        ALL.lock().values().filter_map(Weak::upgrade).filter(|u| u.net == net).collect();
     for u in all {
         let s = u.state.lock();
         if s.closed {

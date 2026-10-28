@@ -4,33 +4,79 @@
 //! devices, for example `SIOCGIFINDEX`, as each socket of Linux does. Programs such as
 //! `tst_ns_ifmove` of LTP make one only for these ioctls.
 //!
-//! This socket does not get the frames that the devices receive yet: a receive waits until its
-//! timeout or a signal.
+//! A socket gets a copy of each frame that a device of its namespace receives, if the protocol
+//! and the device match, as `packet_rcv` of Linux. A socket of `ETH_P_ALL` also gets the frames
+//! that the devices send, as `dev_queue_xmit_nit` of Linux. A `SOCK_RAW` socket gets the link
+//! header, and a `SOCK_DGRAM` socket gets the payload. A TUN device has no link header, thus its
+//! frames have none for both types.
 
 use crate::buf::NetBuf;
-use crate::consts::{MSG_DONTWAIT, MSG_OOB, SOCK_DGRAM, SOCK_RAW};
-use crate::dev;
+use crate::consts::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW};
+use crate::dev::{self, LinkKind, NetDevice};
 use crate::ether::{EthHeader, HLEN, MacAddr};
 use crate::options::Options;
-use crate::{Message, PathOps, Received, Socket, next_ino, wait_for};
-use alloc::sync::Arc;
+use crate::{Message, PathOps, Received, Socket, next_ino, ns, wait_for};
+use alloc::collections::VecDeque;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
-use rk_abi::native::poll::{POLLOUT, POLLWRBAND, POLLWRNORM};
+use rk_abi::native::if_ether::ETH_P_ALL;
+use rk_abi::native::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::socket::{
     SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
-use rk_vfs::wait::WaitQueue;
+use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The family of the packet sockets, `AF_PACKET` of <linux/socket.h>.
 pub const AF_PACKET: u32 = 17;
 
 /// The size of `struct sockaddr_ll` of <linux/if_packet.h>.
 const SOCKADDR_LL: usize = 20;
+
+/// The level of the options of packet sockets, `SOL_PACKET` of <linux/socket.h>.
+pub const SOL_PACKET: u32 = 263;
+/// The options `PACKET_ADD_MEMBERSHIP` and `PACKET_DROP_MEMBERSHIP` of <linux/if_packet.h>.
+const PACKET_ADD_MEMBERSHIP: u32 = 1;
+const PACKET_DROP_MEMBERSHIP: u32 = 2;
+
+/// The types of a received frame, `PACKET_*` of <linux/if_packet.h>: to this host.
+pub const PACKET_HOST: u8 = 0;
+/// To all hosts.
+pub const PACKET_BROADCAST: u8 = 1;
+/// To a group of hosts.
+pub const PACKET_MULTICAST: u8 = 2;
+/// To another host.
+pub const PACKET_OTHERHOST: u8 = 3;
+/// A frame that this host sends.
+pub const PACKET_OUTGOING: u8 = 4;
+
+/// The memory that each queued frame uses in addition to its data, for the limit of
+/// `SO_RCVBUF`, as the `truesize` of an `sk_buff` of Linux.
+const FRAME_OVERHEAD: usize = 256;
+
+/// The direction of a frame for `tap`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    /// The device received the frame.
+    In,
+    /// The device sends the frame. The packet socket with this inode number sent it, or 0.
+    Out(u64),
+}
+
+/// A frame in the receive queue of a socket: the data and the address of the sender.
+struct Queued {
+    data: Vec<u8>,
+    addr: [u8; SOCKADDR_LL],
+}
+
+/// The packet sockets of all namespaces, for `tap`.
+static SOCKETS: SpinLock<Vec<Weak<PacketSocket>>> = SpinLock::new(Vec::new());
+/// The count of packet sockets, so that `tap` does nothing when there is none.
+static COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// A packet socket.
 pub struct PacketSocket {
@@ -41,7 +87,19 @@ pub struct PacketSocket {
     /// The device of `bind`, or 0 for all devices.
     ifindex: AtomicU32,
     options: SpinLock<Options>,
-    wait: WaitQueue,
+    wait: Arc<WaitQueue>,
+    /// The index of the namespace of the socket. The socket holds its namespace, so the index
+    /// does not change.
+    net: usize,
+    /// The received frames, and the memory that they use.
+    queue: SpinLock<(VecDeque<Queued>, usize)>,
+    events: AtomicU64,
+}
+
+impl Drop for PacketSocket {
+    fn drop(&mut self) {
+        COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl PacketSocket {
@@ -54,14 +112,103 @@ impl PacketSocket {
         if kind != SOCK_RAW && kind != SOCK_DGRAM {
             return Err(Errno::ESOCKTNOSUPPORT);
         }
-        Ok(Arc::new(Self {
+        let sock = Arc::new(Self {
             ino: next_ino(),
             kind,
             protocol: AtomicU32::new(protocol & 0xffff),
             ifindex: AtomicU32::new(0),
             options: SpinLock::new(Options::default()),
-            wait: WaitQueue::new(),
-        }))
+            wait: Arc::new(WaitQueue::new()),
+            net: ns::current_index(),
+            queue: SpinLock::new((VecDeque::new(), 0)),
+            events: AtomicU64::new(0),
+        });
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        let mut list = SOCKETS.lock();
+        list.retain(|w| w.strong_count() > 0);
+        list.push(Arc::downgrade(&sock));
+        Ok(sock)
+    }
+
+    /// Tells if the socket takes a frame of the protocol `ethertype` on `dev`.
+    fn takes(&self, dev: &NetDevice, ethertype: u16, dir: Direction) -> bool {
+        let protocol = u16::from_be(self.protocol() as u16);
+        if protocol == 0 || self.net != dev.net() {
+            return false;
+        }
+        let ifindex = self.ifindex.load(Ordering::Relaxed);
+        if ifindex != 0 && ifindex != dev.ifindex() {
+            return false;
+        }
+        match dir {
+            Direction::In => u32::from(protocol) == ETH_P_ALL || protocol == ethertype,
+            Direction::Out(skip) => u32::from(protocol) == ETH_P_ALL && skip != self.ino,
+        }
+    }
+
+    /// Puts a copy of `frame` in the queue, as `packet_rcv` of Linux. A full queue drops it.
+    fn queue(&self, dev: &NetDevice, frame: &[u8], h: &EthHeader, pkttype: u8) {
+        let data = if self.kind == SOCK_DGRAM || dev.kind() == LinkKind::Tun {
+            &frame[HLEN..]
+        } else {
+            frame
+        };
+        let mut addr = [0u8; SOCKADDR_LL];
+        addr[..2].copy_from_slice(&(AF_PACKET as u16).to_ne_bytes());
+        addr[2..4].copy_from_slice(&h.ethertype.to_be_bytes());
+        addr[4..8].copy_from_slice(&dev.ifindex().to_ne_bytes());
+        addr[8..10].copy_from_slice(&dev.kind().arphrd().to_ne_bytes());
+        addr[10] = pkttype;
+        if dev.kind() != LinkKind::Tun {
+            addr[11] = 6;
+            addr[12..18].copy_from_slice(&h.src.0);
+        }
+        let size = data.len() + FRAME_OVERHEAD;
+        let limit = self.options.lock().rcvbuf as usize;
+        {
+            let mut q = self.queue.lock();
+            if q.1 + size > limit && !q.0.is_empty() {
+                return;
+            }
+            q.0.push_back(Queued { data: data.to_vec(), addr });
+            q.1 += size;
+        }
+        self.events.fetch_add(1, Ordering::Relaxed);
+        self.wait.wake_all();
+    }
+}
+
+/// Gives a copy of `frame` to each packet socket that takes it, as `__netif_receive_skb_core`
+/// and `dev_queue_xmit_nit` of Linux. The device calls this for each frame that it receives or
+/// sends.
+pub fn tap(dev: &NetDevice, frame: &NetBuf, dir: Direction) {
+    if COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let data = frame.data();
+    let Some(h) = EthHeader::parse(data) else {
+        return;
+    };
+    let list: Vec<Arc<PacketSocket>> = SOCKETS
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|s| s.takes(dev, h.ethertype, dir))
+        .collect();
+    if list.is_empty() {
+        return;
+    }
+    let pkttype = match dir {
+        Direction::Out(_) => PACKET_OUTGOING,
+        Direction::In if dev.kind() != LinkKind::Ether => PACKET_HOST,
+        Direction::In if h.dst == dev.mac() => PACKET_HOST,
+        Direction::In if h.dst.is_broadcast() => PACKET_BROADCAST,
+        Direction::In if h.dst.is_multicast() => PACKET_MULTICAST,
+        Direction::In => PACKET_OTHERHOST,
+    };
+    // The lock of the list is not held here, so a full queue or a wake cannot block it.
+    for sock in list {
+        sock.queue(dev, data, &h, pkttype);
     }
 }
 
@@ -137,17 +284,40 @@ impl Socket for PacketSocket {
         } else if len < HLEN {
             return Err(Errno::EINVAL);
         }
-        dev.transmit(frame)?;
+        dev.transmit_from(frame, self.ino)?;
         Ok(len)
     }
 
-    fn recv(&self, _len: usize, flags: u32, nonblock: bool) -> Result<Received> {
+    /// Takes one frame from the queue, as `packet_recvmsg` of Linux. The address is the
+    /// `struct sockaddr_ll` of the sender.
+    fn recv(&self, len: usize, flags: u32, nonblock: bool) -> Result<Received> {
         if flags & MSG_OOB != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
         let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
         let timeout = self.options.lock().rcvtimeo;
-        wait_for(&self.wait, timeout, || if nonblock { Err(Errno::EAGAIN) } else { Ok(None) })
+        let item = wait_for(&self.wait, timeout, || {
+            let mut q = self.queue.lock();
+            if flags & MSG_PEEK != 0 {
+                if let Some(f) = q.0.front() {
+                    return Ok(Some(Queued { data: f.data.clone(), addr: f.addr }));
+                }
+            } else if let Some(f) = q.0.pop_front() {
+                q.1 = q.1.saturating_sub(f.data.len() + FRAME_OVERHEAD);
+                return Ok(Some(f));
+            }
+            if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
+        })?;
+        let full = item.data.len();
+        let mut data = item.data;
+        data.truncate(len);
+        Ok(Received {
+            flags: if full > len { MSG_TRUNC } else { 0 },
+            data,
+            len: full,
+            addr: Some(item.addr.to_vec()),
+            ..Received::default()
+        })
     }
 
     /// Gives the `struct sockaddr_ll` of the socket, as `packet_getname` of Linux.
@@ -166,6 +336,9 @@ impl Socket for PacketSocket {
     }
 
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
+        if level == SOL_PACKET {
+            return Err(Errno::ENOPROTOOPT);
+        }
         if level != SOL_SOCKET {
             return Err(Errno::ENOPROTOOPT);
         }
@@ -180,6 +353,19 @@ impl Socket for PacketSocket {
     }
 
     fn set_option(&self, level: u32, name: u32, value: &[u8]) -> Result<()> {
+        // A membership takes the frames of a group or all frames. Each device here gives all
+        // frames that it gets to the sockets, thus the call only checks the device.
+        if level == SOL_PACKET {
+            return match name {
+                PACKET_ADD_MEMBERSHIP | PACKET_DROP_MEMBERSHIP => {
+                    let ifindex = value.get(..4).ok_or(Errno::EINVAL)?;
+                    let ifindex =
+                        u32::from_ne_bytes([ifindex[0], ifindex[1], ifindex[2], ifindex[3]]);
+                    dev::by_index(ifindex).map(|_| ()).ok_or(Errno::ENODEV)
+                }
+                _ => Err(Errno::ENOPROTOOPT),
+            };
+        }
         if level != SOL_SOCKET {
             return Err(Errno::ENOPROTOOPT);
         }
@@ -190,7 +376,21 @@ impl Socket for PacketSocket {
     }
 
     fn poll(&self) -> u32 {
-        POLLOUT | POLLWRNORM | POLLWRBAND
+        let read = if self.queue.lock().0.is_empty() { 0 } else { POLLIN | POLLRDNORM };
+        read | POLLOUT | POLLWRNORM | POLLWRBAND
+    }
+
+    fn poll_wait(&self, table: &mut PollTable) {
+        table.add(&self.wait);
+    }
+
+    fn event_count(&self) -> u64 {
+        self.events.load(Ordering::Relaxed)
+    }
+
+    /// The size of the first frame, as `packet_ioctl` of Linux for `SIOCINQ`.
+    fn readable(&self) -> Result<usize> {
+        Ok(self.queue.lock().0.front().map_or(0, |f| f.data.len()))
     }
 
     fn as_any(&self) -> &dyn Any {

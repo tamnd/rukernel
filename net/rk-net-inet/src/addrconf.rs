@@ -3,8 +3,14 @@
 //!
 //! The loopback device gets `::1/128`, and each Ethernet device gets a link local address from
 //! its MAC address when it goes up. A router advertisement adds the default route, the routes
-//! of the prefixes and the addresses of SLAAC. The stack does no duplicate address detection, so
-//! an address is never tentative.
+//! of the prefixes and the addresses of SLAAC.
+//!
+//! A new address on an Ethernet device is tentative while the duplicate address detection of
+//! RFC 4862 runs, as `addrconf_dad_begin` of Linux. The device joins the solicited node group of
+//! the address and sends an MLD report for it. Then it sends `dad_transmits` neighbour
+//! solicitations from `::`, one each second. If no other node answers, the address is no longer
+//! tentative. An answer, or a probe of another node for the same address, marks the address
+//! `dadfailed`. A tentative address is not a source address.
 //!
 //! Each change takes the lock of the table for a short time. The notifications go out after the
 //! lock is free, as in `fib`.
@@ -19,9 +25,10 @@ use crate::stack6::{self, ROUTES6};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_addr::{
-    IFA_ADDRESS, IFA_CACHEINFO, IFA_F_DEPRECATED, IFA_F_HOMEADDRESS, IFA_F_MANAGETEMPADDR,
-    IFA_F_MCAUTOJOIN, IFA_F_NODAD, IFA_F_NOPREFIXROUTE, IFA_F_OPTIMISTIC, IFA_F_PERMANENT,
-    IFA_FLAGS, IFA_LOCAL, IFA_MC_USERS, IFA_PROTO, IFA_RT_PRIORITY, IFA_TARGET_NETNSID,
+    IFA_ADDRESS, IFA_CACHEINFO, IFA_F_DADFAILED, IFA_F_DEPRECATED, IFA_F_HOMEADDRESS,
+    IFA_F_MANAGETEMPADDR, IFA_F_MCAUTOJOIN, IFA_F_NODAD, IFA_F_NOPREFIXROUTE, IFA_F_OPTIMISTIC,
+    IFA_F_PERMANENT, IFA_F_TENTATIVE, IFA_FLAGS, IFA_LOCAL, IFA_MC_USERS, IFA_PROTO,
+    IFA_RT_PRIORITY, IFA_TARGET_NETNSID,
 };
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_DUMP_FILTERED, NLM_F_EXCL, NLM_F_MULTI};
 use rk_abi::native::rtnetlink::{
@@ -32,7 +39,7 @@ use rk_abi::native::rtnetlink::{
     RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_BLACKHOLE, RTN_LOCAL, RTN_PROHIBIT, RTN_UNICAST,
     RTN_UNREACHABLE, RTNLGRP_IPV6_IFADDR, RTNLGRP_IPV6_ROUTE, RTPROT_BOOT,
 };
-use rk_net::consts::AF_INET6;
+use rk_net::consts::{AF_INET6, IFF_NOARP};
 use rk_net::dev::{self, Event, LinkKind, NetDevice};
 use rk_net::netlink::msg::{Attrs, Builder, attrs};
 use rk_net::netlink::{self, Origin, Request};
@@ -201,10 +208,56 @@ pub(crate) fn add_addr(mut a: Addr6, origin: Origin) -> Result<()> {
     let now = now_cs();
     a.tstamp = now;
     a.cstamp = now;
+    let dev = dev::by_index(a.ifindex);
+    let dad = dev.as_ref().is_some_and(|d| needs_dad(d, &a));
+    if dad {
+        a.flags |= IFA_F_TENTATIVE;
+    }
     let changes = ROUTES6.lock().insert_addr(a.clone())?;
     notify_addr(&a, RTM_NEWADDR, origin);
     notify_changes(&changes);
+    // A device that is down starts the detection when it goes up.
+    if let Some(d) = dev.filter(|d| d.is_up()) {
+        stack6::join(&d, &a.addr);
+        if dad {
+            stack6::start_dad(a.ifindex, a.addr);
+        }
+    }
     Ok(())
+}
+
+/// Tells if the address `a` on `d` needs duplicate address detection, as `addrconf_dad_begin`
+/// of Linux: not on the loopback device, a TUN device or a device with `IFF_NOARP`, not with
+/// `IFA_F_NODAD`, and only with `accept_dad` and `dad_transmits` above 0.
+fn needs_dad(d: &NetDevice, a: &Addr6) -> bool {
+    let ifindex = d.ifindex();
+    let conf = |scope, name| rk_net::sysctl::conf(Family::Ipv6, scope, name);
+    let accept = conf(Scope::All, "accept_dad").max(conf(Scope::Dev(ifindex), "accept_dad"));
+    d.kind() == LinkKind::Ether
+        && d.flags() & IFF_NOARP == 0
+        && a.flags & IFA_F_NODAD == 0
+        && accept > 0
+        && conf(Scope::Dev(ifindex), "dad_transmits") > 0
+}
+
+/// Ends the detection of `addr` on `ifindex`, as `addrconf_dad_completed` of Linux. With
+/// `failed` the address stays tentative and gets `IFA_F_DADFAILED`, as `addrconf_dad_failure`.
+pub(crate) fn dad_done(ifindex: u32, addr: &Ip, failed: bool) {
+    update_addr(
+        ifindex,
+        |a| {
+            if a.addr != *addr || a.flags & IFA_F_TENTATIVE == 0 {
+                return false;
+            }
+            if failed {
+                a.flags |= IFA_F_DADFAILED;
+            } else {
+                a.flags &= !IFA_F_TENTATIVE;
+            }
+            true
+        },
+        Origin::KERNEL,
+    );
 }
 
 /// Changes an address that is there and sends its notification. `f` changes the address and
@@ -326,14 +379,28 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
                 ROUTES6.lock().set_loopback(ifindex);
                 // The address can be there from an earlier time.
                 let _ = add_addr(Addr6::new(ifindex, ip::LOOPBACK, 128), Origin::KERNEL);
-            } else if d.kind() == LinkKind::Ether {
-                let a = Addr6::new(ifindex, ipv6::link_local(ipv6::eui64(d.mac())), 64);
-                let _ = add_addr(a, Origin::KERNEL);
             }
+            let ll = ipv6::link_local(ipv6::eui64(d.mac()));
+            let added = d.kind() == LinkKind::Ether
+                && add_addr(Addr6::new(ifindex, ll, 64), Origin::KERNEL).is_ok();
             let changes = ROUTES6.lock().link_up(ifindex, loopback);
             notify_changes(&changes);
             if d.kind() == LinkKind::Ether {
                 stack6::start_solicit(ifindex);
+            }
+            // The addresses that came while the device was down start their detection now. The
+            // new link local address started it in `add_addr`.
+            let waiting: Vec<(Ip, bool)> = ROUTES6
+                .lock()
+                .addrs_of(ifindex)
+                .filter(|a| !(added && a.addr == ll))
+                .map(|a| (a.addr, a.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED) == IFA_F_TENTATIVE))
+                .collect();
+            for (addr, dad) in waiting {
+                stack6::join(d, &addr);
+                if dad {
+                    stack6::start_dad(ifindex, addr);
+                }
             }
         }
         Event::Down => {
@@ -406,8 +473,9 @@ fn newaddr(req: &Request<'_>) -> Result<()> {
     let rt_priority = a.u32(IFA_RT_PRIORITY)?.unwrap_or(0);
     let proto = a.u8(IFA_PROTO)?.unwrap_or(0);
     // `inet6_addr_add` makes an address with the infinite lifetime permanent.
+    // The state of the detection stays, as Linux keeps it on a change.
     let set = |x: &mut Addr6| {
-        x.flags = flags;
+        x.flags = flags | (x.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED));
         if valid == INFINITY {
             x.flags |= IFA_F_PERMANENT;
         }

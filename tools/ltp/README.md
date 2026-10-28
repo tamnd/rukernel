@@ -38,6 +38,8 @@ tools/ltp/run.py --arch aarch64 --kernel target/aarch64-unknown-none/release/ruk
     --ltp ~/rkltp-arm64/ltp --busybox ~/rkltp-arm64/busybox/busybox --out ~/rkltp-arm64/runs syscalls
 ```
 
+The tests of the network namespaces need the `ip` program of iproute2, because the `ip` applet of BusyBox does not have `ip netns` and the other commands that they use. `tools/ltp/build-ip.sh OUT_DIR` builds a static `ip` of iproute2 6.19.0 with musl in docker, and puts it in `OUT_DIR/ip`. Give it to `run.py` with `--ip OUT_DIR/ip`. The image then has it in /bin, before the applet of BusyBox.
+
 The results are:
 
 - pass: the test exits with 0.

@@ -110,6 +110,14 @@ fn make_node(fs: &FsContext, d: &rk_vfs::device::DeviceInfo) {
     use rk_vfs::inode::mode::{S_IFBLK, S_IFCHR};
 
     let path = alloc::format!("/dev/{}", d.name);
+    // A name with a directory, as `net/tun`, gets its directory first, as devtmpfs of Linux.
+    if let Some((dir, _)) = d.name.rsplit_once('/') {
+        let dir = alloc::format!("/dev/{dir}");
+        match fs.mkdir(fs.root(), dir.as_bytes(), 0o755) {
+            Ok(_) | Err(rk_abi::Errno::EEXIST) => {}
+            Err(e) => println!("rootfs: cannot make {dir}, error {}", e.get()),
+        }
+    }
     let mode = if d.block { S_IFBLK } else { S_IFCHR } | d.perm;
     // mknod applies the umask, but devtmpfs of Linux does not, so the mode is set again.
     let attr = rk_vfs::inode::SetAttr { mode: Some(d.perm), ..Default::default() };

@@ -344,7 +344,8 @@ fn transmit(dev: &NetDevice, next: &route::Next, mut buf: NetBuf) -> Result<()> 
     count(&COUNTERS.ip_out);
     let mac = dev.mac();
     let ether = |dst| EthHeader { dst, src: mac, ethertype: ETH_P_IP as u16 };
-    if dev.kind() == LinkKind::Loopback {
+    // A TUN device has no link header and no neighbours, as the loopback device.
+    if matches!(dev.kind(), LinkKind::Loopback | LinkKind::Tun) {
         ether(MacAddr::ZERO).push(&mut buf);
         return dev.transmit(buf);
     }
