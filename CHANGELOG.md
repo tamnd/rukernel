@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.11] - 2026-10-29
+
 ### Added
 
 - MSI-X on arm64 through the GICv3 ITS, as drivers/irqchip/irq-gic-v3-its.c of Linux (#424). The kernel finds the ITS and the `msi-map` of the PCI host in the device tree, turns on the LPIs of each redistributor and maps each MSI-X vector to an LPI with `MAPD` and `MAPTI`. The virtio-pci devices on the QEMU `virt` machine use MSI-X when the machine has an ITS, and INTx when it has none.
@@ -1059,6 +1061,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.11]: https://github.com/tamnd/rukernel/releases/tag/v0.4.11
 [0.4.10]: https://github.com/tamnd/rukernel/releases/tag/v0.4.10
 [0.4.9]: https://github.com/tamnd/rukernel/releases/tag/v0.4.9
 [0.4.8]: https://github.com/tamnd/rukernel/releases/tag/v0.4.8
