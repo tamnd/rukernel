@@ -23,6 +23,9 @@
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
 //!   `statistics`. `/sys/class/net/NAME` is a link to it.
+//! - A mount of sysfs keeps the network namespace of the task that mounts it, as the namespace
+//!   tag of kernfs in fs/sysfs/mount.c of Linux. The mount shows only the interfaces of that
+//!   namespace, and a mount in another namespace is another file system.
 //!
 //! Linux puts a device of a bus below the directory of the bus. This kernel puts all devices in
 //! `/sys/devices/virtual`. A program that follows the links does not see the difference.
@@ -37,12 +40,13 @@ mod mm;
 use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::Once;
 use rk_net::consts::{IFF_DORMANT, IFF_LOWER_UP, IFF_RUNNING};
 use rk_net::dev::NetDevice;
+use rk_net::ns::NetNs;
 use rk_vfs::blockdev::{block_queue, block_sectors};
 use rk_vfs::device::{DeviceInfo, devices, major, minor};
 use rk_vfs::fstype::{FsType, MountArgs};
@@ -101,9 +105,15 @@ fn writable(path: &str) -> bool {
 /// The block size that `stat` gives for a sysfs file, as Linux gives.
 const BLOCK_SIZE: u32 = 4096;
 
-/// Makes the root of a mount of sysfs. sysfs takes no options, so `args` has no effect.
+/// Makes the root of a mount of sysfs. sysfs takes no options, so `args` has no effect. The
+/// mount keeps the network namespace of the caller, as `sysfs_get_tree` of Linux. It does not
+/// keep the namespace alive, as the passive reference of Linux.
 fn mount(_args: &MountArgs<'_>) -> Result<InodeRef> {
-    Ok(Arc::new(Node { path: String::new(), kind: Kind::Dir }))
+    Ok(Arc::new(Node {
+        path: String::new(),
+        kind: Kind::Dir,
+        net: Arc::downgrade(&rk_net::ns::current()),
+    }))
 }
 
 /// The kind of an entry of sysfs, with its contents.
@@ -119,16 +129,35 @@ enum Kind {
     },
 }
 
-/// An inode of sysfs. `path` is the path from the root, without a `/` at the start.
+/// An inode of sysfs. `path` is the path from the root, without a `/` at the start. `net` is
+/// the network namespace of the mount.
 struct Node {
     path: String,
     kind: Kind,
+    net: Weak<NetNs>,
 }
 
-/// The device of sysfs. Each mount of sysfs shows the same files, so they have one device.
-fn dev() -> u64 {
+/// The device of sysfs in the network namespace with the ID `net`. The mounts of one namespace
+/// show the same files, so they have one device, as the super block of Linux for each namespace
+/// tag. The mounts of two namespaces have two devices, so a mount on another mount of sysfs
+/// works in a new namespace.
+fn dev(net: u32) -> u64 {
     static DEV: Once<u64> = Once::new();
-    *DEV.call_once(rk_vfs::anon_dev)
+    /// The devices of the namespaces other than the first one, by the ID of the namespace.
+    static OTHERS: rk_frame::sync::SpinLock<Vec<(u32, u64)>> =
+        rk_frame::sync::SpinLock::new(Vec::new());
+    if net == 0 {
+        return *DEV.call_once(rk_vfs::anon_dev);
+    }
+    let mut others = OTHERS.lock();
+    // The device of a namespace that stopped can go to a new namespace with another ID.
+    others.retain(|&(id, _)| rk_net::ns::by_id(id).is_some() || id == net);
+    if let Some(&(_, d)) = others.iter().find(|&&(id, _)| id == net) {
+        return d;
+    }
+    let d = rk_vfs::anon_dev();
+    others.push((net, d));
+    d
 }
 
 /// The inode number of the entry at `path`. The number is a hash of the path, so an entry keeps
@@ -281,10 +310,15 @@ fn queue_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
 
 /// The entries of the directory at `path`, from the list of devices `list`. Gives `None` if no
 /// directory has the path.
-fn entries(path: &str, list: &[DeviceInfo]) -> Option<Vec<(String, Kind)>> {
+///
+/// The interfaces are the ones of the namespace `ns`. A namespace that stopped has none.
+fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(String, Kind)>> {
     let mut classes: BTreeSet<&str> = list.iter().map(|d| d.class).collect();
     classes.insert(NET);
-    let net = rk_net::dev::devices();
+    let net = ns.upgrade().map_or_else(Vec::new, |ns| {
+        let _in = rk_net::ns::enter(&ns);
+        rk_net::dev::devices()
+    });
     let net_dev = |name: &str| net.iter().find(|d| d.name() == name).cloned();
     let parts: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
     let dirs = |names: &mut dyn Iterator<Item = &str>| -> Vec<(String, Kind)> {
@@ -359,7 +393,7 @@ impl Node {
     /// The entries of this directory, from the list of devices of this moment.
     fn children(&self) -> Result<Vec<(String, Kind)>> {
         match self.kind {
-            Kind::Dir => entries(&self.path, &devices()).ok_or(Errno::ENOENT),
+            Kind::Dir => entries(&self.path, &devices(), &self.net).ok_or(Errno::ENOENT),
             _ => Err(Errno::ENOTDIR),
         }
     }
@@ -387,8 +421,9 @@ impl Inode for Node {
             Kind::Link(target) => (mode::S_IFLNK, 0o777, 1, target.len() as u64),
         };
         let t = now();
+        let net = self.net.upgrade().map_or(u32::MAX, |n| n.id());
         Metadata {
-            dev: dev(),
+            dev: dev(net),
             ino: ino(&self.path),
             mode: kind | perm,
             nlink,
@@ -438,7 +473,7 @@ impl Inode for Node {
         let name = core::str::from_utf8(name).map_err(|_| Errno::ENOENT)?;
         let (name, kind) =
             self.children()?.into_iter().find(|(n, _)| n == name).ok_or(Errno::ENOENT)?;
-        Ok(Arc::new(Node { path: self.child_path(&name), kind }))
+        Ok(Arc::new(Node { path: self.child_path(&name), kind, net: self.net.clone() }))
     }
 
     fn create(&self, _: &[u8], _: FileType, _: u32, _: u64) -> Result<InodeRef> {
@@ -521,13 +556,17 @@ mod tests {
         ]
     }
 
+    fn init() -> Weak<NetNs> {
+        Arc::downgrade(&rk_net::ns::init_ns())
+    }
+
     fn names(path: &str) -> Vec<String> {
-        entries(path, &list()).unwrap().into_iter().map(|(n, _)| n).collect()
+        entries(path, &list(), &init()).unwrap().into_iter().map(|(n, _)| n).collect()
     }
 
     fn get(path: &str) -> Kind {
         let (dir, name) = path.rsplit_once('/').unwrap();
-        entries(dir, &list()).unwrap().into_iter().find(|(n, _)| n == name).unwrap().1
+        entries(dir, &list(), &init()).unwrap().into_iter().find(|(n, _)| n == name).unwrap().1
     }
 
     #[test]
@@ -548,8 +587,8 @@ mod tests {
         assert_eq!(names("class"), ["block", "mem", "net", "tty"]);
         assert_eq!(names("devices/virtual"), ["block", "mem", "net", "tty"]);
         assert!(names("bus").is_empty());
-        assert!(entries("nothing", &list()).is_none());
-        assert!(entries("devices/virtual/disk", &list()).is_none());
+        assert!(entries("nothing", &list(), &init()).is_none());
+        assert!(entries("devices/virtual/disk", &list(), &init()).is_none());
     }
 
     #[test]
@@ -590,7 +629,7 @@ mod tests {
     #[test]
     fn only_a_loop_device_with_a_file_has_the_loop_directory() {
         assert!(!names("devices/virtual/block/vda").contains(&String::from("loop")));
-        assert_eq!(entries("devices/virtual/block/vda/loop", &list()), None);
+        assert_eq!(entries("devices/virtual/block/vda/loop", &list(), &init()), None);
         assert_eq!(get("devices/virtual/block/vda/ro"), Kind::File(b"0\n".to_vec()));
     }
 
@@ -612,8 +651,11 @@ mod tests {
         }
         assert_eq!(get("kernel/mm/ksm/run"), Kind::Mm { writable: true });
         assert_eq!(get("kernel/mm/ksm/pages_shared"), Kind::Mm { writable: false });
-        let run =
-            Node { path: String::from("kernel/mm/ksm/run"), kind: Kind::Mm { writable: true } };
+        let run = Node {
+            path: String::from("kernel/mm/ksm/run"),
+            kind: Kind::Mm { writable: true },
+            net: init(),
+        };
         assert_eq!(run.metadata().mode, mode::S_IFREG | 0o644);
         let mut buf = [0u8; 8];
         assert_eq!(run.read_at(0, &mut buf).unwrap(), 2);
@@ -622,6 +664,7 @@ mod tests {
         let shared = Node {
             path: String::from("kernel/mm/ksm/pages_shared"),
             kind: Kind::Mm { writable: false },
+            net: init(),
         };
         assert_eq!(shared.write_at(0, b"1").unwrap_err(), Errno::EACCES);
     }
@@ -632,8 +675,11 @@ mod tests {
         assert_eq!(names("kernel/mm/hugepages"), ["hugepages-2048kB"]);
         assert!(names(dir).contains(&String::from("resv_hugepages")));
         assert_eq!(get(&format!("{dir}/nr_hugepages")), Kind::Mm { writable: true });
-        let free =
-            Node { path: format!("{dir}/free_hugepages"), kind: Kind::Mm { writable: false } };
+        let free = Node {
+            path: format!("{dir}/free_hugepages"),
+            kind: Kind::Mm { writable: false },
+            net: init(),
+        };
         let mut buf = [0u8; 8];
         assert_eq!(free.read_at(0, &mut buf).unwrap(), 2);
         assert_eq!(&buf[..2], b"0\n");
@@ -646,7 +692,8 @@ mod tests {
             get("kernel/mm/transparent_hugepage/hpage_pmd_size"),
             Kind::File(b"2097152\n".to_vec())
         );
-        let enabled = Node { path: format!("{THP_DIR}/enabled"), kind: Kind::File(Vec::new()) };
+        let enabled =
+            Node { path: format!("{THP_DIR}/enabled"), kind: Kind::File(Vec::new()), net: init() };
         assert_eq!(enabled.metadata().mode, mode::S_IFREG | 0o644);
         assert_eq!(enabled.write_at(0, b"sometimes\n").unwrap_err(), Errno::EINVAL);
         assert_eq!(enabled.write_at(0, b"madvise\n").unwrap(), 8);
@@ -656,14 +703,15 @@ mod tests {
 
     #[test]
     fn a_node_reads_and_does_not_change() {
-        let file = Node { path: String::from("a/b"), kind: Kind::File(b"hello\n".to_vec()) };
+        let file =
+            Node { path: String::from("a/b"), kind: Kind::File(b"hello\n".to_vec()), net: init() };
         let mut buf = [0u8; 4];
         assert_eq!(file.read_at(4, &mut buf).unwrap(), 2);
         assert_eq!(&buf[..2], b"o\n");
         assert_eq!(file.write_at(0, b"x").unwrap_err(), Errno::EACCES);
         assert_eq!(file.metadata().mode, mode::S_IFREG | 0o444);
         assert_eq!(file.fs_magic(), SYSFS_MAGIC);
-        let root = Node { path: String::new(), kind: Kind::Dir };
+        let root = Node { path: String::new(), kind: Kind::Dir, net: init() };
         assert_eq!(root.metadata().ino, 1);
         assert_eq!(root.unlink(b"block").unwrap_err(), Errno::EPERM);
         assert_eq!(root.lookup(b"nothing").err(), Some(Errno::ENOENT));

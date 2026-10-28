@@ -64,7 +64,7 @@ ip link set lo up 2>/dev/null
 # The drivers that are in the kernel, for tst_require_drivers. rukernel has no modules.
 m=/lib/modules/$(uname -r)
 mkdir -p $m /var/run/netns
-echo kernel/drivers/net/veth.ko > $m/modules.builtin
+printf "kernel/drivers/net/veth.ko\nkernel/drivers/net/dummy.ko\n" > $m/modules.builtin
 : > $m/modules.dep
 if ! mount -t ext4 -o ro /dev/vdb /ltp; then
     echo "ltp-error: cannot mount the LTP image"

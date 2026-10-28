@@ -14,13 +14,14 @@ use rk_abi::native::if_link::{
     IFLA_ADDRESS, IFLA_AF_SPEC, IFLA_ALLMULTI, IFLA_ALT_IFNAME, IFLA_BROADCAST, IFLA_CARRIER,
     IFLA_CARRIER_CHANGES, IFLA_CARRIER_DOWN_COUNT, IFLA_CARRIER_UP_COUNT, IFLA_EXT_MASK,
     IFLA_GRO_IPV4_MAX_SIZE, IFLA_GRO_MAX_SIZE, IFLA_GROUP, IFLA_GSO_IPV4_MAX_SIZE,
-    IFLA_GSO_MAX_SEGS, IFLA_GSO_MAX_SIZE, IFLA_HEADROOM, IFLA_IFNAME, IFLA_LINK, IFLA_LINKINFO,
-    IFLA_LINKMODE, IFLA_MAP, IFLA_MASTER, IFLA_MAX_MTU, IFLA_MAX_PACING_OFFLOAD_HORIZON,
-    IFLA_MIN_MTU, IFLA_MTU, IFLA_NET_NS_FD, IFLA_NET_NS_PID, IFLA_NETNS_IMMUTABLE,
-    IFLA_NUM_RX_QUEUES, IFLA_NUM_TX_QUEUES, IFLA_NUM_VF, IFLA_OPERSTATE, IFLA_PARENT_DEV_BUS_NAME,
-    IFLA_PARENT_DEV_NAME, IFLA_PERM_ADDRESS, IFLA_PROMISCUITY, IFLA_PROTINFO, IFLA_PROTO_DOWN,
-    IFLA_QDISC, IFLA_STATS, IFLA_STATS64, IFLA_TAILROOM, IFLA_TARGET_NETNSID, IFLA_TSO_MAX_SEGS,
-    IFLA_TSO_MAX_SIZE, IFLA_TXQLEN, IFLA_XDP, IFLA_XDP_ATTACHED, XDP_ATTACHED_NONE,
+    IFLA_GSO_MAX_SEGS, IFLA_GSO_MAX_SIZE, IFLA_HEADROOM, IFLA_IFNAME, IFLA_LINK, IFLA_LINK_NETNSID,
+    IFLA_LINKINFO, IFLA_LINKMODE, IFLA_MAP, IFLA_MASTER, IFLA_MAX_MTU,
+    IFLA_MAX_PACING_OFFLOAD_HORIZON, IFLA_MIN_MTU, IFLA_MTU, IFLA_NET_NS_FD, IFLA_NET_NS_PID,
+    IFLA_NETNS_IMMUTABLE, IFLA_NUM_RX_QUEUES, IFLA_NUM_TX_QUEUES, IFLA_NUM_VF, IFLA_OPERSTATE,
+    IFLA_PARENT_DEV_BUS_NAME, IFLA_PARENT_DEV_NAME, IFLA_PERM_ADDRESS, IFLA_PROMISCUITY,
+    IFLA_PROTINFO, IFLA_PROTO_DOWN, IFLA_QDISC, IFLA_STATS, IFLA_STATS64, IFLA_TAILROOM,
+    IFLA_TARGET_NETNSID, IFLA_TSO_MAX_SEGS, IFLA_TSO_MAX_SIZE, IFLA_TXQLEN, IFLA_XDP,
+    IFLA_XDP_ATTACHED, XDP_ATTACHED_NONE,
 };
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{RTM_DELLINK, RTM_GETLINK, RTM_NEWLINK, RTM_SETLINK, RTNLGRP_LINK};
@@ -168,6 +169,14 @@ pub fn fill(
         let info = b.nest(IFLA_LINKINFO as u16);
         b.str(IFLA_INFO_KIND as u16, kind);
         b.end_nest(info);
+    }
+    // The nsid of the namespace of the other end, if that is not this namespace, as
+    // `rtnl_fill_link_netnsid` of Linux.
+    if let Some(peer) = dev.peer()
+        && peer.net() != dev.net()
+        && let Some(net) = ns::by_index(peer.net())
+    {
+        b.u32(IFLA_LINK_NETNSID as u16, super::nsid::peer_id_alloc(&net) as u32);
     }
     let spec = b.nest(IFLA_AF_SPEC as u16);
     let families = AF.lock().clone();
@@ -365,11 +374,20 @@ fn target_ns(a: &Attrs<'_>) -> Result<Option<Arc<NetNs>>> {
     Ok(None)
 }
 
-/// Makes a device of a kind, as `rtnl_create_link` and `veth_newlink` of Linux. Only the kind
-/// `veth` is here. The new device is in the namespace of `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`,
-/// else in the current namespace. The other end has its own attributes in `VETH_INFO_PEER`.
+/// Makes a device of a kind, as `rtnl_create_link`, `veth_newlink` and the `dummy` link of
+/// Linux. The kinds `veth` and `dummy` are here. The new device is in the namespace of
+/// `IFLA_NET_NS_PID` or `IFLA_NET_NS_FD`, else in the current namespace. The other end of a
+/// veth pair has its own attributes in `VETH_INFO_PEER`.
 fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
     let info = Attrs::parse(a.get(IFLA_LINKINFO).ok_or(Errno::EOPNOTSUPP)?, IFLA_INFO_MAX);
+    if info.str(IFLA_INFO_KIND) == Some(crate::dummy::KIND.as_bytes()) {
+        let dev_ns = target_ns(a)?;
+        let dev = {
+            let _in = dev_ns.as_deref().map(ns::enter);
+            crate::dummy::create(a.str(IFLA_IFNAME))?
+        };
+        return configure(&dev, h, a).inspect_err(|_| dev::unregister(&dev));
+    }
     if info.str(IFLA_INFO_KIND) != Some(veth::KIND.as_bytes()) {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -390,24 +408,26 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
         let _in = dev_ns.as_deref().map(ns::enter);
         veth::create(name, peer_name, Some(&peer_ns))?
     };
-    // The other attributes, as `rtnl_configure_link` of Linux. An error removes the pair.
-    let configure = || -> Result<()> {
-        for (d, h, a) in [(&peer, peer_h, &peer_a), (&dev, h, a)] {
-            if let Some(mtu) = a.u32(IFLA_MTU)? {
-                d.set_mtu(mtu)?;
-            }
-            if let Some(len) = a.u32(IFLA_TXQLEN)? {
-                d.set_txqlen(len);
-            }
-            let (flags, change) = (u32_at(h, 8), u32_at(h, 12));
-            if flags != 0 {
-                let mask = if change != 0 { change } else { u32::MAX };
-                d.change_flags((flags & mask) | (d.flags() & !mask))?;
-            }
-        }
-        Ok(())
-    };
-    configure().inspect_err(|_| dev::unregister(&dev))
+    // An error removes the pair.
+    configure(&peer, peer_h, &peer_a)
+        .and_then(|()| configure(&dev, h, a))
+        .inspect_err(|_| dev::unregister(&dev))
+}
+
+/// Sets the other attributes of a new device, as `rtnl_configure_link` of Linux.
+fn configure(d: &NetDevice, h: &[u8], a: &Attrs<'_>) -> Result<()> {
+    if let Some(mtu) = a.u32(IFLA_MTU)? {
+        d.set_mtu(mtu)?;
+    }
+    if let Some(len) = a.u32(IFLA_TXQLEN)? {
+        d.set_txqlen(len);
+    }
+    let (flags, change) = (u32_at(h, 8), u32_at(h, 12));
+    if flags != 0 {
+        let mask = if change != 0 { change } else { u32::MAX };
+        d.change_flags((flags & mask) | (d.flags() & !mask))?;
+    }
+    Ok(())
 }
 
 /// `RTM_DELLINK`, as `rtnl_dellink` of Linux. Only a virtual device can go away: another device

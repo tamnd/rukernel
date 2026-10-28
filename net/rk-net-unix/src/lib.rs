@@ -55,8 +55,10 @@ const MAX_DGRAM_QLEN: usize = 10;
 enum Key {
     /// A socket file in the tree.
     Path(NodeId),
-    /// An abstract name: the bytes after the first 0.
-    Abstract(Vec<u8>),
+    /// An abstract name: the ID of the network namespace and the bytes after the first 0. Each
+    /// namespace has its own abstract names, as `unix_find_abstract` of Linux, which uses
+    /// `sock_net` in the hash.
+    Abstract(u32, Vec<u8>),
 }
 
 /// The bound sockets.
@@ -154,10 +156,11 @@ impl Name {
         addr
     }
 
-    fn key(&self, paths: &dyn PathOps) -> Result<Key> {
+    /// The key of the name. `net` is the ID of the network namespace of the socket.
+    fn key(&self, paths: &dyn PathOps, net: u32) -> Result<Key> {
         match self {
             Self::Path(p) => Ok(Key::Path(paths.find_node(p)?)),
-            Self::Abstract(a) => Ok(Key::Abstract(a.clone())),
+            Self::Abstract(a) => Ok(Key::Abstract(net, a.clone())),
         }
     }
 }
@@ -241,6 +244,8 @@ pub struct Unix {
     inflight: AtomicUsize,
     /// The count of the wakes, for an edge triggered epoll entry.
     events: AtomicU64,
+    /// The ID of the network namespace that made the socket, for the abstract names.
+    net: u32,
     this: Weak<Unix>,
 }
 
@@ -291,6 +296,7 @@ impl Unix {
             wait: Arc::new(WaitQueue::new()),
             inflight: AtomicUsize::new(0),
             events: AtomicU64::new(0),
+            net: rk_net::ns::current().id(),
             this: this.clone(),
         });
         ALL.lock().insert(sock.ino, Arc::downgrade(&sock));
@@ -346,9 +352,11 @@ impl Unix {
         }
     }
 
-    /// Finds the socket with the name in `addr`. The type must be `kind`.
-    fn lookup(paths: &dyn PathOps, name: &Name, kind: u32) -> Result<Arc<Unix>> {
-        let key = name.key(paths)?;
+    /// Finds the socket with the name in `addr`. The type must be the type of this socket. An
+    /// abstract name is in the namespace of this socket.
+    fn lookup(&self, paths: &dyn PathOps, name: &Name) -> Result<Arc<Unix>> {
+        let kind = self.kind;
+        let key = name.key(paths, self.net)?;
         let found = NAMES.lock().get(&key).and_then(Weak::upgrade);
         let Some(other) = found else { return Err(Errno::ECONNREFUSED) };
         if other.state.lock().closed {
@@ -371,7 +379,7 @@ impl Unix {
             let n = AUTOBIND.fetch_add(1, Ordering::Relaxed) & 0xfffff;
             let name = Name::Abstract(format!("{n:05x}").into_bytes());
             let Name::Abstract(a) = &name else { continue };
-            let key = Key::Abstract(a.clone());
+            let key = Key::Abstract(self.net, a.clone());
             if names.get(&key).and_then(Weak::upgrade).is_some() {
                 continue;
             }
@@ -467,7 +475,7 @@ impl Unix {
         if self.state.lock().passcred {
             self.autobind()?;
         }
-        let other = Self::lookup(paths, &name, self.kind)?;
+        let other = self.lookup(paths, &name)?;
         if !may_send(&other, self) {
             return Err(Errno::EPERM);
         }
@@ -495,7 +503,7 @@ impl Unix {
             self.autobind()?;
         }
         loop {
-            let other = Self::lookup(paths, &name, self.kind)?;
+            let other = self.lookup(paths, &name)?;
             let mut o = other.state.lock();
             if o.conn != Conn::Listening || o.shut_rd {
                 return Err(Errno::ECONNREFUSED);
@@ -625,9 +633,7 @@ impl Unix {
             self.autobind()?;
         }
         let other = match &msg.addr {
-            Some(addr) if self.kind == SOCK_DGRAM => {
-                Self::lookup(paths, &Name::parse(addr)?, self.kind)?
-            }
+            Some(addr) if self.kind == SOCK_DGRAM => self.lookup(paths, &Name::parse(addr)?)?,
             _ => match self.state.lock().peer.clone() {
                 Some(peer) => peer,
                 None => return Err(Errno::ENOTCONN),
@@ -936,7 +942,7 @@ impl Socket for Unix {
         }
         let key = match &name {
             Name::Path(p) => Key::Path(paths.make_node(p)?),
-            Name::Abstract(a) => Key::Abstract(a.clone()),
+            Name::Abstract(a) => Key::Abstract(self.net, a.clone()),
         };
         let mut s = self.state.lock();
         if s.addr.is_some() {

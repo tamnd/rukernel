@@ -703,6 +703,7 @@ pub fn init() {
     static OPS: AtomicBool = AtomicBool::new(false);
     if !OPS.swap(true, Ordering::Relaxed) {
         ns::add_device_ops(ns_init, ns_exit);
+        crate::sysctl::init();
     }
     if by_name("lo").is_none() {
         // Only a second loopback device gives an error, and a race of two calls at boot is not

@@ -606,7 +606,7 @@ impl Dgram {
         let ttl = if ipv4::is_multicast(dst) {
             s.multicast_ttl as u8
         } else {
-            s.ttl.unwrap_or(ipv4::DEFAULT_TTL)
+            s.ttl.unwrap_or_else(rk_net::sysctl::default_ttl)
         };
         Out { src, dst, protocol, ttl, tos: s.tos }
     }
@@ -1192,7 +1192,7 @@ impl Socket for Dgram {
                 _ => s.options.get(name)?,
             }),
             IPPROTO_IP => Ok(match name {
-                IP_TTL => int(i32::from(s.ttl.unwrap_or(ipv4::DEFAULT_TTL))),
+                IP_TTL => int(i32::from(s.ttl.unwrap_or_else(rk_net::sysctl::default_ttl))),
                 IP_TOS => int(i32::from(s.tos)),
                 IP_RECVERR => int(i32::from(s.recverr)),
                 IP_HDRINCL => int(i32::from(s.hdrincl)),

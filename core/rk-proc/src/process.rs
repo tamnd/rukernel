@@ -190,8 +190,6 @@ pub struct Process {
     cgroup: AtomicU32,
     /// The cgroup namespace of the process, or 0 for the namespace of the system.
     cgns: AtomicU32,
-    /// The network namespace of the process, or `None` for the first namespace.
-    net: SpinLock<Option<Arc<NetNs>>>,
     /// The process keyring and the session keyring.
     keys: SpinLock<ProcessKeys>,
     /// A signal to the process or to one of its threads wakes this queue, for the signal files
@@ -279,6 +277,9 @@ pub struct Thread {
     timer_slack: SpinLock<(u64, u64)>,
     /// The I/O privilege level that `iopl` set, as `iopl_emul` of Linux.
     iopl: AtomicU32,
+    /// The network namespace of the thread, or `None` for the first namespace, as
+    /// `nsproxy->net_ns` of Linux.
+    net: SpinLock<Option<Arc<NetNs>>>,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -516,24 +517,13 @@ impl Process {
         self.cgns.load(Ordering::Relaxed)
     }
 
-    /// The network namespace of the process, as `nsproxy->net_ns` of Linux.
+    /// The network namespace of the process: the namespace of its leader thread, as
+    /// `/proc/PID/ns/net` of Linux shows it. Each thread has its own namespace, as `nsproxy` of
+    /// Linux is a part of each task. A process without threads has the first namespace.
     pub fn net_ns(&self) -> Arc<NetNs> {
-        self.net.lock().clone().unwrap_or_else(rk_net::ns::init_ns)
-    }
-
-    /// The network namespace of the process, or `None` for the first namespace.
-    pub fn net_ns_opt(&self) -> Option<Arc<NetNs>> {
-        self.net.lock().clone()
-    }
-
-    /// Puts the process in the network namespace `ns`, for `CLONE_NEWNET` and `setns`.
-    pub fn set_net_ns(&self, ns: Arc<NetNs>) {
-        let old = {
-            let mut net = self.net.lock();
-            core::mem::replace(&mut *net, if ns.is_init() { None } else { Some(ns) })
-        };
-        // The old namespace can stop here, so the lock is free.
-        drop(old);
+        let threads = self.threads();
+        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        leader.map_or_else(rk_net::ns::init_ns, |t| t.net_ns())
     }
 
     /// Puts the process in the cgroup namespace `ns`, for `CLONE_NEWCGROUP` and `setns`.
@@ -888,7 +878,6 @@ impl Process {
             keys: SpinLock::new(ProcessKeys::default()),
             cgroup: AtomicU32::new(rk_cgroup::ROOT),
             cgns: AtomicU32::new(0),
-            net: SpinLock::new(None),
             signal_poll: Arc::new(PollQueue::new()),
             exit_poll: Arc::new(PollQueue::new()),
         })
@@ -1375,7 +1364,30 @@ impl Thread {
             keys: SpinLock::new(ThreadKeys::default()),
             timer_slack: SpinLock::new((TIMER_SLACK_NS, TIMER_SLACK_NS)),
             iopl: AtomicU32::new(0),
+            net: SpinLock::new(None),
         })
+    }
+
+    /// The network namespace of the thread, as `current->nsproxy->net_ns` of Linux.
+    pub fn net_ns(&self) -> Arc<NetNs> {
+        self.net.lock().clone().unwrap_or_else(rk_net::ns::init_ns)
+    }
+
+    /// The network namespace of the thread, or `None` for the first namespace.
+    pub fn net_ns_opt(&self) -> Option<Arc<NetNs>> {
+        self.net.lock().clone()
+    }
+
+    /// Puts the thread in the network namespace `ns`, for `CLONE_NEWNET`, `unshare` and `setns`.
+    /// The other threads of the process keep their namespace, as `switch_task_namespaces` of
+    /// Linux changes only one task.
+    pub fn set_net_ns(&self, ns: Arc<NetNs>) {
+        let old = {
+            let mut net = self.net.lock();
+            core::mem::replace(&mut *net, if ns.is_init() { None } else { Some(ns) })
+        };
+        // The old namespace can stop here, so the lock is free.
+        drop(old);
     }
 
     /// The slack of the timers of the thread in nanoseconds, for `PR_GET_TIMERSLACK`.
@@ -1542,13 +1554,13 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     child.set_thp_disable(pp.thp_disable());
     child.cgroup.store(cgroup, Ordering::Relaxed);
     child.set_cgroup_ns(pp.cgroup_ns());
-    *child.net.lock() = pp.net_ns_opt();
     if !share.vm
         && let Some(vm) = child.vm()
     {
         vm.set_memcg(child.memcg());
     }
     let thread = Thread::new(pid, child.clone(), parent.blocked());
+    *thread.net.lock() = parent.net_ns_opt();
     thread.inherit_seccomp(parent);
     thread.inherit_timer_slack(parent);
     *thread.sched.lock() = parent.sched().forked();
@@ -1583,6 +1595,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
         }
     };
     let new = Thread::new(tid, process.clone(), thread.blocked());
+    *new.net.lock() = thread.net_ns_opt();
     new.inherit_seccomp(thread);
     new.inherit_timer_slack(thread);
     *new.sched.lock() = thread.sched().forked();
@@ -1890,6 +1903,10 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         });
         last
     };
+    // The thread leaves its network namespace, as `exit_task_namespaces` of Linux. The
+    // namespace can stop here, and its exit takes the locks of the network layer.
+    let net = thread.net.lock().take();
+    drop(net);
     if !last {
         process.thread_exit.wake_all();
         return;
@@ -1904,11 +1921,10 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     }
     let files = process.files.lock().take();
     let fs = process.fs.lock().take();
-    let net = process.net.lock().take();
     // The program does not run now, so its file can take a write, as `set_mm_exe_file` with
     // no file in `exit_mmap` of Linux.
     let deny = process.image.lock().deny.take();
-    drop((vm, files, fs, net, deny));
+    drop((vm, files, fs, deny));
 
     let (children, parent, status) = {
         let mut s = process.state.lock();
