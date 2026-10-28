@@ -27,11 +27,21 @@ fn with_pool<R>(f: impl FnOnce(&mut Pool<HugeRun>) -> R) -> R {
     f(&mut POOL.lock())
 }
 
+/// The private huge pages that hold a page of the subpool of a mount, by the physical address of
+/// the run, as the subpool of a folio of Linux. The page gives it back when it is free again.
+static CHARGED: SpinLock<BTreeMap<u64, Arc<Subpool>>> = SpinLock::new(BTreeMap::new());
+
 /// Takes a run back from the last frame of a huge page. A surplus page goes back to the
-/// allocator, after the lock of the pool is released.
+/// allocator, after the lock of the pool is released. A private page of a mount then gives its
+/// page back to the subpool, as `free_huge_folio` of Linux, so the mount can reserve the free
+/// page again for `min_size=`.
 fn give_back(run: HugeRun) {
+    let subpool = CHARGED.lock().remove(&run.addr().get());
     let gone = with_pool(|p| p.give_back(run));
     drop(gone);
+    if let Some(subpool) = subpool {
+        subpool.release(1);
+    }
 }
 
 /// Takes a new run from the allocator for the pool. The pool does not take the last memory: an
@@ -129,10 +139,47 @@ pub fn alloc_page(reserved: bool) -> Result<HugePage, Errno> {
 /// As for `alloc_page`.
 pub fn copy_page(from: &[Arc<Frame>], reserved: bool) -> Result<HugePage, Errno> {
     let copy = alloc_page(reserved)?;
-    for (to, from) in copy.iter().zip(from) {
+    copy_frames(&copy, from);
+    Ok(copy)
+}
+
+/// Copies the frames of the huge page `from` to `to`.
+fn copy_frames(to: &[Arc<Frame>], from: &[Arc<Frame>]) {
+    for (to, from) in to.iter().zip(from) {
         to.copy_from(from);
     }
-    Ok(copy)
+}
+
+/// Takes a private huge page of a mapping of a file of hugetlbfs, with the pages `subpool` of
+/// its mount, as `alloc_hugetlb_folio` of Linux. `reserved` tells that the mapping has a
+/// reservation for the page, which has a page of the subpool already. Else the page takes a page
+/// of the subpool now. The page keeps it until the page is free again. The page is a copy of
+/// `from`, or zeros.
+///
+/// # Errors
+///
+/// `ENOSPC` if the pool has no page for the caller, or if `size=` of the mount does not allow one
+/// more page. A page fault then sends `SIGBUS`.
+pub(crate) fn private_page(
+    subpool: &Arc<Subpool>,
+    reserved: bool,
+    from: Option<&[Arc<Frame>]>,
+) -> Result<HugePage, Errno> {
+    let kept = if reserved { true } else { subpool.charge()? };
+    let page = match alloc_page(kept) {
+        Ok(page) => page,
+        Err(e) => {
+            if !reserved {
+                subpool.uncharge(kept);
+            }
+            return Err(e);
+        }
+    };
+    CHARGED.lock().insert(page[0].addr().get(), subpool.clone());
+    if let Some(from) = from {
+        copy_frames(&page, from);
+    }
+    Ok(page)
 }
 
 /// Takes a transparent huge page from the allocator for copy on write, and copies `from` to it.
@@ -218,6 +265,12 @@ impl HugeFile {
         };
         let kept = subpool.charge()?;
         alloc_page(kept).inspect_err(|_| subpool.uncharge(kept))
+    }
+
+    /// The pages of the mount of hugetlbfs of the file, or `None` for a file of a `SHM_HUGETLB`
+    /// segment or of a `MAP_HUGETLB` mapping.
+    pub fn subpool(&self) -> Option<&Arc<Subpool>> {
+        self.subpool.as_ref()
     }
 
     /// Sets the path that /proc/PID/maps shows.

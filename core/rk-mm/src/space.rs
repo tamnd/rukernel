@@ -4,7 +4,7 @@
 //! first access, in `handle_fault`. A private page that two address spaces share after `fork` is
 //! read only in both, and the first write copies it. This is copy on write.
 
-use crate::hugetlb::HPAGE_SIZE;
+use crate::hugetlb::{HPAGE_SIZE, Subpool};
 use crate::tunables::{self, OVERCOMMIT_NEVER, ThpMode};
 use crate::vma::{
     Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up,
@@ -248,11 +248,15 @@ pub struct AddressSpace {
     memcg: AtomicU32,
     /// The data of KSM.
     ksm: ksmd::MmKsm,
-    /// The 2 MiB blocks of the private hugetlb areas that have a reservation and no page yet. A
-    /// child of `fork` does not get them, as on Linux.
-    huge_resv: SpinLock<BTreeSet<usize>>,
+    /// The 2 MiB blocks of the private hugetlb areas that have a reservation and no page yet,
+    /// with the pages of the mount of hugetlbfs of the file of the area. A child of `fork` does
+    /// not get them, as on Linux.
+    huge_resv: SpinLock<BTreeMap<usize, Option<Arc<Subpool>>>>,
     /// The largest number of pages with a frame before an unmap, as `hiwater_rss` of Linux.
     hiwater: AtomicUsize,
+    /// The top of the `mmap` area, as `mmap_base` of Linux. It is [`MMAP_TOP`] less a random
+    /// offset that `execve` sets.
+    mmap_top: AtomicUsize,
 }
 
 fn map_error(e: MapError) -> Errno {
@@ -286,9 +290,23 @@ impl Drop for AddressSpace {
         }
         uncharge_commit(accounted(st.vmas.iter()));
         drop(st);
-        let unused = self.huge_resv.lock().len();
-        hugetlb::unreserve(unused);
+        let unused = core::mem::take(&mut *self.huge_resv.lock());
+        unreserve_blocks(unused.into_values());
     }
+}
+
+/// Gives back the reservations of private hugetlb blocks that no page used. A block of a file of
+/// hugetlbfs gives its page back to the subpool of the mount too, as `hugetlb_vm_op_close` of
+/// Linux.
+fn unreserve_blocks(blocks: impl Iterator<Item = Option<Arc<Subpool>>>) {
+    let mut anon = 0;
+    for subpool in blocks {
+        match subpool {
+            Some(subpool) => subpool.unreserve(1),
+            None => anon += 1,
+        }
+    }
+    hugetlb::unreserve(anon);
 }
 
 /// The pages of memory.
@@ -336,9 +354,23 @@ impl AddressSpace {
             state: StateLock::new(state),
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
-            huge_resv: SpinLock::new(BTreeSet::new()),
+            huge_resv: SpinLock::new(BTreeMap::new()),
             hiwater: AtomicUsize::new(0),
+            mmap_top: AtomicUsize::new(MMAP_TOP),
         }
+    }
+
+    /// The top of the `mmap` area.
+    pub fn mmap_top(&self) -> usize {
+        self.mmap_top.load(Ordering::Relaxed)
+    }
+
+    /// Moves the top of the `mmap` area down by `offset` bytes, as `arch_pick_mmap_layout` of
+    /// Linux does for a random offset. The offset is rounded down to a page. An offset that is
+    /// too large is limited, so that the `mmap` area keeps at least half of its size.
+    pub fn set_mmap_offset(&self, offset: usize) {
+        let offset = offset.min((MMAP_TOP - MMAP_MIN_ADDR) / 2) & !(PAGE_SIZE - 1);
+        self.mmap_top.store(MMAP_TOP - offset, Ordering::Relaxed);
     }
 
     /// Sets the memory cgroup that the new anonymous pages are charged to. The pages that the
@@ -447,7 +479,7 @@ impl AddressSpace {
             if st.vmas.len() > tunables::max_map_count() {
                 return Err(Errno::ENOMEM);
             }
-            let (bottom, top) = if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, MMAP_TOP) };
+            let (bottom, top) = if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, self.mmap_top()) };
             let hint = if hugetlb {
                 req.addr.checked_next_multiple_of(align).unwrap_or(0)
             } else {
@@ -545,7 +577,7 @@ impl AddressSpace {
                 if shared && !noreserve {
                     huge.reserve(first, first + blocks)?;
                 } else if !shared && !noreserve {
-                    self.reserve_private(start, len)?;
+                    self.reserve_private(start, len, huge.subpool())?;
                 }
                 if prot.write {
                     huge.grow_to(offset + len as u64);
@@ -554,17 +586,29 @@ impl AddressSpace {
             }
             None => {
                 if !noreserve {
-                    self.reserve_private(start, len)?;
+                    self.reserve_private(start, len, None)?;
                 }
                 Ok(None)
             }
         }
     }
 
-    /// Reserves the huge pages of the private hugetlb range `start..start + len`.
-    fn reserve_private(&self, start: usize, len: usize) -> Result<(), Errno> {
-        hugetlb::reserve(len / HPAGE_SIZE)?;
-        self.huge_resv.lock().extend((start..start + len).step_by(HPAGE_SIZE));
+    /// Reserves the huge pages of the private hugetlb range `start..start + len`. A private
+    /// mapping of a file of hugetlbfs takes the pages from `subpool`, the pages of the mount, so
+    /// `size=` limits them, as `hugetlb_reserve_pages` of Linux.
+    fn reserve_private(
+        &self,
+        start: usize,
+        len: usize,
+        subpool: Option<&Arc<Subpool>>,
+    ) -> Result<(), Errno> {
+        let blocks = len / HPAGE_SIZE;
+        match subpool {
+            Some(subpool) => subpool.reserve(blocks as u64)?,
+            None => hugetlb::reserve(blocks)?,
+        }
+        let mut resv = self.huge_resv.lock();
+        resv.extend((start..start + len).step_by(HPAGE_SIZE).map(|b| (b, subpool.cloned())));
         Ok(())
     }
 
@@ -572,13 +616,10 @@ impl AddressSpace {
     fn unreserve_private(&self, start: usize, end: usize) {
         let unused = {
             let mut resv = self.huge_resv.lock();
-            let blocks: Vec<usize> = resv.range(start..end).copied().collect();
-            for b in &blocks {
-                resv.remove(b);
-            }
-            blocks.len()
+            let blocks: Vec<usize> = resv.range(start..end).map(|(&b, _)| b).collect();
+            blocks.iter().filter_map(|b| resv.remove(b)).collect::<Vec<_>>()
         };
-        hugetlb::unreserve(unused);
+        unreserve_blocks(unused.into_iter());
     }
 
     /// Tells if `start` or `end` is in a hugetlb area and is not 2 MiB aligned. Such an area
@@ -924,7 +965,7 @@ impl AddressSpace {
         if !remap.may_move {
             return Err(Errno::ENOMEM);
         }
-        let to = st.vmas.find_gap(new_len, MMAP_MIN_ADDR, MMAP_TOP).ok_or(Errno::ENOMEM)?;
+        let to = st.vmas.find_gap(new_len, MMAP_MIN_ADDR, self.mmap_top()).ok_or(Errno::ENOMEM)?;
         self.move_locked(&mut st, addr, old_len, new_len, to, remap.dont_unmap)
     }
 
@@ -1204,6 +1245,11 @@ impl AddressSpace {
         {
             return Ok(true);
         }
+        // A private page of a file of hugetlbfs takes a page of the mount.
+        let subpool = match &vma.backing {
+            Backing::File { file, .. } => file.huge_file().and_then(hugetlb::HugeFile::subpool),
+            Backing::Anon => None,
+        };
         if let Some((frames, _)) = self.vm.huge_block(at) {
             // A write to a page that is read only. The page table and `frames` hold two
             // references to a page that only this address space uses.
@@ -1211,7 +1257,7 @@ impl AddressSpace {
                 drop(frames);
                 return Ok(self.vm.protect_huge(at, page_prot(vma, true)));
             }
-            let copy = self.take_huge(block, Some(&frames))?;
+            let copy = self.take_huge(block, Some(&frames), subpool)?;
             drop(frames);
             self.unmap_pages(at, VirtAddr::new(block + HPAGE_SIZE));
             self.vm.map_hugetlb(at, copy, page_prot(vma, true)).map_err(map_error)?;
@@ -1221,7 +1267,7 @@ impl AddressSpace {
             return Ok(false);
         }
         let (huge, exclusive) = match &vma.backing {
-            Backing::Anon => (self.take_huge(block, None)?, true),
+            Backing::Anon => (self.take_huge(block, None, None)?, true),
             Backing::File { file, offset } => {
                 let Some(file) = file.huge_file() else { return Ok(false) };
                 let index = (offset + (block - vma.start) as u64) / HPAGE_SIZE as u64;
@@ -1234,8 +1280,8 @@ impl AddressSpace {
                     // page that the file does not have is a new private page, as on Linux.
                     match file.lookup(index) {
                         Some(cached) if !write => (cached, false),
-                        Some(cached) => (self.take_huge(block, Some(&cached))?, true),
-                        None => (self.take_huge(block, None)?, true),
+                        Some(cached) => (self.take_huge(block, Some(&cached), subpool)?, true),
+                        None => (self.take_huge(block, None, subpool)?, true),
                     }
                 }
             }
@@ -1245,19 +1291,25 @@ impl AddressSpace {
     }
 
     /// Takes a huge page for the private hugetlb `block`, with the reservation of the block if it
-    /// has one, and copies `from` to it.
+    /// has one, and copies `from` to it. A block of a mapping of a file of hugetlbfs takes the page
+    /// from `subpool`, the pages of the mount of the file.
     fn take_huge(
         &self,
         block: usize,
         from: Option<&[Arc<Frame>]>,
+        subpool: Option<&Arc<Subpool>>,
     ) -> Result<hugetlb::HugePage, Errno> {
-        let reserved = self.huge_resv.lock().remove(&block);
-        let page = match from {
-            Some(from) => hugetlb::copy_page(from, reserved),
-            None => hugetlb::alloc_page(reserved),
+        let resv = self.huge_resv.lock().remove(&block);
+        let reserved = resv.is_some();
+        let page = match (subpool, from) {
+            (Some(subpool), from) => hugetlb::private_page(subpool, reserved, from),
+            (None, Some(from)) => hugetlb::copy_page(from, reserved),
+            (None, None) => hugetlb::alloc_page(reserved),
         };
-        if page.is_err() && reserved {
-            self.huge_resv.lock().insert(block);
+        if page.is_err()
+            && let Some(resv) = resv
+        {
+            self.huge_resv.lock().insert(block, resv);
         }
         page
     }
@@ -1419,6 +1471,7 @@ impl AddressSpace {
             .map(|v| ForkArea { start: v.start, end: v.end, shared: v.shared })
             .collect();
         let child = Self::with_vm(self.vm.fork(&areas).map_err(map_error)?);
+        child.mmap_top.store(self.mmap_top(), Ordering::Relaxed);
         // The private areas of the child go in the commit count. The memory of a shared area is
         // in the count one time.
         charge_commit(accounted(st.vmas.iter().filter(|v| !v.shared && !v.dont_fork)))?;

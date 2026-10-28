@@ -78,7 +78,42 @@ fi
 git clone --quiet --depth 1 --branch "$LTP_TAG" https://github.com/linux-test-project/ltp /ltp
 cd /ltp
 make autotools >/dev/null
-./configure --prefix=/opt/ltp LDFLAGS=-static >/dev/null
+# The brk and sbrk functions of musl give ENOMEM and do not call the kernel, except sbrk(0). Tests
+# such as hugemmap07, sbrk01 and mmapstress02 need them, so each program links these versions,
+# which call the brk system call as glibc does.
+cat >/ltp/rk-brk.c <<EOF
+#include <errno.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+int brk(void *end)
+{
+	if ((uintptr_t)syscall(SYS_brk, end) < (uintptr_t)end) {
+		errno = ENOMEM;
+		return -1;
+	}
+	return 0;
+}
+
+void *sbrk(intptr_t inc)
+{
+	/* The malloc of musl can move the break, so the function does not keep it. */
+	uintptr_t old = (uintptr_t)syscall(SYS_brk, 0);
+
+	if (inc == 0)
+		return (void *)old;
+	if ((inc > 0 && old + (uintptr_t)inc < old) || (inc < 0 && old < (uintptr_t)-inc)) {
+		errno = ENOMEM;
+		return (void *)-1;
+	}
+	if (brk((void *)(old + inc)) < 0)
+		return (void *)-1;
+	return (void *)old;
+}
+EOF
+cc -O2 -c -o /ltp/rk-brk.o /ltp/rk-brk.c
+./configure --prefix=/opt/ltp LDFLAGS="-static /ltp/rk-brk.o" >/dev/null
 if [ "$FULL" = 1 ]; then
 	# A test that does not build does not stop the build. notbuilt.txt below records it. The
 	# Makefile of a directory with subdirectories stops at the first subdirectory that fails, also

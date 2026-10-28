@@ -26,6 +26,7 @@ The table has four classes of spec/19-rukernel-bench.md section 19.1.
 | mem | `fork_big` | the same in a process with 128 MiB of written private memory |
 | mem | `fault_mt` | `fault` in one thread per CPU at the same time, as page_fault1 of will-it-scale. The value is the wall time over the faults of all threads |
 | mem | `mmap_mt` | `mmap` and `munmap` of 64 KiB in one thread per CPU at the same time, as mmap1 of will-it-scale |
+| mem | `cow` | the write fault that copies a private page of 4 KiB that a child of `fork` also maps. The time of the page copy is a part of it |
 | net | `tcp_rr` | a round trip of 1 byte over TCP on loopback between two processes |
 | net | `tcp_stream` | the throughput of one TCP connection on loopback |
 | net | `udp_rr` | a round trip of 1 byte over UDP on loopback between two processes |
@@ -41,6 +42,14 @@ Build the release kernel first. On a host with QEMU and a compiler for static mu
 cargo build --release --package rukernel --target x86_64-unknown-none
 tools/bench/run.py --rukernel target/x86_64-unknown-none/release/rukernel \
     --linux /boot/vmlinuz-VERSION --cc musl-gcc --runs 10 --out /tmp/bench
+```
+
+`--arch aarch64` runs arm64 kernels on the `virt` machine of `qemu-system-aarch64` with a GICv3, and the console is `ttyAMA0`. Without KVM on an arm64 host, the CPU is `cortex-a72`, as in the arm64 boot tests. `--rukernel` is then the arm64 ELF file of rukernel, which `run.py` changes into an `Image`, and `--linux` is a Linux arm64 `Image`, for example the uncompressed `vmlinuz` of the arm64 kernel package of Ubuntu. `--cc` must make static arm64 programs. `results-aarch64.md` has the arm64 table.
+
+```
+cargo build --release --package rukernel --target aarch64-unknown-none
+tools/bench/run.py --arch aarch64 --rukernel target/aarch64-unknown-none/release/rukernel \
+    --linux Image --cc aarch64-linux-musl-gcc --only cow --table tools/bench/results-aarch64.md
 ```
 
 `--cc` takes a command with arguments, for example `"zig cc -target x86_64-linux-musl"`. `--bench FILE` uses a program that is already compiled. `--only getpid,fork` runs only some benchmarks. `--reuse` makes the table again from the logs of an earlier run, with no boot. `--reuse-linux` boots only rukernel and takes the Linux values from the earlier log, so two rukernel builds can use the same Linux run. `--smp` and `--memory` change the machine for both kernels. `run.py --help` gives all the options.
