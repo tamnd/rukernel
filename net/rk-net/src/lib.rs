@@ -367,3 +367,5 @@ mod tests;
 mod tests_dev;
 #[cfg(test)]
 mod tests_ns;
+#[cfg(test)]
+mod tests_tun;

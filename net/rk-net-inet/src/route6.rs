@@ -13,12 +13,16 @@ use crate::ipv6;
 use crate::route::{INFINITY, Metrics, RTAX_MAX};
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_abi::native::if_addr::{IFA_F_NOPREFIXROUTE, IFA_F_PERMANENT, IFA_F_TENTATIVE};
+use rk_abi::native::if_addr::{
+    IFA_F_DADFAILED, IFA_F_DEPRECATED, IFA_F_NOPREFIXROUTE, IFA_F_OPTIMISTIC, IFA_F_PERMANENT,
+    IFA_F_TENTATIVE,
+};
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
     RT_TABLE_LOCAL, RT_TABLE_MAIN, RTN_BLACKHOLE, RTN_LOCAL, RTN_MULTICAST, RTN_PROHIBIT,
     RTN_UNICAST, RTN_UNREACHABLE, RTPROT_KERNEL,
 };
+use rk_net::sysctl::{Family, Scope};
 use rk_vfs::inode::Result;
 
 /// The metric of a route of the kernel to a prefix, `IP6_RT_PRIO_ADDRCONF` of Linux.
@@ -481,22 +485,54 @@ impl Table6 {
     }
 
     /// The best source address for `dst` on the interface `ifindex`, as `ipv6_dev_get_saddr` of
-    /// Linux with the rules of RFC 6724 that matter for a host.
+    /// Linux with the rules of RFC 6724 that matter for a host. An optimistic address of RFC
+    /// 4429 is a source, but rule 3 puts it after the preferred addresses unless
+    /// `use_optimistic` is set.
     pub fn select_src(&self, dst: &Ip, ifindex: u32) -> Option<Ip> {
+        let conf = |scope, name| rk_net::sysctl::conf(Family::Ipv6, scope, name);
+        let use_optimistic =
+            |i| conf(Scope::All, "use_optimistic") > 0 || conf(Scope::Dev(i), "use_optimistic") > 0;
+        self.select_src_with(dst, ifindex, true, use_optimistic)
+    }
+
+    /// The best source address for `dst` as `select_src`, without the optimistic addresses.
+    /// Neighbour discovery uses this, as `ndisc_solicit` of Linux.
+    pub fn select_src_strict(&self, dst: &Ip, ifindex: u32) -> Option<Ip> {
+        self.select_src_with(dst, ifindex, false, |_| false)
+    }
+
+    fn select_src_with(
+        &self,
+        dst: &Ip,
+        ifindex: u32,
+        optimistic: bool,
+        use_optimistic: impl Fn(u32) -> bool,
+    ) -> Option<Ip> {
         let want = scope_rank(dst);
         self.addrs
             .iter()
-            .filter(|a| a.flags & IFA_F_TENTATIVE == 0)
+            .filter(|a| {
+                a.flags & IFA_F_TENTATIVE == 0
+                    || (optimistic
+                        && a.flags & (IFA_F_OPTIMISTIC | IFA_F_DADFAILED) == IFA_F_OPTIMISTIC)
+            })
             // A link local address is good only on its own link.
             .filter(|a| !(ipv6::is_link_local(&a.addr) && a.ifindex != ifindex))
             .filter(|a| a.addr != ip::LOOPBACK || *dst == ip::LOOPBACK)
             .max_by_key(|a| {
                 let s = scope_rank(&a.addr);
+                let avoid = if a.flags & IFA_F_OPTIMISTIC != 0 && !use_optimistic(a.ifindex) {
+                    IFA_F_DEPRECATED | IFA_F_OPTIMISTIC
+                } else {
+                    IFA_F_DEPRECATED
+                };
                 (
                     a.addr == *dst,
                     // Rule 2: a scope that is large enough, then the smallest of those.
                     s >= want,
                     if s >= want { u8::MAX - s } else { s },
+                    // Rule 3: avoid the deprecated and the optimistic addresses.
+                    a.flags & avoid == 0,
                     a.ifindex == ifindex,
                     common(&a.addr, dst),
                 )

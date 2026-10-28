@@ -6,8 +6,13 @@
 //! the device receives. Without `IFF_NO_PI` each frame starts with a `struct tun_pi`, and with
 //! `IFF_VNET_HDR` a `struct virtio_net_hdr` comes next.
 //!
-//! Each device has one queue. The device goes away when its file closes, if it is not
-//! persistent, or when its namespace stops.
+//! Each file that is attached to a device is a queue of the device. A device with
+//! `IFF_MULTI_QUEUE` takes up to `MAX_TAP_QUEUES` files, and a frame that the kernel sends goes to
+//! one queue by the hash of its flow, as `tun_automq_select_queue` of Linux. `TUNSETQUEUE` takes
+//! a queue off the device (`IFF_DETACH_QUEUE`) and puts it back (`IFF_ATTACH_QUEUE`).
+//! `TUNSETIFINDEX` gives the interface index of the next device that `TUNSETIFF` makes. The
+//! device goes away when its last file closes, if it is not persistent, or when its namespace
+//! stops.
 
 use crate::buf::NetBuf;
 use crate::dev::{self, Event, LinkKind, NetDevice, NetDriver};
@@ -18,7 +23,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::{ETH_P_IP, ETH_P_IPV6};
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
@@ -45,8 +50,12 @@ pub const IFF_NAPI: u32 = 0x0010;
 pub const IFF_NAPI_FRAGS: u32 = 0x0020;
 /// The device has no carrier at the start, for `TUNGETFEATURES`.
 pub const IFF_NO_CARRIER: u32 = 0x0040;
-/// More than one queue. This device has one queue.
+/// More than one queue: more than one file can attach to the device.
 pub const IFF_MULTI_QUEUE: u32 = 0x0100;
+/// `TUNSETQUEUE` puts the queue of the file back on its device.
+pub const IFF_ATTACH_QUEUE: u32 = 0x0200;
+/// `TUNSETQUEUE` takes the queue of the file off its device.
+pub const IFF_DETACH_QUEUE: u32 = 0x0400;
 /// The device stays when its file closes.
 pub const IFF_PERSIST: u32 = 0x0800;
 /// No `struct tun_pi` before the frames.
@@ -79,6 +88,7 @@ const TUNSETSNDBUF: u32 = 0x4004_54d4;
 const TUNGETVNETHDRSZ: u32 = 0x8004_54d7;
 const TUNSETVNETHDRSZ: u32 = 0x4004_54d8;
 const TUNSETQUEUE: u32 = 0x4004_54d9;
+const TUNSETIFINDEX: u32 = 0x4004_54da;
 const TUNSETVNETLE: u32 = 0x4004_54dc;
 const TUNGETVNETLE: u32 = 0x8004_54dd;
 const TUNSETCARRIER: u32 = 0x4004_54e2;
@@ -105,6 +115,8 @@ const READQ: usize = 500;
 const BACKLOG: usize = 1000;
 /// The largest MTU, `MAX_MTU` of tun.c.
 const MAX_MTU: u32 = 65535;
+/// The most queues of a device, `MAX_TAP_QUEUES` of Linux.
+pub const MAX_TAP_QUEUES: usize = 256;
 
 /// The settings of a device that the ioctls change.
 struct Config {
@@ -120,21 +132,44 @@ struct Config {
     carrier: bool,
 }
 
+/// A queue of a device: the frames that the kernel sent for the reads of one file, as the
+/// queue of `struct tun_file` of Linux.
+pub(crate) struct Queue {
+    pub(crate) out: SpinLock<VecDeque<NetBuf>>,
+    /// The queue takes frames. A queue that `IFF_DETACH_QUEUE` took off the device does not.
+    pub(crate) enabled: AtomicBool,
+    wait: Arc<WaitQueue>,
+    events: AtomicU64,
+}
+
+impl Queue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            out: SpinLock::new(VecDeque::new()),
+            enabled: AtomicBool::new(false),
+            wait: Arc::new(WaitQueue::new()),
+            events: AtomicU64::new(0),
+        })
+    }
+
+    fn wake(&self) {
+        self.events.fetch_add(1, Ordering::Relaxed);
+        self.wait.wake_all();
+    }
+}
+
 /// The driver of a TUN or TAP device.
 pub struct Tun {
     mac: MacAddr,
     tap: bool,
     config: SpinLock<Config>,
-    /// A file is attached.
-    attached: AtomicBool,
+    /// The queues of the files of the device, the enabled and the disabled ones, in the order of
+    /// their attach, as `tfiles` and `disabled` of Linux.
+    queues: SpinLock<Vec<Arc<Queue>>>,
     /// The device went away. A file of the device then gives `EBADFD`.
     gone: AtomicBool,
-    /// The frames that the kernel sent, for the reads.
-    out: SpinLock<VecDeque<NetBuf>>,
     /// The frames that the writes gave, for the poll of the device.
     input: SpinLock<VecDeque<NetBuf>>,
-    wait: Arc<WaitQueue>,
-    events: AtomicU64,
 }
 
 /// The TUN and TAP devices, to find the driver of a device.
@@ -154,18 +189,60 @@ impl Tun {
                 vnet_le: false,
                 carrier: true,
             }),
-            attached: AtomicBool::new(false),
+            queues: SpinLock::new(Vec::new()),
             gone: AtomicBool::new(false),
-            out: SpinLock::new(VecDeque::new()),
             input: SpinLock::new(VecDeque::new()),
-            wait: Arc::new(WaitQueue::new()),
-            events: AtomicU64::new(0),
         })
     }
 
-    fn wake(&self) {
-        self.events.fetch_add(1, Ordering::Relaxed);
-        self.wait.wake_all();
+    fn multi_queue(&self) -> bool {
+        self.config.lock().flags & IFF_MULTI_QUEUE != 0
+    }
+
+    /// Puts the queue `q` of a file on the device, as `tun_attach` of Linux. A device without
+    /// `IFF_MULTI_QUEUE` takes one enabled queue, and a device takes at most `MAX_TAP_QUEUES`.
+    fn attach(&self, q: &Arc<Queue>) -> Result<()> {
+        let multi = self.multi_queue();
+        let mut queues = self.queues.lock();
+        let known = queues.iter().any(|x| Arc::ptr_eq(x, q));
+        if !multi && queues.iter().any(|x| x.enabled.load(Ordering::Relaxed)) {
+            return Err(Errno::EBUSY);
+        }
+        if !known && queues.len() >= MAX_TAP_QUEUES {
+            return Err(Errno::E2BIG);
+        }
+        q.enabled.store(true, Ordering::Release);
+        if !known {
+            queues.push(q.clone());
+        }
+        Ok(())
+    }
+
+    /// Takes the queue `q` off the device, as `__tun_detach` of Linux. The frames of the queue go
+    /// away. With `keep` the queue stays as a disabled queue, for `IFF_DETACH_QUEUE`. Gives the
+    /// count of the queues that are left.
+    fn detach(&self, q: &Arc<Queue>, keep: bool) -> usize {
+        q.enabled.store(false, Ordering::Release);
+        q.out.lock().clear();
+        q.wake();
+        let mut queues = self.queues.lock();
+        if !keep {
+            queues.retain(|x| !Arc::ptr_eq(x, q));
+        }
+        queues.len()
+    }
+
+    /// The enabled queue for `frame`: the hash of its flow selects one of them, as
+    /// `tun_automq_select_queue` of Linux.
+    fn select(&self, frame: &NetBuf) -> Option<Arc<Queue>> {
+        let queues = self.queues.lock();
+        let enabled = queues.iter().filter(|q| q.enabled.load(Ordering::Relaxed));
+        let n = enabled.clone().count();
+        if n == 0 {
+            return None;
+        }
+        let i = if n == 1 { 0 } else { flow_hash(frame.data()) as usize % n };
+        enabled.clone().nth(i).cloned()
     }
 
     /// The flags for `TUNGETIFF`, as `tun_flags` of Linux.
@@ -201,25 +278,25 @@ impl NetDriver for Tun {
         Some(KIND)
     }
 
-    /// The carrier is on while a file is attached, as `tun_attach` of Linux sets it.
+    /// The carrier is on while a queue is enabled, as `tun_attach` and `__tun_detach` of Linux
+    /// set it.
     fn link_up(&self) -> bool {
-        self.attached.load(Ordering::Relaxed) && self.config.lock().carrier
+        self.queues.lock().iter().any(|q| q.enabled.load(Ordering::Relaxed))
+            && self.config.lock().carrier
     }
 
-    /// Puts the frame in the queue of the reads, as `tun_net_xmit` of Linux. Without a file, or
-    /// with a full queue, the frame goes away.
+    /// Puts the frame in the queue of the reads of one file, as `tun_net_xmit` of Linux. Without
+    /// an enabled queue, or with a full queue, the frame goes away.
     fn transmit(&self, frame: NetBuf) -> Result<()> {
-        if !self.attached.load(Ordering::Relaxed) {
-            return Ok(());
-        }
+        let Some(queue) = self.select(&frame) else { return Ok(()) };
         {
-            let mut q = self.out.lock();
+            let mut q = queue.out.lock();
             if q.len() >= READQ {
                 return Err(Errno::ENOBUFS);
             }
             q.push_back(frame);
         }
-        self.wake();
+        queue.wake();
         Ok(())
     }
 
@@ -239,27 +316,52 @@ impl NetDriver for Tun {
 pub struct TunFile {
     /// The namespace of the process that opened the file. A new device goes in it.
     net: Arc<NetNs>,
+    /// The interface index for the device that `TUNSETIFF` makes, from `TUNSETIFINDEX`. With 0
+    /// the device gets a free index.
+    pub(crate) ifindex: AtomicU32,
+    /// The queue of the file. It is on the device of the file while it is enabled.
+    pub(crate) queue: Arc<Queue>,
+    /// The device of the file. The file is detached if this is set and the queue is not enabled.
     attached: SpinLock<Option<(Arc<Tun>, Arc<NetDevice>)>>,
 }
 
 impl TunFile {
-    /// The device of the file. Gives `EBADFD` if the file has none, as Linux.
-    fn device(&self) -> Result<(Arc<Tun>, Arc<NetDevice>)> {
+    pub(crate) fn new(net: Arc<NetNs>) -> Self {
+        Self { net, ifindex: AtomicU32::new(0), queue: Queue::new(), attached: SpinLock::new(None) }
+    }
+
+    /// The device of the file. Gives `EBADFD` if the file has none, or if `IFF_DETACH_QUEUE`
+    /// took its queue off, as Linux.
+    pub(crate) fn device(&self) -> Result<(Arc<Tun>, Arc<NetDevice>)> {
         let a = self.attached.lock().clone();
         match a {
-            Some((tun, dev)) if !tun.gone.load(Ordering::Relaxed) => Ok((tun, dev)),
+            Some((tun, dev))
+                if !tun.gone.load(Ordering::Relaxed)
+                    && self.queue.enabled.load(Ordering::Relaxed) =>
+            {
+                Ok((tun, dev))
+            }
             _ => Err(Errno::EBADFD),
         }
     }
 
+    /// The device of a file that `IFF_DETACH_QUEUE` took off, as `tfile->detached` of Linux.
+    fn detached(&self) -> Option<Arc<Tun>> {
+        let a = self.attached.lock();
+        let (tun, _) = a.as_ref()?;
+        (!tun.gone.load(Ordering::Relaxed) && !self.queue.enabled.load(Ordering::Relaxed))
+            .then(|| tun.clone())
+    }
+
     /// Makes a device or attaches to one, as `tun_set_iff` of Linux. Gives the name.
-    fn set_iff(&self, name: &str, flags: u32) -> Result<String> {
+    pub(crate) fn set_iff(&self, name: &str, flags: u32) -> Result<String> {
         let _in = ns::enter(&self.net);
         let tap = match flags & (IFF_TUN | IFF_TAP) {
             IFF_TUN => false,
             IFF_TAP => true,
             _ => return Err(Errno::EINVAL),
         };
+        let detached = self.detached();
         let (tun, dev) = match (!name.is_empty()).then(|| dev::by_name(name)).flatten() {
             Some(dev) => {
                 if flags & IFF_TUN_EXCL != 0 {
@@ -269,15 +371,28 @@ impl TunFile {
                 if tun.tap != tap {
                     return Err(Errno::EINVAL);
                 }
+                if (flags & IFF_MULTI_QUEUE != 0) != tun.multi_queue() {
+                    return Err(Errno::EINVAL);
+                }
                 if tun.not_capable() {
                     return Err(Errno::EPERM);
                 }
-                if tun.attached.swap(true, Ordering::AcqRel) {
-                    return Err(Errno::EBUSY);
+                // A detached file attaches again only to its own device.
+                if detached.as_ref().is_some_and(|d| !Arc::ptr_eq(d, &tun)) {
+                    return Err(Errno::EINVAL);
+                }
+                tun.attach(&self.queue)?;
+                // Only the first queue sets the flags, as Linux.
+                if tun.queues.lock().len() == 1 {
+                    let mut c = tun.config.lock();
+                    c.flags = (c.flags & !FEATURES) | (flags & FEATURES);
                 }
                 (tun, dev)
             }
             None => {
+                if detached.is_some() {
+                    return Err(Errno::EINVAL);
+                }
                 if !cred::current().capable(cap::NET_ADMIN) {
                     return Err(Errno::EPERM);
                 }
@@ -288,28 +403,55 @@ impl TunFile {
                 };
                 let name = alloc_name(pattern)?;
                 let tun = Tun::new(tap, flags & FEATURES);
-                tun.attached.store(true, Ordering::Release);
-                let dev = dev::register_named(tun.clone(), Some(name.as_bytes()))?;
+                tun.attach(&self.queue)?;
+                let ifindex = self.ifindex.load(Ordering::Relaxed);
+                let dev = match dev::register_at(tun.clone(), Some(name.as_bytes()), ifindex) {
+                    Ok(dev) => dev,
+                    Err(e) => {
+                        tun.detach(&self.queue, false);
+                        return Err(e);
+                    }
+                };
                 TUNS.lock().push((Arc::downgrade(&dev), tun.clone()));
                 (tun, dev)
             }
         };
-        {
-            let mut c = tun.config.lock();
-            c.flags = (c.flags & !FEATURES) | (flags & FEATURES);
-        }
         let name = dev.name();
         *self.attached.lock() = Some((tun, dev));
         Ok(name)
     }
 
+    /// Takes the queue of the file off its device or puts it back, as `tun_set_queue` of Linux.
+    pub(crate) fn set_queue(&self, flags: u32) -> Result<()> {
+        match flags {
+            IFF_ATTACH_QUEUE => {
+                let tun = self.detached().ok_or(Errno::EINVAL)?;
+                if tun.not_capable() {
+                    return Err(Errno::EPERM);
+                }
+                tun.attach(&self.queue)
+            }
+            IFF_DETACH_QUEUE => {
+                let (tun, _) = self.device().map_err(|_| Errno::EINVAL)?;
+                if !tun.multi_queue() {
+                    return Err(Errno::EINVAL);
+                }
+                tun.detach(&self.queue, true);
+                Ok(())
+            }
+            _ => Err(Errno::EINVAL),
+        }
+    }
+
     /// Takes the file off its device, as `tun_detach` of Linux. A device that is not persistent
-    /// goes away.
+    /// goes away with its last queue.
     fn detach(&self) {
         let Some((tun, dev)) = self.attached.lock().take() else { return };
-        tun.attached.store(false, Ordering::Release);
-        tun.out.lock().clear();
-        if tun.config.lock().flags & IFF_PERSIST == 0 {
+        let left = tun.detach(&self.queue, false);
+        if left == 0
+            && tun.config.lock().flags & IFF_PERSIST == 0
+            && !tun.gone.load(Ordering::Relaxed)
+        {
             let _in = ns::enter_index(dev.net());
             dev::unregister(&dev);
         }
@@ -320,6 +462,41 @@ impl Drop for TunFile {
     fn drop(&mut self) {
         self.detach();
     }
+}
+
+/// A hash of the flow of the frame `data` (an Ethernet frame) that is the same in the two
+/// directions, as the symmetric flow hash of Linux. It uses the IP addresses, the protocol and
+/// the ports of TCP, UDP and SCTP.
+pub(crate) fn flow_hash(data: &[u8]) -> u32 {
+    let ethertype = EthHeader::parse(data).map_or(0, |h| h.ethertype);
+    let ip = data.get(HLEN..).unwrap_or(&[]);
+    let (src, dst, proto, l4): (&[u8], &[u8], u8, &[u8]) = match ethertype {
+        t if t == ETH_P_IP as u16 && ip.len() >= 20 => {
+            let ihl = usize::from(ip[0] & 0xf) * 4;
+            // A fragment after the first one has no ports.
+            let frag = u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0;
+            let l4 = if frag { &[][..] } else { ip.get(ihl..).unwrap_or(&[]) };
+            (&ip[12..16], &ip[16..20], ip[9], l4)
+        }
+        t if t == ETH_P_IPV6 as u16 && ip.len() >= 40 => {
+            (&ip[8..24], &ip[24..40], ip[6], &ip[40..])
+        }
+        _ => return 0,
+    };
+    let ports = match proto {
+        6 | 17 | 132 if l4.len() >= 4 => {
+            let a = u32::from(u16::from_be_bytes([l4[0], l4[1]]));
+            let b = u32::from(u16::from_be_bytes([l4[2], l4[3]]));
+            a.min(b) << 16 | a.max(b)
+        }
+        _ => 0,
+    };
+    let (lo, hi) = if src <= dst { (src, dst) } else { (dst, src) };
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in lo.iter().chain(hi).chain(&[proto]).chain(&ports.to_be_bytes()) {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 /// The driver of the device `dev`, if it is a TUN or TAP device.
@@ -364,11 +541,12 @@ impl FileOps for TunFile {
     /// start of the frame.
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
         let (tun, dev) = self.device()?;
-        let frame = tun.wait.wait_interruptible(|| {
-            if tun.gone.load(Ordering::Relaxed) {
+        let queue = &self.queue;
+        let frame = queue.wait.wait_interruptible(|| {
+            if tun.gone.load(Ordering::Relaxed) || !queue.enabled.load(Ordering::Relaxed) {
                 return Err(Errno::EBADFD);
             }
-            if let Some(f) = tun.out.lock().pop_front() {
+            if let Some(f) = queue.out.lock().pop_front() {
                 return Ok(Some(f));
             }
             if file.nonblock() { Err(Errno::EAGAIN) } else { Ok(None) }
@@ -455,8 +633,16 @@ impl FileOps for TunFile {
     fn ioctl(&self, _file: &File, cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
         match cmd {
             TUNSETIFF => {
-                if self.attached.lock().is_some() {
-                    return Err(Errno::EEXIST);
+                {
+                    let mut a = self.attached.lock();
+                    match a.as_ref() {
+                        // The device went away: the file can take a new one, as Linux.
+                        Some((tun, _)) if tun.gone.load(Ordering::Relaxed) => *a = None,
+                        Some(_) if self.queue.enabled.load(Ordering::Relaxed) => {
+                            return Err(Errno::EEXIST);
+                        }
+                        _ => {}
+                    }
                 }
                 let mut req = [0u8; IFREQ];
                 mem.read(arg, &mut req)?;
@@ -474,7 +660,24 @@ impl FileOps for TunFile {
             TUNGETFEATURES => {
                 return write_int(mem, arg, (IFF_TUN | IFF_TAP | IFF_NO_CARRIER | FEATURES) as i32);
             }
-            TUNSETQUEUE => return Err(Errno::EINVAL),
+            TUNSETQUEUE => {
+                let mut req = [0u8; IFREQ];
+                mem.read(arg, &mut req)?;
+                let flags = u32::from(u16::from_ne_bytes([req[IFR_FLAGS], req[IFR_FLAGS + 1]]));
+                self.set_queue(flags)?;
+                return Ok(0);
+            }
+            TUNSETIFINDEX => {
+                if self.device().is_ok() {
+                    return Err(Errno::EPERM);
+                }
+                let v = read_int(mem, arg)?;
+                if v < 0 {
+                    return Err(Errno::EINVAL);
+                }
+                self.ifindex.store(v as u32, Ordering::Relaxed);
+                return Ok(0);
+            }
             _ => {}
         }
         let (tun, dev) = self.device()?;
@@ -547,8 +750,10 @@ impl FileOps for TunFile {
 
     /// A file without a device gives `POLLERR`, as `tun_chr_poll` of Linux.
     fn poll(&self, _file: &File) -> u32 {
-        let Ok((tun, _)) = self.device() else { return POLLERR };
-        let read = if tun.out.lock().is_empty() { 0 } else { POLLIN | POLLRDNORM };
+        if self.device().is_err() {
+            return POLLERR;
+        }
+        let read = if self.queue.out.lock().is_empty() { 0 } else { POLLIN | POLLRDNORM };
         read | POLLOUT | POLLWRNORM
     }
 
@@ -557,13 +762,11 @@ impl FileOps for TunFile {
     }
 
     fn poll_wait(&self, _file: &File, table: &mut PollTable) {
-        if let Some((tun, _)) = self.attached.lock().as_ref() {
-            table.add(&tun.wait);
-        }
+        table.add(&self.queue.wait);
     }
 
     fn event_count(&self) -> u64 {
-        self.attached.lock().as_ref().map_or(0, |(t, _)| t.events.load(Ordering::Relaxed))
+        self.queue.events.load(Ordering::Relaxed)
     }
 
     fn fdinfo(&self, _file: &File) -> Vec<u8> {
@@ -578,7 +781,7 @@ struct TunDevice;
 impl CharDevice for TunDevice {
     /// Opens a file without a device, as `tun_chr_open` of Linux.
     fn open(&self, _flags: u32) -> Result<Arc<dyn FileOps>> {
-        Ok(Arc::new(TunFile { net: ns::current(), attached: SpinLock::new(None) }))
+        Ok(Arc::new(TunFile::new(ns::current())))
     }
 }
 
@@ -593,8 +796,11 @@ fn notifier(dev: &NetDevice, event: Event) {
         let same = core::ptr::eq(d.as_ptr(), dev);
         if same {
             tun.gone.store(true, Ordering::Relaxed);
-            tun.attached.store(false, Ordering::Relaxed);
-            tun.wake();
+            for q in core::mem::take(&mut *tun.queues.lock()) {
+                q.enabled.store(false, Ordering::Relaxed);
+                q.out.lock().clear();
+                q.wake();
+            }
         }
         !same && d.strong_count() > 0
     });

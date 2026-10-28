@@ -504,6 +504,7 @@ fn loopback_sockets() {
 
     tcp_loopback();
     ipv6_loopback();
+    ipv6_groups();
 }
 
 fn tcp_send(s: &crate::Stream, data: &[u8]) -> Result<usize, Errno> {
@@ -924,4 +925,95 @@ fn ipv6_loopback() {
     c4.release();
     s4.release();
     l.release();
+}
+
+/// The multicast groups of a socket of IPv6: `IPV6_JOIN_GROUP`, `MCAST_JOIN_GROUP` and their
+/// errors, as `ipv6_sock_mc_join` and `ipv6_sock_mc_drop` of Linux.
+fn ipv6_groups() {
+    use crate::mcast6;
+    use rk_abi::native::in6::{IPV6_ADD_MEMBERSHIP, IPV6_DROP_MEMBERSHIP};
+    use rk_abi::native::inet::IPPROTO_IPV6;
+    let mreq = |g: &Ip, ifindex: i32| {
+        let mut v = g.to_vec();
+        v.extend_from_slice(&ifindex.to_ne_bytes());
+        v
+    };
+    let g = v6([0xff02, 0, 0, 0, 0, 0, 0, 0x123]);
+    let s = Dgram::new6(Proto::Udp);
+    let t = Dgram::new6(Proto::Udp);
+    let set = |s: &Dgram, name, v: &[u8]| s.set_option(IPPROTO_IPV6, name, v);
+    assert_eq!(set(&s, IPV6_ADD_MEMBERSHIP, &mreq(&g, 1)[..19]), Err(Errno::EINVAL));
+    assert_eq!(set(&s, IPV6_ADD_MEMBERSHIP, &mreq(&ip::LOOPBACK, 1)), Err(Errno::EINVAL));
+    assert_eq!(set(&s, IPV6_ADD_MEMBERSHIP, &mreq(&g, 99)), Err(Errno::ENODEV));
+    assert_eq!(set(&s, IPV6_ADD_MEMBERSHIP, &mreq(&g, 1)), Ok(()));
+    assert!(mcast6::joined(1, &g));
+    assert_eq!(set(&s, IPV6_ADD_MEMBERSHIP, &mreq(&g, 1)), Err(Errno::EADDRINUSE));
+    assert_eq!(set(&s, IPV6_ADD_MEMBERSHIP, &mreq(&g, 0)), Err(Errno::EADDRINUSE));
+    // `struct group_req`: the interface, then a `sockaddr_in6` at offset 8.
+    let mut req = vec![0u8; 136];
+    req[..4].copy_from_slice(&1u32.to_ne_bytes());
+    req[8..10].copy_from_slice(&(rk_net::consts::AF_INET6 as u16).to_ne_bytes());
+    req[16..32].copy_from_slice(&g);
+    assert_eq!(set(&t, 42, &req[..135]), Err(Errno::EINVAL));
+    assert_eq!(set(&t, 42, &req), Ok(()));
+    // The group stays while a socket is in it.
+    assert_eq!(
+        set(&s, IPV6_DROP_MEMBERSHIP, &mreq(&v6([0xff02, 0, 0, 0, 0, 0, 0, 7]), 0)),
+        Err(Errno::EADDRNOTAVAIL)
+    );
+    assert_eq!(set(&s, IPV6_DROP_MEMBERSHIP, &mreq(&g, 0)), Ok(()));
+    assert_eq!(set(&s, IPV6_DROP_MEMBERSHIP, &mreq(&g, 0)), Err(Errno::EADDRNOTAVAIL));
+    assert!(mcast6::joined(1, &g));
+    // A socket that closes leaves its groups.
+    t.release();
+    assert!(!mcast6::joined(1, &g));
+    s.release();
+}
+
+#[test]
+fn mld_delays_and_random_identifiers() {
+    use crate::mcast6::max_delay;
+    let msg = |code: u16| {
+        let mut m = vec![130u8, 0, 0, 0];
+        m.extend_from_slice(&code.to_be_bytes());
+        m
+    };
+    assert_eq!(max_delay(&msg(10_000), true), 10_000);
+    assert_eq!(max_delay(&msg(0x8000), true), 0x8000);
+    assert_eq!(max_delay(&msg(1000), false), 1000);
+    // The code of MLDv2 with the exponent: (0x1000 | mant) << (exp + 3).
+    assert_eq!(max_delay(&msg(0x8001), false), 0x1001 << 3);
+    assert_eq!(max_delay(&msg(0xf000), false), 0x1000 << 10);
+    assert_eq!(crate::mcast6::random_below(0), 0);
+    assert!((0..100).all(|_| crate::mcast6::random_below(7) < 7));
+}
+
+#[test]
+fn optimistic_addresses_are_sources_after_the_preferred_ones() {
+    use crate::route6::{Addr6, Table6};
+    use rk_abi::native::if_addr::{IFA_F_DADFAILED, IFA_F_OPTIMISTIC, IFA_F_TENTATIVE};
+    let mut t = Table6::new();
+    let dst = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]);
+    let tentative = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
+    let optimistic = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x11]);
+    let failed = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x12]);
+    let mut a = Addr6::new(2, tentative, 64);
+    a.flags |= IFA_F_TENTATIVE;
+    t.insert_addr(a).unwrap();
+    assert_eq!(t.select_src(&dst, 2), None);
+    let mut a = Addr6::new(2, failed, 64);
+    a.flags |= IFA_F_TENTATIVE | IFA_F_OPTIMISTIC | IFA_F_DADFAILED;
+    t.insert_addr(a).unwrap();
+    assert_eq!(t.select_src(&dst, 2), None);
+    let mut a = Addr6::new(2, optimistic, 64);
+    a.flags |= IFA_F_TENTATIVE | IFA_F_OPTIMISTIC;
+    t.insert_addr(a).unwrap();
+    assert_eq!(t.select_src(&dst, 2), Some(optimistic));
+    // Neighbour discovery does not use an optimistic source.
+    assert_eq!(t.select_src_strict(&dst, 2), None);
+    // A preferred address of the same scope comes first.
+    let preferred = v6([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x14]);
+    t.insert_addr(Addr6::new(2, preferred, 64)).unwrap();
+    assert_eq!(t.select_src(&dst, 2), Some(preferred));
+    assert_eq!(t.select_src_strict(&dst, 2), Some(preferred));
 }

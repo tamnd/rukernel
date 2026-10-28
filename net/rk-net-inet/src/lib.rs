@@ -32,6 +32,7 @@ mod ioctl;
 pub mod ip;
 pub mod ipv4;
 pub mod ipv6;
+mod mcast6;
 pub mod neigh;
 pub mod ports;
 mod procfs;

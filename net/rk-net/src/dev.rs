@@ -570,6 +570,16 @@ pub fn register(driver: Arc<dyn NetDriver>) -> Result<Arc<NetDevice>> {
 /// Linux. Without a name, a virtual device gets its kind and the lowest free number, as `vethN`.
 /// Gives `EEXIST` if the name is in use, and `EINVAL` for a bad name.
 pub fn register_named(driver: Arc<dyn NetDriver>, name: Option<&[u8]>) -> Result<Arc<NetDevice>> {
+    register_at(driver, name, 0)
+}
+
+/// Registers a device as `register_named`, with the interface index `ifindex` if it is not 0, as
+/// `dev_index_reserve` of Linux. Gives `EBUSY` if a device of the namespace has the index.
+pub fn register_at(
+    driver: Arc<dyn NetDriver>,
+    name: Option<&[u8]>,
+    ifindex: u32,
+) -> Result<Arc<NetDevice>> {
     let net = ns::current_index();
     let dev = {
         let mut devices = DEVICES.lock();
@@ -596,7 +606,13 @@ pub fn register_named(driver: Arc<dyn NetDriver>, name: Option<&[u8]>) -> Result
                 }
             }
         };
-        let ifindex = new_index(&devices, net);
+        let ifindex = match ifindex {
+            0 => new_index(&devices, net),
+            i if devices.iter().any(|d| d.net() == net && d.ifindex() == i) => {
+                return Err(Errno::EBUSY);
+            }
+            i => i,
+        };
         let dev = Arc::new(NetDevice {
             name: SpinLock::new(name),
             ifindex: AtomicU32::new(ifindex),
