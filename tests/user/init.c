@@ -431,6 +431,39 @@ static void test_hugetlbfs(void)
 	unlink("/huge/f");
 	check("the pages of a file of hugetlbfs go back to the reservation of min_size=",
 	      meminfo("HugePages_Rsvd:") == 1 && meminfo("HugePages_Free:") == 4);
+
+	/* A private mapping of a file takes the pages of the mount too (#415). */
+	fd = open("/huge/p", O_CREAT | O_RDWR, 0600);
+	m = mmap(NULL, 3 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	check("a private mapping of hugetlbfs past size= gives ENOMEM", m == MAP_FAILED && errno == ENOMEM);
+	m = mmap(NULL, 2 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	check("a private mapping of hugetlbfs reserves its pages in the mount",
+	      m != MAP_FAILED && meminfo("HugePages_Rsvd:") == 2 &&
+		      mmap(NULL, huge, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED);
+	if (m != MAP_FAILED) {
+		m[0] = 1;
+		munmap(m, 2 * huge);
+	}
+	check("the private pages go back to the mount",
+	      meminfo("HugePages_Rsvd:") == 1 && meminfo("HugePages_Free:") == 4);
+	m = mmap(NULL, 3 * huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_NORESERVE, fd, 0);
+	if (m != MAP_FAILED) {
+		int status = 0;
+		pid_t pid = fork();
+		if (pid == 0) {
+			m[0] = 1;
+			m[huge] = 1;
+			m[2 * huge] = 1;
+			_exit(0);
+		}
+		check("a private fault of hugetlbfs past size= gives SIGBUS",
+		      waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGBUS);
+		munmap(m, 3 * huge);
+	}
+	close(fd);
+	unlink("/huge/p");
+	check("the pages of a private fault go back to the mount",
+	      meminfo("HugePages_Rsvd:") == 1 && meminfo("HugePages_Free:") == 4);
 	umount("/huge");
 	check("the reservation of min_size= goes with the mount", meminfo("HugePages_Rsvd:") == 0);
 	write_text("/proc/sys/vm/nr_hugepages", "0");

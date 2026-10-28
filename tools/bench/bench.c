@@ -38,6 +38,7 @@
 #define PAGE 4096
 #define FAULT_BYTES (16L << 20)
 #define BIG_BYTES (128L << 20)
+#define COW_BYTES (16L << 20)
 #define MT_BYTES (4L << 20)
 #define STREAM_CHUNK 65536
 #define UDP_SIZE 1024
@@ -205,6 +206,47 @@ static double b_fault(void)
 			m[i * PAGE] = 1;
 		total += now_ns() - t;
 		munmap(m, FAULT_BYTES);
+	}
+	return (double)total / (rounds * pages);
+}
+
+/*
+ * mem: the write fault that copies a private page of 4 KiB, which a child of fork also maps. The
+ * area has no transparent huge pages, so each fault copies one page. Only the writes are in the
+ * time.
+ */
+static double b_cow(void)
+{
+	long rounds = count(400) / 100 + 1, pages = COW_BYTES / PAGE, total = 0;
+	for (long r = 0; r < rounds; r++) {
+		char *m = mmap(NULL, COW_BYTES, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED)
+			die("mmap");
+		madvise(m, COW_BYTES, MADV_NOHUGEPAGE);
+		for (long i = 0; i < pages; i++)
+			m[i * PAGE] = 1;
+		int p[2];
+		if (pipe(p) != 0)
+			die("pipe");
+		pid_t pid = fork();
+		if (pid < 0)
+			die("fork");
+		if (pid == 0) {
+			/* The child keeps the pages until the parent closes the pipe. */
+			char c;
+			close(p[1]);
+			read(p[0], &c, 1);
+			_exit(0);
+		}
+		close(p[0]);
+		long t = now_ns();
+		for (long i = 0; i < pages; i++)
+			m[i * PAGE] = 2;
+		total += now_ns() - t;
+		close(p[1]);
+		waitpid(pid, NULL, 0);
+		munmap(m, COW_BYTES);
 	}
 	return (double)total / (rounds * pages);
 }
@@ -552,7 +594,7 @@ static const struct {
 	{"thread", b_thread},	   {"fault", b_fault},		{"mmap", b_mmap},
 	{"fork", b_fork},	   {"fork_big", b_fork_big},	{"tcp_rr", b_tcp_rr},
 	{"tcp_stream", b_tcp_stream}, {"udp_rr", b_udp_rr},	{"udp_stream", b_udp_stream},
-	{"fault_mt", b_fault_mt},  {"mmap_mt", b_mmap_mt},
+	{"fault_mt", b_fault_mt},  {"mmap_mt", b_mmap_mt},	{"cow", b_cow},
 };
 
 /* As init: get a console, mount /proc and /dev, and bring up lo. Errors do not stop the run. */

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Runs the benchmarks of bench.c on rukernel and on Linux under QEMU, and writes the table.
 
-Usage: tools/bench/run.py --rukernel FILE --linux FILE [--cc CC] [options]
+Usage: tools/bench/run.py --rukernel FILE --linux FILE [--cc CC] [--arch aarch64] [options]
 
 The script compiles bench.c as a static program with CC (or takes --bench), and puts it in an
 initramfs as /init. Then it boots each kernel one time in QEMU with the same machine (CPU count,
@@ -9,6 +9,10 @@ memory, accelerator and CPU model) and the same initramfs. The program runs each
 as a warm-up and then --runs times, and prints one line for each run. The script keeps the serial
 output of each kernel in OUT/KERNEL.log and writes the table to --table. With --reuse, it does not
 boot and makes the table from these logs.
+
+With --arch aarch64, the two kernels are arm64 kernels on the QEMU `virt` machine. --rukernel is
+then the kernel ELF file or its `Image`, and --linux is a Linux arm64 `Image`. CC must make arm64
+programs.
 
 The value of a run is the time of one operation, or a throughput for the stream benchmarks. The
 table gives the median of the runs and the interquartile range (IQR) as a percentage of the median.
@@ -19,6 +23,7 @@ tells that rukernel is slower. A row with a ratio above 2.00 is red.
 
 import argparse
 import datetime
+import importlib.util
 import os
 import platform
 import select
@@ -46,6 +51,7 @@ BENCHES = [
     ("mem", "fork_big", "us", False, "the same with 128 MiB of written private memory"),
     ("mem", "fault_mt", "ns", False, "`fault` in one thread per CPU at the same time, wall time"),
     ("mem", "mmap_mt", "ns", False, "`mmap` in one thread per CPU at the same time, wall time"),
+    ("mem", "cow", "ns", False, "write fault that copies a 4 KiB page that a child of fork maps"),
     ("net", "tcp_rr", "us", False, "TCP round trip of 1 byte on loopback"),
     ("net", "tcp_stream", "MB/s", True, "TCP throughput on loopback, writes of 64 KiB"),
     ("net", "udp_rr", "us", False, "UDP round trip of 1 byte on loopback"),
@@ -67,20 +73,44 @@ def cpio(entries):
     return bytes(out)
 
 
-def accel():
-    """Gives the accelerator and the CPU model. Both kernels use the same."""
-    if os.access("/dev/kvm", os.R_OK | os.W_OK):
+def accel(a):
+    """Gives the accelerator and the CPU model. Both kernels use the same. KVM needs a host of the
+    same architecture. Without KVM, an arm64 guest has the CPU of the arm64 boot tests."""
+    host = {"arm64": "aarch64", "amd64": "x86_64"}.get(platform.machine(), platform.machine())
+    if host == a.arch and os.access("/dev/kvm", os.R_OK | os.W_OK):
         return ["-accel", "kvm", "-cpu", "host"]
-    return ["-accel", "tcg", "-cpu", "max"]
+    return ["-accel", "tcg", "-cpu", "cortex-a72" if a.arch == "aarch64" else "max"]
+
+
+def qemu_binary(a):
+    return f"qemu-system-{a.arch}"
+
+
+def machine(a):
+    """Gives the machine options of QEMU. The arm64 kernel of rukernel uses the GICv3."""
+    if a.arch == "aarch64":
+        return ["-machine", "virt,gic-version=3"]
+    return ["-machine", "q35"]
 
 
 def qemu_command(a, kernel, initrd, cmdline):
-    return [
-        "qemu-system-x86_64", "-machine", "q35", "-m", a.memory, "-smp", str(a.smp),
+    cmd = [qemu_binary(a)] + machine(a) + [
+        "-m", a.memory, "-smp", str(a.smp),
         "-display", "none", "-serial", "stdio", "-no-reboot", "-monitor", "none",
-        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-kernel", kernel, "-initrd", initrd, "-append", cmdline,
-    ] + accel()
+    ]
+    if a.arch == "x86_64":
+        cmd += ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+    return cmd + accel(a)
+
+
+def arm64_image(kernel, path):
+    """Writes the arm64 `Image` of the rukernel ELF file to `path`, with the function of the LTP
+    runner. Gives `path`, or `kernel` if it is an `Image` already."""
+    spec = importlib.util.spec_from_file_location("ltp_run", os.path.join(HERE, "../ltp/run.py"))
+    ltp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ltp)
+    return ltp.arm64_image(kernel, path)
 
 
 def parse(path):
@@ -162,8 +192,8 @@ def host_info():
     return f"{model}, {os.cpu_count()} CPUs, Linux {platform.release()}"
 
 
-def qemu_version():
-    out = subprocess.run(["qemu-system-x86_64", "--version"], capture_output=True, text=True)
+def qemu_version(a):
+    out = subprocess.run([qemu_binary(a), "--version"], capture_output=True, text=True)
     return out.stdout.splitlines()[0] if out.stdout else "unknown"
 
 
@@ -175,7 +205,9 @@ def commit():
 
 def table(a, linux, rk):
     """Gives the text of results.md."""
-    acc = " ".join(accel())
+    acc = " ".join(accel(a))
+    target = f"{a.arch}-unknown-none"
+    arch_opt = " --arch aarch64" if a.arch == "aarch64" else ""
     lines = [
         "# rukernel-bench: the first table",
         "",
@@ -187,7 +219,8 @@ def table(a, linux, rk):
         f"- rukernel commit: {a.commit} (release build of the `rukernel` package)",
         f"- Linux: `{os.path.basename(a.linux)}` ({a.linux_note})",
         f"- Host: {a.host}",
-        f"- QEMU: {qemu_version()}, `-machine q35 -m {a.memory} -smp {a.smp} {acc}`, the same "
+        f"- QEMU: {qemu_version(a)}, `{' '.join(machine(a))} -m {a.memory} -smp {a.smp} {acc}`, "
+        "the same "
         "for both kernels",
         f"- Userland: one static musl program (`tools/bench/bench.c`) as /init in the same "
         "initramfs for both kernels",
@@ -240,9 +273,9 @@ def table(a, linux, rk):
         "To make this table again on a host with QEMU and a C compiler for static musl programs:",
         "",
         "```",
-        "cargo build --release --package rukernel --target x86_64-unknown-none",
-        f"tools/bench/run.py --rukernel target/x86_64-unknown-none/release/rukernel \\",
-        f"    --linux {a.linux} --cc musl-gcc --runs {a.runs}",
+        f"cargo build --release --package rukernel --target {target}",
+        f"tools/bench/run.py{arch_opt} --rukernel target/{target}/release/rukernel \\",
+        f"    --linux {a.linux} --cc {a.cc or 'musl-gcc'} --runs {a.runs}",
         "```",
         "",
     ]
@@ -273,7 +306,9 @@ def initramfs(a):
 def main():
     p = argparse.ArgumentParser(description="Runs the benchmarks on rukernel and Linux in QEMU.")
     p.add_argument("--rukernel", required=True, help="the rukernel ELF file (a release build)")
-    p.add_argument("--linux", required=True, help="the Linux bzImage")
+    p.add_argument("--linux", required=True, help="the Linux bzImage, or the arm64 Image")
+    p.add_argument("--arch", choices=["x86_64", "aarch64"], default="x86_64",
+                   help="the architecture of the kernels and of the QEMU machine")
     p.add_argument("--linux-note", default="the kernel of the host distribution",
                    help="a note on the Linux kernel for the table")
     p.add_argument("--cc", help="a C compiler for static musl programs, for example musl-gcc")
@@ -300,8 +335,9 @@ def main():
 
     a.only_set = set(a.only.split(",")) if a.only else set()
     args = f"-- {a.runs} {a.scale}" + "".join(f" {n}" for n in sorted(a.only_set))
-    a.linux_cmdline = f"console=ttyS0 rdinit=/init mitigations=off quiet panic=-1 {args}"
-    a.rk_cmdline = f"console=ttyS0 rk.test=init rdinit=/init {args}"
+    console = "ttyAMA0" if a.arch == "aarch64" else "ttyS0"
+    a.linux_cmdline = f"console={console} rdinit=/init mitigations=off quiet panic=-1 {args}"
+    a.rk_cmdline = f"console={console} rk.test=init rdinit=/init {args}"
     a.date = a.date or datetime.date.today().isoformat()
     a.commit = a.commit or commit()
     a.host = host_info()
@@ -315,7 +351,10 @@ def main():
             linux = parse(os.path.join(a.out, "linux.log"))
         else:
             linux = boot(a, "linux", a.linux, initrd, a.linux_cmdline)
-        rk = boot(a, "rukernel", a.rukernel, initrd, a.rk_cmdline)
+        kernel = a.rukernel
+        if a.arch == "aarch64":
+            kernel = arm64_image(kernel, os.path.join(a.out, "Image"))
+        rk = boot(a, "rukernel", kernel, initrd, a.rk_cmdline)
     text = table(a, linux, rk)
     with open(a.table, "w") as f:
         f.write(text)

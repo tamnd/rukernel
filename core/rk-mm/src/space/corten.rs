@@ -328,7 +328,8 @@ impl AddressSpace {
                 if va.len() > tunables::max_map_count() {
                     return Err(Errno::ENOMEM);
                 }
-                let (bottom, top) = if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, MMAP_TOP) };
+                let (bottom, top) =
+                    if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, self.mmap_top()) };
                 let hint = req.addr & !(PAGE_SIZE - 1);
                 let hint_ok = hint >= MMAP_MIN_ADDR
                     && hint

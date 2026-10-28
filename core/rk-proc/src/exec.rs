@@ -31,6 +31,23 @@ use rk_vfs::{FileType, FsContext, InodeRef, Location};
 const MAX_SCRIPT_DEPTH: usize = 4;
 /// The longest `#!` line that the kernel reads. Linux names it `BINPRM_BUF_SIZE`.
 const SCRIPT_LINE: usize = 256;
+/// The flag of `personality` that turns off the random layout, as in Linux.
+pub const ADDR_NO_RANDOMIZE: u32 = 0x0004_0000;
+
+/// The bits of the random offset of the `mmap` area, in pages. They are the defaults of
+/// `mmap_rnd_bits` of Linux: 28 on x86-64 and 18 on arm64 with 4 KiB pages.
+#[cfg(target_arch = "aarch64")]
+const MMAP_RND_BITS: u32 = 18;
+#[cfg(not(target_arch = "aarch64"))]
+const MMAP_RND_BITS: u32 = 28;
+
+/// The random offset of the `mmap` area for the random value `seed`, as `arch_mmap_rnd` of Linux.
+/// A program that uses an address near the top of the user space, such as LTP hugemmap24, needs a
+/// free range above the `mmap` area.
+fn mmap_offset(seed: u64) -> usize {
+    (seed & ((1 << MMAP_RND_BITS) - 1)) as usize * PAGE_SIZE
+}
+
 /// The base of a position independent executable. Linux names it `ELF_ET_DYN_BASE`: two thirds of
 /// the user address space, at a 2 MiB boundary.
 pub const ET_DYN_BASE: usize = (STACK_TOP / 3 * 2) & !0x1f_ffff;
@@ -291,7 +308,8 @@ type Built = (AddressSpace, ExecImage, (Location, DenyWrite), Vec<Vec<u8>>, Vec<
 /// Makes the new address space and the initial stack for `args`. `random` gives the 16 bytes of
 /// `AT_RANDOM`. Also gives the file of the program, the arguments, which an interpreter line
 /// changes, the auxiliary vector and the new credentials. With `no_setid`, the set-user-ID and
-/// set-group-ID bits of the file have no effect.
+/// set-group-ID bits of the file have no effect. With `randomize`, the top of the `mmap` area
+/// gets a random offset.
 fn build(
     fs: &FsContext,
     mut args: ExecArgs,
@@ -299,6 +317,7 @@ fn build(
     cred: &Cred,
     no_setid: bool,
     memcg: u32,
+    randomize: bool,
 ) -> Result<Built, Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
@@ -350,6 +369,9 @@ fn build(
     let space = AddressSpace::new()?;
     // The pages of the new program go to the memory cgroup of the process.
     space.set_memcg(memcg);
+    if randomize {
+        space.set_mmap_offset(mmap_offset(rk_frame::arch::random_seed()));
+    }
     let interp = match header.interp {
         Some((offset, len)) => {
             let mut name = vec![0u8; len as usize];
@@ -451,8 +473,9 @@ pub fn exec(
     // A tracer cannot follow a program that gets more rights, so the bits have no effect then.
     // A tracer with `CAP_SYS_PTRACE` can, as `cap_bprm_creds_from_file` of Linux.
     let no_setid = thread.no_new_privs() || (thread.is_traced() && !thread.tracer_capable());
+    let randomize = process.personality() & ADDR_NO_RANDOMIZE == 0;
     let (space, image, (at, deny), argv, auxv, cred) =
-        build(&ctx, args, random, &process.cred(), no_setid, process.memcg())?;
+        build(&ctx, args, random, &process.cred(), no_setid, process.memcg(), randomize)?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
     release(thread);

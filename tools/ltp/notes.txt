@@ -19,11 +19,11 @@ shm_test01	The test calls sched_yield for each byte of a map of up to 4 MB, abou
 starvation	The test calibrates its runtime from the speed of the machine. Under QEMU without KVM it asks for about 6 to 9 min, more than the 240 s limit of the runner. Before #408 the woken thread did not get the CPU in time, and the test did not stop in its own time limit (TBROK). With the EEVDF wakeup preemption of #408, the test passes in about 7 min with --timeout 900.
 preadv203	Since #408, RWF_NOWAIT on tmpfs gives EOPNOTSUPP, as on Linux, and the test gives TCONF on tmpfs before its writes. On ext2 the test passes when a read with RWF_NOWAIT finds a page that is not in the cache and gets EAGAIN. In some runs no read gets EAGAIN, and the test fails.
 preadv203_64	The same as preadv203: TCONF on tmpfs, and ext2 passes when a read gets EAGAIN.
-mmapstress02	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
-mmapstress03	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
-mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
-mmapstress08	Uses sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
-sbrk01	sbrk(0) passes. The musl libc of the LTP build gives ENOMEM for sbrk with a size that is not 0, without a system call, so sbrk(8192) and sbrk(-8192) fail. The kernel brk is not the cause.
+mmapstress02	The musl libc gives ENOMEM for each brk and sbrk call with a size that is not 0. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh, so the test cannot run. With them the test passes.
+mmapstress03	The musl libc gives ENOMEM for each brk and sbrk call with a size that is not 0. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh, so the test cannot run. With them the test passes.
+mmapstress05	The musl libc gives ENOMEM for each brk and sbrk call with a size that is not 0. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh, so the test cannot run. With them the test passes.
+mmapstress08	The musl libc gives ENOMEM for each brk and sbrk call with a size that is not 0. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh, so the test cannot run. With them the test passes.
+sbrk01	The musl libc gives ENOMEM for each brk and sbrk call with a size that is not 0. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh, so the test cannot run. With them the test passes.
 overcommit_memory02	With -R 0 the commit limit is 0 (no swap), and the test then reads the sysctl back with fopen. musl malloc needs a new mmap for the FILE, which the strict policy refuses, so the test gives TBROK instead of the TCONF that it gives with glibc.
 vma02	Needs NUMA and mbind (#322) (TCONF).
 vma03	Needs mmap2, which only a 32 bit kernel has (TCONF on x86_64).
@@ -79,8 +79,7 @@ ioctl_ns01	The test needs CLONE_NEWPID. rukernel has only the first PID name spa
 ioctl_ns05	The test needs CLONE_NEWPID. rukernel has only the first PID name space (TCONF).
 ioctl_ns06	The test needs CLONE_NEWUSER. rukernel has only the first user name space.
 prctl09	The test sleeps 25 ms many times and checks the time with a small margin. Under QEMU without KVM on a busy host, a sleep can take up to 200 ms. It passes when the host is less busy.
-hugemmap07	The test calls brk to set the break back. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the cleanup gives TBROK. The hugetlb part of the test passes.
-hugemmap24	The test puts its slice boundary above the heap, from malloc(1). musl malloc gives an mmap address near the top of user space, so each boundary is above TASK_SIZE and MAP_FIXED gives ENOMEM, as on Linux with musl. The test is for the slices of powerpc.
+hugemmap07	The test calls brk to set the break back, and the musl libc gives ENOMEM for each brk call, so the cleanup gives TBROK. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh. With them the test passes.
 hugemmap32	The test needs gigantic huge pages (1 GiB). rukernel has only 2 MiB huge pages (TCONF).
 hugemmap34	The test is only for ppc and ppc64 (TCONF on x86_64).
 hugemmap35	The test is only for aarch64 (TCONF on x86_64).

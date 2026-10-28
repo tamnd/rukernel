@@ -19,6 +19,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - Each mount of devpts is a new instance with its own slaves and numbers, as `get_tree_nodev` in fs/devpts/inode.c of Linux (#413). devpts takes the options `newinstance`, `mode`, `ptmxmode`, `uid`, `gid` and `max`, and an unknown option gives `EINVAL`. /dev/ptmx uses the instance on /dev/pts, and the `ptmx` file of devpts uses its own instance.
 - IPv6 processes the routing header on receive, as `ipv6_rthdr_rcv` of net/ipv6/exthdrs.c of Linux (#413). A segment routing header (type 4) goes to the next segment of the list when `seg6_enabled` is on, and a header with no segments left that holds an IPv4 or IPv6 packet gives the inner packet. A bad header gives an ICMPv6 parameter problem, and a hop limit of 1 gives an ICMPv6 time exceeded. rukernel does not forward, so a packet for another address is dropped.
 - The LTP tools record the results of the pty group (#413).
+- The `mmap` area of a program has a random top, as `arch_mmap_rnd` of Linux. `execve` moves the top down by a random number of pages: up to 2^28 pages on x86-64 and up to 2^18 pages on arm64, the defaults of `mmap_rnd_bits`. A process with `ADDR_NO_RANDOMIZE` in its personality keeps the fixed top. LTP hugemmap24 passes (#415).
+- tools/bench has the benchmark `cow`: a write fault that copies a 4 KiB page that a child of `fork` maps. tools/bench/run.py takes `--arch aarch64` and runs the arm64 kernels of rukernel and Linux on the QEMU `virt` machine (#415).
 
 ### Fixed
 
@@ -30,6 +32,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A regular file on a mount of type ext2 does not take `RWF_NOWAIT`, and `preadv2` and `pwritev2` with it give `EOPNOTSUPP`, as Linux, where fs/ext2/file.c does not set `FMODE_NOWAIT` (#417). LTP preadv203 and preadv203_64 then give TCONF on ext2, as on Linux.
 - The task switch and the system call are faster. The walk of the pressure counts up the cgroup tree does not allocate, and the x86_64 clock multiplies and shifts instead of a division of 128 bits (#417).
 - The LTP runner gives starvation 1800 s, because the test can run for 650 s to 1150 s under QEMU without KVM by design (#417).
+- A private mapping of a file of hugetlbfs is charged to the subpool of the mount, as `hugetlb_reserve_pages` and `alloc_hugetlb_folio` of Linux. The `size=` limit of the mount applies to it, so `mmap` gives `ENOMEM` when the reservation does not fit, and a fault of a `MAP_NORESERVE` mapping over the limit gives `SIGBUS`. A page gives its charge back when it is freed, and a reservation without a page gives it back at `munmap` or at exit (#415).
+- The LTP build links `brk` and `sbrk` functions that call the kernel, because the functions of musl give `ENOMEM`. LTP hugemmap07 no longer gives TBROK, and sbrk01, mmapstress02, mmapstress03, mmapstress05 and mmapstress08 pass (#415).
 
 ## [0.4.8] - 2026-10-28
 
