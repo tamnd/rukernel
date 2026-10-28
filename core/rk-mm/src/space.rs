@@ -105,7 +105,9 @@ impl MmFile for SharedAnon {
         if let Some(frame) = pages.get(&index) {
             return Ok(frame.clone());
         }
-        let frame = anon_frame(0)?;
+        // Linux keeps this memory in shmem, so the page is not anonymous.
+        above_reserve()?;
+        let frame = charged(alloc_zeroed_frame(), 0)?;
         pages.insert(index, frame.clone());
         Ok(frame)
     }
@@ -1750,6 +1752,8 @@ fn charge_block(mut frames: Vec<Frame>, memcg: u32) -> Option<Vec<Arc<Frame>>> {
             frame.set_memcg(memcg);
         }
     }
+    // A transparent huge page is anonymous memory.
+    frames.iter().for_each(Frame::set_anon);
     Some(frames.into_iter().map(Arc::new).collect())
 }
 
@@ -1762,13 +1766,17 @@ fn above_reserve() -> Result<(), Errno> {
 /// A new anonymous page with zeros, charged to the memory cgroup `memcg`.
 fn anon_frame(memcg: u32) -> Result<Arc<Frame>, Errno> {
     above_reserve()?;
-    charged(alloc_zeroed_frame(), memcg)
+    let frame = charged(alloc_zeroed_frame(), memcg)?;
+    frame.set_anon();
+    Ok(frame)
 }
 
-/// A copy of `from` for copy on write, charged to the memory cgroup `memcg`.
+/// A copy of `from` for copy on write, charged to the memory cgroup `memcg`. The copy is
+/// anonymous, also when `from` is a page of a file, as `wp_page_copy` of Linux makes it.
 fn copy_frame(from: &Frame, memcg: u32) -> Result<Arc<Frame>, Errno> {
     above_reserve()?;
     let frame = charged(rk_frame::mm::alloc_frame(), memcg)?;
     frame.copy_from(from);
+    frame.set_anon();
     Ok(frame)
 }

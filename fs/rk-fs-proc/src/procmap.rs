@@ -46,6 +46,18 @@ pub(crate) const KPF_DIRTY: u64 = 1 << 4;
 pub(crate) const KPF_LRU: u64 = 1 << 5;
 /// `KPF_MMAP` of `/proc/kpageflags`.
 pub(crate) const KPF_MMAP: u64 = 1 << 11;
+/// `KPF_ANON` of `/proc/kpageflags`.
+pub(crate) const KPF_ANON: u64 = 1 << 12;
+/// `KPF_SWAPBACKED` of `/proc/kpageflags`.
+pub(crate) const KPF_SWAPBACKED: u64 = 1 << 23;
+
+/// The flags of a mapped page of a file in `/proc/kpageflags`. `KPF_DIRTY` comes in addition when
+/// a mapping changed the page after the last write back.
+pub(crate) const KPF_FILE_PAGE: u64 = KPF_UPTODATE | KPF_LRU | KPF_MMAP;
+/// The flags of an anonymous page of a process in `/proc/kpageflags`, as `stable_page_flags` in
+/// fs/proc/page.c of Linux gives them for a page that `do_anonymous_page` or a copy on write
+/// made. The dirty state of such a page is in the page table, so `KPF_DIRTY` is not there.
+pub(crate) const KPF_ANON_PAGE: u64 = KPF_FILE_PAGE | KPF_ANON | KPF_SWAPBACKED;
 
 /// The fields of an area that a query looks at.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,6 +216,13 @@ mod tests {
 
     fn query(addr: u64, flags: u64) -> Query {
         Query { size: QUERY_SIZE as u64, flags, addr, ..Query::default() }
+    }
+
+    #[test]
+    fn page_flags_match_linux() {
+        // The bits of include/uapi/linux/kernel-page-flags.h of Linux.
+        assert_eq!(KPF_ANON_PAGE, 0x80_1828);
+        assert_eq!(KPF_FILE_PAGE | KPF_DIRTY, 0x838);
     }
 
     #[test]

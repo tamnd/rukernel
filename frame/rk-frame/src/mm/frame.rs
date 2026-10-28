@@ -5,7 +5,7 @@ use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
 use crate::sync::{Once, SpinLock};
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// The allocator manages physical memory below this address. 64 GiB needs a bitmap of 2 MiB.
 const MAX_PHYS: u64 = 64 << 30;
@@ -90,6 +90,22 @@ pub struct Frame {
     /// The frame is a part of a [`HugeRun`] of the pool of huge pages. It goes back to the pool
     /// with the other frames of the run, and not to the allocator.
     pooled: bool,
+}
+
+/// The frames that hold anonymous memory of a process, one bit for each frame, as `PageAnon` of
+/// Linux. `/proc/kpageflags` reads the bit of a page frame number without the `Frame`.
+static ANON: [AtomicU64; WORDS] = [const { AtomicU64::new(0) }; WORDS];
+
+/// The word of `ANON` and the bit in it of the frame at the physical address `phys`.
+fn anon_bit(phys: u64) -> Option<(&'static AtomicU64, u64)> {
+    let frame = usize::try_from(phys / PAGE_SIZE as u64).ok()?;
+    Some((ANON.get(frame / 64)?, 1 << (frame % 64)))
+}
+
+/// Tells if the frame at the physical address `phys` holds anonymous memory of a process, for
+/// `/proc/kpageflags`. See [`Frame::set_anon`].
+pub fn phys_is_anon(phys: PhysAddr) -> bool {
+    anon_bit(phys.get()).is_some_and(|(word, bit)| word.load(Ordering::Relaxed) & bit != 0)
 }
 
 /// The function that removes the charge of a frame from its memory cgroup.
@@ -203,6 +219,20 @@ impl Frame {
     /// frame, through the function of `set_uncharge_hook`.
     pub fn set_memcg(&mut self, memcg: u32) {
         self.memcg = memcg;
+    }
+
+    /// Marks the frame as anonymous memory of a process, as `folio_add_new_anon_rmap` of Linux
+    /// sets `PageAnon`. A page of a file or of shared memory does not have the mark. The mark goes
+    /// away when the frame goes back.
+    pub fn set_anon(&self) {
+        if let Some((word, bit)) = anon_bit(self.phys) {
+            word.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    /// Tells if the frame holds anonymous memory of a process. See [`Frame::set_anon`].
+    pub fn is_anon(&self) -> bool {
+        phys_is_anon(self.addr())
     }
 
     /// The physical address of the frame.
@@ -351,6 +381,9 @@ impl Drop for Frame {
             && let Some(f) = UNCHARGE.get()
         {
             f(self.memcg);
+        }
+        if let Some((word, bit)) = anon_bit(self.phys) {
+            word.fetch_and(!bit, Ordering::Relaxed);
         }
         let frame = self.phys as usize / PAGE_SIZE;
         if self.pooled {

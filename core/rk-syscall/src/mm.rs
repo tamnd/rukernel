@@ -1,7 +1,7 @@
 //! The system calls of memory: `mmap`, `munmap`, `mprotect`, `brk` and `madvise`.
 
 use crate::cx::{Cx, SysResult};
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -45,6 +45,26 @@ fn low32(_flags: u32) -> bool {
 /// The device number of `/dev/zero`.
 const DEV_ZERO: u64 = rk_vfs::device::makedev(1, 5);
 
+/// The state of a page of [`FilePages`] against the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageState {
+    /// The page has the data of the file, and no shared mapping changed it.
+    Clean,
+    /// A write fault of a shared mapping changed the page after the last write back, as
+    /// `PG_dirty` of Linux.
+    Dirty,
+    /// A write back wrote the page, and a shared mapping that can write the file still exists.
+    /// That mapping can change the page without a fault, so the next write back writes the page
+    /// again. `/proc/kpageflags` shows the page as clean.
+    Written,
+}
+
+/// A page of [`FilePages`]: the copy of the file data and its state.
+struct CachedPage {
+    frame: Arc<Frame>,
+    state: PageState,
+}
+
 /// The pages of a regular file, for a file mapping.
 ///
 /// Each page is a copy of the file data, which the first fault reads. All the mappings of the
@@ -56,19 +76,14 @@ pub(crate) struct FilePages {
     inode: InodeRef,
     /// The path of the file when it was first mapped.
     path: Vec<u8>,
-    pages: SpinLock<BTreeMap<u64, Arc<Frame>>>,
-    /// The pages that a shared mapping changed. Lock it before `pages`.
-    dirty: SpinLock<BTreeSet<u64>>,
-    /// The pages of `dirty` that a write back wrote, and that no write fault changed after it.
-    /// The pages stay in `dirty`, because a mapping in another address space can still write
-    /// them without a fault. `/proc/kpageflags` shows these pages as clean.
-    clean: SpinLock<BTreeSet<u64>>,
+    /// The pages by their index in the file, with the clean or dirty state of each page.
+    pages: SpinLock<BTreeMap<u64, CachedPage>>,
 }
 
 impl MmFile for FilePages {
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
-        if let Some(frame) = self.pages.lock().get(&index) {
-            return Ok(frame.clone());
+        if let Some(page) = self.pages.lock().get(&index) {
+            return Ok(page.frame.clone());
         }
         let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EIO)?;
         // A page that starts past the end of the file has no data. The fault then sends SIGBUS.
@@ -77,8 +92,8 @@ impl MmFile for FilePages {
         }
         let frame = rk_frame::mm::alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
         frame.write_bytes(0, &self.read_page(offset)?);
-        let frame = Arc::new(frame);
-        Ok(self.pages.lock().entry(index).or_insert(frame).clone())
+        let page = CachedPage { frame: Arc::new(frame), state: PageState::Clean };
+        Ok(self.pages.lock().entry(index).or_insert(page).frame.clone())
     }
 
     fn name(&self) -> (u64, u64, Vec<u8>) {
@@ -91,8 +106,9 @@ impl MmFile for FilePages {
     }
 
     fn dirty(&self, index: u64) {
-        self.dirty.lock().insert(index);
-        self.clean.lock().remove(&index);
+        if let Some(page) = self.pages.lock().get_mut(&index) {
+            page.state = PageState::Dirty;
+        }
     }
 
     fn cached(&self, index: u64) -> bool {
@@ -100,11 +116,17 @@ impl MmFile for FilePages {
     }
 
     fn write_back(&self, first: u64, end: u64) -> Result<(), Errno> {
-        let pages: Vec<(u64, Arc<Frame>)> = {
-            let dirty = self.dirty.lock();
-            let pages = self.pages.lock();
-            dirty.range(first..end).filter_map(|i| Some((*i, pages.get(i)?.clone()))).collect()
-        };
+        let pages: Vec<(u64, Arc<Frame>)> = self
+            .pages
+            .lock()
+            .range(first..end)
+            .filter(|(_, p)| p.state != PageState::Clean)
+            .map(|(i, p)| (*i, p.frame.clone()))
+            .collect();
+        // Without a shared mapping that can write the file, only a write fault can change the
+        // pages again, so they become clean.
+        let after =
+            if writably_mapped(&self.inode) { PageState::Written } else { PageState::Clean };
         // A page past the end of the file does not change the file, as on Linux.
         let size = self.inode.metadata().size;
         let mut buf = vec![0u8; PAGE_SIZE];
@@ -121,7 +143,11 @@ impl MmFile for FilePages {
                 }
                 done += n;
             }
-            self.clean.lock().insert(index);
+            if let Some(page) = self.pages.lock().get_mut(&index)
+                && Arc::ptr_eq(&page.frame, &frame)
+            {
+                page.state = after;
+            }
         }
         Ok(())
     }
@@ -147,7 +173,7 @@ impl FilePages {
     fn copies(&self, start: u64, end: u64) -> Vec<(u64, Arc<Frame>)> {
         let first = start / PAGE_SIZE as u64;
         let last = end.div_ceil(PAGE_SIZE as u64);
-        self.pages.lock().range(first..last).map(|(i, f)| (*i, f.clone())).collect()
+        self.pages.lock().range(first..last).map(|(i, p)| (*i, p.frame.clone())).collect()
     }
 }
 
@@ -184,16 +210,17 @@ impl rk_vfs::mapped::Mapped for FilePages {
 
     fn sync(&self, start: u64, end: u64) -> Result<(), Errno> {
         let first = start / PAGE_SIZE as u64;
-        if self.dirty.lock().range(first..end.div_ceil(PAGE_SIZE as u64)).next().is_none() {
+        let end = end.div_ceil(PAGE_SIZE as u64);
+        if self.pages.lock().range(first..end).all(|(_, p)| p.state == PageState::Clean) {
             return Ok(());
         }
-        self.write_back(first, end.div_ceil(PAGE_SIZE as u64))
+        self.write_back(first, end)
     }
 
     fn frame_dirty(&self, phys: u64) -> Option<bool> {
-        let index = *self.pages.lock().iter().find(|(_, f)| f.addr().get() == phys)?.0;
-        let dirty = self.dirty.lock().contains(&index);
-        Some(dirty && !self.clean.lock().contains(&index))
+        let pages = self.pages.lock();
+        let page = pages.values().find(|p| p.frame.addr().get() == phys)?;
+        Some(page.state == PageState::Dirty)
     }
 }
 
@@ -210,9 +237,7 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
     map.entry(key)
         .or_insert_with(|| {
             let pages = SpinLock::new(BTreeMap::new());
-            let dirty = SpinLock::new(BTreeSet::new());
-            let clean = SpinLock::new(BTreeSet::new());
-            let pages = Arc::new(FilePages { inode: inode.clone(), path, pages, dirty, clean });
+            let pages = Arc::new(FilePages { inode: inode.clone(), path, pages });
             let mapped: Arc<dyn rk_vfs::mapped::Mapped> = pages.clone();
             rk_vfs::mapped::register(inode, Arc::downgrade(&mapped));
             pages

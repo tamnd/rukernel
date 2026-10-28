@@ -204,10 +204,32 @@ def runtests(ltp, groups):
 
 
 def make_image(ltp, path):
-    """Makes the ext4 image of the LTP tree, if it is not there or is older than the tree."""
+    """Makes the ext4 image of the LTP tree, if it is not there or is older than the tree.
+
+    The file PATH.tree has the path of the tree that the image came from. Other runs can use the
+    image, so the script stops when --ltp is another tree, and it does not make the image again
+    from a tree that it did not make it from.
+    """
+    ltp = os.path.realpath(ltp)
+    record = path + ".tree"
     stamp = os.path.join(ltp, "Version")
-    if os.path.exists(path) and os.path.getmtime(path) >= os.path.getmtime(stamp):
-        return
+    if os.path.exists(path):
+        current = os.path.getmtime(path) >= os.path.getmtime(stamp)
+        tree = None
+        if os.path.exists(record):
+            with open(record) as f:
+                tree = f.read().strip()
+        if tree is not None and tree != ltp:
+            sys.exit(f"ltp: the image {path} comes from {tree}, not from --ltp {ltp}. "
+                     "Give --image another path.")
+        if tree is None and not current:
+            sys.exit(f"ltp: the image {path} is older than {stamp}, and {record} does not tell "
+                     "the tree that it came from. Give --image another path, or remove the image.")
+        if current:
+            if tree is None:
+                print(f"ltp: {record} is not there, so the script cannot check that {path} comes "
+                      f"from {ltp}", file=sys.stderr)
+            return
     size = sum(
         os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(ltp) for f in fs
         if not os.path.islink(os.path.join(d, f))
@@ -217,6 +239,9 @@ def make_image(ltp, path):
     subprocess.run(["truncate", "-s", f"{mib}M", tmp], check=True)
     subprocess.run(["mkfs.ext4", "-q", "-F", "-L", "ltp", "-d", ltp, tmp], check=True)
     os.replace(tmp, path)
+    with open(record + ".new", "w") as f:
+        f.write(ltp + "\n")
+    os.replace(record + ".new", record)
 
 
 class Batch:
