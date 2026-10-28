@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.6] - 2026-10-28
+
 ### Added
 
 - Network namespaces and veth, as net/core/net_namespace.c and drivers/net/veth.c of Linux (#372). `unshare(CLONE_NEWNET)` and `clone` with `CLONE_NEWNET` put the process in a new namespace with its own devices and loopback device, IPv4 and IPv6 routes and addresses, neighbours, ports, sockets, counters, rtnetlink sockets, and view of /proc/net and /sys/class/net. A socket stays in the namespace where it was made. The link /proc/PID/ns/net gives `net:[INODE]` and opens a file of nsfs, and `setns` takes this file or a pidfd with `CLONE_NEWNET`. The file keeps the namespace, so `ip netns add` and `ip netns exec` work. `ip link add NAME type veth peer name PEER` makes a pair, and `ip link set DEV netns PID` and `IFLA_NET_NS_FD` move a device to another namespace. When a namespace ends, its veth devices go and its other devices go back to the first namespace. The new boot test `netns` pings over IPv4 and IPv6 between two namespaces through a veth pair. The threads of a process share one network namespace.
@@ -874,6 +876,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.6]: https://github.com/tamnd/rukernel/releases/tag/v0.4.6
 [0.4.5]: https://github.com/tamnd/rukernel/releases/tag/v0.4.5
 [0.4.4]: https://github.com/tamnd/rukernel/releases/tag/v0.4.4
 [0.4.3]: https://github.com/tamnd/rukernel/releases/tag/v0.4.3
