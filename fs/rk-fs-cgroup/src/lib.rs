@@ -57,11 +57,15 @@ const BLOCK_SIZE: u32 = 4096;
 /// there, and the number of a file has its place in the list of files plus 1.
 const INO_SHIFT: u32 = 8;
 
+/// The first place of a child cgroup in a read of a directory, after the places of the files.
+const CHILD_POS: u64 = 1 << INO_SHIFT;
+
 /// The key of the owner that a cgroup got from the process that made it, below the inode number
 /// of its directory. The files of the cgroup have this owner if `chown` did not change it.
 const CREATOR: u64 = (1 << INO_SHIFT) - 1;
 
 const _: () = assert!(FILES.len() < CREATOR as usize);
+const _: () = assert!(FILES.len() as u64 + 2 < CHILD_POS);
 
 /// The mount option `nsdelegate`, `CGRP_ROOT_NS_DELEGATE` of Linux: each cgroup namespace is a
 /// delegation boundary. All the mounts share it, as all the mounts of cgroup2 of Linux share one
@@ -209,6 +213,9 @@ impl Node {
     fn text(&self, name: &str) -> Result<String> {
         self.live()?;
         match name {
+            // A threaded cgroup has no process of its own, and Linux gives `EOPNOTSUPP` for a
+            // read of its `cgroup.procs`.
+            "cgroup.procs" if rk_cgroup::with(|h| h.is_threaded(self.id)) => Err(Errno::EOPNOTSUPP),
             "cgroup.procs" => Ok(lines(&procs::processes(self.id))),
             "cgroup.threads" => Ok(lines(&procs::threads(self.id))),
             _ => {
@@ -423,12 +430,24 @@ impl Inode for Node {
                     name: b"..".to_vec(),
                 }
             }
+            // A file has the place 1 + its index, and a child has the place CHILD_POS + its ID.
+            // The places do not change when an entry goes away, so an rmdir between two reads
+            // of the directory does not make the next read skip an entry.
             _ => {
                 let entries = self.entries()?;
-                let Some((name, child)) = entries.into_iter().nth((pos - 2) as usize) else {
+                let place = |name: &[u8], child: Option<CgId>| match child {
+                    Some(id) => CHILD_POS + u64::from(id),
+                    None => 1 + file_index(core::str::from_utf8(name).unwrap_or("")),
+                };
+                let Some((name, child)) = entries
+                    .into_iter()
+                    .filter(|(n, c)| place(n, *c) >= pos)
+                    .min_by_key(|(n, c)| place(n, *c))
+                else {
                     return Ok(None);
                 };
-                match child {
+                let next = place(&name, child) + 1;
+                let entry = match child {
                     Some(id) => {
                         DirEntry { ino: Self::ino(id, None), kind: FileType::Directory, name }
                     }
@@ -436,7 +455,8 @@ impl Inode for Node {
                         let ino = Self::ino(self.id, core::str::from_utf8(&name).ok());
                         DirEntry { ino, kind: FileType::Regular, name }
                     }
-                }
+                };
+                return Ok(Some((entry, next)));
             }
         };
         Ok(Some((entry, pos + 1)))

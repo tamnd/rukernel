@@ -77,13 +77,13 @@ fn subtree_control_gives_the_controllers_to_the_children() {
 #[test]
 fn a_cgroup_with_processes_has_no_controllers_for_children() {
     let mut h = Hierarchy::new(0, 1);
-    h.write(ROOT, "cgroup.subtree_control", b"+pids", 0).unwrap();
+    h.write(ROOT, "cgroup.subtree_control", b"+pids +memory", 0).unwrap();
     let a = h.mkdir(ROOT, b"a", 0).unwrap();
     let b = h.mkdir(a, b"b", 0).unwrap();
     h.add_process(a);
-    assert_eq!(h.write(a, "cgroup.subtree_control", b"+pids", 0), Err(Errno::EBUSY));
+    assert_eq!(h.write(a, "cgroup.subtree_control", b"+memory", 0), Err(Errno::EBUSY));
     h.migrate(a, b, 1).unwrap();
-    h.write(a, "cgroup.subtree_control", b"+pids", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
     assert_eq!(h.can_attach(a), Err(Errno::EBUSY));
     assert_eq!(h.migrate(b, a, 1), Err(Errno::EBUSY));
     // The root can have both.
@@ -241,7 +241,7 @@ fn freeze_and_kill_tell_the_caller() {
     assert_eq!(h.write(a, "cgroup.freeze", b"2", 0), Err(Errno::ERANGE));
     assert_eq!(h.write(a, "cgroup.kill", b"1", 0), Ok(Effect::Kill));
     assert_eq!(h.write(ROOT, "cgroup.kill", b"1", 0), Err(Errno::ENOENT));
-    assert_eq!(h.write(a, "cgroup.type", b"threaded", 0), Err(Errno::EOPNOTSUPP));
+    assert_eq!(h.write(a, "cgroup.type", b"domain", 0), Err(Errno::EINVAL));
     assert_eq!(h.write(a, "cgroup.stat", b"1", 0), Err(Errno::EACCES));
 }
 
@@ -415,9 +415,10 @@ fn io_stat_counts_the_subtree_and_io_max_gives_a_delay() {
     let a = h.mkdir(ROOT, b"a", 0).unwrap();
     let dev = io::makedev(253, 0);
     assert_eq!(io::parse_dev("253:0"), Ok(dev));
-    assert_eq!(h.charge_io(a, dev, false, 4096, 1, 0), 0);
-    assert_eq!(h.charge_io(a, dev, true, 8192, 2, 0), 0);
-    let line = "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=0 dios=0\n";
+    assert_eq!(h.charge_io(a, dev, io::Op::Read, (4096, 1), 0), 0);
+    assert_eq!(h.charge_io(a, dev, io::Op::Write, (8192, 2), 0), 0);
+    assert_eq!(h.charge_io(a, dev, io::Op::Discard, (1 << 20, 1), 0), 0);
+    let line = "253:0 rbytes=4096 wbytes=8192 rios=1 wios=2 dbytes=1048576 dios=1\n";
     assert_eq!(h.read(a, "io.stat", 0).unwrap(), line);
     assert_eq!(h.read(ROOT, "io.stat", 0).unwrap(), line);
     assert!(!names(&h, ROOT).contains(&"io.max"));
@@ -425,15 +426,15 @@ fn io_stat_counts_the_subtree_and_io_max_gives_a_delay() {
     h.write(a, "io.max", b"253:0 wbps=1048576 riops=10", 0).unwrap();
     assert_eq!(h.read(a, "io.max", 0).unwrap(), "253:0 rbps=max wbps=1048576 riops=10 wiops=max\n");
     // 1 MiB at 1 MiB/s takes a second, and the next MiB waits one more second.
-    assert_eq!(h.charge_io(a, dev, true, 1 << 20, 1, SEC), SEC);
-    assert_eq!(h.charge_io(a, dev, true, 1 << 20, 1, SEC), 2 * SEC);
+    assert_eq!(h.charge_io(a, dev, io::Op::Write, (1 << 20, 1), SEC), SEC);
+    assert_eq!(h.charge_io(a, dev, io::Op::Write, (1 << 20, 1), SEC), 2 * SEC);
     // A read of 1 bio at 10 IOPS takes 100 ms.
-    assert_eq!(h.charge_io(a, dev, false, 512, 1, SEC), SEC / 10);
+    assert_eq!(h.charge_io(a, dev, io::Op::Read, (512, 1), SEC), SEC / 10);
     assert_eq!(h.write(a, "io.max", b"253:0 wbps=0", 0), Err(Errno::ERANGE));
     assert_eq!(h.write(a, "io.max", b"253:0 xbps=1", 0), Err(Errno::EINVAL));
     h.write(a, "io.max", b"253:0 wbps=max riops=max", 0).unwrap();
     assert_eq!(h.read(a, "io.max", 0).unwrap(), "");
-    assert_eq!(h.charge_io(a, dev, true, 1 << 20, 1, SEC), 0);
+    assert_eq!(h.charge_io(a, dev, io::Op::Write, (1 << 20, 1), SEC), 0);
 
     assert_eq!(h.read(a, "io.weight", 0).unwrap(), "default 100\n");
     h.write(a, "io.weight", b"default 200", 0).unwrap();
@@ -443,4 +444,186 @@ fn io_stat_counts_the_subtree_and_io_max_gives_a_delay() {
     h.write(a, "io.weight", b"300", 0).unwrap();
     assert_eq!(h.read(a, "io.weight", 0).unwrap(), "default 300\n");
     assert_eq!(h.write(a, "io.weight", b"0", 0), Err(Errno::EINVAL));
+}
+
+#[test]
+fn threaded_cgroups_follow_the_thread_mode_rules() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+cpu +memory +pids", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    assert_eq!(h.read(a, "cgroup.type", 0).unwrap(), "domain\n");
+    // A parent that gives a domain controller cannot be a thread root.
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    assert_eq!(h.write(b, "cgroup.type", b"threaded", 0), Err(Errno::EOPNOTSUPP));
+    h.write(a, "cgroup.subtree_control", b"-memory +cpu", 0).unwrap();
+    h.write(b, "cgroup.type", b"threaded", 0).unwrap();
+    assert_eq!(h.read(b, "cgroup.type", 0).unwrap(), "threaded\n");
+    assert_eq!(h.read(a, "cgroup.type", 0).unwrap(), "domain threaded\n");
+    assert_eq!(h.dom(b), a);
+    // Only the threaded controllers go into the threaded subtree.
+    assert_eq!(h.controllers(b), CPU);
+    assert_eq!(h.write(a, "cgroup.subtree_control", b"+memory", 0), Err(Errno::EOPNOTSUPP));
+    // A new child of a threaded cgroup is a domain that is not valid.
+    let c = h.mkdir(b, b"c", 0).unwrap();
+    assert_eq!(h.read(c, "cgroup.type", 0).unwrap(), "domain invalid\n");
+    assert_eq!(h.can_attach(c), Err(Errno::EOPNOTSUPP));
+    h.write(c, "cgroup.type", b"threaded", 0).unwrap();
+    assert_eq!(h.dom(c), a);
+    // The thread root and a threaded cgroup can have threads, and threads move in the subtree.
+    h.charge_pids(a, 2).unwrap();
+    h.add_process(a);
+    assert_eq!(h.can_attach_thread(a, b), Ok(()));
+    h.move_thread(a, b);
+    assert_eq!(h.pids(b), 1);
+    assert!(h.populated(b));
+    assert_eq!(h.can_attach_thread(a, ROOT), Err(Errno::EOPNOTSUPP));
+    // A populated cgroup cannot change its type.
+    let d = h.mkdir(a, b"d", 0).unwrap();
+    h.charge_pids(d, 1).unwrap();
+    assert_eq!(h.write(d, "cgroup.type", b"threaded", 0), Err(Errno::EOPNOTSUPP));
+    h.uncharge_pids(d, 1);
+    h.rmdir(a, b"d").unwrap();
+    h.move_thread(b, a);
+    h.rmdir(b, b"c").unwrap();
+    h.rmdir(a, b"b").unwrap();
+    assert_eq!(h.read(a, "cgroup.type", 0).unwrap(), "domain threaded\n");
+    h.write(a, "cgroup.subtree_control", b"-cpu", 0).unwrap();
+    assert_eq!(h.read(a, "cgroup.type", 0).unwrap(), "domain\n");
+}
+
+#[test]
+fn io_weight_shares_a_device() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+io", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let b = h.mkdir(ROOT, b"b", 0).unwrap();
+    let dev = io::makedev(8, 0);
+    h.write(a, "io.weight", b"200", 0).unwrap();
+    // A cgroup alone gets the whole device and does not wait.
+    assert_eq!(h.io_share(a, dev, 0), io::SHARE_UNIT);
+    for i in 0..8 {
+        assert_eq!(h.charge_io_timed(a, dev, io::Op::Write, (1 << 20, 1), i, 1_000_000), 0);
+    }
+    // With b active, a gets two thirds and b one third.
+    h.charge_io_timed(b, dev, io::Op::Write, (1 << 20, 1), 10, 1_000_000);
+    assert_eq!(h.io_share(a, dev, 11), io::SHARE_UNIT * 2 / 3);
+    assert_eq!(h.io_share(b, dev, 11), io::SHARE_UNIT / 3);
+    // Each cgroup that goes on alone gets ahead of the device and waits, b more than a.
+    let (mut da, mut db) = (0, 0);
+    for i in 0..4 {
+        da += h.charge_io_timed(a, dev, io::Op::Write, (1 << 20, 1), 20 + i, 1_000_000);
+    }
+    for i in 0..4 {
+        db += h.charge_io_timed(b, dev, io::Op::Write, (1 << 20, 1), 30 + i, 1_000_000);
+    }
+    assert!(da > 0 && db > da, "{da} {db}");
+    // A change of a limit wakes the threads that wait.
+    assert_eq!(h.write(a, "io.max", b"8:0 wbps=1048576", 0), Ok(Effect::Throttle));
+    // A cgroup that is idle for longer than `ACTIVE_NS` does not count.
+    assert_eq!(h.io_share(a, dev, 40 + io::ACTIVE_NS + 1), io::SHARE_UNIT);
+}
+
+/// The cgroups of memcontrol03 and memcontrol04 of LTP: A with B and G, and B with C, D, E and
+/// F. C, D and F have 50 MiB of page cache each.
+fn protection_tree(file: &str) -> (Hierarchy, [CgId; 5]) {
+    const M: u64 = 1 << 20;
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    h.write(a, "memory.max", b"200M", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    h.write(b, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let leaves: Vec<CgId> =
+        [b"c", b"d", b"e", b"f"].iter().map(|n| h.mkdir(b, *n, 0).unwrap()).collect();
+    for (&id, size) in leaves.iter().zip([50 * M, 50 * M, 0, 50 * M]) {
+        assert_eq!(h.charge_file(id, size), None);
+    }
+    for (&id, value) in [b].iter().chain(&leaves).zip(["50M", "75M", "25M", "500M", "0"]) {
+        h.write(id, file, value.as_bytes(), 0).unwrap();
+    }
+    (h, [b, leaves[0], leaves[1], leaves[2], leaves[3]])
+}
+
+/// Does the plans of a reclaim of `want` bytes in `root`, in batches of 256 KiB as a charge
+/// does them.
+fn reclaim(h: &mut Hierarchy, root: CgId, want: u64) {
+    let mut done = 0;
+    while done < want {
+        let plan = h.reclaim_plan(root, 256 << 10);
+        if plan.is_empty() {
+            return;
+        }
+        for (id, bytes) in plan {
+            h.uncharge_file(id, bytes);
+            done += bytes;
+        }
+    }
+}
+
+#[test]
+fn memory_min_and_low_protect_the_page_cache() {
+    const M: u64 = 1 << 20;
+    let current = |h: &Hierarchy, id: CgId| h.nodes[&id].mem.current;
+    let low = |h: &Hierarchy, id: CgId| h.nodes[&id].mem.events_local[EV_LOW];
+    for file in ["memory.min", "memory.low"] {
+        let (mut h, [b, c, d, e, f]) = protection_tree(file);
+        let a = h.parent(b).unwrap();
+        assert_eq!(h.read(c, "memory.stat", 0).unwrap().lines().nth(1), Some("file 52428800"));
+        // 98 MiB must go: F has no protection, and C and D keep their part of the 50 MiB of B.
+        // The parts change with the use in each batch, and they end near 29 MiB and 21 MiB, as
+        // in Linux.
+        reclaim(&mut h, a, 98 * M);
+        assert!(current(&h, b).abs_diff(52 * M) < 2 * M, "{file}: B={}", current(&h, b));
+        assert!(current(&h, c).abs_diff(29 * M) < 2 * M, "{file}: C={}", current(&h, c));
+        assert!(current(&h, d).abs_diff(21 * M) < 2 * M, "{file}: D={}", current(&h, d));
+        assert_eq!(current(&h, e), 0);
+        assert_eq!(low(&h, c), 0);
+        // All the rest: `memory.min` keeps 50 MiB, but `memory.low` gives way, with low events
+        // in B, C and D only.
+        reclaim(&mut h, a, 100 * M);
+        if file == "memory.min" {
+            assert!(current(&h, b).abs_diff(50 * M) < M, "B={}", current(&h, b));
+        } else {
+            assert_eq!(current(&h, b), 0);
+            assert!(low(&h, c) > 0 && low(&h, d) > 0);
+            assert_eq!((low(&h, e), low(&h, f)), (0, 0));
+        }
+    }
+}
+
+#[test]
+fn events_change_only_with_the_first_and_the_last_task() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    let c = h.mkdir(a, b"c", 0).unwrap();
+    h.refresh_events();
+    h.add_process(b);
+    h.charge_pids(b, 1).unwrap();
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 0\n");
+    let seq = h.event_seq(a, "cgroup.events").unwrap();
+    // A second process, a new cgroup and its removal do not change the events, and the walk
+    // over each cgroup does not run again.
+    h.add_process(b);
+    h.charge_pids(b, 1).unwrap();
+    let d = h.mkdir(b, b"d", 0).unwrap();
+    assert_eq!(h.rmdir(b, b"d").unwrap(), d);
+    assert!(!h.dirty);
+    // A move of each task from `b` to `c` keeps `a` populated, and `b` is empty after it.
+    h.move_thread(b, c);
+    h.move_leader(b, c);
+    h.move_thread(b, c);
+    h.move_leader(b, c);
+    assert_eq!(h.read(b, "cgroup.events", 0).unwrap(), "populated 0\nfrozen 0\n");
+    assert_eq!(h.read(c, "cgroup.events", 0).unwrap(), "populated 1\nfrozen 0\n");
+    assert_eq!(h.event_seq(a, "cgroup.events").unwrap(), seq);
+    // The exit of the last task makes `a` and `c` empty.
+    for _ in 0..2 {
+        h.uncharge_pids(c, 1);
+        h.remove_process(c);
+    }
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 0\nfrozen 0\n");
+    assert!(h.event_seq(a, "cgroup.events").unwrap() > seq);
 }

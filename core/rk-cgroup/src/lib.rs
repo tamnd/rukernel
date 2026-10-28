@@ -3,18 +3,27 @@
 //! A cgroup is a node of one tree. Each process is in one cgroup, and its children start in the
 //! same cgroup. The root has the ID `ROOT`. A cgroup gives a controller to its children when the
 //! name of the controller is in its `cgroup.subtree_control`. A cgroup that is not the root and
-//! that gives controllers to its children cannot have processes: the rule of no internal
+//! that gives domain controllers to its children cannot have processes: the rule of no internal
 //! processes of Linux.
+//!
+//! A cgroup of the type `threaded` is in the threaded subtree of its thread root, the nearest
+//! domain cgroup above it. The threads of one process can be in different cgroups of this
+//! subtree, and only the threaded controllers (`cpu`, `cpuset` and `pids`) work in it. The rules
+//! are those of the thread mode of Linux.
 //!
 //! The controllers:
 //!
 //! - `pids` counts the threads of each subtree and refuses a new thread past `pids.max`.
-//! - `memory` counts the anonymous pages of each subtree. A charge past `memory.max` fails, and
-//!   the caller then kills a process of the cgroup, as the OOM killer of the cgroup in Linux.
+//! - `memory` counts the anonymous pages and the page cache of each subtree. A charge past
+//!   `memory.max` first takes back clean page cache, and then fails. The caller then kills a
+//!   process of the cgroup, as the OOM killer of the cgroup in Linux. `memory.min` and
+//!   `memory.low` protect the page cache of a cgroup from this reclaim.
 //! - `cpu` counts the CPU time of each subtree. `cpu.max` gives a quota of time in each period.
 //!   A thread of a cgroup that used its quota waits until the next period. `cpu.weight` changes
 //!   the weight of the threads of the cgroup in the fair class.
 //! - `cpuset` limits the CPUs of the threads of the cgroup.
+//! - `io` counts the I/O of each subtree on each device. `io.max` limits it, and `io.weight`
+//!   shares the time of a device between the cgroups that use it.
 //!
 //! `Hierarchy` has all the state, and it is pure, so the tests on the host examine it. The
 //! functions at the end of this file keep one `Hierarchy` for the kernel, with a lock. The file
@@ -35,7 +44,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
-use rk_frame::sync::SpinLock;
+use rk_frame::sync::{Once, SpinLock};
 
 /// The ID of a cgroup. IDs are not used again, so an old ID never names a new cgroup.
 pub type CgId = u32;
@@ -58,6 +67,9 @@ pub const PIDS: u8 = 1 << 3;
 pub const IO: u8 = 1 << 4;
 /// The bits of all controllers.
 pub const ALL: u8 = CPUSET | CPU | IO | MEMORY | PIDS;
+/// The bits of the threaded controllers, `cgrp_dfl_threaded_ss_mask` of Linux. Only these
+/// controllers work in a threaded subtree. The others are domain controllers.
+pub const THREADED: u8 = CPUSET | CPU | PIDS;
 
 /// The controllers in the order of Linux, with their names.
 pub const CONTROLLERS: [(u8, &str); 5] =
@@ -117,8 +129,13 @@ pub struct Memory {
     pub high: u64,
     /// `memory.max`.
     pub max: u64,
-    /// `memory.swap.max`. rukernel has no swap, so the value has no effect.
+    /// `memory.swap.max`. rukernel has no swap, so the value has no effect: no page of a
+    /// cgroup goes to swap with any value.
     pub swap_max: u64,
+    /// The bytes of the page cache that the subtree uses, a part of `current`.
+    pub file: u64,
+    /// The bytes of the page cache that this cgroup uses, without the subtree.
+    pub file_local: u64,
     /// `memory.oom.group`.
     pub oom_group: bool,
     /// The counts of `memory.events`, with the events of the subtree.
@@ -140,6 +157,8 @@ impl Default for Memory {
             high: MAX,
             max: MAX,
             swap_max: MAX,
+            file: 0,
+            file_local: 0,
             oom_group: false,
             events: [0; NR_EV],
             events_local: [0; NR_EV],
@@ -267,6 +286,11 @@ pub struct Cpuset {
 struct Node {
     /// The parent, or 0 for the root.
     parent: CgId,
+    /// The domain of the cgroup, `dom_cgrp` of Linux: the cgroup itself, or the thread root of
+    /// the threaded subtree for a threaded cgroup.
+    dom: CgId,
+    /// The children of the type `threaded`.
+    nr_threaded_children: u32,
     name: Vec<u8>,
     children: BTreeMap<Vec<u8>, CgId>,
     /// The depth from the root: 0 for the root.
@@ -305,9 +329,11 @@ struct Node {
 }
 
 impl Node {
-    fn new(parent: CgId, name: &[u8], depth: u32, now: u64) -> Self {
+    fn new(parent: CgId, dom: CgId, name: &[u8], depth: u32, now: u64) -> Self {
         Self {
             parent,
+            dom,
+            nr_threaded_children: 0,
             name: name.to_vec(),
             children: BTreeMap::new(),
             depth,
@@ -426,6 +452,9 @@ pub enum Effect {
     MemoryOver,
     /// `cpuset.cpus` changed: set the CPUs of the threads of the subtree again.
     Cpuset,
+    /// `memory.high`, `io.max` or `cpu.max` changed: wake the threads that wait for these
+    /// limits, so that they wait again with the new limits.
+    Throttle,
 }
 
 /// The names of the controllers in `mask`, with a space between two names and a new line at the
@@ -544,6 +573,8 @@ pub struct Hierarchy {
     /// A cgroup had a quota in `cpu.max`. The value stays true after the quota goes away, so
     /// it only tells that `throttled_until` must look.
     any_quota: bool,
+    /// The share of each device for `io.weight`.
+    io_shares: BTreeMap<u64, io::Share>,
 }
 
 impl Hierarchy {
@@ -551,7 +582,7 @@ impl Hierarchy {
     /// one bit for each CPU of the machine.
     pub fn new(now: u64, online_cpus: u64) -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert(ROOT, Node::new(0, b"", 0, now));
+        nodes.insert(ROOT, Node::new(0, ROOT, b"", 0, now));
         let mut namespaces = BTreeMap::new();
         namespaces.insert(0, ROOT);
         Self {
@@ -565,6 +596,7 @@ impl Hierarchy {
             nr_freeze: 0,
             any_over_high: false,
             any_quota: false,
+            io_shares: BTreeMap::new(),
         }
     }
 
@@ -656,11 +688,15 @@ impl Hierarchy {
     }
 
     /// The controllers that `id` can use: all for the root, and the `cgroup.subtree_control`
-    /// of the parent for another cgroup.
+    /// of the parent for another cgroup. A threaded cgroup gets only the threaded controllers,
+    /// as `cgroup_control` of Linux.
     pub fn controllers(&self, id: CgId) -> u8 {
         match self.parent(id) {
             None => ALL,
-            Some(p) => self.nodes.get(&p).map_or(0, |n| n.subtree_control),
+            Some(p) => {
+                let mask = self.nodes.get(&p).map_or(0, |n| n.subtree_control);
+                if self.is_threaded(id) { mask & THREADED } else { mask }
+            }
         }
     }
 
@@ -721,7 +757,8 @@ impl Hierarchy {
         }
         let id = self.next;
         self.next += 1;
-        let mut node = Node::new(parent, name, depth, now);
+        // A new cgroup is a domain, also below a threaded cgroup, where it is not valid.
+        let mut node = Node::new(parent, id, name, depth, now);
         node.cpu.period_start = now;
         self.nodes.insert(id, node);
         for a in self.path_ids(parent) {
@@ -730,7 +767,7 @@ impl Hierarchy {
             }
         }
         self.node_mut(parent)?.children.insert(name.to_vec(), id);
-        self.dirty = true;
+        self.empty_changed();
         Ok(id)
     }
 
@@ -749,7 +786,12 @@ impl Hierarchy {
         if n.freeze {
             self.nr_freeze -= 1;
         }
-        self.node_mut(parent)?.children.remove(name);
+        let threaded = self.is_threaded(id);
+        let p = self.node_mut(parent)?;
+        p.children.remove(name);
+        if threaded {
+            p.nr_threaded_children -= 1;
+        }
         for a in self.path_ids(parent) {
             if let Some(n) = self.nodes.get_mut(&a) {
                 n.nr_descendants = n.nr_descendants.saturating_sub(1);
@@ -762,14 +804,129 @@ impl Hierarchy {
         } else {
             self.nodes.remove(&id);
         }
-        self.dirty = true;
+        self.empty_changed();
         Ok(id)
     }
 
-    /// Tells if the subtree of `id` has a process, the `populated` value of `cgroup.events`.
+    /// Tells if the subtree of `id` has a process or a thread, the `populated` value of
+    /// `cgroup.events`.
     pub fn populated(&self, id: CgId) -> bool {
         let Some(n) = self.nodes.get(&id) else { return false };
-        n.nr_procs > 0 || n.children.values().any(|&c| self.populated(c))
+        n.nr_procs > 0 || n.pids > 0 || n.children.values().any(|&c| self.populated(c))
+    }
+
+    /// The threads of `id` without the threads of its subtree.
+    fn own_threads(&self, id: CgId) -> u64 {
+        let Some(n) = self.nodes.get(&id) else { return 0 };
+        let below: u64 = n.children.values().map(|&c| self.pids(c)).sum();
+        n.pids.saturating_sub(below)
+    }
+
+    /// Tells if `id` itself has a process or a thread, `cgroup_has_tasks` of Linux.
+    fn has_tasks(&self, id: CgId) -> bool {
+        self.nodes.get(&id).is_some_and(|n| n.nr_procs > 0) || self.own_threads(id) > 0
+    }
+
+    /// The domain of `id`: `id` itself, or the thread root for a threaded cgroup.
+    pub fn dom(&self, id: CgId) -> CgId {
+        self.nodes.get(&id).map_or(id, |n| n.dom)
+    }
+
+    /// Tells if `id` has the type `threaded`, `cgroup_is_threaded` of Linux.
+    pub fn is_threaded(&self, id: CgId) -> bool {
+        self.dom(id) != id
+    }
+
+    /// Tells if `id` can have processes and give domain controllers to its children at the same
+    /// time, `cgroup_is_mixable` of Linux: only the root can.
+    fn is_mixable(&self, id: CgId) -> bool {
+        self.parent(id).is_none()
+    }
+
+    /// Tells if `id` can be the root of a threaded subtree, `cgroup_can_be_thread_root` of Linux.
+    fn can_be_thread_root(&self, id: CgId) -> bool {
+        if self.is_mixable(id) {
+            return true;
+        }
+        let Some(n) = self.nodes.get(&id) else { return false };
+        if self.is_threaded(id) || n.subtree_control & !THREADED != 0 {
+            return false;
+        }
+        // A populated domain child, `nr_populated_domain_children` of Linux.
+        !n.children.values().any(|&c| !self.is_threaded(c) && self.populated(c))
+    }
+
+    /// Tells if `id` is the root of a threaded subtree, `cgroup_is_thread_root` of Linux.
+    fn is_thread_root(&self, id: CgId) -> bool {
+        let Some(n) = self.nodes.get(&id) else { return false };
+        if self.is_threaded(id) {
+            return false;
+        }
+        n.nr_threaded_children > 0 || (self.has_tasks(id) && n.subtree_control & THREADED != 0)
+    }
+
+    /// Tells if `id` is a valid domain, `cgroup_is_valid_domain` of Linux: it is not threaded,
+    /// and no cgroup above it is threaded or a thread root that is not the root.
+    fn is_valid_domain(&self, id: CgId) -> bool {
+        if self.is_threaded(id) {
+            return false;
+        }
+        let mut at = id;
+        while let Some(p) = self.parent(at) {
+            if (!self.is_mixable(p) && self.is_thread_root(p)) || self.is_threaded(p) {
+                return false;
+            }
+            at = p;
+        }
+        true
+    }
+
+    /// The text of `cgroup.type` of `id`, as `cgroup_type_show` of Linux.
+    fn type_name(&self, id: CgId) -> &'static str {
+        if self.is_threaded(id) {
+            "threaded"
+        } else if !self.is_valid_domain(id) {
+            "domain invalid"
+        } else if self.is_thread_root(id) {
+            "domain threaded"
+        } else {
+            "domain"
+        }
+    }
+
+    /// Makes `id` a threaded cgroup in the threaded subtree of its parent, for a write of
+    /// `threaded` to `cgroup.type`, as `cgroup_enable_threaded` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// `EOPNOTSUPP` if `id` has a process or a thread in its subtree, gives domain controllers
+    /// to its children, or its parent cannot be in a threaded subtree.
+    fn enable_threaded(&mut self, id: CgId) -> Result<(), Errno> {
+        if self.is_threaded(id) {
+            return Ok(());
+        }
+        let parent = self.parent(id).ok_or(Errno::ENOENT)?;
+        if self.populated(id) || self.subtree_control(id) & !THREADED != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let dom = self.dom(parent);
+        if !self.is_valid_domain(dom) || !self.can_be_thread_root(dom) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        // The threaded cgroups below `id` join the subtree of `dom` too. A child that is not
+        // threaded stays a domain, and it is not valid.
+        let mut stack = alloc::vec![id];
+        while let Some(at) = stack.pop() {
+            if at != id && !self.is_threaded(at) {
+                continue;
+            }
+            let n = self.node_mut(at)?;
+            n.dom = dom;
+            stack.extend(n.children.values().copied());
+        }
+        self.node_mut(parent)?.nr_threaded_children += 1;
+        self.dirty = true;
+        Ok(())
     }
 
     /// Tells if `id` or a cgroup above it has `cgroup.freeze` 1, so the threads of `id` must
@@ -823,8 +980,8 @@ impl Hierarchy {
             let (child_populated, children_frozen, child_pids) =
                 below.remove(&id).unwrap_or((false, true, 0));
             let n = &self.nodes[&id];
-            let populated = n.nr_procs > 0 || child_populated;
             let own = n.pids.saturating_sub(child_pids);
+            let populated = n.nr_procs > 0 || own > 0 || child_populated;
             let frozen = freezing[&id] && n.nr_frozen >= own && children_frozen;
             let (parent, pids) = (n.parent, n.pids);
             let p = below.entry(parent).or_insert((false, true, 0));
@@ -864,36 +1021,62 @@ impl Hierarchy {
         self.nodes.iter().filter(|&(&i, n)| n.dead && i != id && self.is_descendant(i, id)).count()
     }
 
-    /// Checks that a process can move to `id`.
+    /// Checks that a process or a thread can move to `id`, as `cgroup_migrate_vet_dst` of
+    /// Linux.
     ///
     /// # Errors
     ///
-    /// `ENOENT` if `id` does not exist, and `EBUSY` if `id` is not the root and gives controllers
-    /// to its children: the rule of no internal processes.
+    /// `ENOENT` if `id` does not exist, `EOPNOTSUPP` if the domain of `id` is not valid, and
+    /// `EBUSY` if `id` is not the root and gives controllers to its children: the rule of no
+    /// internal processes. A cgroup that can be a thread root can have processes when it gives
+    /// only threaded controllers to its children.
     pub fn can_attach(&self, id: CgId) -> Result<(), Errno> {
         let n = self.node(id)?;
         if n.dead {
             return Err(Errno::ENOENT);
         }
-        if n.parent != 0 && n.subtree_control != 0 {
+        if !self.is_valid_domain(self.dom(id)) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if self.is_mixable(id) || self.can_be_thread_root(id) || self.is_threaded(id) {
+            return Ok(());
+        }
+        if n.subtree_control != 0 {
             return Err(Errno::EBUSY);
+        }
+        Ok(())
+    }
+
+    /// Checks that a thread can move alone from `from` to `to`, for a write of
+    /// `cgroup.threads`, as `cgroup_attach_permissions` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `can_attach`, and `EOPNOTSUPP` if the two cgroups are not in one domain:
+    /// a thread can leave the cgroup of its process only in a threaded subtree.
+    pub fn can_attach_thread(&self, from: CgId, to: CgId) -> Result<(), Errno> {
+        self.can_attach(to)?;
+        if self.dom(from) != self.dom(to) {
+            return Err(Errno::EOPNOTSUPP);
         }
         Ok(())
     }
 
     /// Adds a new process to `id`. The caller charged its thread with `charge_pids`.
     pub fn add_process(&mut self, id: CgId) {
+        let had = self.has_tasks(id);
         if let Some(n) = self.nodes.get_mut(&id) {
             n.nr_procs += 1;
-            self.dirty = true;
+            self.tasks_changed(id, had);
         }
     }
 
     /// Removes a process that ended from `id`.
     pub fn remove_process(&mut self, id: CgId) {
+        let had = self.has_tasks(id);
         if let Some(n) = self.nodes.get_mut(&id) {
             n.nr_procs = n.nr_procs.saturating_sub(1);
-            self.dirty = true;
+            self.tasks_changed(id, had);
         }
     }
 
@@ -904,26 +1087,56 @@ impl Hierarchy {
     ///
     /// The errors of `can_attach`.
     pub fn migrate(&mut self, from: CgId, to: CgId, threads: u64) -> Result<(), Errno> {
+        let threads: Vec<CgId> = (0..threads).map(|_| from).collect();
+        self.migrate_process(from, to, &threads)
+    }
+
+    /// Moves a process from `from`, the cgroup of its leader thread, to `to`. `threads` has the
+    /// cgroup of each thread of the process: in a threaded subtree, the threads can be in
+    /// different cgroups. All the threads go to `to`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `can_attach`.
+    pub fn migrate_process(&mut self, from: CgId, to: CgId, threads: &[CgId]) -> Result<(), Errno> {
         self.can_attach(to)?;
-        if from == to {
-            return Ok(());
+        for &t in threads {
+            self.move_thread(t, to);
         }
-        self.remove_process(from);
-        self.uncharge_pids(from, threads);
-        self.add_process(to);
-        self.force_charge_pids(to, threads);
+        if from != to {
+            self.remove_process(from);
+            self.add_process(to);
+        }
         Ok(())
+    }
+
+    /// Moves one thread from `from` to `to`, without the checks. The caller moves the process
+    /// with `move_leader` if the thread is its leader.
+    pub fn move_thread(&mut self, from: CgId, to: CgId) {
+        if from != to {
+            self.uncharge_pids(from, 1);
+            self.force_charge_pids(to, 1);
+        }
+    }
+
+    /// Moves the count of a process from `from` to `to`, after a move of its leader thread.
+    pub fn move_leader(&mut self, from: CgId, to: CgId) {
+        if from != to {
+            self.remove_process(from);
+            self.add_process(to);
+        }
     }
 
     /// Adds `n` threads to `id` and the cgroups above it, past the limits, as a move does.
     fn force_charge_pids(&mut self, id: CgId, n: u64) {
+        let had = self.has_tasks(id);
         for a in self.path_ids(id) {
             if let Some(node) = self.nodes.get_mut(&a) {
                 node.pids += n;
                 node.pids_peak = node.pids_peak.max(node.pids);
             }
         }
-        self.dirty = true;
+        self.tasks_changed(id, had);
     }
 
     /// Adds `n` new threads to `id` and the cgroups above it, as `pids_try_charge` of Linux.
@@ -950,12 +1163,33 @@ impl Hierarchy {
 
     /// Removes `n` threads that ended from `id` and the cgroups above it.
     pub fn uncharge_pids(&mut self, id: CgId, n: u64) {
+        let had = self.has_tasks(id);
         for a in self.path_ids(id) {
             if let Some(node) = self.nodes.get_mut(&a) {
                 node.pids = node.pids.saturating_sub(n);
             }
         }
-        self.dirty = true;
+        self.tasks_changed(id, had);
+    }
+
+    /// Marks `cgroup.events` for `refresh_events` after a change of the tasks of `id`, if a
+    /// value can change: `id` got its first task or lost its last one, or a cgroup is frozen.
+    /// The cgroups above `id` keep their own tasks, as their counts and the counts of their
+    /// children change together. `refresh_events` goes over each cgroup, and a mark at each
+    /// fork and exit made each of them slow with thousands of cgroups.
+    fn tasks_changed(&mut self, id: CgId, had_tasks: bool) {
+        if self.nr_freeze > 0 || self.has_tasks(id) != had_tasks {
+            self.dirty = true;
+        }
+    }
+
+    /// Marks `cgroup.events` for `refresh_events` after `mkdir` or `rmdir`. The cgroup has no
+    /// task, so `populated` does not change. Without a frozen cgroup, `frozen` is 0 in each
+    /// cgroup, and a new cgroup starts with the right values.
+    fn empty_changed(&mut self) {
+        if self.nr_freeze > 0 {
+            self.dirty = true;
+        }
     }
 
     /// The threads of the subtree of `id`: `pids.current`.
@@ -997,13 +1231,150 @@ impl Hierarchy {
     /// Removes a charge of `bytes` from `id` and the cgroups above it. A removed cgroup goes
     /// away when it has no charge left.
     pub fn uncharge_memory(&mut self, id: CgId, bytes: u64) {
+        self.uncharge(id, bytes, false);
+    }
+
+    /// Charges `bytes` of the page cache to `id` and the cgroups above it. The charge does not
+    /// fail: the page is in the cache already. Gives the highest cgroup whose `memory.max` the
+    /// use now passes, and the caller then takes pages back from it with `reclaim_plan`.
+    pub fn charge_file(&mut self, id: CgId, bytes: u64) -> Option<CgId> {
+        let mut over = None;
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.mem.file_local += bytes;
+        }
+        for a in self.path_ids(id) {
+            let on = self.on(a, MEMORY);
+            let Some(n) = self.nodes.get_mut(&a) else { continue };
+            n.mem.current += bytes;
+            n.mem.file += bytes;
+            n.mem.peak = n.mem.peak.max(n.mem.current);
+            if on && n.mem.max != MAX && n.mem.current > n.mem.max {
+                over = Some(a);
+            }
+            if on && n.mem.high != MAX && n.mem.current > n.mem.high {
+                n.mem.over_high += bytes;
+                self.any_over_high = true;
+                self.memory_event(a, EV_HIGH);
+            }
+        }
+        over
+    }
+
+    /// Removes a charge of `bytes` of the page cache from `id` and the cgroups above it.
+    pub fn uncharge_file(&mut self, id: CgId, bytes: u64) {
+        self.uncharge(id, bytes, true);
+    }
+
+    /// Removes a charge of `bytes`, of the page cache if `file`, from `id` and the cgroups
+    /// above it. A removed cgroup goes away when it has no charge left.
+    fn uncharge(&mut self, id: CgId, bytes: u64, file: bool) {
+        if file && let Some(n) = self.nodes.get_mut(&id) {
+            n.mem.file_local = n.mem.file_local.saturating_sub(bytes);
+        }
         for a in self.path_ids(id) {
             let Some(n) = self.nodes.get_mut(&a) else { continue };
             n.mem.current = n.mem.current.saturating_sub(bytes);
+            if file {
+                n.mem.file = n.mem.file.saturating_sub(bytes);
+            }
             if n.dead && n.mem.current == 0 && n.children.is_empty() {
                 self.nodes.remove(&a);
             }
         }
+    }
+
+    /// The effective `memory.min` and `memory.low` of each cgroup below `root` that uses
+    /// memory, for a reclaim in `root`, as `mem_cgroup_calculate_protection` of Linux. A child
+    /// of `root` has its own values. A cgroup lower down gets its part of the effective value
+    /// of its parent: if the protected use of the children, `min(current, memory.min)`, is
+    /// above the effective value of the parent, each child gets the part of its protected use.
+    /// `root` itself has no protection. The removed cgroups count with their parent.
+    fn protection(&self, root: CgId) -> BTreeMap<CgId, (u64, u64)> {
+        // The cgroups below `root`, with the removed ones, by their parent.
+        let mut below: BTreeMap<CgId, Vec<CgId>> = BTreeMap::new();
+        for (&id, n) in &self.nodes {
+            if id != root && n.mem.current > 0 && self.is_descendant(id, root) {
+                below.entry(n.parent).or_default().push(id);
+            }
+        }
+        let mut out = BTreeMap::new();
+        out.insert(root, (0, 0));
+        let mut todo = alloc::vec![root];
+        while let Some(parent) = todo.pop() {
+            let Some(kids) = below.get(&parent) else { continue };
+            let (pmin, plow) = out[&parent];
+            let used = |id: CgId, f: fn(&Memory) -> u64| {
+                let n = &self.nodes[&id];
+                if self.on(id, MEMORY) { n.mem.current.min(f(&n.mem)) } else { 0 }
+            };
+            let sum_min: u64 = kids.iter().map(|&k| used(k, |m| m.min)).sum();
+            let sum_low: u64 = kids.iter().map(|&k| used(k, |m| m.low)).sum();
+            for &k in kids {
+                let n = &self.nodes[&k];
+                let prot = if !self.on(k, MEMORY) {
+                    (0, 0)
+                } else if parent == root {
+                    (n.mem.min, n.mem.low)
+                } else {
+                    let part = |own: u64, sum: u64, parent_e: u64| {
+                        if sum > parent_e {
+                            (u128::from(own) * u128::from(parent_e) / u128::from(sum)) as u64
+                        } else {
+                            own
+                        }
+                    };
+                    (
+                        part(used(k, |m| m.min), sum_min, pmin),
+                        part(used(k, |m| m.low), sum_low, plow),
+                    )
+                };
+                out.insert(k, prot);
+                todo.push(k);
+            }
+        }
+        out
+    }
+
+    /// Plans the reclaim of `want` bytes of the page cache in the subtree of `root`, as
+    /// `try_to_free_mem_cgroup_pages` of Linux. Gives the cgroups and the bytes of their own
+    /// page cache to take. A cgroup keeps its effective `memory.low`, and its effective
+    /// `memory.min`. If that is not enough for `want`, a second pass goes below the effective
+    /// `memory.low`, and each cgroup at or below it counts a `low` event. The plan takes from
+    /// each cgroup in proportion to what it can give.
+    pub fn reclaim_plan(&mut self, root: CgId, want: u64) -> Vec<(CgId, u64)> {
+        let prot = self.protection(root);
+        let free = |h: &Self, low_pass: bool| -> Vec<(CgId, u64)> {
+            prot.iter()
+                .filter_map(|(&id, &(emin, elow))| {
+                    let m = &h.nodes[&id].mem;
+                    let keep = if low_pass { emin } else { emin.max(elow) };
+                    let n = m.file_local.min(m.current.saturating_sub(keep));
+                    (n > 0).then_some((id, n))
+                })
+                .collect()
+        };
+        let mut plan = free(self, false);
+        if plan.iter().map(|p| p.1).sum::<u64>() < want {
+            // `mem_cgroup_below_low` of Linux: a cgroup with an effective `memory.low` that
+            // its use does not pass.
+            let low: Vec<CgId> = prot
+                .iter()
+                .filter(|(id, (_, elow))| *elow > 0 && self.nodes[id].mem.current <= *elow)
+                .map(|(&id, _)| id)
+                .collect();
+            for id in low {
+                self.memory_event(id, EV_LOW);
+            }
+            plan = free(self, true);
+        }
+        let total: u64 = plan.iter().map(|p| p.1).sum();
+        if total > want {
+            for p in &mut plan {
+                p.1 = (u128::from(p.1) * u128::from(want)).div_ceil(u128::from(total)) as u64;
+            }
+        }
+        plan.retain(|p| p.1 > 0);
+        plan
     }
 
     /// Counts the event `ev` of `memory.events` in `id` and the cgroups above it, and of
@@ -1083,26 +1454,54 @@ impl Hierarchy {
         if delay <= HIGH_DELAY_MIN { 0 } else { delay.min(HIGH_DELAY_MAX) }
     }
 
-    /// Charges `bytes` bytes in `ios` bios of the device `dev` to `id` and to each cgroup above
-    /// it, at the time `now`. `write` tells a write from a read. Gives the time in nanoseconds
-    /// that the task waits to keep the use under `io.max` of these cgroups.
-    pub fn charge_io(
+    /// Charges `bytes` bytes in `ios` bios of the kind `op` of the device `dev` to `id` and to
+    /// each cgroup above it, at the time `now`. The device took `ns` nanoseconds for them. Gives
+    /// the time in nanoseconds that the task waits to keep the use under `io.max` of these
+    /// cgroups and in the part of the device that `io.weight` gives.
+    pub fn charge_io(&mut self, id: CgId, dev: u64, op: io::Op, io: (u64, u64), now: u64) -> u64 {
+        self.charge_io_timed(id, dev, op, io, now, 0)
+    }
+
+    /// `charge_io` with the time `ns` that the device took.
+    pub fn charge_io_timed(
         &mut self,
         id: CgId,
         dev: u64,
-        write: bool,
-        bytes: u64,
-        ios: u64,
+        op: io::Op,
+        (bytes, ios): (u64, u64),
         now: u64,
+        ns: u64,
     ) -> u64 {
         let mut delay = 0;
         for a in self.path_ids(id) {
             let limit = self.on(a, IO);
             if let Some(n) = self.nodes.get_mut(&a) {
-                delay = delay.max(n.io.charge(dev, write, bytes, ios, now, limit));
+                delay = delay.max(n.io.charge(dev, op, bytes, ios, now, limit));
             }
         }
-        delay
+        let share = self.io_share(id, dev, now);
+        let s = self.io_shares.entry(dev).or_default();
+        delay.max(s.charge(id, bytes, ns, share, now))
+    }
+
+    /// The part of the device `dev` that `id` gets now by `io.weight`, in units of
+    /// `io::SHARE_UNIT`. At each level of the path, a cgroup with the io controller gets its
+    /// weight divided by the sum of the weights of its siblings that are active on the device,
+    /// with itself.
+    pub fn io_share(&mut self, id: CgId, dev: u64, now: u64) -> u64 {
+        let active = self.io_shares.get_mut(&dev).map(|s| s.active(now)).unwrap_or_default();
+        let mut part = u128::from(io::SHARE_UNIT);
+        for a in self.path_ids(id).into_iter().rev() {
+            let Some(p) = self.parent(a).filter(|_| self.on(a, IO)) else { continue };
+            let mut sum = 0u128;
+            for &s in self.nodes[&p].children.values() {
+                if s == a || (self.on(s, IO) && active.iter().any(|&x| self.is_descendant(x, s))) {
+                    sum += u128::from(self.nodes[&s].io.weight_of(dev));
+                }
+            }
+            part = part * u128::from(self.nodes[&a].io.weight_of(dev)) / sum.max(1);
+        }
+        u64::try_from(part).unwrap_or(io::SHARE_UNIT)
     }
 
     /// The memory of `id`.
@@ -1262,6 +1661,7 @@ impl Hierarchy {
         let dying = self.nr_dying(id);
         let cpus = self.effective_cpus(id);
         let mems = self.effective_mems(id);
+        let type_name = self.type_name(id);
         let n = self.node_mut(id)?;
         if let Some(r) = name.strip_suffix(".pressure") {
             let r = psi::NAMES.iter().position(|&x| x == r).ok_or(Errno::ENOENT)?;
@@ -1279,7 +1679,7 @@ impl Hierarchy {
             "cgroup.events" => {
                 format!("populated {}\nfrozen {}\n", u8::from(populated), u8::from(frozen))
             }
-            "cgroup.type" => String::from("domain\n"),
+            "cgroup.type" => format!("{type_name}\n"),
             "cgroup.freeze" => format!("{}\n", u8::from(n.freeze)),
             "cgroup.max.depth" => {
                 show_max(if n.max_depth == u32::MAX { MAX } else { u64::from(n.max_depth) })
@@ -1337,7 +1737,10 @@ impl Hierarchy {
             "memory.events" => events(&n.mem.events),
             "memory.events.local" => events(&n.mem.events_local),
             "memory.stat" => memory_stat(&n.mem),
-            "memory.numa_stat" => format!("anon N0={}\nfile N0=0\n", n.mem.current),
+            "memory.numa_stat" => {
+                let anon = n.mem.current.saturating_sub(n.mem.file);
+                format!("anon N0={anon}\nfile N0={}\n", n.mem.file)
+            }
             "memory.swap.current" | "memory.swap.peak" | "memory.zswap.current" => {
                 String::from("0\n")
             }
@@ -1377,6 +1780,13 @@ impl Hierarchy {
                     _ => Err(Errno::ERANGE),
                 };
             }
+            // Only `threaded` is a valid write, as `cgroup_type_write` of Linux.
+            "cgroup.type" => {
+                return match text(data)? {
+                    "threaded" => self.enable_threaded(id).map(|()| Effect::None),
+                    _ => Err(Errno::EINVAL),
+                };
+            }
             _ => {}
         }
         let n = self.node_mut(id)?;
@@ -1398,12 +1808,6 @@ impl Hierarchy {
                 }
                 self.dirty = true;
                 return Ok(Effect::Freeze);
-            }
-            "cgroup.type" => {
-                return Err(match text(data)? {
-                    "threaded" => Errno::EOPNOTSUPP,
-                    _ => Errno::EINVAL,
-                });
             }
             "cgroup.max.depth" => {
                 n.max_depth = u32::try_from(parse_max(data)?).unwrap_or(u32::MAX);
@@ -1449,7 +1853,7 @@ impl Hierarchy {
                 }
                 n.cpu.set_max(quota.map(|q| q * 1000), period * 1000, now);
                 self.any_quota |= quota.is_some();
-                Effect::None
+                Effect::Throttle
             }
             "cpu.max.burst" => {
                 if parse_max(data)? != 0 {
@@ -1481,7 +1885,7 @@ impl Hierarchy {
             },
             "io.max" => {
                 n.io.write_max(text(data)?)?;
-                Effect::None
+                Effect::Throttle
             }
             "io.weight" => {
                 n.io.write_weight(text(data)?)?;
@@ -1497,7 +1901,7 @@ impl Hierarchy {
             }
             "memory.high" => {
                 n.mem.high = parse_bytes(data)?;
-                Effect::None
+                Effect::Throttle
             }
             "memory.max" => {
                 n.mem.max = parse_bytes(data)?;
@@ -1567,11 +1971,8 @@ impl Hierarchy {
         let n = self.node(id)?;
         let enable = enable & !n.subtree_control;
         let disable = disable & n.subtree_control;
-        // A cgroup that is not the root and that has processes cannot give controllers to its
-        // children.
-        if enable != 0 && n.parent != 0 && n.nr_procs > 0 {
-            return Err(Errno::EBUSY);
-        }
+        self.vet_enable(id, enable)?;
+        let n = self.node(id)?;
         // A controller that a child gives to its own children stays.
         for &c in n.children.values() {
             if self.subtree_control(c) & disable != 0 {
@@ -1580,6 +1981,33 @@ impl Hierarchy {
         }
         let n = self.node_mut(id)?;
         n.subtree_control = (n.subtree_control | enable) & !disable;
+        Ok(())
+    }
+
+    /// Checks that `id` can give the controllers `enable` to its children, as
+    /// `cgroup_vet_subtree_control_enable` of Linux. A cgroup that is not the root and that has
+    /// processes cannot give domain controllers to its children. A threaded subtree has only
+    /// threaded controllers.
+    fn vet_enable(&self, id: CgId, enable: u8) -> Result<(), Errno> {
+        if enable == 0 {
+            return Ok(());
+        }
+        if !self.is_valid_domain(self.dom(id)) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if self.is_mixable(id) {
+            return Ok(());
+        }
+        if enable & !THREADED != 0 {
+            if self.is_thread_root(id) || self.is_threaded(id) {
+                return Err(Errno::EOPNOTSUPP);
+            }
+        } else if self.can_be_thread_root(id) || self.is_threaded(id) {
+            return Ok(());
+        }
+        if self.has_tasks(id) {
+            return Err(Errno::EBUSY);
+        }
         Ok(())
     }
 
@@ -1617,12 +2045,14 @@ fn nice_of_weight(w: u32) -> i32 {
     best
 }
 
-/// The text of `memory.stat`. All memory that rukernel charges is anonymous memory of processes.
+/// The text of `memory.stat`. The memory that rukernel charges is the anonymous memory of the
+/// processes and the page cache.
 fn memory_stat(m: &Memory) -> String {
+    let anon = m.current.saturating_sub(m.file);
     let mut out = String::new();
     for (name, v) in [
-        ("anon", m.current),
-        ("file", 0),
+        ("anon", anon),
+        ("file", m.file),
         ("kernel", 0),
         ("kernel_stack", 0),
         ("pagetables", 0),
@@ -1639,8 +2069,8 @@ fn memory_stat(m: &Memory) -> String {
         ("file_thp", 0),
         ("shmem_thp", 0),
         ("inactive_anon", 0),
-        ("active_anon", m.current),
-        ("inactive_file", 0),
+        ("active_anon", anon),
+        ("inactive_file", m.file),
         ("active_file", 0),
         ("unevictable", 0),
         ("slab_reclaimable", 0),
@@ -1730,7 +2160,32 @@ pub fn uncharge_thread(id: CgId) {
     with(|h| h.uncharge_pids(id, 1));
 }
 
-/// Charges a page of memory to `id`.
+/// The function that drops the clean page cache of a cgroup: it gets the cgroup and the bytes,
+/// and gives the bytes that it dropped. The block layer gives it.
+pub type ReclaimFn = fn(CgId, u64) -> u64;
+
+/// The hook of [`set_reclaim`].
+static RECLAIM: Once<ReclaimFn> = Once::new();
+
+/// The bytes that a reclaim for a charge takes at least, as `SWAP_CLUSTER_MAX` of Linux.
+const RECLAIM_BATCH: u64 = 64 * PAGE_SIZE;
+
+/// Sets the function that drops the page cache of a cgroup. The kernel calls this once.
+pub fn set_reclaim(f: ReclaimFn) {
+    RECLAIM.call_once(|| f);
+}
+
+/// Takes back `want` bytes of the page cache in the subtree of `root`, as
+/// `try_to_free_mem_cgroup_pages` of Linux. See `Hierarchy::reclaim_plan`. Gives the bytes that
+/// were dropped. The caller must not hold the lock of a page cache.
+pub fn reclaim(root: CgId, want: u64) -> u64 {
+    let Some(drop) = RECLAIM.get() else { return 0 };
+    let plan = with(|h| h.reclaim_plan(root, want));
+    plan.into_iter().map(|(id, bytes)| drop(id, bytes)).sum()
+}
+
+/// Charges a page of memory to `id`. A charge past a `memory.max` first takes back page cache
+/// of that cgroup.
 ///
 /// # Errors
 ///
@@ -1739,7 +2194,50 @@ pub fn charge_page(id: CgId) -> Result<(), CgId> {
     if id == 0 {
         return Ok(());
     }
-    with(|h| h.charge_memory(id, PAGE_SIZE))
+    let mut tries = 0;
+    loop {
+        match with(|h| h.charge_memory(id, PAGE_SIZE)) {
+            Ok(()) => return Ok(()),
+            Err(over) if tries < 8 && reclaim(over, RECLAIM_BATCH) > 0 => tries += 1,
+            Err(over) => return Err(over),
+        }
+    }
+}
+
+/// Charges `bytes` of the page cache to `id`. The page cache calls this with its lock, so the
+/// charge does not take pages back. See [`balance_file`].
+pub fn charge_file(id: CgId, bytes: u64) {
+    if id != 0 {
+        with(|h| h.charge_file(id, bytes));
+    }
+}
+
+/// Removes a charge of `bytes` of the page cache from `id`.
+pub fn uncharge_file(id: CgId, bytes: u64) {
+    if id != 0 {
+        with(|h| h.uncharge_file(id, bytes));
+    }
+}
+
+/// Takes back page cache until the cgroups above `id` are not over `memory.max`, after a charge
+/// of the page cache. The page cache calls this without its lock.
+pub fn balance_file(id: CgId) {
+    if id == 0 {
+        return;
+    }
+    for _ in 0..64 {
+        let over = with(|h| {
+            h.path_ids(id).into_iter().rev().find_map(|a| {
+                let m = &h.nodes.get(&a)?.mem;
+                (h.on(a, MEMORY) && m.max != MAX && m.current > m.max)
+                    .then(|| (a, m.current - m.max))
+            })
+        });
+        let Some((cg, excess)) = over else { return };
+        if reclaim(cg, excess.max(RECLAIM_BATCH)) == 0 {
+            return;
+        }
+    }
 }
 
 /// Charges `n` pages of memory to `id` at one time, as for a huge page.
@@ -1778,14 +2276,14 @@ pub fn high_delay(id: CgId) -> u64 {
     with(|h| h.high_delay(id))
 }
 
-/// Charges an I/O to `id`. See `Hierarchy::charge_io`. Gives the delay of `io.max` in
-/// nanoseconds.
-pub fn charge_io(id: CgId, dev: u64, write: bool, bytes: u64, ios: u64) -> u64 {
+/// Charges an I/O of `bytes` in `ios` bios that took the device `ns` nanoseconds to `id`. See
+/// `Hierarchy::charge_io`. Gives the delay of `io.max` and `io.weight` in nanoseconds.
+pub fn charge_io(id: CgId, dev: u64, op: io::Op, (bytes, ios): (u64, u64), ns: u64) -> u64 {
     if id == 0 {
         return 0;
     }
     let now = now();
-    with(|h| h.charge_io(id, dev, write, bytes, ios, now))
+    with(|h| h.charge_io_timed(id, dev, op, (bytes, ios), now, ns))
 }
 
 /// The time in nanoseconds until which a thread of `id` waits for its quota.

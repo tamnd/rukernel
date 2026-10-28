@@ -43,10 +43,7 @@ pub(crate) fn processes(id: CgId) -> Vec<u32> {
 
 /// The IDs of the threads in the cgroup `id`, for `cgroup.threads`.
 pub(crate) fn threads(id: CgId) -> Vec<u32> {
-    let mut out: Vec<u32> = rk_proc::cgroup::processes_of(id)
-        .iter()
-        .flat_map(|p| p.threads().into_iter().map(|t| t.tid()))
-        .collect();
+    let mut out: Vec<u32> = rk_proc::cgroup::threads_of(id).iter().map(|t| t.tid()).collect();
     out.sort_unstable();
     out
 }
@@ -67,9 +64,9 @@ pub(crate) fn move_process(
     rk_proc::cgroup::migrate(&process, id)
 }
 
-/// Moves the thread `tid` to the cgroup `id`. The cgroups here are all of the type `domain`,
-/// so a thread cannot leave its process, as in Linux. `check` gets the cgroup of the thread and
-/// gives an error if the move is not allowed.
+/// Moves the thread `tid` to the cgroup `id`. A thread can leave the cgroup of its process only
+/// in a threaded subtree, as in Linux. `check` gets the cgroup of the thread and gives an error
+/// if the move is not allowed.
 pub(crate) fn move_thread(
     id: CgId,
     tid: u32,
@@ -80,8 +77,8 @@ pub(crate) fn move_thread(
     } else {
         rk_proc::find_thread(tid).ok_or(Errno::ESRCH)?
     };
-    check(thread.process().cgroup())?;
-    if thread.process().cgroup() == id { Ok(()) } else { Err(Errno::EOPNOTSUPP) }
+    check(thread.cgroup())?;
+    rk_proc::cgroup::migrate_thread(&thread, id)
 }
 
 /// Tells if the block device `dev` exists.
@@ -97,5 +94,6 @@ pub(crate) fn apply(id: CgId, effect: Effect) {
         Effect::Freeze => rk_proc::cgroup::freeze_changed(id),
         Effect::MemoryOver => rk_proc::cgroup::reclaim_over_limit(id),
         Effect::Cpuset => rk_proc::cgroup::update_cpus(id),
+        Effect::Throttle => rk_proc::cgroup::limits_changed(),
     }
 }

@@ -4242,6 +4242,46 @@ static long cg_io_value(const char *cg, const char *key)
 	return atol(p + strlen(key));
 }
 
+/* Moves the caller to the threaded cgroup /cg/th/x with cgroup.threads. */
+static int cg_thread_move(void)
+{
+	char buf[64];
+
+	if (cg_write("/cg/th/x/cgroup.threads", "0") != 0)
+		return 1;
+	if (read_file("/proc/self/cgroup", buf, sizeof(buf)) <= 0 || strcmp(buf, "0::/th/x\n") != 0)
+		return 2;
+	return 0;
+}
+
+/* Checks the thread mode: cgroup.type, cgroup.threads and cgroup.procs of a threaded cgroup. */
+static void test_cgroup_threaded(void)
+{
+	char buf[64];
+	int status;
+
+	mkdir("/cg/th", 0755);
+	mkdir("/cg/th/x", 0755);
+	check("cgroup.type of a new cgroup is domain",
+	      read_file("/cg/th/x/cgroup.type", buf, sizeof(buf)) > 0 && strcmp(buf, "domain\n") == 0);
+	check("cgroup.type takes threaded", cg_write("/cg/th/x/cgroup.type", "threaded") == 0);
+	check("cgroup.type tells threaded",
+	      read_file("/cg/th/x/cgroup.type", buf, sizeof(buf)) > 0 && strcmp(buf, "threaded\n") == 0);
+	check("the parent of a threaded cgroup is a thread root",
+	      read_file("/cg/th/cgroup.type", buf, sizeof(buf)) > 0 &&
+		      strcmp(buf, "domain threaded\n") == 0);
+	check("cgroup.type refuses domain",
+	      cg_write("/cg/th/x/cgroup.type", "domain") == -1 && errno == EINVAL);
+	check("cgroup.procs of a threaded cgroup gives EOPNOTSUPP",
+	      read_file("/cg/th/x/cgroup.procs", buf, sizeof(buf)) < 0 && errno == EOPNOTSUPP);
+	status = wait_status(cgroup_child("/cg/th", cg_thread_move));
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("cg_thread_move: status %#x\n", status);
+	check("cgroup.threads moves a thread in a threaded subtree",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("rmdir removes a threaded cgroup", rmdir("/cg/th/x") == 0 && rmdir("/cg/th") == 0);
+}
+
 /* Checks the io controller: io.stat, io.max and io.weight. */
 static void test_cgroup_io(void)
 {
@@ -4415,8 +4455,9 @@ static void test_cgroup(void)
 	check("rmdir of a cgroup with a process gives EBUSY", rmdir("/cg/t/a") == 0 && rmdir("/cg/t") == -1 &&
 								      errno == EBUSY);
 	mkdir("/cg/t/a", 0755);
+	/* Only a domain controller is under the rule. pids is a threaded controller, as in Linux. */
 	check("no internal processes: subtree_control gives EBUSY",
-	      cg_write("/cg/t/cgroup.subtree_control", "+pids") == -1 && errno == EBUSY);
+	      cg_write("/cg/t/cgroup.subtree_control", "+memory") == -1 && errno == EBUSY);
 	kill(pid, SIGKILL);
 	wait_status(pid);
 	check("cgroup.events tells empty", cg_value("/cg/t/cgroup.events", "populated ") == 0);
@@ -4550,6 +4591,7 @@ static void test_cgroup(void)
 	close(cg_ns_fd);
 
 	test_cgroup_io();
+	test_cgroup_threaded();
 	test_cgroup_delegation();
 	check("rmdir removes the cgroups", rmdir("/cg/t/a") == 0 && rmdir("/cg/t") == 0);
 	umount("/cg");

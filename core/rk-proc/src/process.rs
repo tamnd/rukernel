@@ -153,8 +153,11 @@ pub struct Process {
     image: SpinLock<Image>,
     /// The tick of the timer when the process was made.
     start_tick: u64,
-    /// The value of `/proc/PID/oom_score_adj`. rukernel has no OOM killer yet.
+    /// The value of `/proc/PID/oom_score_adj`.
     oom_score_adj: AtomicI32,
+    /// The OOM reaper took the private pages of the process. The OOM killers do not wait for
+    /// it again, as `MMF_OOM_SKIP` of Linux.
+    oom_reaped: AtomicBool,
     /// The `MEMBARRIER_CMD_REGISTER_*` commands that the process gave, as the bits of the
     /// commands that they allow. A new address space has none.
     membarrier: AtomicU32,
@@ -191,7 +194,8 @@ pub struct Process {
     /// The tracer of the leader thread after the leader ended. The tracer gets the exit of the
     /// process.
     leader_tracer: SpinLock<Weak<Process>>,
-    /// The cgroup of the process. All the threads of a process are in one cgroup.
+    /// The cgroup of the process: the cgroup of its leader thread, for `cgroup.procs` and the
+    /// memory controller. In a threaded subtree, the other threads can be in other cgroups.
     cgroup: AtomicU32,
     /// The cgroup namespace of the process, or 0 for the namespace of the system.
     cgns: AtomicU32,
@@ -262,6 +266,8 @@ pub struct Thread {
     /// The time in nanoseconds that the thread must wait for `io.max` of its cgroup before it
     /// goes back to user mode.
     io_delay: AtomicU64,
+    /// The cgroup of the thread. It is the cgroup of the process, except in a threaded subtree.
+    cgroup: AtomicU32,
     /// The tracing state, while a tracer traces the thread.
     ptrace: SpinLock<Option<ptrace::Ptrace>>,
     /// The signal of a group stop that the traced thread did not take yet, or 0. A thread that
@@ -496,7 +502,7 @@ impl Process {
         self.cmaxrss.load(Ordering::Relaxed) * (rk_mm::PAGE_SIZE as u64 / 1024)
     }
 
-    /// The cgroup of the process.
+    /// The cgroup of the process: the cgroup of its leader thread.
     pub fn cgroup(&self) -> u32 {
         self.cgroup.load(Ordering::Relaxed)
     }
@@ -508,17 +514,50 @@ impl Process {
         if cg == rk_cgroup::ROOT { 0 } else { cg }
     }
 
-    /// Moves the process to the cgroup `to` in the hierarchy, and gives its threads. The lock of
-    /// the state keeps the number of threads stable during the move.
+    /// Moves the process with all its threads to the cgroup `to` in the hierarchy, and gives
+    /// its threads. The lock of the state keeps the threads stable during the move.
     pub(crate) fn move_cgroup(&self, to: u32) -> Result<Vec<Arc<Thread>>, Errno> {
         let s = self.state.lock();
         if s.threads.is_empty() {
             return Err(Errno::ESRCH);
         }
         let from = self.cgroup();
-        rk_cgroup::with(|h| h.migrate(from, to, s.threads.len() as u64))?;
+        let threads: Vec<u32> = s.threads.iter().map(|t| t.cgroup()).collect();
+        rk_cgroup::with(|h| h.migrate_process(from, to, &threads))?;
+        for t in &s.threads {
+            t.cgroup.store(to, Ordering::Relaxed);
+        }
         self.cgroup.store(to, Ordering::Relaxed);
         Ok(s.threads.clone())
+    }
+
+    /// Moves the thread `thread` of the process alone to the cgroup `to`, for a write of
+    /// `cgroup.threads`. A move of the leader thread moves the process too.
+    ///
+    /// # Errors
+    ///
+    /// `ESRCH` for a thread that ended, and the errors of `Hierarchy::can_attach_thread`.
+    pub(crate) fn move_thread_cgroup(&self, thread: &Thread, to: u32) -> Result<(), Errno> {
+        let s = self.state.lock();
+        if !s.threads.iter().any(|t| t.tid == thread.tid) {
+            return Err(Errno::ESRCH);
+        }
+        let from = thread.cgroup();
+        let leader = thread.tid == self.pid;
+        let pfrom = self.cgroup();
+        rk_cgroup::with(|h| {
+            h.can_attach_thread(from, to)?;
+            h.move_thread(from, to);
+            if leader {
+                h.move_leader(pfrom, to);
+            }
+            Ok::<(), Errno>(())
+        })?;
+        thread.cgroup.store(to, Ordering::Relaxed);
+        if leader {
+            self.cgroup.store(to, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// The cgroup namespace of the process, or 0 for the namespace of the system.
@@ -741,6 +780,16 @@ impl Process {
         self.oom_score_adj.load(Ordering::Relaxed)
     }
 
+    /// Tells if the OOM reaper took the private pages of the process.
+    pub fn oom_reaped(&self) -> bool {
+        self.oom_reaped.load(Ordering::Relaxed)
+    }
+
+    /// Records that the OOM reaper took the private pages of the process.
+    pub fn set_oom_reaped(&self) {
+        self.oom_reaped.store(true, Ordering::Relaxed);
+    }
+
     /// Sets the value of `/proc/PID/oom_score_adj`.
     pub fn set_oom_score_adj(&self, value: i32) {
         self.oom_score_adj.store(value, Ordering::Relaxed);
@@ -881,6 +930,7 @@ impl Process {
             image: SpinLock::new(Image::default()),
             start_tick: rk_frame::time::ticks(),
             oom_score_adj: AtomicI32::new(0),
+            oom_reaped: AtomicBool::new(false),
             membarrier: AtomicU32::new(0),
             personality: AtomicU32::new(0),
             pdeath_signal: AtomicU32::new(0),
@@ -1030,6 +1080,11 @@ impl Thread {
         }
     }
 
+    /// The cgroup of the thread.
+    pub fn cgroup(&self) -> u32 {
+        self.cgroup.load(Ordering::Relaxed)
+    }
+
     /// Adds `ns` nanoseconds to the wait of the thread for `io.max`. The longest delay counts,
     /// because each delay starts now.
     pub fn add_io_delay(&self, ns: u64) {
@@ -1060,7 +1115,7 @@ impl Thread {
     /// cgroup. If the two have no CPU in common, the cpuset wins, as in Linux.
     pub fn allowed_cpus(&self) -> u64 {
         let affinity = self.sched().affinity;
-        let cpus = rk_cgroup::with(|h| h.effective_cpus(self.process.cgroup()));
+        let cpus = rk_cgroup::with(|h| h.effective_cpus(self.cgroup()));
         match cpus {
             0 => affinity,
             c if affinity & c == 0 => c,
@@ -1233,7 +1288,7 @@ impl Thread {
         if self.is_killed() || !self.pending().without(self.blocked()).is_empty() {
             return true;
         }
-        if rk_cgroup::frozen(self.process.cgroup()) {
+        if rk_cgroup::frozen(self.cgroup()) {
             return true;
         }
         if self.is_traced() {
@@ -1401,6 +1456,7 @@ impl Thread {
             sys_ticks: AtomicU64::new(0),
             sys_rest: AtomicU64::new(0),
             io_delay: AtomicU64::new(0),
+            cgroup: AtomicU32::new(rk_cgroup::ROOT),
             ptrace: SpinLock::new(None),
             group_stop: AtomicU32::new(0),
             seccomp_mode: AtomicU32::new(0),
@@ -1609,6 +1665,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     }
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     *thread.net.lock() = parent.net_ns_opt();
+    thread.cgroup.store(cgroup, Ordering::Relaxed);
     thread.inherit_seccomp(parent);
     thread.inherit_timer_slack(parent);
     *thread.sched.lock() = parent.sched().forked();
@@ -1631,7 +1688,8 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
 /// thread.
 pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     let process = thread.process.clone();
-    let cgroup = process.cgroup();
+    // The new thread starts in the cgroup of the thread that makes it, as in Linux.
+    let cgroup = thread.cgroup();
     rk_cgroup::charge_thread(cgroup)?;
     let mut table = TABLE.lock();
     let tid = match alloc_pid(&mut table) {
@@ -1644,6 +1702,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     };
     let new = Thread::new(tid, process.clone(), thread.blocked());
     *new.net.lock() = thread.net_ns_opt();
+    new.cgroup.store(cgroup, Ordering::Relaxed);
     new.inherit_seccomp(thread);
     new.inherit_timer_slack(thread);
     *new.sched.lock() = thread.sched().forked();
@@ -1942,12 +2001,12 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         process.dead_sys_ticks.fetch_add(thread.sys_ticks(), Ordering::Relaxed);
         // The thread leaves its cgroup with the lock held, so a move of the process counts the
         // threads that stay.
-        let cgroup = process.cgroup();
+        let (cgroup, pcgroup) = (thread.cgroup(), process.cgroup());
         let last = s.threads.is_empty();
         rk_cgroup::with(|h| {
             h.uncharge_pids(cgroup, 1);
             if last {
-                h.remove_process(cgroup);
+                h.remove_process(pcgroup);
             }
         });
         last

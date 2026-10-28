@@ -4,10 +4,18 @@
 //! The block layer charges each bio to the cgroup of the task that submits it and to each
 //! cgroup above, and `io.stat` shows the counts of each device. `io.max` limits the bytes and the
 //! I/O operations in each second for a device. A charge over a limit gives a delay, and the task
-//! waits for that time before it goes back to user mode. rukernel has no proportional I/O
-//! scheduler, so `io.weight` keeps its values but has no effect.
+//! waits for that time before it goes back to user mode.
+//!
+//! `io.weight` shares a device among the cgroups that use it at the same time, with a virtual
+//! time as a fair queue. Each cgroup that did I/O on the device in the last [`ACTIVE_NS`] is
+//! active. A cgroup gets the part of the device that its weight gives among the active siblings,
+//! at each level of the tree. Its virtual time moves forward by the bytes of each charge divided
+//! by that part, and the virtual time of the device moves forward by the bytes. A cgroup whose
+//! virtual time is ahead of the device waits for the time that the device takes for the
+//! difference, so a cgroup with twice the weight gets twice the bytes. Linux does this with the
+//! iocost or BFQ scheduler.
 
-use crate::MAX;
+use crate::{CgId, MAX};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -25,6 +33,29 @@ const LIMIT_KEYS: [&str; 4] = ["rbps", "wbps", "riops", "wiops"];
 
 /// The nanoseconds in one second.
 const NS_PER_SEC: u128 = 1_000_000_000;
+
+/// A cgroup that did I/O on a device in this time in nanoseconds is active on the device.
+pub const ACTIVE_NS: u64 = 100_000_000;
+
+/// The bytes that a cgroup can be ahead of the device before it waits.
+const SLACK_BYTES: u64 = 256 << 10;
+
+/// The longest wait for `io.weight` for one charge, in nanoseconds.
+const WEIGHT_DELAY_MAX: u64 = 250_000_000;
+
+/// The unit of the part of a device that a cgroup gets: the whole device.
+pub const SHARE_UNIT: u64 = 1 << 16;
+
+/// The kind of an I/O.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    /// A read.
+    Read,
+    /// A write.
+    Write,
+    /// A discard. The limits of `io.max` count it as a write, as blk-throttle of Linux does.
+    Discard,
+}
 
 /// The major number of a device number, in the encoding of Linux.
 pub const fn major(dev: u64) -> u32 {
@@ -107,28 +138,27 @@ impl Default for Io {
 }
 
 impl Io {
-    /// Adds a charge of `bytes` bytes in `ios` bios to the device `dev` at the time `now`.
-    /// `write` tells a write from a read. With `limit`, the limits of `io.max` apply. Gives the
-    /// delay in nanoseconds that keeps the use under the limits.
-    pub fn charge(
-        &mut self,
-        dev: u64,
-        write: bool,
-        bytes: u64,
-        ios: u64,
-        now: u64,
-        limit: bool,
-    ) -> u64 {
+    /// Adds a charge of `bytes` bytes in `ios` bios of the kind `op` to the device `dev` at the
+    /// time `now`. With `limit`, the limits of `io.max` apply. Gives the delay in nanoseconds
+    /// that keeps the use under the limits.
+    pub fn charge(&mut self, dev: u64, op: Op, bytes: u64, ios: u64, now: u64, limit: bool) -> u64 {
         let s = self.stat.entry(dev).or_default();
-        if write {
-            s.wbytes += bytes;
-            s.wios += ios;
-        } else {
-            s.rbytes += bytes;
-            s.rios += ios;
+        match op {
+            Op::Read => {
+                s.rbytes += bytes;
+                s.rios += ios;
+            }
+            Op::Write => {
+                s.wbytes += bytes;
+                s.wios += ios;
+            }
+            Op::Discard => {
+                s.dbytes += bytes;
+                s.dios += ios;
+            }
         }
         let Some(&max) = self.max.get(&dev).filter(|_| limit) else { return 0 };
-        let w = usize::from(write);
+        let w = usize::from(op != Op::Read);
         let mut delay = 0;
         for (k, amount) in [(w, bytes), (2 + w, ios)] {
             if max[k] == MAX || amount == 0 {
@@ -141,6 +171,11 @@ impl Io {
             delay = delay.max(*next - now);
         }
         delay
+    }
+
+    /// The weight of `io.weight` for the device `dev`.
+    pub fn weight_of(&self, dev: u64) -> u32 {
+        self.weights.get(&dev).copied().unwrap_or(self.weight)
     }
 
     /// The text of `io.stat`: one line for each device with counts.
@@ -247,5 +282,55 @@ impl Io {
             }
         }
         Ok(())
+    }
+}
+
+/// The state of one device for the share of `io.weight`.
+#[derive(Clone, Debug, Default)]
+pub struct Share {
+    /// The virtual time of the device: the bytes that it did.
+    vtime: u64,
+    /// The bytes and the time in nanoseconds that the device took for them, for its speed. The
+    /// counts go down by half when the time passes a second, so the speed follows the device.
+    bytes: u64,
+    busy: u64,
+    /// The virtual time and the time of the last charge of each cgroup that does I/O.
+    cgroups: BTreeMap<CgId, (u64, u64)>,
+}
+
+impl Share {
+    /// The cgroups that did I/O on the device since `now - ACTIVE_NS`. Forgets the others.
+    pub fn active(&mut self, now: u64) -> alloc::vec::Vec<CgId> {
+        let since = now.saturating_sub(ACTIVE_NS);
+        self.cgroups.retain(|_, &mut (_, last)| last >= since);
+        self.cgroups.keys().copied().collect()
+    }
+
+    /// Adds a charge of `bytes` that took `ns` of the device to the cgroup `id`, which gets the
+    /// part `share` of the device, in units of [`SHARE_UNIT`]. Gives the time in nanoseconds
+    /// that the cgroup waits, so that it does not get more than its part.
+    pub fn charge(&mut self, id: CgId, bytes: u64, ns: u64, share: u64, now: u64) -> u64 {
+        self.bytes += bytes;
+        self.busy += ns;
+        if self.busy > 1_000_000_000 {
+            self.bytes /= 2;
+            self.busy /= 2;
+        }
+        let share = share.clamp(1, SHARE_UNIT);
+        let cost = u128::from(bytes) * u128::from(SHARE_UNIT) / u128::from(share);
+        let cost = u64::try_from(cost).unwrap_or(u64::MAX);
+        let vtime = self.vtime;
+        let entry = self.cgroups.entry(id).or_insert((vtime, now));
+        entry.0 = entry.0.max(vtime).saturating_add(cost);
+        entry.1 = now;
+        let ahead = entry.0;
+        self.vtime += bytes;
+        let lead = ahead.saturating_sub(self.vtime).saturating_sub(SLACK_BYTES);
+        if lead == 0 || self.bytes == 0 || self.busy == 0 {
+            return 0;
+        }
+        // The time that the device takes for the bytes of the lead, at its speed.
+        let delay = u128::from(lead) * u128::from(self.busy) / u128::from(self.bytes);
+        u64::try_from(delay).unwrap_or(u64::MAX).min(WEIGHT_DELAY_MAX)
     }
 }
