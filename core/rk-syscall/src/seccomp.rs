@@ -149,13 +149,18 @@ fn read_prog(cx: &Cx<'_>, addr: u64) -> Result<alloc::vec::Vec<bpf::Insn>, Errno
     if len == 0 || len > bpf::BPF_MAXINSNS {
         return Err(Errno::EINVAL);
     }
+    // A filter needs `CAP_SYS_ADMIN` or the no_new_privs bit, as `seccomp_prepare_filter` in
+    // kernel/seccomp.c of Linux.
+    if !cx.thread.no_new_privs() && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EACCES);
+    }
     let prog = bpf::from_bytes(&cx.read_bytes(u64::from_ne_bytes(ptr), len * INSN_SIZE)?);
     bpf::check(&prog)?;
     Ok(prog)
 }
 
-/// `SECCOMP_SET_MODE_FILTER`: adds a filter to the chain of the thread. All processes of rukernel
-/// run as root, thus the thread does not need the no_new_privs bit. With
+/// `SECCOMP_SET_MODE_FILTER`: adds a filter to the chain of the thread. The thread needs
+/// `CAP_SYS_ADMIN` or the no_new_privs bit. With
 /// `SECCOMP_FILTER_FLAG_TSYNC`, each other thread of the process gets the new chain. With
 /// `SECCOMP_FILTER_FLAG_NEW_LISTENER`, the call gives the descriptor of a new listener.
 fn set_mode_filter(cx: &Cx<'_>, flags: u64, uprog: u64) -> SysResult {

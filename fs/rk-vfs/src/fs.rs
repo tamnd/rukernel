@@ -183,6 +183,16 @@ impl FsContext {
         self.ns = ns;
     }
 
+    /// Puts the context in the mount name space `ns`, for `setns`. The root and the current
+    /// directory go to the root of `ns`, as `mntns_install` in fs/namespace.c of Linux. The
+    /// caller checked the capabilities.
+    pub fn set_namespace(&mut self, ns: Arc<MountNamespace>) {
+        let root = ns.root();
+        self.root = root.clone();
+        self.cwd = root;
+        self.ns = ns;
+    }
+
     /// `chroot`, without the check of `CAP_SYS_CHROOT`.
     pub fn chroot(&mut self, start: &Location, path: &[u8]) -> Result<()> {
         let at = self.resolve(start, path, true)?;

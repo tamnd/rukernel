@@ -3,7 +3,7 @@
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
 use alloc::vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::random::{GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM};
 use rk_abi::native::syscalls as nr;
@@ -308,9 +308,14 @@ pub(crate) fn clock_nanosleep(
     rem: u64,
 ) -> SysResult {
     let clock = clock as u32;
-    // A thread clock cannot wait, as in Linux. rukernel does not wait on the CPU clock of another
-    // process yet.
-    if matches!(clock, CLOCK_THREAD_CPUTIME_ID) || (clock as i32) < 0 {
+    // A thread clock cannot wait, as in Linux: `clock_thread` in kernel/time/posix-cpu-timers.c
+    // has no `nsleep`, so kernel/time/posix-timers.c gives `EOPNOTSUPP`, and `posix_cpu_nsleep`
+    // gives `EINVAL` for the clock ID of a thread. rukernel does not wait on the CPU clock of
+    // another process yet.
+    if clock == CLOCK_THREAD_CPUTIME_ID {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if (clock as i32) < 0 {
         return Err(Errno::EINVAL);
     }
     let now = clock_ns(cx.thread, clock)?;
@@ -380,11 +385,90 @@ fn utsname_field(s: &[u8]) -> [u8; 65] {
     f
 }
 
+/// The `UNAME26` flag of the personality, from include/uapi/linux/personality.h.
+const UNAME26: u32 = 0x002_0000;
+
+/// The release that `uname` gives. With `UNAME26`, the release is `2.6.x` with x = 60 + the
+/// second number of the version, as `override_release` in kernel/sys.c of Linux.
+fn release(personality: u32) -> alloc::vec::Vec<u8> {
+    let real = crate::UNAME_RELEASE;
+    if personality & UNAME26 == 0 {
+        return real.as_bytes().to_vec();
+    }
+    let mut dots = 0;
+    let rest = real
+        .find(|c: char| {
+            if c == '.' {
+                dots += 1;
+            }
+            dots >= 3 || !(c.is_ascii_digit() || c == '.')
+        })
+        .map_or("", |i| &real[i..]);
+    let minor: u32 = real.split('.').nth(1).and_then(|m| m.parse().ok()).unwrap_or(0);
+    alloc::format!("2.6.{}{rest}", minor + 60).into_bytes()
+}
+
+/// The magic numbers and the commands of `reboot`, from include/uapi/linux/reboot.h.
+const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
+const LINUX_REBOOT_MAGIC2: u32 = 672_274_793;
+const LINUX_REBOOT_MAGIC2A: u32 = 85_072_278;
+const LINUX_REBOOT_MAGIC2B: u32 = 369_367_448;
+const LINUX_REBOOT_MAGIC2C: u32 = 537_993_216;
+const LINUX_REBOOT_CMD_RESTART: u32 = 0x0123_4567;
+const LINUX_REBOOT_CMD_HALT: u32 = 0xcdef_0123;
+const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ab_cdef;
+const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0;
+const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_fedc;
+const LINUX_REBOOT_CMD_RESTART2: u32 = 0xa1b2_c3d4;
+
+/// Tells if Ctrl-Alt-Del restarts the machine at once, as `C_A_D` of Linux. rukernel has no
+/// keyboard handler for it yet, so only `reboot` reads and writes it.
+static CTRL_ALT_DEL: AtomicBool = AtomicBool::new(true);
+
+/// `reboot`, as kernel/reboot.c of Linux. The permission comes first, then the magic numbers,
+/// then the command. rukernel cannot restart the machine, so a restart stops it, as a halt and
+/// a power off do.
+pub(crate) fn reboot(cx: &Cx<'_>, magic1: u64, magic2: u64, cmd: u64) -> SysResult {
+    if !cx.process().cred().capable(cap::SYS_BOOT) {
+        return Err(Errno::EPERM);
+    }
+    let magic2 = magic2 as u32;
+    if magic1 as u32 != LINUX_REBOOT_MAGIC1
+        || ![LINUX_REBOOT_MAGIC2, LINUX_REBOOT_MAGIC2A, LINUX_REBOOT_MAGIC2B, LINUX_REBOOT_MAGIC2C]
+            .contains(&magic2)
+    {
+        return Err(Errno::EINVAL);
+    }
+    match cmd as u32 {
+        LINUX_REBOOT_CMD_CAD_ON => CTRL_ALT_DEL.store(true, Ordering::Relaxed),
+        LINUX_REBOOT_CMD_CAD_OFF => {
+            CTRL_ALT_DEL.store(false, Ordering::Relaxed);
+        }
+        LINUX_REBOOT_CMD_RESTART
+        | LINUX_REBOOT_CMD_RESTART2
+        | LINUX_REBOOT_CMD_HALT
+        | LINUX_REBOOT_CMD_POWER_OFF => rk_frame::arch::qemu_exit(0),
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(0)
+}
+
+/// `personality`, as kernel/exec_domain.c of Linux: sets the personality, except for
+/// `0xffffffff`, and gives the old one. Linux does not examine the value.
+pub(crate) fn personality(cx: &Cx<'_>, value: u64) -> SysResult {
+    let process = cx.process();
+    let old = process.personality();
+    if value as u32 != 0xffff_ffff {
+        process.set_personality(value as u32);
+    }
+    Ok(u64::from(old))
+}
+
 pub(crate) fn uname(cx: &Cx<'_>, buf: u64) -> SysResult {
     let u = NewUtsname {
         sysname: utsname_field(b"Linux"),
         nodename: rk_proc::uts::hostname(),
-        release: utsname_field(crate::UNAME_RELEASE.as_bytes()),
+        release: utsname_field(&release(cx.process().personality())),
         version: utsname_field(crate::UNAME_VERSION.as_bytes()),
         machine: utsname_field(rk_frame::arch::UNAME_MACHINE.as_bytes()),
         domainname: rk_proc::uts::domainname(),
@@ -512,13 +596,16 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
 
 pub(crate) fn getrusage(cx: &Cx<'_>, who: u64, buf: u64) -> SysResult {
     // `RUSAGE_SELF`, `RUSAGE_CHILDREN` and `RUSAGE_THREAD`.
-    let ticks = match who as i32 {
-        0 => cx.process().user_ticks(),
-        -1 => cx.process().child_ticks(),
-        1 => cx.thread.user_ticks(),
+    let process = cx.process();
+    let (ticks, maxrss) = match who as i32 {
+        0 => (process.user_ticks(), process.maxrss_kb()),
+        -1 => (process.child_ticks(), process.child_maxrss_kb()),
+        1 => (cx.thread.user_ticks(), process.maxrss_kb()),
         _ => return Err(Errno::EINVAL),
     };
-    cx.write_val(buf, &rusage(ticks))?;
+    let mut r = rusage(ticks);
+    r.ru_maxrss = maxrss as i64;
+    cx.write_val(buf, &r)?;
     Ok(0)
 }
 

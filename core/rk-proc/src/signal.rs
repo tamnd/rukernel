@@ -383,6 +383,16 @@ impl Pending {
         self.set
     }
 
+    /// The number of signals in the queue.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Tells if no signal is pending.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     /// Adds a signal. Gives `false` if the kernel discards it: a standard signal that is pending
     /// already, or a real time signal when the queue is full.
     pub fn push(&mut self, info: SigInfo) -> bool {

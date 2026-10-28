@@ -9,6 +9,7 @@ use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_abi::native::sched;
 use rk_frame::sync::Once;
 
 /// The magic number of nsfs, `NSFS_MAGIC` of `<linux/magic.h>`.
@@ -19,6 +20,18 @@ pub const NSFS_MAGIC: u64 = 0x6e73_6673;
 pub enum NsKind {
     /// A cgroup namespace.
     Cgroup,
+    /// An IPC namespace. rukernel has only the first one.
+    Ipc,
+    /// A mount namespace.
+    Mnt,
+    /// A PID namespace. rukernel has only the first one.
+    Pid,
+    /// A time namespace. rukernel has only the first one.
+    Time,
+    /// A user namespace. rukernel has only the first one.
+    User,
+    /// A UTS namespace. rukernel has only the first one.
+    Uts,
 }
 
 impl NsKind {
@@ -26,20 +39,38 @@ impl NsKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Cgroup => "cgroup",
+            Self::Ipc => "ipc",
+            Self::Mnt => "mnt",
+            Self::Pid => "pid",
+            Self::Time => "time",
+            Self::User => "user",
+            Self::Uts => "uts",
         }
     }
 
     /// The `CLONE_NEW*` flag of the kind, for the `nstype` of `setns`.
     pub fn clone_flag(self) -> u64 {
         match self {
-            Self::Cgroup => rk_abi::native::sched::CLONE_NEWCGROUP,
+            Self::Cgroup => sched::CLONE_NEWCGROUP,
+            Self::Ipc => sched::CLONE_NEWIPC,
+            Self::Mnt => sched::CLONE_NEWNS,
+            Self::Pid => sched::CLONE_NEWPID,
+            Self::Time => sched::CLONE_NEWTIME,
+            Self::User => sched::CLONE_NEWUSER,
+            Self::Uts => sched::CLONE_NEWUTS,
         }
     }
 
     /// The inode number of the first namespace of the kind, `PROC_*_INIT_INO` of Linux.
     fn init_ino(self) -> u64 {
         match self {
+            Self::Ipc => 0xEFFF_FFFF,
+            Self::Uts => 0xEFFF_FFFE,
+            Self::User => 0xEFFF_FFFD,
+            Self::Pid => 0xEFFF_FFFC,
             Self::Cgroup => 0xEFFF_FFFB,
+            Self::Time => 0xEFFF_FFFA,
+            Self::Mnt => 0xEFFF_FFF8,
         }
     }
 
@@ -47,6 +78,9 @@ impl NsKind {
     fn base(self) -> u64 {
         match self {
             Self::Cgroup => 0xF000_0000,
+            Self::Mnt => 0xF100_0000,
+            // The other kinds have only the first namespace.
+            _ => 0xF200_0000,
         }
     }
 }

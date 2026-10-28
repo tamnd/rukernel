@@ -432,6 +432,13 @@ pub(crate) fn sched_setaffinity(cx: &Cx<'_>, pid: u64, len: u64, mask: u64) -> S
     let mut raw = [0u8; MASK_SIZE];
     raw[..len].copy_from_slice(&cx.read_bytes(mask, len)?);
     let thread = affinity_target(cx, pid)?;
+    // Another user needs `CAP_SYS_NICE`, as `check_same_owner` in kernel/sched/syscalls.c of
+    // Linux.
+    let cred = cx.process().cred();
+    let target = thread.process().cred();
+    if cred.euid != target.euid && cred.euid != target.uid && !cred.capable(cap::SYS_NICE) {
+        return Err(Errno::EPERM);
+    }
     let affinity = u64::from_ne_bytes(raw) & online();
     if affinity == 0 {
         return Err(Errno::EINVAL);

@@ -41,12 +41,34 @@ const PR_GET_DUMPABLE: u64 = 3;
 const PR_SET_DUMPABLE: u64 = 4;
 const PR_SET_NAME: u64 = 15;
 const PR_GET_NAME: u64 = 16;
+/// The other `option` values, from include/uapi/linux/prctl.h of Linux.
+const PR_GET_TSC: u64 = 25;
+const PR_SET_TSC: u64 = 26;
+const PR_SET_TIMERSLACK: u64 = 29;
+const PR_GET_TIMERSLACK: u64 = 30;
+const PR_SET_THP_DISABLE: u64 = 41;
+const PR_GET_THP_DISABLE: u64 = 42;
+const PR_GET_SPECULATION_CTRL: u64 = 52;
+const PR_SET_SPECULATION_CTRL: u64 = 53;
+/// The `PR_SET_TSC` values: `rdtsc` works, or it gives `SIGSEGV`.
+const PR_TSC_ENABLE: u64 = 1;
+const PR_TSC_SIGSEGV: u64 = 2;
+/// The speculation features that `PR_GET_SPECULATION_CTRL` knows: `PR_SPEC_STORE_BYPASS`,
+/// `PR_SPEC_INDIRECT_BRANCH` and `PR_SPEC_L1D_FLUSH`.
+const PR_SPEC_L1D_FLUSH: u64 = 2;
+/// `PR_SPEC_NOT_AFFECTED` and `PR_SPEC_ENABLE`.
+const PR_SPEC_NOT_AFFECTED: u64 = 0;
+const PR_SPEC_ENABLE: u64 = 1 << 1;
 
 /// The `code` values of `arch_prctl`, from arch/x86/include/uapi/asm/prctl.h.
 #[cfg(target_arch = "x86_64")]
 const ARCH_SET_FS: u64 = 0x1002;
 #[cfg(target_arch = "x86_64")]
 const ARCH_GET_FS: u64 = 0x1003;
+#[cfg(target_arch = "x86_64")]
+const ARCH_GET_CPUID: u64 = 0x1011;
+#[cfg(target_arch = "x86_64")]
+const ARCH_SET_CPUID: u64 = 0x1012;
 
 /// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
 /// have yet. They give `EINVAL`, as Linux without the namespace type gives.
@@ -167,9 +189,10 @@ fn join_cgroup_ns(process: &Process, ns: u32) -> Result<(), Errno> {
 /// `setns`: joins the namespace of a file of `/proc/PID/ns`, or the namespaces of the process of
 /// a process file descriptor, as `setns` of `kernel/nsproxy.c` of Linux.
 ///
-/// The cgroup namespace is the only namespace that a process can change here. The other kinds
-/// that `unshare` cannot make are the same for each process, so a process file descriptor joins
-/// them with no change. A mount namespace through a process file descriptor gives `EINVAL`.
+/// A process can change its cgroup namespace, and its mount namespace through a file. The other
+/// kinds that `unshare` cannot make are the same for each process, so a join changes nothing, but
+/// it needs `CAP_SYS_ADMIN` as in Linux. A mount namespace through a process file descriptor gives
+/// `EINVAL`.
 pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     let file = cx.file(fd)?;
     let process = cx.process();
@@ -179,6 +202,7 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
         }
         match kind {
             rk_vfs::nsfs::NsKind::Cgroup => join_cgroup_ns(process, id)?,
+            kind => crate::ns::install(cx, process, kind, id)?,
         }
         return Ok(0);
     }
@@ -194,6 +218,11 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     }
     if target.is_zombie() {
         return Err(Errno::ESRCH);
+    }
+    // The caller is in the user namespace of the target already. A join of another kind needs
+    // `CAP_SYS_ADMIN`, as `validate_nsset` of Linux, and an error changes nothing.
+    if nstype & !CLONE_NEWUSER != 0 && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
     }
     if nstype & CLONE_NEWCGROUP != 0 {
         join_cgroup_ns(process, target.cgroup_ns())?;
@@ -319,17 +348,30 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if flags & CLONE_SETTLS != 0 {
         regs.set_tls(args.tls);
     }
-    if flags & CLONE_PARENT_SETTID != 0 {
-        cx.write_val(args.parent_tid, &tid)?;
-    }
-    if flags & CLONE_PIDFD != 0 {
-        let fd = crate::pidfd::open(cx, thread.process().clone(), 0)?;
-        cx.write_val(args.pidfd, &fd)?;
-    }
-    if flags & CLONE_CHILD_SETTID != 0
-        && let Some(vm) = thread.process().vm()
-    {
-        vm.write(args.child_tid as usize, &tid.to_ne_bytes())?;
+    // An error here ends the new thread before it runs, so that no child stays that never
+    // ends. A process file descriptor that the caller cannot get closes again, as
+    // `copy_process` in kernel/fork.c of Linux, which installs the descriptor after the write.
+    let setup = |cx: &mut Cx<'_>| -> Result<(), Errno> {
+        if flags & CLONE_PARENT_SETTID != 0 {
+            cx.write_val(args.parent_tid, &tid)?;
+        }
+        if flags & CLONE_PIDFD != 0 {
+            let fd = crate::pidfd::open(cx, thread.process().clone(), 0)?;
+            if let Err(e) = cx.write_val(args.pidfd, &fd) {
+                let _ = cx.files()?.lock().remove(fd);
+                return Err(e);
+            }
+        }
+        if flags & CLONE_CHILD_SETTID != 0
+            && let Some(vm) = thread.process().vm()
+        {
+            vm.write(args.child_tid as usize, &tid.to_ne_bytes())?;
+        }
+        Ok(())
+    };
+    if let Err(e) = setup(cx) {
+        rk_proc::exit_thread(&thread, WaitStatus::exited(0));
+        return Err(e);
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
         thread.set_clear_child_tid(args.child_tid as usize);
@@ -513,18 +555,31 @@ pub(crate) fn waitid(
         return Err(Errno::EINVAL);
     }
     let id = id as i32;
+    // A wait on a process file descriptor with `O_NONBLOCK` does not wait. It gives `EAGAIN` if
+    // no child changed, as `kernel_waitid` in kernel/exit.c of Linux.
+    let mut nonblock = false;
     let target = match idtype as u32 {
         P_ALL => WaitTarget::Any,
         P_PID if id > 0 => WaitTarget::Pid(id as Pid),
         P_PGID if id == 0 => WaitTarget::Pgid(cx.process().pgid()),
         P_PGID if id > 0 => WaitTarget::Pgid(id as Pid),
-        P_PIDFD => WaitTarget::Pid(crate::pidfd::process_of(cx, id as u32 as u64)?.pid()),
+        P_PIDFD => {
+            let fd = id as u32 as u64;
+            let pid = crate::pidfd::process_of(cx, fd)?.pid();
+            nonblock = options & WNOHANG == 0 && cx.file(fd)?.flags().nonblock();
+            WaitTarget::Pid(pid)
+        }
         _ => return Err(Errno::EINVAL),
     };
     // With `WNOHANG` and no child that changed, the fields are 0, as in Linux.
     let mut info = SigInfo::default();
     let mut ticks = 0;
-    if let Some(r) = wait_child(cx, target, options)? {
+    let options = if nonblock { options | WNOHANG } else { options };
+    let result = wait_child(cx, target, options)?;
+    if result.is_none() && nonblock {
+        return Err(Errno::EAGAIN);
+    }
+    if let Some(r) = result {
         let (code, value) = r.status.child_code();
         info = SigInfo::new(SIGCHLD, code, r.pid);
         info.uid = r.uid;
@@ -558,6 +613,10 @@ pub(crate) fn setpgid(cx: &Cx<'_>, pid: u64, pgid: u64) -> SysResult {
     if target.sid() != me.sid() {
         return Err(Errno::EPERM);
     }
+    // A child that ran `execve` keeps its group, as `PF_FORKNOEXEC` in kernel/sys.c of Linux.
+    if !Arc::ptr_eq(&target, me) && target.did_exec() {
+        return Err(Errno::EACCES);
+    }
     if target.sid() == target.pid() {
         return Err(Errno::EPERM);
     }
@@ -586,8 +645,9 @@ pub(crate) fn getsid(cx: &Cx<'_>, pid: u64) -> SysResult {
     Ok(u64::from(find(cx, pid)?.sid()))
 }
 
-pub(crate) fn prctl(cx: &Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
+pub(crate) fn prctl(cx: &mut Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
     let arg2 = args[0];
+    let [_, arg3, arg4, arg5] = args;
     match option {
         PR_SET_NAME => {
             let name = cx.vm()?.read_cstr(arg2 as usize, 16).or_else(|e| {
@@ -608,11 +668,65 @@ pub(crate) fn prctl(cx: &Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
             if arg2 > NSIG {
                 return Err(Errno::EINVAL);
             }
+            cx.process().set_pdeath_signal(arg2 as u32);
             Ok(0)
         }
         PR_GET_PDEATHSIG => {
-            cx.write_val(arg2, &0i32)?;
+            cx.write_val(arg2, &(cx.process().pdeath_signal() as i32))?;
             Ok(0)
+        }
+        // As `SET_TSC_CTL` and `GET_TSC_CTL` in arch/x86/kernel/process.c of Linux. The flag
+        // belongs to the thread, and a child of `fork` gets it with the registers.
+        PR_GET_TSC if cfg!(target_arch = "x86_64") => {
+            let value = if cx.regs.no_tsc() { PR_TSC_SIGSEGV } else { PR_TSC_ENABLE };
+            cx.write_val(arg2, &(value as i32))?;
+            Ok(0)
+        }
+        PR_SET_TSC if cfg!(target_arch = "x86_64") => match arg2 {
+            PR_TSC_ENABLE | PR_TSC_SIGSEGV => {
+                cx.regs.set_no_tsc(arg2 == PR_TSC_SIGSEGV);
+                Ok(0)
+            }
+            _ => Err(Errno::EINVAL),
+        },
+        // As kernel/sys.c of Linux: 0 sets the default slack again.
+        PR_SET_TIMERSLACK => {
+            cx.thread.set_timer_slack(arg2);
+            Ok(0)
+        }
+        PR_GET_TIMERSLACK => Ok(cx.thread.timer_slack()),
+        PR_GET_THP_DISABLE => {
+            if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(u64::from(cx.process().thp_disable()))
+        }
+        PR_SET_THP_DISABLE => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            cx.process().set_thp_disable(arg2 != 0);
+            Ok(0)
+        }
+        // As arch/x86/kernel/cpu/bugs.c of Linux on a CPU that is not affected: each known
+        // feature is `PR_SPEC_NOT_AFFECTED`, and only `PR_SPEC_ENABLE` can be set.
+        PR_GET_SPECULATION_CTRL => {
+            if arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if arg2 > PR_SPEC_L1D_FLUSH {
+                return Err(Errno::ENODEV);
+            }
+            Ok(PR_SPEC_NOT_AFFECTED)
+        }
+        PR_SET_SPECULATION_CTRL => {
+            if arg4 != 0 || arg5 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if arg2 > PR_SPEC_L1D_FLUSH {
+                return Err(Errno::ENODEV);
+            }
+            if arg3 == PR_SPEC_ENABLE { Ok(0) } else { Err(Errno::ENXIO) }
         }
         PR_GET_DUMPABLE => Ok(1),
         PR_SET_DUMPABLE => {
@@ -621,9 +735,12 @@ pub(crate) fn prctl(cx: &Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
             }
             Ok(0)
         }
-        _ => crate::cred::prctl(cx, option, args)
-            .or_else(|| crate::ksm::prctl(cx, option, args))
-            .unwrap_or_else(|| crate::seccomp::prctl(cx, option, args)),
+        _ => {
+            let cx = &*cx;
+            crate::cred::prctl(cx, option, args)
+                .or_else(|| crate::ksm::prctl(cx, option, args))
+                .unwrap_or_else(|| crate::seccomp::prctl(cx, option, args))
+        }
     }
 }
 
@@ -642,8 +759,46 @@ pub(crate) fn arch_prctl(cx: &mut Cx<'_>, code: u64, addr: u64) -> SysResult {
             cx.write_val(addr, &base)?;
             Ok(0)
         }
+        // rukernel does not use CPUID faulting, so CPUID is always on, as
+        // arch/x86/kernel/process.c of Linux on a CPU without `X86_FEATURE_CPUID_FAULT`.
+        ARCH_GET_CPUID => Ok(1),
+        ARCH_SET_CPUID => Err(Errno::ENODEV),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// The number of I/O ports, as `IO_BITMAP_BITS` in arch/x86/include/asm/processor.h of Linux.
+#[cfg(target_arch = "x86_64")]
+const IO_BITMAP_BITS: u64 = 65536;
+
+/// `ioperm`, as `ksys_ioperm` in arch/x86/kernel/ioport.c of Linux. The checks are those of
+/// Linux, but the kernel keeps no I/O bitmap: an `in` or `out` instruction still gives `SIGSEGV`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn ioperm(cx: &Cx<'_>, from: u64, num: u64, turn_on: u64) -> SysResult {
+    let end = from.checked_add(num).ok_or(Errno::EINVAL)?;
+    if end <= from || end > IO_BITMAP_BITS {
+        return Err(Errno::EINVAL);
+    }
+    if turn_on != 0 && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_RAWIO) {
+        return Err(Errno::EPERM);
+    }
+    Ok(0)
+}
+
+/// `iopl`, as `SYSCALL_DEFINE1(iopl)` in arch/x86/kernel/ioport.c of Linux. A higher level
+/// needs `CAP_SYS_RAWIO`. As in Linux, the level is not put in RFLAGS. The kernel keeps no I/O
+/// bitmap, so the level does not let the user code use the ports.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn iopl(cx: &Cx<'_>, level: u64) -> SysResult {
+    if level > 3 {
+        return Err(Errno::EINVAL);
+    }
+    let level = level as u32;
+    if level > cx.thread.iopl() && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_RAWIO) {
+        return Err(Errno::EPERM);
+    }
+    cx.thread.set_iopl(level);
+    Ok(0)
 }
 
 /// The `type` values of `kcmp`, from include/uapi/linux/kcmp.h.
@@ -652,6 +807,8 @@ const KCMP_VM: u64 = 1;
 const KCMP_FILES: u64 = 2;
 const KCMP_FS: u64 = 3;
 const KCMP_SIGHAND: u64 = 4;
+const KCMP_IO: u64 = 5;
+const KCMP_SYSVSEM: u64 = 6;
 
 /// Gives the result of `kcmp` for two kernel objects: 0 if they are the same object, else 1 or
 /// 2 in an order of the objects.
@@ -696,6 +853,16 @@ pub(crate) fn kcmp(pid1: u64, pid2: u64, kind: u64, idx1: u64, idx2: u64) -> Sys
         }
         // The signal actions belong to the process, so two processes do not share them.
         KCMP_SIGHAND => Ok(kcmp_order(Arc::as_ptr(&p1), Arc::as_ptr(&p2))),
+        // rukernel keeps no I/O context, so each task has the null context of Linux.
+        KCMP_IO => Ok(0),
+        // Each process has its own undo list, or none, as a null `undo_list` of Linux.
+        KCMP_SYSVSEM => {
+            match (crate::sem::has_undo(p1.pid() as i32), crate::sem::has_undo(p2.pid() as i32)) {
+                (false, false) => Ok(0),
+                _ if Arc::ptr_eq(&p1, &p2) => Ok(0),
+                _ => Ok(kcmp_order(Arc::as_ptr(&p1), Arc::as_ptr(&p2))),
+            }
+        }
         _ => Err(Errno::EINVAL),
     }
 }

@@ -325,7 +325,7 @@ pub(crate) fn signal_group(pgid: Pid, info: SigInfo) -> Result<(), Errno> {
 
 /// Checks that the caller can send `sig` to `target`, as `check_kill_permission` of Linux. A
 /// process in the same session can always send `SIGCONT`.
-fn may_signal(cx: &Cx<'_>, target: &Process, sig: u32) -> Result<(), Errno> {
+pub(crate) fn may_signal(cx: &Cx<'_>, target: &Process, sig: u32) -> Result<(), Errno> {
     let me = cx.process();
     if me.cred().may_kill(&target.cred()) || (sig == SIGCONT && me.sid() == target.sid()) {
         Ok(())
@@ -394,6 +394,27 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
 }
 
 /// Sends `sig` to the thread `tid`. If `tgid` is given, the thread must be in that process.
+/// Gives `EAGAIN` if a real time signal with the code `code` cannot go in a queue of `target`:
+/// the user of `target` has `RLIMIT_SIGPENDING` signals in queues already. This is as
+/// `__sigqueue_alloc` and `__send_signal_locked` in kernel/signal.c of Linux. `kill` (`SI_USER`)
+/// and a standard signal do not fail.
+fn check_queue(target: &Process, sig: u32, code: i32) -> Result<(), Errno> {
+    if sig < rk_abi::native::signal::SIGRTMIN || code == rk_proc::signal::SI_USER {
+        return Ok(());
+    }
+    let limit = target.limit(rk_proc::limits::RLIMIT_SIGPENDING).cur;
+    if limit == rk_proc::limits::RLIM_INFINITY {
+        return Ok(());
+    }
+    let uid = target.cred().uid;
+    let queued: usize = rk_proc::processes()
+        .iter()
+        .filter(|p| p.cred().uid == uid)
+        .map(|p| p.queued_signals())
+        .sum();
+    if queued as u64 >= limit { Err(Errno::EAGAIN) } else { Ok(()) }
+}
+
 fn signal_thread(cx: &Cx<'_>, tgid: Option<u64>, tid: u64, sig: u64) -> SysResult {
     if tid as i32 <= 0 || tgid.is_some_and(|g| g as i32 <= 0) {
         return Err(Errno::EINVAL);
@@ -407,6 +428,7 @@ fn signal_thread(cx: &Cx<'_>, tgid: Option<u64>, tid: u64, sig: u64) -> SysResul
     }
     may_signal(cx, thread.process(), sig as u32)?;
     if sig != 0 {
+        check_queue(thread.process(), sig as u32, SI_TKILL)?;
         let mut info = SigInfo::new(sig as u32, SI_TKILL, cx.process().pid());
         info.uid = cx.process().cred().uid;
         thread.send_signal(info);
@@ -497,6 +519,7 @@ pub(crate) fn rt_sigqueueinfo(cx: &Cx<'_>, tgid: u64, sig: u64, uinfo: u64) -> S
         .ok_or(Errno::ESRCH)?;
     may_signal(cx, &target, sig as u32)?;
     if sig != 0 {
+        check_queue(&target, sig as u32, info.code)?;
         rk_proc::send_signal(&target, info);
     }
     Ok(0)
@@ -518,6 +541,7 @@ pub(crate) fn rt_tgsigqueueinfo(
         .ok_or(Errno::ESRCH)?;
     may_signal(cx, thread.process(), sig as u32)?;
     if sig != 0 {
+        check_queue(thread.process(), sig as u32, info.code)?;
         thread.send_signal(info);
     }
     Ok(0)

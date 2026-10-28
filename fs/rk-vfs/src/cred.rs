@@ -99,12 +99,16 @@ pub mod cap {
     pub const IPC_LOCK: u32 = 14;
     /// Skip the permission checks of the System V IPC objects.
     pub const IPC_OWNER: u32 = 15;
+    /// Use the I/O ports, with `ioperm` and `iopl`.
+    pub const SYS_RAWIO: u32 = 17;
     /// Use `chroot`.
     pub const SYS_CHROOT: u32 = 18;
     /// Trace each process.
     pub const SYS_PTRACE: u32 = 19;
     /// Do the many administration operations.
     pub const SYS_ADMIN: u32 = 21;
+    /// Use `reboot`.
+    pub const SYS_BOOT: u32 = 22;
     /// Lower the nice value and change the priority of each process.
     pub const SYS_NICE: u32 = 23;
     /// Go past the resource limits.

@@ -349,7 +349,7 @@ pub(crate) fn io_submit(cx: &Cx<'_>, id: u64, nr: u64, iocbpp: u64) -> SysResult
             res2: 0,
         });
         if let Some(efd) = &item.resfd {
-            let _ = efd.write(&1u64.to_ne_bytes());
+            crate::eventfd::signal(efd);
         }
     }
     rk_vfs::wait::poll_wake();

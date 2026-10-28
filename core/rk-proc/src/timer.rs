@@ -11,10 +11,11 @@
 //! timers when it comes back to the kernel with `check_cpu_timers`.
 
 use crate::process::{Process, Thread};
-use crate::signal::SigInfo;
+use crate::signal::{SI_KERNEL, SigInfo};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use rk_abi::native::signal::{SIGKILL, SIGXCPU};
 use rk_frame::sync::{Once, SpinLock};
 use rk_frame::task::{TaskOptions, WaitQueue};
 use rk_frame::time::HZ;
@@ -96,6 +97,9 @@ struct TimerState {
     overrun: i32,
     /// The timer of `CLOCK_REALTIME` has an absolute time, so a clock set moves its time.
     abs: bool,
+    /// The intervals that ended before boot, for an absolute time before boot. The first signal
+    /// counts them as overruns.
+    late: u64,
 }
 
 /// A timer.
@@ -159,6 +163,18 @@ impl Timer {
     /// Sets the timer as `arm` does. With `abs`, a timer of `CLOCK_REALTIME` has an absolute time,
     /// and `clock_was_set` moves the time when the real time changes.
     pub fn arm_abs(self: &Arc<Self>, expires: u64, interval: u64, abs: bool) -> (u64, u64) {
+        self.arm_late(expires, interval, abs, 0)
+    }
+
+    /// Sets the timer as `arm_abs` does. `late` intervals ended before `expires`, so the first
+    /// signal counts them as overruns. This is for an absolute time before boot.
+    pub fn arm_late(
+        self: &Arc<Self>,
+        expires: u64,
+        interval: u64,
+        abs: bool,
+        late: u64,
+    ) -> (u64, u64) {
         if self.info.code == crate::signal::SI_TIMER {
             match &self.target {
                 Target::Process(p) => {
@@ -184,6 +200,7 @@ impl Timer {
         s.abs = abs && self.realtime;
         s.expires = expires;
         s.interval = if expires == 0 { 0 } else { interval };
+        s.late = if s.interval == 0 { 0 } else { late };
         if !matches!(self.clock, Clock::Boot) {
             if expires != 0 && !was_on {
                 let mut cpu = CPU_TIMERS.lock();
@@ -238,6 +255,7 @@ impl Timer {
             } else {
                 missed = (now - s.expires) / s.interval;
                 s.expires += (missed + 1) * s.interval;
+                missed = missed.saturating_add(core::mem::take(&mut s.late));
                 if key.is_some() {
                     let key = (s.expires, NEXT_KEY.fetch_add(1, Ordering::Relaxed));
                     s.key = Some(key);
@@ -247,7 +265,9 @@ impl Timer {
             missed
         };
         let mut info = self.info;
-        info.uid = u32::try_from(missed).unwrap_or(i32::MAX as u32);
+        // The count saturates at `INT_MAX`, as `timer_overrun_to_int` in
+        // kernel/time/posix-timers.c of Linux.
+        info.uid = missed.min(i32::MAX as u64) as u32;
         match &self.target {
             Target::Process(p) => {
                 if let Some(p) = p.upgrade() {
@@ -300,6 +320,30 @@ pub fn check_cpu_timers(thread: &Thread) {
         CPU_TIMERS.lock().iter().filter(|t| t.clock.follows(thread)).cloned().collect();
     for timer in timers {
         timer.fire(None, timer.now());
+    }
+}
+
+/// Sends `SIGXCPU` or `SIGKILL` when the CPU time of the process of `thread` reaches
+/// `RLIMIT_CPU`, as `check_process_timers` in kernel/time/posix-cpu-timers.c of Linux. At the
+/// hard limit the process gets `SIGKILL`. At the soft limit it gets `SIGXCPU`, and the soft
+/// limit moves one second up, so the next `SIGXCPU` comes one second later.
+pub fn check_cpu_limit(thread: &Thread) {
+    use crate::limits::{RLIM_INFINITY, RLIMIT_CPU};
+    let process = thread.process();
+    let mut limit = process.limit(RLIMIT_CPU);
+    if limit.cur == RLIM_INFINITY {
+        return;
+    }
+    let time = process.user_ticks() * TICK_NS;
+    let secs = |s: u64| s.saturating_mul(NSEC_PER_SEC);
+    if limit.max != RLIM_INFINITY && time >= secs(limit.max) {
+        crate::send_signal(process, SigInfo::new(SIGKILL, SI_KERNEL, 0));
+        return;
+    }
+    if time >= secs(limit.cur) {
+        crate::send_signal(process, SigInfo::new(SIGXCPU, SI_KERNEL, 0));
+        limit.cur += 1;
+        process.set_limit(RLIMIT_CPU, limit);
     }
 }
 

@@ -59,6 +59,34 @@ pub(crate) fn process_of(cx: &Cx<'_>, fd: u64) -> Result<Arc<Process>, Errno> {
     Ok(pidfd.process.clone())
 }
 
+/// The process of `fd` for `pidfd_send_signal`: a process file descriptor, or a directory
+/// `/proc/PID` of a process, as `pidfd_to_pid` and `tgid_pidfd_to_pid` of Linux.
+///
+/// # Errors
+///
+/// Gives `EBADF` for another file, and `ESRCH` if the process of the directory ended.
+fn signal_target_of(cx: &Cx<'_>, fd: u64) -> Result<Arc<Process>, Errno> {
+    /// `PROC_SUPER_MAGIC` of include/uapi/linux/magic.h.
+    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+    if let Ok(process) = process_of(cx, fd) {
+        return Ok(process);
+    }
+    let file = cx.file(fd)?;
+    let at = file.location().ok_or(Errno::EBADF)?;
+    let inode = at.inode();
+    let is_dir =
+        inode.metadata().mode & rk_vfs::inode::mode::S_IFMT == rk_vfs::inode::mode::S_IFDIR;
+    let in_root = at.dentry.parent().is_some_and(|p| Arc::ptr_eq(&p, at.mount.root()));
+    if inode.fs_magic() != PROC_SUPER_MAGIC || !is_dir || !in_root {
+        return Err(Errno::EBADF);
+    }
+    let pid: Pid = core::str::from_utf8(&at.dentry.name())
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .ok_or(Errno::EBADF)?;
+    rk_proc::find_process(pid).ok_or(Errno::ESRCH)
+}
+
 pub(crate) fn pidfd_open(cx: &Cx<'_>, pid: u64, flags: u64) -> SysResult {
     let flags = u32::try_from(flags).map_err(|_| Errno::EINVAL)?;
     let pid = pid as i32;
@@ -87,7 +115,7 @@ pub(crate) fn pidfd_send_signal(
     if flags != 0 || sig > u64::from(NSIG) {
         return Err(Errno::EINVAL);
     }
-    let process = process_of(cx, fd)?;
+    let process = signal_target_of(cx, fd)?;
     if process.is_zombie() {
         return Err(Errno::ESRCH);
     }
@@ -111,6 +139,8 @@ pub(crate) fn pidfd_send_signal(
         info.signo = sig as u32;
         info
     };
+    // The permission of `kill`, as `check_kill_permission` in kernel/signal.c of Linux.
+    crate::signal::may_signal(cx, &process, sig as u32)?;
     if sig != 0 {
         rk_proc::send_signal(&process, info);
     }
@@ -122,6 +152,11 @@ pub(crate) fn pidfd_getfd(cx: &Cx<'_>, fd: u64, target: u64, flags: u64) -> SysR
         return Err(Errno::EINVAL);
     }
     let process = process_of(cx, fd)?;
+    // The caller must be able to attach to the target, as `pidfd_getfd` in kernel/pid.c of
+    // Linux (`PTRACE_MODE_ATTACH_REALCREDS`).
+    if !Arc::ptr_eq(&process, cx.process()) && !cx.process().cred().may_ptrace(&process.cred()) {
+        return Err(Errno::EPERM);
+    }
     let files = process.files().ok_or(Errno::ESRCH)?;
     let file = files.lock().file(target as i32)?;
     Ok(cx.files()?.lock().insert(file, true)? as u64)

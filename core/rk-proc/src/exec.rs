@@ -362,6 +362,12 @@ pub fn exec(
     random: [u8; 16],
     release: fn(&Thread),
 ) -> Result<ExecImage, Errno> {
+    let mut args = args;
+    // A program gets at least one argument: an empty argument list gets an empty `argv[0]`, as
+    // `do_execveat_common` in fs/exec.c of Linux.
+    if args.argv.is_empty() {
+        args.argv.push(Vec::new());
+    }
     let process = thread.process();
     let fs = process.fs().ok_or(Errno::ESRCH)?;
     let mut ctx = fs.lock().clone();
@@ -389,6 +395,7 @@ pub fn exec(
     // The handlers are in the old program, so they go back to the default action. The mask and
     // the pending signals stay, as POSIX tells.
     process.reset_actions();
+    process.set_did_exec();
     // The POSIX timers go away, and the interval timers stay.
     process.timers().clear(true);
     thread.set_altstack(crate::signal::AltStack::default());

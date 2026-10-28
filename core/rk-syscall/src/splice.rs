@@ -8,7 +8,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::vec;
 use rk_abi::Errno;
 use rk_vfs::File;
-use rk_vfs::pipe::{PIPE_BUF, pipe_size, pipe_space};
+use rk_vfs::pipe::{PIPE_BUF, pipe_size, pipe_space, put_to_pipe, take_from_pipe};
 
 /// The most bytes of one call. Linux names it `MAX_RW_COUNT`.
 const MAX_RW_COUNT: usize = 0x7fff_f000;
@@ -17,6 +17,12 @@ const CHUNK: usize = 64 * 1024;
 /// The flags of `splice` that Linux knows: `SPLICE_F_MOVE`, `SPLICE_F_NONBLOCK`, `SPLICE_F_MORE`
 /// and `SPLICE_F_GIFT`.
 const SPLICE_F_ALL: u64 = 0xf;
+/// The `SPLICE_F_NONBLOCK` flag: a pipe that is not ready gives `EAGAIN`.
+const SPLICE_F_NONBLOCK: u64 = 0x2;
+/// The `O_NONBLOCK` flag of a file, which Linux adds as `SPLICE_F_NONBLOCK` for `tee`.
+fn nonblock(flags: u64, files: &[&File]) -> bool {
+    flags & SPLICE_F_NONBLOCK != 0 || files.iter().any(|f| f.flags().nonblock())
+}
 /// The largest advice of `fadvise64`: `POSIX_FADV_NOREUSE`.
 const POSIX_FADV_NOREUSE: u64 = 5;
 
@@ -175,6 +181,79 @@ pub(crate) fn splice(
         update_offset(cx, out_off, out_pos, n)?;
     }
     sigpipe(cx, done)
+}
+
+/// `tee`, as fs/splice.c of Linux: copies data from one pipe to another and leaves it in the
+/// first pipe.
+pub(crate) fn tee(cx: &Cx<'_>, in_fd: u64, out_fd: u64, len: u64, flags: u64) -> SysResult {
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let input = cx.file(in_fd)?;
+    let output = cx.file(out_fd)?;
+    if !input.flags().readable() || !output.flags().writable() {
+        return Err(Errno::EBADF);
+    }
+    if len == 0 {
+        return Ok(0);
+    }
+    let nb = nonblock(flags, &[&input, &output]);
+    let len = (len as usize).min(MAX_RW_COUNT);
+    sigpipe(cx, rk_vfs::pipe::tee(&input, &output, len, nb))
+}
+
+/// `vmsplice`, as fs/splice.c of Linux. For a file that writes, the call copies user memory into
+/// the pipe. Else it copies data of the pipe to user memory. A pipe that is not ready waits,
+/// except with `SPLICE_F_NONBLOCK` or `O_NONBLOCK`.
+pub(crate) fn vmsplice(cx: &Cx<'_>, fd: u64, iov: u64, nr_segs: u64, flags: u64) -> SysResult {
+    if flags & !SPLICE_F_ALL != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let file = cx.file(fd)?;
+    let (readable, writable) = (file.flags().readable(), file.flags().writable());
+    if !readable && !writable {
+        return Err(Errno::EBADF);
+    }
+    let iovecs = crate::fs::read_iovecs(cx, iov, nr_segs)?;
+    let total: u64 = iovecs.iter().map(|v| v.iov_len).sum();
+    if total == 0 {
+        return Ok(0);
+    }
+    let size = pipe_size(&file)?;
+    let nb = nonblock(flags, &[&file]);
+    let want = (total as usize).min(size).min(MAX_RW_COUNT);
+    if writable {
+        // Read only what the pipe can hold. A bad address after some bytes stops the copy.
+        let mut data = vec![];
+        for v in &iovecs {
+            let n = (v.iov_len as usize).min(want - data.len());
+            match cx.read_bytes(v.iov_base, n) {
+                Ok(b) => data.extend_from_slice(&b),
+                Err(e) if data.is_empty() => return Err(e),
+                Err(_) => break,
+            }
+            if data.len() == want {
+                break;
+            }
+        }
+        return sigpipe(cx, put_to_pipe(&file, &data, nb));
+    }
+    let data = take_from_pipe(&file, want, nb)?;
+    let mut done = 0;
+    for v in &iovecs {
+        if done == data.len() {
+            break;
+        }
+        let n = (v.iov_len as usize).min(data.len() - done);
+        if let Err(e) = cx.write_bytes(v.iov_base, &data[done..done + n]) {
+            if done == 0 {
+                return Err(e);
+            }
+            break;
+        }
+        done += n;
+    }
+    Ok(done as u64)
 }
 
 pub(crate) fn copy_file_range(

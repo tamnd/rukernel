@@ -23,7 +23,7 @@ use rk_frame::sync::SpinLock;
 use rk_mm::vma::Backing;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
 use rk_vfs::cred::{IpcOwner, cap};
-use rk_vfs::ipc::SHM_NEXT_ID;
+use rk_vfs::ipc::{SHM_NEXT_ID, SHMALL, SHMMAX, SHMMNI};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new segment.
@@ -52,11 +52,8 @@ const IPC_64: u32 = 0x100;
 const SHM_DEST: u16 = 0o1000;
 const SHM_LOCKED: u16 = 0o2000;
 
-/// The limits, as the defaults of Linux.
+/// The smallest size of a segment, as `SHMMIN` of Linux. The sysctl files have the other limits.
 const SHMMIN: u64 = 1;
-const SHMMAX: u64 = u64::MAX - (1 << 24);
-const SHMALL: u64 = u64::MAX - (1 << 24);
-const SHMMNI: u64 = 4096;
 
 /// The permissions of an IPC object, as `struct ipc64_perm` of x86-64.
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -240,10 +237,10 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
             return Err(Errno::ENOENT);
         }
     }
-    if !(SHMMIN..=SHMMAX).contains(&size) {
+    if !(SHMMIN..=SHMMAX.get()).contains(&size) {
         return Err(Errno::EINVAL);
     }
-    if table.segments.len() as u64 >= SHMMNI {
+    if table.segments.len() as u64 >= SHMMNI.get() as u64 {
         return Err(Errno::ENOSPC);
     }
     let next = table.next;
@@ -354,11 +351,11 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
     match cmd {
         IPC_INFO => {
             let info = ShmInfo64 {
-                shmmax: SHMMAX,
+                shmmax: SHMMAX.get(),
                 shmmin: SHMMIN,
-                shmmni: SHMMNI,
-                shmseg: SHMMNI,
-                shmall: SHMALL,
+                shmmni: SHMMNI.get() as u64,
+                shmseg: SHMMNI.get() as u64,
+                shmall: SHMALL.get(),
                 unused: [0; 4],
             };
             table.sweep();

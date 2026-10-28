@@ -213,9 +213,23 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
 }
 
 /// The directory `/proc/PID/ns`: a magic link for each namespace of the process that has a file,
-/// as `fs/proc/namespaces.c` of Linux. The link shows `cgroup:[INODE]`, and a walk goes to the
+/// as `fs/proc/namespaces.c` of Linux. The link shows `KIND:[INODE]`, and a walk goes to the
 /// file of the namespace, which `setns` takes.
 fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
+    use rk_vfs::nsfs::{NsInode, NsKind, link_text};
+    /// The entries: rukernel makes no PID or time namespace for the children, so the
+    /// `*_for_children` links name the namespace of the process.
+    const ENTRIES: [(&[u8], NsKind); 9] = [
+        (b"cgroup", NsKind::Cgroup),
+        (b"ipc", NsKind::Ipc),
+        (b"mnt", NsKind::Mnt),
+        (b"pid", NsKind::Pid),
+        (b"pid_for_children", NsKind::Pid),
+        (b"time", NsKind::Time),
+        (b"time_for_children", NsKind::Time),
+        (b"user", NsKind::User),
+        (b"uts", NsKind::Uts),
+    ];
     let path = join(base, b"ns");
     let path_ = path.clone();
     dir(
@@ -223,19 +237,22 @@ fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
         base,
         0o511,
         move || {
-            use rk_vfs::nsfs::{NsInode, NsKind, link_text};
-            let kind = NsKind::Cgroup;
-            let (p_, p_j) = (w.clone(), w.clone());
-            let link = jump_link(
-                &join(&path_, kind.name().as_bytes()),
-                0o777,
-                move || Ok(link_text(kind, alive(&p_)?.cgroup_ns())),
-                move || {
-                    let ns = alive(&p_j)?.cgroup_ns();
-                    Ok(rk_vfs::Location::detached(NsInode::new(kind, ns)))
-                },
-            );
-            Ok(alloc::vec![(kind.name().as_bytes().to_vec(), link)])
+            Ok(ENTRIES
+                .iter()
+                .map(|&(name, kind)| {
+                    let (p_, p_j) = (w.clone(), w.clone());
+                    let link = jump_link(
+                        &join(&path_, name),
+                        0o777,
+                        move || Ok(link_text(kind, rk_proc::ns::ns_id(&*alive(&p_)?, kind)?)),
+                        move || {
+                            let id = rk_proc::ns::ns_id(&*alive(&p_j)?, kind)?;
+                            Ok(rk_vfs::Location::detached(NsInode::new(kind, id)))
+                        },
+                    );
+                    (name.to_vec(), owned(&w, link))
+                })
+                .collect())
         },
         None,
     )
@@ -312,10 +329,15 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/inotify/max_queued_events", ""),
     ("fs/inotify/max_user_instances", ""),
     ("fs/inotify/max_user_watches", ""),
+    ("fs/pipe-max-size", ""),
+    // rukernel does not count the pipe pages of each user, so the limits only keep their text.
+    ("fs/pipe-user-pages-hard", "0"),
+    ("fs/pipe-user-pages-soft", "16384"),
     ("fs/protected_fifos", ""),
     ("fs/protected_hardlinks", ""),
     ("fs/protected_regular", ""),
     ("fs/protected_symlinks", ""),
+    ("kernel/core_pattern", "core"),
     ("kernel/domainname", ""),
     ("kernel/hostname", ""),
     ("kernel/keys/gc_delay", ""),
@@ -329,9 +351,15 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/overflowgid", "65534"),
     ("kernel/overflowuid", "65534"),
     ("kernel/pid_max", "4194304"),
+    // The console, default, smallest and boot log levels, as `console_printk` of Linux.
+    ("kernel/printk", "4\t4\t1\t7"),
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
     ("kernel/version", ""),
+    // The tag of an IPv4 device, which no part of the kernel reads.
+    ("net/ipv4/conf/all/tag", "0"),
+    ("net/ipv4/conf/default/tag", "0"),
+    ("net/ipv4/conf/lo/tag", "0"),
     ("net/ipv4/ping_group_range", ""),
     ("vm/dirty_background_bytes", "0"),
     ("vm/dirty_background_ratio", "10"),
@@ -420,6 +448,12 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some(t) = rk_vfs::ipc::sysctl(name) {
         return format!("{}\n", t.get()).into_bytes();
     }
+    if let Some(t) = rk_vfs::ipc::long_sysctl(name) {
+        return format!("{}\n", t.get()).into_bytes();
+    }
+    if name == "fs/pipe-max-size" {
+        return format!("{}\n", rk_vfs::pipe::PIPE_MAX_SIZE.load(Ordering::Relaxed)).into_bytes();
+    }
     if let Some((v, _)) = protected(name).or_else(|| key_limit(name)) {
         return format!("{}\n", v.load(Ordering::Relaxed)).into_bytes();
     }
@@ -454,6 +488,19 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
     if let Some(t) = rk_vfs::ipc::sysctl(name) {
         let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
         return t.set(text.trim().parse().map_err(|_| Errno::EINVAL)?);
+    }
+    if let Some(t) = rk_vfs::ipc::long_sysctl(name) {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        t.set(text.trim().parse().map_err(|_| Errno::EINVAL)?);
+        return Ok(());
+    }
+    // The size goes up to a power of two count of pages, as `proc_dopipe_max_size` of Linux.
+    if name == "fs/pipe-max-size" {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let n: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+        let size = rk_vfs::pipe::round_pipe_size(n as usize).ok_or(Errno::EINVAL)?;
+        rk_vfs::pipe::PIPE_MAX_SIZE.store(size, Ordering::Relaxed);
+        return Ok(());
     }
     // A value out of the range gives `EINVAL`, as `proc_dointvec_minmax` of Linux.
     if let Some((v, max)) = protected(name) {
@@ -1024,6 +1071,17 @@ fn fdinfo_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
     )
 }
 
+/// The thread of `timerslack_ns`: the thread `t`, or the main thread of the process `w`.
+fn slack_thread(w: &Weak<Process>, t: &Option<Weak<Thread>>) -> Result<Arc<Thread>> {
+    if let Some(t) = t {
+        return alive(t);
+    }
+    let p = alive(w)?;
+    let threads = p.threads();
+    let main = threads.iter().find(|t| t.tid() == p.pid()).or(threads.first());
+    main.cloned().ok_or(Errno::ESRCH)
+}
+
 /// The files of a process directory, from the process `w`. `t` is the thread of a directory in
 /// `task`, or `None` for the directory of the process.
 fn process_files(
@@ -1066,6 +1124,33 @@ fn process_files(
             move |data| {
                 let name = data.strip_suffix(b"\n").unwrap_or(data);
                 alive(&p2)?.set_comm(name);
+                Ok(())
+            },
+        ),
+    ));
+    // As `timerslack_ns` in fs/proc/base.c of Linux: the slack of the thread of the directory, or
+    // of the main thread. Another process needs `CAP_SYS_NICE` to change it, and 0 sets the
+    // default again.
+    let p_ = w.clone();
+    let t_ = t.clone();
+    let p2 = w.clone();
+    let t2 = t.clone();
+    out.push((
+        b"timerslack_ns".to_vec(),
+        rw_file(
+            &join(base, b"timerslack_ns"),
+            move || Ok(alloc::format!("{}\n", slack_thread(&p_, &t_)?.timer_slack()).into_bytes()),
+            move |data| {
+                let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+                let ns: u64 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+                let thread = slack_thread(&p2, &t2)?;
+                let me = rk_proc::current_thread().ok_or(Errno::EPERM)?;
+                if !Arc::ptr_eq(me.process(), thread.process())
+                    && !me.process().cred().capable(rk_vfs::cred::cap::SYS_NICE)
+                {
+                    return Err(Errno::EPERM);
+                }
+                thread.set_timer_slack(ns);
                 Ok(())
             },
         ),

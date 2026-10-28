@@ -106,6 +106,27 @@ impl FileOps for EventFd {
     fn event_count(&self) -> u64 {
         self.events.load(Ordering::Relaxed)
     }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+
+/// Adds 1 to the counter of the event file `file` for the kernel, as `eventfd_signal_mask` in
+/// fs/eventfd.c of Linux. The add does not wait: the counter stops at `u64::MAX`, and then a poll
+/// gives `POLLERR`. Another file gets a write of 1.
+pub(crate) fn signal(file: &File) {
+    let Some(efd) = file.ops().as_any().and_then(|a| a.downcast_ref::<EventFd>()) else {
+        let _ = file.write(&1u64.to_ne_bytes());
+        return;
+    };
+    {
+        let mut count = efd.count.lock();
+        if *count < u64::MAX {
+            *count += 1;
+        }
+    }
+    efd.wake();
 }
 
 pub(crate) fn eventfd2(cx: &Cx<'_>, count: u64, flags: u64) -> SysResult {
