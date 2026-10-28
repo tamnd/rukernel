@@ -164,6 +164,10 @@ pub struct Task {
     state: AtomicU8,
     /// The tick when the task last came on the CPU.
     start_tick: AtomicU64,
+    /// The clock in nanoseconds when the task last came on the CPU.
+    run_start: AtomicU64,
+    /// The nanoseconds on the CPU of the runs of the task that ended.
+    cpu_ns: AtomicU64,
     /// The tick of the last call to `Scheduler::should_yield` for the task, or `u64::MAX`.
     yield_tick: AtomicU64,
     /// A change of the task asks for a call to `Scheduler::should_yield` before the next tick.
@@ -338,6 +342,8 @@ impl TaskOptions {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             state: AtomicU8::new(RUNNABLE),
             start_tick: AtomicU64::new(0),
+            run_start: AtomicU64::new(0),
+            cpu_ns: AtomicU64::new(0),
             yield_tick: AtomicU64::new(u64::MAX),
             resched: AtomicBool::new(false),
             context: UnsafeCell::new(TaskContext::new(stack.top())),
@@ -366,6 +372,8 @@ impl Task {
             id,
             state: AtomicU8::new(state),
             start_tick: AtomicU64::new(crate::time::ticks()),
+            run_start: AtomicU64::new(crate::time::nanos()),
+            cpu_ns: AtomicU64::new(0),
             yield_tick: AtomicU64::new(u64::MAX),
             resched: AtomicBool::new(false),
             context: UnsafeCell::new(TaskContext::default()),
@@ -389,6 +397,17 @@ impl Task {
     /// The data of the scheduler for the task.
     pub fn sched_data(&self) -> &(dyn Any + Send + Sync) {
         &**self.sched.call_once(|| scheduler().new_data())
+    }
+
+    /// The nanoseconds that the task ran on a CPU, in user mode and in the kernel. The run of a
+    /// task on the CPU now counts up to now.
+    pub fn cpu_ns(&self) -> u64 {
+        let done = self.cpu_ns.load(Ordering::Relaxed);
+        if self.state.load(Ordering::Acquire) != RUNNING {
+            return done;
+        }
+        let start = self.run_start.load(Ordering::Relaxed);
+        done + crate::time::nanos().saturating_sub(start)
     }
 
     /// Tells if the task returned from its start function.
@@ -527,7 +546,13 @@ fn schedule() {
         scheduler().put_prev(&current, true);
     }
     let next = scheduler().dequeue().unwrap_or_else(idle_task);
+    let now = crate::time::nanos();
+    if state != IDLE {
+        let ran = now.saturating_sub(current.run_start.load(Ordering::Relaxed));
+        current.cpu_ns.fetch_add(ran, Ordering::Relaxed);
+    }
     if !next.is_idle() {
+        next.run_start.store(now, Ordering::Relaxed);
         next.state.store(RUNNING, Ordering::Release);
         next.start_tick.store(crate::time::ticks(), Ordering::Relaxed);
         scheduler().set_next(&next);
@@ -563,6 +588,8 @@ fn idle_task() -> Arc<Task> {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 state: AtomicU8::new(IDLE),
                 start_tick: AtomicU64::new(0),
+                run_start: AtomicU64::new(0),
+                cpu_ns: AtomicU64::new(0),
                 yield_tick: AtomicU64::new(u64::MAX),
                 resched: AtomicBool::new(false),
                 context: UnsafeCell::new(TaskContext::new(stack.top())),

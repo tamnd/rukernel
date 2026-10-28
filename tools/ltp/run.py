@@ -83,20 +83,27 @@ while IFS='	' read -r tag limit cmd; do
         echo "ltp-result: $tag missing"
         continue
     fi
-    rm -f /run-timeout
+    rm -f /run-timeout /run-pid
     cd /tmp
-    setsid sh -c "$cmd" </dev/null >/run-out 2>&1 &
-    pid=$!
     (
         trap 'kill $s 2>/dev/null; exit 0' TERM
         sleep $limit & s=$!
         wait $s
         echo > /run-timeout
-        kill -KILL -$pid 2>/dev/null
+        read p < /run-pid && kill -KILL -$p 2>/dev/null
     ) &
     dog=$!
-    wait $pid
+    # The test runs in the foreground. A command in the background of a shell without job control
+    # ignores SIGINT and SIGQUIT, and the children of the test keep this. Then kill11 waits
+    # forever for a child that ignores SIGQUIT. This shell (BusyBox ash as PID 1) also ignores
+    # SIGQUIT. The shell of the test forks the command, because `exit` comes after it, and the
+    # fork sets SIGQUIT back to the default. A command that the shell runs with exec keeps the
+    # ignored SIGQUIT. The session of the test has the number of its shell, which writes it to
+    # /run-pid.
+    setsid sh -c "echo \$\$ > /run-pid; $cmd; exit \$?" </dev/null >/run-out 2>&1
     code=$?
+    pid=
+    read pid < /run-pid 2>/dev/null
     # A test that stops early can leave the strict overcommit policy with a limit of 0, and then
     # this shell cannot fork. The shell writes the defaults back without a fork.
     echo 0 > /proc/sys/vm/overcommit_memory
@@ -104,7 +111,7 @@ while IFS='	' read -r tag limit cmd; do
     kill $dog 2>/dev/null
     wait $dog 2>/dev/null
     # The processes that the test left behind.
-    kill -KILL -$pid 2>/dev/null
+    [ -n "$pid" ] && kill -KILL -$pid 2>/dev/null
     cd /
     [ -e /run-timeout ] && code=timeout
     case $code in

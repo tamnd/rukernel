@@ -759,6 +759,7 @@ pub(super) fn wait_tracee(
                 uid: t.process.cred().uid,
                 status,
                 ticks: t.user_ticks(),
+                sys_ticks: t.sys_ticks(),
                 trapped: false,
             });
         }
@@ -774,12 +775,14 @@ pub(super) fn wait_tracee(
                     s.tracees.remove(i - 1);
                 }
                 let ticks = t.process.user_ticks() + t.process.child_ticks();
+                let sys_ticks = t.process.sys_ticks() + t.process.child_sys_ticks();
                 let uid = t.process.cred().uid;
                 return Found::Report(WaitResult {
                     pid: t.tid,
                     uid,
                     status,
                     ticks,
+                    sys_ticks,
                     trapped: false,
                 });
             }
@@ -795,6 +798,7 @@ pub(super) fn wait_tracee(
                 uid: t.process.cred().uid,
                 status,
                 ticks: t.user_ticks(),
+                sys_ticks: t.sys_ticks(),
                 trapped: true,
             });
         }

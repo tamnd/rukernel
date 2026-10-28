@@ -113,6 +113,8 @@ pub struct WaitResult {
     pub status: WaitStatus,
     /// The user CPU time in timer ticks.
     pub ticks: u64,
+    /// The system CPU time in timer ticks.
+    pub sys_ticks: u64,
     /// The status is a stop of a traced thread. `waitid` gives `CLD_TRAPPED` for it.
     pub trapped: bool,
 }

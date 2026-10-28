@@ -14,6 +14,10 @@ extern crate alloc;
 mod kernel;
 #[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod node;
+// The kernel uses all of the module, and the unit tests use a part of it.
+#[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg_attr(test, allow(dead_code))]
+mod procmap;
 pub mod text;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]

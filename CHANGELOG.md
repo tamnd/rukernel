@@ -9,6 +9,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The Unix 98 pseudo terminals: /dev/ptmx and the file system devpts, as drivers/tty/pty.c and fs/devpts/inode.c of Linux (#403). `ioctl` has `TIOCGPTN`, `TIOCSPTLCK`, `TIOCGPTLCK`, `TIOCPKT`, `TIOCGPKT`, `TIOCGETD`, `TIOCSETD` (only `N_TTY`) and the terminal commands (`TCGETS`, `TCGETA`, `TCSETS*`, `TCSETA*`, `TIOCGWINSZ`, `TIOCSWINSZ`, `FIONREAD` and others) on both sides of the pair. musl `openpty` works, and LTP ioctl01 passes.
 - `setsockopt` with `IPV6_ADDRFORM` changes a connected UDP socket of `AF_INET6` with an IPv4 peer into an `AF_INET` socket, as net/ipv6/ipv6_sockglue.c of Linux (#403).
 - EEVDF wakeup preemption, as `check_preempt_wakeup_fair` of Linux with `RUN_TO_PARITY` (#408). A task that wakes, or a new task, takes the CPU from the current task when the current task is not eligible or has used its slice, and the wakeup has an earlier deadline. A wakeup for another CPU sends a reschedule IPI to that CPU.
+- /proc/PID/pagemap gives the present bit, the file bit and, for a caller with `CAP_SYS_ADMIN`, the page frame number of each page, as fs/proc/task_mmu.c of Linux (#387). LTP mmap12 passes.
+- /proc/kpageflags gives `KPF_UPTODATE`, `KPF_LRU`, `KPF_MMAP` and `KPF_DIRTY` for the pages of mapped files (#387). `msync` of a shared file mapping makes the pages clean, and LTP msync04 uses this.
+- The ioctl `PROCMAP_QUERY` of /proc/PID/maps finds the area at an address or the next area, with the filters of the flags and the name of the area, as `do_procmap_query` of Linux (#387).
+- `statmount` gives `STATMOUNT_MNT_NS_ID` and takes `mnt_ns_id` to look at the mounts of another mount name space (#387).
 
 ### Fixed
 
@@ -22,6 +26,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `preadv2` and `pwritev2` with `RWF_NOWAIT` on a tmpfs file give `EOPNOTSUPP`, as Linux, where tmpfs does not set `FMODE_NOWAIT` (#408).
 - The free of a large kernel heap block sends one TLB shootdown for the range, not one for each page (#408).
 - The unit tests of the key service that walk all the keys no longer run at the same time as the tests that expect a key to go with its last reference. A walk holds each key for a short time, so `keyring_read_sizes` and `quota_and_drop` failed now and then (#407).
+- The kernel counts the system CPU time of each thread from the time on the CPU outside user mode (#387). `times`, `getrusage`, `wait4` and /proc/PID/stat give it, and LTP times03 passes.
+- `ru_maxrss` is the high-water mark of the resident pages (#387). Before, an `munmap` made it smaller.
+- exec maps the aligned segments of an ELF file as private mappings of the file, so /proc/PID/maps shows the path of the executable (#387).
+- tools/ltp runs each test in the foreground of the init shell, and the shell of the test forks the command, so the test does not keep the ignored `SIGQUIT` of BusyBox ash as PID 1 (#387). LTP kill11 passes now. Before, its child ignored `SIGQUIT` and the test hung.
 
 ## [0.4.7] - 2026-10-28
 

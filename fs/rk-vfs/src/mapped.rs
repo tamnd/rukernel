@@ -29,6 +29,12 @@ pub trait Mapped: Send + Sync {
     ///
     /// Gives the error of the write.
     fn sync(&self, start: u64, end: u64) -> Result<()>;
+
+    /// Tells if the frame at the physical address `phys` is a page of the file, and if a mapping
+    /// changed it after the last write back. Gives `None` if the frame is not a page of the file.
+    fn frame_dirty(&self, _phys: u64) -> Option<bool> {
+        None
+    }
 }
 
 /// The mapped files, by the address of the inode.
@@ -78,6 +84,15 @@ pub fn extend(inode: &InodeRef, size: u64) {
             pages.zero(old, size);
         }
     }
+}
+
+/// Tells if the frame at the physical address `phys` is a page of a mapped file, and if a mapping
+/// changed it after the last write back, for `/proc/kpageflags`. Gives `None` if the frame is not
+/// a page of a mapped file.
+pub fn frame_dirty(phys: u64) -> Option<bool> {
+    let files: alloc::vec::Vec<Arc<dyn Mapped>> =
+        MAPPED.lock().values().filter_map(Weak::upgrade).collect();
+    files.iter().find_map(|f| f.frame_dirty(phys))
 }
 
 /// Writes back the changed mapped pages of `inode` from `start` up to `end`, before a read.

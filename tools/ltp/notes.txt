@@ -23,6 +23,7 @@ mmapstress02	Grows the heap with sbrk. The musl libc of the LTP build gives ENOM
 mmapstress03	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress08	Uses sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
+sbrk01	sbrk(0) passes. The musl libc of the LTP build gives ENOMEM for sbrk with a size that is not 0, without a system call, so sbrk(8192) and sbrk(-8192) fail. The kernel brk is not the cause.
 overcommit_memory02	With -R 0 the commit limit is 0 (no swap), and the test then reads the sysctl back with fopen. musl malloc needs a new mmap for the FILE, which the strict policy refuses, so the test gives TBROK instead of the TCONF that it gives with glibc.
 vma02	Needs NUMA and mbind (#322) (TCONF).
 vma03	Needs mmap2, which only a 32 bit kernel has (TCONF on x86_64).
@@ -73,7 +74,6 @@ rt_sigaction01	The LTP helper gives sa_restorer from the old action of sigaction
 rt_sigprocmask01	The LTP helper gives sa_restorer from the old action of sigaction. musl does not give sa_restorer back, so the handler returns to a bad address. This fails on Linux with musl too.
 sigwaitinfo01	musl sigwaitinfo and sigtimedwait start the call again after EINTR, so the test of an empty set waits until the runner stops it. This fails on Linux with musl too.
 sigtimedwait01	musl sigwaitinfo and sigtimedwait start the call again after EINTR, so the test of an empty set waits until the runner stops it. This fails on Linux with musl too.
-kill11	The runner starts each test as a background job of busybox ash, which ignores SIGQUIT. The test does not reset SIGQUIT, so the child does not end and the test waits until the runner stops it.
 setgroups03	musl has NGROUPS_MAX 32, but Linux takes 65536 groups. The test expects EINVAL above NGROUPS_MAX + 1 and gets no error. This fails on Linux with musl too.
 sched_setscheduler04	sched_getscheduler and sched_getparam of musl give ENOSYS and do not call the kernel. This fails on Linux with musl too.
 clone08	The clone wrapper of musl gives EINVAL for CLONE_THREAD, CLONE_SETTLS and CLONE_CHILD_CLEARTID, and does not call the kernel. This fails on Linux with musl too.
@@ -82,12 +82,7 @@ clone09	The test needs CLONE_NEWNET. The network name space is the work of #372.
 ioctl_ns01	The test needs CLONE_NEWPID. rukernel has only the first PID name space.
 ioctl_ns05	The test needs CLONE_NEWPID. rukernel has only the first PID name space (TCONF).
 ioctl_ns06	The test needs CLONE_NEWUSER. rukernel has only the first user name space.
-mmap12	The test needs /proc/PID/pagemap, which rukernel does not have.
-msync04	The test needs /proc/PID/pagemap, which rukernel does not have.
-ioctl10	The test needs the PROCMAP_QUERY ioctl of /proc/PID/maps, which rukernel does not have.
 prctl09	The test sleeps 25 ms many times and checks the time with a small margin. Under QEMU without KVM on a busy host, a sleep can take up to 200 ms. It passes when the host is less busy.
-times03	rukernel does not count the system CPU time, so tms_stime stays 0.
-execve04	rukernel does not count the writers of an inode (i_writecount), so execve of a file that is open for write does not give ETXTBSY.
 hugemmap07	The test calls brk to set the break back. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the cleanup gives TBROK. The hugetlb part of the test passes.
 hugemmap24	The test puts its slice boundary above the heap, from malloc(1). musl malloc gives an mmap address near the top of user space, so each boundary is above TASK_SIZE and MAP_FIXED gives ENOMEM, as on Linux with musl. The test is for the slices of powerpc.
 hugemmap32	The test needs gigantic huge pages (1 GiB). rukernel has only 2 MiB huge pages (TCONF).

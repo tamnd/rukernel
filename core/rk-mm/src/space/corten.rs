@@ -289,7 +289,7 @@ impl AddressSpace {
             if vma.hugetlb && !vma.shared {
                 self.unreserve_private(vma.start, vma.end);
             }
-            self.vm.unmap_range(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
+            self.unmap_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
             if vma.account {
                 uncharge_commit(vma.len());
             }
