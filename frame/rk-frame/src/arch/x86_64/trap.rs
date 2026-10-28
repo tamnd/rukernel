@@ -15,6 +15,7 @@ pub(crate) const NMI: u8 = 2;
 pub(crate) const BREAKPOINT: u8 = 3;
 pub(crate) const OVERFLOW: u8 = 4;
 pub(crate) const INVALID_OPCODE: u8 = 6;
+pub(crate) const DEVICE_NOT_AVAILABLE: u8 = 7;
 pub(crate) const DOUBLE_FAULT: u8 = 8;
 pub(crate) const GENERAL_PROTECTION: u8 = 13;
 pub(crate) const PAGE_FAULT: u8 = 14;

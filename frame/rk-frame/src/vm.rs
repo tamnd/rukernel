@@ -81,6 +81,25 @@ pub enum MapError {
     NoMemory,
 }
 
+/// An area of the parent that `VmSpace::fork` copies to the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkArea {
+    /// The first address of the area. It is page aligned.
+    pub start: usize,
+    /// The end of the area. It is page aligned.
+    pub end: usize,
+    /// The area is shared, so both spaces keep the permissions of each page. A private area is
+    /// read only in both spaces, so the first write in either one copies the page.
+    pub shared: bool,
+}
+
+impl ForkArea {
+    /// The permissions of a page of the area after the fork, in both spaces.
+    fn prot(self, prot: PageProt) -> PageProt {
+        if self.shared { prot } else { PageProt { writable: false, ..prot } }
+    }
+}
+
 /// An access to user memory found a page that is not mapped, or a write found a page that is not
 /// writable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +136,8 @@ impl Inner {
 /// The page table of one user address space.
 pub struct VmSpace {
     inner: SpinLock<Inner>,
+    /// A copy of `Inner::root`, which does not change. `activate` reads it without the lock.
+    root: u64,
 }
 
 impl VmSpace {
@@ -124,7 +145,7 @@ impl VmSpace {
     pub fn new() -> Option<Self> {
         let root = paging::new_user_root()?;
         let inner = Inner { root, pages: BTreeMap::new(), huge: BTreeMap::new() };
-        Some(Self { inner: SpinLock::new(inner) })
+        Some(Self { inner: SpinLock::new(inner), root })
     }
 
     /// Maps `frame` at the user address `addr`.
@@ -256,6 +277,100 @@ impl VmSpace {
         true
     }
 
+    /// Makes the address space of a child of `fork` with the pages of this space in `areas`. The
+    /// areas are in address order and do not overlap. The child maps the same frames. A page of a
+    /// private area becomes read only in both spaces. A huge page that is all in one area stays a
+    /// huge page in both spaces. A huge page that is in part in an area stays whole in this space
+    /// if its permissions do not change, and the child maps its pages one by one.
+    ///
+    /// The copy works on one last level table at a time, and one TLB flush is for all the pages
+    /// of an area that become read only.
+    ///
+    /// # Errors
+    ///
+    /// Gives `MapError::NoMemory` if no frame is free for a page table.
+    pub fn fork(&self, areas: &[ForkArea]) -> Result<Self, MapError> {
+        let child = Self::new().ok_or(MapError::NoMemory)?;
+        let mut parent = self.inner.lock();
+        let mut c = child.inner.lock();
+        let root = parent.root;
+        // The huge pages first, so the pass over the 4 KiB pages below sees the splits.
+        let mut next = 0;
+        while let Some((&block, &(_, thp))) = parent.huge.range(next..).next() {
+            next = block + HUGE_PAGE_SIZE;
+            let Some((phys, prot)) = parent.pages.get(&block).map(|(f, p)| (f.addr().get(), *p))
+            else {
+                continue;
+            };
+            let i = areas.partition_point(|r| r.end <= block);
+            if let Some(&area) = areas.get(i).filter(|r| r.start <= block && next <= r.end) {
+                let ro = area.prot(prot);
+                if ro != PageProt::NONE {
+                    if ro != prot {
+                        for (_, (_, p)) in parent.pages.range_mut(block..next) {
+                            *p = ro;
+                        }
+                        paging::user_protect_huge(root, block, phys, ro.bits());
+                    }
+                    let table = paging::user_map_huge(c.root, block, phys, ro.bits())
+                        .map_err(|()| MapError::NoMemory)?;
+                    c.huge.insert(block, (table, thp));
+                    if thp {
+                        HUGE_MAPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+            }
+            // The pages of a private area become read only, and that splits the huge page.
+            let private = areas[i..].iter().take_while(|r| r.start < next).any(|r| !r.shared);
+            if prot.writable && private {
+                parent.split(block);
+            }
+        }
+        // The child gets the pages in the areas. A clone of the whole map makes no search for
+        // each page, and the pages outside the areas go after it.
+        let mut pages = parent.pages.clone();
+        let mut i = 0;
+        pages.retain(|&a, (_, prot)| {
+            while areas.get(i).is_some_and(|r| r.end <= a) {
+                i += 1;
+            }
+            match areas.get(i) {
+                Some(area) if area.start <= a => {
+                    *prot = area.prot(*prot);
+                    true
+                }
+                _ => false,
+            }
+        });
+        // The pages of the private areas become read only in this space. A page that is read only
+        // after an earlier fork needs no change.
+        for area in areas.iter().filter(|r| !r.shared) {
+            let ro = parent.pages.range_mut(area.start..area.end).filter(|(_, (_, p))| p.writable);
+            paging::user_protect_many(
+                root,
+                ro.map(|(&a, (f, p))| {
+                    p.writable = false;
+                    (a, f.addr().get(), p.bits())
+                }),
+            );
+        }
+        // The child maps the pages that are not in its huge pages.
+        let mut block = (usize::MAX, false);
+        let small = pages.iter().filter(|&(&a, _)| {
+            let b = a & !(HUGE_PAGE_SIZE - 1);
+            if block.0 != b {
+                block = (b, c.huge.contains_key(&b));
+            }
+            !block.1
+        });
+        paging::user_map_new(c.root, small.map(|(&a, (f, p))| (a, f.addr().get(), p.bits())))
+            .map_err(|()| MapError::NoMemory)?;
+        c.pages = pages;
+        drop(c);
+        Ok(child)
+    }
+
     /// Removes the pages in `start..end`. A huge page that is all in the range goes as one, and a
     /// huge page that is in part in the range is split first.
     pub fn unmap_range(&self, start: VirtAddr, end: VirtAddr) {
@@ -366,7 +481,7 @@ impl VmSpace {
 
     /// Loads this address space, so the user code of the process can run.
     pub fn activate(&self) {
-        paging::activate(self.inner.lock().root);
+        paging::activate(self.root);
     }
 
     /// Loads the kernel page table. No user address space is active after this.

@@ -84,6 +84,12 @@ pub trait Scheduler: Sync {
     fn put_prev(&self, _task: &Task, _sleeping: bool) {}
     /// The task comes on the CPU.
     fn set_next(&self, _task: &Task) {}
+    /// Tells if the current task `task` would run again at once after a yield, because no other
+    /// task waits for this CPU and the task can stay on it. `yield_now` then returns at once, as
+    /// `yield_task_fair` of Linux does when the queue has only the current task.
+    fn runs_alone(&self, _task: &Task) -> bool {
+        false
+    }
     /// Tells if the current task must give the CPU to another task. `ran` is the count of timer
     /// ticks since the task came on the CPU.
     fn should_yield(&self, _task: &Task, ran: u64) -> bool {
@@ -158,6 +164,10 @@ pub struct Task {
     state: AtomicU8,
     /// The tick when the task last came on the CPU.
     start_tick: AtomicU64,
+    /// The tick of the last call to `Scheduler::should_yield` for the task, or `u64::MAX`.
+    yield_tick: AtomicU64,
+    /// A change of the task asks for a call to `Scheduler::should_yield` before the next tick.
+    resched: AtomicBool,
     context: UnsafeCell<TaskContext>,
     entry: SpinLock<Option<Entry>>,
     data: Box<dyn Any + Send + Sync>,
@@ -284,6 +294,8 @@ impl TaskOptions {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             state: AtomicU8::new(RUNNABLE),
             start_tick: AtomicU64::new(0),
+            yield_tick: AtomicU64::new(u64::MAX),
+            resched: AtomicBool::new(false),
             context: UnsafeCell::new(TaskContext::new(stack.top())),
             entry: SpinLock::new(Some(self.entry)),
             data: self.data,
@@ -310,6 +322,8 @@ impl Task {
             id,
             state: AtomicU8::new(state),
             start_tick: AtomicU64::new(crate::time::ticks()),
+            yield_tick: AtomicU64::new(u64::MAX),
+            resched: AtomicBool::new(false),
             context: UnsafeCell::new(TaskContext::default()),
             entry: SpinLock::new(None),
             data: Box::new(()),
@@ -362,15 +376,30 @@ impl Task {
 }
 
 /// Tells if the current task ran for its time slice since it came on the CPU.
+///
+/// The scheduler looks at most one time in each timer tick, as the tick of Linux sets
+/// `TIF_NEED_RESCHED`, so a task that makes many system calls does not pay for the check each
+/// time. A change of the nice value, the CPUs or the group of the task makes it look again before
+/// the next tick.
 pub fn should_yield() -> bool {
+    let now = crate::time::ticks();
+    // The first check does not copy the `Arc` of the task.
+    let check = this_cpu().current.lock().as_ref().is_none_or(|current| {
+        current.yield_tick.swap(now, Ordering::Relaxed) != now
+            || current.resched.swap(false, Ordering::Relaxed)
+    });
+    if !check {
+        return false;
+    }
     let current = Task::current();
-    let ran = crate::time::ticks().wrapping_sub(current.start_tick.load(Ordering::Relaxed));
+    let ran = now.wrapping_sub(current.start_tick.load(Ordering::Relaxed));
     scheduler().should_yield(&current, ran)
 }
 
 /// Sets the share of the CPU of `task`. See `Scheduler::set_nice`.
 pub fn set_nice(task: &Task, nice: i32, idle: bool) {
     scheduler().set_nice(task, nice, idle);
+    task.resched.store(true, Ordering::Relaxed);
 }
 
 /// Sets the CPUs that `task` can use. See `Scheduler::set_affinity`.
@@ -378,17 +407,19 @@ pub fn set_affinity(task: &Task, mask: u64) {
     if let Some(id) = scheduler().set_affinity(task, mask) {
         kick(id);
     }
+    task.resched.store(true, Ordering::Relaxed);
 }
 
 /// Puts `task` in the group `group`. See `Scheduler::set_group`.
 pub fn set_group(task: &Task, group: u32) {
     scheduler().set_group(task, group);
+    task.resched.store(true, Ordering::Relaxed);
 }
 
 /// Lets the next task run. The current task stays runnable, so it runs again later.
 pub fn yield_now() {
     let current = Task::current();
-    if current.is_idle() {
+    if current.is_idle() || scheduler().runs_alone(&current) {
         return;
     }
     current.state.store(RUNNABLE, Ordering::Release);
@@ -474,6 +505,8 @@ fn idle_task() -> Arc<Task> {
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 state: AtomicU8::new(IDLE),
                 start_tick: AtomicU64::new(0),
+                yield_tick: AtomicU64::new(u64::MAX),
+                resched: AtomicBool::new(false),
                 context: UnsafeCell::new(TaskContext::new(stack.top())),
                 entry: SpinLock::new(Some(Box::new(|| idle_loop()))),
                 data: Box::new(()),

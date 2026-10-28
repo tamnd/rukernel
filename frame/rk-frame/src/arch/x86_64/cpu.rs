@@ -5,7 +5,7 @@
 //! user mode the GS base is 0, and the entry code changes it with `swapgs`. Rust code finds the
 //! number of the CPU at `%gs:24`, and the other values of the CPU by that number.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// The most CPUs that the kernel uses. A mask of the CPUs fits in a `u64`.
 pub(crate) const MAX_CPUS: usize = crate::cpu::MAX_CPUS;
@@ -29,6 +29,15 @@ pub(crate) struct Local {
     id: AtomicU64,
     /// The vector, the error code and CR2 of the last exception in user mode.
     pub(crate) exception: [AtomicU64; 3],
+    /// The value in the FS base MSR, or `u64::MAX` before the first write. `user::enter` writes
+    /// the MSR only when the value changes.
+    pub(crate) fs_base: AtomicU64,
+    /// The value of CR4.TSD.
+    pub(crate) tsd: AtomicBool,
+    /// The tag of the user FPU state in the registers of the CPU, or 0. See `user::FpuState`.
+    pub(crate) fpu_tag: AtomicU64,
+    /// The value of CR0.TS. See `user::enter`.
+    pub(crate) ts: AtomicBool,
 }
 
 static LOCALS: [Local; MAX_CPUS] = [const {
@@ -38,6 +47,10 @@ static LOCALS: [Local; MAX_CPUS] = [const {
         user_rsp: AtomicU64::new(0),
         id: AtomicU64::new(0),
         exception: [const { AtomicU64::new(0) }; 3],
+        fs_base: AtomicU64::new(u64::MAX),
+        tsd: AtomicBool::new(false),
+        fpu_tag: AtomicU64::new(0),
+        ts: AtomicBool::new(false),
     }
 }; MAX_CPUS];
 

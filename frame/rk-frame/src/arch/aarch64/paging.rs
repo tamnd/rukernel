@@ -578,6 +578,27 @@ pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
     }
 }
 
+/// Maps 4 KiB pages in `root` as `user_map` does. `pages` gives the address, the frame and the
+/// permissions of each page, in address order. `root` is a new address space, as the child of
+/// `fork`. Gives `Err` if no frame is free for a page table.
+pub(crate) fn user_map_new(
+    root: u64,
+    pages: impl Iterator<Item = (usize, u64, UserProt)>,
+) -> Result<(), ()> {
+    for (virt, phys, prot) in pages {
+        user_map(root, virt, phys, prot)?;
+    }
+    Ok(())
+}
+
+/// Changes the permissions of 4 KiB pages in `root` as `user_protect` does. `pages` gives the
+/// address, the frame and the new permissions of each page, in address order.
+pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u64, UserProt)>) {
+    for (virt, phys, prot) in pages {
+        user_protect(root, virt, phys, prot);
+    }
+}
+
 /// The size of a block at level 2.
 const BLOCK_SIZE: usize = 2 << 20;
 

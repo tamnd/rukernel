@@ -581,6 +581,12 @@ mod glue {
             }
         }
 
+        fn runs_alone(&self, task: &Task) -> bool {
+            let this = cpu::id();
+            balance::allows(data(task).affinity.load(Ordering::Relaxed), this)
+                && self.rqs[this].lock().queue.is_empty()
+        }
+
         fn should_yield(&self, task: &Task, _ran: u64) -> bool {
             let this = cpu::id();
             let (used, e) = charge(task);

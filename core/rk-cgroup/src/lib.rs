@@ -541,6 +541,9 @@ pub struct Hierarchy {
     nr_freeze: u32,
     /// A cgroup can have pages that it charged over `memory.high`, for `high_delay`.
     any_over_high: bool,
+    /// A cgroup had a quota in `cpu.max`. The value stays true after the quota goes away, so
+    /// it only tells that `throttled_until` must look.
+    any_quota: bool,
 }
 
 impl Hierarchy {
@@ -561,6 +564,7 @@ impl Hierarchy {
             notify: false,
             nr_freeze: 0,
             any_over_high: false,
+            any_quota: false,
         }
     }
 
@@ -1119,20 +1123,27 @@ impl Hierarchy {
     /// Adds `ns` of CPU time of a thread of `id` at the time `now` to `id` and the cgroups above
     /// it, and to their quotas.
     pub fn charge_cpu(&mut self, id: CgId, ns: u64, now: u64) {
-        for a in self.path_ids(id) {
-            let on = self.on(a, CPU);
-            let Some(n) = self.nodes.get_mut(&a) else { continue };
-            if on {
-                n.cpu.charge(ns, now);
-            } else {
-                n.cpu.usage += ns;
+        // The scheduler calls this often, so the walk up the tree does not make a `Vec`.
+        let mut at = id;
+        while let Some(parent) = self.nodes.get(&at).map(|n| n.parent) {
+            let on = self.on(at, CPU);
+            if let Some(n) = self.nodes.get_mut(&at) {
+                if on {
+                    n.cpu.charge(ns, now);
+                } else {
+                    n.cpu.usage += ns;
+                }
             }
+            at = parent;
         }
     }
 
     /// The time until which a thread of `id` must wait, because `id` or a cgroup above it used
     /// its quota of `cpu.max`. `None` if the thread can run.
     pub fn throttled_until(&mut self, id: CgId, now: u64) -> Option<u64> {
+        if !self.any_quota {
+            return None;
+        }
         let mut until = None;
         for a in self.path_ids(id) {
             if !self.on(a, CPU) {
@@ -1437,6 +1448,7 @@ impl Hierarchy {
                     return Err(Errno::EINVAL);
                 }
                 n.cpu.set_max(quota.map(|q| q * 1000), period * 1000, now);
+                self.any_quota |= quota.is_some();
                 Effect::None
             }
             "cpu.max.burst" => {
@@ -1656,6 +1668,10 @@ static ANY_FREEZE: AtomicBool = AtomicBool::new(false);
 /// A cgroup charged pages over its `memory.high`. The return to user mode looks at it first.
 static ANY_OVER_HIGH: AtomicBool = AtomicBool::new(false);
 
+/// A cgroup had a quota in `cpu.max`. The return to user mode looks at it first, so that it does
+/// not take the lock of the hierarchy when no cgroup has a quota.
+static ANY_QUOTA: AtomicBool = AtomicBool::new(false);
+
 /// The function that wakes the tasks in `poll`, after a change of a file with events.
 static NOTIFY: SpinLock<Option<fn()>> = SpinLock::new(None);
 
@@ -1675,6 +1691,7 @@ pub fn with<R>(f: impl FnOnce(&mut Hierarchy) -> R) -> R {
         h.refresh_events();
         ANY_FREEZE.store(h.any_freeze(), Ordering::Relaxed);
         ANY_OVER_HIGH.store(h.any_over_high, Ordering::Relaxed);
+        ANY_QUOTA.store(h.any_quota, Ordering::Relaxed);
         (r, h.take_notify())
     };
     if notify && let Some(f) = *NOTIFY.lock() {
@@ -1773,6 +1790,9 @@ pub fn charge_io(id: CgId, dev: u64, write: bool, bytes: u64, ios: u64) -> u64 {
 
 /// The time in nanoseconds until which a thread of `id` waits for its quota.
 pub fn throttled_until(id: CgId) -> Option<u64> {
+    if !ANY_QUOTA.load(Ordering::Relaxed) {
+        return None;
+    }
     let now = now();
     with(|h| h.throttled_until(id, now))
 }
@@ -1785,6 +1805,14 @@ pub fn weight_factor(id: CgId) -> u64 {
 /// Tells if `id` or a cgroup above it has `cgroup.freeze` 1, so its threads must freeze.
 pub fn frozen(id: CgId) -> bool {
     ANY_FREEZE.load(Ordering::Relaxed) && with(|h| h.frozen(id))
+}
+
+/// Tells if a cgroup has `cgroup.freeze` 1, charged pages over its `memory.high`, or had a quota
+/// in `cpu.max`. If not, `frozen`, `high_delay` and `throttled_until` give no wait.
+pub fn any_limit() -> bool {
+    ANY_FREEZE.load(Ordering::Relaxed)
+        || ANY_OVER_HIGH.load(Ordering::Relaxed)
+        || ANY_QUOTA.load(Ordering::Relaxed)
 }
 
 /// Changes the pressure counts of `id` with `f`.

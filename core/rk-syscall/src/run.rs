@@ -180,14 +180,13 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
             break process.group_exit().unwrap_or(WaitStatus::exited(0));
         }
         // A thread of a frozen cgroup, or of a cgroup without CPU quota, waits here.
-        rk_proc::cgroup::wait_frozen(thread);
-        rk_proc::cgroup::wait_throttled(thread);
+        rk_proc::cgroup::wait_limits(thread);
         if thread.is_killed() {
             break process.group_exit().unwrap_or(WaitStatus::exited(0));
         }
-        let Some(vm) = process.vm() else { break WaitStatus::exited(0) };
-        vm.activate();
-        drop(vm);
+        if !process.activate_vm() {
+            break WaitStatus::exited(0);
+        }
         // The number of a system call that can start again after a signal. `rt_sigreturn` puts
         // back the registers of the frame, so its return value is not a restart code.
         let mut syscall = None;
@@ -279,12 +278,7 @@ fn syscall_entry(thread: &Arc<Thread>, regs: &mut UserContext) -> Entry {
 /// gets `SIGTRAP` instead, because the trap flag stops it only after the next instruction, as
 /// `syscall_exit_work` of Linux does.
 fn syscall_exit(thread: &Arc<Thread>, regs: &mut UserContext, number: u64) {
-    thread.set_syscall_info(SyscallInfo {
-        nr: -1,
-        sp: regs.sp(),
-        pc: regs.pc(),
-        ..SyscallInfo::default()
-    });
+    thread.set_syscall_exit(regs.sp(), regs.pc());
     if thread.single_stepping() {
         thread.send_signal(SigInfo::fault(SIGTRAP, TRAP_BRKPT, regs.pc()));
     } else if thread.syscall_traced() {
