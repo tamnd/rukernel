@@ -200,10 +200,10 @@ fn pseudo_terminal_pair() {
     assert_eq!(slave.ioctl(&sf, TCGETS, BASE, &mem), Err(Errno::EIO));
 }
 
-/// The process of the hook of `set_caller_hook` in the tests: the process ID, the process group
-/// and the session.
-static CALLER: [core::sync::atomic::AtomicU32; 3] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 3];
+/// The process of the hook of `set_caller_hook` in the tests: the process ID, the process group,
+/// the session, and 1 if the process left its controlling terminal.
+static CALLER: [core::sync::atomic::AtomicU32; 4] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 4];
 
 fn test_caller() -> crate::Caller {
     use core::sync::atomic::Ordering::Relaxed;
@@ -211,14 +211,33 @@ fn test_caller() -> crate::Caller {
         pid: CALLER[0].load(Relaxed),
         pgid: CALLER[1].load(Relaxed),
         sid: CALLER[2].load(Relaxed),
+        no_ctty: CALLER[3].load(Relaxed) != 0,
     }
 }
 
 fn set_caller(pid: u32, pgid: u32, sid: u32) {
     use core::sync::atomic::Ordering::Relaxed;
-    for (a, v) in CALLER.iter().zip([pid, pgid, sid]) {
+    for (a, v) in CALLER.iter().zip([pid, pgid, sid, 0]) {
         a.store(v, Relaxed);
     }
+}
+
+/// The signals of the hook `signal_leader` in the tests: the session and the signal.
+static LEADER_SIGNALS: rk_frame::sync::SpinLock<Vec<(u32, u32)>> =
+    rk_frame::sync::SpinLock::new(Vec::new());
+
+/// The hooks of the sessions in the tests. The groups 920 and 921 are in the session 920, and the
+/// group 950 is in the session 950. No process has another group.
+fn set_test_session_hooks() {
+    crate::set_session_hooks(crate::SessionHooks {
+        signal_leader: |sid, sig| LEADER_SIGNALS.lock().push((sid, sig)),
+        pgrp_session: |pgrp| match pgrp {
+            920 | 921 => Some(920),
+            950 => Some(950),
+            _ => None,
+        },
+        leave_ctty: || CALLER[3].store(1, core::sync::atomic::Ordering::Relaxed),
+    });
 }
 
 #[test]
@@ -269,8 +288,11 @@ fn pseudo_terminal_hang_up() {
 fn pseudo_terminal_controlling_terminal() {
     use crate::pty::{open_ptmx, open_slave, test_instance};
     use rk_abi::Errno;
-    use rk_abi::native::ioctls::{TIOCGPGRP, TIOCGSID, TIOCNOTTY, TIOCSCTTY, TIOCSPTLCK};
+    use rk_abi::native::ioctls::{
+        TIOCGPGRP, TIOCGSID, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK, TIOCVHANGUP,
+    };
     use rk_abi::native::open::{O_NOCTTY, O_NONBLOCK};
+    use rk_abi::native::signal::{SIGCONT, SIGHUP};
     use rk_vfs::File;
 
     crate::set_caller_hook(test_caller);
@@ -319,6 +341,52 @@ fn pseudo_terminal_controlling_terminal() {
     crate::session_leader_exit(910);
     assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
     drop(other);
+
+    // `TIOCSPGRP` needs the slave as the controlling terminal of the caller and a group of the
+    // session of the caller, as `tiocspgrp` of Linux. The master sets the group of the slave.
+    set_test_session_hooks();
+    set_caller(920, 920, 920);
+    mem.set_int(920);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ENOTTY));
+    assert_eq!(slave.ioctl(&sf, TIOCSCTTY, 0, &mem), Ok(0));
+    mem.set_int(921);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCGPGRP, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), 921);
+    for (pgrp, err) in [(950, Errno::EPERM), (999, Errno::ESRCH), (-1, Errno::EINVAL)] {
+        mem.set_int(pgrp);
+        assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(err));
+    }
+    mem.set_int(920);
+    assert_eq!(master.ioctl(&mf, TIOCSPGRP, BASE, &mem), Ok(0));
+    set_caller(930, 930, 930);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ENOTTY));
+
+    // `TIOCNOTTY` from a process that is not the session leader: the process leaves the slave,
+    // and the slave stays with the session.
+    set_caller(922, 921, 920);
+    assert_eq!(slave.ioctl(&sf, TIOCNOTTY, 0, &mem), Ok(0));
+    assert_eq!(CALLER[3].load(core::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Err(Errno::ENOTTY));
+    assert_eq!(slave.ioctl(&sf, TIOCNOTTY, 0, &mem), Err(Errno::ENOTTY));
+    set_caller(920, 920, 920);
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), 920);
+
+    // A hang up of the slave sends `SIGHUP` and `SIGCONT` to the session leader, as
+    // `tty_signal_session_leader` of Linux, and the slave has no session after it.
+    LEADER_SIGNALS.lock().retain(|&(sid, _)| sid != 920);
+    assert_eq!(slave.ioctl(&sf, TIOCVHANGUP, 0, &mem), Ok(0));
+    let sent = |sid: u32| LEADER_SIGNALS.lock().iter().filter(|s| s.0 == sid).count();
+    assert_eq!(*LEADER_SIGNALS.lock(), [(920, SIGHUP), (920, SIGCONT)]);
+    drop((sf, slave));
+    // The close of the master hangs up the slave too.
+    let slave = open_slave(&root, 0, 0).unwrap();
+    let sf = File::with_ops(slave.clone(), None, O_NONBLOCK);
+    assert_eq!(slave.ioctl(&sf, TIOCGSID, BASE, &mem), Ok(0));
+    drop((mf, master));
+    assert_eq!(sent(920), 4);
+    assert_eq!(slave.read(&sf, &mut [0u8; 4]), Ok(0));
     set_caller(0, 0, 0);
 }
 
@@ -342,4 +410,14 @@ fn devpts_options() {
     assert_eq!(open_ptmx(&root).err(), Some(Errno::ENOSPC));
     drop(first);
     assert!(open_ptmx(&root).is_ok());
+
+    // devpts has its own magic number, and only the kernel makes and removes its files.
+    assert_eq!(root.fs_magic(), crate::pty::DEVPTS_SUPER_MAGIC);
+    let dev = rk_vfs::FileType::CharDevice;
+    assert_eq!(root.create(b"x", dev, 0o600, 0).err(), Some(Errno::EPERM));
+    assert_eq!(root.create(b"d", rk_vfs::FileType::Directory, 0o755, 0).err(), Some(Errno::EPERM));
+    assert_eq!(root.symlink(b"s", b"ptmx").err(), Some(Errno::EPERM));
+    assert_eq!(root.unlink(b"ptmx"), Err(Errno::EPERM));
+    assert_eq!(root.tmpfile(0o600).err(), Some(Errno::EOPNOTSUPP));
+    assert!(root.lookup(b"ptmx").is_ok());
 }

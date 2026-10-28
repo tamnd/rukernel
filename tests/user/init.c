@@ -541,6 +541,90 @@ static void test_devices(void)
 	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
+static volatile sig_atomic_t pty_hups, pty_conts;
+
+static void pty_on_signal(int sig)
+{
+	if (sig == SIGHUP)
+		pty_hups++;
+	else
+		pty_conts++;
+}
+
+/* Opens a new pty pair: gives the master, and the path of the slave in name. */
+static int pty_open_pair(char *name, size_t size)
+{
+	int lock = 0, n = -1;
+	int m = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+	if (m < 0 || ioctl(m, TIOCSPTLCK, &lock) != 0 || ioctl(m, TIOCGPTN, &n) != 0)
+		return -1;
+	snprintf(name, size, "/dev/pts/%d", n);
+	return m;
+}
+
+/*
+ * The session checks of #433, in a new session with the slave name as its controlling terminal.
+ * Gives 0, or the number of the check that failed.
+ */
+static int pty_session_child(const char *name)
+{
+	pid_t sid = 0, pgrp;
+	if (setsid() != getpid())
+		return 1;
+	/* /dev/tty gives ENXIO without a controlling terminal, as tty_open_current_tty. */
+	if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO)
+		return 2;
+	int t = open(name, O_RDWR);
+	if (t < 0 || ioctl(t, TIOCGSID, &sid) != 0 || sid != getpid())
+		return 3;
+	/* TIOCSPGRP checks the group, as tiocspgrp: EPERM for another session, ESRCH for no group. */
+	pgrp = getpid();
+	if (ioctl(t, TIOCSPGRP, &pgrp) != 0)
+		return 4;
+	pgrp = 1;
+	if (ioctl(t, TIOCSPGRP, &pgrp) != -1 || errno != EPERM)
+		return 5;
+	pgrp = 0x3fffff;
+	if (ioctl(t, TIOCSPGRP, &pgrp) != -1 || errno != ESRCH)
+		return 6;
+	/* TIOCNOTTY of a process that is not the leader drops its controlling terminal only. */
+	pid_t pid = fork();
+	if (pid == 0) {
+		if (ioctl(t, TIOCNOTTY) != 0)
+			_exit(1);
+		if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO)
+			_exit(2);
+		pgrp = getpgrp();
+		if (ioctl(t, TIOCSPGRP, &pgrp) != -1 || errno != ENOTTY)
+			_exit(3);
+		_exit(0);
+	}
+	int status = -1;
+	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return 10 + (WIFEXITED(status) ? WEXITSTATUS(status) : 9);
+	if (ioctl(t, TIOCGSID, &sid) != 0 || sid != getpid())
+		return 7;
+	/* A hang up of the slave sends SIGHUP and SIGCONT to the session leader. */
+	signal(SIGHUP, pty_on_signal);
+	signal(SIGCONT, pty_on_signal);
+	if (ioctl(t, TIOCVHANGUP, 0) != 0 || pty_hups != 1 || pty_conts != 1)
+		return 20;
+	if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO)
+		return 21;
+	/* The close of the master hangs up the slave too, as pty_close. */
+	char other[32];
+	int m = pty_open_pair(other, sizeof(other));
+	int u = m < 0 ? -1 : open(other, O_RDWR);
+	if (u < 0 || ioctl(u, TIOCGSID, &sid) != 0 || sid != getpid())
+		return 22;
+	close(m);
+	if (pty_hups != 2 || pty_conts != 2)
+		return 23;
+	if (read(u, &sid, 1) != 0)
+		return 24;
+	return 0;
+}
+
 /* The pseudo terminals: /dev/ptmx and devpts, as musl openpty does it (#403). */
 static void test_pty(void)
 {
@@ -595,6 +679,56 @@ static void test_pty(void)
 	}
 	int status = -1;
 	check("open of a pty slave sets the controlling terminal", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/* The session rules of #433: ENXIO, TIOCSPGRP, TIOCNOTTY and the hang up signals. */
+	pid = fork();
+	if (pid == 0)
+		_exit(pty_session_child(name));
+	status = -1;
+	if (pid > 0)
+		waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("pty session child: status %#x\n", status);
+	check("pty session: ENXIO, TIOCSPGRP, TIOCNOTTY, SIGHUP and SIGCONT", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/* devpts has its own magic, and mknod in it fails, as Linux (#433). */
+	struct statfs sfs;
+	check("statfs of devpts gives DEVPTS_SUPER_MAGIC", statfs("/dev/pts", &sfs) == 0 && sfs.f_type == 0x1cd1);
+	check("mknod in devpts gives EPERM", mknod("/dev/pts/x", S_IFCHR | 0600, makedev(1, 3)) == -1 && errno == EPERM);
+	check("mkdir in devpts gives EPERM", mkdir("/dev/pts/d", 0755) == -1 && errno == EPERM);
+	check("unlink in devpts gives EPERM", unlink("/dev/pts/ptmx") == -1 && errno == EPERM);
+	/* A bind mount of /dev/pts/ptmx on /dev/ptmx finds devpts for TIOCGPTPEER, as devpts_mntget (#433). */
+	check("bind mount /dev/pts/ptmx on /dev/ptmx", mount("/dev/pts/ptmx", "/dev/ptmx", NULL, MS_BIND, NULL) == 0);
+	char bname[32];
+	int bm = pty_open_pair(bname, sizeof(bname));
+	struct stat pts;
+	p = bm < 0 ? -1 : ioctl(bm, TIOCGPTPEER, O_RDWR | O_NOCTTY);
+	check("TIOCGPTPEER through a bind mount of ptmx", p >= 0 && fstat(p, &ps) == 0 && stat(bname, &ss) == 0 && stat("/dev/pts", &pts) == 0 && ps.st_rdev == ss.st_rdev && ps.st_dev == pts.st_dev);
+	close(p);
+	close(bm);
+	umount("/dev/ptmx");
+	/* The console: /dev/console never sets the controlling terminal, and TIOCNOTTY of a
+	 * process that is not the leader drops it (#433). */
+	pid = fork();
+	if (pid == 0) {
+		int con = open("/dev/console", O_RDWR | O_NOCTTY);
+		if (con < 0 || ioctl(con, TIOCSCTTY, 0) != -1 || errno != EPERM)
+			_exit(1);
+		if (ioctl(con, TIOCNOTTY) != 0 || open("/dev/tty", O_RDWR) != -1 || errno != ENXIO)
+			_exit(2);
+		if (ioctl(con, TIOCGPGRP, &n) != -1 || errno != ENOTTY)
+			_exit(3);
+		if (setsid() != getpid())
+			_exit(4);
+		int c2 = open("/dev/console", O_RDWR);
+		if (c2 < 0 || open("/dev/tty", O_RDWR) != -1 || errno != ENXIO)
+			_exit(5);
+		if (ioctl(c2, TIOCSCTTY, 0) != -1 || errno != EPERM)
+			_exit(6);
+		_exit(0);
+	}
+	status = -1;
+	if (pid > 0)
+		waitpid(pid, &status, 0);
+	check("console: TIOCSCTTY, TIOCNOTTY and /dev/tty", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	/* TIOCVHANGUP hangs up the open files of the slave (#413). */
 	int h = open(name, O_RDWR | O_NOCTTY);
 	check("TIOCVHANGUP on the pty slave", h >= 0 && ioctl(h, TIOCVHANGUP, 0) == 0);

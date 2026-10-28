@@ -59,6 +59,7 @@ The results are:
 | [mm](mm.md) | 74 | 35 | 15 | 22 | 2 | 0 | 0 | 0 | 0 |
 | [sched](sched.md) | 14 | 5 | 2 | 3 | 3 | 0 | 0 | 1 | 0 |
 | [net](net.md) | 356 | 5 | 47 | 212 | 0 | 0 | 0 | 92 | 0 |
+| [pty](pty.md) | 16 | 11 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 
 The table of a group has the newest result of each test, and the Last run column of the table gives its date. A change after that date can change the result. The hang column also counts the tests after which the init script stopped.
 
@@ -265,6 +266,12 @@ These are the tests that do not pass, in groups by the cause. The cause is the n
 - Does not apply: Needs CONFIG_USER_NS, CONFIG_NET_NS. 1: [fanout01](https://github.com/linux-test-project/ltp/blob/20260930/testcases/network/packet/fanout01.c). Linux code: [net/packet/af_packet.c](https://github.com/torvalds/linux/blob/v7.3/net/packet/af_packet.c).
 - Fail: Other reasons. 1: [rpcinfo](https://github.com/linux-test-project/ltp/blob/20260930/testcases/network/rpc/basic_tests/rpcinfo/rpcinfo01.sh). Linux code: [net/sunrpc/](https://github.com/torvalds/linux/blob/v7.3/net/sunrpc/).
 - Fail: The test wants getprotobyname("hopopt") to give 0. The LTP build links musl, and the protocol table of musl is built in and has "ip" for 0, so this check fails on Linux with musl too. The other checks of asapi_01 pass. 1: [asapi_01](https://github.com/linux-test-project/ltp/blob/20260930/testcases/network/lib6/asapi_01.c). Linux code: [net/ipv6/](https://github.com/torvalds/linux/blob/v7.3/net/ipv6/).
+
+### pty
+
+- Does not apply: Other reasons. 3: [pty05](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/pty/pty05.c), [pty06](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/pty/pty06.c) and [pty07](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/pty/pty07.c). Linux code: [drivers/tty/pty.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/pty.c), [drivers/tty/tty_io.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/tty_io.c), [drivers/tty/n_tty.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/n_tty.c).
+- Does not apply: Needs CONFIG_SERIO_SERPORT. 1: [pty03](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/pty/pty03.c). Linux code: [drivers/tty/pty.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/pty.c), [drivers/tty/tty_io.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/tty_io.c), [drivers/tty/n_tty.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/n_tty.c).
+- Does not apply: Unexpected EINVAL. 1: [pty04](https://github.com/linux-test-project/ltp/blob/20260930/testcases/kernel/pty/pty04.c). Linux code: [drivers/tty/pty.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/pty.c), [drivers/tty/tty_io.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/tty_io.c), [drivers/tty/n_tty.c](https://github.com/torvalds/linux/blob/v7.3/drivers/tty/n_tty.c).
 
 <!-- report: end -->
 

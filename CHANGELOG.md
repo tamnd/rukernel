@@ -2,6 +2,25 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The console takes `TIOCVHANGUP`, as `tty_vhangup` of Linux (#433). It needs `CAP_SYS_ADMIN`. The open files of the console hang up, the console has no session after it, and the session leader gets `SIGHUP` and `SIGCONT`. A new open of the console works.
+- The console takes `TIOCSCTTY` and `TIOCNOTTY` with the rules of `tiocsctty` and `tiocnotty` of Linux, and an open of /dev/ttyS0 without `O_NOCTTY` makes the console the controlling terminal of a session leader without one (#433). An open of /dev/console never does.
+- `statfs` on devpts gives `DEVPTS_SUPER_MAGIC` (0x1cd1) (#433).
+
+### Fixed
+
+- An open of /dev/tty without a controlling terminal gives `ENXIO`, as `tty_open_current_tty` of Linux (#433). It opened the console before.
+- A hang up of a pseudo terminal slave with `TIOCVHANGUP` and the close of the master send `SIGHUP` and `SIGCONT` to the session leader, as `tty_signal_session_leader` of Linux (#433). The close of the master also takes the session from the slave.
+- `TIOCSPGRP` checks the session, as `tiocspgrp` of Linux (#433). A terminal that is not the controlling terminal of the caller gives `ENOTTY`, a group that no process has gives `ESRCH`, and a group of another session gives `EPERM`.
+- `TIOCNOTTY` from a process that is not the session leader drops the controlling terminal of the process, as `proc_clear_tty` of Linux (#433). It did nothing before. A child of `fork` keeps this state, and `setsid` clears it.
+- `TIOCGPGRP` and `TIOCGSID` on the console give `ENOTTY` when the console is not the controlling terminal of the caller, as `tiocgpgrp` and `tiocgsid` of Linux (#433).
+- `mknod`, `mkdir`, `symlink`, `link`, `unlink`, `rmdir` and `rename` in devpts give `EPERM`, and `O_TMPFILE` gives `EOPNOTSUPP`, as Linux (#433).
+- The status table of tools/ltp/README.md has the pty group (#433).
+- `TIOCGPTPEER` on a master from a bind mount of /dev/pts/ptmx on /dev/ptmx finds the devpts mount, as `devpts_mntget` of Linux (#433). It failed before.
+
 ## [0.4.9] - 2026-10-29
 
 ### Added

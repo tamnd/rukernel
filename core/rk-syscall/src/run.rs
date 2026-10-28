@@ -375,8 +375,30 @@ pub fn init() {
     rk_drv_tty::set_caller_hook(|| {
         rk_proc::current_thread().map_or_else(rk_drv_tty::Caller::default, |t| {
             let p = t.process();
-            rk_drv_tty::Caller { pid: p.pid(), pgid: p.pgid(), sid: p.sid() }
+            rk_drv_tty::Caller { pid: p.pid(), pgid: p.pgid(), sid: p.sid(), no_ctty: p.no_ctty() }
         })
+    });
+    rk_drv_tty::set_session_hooks(rk_drv_tty::SessionHooks {
+        signal_leader: |sid, sig| {
+            if let Some(p) = rk_proc::find_process(sid)
+                && p.sid() == sid
+                && !p.is_zombie()
+            {
+                rk_proc::send_signal(&p, SigInfo::new(sig, SI_KERNEL, 0));
+            }
+        },
+        // The session of a member of the group, else of the process with the ID, as
+        // `session_of_pgrp` of Linux.
+        pgrp_session: |pgrp| {
+            let all = rk_proc::processes();
+            let member = all.iter().find(|p| p.pgid() == pgrp);
+            member.or_else(|| all.iter().find(|p| p.pid() == pgrp)).map(|p| p.sid())
+        },
+        leave_ctty: || {
+            if let Some(t) = rk_proc::current_thread() {
+                t.process().set_no_ctty(true);
+            }
+        },
     });
     rk_net::set_cred_source(crate::net::current_cred);
     rk_net::ns::set_source(|| rk_proc::current_thread().and_then(|t| t.net_ns_opt()));
