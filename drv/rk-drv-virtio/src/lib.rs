@@ -11,9 +11,11 @@
 //! does not preempt a task in the kernel, so the queue of a disk does one request at a time under
 //! a lock. virtio-net keeps many buffers in its queues, and the network device layer polls the
 //! device for received frames when the interrupt of the device came. The interrupt wakes the wait
-//! of virtio-blk and an idle CPU. On arm64 it is an SPI of the GIC: the INTx line of a PCI device,
-//! or the line of an MMIO device. On x86-64 it is the MSI-X message of a PCI device. A device
-//! without an interrupt is polled.
+//! of virtio-blk and an idle CPU. On arm64 it is an SPI of the GIC for the INTx line of a PCI
+//! device and for the line of an MMIO device, and an LPI of the GICv3 ITS for an MSI-X vector. On
+//! x86-64 it is an MSI-X vector. A PCI device with MSI-X gets a vector for its configuration and a
+//! vector for each queue, or else one shared vector, as Linux. A device without an interrupt is
+//! polled.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -26,6 +28,12 @@ extern crate alloc;
     allow(dead_code)
 )]
 mod ring;
+// The same for the MSI-X vectors of the PCI transport.
+#[cfg_attr(
+    not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))),
+    allow(dead_code)
+)]
+mod vectors;
 // The same for the header of virtio-net.
 #[cfg_attr(
     not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))),
@@ -71,17 +79,24 @@ struct Probe {
 impl Probe {
     /// Starts the driver for the device with the virtio device ID `id` on the transport `t`.
     /// `bus` is the number of the device among all virtio devices, and `place` tells where the
-    /// device is.
-    fn add(&mut self, id: u32, t: transport::Transport, bus: u32, place: core::fmt::Arguments<'_>) {
+    /// device is, from the kind of its interrupt.
+    fn add(
+        &mut self,
+        id: u32,
+        t: transport::Transport,
+        bus: u32,
+        place: impl Fn(&str) -> alloc::string::String,
+    ) {
         match id {
             DEVICE_BLK => {
-                if let Some(name) = blk::probe(t, self.disks) {
-                    rk_frame::println!("virtio: {name} on {place}");
+                if let Some((name, kind)) = blk::probe(t, self.disks) {
+                    rk_frame::println!("virtio: {name} on {}", place(&kind));
                     self.disks += 1;
                 }
             }
             DEVICE_NET => {
-                if let Some(nic) = net::probe(t, self.nics, bus) {
+                if let Some((nic, kind)) = net::probe(t, self.nics, bus) {
+                    let place = place(&kind);
                     rk_frame::println!("virtio: {} on {place}, MAC {}", nic.name(), nic.mac());
                     self.nics += 1;
                 }
@@ -105,8 +120,7 @@ impl Probe {
                 continue;
             }
             if let Some(t) = pci::PciTransport::new(dev) {
-                let kind = t.irq_kind();
-                let place = format_args!("PCI {:?} with {kind}", dev.address());
+                let place = |kind: &str| alloc::format!("PCI {:?} with {kind}", dev.address());
                 self.add(id, transport::Transport::Pci(t), this, place);
             }
         }
@@ -138,12 +152,8 @@ pub fn init() {
             continue;
         };
         if matches!(id, DEVICE_BLK | DEVICE_NET) {
-            probe.add(
-                id,
-                transport::Transport::Mmio(t),
-                bus,
-                format_args!("MMIO {:#x}", dev.phys()),
-            );
+            let place = |_: &str| alloc::format!("MMIO {:#x}", dev.phys());
+            probe.add(id, transport::Transport::Mmio(t), bus, place);
         }
         bus += 1;
     }

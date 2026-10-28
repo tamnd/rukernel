@@ -49,22 +49,51 @@ fn write(entry: usize, offset: usize, value: u32) {
     unsafe { ((entry + offset) as *mut u32).write_volatile(value) };
 }
 
-/// Sets up the MSI-X table entry at the virtual address `entry` with a free vector, to the boot
-/// CPU and unmasked. Gives the vector, or `None` if no vector is free.
-pub(crate) fn alloc(entry: usize) -> Option<u8> {
-    let n = ENTRY
-        .iter()
-        .position(|e| e.compare_exchange(0, entry, Ordering::AcqRel, Ordering::Relaxed).is_ok())?;
-    let vector = FIRST_VECTOR + n as u8;
+/// Sets up the MSI-X table entries at the virtual addresses `entries`, each with a free vector,
+/// to the boot CPU and unmasked. Writes the vector of each entry to `vectors`. Gives `false` if
+/// not enough vectors are free. Then no entry has a vector.
+pub(crate) fn alloc(entries: &[usize], vectors: &mut [u8]) -> bool {
+    if vectors.len() < entries.len() {
+        return false;
+    }
+    for (k, &entry) in entries.iter().enumerate() {
+        let free = ENTRY.iter().position(|e| {
+            e.compare_exchange(0, entry, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        });
+        let Some(n) = free else {
+            vectors[..k].iter().for_each(|&v| free_vector(v));
+            return false;
+        };
+        vectors[k] = FIRST_VECTOR + n as u8;
+    }
     let target = cpu::apic_id(0);
-    TARGET[n].store(target, Ordering::Relaxed);
-    write(entry, ENTRY_CONTROL, CONTROL_MASKED);
-    write(entry, ENTRY_ADDR_LOW, MSG_ADDR | (target & 0xff) << 12);
-    write(entry, ENTRY_ADDR_HIGH, 0);
-    // Bits 10 to 8 of the data are 0 for the fixed delivery mode, and bit 15 is 0 for an edge.
-    write(entry, ENTRY_DATA, u32::from(vector));
-    write(entry, ENTRY_CONTROL, 0);
-    Some(vector)
+    for (&entry, &vector) in entries.iter().zip(vectors.iter()) {
+        let n = usize::from(vector - FIRST_VECTOR);
+        TARGET[n].store(target, Ordering::Relaxed);
+        write(entry, ENTRY_CONTROL, CONTROL_MASKED);
+        write(entry, ENTRY_ADDR_LOW, MSG_ADDR | (target & 0xff) << 12);
+        write(entry, ENTRY_ADDR_HIGH, 0);
+        // Bits 10 to 8 of the data are 0 for the fixed delivery mode, and bit 15 is 0 for an edge.
+        write(entry, ENTRY_DATA, u32::from(vector));
+        write(entry, ENTRY_CONTROL, 0);
+    }
+    true
+}
+
+/// Masks the entry of the line `vector` and makes the vector free.
+fn free_vector(vector: u8) {
+    let Some(n) = line(vector) else { return };
+    let entry = ENTRY[n].load(Ordering::Acquire);
+    if entry != 0 {
+        write(entry, ENTRY_CONTROL, CONTROL_MASKED);
+    }
+    ENTRY[n].store(0, Ordering::Release);
+    FIRED.fetch_and(!(1 << n), Ordering::AcqRel);
+}
+
+/// Gives back the lines `vectors`, which `alloc` gave.
+pub(crate) fn free(vectors: &[u8]) {
+    vectors.iter().for_each(|&v| free_vector(v));
 }
 
 /// The handler of a device line: masks the entry and sets the flag of the line. It takes no lock.

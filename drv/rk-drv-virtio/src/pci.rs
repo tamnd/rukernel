@@ -1,7 +1,10 @@
 //! The modern virtio PCI transport, from section 4.1 of the virtio 1.2 specification.
 
 use crate::transport::{QueueAddrs, status};
-use core::sync::atomic::{AtomicBool, Ordering};
+use crate::vectors::{self, Mode, NO_VECTOR};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
 use rk_frame::pci::{IoMem, Line, PciDevice};
 
 /// The capability ID of the vendor specific capabilities that virtio uses.
@@ -49,10 +52,10 @@ pub(crate) fn device_type(dev: &PciDevice) -> Option<u32> {
     }
 }
 
-/// The value of an MSI-X vector register for no vector.
-const NO_VECTOR: u16 = 0xffff;
-/// The MSI-X vector of the queues, when the function has MSI-X: the first entry of its table.
-const QUEUE_VECTOR: u16 = 0;
+/// The size of the legacy registers in the I/O BAR 0 of a transitional device, and the offset of
+/// the device status there, from section 4.1.4.8 of the virtio 1.2 specification.
+const LEGACY_LEN: usize = 20;
+const LEGACY_STATUS: usize = 18;
 
 /// The place of a configuration structure: a range of a BAR.
 #[derive(Clone, Copy)]
@@ -64,15 +67,18 @@ struct Place {
 
 /// A virtio device on the PCI bus, after the reset.
 pub(crate) struct PciTransport {
+    dev: PciDevice,
     common: IoMem,
     notify: IoMem,
     notify_multiplier: u32,
     device: IoMem,
-    /// The interrupt line: the MSI-X line of the function, or else the INTx line with the ISR
-    /// status byte.
+    /// The ISR status byte, for the INTx line.
+    isr: Option<IoMem>,
+    /// The interrupt lines, after `find_queues`.
     irq: Irq,
-    /// The device took the MSI-X vector of each queue. If it did not, the driver polls.
-    vectors_ok: AtomicBool,
+    /// The device status in the legacy registers of the I/O BAR 0 was the same as in the common
+    /// configuration.
+    legacy_io: bool,
 }
 
 /// The interrupt of a device on the PCI bus.
@@ -81,9 +87,9 @@ enum Irq {
     None,
     /// The INTx line. A read of the ISR status byte lowers it.
     Intx(IoMem, Line),
-    /// The MSI-X line of the queues. Each message is an edge, so the driver does not read the
-    /// ISR status byte.
-    Msix(Line),
+    /// The MSI-X lines in the order of the vectors, and the number of queues that have a vector.
+    /// Each message is an edge, so the driver does not read the ISR status byte.
+    Msix(Mode, Vec<Line>, u16),
 }
 
 impl PciTransport {
@@ -120,18 +126,17 @@ impl PciTransport {
             return None;
         }
         dev.enable();
-        // With MSI-X, the queues send their messages to the first entry of the table. Without
-        // it, the device raises its INTx line, and a read of the ISR status byte lowers the line.
-        let irq = match dev.msix() {
-            Some(line) => Irq::Msix(line),
-            None => match isr.and_then(map).zip(dev.irq()) {
-                Some((isr, line)) => Irq::Intx(isr, line),
-                None => Irq::None,
-            },
+        let (notify, device, isr) = (map(notify?)?, map(device?)?, isr.and_then(map));
+        let mut t = Self {
+            dev: *dev,
+            common,
+            notify,
+            notify_multiplier,
+            device,
+            isr,
+            irq: Irq::None,
+            legacy_io: false,
         };
-        let (notify, device) = (map(notify?)?, map(device?)?);
-        let vectors_ok = AtomicBool::new(true);
-        let t = Self { common, notify, notify_multiplier, device, irq, vectors_ok };
         t.common.write_u8(common::DEVICE_STATUS, 0);
         // The device gives 0 when the reset is done.
         while t.common.read_u8(common::DEVICE_STATUS) != 0 {
@@ -139,7 +144,60 @@ impl PciTransport {
         }
         t.common.write_u16(common::MSIX_CONFIG, NO_VECTOR);
         t.set_status(status::ACKNOWLEDGE | status::DRIVER);
+        // A transitional device also has the legacy registers in its I/O BAR 0, with the same
+        // device status. The log tells when a read through the I/O BAR gives it, so the I/O
+        // window of the host and of each bridge on the path works.
+        t.legacy_io = dev
+            .map_io_bar(0, 0, LEGACY_LEN)
+            .is_some_and(|io| io.read_u8(LEGACY_STATUS) == t.status());
         Some(t)
+    }
+
+    /// Gives the interrupt lines to the device for its configuration and for the queues 0 to
+    /// `queues - 1`, as `vp_find_vqs` of Linux: a MSI-X vector for each queue, else one shared
+    /// MSI-X vector, else the INTx line with the ISR status byte, else no line. The driver calls
+    /// this after the feature negotiation and before it makes the queues.
+    pub(crate) fn find_queues(&mut self, queues: u16) {
+        for mode in vectors::modes(queues, self.dev.msix_table_size()) {
+            let Some(lines) = self.dev.msix_vectors(mode.count(queues)) else { continue };
+            if self.set_vectors(mode, queues) {
+                self.irq = Irq::Msix(mode, lines, queues);
+                return;
+            }
+            self.dev.msix_free(&lines);
+        }
+        self.irq = match self.isr.take().zip(self.dev.irq()) {
+            Some((isr, line)) => Irq::Intx(isr, line),
+            None => Irq::None,
+        };
+    }
+
+    /// Writes the vectors of `mode` to the vector registers of the configuration and of the
+    /// queues. Gives `false`, with no vector in the registers, if the device does not take one:
+    /// the device then gives `NO_VECTOR` back, as `vp_setup_vq` of Linux tests.
+    fn set_vectors(&self, mode: Mode, queues: u16) -> bool {
+        let c = &self.common;
+        let mut ok = {
+            c.write_u16(common::MSIX_CONFIG, mode.config_vector());
+            c.read_u16(common::MSIX_CONFIG) == mode.config_vector()
+        };
+        for index in 0..queues {
+            if !ok {
+                break;
+            }
+            let vector = mode.queue_vector(index, queues);
+            c.write_u16(common::QUEUE_SELECT, index);
+            c.write_u16(common::QUEUE_MSIX_VECTOR, vector);
+            ok = c.read_u16(common::QUEUE_MSIX_VECTOR) == vector;
+        }
+        if !ok {
+            c.write_u16(common::MSIX_CONFIG, NO_VECTOR);
+            for index in 0..queues {
+                c.write_u16(common::QUEUE_SELECT, index);
+                c.write_u16(common::QUEUE_MSIX_VECTOR, NO_VECTOR);
+            }
+        }
+        ok
     }
 
     /// Reads the device status.
@@ -175,15 +233,11 @@ impl PciTransport {
         let c = &self.common;
         c.write_u16(common::QUEUE_SELECT, index);
         c.write_u16(common::QUEUE_SIZE, size);
-        if matches!(self.irq, Irq::Msix(_)) {
-            // The device gives NO_VECTOR back if it cannot use the vector.
-            c.write_u16(common::QUEUE_MSIX_VECTOR, QUEUE_VECTOR);
-            if c.read_u16(common::QUEUE_MSIX_VECTOR) != QUEUE_VECTOR {
-                self.vectors_ok.store(false, Ordering::Relaxed);
-            }
-        } else {
-            c.write_u16(common::QUEUE_MSIX_VECTOR, NO_VECTOR);
-        }
+        let vector = match &self.irq {
+            Irq::Msix(mode, _, queues) => mode.queue_vector(index, *queues),
+            _ => NO_VECTOR,
+        };
+        c.write_u16(common::QUEUE_MSIX_VECTOR, vector);
         for (reg, addr) in [
             (common::QUEUE_DESC, addrs.desc),
             (common::QUEUE_DRIVER, addrs.avail),
@@ -207,30 +261,49 @@ impl PciTransport {
         self.notify.write_u16(at, index);
     }
 
-    /// The interrupt line of the device, or `None` if the driver must poll.
-    pub(crate) fn irq(&self) -> Option<Line> {
+    /// The interrupt line of the queue `index`, or `None` if the driver must poll.
+    pub(crate) fn line(&self, index: u16) -> Option<Line> {
         match &self.irq {
             Irq::Intx(_, line) => Some(*line),
-            Irq::Msix(line) => self.vectors_ok.load(Ordering::Relaxed).then_some(*line),
+            Irq::Msix(mode, lines, queues) => lines.get(mode.queue_line(index, *queues)?).copied(),
             Irq::None => None,
         }
     }
 
-    /// The kind of the interrupt of the device, for the log: MSI-X, INTx, or none.
-    pub(crate) fn irq_kind(&self) -> &'static str {
-        match self.irq {
-            Irq::Msix(_) => "MSI-X",
-            Irq::Intx(..) => "INTx",
-            Irq::None => "no interrupt",
+    /// Handles each line of the device that came: for the INTx line, reads the ISR status byte,
+    /// so that the device lowers the line, and turns the line on again. Gives `true` if a line
+    /// came.
+    pub(crate) fn handle_interrupt(&self) -> bool {
+        match &self.irq {
+            Irq::Intx(isr, line) => {
+                if !line.take() {
+                    return false;
+                }
+                isr.read_u8(0);
+                line.unmask();
+                true
+            }
+            Irq::Msix(_, lines, _) => lines.iter().fold(false, |came, line| {
+                if !line.take() {
+                    return came;
+                }
+                line.unmask();
+                true
+            }),
+            Irq::None => false,
         }
     }
 
-    /// Tells the device that the driver saw its interrupt. For the INTx line, the read of the
-    /// ISR status byte clears it, and the device then lowers the line.
-    pub(crate) fn ack_interrupt(&self) {
-        if let Irq::Intx(isr, _) = &self.irq {
-            isr.read_u8(0);
-        }
+    /// The kind of the interrupt of the device, for the log: the MSI-X vectors, INTx, or none,
+    /// and the legacy I/O BAR if a read through it worked.
+    pub(crate) fn irq_kind(&self) -> String {
+        let kind = match &self.irq {
+            Irq::Msix(_, lines, _) if lines.len() == 1 => String::from("1 MSI-X vector"),
+            Irq::Msix(_, lines, _) => format!("{} MSI-X vectors", lines.len()),
+            Irq::Intx(..) => String::from("INTx"),
+            Irq::None => String::from("no interrupt"),
+        };
+        if self.legacy_io { format!("{kind} and the legacy I/O BAR") } else { kind }
     }
 
     /// Reads the byte at `offset` of the configuration of the device.

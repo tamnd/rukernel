@@ -2126,12 +2126,15 @@ const AARCH64_BUSYBOX_INPUT: &[(&str, &[u8])] = &[
 enum ArmPci {
     /// The test uses the virtio-mmio devices.
     No,
-    /// On bus 0, with MSI-X through the GICv3 ITS.
+    /// On bus 0, with an MSI-X vector for the configuration and for each queue through the GICv3
+    /// ITS.
     Bus0,
-    /// Behind a PCIe root port on bus 1, with MSI-X through the ITS.
+    /// Behind a PCIe root port on bus 1, with MSI-X vectors through the ITS.
     Bridge,
     /// Behind a PCIe root port on bus 1, with no MSI-X vectors on the device, so with the INTx
-    /// pin through the port. The root port needs the ITS for its own MSI-X capability.
+    /// pin through the port. The root port needs the ITS for its own MSI-X capability. The device
+    /// is transitional, so it also has the legacy registers in an I/O BAR, which the I/O window
+    /// of the port holds.
     BridgeIntx,
 }
 
@@ -2260,10 +2263,11 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             ("virtio-blk-pci", "virtio-net-pci")
         };
         // A device behind the bridge is on the bus of the root port. A device with `vectors=0` has
-        // no MSI-X capability, so it uses its INTx pin.
+        // no MSI-X capability, so it uses its INTx pin. With `disable-legacy=off` the device has
+        // the legacy registers in the I/O BAR 0.
         let bus = match pci {
             ArmPci::Bridge => ",bus=rp0",
-            ArmPci::BridgeIntx => ",bus=rp0,vectors=0",
+            ArmPci::BridgeIntx => ",bus=rp0,vectors=0,disable-legacy=off",
             _ => "",
         };
         let smp = if matches!(*test, "boot" | "smp") { AARCH64_SMP_CPUS } else { "1" };
@@ -2321,13 +2325,15 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             && log.contains("aarch64 booting with linux")
             && log.contains(&format!("smp: {smp} CPUs run"))
             && log.contains(&pass_line(test));
-        // The driver tells the bus of the device and the kind of its interrupt.
-        let device = if *test == "blk" { "vda" } else { "eth0" };
+        // The driver tells the bus of the device and the kind of its interrupt. virtio-blk has
+        // one queue and virtio-net two, and the configuration has one more MSI-X vector.
+        let (device, msix) =
+            if *test == "blk" { ("vda", "2 MSI-X vectors") } else { ("eth0", "3 MSI-X vectors") };
         let probe = match pci {
             ArmPci::No => None,
-            ArmPci::Bus0 => Some((0, 1, "MSI-X")),
-            ArmPci::Bridge => Some((1, 0, "MSI-X")),
-            ArmPci::BridgeIntx => Some((1, 0, "INTx")),
+            ArmPci::Bus0 => Some((0, 1, msix)),
+            ArmPci::Bridge => Some((1, 0, msix)),
+            ArmPci::BridgeIntx => Some((1, 0, "INTx and the legacy I/O BAR")),
         }
         .map(|(bus, slot, kind)| {
             format!("{device} on PCI PciAddress {{ bus: {bus}, device: {slot}, function: 0 }} with {kind}")

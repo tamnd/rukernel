@@ -123,17 +123,22 @@ impl MmioTransport {
         self.regs.write_u32(QUEUE_NOTIFY, u32::from(index));
     }
 
-    /// The interrupt line of the device.
-    pub(crate) fn irq(&self) -> Option<Line> {
+    /// The interrupt line of the queue `index`: the one line of the device.
+    pub(crate) fn line(&self, _index: u16) -> Option<Line> {
         self.irq
     }
 
-    /// Tells the device that the driver saw its interrupt. The device then lowers the line.
-    pub(crate) fn ack_interrupt(&self) {
+    /// Handles the line of the device, if it came: tells the device that the driver saw the
+    /// interrupt, so that the device lowers the line, and turns the line on again. Gives `true`
+    /// if the line came.
+    pub(crate) fn handle_interrupt(&self) -> bool {
+        let Some(line) = self.irq.filter(|l| l.take()) else { return false };
         let pending = self.regs.read_u32(INTERRUPT_STATUS);
         if pending != 0 {
             self.regs.write_u32(INTERRUPT_ACK, pending);
         }
+        line.unmask();
+        true
     }
 
     /// Reads the byte at `offset` of the configuration of the device.

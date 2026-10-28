@@ -72,12 +72,13 @@ impl Ring {
 
 /// Starts the driver for the network device number `index` on the transport `t`, and registers
 /// the device. `bus` is the number of the device among all virtio devices, as the name `virtioN`
-/// of Linux.
-pub(crate) fn probe(t: Transport, index: u32, bus: u32) -> Option<Arc<NetDevice>> {
+/// of Linux. Gives the device and the kind of its interrupt.
+pub(crate) fn probe(mut t: Transport, index: u32, bus: u32) -> Option<(Arc<NetDevice>, String)> {
     let Some(features) = t.negotiate(F_MAC | F_STATUS) else {
         t.fail();
         return None;
     };
+    t.find_queues(2);
     let (Some(mut rx), Some(tx)) = (Ring::new(&t, RX_QUEUE, true), Ring::new(&t, TX_QUEUE, false))
     else {
         t.fail();
@@ -94,6 +95,7 @@ pub(crate) fn probe(t: Transport, index: u32, bus: u32) -> Option<Arc<NetDevice>
         rx.queue.push_avail(id);
     }
     rx.queue.kick(&t);
+    let kind = t.irq_kind();
     let driver = VirtioNet {
         mac,
         bus,
@@ -102,7 +104,7 @@ pub(crate) fn probe(t: Transport, index: u32, bus: u32) -> Option<Arc<NetDevice>
         rx: SpinLock::new(rx),
         tx: SpinLock::new(tx),
     };
-    register(Arc::new(driver)).ok()
+    register(Arc::new(driver)).ok().map(|nic| (nic, kind))
 }
 
 /// A virtio-net device.
