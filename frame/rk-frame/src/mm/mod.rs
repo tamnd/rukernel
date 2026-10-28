@@ -14,7 +14,7 @@ pub(crate) mod bitmap;
 #[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 pub(crate) mod frame;
 #[cfg(target_os = "none")]
-mod heap;
+pub(crate) mod heap;
 #[cfg(target_os = "none")]
 pub use frame::{
     Frame, FrameStats, HUGE_FRAMES, HugeRun, Mapping, PageInfo, alloc_frame, alloc_huge_frames,

@@ -621,24 +621,83 @@ pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
     }
 }
 
-/// Maps 4 KiB pages in `root` as `user_map` does. `pages` gives the address, the frame and the
-/// permissions of each page, in address order. `root` is a new address space, as the child of
-/// `fork`. Gives `Err` if no frame is free for a page table.
+/// Drops the TLB entries of all the user pages on each CPU. All user pages have ASID 0. The TLB
+/// invalidation goes to each CPU of the inner shareable domain, so no interrupt is needed.
+fn flush_user_all() {
+    // SAFETY: the TLB invalidation and the barriers change no memory.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi aside1is, xzr",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Maps 4 KiB pages in `root` as `user_map` does, but with no TLB flush. `pages` gives the
+/// address, the frame and the permissions of each page, in address order. `root` is a new
+/// address space that no CPU has loaded, as the child of `fork`. One walk finds the level 3 table
+/// for all the pages in it. Gives `Err` if no frame is free for a page table.
+///
+/// The instruction cache needs no step: the frames are the frames of the parent, which has them
+/// executable already, and `user_map` or `user_protect` made the instruction fetches see them.
 pub(crate) fn user_map_new(
     root: u64,
     pages: impl Iterator<Item = (usize, u64, UserProt)>,
 ) -> Result<(), ()> {
+    debug_assert!(active().load(Ordering::Acquire) != root, "the address space is active");
+    let mut leaf = (usize::MAX, 0);
     for (virt, phys, prot) in pages {
-        user_map(root, virt, phys, prot)?;
+        assert!(virt < USER_END, "{virt:#x} is not in the user half");
+        let block = virt & !(BLOCK_SIZE - 1);
+        if leaf.0 != block {
+            let e = walk(root, 0, 2, virt, &mut alloc_table_frame).ok_or(())?;
+            let value = e.load(Ordering::Relaxed);
+            let table = if value & VALID == 0 {
+                let new = alloc_table_frame().ok_or(())?;
+                sync_tables();
+                e.store(new | VALID | TABLE, Ordering::Relaxed);
+                new
+            } else {
+                assert!(value & TABLE != 0, "a huge page is in the path of a 4 KiB mapping");
+                value & ADDR_MASK
+            };
+            leaf = (block, table);
+        }
+        entry(leaf.1, indexes(virt)[3])
+            .store(phys | user_flags(prot.0, prot.1, prot.2), Ordering::Relaxed);
     }
+    sync_tables();
     Ok(())
 }
 
 /// Changes the permissions of 4 KiB pages in `root` as `user_protect` does. `pages` gives the
-/// address, the frame and the new permissions of each page, in address order.
+/// address, the frame and the new permissions of each page, in address order. One walk finds the
+/// level 3 table for all the pages in it, and one TLB invalidation at the end is for all the
+/// pages.
 pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u64, UserProt)>) {
+    let mut leaf = (usize::MAX, None);
+    let mut changed = false;
     for (virt, phys, prot) in pages {
-        user_protect(root, virt, phys, prot);
+        let block = virt & !(BLOCK_SIZE - 1);
+        if leaf.0 != block {
+            let e = walk(root, 0, 2, virt, &mut || None).map(|e| e.load(Ordering::Relaxed));
+            let table = e.filter(|v| v & VALID != 0 && v & TABLE != 0).map(|v| v & ADDR_MASK);
+            leaf = (block, table);
+        }
+        if let Some(table) = leaf.1 {
+            if prot.2 {
+                sync_icache(phys);
+            }
+            entry(table, indexes(virt)[3])
+                .store(phys | user_flags(prot.0, prot.1, prot.2), Ordering::Relaxed);
+            changed = true;
+        }
+    }
+    if changed {
+        flush_user_all();
     }
 }
 

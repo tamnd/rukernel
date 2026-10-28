@@ -87,3 +87,7 @@ panic = "warn"
 [profile.release]
 debug = "line-tables-only"
 codegen-units = 1
+# Thin LTO lets the code of one crate inline into another. On QEMU TCG it makes the system call
+# rows of tools/bench 15 to 40 percent faster, and the build takes about the same time. Fat LTO
+# is up to 20 percent faster again on some rows, but a rebuild takes 2 times longer (#401).
+lto = "thin"
