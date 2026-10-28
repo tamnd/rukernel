@@ -78,7 +78,7 @@ The kernel heap is a cost for the VMA backend too: the 2 large allocations of ea
 - The kernel heap gives an object of up to 4 pages from the direct map, and keeps up to 8 freed objects of up to 16 pages mapped for the next allocation. Before, each object larger than 2048 bytes got new pages in the heap range, and its free sent a TLB shootdown to the other CPUs. Each `fork` and exit had two such objects: the kernel stack (32 KiB) and the `Process`. The `munmap` path had one too: the list of the frames to free (`HUGE_FRAMES` pointers, 4 KiB).
 - `VmSpace` keeps one entry for each huge page, not 512. `fork_big` maps its 128 MiB with 64 transparent huge pages.
 
-The base of these runs (212e8b2) is before #405. Thus the CortenMM columns do not have the changes of #405 to the tree. The code after the merge has the changes of #405 and #401, and its numbers are not measured yet.
+The base of these runs (212e8b2) is before #405. Thus the CortenMM columns do not have the changes of #405 to the tree. The next section measures the code after the merge, with the changes of #405 and #401.
 
 The A/B runs boot four kernels one after the other, 3 times each: the base (212e8b2) and #401, each with the VMA backend and with the `corten` feature. Host: server2, AMD EPYC, 6 CPUs, QEMU 8.2.2 with TCG, `-smp 4 -m 1G`. Each run has 5 runs for each row. The table gives the median of the 3 medians of each kernel, and the lowest of the 3 medians in parentheses. The load average was between 2.4 and 9.0. Linux is from the run of the base before the A/B. Times in ns, `fork`, `fork_big` and `thread` in us.
 
@@ -104,6 +104,31 @@ The medians of each run:
 | `fork_big` (us) | CortenMM #401 | 17027 | 27319 | 18978 |
 
 The runs of the two versions do not overlap for `mmap`, `fork`, `fork_big` and `thread`. `fork` is 1.5 times faster on the VMA backend and 2.7 times faster on CortenMM. CortenMM gains more, because each node of its tree has a `Vec` of 512 slots, which is a large heap object, and `fork` builds the nodes of the tree of the child. Thus most of the earlier gap of CortenMM in `fork` was the cost of the large heap objects and of their TLB shootdowns. CortenMM is still 2 times slower than VMA in `fork`. `fork_big` is 2.9 times faster on VMA and 7.7 times faster on CortenMM. `mmap` is 32 times faster on VMA, because `munmap` no longer maps and unmaps a heap page. For `fault`, the runs overlap, so the difference is not larger than the noise.
+
+## `fork` with #405 and #401
+
+The A/B of #442 boots the base fa7f8e5 (the merge of #401, with the changes of #405) with the VMA backend and with the `corten` feature, one after the other, 3 times each, with the method above. Host: server2, QEMU 8.2.2 with TCG, `-smp 4 -m 1G`, 5 runs for each row. The load average was between 2.3 and 7.2 (another agent built and booted kernels on the host at the same time). The table gives the median of the 3 medians of each kernel, and the lowest of the 3 medians in parentheses. The ratio is CortenMM divided by VMA, on the medians. Linux is from a run just before the A/B. Times in ns, `fork`, `fork_big` and `thread` in us.
+
+| Benchmark | Linux | VMA | CortenMM | Ratio |
+|---|---|---|---|---|
+| `fault` | 40690 | 75201 (58066) | 79000 (51932) | 1.05 |
+| `mmap` | 78528 | 16030 (14997) | 58161 (56103) | 3.63 |
+| `fork` (us) | 9584 | 2367 (2330) | 4484 (4343) | 1.89 |
+| `fork_big` (us) | 59442 | 7467 (7314) | 22640 (22582) | 3.03 |
+| `thread` (us) | 8628 | 2582 (2486) | 2820 (2342) | 1.09 |
+
+The medians of each run:
+
+| Benchmark | Kernel | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|---|
+| `fork` (us) | VMA | 2367 | 2330 | 2399 |
+| `fork` (us) | CortenMM | 4484 | 4343 | 4516 |
+| `fork_big` (us) | VMA | 7314 | 7748 | 7467 |
+| `fork_big` (us) | CortenMM | 22640 | 22582 | 29710 |
+
+A first pass of the same A/B, under a load average of 5.6 to 14, gave 2060 (1397) us and 4530 (3362) us for `fork`, and 8191 (7920) us and 24763 (23811) us for `fork_big`, so the two passes agree. The runs of the two backends do not overlap for `mmap`, `fork` and `fork_big`. For `fault` and `thread`, they overlap.
+
+With the changes of both #405 and #401, CortenMM is 1.9 times slower than VMA in `fork` and 3.0 times slower in `fork_big`. #401 removed most of the cost that the two backends share (the large heap objects and their TLB shootdowns), so the ratio grew: after #405 alone it was 1.41 and 1.60. The time that is left on CortenMM is the walk of the statuses: `fork_big` costs 15 ms more than on VMA, and the tree of a process that touched 128 MiB has 64 nodes of the lowest level with 32768 slots, which `fork` and the exit of the child walk. CortenMM with #401 but without #405 gave 6324 us and 18978 us at 212e8b2 (the section above), under a different load. Thus the one walk of #405 gives no clear gain after #401. `mmap` is 3.6 times slower on CortenMM, because `mmap` and `munmap` change both `va` and the tree, and the tree makes and frees nodes.
 
 ## Fidelity of maps and smaps
 
@@ -144,13 +169,12 @@ There is no `fork` boot test. The `mm`, `vm`, `init` and `busybox` tests use `fo
 - Remove the big kernel lock, and give the page table of rk-frame a lock for each node, as spec/25-removing-the-big-kernel-lock.md gives. Then run `fault_mt` and `mmap_mt` again, on hardware or with KVM.
 - Keep the status in the page table pages, as CortenMM does, and remove the separate tree.
 - Run the `maps` and `smaps` differential over the full L4 corpus.
-- Run the `fork` A/B again with the code of both #405 and #401.
 
 ## Recommendation for question 1
 
 Keep the VMAs as the source of truth for now, and decide again after the big kernel lock goes.
 
-- Scalability: not shown. With the big kernel lock, only one CPU runs kernel code at a time, so the per node locks cannot give scaling. `fault_mt` and `mmap_mt` show no clear gain, and `fork` was 3 to 4 times slower (1.4 times since #405). The test of document 22 cannot pass or fail until the kernel runs page faults on more than one CPU at the same time.
+- Scalability: not shown. With the big kernel lock, only one CPU runs kernel code at a time, so the per node locks cannot give scaling. `fault_mt` and `mmap_mt` show no clear gain, and `fork` was 3 to 4 times slower (1.9 times with #405 and #401, and 3.0 times for `fork_big`). The test of document 22 cannot pass or fail until the kernel runs page faults on more than one CPU at the same time.
 - Fidelity: passes, and is better than the VMA backend. The CortenMM backend makes `maps` and `smaps` from the statuses with no shadow structure, and in the two cases that differ it shows the same areas as Linux. This removes the main argument for VMAs in question 1 (the cost of a shadow view). The differential ran on a small set of cases, not the full L4 corpus.
 
 Thus question 1 stays open. Do the follow up items above in this order: the big kernel lock, the page table locks of rk-frame, and the statuses in the page table pages. Then run `fault_mt`, `mmap_mt` and will-it-scale on hardware or with KVM. Until then, the default backend gets the merge rules of Linux, and the `corten` feature stays as the experiment.

@@ -12,6 +12,7 @@ use crate::signal::{
 };
 use crate::timer::Timers;
 use crate::wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -80,7 +81,9 @@ struct Image {
 /// The signal state that the threads of a process share: the actions and the queue of the
 /// signals that any thread can take.
 struct SharedSignals {
-    actions: [SigAction; NSIG as usize],
+    /// The actions (2 KiB) are in a box of their own, so that `Process` fits a slab class of the
+    /// kernel heap.
+    actions: Box<[SigAction; NSIG as usize]>,
     pending: Pending,
 }
 
@@ -228,6 +231,11 @@ struct ThreadKeys {
     /// The default keyring of `request_key`, a `KEY_REQKEY_DEFL_*` value.
     reqkey: u8,
 }
+
+// `Arc` puts two counts before the process. The largest slab class of the kernel heap is 2048
+// bytes, and a larger object takes frames of its own. The unit tests run on the host, where this
+// module is not built, so the build checks the size.
+const _: () = assert!(size_of::<Process>() + 2 * size_of::<usize>() <= 2048);
 
 impl core::fmt::Debug for Process {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -663,7 +671,7 @@ impl Process {
     /// Sets each action that has a handler back to `SIG_DFL`, for `execve`. An ignored signal
     /// stays ignored.
     pub fn reset_actions(&self) {
-        for a in &mut self.signals.lock().actions {
+        for a in self.signals.lock().actions.iter_mut() {
             if a.handler != SIG_IGN {
                 *a = SigAction::default();
             }
@@ -915,7 +923,7 @@ impl Process {
         vm: Arc<AddressSpace>,
         files: SharedFiles,
         fs: SharedFs,
-        actions: [SigAction; NSIG as usize],
+        actions: Box<[SigAction; NSIG as usize]>,
         exit_signal: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -1568,7 +1576,7 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
         vm,
         files,
         Arc::new(SpinLock::new(fs)),
-        [SigAction::default(); NSIG as usize],
+        Box::new([SigAction::default(); NSIG as usize]),
         // As in Linux. A tracer of init waits for it as for a child of `fork`.
         SIGCHLD,
     );
@@ -1643,7 +1651,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
         let s = pp.state.lock();
         (s.pgid, s.sid, s.comm.clone())
     };
-    let actions = pp.signals.lock().actions;
+    let actions = pp.signals.lock().actions.clone();
     let (owner, exit_signal) = if share.parent {
         // Linux gives `EINVAL` for init, which has no parent.
         (pp.parent().ok_or(Errno::EINVAL)?, pp.exit_signal)
