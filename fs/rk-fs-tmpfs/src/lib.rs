@@ -45,6 +45,10 @@ struct Fs {
     read_only: AtomicBool,
     /// The pages of the regular files, and the limit of the option `size=`.
     space: Space,
+    /// The magic number of the file system in `statfs`.
+    magic: u64,
+    /// Only the kernel adds and removes names, with [`kernel_create`] and [`kernel_unlink`].
+    fixed: bool,
 }
 
 /// The attributes of a node.
@@ -191,14 +195,55 @@ pub fn new(perm: u32) -> InodeRef {
     make(perm, u64::MAX)
 }
 
+/// Makes a new file system in memory for a driver, as devpts, and gives its root directory, with
+/// the permission bits `perm`. `statfs` gives `magic`. Only the kernel adds and removes names,
+/// with [`kernel_create`] and [`kernel_unlink`]. `mknod`, `mkdir`, `symlink`, `link`, `unlink`,
+/// `rmdir` and `rename` give `EPERM`, and `O_TMPFILE` gives `EOPNOTSUPP`, as a directory of Linux
+/// with only a `lookup` operation.
+pub fn new_fixed(perm: u32, magic: u64) -> InodeRef {
+    make_fs(perm, u64::MAX, magic, true)
+}
+
+/// Adds the file `name` to the directory `dir` of the file system of [`new_fixed`] or [`new`],
+/// with the type `kind`, the permission bits `perm` and the device number `rdev`.
+pub fn kernel_create(
+    dir: &InodeRef,
+    name: &[u8],
+    kind: FileType,
+    perm: u32,
+    rdev: u64,
+) -> Result<InodeRef> {
+    node_of(dir)?.add_entry(name, kind, perm, rdev)
+}
+
+/// Removes the file `name` from the directory `dir` of the file system of [`new_fixed`] or
+/// [`new`].
+pub fn kernel_unlink(dir: &InodeRef, name: &[u8]) -> Result<()> {
+    node_of(dir)?.remove_entry(name)
+}
+
+/// The node of tmpfs of `inode`, or `EXDEV` for an inode of another file system.
+fn node_of(inode: &InodeRef) -> Result<&Node> {
+    let any: &dyn Any = &**inode;
+    any.downcast_ref::<Node>().ok_or(Errno::EXDEV)
+}
+
 /// Makes a new tmpfs with the permission bits `perm` on the root, and at most `max` pages of data.
 fn make(perm: u32, max: u64) -> Arc<Node> {
+    make_fs(perm, max, TMPFS_MAGIC, false)
+}
+
+/// Makes a new file system in memory with the permission bits `perm` on the root, at most `max`
+/// pages of data, the magic number `magic`, and names that only the kernel changes if `fixed`.
+fn make_fs(perm: u32, max: u64, magic: u64, fixed: bool) -> Arc<Node> {
     let fs = Arc::new(Fs {
         dev: rk_vfs::anon_dev(),
         next_ino: AtomicU64::new(1),
         nodes: SpinLock::new(BTreeMap::new()),
         read_only: AtomicBool::new(false),
         space: Space::new(max),
+        magic,
+        fixed,
     });
     let root = Node::new(&fs, mode::S_IFDIR | (perm & mode::PERM_MASK), 0, Weak::new());
     root.attrs.lock().nlink = 2;
@@ -241,6 +286,37 @@ impl Node {
     }
 
     /// Gives `EROFS` if the file system is read only.
+    /// Gives `EPERM` for a change of a name by a user on a file system of [`new_fixed`].
+    fn check_names(&self) -> Result<()> {
+        if self.fs.fixed { Err(Errno::EPERM) } else { Ok(()) }
+    }
+
+    /// Adds the file `name`, for `create` and [`kernel_create`].
+    fn add_entry(&self, name: &[u8], kind: FileType, perm: u32, rdev: u64) -> Result<InodeRef> {
+        self.check_rw()?;
+        if kind == FileType::Symlink {
+            return Err(Errno::EINVAL);
+        }
+        let parent = if kind == FileType::Directory { self.this.clone() } else { Weak::new() };
+        let mode = kind.mode_bits() | (perm & mode::PERM_MASK);
+        let child = Node::new(&self.fs, mode, rdev, parent);
+        self.insert(name, child.clone())?;
+        Ok(child)
+    }
+
+    /// Removes the file `name`, for `unlink` and [`kernel_unlink`].
+    fn remove_entry(&self, name: &[u8]) -> Result<()> {
+        self.check_rw()?;
+        let node = self.get(name)?;
+        if node.is_dir() {
+            return Err(Errno::EISDIR);
+        }
+        self.take(name)?;
+        node.add_links(-1);
+        self.touch();
+        Ok(())
+    }
+
     fn check_rw(&self) -> Result<()> {
         if self.fs.read_only.load(Ordering::Acquire) { Err(Errno::EROFS) } else { Ok(()) }
     }
@@ -563,18 +639,14 @@ impl Inode for Node {
     }
 
     fn create(&self, name: &[u8], kind: FileType, perm: u32, rdev: u64) -> Result<InodeRef> {
-        self.check_rw()?;
-        if kind == FileType::Symlink {
-            return Err(Errno::EINVAL);
-        }
-        let parent = if kind == FileType::Directory { self.this.clone() } else { Weak::new() };
-        let mode = kind.mode_bits() | (perm & mode::PERM_MASK);
-        let child = Node::new(&self.fs, mode, rdev, parent);
-        self.insert(name, child.clone())?;
-        Ok(child)
+        self.check_names()?;
+        self.add_entry(name, kind, perm, rdev)
     }
 
     fn tmpfile(&self, perm: u32) -> Result<InodeRef> {
+        if self.fs.fixed {
+            return Err(Errno::EOPNOTSUPP);
+        }
         self.check_rw()?;
         if !self.is_dir() {
             return Err(Errno::ENOTDIR);
@@ -585,6 +657,7 @@ impl Inode for Node {
     }
 
     fn symlink(&self, name: &[u8], target: &[u8]) -> Result<InodeRef> {
+        self.check_names()?;
         self.check_rw()?;
         let child = Node::new(&self.fs, mode::S_IFLNK | 0o777, 0, Weak::new());
         *child.data.lock() = Data::Symlink(target.to_vec());
@@ -593,6 +666,7 @@ impl Inode for Node {
     }
 
     fn link(&self, name: &[u8], inode: &InodeRef) -> Result<()> {
+        self.check_names()?;
         self.check_rw()?;
         let node = self.same_fs(inode)?;
         if node.is_dir() {
@@ -604,18 +678,12 @@ impl Inode for Node {
     }
 
     fn unlink(&self, name: &[u8]) -> Result<()> {
-        self.check_rw()?;
-        let node = self.get(name)?;
-        if node.is_dir() {
-            return Err(Errno::EISDIR);
-        }
-        self.take(name)?;
-        node.add_links(-1);
-        self.touch();
-        Ok(())
+        self.check_names()?;
+        self.remove_entry(name)
     }
 
     fn rmdir(&self, name: &[u8]) -> Result<()> {
+        self.check_names()?;
         self.check_rw()?;
         let node = self.get(name)?;
         if !node.is_dir() {
@@ -632,6 +700,7 @@ impl Inode for Node {
     }
 
     fn rename(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
+        self.check_names()?;
         self.move_entry(old, new_dir, new, None)
     }
 
@@ -642,10 +711,12 @@ impl Inode for Node {
         new: &[u8],
         owner: (u32, u32),
     ) -> Result<()> {
+        self.check_names()?;
         self.move_entry(old, new_dir, new, Some(owner))
     }
 
     fn exchange(&self, old: &[u8], new_dir: &InodeRef, new: &[u8]) -> Result<()> {
+        self.check_names()?;
         self.check_rw()?;
         let target_dir = self.same_fs(new_dir)?;
         let this = self.this.upgrade().ok_or(Errno::ENOENT)?;
@@ -799,7 +870,7 @@ impl Inode for Node {
     }
 
     fn fs_magic(&self) -> u64 {
-        TMPFS_MAGIC
+        self.fs.magic
     }
 }
 

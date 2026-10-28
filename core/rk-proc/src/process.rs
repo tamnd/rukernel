@@ -169,6 +169,10 @@ pub struct Process {
     /// Tells if transparent huge pages are off, as `MMF_DISABLE_THP` of Linux. A child gets the
     /// flag on `fork`, and `execve` keeps it.
     thp_disable: AtomicBool,
+    /// Tells if the process left the controlling terminal of its session with `TIOCNOTTY`, as
+    /// `proc_clear_tty` of Linux for a process that is not the session leader. A child gets the
+    /// flag on `fork`, and `setsid` clears it.
+    no_ctty: AtomicBool,
     /// Tells if the process ran `execve` after `fork`, as the inverse of `PF_FORKNOEXEC` of Linux.
     did_exec: AtomicBool,
     limits: SpinLock<[Limit; RLIM_NLIMITS]>,
@@ -434,6 +438,7 @@ impl Process {
         }
         s.pgid = self.pid;
         s.sid = self.pid;
+        self.set_no_ctty(false);
         Ok(self.pid)
     }
 
@@ -775,6 +780,16 @@ impl Process {
         self.thp_disable.store(value, Ordering::Relaxed);
     }
 
+    /// Tells if the process left the controlling terminal of its session with `TIOCNOTTY`.
+    pub fn no_ctty(&self) -> bool {
+        self.no_ctty.load(Ordering::Relaxed)
+    }
+
+    /// Sets or clears the flag that the process left the controlling terminal of its session.
+    pub fn set_no_ctty(&self, value: bool) {
+        self.no_ctty.store(value, Ordering::Relaxed);
+    }
+
     /// The value of `/proc/PID/oom_score_adj`.
     pub fn oom_score_adj(&self) -> i32 {
         self.oom_score_adj.load(Ordering::Relaxed)
@@ -935,6 +950,7 @@ impl Process {
             personality: AtomicU32::new(0),
             pdeath_signal: AtomicU32::new(0),
             thp_disable: AtomicBool::new(false),
+            no_ctty: AtomicBool::new(false),
             did_exec: AtomicBool::new(false),
             limits: SpinLock::new(crate::limits::defaults(
                 rk_mm::STACK_SIZE as u64,
@@ -1656,6 +1672,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     child.set_oom_score_adj(pp.oom_score_adj());
     child.set_personality(pp.personality());
     child.set_thp_disable(pp.thp_disable());
+    child.set_no_ctty(pp.no_ctty());
     child.cgroup.store(cgroup, Ordering::Relaxed);
     child.set_cgroup_ns(pp.cgroup_ns());
     if !share.vm
