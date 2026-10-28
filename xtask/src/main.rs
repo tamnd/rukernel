@@ -2031,8 +2031,9 @@ const AARCH64_TESTS: &[&str] =
 
 /// The tests that `boot-test aarch64` runs with the user programs of tests/user in the initramfs,
 /// as the x86-64 tests of the same names. They need `find_user_cc_aarch64`. The `busybox` test
-/// also needs an arm64 BusyBox from `RK_BUSYBOX_AARCH64`. The `blk` and `inet` tests use the
-/// virtio-mmio devices of the `virt` machine.
+/// also needs an arm64 BusyBox from `RK_BUSYBOX_AARCH64`, which tools/busybox/build.sh makes. The
+/// `blk` and `inet` tests run two times: with the virtio-mmio devices of the `virt` machine, and
+/// with virtio-pci devices on the PCI bus of the ECAM host.
 const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "inet", "busybox"];
 
 /// The time limit of each test of `AARCH64_USER_TESTS`. QEMU emulates each instruction, and the
@@ -2149,16 +2150,29 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         }
         None => Vec::new(),
     };
-    // The tests run with a GICv3, and the `boot` test also runs with a GICv2.
-    let runs = [("boot", "2")]
+    // The tests run with a GICv3, and the `boot` test also runs with a GICv2. The device tests
+    // also run with virtio-pci devices.
+    let pci_runs =
+        user_tests.iter().filter(|t| matches!(**t, "blk" | "inet")).map(|t| (*t, "3", true));
+    let runs = [("boot", "2", false)]
         .into_iter()
-        .chain(AARCH64_TESTS.iter().chain(&user_tests).map(|t| (*t, "3")));
+        .chain(AARCH64_TESTS.iter().chain(&user_tests).map(|t| (*t, "3", false)))
+        .chain(pci_runs);
     // RK_AARCH64_TESTS gives a list of test names with commas, for a run by hand.
     let only = std::env::var("RK_AARCH64_TESTS").ok();
     let selected = |t: &str| only.as_deref().is_none_or(|o| o.split(',').any(|n| n == t));
-    for (test, gic) in runs.filter(|(t, _)| selected(t)) {
+    for (test, gic, pci) in runs.filter(|(t, _, _)| selected(t)) {
         let test = &test;
-        let name = if gic == "2" { format!("{test} with GICv2") } else { String::from(*test) };
+        let name = match (gic, pci) {
+            ("2", _) => format!("{test} with GICv2"),
+            (_, true) => format!("{test} with virtio-pci"),
+            _ => String::from(*test),
+        };
+        let (blk_device, net_device) = if pci {
+            ("virtio-blk-pci", "virtio-net-pci")
+        } else {
+            ("virtio-blk-device", "virtio-net-device")
+        };
         let smp = if matches!(*test, "boot" | "smp") { AARCH64_SMP_CPUS } else { "1" };
         // The `inet` test connects to a TCP server on the host, as on x86-64.
         let server = if *test == "inet" { Some(TcpServer::start()?) } else { None };
@@ -2184,10 +2198,11 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             write_blk_disk(&disk)?;
             cmd.arg("-drive")
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
-                .args(["-device", "virtio-blk-device,drive=disk0"]);
+                .arg("-device")
+                .arg(format!("{blk_device},drive=disk0"));
         }
         if *test == "inet" {
-            cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-device,netdev=n0"]);
+            cmd.args(["-netdev", "user,id=n0", "-device", &format!("{net_device},netdev=n0")]);
         }
         // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
         // gives the result.

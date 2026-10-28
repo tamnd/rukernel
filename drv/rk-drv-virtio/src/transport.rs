@@ -1,11 +1,11 @@
-//! The transport of a virtio device: the modern PCI transport on x86-64, and the MMIO transport
-//! of the device tree on arm64. The drivers use the device through `Transport`, which does the
-//! steps that are the same on each transport, such as the feature negotiation.
+//! The transport of a virtio device: the modern PCI transport, and on arm64 also the MMIO
+//! transport of the device tree. The drivers use the device through `Transport`, which does the
+//! steps that are the same on each transport, such as the feature negotiation and the interrupt.
 
 #[cfg(target_arch = "aarch64")]
 use crate::mmio::MmioTransport;
-#[cfg(target_arch = "x86_64")]
 use crate::pci::PciTransport;
+use rk_frame::irq::Line;
 
 /// The bits of the device status.
 pub(crate) mod status {
@@ -29,7 +29,6 @@ pub(crate) struct QueueAddrs {
 /// A virtio device after the reset, on one of the transports.
 pub(crate) enum Transport {
     /// A device on the PCI bus.
-    #[cfg(target_arch = "x86_64")]
     Pci(PciTransport),
     /// A device on the MMIO transport.
     #[cfg(target_arch = "aarch64")]
@@ -40,7 +39,6 @@ pub(crate) enum Transport {
 macro_rules! each {
     ($t:expr, $x:ident => $e:expr) => {
         match $t {
-            #[cfg(target_arch = "x86_64")]
             Transport::Pci($x) => $e,
             #[cfg(target_arch = "aarch64")]
             Transport::Mmio($x) => $e,
@@ -93,6 +91,33 @@ impl Transport {
     /// `enable_queue` gave.
     pub(crate) fn notify(&self, at: usize, index: u16) {
         each!(self, t => t.notify(at, index));
+    }
+
+    /// The interrupt line of the device, or `None` if the driver must poll.
+    pub(crate) fn irq(&self) -> Option<Line> {
+        each!(self, t => t.irq())
+    }
+
+    /// Handles the interrupt of the device, if it came: tells the device that the driver saw it
+    /// and turns the line on again. The driver then reads its queues. Gives `true` if the
+    /// interrupt came.
+    pub(crate) fn handle_interrupt(&self) -> bool {
+        let Some(line) = self.irq() else { return false };
+        if !line.take() {
+            return false;
+        }
+        each!(self, t => t.ack_interrupt());
+        line.unmask();
+        true
+    }
+
+    /// Waits until the interrupt of the device or another interrupt comes. Without a line, the
+    /// call only spins once.
+    pub(crate) fn wait(&self) {
+        match self.irq() {
+            Some(line) => line.wait(),
+            None => core::hint::spin_loop(),
+        }
     }
 
     /// Reads the byte at `offset` of the configuration of the device.

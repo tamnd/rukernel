@@ -27,7 +27,7 @@ pub mod iomem;
 #[cfg(target_os = "none")]
 pub mod irq;
 pub mod mm;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod pci;
 pub mod sync;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]

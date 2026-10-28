@@ -4,7 +4,8 @@
 //! an interface index. The device counts the packets and the bytes, and it checks the flags and
 //! the MTU, so a driver only moves frames. A frame on the receive path goes from `NetDevice::poll`
 //! to a function of the caller. This is the place of the NAPI poll of Linux, and the IPv4 stack
-//! puts its receive function here. The drivers do not use interrupts yet, so the caller polls.
+//! puts its receive function here. The caller polls. On arm64 the interrupt of a device only
+//! wakes an idle CPU.
 
 use crate::buf::NetBuf;
 use crate::consts::{
