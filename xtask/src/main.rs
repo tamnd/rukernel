@@ -1268,7 +1268,14 @@ fn build_ltp_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
 /// Builds the x86-64 kernel and the initramfs of the boot tests, and gives the path of the ELF
 /// image. The initramfs is in the same directory.
 fn build_kernel() -> Result<PathBuf> {
-    cargo(&["build", "--package", "rukernel", "--target", "x86_64-unknown-none"])?;
+    // RK_KERNEL_FEATURES selects features of the kernel, such as `corten` for the CortenMM
+    // backend of rk-mm.
+    let features = std::env::var("RK_KERNEL_FEATURES").unwrap_or_default();
+    let mut args = vec!["build", "--package", "rukernel", "--target", "x86_64-unknown-none"];
+    if !features.is_empty() {
+        args.extend(["--features", features.as_str()]);
+    }
+    cargo(&args)?;
     let kernel = workspace_root().join("target/x86_64-unknown-none/debug/rukernel");
     let dir = kernel.parent().ok_or("the kernel path has no directory")?;
     let user = build_user(dir)?;

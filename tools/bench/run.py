@@ -44,6 +44,8 @@ BENCHES = [
     ("mem", "mmap", "ns", False, "`mmap` and `munmap` of 64 KiB anonymous memory"),
     ("mem", "fork", "us", False, "`fork`, `_exit` and `waitpid` of a small process"),
     ("mem", "fork_big", "us", False, "the same with 128 MiB of written private memory"),
+    ("mem", "fault_mt", "ns", False, "`fault` in one thread per CPU at the same time, wall time"),
+    ("mem", "mmap_mt", "ns", False, "`mmap` in one thread per CPU at the same time, wall time"),
     ("net", "tcp_rr", "us", False, "TCP round trip of 1 byte on loopback"),
     ("net", "tcp_stream", "MB/s", True, "TCP throughput on loopback, writes of 64 KiB"),
     ("net", "udp_rr", "us", False, "UDP round trip of 1 byte on loopback"),
@@ -288,6 +290,8 @@ def main():
     p.add_argument("--commit", help="the rukernel commit for the table (default: git HEAD)")
     p.add_argument("--reuse", action="store_true", help="do not boot, and make the table from "
                    "the logs in --out of an earlier run with the same options, on the same host")
+    p.add_argument("--reuse-linux", action="store_true", help="boot only rukernel, and take the "
+                   "Linux values from the log in --out of an earlier run with the same options")
     p.add_argument("--date", help="the date of the run for the table (default: today)")
     p.add_argument("--only", help="run only these benchmarks, with a comma between them")
     a = p.parse_args()
@@ -307,7 +311,10 @@ def main():
         rk = parse(os.path.join(a.out, "rukernel.log"))
     else:
         initrd = initramfs(a)
-        linux = boot(a, "linux", a.linux, initrd, a.linux_cmdline)
+        if a.reuse_linux:
+            linux = parse(os.path.join(a.out, "linux.log"))
+        else:
+            linux = boot(a, "linux", a.linux, initrd, a.linux_cmdline)
         rk = boot(a, "rukernel", a.rukernel, initrd, a.rk_cmdline)
     text = table(a, linux, rk)
     with open(a.table, "w") as f:

@@ -38,6 +38,7 @@
 #define PAGE 4096
 #define FAULT_BYTES (16L << 20)
 #define BIG_BYTES (128L << 20)
+#define MT_BYTES (4L << 20)
 #define STREAM_CHUNK 65536
 #define UDP_SIZE 1024
 
@@ -253,6 +254,80 @@ static double b_fork_big(void)
 	double v = fork_loop(count(50));
 	munmap(m, BIG_BYTES);
 	return v;
+}
+
+/* The number of threads of the multithreaded benchmarks: one for each CPU of the process. */
+static int nthreads(void)
+{
+	cpu_set_t set;
+	if (sched_getaffinity(0, sizeof(set), &set) != 0)
+		return 1;
+	int n = CPU_COUNT(&set);
+	return n > 0 ? n : 1;
+}
+
+struct mt_arg {
+	pthread_barrier_t *start;
+	long rounds;
+	int fault;
+};
+
+/* One thread of fault_mt or mmap_mt. Each thread maps its own range, as will-it-scale does. */
+static void *mt_fn(void *p)
+{
+	struct mt_arg *a = p;
+	pthread_barrier_wait(a->start);
+	for (long r = 0; r < a->rounds; r++) {
+		long len = a->fault ? MT_BYTES : 65536;
+		char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED)
+			die("mmap");
+		if (a->fault)
+			for (long i = 0; i < len; i += PAGE)
+				m[i] = 1;
+		munmap(m, len);
+	}
+	return NULL;
+}
+
+/* Runs `rounds` rounds in each of the threads, and gives the wall time in ns of one operation of
+ * all the threads: the time of the run over the operations of all threads. */
+static double mt_run(long rounds, int fault, long ops_per_round)
+{
+	int n = nthreads();
+	pthread_t th[64];
+	struct mt_arg arg[64];
+	pthread_barrier_t start;
+	if (n > 64)
+		n = 64;
+	pthread_barrier_init(&start, NULL, n + 1);
+	for (int i = 0; i < n; i++) {
+		arg[i] = (struct mt_arg){&start, rounds, fault};
+		if (pthread_create(&th[i], NULL, mt_fn, &arg[i]) != 0)
+			die("pthread_create");
+	}
+	pthread_barrier_wait(&start);
+	long t = now_ns();
+	for (int i = 0; i < n; i++)
+		pthread_join(th[i], NULL);
+	long total = now_ns() - t;
+	pthread_barrier_destroy(&start);
+	return (double)total / (n * rounds * ops_per_round);
+}
+
+/* mem: the write fault on a new anonymous page in each thread at the same time, as page_fault1 of
+ * will-it-scale. Each round of a thread maps 4 MiB, writes each page and unmaps it. The time is
+ * the wall time of one fault: the time of the run over the faults of all threads. */
+static double b_fault_mt(void)
+{
+	return mt_run(count(400) / 100 + 1, 1, MT_BYTES / PAGE);
+}
+
+/* mem: mmap and munmap of 64 KiB in each thread at the same time, as mmap1 of will-it-scale. The
+ * time is the wall time of one pair over the pairs of all threads. */
+static double b_mmap_mt(void)
+{
+	return mt_run(count(2000), 0, 1);
 }
 
 static struct sockaddr_in loopback(int p)
@@ -477,6 +552,7 @@ static const struct {
 	{"thread", b_thread},	   {"fault", b_fault},		{"mmap", b_mmap},
 	{"fork", b_fork},	   {"fork_big", b_fork_big},	{"tcp_rr", b_tcp_rr},
 	{"tcp_stream", b_tcp_stream}, {"udp_rr", b_udp_rr},	{"udp_stream", b_udp_stream},
+	{"fault_mt", b_fault_mt},  {"mmap_mt", b_mmap_mt},
 };
 
 /* As init: get a console, mount /proc and /dev, and bring up lo. Errors do not stop the run. */
