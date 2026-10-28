@@ -4,11 +4,13 @@
 #
 # clone08 and clone10 use CLONE_THREAD or CLONE_SETTLS, and the clone function of musl refuses them
 # with EINVAL. clone09 needs network name spaces. clone11 needs kernel options that rukernel does
-# not have. fork13 forks until its run time is over, and fork14 maps 16 TiB and forks after each
-# GiB. They are too slow for the boot test. mremap06 needs fallocate, and mremap07 needs kernel
-# options that rukernel does not have. msync04 needs a block device. mlock02 needs user IDs, and
-# mincore04 needs a page cache that processes share. setrlimit01 and setrlimit06 need the kernel to
-# enforce the limits, and setrlimit02 needs user IDs. futex_waitv03 needs System V shared memory.
+# not have. fork13 forks until its run time is over, so it is too slow for the boot test. fork14
+# maps 1 GiB 16384 times. With the 512 MiB of the boot test, the overcommit check refuses each map,
+# as on Linux, and the test gives TCONF and checks nothing. mremap06 needs fallocate, and mremap07
+# needs kernel options that rukernel does not have. msync04 needs a block device. mlock02 needs user
+# IDs, and mincore04 needs a page cache that processes share. setrlimit01 and setrlimit06 need the
+# kernel to enforce the limits, and setrlimit02 needs user IDs. futex_waitv03 needs System V shared
+# memory.
 #
 # sigwaitinfo01 and sigtimedwait01 wait for an empty set of signals, and the wrappers of musl call
 # the system call again after EINTR, so the tests do not stop. rt_sigsuspend01, rt_sigaction01 and

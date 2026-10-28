@@ -195,6 +195,22 @@ impl<T> Eevdf<T> {
         e.lag = 0;
     }
 
+    /// Tells if `e`, a task that wakes or is new and is in the queue now, takes the CPU from
+    /// `curr`, the task that runs, as `check_preempt_wakeup_fair` of Linux. With the
+    /// `RUN_TO_PARITY` of Linux, `curr` keeps the CPU while it is eligible and did not use its
+    /// slice, so that it runs to the average before a wake stops it. Then `e` takes the CPU if
+    /// it is eligible and `curr` is not eligible or has a later deadline.
+    pub fn wakeup_preempt(&self, curr: &Entity, e: &Entity) -> bool {
+        let (key, load) = self.sums(Some(curr));
+        // The test of `pick`, for a load that is not 0.
+        let eligible = |v: u64| (i128::from(v) - i128::from(self.min_vruntime)) * load <= key;
+        let curr_eligible = eligible(curr.vruntime);
+        if curr_eligible && curr.vruntime < curr.deadline {
+            return false;
+        }
+        eligible(e.vruntime) && (!curr_eligible || e.deadline < curr.deadline)
+    }
+
     /// Adds a task.
     pub fn push(&mut self, task: T, e: Entity) {
         self.key += self.key_of(&e);
@@ -358,6 +374,11 @@ mod glue {
         /// The number and the entity of the task that runs on the CPU. The entity is a copy from
         /// the last charge, as `curr` of Linux is current from the last `update_curr`.
         curr: Option<(u64, Entity)>,
+        /// The time in nanoseconds of the copy in `curr`.
+        curr_at: u64,
+        /// A task that woke asks the task that runs to give the CPU, as `TIF_NEED_RESCHED` of
+        /// Linux after `wakeup_preempt`.
+        preempt: bool,
         /// The time of the next periodic balance, in nanoseconds.
         next_balance: u64,
         /// The number and the cgroup of the task that counts as on the CPU in the pressure of
@@ -367,7 +388,14 @@ mod glue {
 
     impl Rq {
         const fn new() -> Self {
-            Self { queue: Eevdf::new(), curr: None, next_balance: 0, psi_curr: None }
+            Self {
+                queue: Eevdf::new(),
+                curr: None,
+                curr_at: 0,
+                preempt: false,
+                next_balance: 0,
+                psi_curr: None,
+            }
         }
 
         fn load(&self) -> Load {
@@ -426,8 +454,8 @@ mod glue {
         }
 
         /// Adds `task` with the entity `e` to the queue of `cpu`. If `place` is `Some(new)`, the
-        /// task is first placed in the virtual time of the queue.
-        fn push(&self, cpu: usize, task: Arc<Task>, mut e: Entity, place: Option<bool>) {
+        /// task is first placed in the virtual time of the queue. Gives the entity in the queue.
+        fn push(&self, cpu: usize, task: Arc<Task>, mut e: Entity, place: Option<bool>) -> Entity {
             data(&task).cpu.store(cpu, Ordering::Relaxed);
             let mut rq = self.rqs[cpu].lock();
             if let Some(new) = place {
@@ -435,6 +463,21 @@ mod glue {
                 rq.queue.place(&mut e, curr.as_ref(), new);
             }
             rq.queue.push(task, e);
+            e
+        }
+
+        /// Tells if the task `id` with the entity `e`, which woke into the queue of `cpu`, takes
+        /// the CPU from the task that runs there, as `wakeup_preempt` of Linux. Then the queue
+        /// remembers it for `should_yield`.
+        fn wakeup_preempt(&self, cpu: usize, id: u64, e: &Entity) -> bool {
+            let now = rk_frame::time::nanos();
+            let mut rq = self.rqs[cpu].lock();
+            let Some(mut curr) = rq.curr_except(id) else { return false };
+            // The copy is from the last charge, so the task ran for the time since then.
+            curr.vruntime = curr.vruntime.saturating_add(curr.virt(now.saturating_sub(rq.curr_at)));
+            let preempt = rq.queue.wakeup_preempt(&curr, e);
+            rq.preempt |= preempt;
+            preempt
         }
 
         /// Removes a task for which `ok` gives `true` from the queue of `cpu`. The entity has
@@ -503,8 +546,13 @@ mod glue {
                 self.rqs[this].lock().queue.save_lag(&mut e, TICK_NS);
             }
             let cpu = self.select(&task, d.cpu.load(Ordering::Relaxed), why == Enqueue::New);
+            let id = task.id();
             // A task that wakes has the lag of its sleep, from `put_prev` on the CPU where it ran.
-            self.push(cpu, task, e, Some(why == Enqueue::New));
+            let e = self.push(cpu, task, e, Some(why == Enqueue::New));
+            // A task that moves for its affinity mask does not stop the task that runs.
+            if why != Enqueue::Yield && self.wakeup_preempt(cpu, id, &e) {
+                rk_frame::task::resched_cpu(cpu);
+            }
             cpu
         }
 
@@ -569,6 +617,8 @@ mod glue {
             let old = {
                 let mut rq = self.rqs[this].lock();
                 rq.curr = Some((task.id(), e));
+                rq.curr_at = rk_frame::time::nanos();
+                rq.preempt = false;
                 rq.psi_curr.replace((task.id(), group))
             };
             match old {
@@ -591,14 +641,15 @@ mod glue {
             let this = cpu::id();
             let (used, e) = charge(task);
             let now = rk_frame::time::nanos();
-            let due = {
+            let (due, preempt) = {
                 let mut rq = self.rqs[this].lock();
                 rq.curr = Some((task.id(), e));
+                rq.curr_at = now;
                 let due = now >= rq.next_balance;
                 if due {
                     rq.next_balance = now + BALANCE_INTERVAL;
                 }
-                due
+                (due, core::mem::take(&mut rq.preempt))
             };
             // The periodic balance on the tick, as `sched_balance_trigger` of Linux.
             if due {
@@ -609,7 +660,7 @@ mod glue {
             if !balance::allows(data(task).affinity.load(Ordering::Relaxed), this) {
                 return true;
             }
-            used && !self.rqs[this].lock().queue.is_empty()
+            (used || preempt) && !self.rqs[this].lock().queue.is_empty()
         }
 
         fn set_nice(&self, task: &Task, nice: i32, idle: bool) {
