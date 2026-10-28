@@ -63,6 +63,7 @@ version = "0.4.7"
 dependencies = [
  "rk-abi",
  "rk-frame",
+ "rk-fs-tmpfs",
  "rk-vfs",
  "zerocopy",
 ]

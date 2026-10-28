@@ -1233,3 +1233,32 @@ offset = 4
 name = "ws_ypixel"
 type = "u16"
 offset = 6
+
+[[struct]]
+name = "termio"
+size = 18
+align = 2
+[[struct.field]]
+name = "c_iflag"
+type = "u16"
+offset = 0
+[[struct.field]]
+name = "c_oflag"
+type = "u16"
+offset = 2
+[[struct.field]]
+name = "c_cflag"
+type = "u16"
+offset = 4
+[[struct.field]]
+name = "c_lflag"
+type = "u16"
+offset = 6
+[[struct.field]]
+name = "c_line"
+type = "u8"
+offset = 8
+[[struct.field]]
+name = "c_cc"
+type = "[u8; 8]"
+offset = 9

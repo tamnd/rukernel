@@ -352,7 +352,7 @@ fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, seg: &Seg) {
     }
     let &(src, sport, dst, dport) = key;
     let bytes = seg.encode(sport, dport, &src, &dst);
-    let out = Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos };
+    let out = Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos, ext: Vec::new() };
     // A lost segment is like a segment that the network lost: the timers send it again.
     let _ = stack6::output_ip(&out, oif, &bytes);
 }

@@ -46,7 +46,7 @@ const STRUCTS: &[(&str, &[&str])] = &[
     ("asm/signal.h", &["sigaltstack"]),
     ("linux/capability.h", &["__user_cap_header_struct", "__user_cap_data_struct"]),
     ("asm/termbits.h", &["termios", "termios2"]),
-    ("asm/termios.h", &["winsize"]),
+    ("asm/termios.h", &["winsize", "termio"]),
 ];
 
 /// The type of one field.

@@ -929,3 +929,27 @@ const _: () = {
     assert!(core::mem::offset_of!(Winsize, ws_xpixel) == 4);
     assert!(core::mem::offset_of!(Winsize, ws_ypixel) == 6);
 };
+
+/// `struct termio` from `<asm/termios.h>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+pub struct Termio {
+    pub c_iflag: u16,
+    pub c_oflag: u16,
+    pub c_cflag: u16,
+    pub c_lflag: u16,
+    pub c_line: u8,
+    pub c_cc: [u8; 8],
+    _pad0: [u8; 1],
+}
+
+const _: () = {
+    assert!(size_of::<Termio>() == 18);
+    assert!(align_of::<Termio>() == 2);
+    assert!(core::mem::offset_of!(Termio, c_iflag) == 0);
+    assert!(core::mem::offset_of!(Termio, c_oflag) == 2);
+    assert!(core::mem::offset_of!(Termio, c_cflag) == 4);
+    assert!(core::mem::offset_of!(Termio, c_lflag) == 6);
+    assert!(core::mem::offset_of!(Termio, c_line) == 8);
+    assert!(core::mem::offset_of!(Termio, c_cc) == 9);
+};

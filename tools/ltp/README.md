@@ -17,7 +17,7 @@ This directory has the files that run the Linux Test Project (LTP) on rukernel, 
 
 `run.py` makes an ext4 image of the LTP tree, and splits the tests of each runtest file in batches of 60 tests. Each batch boots the kernel in QEMU, with BusyBox and an init script in the initramfs. The script mounts the image read only on `/ltp`, mounts tmpfs on `/tmp` and `/dev/shm`, brings up `lo`, and runs the tests one after the other, as `runltp` does. The second disk, `/dev/vda`, is the device of the tests that need one (`LTP_DEV`). `LTP_TIMEOUT_MUL` is 4, because QEMU without KVM is slow.
 
-Each test runs in its own session with a time limit (200 seconds for the baseline). When the time is over, the script kills all the processes of the session, so one test that hangs does not stop the batch. When the kernel panics or hangs during a test, `run.py` records the result of the test and boots again with the next test. At most 2 batches run at the same time.
+Each test runs in its own session with a time limit (200 seconds for the baseline). A test that runs longer by design has a larger limit in `LIMITS` of `run.py`, for example setsockopt11 with its runtime of 300 seconds. When the time is over, the script kills all the processes of the session, so one test that hangs does not stop the batch. When the kernel panics or hangs during a test, `run.py` records the result of the test and boots again with the next test. At most 2 batches run at the same time.
 
 ```sh
 tools/ltp/build.sh --full ~/rkltp
