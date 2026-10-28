@@ -167,6 +167,10 @@ pub const ARPHRD_ETHER: u16 = 1;
 pub const ARPHRD_LOOPBACK: u16 = 772;
 /// A device without a link header, as a TUN device.
 pub const ARPHRD_NONE: u16 = 0xfffe;
+/// A SLIP line.
+pub const ARPHRD_SLIP: u16 = 256;
+/// A CAN bus, as a SLCAN line.
+pub const ARPHRD_CAN: u16 = 280;
 /// The flag of an ARP entry with a known hardware address, `ATF_COM` of linux/if_arp.h, for
 /// /proc/net/arp. The value is written by hand, as the values of `ARPHRD_*`.
 pub const ATF_COM: u32 = 0x02;

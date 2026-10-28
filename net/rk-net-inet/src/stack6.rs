@@ -366,8 +366,9 @@ fn ether(dev: &NetDevice, dst: MacAddr) -> EthHeader {
 fn transmit(dev: &NetDevice, next: &Next6, mut buf: NetBuf) -> Result<()> {
     count(&COUNTERS6.out_transmits);
     add(&COUNTERS6.out_octets, buf.len());
-    // A TUN device has no link header and no neighbours, as the loopback device.
-    if matches!(dev.kind(), LinkKind::Loopback | LinkKind::Tun) {
+    // A TUN device and a line device have no link header and no neighbours, as the loopback
+    // device.
+    if matches!(dev.kind(), LinkKind::Loopback | LinkKind::Tun | LinkKind::Line { .. }) {
         ether(dev, MacAddr::ZERO).push(&mut buf);
         return dev.transmit(buf);
     }

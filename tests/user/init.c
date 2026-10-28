@@ -564,7 +564,13 @@ static void test_devices(void)
 	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
-static volatile sig_atomic_t pty_hups, pty_conts;
+static volatile sig_atomic_t pty_hups, pty_conts, pty_ttous;
+
+static void pty_on_ttou(int sig)
+{
+	(void)sig;
+	pty_ttous++;
+}
 
 static void pty_on_signal(int sig)
 {
@@ -627,6 +633,38 @@ static int pty_session_child(const char *name)
 		return 10 + (WIFEXITED(status) ? WEXITSTATUS(status) : 9);
 	if (ioctl(t, TIOCGSID, &sid) != 0 || sid != getpid())
 		return 7;
+	/*
+	 * TIOCSPGRP from a background group sends SIGTTOU to the group, as tty_check_change.
+	 * Without SA_RESTART the call gives EINTR after the handler. A blocked SIGTTOU lets it set
+	 * the group.
+	 */
+	pid = fork();
+	if (pid == 0) {
+		struct sigaction sa = { .sa_handler = pty_on_ttou };
+		sigset_t set;
+		sigemptyset(&set);
+		sigaddset(&set, SIGTTOU);
+		if (setpgid(0, 0) != 0 || sigaction(SIGTTOU, &sa, NULL) != 0)
+			_exit(1);
+		pgrp = getpgrp();
+		if (ioctl(t, TIOCSPGRP, &pgrp) != -1 || errno != EINTR || pty_ttous != 1)
+			_exit(2);
+		if (sigprocmask(SIG_BLOCK, &set, NULL) != 0 || ioctl(t, TIOCSPGRP, &pgrp) != 0 || pty_ttous != 1)
+			_exit(3);
+		_exit(0);
+	}
+	status = -1;
+	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return 30 + (WIFEXITED(status) ? WEXITSTATUS(status) : 9);
+	/* The group of the leader is in the background now. Its parent is init, so the group is
+	 * orphaned and gets ENOTTY. With SIGTTOU ignored, it sets the group. */
+	pgrp = getpid();
+	if (getppid() == 1 && (ioctl(t, TIOCSPGRP, &pgrp) != -1 || errno != ENOTTY))
+		return 40;
+	signal(SIGTTOU, SIG_IGN);
+	if (ioctl(t, TIOCSPGRP, &pgrp) != 0)
+		return 41;
+	signal(SIGTTOU, SIG_DFL);
 	/* A hang up of the slave sends SIGHUP and SIGCONT to the session leader. */
 	signal(SIGHUP, pty_on_signal);
 	signal(SIGCONT, pty_on_signal);
@@ -3762,7 +3800,11 @@ static void test_tty(void)
 	int status = 0;
 	check("^C stops the foreground job", waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) &&
 						    WTERMSIG(status) == SIGINT);
+	/* init is in the background now. A shell ignores SIGTTOU to take the terminal back, as
+	 * tty_check_change in drivers/tty/tty_jobctrl.c of Linux sends SIGTTOU otherwise. */
+	signal(SIGTTOU, SIG_IGN);
 	check("tcsetpgrp back to init", tcsetpgrp(0, getpgrp()) == 0);
+	signal(SIGTTOU, SIG_DFL);
 }
 
 /* The load of hackbench in its process mode: each group has HB_FDS senders and HB_FDS receivers,
@@ -4530,6 +4572,119 @@ static void test_tcp_host(int port)
 #define RK_IFF_DETACH_QUEUE 0x0400
 #define RK_TUNSETQUEUE _IOW('T', 217, int)
 #define RK_TUNSETIFINDEX _IOW('T', 218, unsigned int)
+#define RK_N_SLIP 1
+#define RK_N_SLCAN 17
+#define RK_ETH_P_IP 0x0800
+#define RK_ETH_P_CAN 0x000c
+
+/* Opens a pty pair and sets the line discipline ldisc on the slave. Gives the master, the slave
+ * in *slave and the name of the network device in name, or -1. */
+static int line_open(int ldisc, int *slave, char *name)
+{
+	char path[32];
+	if (access("/dev/pts/ptmx", F_OK) != 0) {
+		mkdir("/dev/pts", 0755);
+		mount("devpts", "/dev/pts", "devpts", 0, NULL);
+	}
+	int m = pty_open_pair(path, sizeof(path));
+	*slave = m < 0 ? -1 : open(path, O_RDWR | O_NOCTTY);
+	if (*slave < 0 || ioctl(*slave, TIOCSETD, &ldisc) != 0 || ioctl(*slave, SIOCGIFNAME, name) != 0) {
+		close(m);
+		return -1;
+	}
+	return m;
+}
+
+/* Sets the device name up with the MTU mtu, and binds a new packet socket to it for the
+ * protocol proto. Gives the socket, or -1. */
+static int line_socket(const char *name, int mtu, int proto)
+{
+	int p = socket(AF_PACKET, SOCK_RAW, 0);
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, name);
+	ifr.ifr_mtu = mtu;
+	int r = ioctl(p, SIOCSIFMTU, &ifr);
+	r |= ioctl(p, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags |= IFF_UP;
+	r |= ioctl(p, SIOCSIFFLAGS, &ifr);
+	r |= ioctl(p, SIOCGIFINDEX, &ifr);
+	struct sockaddr_ll ll = { .sll_family = AF_PACKET, .sll_protocol = htons(proto),
+				  .sll_ifindex = ifr.ifr_ifindex };
+	r |= bind(p, (struct sockaddr *)&ll, sizeof(ll));
+	if (p < 0 || r != 0) {
+		close(p);
+		return -1;
+	}
+	return p;
+}
+
+/* Reads at most size bytes from fd after a poll of one second. */
+static long line_read(int fd, void *buf, size_t size)
+{
+	struct pollfd pf = { .fd = fd, .events = POLLIN };
+	return poll(&pf, 1, 1000) == 1 ? read(fd, buf, size) : -1;
+}
+
+/* The line disciplines N_SLIP and N_SLCAN on a pty slave, as LTP pty04 (#433). */
+static void test_slip(void)
+{
+	char name[IFNAMSIZ] = { 0 };
+	int s = -1, d = -1;
+	int m = line_open(RK_N_SLIP, &s, name);
+	check("TIOCSETD N_SLIP makes a SLIP device", m >= 0 && strncmp(name, "sl", 2) == 0 &&
+						       ioctl(s, TIOCGETD, &d) == 0 && d == RK_N_SLIP);
+	if (m < 0)
+		return;
+	check("a read of a slave with N_SLIP gives EIO", read(s, &d, 1) == -1 && errno == EIO);
+	int p = line_socket(name, 1000, RK_ETH_P_IP);
+	check("a packet socket binds to the SLIP device", p >= 0);
+	/* A SLIP frame from the master. ESC ESC_END is END, and ESC ESC_ESC is ESC. */
+	unsigned char in[] = { 'a', 0xdb, 0xdc, 'b', 0xdb, 0xdd, 'c', 0xc0 }, buf[64];
+	struct sockaddr_ll from = { 0 };
+	socklen_t fl = sizeof(from);
+	struct pollfd pf = { .fd = p, .events = POLLIN };
+	long n = -1;
+	if (write(m, in, sizeof(in)) == sizeof(in) && poll(&pf, 1, 1000) == 1)
+		n = recvfrom(p, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
+	check("a packet socket gets the SLIP frame of the master",
+	      n == 5 && memcmp(buf, "a\xc0" "b\xdb" "c", 5) == 0 && from.sll_hatype == 256 &&
+		      from.sll_protocol == htons(RK_ETH_P_IP));
+	/* A frame that the socket sends goes to the master with END at both ends. */
+	n = send(p, "x\xc0y", 3, 0) == 3 ? line_read(m, buf, sizeof(buf)) : -1;
+	check("the master reads the SLIP frame of the packet socket",
+	      n == 6 && memcmp(buf, "\xc0x\xdb\xdcy\xc0", 6) == 0);
+	/* A hang up of the slave removes the device. The socket gets ENETDOWN, as packet_notifier. */
+	check("a hang up of the slave removes the SLIP device",
+	      ioctl(s, TIOCVHANGUP, 0) == 0 && if_nametoindex(name) == 0);
+	check("a packet socket of a removed device gets ENETDOWN and then ENXIO",
+	      recv(p, buf, sizeof(buf), MSG_DONTWAIT) == -1 && errno == ENETDOWN &&
+		      send(p, "x", 1, 0) == -1 && errno == ENXIO);
+	close(p);
+	close(s);
+	close(m);
+
+	/* N_SLCAN: a CAN frame is a line of text. */
+	m = line_open(RK_N_SLCAN, &s, name);
+	check("TIOCSETD N_SLCAN makes a serial line CAN device", m >= 0 && strncmp(name, "slcan", 5) == 0);
+	if (m < 0)
+		return;
+	p = line_socket(name, 16, RK_ETH_P_CAN);
+	check("a packet socket binds to the serial line CAN device", p >= 0);
+	const char *line = "t00185f5f5f5f5f5f5f5f\r";
+	pf.fd = p;
+	n = -1;
+	if (write(m, line, strlen(line)) == (long)strlen(line) && poll(&pf, 1, 1000) == 1)
+		n = recv(p, buf, sizeof(buf), 0);
+	check("a packet socket gets the CAN frame of the master",
+	      n == 16 && memcmp(buf, "\x01\0\0\0\x08\0\0\0________", 16) == 0);
+	n = n == 16 && send(p, buf, 16, 0) == 16 ? line_read(m, buf, sizeof(buf)) : -1;
+	check("the master reads the CAN frame of the packet socket",
+	      n == 22 && memcmp(buf, "t00185F5F5F5F5F5F5F5F\r", 22) == 0);
+	close(m);
+	check("the close of the master removes the serial line CAN device", if_nametoindex(name) == 0);
+	close(p);
+	close(s);
+}
 
 /* An AF_PACKET socket on lo gets the frames of a datagram over lo. */
 static void test_packet_lo(void)
@@ -4875,6 +5030,7 @@ static void test_inet(int port)
 	test_tun();
 	test_tun_mq();
 	test_tun6();
+	test_slip();
 	test_tcp_lo();
 	test_tcp_host(port);
 }

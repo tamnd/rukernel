@@ -6,7 +6,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
-use rk_abi::native::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+use rk_abi::native::signal::{SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP, SIGTTOU};
 use rk_abi::native::syscalls as nr;
 use rk_frame::addr::VirtAddr;
 use rk_frame::println;
@@ -400,6 +400,24 @@ pub fn init() {
             if let Some(t) = rk_proc::current_thread() {
                 t.process().set_no_ctty(true);
             }
+        },
+        // `SIGTTOU` is blocked or has `SIG_IGN`, as `is_ignored` of tty_jobctrl.c of Linux.
+        ttou_ignored: || {
+            rk_proc::current_thread().is_some_and(|t| {
+                t.blocked().contains(SIGTTOU)
+                    || t.process().action(SIGTTOU).handler == rk_proc::signal::SIG_IGN
+            })
+        },
+        // A group is orphaned if no member that is alive has a parent in another group of the
+        // same session, as `will_become_orphaned_pgrp` of kernel/exit.c of Linux. A parent that
+        // is init does not count.
+        pgrp_orphaned: |pgrp| {
+            !rk_proc::processes().iter().any(|p| {
+                p.pgid() == pgrp
+                    && !p.is_zombie()
+                    && p.parent()
+                        .is_some_and(|q| q.pid() != 1 && q.pgid() != pgrp && q.sid() == p.sid())
+            })
         },
     });
     rk_net::set_cred_source(crate::net::current_cred);

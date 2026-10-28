@@ -14,12 +14,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A TUN device gets a link local address with a random interface identifier when it goes up, as addrconf.c of Linux (#429).
 - Optimistic duplicate address detection, as RFC 4429 and addrconf.c of Linux (#429). With `optimistic_dad`, the link local and SLAAC addresses are optimistic, and a program can add an optimistic address. An optimistic address is a source address after the preferred ones, or before them with `use_optimistic`. The first probe of an address that is not optimistic comes after a random delay of up to `router_solicitation_delay`.
 - `/proc/PID/pagemap` gives `PM_GUARD_REGION` (bit 58) and `PM_SWAP` for a guard page of `MADV_GUARD_INSTALL`, as task_mmu.c of Linux (#444).
+- The line disciplines `N_SLIP` and `N_SLCAN` for `TIOCSETD` on a pseudo terminal slave, as slip.c and slcan-core.c of Linux (#433). Each makes a network device, `slN` or `slcanN`, and `SIOCGIFNAME` on the slave gives its name. A write to the master gives frames to the device, and a frame that the device sends goes to the master. A hang up of the slave or of the master removes the device. A packet socket that is bound to a device that goes down gets `ENETDOWN`, as `packet_notifier` of Linux.
 
 ### Fixed
 
 - `/proc/PID/pagemap` gives `PM_MMAP_EXCLUSIVE` from the map count of the frame, not from the reference count, as task_mmu.c of Linux (#444). A page that two mappings of a shared file map is not exclusive.
 - An unmap clears the soft-dirty state of its pages, and the pages of stack growth keep the soft-dirty state of the area, as Linux (#444).
 - `/proc/kpageflags` gives `KPF_MMAP` for a hugetlb page only while a process maps it, as fs/proc/page.c of Linux (#444).
+- `TIOCSPGRP` from a process in a background group of the terminal sends `SIGTTOU` to the group and starts again after the signal, as `tty_check_change` of Linux (#433). A process that blocks or ignores `SIGTTOU` sets the group. A process in an orphaned group gets `ENOTTY`.
 
 ## [0.4.10] - 2026-10-29
 

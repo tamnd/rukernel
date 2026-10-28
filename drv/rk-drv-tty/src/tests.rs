@@ -226,9 +226,18 @@ fn set_caller(pid: u32, pgid: u32, sid: u32) {
 static LEADER_SIGNALS: rk_frame::sync::SpinLock<Vec<(u32, u32)>> =
     rk_frame::sync::SpinLock::new(Vec::new());
 
+/// The signals of the hook of `set_signal_handler` in the tests: the group and the signal.
+static GROUP_SIGNALS: rk_frame::sync::SpinLock<Vec<(u32, u32)>> =
+    rk_frame::sync::SpinLock::new(Vec::new());
+
+/// The state of `SIGTTOU` for the hooks in the tests: bit 0 tells that the caller ignores it,
+/// and bit 1 tells that the group of the caller is orphaned.
+static TTOU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// The hooks of the sessions in the tests. The groups 920 and 921 are in the session 920, and the
 /// group 950 is in the session 950. No process has another group.
 fn set_test_session_hooks() {
+    crate::set_signal_handler(|pgrp, sig| GROUP_SIGNALS.lock().push((pgrp, sig)));
     crate::set_session_hooks(crate::SessionHooks {
         signal_leader: |sid, sig| LEADER_SIGNALS.lock().push((sid, sig)),
         pgrp_session: |pgrp| match pgrp {
@@ -237,6 +246,8 @@ fn set_test_session_hooks() {
             _ => None,
         },
         leave_ctty: || CALLER[3].store(1, core::sync::atomic::Ordering::Relaxed),
+        ttou_ignored: || TTOU.load(core::sync::atomic::Ordering::Relaxed) & 1 != 0,
+        pgrp_orphaned: |_| TTOU.load(core::sync::atomic::Ordering::Relaxed) & 2 != 0,
     });
 }
 
@@ -353,12 +364,42 @@ fn pseudo_terminal_controlling_terminal() {
     assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Ok(0));
     assert_eq!(slave.ioctl(&sf, TIOCGPGRP, BASE, &mem), Ok(0));
     assert_eq!(mem.int(), 921);
+    // The group 920 is in the background now. The check of `tty_check_change` comes first, so
+    // the caller ignores `SIGTTOU` for the checks of the group argument.
+    use core::sync::atomic::Ordering::Relaxed;
+    use rk_abi::native::signal::SIGTTOU;
+    TTOU.store(1, Relaxed);
     for (pgrp, err) in [(950, Errno::EPERM), (999, Errno::ESRCH), (-1, Errno::EINVAL)] {
         mem.set_int(pgrp);
         assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(err));
     }
+    TTOU.store(0, Relaxed);
+    // `TIOCSPGRP` from the background sends `SIGTTOU` to the group of the caller, and the call
+    // starts again after the signal, as `tty_check_change` of Linux. The master sets the group
+    // of the slave, so the check is the same on the master.
     mem.set_int(920);
+    GROUP_SIGNALS.lock().clear();
+    assert_eq!(master.ioctl(&mf, TIOCSPGRP, BASE, &mem), Err(Errno::ERESTARTSYS));
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ERESTARTSYS));
+    assert_eq!(*GROUP_SIGNALS.lock(), [(920, SIGTTOU), (920, SIGTTOU)]);
+    // An orphaned group gets no signal, and `ENOTTY`.
+    TTOU.store(2, Relaxed);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ENOTTY));
+    assert_eq!(GROUP_SIGNALS.lock().len(), 2);
+    // A caller that blocks or ignores `SIGTTOU` sets the group.
+    TTOU.store(1, Relaxed);
     assert_eq!(master.ioctl(&mf, TIOCSPGRP, BASE, &mem), Ok(0));
+    TTOU.store(0, Relaxed);
+    // The foreground group sets it without a check.
+    mem.set_int(921);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Ok(0));
+    mem.set_int(920);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ERESTARTSYS));
+    assert_eq!(GROUP_SIGNALS.lock().len(), 3);
+    TTOU.store(1, Relaxed);
+    assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Ok(0));
+    TTOU.store(0, Relaxed);
+    // A process without the slave as its controlling terminal gets no signal.
     set_caller(930, 930, 930);
     assert_eq!(slave.ioctl(&sf, TIOCSPGRP, BASE, &mem), Err(Errno::ENOTTY));
 
@@ -420,4 +461,136 @@ fn devpts_options() {
     assert_eq!(root.unlink(b"ptmx"), Err(Errno::EPERM));
     assert_eq!(root.tmpfile(0o600).err(), Some(Errno::EOPNOTSUPP));
     assert!(root.lookup(b"ptmx").is_ok());
+}
+
+#[test]
+fn slip_and_slcan_codecs() {
+    use crate::netldisc::{LineRx, slcan_decode, slcan_encode, slip_encode};
+
+    // SLIP changes `END` and `ESC` in the data, and puts `END` at both ends, as `slip_esc`.
+    let mut out = Vec::new();
+    slip_encode(&[1, 0xc0, 2, 0xdb, 3], &mut out);
+    assert_eq!(out, [0xc0, 1, 0xdb, 0xdc, 2, 0xdb, 0xdd, 3, 0xc0]);
+    let mut rx = LineRx::default();
+    let frames: Vec<_> = out.iter().filter_map(|&b| rx.slip(b, 1152)).collect();
+    assert_eq!(frames, [alloc::vec![1, 0xc0, 2, 0xdb, 3]]);
+    // A frame of 2 bytes or less goes away, as `slip_unesc`.
+    assert_eq!([1u8, 2, 0xc0].iter().filter_map(|&b| rx.slip(b, 1152)).count(), 0);
+    // A frame that is too large goes away, and the next frame is good.
+    let big: Vec<u8> = [[7u8; 9].as_slice(), &[0xc0, 4, 5, 6, 0xc0]].concat();
+    let frames: Vec<_> = big.iter().filter_map(|&b| rx.slip(b, 8)).collect();
+    assert_eq!(frames, [alloc::vec![4, 5, 6]]);
+
+    // The frame of LTP pty04: the identifier 1, 8 bytes of `_`, and zero padding.
+    let line = b"t00185f5f5f5f5f5f5f5f";
+    let frame = slcan_decode(line).unwrap();
+    assert_eq!(frame[..8], [1, 0, 0, 0, 8, 0, 0, 0]);
+    assert_eq!(frame[8..], [b'_'; 8]);
+    // The line that the device sends has uppercase digits, as `slc_encaps`.
+    let mut out = Vec::new();
+    assert!(slcan_encode(&frame, &mut out));
+    assert_eq!(out, b"t00185F5F5F5F5F5F5F5F\r");
+    assert_eq!(slcan_decode(&out[..out.len() - 1]), Some(frame));
+    // An extended remote request has no data.
+    let frame = slcan_decode(b"R123456782").unwrap();
+    assert_eq!(u32::from_ne_bytes(frame[..4].try_into().unwrap()), 0xc000_0000 | 0x1234_5678);
+    assert_eq!(frame[4], 2);
+    out.clear();
+    assert!(slcan_encode(&frame, &mut out));
+    assert_eq!(out, b"R123456782\r");
+    // Bad lines and frames.
+    for line in [&b"x0011"[..], b"t0019", b"t00Z1aa", b"t0012aa", b"t001"] {
+        assert_eq!(slcan_decode(line), None);
+    }
+    let mut bad = [0u8; 16];
+    bad[4] = 9;
+    assert!(!slcan_encode(&bad, &mut out));
+    // A line ends at a carriage return or a bell. A short line goes away.
+    let mut rx = LineRx::default();
+    let lines: Vec<_> = b"t0010\rt01\x07r0020\x07".iter().filter_map(|&b| rx.slcan(b)).collect();
+    assert_eq!(lines, [b"t0010".to_vec(), b"r0020".to_vec()]);
+}
+
+#[test]
+fn slip_line_discipline() {
+    use crate::netldisc::{N_SLCAN, N_SLIP, N_TTY};
+    use crate::pty::{open_ptmx, open_slave, test_instance};
+    use rk_abi::Errno;
+    use rk_abi::native::ioctls::{TIOCGETD, TIOCSETD, TIOCSPTLCK, TIOCVHANGUP};
+    use rk_abi::native::open::{O_NOCTTY, O_NONBLOCK};
+    use rk_abi::native::sockios::SIOCGIFNAME;
+    use rk_net::buf::NetBuf;
+    use rk_net::consts::ARPHRD_SLIP;
+    use rk_net::ether::{EthHeader, HLEN, MacAddr};
+    use rk_vfs::File;
+
+    let root = test_instance(b"").unwrap();
+    let mem = Mem(core::cell::RefCell::new([0; 256]));
+    let master = open_ptmx(&root).unwrap();
+    let mf = File::with_ops(master.clone(), None, O_NONBLOCK);
+    mem.set_int(0);
+    assert_eq!(master.ioctl(&mf, TIOCSPTLCK, BASE, &mem), Ok(0));
+    let slave = open_slave(&root, 0, O_NOCTTY).unwrap();
+    let sf = File::with_ops(slave.clone(), None, O_NONBLOCK);
+
+    // `N_TTY` has no network device. A number that is not a line discipline gives `EINVAL`.
+    assert_eq!(slave.ioctl(&sf, SIOCGIFNAME, BASE, &mem), Err(Errno::ENOTTY));
+    for n in [-1, 2, 31] {
+        mem.set_int(n);
+        assert_eq!(slave.ioctl(&sf, TIOCSETD, BASE, &mem), Err(Errno::EINVAL));
+    }
+    mem.set_int(N_SLIP);
+    assert_eq!(slave.ioctl(&sf, TIOCSETD, BASE, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCSETD, BASE, &mem), Ok(0));
+    assert_eq!(slave.ioctl(&sf, TIOCGETD, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), N_SLIP);
+    // The master keeps `N_TTY`.
+    assert_eq!(master.ioctl(&mf, TIOCGETD, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), N_TTY);
+    assert_eq!(slave.ioctl(&sf, SIOCGIFNAME, BASE, &mem), Ok(0));
+    let name = mem.0.borrow().split(|&b| b == 0).next().unwrap().to_vec();
+    let name = alloc::string::String::from_utf8(name).unwrap();
+    assert!(name.starts_with("sl"));
+    let dev = rk_net::dev::by_name(&name).unwrap();
+    assert_eq!(dev.kind().arphrd(), ARPHRD_SLIP);
+    assert_eq!(dev.mtu(), 296);
+    let poll = || {
+        let mut frames = Vec::new();
+        dev.poll(8, &mut |_, f| frames.push(f.data()[HLEN..].to_vec()));
+        frames
+    };
+
+    // A device that is down drops the bytes.
+    assert_eq!(master.write(&mf, &[1, 2, 3, 0xc0]), Ok(4));
+    assert!(poll().is_empty());
+    dev.set_up(true);
+    assert_eq!(master.write(&mf, &[1, 0xdb, 0xdc, 2]), Ok(4));
+    assert_eq!(master.write(&mf, &[0xc0]), Ok(1));
+    assert_eq!(poll(), [alloc::vec![1, 0xc0, 2]]);
+    // A frame that the device sends goes to the master.
+    let mut frame = NetBuf::new(HLEN, 3);
+    frame.put(3).copy_from_slice(&[5, 6, 7]);
+    EthHeader { dst: MacAddr::ZERO, src: MacAddr::ZERO, ethertype: 0x800 }.push(&mut frame);
+    assert_eq!(dev.transmit_from(frame, 0), Ok(()));
+    let mut buf = [0u8; 16];
+    assert_eq!(master.read(&mf, &mut buf), Ok(5));
+    assert_eq!(buf[..5], [0xc0, 5, 6, 7, 0xc0]);
+    // SLIP has no read and no write for the slave.
+    assert_eq!(slave.read(&sf, &mut buf), Err(Errno::EIO));
+    assert_eq!(slave.write(&sf, b"x"), Err(Errno::EIO));
+
+    // A change of the line discipline removes the device and makes a new one.
+    mem.set_int(N_SLCAN);
+    assert_eq!(slave.ioctl(&sf, TIOCSETD, BASE, &mem), Ok(0));
+    assert!(rk_net::dev::by_name(&name).is_none());
+    assert_eq!(slave.ioctl(&sf, SIOCGIFNAME, BASE, &mem), Ok(0));
+    assert!(mem.0.borrow().starts_with(b"slcan"));
+    // A hang up of the slave removes the device and gives the slave `N_TTY`.
+    assert_eq!(slave.ioctl(&sf, TIOCVHANGUP, 0, &mem), Ok(0));
+    let name = mem.0.borrow().split(|&b| b == 0).next().unwrap().to_vec();
+    assert!(rk_net::dev::by_name(core::str::from_utf8(&name).unwrap()).is_none());
+    let again = open_slave(&root, 0, O_NOCTTY).unwrap();
+    let af = File::with_ops(again.clone(), None, O_NONBLOCK);
+    assert_eq!(again.ioctl(&af, TIOCGETD, BASE, &mem), Ok(0));
+    assert_eq!(mem.int(), N_TTY);
 }
