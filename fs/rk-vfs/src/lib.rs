@@ -30,6 +30,7 @@ pub mod lock;
 pub mod loopdev;
 pub mod mapped;
 pub mod notify;
+pub mod nsfs;
 pub mod path;
 pub mod pipe;
 pub mod swap;

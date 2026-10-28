@@ -151,6 +151,56 @@ fn new_cgroup_ns(process: &Process) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Puts `process` in the cgroup namespace `ns`, as `cgroupns_install` of Linux.
+///
+/// # Errors
+///
+/// `EPERM` without `CAP_SYS_ADMIN`.
+fn join_cgroup_ns(process: &Process, ns: u32) -> Result<(), Errno> {
+    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    process.set_cgroup_ns(ns);
+    Ok(())
+}
+
+/// `setns`: joins the namespace of a file of `/proc/PID/ns`, or the namespaces of the process of
+/// a process file descriptor, as `setns` of `kernel/nsproxy.c` of Linux.
+///
+/// The cgroup namespace is the only namespace that a process can change here. The other kinds
+/// that `unshare` cannot make are the same for each process, so a process file descriptor joins
+/// them with no change. A mount namespace through a process file descriptor gives `EINVAL`.
+pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
+    let file = cx.file(fd)?;
+    let process = cx.process();
+    if let Some((kind, id)) = file.inode().and_then(rk_vfs::nsfs::ns_of) {
+        if nstype != 0 && nstype != kind.clone_flag() {
+            return Err(Errno::EINVAL);
+        }
+        match kind {
+            rk_vfs::nsfs::NsKind::Cgroup => join_cgroup_ns(process, id)?,
+        }
+        return Ok(0);
+    }
+    let Ok(target) = crate::pidfd::process_of(cx, fd) else {
+        return Err(Errno::EINVAL);
+    };
+    let all = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEW_ANY;
+    if nstype == 0 || nstype & !all != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if nstype & CLONE_NEWNS != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if target.is_zombie() {
+        return Err(Errno::ESRCH);
+    }
+    if nstype & CLONE_NEWCGROUP != 0 {
+        join_cgroup_ns(process, target.cgroup_ns())?;
+    }
+    Ok(0)
+}
+
 /// The cgroup of the directory that `fd` opens, for `CLONE_INTO_CGROUP`.
 ///
 /// # Errors

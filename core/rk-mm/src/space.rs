@@ -593,6 +593,12 @@ impl AddressSpace {
         self.state.lock().vmas.iter().filter(|v| v.locked).map(Vma::len).sum()
     }
 
+    /// The number of pages of the address space that have a frame. It does not allocate, so the
+    /// OOM killer can use it when the memory is short.
+    pub fn page_count(&self) -> usize {
+        self.vm.page_count()
+    }
+
     /// The number of pages in `start..end` that have a frame.
     pub fn resident_pages(&self, start: usize, end: usize) -> usize {
         self.vm.pages_in(VirtAddr::new(start), VirtAddr::new(end))
@@ -1193,9 +1199,13 @@ fn write_back(vma: &Vma<FileRef>, start: usize, end: usize) -> Result<(), Errno>
 }
 
 /// Charges a page to the memory cgroup `memcg`, and marks `frame` with the charge. A frame that
-/// is not there or a charge past the limit gives `ENOMEM`.
+/// is not there, a frame from the reserve of the kernel ([`crate::USER_RESERVE`]) or a charge
+/// past the limit gives `ENOMEM`.
 fn charged(frame: Option<Frame>, memcg: u32) -> Result<Arc<Frame>, Errno> {
     let mut frame = frame.ok_or(Errno::ENOMEM)?;
+    if rk_frame::mm::frame_stats().free < crate::USER_RESERVE {
+        return Err(Errno::ENOMEM);
+    }
     if memcg != 0 {
         rk_cgroup::charge_page(memcg).map_err(|_| Errno::ENOMEM)?;
         frame.set_memcg(memcg);

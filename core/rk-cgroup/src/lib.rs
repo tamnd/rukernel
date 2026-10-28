@@ -26,12 +26,14 @@
 
 extern crate alloc;
 
+pub mod io;
 pub mod psi;
 
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 
@@ -52,12 +54,14 @@ pub const CPU: u8 = 1 << 1;
 pub const MEMORY: u8 = 1 << 2;
 /// The bit of the pids controller.
 pub const PIDS: u8 = 1 << 3;
+/// The bit of the io controller.
+pub const IO: u8 = 1 << 4;
 /// The bits of all controllers.
-pub const ALL: u8 = CPUSET | CPU | MEMORY | PIDS;
+pub const ALL: u8 = CPUSET | CPU | IO | MEMORY | PIDS;
 
 /// The controllers in the order of Linux, with their names.
-pub const CONTROLLERS: [(u8, &str); 4] =
-    [(CPUSET, "cpuset"), (CPU, "cpu"), (MEMORY, "memory"), (PIDS, "pids")];
+pub const CONTROLLERS: [(u8, &str); 5] =
+    [(CPUSET, "cpuset"), (CPU, "cpu"), (IO, "io"), (MEMORY, "memory"), (PIDS, "pids")];
 
 /// The value `max`: no limit.
 pub const MAX: u64 = u64::MAX;
@@ -77,6 +81,18 @@ const EV_HIGH: usize = 1;
 const EV_MAX: usize = 2;
 const EV_OOM: usize = 3;
 const EV_OOM_KILL: usize = 4;
+const EV_OOM_GROUP_KILL: usize = 5;
+/// The number of counts of `memory.events`.
+const NR_EV: usize = 6;
+
+/// The pages that a cgroup over `memory.high` charges before its threads wait the full delay,
+/// `MEMCG_CHARGE_BATCH` of Linux.
+const HIGH_BATCH: u64 = 64;
+/// The longest wait for `memory.high` in nanoseconds, `MEMCG_MAX_HIGH_DELAY_JIFFIES` of Linux.
+const HIGH_DELAY_MAX: u64 = 2_000_000_000;
+/// The shortest wait for `memory.high` in nanoseconds. A shorter wait does not happen, as in
+/// Linux, where the wait must be longer than `HZ / 100`.
+const HIGH_DELAY_MIN: u64 = 10_000_000;
 
 /// The weight of each nice value from -20 to 19 in the fair class: `sched_prio_to_weight` of
 /// Linux. `cpu.weight.nice` uses it.
@@ -106,9 +122,12 @@ pub struct Memory {
     /// `memory.oom.group`.
     pub oom_group: bool,
     /// The counts of `memory.events`, with the events of the subtree.
-    pub events: [u64; 5],
+    pub events: [u64; NR_EV],
     /// The counts of `memory.events.local`, with the events of this cgroup only.
-    pub events_local: [u64; 5],
+    pub events_local: [u64; NR_EV],
+    /// The bytes that the subtree charged while the use was over `memory.high`. The next
+    /// return of a thread to user mode waits for them, and sets the count to 0.
+    pub over_high: u64,
 }
 
 impl Default for Memory {
@@ -122,8 +141,9 @@ impl Default for Memory {
             max: MAX,
             swap_max: MAX,
             oom_group: false,
-            events: [0; 5],
-            events_local: [0; 5],
+            events: [0; NR_EV],
+            events_local: [0; NR_EV],
+            over_high: 0,
         }
     }
 }
@@ -260,7 +280,17 @@ struct Node {
     nr_descendants: u32,
     /// The processes in this cgroup, without the subtree.
     nr_procs: u32,
+    /// `cgroup.freeze`: the freeze of this cgroup. The threads of the subtree freeze.
     freeze: bool,
+    /// The threads of this cgroup, without the subtree, that wait in the freezer.
+    nr_frozen: u64,
+    /// The values of `cgroup.events` at the last change: `populated` and `frozen`.
+    ev_populated: bool,
+    ev_frozen: bool,
+    /// The count of the changes of `cgroup.events`, for `poll`.
+    ev_seq: u64,
+    /// The count of the changes of `memory.events` and `pids.events`, for `poll`.
+    files_seq: u64,
     /// The threads of the subtree: `pids.current`.
     pids: u64,
     pids_max: u64,
@@ -270,6 +300,7 @@ struct Node {
     mem: Memory,
     cpu: Cpu,
     cpuset: Cpuset,
+    io: io::Io,
     psi: psi::Psi,
 }
 
@@ -287,6 +318,11 @@ impl Node {
             nr_descendants: 0,
             nr_procs: 0,
             freeze: false,
+            nr_frozen: 0,
+            ev_populated: false,
+            ev_frozen: false,
+            ev_seq: 1,
+            files_seq: 1,
             pids: 0,
             pids_max: MAX,
             pids_peak: 0,
@@ -294,6 +330,7 @@ impl Node {
             mem: Memory::default(),
             cpu: Cpu { period_start: now, ..Cpu::default() },
             cpuset: Cpuset::default(),
+            io: io::Io::default(),
             psi: psi::Psi::new(now, parent == 0),
         }
     }
@@ -319,7 +356,7 @@ const fn file(name: &'static str, ctrl: u8, root: bool, child: bool, perm: u32) 
 }
 
 /// The files of a cgroup, as Linux names them.
-pub const FILES: [FileInfo; 47] = [
+pub const FILES: [FileInfo; 50] = [
     file("cgroup.controllers", 0, true, true, 0o444),
     file("cgroup.events", 0, false, true, 0o444),
     file("cgroup.freeze", 0, false, true, 0o644),
@@ -345,6 +382,9 @@ pub const FILES: [FileInfo; 47] = [
     file("cpuset.cpus.partition", CPUSET, false, true, 0o644),
     file("cpuset.mems", CPUSET, false, true, 0o644),
     file("cpuset.mems.effective", CPUSET, true, true, 0o444),
+    file("io.max", IO, false, true, 0o644),
+    file("io.stat", IO, true, true, 0o444),
+    file("io.weight", IO, false, true, 0o644),
     file("memory.current", MEMORY, false, true, 0o444),
     file("memory.events", MEMORY, false, true, 0o444),
     file("memory.events.local", MEMORY, false, true, 0o444),
@@ -493,6 +533,14 @@ pub struct Hierarchy {
     /// root `ROOT`.
     namespaces: BTreeMap<u32, CgId>,
     next_ns: u32,
+    /// A change can change `cgroup.events`, and `refresh_events` must look again.
+    dirty: bool,
+    /// A file that `poll` watches changed since the last `take_notify`.
+    notify: bool,
+    /// The cgroups with `cgroup.freeze` 1.
+    nr_freeze: u32,
+    /// A cgroup can have pages that it charged over `memory.high`, for `high_delay`.
+    any_over_high: bool,
 }
 
 impl Hierarchy {
@@ -503,7 +551,17 @@ impl Hierarchy {
         nodes.insert(ROOT, Node::new(0, b"", 0, now));
         let mut namespaces = BTreeMap::new();
         namespaces.insert(0, ROOT);
-        Self { nodes, next: ROOT + 1, online_cpus, namespaces, next_ns: 1 }
+        Self {
+            nodes,
+            next: ROOT + 1,
+            online_cpus,
+            namespaces,
+            next_ns: 1,
+            dirty: false,
+            notify: false,
+            nr_freeze: 0,
+            any_over_high: false,
+        }
     }
 
     /// Sets the CPUs of the machine, when the CPUs start.
@@ -668,6 +726,7 @@ impl Hierarchy {
             }
         }
         self.node_mut(parent)?.children.insert(name.to_vec(), id);
+        self.dirty = true;
         Ok(id)
     }
 
@@ -683,6 +742,9 @@ impl Hierarchy {
             return Err(Errno::EBUSY);
         }
         let keep = n.mem.current > 0;
+        if n.freeze {
+            self.nr_freeze -= 1;
+        }
         self.node_mut(parent)?.children.remove(name);
         for a in self.path_ids(parent) {
             if let Some(n) = self.nodes.get_mut(&a) {
@@ -690,10 +752,13 @@ impl Hierarchy {
             }
         }
         if keep {
-            self.node_mut(id)?.dead = true;
+            let n = self.node_mut(id)?;
+            n.dead = true;
+            n.freeze = false;
         } else {
             self.nodes.remove(&id);
         }
+        self.dirty = true;
         Ok(id)
     }
 
@@ -703,9 +768,91 @@ impl Hierarchy {
         n.nr_procs > 0 || n.children.values().any(|&c| self.populated(c))
     }
 
-    /// Tells if `id` or a cgroup above it is frozen.
+    /// Tells if `id` or a cgroup above it has `cgroup.freeze` 1, so the threads of `id` must
+    /// freeze, as `CGRP_FREEZE` of Linux.
     pub fn frozen(&self, id: CgId) -> bool {
-        self.path_ids(id).iter().any(|i| self.nodes[i].freeze)
+        self.nr_freeze > 0 && self.path_ids(id).iter().any(|i| self.nodes[i].freeze)
+    }
+
+    /// Tells if `id` is frozen: it must freeze, and each thread of its subtree waits in the
+    /// freezer. This is the `frozen` value of `cgroup.events`, as `CGRP_FROZEN` of Linux.
+    pub fn events_frozen(&mut self, id: CgId) -> bool {
+        self.refresh_events();
+        self.nodes.get(&id).is_some_and(|n| n.ev_frozen)
+    }
+
+    /// Tells if a cgroup has `cgroup.freeze` 1.
+    pub fn any_freeze(&self) -> bool {
+        self.nr_freeze > 0
+    }
+
+    /// Counts a thread of `id` that starts (`on` true) or stops waiting in the freezer.
+    pub fn thread_frozen(&mut self, id: CgId, on: bool) {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.nr_frozen = if on { n.nr_frozen + 1 } else { n.nr_frozen.saturating_sub(1) };
+            self.dirty = true;
+        }
+    }
+
+    /// Computes `populated` and `frozen` of `cgroup.events` again for each cgroup after a
+    /// change, as `cgroup_update_populated` and `cgroup_update_frozen` of Linux. A cgroup whose
+    /// values change counts a change for `poll`.
+    pub fn refresh_events(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        // A child has a larger ID than its parent, so the order of the IDs goes down the tree,
+        // and the reverse order goes up.
+        let ids: Vec<CgId> =
+            self.nodes.iter().filter(|(_, n)| !n.dead).map(|(&id, _)| id).collect();
+        let mut freezing: BTreeMap<CgId, bool> = BTreeMap::new();
+        for &id in &ids {
+            let n = &self.nodes[&id];
+            let up = freezing.get(&n.parent).copied().unwrap_or(false);
+            freezing.insert(id, n.freeze || up);
+        }
+        // For each cgroup: a child is populated, each child is frozen, and the threads of the
+        // children.
+        let mut below: BTreeMap<CgId, (bool, bool, u64)> = BTreeMap::new();
+        for &id in ids.iter().rev() {
+            let (child_populated, children_frozen, child_pids) =
+                below.remove(&id).unwrap_or((false, true, 0));
+            let n = &self.nodes[&id];
+            let populated = n.nr_procs > 0 || child_populated;
+            let own = n.pids.saturating_sub(child_pids);
+            let frozen = freezing[&id] && n.nr_frozen >= own && children_frozen;
+            let (parent, pids) = (n.parent, n.pids);
+            let p = below.entry(parent).or_insert((false, true, 0));
+            p.0 |= populated;
+            p.1 &= frozen;
+            p.2 += pids;
+            let Some(n) = self.nodes.get_mut(&id) else { continue };
+            if n.ev_populated != populated || n.ev_frozen != frozen {
+                n.ev_populated = populated;
+                n.ev_frozen = frozen;
+                n.ev_seq += 1;
+                self.notify = true;
+            }
+        }
+    }
+
+    /// Tells if a file that `poll` watches changed since the last call.
+    pub fn take_notify(&mut self) -> bool {
+        core::mem::take(&mut self.notify)
+    }
+
+    /// The count of the changes of the file `name` of `id`, for `poll`, or `None` for a file
+    /// without events. `cgroup.events`, `memory.events`, `memory.events.local` and
+    /// `pids.events` have events, as the files of Linux that `cgroup_file_notify` tells.
+    pub fn event_seq(&mut self, id: CgId, name: &str) -> Option<u64> {
+        self.refresh_events();
+        let n = self.nodes.get(&id)?;
+        match name {
+            "cgroup.events" => Some(n.ev_seq),
+            "memory.events" | "memory.events.local" | "pids.events" => Some(n.files_seq),
+            _ => None,
+        }
     }
 
     /// The removed cgroups below `id` that still have charges.
@@ -734,6 +881,7 @@ impl Hierarchy {
     pub fn add_process(&mut self, id: CgId) {
         if let Some(n) = self.nodes.get_mut(&id) {
             n.nr_procs += 1;
+            self.dirty = true;
         }
     }
 
@@ -741,6 +889,7 @@ impl Hierarchy {
     pub fn remove_process(&mut self, id: CgId) {
         if let Some(n) = self.nodes.get_mut(&id) {
             n.nr_procs = n.nr_procs.saturating_sub(1);
+            self.dirty = true;
         }
     }
 
@@ -770,6 +919,7 @@ impl Hierarchy {
                 node.pids_peak = node.pids_peak.max(node.pids);
             }
         }
+        self.dirty = true;
     }
 
     /// Adds `n` new threads to `id` and the cgroups above it, as `pids_try_charge` of Linux.
@@ -785,6 +935,8 @@ impl Hierarchy {
             let Some(node) = self.nodes.get_mut(&a) else { continue };
             if on && node.pids_max != MAX && node.pids + n > node.pids_max {
                 node.pids_events_max += 1;
+                node.files_seq += 1;
+                self.notify = true;
                 return Err(Errno::EAGAIN);
             }
         }
@@ -799,6 +951,7 @@ impl Hierarchy {
                 node.pids = node.pids.saturating_sub(n);
             }
         }
+        self.dirty = true;
     }
 
     /// The threads of the subtree of `id`: `pids.current`.
@@ -829,6 +982,8 @@ impl Hierarchy {
             n.mem.peak = n.mem.peak.max(n.mem.current);
             let high = on && n.mem.high != MAX && n.mem.current > n.mem.high;
             if high {
+                n.mem.over_high += bytes;
+                self.any_over_high = true;
                 self.memory_event(a, EV_HIGH);
             }
         }
@@ -856,8 +1011,10 @@ impl Hierarchy {
         for a in self.path_ids(id) {
             if let Some(n) = self.nodes.get_mut(&a) {
                 n.mem.events[ev] += 1;
+                n.files_seq += 1;
             }
         }
+        self.notify = true;
     }
 
     /// Counts an OOM in `id`: a charge failed, and the caller looks for a process to kill.
@@ -868,6 +1025,80 @@ impl Hierarchy {
     /// Counts an OOM kill in `id`.
     pub fn count_oom_kill(&mut self, id: CgId) {
         self.memory_event(id, EV_OOM_KILL);
+    }
+
+    /// Counts a kill of the whole group `id` for `memory.oom.group`.
+    pub fn count_oom_group_kill(&mut self, id: CgId) {
+        self.memory_event(id, EV_OOM_GROUP_KILL);
+    }
+
+    /// The cgroup that an OOM kill of a process of `victim` must kill as a whole, as
+    /// `mem_cgroup_get_oom_group` of Linux: the highest cgroup with `memory.oom.group` 1 from
+    /// `victim` up to `domain`, the cgroup whose limit the charge passed. `domain` is the root
+    /// for an OOM of the system. Gives `None` if no such cgroup has `memory.oom.group` 1.
+    pub fn oom_group(&self, victim: CgId, domain: CgId) -> Option<CgId> {
+        let path = self.path_ids(victim);
+        // The path goes from `victim` up to the root. A group above `domain` does not count.
+        let end = path.iter().position(|&a| a == domain)?;
+        path[..=end]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&a| self.on(a, MEMORY) && self.nodes.get(&a).is_some_and(|n| n.mem.oom_group))
+    }
+
+    /// The time in nanoseconds that a thread of `id` must wait because its cgroup or a cgroup
+    /// above it uses more than `memory.high`, as `mem_cgroup_handle_over_high` of Linux. The
+    /// wait grows with the square of the part of the use over the limit and with the pages that
+    /// the cgroup charged while over it. Sets the count of these pages to 0.
+    pub fn high_delay(&mut self, id: CgId) -> u64 {
+        if !self.any_over_high {
+            return 0;
+        }
+        let (mut overage, mut pages) = (0u64, 0u64);
+        for a in self.path_ids(id) {
+            let on = self.on(a, MEMORY);
+            let Some(n) = self.nodes.get_mut(&a) else { continue };
+            let charged = core::mem::take(&mut n.mem.over_high);
+            if !on || n.mem.high == MAX || n.mem.current <= n.mem.high || n.mem.high == 0 {
+                continue;
+            }
+            // The part over the limit in units of 2^-20, `calculate_overage` of Linux.
+            let over = ((n.mem.current - n.mem.high) << 20) / n.mem.high;
+            overage = overage.max(over);
+            pages = pages.max(charged / PAGE_SIZE);
+        }
+        self.any_over_high = self.nodes.values().any(|n| n.mem.over_high > 0);
+        // `calculate_high_delay` of Linux, in nanoseconds instead of jiffies. Linux handles the
+        // pages in batches of `HIGH_BATCH`, and the limit is for one batch. Here a thread can
+        // come back after each page, so the limit is for a batch and the wait is for the part of
+        // a batch.
+        let delay = (u128::from(overage) * u128::from(overage) * 1_000_000_000) >> 34;
+        let delay = delay.min(u128::from(HIGH_DELAY_MAX)) * u128::from(pages);
+        let delay = u64::try_from(delay / u128::from(HIGH_BATCH)).unwrap_or(HIGH_DELAY_MAX);
+        if delay <= HIGH_DELAY_MIN { 0 } else { delay.min(HIGH_DELAY_MAX) }
+    }
+
+    /// Charges `bytes` bytes in `ios` bios of the device `dev` to `id` and to each cgroup above
+    /// it, at the time `now`. `write` tells a write from a read. Gives the time in nanoseconds
+    /// that the task waits to keep the use under `io.max` of these cgroups.
+    pub fn charge_io(
+        &mut self,
+        id: CgId,
+        dev: u64,
+        write: bool,
+        bytes: u64,
+        ios: u64,
+        now: u64,
+    ) -> u64 {
+        let mut delay = 0;
+        for a in self.path_ids(id) {
+            let limit = self.on(a, IO);
+            if let Some(n) = self.nodes.get_mut(&a) {
+                delay = delay.max(n.io.charge(dev, write, bytes, ios, now, limit));
+            }
+        }
+        delay
     }
 
     /// The memory of `id`.
@@ -1016,7 +1247,7 @@ impl Hierarchy {
         let avail = self.controllers(id);
         let cpu_on = self.on(id, CPU);
         let populated = self.populated(id);
-        let frozen = self.frozen(id);
+        let frozen = self.events_frozen(id);
         let dying = self.nr_dying(id);
         let cpus = self.effective_cpus(id);
         let mems = self.effective_mems(id);
@@ -1025,10 +1256,10 @@ impl Hierarchy {
             let r = psi::NAMES.iter().position(|&x| x == r).ok_or(Errno::ENOENT)?;
             return Ok(n.psi.show(now, r));
         }
-        let events = |e: &[u64; 5]| {
+        let events = |e: &[u64; NR_EV]| {
             format!(
-                "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill 0\n",
-                e[EV_LOW], e[EV_HIGH], e[EV_MAX], e[EV_OOM], e[EV_OOM_KILL]
+                "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill {}\n",
+                e[EV_LOW], e[EV_HIGH], e[EV_MAX], e[EV_OOM], e[EV_OOM_KILL], e[EV_OOM_GROUP_KILL]
             )
         };
         let out = match name {
@@ -1082,6 +1313,9 @@ impl Hierarchy {
             "cpuset.mems.effective" => show_list(mems),
             "cpuset.cpus.exclusive" => String::from("\n"),
             "cpuset.cpus.partition" => String::from(if root { "root\n" } else { "member\n" }),
+            "io.stat" => n.io.show_stat(),
+            "io.max" => n.io.show_max(),
+            "io.weight" => n.io.show_weight(),
             "memory.current" => format!("{}\n", n.mem.current),
             "memory.peak" => format!("{}\n", n.mem.peak),
             "memory.min" => show_max(n.mem.min),
@@ -1137,12 +1371,22 @@ impl Hierarchy {
         let n = self.node_mut(id)?;
         let effect = match name {
             "cgroup.freeze" => {
-                n.freeze = match text(data)? {
+                let freeze = match text(data)? {
                     "0" => false,
                     "1" => true,
                     _ => return Err(Errno::ERANGE),
                 };
-                Effect::Freeze
+                if freeze == n.freeze {
+                    return Ok(Effect::None);
+                }
+                n.freeze = freeze;
+                if freeze {
+                    self.nr_freeze += 1;
+                } else {
+                    self.nr_freeze -= 1;
+                }
+                self.dirty = true;
+                return Ok(Effect::Freeze);
             }
             "cgroup.type" => {
                 return Err(match text(data)? {
@@ -1223,6 +1467,14 @@ impl Hierarchy {
                 "member" => Effect::None,
                 _ => return Err(Errno::EINVAL),
             },
+            "io.max" => {
+                n.io.write_max(text(data)?)?;
+                Effect::None
+            }
+            "io.weight" => {
+                n.io.write_weight(text(data)?)?;
+                Effect::None
+            }
             "memory.min" => {
                 n.mem.min = parse_bytes(data)?;
                 Effect::None
@@ -1397,11 +1649,38 @@ fn memory_stat(m: &Memory) -> String {
 /// The hierarchy of the kernel. It is made at the first use.
 static HIERARCHY: SpinLock<Option<Hierarchy>> = SpinLock::new(None);
 
-/// Calls `f` with the hierarchy of the kernel.
+/// A cgroup has `cgroup.freeze` 1. The check of a signal looks at it first, so that the
+/// check does not take the lock of the hierarchy when no cgroup freezes.
+static ANY_FREEZE: AtomicBool = AtomicBool::new(false);
+
+/// A cgroup charged pages over its `memory.high`. The return to user mode looks at it first.
+static ANY_OVER_HIGH: AtomicBool = AtomicBool::new(false);
+
+/// The function that wakes the tasks in `poll`, after a change of a file with events.
+static NOTIFY: SpinLock<Option<fn()>> = SpinLock::new(None);
+
+/// Sets the function that wakes the tasks in `poll` after a change of `cgroup.events` or of
+/// another file with events. rk-fs-cgroup sets it.
+pub fn set_notify(f: fn()) {
+    *NOTIFY.lock() = Some(f);
+}
+
+/// Calls `f` with the hierarchy of the kernel. After a change of a file with events, this wakes
+/// the tasks in `poll`, without the lock of the hierarchy.
 pub fn with<R>(f: impl FnOnce(&mut Hierarchy) -> R) -> R {
-    let mut h = HIERARCHY.lock();
-    let h = h.get_or_insert_with(|| Hierarchy::new(now(), 1));
-    f(h)
+    let (r, notify) = {
+        let mut h = HIERARCHY.lock();
+        let h = h.get_or_insert_with(|| Hierarchy::new(now(), 1));
+        let r = f(h);
+        h.refresh_events();
+        ANY_FREEZE.store(h.any_freeze(), Ordering::Relaxed);
+        ANY_OVER_HIGH.store(h.any_over_high, Ordering::Relaxed);
+        (r, h.take_notify())
+    };
+    if notify && let Some(f) = *NOTIFY.lock() {
+        f();
+    }
+    r
 }
 
 /// The time now in nanoseconds since boot. The host has no clock of the kernel, so the time is
@@ -1461,6 +1740,25 @@ pub fn charge_cpu(id: CgId, ns: u64) {
     }
 }
 
+/// The time in nanoseconds that a thread of `id` waits for `memory.high`. See
+/// `Hierarchy::high_delay`.
+pub fn high_delay(id: CgId) -> u64 {
+    if id == 0 || !ANY_OVER_HIGH.load(Ordering::Relaxed) {
+        return 0;
+    }
+    with(|h| h.high_delay(id))
+}
+
+/// Charges an I/O to `id`. See `Hierarchy::charge_io`. Gives the delay of `io.max` in
+/// nanoseconds.
+pub fn charge_io(id: CgId, dev: u64, write: bool, bytes: u64, ios: u64) -> u64 {
+    if id == 0 {
+        return 0;
+    }
+    let now = now();
+    with(|h| h.charge_io(id, dev, write, bytes, ios, now))
+}
+
 /// The time in nanoseconds until which a thread of `id` waits for its quota.
 pub fn throttled_until(id: CgId) -> Option<u64> {
     let now = now();
@@ -1472,9 +1770,9 @@ pub fn weight_factor(id: CgId) -> u64 {
     with(|h| h.weight_factor(id))
 }
 
-/// Tells if `id` or a cgroup above it is frozen.
+/// Tells if `id` or a cgroup above it has `cgroup.freeze` 1, so its threads must freeze.
 pub fn frozen(id: CgId) -> bool {
-    with(|h| h.frozen(id))
+    ANY_FREEZE.load(Ordering::Relaxed) && with(|h| h.frozen(id))
 }
 
 /// Changes the pressure counts of `id` with `f`.

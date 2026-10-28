@@ -11,7 +11,6 @@ ksm04_1	The test needs a NUMA system with a node that has memory and CPUs. ruker
 ksm06	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 ksm06_1	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
 ksm06_2	The test needs CONFIG_NUMA and two NUMA nodes with memory, for merge_across_nodes. rukernel has no NUMA (TCONF).
-<<<<<<< HEAD
 asapi_01	The test wants getprotobyname("hopopt") to give 0. The LTP build links musl, and the protocol table of musl is built in and has "ip" for 0, so this check fails on Linux with musl too. The other checks of asapi_01 pass.
 fork13	The test runs for 600 s (.runtime = 600), and it forks until the time ends. The runner limit is 240 s, so the runner stops it. It is not a hang: the after kernel did 146018 forks in the time.
 hackbench01	The test sends 20 M socket messages (50 groups x 20 senders x 20 receivers x 1000 messages). Under QEMU without KVM this takes more than the time limit. A smaller run (hackbench 5 process 100) passes.
@@ -20,7 +19,6 @@ shm_test01	The test calls sched_yield for each byte of a map of up to 4 MB, abou
 starvation	The test calibrates its runtime from the speed of the machine. Under QEMU without KVM it asks for about 9 min, more than the 240 s limit of the runner. starvation -l 20000 passes.
 preadv203	On ext2 the test passes: RWF_NOWAIT gives EAGAIN when a page is not in the cache. On tmpfs the test fails, because tmpfs pages are always in memory and a read never gives EAGAIN.
 preadv203_64	The same as preadv203: ext2 passes, tmpfs fails, because tmpfs pages are always in memory.
-=======
 mmapstress02	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress03	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
@@ -33,4 +31,33 @@ vma02	Needs NUMA and mbind (#322) (TCONF).
 vma03	Needs mmap2, which only a 32 bit kernel has (TCONF on x86_64).
 vma04	Needs NUMA and mbind (#322) (TCONF).
 vma05	Needs gdb in the guest, which the LTP image does not have (TCONF).
->>>>>>> 475b165 (Add transparent huge pages, the overcommit policy and the vm tunables (#365))
+cgroup	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+memcg_regression	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+memcg_failcnt	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+memcg_stat	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+memcg_control	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+cgroup_fj_function_cpuset	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+cgroup_fj_function_cpu	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+cgroup_fj_function_memory	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+cgroup_fj_function_freezer	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_1_1	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_2_2	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_3_1	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_4_2	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_5_1	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_6_2	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_8_2	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+pids_9_2	The script sources cgroup_lib.sh, but the LTP install in the image does not have this file, so the shell stops before the test starts. The LTP build must install testcases/kernel/controllers/cgroup/cgroup_lib.sh.
+memcontrol01	The LTP build in the image does not have this test binary.
+memcontrol02	The LTP build in the image does not have this test binary.
+memcontrol03	The LTP build in the image does not have this test binary.
+memcontrol04	The LTP build in the image does not have this test binary.
+memcg_test_3	The test makes and removes a cgroup in a loop until a child sends it 50000 SIGUSR1 signals. With one CPU under QEMU without KVM, the loop does not end in the time limit of 120 s. The cause is not confirmed.
+cpuacct_1_1	The test needs the cpuacct controller of cgroup v1. rukernel has only cgroup v2 (TCONF).
+cgroup_xattr	The test needs a cgroup v1 hierarchy. rukernel has only cgroup v2 (TCONF).
+oom01	The first case sets overcommit_memory to 2 and expects mmap to give ENOMEM. rukernel does not do strict overcommit, so the system OOM killer kills the process. The other four cases pass.
+oom02	The test needs a NUMA system. rukernel has no NUMA (TCONF).
+oom04	The test needs a NUMA system with the cpuset controller. rukernel has no NUMA (TCONF).
+oom05	The test needs a NUMA system with the cpuset controller. rukernel has no NUMA (TCONF).
+setns01	The test needs /proc/self/ns/{ipc,mnt,net,pid,user,uts}. rukernel has only /proc/self/ns/cgroup (TCONF).
+setns02	The test needs IPC and UTS name spaces with setns. rukernel does not have them (TCONF).

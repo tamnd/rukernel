@@ -2,7 +2,7 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{
-    FindFn, data_file, dead_link, dir, file, join, jump_link, link, rw_file, set_owner,
+    FindFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file, set_owner,
 };
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
 use alloc::boxed::Box;
@@ -172,14 +172,23 @@ fn pressure_dir() -> InodeRef {
         b"/",
         0o555,
         || {
-            let files: [(&[u8], fn() -> Vec<u8>); 3] = [
-                (b"cpu", || pressure(rk_cgroup::psi::CPU)),
-                (b"memory", || pressure(rk_cgroup::psi::MEMORY)),
-                (b"io", || pressure(rk_cgroup::psi::IO)),
+            // An open file keeps a trigger after a write, as the pressure files of cgroup2.
+            let files: [(&[u8], usize); 3] = [
+                (b"cpu", rk_cgroup::psi::CPU),
+                (b"memory", rk_cgroup::psi::MEMORY),
+                (b"io", rk_cgroup::psi::IO),
             ];
             Ok(files
                 .iter()
-                .map(|&(name, f)| (name.to_vec(), text_file(&join(b"/pressure", name), f)))
+                .map(|&(name, r)| {
+                    let file = ops_file(
+                        &join(b"/pressure", name),
+                        0o666,
+                        move || Ok(pressure(r)),
+                        move || rk_fs_cgroup::system_pressure(r),
+                    );
+                    (name.to_vec(), file)
+                })
                 .collect())
         },
         None,
@@ -201,6 +210,35 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
     out.extend_from_slice(&path);
     out.push(b'\n');
     out
+}
+
+/// The directory `/proc/PID/ns`: a magic link for each namespace of the process that has a file,
+/// as `fs/proc/namespaces.c` of Linux. The link shows `cgroup:[INODE]`, and a walk goes to the
+/// file of the namespace, which `setns` takes.
+fn ns_dir(base: &[u8], w: Weak<Process>) -> InodeRef {
+    let path = join(base, b"ns");
+    let path_ = path.clone();
+    dir(
+        &path,
+        base,
+        0o511,
+        move || {
+            use rk_vfs::nsfs::{NsInode, NsKind, link_text};
+            let kind = NsKind::Cgroup;
+            let (p_, p_j) = (w.clone(), w.clone());
+            let link = jump_link(
+                &join(&path_, kind.name().as_bytes()),
+                0o777,
+                move || Ok(link_text(kind, alive(&p_)?.cgroup_ns())),
+                move || {
+                    let ns = alive(&p_j)?.cgroup_ns();
+                    Ok(rk_vfs::Location::detached(NsInode::new(kind, ns)))
+                },
+            );
+            Ok(alloc::vec![(kind.name().as_bytes().to_vec(), link)])
+        },
+        None,
+    )
 }
 
 /// The directory `/proc/sysvipc`, with the System V objects of each kind.
@@ -1087,6 +1125,7 @@ fn process_files(
         b"cgroup".to_vec(),
         file(&join(base, b"cgroup"), move || Ok(cgroup_of(&*alive(&p_)?))),
     ));
+    out.push((b"ns".to_vec(), ns_dir(base, w.clone())));
     let p_ = w.clone();
     let p2 = w.clone();
     out.push((

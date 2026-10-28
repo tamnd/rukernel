@@ -21,10 +21,10 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use deadline::{Deadline, Dir, Request};
 use rk_abi::Errno;
-use rk_frame::sync::SpinLock;
+use rk_frame::sync::{Once, SpinLock};
 
 /// The result of the block layer.
 pub type Result<T> = core::result::Result<T, Errno>;
@@ -102,6 +102,19 @@ impl Bio {
     }
 }
 
+/// The hook that charges the I/O of a queue to the task that submits it, for the io controller
+/// of cgroup v2. It gets the device, `true` for a write, the bytes and the count of bios.
+pub type AccountFn = fn(dev: u64, write: bool, bytes: u64, ios: u64);
+
+/// The hook of [`set_account`].
+static ACCOUNT: Once<AccountFn> = Once::new();
+
+/// Sets the hook that charges each submitted batch of bios, as `blk_cgroup_bio_start` of Linux.
+/// Only the first call has an effect.
+pub fn set_account(f: AccountFn) {
+    ACCOUNT.call_once(|| f);
+}
+
 /// The I/O scheduler of a queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheduler {
@@ -152,6 +165,8 @@ pub struct Queue {
     stats: SpinLock<Stats>,
     /// `BLKROSET` made the device read only, as `bd_read_only` of Linux.
     read_only: AtomicBool,
+    /// The device number, for the charges of the io controller.
+    dev: AtomicU64,
 }
 
 impl Queue {
@@ -162,7 +177,13 @@ impl Queue {
             pending: SpinLock::new(Pending::Deadline(Deadline::new(MAX_SECTORS))),
             stats: SpinLock::new(Stats::default()),
             read_only: AtomicBool::new(false),
+            dev: AtomicU64::new(0),
         }
+    }
+
+    /// Sets the device number of the queue. The charges of the io controller use it.
+    pub fn set_dev(&self, dev: u64) {
+        self.dev.store(dev, Ordering::Relaxed);
     }
 
     /// The number of sectors of the device.
@@ -234,6 +255,8 @@ impl Queue {
             }
         }
         let mut stats = self.stats.lock();
+        // The bytes and the bios of each direction, for the io controller.
+        let mut charge = [(0u64, 0u64); 2];
         loop {
             let rq = match &mut *pending {
                 Pending::None(fifo) => fifo.pop_front(),
@@ -243,7 +266,20 @@ impl Queue {
             stats.ios[rq.dir as usize] += 1;
             stats.merges[rq.dir as usize] += rq.bios.len() as u64 - 1;
             stats.sectors[rq.dir as usize] += rq.sectors;
+            let c = &mut charge[rq.dir as usize];
+            c.0 += rq.sectors * SECTOR_SIZE as u64;
+            c.1 += rq.bios.len() as u64;
             self.run(&rq, bios);
+        }
+        drop(stats);
+        drop(pending);
+        if let Some(account) = ACCOUNT.get() {
+            let dev = self.dev.load(Ordering::Relaxed);
+            for (dir, &(bytes, ios)) in charge.iter().enumerate() {
+                if ios > 0 {
+                    account(dev, dir == Dir::Write as usize, bytes, ios);
+                }
+            }
         }
     }
 

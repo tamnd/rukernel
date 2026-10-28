@@ -215,6 +215,9 @@ pub struct Thread {
     restart: SpinLock<Option<Restart>>,
     /// The timer ticks that came while the thread ran user code.
     user_ticks: AtomicU64,
+    /// The time in nanoseconds that the thread must wait for `io.max` of its cgroup before it
+    /// goes back to user mode.
+    io_delay: AtomicU64,
     /// The tracing state, while a tracer traces the thread.
     ptrace: SpinLock<Option<ptrace::Ptrace>>,
     /// The signal of a group stop that the traced thread did not take yet, or 0. A thread that
@@ -809,6 +812,17 @@ impl Thread {
         self.user_ticks.fetch_add(ticks, Ordering::Relaxed);
     }
 
+    /// Adds `ns` nanoseconds to the wait of the thread for `io.max`. The longest delay counts,
+    /// because each delay starts now.
+    pub fn add_io_delay(&self, ns: u64) {
+        self.io_delay.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// Takes the wait of the thread for `io.max`.
+    pub fn take_io_delay(&self) -> u64 {
+        self.io_delay.swap(0, Ordering::Relaxed)
+    }
+
     /// Tells the thread which task runs it. The code that spawns the task calls this one time.
     pub fn set_task(&self, task: &Arc<Task>) {
         *self.task.lock() = Arc::downgrade(task);
@@ -925,7 +939,7 @@ impl Thread {
     }
 
     /// Wakes the task of the thread, so that a wait sees a new signal.
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         if let Some(task) = self.task() {
             task.wake();
         }
@@ -958,9 +972,14 @@ impl Thread {
     }
 
     /// Tells if a wait must stop: the group exits, the process stops, a signal that is not
-    /// blocked is pending, or the tracer asks for a stop.
+    /// blocked is pending, the tracer asks for a stop, or the cgroup of the thread freezes. A
+    /// freeze stops the wait as a signal does in Linux (`JOBCTL_TRAP_FREEZE`), so that the thread
+    /// goes to the freezer.
     pub fn signal_pending(&self) -> bool {
         if self.is_killed() || !self.pending().without(self.blocked()).is_empty() {
+            return true;
+        }
+        if rk_cgroup::frozen(self.process.cgroup()) {
             return true;
         }
         if self.is_traced() {
@@ -1121,6 +1140,7 @@ impl Thread {
             vfork_done: SpinLock::new(None),
             restart: SpinLock::new(None),
             user_ticks: AtomicU64::new(0),
+            io_delay: AtomicU64::new(0),
             ptrace: SpinLock::new(None),
             group_stop: AtomicU32::new(0),
             seccomp_mode: AtomicU32::new(0),

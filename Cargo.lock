@@ -118,6 +118,7 @@ dependencies = [
  "rk-abi",
  "rk-cgroup",
  "rk-frame",
+ "rk-fs-cgroup",
  "rk-mm",
  "rk-net",
  "rk-proc",

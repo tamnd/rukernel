@@ -162,6 +162,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETSOCKOPT => net::getsockopt(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::SETSOCKOPT => net::setsockopt(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::UNSHARE => process::unshare(cx, a[0]),
+        nr::SETNS => process::setns(cx, a[0], a[1]),
         #[cfg(target_arch = "x86_64")]
         nr::FORK => process::fork(cx),
         #[cfg(target_arch = "x86_64")]

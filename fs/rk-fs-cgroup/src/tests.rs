@@ -85,3 +85,20 @@ fn the_inode_number_holds_the_cgroup() {
     assert_eq!(a >> INO_SHIFT, u64::from(rk_cgroup::ROOT));
     assert_eq!(parse_id(b" 12\n").unwrap(), 12);
 }
+
+#[test]
+fn chown_and_chmod_change_one_inode() {
+    let root = root();
+    let dir = root.create(b"fs-c", FileType::Directory, 0o755, 0).unwrap();
+    let procs = dir.lookup(b"cgroup.procs").unwrap();
+    let attr = SetAttr { uid: Some(65534), gid: Some(65533), ..SetAttr::default() };
+    procs.set_attr(&attr).unwrap();
+    let m = procs.metadata();
+    assert_eq!((m.uid, m.gid, m.mode), (65534, 65533, mode::S_IFREG | 0o644));
+    assert_eq!(dir.metadata().uid, 0);
+    assert_eq!(dir.lookup(b"cgroup.threads").unwrap().metadata().uid, 0);
+    dir.set_attr(&SetAttr { mode: Some(0o700), ..SetAttr::default() }).unwrap();
+    assert_eq!(dir.metadata().mode, mode::S_IFDIR | 0o700);
+    root.rmdir(b"fs-c").unwrap();
+    assert!(ATTRS.lock().keys().all(|&ino| ino >> INO_SHIFT != m.ino >> INO_SHIFT));
+}

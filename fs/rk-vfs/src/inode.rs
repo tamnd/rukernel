@@ -447,6 +447,13 @@ pub trait Inode: Any + Send + Sync {
         None
     }
 
+    /// The operations of a new open file of a regular file, for a file of a pseudo file system
+    /// that keeps a state for each open file or has its own `poll`, as the pressure files of
+    /// cgroup2. `flags` are the flags of the open. `None` uses the operations of the inode.
+    fn open_file(&self, _flags: u32) -> Option<Result<Arc<dyn crate::file::FileOps>>> {
+        None
+    }
+
     /// Gives the entry at the position `pos` of a directory and the position of the next entry,
     /// or `None` at the end. Position 0 is the first entry. The entries `.` and `..` are first.
     fn read_dir(&self, _pos: u64) -> Result<Option<(DirEntry, u64)>> {
