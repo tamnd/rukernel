@@ -19,6 +19,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - An OOM reaper (#384). After an OOM kill, the kernel frees the private pages of the victim at once, and the OOM killer does not wait for the exit of the victim.
 - A write of `memory.high`, `io.max` or `cpu.max` wakes the threads that wait for the old limit (#384).
 - tools/ltp/build.sh installs the tests and scripts of the directories that have subdirectories, as memcontrol01 to memcontrol04 and cgroup_lib.sh (#384).
+- On x86-64, the virtio PCI devices interrupt through MSI-X, so the drivers do not poll (#399). Each device gets one vector from 0x40, the message goes to the local APIC of the CPU that waits, and the handler masks the entry of the MSI-X table until the driver takes the interrupt. A device without MSI-X is polled as before.
+- The receive path of virtio-net runs from the interrupt on x86-64 too (#399). The MSI-X message stops the user code or wakes an idle CPU, and the bottom half that reads the receive queue runs after it.
+- tools/ltp/run.py has `--arch aarch64`, which runs the tests on the arm64 kernel on the `virt` machine of QEMU (#399). tools/ltp/build.sh has `--arch aarch64`, and `LTP_TESTDIRS` builds only some directories of tests. The full build strips the tree before it copies the tree out of the container, so it needs 5 times less free space.
+- The boot job of CI builds the arm64 BusyBox with tools/busybox/build.sh, keeps it in the cache, and gives it to `boot-test aarch64` in `RK_BUSYBOX_AARCH64` (#399).
 
 ### Fixed
 
@@ -38,6 +42,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - tools/ltp runs each test in the foreground of the init shell, and the shell of the test forks the command, so the test does not keep the ignored `SIGQUIT` of BusyBox ash as PID 1 (#387). LTP kill11 passes now. Before, its child ignored `SIGQUIT` and the test hung.
 - A read of a cgroupfs directory no longer skips entries when an `rmdir` happens between two reads (#384). Each entry keeps its place in the listing (a file by its index, a child cgroup by its ID), so `find -depth -exec rmdir` removes a whole tree. Before, the LTP cgroup_fj tests left their directory behind (`EBUSY`).
 - A fork, an exit, `mkdir` and `rmdir` no longer make the kernel compute `cgroup.events` again for each cgroup (#384). The kernel computes the events again only when a cgroup gets its first task or loses its last one, or while a cgroup is frozen. Before, these calls got slower with each cgroup, and the creation of 10000 cgroups took more than 20 minutes under QEMU without KVM. Now it takes about 5 minutes.
+- The timer of a pressure trigger starts on its own clock (#399). Before, it started at the time of the counter, which can be ahead of the clock of the timers when ticks are late, so on a busy host the timer did not fire during the stall and the arm64 init check "a stall polls POLLPRI on the trigger" failed.
 
 ## [0.4.7] - 2026-10-28
 

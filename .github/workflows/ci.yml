@@ -172,6 +172,19 @@ jobs:
       - name: install gdb, strace and procps-ng
         if: steps.debug-tools.outputs.cache-hit != 'true'
         run: tools/debug/build.sh ~/.cache/rk-debug-tools
+      # tools/busybox/build.sh builds the arm64 BusyBox for the arm64 `busybox` test in an arm64
+      # container, which docker runs under qemu-user with binfmt. The cache keeps the program until
+      # the script changes.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: busybox-aarch64
+        with:
+          path: ~/.cache/rk-busybox-aarch64
+          key: busybox-aarch64-${{ hashFiles('tools/busybox/build.sh') }}
+      - name: build the arm64 BusyBox
+        if: steps.busybox-aarch64.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get install --yes --no-install-recommends qemu-user-static
+          tools/busybox/build.sh ~/.cache/rk-busybox-aarch64
       # The arm64 user tests need a C compiler that makes arm64 programs with musl. Ubuntu has no
       # such package, so the job uses `zig cc`, which `cargo xtask boot-test` finds on the PATH.
       - name: install zig for the arm64 user programs
@@ -181,7 +194,7 @@ jobs:
           tar --extract --xz --file /tmp/zig.tar.xz --directory "$HOME"
           echo "$HOME/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
       - name: boot tests
-        run: RK_LTP="$HOME/.cache/rk-ltp" RK_KSELFTEST="$HOME/.cache/rk-kselftest" RK_DEBUG_TOOLS="$HOME/.cache/rk-debug-tools" cargo xtask boot-test
+        run: RK_LTP="$HOME/.cache/rk-ltp" RK_KSELFTEST="$HOME/.cache/rk-kselftest" RK_DEBUG_TOOLS="$HOME/.cache/rk-debug-tools" RK_BUSYBOX_AARCH64="$HOME/.cache/rk-busybox-aarch64/busybox" cargo xtask boot-test
 
   # rk-abigen reads the pinned Linux tree and writes abi/ and core/rk-abi/src/generated/. This job
   # runs it again and fails if the output is not the same as the files in the tree, per

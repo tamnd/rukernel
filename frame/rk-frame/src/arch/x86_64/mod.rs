@@ -8,6 +8,7 @@ pub(crate) mod cpu;
 mod gdt;
 mod idt;
 pub(crate) mod io;
+pub(crate) mod msi;
 pub(crate) mod paging;
 pub(crate) mod rtc;
 pub(crate) mod serial;
@@ -120,7 +121,7 @@ pub(crate) fn under_tcg() -> bool {
 
 /// Handles an interrupt from a device or the local APIC.
 fn interrupt(vector: u8) {
-    if !smp::handle(vector) && !apic::handle(vector) {
+    if !smp::handle(vector) && !apic::handle(vector) && !msi::handle(vector) {
         crate::console::_print_panic(format_args!(
             "rk-frame: spurious interrupt on vector {vector}\n"
         ));

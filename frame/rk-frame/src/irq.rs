@@ -22,11 +22,11 @@ pub fn wait() {
     imp::irq::wait();
 }
 
-/// The interrupt line of a device: an SPI of the GIC on arm64. The handler of the line turns the
-/// line off and keeps a flag that the line came, because a handler takes no lock and cannot reach
-/// the device. The driver tests the flag with `take`, tells the device that the interrupt is
-/// handled, and turns the line on again with `unmask`. Between the two, a level triggered line
-/// does not come again and again. x86-64 has no lines yet, so its drivers poll.
+/// The interrupt line of a device: an SPI of the GIC on arm64, and the vector of an MSI-X table
+/// entry on x86-64. The handler of the line turns the line off and keeps a flag that the line
+/// came, because a handler takes no lock and cannot reach the device. The driver tests the flag
+/// with `take`, tells the device that the interrupt is handled, and turns the line on again with
+/// `unmask`. Between the two, a level triggered line does not come again and again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Line {
     intid: u32,
@@ -40,6 +40,14 @@ impl Line {
         imp::gic::enable_device(intid, edge).then_some(Self { intid })
     }
 
+    /// Makes the line of the MSI-X table entry at the virtual address `entry`, with a free vector,
+    /// and turns it on. The line goes to the boot CPU until a `wait` on another CPU. Gives `None`
+    /// if no vector is free.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn msix(entry: usize) -> Option<Self> {
+        imp::msi::alloc(entry).map(|v| Self { intid: u32::from(v) })
+    }
+
     /// The interrupt number.
     pub fn number(self) -> u32 {
         self.intid
@@ -50,7 +58,9 @@ impl Line {
     pub fn take(self) -> bool {
         #[cfg(target_arch = "aarch64")]
         return imp::gic::take_device(self.intid);
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        return imp::msi::take(self.intid as u8);
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         false
     }
 
@@ -58,6 +68,8 @@ impl Line {
     pub fn unmask(self) {
         #[cfg(target_arch = "aarch64")]
         imp::gic::unmask_device(self.intid);
+        #[cfg(target_arch = "x86_64")]
+        imp::msi::unmask(self.intid as u8);
     }
 
     /// Waits on this CPU until the line comes, or until another interrupt comes. The line goes to
@@ -65,23 +77,30 @@ impl Line {
     /// interrupts, the call does not wait. The caller tests its condition and calls this in a
     /// loop, and calls `take` and `unmask` when the line came.
     pub fn wait(self) {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             if !enabled() {
                 core::hint::spin_loop();
                 return;
             }
+            #[cfg(target_arch = "aarch64")]
+            let fired = || imp::gic::fired(self.intid);
+            #[cfg(target_arch = "x86_64")]
+            let fired = || imp::msi::fired(self.intid as u8);
+            #[cfg(target_arch = "aarch64")]
             imp::gic::route_here(self.intid);
+            #[cfg(target_arch = "x86_64")]
+            imp::msi::route_here(self.intid as u8);
             disable();
             // With interrupts off, the line cannot come between the test and `wait`. A line that
             // is pending wakes `wait`, and `wait` turns interrupts on, so the handler runs.
-            if imp::gic::fired(self.intid) {
+            if fired() {
                 enable();
             } else {
                 wait();
             }
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         core::hint::spin_loop();
     }
 }

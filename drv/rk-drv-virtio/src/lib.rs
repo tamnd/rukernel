@@ -10,9 +10,10 @@
 //! A request of virtio-blk waits for the device in a loop that reads the used ring. The kernel
 //! does not preempt a task in the kernel, so the queue of a disk does one request at a time under
 //! a lock. virtio-net keeps many buffers in its queues, and the network device layer polls the
-//! device for received frames. On arm64 the interrupt of the device (an SPI of the GIC) wakes the
-//! wait of virtio-blk and an idle CPU. x86-64 has no device interrupts yet, so there the drivers
-//! only poll.
+//! device for received frames when the interrupt of the device came. The interrupt wakes the wait
+//! of virtio-blk and an idle CPU. On arm64 it is an SPI of the GIC: the INTx line of a PCI device,
+//! or the line of an MMIO device. On x86-64 it is the MSI-X message of a PCI device. A device
+//! without an interrupt is polled.
 
 #![no_std]
 #![forbid(unsafe_code)]

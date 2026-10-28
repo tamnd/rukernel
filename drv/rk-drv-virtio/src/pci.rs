@@ -1,6 +1,7 @@
 //! The modern virtio PCI transport, from section 4.1 of the virtio 1.2 specification.
 
 use crate::transport::{QueueAddrs, status};
+use core::sync::atomic::{AtomicBool, Ordering};
 use rk_frame::pci::{IoMem, Line, PciDevice};
 
 /// The capability ID of the vendor specific capabilities that virtio uses.
@@ -50,6 +51,8 @@ pub(crate) fn device_type(dev: &PciDevice) -> Option<u32> {
 
 /// The value of an MSI-X vector register for no vector.
 const NO_VECTOR: u16 = 0xffff;
+/// The MSI-X vector of the queues, when the function has MSI-X: the first entry of its table.
+const QUEUE_VECTOR: u16 = 0;
 
 /// The place of a configuration structure: a range of a BAR.
 #[derive(Clone, Copy)]
@@ -65,8 +68,22 @@ pub(crate) struct PciTransport {
     notify: IoMem,
     notify_multiplier: u32,
     device: IoMem,
-    /// The ISR status byte and the INTx line, when the device has both.
-    isr: Option<(IoMem, Line)>,
+    /// The interrupt line: the MSI-X line of the function, or else the INTx line with the ISR
+    /// status byte.
+    irq: Irq,
+    /// The device took the MSI-X vector of each queue. If it did not, the driver polls.
+    vectors_ok: AtomicBool,
+}
+
+/// The interrupt of a device on the PCI bus.
+enum Irq {
+    /// No line, so the driver polls.
+    None,
+    /// The INTx line. A read of the ISR status byte lowers it.
+    Intx(IoMem, Line),
+    /// The MSI-X line of the queues. Each message is an edge, so the driver does not read the
+    /// ISR status byte.
+    Msix(Line),
 }
 
 impl PciTransport {
@@ -103,11 +120,18 @@ impl PciTransport {
             return None;
         }
         dev.enable();
-        // The driver does not use MSI-X, so the device raises its INTx line. A read of the ISR
-        // status byte lowers the line.
-        let isr = isr.and_then(map).zip(dev.irq());
+        // With MSI-X, the queues send their messages to the first entry of the table. Without
+        // it, the device raises its INTx line, and a read of the ISR status byte lowers the line.
+        let irq = match dev.msix() {
+            Some(line) => Irq::Msix(line),
+            None => match isr.and_then(map).zip(dev.irq()) {
+                Some((isr, line)) => Irq::Intx(isr, line),
+                None => Irq::None,
+            },
+        };
         let (notify, device) = (map(notify?)?, map(device?)?);
-        let t = Self { common, notify, notify_multiplier, device, isr };
+        let vectors_ok = AtomicBool::new(true);
+        let t = Self { common, notify, notify_multiplier, device, irq, vectors_ok };
         t.common.write_u8(common::DEVICE_STATUS, 0);
         // The device gives 0 when the reset is done.
         while t.common.read_u8(common::DEVICE_STATUS) != 0 {
@@ -151,7 +175,15 @@ impl PciTransport {
         let c = &self.common;
         c.write_u16(common::QUEUE_SELECT, index);
         c.write_u16(common::QUEUE_SIZE, size);
-        c.write_u16(common::QUEUE_MSIX_VECTOR, NO_VECTOR);
+        if matches!(self.irq, Irq::Msix(_)) {
+            // The device gives NO_VECTOR back if it cannot use the vector.
+            c.write_u16(common::QUEUE_MSIX_VECTOR, QUEUE_VECTOR);
+            if c.read_u16(common::QUEUE_MSIX_VECTOR) != QUEUE_VECTOR {
+                self.vectors_ok.store(false, Ordering::Relaxed);
+            }
+        } else {
+            c.write_u16(common::QUEUE_MSIX_VECTOR, NO_VECTOR);
+        }
         for (reg, addr) in [
             (common::QUEUE_DESC, addrs.desc),
             (common::QUEUE_DRIVER, addrs.avail),
@@ -175,15 +207,19 @@ impl PciTransport {
         self.notify.write_u16(at, index);
     }
 
-    /// The interrupt line of the device.
+    /// The interrupt line of the device, or `None` if the driver must poll.
     pub(crate) fn irq(&self) -> Option<Line> {
-        self.isr.as_ref().map(|(_, line)| *line)
+        match &self.irq {
+            Irq::Intx(_, line) => Some(*line),
+            Irq::Msix(line) => self.vectors_ok.load(Ordering::Relaxed).then_some(*line),
+            Irq::None => None,
+        }
     }
 
-    /// Tells the device that the driver saw its interrupt. The read of the ISR status byte
-    /// clears it, and the device then lowers the line.
+    /// Tells the device that the driver saw its interrupt. For the INTx line, the read of the
+    /// ISR status byte clears it, and the device then lowers the line.
     pub(crate) fn ack_interrupt(&self) {
-        if let Some((isr, _)) = &self.isr {
+        if let Irq::Intx(isr, _) = &self.irq {
             isr.read_u8(0);
         }
     }

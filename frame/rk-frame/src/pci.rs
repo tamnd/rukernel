@@ -10,7 +10,8 @@
 //! the memory decoding and the bus master bit, and map a range of a memory BAR as an `IoMem`. It
 //! cannot write other registers of the configuration space, because a BAR that moves onto RAM
 //! breaks the memory safety of the kernel. On arm64 it gets the interrupt line of the INTx pin of
-//! the function from the `interrupt-map` of the host.
+//! the function from the `interrupt-map` of the host. On x86-64 it turns on MSI-X and gets the line
+//! of the first entry of the MSI-X table.
 //!
 //! A device with the bus master bit can write each physical address. rukernel has no IOMMU
 //! driver yet, so the kernel trusts the device and the driver to give the device only the
@@ -277,6 +278,17 @@ mod host {
 const COMMAND: u8 = 0x04;
 const COMMAND_MEMORY: u16 = 1 << 1;
 const COMMAND_BUS_MASTER: u16 = 1 << 2;
+/// The bit of the command register that turns off the INTx pin.
+#[cfg(target_arch = "x86_64")]
+const COMMAND_INTX_DISABLE: u16 = 1 << 10;
+/// The capability ID of MSI-X, and the bits of its message control register in the upper half of
+/// the first register of the capability.
+#[cfg(target_arch = "x86_64")]
+const CAP_MSIX: u8 = 0x11;
+#[cfg(target_arch = "x86_64")]
+const MSIX_ENABLE: u32 = 1 << 31;
+#[cfg(target_arch = "x86_64")]
+const MSIX_FUNCTION_MASK: u32 = 1 << 30;
 /// The bit of the status register that tells that the function has a capability list.
 const STATUS_CAP_LIST: u32 = 1 << 20;
 const CAP_POINTER: u8 = 0x34;
@@ -420,6 +432,28 @@ impl PciDevice {
         None
     }
 
+    /// Turns on MSI-X for the function with the line of the first entry of its MSI-X table, and
+    /// gives the line. The INTx pin of the function is off after this. All the sources of
+    /// interrupts of the function can use the entry, as entry 0 of the device. Gives `None` if the
+    /// function has no MSI-X capability, if its table is not in a memory BAR, if no vector is
+    /// free, and on arm64, which has no GICv3 ITS driver yet.
+    pub fn msix(&self) -> Option<Line> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let (_, at) = self.capabilities().into_iter().find(|(id, _)| *id == CAP_MSIX)?;
+            let table = self.read_config(at + 4);
+            let table = self.map_bar((table & 7) as u8, u64::from(table & !7), MSIX_ENTRY_SIZE)?;
+            let line = Line::msix(table.base())?;
+            let control = self.read_config(at);
+            self.address.write_u32(at, (control | MSIX_ENABLE) & !MSIX_FUNCTION_MASK);
+            let command = self.read_config(COMMAND) as u16;
+            self.address.write_command(command | COMMAND_INTX_DISABLE);
+            Some(line)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        None
+    }
+
     /// Turns on the memory decoding and the bus master bit, so that the device answers to its
     /// memory registers and can do DMA.
     pub fn enable(&self) {
@@ -491,6 +525,10 @@ impl PciDevice {
         map_registers(base + offset, len)
     }
 }
+
+/// The size of an entry of the MSI-X table.
+#[cfg(target_arch = "x86_64")]
+const MSIX_ENTRY_SIZE: usize = crate::arch::imp::msi::ENTRY_SIZE;
 
 /// Maps `len` bytes of device registers at the physical address `start`. The caller checked that
 /// the range is not RAM.

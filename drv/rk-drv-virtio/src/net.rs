@@ -4,9 +4,9 @@
 //! header of virtio-net and then the Ethernet frame. The driver keeps all of the receive buffers
 //! in the receive queue, and gives each buffer back to the device after it copies the frame out.
 //! `poll` reads the used ring of the receive queue, and `transmit` takes back the sent buffers from
-//! the used ring of the transmit queue. The network layer calls `poll` from a bottom half. The
-//! interrupt of the device only wakes an idle CPU, so the bottom half runs soon after a frame
-//! comes. `poll` tells the device that the driver saw the interrupt before it reads the ring, so a
+//! the used ring of the transmit queue. The network layer calls `poll` from a bottom half, which
+//! runs after each interrupt. The interrupt of the device wakes an idle CPU or stops the user code
+//! on a CPU, so the bottom half runs soon after a frame comes. `poll` tells the device that the driver saw the interrupt before it reads the ring, so a
 //! frame that comes later raises the line again.
 
 use crate::net_hdr::{self, NetHdr};

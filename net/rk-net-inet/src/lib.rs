@@ -11,10 +11,11 @@
 //! IPv6, and `addrconf` gives the devices their addresses and has the rtnetlink messages of
 //! `AF_INET6`.
 //!
-//! The drivers poll, and on arm64 a device interrupt only wakes an idle CPU. A bottom half of the
-//! kernel calls `poll`, which takes the received frames of each device and runs the timers of the
-//! neighbour table. The bottom half runs in the idle loop and after each interrupt in user mode,
-//! thus at least at each tick of the timer when a process runs. The poll also runs the timers of
+//! A bottom half of the kernel calls `poll`, which takes the received frames of each device and
+//! runs the timers of the neighbour table. The bottom half runs in the idle loop and after each
+//! interrupt in user mode, thus at least at each tick of the timer when a process runs. The
+//! interrupt of a device (an SPI on arm64, an MSI-X message on x86-64) wakes an idle CPU or stops
+//! the user code, so the bottom half runs soon after a frame comes. The poll also runs the timers of
 //! TCP. A send also calls `poll`, so that a packet on the loopback device arrives before the send
 //! returns, as on Linux.
 
