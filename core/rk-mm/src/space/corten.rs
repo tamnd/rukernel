@@ -102,14 +102,12 @@ pub(super) struct Meta {
     brk_start: usize,
     brk: usize,
     lock_future: bool,
-    /// The guard pages of `MADV_GUARD_INSTALL`.
-    guards: BTreeSet<usize>,
 }
 
 /// The state of an address space in the CortenMM backend.
 ///
-/// The order of the locks is `meta`, then the nodes of the tree, then `va`. A call can skip a
-/// lock, but it does not take them in another order.
+/// The order of the locks is `meta`, then the nodes of the tree, then `va`, then `guards`. A call
+/// can skip a lock, but it does not take them in another order.
 pub(super) struct Corten {
     tree: Tree<Status>,
     /// The ranges that are mapped or that a `mmap` reserved. The search for a free range uses
@@ -117,6 +115,9 @@ pub(super) struct Corten {
     /// set when no call is in progress.
     va: SpinLock<VmaSet<FileRef>>,
     meta: SpinLock<Meta>,
+    /// The guard pages of `MADV_GUARD_INSTALL`. A call holds this lock only for a short time, and
+    /// takes no other lock while it holds it.
+    guards: SpinLock<BTreeSet<usize>>,
 }
 
 impl Corten {
@@ -125,12 +126,8 @@ impl Corten {
         let c = Self {
             tree: Tree::new(),
             va: SpinLock::new(VmaSet::new()),
-            meta: SpinLock::new(Meta {
-                brk_start: 0,
-                brk: 0,
-                lock_future: false,
-                guards: BTreeSet::new(),
-            }),
+            meta: SpinLock::new(Meta { brk_start: 0, brk: 0, lock_future: false }),
+            guards: SpinLock::new(BTreeSet::new()),
         };
         *c.lock() = st;
         c
@@ -141,7 +138,7 @@ impl Corten {
         let meta = self.meta.lock();
         let range = self.tree.lock(0, TREE_END);
         let va = self.va.lock();
-        Whole::new(range, meta, va)
+        Whole::new(range, meta, va, &self.guards)
     }
 
     /// Locks the whole address space if no other call holds a part of it.
@@ -149,7 +146,7 @@ impl Corten {
         let meta = self.meta.try_lock()?;
         let range = self.tree.try_lock_all()?;
         let va = self.va.try_lock()?;
-        Some(Whole::new(range, meta, va))
+        Some(Whole::new(range, meta, va, &self.guards))
     }
 }
 
@@ -159,6 +156,7 @@ pub(super) struct Whole<'a> {
     range: RangeLock<Status>,
     meta: SpinLockGuard<'a, Meta>,
     va: SpinLockGuard<'a, VmaSet<FileRef>>,
+    guards: &'a SpinLock<BTreeSet<usize>>,
     /// The areas before the changes.
     old: Vec<Vma<FileRef>>,
     state: State,
@@ -170,6 +168,7 @@ impl<'a> Whole<'a> {
         range: RangeLock<Status>,
         meta: SpinLockGuard<'a, Meta>,
         va: SpinLockGuard<'a, VmaSet<FileRef>>,
+        guards: &'a SpinLock<BTreeSet<usize>>,
     ) -> Self {
         let old = views(&range, 0, TREE_END);
         let mut vmas = VmaSet::new();
@@ -181,9 +180,9 @@ impl<'a> Whole<'a> {
             brk_start: meta.brk_start,
             brk: meta.brk,
             lock_future: meta.lock_future,
-            guards: meta.guards.clone(),
+            guards: guards.lock().clone(),
         };
-        Self { range, meta, va, old, state, changed: false }
+        Self { range, meta, va, guards, old, state, changed: false }
     }
 }
 
@@ -209,7 +208,7 @@ impl Drop for Whole<'_> {
         self.meta.brk_start = self.state.brk_start;
         self.meta.brk = self.state.brk;
         self.meta.lock_future = self.state.lock_future;
-        self.meta.guards.clone_from(&self.state.guards);
+        self.guards.lock().clone_from(&self.state.guards);
         let new: Vec<Vma<FileRef>> = self.state.vmas.iter().cloned().collect();
         let same = |a: &Vma<FileRef>, b: &Vma<FileRef>| {
             a.start == b.start && a.end == b.end && same_area(a, b)
@@ -248,7 +247,7 @@ impl AddressSpace {
             return Err(Errno::EFAULT);
         }
         // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
-        if self.state.meta.lock().guards.contains(&page) {
+        if self.state.guards.lock().contains(&page) {
             return Err(Errno::EFAULT);
         }
         loop {
@@ -278,6 +277,14 @@ impl AddressSpace {
 
     /// Removes the pages of `start..end` in a locked range, as `unmap_locked`.
     fn clear_locked(&self, range: &mut RangeLock<Status>, start: usize, end: usize) {
+        // The guard pages of the range go with it, as on Linux.
+        {
+            let mut guards = self.state.guards.lock();
+            let inside: Vec<usize> = guards.range(start..end).copied().collect();
+            for g in inside {
+                guards.remove(&g);
+            }
+        }
         for vma in views(range, start, end) {
             if vma.hugetlb && !vma.shared {
                 self.unreserve_private(vma.start, vma.end);
