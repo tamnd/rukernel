@@ -64,6 +64,7 @@ dependencies = [
  "rk-abi",
  "rk-frame",
  "rk-fs-tmpfs",
+ "rk-net",
  "rk-vfs",
  "zerocopy",
 ]

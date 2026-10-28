@@ -19,6 +19,7 @@
 extern crate alloc;
 
 pub mod ldisc;
+pub mod netldisc;
 pub mod pty;
 
 use alloc::sync::Arc;
@@ -32,7 +33,7 @@ use rk_abi::native::ioctls::{
 };
 use rk_abi::native::open::O_NOCTTY;
 use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
-use rk_abi::native::signal::{SIGCONT, SIGHUP};
+use rk_abi::native::signal::{SIGCONT, SIGHUP, SIGTTOU};
 use rk_abi::native::termbits::{TCIFLUSH, TCIOFLUSH};
 use rk_abi::native::types::{Termios, Winsize};
 use rk_frame::sync::SpinLock;
@@ -112,6 +113,12 @@ pub struct SessionHooks {
     /// Makes the process that runs now leave the controlling terminal of its session, as
     /// `proc_clear_tty` of Linux.
     pub leave_ctty: fn(),
+    /// Tells if the thread that runs now blocks or ignores `SIGTTOU`, as `is_ignored` of
+    /// drivers/tty/tty_jobctrl.c of Linux.
+    pub ttou_ignored: fn() -> bool,
+    /// Tells if the process group of its argument is orphaned, as `is_current_pgrp_orphaned`
+    /// of Linux: no member has a parent in another group of the same session.
+    pub pgrp_orphaned: fn(u32) -> bool,
 }
 
 /// The functions of the process layer for the sessions. The process layer sets them.
@@ -203,6 +210,30 @@ fn read_pgrp(mem: &dyn UserMemory, arg: usize) -> Result<(u32, Option<u32>)> {
     }
     let pgrp = pgrp as u32;
     Ok((pgrp, session_hooks().and_then(|h| (h.pgrp_session)(pgrp))))
+}
+
+/// Checks that the caller `c` can set the foreground process group of a terminal, as
+/// `tty_check_change` of drivers/tty/tty_jobctrl.c of Linux. `is_ctty` tells if the terminal is
+/// the controlling terminal of the caller, and `tty_pgrp` is its foreground process group. A
+/// caller in a background group gets `SIGTTOU` for its group, and the call starts again after
+/// the signal (`ERESTARTSYS`). A caller that blocks or ignores `SIGTTOU` can set it. A caller in
+/// an orphaned group gets `ENOTTY`, as `tiocspgrp` changes the `EIO` of `tty_check_change`.
+///
+/// The caller does not hold the lock of the terminal, because the process layer takes its own
+/// locks.
+fn check_change(is_ctty: bool, tty_pgrp: u32, c: &Caller) -> Result<()> {
+    if !is_ctty || tty_pgrp == 0 || c.pgid == tty_pgrp {
+        return Ok(());
+    }
+    let Some(hooks) = session_hooks() else { return Ok(()) };
+    if (hooks.ttou_ignored)() {
+        return Ok(());
+    }
+    if (hooks.pgrp_orphaned)(c.pgid) {
+        return Err(Errno::ENOTTY);
+    }
+    send_signals(alloc::vec![(c.pgid, SIGTTOU)]);
+    Err(Errno::ERESTARTSYS)
 }
 
 /// `TIOCSPGRP` on `tty`, as `tiocspgrp` of Linux. The terminal must be the controlling terminal
@@ -407,6 +438,11 @@ impl FileOps for ConsoleFile {
                 return Ok(0);
             }
             TIOCSPGRP => {
+                let (is_ctty, tty_pgrp) = {
+                    let tty = CONSOLE.lock();
+                    (tty.is_ctty_of(&c), tty.pgrp)
+                };
+                check_change(is_ctty, tty_pgrp, &c)?;
                 let pgrp = read_pgrp(mem, arg)?;
                 set_pgrp(&mut CONSOLE.lock(), &c, pgrp)?;
                 return Ok(0);

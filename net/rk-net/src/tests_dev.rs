@@ -186,3 +186,36 @@ fn devices_get_names_indexes_and_counts() {
     let s = lo.stats();
     assert_eq!((s.tx_packets, s.rx_packets, s.rx_bytes), (3, 3, 60));
 }
+
+/// A packet socket of a device that goes down gets `ENETDOWN` once, and a send after the device
+/// goes away gives `ENXIO`, as `packet_notifier` of Linux.
+#[test]
+fn a_packet_socket_sees_its_device_go_down() {
+    use crate::packet::{AF_PACKET, PacketSocket};
+    use crate::{Message, NoPaths, Socket};
+    use rk_abi::native::socket::{SO_ERROR, SOL_SOCKET};
+
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let d = crate::dummy::create(Some(b"pkdown0")).unwrap();
+    d.set_up(true);
+    let protocol = (ETH_P_IP as u16).to_be();
+    let p = PacketSocket::new(crate::consts::SOCK_RAW, u32::from(protocol)).unwrap();
+    let mut addr = [0u8; 20];
+    addr[..2].copy_from_slice(&(AF_PACKET as u16).to_ne_bytes());
+    addr[2..4].copy_from_slice(&protocol.to_ne_bytes());
+    addr[4..8].copy_from_slice(&d.ifindex().to_ne_bytes());
+    p.bind(&NoPaths, &addr).unwrap();
+    d.set_up(false);
+    assert_eq!(p.recv(64, 0, true).err(), Some(Errno::ENETDOWN));
+    assert_eq!(p.recv(64, 0, true).err(), Some(Errno::EAGAIN));
+    // `SO_ERROR` gives the error and clears it.
+    d.set_up(true);
+    d.set_up(false);
+    let err = |p: &PacketSocket| p.get_option(SOL_SOCKET, SO_ERROR).unwrap();
+    assert_eq!(err(&p), i32::from(Errno::ENETDOWN.get()).to_ne_bytes());
+    assert_eq!(err(&p), 0i32.to_ne_bytes());
+    dev::unregister(&d);
+    let msg = Message { data: alloc::vec![0; HLEN], ..Message::default() };
+    assert_eq!(p.send(&NoPaths, msg, 0, true).err(), Some(Errno::ENXIO));
+}

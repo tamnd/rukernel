@@ -16,10 +16,16 @@
 //! open of the `ptmx` file of devpts uses its own instance. The open of a slave finds the pair
 //! through the file in devpts, as `devpts_get_priv`, so a slave device file out of devpts does
 //! not open.
+//!
+//! `TIOCSETD` on the slave sets the line discipline of the slave. `N_SLIP` and `N_SLCAN` make a
+//! network device, as [`crate::netldisc`] tells. The data that the master writes then goes to the
+//! device, and the frames that the device sends go to the master.
 
+use crate::netldisc::{LineOut, N_TTY, NR_LDISCS, NetLine, Proto};
 use crate::{
-    Caller, HUNG_POLL, Tty, caller, check_vhangup, finish_leave_ctty, hang_up_session, hung_ioctl,
-    leave_ctty, read_pgrp, send_signals, session_has_tty, set_ctty, set_pgrp,
+    Caller, HUNG_POLL, Tty, caller, check_change, check_vhangup, finish_leave_ctty,
+    hang_up_session, hung_ioctl, leave_ctty, read_pgrp, send_signals, session_has_tty, set_ctty,
+    set_pgrp,
 };
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
@@ -36,6 +42,7 @@ use rk_abi::native::ioctls::{
 use rk_abi::native::open::{O_CLOEXEC, O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC};
 use rk_abi::native::poll::{POLLHUP, POLLIN, POLLOUT};
 use rk_abi::native::signal::{SIGHUP, SIGWINCH};
+use rk_abi::native::sockios::SIOCGIFNAME;
 use rk_abi::native::termbits::{TCIFLUSH, TCIOFLUSH, TCOFLUSH};
 use rk_abi::native::types::{Termio, Termios, Winsize};
 use rk_frame::sync::SpinLock;
@@ -256,6 +263,8 @@ struct PairState {
     slave_closed: bool,
     /// The number of hang ups of the slave. A slave file of an older hang up is hung up.
     slave_hangups: u64,
+    /// The line discipline of the slave that makes a network device, or `None` for `N_TTY`.
+    line: Option<Arc<NetLine>>,
 }
 
 /// A pair of a master and a slave.
@@ -298,6 +307,7 @@ fn open_pair(inst: &Arc<Instance>) -> Result<Arc<Pair>> {
                 slave_opens: 0,
                 slave_closed: true,
                 slave_hangups: 0,
+                line: None,
             }),
             wait: Arc::new(WaitQueue::new()),
         });
@@ -332,11 +342,12 @@ fn make_slave_file(pair: &Pair) -> Result<()> {
 /// after it, and the leader of its session gets `SIGHUP` and `SIGCONT`, as `tty_vhangup` of the
 /// slave.
 fn close_master(pair: &Pair) {
-    let sid = {
+    let (sid, line) = {
         let mut st = pair.state.lock();
         st.master_open = false;
-        st.tty.hang_up()
+        (st.tty.hang_up(), st.line.take())
     };
+    close_line(line);
     if let Some(root) = pair.inst.root.upgrade() {
         let _ = rk_fs_tmpfs::kernel_unlink(&root, &slave_name(pair.index));
     }
@@ -344,6 +355,68 @@ fn close_master(pair: &Pair) {
     NR_PAIRS.fetch_sub(1, Ordering::AcqRel);
     pair.wait.wake_all();
     hang_up_session(sid);
+}
+
+/// The frames that the network device of the slave sends go to the master, as `pty_write` of
+/// Linux.
+impl LineOut for Pair {
+    fn write_line(&self, data: &[u8]) -> Result<()> {
+        {
+            let mut st = self.state.lock();
+            if !st.master_open {
+                return Ok(());
+            }
+            if st.to_master.len() >= MASTER_BUF {
+                return Err(Errno::ENOBUFS);
+            }
+            st.to_master.extend(data);
+        }
+        self.wait.wake_all();
+        Ok(())
+    }
+}
+
+/// Closes the line discipline `line` that a hang up or a change took from the slave. The caller
+/// does not hold the lock of the pair, because the network device takes other locks.
+fn close_line(line: Option<Arc<NetLine>>) {
+    if let Some(line) = line {
+        line.close();
+    }
+}
+
+/// Sets the line discipline `n` on the slave of `pair`, as `tty_set_ldisc` of Linux. The old
+/// line discipline closes after the new one opens. The same line discipline again does nothing.
+///
+/// Linux opens the line discipline of `c_line` again at the next open of the slave after a hang
+/// up. Here a hang up gives the slave `N_TTY`.
+fn set_ldisc(pair: &Arc<Pair>, n: i32) -> Result<usize> {
+    // A number without a line discipline in the kernel gives `EINVAL`, as `tty_ldisc_get`.
+    if !(N_TTY..NR_LDISCS).contains(&n) {
+        return Err(Errno::EINVAL);
+    }
+    let proto = match n {
+        N_TTY => None,
+        n => Some(Proto::from_ldisc(n).ok_or(Errno::EINVAL)?),
+    };
+    let current = pair.state.lock().line.as_ref().map_or(N_TTY, |l| l.ldisc());
+    if current == n {
+        return Ok(0);
+    }
+    let new = match proto {
+        Some(proto) => {
+            let out: Weak<dyn LineOut> = Arc::downgrade(pair) as Weak<dyn LineOut>;
+            Some(NetLine::open(proto, out)?)
+        }
+        None => None,
+    };
+    let old = {
+        let mut st = pair.state.lock();
+        st.tty.ldisc.flush_input();
+        core::mem::replace(&mut st.line, new)
+    };
+    close_line(old);
+    pair.wait.wake_all();
+    Ok(0)
 }
 
 /// Each pair of each instance of devpts.
@@ -403,7 +476,7 @@ fn receive(st: &mut PairState, data: &[u8]) -> Vec<(u32, u32)> {
 /// Runs an ioctl of the terminal on the pair, from either side. Gives `None` for a command that
 /// the terminal does not have. `master` tells the side of `TCFLSH` and `FIONREAD`.
 fn tty_ioctl(
-    pair: &Pair,
+    pair: &Arc<Pair>,
     master: bool,
     file: &File,
     cmd: u32,
@@ -424,7 +497,16 @@ fn tty_ioctl(
             let r = leave_ctty(&mut pair.state.lock().tty, &c);
             return Some(r.map(|signals| finish_leave_ctty(&c, signals)).map(|()| 0));
         }
+        // Only the slave has the line disciplines that make a network device.
+        TIOCSETD if !master => return Some(read_int(mem, arg).and_then(|n| set_ldisc(pair, n))),
         TIOCSPGRP => {
+            let (is_ctty, tty_pgrp) = {
+                let st = pair.state.lock();
+                (st.tty.is_ctty_of(&c), st.tty.pgrp)
+            };
+            if let Err(e) = check_change(is_ctty, tty_pgrp, &c) {
+                return Some(Err(e));
+            }
             let r = read_pgrp(mem, arg).and_then(|p| set_pgrp(&mut pair.state.lock().tty, &c, p));
             return Some(r.map(|()| 0));
         }
@@ -495,15 +577,27 @@ fn tty_ioctl(
                 }
                 if (master && output) || (!master && input) {
                     st.tty.ldisc.flush_input();
+                    if let Some(line) = &st.line {
+                        line.flush();
+                    }
                 }
             }
-            // Only the line discipline `N_TTY` (0) is in the kernel. Linux gives `EINVAL` for a
-            // line discipline that has no module, as `tty_ldisc_get`.
-            TIOCGETD => mem.write(arg, &0i32.to_ne_bytes())?,
+            TIOCGETD => {
+                let n = if master { N_TTY } else { st.line.as_ref().map_or(N_TTY, |l| l.ldisc()) };
+                mem.write(arg, &n.to_ne_bytes())?;
+            }
+            // The master has only `N_TTY`.
             TIOCSETD => {
-                if read_int(mem, arg)? != 0 {
+                if read_int(mem, arg)? != N_TTY {
                     return Err(Errno::EINVAL);
                 }
+            }
+            // The name of the network device with the NUL, as `slip_ioctl` and `slcan_ioctl` of
+            // Linux. `N_TTY` does not have it.
+            SIOCGIFNAME if !master && st.line.is_some() => {
+                let mut name = st.line.as_ref().map(|l| l.name()).unwrap_or_default().into_bytes();
+                name.push(0);
+                mem.write(arg, &name)?;
             }
             TCSBRK | TCSBRKP | TCXONC => {}
             // Only the master has a peer, as `ptm_open_peer` of Linux.
@@ -611,10 +705,20 @@ impl FileOps for MasterFile {
         if self.hung() {
             return Err(Errno::EIO);
         }
+        let mut kick = false;
         let signals = {
             let mut st = self.pair.state.lock();
-            receive(&mut st, buf)
+            match &st.line {
+                Some(line) => {
+                    kick = line.receive(buf);
+                    Vec::new()
+                }
+                None => receive(&mut st, buf),
+            }
         };
+        if kick {
+            rk_net::dev::kick_rx();
+        }
         send_signals(signals);
         self.pair.wait.wake_all();
         Ok(buf.len())
@@ -722,6 +826,10 @@ impl FileOps for SlaveFile {
             if self.hung(&st) {
                 return Ok(Some(0));
             }
+            // A line discipline without a read gives `EIO`, as `tty_read` of Linux.
+            if st.line.is_some() {
+                return Err(Errno::EIO);
+            }
             if st.tty.ldisc.readable() || buf.is_empty() {
                 return Ok(Some(st.tty.ldisc.read(buf)));
             }
@@ -738,7 +846,8 @@ impl FileOps for SlaveFile {
         let pair = &self.pair;
         pair.wait.wait_interruptible(|| {
             let mut st = pair.state.lock();
-            if self.hung(&st) {
+            // A line discipline without a write gives `EIO`, as `tty_write` of Linux.
+            if self.hung(&st) || st.line.is_some() {
                 return Err(Errno::EIO);
             }
             if st.to_master.len() < MASTER_BUF {
@@ -766,12 +875,14 @@ impl FileOps for SlaveFile {
             // up, and the slave has no session after it. A new open of the slave works.
             // The leader of the session gets `SIGHUP` and `SIGCONT`, as
             // `tty_signal_session_leader` of Linux.
+            // The line discipline closes, as `tty_ldisc_hangup`.
             check_vhangup()?;
-            let sid = {
+            let (sid, line) = {
                 let mut st = pair.state.lock();
                 st.slave_hangups += 1;
-                st.tty.hang_up()
+                (st.tty.hang_up(), st.line.take())
             };
+            close_line(line);
             pair.wait.wake_all();
             hang_up_session(sid);
             return Ok(0);
@@ -791,6 +902,10 @@ impl FileOps for SlaveFile {
         let st = self.pair.state.lock();
         if self.hung(&st) {
             return HUNG_POLL;
+        }
+        // A line discipline without a poll gives no events, as `tty_poll` of Linux.
+        if st.line.is_some() {
+            return 0;
         }
         let mut events = 0;
         if st.tty.ldisc.readable() {

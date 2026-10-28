@@ -37,6 +37,14 @@ pub enum LinkKind {
     /// A TUN device, which has no link header. A frame inside the kernel still starts with an
     /// Ethernet header with zero addresses, as on the loopback device.
     Tun,
+    /// A device on a terminal line, which a line discipline such as SLIP makes. It has no link
+    /// header, as a TUN device, and it has its own hardware type and flags.
+    Line {
+        /// The hardware type, for example `ARPHRD_SLIP`.
+        arphrd: u16,
+        /// The flags of a new device.
+        flags: u32,
+    },
 }
 
 impl LinkKind {
@@ -46,6 +54,7 @@ impl LinkKind {
             Self::Ether => ARPHRD_ETHER,
             Self::Loopback => ARPHRD_LOOPBACK,
             Self::Tun => ARPHRD_NONE,
+            Self::Line { arphrd, .. } => arphrd,
         }
     }
 
@@ -55,7 +64,15 @@ impl LinkKind {
             Self::Ether => IFF_BROADCAST | IFF_MULTICAST,
             Self::Loopback => IFF_LOOPBACK,
             Self::Tun => IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST,
+            Self::Line { flags, .. } => flags,
         }
+    }
+
+    /// Tells if a frame of the device has a link header for the user, as a nonzero
+    /// `hard_header_len` of Linux. A frame inside the kernel always starts with an Ethernet
+    /// header.
+    pub fn has_header(self) -> bool {
+        matches!(self, Self::Ether | Self::Loopback)
     }
 }
 
@@ -92,7 +109,7 @@ pub trait NetDriver: Send + Sync {
     /// The smallest MTU, as `dev->min_mtu` of Linux.
     fn min_mtu(&self) -> u32 {
         match self.kind() {
-            LinkKind::Ether | LinkKind::Tun => ETH_MIN_MTU,
+            LinkKind::Ether | LinkKind::Tun | LinkKind::Line { .. } => ETH_MIN_MTU,
             LinkKind::Loopback => 0,
         }
     }
@@ -330,7 +347,7 @@ impl NetDevice {
     pub fn max_mtu(&self) -> u32 {
         match self.kind {
             LinkKind::Loopback => 0,
-            LinkKind::Ether | LinkKind::Tun => self.driver.max_mtu(),
+            LinkKind::Ether | LinkKind::Tun | LinkKind::Line { .. } => self.driver.max_mtu(),
         }
     }
 
@@ -449,7 +466,7 @@ impl NetDevice {
     pub fn broadcast(&self) -> MacAddr {
         match self.kind {
             LinkKind::Ether => MacAddr::BROADCAST,
-            LinkKind::Loopback | LinkKind::Tun => MacAddr::ZERO,
+            LinkKind::Loopback | LinkKind::Tun | LinkKind::Line { .. } => MacAddr::ZERO,
         }
     }
 
@@ -588,7 +605,7 @@ pub fn register_at(
         let name = match (kind, name) {
             (LinkKind::Loopback, _) if taken("lo") => return Err(Errno::EEXIST),
             (LinkKind::Loopback, _) => String::from("lo"),
-            (LinkKind::Ether | LinkKind::Tun, Some(name)) => {
+            (_, Some(name)) => {
                 let name = core::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
                 if !valid_name(name.as_bytes()) {
                     return Err(Errno::EINVAL);
@@ -598,7 +615,7 @@ pub fn register_at(
                 }
                 String::from(name)
             }
-            (LinkKind::Ether | LinkKind::Tun, None) => {
+            (_, None) => {
                 let prefix = driver.link_kind().unwrap_or("eth");
                 match (0..).map(|n| format!("{prefix}{n}")).find(|n| !taken(n)) {
                     Some(name) => name,
@@ -750,6 +767,7 @@ pub fn init() {
     static OPS: AtomicBool = AtomicBool::new(false);
     if !OPS.swap(true, Ordering::Relaxed) {
         ns::add_device_ops(ns_init, ns_exit);
+        add_notifier(crate::packet::device_event);
         crate::sysctl::init();
     }
     if by_name("lo").is_none() {

@@ -8,11 +8,16 @@
 //! and the device match, as `packet_rcv` of Linux. A socket of `ETH_P_ALL` also gets the frames
 //! that the devices send, as `dev_queue_xmit_nit` of Linux. A `SOCK_RAW` socket gets the link
 //! header, and a `SOCK_DGRAM` socket gets the payload. A TUN device has no link header, thus its
-//! frames have none for both types.
+//! frames have none for both types. A device on a terminal line, as a SLIP device, has no link
+//! header too.
+//!
+//! When the device of a bound socket goes down, the socket gets the error `ENETDOWN` and no
+//! frames, as `packet_notifier` of Linux. When the device goes away, the socket has no device,
+//! and a send gives `ENXIO`.
 
 use crate::buf::NetBuf;
 use crate::consts::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW};
-use crate::dev::{self, LinkKind, NetDevice};
+use crate::dev::{self, Event, LinkKind, NetDevice};
 use crate::ether::{EthHeader, HLEN, MacAddr};
 use crate::options::Options;
 use crate::{Message, PathOps, Received, Socket, next_ino, ns, wait_for};
@@ -20,10 +25,10 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::ETH_P_ALL;
-use rk_abi::native::poll::{POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
+use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::socket::{
     SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
 };
@@ -58,6 +63,9 @@ pub const PACKET_OUTGOING: u8 = 4;
 /// `SO_RCVBUF`, as the `truesize` of an `sk_buff` of Linux.
 const FRAME_OVERHEAD: usize = 256;
 
+/// The interface index of a socket whose device went away, `-1` of Linux. No device has it.
+const GONE: u32 = u32::MAX;
+
 /// The direction of a frame for `tap`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -84,8 +92,13 @@ pub struct PacketSocket {
     kind: u32,
     /// The protocol in network byte order, as the caller gave it.
     protocol: AtomicU32,
-    /// The device of `bind`, or 0 for all devices.
+    /// The device of `bind`, or 0 for all devices, or `GONE`.
     ifindex: AtomicU32,
+    /// The device of `bind` went down, thus the socket takes no frames, as a packet socket of
+    /// Linux that is not `PACKET_SOCK_RUNNING`.
+    stopped: AtomicBool,
+    /// The error for the next receive or `SO_ERROR`, as `sk_err` of Linux, or 0.
+    err: AtomicU32,
     options: SpinLock<Options>,
     wait: Arc<WaitQueue>,
     /// The index of the namespace of the socket. The socket holds its namespace, so the index
@@ -117,6 +130,8 @@ impl PacketSocket {
             kind,
             protocol: AtomicU32::new(protocol & 0xffff),
             ifindex: AtomicU32::new(0),
+            stopped: AtomicBool::new(false),
+            err: AtomicU32::new(0),
             options: SpinLock::new(Options::default()),
             wait: Arc::new(WaitQueue::new()),
             net: ns::current_index(),
@@ -133,7 +148,7 @@ impl PacketSocket {
     /// Tells if the socket takes a frame of the protocol `ethertype` on `dev`.
     fn takes(&self, dev: &NetDevice, ethertype: u16, dir: Direction) -> bool {
         let protocol = u16::from_be(self.protocol() as u16);
-        if protocol == 0 || self.net != dev.net() {
+        if protocol == 0 || self.net != dev.net() || self.stopped.load(Ordering::Relaxed) {
             return false;
         }
         let ifindex = self.ifindex.load(Ordering::Relaxed);
@@ -146,9 +161,17 @@ impl PacketSocket {
         }
     }
 
+    /// Gives the pending error and clears it, as `sock_error` of Linux.
+    fn take_error(&self) -> Result<()> {
+        match self.err.swap(0, Ordering::Relaxed) {
+            0 => Ok(()),
+            e => Err(Errno::new(e as u16).unwrap_or(Errno::EIO)),
+        }
+    }
+
     /// Puts a copy of `frame` in the queue, as `packet_rcv` of Linux. A full queue drops it.
     fn queue(&self, dev: &NetDevice, frame: &[u8], h: &EthHeader, pkttype: u8) {
-        let data = if self.kind == SOCK_DGRAM || dev.kind() == LinkKind::Tun {
+        let data = if self.kind == SOCK_DGRAM || !dev.kind().has_header() {
             &frame[HLEN..]
         } else {
             frame
@@ -159,7 +182,7 @@ impl PacketSocket {
         addr[4..8].copy_from_slice(&dev.ifindex().to_ne_bytes());
         addr[8..10].copy_from_slice(&dev.kind().arphrd().to_ne_bytes());
         addr[10] = pkttype;
-        if dev.kind() != LinkKind::Tun {
+        if dev.kind().has_header() {
             addr[11] = 6;
             addr[12..18].copy_from_slice(&h.src.0);
         }
@@ -175,6 +198,38 @@ impl PacketSocket {
         }
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
+    }
+}
+
+/// Takes the change `event` of `dev` for the sockets that are bound to it, as `packet_notifier` of
+/// Linux. A device that goes down gives `ENETDOWN` to each bound socket that takes frames, and the
+/// socket takes no frames until the device is up again. A device that goes away leaves the
+/// sockets without a device.
+pub(crate) fn device_event(dev: &NetDevice, event: Event) {
+    if COUNT.load(Ordering::Relaxed) == 0
+        || !matches!(event, Event::Up | Event::Down | Event::Unregister)
+    {
+        return;
+    }
+    let list: Vec<Arc<PacketSocket>> = SOCKETS
+        .lock()
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|s| s.net == dev.net() && s.ifindex.load(Ordering::Relaxed) == dev.ifindex())
+        .collect();
+    for sock in list {
+        if event == Event::Up {
+            sock.stopped.store(false, Ordering::Relaxed);
+            continue;
+        }
+        if !sock.stopped.swap(true, Ordering::Relaxed) && sock.protocol() != 0 {
+            sock.err.store(u32::from(Errno::ENETDOWN.get()), Ordering::Relaxed);
+        }
+        if event == Event::Unregister {
+            sock.ifindex.store(GONE, Ordering::Relaxed);
+        }
+        sock.events.fetch_add(1, Ordering::Relaxed);
+        sock.wait.wake_all();
     }
 }
 
@@ -254,11 +309,13 @@ impl Socket for PacketSocket {
             self.protocol.store(u32::from(protocol), Ordering::Relaxed);
         }
         self.ifindex.store(ifindex, Ordering::Relaxed);
+        self.stopped.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     /// Sends one frame, as `packet_snd` of Linux. A `SOCK_RAW` socket gives the whole frame. A
-    /// `SOCK_DGRAM` socket gives the payload, and the kernel adds the link header.
+    /// `SOCK_DGRAM` socket gives the payload, and the kernel adds the link header. A device
+    /// without a link header takes the payload from both types.
     fn send(
         &self,
         _paths: &dyn PathOps,
@@ -278,7 +335,14 @@ impl Socket for PacketSocket {
         let len = msg.data.len();
         let mut frame = NetBuf::new(HLEN, len);
         frame.put(len).copy_from_slice(&msg.data);
-        if self.kind == SOCK_DGRAM {
+        if !dev.kind().has_header() {
+            let h = EthHeader {
+                dst: MacAddr::ZERO,
+                src: MacAddr::ZERO,
+                ethertype: u16::from_be(protocol),
+            };
+            h.push(&mut frame);
+        } else if self.kind == SOCK_DGRAM {
             let h = EthHeader { dst, src: dev.mac(), ethertype: u16::from_be(protocol) };
             h.push(&mut frame);
         } else if len < HLEN {
@@ -297,6 +361,8 @@ impl Socket for PacketSocket {
         let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
         let timeout = self.options.lock().rcvtimeo;
         let item = wait_for(&self.wait, timeout, || {
+            // A pending error comes first, as `sock_error` in `__skb_try_recv_datagram`.
+            self.take_error()?;
             let mut q = self.queue.lock();
             if flags & MSG_PEEK != 0 {
                 if let Some(f) = q.0.front() {
@@ -347,7 +413,8 @@ impl Socket for PacketSocket {
             SO_TYPE => int(self.kind),
             SO_DOMAIN => int(AF_PACKET),
             SO_PROTOCOL => int(self.protocol()),
-            SO_ERROR | SO_ACCEPTCONN => int(0),
+            SO_ERROR => int(self.err.swap(0, Ordering::Relaxed)),
+            SO_ACCEPTCONN => int(0),
             _ => self.options.lock().get(name)?,
         })
     }
@@ -377,7 +444,8 @@ impl Socket for PacketSocket {
 
     fn poll(&self) -> u32 {
         let read = if self.queue.lock().0.is_empty() { 0 } else { POLLIN | POLLRDNORM };
-        read | POLLOUT | POLLWRNORM | POLLWRBAND
+        let err = if self.err.load(Ordering::Relaxed) != 0 { POLLERR } else { 0 };
+        read | err | POLLOUT | POLLWRNORM | POLLWRBAND
     }
 
     fn poll_wait(&self, table: &mut PollTable) {

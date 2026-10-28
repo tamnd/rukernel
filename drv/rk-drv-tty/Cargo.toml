@@ -13,6 +13,7 @@ publish.workspace = true
 rk-abi.workspace = true
 rk-frame.workspace = true
 rk-fs-tmpfs.workspace = true
+rk-net.workspace = true
 rk-vfs.workspace = true
 zerocopy.workspace = true
 
