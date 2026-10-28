@@ -61,6 +61,12 @@ impl IoMem {
         self.len == 0
     }
 
+    /// The kernel virtual address of the range.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn base(&self) -> usize {
+        self.virt
+    }
+
     fn ptr<T>(&self, offset: usize) -> *mut T {
         let size = size_of::<T>();
         assert!(

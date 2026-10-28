@@ -28,6 +28,16 @@ tools/ltp/run.py --kernel target/x86_64-unknown-none/release/rukernel --ltp ~/rk
 
 The boot tests download the static BusyBox to `target/x86_64-unknown-none/debug/busybox`. `net` runs each `runtest/net.*` file. `--only` runs only some tests, for example `--only fork01,mmap01`. A batch that is done does not run again, unless `--force` is given, so a second run continues a run that stopped. `--only @FILE` reads the tags from a file. `--first 101` numbers the batches from 101, so the run keeps the old logs, and `report.py` uses the newest result of each test. The baseline uses the release build of the kernel, because the debug build is 5 times slower under QEMU without KVM.
 
+`--arch aarch64` runs the tests on the arm64 kernel, on the `virt` machine of `qemu-system-aarch64` with a GICv3 and TCG. `run.py` makes the arm64 `Image` from the ELF file of the kernel, and the console is `ttyAMA0`. `build.sh --arch aarch64` builds LTP for arm64 in an arm64 Alpine container. The host must run arm64 programs through qemu-user-static with binfmt, and the build is about 10 times slower than the x86-64 build. `LTP_TESTDIRS` sets the directories of the tests that the full build builds, so `LTP_TESTDIRS=testcases/kernel/syscalls` builds only the syscalls group. The arm64 BusyBox comes from `tools/busybox/build.sh` on the same host.
+
+```sh
+LTP_TESTDIRS=testcases/kernel/syscalls tools/ltp/build.sh --full --arch aarch64 ~/rkltp-arm64
+tools/busybox/build.sh ~/rkltp-arm64/busybox
+cargo build --release --package rukernel --target aarch64-unknown-none
+tools/ltp/run.py --arch aarch64 --kernel target/aarch64-unknown-none/release/rukernel \
+    --ltp ~/rkltp-arm64/ltp --busybox ~/rkltp-arm64/busybox/busybox --out ~/rkltp-arm64/runs syscalls
+```
+
 The results are:
 
 - pass: the test exits with 0.

@@ -15,7 +15,10 @@ pub(crate) type TriggerTimer = Arc<Timer>;
 pub(crate) fn start_timer(trigger: &Arc<PsiTrigger>, period: u64) -> TriggerTimer {
     let weak: Weak<dyn Expire> = Arc::downgrade(trigger) as Weak<dyn Expire>;
     let timer = Timer::new(Clock::Boot, Target::Notify(weak), SigInfo::new(0, 0, 0));
-    timer.arm(rk_cgroup::now() + period, period);
+    // The first expiry is on the clock of the timer. The clock of the pressure counts the time of
+    // the counter, and it can be ahead of the clock of the timer when ticks are late, for example
+    // under QEMU on a busy host. With that time the timer did not fire during a stall.
+    timer.arm(timer.now() + period, period);
     timer
 }
 

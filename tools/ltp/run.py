@@ -27,12 +27,17 @@ these lines.
 At most --jobs batches run at the same time. A batch with the file `done` in its directory does
 not run again, unless --force is given. report.py takes the newest result of each test, so a
 second run with --only and --first 101 runs some tests again and keeps the other results. Without KVM, QEMU uses TCG, and a batch is slow.
+
+--arch aarch64 runs an arm64 kernel and an arm64 LTP tree (`build.sh --full --arch aarch64`) on
+the QEMU `virt` machine. --kernel is then the kernel ELF file or its `Image`. The disks are
+virtio-pci devices on the PCI bus of the ECAM host, so they have the same names as on x86-64.
 """
 
 import argparse
 import concurrent.futures
 import os
 import select
+import struct
 import shutil
 import subprocess
 import sys
@@ -139,6 +144,44 @@ def cpio(entries):
     return bytes(out)
 
 
+# The offset and the value of the magic number in the header of a Linux arm64 `Image`, per
+# Documentation/arch/arm64/booting.rst of Linux.
+IMAGE_MAGIC_AT = 0x38
+IMAGE_MAGIC = 0x644D5241
+
+
+def arm64_image(kernel, path):
+    """Writes the Linux arm64 `Image` of the kernel ELF file to `path`, as `cargo xtask` does.
+    The physical address of each segment is its offset in the image. Gives `path`, or `kernel` if
+    the kernel is an `Image` already."""
+    with open(kernel, "rb") as f:
+        elf = f.read()
+    if elf[:4] != b"\x7fELF":
+        if struct.unpack_from("<I", elf, IMAGE_MAGIC_AT)[0] != IMAGE_MAGIC:
+            sys.exit(f"ltp: {kernel} is not an ELF file or an arm64 Image")
+        return kernel
+    if elf[4] != 2:
+        sys.exit(f"ltp: {kernel} is not an ELF64 file")
+    phoff, = struct.unpack_from("<Q", elf, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", elf, 0x36)
+    image = bytearray()
+    for i in range(phnum):
+        ph = phoff + i * phentsize
+        kind, = struct.unpack_from("<I", elf, ph)
+        if kind != 1:
+            continue
+        offset, = struct.unpack_from("<Q", elf, ph + 8)
+        at, size = struct.unpack_from("<QQ", elf, ph + 24)
+        if len(image) < at + size:
+            image.extend(bytes(at + size - len(image)))
+        image[at:at + size] = elf[offset:offset + size]
+    if struct.unpack_from("<I", image, IMAGE_MAGIC_AT)[0] != IMAGE_MAGIC:
+        sys.exit(f"ltp: {kernel} does not start with an arm64 Image header")
+    with open(path, "wb") as f:
+        f.write(image)
+    return path
+
+
 def runtests(ltp, groups):
     """Gives the tests of the groups: a list of (runtest file, tag, command)."""
     names = []
@@ -229,21 +272,33 @@ class Batch:
         disk = os.path.join(self.dir, "dev.img")
         with open(disk, "wb") as f:
             f.truncate(512 << 20)
-        cmd = [
-            "qemu-system-x86_64", "-machine", "q35", "-m", self.a.memory, "-smp", str(self.a.smp),
+        if self.a.arch == "aarch64":
+            # PSCI SYSTEM_OFF stops QEMU at the end. The arm64 kernel uses the GICv3.
+            cmd = [
+                "qemu-system-aarch64", "-machine", "virt,gic-version=3", "-cpu", "cortex-a72",
+                "-accel", "tcg", "-global", "virtio-mmio.force-legacy=false",
+            ]
+            console = "ttyAMA0"
+        else:
+            cmd = [
+                "qemu-system-x86_64", "-machine", "q35",
+                "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+            ]
+            if os.access("/dev/kvm", os.R_OK | os.W_OK):
+                cmd += ["-accel", "kvm", "-cpu", "host"]
+            else:
+                cmd += ["-accel", "tcg", "-cpu", "max"]
+            console = "ttyS0"
+        cmd += [
+            "-m", self.a.memory, "-smp", str(self.a.smp),
             "-display", "none", "-serial", "stdio", "-no-reboot", "-monitor", "none",
-            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-kernel", self.a.kernel, "-initrd", initrd,
-            "-append", "console=ttyS0 rk.test=init rdinit=/init",
+            "-append", f"console={console} rk.test=init rdinit=/init",
             "-drive", f"if=none,id=dev,format=raw,cache=unsafe,file={disk}",
             "-device", "virtio-blk-pci,drive=dev",
             "-drive", f"if=none,id=ltp,format=raw,readonly=on,file={self.a.image}",
             "-device", "virtio-blk-pci,drive=ltp",
         ]
-        if os.access("/dev/kvm", os.R_OK | os.W_OK):
-            cmd += ["-accel", "kvm", "-cpu", "host"]
-        else:
-            cmd += ["-accel", "tcg", "-cpu", "max"]
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         done, current, how = set(), None, "exit"
         # The time of the last start of a test, or of the boot.
@@ -319,7 +374,9 @@ class Batch:
 
 def main():
     p = argparse.ArgumentParser(description="Runs LTP runtest files on rukernel under QEMU.")
-    p.add_argument("--kernel", required=True, help="the kernel ELF file")
+    p.add_argument("--kernel", required=True, help="the kernel ELF file, or an arm64 Image")
+    p.add_argument("--arch", choices=["x86_64", "aarch64"], default="x86_64",
+                   help="the architecture of the kernel and of the LTP tree")
     p.add_argument("--ltp", required=True, help="the LTP tree of build.sh --full")
     p.add_argument("--busybox", required=True, help="a static BusyBox program")
     p.add_argument("--out", default="runs", help="the directory of the batches")
@@ -345,6 +402,8 @@ def main():
     a.busybox = os.path.abspath(a.busybox)
     a.ip = a.ip and os.path.abspath(a.ip)
     os.makedirs(a.out, exist_ok=True)
+    if a.arch == "aarch64":
+        a.kernel = arm64_image(a.kernel, os.path.join(a.out, "Image"))
     a.image = os.path.abspath(a.image or os.path.join(a.out, "ltp.img"))
     make_image(a.ltp, a.image)
 
