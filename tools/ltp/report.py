@@ -21,9 +21,9 @@ or the directory of the source of the test in LTP, as kernel/syscalls/fork. The 
 comes from tools/rk-abigen. If the Linux tarball of rk-abigen is in its cache, the script stops
 when a path of linux.txt is not in it.
 
-The script writes syscalls.md, mm.md, sched.md and net.md in the directory of --out, by default
-the directory of the script. It also writes the status and the work that remains in README.md of
-that directory, between the lines `<!-- report: begin -->` and `<!-- report: end -->`.
+The script writes syscalls.md, mm.md, sched.md, net.md and pty.md in the directory of --out, by
+default the directory of the script. It also writes the status and the work that remains in
+README.md of that directory, between the lines `<!-- report: begin -->` and `<!-- report: end -->`.
 """
 
 import argparse
@@ -37,12 +37,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 LTP_URL = "https://github.com/linux-test-project/ltp/blob/{}/testcases/{}"
 LINUX_URL = "https://github.com/torvalds/linux/blob/v{}/{}"
-GROUPS = ["syscalls", "mm", "sched", "net"]
+GROUPS = ["syscalls", "mm", "sched", "net", "pty"]
 TITLES = {
     "syscalls": "LTP syscalls results",
     "mm": "LTP mm results",
     "sched": "LTP sched results",
     "net": "LTP net results",
+    "pty": "LTP pty results",
 }
 
 # The status of each result of run.py. A code is the exit code of the test. LTP gives 32 (TCONF)
@@ -189,6 +190,7 @@ GROUP_DIRS = {
     "mm": "kernel/mem/",
     "sched": "kernel/sched/",
     "net": "network/",
+    "pty": "kernel/pty/",
 }
 
 

@@ -166,6 +166,13 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
     let process = thread.process();
     if process.threads().len() <= 1 {
         crate::sem::exit(process.pid() as i32);
+        // A session leader leaves its controlling terminal, as `disassociate_ctty` of Linux.
+        // The SIGHUP to the foreground group can reach the leader, so its exit status is fixed
+        // first, as the exit code of Linux is set before `disassociate_ctty`.
+        if process.pid() == process.sid() {
+            rk_proc::exit_group(&thread, status);
+            rk_drv_tty::session_leader_exit(process.sid());
+        }
     }
     rk_proc::exit_thread(&thread, status);
 }
@@ -364,6 +371,12 @@ pub fn init() {
     });
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
+    });
+    rk_drv_tty::set_caller_hook(|| {
+        rk_proc::current_thread().map_or_else(rk_drv_tty::Caller::default, |t| {
+            let p = t.process();
+            rk_drv_tty::Caller { pid: p.pid(), pgid: p.pgid(), sid: p.sid() }
+        })
     });
     rk_net::set_cred_source(crate::net::current_cred);
     rk_net::ns::set_source(|| rk_proc::current_thread().and_then(|t| t.net_ns_opt()));

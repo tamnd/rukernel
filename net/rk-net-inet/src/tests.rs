@@ -827,11 +827,26 @@ fn ipv6_loopback() {
     assert_eq!(send6(&o, Some((src, 9)), b"x"), Err(Errno::ENETUNREACH));
 
     // A socket with `IPV6_RTHDR` sends its datagrams through the routing header, and the
-    // checksum is for the final destination.
+    // checksum is for the final destination. The input drops a segment routing header while
+    // `seg6_enabled` is 0, as Linux.
     let r6 = Dgram::new6(Proto::Udp);
     r6.set_option(IPPROTO_IPV6, IPV6_RTHDR, &srh(&[lo, lo, lo], 1)).unwrap();
     assert_eq!(send6(&r6, Some((lo, port)), b"rthdr"), Ok(5));
-    assert_eq!(a.recv(100, 0, true).unwrap().data, b"rthdr");
+    assert_eq!(a.recv(100, 0, true).map(|r| r.data), Err(Errno::EAGAIN));
+    let seg6 = |v: &[u8]| {
+        for d in ["all", "lo"] {
+            rk_net::sysctl::write(&alloc::format!("ipv6/conf/{d}/seg6_enabled"), v).unwrap();
+        }
+    };
+    seg6(b"1\n");
+    // The input goes to the next segment, an address of the host, with one hop less, and then
+    // to the final destination.
+    assert_eq!(send6(&r6, Some((lo, port)), b"rthdr"), Ok(5));
+    let r = a.recv(100, 0, true).unwrap();
+    assert_eq!(r.data, b"rthdr");
+    let hops = int(i32::from(ipv6::DEFAULT_HOPS) - 1);
+    assert_eq!(r.control.last(), Some(&(IPPROTO_IPV6, IPV6_HOPLIMIT, hops)));
+    seg6(b"0\n");
 
     // `IPV6_ADDRFORM` changes a UDP socket with an IPv4 peer to `AF_INET`.
     let f = Dgram::new6(Proto::Udp);
@@ -870,6 +885,22 @@ fn ipv6_loopback() {
     assert_eq!(r.data[0], 128);
     assert_eq!(raw.recv(200, 0, true).err(), Some(Errno::EAGAIN));
     assert!(p.recv(100, 0, true).is_ok());
+
+    // A routing header of type 0 with a segment left gives a parameter problem at its type, as
+    // `ipv6_rthdr_rcv`. With no segment left the host takes the packet.
+    let hdrincl = Dgram::new6(Proto::Raw(255));
+    let packet = |left: u8| {
+        let mut p = ipv6::Header::new(lo, lo, ipv6::NEXT_ROUTING, 24).to_bytes().to_vec();
+        p.extend_from_slice(&[ipv6::NEXT_NONE, 2, 0, left, 0, 0, 0, 0]);
+        p.extend_from_slice(&lo);
+        p
+    };
+    assert_eq!(send6(&hdrincl, Some((lo, 0)), &packet(1)), Ok(64));
+    let r = raw.recv(200, 0, true).unwrap();
+    assert_eq!((r.data[0], r.data[1]), (4, 0));
+    assert_eq!(u32::from_be_bytes([r.data[4], r.data[5], r.data[6], r.data[7]]), 42);
+    assert_eq!(send6(&hdrincl, Some((lo, 0)), &packet(0)), Ok(64));
+    assert_eq!(raw.recv(200, 0, true).err(), Some(Errno::EAGAIN));
 
     // TCP of IPv6, and an IPv4 connection to a dual stack listener.
     let l = Stream::new6();

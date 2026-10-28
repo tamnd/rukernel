@@ -31,12 +31,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::icmpv6::{
     ICMPV6_ADDR_UNREACH, ICMPV6_ADM_PROHIBITED, ICMPV6_DEST_UNREACH, ICMPV6_ECHO_REPLY,
-    ICMPV6_ECHO_REQUEST, ICMPV6_NOROUTE, ICMPV6_NOT_NEIGHBOUR, ICMPV6_PARAMPROB, ICMPV6_PKT_TOOBIG,
-    ICMPV6_POLICY_FAIL, ICMPV6_PORT_UNREACH, ICMPV6_REJECT_ROUTE, ICMPV6_TIME_EXCEED,
-    ICMPV6_UNK_NEXTHDR,
+    ICMPV6_ECHO_REQUEST, ICMPV6_EXC_HOPLIMIT, ICMPV6_HDR_FIELD, ICMPV6_NOROUTE,
+    ICMPV6_NOT_NEIGHBOUR, ICMPV6_PARAMPROB, ICMPV6_PKT_TOOBIG, ICMPV6_POLICY_FAIL,
+    ICMPV6_PORT_UNREACH, ICMPV6_REJECT_ROUTE, ICMPV6_TIME_EXCEED, ICMPV6_UNK_NEXTHDR,
 };
 use rk_abi::native::if_addr::IFA_F_TENTATIVE;
 use rk_abi::native::if_ether::ETH_P_IPV6;
+use rk_abi::native::inet::{IPPROTO_IPIP, IPPROTO_IPV6};
 use rk_abi::native::rtnetlink::RTPROT_RA;
 use rk_frame::sync::SpinLock;
 use rk_net::buf::{HEADROOM, NetBuf};
@@ -93,6 +94,10 @@ const DEST_UNREACH: u8 = ICMPV6_DEST_UNREACH as u8;
 const PKT_TOOBIG: u8 = ICMPV6_PKT_TOOBIG as u8;
 const TIME_EXCEED: u8 = ICMPV6_TIME_EXCEED as u8;
 const PARAMPROB: u8 = ICMPV6_PARAMPROB as u8;
+/// The code of a parameter problem in a field of a header.
+const HDR_FIELD: u8 = ICMPV6_HDR_FIELD as u8;
+/// The code of a time exceeded message for the hop limit.
+const EXC_HOPLIMIT: u8 = ICMPV6_EXC_HOPLIMIT as u8;
 
 /// The counters of IPv6, as the lines of /proc/net/snmp6.
 pub(crate) struct Counters6 {
@@ -603,6 +608,7 @@ pub(crate) fn input(dev: &NetDevice, mut frame: NetBuf) {
         count(&COUNTERS6.in_mcast);
         add(&COUNTERS6.in_mcast_octets, frame.len());
     }
+    let Some(h) = rthdr_input(dev, &mut frame, h) else { return };
     let packet = frame.data();
     let payload = &packet[h.l4..];
     let raw = stack::raw_sockets(AF_INET6, h.protocol);
@@ -624,6 +630,108 @@ pub(crate) fn input(dev: &NetDevice, mut frame: NetBuf) {
             icmp_error(&h, ifindex, packet, PARAMPROB, ICMPV6_UNK_NEXTHDR as u8, h.nh as u32);
         }
         _ => {}
+    }
+}
+
+/// `IPV6_SRCRT_TYPE_2` of include/uapi/linux/ipv6.h: the routing header of Mobile IPv6.
+const SRCRT_TYPE_2: u8 = 2;
+/// `IPV6_SRCRT_TYPE_3` of include/uapi/linux/ipv6.h: the routing header of RPL.
+const SRCRT_TYPE_3: u8 = 3;
+/// `IPV6_SRCRT_TYPE_4` of include/uapi/linux/ipv6.h: the segment routing header.
+const SRCRT_TYPE_4: u8 = 4;
+
+/// Processes the routing header of a packet for this host, as `ipv6_rthdr_rcv` and
+/// `ipv6_srh_rcv` in net/ipv6/exthdrs.c of Linux. Gives the header of the packet for the upper
+/// layer, or `None` when the packet is dropped or goes to the input again after its
+/// encapsulation is removed.
+///
+/// A segment routing header with segments left goes to its next segment: the header and the
+/// destination of the packet change. When the next segment is an address of the host, the
+/// processing continues with one hop less, as for the loopback route of Linux. Else the packet
+/// is dropped, because the stack does not forward. Linux takes a segment routing header only
+/// when `seg6_enabled` of `all` and of the device are on. There is no RPL and no Mobile IPv6
+/// home address, so a header of type 3, and a header of type 2 with an address, are dropped.
+fn rthdr_input(dev: &NetDevice, frame: &mut NetBuf, mut h: Header) -> Option<Header> {
+    let Some(at) = h.routing_header(frame.data()) else { return Some(h) };
+    let (hdr_errors, addr_errors) = (&COUNTERS6.in_hdr_errors, &COUNTERS6.in_addr_errors);
+    let Some(&[_, hdrlen, kind, _]) = frame.data().get(at..at + 4) else {
+        count(hdr_errors);
+        return None;
+    };
+    let len = (usize::from(hdrlen) + 1) * 8;
+    if frame.len() < at + len {
+        count(hdr_errors);
+        return None;
+    }
+    if ipv6::is_multicast(&h.dst) {
+        count(addr_errors);
+        return None;
+    }
+    let ifindex = dev.ifindex();
+    let conf = |name| {
+        use rk_net::sysctl::{Family, Scope, conf};
+        conf(Family::Ipv6, Scope::All, name).min(conf(Family::Ipv6, Scope::Dev(ifindex), name))
+    };
+    // The number of addresses in the header.
+    let n = hdrlen / 2;
+    match kind {
+        SRCRT_TYPE_4 if conf("seg6_enabled") == 0 => None,
+        SRCRT_TYPE_4 => loop {
+            let left = frame.data()[at + 3];
+            if left == 0 {
+                let next = frame.data()[at];
+                if u32::from(next) == IPPROTO_IPV6 || u32::from(next) == IPPROTO_IPIP {
+                    // The packet in the header goes to the input of its protocol, as
+                    // `netif_rx` of the inner packet.
+                    let inner = NetBuf::from_slice(&frame.data()[at + len..]);
+                    if u32::from(next) == IPPROTO_IPV6 {
+                        input(dev, inner);
+                    } else {
+                        stack::ip_input(dev, inner);
+                    }
+                    return None;
+                }
+                return Some(h);
+            }
+            if left >= n {
+                count(hdr_errors);
+                let packet = frame.data();
+                icmp_error(&h, ifindex, packet, PARAMPROB, HDR_FIELD, (at + 3) as u32);
+                return None;
+            }
+            let seg = at + 8 + 16 * usize::from(left - 1);
+            let data = frame.data_mut();
+            data[at + 3] = left - 1;
+            data.copy_within(seg..seg + 16, 24);
+            h.dst = data[24..40].try_into().unwrap_or_default();
+            if !ROUTES6.lock().is_local(&h.dst) {
+                count(addr_errors);
+                return None;
+            }
+            if h.hops <= 1 {
+                count(hdr_errors);
+                icmp_error(&h, ifindex, frame.data(), TIME_EXCEED, EXC_HOPLIMIT, 0);
+                return None;
+            }
+            h.hops -= 1;
+            frame.data_mut()[7] = h.hops;
+        },
+        SRCRT_TYPE_3 => None,
+        // A type 2 header that this host did not process itself is dropped.
+        SRCRT_TYPE_2 if frame.data()[at + 3] == 0 => {
+            count(addr_errors);
+            None
+        }
+        _ if frame.data()[at + 3] == 0 => Some(h),
+        SRCRT_TYPE_2 if conf("accept_source_route") >= 0 => {
+            count(if hdrlen != 2 || frame.data()[at + 3] != 1 { hdr_errors } else { addr_errors });
+            None
+        }
+        _ => {
+            count(hdr_errors);
+            icmp_error(&h, ifindex, frame.data(), PARAMPROB, HDR_FIELD, (at + 2) as u32);
+            None
+        }
     }
 }
 

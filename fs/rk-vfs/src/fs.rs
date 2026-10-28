@@ -468,7 +468,7 @@ impl FsContext {
                 Ok(File::open_inode(at, flags))
             }
             FileType::CharDevice => {
-                let ops = device::open_char(meta.rdev, flags)?;
+                let ops = device::open_char_at(meta.rdev, &at, flags)?;
                 Ok(File::with_ops(ops, Some(at), flags))
             }
             FileType::BlockDevice => {

@@ -1,19 +1,19 @@
 # LTP
 
-This directory has the files that run the Linux Test Project (LTP) on rukernel, and the record of the results of the syscalls, mm, sched and net groups. The exit of R4 uses these groups.
+This directory has the files that run the Linux Test Project (LTP) on rukernel, and the record of the results of the syscalls, mm, sched, net and pty groups. The exit of R4 uses the first four groups.
 
 - `build.sh` builds LTP as static musl programs in an Alpine container. Without `--full`, it builds the tests of the `ltp` boot test. With `--full`, it builds all of LTP.
 - `tests.txt` has the tests that `cargo xtask boot-test ltp` runs, and the reasons why other tests are not in it.
 - `kconfig` tells LTP the kernel options of rukernel.
 - `run.py` runs runtest files of LTP on rukernel under QEMU, in batches.
-- `syscalls.md`, `mm.md`, `sched.md` and `net.md` have the result of each test of a group.
+- `syscalls.md`, `mm.md`, `sched.md`, `net.md` and `pty.md` have the result of each test of a group.
 - `notes.txt` has a note for some tests: the missing feature, or the pull request that fixed the test.
 - `linux.txt` has the Linux code that each test checks, as paths in the Linux tree.
 - `report.py` makes the result files from the logs of the runs, and `update.sh` copies the logs from the test server and runs `report.py`.
 
 ## How the tests run
 
-`build.sh --full OUT` builds LTP at the tag in `build.sh` and installs it in `OUT/ltp`, as LTP installs itself in `/opt/ltp`. A test that does not build with musl does not stop the build. `OUT/notbuilt.txt` has the tests of the four groups that have no program, and `OUT/src.tar.gz` has the sources of the tests for `report.py`. The build takes about 15 minutes on an x86-64 host with 6 cores.
+`build.sh --full OUT` builds LTP at the tag in `build.sh` and installs it in `OUT/ltp`, as LTP installs itself in `/opt/ltp`. A test that does not build with musl does not stop the build. `OUT/notbuilt.txt` has the tests of the groups that have no program, and `OUT/src.tar.gz` has the sources of the tests for `report.py`. The build takes about 15 minutes on an x86-64 host with 6 cores.
 
 `run.py` makes an ext4 image of the LTP tree, and splits the tests of each runtest file in batches of 60 tests. Each batch boots the kernel in QEMU, with BusyBox and an init script in the initramfs. The script mounts the image read only on `/ltp`, mounts tmpfs on `/tmp` and `/dev/shm`, brings up `lo`, and runs the tests one after the other, as `runltp` does. The second disk, `/dev/vda`, is the device of the tests that need one (`LTP_DEV`). `LTP_TIMEOUT_MUL` is 4, because QEMU without KVM is slow. The file `IMAGE.tree` next to the image has the path of the LTP tree that the image came from. When `--ltp` is another tree, `run.py` stops, and it does not make an image again that has no such file. Thus a run with another tree does not change an image that other runs use.
 
@@ -23,7 +23,7 @@ Each test runs in its own session with a time limit (200 seconds for the baselin
 tools/ltp/build.sh --full ~/rkltp
 cargo build --release --package rukernel --target x86_64-unknown-none
 tools/ltp/run.py --kernel target/x86_64-unknown-none/release/rukernel --ltp ~/rkltp/ltp \
-    --busybox target/x86_64-unknown-none/debug/busybox --out ~/rkltp/runs syscalls mm sched net
+    --busybox target/x86_64-unknown-none/debug/busybox --out ~/rkltp/runs syscalls mm sched net pty
 ```
 
 The boot tests download the static BusyBox to `target/x86_64-unknown-none/debug/busybox`. `net` runs each `runtest/net.*` file. `--only` runs only some tests, for example `--only fork01,mmap01`. A batch that is done does not run again, unless `--force` is given, so a second run continues a run that stopped. `--only @FILE` reads the tags from a file. `--first 101` numbers the batches from 101, so the run keeps the old logs, and `report.py` uses the newest result of each test. The baseline uses the release build of the kernel, because the debug build is 5 times slower under QEMU without KVM.

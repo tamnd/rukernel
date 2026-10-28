@@ -7,6 +7,7 @@
 //! The kernel also keeps a list of the devices with their names, as the device model of Linux
 //! does. devtmpfs makes a device file for each one, and sysfs shows each one.
 
+use crate::dentry::Location;
 use crate::file::FileOps;
 use crate::inode::Result;
 use alloc::collections::BTreeMap;
@@ -37,9 +38,20 @@ pub const fn minor(dev: u64) -> u32 {
 pub trait CharDevice: Send + Sync {
     /// Gives the operations of a new open file of the device.
     fn open(&self, flags: u32) -> Result<Arc<dyn FileOps>>;
+
+    /// Gives the operations of a new open file of the device file at `at`. A driver that must
+    /// know the device file, as the pseudo terminals of devpts, uses it. The default calls
+    /// [`CharDevice::open`].
+    fn open_at(&self, at: &Location, flags: u32) -> Result<Arc<dyn FileOps>> {
+        let _ = at;
+        self.open(flags)
+    }
 }
 
 static CHAR_DEVICES: SpinLock<BTreeMap<u64, Arc<dyn CharDevice>>> = SpinLock::new(BTreeMap::new());
+
+/// The drivers of all the minor numbers of a major number, by the major number.
+static CHAR_MAJORS: SpinLock<BTreeMap<u32, Arc<dyn CharDevice>>> = SpinLock::new(BTreeMap::new());
 
 /// Adds the driver of the character device `rdev`. A second driver for the same number takes
 /// the place of the first.
@@ -52,10 +64,29 @@ pub fn unregister_char(rdev: u64) {
     CHAR_DEVICES.lock().remove(&rdev);
 }
 
+/// Adds the driver of each minor number of the major number `major`, as a `cdev` of Linux with
+/// the full range of minor numbers. A driver of one device number comes first.
+pub fn register_char_major(major: u32, device: Arc<dyn CharDevice>) {
+    CHAR_MAJORS.lock().insert(major, device);
+}
+
+/// The driver of the character device `rdev`.
+fn char_driver(rdev: u64) -> Result<Arc<dyn CharDevice>> {
+    if let Some(device) = CHAR_DEVICES.lock().get(&rdev).cloned() {
+        return Ok(device);
+    }
+    CHAR_MAJORS.lock().get(&major(rdev)).cloned().ok_or(Errno::ENXIO)
+}
+
 /// Opens the character device `rdev`. Gives `ENXIO` if no driver has the number, as Linux.
 pub fn open_char(rdev: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
-    let device = CHAR_DEVICES.lock().get(&rdev).cloned().ok_or(Errno::ENXIO)?;
-    device.open(flags)
+    char_driver(rdev)?.open(flags)
+}
+
+/// Opens the character device `rdev` through its device file at `at`. Gives `ENXIO` if no driver
+/// has the number.
+pub fn open_char_at(rdev: u64, at: &Location, flags: u32) -> Result<Arc<dyn FileOps>> {
+    char_driver(rdev)?.open_at(at, flags)
 }
 
 /// A device in the list of devices.

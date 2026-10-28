@@ -15,8 +15,9 @@
 #
 # With --full, it builds all of LTP and installs it in OUT_DIR/ltp, as LTP installs itself in
 # /opt/ltp. tools/ltp/run.py runs the runtest files of this tree. OUT_DIR/notbuilt.txt has the
-# tests of the syscalls, mm, sched and net groups that have no program, because the program did
-# not build with musl. OUT_DIR/src.tar.gz has the C and shell sources of the tests for report.py.
+# tests of the syscalls, mm, sched, net and pty groups that have no program, because the program
+# did not build with musl. OUT_DIR/src.tar.gz has the C and shell sources of the tests for
+# report.py.
 # LTP_TESTDIRS gives the directories of the tests that --full builds, with a space between them.
 # The default is all of testcases. For example, LTP_TESTDIRS=testcases/kernel/syscalls builds only
 # the syscalls group, which is faster under qemu-user.
@@ -40,7 +41,7 @@ fsmount fspick move_mount open_tree setxattr getxattr listxattr removexattr fset
 flistxattr fremovexattr lgetxattr llistxattr lremovexattr sendfile splice copy_file_range fadvise"
 
 # The runtest files of the groups that notbuilt.txt lists. net.* is each runtest/net.* file.
-LTP_GROUPS="syscalls mm sched controllers net.*"
+LTP_GROUPS="syscalls mm sched controllers net.* pty"
 
 full=0
 platform=linux/amd64

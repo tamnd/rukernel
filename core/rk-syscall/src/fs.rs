@@ -17,7 +17,7 @@ use rk_abi::native::fcntl::{
     F_SETLEASE, F_SETLK, F_SETLKW, F_SETOWN, F_SETOWN_EX, F_SETPIPE_SZ, F_SETSIG, F_UNLCK, F_WRLCK,
     FD_CLOEXEC,
 };
-use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX};
+use rk_abi::native::ioctls::{FIOCLEX, FIONBIO, FIONCLEX, TIOCGPTPEER};
 use rk_abi::native::mount::{
     MS_MANDLOCK, MS_NOATIME, MS_NODEV, MS_NODIRATIME, MS_NOEXEC, MS_NOSUID, MS_NOSYMFOLLOW,
     MS_RDONLY, MS_RELATIME, MS_SYNCHRONOUS,
@@ -940,6 +940,14 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     }
     if let Some(notify) = crate::seccomp::listener_of(&file) {
         return crate::seccomp::listener_ioctl(cx, &notify, cmd, arg);
+    }
+    // `TIOCGPTPEER` on the master of a pseudo terminal opens the slave with the open flags
+    // `arg` and gives a new file descriptor, as `ptm_open_peer` of Linux.
+    if cmd == TIOCGPTPEER
+        && let Some(peer) = rk_drv_tty::pty::open_peer(&file, arg as u32)
+    {
+        let fd = cx.files()?.lock().insert(peer?, arg as u32 & O_CLOEXEC != 0)?;
+        return Ok(fd as u64);
     }
     let vm = cx.vm()?;
     Ok(file.ioctl(cmd, arg as usize, &UserMem(&vm))? as u64)

@@ -290,6 +290,18 @@ impl Header {
         Ok(())
     }
 
+    /// The offset of the first routing header of `packet`, after the extension headers before
+    /// it, or `None`. The extension headers are in the packet, as `parse` checked.
+    pub fn routing_header(&self, packet: &[u8]) -> Option<usize> {
+        let (mut next, mut at) = (self.next, HLEN);
+        while matches!(next, NEXT_HOPOPTS | NEXT_DSTOPTS) {
+            let e = packet.get(at..at + 2)?;
+            next = e[0];
+            at += (usize::from(e[1]) + 1) * 8;
+        }
+        (next == NEXT_ROUTING).then_some(at)
+    }
+
     /// The bytes of the fixed header.
     pub fn to_bytes(&self) -> [u8; HLEN] {
         let mut b = [0u8; HLEN];

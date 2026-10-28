@@ -13,6 +13,12 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - tools/ltp/build-ip.sh builds a static iproute2 `ip` for the LTP image (#410).
 - devtmpfs and /sys/class make the nodes of devices with a directory in the name, as /dev/net/tun (#410).
 - /proc/kpageflags gives `KPF_ANON`, `KPF_SWAPBACKED`, `KPF_UPTODATE`, `KPF_LRU` and `KPF_MMAP` for the anonymous pages of the processes, as fs/proc/page.c of Linux (#421). Each frame of anonymous memory has a mark, as `PageAnon` of Linux.
+- `ioctl` `TIOCGPTPEER` on the master of a pseudo terminal opens the slave and gives a new file descriptor, as `ptm_open_peer` of Linux (#413). The flags of the open come from the argument, and the slave of another file gives `EIO`.
+- A pseudo terminal can be the controlling terminal of a session (#413). `TIOCSCTTY` makes the slave the controlling terminal of a session leader, as `tiocsctty` of Linux, and with the argument 1 and `CAP_SYS_ADMIN` it takes the slave from another session. `TIOCNOTTY` ends it. An open of a slave without `O_NOCTTY` by a session leader without a controlling terminal makes the slave its controlling terminal. `/dev/tty` opens the slave, and the exit of the session leader sends `SIGHUP` to the foreground process group. `TIOCGSID` and `TIOCGPGRP` on a slave give `ENOTTY` to a process of another session.
+- `ioctl` `TIOCVHANGUP` hangs up a pseudo terminal, as `tty_vhangup` of Linux (#413). It needs `CAP_SYS_ADMIN`. After the hang up a read gives 0, a write and an ioctl give `EIO`, and a poll gives `POLLHUP` and `POLLERR`. LTP pty04 now gets to the line disciplines, which rukernel does not have.
+- Each mount of devpts is a new instance with its own slaves and numbers, as `get_tree_nodev` in fs/devpts/inode.c of Linux (#413). devpts takes the options `newinstance`, `mode`, `ptmxmode`, `uid`, `gid` and `max`, and an unknown option gives `EINVAL`. /dev/ptmx uses the instance on /dev/pts, and the `ptmx` file of devpts uses its own instance.
+- IPv6 processes the routing header on receive, as `ipv6_rthdr_rcv` of net/ipv6/exthdrs.c of Linux (#413). A segment routing header (type 4) goes to the next segment of the list when `seg6_enabled` is on, and a header with no segments left that holds an IPv4 or IPv6 packet gives the inner packet. A bad header gives an ICMPv6 parameter problem, and a hop limit of 1 gives an ICMPv6 time exceeded. rukernel does not forward, so a packet for another address is dropped.
+- The LTP tools record the results of the pty group (#413).
 
 ### Fixed
 
@@ -20,6 +26,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The file bit of /proc/PID/pagemap comes from the page itself, as fs/proc/task_mmu.c of Linux (#421). A page of a private file mapping has the bit until the first write makes an anonymous copy, also when the mapping can be written.
 - The page cache of a mapped file keeps the clean or dirty state of each page, and /proc/kpageflags and `msync` use it in place of the sets of dirty and clean pages of the file (#421). A write back makes the pages clean when no shared mapping can write the file.
 - tools/ltp/run.py records the LTP tree of an image in `IMAGE.tree`, and stops when `--image` and `--ltp` do not agree (#421). It does not make a shared image again from another tree.
+- A read of the master of a pseudo terminal before the first open of the slave gives `EIO`, as Linux (#413). It waited before.
 
 ## [0.4.8] - 2026-10-28
 
