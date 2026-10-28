@@ -25,9 +25,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub use host::HugeFile;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_mm::hugetlb::HPAGE_SIZE;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use rk_mm::hugetlb::HugeFile;
+use rk_mm::hugetlb::{HPAGE_SIZE, Subpool};
 use rk_vfs::inode::{FsStat, mode};
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
 
@@ -147,25 +147,12 @@ struct Fs {
     dev: u64,
     next_ino: AtomicU64,
     opts: Options,
+    /// The pages of the files, for `size=` and `min_size=`. Each file has it too, so the
+    /// reservations of `min_size=` stay until the last file goes.
+    subpool: Arc<Subpool>,
     /// The nodes in use, by inode number.
     nodes: SpinLock<BTreeMap<u64, Weak<Node>>>,
     read_only: AtomicBool,
-}
-
-impl Fs {
-    /// The huge pages that the files of the file system have.
-    fn used_pages(&self) -> u64 {
-        let nodes: Vec<Arc<Node>> = self.nodes.lock().values().filter_map(Weak::upgrade).collect();
-        nodes.iter().map(|n| n.file().map_or(0, |f| f.page_count() as u64)).sum()
-    }
-}
-
-impl Drop for Fs {
-    fn drop(&mut self) {
-        if let Some(min) = self.opts.min_pages {
-            rk_mm::hugetlb::unreserve(min as usize);
-        }
-    }
 }
 
 struct Attrs {
@@ -209,20 +196,27 @@ pub const FS_TYPE: rk_vfs::fstype::FsType =
 pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let pool = rk_mm::hugetlb::counts().total as u64;
     let opts = parse_options(args.data, pool)?;
-    if let Some(min) = opts.min_pages {
-        rk_mm::hugetlb::reserve(usize::try_from(min).map_err(|_| Errno::ENOMEM)?)?;
-    }
-    let root = new(opts);
+    let root = new(opts)?;
     root.set_read_only(args.read_only)?;
     Ok(root)
 }
 
 /// Makes a new hugetlbfs with the options `opts` and gives its root directory.
-pub fn new(opts: Options) -> InodeRef {
+///
+/// # Errors
+///
+/// `ENOMEM` if the pool does not have the pages of `min_size=`.
+pub fn new(opts: Options) -> Result<InodeRef> {
+    Ok(new_with(opts, Subpool::new(opts.max_pages, opts.min_pages)?))
+}
+
+/// Makes a new hugetlbfs with the options `opts` and the pages `subpool` of its files.
+fn new_with(opts: Options, subpool: Arc<Subpool>) -> InodeRef {
     let fs = Arc::new(Fs {
         dev: rk_vfs::anon_dev(),
         next_ino: AtomicU64::new(1),
         opts,
+        subpool,
         nodes: SpinLock::new(BTreeMap::new()),
         read_only: AtomicBool::new(false),
     });
@@ -245,7 +239,8 @@ pub fn huge_file(inode: &InodeRef) -> Option<Arc<HugeFile>> {
 /// The private hugetlbfs of the kernel, for `memfd_create(MFD_HUGETLB)`.
 pub fn internal() -> InodeRef {
     static ROOT: rk_frame::sync::Once<InodeRef> = rk_frame::sync::Once::new();
-    ROOT.call_once(|| new(Options { mode: 0o1777, ..Options::default() })).clone()
+    let make = || new_with(Options { mode: 0o1777, ..Options::default() }, Subpool::unlimited());
+    ROOT.call_once(make).clone()
 }
 
 impl Node {
@@ -253,7 +248,10 @@ impl Node {
         let t = now();
         let ino = fs.next_ino.fetch_add(1, Ordering::Relaxed);
         let data = match FileType::from_mode(mode) {
-            Some(FileType::Regular) => Data::File(HugeFile::new(fs.dev, ino, Vec::new(), 0)),
+            Some(FileType::Regular) => {
+                let subpool = Some(fs.subpool.clone());
+                Data::File(HugeFile::new_in(fs.dev, ino, Vec::new(), 0, subpool))
+            }
             Some(FileType::Directory) => Data::Dir { entries: BTreeMap::new(), parent },
             Some(FileType::Symlink) => Data::Symlink(Vec::new()),
             _ => Data::Special,
@@ -503,14 +501,9 @@ impl Inode for Node {
                 file.zero(offset, len);
             }
         } else {
-            let (first, last) = (offset / HPAGE, end.div_ceil(HPAGE));
-            if let Some(max) = self.fs.opts.max_pages {
-                let new = (first..last).filter(|&i| file.lookup(i).is_none()).count() as u64;
-                if self.fs.used_pages() + new > max {
-                    return Err(Errno::ENOSPC);
-                }
-            }
-            file.allocate(first, last)?;
+            // `size=` of the mount limits the new pages, and the pages before the first one that
+            // it does not allow stay, as on Linux.
+            file.allocate(offset / HPAGE, end.div_ceil(HPAGE))?;
             if mode & KEEP_SIZE == 0 && file.size() < end {
                 file.grow_to(end);
             }
@@ -656,12 +649,13 @@ impl Inode for Node {
     }
 
     /// The counts of `hugetlbfs_statfs` of Linux: the blocks are huge pages, and a mount without
-    /// `size=` gives 0 blocks, and a mount without `nr_inodes=` gives -1 inodes.
+    /// `size=` gives 0 blocks, and a mount without `nr_inodes=` gives -1 inodes. The used blocks
+    /// are the pages and the reservations of the files.
     fn fs_stat(&self) -> Option<FsStat> {
         let mut st = FsStat { bsize: HPAGE, ..FsStat::default() };
         if let Some(max) = self.fs.opts.max_pages {
             st.blocks = max;
-            st.bfree = max.saturating_sub(self.fs.used_pages());
+            st.bfree = max.saturating_sub(self.fs.subpool.counts().used);
             st.bavail = st.bfree;
         }
         match self.fs.opts.max_inodes {

@@ -73,6 +73,51 @@ pub fn random_seed() -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
+/// Gives EAX, EBX, ECX and EDX of the CPUID leaf `leaf` with the subleaf 0.
+fn cpuid(leaf: u32) -> [u32; 4] {
+    let (eax, ebx, ecx, edx): (u32, u64, u32, u32);
+    // SAFETY: `cpuid` only writes the four registers. LLVM uses rbx, so the code keeps it and
+    // gives EBX in `tmp`.
+    unsafe {
+        core::arch::asm!(
+            "mov {tmp}, rbx",
+            "cpuid",
+            "xchg {tmp}, rbx",
+            tmp = out(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") 0u32 => ecx,
+            out("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    [eax, ebx as u32, ecx, edx]
+}
+
+/// Tells if the kernel runs on QEMU without KVM, the tiny code generator (TCG). QEMU gives the
+/// signature `TCGTCGTCGTCG` in the hypervisor leaf 0x4000_0000 then. KVM gives `KVMKVMKVM`, and a
+/// real CPU has no hypervisor leaf. The value is found one time, because `cpuid` under KVM is a
+/// slow exit to the host.
+pub(crate) fn under_tcg() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    const UNKNOWN: u8 = 0;
+    const NO: u8 = 1;
+    const YES: u8 = 2;
+    static TCG: AtomicU8 = AtomicU8::new(UNKNOWN);
+    match TCG.load(Ordering::Relaxed) {
+        NO => false,
+        YES => true,
+        _ => {
+            // CPUID leaf 1, ECX bit 31 tells that a hypervisor runs the kernel.
+            let tcg = cpuid(1)[2] & (1 << 31) != 0 && {
+                let [_, b, c, d] = cpuid(0x4000_0000);
+                [b, c, d].iter().flat_map(|r| r.to_le_bytes()).eq(*b"TCGTCGTCGTCG")
+            };
+            TCG.store(if tcg { YES } else { NO }, Ordering::Relaxed);
+            tcg
+        }
+    }
+}
+
 /// Handles an interrupt from a device or the local APIC.
 fn interrupt(vector: u8) {
     if !smp::handle(vector) && !apic::handle(vector) {
@@ -110,6 +155,16 @@ pub(crate) mod mem {
                 options(nostack, preserves_flags),
             );
         }
+    }
+
+    /// Copies the page of 4 KiB at `src` to the page at `dst`, for copy on write.
+    ///
+    /// # Safety
+    ///
+    /// The two pages must be valid kernel memory, and they must not overlap.
+    pub(crate) unsafe fn copy_page(dst: *mut u8, src: *const u8) {
+        // SAFETY: as for `copy`.
+        unsafe { copy(dst, src, 4096) };
     }
 
     /// Writes `len` zero bytes at `dst`.

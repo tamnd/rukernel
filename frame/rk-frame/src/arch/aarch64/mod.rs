@@ -165,6 +165,48 @@ pub(crate) mod mem {
         }
     }
 
+    /// Copies the page of 4 KiB at `src` to the page at `dst`, for copy on write. Each step of
+    /// the loop copies 128 bytes with the SIMD registers, so the loop has about a third of the
+    /// instructions of `copy`. This matters most on QEMU without KVM, where the time of a copy
+    /// follows the number of instructions.
+    ///
+    /// # Safety
+    ///
+    /// The two pages must be valid kernel memory, 16 byte aligned, and they must not overlap.
+    pub(crate) unsafe fn copy_page(dst: *mut u8, src: *const u8) {
+        // SAFETY: the caller gives two valid pages. The loop runs 32 times, and each step reads
+        // and writes 128 bytes. The trap entry keeps the SIMD registers of user code, and the
+        // compiler keeps the ones that this function changes.
+        unsafe {
+            core::arch::asm!(
+                "1: ldp q0, q1, [{src}]",
+                "ldp q2, q3, [{src}, #32]",
+                "ldp q4, q5, [{src}, #64]",
+                "ldp q6, q7, [{src}, #96]",
+                "add {src}, {src}, #128",
+                "stp q0, q1, [{dst}]",
+                "stp q2, q3, [{dst}, #32]",
+                "stp q4, q5, [{dst}, #64]",
+                "stp q6, q7, [{dst}, #96]",
+                "add {dst}, {dst}, #128",
+                "subs {n}, {n}, #1",
+                "b.ne 1b",
+                n = inout(reg) 4096usize / 128 => _,
+                src = inout(reg) src => _,
+                dst = inout(reg) dst => _,
+                out("v0") _,
+                out("v1") _,
+                out("v2") _,
+                out("v3") _,
+                out("v4") _,
+                out("v5") _,
+                out("v6") _,
+                out("v7") _,
+                options(nostack),
+            );
+        }
+    }
+
     /// Writes `len` zero bytes at `dst`.
     ///
     /// # Safety

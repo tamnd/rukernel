@@ -24,7 +24,7 @@ fn the_options_follow_linux() {
 
 #[test]
 fn a_file_has_no_write_and_a_size_of_whole_huge_pages() {
-    let root = new(Options::default());
+    let root = new(Options::default()).unwrap();
     let f = file(&root);
     assert_eq!(f.write_at(0, b"x"), Err(Errno::EINVAL));
     let size = |s| SetAttr { size: Some(s), ..SetAttr::default() };
@@ -37,7 +37,7 @@ fn a_file_has_no_write_and_a_size_of_whole_huge_pages() {
 
 #[test]
 fn fallocate_gives_and_frees_whole_huge_pages() {
-    let root = new(Options::default());
+    let root = new(Options::default()).unwrap();
     let f = file(&root);
     assert_eq!(f.fallocate(0x10, 0, M2), Err(Errno::EOPNOTSUPP));
     f.fallocate(KEEP_SIZE, 1, M2).unwrap();
@@ -61,7 +61,8 @@ fn fallocate_gives_and_frees_whole_huge_pages() {
 
 #[test]
 fn the_counts_of_statfs_follow_the_options() {
-    let root = new(Options { max_pages: Some(2), max_inodes: Some(3), ..Options::default() });
+    let root =
+        new(Options { max_pages: Some(2), max_inodes: Some(3), ..Options::default() }).unwrap();
     let f = file(&root);
     f.fallocate(0, 0, M2).unwrap();
     let st = root.fs_stat().unwrap();
@@ -69,6 +70,29 @@ fn the_counts_of_statfs_follow_the_options() {
     assert_eq!(f.fallocate(0, 0, 3 * M2), Err(Errno::ENOSPC));
     root.create(b"g", FileType::Regular, 0o600, 0).unwrap();
     assert_eq!(root.create(b"h", FileType::Regular, 0o600, 0).err(), Some(Errno::ENOSPC));
-    let open = new(Options::default()).fs_stat().unwrap();
+    let open = new(Options::default()).unwrap().fs_stat().unwrap();
     assert_eq!((open.blocks, open.files), (0, u64::MAX));
+}
+
+#[test]
+fn size_limits_each_new_page_and_a_hole_gives_pages_back() {
+    let opts = Options { max_pages: Some(2), min_pages: Some(1), ..Options::default() };
+    let root = new(opts).unwrap();
+    let f = file(&root);
+    let pool = |root: &InodeRef| {
+        let any: &dyn Any = &**root;
+        any.downcast_ref::<Node>().unwrap().fs.subpool.counts()
+    };
+    assert_eq!((pool(&root).used, pool(&root).rsv), (0, 1));
+    // The first page uses the reservation of `min_size=`, and the second one does not.
+    f.fallocate(0, 0, 3 * M2).unwrap_err();
+    assert_eq!((pool(&root).used, pool(&root).rsv), (2, 0));
+    assert_eq!(f.metadata().blocks, 2 * M2 / 512);
+    f.fallocate(PUNCH_HOLE | KEEP_SIZE, 0, M2).unwrap();
+    assert_eq!((pool(&root).used, pool(&root).rsv), (1, 0));
+    f.fallocate(0, 2 * M2, M2).unwrap();
+    assert_eq!(f.fallocate(0, 3 * M2, M2), Err(Errno::ENOSPC));
+    // A truncate gives back the pages, and the mount reserves its page again.
+    f.set_attr(&SetAttr { size: Some(0), ..SetAttr::default() }).unwrap();
+    assert_eq!((pool(&root).used, pool(&root).rsv), (0, 1));
 }

@@ -6,7 +6,7 @@
 //! shared `MAP_HUGETLB` mapping, as the page cache of the inode of hugetlbfs in Linux.
 
 use super::{AddressSpace, MmFile, above_reserve};
-use crate::hugetlb::{Counts, HPAGE_SIZE, Pool};
+use crate::hugetlb::{Counts, HPAGE_SIZE, Pool, Subpool};
 use crate::tunables;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
@@ -164,6 +164,9 @@ struct FileState {
 /// file is truncated or goes away.
 pub struct HugeFile {
     state: SpinLock<FileState>,
+    /// The pages of the mount of hugetlbfs, for `size=` and `min_size=`. The other files have
+    /// none.
+    subpool: Option<Arc<Subpool>>,
     /// The device, the inode number and the path, for /proc/PID/maps.
     name: SpinLock<(u64, u64, Vec<u8>)>,
 }
@@ -176,8 +179,45 @@ fn huge_pages(bytes: u64) -> u64 {
 impl HugeFile {
     /// Makes an empty file of `size` bytes with the name `name` for /proc/PID/maps.
     pub fn new(dev: u64, ino: u64, path: Vec<u8>, size: u64) -> Arc<Self> {
+        Self::new_in(dev, ino, path, size, None)
+    }
+
+    /// Makes an empty file as `new` does, in the mount of hugetlbfs with the pages `subpool`.
+    pub fn new_in(
+        dev: u64,
+        ino: u64,
+        path: Vec<u8>,
+        size: u64,
+        subpool: Option<Arc<Subpool>>,
+    ) -> Arc<Self> {
         let state = FileState { pages: BTreeMap::new(), reserved: BTreeSet::new(), size };
-        Arc::new(Self { state: SpinLock::new(state), name: SpinLock::new((dev, ino, path)) })
+        let name = SpinLock::new((dev, ino, path));
+        Arc::new(Self { state: SpinLock::new(state), subpool, name })
+    }
+
+    /// Gives back `unused` reservations that no page used, and the pages `gone` that the file
+    /// removed. The caller removed the pages from the address spaces that mapped them.
+    fn release(&self, gone: Vec<HugePage>, unused: usize) {
+        let pages = gone.len() as u64;
+        drop(gone);
+        match &self.subpool {
+            Some(subpool) => {
+                subpool.unreserve(unused as u64);
+                subpool.release(pages);
+            }
+            None => unreserve(unused),
+        }
+    }
+
+    /// Takes a page from the pool for an index that has a reservation if `reserved` is set. An
+    /// index without one takes a page of the mount first, so `size=` limits the pages that a fault
+    /// or `fallocate` adds, as `alloc_hugetlb_folio` of Linux.
+    fn new_page(&self, reserved: bool) -> Result<HugePage, Errno> {
+        let Some(subpool) = self.subpool.as_ref().filter(|_| !reserved) else {
+            return alloc_page(reserved);
+        };
+        let kept = subpool.charge()?;
+        alloc_page(kept).inspect_err(|_| subpool.uncharge(kept))
     }
 
     /// Sets the path that /proc/PID/maps shows.
@@ -208,13 +248,12 @@ impl HugeFile {
         let (gone, unused) = {
             let mut st = self.state.lock();
             st.size = size;
-            let gone = st.pages.split_off(&first);
+            let gone: Vec<HugePage> = st.pages.split_off(&first).into_values().collect();
             let unused = st.reserved.split_off(&first).len();
             (gone, unused)
         };
         unmap_pages(self, first, u64::MAX);
-        drop(gone);
-        unreserve(unused);
+        self.release(gone, unused);
     }
 
     /// Reserves the huge pages `first..end` of the file for a shared mapping, as
@@ -223,13 +262,17 @@ impl HugeFile {
     ///
     /// # Errors
     ///
-    /// `ENOMEM` if the pool does not have the pages.
+    /// `ENOMEM` if the pool does not have the pages, or if `size=` of the mount does not allow
+    /// them.
     pub fn reserve(&self, first: u64, end: u64) -> Result<(), Errno> {
         let mut st = self.state.lock();
         let new: Vec<u64> = (first..end)
             .filter(|i| !st.pages.contains_key(i) && !st.reserved.contains(i))
             .collect();
-        reserve(new.len())?;
+        match &self.subpool {
+            Some(subpool) => subpool.reserve(new.len() as u64)?,
+            None => reserve(new.len())?,
+        }
         st.reserved.extend(new);
         Ok(())
     }
@@ -243,8 +286,8 @@ impl HugeFile {
     ///
     /// # Errors
     ///
-    /// `ENXIO` for a page after the end of the file, and `ENOSPC` if the pool has no page. A
-    /// page fault sends `SIGBUS` for each.
+    /// `ENXIO` for a page after the end of the file, and `ENOSPC` if the pool has no page or
+    /// `size=` of the mount does not allow one more. A page fault sends `SIGBUS` for each.
     pub fn page_at(&self, index: u64) -> Result<HugePage, Errno> {
         let mut st = self.state.lock();
         if index >= huge_pages(st.size) {
@@ -254,7 +297,7 @@ impl HugeFile {
             return Ok(page.clone());
         }
         let reserved = st.reserved.remove(&index);
-        match alloc_page(reserved) {
+        match self.new_page(reserved) {
             Ok(page) => {
                 st.pages.insert(index, page.clone());
                 Ok(page)
@@ -273,7 +316,7 @@ impl HugeFile {
     ///
     /// # Errors
     ///
-    /// `ENOSPC` if the pool has no page.
+    /// `ENOSPC` if the pool has no page, or if `size=` of the mount does not allow one more.
     pub fn allocate(&self, first: u64, end: u64) -> Result<(), Errno> {
         for index in first..end {
             let mut st = self.state.lock();
@@ -281,7 +324,7 @@ impl HugeFile {
                 continue;
             }
             let reserved = st.reserved.remove(&index);
-            match alloc_page(reserved) {
+            match self.new_page(reserved) {
                 Ok(page) => {
                     st.pages.insert(index, page);
                 }
@@ -316,8 +359,7 @@ impl HugeFile {
             (gone, reserved.len())
         };
         unmap_pages(self, first, end);
-        drop(gone);
-        unreserve(unused);
+        self.release(gone, unused);
     }
 
     /// Writes zeros to `offset..offset + len` in the pages that the file has, as
@@ -363,8 +405,12 @@ impl HugeFile {
 
 impl Drop for HugeFile {
     fn drop(&mut self) {
-        let unused = self.state.lock().reserved.len();
-        unreserve(unused);
+        let (gone, unused) = {
+            let mut st = self.state.lock();
+            let pages = core::mem::take(&mut st.pages);
+            (pages.into_values().collect(), st.reserved.len())
+        };
+        self.release(gone, unused);
     }
 }
 

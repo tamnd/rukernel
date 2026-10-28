@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
-use rk_mm::hugetlb::HPAGE_SIZE;
+use rk_mm::hugetlb::{HPAGE_SIZE, Subpool};
 
 const HPAGE: u64 = HPAGE_SIZE as u64;
 
@@ -16,15 +16,35 @@ struct State {
     size: u64,
 }
 
-/// The huge pages of one file.
+/// The huge pages of one file. The model has no reservations, so each page takes a page of the
+/// mount when it is added.
 pub struct HugeFile {
     state: SpinLock<State>,
+    subpool: Option<Arc<Subpool>>,
 }
 
 impl HugeFile {
     /// Makes an empty file of `size` bytes.
-    pub fn new(_dev: u64, _ino: u64, _path: Vec<u8>, size: u64) -> Arc<Self> {
-        Arc::new(Self { state: SpinLock::new(State { pages: BTreeMap::new(), size }) })
+    pub fn new(dev: u64, ino: u64, path: Vec<u8>, size: u64) -> Arc<Self> {
+        Self::new_in(dev, ino, path, size, None)
+    }
+
+    /// Makes an empty file of `size` bytes in the mount with the pages `subpool`.
+    pub fn new_in(
+        _dev: u64,
+        _ino: u64,
+        _path: Vec<u8>,
+        size: u64,
+        subpool: Option<Arc<Subpool>>,
+    ) -> Arc<Self> {
+        Arc::new(Self { state: SpinLock::new(State { pages: BTreeMap::new(), size }), subpool })
+    }
+
+    /// Gives back `n` pages that the file removed to the mount.
+    fn release(&self, n: usize) {
+        if let Some(subpool) = &self.subpool {
+            subpool.release(n as u64);
+        }
     }
 
     /// Sets the path that /proc/PID/maps shows.
@@ -48,9 +68,12 @@ impl HugeFile {
 
     /// Changes the size of the file, and drops the pages after the end.
     pub fn set_size(&self, size: u64) {
-        let mut st = self.state.lock();
-        st.size = size;
-        let _ = st.pages.split_off(&size.div_ceil(HPAGE));
+        let gone = {
+            let mut st = self.state.lock();
+            st.size = size;
+            st.pages.split_off(&size.div_ceil(HPAGE)).len()
+        };
+        self.release(gone);
     }
 
     /// Tells if the file has the page `index`.
@@ -62,18 +85,30 @@ impl HugeFile {
     ///
     /// # Errors
     ///
-    /// None in the model.
+    /// `ENOSPC` if `size=` of the mount does not allow one more page.
     pub fn allocate(&self, first: u64, end: u64) -> Result<(), Errno> {
         let mut st = self.state.lock();
         for i in first..end {
-            st.pages.entry(i).or_insert_with(|| vec![0; HPAGE_SIZE]);
+            if st.pages.contains_key(&i) {
+                continue;
+            }
+            if let Some(subpool) = &self.subpool {
+                subpool.charge()?;
+            }
+            st.pages.insert(i, vec![0; HPAGE_SIZE]);
         }
         Ok(())
     }
 
     /// Removes the pages of `first..end`.
     pub fn punch(&self, first: u64, end: u64) {
-        self.state.lock().pages.retain(|&i, _| i < first || i >= end);
+        let gone = {
+            let mut st = self.state.lock();
+            let before = st.pages.len();
+            st.pages.retain(|&i, _| i < first || i >= end);
+            before - st.pages.len()
+        };
+        self.release(gone);
     }
 
     /// Writes zeros to a range of the pages that the file has.
@@ -101,5 +136,12 @@ impl HugeFile {
             *b = st.pages.get(&(at / HPAGE)).map_or(0, |p| p[(at % HPAGE) as usize]);
         }
         len
+    }
+}
+
+impl Drop for HugeFile {
+    fn drop(&mut self) {
+        let gone = self.state.lock().pages.len();
+        self.release(gone);
     }
 }

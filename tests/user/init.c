@@ -356,6 +356,85 @@ static void test_memory(void)
 	}
 }
 
+/* Gives the value of the line `name` of /proc/meminfo, or -1. */
+static long meminfo(const char *name)
+{
+	char buf[4096];
+	int fd = open("/proc/meminfo", O_RDONLY);
+	if (fd < 0)
+		return -1;
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	char *at = strstr(buf, name);
+	return at ? strtol(at + strlen(name) + 1, NULL, 10) : -1;
+}
+
+/* Writes `text` to the file `path`. Gives 0, or -1 for an error. */
+static int write_text(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	ssize_t n = write(fd, text, strlen(text));
+	close(fd);
+	return n == (ssize_t)strlen(text) ? 0 : -1;
+}
+
+/* Touches the bytes at `p` and gives the signal that stopped the child, or 0. */
+static int touch_in_child(volatile char *p)
+{
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0) {
+		*p = 1;
+		_exit(0);
+	}
+	if (waitpid(pid, &status, 0) != pid)
+		return -1;
+	return WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+}
+
+/* `size=` and `min_size=` of hugetlbfs, as the subpool of mm/hugetlb.c of Linux (#392). */
+static void test_hugetlbfs(void)
+{
+	const long huge = 2 << 20;
+	mount("proc", "/proc", "proc", 0, NULL);
+	mkdir("/huge", 0755);
+	if (write_text("/proc/sys/vm/nr_hugepages", "4") != 0 || meminfo("HugePages_Total:") != 4 ||
+	    mount("none", "/huge", "hugetlbfs", 0, "size=4M,min_size=2M") != 0) {
+		check("hugetlbfs with 4 huge pages", 0);
+		umount("/proc");
+		return;
+	}
+	check("min_size= reserves its page", meminfo("HugePages_Rsvd:") == 1);
+	int fd = open("/huge/f", O_CREAT | O_RDWR, 0600);
+	char *m = mmap(NULL, huge, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	check("a mapping of hugetlbfs uses the reservation of min_size=",
+	      m != MAP_FAILED && meminfo("HugePages_Rsvd:") == 1);
+	if (m != MAP_FAILED)
+		munmap(m, huge);
+	m = mmap(NULL, 3 * huge, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NORESERVE, fd, 0);
+	check("mmap of hugetlbfs with MAP_NORESERVE", m != MAP_FAILED);
+	if (m != MAP_FAILED) {
+		check("faults of hugetlbfs within size= work",
+		      touch_in_child(m) == 0 && touch_in_child(m + huge) == 0);
+		check("a fault of hugetlbfs past size= gives SIGBUS",
+		      touch_in_child(m + 2 * huge) == SIGBUS);
+		munmap(m, 3 * huge);
+	}
+	close(fd);
+	unlink("/huge/f");
+	check("the pages of a file of hugetlbfs go back to the reservation of min_size=",
+	      meminfo("HugePages_Rsvd:") == 1 && meminfo("HugePages_Free:") == 4);
+	umount("/huge");
+	check("the reservation of min_size= goes with the mount", meminfo("HugePages_Rsvd:") == 0);
+	write_text("/proc/sys/vm/nr_hugepages", "0");
+	umount("/proc");
+}
+
 static void test_files(void)
 {
 	static const char data[] = "rukernel tmpfs data\n";
@@ -3558,16 +3637,6 @@ static int ping_raw(int fd)
 	return replies;
 }
 
-static int write_text(const char *path, const char *text)
-{
-	int fd = open(path, O_WRONLY);
-	if (fd < 0)
-		return -1;
-	long n = write(fd, text, strlen(text));
-	close(fd);
-	return n == (long)strlen(text) ? 0 : -1;
-}
-
 static void test_inet_ping(void)
 {
 	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -4488,6 +4557,7 @@ static void test_all(void)
 	test_creds();
 	test_uname();
 	test_memory();
+	test_hugetlbfs();
 	test_files();
 	test_perms();
 	test_devices();
