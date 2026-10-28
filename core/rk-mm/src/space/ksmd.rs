@@ -200,6 +200,10 @@ impl Pages for Spaces {
             let _ = sp.vm.map(at, frame.clone(), prot);
             return false;
         }
+        // The page is a KSM page now, and `/proc/kpageflags` shows it. The zero page is not.
+        if zero_phys() != Some(kpage.addr().get()) {
+            kpage.set_ksm();
+        }
         true
     }
 
@@ -216,6 +220,12 @@ impl Pages for Spaces {
         sp.vm.unmap(at);
         sp.vm.map(at, copy, page_prot(vma, true)).map_err(map_error)
     }
+}
+
+/// The physical address of the page of zeros that KSM maps for the empty pages with
+/// `use_zero_pages`, as the zero page of Linux, or `None` before KSM made it.
+pub fn zero_phys() -> Option<u64> {
+    ZERO.get().and_then(|z| z.as_ref()).map(|f| f.addr().get())
 }
 
 /// Removes the address spaces that ended.

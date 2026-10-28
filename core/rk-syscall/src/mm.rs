@@ -20,7 +20,7 @@ use rk_abi::native::mman::{
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
-use rk_mm::{Backing, HugeAdvice, MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind};
+use rk_mm::{Backing, HugeAdvice, MmFile, MmapRequest, PAGE_SIZE, Prot, Remap, VmaKind, WriteMap};
 use rk_proc::limits::RLIMIT_MEMLOCK;
 use rk_vfs::InodeRef;
 use rk_vfs::cred::cap;
@@ -45,24 +45,16 @@ fn low32(_flags: u32) -> bool {
 /// The device number of `/dev/zero`.
 const DEV_ZERO: u64 = rk_vfs::device::makedev(1, 5);
 
-/// The state of a page of [`FilePages`] against the file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PageState {
-    /// The page has the data of the file, and no shared mapping changed it.
-    Clean,
-    /// A write fault of a shared mapping changed the page after the last write back, as
-    /// `PG_dirty` of Linux.
-    Dirty,
-    /// A write back wrote the page, and a shared mapping that can write the file still exists.
-    /// That mapping can change the page without a fault, so the next write back writes the page
-    /// again. `/proc/kpageflags` shows the page as clean.
-    Written,
-}
-
 /// A page of [`FilePages`]: the copy of the file data and its state.
 struct CachedPage {
     frame: Arc<Frame>,
-    state: PageState,
+    /// A write fault of a shared mapping changed the page after the last write back, as `PG_dirty`
+    /// of Linux.
+    dirty: bool,
+    /// The mappings that made the page writable after the last write back. Only these mappings
+    /// can change the page without a fault. The write back makes them read only, as
+    /// `folio_mkclean` of Linux, so a clean page has no writer.
+    writers: Vec<WriteMap>,
 }
 
 /// The pages of a regular file, for a file mapping.
@@ -78,6 +70,16 @@ pub(crate) struct FilePages {
     path: Vec<u8>,
     /// The pages by their index in the file, with the clean or dirty state of each page.
     pages: SpinLock<BTreeMap<u64, CachedPage>>,
+    /// This object, for the records of `rk_vfs::mapped::add_frame`.
+    me: Weak<dyn rk_vfs::mapped::Mapped>,
+}
+
+impl Drop for FilePages {
+    fn drop(&mut self) {
+        for page in self.pages.lock().values() {
+            rk_vfs::mapped::remove_frame(page.frame.addr().get(), &self.me);
+        }
+    }
 }
 
 impl MmFile for FilePages {
@@ -92,8 +94,13 @@ impl MmFile for FilePages {
         }
         let frame = rk_frame::mm::alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
         frame.write_bytes(0, &self.read_page(offset)?);
-        let page = CachedPage { frame: Arc::new(frame), state: PageState::Clean };
-        Ok(self.pages.lock().entry(index).or_insert(page).frame.clone())
+        let mut pages = self.pages.lock();
+        let page = pages.entry(index).or_insert_with(|| {
+            let phys = frame.addr().get();
+            rk_vfs::mapped::add_frame(phys, self.me.clone(), index);
+            CachedPage { frame: Arc::new(frame), dirty: false, writers: Vec::new() }
+        });
+        Ok(page.frame.clone())
     }
 
     fn name(&self) -> (u64, u64, Vec<u8>) {
@@ -105,9 +112,13 @@ impl MmFile for FilePages {
         true
     }
 
-    fn dirty(&self, index: u64) {
+    fn dirty(&self, index: u64, map: WriteMap) {
         if let Some(page) = self.pages.lock().get_mut(&index) {
-            page.state = PageState::Dirty;
+            page.dirty = true;
+            page.writers.retain(WriteMap::alive);
+            if !page.writers.iter().any(|w| w.same(&map)) {
+                page.writers.push(map);
+            }
         }
     }
 
@@ -116,37 +127,45 @@ impl MmFile for FilePages {
     }
 
     fn write_back(&self, first: u64, end: u64) -> Result<(), Errno> {
-        let pages: Vec<(u64, Arc<Frame>)> = self
+        // The pages become clean before the copy of their data, as `folio_clear_dirty_for_io` of
+        // Linux. A write fault after this step marks a page dirty again.
+        let pages: Vec<(u64, Arc<Frame>, Vec<WriteMap>)> = self
             .pages
             .lock()
-            .range(first..end)
-            .filter(|(_, p)| p.state != PageState::Clean)
-            .map(|(i, p)| (*i, p.frame.clone()))
+            .range_mut(first..end)
+            .filter(|(_, p)| p.dirty)
+            .map(|(i, p)| {
+                p.dirty = false;
+                (*i, p.frame.clone(), core::mem::take(&mut p.writers))
+            })
             .collect();
-        // Without a shared mapping that can write the file, only a write fault can change the
-        // pages again, so they become clean.
-        let after =
-            if writably_mapped(&self.inode) { PageState::Written } else { PageState::Clean };
+        // The mappings that wrote the pages become read only, as `folio_mkclean` of Linux. A write
+        // after this step is a fault that marks the page dirty again, so the copy below cannot
+        // miss a change of a page that stays clean.
+        for (_, frame, writers) in &pages {
+            for writer in writers {
+                writer.mkclean(frame);
+            }
+        }
         // A page past the end of the file does not change the file, as on Linux.
         let size = self.inode.metadata().size;
         let mut buf = vec![0u8; PAGE_SIZE];
-        for (index, frame) in pages {
+        for (n, (index, frame, _)) in pages.iter().enumerate() {
             let offset = index * PAGE_SIZE as u64;
             let Some(left) = size.checked_sub(offset).filter(|&l| l > 0) else { break };
             let len = PAGE_SIZE.min(usize::try_from(left).unwrap_or(PAGE_SIZE));
             frame.read_bytes(0, &mut buf[..len]);
-            let mut done = 0;
-            while done < len {
-                let n = self.inode.write_at(offset + done as u64, &buf[done..len])?;
-                if n == 0 {
-                    return Err(Errno::EIO);
+            if let Err(e) = self.write_page(offset, &buf[..len]) {
+                // The pages that the write back did not write stay dirty.
+                let mut cached = self.pages.lock();
+                for (index, frame, _) in &pages[n..] {
+                    if let Some(page) = cached.get_mut(index)
+                        && Arc::ptr_eq(&page.frame, frame)
+                    {
+                        page.dirty = true;
+                    }
                 }
-                done += n;
-            }
-            if let Some(page) = self.pages.lock().get_mut(&index)
-                && Arc::ptr_eq(&page.frame, &frame)
-            {
-                page.state = after;
+                return Err(e);
             }
         }
         Ok(())
@@ -154,6 +173,19 @@ impl MmFile for FilePages {
 }
 
 impl FilePages {
+    /// Writes `data` to the file at `offset`.
+    fn write_page(&self, offset: u64, data: &[u8]) -> Result<(), Errno> {
+        let mut done = 0;
+        while done < data.len() {
+            let n = self.inode.write_at(offset + done as u64, &data[done..])?;
+            if n == 0 {
+                return Err(Errno::EIO);
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
     /// Reads the page of the file at `offset`. The bytes past the end of the file are zero.
     fn read_page(&self, offset: u64) -> Result<Vec<u8>, Errno> {
         let mut buf = vec![0u8; PAGE_SIZE];
@@ -211,16 +243,14 @@ impl rk_vfs::mapped::Mapped for FilePages {
     fn sync(&self, start: u64, end: u64) -> Result<(), Errno> {
         let first = start / PAGE_SIZE as u64;
         let end = end.div_ceil(PAGE_SIZE as u64);
-        if self.pages.lock().range(first..end).all(|(_, p)| p.state == PageState::Clean) {
+        if self.pages.lock().range(first..end).all(|(_, p)| !p.dirty) {
             return Ok(());
         }
         self.write_back(first, end)
     }
 
-    fn frame_dirty(&self, phys: u64) -> Option<bool> {
-        let pages = self.pages.lock();
-        let page = pages.values().find(|p| p.frame.addr().get() == phys)?;
-        Some(page.state == PageState::Dirty)
+    fn page_dirty(&self, index: u64) -> Option<bool> {
+        self.pages.lock().get(&index).map(|p| p.dirty)
     }
 }
 
@@ -236,8 +266,12 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
     map.retain(|_, pages| Arc::strong_count(pages) > 1);
     map.entry(key)
         .or_insert_with(|| {
-            let pages = SpinLock::new(BTreeMap::new());
-            let pages = Arc::new(FilePages { inode: inode.clone(), path, pages });
+            let pages = Arc::new_cyclic(|me: &Weak<FilePages>| FilePages {
+                inode: inode.clone(),
+                path,
+                pages: SpinLock::new(BTreeMap::new()),
+                me: me.clone(),
+            });
             let mapped: Arc<dyn rk_vfs::mapped::Mapped> = pages.clone();
             rk_vfs::mapped::register(inode, Arc::downgrade(&mapped));
             pages
@@ -283,8 +317,8 @@ impl MmFile for SharedWrite {
         self.pages.writes_back()
     }
 
-    fn dirty(&self, index: u64) {
-        self.pages.dirty(index);
+    fn dirty(&self, index: u64, map: WriteMap) {
+        self.pages.dirty(index, map);
     }
 
     fn cached(&self, index: u64) -> bool {

@@ -25,7 +25,9 @@ use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub use crate::space::ksmd::{exec, fork, madvise, merge_any, merging_pages, set_merge_any, stat};
+pub use crate::space::ksmd::{
+    exec, fork, madvise, merge_any, merging_pages, set_merge_any, stat, zero_phys,
+};
 
 /// The number of an address space in KSM. 0 is no address space.
 pub type MmId = u64;

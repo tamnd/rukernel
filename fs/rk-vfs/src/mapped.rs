@@ -30,10 +30,33 @@ pub trait Mapped: Send + Sync {
     /// Gives the error of the write.
     fn sync(&self, start: u64, end: u64) -> Result<()>;
 
-    /// Tells if the frame at the physical address `phys` is a page of the file, and if a mapping
-    /// changed it after the last write back. Gives `None` if the frame is not a page of the file.
-    fn frame_dirty(&self, _phys: u64) -> Option<bool> {
+    /// Tells if a mapping changed the page `index` after the last write back. Gives `None` if the
+    /// file has no copy of the page.
+    fn page_dirty(&self, _index: u64) -> Option<bool> {
         None
+    }
+}
+
+/// The file of a frame and the index of the page in the file, as the `mapping` and the `index` of
+/// a `struct page` of Linux.
+type FramePage = (Weak<dyn Mapped>, u64);
+
+/// The frames of the copies, by their physical address. `/proc/kpageflags` finds the page of a
+/// frame here with no search of the files.
+static FRAMES: SpinLock<BTreeMap<u64, FramePage>> = SpinLock::new(BTreeMap::new());
+
+/// Records that the frame at the physical address `phys` is the copy of the page `index` of
+/// `pages`. The file calls [`remove_frame`] before the frame goes.
+pub fn add_frame(phys: u64, pages: Weak<dyn Mapped>, index: u64) {
+    FRAMES.lock().insert(phys, (pages, index));
+}
+
+/// Removes the record of [`add_frame`] for the frame at the physical address `phys`, if it is a
+/// record of `pages`.
+pub fn remove_frame(phys: u64, pages: &Weak<dyn Mapped>) {
+    let mut frames = FRAMES.lock();
+    if frames.get(&phys).is_some_and(|(p, _)| Weak::ptr_eq(p, pages)) {
+        frames.remove(&phys);
     }
 }
 
@@ -90,9 +113,8 @@ pub fn extend(inode: &InodeRef, size: u64) {
 /// changed it after the last write back, for `/proc/kpageflags`. Gives `None` if the frame is not
 /// a page of a mapped file.
 pub fn frame_dirty(phys: u64) -> Option<bool> {
-    let files: alloc::vec::Vec<Arc<dyn Mapped>> =
-        MAPPED.lock().values().filter_map(Weak::upgrade).collect();
-    files.iter().find_map(|f| f.frame_dirty(phys))
+    let (pages, index) = FRAMES.lock().get(&phys).cloned()?;
+    pages.upgrade()?.page_dirty(index)
 }
 
 /// Writes back the changed mapped pages of `inode` from `start` up to `end`, before a read.

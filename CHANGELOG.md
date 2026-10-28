@@ -13,6 +13,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `VmSpace` keeps one entry for each huge page and not one for each of its 512 pages, so `fork` and the exit of a process do not walk them (#401). `fork_big` (128 MiB of written private memory) goes from 26 ms to 9 ms on the default backend and from 146 ms to 19 ms with the `corten` feature, on a base before #405.
 - The release profile uses thin LTO (#401). On QEMU TCG with 1 CPU, `getpid` goes from 2419 ns to 1679 ns, `read` of /dev/zero from 4528 ns to 2758 ns and `sched_yield` from 2639 ns to 1860 ns. A clean release build takes 68 s and not 71 s, and a rebuild after a change in rk-frame takes 49 s and not 41 s. Fat LTO was faster again on some rows (`getpid` 1319 ns), but its clean build took 119 s and its rebuild 96 s.
 - On arm64, the `fork` copy of the page tables finds the last level table once for each 2 MiB, and makes no TLB flush for the new address space (#401). The permission change of the pages of the parent makes one TLB invalidation of all user pages, not one for each page.
+- The write back of a shared file mapping makes the mappings of each page read only, as `folio_mkclean` of Linux (#430). The next write to a page is a fault that marks the page dirty again. This replaces the `Written` state of a page.
+- `/proc/kpageflags` finds the file of a page from its frame through a map of the frames of the page caches (#430). It does not search the mapped files of each process.
+- `/proc/kpageflags` gives `KPF_COMPOUND_HEAD`, `KPF_COMPOUND_TAIL`, `KPF_HUGE`, `KPF_THP`, `KPF_KSM` and `KPF_ZERO_PAGE`, as `stable_page_flags` of Linux (#430). A private hugetlb page has `KPF_ANON`.
+- `/proc/PID/pagemap` gives `PM_MMAP_EXCLUSIVE` (bit 56) and `PM_SOFT_DIRTY` (bit 55) (#430). A write of 4 to the new file `/proc/PID/clear_refs` makes all the pages of the process clean, and the next write to a page makes it soft-dirty again.
 
 ### Fixed
 
@@ -24,6 +28,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `mknod`, `mkdir`, `symlink`, `link`, `unlink`, `rmdir` and `rename` in devpts give `EPERM`, and `O_TMPFILE` gives `EOPNOTSUPP`, as Linux (#433).
 - The status table of tools/ltp/README.md has the pty group (#433).
 - `TIOCGPTPEER` on a master from a bind mount of /dev/pts/ptmx on /dev/ptmx finds the devpts mount, as `devpts_mntget` of Linux (#433). It failed before.
+- `KPF_SWAPBACKED` is bit 14 in `/proc/kpageflags`, as in Linux (#430). It was bit 23.
+- The KSM zero frame has no `PM_FILE` bit in `/proc/PID/pagemap`, as the zero page of Linux (#430).
 
 ## [0.4.9] - 2026-10-29
 
