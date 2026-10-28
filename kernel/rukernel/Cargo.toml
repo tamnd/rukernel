@@ -38,5 +38,9 @@ rk-sched.workspace = true
 rk-syscall.workspace = true
 rk-vfs.workspace = true
 
+[features]
+# The CortenMM backend of the address space in rk-mm, per spec/24-open-questions.md question 1.
+corten = ["rk-mm/corten"]
+
 [lints]
 workspace = true

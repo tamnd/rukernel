@@ -18,6 +18,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `ioctl` commands `RNDGETENTCNT`, `RNDADDTOENTCNT`, `RNDADDENTROPY`, `RNDZAPENTCNT`, `RNDCLEARPOOL` and `RNDRESEEDCRNG` of /dev/random and /dev/urandom, and the sysctls `kernel.random.entropy_avail` and `kernel.random.poolsize` (#385).
 - The block device `ioctl` commands `BLKRAGET`, `BLKRASET`, `BLKFRAGET` and `BLKFRASET`, and the directory /sys/block/DEV/queue (#385).
 - `poll` on /proc/PID/mounts gives `POLLERR | POLLPRI` after a mount or an unmount in the namespace, as `mounts_poll` of Linux (#385).
+- The CortenMM experiment, an address space backend of rk-mm behind the `corten` feature (#323). The status of each page is in a tree with the shape of the page table, and each node of the tree has its own lock. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range, and the other calls lock the whole tree. The default kernel keeps the VMA backend. `RK_KERNEL_FEATURES=corten cargo xtask boot-test` boots the new backend. The benchmarks `fault_mt` and `mmap_mt` of tools/bench run the page fault and `mmap` in one thread per CPU, and `run.py --reuse-linux` boots only rukernel. tools/bench/cortenmm.md has the results.
 
 ### Fixed
 

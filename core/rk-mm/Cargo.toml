@@ -14,5 +14,9 @@ rk-abi.workspace = true
 rk-cgroup.workspace = true
 rk-frame.workspace = true
 
+[features]
+# The CortenMM backend of the address space, per spec/24-open-questions.md question 1.
+corten = []
+
 [lints]
 workspace = true

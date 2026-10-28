@@ -24,6 +24,8 @@ The table has four classes of spec/19-rukernel-bench.md section 19.1.
 | mem | `mmap` | `mmap` and `munmap` of 64 KiB anonymous memory |
 | mem | `fork` | `fork`, `_exit` of the child and `waitpid` |
 | mem | `fork_big` | the same in a process with 128 MiB of written private memory |
+| mem | `fault_mt` | `fault` in one thread per CPU at the same time, as page_fault1 of will-it-scale. The value is the wall time over the faults of all threads |
+| mem | `mmap_mt` | `mmap` and `munmap` of 64 KiB in one thread per CPU at the same time, as mmap1 of will-it-scale |
 | net | `tcp_rr` | a round trip of 1 byte over TCP on loopback between two processes |
 | net | `tcp_stream` | the throughput of one TCP connection on loopback |
 | net | `udp_rr` | a round trip of 1 byte over UDP on loopback between two processes |
@@ -41,7 +43,7 @@ tools/bench/run.py --rukernel target/x86_64-unknown-none/release/rukernel \
     --linux /boot/vmlinuz-VERSION --cc musl-gcc --runs 10 --out /tmp/bench
 ```
 
-`--cc` takes a command with arguments, for example `"zig cc -target x86_64-linux-musl"`. `--bench FILE` uses a program that is already compiled. `--only getpid,fork` runs only some benchmarks. `--reuse` makes the table again from the logs of an earlier run, with no boot. `--smp` and `--memory` change the machine for both kernels. `run.py --help` gives all the options.
+`--cc` takes a command with arguments, for example `"zig cc -target x86_64-linux-musl"`. `--bench FILE` uses a program that is already compiled. `--only getpid,fork` runs only some benchmarks. `--reuse` makes the table again from the logs of an earlier run, with no boot. `--reuse-linux` boots only rukernel and takes the Linux values from the earlier log, so two rukernel builds can use the same Linux run. `--smp` and `--memory` change the machine for both kernels. `run.py --help` gives all the options.
 
 ## Limits
 

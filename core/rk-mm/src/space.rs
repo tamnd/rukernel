@@ -19,6 +19,8 @@ use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, fr
 use rk_frame::sync::SpinLock;
 use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
 
+#[cfg(feature = "corten")]
+mod corten;
 pub(crate) mod hugetlb;
 pub(crate) mod ksmd;
 
@@ -228,10 +230,18 @@ struct State {
     guards: BTreeSet<usize>,
 }
 
+/// The lock of the areas. The VMA backend has one lock for the whole address space. The CortenMM
+/// backend of the `corten` feature locks the nodes of a page table tree instead, per
+/// spec/24-open-questions.md question 1.
+#[cfg(not(feature = "corten"))]
+type StateLock = SpinLock<State>;
+#[cfg(feature = "corten")]
+type StateLock = corten::Corten;
+
 /// The address space of one process.
 pub struct AddressSpace {
     vm: VmSpace,
-    state: SpinLock<State>,
+    state: StateLock,
     /// The memory cgroup that the new anonymous pages are charged to, or 0 for none.
     memcg: AtomicU32,
     /// The data of KSM.
@@ -319,7 +329,7 @@ impl AddressSpace {
         };
         Self {
             vm,
-            state: SpinLock::new(state),
+            state: StateLock::new(state),
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
             huge_resv: SpinLock::new(BTreeSet::new()),
@@ -404,6 +414,10 @@ impl AddressSpace {
             && !offset.is_multiple_of(align as u64)
         {
             return Err(Errno::EINVAL);
+        }
+        #[cfg(feature = "corten")]
+        if !hugetlb {
+            return self.corten_mmap(req, len);
         }
         let mut st = self.state.lock();
         let start = if req.fixed || req.noreplace {
@@ -621,11 +635,14 @@ impl AddressSpace {
     ///
     /// `EINVAL` if `addr` is not page aligned, `len` is 0 or the range is not in the user half.
     /// `ENOMEM` if the range is in the middle of an area and the split makes too many areas.
+    #[cfg_attr(feature = "corten", allow(unreachable_code))]
     pub fn munmap(&self, addr: usize, len: usize) -> Result<(), Errno> {
         let end = page_up(len)
             .and_then(|l| addr.checked_add(l))
             .filter(|&e| len != 0 && is_page_aligned(addr) && e <= USER_END)
             .ok_or(Errno::EINVAL)?;
+        #[cfg(feature = "corten")]
+        return self.corten_munmap(addr, end);
         let mut st = self.state.lock();
         if Self::splits_huge(&st, addr, end) {
             return Err(Errno::EINVAL);
@@ -639,20 +656,30 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Calls `f` with the area at `at`, or `None` if no area has it. The CortenMM backend gives
+    /// the part of the area in the 2 MiB block of `at`.
+    fn with_area<R>(&self, at: usize, f: impl FnOnce(Option<&Vma<FileRef>>) -> R) -> R {
+        #[cfg(feature = "corten")]
+        return f(self.corten_area(at).as_ref());
+        #[cfg(not(feature = "corten"))]
+        f(self.state.lock().vmas.find(at))
+    }
+
     /// Gives a frame to each page of `start..end` that has none. A page of an area that allows a
     /// write gets a frame of its own, so that a later write does not copy it.
     fn populate(&self, start: usize, end: usize) -> Result<(), Errno> {
         let mut at = start;
         while at < end {
-            let (access, step) = match self.state.lock().vmas.find(at) {
-                Some(v) if !v.prot.write && !v.prot.read && !v.prot.exec => {
-                    at = v.end;
+            let (access, step) = match self.with_area(at, |v| v.map(|v| (v.prot, v.hugetlb, v.end)))
+            {
+                Some((prot, _, end)) if !prot.write && !prot.read && !prot.exec => {
+                    at = end;
                     continue;
                 }
-                Some(v) => {
-                    let access = if v.prot.write { Access::Write } else { Access::Read };
+                Some((prot, hugetlb, _)) => {
+                    let access = if prot.write { Access::Write } else { Access::Read };
                     // One fault maps the whole huge page of a hugetlb area.
-                    let step = if v.hugetlb { HPAGE_SIZE - at % HPAGE_SIZE } else { PAGE_SIZE };
+                    let step = if hugetlb { HPAGE_SIZE - at % HPAGE_SIZE } else { PAGE_SIZE };
                     (access, step)
                 }
                 None => return Err(Errno::ENOMEM),
@@ -943,6 +970,7 @@ impl AddressSpace {
     ///
     /// `EINVAL` if `addr` is not page aligned, `ENOMEM` if a page of the range is not mapped, and
     /// `EACCES` for write access to an area that cannot get it.
+    #[cfg_attr(feature = "corten", allow(unreachable_code))]
     pub fn mprotect(&self, addr: usize, len: usize, prot: Prot) -> Result<(), Errno> {
         if !is_page_aligned(addr) {
             return Err(Errno::EINVAL);
@@ -951,6 +979,8 @@ impl AddressSpace {
         if end > USER_END {
             return Err(Errno::ENOMEM);
         }
+        #[cfg(feature = "corten")]
+        return self.corten_mprotect(addr, end, prot);
         let mut st = self.state.lock();
         if !st.vmas.covers(addr, end) {
             return Err(Errno::ENOMEM);
@@ -997,7 +1027,10 @@ impl AddressSpace {
 
     /// Moves the end of the heap to `addr`, and gives the new end. A bad value gives the old end,
     /// as Linux does.
+    #[cfg_attr(feature = "corten", allow(unreachable_code))]
     pub fn brk(&self, addr: usize) -> usize {
+        #[cfg(feature = "corten")]
+        return self.corten_brk(addr);
         let mut st = self.state.lock();
         let (Some(old_end), Some(new_end)) = (page_up(st.brk), page_up(addr)) else {
             return st.brk;
@@ -1029,17 +1062,29 @@ impl AddressSpace {
     /// file for a page that the file cannot give, such as a page past the end of the file. The
     /// kernel then sends `SIGBUS`.
     pub fn handle_fault(&self, addr: usize, access: Access) -> Result<(), Errno> {
-        let mut st = self.state.lock();
-        // A fault below an area that grows down makes the area larger, up to the size of the
-        // main stack, as Linux does with the default `RLIMIT_STACK`.
-        if st.vmas.find(addr).is_none() && !st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE) {
-            return Err(Errno::EFAULT);
+        #[cfg(feature = "corten")]
+        return self.corten_fault(addr, access);
+        #[cfg(not(feature = "corten"))]
+        {
+            let mut st = self.state.lock();
+            // A fault below an area that grows down makes the area larger, up to the size of the
+            // main stack, as Linux does with the default `RLIMIT_STACK`.
+            if st.vmas.find(addr).is_none() && !st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE)
+            {
+                return Err(Errno::EFAULT);
+            }
+            let vma = st.vmas.find(addr).ok_or(Errno::EFAULT)?;
+            // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
+            if !st.guards.is_empty() && st.guards.contains(&(addr & !(PAGE_SIZE - 1))) {
+                return Err(Errno::EFAULT);
+            }
+            self.fault_area(vma, addr, access)
         }
-        let vma = st.vmas.find(addr).ok_or(Errno::EFAULT)?;
-        // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
-        if !st.guards.is_empty() && st.guards.contains(&(addr & !(PAGE_SIZE - 1))) {
-            return Err(Errno::EFAULT);
-        }
+    }
+
+    /// Handles a page fault at `addr` in `vma`, the area that has the address. The caller holds
+    /// the lock of the area.
+    fn fault_area(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Result<(), Errno> {
         let allowed = match access {
             Access::Read => vma.prot.read || vma.prot.write || vma.prot.exec,
             Access::Write => vma.prot.write,
@@ -1584,10 +1629,10 @@ impl AddressSpace {
     ///
     /// Gives `EFAULT` if `addr` is not in an area that allows a read.
     pub fn shared_phys(&self, addr: usize) -> Result<Option<u64>, Errno> {
-        let shared = match self.state.lock().vmas.find(addr) {
-            Some(vma) if vma.prot.read => vma.shared,
-            _ => return Err(Errno::EFAULT),
-        };
+        let shared = self.with_area(addr, |v| match v {
+            Some(vma) if vma.prot.read => Ok(vma.shared),
+            _ => Err(Errno::EFAULT),
+        })?;
         if !shared {
             return Ok(None);
         }
