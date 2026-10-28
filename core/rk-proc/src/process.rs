@@ -1397,6 +1397,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     } else {
         let child = Arc::new(vm.fork()?);
         rk_mm::ksm::fork(&vm, &child);
+        rk_mm::hugetlb::track(&child);
         child
     };
     let files = pp.files().ok_or(Errno::ESRCH)?;

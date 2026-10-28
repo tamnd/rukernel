@@ -113,6 +113,10 @@ pub struct Vma<F> {
     pub huge: HugeAdvice,
     /// The pages of the area are in the commit count. Linux names it `VM_ACCOUNT`.
     pub account: bool,
+    /// The area has huge pages of hugetlbfs, from `MAP_HUGETLB`, `SHM_HUGETLB` or a file of
+    /// hugetlbfs. Its start, its end and the edges of each change are 2 MiB aligned, and each page
+    /// fault maps a huge page. Linux names it `VM_HUGETLB`.
+    pub hugetlb: bool,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -133,6 +137,7 @@ impl<F: Clone> Vma<F> {
             mergeable: false,
             huge: HugeAdvice::None,
             account: false,
+            hugetlb: false,
             backing: Backing::Anon,
             kind,
         }
@@ -253,6 +258,7 @@ impl<F: Clone> VmaSet<F> {
             && a.mergeable == b.mergeable
             && a.huge == b.huge
             && a.account == b.account
+            && a.hugetlb == b.hugetlb
             && a.kind == b.kind;
         if !same {
             return false;
@@ -356,6 +362,19 @@ impl<F: Clone> VmaSet<F> {
         Some(start)
     }
 
+    /// Finds a free range of `len` bytes as `find_gap` does, with a start that is a multiple of
+    /// `align`, a power of two. hugetlbfs uses it, as `hugetlb_get_unmapped_area` of Linux.
+    pub fn find_gap_aligned(
+        &mut self,
+        len: usize,
+        align: usize,
+        bottom: usize,
+        top: usize,
+    ) -> Option<usize> {
+        let start = self.find_gap(len.checked_add(align - PAGE_SIZE)?, bottom, top)?;
+        Some(start.checked_add(align - 1)? & !(align - 1))
+    }
+
     /// The areas in address order.
     pub fn iter(&self) -> impl Iterator<Item = &Vma<F>> {
         self.areas.values()
@@ -455,6 +474,7 @@ mod tests {
             mergeable: false,
             huge: HugeAdvice::None,
             account: false,
+            hugetlb: false,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });

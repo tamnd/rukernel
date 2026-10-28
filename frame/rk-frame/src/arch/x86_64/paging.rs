@@ -167,6 +167,20 @@ pub(crate) fn flush(virt: usize) {
     unsafe { core::arch::asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
 }
 
+/// Drops all the TLB entries of user pages on this CPU. The kernel pages are global, so they stay.
+pub(crate) fn flush_user_all() {
+    // SAFETY: a write of the value that CR3 has now only drops the TLB entries that are not
+    // global. The page tables do not change.
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, cr3",
+            "mov cr3, {0}",
+            out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Makes the kernel page tables and loads them. After this, the boot identity map is gone.
 pub(crate) fn init(info: &BootInfo) {
     let pml4 = alloc_table_frame().unwrap_or_else(|| panic!("no frame for the kernel page tables"));
@@ -421,6 +435,17 @@ fn flush_user(root: u64, virt: usize) {
     super::smp::shootdown(root, virt as u64);
 }
 
+/// Drops all the TLB entries of user pages on each CPU where `root` is active, after a huge page
+/// goes away. One `invlpg` is enough for the CPU, but QEMU without KVM then can keep the code
+/// that it translated from other pages of the huge page, and run the old code at an address that
+/// has no page now.
+fn flush_user_block(root: u64) {
+    if active().load(Ordering::Acquire) == root {
+        flush_user_all();
+    }
+    super::smp::shootdown(root, super::smp::FLUSH_ALL);
+}
+
 /// The permissions of a user page: readable, writable and executable.
 pub(crate) type UserProt = (bool, bool, bool);
 
@@ -489,6 +514,16 @@ fn user_huge_entry(root: u64, virt: usize) -> (u64, usize, u64) {
     (table, i2, e)
 }
 
+/// Changes the permissions of the huge page at `virt` in `root`, which maps the 2 MiB at `phys`.
+/// The page stays one huge entry.
+pub(crate) fn user_protect_huge(root: u64, virt: usize, phys: u64, prot: UserProt) {
+    let (pd, i2, _) = user_huge_entry(root, virt);
+    let flags = user_flags(prot.0, prot.1, prot.2);
+    assert!(flags & PRESENT != 0, "a huge page must allow an access");
+    write_entry(pd, i2, phys | flags | HUGE);
+    flush_user(root, virt);
+}
+
 /// Changes the huge page at `virt` in `root` to 512 pages of 4 KiB with the same frames and
 /// permissions. `table` is the table that `user_map_huge` gave.
 pub(crate) fn user_split_huge(root: u64, virt: usize, table: u64) {
@@ -510,7 +545,7 @@ pub(crate) fn user_unmap_huge(root: u64, virt: usize, table: u64) {
         write_entry(table, i, 0);
     }
     write_entry(pd, i2, table | PRESENT | WRITABLE | USER);
-    flush_user(root, virt);
+    flush_user_block(root);
 }
 
 /// Loads `root` into CR3. A value of 0 loads the kernel table.

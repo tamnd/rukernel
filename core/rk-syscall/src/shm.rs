@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
+use rk_mm::hugetlb::HugeFile;
 use rk_mm::vma::Backing;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
 use rk_vfs::cred::{IpcOwner, cap};
@@ -31,6 +32,12 @@ const IPC_PRIVATE: i32 = 0;
 /// The flags of `shmget`.
 const IPC_CREAT: u32 = 0o1000;
 const IPC_EXCL: u32 = 0o2000;
+/// The segment has huge pages of the pool of hugetlbfs.
+const SHM_HUGETLB: u32 = 0o4000;
+/// A `SHM_HUGETLB` segment reserves no huge pages.
+const SHM_NORESERVE: u32 = 0o10000;
+/// The bits of the size of a huge page, as `SHM_HUGE_SHIFT`.
+const SHM_HUGE_SHIFT: u32 = 26;
 /// The flags of `shmat`.
 const SHM_RDONLY: u32 = 0o10000;
 const SHM_RND: u32 = 0o20000;
@@ -54,6 +61,24 @@ const SHM_LOCKED: u16 = 0o2000;
 
 /// The smallest size of a segment, as `SHMMIN` of Linux. The sysctl files have the other limits.
 const SHMMIN: u64 = 1;
+
+/// The size of a huge page.
+const HPAGE: u64 = rk_mm::hugetlb::HPAGE_SIZE as u64;
+
+/// `kernel.shmmax`.
+fn shmmax() -> u64 {
+    SHMMAX.get()
+}
+
+/// `kernel.shmall`.
+fn shmall() -> u64 {
+    SHMALL.get()
+}
+
+/// `kernel.shmmni`.
+fn shmmni() -> u64 {
+    SHMMNI.get() as u64
+}
 
 /// The permissions of an IPC object, as `struct ipc64_perm` of x86-64.
 #[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -131,10 +156,34 @@ struct ShmPages {
     id: i32,
     size: u64,
     pages: SpinLock<BTreeMap<u64, Arc<Frame>>>,
+    /// The huge pages of a `SHM_HUGETLB` segment.
+    huge: Option<Arc<HugeFile>>,
+}
+
+impl ShmPages {
+    /// The size of a mapping of the segment: whole pages, or whole huge pages for a
+    /// `SHM_HUGETLB` segment.
+    fn map_len(&self) -> u64 {
+        let unit = if self.huge.is_some() { HPAGE } else { PAGE_SIZE as u64 };
+        self.size.next_multiple_of(unit)
+    }
+
+    /// The number of pages of 4 KiB in memory.
+    fn rss(&self) -> u64 {
+        let huge = self.huge.as_ref().map_or(0, |h| h.page_count() as u64);
+        self.pages.lock().len() as u64 + huge * (HPAGE / PAGE_SIZE as u64)
+    }
 }
 
 impl MmFile for ShmPages {
+    fn huge_file(&self) -> Option<&HugeFile> {
+        self.huge.as_deref()
+    }
+
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
+        if let Some(huge) = &self.huge {
+            return huge.page(index);
+        }
         if index.checked_mul(PAGE_SIZE as u64).is_none_or(|o| o >= self.size) {
             return Err(Errno::EIO);
         }
@@ -237,16 +286,23 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
             return Err(Errno::ENOENT);
         }
     }
-    if !(SHMMIN..=SHMMAX.get()).contains(&size) {
+    if !(SHMMIN..=shmmax()).contains(&size) {
         return Err(Errno::EINVAL);
     }
-    if table.segments.len() as u64 >= SHMMNI.get() as u64 {
+    let pages = size.div_ceil(PAGE_SIZE as u64);
+    let total: u64 = table.segments.values().map(|s| s.pages.size.div_ceil(PAGE_SIZE as u64)).sum();
+    if total.checked_add(pages).is_none_or(|t| t > shmall()) {
         return Err(Errno::ENOSPC);
     }
+    if table.segments.len() as u64 >= shmmni() {
+        return Err(Errno::ENOSPC);
+    }
+    let huge = if flags & SHM_HUGETLB != 0 { Some(huge_segment(cx, size, flags)?) } else { None };
     let next = table.next;
     let id = rk_vfs::ipc::alloc_id(&SHM_NEXT_ID, next, |id| table.segments.contains_key(&id));
     table.next = id.wrapping_add(1) & i32::MAX;
-    let pages = Arc::new(ShmPages { key, id, size, pages: SpinLock::new(BTreeMap::new()) });
+    let pages = SpinLock::new(BTreeMap::new());
+    let pages = Arc::new(ShmPages { key, id, size, pages, huge });
     // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
     let perm = IpcPerm {
         key,
@@ -260,6 +316,33 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
     let segment = Segment { pages, perm, atime: 0, dtime: 0, ctime: now(), cpid: pid(cx), lpid: 0 };
     table.segments.insert(id, segment);
     Ok(id as u64)
+}
+
+/// Makes the huge pages of a new `SHM_HUGETLB` segment of `size` bytes, as
+/// `hugetlb_file_setup` of Linux. The segment reserves its pages unless `SHM_NORESERVE` is set.
+/// A caller without `CAP_IPC_LOCK` must be in the group `vm.hugetlb_shm_group` or have the
+/// size in its `RLIMIT_MEMLOCK`.
+///
+/// # Errors
+///
+/// `EINVAL` for a size of huge page that the pool does not have, `EPERM` for a caller that may
+/// not lock the memory, and `ENOMEM` if the pool does not have the pages.
+fn huge_segment(cx: &Cx<'_>, size: u64, flags: u32) -> Result<Arc<HugeFile>, Errno> {
+    crate::mm::hugetlb_size(flags >> SHM_HUGE_SHIFT)?;
+    let c = cx.process().cred();
+    let group = u32::try_from(rk_mm::hugetlb::shm_group()).unwrap_or(u32::MAX);
+    if !c.capable(cap::IPC_LOCK) && !c.in_group(group) {
+        let limit = cx.process().limit(rk_proc::limits::RLIMIT_MEMLOCK).cur;
+        if size.next_multiple_of(HPAGE) > limit {
+            return Err(Errno::EPERM);
+        }
+    }
+    let len = size.next_multiple_of(HPAGE);
+    let huge = HugeFile::new(0, 0, Vec::new(), len);
+    if flags & SHM_NORESERVE == 0 {
+        huge.reserve(0, len / HPAGE)?;
+    }
+    Ok(huge)
 }
 
 pub(crate) fn shmat(cx: &Cx<'_>, id: u64, addr: u64, flags: u64) -> SysResult {
@@ -286,11 +369,14 @@ pub(crate) fn shmat(cx: &Cx<'_>, id: u64, addr: u64, flags: u64) -> SysResult {
         c.ipc_permission(&s.perm.owner(), access)?;
         s.pages.clone()
     };
-    let len = usize::try_from(pages.size.next_multiple_of(PAGE_SIZE as u64))
-        .map_err(|_| Errno::ENOMEM)?;
+    let len = usize::try_from(pages.map_len()).map_err(|_| Errno::ENOMEM)?;
     let prot = Prot { read: true, write: !read_only, exec: flags & SHM_EXEC != 0 };
+    // A `SHM_HUGETLB` segment reserved its pages in `shmget`, so an attach reserves none, as
+    // the `S_PRIVATE` inode of Linux.
+    let noreserve = pages.huge.is_some();
     let file: Arc<dyn MmFile> = pages;
     let req = MmapRequest {
+        noreserve,
         addr,
         fixed: addr != 0,
         noreplace: addr != 0 && flags & SHM_REMAP == 0,
@@ -329,8 +415,8 @@ pub(crate) fn shmdt(cx: &Cx<'_>, addr: u64) -> SysResult {
             _ => None,
         })
         .ok_or(Errno::EINVAL)?;
-    let size = TABLE.lock().segments.get(&id).map_or(PAGE_SIZE as u64, |s| s.pages.size);
-    let len = usize::try_from(size.next_multiple_of(PAGE_SIZE as u64)).unwrap_or(PAGE_SIZE);
+    let size = TABLE.lock().segments.get(&id).map_or(PAGE_SIZE as u64, |s| s.pages.map_len());
+    let len = usize::try_from(size).unwrap_or(PAGE_SIZE);
     vm.munmap(addr, len)?;
     let mut table = TABLE.lock();
     if let Some(s) = table.segments.get_mut(&id) {
@@ -351,11 +437,11 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
     match cmd {
         IPC_INFO => {
             let info = ShmInfo64 {
-                shmmax: SHMMAX.get(),
+                shmmax: shmmax(),
                 shmmin: SHMMIN,
-                shmmni: SHMMNI.get() as u64,
-                shmseg: SHMMNI.get() as u64,
-                shmall: SHMALL.get(),
+                shmmni: shmmni(),
+                shmseg: shmmni(),
+                shmall: shmall(),
                 unused: [0; 4],
             };
             table.sweep();
@@ -373,7 +459,7 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
                     .values()
                     .map(|s| s.pages.size.div_ceil(PAGE_SIZE as u64))
                     .sum(),
-                shm_rss: table.segments.values().map(|s| s.pages.pages.lock().len() as u64).sum(),
+                shm_rss: table.segments.values().map(|s| s.pages.rss()).sum(),
                 ..ShmUse::default()
             };
             let max = table.segments.keys().next_back().copied().unwrap_or(0);

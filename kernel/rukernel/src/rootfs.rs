@@ -15,6 +15,7 @@ pub(crate) fn init(boot: &BootInfo) {
     rk_vfs::fstype::register(rk_fs_tmpfs::FS_TYPE);
     rk_vfs::fstype::register(rk_fs_tmpfs::DEVTMPFS);
     rk_vfs::fstype::register(rk_fs_overlay::FS_TYPE);
+    rk_vfs::fstype::register(rk_fs_hugetlbfs::FS_TYPE);
     for t in rk_fs_ext4::FS_TYPES {
         rk_vfs::fstype::register(t);
     }

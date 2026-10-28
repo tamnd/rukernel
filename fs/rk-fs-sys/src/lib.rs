@@ -15,9 +15,10 @@
 //! - `/sys/kernel/mm/ksm` has the files of Kernel Samepage Merging. A write to some of them
 //!   changes the settings of KSM.
 //! - `/sys/kernel/mm/transparent_hugepage` has the policy for huge pages. `enabled` and `defrag`
-//!   take a write, as in Linux. The kernel has no hugetlbfs, so `/sys/kernel/mm/hugepages` is
-//!   not there, as in Linux without `CONFIG_HUGETLBFS`. LTP looks for that directory to know if
-//!   it can mount hugetlbfs.
+//!   take a write, as in Linux.
+//! - `/sys/kernel/mm/hugepages/hugepages-2048kB` has the counters of the pool of hugetlbfs.
+//!   `nr_hugepages` and `nr_overcommit_hugepages` take a write, as in Linux. LTP looks for that
+//!   directory to know if it can mount hugetlbfs.
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
 //!   `statistics`. `/sys/class/net/NAME` is a link to it.
@@ -110,9 +111,9 @@ enum Kind {
     Dir,
     File(Vec<u8>),
     Link(Vec<u8>),
-    /// A file of KSM. A read gives the value of that moment. `writable` tells that a write can
-    /// change it.
-    Ksm {
+    /// A file of KSM or of the pool of hugetlbfs. A read gives the value of that moment.
+    /// `writable` tells that a write can change it.
+    Mm {
         writable: bool,
     },
 }
@@ -355,10 +356,10 @@ impl Inode for Node {
         let (kind, perm, nlink, size) = match &self.kind {
             Kind::Dir => (mode::S_IFDIR, 0o755, 2, 0),
             Kind::File(_) if writable(&self.path) => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
-            Kind::File(_) | Kind::Ksm { writable: false } => {
+            Kind::File(_) | Kind::Mm { writable: false } => {
                 (mode::S_IFREG, 0o444, 1, BLOCK_SIZE as u64)
             }
-            Kind::Ksm { writable: true } => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
+            Kind::Mm { writable: true } => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
             Kind::Link(target) => (mode::S_IFLNK, 0o777, 1, target.len() as u64),
         };
         let t = now();
@@ -387,7 +388,7 @@ impl Inode for Node {
         let live;
         let text = match &self.kind {
             Kind::File(text) => text,
-            Kind::Ksm { .. } => {
+            Kind::Mm { .. } => {
                 live = mm::read(&self.path);
                 &live
             }
@@ -402,9 +403,9 @@ impl Inode for Node {
 
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
         match self.kind {
-            Kind::Ksm { writable: true } => mm::write(&self.path, buf),
+            Kind::Mm { writable: true } => mm::write(&self.path, buf),
             Kind::File(_) => write_file(&self.path, buf).map(|()| buf.len()),
-            Kind::Ksm { .. } => Err(Errno::EACCES),
+            Kind::Mm { .. } => Err(Errno::EACCES),
             _ => Err(Errno::EINVAL),
         }
     }
@@ -462,7 +463,7 @@ impl Inode for Node {
                 };
                 let kind = match kind {
                     Kind::Dir => FileType::Directory,
-                    Kind::File(_) | Kind::Ksm { .. } => FileType::Regular,
+                    Kind::File(_) | Kind::Mm { .. } => FileType::Regular,
                     Kind::Link(_) => FileType::Symlink,
                 };
                 DirEntry { ino: ino(&self.child_path(&name)), kind, name: name.into_bytes() }
@@ -572,15 +573,15 @@ mod tests {
     #[test]
     fn ksm_has_the_files_of_linux() {
         assert_eq!(names("kernel"), ["mm"]);
-        assert_eq!(names("kernel/mm"), ["ksm", "transparent_hugepage"]);
+        assert_eq!(names("kernel/mm"), ["hugepages", "ksm", "transparent_hugepage"]);
         let files = names("kernel/mm/ksm");
         for f in ["run", "pages_to_scan", "sleep_millisecs", "full_scans", "pages_shared"] {
             assert!(files.contains(&String::from(f)), "{f}");
         }
-        assert_eq!(get("kernel/mm/ksm/run"), Kind::Ksm { writable: true });
-        assert_eq!(get("kernel/mm/ksm/pages_shared"), Kind::Ksm { writable: false });
+        assert_eq!(get("kernel/mm/ksm/run"), Kind::Mm { writable: true });
+        assert_eq!(get("kernel/mm/ksm/pages_shared"), Kind::Mm { writable: false });
         let run =
-            Node { path: String::from("kernel/mm/ksm/run"), kind: Kind::Ksm { writable: true } };
+            Node { path: String::from("kernel/mm/ksm/run"), kind: Kind::Mm { writable: true } };
         assert_eq!(run.metadata().mode, mode::S_IFREG | 0o644);
         let mut buf = [0u8; 8];
         assert_eq!(run.read_at(0, &mut buf).unwrap(), 2);
@@ -588,9 +589,23 @@ mod tests {
         assert_eq!(run.write_at(0, b"7").unwrap_err(), Errno::EINVAL);
         let shared = Node {
             path: String::from("kernel/mm/ksm/pages_shared"),
-            kind: Kind::Ksm { writable: false },
+            kind: Kind::Mm { writable: false },
         };
         assert_eq!(shared.write_at(0, b"1").unwrap_err(), Errno::EACCES);
+    }
+
+    #[test]
+    fn the_pool_of_hugetlbfs_has_the_files_of_linux() {
+        let dir = "kernel/mm/hugepages/hugepages-2048kB";
+        assert_eq!(names("kernel/mm/hugepages"), ["hugepages-2048kB"]);
+        assert!(names(dir).contains(&String::from("resv_hugepages")));
+        assert_eq!(get(&format!("{dir}/nr_hugepages")), Kind::Mm { writable: true });
+        let free =
+            Node { path: format!("{dir}/free_hugepages"), kind: Kind::Mm { writable: false } };
+        let mut buf = [0u8; 8];
+        assert_eq!(free.read_at(0, &mut buf).unwrap(), 2);
+        assert_eq!(&buf[..2], b"0\n");
+        assert_eq!(free.write_at(0, b"1").unwrap_err(), Errno::EACCES);
     }
 
     #[test]

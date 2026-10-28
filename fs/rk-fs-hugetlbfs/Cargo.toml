@@ -1,0 +1,19 @@
+[package]
+name = "rk-fs-hugetlbfs"
+description = "hugetlbfs for rukernel: files whose mappings use the huge pages of the pool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+rk-mm.workspace = true
+rk-vfs.workspace = true
+
+[lints]
+workspace = true

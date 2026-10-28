@@ -26,11 +26,14 @@ pub struct MemInfo {
     pub committed: u64,
     /// The memory in transparent huge pages.
     pub anon_huge: u64,
+    /// The counters of the pool of hugetlbfs, in huge pages.
+    pub hugetlb: rk_mm::hugetlb::Counts,
 }
 
 /// The text of `/proc/meminfo`. R1 has no page cache, so the other counts are 0.
 pub fn meminfo(m: MemInfo) -> String {
-    let rows: [(&str, u64); 25] = [
+    let h = m.hugetlb;
+    let rows: [(&str, u64); 26] = [
         ("MemTotal", m.total),
         ("MemFree", m.free),
         ("MemAvailable", m.free),
@@ -51,11 +54,12 @@ pub fn meminfo(m: MemInfo) -> String {
         ("Committed_AS", m.committed),
         ("VmallocTotal", 34_359_738_367),
         ("AnonHugePages", m.anon_huge),
-        ("HugePages_Total", 0),
-        ("HugePages_Free", 0),
-        ("HugePages_Rsvd", 0),
-        ("HugePages_Surp", 0),
-        ("Hugepagesize", 2048),
+        ("HugePages_Total", h.total as u64),
+        ("HugePages_Free", h.free as u64),
+        ("HugePages_Rsvd", h.resv as u64),
+        ("HugePages_Surp", h.surplus as u64),
+        ("Hugepagesize", rk_mm::hugetlb::HPAGE_KB as u64),
+        ("Hugetlb", (h.total * rk_mm::hugetlb::HPAGE_KB) as u64),
     ];
     let mut out = String::new();
     for (name, value) in rows {
@@ -530,15 +534,17 @@ mod tests {
             commit_limit: 512,
             committed: 100,
             anon_huge: 2048,
+            hugetlb: rk_mm::hugetlb::Counts { total: 3, free: 2, ..Default::default() },
         };
         let text = meminfo(m);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 25);
+        assert_eq!(lines.len(), 26);
         assert!(text.contains("\nCommitted_AS:        100 kB\n"));
         assert!(text.contains("\nAnonHugePages:      2048 kB\n"));
         assert_eq!(lines[0], "MemTotal:           1024 kB");
         assert_eq!(lines[2], "MemAvailable:        512 kB");
-        assert!(text.contains("\nHugePages_Total:       0\n"));
+        assert!(text.contains("\nHugePages_Total:       3\nHugePages_Free:        2\n"));
+        assert!(text.ends_with("\nHugepagesize:       2048 kB\nHugetlb:            6144 kB\n"));
     }
 
     #[test]

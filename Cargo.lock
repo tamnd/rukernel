@@ -102,6 +102,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-fs-hugetlbfs"
+version = "0.4.5"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-mm",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-fs-overlay"
 version = "0.4.5"
 dependencies = [
@@ -227,6 +237,7 @@ dependencies = [
  "rk-drv-tty",
  "rk-frame",
  "rk-fs-cgroup",
+ "rk-fs-hugetlbfs",
  "rk-fs-tmpfs",
  "rk-mm",
  "rk-net",
@@ -258,6 +269,7 @@ dependencies = [
  "rk-frame",
  "rk-fs-cgroup",
  "rk-fs-ext4",
+ "rk-fs-hugetlbfs",
  "rk-fs-overlay",
  "rk-fs-proc",
  "rk-fs-sys",

@@ -12,10 +12,10 @@ use rk_abi::native::mman::{
     MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_MERGEABLE,
     MADV_NOHUGEPAGE, MADV_NORMAL, MADV_PAGEOUT, MADV_POPULATE_READ, MADV_POPULATE_WRITE,
     MADV_RANDOM, MADV_REMOVE, MADV_SEQUENTIAL, MADV_UNMERGEABLE, MADV_WILLNEED, MADV_WIPEONFORK,
-    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_LOCKED, MAP_NORESERVE,
-    MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_TYPE, MCL_CURRENT, MCL_FUTURE,
-    MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED, MREMAP_MAYMOVE, MS_ASYNC,
-    MS_INVALIDATE, MS_SYNC,
+    MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_GROWSDOWN, MAP_HUGE_SHIFT, MAP_HUGETLB,
+    MAP_LOCKED, MAP_NORESERVE, MAP_POPULATE, MAP_PRIVATE, MAP_SHARED, MAP_SHARED_VALIDATE,
+    MAP_TYPE, MCL_CURRENT, MCL_FUTURE, MCL_ONFAULT, MLOCK_ONFAULT, MREMAP_DONTUNMAP, MREMAP_FIXED,
+    MREMAP_MAYMOVE, MS_ASYNC, MS_INVALIDATE, MS_SYNC,
 };
 use rk_frame::mm::Frame;
 use rk_frame::sync::SpinLock;
@@ -304,24 +304,36 @@ pub(crate) fn mmap(
                 }
                 may_write = false;
             }
-            match meta.file_type() {
-                Some(rk_vfs::FileType::Regular) => {
-                    let path =
-                        file.location().map(rk_vfs::Location::absolute_path).unwrap_or_default();
-                    let pages = file_pages(inode, path);
-                    let pages: Arc<dyn MmFile> = if shared && may_write {
-                        Arc::new(SharedWrite::new(inode, pages))
-                    } else {
-                        pages
-                    };
-                    Some((pages, offset))
-                }
-                // A mapping of /dev/zero is anonymous memory, as in Linux.
-                Some(rk_vfs::FileType::CharDevice) if meta.rdev == DEV_ZERO => None,
-                _ => return Err(Errno::ENODEV),
-            }
+            let path = || file.location().map(rk_vfs::Location::absolute_path).unwrap_or_default();
+            // A file of hugetlbfs gives its huge pages. `MAP_HUGETLB` is only for such a file or
+            // for anonymous memory, as `ksys_mmap_pgoff` of Linux.
+            let pages: Option<Arc<dyn MmFile>> =
+                match (rk_fs_hugetlbfs::huge_file(inode), meta.file_type()) {
+                    (Some(huge), _) => {
+                        huge.set_path(path());
+                        Some(huge)
+                    }
+                    _ if flags & MAP_HUGETLB != 0 => return Err(Errno::EINVAL),
+                    (None, Some(rk_vfs::FileType::Regular)) => {
+                        let pages = file_pages(inode, path());
+                        Some(if shared && may_write {
+                            Arc::new(SharedWrite::new(inode, pages))
+                        } else {
+                            pages
+                        })
+                    }
+                    // A mapping of /dev/zero is anonymous memory, as in Linux.
+                    (None, Some(rk_vfs::FileType::CharDevice)) if meta.rdev == DEV_ZERO => None,
+                    _ => return Err(Errno::ENODEV),
+                };
+            pages.map(|p| (p, offset))
         }
     };
+    let hugetlb = file.is_none() && flags & MAP_HUGETLB != 0;
+    let huge_file = file.as_ref().is_some_and(|(f, _)| f.huge_file().is_some());
+    if hugetlb {
+        hugetlb_size(flags >> MAP_HUGE_SHIFT)?;
+    }
     let req = MmapRequest {
         addr: addr as usize,
         len: len as usize,
@@ -337,8 +349,28 @@ pub(crate) fn mmap(
         file,
         kind: VmaKind::Normal,
         noreserve: flags & MAP_NORESERVE != 0,
+        hugetlb,
     };
-    Ok(cx.vm()?.mmap(req)? as u64)
+    let vm = cx.vm()?;
+    let at = vm.mmap(req)?;
+    // A truncate of the file then removes its pages from this address space.
+    if huge_file {
+        rk_mm::hugetlb::track(&vm);
+    }
+    Ok(at as u64)
+}
+
+/// Checks the size of a huge page that the bits `log` of `MAP_HUGE_*`, `SHM_HUGE_*` or
+/// `MFD_HUGE_*` give: 0 for the default, or 21 for 2 MiB, the only size of the pool.
+///
+/// # Errors
+///
+/// `EINVAL` for another size, as `hstate_sizelog` of Linux finds no pool for it.
+pub(crate) fn hugetlb_size(log: u32) -> Result<(), Errno> {
+    match log & 0x3f {
+        0 | 21 => Ok(()),
+        _ => Err(Errno::EINVAL),
+    }
 }
 
 pub(crate) fn msync(cx: &Cx<'_>, addr: u64, len: u64, flags: u64) -> SysResult {

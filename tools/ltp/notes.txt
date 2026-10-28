@@ -2,7 +2,6 @@
 # report.py puts the note in the table, and the note gives the cause of the test in the work that
 # remains. Without a note, the table shows the reason from the log. A test name can have the
 # runtest file before it, as net.ipv6:ping601, when two runtest files have the same name.
-cachestat03	Needs hugetlbfs, which rukernel does not have (TCONF).
 fanotify05	The test makes 3 x 16385 files on ext2. Under QEMU without KVM on a busy host, this can take more than the time limit of the test (172 s, TBROK). It passes when the host is less busy.
 ksm02	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
 ksm02_1	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
@@ -24,9 +23,6 @@ mmapstress03	Grows the heap with sbrk. The musl libc of the LTP build gives ENOM
 mmapstress05	Grows the heap with sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 mmapstress08	Uses sbrk. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the test cannot run.
 overcommit_memory02	With -R 0 the commit limit is 0 (no swap), and the test then reads the sysctl back with fopen. musl malloc needs a new mmap for the FILE, which the strict policy refuses, so the test gives TBROK instead of the TCONF that it gives with glibc.
-thp02	LTP needs /sys/kernel/mm/hugepages, which only hugetlbfs makes, and rukernel has no hugetlbfs (TCONF). The test passes on rukernel when the directory is there (#365), but the directory makes the tests that mount hugetlbfs, as cpuset02, give TBROK.
-thp03	LTP needs /sys/kernel/mm/hugepages, which only hugetlbfs makes, and rukernel has no hugetlbfs (TCONF), as thp02.
-thp04	LTP needs /sys/kernel/mm/hugepages to find the size of a huge page, and only hugetlbfs makes it (TCONF). The test passes on rukernel when the directory is there (#365).
 vma02	Needs NUMA and mbind (#322) (TCONF).
 vma03	Needs mmap2, which only a 32 bit kernel has (TCONF on x86_64).
 vma04	Needs NUMA and mbind (#322) (TCONF).
@@ -91,3 +87,9 @@ ioctl10	The test needs the PROCMAP_QUERY ioctl of /proc/PID/maps, which rukernel
 prctl09	The test sleeps 25 ms many times and checks the time with a small margin. Under QEMU without KVM on a busy host, a sleep can take up to 200 ms. It passes when the host is less busy.
 times03	rukernel does not count the system CPU time, so tms_stime stays 0.
 execve04	rukernel does not count the writers of an inode (i_writecount), so execve of a file that is open for write does not give ETXTBSY.
+hugemmap07	The test calls brk to set the break back. The musl libc of the LTP build gives ENOMEM for each brk and sbrk call, so the cleanup gives TBROK. The hugetlb part of the test passes.
+hugemmap24	The test puts its slice boundary above the heap, from malloc(1). musl malloc gives an mmap address near the top of user space, so each boundary is above TASK_SIZE and MAP_FIXED gives ENOMEM, as on Linux with musl. The test is for the slices of powerpc.
+hugemmap32	The test needs gigantic huge pages (1 GiB). rukernel has only 2 MiB huge pages (TCONF).
+hugemmap34	The test is only for ppc and ppc64 (TCONF on x86_64).
+hugemmap35	The test is only for aarch64 (TCONF on x86_64).
+hugeshmat04	The test needs 2048 MB MemAvailable. The LTP VM has less memory (TCONF).

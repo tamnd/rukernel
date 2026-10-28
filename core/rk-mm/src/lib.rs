@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod hugetlb;
 pub mod ksm;
 pub mod tunables;
 pub mod vma;

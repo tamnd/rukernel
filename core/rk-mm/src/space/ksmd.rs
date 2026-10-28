@@ -60,9 +60,10 @@ static STARTED: Once<()> = Once::new();
 /// The page with zeros that `use_zero_pages` maps.
 static ZERO: Once<Option<Arc<Frame>>> = Once::new();
 
-/// Tells if KSM can merge the pages of the area. A shared area is never mergeable.
+/// Tells if KSM can merge the pages of the area. A shared area and a hugetlb area are never
+/// mergeable.
 fn eligible(vma: &Vma<super::FileRef>, merge_any: bool) -> bool {
-    (vma.mergeable || merge_any) && !vma.shared
+    (vma.mergeable || merge_any) && !vma.shared && !vma.hugetlb
 }
 
 impl AddressSpace {
@@ -324,14 +325,14 @@ pub(super) fn exit(vm: &AddressSpace) {
 }
 
 /// `madvise(MADV_MERGEABLE)` and `madvise(MADV_UNMERGEABLE)` for the pages in `start..end`. A
-/// shared area does not change, as in Linux.
+/// shared area and a hugetlb area do not change, as in Linux.
 ///
 /// # Errors
 ///
 /// `ENOMEM` if no frame is free for a copy of a KSM page.
 pub fn madvise(vm: &Arc<AddressSpace>, start: usize, end: usize, merge: bool) -> Result<(), Errno> {
     vm.state.lock().vmas.update_range(start, end, |v| {
-        if !v.shared {
+        if !v.shared && !v.hugetlb {
             v.mergeable = merge;
         }
     });
