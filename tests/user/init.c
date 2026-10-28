@@ -2734,12 +2734,13 @@ static void test_mount_api(void)
 	errno = 0;
 	check("mount_setattr of an atime value without MOUNT_ATTR__ATIME gives EINVAL",
 	      syscall(SYS_mount_setattr, AT_FDCWD, "/mnt2", 0, &attr, sizeof(attr)) == -1 && errno == EINVAL);
-	check("umount the clone", umount("/mnt2") == 0);
-	check("umount the mount of fsmount", umount("/mnt") == 0 && access("/mnt/f", F_OK) == -1);
+	/* A descriptor of a mount keeps the mount busy, as on Linux. */
 	close(pfd);
 	close(tfd);
 	close(mfd);
 	close(fd);
+	check("umount the clone", umount("/mnt2") == 0);
+	check("umount the mount of fsmount", umount("/mnt") == 0 && access("/mnt/f", F_OK) == -1);
 	rmdir("/mnt");
 	rmdir("/mnt2");
 }
