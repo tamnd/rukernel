@@ -236,6 +236,9 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
     let file = |name: &str, text: String| (String::from(name), Kind::File(text.into_bytes()));
     let flags = d.flags() & !(IFF_RUNNING | IFF_LOWER_UP | IFF_DORMANT);
     let index = d.ifindex();
+    // The index of the other end of a veth pair, as `dev_get_iflink` and `veth_get_iflink` of
+    // Linux. Another device gives its own index.
+    let iflink = d.peer().map_or(index, |p| p.ifindex());
     let mut out = Vec::from([
         file("addr_assign_type", String::from("0\n")),
         file("addr_len", format!("{}\n", d.mac().0.len())),
@@ -251,7 +254,7 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
         file("dormant", String::from("0\n")),
         file("flags", format!("{flags:#x}\n")),
         file("ifindex", format!("{index}\n")),
-        file("iflink", format!("{index}\n")),
+        file("iflink", format!("{iflink}\n")),
         file("mtu", format!("{}\n", d.mtu())),
         file("operstate", format!("{}\n", OPERSTATES[usize::from(d.operstate()).min(6)])),
         (String::from("statistics"), Kind::Dir),
@@ -589,6 +592,19 @@ mod tests {
         assert_eq!(get(&format!("{lo}/type")), Kind::File(b"772\n".to_vec()));
         assert_eq!(get(&format!("{lo}/address")), Kind::File(b"00:00:00:00:00:00\n".to_vec()));
         assert!(names(&format!("{lo}/statistics")).contains(&String::from("rx_bytes")));
+    }
+
+    #[test]
+    fn the_iflink_of_a_veth_end_is_the_index_of_the_other_end() {
+        rk_net::dev::init();
+        let (a, b) = rk_net::veth::create(Some(b"sva"), Some(b"svb"), None).unwrap();
+        let iflink = |name: &str| get(&format!("devices/virtual/net/{name}/iflink"));
+        assert_eq!(iflink("sva"), Kind::File(format!("{}\n", b.ifindex()).into_bytes()));
+        assert_eq!(iflink("svb"), Kind::File(format!("{}\n", a.ifindex()).into_bytes()));
+        assert_eq!(iflink("lo"), Kind::File(b"1\n".to_vec()));
+        assert!(names("class/net").contains(&String::from("sva")));
+        rk_net::dev::unregister(&a);
+        assert!(!names("class/net").contains(&String::from("svb")));
     }
 
     #[test]

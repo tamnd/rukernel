@@ -61,6 +61,7 @@
 #include <netinet/tcp.h>
 #include <net/if.h>
 #include <netpacket/packet.h>
+#include <linux/rtnetlink.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -5021,6 +5022,267 @@ static void test_tun_mq(void)
 	check("rkmq0 goes away when its last file closes", if_nametoindex("rkmq0") == 0);
 }
 
+/* The netlink attribute of the other end of a veth pair, VETH_INFO_PEER of <linux/veth.h>. */
+#define RK_VETH_INFO_PEER 1
+
+/* Adds the attribute `type` with `len` bytes of `data` to the netlink message m. A null `data`
+ * gives zeros. Gives the attribute, so that the caller can end a nest with nl_end. */
+static struct rtattr *nl_put(struct nlmsghdr *m, int type, const void *data, int len)
+{
+	struct rtattr *a = (struct rtattr *)((char *)m + NLMSG_ALIGN(m->nlmsg_len));
+	a->rta_type = type;
+	a->rta_len = RTA_LENGTH(len);
+	if (data)
+		memcpy(RTA_DATA(a), data, len);
+	else
+		memset(RTA_DATA(a), 0, len);
+	m->nlmsg_len = NLMSG_ALIGN(m->nlmsg_len) + RTA_ALIGN(a->rta_len);
+	return a;
+}
+
+/* Sets the length of the nest `a` to the end of the message m. */
+static void nl_end(struct nlmsghdr *m, struct rtattr *a)
+{
+	a->rta_len = (char *)m + m->nlmsg_len - (char *)a;
+}
+
+/* Sends the request m on the rtnetlink socket fd and reads the first reply into buf. Gives the
+ * length of the reply, or -1. */
+static long nl_ask(int fd, struct nlmsghdr *m, void *buf, int size)
+{
+	m->nlmsg_flags |= NLM_F_REQUEST;
+	if (send(fd, m, m->nlmsg_len, 0) != (long)m->nlmsg_len)
+		return -1;
+	return recv(fd, buf, size, 0);
+}
+
+/* Sends the request m with NLM_F_ACK. Gives the error of the ack: 0, or a negative errno. */
+static int nl_talk(int fd, struct nlmsghdr *m)
+{
+	char buf[1024];
+	m->nlmsg_flags |= NLM_F_ACK;
+	long n = nl_ask(fd, m, buf, sizeof(buf));
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	if (n < (long)NLMSG_LENGTH(sizeof(struct nlmsgerr)) || r->nlmsg_type != NLMSG_ERROR)
+		return -EPROTO;
+	return ((struct nlmsgerr *)NLMSG_DATA(r))->error;
+}
+
+/* Gives the u32 attribute `type` of the link message r, or -1 if it is not there. */
+static long link_u32(struct nlmsghdr *r, int type)
+{
+	struct ifinfomsg *ifi = NLMSG_DATA(r);
+	int len = r->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+	for (struct rtattr *a = IFLA_RTA(ifi); RTA_OK(a, len); a = RTA_NEXT(a, len))
+		if (a->rta_type == type)
+			return *(unsigned int *)RTA_DATA(a);
+	return -1;
+}
+
+/* Gives the interface `name` the IPv4 address `addr`/24 and sets it up. Gives 0 or -1. */
+static int if_up_addr(const char *name, unsigned long addr)
+{
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, name);
+	struct sockaddr_in a = inet_addr4(addr, 0);
+	memcpy(&ifr.ifr_addr, &a, sizeof(a));
+	int r = ioctl(s, SIOCSIFADDR, &ifr);
+	a = inet_addr4(0xffffff00, 0);
+	memcpy(&ifr.ifr_netmask, &a, sizeof(a));
+	r |= ioctl(s, SIOCSIFNETMASK, &ifr);
+	r |= ioctl(s, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags |= IFF_UP;
+	r |= ioctl(s, SIOCSIFFLAGS, &ifr);
+	close(s);
+	return r ? -1 : 0;
+}
+
+/* Gives the flags of the interface `name`, or -1. */
+static int if_flags(const char *name)
+{
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, name);
+	int r = ioctl(s, SIOCGIFFLAGS, &ifr);
+	close(s);
+	return r ? -1 : (unsigned short)ifr.ifr_flags;
+}
+
+/* Reads the first line of the file `path` into buf. Gives buf, or "" on an error. */
+static char *read_line(const char *path, char *buf, int size)
+{
+	int fd = open(path, O_RDONLY);
+	long n = fd < 0 ? -1 : read(fd, buf, size - 1);
+	if (fd >= 0)
+		close(fd);
+	buf[n < 0 ? 0 : n] = 0;
+	buf[strcspn(buf, "\n")] = 0;
+	return buf;
+}
+
+/* The other end of the pair in test_veth. It runs in its own network namespace. It tells the
+ * first end its state with one byte on `out`, and waits for a byte on `in` for each step. */
+static void veth_peer(int in, int out)
+{
+	char c = unshare(CLONE_NEWNET) == 0;
+	write(out, &c, 1);
+	if (read(in, &c, 1) != 1)
+		_exit(1);
+	c = if_nametoindex("rkvb") > 0 && if_up_addr("rkvb", 0x0a4d0002) == 0;
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in me = inet_addr4(0, 7777);
+	c &= bind(u, (struct sockaddr *)&me, sizeof(me)) == 0;
+	write(out, &c, 1);
+	char buf[16];
+	struct sockaddr_in from;
+	c = 0;
+	for (int i = 0; i < 10 && !c; i++) {
+		long n = recv_wait(u, buf, sizeof(buf), &from, 1000);
+		c = n == 6 && memcmp(buf, "rkveth", 6) == 0 &&
+		    from.sin_addr.s_addr == htonl(0x0a4d0001);
+	}
+	if (c)
+		sendto(u, "rkback", 6, 0, (struct sockaddr *)&from, sizeof(from));
+	write(out, &c, 1);
+	if (read(in, &c, 1) != 1)
+		_exit(1);
+	c = if_nametoindex("rkvb") == 0;
+	write(out, &c, 1);
+	_exit(0);
+}
+
+/* The checks of test_veth, in a child with its own network and mount namespaces. */
+static int veth_child(void)
+{
+	failed = 0;
+	check("unshare of the network and mount namespaces for the first end",
+	      unshare(CLONE_NEWNET | CLONE_NEWNS) == 0);
+	int go[2], done[2];
+	if (pipe(go) || pipe(done))
+		return 1;
+	pid_t b = fork();
+	if (b == 0)
+		veth_peer(go[0], done[1]);
+	char c = 0;
+	check("the second end is in a new network namespace", read(done[0], &c, 1) == 1 && c);
+
+	/* ip link add rkva type veth peer name rkvb netns PID */
+	int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	union {
+		struct nlmsghdr h;
+		char buf[512];
+	} m = { 0 };
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	m.h.nlmsg_type = RTM_NEWLINK;
+	m.h.nlmsg_flags = NLM_F_CREATE | NLM_F_EXCL;
+	nl_put(&m.h, IFLA_IFNAME, "rkva", 5);
+	struct rtattr *info = nl_put(&m.h, IFLA_LINKINFO, NULL, 0);
+	nl_put(&m.h, IFLA_INFO_KIND, "veth", 4);
+	struct rtattr *data = nl_put(&m.h, IFLA_INFO_DATA, NULL, 0);
+	struct rtattr *peer = nl_put(&m.h, RK_VETH_INFO_PEER, NULL, sizeof(struct ifinfomsg));
+	nl_put(&m.h, IFLA_IFNAME, "rkvb", 5);
+	unsigned int pid = b;
+	nl_put(&m.h, IFLA_NET_NS_PID, &pid, 4);
+	nl_end(&m.h, peer);
+	nl_end(&m.h, data);
+	nl_end(&m.h, info);
+	check("RTM_NEWLINK makes a veth pair with the peer in another namespace",
+	      nl_talk(nl, &m.h) == 0);
+	int index = if_nametoindex("rkva");
+	check("the first end is in this namespace and the peer is not",
+	      index > 0 && if_nametoindex("rkvb") == 0);
+
+	/* ip link show rkva */
+	memset(&m, 0, sizeof(m));
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	m.h.nlmsg_type = RTM_GETLINK;
+	((struct ifinfomsg *)NLMSG_DATA(&m.h))->ifi_index = index;
+	char reply[4096];
+	long n = nl_ask(nl, &m.h, reply, sizeof(reply));
+	struct nlmsghdr *r = (struct nlmsghdr *)reply;
+	long link = n > 0 && r->nlmsg_type == RTM_NEWLINK ? link_u32(r, IFLA_LINK) : -1;
+	printf("init: inet: veth: rkva is %d, its peer is %ld\n", index, link);
+	check("IFLA_LINK gives the index of the peer", link > 0);
+	check("IFLA_LINK_NETNSID tells that the peer is in another namespace",
+	      n > 0 && link_u32(r, IFLA_LINK_NETNSID) != -1);
+
+	check("rkva gets 10.77.0.1/24 and goes up", if_up_addr("rkva", 0x0a4d0001) == 0);
+	int flags = if_flags("rkva");
+	check("rkva has no carrier while the peer is down",
+	      (flags & IFF_UP) && !(flags & IFF_RUNNING));
+	c = 1;
+	write(go[1], &c, 1);
+	check("the peer gets 10.77.0.2/24 and goes up", read(done[0], &c, 1) == 1 && c);
+	check("rkva has the carrier when the peer is up", if_flags("rkva") & IFF_RUNNING);
+
+	/* A datagram goes to the other namespace, and the reply comes back. */
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in to = inet_addr4(0x0a4d0002, 7777), from;
+	char buf[16];
+	n = -1;
+	for (int i = 0; i < 5 && n != 6; i++) {
+		sendto(u, "rkveth", 6, 0, (struct sockaddr *)&to, sizeof(to));
+		n = recv_wait(u, buf, sizeof(buf), &from, 1000);
+	}
+	check("a UDP datagram crosses the pair and the reply comes back",
+	      n == 6 && memcmp(buf, "rkback", 6) == 0);
+	check("the peer got the datagram from 10.77.0.1", read(done[0], &c, 1) == 1 && c);
+	close(u);
+
+	char text[4096];
+	int fd = open("/proc/net/dev", O_RDONLY);
+	n = fd < 0 ? -1 : read(fd, text, sizeof(text) - 1);
+	text[n < 0 ? 0 : n] = 0;
+	close(fd);
+	check("/proc/net/dev shows rkva", strstr(text, "rkva:") != NULL && !strstr(text, "rkvb:"));
+	mkdir("/sys", 0755);
+	check("mount sysfs in the new namespace", mount("sysfs", "/sys", "sysfs", 0, NULL) == 0);
+	char line[64], want[16];
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, "rkva");
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	unsigned char *mac = (unsigned char *)ifr.ifr_hwaddr.sa_data;
+	char hw[32] = "";
+	if (ioctl(s, SIOCGIFHWADDR, &ifr) == 0)
+		snprintf(hw, sizeof(hw), "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2],
+			 mac[3], mac[4], mac[5]);
+	close(s);
+	check("/sys/class/net/rkva/address gives the hardware address",
+	      hw[0] && strcmp(read_line("/sys/class/net/rkva/address", line, sizeof(line)), hw) == 0);
+	snprintf(want, sizeof(want), "%ld", link);
+	check("/sys/class/net/rkva/iflink gives the index of the peer",
+	      strcmp(read_line("/sys/class/net/rkva/iflink", line, sizeof(line)), want) == 0);
+	check("/sys/class/net/rkvb is not in this namespace",
+	      access("/sys/class/net/rkvb", F_OK) != 0);
+	umount("/sys");
+
+	/* ip link del rkva */
+	memset(&m, 0, sizeof(m));
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	m.h.nlmsg_type = RTM_DELLINK;
+	nl_put(&m.h, IFLA_IFNAME, "rkva", 5);
+	check("RTM_DELLINK removes rkva", nl_talk(nl, &m.h) == 0 && if_nametoindex("rkva") == 0);
+	c = 1;
+	write(go[1], &c, 1);
+	check("the peer goes away with rkva", read(done[0], &c, 1) == 1 && c);
+	close(nl);
+	int status;
+	check("the peer process ends", waitpid(b, &status, 0) == b && status == 0);
+	return failed;
+}
+
+/* A veth pair, as drivers/net/veth.c of Linux, with its ends in two network namespaces. */
+static void test_veth(void)
+{
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(veth_child());
+	int status;
+	check("the checks of the veth pair pass",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void test_inet(int port)
 {
 	test_inet_ping();
@@ -5030,6 +5292,7 @@ static void test_inet(int port)
 	test_tun();
 	test_tun_mq();
 	test_tun6();
+	test_veth();
 	test_slip();
 	test_tcp_lo();
 	test_tcp_host(port);

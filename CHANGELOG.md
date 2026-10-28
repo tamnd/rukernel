@@ -2,6 +2,17 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The `inet` boot test makes a veth pair with RTM_NEWLINK and `VETH_INFO_PEER`, with the peer in another network namespace. It checks `IFLA_LINK`, the carrier, /proc/net/dev and /sys/class/net, sends a UDP datagram across the pair, and deletes the pair (#454).
+
+### Fixed
+
+- `tools/ltp/build-ip.sh` builds `ip` with `SHARED_LIBS=n`. The static `ip` did not find the veth link kind, so `ip link add ... type veth peer name ...` failed with "Garbage instead of arguments" and the LTP net tests did not start (#454).
+- /sys/class/net/NAME/iflink of a veth device gives the index of the other end, as `veth_get_iflink` of Linux (#454).
+
 ## [0.4.11] - 2026-10-29
 
 ### Added

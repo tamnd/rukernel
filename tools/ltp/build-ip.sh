@@ -24,7 +24,10 @@ cd "iproute2-$V"
 # optional ones.
 ./configure >/dev/null
 # The top Makefile gives the include paths, and SUBDIRS selects the library and `ip` only.
-make -j"$(nproc)" SUBDIRS="lib ip" LDFLAGS=-static >/dev/null
+# SHARED_LIBS=n puts a table of the link kinds (static-syms.c) in the program. Without it, `ip`
+# looks for `veth_link_util` and the other kinds with dlopen(NULL), which fails in a static musl
+# program, and `ip link add ... type veth peer ...` fails with "Garbage instead of arguments".
+make -j"$(nproc)" SUBDIRS="lib ip" SHARED_LIBS=n LDFLAGS=-static >/dev/null
 strip -o /out/ip ip/ip
 '
 echo "ip: the program is $out/ip"
