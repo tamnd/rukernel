@@ -246,6 +246,14 @@ pub trait Inode: Any + Send + Sync {
         Err(Errno::EOPNOTSUPP)
     }
 
+    /// Gives the next data at or after `at` if `data`, else the next hole, for `SEEK_DATA` and
+    /// `SEEK_HOLE` on a file system that keeps its holes in memory, as `shmem_file_llseek` of
+    /// Linux. `at` is before the end of the file. `ENXIO` tells that there is no more data. The
+    /// default gives `EOPNOTSUPP`, and then the extents of [`Inode::fiemap`] give the holes.
+    fn seek_hole_data(&self, _at: u64, _data: bool) -> Result<u64> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
     /// Gives the extents of a regular file that have bytes in `start..start + len`, in order,
     /// for `FS_IOC_FIEMAP`. The default gives `EOPNOTSUPP`.
     fn fiemap(&self, _start: u64, _len: u64) -> Result<Vec<FiemapExtent>> {
@@ -335,6 +343,19 @@ pub trait Inode: Any + Send + Sync {
     /// starts them again, for `FITHAW`. The default gives `EOPNOTSUPP`.
     fn freeze(&self, _frozen: bool) -> Result<()> {
         Err(Errno::EOPNOTSUPP)
+    }
+
+    /// The seals of the file, the `F_SEAL_*` bits of `fcntl(F_GET_SEALS)`, as
+    /// `memfd_file_seals_ptr` of Linux. `None` if the file system has no seals, which the
+    /// default gives.
+    fn seals(&self) -> Option<u32> {
+        None
+    }
+
+    /// Sets the seals of the file to `seals`. The caller does the checks of
+    /// `fcntl(F_ADD_SEALS)`. The default gives `EINVAL`.
+    fn set_seals(&self, _seals: u32) -> Result<()> {
+        Err(Errno::EINVAL)
     }
 
     /// Makes the file system of the inode read only, or writable again, for a remount. The

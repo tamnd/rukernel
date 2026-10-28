@@ -48,8 +48,8 @@ use rk_abi::native::socket::{
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
-    AF_INET, AF_INET6, ICMP_ECHO, ICMP_FILTER, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK,
-    MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_RAW,
+    AF_INET, AF_INET6, ICMP_ECHO, ICMP_FILTER, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB,
+    MSG_PEEK, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_RAW,
 };
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
@@ -253,6 +253,9 @@ struct State {
     shut_rd: bool,
     shut_wr: bool,
     closed: bool,
+    /// The datagram of `MSG_MORE` that waits for more data: the address, the port and the
+    /// scope of the first send, and the data, as `pending` of `struct udp_sock` of Linux.
+    corked: Option<(Ip, u16, u32, Vec<u8>)>,
 }
 
 /// A socket of /proc/net/udp, /proc/net/icmp or /proc/net/raw.
@@ -348,6 +351,7 @@ impl Dgram {
                 shut_rd: false,
                 shut_wr: false,
                 closed: false,
+                corked: None,
             }),
             wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
@@ -1002,12 +1006,28 @@ impl Socket for Dgram {
             if s.shut_wr {
                 return Err(Errno::EPIPE);
             }
-            let (dst, port, scope) = match to.or(s.remote.map(|(a, p)| (a, p, 0))) {
-                Some(d) => d,
-                None if matches!(self.proto, Proto::Raw(_)) && s.hdrincl => (self.any(), 0, 0),
-                None => return Err(Errno::EDESTADDRREQ),
-            };
-            self.send_to(&mut s, dst, port, scope, &msg.data)?;
+            // A UDP send with `MSG_MORE` adds its data to one datagram, and the next send
+            // without it sends the datagram to the address of the first send, as
+            // `udp_sendmsg` of Linux.
+            if let Some((dst, port, scope, mut data)) = s.corked.take() {
+                data.extend_from_slice(&msg.data);
+                if flags & MSG_MORE != 0 {
+                    s.corked = Some((dst, port, scope, data));
+                    return Ok(msg.data.len());
+                }
+                self.send_to(&mut s, dst, port, scope, &data)?;
+            } else {
+                let (dst, port, scope) = match to.or(s.remote.map(|(a, p)| (a, p, 0))) {
+                    Some(d) => d,
+                    None if matches!(self.proto, Proto::Raw(_)) && s.hdrincl => (self.any(), 0, 0),
+                    None => return Err(Errno::EDESTADDRREQ),
+                };
+                if flags & MSG_MORE != 0 && self.proto == Proto::Udp {
+                    s.corked = Some((dst, port, scope, msg.data.clone()));
+                    return Ok(msg.data.len());
+                }
+                self.send_to(&mut s, dst, port, scope, &msg.data)?;
+            }
         }
         // The packet on the loopback device arrives now, as `netif_rx` and the softirq on the
         // return of Linux.
@@ -1128,7 +1148,12 @@ impl Socket for Dgram {
                 Ok(s.filter.to_ne_bytes().to_vec())
             }
             SOL_RAW if matches!(self.proto, Proto::Raw(_)) => Err(Errno::EOPNOTSUPP),
-            _ => Err(Errno::ENOPROTOOPT),
+            // An IPv4 socket gives the other levels to `ip_getsockopt` of Linux, which gives
+            // `EOPNOTSUPP`. The level of the transport protocol and IPv6 give `ENOPROTOOPT`.
+            IPPROTO_TCP if self.proto == Proto::Tcp => Err(Errno::ENOPROTOOPT),
+            IPPROTO_UDP if self.proto == Proto::Udp => Err(Errno::ENOPROTOOPT),
+            _ if self.family == AF_INET6 => Err(Errno::ENOPROTOOPT),
+            _ => Err(Errno::EOPNOTSUPP),
         }
     }
 

@@ -44,8 +44,8 @@ use rk_abi::native::tcp::{
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
-    AF_INET, AF_INET6, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_WAITALL, SHUT_RD,
-    SHUT_RDWR, SHUT_WR, SOCK_STREAM,
+    AF_INET, AF_INET6, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB, MSG_PEEK, MSG_WAITALL,
+    SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_STREAM,
 };
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
@@ -143,6 +143,9 @@ struct Inner {
     tos: u8,
     nodelay: bool,
     cork: bool,
+    /// The multicast groups of `MCAST_JOIN_GROUP`: the interface and the group address. A
+    /// socket from `accept` does not copy them, as `inet_csk_clone_lock` of Linux.
+    mc_groups: Vec<(u32, [u8; 4])>,
     quickack: bool,
     /// `TCP_MAXSEG`, or 0.
     maxseg: u32,
@@ -184,6 +187,7 @@ impl Inner {
             tos: 0,
             nodelay: false,
             cork: false,
+            mc_groups: Vec::new(),
             quickack: false,
             maxseg: 0,
             keepidle: super::conn::KEEPIDLE,
@@ -1071,6 +1075,12 @@ impl Socket for Stream {
             let now = stack::now_ms();
             let (tx, r) = {
                 let mut s = self.state.lock();
+                // `MSG_MORE` corks the connection for this send, as `tcp_push` of Linux with
+                // `TCP_NAGLE_CORK`. The next send without it sends the data that waits.
+                let cork = s.cork || flags & MSG_MORE != 0;
+                if let Some(c) = s.conn.as_mut() {
+                    c.cork = cork;
+                }
                 let r = Self::send_step(&mut s, &data[done..], now);
                 (self.collect(&mut s), r)
             };
@@ -1258,7 +1268,10 @@ impl Socket for Stream {
                 }
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
-            _ => Err(Errno::ENOPROTOOPT),
+            // An IPv4 socket gives the other levels to `ip_getsockopt` of Linux, which gives
+            // `EOPNOTSUPP`. IPv6 gives `ENOPROTOOPT`.
+            _ if self.family == AF_INET6 => Err(Errno::ENOPROTOOPT),
+            _ => Err(Errno::EOPNOTSUPP),
         }
     }
 
@@ -1292,6 +1305,18 @@ impl Socket for Stream {
                         }
                     }
                 },
+                IPPROTO_IP if matches!(name, MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP) => {
+                    let (index, group) = group_req(value)?;
+                    let found = s.mc_groups.iter().position(|&g| g == (index, group));
+                    match (name, found) {
+                        (MCAST_JOIN_GROUP, Some(_)) => return Err(Errno::EADDRINUSE),
+                        (MCAST_JOIN_GROUP, None) => s.mc_groups.push((index, group)),
+                        (_, Some(i)) => {
+                            s.mc_groups.remove(i);
+                        }
+                        (_, None) => return Err(Errno::EADDRNOTAVAIL),
+                    }
+                }
                 IPPROTO_IP => {
                     let v = int_of(value)?;
                     match name {
@@ -1464,4 +1489,30 @@ impl Socket for Stream {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// `MCAST_JOIN_GROUP` of `<linux/in.h>`.
+const MCAST_JOIN_GROUP: u32 = 42;
+/// `MCAST_LEAVE_GROUP` of `<linux/in.h>`.
+const MCAST_LEAVE_GROUP: u32 = 45;
+/// The size of `struct group_req`: the interface, a pad and a `struct sockaddr_storage`.
+const GROUP_REQ_SIZE: usize = 136;
+
+/// Reads a `struct group_req` of an IPv4 group: the interface index and the group address, as
+/// `ip_mc_join_group` of Linux. Gives `EINVAL` for a short value or an address that is not a
+/// multicast IPv4 address.
+fn group_req(value: &[u8]) -> Result<(u32, [u8; 4])> {
+    if value.len() < GROUP_REQ_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let index = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+    let family = u16::from_ne_bytes([value[8], value[9]]);
+    if u32::from(family) != AF_INET {
+        return Err(Errno::EINVAL);
+    }
+    let group = [value[12], value[13], value[14], value[15]];
+    if group[0] & 0xf0 != 0xe0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok((index, group))
 }

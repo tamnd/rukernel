@@ -61,3 +61,14 @@ oom04	The test needs a NUMA system with the cpuset controller. rukernel has no N
 oom05	The test needs a NUMA system with the cpuset controller. rukernel has no NUMA (TCONF).
 setns01	The test needs /proc/self/ns/{ipc,mnt,net,pid,user,uts}. rukernel has only /proc/self/ns/cgroup (TCONF).
 setns02	The test needs IPC and UTS name spaces with setns. rukernel does not have them (TCONF).
+gethostbyname_r01	musl gethostbyname_r gives 0 and no ERANGE for a short buffer. The kernel is not part of the call (#378).
+gethostname02	musl gethostname cuts the name to the buffer and gives no ENAMETOOLONG. The kernel is not part of the call (#378).
+lstat03	LTP passes "-b 1024" to mkfs.ext2 as one argument, and BusyBox mkfs.ext2 rejects it (invalid number ' 1024'). The kernel is not part of the failure (#378).
+nftw01	musl nftw differs from glibc in the flags and the errors that the test checks (#378).
+nftw6401	musl nftw differs from glibc in the flags and the errors that the test checks (#378).
+open13	musl fchmod and fchown try /proc/self/fd/N after EBADF, so they succeed on an O_PATH file where the test expects EBADF. The system calls give EBADF (#378).
+pathconf02	musl pathconf does not call the kernel, so it gives no error for a bad path (#378).
+prot_hsymlinks	Needs useradd, which the LTP image does not have (#378).
+readlink03	musl readlink changes a buffer size of 0 to a buffer of 1 byte, so the kernel never sees the size 0 and gives no EINVAL (#378).
+readlinkat02	musl readlinkat changes a buffer size of 0 to a buffer of 1 byte, so the kernel never sees the size 0 and gives no EINVAL (#378).
+stat04	LTP passes "-b 1024" to mkfs.ext2 as one argument, and BusyBox mkfs.ext2 rejects it (invalid number ' 1024'). The kernel is not part of the failure (#378).

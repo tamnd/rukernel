@@ -309,11 +309,12 @@ pub(crate) fn pselect6(
 }
 
 pub(crate) fn pipe2(cx: &Cx<'_>, fds: u64, flags: u64) -> SysResult {
+    use rk_abi::native::open::O_DIRECT;
     let flags = flags as u32;
-    if flags & !(O_CLOEXEC | O_NONBLOCK) != 0 {
+    if flags & !(O_CLOEXEC | O_NONBLOCK | O_DIRECT) != 0 {
         return Err(Errno::EINVAL);
     }
-    let (r, w) = rk_vfs::pipe::pipe(flags & O_NONBLOCK);
+    let (r, w) = rk_vfs::pipe::pipe(flags & (O_NONBLOCK | O_DIRECT));
     let cloexec = flags & O_CLOEXEC != 0;
     let files = cx.files()?;
     let (rfd, wfd) = {

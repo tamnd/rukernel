@@ -243,6 +243,7 @@ impl<'a> Walk<'a> {
         }
         let level = protected::get(&protected::SYMLINKS);
         self.cred.may_follow_link(level, &dir.inode().metadata(), &link.inode().metadata())?;
+        no_symfollow(link)?;
         link.inode().follow_link()
     }
 
@@ -258,6 +259,7 @@ impl<'a> Walk<'a> {
         if self.links > MAX_LINKS {
             return Err(Errno::ELOOP);
         }
+        no_symfollow(link)?;
         let jump = jump?;
         if self.flags & resolve::NO_XDEV != 0 && !Arc::ptr_eq(&jump.mount, &dir.mount) {
             return Err(Errno::EXDEV);
@@ -276,6 +278,7 @@ impl<'a> Walk<'a> {
             if self.flags & resolve::NO_XDEV != 0 {
                 return Err(Errno::EXDEV);
             }
+            mount.enter();
             next = Location { dentry: mount.root().clone(), mount };
         }
         Ok(next)
@@ -334,4 +337,10 @@ impl<'a> Walk<'a> {
         }
         Ok(path)
     }
+}
+
+/// Gives `ELOOP` if the link `link` is on a mount with `MS_NOSYMFOLLOW`, as `pick_link` of Linux.
+fn no_symfollow(link: &Location) -> Result<()> {
+    let nosymfollow = u64::from(rk_abi::native::mount::MS_NOSYMFOLLOW);
+    if link.mount.flags() & nosymfollow != 0 { Err(Errno::ELOOP) } else { Ok(()) }
 }

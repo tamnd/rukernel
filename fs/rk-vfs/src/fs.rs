@@ -272,7 +272,11 @@ impl FsContext {
         } else {
             self.resolve(start, path, follow)?
         };
-        self.open_inode(at, flags, created)
+        let file = self.open_inode(at, flags, created)?;
+        if created {
+            file.set_created();
+        }
+        Ok(file)
     }
 
     /// The check of `fs.protected_regular` and `fs.protected_fifos` for an `open` with
@@ -415,6 +419,13 @@ impl FsContext {
         if !created {
             self.cred.inode_permission(&**at.inode(), open_mask(flags))?;
         }
+        // A mount with `MS_NODEV` does not open a device, as `may_open_dev` of Linux.
+        let nodev = u64::from(rk_abi::native::mount::MS_NODEV);
+        if matches!(kind, FileType::CharDevice | FileType::BlockDevice)
+            && at.mount.flags() & nodev != 0
+        {
+            return Err(Errno::EACCES);
+        }
         // A write of a regular file needs a writable mount, as `mnt_get_write_access` in
         // `do_dentry_open` of Linux.
         if kind == FileType::Regular && write {
@@ -548,14 +559,8 @@ impl FsContext {
 
     /// `linkat`. `old` is the location of the file, after the walk of the old path.
     pub fn link(&self, old: &Location, start: &Location, path: &[u8]) -> Result<()> {
-        let meta = old.inode().metadata();
-        if meta.is_dir() {
-            return Err(Errno::EPERM);
-        }
-        // A file without a link gets one only from `O_TMPFILE`, as `vfs_link` of Linux.
-        if meta.nlink == 0 && !old.dentry.linkable() {
-            return Err(Errno::ENOENT);
-        }
+        // The checks have the order of `do_linkat` and `vfs_link` of Linux: the new name and its
+        // mount first, then the old file.
         let parent = self.parent(start, path)?;
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
@@ -568,6 +573,14 @@ impl FsContext {
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         check_fixed(&**old.inode())?;
+        let meta = old.inode().metadata();
+        if meta.is_dir() {
+            return Err(Errno::EPERM);
+        }
+        // A file without a link gets one only from `O_TMPFILE`, as `vfs_link` of Linux.
+        if meta.nlink == 0 && !old.dentry.linkable() {
+            return Err(Errno::ENOENT);
+        }
         parent.dir.inode().link(&parent.name, old.inode())?;
         old.dentry.clear_linkable();
         parent.dir.dentry.add_child(&parent.name, old.inode().clone());

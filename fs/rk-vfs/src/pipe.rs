@@ -4,6 +4,10 @@
 //! is atomic: it waits until the buffer has space for all of it. A write to a pipe that has no
 //! read end gives `EPIPE`, and the system call layer sends `SIGPIPE`.
 //!
+//! A write end with `O_DIRECT` writes packets, as `pipe2(O_DIRECT)` of Linux: each write of up
+//! to `PIPE_BUF` bytes is one packet, and a read gives at most one packet. A read into a buffer
+//! that is smaller than the packet discards the rest of the packet.
+//!
 //! A named pipe, or FIFO, is a pipe that a file of the type `S_IFIFO` names. Each open of the
 //! file gives an end of one pipe, which lives while one end is open. An open for reading waits
 //! for a writer, and an open for writing waits for a reader, as `fifo_open` of Linux.
@@ -27,6 +31,11 @@ pub const PIPE_SIZE: usize = 65536;
 
 struct State {
     buf: VecDeque<u8>,
+    /// The packets in `buf`, in order, as the position of the first byte and the length. A
+    /// position counts the bytes from the start of the pipe.
+    packets: VecDeque<(u64, usize)>,
+    /// The position of the first byte of `buf`.
+    head: u64,
     /// The capacity in bytes. `F_SETPIPE_SZ` changes it.
     size: usize,
     readers: usize,
@@ -136,10 +145,26 @@ impl FileOps for PipeEnd {
         let n = self.pipe.wait.wait_interruptible(|| {
             let mut s = self.pipe.state.lock();
             if !s.buf.is_empty() {
-                let n = buf.len().min(s.buf.len());
-                for (d, b) in buf.iter_mut().zip(s.buf.drain(..n)) {
+                // A packet at the front gives its bytes and goes away. Other data stops at the
+                // next packet.
+                let (n, drop) = match s.packets.front().copied() {
+                    Some((at, len)) if at == s.head => {
+                        s.packets.pop_front();
+                        (buf.len().min(len), len)
+                    }
+                    Some((at, _)) => {
+                        let n = buf.len().min((at - s.head) as usize);
+                        (n, n)
+                    }
+                    None => {
+                        let n = buf.len().min(s.buf.len());
+                        (n, n)
+                    }
+                };
+                for (d, b) in buf.iter_mut().zip(s.buf.drain(..drop)) {
                     *d = b;
                 }
+                s.head += drop as u64;
                 return Ok(Some(n));
             }
             if s.writers == 0 {
@@ -161,9 +186,13 @@ impl FileOps for PipeEnd {
             return Ok(0);
         }
         let nonblock = file.flags().nonblock();
+        let packet = file.flags().0 & rk_abi::native::open::O_DIRECT != 0;
         let mut done = 0;
         while done < buf.len() {
-            let rest = &buf[done..];
+            let mut rest = &buf[done..];
+            if packet {
+                rest = &rest[..rest.len().min(PIPE_BUF)];
+            }
             let r = self.pipe.wait.wait_interruptible(|| {
                 let mut s = self.pipe.state.lock();
                 if s.readers == 0 {
@@ -174,6 +203,10 @@ impl FileOps for PipeEnd {
                 let need = if rest.len() <= PIPE_BUF { rest.len() } else { 1 };
                 if space >= need {
                     let n = rest.len().min(space);
+                    if packet {
+                        let at = s.head + s.buf.len() as u64;
+                        s.packets.push_back((at, n));
+                    }
                     s.buf.extend(&rest[..n]);
                     return Ok(Some(n));
                 }
@@ -319,13 +352,14 @@ pub fn set_pipe_size(file: &File, size: usize) -> Result<usize> {
 }
 
 /// Makes a pipe, and gives the read end and the write end. `flags` holds `O_NONBLOCK` for both
-/// files.
+/// files, and `O_DIRECT` for the write end, as `create_pipe_files` of Linux.
 pub fn pipe(flags: u32) -> (Arc<File>, Arc<File>) {
-    use rk_abi::native::open::{O_RDONLY, O_WRONLY};
+    use rk_abi::native::open::{O_DIRECT, O_NONBLOCK, O_RDONLY, O_WRONLY};
     let pipe = new_pipe();
     let r = Arc::new(PipeEnd::new(pipe.clone(), true, false, false));
     let w = Arc::new(PipeEnd::new(pipe, false, true, false));
-    (File::with_ops(r, None, O_RDONLY | flags), File::with_ops(w, None, O_WRONLY | flags))
+    let (rflags, wflags) = (flags & O_NONBLOCK, flags & (O_NONBLOCK | O_DIRECT));
+    (File::with_ops(r, None, O_RDONLY | rflags), File::with_ops(w, None, O_WRONLY | wflags))
 }
 
 /// Makes a pipe with no ends.
@@ -334,6 +368,8 @@ fn new_pipe() -> Arc<Pipe> {
     Arc::new(Pipe {
         state: SpinLock::new(State {
             buf: VecDeque::new(),
+            packets: VecDeque::new(),
+            head: 0,
             size: PIPE_SIZE,
             readers: 0,
             writers: 0,
@@ -533,6 +569,23 @@ mod tests {
         assert_eq!(rw.read(&mut buf).unwrap(), 1);
         drop((r, w, rw));
         assert!(FIFOS.lock().values().all(|p| p.strong_count() == 0));
+    }
+
+    #[test]
+    fn a_write_end_with_o_direct_writes_packets() {
+        let (r, w) = pipe(rk_abi::native::open::O_DIRECT);
+        assert_eq!(r.flags().0 & rk_abi::native::open::O_DIRECT, 0);
+        assert_eq!(w.write(b"abc"), Ok(3));
+        assert_eq!(w.write(b"defg"), Ok(4));
+        let mut buf = [0u8; 8];
+        assert_eq!(r.read(&mut buf), Ok(3));
+        assert_eq!(&buf[..3], b"abc");
+        // A small buffer discards the rest of the packet.
+        assert_eq!(r.read(&mut buf[..2]), Ok(2));
+        assert_eq!(&buf[..2], b"de");
+        assert_eq!(w.write(b"hi"), Ok(2));
+        assert_eq!(r.read(&mut buf), Ok(2));
+        assert_eq!(&buf[..2], b"hi");
     }
 
     #[test]

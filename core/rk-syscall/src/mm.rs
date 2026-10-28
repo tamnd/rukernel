@@ -2,10 +2,11 @@
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_abi::native::fcntl::{F_SEAL_FUTURE_WRITE, F_SEAL_WRITE};
 use rk_abi::native::mman::{
     MADV_COLD, MADV_DODUMP, MADV_DOFORK, MADV_DONTDUMP, MADV_DONTFORK, MADV_DONTNEED,
     MADV_DONTNEED_LOCKED, MADV_FREE, MADV_HUGEPAGE, MADV_KEEPONFORK, MADV_MERGEABLE,
@@ -201,6 +202,60 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
         .clone()
 }
 
+/// The token of the shared mappings that can write a file, by the address of the inode. Each
+/// such mapping holds the token, so the file has one while the token lives, as
+/// `i_mmap_writable` of Linux counts them.
+static WRITERS: SpinLock<BTreeMap<usize, Weak<()>>> = SpinLock::new(BTreeMap::new());
+
+/// The pages of a file in a shared mapping that can write it. It holds the token of `WRITERS`.
+struct SharedWrite {
+    pages: Arc<FilePages>,
+    _token: Arc<()>,
+}
+
+impl SharedWrite {
+    fn new(inode: &InodeRef, pages: Arc<FilePages>) -> Self {
+        let key = Arc::as_ptr(inode).cast::<()>() as usize;
+        let mut map = WRITERS.lock();
+        map.retain(|_, token| token.strong_count() > 0);
+        let token = map.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let token = Arc::new(());
+            map.insert(key, Arc::downgrade(&token));
+            token
+        });
+        SharedWrite { pages, _token: token }
+    }
+}
+
+impl MmFile for SharedWrite {
+    fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
+        self.pages.page(index)
+    }
+
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        self.pages.name()
+    }
+
+    fn writes_back(&self) -> bool {
+        self.pages.writes_back()
+    }
+
+    fn dirty(&self, index: u64) {
+        self.pages.dirty(index);
+    }
+
+    fn write_back(&self, first: u64, end: u64) -> Result<(), Errno> {
+        self.pages.write_back(first, end)
+    }
+}
+
+/// Tells if a shared mapping that can write `inode` exists, as `mapping_writably_mapped` of
+/// Linux.
+pub(crate) fn writably_mapped(inode: &InodeRef) -> bool {
+    let key = Arc::as_ptr(inode).cast::<()>() as usize;
+    WRITERS.lock().get(&key).is_some_and(|token| token.strong_count() > 0)
+}
+
 pub(crate) fn mmap(
     cx: &Cx<'_>,
     addr: u64,
@@ -212,7 +267,7 @@ pub(crate) fn mmap(
 ) -> SysResult {
     let flags = flags as u32;
     // Linux looks up the descriptor before it checks the other arguments.
-    let file = if flags & MAP_ANONYMOUS != 0 { None } else { Some(cx.file(fd)?) };
+    let file = if flags & MAP_ANONYMOUS != 0 { None } else { Some(cx.fdget(fd)?) };
     let prot = Prot::from_bits(prot as u32).ok_or(Errno::EINVAL)?;
     let shared = match flags & MAP_TYPE {
         MAP_SHARED => true,
@@ -228,7 +283,7 @@ pub(crate) fn mmap(
     if len == 0 || offset as usize % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
     }
-    let may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
+    let mut may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
     let file = match file {
         None => None,
         Some(file) => {
@@ -240,11 +295,25 @@ pub(crate) fn mmap(
             if shared && prot.write {
                 rk_vfs::swap::check(&**inode)?;
             }
+            // A file with a write seal has no shared mapping that can write, and a shared
+            // mapping that reads cannot become writable, as `memfd_check_seals_mmap` of Linux.
+            let write_seals = (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) as u32;
+            if shared && inode.seals().is_some_and(|seals| seals & write_seals != 0) {
+                if prot.write {
+                    return Err(Errno::EPERM);
+                }
+                may_write = false;
+            }
             match meta.file_type() {
                 Some(rk_vfs::FileType::Regular) => {
                     let path =
                         file.location().map(rk_vfs::Location::absolute_path).unwrap_or_default();
-                    let pages: Arc<dyn MmFile> = file_pages(inode, path);
+                    let pages = file_pages(inode, path);
+                    let pages: Arc<dyn MmFile> = if shared && may_write {
+                        Arc::new(SharedWrite::new(inode, pages))
+                    } else {
+                        pages
+                    };
                     Some((pages, offset))
                 }
                 // A mapping of /dev/zero is anonymous memory, as in Linux.

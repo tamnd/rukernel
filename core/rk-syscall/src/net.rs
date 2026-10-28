@@ -106,6 +106,9 @@ impl PathOps for Paths<'_, '_> {
         let fs = self.cx.fs()?;
         let start = self.cx.dir_start(&fs, AT_FDCWD as u64, path)?;
         let at = fs.resolve(&start, path, true)?;
+        // A connect and a send need a write permission on the socket file, as
+        // `unix_find_bsd` of Linux.
+        fs.permission(&at, rk_vfs::cred::may::WRITE)?;
         if at.inode().metadata().mode & S_IFMT != S_IFSOCK {
             return Err(Errno::ECONNREFUSED);
         }
@@ -113,9 +116,10 @@ impl PathOps for Paths<'_, '_> {
     }
 }
 
-/// The socket of `fd`. Gives `ENOTSOCK` if the file is not a socket.
+/// The socket of `fd`. Gives `ENOTSOCK` if the file is not a socket, and `EBADF` if it is a
+/// file of `O_PATH`, as `sockfd_lookup` of Linux.
 fn socket(cx: &Cx<'_>, fd: u64) -> Result<(Arc<File>, Arc<dyn Socket>), Errno> {
-    let file = cx.file(fd)?;
+    let file = cx.fdget(fd)?;
     let sock = rk_net::socket_of(&file).ok_or(Errno::ENOTSOCK)?;
     Ok((file, sock))
 }
@@ -137,6 +141,14 @@ fn new_socket(
     kind: u32,
     protocol: u64,
 ) -> Result<Arc<dyn Socket>, Errno> {
+    // The checks of the family and the type of `__sock_create` of Linux: `NPROTO` is 46 and
+    // `SOCK_MAX` is 11.
+    if domain >= 46 {
+        return Err(Errno::EAFNOSUPPORT);
+    }
+    if kind >= 11 {
+        return Err(Errno::EINVAL);
+    }
     match u32::try_from(domain).unwrap_or(u32::MAX) {
         AF_UNIX => {
             let protocol = u32::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
@@ -192,8 +204,11 @@ pub(crate) fn socket_call(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64) ->
 
 pub(crate) fn socketpair(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64, sv: u64) -> SysResult {
     let (kind, flags) = split_type(kind)?;
+    // Only a family with a `socketpair` operation makes the pair. The others make the socket
+    // and then give `EOPNOTSUPP`, as `sock_no_socketpair` of Linux.
     if domain != u64::from(AF_UNIX) {
-        return Err(Errno::EAFNOSUPPORT);
+        new_socket(cx, domain, kind, protocol)?;
+        return Err(Errno::EOPNOTSUPP);
     }
     rk_net_unix::check_protocol(u32::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?)?;
     let (a, b) = Unix::pair(kind)?;
@@ -459,6 +474,10 @@ impl MsgHdr {
             w.copy_from_slice(&b[i..i + 8]);
             u64::from_ne_bytes(w)
         };
+        // Too many vectors give `EMSGSIZE`, as `copy_msghdr_from_user` of Linux.
+        if word(24) > MMSG_MAX {
+            return Err(Errno::EMSGSIZE);
+        }
         Ok(Self {
             name: word(0),
             namelen: word(8) as u32,

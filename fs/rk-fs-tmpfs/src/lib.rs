@@ -9,16 +9,23 @@
 
 extern crate alloc;
 
+mod pages;
+
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
+use rk_abi::native::fcntl::{
+    F_SEAL_EXEC, F_SEAL_FUTURE_WRITE, F_SEAL_GROW, F_SEAL_SEAL, F_SEAL_SHRINK, F_SEAL_WRITE,
+};
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::{fileid, mode};
 use rk_vfs::xattr::Xattrs;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec, now};
+
+use pages::{PAGE, Pages, Space};
 
 /// The largest file, as `MAX_LFS_FILESIZE` of Linux on a 64 bit CPU.
 const MAX_FILE_SIZE: u64 = i64::MAX as u64;
@@ -36,6 +43,8 @@ struct Fs {
     /// The file system is read only, after a mount with `MS_RDONLY` or a read only remount. A
     /// change gives `EROFS`.
     read_only: AtomicBool,
+    /// The pages of the regular files, and the limit of the option `size=`.
+    space: Space,
 }
 
 /// The attributes of a node.
@@ -55,7 +64,7 @@ struct Attrs {
 }
 
 enum Data {
-    File(Vec<u8>),
+    File(Pages),
     Dir { entries: BTreeMap<Vec<u8>, Arc<Node>>, parent: Weak<Node> },
     Symlink(Vec<u8>),
     Special,
@@ -69,7 +78,13 @@ struct Node {
     attrs: SpinLock<Attrs>,
     data: SpinLock<Data>,
     xattrs: SpinLock<Xattrs>,
+    /// The seals of `fcntl(F_ADD_SEALS)`. A new node has `F_SEAL_SEAL`, so only `memfd_create`
+    /// with `MFD_ALLOW_SEALING` gives a file that can take seals, as `shmem_get_inode` of Linux.
+    seals: AtomicU32,
 }
+
+/// The seals that stop a change of the data.
+const SEALS_WRITE: u32 = (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) as u32;
 
 /// The magic number of tmpfs, `TMPFS_MAGIC` of `<linux/magic.h>`.
 pub const TMPFS_MAGIC: u64 = 0x0102_1994;
@@ -79,14 +94,25 @@ pub const FS_TYPE: rk_vfs::fstype::FsType =
     rk_vfs::fstype::FsType { name: "tmpfs", nodev: true, make: mount };
 
 /// Makes a new tmpfs for `mount(2)`. The option `mode=` gives the permission bits of the root in
-/// octal. The default is 1777, as Linux gives. A mount with `MS_RDONLY` makes an empty file
-/// system that is read only, as Linux.
+/// octal. The default is 1777, as Linux gives. The option `size=` gives the largest size of the
+/// data, in bytes with an optional suffix `k`, `m` or `g`, and `nr_blocks=` gives it in pages. A
+/// write past it gives `ENOSPC`. A size in percent of the memory has no limit. A mount with
+/// `MS_RDONLY` makes an empty file system that is read only, as Linux.
 pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let perm = match rk_vfs::fstype::option(args.data, b"mode") {
         Some(v) => parse_octal(v).ok_or(Errno::EINVAL)?,
         None => 0o1777,
     };
-    let root = new(perm);
+    let max = match (
+        rk_vfs::fstype::option(args.data, b"size"),
+        rk_vfs::fstype::option(args.data, b"nr_blocks"),
+    ) {
+        (Some(v), _) if v.ends_with(b"%") => u64::MAX,
+        (Some(v), _) => parse_size(v).ok_or(Errno::EINVAL)?.div_ceil(PAGE),
+        (None, Some(v)) => parse_size(v).ok_or(Errno::EINVAL)?,
+        (None, None) => u64::MAX,
+    };
+    let root = make(perm, max);
     root.set_read_only(args.read_only)?;
     Ok(root)
 }
@@ -112,6 +138,29 @@ fn mount_devtmpfs(_args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     Ok(root)
 }
 
+/// Parses a number with an optional suffix `k`, `m`, `g`, `t`, `p` or `e`, as `memparse` of
+/// Linux.
+fn parse_size(v: &[u8]) -> Option<u64> {
+    let digits = v.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let n = v[..digits]
+        .iter()
+        .try_fold(0u64, |n, &b| n.checked_mul(10)?.checked_add(u64::from(b - b'0')))?;
+    let shift = match &v[digits..] {
+        b"" => 0,
+        b"k" | b"K" => 10,
+        b"m" | b"M" => 20,
+        b"g" | b"G" => 30,
+        b"t" | b"T" => 40,
+        b"p" | b"P" => 50,
+        b"e" | b"E" => 60,
+        _ => return None,
+    };
+    n.checked_mul(1 << shift)
+}
+
 fn parse_octal(v: &[u8]) -> Option<u32> {
     if v.is_empty() || v.len() > 6 {
         return None;
@@ -121,11 +170,17 @@ fn parse_octal(v: &[u8]) -> Option<u32> {
 
 /// Makes a new tmpfs and gives its root directory, with the permission bits `perm`.
 pub fn new(perm: u32) -> InodeRef {
+    make(perm, u64::MAX)
+}
+
+/// Makes a new tmpfs with the permission bits `perm` on the root, and at most `max` pages of data.
+fn make(perm: u32, max: u64) -> Arc<Node> {
     let fs = Arc::new(Fs {
         dev: rk_vfs::anon_dev(),
         next_ino: AtomicU64::new(1),
         nodes: SpinLock::new(BTreeMap::new()),
         read_only: AtomicBool::new(false),
+        space: Space::new(max),
     });
     let root = Node::new(&fs, mode::S_IFDIR | (perm & mode::PERM_MASK), 0, Weak::new());
     root.attrs.lock().nlink = 2;
@@ -136,7 +191,7 @@ impl Node {
     fn new(fs: &Arc<Fs>, mode: u32, rdev: u64, parent: Weak<Node>) -> Arc<Node> {
         let t = now();
         let data = match FileType::from_mode(mode) {
-            Some(FileType::Regular) => Data::File(Vec::new()),
+            Some(FileType::Regular) => Data::File(Pages::default()),
             Some(FileType::Directory) => Data::Dir { entries: BTreeMap::new(), parent },
             Some(FileType::Symlink) => Data::Symlink(Vec::new()),
             _ => Data::Special,
@@ -161,6 +216,7 @@ impl Node {
             }),
             data: SpinLock::new(data),
             xattrs: SpinLock::new(Xattrs::new()),
+            seals: AtomicU32::new(F_SEAL_SEAL as u32),
         });
         fs.nodes.lock().insert(ino, Arc::downgrade(&node));
         node
@@ -302,15 +358,19 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.fs.nodes.lock().remove(&self.ino);
+        if let Data::File(d) = &mut *self.data.lock() {
+            d.free(&self.fs.space);
+        }
     }
 }
 
 impl Inode for Node {
     fn metadata(&self) -> Metadata {
-        let size = match &*self.data.lock() {
-            Data::File(d) | Data::Symlink(d) => d.len() as u64,
-            Data::Dir { .. } => u64::from(BLOCK_SIZE),
-            Data::Special => 0,
+        let (size, blocks) = match &*self.data.lock() {
+            Data::File(d) => (d.len(), d.count() * (PAGE / 512)),
+            Data::Symlink(d) => (d.len() as u64, (d.len() as u64).div_ceil(512)),
+            Data::Dir { .. } => (u64::from(BLOCK_SIZE), u64::from(BLOCK_SIZE) / 512),
+            Data::Special => (0, 0),
         };
         let a = self.attrs.lock();
         Metadata {
@@ -323,7 +383,7 @@ impl Inode for Node {
             rdev: a.rdev,
             size,
             blksize: BLOCK_SIZE,
-            blocks: size.div_ceil(512),
+            blocks,
             atime: a.atime,
             mtime: a.mtime,
             ctime: a.ctime,
@@ -333,12 +393,28 @@ impl Inode for Node {
 
     fn set_attr(&self, attr: &SetAttr) -> Result<()> {
         self.check_rw()?;
+        // The checks of the seals in `shmem_setattr` of Linux.
+        let seals = self.seals.load(Ordering::Acquire);
+        if let Some(perm) = attr.mode
+            && seals & F_SEAL_EXEC as u32 != 0
+            && (self.attrs.lock().mode ^ perm) & 0o111 != 0
+        {
+            return Err(Errno::EPERM);
+        }
         if let Some(size) = attr.size {
             if size > MAX_FILE_SIZE {
                 return Err(Errno::EFBIG);
             }
             match &mut *self.data.lock() {
-                Data::File(d) => d.resize(usize::try_from(size).map_err(|_| Errno::EFBIG)?, 0),
+                Data::File(d) => {
+                    let old = d.len();
+                    if (size < old && seals & F_SEAL_SHRINK as u32 != 0)
+                        || (size > old && seals & F_SEAL_GROW as u32 != 0)
+                    {
+                        return Err(Errno::EPERM);
+                    }
+                    d.set_len(&self.fs.space, size);
+                }
                 Data::Dir { .. } => return Err(Errno::EISDIR),
                 _ => return Err(Errno::EINVAL),
             }
@@ -374,12 +450,7 @@ impl Inode for Node {
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         match &*self.data.lock() {
-            Data::File(d) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(d.len());
-                let n = buf.len().min(d.len() - start);
-                buf[..n].copy_from_slice(&d[start..start + n]);
-                Ok(n)
-            }
+            Data::File(d) => Ok(d.read(offset, buf)),
             Data::Dir { .. } => Err(Errno::EISDIR),
             _ => Err(Errno::EINVAL),
         }
@@ -391,21 +462,20 @@ impl Inode for Node {
         if end > MAX_FILE_SIZE {
             return Err(Errno::EFBIG);
         }
-        let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-        let end = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
-        match &mut *self.data.lock() {
+        let n = match &mut *self.data.lock() {
             Data::File(d) => {
-                if d.len() < end {
-                    d.try_reserve(end - d.len()).map_err(|_| Errno::ENOSPC)?;
-                    d.resize(end, 0);
+                // The checks of the seals in `shmem_write_begin` of Linux.
+                let seals = self.seals.load(Ordering::Acquire);
+                if seals & SEALS_WRITE != 0 || (seals & F_SEAL_GROW as u32 != 0 && end > d.len()) {
+                    return Err(Errno::EPERM);
                 }
-                d[start..end].copy_from_slice(buf);
+                d.write(&self.fs.space, offset, buf)?
             }
             Data::Dir { .. } => return Err(Errno::EISDIR),
             _ => return Err(Errno::EINVAL),
-        }
+        };
         self.touch();
-        Ok(buf.len())
+        Ok(n)
     }
 
     fn attr_flags(&self) -> Result<u32> {
@@ -427,27 +497,34 @@ impl Inode for Node {
 
     fn fallocate(&self, mode: u32, offset: u64, len: u64) -> Result<()> {
         self.check_rw()?;
-        use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE};
+        use rk_vfs::inode::falloc::{KEEP_SIZE, PUNCH_HOLE};
         let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
         if end > MAX_FILE_SIZE {
             return Err(Errno::EFBIG);
         }
-        let start = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
-        let end = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
-        // The data is in one buffer, so a range has no blocks of its own to give or to free.
+        // tmpfs has no other mode, as `shmem_fallocate` of Linux.
+        if mode & !(KEEP_SIZE | PUNCH_HOLE) != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let start = offset;
         match &mut *self.data.lock() {
             Data::File(d) => {
-                if mode & (PUNCH_HOLE | ZERO_RANGE) != 0 {
-                    let stop = end.min(d.len());
-                    if start < stop {
-                        d[start..stop].fill(0);
+                // The checks of the seals in `shmem_fallocate` of Linux.
+                let seals = self.seals.load(Ordering::Acquire);
+                if mode & PUNCH_HOLE != 0 {
+                    if seals & SEALS_WRITE != 0 {
+                        return Err(Errno::EPERM);
                     }
-                } else if mode & !KEEP_SIZE != 0 {
-                    return Err(Errno::EOPNOTSUPP);
+                } else if seals & F_SEAL_GROW as u32 != 0 && end > d.len() {
+                    return Err(Errno::EPERM);
                 }
-                if mode & KEEP_SIZE == 0 && d.len() < end {
-                    d.try_reserve(end - d.len()).map_err(|_| Errno::ENOSPC)?;
-                    d.resize(end, 0);
+                if mode & PUNCH_HOLE != 0 {
+                    d.clear(&self.fs.space, start, end);
+                } else {
+                    d.allocate(&self.fs.space, start, end)?;
+                    if mode & KEEP_SIZE == 0 && d.len() < end {
+                        d.set_len(&self.fs.space, end);
+                    }
                 }
             }
             Data::Dir { .. } => return Err(Errno::EISDIR),
@@ -603,6 +680,42 @@ impl Inode for Node {
 
     fn fs_id(&self) -> u64 {
         self.fs.dev
+    }
+
+    fn seek_hole_data(&self, at: u64, data: bool) -> Result<u64> {
+        match &*self.data.lock() {
+            Data::File(d) => d.seek(at, data).ok_or(Errno::ENXIO),
+            _ => Err(Errno::EOPNOTSUPP),
+        }
+    }
+
+    /// The counts of a tmpfs with the option `size=`. Without a limit, the counts are 0, as for a
+    /// file system with no blocks.
+    fn fs_stat(&self) -> Option<rk_vfs::inode::FsStat> {
+        let max = self.fs.space.max();
+        (max != u64::MAX).then(|| {
+            let free = max.saturating_sub(self.fs.space.used());
+            rk_vfs::inode::FsStat {
+                bsize: PAGE,
+                blocks: max,
+                bfree: free,
+                bavail: free,
+                files: 0,
+                ffree: 0,
+            }
+        })
+    }
+
+    fn seals(&self) -> Option<u32> {
+        matches!(*self.data.lock(), Data::File(_)).then(|| self.seals.load(Ordering::Acquire))
+    }
+
+    fn set_seals(&self, seals: u32) -> Result<()> {
+        if !matches!(*self.data.lock(), Data::File(_)) {
+            return Err(Errno::EINVAL);
+        }
+        self.seals.store(seals, Ordering::Release);
+        Ok(())
     }
 
     /// Makes the file system read only or writable again, for a remount, as `shmem_reconfigure`

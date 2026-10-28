@@ -216,9 +216,18 @@ pub(crate) fn copy_file_range(
     let out_pos = offset_at(cx, out_off)?;
     let in_start = in_pos.unwrap_or_else(|| input.pos());
     let out_start = out_pos.unwrap_or_else(|| output.pos());
-    if in_start.checked_add(len).is_none_or(|e| e > i64::MAX as u64)
-        || out_start.checked_add(len).is_none_or(|e| e > i64::MAX as u64)
-    {
+    // `generic_copy_file_checks` of Linux: the offsets must not wrap. Then the copy stops at the
+    // end of the input, and a start at the largest file size gives `EFBIG`.
+    if in_start.checked_add(len).is_none() || out_start.checked_add(len).is_none() {
+        return Err(Errno::EOVERFLOW);
+    }
+    let max = i64::MAX as u64;
+    let len = len.min(in_meta.size.saturating_sub(in_start));
+    if out_start >= max {
+        return Err(Errno::EFBIG);
+    }
+    let len = len.min(max - out_start);
+    if in_start.checked_add(len).is_none_or(|e| e > max) {
         return Err(Errno::EOVERFLOW);
     }
     // The two ranges of one file must not overlap.
