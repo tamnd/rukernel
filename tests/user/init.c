@@ -1031,7 +1031,20 @@ static void test_stop(void)
 	      WIFCONTINUED(st));
 	check("the parent gets SIGCHLD with CLD_CONTINUED", sigtimedwait(&set, &si, &wait_time) == SIGCHLD &&
 	      si.si_code == CLD_CONTINUED && si.si_status == SIGCONT);
-	usleep(50 * 1000);
+	/* The thread of the child runs again at once. A fixed sleep is not a good test: on a busy
+	 * host, the host can stop the virtual CPU for longer than the sleep, and then the timer of
+	 * the sleep is due before the thread runs one instruction. Thus the parent waits up to 2 s for
+	 * a change, and tells the time when it is long. */
+	struct timespec cont, now;
+	clock_gettime(CLOCK_MONOTONIC, &cont);
+	long cont_ms = 0;
+	while (*stop_counter == count && cont_ms < 2000) {
+		usleep(1000);
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		cont_ms = (timespec_ns(&now) - timespec_ns(&cont)) / 1000000;
+	}
+	if (cont_ms >= 50)
+		printf("init: the threads ran again after %ld ms\n", cont_ms);
 	check("the threads run again", *stop_counter != count);
 
 	memset(&si, 0xff, sizeof(si));

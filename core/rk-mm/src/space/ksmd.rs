@@ -331,7 +331,7 @@ pub(super) fn exit(vm: &AddressSpace) {
 ///
 /// `ENOMEM` if no frame is free for a copy of a KSM page.
 pub fn madvise(vm: &Arc<AddressSpace>, start: usize, end: usize, merge: bool) -> Result<(), Errno> {
-    vm.state.lock().vmas.update_range(start, end, |v| {
+    vm.state.lock().vmas.update_range_merged(start, end, |v| {
         if !v.shared && !v.hugetlb {
             v.mergeable = merge;
         }
@@ -359,7 +359,7 @@ pub fn set_merge_any(vm: &Arc<AddressSpace>, on: bool) -> Result<(), Errno> {
     if !vm.ksm.merge_any.swap(false, Ordering::Relaxed) {
         return Ok(());
     }
-    vm.state.lock().vmas.update_range(0, rk_frame::vm::USER_END, |v| v.mergeable = false);
+    vm.state.lock().vmas.update_range_merged(0, rk_frame::vm::USER_END, |v| v.mergeable = false);
     unmerge(vm, 0, usize::MAX)
 }
 

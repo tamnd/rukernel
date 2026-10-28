@@ -11,7 +11,8 @@
 
 use super::{
     Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, STACK_GUARD_GAP,
-    STACK_SIZE, SharedAnon, State, charge_commit, page_prot, uncharge_commit, write_back,
+    STACK_SIZE, SharedAnon, State, charge_commit, map_error, page_prot, uncharge_commit,
+    write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
 use crate::pttree::{RangeLock, TREE_END, Tree};
@@ -21,10 +22,11 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
-use rk_frame::vm::{HUGE_PAGE_SIZE, USER_END};
+use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, USER_END};
 
 /// The status of a page: the area that mapped it. The start and the file offset of the area give
 /// the offset of each page. The end has no meaning, because a later call can change a part of
@@ -32,33 +34,10 @@ use rk_frame::vm::{HUGE_PAGE_SIZE, USER_END};
 pub(super) type Status = Arc<Vma<FileRef>>;
 
 /// Tells if two statuses are the same area, so that two runs of pages next to each other with
-/// them are one area. The attributes are the same, and a file has the same offset for each page.
-/// These are the merge rules of `vma_merge` in Linux.
-fn same_area(a: &Vma<FileRef>, b: &Vma<FileRef>) -> bool {
-    let backing = match (&a.backing, &b.backing) {
-        (Backing::Anon, Backing::Anon) => true,
-        (Backing::File { file: f, offset: x }, Backing::File { file: g, offset: y }) => {
-            Arc::ptr_eq(f, g) && x.wrapping_sub(a.start as u64) == y.wrapping_sub(b.start as u64)
-        }
-        _ => false,
-    };
-    backing
-        && a.prot == b.prot
-        && a.shared == b.shared
-        && a.may_write == b.may_write
-        && a.locked == b.locked
-        && a.grows_down == b.grows_down
-        && a.mergeable == b.mergeable
-        && a.huge == b.huge
-        && a.account == b.account
-        && a.hugetlb == b.hugetlb
-        && a.dont_fork == b.dont_fork
-        && a.wipe_on_fork == b.wipe_on_fork
-        && a.kind == b.kind
-}
-
+/// them are one area. These are the merge rules of `vma_merge` in Linux, as the VMA backend uses
+/// them.
 fn same_status(a: &Status, b: &Status) -> bool {
-    Arc::ptr_eq(a, b) || same_area(a, b)
+    Arc::ptr_eq(a, b) || a.can_merge(b)
 }
 
 /// The area of the status `s` for the pages in `start..end`.
@@ -84,6 +63,26 @@ fn views(range: &RangeLock<Status>, start: usize, end: usize) -> Vec<Vma<FileRef
 fn area_at(range: &RangeLock<Status>, addr: usize) -> Option<Vma<FileRef>> {
     let (a, b, s) = range.run_at(addr, same_status)?;
     Some(view(&s, a, b))
+}
+
+/// The number of areas in a list of areas in address order: a run of areas that touch and can
+/// merge is one area, as in the tree.
+fn area_count<'a>(areas: impl Iterator<Item = &'a Vma<FileRef>>) -> usize {
+    let mut last: Option<&Vma<FileRef>> = None;
+    let mut n = 0;
+    for v in areas {
+        if !last.is_some_and(|l| l.end == v.start && l.can_merge(v)) {
+            n += 1;
+        }
+        last = Some(v);
+    }
+    n
+}
+
+/// The range of the lock of a change of `start..end`: one page more on each side, if the tree
+/// has it, so that the change can count the areas that it joins or splits.
+fn window(start: usize, end: usize) -> (usize, usize) {
+    (start.saturating_sub(PAGE_SIZE), (end + PAGE_SIZE).min(TREE_END))
 }
 
 /// A range in the set of reserved ranges. Only its range has a meaning.
@@ -118,6 +117,10 @@ pub(super) struct Corten {
     /// The guard pages of `MADV_GUARD_INSTALL`. A call holds this lock only for a short time, and
     /// takes no other lock while it holds it.
     guards: SpinLock<BTreeSet<usize>>,
+    /// The number of areas, as `map_count` of Linux. A change of a range locks one page more on
+    /// each side, so it sees each area that it joins or splits, and two changes that can change
+    /// the count of one area do not run at the same time.
+    count: AtomicUsize,
 }
 
 impl Corten {
@@ -128,9 +131,29 @@ impl Corten {
             va: SpinLock::new(VmaSet::new()),
             meta: SpinLock::new(Meta { brk_start: 0, brk: 0, lock_future: false }),
             guards: SpinLock::new(BTreeSet::new()),
+            count: AtomicUsize::new(0),
         };
         *c.lock() = st;
         c
+    }
+
+    /// Sets the status of `start..end` in `range`, and changes the count of areas. `range` locks
+    /// the [`window`] of the range.
+    fn set(&self, range: &mut RangeLock<Status>, start: usize, end: usize, status: Option<Status>) {
+        let (lo, hi) = window(start, end);
+        let before = range.runs(lo, hi, same_status).len();
+        range.set(start, end, status);
+        let after = range.runs(lo, hi, same_status).len();
+        if after >= before {
+            self.count.fetch_add(after - before, Ordering::Relaxed);
+        } else {
+            self.count.fetch_sub(before - after, Ordering::Relaxed);
+        }
+    }
+
+    /// The number of areas.
+    fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Locks the whole address space, and gives its areas.
@@ -138,7 +161,7 @@ impl Corten {
         let meta = self.meta.lock();
         let range = self.tree.lock(0, TREE_END);
         let va = self.va.lock();
-        Whole::new(range, meta, va, &self.guards)
+        Whole::new(range, meta, va, &self.guards, &self.count)
     }
 
     /// Locks the whole address space if no other call holds a part of it.
@@ -146,7 +169,7 @@ impl Corten {
         let meta = self.meta.try_lock()?;
         let range = self.tree.try_lock_all()?;
         let va = self.va.try_lock()?;
-        Some(Whole::new(range, meta, va, &self.guards))
+        Some(Whole::new(range, meta, va, &self.guards, &self.count))
     }
 }
 
@@ -157,6 +180,7 @@ pub(super) struct Whole<'a> {
     meta: SpinLockGuard<'a, Meta>,
     va: SpinLockGuard<'a, VmaSet<FileRef>>,
     guards: &'a SpinLock<BTreeSet<usize>>,
+    count: &'a AtomicUsize,
     /// The areas before the changes.
     old: Vec<Vma<FileRef>>,
     state: State,
@@ -169,6 +193,7 @@ impl<'a> Whole<'a> {
         meta: SpinLockGuard<'a, Meta>,
         va: SpinLockGuard<'a, VmaSet<FileRef>>,
         guards: &'a SpinLock<BTreeSet<usize>>,
+        count: &'a AtomicUsize,
     ) -> Self {
         let old = views(&range, 0, TREE_END);
         let mut vmas = VmaSet::new();
@@ -182,7 +207,7 @@ impl<'a> Whole<'a> {
             lock_future: meta.lock_future,
             guards: guards.lock().clone(),
         };
-        Self { range, meta, va, guards, old, state, changed: false }
+        Self { range, meta, va, guards, count, old, state, changed: false }
     }
 }
 
@@ -210,8 +235,9 @@ impl Drop for Whole<'_> {
         self.meta.lock_future = self.state.lock_future;
         self.guards.lock().clone_from(&self.state.guards);
         let new: Vec<Vma<FileRef>> = self.state.vmas.iter().cloned().collect();
+        self.count.store(area_count(new.iter()), Ordering::Relaxed);
         let same = |a: &Vma<FileRef>, b: &Vma<FileRef>| {
-            a.start == b.start && a.end == b.end && same_area(a, b)
+            a.start == b.start && a.end == b.end && a.same_mapping(b)
         };
         // Write only the range from the first area that changed to the last one.
         let n = self.old.len().min(new.len());
@@ -240,6 +266,86 @@ impl Drop for Whole<'_> {
 }
 
 impl AddressSpace {
+    /// `fork` with a walk of the tree. The child gets a copy of the tree, as `dup_mmap` in
+    /// kernel/fork.c of Linux copies the areas, and no call makes the list of areas.
+    pub(super) fn corten_fork(&self) -> Result<Self, Errno> {
+        let meta = self.state.meta.lock();
+        let all = self.state.tree.lock(0, TREE_END);
+        let runs = all.runs(0, TREE_END, same_status);
+        // An area of `MADV_DONTFORK` does not go to the child, and an area of `MADV_WIPEONFORK`
+        // goes without its pages.
+        let copied = |s: &Status| !s.dont_fork && !s.wipe_on_fork;
+        let areas: Vec<ForkArea> = runs
+            .iter()
+            .filter(|r| copied(&r.2))
+            .map(|r| ForkArea { start: r.0, end: r.1, shared: r.2.shared })
+            .collect();
+        let vm = self.vm.fork(&areas).map_err(map_error)?;
+        // The private areas of the child go in the commit count. The memory of a shared area is
+        // in the count one time.
+        let charge = runs.iter().filter(|r| r.2.account && !r.2.shared && !r.2.dont_fork);
+        charge_commit(charge.map(|r| r.1 - r.0).sum())?;
+        // The child does not get the locks of the parent, as on Linux. Each status of the parent
+        // gives one status of the child, so the pages of an area keep one status.
+        let mut copies: BTreeMap<usize, Option<Status>> = BTreeMap::new();
+        // The slots of a node often hold the same status, so the last copy comes first.
+        let mut recent: Option<(usize, Option<Status>)> = None;
+        let mut map = |s: &Status| {
+            let key = Arc::as_ptr(s) as usize;
+            if let Some((k, copy)) = &recent
+                && *k == key
+            {
+                return copy.clone();
+            }
+            let copy = copies.entry(key).or_insert_with(|| {
+                (!s.dont_fork).then(|| {
+                    let mut v = Vma::clone(s);
+                    v.locked = false;
+                    v.account &= !v.shared;
+                    Arc::new(v)
+                })
+            });
+            recent = Some((key, copy.clone()));
+            copy.clone()
+        };
+        let tree = Tree::fork(&all, &mut map);
+        let mut va = VmaSet::new();
+        let mut count = 0;
+        let mut last: Option<(usize, Status)> = None;
+        for (start, end, s) in &runs {
+            let Some(s) = map(s) else { continue };
+            va.insert_merged(placeholder(*start, *end));
+            if !last.as_ref().is_some_and(|(e, l)| e == start && same_status(l, &s)) {
+                count += 1;
+            }
+            last = Some((*end, s));
+        }
+        // The guard pages of the areas with their pages go to the child, as the guard markers
+        // that `copy_page_range` of Linux copies.
+        let guards: BTreeSet<usize> = {
+            let guards = self.state.guards.lock();
+            let keep = |g: &&usize| {
+                let i = runs.partition_point(|r| r.1 <= **g);
+                runs.get(i).is_some_and(|r| r.0 <= **g && copied(&r.2))
+            };
+            guards.iter().filter(keep).copied().collect()
+        };
+        let state = Corten {
+            tree,
+            va: SpinLock::new(va),
+            meta: SpinLock::new(Meta {
+                brk_start: meta.brk_start,
+                brk: meta.brk,
+                lock_future: false,
+            }),
+            guards: SpinLock::new(guards),
+            count: AtomicUsize::new(count),
+        };
+        drop(all);
+        drop(meta);
+        Ok(Self::with_state(vm, state))
+    }
+
     /// Handles a page fault at `addr` with the lock of the node of its 2 MiB block.
     pub(super) fn corten_fault(&self, addr: usize, access: Access) -> Result<(), Errno> {
         let page = addr & !(PAGE_SIZE - 1);
@@ -275,7 +381,8 @@ impl AddressSpace {
         area_at(&self.state.tree.lock(page, page + PAGE_SIZE), page)
     }
 
-    /// Removes the pages of `start..end` in a locked range, as `unmap_locked`.
+    /// Removes the pages of `start..end` in a locked range, as `unmap_locked`. The range locks the
+    /// [`window`] of `start..end`.
     fn clear_locked(&self, range: &mut RangeLock<Status>, start: usize, end: usize) {
         // The guard pages of the range go with it, as on Linux.
         {
@@ -296,7 +403,7 @@ impl AddressSpace {
             // munmap has no error for a failed write back, as on Linux.
             let _ = write_back(&vma, vma.start, vma.end);
         }
-        range.set(start, end, None);
+        self.state.set(range, start, end, None);
         self.state.va.lock().remove_range(start, end);
     }
 
@@ -324,10 +431,10 @@ impl AddressSpace {
             let start = if fixed {
                 req.addr
             } else {
-                let mut va = self.state.va.lock();
-                if va.len() > tunables::max_map_count() {
+                if self.state.count() > tunables::max_map_count() {
                     return Err(Errno::ENOMEM);
                 }
+                let mut va = self.state.va.lock();
                 let (bottom, top) =
                     if req.low32 { LOW32 } else { (MMAP_MIN_ADDR, self.mmap_top()) };
                 let hint = req.addr & !(PAGE_SIZE - 1);
@@ -342,7 +449,8 @@ impl AddressSpace {
                 start
             };
             let end = start + len;
-            let mut range = self.state.tree.lock(start, end);
+            let (lo, hi) = window(start, end);
+            let mut range = self.state.tree.lock(lo, hi);
             if range.any(start, end) {
                 if req.noreplace {
                     return Err(Errno::EEXIST);
@@ -360,7 +468,7 @@ impl AddressSpace {
                 }
                 self.clear_locked(&mut range, start, end);
             }
-            if fixed && self.state.va.lock().len() > tunables::max_map_count() {
+            if fixed && self.state.count() > tunables::max_map_count() {
                 return Err(Errno::ENOMEM);
             }
             let no_file = req.file.is_none();
@@ -399,7 +507,7 @@ impl AddressSpace {
                 dont_fork: false,
                 wipe_on_fork: false,
             };
-            range.set(start, end, Some(Arc::new(vma)));
+            self.state.set(&mut range, start, end, Some(Arc::new(vma)));
             reserve(&mut self.state.va.lock(), start, end);
             drop(range);
             if req.populate || locked {
@@ -412,9 +520,20 @@ impl AddressSpace {
 
     /// `munmap` of the page aligned range `start..end`.
     pub(super) fn corten_munmap(&self, start: usize, end: usize) -> Result<(), Errno> {
-        let mut range = self.state.tree.lock(start, (end + PAGE_SIZE).min(TREE_END));
+        let (lo, hi) = window(start, end);
+        let mut range = self.state.tree.lock(lo, hi);
         if Self::corten_splits_huge(&range, start, end) {
             return Err(Errno::EINVAL);
+        }
+        // The unmap of the middle of an area makes one area more. Linux lets the count go above
+        // `max_map_count` for a short time only, so it gives `ENOMEM` here, as
+        // `do_vmi_align_munmap` in mm/vma.c.
+        if lo < start
+            && end < hi
+            && self.state.count() >= tunables::max_map_count()
+            && matches!(&range.runs(lo, hi, same_status)[..], [(a, b, _)] if *a == lo && *b == hi)
+        {
+            return Err(Errno::ENOMEM);
         }
         self.clear_locked(&mut range, start, end);
         Ok(())
@@ -427,7 +546,8 @@ impl AddressSpace {
         end: usize,
         prot: Prot,
     ) -> Result<(), Errno> {
-        let mut range = self.state.tree.lock(start, (end + PAGE_SIZE).min(TREE_END));
+        let (lo, hi) = window(start, end);
+        let mut range = self.state.tree.lock(lo, hi);
         let old = views(&range, start, end);
         let mut at = start;
         for v in &old {
@@ -454,7 +574,7 @@ impl AddressSpace {
         for mut vma in old {
             vma.prot = prot;
             vma.account |= prot.write && !vma.shared && !vma.hugetlb;
-            range.set(vma.start, vma.end, Some(Arc::new(vma.clone())));
+            self.state.set(&mut range, vma.start, vma.end, Some(Arc::new(vma.clone())));
             let mut next = 0;
             for page in self.vm.mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end)) {
                 let a = page.get();
@@ -490,17 +610,19 @@ impl AddressSpace {
             return meta.brk;
         }
         if new_end > old_end {
-            let mut range = self.state.tree.lock(old_end, new_end);
+            let (lo, hi) = window(old_end, new_end);
+            let mut range = self.state.tree.lock(lo, hi);
             if range.any(old_end, new_end) || charge_commit(new_end - old_end).is_err() {
                 return meta.brk;
             }
             let mut vma = Vma::anon(old_end, new_end, Prot::RW, VmaKind::Heap);
             vma.locked = meta.lock_future;
             vma.account = true;
-            range.set(old_end, new_end, Some(Arc::new(vma)));
+            self.state.set(&mut range, old_end, new_end, Some(Arc::new(vma)));
             reserve(&mut self.state.va.lock(), old_end, new_end);
         } else if new_end < old_end {
-            let mut range = self.state.tree.lock(new_end, old_end);
+            let (lo, hi) = window(new_end, old_end);
+            let mut range = self.state.tree.lock(lo, hi);
             self.clear_locked(&mut range, new_end, old_end);
         }
         meta.brk = addr;

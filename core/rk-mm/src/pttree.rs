@@ -18,12 +18,18 @@
 //! on another 2 MiB block. A walk locks a node on the way only to make a missing child. A node
 //! that a holder removes from the tree is dead, and a walk that locks a dead node starts again.
 //!
+//! An empty node leaves the tree, as an empty page table page of Linux goes in `free_pgtables`.
+//! A `set` that empties a child below the top of its lock removes the child at once. When a lock
+//! drops and its top node is empty, it locks the parent and removes the node, and then the parent
+//! if it is empty too. The nodes that a walk makes and that stay empty go in the same way.
+//!
 //! The protocol has no deadlock. An operation waits for a node only when it holds no node, or
 //! when it holds an ancestor of the node, so each chain of waits goes down the tree. A node that a
 //! holder makes is locked before other operations can see it.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::{Index, IndexMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 use rk_frame::sync::SpinLock;
 
@@ -61,6 +67,47 @@ impl<S: Clone> Slot<S> {
     }
 }
 
+/// The slots in one chunk of [`Slots`].
+const CHUNK: usize = 128;
+
+/// The slots of a node, in chunks of [`CHUNK`] slots. A chunk is 2 KiB, a small allocation of the
+/// kernel heap. An allocation of more than 2 KiB maps pages of the heap, and its free sends a TLB
+/// shootdown to each CPU. With one allocation of 8 KiB for each node, `fork` and `exit` made and
+/// freed about 20 such allocations, and the shootdowns were most of their time.
+struct Slots<S>([Vec<Slot<S>>; FANOUT / CHUNK]);
+
+const _: () = assert!(CHUNK * size_of::<Slot<Arc<()>>>() <= 2048);
+
+impl<S> Slots<S> {
+    /// Gives the slots in order.
+    fn iter(&self) -> impl Iterator<Item = &Slot<S>> {
+        self.0.iter().flatten()
+    }
+
+    /// Gives the slots in order, to change them.
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Slot<S>> {
+        self.0.iter_mut().flatten()
+    }
+
+    /// Gives the slots from `first` to `last`, both included.
+    fn range(&self, first: usize, last: usize) -> impl Iterator<Item = &Slot<S>> {
+        self.iter().skip(first).take(last + 1 - first)
+    }
+}
+
+impl<S> Index<usize> for Slots<S> {
+    type Output = Slot<S>;
+    fn index(&self, i: usize) -> &Slot<S> {
+        &self.0[i / CHUNK][i % CHUNK]
+    }
+}
+
+impl<S> IndexMut<usize> for Slots<S> {
+    fn index_mut(&mut self, i: usize) -> &mut Slot<S> {
+        &mut self.0[i / CHUNK][i % CHUNK]
+    }
+}
+
 /// One node of the tree.
 struct Node<S> {
     level: u32,
@@ -72,13 +119,13 @@ struct Node<S> {
     dead: AtomicBool,
     /// The slots. A walk reads them with no `busy`, so the spin lock gives safe access. It is held
     /// only for a short time.
-    slots: SpinLock<Vec<Slot<S>>>,
+    slots: SpinLock<Slots<S>>,
 }
 
 impl<S: Clone> Node<S> {
     /// Makes a node with each slot a copy of `fill`. The caller holds the new node.
     fn new_held(level: u32, base: usize, fill: &Slot<S>) -> Self {
-        let slots = (0..FANOUT).map(|_| fill.leaf_copy()).collect();
+        let slots = Slots(core::array::from_fn(|_| (0..CHUNK).map(|_| fill.leaf_copy()).collect()));
         Self {
             level,
             base,
@@ -130,6 +177,11 @@ impl<S> Node<S> {
         }
     }
 
+    /// Tells if no slot of the node has a status or a child.
+    fn is_empty(&self) -> bool {
+        self.slots.lock().iter().all(|s| matches!(s, Slot::Empty))
+    }
+
     /// The end of the node.
     fn end(&self) -> usize {
         self.base + slot_size(self.level) * FANOUT
@@ -168,53 +220,34 @@ impl<S: Clone> Tree<S> {
     ///
     /// If the range is empty or goes past [`TREE_END`].
     pub fn lock(&self, start: usize, end: usize) -> RangeLock<S> {
-        assert!(start < end && end <= TREE_END, "a bad range for the tree");
-        let node = 'walk: loop {
-            let mut node = self.root.clone();
-            let mut held = false;
-            while node.level > 1 {
-                let i = node.index(start);
-                if i != node.index(end - 1) {
-                    break;
-                }
-                let child = match &node.slots.lock()[i] {
-                    Slot::Child(c) => Some(c.clone()),
-                    _ => None,
-                };
-                if let Some(c) = child {
-                    if held {
-                        node.release();
-                        held = false;
-                    }
-                    node = c;
-                    continue;
-                }
-                // The child is missing. Only the holder of the node makes it.
-                if !held {
-                    if !node.acquire_live() {
-                        continue 'walk;
-                    }
-                    held = true;
-                    continue;
-                }
-                let next = {
-                    let mut slots = node.slots.lock();
-                    let base = node.base + i * slot_size(node.level);
-                    let c = Arc::new(Node::new_held(node.level - 1, base, &slots[i]));
-                    slots[i] = Slot::Child(c.clone());
-                    c
-                };
-                node.release();
-                node = next;
-            }
-            if held || node.acquire_live() {
-                break node;
-            }
-        };
-        let mut held = Vec::new();
-        held.push(node.clone());
-        lock_below(&node, start, end, &mut held, false);
-        RangeLock { start, end, held }
+        lock_from(&self.root, start, end, 1)
+    }
+
+    /// Makes a copy of the tree that `all` locks, as `fork` copies the page table. `map` gives
+    /// the status of the copy for each status of the tree, or `None` for a page that the copy does
+    /// not have. A node of the copy with no status does not stay.
+    ///
+    /// # Panics
+    ///
+    /// If `all` does not lock the whole tree.
+    pub fn fork(all: &RangeLock<S>, mut map: impl FnMut(&S) -> Option<S>) -> Self {
+        assert!(all.held[0].level == LEVELS && all.span() == (0, TREE_END), "a fork of a part");
+        let root = copy_node(&all.held[0], &mut map);
+        root.release();
+        Self { root: Arc::new(root) }
+    }
+
+    /// The number of nodes in the tree, for the tests.
+    #[cfg(test)]
+    fn nodes(&self) -> usize {
+        fn count<S>(node: &Node<S>) -> usize {
+            let slots = node.slots.lock();
+            1 + slots
+                .iter()
+                .map(|s| if let Slot::Child(c) = s { count(c) } else { 0 })
+                .sum::<usize>()
+        }
+        count(&self.root)
     }
 
     /// Locks the whole tree if no other operation holds a node. Gives `None` if one does.
@@ -225,11 +258,119 @@ impl<S: Clone> Tree<S> {
         let mut held = Vec::new();
         held.push(self.root.clone());
         if !lock_below(&self.root, 0, TREE_END, &mut held, true) {
-            drop(RangeLock { start: 0, end: TREE_END, held });
+            drop(RangeLock { start: 0, end: TREE_END, held, root: None, prune: false });
             return None;
         }
-        Some(RangeLock { start: 0, end: TREE_END, held })
+        Some(RangeLock { start: 0, end: TREE_END, held, root: None, prune: false })
     }
+}
+
+/// Locks the page aligned range `start..end` of the tree of `root`, as [`Tree::lock`]. The walk
+/// stops at a node of `top` or a higher level, so the lock holds a node of that level at least.
+fn lock_from<S: Clone>(root: &Arc<Node<S>>, start: usize, end: usize, top: u32) -> RangeLock<S> {
+    assert!(start < end && end <= TREE_END, "a bad range for the tree");
+    // The walk made a node, which can stay empty.
+    let mut made = false;
+    let node = 'walk: loop {
+        let mut node = root.clone();
+        let mut held = false;
+        while node.level > top {
+            let i = node.index(start);
+            if i != node.index(end - 1) {
+                break;
+            }
+            let child = match &node.slots.lock()[i] {
+                Slot::Child(c) => Some(c.clone()),
+                _ => None,
+            };
+            if let Some(c) = child {
+                if held {
+                    node.release();
+                    held = false;
+                }
+                node = c;
+                continue;
+            }
+            // The child is missing. Only the holder of the node makes it.
+            if !held {
+                if !node.acquire_live() {
+                    continue 'walk;
+                }
+                held = true;
+                continue;
+            }
+            let next = {
+                let mut slots = node.slots.lock();
+                let base = node.base + i * slot_size(node.level);
+                let c = Arc::new(Node::new_held(node.level - 1, base, &slots[i]));
+                slots[i] = Slot::Child(c.clone());
+                c
+            };
+            made = true;
+            node.release();
+            node = next;
+        }
+        if held || node.acquire_live() {
+            break node;
+        }
+    };
+    let mut held = Vec::new();
+    held.push(node.clone());
+    lock_below(&node, start, end, &mut held, false);
+    RangeLock { start, end, held, root: Some(root.clone()), prune: made }
+}
+
+/// Removes the empty node of `level` at `base` from the tree, and then each node above it that
+/// becomes empty, as `free_pgtables` of Linux frees the page table pages of a range with no
+/// mapping. The caller holds no node.
+fn prune_up<S: Clone>(root: &Arc<Node<S>>, mut base: usize, mut level: u32) {
+    while level < LEVELS {
+        let end = base + slot_size(level) * FANOUT;
+        // The lock holds the parent of the node, and the node if it is there.
+        let mut lock = lock_from(root, base, end, level + 1);
+        lock.prune = false;
+        let parent = lock.held[0].clone();
+        let empty = {
+            let mut slots = parent.slots.lock();
+            let i = parent.index(base);
+            if let Slot::Child(c) = &slots[i] {
+                if !c.is_empty() {
+                    return;
+                }
+                c.kill();
+                slots[i] = Slot::Empty;
+            }
+            slots.iter().all(|s| matches!(s, Slot::Empty))
+        };
+        drop(lock);
+        if !empty {
+            return;
+        }
+        base = parent.base;
+        level = parent.level;
+    }
+}
+
+/// Makes a copy of `node` and of each node below it, with each status that `map` gives. The copy
+/// is held. A child of the copy with no status is not there.
+fn copy_node<S: Clone>(node: &Node<S>, map: &mut impl FnMut(&S) -> Option<S>) -> Node<S> {
+    let copy = Node::new_held(node.level, node.base, &Slot::Empty);
+    {
+        let from = node.slots.lock();
+        let mut to = copy.slots.lock();
+        for (dst, src) in to.iter_mut().zip(from.iter()) {
+            *dst = match src {
+                Slot::Empty => Slot::Empty,
+                Slot::Status(s) => map(s).map_or(Slot::Empty, Slot::Status),
+                Slot::Child(c) => {
+                    let child = copy_node(c, map);
+                    child.release();
+                    if child.is_empty() { Slot::Empty } else { Slot::Child(Arc::new(child)) }
+                }
+            };
+        }
+    }
+    copy
 }
 
 /// Locks each node below `node` that has an address in `start..end`, in the order of the
@@ -247,8 +388,10 @@ fn lock_below<S>(
     }
     let first = node.index(start.max(node.base));
     let last = node.index(end.min(node.end()) - 1);
-    let children: Vec<Arc<Node<S>>> = node.slots.lock()[first..=last]
-        .iter()
+    let children: Vec<Arc<Node<S>>> = node
+        .slots
+        .lock()
+        .range(first, last)
         .filter_map(|s| match s {
             Slot::Child(c) => Some(c.clone()),
             _ => None,
@@ -272,17 +415,32 @@ fn lock_below<S>(
 
 /// A locked range of the tree. The guard reads and changes the statuses of the pages in the
 /// range. It unlocks the nodes when it is dropped.
-pub struct RangeLock<S> {
+pub struct RangeLock<S: Clone> {
     start: usize,
     end: usize,
     /// The locked nodes. The first is the top node.
     held: Vec<Arc<Node<S>>>,
+    /// The root of the tree, to remove the top node after the unlock if it is empty. It is
+    /// `None` for a lock that does not remove nodes.
+    root: Option<Arc<Node<S>>>,
+    /// The walk made a node, or a `set` made pages empty, so the top node can be empty.
+    prune: bool,
 }
 
-impl<S> Drop for RangeLock<S> {
+impl<S: Clone> Drop for RangeLock<S> {
     fn drop(&mut self) {
         for node in self.held.iter().rev() {
             node.release();
+        }
+        // `set` removes each empty node below the top node. The top node needs the lock of its
+        // parent, so it goes after the unlock.
+        let top = &self.held[0];
+        if self.prune
+            && top.level < LEVELS
+            && let Some(root) = &self.root
+            && top.is_empty()
+        {
+            prune_up(root, top.base, top.level);
         }
     }
 }
@@ -331,7 +489,10 @@ impl<S: Clone> RangeLock<S> {
         assert!(start.is_multiple_of(page) && end.is_multiple_of(page), "the range is not aligned");
         let fill = match status {
             Some(s) => Slot::Status(s),
-            None => Slot::Empty,
+            None => {
+                self.prune = true;
+                Slot::Empty
+            }
         };
         let top = self.held[0].clone();
         set_in(&top, start, end, &fill, &mut self.held);
@@ -352,7 +513,7 @@ impl<S: Clone> RangeLock<S> {
     ) -> Vec<(usize, usize, S)> {
         self.check(start, end);
         let mut out: Vec<(usize, usize, S)> = Vec::new();
-        collect(&self.held[0], start, end, &mut |a, b, s: &S| {
+        collect(&self.held[0], start, end, &same, &mut |a, b, s: &S| {
             if let Some(last) = out.last_mut()
                 && last.1 == a
                 && same(&last.2, s)
@@ -400,7 +561,7 @@ impl<S: Clone> RangeLock<S> {
     pub fn any(&self, start: usize, end: usize) -> bool {
         self.check(start, end);
         let mut found = false;
-        collect(&self.held[0], start, end, &mut |_, _, _: &S| found = true);
+        collect(&self.held[0], start, end, &|_, _| true, &mut |_, _, _: &S| found = true);
         found
     }
 }
@@ -430,6 +591,8 @@ fn set_in<S: Clone>(
         }
         let child = match &slots[i] {
             Slot::Child(c) => c.clone(),
+            // An empty slot stays empty, with no child.
+            Slot::Empty if matches!(fill, Slot::Empty) => continue,
             old => {
                 let c = Arc::new(Node::new_held(node.level - 1, lo, old));
                 slots[i] = Slot::Child(c.clone());
@@ -438,37 +601,58 @@ fn set_in<S: Clone>(
             }
         };
         set_in(&child, start, end, fill, held);
+        // A child with no status leaves the tree. The caller holds it, so no walk uses it.
+        if matches!(fill, Slot::Empty) && child.is_empty() {
+            child.kill();
+            slots[i] = Slot::Empty;
+        }
     }
 }
 
 /// Calls `f` with each range of `node` in `start..end` that has one status, in address order.
+/// Slots next to each other with statuses that `same` joins go to `f` as one range, because a
+/// node of the lowest level often has the same status in each slot.
 fn collect<S: Clone>(
     node: &Arc<Node<S>>,
     start: usize,
     end: usize,
+    same: &impl Fn(&S, &S) -> bool,
     f: &mut impl FnMut(usize, usize, &S),
 ) {
     let size = slot_size(node.level);
     let first = node.index(start.max(node.base));
     let last = node.index(end.min(node.end()) - 1);
-    // The children go after the lock of the slots, because `f` can take time.
-    let mut items: Vec<(usize, Slot<S>)> = Vec::new();
-    {
-        let slots = node.slots.lock();
-        for (i, slot) in slots[first..=last].iter().enumerate() {
-            let item = match slot {
-                Slot::Empty => continue,
-                Slot::Status(s) => Slot::Status(s.clone()),
-                Slot::Child(c) => Slot::Child(c.clone()),
-            };
-            items.push((node.base + (first + i) * size, item));
+    // The children go after the lock of the slots, because `f` can take time. The slots go in
+    // batches of `BATCH`, so that the list is a small allocation of the kernel heap (see
+    // `Slots`).
+    const BATCH: usize = 64;
+    let mut items: Vec<(usize, usize, Slot<S>)> = Vec::with_capacity(BATCH);
+    let mut next = first;
+    while next <= last {
+        let to = (next + BATCH - 1).min(last);
+        {
+            let slots = node.slots.lock();
+            for (i, slot) in slots.range(next, to).enumerate() {
+                let lo = node.base + (next + i) * size;
+                match slot {
+                    Slot::Empty => {}
+                    Slot::Status(s) => match items.last_mut() {
+                        Some((_, hi, Slot::Status(t))) if *hi == lo && same(t, s) => {
+                            *hi = lo + size
+                        }
+                        _ => items.push((lo, lo + size, Slot::Status(s.clone()))),
+                    },
+                    Slot::Child(c) => items.push((lo, lo + size, Slot::Child(c.clone()))),
+                }
+            }
         }
-    }
-    for (lo, item) in items {
-        match item {
-            Slot::Status(s) => f(lo.max(start), (lo + size).min(end), &s),
-            Slot::Child(c) => collect(&c, start, end, f),
-            Slot::Empty => {}
+        next = to + 1;
+        for (lo, hi, item) in items.drain(..) {
+            match item {
+                Slot::Status(s) => f(lo.max(start), hi.min(end), &s),
+                Slot::Child(c) => collect(&c, start, end, same, f),
+                Slot::Empty => {}
+            }
         }
     }
 }
@@ -548,6 +732,73 @@ mod tests {
         assert_eq!(r.run_at(M2 + 25 * P, |_, _| true), Some((M2 + 10 * P, M2 + 30 * P, 1)));
         assert_eq!(r.run_at(M2 + 25 * P, eq), Some((M2 + 20 * P, M2 + 30 * P, 2)));
         assert_eq!(r.run_at(M2 + 31 * P, eq), None);
+    }
+
+    #[test]
+    fn runs_cross_the_chunks_and_batches() {
+        // Each page of one node has its own status, so the walk goes through all chunks of the
+        // slots and all batches of `collect`.
+        let t: Tree<u32> = Tree::new();
+        let mut r = t.lock(0, TREE_END);
+        for i in 0..FANOUT {
+            r.set(M2 + i * P, M2 + (i + 1) * P, Some((i % 2) as u32));
+        }
+        let runs = r.runs(0, TREE_END, eq);
+        assert_eq!(runs.len(), FANOUT);
+        assert!(
+            runs.iter()
+                .enumerate()
+                .all(|(i, x)| *x == (M2 + i * P, M2 + (i + 1) * P, (i % 2) as u32))
+        );
+        assert_eq!(r.runs(M2 + 100 * P, M2 + 300 * P, eq).len(), 200);
+        assert_eq!(r.run_at(M2 + 200 * P, eq), Some((M2 + 200 * P, M2 + 201 * P, 0)));
+    }
+
+    #[test]
+    fn empty_nodes_leave_the_tree() {
+        let t: Tree<u32> = Tree::new();
+        // A page lock makes the nodes down to the leaf, and the clear of the page removes them.
+        let mut r = t.lock(G1 + M2 + P, G1 + M2 + 2 * P);
+        r.set(G1 + M2 + P, G1 + M2 + 2 * P, Some(1));
+        drop(r);
+        assert_eq!(t.nodes(), 4);
+        let mut r = t.lock(G1 + M2 + P, G1 + M2 + 2 * P);
+        r.set(G1 + M2 + P, G1 + M2 + 2 * P, None);
+        drop(r);
+        assert_eq!(t.nodes(), 1);
+        // A clear of a large range removes the nodes below it, and keeps the nodes in use.
+        let mut all = t.lock(0, TREE_END);
+        all.set(G1 + P, G1 + 2 * P, Some(1));
+        all.set(3 * G1 + P, 3 * G1 + 2 * P, Some(2));
+        drop(all);
+        assert_eq!(t.nodes(), 6);
+        let mut r = t.lock(0, 2 * G1);
+        r.set(0, 2 * G1, None);
+        drop(r);
+        assert_eq!(t.nodes(), 4);
+        // The walk of a lock makes the nodes of its range, and the unlock removes them again if
+        // they have no status.
+        let r = t.lock(5 * G1, 5 * G1 + P);
+        assert_eq!(t.nodes(), 6);
+        drop(r);
+        assert_eq!(t.nodes(), 4);
+        assert_eq!(
+            t.lock(0, TREE_END).runs(0, TREE_END, eq),
+            vec![(3 * G1 + P, 3 * G1 + 2 * P, 2)]
+        );
+    }
+
+    #[test]
+    fn fork_copies_the_statuses() {
+        let t: Tree<u32> = Tree::new();
+        let mut all = t.lock(0, TREE_END);
+        all.set(G1, G1 + 3 * P, Some(1));
+        all.set(G1 + 3 * P, G1 + 5 * P, Some(2));
+        all.set(4 * G1, 5 * G1, Some(2));
+        let child = Tree::fork(&all, |&s| (s != 2).then_some(s + 10));
+        drop(all);
+        assert_eq!(child.lock(0, TREE_END).runs(0, TREE_END, eq), vec![(G1, G1 + 3 * P, 11)]);
+        assert_eq!(child.nodes(), 4);
     }
 
     #[test]
