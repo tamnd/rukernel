@@ -22,18 +22,18 @@ dependencies = [
 
 [[package]]
 name = "rk-abi"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "rk-abigen"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "rk-block"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "rk-cgroup"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "rk-drv-mem"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "rk-drv-tty"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "rk-drv-virtio"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -79,11 +79,11 @@ dependencies = [
 
 [[package]]
 name = "rk-frame"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "rk-fs-cgroup"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-ext4"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-overlay"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-proc"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-sys"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-tmpfs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "rk-fs-xfs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -155,11 +155,11 @@ dependencies = [
 
 [[package]]
 name = "rk-lib"
-version = "0.4.3"
+version = "0.4.4"
 
 [[package]]
 name = "rk-mm"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "rk-net"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "rk-net-inet"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "rk-net-unix"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-frame",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "rk-proc"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "rk-sched"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-cgroup",
  "rk-frame",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "rk-syscall"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "rk-vfs"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-block",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "rukernel"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
@@ -289,7 +289,7 @@ checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
 name = "xtask"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rk-vfs",
 ]
