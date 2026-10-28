@@ -112,6 +112,9 @@ pub struct Frame {
     /// The frame is a part of a [`HugeRun`] of the pool of huge pages. It goes back to the pool
     /// with the other frames of the run, and not to the allocator.
     pooled: bool,
+    /// The number of page table entries of the user address spaces that map the frame, as
+    /// `_mapcount` of a `struct page` of Linux (mm/rmap.c). See [`Frame::map_count`].
+    maps: AtomicU32,
 }
 
 /// The frames that hold anonymous memory of a process, one bit for each frame, as `PageAnon` of
@@ -185,6 +188,18 @@ pub fn phys_huge(phys: PhysAddr) -> Option<HugeKind> {
     }
 }
 
+/// The number of page table entries of the user address spaces that map a frame of each pooled
+/// run, by the index of the run. A huge page of hugetlbfs is mapped while the count is not 0, as
+/// `folio_mapped` of Linux.
+static RUN_MAPS: [AtomicU32; RUNS] = [const { AtomicU32::new(0) }; RUNS];
+
+/// Tells if a page table entry of a user address space maps a frame of the huge page of hugetlbfs
+/// that has the frame at the physical address `phys`, for `KPF_MMAP` of `/proc/kpageflags`.
+pub fn phys_huge_mapped(phys: PhysAddr) -> bool {
+    let Ok(frame) = usize::try_from(phys.get() / PAGE_SIZE as u64) else { return false };
+    RUN_MAPS.get(frame / HUGE_FRAMES).is_some_and(|n| n.load(Ordering::Relaxed) != 0)
+}
+
 /// The function that removes the charge of a frame from its memory cgroup.
 static UNCHARGE: Once<fn(u32)> = Once::new();
 
@@ -197,7 +212,7 @@ pub fn set_uncharge_hook(f: fn(u32)) {
 /// Takes a free frame. The contents of the frame are not defined.
 pub fn alloc_frame() -> Option<Frame> {
     let frame = FRAMES.lock().alloc()?;
-    Some(Frame { phys: (frame * PAGE_SIZE) as u64, memcg: 0, pooled: false })
+    Some(Frame::new((frame * PAGE_SIZE) as u64, false))
 }
 
 /// Takes a free frame and fills it with zeros.
@@ -216,7 +231,7 @@ pub fn alloc_huge_frames() -> Option<alloc::vec::Vec<Frame>> {
     let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
     set_run_kind(first, Some(HugeKind::Thp));
     let frames = (first..first + HUGE_FRAMES).map(|f| {
-        let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0, pooled: false };
+        let mut frame = Frame::new((f * PAGE_SIZE) as u64, false);
         frame.zero();
         frame
     });
@@ -274,7 +289,7 @@ impl HugeRun {
         RETURNED[first / HUGE_FRAMES].store(0, Ordering::Relaxed);
         set_run_kind(first, Some(HugeKind::Hugetlb));
         let frames = (first..first + HUGE_FRAMES).map(|f| {
-            let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0, pooled: true };
+            let mut frame = Frame::new((f * PAGE_SIZE) as u64, true);
             frame.zero();
             frame
         });
@@ -295,6 +310,38 @@ impl Drop for HugeRun {
 impl Frame {
     /// The number of 8 byte words in a frame.
     pub const WORDS: usize = PAGE_SIZE / 8;
+
+    fn new(phys: u64, pooled: bool) -> Self {
+        Self { phys, memcg: 0, pooled, maps: AtomicU32::new(0) }
+    }
+
+    /// The number of page table entries of the user address spaces that map the frame, as
+    /// `folio_precise_page_mapcount` of Linux. The page cache of a file and the other holders of
+    /// the frame do not count. A huge page that one entry maps counts one for each of its frames.
+    pub fn map_count(&self) -> u32 {
+        self.maps.load(Ordering::Relaxed)
+    }
+
+    /// Adds one page table entry to the map count, as `folio_add_anon_rmap_pte` and
+    /// `folio_add_file_rmap_pte` of Linux.
+    pub(crate) fn map_get(&self) {
+        self.maps.fetch_add(1, Ordering::Relaxed);
+        if self.pooled
+            && let Some(n) = RUN_MAPS.get(self.phys as usize / PAGE_SIZE / HUGE_FRAMES)
+        {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Removes one page table entry from the map count, as `folio_remove_rmap_pte` of Linux.
+    pub(crate) fn map_put(&self) {
+        self.maps.fetch_sub(1, Ordering::Relaxed);
+        if self.pooled
+            && let Some(n) = RUN_MAPS.get(self.phys as usize / PAGE_SIZE / HUGE_FRAMES)
+        {
+            n.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 
     /// Marks the frame as charged to the memory cgroup `memcg`. The charge goes away with the
     /// frame, through the function of `set_uncharge_hook`.

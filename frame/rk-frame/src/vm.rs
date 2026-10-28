@@ -112,6 +112,38 @@ pub struct UserFault {
     pub write: bool,
 }
 
+/// A frame that a page table entry maps. The value counts in the map count of the frame while it
+/// lives, as the reverse map of Linux (mm/rmap.c) does. Other references to the frame, as the
+/// page cache of a file, do not count. See [`Frame::map_count`].
+struct Mapped(Arc<Frame>);
+
+impl Mapped {
+    fn new(frame: Arc<Frame>) -> Self {
+        frame.map_get();
+        Self(frame)
+    }
+}
+
+impl Clone for Mapped {
+    fn clone(&self) -> Self {
+        Self::new(self.0.clone())
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        self.0.map_put();
+    }
+}
+
+impl core::ops::Deref for Mapped {
+    type Target = Arc<Frame>;
+
+    fn deref(&self) -> &Arc<Frame> {
+        &self.0
+    }
+}
+
 /// A huge page of an address space.
 struct Huge {
     /// The last level table for the split of the page.
@@ -119,7 +151,7 @@ struct Huge {
     /// The page is a transparent huge page. A page of hugetlbfs is not.
     thp: bool,
     /// The `HUGE_FRAMES` frames of the page, in address order.
-    frames: Vec<Arc<Frame>>,
+    frames: Vec<Mapped>,
     /// The permissions of each page of the huge page.
     prot: PageProt,
 }
@@ -128,7 +160,7 @@ struct Inner {
     /// The physical address of the top level table.
     root: u64,
     /// The frame and the permissions at each mapped page address that is not in a huge page.
-    pages: BTreeMap<usize, (Arc<Frame>, PageProt)>,
+    pages: BTreeMap<usize, (Mapped, PageProt)>,
     /// The huge pages by their address. No address of `pages` is in a huge page.
     huge: BTreeMap<usize, Huge>,
 }
@@ -142,11 +174,11 @@ impl Inner {
     /// Gives the frame and the permissions of the page at the page address `addr`.
     fn get(&self, addr: usize) -> Option<(&Arc<Frame>, PageProt)> {
         if let Some((frame, prot)) = self.pages.get(&addr) {
-            return Some((frame, *prot));
+            return Some((&frame.0, *prot));
         }
         let block = block_of(addr);
         let huge = self.huge.get(&block)?;
-        Some((&huge.frames[(addr - block) / PAGE_SIZE], huge.prot))
+        Some((&huge.frames[(addr - block) / PAGE_SIZE].0, huge.prot))
     }
 
     /// Changes the huge page that contains `addr`, if there is one, to 4 KiB pages.
@@ -217,7 +249,7 @@ impl VmSpace {
         }
         paging::user_map(inner.root, a, frame.addr().get(), prot.bits())
             .map_err(|()| MapError::NoMemory)?;
-        inner.pages.insert(a, (frame, prot));
+        inner.pages.insert(a, (Mapped::new(frame), prot));
         Ok(())
     }
 
@@ -283,6 +315,7 @@ impl VmSpace {
         }
         let table = paging::user_map_huge(inner.root, a, first, prot.bits())
             .map_err(|()| MapError::NoMemory)?;
+        let frames = frames.into_iter().map(Mapped::new).collect();
         inner.huge.insert(a, Huge { table, thp, frames, prot });
         if thp {
             HUGE_MAPPED.fetch_add(1, Ordering::Relaxed);
@@ -300,7 +333,7 @@ impl VmSpace {
     pub fn huge_block(&self, block: VirtAddr) -> Option<(Vec<Arc<Frame>>, PageProt)> {
         let inner = self.inner.lock();
         let huge = inner.huge.get(&block.get())?;
-        Some((huge.frames.clone(), huge.prot))
+        Some((huge.frames.iter().map(|f| f.0.clone()).collect(), huge.prot))
     }
 
     /// Changes the permissions of the huge page at the 2 MiB aligned `block` and keeps it whole.
@@ -461,7 +494,7 @@ impl VmSpace {
         inner.split(addr.get());
         let (frame, _) = inner.pages.remove(&addr.get())?;
         paging::user_unmap(inner.root, addr.get());
-        Some(frame)
+        Some(frame.0.clone())
     }
 
     /// Changes the permissions of the page at `addr`. Gives `false` if no page is mapped there.
