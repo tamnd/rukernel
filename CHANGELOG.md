@@ -21,6 +21,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The LTP tools record the results of the pty group (#413).
 - The `mmap` area of a program has a random top, as `arch_mmap_rnd` of Linux. `execve` moves the top down by a random number of pages: up to 2^28 pages on x86-64 and up to 2^18 pages on arm64, the defaults of `mmap_rnd_bits`. A process with `ADDR_NO_RANDOMIZE` in its personality keeps the fixed top. LTP hugemmap24 passes (#415).
 - tools/bench has the benchmark `cow`: a write fault that copies a 4 KiB page that a child of `fork` maps. tools/bench/run.py takes `--arch aarch64` and runs the arm64 kernels of rukernel and Linux on the QEMU `virt` machine (#415).
+- With the `corten` feature, `fork` copies the tree of statuses with one walk and does not build the list of areas, as `dup_mmap` of Linux copies the areas (#405).
+- spec/25-removing-the-big-kernel-lock.md gives the design for the removal of the big kernel lock: the state that it protects, the order of the steps, a lock for each page table page, and the risks (#405).
 
 ### Fixed
 
@@ -34,6 +36,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The LTP runner gives starvation 1800 s, because the test can run for 650 s to 1150 s under QEMU without KVM by design (#417).
 - A private mapping of a file of hugetlbfs is charged to the subpool of the mount, as `hugetlb_reserve_pages` and `alloc_hugetlb_folio` of Linux. The `size=` limit of the mount applies to it, so `mmap` gives `ENOMEM` when the reservation does not fit, and a fault of a `MAP_NORESERVE` mapping over the limit gives `SIGBUS`. A page gives its charge back when it is freed, and a reservation without a page gives it back at `munmap` or at exit (#415).
 - The LTP build links `brk` and `sbrk` functions that call the kernel, because the functions of musl give `ENOMEM`. LTP hugemmap07 no longer gives TBROK, and sbrk01, mmapstress02, mmapstress03, mmapstress05 and mmapstress08 pass (#415).
+- The address space merges areas as `vma_merge` of Linux (#405). After an `mprotect`, `mlock`, `madvise` or `mremap` gives an area the same flags as its neighbour, the two areas are one area again, and two file mappings at offsets that follow each other are one area. Before, /proc/PID/maps showed 3 areas after an `mprotect` of the middle of an area and back.
+- With the `corten` feature, an empty node of the tree of statuses leaves the tree (#405). Before, `munmap` left the empty nodes.
+- With the `corten` feature, `fork` and `exit` are about as fast as with the default backend (#405). Before, each node of the tree of statuses was one allocation of 8 KiB, and the walk of the tree made a list of up to 512 slots. Each allocation of the kernel heap of more than 2 KiB maps pages, and its free sends a TLB shootdown to each CPU. A `fork` and the `exit` of the child made about 20 of these, and the shootdowns took most of the time. Now the slots of a node are in chunks of 2 KiB and the walk reads them in batches of 64.
+- With the `corten` feature, the `max_map_count` check counts the areas exactly, and `munmap` of the middle of an area gives `ENOMEM` when the split goes over `max_map_count`, as `do_vmi_align_munmap` of Linux (#405).
+- The `init` check "the threads run again" waits up to 2 s for the counter to change, not a fixed 50 ms, and prints the wait when it is 50 ms or more (#405). The check failed in 2 of 12 boots with the `corten` feature at #323. The check passed in 40 boots at this base and with the code of #323, also on a busy host, and 600 extra rounds of stop and continue found no lost wake and no lost shared page. Thus the fixed sleep is the only cause left.
 
 ## [0.4.8] - 2026-10-28
 

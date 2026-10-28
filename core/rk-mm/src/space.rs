@@ -17,7 +17,9 @@ use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
 use rk_frame::sync::SpinLock;
-use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
+#[cfg(not(feature = "corten"))]
+use rk_frame::vm::ForkArea;
+use rk_frame::vm::{HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
 
 #[cfg(feature = "corten")]
 mod corten;
@@ -85,6 +87,13 @@ pub trait MmFile: Send + Sync {
 
 /// A file in an area.
 pub type FileRef = Arc<dyn MmFile>;
+
+/// Two files are the same if they are the same object, so that two areas of one file can merge.
+impl PartialEq for dyn MmFile {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::addr_eq(self, other)
+    }
+}
 
 impl core::fmt::Debug for dyn MmFile {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -349,9 +358,14 @@ impl AddressSpace {
             lock_future: false,
             guards: BTreeSet::new(),
         };
+        Self::with_state(vm, StateLock::new(state))
+    }
+
+    /// Makes an address space with the page table `vm` and the areas of `state`.
+    fn with_state(vm: VmSpace, state: StateLock) -> Self {
         Self {
             vm,
-            state: StateLock::new(state),
+            state,
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
             huge_resv: SpinLock::new(BTreeMap::new()),
@@ -798,7 +812,7 @@ impl AddressSpace {
             if !st.vmas.covers(start, end) {
                 return Err(Errno::ENOMEM);
             }
-            st.vmas.update_range(start, end, |vma| vma.locked = lock);
+            st.vmas.update_range_merged(start, end, |vma| vma.locked = lock);
         }
         if lock && !on_fault {
             only_enomem(self.populate(start, end))?;
@@ -832,7 +846,7 @@ impl AddressSpace {
             }
             st.lock_future = lock && future;
             if current || !lock {
-                st.vmas.update_range(0, USER_END, |vma| vma.locked = lock);
+                st.vmas.update_range_merged(0, USER_END, |vma| vma.locked = lock);
             }
             st.vmas.iter().map(|v| (v.start, v.end)).collect()
         };
@@ -960,6 +974,7 @@ impl AddressSpace {
                 charge_commit(new_len - old_len)?;
             }
             st.vmas.update_range(addr, end, |vma| vma.end = new_end);
+            st.vmas.merge_range(addr, new_end);
             return Ok(addr);
         }
         if !remap.may_move {
@@ -1026,11 +1041,11 @@ impl AddressSpace {
             }
         }
         if dont_unmap {
-            st.vmas.insert(Vma { start: addr, end: addr + old_len, ..vma.clone() });
+            st.vmas.insert_merged(Vma { start: addr, end: addr + old_len, ..vma.clone() });
         }
         vma.start = to;
         vma.end = to + new_len;
-        st.vmas.insert(vma);
+        st.vmas.insert_merged(vma);
         Ok(to)
     }
 
@@ -1071,7 +1086,7 @@ impl AddressSpace {
                 .sum();
             charge_commit(more)?;
         }
-        st.vmas.update_range(addr, end, |vma| {
+        st.vmas.update_range_merged(addr, end, |vma| {
             vma.prot = prot;
             vma.account |= prot.write && !vma.shared && !vma.hugetlb;
         });
@@ -1387,7 +1402,7 @@ impl AddressSpace {
         if !st.vmas.covers(start, end) {
             return Err(Errno::ENOMEM);
         }
-        st.vmas.update_range(start, end, |vma| vma.huge = advice);
+        st.vmas.update_range_merged(start, end, |vma| vma.huge = advice);
         Ok(())
     }
 
@@ -1460,6 +1475,15 @@ impl AddressSpace {
     ///
     /// Gives `ENOMEM` if no frame is free for a page table.
     pub fn fork(&self) -> Result<Self, Errno> {
+        #[cfg(feature = "corten")]
+        return self.corten_fork();
+        #[cfg(not(feature = "corten"))]
+        self.vma_fork()
+    }
+
+    /// `fork` of the VMA backend. It copies the list of areas.
+    #[cfg(not(feature = "corten"))]
+    fn vma_fork(&self) -> Result<Self, Errno> {
         let st = self.state.lock();
         // An area of `MADV_DONTFORK` does not go to the child, and an area of `MADV_WIPEONFORK`
         // goes without its pages, as `dup_mmap` in kernel/fork.c of Linux.
@@ -1527,7 +1551,7 @@ impl AddressSpace {
         if !st.vmas.covers(start, end) {
             return Err(Errno::ENOMEM);
         }
-        st.vmas.update_range(start, end, |vma| {
+        st.vmas.update_range_merged(start, end, |vma| {
             if let Some(on) = dont_fork {
                 vma.dont_fork = on;
             }

@@ -174,6 +174,43 @@ impl<F: Clone> Vma<F> {
     }
 }
 
+impl<F: PartialEq> Vma<F> {
+    /// Tells if each page of `self` and of `other` has the same mapping: the same attributes, and
+    /// for a file the same file at the same offset from the address of the page. The ends of the
+    /// areas have no effect.
+    pub fn same_mapping(&self, other: &Self) -> bool {
+        let backing = match (&self.backing, &other.backing) {
+            (Backing::Anon, Backing::Anon) => true,
+            (Backing::File { file: f, offset: x }, Backing::File { file: g, offset: y }) => {
+                // The wrapping difference is the offset of the address 0, so it is the same for
+                // two areas that map the file at offsets that follow each other.
+                f == g && x.wrapping_sub(self.start as u64) == y.wrapping_sub(other.start as u64)
+            }
+            _ => false,
+        };
+        backing
+            && self.prot == other.prot
+            && self.shared == other.shared
+            && self.may_write == other.may_write
+            && self.locked == other.locked
+            && self.grows_down == other.grows_down
+            && self.mergeable == other.mergeable
+            && self.huge == other.huge
+            && self.account == other.account
+            && self.hugetlb == other.hugetlb
+            && self.dont_fork == other.dont_fork
+            && self.wipe_on_fork == other.wipe_on_fork
+            && self.kind == other.kind
+    }
+
+    /// Tells if `self` and `other` can be one area when they touch, as `is_mergeable_vma` and
+    /// `is_mergeable_anon_vma` in mm/vma.c of Linux. They have the same mapping, and they are not
+    /// hugetlb areas, which Linux marks `VM_DONTEXPAND` so that they do not merge.
+    pub fn can_merge(&self, other: &Self) -> bool {
+        !self.hugetlb && self.same_mapping(other)
+    }
+}
+
 /// The areas of one address space, in address order. No two areas overlap.
 #[derive(Clone, Debug)]
 pub struct VmaSet<F> {
@@ -224,60 +261,6 @@ impl<F: Clone> VmaSet<F> {
         assert!(is_page_aligned(vma.start) && is_page_aligned(vma.end), "the area is not aligned");
         assert!(!self.overlaps(vma.start, vma.end), "the area overlaps another area");
         self.areas.insert(vma.start, vma);
-    }
-
-    /// Adds an area, and joins it to an area next to it that has the same attributes, as
-    /// `vma_merge` in Linux. Only private anonymous areas join. A process that maps many anonymous
-    /// areas one after the other then has one area, so `fork` does not copy each of them.
-    ///
-    /// # Panics
-    ///
-    /// If the area is empty, is not page aligned or overlaps an area of the set.
-    pub fn insert_merged(&mut self, vma: Vma<F>) {
-        let start = vma.start;
-        self.insert(vma);
-        let mut key = start;
-        if let Some((&below, _)) = self.areas.range(..start).next_back()
-            && self.join(below, start)
-        {
-            key = below;
-        }
-        if let Some(end) = self.areas.get(&key).map(|v| v.end) {
-            self.join(key, end);
-        }
-    }
-
-    /// Joins the area at `upper` to the area at `lower`, if they touch and can join. Gives
-    /// `true` if they joined.
-    fn join(&mut self, lower: usize, upper: usize) -> bool {
-        let (Some(a), Some(b)) = (self.areas.get(&lower), self.areas.get(&upper)) else {
-            return false;
-        };
-        let same = a.end == b.start
-            && matches!((&a.backing, &b.backing), (Backing::Anon, Backing::Anon))
-            && !a.shared
-            && !b.shared
-            && !a.grows_down
-            && !b.grows_down
-            && a.prot == b.prot
-            && a.may_write == b.may_write
-            && a.locked == b.locked
-            && a.mergeable == b.mergeable
-            && a.huge == b.huge
-            && a.account == b.account
-            && a.hugetlb == b.hugetlb
-            && a.dont_fork == b.dont_fork
-            && a.wipe_on_fork == b.wipe_on_fork
-            && a.kind == b.kind;
-        if !same {
-            return false;
-        }
-        let end = b.end;
-        self.areas.remove(&upper);
-        if let Some(a) = self.areas.get_mut(&lower) {
-            a.end = end;
-        }
-        true
     }
 
     /// Makes `start` and `end` the edges of areas, if an area contains them.
@@ -400,6 +383,62 @@ impl<F: Clone> VmaSet<F> {
     }
 }
 
+impl<F: Clone + PartialEq> VmaSet<F> {
+    /// Adds an area, and joins it to the areas next to it that have the same mapping, as
+    /// `vma_merge_new_range` in mm/vma.c of Linux. A process that maps many anonymous areas one
+    /// after the other then has one area, so `fork` does not copy each of them, and two mappings of
+    /// a file at offsets that follow each other are one area.
+    ///
+    /// # Panics
+    ///
+    /// If the area is empty, is not page aligned or overlaps an area of the set.
+    pub fn insert_merged(&mut self, vma: Vma<F>) {
+        let (start, end) = (vma.start, vma.end);
+        self.insert(vma);
+        self.merge_range(start, end);
+    }
+
+    /// Joins the areas in `start..end`, and the areas next to the range, that touch and have the
+    /// same mapping. A call that changes the areas of a range calls it after the change, so that
+    /// a change of the middle of an area and back gives one area again, as `vma_modify` in
+    /// mm/vma.c of Linux.
+    pub fn merge_range(&mut self, start: usize, end: usize) {
+        let first = self.areas.range(..start).next_back().map_or(start, |(&k, _)| k);
+        let keys: Vec<usize> = self.areas.range(first..=end).map(|(&k, _)| k).collect();
+        let Some((&head, rest)) = keys.split_first() else { return };
+        let mut lower = head;
+        for &upper in rest {
+            if !self.join(lower, upper) {
+                lower = upper;
+            }
+        }
+    }
+
+    /// Calls `f` for each area in `start..end`, as `update_range`, and then joins the areas of the
+    /// range and next to it, as `merge_range`.
+    pub fn update_range_merged(&mut self, start: usize, end: usize, f: impl FnMut(&mut Vma<F>)) {
+        self.update_range(start, end, f);
+        self.merge_range(start, end);
+    }
+
+    /// Joins the area at `upper` to the area at `lower`, if they touch and can merge. Gives `true`
+    /// if they joined.
+    fn join(&mut self, lower: usize, upper: usize) -> bool {
+        let (Some(a), Some(b)) = (self.areas.get(&lower), self.areas.get(&upper)) else {
+            return false;
+        };
+        if a.end != b.start || !a.can_merge(b) {
+            return false;
+        }
+        let end = b.end;
+        self.areas.remove(&upper);
+        if let Some(a) = self.areas.get_mut(&lower) {
+            a.end = end;
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +466,50 @@ mod tests {
         s.insert_merged(Vma::anon(30 * P, 40 * P, Prot::default(), VmaKind::Normal));
         s.insert_merged(Vma::anon(40 * P, 50 * P, Prot::RW, VmaKind::Heap));
         assert_eq!(ranges(&s), [(5, 30), (30, 40), (40, 50)]);
+    }
+
+    fn file_area(start: usize, end: usize, file: u32, offset: usize) -> Vma<u32> {
+        Vma {
+            backing: Backing::File { file, offset: (offset * P) as u64 },
+            shared: true,
+            ..Vma::anon(start * P, end * P, Prot::RW, VmaKind::Normal)
+        }
+    }
+
+    #[test]
+    fn a_change_of_the_middle_and_back_gives_one_area() {
+        let mut s = set(&[(10, 20)]);
+        s.update_range_merged(12 * P, 15 * P, |v| v.prot.write = false);
+        assert_eq!(ranges(&s), [(10, 12), (12, 15), (15, 20)]);
+        s.update_range_merged(12 * P, 15 * P, |v| v.prot.write = true);
+        assert_eq!(ranges(&s), [(10, 20)]);
+        // A change of the whole range joins the areas next to it too.
+        s.update_range(10 * P, 20 * P, |v| v.locked = true);
+        s.update_range(13 * P, 20 * P, |v| v.locked = false);
+        s.update_range_merged(10 * P, 13 * P, |v| v.locked = false);
+        assert_eq!(ranges(&s), [(10, 20)]);
+    }
+
+    #[test]
+    fn file_areas_join_at_offsets_that_follow() {
+        let mut s = VmaSet::new();
+        s.insert_merged(file_area(10, 20, 7, 0));
+        s.insert_merged(file_area(20, 30, 7, 10));
+        assert_eq!(ranges(&s), [(10, 30)]);
+        // Another offset, another file, or a hugetlb area does not join.
+        s.insert_merged(file_area(30, 40, 7, 30));
+        s.insert_merged(file_area(40, 50, 8, 30));
+        let mut huge = file_area(50, 60, 8, 40);
+        huge.hugetlb = true;
+        s.insert_merged(huge);
+        let mut huge = file_area(60, 70, 8, 50);
+        huge.hugetlb = true;
+        s.insert_merged(huge);
+        assert_eq!(ranges(&s), [(10, 30), (30, 40), (40, 50), (50, 60), (60, 70)]);
+        // A file area that is split and changed back is one area again.
+        s.update_range_merged(15 * P, 16 * P, |v| v.prot.exec = true);
+        s.update_range_merged(15 * P, 16 * P, |v| v.prot.exec = false);
+        assert_eq!(s.iter().next().map(|v| (v.start / P, v.end / P)), Some((10, 30)));
     }
 
     #[test]

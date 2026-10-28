@@ -80,6 +80,7 @@ These are decided and the rest of the spec builds on them. Reopening one needs a
 | 22 | Milestones R0 to R12 |
 | 23 | Repository and crate layout |
 | 24 | Open questions, ranked |
+| 25 | Removing the big kernel lock: what it protects, the steps, the page table locks, the risks |
 
 ## What this is not
 
