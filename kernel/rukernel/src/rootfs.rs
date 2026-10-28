@@ -16,6 +16,7 @@ pub(crate) fn init(boot: &BootInfo) {
     rk_vfs::fstype::register(rk_fs_tmpfs::DEVTMPFS);
     rk_vfs::fstype::register(rk_fs_overlay::FS_TYPE);
     rk_vfs::fstype::register(rk_fs_hugetlbfs::FS_TYPE);
+    rk_vfs::fstype::register(rk_drv_tty::pty::DEVPTS);
     for t in rk_fs_ext4::FS_TYPES {
         rk_vfs::fstype::register(t);
     }
@@ -62,6 +63,7 @@ pub(crate) fn make_dev(fs: &FsContext) {
         ("console", 0o600, rk_drv_tty::CONSOLE_RDEV),
         ("tty", 0o666, rk_drv_tty::TTY_RDEV),
         ("ttyS0", 0o660, rk_drv_tty::TTYS0_RDEV),
+        ("ptmx", 0o666, rk_drv_tty::pty::PTMX_RDEV),
     ];
     for (name, perm, rdev) in tty {
         add_device(DeviceInfo { name: String::from(name), class: "tty", rdev, block: false, perm });
@@ -82,6 +84,8 @@ pub(crate) fn make_dev(fs: &FsContext) {
     register_major(false, 4, "ttyS");
     register_major(false, 5, "/dev/tty");
     register_major(false, 5, "/dev/console");
+    register_major(false, 5, "/dev/ptmx");
+    register_major(false, rk_drv_tty::pty::SLAVE_MAJOR, "pts");
     register_major(true, rk_drv_virtio::VIRTBLK_MAJOR, "virtblk");
     let root = fs.root().clone();
     let _ = fs.mkdir(&root, b"/dev", 0o755);

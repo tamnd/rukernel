@@ -1,8 +1,8 @@
 //! The terminals of rukernel.
 //!
-//! R1 has one terminal: the serial console. `/dev/console` (5, 1), `/dev/tty` (5, 0) and
+//! The serial console is the first terminal. `/dev/console` (5, 1), `/dev/tty` (5, 0) and
 //! `/dev/ttyS0` (4, 64) open it. The line discipline does the input and output processing, per
-//! spec/22-milestones.md item R1.
+//! spec/22-milestones.md item R1. The pseudo terminals of [`pty`] are the other terminals.
 //!
 //! R1 has no I/O APIC, so the serial port has no interrupt. The driver reads the serial port in
 //! the bottom half of rk-frame instead, after each interrupt. The timer interrupts 250 times each
@@ -14,6 +14,7 @@
 extern crate alloc;
 
 pub mod ldisc;
+pub mod pty;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -50,12 +51,19 @@ struct Tty {
     sid: u32,
 }
 
-static CONSOLE: SpinLock<Tty> = SpinLock::new(Tty {
-    ldisc: LineDiscipline::new(),
-    winsize: Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 },
-    pgrp: 0,
-    sid: 0,
-});
+impl Tty {
+    /// The state of a new terminal.
+    const fn new() -> Self {
+        Self {
+            ldisc: LineDiscipline::new(),
+            winsize: Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 },
+            pgrp: 0,
+            sid: 0,
+        }
+    }
+}
+
+static CONSOLE: SpinLock<Tty> = SpinLock::new(Tty::new());
 
 /// The type of the function that sends a signal to a process group.
 type SignalFn = fn(u32, u32);
@@ -67,6 +75,21 @@ static SIGNAL: SpinLock<Option<SignalFn>> = SpinLock::new(None);
 /// group. Its arguments are the process group and the signal.
 pub fn set_signal_handler(f: fn(u32, u32)) {
     *SIGNAL.lock() = Some(f);
+}
+
+/// Sends each signal of `signals` to its process group. A group of 0 gets no signal.
+fn send_signals(signals: Vec<(u32, u32)>) {
+    if signals.is_empty() {
+        return;
+    }
+    let handler = *SIGNAL.lock();
+    if let Some(send) = handler {
+        for (pgrp, sig) in signals {
+            if pgrp != 0 {
+                send(pgrp, sig);
+            }
+        }
+    }
 }
 
 /// The readers of the console wait here for input.
@@ -108,14 +131,7 @@ pub fn poll_input() {
     if received {
         INPUT_WAIT.wake_all();
     }
-    let handler = *SIGNAL.lock();
-    if let Some(send) = handler {
-        for (pgrp, sig) in signals {
-            if pgrp != 0 {
-                send(pgrp, sig);
-            }
-        }
-    }
+    send_signals(signals);
 }
 
 /// An open file of the console.
@@ -211,12 +227,13 @@ impl CharDevice for ConsoleDevice {
     }
 }
 
-/// Adds the console devices to the table of character devices, and adds `poll_input` to the
-/// bottom half.
+/// Adds the console devices and `/dev/ptmx` to the table of character devices, and adds
+/// `poll_input` to the bottom half.
 pub fn init() {
     for rdev in [TTY_RDEV, CONSOLE_RDEV, TTYS0_RDEV] {
         device::register_char(rdev, Arc::new(ConsoleDevice));
     }
+    pty::init();
     #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     rk_frame::task::add_bottom_half(poll_input);
 }

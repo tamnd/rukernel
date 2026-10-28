@@ -41,19 +41,24 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# The script that runs as init. It reads the tests from /tests, one test on each line: the tag, a
-# tab and the command. T is the time limit of each test in seconds.
+# The time limits in seconds of the tests that run longer than --timeout by design, when it is
+# smaller. setsockopt11 repeats its check for up to 300 s (.runtime = 300), and a busy host does
+# not complete the 64 rounds in that time.
+LIMITS = {"setsockopt11": 420}
+
+# The script that runs as init. It reads the tests from /tests, one test on each line: the tag,
+# the time limit of the test in seconds and the command, with a tab between them.
 INIT = r"""#!/bin/busybox sh
 /bin/busybox mkdir -p /usr/bin /usr/sbin /sbin
 /bin/busybox --install -s
 export PATH=/ltp/testcases/bin:/ltp/bin:/bin:/sbin:/usr/bin:/usr/sbin
 export LTPROOT=/ltp TMPDIR=/tmp LTP_TIMEOUT_MUL=@MUL@ KCONFIG_PATH=/etc/kconfig LTP_DEV=/dev/vda
-T=@TIMEOUT@
 mkdir -p /proc /sys /dev /tmp /ltp
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
-mkdir -p /dev/shm
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs shm /dev/shm
 mount -t tmpfs tmp /tmp
 [ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
@@ -71,7 +76,7 @@ if ! mount -t ext4 -o ro /dev/vdb /ltp; then
     exit 1
 fi
 echo "ltp-ready"
-while IFS='	' read -r tag cmd; do
+while IFS='	' read -r tag limit cmd; do
     echo "ltp-start: $tag"
     set -- $cmd
     if [ "${1#*=}" = "$1" ] && ! command -v "$1" >/dev/null 2>&1; then
@@ -84,7 +89,7 @@ while IFS='	' read -r tag cmd; do
     pid=$!
     (
         trap 'kill $s 2>/dev/null; exit 0' TERM
-        sleep $T & s=$!
+        sleep $limit & s=$!
         wait $s
         echo > /run-timeout
         kill -KILL -$pid 2>/dev/null
@@ -173,13 +178,17 @@ class Batch:
         self.tests = tests
         self.dir = os.path.join(a.out, name)
 
+    def limit(self, tag):
+        """Gives the time limit of the test `tag` in seconds."""
+        return max(self.a.timeout, LIMITS.get(tag, 0))
+
     def initramfs(self, tests):
         with open(self.a.busybox, "rb") as f:
             busybox = f.read()
         with open(os.path.join(HERE, "kconfig"), "rb") as f:
             kconfig = f.read()
-        init = INIT.replace("@TIMEOUT@", str(self.a.timeout)).replace("@MUL@", str(self.a.mul))
-        lst = "".join(f"{tag}\t{cmd}\n" for _, tag, cmd in tests)
+        init = INIT.replace("@MUL@", str(self.a.mul))
+        lst = "".join(f"{tag}\t{self.limit(tag)}\t{cmd}\n" for _, tag, cmd in tests)
         entries = [(".", 0o040755, b"")]
         entries += [(d, 0o040755, b"") for d in ("bin", "etc", "tmp", "proc", "sys", "dev", "ltp")]
         if self.a.ip:
@@ -250,7 +259,7 @@ class Batch:
                     # after other text on the same line.
                     if "ltp-start: " in line:
                         current = line.split("ltp-start: ", 1)[1].strip()
-                        since, limit = time.monotonic(), self.a.timeout + 120
+                        since, limit = time.monotonic(), self.limit(current) + 120
                     elif "ltp-result: " in line:
                         done.add(line.split("ltp-result: ", 1)[1].split()[0])
                         current = None

@@ -47,6 +47,11 @@ pub fn register_char(rdev: u64, device: Arc<dyn CharDevice>) {
     CHAR_DEVICES.lock().insert(rdev, device);
 }
 
+/// Removes the driver of the character device `rdev`. A later open of the number gives `ENXIO`.
+pub fn unregister_char(rdev: u64) {
+    CHAR_DEVICES.lock().remove(&rdev);
+}
+
 /// Opens the character device `rdev`. Gives `ENXIO` if no driver has the number, as Linux.
 pub fn open_char(rdev: u64, flags: u32) -> Result<Arc<dyn FileOps>> {
     let device = CHAR_DEVICES.lock().get(&rdev).cloned().ok_or(Errno::ENXIO)?;

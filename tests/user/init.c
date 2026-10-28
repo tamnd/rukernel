@@ -427,6 +427,35 @@ static void test_devices(void)
 	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
+/* The pseudo terminals: /dev/ptmx and devpts, as musl openpty does it (#403). */
+static void test_pty(void)
+{
+	mkdir("/dev/pts", 0755);
+	check("mount devpts", mount("devpts", "/dev/pts", "devpts", 0, NULL) == 0);
+	int m = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+	int n = -1, lock = 0;
+	check("open /dev/ptmx", m >= 0);
+	if (m < 0)
+		return;
+	check("TIOCSPTLCK and TIOCGPTN", ioctl(m, TIOCSPTLCK, &lock) == 0 && ioctl(m, TIOCGPTN, &n) == 0 && n >= 0);
+	char name[32];
+	snprintf(name, sizeof(name), "/dev/pts/%d", n);
+	int s = open(name, O_RDWR | O_NOCTTY);
+	check("open the pty slave", s >= 0 && isatty(s));
+	check("TCGETA with a bad pointer gives EFAULT", ioctl(m, TCGETA, (void *)8) == -1 && errno == EFAULT);
+	struct termios t;
+	check("tcgetattr on the pty master", tcgetattr(m, &t) == 0 && (t.c_lflag & ICANON));
+	char buf[16] = { 0 };
+	check("pty master to slave", write(m, "hi\n", 3) == 3 && read(s, buf, sizeof(buf)) == 3 && memcmp(buf, "hi\n", 3) == 0);
+	check("pty echo", read(m, buf, sizeof(buf)) == 4 && memcmp(buf, "hi\r\n", 4) == 0);
+	check("pty slave to master", write(s, "ok", 2) == 2 && read(m, buf, sizeof(buf)) == 2 && memcmp(buf, "ok", 2) == 0);
+	close(s);
+	check("pty master read after the slave closes gives EIO", read(m, buf, 1) == -1 && errno == EIO);
+	close(m);
+	check("pty slave goes away with the master", access(name, F_OK) == -1);
+	umount("/dev/pts");
+}
+
 static void test_fork(void)
 {
 	int status = 0;
@@ -4462,6 +4491,7 @@ static void test_all(void)
 	test_files();
 	test_perms();
 	test_devices();
+	test_pty();
 	test_fork();
 	test_exec();
 	test_time();

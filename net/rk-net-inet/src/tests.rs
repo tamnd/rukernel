@@ -730,6 +730,35 @@ fn sockaddr_in6() {
     assert_eq!(four, sockaddr::make([127, 0, 0, 1], 53));
 }
 
+/// A segment routing header with the segments `segs` and `left` segments left.
+fn srh(segs: &[Ip], left: u8) -> Vec<u8> {
+    let n = segs.len() as u8;
+    let mut h = vec![0, 2 * n, 4, left, n - 1, 0, 0, 0];
+    for s in segs {
+        h.extend_from_slice(s);
+    }
+    h
+}
+
+#[test]
+fn routing_header_on_send() {
+    use crate::socket::push_rthdr;
+    let (a, b, c, d) =
+        (v6([1, 0, 0, 0, 0, 0, 0, 1]), v6([2, 0, 0, 0, 0, 0, 0, 2]), v6([3; 8]), v6([4; 8]));
+    // Segment routing: segment 0 is the final destination, and the packet goes to the segment
+    // "segments left", as `ipv6_push_rthdr4`.
+    let (h, first) = push_rthdr(&srh(&[a, b, c], 2), &d, 17);
+    assert_eq!(first, c);
+    assert_eq!(&h[..8], &[17, 6, 4, 2, 2, 0, 0, 0]);
+    assert_eq!((&h[8..24], &h[24..40], &h[40..56]), (&d[..], &b[..], &c[..]));
+    // Type 2: the packet goes to the address of the header, and the header has the final
+    // destination, as `ipv6_push_rthdr0`.
+    let mut t2 = vec![0, 2, 2, 1, 0, 0, 0, 0];
+    t2.extend_from_slice(&a);
+    let (h, first) = push_rthdr(&t2, &d, 58);
+    assert_eq!((first, h[0], &h[8..24]), (a, 58, &d[..]));
+}
+
 fn send6(s: &Dgram, to: Option<(Ip, u16)>, data: &[u8]) -> Result<usize, Errno> {
     use rk_net::consts::AF_INET6;
     let msg = Message {
@@ -745,10 +774,11 @@ fn send6(s: &Dgram, to: Option<(Ip, u16)>, data: &[u8]) -> Result<usize, Errno> 
 fn ipv6_loopback() {
     use crate::{Stream, ipv6};
     use rk_abi::native::in6::{
-        IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO, IPV6_V6ONLY,
+        IPV6_ADDRFORM, IPV6_HOPLIMIT, IPV6_PKTINFO, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO,
+        IPV6_RTHDR, IPV6_V6ONLY,
     };
     use rk_abi::native::inet::IPPROTO_IPV6;
-    use rk_net::consts::AF_INET6;
+    use rk_net::consts::{AF_INET, AF_INET6};
     let lo = ip::LOOPBACK;
     let name = |a: &[u8]| sockaddr::parse_bind_in(AF_INET6, a).unwrap();
     let make = |a: &Ip, p| sockaddr::make_in(AF_INET6, a, p, 0);
@@ -795,6 +825,29 @@ fn ipv6_loopback() {
     let o = Dgram::new6(Proto::Udp);
     o.set_option(IPPROTO_IPV6, IPV6_V6ONLY, &int(1)).unwrap();
     assert_eq!(send6(&o, Some((src, 9)), b"x"), Err(Errno::ENETUNREACH));
+
+    // A socket with `IPV6_RTHDR` sends its datagrams through the routing header, and the
+    // checksum is for the final destination.
+    let r6 = Dgram::new6(Proto::Udp);
+    r6.set_option(IPPROTO_IPV6, IPV6_RTHDR, &srh(&[lo, lo, lo], 1)).unwrap();
+    assert_eq!(send6(&r6, Some((lo, port)), b"rthdr"), Ok(5));
+    assert_eq!(a.recv(100, 0, true).unwrap().data, b"rthdr");
+
+    // `IPV6_ADDRFORM` changes a UDP socket with an IPv4 peer to `AF_INET`.
+    let f = Dgram::new6(Proto::Udp);
+    let fourport = sockaddr::parse_bind(&four.name()).unwrap().1;
+    assert_eq!(f.set_option(IPPROTO_IPV6, IPV6_ADDRFORM, &int(2)), Err(Errno::ENOTCONN));
+    assert_eq!(f.set_option(IPPROTO_IPV6, IPV6_ADDRFORM, &int(10)), Err(Errno::EINVAL));
+    f.connect(&NoPaths, &make(&lo, fourport), true).unwrap();
+    assert_eq!(f.set_option(IPPROTO_IPV6, IPV6_ADDRFORM, &int(2)), Err(Errno::EADDRNOTAVAIL));
+    f.connect(&NoPaths, &make(&src, fourport), true).unwrap();
+    assert_eq!(f.set_option(IPPROTO_IPV6, IPV6_ADDRFORM, &int(2)), Ok(()));
+    assert_eq!(f.family(), AF_INET);
+    assert_eq!(f.peer_name(), Ok(sockaddr::make(ipv4::LOOPBACK, fourport)));
+    assert_eq!(send(&f, None, b"form"), Ok(4));
+    assert_eq!(four.recv(100, 0, true).unwrap().data, b"form");
+    let pf = Dgram::new6(Proto::Ping);
+    assert_eq!(pf.set_option(IPPROTO_IPV6, IPV6_ADDRFORM, &int(2)), Err(Errno::ENOPROTOOPT));
 
     // ICMPv6 echo: the stack answers, and the reply has the identifier of the socket.
     let p = Dgram::new6(Proto::Ping);

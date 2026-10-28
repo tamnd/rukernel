@@ -2,6 +2,18 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The Unix 98 pseudo terminals: /dev/ptmx and the file system devpts, as drivers/tty/pty.c and fs/devpts/inode.c of Linux (#403). `ioctl` has `TIOCGPTN`, `TIOCSPTLCK`, `TIOCGPTLCK`, `TIOCPKT`, `TIOCGPKT`, `TIOCGETD`, `TIOCSETD` (only `N_TTY`) and the terminal commands (`TCGETS`, `TCGETA`, `TCSETS*`, `TCSETA*`, `TIOCGWINSZ`, `TIOCSWINSZ`, `FIONREAD` and others) on both sides of the pair. musl `openpty` works, and LTP ioctl01 passes.
+- `setsockopt` with `IPV6_ADDRFORM` changes a connected UDP socket of `AF_INET6` with an IPv4 peer into an `AF_INET` socket, as net/ipv6/ipv6_sockglue.c of Linux (#403).
+
+### Fixed
+
+- The IPv6 datagram sockets put the routing header of `IPV6_RTHDR` in the packets that they send, as `ipv6_push_nfrag_opts` of Linux (#403). The packet goes to the first address of the route, and the UDP checksum uses the final destination.
+- tools/ltp gives setsockopt11 a limit of 420 seconds, because the test runs for 300 seconds (#403).
+
 ## [0.4.7] - 2026-10-28
 
 ### Added
@@ -14,7 +26,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `madvise` with `MADV_DONTFORK`, `MADV_DOFORK`, `MADV_WIPEONFORK` and `MADV_KEEPONFORK` change `fork` (#385). The child of `fork` does not get a `MADV_DONTFORK` area, and gets a `MADV_WIPEONFORK` area with zero pages.
 - `fcntl` with `F_SETFL` turns `O_ASYNC` on and off, and a pipe sends `SIGIO` or the signal of `F_SETSIG` to the owner when it has data or space, as `kill_fasync` of Linux (#385).
 - `setsockopt` with `IPV6_ADDRFORM` changes a TCP connection of an `AF_INET6` socket to an IPv4 peer into an `AF_INET` socket, as net/ipv6/ipv6_sockglue.c of Linux (#385).
-- `setsockopt` with `IPV6_RTHDR` on an IPv6 datagram socket checks and keeps a routing header of type 2 or 4, and `UDP_CORK` collects the sends in one datagram (#385). The stack does not put the routing header in the packets yet.
+- `setsockopt` with `IPV6_RTHDR` on an IPv6 datagram socket checks and keeps a routing header of type 2 or 4, and `UDP_CORK` collects the sends in one datagram (#385).
 - The `ioctl` commands `RNDGETENTCNT`, `RNDADDTOENTCNT`, `RNDADDENTROPY`, `RNDZAPENTCNT`, `RNDCLEARPOOL` and `RNDRESEEDCRNG` of /dev/random and /dev/urandom, and the sysctls `kernel.random.entropy_avail` and `kernel.random.poolsize` (#385).
 - The block device `ioctl` commands `BLKRAGET`, `BLKRASET`, `BLKFRAGET` and `BLKFRASET`, and the directory /sys/block/DEV/queue (#385).
 - `poll` on /proc/PID/mounts gives `POLLERR | POLLPRI` after a mount or an unmount in the namespace, as `mounts_poll` of Linux (#385).

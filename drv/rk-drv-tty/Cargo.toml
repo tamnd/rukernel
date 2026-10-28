@@ -1,6 +1,6 @@
 [package]
 name = "rk-drv-tty"
-description = "The terminals of rukernel: the line discipline and the serial console."
+description = "The terminals of rukernel: the line discipline, the serial console and the pseudo terminals."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,7 @@ publish.workspace = true
 [dependencies]
 rk-abi.workspace = true
 rk-frame.workspace = true
+rk-fs-tmpfs.workspace = true
 rk-vfs.workspace = true
 zerocopy.workspace = true
 

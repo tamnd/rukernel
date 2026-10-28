@@ -26,11 +26,11 @@ use rk_abi::Errno;
 use rk_abi::native::icmpv6::{ICMPV6_ECHO_REQUEST, ICMPV6_FILTER};
 use rk_abi::native::in6::{
     IPV6_2292DSTOPTS, IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR,
-    IPV6_ADDR_PREFERENCES, IPV6_AUTOFLOWLABEL, IPV6_CHECKSUM, IPV6_DONTFRAG, IPV6_FLOWINFO,
-    IPV6_FLOWINFO_SEND, IPV6_FREEBIND, IPV6_HDRINCL, IPV6_HOPLIMIT, IPV6_MINHOPCOUNT, IPV6_MTU,
-    IPV6_MTU_DISCOVER, IPV6_MULTICAST_ALL, IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF,
-    IPV6_MULTICAST_LOOP, IPV6_PKTINFO, IPV6_PMTUDISC_OMIT, IPV6_RECVDSTOPTS, IPV6_RECVERR,
-    IPV6_RECVERR_RFC4884, IPV6_RECVFRAGSIZE, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
+    IPV6_ADDR_PREFERENCES, IPV6_ADDRFORM, IPV6_AUTOFLOWLABEL, IPV6_CHECKSUM, IPV6_DONTFRAG,
+    IPV6_FLOWINFO, IPV6_FLOWINFO_SEND, IPV6_FREEBIND, IPV6_HDRINCL, IPV6_HOPLIMIT,
+    IPV6_MINHOPCOUNT, IPV6_MTU, IPV6_MTU_DISCOVER, IPV6_MULTICAST_ALL, IPV6_MULTICAST_HOPS,
+    IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP, IPV6_PKTINFO, IPV6_PMTUDISC_OMIT, IPV6_RECVDSTOPTS,
+    IPV6_RECVERR, IPV6_RECVERR_RFC4884, IPV6_RECVFRAGSIZE, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
     IPV6_RECVORIGDSTADDR, IPV6_RECVPATHMTU, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS,
     IPV6_ROUTER_ALERT_ISOLATE, IPV6_RTHDR, IPV6_TCLASS, IPV6_TRANSPARENT, IPV6_UNICAST_HOPS,
     IPV6_UNICAST_IF, IPV6_V6ONLY,
@@ -258,8 +258,8 @@ struct State {
     corked: Option<(Ip, u16, u32, Vec<u8>)>,
     /// `UDP_CORK`: each send adds its data to one datagram, as `MSG_MORE`.
     cork: bool,
-    /// `IPV6_RTHDR`: the routing header that the program set. The stack keeps it for
-    /// `getsockopt`, but does not put it in the packets yet.
+    /// `IPV6_RTHDR`: the routing header that the program set. Each UDP and raw packet of IPv6
+    /// gets it.
     rthdr: Option<Vec<u8>>,
 }
 
@@ -316,6 +316,31 @@ fn rthdr_of(value: &[u8]) -> Option<Option<Vec<u8>>> {
     ok.then(|| Some(value.to_vec()))
 }
 
+/// Makes the routing header of a packet to `dst` from the header `rthdr` of `IPV6_RTHDR`, as
+/// `ipv6_push_rthdr0` and `ipv6_push_rthdr4` in net/ipv6/exthdrs.c of Linux. The packet goes to
+/// the next address of the header, and `dst`, the final destination, takes its place in the
+/// header. Gives the header with the next header `next`, and the destination of the packet.
+pub(crate) fn push_rthdr(rthdr: &[u8], dst: &Ip, next: u8) -> (Vec<u8>, Ip) {
+    let addr = |i: usize| -> Ip {
+        rthdr.get(8 + 16 * i..24 + 16 * i).and_then(|a| a.try_into().ok()).unwrap_or(*dst)
+    };
+    let mut h = rthdr.to_vec();
+    h[0] = next;
+    if rthdr[2] == SRCRT_TYPE_4 {
+        // The segments are in the reverse order: segment 0 is the final destination, and the
+        // packet goes to the segment "segments left".
+        h[8..24].copy_from_slice(dst);
+        (h, addr(usize::from(rthdr[3])))
+    } else {
+        // The packet goes to the first address. The other addresses move up one place, and the
+        // final destination is the last address.
+        let hops = usize::from(rthdr[1]) / 2;
+        h.copy_within(24..8 + 16 * hops, 8);
+        h[8 + 16 * (hops - 1)..8 + 16 * hops].copy_from_slice(dst);
+        (h, addr(0))
+    }
+}
+
 /// A socket of /proc/net/udp, /proc/net/icmp or /proc/net/raw.
 pub(crate) struct SockLine {
     /// The family of the socket.
@@ -338,8 +363,9 @@ pub(crate) struct SockLine {
 
 /// A datagram socket of IPv4 or IPv6.
 pub struct Dgram {
-    /// `AF_INET` or `AF_INET6`.
-    family: u32,
+    /// `AF_INET` or `AF_INET6`. `IPV6_ADDRFORM` changes a UDP socket from `AF_INET6` to
+    /// `AF_INET`.
+    family: AtomicU32,
     proto: Proto,
     ino: u64,
     /// The owner, the file system user ID of the creator as `sk_uid` of Linux.
@@ -375,7 +401,7 @@ impl Dgram {
     fn make(family: u32, proto: Proto) -> Arc<Self> {
         let v6 = family == AF_INET6;
         let sock = Arc::new(Self {
-            family,
+            family: AtomicU32::new(family),
             proto,
             ino: rk_net::next_ino(),
             uid: rk_vfs::cred::current().fsuid,
@@ -427,12 +453,17 @@ impl Dgram {
 
     /// The family of the socket: `AF_INET` or `AF_INET6`.
     pub fn family(&self) -> u32 {
-        self.family
+        self.af()
+    }
+
+    /// The family of the socket.
+    fn af(&self) -> u32 {
+        self.family.load(Ordering::Relaxed)
     }
 
     /// The wildcard address of the family of the socket.
     fn any(&self) -> Ip {
-        if self.family == AF_INET6 { ip::ANY } else { ip::V4_ANY }
+        if self.af() == AF_INET6 { ip::ANY } else { ip::V4_ANY }
     }
 
     /// The values for a line of /proc/net/udp, /proc/net/icmp or /proc/net/raw, or `None` if
@@ -453,7 +484,7 @@ impl Dgram {
             (_, r) => r.unwrap_or((self.any(), 0)),
         };
         Some(SockLine {
-            family: self.family,
+            family: self.af(),
             local: (s.local, port),
             remote,
             connected: s.remote.is_some(),
@@ -615,14 +646,14 @@ impl Dgram {
     /// destination. The caller holds the state.
     fn send_to(&self, s: &mut State, dst: Ip, dport: u16, scope: u32, data: &[u8]) -> Result<()> {
         let Some(d4) = ip::v4(&dst) else {
-            if self.family == AF_INET || ip::v4(&s.local).is_some_and(|a| a != ipv4::ANY) {
+            if self.af() == AF_INET || ip::v4(&s.local).is_some_and(|a| a != ipv4::ANY) {
                 return Err(Errno::ENETUNREACH);
             }
             // A destination of `::` is the local host, as `udpv6_sendmsg` of Linux.
             let dst = if dst == ip::ANY { ip::LOOPBACK } else { dst };
             return self.send6(s, dst, dport, scope, data);
         };
-        if self.family == AF_INET6 {
+        if self.af() == AF_INET6 {
             // Only UDP of IPv6 sends to an IPv4-mapped address, as `udpv6_sendmsg`.
             if self.proto != Proto::Udp {
                 return Err(Errno::EINVAL);
@@ -705,14 +736,22 @@ impl Dgram {
         {
             return self.send_hdrincl6(s, oif, data);
         }
-        let next = stack6::route(&dst, oif)?;
+        // A UDP or raw packet goes to the first address of the routing header, as
+        // `fl6_update_dst`. The checksum uses the final destination.
+        let (ext, first) = match (&s.rthdr, self.proto) {
+            (Some(r), Proto::Udp) => push_rthdr(r, &dst, PROTO_UDP),
+            (Some(r), Proto::Raw(p)) => push_rthdr(r, &dst, p),
+            _ => (Vec::new(), dst),
+        };
+        let next = stack6::route(&first, oif)?;
         let src = if ip::is_any(&s.local) { next.src } else { s.local };
         let hops = if ipv6::is_multicast(&dst) {
             s.mc_hops as u8
         } else {
             s.hops.unwrap_or(ipv6::DEFAULT_HOPS)
         };
-        let out = |next| Out6 { src, dst, next, hops, tclass: s.tclass };
+        let tclass = s.tclass;
+        let out = |next| Out6 { src, dst: first, next, hops, tclass, ext: ext.clone() };
         match self.proto {
             Proto::Udp => {
                 if dport == 0 {
@@ -835,6 +874,27 @@ impl Dgram {
         }))
     }
 
+    /// Changes a connected UDP socket of IPv6 with an IPv4 peer to an `AF_INET` socket, for
+    /// `IPV6_ADDRFORM`, as `do_ipv6_setsockopt` in net/ipv6/ipv6_sockglue.c of Linux. The other
+    /// kinds give `ENOPROTOOPT`.
+    fn addrform(&self, s: &mut State) -> Result<()> {
+        if self.proto != Proto::Udp {
+            return Err(Errno::ENOPROTOOPT);
+        }
+        // A corked datagram of IPv6 waits, as `up->pending == AF_INET6`.
+        if s.corked.as_ref().is_some_and(|c| ip::v4(&c.0).is_none()) {
+            return Err(Errno::EBUSY);
+        }
+        let Some((peer, _)) = s.remote else { return Err(Errno::ENOTCONN) };
+        if s.v6only || ip::v4(&peer).is_none() {
+            return Err(Errno::EADDRNOTAVAIL);
+        }
+        // An IPv4 socket has no options of IPv6, as Linux frees `np->opt`.
+        s.rthdr = None;
+        self.family.store(AF_INET, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Tells if `name` is a flag of the level `IPPROTO_IPV6`. The stack keeps these flags, and
     /// uses only the flags of the control messages in `control6`.
     fn is_flag6(name: u32) -> bool {
@@ -881,6 +941,8 @@ impl Dgram {
         let raw = matches!(self.proto, Proto::Raw(_));
         let hops = |v: i32| if (-1..=255).contains(&v) { Ok(v) } else { Err(Errno::EINVAL) };
         match name {
+            IPV6_ADDRFORM if v != AF_INET as i32 => return Err(Errno::EINVAL),
+            IPV6_ADDRFORM => self.addrform(s)?,
             // A socket with a port or a raw socket keeps its family, as Linux.
             IPV6_V6ONLY if raw || s.port != 0 => return Err(Errno::EINVAL),
             IPV6_V6ONLY => s.v6only = v != 0,
@@ -929,7 +991,7 @@ impl Dgram {
 
 impl Socket for Dgram {
     fn family(&self) -> u32 {
-        self.family
+        self.af()
     }
 
     fn kind(&self) -> u32 {
@@ -943,7 +1005,7 @@ impl Socket for Dgram {
     fn protocol(&self) -> u32 {
         match self.proto {
             Proto::Udp => IPPROTO_UDP,
-            Proto::Ping if self.family == AF_INET6 => SOL_ICMPV6,
+            Proto::Ping if self.af() == AF_INET6 => SOL_ICMPV6,
             Proto::Ping => IPPROTO_ICMP,
             Proto::Raw(p) => u32::from(p),
             Proto::Tcp => IPPROTO_TCP,
@@ -955,13 +1017,13 @@ impl Socket for Dgram {
     }
 
     fn bind(&self, _paths: &dyn PathOps, addr: &[u8]) -> Result<()> {
-        let (addr, port, scope) = sockaddr::parse_bind_in(self.family, addr)?;
+        let (addr, port, scope) = sockaddr::parse_bind_in(self.af(), addr)?;
         let mut s = self.state.lock();
         let mut v6only = s.v6only;
         match ip::v4(&addr) {
             Some(a4) => {
                 // An IPv6 socket binds to an IPv4 address only for UDP, as `__inet6_bind`.
-                if self.family == AF_INET6 && (s.v6only || self.proto != Proto::Udp) {
+                if self.af() == AF_INET6 && (s.v6only || self.proto != Proto::Udp) {
                     return Err(if s.v6only { Errno::EINVAL } else { Errno::EADDRNOTAVAIL });
                 }
                 let ok = {
@@ -1013,7 +1075,7 @@ impl Socket for Dgram {
     }
 
     fn connect(&self, _paths: &dyn PathOps, addr: &[u8], _nonblock: bool) -> Result<()> {
-        let Some((dst, port, scope)) = sockaddr::parse_connect_in(self.family, addr)? else {
+        let Some((dst, port, scope)) = sockaddr::parse_connect_in(self.af(), addr)? else {
             // `AF_UNSPEC` removes the peer, as `__udp_disconnect` of Linux.
             let mut s = self.state.lock();
             s.remote = None;
@@ -1028,7 +1090,7 @@ impl Socket for Dgram {
         let mut s = self.state.lock();
         let (dst, src) = match ip::v4(&dst) {
             Some(d4) => {
-                if self.family == AF_INET6 && (s.v6only || self.proto != Proto::Udp) {
+                if self.af() == AF_INET6 && (s.v6only || self.proto != Proto::Udp) {
                     return Err(Errno::ENETUNREACH);
                 }
                 let d4 = if d4 == ipv4::ANY { ipv4::LOOPBACK } else { d4 };
@@ -1064,7 +1126,7 @@ impl Socket for Dgram {
             return Err(Errno::EOPNOTSUPP);
         }
         let to = match &msg.addr {
-            Some(a) => sockaddr::parse_send_in(self.family, a)?,
+            Some(a) => sockaddr::parse_send_in(self.af(), a)?,
             None => None,
         };
         self.take_error()?;
@@ -1133,7 +1195,7 @@ impl Socket for Dgram {
                 return Ok(Some(Received {
                     data,
                     len: full,
-                    addr: Some(sockaddr::make_in(self.family, &src, port, scope)),
+                    addr: Some(sockaddr::make_in(self.af(), &src, port, scope)),
                     flags: trunc,
                     control: info.map(|i| control6(&s, &i)).unwrap_or_default(),
                     ..Received::default()
@@ -1169,13 +1231,13 @@ impl Socket for Dgram {
     fn name(&self) -> Vec<u8> {
         let s = self.state.lock();
         let port = if matches!(self.proto, Proto::Raw(_)) { 0 } else { s.port };
-        sockaddr::make_in(self.family, &s.local, port, stack6::scope_of(&s.local, s.oif))
+        sockaddr::make_in(self.af(), &s.local, port, stack6::scope_of(&s.local, s.oif))
     }
 
     fn peer_name(&self) -> Result<Vec<u8>> {
         let s = self.state.lock();
         let (a, p) = s.remote.ok_or(Errno::ENOTCONN)?;
-        Ok(sockaddr::make_in(self.family, &a, p, stack6::scope_of(&a, s.oif)))
+        Ok(sockaddr::make_in(self.af(), &a, p, stack6::scope_of(&a, s.oif)))
     }
 
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
@@ -1183,7 +1245,7 @@ impl Socket for Dgram {
         match level {
             SOL_SOCKET => Ok(match name {
                 SO_TYPE => int(self.kind() as i32),
-                SO_DOMAIN => int(self.family as i32),
+                SO_DOMAIN => int(self.af() as i32),
                 SO_PROTOCOL => int(self.protocol() as i32),
                 SO_ERROR => int(s.error.take().map_or(0, |e| i32::from(e.get()))),
                 SO_ACCEPTCONN => int(0),
@@ -1201,11 +1263,9 @@ impl Socket for Dgram {
                 IP_MULTICAST_LOOP => int(i32::from(s.multicast_loop)),
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
-            IPPROTO_IPV6 if self.family == AF_INET6 => self.get_option6(&s, name),
-            SOL_RAW if self.family == AF_INET6 && name == IPV6_CHECKSUM => {
-                self.get_option6(&s, name)
-            }
-            SOL_ICMPV6 if self.family == AF_INET6 && self.proto == Proto::Raw(PROTO_ICMPV6) => {
+            IPPROTO_IPV6 if self.af() == AF_INET6 => self.get_option6(&s, name),
+            SOL_RAW if self.af() == AF_INET6 && name == IPV6_CHECKSUM => self.get_option6(&s, name),
+            SOL_ICMPV6 if self.af() == AF_INET6 && self.proto == Proto::Raw(PROTO_ICMPV6) => {
                 if name != ICMP6_FILTER {
                     return Err(Errno::EINVAL);
                 }
@@ -1223,7 +1283,7 @@ impl Socket for Dgram {
                 Ok(int(i32::from(s.cork)))
             }
             IPPROTO_UDP if self.proto == Proto::Udp => Err(Errno::ENOPROTOOPT),
-            _ if self.family == AF_INET6 => Err(Errno::ENOPROTOOPT),
+            _ if self.af() == AF_INET6 => Err(Errno::ENOPROTOOPT),
             _ => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -1269,7 +1329,7 @@ impl Socket for Dgram {
                     _ => return Err(Errno::ENOPROTOOPT),
                 }
             }
-            IPPROTO_IPV6 if self.family == AF_INET6 => self.set_option6(&mut s, name, value)?,
+            IPPROTO_IPV6 if self.af() == AF_INET6 => self.set_option6(&mut s, name, value)?,
             IPPROTO_UDP if self.proto == Proto::Udp && name == UDP_CORK => {
                 s.cork = int_of(value)? != 0;
                 // The end of the cork sends the datagram that waits, as
@@ -1280,10 +1340,10 @@ impl Socket for Dgram {
                     let _ = self.send_to(&mut s, dst, port, scope, &data);
                 }
             }
-            SOL_RAW if self.family == AF_INET6 && name == IPV6_CHECKSUM => {
+            SOL_RAW if self.af() == AF_INET6 && name == IPV6_CHECKSUM => {
                 self.set_option6(&mut s, name, value)?;
             }
-            SOL_ICMPV6 if self.family == AF_INET6 && self.proto == Proto::Raw(PROTO_ICMPV6) => {
+            SOL_ICMPV6 if self.af() == AF_INET6 && self.proto == Proto::Raw(PROTO_ICMPV6) => {
                 if name != ICMP6_FILTER {
                     return Err(Errno::ENOPROTOOPT);
                 }

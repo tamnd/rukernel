@@ -289,6 +289,9 @@ pub(crate) struct Out6 {
     pub hops: u8,
     /// The traffic class.
     pub tclass: u8,
+    /// The routing header between the IPv6 header and the payload, or nothing. Its next header
+    /// is `next`.
+    pub ext: Vec<u8>,
 }
 
 /// Sends a packet with the payload `payload` on the route `next`, as `ip6_xmit` of Linux. The
@@ -296,14 +299,18 @@ pub(crate) struct Out6 {
 pub(crate) fn output(next: &Next6, out: &Out6, payload: &[u8]) -> Result<()> {
     let dev = dev::by_index(next.ifindex).ok_or(Errno::ENETUNREACH)?;
     let mtu = if next.mtu != 0 { next.mtu.min(dev.mtu()) } else { dev.mtu() };
-    if payload.len() > usize::from(u16::MAX) || HLEN + payload.len() > mtu as usize {
+    let len = out.ext.len() + payload.len();
+    if len > usize::from(u16::MAX) || HLEN + len > mtu as usize {
         return Err(Errno::EMSGSIZE);
     }
-    let mut h = Header::new(out.src, out.dst, out.next, payload.len());
+    // The fixed header names the routing header, as `ipv6_push_nfrag_opts`.
+    let first = if out.ext.is_empty() { out.next } else { ipv6::NEXT_ROUTING };
+    let mut h = Header::new(out.src, out.dst, first, len);
     h.hops = out.hops;
     h.tclass = out.tclass;
-    let mut buf = NetBuf::new(HEADROOM, HLEN + payload.len());
+    let mut buf = NetBuf::new(HEADROOM, HLEN + len);
     buf.extend_from_slice(&h.to_bytes());
+    buf.extend_from_slice(&out.ext);
     buf.extend_from_slice(payload);
     if out.next == PROTO_ICMPV6 {
         count_icmp_out(payload);
@@ -597,8 +604,14 @@ fn send_icmp(src: &Ip, dst: &Ip, ifindex: u32, mut msg: Vec<u8>) {
     msg[2..4].fill(0);
     let sum = checksum::upper(src, dst, PROTO_ICMPV6, &msg);
     msg[2..4].copy_from_slice(&sum.to_be_bytes());
-    let out =
-        Out6 { src: *src, dst: *dst, next: PROTO_ICMPV6, hops: ipv6::DEFAULT_HOPS, tclass: 0 };
+    let out = Out6 {
+        src: *src,
+        dst: *dst,
+        next: PROTO_ICMPV6,
+        hops: ipv6::DEFAULT_HOPS,
+        tclass: 0,
+        ext: Vec::new(),
+    };
     // An ICMPv6 message that the stack makes is not for a socket, and a lost one is not an
     // error.
     if output(&next, &out, &msg).is_err() {
