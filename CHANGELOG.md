@@ -2,8 +2,6 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
-
 ## [0.4.11] - 2026-10-29
 
 ### Added
