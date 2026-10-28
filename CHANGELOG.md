@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.4] - 2026-10-28
+
 ### Added
 
 - Kernel Samepage Merging, as mm/ksm.c of Linux (#364). `madvise(MADV_MERGEABLE)` and `prctl(PR_SET_MEMORY_MERGE)` make the private anonymous pages of a process mergeable, and `MADV_UNMERGEABLE` and `PR_SET_MEMORY_MERGE` with 0 make them private again. The kernel thread `ksmd` scans the mergeable pages and maps each group of pages with the same contents to one read only page, and a write to that page copies it. The files of /sys/kernel/mm/ksm show the counters and change the settings (`run`, `pages_to_scan`, `sleep_millisecs`, `max_page_sharing`, `merge_across_nodes`, `use_zero_pages`, `smart_scan`), and /proc/PID/ksm_stat and /proc/PID/ksm_merging_pages show the counters of a process. `tools/ltp/kconfig` now sets `CONFIG_KSM`.
@@ -803,6 +805,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.4]: https://github.com/tamnd/rukernel/releases/tag/v0.4.4
 [0.4.3]: https://github.com/tamnd/rukernel/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tamnd/rukernel/releases/tag/v0.4.2
 [0.4.1]: https://github.com/tamnd/rukernel/releases/tag/v0.4.1
