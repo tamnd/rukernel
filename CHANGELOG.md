@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.5] - 2026-10-28
+
 ### Added
 
 - The cgroup v2 freezer and the notification of cgroup events, as kernel/cgroup/freezer.c of Linux (#366). A write of 1 to `cgroup.freeze` stops each thread of the cgroup and of its descendants at its next return to user mode, and a new child cgroup of a frozen cgroup is frozen too. `cgroup.events` tells `frozen 1` when each thread waits, and `poll` of `cgroup.events` and `cgroup.freeze` gives `POLLPRI` and `POLLERR` when a value changes after the last read.
@@ -851,6 +853,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.5]: https://github.com/tamnd/rukernel/releases/tag/v0.4.5
 [0.4.4]: https://github.com/tamnd/rukernel/releases/tag/v0.4.4
 [0.4.3]: https://github.com/tamnd/rukernel/releases/tag/v0.4.3
 [0.4.2]: https://github.com/tamnd/rukernel/releases/tag/v0.4.2
