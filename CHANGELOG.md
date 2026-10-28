@@ -30,6 +30,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `TIOCGPTPEER` on a master from a bind mount of /dev/pts/ptmx on /dev/ptmx finds the devpts mount, as `devpts_mntget` of Linux (#433). It failed before.
 - `KPF_SWAPBACKED` is bit 14 in `/proc/kpageflags`, as in Linux (#430). It was bit 23.
 - The KSM zero frame has no `PM_FILE` bit in `/proc/PID/pagemap`, as the zero page of Linux (#430).
+- An exec maps each page of an ELF segment that has only file data from the shared pages of the file, as Linux maps the page cache, and a write copies the page (#423). Before, each exec read and copied each page of the program again. Under QEMU without KVM, fork and exec of BusyBox is about 2 to 4 times faster, and the phases of cgroup_fj_stress that run many commands are about 3 times faster. Eleven of the twelve cgroup_fj_stress tests for cpuset, cpu and memory with 2_9 and 10_3 now end in 99 to 218 s, in the 240 s limit of the runner.
+- The fault of an ELF page that the file data does not fill writes the data once and sets only the rest of the page to zero, and `execve` reads its strings in chunks of 128 bytes, not in a zeroed page for each string (#423).
+- tools/ltp/notes.txt gives the causes of the TWARN of cgroup_fj_function_cpuset, of memcg_test_3, and of memcontrol03 and memcontrol04, with the results of Linux 6.8 in the same runner (#423).
 
 ## [0.4.9] - 2026-10-29
 

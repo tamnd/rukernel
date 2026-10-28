@@ -358,6 +358,8 @@ pub fn init() {
     rk_vfs::inode::set_clock(crate::info::realtime);
     rk_vfs::cred::set_current(|| rk_proc::current_thread().map(|t| t.process().cred()));
     rk_vfs::blockdev::set_account(rk_proc::cgroup::io_account);
+    // The segments of a program use the shared pages of the file, so an exec does not copy them.
+    rk_proc::exec::set_file_pages_hook(crate::mm::exec_pages);
     // The page cache is charged to the memory cgroup of the writer, and a memory cgroup at its
     // limit takes its clean cache back. The charged cache of all cgroups stays below a quarter
     // of the memory.

@@ -279,6 +279,12 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
         .clone()
 }
 
+/// Gives the pages of `inode`, which has the path `path`, for the segments of a program that exec
+/// maps. Exec and `mmap` share the pages.
+pub(crate) fn exec_pages(inode: &InodeRef, path: Vec<u8>) -> rk_mm::FileRef {
+    file_pages(inode, path)
+}
+
 /// The token of the shared mappings that can write a file, by the address of the inode. Each
 /// such mapping holds the token, so the file has one while the token lives, as
 /// `i_mmap_writable` of Linux counts them.

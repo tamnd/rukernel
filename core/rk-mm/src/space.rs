@@ -1873,12 +1873,15 @@ impl AddressSpace {
     /// Gives `EFAULT` for a bad address, and `ENAMETOOLONG` if no zero byte is in the first `max`
     /// bytes.
     pub fn read_cstr(&self, addr: usize, max: usize) -> Result<Vec<u8>, Errno> {
+        // Most strings are short, as the arguments and the environment of an exec, so the string
+        // is read in small chunks and not in a page each time.
+        const CHUNK: usize = 128;
         let mut out = Vec::new();
         let mut at = addr;
+        let mut chunk = [0u8; CHUNK];
         while out.len() < max {
-            // Read up to the end of the page, so a string at the end of an area works.
-            let n = (PAGE_SIZE - at % PAGE_SIZE).min(max - out.len());
-            let mut chunk = [0u8; PAGE_SIZE];
+            // Read up to the end of the page at most, so a string at the end of an area works.
+            let n = (PAGE_SIZE - at % PAGE_SIZE).min(max - out.len()).min(CHUNK);
             self.read(at, &mut chunk[..n])?;
             if let Some(zero) = chunk[..n].iter().position(|&b| b == 0) {
                 out.extend_from_slice(&chunk[..zero]);
