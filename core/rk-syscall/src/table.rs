@@ -177,6 +177,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::WAITID => process::waitid(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::KILL => signal::kill(cx, a[0], a[1]),
         nr::UNAME => info::uname(cx, a[0]),
+        nr::PERSONALITY => info::personality(cx, a[0]),
+        nr::REBOOT => info::reboot(cx, a[0], a[1], a[2]),
         nr::SYSLOG => info::syslog(cx, a[0], a[1], a[2]),
         nr::FCNTL => fs::fcntl(cx, a[0], a[1], a[2]),
         nr::FLOCK => fs::flock(cx, a[0], a[1]),
@@ -302,6 +304,10 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SECCOMP => seccomp::seccomp(cx, a[0], a[1], a[2]),
         #[cfg(target_arch = "x86_64")]
         nr::ARCH_PRCTL => process::arch_prctl(cx, a[0], a[1]),
+        #[cfg(target_arch = "x86_64")]
+        nr::IOPERM => process::ioperm(cx, a[0], a[1], a[2]),
+        #[cfg(target_arch = "x86_64")]
+        nr::IOPL => process::iopl(cx, a[0]),
         nr::SYNC => {
             // `sync` does not give an error, as in Linux.
             if let Ok(fs) = cx.fs() {
@@ -395,6 +401,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PIDFD_SEND_SIGNAL => pidfd::pidfd_send_signal(cx, a[0], a[1], a[2], a[3]),
         nr::SENDFILE => splice::sendfile(cx, a[0], a[1], a[2], a[3]),
         nr::SPLICE => splice::splice(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::TEE => splice::tee(cx, a[0], a[1], a[2], a[3]),
+        nr::VMSPLICE => splice::vmsplice(cx, a[0], a[1], a[2], a[3]),
         nr::COPY_FILE_RANGE => splice::copy_file_range(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::FADVISE64 => splice::fadvise64(cx, a[0], a[1], a[2], a[3]),
         nr::PIDFD_GETFD => pidfd::pidfd_getfd(cx, a[0], a[1], a[2]),

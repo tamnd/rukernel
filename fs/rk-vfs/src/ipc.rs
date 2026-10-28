@@ -11,7 +11,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::Once;
 
@@ -52,6 +52,27 @@ impl Tunable {
     }
 }
 
+/// A limit of the type `unsigned long` that a sysctl file reads and writes. Each value is valid,
+/// as `proc_doulongvec_minmax` of Linux without a range.
+pub struct LongTunable(AtomicU64);
+
+impl LongTunable {
+    /// Makes a limit with the first value `value`.
+    pub const fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+
+    /// The value.
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Changes the value.
+    pub fn set(&self, value: u64) {
+        self.0.store(value, Ordering::Relaxed);
+    }
+}
+
 /// The largest number of System V objects of one kind, as `IPCMNI` of Linux.
 pub const IPCMNI: i32 = 32768;
 
@@ -67,6 +88,14 @@ pub static MSG_NEXT_ID: Tunable = Tunable::new(-1, -1, i32::MAX);
 pub static SEM_NEXT_ID: Tunable = Tunable::new(-1, -1, i32::MAX);
 /// The ID of the next new shared memory segment, or -1, `kernel.shm_next_id`.
 pub static SHM_NEXT_ID: Tunable = Tunable::new(-1, -1, i32::MAX);
+
+/// The largest size of a System V shared memory segment, `kernel.shmmax`. The default is
+/// `ULONG_MAX - (1 << 24)`, as `SHMMAX` of Linux.
+pub static SHMMAX: LongTunable = LongTunable::new(u64::MAX - (1 << 24));
+/// The largest number of pages of all the System V shared memory segments, `kernel.shmall`.
+pub static SHMALL: LongTunable = LongTunable::new(u64::MAX - (1 << 24));
+/// The largest number of System V shared memory segments, `kernel.shmmni`.
+pub static SHMMNI: Tunable = Tunable::new(4096, 0, IPCMNI);
 
 /// The largest number of POSIX message queues, `fs.mqueue.queues_max`.
 pub static MQ_QUEUES_MAX: Tunable = Tunable::new(256, 0, i32::MAX);
@@ -93,6 +122,7 @@ pub fn sysctl(name: &str) -> Option<&'static Tunable> {
         "kernel/msg_next_id" => &MSG_NEXT_ID,
         "kernel/sem_next_id" => &SEM_NEXT_ID,
         "kernel/shm_next_id" => &SHM_NEXT_ID,
+        "kernel/shmmni" => &SHMMNI,
         "fs/mqueue/queues_max" => &MQ_QUEUES_MAX,
         "fs/mqueue/msg_max" => &MQ_MSG_MAX,
         "fs/mqueue/msgsize_max" => &MQ_MSGSIZE_MAX,
@@ -115,7 +145,19 @@ pub const SYSCTL_NAMES: &[&str] = &[
     "kernel/msgmni",
     "kernel/sem_next_id",
     "kernel/shm_next_id",
+    "kernel/shmall",
+    "kernel/shmmax",
+    "kernel/shmmni",
 ];
+
+/// Finds the limit of the type `unsigned long` of the sysctl file `name`.
+pub fn long_sysctl(name: &str) -> Option<&'static LongTunable> {
+    match name {
+        "kernel/shmall" => Some(&SHMALL),
+        "kernel/shmmax" => Some(&SHMMAX),
+        _ => None,
+    }
+}
 
 /// Gives the first ID for a new object that is not in use: the value of the `*_next_id` file
 /// `next_id` if it is set, and else `next`. `used` tells if an ID is in use. The value of the
@@ -461,6 +503,6 @@ mod tests {
         assert_eq!(t.get(), -1);
         assert_eq!(alloc_id(&t, 3, |_| false), 3);
         assert!(sysctl("kernel/msgmni").is_some());
-        assert!(SYSCTL_NAMES.iter().all(|n| sysctl(n).is_some()));
+        assert!(SYSCTL_NAMES.iter().all(|n| sysctl(n).is_some() || long_sysctl(n).is_some()));
     }
 }

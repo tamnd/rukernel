@@ -197,6 +197,7 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
         if user != 0 {
             thread.add_user_ticks(user);
             rk_proc::timer::check_cpu_timers(&thread);
+            rk_proc::timer::check_cpu_limit(&thread);
         }
         match reason {
             ReturnReason::Syscall => {

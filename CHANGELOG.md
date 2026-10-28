@@ -18,6 +18,17 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - tmpfs keeps the data of a file in pages, and a page that the file did not write is a hole with no memory, as mm/shmem.c of Linux (#378). A write far past the end takes only the pages that it writes, `FALLOC_FL_PUNCH_HOLE` frees the full pages, `st_blocks` counts the pages, and `SEEK_DATA` and `SEEK_HOLE` find the holes. The mount options `size=` and `nr_blocks=` limit the data and `statfs` shows the limit. Before, a write at 4 GiB tried to get 4 GiB of memory and gave `ENOSPC` (LTP open12, openat02, fallocate04, fallocate05 and lseek11).
 - `pipe2(O_DIRECT)` makes a pipe that writes packets, as Linux (#378).
 - A TCP socket takes `MCAST_JOIN_GROUP` and `MCAST_LEAVE_GROUP`, and UDP sends with `MSG_MORE` add to one datagram until a send without it, as Linux (#378).
+- The links ipc, mnt, pid, pid_for_children, time, time_for_children, user and uts in /proc/PID/ns, as fs/proc/namespaces.c of Linux (#377). `setns` takes these files and a pidfd with the flags of these types. A join of a mount name space needs `CAP_SYS_ADMIN` and `CAP_SYS_CHROOT`, and a join of the other types needs `CAP_SYS_ADMIN`. The user name space of the caller gives `EINVAL`.
+- The `ioctl` commands of the name space files, as fs/nsfs.c of Linux (#377): `NS_GET_USERNS`, `NS_GET_PARENT`, `NS_GET_NSTYPE`, `NS_GET_OWNER_UID`, `NS_GET_MNTNS_ID` and the four commands that change a PID between name spaces.
+- `personality`, `reboot`, `ioperm`, `iopl`, `tee` and `vmsplice` (#377). `personality` keeps the persona and `UNAME26` changes the release of `uname`. `reboot` checks the magic numbers and `CAP_SYS_BOOT`, and `LINUX_REBOOT_CMD_CAD_ON` and `CAD_OFF` work. `ioperm` and `iopl` do the checks of Linux and keep the level, but the kernel does not give port access.
+- `prctl` commands (#377): `PR_SET_PDEATHSIG` and `PR_GET_PDEATHSIG`, `PR_SET_TSC` and `PR_GET_TSC` (x86, with `CR4.TSD`), `PR_SET_TIMERSLACK` and `PR_GET_TIMERSLACK`, `PR_SET_THP_DISABLE` and `PR_GET_THP_DISABLE`, and `PR_GET_SPECULATION_CTRL` and `PR_SET_SPECULATION_CTRL`.
+- The file /proc/PID/timerslack_ns (#377). A write for another process needs `CAP_SYS_NICE`.
+- `RLIMIT_CPU` (#377). A process gets `SIGXCPU` at the soft limit and each second after it, and `SIGKILL` at the hard limit, as kernel/time/posix-cpu-timers.c of Linux.
+- `RLIMIT_SIGPENDING` (#377). A real-time signal that is not from `kill` gives `EAGAIN` when the user has that many signals in the queues.
+- `ARCH_GET_CPUID` and `ARCH_SET_CPUID` of `arch_prctl` (#377). CPUID is always on, so `ARCH_SET_CPUID` gives `ENODEV`.
+- `ru_maxrss` of `getrusage` (#377). The kernel keeps the largest resident set of a process at `execve` and at the exit, and a wait adds the value of the child to its parent.
+- The sysctl files fs.pipe-max-size, fs.pipe-user-pages-hard, fs.pipe-user-pages-soft and kernel.core_pattern, and 64-bit values for kernel.shmmax and kernel.shmall (#377). `fcntl(F_SETPIPE_SZ)` takes fs.pipe-max-size as its limit without `CAP_SYS_RESOURCE`.
+- `KCMP_IO` and `KCMP_SYSVSEM` of `kcmp` (#377).
 
 ### Changed
 
@@ -26,6 +37,18 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - Errors of the file, mount and socket calls now follow Linux (#378). An `O_PATH` file gives `EBADF` to the calls that need an open file. `mount` gives `ENOENT` for a symbolic link as the target, `EINVAL` for no type or no source, and `EBUSY` for the same file system on the same place. `umount2` gives `EINVAL` for a path that is not a mount, `EBUSY` for a mount with open files, and `EAGAIN` for the first `MNT_EXPIRE`. `link` makes its checks in the order of Linux. A mount with `MS_NODEV` stops the opens of devices, `MS_NOEXEC` stops `execve`, and `MS_NOSYMFOLLOW` stops symbolic links. `fsync` and `fdatasync` give `EINVAL` for a pipe, a socket and a character device. `copy_file_range` gives `EFBIG` at the largest file size, and `FICLONE` and `FICLONERANGE` give `EOPNOTSUPP`. `socket` gives `EAFNOSUPPORT` and `EINVAL` for a bad family or type, `socketpair` gives `EOPNOTSUPP` for a family that is not `AF_UNIX`, `getsockopt` gives `EOPNOTSUPP` or `ENOPROTOOPT` for an unknown option as Linux, `sendmsg` gives `EMSGSIZE` for too many buffers, and `connect` to a UNIX socket file without write permission gives `EACCES`. The LTP tests of the files, mounts and sockets groups of the issue pass now, and `tools/ltp/notes.txt` gives the reason for each test that musl or BusyBox stops.
+- `pidfd_send_signal` takes a /proc/PID directory, and checks the permission to send the signal (#377).
+- `pidfd_getfd`, `get_robust_list` for another process, `process_vm_readv` and `process_vm_writev` need the permission of `ptrace` (#377).
+- `sched_setaffinity` of another process needs the same user or `CAP_SYS_NICE` (#377).
+- `setpgid` of a child that ran `execve` gives `EACCES` (#377).
+- `execve` with an empty argument list gives the program an empty `argv[0]`, as fs/exec.c of Linux (#377).
+- The overrun count of a POSIX timer stops at `INT_MAX`, and a `CLOCK_REALTIME` timer with an absolute time before boot counts the intervals before boot (#377).
+- An event file that AIO writes stops at `UINT64_MAX`, and `poll` then gives `POLLERR`, as `eventfd_signal_mask` of Linux (#377).
+- `clock_nanosleep` on `CLOCK_THREAD_CPUTIME_ID` gives `EOPNOTSUPP` (#377).
+- `waitid(P_PIDFD)` on a pidfd with `O_NONBLOCK` gives `EAGAIN` when the child did not change (#377).
+- A `clone` that fails after it made the child, for example with a bad address for `CLONE_PIDFD`, ends the child, so no child stays that never runs (#377).
+- `seccomp(SECCOMP_SET_MODE_FILTER)` without `CAP_SYS_ADMIN` and without no_new_privs gives `EACCES` (#377).
+- `poll`, `select` and `pselect` with `STICKY_TIMEOUTS` in the persona do not change the timeout (#377).
 
 ## [0.4.4] - 2026-10-28
 

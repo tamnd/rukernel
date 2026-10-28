@@ -100,8 +100,20 @@ pub(crate) fn timespec_deadline(cx: &Cx<'_>, tsp: u64) -> Result<Option<u64>, Er
     Ok(Some(deadline_after(ns)))
 }
 
+/// The `STICKY_TIMEOUTS` flag of the personality, from include/uapi/linux/personality.h. With
+/// it, `select` and `poll` do not write the time that is left.
+const STICKY_TIMEOUTS: u32 = 0x400_0000;
+
+/// Tells if the caller has `STICKY_TIMEOUTS`.
+fn sticky(cx: &Cx<'_>) -> bool {
+    cx.process().personality() & STICKY_TIMEOUTS != 0
+}
+
 /// Writes the time that is left back to a `timespec`, as `poll_select_finish` does.
 fn write_timespec_left(cx: &Cx<'_>, tsp: u64, deadline: Option<u64>) {
+    if sticky(cx) {
+        return;
+    }
     if let (Some(d), true) = (deadline, tsp != 0) {
         let ns = left(d);
         let ts = KernelTimespec {
@@ -273,7 +285,7 @@ pub(crate) fn select(cx: &Cx<'_>, nfds: u64, inp: u64, outp: u64, exp: u64, tvp:
         Some(deadline_after(ns))
     };
     let r = do_select(cx, nfds, [inp, outp, exp], deadline);
-    if let Some(d) = deadline {
+    if let (Some(d), false) = (deadline, sticky(cx)) {
         let ns = left(d);
         let tv = KernelOldTimeval {
             tv_sec: (ns / NSEC_PER_SEC) as i64,

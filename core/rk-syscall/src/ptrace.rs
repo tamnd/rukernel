@@ -400,6 +400,10 @@ fn process_vm(
     let local = read_iovecs(cx, local.0, local.1)?;
     let remote = read_iovecs(cx, remote.0, remote.1)?;
     let thread: Arc<Thread> = rk_proc::find_thread(pid as u32).ok_or(Errno::ESRCH)?;
+    // `mm_access` with `PTRACE_MODE_ATTACH_REALCREDS`, as mm/process_vm_access.c of Linux.
+    if !Arc::ptr_eq(thread.process(), cx.process()) {
+        may_attach(cx, &thread)?;
+    }
     let other = thread.process().vm().ok_or(Errno::ESRCH)?;
     let me = cx.vm()?;
     let mut buf = vec![0u8; 4096];

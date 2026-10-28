@@ -5,6 +5,8 @@
 
 /// The number of resources. Linux names it `RLIM_NLIMITS`.
 pub const RLIM_NLIMITS: usize = 16;
+/// The CPU time of a process in seconds.
+pub const RLIMIT_CPU: usize = 0;
 /// The size of a file that a process writes.
 pub const RLIMIT_FSIZE: usize = 1;
 /// The size of a core file.
@@ -19,6 +21,8 @@ pub const RLIMIT_NOFILE: usize = 7;
 pub const RLIMIT_MEMLOCK: usize = 8;
 /// The default of `RLIMIT_MEMLOCK`, `MLOCK_LIMIT` of Linux: 8 MiB.
 pub const MLOCK_LIMIT: u64 = 8 << 20;
+/// The number of signals that wait in the queues of the processes of a user.
+pub const RLIMIT_SIGPENDING: usize = 11;
 /// The lowest nice value without `CAP_SYS_NICE`, as `20 - limit`.
 pub const RLIMIT_NICE: usize = 13;
 /// The highest real-time priority without `CAP_SYS_NICE`.

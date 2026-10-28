@@ -182,19 +182,31 @@ pub(crate) fn timer_settime(cx: &Cx<'_>, id: u64, flags: u64, new: u64, old: u64
     let value = timespec_ns(&new.it_value)?;
     let interval = timespec_ns(&new.it_interval)?;
     let now = timer.now();
+    let mut late = 0;
     let expires = if value == 0 {
         0
     } else if flags as u32 & TIMER_ABSTIME != 0 {
         // A time in the past fires the timer at once.
         if timer.is_realtime() {
-            crate::info::boot_ns(CLOCK_REALTIME, value).max(1)
+            let offset = rk_frame::time::realtime_offset_ns() as i64;
+            let back = i128::from(offset) - i128::from(value);
+            if back > 0 && interval != 0 {
+                // The time is before boot. The timer fires at the first interval after boot,
+                // and the intervals before boot are overruns, as Linux counts the overruns
+                // from the absolute time in `common_hrtimer_rearm`.
+                let back = u64::try_from(back).unwrap_or(u64::MAX);
+                late = back / interval + 1;
+                late.saturating_mul(interval).saturating_sub(back).max(1)
+            } else {
+                crate::info::boot_ns(CLOCK_REALTIME, value).max(1)
+            }
         } else {
             value.max(1)
         }
     } else {
         now.saturating_add(value)
     };
-    let prev = timer.arm_abs(expires, interval, flags as u32 & TIMER_ABSTIME != 0);
+    let prev = timer.arm_late(expires, interval, flags as u32 & TIMER_ABSTIME != 0, late);
     cx.write_opt(old, &itimerspec(prev))?;
     Ok(0)
 }

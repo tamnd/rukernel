@@ -17,7 +17,7 @@ use crate::inode::{Inode, InodeRef, Metadata, Result, SetAttr};
 use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::ioctls::FIONREAD;
 use rk_abi::native::stat::S_IFIFO;
@@ -295,8 +295,23 @@ impl FileOps for PipeEnd {
     }
 }
 
-/// The largest capacity of a pipe, the default of `/proc/sys/fs/pipe-max-size` of Linux.
-pub const PIPE_MAX_SIZE: usize = 1 << 20;
+/// The largest capacity of a pipe that a process without `CAP_SYS_RESOURCE` can set, the sysctl
+/// `fs.pipe-max-size`. A new pipe of such a process is not larger, as `alloc_pipe_info` of Linux.
+pub static PIPE_MAX_SIZE: AtomicUsize = AtomicUsize::new(1 << 20);
+
+/// Rounds `size` up to a power of two count of pages, as `round_pipe_size` of Linux. Gives `None`
+/// for a size above 2 GiB.
+pub fn round_pipe_size(size: usize) -> Option<usize> {
+    if size > (1 << 31) {
+        return None;
+    }
+    Some(size.max(PAGE_SIZE).div_ceil(PAGE_SIZE).next_power_of_two() * PAGE_SIZE)
+}
+
+/// Tells if the process that runs now can pass `fs.pipe-max-size`.
+fn may_pass_max() -> bool {
+    crate::cred::current().capable(crate::cred::cap::SYS_RESOURCE)
+}
 
 const PAGE_SIZE: usize = 4096;
 
@@ -330,18 +345,16 @@ pub fn pipe_space(file: &File) -> Result<usize> {
 /// # Errors
 ///
 /// Gives `EBADF` if the file is not a pipe, `EINVAL` for a size that is too large, `EPERM` for
-/// a size above `PIPE_MAX_SIZE`, and `EBUSY` if the pipe holds more data than the new capacity.
+/// a larger size above `PIPE_MAX_SIZE` without `CAP_SYS_RESOURCE`, and `EBUSY` if the pipe holds
+/// more data than the new capacity, as `pipe_set_size` of Linux.
 pub fn set_pipe_size(file: &File, size: usize) -> Result<usize> {
     let end = end_of(file)?;
-    if size > (1 << 31) {
-        return Err(Errno::EINVAL);
-    }
-    let size = size.max(PAGE_SIZE).div_ceil(PAGE_SIZE).next_power_of_two() * PAGE_SIZE;
-    if size > PIPE_MAX_SIZE {
-        return Err(Errno::EPERM);
-    }
+    let size = round_pipe_size(size).ok_or(Errno::EINVAL)?;
     {
         let mut s = end.pipe.state.lock();
+        if size > s.size && size > PIPE_MAX_SIZE.load(Ordering::Relaxed) && !may_pass_max() {
+            return Err(Errno::EPERM);
+        }
         if s.buf.len() > size {
             return Err(Errno::EBUSY);
         }
@@ -349,6 +362,92 @@ pub fn set_pipe_size(file: &File, size: usize) -> Result<usize> {
     }
     end.pipe.wake(false);
     Ok(size)
+}
+
+/// Waits until the pipe of `end` has data or no writer, as `ipipe_prep` in fs/splice.c of Linux.
+/// Then `take` gets the data under the lock and gives the result.
+fn wait_data<T>(end: &PipeEnd, nonblock: bool, mut take: impl FnMut(&mut State) -> T) -> Result<T> {
+    end.pipe.wait.wait_interruptible(|| {
+        let mut s = end.pipe.state.lock();
+        if !s.buf.is_empty() || s.writers == 0 {
+            return Ok(Some(take(&mut s)));
+        }
+        if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
+    })
+}
+
+/// Waits until the pipe of `end` has space, as `opipe_prep` in fs/splice.c of Linux, and adds
+/// the bytes of `data` that fit. Gives the count of bytes. A pipe without a reader gives `EPIPE`.
+fn put_some(end: &PipeEnd, data: &[u8], nonblock: bool) -> Result<usize> {
+    let n = end.pipe.wait.wait_interruptible(|| {
+        let mut s = end.pipe.state.lock();
+        if s.readers == 0 {
+            return Err(Errno::EPIPE);
+        }
+        let space = s.size.saturating_sub(s.buf.len());
+        if space > 0 {
+            let n = data.len().min(space);
+            s.buf.extend(&data[..n]);
+            return Ok(Some(n));
+        }
+        if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
+    })?;
+    if n > 0 {
+        end.pipe.wake(true);
+    }
+    Ok(n)
+}
+
+/// Copies up to `len` bytes from the pipe of `input` to the pipe of `output`, for `tee`. The
+/// bytes stay in `input`, as `link_pipe` in fs/splice.c of Linux. Gives 0 if `input` is empty
+/// and has no writer.
+///
+/// # Errors
+///
+/// Gives `EINVAL` if a file is not a pipe or both files are of the same pipe, `EAGAIN` with
+/// `nonblock` if a pipe is not ready, and `EPIPE` if `output` has no reader.
+pub fn tee(input: &File, output: &File, len: usize, nonblock: bool) -> Result<usize> {
+    let (i, o) = (end_of(input), end_of(output));
+    let (Ok(i), Ok(o)) = (i, o) else { return Err(Errno::EINVAL) };
+    if Arc::ptr_eq(&i.pipe, &o.pipe) {
+        return Err(Errno::EINVAL);
+    }
+    let data: alloc::vec::Vec<u8> =
+        wait_data(i, nonblock, |s| s.buf.iter().take(len).copied().collect())?;
+    if data.is_empty() {
+        return Ok(0);
+    }
+    put_some(o, &data, nonblock)
+}
+
+/// Adds the bytes of `data` that fit to the pipe of `output`, for `vmsplice`. It waits for space
+/// only before the first byte, and a write of up to `PIPE_BUF` bytes is not atomic, as
+/// `vmsplice_to_pipe` of Linux.
+///
+/// # Errors
+///
+/// Gives `EBADF` if the file is not a pipe, `EAGAIN` with `nonblock` if the pipe is full, and
+/// `EPIPE` if it has no reader.
+pub fn put_to_pipe(output: &File, data: &[u8], nonblock: bool) -> Result<usize> {
+    put_some(end_of(output)?, data, nonblock)
+}
+
+/// Takes up to `len` bytes from the pipe of `input`, for `vmsplice`. It waits for data, and an
+/// empty pipe without a writer gives no bytes.
+///
+/// # Errors
+///
+/// Gives `EBADF` if the file is not a pipe, and `EAGAIN` with `nonblock` if the pipe is empty.
+pub fn take_from_pipe(input: &File, len: usize, nonblock: bool) -> Result<alloc::vec::Vec<u8>> {
+    let end = end_of(input)?;
+    let data: alloc::vec::Vec<u8> = wait_data(end, nonblock, |s| {
+        let n = len.min(s.buf.len());
+        s.buf.drain(..n).collect()
+    })?;
+    if !data.is_empty() {
+        end.pipe.wake(false);
+    }
+    Ok(data)
 }
 
 /// Makes a pipe, and gives the read end and the write end. `flags` holds `O_NONBLOCK` for both
@@ -370,7 +469,11 @@ fn new_pipe() -> Arc<Pipe> {
             buf: VecDeque::new(),
             packets: VecDeque::new(),
             head: 0,
-            size: PIPE_SIZE,
+            size: if PIPE_SIZE > PIPE_MAX_SIZE.load(Ordering::Relaxed) && !may_pass_max() {
+                PIPE_MAX_SIZE.load(Ordering::Relaxed)
+            } else {
+                PIPE_SIZE
+            },
             readers: 0,
             writers: 0,
             reader_opens: 0,

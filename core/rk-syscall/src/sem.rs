@@ -557,6 +557,12 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
     }
 }
 
+/// Tells if the process `pid` has an undo list, as a `sysvsem.undo_list` that is not null in
+/// Linux.
+pub(crate) fn has_undo(pid: i32) -> bool {
+    TABLE.lock().undo.range((pid, i32::MIN)..=(pid, i32::MAX)).next().is_some()
+}
+
 /// Does the changes that `SEM_UNDO` recorded for the process `pid`, when it ends, as `exit_sem`
 /// of Linux. A value stays in `0..=SEMVMX`.
 pub(crate) fn exit(pid: i32) {

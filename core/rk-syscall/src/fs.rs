@@ -894,6 +894,9 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     if cmd == rk_vfs::file::EXT4_IOC_MOVE_EXT {
         return move_ext(cx, &file, arg);
     }
+    if let Some((kind, id)) = file.inode().and_then(rk_vfs::nsfs::ns_of) {
+        return crate::ns::ioctl(cx, kind, id, cmd, arg);
+    }
     if let Some(notify) = crate::seccomp::listener_of(&file) {
         return crate::seccomp::listener_ioctl(cx, &notify, cmd, arg);
     }

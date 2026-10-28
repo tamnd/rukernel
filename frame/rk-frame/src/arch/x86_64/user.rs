@@ -221,6 +221,27 @@ const CR0_EM: u64 = 1 << 2;
 const CR4_OSFXSR: u64 = 1 << 9;
 /// CR4.OSXMMEXCPT: the kernel handles the SIMD floating point exception.
 const CR4_OSXMMEXCPT: u64 = 1 << 10;
+/// CR4.TSD: `rdtsc` and `rdtscp` fault outside ring 0.
+const CR4_TSD: u64 = 1 << 2;
+
+/// Sets or clears CR4.TSD, as `cr4_toggle_bits_irqsoff(X86_CR4_TSD)` in arch/x86/kernel/process.c
+/// of Linux. CR4 is written only when the bit changes.
+fn set_tsd(on: bool) {
+    let cr4: u64;
+    // SAFETY: reading CR4 has no side effect.
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags))
+    };
+    if (cr4 & CR4_TSD != 0) == on {
+        return;
+    }
+    let cr4 = if on { cr4 | CR4_TSD } else { cr4 & !CR4_TSD };
+    // SAFETY: CR4.TSD changes only how `rdtsc` and `rdtscp` run outside ring 0. The kernel runs in
+    // ring 0, so it is not affected.
+    unsafe {
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags))
+    };
+}
 
 /// Lets user code use x87, MMX and SSE. CR4.OSXSAVE stays clear, so CPUID tells user code that
 /// AVX is not available, and the `fxsave` state is complete. The kernel itself does not use these
@@ -303,8 +324,9 @@ pub(crate) fn classify(vector: u8, error: u64, cr2: u64) -> crate::user::Excepti
 
 /// Runs user code with the registers `regs`, the FPU state `fpu` and the FS base `fs_base`, until
 /// it comes back to the kernel. When this function returns, `regs` and `fpu` have the user values
-/// at that time. User code cannot change the FS base, because CR4.FSGSBASE is clear.
-pub(crate) fn enter(regs: &mut UserRegs, fpu: &mut FpuState, fs_base: u64) -> Return {
+/// at that time. User code cannot change the FS base, because CR4.FSGSBASE is clear. If `no_tsc`
+/// is true, `rdtsc` and `rdtscp` cause a general protection fault in the user code.
+pub(crate) fn enter(regs: &mut UserRegs, fpu: &mut FpuState, fs_base: u64, no_tsc: bool) -> Return {
     if regs.rip >= LOWER_HALF_END {
         // `iretq` to this address would fault in kernel mode. User code that jumps there gets a
         // general protection fault, so the result is the same.
@@ -316,6 +338,7 @@ pub(crate) fn enter(regs: &mut UserRegs, fpu: &mut FpuState, fs_base: u64) -> Re
     // A value that is not canonical makes `wrmsr` fault. The user gets a value of 0 then, as an
     // access through it would fault.
     wrmsr(IA32_FS_BASE, if fs_base < LOWER_HALF_END { fs_base } else { 0 });
+    set_tsd(no_tsc);
     // SAFETY: `fpu` is a valid `fxsave` area of 512 bytes, aligned to 16. Its MXCSR has no
     // reserved bit set, because only `fxsave` and `FpuState::default` write it.
     unsafe {

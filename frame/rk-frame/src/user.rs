@@ -105,6 +105,7 @@ pub struct UserContext {
     regs: UserRegs,
     fpu: FpuState,
     tls: u64,
+    no_tsc: bool,
 }
 
 impl UserContext {
@@ -148,6 +149,19 @@ impl UserContext {
     /// makes the entry load 0.
     pub fn set_tls(&mut self, value: u64) {
         self.tls = value;
+    }
+
+    /// Tells if `rdtsc` and `rdtscp` fault in the user code, as `TIF_NOTSC` of Linux.
+    pub fn no_tsc(&self) -> bool {
+        self.no_tsc
+    }
+
+    /// Makes `rdtsc` and `rdtscp` fault in the user code, or not, for `prctl(PR_SET_TSC)`. On
+    /// x86-64 the kernel sets CR4.TSD while this user code runs, as `disable_TSC` in
+    /// arch/x86/kernel/process.c of Linux. arm64 has no such instruction, so the flag does nothing
+    /// there.
+    pub fn set_no_tsc(&mut self, value: bool) {
+        self.no_tsc = value;
     }
 
     /// The FS base. `arch_prctl(ARCH_GET_FS)` gives it.
@@ -230,7 +244,7 @@ impl UserContext {
         // User code runs without the kernel lock, so the other CPUs can run kernel code.
         crate::task::kernel_unlock();
         #[cfg(target_arch = "x86_64")]
-        let reason = user::enter(&mut self.regs, &mut self.fpu, self.tls);
+        let reason = user::enter(&mut self.regs, &mut self.fpu, self.tls, self.no_tsc);
         #[cfg(target_arch = "aarch64")]
         let reason = user::enter(&mut self.regs, &mut self.fpu, &mut self.tls);
         crate::task::kernel_lock();

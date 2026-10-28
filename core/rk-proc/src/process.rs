@@ -8,7 +8,7 @@ use crate::keys::{self, Key, Slot};
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE};
 use crate::sched::SchedParams;
 use crate::signal::{
-    AltStack, NSIG, Pending, SI_TIMER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
+    AltStack, NSIG, Pending, SI_TIMER, SI_USER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
 use crate::timer::Timers;
 use crate::wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
@@ -154,6 +154,16 @@ pub struct Process {
     /// The `MEMBARRIER_CMD_REGISTER_*` commands that the process gave, as the bits of the
     /// commands that they allow. A new address space has none.
     membarrier: AtomicU32,
+    /// The execution domain and its flags, as `task_struct.personality` of Linux.
+    personality: AtomicU32,
+    /// The signal that the process gets when its parent ends, or 0, as `pdeath_signal` of Linux.
+    /// A new process has none.
+    pdeath_signal: AtomicU32,
+    /// Tells if transparent huge pages are off, as `MMF_DISABLE_THP` of Linux. A child gets the
+    /// flag on `fork`, and `execve` keeps it.
+    thp_disable: AtomicBool,
+    /// Tells if the process ran `execve` after `fork`, as the inverse of `PF_FORKNOEXEC` of Linux.
+    did_exec: AtomicBool,
     limits: SpinLock<[Limit; RLIM_NLIMITS]>,
     /// The credentials. A change makes a new copy, so a reader keeps a stable view.
     cred: SpinLock<Arc<Cred>>,
@@ -163,6 +173,12 @@ pub struct Process {
     /// The user CPU time in timer ticks of the children that a wait reaped, with their own
     /// reaped children.
     child_ticks: AtomicU64,
+    /// The largest resident set in pages of the address spaces that the process left, at an
+    /// `execve` or the exit, as `signal_struct.maxrss` of Linux.
+    maxrss: AtomicU64,
+    /// The largest resident set in pages of the children that a wait reaped and of their reaped
+    /// children, as `signal_struct.cmaxrss` of Linux.
+    cmaxrss: AtomicU64,
     /// The tracer of the leader thread after the leader ended. The tracer gets the exit of the
     /// process.
     leader_tracer: SpinLock<Weak<Process>>,
@@ -237,6 +253,11 @@ pub struct Thread {
     sched: SpinLock<SchedParams>,
     /// The thread keyring and the default keyring of `request_key`.
     keys: SpinLock<ThreadKeys>,
+    /// The slack of the timers in nanoseconds, as `timer_slack_ns` of Linux, and the value that
+    /// `PR_SET_TIMERSLACK` with 0 sets, as `default_timer_slack_ns`.
+    timer_slack: SpinLock<(u64, u64)>,
+    /// The I/O privilege level that `iopl` set, as `iopl_emul` of Linux.
+    iopl: AtomicU32,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -411,9 +432,30 @@ impl Process {
         vm.set_memcg(self.memcg());
         let old = self.vm.lock().replace(vm.clone());
         if let Some(old) = &old {
+            self.note_rss(old);
             rk_mm::ksm::exec(old, &vm);
         }
         old
+    }
+
+    /// Keeps the resident set of `vm` in the largest resident set of the process, before the
+    /// process leaves `vm`, as `setmax_mm_hiwater_rss` of Linux.
+    fn note_rss(&self, vm: &AddressSpace) {
+        self.maxrss.fetch_max(vm.page_count() as u64, Ordering::Relaxed);
+    }
+
+    /// The largest resident set of the process in KiB, for `ru_maxrss` of `RUSAGE_SELF`, as
+    /// `getrusage` in kernel/sys.c of Linux. Linux takes the high water mark of the address
+    /// space. rukernel takes the resident set now, so a set that got smaller does not count.
+    pub fn maxrss_kb(&self) -> u64 {
+        let now = self.vm().map_or(0, |vm| vm.page_count() as u64);
+        self.maxrss.load(Ordering::Relaxed).max(now) * (rk_mm::PAGE_SIZE as u64 / 1024)
+    }
+
+    /// The largest resident set of the reaped children in KiB, for `ru_maxrss` of
+    /// `RUSAGE_CHILDREN`.
+    pub fn child_maxrss_kb(&self) -> u64 {
+        self.cmaxrss.load(Ordering::Relaxed) * (rk_mm::PAGE_SIZE as u64 / 1024)
     }
 
     /// The cgroup of the process.
@@ -572,6 +614,46 @@ impl Process {
         self.child_ticks.load(Ordering::Relaxed)
     }
 
+    /// The personality, as `personality(0xffffffff)` gives it.
+    pub fn personality(&self) -> u32 {
+        self.personality.load(Ordering::Relaxed)
+    }
+
+    /// Sets the personality, for `personality`.
+    pub fn set_personality(&self, value: u32) {
+        self.personality.store(value, Ordering::Relaxed);
+    }
+
+    /// The signal that the process gets when its parent ends, or 0.
+    pub fn pdeath_signal(&self) -> u32 {
+        self.pdeath_signal.load(Ordering::Relaxed)
+    }
+
+    /// Sets the signal that the process gets when its parent ends, for `PR_SET_PDEATHSIG`.
+    pub fn set_pdeath_signal(&self, sig: u32) {
+        self.pdeath_signal.store(sig, Ordering::Relaxed);
+    }
+
+    /// Tells if transparent huge pages are off, as `PR_GET_THP_DISABLE` gives it.
+    pub fn thp_disable(&self) -> bool {
+        self.thp_disable.load(Ordering::Relaxed)
+    }
+
+    /// Tells if the process ran `execve` after it was made.
+    pub fn did_exec(&self) -> bool {
+        self.did_exec.load(Ordering::Relaxed)
+    }
+
+    /// Records that the process ran `execve`.
+    pub fn set_did_exec(&self) {
+        self.did_exec.store(true, Ordering::Relaxed);
+    }
+
+    /// Turns transparent huge pages off or on, for `PR_SET_THP_DISABLE`.
+    pub fn set_thp_disable(&self, value: bool) {
+        self.thp_disable.store(value, Ordering::Relaxed);
+    }
+
     /// The value of `/proc/PID/oom_score_adj`.
     pub fn oom_score_adj(&self) -> i32 {
         self.oom_score_adj.load(Ordering::Relaxed)
@@ -634,6 +716,14 @@ impl Process {
     /// The signals that any thread of the process can take.
     pub fn shared_pending(&self) -> SigSet {
         self.signals.lock().pending.set()
+    }
+
+    /// The number of signals in the queues of the process and of its threads, as the
+    /// `UCOUNT_RLIMIT_SIGPENDING` count of Linux counts them.
+    pub fn queued_signals(&self) -> usize {
+        let shared = self.signals.lock().pending.len();
+        let threads = self.threads();
+        shared + threads.iter().map(|t| t.signals.lock().pending.len()).sum::<usize>()
     }
 
     /// The interval timers and the POSIX timers of the process.
@@ -710,6 +800,10 @@ impl Process {
             start_tick: rk_frame::time::ticks(),
             oom_score_adj: AtomicI32::new(0),
             membarrier: AtomicU32::new(0),
+            personality: AtomicU32::new(0),
+            pdeath_signal: AtomicU32::new(0),
+            thp_disable: AtomicBool::new(false),
+            did_exec: AtomicBool::new(false),
             limits: SpinLock::new(crate::limits::defaults(
                 rk_mm::STACK_SIZE as u64,
                 u64::from(PID_MAX),
@@ -719,6 +813,8 @@ impl Process {
             timers: SpinLock::new(Timers::default()),
             dead_ticks: AtomicU64::new(0),
             child_ticks: AtomicU64::new(0),
+            maxrss: AtomicU64::new(0),
+            cmaxrss: AtomicU64::new(0),
             leader_tracer: SpinLock::new(Weak::new()),
             keys: SpinLock::new(ProcessKeys::default()),
             cgroup: AtomicU32::new(rk_cgroup::ROOT),
@@ -1150,9 +1246,45 @@ impl Thread {
             syscall: SpinLock::new(SyscallInfo { nr: -1, ..SyscallInfo::default() }),
             sched: SpinLock::new(SchedParams::default()),
             keys: SpinLock::new(ThreadKeys::default()),
+            timer_slack: SpinLock::new((TIMER_SLACK_NS, TIMER_SLACK_NS)),
+            iopl: AtomicU32::new(0),
         })
     }
+
+    /// The slack of the timers of the thread in nanoseconds, for `PR_GET_TIMERSLACK`.
+    pub fn timer_slack(&self) -> u64 {
+        self.timer_slack.lock().0
+    }
+
+    /// Sets the slack of the timers, for `PR_SET_TIMERSLACK`. The value 0 sets the default of
+    /// the thread, as `prctl` in kernel/sys.c of Linux.
+    pub fn set_timer_slack(&self, ns: u64) {
+        let mut slack = self.timer_slack.lock();
+        slack.0 = if ns == 0 { slack.1 } else { ns };
+    }
+
+    /// Gives the slack of `parent` to the new thread: both values of the new thread are the
+    /// current value of `parent`, as `copy_process` of Linux.
+    fn inherit_timer_slack(&self, parent: &Thread) {
+        let ns = parent.timer_slack();
+        *self.timer_slack.lock() = (ns, ns);
+        // A new task also gets the I/O privilege level, as `copy_thread` of Linux.
+        self.set_iopl(parent.iopl());
+    }
+
+    /// The I/O privilege level that `iopl` set.
+    pub fn iopl(&self) -> u32 {
+        self.iopl.load(Ordering::Relaxed)
+    }
+
+    /// Sets the I/O privilege level, for `iopl`.
+    pub fn set_iopl(&self, level: u32) {
+        self.iopl.store(level, Ordering::Relaxed);
+    }
 }
+
+/// The slack of the timers of init, in nanoseconds, as `init_task` of Linux.
+const TIMER_SLACK_NS: u64 = 50_000;
 
 /// Makes init, the process with the ID 1. Its thread does not run yet: the caller spawns a task
 /// for it after `exec`.
@@ -1278,6 +1410,8 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     // The child shares the session keyring. It has no thread keyring and no process keyring.
     child.keys.lock().session = pp.keys.lock().session.clone();
     child.set_oom_score_adj(pp.oom_score_adj());
+    child.set_personality(pp.personality());
+    child.set_thp_disable(pp.thp_disable());
     child.cgroup.store(cgroup, Ordering::Relaxed);
     child.set_cgroup_ns(pp.cgroup_ns());
     if !share.vm
@@ -1287,6 +1421,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     }
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     thread.inherit_seccomp(parent);
+    thread.inherit_timer_slack(parent);
     *thread.sched.lock() = parent.sched().forked();
     thread.keys.lock().reqkey = parent.keys.lock().reqkey;
     child.state.lock().threads.push(thread.clone());
@@ -1320,6 +1455,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     };
     let new = Thread::new(tid, process.clone(), thread.blocked());
     new.inherit_seccomp(thread);
+    new.inherit_timer_slack(thread);
     *new.sched.lock() = thread.sched().forked();
     table.threads.insert(tid, Arc::downgrade(&new));
     drop(table);
@@ -1631,6 +1767,9 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     // The task runs on the page table of the address space, so the kernel table goes first.
     VmSpace::deactivate();
     let vm = process.vm.lock().take();
+    if let Some(vm) = &vm {
+        process.note_rss(vm);
+    }
     let files = process.files.lock().take();
     let fs = process.fs.lock().take();
     drop((vm, files, fs));
@@ -1643,6 +1782,14 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     };
     // A process file descriptor of the process is now readable.
     rk_vfs::wait::poll_wake();
+    // Each child that asked for it gets its signal, as `reparent_leader` in kernel/exit.c of
+    // Linux.
+    for child in &children {
+        let sig = child.pdeath_signal();
+        if sig != 0 && !child.is_zombie() {
+            deliver(child, None, SigInfo::new(sig, SI_USER, process.pid));
+        }
+    }
     let init = find_process(INIT_PID).filter(|init| !Arc::ptr_eq(init, &process));
     if let Some(init) = &init {
         let zombies = children.iter().any(|c| c.is_zombie());
@@ -1745,6 +1892,10 @@ pub fn wait_child(
                 s.tracees.retain(|t| !Arc::ptr_eq(&t.process, &child));
                 drop(s);
                 process.child_ticks.fetch_add(ticks, Ordering::Relaxed);
+                // As `wait_task_zombie` in kernel/exit.c of Linux.
+                let rss = child.maxrss.load(Ordering::Relaxed);
+                let rss = rss.max(child.cmaxrss.load(Ordering::Relaxed));
+                process.cmaxrss.fetch_max(rss, Ordering::Relaxed);
                 TABLE.lock().processes.remove(&child.pid);
             }
             let uid = child.cred().uid;

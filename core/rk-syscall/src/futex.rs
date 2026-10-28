@@ -521,7 +521,17 @@ pub(crate) fn set_robust_list(cx: &Cx<'_>, head: u64, len: u64) -> SysResult {
 pub(crate) fn get_robust_list(cx: &Cx<'_>, tid: u64, head: u64, len: u64) -> SysResult {
     let head_addr = match tid as u32 {
         0 => cx.thread.robust_list(),
-        tid => rk_proc::find_thread(tid).ok_or(Errno::ESRCH)?.robust_list(),
+        tid => {
+            let thread = rk_proc::find_thread(tid).ok_or(Errno::ESRCH)?;
+            // `ptrace_may_access` with `PTRACE_MODE_READ_REALCREDS`, as kernel/futex/syscalls.c
+            // of Linux. A thread of the same process can always read it.
+            if !Arc::ptr_eq(thread.process(), cx.process())
+                && !cx.process().cred().may_ptrace(&thread.process().cred())
+            {
+                return Err(Errno::EPERM);
+            }
+            thread.robust_list()
+        }
     };
     cx.write_val(head, &(head_addr as u64))?;
     cx.write_val(len, &(size_of::<RobustListHead>() as u64))?;
