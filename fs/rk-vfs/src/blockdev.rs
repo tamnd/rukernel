@@ -20,7 +20,8 @@ use rk_block::cache::{PAGE_SIZE, PageCache};
 use rk_block::{Bio, Op, Queue};
 use rk_frame::sync::SpinLock;
 
-pub use rk_block::{BlockDevice, READAHEAD_PAGES, SECTOR_SIZE, set_account};
+pub use rk_block::cache::{MemcgOps, set_memcg_ops};
+pub use rk_block::{BlockDevice, IoOp, READAHEAD_PAGES, SECTOR_SIZE, set_account};
 
 /// The `ioctl` commands of block devices, from `<linux/fs.h>`.
 pub mod ioctl {
@@ -319,6 +320,23 @@ pub fn drop_clean_all() {
     for cache in caches {
         cache.drop_clean();
     }
+}
+
+/// Drops up to `bytes` bytes of the clean cache that is charged to the memory cgroup `memcg`,
+/// from the block devices. Gives the bytes that went. The memory cgroups call this for a reclaim,
+/// also in a page fault, so it does not wait for a lock.
+pub fn reclaim_memcg(memcg: u32, bytes: u64) -> u64 {
+    let Some(devices) = BLOCK_DEVICES.try_lock() else { return 0 };
+    let caches: Vec<Arc<DiskCache>> = devices.values().map(|e| e.cache.clone()).collect();
+    drop(devices);
+    let mut freed = 0;
+    for cache in caches {
+        if freed >= bytes {
+            break;
+        }
+        freed += cache.reclaim(memcg, bytes - freed);
+    }
+    freed
 }
 
 /// Gives the name and the device number of each block device.

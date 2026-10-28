@@ -1,11 +1,13 @@
-//! The processes in the cgroups: the move of a process, the kill of a subtree, the freezer, the
-//! wait of `memory.high`, and the OOM killers of a memory cgroup and of the system. rk-cgroup keeps the hierarchy and the counts, and this
-//! module changes the processes and the threads.
+//! The processes in the cgroups: the move of a process or a thread, the kill of a subtree, the
+//! freezer, the wait of `memory.high`, and the OOM killers of a memory cgroup and of the system.
+//! rk-cgroup keeps the hierarchy and the counts, and this module changes the processes and the
+//! threads.
 
 use crate::process::{Process, Thread, kill_group, processes};
 use crate::wait::WaitStatus;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::signal::SIGKILL;
 use rk_cgroup::CgId;
@@ -16,6 +18,27 @@ static THAW: WaitQueue = WaitQueue::new();
 
 /// The threads of a cgroup without CPU quota wait here until the next period.
 static THROTTLE: WaitQueue = WaitQueue::new();
+
+/// The count of the changes of `memory.high`, `io.max` and `cpu.max`. A thread that waits for
+/// one of these limits stops its wait when the count changes.
+static LIMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Wakes the threads that wait for `memory.high`, `io.max` or `cpu.max`, after a change of one of
+/// these limits. Each thread waits again with the new limits at its next return to user mode,
+/// as Linux does when `tg_conf_updated` dispatches the throttled bios again.
+pub fn limits_changed() {
+    LIMITS.fetch_add(1, Ordering::Relaxed);
+    THROTTLE.wake_all();
+}
+
+/// Waits on `THROTTLE` up to the tick `deadline` for a limit of the cgroup of `thread`. A kill
+/// or a change of a limit ends the wait.
+fn throttle_wait(thread: &Thread, deadline: u64) {
+    let seq = LIMITS.load(Ordering::Relaxed);
+    THROTTLE.wait_until_timeout(deadline, || {
+        (thread.is_killed() || LIMITS.load(Ordering::Relaxed) != seq).then_some(())
+    });
+}
 
 /// The free frames under which the memory of the system is short, for the OOM killers. A fault
 /// of a process fails under the reserve of rk-mm or under `vm.min_free_kbytes`, so the memory is
@@ -39,7 +62,29 @@ pub fn migrate(process: &Process, to: CgId) -> Result<(), Errno> {
     if let Some(vm) = process.vm() {
         vm.set_memcg(process.memcg());
     }
-    for t in &threads {
+    moved(&threads, to);
+    Ok(())
+}
+
+/// Moves `thread` alone to the cgroup `to`, for a write of `cgroup.threads`. In a threaded
+/// subtree, the threads of a process can be in different cgroups.
+///
+/// # Errors
+///
+/// `ESRCH` for a thread that ended, and the errors of `Hierarchy::can_attach_thread`.
+pub fn migrate_thread(thread: &Arc<Thread>, to: CgId) -> Result<(), Errno> {
+    let process = thread.process();
+    process.move_thread_cgroup(thread, to)?;
+    if let Some(vm) = process.vm() {
+        vm.set_memcg(process.memcg());
+    }
+    moved(core::slice::from_ref(thread), to);
+    Ok(())
+}
+
+/// Sets the group of the tasks of `threads` after their move to `to`, and their CPUs.
+fn moved(threads: &[Arc<Thread>], to: CgId) {
+    for t in threads {
         if let Some(task) = t.task() {
             rk_frame::task::set_group(&task, to);
         }
@@ -50,24 +95,48 @@ pub fn migrate(process: &Process, to: CgId) -> Result<(), Errno> {
     // of Linux.
     THAW.wake_all();
     if rk_cgroup::frozen(to) {
-        for t in &threads {
+        for t in threads {
             t.wake();
         }
     }
-    Ok(())
 }
 
-/// The processes in the cgroup `id` and the cgroups below it.
+/// The processes with a thread in the cgroup `id` or the cgroups below it.
 pub fn processes_in(id: CgId) -> Vec<Arc<Process>> {
     // `is_zombie` takes the lock of the state of the process, and the lock order is the state
     // first and then the hierarchy. Thus the check of the state is before `with`.
-    let live: Vec<Arc<Process>> = processes().into_iter().filter(|p| !p.is_zombie()).collect();
-    rk_cgroup::with(|h| live.into_iter().filter(|p| h.is_descendant(p.cgroup(), id)).collect())
+    let live: Vec<(Arc<Process>, Vec<CgId>)> = processes()
+        .into_iter()
+        .filter(|p| !p.is_zombie())
+        .map(|p| {
+            let cgs = p.threads().iter().map(|t| t.cgroup()).chain([p.cgroup()]).collect();
+            (p, cgs)
+        })
+        .collect();
+    rk_cgroup::with(|h| {
+        live.into_iter()
+            .filter(|(_, cgs)| cgs.iter().any(|&c| h.is_descendant(c, id)))
+            .map(|(p, _)| p)
+            .collect()
+    })
 }
 
-/// The processes in the cgroup `id` only, for `cgroup.procs`.
+/// The processes of the cgroup `id`, for `cgroup.procs`: the processes whose leader thread is
+/// in `id`. For the root of a threaded subtree, the processes of the threaded cgroups below it
+/// count too, as `CSS_TASK_ITER_THREADED` of Linux.
 pub fn processes_of(id: CgId) -> Vec<Arc<Process>> {
-    processes().into_iter().filter(|p| !p.is_zombie() && p.cgroup() == id).collect()
+    let live: Vec<Arc<Process>> = processes().into_iter().filter(|p| !p.is_zombie()).collect();
+    rk_cgroup::with(|h| live.into_iter().filter(|p| h.dom(p.cgroup()) == id).collect())
+}
+
+/// The threads in the cgroup `id` only, for `cgroup.threads`.
+pub fn threads_of(id: CgId) -> Vec<Arc<Thread>> {
+    processes()
+        .into_iter()
+        .filter(|p| !p.is_zombie())
+        .flat_map(|p| p.threads())
+        .filter(|t| t.cgroup() == id)
+        .collect()
 }
 
 /// Sends `SIGKILL` to each process in the subtree of `id`, for `cgroup.kill`.
@@ -108,15 +177,14 @@ pub fn wait_limits(thread: &Thread) {
 /// (`do_freezer_trap`). The thread counts as frozen in its cgroup while it waits, so that
 /// `cgroup.events` tells when the whole cgroup is frozen. A kill ends the wait.
 pub fn wait_frozen(thread: &Thread) {
-    let process = thread.process();
-    let mut cg = process.cgroup();
+    let mut cg = thread.cgroup();
     while !thread.is_killed() && rk_cgroup::frozen(cg) {
         rk_cgroup::with(|h| h.thread_frozen(cg, true));
         THAW.wait_until(|| {
-            (thread.is_killed() || process.cgroup() != cg || !rk_cgroup::frozen(cg)).then_some(())
+            (thread.is_killed() || thread.cgroup() != cg || !rk_cgroup::frozen(cg)).then_some(())
         });
         rk_cgroup::with(|h| h.thread_frozen(cg, false));
-        cg = process.cgroup();
+        cg = thread.cgroup();
     }
 }
 
@@ -124,7 +192,7 @@ pub fn wait_frozen(thread: &Thread) {
 /// throttle of `cpu.max`. The thread counts as a task that can run in the pressure of the CPU
 /// while it waits, as a throttled task of Linux. A kill ends the wait.
 pub fn wait_throttled(thread: &Thread) {
-    let cg = thread.process().cgroup();
+    let cg = thread.cgroup();
     wait_over_high(thread, cg);
     wait_io(thread, cg);
     let Some(until) = rk_cgroup::throttled_until(cg) else { return };
@@ -132,14 +200,13 @@ pub fn wait_throttled(thread: &Thread) {
     let ticks = until.saturating_sub(now).div_ceil(TICK_NS).max(1);
     let deadline = rk_frame::time::ticks() + ticks;
     rk_cgroup::psi_change(cg, |c| c.runnable += 1);
-    THROTTLE.wait_until_timeout(deadline, || thread.is_killed().then_some(()));
+    throttle_wait(thread, deadline);
     rk_cgroup::psi_change(cg, |c| c.runnable = c.runnable.saturating_sub(1));
 }
 
 /// Keeps `thread` waiting when its cgroup charged pages over `memory.high`, as
 /// `mem_cgroup_handle_over_high` of Linux. The wait counts as a memory stall in the pressure.
-/// rukernel does not take pages back from a cgroup, so this wait is the only effect of the
-/// limit. A kill ends the wait.
+/// A kill or a change of the limit ends the wait.
 fn wait_over_high(thread: &Thread, cg: CgId) {
     let delay = rk_cgroup::high_delay(thread.process().memcg());
     if delay == 0 {
@@ -147,24 +214,33 @@ fn wait_over_high(thread: &Thread, cg: CgId) {
     }
     let deadline = rk_frame::time::ticks() + delay.div_ceil(TICK_NS);
     rk_cgroup::psi_change(cg, |c| c.memstall += 1);
-    THROTTLE.wait_until_timeout(deadline, || thread.is_killed().then_some(()));
+    throttle_wait(thread, deadline);
     rk_cgroup::psi_change(cg, |c| c.memstall = c.memstall.saturating_sub(1));
 }
 
 /// Charges an I/O of the current thread to its cgroup, for `io.stat`. Kernel work goes to the
 /// root. The delay of `io.max` waits until the thread goes back to user mode, so the thread does
-/// not wait with the locks of a file system. The block layer calls this after each batch.
-pub fn io_account(dev: u64, write: bool, bytes: u64, ios: u64) {
+/// not wait with the locks of a file system. The block layer calls this after each batch, with
+/// the time `ns` that the device took.
+pub fn io_account(dev: u64, op: rk_vfs::blockdev::IoOp, bytes: u64, ios: u64, ns: u64) {
+    use rk_cgroup::io::Op;
+    use rk_vfs::blockdev::IoOp;
     let thread = crate::current_thread();
-    let cg = thread.as_ref().map_or(rk_cgroup::ROOT, |t| t.process().cgroup());
-    let delay = rk_cgroup::charge_io(cg, dev, write, bytes, ios);
+    let cg = thread.as_ref().map_or(rk_cgroup::ROOT, |t| t.cgroup());
+    let op = match op {
+        IoOp::Read => Op::Read,
+        IoOp::Write => Op::Write,
+        IoOp::Discard => Op::Discard,
+    };
+    let delay = rk_cgroup::charge_io(cg, dev, op, (bytes, ios), ns);
     if let Some(t) = thread.filter(|_| delay > 0) {
         t.add_io_delay(delay);
     }
 }
 
-/// Keeps `thread` waiting for the delay of `io.max`, as the throttle of blk-throttle of Linux.
-/// The wait counts as an I/O stall in the pressure. A kill ends the wait.
+/// Keeps `thread` waiting for the delay of `io.max` and `io.weight`, as the throttle of
+/// blk-throttle of Linux. The wait counts as an I/O stall in the pressure. A kill or a change of
+/// the limit ends the wait.
 fn wait_io(thread: &Thread, cg: CgId) {
     let delay = thread.take_io_delay();
     if delay == 0 {
@@ -172,7 +248,7 @@ fn wait_io(thread: &Thread, cg: CgId) {
     }
     let deadline = rk_frame::time::ticks() + delay.div_ceil(TICK_NS);
     rk_cgroup::psi_change(cg, |c| c.iowait += 1);
-    THROTTLE.wait_until_timeout(deadline, || thread.is_killed().then_some(()));
+    throttle_wait(thread, deadline);
     rk_cgroup::psi_change(cg, |c| c.iowait = c.iowait.saturating_sub(1));
 }
 
@@ -207,14 +283,41 @@ fn kill_victim(victim: &Arc<Process>, domain: CgId, why: &str) {
         h.oom_group(victim.cgroup(), domain)
     });
     kill_group(victim, WaitStatus::signaled(SIGKILL, false));
-    let Some(group) = group else { return };
-    rk_cgroup::with(|h| h.count_oom_group_kill(group));
-    for p in processes_in(group) {
-        if !Arc::ptr_eq(&p, victim) && p.oom_score_adj() > -1000 && p.group_exit().is_none() {
-            rk_cgroup::with(|h| h.count_oom_kill(p.cgroup()));
-            kill_group(&p, WaitStatus::signaled(SIGKILL, false));
+    let mut killed = alloc::vec![victim.clone()];
+    if let Some(group) = group {
+        rk_cgroup::with(|h| h.count_oom_group_kill(group));
+        for p in processes_in(group) {
+            if !Arc::ptr_eq(&p, victim) && p.oom_score_adj() > -1000 && p.group_exit().is_none() {
+                rk_cgroup::with(|h| h.count_oom_kill(p.cgroup()));
+                kill_group(&p, WaitStatus::signaled(SIGKILL, false));
+                killed.push(p);
+            }
         }
     }
+    for p in &killed {
+        reap(p);
+    }
+}
+
+/// Takes the private pages of `victim` at once after its kill, as the OOM reaper of Linux. A
+/// thread of the victim can wait for a long time before its exit frees the memory, for example
+/// in a wait without a kill check. The reaper does not touch an address space that a live
+/// process outside the kill shares, as `CLONE_VM` without `CLONE_THREAD` gives.
+fn reap(victim: &Arc<Process>) {
+    let Some(vm) = victim.vm() else { return };
+    let shared = processes().into_iter().any(|p| {
+        !Arc::ptr_eq(&p, victim)
+            && !p.is_zombie()
+            && p.group_exit().is_none()
+            && p.vm().is_some_and(|v| Arc::ptr_eq(&v, &vm))
+    });
+    if shared {
+        return;
+    }
+    let pages = vm.reap();
+    victim.set_oom_reaped();
+    rk_frame::println!("oom_reaper: reaped process {}, {} kB", victim.pid(), pages * 4);
+    THROTTLE.wake_all();
 }
 
 /// Handles a page fault of `thread` that did not get a page because the memory of the system
@@ -228,12 +331,19 @@ pub fn system_oom(thread: &Thread) -> bool {
     if rk_frame::mm::frame_stats().free > system_reserve() {
         return false;
     }
+    // The clean page cache goes first, as the reclaim of Linux before `out_of_memory`.
+    rk_vfs::blockdev::drop_clean_all();
+    if rk_frame::mm::frame_stats().free > system_reserve() {
+        return true;
+    }
     // A victim that is still on its way out frees its memory soon: wait for it, as Linux does
     // for a task with `TIF_MEMDIE`.
     let all: Vec<Arc<Process>> =
         processes().into_iter().filter(|p| !p.is_zombie() && p.vm().is_some()).collect();
-    let dying =
-        all.iter().find(|p| p.group_exit().is_some() && !Arc::ptr_eq(p, thread.process())).cloned();
+    let dying = all
+        .iter()
+        .find(|p| p.group_exit().is_some() && !p.oom_reaped() && !Arc::ptr_eq(p, thread.process()))
+        .cloned();
     let victim = match dying {
         Some(p) => p,
         None => {
@@ -247,6 +357,10 @@ pub fn system_oom(thread: &Thread) -> bool {
                 return false;
             };
             kill_victim(&victim, rk_cgroup::ROOT, "Out of memory");
+            if victim.oom_reaped() {
+                // The memory is free now, and the fault can try again at once.
+                return true;
+            }
             victim
         }
     };
@@ -254,7 +368,7 @@ pub fn system_oom(thread: &Thread) -> bool {
         // The thread ends at its return to user mode.
         return true;
     }
-    let cg = thread.process().cgroup();
+    let cg = thread.cgroup();
     rk_cgroup::psi_change(cg, |c| c.memstall += 1);
     let deadline = rk_frame::time::ticks() + rk_frame::time::HZ;
     THROTTLE.wait_until_timeout(deadline, || {
@@ -284,12 +398,13 @@ pub fn memcg_oom(thread: &Thread) -> bool {
         }
         Err(id) => id,
     };
-    let cg = process.cgroup();
+    let cg = thread.cgroup();
     rk_cgroup::with(|h| h.count_oom(blocking));
     rk_cgroup::psi_change(cg, |c| c.memstall += 1);
     let victim = oom_kill(blocking);
     if let Some(victim) = &victim
         && !Arc::ptr_eq(victim, process)
+        && !victim.oom_reaped()
     {
         // The memory of the victim is free when its address space goes. Wait for that, but not
         // for ever, and stop if this thread gets a kill.

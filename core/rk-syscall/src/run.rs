@@ -50,7 +50,7 @@ pub(crate) fn start_thread(thread: Arc<Thread>, regs: UserContext) -> Result<(),
         .data(thread.clone())
         .nice(nice, idle)
         .affinity(thread.allowed_cpus())
-        .group(thread.process().cgroup())
+        .group(thread.cgroup())
         .spawn()
         .ok_or(Errno::ENOMEM)?;
     thread.set_task(&task);
@@ -351,6 +351,17 @@ pub fn init() {
     rk_vfs::inode::set_clock(crate::info::realtime);
     rk_vfs::cred::set_current(|| rk_proc::current_thread().map(|t| t.process().cred()));
     rk_vfs::blockdev::set_account(rk_proc::cgroup::io_account);
+    // The page cache is charged to the memory cgroup of the writer, and a memory cgroup at its
+    // limit takes its clean cache back. The charged cache of all cgroups stays below a quarter
+    // of the memory.
+    rk_cgroup::set_reclaim(rk_vfs::blockdev::reclaim_memcg);
+    rk_vfs::blockdev::set_memcg_ops(rk_vfs::blockdev::MemcgOps {
+        current: || rk_proc::current_thread().map_or(0, |t| t.process().memcg()),
+        charge: rk_cgroup::charge_file,
+        uncharge: rk_cgroup::uncharge_file,
+        balance: rk_cgroup::balance_file,
+        limit: rk_frame::mm::frame_stats().total * 4096 / 4,
+    });
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });

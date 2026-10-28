@@ -13,6 +13,12 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - /proc/kpageflags gives `KPF_UPTODATE`, `KPF_LRU`, `KPF_MMAP` and `KPF_DIRTY` for the pages of mapped files (#387). `msync` of a shared file mapping makes the pages clean, and LTP msync04 uses this.
 - The ioctl `PROCMAP_QUERY` of /proc/PID/maps finds the area at an address or the next area, with the filters of the flags and the name of the area, as `do_procmap_query` of Linux (#387).
 - `statmount` gives `STATMOUNT_MNT_NS_ID` and takes `mnt_ns_id` to look at the mounts of another mount name space (#387).
+- Threaded cgroups, as the thread mode of kernel/cgroup/cgroup.c of Linux (#384). A write of `threaded` to `cgroup.type` makes a threaded cgroup, and `cgroup.type` shows `domain`, `domain threaded`, `domain invalid` or `threaded`. A write to `cgroup.threads` moves one thread inside a threaded subtree, and only the cpu, cpuset and pids controllers work in a threaded cgroup. A read of `cgroup.procs` of a threaded cgroup gives `EOPNOTSUPP`, and the other errors follow Linux.
+- The page cache is charged to the memory cgroup of the task that reads or writes it, and `memory.stat` shows it as `file` (#384). A charge past `memory.max` first drops clean page cache of the cgroup, and `memory.min` and `memory.low` protect the cache of a cgroup from this reclaim, as `mem_cgroup_calculate_protection` of Linux. A reclaim that goes below `memory.low` counts a `low` event.
+- `io.weight` shares the time of a device between the cgroups that use it, as the iocost controller of Linux does in proportion to the weights (#384). `io.stat` counts discards as `dbytes` and `dios`.
+- An OOM reaper (#384). After an OOM kill, the kernel frees the private pages of the victim at once, and the OOM killer does not wait for the exit of the victim.
+- A write of `memory.high`, `io.max` or `cpu.max` wakes the threads that wait for the old limit (#384).
+- tools/ltp/build.sh installs the tests and scripts of the directories that have subdirectories, as memcontrol01 to memcontrol04 and cgroup_lib.sh (#384).
 
 ### Fixed
 
@@ -30,6 +36,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `ru_maxrss` is the high-water mark of the resident pages (#387). Before, an `munmap` made it smaller.
 - exec maps the aligned segments of an ELF file as private mappings of the file, so /proc/PID/maps shows the path of the executable (#387).
 - tools/ltp runs each test in the foreground of the init shell, and the shell of the test forks the command, so the test does not keep the ignored `SIGQUIT` of BusyBox ash as PID 1 (#387). LTP kill11 passes now. Before, its child ignored `SIGQUIT` and the test hung.
+- A read of a cgroupfs directory no longer skips entries when an `rmdir` happens between two reads (#384). Each entry keeps its place in the listing (a file by its index, a child cgroup by its ID), so `find -depth -exec rmdir` removes a whole tree. Before, the LTP cgroup_fj tests left their directory behind (`EBUSY`).
+- A fork, an exit, `mkdir` and `rmdir` no longer make the kernel compute `cgroup.events` again for each cgroup (#384). The kernel computes the events again only when a cgroup gets its first task or loses its last one, or while a cgroup is frozen. Before, these calls got slower with each cgroup, and the creation of 10000 cgroups took more than 20 minutes under QEMU without KVM. Now it takes about 5 minutes.
 
 ## [0.4.7] - 2026-10-28
 

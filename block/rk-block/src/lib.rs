@@ -102,9 +102,21 @@ impl Bio {
     }
 }
 
+/// The kind of an I/O that the io controller of cgroup v2 counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoOp {
+    /// A read.
+    Read,
+    /// A write.
+    Write,
+    /// A discard.
+    Discard,
+}
+
 /// The hook that charges the I/O of a queue to the task that submits it, for the io controller
-/// of cgroup v2. It gets the device, `true` for a write, the bytes and the count of bios.
-pub type AccountFn = fn(dev: u64, write: bool, bytes: u64, ios: u64);
+/// of cgroup v2. It gets the device, the kind of the I/O, the bytes, the count of bios and the
+/// time in nanoseconds that the device took.
+pub type AccountFn = fn(dev: u64, op: IoOp, bytes: u64, ios: u64, ns: u64);
 
 /// The hook of [`set_account`].
 static ACCOUNT: Once<AccountFn> = Once::new();
@@ -292,9 +304,16 @@ impl Queue {
         drop(pending);
         if let Some(account) = ACCOUNT.get() {
             let dev = self.dev.load(Ordering::Relaxed);
+            // The time of the batch goes to the two directions by their bytes.
+            let ns = crate::now().saturating_sub(now);
+            let total = (charge[0].0 + charge[1].0).max(1);
             for (dir, &(bytes, ios)) in charge.iter().enumerate() {
                 if ios > 0 {
-                    account(dev, dir == Dir::Write as usize, bytes, ios);
+                    let op = if dir == Dir::Write as usize { IoOp::Write } else { IoOp::Read };
+                    let share =
+                        u64::try_from(u128::from(ns) * u128::from(bytes) / u128::from(total))
+                            .unwrap_or(ns);
+                    account(dev, op, bytes, ios, share);
                 }
             }
         }
@@ -394,7 +413,14 @@ impl Queue {
         if sector.checked_add(count).is_none_or(|e| e > self.sectors()) {
             return Err(Errno::EIO);
         }
-        self.device.discard(sector, count)
+        let start = now();
+        self.device.discard(sector, count)?;
+        if let Some(account) = ACCOUNT.get() {
+            let dev = self.dev.load(Ordering::Relaxed);
+            let ns = now().saturating_sub(start);
+            account(dev, IoOp::Discard, count * SECTOR_SIZE as u64, 1, ns);
+        }
+        Ok(())
     }
 }
 

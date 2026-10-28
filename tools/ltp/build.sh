@@ -32,8 +32,8 @@ timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority ni
 fsmount fspick move_mount open_tree setxattr getxattr listxattr removexattr fsetxattr fgetxattr
 flistxattr fremovexattr lgetxattr llistxattr lremovexattr sendfile splice copy_file_range fadvise"
 
-# The runtest files of the groups that the R4 exit uses. net.* is each runtest/net.* file.
-LTP_GROUPS="syscalls mm sched net.*"
+# The runtest files of the groups that notbuilt.txt lists. net.* is each runtest/net.* file.
+LTP_GROUPS="syscalls mm sched controllers net.*"
 
 full=0
 if [ "${1:-}" = "--full" ]; then
@@ -67,8 +67,15 @@ if [ "$FULL" = 1 ]; then
 		make -C testcases/lib -k -j"$(nproc)"
 		dirs=$(find testcases -name Makefile -exec grep -l generic_leaf_target {} + | xargs -n1 dirname)
 		echo "$dirs" | xargs -P"$(nproc)" -I{} make -C {} -k
+		# A directory with subdirectories can also have its own tests and scripts, as
+		# controllers/memcg (memcontrol01 to memcontrol04) and controllers (cgroup_lib.sh). The
+		# target trunk-all builds them without the subdirectories. The install of these files
+		# needs the goal install, because env_post.mk sets INSTALL_FILES only for it.
+		trunks=$(find testcases -name Makefile -exec grep -l generic_trunk_target {} + | xargs -n1 dirname)
+		echo "$trunks" | xargs -I{} make -C {} -k trunk-all
 		make -k
 		echo "$dirs" | xargs -I{} make -C {} -k install
+		echo "$trunks" | xargs -I{} make -C {} -k install
 		# testcases/lib has the shell library (tst_test.sh, tst_net.sh) and its helper programs.
 		make -C testcases/lib -k install
 		make -k install

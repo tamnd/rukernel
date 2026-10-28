@@ -44,6 +44,27 @@ fn mkdir_makes_a_cgroup_with_its_files() {
     assert_eq!(read_err(&events), Errno::ENODEV);
 }
 
+#[test]
+fn rmdir_during_a_read_of_the_directory_skips_no_entry() {
+    let root = root();
+    let top = root.create(b"fs-rd", FileType::Directory, 0o755, 0).unwrap();
+    for i in 0..20 {
+        top.create(format!("c{i}").as_bytes(), FileType::Directory, 0o755, 0).unwrap();
+    }
+    // Remove each child when the read gets to it, as `find -depth -exec rmdir` does.
+    let mut pos = 0;
+    let mut removed = 0;
+    while let Some((e, next)) = top.read_dir(pos).unwrap() {
+        if e.kind == FileType::Directory && e.name.starts_with(b"c") {
+            top.rmdir(&e.name).unwrap();
+            removed += 1;
+        }
+        pos = next;
+    }
+    assert_eq!(removed, 20);
+    root.rmdir(b"fs-rd").unwrap();
+}
+
 fn read_err(inode: &InodeRef) -> Errno {
     let mut buf = [0u8; 16];
     inode.read_at(0, &mut buf).unwrap_err()

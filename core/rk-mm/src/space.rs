@@ -1385,6 +1385,19 @@ impl AddressSpace {
         }
     }
 
+    /// Removes the frames of each private area, for the OOM reaper. A shared area keeps its
+    /// frames, because other address spaces can map them. Gives the number of pages that were
+    /// mapped before. The call does not allocate, so it works when the memory is short, as
+    /// `__oom_reap_task_mm` of Linux.
+    pub fn reap(&self) -> usize {
+        let st = self.state.lock();
+        let before = self.vm.page_count();
+        for vma in st.vmas.iter().filter(|v| !v.shared) {
+            self.vm.unmap_range(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
+        }
+        before.saturating_sub(self.vm.page_count())
+    }
+
     /// Makes the address space of a child of `fork`. A shared area maps the same frames. A
     /// private area maps the same frames read only in both address spaces, so the first write in
     /// either one copies the page. A huge page stays a huge page in both.
