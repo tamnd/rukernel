@@ -1607,10 +1607,12 @@ impl Hierarchy {
     /// Changes the counts of the pressure of `id` and of the cgroups above it with `f` at the
     /// time `now`.
     pub fn psi_change(&mut self, id: CgId, now: u64, f: impl Fn(&mut psi::Counts)) {
-        for a in self.path_ids(id) {
-            if let Some(n) = self.nodes.get_mut(&a) {
-                n.psi.change(now, &f);
-            }
+        // The scheduler calls this at each task switch, so the walk up the tree does not make a
+        // `Vec`, as in `charge_cpu`.
+        let mut at = id;
+        while let Some(n) = self.nodes.get_mut(&at) {
+            n.psi.change(now, &f);
+            at = n.parent;
         }
     }
 
