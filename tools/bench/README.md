@@ -32,6 +32,8 @@ The table has four classes of spec/19-rukernel-bench.md section 19.1.
 | net | `udp_rr` | a round trip of 1 byte over UDP on loopback between two processes |
 | net | `udp_stream` | the throughput of datagrams of 1 KiB over UDP on loopback, as the receiver counts them |
 
+`udp_stream` depends much on the scheduler. With 1 CPU, the sender and the receiver share the CPU. Since the EEVDF wakeup preemption of #408 (2bcd83e), the receiver that a datagram wakes takes the CPU from the sender at once, as in Linux, so the two tasks switch about one time for each datagram. Before, the sender ran until the next tick, and the receiver then read the datagrams in a batch. This is the cause of the drop of the row from 16.8 MB/s (f4a973a) to 4.73 MB/s (212e8b2 with #401) in results.md (#442). A `git bisect` on server2 found 2bcd83e: 4.00 MB/s, and 18.0 MB/s at the commit before it (d94bb6d). At fa7f8e5, the row gives 5.29 MB/s, and 21.0 MB/s with the wakeup preemption turned off. Linux gives 5.50 MB/s in the same run. Thus the network code did not become slower, and the new value is the one to compare with Linux.
+
 ## How it runs
 
 `run.py` compiles `bench.c` as a static musl program and puts it as `/init` in an initramfs. It boots each kernel one time in QEMU, with the same machine: the same CPU count, memory, accelerator and CPU model. As init, the program mounts /proc and /dev, brings up `lo`, and runs each benchmark one time as a warm-up and then `--runs` times. Each run prints one line on the serial console. `run.py` reads the lines, and writes the median of each benchmark, the interquartile range, and the ratio of rukernel to Linux to `results.md`. A row where rukernel is more than 2 times slower than Linux is red. The serial output of each kernel stays in `OUT/linux.log` and `OUT/rukernel.log`.
@@ -51,6 +53,18 @@ cargo build --release --package rukernel --target aarch64-unknown-none
 tools/bench/run.py --arch aarch64 --rukernel target/aarch64-unknown-none/release/rukernel \
     --linux Image --cc aarch64-linux-musl-gcc --only cow --table tools/bench/results-aarch64.md
 ```
+
+The arm64 `fork` copy of #401, with `run.py --arch aarch64` on server2 (QEMU 8.2.2 with TCG, `cortex-a72`, `-smp 1`, load average 6 to 7), rukernel only, because the host has no Linux arm64 `Image`. The medians of 2 boots of 5 runs each (#442):
+
+| Benchmark | 212e8b2 (before #401) | fa7f8e5 (#401) |
+|---|---|---|
+| `fork` (us) | 856, 817 | 629, 665 |
+| `fork_big` (us) | 7724, 7745 | 2920, 2799 |
+| `cow` (ns) | 20966, 21334 | 19293, 17496 |
+| `fault` (ns) | 5884, 5876 | 5702, 5434 |
+| `mmap` (ns) | 33273, 27315 | 22569, 22296 |
+
+`fork` is 1.3 times faster and `fork_big` 2.7 times faster. `fork_big` also gains from the one entry for each huge page of #401.
 
 `--cc` takes a command with arguments, for example `"zig cc -target x86_64-linux-musl"`. `--bench FILE` uses a program that is already compiled. `--only getpid,fork` runs only some benchmarks. `--reuse` makes the table again from the logs of an earlier run, with no boot. `--reuse-linux` boots only rukernel and takes the Linux values from the earlier log, so two rukernel builds can use the same Linux run. `--smp` and `--memory` change the machine for both kernels. `run.py --help` gives all the options.
 

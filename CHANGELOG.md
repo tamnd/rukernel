@@ -17,6 +17,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `/proc/kpageflags` finds the file of a page from its frame through a map of the frames of the page caches (#430). It does not search the mapped files of each process.
 - `/proc/kpageflags` gives `KPF_COMPOUND_HEAD`, `KPF_COMPOUND_TAIL`, `KPF_HUGE`, `KPF_THP`, `KPF_KSM` and `KPF_ZERO_PAGE`, as `stable_page_flags` of Linux (#430). A private hugetlb page has `KPF_ANON`.
 - `/proc/PID/pagemap` gives `PM_MMAP_EXCLUSIVE` (bit 56) and `PM_SOFT_DIRTY` (bit 55) (#430). A write of 4 to the new file `/proc/PID/clear_refs` makes all the pages of the process clean, and the next write to a page makes it soft-dirty again.
+- The signal actions of a process (2 KiB) are in a box of their own, so that `Process` with the counts of its `Arc` is 968 bytes and fits the slab class of 1024 bytes of the kernel heap (#442). It was 3008 bytes, a large object of one page. The build checks the size.
+- tools/bench/cortenmm.md has the `fork` A/B with the changes of both #405 and #401 (#442). CortenMM is 1.9 times slower than VMA in `fork` (4484 and 2367 us) and 3.0 times slower in `fork_big` (22640 and 7467 us). The walk of the statuses is the cost that is left.
+- tools/bench/README.md gives the cause of the drop of `udp_stream` from 16.8 MB/s to 4.73 MB/s (#442): the EEVDF wakeup preemption of #408 lets the receiver take the CPU at each datagram, as in Linux. A bisect found 2bcd83e. Without the wakeup preemption the base gives 21.0 MB/s, and with it 5.29 MB/s, and Linux 5.50 MB/s. The README also has the numbers of the arm64 `fork` copy of #401: `fork` from 0.84 to 0.65 ms and `fork_big` from 7.7 to 2.9 ms on QEMU TCG.
 
 ### Fixed
 
