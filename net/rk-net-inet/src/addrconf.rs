@@ -2,15 +2,22 @@
 //! net/ipv6/addrconf.c and the netlink parts of net/ipv6/route.c of Linux.
 //!
 //! The loopback device gets `::1/128`, and each Ethernet device gets a link local address from
-//! its MAC address when it goes up. A router advertisement adds the default route, the routes
-//! of the prefixes and the addresses of SLAAC.
+//! its MAC address when it goes up. A TUN device has no hardware address, so it gets a link
+//! local address with a random interface identifier, as `IN6_ADDR_GEN_MODE_RANDOM` of Linux. A
+//! router advertisement adds the default route, the routes of the prefixes and the addresses of
+//! SLAAC.
 //!
 //! A new address on an Ethernet device is tentative while the duplicate address detection of
 //! RFC 4862 runs, as `addrconf_dad_begin` of Linux. The device joins the solicited node group of
-//! the address and sends an MLD report for it. Then it sends `dad_transmits` neighbour
-//! solicitations from `::`, one each second. If no other node answers, the address is no longer
-//! tentative. An answer, or a probe of another node for the same address, marks the address
-//! `dadfailed`. A tentative address is not a source address.
+//! the address and sends an MLD report for it. After a random delay below
+//! `router_solicitation_delay`, it sends `dad_transmits` neighbour solicitations from `::`, one
+//! each second. If no other node answers, the address is no longer tentative. An answer, or a
+//! probe of another node for the same address, marks the address `dadfailed`. A tentative
+//! address is not a source address. A TUN device has `IFF_NOARP`, so it does no detection.
+//!
+//! With `optimistic_dad`, the link local address and the addresses of SLAAC are optimistic, as
+//! RFC 4429: the detection starts at once, and the address is a source address while it is
+//! tentative. A program can ask for `IFA_F_OPTIMISTIC` too.
 //!
 //! Each change takes the lock of the table for a short time. The notifications go out after the
 //! lock is free, as in `fib`.
@@ -18,10 +25,12 @@
 use crate::fib::{self, IFADDR_LEN, RTMSG_LEN, now_cs};
 use crate::ip::{self, Ip};
 use crate::ipv6;
+use crate::mcast6;
 use crate::route::{INFINITY, RTAX_MAX};
 use crate::route6::{Addr6, Changes6, Match6, PRIO_USER, Route6};
 use crate::stack;
 use crate::stack6::{self, ROUTES6};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_addr::{
@@ -39,10 +48,12 @@ use rk_abi::native::rtnetlink::{
     RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_BLACKHOLE, RTN_LOCAL, RTN_PROHIBIT, RTN_UNICAST,
     RTN_UNREACHABLE, RTNLGRP_IPV6_IFADDR, RTNLGRP_IPV6_ROUTE, RTPROT_BOOT,
 };
+use rk_frame::sync::SpinLock;
 use rk_net::consts::{AF_INET6, IFF_NOARP};
 use rk_net::dev::{self, Event, LinkKind, NetDevice};
 use rk_net::netlink::msg::{Attrs, Builder, attrs};
 use rk_net::netlink::{self, Origin, Request};
+use rk_net::ns::PerNet;
 use rk_net::sysctl::{Family, Scope};
 use rk_vfs::inode::Result;
 
@@ -212,7 +223,11 @@ pub(crate) fn add_addr(mut a: Addr6, origin: Origin) -> Result<()> {
     let dad = dev.as_ref().is_some_and(|d| needs_dad(d, &a));
     if dad {
         a.flags |= IFA_F_TENTATIVE;
+    } else {
+        // An address without the detection is not optimistic, as `addrconf_dad_begin`.
+        a.flags &= !IFA_F_OPTIMISTIC;
     }
+    let optimistic = a.flags & IFA_F_OPTIMISTIC != 0;
     let changes = ROUTES6.lock().insert_addr(a.clone())?;
     notify_addr(&a, RTM_NEWADDR, origin);
     notify_changes(&changes);
@@ -220,7 +235,7 @@ pub(crate) fn add_addr(mut a: Addr6, origin: Origin) -> Result<()> {
     if let Some(d) = dev.filter(|d| d.is_up()) {
         stack6::join(&d, &a.addr);
         if dad {
-            stack6::start_dad(a.ifindex, a.addr);
+            stack6::start_dad(a.ifindex, a.addr, optimistic);
         }
     }
     Ok(())
@@ -240,8 +255,63 @@ fn needs_dad(d: &NetDevice, a: &Addr6) -> bool {
         && conf(Scope::Dev(ifindex), "dad_transmits") > 0
 }
 
+/// Tells if a new address of the kernel on `ifindex` is optimistic, as RFC 4429 and
+/// `addrconf_add_linklocal` of Linux: `optimistic_dad` of `all` or of the device is on, and
+/// `forwarding` of `all` is off.
+fn optimistic_dad(ifindex: u32) -> bool {
+    let conf = |scope, name| rk_net::sysctl::conf(Family::Ipv6, scope, name);
+    (conf(Scope::All, "optimistic_dad") > 0 || conf(Scope::Dev(ifindex), "optimistic_dad") > 0)
+        && conf(Scope::All, "forwarding") == 0
+}
+
+/// A new address of the kernel on `ifindex`, with `IFA_F_OPTIMISTIC` if `optimistic_dad` asks
+/// for it.
+fn kernel_addr(ifindex: u32, addr: Ip, prefix: u8) -> Addr6 {
+    let mut a = Addr6::new(ifindex, addr, prefix);
+    if optimistic_dad(ifindex) {
+        a.flags |= IFA_F_OPTIMISTIC;
+    }
+    a
+}
+
+/// The interface identifiers of the devices without a hardware address.
+static IIDS: PerNet<SpinLock<BTreeMap<u32, [u8; 8]>>> =
+    PerNet::new(|| SpinLock::new(BTreeMap::new()));
+
+/// The interface identifier of the link local address of `d`, as `addrconf_addr_gen` of Linux.
+/// An Ethernet device takes the EUI-64 of its MAC address. A TUN device has no hardware address,
+/// so Linux uses `IN6_ADDR_GEN_MODE_RANDOM` for it: a random identifier that stays the same
+/// while the device is there.
+fn interface_id(d: &NetDevice) -> Option<[u8; 8]> {
+    match d.kind() {
+        LinkKind::Ether => Some(ipv6::eui64(d.mac())),
+        LinkKind::Tun => Some(*IIDS.lock().entry(d.ifindex()).or_insert_with(random_iid)),
+        _ => None,
+    }
+}
+
+/// A random interface identifier that is not reserved, as `ipv6_reserved_interfaceid` of
+/// Linux asks: not 0 and not the anycast identifiers of a subnet.
+fn random_iid() -> [u8; 8] {
+    loop {
+        let id = mcast6::random_u64().to_be_bytes();
+        let reserved = id == [0; 8]
+            || id[..7] == [0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff] && id[7] >= 0x80
+            || id[..5] == [0x02, 0x00, 0x5e, 0xff, 0xfe];
+        if !reserved {
+            return id;
+        }
+    }
+}
+
+/// Clears the interface identifiers of a namespace that stops.
+pub(crate) fn ns_exit() {
+    IIDS.reset();
+}
+
 /// Ends the detection of `addr` on `ifindex`, as `addrconf_dad_completed` of Linux. With
 /// `failed` the address stays tentative and gets `IFA_F_DADFAILED`, as `addrconf_dad_failure`.
+/// The address is no longer optimistic in the two cases.
 pub(crate) fn dad_done(ifindex: u32, addr: &Ip, failed: bool) {
     update_addr(
         ifindex,
@@ -254,6 +324,7 @@ pub(crate) fn dad_done(ifindex: u32, addr: &Ip, failed: bool) {
             } else {
                 a.flags &= !IFA_F_TENTATIVE;
             }
+            a.flags &= !IFA_F_OPTIMISTIC;
             true
         },
         Origin::KERNEL,
@@ -345,7 +416,7 @@ pub(crate) fn slaac(ifindex: u32, addr: Ip, prefix: u8, valid: u32, preferred: u
     ) {
         return;
     }
-    let mut a = Addr6::new(ifindex, addr, prefix);
+    let mut a = kernel_addr(ifindex, addr, prefix);
     set(&mut a);
     // The address can be there on another device, which is not an error of the router.
     let _ = add_addr(a, Origin::KERNEL);
@@ -380,26 +451,28 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
                 // The address can be there from an earlier time.
                 let _ = add_addr(Addr6::new(ifindex, ip::LOOPBACK, 128), Origin::KERNEL);
             }
-            let ll = ipv6::link_local(ipv6::eui64(d.mac()));
-            let added = d.kind() == LinkKind::Ether
-                && add_addr(Addr6::new(ifindex, ll, 64), Origin::KERNEL).is_ok();
+            let id = interface_id(d);
+            let ll = ipv6::link_local(id.unwrap_or_default());
+            let added =
+                id.is_some() && add_addr(kernel_addr(ifindex, ll, 64), Origin::KERNEL).is_ok();
             let changes = ROUTES6.lock().link_up(ifindex, loopback);
             notify_changes(&changes);
+            mcast6::up(d);
             if d.kind() == LinkKind::Ether {
                 stack6::start_solicit(ifindex);
             }
             // The addresses that came while the device was down start their detection now. The
             // new link local address started it in `add_addr`.
-            let waiting: Vec<(Ip, bool)> = ROUTES6
+            let waiting: Vec<(Ip, u32)> = ROUTES6
                 .lock()
                 .addrs_of(ifindex)
                 .filter(|a| !(added && a.addr == ll))
-                .map(|a| (a.addr, a.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED) == IFA_F_TENTATIVE))
+                .map(|a| (a.addr, a.flags))
                 .collect();
-            for (addr, dad) in waiting {
+            for (addr, flags) in waiting {
                 stack6::join(d, &addr);
-                if dad {
-                    stack6::start_dad(ifindex, addr);
+                if flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED) == IFA_F_TENTATIVE {
+                    stack6::start_dad(ifindex, addr, flags & IFA_F_OPTIMISTIC != 0);
                 }
             }
         }
@@ -413,7 +486,11 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
             stack6::stop_solicit(ifindex);
         }
         // The device is down before it goes, so it has no address or route.
-        Event::Flags(_) | Event::Mtu | Event::Name | Event::Register | Event::Unregister => {}
+        Event::Unregister => {
+            IIDS.lock().remove(&ifindex);
+            mcast6::forget(ifindex);
+        }
+        Event::Flags(_) | Event::Mtu | Event::Name | Event::Register => {}
     }
 }
 

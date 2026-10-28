@@ -1801,6 +1801,18 @@ const INET6_SCRIPT2: &[u8] = b"ip -6 addr add 2001:db8:1::5/64 dev eth0 \
 && grep -q '^Icmp6InEchoReplies[[:space:]]*[1-9]' /proc/net/snmp6 \
 && echo 'inet6: second'' part' || exit 1\n";
 
+/// The optimistic line of the `inet6` test (#429). With `optimistic_dad`, the link local address
+/// is tentative and optimistic (0x44) after the device goes up again, and loses the two flags
+/// when duplicate address detection ends.
+const INET6_SCRIPT_OPTIMISTIC: &[u8] = b"C=/proc/sys/net/ipv6/conf/eth0 \
+&& L='^fe80000000000000505400fffe123456 02 40 20' \
+&& echo 1 > $C/optimistic_dad && echo 3 > $C/dad_transmits \
+&& ip link set eth0 down && ip link set eth0 up && grep 505400fffe123456 /proc/net/if_inet6 \
+&& grep -q \"$L [4c]4 \" /proc/net/if_inet6 \
+&& { for i in 1 2 3 4 5 6 7 8; do grep -q \"$L [08]0 \" /proc/net/if_inet6 && break; sleep 1; done; } \
+&& grep -q \"$L [08]0 \" /proc/net/if_inet6 && echo 0 > $C/optimistic_dad && echo 1 > $C/dad_transmits \
+&& echo 'inet6: optimistic'' part' || exit 1\n";
+
 /// The third line of the `inet6` test. It runs a TCP server and a UDP server on `::` and finds
 /// them in /proc/net/tcp6 and /proc/net/udp6. A TCP client connects to the server on `::1`.
 const INET6_SCRIPT3: &[u8] = b"{ busybox tcpsvd :: 5557 echo v6ok </dev/null & } && { busybox udpsvd :: 5558 true </dev/null & } \
@@ -1880,7 +1892,8 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
         "inet6" => &[
             ("/ # ", INET6_SCRIPT),
             ("inet6: first part", INET6_SCRIPT2),
-            ("inet6: second part", INET6_SCRIPT3),
+            ("inet6: second part", INET6_SCRIPT_OPTIMISTIC),
+            ("inet6: optimistic part", INET6_SCRIPT3),
         ],
         _ => &[],
     }

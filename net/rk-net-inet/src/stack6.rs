@@ -5,8 +5,8 @@
 //! The stack has no fragments. An Ethernet device sends router solicitations when it goes up,
 //! and a router advertisement gives the default route and the global address of the device
 //! (SLAAC). A new address goes through duplicate address detection, and the device sends an
-//! MLDv2 report when it joins the solicited node group of the address. The stack does not answer
-//! the queries of MLD.
+//! MLD report when it joins the solicited node group of the address. `mcast6` has the groups and
+//! the answers to the queries of MLD.
 //!
 //! The locks are the same as in `stack`: the code holds at most one table lock at a time, and
 //! the notifications of rtnetlink go out after the lock is free.
@@ -23,7 +23,7 @@ use crate::route::INFINITY;
 use crate::route6::{Next6, PRIO_ADDRCONF, Route6, Table6};
 use crate::socket::Info6;
 use crate::stack::{self, PING_PORTS, UDP_PORTS, count, icmp_types, now_ms};
-use crate::{addrconf, checksum, neigh};
+use crate::{addrconf, checksum, mcast6, neigh};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -35,7 +35,7 @@ use rk_abi::native::icmpv6::{
     ICMPV6_NOT_NEIGHBOUR, ICMPV6_PARAMPROB, ICMPV6_PKT_TOOBIG, ICMPV6_POLICY_FAIL,
     ICMPV6_PORT_UNREACH, ICMPV6_REJECT_ROUTE, ICMPV6_TIME_EXCEED, ICMPV6_UNK_NEXTHDR,
 };
-use rk_abi::native::if_addr::IFA_F_TENTATIVE;
+use rk_abi::native::if_addr::{IFA_F_OPTIMISTIC, IFA_F_TENTATIVE};
 use rk_abi::native::if_ether::ETH_P_IPV6;
 use rk_abi::native::inet::{IPPROTO_IPIP, IPPROTO_IPV6};
 use rk_abi::native::rtnetlink::RTPROT_RA;
@@ -72,15 +72,6 @@ struct Dad {
 
 /// The time between two probes, `RETRANS_TIMER` of Linux, in milliseconds.
 const RETRANS_TIMER_MS: u64 = 1000;
-/// The group of the MLDv2 routers, `ff02::16`.
-const ALL_MLDV2_ROUTERS: Ip = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x16];
-/// The ICMPv6 type of an MLDv2 report, `ICMPV6_MLD2_REPORT`.
-const MLD2_REPORT: u8 = 143;
-/// The record of a join, `MLD2_CHANGE_TO_EXCLUDE`.
-const MLD2_CHANGE_TO_EXCLUDE: u8 = 4;
-/// The next header of the hop-by-hop options, `NEXTHDR_HOP`.
-const NEXT_HOP: u8 = 0;
-
 /// The count of router solicitations, `rtr_solicits` of Linux.
 const RTR_SOLICITS: u32 = 3;
 /// The time between two router solicitations, `rtr_solicit_interval` of Linux.
@@ -360,7 +351,7 @@ pub(crate) fn output_raw(next: &Next6, packet: &[u8]) -> Result<()> {
 }
 
 /// Counts an ICMPv6 message that goes out, as `icmp6_msg_outstats` of Linux.
-fn count_icmp_out(msg: &[u8]) {
+pub(crate) fn count_icmp_out(msg: &[u8]) {
     if let Some(&t) = msg.first() {
         count(&COUNTERS6.icmp_out);
         count(&COUNTERS6.icmp_out_type[usize::from(t)]);
@@ -448,7 +439,7 @@ fn put_link_option(msg: &mut Vec<u8>, kind: u8, dev: &NetDevice) {
 
 /// Sends a neighbour solicitation for `target` on `dev`, as `ndisc_solicit` of Linux.
 fn solicit(dev: &NetDevice, target: &Ip) {
-    let Some(src) = ROUTES6.lock().select_src(target, dev.ifindex()) else { return };
+    let Some(src) = ROUTES6.lock().select_src_strict(target, dev.ifindex()) else { return };
     let dst = ipv6::solicited_node(target);
     let mut msg = Vec::with_capacity(32);
     msg.extend_from_slice(&[NDISC_NEIGHBOUR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0]);
@@ -467,19 +458,29 @@ fn send_dad(dev: &NetDevice, target: &Ip) {
     send_ndisc(dev, &ip::ANY, &dst, ipv6::multicast_mac(&dst), msg);
 }
 
-/// Starts the duplicate address detection of `addr` on `ifindex`. The first probe goes out at
-/// the next poll. A detection that runs for the address goes on.
-pub(crate) fn start_dad(ifindex: u32, addr: Ip) {
-    let probes = rk_net::sysctl::conf(
-        rk_net::sysctl::Family::Ipv6,
-        rk_net::sysctl::Scope::Dev(ifindex),
-        "dad_transmits",
-    );
+/// Starts the duplicate address detection of `addr` on `ifindex`, as `addrconf_dad_kick` of
+/// Linux. The first probe goes out after a random delay below `router_solicitation_delay`, or
+/// at the next poll for an `optimistic` address. A detection that runs for the address goes on.
+pub(crate) fn start_dad(ifindex: u32, addr: Ip, optimistic: bool) {
+    let conf = |name| {
+        rk_net::sysctl::conf(
+            rk_net::sysctl::Family::Ipv6,
+            rk_net::sysctl::Scope::Dev(ifindex),
+            name,
+        )
+    };
+    let probes = conf("dad_transmits");
+    // The value is in seconds. Linux takes a delay below 1 jiffy, which is 0, for 0.
+    let delay = if optimistic {
+        0
+    } else {
+        mcast6::random_below(u64::try_from(conf("router_solicitation_delay")).unwrap_or(0) * 1000)
+    };
     let mut d = DAD.lock();
     if d.iter().any(|x| x.ifindex == ifindex && x.addr == addr) {
         return;
     }
-    d.push(Dad { ifindex, addr, probes: probes.max(1) as u32, next: now_ms() });
+    d.push(Dad { ifindex, addr, probes: probes.max(1) as u32, next: now_ms() + delay });
 }
 
 /// Tells if `addr` on `ifindex` is in duplicate address detection, and stops the detection
@@ -497,47 +498,22 @@ fn dad_conflict(ifindex: u32, addr: &Ip) -> bool {
     found
 }
 
-/// Sends an MLDv2 report that the device joins `group`, as `igmp6_send` of Linux. The packet
-/// has the router alert option and the hop limit 1. The source is a link local address, or
-/// `::` if the device has none yet, as RFC 3590 allows.
-fn send_mld_join(dev: &NetDevice, group: &Ip) {
-    let ifindex = dev.ifindex();
-    let src = ROUTES6
-        .lock()
-        .addrs_of(ifindex)
-        .find(|a| ipv6::is_link_local(&a.addr) && a.flags & IFA_F_TENTATIVE == 0)
-        .map_or(ip::ANY, |a| a.addr);
-    let mut msg = Vec::with_capacity(28);
-    msg.extend_from_slice(&[MLD2_REPORT, 0, 0, 0, 0, 0, 0, 1]);
-    msg.extend_from_slice(&[MLD2_CHANGE_TO_EXCLUDE, 0, 0, 0]);
-    msg.extend_from_slice(group);
-    let dst = ALL_MLDV2_ROUTERS;
-    let sum = checksum::upper(&src, &dst, PROTO_ICMPV6, &msg);
-    msg[2..4].copy_from_slice(&sum.to_be_bytes());
-    // The hop-by-hop header: the router alert option for MLD, then two bytes of padding.
-    let hop = [PROTO_ICMPV6, 0, 5, 2, 0, 0, 1, 0];
-    let mut h = Header::new(src, dst, NEXT_HOP, hop.len() + msg.len());
-    h.hops = 1;
-    let mut buf = NetBuf::new(HEADROOM, HLEN + hop.len() + msg.len());
-    buf.extend_from_slice(&h.to_bytes());
-    buf.extend_from_slice(&hop);
-    buf.extend_from_slice(&msg);
-    count_icmp_out(&msg);
-    count(&COUNTERS6.out_requests);
+/// Gives a packet to a multicast group `dst` on `dev`, as `ip6_finish_output2` of Linux.
+pub(crate) fn transmit_mcast(dev: &NetDevice, dst: &Ip, mut buf: NetBuf) -> Result<()> {
     count(&COUNTERS6.out_transmits);
-    count(&COUNTERS6.out_mcast);
-    ether(dev, ipv6::multicast_mac(&dst)).push(&mut buf);
-    // A lost report is like a lost frame. A router asks again with a query.
-    let _ = dev.transmit(buf);
+    add(&COUNTERS6.out_octets, buf.len());
+    let mac = if dev.kind() == LinkKind::Ether { ipv6::multicast_mac(dst) } else { MacAddr::ZERO };
+    ether(dev, mac).push(&mut buf);
+    dev.transmit(buf)
 }
 
 /// Joins the solicited node group of the address `addr` on `dev`, as `addrconf_join_solict` of
-/// Linux, and sends the MLD report. The loopback device and a TUN device send no report.
+/// Linux, and sends the MLD report. The loopback device sends no report.
 pub(crate) fn join(dev: &NetDevice, addr: &Ip) {
-    if dev.kind() != LinkKind::Ether || ipv6::is_multicast(addr) {
+    if ipv6::is_multicast(addr) {
         return;
     }
-    send_mld_join(dev, &ipv6::solicited_node(addr));
+    mcast6::report_change(dev, &ipv6::solicited_node(addr), true);
 }
 
 /// Sends a router solicitation on `dev`, as `ndisc_send_rs` of Linux. Without a link local
@@ -601,6 +577,7 @@ pub(crate) fn input(dev: &NetDevice, mut frame: NetBuf) {
         let t = ROUTES6.lock();
         if mcast { loopback || t.takes_multicast(ifindex, &h.dst) } else { t.is_local(&h.dst) }
     };
+    let ours = ours || (mcast && mcast6::joined(ifindex, &h.dst));
     if !ours {
         return count(&COUNTERS6.in_addr_errors);
     }
@@ -786,6 +763,7 @@ fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], mcast: bool) {
         NDISC_NEIGHBOUR_SOLICITATION => ndisc_ns(dev, h, msg),
         NDISC_NEIGHBOUR_ADVERTISEMENT => ndisc_na(dev, h, msg),
         NDISC_ROUTER_ADVERTISEMENT => ndisc_ra(dev, h, msg),
+        mcast6::MLD_QUERY => mcast6::query_input(dev, h, msg),
         _ => {}
     }
 }
@@ -865,10 +843,11 @@ fn ndisc_ns(dev: &NetDevice, h: &Header, msg: &[u8]) {
         return;
     }
     let ifindex = dev.ifindex();
-    let (ours, tentative) = {
+    let (ours, tentative, optimistic) = {
         let t = ROUTES6.lock();
         let a = t.addrs_of(ifindex).find(|a| a.addr == target);
-        (a.is_some(), a.is_some_and(|a| a.flags & IFA_F_TENTATIVE != 0))
+        let flag = |f| a.is_some_and(|a| a.flags & f != 0);
+        (a.is_some(), flag(IFA_F_TENTATIVE), flag(IFA_F_OPTIMISTIC))
     };
     let slla = link_option(&msg[24..], ND_OPT_SOURCE_LL_ADDR);
     // A probe of duplicate address detection has the source `::` and no link address.
@@ -877,8 +856,9 @@ fn ndisc_ns(dev: &NetDevice, h: &Header, msg: &[u8]) {
         return;
     }
     // A tentative address answers nothing. A probe of another node for it is a conflict, as
-    // `ndisc_recv_ns` of Linux.
-    if tentative {
+    // `ndisc_recv_ns` of Linux. An optimistic address answers a solicitation that is not a probe,
+    // without the override flag, as RFC 4429 asks.
+    if tentative && (dad || !optimistic) {
         if dad {
             dad_conflict(ifindex, &target);
         }
@@ -892,6 +872,7 @@ fn ndisc_ns(dev: &NetDevice, h: &Header, msg: &[u8]) {
     }
     let (dst, flags) =
         if dad { (ALL_NODES, NA_OVERRIDE) } else { (h.src, NA_SOLICITED | NA_OVERRIDE) };
+    let flags = if optimistic { flags & !NA_OVERRIDE } else { flags };
     let mac = if dad {
         Some(ipv6::multicast_mac(&ALL_NODES))
     } else {
@@ -1055,6 +1036,7 @@ pub(crate) fn tick() {
         }
     }
     dad_tick(now);
+    mcast6::tick(now);
     // The lifetimes count in seconds, thus one check each second is enough.
     if NEXT_EXPIRE.load(Ordering::Relaxed) <= now {
         NEXT_EXPIRE.store(now + 1000, Ordering::Relaxed);
@@ -1105,4 +1087,6 @@ pub(crate) fn ns_exit() {
     NEXT_EXPIRE.reset();
     DAD.reset();
     COUNTERS6.reset();
+    mcast6::ns_exit();
+    addrconf::ns_exit();
 }

@@ -26,14 +26,14 @@ use rk_abi::Errno;
 use rk_abi::native::icmpv6::{ICMPV6_ECHO_REQUEST, ICMPV6_FILTER};
 use rk_abi::native::in6::{
     IPV6_2292DSTOPTS, IPV6_2292HOPLIMIT, IPV6_2292HOPOPTS, IPV6_2292PKTINFO, IPV6_2292RTHDR,
-    IPV6_ADDR_PREFERENCES, IPV6_ADDRFORM, IPV6_AUTOFLOWLABEL, IPV6_CHECKSUM, IPV6_DONTFRAG,
-    IPV6_FLOWINFO, IPV6_FLOWINFO_SEND, IPV6_FREEBIND, IPV6_HDRINCL, IPV6_HOPLIMIT,
-    IPV6_MINHOPCOUNT, IPV6_MTU, IPV6_MTU_DISCOVER, IPV6_MULTICAST_ALL, IPV6_MULTICAST_HOPS,
-    IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP, IPV6_PKTINFO, IPV6_PMTUDISC_OMIT, IPV6_RECVDSTOPTS,
-    IPV6_RECVERR, IPV6_RECVERR_RFC4884, IPV6_RECVFRAGSIZE, IPV6_RECVHOPLIMIT, IPV6_RECVHOPOPTS,
-    IPV6_RECVORIGDSTADDR, IPV6_RECVPATHMTU, IPV6_RECVPKTINFO, IPV6_RECVRTHDR, IPV6_RECVTCLASS,
-    IPV6_ROUTER_ALERT_ISOLATE, IPV6_RTHDR, IPV6_TCLASS, IPV6_TRANSPARENT, IPV6_UNICAST_HOPS,
-    IPV6_UNICAST_IF, IPV6_V6ONLY,
+    IPV6_ADD_MEMBERSHIP, IPV6_ADDR_PREFERENCES, IPV6_ADDRFORM, IPV6_AUTOFLOWLABEL, IPV6_CHECKSUM,
+    IPV6_DONTFRAG, IPV6_DROP_MEMBERSHIP, IPV6_FLOWINFO, IPV6_FLOWINFO_SEND, IPV6_FREEBIND,
+    IPV6_HDRINCL, IPV6_HOPLIMIT, IPV6_MINHOPCOUNT, IPV6_MTU, IPV6_MTU_DISCOVER, IPV6_MULTICAST_ALL,
+    IPV6_MULTICAST_HOPS, IPV6_MULTICAST_IF, IPV6_MULTICAST_LOOP, IPV6_PKTINFO, IPV6_PMTUDISC_OMIT,
+    IPV6_RECVDSTOPTS, IPV6_RECVERR, IPV6_RECVERR_RFC4884, IPV6_RECVFRAGSIZE, IPV6_RECVHOPLIMIT,
+    IPV6_RECVHOPOPTS, IPV6_RECVORIGDSTADDR, IPV6_RECVPATHMTU, IPV6_RECVPKTINFO, IPV6_RECVRTHDR,
+    IPV6_RECVTCLASS, IPV6_ROUTER_ALERT_ISOLATE, IPV6_RTHDR, IPV6_TCLASS, IPV6_TRANSPARENT,
+    IPV6_UNICAST_HOPS, IPV6_UNICAST_IF, IPV6_V6ONLY,
 };
 use rk_abi::native::inet::{
     IP_HDRINCL, IP_MTU_DISCOVER, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
@@ -261,10 +261,43 @@ struct State {
     /// `IPV6_RTHDR`: the routing header that the program set. Each UDP and raw packet of IPv6
     /// gets it.
     rthdr: Option<Vec<u8>>,
+    /// The multicast groups of IPv6 that the socket joined: the interface and the group, as
+    /// `ipv6_mc_list` of Linux.
+    groups6: Vec<(u32, Ip)>,
 }
 
 /// `UDP_CORK` of include/uapi/linux/udp.h.
 const UDP_CORK: u32 = 1;
+/// `MCAST_JOIN_GROUP` of include/uapi/linux/in.h.
+const MCAST_JOIN_GROUP: u32 = 42;
+/// `MCAST_LEAVE_GROUP` of include/uapi/linux/in.h.
+const MCAST_LEAVE_GROUP: u32 = 45;
+/// The size of `struct ipv6_mreq`.
+const IPV6_MREQ_LEN: usize = 20;
+/// The size of `struct group_req` on a 64-bit machine.
+const GROUP_REQ_LEN: usize = 136;
+
+/// The interface and the group of `struct ipv6_mreq` or `struct group_req` in `value`, for the
+/// option `name`, as `do_ipv6_setsockopt` of Linux.
+fn membership(name: u32, value: &[u8]) -> Result<(u32, Ip)> {
+    if name == MCAST_JOIN_GROUP || name == MCAST_LEAVE_GROUP {
+        if value.len() < GROUP_REQ_LEN {
+            return Err(Errno::EINVAL);
+        }
+        let ifindex = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+        if u32::from(u16::from_ne_bytes([value[8], value[9]])) != AF_INET6 {
+            return Err(Errno::EINVAL);
+        }
+        let group: Ip = value[16..32].try_into().map_err(|_| Errno::EINVAL)?;
+        return Ok((ifindex, group));
+    }
+    if value.len() < IPV6_MREQ_LEN {
+        return Err(Errno::EINVAL);
+    }
+    let group: Ip = value[..16].try_into().map_err(|_| Errno::EINVAL)?;
+    let ifindex = i32::from_ne_bytes([value[16], value[17], value[18], value[19]]);
+    Ok((u32::try_from(ifindex).unwrap_or(0), group))
+}
 /// `IPV6_SRCRT_TYPE_2` of include/uapi/linux/ipv6.h: the routing header of Mobile IPv6.
 const SRCRT_TYPE_2: u8 = 2;
 /// `IPV6_SRCRT_TYPE_4` of include/uapi/linux/ipv6.h: the segment routing header.
@@ -438,6 +471,7 @@ impl Dgram {
                 corked: None,
                 cork: false,
                 rthdr: None,
+                groups6: Vec::new(),
             }),
             wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
@@ -937,6 +971,17 @@ impl Dgram {
             s.rthdr = rthdr_of(value).ok_or(Errno::EINVAL)?;
             return Ok(());
         }
+        if matches!(
+            name,
+            IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP | MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP
+        ) {
+            let (ifindex, group) = membership(name, value)?;
+            return if name == IPV6_ADD_MEMBERSHIP || name == MCAST_JOIN_GROUP {
+                Self::join6(s, ifindex, &group)
+            } else {
+                Self::leave6(s, ifindex, &group)
+            };
+        }
         let v = int_of(value)?;
         let raw = matches!(self.proto, Proto::Raw(_));
         let hops = |v: i32| if (-1..=255).contains(&v) { Ok(v) } else { Err(Errno::EINVAL) };
@@ -970,6 +1015,45 @@ impl Dgram {
             }
             _ => return Err(Errno::ENOPROTOOPT),
         }
+        Ok(())
+    }
+
+    /// Joins a multicast group of IPv6, as `ipv6_sock_mc_join` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` for an address that is not multicast, `EADDRINUSE` if the socket is in the
+    /// group on the interface, and `ENODEV` for an interface that is not there.
+    fn join6(s: &mut State, ifindex: u32, group: &Ip) -> Result<()> {
+        if !ipv6::is_multicast(group) {
+            return Err(Errno::EINVAL);
+        }
+        if s.groups6.iter().any(|(i, g)| (ifindex == 0 || *i == ifindex) && g == group) {
+            return Err(Errno::EADDRINUSE);
+        }
+        let dev = crate::mcast6::sock_join(ifindex, group)?;
+        s.groups6.push((dev, *group));
+        Ok(())
+    }
+
+    /// Leaves a multicast group of IPv6, as `ipv6_sock_mc_drop` of Linux. The interface 0 takes
+    /// the group on any interface.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` for an address that is not multicast, and `EADDRNOTAVAIL` if the socket is
+    /// not in the group.
+    fn leave6(s: &mut State, ifindex: u32, group: &Ip) -> Result<()> {
+        if !ipv6::is_multicast(group) {
+            return Err(Errno::EINVAL);
+        }
+        let at = s
+            .groups6
+            .iter()
+            .position(|(i, g)| (ifindex == 0 || *i == ifindex) && g == group)
+            .ok_or(Errno::EADDRNOTAVAIL)?;
+        let (i, g) = s.groups6.remove(at);
+        crate::mcast6::leave(i, &g);
         Ok(())
     }
 
@@ -1407,7 +1491,12 @@ impl Socket for Dgram {
         s.closed = true;
         self.release_port(&mut s);
         s.queue.clear();
+        let groups = core::mem::take(&mut s.groups6);
         drop(s);
+        // The socket leaves its groups, as `ipv6_sock_mc_close` of Linux.
+        for (i, g) in &groups {
+            crate::mcast6::leave(*i, g);
+        }
         stack::remove_socket(self.ino);
     }
 

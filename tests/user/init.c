@@ -4453,6 +4453,11 @@ static void test_tcp_host(int port)
 #define RK_TUNSETIFF _IOW('T', 202, int)
 #define RK_IFF_TUN 0x0001
 #define RK_IFF_NO_PI 0x1000
+#define RK_IFF_MULTI_QUEUE 0x0100
+#define RK_IFF_ATTACH_QUEUE 0x0200
+#define RK_IFF_DETACH_QUEUE 0x0400
+#define RK_TUNSETQUEUE _IOW('T', 217, int)
+#define RK_TUNSETIFINDEX _IOW('T', 218, unsigned int)
 
 /* An AF_PACKET socket on lo gets the frames of a datagram over lo. */
 static void test_packet_lo(void)
@@ -4556,6 +4561,239 @@ static void test_tun(void)
 	check("rktun0 goes away when the file closes", if_nametoindex("rktun0") == 0);
 }
 
+/* Reads the frames of the TUN file t until there is no frame. Gives the number of UDP datagrams
+ * of 4 bytes over IPv4. The device sends IPv6 frames too, for example MLD reports. */
+static int tun_udp_frames(int t, unsigned char *buf, int size)
+{
+	int got = 0;
+	long n;
+	while ((n = read(t, buf, size)) > 0)
+		got += n == 32 && buf[0] == 0x45 && buf[9] == IPPROTO_UDP;
+	return got;
+}
+
+/* Reads the frames of the TUN file t for up to five seconds. Gives 1 when an MLD message of the
+ * type `type` names the group `group`. A message of MLD comes after the IPv6 header and the
+ * hop-by-hop header of 8 bytes. A report of MLDv2 has records of 20 bytes after 8 bytes, with
+ * the record type `rec` at the offset 0 and the group at the offset 4. A message of MLDv1 has
+ * the group at the offset 8. */
+static int tun_mld(int t, int type, int rec, const struct in6_addr *group)
+{
+	unsigned char buf[1500];
+	for (int i = 0; i < 5; i++) {
+		struct pollfd pf = { .fd = t, .events = POLLIN };
+		if (poll(&pf, 1, 1000) != 1)
+			continue;
+		long n;
+		while ((n = read(t, buf, sizeof(buf))) > 0) {
+			if (n < 40 + 8 + 24 || (buf[0] >> 4) != 6 || buf[6] != 0 || buf[7] != 1 ||
+			    buf[40] != IPPROTO_ICMPV6 || buf[48] != type)
+				continue;
+			if (type != 143 && memcmp(buf + 56, group, 16) == 0)
+				return 1;
+			int records = (buf[54] << 8) | buf[55];
+			for (int k = 0; type == 143 && k < records && 56 + 20 * k + 20 <= n; k++)
+				if (buf[56 + 20 * k] == rec && !memcmp(buf + 56 + 20 * k + 4, group, 16))
+					return 1;
+		}
+	}
+	return 0;
+}
+
+/* Writes an MLD query of `len` bytes from fe80::2 to ff02::1 into the TUN file t. A query of 24
+ * bytes is MLDv1, and a query of 28 bytes is MLDv2. The maximum delay is 10 ms. */
+static int tun_mld_query(int t, int len)
+{
+	unsigned char p[40 + 28] = { 0x60, 0, 0, 0, 0, len, IPPROTO_ICMPV6, 1 };
+	p[8] = 0xfe;
+	p[9] = 0x80;
+	p[23] = 2;
+	p[24] = 0xff;
+	p[25] = 0x02;
+	p[39] = 1;
+	unsigned char *m = p + 40;
+	m[0] = 130;
+	m[5] = 10;
+	/* The checksum covers the pseudo header: the addresses, the length and the next header. */
+	unsigned char sum[40 + 28] = { 0 };
+	memcpy(sum, p + 8, 32);
+	sum[35] = len;
+	sum[39] = IPPROTO_ICMPV6;
+	memcpy(sum + 40, m, len);
+	unsigned short c = inet_sum(sum, 40 + len);
+	memcpy(m + 2, &c, 2);
+	return write(t, p, 40 + len) == 40 + len;
+}
+
+/* Reads /proc/net/if_inet6. Gives 1 when the device `name` has a link local address that is
+ * not tentative. */
+static int tun_has_link_local(const char *name)
+{
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	FILE *f = fopen("/proc/net/if_inet6", "r");
+	if (!f)
+		return 0;
+	char addr[40], dev[32];
+	unsigned int ifindex, prefix, scope, flags;
+	int found = 0;
+	while (fscanf(f, "%39s %x %x %x %x %31s", addr, &ifindex, &prefix, &scope, &flags, dev) == 6) {
+		if (strcmp(dev, name) == 0)
+			printf("init: inet: %s has %s, flags %x\n", name, addr, flags);
+		found |= strcmp(dev, name) == 0 && strncmp(addr, "fe80", 4) == 0 && prefix == 64 &&
+			 !(flags & 0x40);
+	}
+	fclose(f);
+	return found;
+}
+
+/* Makes the TUN device rktun6 and brings it up. The device must get a link local address
+ * without duplicate address detection. A socket joins a group: the device must send an MLDv2
+ * report, and answer a general query of MLDv2 and of MLDv1. After the MLDv1 query, the leave of
+ * the group must send an MLDv1 done message (#429). */
+static void test_tun6(void)
+{
+	int t = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, "rktun6");
+	ifr.ifr_flags = RK_IFF_TUN | RK_IFF_NO_PI;
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	int r = ioctl(t, RK_TUNSETIFF, &ifr);
+	r |= ioctl(s, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags |= IFF_UP;
+	r |= ioctl(s, SIOCSIFFLAGS, &ifr);
+	check("rktun6 goes up", t >= 0 && r == 0);
+	close(s);
+	if (t < 0 || r != 0)
+		return;
+	check("rktun6 gets a link local address at once", tun_has_link_local("rktun6"));
+
+	struct ipv6_mreq m = { .ipv6mr_interface = if_nametoindex("rktun6") };
+	inet_pton(AF_INET6, "ff02::4242", &m.ipv6mr_multiaddr);
+	int s6 = socket(AF_INET6, SOCK_DGRAM, 0);
+	r = setsockopt(s6, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m, sizeof(m));
+	check("IPV6_JOIN_GROUP joins ff02::4242 on rktun6", r == 0);
+	check("the join sends an MLDv2 report", tun_mld(t, 143, 4, &m.ipv6mr_multiaddr));
+	errno = 0;
+	check("a second join gives EADDRINUSE",
+	      setsockopt(s6, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m, sizeof(m)) == -1 &&
+		      errno == EADDRINUSE);
+	check("a general query of MLDv2 gets a report",
+	      tun_mld_query(t, 28) && tun_mld(t, 143, 2, &m.ipv6mr_multiaddr));
+	check("a general query of MLDv1 gets a report of MLDv1",
+	      tun_mld_query(t, 24) && tun_mld(t, 131, 0, &m.ipv6mr_multiaddr));
+	r = setsockopt(s6, IPPROTO_IPV6, IPV6_LEAVE_GROUP, &m, sizeof(m));
+	check("the leave sends an MLDv1 done", r == 0 && tun_mld(t, 132, 0, &m.ipv6mr_multiaddr));
+	close(s6);
+	close(t);
+}
+
+/* Makes a TUN device with two queues and the interface index 77, and sends datagrams of 16
+ * flows through it. Each queue must get some of them. Then takes a queue off and puts it back. */
+static void test_tun_mq(void)
+{
+	int q[2];
+	q[0] = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+	q[1] = open("/dev/net/tun", O_RDWR | O_NONBLOCK);
+	if (q[0] < 0 || q[1] < 0) {
+		check("/dev/net/tun opens two times", 0);
+		return;
+	}
+	unsigned int index = 77;
+	check("TUNSETIFINDEX takes an index", ioctl(q[0], RK_TUNSETIFINDEX, &index) == 0);
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, "rkmq0");
+	ifr.ifr_flags = RK_IFF_TUN | RK_IFF_NO_PI | RK_IFF_MULTI_QUEUE;
+	int r0 = ioctl(q[0], RK_TUNSETIFF, &ifr);
+	int r1 = ioctl(q[1], RK_TUNSETIFF, &ifr);
+	check("two files attach to the multi-queue device rkmq0", r0 == 0 && r1 == 0);
+	check("rkmq0 has the index of TUNSETIFINDEX", if_nametoindex("rkmq0") == 77);
+	errno = 0;
+	check("TUNSETIFINDEX on an attached file gives EPERM",
+	      ioctl(q[1], RK_TUNSETIFINDEX, &index) == -1 && errno == EPERM);
+	int single = open("/dev/net/tun", O_RDWR);
+	struct ifreq one = { 0 };
+	strcpy(one.ifr_name, "rkmq0");
+	one.ifr_flags = RK_IFF_TUN | RK_IFF_NO_PI;
+	errno = 0;
+	check("a file without IFF_MULTI_QUEUE cannot attach to rkmq0",
+	      ioctl(single, RK_TUNSETIFF, &one) == -1 && errno == EINVAL);
+	close(single);
+
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in a = inet_addr4(0x0a090801, 0);
+	memcpy(&ifr.ifr_addr, &a, sizeof(a));
+	int r = ioctl(s, SIOCSIFADDR, &ifr);
+	a = inet_addr4(0xffffff00, 0);
+	memcpy(&ifr.ifr_netmask, &a, sizeof(a));
+	r |= ioctl(s, SIOCSIFNETMASK, &ifr);
+	r |= ioctl(s, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags |= IFF_UP;
+	r |= ioctl(s, SIOCSIFFLAGS, &ifr);
+	check("rkmq0 gets 10.9.8.1/24 and goes up", r == 0);
+
+	/* Each datagram has its own source port, so it is its own flow. */
+	int got[2] = { 0, 0 };
+	unsigned char buf[256];
+	for (int i = 0; i < 16; i++) {
+		int c = socket(AF_INET, SOCK_DGRAM, 0);
+		struct sockaddr_in me = inet_addr4(0x0a090801, 40000 + i);
+		bind(c, (struct sockaddr *)&me, sizeof(me));
+		struct sockaddr_in peer = inet_addr4(0x0a090802, 9);
+		sendto(c, "rkmq", 4, 0, (struct sockaddr *)&peer, sizeof(peer));
+		close(c);
+	}
+	for (int i = 0; i < 10 && got[0] + got[1] < 16; i++) {
+		struct pollfd pf[2] = { { .fd = q[0], .events = POLLIN },
+					{ .fd = q[1], .events = POLLIN } };
+		if (poll(pf, 2, 1000) < 1)
+			break;
+		for (int k = 0; k < 2; k++)
+			got[k] += tun_udp_frames(q[k], buf, sizeof(buf));
+	}
+	printf("init: inet: tun mq: queue 0 got %d, queue 1 got %d\n", got[0], got[1]);
+	check("the flows go to the two queues", got[0] > 0 && got[1] > 0 && got[0] + got[1] == 16);
+
+	struct ifreq qr = { 0 };
+	qr.ifr_flags = RK_IFF_DETACH_QUEUE;
+	check("TUNSETQUEUE takes a queue off", ioctl(q[1], RK_TUNSETQUEUE, &qr) == 0);
+	errno = 0;
+	long n = read(q[1], buf, sizeof(buf));
+	struct pollfd pf = { .fd = q[1], .events = POLLIN };
+	int pr = poll(&pf, 1, 0);
+	check("a detached queue gives EBADFD and POLLERR",
+	      n == -1 && errno == EBADFD && pr == 1 && (pf.revents & POLLERR));
+	got[0] = got[1] = 0;
+	for (int i = 0; i < 8; i++) {
+		int c = socket(AF_INET, SOCK_DGRAM, 0);
+		struct sockaddr_in me = inet_addr4(0x0a090801, 41000 + i);
+		bind(c, (struct sockaddr *)&me, sizeof(me));
+		struct sockaddr_in peer = inet_addr4(0x0a090802, 9);
+		sendto(c, "rkmq", 4, 0, (struct sockaddr *)&peer, sizeof(peer));
+		close(c);
+	}
+	for (int i = 0; i < 10 && got[0] < 8; i++) {
+		pf = (struct pollfd){ .fd = q[0], .events = POLLIN };
+		if (poll(&pf, 1, 1000) != 1)
+			break;
+		got[0] += tun_udp_frames(q[0], buf, sizeof(buf));
+	}
+	check("the queue that is left gets all of the flows", got[0] == 8);
+	qr.ifr_flags = RK_IFF_ATTACH_QUEUE;
+	r = ioctl(q[1], RK_TUNSETQUEUE, &qr);
+	/* The queue can get an MLD report of the device, so it reads until there is no frame. */
+	do {
+		errno = 0;
+		n = read(q[1], buf, sizeof(buf));
+	} while (n > 0);
+	check("TUNSETQUEUE puts the queue back", r == 0 && n == -1 && errno == EAGAIN);
+	close(s);
+	close(q[0]);
+	check("rkmq0 stays while a queue is open", if_nametoindex("rkmq0") == 77);
+	close(q[1]);
+	check("rkmq0 goes away when its last file closes", if_nametoindex("rkmq0") == 0);
+}
+
 static void test_inet(int port)
 {
 	test_inet_ping();
@@ -4563,6 +4801,8 @@ static void test_inet(int port)
 	test_inet_lo();
 	test_packet_lo();
 	test_tun();
+	test_tun_mq();
+	test_tun6();
 	test_tcp_lo();
 	test_tcp_host(port);
 }
