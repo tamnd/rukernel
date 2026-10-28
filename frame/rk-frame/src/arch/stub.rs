@@ -108,6 +108,7 @@ pub(crate) mod mem {
 pub(crate) mod paging {
     use crate::mm::PageInfo;
 
+    pub(crate) const PAGE_OFFSET: usize = 0;
     pub(crate) const VMALLOC_START: usize = 0;
     pub(crate) const HEAP_START: usize = 0;
     pub(crate) const HEAP_END: usize = 0;

@@ -10,9 +10,11 @@
 //!
 //! A run of 512 frames that is 2 MiB aligned can be mapped at a 2 MiB aligned address with one
 //! huge entry, as the transparent huge pages of Linux. Each frame of the run is still a page of the
-//! address space. A change to one page of the run splits the huge entry into a last level table
-//! first. The table for the split is made when the huge page is mapped, as the deposited table of
-//! Linux, so a split cannot fail.
+//! address space, but the space keeps one entry for the huge page and not one for each page, so a
+//! `fork` and the exit of a process do not walk 512 entries for it. A change to one page of the run
+//! splits the huge entry into a last level table first, and the pages get their own entries then.
+//! The table for the split is made when the huge page is mapped, as the deposited table of Linux,
+//! so a split cannot fail.
 //!
 //! The kernel reads and writes user memory with `read` and `write`. These functions walk the page
 //! table in software and copy through the direct map, so they work on an address space that is not
@@ -110,26 +112,76 @@ pub struct UserFault {
     pub write: bool,
 }
 
+/// A huge page of an address space.
+struct Huge {
+    /// The last level table for the split of the page.
+    table: u64,
+    /// The page is a transparent huge page. A page of hugetlbfs is not.
+    thp: bool,
+    /// The `HUGE_FRAMES` frames of the page, in address order.
+    frames: Vec<Arc<Frame>>,
+    /// The permissions of each page of the huge page.
+    prot: PageProt,
+}
+
 struct Inner {
     /// The physical address of the top level table.
     root: u64,
-    /// The frame and the permissions at each mapped page address.
+    /// The frame and the permissions at each mapped page address that is not in a huge page.
     pages: BTreeMap<usize, (Arc<Frame>, PageProt)>,
-    /// The address of each huge page, the last level table for its split, and if the page is a
-    /// transparent huge page. A page of hugetlbfs is not.
-    huge: BTreeMap<usize, (u64, bool)>,
+    /// The huge pages by their address. No address of `pages` is in a huge page.
+    huge: BTreeMap<usize, Huge>,
+}
+
+/// The address of the huge page that contains `addr`.
+fn block_of(addr: usize) -> usize {
+    addr & !(HUGE_PAGE_SIZE - 1)
 }
 
 impl Inner {
+    /// Gives the frame and the permissions of the page at the page address `addr`.
+    fn get(&self, addr: usize) -> Option<(&Arc<Frame>, PageProt)> {
+        if let Some((frame, prot)) = self.pages.get(&addr) {
+            return Some((frame, *prot));
+        }
+        let block = block_of(addr);
+        let huge = self.huge.get(&block)?;
+        Some((&huge.frames[(addr - block) / PAGE_SIZE], huge.prot))
+    }
+
     /// Changes the huge page that contains `addr`, if there is one, to 4 KiB pages.
     fn split(&mut self, addr: usize) {
-        let block = addr & !(HUGE_PAGE_SIZE - 1);
-        if let Some((table, thp)) = self.huge.remove(&block) {
-            paging::user_split_huge(self.root, block, table);
-            if thp {
+        let block = block_of(addr);
+        if let Some(huge) = self.huge.remove(&block) {
+            paging::user_split_huge(self.root, block, huge.table);
+            if huge.thp {
                 HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
             }
+            let pages = huge.frames.into_iter().enumerate();
+            self.pages.extend(pages.map(|(i, f)| (block + i * PAGE_SIZE, (f, huge.prot))));
         }
+    }
+
+    /// Calls `f` for each mapped page address in `start..end`, in order.
+    fn each_page(&self, start: usize, end: usize, mut f: impl FnMut(usize)) {
+        let mut small = self.pages.range(start..end).map(|(&a, _)| a).peekable();
+        for &block in self.huge.range(block_of(start)..end).map(|(b, _)| b) {
+            let (from, to) = (block.max(start), (block + HUGE_PAGE_SIZE).min(end));
+            while let Some(a) = small.next_if(|&a| a < from) {
+                f(a);
+            }
+            (from..to).step_by(PAGE_SIZE).for_each(&mut f);
+        }
+        small.for_each(f);
+    }
+
+    /// The number of mapped pages in `start..end`.
+    fn count(&self, start: usize, end: usize) -> usize {
+        let huge = self
+            .huge
+            .range(block_of(start)..end)
+            .map(|(&block, _)| ((block + HUGE_PAGE_SIZE).min(end) - block.max(start)) / PAGE_SIZE);
+        self.pages.range(start..end).count() + huge.sum::<usize>()
     }
 }
 
@@ -160,7 +212,7 @@ impl VmSpace {
             return Err(MapError::BadAddress);
         }
         let mut inner = self.inner.lock();
-        if inner.pages.contains_key(&a) {
+        if inner.get(a).is_some() {
             return Err(MapError::Mapped);
         }
         paging::user_map(inner.root, a, frame.addr().get(), prot.bits())
@@ -225,17 +277,15 @@ impl VmSpace {
             assert_eq!(f.addr().get(), first + (i * PAGE_SIZE) as u64, "the frames are not a run");
         }
         let mut inner = self.inner.lock();
-        if inner.pages.range(a..a + HUGE_PAGE_SIZE).next().is_some() {
+        if inner.huge.contains_key(&a) || inner.pages.range(a..a + HUGE_PAGE_SIZE).next().is_some()
+        {
             return Err(MapError::Mapped);
         }
         let table = paging::user_map_huge(inner.root, a, first, prot.bits())
             .map_err(|()| MapError::NoMemory)?;
-        inner.huge.insert(a, (table, thp));
+        inner.huge.insert(a, Huge { table, thp, frames, prot });
         if thp {
             HUGE_MAPPED.fetch_add(1, Ordering::Relaxed);
-        }
-        for (i, f) in frames.into_iter().enumerate() {
-            inner.pages.insert(a + i * PAGE_SIZE, (f, prot));
         }
         Ok(())
     }
@@ -248,12 +298,9 @@ impl VmSpace {
     /// Gives the frames and the permissions of the huge page at the 2 MiB aligned `block`, or
     /// `None` if no huge page is mapped there.
     pub fn huge_block(&self, block: VirtAddr) -> Option<(Vec<Arc<Frame>>, PageProt)> {
-        let a = block.get();
         let inner = self.inner.lock();
-        inner.huge.get(&a)?;
-        let prot = inner.pages.get(&a)?.1;
-        let frames = inner.pages.range(a..a + HUGE_PAGE_SIZE).map(|(_, (f, _))| f.clone());
-        Some((frames.collect(), prot))
+        let huge = inner.huge.get(&block.get())?;
+        Some((huge.frames.clone(), huge.prot))
     }
 
     /// Changes the permissions of the huge page at the 2 MiB aligned `block` and keeps it whole.
@@ -262,18 +309,12 @@ impl VmSpace {
     pub fn protect_huge(&self, block: VirtAddr, prot: PageProt) -> bool {
         let a = block.get();
         let mut inner = self.inner.lock();
-        if prot == PageProt::NONE || !inner.huge.contains_key(&a) {
-            return false;
-        }
         let root = inner.root;
-        let mut phys = 0;
-        for (i, (_, (frame, old))) in inner.pages.range_mut(a..a + HUGE_PAGE_SIZE).enumerate() {
-            if i == 0 {
-                phys = frame.addr().get();
-            }
-            *old = prot;
-        }
-        paging::user_protect_huge(root, a, phys, prot.bits());
+        let Some(huge) = inner.huge.get_mut(&a).filter(|_| prot != PageProt::NONE) else {
+            return false;
+        };
+        huge.prot = prot;
+        paging::user_protect_huge(root, a, huge.frames[0].addr().get(), prot.bits());
         true
     }
 
@@ -294,27 +335,26 @@ impl VmSpace {
         let mut parent = self.inner.lock();
         let mut c = child.inner.lock();
         let root = parent.root;
+        // The pages of the huge pages that the child maps one by one.
+        let mut extra = Vec::new();
         // The huge pages first, so the pass over the 4 KiB pages below sees the splits.
         let mut next = 0;
-        while let Some((&block, &(_, thp))) = parent.huge.range(next..).next() {
+        while let Some((&block, huge)) = parent.huge.range_mut(next..).next() {
             next = block + HUGE_PAGE_SIZE;
-            let Some((phys, prot)) = parent.pages.get(&block).map(|(f, p)| (f.addr().get(), *p))
-            else {
-                continue;
-            };
+            let prot = huge.prot;
             let i = areas.partition_point(|r| r.end <= block);
             if let Some(&area) = areas.get(i).filter(|r| r.start <= block && next <= r.end) {
                 let ro = area.prot(prot);
                 if ro != PageProt::NONE {
+                    let phys = huge.frames[0].addr().get();
                     if ro != prot {
-                        for (_, (_, p)) in parent.pages.range_mut(block..next) {
-                            *p = ro;
-                        }
+                        huge.prot = ro;
                         paging::user_protect_huge(root, block, phys, ro.bits());
                     }
                     let table = paging::user_map_huge(c.root, block, phys, ro.bits())
                         .map_err(|()| MapError::NoMemory)?;
-                    c.huge.insert(block, (table, thp));
+                    let (thp, frames) = (huge.thp, huge.frames.clone());
+                    c.huge.insert(block, Huge { table, thp, frames, prot: ro });
                     if thp {
                         HUGE_MAPPED.fetch_add(1, Ordering::Relaxed);
                     }
@@ -325,6 +365,15 @@ impl VmSpace {
             let private = areas[i..].iter().take_while(|r| r.start < next).any(|r| !r.shared);
             if prot.writable && private {
                 parent.split(block);
+                continue;
+            }
+            // The huge page stays whole in this space, and the child maps the pages of it that
+            // are in the areas.
+            for area in areas[i..].iter().take_while(|r| r.start < next) {
+                for a in (area.start.max(block)..area.end.min(next)).step_by(PAGE_SIZE) {
+                    let frame = huge.frames[(a - block) / PAGE_SIZE].clone();
+                    extra.push((a, (frame, area.prot(prot))));
+                }
             }
         }
         // The child gets the pages in the areas. A clone of the whole map makes no search for
@@ -343,6 +392,7 @@ impl VmSpace {
                 _ => false,
             }
         });
+        pages.extend(extra);
         // The pages of the private areas become read only in this space. A page that is read only
         // after an earlier fork needs no change.
         for area in areas.iter().filter(|r| !r.shared) {
@@ -356,16 +406,8 @@ impl VmSpace {
             );
         }
         // The child maps the pages that are not in its huge pages.
-        let mut block = (usize::MAX, false);
-        let small = pages.iter().filter(|&(&a, _)| {
-            let b = a & !(HUGE_PAGE_SIZE - 1);
-            if block.0 != b {
-                block = (b, c.huge.contains_key(&b));
-            }
-            !block.1
-        });
-        paging::user_map_new(c.root, small.map(|(&a, (f, p))| (a, f.addr().get(), p.bits())))
-            .map_err(|()| MapError::NoMemory)?;
+        let small = pages.iter().map(|(&a, (f, p))| (a, f.addr().get(), p.bits()));
+        paging::user_map_new(c.root, small).map_err(|()| MapError::NoMemory)?;
         c.pages = pages;
         drop(c);
         Ok(child)
@@ -381,18 +423,15 @@ impl VmSpace {
         let mut gone = Vec::with_capacity(batch);
         let first = start & !(HUGE_PAGE_SIZE - 1);
         let mut inner = self.inner.lock();
-        while let Some((&block, &(table, thp))) = inner.huge.range(first..end).next() {
+        while let Some(&block) = inner.huge.range(first..end).next().map(|(b, _)| b) {
             if block >= start && block + HUGE_PAGE_SIZE <= end {
-                inner.huge.remove(&block);
-                paging::user_unmap_huge(inner.root, block, table);
-                if thp {
+                let Some(huge) = inner.huge.remove(&block) else { break };
+                paging::user_unmap_huge(inner.root, block, huge.table);
+                if huge.thp {
                     HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
                 }
-                while let Some((&a, _)) = inner.pages.range(block..block + HUGE_PAGE_SIZE).next() {
-                    gone.extend(inner.pages.remove(&a));
-                }
                 drop(inner);
-                gone.clear();
+                drop(huge);
                 inner = self.inner.lock();
             } else {
                 inner.split(block);
@@ -418,9 +457,7 @@ impl VmSpace {
     /// Removes the page at `addr` and gives its frame.
     pub fn unmap(&self, addr: VirtAddr) -> Option<Arc<Frame>> {
         let mut inner = self.inner.lock();
-        if !inner.pages.contains_key(&addr.get()) {
-            return None;
-        }
+        inner.get(addr.get())?;
         inner.split(addr.get());
         let (frame, _) = inner.pages.remove(&addr.get())?;
         paging::user_unmap(inner.root, addr.get());
@@ -431,11 +468,11 @@ impl VmSpace {
     pub fn protect(&self, addr: VirtAddr, prot: PageProt) -> bool {
         let mut inner = self.inner.lock();
         let root = inner.root;
-        let block = addr.get() & !(HUGE_PAGE_SIZE - 1);
-        match inner.pages.get(&addr.get()) {
+        let block = block_of(addr.get());
+        match inner.get(addr.get()) {
             None => return false,
             // A huge page stays whole when its permissions do not change.
-            Some((_, old)) if *old == prot && inner.huge.contains_key(&block) => return true,
+            Some((_, old)) if old == prot && inner.huge.contains_key(&block) => return true,
             Some(_) => inner.split(block),
         }
         let Some((frame, old)) = inner.pages.get_mut(&addr.get()) else { return false };
@@ -447,36 +484,38 @@ impl VmSpace {
     /// Gives the frame and the permissions of the page that contains `addr`.
     pub fn page(&self, addr: VirtAddr) -> Option<(Arc<Frame>, PageProt)> {
         let page = addr.get() & !(PAGE_SIZE - 1);
-        self.inner.lock().pages.get(&page).cloned()
+        self.inner.lock().get(page).map(|(frame, prot)| (frame.clone(), prot))
     }
 
     /// Gives the page addresses in `start..end` that are mapped, in order.
     pub fn mapped_pages(&self, start: VirtAddr, end: VirtAddr) -> alloc::vec::Vec<VirtAddr> {
         let inner = self.inner.lock();
-        inner.pages.range(start.get()..end.get()).map(|(&a, _)| VirtAddr::new(a)).collect()
+        let mut out = Vec::new();
+        inner.each_page(start.get(), end.get(), |a| out.push(VirtAddr::new(a)));
+        out
     }
 
     /// The number of mapped pages in `start..end`. It allocates no memory, so the OOM killer can
     /// use it.
     pub fn pages_in(&self, start: VirtAddr, end: VirtAddr) -> usize {
-        self.inner.lock().pages.range(start.get()..end.get()).count()
+        self.inner.lock().count(start.get(), end.get())
     }
 
     /// Adds the page addresses in `start..end` that are mapped to `out`, in order. Gives `false`
     /// and adds nothing if the kernel heap has no memory for them.
     pub fn try_mapped_pages(&self, start: VirtAddr, end: VirtAddr, out: &mut Vec<usize>) -> bool {
         let inner = self.inner.lock();
-        let pages = inner.pages.range(start.get()..end.get());
-        if out.try_reserve(pages.clone().count()).is_err() {
+        if out.try_reserve(inner.count(start.get(), end.get())).is_err() {
             return false;
         }
-        out.extend(pages.map(|(&a, _)| a));
+        inner.each_page(start.get(), end.get(), |a| out.push(a));
         true
     }
 
     /// The number of mapped pages.
     pub fn page_count(&self) -> usize {
-        self.inner.lock().pages.len()
+        let inner = self.inner.lock();
+        inner.pages.len() + inner.huge.len() * HUGE_FRAMES
     }
 
     /// Loads this address space, so the user code of the process can run.
@@ -560,7 +599,7 @@ impl VmSpace {
             let n = (PAGE_SIZE - offset).min(end - at);
             let frame = {
                 let inner = self.inner.lock();
-                match inner.pages.get(&page) {
+                match inner.get(page) {
                     Some((frame, prot)) if prot.allows(write) => frame.clone(),
                     _ => return Err(UserFault { addr: at, write }),
                 }
@@ -580,11 +619,12 @@ impl Drop for VmSpace {
         }
         paging::free_user_root(inner.root);
         // `free_user_root` does not see the tables for the splits of the huge pages.
-        for &(table, _) in inner.huge.values() {
-            free_frame_phys(table);
+        for huge in inner.huge.values() {
+            free_frame_phys(huge.table);
         }
-        let thp = inner.huge.values().filter(|&&(_, thp)| thp).count();
+        let thp = inner.huge.values().filter(|huge| huge.thp).count();
         HUGE_MAPPED.fetch_sub(thp, Ordering::Relaxed);
-        // The frames go when `pages` is dropped, after the tables that map them are gone.
+        // The frames go when `pages` and `huge` are dropped, after the tables that map them are
+        // gone.
     }
 }

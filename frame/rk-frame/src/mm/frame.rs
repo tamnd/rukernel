@@ -65,6 +65,14 @@ pub(crate) fn free_frame_phys(phys: u64) {
     FRAMES.lock().free(phys as usize / PAGE_SIZE);
 }
 
+/// Takes `1 << order` frames in a row, where `order` is less than 6, and gives the physical address
+/// of the first one. The address is a multiple of the size of the run. The heap uses this
+/// function, and gives the frames back with `free_frame_phys`.
+pub(crate) fn alloc_run_phys(order: u32) -> Option<u64> {
+    let frame = FRAMES.lock().alloc_small_run(order)?;
+    Some((frame * PAGE_SIZE) as u64)
+}
+
 /// The number of frames that the allocator manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameStats {

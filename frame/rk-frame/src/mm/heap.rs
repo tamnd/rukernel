@@ -2,14 +2,20 @@
 //!
 //! The safe kernel crates use `alloc`: `Box`, `Vec`, `BTreeMap` and `Arc`. This module gives the
 //! memory for them. A small object comes from a slab of its size class. A slab is one frame in the
-//! direct map, so it costs no virtual address space. A large object gets its own pages in the heap
-//! range of the vmalloc area, with a guard page after it.
+//! direct map, so it costs no virtual address space. A large object of up to `DIRECT_PAGES` pages
+//! gets frames in a row in the direct map, as `kmalloc_large` of Linux, so its allocation and its
+//! free change no page table and need no TLB flush. A larger object gets its own pages in the heap
+//! range of the vmalloc area, with a guard page after it. The kernel stacks are such objects.
 //!
-//! The slab pages stay in the heap after their objects are freed. The pages of a large object go
-//! back to the frame allocator, but the virtual addresses are not used again. The heap range is 4
-//! TiB, so this is not a problem before the vmalloc allocator of R4 replaces this code.
+//! The slab pages stay in the heap after their objects are freed. The pages of an object in the
+//! heap range go back to the frame allocator, but the virtual addresses are not used again. The
+//! heap range is 4 TiB, so this is not a problem before the vmalloc allocator of R4 replaces this
+//! code. A few of the freed objects of up to `CACHE_PAGES` pages stay mapped in a cache, and the
+//! next allocation of the same size takes one, as the cache of kernel stacks of Linux
+//! (`cached_stacks` in kernel/fork.c). Thus a `fork` and the exit of the child do not map and
+//! unmap a kernel stack, and the free sends no TLB shootdown to the other CPUs.
 
-use super::frame::{alloc_frame_phys, free_frame_phys};
+use super::frame::{alloc_frame_phys, alloc_run_phys, free_frame_phys};
 use crate::addr::PAGE_SIZE;
 use crate::arch::imp::paging;
 use crate::sync::SpinLock;
@@ -24,6 +30,19 @@ const LARGEST_CLASS: usize = CLASSES[CLASSES.len() - 1];
 /// The head of the free list of each class. A free object holds the address of the next free
 /// object in its first word. The value 0 ends the list.
 static FREE: SpinLock<[usize; CLASSES.len()]> = SpinLock::new([0; CLASSES.len()]);
+
+/// A large object of up to this many pages comes from the direct map. A larger object has a guard
+/// page, so a kernel stack must be larger.
+pub(crate) const DIRECT_PAGES: usize = 4;
+
+/// The number of freed objects of the heap range that the cache keeps.
+const CACHE_SLOTS: usize = 8;
+/// The cache keeps freed objects of the heap range of up to this many pages.
+const CACHE_PAGES: usize = 16;
+
+/// The freed objects of the heap range that stay mapped. A slot is 0, or the address of an object
+/// plus its page count minus one. The address is page aligned, so the count fits below it.
+static CACHE: [AtomicUsize; CACHE_SLOTS] = [const { AtomicUsize::new(0) }; CACHE_SLOTS];
 
 /// The next free address in the heap range.
 static NEXT_LARGE: AtomicUsize = AtomicUsize::new(paging::HEAP_START);
@@ -107,6 +126,15 @@ fn alloc_large(layout: Layout) -> *mut u8 {
         return core::ptr::null_mut();
     }
     let pages = layout.size().div_ceil(PAGE_SIZE);
+    if pages <= DIRECT_PAGES
+        && let Some(ptr) = alloc_direct(pages)
+    {
+        return ptr;
+    }
+    if let Some(start) = cache_take(pages) {
+        IN_USE.fetch_add((pages * PAGE_SIZE) as u64, Ordering::Relaxed);
+        return start as *mut u8;
+    }
     // The page after the object is a guard page, so an overrun is a page fault.
     let start = NEXT_LARGE.fetch_add((pages + 1) * PAGE_SIZE, Ordering::Relaxed);
     if start + (pages + 1) * PAGE_SIZE > paging::HEAP_END {
@@ -130,6 +158,58 @@ fn alloc_large(layout: Layout) -> *mut u8 {
     }
     IN_USE.fetch_add((pages * PAGE_SIZE) as u64, Ordering::Relaxed);
     start as *mut u8
+}
+
+/// The order of the run of frames for an object of `pages` pages in the direct map. The run is a
+/// power of two, so its address is aligned to its size.
+fn direct_order(pages: usize) -> u32 {
+    pages.next_power_of_two().trailing_zeros()
+}
+
+/// Takes frames in a row for an object of `pages` pages, and gives its address in the direct map.
+/// Gives `None` if no such run is free, or if the direct map is not in use yet.
+fn alloc_direct(pages: usize) -> Option<*mut u8> {
+    let order = direct_order(pages);
+    let phys = alloc_run_phys(order)?;
+    let virt = paging::phys_to_virt(phys);
+    if virt < paging::PAGE_OFFSET {
+        // The boot identity map. `dealloc` could not find the frames from this address.
+        free_direct(phys, order);
+        return None;
+    }
+    IN_USE.fetch_add((PAGE_SIZE << order) as u64, Ordering::Relaxed);
+    Some(virt as *mut u8)
+}
+
+/// Gives back the run of `1 << order` frames at `phys`.
+fn free_direct(phys: u64, order: u32) {
+    for i in 0..1u64 << order {
+        free_frame_phys(phys + i * PAGE_SIZE as u64);
+    }
+}
+
+/// Takes a freed object of `pages` pages from the cache, if it has one.
+fn cache_take(pages: usize) -> Option<usize> {
+    if pages > CACHE_PAGES {
+        return None;
+    }
+    CACHE.iter().find_map(|slot| {
+        let value = slot.load(Ordering::Relaxed);
+        let ours = value != 0 && value % PAGE_SIZE == pages - 1;
+        let taken =
+            ours && slot.compare_exchange(value, 0, Ordering::Acquire, Ordering::Relaxed).is_ok();
+        taken.then(|| value - (pages - 1))
+    })
+}
+
+/// Puts a freed object of `pages` pages at `start` in the cache. Gives `false` if it is full or
+/// if the object is too large.
+fn cache_put(start: usize, pages: usize) -> bool {
+    pages <= CACHE_PAGES
+        && CACHE.iter().any(|slot| {
+            slot.compare_exchange(0, start + pages - 1, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+        })
 }
 
 /// Removes the first `pages` pages at `start` and gives their frames back. The other CPUs drop
@@ -158,7 +238,16 @@ unsafe impl GlobalAlloc for Heap {
             Some(index) => dealloc_small(ptr, index),
             None => {
                 let pages = layout.size().div_ceil(PAGE_SIZE);
-                unmap_large(ptr as usize, pages);
+                let start = ptr as usize;
+                if !(paging::HEAP_START..paging::HEAP_END).contains(&start) {
+                    let order = direct_order(pages);
+                    free_direct((start - paging::PAGE_OFFSET) as u64, order);
+                    IN_USE.fetch_sub((PAGE_SIZE << order) as u64, Ordering::Relaxed);
+                    return;
+                }
+                if !cache_put(start, pages) {
+                    unmap_large(start, pages);
+                }
                 IN_USE.fetch_sub((pages * PAGE_SIZE) as u64, Ordering::Relaxed);
             }
         }
@@ -169,3 +258,4 @@ unsafe impl GlobalAlloc for Heap {
 static HEAP: Heap = Heap;
 
 const _: () = assert!(LARGEST_CLASS < PAGE_SIZE);
+const _: () = assert!(CACHE_PAGES < PAGE_SIZE);

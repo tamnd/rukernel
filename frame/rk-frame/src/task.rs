@@ -119,8 +119,8 @@ fn scheduler() -> &'static dyn Scheduler {
     *SCHEDULER.get().unwrap_or_else(|| panic!("no scheduler is injected"))
 }
 
-/// A kernel stack on the heap. A large heap block has an unmapped page before it and after it, so
-/// an overflow is a page fault.
+/// A kernel stack on the heap. A large heap block that is not in the direct map has an unmapped
+/// page before it and after it, so an overflow is a page fault.
 struct KernelStack {
     base: *mut u8,
 }
@@ -130,6 +130,9 @@ struct KernelStack {
 unsafe impl Send for KernelStack {}
 // SAFETY: as above. No method reads or writes the memory through a shared reference.
 unsafe impl Sync for KernelStack {}
+
+// A kernel stack must not come from the direct map, where it has no guard page.
+const _: () = assert!(KERNEL_STACK_SIZE > crate::mm::heap::DIRECT_PAGES * crate::addr::PAGE_SIZE);
 
 const STACK_LAYOUT: Layout = match Layout::from_size_align(KERNEL_STACK_SIZE, 16) {
     Ok(layout) => layout,
