@@ -4,6 +4,11 @@
 use super::*;
 use rk_abi::native::keyctl::KEYCTL_MOVE_EXCL;
 
+/// The lock of the tests that walk all the keys, and of the tests that expect a key to go with
+/// its last reference. A walk holds a reference to each key for a short time, so a key of a
+/// different test can stay after its last link goes.
+static WALK: SpinLock<()> = SpinLock::new(());
+
 /// The keyrings of a test thread.
 struct TestOwner {
     rings: SpinLock<[Option<Arc<Key>>; 3]>,
@@ -99,6 +104,7 @@ fn add_key_errors() {
 
 #[test]
 fn keyring_read_sizes() {
+    let _walk = WALK.lock();
     let (c, o) = (cred(5003), TestOwner::default());
     let cx = Caller { cred: &c, now: 0, owner: &o };
     let a = add_key(&cx, b"user", Some(b"a"), b"1".to_vec(), PROC).unwrap();
@@ -190,6 +196,7 @@ fn restrict_reject_all() {
 
 #[test]
 fn quota_and_drop() {
+    let _walk = WALK.lock();
     let uid = 5008;
     {
         let (c, o) = (cred(uid), TestOwner::default());
@@ -214,6 +221,7 @@ fn quota_and_drop() {
 
 #[test]
 fn invalidate_removes_links() {
+    let _walk = WALK.lock();
     let (c, o) = (cred(5009), TestOwner::default());
     let cx = Caller { cred: &c, now: 0, owner: &o };
     let k = add_key(&cx, b"user", Some(b"k"), b"1".to_vec(), PROC).unwrap();
@@ -238,6 +246,7 @@ fn permissions_and_chown() {
 
 #[test]
 fn session_and_user_rings() {
+    let _walk = WALK.lock();
     let (c, o) = (cred(5011), TestOwner::default());
     let cx = Caller { cred: &c, now: 0, owner: &o };
     let us = get_keyring_id(&cx, KEY_SPEC_USER_SESSION_KEYRING, false).unwrap();

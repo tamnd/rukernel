@@ -21,6 +21,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A new kernel log record wakes the readers of /dev/kmsg that wait in `poll` or `read`, as `wake_up_klogd` of Linux (#408). A bottom half wakes the wait queue, so `printk` does not take the lock of the queue.
 - `preadv2` and `pwritev2` with `RWF_NOWAIT` on a tmpfs file give `EOPNOTSUPP`, as Linux, where tmpfs does not set `FMODE_NOWAIT` (#408).
 - The free of a large kernel heap block sends one TLB shootdown for the range, not one for each page (#408).
+- The unit tests of the key service that walk all the keys no longer run at the same time as the tests that expect a key to go with its last reference. A walk holds each key for a short time, so `keyring_read_sizes` and `quota_and_drop` failed now and then (#407).
 
 ## [0.4.7] - 2026-10-28
 
