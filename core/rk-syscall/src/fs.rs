@@ -577,6 +577,10 @@ pub(crate) fn openat2(cx: &Cx<'_>, dirfd: u64, path: u64, how: u64, size: u64) -
 /// writeback or evicted. Other files have no pages in the cache.
 pub(crate) fn cachestat(cx: &Cx<'_>, fd: u64, range: u64, out: u64, flags: u64) -> SysResult {
     let file = cx.fdget(fd)?;
+    // The pages of hugetlbfs are not in the page cache, as `is_file_hugepages` of Linux.
+    if file.inode().is_some_and(|i| rk_fs_hugetlbfs::huge_file(i).is_some()) {
+        return Err(Errno::EOPNOTSUPP);
+    }
     if flags as u32 != 0 {
         return Err(Errno::EINVAL);
     }

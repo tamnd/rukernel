@@ -87,6 +87,9 @@ pub struct Frame {
     phys: u64,
     /// The memory cgroup that the page is charged to, or 0.
     memcg: u32,
+    /// The frame is a part of a [`HugeRun`] of the pool of huge pages. It goes back to the pool
+    /// with the other frames of the run, and not to the allocator.
+    pooled: bool,
 }
 
 /// The function that removes the charge of a frame from its memory cgroup.
@@ -101,7 +104,7 @@ pub fn set_uncharge_hook(f: fn(u32)) {
 /// Takes a free frame. The contents of the frame are not defined.
 pub fn alloc_frame() -> Option<Frame> {
     let frame = FRAMES.lock().alloc()?;
-    Some(Frame { phys: (frame * PAGE_SIZE) as u64, memcg: 0 })
+    Some(Frame { phys: (frame * PAGE_SIZE) as u64, memcg: 0, pooled: false })
 }
 
 /// Takes a free frame and fills it with zeros.
@@ -119,11 +122,77 @@ pub const HUGE_FRAMES: usize = 512;
 pub fn alloc_huge_frames() -> Option<alloc::vec::Vec<Frame>> {
     let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
     let frames = (first..first + HUGE_FRAMES).map(|f| {
-        let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0 };
+        let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0, pooled: false };
         frame.zero();
         frame
     });
     Some(frames.collect())
+}
+
+/// The number of runs of `HUGE_FRAMES` frames below `MAX_PHYS`.
+const RUNS: usize = (MAX_PHYS / PAGE_SIZE as u64) as usize / HUGE_FRAMES;
+
+/// The number of frames of each pooled run that are back, by the index of the run. A run goes
+/// back to the pool when all its frames are back.
+static RETURNED: [AtomicU16; RUNS] = [const { AtomicU16::new(0) }; RUNS];
+
+/// The function that takes a run back into the pool of huge pages.
+static HUGE_RETURN: Once<fn(HugeRun)> = Once::new();
+
+/// Sets the function that takes a [`HugeRun`] back when the last frame of its
+/// [`HugeRun::into_frames`] is dropped. Only the first call has an effect. Without a function,
+/// the run goes back to the allocator.
+///
+/// The function runs where the last frame is dropped, which can be with locks of the caller held.
+/// It must not drop a frame while it holds a lock that the drop of a frame can take.
+pub fn set_huge_return_hook(f: fn(HugeRun)) {
+    HUGE_RETURN.call_once(|| f);
+}
+
+/// A run of `HUGE_FRAMES` frames that is 2 MiB aligned, for the pool of huge pages of hugetlbfs.
+/// The run goes back to the allocator when the value is dropped. This is the `struct folio` of a
+/// huge page of Linux, in mm/hugetlb.c.
+#[derive(Debug)]
+pub struct HugeRun {
+    /// The number of the first frame.
+    first: usize,
+}
+
+impl HugeRun {
+    /// Takes a free run. The contents of the frames are not defined. Gives `None` if no run is
+    /// free.
+    pub fn alloc() -> Option<Self> {
+        let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
+        Some(Self { first })
+    }
+
+    /// The physical address of the first frame.
+    pub fn addr(&self) -> PhysAddr {
+        PhysAddr::new((self.first * PAGE_SIZE) as u64)
+    }
+
+    /// Fills the frames with zeros and gives them. The run comes back through the function of
+    /// [`set_huge_return_hook`] when each of the frames is dropped.
+    pub fn into_frames(self) -> alloc::vec::Vec<Frame> {
+        let first = self.first;
+        core::mem::forget(self);
+        RETURNED[first / HUGE_FRAMES].store(0, Ordering::Relaxed);
+        let frames = (first..first + HUGE_FRAMES).map(|f| {
+            let mut frame = Frame { phys: (f * PAGE_SIZE) as u64, memcg: 0, pooled: true };
+            frame.zero();
+            frame
+        });
+        frames.collect()
+    }
+}
+
+impl Drop for HugeRun {
+    fn drop(&mut self) {
+        let mut frames = FRAMES.lock();
+        for f in self.first..self.first + HUGE_FRAMES {
+            frames.free(f);
+        }
+    }
 }
 
 impl Frame {
@@ -282,7 +351,19 @@ impl Drop for Frame {
         {
             f(self.memcg);
         }
-        FRAMES.lock().free(self.phys as usize / PAGE_SIZE);
+        let frame = self.phys as usize / PAGE_SIZE;
+        if self.pooled {
+            let first = frame & !(HUGE_FRAMES - 1);
+            let back = RETURNED[first / HUGE_FRAMES].fetch_add(1, Ordering::AcqRel) + 1;
+            if usize::from(back) == HUGE_FRAMES {
+                let run = HugeRun { first };
+                if let Some(f) = HUGE_RETURN.get() {
+                    f(run);
+                }
+            }
+            return;
+        }
+        FRAMES.lock().free(frame);
     }
 }
 

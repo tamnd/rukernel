@@ -40,6 +40,8 @@ pub(crate) const LEAVE: u64 = u64::MAX;
 /// The address in `FLUSH_ADDR` that tells each CPU to do nothing. The interrupt is a full
 /// memory barrier, which `membarrier(2)` needs.
 pub(crate) const BARRIER: u64 = u64::MAX - 1;
+/// The address in `FLUSH_ADDR` that tells each CPU to drop all the TLB entries of user pages.
+pub(crate) const FLUSH_ALL: u64 = u64::MAX - 2;
 
 /// One request at a time goes to the other CPUs.
 static FLUSH: SpinLock<()> = SpinLock::new(());
@@ -93,6 +95,8 @@ pub(crate) fn poll() {
         paging::leave(root);
     } else if addr == BARRIER {
         core::sync::atomic::fence(Ordering::SeqCst);
+    } else if addr == FLUSH_ALL {
+        paging::flush_user_all();
     } else {
         paging::flush(addr as usize);
     }

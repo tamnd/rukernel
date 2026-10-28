@@ -16,6 +16,7 @@ rk-drv-tty.workspace = true
 rk-cgroup.workspace = true
 rk-frame.workspace = true
 rk-fs-cgroup.workspace = true
+rk-fs-hugetlbfs.workspace = true
 rk-fs-tmpfs.workspace = true
 rk-mm.workspace = true
 rk-net.workspace = true

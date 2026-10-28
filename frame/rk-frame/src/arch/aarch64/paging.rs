@@ -620,6 +620,24 @@ fn user_block(root: u64, virt: usize) -> &'static AtomicU64 {
     e
 }
 
+/// Changes the permissions of the block at `virt` in `root`, which maps the 2 MiB at `phys`. The
+/// block stays one block descriptor.
+pub(crate) fn user_protect_huge(root: u64, virt: usize, phys: u64, prot: UserProt) {
+    let e = user_block(root, virt);
+    let flags = user_flags(prot.0, prot.1, prot.2);
+    assert!(flags & VALID != 0, "a huge page must allow an access");
+    if prot.2 {
+        for i in 0..BLOCK_SIZE / 4096 {
+            sync_icache(phys + (i * 4096) as u64);
+        }
+    }
+    // Break before make, as in `user_map_huge`.
+    e.store(0, Ordering::Relaxed);
+    flush_user(virt);
+    e.store(phys | (flags & !TABLE), Ordering::Relaxed);
+    flush_user(virt);
+}
+
 /// Changes the block at `virt` in `root` to 512 pages of 4 KiB with the same frames and
 /// permissions. `table` is the table that `user_map_huge` gave.
 pub(crate) fn user_split_huge(root: u64, virt: usize, table: u64) {

@@ -1725,6 +1725,18 @@ pub fn charge_page(id: CgId) -> Result<(), CgId> {
     with(|h| h.charge_memory(id, PAGE_SIZE))
 }
 
+/// Charges `n` pages of memory to `id` at one time, as for a huge page.
+///
+/// # Errors
+///
+/// Gives the cgroup whose limit the charge passes. Then no page is charged.
+pub fn charge_pages(id: CgId, n: usize) -> Result<(), CgId> {
+    if id == 0 {
+        return Ok(());
+    }
+    with(|h| h.charge_memory(id, PAGE_SIZE * n as u64))
+}
+
 /// Removes the charge of a page from `id`. rk-frame calls this when a charged frame is free.
 pub fn uncharge_page(id: CgId) {
     if id != 0 {

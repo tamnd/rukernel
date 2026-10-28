@@ -92,6 +92,7 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
                 commit_limit: pages(rk_mm::tunables::commit_limit(f.total)),
                 committed: pages(rk_mm::tunables::committed_pages()),
                 anon_huge: rk_frame::vm::huge_pages_mapped() as u64 * 2048,
+                hugetlb: rk_mm::hugetlb::counts(),
             })
             .into_bytes()
         }),
@@ -377,10 +378,14 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("vm/dirty_ratio", "20"),
     ("vm/dirty_writeback_centisecs", "500"),
     ("vm/drop_caches", "0"),
+    ("vm/hugetlb_shm_group", ""),
     ("vm/max_map_count", ""),
     ("vm/min_free_kbytes", ""),
     ("vm/mmap_min_addr", "65536"),
-    ("vm/nr_hugepages", "0"),
+    ("vm/compact_memory", "0"),
+    ("vm/nr_hugepages", ""),
+    ("vm/nr_hugepages_mempolicy", ""),
+    ("vm/nr_overcommit_hugepages", ""),
     ("vm/overcommit_kbytes", ""),
     ("vm/overcommit_memory", ""),
     ("vm/overcommit_ratio", ""),
@@ -439,6 +444,18 @@ fn vm_tunable(name: &str) -> Option<(fn() -> usize, fn(usize) -> Option<()>)> {
         "vm/overcommit_kbytes" => (t::overcommit_kbytes, |v| Some(t::set_overcommit_kbytes(v))),
         "vm/overcommit_memory" => (t::overcommit_memory, t::set_overcommit_memory),
         "vm/overcommit_ratio" => (t::overcommit_ratio, |v| Some(t::set_overcommit_ratio(v))),
+        "vm/nr_hugepages" | "vm/nr_hugepages_mempolicy" => (
+            || {
+                let c = rk_mm::hugetlb::counts();
+                c.total - c.surplus
+            },
+            |v| Some(rk_mm::hugetlb::set_nr_hugepages(v)),
+        ),
+        "vm/hugetlb_shm_group" => (rk_mm::hugetlb::shm_group, rk_mm::hugetlb::set_shm_group),
+        "vm/nr_overcommit_hugepages" => (
+            || rk_mm::hugetlb::counts().overcommit,
+            |v| Some(rk_mm::hugetlb::set_nr_overcommit_hugepages(v)),
+        ),
         _ => return None,
     })
 }
@@ -540,13 +557,6 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
         }
         return set(n).ok_or(Errno::EINVAL);
     }
-    // The kernel has no pool of huge pages for hugetlbfs, so the pool stays empty after a write,
-    // as on Linux when no huge page is free.
-    if name == "vm/nr_hugepages" {
-        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
-        text.trim().parse::<u64>().map_err(|_| Errno::EINVAL)?;
-        return Ok(());
-    }
     // Two group IDs, as `ipv4_ping_group_range` of Linux.
     if name == PING_GROUP_RANGE {
         let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
@@ -569,6 +579,10 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
         return Ok(());
     }
     // A write to `drop_caches` removes the clean pages of the block devices. The value stays 0.
+    // The kernel does not move pages, so a write to `compact_memory` has no work.
+    if name == "vm/compact_memory" {
+        return Ok(());
+    }
     if name == "vm/drop_caches" {
         rk_vfs::blockdev::drop_clean_all();
         return Ok(());
