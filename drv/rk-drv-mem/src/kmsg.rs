@@ -16,6 +16,7 @@ use rk_frame::console::{self, LogRecord};
 use rk_frame::sync::SpinLock;
 use rk_vfs::device::{self, CharDevice, makedev};
 use rk_vfs::inode::Result;
+use rk_vfs::wait::PollTable;
 use rk_vfs::{File, FileOps, WaitQueue, Whence};
 
 /// The device number of `/dev/kmsg`.
@@ -30,8 +31,8 @@ const DEFAULT_LEVEL: u32 = 4;
 /// The facility of a write without a facility, `LOG_USER`.
 const LOG_USER: u32 = 1;
 
-/// The readers that wait for a new record. A write to `/dev/kmsg` wakes them. The text of
-/// `print!` cannot wake them, so a reader also looks at the log at each tick.
+/// The readers and the waits of `poll` that wait for a new record. A write to `/dev/kmsg` wakes
+/// them. The text of `print!` cannot wake them, so a reader also looks at the log at each tick.
 static WAIT: WaitQueue = WaitQueue::new();
 
 /// Gives the facility and the level of a write, and the text of the record, as `devkmsg_write`.
@@ -118,7 +119,7 @@ impl FileOps for KmsgFile {
             if let Some(result) = self.read_record(buf) {
                 return result;
             }
-            if file.flags().nonblock() {
+            if file.nonblock() {
                 return Err(Errno::EAGAIN);
             }
             if rk_vfs::wait::interrupted() {
@@ -140,7 +141,6 @@ impl FileOps for KmsgFile {
         let (prio, text) = parse(buf);
         console::log_emit(prio, text);
         WAIT.wake_all();
-        rk_vfs::wait::poll_wake();
         Ok(buf.len())
     }
 
@@ -157,6 +157,10 @@ impl FileOps for KmsgFile {
         };
         *self.seq.lock() = seq;
         Some(Ok(0))
+    }
+
+    fn poll_wait(&self, _file: &File, table: &mut PollTable) {
+        table.add_static(&WAIT);
     }
 
     fn poll(&self, _file: &File) -> u32 {

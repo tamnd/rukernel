@@ -306,7 +306,7 @@ const FIONREAD: u32 = rk_abi::native::ioctls::FIONREAD;
 impl FileOps for InotifyFile {
     /// A read takes whole events, as `inotify_read` of Linux.
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
-        let nonblock = file.flags().nonblock();
+        let nonblock = file.nonblock();
         let g = &self.group;
         let out = g.wait.wait_interruptible(|| {
             let mut st = g.state.lock();

@@ -191,7 +191,7 @@ pub trait Socket: Send + Sync {
     /// The events of `poll`.
     fn poll(&self) -> u32;
     /// Adds to `table` the queues that a new event of the socket wakes, as `poll_wait` of Linux.
-    /// A socket that adds no queue makes the wait use `POLL_WAIT`.
+    /// A socket must add a queue, and wake it at each new event.
     fn poll_wait(&self, _table: &mut PollTable) {}
     /// A count that goes up at each wake of the socket, for an edge triggered epoll entry.
     fn event_count(&self) -> u64 {
@@ -254,7 +254,7 @@ impl Drop for SocketFile {
 
 impl FileOps for SocketFile {
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
-        let r = self.socket.recv(buf.len(), 0, file.flags().nonblock())?;
+        let r = self.socket.recv(buf.len(), 0, file.nonblock())?;
         buf[..r.data.len()].copy_from_slice(&r.data);
         Ok(r.data.len())
     }

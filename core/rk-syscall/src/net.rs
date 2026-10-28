@@ -744,17 +744,18 @@ pub(crate) fn recvmmsg(
 }
 
 /// `read` and `readv` on a socket: one receive into the vectors, as `sock_read_iter` of Linux.
+/// With `nonblock`, the receive does not wait.
 pub(crate) fn read_socket(
     cx: &Cx<'_>,
-    file: &File,
     sock: &dyn Socket,
     iovs: &[Iovec],
+    nonblock: bool,
 ) -> SysResult {
     let len = iovs.iter().fold(0usize, |t, v| t.saturating_add(v.iov_len as usize));
     if len == 0 {
         return Ok(0);
     }
-    let r = sock.recv(len.min(SEND_MAX), 0, file.flags().nonblock())?;
+    let r = sock.recv(len.min(SEND_MAX), 0, nonblock)?;
     scatter(cx, iovs, &r.data)?;
     Ok(r.data.len() as u64)
 }

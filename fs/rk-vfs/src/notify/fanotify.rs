@@ -655,7 +655,7 @@ impl FileOps for FanotifyFile {
     /// A read takes whole events, as `fanotify_read` of Linux. Each event with a file gets a new
     /// descriptor of the file. A permission event then waits in the access list for its answer.
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
-        let nonblock = file.flags().nonblock();
+        let nonblock = file.nonblock();
         let g = &self.group;
         let mut out = Vec::new();
         loop {

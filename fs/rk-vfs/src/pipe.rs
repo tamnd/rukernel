@@ -141,7 +141,7 @@ impl FileOps for PipeEnd {
         if buf.is_empty() {
             return Ok(0);
         }
-        let nonblock = file.flags().nonblock();
+        let nonblock = file.nonblock();
         let n = self.pipe.wait.wait_interruptible(|| {
             let mut s = self.pipe.state.lock();
             if !s.buf.is_empty() {

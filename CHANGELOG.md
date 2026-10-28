@@ -10,6 +10,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - hugetlbfs, as fs/hugetlbfs and mm/hugetlb.c of Linux (#371). `mount -t hugetlbfs` makes a file system whose files keep their data in huge pages of 2 MiB from a pool, with the options `mode`, `uid`, `gid`, `size`, `min_size`, `nr_inodes` and `pagesize`. A mapping of a file, `mmap` with `MAP_HUGETLB`, `shmget` with `SHM_HUGETLB` and `memfd_create` with `MFD_HUGETLB` get huge pages from the pool. A mapping reserves its pages, so a later fault does not fail, unless it has `MAP_NORESERVE` or `SHM_NORESERVE`. `ftruncate`, `read` and `fallocate` with `FALLOC_FL_PUNCH_HOLE` and `FALLOC_FL_KEEP_SIZE` work on the files, and a truncate or a hole removes the pages from each process that maps them, so a later access gives `SIGBUS`. `cachestat` on a file of hugetlbfs gives `EOPNOTSUPP`. `vm.nr_hugepages`, `vm.nr_overcommit_hugepages`, `vm.hugetlb_shm_group` and the files of /sys/kernel/mm/hugepages/hugepages-2048kB set and show the pool, and /proc/meminfo has the `HugePages_*`, `Hugepagesize` and `Hugetlb` lines.
 - `shmget` checks `kernel.shmall` against the pages of all the segments, and takes `SHM_HUGETLB` (#371).
 - The first rukernel-bench table, in tools/bench (#327). `bench.c` has benchmarks of the entry, sched, mem and net classes, and `run.py` boots rukernel and Linux in QEMU with the same machine and the same static musl initramfs, and writes the median, the interquartile range and the ratio of each benchmark to `results.md`. A row where rukernel is more than 2 times slower than Linux is red. The harness moves to the repository `tamnd/rukernel-bench` later.
+- `preadv2` with the offset -1 takes `RWF_NOWAIT` (#375). A pipe, a socket or a character device with no data gives `EAGAIN`, and a file gives `EAGAIN` when its page is not in the page cache, as `IOCB_NOWAIT` of Linux.
+
+### Changed
+
+- kmsg, signalfd, the seccomp listener, AIO contexts, pidfds and the cgroup event and PSI files have their own poll wait queues, and the global `POLL_WAIT` queue is gone (#375). A wake of one file no longer wakes each task in `poll`, `select` and `epoll_wait`.
 
 ### Fixed
 
@@ -17,6 +22,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A transparent huge page in a memory cgroup charges the whole block to the cgroup (#371). Before, a process in a memory cgroup got only 4 KiB pages.
 - `mmap` with `MAP_FIXED` of a range past the end of user space gives `ENOMEM`, as on Linux (#371). Before, it gave `EINVAL`.
 - On x86-64, the removal of a huge page drops all the TLB entries of user pages of the process (#371). Under QEMU without KVM, one `invlpg` let the process run old code from a huge page that was gone.
+- The user CPU time of a thread comes from the time stamp counter around the user code, not from the timer ticks that come at the entry to user mode (#375). The kernel runs with interrupts off, so a tick that fell due in the kernel or in the wake from a sleep counted as user time. On a busy host a sleep added CPU time and `ITIMER_VIRTUAL` fired early.
+- The timer checks and the relatime check of the init boot test do not assume a fast host (#375). The `timer_gettime` check uses a long timer, the check of the timer signal takes a `SIGALRM` that is still pending, the child of the nanosleep check sends its signal until the parent stops it, and the relatime check waits for the clock to move after `futimens`.
 
 ## [0.4.5] - 2026-10-28
 

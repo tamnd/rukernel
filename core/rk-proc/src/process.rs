@@ -24,6 +24,7 @@ use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
 use rk_net::ns::NetNs;
 use rk_vfs::cred::Cred;
+use rk_vfs::wait::WaitQueue as PollQueue;
 use rk_vfs::{FdTable, FsContext, Location};
 
 pub mod ptrace;
@@ -191,6 +192,12 @@ pub struct Process {
     net: SpinLock<Option<Arc<NetNs>>>,
     /// The process keyring and the session keyring.
     keys: SpinLock<ProcessKeys>,
+    /// A signal to the process or to one of its threads wakes this queue, for the signal files
+    /// that the process reads, as `sighand_struct.signalfd_wqh` of Linux.
+    signal_poll: Arc<PollQueue>,
+    /// The exit of the process wakes this queue, for its process file descriptors, as
+    /// `pid.wait_pidfd` of Linux.
+    exit_poll: Arc<PollQueue>,
 }
 
 /// The keyrings of a process.
@@ -232,8 +239,10 @@ pub struct Thread {
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
     /// The call that `restart_syscall` continues.
     restart: SpinLock<Option<Restart>>,
-    /// The timer ticks that came while the thread ran user code.
+    /// The user CPU time of the thread in whole timer ticks.
     user_ticks: AtomicU64,
+    /// The user CPU time of the thread in nanoseconds that is not yet a whole tick.
+    user_rest: AtomicU64,
     /// The time in nanoseconds that the thread must wait for `io.max` of its cgroup before it
     /// goes back to user mode.
     io_delay: AtomicU64,
@@ -563,6 +572,16 @@ impl Process {
         &self.child_wait
     }
 
+    /// The queue that a signal to the process wakes. A signal file waits here.
+    pub fn signal_poll(&self) -> &Arc<PollQueue> {
+        &self.signal_poll
+    }
+
+    /// The queue that the exit of the process wakes. A process file descriptor waits here.
+    pub fn exit_poll(&self) -> &Arc<PollQueue> {
+        &self.exit_poll
+    }
+
     /// The action of `sig`.
     pub fn action(&self, sig: u32) -> SigAction {
         self.signals.lock().actions[sig as usize - 1]
@@ -843,6 +862,8 @@ impl Process {
             cgroup: AtomicU32::new(rk_cgroup::ROOT),
             cgns: AtomicU32::new(0),
             net: SpinLock::new(None),
+            signal_poll: Arc::new(PollQueue::new()),
+            exit_poll: Arc::new(PollQueue::new()),
         })
     }
 }
@@ -924,12 +945,21 @@ impl Thread {
         self.user_ticks.load(Ordering::Relaxed)
     }
 
-    /// Adds timer ticks to the user CPU time of the thread. The kernel runs with interrupts
-    /// off, so the timer ticks only while a thread runs user code or the CPU is idle. The ticks
-    /// that come while the thread runs user code are its user time, and the system time is 0.
-    pub fn add_user_ticks(&self, ticks: u64) {
-        USER_TICKS.fetch_add(ticks, Ordering::Relaxed);
-        self.user_ticks.fetch_add(ticks, Ordering::Relaxed);
+    /// Adds `ns` nanoseconds of user code to the user CPU time of the thread, and gives the
+    /// number of whole ticks that this adds. Only the thread itself calls it. The time comes from
+    /// the clock around the user code, not from the ticks that the timer interrupt counts: the
+    /// kernel runs with interrupts off, so a tick that falls due in the kernel or in a wake from
+    /// idle comes at the next entry to user mode, and is not user time. The system time is 0.
+    pub fn add_user_ns(&self, ns: u64) -> u64 {
+        let tick_ns = 1_000_000_000 / rk_frame::time::HZ;
+        let total = self.user_rest.load(Ordering::Relaxed) + ns;
+        self.user_rest.store(total % tick_ns, Ordering::Relaxed);
+        let ticks = total / tick_ns;
+        if ticks != 0 {
+            USER_TICKS.fetch_add(ticks, Ordering::Relaxed);
+            self.user_ticks.fetch_add(ticks, Ordering::Relaxed);
+        }
+        ticks
     }
 
     /// Adds `ns` nanoseconds to the wait of the thread for `io.max`. The longest delay counts,
@@ -1260,6 +1290,7 @@ impl Thread {
             vfork_done: SpinLock::new(None),
             restart: SpinLock::new(None),
             user_ticks: AtomicU64::new(0),
+            user_rest: AtomicU64::new(0),
             io_delay: AtomicU64::new(0),
             ptrace: SpinLock::new(None),
             group_stop: AtomicU32::new(0),
@@ -1586,7 +1617,7 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
         t.wake();
     }
     // A signal file of the process can be ready now.
-    rk_vfs::wait::poll_wake();
+    process.signal_poll.wake_all();
 }
 
 /// Discards each pending signal of `set` in the queue of `process` and of each of its `threads`.
@@ -1808,7 +1839,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         (core::mem::take(&mut s.children), s.parent.upgrade(), status)
     };
     // A process file descriptor of the process is now readable.
-    rk_vfs::wait::poll_wake();
+    process.exit_poll.wake_all();
     // Each child that asked for it gets its signal, as `reparent_leader` in kernel/exit.c of
     // Linux.
     for child in &children {

@@ -129,7 +129,7 @@ impl FileOps for ConsoleFile {
             if tty.ldisc.readable() || buf.is_empty() {
                 return Ok(Some(tty.ldisc.read(buf)));
             }
-            if file.flags().nonblock() {
+            if file.nonblock() {
                 return Err(Errno::EAGAIN);
             }
             Ok(None)
