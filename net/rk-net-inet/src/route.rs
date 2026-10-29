@@ -758,6 +758,30 @@ impl Table {
         Ok((Next { ifindex: r.ifindex, hop, src, local: false, broadcast }, Some(r)))
     }
 
+    /// Finds the route of a received packet to `dst`, as `ip_route_input_slow` of Linux. The
+    /// route needs no source address. Gives the next hop and the type of the route, `RTN_*`.
+    /// The source of the `Next` is the preferred source, or `0.0.0.0`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENETUNREACH` if no route matches, and the error of a route of the type
+    /// `unreachable`, `prohibit` or `blackhole`.
+    pub fn lookup_input(&self, dst: Addr) -> Result<(Next, u8)> {
+        let r = self.fib_lookup(dst, RT_SCOPE_UNIVERSE as u8, 0).ok_or(Errno::ENETUNREACH)?;
+        if let Some(e) = r.error() {
+            return Err(e);
+        }
+        let kind = u32::from(r.kind);
+        let next = Next {
+            ifindex: r.ifindex,
+            hop: r.gateway.unwrap_or(dst),
+            src: r.prefsrc.unwrap_or(ipv4::ANY),
+            local: kind == RTN_LOCAL,
+            broadcast: kind == RTN_BROADCAST || self.is_broadcast(dst),
+        };
+        Ok((next, r.kind))
+    }
+
     /// The scope `nowhere`, for a `Match` that takes each scope.
     pub const SCOPE_ANY: u8 = RT_SCOPE_NOWHERE as u8;
 }

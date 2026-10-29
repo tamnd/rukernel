@@ -22,7 +22,7 @@ use rk_abi::native::rtnetlink::{
     RTN_UNREACHABLE,
 };
 use rk_net::consts::{
-    AF_INET, AF_INET6, ATF_COM, ATF_PERM, RTF_GATEWAY, RTF_HOST, RTF_REJECT, RTF_UP,
+    AF_INET, AF_INET6, ATF_COM, ATF_PERM, ATF_PUBL, RTF_GATEWAY, RTF_HOST, RTF_REJECT, RTF_UP,
 };
 use rk_net::dev;
 use rk_net::ether::MacAddr;
@@ -382,14 +382,14 @@ pub(crate) fn show_snmp6() -> String {
     let ip = [
         ("InReceives", c(&k.in_receives)),
         ("InHdrErrors", c(&k.in_hdr_errors)),
-        ("InTooBigErrors", 0),
+        ("InTooBigErrors", c(&k.in_too_big_errors)),
         ("InNoRoutes", 0),
         ("InAddrErrors", c(&k.in_addr_errors)),
         ("InUnknownProtos", c(&k.in_unknown_protos)),
         ("InTruncatedPkts", c(&k.in_truncated)),
         ("InDiscards", 0),
         ("InDelivers", c(&k.in_delivers)),
-        ("OutForwDatagrams", 0),
+        ("OutForwDatagrams", c(&k.out_forw_datagrams)),
         ("OutRequests", c(&k.out_requests)),
         ("OutDiscards", 0),
         ("OutNoRoutes", c(&k.out_no_routes)),
@@ -538,6 +538,19 @@ pub(crate) fn show_arp() -> String {
             d.kind().arphrd(),
             "*",
             d.name()
+        ));
+    }
+    // The proxy entries, as `arp_format_pneigh_entry` of Linux.
+    for p in stack::proxies() {
+        let [a, b, c, e] = p.addr;
+        let ip = format!("{a}.{b}.{c}.{e}");
+        let d = dev::by_index(p.ifindex).filter(|_| p.ifindex != 0);
+        let hatype = d.as_ref().map_or(0, |d| d.kind().arphrd());
+        let name = d.map_or(String::from("*"), |d| d.name());
+        out.push_str(&format!(
+            "{ip:<16} 0x{hatype:<10x}0x{:<10x}{}     *        {name}\n",
+            ATF_PUBL | ATF_PERM,
+            MacAddr::ZERO
         ));
     }
     out
@@ -748,22 +761,26 @@ pub(crate) fn show_netstat() -> String {
 }
 
 /// The text of /proc/net/snmp. The stack keeps only some of the counters, and the others are 0.
-/// `Forwarding` is 2 because the stack does not forward, and the TCP constants are the values
-/// of Linux: the RTO algorithm 1 (other), 200 ms and 120 s, and no limit of connections.
+/// `Forwarding` is 1 when `conf/all/forwarding` is on, else 2, and the TCP constants are the
+/// values of Linux: the RTO algorithm 1 (other), 200 ms and 120 s, and no limit of connections.
 pub(crate) fn show_snmp() -> String {
     let c = |a: &core::sync::atomic::AtomicU64| a.load(Ordering::Relaxed) as i64;
     let k = &COUNTERS;
+    let forwarding = {
+        use rk_net::sysctl::{Family, Scope, conf};
+        conf(Family::Ipv4, Scope::All, "forwarding") != 0
+    };
     let mut out = String::new();
     table(
         &mut out,
         "Ip",
         &[
-            ("Forwarding", 2),
+            ("Forwarding", if forwarding { 1 } else { 2 }),
             ("DefaultTTL", i64::from(rk_net::sysctl::default_ttl())),
             ("InReceives", c(&k.ip_in)),
             ("InHdrErrors", c(&k.ip_in_hdr_errors)),
             ("InAddrErrors", c(&k.ip_in_addr_errors)),
-            ("ForwDatagrams", 0),
+            ("ForwDatagrams", c(&k.ip_forw_datagrams)),
             ("InUnknownProtos", c(&k.ip_in_unknown_protos)),
             ("InDiscards", 0),
             ("InDelivers", c(&k.ip_in_delivers)),
@@ -775,9 +792,9 @@ pub(crate) fn show_snmp() -> String {
             ("ReasmOKs", c(&k.ip_reasm_oks)),
             ("ReasmFails", c(&k.ip_reasm_fails)),
             ("FragOKs", c(&k.ip_frag_oks)),
-            ("FragFails", 0),
+            ("FragFails", c(&k.ip_frag_fails)),
             ("FragCreates", c(&k.ip_frag_creates)),
-            ("OutTransmits", c(&k.ip_out)),
+            ("OutTransmits", c(&k.ip_out) + c(&k.ip_forw_datagrams)),
         ],
     );
     // The types of the `Icmp` line, as `icmpmibmap` of Linux.

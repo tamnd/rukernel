@@ -28,6 +28,7 @@ mod addrconf;
 pub mod checksum;
 pub mod config;
 pub mod fib;
+pub mod forward;
 pub mod frag;
 mod igmp;
 mod ioctl;

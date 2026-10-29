@@ -41,6 +41,8 @@ pub(crate) static ROUTES: PerNet<SpinLock<route::Table>> =
 /// The neighbour table. A packet that waits has its IPv4 header and no link header.
 static NEIGH: PerNet<SpinLock<neigh::Table<NetBuf>>> =
     PerNet::new(|| SpinLock::new(neigh::Table::new()));
+/// The proxy entries of ARP, as the `phash_buckets` of `arp_tbl` of Linux.
+static PNEIGH: PerNet<SpinLock<neigh::Proxy>> = PerNet::new(|| SpinLock::new(neigh::Proxy::new()));
 /// The ports of the UDP sockets.
 pub(crate) static UDP_PORTS: PerNet<SpinLock<Ports>> =
     PerNet::new(|| SpinLock::new(Ports::new(ports::EPHEMERAL)));
@@ -77,8 +79,12 @@ pub struct Counters {
     pub ip_frag_oks: AtomicU64,
     /// The fragments that the stack made.
     pub ip_frag_creates: AtomicU64,
-    /// The packets to an address that is not local. The stack does not forward.
+    /// The packets to an address that is not local, when the device does not forward.
     pub ip_in_addr_errors: AtomicU64,
+    /// The packets that the stack forwarded, as `IPSTATS_MIB_OUTFORWDATAGRAMS` of Linux.
+    pub ip_forw_datagrams: AtomicU64,
+    /// The packets that needed fragments and had the flag "do not fragment".
+    pub ip_frag_fails: AtomicU64,
     /// The IPv4 packets that went to a protocol or a raw socket.
     pub ip_in_delivers: AtomicU64,
     /// The IPv4 packets of a protocol without a handler or a raw socket.
@@ -142,6 +148,8 @@ impl rk_net::ns::Clear for Counters {
         self.ip_frag_oks.store(0, Ordering::Relaxed);
         self.ip_frag_creates.store(0, Ordering::Relaxed);
         self.ip_in_addr_errors.store(0, Ordering::Relaxed);
+        self.ip_forw_datagrams.store(0, Ordering::Relaxed);
+        self.ip_frag_fails.store(0, Ordering::Relaxed);
         self.ip_in_delivers.store(0, Ordering::Relaxed);
         self.ip_in_unknown_protos.store(0, Ordering::Relaxed);
         self.ip_out.store(0, Ordering::Relaxed);
@@ -197,6 +205,8 @@ fn new_counters() -> Counters {
         ip_in_delivers: AtomicU64::new(0),
         ip_in_unknown_protos: AtomicU64::new(0),
         ip_in_addr_errors: AtomicU64::new(0),
+        ip_forw_datagrams: AtomicU64::new(0),
+        ip_frag_fails: AtomicU64::new(0),
         ip_out: AtomicU64::new(0),
         udp_in: AtomicU64::new(0),
         udp_no_ports: AtomicU64::new(0),
@@ -401,9 +411,10 @@ pub(crate) fn route_mc(dst: Addr, oif: u32, src: Addr) -> Result<route::Next> {
     Ok(route::Next { ifindex: oif, hop: dst, src, local: false, broadcast: false })
 }
 
-/// Removes the neighbours of an interface, as `arp_ifdown` of Linux.
+/// Removes the neighbours and the proxy entries of an interface, as `arp_ifdown` of Linux.
 pub(crate) fn flush_neigh(ifindex: u32) {
     NEIGH.lock().flush(ifindex, now_ms());
+    PNEIGH.lock().flush(ifindex);
     neigh_notify();
 }
 
@@ -453,6 +464,23 @@ pub(crate) fn neigh_del(ifindex: u32, addr: Addr) -> bool {
     let found = NEIGH.lock().remove((ifindex, addr), now_ms());
     neigh_notify();
     found
+}
+
+/// Adds a proxy entry of ARP for `addr` on the interface `ifindex`, or on each interface if it
+/// is 0, as `pneigh_create` of Linux. An entry that is there gets the flags `flags`.
+pub(crate) fn pneigh_add(addr: Addr, ifindex: u32, flags: u8) {
+    PNEIGH.lock().add(addr, ifindex, flags);
+}
+
+/// Removes a proxy entry of ARP, as `pneigh_delete` of Linux. Gives `false` if there is no
+/// entry with that address and interface.
+pub(crate) fn pneigh_del(addr: Addr, ifindex: u32) -> bool {
+    PNEIGH.lock().remove(addr, ifindex)
+}
+
+/// The proxy entries of ARP.
+pub(crate) fn proxies() -> Vec<neigh::ProxyInfo> {
+    PNEIGH.lock().entries()
 }
 
 /// The neighbours: the interface, the address, the hardware address if the entry is valid,
@@ -557,7 +585,7 @@ fn poll_looped() -> usize {
     let n = looped.len();
     for (d, frame) in looped {
         let _in = rk_net::ns::enter_index(d.net());
-        ip_input(&d, frame);
+        ip_input(&d, frame, false);
     }
     n
 }
@@ -584,9 +612,15 @@ pub(crate) fn output_raw(next: &route::Next, packet: &[u8]) -> Result<()> {
     transmit(&dev, next, NetBuf::from_slice(packet))
 }
 
-/// Gives a packet to the link: the loopback device, a broadcast, or a neighbour.
-fn transmit(dev: &NetDevice, next: &route::Next, mut buf: NetBuf) -> Result<()> {
+/// Gives a packet that the host makes to the link, and counts it.
+fn transmit(dev: &NetDevice, next: &route::Next, buf: NetBuf) -> Result<()> {
     count(&COUNTERS.ip_out);
+    xmit(dev, next, buf)
+}
+
+/// Gives a packet to the link: the loopback device, a broadcast, or a neighbour, as
+/// `ip_finish_output2` of Linux.
+pub(crate) fn xmit(dev: &NetDevice, next: &route::Next, mut buf: NetBuf) -> Result<()> {
     let mac = dev.mac();
     let ether = |dst| EthHeader { dst, src: mac, ethertype: ETH_P_IP as u16 };
     // A TUN device and a line device have no link header and no neighbours, as the loopback
@@ -641,8 +675,10 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
     frame.protocol = eth.ethertype;
     match u32::from(eth.ethertype) {
         ETH_P_ARP => arp_input(dev, frame.data()),
-        ETH_P_IP => ip_input(dev, frame),
-        ETH_P_IPV6 => crate::stack6::input(dev, frame),
+        // A frame to a link multicast or broadcast address is not `PACKET_HOST`, and the stack
+        // does not forward it.
+        ETH_P_IP => ip_input(dev, frame, !eth.dst.is_multicast()),
+        ETH_P_IPV6 => crate::stack6::input(dev, frame, !eth.dst.is_multicast()),
         _ => {}
     }
 }
@@ -658,10 +694,12 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
         return;
     }
     let ours = { ROUTES.lock().is_local(p.target_ip) };
+    let proxied = !ours && p.op == ARPOP_REQUEST && proxy_arp(dev, &p);
     // A probe for duplicate addresses has the sender 0.0.0.0, and it does not go in the table.
     if p.sender_ip != ipv4::ANY && !p.sender_mac.is_multicast() {
         let key = (dev.ifindex(), p.sender_ip);
-        let waiting = NEIGH.lock().update(key, p.sender_mac, now_ms(), ours);
+        // A request that the host answers makes an entry of the sender, as `neigh_event_ns`.
+        let waiting = NEIGH.lock().update(key, p.sender_mac, now_ms(), ours || proxied);
         neigh_notify();
         for mut packet in waiting {
             EthHeader { dst: p.sender_mac, src: dev.mac(), ethertype: ETH_P_IP as u16 }
@@ -669,7 +707,7 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
             let _ = dev.transmit(packet);
         }
     }
-    if p.op == ARPOP_REQUEST && ours {
+    if p.op == ARPOP_REQUEST && (ours || proxied) {
         let reply = ArpPacket {
             op: ARPOP_REPLY,
             sender_mac: dev.mac(),
@@ -681,10 +719,44 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
     }
 }
 
-/// Takes an IPv4 packet, as `ip_rcv` and `ip_local_deliver` of Linux. The stack does not
-/// forward. It takes a packet to a local address, to a broadcast address, or to a multicast
-/// group of the device, and it puts the fragments together first.
-pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
+/// Tells if the host answers the ARP request `p` for an address of another host, as the
+/// `IN_DEV_FORWARD` case of `arp_process` in net/ipv4/arp.c of Linux. The interface must
+/// forward, the target must have a unicast route through another interface, and `proxy_arp`
+/// of the interface or a proxy entry must allow it. Linux waits `proxy_delay` before the reply
+/// to a broadcast request. This stack answers at once.
+fn proxy_arp(dev: &NetDevice, p: &ArpPacket) -> bool {
+    use rk_net::sysctl::{Family, Scope, conf};
+    let ifindex = dev.ifindex();
+    // `ip_route_input_noref` with the sender as the source: a sender 0.0.0.0 is a martian.
+    if p.sender_ip == ipv4::ANY
+        || ipv4::is_multicast(p.sender_ip)
+        || p.target_ip == ipv4::ANY
+        || p.target_ip == ipv4::BROADCAST
+        || conf(Family::Ipv4, Scope::Dev(ifindex), "forwarding") == 0
+    {
+        return false;
+    }
+    let Ok((next, kind)) = ROUTES.lock().lookup_input(p.target_ip) else { return false };
+    if u32::from(kind) != rk_abi::native::rtnetlink::RTN_UNICAST
+        || next.broadcast
+        || next.ifindex == ifindex
+    {
+        return false;
+    }
+    let orconf = |name| {
+        conf(Family::Ipv4, Scope::All, name) != 0
+            || conf(Family::Ipv4, Scope::Dev(ifindex), name) != 0
+    };
+    let medium = |i| conf(Family::Ipv4, Scope::Dev(i), "medium_id");
+    crate::forward::fwd_proxy(orconf("proxy_arp"), medium(ifindex), medium(next.ifindex))
+        || PNEIGH.lock().lookup(p.target_ip, ifindex)
+}
+
+/// Takes an IPv4 packet, as `ip_rcv` and `ip_local_deliver` of Linux. It takes a packet to a
+/// local address, to a broadcast address, or to a multicast group of the device, and it puts
+/// the fragments together first. It forwards a packet to another host if the device forwards.
+/// `host` tells that the frame came to the link address of the device, `PACKET_HOST` of Linux.
+pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
     count(&COUNTERS.ip_in);
     let Ok(h) = Header::parse(frame.data()) else {
         return count(&COUNTERS.ip_in_hdr_errors);
@@ -703,6 +775,10 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf) {
     // that the host sends to a group comes back on the loopback device.
     let mcast = ipv4::is_multicast(h.dst) && (loopback || igmp::joined(dev.ifindex(), h.dst));
     if !local && !broadcast && !mcast {
+        if !loopback && !ipv4::is_multicast(h.dst) && crate::forward::forward4(dev, &h, frame, host)
+        {
+            return;
+        }
         return count(&COUNTERS.ip_in_addr_errors);
     }
     let (h, frame) = if h.is_fragment() {
@@ -885,6 +961,15 @@ const ICMP_ERROR_DATA: usize = 576 - HLEN - 8;
 /// Sends an ICMP error about the packet `packet` with the header `h`, as `icmp_send` of Linux.
 /// The stack sends no error about a broadcast or about an ICMP error.
 pub(crate) fn icmp_error(h: &Header, packet: &[u8], kind: u8, code: u8) {
+    icmp_send(h, packet, kind, code, 0);
+}
+
+/// Sends an ICMP error as `icmp_error`, with `info` in the bytes 4 to 8 of the message: the
+/// MTU of `ICMP_FRAG_NEEDED` or the gateway of `ICMP_REDIRECT`. The error about a packet that
+/// the host forwards comes from the address of the route to the sender, as `__icmp_send` of
+/// Linux with `icmp_errors_use_inbound_ifaddr` 0. The stack sends no error about a fragment
+/// that is not the first one.
+pub(crate) fn icmp_send(h: &Header, packet: &[u8], kind: u8, code: u8, info: u32) {
     if let Some(&t) = packet.get(h.hlen)
         && h.protocol == PROTO_ICMP
         && t != ICMP_ECHO
@@ -895,17 +980,32 @@ pub(crate) fn icmp_error(h: &Header, packet: &[u8], kind: u8, code: u8) {
     if h.src == ipv4::ANY || ipv4::is_multicast(h.src) || h.src == ipv4::BROADCAST {
         return;
     }
-    let local = ROUTES.lock().is_local(h.dst);
-    if !local {
+    if h.frag_offset() != 0 || h.dst == ipv4::ANY || ipv4::is_multicast(h.dst) {
         return;
     }
+    let (local, broadcast) = {
+        let routes = ROUTES.lock();
+        (routes.is_local(h.dst), routes.is_broadcast(h.dst))
+    };
+    if broadcast {
+        return;
+    }
+    let src = if local {
+        h.dst
+    } else {
+        match route(h.src) {
+            Ok(n) => n.src,
+            Err(_) => return,
+        }
+    };
     let data = &packet[..packet.len().min(ICMP_ERROR_DATA)];
     let mut msg = Vec::with_capacity(8 + data.len());
-    msg.extend_from_slice(&[kind, code, 0, 0, 0, 0, 0, 0]);
+    msg.extend_from_slice(&[kind, code, 0, 0]);
+    msg.extend_from_slice(&info.to_be_bytes());
     msg.extend_from_slice(data);
     let sum = checksum::checksum(&msg);
     msg[2..4].copy_from_slice(&sum.to_be_bytes());
-    send_icmp(h.dst, h.src, h.tos, &msg);
+    send_icmp(src, h.src, h.tos, &msg);
 }
 
 /// Takes a UDP datagram, as `udp_rcv` of Linux. `packet` has the IPv4 header, and it came in
@@ -1085,5 +1185,6 @@ pub(crate) fn ns_exit() {
     PING_PORTS.reset();
     SOCKETS.reset();
     FRAGS.reset();
+    PNEIGH.reset();
     COUNTERS.reset();
 }

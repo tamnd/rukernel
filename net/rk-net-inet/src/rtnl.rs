@@ -4,7 +4,8 @@
 use crate::fib::{self, IFADDR_LEN, RTMSG_LEN};
 use crate::ip::{self, Ip};
 use crate::ipv4;
-use crate::neigh::{Change, Info, Nud};
+use crate::ipv4::Addr;
+use crate::neigh::{Change, Info, Nud, ProxyInfo};
 use crate::route::{
     INFINITY, IfAddr, Match, Metrics, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK, RTAX_FEATURES,
     RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
@@ -21,8 +22,8 @@ use rk_abi::native::if_addr::{
 };
 use rk_abi::native::neighbour::{
     NDA_CACHEINFO, NDA_DST, NDA_IFINDEX, NDA_LLADDR, NDA_MASTER, NDA_NDM_FLAGS_MASK, NDA_PROBES,
-    NTF_PROXY, NUD_DELAY, NUD_INCOMPLETE, NUD_NOARP, NUD_PERMANENT, NUD_PROBE, NUD_REACHABLE,
-    NUD_STALE,
+    NTF_PROXY, NUD_DELAY, NUD_INCOMPLETE, NUD_NOARP, NUD_NONE, NUD_PERMANENT, NUD_PROBE,
+    NUD_REACHABLE, NUD_STALE,
 };
 use rk_abi::native::netlink::{NLM_F_DUMP_FILTERED, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
@@ -499,9 +500,23 @@ struct NeighReq {
     state: u32,
 }
 
+/// A request of `RTM_NEWNEIGH` or `RTM_DELNEIGH` with `NTF_PROXY`: the address, the interface
+/// or 0, and the flags `NTF_*`.
+struct ProxyReq {
+    dst: Addr,
+    ifindex: u32,
+    flags: u8,
+}
+
+/// A request of `RTM_NEWNEIGH` or `RTM_DELNEIGH`: a neighbour or a proxy entry.
+enum NeighOp {
+    Neigh(NeighReq),
+    Proxy(ProxyReq),
+}
+
 /// Reads a request of `RTM_NEWNEIGH` or `RTM_DELNEIGH` with the checks of `neigh_add` and
 /// `neigh_delete` in net/core/neighbour.c of Linux.
-fn neigh_req(req: &Request<'_>) -> Result<NeighReq> {
+fn neigh_req(req: &Request<'_>) -> Result<NeighOp> {
     let (h, a) = req.parse(NDMSG_LEN, NDA_MAX)?;
     let Some(dst) = a.get(NDA_DST) else { return Err(Errno::EINVAL) };
     let ifindex = u32_at(h, 4);
@@ -519,20 +534,33 @@ fn neigh_req(req: &Request<'_>) -> Result<NeighReq> {
         AF_INET6 => dst.get(..16).ok_or(Errno::EINVAL)?.try_into().unwrap_or_default(),
         _ => return Err(Errno::EAFNOSUPPORT),
     };
-    // The stack has no proxy entries, `pneigh_*` of Linux.
+    // A proxy entry, `pneigh_create` and `pneigh_delete` of Linux, needs no device. The stack
+    // has proxy entries of ARP only, because it does not proxy neighbour discovery.
     if u32::from(h[10]) & NTF_PROXY != 0 {
-        return Err(Errno::EOPNOTSUPP);
+        let Some(dst) = ip::v4(&dst).filter(|_| family == AF_INET) else {
+            return Err(Errno::EOPNOTSUPP);
+        };
+        let ifindex = dev.map_or(0, |d| d.ifindex());
+        return Ok(NeighOp::Proxy(ProxyReq { dst, ifindex, flags: h[10] }));
     }
     let Some(dev) = dev else { return Err(Errno::EINVAL) };
     let lladdr = lladdr.and_then(|l| l.get(..6)).map(|l| MacAddr(l.try_into().unwrap_or([0; 6])));
-    Ok(NeighReq { family, dev, dst, lladdr, state: u32::from(u16::from_ne_bytes([h[8], h[9]])) })
+    let state = u32::from(u16::from_ne_bytes([h[8], h[9]]));
+    Ok(NeighOp::Neigh(NeighReq { family, dev, dst, lladdr, state }))
 }
 
 /// `RTM_NEWNEIGH`, as `neigh_add` of Linux: `ip neigh add`, `change` and `replace`. The flags
 /// `NLM_F_CREATE`, `NLM_F_EXCL` and `NLM_F_REPLACE` choose what happens to an entry that is
 /// there or not there.
 fn newneigh(req: &Request<'_>) -> Result<()> {
-    let n = neigh_req(req)?;
+    let n = match neigh_req(req)? {
+        NeighOp::Neigh(n) => n,
+        // An entry that is there gets the new flags, as `neigh_add` of Linux.
+        NeighOp::Proxy(p) => {
+            stack::pneigh_add(p.dst, p.ifindex, p.flags);
+            return Ok(());
+        }
+    };
     let nud = match n.state {
         NUD_PERMANENT => Nud::Permanent,
         NUD_NOARP => Nud::Noarp,
@@ -549,7 +577,12 @@ fn newneigh(req: &Request<'_>) -> Result<()> {
 
 /// `RTM_DELNEIGH`, as `neigh_delete` of Linux: `ip neigh del`.
 fn delneigh(req: &Request<'_>) -> Result<()> {
-    let n = neigh_req(req)?;
+    let n = match neigh_req(req)? {
+        NeighOp::Neigh(n) => n,
+        NeighOp::Proxy(p) => {
+            return if stack::pneigh_del(p.dst, p.ifindex) { Ok(()) } else { Err(Errno::ENOENT) };
+        }
+    };
     let ifindex = n.dev.ifindex();
     let found = match ip::v4(&n.dst).filter(|_| n.family == AF_INET) {
         Some(a) => stack::neigh_del(ifindex, a),
@@ -596,7 +629,15 @@ fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         proxy = u32::from(p[10]) == NTF_PROXY;
     }
     if proxy {
-        return Ok(Vec::new());
+        if family != 0 && family != AF_INET as u8 {
+            return Ok(Vec::new());
+        }
+        // `pneigh_dump_table`: a filter on the interface skips the entries without a device.
+        return Ok(stack::proxies()
+            .iter()
+            .filter(|n| ifindex == 0 || n.ifindex == ifindex)
+            .map(|n| fill_pneigh(n, flags, req.hdr.seq, req.portid))
+            .collect());
     }
     let mut all: Vec<(u8, Info<Ip>)> = Vec::new();
     if family == 0 || family == AF_INET as u8 {
@@ -610,6 +651,20 @@ fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         .filter(|(_, n)| ifindex == 0 || n.ifindex == ifindex)
         .map(|(af, n)| fill_neigh(*af, n, RTM_NEWNEIGH, flags, req.hdr.seq, req.portid))
         .collect())
+}
+
+/// A message of a proxy entry of ARP, as `pneigh_fill_info` in net/core/neighbour.c of Linux.
+fn fill_pneigh(n: &ProxyInfo, flags: u32, seq: u32, portid: u32) -> Vec<u8> {
+    let mut b = Builder::new(RTM_NEWNEIGH as u16, flags as u16, seq, portid);
+    let mut h = [0u8; NDMSG_LEN];
+    h[0] = AF_INET as u8;
+    h[4..8].copy_from_slice(&n.ifindex.to_ne_bytes());
+    h[8..10].copy_from_slice(&(NUD_NONE as u16).to_ne_bytes());
+    h[10] = n.flags | NTF_PROXY as u8;
+    h[11] = RTN_UNICAST as u8;
+    b.fixed(&h);
+    b.put(NDA_DST as u16, &n.addr);
+    b.finish()
 }
 
 /// A message of a neighbour, as `neigh_fill_info` in net/core/neighbour.c of Linux.

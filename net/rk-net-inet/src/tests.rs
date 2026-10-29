@@ -1315,3 +1315,117 @@ fn neighbour_changes() {
     t.flush(2, 21);
     assert!(matches!(t.take_changes()[..], [Change::Del(i)] if i.ifindex == 2));
 }
+
+/// The incremental update of `ip_decrease_ttl` gives the same checksum as a full computation.
+#[test]
+fn decrease_ttl_keeps_the_checksum() {
+    for (ttl, id) in [(64u8, 1u16), (2, 0xffff), (255, 0x1234), (1, 0)] {
+        let mut h = Header::new([10, 0, 1, 2], [10, 0, 2, 2], ipv4::PROTO_ICMP, 100);
+        h.ttl = ttl;
+        h.id = id;
+        let mut b = h.to_bytes();
+        ipv4::decrease_ttl(&mut b);
+        assert_eq!(b[8], ttl - 1);
+        assert_eq!(checksum::checksum(&b), 0, "ttl {ttl}");
+        let mut full = b;
+        ipv4::set_checksum(&mut full);
+        assert_eq!(b, full);
+    }
+}
+
+/// The fragments after the first keep only the options with the copy flag, as
+/// `ip_options_fragment`.
+#[test]
+fn options_of_later_fragments() {
+    // Record route (7, not copied), a NOOP, security (130, copied) and the end.
+    let mut o = [7, 7, 4, 0, 0, 0, 0, 1, 130, 4, 1, 2, 0, 0];
+    ipv4::options_fragment(&mut o);
+    assert_eq!(o, [1, 1, 1, 1, 1, 1, 1, 1, 130, 4, 1, 2, 0, 0]);
+    // A bad length stops the walk.
+    let mut o = [7, 0, 9, 9];
+    ipv4::options_fragment(&mut o);
+    assert_eq!(o, [7, 0, 9, 9]);
+}
+
+#[test]
+fn forward_verdicts() {
+    use crate::forward::{Verdict, verdict};
+    assert_eq!(verdict(1, 100, false, 1500), Verdict::TimeExceeded);
+    assert_eq!(verdict(0, 100, true, 1500), Verdict::TimeExceeded);
+    assert_eq!(verdict(2, 1500, true, 1500), Verdict::Send);
+    assert_eq!(verdict(64, 1501, true, 1500), Verdict::FragNeeded(1500));
+    assert_eq!(verdict(64, 3000, false, 1400), Verdict::Fragment);
+}
+
+/// The checks of `arp_fwd_proxy` with `medium_id`.
+#[test]
+fn proxy_arp_medium() {
+    use crate::forward::fwd_proxy;
+    assert!(!fwd_proxy(false, 0, 0));
+    assert!(fwd_proxy(true, 0, 0));
+    assert!(!fwd_proxy(true, -1, 2));
+    assert!(fwd_proxy(true, 1, 2));
+    assert!(!fwd_proxy(true, 1, 1));
+    assert!(!fwd_proxy(true, 1, -1));
+}
+
+/// The proxy entries of `pneigh_lookup`: an entry of the device or of each device.
+#[test]
+fn proxy_entries() {
+    let mut p: neigh::Proxy = neigh::Proxy::new();
+    p.add([10, 0, 2, 9], 3, 0);
+    p.add([10, 0, 2, 10], 0, 0);
+    assert!(p.lookup([10, 0, 2, 9], 3));
+    assert!(!p.lookup([10, 0, 2, 9], 4));
+    assert!(p.lookup([10, 0, 2, 10], 7));
+    // An add of an entry that is there changes its flags.
+    p.add([10, 0, 2, 9], 3, 0x40);
+    assert_eq!(p.entries().len(), 2);
+    assert_eq!(p.entries()[0].flags, 0x40);
+    // A delete needs the same device.
+    assert!(!p.remove([10, 0, 2, 10], 3));
+    assert!(p.remove([10, 0, 2, 10], 0));
+    p.flush(3);
+    assert!(p.is_empty());
+}
+
+/// The limits of `ip_rt_send_redirect`: the time between two redirects doubles, the host sends
+/// at most `REDIRECT_NUMBER` of them, and a silence starts the count again.
+#[test]
+fn redirect_limits() {
+    use neigh::{REDIRECT_LOAD_MS, REDIRECT_NUMBER, REDIRECT_SILENCE_MS, Redirects};
+    let mut r: Redirects = Redirects::new();
+    let host = [10, 0, 1, 2];
+    let mut now = 1000;
+    assert!(r.allow(host, now));
+    assert!(!r.allow(host, now + 1));
+    // Another host has its own count.
+    assert!(r.allow([10, 0, 1, 3], now + 1));
+    for n in 1..REDIRECT_NUMBER {
+        now += (REDIRECT_LOAD_MS << n) + 1;
+        assert!(r.allow(host, now), "redirect {n}");
+    }
+    now += REDIRECT_SILENCE_MS / 2;
+    assert!(!r.allow(host, now));
+    assert!(r.allow(host, now + REDIRECT_SILENCE_MS + 1));
+}
+
+/// The input route of a forwarded packet needs no source address and gives the errors of the
+/// routes without a next hop.
+#[test]
+fn input_routes() {
+    let mut t = qemu_table();
+    let (n, kind) = t.lookup_input([8, 8, 8, 8]).unwrap();
+    assert_eq!((n.ifindex, n.hop, u32::from(kind)), (2, [10, 0, 2, 2], RTN_UNICAST));
+    let (n, _) = t.lookup_input([10, 0, 2, 7]).unwrap();
+    assert_eq!(n.hop, [10, 0, 2, 7]);
+    assert!(t.lookup_input([10, 0, 2, 15]).unwrap().0.local);
+    let mut r = Route::new([192, 168, 0, 0], 16, None, 0);
+    r.kind = rk_abi::native::rtnetlink::RTN_UNREACHABLE as u8;
+    t.insert_route(r, NLM_F_CREATE).unwrap();
+    assert_eq!(t.lookup_input([192, 168, 1, 1]), Err(Errno::EHOSTUNREACH));
+    let mut t = Table::new();
+    t.insert_addr(IfAddr::new(2, [10, 0, 2, 15], 24, "eth0")).unwrap();
+    t.sync_link(ETH);
+    assert_eq!(t.lookup_input([8, 8, 8, 8]), Err(Errno::ENETUNREACH));
+}

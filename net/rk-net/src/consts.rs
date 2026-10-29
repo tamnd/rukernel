@@ -196,6 +196,8 @@ pub const ARPOP_REPLY: u16 = 2;
 pub const ICMP_ECHOREPLY: u8 = 0;
 /// The destination cannot be reached.
 pub const ICMP_DEST_UNREACH: u8 = 3;
+/// A better route is on the link.
+pub const ICMP_REDIRECT: u8 = 5;
 /// An echo request.
 pub const ICMP_ECHO: u8 = 8;
 /// The time to live of the packet is over.
@@ -213,6 +215,12 @@ pub const ICMP_PROT_UNREACH: u8 = 2;
 pub const ICMP_PORT_UNREACH: u8 = 3;
 /// The packet must be fragmented, but it has the flag "do not fragment".
 pub const ICMP_FRAG_NEEDED: u8 = 4;
+/// A filter of the administrator stops the packet.
+pub const ICMP_PKT_FILTERED: u8 = 13;
+/// The code of `ICMP_REDIRECT` for a redirect of one host.
+pub const ICMP_REDIR_HOST: u8 = 1;
+/// The code of `ICMP_TIME_EXCEEDED` when the time to live is over in transit.
+pub const ICMP_EXC_TTL: u8 = 0;
 
 /// The option of the level `SOL_RAW` for a raw ICMP socket: a mask of the ICMP types to drop.
 pub const ICMP_FILTER: u32 = 1;
