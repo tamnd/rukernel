@@ -12,6 +12,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `tools/ltp/build-ip.sh` builds `ip` with `SHARED_LIBS=n`. The static `ip` did not find the veth link kind, so `ip link add ... type veth peer name ...` failed with "Garbage instead of arguments" and the LTP net tests did not start (#454).
 - /sys/class/net/NAME/iflink of a veth device gives the index of the other end, as `veth_get_iflink` of Linux (#454).
+- `populated` of `cgroup.events` changes at once on the path from the cgroup up to the first cgroup whose value does not change, as `cgroup_update_populated` of Linux (#446). Before, the exit of the last task of a cgroup made `refresh_events` go over each cgroup. In the init boot test, the stop of 100 processes, each in its own leaf of a tree of 1110 cgroups, takes 1070 ms, not 7508 ms. A read of a cgroup file counts the dying cgroups only for `cgroup.stat`.
+- tools/ltp/run.py gives cgroup_fj_stress_memory_10_3_each a limit of 600 s, and runs memcontrol03 and memcontrol04 each in their own boot, so the cgroups that they leave do not change the later tests (#446). tools/ltp/notes.txt gives the cause of the `EBUSY` and the segfault in the cleanup of memcontrol04.
 
 ## [0.4.11] - 2026-10-29
 

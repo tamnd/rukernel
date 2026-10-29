@@ -627,3 +627,50 @@ fn events_change_only_with_the_first_and_the_last_task() {
     assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 0\nfrozen 0\n");
     assert!(h.event_seq(a, "cgroup.events").unwrap() > seq);
 }
+
+/// The `populated` value of `id` from the counts of the subtree, as the walk over the subtree
+/// that `populated` was before.
+fn populated_by_walk(h: &Hierarchy, id: CgId) -> bool {
+    let n = &h.nodes[&id];
+    n.nr_procs > 0 || n.pids > 0 || n.children.values().any(|&c| populated_by_walk(h, c))
+}
+
+#[test]
+fn populated_changes_up_the_tree_without_a_walk_over_each_cgroup() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let mut leaves = Vec::new();
+    for i in 0..3u8 {
+        let b = h.mkdir(a, &[b'b', i], 0).unwrap();
+        for j in 0..3u8 {
+            leaves.push(h.mkdir(b, &[b'c', j], 0).unwrap());
+        }
+    }
+    let seq = h.event_seq(a, "cgroup.events").unwrap();
+    for &c in &leaves {
+        h.charge_pids(c, 1).unwrap();
+        h.add_process(c);
+        assert!(!h.dirty);
+    }
+    // Only the first task below `a` changes its events.
+    assert_eq!(h.event_seq(a, "cgroup.events").unwrap(), seq + 1);
+    assert!(h.populated(ROOT));
+    for &c in &leaves {
+        h.uncharge_pids(c, 1);
+        h.remove_process(c);
+        for &id in h.nodes.keys() {
+            assert_eq!(h.populated(id), populated_by_walk(&h, id));
+        }
+    }
+    assert_eq!(h.event_seq(a, "cgroup.events").unwrap(), seq + 2);
+    assert_eq!(h.read(a, "cgroup.events", 0).unwrap(), "populated 0\nfrozen 0\n");
+    assert!(h.nodes.values().all(|n| n.nr_populated_children == 0));
+    // A move keeps the counts right.
+    h.charge_pids(leaves[0], 1).unwrap();
+    h.add_process(leaves[0]);
+    h.migrate(leaves[0], leaves[8], 1).unwrap();
+    for &id in h.nodes.keys() {
+        assert_eq!(h.populated(id), populated_by_walk(&h, id));
+    }
+    assert!(!h.populated(leaves[0]) && h.populated(leaves[8]));
+}

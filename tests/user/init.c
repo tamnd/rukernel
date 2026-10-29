@@ -5473,6 +5473,20 @@ static int cg_io(void)
 	return 0;
 }
 
+/* Reads 64 KiB of /dev/vda before the blocks of cg_io, so that the page cache of the read is new
+ * and the cgroup of the caller gets its charge. */
+static int cg_cache(void)
+{
+	static char b[65536];
+	int fd = open("/dev/vda", O_RDONLY);
+	off_t at = fd < 0 ? -1 : lseek(fd, 0, SEEK_END) - 2 * (off_t)sizeof(b);
+
+	if (at < 0 || pread(fd, b, sizeof(b), at) != (ssize_t)sizeof(b))
+		return 2;
+	close(fd);
+	return 0;
+}
+
 /* Gives the value of `key` in the line of the device 254:0 in io.stat of the cgroup `cg`, or
  * -1. */
 static long cg_io_value(const char *cg, const char *key)
@@ -5527,6 +5541,85 @@ static void test_cgroup_threaded(void)
 	check("rmdir removes a threaded cgroup", rmdir("/cg/th/x") == 0 && rmdir("/cg/th") == 0);
 }
 
+/* The tree of test_cgroup_stop, as cgroup_fj_stress memory 10 3 each of LTP: 1110 cgroups below
+ * /cg/s. A process goes in each STOP_STEP-th leaf, so that the boot test stays short. */
+#define STOP_FAN 10
+#define STOP_LEAVES (STOP_FAN * STOP_FAN * STOP_FAN)
+#define STOP_STEP 10
+#define STOP_PROCS (STOP_LEAVES / STOP_STEP)
+
+/* Makes a tree of 1110 cgroups with processes in its leaves, then kills and waits for each process
+ * one after the other, as cgroup_fj_stress of LTP. Each exit empties a leaf, so cgroup.events of
+ * the leaf changes. The kernel must not go over each cgroup at each exit. */
+static void test_cgroup_stop(void)
+{
+	static pid_t pids[STOP_PROCS];
+	char path[64], want[16];
+	long long start, stop_ms;
+	int i, made = 0, moved = 0, waited = 0, removed = 0;
+
+	if (mkdir("/cg/s", 0755) != 0 || cg_write("/cg/s/cgroup.subtree_control", "+memory") != 0) {
+		check("cgroup stop: make /cg/s", 0);
+		return;
+	}
+	for (i = 0; i < STOP_FAN; i++) {
+		snprintf(path, sizeof(path), "/cg/s/%d", i);
+		made += mkdir(path, 0755) == 0;
+		snprintf(path, sizeof(path), "/cg/s/%d/cgroup.subtree_control", i);
+		cg_write(path, "+memory");
+		for (int j = 0; j < STOP_FAN; j++) {
+			snprintf(path, sizeof(path), "/cg/s/%d/%d", i, j);
+			made += mkdir(path, 0755) == 0;
+			snprintf(path, sizeof(path), "/cg/s/%d/%d/cgroup.subtree_control", i, j);
+			cg_write(path, "+memory");
+			for (int k = 0; k < STOP_FAN; k++) {
+				snprintf(path, sizeof(path), "/cg/s/%d/%d/%d", i, j, k);
+				made += mkdir(path, 0755) == 0;
+			}
+		}
+	}
+	check("cgroup stop: mkdir makes 1110 cgroups", made == STOP_FAN + STOP_FAN * STOP_FAN + STOP_LEAVES);
+	for (i = 0; i < STOP_PROCS; i++) {
+		int leaf = i * STOP_STEP;
+
+		pids[i] = fork();
+		if (pids[i] == 0) {
+			for (;;)
+				pause();
+		}
+		if (pids[i] < 0)
+			break;
+		snprintf(path, sizeof(path), "/cg/s/%d/%d/%d/cgroup.procs", leaf / 100, leaf / 10 % 10, leaf % 10);
+		snprintf(want, sizeof(want), "%d", pids[i]);
+		moved += cg_write(path, want) == 0;
+	}
+	check("cgroup stop: the processes move to the leaves", moved == STOP_PROCS);
+	check("cgroup stop: /cg/s is populated", cg_value("/cg/s/cgroup.events", "populated ") == 1);
+	start = clock_ms(CLOCK_MONOTONIC);
+	for (i = 0; i < STOP_PROCS && pids[i] > 0; i++) {
+		kill(pids[i], SIGKILL);
+		waited += wait_status(pids[i]) != -1;
+	}
+	stop_ms = clock_ms(CLOCK_MONOTONIC) - start;
+	printf("init: cgroup stop: %d processes in %lld ms\n", waited, stop_ms);
+	check("cgroup stop: each process ends", waited == STOP_PROCS);
+	check("cgroup stop: /cg/s is empty", cg_value("/cg/s/cgroup.events", "populated ") == 0 &&
+						     cg_value("/cg/s/0/0/0/cgroup.events", "populated ") == 0);
+	for (i = STOP_LEAVES - 1; i >= 0; i--) {
+		snprintf(path, sizeof(path), "/cg/s/%d/%d/%d", i / 100, i / 10 % 10, i % 10);
+		removed += rmdir(path) == 0;
+		if (i % 10 == 0) {
+			snprintf(path, sizeof(path), "/cg/s/%d/%d", i / 100, i / 10 % 10);
+			removed += rmdir(path) == 0;
+		}
+		if (i % 100 == 0) {
+			snprintf(path, sizeof(path), "/cg/s/%d", i / 100);
+			removed += rmdir(path) == 0;
+		}
+	}
+	check("cgroup stop: rmdir removes the cgroups", removed == made && rmdir("/cg/s") == 0);
+}
+
 /* Checks the io controller: io.stat, io.max and io.weight. */
 static void test_cgroup_io(void)
 {
@@ -5551,6 +5644,11 @@ static void test_cgroup_io(void)
 								 cg_io_value("/cg/t", "wbytes=") >= before + 65536 &&
 								 cg_io_value("/cg/t", "wios=") > 0 &&
 								 cg_io_value("/cg", "wbytes=") >= 65536);
+	/* The exit of the last task lets rmdir remove the cgroup, also with charges of page cache, as
+	 * the offline of a memory cgroup in mm/memcontrol.c of Linux. */
+	check("rmdir removes a cgroup with charges of page cache",
+	      mkdir("/cg/t/pc", 0755) == 0 && (status = wait_status(cgroup_child("/cg/t/pc", cg_cache)), WIFEXITED(status)) &&
+		      WEXITSTATUS(status) == 0 && cg_value("/cg/t/pc/memory.current", "") > 0 && rmdir("/cg/t/pc") == 0);
 	check("io.max takes a limit", cg_write("/cg/t/io.max", "254:0 wbps=65536") == 0 &&
 					      read_file("/cg/t/io.max", buf, sizeof(buf)) > 0 &&
 					      strcmp(buf, "254:0 rbps=max wbps=65536 riops=max wiops=max\n") == 0);
@@ -5838,6 +5936,7 @@ static void test_cgroup(void)
 	test_cgroup_io();
 	test_cgroup_threaded();
 	test_cgroup_delegation();
+	test_cgroup_stop();
 	check("rmdir removes the cgroups", rmdir("/cg/t/a") == 0 && rmdir("/cg/t") == 0);
 	umount("/cg");
 	rmdir("/cg");

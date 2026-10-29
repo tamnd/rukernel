@@ -304,12 +304,14 @@ struct Node {
     nr_descendants: u32,
     /// The processes in this cgroup, without the subtree.
     nr_procs: u32,
+    /// The children whose subtree has a task, as `nr_populated_domain_children` and
+    /// `nr_populated_threaded_children` of Linux together.
+    nr_populated_children: u32,
     /// `cgroup.freeze`: the freeze of this cgroup. The threads of the subtree freeze.
     freeze: bool,
     /// The threads of this cgroup, without the subtree, that wait in the freezer.
     nr_frozen: u64,
-    /// The values of `cgroup.events` at the last change: `populated` and `frozen`.
-    ev_populated: bool,
+    /// The value of `frozen` of `cgroup.events` at the last change.
     ev_frozen: bool,
     /// The count of the changes of `cgroup.events`, for `poll`.
     ev_seq: u64,
@@ -343,9 +345,9 @@ impl Node {
             max_descendants: u32::MAX,
             nr_descendants: 0,
             nr_procs: 0,
+            nr_populated_children: 0,
             freeze: false,
             nr_frozen: 0,
-            ev_populated: false,
             ev_frozen: false,
             ev_seq: 1,
             files_seq: 1,
@@ -811,8 +813,7 @@ impl Hierarchy {
     /// Tells if the subtree of `id` has a process or a thread, the `populated` value of
     /// `cgroup.events`.
     pub fn populated(&self, id: CgId) -> bool {
-        let Some(n) = self.nodes.get(&id) else { return false };
-        n.nr_procs > 0 || n.pids > 0 || n.children.values().any(|&c| self.populated(c))
+        self.nodes.get(&id).is_some_and(|n| n.nr_populated_children > 0) || self.has_tasks(id)
     }
 
     /// The threads of `id` without the threads of its subtree.
@@ -955,9 +956,9 @@ impl Hierarchy {
         }
     }
 
-    /// Computes `populated` and `frozen` of `cgroup.events` again for each cgroup after a
-    /// change, as `cgroup_update_populated` and `cgroup_update_frozen` of Linux. A cgroup whose
-    /// values change counts a change for `poll`.
+    /// Computes `frozen` of `cgroup.events` again for each cgroup after a change, as
+    /// `cgroup_update_frozen` of Linux. A cgroup whose value changes counts a change for `poll`.
+    /// `populated` changes at once in `update_populated`.
     pub fn refresh_events(&mut self) {
         if !self.dirty {
             return;
@@ -973,24 +974,19 @@ impl Hierarchy {
             let up = freezing.get(&n.parent).copied().unwrap_or(false);
             freezing.insert(id, n.freeze || up);
         }
-        // For each cgroup: a child is populated, each child is frozen, and the threads of the
-        // children.
-        let mut below: BTreeMap<CgId, (bool, bool, u64)> = BTreeMap::new();
+        // For each cgroup: each child is frozen, and the threads of the children.
+        let mut below: BTreeMap<CgId, (bool, u64)> = BTreeMap::new();
         for &id in ids.iter().rev() {
-            let (child_populated, children_frozen, child_pids) =
-                below.remove(&id).unwrap_or((false, true, 0));
+            let (children_frozen, child_pids) = below.remove(&id).unwrap_or((true, 0));
             let n = &self.nodes[&id];
             let own = n.pids.saturating_sub(child_pids);
-            let populated = n.nr_procs > 0 || own > 0 || child_populated;
             let frozen = freezing[&id] && n.nr_frozen >= own && children_frozen;
             let (parent, pids) = (n.parent, n.pids);
-            let p = below.entry(parent).or_insert((false, true, 0));
-            p.0 |= populated;
-            p.1 &= frozen;
-            p.2 += pids;
+            let p = below.entry(parent).or_insert((true, 0));
+            p.0 &= frozen;
+            p.1 += pids;
             let Some(n) = self.nodes.get_mut(&id) else { continue };
-            if n.ev_populated != populated || n.ev_frozen != frozen {
-                n.ev_populated = populated;
+            if n.ev_frozen != frozen {
                 n.ev_frozen = frozen;
                 n.ev_seq += 1;
                 self.notify = true;
@@ -1172,14 +1168,48 @@ impl Hierarchy {
         self.tasks_changed(id, had);
     }
 
-    /// Marks `cgroup.events` for `refresh_events` after a change of the tasks of `id`, if a
-    /// value can change: `id` got its first task or lost its last one, or a cgroup is frozen.
-    /// The cgroups above `id` keep their own tasks, as their counts and the counts of their
-    /// children change together. `refresh_events` goes over each cgroup, and a mark at each
-    /// fork and exit made each of them slow with thousands of cgroups.
+    /// Updates `cgroup.events` after a change of the tasks of `id`. When `id` gets its first
+    /// task or loses its last one, `update_populated` changes `populated`. The cgroups above
+    /// `id` keep their own tasks, as their counts and the counts of their children change
+    /// together. `frozen` can change only when a cgroup is frozen, and only then
+    /// `refresh_events` must go over each cgroup.
     fn tasks_changed(&mut self, id: CgId, had_tasks: bool) {
-        if self.nr_freeze > 0 || self.has_tasks(id) != had_tasks {
+        let has = self.has_tasks(id);
+        if has != had_tasks {
+            self.update_populated(id, had_tasks);
+        }
+        if self.nr_freeze > 0 {
             self.dirty = true;
+        }
+    }
+
+    /// Changes `populated` of `id` and of the cgroups above it after `id` got its first task
+    /// or lost its last one, as `cgroup_update_populated` in kernel/cgroup/cgroup.c of Linux.
+    /// `had_tasks` tells if `id` had tasks before. The walk goes up while the value of a cgroup
+    /// changes, so an exit does not look at the other cgroups.
+    fn update_populated(&mut self, id: CgId, had_tasks: bool) {
+        let mut at = id;
+        let mut was = had_tasks || self.nodes.get(&id).is_some_and(|n| n.nr_populated_children > 0);
+        loop {
+            let now = self.populated(at);
+            if now == was {
+                return;
+            }
+            let Some(n) = self.nodes.get_mut(&at) else { return };
+            n.ev_seq += 1;
+            self.notify = true;
+            let parent = n.parent;
+            if parent == 0 {
+                return;
+            }
+            was = self.populated(parent);
+            let Some(p) = self.nodes.get_mut(&parent) else { return };
+            if now {
+                p.nr_populated_children += 1;
+            } else {
+                p.nr_populated_children = p.nr_populated_children.saturating_sub(1);
+            }
+            at = parent;
         }
     }
 
@@ -1660,7 +1690,8 @@ impl Hierarchy {
         let cpu_on = self.on(id, CPU);
         let populated = self.populated(id);
         let frozen = self.events_frozen(id);
-        let dying = self.nr_dying(id);
+        // The count goes over each cgroup, so only cgroup.stat counts.
+        let dying = if name == "cgroup.stat" { self.nr_dying(id) } else { 0 };
         let cpus = self.effective_cpus(id);
         let mems = self.effective_mems(id);
         let type_name = self.type_name(id);
