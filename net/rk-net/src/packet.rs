@@ -14,13 +14,16 @@
 //! When the device of a bound socket goes down, the socket gets the error `ENETDOWN` and no
 //! frames, as `packet_notifier` of Linux. When the device goes away, the socket has no device,
 //! and a send gives `ENXIO`.
+//!
+//! A socket can have a mapped receive ring and a mapped transmit ring, as `PACKET_RX_RING` and
+//! `PACKET_TX_RING` of Linux. The module `ring` has them.
 
 use crate::buf::NetBuf;
 use crate::consts::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW};
 use crate::dev::{self, Event, LinkKind, NetDevice};
 use crate::ether::{EthHeader, HLEN, MacAddr};
-use crate::options::Options;
-use crate::{Message, PathOps, Received, Socket, next_ino, ns, wait_for};
+use crate::options::{Options, hz, now};
+use crate::{Message, PathOps, Received, Socket, SocketMap, next_ino, ns, wait_for};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -39,6 +42,12 @@ use rk_vfs::wait::{PollTable, WaitQueue};
 /// The family of the packet sockets, `AF_PACKET` of <linux/socket.h>.
 pub const AF_PACKET: u32 = 17;
 
+mod ring;
+#[cfg(test)]
+mod tests;
+
+use ring::{Packet, Req, Ring, Stats, TPACKET_V1, TPACKET_V2, TPACKET_V3};
+
 /// The size of `struct sockaddr_ll` of <linux/if_packet.h>.
 const SOCKADDR_LL: usize = 20;
 
@@ -47,10 +56,15 @@ pub const SOL_PACKET: u32 = 263;
 /// The options `PACKET_ADD_MEMBERSHIP` and `PACKET_DROP_MEMBERSHIP` of <linux/if_packet.h>.
 const PACKET_ADD_MEMBERSHIP: u32 = 1;
 const PACKET_DROP_MEMBERSHIP: u32 = 2;
-/// The option `PACKET_VERSION` of <linux/if_packet.h>: the format of the mapped rings.
+/// The options of the mapped rings of <linux/if_packet.h>.
+const PACKET_RX_RING: u32 = 5;
+const PACKET_STATISTICS: u32 = 6;
 const PACKET_VERSION: u32 = 10;
-/// The ring format `TPACKET_V1` of <linux/if_packet.h>, the default.
-const TPACKET_V1: i32 = 0;
+const PACKET_HDRLEN: u32 = 11;
+const PACKET_RESERVE: u32 = 12;
+const PACKET_TX_RING: u32 = 13;
+const PACKET_LOSS: u32 = 14;
+const PACKET_TIMESTAMP: u32 = 17;
 
 /// The types of a received frame, `PACKET_*` of <linux/if_packet.h>: to this host.
 pub const PACKET_HOST: u8 = 0;
@@ -85,6 +99,19 @@ struct Queued {
     addr: [u8; SOCKADDR_LL],
 }
 
+/// The options of the rings of a socket.
+#[derive(Default)]
+struct RingCfg {
+    /// The format of the rings, `PACKET_VERSION`.
+    version: i32,
+    /// The free space before the link header in each frame, `PACKET_RESERVE`.
+    reserve: u32,
+    /// A transmit ring skips a bad frame, `PACKET_LOSS`.
+    loss: bool,
+    /// The value of `PACKET_TIMESTAMP`. The frames always have a software time stamp.
+    tstamp: i32,
+}
+
 /// The packet sockets of all namespaces, for `tap`.
 static SOCKETS: SpinLock<Vec<Weak<PacketSocket>>> = SpinLock::new(Vec::new());
 /// The count of packet sockets, so that `tap` does nothing when there is none.
@@ -111,6 +138,17 @@ pub struct PacketSocket {
     /// The received frames, and the memory that they use.
     queue: SpinLock<(VecDeque<Queued>, usize)>,
     events: AtomicU64,
+    /// The options of the rings. The lock comes before the locks of the rings.
+    cfg: SpinLock<RingCfg>,
+    /// The receive ring. Its lock comes before the lock of the transmit ring.
+    rx: SpinLock<Option<Ring>>,
+    /// The transmit ring.
+    tx: SpinLock<Option<Ring>>,
+    /// The counts of `PACKET_STATISTICS`.
+    stats: Stats,
+    /// Each mapping of the rings holds a clone, so the socket is mapped while the count is more
+    /// than 1, as `po->mapped` of Linux.
+    maps: Arc<()>,
 }
 
 impl Drop for PacketSocket {
@@ -141,6 +179,11 @@ impl PacketSocket {
             net: ns::current_index(),
             queue: SpinLock::new((VecDeque::new(), 0)),
             events: AtomicU64::new(0),
+            cfg: SpinLock::new(RingCfg::default()),
+            rx: SpinLock::new(None),
+            tx: SpinLock::new(None),
+            stats: Stats::default(),
+            maps: Arc::new(()),
         });
         COUNT.fetch_add(1, Ordering::Relaxed);
         let mut list = SOCKETS.lock();
@@ -173,13 +216,11 @@ impl PacketSocket {
         }
     }
 
-    /// Puts a copy of `frame` in the queue, as `packet_rcv` of Linux. A full queue drops it.
+    /// Puts a copy of `frame` in the queue, as `packet_rcv` of Linux. A full queue drops it. A
+    /// socket with a receive ring puts the frame in the ring, as `tpacket_rcv` of Linux.
     fn queue(&self, dev: &NetDevice, frame: &[u8], h: &EthHeader, pkttype: u8) {
-        let data = if self.kind == SOCK_DGRAM || !dev.kind().has_header() {
-            &frame[HLEN..]
-        } else {
-            frame
-        };
+        let raw = self.kind == SOCK_RAW && dev.kind().has_header();
+        let data = if !raw { &frame[HLEN..] } else { frame };
         let mut addr = [0u8; SOCKADDR_LL];
         addr[..2].copy_from_slice(&(AF_PACKET as u16).to_ne_bytes());
         addr[2..4].copy_from_slice(&h.ethertype.to_be_bytes());
@@ -190,19 +231,226 @@ impl PacketSocket {
             addr[11] = 6;
             addr[12..18].copy_from_slice(&h.src.0);
         }
+        {
+            let mut rx = self.rx.lock();
+            if let Some(ring) = rx.as_mut() {
+                let p = Packet {
+                    data,
+                    maclen: if raw { HLEN } else { 0 },
+                    dgram: self.kind == SOCK_DGRAM,
+                    addr: &addr,
+                };
+                if !ring.receive(&p, &self.stats, now()) {
+                    self.stats.drops.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                drop(rx);
+                self.events.fetch_add(1, Ordering::Relaxed);
+                self.wait.wake_all();
+                return;
+            }
+        }
         let size = data.len() + FRAME_OVERHEAD;
         let limit = self.options.lock().rcvbuf as usize;
         {
             let mut q = self.queue.lock();
             if q.1 + size > limit && !q.0.is_empty() {
+                self.stats.drops.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             q.0.push_back(Queued { data: data.to_vec(), addr });
             q.1 += size;
+            self.stats.packets.fetch_add(1, Ordering::Relaxed);
         }
         self.events.fetch_add(1, Ordering::Relaxed);
         self.wait.wake_all();
     }
+
+    /// Tells if a mapping of the rings exists.
+    fn mapped(&self) -> bool {
+        Arc::strong_count(&self.maps) > 1
+    }
+
+    /// Makes or removes a ring, as `packet_set_ring` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EBUSY` if the rings are mapped or the ring exists, and the errors of `Ring::new`.
+    fn set_ring(&self, value: &[u8], tx: bool) -> Result<()> {
+        let cfg = self.cfg.lock();
+        let req = Req::parse(cfg.version, value)?;
+        let mut rx = self.rx.lock();
+        let mut txr = self.tx.lock();
+        if self.mapped() {
+            return Err(Errno::EBUSY);
+        }
+        let slot = if tx { &mut *txr } else { &mut *rx };
+        if req.removes() {
+            req.check_remove()?;
+            *slot = None;
+            return Ok(());
+        }
+        if slot.is_some() {
+            return Err(Errno::EBUSY);
+        }
+        let ring = Ring::new(cfg.version, cfg.reserve, &req, tx, now(), hz())?;
+        let timed = ring.deadline().is_some();
+        *slot = Some(ring);
+        if timed {
+            retire::start();
+        }
+        Ok(())
+    }
+
+    /// Sends the frames of the transmit ring that the program asks to send, as `tpacket_snd` of
+    /// Linux. Gives the count of bytes, or `None` if the socket has no transmit ring.
+    fn send_ring(&self, ifindex: u32, protocol: u16, dst: MacAddr) -> Option<Result<usize>> {
+        let loss = self.cfg.lock().loss;
+        let mut tx = self.tx.lock();
+        let ring = tx.as_mut()?;
+        let Some(dev) = dev::by_index(ifindex) else { return Some(Err(Errno::ENXIO)) };
+        if !dev.is_up() {
+            return Some(Err(Errno::ENETDOWN));
+        }
+        // The largest packet: the frame without its header, and no more than the MTU with the
+        // link header, as `tpacket_snd`.
+        let raw = self.kind == SOCK_RAW && dev.kind().has_header();
+        let max = ring.send_max().min(dev.mtu() as usize + if raw { HLEN } else { 0 } + 4);
+        let mut total = 0usize;
+        while let Some(next) = ring.take_send(max) {
+            let (at, data) = match next {
+                Ok(v) => v,
+                Err((at, e)) => {
+                    if loss {
+                        ring.set_status(at, ring::TP_STATUS_AVAILABLE);
+                        ring.advance();
+                        continue;
+                    }
+                    ring.set_status(at, ring::TP_STATUS_WRONG_FORMAT);
+                    return Some(Err(e));
+                }
+            };
+            let len = data.len();
+            let frame = match self.frame_for(&dev, data, protocol, dst) {
+                Ok(f) => f,
+                Err(e) => {
+                    if loss {
+                        ring.set_status(at, ring::TP_STATUS_AVAILABLE);
+                        ring.advance();
+                        continue;
+                    }
+                    ring.set_status(at, ring::TP_STATUS_WRONG_FORMAT);
+                    return Some(Err(e));
+                }
+            };
+            if let Err(e) = dev.transmit_from(frame, self.ino) {
+                ring.set_status(at, ring::TP_STATUS_SEND_REQUEST);
+                return Some(Err(e));
+            }
+            ring.set_status(at, ring::TP_STATUS_AVAILABLE);
+            ring.advance();
+            total += len;
+        }
+        Some(Ok(total))
+    }
+
+    /// Makes the frame that `dev` sends for `data`. A `SOCK_RAW` socket gives the whole frame. A
+    /// `SOCK_DGRAM` socket gives the payload, and the kernel adds the link header. A device
+    /// without a link header takes the payload from both types.
+    fn frame_for(
+        &self,
+        dev: &NetDevice,
+        data: Vec<u8>,
+        protocol: u16,
+        dst: MacAddr,
+    ) -> Result<NetBuf> {
+        let len = data.len();
+        let mut frame = NetBuf::new(HLEN, len);
+        frame.put(len).copy_from_slice(&data);
+        if !dev.kind().has_header() {
+            let h = EthHeader {
+                dst: MacAddr::ZERO,
+                src: MacAddr::ZERO,
+                ethertype: u16::from_be(protocol),
+            };
+            h.push(&mut frame);
+        } else if self.kind == SOCK_DGRAM {
+            let h = EthHeader { dst, src: dev.mac(), ethertype: u16::from_be(protocol) };
+            h.push(&mut frame);
+        } else if len < HLEN {
+            return Err(Errno::EINVAL);
+        }
+        Ok(frame)
+    }
+
+    /// Runs the retire timer of the receive ring. Gives the tick of the next run, or `None` if the
+    /// ring has no timer.
+    #[cfg_attr(
+        not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
+    fn retire(&self, now: u64) -> Option<u64> {
+        let mut rx = self.rx.lock();
+        let ring = rx.as_mut()?;
+        let woke = ring.expire(&self.stats, now);
+        let next = ring.deadline();
+        drop(rx);
+        if woke {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            self.wait.wake_all();
+        }
+        next
+    }
+}
+
+/// The retire timer of the `TPACKET_V3` receive rings, as `prb_retire_rx_blk_timer_expired` of
+/// Linux. One kernel task runs the timers of all rings. It waits until the earliest deadline.
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+mod retire {
+    use super::{PacketSocket, SOCKETS};
+    use alloc::sync::{Arc, Weak};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use rk_frame::sync::Once;
+    use rk_frame::task::{TaskOptions, WaitQueue};
+
+    /// The count of new rings. The task waits until it changes or a deadline comes.
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    static WAKE: WaitQueue = WaitQueue::new();
+    static STARTED: Once<()> = Once::new();
+
+    /// Starts the task the first time that a ring has a timer, and tells it of a new ring.
+    pub(super) fn start() {
+        STARTED.call_once(|| {
+            let _ = TaskOptions::new(run).spawn();
+        });
+        EPOCH.fetch_add(1, Ordering::Release);
+        WAKE.wake_all();
+    }
+
+    fn run() {
+        loop {
+            let epoch = EPOCH.load(Ordering::Acquire);
+            let now = rk_frame::time::ticks();
+            let list: Vec<Arc<PacketSocket>> =
+                SOCKETS.lock().iter().filter_map(Weak::upgrade).collect();
+            let next = list.iter().filter_map(|s| s.retire(now)).min();
+            drop(list);
+            let changed = || (EPOCH.load(Ordering::Acquire) != epoch).then_some(());
+            match next {
+                Some(deadline) => {
+                    WAKE.wait_until_timeout(deadline, changed);
+                }
+                None => WAKE.wait_until(changed),
+            }
+        }
+    }
+}
+
+/// No task runs the retire timers on a machine without tasks.
+#[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+mod retire {
+    pub(super) fn start() {}
 }
 
 /// Takes the change `event` of `dev` for the sockets that are bound to it, as `packet_notifier` of
@@ -317,9 +565,7 @@ impl Socket for PacketSocket {
         Ok(())
     }
 
-    /// Sends one frame, as `packet_snd` of Linux. A `SOCK_RAW` socket gives the whole frame. A
-    /// `SOCK_DGRAM` socket gives the payload, and the kernel adds the link header. A device
-    /// without a link header takes the payload from both types.
+    /// Sends one frame, as `packet_snd` of Linux. `frame_for` makes the frame.
     fn send(
         &self,
         _paths: &dyn PathOps,
@@ -334,24 +580,14 @@ impl Socket for PacketSocket {
             Some(a) if !a.is_empty() => parse_addr(a)?,
             _ => (self.protocol() as u16, self.ifindex.load(Ordering::Relaxed), MacAddr::BROADCAST),
         };
+        // A socket with a transmit ring sends the frames of the ring, as `packet_sendmsg`.
+        if let Some(r) = self.send_ring(ifindex, protocol, dst) {
+            return r;
+        }
         // No device gives `ENXIO`, as Linux.
         let dev = dev::by_index(ifindex).ok_or(Errno::ENXIO)?;
         let len = msg.data.len();
-        let mut frame = NetBuf::new(HLEN, len);
-        frame.put(len).copy_from_slice(&msg.data);
-        if !dev.kind().has_header() {
-            let h = EthHeader {
-                dst: MacAddr::ZERO,
-                src: MacAddr::ZERO,
-                ethertype: u16::from_be(protocol),
-            };
-            h.push(&mut frame);
-        } else if self.kind == SOCK_DGRAM {
-            let h = EthHeader { dst, src: dev.mac(), ethertype: u16::from_be(protocol) };
-            h.push(&mut frame);
-        } else if len < HLEN {
-            return Err(Errno::EINVAL);
-        }
+        let frame = self.frame_for(&dev, msg.data, protocol, dst)?;
         dev.transmit_from(frame, self.ino)?;
         Ok(len)
     }
@@ -407,8 +643,16 @@ impl Socket for PacketSocket {
 
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
         if level == SOL_PACKET {
+            let int = |v: i32| v.to_ne_bytes().to_vec();
+            let cfg = self.cfg.lock();
             return match name {
-                PACKET_VERSION => Ok(TPACKET_V1.to_ne_bytes().to_vec()),
+                PACKET_VERSION => Ok(int(cfg.version)),
+                PACKET_RESERVE => Ok(int(cfg.reserve as i32)),
+                PACKET_LOSS => Ok(int(i32::from(cfg.loss))),
+                PACKET_TIMESTAMP => Ok(int(cfg.tstamp)),
+                PACKET_STATISTICS => Ok(self.stats.take(cfg.version)),
+                // `PACKET_HDRLEN` reads the version from the value, see `get_option_in`.
+                PACKET_HDRLEN => Err(Errno::EINVAL),
                 _ => Err(Errno::ENOPROTOOPT),
             };
         }
@@ -437,13 +681,31 @@ impl Socket for PacketSocket {
                         u32::from_ne_bytes([ifindex[0], ifindex[1], ifindex[2], ifindex[3]]);
                     dev::by_index(ifindex).map(|_| ()).ok_or(Errno::ENODEV)
                 }
-                // rukernel has no mapped rings (`PACKET_RX_RING`), so only `TPACKET_V1`, the
-                // format of a socket without a ring, is accepted. `TPACKET_V2` and `TPACKET_V3`
-                // give `EINVAL`, as an unknown version gives in `packet_setsockopt` of Linux,
-                // and a program such as setsockopt02 of LTP then knows that they are missing.
-                PACKET_VERSION => {
+                PACKET_RX_RING | PACKET_TX_RING => self.set_ring(value, name == PACKET_TX_RING),
+                // The options of the rings, as `packet_setsockopt` of Linux. The value must be
+                // an `int`, and a socket with a ring cannot change the format or the reserve.
+                PACKET_VERSION | PACKET_RESERVE | PACKET_LOSS | PACKET_TIMESTAMP => {
                     let v: [u8; 4] = value.try_into().map_err(|_| Errno::EINVAL)?;
-                    if i32::from_ne_bytes(v) == TPACKET_V1 { Ok(()) } else { Err(Errno::EINVAL) }
+                    let v = i32::from_ne_bytes(v);
+                    let mut cfg = self.cfg.lock();
+                    if name == PACKET_TIMESTAMP {
+                        cfg.tstamp = v;
+                        return Ok(());
+                    }
+                    if self.rx.lock().is_some() || self.tx.lock().is_some() {
+                        return Err(Errno::EBUSY);
+                    }
+                    match name {
+                        PACKET_VERSION if matches!(v, TPACKET_V1 | TPACKET_V2 | TPACKET_V3) => {
+                            cfg.version = v;
+                        }
+                        PACKET_VERSION => return Err(Errno::EINVAL),
+                        // A negative `int` is more than `INT_MAX` as the `unsigned int` of Linux.
+                        PACKET_RESERVE if v < 0 => return Err(Errno::EINVAL),
+                        PACKET_RESERVE => cfg.reserve = v as u32,
+                        _ => cfg.loss = v != 0,
+                    }
+                    Ok(())
                 }
                 _ => Err(Errno::ENOPROTOOPT),
             };
@@ -457,8 +719,54 @@ impl Socket for PacketSocket {
         }
     }
 
+    /// `PACKET_HDRLEN` reads an `int`, the version.
+    fn option_input(&self, level: u32, name: u32) -> usize {
+        if level == SOL_PACKET && name == PACKET_HDRLEN { 4 } else { 0 }
+    }
+
+    /// Gives the size of the frame header of a version for `PACKET_HDRLEN`, as
+    /// `packet_getsockopt` of Linux.
+    fn get_option_in(&self, level: u32, name: u32, input: &[u8]) -> Result<Vec<u8>> {
+        if level != SOL_PACKET || name != PACKET_HDRLEN {
+            return self.get_option(level, name);
+        }
+        let v: [u8; 4] =
+            input.get(..4).ok_or(Errno::EINVAL)?.try_into().map_err(|_| Errno::EINVAL)?;
+        let size = ring::header_size(i32::from_ne_bytes(v)).ok_or(Errno::EINVAL)?;
+        Ok((size as i32).to_ne_bytes().to_vec())
+    }
+
+    /// Maps the receive ring and then the transmit ring, as `packet_mmap` of Linux. The mapping
+    /// must start at 0 and have the size of the rings.
+    fn mmap(&self, offset: u64, len: usize) -> Result<SocketMap> {
+        if offset != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let rx = self.rx.lock();
+        let tx = self.tx.lock();
+        let pages: Vec<&ring::Page> =
+            rx.iter().chain(tx.iter()).flat_map(|r| r.pages().iter()).collect();
+        if pages.is_empty() || pages.len() * rk_frame::addr::PAGE_SIZE != len {
+            return Err(Errno::EINVAL);
+        }
+        #[cfg(target_os = "none")]
+        let frames: Vec<Arc<rk_frame::mm::Frame>> = pages.iter().map(|&p| p.clone()).collect();
+        let hold: Arc<dyn Any + Send + Sync> = self.maps.clone();
+        Ok(SocketMap {
+            #[cfg(target_os = "none")]
+            frames,
+            pages: pages.len(),
+            hold,
+        })
+    }
+
     fn poll(&self) -> u32 {
-        let read = if self.queue.lock().0.is_empty() { 0 } else { POLLIN | POLLRDNORM };
+        let ring = self.rx.lock().as_ref().map(Ring::readable);
+        let ready = match ring {
+            Some(r) => r,
+            None => !self.queue.lock().0.is_empty(),
+        };
+        let read = if ready { POLLIN | POLLRDNORM } else { 0 };
         let err = if self.err.load(Ordering::Relaxed) != 0 { POLLERR } else { 0 };
         read | err | POLLOUT | POLLWRNORM | POLLWRBAND
     }
