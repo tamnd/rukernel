@@ -122,6 +122,12 @@ pub struct Vma<F> {
     /// `MADV_WIPEONFORK`: a child of `fork` gets the area without its pages, so each page is
     /// zero there. Linux names it `VM_WIPEONFORK`.
     pub wipe_on_fork: bool,
+    /// The anonymous pages of a parent of `fork`. A child gets a new value that is not 0 for each
+    /// private area, and the pieces of the area keep it. 0 tells that the area did not come from
+    /// `fork`. Linux keeps an `anon_vma` for each area, and the chain of an area that a child got
+    /// from `fork` also has the `anon_vma` of the parent, so the area does not merge with an area
+    /// of another `anon_vma` (`vma_had_uncowed_parents` in mm/vma.c).
+    pub fork_anon: u64,
     /// What the area holds.
     pub backing: Backing<F>,
     /// What the area is for.
@@ -145,6 +151,7 @@ impl<F: Clone> Vma<F> {
             hugetlb: false,
             dont_fork: false,
             wipe_on_fork: false,
+            fork_anon: 0,
             backing: Backing::Anon,
             kind,
         }
@@ -200,12 +207,15 @@ impl<F: PartialEq> Vma<F> {
             && self.hugetlb == other.hugetlb
             && self.dont_fork == other.dont_fork
             && self.wipe_on_fork == other.wipe_on_fork
+            && self.fork_anon == other.fork_anon
             && self.kind == other.kind
     }
 
     /// Tells if `self` and `other` can be one area when they touch, as `is_mergeable_vma` and
     /// `is_mergeable_anon_vma` in mm/vma.c of Linux. They have the same mapping, and they are not
-    /// hugetlb areas, which Linux marks `VM_DONTEXPAND` so that they do not merge.
+    /// hugetlb areas, which Linux marks `VM_DONTEXPAND` so that they do not merge. The same
+    /// mapping includes [`Vma::fork_anon`], so an area that a child got from `fork` merges only
+    /// with the other pieces of the same area.
     pub fn can_merge(&self, other: &Self) -> bool {
         !self.hugetlb && self.same_mapping(other)
     }
@@ -469,6 +479,26 @@ mod tests {
         assert_eq!(ranges(&s), [(5, 30), (30, 40), (40, 50)]);
     }
 
+    #[test]
+    fn an_area_from_fork_joins_only_its_own_pieces() {
+        // vma01 of LTP: the area that a child got from `fork` does not join a new area next to it.
+        let mut s = VmaSet::new();
+        s.insert(Vma { fork_anon: 1, ..Vma::anon(10 * P, 20 * P, Prot::RW, VmaKind::Normal) });
+        s.insert_merged(Vma::anon(20 * P, 30 * P, Prot::RW, VmaKind::Normal));
+        assert_eq!(ranges(&s), [(10, 20), (20, 30)]);
+        // Two areas from `fork` that were two areas in the parent do not join.
+        s.insert_merged(Vma {
+            fork_anon: 2,
+            ..Vma::anon(5 * P, 10 * P, Prot::RW, VmaKind::Normal)
+        });
+        assert_eq!(ranges(&s), [(5, 10), (10, 20), (20, 30)]);
+        // The pieces of one area from `fork` join again.
+        s.update_range_merged(12 * P, 15 * P, |v| v.prot.write = false);
+        assert_eq!(ranges(&s), [(5, 10), (10, 12), (12, 15), (15, 20), (20, 30)]);
+        s.update_range_merged(12 * P, 15 * P, |v| v.prot.write = true);
+        assert_eq!(ranges(&s), [(5, 10), (10, 20), (20, 30)]);
+    }
+
     fn file_area(start: usize, end: usize, file: u32, offset: usize) -> Vma<u32> {
         Vma {
             backing: Backing::File { file, offset: (offset * P) as u64 },
@@ -570,6 +600,7 @@ mod tests {
             hugetlb: false,
             dont_fork: false,
             wipe_on_fork: false,
+            fork_anon: 0,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,
         });

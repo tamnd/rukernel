@@ -3,11 +3,9 @@
 
 use crate::cx::{Cx, SysResult};
 use rk_abi::Errno;
-use rk_abi::native::open::O_RDONLY;
 use rk_proc::Process;
 use rk_vfs::cred::cap;
 use rk_vfs::nsfs::{NsInode, NsKind};
-use rk_vfs::{File, Location};
 
 /// `NS_GET_USERNS` of include/uapi/linux/nsfs.h.
 const NS_GET_USERNS: u32 = 0xb701;
@@ -28,19 +26,13 @@ const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
 /// `NS_GET_TGID_IN_PIDNS`: `_IOR(0xb7, 9, int)`.
 const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
 
-/// Opens a file of the namespace with `O_CLOEXEC`, as `open_related_ns` of Linux.
-fn open_ns(cx: &Cx<'_>, kind: NsKind, id: u32) -> SysResult {
-    let file = File::open_inode(Location::detached(NsInode::new(kind, id)), O_RDONLY);
-    Ok(cx.files()?.lock().insert(file, true)? as u64)
-}
-
 /// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. rukernel has
 /// only the user namespace and the PID namespace of the system, so these have no parent.
 pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
-        // The owner of each namespace is the user namespace of the system, which has no owner.
-        NS_GET_USERNS if kind == NsKind::User => Err(Errno::EPERM),
-        NS_GET_USERNS => open_ns(cx, NsKind::User, 0),
+        // rukernel has no user namespace files, as Linux without `CONFIG_USER_NS`, where
+        // `ns_get_owner` gives `EPERM`.
+        NS_GET_USERNS => Err(Errno::EPERM),
         NS_GET_PARENT if matches!(kind, NsKind::Pid | NsKind::User) => Err(Errno::EPERM),
         NS_GET_PARENT => Err(Errno::EINVAL),
         NS_GET_NSTYPE => Ok(kind.clone_flag()),

@@ -8,6 +8,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The page table of a process has a lock for each 2 MiB block, as the split page table locks of Linux (`pte_lockptr` in include/linux/mm.h), and a new upper table goes in with a compare and swap, as `pmd_install` in mm/memory.c (#468). Page faults in two blocks of one process do not wait for each other. The areas of the VMA backend have a read-write lock, as `mmap_lock`, and a fault takes it for a read.
 - The frame allocator and the heap keep a list of free frames and of free objects for each CPU, as the per-CPU pagesets of mm/page_alloc.c (#468). A list takes and gives back a batch of 32 frames or 16 objects under the global lock. An allocation that finds no free frame or no free run takes back the lists of all the CPUs first.
+- `futex_waitv`, as `sys_futex_waitv` in kernel/futex/syscalls.c of Linux (#475). A thread waits on up to 128 futexes of 32 bits, private or shared, with an absolute timeout of `CLOCK_MONOTONIC` or `CLOCK_REALTIME`, and gets the index of the futex that a wake woke. `FUTEX2_NUMA` gives `EINVAL`. Before, the call gave `ENOSYS`, futex_waitv02 and futex_waitv03 stopped with TCONF while their thread still used the memory that the cleanup freed, and the thread got `EFAULT` or SIGSEGV.
+- /proc/PID/coredump_filter, as fs/proc/base.c of Linux (#475). The default is `00000033`, a write takes a number in the base of its prefix and keeps the 9 bits of the filter, and a child of `fork` gets the value of its parent. madvise08 now reads the file, but it still stops with TBROK because rukernel writes no core dump.
+
+### Fixed
+
+- After a `fork`, a private area that the child got does not merge with a new area next to it, as `is_mergeable_anon_vma` in mm/vma.c of Linux, because its `anon_vma` chain is not singular (#475). The pieces of one such area still merge again after an `mprotect` and back. LTP vma01 failed since the area merge of #405.
+- /proc/PID/ns has no `user` link, as Linux without `CONFIG_USER_NS`, because rukernel cannot make a user namespace (#475). `NS_GET_USERNS` gives `EPERM` and `setns` of a pidfd with `CLONE_NEWUSER` gives `EINVAL`, as on that Linux. getxattr05 found the link and then got `EINVAL` from `unshare(CLONE_NEWUSER)`. ioctl_ns04 now gives TBROK, as on that Linux, because its setup reports TCONF and does not stop the test.
+- `PACKET_VERSION` of `AF_PACKET` sockets takes `TPACKET_V1` and `getsockopt` gives it (#475). `TPACKET_V2` and `TPACKET_V3` give `EINVAL`, because there are no mapped rings yet, so setsockopt02 reports TCONF and not `ENOPROTOOPT`.
 
 ## [0.4.13] - 2026-10-29
 

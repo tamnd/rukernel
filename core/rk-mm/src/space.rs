@@ -13,7 +13,7 @@ use crate::vma::{
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
@@ -433,6 +433,12 @@ fn accounted<'a>(vmas: impl Iterator<Item = &'a Vma<FileRef>>) -> usize {
     vmas.filter(|v| v.account).map(Vma::len).sum()
 }
 
+/// Gives a new value for [`Vma::fork_anon`]. It is never 0.
+fn next_fork_anon() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 impl AddressSpace {
     /// Makes an empty address space. Gives `ENOMEM` if no frame is free for the page table.
     pub fn new() -> Result<Self, Errno> {
@@ -652,6 +658,7 @@ impl AddressSpace {
             hugetlb,
             dont_fork: false,
             wipe_on_fork: false,
+            fork_anon: 0,
             backing,
             kind: req.kind,
         });
@@ -1732,6 +1739,11 @@ impl AddressSpace {
         vmas.update_range(0, USER_END, |vma| {
             vma.locked = false;
             vma.account &= !vma.shared;
+            // An area of `MADV_WIPEONFORK` has no pages of the parent, and Linux gives it no
+            // `anon_vma` in `dup_mmap`.
+            if !vma.shared && !vma.wipe_on_fork {
+                vma.fork_anon = next_fork_anon();
+            }
         });
         // The guard pages of the areas with their pages go to the child, as the guard markers
         // that `copy_page_range` of Linux copies.
