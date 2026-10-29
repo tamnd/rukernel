@@ -4805,6 +4805,350 @@ static int par_cg_run(int n)
 	return ok;
 }
 
+/* The queue of par_mq, its messages, and the calls that gave a wrong result. */
+#define PAR_MQ "/rk-smp"
+#define PAR_MQ_RACE "/rk-smp-race"
+#define PAR_MQ_ROUNDS 30
+static mqd_t par_mqd;
+static int par_mq_sent, par_mq_got, par_mq_bad, par_mq_unlinked;
+static pthread_barrier_t par_mq_barrier;
+
+/* An absolute CLOCK_REALTIME time `ms` milliseconds from now, for mq_timedsend. */
+static struct timespec par_after_ms(int ms)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += ms * 1000000L;
+	if (ts.tv_nsec >= 1000000000L) {
+		ts.tv_sec++;
+		ts.tv_nsec -= 1000000000L;
+	}
+	return ts;
+}
+
+/* Sends (an even `arg`) or receives (an odd `arg`) messages on par_mqd on the CPU `arg`, while the
+ * main thread unlinks the queue and makes new queues with the same name. The descriptor keeps its
+ * queue after the unlink, as in ipc/mqueue.c of Linux. */
+static void *par_mq(void *arg)
+{
+	int i = (int)(long)arg;
+	pin_cpu(i);
+	for (int k = 0; k < 100; k++) {
+		struct timespec ts = par_after_ms(10);
+		char msg[16];
+		if (i % 2 == 0) {
+			memset(msg, 'a' + k % 26, sizeof(msg));
+			if (mq_timedsend(par_mqd, msg, sizeof(msg), k % 4, &ts) == 0)
+				__atomic_fetch_add(&par_mq_sent, 1, __ATOMIC_RELAXED);
+			else if (errno != ETIMEDOUT)
+				__atomic_fetch_add(&par_mq_bad, 1, __ATOMIC_RELAXED);
+			continue;
+		}
+		unsigned prio = 99;
+		ssize_t n = mq_timedreceive(par_mqd, msg, sizeof(msg), &prio, &ts);
+		int ok = n == sizeof(msg) && prio < 4;
+		for (int j = 1; ok && j < (int)sizeof(msg); j++)
+			ok = msg[j] == msg[0];
+		if (ok)
+			__atomic_fetch_add(&par_mq_got, 1, __ATOMIC_RELAXED);
+		else if (n != -1 || errno != ETIMEDOUT)
+			__atomic_fetch_add(&par_mq_bad, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+/* Opens PAR_MQ_RACE with O_CREAT on the CPU `arg` at the same time as the other threads, and then
+ * unlinks it at the same time as them. Each open must work, and one unlink of each round must
+ * work, as with the lock of the root inode in ipc/mqueue.c of Linux. */
+static void *par_mq_race(void *arg)
+{
+	struct mq_attr attr = { .mq_maxmsg = 4, .mq_msgsize = 16 };
+	pin_cpu((int)(long)arg);
+	for (int k = 0; k < PAR_MQ_ROUNDS; k++) {
+		pthread_barrier_wait(&par_mq_barrier);
+		mqd_t q = mq_open(PAR_MQ_RACE, O_RDWR | O_CREAT, 0600, &attr);
+		if (q == (mqd_t)-1)
+			__atomic_fetch_add(&par_mq_bad, 1, __ATOMIC_RELAXED);
+		else
+			mq_close(q);
+		pthread_barrier_wait(&par_mq_barrier);
+		if (mq_unlink(PAR_MQ_RACE) == 0)
+			__atomic_fetch_add(&par_mq_unlinked, 1, __ATOMIC_RELAXED);
+		else if (errno != ENOENT)
+			__atomic_fetch_add(&par_mq_bad, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+/* Runs the POSIX message queues on `n` CPUs: sends and receives on one queue while another thread
+ * unlinks it, and opens and unlinks of one name at the same time. */
+static void par_mq_run(int n)
+{
+	pthread_t t[4];
+	struct mq_attr attr = { .mq_maxmsg = 8, .mq_msgsize = 16 };
+	mq_unlink(PAR_MQ);
+	par_mqd = mq_open(PAR_MQ, O_RDWR | O_CREAT | O_EXCL, 0600, &attr);
+	int ok = par_mqd != (mqd_t)-1 && n >= 2;
+	if (ok) {
+		for (int i = 0; i < n; i++)
+			pthread_create(&t[i], NULL, par_mq, (void *)(long)i);
+		for (int k = 0; k < 50; k++) {
+			if (mq_unlink(PAR_MQ) != 0 && errno != ENOENT)
+				ok = 0;
+			mqd_t q = mq_open(PAR_MQ, O_RDWR | O_CREAT, 0600, &attr);
+			ok &= q != (mqd_t)-1;
+			if (q != (mqd_t)-1)
+				mq_close(q);
+		}
+		for (int i = 0; i < n; i++)
+			pthread_join(t[i], NULL);
+		struct mq_attr now;
+		ok = ok && mq_getattr(par_mqd, &now) == 0 &&
+		     par_mq_sent == par_mq_got + now.mq_curmsgs && par_mq_bad == 0;
+		mq_close(par_mqd);
+		mq_unlink(PAR_MQ);
+	}
+	check("mq send and receive on each CPU while another thread unlinks the queue", ok);
+
+	mq_unlink(PAR_MQ_RACE);
+	pthread_barrier_init(&par_mq_barrier, NULL, n);
+	for (int i = 0; i < n; i++)
+		pthread_create(&t[i], NULL, par_mq_race, (void *)(long)i);
+	for (int i = 0; i < n; i++)
+		pthread_join(t[i], NULL);
+	pthread_barrier_destroy(&par_mq_barrier);
+	check("mq_open with O_CREAT and mq_unlink of one name on each CPU",
+	      par_mq_bad == 0 && par_mq_unlinked == PAR_MQ_ROUNDS);
+}
+
+/* The context of par_aio, its events, and the calls that gave a wrong result. */
+#define PAR_AIO_FILE "/tmp/smp-aio"
+static aio_context_t par_aio_ctx;
+static int par_aio_fd, par_aio_bad, par_aio_destroyed;
+static long par_aio_sent, par_aio_got;
+/* The result of the io_getevents that waits for io_destroy, and the time of its end. */
+static long par_aio_wait_r = -2;
+static struct timespec par_aio_wait_end;
+
+/* Submits writes to PAR_AIO_FILE and reaps the events on the CPU `arg` until io_destroy removes
+ * the context. Then io_submit and io_getevents give EINVAL, as lookup_ioctx in fs/aio.c of Linux. */
+static void *par_aio(void *arg)
+{
+	static char bufs[4][64];
+	int i = (int)(long)arg;
+	pin_cpu(i);
+	memset(bufs[i], 'a' + i, sizeof(bufs[i]));
+	for (int k = 0; k < 5000; k++) {
+		struct iocb cb[4], *list[4];
+		for (int j = 0; j < 4; j++) {
+			memset(&cb[j], 0, sizeof(cb[j]));
+			cb[j].aio_lio_opcode = IOCB_CMD_PWRITE;
+			cb[j].aio_fildes = par_aio_fd;
+			cb[j].aio_buf = (unsigned long)bufs[i];
+			cb[j].aio_nbytes = sizeof(bufs[i]);
+			cb[j].aio_offset = (i * 4 + j) * 64;
+			list[j] = &cb[j];
+		}
+		long r = syscall(SYS_io_submit, par_aio_ctx, 4, list);
+		if (r > 0)
+			__atomic_fetch_add(&par_aio_sent, r, __ATOMIC_RELAXED);
+		else if (errno == EINVAL)
+			break;
+		else if (errno != EAGAIN)
+			__atomic_fetch_add(&par_aio_bad, 1, __ATOMIC_RELAXED);
+		struct io_event ev[8];
+		r = syscall(SYS_io_getevents, par_aio_ctx, 0, 8, ev, &(struct timespec){ 0, 0 });
+		if (r < 0 && errno == EINVAL)
+			break;
+		if (r < 0)
+			__atomic_fetch_add(&par_aio_bad, 1, __ATOMIC_RELAXED);
+		for (long e = 0; e < r; e++)
+			if (ev[e].res != 64)
+				__atomic_fetch_add(&par_aio_bad, 1, __ATOMIC_RELAXED);
+		if (r > 0)
+			__atomic_fetch_add(&par_aio_got, r, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+/* Waits in io_getevents for more events than the other threads let stay in the context. Only
+ * io_destroy ends the wait, as kill_ioctx in fs/aio.c of Linux wakes ctx->wait. */
+static void *par_aio_wait(void *arg)
+{
+	struct io_event ev[64];
+	pin_cpu((int)(long)arg);
+	long r = syscall(SYS_io_getevents, par_aio_ctx, 64, 64, ev, &(struct timespec){ 5, 0 });
+	clock_gettime(CLOCK_MONOTONIC, &par_aio_wait_end);
+	par_aio_wait_r = r < 0 ? -errno : r;
+	if (r > 0)
+		__atomic_fetch_add(&par_aio_got, r, __ATOMIC_RELAXED);
+	return NULL;
+}
+
+/* Calls io_destroy at the same time as the main thread. */
+static void *par_aio_destroy(void *arg)
+{
+	(void)arg;
+	if (syscall(SYS_io_destroy, par_aio_ctx) == 0)
+		__atomic_fetch_add(&par_aio_destroyed, 1, __ATOMIC_RELAXED);
+	return NULL;
+}
+
+/* Runs aio on `n` CPUs: threads submit and reap on one context, one thread waits in io_getevents,
+ * and two threads destroy the context at the same time. */
+static void par_aio_run(int n)
+{
+	pthread_t t[4], w, d;
+	par_aio_fd = open(PAR_AIO_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	int ok = par_aio_fd >= 0 && n >= 2 && syscall(SYS_io_setup, 64, &par_aio_ctx) == 0;
+	if (!ok) {
+		check("aio on each CPU while two threads destroy the context", 0);
+		return;
+	}
+	pthread_create(&w, NULL, par_aio_wait, (void *)0L);
+	for (int i = 1; i < n; i++)
+		pthread_create(&t[i], NULL, par_aio, (void *)(long)i);
+	struct timespec t0, now;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	do {
+		sched_yield();
+		clock_gettime(CLOCK_MONOTONIC, &now);
+	} while (__atomic_load_n(&par_aio_sent, __ATOMIC_RELAXED) < 200 && now.tv_sec - t0.tv_sec < 2);
+	pthread_create(&d, NULL, par_aio_destroy, NULL);
+	struct timespec gone;
+	clock_gettime(CLOCK_MONOTONIC, &gone);
+	if (syscall(SYS_io_destroy, par_aio_ctx) == 0)
+		__atomic_fetch_add(&par_aio_destroyed, 1, __ATOMIC_RELAXED);
+	pthread_join(d, NULL);
+	for (int i = 1; i < n; i++)
+		pthread_join(t[i], NULL);
+	pthread_join(w, NULL);
+	struct iocb cb = { .aio_lio_opcode = IOCB_CMD_FSYNC, .aio_fildes = par_aio_fd };
+	struct iocb *list[1] = { &cb };
+	long waited = (par_aio_wait_end.tv_sec - gone.tv_sec) * 1000 +
+		      (par_aio_wait_end.tv_nsec - gone.tv_nsec) / 1000000;
+	ok = par_aio_destroyed == 1 && par_aio_bad == 0 && par_aio_sent > 0 &&
+	     par_aio_got <= par_aio_sent &&
+	     syscall(SYS_io_submit, par_aio_ctx, 1, list) == -1 && errno == EINVAL;
+	check("aio on each CPU while two threads destroy the context", ok);
+	check("io_destroy ends a wait in io_getevents on another CPU",
+	      (par_aio_wait_r == -EINVAL || par_aio_wait_r >= 0) && waited < 2000);
+	close(par_aio_fd);
+	unlink(PAR_AIO_FILE);
+}
+
+/* The pages of par_ksm, and the reads that did not give the last write. */
+#define PAR_KSM_PAGES 64
+#define PAR_KSM_FILL 0x5a
+static unsigned char *par_ksm_area;
+static int par_ksm_bad, par_ksm_stop;
+
+/* Writes the pages of the CPU `arg` while ksmd merges them, with stores and with read() into the
+ * pages, and then writes the pages back to the contents that merge. Each read must give the last
+ * write. write_protect_page in mm/ksm.c of Linux checks the count of references after the
+ * protect, so a write that started before it does not go to a page that a KSM page replaces. */
+static void *par_ksm(void *arg)
+{
+	int i = (int)(long)arg, pfd[2];
+	pin_cpu(i);
+	if (pipe(pfd) != 0) {
+		__atomic_fetch_add(&par_ksm_bad, 1, __ATOMIC_RELAXED);
+		return NULL;
+	}
+	long fill;
+	memset(&fill, PAR_KSM_FILL, sizeof(fill));
+	for (int round = 0; round < 20 || !__atomic_load_n(&par_ksm_stop, __ATOMIC_ACQUIRE); round++) {
+		for (int p = i; p < PAR_KSM_PAGES; p += par_threads) {
+			unsigned char *page = par_ksm_area + p * 4096;
+			long *a = (long *)(page + (round % 256) * 8);
+			long *b = (long *)(page + 2048 + (round % 256) * 8);
+			long v = ((long)i << 32) | ((long)round << 16) | p;
+			*a = v;
+			long w = ~v;
+			int ok = write(pfd[1], &w, sizeof(w)) == sizeof(w) &&
+				 read(pfd[0], b, sizeof(w)) == sizeof(w);
+			ok = ok && *a == v && *b == w;
+			*a = fill;
+			*b = fill;
+			ok = ok && *a == fill && *b == fill;
+			if (!ok)
+				__atomic_fetch_add(&par_ksm_bad, 1, __ATOMIC_RELAXED);
+		}
+		sched_yield();
+	}
+	close(pfd[0]);
+	close(pfd[1]);
+	return NULL;
+}
+
+static int ksm_set(const char *name, const char *value)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/sys/kernel/mm/ksm/%s", name);
+	return cg_write(path, value);
+}
+
+static long ksm_get(const char *name)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/sys/kernel/mm/ksm/%s", name);
+	return cg_value(path, "");
+}
+
+/* Runs KSM on `n` CPUs: ksmd merges equal pages while threads write them. */
+static void par_ksm_run(int n)
+{
+	pthread_t t[4];
+	mkdir("/sys", 0755);
+	int mounted = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
+	unsigned char *m = mmap(NULL, PAR_KSM_PAGES * 4096, PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	int ok = mounted && m != MAP_FAILED;
+	if (ok) {
+		memset(m, PAR_KSM_FILL, PAR_KSM_PAGES * 4096);
+		ok = madvise(m, PAR_KSM_PAGES * 4096, MADV_MERGEABLE) == 0 &&
+		     ksm_set("sleep_millisecs", "0") == 0 && ksm_set("pages_to_scan", "1000") == 0 &&
+		     ksm_set("run", "1") == 0;
+	}
+	/* Two full scans merge the pages: the first puts them in the unstable tree. */
+	for (int k = 0; ok && k < 300 && ksm_get("pages_sharing") <= 0; k++)
+		usleep(10000);
+	long sharing = ok ? ksm_get("pages_sharing") : 0;
+	check("ksmd merges equal pages on an SMP system", ok && sharing > 0);
+	if (ok && sharing > 0) {
+		long scans = ksm_get("full_scans");
+		par_threads = n;
+		par_ksm_area = m;
+		for (int i = 0; i < n; i++)
+			pthread_create(&t[i], NULL, par_ksm, (void *)(long)i);
+		/* The writes go on until ksmd did 3 full scans, or for at most 2 s. */
+		long now = scans;
+		for (int k = 0; k < 200 && now < scans + 3; k++) {
+			usleep(10000);
+			now = ksm_get("full_scans");
+		}
+		__atomic_store_n(&par_ksm_stop, 1, __ATOMIC_RELEASE);
+		for (int i = 0; i < n; i++)
+			pthread_join(t[i], NULL);
+		int same = 1;
+		for (int k = 0; same && k < PAR_KSM_PAGES * 4096; k++)
+			same = m[k] == PAR_KSM_FILL;
+		check("writes on each CPU to pages that ksmd merges are not lost",
+		      par_ksm_bad == 0 && same && now > scans);
+	}
+	if (mounted) {
+		check("KSM unmerges the pages after the writes", ksm_set("run", "2") == 0 &&
+			      ksm_get("pages_sharing") == 0);
+		ksm_set("run", "0");
+		ksm_set("sleep_millisecs", "20");
+		ksm_set("pages_to_scan", "100");
+	}
+	if (m != MAP_FAILED)
+		munmap(m, PAR_KSM_PAGES * 4096);
+	if (mounted)
+		umount("/sys");
+}
+
 /* Runs futexes, sockets, faults and system calls on several CPUs at the same time. Before #405,
  * only one CPU at a time ran kernel code, so these races could not occur. */
 static void test_smp_parallel(int cpus)
@@ -4880,6 +5224,14 @@ static void test_smp_parallel(int cpus)
 	check("page faults of one file on each CPU read the right data", par_file_run(n));
 	check("forks and pages on each CPU in one cgroup keep pids.max and the counts",
 	      par_cg_run(n));
+	struct timespec t0, t1;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	par_mq_run(n);
+	par_aio_run(n);
+	par_ksm_run(n);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	printf("init: mq, aio and KSM on %d CPUs take %ld ms\n", n,
+	       (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
 }
 
 static void test_smp(void)

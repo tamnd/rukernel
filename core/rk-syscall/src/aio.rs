@@ -10,6 +10,12 @@
 //! come one after the other in a call go to the file as one batch, so that the block layer can
 //! merge and sort them. A request is never in progress after `io_submit`, so `io_cancel` finds
 //! no request.
+//!
+//! The calls run on many CPUs at the same time. `io_submit` takes the slots of its events before
+//! it does the requests, so two calls cannot put more than `nr` events in a context. `io_destroy`
+//! marks the context dead, wakes the tasks in `io_getevents`, and waits until the calls of
+//! `io_submit` that are in progress are done, as `kill_ioctx` and `io_destroy` of fs/aio.c of Linux
+//! do.
 
 use crate::cx::{Cx, SysResult};
 use crate::poll::{restore_mask, set_temp_mask, timespec_deadline, wait_events};
@@ -72,29 +78,44 @@ struct IoEvent {
     res2: i64,
 }
 
+/// The events of a context and the slots that `io_submit` took.
+struct Ring {
+    /// The events of the requests that are done.
+    events: VecDeque<IoEvent>,
+    /// The slots of the calls of `io_submit` that are in progress, as `reqs_available` of Linux.
+    reserved: u64,
+    /// `io_destroy` removed the context, as `kioctx.dead` of Linux.
+    dead: bool,
+}
+
 /// A context of `io_setup`.
 struct Context {
     /// The address space of the process that made the context.
     owner: Weak<AddressSpace>,
     /// The most events that can wait.
     nr: u64,
-    events: SpinLock<VecDeque<IoEvent>>,
-    /// `io_getevents` waits here for new events, as `kioctx.wait` of Linux.
+    ring: SpinLock<Ring>,
+    /// `io_getevents` waits here for new events, as `kioctx.wait` of Linux. `io_destroy` waits
+    /// here for the end of the calls of `io_submit`.
     wait: Arc<WaitQueue>,
 }
 
-/// The contexts by ID.
-static CONTEXTS: SpinLock<BTreeMap<u64, Arc<Context>>> = SpinLock::new(BTreeMap::new());
+/// The key of a context: the address space and the ID. Two processes can have the same ID,
+/// because the ID is an address in each process. The `Weak` reference of the context keeps the
+/// address of the address space while the context is in the map.
+type Key = (usize, u64);
+
+fn key(vm: &Arc<AddressSpace>, id: u64) -> Key {
+    (Arc::as_ptr(vm) as usize, id)
+}
+
+/// The contexts by key.
+static CONTEXTS: SpinLock<BTreeMap<Key, Arc<Context>>> = SpinLock::new(BTreeMap::new());
 
 /// Gives the context `id` of the process.
 fn context(cx: &Cx<'_>, id: u64) -> Result<Arc<Context>, Errno> {
     let vm = cx.vm()?;
-    CONTEXTS
-        .lock()
-        .get(&id)
-        .filter(|c| c.owner.as_ptr() == Arc::as_ptr(&vm))
-        .cloned()
-        .ok_or(Errno::EINVAL)
+    CONTEXTS.lock().get(&key(&vm, id)).cloned().ok_or(Errno::EINVAL)
 }
 
 pub(crate) fn io_setup(cx: &Cx<'_>, nr: u64, idp: u64) -> SysResult {
@@ -104,31 +125,46 @@ pub(crate) fn io_setup(cx: &Cx<'_>, nr: u64, idp: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let vm = cx.vm()?;
-    let mut contexts = CONTEXTS.lock();
-    contexts.retain(|_, c| c.owner.strong_count() > 0);
-    if contexts.values().map(|c| c.nr).sum::<u64>() + u64::from(nr) > AIO_MAX_NR {
-        return Err(Errno::EAGAIN);
-    }
+    // The map and the write to user memory can wait and take the locks of the address space, so
+    // they run without the lock of the contexts, as `ioctx_alloc` of Linux sets up the ring before
+    // it takes `aio_nr_lock`.
     let prot = Prot::from_bits(3).ok_or(Errno::EINVAL)?;
     let id = vm.mmap(MmapRequest::anon(PAGE_SIZE, prot))? as u64;
-    if let Err(e) = cx.write_val(idp, &id) {
-        let _ = vm.munmap(id as usize, PAGE_SIZE);
-        return Err(e);
-    }
     let ctx = Context {
         owner: Arc::downgrade(&vm),
         nr: u64::from(nr),
-        events: SpinLock::new(VecDeque::new()),
+        ring: SpinLock::new(Ring { events: VecDeque::new(), reserved: 0, dead: false }),
         wait: Arc::new(WaitQueue::new()),
     };
-    contexts.insert(id, Arc::new(ctx));
+    {
+        let mut contexts = CONTEXTS.lock();
+        contexts.retain(|_, c| c.owner.strong_count() > 0);
+        if contexts.values().map(|c| c.nr).sum::<u64>() + u64::from(nr) > AIO_MAX_NR {
+            drop(contexts);
+            let _ = vm.munmap(id as usize, PAGE_SIZE);
+            return Err(Errno::EAGAIN);
+        }
+        contexts.insert(key(&vm, id), Arc::new(ctx));
+    }
+    if let Err(e) = cx.write_val(idp, &id) {
+        CONTEXTS.lock().remove(&key(&vm, id));
+        let _ = vm.munmap(id as usize, PAGE_SIZE);
+        return Err(e);
+    }
     Ok(0)
 }
 
 pub(crate) fn io_destroy(cx: &Cx<'_>, id: u64) -> SysResult {
-    context(cx, id)?;
-    CONTEXTS.lock().remove(&id);
-    let _ = cx.vm()?.munmap(id as usize, PAGE_SIZE);
+    let vm = cx.vm()?;
+    // The find and the removal are one step, so only one of two calls removes the context, and
+    // the other gives `EINVAL`, as `kill_ioctx` of Linux.
+    let ctx = CONTEXTS.lock().remove(&key(&vm, id)).ok_or(Errno::EINVAL)?;
+    ctx.ring.lock().dead = true;
+    // The tasks in `io_getevents` stop, as `kill_ioctx` of Linux wakes `ctx->wait`.
+    ctx.wait.wake_all();
+    // Linux waits until the requests in progress are done (`ctx->rq_wait` in `io_destroy`).
+    ctx.wait.wait_until(|| (ctx.ring.lock().reserved == 0).then_some(()));
+    let _ = vm.munmap(id as usize, PAGE_SIZE);
     Ok(0)
 }
 
@@ -323,7 +359,17 @@ pub(crate) fn io_submit(cx: &Cx<'_>, id: u64, nr: u64, iocbpp: u64) -> SysResult
         return Err(Errno::EINVAL);
     }
     let nr = nr.min(ctx.nr);
-    let room = ctx.nr.saturating_sub(ctx.events.lock().len() as u64);
+    // Take the slots for the events first, as `get_reqs_available` of Linux. A call on another
+    // CPU then sees fewer free slots.
+    let room = {
+        let mut ring = ctx.ring.lock();
+        if ring.dead {
+            return Err(Errno::EINVAL);
+        }
+        let room = ctx.nr.saturating_sub(ring.events.len() as u64 + ring.reserved).min(nr);
+        ring.reserved += room;
+        room
+    };
     let mut items = Vec::new();
     let mut error = None;
     for k in 0..nr {
@@ -341,20 +387,28 @@ pub(crate) fn io_submit(cx: &Cx<'_>, id: u64, nr: u64, iocbpp: u64) -> SysResult
         }
     }
     let results = run(cx, &items);
-    for (item, r) in items.iter().zip(results) {
-        let res = match r {
-            Ok(n) => n as i64,
-            Err(e) => -i64::from(e.get()),
-        };
-        ctx.events.lock().push_back(IoEvent {
+    let events: Vec<IoEvent> = items
+        .iter()
+        .zip(results)
+        .map(|(item, r)| IoEvent {
             data: item.iocb.aio_data,
             obj: item.obj,
-            res,
+            res: match r {
+                Ok(n) => n as i64,
+                Err(e) => -i64::from(e.get()),
+            },
             res2: 0,
-        });
-        if let Some(efd) = &item.resfd {
-            crate::eventfd::signal(efd);
-        }
+        })
+        .collect();
+    {
+        // The events go in and the slots go back in one step. A context that `io_destroy`
+        // removed keeps the events, and no call reads them.
+        let mut ring = ctx.ring.lock();
+        ring.events.extend(events);
+        ring.reserved -= room;
+    }
+    for efd in items.iter().filter_map(|item| item.resfd.as_ref()) {
+        crate::eventfd::signal(efd);
     }
     ctx.wait.wake_all();
     match (items.len(), error) {
@@ -370,24 +424,31 @@ fn getevents(cx: &Cx<'_>, id: u64, min_nr: u64, nr: u64, events: u64, timeout: u
         return Err(Errno::EINVAL);
     }
     let deadline = timespec_deadline(cx, timeout)?;
+    // A context that `io_destroy` removed gives the events that it has, and then `EINVAL`, as
+    // `aio_read_events` of Linux.
     let grab = |need: i64| {
-        let mut q = ctx.events.lock();
-        if (q.len() as i64) < need {
-            return None;
+        let mut guard = ctx.ring.lock();
+        let ring = &mut *guard;
+        let q = &mut ring.events;
+        if q.is_empty() && ring.dead {
+            return Err(Errno::EINVAL);
+        }
+        if (q.len() as i64) < need && !ring.dead {
+            return Ok(None);
         }
         let n = (nr as usize).min(q.len());
-        Some(q.drain(..n).collect::<Vec<_>>())
+        Ok(Some(q.drain(..n).collect::<Vec<_>>()))
     };
     let scan = |table: Option<&mut PollTable>| {
         if let Some(table) = table {
             table.add(&ctx.wait);
         }
-        Ok(grab(min_nr))
+        grab(min_nr)
     };
     let list = match wait_events(cx, deadline, scan) {
         Ok(Some(list)) => list,
-        Ok(None) => grab(0).unwrap_or_default(),
-        Err(Errno::ERESTARTNOHAND) => match grab(1) {
+        Ok(None) => grab(0)?.unwrap_or_default(),
+        Err(Errno::ERESTARTNOHAND) => match grab(1)? {
             Some(list) => list,
             None => return Err(Errno::EINTR),
         },
