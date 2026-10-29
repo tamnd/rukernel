@@ -15,12 +15,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - /proc/sys/kernel/core_pattern with `%%`, `%p`, `%P`, `%i`, `%I`, `%u`, `%g`, `%d`, `%s`, `%t`, `%h`, `%e`, `%E`, `%f`, `%c` and `%C`, and /proc/sys/kernel/core_uses_pid, as `format_corename` in fs/coredump.c of Linux (#475). A pattern that starts with `|` or `@` gives no dump, because the kernel has no usermode helper. Thus the pipe part of coredump01 of LTP fails.
 - `madvise` with `MADV_DONTDUMP` and `MADV_DODUMP` sets and clears `VM_DONTDUMP` on the areas (#475).
 - `PR_SET_DUMPABLE`, `PR_GET_DUMPABLE` and /proc/sys/fs/suid_dumpable, as kernel/sys.c and fs/exec.c of Linux (#475). `execve` of a file that the caller cannot read, or with a set-user-ID or set-group-ID change, and a change of the effective or file system IDs set the flag to fs.suid_dumpable. With the value 2 the core file must have an absolute path and is written as root.
+- The `inet` boot test checks that a socket of DCCP or SCTP gives the error of Linux without these modules (`ESOCKTNOSUPPORT` or `EPROTONOSUPPORT`, as `inet_create` in net/ipv4/af_inet.c), so that the LTP tests dccp01 and sctp01 give TCONF for them (#458). tools/ltp/notes.txt gives the cause of the LTP tests of the network that still fail because the BusyBox tools do not have an option, or because they run longer than the time limit.
 
 ### Fixed
 
 - A signal with a core dump action stops the process from a thread of the process, after it is queued, as `complete_signal` in kernel/signal.c of Linux (#475). Before, the sender stopped the process at once.
 - `F_SETLEASE` with `F_WRLCK` gives `EAGAIN` when another file has the inode open for a read, and `F_SETLEASE` with `F_UNLCK` gives `EAGAIN` when the file has no lease, as `check_conflicting_open` and `generic_delete_lease` in fs/locks.c of Linux (#481). A lease conflicts with the leases of other files, and goes away when its file closes. fcntl32 passes with its directory on ext2.
 - `splice` gives `EINVAL` for a file that has no `splice_read` or `splice_write` of Linux, as a directory, an eventfd, an epoll, a signalfd, a timerfd, a pidfd or an inotify file, before it waits for the pipe (#481). This is `warn_unsupported` in fs/splice.c. splice07 of LTP waited for the empty pipe until the runner stopped it, and it passes now.
+- `setsockopt` with `IPV6_CHECKSUM` at the level `SOL_RAW` on a raw ICMPv6 socket sets the offset of the checksum, as `do_rawv6_setsockopt` in net/ipv6/raw.c of Linux (#458). The level `IPPROTO_IPV6` still gives `EINVAL` for ICMPv6, and an odd offset gives `EINVAL`. Before, both levels gave `EINVAL`, so `traceroute6 -I` of BusyBox stopped and LTP traceroute601 failed.
 
 ## [0.4.14] - 2026-10-29
 
