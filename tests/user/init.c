@@ -2692,6 +2692,18 @@ static void test_syslog(void)
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
 	check("syslog reads the boot log with the level and the time", n > 0 && strncmp(buf, "<6>[", 4) == 0 && strstr(buf, "rukernel") != NULL);
+#if defined(__x86_64__)
+	{
+		/* CPUID leaf 1, ECX bit 21: the CPU has the x2APIC. The kernel then logs
+		 * "x2apic enabled", as x2apic_enable of arch/x86/kernel/apic/apic.c in Linux. */
+		unsigned int eax = 1, ebx, ecx = 0, edx;
+
+		__asm__ volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+		check("the kernel uses the x2APIC if and only if the CPU has it",
+		      (strstr(buf, "x2apic enabled") != NULL) == ((ecx >> 21) & 1));
+		printf("init: the CPU %s the x2APIC\n", (ecx >> 21) & 1 ? "has" : "does not have");
+	}
+#endif
 	check("syslog with a bad action gives EINVAL", klogctl(99, NULL, 0) < 0 && errno == EINVAL);
 	check("syslog read with no buffer gives EINVAL", klogctl(3, NULL, 10) < 0 && errno == EINVAL);
 	check("syslog clears the kernel log", klogctl(5, NULL, 0) == 0 && klogctl(3, buf, sizeof(buf)) == 0);

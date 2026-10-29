@@ -15,6 +15,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - /proc/net/igmp, /proc/net/igmp6 and /proc/net/dev_mcast in the format of Linux, for `ip maddr show`. `SIOCADDMULTI` and `SIOCDELMULTI` keep a list of link addresses for each device, as `dev_mc_add_global` of Linux, so `ip maddr add` and `ip maddr del` work (#458).
 - A device that goes up joins 224.0.0.1, as `ip_mc_up` in net/ipv4/igmp.c. It answers a ping to the group when `net.ipv4.icmp_echo_ignore_broadcasts` is 0 (#458).
 - The `inet` boot test checks large pings, `IP_PMTUDISC_DO`, `SO_BINDTODEVICE`, a ping to 224.0.0.1, the multicast files, `RTM_NEWNEIGH`, `RTM_DELNEIGH` and the ARP ioctls over the veth pair. The `netns` test sends large pings with IPv4 and IPv6 (#458).
+- The kernel writes `x2apic enabled` in the boot log when it puts the local APIC in x2APIC mode, as `x2apic_enable` of Linux. The `init` boot test checks that the kernel uses the x2APIC if and only if CPUID gives it (#442).
+- `RK_QEMU` gives the directory of the QEMU programs of `cargo xtask qemu` and the boot tests, and `RK_QEMU_CPU` gives the x86-64 CPU model without KVM. `tools/bench/run.py` has `--qemu` and `--cpu` (#442). With QEMU 9.2.4, which gives the x2APIC under TCG, the boot tests `init`, `smp`, `busybox`, `mm`, `task`, `blk` and `inet` pass in x2APIC mode, and the bench shows no difference between the two modes. tools/bench/README.md gives the numbers and results-x2apic.md has the table.
+- `tools/bench/linux-arm64.sh` builds a Linux 7.3 arm64 `Image` with `defconfig`, from the tarball that tools/rk-abigen uses. tools/bench/results-aarch64.md is the first arm64 table with a Linux column. `tcp_stream` is red in it, with 25.7 MB/s on rukernel and 57.5 MB/s on Linux (#442).
 
 ### Fixed
 

@@ -1,0 +1,199 @@
+bench-start: getpid
+bench: getpid 1335.084
+bench: getpid 1372.761
+bench: getpid 1387.631
+bench: getpid 1286.987
+bench: getpid 1505.337
+bench: getpid 1361.668
+bench: getpid 1314.783
+bench: getpid 1226.915
+bench: getpid 1349.701
+bench: getpid 1172.303
+bench-start: null
+bench: null 1328.139
+bench: null 1258.373
+bench: null 1191.261
+bench: null 1182.182
+bench: null 1225.965
+bench: null 1264.356
+bench: null 1324.763
+bench: null 1735.714
+bench: null 1632.113
+bench: null 1617.104
+bench-start: read_zero
+bench: read_zero 2557.737
+bench: read_zero 3849.033
+bench: read_zero 3393.485
+bench: read_zero 3465.191
+bench: read_zero 2599.513
+bench: read_zero 2484.618
+bench: read_zero 2255.778
+bench: read_zero 2222.473
+bench: read_zero 2557.360
+bench: read_zero 2462.605
+bench-start: pipe_rw
+bench: pipe_rw 14812.702
+bench: pipe_rw 14529.414
+bench: pipe_rw 14930.926
+bench: pipe_rw 17385.598
+bench: pipe_rw 16144.115
+bench: pipe_rw 15125.921
+bench: pipe_rw 10474.982
+bench: pipe_rw 10399.968
+bench: pipe_rw 10174.103
+bench: pipe_rw 10415.176
+bench-start: ctxsw
+bench: ctxsw 417143.822
+bench: ctxsw 381604.932
+bench: ctxsw 357796.726
+bench: ctxsw 394025.864
+bench: ctxsw 414606.495
+bench: ctxsw 489385.313
+bench: ctxsw 407692.882
+bench: ctxsw 347187.977
+bench: ctxsw 346115.855
+bench: ctxsw 392116.786
+bench-start: yield
+bench: yield 5125.551
+bench: yield 4994.206
+bench: yield 5044.455
+bench: yield 4099.374
+bench: yield 5943.796
+bench: yield 4113.158
+bench: yield 4260.415
+bench: yield 4524.690
+bench: yield 4451.144
+bench: yield 4526.791
+bench-start: thread
+bench: thread 2929.050
+bench: thread 3577.898
+bench: thread 3667.060
+bench: thread 3709.052
+bench: thread 3523.811
+bench: thread 3469.770
+bench: thread 3592.059
+bench: thread 4333.869
+bench: thread 3801.262
+bench: thread 4151.001
+bench-start: fault
+bench: fault 63080.390
+bench: fault 55699.766
+bench: fault 62731.538
+bench: fault 50898.182
+bench: fault 52235.628
+bench: fault 50539.038
+bench: fault 41528.246
+bench: fault 47718.542
+bench: fault 62680.032
+bench: fault 48758.825
+bench-start: mmap
+bench: mmap 64896.063
+bench: mmap 65820.962
+bench: mmap 72846.223
+bench: mmap 113957.066
+bench: mmap 100895.450
+bench: mmap 70221.153
+bench: mmap 66332.013
+bench: mmap 59278.934
+bench: mmap 66374.566
+bench: mmap 95564.747
+bench-start: fork
+bench: fork 6564.965
+bench: fork 5341.233
+bench: fork 5617.755
+bench: fork 7075.565
+bench: fork 5917.147
+bench: fork 7459.194
+bench: fork 6430.210
+bench: fork 6534.143
+bench: fork 6965.558
+bench: fork 5745.247
+bench-start: fork_big
+bench: fork_big 51214.391
+bench: fork_big 44650.867
+bench: fork_big 47230.489
+bench: fork_big 50077.312
+bench: fork_big 50615.438
+bench: fork_big 51446.013
+bench: fork_big 46266.067
+bench: fork_big 48202.871
+bench: fork_big 47862.499
+bench: fork_big 54774.014
+bench-start: tcp_rr
+bench: tcp_rr 1007.043
+bench: tcp_rr 1233.233
+bench: tcp_rr 1141.406
+bench: tcp_rr 1438.060
+bench: tcp_rr 1253.315
+bench: tcp_rr 1167.504
+bench: tcp_rr 984.473
+bench: tcp_rr 1213.300
+bench: tcp_rr 1165.874
+bench: tcp_rr 1036.367
+bench-start: tcp_stream
+bench: tcp_stream 18.936
+bench: tcp_stream 18.110
+bench: tcp_stream 20.821
+bench: tcp_stream 24.251
+bench: tcp_stream 24.262
+bench: tcp_stream 24.730
+bench: tcp_stream 20.766
+bench: tcp_stream 24.130
+bench: tcp_stream 27.408
+bench: tcp_stream 28.731
+bench-start: udp_rr
+bench: udp_rr 718.224
+bench: udp_rr 733.909
+bench: udp_rr 1088.757
+bench: udp_rr 794.813
+bench: udp_rr 696.148
+bench: udp_rr 842.639
+bench: udp_rr 851.171
+bench: udp_rr 676.322
+bench: udp_rr 705.457
+bench: udp_rr 1214.394
+bench-start: udp_stream
+bench: udp_stream 3.697
+bench: udp_stream 4.008
+bench: udp_stream 3.779
+bench: udp_stream 3.672
+bench: udp_stream 3.588
+bench: udp_stream 4.080
+bench: udp_stream 3.591
+bench: udp_stream 4.322
+bench: udp_stream 3.574
+bench: udp_stream 4.075
+bench-start: fault_mt
+bench: fault_mt 44991.680
+bench: fault_mt 60802.146
+bench: fault_mt 43681.354
+bench: fault_mt 50403.334
+bench: fault_mt 52362.538
+bench: fault_mt 49301.854
+bench: fault_mt 49729.704
+bench: fault_mt 55072.492
+bench: fault_mt 45942.652
+bench: fault_mt 57269.095
+bench-start: mmap_mt
+bench: mmap_mt 85123.346
+bench: mmap_mt 83551.779
+bench: mmap_mt 88622.641
+bench: mmap_mt 92327.209
+bench: mmap_mt 94106.795
+bench: mmap_mt 81125.075
+bench: mmap_mt 77626.376
+bench: mmap_mt 76229.114
+bench: mmap_mt 61349.162
+bench: mmap_mt 71893.448
+bench-start: cow
+bench: cow 117601.817
+bench: cow 99513.211
+bench: cow 92257.777
+bench: cow 101384.049
+bench: cow 79528.167
+bench: cow 96716.994
+bench: cow 102979.433
+bench: cow 84507.857
+bench: cow 103003.847
+bench: cow 90623.249
+bench-done

@@ -1563,15 +1563,26 @@ fn blk_disk_has_note(path: &Path) -> Result<bool> {
 /// several CPUs at the same time.
 const SMP_CPUS: &str = "4";
 
+/// The QEMU program `name`, for example `qemu-system-x86_64`. `RK_QEMU` gives the directory of the
+/// programs of a different QEMU build, for example `$HOME/rk-qemu9/install/bin`. Without it, the
+/// program comes from `PATH`. QEMU 8.2 has no x2APIC without KVM, and QEMU 9.0 and later have it.
+fn qemu_program(name: &str) -> PathBuf {
+    match std::env::var_os("RK_QEMU") {
+        Some(dir) => PathBuf::from(dir).join(name),
+        None => PathBuf::from(name),
+    }
+}
+
 /// The QEMU command for the x86-64 kernel with the initramfs `initrd`. The machine has one CPU, or
-/// the number of CPUs in `RK_SMP`. The `smp` boot test has `SMP_CPUS` CPUs.
+/// the number of CPUs in `RK_SMP`. The `smp` boot test has `SMP_CPUS` CPUs. Without KVM, the CPU
+/// model is `max`, or the model in `RK_QEMU_CPU`, for example `max,-x2apic`.
 fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
     let smp = if cmdline.ends_with("-- smp") {
         String::from(SMP_CPUS)
     } else {
         std::env::var("RK_SMP").unwrap_or_else(|_| String::from("1"))
     };
-    let mut cmd = Command::new("qemu-system-x86_64");
+    let mut cmd = Command::new(qemu_program("qemu-system-x86_64"));
     cmd.args(["-machine", "q35", "-m", "512M", "-smp", &smp, "-display", "none"])
         .args(["-serial", "stdio", "-no-reboot", "-monitor", "none"])
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
@@ -1583,7 +1594,8 @@ fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
     if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);
     } else {
-        cmd.args(["-accel", "tcg", "-cpu", "max"]);
+        let cpu = std::env::var("RK_QEMU_CPU").unwrap_or_else(|_| String::from("max"));
+        cmd.args(["-accel", "tcg", "-cpu", &cpu]);
     }
     cmd
 }
@@ -2213,12 +2225,13 @@ fn aarch64_initramfs(elf: &Path) -> Result<Option<(PathBuf, bool)>> {
 /// on `qemu-system-aarch64 -M virt`, and adds the failures to `errors`. Without QEMU for arm64,
 /// the tests are skipped, except in CI.
 fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
-    let qemu = "qemu-system-aarch64";
-    if Command::new(qemu).arg("--version").stdout(Stdio::null()).status().is_err() {
+    let qemu = qemu_program("qemu-system-aarch64");
+    if Command::new(&qemu).arg("--version").stdout(Stdio::null()).status().is_err() {
         if std::env::var_os("CI").is_some() {
+            let qemu = qemu.display();
             return Err(format!("no {qemu} for the arm64 boot tests, install qemu-system-arm"));
         }
-        println!("boot tests on arm64: skipped, no {qemu}");
+        println!("boot tests on arm64: skipped, no {}", qemu.display());
         return Ok(());
     }
     cargo(&["build", "--package", "rukernel", "--target", "aarch64-unknown-none"])?;
@@ -2279,7 +2292,7 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         if let Some(server) = &server {
             cmdline = format!("{cmdline} {}", server.port);
         }
-        let mut cmd = Command::new(qemu);
+        let mut cmd = Command::new(&qemu);
         let machine = if gic == "3" {
             String::from("virt,gic-version=3,its=on")
         } else {
