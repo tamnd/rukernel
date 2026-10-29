@@ -657,11 +657,14 @@ impl Process {
     /// Sets the action of `sig` and gives the old one, for `rt_sigaction`. If the new action
     /// discards the signal, the pending instances go too, as POSIX tells.
     pub fn set_action(&self, sig: u32, action: SigAction) -> SigAction {
+        // The list of threads comes before the lock of the signals, because `wait_child` takes
+        // the lock of the signals under the lock of the state. A new thread has no pending signal.
+        let threads = if action.ignores(sig) { self.threads() } else { Vec::new() };
         let mut sigs = self.signals.lock();
         let old = core::mem::replace(&mut sigs.actions[sig as usize - 1], action);
         if action.ignores(sig) {
             sigs.pending.discard(sig);
-            for t in self.threads() {
+            for t in threads {
                 t.signals.lock().pending.discard(sig);
             }
         }
@@ -1742,7 +1745,14 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
         new.keys.lock().ring = keys::new_thread_ring(&process.cred());
     }
     new.keys.lock().reqkey = reqkey.1;
-    process.state.lock().threads.push(new.clone());
+    let mut s = process.state.lock();
+    // A thread on another CPU can start the exit of the group after the checks of `clone`. That
+    // thread kills the threads in the list, so a thread that comes after it is killed here.
+    if s.group_exit.is_some() {
+        new.killed.store(true, Ordering::Release);
+    }
+    s.threads.push(new.clone());
+    drop(s);
     Ok(new)
 }
 

@@ -552,7 +552,10 @@ impl Unix {
     /// Tells if a message to `peer` gets the credentials of the sender: `SO_PASSCRED` is set on
     /// this socket or on `peer`.
     fn may_passcred(&self, peer: &Self) -> bool {
-        self.state.lock().passcred || peer.state.lock().passcred
+        // The lock of this socket goes before the lock of the peer is taken. Two sockets that
+        // send to each other on two CPUs then do not wait for each other.
+        let mine = self.state.lock().passcred;
+        mine || peer.state.lock().passcred
     }
 
     /// The send of a stream socket: the data goes in pieces into the queue of the peer.
@@ -597,9 +600,13 @@ impl Unix {
                 Err(e) => return Err(e),
             };
             let n = (data.len() - sent).min(space).min((sndbuf / 2).saturating_sub(64).max(1));
+            // The count goes up before the data is in the queue. The receiver on another CPU can
+            // take the data and decrease the count before a later increase.
+            self.inflight.fetch_add(n, Ordering::Relaxed);
             let mut p = peer.state.lock();
             if p.closed || p.shut_rd {
                 drop(p);
+                self.inflight.fetch_sub(n, Ordering::Relaxed);
                 return if sent > 0 { Ok(sent) } else { Err(Errno::EPIPE) };
             }
             p.queue.push_back(Packet {
@@ -611,7 +618,6 @@ impl Unix {
                 sender: self.this.clone(),
             });
             drop(p);
-            self.inflight.fetch_add(n, Ordering::Relaxed);
             peer.wake();
             sent += n;
         }
@@ -657,7 +663,11 @@ impl Unix {
         })?;
         let me = self.me();
         let mut msg = Some(msg);
-        wait_for(&other.wait, timeout, || {
+        // The address is read before the lock of the receiver is taken, as in `may_passcred`.
+        let my_addr = self.state.lock().addr.clone();
+        // The count goes up before the message is in the queue, as in `send_stream`.
+        self.inflight.fetch_add(len, Ordering::Relaxed);
+        let sent = wait_for(&other.wait, timeout, || {
             let mut o = other.state.lock();
             if o.closed {
                 drop(o);
@@ -684,11 +694,7 @@ impl Unix {
             }
             let Some(msg) = msg.take() else { return Ok(Some(())) };
             let cred = msg.cred.or_else(|| (passcred || o.passcred).then(current_cred));
-            let from = if Arc::ptr_eq(&other, &me) {
-                o.addr.clone()
-            } else {
-                self.state.lock().addr.clone()
-            };
+            let from = if Arc::ptr_eq(&other, &me) { o.addr.clone() } else { my_addr.clone() };
             o.queue.push_back(Packet {
                 data: msg.data,
                 read: 0,
@@ -698,8 +704,13 @@ impl Unix {
                 sender: self.this.clone(),
             });
             Ok(Some(()))
-        })?;
-        self.inflight.fetch_add(len, Ordering::Relaxed);
+        });
+        if let Err(e) = sent {
+            if msg.is_some() {
+                self.inflight.fetch_sub(len, Ordering::Relaxed);
+            }
+            return Err(e);
+        }
         other.wake();
         Ok(len)
     }

@@ -245,11 +245,11 @@ impl UserContext {
     }
 
     /// Runs the user code as `execute` does, and also gives the nanoseconds in user mode. The
-    /// time does not include the wait for the kernel lock and the bottom half after the return,
-    /// because they are kernel work: on a machine with many CPUs, the wait for the lock can be
-    /// long.
+    /// time does not include the bottom half after the return, because it is kernel work. With the
+    /// `big-lock` feature, the time also does not include the wait for the kernel lock.
     pub fn execute_timed(&mut self) -> (ReturnReason, u64) {
-        // User code runs without the kernel lock, so the other CPUs can run kernel code.
+        // With the `big-lock` feature, user code runs without the kernel lock, so the other CPUs
+        // can run kernel code. Without the feature, the two calls do nothing.
         crate::task::kernel_unlock();
         let start = crate::time::nanos();
         #[cfg(target_arch = "x86_64")]

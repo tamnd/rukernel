@@ -892,7 +892,7 @@ pub fn poll() {
 /// and does not send on a socket, so the wait is short.
 pub(crate) fn poll_now() {
     while POLLING.swap(true, Ordering::Acquire) {
-        core::hint::spin_loop();
+        rk_frame::sync::wait_hint();
     }
     poll_locked();
 }

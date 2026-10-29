@@ -39,6 +39,10 @@ static PENDING: AtomicU64 = AtomicU64::new(0);
 /// function returns when each of these CPUs did it.
 pub(crate) fn shootdown(root: u64, addr: u64) {
     let me = cpu::id();
+    // The change of the page table comes before the read of the address space of each CPU, and
+    // `paging::activate` changes the address space before it loads the table. Thus a CPU that is
+    // not in the mask loads the table after the change, and has no old TLB entry.
+    core::sync::atomic::fence(Ordering::SeqCst);
     let mask = (0..cpu::count())
         .filter(|&c| c != me && (root == 0 || paging::active_on(c) == root))
         .fold(0u64, |m, c| m | 1 << c);

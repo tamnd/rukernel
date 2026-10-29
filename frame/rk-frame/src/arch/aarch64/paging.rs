@@ -794,7 +794,7 @@ pub(crate) fn user_unmap_huge(root: u64, virt: usize, table: u64) {
 
 /// Loads `root` in TTBR0. A value of 0 loads the empty table.
 pub(crate) fn activate(root: u64) {
-    if active().swap(root, Ordering::AcqRel) == root {
+    if active().swap(root, Ordering::SeqCst) == root {
         return;
     }
     load_ttbr0(if root == 0 { empty_root() } else { root });

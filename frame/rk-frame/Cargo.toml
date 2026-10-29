@@ -9,5 +9,10 @@ repository.workspace = true
 authors.workspace = true
 publish.workspace = true
 
+[features]
+# The big kernel lock: only one CPU at a time runs kernel code. It is off by default, and it is
+# only for a comparison with the old kernel (#405).
+big-lock = []
+
 [lints]
 workspace = true

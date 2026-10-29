@@ -11,12 +11,22 @@
 //! The kernel runs with interrupts off, so a task in the kernel is not preempted. A task that runs
 //! user code yields when `should_yield` tells that its time slice is over.
 //!
-//! Each CPU runs user code at the same time, but only one CPU at a time runs kernel code. A CPU
-//! holds the kernel lock while it runs kernel code, and releases it when it enters user mode or
-//! waits for an interrupt. This is the big kernel lock of Linux 2.0, and it keeps the code of the
-//! kernel, which was written for one CPU, correct. The scheduler can keep a queue for each CPU, and
-//! tells which CPU gets a task that becomes runnable. Each CPU has its own current task, and an
-//! idle task that runs when no other task can run.
+//! The CPUs run user code and kernel code at the same time. The data that two CPUs can use is
+//! in locks or in atomic values. The scheduler can keep a queue for each CPU, and tells which CPU
+//! gets a task that becomes runnable. Each CPU has its own current task, and an idle task that
+//! runs when no other task can run.
+//!
+//! A task that blocks or yields is on its CPU until the switch to the next task saved its
+//! registers. Another CPU must not run it before then. As `on_cpu` of Linux, the flag `on_cpu` of
+//! a task is set until the next task of the CPU clears it in `finish_switch`. A wake of a task
+//! that blocks does not put it in a queue while the flag is set, and the load balancer of the
+//! scheduler does not move a task with the flag. The CPU of the task puts it in a queue after the
+//! switch.
+//!
+//! The `big-lock` feature keeps the big kernel lock of Linux 2.0: then only one CPU at a time runs
+//! kernel code. A CPU holds the lock while it runs kernel code, and releases it when it enters user
+//! mode or waits for an interrupt. The feature is for the comparison with the old kernel, and the
+//! kernel is correct without it.
 //!
 //! An interrupt handler takes no lock, so it cannot wake a task. The work that an interrupt starts
 //! runs later as a bottom half, when the kernel is back from the interrupt and holds no lock: in
@@ -45,12 +55,20 @@ pub const TIME_SLICE: u64 = 4;
 const RUNNING: u8 = 0;
 /// The task is in the queue of the scheduler.
 const RUNNABLE: u8 = 1;
-/// The task waits for a `wake`.
+/// The task will wait for a `wake`, but it is still on the CPU and it can stop the wait. A `wake`
+/// makes it `RUNNING` again, so it does not switch.
 const BLOCKED: u8 = 2;
 /// The task returned from its start function.
 const EXITED: u8 = 3;
 /// The task is the idle task of a CPU. It is never in the queue of the scheduler.
 const IDLE: u8 = 4;
+/// The task waits for a `wake`, and its CPU switches to another task. A `wake` makes it `WAKING`.
+const SLEEPING: u8 = 5;
+/// The task waits for a `wake`, and it is not on a CPU. A `wake` puts it in a queue.
+const ASLEEP: u8 = 6;
+/// A `wake` came while the task was `SLEEPING`. The CPU of the task puts it in a queue after the
+/// switch.
+const WAKING: u8 = 7;
 
 /// Why a task goes into the queue of the scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +102,17 @@ pub trait Scheduler: Sync {
     fn put_prev(&self, _task: &Task, _sleeping: bool) {}
     /// The task comes on the CPU.
     fn set_next(&self, _task: &Task) {}
+    /// Tells if the current task `task`, which yields, can stay in the queue of this CPU. If not,
+    /// rk-frame gives it to `enqueue` after the switch to the next task, so that no other CPU runs
+    /// it before its registers are saved.
+    fn can_stay(&self, _task: &Task) -> bool {
+        true
+    }
+    /// Tells if the queue of this CPU has a task, so that the idle task must not wait for an
+    /// interrupt.
+    fn has_queued(&self) -> bool {
+        false
+    }
     /// Tells if the current task `task` would run again at once after a yield, because no other
     /// task waits for this CPU and the task can stay on it. `yield_now` then returns at once, as
     /// `yield_task_fair` of Linux does when the queue has only the current task.
@@ -175,6 +204,8 @@ pub struct Task {
     yield_tick: AtomicU64,
     /// A change of the task asks for a call to `Scheduler::should_yield` before the next tick.
     resched: AtomicBool,
+    /// The task is on a CPU, or its CPU did not save its registers yet.
+    on_cpu: AtomicBool,
     context: UnsafeCell<TaskContext>,
     entry: SpinLock<Option<Entry>>,
     data: Box<dyn Any + Send + Sync>,
@@ -185,8 +216,8 @@ pub struct Task {
 }
 
 // SAFETY: `context` is written only by `switch` on the CPU where the task stops, while interrupts
-// are off and the task is not in a queue. It is read only by the switch that starts the task
-// again. The other fields are atomic, locked or not changed after the task is made.
+// are off and `on_cpu` is set. It is read only by the switch that starts the task again, after
+// `on_cpu` is clear. The other fields are atomic, locked or not changed after the task is made.
 unsafe impl Sync for Task {}
 
 impl core::fmt::Debug for Task {
@@ -206,87 +237,117 @@ struct PerCpu {
     /// The scheduler asks the task on the CPU to call `Scheduler::should_yield` before the next
     /// tick, as `TIF_NEED_RESCHED` of Linux.
     resched: AtomicBool,
+    /// The task before the last switch. `finish_switch` clears its `on_cpu` flag.
+    prev: SpinLock<Option<Arc<Task>>>,
+    /// The previous task yielded and must go to the queue of another CPU after the switch.
+    migrate: AtomicBool,
 }
 
 static CPUS: [PerCpu; MAX_CPUS] = [const {
-    PerCpu { current: SpinLock::new(None), idle: Once::new(), resched: AtomicBool::new(false) }
+    PerCpu {
+        current: SpinLock::new(None),
+        idle: Once::new(),
+        resched: AtomicBool::new(false),
+        prev: SpinLock::new(None),
+        migrate: AtomicBool::new(false),
+    }
 }; MAX_CPUS];
 
 fn this_cpu() -> &'static PerCpu {
     &CPUS[cpu::id()]
 }
 
-/// The kernel lock. The boot CPU holds it from the start.
-static KERNEL_LOCK: AtomicBool = AtomicBool::new(true);
+#[cfg(feature = "big-lock")]
+mod big_lock {
+    use super::{cpu, smp};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// The CPUs that wait for an interrupt in `kernel_lock`.
-static LOCK_WAITERS: AtomicU64 = AtomicU64::new(0);
+    /// The kernel lock. The boot CPU holds it from the start.
+    static KERNEL_LOCK: AtomicBool = AtomicBool::new(true);
 
-/// The tries of `kernel_lock` before the CPU waits for an interrupt. A short spin takes a lock
-/// that is free again soon without an interrupt. On TCG with 4 CPUs on a busy host, hackbench took
-/// 235 s with a spin only, 123 s with 4096 tries and 70 s with 64 tries (#396).
-const LOCK_SPINS: u32 = 1 << 6;
+    /// The CPUs that wait for an interrupt in `kernel_lock`.
+    static LOCK_WAITERS: AtomicU64 = AtomicU64::new(0);
 
-/// Takes the kernel lock. While the CPU waits, it does the TLB requests of the other CPUs, because
-/// the CPU that holds the lock can wait for them.
-///
-/// After `LOCK_SPINS` tries, the CPU waits for an interrupt, and `kernel_unlock` sends one. In a
-/// virtual machine, a spin uses a CPU of the host. When the host has fewer free CPUs than the
-/// machine, for example on a busy host, the spin of a CPU can stop the host from running the CPU
-/// that holds the lock, and the kernel becomes very slow. The callers hold no lock and no state,
-/// as the idle loop, so the interrupt handlers can run during the wait.
-pub(crate) fn kernel_lock() {
-    let mut tries = 0;
-    while KERNEL_LOCK
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        smp::poll();
-        if tries < LOCK_SPINS {
-            tries += 1;
-            core::hint::spin_loop();
-            continue;
-        }
-        let bit = 1u64 << cpu::id();
-        // The order of the bit and the test is the order of the release and the test of
-        // `kernel_unlock`, so one of the two CPUs sees the other.
-        LOCK_WAITERS.fetch_or(bit, Ordering::SeqCst);
-        if KERNEL_LOCK.load(Ordering::SeqCst) {
-            let enabled = crate::irq::enabled();
-            // An interrupt that comes before `wait` stays pending, and `wait` takes it.
-            crate::irq::wait();
-            if !enabled {
-                crate::irq::disable();
+    /// The tries of `kernel_lock` before the CPU waits for an interrupt. A short spin takes a lock
+    /// that is free again soon without an interrupt. On TCG with 4 CPUs on a busy host, hackbench
+    /// took 235 s with a spin only, 123 s with 4096 tries and 70 s with 64 tries (#396).
+    const LOCK_SPINS: u32 = 1 << 6;
+
+    /// Takes the kernel lock. While the CPU waits, it does the TLB requests of the other CPUs,
+    /// because the CPU that holds the lock can wait for them.
+    ///
+    /// After `LOCK_SPINS` tries, the CPU waits for an interrupt, and `kernel_unlock` sends one. In
+    /// a virtual machine, a spin uses a CPU of the host. When the host has fewer free CPUs than the
+    /// machine, the spin of a CPU can stop the host from running the CPU that holds the lock, and
+    /// the kernel becomes very slow. The callers hold no lock and no state, as the idle loop, so
+    /// the interrupt handlers can run during the wait.
+    pub(crate) fn kernel_lock() {
+        let mut tries = 0;
+        while KERNEL_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            smp::poll();
+            if tries < LOCK_SPINS {
+                tries += 1;
+                core::hint::spin_loop();
+                continue;
             }
+            let bit = 1u64 << cpu::id();
+            // The order of the bit and the test is the order of the release and the test of
+            // `kernel_unlock`, so one of the two CPUs sees the other.
+            LOCK_WAITERS.fetch_or(bit, Ordering::SeqCst);
+            if KERNEL_LOCK.load(Ordering::SeqCst) {
+                let enabled = crate::irq::enabled();
+                // An interrupt that comes before `wait` stays pending, and `wait` takes it.
+                crate::irq::wait();
+                if !enabled {
+                    crate::irq::disable();
+                }
+            }
+            LOCK_WAITERS.fetch_and(!bit, Ordering::SeqCst);
         }
-        LOCK_WAITERS.fetch_and(!bit, Ordering::SeqCst);
+    }
+
+    /// Releases the kernel lock, and wakes a CPU that waits for it.
+    pub(crate) fn kernel_unlock() {
+        KERNEL_LOCK.store(false, Ordering::SeqCst);
+        let waiters = LOCK_WAITERS.load(Ordering::SeqCst);
+        if waiters != 0 {
+            // Each release wakes the next CPU after this one, so each CPU gets its turn. The timer
+            // interrupt also wakes each CPU at each tick.
+            let me = cpu::id() as u32;
+            let next = waiters.rotate_right(me + 1).trailing_zeros();
+            smp::reschedule(((me + 1 + next) % 64) as usize);
+        }
     }
 }
 
-/// Releases the kernel lock, and wakes a CPU that waits for it.
-pub(crate) fn kernel_unlock() {
-    KERNEL_LOCK.store(false, Ordering::SeqCst);
-    let waiters = LOCK_WAITERS.load(Ordering::SeqCst);
-    if waiters != 0 {
-        // Each release wakes the next CPU after this one, so each CPU gets its turn. The timer
-        // interrupt also wakes each CPU at each tick.
-        let me = cpu::id() as u32;
-        let next = waiters.rotate_right(me + 1).trailing_zeros();
-        smp::reschedule(((me + 1 + next) % 64) as usize);
-    }
-}
+#[cfg(feature = "big-lock")]
+pub(crate) use big_lock::{kernel_lock, kernel_unlock};
+
+/// Takes the kernel lock of the `big-lock` feature. Without the feature, there is no such lock.
+#[cfg(not(feature = "big-lock"))]
+#[inline]
+pub(crate) fn kernel_lock() {}
+
+/// Releases the kernel lock of the `big-lock` feature.
+#[cfg(not(feature = "big-lock"))]
+#[inline]
+pub(crate) fn kernel_unlock() {}
 
 /// The CPUs that wait for an interrupt in their idle task.
 static IDLE_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Wakes the CPU `id` if it waits in its idle task, so that it runs a task from its queue.
 fn kick(id: usize) {
-    if id != cpu::id() && id < 64 && IDLE_MASK.load(Ordering::Acquire) & 1 << id != 0 {
+    // The task is in the queue before the test of the mask, and the idle task sets its bit before
+    // it tests its queue. Thus one of the two sees the other.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    if id != cpu::id() && id < 64 && IDLE_MASK.load(Ordering::SeqCst) & 1 << id != 0 {
         smp::reschedule(id);
     }
 }
-/// An exited task that the next task drops after the switch, when its stack is not in use.
-static EXITED_TASK: SpinLock<Option<Arc<Task>>> = SpinLock::new(None);
 
 /// Makes a new task.
 pub struct TaskOptions {
@@ -349,6 +410,7 @@ impl TaskOptions {
             cpu_ns: AtomicU64::new(0),
             yield_tick: AtomicU64::new(u64::MAX),
             resched: AtomicBool::new(false),
+            on_cpu: AtomicBool::new(false),
             context: UnsafeCell::new(TaskContext::new(stack.top())),
             entry: SpinLock::new(Some(self.entry)),
             data: self.data,
@@ -379,6 +441,7 @@ impl Task {
             cpu_ns: AtomicU64::new(0),
             yield_tick: AtomicU64::new(u64::MAX),
             resched: AtomicBool::new(false),
+            on_cpu: AtomicBool::new(true),
             context: UnsafeCell::new(TaskContext::default()),
             entry: SpinLock::new(None),
             data: Box::new(()),
@@ -425,19 +488,38 @@ impl Task {
 
     /// Tells if the task waits in a wait queue.
     pub fn is_blocked(&self) -> bool {
-        self.state.load(Ordering::Acquire) == BLOCKED
+        matches!(self.state.load(Ordering::Acquire), BLOCKED | SLEEPING | ASLEEP)
+    }
+
+    /// Tells if the task is on a CPU, or if its CPU did not save its registers yet. The load
+    /// balancer of the scheduler must not move such a task to another CPU.
+    pub fn is_on_cpu(&self) -> bool {
+        self.on_cpu.load(Ordering::Acquire)
     }
 
     /// Makes a blocked task runnable. Gives `false` if the task was not blocked.
+    ///
+    /// A task that did not switch yet runs on, as `ttwu_runnable` of Linux. A task whose CPU did
+    /// not save its registers yet goes to a queue after the switch, as the wait for `on_cpu` in
+    /// `try_to_wake_up` of Linux does. Thus the function does not wait for another CPU.
     pub fn wake(self: &Arc<Self>) -> bool {
-        let woken = self
-            .state
-            .compare_exchange(BLOCKED, RUNNABLE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if woken {
-            kick(scheduler().enqueue(self.clone(), Enqueue::Wake));
+        let mut state = self.state.load(Ordering::SeqCst);
+        loop {
+            let new = match state {
+                BLOCKED => RUNNING,
+                SLEEPING => WAKING,
+                ASLEEP => RUNNABLE,
+                _ => return false,
+            };
+            match self.state.compare_exchange(state, new, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) if new == RUNNABLE => {
+                    kick(scheduler().enqueue(self.clone(), Enqueue::Wake));
+                    return true;
+                }
+                Ok(_) => return true,
+                Err(now) => state = now,
+            }
         }
-        woken
     }
 }
 
@@ -504,7 +586,13 @@ pub fn yield_now() {
     }
     current.state.store(RUNNABLE, Ordering::Release);
     scheduler().put_prev(&current, false);
-    kick(scheduler().enqueue(current, Enqueue::Yield));
+    if scheduler().can_stay(&current) {
+        kick(scheduler().enqueue(current, Enqueue::Yield));
+    } else {
+        // Another CPU could take the task from its queue before this CPU saved its registers.
+        this_cpu().migrate.store(true, Ordering::Relaxed);
+        drop(current);
+    }
     schedule();
 }
 
@@ -544,8 +632,21 @@ impl Drop for IrqOff {
 fn schedule() {
     let _irq = IrqOff::new();
     let current = Task::current();
-    let state = current.state.load(Ordering::Acquire);
-    if state == BLOCKED || state == EXITED {
+    let mut state = current.state.load(Ordering::Acquire);
+    if state == RUNNING {
+        // A `wake` came before the task blocked, so it runs on. It is in no queue.
+        return;
+    }
+    if state == BLOCKED {
+        // From here, a `wake` does not stop the switch.
+        match current.state.compare_exchange(BLOCKED, SLEEPING, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => state = SLEEPING,
+            // A `wake` made the task `RUNNING` again.
+            Err(_) => return,
+        }
+    }
+    if state == SLEEPING || state == EXITED {
         scheduler().put_prev(&current, true);
     }
     let next = scheduler().dequeue().unwrap_or_else(idle_task);
@@ -563,19 +664,21 @@ fn schedule() {
     if Arc::ptr_eq(&current, &next) {
         return;
     }
+    // A task in a queue of this CPU is not on another CPU, because a task goes to a queue of
+    // another CPU only after `finish_switch`. The wait is for safety.
+    while next.on_cpu.swap(true, Ordering::Acquire) {
+        crate::sync::wait_hint();
+    }
     let from = current.context.get();
     let to = next.context.get().cast_const();
     *this_cpu().current.lock() = Some(next);
-    if current.state.load(Ordering::Acquire) == EXITED {
-        *EXITED_TASK.lock() = Some(current);
-    } else {
-        // The queue, a wait queue or a `wake` holds the current task, so its context lives.
-        drop(current);
-    }
-    // SAFETY: interrupts are off, and the CPU holds the kernel lock, so no other CPU switches. `to`
-    // is the context of `next`, which the current task of this CPU holds, and it is not on a CPU.
-    // `from` is the context of the current task, which the CPU held until now and which a queue,
-    // a wait queue, the idle task of the CPU or `EXITED_TASK` holds now.
+    // `finish_switch` on the next task clears the flag `on_cpu` of the current task.
+    *this_cpu().prev.lock() = Some(current);
+    // SAFETY: interrupts are off. `to` is the context of `next`, which the current task of this
+    // CPU holds now. Its `on_cpu` flag was clear, so its CPU saved its registers, and no other CPU
+    // switches to it while the flag is set. `from` is the context of the current task, which the
+    // previous task of this CPU holds until `finish_switch`, and no other CPU switches to it while
+    // its `on_cpu` flag is set.
     unsafe { switch(from, to) };
     finish_switch();
 }
@@ -595,6 +698,7 @@ fn idle_task() -> Arc<Task> {
                 cpu_ns: AtomicU64::new(0),
                 yield_tick: AtomicU64::new(u64::MAX),
                 resched: AtomicBool::new(false),
+                on_cpu: AtomicBool::new(false),
                 context: UnsafeCell::new(TaskContext::new(stack.top())),
                 entry: SpinLock::new(Some(Box::new(|| idle_loop()))),
                 data: Box::new(()),
@@ -612,15 +716,18 @@ fn idle_loop() -> ! {
     loop {
         run_bottom_half();
         schedule();
-        // The CPU holds the kernel lock, so a task that is made runnable after this point sees
-        // the CPU in the mask and wakes it. An interrupt that comes before `wait` stays pending,
-        // and `wait` takes it.
-        IDLE_MASK.fetch_or(bit, Ordering::AcqRel);
-        kernel_unlock();
-        crate::irq::wait();
-        crate::irq::disable();
-        kernel_lock();
-        IDLE_MASK.fetch_and(!bit, Ordering::AcqRel);
+        // A task that goes to the queue of this CPU after this point sees the CPU in the mask and
+        // wakes it. A task that came before is in the queue. An interrupt that comes before `wait`
+        // stays pending, and `wait` takes it.
+        IDLE_MASK.fetch_or(bit, Ordering::SeqCst);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if !scheduler().has_queued() {
+            kernel_unlock();
+            crate::irq::wait();
+            crate::irq::disable();
+            kernel_lock();
+        }
+        IDLE_MASK.fetch_and(!bit, Ordering::SeqCst);
     }
 }
 
@@ -634,10 +741,30 @@ pub(crate) fn run_secondary() -> ! {
     idle_loop()
 }
 
-/// Drops the task that exited before the switch to this task.
+/// Ends the switch from the previous task of this CPU, on the stack of the new task, as
+/// `finish_task_switch` of Linux. The registers of the previous task are saved now, so another
+/// CPU can run it: its `on_cpu` flag is cleared, and a task that a `wake` or a yield gave to
+/// another CPU goes to a queue. The task that exited is dropped here, when its stack is not in use.
 fn finish_switch() {
-    let exited = EXITED_TASK.lock().take();
-    drop(exited);
+    let Some(prev) = this_cpu().prev.lock().take() else { return };
+    prev.on_cpu.store(false, Ordering::SeqCst);
+    let state = prev.state.load(Ordering::SeqCst);
+    let wake = match state {
+        // A `wake` that comes after this point sees `ASLEEP`, and puts the task in a queue.
+        SLEEPING => prev
+            .state
+            .compare_exchange(SLEEPING, ASLEEP, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err(),
+        WAKING => true,
+        _ => false,
+    };
+    if wake {
+        // Only `wake` makes the state `WAKING`, and only this CPU changes it after that.
+        prev.state.store(RUNNABLE, Ordering::SeqCst);
+        kick(scheduler().enqueue(prev, Enqueue::Wake));
+    } else if state == RUNNABLE && this_cpu().migrate.swap(false, Ordering::Relaxed) {
+        kick(scheduler().enqueue(prev, Enqueue::Yield));
+    }
 }
 
 /// The first code of a new task, on its own stack. `rk_task_entry` calls it.
@@ -685,11 +812,22 @@ pub(crate) fn run_bottom_half() {
     for task in expired.values().filter_map(Weak::upgrade) {
         task.wake();
     }
+    // One CPU at a time runs the functions, as a tasklet of Linux runs on one CPU at a time. The
+    // functions were written for one CPU, for example the read of the console in rk-drv-tty. A CPU
+    // that finds them in use goes on, because the other CPU runs them now, and the next interrupt
+    // runs them again.
+    if BOTTOM_HALF_BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
     let halves = *BOTTOM_HALVES.lock();
     for f in halves.into_iter().flatten() {
         f();
     }
+    BOTTOM_HALF_BUSY.store(false, Ordering::Release);
 }
+
+/// A CPU runs the functions of `add_bottom_half`.
+static BOTTOM_HALF_BUSY: AtomicBool = AtomicBool::new(false);
 
 /// A queue of tasks that wait for a condition.
 pub struct WaitQueue {
@@ -710,18 +848,13 @@ impl WaitQueue {
                 return value;
             }
             let current = Task::current();
-            current.state.store(BLOCKED, Ordering::Release);
+            current.state.store(BLOCKED, Ordering::SeqCst);
             self.waiters.lock().push_back(current.clone());
             // A wake that comes between the test and here finds the task in the queue.
             if let Some(value) = cond() {
-                if current.state.swap(RUNNING, Ordering::AcqRel) == RUNNABLE {
-                    // A wake made the task runnable and put it in the queue of the scheduler.
-                    // The task runs again from there, so it lets the other tasks run first.
-                    current.state.store(RUNNABLE, Ordering::Release);
-                    schedule();
-                } else {
-                    self.waiters.lock().retain(|t| !Arc::ptr_eq(t, &current));
-                }
+                // A wake of a task that did not switch only makes it `RUNNING`.
+                current.state.store(RUNNING, Ordering::SeqCst);
+                self.waiters.lock().retain(|t| !Arc::ptr_eq(t, &current));
                 return value;
             }
             drop(current);
@@ -782,17 +915,14 @@ pub fn wait_any<R>(
     if deadline != u64::MAX {
         TIMERS.lock().insert(key, Arc::downgrade(&current));
     }
-    current.state.store(BLOCKED, Ordering::Release);
+    current.state.store(BLOCKED, Ordering::SeqCst);
     for queue in queues {
         queue.waiters.lock().push_back(current.clone());
     }
     let value = cond();
     if value.is_some() || crate::time::ticks() >= deadline {
-        if current.state.swap(RUNNING, Ordering::AcqRel) == RUNNABLE {
-            // A wake made the task runnable, as in `wait_until`.
-            current.state.store(RUNNABLE, Ordering::Release);
-            schedule();
-        }
+        // A wake of a task that did not switch only makes it `RUNNING`, as in `wait_until`.
+        current.state.store(RUNNING, Ordering::SeqCst);
     } else {
         block();
     }

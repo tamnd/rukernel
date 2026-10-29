@@ -4022,6 +4022,150 @@ static void test_blk(void)
 	close(fd);
 }
 
+/* The rounds of each check of system calls on several CPUs at the same time (#405). */
+#define PAR_ROUNDS 2000
+
+/* Pins the calling thread to the CPU `c`. */
+static void pin_cpu(int c)
+{
+	cpu_set_t one;
+	CPU_ZERO(&one);
+	CPU_SET(c, &one);
+	sched_setaffinity(0, sizeof(one), &one);
+}
+
+/* The word of a futex ping-pong, and the waits that timed out. */
+static volatile int par_word;
+static int par_timeouts;
+
+/* One side of a futex ping-pong on the CPU `arg`: it waits for its turn, then gives the turn to
+ * the other side. A lost wake gives a timeout. */
+static void *par_futex(void *arg)
+{
+	int cpu = (int)(long)arg, me = cpu & 1;
+	pin_cpu(cpu);
+	for (int i = 0; i < PAR_ROUNDS; i++) {
+		int w;
+		while ((w = __atomic_load_n(&par_word, __ATOMIC_ACQUIRE)) != me) {
+			struct timespec ts = { 1, 0 };
+			if (syscall(SYS_futex, &par_word, FUTEX_WAIT_PRIVATE, w, &ts) == -1 &&
+			    errno == ETIMEDOUT)
+				__atomic_fetch_add(&par_timeouts, 1, __ATOMIC_RELAXED);
+		}
+		__atomic_store_n(&par_word, !me, __ATOMIC_RELEASE);
+		syscall(SYS_futex, &par_word, FUTEX_WAKE_PRIVATE, 1);
+	}
+	return NULL;
+}
+
+/* The sockets of the datagram check, and the result of each side. */
+static int par_fds[2], par_ok[2];
+
+/* Sends a datagram to the other socket of the pair and takes one from it, while the other side
+ * does the same on another CPU. Both sockets have SO_PASSCRED. */
+static void *par_dgram(void *arg)
+{
+	int side = (int)(long)arg;
+	pin_cpu(side);
+	char buf[64];
+	int ok = 1;
+	for (int i = 0; i < PAR_ROUNDS && ok; i++)
+		ok = send(par_fds[side], "ping", 4, 0) == 4 &&
+		     recv(par_fds[side], buf, sizeof(buf), 0) == 4;
+	par_ok[side] = ok;
+	return NULL;
+}
+
+/* The reads that gave EFAULT, and the end of the forks. */
+static int par_efault, par_done;
+
+/* Reads into new pages while the main thread forks on another CPU. A fork makes the private pages
+ * read only, so the read must fault the page in again and not give EFAULT. */
+static void *par_read(void *arg)
+{
+	pin_cpu((int)(long)arg);
+	int fd = open("/dev/zero", O_RDONLY);
+	while (fd >= 0 && !__atomic_load_n(&par_done, __ATOMIC_ACQUIRE)) {
+		char *m = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m == MAP_FAILED)
+			break;
+		for (int j = 0; j < 16; j++) {
+			m[j * 4096] = 1;
+			if (read(fd, m + j * 4096, 4096) < 0 && errno == EFAULT)
+				__atomic_fetch_add(&par_efault, 1, __ATOMIC_RELAXED);
+		}
+		munmap(m, 16 * 4096);
+	}
+	if (fd >= 0)
+		close(fd);
+	return NULL;
+}
+
+/* Calls getpid on the CPU `arg`, and gives 1 if each call gives the same value. */
+static void *par_getpid(void *arg)
+{
+	pin_cpu((int)(long)arg);
+	pid_t pid = getpid();
+	long same = 1;
+	for (int i = 0; i < 20 * PAR_ROUNDS; i++)
+		same &= getpid() == pid;
+	return (void *)same;
+}
+
+/* Runs futexes, sockets, faults and system calls on several CPUs at the same time. Before #405,
+ * only one CPU at a time ran kernel code, so these races could not occur. */
+static void test_smp_parallel(int cpus)
+{
+	pthread_t t[4];
+	int n = cpus < 4 ? cpus : 4;
+
+	pthread_create(&t[0], NULL, par_futex, (void *)0L);
+	pthread_create(&t[1], NULL, par_futex, (void *)1L);
+	pthread_join(t[0], NULL);
+	pthread_join(t[1], NULL);
+	check("a futex ping-pong on two CPUs loses no wake", par_timeouts == 0);
+
+	int on = 1;
+	int ok = socketpair(AF_UNIX, SOCK_DGRAM, 0, par_fds) == 0 &&
+		 setsockopt(par_fds[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0 &&
+		 setsockopt(par_fds[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0;
+	if (ok) {
+		pthread_create(&t[0], NULL, par_dgram, (void *)0L);
+		pthread_create(&t[1], NULL, par_dgram, (void *)1L);
+		pthread_join(t[0], NULL);
+		pthread_join(t[1], NULL);
+		close(par_fds[0]);
+		close(par_fds[1]);
+	}
+	check("two CPUs send datagrams with SO_PASSCRED to each other",
+	      ok && par_ok[0] && par_ok[1]);
+
+	pthread_create(&t[0], NULL, par_read, (void *)1L);
+	pin_cpu(0);
+	int forks = 1;
+	for (int i = 0; i < 50 && forks; i++) {
+		pid_t pid = fork();
+		if (pid == 0)
+			_exit(0);
+		int status;
+		forks = pid > 0 && waitpid(pid, &status, 0) == pid;
+	}
+	__atomic_store_n(&par_done, 1, __ATOMIC_RELEASE);
+	pthread_join(t[0], NULL);
+	check("a read on one CPU during a fork on another CPU gives no EFAULT",
+	      forks && par_efault == 0);
+
+	for (int i = 0; i < n; i++)
+		pthread_create(&t[i], NULL, par_getpid, (void *)(long)i);
+	long same = 1;
+	for (int i = 0; i < n; i++) {
+		void *r;
+		pthread_join(t[i], &r);
+		same &= (long)r;
+	}
+	check("getpid on each CPU at the same time", same);
+}
+
 static void test_smp(void)
 {
 	cpu_set_t set;
@@ -4053,6 +4197,8 @@ static void test_smp(void)
 	check("a child of fork runs on the CPU of the mask of its parent",
 	      pinned > 0 && waitpid(pinned, &pstatus, 0) == pinned && WIFEXITED(pstatus) &&
 		      WEXITSTATUS(pstatus) == 0);
+	sched_setaffinity(0, sizeof(set), &set);
+	test_smp_parallel(cpus);
 	sched_setaffinity(0, sizeof(set), &set);
 
 	int start[2];

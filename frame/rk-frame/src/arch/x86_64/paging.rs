@@ -114,8 +114,8 @@ fn read_entry(table: u64, index: usize) -> u64 {
 }
 
 fn write_entry(table: u64, index: usize, value: u64) {
-    // SAFETY: as for `read_entry`. The caller holds the `TABLES` lock, or the tables are not in
-    // use yet.
+    // SAFETY: as for `read_entry`. The caller holds the `TABLES` lock for a kernel table or the
+    // lock of the `VmSpace` for a user table, or the tables are not in use yet.
     unsafe { entry(table, index).write_volatile(value) };
 }
 
@@ -405,8 +405,8 @@ pub(crate) fn query(virt: usize) -> Option<PageInfo> {
 /// below the end of the lower half is not used, as in Linux.
 pub(crate) const USER_END: usize = 0x0000_7fff_ffff_f000;
 
-/// The top level table that CR3 of each CPU has now. Each CPU changes only its own value, with
-/// the big kernel lock or before it runs tasks.
+/// The top level table that CR3 of each CPU has now. Each CPU changes only its own value, before
+/// it loads the table. `smp::shootdown_range` reads the values of the other CPUs.
 static ACTIVE: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 fn active() -> &'static AtomicU64 {
@@ -652,7 +652,7 @@ pub(crate) fn user_unmap_huge(root: u64, virt: usize, table: u64) {
 /// Loads `root` into CR3. A value of 0 loads the kernel table.
 pub(crate) fn activate(root: u64) {
     let root = if root == 0 { KERNEL_PML4.load(Ordering::Acquire) } else { root };
-    if active().swap(root, Ordering::AcqRel) == root {
+    if active().swap(root, Ordering::SeqCst) == root {
         return;
     }
     // SAFETY: `root` is the kernel table or a table from `new_user_root`. Each one has the kernel

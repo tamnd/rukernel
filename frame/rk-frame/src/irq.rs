@@ -111,7 +111,7 @@ impl Line {
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
             if !enabled() {
-                core::hint::spin_loop();
+                crate::sync::wait_hint();
                 return;
             }
             #[cfg(target_arch = "aarch64")]

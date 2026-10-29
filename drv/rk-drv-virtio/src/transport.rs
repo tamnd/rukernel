@@ -128,7 +128,7 @@ impl Transport {
     pub(crate) fn wait(&self, index: u16) {
         match each!(self, t => t.line(index)) {
             Some(line) => line.wait(),
-            None => core::hint::spin_loop(),
+            None => rk_frame::sync::wait_hint(),
         }
     }
 

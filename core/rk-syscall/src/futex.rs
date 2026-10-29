@@ -127,12 +127,20 @@ fn wake_key(key: Key, n: u32, bitset: u32) -> u32 {
         if queue.is_empty() {
             table.remove(&key);
         }
+        // The flag changes under the lock, so `remove_waiter` that does not find a waiter sees it.
+        for w in &woken {
+            w.woken.store(true, Ordering::Release);
+        }
     }
     for w in &woken {
-        w.woken.store(true, Ordering::Release);
         w.queue.wake_all();
     }
     woken.len() as u32
+}
+
+/// Puts `waiter` in the queue of `key`. A wake that comes after this finds the waiter.
+fn queue(key: Key, waiter: &Arc<Waiter>) {
+    FUTEXES.lock().entry(key).or_default().push_back(waiter.clone());
 }
 
 /// Removes `waiter` from the table, if a wake did not remove it. A requeue can move a waiter, so
@@ -149,16 +157,14 @@ fn remove_waiter(waiter: &Arc<Waiter>) {
     }
 }
 
-/// Puts `waiter` in the queue of `key` and waits for a wake. `deadline` is a tick count. A signal
+/// Waits for a wake of `waiter`, which `queue` put in a queue. `deadline` is a tick count. A signal
 /// gives `on_signal`. Gives `Ok` if a wake came, also after the timeout or the signal.
 fn sleep(
     thread: &Thread,
-    key: Key,
     waiter: &Arc<Waiter>,
     deadline: Option<u64>,
     on_signal: Errno,
 ) -> Result<(), Errno> {
-    FUTEXES.lock().entry(key).or_default().push_back(waiter.clone());
     let cond = || {
         if waiter.woken.load(Ordering::Acquire) {
             Some(Ok(()))
@@ -173,6 +179,7 @@ fn sleep(
         None => waiter.queue.wait_until(cond),
     };
     if !waiter.woken.load(Ordering::Acquire) {
+        // A wake that removed the waiter set `woken` under the lock of the table.
         remove_waiter(waiter);
     }
     if waiter.woken.load(Ordering::Acquire) { Ok(()) } else { r }
@@ -189,14 +196,25 @@ fn wait(
     bitset: u32,
 ) -> SysResult {
     let key = key(vm, addr, private)?;
-    if read_word(vm, addr)? != val {
-        return Err(Errno::EAGAIN);
+    // The waiter is in the queue before the read of the word, as in `futex_wait_setup` of Linux
+    // (kernel/futex/waitwake.c). A thread that changes the word and then calls `FUTEX_WAKE` on
+    // another CPU finds the waiter, or the read sees the new word. Thus no wake is lost.
+    let waiter = Waiter::new(thread.tid(), bitset);
+    queue(key, &waiter);
+    let word = read_word(vm, addr);
+    if word.as_ref().is_ok_and(|&w| w == val) {
+        // Linux starts a wait with a timeout again through `restart_syscall`. rukernel does not
+        // have it yet, so that wait gives `EINTR`.
+        let on_signal = if deadline.is_some() { Errno::EINTR } else { Errno::ERESTARTSYS };
+        sleep(thread, &waiter, deadline, on_signal)?;
+        return Ok(0);
     }
-    // Linux starts a wait with a timeout again through `restart_syscall`. rukernel does not have
-    // it yet, so that wait gives `EINTR`.
-    let on_signal = if deadline.is_some() { Errno::EINTR } else { Errno::ERESTARTSYS };
-    sleep(thread, key, &Waiter::new(thread.tid(), bitset), deadline, on_signal)?;
-    Ok(0)
+    remove_waiter(&waiter);
+    if waiter.woken.load(Ordering::Acquire) {
+        return Ok(0);
+    }
+    word?;
+    Err(Errno::EAGAIN)
 }
 
 /// Takes the priority inheritance futex at `addr` for `thread`, as `futex_lock_pi` of Linux does.
@@ -232,14 +250,25 @@ fn lock_pi(
         if rk_proc::find_thread(owner).is_none() {
             return Err(Errno::ESRCH);
         }
-        if word & FUTEX_WAITERS == 0 && !replace_word(vm, addr, word, word | FUTEX_WAITERS)? {
+        // The waiter is in the queue before the word gets `FUTEX_WAITERS`. An unlock that
+        // comes before the change of the word changes the word, so the change fails. An unlock
+        // that comes after it finds the waiter.
+        let waiter = Waiter::new(tid, FUTEX_BITSET_MATCH_ANY);
+        queue(key, &waiter);
+        let marked = replace_word(vm, addr, word, word | FUTEX_WAITERS);
+        if !marked.as_ref().is_ok_and(|&m| m) {
+            remove_waiter(&waiter);
+            if waiter.owner.load(Ordering::Acquire) {
+                return Ok(0);
+            }
+            marked?;
             continue;
         }
-        let waiter = Waiter::new(tid, FUTEX_BITSET_MATCH_ANY);
-        sleep(thread, key, &waiter, deadline, Errno::ERESTARTNOINTR)?;
+        let slept = sleep(thread, &waiter, deadline, Errno::ERESTARTNOINTR);
         if waiter.owner.load(Ordering::Acquire) {
             return Ok(0);
         }
+        slept?;
     }
 }
 
@@ -251,25 +280,42 @@ fn unlock_pi(thread: &Thread, vm: &Arc<AddressSpace>, addr: usize, private: bool
     if word & FUTEX_TID_MASK != thread.tid() {
         return Err(Errno::EPERM);
     }
+    // A thread that waits on another CPU can add `FUTEX_WAITERS` to the word at any time, so
+    // each change of the word is a compare and exchange that the function does again on failure.
+    // The change of the word and the flags of the waiter are under the lock of the table, as the
+    // hash bucket lock in `wake_futex_pi` of Linux (kernel/futex/pi.c). Thus the new owner does not
+    // return before the word has its thread ID, and a waiter that changes the word is in the table.
     let next = {
         let mut table = FUTEXES.lock();
-        let next = table.get_mut(&key).and_then(VecDeque::pop_front);
-        let more = table.get(&key).is_some_and(|q| !q.is_empty());
-        if table.get(&key).is_some_and(VecDeque::is_empty) {
-            table.remove(&key);
+        loop {
+            let word = read_word(vm, addr)?;
+            if word & FUTEX_TID_MASK != thread.tid() {
+                return Err(Errno::EPERM);
+            }
+            let queue = table.get(&key);
+            let Some(next) = queue.and_then(|q| q.front()).cloned() else {
+                if replace_word(vm, addr, word, 0)? {
+                    return Ok(0);
+                }
+                continue;
+            };
+            let more = queue.is_some_and(|q| q.len() > 1);
+            let waiters = if more { FUTEX_WAITERS } else { 0 };
+            if !replace_word(vm, addr, word, next.tid | waiters)? {
+                continue;
+            }
+            if let Some(q) = table.get_mut(&key) {
+                q.pop_front();
+                if q.is_empty() {
+                    table.remove(&key);
+                }
+            }
+            // `remove_waiter` that does not find the waiter sees the flags.
+            next.owner.store(true, Ordering::Release);
+            next.woken.store(true, Ordering::Release);
+            break next;
         }
-        next.map(|w| (w, more))
     };
-    // Only the owner changes the word while it has an owner, and the owner is this thread, so
-    // the word cannot change. The check is for a word that user code wrote in a wrong way.
-    let Some((next, more)) = next else {
-        replace_word(vm, addr, word, 0)?;
-        return Ok(0);
-    };
-    let waiters = if more { FUTEX_WAITERS } else { 0 };
-    replace_word(vm, addr, word, next.tid | waiters)?;
-    next.owner.store(true, Ordering::Release);
-    next.woken.store(true, Ordering::Release);
     next.queue.wake_all();
     Ok(0)
 }
