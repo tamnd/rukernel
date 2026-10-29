@@ -52,11 +52,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # time of a busy loop of 120 million rounds in microseconds divided by 1000. Under QEMU without KVM
 # that is 650 s to 1150 s, as the load of the host changes, and the test can use all of it.
 # cgroup_fj_stress_memory_10_3_each makes 1111 cgroups with a process in each, and ends near 240 s
-# on a busy host.
+# on a busy host. sctp01 and sctp01_ipv6 run 5 TCP loads of 2000 requests with a new connection
+# after 3 requests for each of their 2 data sets before the SCTP part gives TCONF. Under QEMU
+# without KVM on a busy host that takes up to 620 s.
 LIMITS = {
     "setsockopt11": 420,
     "starvation": 1800,
     "cgroup_fj_stress_memory_10_3_each": 600,
+    "sctp01": 900,
+    "sctp01_ipv6": 900,
 }
 
 # The tests that run in their own boot. memcontrol03 and memcontrol04 can leave cgroups with

@@ -534,7 +534,8 @@ impl Dgram {
                 hops: None,
                 mc_hops: 1,
                 tclass: 0,
-                checksum: -1,
+                // A raw ICMPv6 socket has its checksum at the offset 2, as `rawv6_init_sk`.
+                checksum: if v6 && proto == Proto::Raw(PROTO_ICMPV6) { 2 } else { -1 },
                 mtu6: 0,
                 filter6: [0; 8],
                 flags6: BTreeMap::new(),
@@ -947,9 +948,7 @@ impl Dgram {
                     return Err(Errno::EMSGSIZE);
                 }
                 let mut d = data.to_vec();
-                // ICMPv6 always has its checksum at the offset 2, as `rawv6_init_sk`.
-                let at = if protocol == PROTO_ICMPV6 { 2 } else { s.checksum };
-                if let Ok(at) = usize::try_from(at) {
+                if let Ok(at) = usize::try_from(s.checksum) {
                     if at + 2 > d.len() {
                         return Err(Errno::EINVAL);
                     }
@@ -1010,7 +1009,6 @@ impl Dgram {
             IPV6_RECVERR => i32::from(s.recverr),
             IPV6_MTU_DISCOVER => s.mtu_discover,
             IPV6_HDRINCL if raw => i32::from(s.hdrincl),
-            IPV6_CHECKSUM if self.proto == Proto::Raw(PROTO_ICMPV6) => 2,
             IPV6_CHECKSUM if raw => s.checksum,
             IPV6_MTU => {
                 let (dst, _) = s.remote.ok_or(Errno::ENOTCONN)?;
@@ -1118,17 +1116,27 @@ impl Dgram {
             IPV6_MTU if v != 0 && v < ipv6::MIN_MTU as i32 => return Err(Errno::EINVAL),
             IPV6_MTU => s.mtu6 = v,
             IPV6_HDRINCL if raw => s.hdrincl = v != 0,
-            // The checksum of ICMPv6 is always on, as `do_rawv6_setsockopt`.
+            // RFC 3542 does not allow `IPV6_CHECKSUM` at the level `IPPROTO_IPV6` on an ICMPv6
+            // socket, as `do_rawv6_setsockopt`. The level `SOL_RAW` allows it.
             IPV6_CHECKSUM if self.proto == Proto::Raw(PROTO_ICMPV6) => {
                 return Err(Errno::EINVAL);
             }
-            IPV6_CHECKSUM if raw && v > 0 && v & 1 != 0 => return Err(Errno::EINVAL),
-            IPV6_CHECKSUM if raw => s.checksum = v.max(-1),
+            IPV6_CHECKSUM if raw => Self::set_checksum6(s, v)?,
             _ if Self::is_flag6(name) => {
                 s.flags6.insert(name, v);
             }
             _ => return Err(Errno::ENOPROTOOPT),
         }
+        Ok(())
+    }
+
+    /// Sets the offset of the checksum of a raw IPv6 socket, or -1 for no checksum, as
+    /// `do_rawv6_setsockopt` of Linux. An odd offset is not allowed.
+    fn set_checksum6(s: &mut State, v: i32) -> Result<()> {
+        if v > 0 && v & 1 != 0 {
+            return Err(Errno::EINVAL);
+        }
+        s.checksum = v.max(-1);
         Ok(())
     }
 
@@ -1663,7 +1671,10 @@ impl Socket for Dgram {
                 }
             }
             SOL_RAW if self.af() == AF_INET6 && name == IPV6_CHECKSUM => {
-                self.set_option6(&mut s, name, value)?;
+                if !matches!(self.proto, Proto::Raw(_)) {
+                    return Err(Errno::ENOPROTOOPT);
+                }
+                Self::set_checksum6(&mut s, int_of(value)?)?;
             }
             SOL_ICMPV6 if self.af() == AF_INET6 && self.proto == Proto::Raw(PROTO_ICMPV6) => {
                 if name != ICMP6_FILTER {

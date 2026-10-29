@@ -6539,8 +6539,41 @@ static void test_veth(void)
 	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+/* The errors of socket for protocols that rukernel does not have, as inet_create in
+ * net/ipv4/af_inet.c of Linux without the modules, and IPV6_CHECKSUM of a raw ICMPv6 socket, as
+ * do_rawv6_setsockopt in net/ipv6/raw.c. */
+static void test_inet_protos(void)
+{
+#ifndef SOCK_DCCP
+#define SOCK_DCCP 6
+#endif
+	errno = 0;
+	check("socket of SOCK_DCCP gives ESOCKTNOSUPPORT",
+	      socket(AF_INET, SOCK_DCCP, IPPROTO_DCCP) == -1 && errno == ESOCKTNOSUPPORT);
+	errno = 0;
+	check("socket of SOCK_STREAM and IPPROTO_SCTP gives EPROTONOSUPPORT",
+	      socket(AF_INET6, SOCK_STREAM, IPPROTO_SCTP) == -1 && errno == EPROTONOSUPPORT);
+	errno = 0;
+	check("socket of SOCK_SEQPACKET and IPPROTO_SCTP gives ESOCKTNOSUPPORT",
+	      socket(AF_INET, SOCK_SEQPACKET, IPPROTO_SCTP) == -1 && errno == ESOCKTNOSUPPORT);
+
+	int s = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+	int v = -1;
+	socklen_t len = sizeof(v);
+	check("a raw ICMPv6 socket has its checksum at the offset 2",
+	      getsockopt(s, IPPROTO_IPV6, IPV6_CHECKSUM, &v, &len) == 0 && v == 2);
+	v = 2;
+	errno = 0;
+	check("IPV6_CHECKSUM of the level IPPROTO_IPV6 on ICMPv6 gives EINVAL",
+	      setsockopt(s, IPPROTO_IPV6, IPV6_CHECKSUM, &v, sizeof(v)) == -1 && errno == EINVAL);
+	check("IPV6_CHECKSUM of the level SOL_RAW on ICMPv6 is allowed",
+	      setsockopt(s, SOL_RAW, IPV6_CHECKSUM, &v, sizeof(v)) == 0);
+	close(s);
+}
+
 static void test_inet(int port)
 {
+	test_inet_protos();
 	test_inet_ping();
 	test_inet_dns();
 	test_inet_lo();

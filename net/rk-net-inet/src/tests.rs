@@ -419,6 +419,37 @@ fn socket_kinds() {
     assert_eq!(classify(SOCK_STREAM, IPPROTO_UDP), Err(Errno::EPROTONOSUPPORT));
     assert_eq!(classify(SOCK_SEQPACKET, 0), Err(Errno::ESOCKTNOSUPPORT));
     assert_eq!(classify(SOCK_DGRAM, 1000), Err(Errno::EINVAL));
+    // Linux without the DCCP and SCTP modules gives these errors, and LTP then gives TCONF.
+    const SOCK_DCCP: u32 = 6;
+    assert_eq!(classify(SOCK_DCCP, 33), Err(Errno::ESOCKTNOSUPPORT));
+    assert_eq!(classify(SOCK_STREAM, 132), Err(Errno::EPROTONOSUPPORT));
+    assert_eq!(classify(SOCK_SEQPACKET, 132), Err(Errno::ESOCKTNOSUPPORT));
+}
+
+/// `IPV6_CHECKSUM` of a raw ICMPv6 socket, as `do_rawv6_setsockopt` of Linux. The level
+/// `SOL_RAW` can set it, and the level `IPPROTO_IPV6` cannot.
+#[test]
+fn ipv6_raw_checksum_option() {
+    use rk_abi::native::in6::IPV6_CHECKSUM;
+    use rk_abi::native::inet::IPPROTO_IPV6;
+    use rk_net::consts::SOL_RAW;
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+    let icmp = Dgram::new6(Proto::Raw(58));
+    assert_eq!(icmp.get_option(IPPROTO_IPV6, IPV6_CHECKSUM), Ok(int(2)));
+    assert_eq!(icmp.get_option(SOL_RAW, IPV6_CHECKSUM), Ok(int(2)));
+    assert_eq!(icmp.set_option(IPPROTO_IPV6, IPV6_CHECKSUM, &int(2)), Err(Errno::EINVAL));
+    assert_eq!(icmp.set_option(SOL_RAW, IPV6_CHECKSUM, &int(2)), Ok(()));
+    assert_eq!(icmp.set_option(SOL_RAW, IPV6_CHECKSUM, &int(3)), Err(Errno::EINVAL));
+    assert_eq!(icmp.set_option(SOL_RAW, IPV6_CHECKSUM, &int(-5)), Ok(()));
+    assert_eq!(icmp.get_option(SOL_RAW, IPV6_CHECKSUM), Ok(int(-1)));
+    // Another raw protocol has no checksum at the start.
+    let raw = Dgram::new6(Proto::Raw(253));
+    assert_eq!(raw.get_option(IPPROTO_IPV6, IPV6_CHECKSUM), Ok(int(-1)));
+    assert_eq!(raw.set_option(IPPROTO_IPV6, IPV6_CHECKSUM, &int(4)), Ok(()));
+    assert_eq!(raw.get_option(SOL_RAW, IPV6_CHECKSUM), Ok(int(4)));
+    // A UDP socket has no options of the level `SOL_RAW`.
+    let udp = Dgram::new6(Proto::Udp);
+    assert_eq!(udp.set_option(SOL_RAW, IPV6_CHECKSUM, &int(2)), Err(Errno::ENOPROTOOPT));
 }
 
 fn send(s: &Dgram, to: Option<([u8; 4], u16)>, data: &[u8]) -> Result<usize, Errno> {
