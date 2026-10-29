@@ -258,6 +258,8 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                             let p = alive(&p_)?;
                             let id = match (kind, &t_) {
                                 (NsKind::Net, Some(t)) => alive(t)?.net_ns().id(),
+                                (NsKind::Uts, Some(t)) => alive(t)?.uts_ns().id(),
+                                (NsKind::Ipc, Some(t)) => alive(t)?.ipc_ns().id(),
                                 _ => rk_proc::ns::ns_id(&p, kind)?,
                             };
                             Ok(link_text(kind, id))
@@ -265,13 +267,27 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                         move || {
                             let p = alive(&p_j)?;
                             let node = match kind {
-                                // The file keeps the network namespace, as on Linux.
+                                // The file keeps the network, UTS or IPC namespace, as on Linux.
                                 NsKind::Net => {
                                     let net = match &t_j {
                                         Some(t) => alive(t)?.net_ns(),
                                         None => p.net_ns(),
                                     };
                                     NsInode::with_hold(kind, net.id(), net)
+                                }
+                                NsKind::Uts => {
+                                    let uts = match &t_j {
+                                        Some(t) => alive(t)?.uts_ns(),
+                                        None => p.uts_ns(),
+                                    };
+                                    NsInode::with_hold(kind, uts.id(), uts)
+                                }
+                                NsKind::Ipc => {
+                                    let ipc = match &t_j {
+                                        Some(t) => alive(t)?.ipc_ns(),
+                                        None => p.ipc_ns(),
+                                    };
+                                    NsInode::with_hold(kind, ipc.id(), ipc)
                                 }
                                 _ => NsInode::new(kind, rk_proc::ns::ns_id(&p, kind)?),
                             };
@@ -357,6 +373,11 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/inotify/max_queued_events", ""),
     ("fs/inotify/max_user_instances", ""),
     ("fs/inotify/max_user_watches", ""),
+    // The time in seconds that a lease holder has to give up its lease, and the switch of the
+    // leases, as `lease_break_time` and `leases_enable` of fs/locks.c of Linux. rukernel does not
+    // break a lease yet, so the files only keep their text.
+    ("fs/lease-break-time", "45"),
+    ("fs/leases-enable", "1"),
     ("fs/pipe-max-size", ""),
     // rukernel does not count the pipe pages of each user, so the limits only keep their text.
     ("fs/pipe-user-pages-hard", "0"),

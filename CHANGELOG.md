@@ -2,6 +2,19 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- UTS namespaces, as kernel/utsname.c of Linux (#481). `clone` and `unshare` with `CLONE_NEWUTS` give the thread a new namespace with a copy of the host name and the NIS domain name, and `uname`, `sethostname`, `setdomainname` and /proc/sys/kernel use the namespace of the caller. It needs `CAP_SYS_ADMIN`.
+- IPC namespaces, as ipc/namespace.c of Linux (#481). `clone` and `unshare` with `CLONE_NEWIPC` give the thread a new namespace with no shared memory segments, message queues, semaphore sets or POSIX message queues. The objects of a namespace go when its last thread leaves it. `CLONE_NEWIPC` with `CLONE_SYSVSEM` in `clone` gives `EINVAL`, and `unshare` with `CLONE_NEWIPC` or `CLONE_SYSVSEM` does the semaphore undo changes, as `exit_sem`.
+- `setns` joins a UTS or an IPC namespace through a file of /proc/PID/ns or through a pidfd (#481). An open file of the namespace keeps it. setns02 of LTP passes.
+- /proc/sys/fs/lease-break-time and /proc/sys/fs/leases-enable, as fs/locks.c of Linux (#481). A write keeps the value, so fcntl33 gives TCONF without a TWARN. fcntl33 skips tmpfs by design, and rukernel does not break a lease yet.
+
+### Fixed
+
+- `splice` gives `EINVAL` for a file that has no `splice_read` or `splice_write` of Linux, as a directory, an eventfd, an epoll, a signalfd, a timerfd, a pidfd or an inotify file, before it waits for the pipe (#481). This is `warn_unsupported` in fs/splice.c. splice07 of LTP waited for the empty pipe until the runner stopped it, and it passes now.
+
 ## [0.4.14] - 2026-10-29
 
 ### Added

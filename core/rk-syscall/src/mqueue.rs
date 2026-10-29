@@ -194,7 +194,7 @@ impl Inode for MqInode {
     fn metadata(&self) -> Metadata {
         let s = self.state.lock();
         Metadata {
-            dev: root().dev,
+            dev: dev(),
             ino: self.ino,
             mode: mode::S_IFREG | s.perm,
             nlink: 1,
@@ -242,7 +242,7 @@ impl Inode for MqInode {
     }
 
     fn fs_id(&self) -> u64 {
-        root().dev
+        dev()
     }
 
     fn fs_magic(&self) -> u64 {
@@ -354,31 +354,52 @@ impl Inode for MqRoot {
     }
 }
 
-static ROOT: Once<Arc<MqRoot>> = Once::new();
-static MOUNT: Once<Arc<Mount>> = Once::new();
+/// The device of the mqueue file systems.
+fn dev() -> u64 {
+    static DEV: Once<u64> = Once::new();
+    *DEV.call_once(rk_vfs::anon_dev)
+}
 
-/// The root directory, which all the mounts share.
-fn root() -> &'static Arc<MqRoot> {
-    ROOT.call_once(|| {
-        Arc::new(MqRoot {
-            dev: rk_vfs::anon_dev(),
-            queues: SpinLock::new(BTreeMap::new()),
-            attr: SpinLock::new((0, 0, mode::S_ISVTX | 0o777)),
-        })
-    })
+/// The root directory and the internal mount of each IPC namespace, as `ipc_ns->mq_mnt` of
+/// Linux. A namespace gets them at its first use.
+static ROOTS: SpinLock<BTreeMap<u32, (Arc<MqRoot>, Arc<Mount>)>> = SpinLock::new(BTreeMap::new());
+
+/// The root directory and the internal mount of the IPC namespace of the caller. Each mount of
+/// mqueue in the namespace shows this root, as `mqueue_get_tree` of ipc/mqueue.c of Linux.
+fn ns_root() -> (Arc<MqRoot>, Arc<Mount>) {
+    let id = crate::ns::ipc_id();
+    if let Some(r) = ROOTS.lock().get(&id) {
+        return r.clone();
+    }
+    let root = Arc::new(MqRoot {
+        dev: dev(),
+        queues: SpinLock::new(BTreeMap::new()),
+        attr: SpinLock::new((0, 0, mode::S_ISVTX | 0o777)),
+    });
+    let inode: InodeRef = root.clone();
+    let source = MountSource { source: b"mqueue".to_vec(), fstype: "mqueue", flags: 0 };
+    let mount = MountNamespace::detached(Dentry::new_root(inode), source);
+    ROOTS.lock().entry(id).or_insert((root, mount)).clone()
+}
+
+/// The root directory of the IPC namespace of the caller.
+fn root() -> Arc<MqRoot> {
+    ns_root().0
 }
 
 /// The internal mount of the root, for the files that `mq_open` gives.
-fn mount() -> &'static Arc<Mount> {
-    MOUNT.call_once(|| {
-        let root: InodeRef = root().clone();
-        let source = MountSource { source: b"mqueue".to_vec(), fstype: "mqueue", flags: 0 };
-        MountNamespace::detached(Dentry::new_root(root), source)
-    })
+fn mount() -> Arc<Mount> {
+    ns_root().1
+}
+
+/// Removes the queues of the IPC namespace `id` that stops, as `mq_put_mnt` of Linux.
+pub(crate) fn exit_ns(id: u32) {
+    let old = ROOTS.lock().remove(&id);
+    drop(old);
 }
 
 fn make_root(_args: &MountArgs<'_>) -> Result<InodeRef> {
-    let root: InodeRef = root().clone();
+    let root: InodeRef = root();
     Ok(root)
 }
 
@@ -542,15 +563,16 @@ pub(crate) fn mq_open(cx: &Cx<'_>, name: u64, flags: u64, perm: u64, attr: u64) 
         }
     };
     let inode: InodeRef = queue.clone();
-    let dentry = mount().root().clone().add_child(&name, inode);
-    let location = Location { mount: mount().clone(), dentry };
+    let mount = mount();
+    let dentry = mount.root().clone().add_child(&name, inode);
+    let location = Location { mount: mount.clone(), dentry };
     let keep = O_ACCMODE | O_NONBLOCK;
     let file = File::with_ops(Arc::new(MqFile { queue }), Some(location), flags & keep);
     let fd = cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0);
     // Linux takes the descriptor first, so a call that gives `EMFILE` makes no queue.
     if fd.is_err() && created {
         let _ = root.unlink(&name);
-        mount().root().forget_child(&name);
+        mount.root().forget_child(&name);
     }
     Ok(fd? as u64)
 }

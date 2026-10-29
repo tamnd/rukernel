@@ -12,12 +12,12 @@
 //! creator or a process with `CAP_SYS_ADMIN` can change or remove a queue.
 
 use crate::cx::{Cx, SysResult};
+use crate::ns::PerNs;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_frame::sync::SpinLock;
 use rk_vfs::WaitQueue;
 use rk_vfs::cred::{IpcOwner, cap};
 use rk_vfs::ipc::{MSG_NEXT_ID, MSGMAX, MSGMNB, MSGMNI, Msg, MsgQueue, Search};
@@ -151,7 +151,18 @@ impl Table {
     }
 }
 
-static TABLE: SpinLock<Table> = SpinLock::new(Table { queues: BTreeMap::new(), next: 0 });
+/// An empty table.
+const fn empty() -> Table {
+    Table { queues: BTreeMap::new(), next: 0 }
+}
+
+/// The table of each IPC namespace.
+static TABLE: PerNs<Table> = PerNs::new(empty(), empty);
+
+/// Removes the objects of the IPC namespace `id` that stops, as `msg_exit_ns` of Linux.
+pub(crate) fn exit_ns(id: u32) {
+    TABLE.exit(id);
+}
 
 /// The tasks that wait in `msgsnd` and `msgrcv`. Each change of a queue wakes them, and each one
 /// tests its queue again.
@@ -169,7 +180,7 @@ pub(crate) fn msgget(cx: &Cx<'_>, key: u64, flags: u64) -> SysResult {
     let key = key as i32;
     let flags = flags as u32;
     let c = cx.process().cred();
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     if key != IPC_PRIVATE {
         let found = table
             .queues
@@ -233,7 +244,7 @@ pub(crate) fn msgsnd(cx: &Cx<'_>, id: u64, msgp: u64, msgsz: u64, flags: u64) ->
     let thread = cx.thread;
     let mut msg = Some(Msg { mtype, text });
     let mut step = || {
-        let mut table = TABLE.lock();
+        let mut table = TABLE.get().lock();
         let Some(q) = table.queues.get_mut(&id) else { return Some(Err(Errno::EIDRM)) };
         if let Err(e) = c.ipc_permission(&q.perm.owner(), 0o222) {
             return Some(Err(e));
@@ -256,7 +267,7 @@ pub(crate) fn msgsnd(cx: &Cx<'_>, id: u64, msgp: u64, msgsz: u64, flags: u64) ->
         None
     };
     // The first try finds a queue that is not there with `EINVAL`, and a later one with `EIDRM`.
-    if !TABLE.lock().queues.contains_key(&id) {
+    if !TABLE.get().lock().queues.contains_key(&id) {
         return Err(Errno::EINVAL);
     }
     let r = match step() {
@@ -293,7 +304,7 @@ pub(crate) fn msgrcv(
     let pid = pid(cx);
     let thread = cx.thread;
     let mut step = || {
-        let mut table = TABLE.lock();
+        let mut table = TABLE.get().lock();
         let Some(q) = table.queues.get_mut(&id) else { return Some(Err(Errno::EIDRM)) };
         if let Err(e) = c.ipc_permission(&q.perm.owner(), 0o444) {
             return Some(Err(e));
@@ -323,7 +334,7 @@ pub(crate) fn msgrcv(
         }
         None
     };
-    if !TABLE.lock().queues.contains_key(&id) {
+    if !TABLE.get().lock().queues.contains_key(&id) {
         return Err(Errno::EINVAL);
     }
     let msg = match step() {
@@ -349,7 +360,7 @@ pub(crate) fn msgctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
     let c = cx.process().cred();
     // `IPC_SET` reads the new values before it finds the queue, as Linux.
     let new: Option<MsqidDs> = if cmd == IPC_SET { Some(cx.read_val(buf)?) } else { None };
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     match cmd {
         IPC_INFO | MSG_INFO => {
             let mut info = MsgInfo {
@@ -427,7 +438,7 @@ pub(crate) fn proc_text() -> Vec<u8> {
         "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      \
          stime      rtime      ctime\n",
     );
-    for (id, q) in &TABLE.lock().queues {
+    for (id, q) in &TABLE.get().lock().queues {
         let p = &q.perm;
         out.push_str(&format!(
             "{:10} {:10}  {:4o}  {:10} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}\n",

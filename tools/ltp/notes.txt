@@ -45,7 +45,6 @@ cgroup_xattr	The test needs a cgroup v1 hierarchy. rukernel has only cgroup v2 (
 oom02	The test needs a NUMA system. rukernel has no NUMA (TCONF).
 oom04	The test needs a NUMA system with the cpuset controller. rukernel has no NUMA (TCONF).
 oom05	The test needs a NUMA system with the cpuset controller. rukernel has no NUMA (TCONF).
-setns02	The test needs IPC and UTS name spaces with setns. rukernel does not have them (TCONF).
 gethostbyname_r01	musl gethostbyname_r gives 0 and no ERANGE for a short buffer. The kernel is not part of the call (#378).
 gethostname02	musl gethostname cuts the name to the buffer and gives no ENAMETOOLONG. The kernel is not part of the call (#378).
 lstat03	LTP passes "-b 1024" to mkfs.ext2 as one argument, and BusyBox mkfs.ext2 rejects it (invalid number ' 1024'). The kernel is not part of the failure (#378).
@@ -78,3 +77,9 @@ hugemmap35	The test is only for aarch64 (TCONF on x86_64).
 hugeshmat04	The test needs 2048 MB MemAvailable. The LTP VM has less memory (TCONF).
 mq_open01	The case with the name "" wants EINVAL. glibc gives EINVAL in mq_open for a name without a "/" at the start, but musl gives the name to the kernel. Linux then gives ENOENT for the empty name (getname), and rukernel gives ENOENT as Linux does. The other cases pass.
 statx11	The test needs the field stx_dio_mem_align in struct statx of the libc at build time. The musl of the LTP build does not have it, so the test gives TCONF. The kernel gives STATX_DIOALIGN for a block device, as Linux.
+sendmsg01	The case "invalid cmsg pointer" gives msg_control = -1. The sendmsg wrapper of musl copies the control data to a buffer on the stack before the call, so the test gets SIGSEGV in musl and the kernel never sees the pointer. This fails on Linux with musl too (#481).
+recvmmsg01	The case with a bad msgvec address gets SIGSEGV in musl: the recvmmsg wrapper of musl writes 0 to the padding of each msg_hdr before the call. This fails on Linux with musl too (#481).
+trace_sched01	The threads call sched_setscheduler and sched_getparam of musl, which give ENOSYS and do not call the kernel, so each thread stops with -1. This fails on Linux with musl too (#481).
+time-schedule01	The test calls sched_setscheduler of musl, which gives ENOSYS and does not call the kernel ("Error changing to RT class"). This fails on Linux with musl too (#481).
+fcntl33	The test skips tmpfs, ramfs and nfs (.skip_filesystems), and the runner puts TMPDIR on tmpfs, so the result is TCONF. rukernel does not break a lease yet when a conflicting open comes, as `__break_lease` of fs/locks.c in Linux does, so the test cannot pass on another file system either (#481).
+fcntl33_64	The same as fcntl33: TCONF on tmpfs, and rukernel does not break a lease yet (#481).

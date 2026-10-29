@@ -72,8 +72,29 @@ const ARCH_SET_CPUID: u64 = 0x1012;
 
 /// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
 /// have yet. They give `EINVAL`, as Linux without the namespace type gives.
-const CLONE_NEW_ANY: u64 =
-    CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWTIME;
+const CLONE_NEW_ANY: u64 = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWTIME;
+
+/// Checks that `process` can make a new UTS or IPC namespace, as `create_new_namespaces` of
+/// kernel/nsproxy.c of Linux. It needs `CAP_SYS_ADMIN`.
+fn may_new_ns(process: &Process, flags: u64) -> Result<(), Errno> {
+    if flags & (CLONE_NEWUTS | CLONE_NEWIPC) != 0
+        && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN)
+    {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// Puts `thread` in a new UTS namespace with a copy of the names, and in a new IPC namespace
+/// with no objects, as `flags` asks, as `copy_utsname` and `copy_ipcs` of Linux.
+fn new_uts_ipc_ns(thread: &rk_proc::Thread, flags: u64) {
+    if flags & CLONE_NEWUTS != 0 {
+        thread.set_uts_ns(thread.uts_ns().copy());
+    }
+    if flags & CLONE_NEWIPC != 0 {
+        thread.set_ipc_ns(rk_proc::ns::new_ipc());
+    }
+}
 
 /// Makes a new network namespace for `CLONE_NEWNET`, as `copy_net_ns` of Linux. It needs
 /// `CAP_SYS_ADMIN`.
@@ -96,6 +117,8 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         | CLONE_NEWNS
         | CLONE_NEWCGROUP
         | CLONE_NEWNET
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
         | CLONE_NEW_ANY;
     if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
@@ -110,6 +133,11 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         }
         flags |= CLONE_FS;
     }
+    may_new_ns(process, flags)?;
+    // A new IPC namespace leaves the semaphore undo list too, as `ksys_unshare` of Linux.
+    if flags & CLONE_NEWIPC != 0 {
+        flags |= CLONE_SYSVSEM;
+    }
     if flags & CLONE_NEWCGROUP != 0 {
         new_cgroup_ns(process)?;
     }
@@ -117,6 +145,12 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && process.threads().len() > 1 {
         return Err(Errno::EINVAL);
     }
+    // `CLONE_SYSVSEM` does the changes of the undo list as an exit does, as `exit_sem`. The
+    // threads of a process share the list, so the last user does the changes.
+    if flags & CLONE_SYSVSEM != 0 && process.threads().len() <= 1 {
+        crate::sem::exit(process.pid() as i32);
+    }
+    new_uts_ipc_ns(cx.thread, flags);
     // Only the caller gets the new namespace, as `switch_task_namespaces` of Linux.
     if flags & CLONE_NEWNET != 0 {
         cx.thread.set_net_ns(new_net_ns(process)?);
@@ -201,6 +235,37 @@ fn join_net_ns(cx: &Cx<'_>, ns: Arc<rk_net::ns::NetNs>) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Puts the calling thread in the UTS namespace `ns`, as `utsns_install` of kernel/utsname.c
+/// of Linux.
+///
+/// # Errors
+///
+/// `EPERM` without `CAP_SYS_ADMIN`.
+fn join_uts_ns(cx: &Cx<'_>, ns: Arc<rk_proc::uts::UtsNs>) -> Result<(), Errno> {
+    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    cx.thread.set_uts_ns(ns);
+    Ok(())
+}
+
+/// Puts the calling thread in the IPC namespace `ns`, as `ipcns_install` of ipc/namespace.c of
+/// Linux. The process leaves the semaphore undo list of the old namespace, as `exit_sem`.
+///
+/// # Errors
+///
+/// `EPERM` without `CAP_SYS_ADMIN`.
+fn join_ipc_ns(cx: &Cx<'_>, ns: Arc<rk_proc::ns::IpcNs>) -> Result<(), Errno> {
+    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    if cx.process().threads().len() <= 1 {
+        crate::sem::exit(cx.process().pid() as i32);
+    }
+    cx.thread.set_ipc_ns(ns);
+    Ok(())
+}
+
 /// Puts `process` in the cgroup namespace `ns`, as `cgroupns_install` of Linux.
 ///
 /// # Errors
@@ -217,10 +282,10 @@ fn join_cgroup_ns(process: &Process, ns: u32) -> Result<(), Errno> {
 /// `setns`: joins the namespace of a file of `/proc/PID/ns`, or the namespaces of the process of
 /// a process file descriptor, as `setns` of `kernel/nsproxy.c` of Linux.
 ///
-/// A process can change its cgroup and network namespaces, and its mount namespace through a
-/// file. The other kinds that `unshare` cannot make are the same for each process, so a join
-/// changes nothing, but it needs `CAP_SYS_ADMIN` as in Linux. A mount namespace through a process
-/// file descriptor gives `EINVAL`.
+/// A process can change its cgroup, network, UTS and IPC namespaces, and its mount namespace
+/// through a file. The other kinds that `unshare` cannot make are the same for each process, so a
+/// join changes nothing, but it needs `CAP_SYS_ADMIN` as in Linux. A mount namespace through a
+/// process file descriptor gives `EINVAL`.
 pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     let file = cx.file(fd)?;
     let process = cx.process();
@@ -233,6 +298,12 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
             // The file keeps the namespace, so the search finds it.
             rk_vfs::nsfs::NsKind::Net => {
                 join_net_ns(cx, rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?)?;
+            }
+            rk_vfs::nsfs::NsKind::Uts => {
+                join_uts_ns(cx, rk_proc::uts::by_id(id).ok_or(Errno::EINVAL)?)?;
+            }
+            rk_vfs::nsfs::NsKind::Ipc => {
+                join_ipc_ns(cx, rk_proc::ns::ipc_by_id(id).ok_or(Errno::EINVAL)?)?;
             }
             kind => crate::ns::install(cx, process, kind, id)?,
         }
@@ -262,6 +333,12 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     }
     if nstype & CLONE_NEWNET != 0 {
         join_net_ns(cx, target.net_ns())?;
+    }
+    if nstype & CLONE_NEWUTS != 0 {
+        join_uts_ns(cx, target.uts_ns())?;
+    }
+    if nstype & CLONE_NEWIPC != 0 {
+        join_ipc_ns(cx, target.ipc_ns())?;
     }
     Ok(0)
 }
@@ -333,6 +410,11 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
     }
+    // A new IPC namespace cannot share the semaphore undo list, as `copy_process` of Linux.
+    if flags & (CLONE_NEWIPC | CLONE_SYSVSEM) == CLONE_NEWIPC | CLONE_SYSVSEM {
+        return Err(Errno::EINVAL);
+    }
+    may_new_ns(cx.process(), flags)?;
     if flags & CLONE_NEWCGROUP != 0 && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
@@ -371,6 +453,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if let Some(net) = net {
         thread.set_net_ns(net);
     }
+    new_uts_ipc_ns(&thread, flags);
     if flags & CLONE_NEWCGROUP != 0 {
         let process = thread.process();
         let ns = rk_cgroup::with(|h| h.new_namespace(process.cgroup()));

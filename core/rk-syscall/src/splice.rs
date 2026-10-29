@@ -8,6 +8,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::vec;
 use rk_abi::Errno;
 use rk_vfs::File;
+use rk_vfs::inode::FileType;
 use rk_vfs::pipe::{PIPE_BUF, pipe_size, pipe_space, put_to_pipe, take_from_pipe};
 
 /// The most bytes of one call. Linux names it `MAX_RW_COUNT`.
@@ -29,6 +30,19 @@ const POSIX_FADV_NOREUSE: u64 = 5;
 /// Tells if `file` is one end of a pipe.
 fn is_pipe(file: &File) -> bool {
     pipe_size(file).is_ok()
+}
+
+/// Tells if `file` has the splice operations of Linux (`splice_read` and `splice_write`). A file
+/// in the tree other than a directory, a pipe and a socket have them. A directory and a file of
+/// an anonymous inode, as an eventfd, an epoll, a signalfd, a timerfd, a pidfd or an inotify
+/// file, have neither, so `splice` gives `EINVAL` before it waits for the pipe, as
+/// `warn_unsupported` in fs/splice.c of Linux.
+fn can_splice(file: &File) -> bool {
+    let kind = file.metadata().ok().and_then(|m| m.file_type());
+    if kind == Some(FileType::Directory) {
+        return false;
+    }
+    file.location().is_some() || is_pipe(file) || kind == Some(FileType::Socket)
 }
 
 /// Reads the offset at the user pointer `addr`. A null pointer gives `None`, and the copy then
@@ -172,8 +186,17 @@ pub(crate) fn splice(
     {
         return Err(Errno::ESPIPE);
     }
+    // A splice from a pipe needs `splice_write` of the output, as `do_splice_from`, also for a
+    // length of 0. A splice to a pipe needs `splice_read` of the input after the check of the
+    // length, as `vfs_splice_read`.
+    if in_pipe && !out_pipe && !can_splice(&output) {
+        return Err(Errno::EINVAL);
+    }
     if len == 0 {
         return Ok(0);
+    }
+    if out_pipe && !in_pipe && !can_splice(&input) {
+        return Err(Errno::EINVAL);
     }
     let done = copy(&input, in_pos, &output, out_pos, len as usize);
     if let Ok(n) = done {
