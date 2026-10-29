@@ -12,6 +12,7 @@
 //! creator or a process with `CAP_SYS_ADMIN` can change or remove a segment.
 
 use crate::cx::{Cx, SysResult};
+use crate::ns::PerNs;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -202,7 +203,7 @@ impl MmFile for ShmPages {
     /// A new map of the segment needs the segment in the table, as `__shm_open` in ipc/shm.c
     /// of Linux. A removed segment that only the caller holds goes now, as `shm_close`.
     fn reopen(&self) -> Result<(), Errno> {
-        let mut table = TABLE.lock();
+        let mut table = TABLE.get().lock();
         let Some(s) = table.segments.get(&self.id) else { return Err(Errno::EINVAL) };
         if !core::ptr::eq(Arc::as_ptr(&s.pages), self) {
             return Err(Errno::EINVAL);
@@ -266,7 +267,18 @@ impl Table {
     }
 }
 
-static TABLE: SpinLock<Table> = SpinLock::new(Table { segments: BTreeMap::new(), next: 0 });
+/// An empty table.
+const fn empty() -> Table {
+    Table { segments: BTreeMap::new(), next: 0 }
+}
+
+/// The table of each IPC namespace.
+static TABLE: PerNs<Table> = PerNs::new(empty(), empty);
+
+/// Removes the objects of the IPC namespace `id` that stops, as `shm_exit_ns` of Linux.
+pub(crate) fn exit_ns(id: u32) {
+    TABLE.exit(id);
+}
 
 fn now() -> i64 {
     crate::info::realtime().sec
@@ -280,7 +292,7 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
     let key = key as i32;
     let flags = flags as u32;
     let c = cx.process().cred();
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     table.sweep();
     if key != IPC_PRIVATE {
         let found = table
@@ -380,7 +392,7 @@ pub(crate) fn shmat(cx: &Cx<'_>, id: u64, addr: u64, flags: u64) -> SysResult {
     }
     let c = cx.process().cred();
     let pages = {
-        let mut table = TABLE.lock();
+        let mut table = TABLE.get().lock();
         let s = table.get(id as i32)?;
         c.ipc_permission(&s.perm.owner(), access)?;
         s.pages.clone()
@@ -406,7 +418,7 @@ pub(crate) fn shmat(cx: &Cx<'_>, id: u64, addr: u64, flags: u64) -> SysResult {
         Err(Errno::EEXIST) => return Err(Errno::EINVAL),
         r => r?,
     };
-    if let Ok(s) = TABLE.lock().get(id as i32) {
+    if let Ok(s) = TABLE.get().lock().get(id as i32) {
         s.atime = now();
         s.lpid = pid(cx);
     }
@@ -431,10 +443,10 @@ pub(crate) fn shmdt(cx: &Cx<'_>, addr: u64) -> SysResult {
             _ => None,
         })
         .ok_or(Errno::EINVAL)?;
-    let size = TABLE.lock().segments.get(&id).map_or(PAGE_SIZE as u64, |s| s.pages.map_len());
+    let size = TABLE.get().lock().segments.get(&id).map_or(PAGE_SIZE as u64, |s| s.pages.map_len());
     let len = usize::try_from(size).unwrap_or(PAGE_SIZE);
     vm.munmap(addr, len)?;
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     if let Some(s) = table.segments.get_mut(&id) {
         s.dtime = now();
         s.lpid = pid(cx);
@@ -449,7 +461,7 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
     let c = cx.process().cred();
     // `IPC_SET` reads the new values before it finds the segment, as Linux.
     let new: Option<ShmidDs> = if cmd == IPC_SET { Some(cx.read_val(buf)?) } else { None };
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     match cmd {
         IPC_INFO => {
             let info = ShmInfo64 {
@@ -543,7 +555,7 @@ pub(crate) fn proc_text() -> Vec<u8> {
         "       key      shmid perms                  size  cpid  lpid nattch   uid   gid  cuid  \
          cgid      atime      dtime      ctime                   rss                  swap\n",
     );
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     table.sweep();
     for (id, s) in &table.segments {
         let p = &s.perm;

@@ -355,6 +355,7 @@ fn net_ns_of_fd(fd: i32) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
 pub fn init() {
     rk_vfs::ipc::set_sysvipc(crate::msg::sysvipc);
     crate::mqueue::register();
+    crate::ns::init();
     rk_vfs::inode::set_clock(crate::info::realtime);
     rk_vfs::cred::set_current(|| rk_proc::current_thread().map(|t| t.process().cred()));
     rk_vfs::blockdev::set_account(rk_proc::cgroup::io_account);

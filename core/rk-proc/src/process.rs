@@ -6,11 +6,13 @@
 
 use crate::keys::{self, Key, Slot};
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE};
+use crate::ns::IpcNs;
 use crate::sched::SchedParams;
 use crate::signal::{
     AltStack, NSIG, Pending, SI_TIMER, SI_USER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
 use crate::timer::Timers;
+use crate::uts::UtsNs;
 use crate::wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -319,6 +321,10 @@ pub struct Thread {
     /// The network namespace of the thread, or `None` for the first namespace, as
     /// `nsproxy->net_ns` of Linux.
     net: SpinLock<Option<Arc<NetNs>>>,
+    /// The UTS namespace and the IPC namespace of the thread, or `None` for the first ones, as
+    /// `nsproxy->uts_ns` and `nsproxy->ipc_ns` of Linux.
+    uts: SpinLock<Option<Arc<UtsNs>>>,
+    ipc: SpinLock<Option<Arc<IpcNs>>>,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -597,6 +603,20 @@ impl Process {
         let threads = self.threads();
         let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
         leader.map_or_else(rk_net::ns::init_ns, |t| t.net_ns())
+    }
+
+    /// The UTS namespace of the process: the namespace of its leader thread, as for `net_ns`.
+    pub fn uts_ns(&self) -> Arc<UtsNs> {
+        let threads = self.threads();
+        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        leader.map_or_else(crate::uts::init_ns, |t| t.uts_ns())
+    }
+
+    /// The IPC namespace of the process: the namespace of its leader thread, as for `net_ns`.
+    pub fn ipc_ns(&self) -> Arc<IpcNs> {
+        let threads = self.threads();
+        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        leader.map_or_else(crate::ns::init_ipc, |t| t.ipc_ns())
     }
 
     /// Puts the process in the cgroup namespace `ns`, for `CLONE_NEWCGROUP` and `setns`.
@@ -1520,6 +1540,8 @@ impl Thread {
             timer_slack: SpinLock::new((TIMER_SLACK_NS, TIMER_SLACK_NS)),
             iopl: AtomicU32::new(0),
             net: SpinLock::new(None),
+            uts: SpinLock::new(None),
+            ipc: SpinLock::new(None),
         })
     }
 
@@ -1542,6 +1564,29 @@ impl Thread {
             core::mem::replace(&mut *net, if ns.is_init() { None } else { Some(ns) })
         };
         // The old namespace can stop here, so the lock is free.
+        drop(old);
+    }
+
+    /// The UTS namespace of the thread, as `current->nsproxy->uts_ns` of Linux.
+    pub fn uts_ns(&self) -> Arc<UtsNs> {
+        self.uts.lock().clone().unwrap_or_else(crate::uts::init_ns)
+    }
+
+    /// Puts the thread in the UTS namespace `ns`, for `CLONE_NEWUTS`, `unshare` and `setns`.
+    pub fn set_uts_ns(&self, ns: Arc<UtsNs>) {
+        let old = core::mem::replace(&mut *self.uts.lock(), (!ns.is_init()).then_some(ns));
+        drop(old);
+    }
+
+    /// The IPC namespace of the thread, as `current->nsproxy->ipc_ns` of Linux.
+    pub fn ipc_ns(&self) -> Arc<IpcNs> {
+        self.ipc.lock().clone().unwrap_or_else(crate::ns::init_ipc)
+    }
+
+    /// Puts the thread in the IPC namespace `ns`, for `CLONE_NEWIPC`, `unshare` and `setns`.
+    /// The old namespace can stop here and remove its objects, so the lock is free then.
+    pub fn set_ipc_ns(&self, ns: Arc<IpcNs>) {
+        let old = core::mem::replace(&mut *self.ipc.lock(), (!ns.is_init()).then_some(ns));
         drop(old);
     }
 
@@ -1718,6 +1763,8 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     }
     let thread = Thread::new(pid, child.clone(), parent.blocked());
     *thread.net.lock() = parent.net_ns_opt();
+    *thread.uts.lock() = parent.uts.lock().clone();
+    *thread.ipc.lock() = parent.ipc.lock().clone();
     thread.cgroup.store(cgroup, Ordering::Relaxed);
     thread.inherit_seccomp(parent);
     thread.inherit_timer_slack(parent);
@@ -1755,6 +1802,8 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     };
     let new = Thread::new(tid, process.clone(), thread.blocked());
     *new.net.lock() = thread.net_ns_opt();
+    *new.uts.lock() = thread.uts.lock().clone();
+    *new.ipc.lock() = thread.ipc.lock().clone();
     new.cgroup.store(cgroup, Ordering::Relaxed);
     new.inherit_seccomp(thread);
     new.inherit_timer_slack(thread);
@@ -2073,6 +2122,12 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     // namespace can stop here, and its exit takes the locks of the network layer.
     let net = thread.net.lock().take();
     drop(net);
+    // The thread leaves its UTS and IPC namespaces too. The objects of an IPC namespace go when
+    // its last thread leaves, as `free_ipc_ns` of Linux.
+    let uts = thread.uts.lock().take();
+    drop(uts);
+    let ipc = thread.ipc.lock().take();
+    drop(ipc);
     if !last {
         process.thread_exit.wake_all();
         return;

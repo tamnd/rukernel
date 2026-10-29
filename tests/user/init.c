@@ -2556,6 +2556,65 @@ static void test_mount_ns(void)
 	rmdir("/mnt");
 }
 
+/* A child in a new UTS namespace has its own host name, and a child in a new IPC namespace does
+ * not see the shared memory of the parent. setns with the file of the namespace of the parent
+ * puts each one back, as kernel/utsname.c and ipc/namespace.c of Linux. setns02 of LTP does the
+ * same (#481). */
+static void test_uts_ipc_ns(void)
+{
+	struct utsname u;
+	char old[sizeof(u.nodename)];
+	int status = -1, shmid, uts_fd, ipc_fd;
+	pid_t pid;
+
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	uname(&u);
+	strcpy(old, u.nodename);
+	uts_fd = open("/proc/self/ns/uts", O_RDONLY);
+	ipc_fd = open("/proc/self/ns/ipc", O_RDONLY);
+	shmid = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+	check("open the files of the UTS and IPC namespaces", uts_fd >= 0 && ipc_fd >= 0 && shmid >= 0);
+	pid = fork();
+	if (pid == 0) {
+		struct utsname c;
+		int ok = unshare(CLONE_NEWUTS) == 0;
+		ok = ok && sethostname("uts-child", 9) == 0 && uname(&c) == 0;
+		ok = ok && strcmp(c.nodename, "uts-child") == 0;
+		ok = ok && setns(uts_fd, CLONE_NEWUTS) == 0 && uname(&c) == 0;
+		ok = ok && strcmp(c.nodename, old) == 0;
+		_exit(ok ? 0 : 1);
+	}
+	waitpid(pid, &status, 0);
+	check("unshare(CLONE_NEWUTS) gives a host name of its own and setns goes back",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	uname(&u);
+	check("the host name of the parent does not change", strcmp(u.nodename, old) == 0);
+	pid = fork();
+	if (pid == 0) {
+		int ok = unshare(CLONE_NEWIPC) == 0;
+		void *a;
+		errno = 0;
+		ok = ok && shmat(shmid, NULL, 0) == (void *)-1 && errno == EINVAL;
+		ok = ok && shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600) >= 0;
+		ok = ok && setns(ipc_fd, 0) == 0;
+		a = shmat(shmid, NULL, 0);
+		ok = ok && a != (void *)-1 && shmdt(a) == 0;
+		_exit(ok ? 0 : 1);
+	}
+	waitpid(pid, &status, 0);
+	check("unshare(CLONE_NEWIPC) hides the shared memory and setns shows it again",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	errno = 0;
+	check("clone with CLONE_NEWIPC and CLONE_SYSVSEM gives EINVAL",
+	      syscall(SYS_clone, CLONE_NEWIPC | CLONE_SYSVSEM | SIGCHLD, 0, 0, 0, 0) == -1 &&
+		      errno == EINVAL);
+	shmctl(shmid, IPC_RMID, NULL);
+	close(uts_fd);
+	close(ipc_fd);
+	umount("/proc");
+}
+
 /* A walk follows 40 symbolic links and gives ELOOP at the next one, as Linux. */
 static void test_symlink_chain(void)
 {
@@ -2633,6 +2692,24 @@ static void test_splice(void)
 	off = 0;
 	check("splice to a pipe writes only what fits and does not wait",
 	      syscall(SYS_splice, in, &off, p[1], NULL, 100000, 0) == 65536 && off == 65536);
+	close(p[0]);
+	close(p[1]);
+	/* An eventfd has no splice operations, so a splice gives EINVAL and does not wait for the
+	 * empty pipe, as fs/splice.c of Linux. splice07 of LTP waited here (#481). */
+	check("pipe for a splice to an eventfd", pipe(p) == 0);
+	int efd = syscall(SYS_eventfd2, 0, 0);
+	errno = 0;
+	check("splice from an empty pipe to an eventfd gives EINVAL",
+	      syscall(SYS_splice, p[0], NULL, efd, NULL, 1, 0) == -1 && errno == EINVAL);
+	errno = 0;
+	check("splice from an eventfd to a pipe gives EINVAL",
+	      syscall(SYS_splice, efd, NULL, p[1], NULL, 1, 0) == -1 && errno == EINVAL);
+	close(efd);
+	int dfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+	errno = 0;
+	check("splice from a directory to a pipe gives EINVAL",
+	      syscall(SYS_splice, dfd, NULL, p[1], NULL, 1, 0) == -1 && errno == EINVAL);
+	close(dfd);
 	close(p[0]);
 	close(p[1]);
 	ftruncate(in, 8);
@@ -6936,6 +7013,7 @@ static void test_all(void)
 	test_ptrace();
 	test_mount();
 	test_mount_ns();
+	test_uts_ipc_ns();
 	test_mount_api();
 	test_symlink_chain();
 	test_splice();

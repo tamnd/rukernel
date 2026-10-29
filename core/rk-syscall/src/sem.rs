@@ -11,13 +11,13 @@
 //! creator or a process with `CAP_SYS_ADMIN` can change or remove a set.
 
 use crate::cx::{Cx, SysResult};
+use crate::ns::PerNs;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_frame::sync::SpinLock;
 use rk_vfs::WaitQueue;
 use rk_vfs::cred::IpcOwner;
 use rk_vfs::ipc::SEM_NEXT_ID;
@@ -198,8 +198,18 @@ impl Table {
     }
 }
 
-static TABLE: SpinLock<Table> =
-    SpinLock::new(Table { sets: BTreeMap::new(), next: 0, undo: BTreeMap::new() });
+/// An empty table.
+const fn empty() -> Table {
+    Table { sets: BTreeMap::new(), next: 0, undo: BTreeMap::new() }
+}
+
+/// The table of each IPC namespace.
+static TABLE: PerNs<Table> = PerNs::new(empty(), empty);
+
+/// Removes the objects of the IPC namespace `id` that stops, as `sem_exit_ns` of Linux.
+pub(crate) fn exit_ns(id: u32) {
+    TABLE.exit(id);
+}
 
 /// The tasks that wait in `semop`. Each change of a set wakes them, and each one tests its
 /// operations again.
@@ -221,7 +231,7 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
         return Err(Errno::EINVAL);
     }
     let c = cx.process().cred();
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     if key != IPC_PRIVATE {
         let found = table
             .sets
@@ -358,7 +368,7 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
     let access = if ops.iter().any(|s| s.op != 0) { 0o222 } else { 0o444 };
     let c = cx.process().cred();
     {
-        let mut table = TABLE.lock();
+        let mut table = TABLE.get().lock();
         let set = table.get(id)?;
         if ops.iter().any(|s| usize::from(s.num) >= set.members.len()) {
             return Err(Errno::EFBIG);
@@ -369,7 +379,7 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
     // The semaphore that the task waits for, so the end of the wait takes the count away.
     let mut waits: Option<(usize, bool)> = None;
     let mut step = || {
-        let mut table = TABLE.lock();
+        let mut table = TABLE.get().lock();
         let r = match try_ops(&mut table, id, &ops, pid) {
             Ok(Try::Done) => Some(Ok(())),
             Err(e) => Some(Err(e)),
@@ -397,7 +407,7 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
     let r = match step() {
         Some(r) => r,
         None if deadline.is_some_and(|d| d <= rk_frame::time::ticks()) => {
-            let mut table = TABLE.lock();
+            let mut table = TABLE.get().lock();
             if let Some((n, z)) = waits.take() {
                 count_waiter(&mut table, id, n, z, false);
             }
@@ -406,7 +416,7 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
         None => {
             let r = WAIT.wait_until_timeout(deadline.unwrap_or(u64::MAX), &mut step);
             if r.is_none() {
-                let mut table = TABLE.lock();
+                let mut table = TABLE.get().lock();
                 if let Some((n, z)) = waits.take() {
                     count_waiter(&mut table, id, n, z, false);
                 }
@@ -431,7 +441,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
     if cmd == SETVAL && !(0..=SEMVMX).contains(&(arg as i32)) {
         return Err(Errno::ERANGE);
     }
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     match cmd {
         IPC_INFO | SEM_INFO => {
             let mut info = SemInfo {
@@ -537,7 +547,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             if vals.iter().any(|&v| i32::from(v) > SEMVMX) {
                 return Err(Errno::ERANGE);
             }
-            let mut table = TABLE.lock();
+            let mut table = TABLE.get().lock();
             let s = table.get(id)?;
             if s.members.len() != len {
                 return Err(Errno::EIDRM);
@@ -560,13 +570,16 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
 /// Tells if the process `pid` has an undo list, as a `sysvsem.undo_list` that is not null in
 /// Linux.
 pub(crate) fn has_undo(pid: i32) -> bool {
-    TABLE.lock().undo.range((pid, i32::MIN)..=(pid, i32::MAX)).next().is_some()
+    TABLE
+        .all()
+        .iter()
+        .any(|t| t.lock().undo.range((pid, i32::MIN)..=(pid, i32::MAX)).next().is_some())
 }
 
 /// Does the changes that `SEM_UNDO` recorded for the process `pid`, when it ends, as `exit_sem`
 /// of Linux. A value stays in `0..=SEMVMX`.
 pub(crate) fn exit(pid: i32) {
-    let mut table = TABLE.lock();
+    let mut table = TABLE.get().lock();
     let ids: Vec<i32> =
         table.undo.range((pid, i32::MIN)..=(pid, i32::MAX)).map(|((_, id), _)| *id).collect();
     if ids.is_empty() {
@@ -592,7 +605,7 @@ pub(crate) fn proc_text() -> Vec<u8> {
     let mut out = String::from(
         "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n",
     );
-    for (id, s) in &TABLE.lock().sets {
+    for (id, s) in &TABLE.get().lock().sets {
         let p = &s.perm;
         out.push_str(&format!(
             "{:10} {:10}  {:4o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}\n",

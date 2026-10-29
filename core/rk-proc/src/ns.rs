@@ -1,8 +1,9 @@
 //! The IDs of the namespaces of a process, for the files of nsfs (`rk_vfs::nsfs`), as
 //! kernel/nscommon.c of Linux.
 //!
-//! The ID 0 is the first namespace of a kind. rukernel has more than one namespace only for the
-//! mount and the cgroup kinds. A mount namespace gets an ID the first time that a file names it.
+//! The ID 0 is the first namespace of a kind. rukernel has more than one namespace for the mount,
+//! the cgroup, the network, the UTS and the IPC kinds. A mount namespace gets an ID the first time
+//! that a file names it.
 
 use crate::process::{INIT_PID, Process, find_process};
 use alloc::sync::{Arc, Weak};
@@ -66,6 +67,74 @@ pub fn ns_id(process: &Process, kind: NsKind) -> Result<u32, Errno> {
         }
         NsKind::Cgroup => process.cgroup_ns(),
         NsKind::Net => process.net_ns().id(),
+        NsKind::Uts => process.uts_ns().id(),
+        NsKind::Ipc => process.ipc_ns().id(),
         _ => 0,
     })
+}
+
+/// An IPC namespace, as `struct ipc_namespace` of Linux. The System V objects and the POSIX
+/// message queues of a namespace are in rk-syscall, which keeps them by the ID of the namespace.
+pub struct IpcNs {
+    /// The ID of the namespace for nsfs. The first namespace has the ID 0.
+    id: u32,
+}
+
+/// The IPC namespaces other than the first one, for `ipc_by_id`.
+static IPC_LIVE: SpinLock<Vec<Weak<IpcNs>>> = SpinLock::new(Vec::new());
+
+/// The next ID for an IPC namespace.
+static IPC_NEXT_ID: AtomicU32 = AtomicU32::new(1);
+
+/// The function that removes the objects of an IPC namespace that stops.
+static IPC_EXIT: Once<fn(u32)> = Once::new();
+
+/// Sets the function that removes the objects of an IPC namespace when it stops, as
+/// `free_ipc_ns` of ipc/namespace.c of Linux does with `shm_exit_ns`, `msg_exit_ns` and
+/// `sem_exit_ns`.
+pub fn on_ipc_exit(f: fn(u32)) {
+    IPC_EXIT.call_once(|| f);
+}
+
+/// The first IPC namespace, `init_ipc_ns` of Linux.
+pub fn init_ipc() -> Arc<IpcNs> {
+    static INIT: Once<Arc<IpcNs>> = Once::new();
+    INIT.call_once(|| Arc::new(IpcNs { id: 0 })).clone()
+}
+
+/// Makes a new IPC namespace with no objects, as `create_ipc_ns` of Linux.
+pub fn new_ipc() -> Arc<IpcNs> {
+    let ns = Arc::new(IpcNs { id: IPC_NEXT_ID.fetch_add(1, Ordering::Relaxed) });
+    let mut live = IPC_LIVE.lock();
+    live.retain(|w| w.strong_count() > 0);
+    live.push(Arc::downgrade(&ns));
+    ns
+}
+
+/// The IPC namespace with the ID `id`, while it exists.
+pub fn ipc_by_id(id: u32) -> Option<Arc<IpcNs>> {
+    if id == 0 {
+        return Some(init_ipc());
+    }
+    IPC_LIVE.lock().iter().filter_map(Weak::upgrade).find(|ns| ns.id == id)
+}
+
+impl IpcNs {
+    /// The ID of the namespace.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Tells if this is the first namespace.
+    pub fn is_init(&self) -> bool {
+        self.id == 0
+    }
+}
+
+impl Drop for IpcNs {
+    fn drop(&mut self) {
+        if let Some(f) = IPC_EXIT.get() {
+            f(self.id);
+        }
+    }
 }

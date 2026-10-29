@@ -20,7 +20,7 @@ pub const NSFS_MAGIC: u64 = 0x6e73_6673;
 pub enum NsKind {
     /// A cgroup namespace.
     Cgroup,
-    /// An IPC namespace. rukernel has only the first one.
+    /// An IPC namespace.
     Ipc,
     /// A mount namespace.
     Mnt,
@@ -30,7 +30,7 @@ pub enum NsKind {
     Time,
     /// A user namespace. rukernel has only the first one.
     User,
-    /// A UTS namespace. rukernel has only the first one.
+    /// A UTS namespace.
     Uts,
     /// A network namespace.
     Net,
@@ -84,6 +84,8 @@ impl NsKind {
         match self {
             Self::Cgroup => 0xF000_0000,
             Self::Mnt => 0xF100_0000,
+            Self::Ipc => 0xF300_0000,
+            Self::Uts => 0xF400_0000,
             Self::Net => 0xF800_0000,
             // The other kinds have only the first namespace.
             _ => 0xF200_0000,

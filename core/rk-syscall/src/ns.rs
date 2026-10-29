@@ -2,7 +2,10 @@
 //! kernel/nsproxy.c of Linux.
 
 use crate::cx::{Cx, SysResult};
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_frame::sync::SpinLock;
 use rk_proc::Process;
 use rk_vfs::cred::cap;
 use rk_vfs::nsfs::{NsInode, NsKind};
@@ -91,4 +94,81 @@ pub(crate) fn install(cx: &Cx<'_>, process: &Process, kind: NsKind, id: u32) -> 
     }
     // The caller is in the only namespace of the other kinds.
     Ok(())
+}
+
+/// The ID of the IPC namespace of the caller, or 0 for a kernel task.
+pub(crate) fn ipc_id() -> u32 {
+    rk_proc::current_thread().map_or(0, |t| t.ipc_ns().id())
+}
+
+/// Removes the objects of the IPC namespace `id` when its last thread leaves it, as
+/// `free_ipc_ns` of ipc/namespace.c of Linux.
+fn exit_ipc_ns(id: u32) {
+    crate::shm::exit_ns(id);
+    crate::msg::exit_ns(id);
+    crate::sem::exit_ns(id);
+    crate::mqueue::exit_ns(id);
+}
+
+/// Connects the IPC namespaces of rk-proc to the objects of this crate.
+pub(crate) fn init() {
+    rk_proc::ns::on_ipc_exit(exit_ipc_ns);
+}
+
+/// A table of System V objects for each IPC namespace, as the `ids` of `struct ipc_namespace`
+/// of Linux. The first namespace has a static table. The table of another namespace is made at
+/// its first use. When the namespace stops, its table becomes empty and goes back to a free
+/// list for the next namespace, so a reference to a table stays valid.
+pub(crate) struct PerNs<T: 'static> {
+    /// The table of the first namespace.
+    init: SpinLock<T>,
+    /// The tables of the other namespaces, by the ID of the namespace.
+    others: SpinLock<BTreeMap<u32, &'static SpinLock<T>>>,
+    /// The empty tables that no namespace uses.
+    free: SpinLock<Vec<&'static SpinLock<T>>>,
+    /// Makes an empty table.
+    empty: fn() -> T,
+}
+
+impl<T: Send> PerNs<T> {
+    /// Makes the tables. `init` is the table of the first namespace.
+    pub(crate) const fn new(init: T, empty: fn() -> T) -> Self {
+        Self {
+            init: SpinLock::new(init),
+            others: SpinLock::new(BTreeMap::new()),
+            free: SpinLock::new(Vec::new()),
+            empty,
+        }
+    }
+
+    /// The table of the IPC namespace of the caller.
+    pub(crate) fn get(&'static self) -> &'static SpinLock<T> {
+        let id = ipc_id();
+        if id == 0 {
+            return &self.init;
+        }
+        if let Some(t) = self.others.lock().get(&id) {
+            return t;
+        }
+        let table = self.free.lock().pop().unwrap_or_else(|| {
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(SpinLock::new((self.empty)())))
+        });
+        *self.others.lock().entry(id).or_insert(table)
+    }
+
+    /// The tables of all the namespaces.
+    pub(crate) fn all(&'static self) -> Vec<&'static SpinLock<T>> {
+        let mut v = alloc::vec![&self.init];
+        v.extend(self.others.lock().values().copied());
+        v
+    }
+
+    /// Empties the table of the namespace `id` that stops. The objects go after the locks are
+    /// free.
+    pub(crate) fn exit(&'static self, id: u32) {
+        let Some(table) = self.others.lock().remove(&id) else { return };
+        let old = core::mem::replace(&mut *table.lock(), (self.empty)());
+        drop(old);
+        self.free.lock().push(table);
+    }
 }
