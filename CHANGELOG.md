@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.12] - 2026-10-29
+
 ### Added
 
 - The `inet` boot test makes a veth pair with RTM_NEWLINK and `VETH_INFO_PEER`, with the peer in another network namespace. It checks `IFLA_LINK`, the carrier, /proc/net/dev and /sys/class/net, sends a UDP datagram across the pair, and deletes the pair (#454).
@@ -1089,6 +1091,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.12]: https://github.com/tamnd/rukernel/releases/tag/v0.4.12
 [0.4.11]: https://github.com/tamnd/rukernel/releases/tag/v0.4.11
 [0.4.10]: https://github.com/tamnd/rukernel/releases/tag/v0.4.10
 [0.4.9]: https://github.com/tamnd/rukernel/releases/tag/v0.4.9
