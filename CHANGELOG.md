@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The `smp` boot test checks the POSIX message queues, aio and KSM on 4 CPUs at the same time (#468). Threads send and receive on one queue while another thread unlinks it, and threads open and unlink one name at the same time. Threads submit and reap aio on one context while two threads destroy it, and one thread waits in `io_getevents`. Threads write to pages with stores and with `read` while `ksmd` merges them.
+- The page faults, `mmap`, `munmap` and `brk` of one process do not share a lock for the heap, the reserved ranges or the soft-dirty state (#405). In the `corten` backend, a call that changes the page table tree adds the change to a log with one part for each group of CPUs, and only a `mmap` that searches for a free range takes the lock of the reserved ranges and applies the log first, as `vm_unmapped_area` of Linux searches with `mmap_lock` held. Only `brk` locks the heap fields, `MCL_FUTURE` is a flag, and a fault locks the guard pages only when the process has one. In both backends, the soft-dirty state takes its lock only after a write of 4 to /proc/PID/clear_refs.
 
 ### Fixed
 
