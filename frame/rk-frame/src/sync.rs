@@ -1,8 +1,12 @@
 //! Raw synchronization primitives.
 //!
-//! These are the lowest locks of the kernel, per spec/03-architecture.md section 3.5. In R0 there
-//! is one CPU and no interrupt handler takes a lock, so a lock does not turn interrupts off yet.
-//! The `IrqGuard` and the lock levels come with SMP in R2.
+//! These are the lowest locks of the kernel, per spec/03-architecture.md section 3.5. The kernel
+//! runs with interrupts off, so a lock does not turn interrupts off. The CPUs run kernel code at
+//! the same time, so a lock can be held by another CPU.
+//!
+//! A CPU that spins on a lock does the TLB requests of the other CPUs while it waits. The CPU that
+//! holds the lock can wait for such a request, for example after it changed a page table, and the
+//! waiting CPU has interrupts off, so it would not see the interrupt of the request.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
@@ -25,7 +29,8 @@ impl<T> SpinLock<T> {
         Self { locked: AtomicBool::new(false), value: UnsafeCell::new(value) }
     }
 
-    /// Takes the lock. The CPU spins until the lock is free.
+    /// Takes the lock. The CPU spins until the lock is free, and does the TLB requests of the
+    /// other CPUs while it spins.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self
             .locked
@@ -33,7 +38,7 @@ impl<T> SpinLock<T> {
             .is_err()
         {
             while self.locked.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
+                wait_hint();
             }
         }
         SpinLockGuard { lock: self }
@@ -51,6 +56,16 @@ impl<T> SpinLock<T> {
             .ok()
             .map(|_| SpinLockGuard { lock: self })
     }
+}
+
+/// One step of a spin loop. On the kernel, the CPU also does the TLB requests of the other CPUs,
+/// as the wait of `smp_call_function` of Linux does with interrupts on. Each spin loop of the
+/// kernel must use it: the CPU that the loop waits for can wait for a TLB request of this CPU.
+#[inline]
+pub fn wait_hint() {
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    crate::arch::imp::smp::poll();
+    core::hint::spin_loop();
 }
 
 /// The guard of a held `SpinLock`. The lock is released when the guard is dropped.
@@ -111,7 +126,7 @@ impl<T> Once<T> {
             self.state.store(DONE, Ordering::Release);
         }
         while self.state.load(Ordering::Acquire) != DONE {
-            core::hint::spin_loop();
+            wait_hint();
         }
         // SAFETY: the state is DONE.
         unsafe { self.value_ref() }

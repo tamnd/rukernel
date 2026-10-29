@@ -143,8 +143,9 @@ impl<S> Node<S> {
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            // The holder can wait for a TLB request of this CPU, for example in `fork`.
             while self.busy.load(Ordering::Relaxed) {
-                core::hint::spin_loop();
+                rk_frame::sync::wait_hint();
             }
         }
     }

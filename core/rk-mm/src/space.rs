@@ -1943,18 +1943,29 @@ impl AddressSpace {
     }
 
     fn fault_in(&self, addr: usize, access: Access) -> Result<(), Errno> {
-        // A copy gives EFAULT also for a page that would be SIGBUS, as on Linux.
-        self.handle_fault(addr, access).map_err(|e| match e {
-            Errno::ENOMEM => e,
-            _ => Errno::EFAULT,
-        })?;
         let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
-        match self.vm.page(page) {
-            Some((_, p)) if access != Access::Write || p.writable => Ok(()),
-            _ => Err(Errno::EFAULT),
+        // A thread on another CPU can change the page after the fault, for example with `fork`,
+        // which makes the private pages read only, or with `MADV_DONTNEED`. Then the fault runs
+        // again, as the fault of Linux runs again after `fixup_user_fault`.
+        for _ in 0..FAULT_TRIES {
+            // A copy gives EFAULT also for a page that would be SIGBUS, as on Linux.
+            self.handle_fault(addr, access).map_err(|e| match e {
+                Errno::ENOMEM => e,
+                _ => Errno::EFAULT,
+            })?;
+            if let Some((_, p)) = self.vm.page(page)
+                && (access != Access::Write || p.writable)
+            {
+                return Ok(());
+            }
         }
+        Err(Errno::EFAULT)
     }
 }
+
+/// The most faults of `fault_in` for one page. A fault on another CPU can change the page after
+/// each fault, but not each time.
+const FAULT_TRIES: usize = 8;
 
 /// Keeps only the `ENOMEM` error of a populate. A page that has another error, such as a file page
 /// past the end of the file, gets the error at its first access, as on Linux.

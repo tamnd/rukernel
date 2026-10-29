@@ -41,6 +41,8 @@ rk-vfs.workspace = true
 [features]
 # The CortenMM backend of the address space in rk-mm, per spec/24-open-questions.md question 1.
 corten = ["rk-mm/corten"]
+# The big kernel lock of rk-frame, for a comparison with the old kernel (#405).
+big-lock = ["rk-frame/big-lock"]
 
 [lints]
 workspace = true

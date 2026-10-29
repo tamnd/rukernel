@@ -47,3 +47,21 @@ CortenMM locks the page table pages of a range, from the top to the bottom, and 
 - **Interrupts and bottom halves.** The interrupt handlers take no lock now. A bottom half without the kernel lock can run at the same time as a system call that changes the same data, for example the receive queue of a socket.
 - **Performance under TCG.** Without the kernel lock, more CPUs spin on spin locks. On a busy host, a spin uses a CPU of the host, as #396 found for the kernel lock. The spin locks need the same short spin and wait for an interrupt as `kernel_lock` has now.
 - **Tests that depend on timing.** Some boot tests sleep for a fixed time and expect a change, for example "the threads run again" of `init` before #405. With more CPUs and less serial kernel code, the timing changes. These tests must wait for the change with a long timeout, not test it after a fixed sleep.
+
+## 5. Status after #405
+
+The kernel lock is off by default. The `big-lock` feature of rukernel (`rk-frame/big-lock`) keeps it for a comparison. The steps of section 2 were done in this form:
+
+- Step 2 is done. `SpinLock::lock` and `Once::call_once` call `sync::wait_hint`, which does the TLB requests (`smp::poll`). The shootdown has a SeqCst fence before it reads the active tables of the other CPUs, and `paging::activate` changes the active table with a SeqCst swap.
+- Step 3 is done. `Task` has `on_cpu`, and the states `SLEEPING`, `ASLEEP` and `WAKING`. `wake` never waits: a task that did not switch yet runs on, and a task whose CPU did not save its registers yet goes to a queue in `finish_switch`. A yield to a CPU that the affinity mask does not allow also goes to a queue in `finish_switch`. The load balancer of rk-sched skips a task with `on_cpu`. The idle loop sets its bit in `IDLE_MASK` and tests `Scheduler::has_queued` before it waits. The global `EXITED_TASK` is now the per-CPU `prev`.
+- Step 5 is done for the VMA backend: `VmSpace.inner` is the lock of each address space, and `AddressSpace.state` is the lock of the areas. Each page fault of one address space takes these two locks, so faults of different processes run at the same time. Faults of one process do not.
+- Step 7 is done in part. The functions of `add_bottom_half` run on one CPU at a time (`BOTTOM_HALF_BUSY`), as a tasklet of Linux. The timers of `wait_until_timeout` run on each CPU.
+- Steps 1, 4 and 6 are not done. There is no lock level check. The races that an audit of the higher crates found and that the tests can hit are fixed (see CHANGELOG.md). The others are below.
+
+The work that stays:
+
+- The lock for each page table page of section 3. `VmSpace` in frame/rk-frame/src/vm.rs has one lock for each address space.
+- The global locks: the heap (`FREE` in frame/rk-frame/src/mm/heap.rs), the frame allocator (`FRAMES` in frame/rk-frame/src/mm/frame.rs) and the cgroup tree (`HIERARCHY` in core/rk-cgroup/src/lib.rs, which `charge` and `psi` of rk-sched take at each switch of a task in a cgroup).
+- Spin locks held across file I/O: `AddressSpace::handle_fault` calls `FilePages::page` under the state lock, and `unmap_locked`, `msync` and `Drop` of core/rk-mm/src/space.rs call `write_back` under it. ksmd can drop an address space under `GLOBAL` (core/rk-mm/src/space/ksmd.rs).
+- Check then act in rk-proc: the stop of a group against `SIGCONT` (`stop_group`), the zombie and the reparent in `exit_thread`, the last thread test in `run` of core/rk-syscall/src/run.rs, `set_task` after the spawn in `start_thread`, and `FUTEX_CMP_REQUEUE`, which compares the word outside the lock of the table.
+- Check then act in the file systems: the `pending` map of rk-fs-ext4 (`Fs::write`, `Fs::read`), `open` with `O_CREAT` against a create on another CPU (rk-vfs fs.rs), `O_APPEND` writes from two files, the dentry cache (`Dentry::add_child`), `rename` without a rename lock, and `rmdir` and `move_entry` of rk-fs-tmpfs.

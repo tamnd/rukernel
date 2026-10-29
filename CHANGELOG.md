@@ -2,6 +2,20 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The CPUs run system calls, page faults and the scheduler at the same time, without the big kernel lock (#405). A task has an `on_cpu` flag, as Linux has, and a wake of a task that did not switch yet puts it in a queue after the switch. A CPU that waits for a spin lock does the TLB requests of the other CPUs. The `big-lock` feature of rukernel keeps the old lock for a comparison.
+
+### Fixed
+
+- A `FUTEX_WAIT` on one CPU does not lose a `FUTEX_WAKE` from another CPU: the waiter is in the queue before the read of the word, as in kernel/futex/waitwake.c (#405). `FUTEX_LOCK_PI` and `FUTEX_UNLOCK_PI` change the word with a compare and exchange that they do again on failure.
+- `rt_sigaction` with `SIG_IGN` and `wait4` in two threads of one process do not wait for each other, because `set_action` takes the list of threads before the lock of the signals (#405).
+- A thread that `clone` makes while another thread starts `exit_group` is killed, so the exit of the group does not wait for it (#405).
+- Two Unix sockets with `SO_PASSCRED` that send to each other on two CPUs do not wait for each other, and the count of the bytes in flight does not wrap when the receiver takes the data before the count goes up (#405).
+- A `read` into a page that a `fork` on another CPU makes read only faults the page in again and does not give `EFAULT` (#405).
+
 ## [0.4.12] - 2026-10-29
 
 ### Added

@@ -395,7 +395,8 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const INIT_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The longest time that the `smp` boot test can take. It runs the init checks on `SMP_CPUS` CPUs,
-/// and on a busy host it can take more than 300 s, because all kernel code runs under one lock.
+/// and on a busy host it can take more than 300 s, because a spin of one CPU of the machine uses a
+/// CPU of the host.
 const SMP_TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The longest time that a boot test of a root file system can take. The `alpine` test makes and
@@ -1558,8 +1559,8 @@ fn blk_disk_has_note(path: &Path) -> Result<bool> {
 
 /// The number of CPUs of the `smp` boot test.
 ///
-/// The kernel has one lock, so more CPUs make it slower on a host with few free CPUs. On a host
-/// with 6 CPUs and a load of 7 to 10, the `smp` test took 322 s with 8 CPUs and 112 s with 4
+/// Before #405, the kernel had one lock, so more CPUs made it slower on a host with few free CPUs.
+/// On a host with 6 CPUs and a load of 7 to 10, the `smp` test took 322 s with 8 CPUs and 112 s with 4
 /// CPUs (#396). After the wakeup preemption of #408, the test took 267 s with 8 CPUs and 219 s with
 /// 4 CPUs on the same host, so 8 CPUs are still slower. With 4 CPUs, the test still runs tasks on
 /// several CPUs at the same time.

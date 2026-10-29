@@ -410,8 +410,9 @@ mod glue {
 
     /// The fair class with EEVDF and a run queue for each CPU.
     ///
-    /// The kernel lock of rk-frame lets only one CPU at a time run this code. Each method takes
-    /// the lock of one queue at a time, so the locks have no order.
+    /// The CPUs run this code at the same time. Each method takes the lock of one queue at a
+    /// time, so the queue locks have no order. The lock of an entity comes before the lock of a
+    /// queue, as in `put_prev`.
     pub struct Fair {
         rqs: [SpinLock<Rq>; MAX_CPUS],
     }
@@ -498,8 +499,12 @@ mod glue {
             let loads = self.loads();
             let mut skip = 0;
             while let Some(src) = balance::busiest(this, &loads[..Self::cpus()], skip) {
-                let ok =
-                    |t: &Arc<Task>| balance::allows(data(t).affinity.load(Ordering::Relaxed), this);
+                // A task that is still on its CPU stays there, as `can_migrate_task` of Linux does
+                // for `task_on_cpu`.
+                let ok = |t: &Arc<Task>| {
+                    !t.is_on_cpu()
+                        && balance::allows(data(t).affinity.load(Ordering::Relaxed), this)
+                };
                 if let Some((task, e)) = self.steal(src, ok) {
                     self.push(this, task, e, Some(false));
                     return true;
@@ -629,6 +634,14 @@ mod glue {
                 }
                 None => psi(group, 0, 1),
             }
+        }
+
+        fn can_stay(&self, task: &Task) -> bool {
+            balance::allows(data(task).affinity.load(Ordering::Relaxed), cpu::id())
+        }
+
+        fn has_queued(&self) -> bool {
+            !self.rqs[cpu::id()].lock().queue.is_empty()
         }
 
         fn runs_alone(&self, task: &Task) -> bool {
