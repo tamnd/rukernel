@@ -289,8 +289,12 @@ static NEXT_APIC_ID: AtomicU64 = AtomicU64::new(0);
 /// of the CPU, with the page tables of the start code.
 extern "C" fn ap_entry() -> ! {
     let id = NEXT_ID.load(Ordering::Relaxed) as usize;
+    let apic_id = NEXT_APIC_ID.load(Ordering::Relaxed) as u32;
+    // The heap finds the free lists of this CPU with `cpu::id`, so the GS base must be set before
+    // the tables are allocated. The load of the GDT sets GS to 0, so it is set again after it.
+    cpu::init(id, apic_id);
     super::gdt::init_secondary(id);
-    cpu::init(id, NEXT_APIC_ID.load(Ordering::Relaxed) as u32);
+    cpu::init(id, apic_id);
     super::idt::load();
     super::user::init();
     paging::activate(0);

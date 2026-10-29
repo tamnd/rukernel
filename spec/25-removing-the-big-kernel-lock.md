@@ -60,8 +60,13 @@ The kernel lock is off by default. The `big-lock` feature of rukernel (`rk-frame
 
 The work that stays:
 
-- The lock for each page table page of section 3. `VmSpace` in frame/rk-frame/src/vm.rs has one lock for each address space.
-- The global locks: the heap (`FREE` in frame/rk-frame/src/mm/heap.rs), the frame allocator (`FRAMES` in frame/rk-frame/src/mm/frame.rs) and the cgroup tree (`HIERARCHY` in core/rk-cgroup/src/lib.rs, which `charge` and `psi` of rk-sched take at each switch of a task in a cgroup).
+- The cgroup tree (`HIERARCHY` in core/rk-cgroup/src/lib.rs), which `charge` and `psi` of rk-sched take at each switch of a task in a cgroup.
 - Spin locks held across file I/O: `AddressSpace::handle_fault` calls `FilePages::page` under the state lock, and `unmap_locked`, `msync` and `Drop` of core/rk-mm/src/space.rs call `write_back` under it. ksmd can drop an address space under `GLOBAL` (core/rk-mm/src/space/ksmd.rs).
 - Check then act in rk-proc: the stop of a group against `SIGCONT` (`stop_group`), the zombie and the reparent in `exit_thread`, the last thread test in `run` of core/rk-syscall/src/run.rs, `set_task` after the spawn in `start_thread`, and `FUTEX_CMP_REQUEUE`, which compares the word outside the lock of the table.
 - Check then act in the file systems: the `pending` map of rk-fs-ext4 (`Fs::write`, `Fs::read`), `open` with `O_CREAT` against a create on another CPU (rk-vfs fs.rs), `O_APPEND` writes from two files, the dentry cache (`Dentry::add_child`), `rename` without a rename lock, and `rmdir` and `move_entry` of rk-fs-tmpfs.
+
+## 6. Status after #468
+
+- The lock for each page table page of section 3 is done for the last level. `VmSpace` keeps the pages of each 2 MiB block under the lock of the block, as `pte_lockptr` of Linux. A tree with no lock (frame/rk-frame/src/blocks.rs) finds the lock of a block. A new upper table goes in with a compare and swap, as `pmd_install` of Linux, and the upper tables stay until the address space goes, so a walk takes no lock. A call on a range locks one block at a time.
+- The VMA backend has a read-write lock for the areas, as `mmap_lock` of Linux. A page fault takes it for a read and takes one of 16 fault locks by the 2 MiB block, so faults in two blocks of one process run at the same time. The CortenMM backend did not change: its fault locks the node of the block in its tree.
+- The frame allocator and the heap have a list of free frames and a list of free objects for each CPU, as the per-CPU pagesets of mm/page_alloc.c. A list takes and gives back a batch under the global lock. An allocation that finds no frame or no run gives the lists of all the CPUs back first.

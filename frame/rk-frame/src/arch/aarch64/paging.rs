@@ -201,8 +201,26 @@ fn walk(
             let new = alloc()?;
             // The zeros of the new table must be visible before the walker can see the table.
             sync_tables();
-            e.store(new | VALID | TABLE, Ordering::Relaxed);
-            new
+            // Two CPUs can make the same table of a user address space at the same time, when
+            // they hold the locks of two blocks under it (`VmSpace`). The first one puts its table
+            // in the entry, and the other gives its table back, as `pmd_install` of Linux
+            // (mm/memory.c). The kernel tables change under `TABLES`, so the swap does not fail
+            // for them, and a table of `pool_alloc` is never given back.
+            match e.compare_exchange(
+                value,
+                new | VALID | TABLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => new,
+                Err(other) => {
+                    free_frame_phys(new);
+                    if other & TABLE == 0 {
+                        return None;
+                    }
+                    other & ADDR_MASK
+                }
+            }
         } else if value & TABLE == 0 {
             return None;
         } else {
@@ -673,11 +691,14 @@ pub(crate) fn user_map_new(
     Ok(())
 }
 
-/// Changes the permissions of 4 KiB pages in `root` as `user_protect` does. `pages` gives the
-/// address, the frame and the new permissions of each page, in address order. One walk finds the
-/// level 3 table for all the pages in it, and one TLB invalidation at the end is for all the
-/// pages.
-pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u64, UserProt)>) {
+/// Changes the permissions of 4 KiB pages in `root` as `user_protect` does, but with no TLB
+/// invalidation. `pages` gives the address, the frame and the new permissions of each page, in
+/// address order. One walk finds the level 3 table for all the pages in it. Gives `true` if an
+/// entry changed. The caller then calls `user_flush_all`, one time for all the pages.
+pub(crate) fn user_protect_many(
+    root: u64,
+    pages: impl Iterator<Item = (usize, u64, UserProt)>,
+) -> bool {
     let mut leaf = (usize::MAX, None);
     let mut changed = false;
     for (virt, phys, prot) in pages {
@@ -696,9 +717,12 @@ pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u
             changed = true;
         }
     }
-    if changed {
-        flush_user_all();
-    }
+    changed
+}
+
+/// Drops the TLB entries of all the user pages on each CPU, after `user_protect_many`.
+pub(crate) fn user_flush_all(_root: u64) {
+    flush_user_all();
 }
 
 /// The size of a block at level 2.

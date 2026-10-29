@@ -276,13 +276,65 @@ struct State {
     guards: BTreeSet<usize>,
 }
 
-/// The lock of the areas. The VMA backend has one lock for the whole address space. The CortenMM
-/// backend of the `corten` feature locks the nodes of a page table tree instead, per
-/// spec/24-open-questions.md question 1.
+/// The lock of the areas. The VMA backend has one read-write lock for the whole address space, as
+/// the `mmap_lock` of Linux. The CortenMM backend of the `corten` feature locks the nodes of a page
+/// table tree instead, per spec/24-open-questions.md question 1.
 #[cfg(not(feature = "corten"))]
-type StateLock = SpinLock<State>;
+type StateLock = VmaLock;
 #[cfg(feature = "corten")]
 type StateLock = corten::Corten;
+
+/// The number of the fault locks of an address space of the VMA backend.
+#[cfg(not(feature = "corten"))]
+const FAULT_LOCKS: usize = 16;
+
+/// A fault lock on its own cache line, so two CPUs that take two locks do not share a line.
+#[cfg(not(feature = "corten"))]
+#[repr(align(64))]
+struct FaultLock(SpinLock<()>);
+
+/// The lock of the areas of the VMA backend.
+///
+/// A page fault reads the areas, as a fault of Linux takes `mmap_lock` for a read, so faults of
+/// two threads run at the same time. A change of the areas writes them, and waits for the faults.
+/// Two faults in one 2 MiB block take the same fault lock too, so a fault sees the page and maps
+/// it in one step, as a fault of Linux holds the lock of the last level table (`pte_lockptr` in
+/// include/linux/mm.h). Faults in two blocks take two fault locks, except when the blocks share a
+/// lock of the `FAULT_LOCKS` locks. The page table of `VmSpace` has a lock for each block too.
+#[cfg(not(feature = "corten"))]
+struct VmaLock {
+    state: rk_frame::sync::RwLock<State>,
+    /// The fault locks. They are on the heap, so the address space stays small on the stack.
+    faults: alloc::boxed::Box<[FaultLock]>,
+}
+
+#[cfg(not(feature = "corten"))]
+impl VmaLock {
+    fn new(state: State) -> Self {
+        let faults = (0..FAULT_LOCKS).map(|_| FaultLock(SpinLock::new(()))).collect();
+        Self { state: rk_frame::sync::RwLock::new(state), faults }
+    }
+
+    /// Takes the lock to change the areas. No fault runs while the guard lives.
+    fn lock(&self) -> rk_frame::sync::WriteGuard<'_, State> {
+        self.state.write()
+    }
+
+    /// Takes the lock to change the areas if no other call holds it.
+    fn try_lock(&self) -> Option<rk_frame::sync::WriteGuard<'_, State>> {
+        self.state.try_write()
+    }
+
+    /// Takes the lock to read the areas. Other readers can hold it at the same time.
+    fn read(&self) -> rk_frame::sync::ReadGuard<'_, State> {
+        self.state.read()
+    }
+
+    /// The fault lock of the 2 MiB block of `addr`.
+    fn fault_lock(&self, addr: usize) -> &SpinLock<()> {
+        &self.faults[(addr / HUGE_PAGE_SIZE) % FAULT_LOCKS].0
+    }
+}
 
 /// The address space of one process.
 pub struct AddressSpace {
@@ -1206,19 +1258,25 @@ impl AddressSpace {
         #[cfg(feature = "corten")]
         return self.corten_fault(addr, access);
         #[cfg(not(feature = "corten"))]
-        {
-            let mut st = self.state.lock();
-            // A fault below an area that grows down makes the area larger, up to the size of the
-            // main stack, as Linux does with the default `RLIMIT_STACK`.
-            if st.vmas.find(addr).is_none() {
-                self.grow_stack(&mut st, addr)?;
-            }
-            let vma = st.vmas.find(addr).ok_or(Errno::EFAULT)?;
+        loop {
+            let st = self.state.read();
+            let Some(vma) = st.vmas.find(addr) else {
+                drop(st);
+                // A fault below an area that grows down makes the area larger, up to the size of
+                // the main stack, as Linux does with the default `RLIMIT_STACK`. This changes the
+                // areas, so it takes the lock for a write, as `expand_stack` of Linux does.
+                let mut st = self.state.lock();
+                if st.vmas.find(addr).is_none() {
+                    self.grow_stack(&mut st, addr)?;
+                }
+                continue;
+            };
             // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
             if !st.guards.is_empty() && st.guards.contains(&(addr & !(PAGE_SIZE - 1))) {
                 return Err(Errno::EFAULT);
             }
-            self.fault_area(vma, addr, access)
+            let _block = self.state.fault_lock(addr).lock();
+            return self.fault_area(vma, addr, access);
         }
     }
 
@@ -1235,7 +1293,7 @@ impl AddressSpace {
     }
 
     /// Handles a page fault at `addr` in `vma`, the area that has the address. The caller holds
-    /// the lock of the area.
+    /// the lock of the area, and no other fault in the 2 MiB block of `addr` runs.
     fn fault_area(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Result<(), Errno> {
         self.fault_page(vma, addr, access)?;
         let mut soft = self.soft.lock();

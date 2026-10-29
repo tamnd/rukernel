@@ -1,6 +1,8 @@
 //! The frame allocator and the owned memory types.
 
 use super::bitmap::FrameBitmap;
+use super::heap::IrqOff;
+use super::pcp::CpuList;
 use crate::addr::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::imp::{mem, paging};
 use crate::boot::{BootInfo, MemoryKind};
@@ -16,11 +18,123 @@ const LOW_RESERVED: u64 = 1 << 20;
 
 static FRAMES: SpinLock<FrameBitmap<WORDS>> = SpinLock::new(FrameBitmap::new());
 
+/// The free frames of the bitmap, for `frame_stats` with no lock. It changes under the lock.
+static BITMAP_FREE: AtomicUsize = AtomicUsize::new(0);
+/// The frames that the bitmap manages. It changes under the lock.
+static BITMAP_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+/// The lock of the bitmap. The counts of the bitmap go to `BITMAP_FREE` and `BITMAP_TOTAL` when
+/// the guard is dropped.
+struct Global(crate::sync::SpinLockGuard<'static, FrameBitmap<WORDS>>);
+
+impl Global {
+    fn lock() -> Self {
+        Self(FRAMES.lock())
+    }
+}
+
+impl core::ops::Deref for Global {
+    type Target = FrameBitmap<WORDS>;
+    fn deref(&self) -> &FrameBitmap<WORDS> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Global {
+    fn deref_mut(&mut self) -> &mut FrameBitmap<WORDS> {
+        &mut self.0
+    }
+}
+
+impl Drop for Global {
+    fn drop(&mut self) {
+        BITMAP_FREE.store(self.0.free_count(), Ordering::Relaxed);
+        BITMAP_TOTAL.store(self.0.total(), Ordering::Relaxed);
+    }
+}
+
+/// A list of a CPU holds up to this many free frames, as the `high` limit of a per-CPU pageset of
+/// Linux.
+const PCP_HIGH: usize = 128;
+/// A list of a CPU takes or gives back this many frames at a time, as the `batch` of Linux.
+const PCP_BATCH: usize = 32;
+
+/// The free frames of one CPU, on their own cache lines.
+#[repr(align(64))]
+struct CpuFrames {
+    list: SpinLock<CpuList<PCP_HIGH>>,
+    /// The length of the list, for `frame_stats` with no lock.
+    len: AtomicUsize,
+}
+
+static PCP: [CpuFrames; crate::cpu::MAX_CPUS] =
+    [const { CpuFrames { list: SpinLock::new(CpuList::new()), len: AtomicUsize::new(0) } };
+        crate::cpu::MAX_CPUS];
+
+/// Takes one free frame from the list of this CPU, as `rmqueue_pcplist` of Linux. An empty list
+/// takes a batch from the bitmap first. If the bitmap has no free frame, the lists of all the CPUs
+/// go back to the bitmap and the allocation tries again.
+fn take_frame() -> Option<usize> {
+    if let Some(frame) = take_local() {
+        return Some(frame);
+    }
+    drain_all();
+    Global::lock().alloc()
+}
+
+fn take_local() -> Option<usize> {
+    let _irq = IrqOff::new();
+    let cpu = &PCP[crate::cpu::id()];
+    let mut list = cpu.list.lock();
+    let mut global = None;
+    let frame = list.pop_or_refill(PCP_BATCH, || global.get_or_insert_with(Global::lock).alloc());
+    drop(global);
+    cpu.len.store(list.len(), Ordering::Relaxed);
+    frame
+}
+
+/// Puts a free frame on the list of this CPU, as `free_unref_page` of Linux. A full list gives a
+/// batch back to the bitmap first.
+fn give_frame(frame: usize) {
+    let _irq = IrqOff::new();
+    let cpu = &PCP[crate::cpu::id()];
+    let mut list = cpu.list.lock();
+    let mut global = None;
+    list.push_or_drain(frame, PCP_BATCH, |f| global.get_or_insert_with(Global::lock).free(f));
+    drop(global);
+    cpu.len.store(list.len(), Ordering::Relaxed);
+}
+
+/// Gives the frames of the lists of all the CPUs back to the bitmap, so that a run of frames can
+/// form again, as `drain_all_pages` of Linux.
+fn drain_all() {
+    let _irq = IrqOff::new();
+    for cpu in &PCP {
+        if cpu.len.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let mut list = cpu.list.lock();
+        let mut global = Global::lock();
+        list.drain(|f| global.free(f));
+        cpu.len.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Takes `1 << order` frames in a row from the bitmap with `alloc`. If no run is free, the lists of
+/// the CPUs go back to the bitmap and `alloc` tries again.
+fn take_run(alloc: impl Fn(&mut FrameBitmap<WORDS>) -> Option<usize>) -> Option<usize> {
+    if let Some(first) = alloc(&mut Global::lock()) {
+        return Some(first);
+    }
+    drain_all();
+    alloc(&mut Global::lock())
+}
+
 /// Adds the usable memory of the memory map to the allocator, and reserves the kernel image at the
 /// physical addresses `kernel` and the initramfs. The boot CPU calls this one time, before the
 /// kernel page tables exist.
 pub(crate) fn init(info: &BootInfo, kernel: core::ops::Range<u64>) {
-    let mut frames = FRAMES.lock();
+    let mut frames = Global::lock();
     for r in info.memory().iter().filter(|r| r.kind == MemoryKind::Usable) {
         // Only whole frames are usable.
         let start = r.start.get().div_ceil(PAGE_SIZE as u64);
@@ -44,7 +158,7 @@ pub(crate) fn init(info: &BootInfo, kernel: core::ops::Range<u64>) {
 /// Takes one frame for a page table, fills it with zeros and gives its physical address. A page
 /// table frame of the kernel is never given back.
 pub(crate) fn alloc_table_frame() -> Option<u64> {
-    let frame = FRAMES.lock().alloc()?;
+    let frame = take_frame()?;
     let phys = (frame * PAGE_SIZE) as u64;
     let virt = paging::phys_to_virt(phys) as *mut u8;
     // SAFETY: the allocator gave this frame to no other owner, and `phys_to_virt` gives an
@@ -58,7 +172,7 @@ pub(crate) fn alloc_table_frame() -> Option<u64> {
 /// GICv3 ITS, use this function. They are never given back.
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn alloc_table_run(order: u32) -> Option<u64> {
-    let first = FRAMES.lock().alloc_run(order)?;
+    let first = take_run(|frames| frames.alloc_run(order))?;
     let phys = (first * PAGE_SIZE) as u64;
     let virt = paging::phys_to_virt(phys) as *mut u8;
     // SAFETY: the allocator gave these frames to no other owner, and the direct map maps them
@@ -70,20 +184,20 @@ pub(crate) fn alloc_table_run(order: u32) -> Option<u64> {
 /// Takes one frame and gives its physical address. The heap uses this function. It owns the
 /// frame until it gives it back with `free_frame_phys`.
 pub(crate) fn alloc_frame_phys() -> Option<u64> {
-    let frame = FRAMES.lock().alloc()?;
+    let frame = take_frame()?;
     Some((frame * PAGE_SIZE) as u64)
 }
 
 /// Gives back a frame that `alloc_frame_phys` gave.
 pub(crate) fn free_frame_phys(phys: u64) {
-    FRAMES.lock().free(phys as usize / PAGE_SIZE);
+    give_frame(phys as usize / PAGE_SIZE);
 }
 
 /// Takes `1 << order` frames in a row, where `order` is less than 6, and gives the physical address
 /// of the first one. The address is a multiple of the size of the run. The heap uses this
 /// function, and gives the frames back with `free_frame_phys`.
 pub(crate) fn alloc_run_phys(order: u32) -> Option<u64> {
-    let frame = FRAMES.lock().alloc_small_run(order)?;
+    let frame = take_run(|frames| frames.alloc_small_run(order))?;
     Some((frame * PAGE_SIZE) as u64)
 }
 
@@ -96,10 +210,12 @@ pub struct FrameStats {
     pub free: usize,
 }
 
-/// Gives the frame counts.
+/// Gives the frame counts. The free frames on the lists of the CPUs count as free, as on Linux.
+/// The counts take no lock, so they can be a little old.
 pub fn frame_stats() -> FrameStats {
-    let frames = FRAMES.lock();
-    FrameStats { total: frames.total(), free: frames.free_count() }
+    let lists: usize = PCP.iter().map(|cpu| cpu.len.load(Ordering::Relaxed)).sum();
+    let free = BITMAP_FREE.load(Ordering::Relaxed) + lists;
+    FrameStats { total: BITMAP_TOTAL.load(Ordering::Relaxed), free }
 }
 
 /// One physical page of 4 KiB. The value owns the page: no other `Frame` or `Mapping` has the
@@ -211,7 +327,7 @@ pub fn set_uncharge_hook(f: fn(u32)) {
 
 /// Takes a free frame. The contents of the frame are not defined.
 pub fn alloc_frame() -> Option<Frame> {
-    let frame = FRAMES.lock().alloc()?;
+    let frame = take_frame()?;
     Some(Frame::new((frame * PAGE_SIZE) as u64, false))
 }
 
@@ -228,7 +344,7 @@ pub const HUGE_FRAMES: usize = 512;
 /// Takes `HUGE_FRAMES` zeroed frames in a row. The first frame is 2 MiB aligned, so the frames can
 /// be mapped as one huge page. Gives `None` if no such run is free.
 pub fn alloc_huge_frames() -> Option<alloc::vec::Vec<Frame>> {
-    let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
+    let first = take_run(|frames| frames.alloc_run(HUGE_FRAMES.trailing_zeros()))?;
     set_run_kind(first, Some(HugeKind::Thp));
     let frames = (first..first + HUGE_FRAMES).map(|f| {
         let mut frame = Frame::new((f * PAGE_SIZE) as u64, false);
@@ -271,7 +387,7 @@ impl HugeRun {
     /// Takes a free run. The contents of the frames are not defined. Gives `None` if no run is
     /// free.
     pub fn alloc() -> Option<Self> {
-        let first = FRAMES.lock().alloc_run(HUGE_FRAMES.trailing_zeros())?;
+        let first = take_run(|frames| frames.alloc_run(HUGE_FRAMES.trailing_zeros()))?;
         set_run_kind(first, Some(HugeKind::HugetlbFree));
         Some(Self { first })
     }
@@ -300,7 +416,7 @@ impl HugeRun {
 impl Drop for HugeRun {
     fn drop(&mut self) {
         set_run_kind(self.first, None);
-        let mut frames = FRAMES.lock();
+        let mut frames = Global::lock();
         for f in self.first..self.first + HUGE_FRAMES {
             frames.free(f);
         }
@@ -540,7 +656,7 @@ impl Drop for Frame {
         if let Some(slot) = RUN_KIND.get(first / HUGE_FRAMES) {
             let _ = slot.compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed);
         }
-        FRAMES.lock().free(frame);
+        give_frame(frame);
     }
 }
 
