@@ -88,7 +88,7 @@ pub mod ro_compat {
 pub mod compat {
     /// The file system has a journal.
     pub const HAS_JOURNAL: u32 = 0x4;
-    /// The inode [`RESIZE_INO`] keeps the reserved blocks for more group descriptors.
+    /// The inode [`RESIZE_INO`](super::RESIZE_INO) keeps the reserved blocks for more group descriptors.
     pub const RESIZE_INODE: u32 = 0x10;
     /// A large directory can have an htree index, `dir_index`.
     pub const DIR_INDEX: u32 = 0x20;

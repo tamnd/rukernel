@@ -473,7 +473,7 @@ fn find_user_cc() -> Result<Option<UserCc>> {
         return Ok(Some(zig(command)));
     }
     if std::env::var_os("CI").is_some() {
-        return Err(String::from("no C compiler for the user test programs, install musl-tools"));
+        return Err(String::from("no C compiler for the user test programs, set RK_USER_CC"));
     }
     Ok(None)
 }

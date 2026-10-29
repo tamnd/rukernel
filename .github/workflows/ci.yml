@@ -122,7 +122,8 @@ jobs:
           cargo build --target "$TARGET" --release $crates
 
   # The kernel boots in QEMU and runs its self tests. QEMU exits with status 33 for a pass.
-  # Without KVM on the runner, QEMU uses TCG. This is slow, but the R0 tests are short.
+  # The runner has /dev/kvm, but the runner user cannot open it. A udev rule gives access, and
+  # cargo xtask boot-test then runs QEMU with KVM. Without KVM, the ltp boot test is too slow.
   boot:
     name: boot in qemu on x86-64
     needs: quick
@@ -139,10 +140,15 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: boot
-      - name: install qemu for x86-64 and arm64, ovmf and musl
+      - name: give the runner user access to kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: install qemu for x86-64 and arm64, and ovmf
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-system-arm ovmf musl-tools
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86 qemu-system-arm ovmf
       # tools/ltp/build.sh builds the LTP tests in a container. The cache keeps them until the
       # script changes.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -185,15 +191,19 @@ jobs:
         run: |
           sudo apt-get install --yes --no-install-recommends qemu-user-static
           tools/busybox/build.sh ~/.cache/rk-busybox-aarch64
-      # The arm64 user tests need a C compiler that makes arm64 programs with musl. Ubuntu has no
-      # such package, so the job uses `zig cc`, which `cargo xtask boot-test` finds on the PATH.
-      - name: install zig for the arm64 user programs
+      # The user tests need a C compiler that makes static programs with musl 1.2.5 or later and
+      # the Linux uAPI headers. tests/user/init.c includes <linux/audit.h> and calls statx(). The
+      # musl-gcc of Ubuntu 24.04 has no uAPI headers, and its musl 1.2.4 has no statx(). `zig cc`
+      # has musl 1.2.5 and the uAPI headers for x86-64 and arm64.
+      - name: install zig for the user programs
         run: |
           curl --silent --show-error --fail --location --output /tmp/zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
           echo "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea  /tmp/zig.tar.xz" | sha256sum --check
           tar --extract --xz --file /tmp/zig.tar.xz --directory "$HOME"
           echo "$HOME/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
       - name: boot tests
+        env:
+          RK_USER_CC: zig cc -target x86_64-linux-musl
         run: RK_LTP="$HOME/.cache/rk-ltp" RK_KSELFTEST="$HOME/.cache/rk-kselftest" RK_DEBUG_TOOLS="$HOME/.cache/rk-debug-tools" RK_BUSYBOX_AARCH64="$HOME/.cache/rk-busybox-aarch64/busybox" cargo xtask boot-test
 
   # rk-abigen reads the pinned Linux tree and writes abi/ and core/rk-abi/src/generated/. This job

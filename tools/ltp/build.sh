@@ -38,7 +38,8 @@ sched_setattr sched_getattr getcpu rt_sigsuspend sigsuspend rt_sigtimedwait sigp
 rt_sigqueueinfo tgkill sigwaitinfo sigtimedwait sigwait pause alarm timer_create timer_settime
 timer_gettime timer_delete setitimer getitimer waitid getpriority setpriority nice fsopen fsconfig
 fsmount fspick move_mount open_tree setxattr getxattr listxattr removexattr fsetxattr fgetxattr
-flistxattr fremovexattr lgetxattr llistxattr lremovexattr sendfile splice copy_file_range fadvise"
+flistxattr fremovexattr lgetxattr llistxattr lremovexattr sendfile splice copy_file_range fadvise
+mq_notify mq_timedreceive mq_timedsend mq_unlink msgctl msgget msgrcv msgsnd shmget"
 
 # The runtest files of the groups that notbuilt.txt lists. net.* is each runtest/net.* file.
 LTP_GROUPS="syscalls mm sched controllers net.* pty"
