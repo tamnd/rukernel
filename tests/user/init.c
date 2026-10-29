@@ -4369,6 +4369,144 @@ static void *par_fault(void *arg)
 	return NULL;
 }
 
+/* The file of par_file, its size in pages, and the pages that par_file read with a wrong byte. */
+#define PAR_FILE "/tmp/smp-map"
+#define PAR_FILE_PAGES 256
+static int par_file_bad;
+
+/* The byte of the page `p` of PAR_FILE. */
+static char par_file_byte(int p)
+{
+	return (char)(p % 127 + 1);
+}
+
+/* Maps PAR_FILE on the CPU `arg` and reads each page from a different start, while the other CPUs
+ * fault the same pages. A thread with an odd number also writes the same bytes back through a
+ * shared mapping, and msync and munmap write the pages back to the file. The page faults read the
+ * file without the lock of the address space, as filemap_fault of Linux (mm/filemap.c), and the
+ * first read of a page wins. */
+static void *par_file(void *arg)
+{
+	long i = (long)arg;
+	pin_cpu((int)i);
+	int fd = open(PAR_FILE, O_RDWR);
+	for (int round = 0; fd >= 0 && round < 8; round++) {
+		int shared = (i & 1) != 0;
+		char *m = mmap(NULL, PAR_FILE_PAGES * 4096, shared ? PROT_READ | PROT_WRITE : PROT_READ,
+			       shared ? MAP_SHARED : MAP_PRIVATE, fd, 0);
+		if (m == MAP_FAILED) {
+			__atomic_fetch_add(&par_file_bad, 1, __ATOMIC_RELAXED);
+			break;
+		}
+		for (int k = 0; k < PAR_FILE_PAGES; k++) {
+			int p = (k + (int)i * PAR_FILE_PAGES / par_threads + round * 7) % PAR_FILE_PAGES;
+			if (m[p * 4096 + 100] != par_file_byte(p))
+				__atomic_fetch_add(&par_file_bad, 1, __ATOMIC_RELAXED);
+			if (shared)
+				m[p * 4096 + 100] = par_file_byte(p);
+		}
+		if (shared)
+			msync(m, PAR_FILE_PAGES * 4096, MS_SYNC);
+		munmap(m, PAR_FILE_PAGES * 4096);
+	}
+	if (fd >= 0)
+		close(fd);
+	return NULL;
+}
+
+/* Makes PAR_FILE and runs par_file on `n` CPUs. Gives 1 if each read gave the right byte. */
+static int par_file_run(int n)
+{
+	static char page[4096];
+	pthread_t t[4];
+	int fd = open(PAR_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	int ok = fd >= 0;
+	for (int p = 0; p < PAR_FILE_PAGES && ok; p++) {
+		memset(page, par_file_byte(p), sizeof(page));
+		ok = write(fd, page, sizeof(page)) == sizeof(page);
+	}
+	if (fd >= 0)
+		close(fd);
+	if (!ok)
+		return 0;
+	par_file_bad = 0;
+	for (int i = 0; i < n; i++)
+		pthread_create(&t[i], NULL, par_file, (void *)(long)i);
+	for (int i = 0; i < n; i++)
+		pthread_join(t[i], NULL);
+	char c = 0;
+	fd = open(PAR_FILE, O_RDONLY);
+	ok = fd >= 0 && pread(fd, &c, 1, 5 * 4096 + 100) == 1 && c == par_file_byte(5);
+	if (fd >= 0)
+		close(fd);
+	unlink(PAR_FILE);
+	return ok && par_file_bad == 0;
+}
+
+static long cg_value(const char *path, const char *key);
+static int wait_status(pid_t pid);
+
+/* The forks of par_cg that failed. */
+static int par_cg_failed;
+
+/* Forks and reaps children and maps new pages on the CPU `arg`, in the cgroup of the process. The
+ * charges of the pids and the memory change on each CPU at the same time, without one lock for
+ * all the cgroups, as page_counter_try_charge (mm/page_counter.c) and pids_try_charge
+ * (kernel/cgroup/pids.c) of Linux. */
+static void *par_cg(void *arg)
+{
+	pin_cpu((int)(long)arg);
+	for (int k = 0; k < 40; k++) {
+		pid_t pid = fork();
+		if (pid == 0)
+			_exit(0);
+		int status;
+		if (pid < 0 || waitpid(pid, &status, 0) != pid)
+			__atomic_fetch_add(&par_cg_failed, 1, __ATOMIC_RELAXED);
+		char *m = mmap(NULL, 8 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m != MAP_FAILED) {
+			for (int j = 0; j < 8; j++)
+				m[j * 4096] = 1;
+			munmap(m, 8 * 4096);
+		}
+	}
+	return NULL;
+}
+
+/* Runs par_cg on `n` CPUs in a new cgroup with a pids.max that the threads and their children
+ * reach but do not pass. Gives 1 if no fork failed and the cgroup counts no task at the end. */
+static int par_cg_run(int n)
+{
+	char max[16];
+	mkdir("/cgs", 0755);
+	if (mount("none", "/cgs", "cgroup2", 0, NULL) != 0)
+		return 0;
+	cg_write("/cgs/cgroup.subtree_control", "+memory +pids");
+	rmdir("/cgs/smp");
+	int ok = mkdir("/cgs/smp", 0755) == 0;
+	/* The main thread, n threads, and one child of each thread. */
+	snprintf(max, sizeof(max), "%d", 2 * n + 1);
+	ok = ok && cg_write("/cgs/smp/pids.max", max) == 0;
+	pid_t pid = ok ? fork() : -1;
+	if (pid == 0) {
+		pthread_t t[4];
+		if (cg_write("/cgs/smp/cgroup.procs", "0") != 0)
+			_exit(1);
+		for (int i = 0; i < n; i++)
+			pthread_create(&t[i], NULL, par_cg, (void *)(long)i);
+		for (int i = 0; i < n; i++)
+			pthread_join(t[i], NULL);
+		_exit(par_cg_failed == 0 ? 0 : 2);
+	}
+	int status = wait_status(pid);
+	ok = ok && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+	     cg_value("/cgs/smp/pids.current", "") == 0 &&
+	     cg_value("/cgs/smp/pids.events", "max ") == 0 &&
+	     cg_value("/cgs/smp/cgroup.events", "populated ") == 0 && rmdir("/cgs/smp") == 0;
+	umount("/cgs");
+	return ok;
+}
+
 /* Runs futexes, sockets, faults and system calls on several CPUs at the same time. Before #405,
  * only one CPU at a time ran kernel code, so these races could not occur. */
 static void test_smp_parallel(int cpus)
@@ -4440,6 +4578,10 @@ static void test_smp_parallel(int cpus)
 		munmap(area, PAR_PAGES * 4096);
 	}
 	check("page faults on each CPU in one address space lose no write", mapped);
+
+	check("page faults of one file on each CPU read the right data", par_file_run(n));
+	check("forks and pages on each CPU in one cgroup keep pids.max and the counts",
+	      par_cg_run(n));
 }
 
 static void test_smp(void)

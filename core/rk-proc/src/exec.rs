@@ -223,6 +223,11 @@ impl MmFile for Segment {
     fn cached(&self, index: u64) -> bool {
         self.shared(index).is_some_and(|shared| shared.cached(index))
     }
+
+    /// A page that is not shared is a read of the file at each fault.
+    fn ready(&self, index: u64) -> bool {
+        self.shared(index).is_some_and(|shared| shared.ready(index))
+    }
 }
 
 /// The result of the load of one ELF file.

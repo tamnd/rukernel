@@ -565,8 +565,8 @@ fn reclaim(h: &mut Hierarchy, root: CgId, want: u64) {
 #[test]
 fn memory_min_and_low_protect_the_page_cache() {
     const M: u64 = 1 << 20;
-    let current = |h: &Hierarchy, id: CgId| h.nodes[&id].mem.current;
-    let low = |h: &Hierarchy, id: CgId| h.nodes[&id].mem.events_local[EV_LOW];
+    let current = |h: &Hierarchy, id: CgId| h.memory(id).unwrap().current;
+    let low = |h: &Hierarchy, id: CgId| h.memory(id).unwrap().events_local[EV_LOW];
     for file in ["memory.min", "memory.low"] {
         let (mut h, [b, c, d, e, f]) = protection_tree(file);
         let a = h.parent(b).unwrap();
@@ -632,7 +632,7 @@ fn events_change_only_with_the_first_and_the_last_task() {
 /// that `populated` was before.
 fn populated_by_walk(h: &Hierarchy, id: CgId) -> bool {
     let n = &h.nodes[&id];
-    n.nr_procs > 0 || n.pids > 0 || n.children.values().any(|&c| populated_by_walk(h, c))
+    n.c.has_tasks() || n.children.values().any(|&c| populated_by_walk(h, c))
 }
 
 #[test]
@@ -673,4 +673,125 @@ fn populated_changes_up_the_tree_without_a_walk_over_each_cgroup() {
         assert_eq!(h.populated(id), populated_by_walk(&h, id));
     }
     assert!(!h.populated(leaves[0]) && h.populated(leaves[8]));
+}
+
+/// Threads charge one cgroup at the same time with no lock of the tree, as the hot paths do. The
+/// limits hold, and the counts are 0 again when each charge came back.
+#[test]
+fn charges_from_many_threads_keep_the_limits() {
+    extern crate std;
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory +pids", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory +pids", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    h.write(a, "pids.max", b"8", 0).unwrap();
+    h.write(a, "memory.max", format!("{}", 8 * PAGE_SIZE).as_bytes(), 0).unwrap();
+    let c = h.nodes[&b].c.clone();
+    let sh = h.shared.clone();
+    // The charges that passed and that are not back yet.
+    let held = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let (c, sh, held) = (c.clone(), sh.clone(), held.clone());
+            std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    if c.try_charge_pids(1, &sh).is_ok() {
+                        assert!(held.0.fetch_add(1, SeqCst) < 8);
+                        held.0.fetch_sub(1, SeqCst);
+                        c.uncharge_pids(1);
+                    }
+                    if c.try_charge_memory(PAGE_SIZE, &sh).is_ok() {
+                        assert!(held.1.fetch_add(1, SeqCst) < 8);
+                        held.1.fetch_sub(1, SeqCst);
+                        c.uncharge_memory(PAGE_SIZE, false);
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    for id in [ROOT, a, b] {
+        assert_eq!(h.pids(id), 0);
+        assert_eq!(h.memory(id).unwrap().current, 0);
+    }
+    assert!(h.memory(a).unwrap().peak <= 8 * PAGE_SIZE);
+    assert!(h.read(a, "pids.peak", 0).unwrap().trim().parse::<u64>().unwrap() <= 8);
+    assert!(!h.populated(a));
+}
+
+/// A charge that a limit refuses comes back from the cgroups below the limit, and the cgroups
+/// above it do not see it, as `page_counter_try_charge` of Linux.
+#[test]
+fn a_refused_charge_comes_back_from_each_cgroup() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory +pids", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory +pids", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    h.write(a, "memory.max", b"4096", 0).unwrap();
+    h.write(a, "pids.max", b"1", 0).unwrap();
+    h.charge_memory(b, PAGE_SIZE).unwrap();
+    assert_eq!(h.charge_memory(b, PAGE_SIZE), Err(a));
+    for id in [ROOT, a, b] {
+        assert_eq!(h.memory(id).unwrap().current, PAGE_SIZE);
+    }
+    assert_eq!(h.memory(a).unwrap().events[EV_MAX], 1);
+    assert_eq!(h.memory(b).unwrap().events_local[EV_MAX], 0);
+    h.charge_pids(b, 1).unwrap();
+    assert_eq!(h.charge_pids(b, 1), Err(Errno::EAGAIN));
+    for id in [ROOT, a, b] {
+        assert_eq!(h.pids(id), 1);
+    }
+}
+
+/// An uncharge with no lock of the tree and an `rmdir` race. One of the two lets the removed
+/// cgroup go, and the cgroup does not go while it has a charge.
+#[test]
+fn a_removed_cgroup_goes_after_its_last_uncharge() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let c = h.nodes[&a].c.clone();
+    c.try_charge_memory(PAGE_SIZE, &h.shared).unwrap();
+    h.rmdir(ROOT, b"a").unwrap();
+    assert!(h.nodes.contains_key(&a));
+    // The uncharge tells the caller to let the cgroup go.
+    assert!(c.uncharge_memory(PAGE_SIZE, false).reap);
+    h.reap(a);
+    assert!(!h.nodes.contains_key(&a));
+    assert!(!h.shared.map.read().contains_key(&a));
+    // The other order: the charge is back before `rmdir`, so `rmdir` lets it go.
+    let b = h.mkdir(ROOT, b"b", 0).unwrap();
+    let c = h.nodes[&b].c.clone();
+    c.try_charge_memory(PAGE_SIZE, &h.shared).unwrap();
+    assert!(!c.uncharge_memory(PAGE_SIZE, false).reap);
+    h.rmdir(ROOT, b"b").unwrap();
+    assert!(!h.nodes.contains_key(&b));
+    assert!(!h.shared.map.read().contains_key(&b));
+}
+
+/// The counts change with no lock of the tree, and then `tasks_changed` brings `populated` up
+/// to date. A second call for the same change does nothing.
+#[test]
+fn populated_follows_the_counts_that_change_without_the_lock() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    let c = h.nodes[&b].c.clone();
+    let changed = c.try_charge_pids(1, &h.shared).unwrap();
+    assert!(changed.tasks);
+    assert!(!h.populated(a));
+    h.tasks_changed(b, changed);
+    h.tasks_changed(b, changed);
+    assert!(h.populated(a) && h.populated(b));
+    assert_eq!(h.nodes[&a].nr_populated_children, 1);
+    let changed = c.uncharge_pids(1);
+    assert!(changed.tasks);
+    h.tasks_changed(b, changed);
+    h.tasks_changed(b, changed);
+    assert!(!h.populated(a) && !h.populated(ROOT));
+    assert_eq!(h.nodes[&a].nr_populated_children, 0);
 }

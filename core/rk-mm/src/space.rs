@@ -38,6 +38,14 @@ pub trait MmFile: Send + Sync {
     /// Gives `ENOMEM` if no frame is free, or an error of the file system.
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno>;
 
+    /// Tells if [`MmFile::page`] gives the page `index` with no read of the file, for example
+    /// because the page is in the page cache. A fault calls `page` for a page that is not ready
+    /// with no lock of the address space held, as `filemap_fault` of Linux drops `mmap_lock`
+    /// before it waits for the read of a page (`FAULT_FLAG_RETRY`).
+    fn ready(&self, _index: u64) -> bool {
+        true
+    }
+
     /// The device, the inode number and the path of the file, as `/proc/PID/maps` shows them.
     fn name(&self) -> (u64, u64, Vec<u8>) {
         (0, 0, Vec::new())
@@ -274,6 +282,83 @@ struct State {
     /// The guard pages of `MADV_GUARD_INSTALL`, by address. An access to such a page gives
     /// `SIGSEGV`, as a guard marker in the page table of Linux (mm/madvise.c).
     guards: BTreeSet<usize>,
+    /// The write backs of the areas that a change removed. They run after the lock of the areas
+    /// drops, so the I/O of the file does not hold the lock.
+    write_backs: Vec<WriteBack>,
+}
+
+/// A write back of the shared file pages of a part of an area. It runs with no lock of the
+/// address space held, as Linux writes back the pages of a mapping without `mmap_lock` (for
+/// example `msync` in mm/msync.c drops `mmap_lock` around `vfs_fsync_range`).
+struct WriteBack {
+    file: FileRef,
+    first: u64,
+    end: u64,
+}
+
+impl WriteBack {
+    /// The write back of the shared file pages of `vma` from `start` up to `end`, or `None` if
+    /// the area has no such pages there.
+    fn of(vma: &Vma<FileRef>, start: usize, end: usize) -> Option<Self> {
+        match &vma.backing {
+            Backing::File { file, offset } if vma.shared && file.writes_back() => {
+                let start = start.max(vma.start);
+                let end = end.min(vma.end);
+                (start < end).then(|| WriteBack {
+                    file: file.clone(),
+                    first: file_index(vma, *offset, start),
+                    end: file_index(vma, *offset, end),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Writes the pages back. The caller must not hold the lock of the areas.
+    fn run(self) -> Result<(), Errno> {
+        self.file.write_back(self.first, self.end)
+    }
+}
+
+/// The guard of the lock of the areas of the VMA backend for a change. When it drops, it frees
+/// the lock and then runs the write backs that the change queued in `State::write_backs`.
+#[cfg(not(feature = "corten"))]
+struct StateGuard<'a>(Option<rk_frame::sync::WriteGuard<'a, State>>);
+
+#[cfg(not(feature = "corten"))]
+impl core::ops::Deref for StateGuard<'_> {
+    type Target = State;
+    fn deref(&self) -> &State {
+        self.0.as_deref().expect("the guard holds the lock until it drops")
+    }
+}
+
+#[cfg(not(feature = "corten"))]
+impl core::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut State {
+        self.0.as_deref_mut().expect("the guard holds the lock until it drops")
+    }
+}
+
+#[cfg(not(feature = "corten"))]
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        let Some(mut st) = self.0.take() else { return };
+        let jobs = core::mem::take(&mut st.write_backs);
+        drop(st);
+        // munmap has no error for a failed write back, as on Linux.
+        for job in jobs {
+            let _ = job.run();
+        }
+    }
+}
+
+/// A page of a file that a fault read with no lock of the address space held. The fault takes
+/// the lock again and maps this frame if the area still maps the same page of the same file.
+struct Prepared {
+    file: FileRef,
+    index: u64,
+    frame: Arc<Frame>,
 }
 
 /// The lock of the areas. The VMA backend has one read-write lock for the whole address space, as
@@ -315,9 +400,10 @@ impl VmaLock {
         Self { state: rk_frame::sync::RwLock::new(state), faults }
     }
 
-    /// Takes the lock to change the areas. No fault runs while the guard lives.
-    fn lock(&self) -> rk_frame::sync::WriteGuard<'_, State> {
-        self.state.write()
+    /// Takes the lock to change the areas. No fault runs while the guard lives. The write backs
+    /// that the change queues run after the lock drops.
+    fn lock(&self) -> StateGuard<'_> {
+        StateGuard(Some(self.state.write()))
     }
 
     /// Takes the lock to change the areas if no other call holds it.
@@ -384,11 +470,13 @@ impl Drop for AddressSpace {
         ksmd::exit(self);
         // The process ended or called execve. Its shared file mappings go back to their files.
         let st = self.state.lock();
-        for vma in st.vmas.iter() {
-            let _ = write_back(vma, vma.start, vma.end);
-        }
+        let jobs: Vec<WriteBack> =
+            st.vmas.iter().filter_map(|vma| WriteBack::of(vma, vma.start, vma.end)).collect();
         uncharge_commit(accounted(st.vmas.iter()));
         drop(st);
+        for job in jobs {
+            let _ = job.run();
+        }
         let unused = core::mem::take(&mut *self.huge_resv.lock());
         unreserve_blocks(unused.into_values());
     }
@@ -453,6 +541,7 @@ impl AddressSpace {
             brk: 0,
             lock_future: false,
             guards: BTreeSet::new(),
+            write_backs: Vec::new(),
         };
         Self::with_state(vm, StateLock::new(state))
     }
@@ -766,8 +855,10 @@ impl AddressSpace {
             if vma.account {
                 uncharge_commit(vma.len());
             }
-            // munmap has no error for a failed write back, as on Linux.
-            let _ = write_back(&vma, vma.start, vma.end);
+            // The write back runs after the lock of the areas drops, see `StateGuard`.
+            if let Some(job) = WriteBack::of(&vma, vma.start, vma.end) {
+                st.write_backs.push(job);
+            }
         }
     }
 
@@ -786,16 +877,30 @@ impl AddressSpace {
         if end > USER_END {
             return Err(Errno::ENOMEM);
         }
+        // The lock of the areas only finds the pages. The write backs run after it drops, as
+        // `msync` in mm/msync.c of Linux drops `mmap_lock` around `vfs_fsync_range`. The errors
+        // come in the same order as with the write backs under the lock.
         let st = self.state.lock();
+        let mut jobs = Vec::new();
+        let mut busy = false;
         for vma in st.vmas.iter().filter(|v| v.start < end && addr < v.end) {
             if invalidate && vma.locked {
-                return Err(Errno::EBUSY);
+                busy = true;
+                break;
             }
-            // The write back makes the pages read only in each address space that wrote them, so
-            // the next write marks them dirty again, as `folio_mkclean` of Linux.
-            write_back(vma, addr, end)?;
+            jobs.extend(WriteBack::of(vma, addr, end));
         }
-        if !st.vmas.covers(addr, end) {
+        let covers = st.vmas.covers(addr, end);
+        drop(st);
+        // The write back makes the pages read only in each address space that wrote them, so
+        // the next write marks them dirty again, as `folio_mkclean` of Linux.
+        for job in jobs {
+            job.run()?;
+        }
+        if busy {
+            return Err(Errno::EBUSY);
+        }
+        if !covers {
             return Err(Errno::ENOMEM);
         }
         Ok(())
@@ -1265,6 +1370,8 @@ impl AddressSpace {
         #[cfg(feature = "corten")]
         return self.corten_fault(addr, access);
         #[cfg(not(feature = "corten"))]
+        let mut prepared = None;
+        #[cfg(not(feature = "corten"))]
         loop {
             let st = self.state.read();
             let Some(vma) = st.vmas.find(addr) else {
@@ -1282,9 +1389,37 @@ impl AddressSpace {
             if !st.guards.is_empty() && st.guards.contains(&(addr & !(PAGE_SIZE - 1))) {
                 return Err(Errno::EFAULT);
             }
+            // The read of a page of a file can wait for the disk. It runs with no lock held, and
+            // the fault then starts again, as `filemap_fault` of Linux with `FAULT_FLAG_RETRY`.
+            if prepared.is_none()
+                && let Some((file, index)) = self.read_first(vma, addr, access)
+            {
+                drop(st);
+                let frame = file.page(index)?;
+                prepared = Some(Prepared { file, index, frame });
+                continue;
+            }
             let _block = self.state.fault_lock(addr).lock();
-            return self.fault_area(vma, addr, access);
+            return self.fault_area(vma, addr, access, prepared.as_ref());
         }
+    }
+
+    /// Gives the file and the index of the page that a fault at `addr` in `vma` must read from
+    /// the file first, or `None` if the fault does not read the file. The page is not mapped and
+    /// the file must read it ([`MmFile::ready`] is `false`).
+    fn read_first(
+        &self,
+        vma: &Vma<FileRef>,
+        addr: usize,
+        access: Access,
+    ) -> Option<(FileRef, u64)> {
+        let Backing::File { file, offset } = &vma.backing else { return None };
+        let page = addr & !(PAGE_SIZE - 1);
+        if vma.hugetlb || !allowed(vma, access) || self.vm.page(VirtAddr::new(page)).is_some() {
+            return None;
+        }
+        let index = file_index(vma, *offset, page);
+        (!file.ready(index)).then(|| (file.clone(), index))
     }
 
     /// Makes the area above `addr` grow down to the page of `addr`. The new pages keep the
@@ -1301,8 +1436,14 @@ impl AddressSpace {
 
     /// Handles a page fault at `addr` in `vma`, the area that has the address. The caller holds
     /// the lock of the area, and no other fault in the 2 MiB block of `addr` runs.
-    fn fault_area(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Result<(), Errno> {
-        self.fault_page(vma, addr, access)?;
+    fn fault_area(
+        &self,
+        vma: &Vma<FileRef>,
+        addr: usize,
+        access: Access,
+        prepared: Option<&Prepared>,
+    ) -> Result<(), Errno> {
+        self.fault_page(vma, addr, access, prepared)?;
         let mut soft = self.soft.lock();
         if !soft.tracking() {
             return Ok(());
@@ -1325,14 +1466,16 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// `fault_area` without the soft-dirty state.
-    fn fault_page(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Result<(), Errno> {
-        let allowed = match access {
-            Access::Read => vma.prot.read || vma.prot.write || vma.prot.exec,
-            Access::Write => vma.prot.write,
-            Access::Exec => vma.prot.exec,
-        };
-        if !allowed {
+    /// `fault_area` without the soft-dirty state. `prepared` is a page of the file that the
+    /// fault read before with no lock held.
+    fn fault_page(
+        &self,
+        vma: &Vma<FileRef>,
+        addr: usize,
+        access: Access,
+        prepared: Option<&Prepared>,
+    ) -> Result<(), Errno> {
+        if !allowed(vma, access) {
             return Err(Errno::EFAULT);
         }
         let page = addr & !(PAGE_SIZE - 1);
@@ -1354,7 +1497,15 @@ impl AddressSpace {
                     Backing::Anon => (anon_frame(self.memcg())?, true),
                     Backing::File { file, offset } => {
                         let index = file_index(vma, *offset, page);
-                        let frame = file.page(index)?;
+                        // A file with a page cache has the page now, and gives the frame of the
+                        // cache, which a write or a truncate after the read changed. Another
+                        // file gives the frame of the read.
+                        let frame = match prepared {
+                            Some(p) if same_file(&p.file, file) && p.index == index => {
+                                if file.ready(index) { file.page(index)? } else { p.frame.clone() }
+                            }
+                            _ => file.page(index)?,
+                        };
                         if vma.shared {
                             if write {
                                 dirty = Some((file, index));
@@ -1753,8 +1904,14 @@ impl AddressSpace {
             let keep = |&&g: &&usize| st.vmas.find(g).is_some_and(|v| copied(&v));
             st.guards.iter().filter(keep).copied().collect()
         };
-        *child.state.lock() =
-            State { vmas, brk_start: st.brk_start, brk: st.brk, lock_future: false, guards };
+        *child.state.lock() = State {
+            vmas,
+            brk_start: st.brk_start,
+            brk: st.brk,
+            lock_future: false,
+            guards,
+            write_backs: Vec::new(),
+        };
         Ok(child)
     }
 
@@ -2046,24 +2203,29 @@ fn only_enomem(r: Result<(), Errno>) -> Result<(), Errno> {
     }
 }
 
+/// Tells if `vma` allows `access`.
+fn allowed(vma: &Vma<FileRef>, access: Access) -> bool {
+    match access {
+        Access::Read => vma.prot.read || vma.prot.write || vma.prot.exec,
+        Access::Write => vma.prot.write,
+        Access::Exec => vma.prot.exec,
+    }
+}
+
+/// Tells if `a` and `b` are the same file.
+fn same_file(a: &FileRef, b: &FileRef) -> bool {
+    core::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+}
+
 /// The index in the file of the page at `page` in `vma`, which maps the file from `offset`.
 fn file_index(vma: &Vma<FileRef>, offset: u64, page: usize) -> u64 {
     (offset + (page - vma.start) as u64) / PAGE_SIZE as u64
 }
 
 /// Writes back the shared file pages of `vma` from `start` up to `end`.
+#[cfg(feature = "corten")]
 fn write_back(vma: &Vma<FileRef>, start: usize, end: usize) -> Result<(), Errno> {
-    match &vma.backing {
-        Backing::File { file, offset } if vma.shared && file.writes_back() => {
-            let start = start.max(vma.start);
-            let end = end.min(vma.end);
-            if start >= end {
-                return Ok(());
-            }
-            file.write_back(file_index(vma, *offset, start), file_index(vma, *offset, end))
-        }
-        _ => Ok(()),
-    }
+    WriteBack::of(vma, start, end).map_or(Ok(()), WriteBack::run)
 }
 
 /// Charges a page to the memory cgroup `memcg`, and marks `frame` with the charge. A frame that

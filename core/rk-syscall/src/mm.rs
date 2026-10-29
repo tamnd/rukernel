@@ -5,6 +5,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::fcntl::{F_SEAL_FUTURE_WRITE, F_SEAL_WRITE};
 use rk_abi::native::mman::{
@@ -70,6 +71,11 @@ pub(crate) struct FilePages {
     path: Vec<u8>,
     /// The pages by their index in the file, with the clean or dirty state of each page.
     pages: SpinLock<BTreeMap<u64, CachedPage>>,
+    /// The count of the changes of the file data that `wrote`, `changed` and `zero` copied to the
+    /// pages. It changes with the lock of `pages` held. A read of a page with no lock held reads
+    /// the page again if the count changed during the read, because the change did not see the
+    /// page, as a read of Linux that finds a folio which a truncate removed reads it again.
+    seq: AtomicU64,
     /// This object, for the records of `rk_vfs::mapped::add_frame`.
     me: Weak<dyn rk_vfs::mapped::Mapped>,
 }
@@ -84,23 +90,44 @@ impl Drop for FilePages {
 
 impl MmFile for FilePages {
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
-        if let Some(page) = self.pages.lock().get(&index) {
-            return Ok(page.frame.clone());
-        }
         let offset = index.checked_mul(PAGE_SIZE as u64).ok_or(Errno::EIO)?;
-        // A page that starts past the end of the file has no data. The fault then sends SIGBUS.
-        if offset >= self.inode.metadata().size {
-            return Err(Errno::EIO);
+        // The read of the file runs with no lock. Two readers of one page can both read it, and
+        // the first one that inserts the page wins, so each mapping gets the same frame.
+        loop {
+            let seq = {
+                let pages = self.pages.lock();
+                if let Some(page) = pages.get(&index) {
+                    return Ok(page.frame.clone());
+                }
+                self.seq.load(Ordering::Acquire)
+            };
+            // A page that starts past the end of the file has no data. The fault then sends
+            // SIGBUS.
+            if offset >= self.inode.metadata().size {
+                return Err(Errno::EIO);
+            }
+            let frame = rk_frame::mm::alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
+            frame.write_bytes(0, &self.read_page(offset)?);
+            let mut pages = self.pages.lock();
+            if let Some(page) = pages.get(&index) {
+                return Ok(page.frame.clone());
+            }
+            // A write or a truncate during the read changed the file and did not see this page.
+            if self.seq.load(Ordering::Acquire) != seq {
+                continue;
+            }
+            rk_vfs::mapped::add_frame(frame.addr().get(), self.me.clone(), index);
+            let frame = Arc::new(frame);
+            pages.insert(
+                index,
+                CachedPage { frame: frame.clone(), dirty: false, writers: Vec::new() },
+            );
+            return Ok(frame);
         }
-        let frame = rk_frame::mm::alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
-        frame.write_bytes(0, &self.read_page(offset)?);
-        let mut pages = self.pages.lock();
-        let page = pages.entry(index).or_insert_with(|| {
-            let phys = frame.addr().get();
-            rk_vfs::mapped::add_frame(phys, self.me.clone(), index);
-            CachedPage { frame: Arc::new(frame), dirty: false, writers: Vec::new() }
-        });
-        Ok(page.frame.clone())
+    }
+
+    fn ready(&self, index: u64) -> bool {
+        self.pages.lock().contains_key(&index)
     }
 
     fn name(&self) -> (u64, u64, Vec<u8>) {
@@ -201,11 +228,14 @@ impl FilePages {
         Ok(buf)
     }
 
-    /// The copies of the pages that have a byte from `start` to `end` of the file.
+    /// The copies of the pages that have a byte from `start` to `end` of the file, for a change
+    /// of the file data in that range. A read of a page that runs now reads it again.
     fn copies(&self, start: u64, end: u64) -> Vec<(u64, Arc<Frame>)> {
         let first = start / PAGE_SIZE as u64;
         let last = end.div_ceil(PAGE_SIZE as u64);
-        self.pages.lock().range(first..last).map(|(i, p)| (*i, p.frame.clone())).collect()
+        let pages = self.pages.lock();
+        self.seq.fetch_add(1, Ordering::Release);
+        pages.range(first..last).map(|(i, p)| (*i, p.frame.clone())).collect()
     }
 }
 
@@ -270,6 +300,7 @@ pub(crate) fn file_pages(inode: &InodeRef, path: Vec<u8>) -> Arc<FilePages> {
                 inode: inode.clone(),
                 path,
                 pages: SpinLock::new(BTreeMap::new()),
+                seq: AtomicU64::new(0),
                 me: me.clone(),
             });
             let mapped: Arc<dyn rk_vfs::mapped::Mapped> = pages.clone();
@@ -313,6 +344,10 @@ impl SharedWrite {
 impl MmFile for SharedWrite {
     fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
         self.pages.page(index)
+    }
+
+    fn ready(&self, index: u64) -> bool {
+        self.pages.ready(index)
     }
 
     fn name(&self) -> (u64, u64, Vec<u8>) {

@@ -10,8 +10,9 @@
 //! the same status is one area.
 
 use super::{
-    Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, SharedAnon, State,
-    charge_commit, map_error, next_fork_anon, page_prot, uncharge_commit, write_back,
+    Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, Prepared,
+    SharedAnon, State, charge_commit, map_error, next_fork_anon, page_prot, uncharge_commit,
+    write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
 use crate::pttree::{RangeLock, TREE_END, Tree};
@@ -205,6 +206,7 @@ impl<'a> Whole<'a> {
             brk: meta.brk,
             lock_future: meta.lock_future,
             guards: guards.lock().clone(),
+            write_backs: Vec::new(),
         };
         Self { range, meta, va, guards, count, old, state, changed: false }
     }
@@ -226,6 +228,10 @@ impl DerefMut for Whole<'_> {
 
 impl Drop for Whole<'_> {
     fn drop(&mut self) {
+        // The CortenMM backend runs the write backs with the lock of the whole space held.
+        for job in core::mem::take(&mut self.state.write_backs) {
+            let _ = job.run();
+        }
         if !self.changed {
             return;
         }
@@ -362,10 +368,20 @@ impl AddressSpace {
         if self.state.guards.lock().contains(&page) {
             return Err(Errno::EFAULT);
         }
+        let mut prepared = None;
         loop {
             let range = self.state.tree.lock(page, page + PAGE_SIZE);
             if let Some(vma) = area_at(&range, page) {
-                return self.fault_area(&vma, addr, access);
+                // The read of the file runs with no lock of the tree, as in `handle_fault`.
+                if prepared.is_none()
+                    && let Some((file, index)) = self.read_first(&vma, addr, access)
+                {
+                    drop(range);
+                    let frame = file.page(index)?;
+                    prepared = Some(Prepared { file, index, frame });
+                    continue;
+                }
+                return self.fault_area(&vma, addr, access, prepared.as_ref());
             }
             drop(range);
             // A fault below an area that grows down makes the area larger. This is rare, so it
