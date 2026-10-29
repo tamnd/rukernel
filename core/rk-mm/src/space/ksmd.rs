@@ -175,8 +175,12 @@ impl Pages for Spaces {
         if !eligible(vma, sp.ksm_any()) || !maps_only(&sp, at, frame, 1) {
             return false;
         }
-        // The protect flushes the TLB, so no CPU can write the page after it.
-        sp.vm.protect(at, page_prot(vma, false))
+        // The protect flushes the TLB, so no CPU can write the page after it. A copy to user
+        // memory on another CPU can hold the frame from before the protect and write it later,
+        // so the count of references is checked again after the protect, as `write_protect_page`
+        // of mm/ksm.c of Linux checks the count after `ptep_clear_flush`. The page then stays
+        // read only, and a write makes it writable again without a copy.
+        sp.vm.protect(at, page_prot(vma, false)) && maps_only(&sp, at, frame, 1)
     }
 
     fn replace(&mut self, mm: MmId, addr: usize, frame: &Arc<Frame>, kpage: &Arc<Frame>) -> bool {
@@ -189,6 +193,12 @@ impl Pages for Spaces {
         }
         let prot = page_prot(vma, false);
         sp.vm.protect(at, prot);
+        // A fault can make the page writable after `write_protect`, and a copy to user memory can
+        // then hold the frame. Check the count again after the protect, as `write_protect_page`
+        // of mm/ksm.c of Linux, so that no write comes after the compare.
+        if !maps_only(&sp, at, frame, 1) {
+            return false;
+        }
         if !self.same_contents(frame, kpage) {
             // The page stays read only. A write to it makes it writable again, without a copy.
             return false;

@@ -15,6 +15,11 @@
 //! `SIGEV_THREAD`, musl makes a thread that waits on an `AF_NETLINK` socket, and the kernel puts
 //! a cookie of 32 bytes on that socket with `NetlinkSocket::send_from_kernel`, as
 //! `netlink_sendskb` of Linux does.
+//!
+//! The calls run on many CPUs at the same time. The lock of the root makes the find and the add
+//! of `mq_open` with `O_CREAT`, and the find and the removal of `mq_unlink`, safe against the
+//! other calls, as the lock of the root inode does in ipc/mqueue.c of Linux. The lock of a queue
+//! is not held while the kernel sends a signal or a cookie.
 
 use crate::cx::{Cx, SysResult};
 use crate::info::NSEC_PER_SEC;
@@ -105,6 +110,12 @@ impl Notify {
             NotifyKind::Signal { .. } => SIGEV_SIGNAL,
             NotifyKind::Thread { .. } => SIGEV_THREAD,
         }
+    }
+
+    /// Tells if `process` made the registration. Linux compares `struct pid`, so a new process
+    /// that gets the same number is not the owner. The `Weak` reference keeps the address.
+    fn owned_by(&self, process: &Arc<Process>) -> bool {
+        self.process.as_ptr() == Arc::as_ptr(process)
     }
 
     /// Ends the registration. A thread of `SIGEV_THREAD` gets the cookie with `NOTIFY_REMOVED`.
@@ -276,6 +287,19 @@ impl MqRoot {
 
     fn find(&self, name: &[u8]) -> Option<Arc<MqInode>> {
         self.queues.lock().get(name).cloned()
+    }
+
+    /// Removes the name `name` if it is still the queue `queue`. Another call can remove the name
+    /// and make a new queue with it after the caller found `queue`. Then the new queue stays.
+    fn remove_queue(&self, name: &[u8], queue: &Arc<MqInode>) -> Result<()> {
+        let mut queues = self.queues.lock();
+        match queues.get(name) {
+            Some(q) if Arc::ptr_eq(q, queue) => {
+                queues.remove(name);
+                Ok(())
+            }
+            _ => Err(Errno::ENOENT),
+        }
     }
 }
 
@@ -478,11 +502,12 @@ impl Drop for MqFile {
     /// The close of the last descriptor of the file ends the registration of the process that
     /// closes it, as `mqueue_flush_file` of Linux.
     fn drop(&mut self) {
-        let Some(pid) = rk_proc::current_thread().map(|t| t.process().pid()) else { return };
+        let Some(process) = rk_proc::current_thread().map(|t| t.process().clone()) else { return };
         let mut s = self.queue.state.lock();
-        if s.notify.as_ref().is_some_and(|n| n.pid == pid) {
-            if let Some(n) = s.notify.take() {
-                drop(s);
+        if s.notify.as_ref().is_some_and(|n| n.owned_by(&process)) {
+            let n = s.notify.take();
+            drop(s);
+            if let Some(n) = n {
                 n.remove();
             }
         }
@@ -531,8 +556,44 @@ pub(crate) fn mq_open(cx: &Cx<'_>, name: u64, flags: u64, perm: u64, attr: u64) 
     let fs = cx.fs()?;
     let cred = cx.process().cred();
     let root = root();
-    let mut created = false;
-    let queue = match root.find(&name) {
+    let perm = perm as u32 & 0o7777 & !fs.umask();
+    // Another call can make or remove the queue between the find and the add. A call with
+    // `O_CREAT` and without `O_EXCL` then opens the queue that the other call made, as Linux does
+    // with the lock of the root inode.
+    let (queue, created) = loop {
+        match find_or_create(&root, &name, flags, perm, attr.as_ref(), &cred) {
+            Err(Errno::EEXIST) if flags & O_EXCL == 0 => {}
+            r => break r?,
+        }
+    };
+    let inode: InodeRef = queue.clone();
+    let mount = mount();
+    let dentry = mount.root().clone().add_child(&name, inode);
+    let location = Location { mount: mount.clone(), dentry };
+    let keep = O_ACCMODE | O_NONBLOCK;
+    let ops = Arc::new(MqFile { queue: queue.clone() });
+    let file = File::with_ops(ops, Some(location), flags & keep);
+    let fd = cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0);
+    // Linux takes the descriptor first, so a call that gives `EMFILE` makes no queue. Another
+    // call can use the name now, so remove only the queue of this call.
+    if fd.is_err() && created && root.remove_queue(&name, &queue).is_ok() {
+        mount.root().forget_child(&name);
+    }
+    Ok(fd? as u64)
+}
+
+/// Finds the queue `name` and checks the access of `flags`, or makes it if `flags` has
+/// `O_CREAT`. Gives the queue and `true` if this call made it. Gives `EEXIST` if another call
+/// added the name after the find.
+fn find_or_create(
+    root: &MqRoot,
+    name: &[u8],
+    flags: u32,
+    perm: u32,
+    attr: Option<&MqAttr>,
+    cred: &Cred,
+) -> Result<(Arc<MqInode>, bool)> {
+    match root.find(name) {
         Some(queue) => {
             if flags & (O_CREAT | O_EXCL) == O_CREAT | O_EXCL {
                 return Err(Errno::EEXIST);
@@ -546,35 +607,20 @@ pub(crate) fn mq_open(cx: &Cx<'_>, name: u64, flags: u64, perm: u64, attr: u64) 
                 _ => may::READ,
             };
             cred.permission(&queue.metadata(), access)?;
-            queue
+            Ok((queue, false))
         }
-        None if flags & O_CREAT == 0 => return Err(Errno::ENOENT),
+        None if flags & O_CREAT == 0 => Err(Errno::ENOENT),
         None => {
             cred.permission(&root.metadata(), may::WRITE | may::EXEC)?;
-            let (maxmsg, msgsize) = match &attr {
-                Some(a) => check_attr(a, &cred)?,
+            let (maxmsg, msgsize) = match attr {
+                Some(a) => check_attr(a, cred)?,
                 None => default_attr(),
             };
-            let perm = perm as u32 & 0o7777 & !fs.umask();
             let queue = MqInode::new(maxmsg, msgsize, cred.fsuid, cred.fsgid, perm);
-            root.add(&name, &queue, &cred)?;
-            created = true;
-            queue
+            root.add(name, &queue, cred)?;
+            Ok((queue, true))
         }
-    };
-    let inode: InodeRef = queue.clone();
-    let mount = mount();
-    let dentry = mount.root().clone().add_child(&name, inode);
-    let location = Location { mount: mount.clone(), dentry };
-    let keep = O_ACCMODE | O_NONBLOCK;
-    let file = File::with_ops(Arc::new(MqFile { queue }), Some(location), flags & keep);
-    let fd = cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0);
-    // Linux takes the descriptor first, so a call that gives `EMFILE` makes no queue.
-    if fd.is_err() && created {
-        let _ = root.unlink(&name);
-        mount.root().forget_child(&name);
     }
-    Ok(fd? as u64)
 }
 
 pub(crate) fn mq_unlink(cx: &Cx<'_>, name: u64) -> SysResult {
@@ -586,15 +632,18 @@ pub(crate) fn mq_unlink(cx: &Cx<'_>, name: u64) -> SysResult {
     cred.permission(&dir, may::WRITE | may::EXEC)?;
     // The sticky bit of the root lets only the owner remove a queue. Linux gives `EACCES` here.
     cred.check_sticky(&dir, &queue.metadata()).map_err(|_| Errno::EACCES)?;
-    root.unlink(&name)?;
+    // The checks were for `queue`. If another call removed it and made a new queue with the name
+    // after the find, the call gives `ENOENT`, as the first removal won.
+    root.remove_queue(&name, &queue)?;
     mount().root().forget_child(&name);
     Ok(0)
 }
 
-/// Tells the registered process that a message came to the empty queue, and ends the
-/// registration, as `__do_notify` of Linux. `pid` and `uid` are the sender.
-fn notify(s: &mut MqState, pid: u32, uid: u32) {
-    let Some(n) = s.notify.take() else { return };
+/// Tells the registered process `n` that a message came to the empty queue, as `__do_notify` of
+/// Linux. The caller took the registration from the queue, and does not hold the lock of the
+/// queue, so the locks of the signal and of the socket do not come after it. `pid` and `uid` are
+/// the sender.
+fn notify(n: Notify, pid: u32, uid: u32) {
     match n.kind {
         NotifyKind::None => {}
         NotifyKind::Signal { signo, value } => {
@@ -642,6 +691,7 @@ pub(crate) fn mq_timedsend(
     let uid = process.cred().uid;
     let thread = cx.thread;
     let mut data = Some(data);
+    let mut told = None;
     let mut step = || {
         let mut s = queue.state.lock();
         if !s.msgs.is_full() {
@@ -652,7 +702,7 @@ pub(crate) fn mq_timedsend(
             s.ctime = now;
             // A waiting receiver takes the message, so the registered process is not told.
             if was_empty && s.receivers == 0 {
-                notify(&mut s, pid, uid);
+                told = s.notify.take();
             }
             return Some(Ok(()));
         }
@@ -671,6 +721,9 @@ pub(crate) fn mq_timedsend(
             .wait_until_timeout(deadline.unwrap_or(u64::MAX), &mut step)
             .unwrap_or(Err(Errno::ETIMEDOUT)),
     };
+    if let Some(n) = told {
+        notify(n, pid, uid);
+    }
     if r.is_ok() {
         queue.wake();
     }
@@ -771,13 +824,15 @@ pub(crate) fn mq_notify(cx: &Cx<'_>, fd: u64, sevp: u64) -> SysResult {
     let mut s = queue.state.lock();
     match kind {
         None => {
-            if s.notify.as_ref().is_some_and(|n| n.pid == pid) {
-                if let Some(n) = s.notify.take() {
-                    n.remove();
-                }
+            if s.notify.as_ref().is_some_and(|n| n.owned_by(&process)) {
+                let n = s.notify.take();
                 let now = rk_vfs::now();
                 s.atime = now;
                 s.ctime = now;
+                drop(s);
+                if let Some(n) = n {
+                    n.remove();
+                }
             }
         }
         Some(_) if s.notify.is_some() => return Err(Errno::EBUSY),

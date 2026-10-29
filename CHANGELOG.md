@@ -2,6 +2,18 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The `smp` boot test checks the POSIX message queues, aio and KSM on 4 CPUs at the same time (#468). Threads send and receive on one queue while another thread unlinks it, and threads open and unlink one name at the same time. Threads submit and reap aio on one context while two threads destroy it, and one thread waits in `io_getevents`. Threads write to pages with stores and with `read` while `ksmd` merges them.
+
+### Fixed
+
+- `io_submit` takes the slots of its events before it does the requests, as `get_reqs_available` in fs/aio.c of Linux (#468). Before, two calls on two CPUs could put more events in a context than `io_setup` allowed. `io_destroy` removes the context in one step, so a second call gives `EINVAL`, wakes the tasks in `io_getevents`, and waits for the calls of `io_submit` in progress, as `kill_ioctx`. Before, a task in `io_getevents` waited until its timeout. `io_setup` does the map and the write to user memory without the spin lock of the contexts, and the contexts of two processes with the same ID do not replace each other.
+- `mq_open` with `O_CREAT` and without `O_EXCL` opens the queue that another call made at the same time, and does not give `EEXIST` (#468). `mq_unlink` removes only the queue that it checked, so it cannot remove a new queue with the same name that another call made. The kernel sends the signal or the cookie of `mq_notify` without the lock of the queue, and compares the process of a registration and not its PID, as the `struct pid` of `notify_owner` in ipc/mqueue.c of Linux.
+- KSM checks the count of references of a page after it makes the page read only, as `write_protect_page` in mm/ksm.c of Linux (#468). Before, a copy to user memory on another CPU that held the frame from before the protect could write it after the compare, and the write was lost or went to the KSM page.
+
 ## [0.4.15] - 2026-10-29
 
 ### Added
