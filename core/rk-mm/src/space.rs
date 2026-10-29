@@ -5,7 +5,7 @@
 //! read only in both, and the first write copies it. This is copy on write.
 
 use crate::hugetlb::{HPAGE_SIZE, Subpool};
-use crate::softdirty::SoftDirty;
+use crate::softdirty::SoftLock;
 use crate::tunables::{self, OVERCOMMIT_NEVER, ThpMode};
 use crate::vma::{
     Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up,
@@ -427,8 +427,9 @@ pub struct AddressSpace {
     vm: Arc<VmSpace>,
     state: StateLock,
     /// The soft-dirty state of the pages, as `CONFIG_MEM_SOFT_DIRTY` of Linux. Its lock comes after
-    /// the lock of the areas, and no other lock comes after it.
-    soft: SpinLock<SoftDirty>,
+    /// the lock of the areas, and no other lock comes after it. The calls take the lock only after
+    /// a clear.
+    soft: SoftLock,
     /// The memory cgroup that the new anonymous pages are charged to, or 0 for none.
     memcg: AtomicU32,
     /// The data of KSM.
@@ -551,7 +552,7 @@ impl AddressSpace {
         Self {
             vm: Arc::new(vm),
             state,
-            soft: SpinLock::new(SoftDirty::new()),
+            soft: SoftLock::new(),
             memcg: AtomicU32::new(0),
             ksm: ksmd::MmKsm::default(),
             huge_resv: SpinLock::new(BTreeMap::new()),
@@ -640,7 +641,7 @@ impl AddressSpace {
         let len = req.len.checked_next_multiple_of(align).unwrap_or(0);
         let start = self.mmap_area(req)?;
         // A new mapping is soft-dirty, as the flag `VM_SOFTDIRTY` of a new area of Linux.
-        self.soft.lock().mapped(start, start.saturating_add(len));
+        self.soft.mapped(start, start.saturating_add(len));
         Ok(start)
     }
 
@@ -1090,7 +1091,7 @@ impl AddressSpace {
     fn unmap_pages(&self, start: VirtAddr, end: VirtAddr) {
         self.hiwater.fetch_max(self.page_count(), Ordering::Relaxed);
         self.vm.unmap_range(start, end);
-        self.soft.lock().unmapped(start.get(), end.get());
+        self.soft.unmapped(start.get(), end.get());
     }
 
     /// The number of pages in `start..end` that have a frame.
@@ -1217,7 +1218,7 @@ impl AddressSpace {
             }
             st.vmas.update_range(addr, end, |vma| vma.end = new_end);
             st.vmas.merge_range(addr, new_end);
-            self.soft.lock().mapped(end, new_end);
+            self.soft.mapped(end, new_end);
             return Ok(addr);
         }
         if !remap.may_move {
@@ -1289,7 +1290,7 @@ impl AddressSpace {
             }
         }
         // The old pages have no entries now, as `move_ptes` of Linux.
-        self.soft.lock().unmapped(addr, addr + old_len);
+        self.soft.unmapped(addr, addr + old_len);
         if dont_unmap {
             st.vmas.insert_merged(Vma { start: addr, end: addr + old_len, ..vma.clone() });
         }
@@ -1297,7 +1298,7 @@ impl AddressSpace {
         vma.end = to + new_len;
         st.vmas.insert_merged(vma);
         // The pages that move are soft-dirty, as `move_soft_dirty_pte` of Linux.
-        self.soft.lock().mapped(to, to + new_len);
+        self.soft.mapped(to, to + new_len);
         Ok(to)
     }
 
@@ -1383,7 +1384,7 @@ impl AddressSpace {
             vma.locked = st.lock_future;
             vma.account = true;
             st.vmas.insert_merged(vma);
-            self.soft.lock().mapped(old_end, new_end);
+            self.soft.mapped(old_end, new_end);
         } else if new_end < old_end {
             self.unmap_locked(&mut st, new_end, old_end);
         }
@@ -1463,7 +1464,7 @@ impl AddressSpace {
     /// `EFAULT` if no area grows down to `addr`.
     fn grow_stack(&self, st: &mut State, addr: usize) -> Result<(), Errno> {
         let old = st.vmas.grow_down(addr, STACK_GUARD_GAP, STACK_SIZE).ok_or(Errno::EFAULT)?;
-        self.soft.lock().grew(addr & !(PAGE_SIZE - 1), old);
+        self.soft.grew(addr & !(PAGE_SIZE - 1), old);
         Ok(())
     }
 
@@ -1477,25 +1478,23 @@ impl AddressSpace {
         prepared: Option<&Prepared>,
     ) -> Result<(), Errno> {
         self.fault_page(vma, addr, access, prepared)?;
-        let mut soft = self.soft.lock();
-        if !soft.tracking() {
-            return Ok(());
-        }
-        // A huge page has one soft-dirty state, as the entry of a PMD of Linux.
-        let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
-        let (start, end) = if self.vm.is_huge(page) {
-            let block = addr & !(HUGE_PAGE_SIZE - 1);
-            (block, block + HUGE_PAGE_SIZE)
-        } else {
-            (page.get(), page.get() + PAGE_SIZE)
-        };
-        if access == Access::Write {
-            soft.wrote(start, end);
-        } else if soft.any_clean(start, end) {
-            // A read fault can map a writable page. A clean page stays read only, so the first
-            // write is a fault that marks it.
-            self.vm.write_protect(VirtAddr::new(start), VirtAddr::new(end));
-        }
+        self.soft.when_tracking(|soft| {
+            // A huge page has one soft-dirty state, as the entry of a PMD of Linux.
+            let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
+            let (start, end) = if self.vm.is_huge(page) {
+                let block = addr & !(HUGE_PAGE_SIZE - 1);
+                (block, block + HUGE_PAGE_SIZE)
+            } else {
+                (page.get(), page.get() + PAGE_SIZE)
+            };
+            if access == Access::Write {
+                soft.wrote(start, end);
+            } else if soft.any_clean(start, end) {
+                // A read fault can map a writable page. A clean page stays read only, so the
+                // first write is a fault that marks it.
+                self.vm.write_protect(VirtAddr::new(start), VirtAddr::new(end));
+            }
+        });
         Ok(())
     }
 
@@ -1827,12 +1826,12 @@ impl AddressSpace {
     ///
     /// Gives `ENOMEM` if no frame is free for a page table.
     pub fn fork(&self) -> Result<Self, Errno> {
-        let soft = self.soft.lock().clone();
+        let soft = self.soft.get();
         #[cfg(feature = "corten")]
         let child = self.corten_fork()?;
         #[cfg(not(feature = "corten"))]
         let child = self.vma_fork()?;
-        *child.soft.lock() = soft;
+        child.soft.set(soft);
         // A file that writes back does not know the pages of the child, so they become read only,
         // and the first write of the child marks them dirty.
         let st = child.state.lock();
@@ -1855,8 +1854,7 @@ impl AddressSpace {
     /// page of the huge page counts.
     fn soft_prot(&self, addr: usize, mut prot: PageProt) -> PageProt {
         if prot.writable {
-            let soft = self.soft.lock();
-            if soft.tracking() {
+            self.soft.when_tracking(|soft| {
                 let block = addr & !(HUGE_PAGE_SIZE - 1);
                 let (start, end) = if self.vm.is_huge(VirtAddr::new(addr)) {
                     (block, block + HUGE_PAGE_SIZE)
@@ -1864,7 +1862,7 @@ impl AddressSpace {
                     (addr, addr + PAGE_SIZE)
                 };
                 prot.writable = !soft.any_clean(start, end);
-            }
+            });
         }
         prot
     }
@@ -1876,7 +1874,7 @@ impl AddressSpace {
         let st = self.state.lock();
         let ranges: Vec<(usize, usize)> = st.vmas.iter().map(|v| (v.start, v.end)).collect();
         // The faults hold the lock of the areas, so no fault runs between the two steps.
-        self.soft.lock().clear(ranges.iter().copied());
+        self.soft.with(|soft| soft.clear(ranges.iter().copied()));
         for (start, end) in ranges {
             self.vm.write_protect(VirtAddr::new(start), VirtAddr::new(end));
         }
@@ -1886,7 +1884,7 @@ impl AddressSpace {
     /// Tells if the page at `addr` is soft-dirty. `present` tells that the page has a frame. See
     /// [`crate::softdirty::SoftDirty::is_dirty`].
     pub fn soft_dirty(&self, addr: usize, present: bool) -> bool {
-        self.soft.lock().is_dirty(addr, present)
+        self.soft.is_dirty(addr, present)
     }
 
     /// Sets the high water mark of the pages with a frame to the pages that have a frame now, as a

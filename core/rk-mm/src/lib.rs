@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod hugetlb;
 pub mod ksm;
 pub mod pttree;
+pub mod rangelog;
 pub mod softdirty;
 pub mod tunables;
 pub mod vma;

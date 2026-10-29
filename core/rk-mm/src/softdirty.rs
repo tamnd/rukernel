@@ -10,6 +10,8 @@
 //! areas without `VM_SOFTDIRTY`, and the written pages are the entries with the bit.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use core::sync::atomic::{AtomicBool, Ordering};
+use rk_frame::sync::SpinLock;
 
 /// The size of a page.
 const PAGE: usize = crate::vma::PAGE_SIZE;
@@ -160,8 +162,88 @@ impl SoftDirty {
     }
 }
 
+/// The soft-dirty state of an address space with its lock.
+///
+/// The state needs a change only after a write of 4 to `/proc/PID/clear_refs`. Before it, each
+/// page is soft-dirty and the calls have nothing to record. A flag tells this without the lock,
+/// so the page faults, `mmap`, `munmap` and `brk` of a process do not share the lock, as the
+/// soft-dirty bits of Linux are in the page table entries and need no lock of their own.
+///
+/// The flag changes only with the lock held. The callers that skip the lock hold the lock of the
+/// areas of the range, and [`SoftDirty::clear`] runs with the lock of all the areas, so a caller
+/// sees the flag of the last clear.
+pub struct SoftLock {
+    state: SpinLock<SoftDirty>,
+    /// The value of [`SoftDirty::tracking`].
+    tracking: AtomicBool,
+}
+
+impl Default for SoftLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SoftLock {
+    /// Makes the state of a new address space, where all the pages are soft-dirty.
+    pub const fn new() -> Self {
+        Self { state: SpinLock::new(SoftDirty::new()), tracking: AtomicBool::new(false) }
+    }
+
+    /// Tells if a clear made a range clean, without the lock.
+    pub fn tracking(&self) -> bool {
+        self.tracking.load(Ordering::Acquire)
+    }
+
+    /// Runs `f` on the state with the lock held.
+    pub fn with<R>(&self, f: impl FnOnce(&mut SoftDirty) -> R) -> R {
+        let mut s = self.state.lock();
+        let r = f(&mut s);
+        self.tracking.store(s.tracking(), Ordering::Release);
+        r
+    }
+
+    /// Runs `f` on the state with the lock held if a clear made a range clean, and gives `None`
+    /// with no lock if not.
+    pub fn when_tracking<R>(&self, f: impl FnOnce(&mut SoftDirty) -> R) -> Option<R> {
+        if self.tracking() { Some(self.with(f)) } else { None }
+    }
+
+    /// A copy of the state.
+    pub fn get(&self) -> SoftDirty {
+        self.state.lock().clone()
+    }
+
+    /// Sets the state.
+    pub fn set(&self, state: SoftDirty) {
+        self.with(|s| *s = state);
+    }
+
+    /// [`SoftDirty::mapped`]. All the pages are dirty when no range is clean, so it takes no lock.
+    pub fn mapped(&self, start: usize, end: usize) {
+        self.when_tracking(|s| s.mapped(start, end));
+    }
+
+    /// [`SoftDirty::unmapped`]. No page is in the written set when no range is clean.
+    pub fn unmapped(&self, start: usize, end: usize) {
+        self.when_tracking(|s| s.unmapped(start, end));
+    }
+
+    /// [`SoftDirty::grew`]. An area grows clean only if it is in a clean range.
+    pub fn grew(&self, start: usize, old: usize) {
+        self.when_tracking(|s| s.grew(start, old));
+    }
+
+    /// [`SoftDirty::is_dirty`].
+    pub fn is_dirty(&self, page: usize, present: bool) -> bool {
+        self.when_tracking(|s| s.is_dirty(page, present)).unwrap_or(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     const P: usize = PAGE;
@@ -262,5 +344,56 @@ mod tests {
         s.wrote(0x20_0000, 0x40_0000);
         assert!(s.is_dirty(0x3f_f000, true));
         assert!(!s.is_dirty(0x40_0000, true));
+    }
+
+    #[test]
+    fn the_lock_keeps_the_flag() {
+        let s = SoftLock::new();
+        assert!(!s.tracking());
+        // With no clean range, the calls change nothing.
+        s.mapped(0, 0x10_000);
+        s.unmapped(0, 0x10_000);
+        s.grew(0x8_000, 0x10_000);
+        assert!(s.is_dirty(0x1000, false));
+        assert_eq!(s.get(), SoftDirty::new());
+        s.with(|d| d.clear([(0x10_000, 0x20_000)]));
+        assert!(s.tracking());
+        assert!(!s.is_dirty(0x10_000, true));
+        s.with(|d| d.wrote(0x11_000, 0x12_000));
+        assert!(s.is_dirty(0x11_000, true));
+        // A copy for `fork` keeps the flag.
+        let child = SoftLock::new();
+        child.set(s.get());
+        assert!(child.tracking());
+        assert!(!child.is_dirty(0x12_000, true));
+        // A map over the clean range ends the tracking.
+        s.mapped(0, 0x100_000);
+        assert!(!s.tracking());
+        assert!(s.is_dirty(0x12_000, true));
+        assert_eq!(s.get(), SoftDirty::new());
+    }
+
+    #[test]
+    fn threads_skip_the_lock_until_a_clear() {
+        use std::sync::Arc as StdArc;
+        let s = StdArc::new(SoftLock::new());
+        let workers: std::vec::Vec<_> = (0..4usize)
+            .map(|n| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for i in 0..1000 {
+                        let a = (n * 1000 + i) * PAGE;
+                        s.mapped(a, a + PAGE);
+                        s.unmapped(a, a + PAGE);
+                        assert!(s.is_dirty(a, true));
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert!(!s.tracking());
+        assert_eq!(s.get(), SoftDirty::new());
     }
 }

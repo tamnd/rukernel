@@ -4741,6 +4741,62 @@ static int par_file_run(int n)
 	return ok && par_file_bad == 0;
 }
 
+/* The mappings of par_mm that had a wrong byte or failed, and the brk calls that failed. */
+static int par_mm_bad;
+
+/* Maps, writes, checks and unmaps areas on the CPU `arg`, while the other CPUs do the same. Each
+ * thread writes its number to each page of its area, so two areas that overlap give a wrong byte.
+ * The thread 0 also moves the end of the heap, and the thread 1 makes the pages clean in the
+ * soft-dirty state. These calls do not share a lock of the heap or of the reserved ranges (#405),
+ * as Linux keeps brk under mmap_lock and searches for a free range in vm_unmapped_area. */
+static void *par_mm(void *arg)
+{
+	long i = (long)arg;
+	pin_cpu((int)i);
+	long heap = i == 0 ? syscall(SYS_brk, 0) : 0;
+	for (int k = 0; k < 200; k++) {
+		int pages = 1 + (k + (int)i) % 5;
+		char *m = mmap(NULL, pages * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+			       -1, 0);
+		if (m == MAP_FAILED) {
+			__atomic_fetch_add(&par_mm_bad, 1, __ATOMIC_RELAXED);
+			break;
+		}
+		for (int p = 0; p < pages; p++)
+			m[p * 4096 + 7] = (char)(i + 1);
+		sched_yield();
+		for (int p = 0; p < pages; p++)
+			if (m[p * 4096 + 7] != (char)(i + 1))
+				__atomic_fetch_add(&par_mm_bad, 1, __ATOMIC_RELAXED);
+		munmap(m, pages * 4096);
+		if (i == 0 && heap > 0) {
+			long top = heap + 4096 * (1 + k % 4);
+			if (syscall(SYS_brk, top) != top) {
+				__atomic_fetch_add(&par_mm_bad, 1, __ATOMIC_RELAXED);
+			} else {
+				((char *)heap)[k % 4096] = 1;
+				if (syscall(SYS_brk, heap) != heap)
+					__atomic_fetch_add(&par_mm_bad, 1, __ATOMIC_RELAXED);
+			}
+		}
+		if (i == 1 && k % 20 == 0)
+			write_text("/proc/self/clear_refs", "4");
+	}
+	return NULL;
+}
+
+/* Runs par_mm on `n` CPUs. Gives 1 if each area kept its bytes and each brk call worked. */
+static int par_mm_run(int n)
+{
+	pthread_t t[4];
+	par_mm_bad = 0;
+	for (int i = 0; i < n; i++)
+		pthread_create(&t[i], NULL, par_mm, (void *)(long)i);
+	for (int i = 0; i < n; i++)
+		pthread_join(t[i], NULL);
+	return par_mm_bad == 0;
+}
+
 static long cg_value(const char *path, const char *key);
 static int wait_status(pid_t pid);
 
@@ -5221,6 +5277,7 @@ static void test_smp_parallel(int cpus)
 	}
 	check("page faults on each CPU in one address space lose no write", mapped);
 
+	check("mmap, munmap, brk and faults on each CPU keep the areas apart", par_mm_run(n));
 	check("page faults of one file on each CPU read the right data", par_file_run(n));
 	check("forks and pages on each CPU in one cgroup keep pids.max and the counts",
 	      par_cg_run(n));
