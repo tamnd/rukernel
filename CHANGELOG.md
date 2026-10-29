@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The CPUs run system calls, page faults and the scheduler at the same time, without the big kernel lock (#405). A task has an `on_cpu` flag, as Linux has, and a wake of a task that did not switch yet puts it in a queue after the switch. A CPU that waits for a spin lock does the TLB requests of the other CPUs. The `big-lock` feature of rukernel keeps the old lock for a comparison.
+- The `blk` boot test has a second disk with ext2, which xtask makes with mkfs.ext2. Init writes 50 MB to a file on it in chunks of 1 MiB, and 4 MB in chunks of 1 KiB in a memory cgroup, as memcontrol03 of LTP. It calls fsync, checks the data and prints the times (#446).
 
 ### Fixed
 
@@ -15,6 +16,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A thread that `clone` makes while another thread starts `exit_group` is killed, so the exit of the group does not wait for it (#405).
 - Two Unix sockets with `SO_PASSCRED` that send to each other on two CPUs do not wait for each other, and the count of the bytes in flight does not wrap when the receiver takes the data before the count goes up (#405).
 - A `read` into a page that a `fork` on another CPU makes read only faults the page in again and does not give `EFAULT` (#405).
+- A write to an ext2 or ext3 file with a block map finds the blocks in runs, as `ext2_get_blocks` in fs/ext2/inode.c of Linux, and each run goes to the page cache in one call. A small write reads and writes only the entries of the map and the bytes of the bitmap that it uses, not whole blocks. With all the changes of #446 in this list, the release kernel under QEMU without KVM writes 50 MB in chunks of 1 KiB in a memory cgroup, as memcontrol03 and memcontrol04 of LTP, in about 5.0 s, not 7.4 to 9.5 s. In chunks of 1 MiB the write takes 1.3 to 1.5 s, not 2.3 to 3.1 s (#446).
+- virtio-blk sends up to 512 KiB in one request, the largest request of the block queue, not 64 KiB, as `seg_max` in drivers/block/virtio_blk.c of Linux (#446).
+- The page cache drops clean folios until it is an eighth below its limit, as the watermarks of kswapd in mm/vmscan.c of Linux. Before, each read and each write over the limit sorted all the clean folios to drop one folio (#446).
+- A read or a write of the page cache checks the limit of the memory cgroup only after it charged a new folio, as `mem_cgroup_charge` of Linux. Before, each call took the lock of the cgroups (#446).
 
 ## [0.4.12] - 2026-10-29
 

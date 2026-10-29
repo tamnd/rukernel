@@ -1524,6 +1524,8 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
 
 /// The size of the disk of the `blk` boot test.
 const BLK_DISK_SIZE: usize = 1 << 20;
+/// The size of the ext2 disk of the `blk` boot test, as the device of the LTP runner.
+const EXT2_DISK_SIZE: u64 = 512 << 20;
 /// The size of the disk that the `alpine` test makes an ext4 file system on.
 const EXT4_DISK_SIZE: u64 = 64 << 20;
 /// The size of the disk that the `alpine` test makes an XFS file system on. mkfs.xfs does not make
@@ -1545,6 +1547,27 @@ fn blk_cached_byte(k: usize) -> u8 {
 fn write_blk_disk(path: &Path) -> Result {
     let data: Vec<u8> = (0..BLK_DISK_SIZE).map(|k| (k / 512 * 7 + k % 251) as u8).collect();
     fs::write(path, data).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Makes the ext2 disk of the `blk` boot test with `mkfs.ext2` of the host, as LTP makes the file
+/// system of memcontrol03. Gives `false` if the host has no `mkfs.ext2`, and then the test runs
+/// without the disk.
+fn make_ext2_disk(path: &Path) -> Result<bool> {
+    let file = fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.set_len(EXT2_DISK_SIZE).map_err(|e| format!("{}: {e}", path.display()))?;
+    let made = ["mkfs.ext2", "/sbin/mkfs.ext2", "/usr/sbin/mkfs.ext2"].iter().any(|mkfs| {
+        Command::new(mkfs)
+            .args(["-q", "-F"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if !made {
+        println!("boot test blk: the host has no mkfs.ext2, so the test has no ext2 disk");
+    }
+    Ok(made)
 }
 
 /// Tells if the guest wrote its text, and the data that it wrote through the page cache, to the
@@ -2004,6 +2027,16 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             cmd.arg("-drive")
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
+        }
+        // The `blk` test writes 50 MB to a file on an ext2 disk, as memcontrol03 of LTP.
+        if *test == "blk" {
+            let disk = kernel.with_file_name("ext2.img");
+            if make_ext2_disk(&disk)? {
+                cmd.arg("-drive")
+                    // The disk is new for each run, as the disk of the LTP runner.
+                    .arg(format!("if=none,id=ext2,format=raw,cache=unsafe,file={}", disk.display()))
+                    .args(["-device", "virtio-blk-pci,drive=ext2"]);
+            }
         }
         // The `net` test sends an ARP request to the gateway of the user network of QEMU. The
         // `inet` test pings the gateway and asks the DNS server of QEMU. The `netcfg` test sets up

@@ -169,6 +169,8 @@ struct Inner {
     cached: usize,
     /// The number of bytes in the charged folios.
     charged: usize,
+    /// A folio was charged to a memory cgroup since the last call of `balance`.
+    new_charge: bool,
     clock: u64,
 }
 
@@ -218,7 +220,14 @@ type Batch = (Vec<Bio>, Vec<(u64, u16)>);
 impl<S: Store> PageCache<S> {
     /// Makes an empty cache of `store`.
     pub fn new(store: S) -> Self {
-        let inner = Inner { folios: BTreeMap::new(), dirty: 0, cached: 0, charged: 0, clock: 0 };
+        let inner = Inner {
+            folios: BTreeMap::new(),
+            dirty: 0,
+            cached: 0,
+            charged: 0,
+            new_charge: false,
+            clock: 0,
+        };
         Self { store, inner: SpinLock::new(inner) }
     }
 
@@ -257,6 +266,7 @@ impl<S: Store> PageCache<S> {
             {
                 (ops.charge)(memcg, charge_of(len) as u64);
                 inner.charged += len;
+                inner.new_charge = true;
                 CHARGED.fetch_add(len, Ordering::Relaxed);
             }
             Folio { data: vec![0; len], memcg, uptodate: 0, dirty: 0, used }
@@ -341,8 +351,11 @@ impl<S: Store> PageCache<S> {
             Ok(())
         })?;
         self.shrink(&mut inner);
+        let charged = core::mem::take(&mut inner.new_charge);
         drop(inner);
-        balance();
+        if charged {
+            balance();
+        }
         Ok(len)
     }
 
@@ -384,8 +397,11 @@ impl<S: Store> PageCache<S> {
             self.send(&mut inner, batch)?;
         }
         self.shrink(&mut inner);
+        let charged = core::mem::take(&mut inner.new_charge);
         drop(inner);
-        balance();
+        if charged {
+            balance();
+        }
         Ok(len)
     }
 
@@ -537,28 +553,31 @@ impl<S: Store> PageCache<S> {
         }
     }
 
-    /// Drops the clean folios that were used least recently, until the folios that are not
-    /// charged are not above `CACHE_LIMIT`, and the charged folios of all caches are not above
-    /// `MemcgOps::limit`.
+    /// Drops the clean folios that were used least recently when the folios that are not
+    /// charged are above `CACHE_LIMIT`, or the charged folios of all caches are above
+    /// `MemcgOps::limit`. It drops folios until the data is an eighth below the limit, so that
+    /// the sort of the folios is not done again at each write of a long stream, as the low and
+    /// high watermarks of `kswapd` in mm/vmscan.c of Linux.
     fn shrink(&self, inner: &mut Inner) {
         let limit = MEMCG.get().map_or(usize::MAX, |ops| ops.limit);
-        let over = |inner: &Inner| {
-            inner.cached - inner.charged > CACHE_LIMIT
-                || (inner.charged > 0 && CHARGED.load(Ordering::Relaxed) > limit)
+        let over = |inner: &Inner, cache: usize, charged: usize| {
+            inner.cached - inner.charged > cache
+                || (inner.charged > 0 && CHARGED.load(Ordering::Relaxed) > charged)
         };
-        if !over(inner) {
+        if !over(inner, CACHE_LIMIT, limit) {
             return;
         }
+        let (low_cache, low_charged) = (CACHE_LIMIT - CACHE_LIMIT / 8, limit - limit / 8);
         let mut clean: Vec<(u64, u64)> =
             inner.folios.iter().filter(|(_, f)| f.dirty == 0).map(|(i, f)| (f.used, *i)).collect();
         clean.sort_unstable();
         for (_, index) in clean {
-            if !over(inner) {
+            if !over(inner, low_cache, low_charged) {
                 break;
             }
             // A charged folio goes only for the limit of the charged folios.
             let charged = inner.folios[&index].memcg != 0;
-            if charged == (inner.cached - inner.charged > CACHE_LIMIT) {
+            if charged == (inner.cached - inner.charged > low_cache) {
                 continue;
             }
             Self::drop_folio(inner, index);
@@ -566,7 +585,10 @@ impl<S: Store> PageCache<S> {
     }
 }
 
-/// Takes back the cache of the memory cgroup of the current task if it is over its limit.
+/// Takes back the cache of the memory cgroup of the current task if it is over its limit. A read
+/// or a write calls this only after it charged a new folio, as Linux reclaims in
+/// `mem_cgroup_charge` only (mm/memcontrol.c), so a write to folios in the cache does not take
+/// the locks of the cgroups.
 fn balance() {
     if let Some(ops) = MEMCG.get() {
         let memcg = (ops.current)();
@@ -685,6 +707,20 @@ mod tests {
         assert!(c.cached_bytes() <= CACHE_LIMIT);
         c.drop_clean();
         assert_eq!(c.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn a_full_cache_drops_folios_down_to_the_low_mark() {
+        let (_, c) = cache(CACHE_LIMIT + 2 * FOLIO_SIZE);
+        let mut buf = vec![0; FOLIO_SIZE];
+        for i in 0..=(CACHE_LIMIT / FOLIO_SIZE) {
+            c.read((i * FOLIO_SIZE) as u64, &mut buf).unwrap();
+        }
+        assert!(c.cached_bytes() <= CACHE_LIMIT - CACHE_LIMIT / 8);
+        // The next folios do not make the cache drop folios again.
+        let before = c.cached_bytes();
+        c.read(CACHE_LIMIT as u64 + FOLIO_SIZE as u64, &mut buf).unwrap();
+        assert_eq!(c.cached_bytes(), before + FOLIO_SIZE);
     }
 
     #[test]

@@ -33,8 +33,11 @@ const CONFIG_MAX_DISCARD_SECTORS: usize = 36;
 /// The status that the device writes for a request that it did.
 const S_OK: u8 = 0;
 
-/// The data frames of one request. A larger read or write is done as more requests.
-const DATA_FRAMES: usize = 16;
+/// The most data frames of one request: 512 KiB, the `MAX_SECTORS` of the request queue, so a
+/// merged request of the block layer goes to the device as one request. A larger read or write
+/// is done as more requests. A queue with fewer descriptors gives fewer frames, as the `seg_max`
+/// limit of drivers/block/virtio_blk.c of Linux.
+const DATA_FRAMES: usize = 128;
 const SECTORS_PER_FRAME: usize = PAGE_SIZE / SECTOR_SIZE;
 
 /// Starts the driver for the disk number `index` on the transport `t`, and gives the name of the
@@ -56,7 +59,9 @@ pub(crate) fn probe(mut t: Transport, index: u32) -> Option<(String, String)> {
     };
     // The header, the status byte and the data of a request.
     let req = alloc_zeroed_frame()?;
-    let data = (0..DATA_FRAMES).map(|_| alloc_zeroed_frame()).collect::<Option<Vec<_>>>()?;
+    // The header and the status byte take two descriptors.
+    let frames = DATA_FRAMES.min(queue.max_buffers().saturating_sub(2)).max(1);
+    let data = (0..frames).map(|_| alloc_zeroed_frame()).collect::<Option<Vec<_>>>()?;
     let sectors = t.device_u64(0);
     let max_discard = match features & F_DISCARD {
         0 => 0,
@@ -153,7 +158,7 @@ impl BlockDevice for VirtioBlk {
         self.check(sector, buf.len())?;
         let mut st = self.state.lock();
         let mut sector = sector;
-        for chunk in buf.chunks_mut(DATA_FRAMES * PAGE_SIZE) {
+        for chunk in buf.chunks_mut(st.data.len() * PAGE_SIZE) {
             let frames = chunk.len().div_ceil(PAGE_SIZE);
             st.request(T_IN, sector, frames, chunk.len())?;
             for (part, f) in chunk.chunks_mut(PAGE_SIZE).zip(&st.data) {
@@ -171,7 +176,7 @@ impl BlockDevice for VirtioBlk {
         self.check(sector, buf.len())?;
         let mut st = self.state.lock();
         let mut sector = sector;
-        for chunk in buf.chunks(DATA_FRAMES * PAGE_SIZE) {
+        for chunk in buf.chunks(st.data.len() * PAGE_SIZE) {
             for (part, f) in chunk.chunks(PAGE_SIZE).zip(&st.data) {
                 f.write_bytes(0, part);
             }
