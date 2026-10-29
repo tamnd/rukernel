@@ -852,11 +852,14 @@ pub(crate) fn prctl(cx: &mut Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
             }
             if arg3 == PR_SPEC_ENABLE { Ok(0) } else { Err(Errno::ENXIO) }
         }
-        PR_GET_DUMPABLE => Ok(1),
+        // The `dumpable` value of the process, as `prctl_set_dumpable` in kernel/sys.c of Linux.
+        // A user can set only `SUID_DUMP_DISABLE` and `SUID_DUMP_USER`.
+        PR_GET_DUMPABLE => Ok(u64::from(cx.process().dumpable())),
         PR_SET_DUMPABLE => {
             if arg2 > 1 {
                 return Err(Errno::EINVAL);
             }
+            cx.process().set_dumpable(arg2 as u8);
             Ok(0)
         }
         _ => {

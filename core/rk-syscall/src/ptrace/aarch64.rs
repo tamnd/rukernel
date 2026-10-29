@@ -3,11 +3,11 @@
 //! `PTRACE_PEEKUSR`, so the tracer uses `PTRACE_GETREGSET`.
 
 use rk_abi::Errno;
-use rk_frame::user::USER_END;
+use rk_frame::user::{USER_END, UserContext};
 use rk_proc::ptrace::{Ptrace, Stop};
 
 /// The number of words in `struct user_pt_regs`: x0 to x30, sp, pc and pstate.
-pub(super) const NREGS: usize = 34;
+pub(crate) const NREGS: usize = 34;
 /// The words of sp, pc and pstate.
 const R_SP: usize = 31;
 const R_PC: usize = 32;
@@ -19,12 +19,18 @@ const PSTATE_MASK: u64 = 0xf000_0000;
 
 /// Gives `struct user_pt_regs` of the stopped tracee.
 pub(super) fn get_regs(pt: &Ptrace, stop: &Stop) -> [u64; NREGS] {
-    let r = stop.regs.regs();
+    user_regs(&stop.regs, stop.orig_rax, pt.flags(stop))
+}
+
+/// Gives `struct user_pt_regs` from the registers `regs`, with the flags `flags` in PSTATE. It is
+/// also `elf_gregset_t` of the `NT_PRSTATUS` note of a core dump. arm64 has no `orig_rax` word.
+pub(crate) fn user_regs(regs: &UserContext, _orig: u64, flags: u64) -> [u64; NREGS] {
+    let r = regs.regs();
     let mut out = [0; NREGS];
     out[..31].copy_from_slice(&r.x);
     out[R_SP] = r.sp;
     out[R_PC] = r.pc;
-    out[R_PSTATE] = pt.flags(stop);
+    out[R_PSTATE] = flags;
     out
 }
 

@@ -747,6 +747,7 @@ impl AddressSpace {
             hugetlb,
             dont_fork: false,
             wipe_on_fork: false,
+            dont_dump: false,
             fork_anon: 0,
             backing,
             kind: req.kind,
@@ -1095,6 +1096,38 @@ impl AddressSpace {
     /// The number of pages in `start..end` that have a frame.
     pub fn resident_pages(&self, start: usize, end: usize) -> usize {
         self.vm.pages_in(VirtAddr::new(start), VirtAddr::new(end))
+    }
+
+    /// Copies the page at `addr` to `buf` for a core dump, as `get_dump_page` in mm/gup.c of
+    /// Linux. A page with a frame gives its bytes, and the permissions of the page have no
+    /// effect. A page of a file area with no frame gives the page of the file. Gives `false` for
+    /// an anonymous page with no frame, which the dump keeps as a hole, and for a page that the
+    /// file cannot give. `buf` has the size of a page.
+    pub fn dump_page(&self, addr: usize, buf: &mut [u8]) -> bool {
+        let page = addr & !(PAGE_SIZE - 1);
+        if let Some((frame, _)) = self.vm.page(VirtAddr::new(page)) {
+            frame.read_bytes(0, &mut buf[..PAGE_SIZE]);
+            return true;
+        }
+        let file = {
+            let st = self.state.lock();
+            let Some(vma) = st.vmas.iter().find(|v| v.start <= page && page < v.end) else {
+                return false;
+            };
+            match &vma.backing {
+                Backing::File { file, offset } if !vma.hugetlb => {
+                    (file.clone(), file_index(vma, *offset, page))
+                }
+                _ => return false,
+            }
+        };
+        match file.0.page(file.1) {
+            Ok(frame) => {
+                frame.read_bytes(0, &mut buf[..PAGE_SIZE]);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Gives one byte for each page of `addr..addr + len`: 1 if the page has a frame, else 0. A
@@ -1951,6 +1984,23 @@ impl AddressSpace {
                 vma.wipe_on_fork = on;
             }
         });
+        Ok(())
+    }
+
+    /// Sets the dump advice of the areas in `addr..addr + len`: `MADV_DONTDUMP` with `true` and
+    /// `MADV_DODUMP` with `false`, as `madvise_vma_behavior` in mm/madvise.c of Linux. A core
+    /// dump does not hold the pages of an area with the advice.
+    ///
+    /// # Errors
+    ///
+    /// `ENOMEM` if a page of the range is not mapped.
+    pub fn set_dump_advice(&self, addr: usize, len: usize, dont_dump: bool) -> Result<(), Errno> {
+        let (start, end) = Self::lock_range(addr, len)?;
+        let mut st = self.state.lock();
+        if !st.vmas.covers(start, end) {
+            return Err(Errno::ENOMEM);
+        }
+        st.vmas.update_range_merged(start, end, |vma| vma.dont_dump = dont_dump);
         Ok(())
     }
 

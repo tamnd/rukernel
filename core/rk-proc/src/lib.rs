@@ -14,6 +14,7 @@
 extern crate alloc;
 
 pub mod bpf;
+pub mod coredump;
 pub mod elf;
 pub mod keys;
 pub mod limits;
@@ -42,8 +43,8 @@ mod vdso;
 pub use process::{
     COMM_LEN, Delivery, ForkShare, INIT_PID, PID_MAX, Pid, Process, Restart, SharedFiles, SharedFs,
     SyscallInfo, Thread, VforkDone, create_init, current_thread, exit_group, exit_thread,
-    find_process, find_thread, fork, kill_group, new_thread, processes, send_signal, stop_group,
-    user_ticks, wait_child, wait_for_init,
+    find_process, find_thread, fork, kill_group, new_thread, processes, send_signal,
+    start_core_dump, stop_group, user_ticks, wait_child, wait_for_init,
 };
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use process::{ptrace, seccomp};

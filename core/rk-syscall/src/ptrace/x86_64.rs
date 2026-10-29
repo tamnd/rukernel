@@ -2,11 +2,11 @@
 //! `struct user`, as arch/x86/kernel/ptrace.c of Linux has them.
 
 use rk_abi::Errno;
-use rk_frame::user::USER_END;
+use rk_frame::user::{USER_END, UserContext};
 use rk_proc::ptrace::{Ptrace, Stop};
 
 /// The number of words in `struct user_regs_struct`.
-pub(super) const NREGS: usize = 27;
+pub(crate) const NREGS: usize = 27;
 /// The size of `struct user`, and the offset of `u_debugreg` in it.
 const USER_SIZE: u64 = 912;
 const USER_DEBUGREG: u64 = 848;
@@ -29,7 +29,13 @@ const FLAG_MASK: u64 = 0x50dd5;
 
 /// Gives `struct user_regs_struct` of the stopped tracee.
 pub(super) fn get_regs(pt: &Ptrace, stop: &Stop) -> [u64; NREGS] {
-    let r = stop.regs.regs();
+    user_regs(&stop.regs, stop.orig_rax, pt.flags(stop))
+}
+
+/// Gives `struct user_regs_struct` from the registers `regs`, with `orig_rax` and the flags
+/// `flags`. It is also `elf_gregset_t` of the `NT_PRSTATUS` note of a core dump.
+pub(crate) fn user_regs(regs: &UserContext, orig_rax: u64, flags: u64) -> [u64; NREGS] {
+    let r = regs.regs();
     [
         r.r15,
         r.r14,
@@ -46,13 +52,13 @@ pub(super) fn get_regs(pt: &Ptrace, stop: &Stop) -> [u64; NREGS] {
         r.rdx,
         r.rsi,
         r.rdi,
-        stop.orig_rax,
+        orig_rax,
         r.rip,
         USER_CS,
-        pt.flags(stop),
+        flags,
         r.rsp,
         USER_DS,
-        stop.regs.fs_base(),
+        regs.fs_base(),
         0,
         0,
         0,

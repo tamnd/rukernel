@@ -16,6 +16,7 @@ use crate::cx::{Cx, SysResult};
 use crate::fs::read_iovecs;
 use alloc::sync::Arc;
 use alloc::vec;
+pub(crate) use regs::user_regs;
 use regs::{NREGS, get_regs, set_regs};
 #[cfg(target_arch = "x86_64")]
 use regs::{peek_user, poke_user};

@@ -158,6 +158,8 @@ fn run(thread: Arc<Thread>, mut regs: UserContext) {
         }
         run_loop(&thread, &mut regs)
     };
+    // A thread that ends for the core dump of another thread keeps its registers for the dump.
+    crate::coredump::save_thread(&thread, &regs);
     // The tracer can ask for a stop before the exit, with `PTRACE_O_TRACEEXIT`.
     ptrace::event(&thread, &mut regs, NO_SYSCALL, PTRACE_EVENT_EXIT, status.0 as u32 as u64);
     crate::futex::exit_robust_list(&thread);

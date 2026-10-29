@@ -4010,6 +4010,149 @@ static void test_fork_area_merge(void)
 	munmap(t, 6 * ps);
 }
 
+/* A child that sets RLIMIT_CORE to `limit`, sets the dumpable flag and calls abort(). */
+static int core_child(rlim_t limit, int dumpable)
+{
+	pid_t pid = fork();
+	int status = 0;
+
+	if (pid == 0) {
+		struct rlimit rl = { limit, limit };
+
+		setrlimit(RLIMIT_CORE, &rl);
+		prctl(PR_SET_DUMPABLE, dumpable, 0, 0, 0);
+		abort();
+	}
+	if (pid < 0 || waitpid(pid, &status, 0) != pid)
+		return -1;
+	return status;
+}
+
+/* Finds the note of type `type` with the name "CORE" in the notes at buf. */
+static const unsigned char *core_note(const unsigned char *buf, size_t len, unsigned type, size_t *size)
+{
+	size_t off = 0;
+
+	while (off + sizeof(Elf64_Nhdr) <= len) {
+		const Elf64_Nhdr *n = (const Elf64_Nhdr *)(buf + off);
+		size_t name = (n->n_namesz + 3) & ~3u, desc = (n->n_descsz + 3) & ~3u;
+		const unsigned char *p = buf + off + sizeof(*n);
+
+		if (off + sizeof(*n) + name + desc > len)
+			return 0;
+		if (n->n_type == type && n->n_namesz == 5 && !memcmp(p, "CORE", 5)) {
+			*size = n->n_descsz;
+			return p + name;
+		}
+		off += sizeof(*n) + name + desc;
+	}
+	return 0;
+}
+
+/* The ELF core dump of fs/coredump.c and fs/binfmt_elf.c of Linux (#475). */
+static void test_core_dump(void)
+{
+	static unsigned char notes[65536];
+	char buf[256], name[300];
+	Elf64_Ehdr eh;
+	Elf64_Phdr ph;
+	const unsigned char *d;
+	size_t size = 0, notes_len = 0;
+	int status, fd, i, loads = 0;
+	pid_t pid;
+
+	check("core_pattern is core by default",
+	      read_file("/proc/sys/kernel/core_pattern", buf, sizeof(buf)) == 5 && !strcmp(buf, "core\n"));
+	check("prctl PR_GET_DUMPABLE gives 1", prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 1);
+	check("prctl PR_SET_DUMPABLE 2 gives EINVAL", prctl(PR_SET_DUMPABLE, 2, 0, 0, 0) == -1 && errno == EINVAL);
+	check("fs.suid_dumpable above 2 gives EINVAL", put_file("/proc/sys/fs/suid_dumpable", "3") == -1 && errno == EINVAL);
+	check("write core_pattern", put_file("/proc/sys/kernel/core_pattern", "/tmp/core.%e.%p") == 0);
+	check("read core_pattern",
+	      read_file("/proc/sys/kernel/core_pattern", buf, sizeof(buf)) > 0 && !strcmp(buf, "/tmp/core.%e.%p\n"));
+
+	/* RLIMIT_CORE of 0 and a process that is not dumpable give no dump. */
+	status = core_child(0, 1);
+	check("RLIMIT_CORE 0 gives SIGABRT without WCOREDUMP",
+	      WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT && !WCOREDUMP(status));
+	status = core_child(RLIM_INFINITY, 0);
+	check("PR_SET_DUMPABLE 0 gives no core dump", WIFSIGNALED(status) && !WCOREDUMP(status));
+
+	pid = fork();
+	if (pid == 0) {
+		struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
+
+		setrlimit(RLIMIT_CORE, &rl);
+		abort();
+	}
+	status = 0;
+	check("abort with RLIMIT_CORE gives WCOREDUMP",
+	      waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT &&
+		      WCOREDUMP(status));
+	snprintf(name, sizeof(name), "/tmp/core.init.%d", pid);
+	fd = open(name, O_RDONLY);
+	check("the core file has the name of core_pattern", fd >= 0);
+	memset(&eh, 0, sizeof(eh));
+	check("the core file has an ELF header of ET_CORE",
+	      pread(fd, &eh, sizeof(eh), 0) == sizeof(eh) && !memcmp(eh.e_ident, ELFMAG, SELFMAG) &&
+		      eh.e_ident[EI_CLASS] == ELFCLASS64 && eh.e_type == ET_CORE &&
+#if defined(__aarch64__)
+		      eh.e_machine == EM_AARCH64 &&
+#else
+		      eh.e_machine == EM_X86_64 &&
+#endif
+		      eh.e_phentsize == sizeof(Elf64_Phdr) && eh.e_phnum > 1);
+	for (i = 0; fd >= 0 && i < eh.e_phnum && i < 4096; i++) {
+		if (pread(fd, &ph, sizeof(ph), eh.e_phoff + i * sizeof(ph)) != sizeof(ph))
+			break;
+		if (ph.p_type == PT_NOTE && i == 0 && ph.p_filesz <= sizeof(notes))
+			notes_len = pread(fd, notes, ph.p_filesz, ph.p_offset) == (ssize_t)ph.p_filesz ? ph.p_filesz : 0;
+		if (ph.p_type == PT_LOAD)
+			loads++;
+	}
+	check("the core file has a PT_NOTE first and a PT_LOAD for each area", notes_len > 0 && loads == eh.e_phnum - 1);
+	d = core_note(notes, notes_len, NT_PRSTATUS, &size);
+	/* struct elf_prstatus: pr_info.si_signo at 0, pr_pid at 32. */
+	check("NT_PRSTATUS has the signal and the pid",
+	      d && size >= 112 && *(const int *)d == SIGABRT && *(const short *)(d + 12) == SIGABRT &&
+		      *(const int *)(d + 32) == pid);
+	d = core_note(notes, notes_len, NT_PRPSINFO, &size);
+	/* struct elf_prpsinfo: pr_pid at 24, pr_fname at 40. */
+	check("NT_PRPSINFO has the pid and the name",
+	      d && size == 136 && *(const int *)(d + 24) == pid && !strcmp((const char *)d + 40, "init"));
+	d = core_note(notes, notes_len, 0x53494749, &size);
+	check("NT_SIGINFO has SIGABRT", d && size == 128 && *(const int *)d == SIGABRT);
+	d = core_note(notes, notes_len, NT_AUXV, &size);
+	check("NT_AUXV ends with AT_NULL", d && size >= 16 && size % 16 == 0 && *(const long *)(d + size - 16) == AT_NULL);
+	check("the core file has NT_FILE and NT_PRFPREG",
+	      core_note(notes, notes_len, 0x46494c45, &size) && core_note(notes, notes_len, NT_PRFPREG, &size));
+	if (fd >= 0)
+		close(fd);
+	unlink(name);
+
+	/* core_uses_pid adds ".PID" to a pattern without %p. */
+	put_file("/proc/sys/kernel/core_pattern", "/tmp/core");
+	check("write core_uses_pid", put_file("/proc/sys/kernel/core_uses_pid", "1") == 0);
+	status = core_child(RLIM_INFINITY, 1);
+	check("abort with core_uses_pid gives WCOREDUMP", WIFSIGNALED(status) && WCOREDUMP(status));
+	{
+		DIR *dir = opendir("/tmp");
+		struct dirent *e;
+		int found = 0;
+
+		while (dir && (e = readdir(dir)))
+			if (!strncmp(e->d_name, "core.", 5) && e->d_name[5] >= '1' && e->d_name[5] <= '9') {
+				snprintf(name, sizeof(name), "/tmp/%s", e->d_name);
+				unlink(name);
+				found++;
+			}
+		if (dir)
+			closedir(dir);
+		check("core_uses_pid gives the name core.PID", found == 1);
+	}
+	put_file("/proc/sys/kernel/core_uses_pid", "0");
+	put_file("/proc/sys/kernel/core_pattern", "core");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -4067,6 +4210,7 @@ static void test_proc(void)
 	check("coredump_filter refuses a text that is not a number",
 	      put_file("/proc/self/coredump_filter", "x") == -1 && errno == EINVAL);
 	put_file("/proc/self/coredump_filter", "0x33");
+	test_core_dump();
 	errno = 0;
 	check("/proc/self/nothing gives ENOENT", open("/proc/self/nothing", O_RDONLY) == -1 && errno == ENOENT);
 	test_pagemap();

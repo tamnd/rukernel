@@ -8,7 +8,7 @@
 # maps 1 GiB 16384 times. With the 512 MiB of the boot test, the overcommit check refuses each map,
 # as on Linux, and the test gives TCONF and checks nothing. mremap06 needs fallocate, and mremap07
 # needs kernel options that rukernel does not have. msync04 needs a block device. mlock02 needs user
-# IDs, and mincore04 needs a page cache that processes share. setrlimit01 and setrlimit06 need the
+# IDs, and mincore04 needs a page cache that processes share. setrlimit06 needs the
 # kernel to enforce the limits, and setrlimit02 needs user IDs. futex_waitv03 needs System V shared
 # memory.
 #
@@ -18,7 +18,6 @@
 # because CLOCK_REALTIME starts at 0 at boot. tgkill02 needs RLIMIT_SIGPENDING. kill05 needs System
 # V shared memory, and kill13 needs a kernel with UBSAN.
 #
-# waitid10 reads /proc/sys/kernel/core_pattern, and the kernel does not have /proc/sys yet.
 # ptrace02 needs user IDs. ptrace04 and ptrace07 do not apply to x86_64 with this LTP build.
 #
 # epoll_wait05 needs AF_INET sockets. epoll_wait10 polls /proc/mounts for a change of the mounts, and the
@@ -38,8 +37,9 @@
 # kernel, and Linux gives ENOENT, as rukernel does. msgctl05 needs the time_high fields of
 # msqid64_ds, which the x86_64 headers of musl do not have. msgstress01 runs for minutes.
 #
-# clock_gettime04, eventfd06, futex_waitv02, kill11 and sendfile07_64 fail in the last full LTP
+# clock_gettime04, eventfd06, futex_waitv02 and sendfile07_64 fail in the last full LTP
 # run (tools/ltp/syscalls.md). They come back when they pass.
+abort01
 alarm02
 alarm03
 alarm05
@@ -145,11 +145,13 @@ kill03
 kill06
 kill08
 kill10
+kill11
 kill12
 madvise01
 madvise02
 madvise03
 madvise05
+madvise08
 mincore01
 mincore02
 mincore03
@@ -245,6 +247,7 @@ sched_setscheduler01
 setitimer01
 setitimer02
 setpriority01
+setrlimit01
 setrlimit03
 setrlimit04
 setrlimit05
@@ -295,6 +298,7 @@ waitid06
 waitid07
 waitid08
 waitid09
+waitid10
 waitid11
 waitpid01
 waitpid03
