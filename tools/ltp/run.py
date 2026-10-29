@@ -22,7 +22,7 @@ The serial output of a batch goes to OUT/RUNTEST-NNN/log. Each test gives these 
 RESULT is the exit code of the test, `timeout`, or `missing` when the program of the test is not
 in the tree. When the kernel stops (a panic) or hangs during a test, this script writes the result
 `panic` or `hang` for the test in the log, and boots again with the next test. report.py reads
-these lines.
+these lines. A test in ALONE runs in its own boot.
 
 At most --jobs batches run at the same time. A batch with the file `done` in its directory does
 not run again, unless --force is given. report.py takes the newest result of each test, so a
@@ -51,7 +51,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # not complete the 64 rounds in that time. starvation sends 1 million signals. Its runtime is the
 # time of a busy loop of 120 million rounds in microseconds divided by 1000. Under QEMU without KVM
 # that is 650 s to 1150 s, as the load of the host changes, and the test can use all of it.
-LIMITS = {"setsockopt11": 420, "starvation": 1800}
+# cgroup_fj_stress_memory_10_3_each makes 1111 cgroups with a process in each, and ends near 240 s
+# on a busy host.
+LIMITS = {
+    "setsockopt11": 420,
+    "starvation": 1800,
+    "cgroup_fj_stress_memory_10_3_each": 600,
+}
+
+# The tests that run in their own boot. memcontrol03 and memcontrol04 can leave cgroups with
+# charges or processes when they fail, and these cgroups then change the tests after them.
+ALONE = {"memcontrol03", "memcontrol04"}
 
 # The script that runs as init. It reads the tests from /tests, one test on each line: the tag,
 # the time limit of the test in seconds and the command, with a tab between them.
@@ -246,6 +256,17 @@ def make_image(ltp, path):
     os.replace(record + ".new", record)
 
 
+def alone(tests):
+    """Gives the first tests of `tests` that can run in one boot: a test of ALONE by itself, or
+    the tests before the next test of ALONE."""
+    if tests[0][1] in ALONE:
+        return tests[:1]
+    for i, t in enumerate(tests):
+        if t[1] in ALONE:
+            return tests[:i]
+    return tests
+
+
 class Batch:
     """A batch of tests that runs in one directory, with as many boots as it needs."""
 
@@ -379,13 +400,14 @@ class Batch:
                 boots += 1
                 log.write(f"ltp-boot: {boots}\n".encode())
                 log.flush()
-                done, current, how = self.boot(left, log)
+                chunk = alone(left)
+                done, current, how = self.boot(chunk, log)
                 if current is None and not done:
                     # The kernel did not reach the first test. The tests cannot run.
                     for _, tag, _ in left:
                         log.write(f"\nltp-result: {tag} noboot\n".encode())
                     break
-                rest = [t for t in left if t[1] not in done]
+                rest = [t for t in chunk if t[1] not in done]
                 if current is not None:
                     log.write(f"\nltp-result: {current} {how}\n".encode())
                     rest = [t for t in rest if t[1] != current]
@@ -393,7 +415,7 @@ class Batch:
                     # The init script stopped before the end of the list.
                     log.write(f"\nltp-result: {rest[0][1]} crash\n".encode())
                     rest = rest[1:]
-                left = rest
+                left = rest + left[len(chunk):]
         with open(os.path.join(self.dir, "done"), "w") as f:
             f.write(f"{int(time.monotonic() - start)} s, {boots} boots\n")
         return f"{self.name}: {len(self.tests)} tests, {boots} boots, {int(time.monotonic() - start)} s"
