@@ -190,7 +190,21 @@ impl Tx<'_> {
                 set_bit(&mut bitmap, bit + got, true);
                 got += 1;
             }
-            self.write_block_bitmap(group, &bitmap)?;
+            if self.desc_flags(group) & bg::BLOCK_UNINIT == 0 {
+                // The bitmap is on the disk, so only the bytes that change are written, as
+                // Linux marks only the buffer of the bitmap dirty (fs/ext2/balloc.c).
+                let bytes = bit / 8..(bit + got - 1) / 8 + 1;
+                let fs = self.fs;
+                let at = fs.group(group)?.block_bitmap * fs.sb.block_size + bytes.start as u64;
+                fs.write(at, &bitmap[bytes])?;
+                if fs.metadata_csum() {
+                    let len = fs.sb.clusters_per_group as usize / 8;
+                    let csum = crc::crc32c(fs.csum_seed, &bitmap[..len]);
+                    self.desc_set(group, gd::BLOCK_BITMAP_CSUM, csum);
+                }
+            } else {
+                self.write_block_bitmap(group, &bitmap)?;
+            }
             let free = self.desc_get(group, gd::FREE_BLOCKS).saturating_sub(got as u32);
             self.desc_set(group, gd::FREE_BLOCKS, free);
             self.write_desc(group)?;

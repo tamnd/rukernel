@@ -880,6 +880,33 @@ fn a_disk_without_extents_keeps_new_files_in_a_block_map() {
     assert_eq!(read_all(&*file), data);
 }
 
+#[test]
+fn a_block_map_write_goes_over_mapped_blocks_and_holes_in_runs() {
+    let mut img = image();
+    img[1024 + 0x60] &= !(layout::incompat::EXTENTS as u8);
+    let ram = Ram(Arc::new(SpinLock::new(img)));
+    let fs = Fs::open(7, alloc::boxed::Box::new(ram.clone()), false).unwrap();
+    let file = fs.root().unwrap().create(b"runs", FileType::Regular, 0o644, 0).unwrap();
+    // The blocks 0 to 4 and 8 to 9 have data, and the blocks 5 to 7 are a hole.
+    file.write_at(0, &[1u8; 5 * BS]).unwrap();
+    file.write_at(8 * BS as u64, &[2u8; 2 * BS]).unwrap();
+    // One write goes over mapped blocks, the hole, the end of the direct blocks and past the end.
+    let data: Vec<u8> = (0..16 * BS).map(|i| (i % 253) as u8).collect();
+    file.write_at(3 * BS as u64 + 9, &data).unwrap();
+    let mut want = vec![1u8; 3 * BS + 9];
+    want.extend_from_slice(&data);
+    assert_eq!(read_all(&*file), want);
+    // 20 data blocks and the indirect block for the blocks 12 to 19.
+    assert_eq!(file.metadata().blocks, (21 * BS / 512) as u64);
+    // A read that starts and ends in the middle of a block goes over the indirect block.
+    let mut part = vec![0u8; 5 * BS];
+    assert_eq!(file.read_at(10 * BS as u64 + 100, &mut part), Ok(5 * BS));
+    assert_eq!(part[..], want[10 * BS + 100..15 * BS + 100]);
+    drop((file, fs));
+    let file = again(&ram).root().unwrap().lookup(b"runs").unwrap();
+    assert_eq!(read_all(&*file), want);
+}
+
 mod log {
     use super::*;
     use crate::journal::{MAGIC, be32, feature, jsb, put_be32};

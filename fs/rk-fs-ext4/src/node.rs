@@ -164,6 +164,71 @@ impl Fs {
         Ok(Some(u64::from(block)).filter(|&b| b != 0))
     }
 
+    /// Finds `lblock` in the block map as [`Fs::map`] does, and also gives the count of blocks
+    /// from `lblock`, from 1 up to `max`, that are all holes or that follow each other on the
+    /// disk. The count stops at the end of the block of the map that has `lblock`, so the
+    /// function reads each indirect block on the path once, as `ext2_get_blocks` of Linux
+    /// (fs/ext2/inode.c) gives a run of blocks.
+    pub(crate) fn map_indirect_run(
+        &self,
+        raw: &RawInode,
+        lblock: u64,
+        max: u64,
+    ) -> Result<(Option<u64>, u64)> {
+        let per = self.sb.block_size / 4;
+        let max = max.max(1);
+        let root = raw.block();
+        let leaf;
+        let (entries, at): (&[u8], usize) = if lblock < 12 {
+            (&root[..12 * 4], lblock as usize)
+        } else {
+            let (mut block, mut index, mut levels) = if lblock - 12 < per {
+                (u32_at(root, 12 * 4), lblock - 12, 1)
+            } else if lblock - 12 - per < per * per {
+                (u32_at(root, 13 * 4), lblock - 12 - per, 2)
+            } else if lblock - 12 - per - per * per < per * per * per {
+                (u32_at(root, 14 * 4), lblock - 12 - per - per * per, 3)
+            } else {
+                return Err(Errno::EFBIG);
+            };
+            loop {
+                // A missing indirect block is a hole for all the blocks under it.
+                if block == 0 {
+                    return Ok((None, (per.pow(levels) - index).min(max)));
+                }
+                let disk = u64::from(block);
+                if disk >= self.blocks_count() {
+                    return Err(Errno::EIO);
+                }
+                levels -= 1;
+                let span = per.pow(levels);
+                let i = index / span;
+                // Only the entries that the run can use are read, not the whole block, so a
+                // small write does not copy a block of the map each time.
+                let count = if levels == 0 { (per - i).min(max) } else { 1 };
+                let mut data = vec![0u8; count as usize * 4];
+                self.read(disk * self.sb.block_size + i * 4, &mut data)?;
+                if levels == 0 {
+                    leaf = data;
+                    break (&leaf[..], 0);
+                }
+                block = u32_at(&data, 0);
+                index %= span;
+            }
+        };
+        let first = u32_at(entries, at * 4);
+        let mut n = 1;
+        while n < max && at + (n as usize) < entries.len() / 4 {
+            let next = u32_at(entries, (at + n as usize) * 4);
+            let same = if first == 0 { next == 0 } else { u64::from(next) == u64::from(first) + n };
+            if !same {
+                break;
+            }
+            n += 1;
+        }
+        Ok((Some(u64::from(first)).filter(|&b| b != 0), n))
+    }
+
     /// Reads the block map of the file into runs of blocks that follow each other on the disk,
     /// and the indirect blocks of the map.
     pub(crate) fn block_map(&self, raw: &RawInode) -> Result<(Vec<Extent>, Vec<u64>)> {
@@ -233,14 +298,23 @@ impl Fs {
         let len = buf.len().min((size - offset) as usize);
         let bs = self.sb.block_size;
         let mut done = 0;
+        let is_map = raw.flags() & flags::EXTENTS == 0;
         while done < len {
             let at = offset + done as u64;
             let in_block = (at % bs) as usize;
-            let n = (bs as usize - in_block).min(len - done);
+            // A block map gives a run of blocks, so that one read of the disk gets them all.
+            let (found, count) = if is_map {
+                let last = (offset + len as u64).div_ceil(bs);
+                let (block, count) = self.map_indirect_run(raw, at / bs, last - at / bs)?;
+                (block.map(|b| (b, true)), count)
+            } else {
+                (self.map(raw, at / bs)?, 1)
+            };
+            let n = ((count * bs) as usize - in_block).min(len - done);
             let out = &mut buf[done..done + n];
-            match self.map(raw, at / bs)? {
+            match found {
                 Some((block, true)) => {
-                    if block >= self.blocks_count() {
+                    if block + count > self.blocks_count() {
                         return Err(Errno::EUCLEAN);
                     }
                     self.read(block * bs + in_block as u64, out)?;
@@ -320,23 +394,37 @@ impl Tx<'_> {
         let mut runs: Vec<(u64, u64, u32)> = Vec::new();
         let mut pos = offset;
         let mut result = Ok(());
+        let last = end.div_ceil(bs);
         while pos < end {
             let lblock = pos / bs;
             let in_block = (pos % bs) as usize;
+            // The run of blocks from `lblock` that are all holes or that follow each other on
+            // the disk. The data of a run goes to the disk in one write, so the cache gets
+            // large writes, as the bios of many pages of Linux (fs/mpage.c).
+            let (found, count) = if is_map {
+                let (block, count) = fs.map_indirect_run(raw, lblock, last - lblock)?;
+                (block.map(|b| (b, true)), count)
+            } else {
+                match extent::find(&extents, lblock) {
+                    Some(e) if e.init => {
+                        (Some((e.start + (lblock - u64::from(e.lblock)), true)), e.end() - lblock)
+                    }
+                    Some(e) => (Some((e.start + (lblock - u64::from(e.lblock)), false)), 1),
+                    None => (None, 1),
+                }
+            };
             let n = (bs as usize - in_block).min((end - pos) as usize);
             let data = &buf[(pos - offset) as usize..(pos - offset) as usize + n];
-            let found = if raw.flags() & flags::EXTENTS != 0 {
-                extent::find(&extents, lblock)
-                    .map(|e| (e.start + (lblock - u64::from(e.lblock)), e.init))
-            } else {
-                fs.map(raw, lblock)?
-            };
             match found {
                 Some((block, true)) => {
+                    let n = ((count * bs) as usize - in_block).min((end - pos) as usize);
+                    let data = &buf[(pos - offset) as usize..(pos - offset) as usize + n];
                     if let Err(e) = fs.write_file(raw, block * bs + in_block as u64, data) {
                         result = Err(e);
                         break;
                     }
+                    pos += n as u64;
+                    continue;
                 }
                 Some((block, false)) => {
                     let mut full = vec![0u8; bs as usize];
@@ -352,14 +440,12 @@ impl Tx<'_> {
                     changed = true;
                 }
                 None => {
-                    let last = end.div_ceil(bs);
                     let (next, goal) = if is_map {
-                        let mut next = lblock + 1;
-                        while next < last && fs.map(raw, next)?.is_none() {
-                            next += 1;
-                        }
+                        // The run of holes stops at the end of a block of the map, and the
+                        // next run gets its blocks near the end of this one.
+                        let next = lblock + count;
                         let before = match lblock.checked_sub(1) {
-                            Some(l) => fs.map(raw, l)?.map(|(b, _)| b + 1),
+                            Some(l) => fs.map_indirect_run(raw, l, 1)?.0.map(|b| b + 1),
                             None => None,
                         };
                         (next, before.unwrap_or_else(|| fs.goal(ino)))

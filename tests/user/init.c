@@ -3979,8 +3979,120 @@ static void test_cache(int fd)
 	check("syncfs of a bad descriptor gives EBADF", syncfs(-1) == -1 && errno == EBADF);
 }
 
+/* The size of the file that test_ext2 writes in chunks of 1 MiB, as the page cache of
+ * memcontrol03 of LTP. */
+#define EXT2_FILE_SIZE (50 << 20)
+
+/* The size of the file that test_ext2 writes in chunks of 1 KiB. The debug kernel takes about
+ * 150 s for 50 MB in chunks of 1 KiB, so the boot test writes less. */
+#define EXT2_SMALL_SIZE (4 << 20)
+
+/* Writes size bytes to the new file path in chunks of chunk bytes, and calls fsync. The first 8
+ * bytes of each 1 MiB have the number of the MiB. Gives the time in ms, or -1. */
+static long long ext2_write(const char *path, long size, size_t chunk)
+{
+	static unsigned char buf[1 << 20];
+	int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+	if (fd < 0)
+		return -1;
+	long long start = clock_ms(CLOCK_MONOTONIC);
+	int ok = 1;
+	for (long at = 0; ok && at < size; at += chunk) {
+		if (at % sizeof(buf) == 0) {
+			memset(buf, (int)(at >> 20), sizeof(buf));
+			memcpy(buf, &at, sizeof(at));
+		}
+		ok = write(fd, buf + at % sizeof(buf), chunk) == (ssize_t)chunk;
+	}
+	ok = ok && fsync(fd) == 0;
+	long long ms = clock_ms(CLOCK_MONOTONIC) - start;
+	return close(fd) == 0 && ok ? ms : -1;
+}
+
+/* Tells if the file path has the size bytes of ext2_write. */
+static int ext2_data_ok(const char *path, long size)
+{
+	struct stat st;
+	int fd = open(path, O_RDONLY);
+	int ok = fd >= 0 && fstat(fd, &st) == 0 && st.st_size == size && st.st_blocks >= size / 512;
+	for (long at = 0; ok && at < size; at += 1 << 20) {
+		unsigned char got[16];
+		long first;
+		ok = pread(fd, got, sizeof(got), at) == sizeof(got);
+		memcpy(&first, got, sizeof(first));
+		ok = ok && first == at && got[8] == (unsigned char)(at >> 20) &&
+		     pread(fd, got, 1, at + (1 << 20) - 1) == 1 && got[0] == (unsigned char)(at >> 20);
+	}
+	if (fd >= 0)
+		close(fd);
+	return ok;
+}
+
+static int cg_write(const char *path, const char *s);
+
+/* Runs ext2_write of EXT2_SMALL_SIZE bytes in chunks of 1 KiB in a child in the memory cgroup cg, as the
+ * children of memcontrol03. Gives the time in ms, or -1. */
+static long long ext2_write_in_cgroup(const char *cg)
+{
+	int p[2];
+	long long ms = -1;
+	if (pipe(p) != 0)
+		return -1;
+	pid_t pid = fork();
+	if (pid == 0) {
+		char path[64];
+		snprintf(path, sizeof(path), "%s/cgroup.procs", cg);
+		ms = cg_write(path, "0") == 0 ? ext2_write("/ext2/small", EXT2_SMALL_SIZE, 1024) : -1;
+		_exit(write(p[1], &ms, sizeof(ms)) == sizeof(ms) ? 0 : 1);
+	}
+	close(p[1]);
+	if (pid < 0 || read(p[0], &ms, sizeof(ms)) != sizeof(ms))
+		ms = -1;
+	close(p[0]);
+	int status;
+	if (pid > 0 && (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0))
+		ms = -1;
+	return ms;
+}
+
+/* Writes 50 MB to a file on the ext2 disk /dev/vdb of the blk boot test, and calls fsync, as
+ * memcontrol03 and memcontrol04 of LTP. xtask makes the disk with mkfs.ext2, as LTP does. The
+ * test writes in chunks of 1 MiB. Then it writes 4 MB in chunks of 1 KiB, the BUFSIZ of musl that
+ * LTP uses, in a child in a memory cgroup with a memory.max of 200 MB, as the children of
+ * memcontrol03. Under QEMU without KVM, LTP waits 10 s for the write, so the times show if it
+ * can pass. */
+static void test_ext2(void)
+{
+	if (access("/dev/vdb", F_OK) != 0) {
+		printf("init: the blk boot test has no ext2 disk\n");
+		return;
+	}
+	mkdir("/ext2", 0755);
+	int mounted = mount("/dev/vdb", "/ext2", "ext2", 0, NULL) == 0;
+	check("mount of the ext2 disk", mounted);
+	if (!mounted)
+		return;
+	long long big = ext2_write("/ext2/big", EXT2_FILE_SIZE, 1 << 20);
+	check("write of 50 MB to ext2 in chunks of 1 MiB and fsync", big >= 0 && ext2_data_ok("/ext2/big", EXT2_FILE_SIZE));
+	mkdir("/ext2cg", 0755);
+	int cg = mount("none", "/ext2cg", "cgroup2", 0, NULL) == 0 &&
+		 cg_write("/ext2cg/cgroup.subtree_control", "+memory") == 0 && mkdir("/ext2cg/ext2w", 0755) == 0 &&
+		 cg_write("/ext2cg/ext2w/memory.max", "200M") == 0;
+	check("a memory cgroup for the ext2 write", cg);
+	long long small = cg ? ext2_write_in_cgroup("/ext2cg/ext2w") : -1;
+	check("write of 4 MB to ext2 in chunks of 1 KiB and fsync in a memory cgroup",
+	      small >= 0 && ext2_data_ok("/ext2/small", EXT2_SMALL_SIZE));
+	printf("init: ext2 write takes %lld ms for 50 MB in chunks of 1 MiB, %lld ms for 4 MB in chunks of 1 KiB\n",
+	       big, small);
+	check("unlink of the ext2 files", unlink("/ext2/big") == 0 && unlink("/ext2/small") == 0);
+	check("rmdir of the memory cgroup", rmdir("/ext2cg/ext2w") == 0 && umount("/ext2cg") == 0);
+	rmdir("/ext2cg");
+	check("umount of the ext2 disk", umount("/ext2") == 0);
+}
+
 static void test_blk(void)
 {
+	test_ext2();
 	int fd = open("/dev/vda", O_RDWR);
 	check("/dev/vda opens", fd >= 0);
 	if (fd < 0)

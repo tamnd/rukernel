@@ -27,6 +27,15 @@ fn path(per: u64, lblock: u64) -> Result<(usize, [u64; 3], usize)> {
     Err(Errno::EFBIG)
 }
 
+/// The place on the disk of the entry `i` of the block `block` of the map. Gives `EIO` for a
+/// block past the end of the disk, as `Fs::read_block`.
+fn entry_offset(fs: &crate::Fs, block: u64, i: u64) -> Result<u64> {
+    if block >= fs.blocks_count() {
+        return Err(Errno::EIO);
+    }
+    Ok(block * fs.sb.block_size + i * 4)
+}
+
 impl Tx<'_> {
     /// Gives a new indirect block near `goal`, filled with zeros. The count of blocks of the
     /// inode grows by one block.
@@ -62,13 +71,15 @@ impl Tx<'_> {
             block = self.new_indirect(raw, goal)?;
             put32(raw.block_mut(), slot * 4, block);
         }
+        // Only the entry on the path is read and written, not the whole indirect block.
         for &i in &index[..levels - 1] {
-            let mut data = fs.read_block(u64::from(block))?;
-            let mut next = u32_at(&data, i as usize * 4);
+            let at = entry_offset(fs, u64::from(block), i)?;
+            let mut data = [0u8; 4];
+            fs.read(at, &mut data)?;
+            let mut next = u32_at(&data, 0);
             if next == 0 {
                 next = self.new_indirect(raw, goal)?;
-                put32(&mut data, i as usize * 4, next);
-                fs.write(u64::from(block) * fs.sb.block_size, &data)?;
+                fs.write(at, &next.to_le_bytes())?;
             }
             block = next;
         }
@@ -93,17 +104,17 @@ impl Tx<'_> {
         while done < count {
             let (leaf, at, room) = self.leaf(raw, lblock + done, start + done)?;
             let n = room.min(count - done);
-            let put = |entries: &mut [u8]| {
-                for i in 0..n {
-                    put32(entries, (at + i as usize) * 4, (start + done + i) as u32);
-                }
-            };
             match leaf {
-                None => put(raw.block_mut()),
+                None => {
+                    for i in 0..n {
+                        put32(raw.block_mut(), (at + i as usize) * 4, (start + done + i) as u32);
+                    }
+                }
+                // Only the new entries are written, not the whole block of the map.
                 Some(block) => {
-                    let mut data = fs.read_block(block)?;
-                    put(&mut data);
-                    fs.write(block * fs.sb.block_size, &data)?;
+                    let entries: alloc::vec::Vec<u8> =
+                        (0..n).flat_map(|i| ((start + done + i) as u32).to_le_bytes()).collect();
+                    fs.write(entry_offset(fs, block, at as u64)?, &entries)?;
                 }
             }
             done += n;
