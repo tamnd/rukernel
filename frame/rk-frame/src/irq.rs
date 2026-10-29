@@ -1,6 +1,8 @@
 //! Interrupt control on the current CPU.
 
 use crate::arch::imp;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use alloc::vec::Vec;
 
 /// Lets this CPU take interrupts.
 pub fn enable() {
@@ -23,10 +25,10 @@ pub fn wait() {
 }
 
 /// The interrupt line of a device: an SPI of the GIC or the LPI of an MSI-X table entry on arm64,
-/// and the vector of an MSI-X table entry on x86-64. The handler of the line turns the line off and keeps a flag that the line
-/// came, because a handler takes no lock and cannot reach the device. The driver tests the flag
-/// with `take`, tells the device that the interrupt is handled, and turns the line on again with
-/// `unmask`. Between the two, a level triggered line does not come again and again.
+/// and the vector of an MSI-X table entry on x86-64. The handler of the line turns the line off
+/// and keeps a flag that the line came, because a handler takes no lock and cannot reach the
+/// device. The driver tests the flag with `take`, tells the device that the interrupt is handled,
+/// and turns the line on again with `unmask`. Between the two, a level triggered line does not come again and again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Line {
     intid: u32,
@@ -40,21 +42,41 @@ impl Line {
         imp::gic::enable_device(intid, edge).then_some(Self { intid })
     }
 
-    /// Makes the line of the MSI-X table entry at the virtual address `entry` of the function with
-    /// the device ID `device` of the GICv3 ITS, with a free LPI, and turns it on. The line goes to
-    /// the boot CPU until a `wait` on another CPU. Gives `None` if the machine has no ITS, or if no
-    /// LPI is free.
+    /// Makes a line for each MSI-X table entry at the virtual addresses `entries` of the function
+    /// with the device ID `device` of the GICv3 ITS, each with a free LPI, and turns them on. The
+    /// event ID of each entry is its index in `entries`. The lines go to the boot CPU until a
+    /// `wait` on another CPU. Gives `None` if the machine has no ITS, or if not enough LPIs are
+    /// free.
     #[cfg(target_arch = "aarch64")]
-    pub(crate) fn msix(entry: usize, device: u32) -> Option<Self> {
-        imp::its::alloc(entry, device).map(|intid| Self { intid })
+    pub(crate) fn msix(entries: &[usize], device: u32) -> Option<Vec<Self>> {
+        let mut lpis = alloc::vec![0; entries.len()];
+        imp::its::alloc(entries, device, &mut lpis)
+            .then(|| lpis.into_iter().map(|intid| Self { intid }).collect())
     }
 
-    /// Makes the line of the MSI-X table entry at the virtual address `entry`, with a free vector,
-    /// and turns it on. The line goes to the boot CPU until a `wait` on another CPU. Gives `None`
-    /// if no vector is free.
+    /// Gives back the lines `lines` of the function with the device ID `device`, which one
+    /// `msix` gave.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn free_msix(lines: &[Self], device: u32) {
+        let lpis: Vec<u32> = lines.iter().map(|l| l.intid).collect();
+        imp::its::free(&lpis, device);
+    }
+
+    /// Makes a line for each MSI-X table entry at the virtual addresses `entries`, each with a
+    /// free vector, and turns them on. The lines go to the boot CPU until a `wait` on another
+    /// CPU. Gives `None` if not enough vectors are free.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn msix(entry: usize) -> Option<Self> {
-        imp::msi::alloc(entry).map(|v| Self { intid: u32::from(v) })
+    pub(crate) fn msix(entries: &[usize]) -> Option<Vec<Self>> {
+        let mut vectors = alloc::vec![0; entries.len()];
+        imp::msi::alloc(entries, &mut vectors)
+            .then(|| vectors.into_iter().map(|v| Self { intid: u32::from(v) }).collect())
+    }
+
+    /// Gives back the lines `lines`, which one `msix` gave.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn free_msix(lines: &[Self]) {
+        let vectors: Vec<u8> = lines.iter().map(|l| l.intid as u8).collect();
+        imp::msi::free(&vectors);
     }
 
     /// The interrupt number.

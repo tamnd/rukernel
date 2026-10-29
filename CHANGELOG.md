@@ -7,6 +7,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The `inet` boot test makes a veth pair with RTM_NEWLINK and `VETH_INFO_PEER`, with the peer in another network namespace. It checks `IFLA_LINK`, the carrier, /proc/net/dev and /sys/class/net, sends a UDP datagram across the pair, and deletes the pair (#454).
+- Each queue of a virtio-pci device gets its own MSI-X vector, and the configuration gets one more, as `vp_find_vqs_msix` of Linux (#450). This works on arm64 through the GICv3 ITS, with an event ID for each vector, and on x86-64. If the function does not have enough vectors, the device uses one shared vector, and then its INTx pin.
+- The PCI scan on arm64 assigns the I/O BARs from the I/O window of the host and opens the I/O window of each bridge over the I/O BARs behind it, as `pbus_size_io` and `pci_setup_bridge_io` of Linux (#450). A driver can map an I/O BAR with `map_io_bar`. The arm64 boot test `blk` with INTx behind a `pcie-root-port` uses a transitional device and reads its legacy registers through the I/O BAR.
 
 ### Fixed
 

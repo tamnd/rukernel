@@ -5,7 +5,7 @@
 #[cfg(target_arch = "aarch64")]
 use crate::mmio::MmioTransport;
 use crate::pci::PciTransport;
-use rk_frame::irq::Line;
+use alloc::string::String;
 
 /// The bits of the device status.
 pub(crate) mod status {
@@ -93,28 +93,40 @@ impl Transport {
         each!(self, t => t.notify(at, index));
     }
 
-    /// The interrupt line of the device, or `None` if the driver must poll.
-    pub(crate) fn irq(&self) -> Option<Line> {
-        each!(self, t => t.irq())
-    }
-
-    /// Handles the interrupt of the device, if it came: tells the device that the driver saw it
-    /// and turns the line on again. The driver then reads its queues. Gives `true` if the
-    /// interrupt came.
-    pub(crate) fn handle_interrupt(&self) -> bool {
-        let Some(line) = self.irq() else { return false };
-        if !line.take() {
-            return false;
+    /// Gives the interrupt lines to the device for the queues 0 to `queues - 1`, as `find_vqs` of
+    /// Linux. On the PCI transport each queue gets its own MSI-X vector when the function has
+    /// enough. The MMIO transport has one line for all queues. The driver calls this after the
+    /// feature negotiation and before it makes the queues.
+    pub(crate) fn find_queues(&mut self, queues: u16) {
+        match self {
+            Transport::Pci(t) => t.find_queues(queues),
+            #[cfg(target_arch = "aarch64")]
+            Transport::Mmio(_) => {}
         }
-        each!(self, t => t.ack_interrupt());
-        line.unmask();
-        true
     }
 
-    /// Waits until the interrupt of the device or another interrupt comes. Without a line, the
-    /// call only spins once.
-    pub(crate) fn wait(&self) {
-        match self.irq() {
+    /// The kind of the interrupt of the device, for the log.
+    pub(crate) fn irq_kind(&self) -> String {
+        match self {
+            Transport::Pci(t) => t.irq_kind(),
+            #[cfg(target_arch = "aarch64")]
+            Transport::Mmio(t) => {
+                String::from(if t.line(0).is_some() { "its line" } else { "no interrupt" })
+            }
+        }
+    }
+
+    /// Handles each interrupt line of the device that came: tells the device that the driver saw
+    /// it and turns the line on again. The driver then reads its queues. Gives `true` if a line
+    /// came.
+    pub(crate) fn handle_interrupt(&self) -> bool {
+        each!(self, t => t.handle_interrupt())
+    }
+
+    /// Waits until the interrupt of the queue `index` or another interrupt comes. Without a
+    /// line, the call only spins once.
+    pub(crate) fn wait(&self, index: u16) {
+        match each!(self, t => t.line(index)) {
             Some(line) => line.wait(),
             None => core::hint::spin_loop(),
         }

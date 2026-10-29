@@ -5,8 +5,9 @@
 //! A function writes the event ID of an MSI-X table entry to the `GITS_TRANSLATER` register of the
 //! ITS. The ITS gets the device ID of the function from the requester ID of the write. Its tables
 //! map the device ID and the event ID to an LPI and to a collection, and each collection is the
-//! redistributor of one CPU. Each line gets one LPI from `FIRST_LPI`, and the event ID 0 of its
-//! device. The handler masks the MSI-X table entry and sets the flag of the line, as the handler
+//! redistributor of one CPU. Each line gets one LPI from `FIRST_LPI`. The lines of one function
+//! share one interrupt translation table, and the event ID of each line is the index of its MSI-X
+//! table entry, as `its_msi_prepare` and `its_irq_domain_alloc` of Linux. The handler masks the MSI-X table entry and sets the flag of the line, as the handler
 //! of x86-64 in msi.rs does. A message that comes while the entry is masked stays pending in the
 //! function, and the function sends it when the driver unmasks the entry.
 //!
@@ -17,7 +18,6 @@
 //!
 //! Each table is in normal memory with the write back cache, and inner shareable, as the CPUs
 //! use it. A GIC that has only memory without cache for its tables is not supported.
-// TODO: more than one event for each device, for the MSI-X vector of each queue.
 
 use super::gic;
 use crate::sync::SpinLock;
@@ -102,8 +102,9 @@ static ITS_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// The virtual address of the MSI-X table entry of each line, or 0 for a free line.
 static ENTRY: [AtomicUsize; LINES] = [const { AtomicUsize::new(0) }; LINES];
-/// The device ID of each line.
+/// The device ID of each line, and its event ID.
 static DEVICE: [AtomicU32; LINES] = [const { AtomicU32::new(0) }; LINES];
+static EVENT: [AtomicU32; LINES] = [const { AtomicU32::new(0) }; LINES];
 /// The CPU that the collection of each line is.
 static TARGET: [AtomicUsize; LINES] = [const { AtomicUsize::new(0) }; LINES];
 /// A bit for each line that came since the last `take`.
@@ -339,56 +340,108 @@ pub(crate) fn init_cpu(id: usize) {
     }
 }
 
-/// Sets up the MSI-X table entry at the virtual address `entry` of the function with the device
-/// ID `device`, with a free LPI to the boot CPU, and unmasks it. Gives the LPI, or `None` if
-/// there is no ITS, if the device table does not hold the device ID, or if no LPI is free.
-pub(crate) fn alloc(entry: usize, device: u32) -> Option<u32> {
+/// Takes a free line for each entry of `entries`. Gives `false` and takes none if not enough
+/// lines are free.
+fn reserve(entries: &[usize], lines: &mut [usize]) -> bool {
+    for (k, &entry) in entries.iter().enumerate() {
+        let free = ENTRY.iter().position(|e| {
+            e.compare_exchange(0, entry, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+        });
+        match free {
+            Some(n) => lines[k] = n,
+            None => {
+                lines[..k].iter().for_each(|&n| ENTRY[n].store(0, Ordering::Release));
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The number of event ID bits of an interrupt translation table for `events` events: at least 1,
+/// as the size field of `MAPD` is the number of bits less one.
+fn event_bits(events: usize) -> u32 {
+    events.next_power_of_two().trailing_zeros().max(1)
+}
+
+/// Sets up the MSI-X table entries at the virtual addresses `entries` of the function with the
+/// device ID `device`, each with a free LPI to the boot CPU and the event ID of its index in
+/// `entries`, and unmasks them. Writes the LPI of each entry to `lpis`. Gives `false` if there is
+/// no ITS, if the device table does not hold the device ID, or if not enough LPIs are free. Then no
+/// entry has an LPI.
+pub(crate) fn alloc(entries: &[usize], device: u32, lpis: &mut [u32]) -> bool {
     let mut its = ITS.lock();
-    if its.failed {
-        return None;
+    if its.failed || entries.is_empty() || entries.len() > LINES || lpis.len() < entries.len() {
+        return false;
     }
     if !READY.load(Ordering::Acquire) {
         if !its.init() {
             its.failed = true;
-            return None;
+            return false;
         }
         READY.store(true, Ordering::Release);
     }
     if device >= its.devices || its.cpus & 1 == 0 {
-        return None;
+        return false;
     }
-    let n = ENTRY
-        .iter()
-        .position(|e| e.compare_exchange(0, entry, Ordering::AcqRel, Ordering::Relaxed).is_ok())?;
-    let lpi = FIRST_LPI + n as u32;
-    // The interrupt translation table of the device holds the event IDs 0 and 1, and it is
+    let mut lines = [0usize; LINES];
+    let lines = &mut lines[..entries.len()];
+    if !reserve(entries, lines) {
+        return false;
+    }
+    let free = |lines: &[usize]| lines.iter().for_each(|&n| ENTRY[n].store(0, Ordering::Release));
+    // The interrupt translation table of the device holds an event ID for each entry, and it is
     // 256 bytes aligned.
-    let itt = crate::mm::frame::alloc_table_frame().filter(|_| 2 * its.itt_entry <= PAGE);
+    let bits = event_bits(entries.len());
+    let itt = crate::mm::frame::alloc_table_frame().filter(|_| its.itt_entry << bits <= PAGE);
     let target = its.target_of(0);
     let (Some(itt), Some(target)) = (itt, target) else {
-        ENTRY[n].store(0, Ordering::Release);
-        return None;
+        free(lines);
+        return false;
     };
-    DEVICE[n].store(device, Ordering::Relaxed);
-    TARGET[n].store(0, Ordering::Relaxed);
     let doorbell = ITS_PHYS.load(Ordering::Relaxed) + GITS_TRANSLATER;
-    write_entry(entry, ENTRY_CONTROL, CONTROL_MASKED);
-    write_entry(entry, ENTRY_ADDR_LOW, doorbell as u32);
-    write_entry(entry, ENTRY_ADDR_HIGH, (doorbell >> 32) as u32);
-    write_entry(entry, ENTRY_DATA, 0);
     let dev = u64::from(device) << 32;
-    let ok = its.run(&[
-        // The size field is the number of event ID bits less one.
-        [CMD_MAPD | dev, 0, 1 << 63 | itt, 0],
-        [CMD_MAPTI | dev, u64::from(lpi) << 32, 0, 0],
-        [CMD_SYNC, 0, target, 0],
-    ]);
-    if !ok {
-        ENTRY[n].store(0, Ordering::Release);
-        return None;
+    let mut cmds = [[0u64; 4]; LINES + 2];
+    // The size field is the number of event ID bits less one.
+    cmds[0] = [CMD_MAPD | dev, u64::from(bits - 1), 1 << 63 | itt, 0];
+    for (event, (&entry, &n)) in entries.iter().zip(lines.iter()).enumerate() {
+        let lpi = FIRST_LPI + n as u32;
+        DEVICE[n].store(device, Ordering::Relaxed);
+        EVENT[n].store(event as u32, Ordering::Relaxed);
+        TARGET[n].store(0, Ordering::Relaxed);
+        write_entry(entry, ENTRY_CONTROL, CONTROL_MASKED);
+        write_entry(entry, ENTRY_ADDR_LOW, doorbell as u32);
+        write_entry(entry, ENTRY_ADDR_HIGH, (doorbell >> 32) as u32);
+        write_entry(entry, ENTRY_DATA, event as u32);
+        cmds[event + 1] = [CMD_MAPTI | dev, u64::from(lpi) << 32 | event as u64, 0, 0];
+        lpis[event] = lpi;
     }
-    write_entry(entry, ENTRY_CONTROL, 0);
-    Some(lpi)
+    cmds[entries.len() + 1] = [CMD_SYNC, 0, target, 0];
+    if !its.run(&cmds[..entries.len() + 2]) {
+        free(lines);
+        return false;
+    }
+    entries.iter().for_each(|&entry| write_entry(entry, ENTRY_CONTROL, 0));
+    true
+}
+
+/// Gives back the lines `lpis` of the function with the device ID `device`, which one `alloc`
+/// gave. Masks their MSI-X table entries and unmaps the device with `MAPD`, as
+/// `its_irq_domain_free` of Linux. The interrupt translation table is not given back.
+pub(crate) fn free(lpis: &[u32], device: u32) {
+    let mut its = ITS.lock();
+    for &lpi in lpis {
+        let Some(n) = line(lpi) else { continue };
+        let entry = ENTRY[n].load(Ordering::Acquire);
+        if entry != 0 {
+            write_entry(entry, ENTRY_CONTROL, CONTROL_MASKED);
+        }
+        ENTRY[n].store(0, Ordering::Release);
+        FIRED.fetch_and(!(1 << n), Ordering::AcqRel);
+    }
+    if let Some(target) = its.target_of(0) {
+        its.run(&[[CMD_MAPD | u64::from(device) << 32, 0, 0, 0], [CMD_SYNC, 0, target, 0]]);
+    }
 }
 
 /// The handler of a device line: masks the entry and sets the flag of the line. It takes no lock.
@@ -440,7 +493,8 @@ pub(crate) fn route_here(intid: u32) {
     let Some(target) = its.target_of(id) else { return };
     write_entry(entry, ENTRY_CONTROL, CONTROL_MASKED);
     let dev = u64::from(DEVICE[n].load(Ordering::Relaxed)) << 32;
-    if its.run(&[[CMD_MOVI | dev, 0, id as u64, 0], [CMD_SYNC, 0, target, 0]]) {
+    let event = u64::from(EVENT[n].load(Ordering::Relaxed));
+    if its.run(&[[CMD_MOVI | dev, event, id as u64, 0], [CMD_SYNC, 0, target, 0]]) {
         TARGET[n].store(id, Ordering::Relaxed);
     }
     drop(its);

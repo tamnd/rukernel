@@ -89,6 +89,9 @@ pub(crate) struct Platform {
     pub(crate) pci_mem: Option<(u64, u64)>,
     /// The 64 bit memory window of the PCI host, as `pci_mem`.
     pub(crate) pci_mem64: Option<(u64, u64)>,
+    /// The I/O window of the PCI host, as the CPU address, the PCI address and the size. The CPU
+    /// sees the I/O space of the PCI bus as memory at the CPU address.
+    pub(crate) pci_io: Option<(u64, u64, u64)>,
     /// The masks of the PCI address and of the pin for `pci_intx`.
     pub(crate) pci_intx_mask: (u32, u32),
     /// The interrupts of the INTx pins of the PCI host. The first `pci_intx_count` are valid.
@@ -121,6 +124,7 @@ impl Default for Platform {
             pci_ecam: None,
             pci_mem: None,
             pci_mem64: None,
+            pci_io: None,
             pci_intx_mask: (0, 0),
             pci_intx: [PciIntx::default(); MAX_PCI_INTX],
             pci_intx_count: 0,
@@ -258,8 +262,8 @@ impl<'a> Node<'a> {
 
     /// Keeps the memory windows of the `ranges` of a PCI host. An entry has the PCI address in
     /// `#address-cells` of the node (3), the CPU address in `parent_cells`, and the size in
-    /// `#size-cells` of the node (2). Bits 24 and 25 of the first cell give the space: 2 for 32
-    /// bit memory and 3 for 64 bit memory.
+    /// `#size-cells` of the node (2). Bits 24 and 25 of the first cell give the space: 1 for I/O,
+    /// 2 for 32 bit memory and 3 for 64 bit memory.
     fn pci_windows(&self, platform: &mut Platform, parent_cells: u32) {
         let (child, size) = (self.address_cells.unwrap_or(3), self.size_cells.unwrap_or(2));
         if child != 3 {
@@ -275,7 +279,14 @@ impl<'a> Node<'a> {
             ) else {
                 break;
             };
-            if pci != cpu || len == 0 {
+            if len == 0 {
+                continue;
+            }
+            if hi >> 24 & 3 == 1 {
+                platform.pci_io = platform.pci_io.or(Some((cpu, pci, len)));
+                continue;
+            }
+            if pci != cpu {
                 continue;
             }
             match hi >> 24 & 3 {
@@ -798,6 +809,7 @@ mod tests {
         );
         assert_eq!(p.pci_mem, Some((0x1000_0000, 0x2eff_0000)));
         assert_eq!(p.pci_mem64, Some((0x80_0000_0000, 0x80_0000_0000)));
+        assert_eq!(p.pci_io, Some((0x3eff_0000, 0, 0x1_0000)));
         assert_eq!(p.pci_intx_mask, (0x1800, 7));
         let level = |intid| Irq { intid, edge: false };
         assert_eq!(

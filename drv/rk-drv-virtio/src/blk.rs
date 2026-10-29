@@ -38,8 +38,8 @@ const DATA_FRAMES: usize = 16;
 const SECTORS_PER_FRAME: usize = PAGE_SIZE / SECTOR_SIZE;
 
 /// Starts the driver for the disk number `index` on the transport `t`, and gives the name of the
-/// disk.
-pub(crate) fn probe(t: Transport, index: u32) -> Option<String> {
+/// disk and the kind of its interrupt.
+pub(crate) fn probe(mut t: Transport, index: u32) -> Option<(String, String)> {
     if index >= 26 {
         t.fail();
         return None;
@@ -48,6 +48,8 @@ pub(crate) fn probe(t: Transport, index: u32) -> Option<String> {
         t.fail();
         return None;
     };
+    // The device has one request queue.
+    t.find_queues(1);
     let Some(queue) = Queue::new(&t, 0) else {
         t.fail();
         return None;
@@ -61,6 +63,7 @@ pub(crate) fn probe(t: Transport, index: u32) -> Option<String> {
         _ => t.device_u32(CONFIG_MAX_DISCARD_SECTORS),
     };
     t.add_status(status::DRIVER_OK);
+    let kind = t.irq_kind();
     let disk = VirtioBlk {
         sectors,
         read_only: features & F_RO != 0,
@@ -70,7 +73,7 @@ pub(crate) fn probe(t: Transport, index: u32) -> Option<String> {
     };
     let name = format!("vd{}", char::from(b'a' + index as u8));
     register_block(makedev(crate::VIRTBLK_MAJOR, index * 16), &name, Arc::new(disk));
-    Some(name)
+    Some((name, kind))
 }
 
 struct State {

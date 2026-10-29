@@ -29,6 +29,9 @@ pub mod irq;
 pub mod mm;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod pci;
+#[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) mod pci_window;
 pub mod sync;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod task;

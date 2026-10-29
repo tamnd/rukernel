@@ -128,7 +128,7 @@ impl Queue {
             // The line wakes the wait. When the line came, the driver reads the ring again
             // before it waits.
             if !t.handle_interrupt() {
-                t.wait();
+                t.wait(self.index);
             }
         }
     }
