@@ -383,7 +383,9 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/protected_hardlinks", ""),
     ("fs/protected_regular", ""),
     ("fs/protected_symlinks", ""),
-    ("kernel/core_pattern", "core"),
+    ("fs/suid_dumpable", ""),
+    ("kernel/core_pattern", ""),
+    ("kernel/core_uses_pid", ""),
     ("kernel/domainname", ""),
     ("kernel/hostname", ""),
     ("kernel/keys/gc_delay", ""),
@@ -527,6 +529,21 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some((get, _)) = vm_tunable(name) {
         return format!("{}\n", get()).into_bytes();
     }
+    // The core dump settings, which the writer of core files reads.
+    match name {
+        "kernel/core_pattern" => {
+            let mut v = rk_proc::coredump::pattern();
+            v.push(b'\n');
+            return v;
+        }
+        "kernel/core_uses_pid" => {
+            return format!("{}\n", rk_proc::coredump::uses_pid()).into_bytes();
+        }
+        "fs/suid_dumpable" => {
+            return format!("{}\n", rk_proc::coredump::suid_dumpable()).into_bytes();
+        }
+        _ => {}
+    }
     if let Some(f) = uts_name(name) {
         let mut v = rk_proc::uts::bytes(&f()).to_vec();
         v.push(b'\n');
@@ -593,6 +610,22 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         }
         return set(n).ok_or(Errno::EINVAL);
+    }
+    // `core_pattern` is a string of at most 127 bytes, `core_uses_pid` is an `int`, and
+    // `suid_dumpable` is 0, 1 or 2, as fs/coredump.c and fs/exec.c of Linux.
+    match name {
+        "kernel/core_pattern" => return rk_proc::coredump::set_pattern(data),
+        "kernel/core_uses_pid" => {
+            let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+            rk_proc::coredump::set_uses_pid(text.trim().parse().map_err(|_| Errno::EINVAL)?);
+            return Ok(());
+        }
+        "fs/suid_dumpable" => {
+            let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+            let n: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+            return rk_proc::coredump::set_suid_dumpable(n);
+        }
+        _ => {}
     }
     // A name ends at a newline, and only the first 64 bytes count, as `proc_dostring` of Linux.
     if uts_name(name).is_some() {

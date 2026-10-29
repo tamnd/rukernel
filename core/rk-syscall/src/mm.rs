@@ -743,7 +743,7 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
         return Ok(0);
     }
     // `MADV_DONTNEED` and `MADV_FREE` remove the frames, so anonymous memory gives zero pages
-    // again. The advice for huge pages and for `fork` goes in the areas, as `madvise_update_vma`
+    // again. The advice for huge pages, for `fork` and for core dumps goes in the areas, as `madvise_update_vma`
     // of Linux. Each other advice is only a hint, so it has no effect.
     let (addr, len) = (addr as usize, len as usize);
     match advice {
@@ -754,6 +754,8 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
         MADV_DOFORK => vm.set_fork_advice(addr, len, Some(false), None)?,
         MADV_WIPEONFORK => vm.set_fork_advice(addr, len, None, Some(true))?,
         MADV_KEEPONFORK => vm.set_fork_advice(addr, len, None, Some(false))?,
+        MADV_DONTDUMP => vm.set_dump_advice(addr, len, true)?,
+        MADV_DODUMP => vm.set_dump_advice(addr, len, false)?,
         MADV_GUARD_INSTALL => vm.guard_install(addr, len)?,
         MADV_GUARD_REMOVE => vm.guard_remove(addr, len)?,
         _ => {}

@@ -18,7 +18,9 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDSTOP, SA_NOCLDWAIT, SIGCHLD, SIGCONT, SIGKILL};
 use rk_frame::sync::{SpinLock, SpinLockGuard};
@@ -117,8 +119,8 @@ struct ThreadSignals {
 pub enum Delivery {
     /// Run the handler of the action.
     Handler(SigInfo, SigAction),
-    /// End the process with this status.
-    Fatal(WaitStatus),
+    /// End the process with this status. The information of the signal goes in a core dump.
+    Fatal(WaitStatus, SigInfo),
     /// Stop the process with this signal.
     Stop(u32),
 }
@@ -172,6 +174,12 @@ pub struct Process {
     /// The value of `/proc/PID/coredump_filter`: the bits `MMF_DUMP_*` of Linux. A child of
     /// `fork` gets the value of the parent, and `execve` keeps it, as `mm_init` of Linux.
     coredump_filter: AtomicU32,
+    /// The `dumpable` value of `PR_GET_DUMPABLE`: one of `SUID_DUMP_*`, as the dump bits of
+    /// `mm->flags` in Linux. A child of `fork` gets the value of the parent.
+    dumpable: AtomicU8,
+    /// The notes of the threads that ended for a core dump, while a thread of the process
+    /// writes one, as `mm->core_state` of Linux. `None` when no dump runs.
+    core_threads: SpinLock<Option<Vec<crate::coredump::CoreThread>>>,
     /// The OOM reaper took the private pages of the process. The OOM killers do not wait for
     /// it again, as `MMF_OOM_SKIP` of Linux.
     oom_reaped: AtomicBool,
@@ -881,12 +889,62 @@ impl Process {
     }
 
     /// The status of the process when `sig` ends it with the default action. The core dump bit
-    /// is set for a signal that dumps core when `RLIMIT_CORE` is not 0. rukernel does not write
-    /// the core file yet.
+    /// is not set: the writer of the core file sets it after it wrote the file, as
+    /// `coredump_finish` in fs/coredump.c of Linux.
     pub fn fatal_status(&self, sig: u32) -> WaitStatus {
-        let core = crate::signal::default_action(sig) == crate::signal::DefaultAction::CoreDump
-            && self.limit(RLIMIT_CORE).cur != 0;
-        WaitStatus::signaled(sig, core)
+        WaitStatus::signaled(sig, false)
+    }
+
+    /// Tells if `sig` can make a core dump of the process: its default action dumps core, the
+    /// process is dumpable and `RLIMIT_CORE` is not 0. The signal then goes in the queue, so a
+    /// thread of the process writes the dump, as `complete_signal` of Linux does for
+    /// `sig_kernel_coredump`.
+    pub fn may_dump(&self, sig: u32) -> bool {
+        crate::signal::default_action(sig) == crate::signal::DefaultAction::CoreDump
+            && self.dumpable() != crate::coredump::SUID_DUMP_DISABLE
+            && self.limit(RLIMIT_CORE).cur != 0
+    }
+
+    /// The `dumpable` value: one of `SUID_DUMP_*`.
+    pub fn dumpable(&self) -> u8 {
+        self.dumpable.load(Ordering::Relaxed)
+    }
+
+    /// Sets the `dumpable` value, for `PR_SET_DUMPABLE`, `execve` and a change of the
+    /// credentials.
+    pub fn set_dumpable(&self, value: u8) {
+        self.dumpable.store(value, Ordering::Relaxed);
+    }
+
+    /// Keeps the notes of a thread that ends while another thread writes a core dump, as
+    /// `coredump_task_exit` in kernel/exit.c of Linux. Gives `false` if no dump runs.
+    pub fn save_core_thread(&self, notes: crate::coredump::CoreThread) -> bool {
+        match self.core_threads.lock().as_mut() {
+            Some(list) => {
+                list.push(notes);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Tells if a thread of the process writes a core dump.
+    pub fn core_dumping(&self) -> bool {
+        self.core_threads.lock().is_some()
+    }
+
+    /// Gives the notes that the other threads kept for the core dump, and ends the dump.
+    pub fn take_core_threads(&self) -> Vec<crate::coredump::CoreThread> {
+        self.core_threads.lock().take().unwrap_or_default()
+    }
+
+    /// Sets the core dump bit of the exit status after a core file was written, as
+    /// `coredump_finish` in fs/coredump.c of Linux.
+    pub fn set_core_dumped(&self) {
+        let mut s = self.state.lock();
+        if let Some(status) = s.group_exit.as_mut() {
+            *status = WaitStatus(status.0 | 0x80);
+        }
     }
 
     /// Tells if a stop signal stopped the process.
@@ -938,7 +996,23 @@ impl Process {
 
     /// Sets the credentials.
     pub fn set_cred(&self, cred: Cred) {
-        *self.cred.lock() = Arc::new(cred);
+        let mut old = self.cred.lock();
+        self.cred_dump_rule(&old, &cred);
+        *old = Arc::new(cred);
+    }
+
+    /// Sets `dumpable` to `fs.suid_dumpable` when the effective or file system IDs change or
+    /// the permitted capabilities grow, as `commit_creds` in kernel/cred.c of Linux.
+    fn cred_dump_rule(&self, old: &Cred, new: &Cred) {
+        let ids = |c: &Cred| [c.euid, c.egid, c.fsuid, c.fsgid];
+        if crate::coredump::cred_change_drops_dumpable(
+            ids(old),
+            ids(new),
+            old.cap_permitted,
+            new.cap_permitted,
+        ) {
+            self.set_dumpable(crate::coredump::suid_dumpable());
+        }
     }
 
     /// Changes the credentials with `f`, which gives the new credentials from the old. The lock
@@ -950,6 +1024,7 @@ impl Process {
     pub fn change_cred(&self, f: impl FnOnce(&Cred) -> Result<Cred, Errno>) -> Result<(), Errno> {
         let mut cred = self.cred.lock();
         let new = f(&cred)?;
+        self.cred_dump_rule(&cred, &new);
         *cred = Arc::new(new);
         Ok(())
     }
@@ -1000,6 +1075,8 @@ impl Process {
             start_tick: rk_frame::time::ticks(),
             oom_score_adj: AtomicI32::new(0),
             coredump_filter: AtomicU32::new(COREDUMP_FILTER_DEFAULT),
+            dumpable: AtomicU8::new(crate::coredump::SUID_DUMP_USER),
+            core_threads: SpinLock::new(None),
             oom_reaped: AtomicBool::new(false),
             membarrier: AtomicU32::new(0),
             personality: AtomicU32::new(0),
@@ -1445,7 +1522,7 @@ impl Thread {
             return None;
         }
         if action.is_fatal(sig) {
-            return Some(Delivery::Fatal(self.process.fatal_status(sig)));
+            return Some(Delivery::Fatal(self.process.fatal_status(sig), info));
         }
         if action.is_stop(sig) {
             // init does not stop, as Linux does not stop a process with `SIGNAL_UNKILLABLE`.
@@ -1751,6 +1828,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     child.keys.lock().session = pp.keys.lock().session.clone();
     child.set_oom_score_adj(pp.oom_score_adj());
     child.set_coredump_filter(pp.coredump_filter());
+    child.set_dumpable(pp.dumpable());
     child.set_personality(pp.personality());
     child.set_thp_disable(pp.thp_disable());
     child.set_no_ctty(pp.no_ctty());
@@ -1854,6 +1932,32 @@ pub fn exit_group(thread: &Thread, status: WaitStatus) {
     }
 }
 
+/// Starts the exit of the group of `thread` for a core dump with `status`, and waits until the
+/// other threads are gone, as `coredump_wait` and `zap_threads` in fs/coredump.c of Linux. Each
+/// other thread keeps its notes with [`Process::save_core_thread`] before it ends. Gives `false`
+/// if the group exits already, and then no dump starts.
+pub fn start_core_dump(thread: &Thread, status: WaitStatus) -> bool {
+    let process = &thread.process;
+    let others: Vec<Arc<Thread>> = {
+        let mut s = process.state.lock();
+        if s.group_exit.is_some() {
+            return false;
+        }
+        s.group_exit = Some(status);
+        *process.core_threads.lock() = Some(Vec::new());
+        s.threads.iter().filter(|t| t.tid != thread.tid).cloned().collect()
+    };
+    if others.is_empty() {
+        return true;
+    }
+    for t in &others {
+        t.kill();
+    }
+    drop(others);
+    process.thread_exit.wait_until(|| (process.state.lock().threads.len() <= 1).then_some(()));
+    true
+}
+
 /// Sends a signal to `process`, or to `thread` of that process if it is given.
 ///
 /// An action that discards the signal discards it now. `SIGKILL`, and a signal that ends the
@@ -1900,7 +2004,9 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     if action.ignores(sig) && handled {
         return;
     }
-    if action.is_fatal(sig) && handled {
+    // A signal that can dump core goes in the queue, so that a thread of the process writes
+    // the dump, as `complete_signal` of Linux.
+    if action.is_fatal(sig) && handled && !process.may_dump(sig) {
         drop(shared);
         kill_group(process, process.fatal_status(sig));
         return;

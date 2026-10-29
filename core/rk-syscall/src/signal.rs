@@ -27,8 +27,8 @@ use rk_abi::native::types::{KernelTimespec, Sigaltstack};
 use rk_frame::user::UserContext;
 use rk_proc::ptrace::{self, NO_SYSCALL, PTRACE_EVENT_STOP, StopKind};
 use rk_proc::signal::{
-    AltStack, NSIG, SI_TKILL, SI_USER, SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE, SS_ONSTACK,
-    SigAction, SigInfo, SigSet,
+    AltStack, NSIG, SI_KERNEL, SI_TKILL, SI_USER, SIGINFO_SIZE, SS_AUTODISARM, SS_DISABLE,
+    SS_ONSTACK, SigAction, SigInfo, SigSet,
 };
 use rk_proc::{Delivery, Pid, Process, Thread, WaitStatus};
 use zerocopy::FromZeros;
@@ -120,9 +120,8 @@ pub(crate) fn deliver(
             }
             None
         }
-        Some(Delivery::Fatal(status)) => {
-            rk_proc::exit_group(thread, status);
-            Some(thread.process().group_exit().unwrap_or(status))
+        Some(Delivery::Fatal(status, info)) => {
+            Some(crate::coredump::fatal(thread, regs, syscall, status, &info))
         }
         Some(Delivery::Handler(info, action)) => {
             if let Some((e, number)) = restart {
@@ -134,8 +133,8 @@ pub(crate) fn deliver(
                 // The frame does not fit, so the thread cannot run the handler. Linux sends
                 // `SIGSEGV` with the default action then.
                 let status = thread.process().fatal_status(SIGSEGV);
-                rk_proc::exit_group(thread, status);
-                return Some(thread.process().group_exit().unwrap_or(status));
+                let info = SigInfo::new(SIGSEGV, SI_KERNEL, 0);
+                return Some(crate::coredump::fatal(thread, regs, syscall, status, &info));
             }
             let mut blocked = SigSet(blocked.0 | action.mask);
             if action.flags & u64::from(SA_NODEFER) == 0 {

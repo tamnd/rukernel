@@ -122,6 +122,9 @@ pub struct Vma<F> {
     /// `MADV_WIPEONFORK`: a child of `fork` gets the area without its pages, so each page is
     /// zero there. Linux names it `VM_WIPEONFORK`.
     pub wipe_on_fork: bool,
+    /// `MADV_DONTDUMP`: a core dump does not hold the pages of the area. Linux names it
+    /// `VM_DONTDUMP`, and `vma_dump_size` in fs/coredump.c skips such an area.
+    pub dont_dump: bool,
     /// The anonymous pages of a parent of `fork`. A child gets a new value that is not 0 for each
     /// private area, and the pieces of the area keep it. 0 tells that the area did not come from
     /// `fork`. Linux keeps an `anon_vma` for each area, and the chain of an area that a child got
@@ -151,6 +154,7 @@ impl<F: Clone> Vma<F> {
             hugetlb: false,
             dont_fork: false,
             wipe_on_fork: false,
+            dont_dump: false,
             fork_anon: 0,
             backing: Backing::Anon,
             kind,
@@ -207,6 +211,7 @@ impl<F: PartialEq> Vma<F> {
             && self.hugetlb == other.hugetlb
             && self.dont_fork == other.dont_fork
             && self.wipe_on_fork == other.wipe_on_fork
+            && self.dont_dump == other.dont_dump
             && self.fork_anon == other.fork_anon
             && self.kind == other.kind
     }
@@ -600,6 +605,7 @@ mod tests {
             hugetlb: false,
             dont_fork: false,
             wipe_on_fork: false,
+            dont_dump: false,
             fork_anon: 0,
             backing: Backing::File { file: 7u32, offset: 0x1000 },
             kind: VmaKind::Normal,

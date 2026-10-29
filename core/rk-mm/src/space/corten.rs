@@ -532,6 +532,7 @@ impl AddressSpace {
                 kind: req.kind,
                 dont_fork: false,
                 wipe_on_fork: false,
+                dont_dump: false,
                 fork_anon: 0,
             };
             self.state.set(&mut range, start, end, Some(Arc::new(vma)));

@@ -552,6 +552,15 @@ pub fn exec(
     if !name.is_empty() {
         process.set_comm(name);
     }
+    // The dump rule of `begin_new_exec` in fs/exec.c of Linux: a program that the user cannot
+    // read (`would_dump`) or that runs with another user or group ID gets `fs.suid_dumpable`.
+    let readable = ctx.permission(&at, rk_vfs::cred::may::READ).is_ok();
+    let dumpable = if !readable || cred.uid != cred.euid || cred.gid != cred.egid {
+        crate::coredump::suid_dumpable()
+    } else {
+        crate::coredump::SUID_DUMP_USER
+    };
+    process.set_dumpable(dumpable);
     process.set_cred(cred);
     thread.exec_keys();
     process.set_image(&argv, at, auxv, deny);
