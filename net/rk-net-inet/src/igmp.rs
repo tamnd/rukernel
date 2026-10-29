@@ -3,8 +3,9 @@
 //!
 //! A device that goes up joins the group of all of the hosts, 224.0.0.1, as `ip_mc_up` of
 //! Linux, and a device that goes down leaves it, as `ip_mc_down`. A group has a count of its
-//! users. The device takes the packets to its groups. Linux sends no report for 224.0.0.1, and
-//! this stack sends no IGMP reports for the other groups.
+//! users. A socket joins a group with `IP_ADD_MEMBERSHIP` and leaves it with
+//! `IP_DROP_MEMBERSHIP` or at its close. The device takes the packets to its groups. Linux sends
+//! no report for 224.0.0.1, and this stack sends no IGMP reports for the other groups.
 
 use crate::ip::Ip;
 use crate::ipv4::Addr;

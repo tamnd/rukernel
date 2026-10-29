@@ -13,6 +13,9 @@
 //! and `neigh_delete` of Linux. A `Permanent` or `Noarp` entry does not change by ARP and does
 //! not go away by itself.
 //!
+//! The table records each change of an entry in `changes`, and the caller sends them to
+//! `RTNLGRP_NEIGH`, as `neigh_update_notify` and `__neigh_notify` of Linux.
+//!
 //! The table does not send frames itself. Each call gives the work to the caller, and the
 //! caller gives the time in milliseconds. Thus the host tests can run the table.
 
@@ -134,11 +137,46 @@ pub enum Resolve<P> {
     },
 }
 
+/// A change of an entry, for the netlink message of the change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change<A = Addr> {
+    /// The entry is new or it has a new state or a new address, `RTM_NEWNEIGH`.
+    New(Info<A>),
+    /// The entry went away, `RTM_DELNEIGH`.
+    Del(Info<A>),
+}
+
 /// The neighbour table. `P` is the type of a packet that waits, and `A` the type of an address.
 pub struct Table<P, A = Addr> {
     entries: BTreeMap<Key<A>, Entry<P>>,
     /// The packets that the table dropped: a full queue, or no reply.
     pub dropped: u64,
+    /// The changes that the caller did not send yet.
+    changes: Vec<Change<A>>,
+}
+
+/// The entry `key` at the time `now`.
+fn info<P, A: Copy>(&(ifindex, addr): &Key<A>, e: &Entry<P>, now: u64) -> Info<A> {
+    let ago = |t: u64| now.saturating_sub(t);
+    let (mac, state, probes, confirmed) = match &e.state {
+        State::Incomplete { probes, .. } => (None, Nud::Incomplete, *probes, e.updated),
+        State::Reachable { mac, confirmed, stale } => {
+            let state =
+                if !*stale && ago(*confirmed) < REACHABLE_MS { Nud::Reachable } else { Nud::Stale };
+            (Some(*mac), state, 0, *confirmed)
+        }
+        State::Static { mac, nud } => (Some(*mac), *nud, 0, e.updated),
+    };
+    Info {
+        ifindex,
+        addr,
+        mac,
+        state,
+        probes,
+        confirmed: ago(confirmed),
+        used: ago(e.used),
+        updated: ago(e.updated),
+    }
 }
 
 impl<P, A: Copy + Ord> Default for Table<P, A> {
@@ -150,7 +188,31 @@ impl<P, A: Copy + Ord> Default for Table<P, A> {
 impl<P, A: Copy + Ord> Table<P, A> {
     /// An empty table.
     pub const fn new() -> Self {
-        Self { entries: BTreeMap::new(), dropped: 0 }
+        Self { entries: BTreeMap::new(), dropped: 0, changes: Vec::new() }
+    }
+
+    /// Takes the changes since the last call, for `RTM_NEWNEIGH` and `RTM_DELNEIGH`.
+    pub fn take_changes(&mut self) -> Vec<Change<A>> {
+        core::mem::take(&mut self.changes)
+    }
+
+    /// Records a new state of `key` if the state or the address is not `old`, as
+    /// `__neigh_update` of Linux that sends a notification only for a change.
+    fn changed(&mut self, key: Key<A>, old: Option<(Nud, Option<MacAddr>)>, now: u64) {
+        if let Some(e) = self.entries.get(&key) {
+            let new = info(&key, e, now);
+            if old != Some((new.state, new.mac)) {
+                self.changes.push(Change::New(new));
+            }
+        }
+    }
+
+    /// The state and the address of `key`, to find a change.
+    fn state_of(&self, key: Key<A>, now: u64) -> Option<(Nud, Option<MacAddr>)> {
+        self.entries.get(&key).map(|e| {
+            let i = info(&key, e, now);
+            (i.state, i.mac)
+        })
     }
 
     /// Finds the hardware address of `key` for `packet`, as `neigh_resolve_output` of Linux.
@@ -224,25 +286,28 @@ impl<P, A: Copy + Ord> Table<P, A> {
             (None, Some(o)) => o,
             (None, None) => return None,
         };
+        let before = self.state_of(key, now);
         let state = match nud {
             Nud::Permanent | Nud::Noarp => State::Static { mac, nud },
             Nud::Reachable => State::Reachable { mac, confirmed: now, stale: false },
             Nud::Stale => State::Reachable { mac, confirmed: now, stale: true },
             Nud::Incomplete => return None,
         };
-        match self.entries.get_mut(&key) {
+        let waiting = match self.entries.get_mut(&key) {
             Some(entry) => {
                 entry.updated = now;
-                Some(match core::mem::replace(&mut entry.state, state) {
+                match core::mem::replace(&mut entry.state, state) {
                     State::Incomplete { queue, .. } => queue.into(),
                     _ => Vec::new(),
-                })
+                }
             }
             None => {
                 self.entries.insert(key, Entry { state, used: now, updated: now });
-                Some(Vec::new())
+                Vec::new()
             }
-        }
+        };
+        self.changed(key, before, now);
+        Some(waiting)
     }
 
     /// Adds or changes an entry for `RTM_NEWNEIGH` with the netlink flags `flags`, as
@@ -273,9 +338,10 @@ impl<P, A: Copy + Ord> Table<P, A> {
 
     /// Removes the entry `key` and drops the packets that wait for it, as `neigh_delete` of
     /// Linux. Gives `false` if there is no entry.
-    pub fn remove(&mut self, key: Key<A>) -> bool {
+    pub fn remove(&mut self, key: Key<A>, now: u64) -> bool {
         match self.entries.remove(&key) {
             Some(e) => {
+                self.changes.push(Change::Del(info(&key, &e, now)));
                 if let State::Incomplete { queue, .. } = e.state {
                     self.dropped += queue.len() as u64;
                 }
@@ -290,7 +356,8 @@ impl<P, A: Copy + Ord> Table<P, A> {
     /// waited for the address, for the caller to send.
     pub fn update(&mut self, key: Key<A>, mac: MacAddr, now: u64, create: bool) -> Vec<P> {
         let reachable = State::Reachable { mac, confirmed: now, stale: false };
-        match self.entries.get_mut(&key) {
+        let before = self.state_of(key, now);
+        let waiting = match self.entries.get_mut(&key) {
             // ARP does not change an entry of the administrator, as `__neigh_update` gives
             // `EPERM` for `NUD_PERMANENT` and `NUD_NOARP` without `NEIGH_UPDATE_F_ADMIN`.
             Some(Entry { state: State::Static { .. }, .. }) => Vec::new(),
@@ -307,7 +374,9 @@ impl<P, A: Copy + Ord> Table<P, A> {
                 }
                 Vec::new()
             }
-        }
+        };
+        self.changed(key, before, now);
+        waiting
     }
 
     /// Runs the timers, as `neigh_timer_handler` of Linux. Gives the keys that need a new
@@ -316,24 +385,33 @@ impl<P, A: Copy + Ord> Table<P, A> {
     pub fn tick(&mut self, now: u64) -> Vec<Key<A>> {
         let mut probes = Vec::new();
         let mut dropped = 0;
-        self.entries.retain(|key, entry| match &mut entry.state {
-            State::Incomplete { queue, probes: n, next } => {
-                if now < *next {
-                    return true;
+        let mut gone = Vec::new();
+        self.entries.retain(|key, entry| {
+            let keep = match &mut entry.state {
+                State::Incomplete { queue, probes: n, next } => {
+                    if now < *next {
+                        return true;
+                    }
+                    if *n >= MAX_PROBES {
+                        dropped += queue.len() as u64;
+                        false
+                    } else {
+                        *n += 1;
+                        *next = now + RETRANS_MS;
+                        probes.push(*key);
+                        true
+                    }
                 }
-                if *n >= MAX_PROBES {
-                    dropped += queue.len() as u64;
-                    return false;
-                }
-                *n += 1;
-                *next = now + RETRANS_MS;
-                probes.push(*key);
-                true
+                State::Reachable { .. } => now.saturating_sub(entry.used) < GC_MS,
+                State::Static { .. } => true,
+            };
+            if !keep {
+                gone.push(Change::Del(info(key, entry, now)));
             }
-            State::Reachable { .. } => now.saturating_sub(entry.used) < GC_MS,
-            State::Static { .. } => true,
+            keep
         });
         self.dropped += dropped;
+        self.changes.extend(gone);
         probes
     }
 
@@ -343,40 +421,20 @@ impl<P, A: Copy + Ord> Table<P, A> {
     }
 
     /// Removes the entries of an interface.
-    pub fn flush(&mut self, ifindex: u32) {
-        self.entries.retain(|(i, _), _| *i != ifindex);
+    pub fn flush(&mut self, ifindex: u32, now: u64) {
+        let mut gone = Vec::new();
+        self.entries.retain(|key, e| {
+            if key.0 == ifindex {
+                gone.push(Change::Del(info(key, e, now)));
+            }
+            key.0 != ifindex
+        });
+        self.changes.extend(gone);
     }
 
     /// The entries at the time `now`, by interface and address.
     pub fn entries(&self, now: u64) -> Vec<Info<A>> {
-        let ago = |t: u64| now.saturating_sub(t);
-        self.entries
-            .iter()
-            .map(|(&(ifindex, addr), e)| {
-                let (mac, state, probes, confirmed) = match &e.state {
-                    State::Incomplete { probes, .. } => (None, Nud::Incomplete, *probes, e.updated),
-                    State::Reachable { mac, confirmed, stale } => {
-                        let state = if !*stale && ago(*confirmed) < REACHABLE_MS {
-                            Nud::Reachable
-                        } else {
-                            Nud::Stale
-                        };
-                        (Some(*mac), state, 0, *confirmed)
-                    }
-                    State::Static { mac, nud } => (Some(*mac), *nud, 0, e.updated),
-                };
-                Info {
-                    ifindex,
-                    addr,
-                    mac,
-                    state,
-                    probes,
-                    confirmed: ago(confirmed),
-                    used: ago(e.used),
-                    updated: ago(e.updated),
-                }
-            })
-            .collect()
+        self.entries.iter().map(|(key, e)| info(key, e, now)).collect()
     }
 
     /// The count of entries.

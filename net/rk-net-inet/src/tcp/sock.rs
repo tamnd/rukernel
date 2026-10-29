@@ -29,7 +29,10 @@ use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::in6::{IPV6_ADDRFORM, IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY};
-use rk_abi::native::inet::{IP_TOS, IP_TTL, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_TCP};
+use rk_abi::native::inet::{
+    IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_TOS, IP_TTL, IPPROTO_IP,
+    IPPROTO_IPV6, IPPROTO_TCP,
+};
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
@@ -154,6 +157,9 @@ struct Inner {
     /// The multicast groups of `MCAST_JOIN_GROUP`: the interface and the group address. A
     /// socket from `accept` does not copy them, as `inet_csk_clone_lock` of Linux.
     mc_groups: Vec<(u32, [u8; 4])>,
+    /// `IP_BIND_ADDRESS_NO_PORT`: `bind` to the port 0 sets only the address, and `connect`
+    /// gives the port, as `__inet_bind` of Linux.
+    bind_no_port: bool,
     quickack: bool,
     /// `TCP_MAXSEG`, or 0.
     maxseg: u32,
@@ -198,6 +204,7 @@ impl Inner {
             nodelay: false,
             cork: false,
             mc_groups: Vec::new(),
+            bind_no_port: false,
             quickack: false,
             maxseg: 0,
             keepidle: super::conn::KEEPIDLE,
@@ -952,9 +959,11 @@ impl Socket for Stream {
         if s.port != 0 || s.state() != State::Closed {
             return Err(Errno::EINVAL);
         }
-        let b = Binding { addr, reuse: s.reuse(), id: self.ino, v6only };
-        s.port = PORTS.lock().bind(port, b)?;
-        s.bound = true;
+        if port != 0 || !s.bind_no_port {
+            let b = Binding { addr, reuse: s.reuse(), id: self.ino, v6only };
+            s.port = PORTS.lock().bind(port, b)?;
+            s.bound = true;
+        }
         s.lock_addr = !ip::is_any(&addr);
         s.lock_port = port != 0;
         s.local = addr;
@@ -1275,6 +1284,7 @@ impl Socket for Stream {
             IPPROTO_IP => Ok(match name {
                 IP_TTL => int(i32::from(s.ttl())),
                 IP_TOS => int(i32::from(s.tos)),
+                IP_BIND_ADDRESS_NO_PORT => int(i32::from(s.bind_no_port)),
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
             IPPROTO_IPV6 if self.af() == AF_INET6 => Ok(match name {
@@ -1354,8 +1364,12 @@ impl Socket for Stream {
                         (_, None) => return Err(Errno::EADDRNOTAVAIL),
                     }
                 }
+                // A connected socket has no multicast groups, as `do_ip_setsockopt` of Linux.
+                IPPROTO_IP if matches!(name, IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP) => {
+                    return Err(Errno::EPROTO);
+                }
                 IPPROTO_IP => {
-                    let v = int_of(value)?;
+                    let v = crate::socket::ip_int(value)?;
                     match name {
                         IP_TTL => {
                             s.ttl = match v {
@@ -1365,6 +1379,7 @@ impl Socket for Stream {
                             };
                         }
                         IP_TOS => s.tos = v as u8,
+                        IP_BIND_ADDRESS_NO_PORT => s.bind_no_port = v != 0,
                         _ => return Err(Errno::ENOPROTOOPT),
                     }
                 }
