@@ -4815,6 +4815,30 @@ static void test_tcp_lo(void)
 	waitpid(pid, &status, 0);
 	printf("init: inet: tcp lo: server %d, client status %d\n", r, status);
 	check("tcp: 1 MiB each way over lo", r == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* A poll on the listener in another process wakes when the connection comes, and does not
+	 * wait for its timeout. The socket adds its queue to the poll, as sock_poll_wait in
+	 * include/net/sock.h of Linux. recvmsg01 of LTP waits so with select (#470). */
+	pid = fork();
+	if (pid == 0) {
+		struct pollfd w = { .fd = l, .events = POLLIN };
+		struct timespec t0, t1;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		int n = poll(&w, 1, 5000);
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+		_exit(n == 1 && ms < 3000 ? 0 : 1);
+	}
+	usleep(200000);
+	c = socket(AF_INET, SOCK_STREAM, 0);
+	connect(c, (struct sockaddr *)&an, sizeof(an));
+	status = -1;
+	waitpid(pid, &status, 0);
+	check("tcp: a poll on the listener wakes at a connection",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	a = accept(l, NULL, NULL);
+	close(a);
+	close(c);
 	close(ep);
 	close(l);
 }

@@ -114,3 +114,65 @@ fn namespaces_have_their_own_devices_and_values() {
     assert_eq!(ns::count(), 1);
     assert_eq!(ns::current_index(), 0);
 }
+
+/// A socket that records the calls of `poll_wait`.
+struct Waits(core::sync::atomic::AtomicU32);
+
+impl crate::Socket for Waits {
+    fn family(&self) -> u32 {
+        2
+    }
+    fn kind(&self) -> u32 {
+        1
+    }
+    fn ino(&self) -> u64 {
+        1
+    }
+    fn send(
+        &self,
+        _paths: &dyn crate::PathOps,
+        _msg: crate::Message,
+        _flags: u32,
+        _nonblock: bool,
+    ) -> rk_vfs::inode::Result<usize> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    fn recv(
+        &self,
+        _len: usize,
+        _flags: u32,
+        _nonblock: bool,
+    ) -> rk_vfs::inode::Result<crate::Received> {
+        Err(Errno::EOPNOTSUPP)
+    }
+    fn name(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn get_option(&self, _level: u32, _name: u32) -> rk_vfs::inode::Result<Vec<u8>> {
+        Err(Errno::ENOPROTOOPT)
+    }
+    fn set_option(&self, _level: u32, _name: u32, _value: &[u8]) -> rk_vfs::inode::Result<()> {
+        Err(Errno::ENOPROTOOPT)
+    }
+    fn poll(&self) -> u32 {
+        0
+    }
+    fn poll_wait(&self, _table: &mut rk_vfs::wait::PollTable) {
+        self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+// The wrapper of the namespace gives `poll_wait` to the socket in it. Else `select` without a
+// timeout does not wake when a TCP connection comes, as in recvmsg01 of LTP (#470).
+#[test]
+fn namespace_socket_adds_the_queues_of_its_socket() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let inner = alloc::sync::Arc::new(Waits(core::sync::atomic::AtomicU32::new(0)));
+    let sock = ns::NsSocket::wrap(ns::init_ns(), inner.clone());
+    let mut table = rk_vfs::wait::PollTable::new();
+    sock.poll_wait(&mut table);
+    assert_eq!(inner.0.load(core::sync::atomic::Ordering::Relaxed), 1);
+}

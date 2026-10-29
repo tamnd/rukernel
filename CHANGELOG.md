@@ -24,6 +24,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The page cache drops clean folios until it is an eighth below its limit, as the watermarks of kswapd in mm/vmscan.c of Linux. Before, each read and each write over the limit sorted all the clean folios to drop one folio (#446).
 - A read or a write of the page cache checks the limit of the memory cgroup only after it charged a new folio, as `mem_cgroup_charge` of Linux. Before, each call took the lock of the cgroups (#446).
 - `IP_MULTICAST_TTL`, `IP_MULTICAST_LOOP` and the other number options of `IPPROTO_IP` take a value of one byte, as `do_ip_setsockopt` of Linux. They gave `EINVAL` (#458).
+- `poll`, `select` and `epoll_wait` on an IPv4, IPv6, packet or netlink socket wake at a new event of the socket. Before, the wrapper of the network namespace did not add the queue of the socket, so a wait without a timeout did not end, and a wait with a timeout ended only at the timeout. recvmsg01 of LTP passes (#470).
 
 ## [0.4.12] - 2026-10-29
 

@@ -21,6 +21,7 @@ use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
+use rk_vfs::wait::PollTable;
 
 /// The most namespaces at one time.
 const MAX_NS: usize = 4096;
@@ -538,6 +539,12 @@ impl Socket for NsSocket {
     fn poll(&self) -> u32 {
         let _in = enter(&self.net);
         self.inner.poll()
+    }
+
+    // The wrapper adds the queues of the socket in it, so `poll`, `select` and `epoll_wait` wake
+    // at a new event of the socket. Linux adds the queue in `sock_poll_wait`.
+    fn poll_wait(&self, table: &mut PollTable) {
+        self.inner.poll_wait(table);
     }
 
     fn event_count(&self) -> u64 {
