@@ -5430,6 +5430,9 @@ static void veth_peer(int in, int out)
 #ifndef SO_BINDTOIFINDEX
 #define SO_BINDTOIFINDEX 62
 #endif
+#ifndef IP_BIND_ADDRESS_NO_PORT
+#define IP_BIND_ADDRESS_NO_PORT 24
+#endif
 
 /* Sends an echo request with `size` bytes of data and the sequence `seq` to dst on the raw
  * ICMP socket fd, and waits at most ms milliseconds for the reply. Gives 0 if the reply came
@@ -5510,6 +5513,123 @@ static int file_has(const char *path, const char *want)
 {
 	static char text[8192];
 	return read_file(path, text, sizeof(text)) >= 0 && strstr(text, want) != NULL;
+}
+
+/* Waits at most one second for a message of the type `type` for the IPv4 address `addr` on the
+ * rtnetlink socket fd, which is in the group RTNLGRP_NEIGH. Gives the state of the entry, or -1. */
+static int nl_neigh_event(int fd, int type, unsigned long addr)
+{
+	static char buf[8192];
+	unsigned int a = htonl(addr);
+	for (int i = 0; i < 20; i++) {
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		if (poll(&p, 1, 1000) != 1)
+			return -1;
+		long n = recv(fd, buf, sizeof(buf), 0);
+		for (struct nlmsghdr *h = (struct nlmsghdr *)buf; n > 0 && NLMSG_OK(h, n);
+		     h = NLMSG_NEXT(h, n)) {
+			if (h->nlmsg_type != type)
+				continue;
+			struct ndmsg *nd = NLMSG_DATA(h);
+			int len = h->nlmsg_len - NLMSG_LENGTH(sizeof(*nd));
+			for (struct rtattr *r = (struct rtattr *)((char *)nd + NLMSG_ALIGN(sizeof(*nd)));
+			     RTA_OK(r, len); r = RTA_NEXT(r, len))
+				if (r->rta_type == NDA_DST && RTA_PAYLOAD(r) == 4 &&
+				    memcmp(RTA_DATA(r), &a, 4) == 0)
+					return nd->ndm_state;
+		}
+	}
+	return -1;
+}
+
+/* The IPv4 multicast options over rkva, as net/ipv4/ip_sockglue.c and net/ipv4/igmp.c of
+ * Linux, and IP_BIND_ADDRESS_NO_PORT, as __inet_bind in net/ipv4/af_inet.c. */
+static void mcast4_checks(int index)
+{
+	int tx = socket(AF_INET, SOCK_DGRAM, 0), rx = socket(AF_INET, SOCK_DGRAM, 0);
+	unsigned char c = 0;
+	int v = 0;
+	socklen_t len = 1;
+	check("getsockopt of IP_MULTICAST_TTL with one byte gives 1",
+	      getsockopt(tx, IPPROTO_IP, IP_MULTICAST_TTL, &c, &len) == 0 && len == 1 && c == 1);
+	c = 10;
+	len = sizeof(v);
+	check("setsockopt of IP_MULTICAST_TTL takes one byte",
+	      setsockopt(tx, IPPROTO_IP, IP_MULTICAST_TTL, &c, 1) == 0 &&
+		      getsockopt(tx, IPPROTO_IP, IP_MULTICAST_TTL, &v, &len) == 0 && v == 10);
+	c = 0;
+	len = sizeof(v);
+	check("setsockopt of IP_MULTICAST_LOOP takes one byte",
+	      setsockopt(tx, IPPROTO_IP, IP_MULTICAST_LOOP, &c, 1) == 0 &&
+		      getsockopt(tx, IPPROTO_IP, IP_MULTICAST_LOOP, &v, &len) == 0 && v == 0);
+	struct in_addr ifa = { htonl(0x0a4d0001) }, got = { 0 };
+	len = sizeof(got);
+	check("IP_MULTICAST_IF takes the address of rkva and gives it back",
+	      setsockopt(tx, IPPROTO_IP, IP_MULTICAST_IF, &ifa, sizeof(ifa)) == 0 &&
+		      getsockopt(tx, IPPROTO_IP, IP_MULTICAST_IF, &got, &len) == 0 &&
+		      got.s_addr == ifa.s_addr);
+	struct in_addr none = { htonl(0x0a4d0063) };
+	check("IP_MULTICAST_IF of an address that is not local gives EADDRNOTAVAIL",
+	      setsockopt(tx, IPPROTO_IP, IP_MULTICAST_IF, &none, sizeof(none)) == -1 &&
+		      errno == EADDRNOTAVAIL);
+
+	int one = 1;
+	struct sockaddr_in me = inet_addr4(0, 7790), grp = inet_addr4(0xef010203, 7790);
+	setsockopt(rx, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	bind(rx, (struct sockaddr *)&me, sizeof(me));
+	struct ip_mreqn mr = { .imr_multiaddr = { htonl(0xef010203) }, .imr_ifindex = index };
+	check("IP_ADD_MEMBERSHIP joins 239.1.2.3 on rkva",
+	      setsockopt(rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) == 0);
+	check("a second IP_ADD_MEMBERSHIP of the group gives EADDRINUSE",
+	      setsockopt(rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr)) == -1 &&
+		      errno == EADDRINUSE);
+	struct ip_mreq uni = { { htonl(0x0a4d0002) }, { htonl(0x0a4d0001) } };
+	check("IP_ADD_MEMBERSHIP of an address that is not multicast gives EINVAL",
+	      setsockopt(rx, IPPROTO_IP, IP_ADD_MEMBERSHIP, &uni, sizeof(uni)) == -1 &&
+		      errno == EINVAL);
+	check("/proc/net/igmp shows 239.1.2.3", file_has("/proc/net/igmp", "030201EF"));
+	char buf[16];
+	struct sockaddr_in from;
+	check("without IP_MULTICAST_LOOP the sender does not get its datagram",
+	      sendto(tx, "rkmc", 4, 0, (struct sockaddr *)&grp, sizeof(grp)) == 4 &&
+		      recv_wait(rx, buf, sizeof(buf), &from, 300) < 0);
+	c = 1;
+	setsockopt(tx, IPPROTO_IP, IP_MULTICAST_LOOP, &c, 1);
+	check("with IP_MULTICAST_LOOP a member of the group gets the datagram from rkva",
+	      sendto(tx, "rkmc", 4, 0, (struct sockaddr *)&grp, sizeof(grp)) == 4 &&
+		      recv_wait(rx, buf, sizeof(buf), &from, 2000) == 4 &&
+		      memcmp(buf, "rkmc", 4) == 0 && from.sin_addr.s_addr == htonl(0x0a4d0001));
+	check("IP_DROP_MEMBERSHIP leaves the group",
+	      setsockopt(rx, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mr, sizeof(mr)) == 0 &&
+		      !file_has("/proc/net/igmp", "030201EF"));
+	check("a second IP_DROP_MEMBERSHIP gives EADDRNOTAVAIL",
+	      setsockopt(rx, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mr, sizeof(mr)) == -1 &&
+		      errno == EADDRNOTAVAIL);
+	close(tx);
+	close(rx);
+
+	/* bind_noport01 of LTP: the port is 0 after bind, and connect gives one. */
+	int types[2] = { SOCK_DGRAM, SOCK_STREAM };
+	for (int i = 0; i < 2; i++) {
+		int fd = socket(AF_INET, types[i], 0);
+		struct sockaddr_in a = inet_addr4(0x0a4d0001, 0), b;
+		socklen_t bl = sizeof(b);
+		check(i ? "TCP: IP_BIND_ADDRESS_NO_PORT keeps the port 0 after bind"
+			: "UDP: IP_BIND_ADDRESS_NO_PORT keeps the port 0 after bind",
+		      setsockopt(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof(one)) == 0 &&
+			      bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+			      getsockname(fd, (struct sockaddr *)&b, &bl) == 0 && b.sin_port == 0 &&
+			      b.sin_addr.s_addr == htonl(0x0a4d0001));
+		if (i == 0) {
+			struct sockaddr_in peer = inet_addr4(0x0a4d0002, 7777);
+			bl = sizeof(b);
+			check("UDP: connect after IP_BIND_ADDRESS_NO_PORT gives a port",
+			      connect(fd, (struct sockaddr *)&peer, sizeof(peer)) == 0 &&
+				      getsockname(fd, (struct sockaddr *)&b, &bl) == 0 &&
+				      b.sin_port != 0 && b.sin_addr.s_addr == htonl(0x0a4d0001));
+		}
+		close(fd);
+	}
 }
 
 /* The checks of SO_BINDTODEVICE, large pings, multicast and the neighbour table over the veth
@@ -5605,11 +5725,19 @@ static void veth_checks(int nl, int index)
 	      ioctl(ms, SIOCDELMULTI, &mr) == -1 && errno == ENOENT);
 	close(ms);
 
-	/* ip neigh add, replace and del, as neigh_add and neigh_delete in net/core/neighbour.c. */
+	mcast4_checks(index);
+
+	/* ip neigh add, replace and del, as neigh_add and neigh_delete in net/core/neighbour.c. A
+	 * socket in RTNLGRP_NEIGH gets the changes, as neigh_update_notify and __neigh_notify. */
+	int mon = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	struct sockaddr_nl snl = { .nl_family = AF_NETLINK, .nl_groups = RTMGRP_NEIGH };
+	bind(mon, (struct sockaddr *)&snl, sizeof(snl));
 	unsigned char mac9[6] = { 2, 0, 0, 0, 0, 9 }, mac10[6] = { 2, 0, 0, 0, 0, 0x10 };
 	check("RTM_NEWNEIGH adds a permanent entry",
 	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, index, 0x0a4d0009, mac9) == 0 &&
 		      arp_has("10.77.0.9", "0x6", "02:00:00:00:00:09"));
+	check("RTNLGRP_NEIGH gets RTM_NEWNEIGH of the permanent entry",
+	      nl_neigh_event(mon, RTM_NEWNEIGH, 0x0a4d0009) == NUD_PERMANENT);
 	check("RTM_NEWNEIGH with NLM_F_EXCL of an entry that is there gives EEXIST",
 	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, index, 0x0a4d0009, mac9) ==
 		      -EEXIST);
@@ -5619,6 +5747,9 @@ static void veth_checks(int nl, int index)
 	check("RTM_DELNEIGH removes the entry",
 	      nl_neigh(nl, RTM_DELNEIGH, 0, index, 0x0a4d0009, NULL) == 0 &&
 		      !arp_has("10.77.0.9", "0x", ":"));
+	check("RTNLGRP_NEIGH gets RTM_DELNEIGH of the entry",
+	      nl_neigh_event(mon, RTM_DELNEIGH, 0x0a4d0009) == NUD_PERMANENT);
+	close(mon);
 	check("RTM_DELNEIGH of an entry that is not there gives ENOENT",
 	      nl_neigh(nl, RTM_DELNEIGH, 0, index, 0x0a4d0009, NULL) == -ENOENT);
 	check("RTM_NEWNEIGH without NLM_F_CREATE of a new entry gives ENOENT",

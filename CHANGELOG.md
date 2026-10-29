@@ -8,6 +8,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The CPUs run system calls, page faults and the scheduler at the same time, without the big kernel lock (#405). A task has an `on_cpu` flag, as Linux has, and a wake of a task that did not switch yet puts it in a queue after the switch. A CPU that waits for a spin lock does the TLB requests of the other CPUs. The `big-lock` feature of rukernel keeps the old lock for a comparison.
 - The `blk` boot test has a second disk with ext2, which xtask makes with mkfs.ext2. Init writes 50 MB to a file on it in chunks of 1 MiB, and 4 MB in chunks of 1 KiB in a memory cgroup, as memcontrol03 of LTP. It calls fsync, checks the data and prints the times (#446).
+- The IPv4 multicast socket options `IP_MULTICAST_IF`, `IP_ADD_MEMBERSHIP`, `IP_DROP_MEMBERSHIP`, `MCAST_JOIN_GROUP`, `MCAST_LEAVE_GROUP` and `IP_MULTICAST_ALL` for UDP and raw sockets, as net/ipv4/ip_sockglue.c and net/ipv4/igmp.c of Linux (#458). A membership joins the group on the device, and a socket gets the multicast datagrams of its groups. With `IP_MULTICAST_LOOP`, the host also gets the multicast packets that it sends.
+- `IP_BIND_ADDRESS_NO_PORT` for UDP and TCP sockets: `bind` to the port 0 sets only the address, and `connect` gives the port, as `__inet_bind` of Linux (#458).
+- A change of a neighbour entry of IPv4 or IPv6 sends `RTM_NEWNEIGH` or `RTM_DELNEIGH` to `RTNLGRP_NEIGH`, as `neigh_update_notify` and `__neigh_notify` of Linux (#458). Thus `ip monitor neigh` shows the changes.
 
 ### Fixed
 
@@ -20,6 +23,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - virtio-blk sends up to 512 KiB in one request, the largest request of the block queue, not 64 KiB, as `seg_max` in drivers/block/virtio_blk.c of Linux (#446).
 - The page cache drops clean folios until it is an eighth below its limit, as the watermarks of kswapd in mm/vmscan.c of Linux. Before, each read and each write over the limit sorted all the clean folios to drop one folio (#446).
 - A read or a write of the page cache checks the limit of the memory cgroup only after it charged a new folio, as `mem_cgroup_charge` of Linux. Before, each call took the lock of the cgroups (#446).
+- `IP_MULTICAST_TTL`, `IP_MULTICAST_LOOP` and the other number options of `IPPROTO_IP` take a value of one byte, as `do_ip_setsockopt` of Linux. They gave `EINVAL` (#458).
 
 ## [0.4.12] - 2026-10-29
 

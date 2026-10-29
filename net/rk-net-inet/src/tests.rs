@@ -508,6 +508,105 @@ fn loopback_sockets() {
     tcp_loopback();
     ipv6_loopback();
     ipv6_groups();
+    ipv4_groups();
+    bind_no_port();
+}
+
+/// The IPv4 multicast options over the loopback device, as net/ipv4/ip_sockglue.c and
+/// net/ipv4/igmp.c of Linux. The `loopback_sockets` test calls this.
+fn ipv4_groups() {
+    use rk_abi::native::inet::{
+        IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP, IP_MULTICAST_ALL, IP_MULTICAST_IF,
+        IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IPPROTO_IP,
+    };
+    use rk_abi::native::socket::{SO_REUSEADDR, SOL_SOCKET};
+    let lo = ipv4::LOOPBACK;
+    let group = [239, 1, 2, 3];
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+    let mreqn = |g: Addr, a: Addr, i: u32| [&g[..], &a[..], &i.to_ne_bytes()[..]].concat();
+
+    // A value of one byte is good for the numbers, as `do_ip_setsockopt`.
+    let a = Dgram::new(Proto::Udp);
+    assert_eq!(a.get_option(IPPROTO_IP, IP_MULTICAST_TTL), Ok(int(1)));
+    a.set_option(IPPROTO_IP, IP_MULTICAST_TTL, &[10]).unwrap();
+    assert_eq!(a.get_option(IPPROTO_IP, IP_MULTICAST_TTL), Ok(int(10)));
+    assert_eq!(a.set_option(IPPROTO_IP, IP_MULTICAST_TTL, &int(256)), Err(Errno::EINVAL));
+    assert_eq!(a.set_option(IPPROTO_IP, IP_MULTICAST_TTL, &[]), Err(Errno::EINVAL));
+    a.set_option(IPPROTO_IP, IP_MULTICAST_LOOP, &[0]).unwrap();
+    assert_eq!(a.get_option(IPPROTO_IP, IP_MULTICAST_LOOP), Ok(int(0)));
+    a.set_option(IPPROTO_IP, IP_MULTICAST_LOOP, &[1]).unwrap();
+
+    // `IP_MULTICAST_IF` takes `struct in_addr` or `struct ip_mreqn`, and gives the address.
+    assert_eq!(a.get_option(IPPROTO_IP, IP_MULTICAST_IF), Ok(vec![0; 4]));
+    a.set_option(IPPROTO_IP, IP_MULTICAST_IF, &lo).unwrap();
+    assert_eq!(a.get_option(IPPROTO_IP, IP_MULTICAST_IF), Ok(lo.to_vec()));
+    let none = [10, 9, 9, 9];
+    assert_eq!(a.set_option(IPPROTO_IP, IP_MULTICAST_IF, &none), Err(Errno::EADDRNOTAVAIL));
+    let bad = mreqn(ipv4::ANY, ipv4::ANY, 999);
+    assert_eq!(a.set_option(IPPROTO_IP, IP_MULTICAST_IF, &bad), Err(Errno::EADDRNOTAVAIL));
+    assert_eq!(a.set_option(IPPROTO_IP, IP_MULTICAST_IF, &[0; 3]), Err(Errno::EINVAL));
+    a.set_option(IPPROTO_IP, IP_MULTICAST_IF, &[0; 4]).unwrap();
+    assert_eq!(a.get_option(IPPROTO_IP, IP_MULTICAST_IF), Ok(vec![0; 4]));
+
+    // The membership: the group must be multicast, and a second join gives `EADDRINUSE`.
+    let b = Dgram::new(Proto::Udp);
+    b.set_option(SOL_SOCKET, SO_REUSEADDR, &int(1)).unwrap();
+    b.bind(&NoPaths, &sockaddr::make(ipv4::ANY, 0)).unwrap();
+    let port = sockaddr::parse_bind(&b.name()).unwrap().1;
+    let join = mreqn(group, ipv4::ANY, 1);
+    assert_eq!(b.set_option(IPPROTO_IP, IP_ADD_MEMBERSHIP, &join[..7]), Err(Errno::EINVAL));
+    let unicast = mreqn(lo, ipv4::ANY, 1);
+    assert_eq!(b.set_option(IPPROTO_IP, IP_ADD_MEMBERSHIP, &unicast), Err(Errno::EINVAL));
+    b.set_option(IPPROTO_IP, IP_ADD_MEMBERSHIP, &join).unwrap();
+    assert_eq!(b.set_option(IPPROTO_IP, IP_ADD_MEMBERSHIP, &join), Err(Errno::EADDRINUSE));
+    assert!(crate::igmp::joined(1, group));
+
+    // A socket with `IP_MULTICAST_ALL` 0 and no membership does not get the datagram.
+    let c = Dgram::new(Proto::Udp);
+    c.set_option(SOL_SOCKET, SO_REUSEADDR, &int(1)).unwrap();
+    c.set_option(IPPROTO_IP, IP_MULTICAST_ALL, &int(0)).unwrap();
+    c.bind(&NoPaths, &sockaddr::make(ipv4::ANY, port)).unwrap();
+    a.set_option(IPPROTO_IP, IP_MULTICAST_IF, &lo).unwrap();
+    assert_eq!(send(&a, Some((group, port)), b"group"), Ok(5));
+    assert_eq!(b.recv(100, 0, true).unwrap().data, b"group");
+    assert_eq!(c.recv(100, 0, true).err(), Some(Errno::EAGAIN));
+
+    // The drop: by the ifindex, then `EADDRNOTAVAIL`. The close leaves the other groups.
+    b.set_option(IPPROTO_IP, IP_DROP_MEMBERSHIP, &join).unwrap();
+    assert_eq!(b.set_option(IPPROTO_IP, IP_DROP_MEMBERSHIP, &join), Err(Errno::EADDRNOTAVAIL));
+    assert!(!crate::igmp::joined(1, group));
+    c.set_option(IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreqn(group, lo, 0)).unwrap();
+    assert!(crate::igmp::joined(1, group));
+    c.release();
+    assert!(!crate::igmp::joined(1, group));
+    a.release();
+    b.release();
+}
+
+/// `IP_BIND_ADDRESS_NO_PORT`: `bind` to the port 0 sets only the address, and `connect` gives
+/// the port, as `__inet_bind` of Linux. The `loopback_sockets` test calls this.
+fn bind_no_port() {
+    use rk_abi::native::inet::{IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IPPROTO_IP};
+    let lo = ipv4::LOOPBACK;
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+    let u = Dgram::new(Proto::Udp);
+    assert_eq!(u.get_option(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT), Ok(int(0)));
+    u.set_option(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &int(1)).unwrap();
+    assert_eq!(u.get_option(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT), Ok(int(1)));
+    u.bind(&NoPaths, &sockaddr::make(lo, 0)).unwrap();
+    assert_eq!(u.name(), sockaddr::make(lo, 0));
+    u.connect(&NoPaths, &sockaddr::make(lo, 9), true).unwrap();
+    assert_ne!(sockaddr::parse_bind(&u.name()).unwrap().1, 0);
+    u.release();
+
+    let t = crate::Stream::new();
+    t.set_option(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &[1]).unwrap();
+    assert_eq!(t.get_option(IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT), Ok(int(1)));
+    t.bind(&NoPaths, &sockaddr::make(lo, 0)).unwrap();
+    assert_eq!(t.name(), sockaddr::make(lo, 0));
+    // A TCP socket has no groups, as `do_ip_setsockopt`.
+    assert_eq!(t.set_option(IPPROTO_IP, IP_ADD_MEMBERSHIP, &[0; 8]), Err(Errno::EPROTO));
+    t.release();
 }
 
 fn tcp_send(s: &crate::Stream, data: &[u8]) -> Result<usize, Errno> {
@@ -1126,8 +1225,8 @@ fn neighbour_admin_entries() {
     t.add(key, None, Nud::Permanent, 5, NLM_F_REPLACE).unwrap();
     t.tick(5 + neigh::GC_MS * 10);
     assert!(t.contains(key));
-    assert!(t.remove(key));
-    assert!(!t.remove(key));
+    assert!(t.remove(key, 0));
+    assert!(!t.remove(key, 0));
     // An entry without an address is not valid.
     assert_eq!(t.add(key, None, Nud::Reachable, 6, NLM_F_CREATE), Err(Errno::EINVAL));
 }
@@ -1140,8 +1239,48 @@ fn neighbour_admin_entry_sends_the_queue() {
     assert_eq!(t.resolve(key, 0, 7), Resolve::Wait { probe: true });
     let mac = MacAddr([2, 0, 0, 0, 0, 3]);
     assert_eq!(t.add(key, Some(mac), Nud::Reachable, 1, NLM_F_CREATE | NLM_F_REPLACE), Ok(vec![7]));
-    assert!(t.remove(key));
+    assert!(t.remove(key, 0));
     assert_eq!(t.resolve(key, 2, 8), Resolve::Wait { probe: true });
-    assert!(t.remove(key));
+    assert!(t.remove(key, 0));
     assert_eq!(t.dropped, 1);
+}
+
+/// The table records the changes for `RTM_NEWNEIGH` and `RTM_DELNEIGH`, as
+/// `neigh_update_notify` and `__neigh_notify` in net/core/neighbour.c of Linux.
+#[test]
+fn neighbour_changes() {
+    use neigh::{Change, Nud};
+    let key = (2, [10, 0, 0, 7]);
+    let mac = MacAddr([2, 0, 0, 0, 0, 4]);
+    let mut t: neigh::Table<u32> = neigh::Table::new();
+    // A request makes an incomplete entry without a message.
+    assert_eq!(t.resolve(key, 0, 1), Resolve::Wait { probe: true });
+    assert!(t.take_changes().is_empty());
+    // The reply makes the entry reachable.
+    assert_eq!(t.update(key, mac, 1, false), vec![1]);
+    let c = t.take_changes();
+    assert!(matches!(c[..], [Change::New(i)] if i.state == Nud::Reachable && i.mac == Some(mac)));
+    // The same reply again is not a change.
+    t.update(key, mac, 2, false);
+    assert!(t.take_changes().is_empty());
+    // The administrator makes it permanent, and the same request again is not a change.
+    t.add(key, Some(mac), Nud::Permanent, 3, NLM_F_REPLACE).unwrap();
+    assert!(matches!(t.take_changes()[..], [Change::New(i)] if i.state == Nud::Permanent));
+    t.add(key, Some(mac), Nud::Permanent, 4, NLM_F_REPLACE).unwrap();
+    assert!(t.take_changes().is_empty());
+    assert!(t.remove(key, 5));
+    assert!(matches!(t.take_changes()[..], [Change::Del(i)] if i.addr == key.1));
+    // An entry without a reply goes away after the probes.
+    t.resolve(key, 10, 2);
+    for n in 1..=neigh::MAX_PROBES {
+        t.tick(10 + u64::from(n) * neigh::RETRANS_MS);
+    }
+    assert!(!t.contains(key));
+    assert!(matches!(t.take_changes()[..], [Change::Del(i)] if i.state == Nud::Incomplete));
+    // A flush removes the entries of the interface.
+    t.update(key, mac, 20, true);
+    t.update((3, [10, 0, 0, 8]), mac, 20, true);
+    t.take_changes();
+    t.flush(2, 21);
+    assert!(matches!(t.take_changes()[..], [Change::Del(i)] if i.ifindex == 2));
 }

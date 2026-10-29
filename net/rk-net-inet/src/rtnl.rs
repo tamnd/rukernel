@@ -4,7 +4,7 @@
 use crate::fib::{self, IFADDR_LEN, RTMSG_LEN};
 use crate::ip::{self, Ip};
 use crate::ipv4;
-use crate::neigh::{Info, Nud};
+use crate::neigh::{Change, Info, Nud};
 use crate::route::{
     INFINITY, IfAddr, Match, Metrics, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK, RTAX_FEATURES,
     RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
@@ -31,13 +31,13 @@ use rk_abi::native::rtnetlink::{
     RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC, RTA_TABLE, RTA_UID, RTM_DELADDR,
     RTM_DELNEIGH, RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY,
     RTM_F_PREFIX, RTM_GETADDR, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE,
-    RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
+    RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTNLGRP_NEIGH,
 };
 use rk_net::consts::{AF_INET, AF_INET6, IFNAMSIZ};
 use rk_net::dev::{self, NetDevice};
 use rk_net::ether::MacAddr;
 use rk_net::netlink::msg::{Attrs, Builder, attrs};
-use rk_net::netlink::{self, Request};
+use rk_net::netlink::{self, Origin, Request};
 use rk_vfs::inode::Result;
 
 /// The last attribute of an address, `IFA_MAX` of Linux. rk-abigen does not give the `MAX`
@@ -608,38 +608,55 @@ fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
     Ok(all
         .iter()
         .filter(|(_, n)| ifindex == 0 || n.ifindex == ifindex)
-        .map(|(af, n)| {
-            let mut b = Builder::new(RTM_NEWNEIGH as u16, flags as u16, req.hdr.seq, req.portid);
-            let state = match n.state {
-                Nud::Incomplete => NUD_INCOMPLETE,
-                Nud::Reachable => NUD_REACHABLE,
-                Nud::Stale => NUD_STALE,
-                Nud::Permanent => NUD_PERMANENT,
-                Nud::Noarp => NUD_NOARP,
-            };
-            let mut h = [0u8; NDMSG_LEN];
-            h[0] = *af;
-            h[4..8].copy_from_slice(&n.ifindex.to_ne_bytes());
-            h[8..10].copy_from_slice(&(state as u16).to_ne_bytes());
-            h[11] = RTN_UNICAST as u8;
-            b.fixed(&h);
-            match ip::v4(&n.addr) {
-                Some(a) if *af == AF_INET as u8 => b.put(NDA_DST as u16, &a),
-                _ => b.put(NDA_DST as u16, &n.addr),
-            };
-            if let Some(mac) = n.mac {
-                b.put(NDA_LLADDR as u16, &mac.0);
-            }
-            b.u32(NDA_PROBES as u16, n.probes);
-            // `struct nda_cacheinfo` in hundredths of a second, `clock_t` of `USER_HZ`.
-            let mut ci = [0u8; 16];
-            for (i, ms) in [n.confirmed, n.used, n.updated].into_iter().enumerate() {
-                ci[i * 4..i * 4 + 4].copy_from_slice(&((ms / 10) as u32).to_ne_bytes());
-            }
-            b.put(NDA_CACHEINFO as u16, &ci);
-            b.finish()
-        })
+        .map(|(af, n)| fill_neigh(*af, n, RTM_NEWNEIGH, flags, req.hdr.seq, req.portid))
         .collect())
+}
+
+/// A message of a neighbour, as `neigh_fill_info` in net/core/neighbour.c of Linux.
+fn fill_neigh(af: u8, n: &Info<Ip>, ty: u32, flags: u32, seq: u32, portid: u32) -> Vec<u8> {
+    let mut b = Builder::new(ty as u16, flags as u16, seq, portid);
+    let state = match n.state {
+        Nud::Incomplete => NUD_INCOMPLETE,
+        Nud::Reachable => NUD_REACHABLE,
+        Nud::Stale => NUD_STALE,
+        Nud::Permanent => NUD_PERMANENT,
+        Nud::Noarp => NUD_NOARP,
+    };
+    let mut h = [0u8; NDMSG_LEN];
+    h[0] = af;
+    h[4..8].copy_from_slice(&n.ifindex.to_ne_bytes());
+    h[8..10].copy_from_slice(&(state as u16).to_ne_bytes());
+    h[11] = RTN_UNICAST as u8;
+    b.fixed(&h);
+    match ip::v4(&n.addr) {
+        Some(a) if af == AF_INET as u8 => b.put(NDA_DST as u16, &a),
+        _ => b.put(NDA_DST as u16, &n.addr),
+    };
+    if let Some(mac) = n.mac {
+        b.put(NDA_LLADDR as u16, &mac.0);
+    }
+    b.u32(NDA_PROBES as u16, n.probes);
+    // `struct nda_cacheinfo` in hundredths of a second, `clock_t` of `USER_HZ`.
+    let mut ci = [0u8; 16];
+    for (i, ms) in [n.confirmed, n.used, n.updated].into_iter().enumerate() {
+        ci[i * 4..i * 4 + 4].copy_from_slice(&((ms / 10) as u32).to_ne_bytes());
+    }
+    b.put(NDA_CACHEINFO as u16, &ci);
+    b.finish()
+}
+
+/// Sends a change of a neighbour to `RTNLGRP_NEIGH`: `RTM_NEWNEIGH` for a new state or address
+/// and `RTM_DELNEIGH` for an entry that went away, as `neigh_update_notify` and
+/// `__neigh_notify` in net/core/neighbour.c of Linux. `af` is `AF_INET` or `AF_INET6`.
+pub(crate) fn notify_neigh(af: u32, change: Change<Ip>) {
+    if !netlink::has_listeners(RTNLGRP_NEIGH) {
+        return;
+    }
+    let (ty, n) = match change {
+        Change::New(n) => (RTM_NEWNEIGH, n),
+        Change::Del(n) => (RTM_DELNEIGH, n),
+    };
+    netlink::notify(RTNLGRP_NEIGH, fill_neigh(af as u8, &n, ty, 0, 0, 0), Origin::KERNEL);
 }
 
 #[cfg(test)]

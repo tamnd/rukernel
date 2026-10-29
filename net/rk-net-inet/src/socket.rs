@@ -36,8 +36,9 @@ use rk_abi::native::in6::{
     IPV6_UNICAST_HOPS, IPV6_UNICAST_IF, IPV6_V6ONLY,
 };
 use rk_abi::native::inet::{
-    IP_HDRINCL, IP_MTU_DISCOVER, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS, IP_TTL,
-    IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_UDP,
+    IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MTU_DISCOVER,
+    IP_MULTICAST_ALL, IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS,
+    IP_TTL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_UDP,
 };
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -51,6 +52,7 @@ use rk_net::consts::{
     AF_INET, AF_INET6, ICMP_ECHO, ICMP_FILTER, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB,
     MSG_PEEK, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_RAW,
 };
+use rk_net::dev;
 use rk_net::{Message, Options, PathOps, Received, Socket, wait_for};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
@@ -264,6 +266,77 @@ struct State {
     /// The multicast groups of IPv6 that the socket joined: the interface and the group, as
     /// `ipv6_mc_list` of Linux.
     groups6: Vec<(u32, Ip)>,
+    /// The multicast groups of IPv4 that the socket joined, as `mc_list` of Linux.
+    groups4: Vec<Membership>,
+    /// The interface of `IP_MULTICAST_IF`, or 0.
+    mc_index: u32,
+    /// The source address of `IP_MULTICAST_IF`, or `0.0.0.0`.
+    mc_addr: Addr,
+    /// `IP_MULTICAST_ALL`: the socket takes the datagrams of each group of the host.
+    mc_all: bool,
+    /// `IP_BIND_ADDRESS_NO_PORT`: `bind` with the port 0 gives no port, and `connect` gives it.
+    bind_no_port: bool,
+}
+
+/// A multicast group of IPv4 that a socket joined, `struct ip_mreqn` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Membership {
+    /// The group.
+    group: Addr,
+    /// The address of the interface that the program gave, or `0.0.0.0`.
+    addr: Addr,
+    /// The interface.
+    ifindex: u32,
+}
+
+/// The value of an option of the level `IPPROTO_IP` that is a number, as `do_ip_setsockopt` in
+/// net/ipv4/ip_sockglue.c of Linux: an `int`, or one byte for a shorter value.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for an empty value.
+pub(crate) fn ip_int(value: &[u8]) -> Result<i32> {
+    match value {
+        [a, b, c, d, ..] => Ok(i32::from_ne_bytes([*a, *b, *c, *d])),
+        [a, ..] => Ok(i32::from(*a)),
+        [] => Err(Errno::EINVAL),
+    }
+}
+
+/// The IPv4 address at `at` in `value`.
+fn addr_at(value: &[u8], at: usize) -> Addr {
+    let mut a = ipv4::ANY;
+    a.copy_from_slice(&value[at..at + 4]);
+    a
+}
+
+/// The group, the address and the interface of `struct ip_mreq` or `struct ip_mreqn` in
+/// `value`, as `do_ip_setsockopt` of Linux.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a value that is shorter than `struct ip_mreq`.
+fn mreqn(value: &[u8]) -> Result<Membership> {
+    if value.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    let ifindex = match value.get(8..12) {
+        Some(&[a, b, c, d]) => u32::from_ne_bytes([a, b, c, d]),
+        _ => 0,
+    };
+    Ok(Membership { group: addr_at(value, 0), addr: addr_at(value, 4), ifindex })
+}
+
+/// The interface of a group, as `ip_mc_find_dev` in net/ipv4/igmp.c of Linux: the interface of
+/// `m`, else the interface of the address of `m`, else the interface of the route to the group.
+fn mc_find_dev(m: &Membership) -> Option<u32> {
+    if m.ifindex != 0 {
+        return dev::by_index(m.ifindex).map(|d| d.ifindex());
+    }
+    if m.addr != ipv4::ANY {
+        return stack::dev_of_addr(m.addr);
+    }
+    stack::route(m.group).ok().map(|n| n.ifindex)
 }
 
 /// `UDP_CORK` of include/uapi/linux/udp.h.
@@ -472,6 +545,11 @@ impl Dgram {
                 cork: false,
                 rthdr: None,
                 groups6: Vec::new(),
+                groups4: Vec::new(),
+                mc_index: 0,
+                mc_addr: ipv4::ANY,
+                mc_all: true,
+                bind_no_port: false,
             }),
             wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
@@ -559,6 +637,16 @@ impl Dgram {
         }
     }
 
+    /// Tells if the socket takes a packet to `dst` that came in on `dif`, as `ip_mc_sf_allow`
+    /// in net/ipv4/igmp.c of Linux: a packet that is not to a group, a group that the socket
+    /// joined on the device, or any group with `IP_MULTICAST_ALL`.
+    pub(crate) fn mc_allow(&self, dst: Addr, dif: u32) -> bool {
+        let s = self.state.lock();
+        !ipv4::is_multicast(dst)
+            || s.mc_all
+            || s.groups4.iter().any(|m| m.group == dst && (dif == 0 || m.ifindex == dif))
+    }
+
     /// Puts a datagram in the receive queue, as `__udp_queue_rcv_skb` of Linux. Gives `false`
     /// if the socket dropped it: a full receive buffer or a shut down socket.
     /// `scope` is the interface of a link local source, and `info` has the IPv6 header.
@@ -604,6 +692,9 @@ impl Dgram {
             {
                 return;
             }
+        }
+        if !self.mc_allow(h.dst, dif) {
+            return;
         }
         self.deliver(src, 0, 0, packet.to_vec(), None);
     }
@@ -666,8 +757,17 @@ impl Dgram {
     }
 
     /// Checks that `dst` can take a packet from this socket, and gives the route.
+    /// A packet to a group goes through the interface of the socket or of `IP_MULTICAST_IF`,
+    /// and its source is the local address or the address of `IP_MULTICAST_IF`, as
+    /// `udp_sendmsg` of Linux.
     fn route_to(&self, s: &State, dst: Addr) -> Result<crate::route::Next> {
-        let next = stack::route_oif(dst, s.oif)?;
+        let next = if ipv4::is_multicast(dst) {
+            let oif = if s.oif != 0 { s.oif } else { s.mc_index };
+            let local = Self::local4(s);
+            stack::route_mc(dst, oif, if local == ipv4::ANY { s.mc_addr } else { local })?
+        } else {
+            stack::route_oif(dst, s.oif)?
+        };
         if next.broadcast && s.options.get(SO_BROADCAST).is_ok_and(|v| v == int(0)) {
             return Err(Errno::EACCES);
         }
@@ -683,7 +783,7 @@ impl Dgram {
         // `IP_PMTUDISC_DO` and `IP_PMTUDISC_PROBE` forbid the fragments, as `ip_dont_fragment`
         // of Linux.
         let df = matches!(s.mtu_discover, 2 | 3);
-        Out { src, dst, protocol, ttl, tos: s.tos, df }
+        Out { src, dst, protocol, ttl, tos: s.tos, df, mc_loop: s.multicast_loop }
     }
 
     /// Sends `data` to `dst` and `dport`, and `scope` is the interface of a link local
@@ -1071,6 +1171,150 @@ impl Dgram {
         Ok(())
     }
 
+    /// Sets an option of the level `IPPROTO_IP`, as `do_ip_setsockopt` in
+    /// net/ipv4/ip_sockglue.c of Linux.
+    fn set_option4(&self, s: &mut State, name: u32, value: &[u8]) -> Result<()> {
+        match name {
+            IP_MULTICAST_IF => return Self::set_mc_if(s, value),
+            IP_ADD_MEMBERSHIP => return Self::join4(s, mreqn(value)?),
+            IP_DROP_MEMBERSHIP => return Self::leave4(s, mreqn(value)?),
+            MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
+                // `struct group_req` with a `struct sockaddr_in` in `gr_group`.
+                if value.len() < GROUP_REQ_LEN {
+                    return Err(Errno::EINVAL);
+                }
+                if u32::from(u16::from_ne_bytes([value[8], value[9]])) != AF_INET {
+                    return Err(Errno::EINVAL);
+                }
+                let ifindex = u32::from_ne_bytes([value[0], value[1], value[2], value[3]]);
+                let m = Membership { group: addr_at(value, 12), addr: ipv4::ANY, ifindex };
+                return if name == MCAST_JOIN_GROUP {
+                    Self::join4(s, m)
+                } else {
+                    Self::leave4(s, m)
+                };
+            }
+            _ => {}
+        }
+        let v = ip_int(value)?;
+        match name {
+            IP_TTL => {
+                s.ttl = match v {
+                    -1 => None,
+                    1..=255 => Some(v as u8),
+                    _ => return Err(Errno::EINVAL),
+                };
+            }
+            IP_TOS => s.tos = v as u8,
+            IP_RECVERR => s.recverr = v != 0,
+            IP_HDRINCL if matches!(self.proto, Proto::Raw(_)) => s.hdrincl = v != 0,
+            IP_MTU_DISCOVER if (0..=5).contains(&v) => s.mtu_discover = v,
+            IP_MTU_DISCOVER => return Err(Errno::EINVAL),
+            IP_MULTICAST_TTL => {
+                s.multicast_ttl = match v {
+                    -1 => 1,
+                    0..=255 => v,
+                    _ => return Err(Errno::EINVAL),
+                };
+            }
+            IP_MULTICAST_LOOP => s.multicast_loop = v != 0,
+            IP_MULTICAST_ALL => s.mc_all = v != 0,
+            IP_BIND_ADDRESS_NO_PORT => s.bind_no_port = v != 0,
+            _ => return Err(Errno::ENOPROTOOPT),
+        }
+        Ok(())
+    }
+
+    /// Sets `IP_MULTICAST_IF` from `struct in_addr`, `struct ip_mreq` or `struct ip_mreqn`, as
+    /// `do_ip_setsockopt` of Linux. The address `0.0.0.0` without an interface removes the
+    /// setting.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` for a short value or an interface that is not the device of the socket,
+    /// and `EADDRNOTAVAIL` for an address or an interface that is not there.
+    fn set_mc_if(s: &mut State, value: &[u8]) -> Result<()> {
+        let (addr, ifindex) = match value.len() {
+            0..4 => return Err(Errno::EINVAL),
+            4..8 => (addr_at(value, 0), 0),
+            _ => {
+                let m = mreqn(value)?;
+                (m.addr, m.ifindex)
+            }
+        };
+        let ifindex = if ifindex == 0 {
+            if addr == ipv4::ANY {
+                s.mc_index = 0;
+                s.mc_addr = ipv4::ANY;
+                return Ok(());
+            }
+            stack::dev_of_addr(addr).ok_or(Errno::EADDRNOTAVAIL)?
+        } else {
+            dev::by_index(ifindex).ok_or(Errno::EADDRNOTAVAIL)?.ifindex()
+        };
+        if s.oif != 0 && ifindex != s.oif {
+            return Err(Errno::EINVAL);
+        }
+        s.mc_index = ifindex;
+        s.mc_addr = addr;
+        Ok(())
+    }
+
+    /// Joins a multicast group of IPv4 on its interface, as `__ip_mc_join_group` in
+    /// net/ipv4/igmp.c of Linux. The interface joins the group, as `ip_mc_inc_group`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` for an address that is not multicast, `ENODEV` if no interface is found,
+    /// `EADDRINUSE` if the socket is in the group on the interface, and `ENOBUFS` for more
+    /// groups than `net.ipv4.igmp_max_memberships`.
+    fn join4(s: &mut State, mut m: Membership) -> Result<()> {
+        if !ipv4::is_multicast(m.group) {
+            return Err(Errno::EINVAL);
+        }
+        m.ifindex = mc_find_dev(&m).ok_or(Errno::ENODEV)?;
+        if s.groups4.iter().any(|g| g.group == m.group && g.ifindex == m.ifindex) {
+            return Err(Errno::EADDRINUSE);
+        }
+        let max = rk_net::sysctl::ipv4("igmp_max_memberships");
+        if i32::try_from(s.groups4.len()).unwrap_or(i32::MAX) >= max {
+            return Err(Errno::ENOBUFS);
+        }
+        crate::igmp::join(m.ifindex, m.group);
+        s.groups4.push(m);
+        Ok(())
+    }
+
+    /// Leaves a multicast group of IPv4, as `ip_mc_leave_group` in net/ipv4/igmp.c of Linux.
+    /// Without an interface, the address of the interface finds the group.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENODEV` if no interface is found for a request without an interface and an
+    /// address, and `EADDRNOTAVAIL` if the socket is not in the group.
+    fn leave4(s: &mut State, m: Membership) -> Result<()> {
+        let dev = mc_find_dev(&m);
+        if m.ifindex == 0 && m.addr == ipv4::ANY && dev.is_none() {
+            return Err(Errno::ENODEV);
+        }
+        let ifindex = if m.ifindex != 0 { m.ifindex } else { dev.unwrap_or(0) };
+        let at = s
+            .groups4
+            .iter()
+            .position(|g| {
+                g.group == m.group
+                    && if ifindex != 0 {
+                        g.ifindex == ifindex
+                    } else {
+                        m.addr == ipv4::ANY || g.addr == m.addr
+                    }
+            })
+            .ok_or(Errno::EADDRNOTAVAIL)?;
+        let g = s.groups4.remove(at);
+        crate::igmp::leave(g.ifindex, g.group);
+        Ok(())
+    }
+
     fn take_error(&self) -> Result<()> {
         match self.state.lock().error.take() {
             Some(e) => Err(e),
@@ -1162,7 +1406,11 @@ impl Socket for Dgram {
         if s.port != 0 {
             return Err(Errno::EINVAL);
         }
-        if let Some(table) = self.ports() {
+        // With `IP_BIND_ADDRESS_NO_PORT`, the port 0 waits for `connect` or the first send,
+        // as `__inet_bind` of Linux.
+        if let Some(table) = self.ports()
+            && (port != 0 || !s.bind_no_port)
+        {
             let reuse = s.options.get(SO_REUSEADDR).is_ok_and(|v| v != int(0));
             s.port = table.lock().bind(port, Binding { addr, reuse, id: self.ino, v6only })?;
         }
@@ -1359,6 +1607,10 @@ impl Socket for Dgram {
                 IP_MTU_DISCOVER => int(s.mtu_discover),
                 IP_MULTICAST_TTL => int(s.multicast_ttl),
                 IP_MULTICAST_LOOP => int(i32::from(s.multicast_loop)),
+                // `do_ip_getsockopt` gives the address, and at most 4 bytes.
+                IP_MULTICAST_IF => s.mc_addr.to_vec(),
+                IP_MULTICAST_ALL => int(i32::from(s.mc_all)),
+                IP_BIND_ADDRESS_NO_PORT => int(i32::from(s.bind_no_port)),
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
             IPPROTO_IPV6 if self.af() == AF_INET6 => self.get_option6(&s, name),
@@ -1398,32 +1650,7 @@ impl Socket for Dgram {
                 }
                 _ => s.options.set(name, value)?,
             },
-            IPPROTO_IP => {
-                let v = int_of(value)?;
-                match name {
-                    IP_TTL => {
-                        s.ttl = match v {
-                            -1 => None,
-                            1..=255 => Some(v as u8),
-                            _ => return Err(Errno::EINVAL),
-                        };
-                    }
-                    IP_TOS => s.tos = v as u8,
-                    IP_RECVERR => s.recverr = v != 0,
-                    IP_HDRINCL if matches!(self.proto, Proto::Raw(_)) => s.hdrincl = v != 0,
-                    IP_MTU_DISCOVER if (0..=5).contains(&v) => s.mtu_discover = v,
-                    IP_MTU_DISCOVER => return Err(Errno::EINVAL),
-                    IP_MULTICAST_TTL => {
-                        s.multicast_ttl = match v {
-                            -1 => 1,
-                            0..=255 => v,
-                            _ => return Err(Errno::EINVAL),
-                        };
-                    }
-                    IP_MULTICAST_LOOP => s.multicast_loop = v != 0,
-                    _ => return Err(Errno::ENOPROTOOPT),
-                }
-            }
+            IPPROTO_IP => self.set_option4(&mut s, name, value)?,
             IPPROTO_IPV6 if self.af() == AF_INET6 => self.set_option6(&mut s, name, value)?,
             IPPROTO_UDP if self.proto == Proto::Udp && name == UDP_CORK => {
                 s.cork = int_of(value)? != 0;
@@ -1503,10 +1730,15 @@ impl Socket for Dgram {
         self.release_port(&mut s);
         s.queue.clear();
         let groups = core::mem::take(&mut s.groups6);
+        let groups4 = core::mem::take(&mut s.groups4);
         drop(s);
-        // The socket leaves its groups, as `ipv6_sock_mc_close` of Linux.
+        // The socket leaves its groups, as `ipv6_sock_mc_close` and `ip_mc_drop_socket` of
+        // Linux.
         for (i, g) in &groups {
             crate::mcast6::leave(*i, g);
+        }
+        for m in &groups4 {
+            crate::igmp::leave(m.ifindex, m.group);
         }
         stack::remove_socket(self.ino);
     }

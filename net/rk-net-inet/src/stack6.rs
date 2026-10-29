@@ -279,7 +279,17 @@ pub(crate) fn route(dst: &Ip, oif: u32) -> Result<Next6> {
 
 /// Removes the neighbours of an interface, as `ndisc_ifdown` of Linux.
 pub(crate) fn flush_neigh(ifindex: u32) {
-    NEIGH6.lock().flush(ifindex);
+    NEIGH6.lock().flush(ifindex, now_ms());
+    neigh_notify();
+}
+
+/// Sends the changes of the neighbour table to `RTNLGRP_NEIGH`, as `neigh_update_notify` of
+/// Linux. The caller does not hold the lock of the table.
+fn neigh_notify() {
+    let changes = NEIGH6.lock().take_changes();
+    for c in changes {
+        crate::rtnl::notify_neigh(AF_INET6, c);
+    }
 }
 
 /// Adds or changes a neighbour of IPv6 for `RTM_NEWNEIGH`, as `neigh_add` of Linux, and sends
@@ -301,6 +311,7 @@ pub(crate) fn neigh_add(
         let waiting = t.add(key, mac, nud, now_ms(), flags)?;
         (waiting, t.lookup(key).unwrap_or(MacAddr::ZERO))
     };
+    neigh_notify();
     for mut packet in waiting {
         ether(dev, mac).push(&mut packet);
         let _ = dev.transmit(packet);
@@ -311,7 +322,9 @@ pub(crate) fn neigh_add(
 /// Removes a neighbour of IPv6 for `RTM_DELNEIGH`, as `neigh_delete` of Linux. Gives `false`
 /// if there is no entry.
 pub(crate) fn neigh_del(ifindex: u32, addr: &Ip) -> bool {
-    NEIGH6.lock().remove((ifindex, *addr))
+    let found = NEIGH6.lock().remove((ifindex, *addr), now_ms());
+    neigh_notify();
+    found
 }
 
 /// The neighbours of IPv6, as `neighbours` of `stack`.
@@ -358,6 +371,7 @@ pub(crate) fn output_ip(out: &Out6, oif: u32, payload: &[u8]) -> Result<()> {
                 ttl: out.hops,
                 tos: out.tclass,
                 df: out.dontfrag,
+                mc_loop: true,
             };
             stack::output(&next, &o, payload)
         }
@@ -690,6 +704,7 @@ pub(crate) fn stop_solicit(ifindex: u32) {
 /// Records the link address of a neighbour and sends the packets that waited for it.
 fn learn(dev: &NetDevice, addr: &Ip, mac: MacAddr, create: bool) {
     let waiting = NEIGH6.lock().update((dev.ifindex(), *addr), mac, now_ms(), create);
+    neigh_notify();
     for mut packet in waiting {
         ether(dev, mac).push(&mut packet);
         let _ = dev.transmit(packet);
@@ -1166,6 +1181,7 @@ pub(crate) fn tick() {
         let mut neigh = NEIGH6.lock();
         if neigh.is_empty() { Vec::new() } else { neigh.tick(now) }
     };
+    neigh_notify();
     for (ifindex, addr) in probes {
         if let Some(d) = dev::by_index(ifindex) {
             solicit(&d, &addr);

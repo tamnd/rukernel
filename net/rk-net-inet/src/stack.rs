@@ -13,12 +13,13 @@ use crate::ports::{self, Ports};
 use crate::socket::{Dgram, Proto};
 use crate::{checksum, frag, igmp, neigh, route};
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::{ETH_P_ARP, ETH_P_IP, ETH_P_IPV6};
+use rk_abi::native::rtnetlink::RT_SCOPE_LINK;
 use rk_abi::native::socket::SO_BINDTOIFINDEX;
 use rk_frame::sync::SpinLock;
 use rk_net::arp::ArpPacket;
@@ -369,9 +370,54 @@ pub(crate) fn route_oif(dst: Addr, oif: u32) -> Result<route::Next> {
     ROUTES.lock().lookup_route(dst, oif).map(|(n, _)| n)
 }
 
+/// The interface of the local address `a`, as `__ip_dev_find` of Linux.
+pub(crate) fn dev_of_addr(a: Addr) -> Option<u32> {
+    ROUTES.lock().addrs().iter().find(|x| x.local == a).map(|x| x.ifindex)
+}
+
+/// Finds the route of a multicast packet to `dst` from `src` through `oif`, as
+/// `ip_route_output_key_hash_rcu` of Linux. Without an interface, the interface of the source
+/// address sends the packet. A packet with an interface goes out on it without a route. A
+/// packet without an interface and a source address takes the route to `dst`.
+///
+/// # Errors
+///
+/// Gives `ENETUNREACH` for a source address that is not local or a group without a route, and
+/// `ENODEV` for an interface that is not there.
+pub(crate) fn route_mc(dst: Addr, oif: u32, src: Addr) -> Result<route::Next> {
+    let oif = match (oif, src) {
+        (0, ipv4::ANY) => return route_oif(dst, 0),
+        (0, s) => dev_of_addr(s).ok_or(Errno::ENETUNREACH)?,
+        (o, _) => o,
+    };
+    if dev::by_index(oif).is_none() {
+        return Err(Errno::ENODEV);
+    }
+    let src = if src == ipv4::ANY {
+        ROUTES.lock().select_addr(oif, ipv4::ANY, RT_SCOPE_LINK as u8).unwrap_or(ipv4::ANY)
+    } else {
+        src
+    };
+    Ok(route::Next { ifindex: oif, hop: dst, src, local: false, broadcast: false })
+}
+
 /// Removes the neighbours of an interface, as `arp_ifdown` of Linux.
 pub(crate) fn flush_neigh(ifindex: u32) {
-    NEIGH.lock().flush(ifindex);
+    NEIGH.lock().flush(ifindex, now_ms());
+    neigh_notify();
+}
+
+/// Sends the changes of the neighbour table to `RTNLGRP_NEIGH`, as `neigh_update_notify` of
+/// Linux. The caller does not hold the lock of the table.
+fn neigh_notify() {
+    let changes = NEIGH.lock().take_changes();
+    for c in changes {
+        let c = match c {
+            neigh::Change::New(n) => neigh::Change::New(n.map(ip::mapped)),
+            neigh::Change::Del(n) => neigh::Change::Del(n.map(ip::mapped)),
+        };
+        crate::rtnl::notify_neigh(AF_INET, c);
+    }
 }
 
 /// Adds or changes a neighbour for `RTM_NEWNEIGH` and `SIOCSARP`, as `neigh_add` of Linux,
@@ -393,6 +439,7 @@ pub(crate) fn neigh_add(
         let waiting = t.add(key, mac, nud, now_ms(), flags)?;
         (waiting, t.lookup(key).unwrap_or(MacAddr::ZERO))
     };
+    neigh_notify();
     for mut packet in waiting {
         EthHeader { dst: mac, src: dev.mac(), ethertype: ETH_P_IP as u16 }.push(&mut packet);
         let _ = dev.transmit(packet);
@@ -403,7 +450,9 @@ pub(crate) fn neigh_add(
 /// Removes a neighbour for `RTM_DELNEIGH` and `SIOCDARP`, as `neigh_delete` of Linux. Gives
 /// `false` if there is no entry.
 pub(crate) fn neigh_del(ifindex: u32, addr: Addr) -> bool {
-    NEIGH.lock().remove((ifindex, addr))
+    let found = NEIGH.lock().remove((ifindex, addr), now_ms());
+    neigh_notify();
+    found
 }
 
 /// The neighbours: the interface, the address, the hardware address if the entry is valid,
@@ -431,6 +480,9 @@ pub(crate) struct Out {
     pub tos: u8,
     /// The packet must not get fragments, as `IP_PMTUDISC_DO` of Linux.
     pub df: bool,
+    /// A packet to a multicast group of the device comes back to the host too, as
+    /// `IP_MULTICAST_LOOP` of Linux.
+    pub mc_loop: bool,
 }
 
 /// Sends a packet with the payload `payload` on the route `next`, as `ip_queue_xmit` of Linux.
@@ -449,6 +501,15 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
     header.id = IP_ID.fetch_add(1, Ordering::Relaxed);
     if out.protocol == PROTO_ICMP {
         count_icmp_out(payload);
+    }
+    if ipv4::is_multicast(out.dst) {
+        if out.mc_loop {
+            loop_back(&dev, &header, payload);
+        }
+        // A packet with the time to live 0 stays on the host, as `ip_mc_output` of Linux.
+        if out.ttl == 0 {
+            return Ok(());
+        }
     }
     if HLEN + payload.len() <= mtu {
         let mut buf = NetBuf::new(HEADROOM, HLEN + payload.len());
@@ -470,6 +531,35 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
     }
     count(&COUNTERS.ip_frag_oks);
     Ok(())
+}
+
+/// The multicast packets that the host sends to its own groups, with the device that sent
+/// them, as the queue of `dev_loopback_xmit` of Linux. The poll takes them as packets that came
+/// in on the device. The queue is not in the namespace, because the poll takes it for each
+/// namespace.
+static LOOPED: SpinLock<VecDeque<(Arc<NetDevice>, NetBuf)>> = SpinLock::new(VecDeque::new());
+
+/// Puts a copy of a multicast packet in `LOOPED` if the device `dev` is in the group, as
+/// `ip_mc_output` of Linux. The loopback device takes its own packets already.
+fn loop_back(dev: &Arc<NetDevice>, header: &Header, payload: &[u8]) {
+    if dev.kind() == LinkKind::Loopback || !igmp::joined(dev.ifindex(), header.dst) {
+        return;
+    }
+    let mut buf = NetBuf::new(HEADROOM, HLEN + payload.len());
+    buf.extend_from_slice(&header.to_bytes());
+    buf.extend_from_slice(payload);
+    LOOPED.lock().push_back((dev.clone(), buf));
+}
+
+/// Takes the packets of `LOOPED`. Gives their count.
+fn poll_looped() -> usize {
+    let looped: Vec<(Arc<NetDevice>, NetBuf)> = LOOPED.lock().drain(..).collect();
+    let n = looped.len();
+    for (d, frame) in looped {
+        let _in = rk_net::ns::enter_index(d.net());
+        ip_input(&d, frame);
+    }
+    n
 }
 
 /// Counts an ICMP message that goes out, as `icmp_out_count` of Linux.
@@ -572,6 +662,7 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
     if p.sender_ip != ipv4::ANY && !p.sender_mac.is_multicast() {
         let key = (dev.ifindex(), p.sender_ip);
         let waiting = NEIGH.lock().update(key, p.sender_mac, now_ms(), ours);
+        neigh_notify();
         for mut packet in waiting {
             EthHeader { dst: p.sender_mac, src: dev.mac(), ethertype: ETH_P_IP as u16 }
                 .push(&mut packet);
@@ -782,7 +873,7 @@ fn send_icmp(src: Addr, dst: Addr, tos: u8, msg: &[u8]) {
     let ttl = rk_net::sysctl::default_ttl();
     // A large reply goes out in fragments, as the socket of `icmp_reply` with
     // `IP_PMTUDISC_DONT`.
-    let out = Out { src, dst, protocol: PROTO_ICMP, ttl, tos, df: false };
+    let out = Out { src, dst, protocol: PROTO_ICMP, ttl, tos, df: false, mc_loop: false };
     // An ICMP message that the stack makes is not for a socket, and a lost one is not an error.
     let _ = output(&next, &out, msg);
 }
@@ -830,6 +921,9 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32) {
         return count(&COUNTERS.udp_in_errors);
     }
     let (dst, src) = (ip::mapped(h.dst), ip::mapped(h.src));
+    if broadcast {
+        return udp_mcast_input(h, &d[UDP_HLEN..], u.src, u.dst, dif);
+    }
     let found = find_socket(&UDP_PORTS, u.dst, dst, src, u.src, dif);
     let Some(sock) = found else {
         count(&COUNTERS.udp_no_ports);
@@ -842,6 +936,29 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32) {
         count(&COUNTERS.udp_in);
     } else {
         count(&COUNTERS.udp_rcvbuf_errors);
+    }
+}
+
+/// Gives a UDP datagram to a broadcast address or a multicast group to each socket that takes
+/// it, as `__udp4_lib_mcast_deliver` of Linux. A socket takes a datagram to a group if it is in
+/// the group on the device or if it has `IP_MULTICAST_ALL`, as `ip_mc_sf_allow`.
+fn udp_mcast_input(h: &Header, data: &[u8], sport: u16, dport: u16, dif: u32) {
+    let (dst, src) = (ip::mapped(h.dst), ip::mapped(h.src));
+    let found = UDP_PORTS.lock().find(dport, dst);
+    let socks: Vec<Arc<Dgram>> = found
+        .iter()
+        .filter_map(|b| socket(b.id))
+        .filter(|s| s.score(&src, sport, dif).is_some() && s.mc_allow(h.dst, dif))
+        .collect();
+    if socks.is_empty() {
+        return count(&COUNTERS.udp_no_ports);
+    }
+    for sock in socks {
+        if sock.deliver(src, 0, sport, data.to_vec(), None) {
+            count(&COUNTERS.udp_in);
+        } else {
+            count(&COUNTERS.udp_rcvbuf_errors);
+        }
     }
 }
 
@@ -914,6 +1031,7 @@ fn poll_locked() {
             let _in = rk_net::ns::enter_index(d.net());
             n += d.poll(BUDGET, &mut |d, frame| receive(d, frame));
         }
+        n += poll_looped();
         if n == 0 {
             break;
         }
@@ -942,6 +1060,7 @@ fn timers() {
         let mut neigh = NEIGH.lock();
         if neigh.is_empty() { Vec::new() } else { neigh.tick(now_ms()) }
     };
+    neigh_notify();
     for (ifindex, addr) in probes {
         if let Some(d) = dev::by_index(ifindex) {
             solicit(&d, addr);
