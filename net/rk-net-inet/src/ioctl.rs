@@ -9,6 +9,7 @@ use crate::neigh::Nud;
 use crate::route::{IfAddr, Match, RTAX_ADVMSS, RTAX_RTT, RTAX_WINDOW, Route};
 use crate::stack::ROUTES;
 use alloc::string::String;
+use alloc::sync::Arc;
 use rk_abi::Errno;
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
@@ -239,8 +240,9 @@ fn sockaddr_at(b: &[u8], at: usize) -> (u16, Addr) {
     (u16::from_ne_bytes([b[at], b[at + 1]]), [b[at + 4], b[at + 5], b[at + 6], b[at + 7]])
 }
 
-/// `SIOCSARP`, `SIOCDARP` and `SIOCGARP`, as `arp_ioctl` in net/ipv4/arp.c of Linux. The stack
-/// has no proxy ARP, thus `ATF_PUBL` gives `EOPNOTSUPP`.
+/// `SIOCSARP`, `SIOCDARP` and `SIOCGARP`, as `arp_ioctl` in net/ipv4/arp.c of Linux. `SIOCSARP`
+/// and `SIOCDARP` with `ATF_PUBL` change the proxy ARP: a proxy entry, or `proxy_arp` of the
+/// device with the netmask 0.
 fn arp_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
     if cmd != SIOCGARP && !net_admin() {
         return Err(Errno::EPERM);
@@ -272,8 +274,8 @@ fn arp_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
     } else if cmd == SIOCGARP {
         return Err(Errno::ENODEV);
     }
-    if flags & ATF_PUBL != 0 {
-        return Err(Errno::EOPNOTSUPP);
+    if flags & ATF_PUBL != 0 && cmd != SIOCGARP {
+        return arp_public(cmd, &r, flags, d);
     }
     // Without a device, the route to the address gives it, as `arp_req_dev_by_ip`.
     let d = match d {
@@ -328,6 +330,46 @@ fn arp_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
             r[52..52 + len].copy_from_slice(&dn.as_bytes()[..len]);
             mem.write(arg, &r).map_err(|_| Errno::EFAULT)
         }
+    }
+}
+
+/// `SIOCSARP` and `SIOCDARP` with `ATF_PUBL`, as `arp_req_set_public` and
+/// `arp_req_delete_public` in net/ipv4/arp.c of Linux. The netmask is `255.255.255.255`
+/// without `ATF_NETMASK`. That netmask adds or removes a proxy entry of the address on the
+/// device, or on each device without a device. The netmask 0 sets `proxy_arp` of the device,
+/// or of `all` without a device. Without a device, `ATF_COM` takes the device of the hardware
+/// address.
+fn arp_public(cmd: u32, r: &[u8], flags: u32, d: Option<Arc<NetDevice>>) -> Result<()> {
+    use rk_net::sysctl::{Family, Scope, set_conf};
+    let (_, ip) = sockaddr_at(r, 0);
+    let mask = if flags & ATF_NETMASK != 0 { sockaddr_at(r, 36).1 } else { ipv4::BROADCAST };
+    if mask != ipv4::ANY && mask != ipv4::BROADCAST {
+        return Err(Errno::EINVAL);
+    }
+    let d = match d {
+        None if cmd == SIOCSARP && flags & ATF_COM != 0 => {
+            let ha_family = u16::from_ne_bytes([r[16], r[17]]);
+            let mac = MacAddr(r[18..24].try_into().unwrap_or([0; 6]));
+            let found = dev::devices()
+                .into_iter()
+                .find(|x| x.kind().arphrd() == ha_family && x.mac() == mac);
+            Some(found.ok_or(Errno::ENODEV)?)
+        }
+        d => d,
+    };
+    let ifindex = d.as_ref().map_or(0, |d| d.ifindex());
+    if mask == ipv4::ANY {
+        // `arp_req_set_proxy`.
+        let scope = if ifindex == 0 { Scope::All } else { Scope::Dev(ifindex) };
+        return set_conf(Family::Ipv4, scope, "proxy_arp", i32::from(cmd == SIOCSARP));
+    }
+    if cmd == SIOCSARP {
+        crate::stack::pneigh_add(ip, ifindex, 0);
+        Ok(())
+    } else if crate::stack::pneigh_del(ip, ifindex) {
+        Ok(())
+    } else {
+        Err(Errno::ENOENT)
     }
 }
 

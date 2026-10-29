@@ -105,8 +105,12 @@ pub(crate) struct Counters6 {
     pub in_receives: AtomicU64,
     /// The packets with a bad header.
     pub in_hdr_errors: AtomicU64,
-    /// The packets to an address that is not local. The stack does not forward.
+    /// The packets to an address that is not local, when the host does not forward.
     pub in_addr_errors: AtomicU64,
+    /// The packets that the host forwarded, `Ip6OutForwDatagrams`.
+    pub out_forw_datagrams: AtomicU64,
+    /// The packets that were too large to forward, `Ip6InTooBigErrors`.
+    pub in_too_big_errors: AtomicU64,
     /// The packets of a protocol without a handler or a raw socket.
     pub in_unknown_protos: AtomicU64,
     /// The packets shorter than their payload length.
@@ -176,6 +180,8 @@ impl rk_net::ns::Clear for Counters6 {
         self.in_receives.store(0, Ordering::Relaxed);
         self.in_hdr_errors.store(0, Ordering::Relaxed);
         self.in_addr_errors.store(0, Ordering::Relaxed);
+        self.out_forw_datagrams.store(0, Ordering::Relaxed);
+        self.in_too_big_errors.store(0, Ordering::Relaxed);
         self.in_unknown_protos.store(0, Ordering::Relaxed);
         self.in_truncated.store(0, Ordering::Relaxed);
         self.in_delivers.store(0, Ordering::Relaxed);
@@ -223,6 +229,8 @@ fn new_counters6() -> Counters6 {
         in_receives: AtomicU64::new(0),
         in_hdr_errors: AtomicU64::new(0),
         in_addr_errors: AtomicU64::new(0),
+        out_forw_datagrams: AtomicU64::new(0),
+        in_too_big_errors: AtomicU64::new(0),
         in_unknown_protos: AtomicU64::new(0),
         in_truncated: AtomicU64::new(0),
         in_delivers: AtomicU64::new(0),
@@ -519,7 +527,7 @@ fn ether(dev: &NetDevice, dst: MacAddr) -> EthHeader {
 }
 
 /// Gives a packet to the link: the loopback device, a multicast group, or a neighbour.
-fn transmit(dev: &NetDevice, next: &Next6, mut buf: NetBuf) -> Result<()> {
+pub(crate) fn transmit(dev: &NetDevice, next: &Next6, mut buf: NetBuf) -> Result<()> {
     count(&COUNTERS6.out_transmits);
     add(&COUNTERS6.out_octets, buf.len());
     // A TUN device and a line device have no link header and no neighbours, as the loopback
@@ -711,11 +719,13 @@ fn learn(dev: &NetDevice, addr: &Ip, mac: MacAddr, create: bool) {
     }
 }
 
-/// Takes an IPv6 packet, as `ipv6_rcv` and `ip6_input` of Linux. The stack does not forward.
-/// The fragments go to `reassemble`.
-pub(crate) fn input(dev: &NetDevice, frame: NetBuf) {
+/// Takes an IPv6 packet, as `ipv6_rcv` and `ip6_input` of Linux. A packet for another host goes
+/// to `forward::forward6`. The fragments of a packet for the host go to `reassemble`. `host`
+/// tells that the frame came to the link address of the device, `PACKET_HOST` of Linux.
+pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
     count(&COUNTERS6.in_receives);
     add(&COUNTERS6.in_octets, frame.len());
+    let Some(frame) = crate::forward::forward6(dev, frame, host) else { return };
     let (h, mut frame) = match Header::parse(frame.data()) {
         Ok(h) => (h, frame),
         Err(Bad::Fragment) => {
@@ -829,9 +839,9 @@ fn rthdr_input(dev: &NetDevice, frame: &mut NetBuf, mut h: Header) -> Option<Hea
                     // `netif_rx` of the inner packet.
                     let inner = NetBuf::from_slice(&frame.data()[at + len..]);
                     if u32::from(next) == IPPROTO_IPV6 {
-                        input(dev, inner);
+                        input(dev, inner, false);
                     } else {
-                        stack::ip_input(dev, inner);
+                        stack::ip_input(dev, inner, false);
                     }
                     return None;
                 }
@@ -999,7 +1009,16 @@ pub(crate) fn icmp_error(h: &Header, ifindex: u32, packet: &[u8], kind: u8, code
     msg.extend_from_slice(&[kind, code, 0, 0]);
     msg.extend_from_slice(&info.to_be_bytes());
     msg.extend_from_slice(data);
-    send_icmp(&h.dst, &h.src, ifindex, msg);
+    // The error about a packet that the host forwards comes from an address of the host.
+    let src = if ROUTES6.lock().is_local(&h.dst) {
+        h.dst
+    } else {
+        match crate::forward::error_src6(&h.src, ifindex) {
+            Some(s) => s,
+            None => return count(&COUNTERS6.icmp_out_errors),
+        }
+    };
+    send_icmp(&src, &h.src, ifindex, msg);
 }
 
 /// Takes a neighbour solicitation, as `ndisc_recv_ns` of Linux: it learns the address of the

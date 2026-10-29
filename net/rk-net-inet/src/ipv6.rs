@@ -283,8 +283,8 @@ impl Header {
         }
     }
 
-    /// Reads the fixed header in `b`.
-    fn fixed(b: &[u8]) -> Option<Self> {
+    /// Reads the fixed header in `b`, without the extension headers.
+    pub fn fixed(b: &[u8]) -> Option<Self> {
         let b = b.get(..HLEN)?;
         if b[0] >> 4 != 6 {
             return None;

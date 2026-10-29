@@ -354,6 +354,18 @@ pub fn conf(f: Family, scope: Scope, name: &str) -> i32 {
     TABLES.lock().conf(scope).values(f)[at]
 }
 
+/// Sets a `conf` value of the current namespace, as a write of its file, for the kernel
+/// itself: `SIOCSARP` with `ATF_PUBL` sets `proxy_arp`, as `arp_req_set_proxy` of Linux.
+///
+/// # Errors
+///
+/// Gives `EINVAL` if no value has the name `name`.
+pub fn set_conf(f: Family, scope: Scope, name: &str, v: i32) -> Result<()> {
+    let at = f.params().iter().position(|p| p.name == name).ok_or(Errno::EINVAL)?;
+    conf_write(f, scope, f.params()[at].name, at, v);
+    Ok(())
+}
+
 /// Tells if IPv6 is off on the device `ifindex`, `net.ipv6.conf.DEV.disable_ipv6`.
 pub fn ipv6_disabled(ifindex: u32) -> bool {
     conf(Family::Ipv6, Scope::Dev(ifindex), "disable_ipv6") != 0

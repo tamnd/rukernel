@@ -229,3 +229,49 @@ impl UdpHeader {
         p
     }
 }
+
+/// Decreases the time to live of the header `h` by one and updates the checksum without a new
+/// sum, as `ip_decrease_ttl` in include/net/ip.h of Linux. The time to live must be at least 1.
+pub fn decrease_ttl(h: &mut [u8]) {
+    let check = u32::from(u16::from_be_bytes([h[10], h[11]])) + 0x0100;
+    let check = check + u32::from(check >= 0xffff);
+    h[10..12].copy_from_slice(&(check as u16).to_be_bytes());
+    h[8] = h[8].saturating_sub(1);
+}
+
+/// Writes the checksum of the header `h`, with its options.
+pub fn set_checksum(h: &mut [u8]) {
+    h[10..12].fill(0);
+    let sum = checksum::checksum(h);
+    h[10..12].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// The option that ends the list of options, `IPOPT_END`.
+const IPOPT_END: u8 = 0;
+/// The option that does nothing, `IPOPT_NOOP`.
+const IPOPT_NOOP: u8 = 1;
+/// The flag of an option that goes in each fragment, `IPOPT_COPY`.
+const IPOPT_COPY: u8 = 0x80;
+
+/// Replaces the options in `opts` that do not go in each fragment with `IPOPT_NOOP`, as
+/// `ip_options_fragment` in net/ipv4/ip_options.c of Linux. The fragments after the first one
+/// get these options.
+pub fn options_fragment(opts: &mut [u8]) {
+    let mut at = 0;
+    while at < opts.len() {
+        match opts[at] {
+            IPOPT_END => return,
+            IPOPT_NOOP => at += 1,
+            kind => {
+                let len = usize::from(opts.get(at + 1).copied().unwrap_or(0));
+                if len < 2 || at + len > opts.len() {
+                    return;
+                }
+                if kind & IPOPT_COPY == 0 {
+                    opts[at..at + len].fill(IPOPT_NOOP);
+                }
+                at += len;
+            }
+        }
+    }
+}

@@ -1903,9 +1903,68 @@ const NETNS_SCRIPT_SYSCTL: &[u8] = b"$N $A busybox ping6 -s 2048 -c 1 fd00::2 \
 && $N $A ip link add d0 type dummy && $N $A ip link show d0 && ! ip link show d0 \
 && echo 'netns: third'' part' || exit 1\n";
 
-/// The last line of the `netns` test. When the two processes end, the namespaces go, and the
-/// veth pair goes with them.
-const NETNS_SCRIPT3: &[u8] = b"kill $A $B; wait; sleep 1; ip link \
+/// The fourth line of the `netns` test: a third namespace R is a router between A and B, with the
+/// pairs fa-ra and fb-rb. A and B reach R, and their routes go through R. A answers pings again,
+/// after the third line.
+const NETNS_SCRIPT_ROUTER: &[u8] = b"{ busybox unshare -n sleep 1000 & } && R=$! && sleep 1 \
+&& ip link add fa type veth && ip link set veth0 name ra && ip link set fa netns $A \
+&& ip link set ra netns $R && ip link add fb type veth && ip link set veth0 name rb \
+&& ip link set fb netns $B && ip link set rb netns $R && $N $R ip link set lo up \
+&& $N $R ip link set ra up && $N $R ip link set rb up && $N $A ip link set fa up \
+&& $N $B ip link set fb up && $N $R ip addr add 10.10.1.254/24 dev ra \
+&& $N $R ip addr add 10.10.2.254/24 dev rb && $N $A ip addr add 10.10.1.1/24 dev fa \
+&& $N $B ip addr add 10.10.2.1/24 dev fb && $N $B ip addr add 10.10.2.2/24 dev fb \
+&& $N $A ip route add default via 10.10.1.254 && $N $B ip route add default via 10.10.2.254 \
+&& $N $A sh -c 'echo 0 > /proc/sys/net/ipv4/icmp_echo_ignore_all' \
+&& $N $A ping -c 1 10.10.1.254 && $N $B ping -c 1 10.10.2.254 \
+&& echo 'netns: router'' part' || exit 1\n";
+
+/// The fifth line of the `netns` test: IPv4 forwarding. A ping from A to B fails while R does
+/// not forward and passes when it forwards. The time to live 1 gives an ICMP time exceeded
+/// message. A smaller MTU after R gives an ICMP "fragmentation needed" message for a packet with
+/// the flag "do not fragment", and R makes smaller fragments of the fragments of a large ping.
+const NETNS_SCRIPT_FORWARD: &[u8] = b"! $N $A ping -c 1 -W 1 10.10.2.1 \
+&& $N $R sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward' \
+&& $N $R grep -q 1 /proc/sys/net/ipv4/conf/rb/forwarding \
+&& $N $A ping -c 1 10.10.2.1 && $N $B ping -c 1 10.10.1.1 \
+&& ! $N $A ping -c 1 -W 1 -t 1 10.10.2.1 && $N $A grep -q InType11 /proc/net/snmp \
+&& $N $R ip link set rb mtu 1280 && ! $N $A ping -c 1 -W 1 -s 1400 10.10.2.1 \
+&& $N $A grep -q InType3 /proc/net/snmp && $N $A ping -c 1 -s 3000 10.10.2.1 \
+&& $N $R cat /proc/net/snmp && $N $R sh -c 'echo 0 > /proc/sys/net/ipv4/ip_forward' \
+&& ! $N $A ping -c 1 -W 1 10.10.2.1 && echo 'netns: forward'' part' || exit 1\n";
+
+/// The sixth line of the `netns` test: IPv6 forwarding through R with
+/// `net.ipv6.conf.all.forwarding`.
+const NETNS_SCRIPT_FORWARD6: &[u8] = b"$N $R ip -6 addr add fd01::fe/64 dev ra \
+&& $N $R ip -6 addr add fd02::fe/64 dev rb && $N $A ip -6 addr add fd01::1/64 dev fa \
+&& $N $B ip -6 addr add fd02::1/64 dev fb && $N $A ip -6 route add default via fd01::fe \
+&& $N $B ip -6 route add default via fd02::fe \
+&& { for i in 1 2 3 4 5; do $N $R ip -6 addr | grep -q tentative || break; sleep 1; done; } \
+&& { for i in 1 2 3 4 5; do $N $A ip -6 addr | grep -q tentative || break; sleep 1; done; } \
+&& { for i in 1 2 3 4 5; do $N $B ip -6 addr | grep -q tentative || break; sleep 1; done; } \
+&& $N $A busybox ping6 -c 1 fd01::fe && ! $N $A busybox ping6 -c 1 -W 1 fd02::1 \
+&& $N $R sh -c 'echo 1 > /proc/sys/net/ipv6/conf/all/forwarding' \
+&& $N $A busybox ping6 -c 1 fd02::1 \
+&& $N $R grep -q 'Ip6OutForwDatagrams[[:space:]]*[1-9]' /proc/net/snmp6 \
+&& echo 'netns: forward6'' part' || exit 1\n";
+
+/// The seventh line of the `netns` test: proxy ARP. A has a /16 address without a route, so it asks
+/// for B with ARP. R answers when `proxy_arp` of ra is on, and with a proxy entry that
+/// `arp ... pub` adds. /proc/net/arp of R shows the entry.
+const NETNS_SCRIPT_PROXY: &[u8] = b"$N $R sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward' \
+&& $N $A ip route del default && $N $A ip addr del 10.10.1.1/24 dev fa \
+&& $N $A ip addr add 10.10.1.1/16 dev fa && ! $N $A ping -c 1 -W 1 10.10.2.1 \
+&& $N $R sh -c 'echo 1 > /proc/sys/net/ipv4/conf/ra/proxy_arp' \
+&& $N $A ping -c 2 -W 5 10.10.2.1 && $N $A ip neigh \
+&& $N $R sh -c 'echo 0 > /proc/sys/net/ipv4/conf/ra/proxy_arp' \
+&& $N $R busybox arp -i ra -Ds 10.10.2.2 ra pub && $N $R cat /proc/net/arp \
+&& $N $R grep -q '^10.10.2.2 .* 0xc .* ra$' /proc/net/arp && $N $A ping -c 2 -W 5 10.10.2.2 \
+&& $N $R busybox arp -i ra -d 10.10.2.2 pub && ! $N $R grep -q '^10.10.2.2 .* 0xc ' /proc/net/arp \
+&& echo 'netns: proxy'' part' || exit 1\n";
+
+/// The last line of the `netns` test. When the three processes end, the namespaces go, and the
+/// veth pairs go with them.
+const NETNS_SCRIPT3: &[u8] = b"kill $A $B $R; wait; sleep 1; ip link \
 && ! ip link | grep -q veth && test \"$(ip link | grep -c mtu)\" = 1 && exit 0; exit 1\n";
 
 /// The input of a boot test. When the log has the text of an entry, the test writes the bytes of
@@ -1927,7 +1986,11 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("/ # ", NETNS_SCRIPT),
             ("netns: first part", NETNS_SCRIPT2),
             ("netns: second part", NETNS_SCRIPT_SYSCTL),
-            ("netns: third part", NETNS_SCRIPT3),
+            ("netns: third part", NETNS_SCRIPT_ROUTER),
+            ("netns: router part", NETNS_SCRIPT_FORWARD),
+            ("netns: forward part", NETNS_SCRIPT_FORWARD6),
+            ("netns: forward6 part", NETNS_SCRIPT_PROXY),
+            ("netns: proxy part", NETNS_SCRIPT3),
         ],
         "inet6" => &[
             ("/ # ", INET6_SCRIPT),

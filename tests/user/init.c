@@ -6680,6 +6680,69 @@ static int nl_neigh(int fd, int type, int flags, int index, unsigned long addr,
 	return nl_talk(fd, &m.h);
 }
 
+/* Sends RTM_NEWNEIGH or RTM_DELNEIGH with NTF_PROXY for the IPv4 address `addr` on the
+ * interface `index` on the rtnetlink socket fd, as `ip neigh add proxy`. Gives the error of the
+ * ack. */
+static int nl_pneigh(int fd, int type, int index, unsigned long addr)
+{
+	union {
+		struct nlmsghdr h;
+		char buf[256];
+	} m = { 0 };
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	m.h.nlmsg_type = type;
+	m.h.nlmsg_flags = type == RTM_NEWNEIGH ? NLM_F_CREATE : 0;
+	struct ndmsg *nd = NLMSG_DATA(&m.h);
+	nd->ndm_family = AF_INET;
+	nd->ndm_ifindex = index;
+	nd->ndm_flags = NTF_PROXY;
+	unsigned int a = htonl(addr);
+	nl_put(&m.h, NDA_DST, &a, 4);
+	return nl_talk(fd, &m.h);
+}
+
+/* Dumps the proxy entries with RTM_GETNEIGH and NTF_PROXY on the rtnetlink socket fd, as
+ * pneigh_dump_table in net/core/neighbour.c. Gives 1 if the dump has the IPv4 address `addr` on
+ * the interface `index` with NTF_PROXY and NUD_NONE. */
+static int nl_pneigh_dumped(int fd, int index, unsigned long addr)
+{
+	union {
+		struct nlmsghdr h;
+		char buf[64];
+	} m = { 0 };
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	m.h.nlmsg_type = RTM_GETNEIGH;
+	m.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	struct ndmsg *q = NLMSG_DATA(&m.h);
+	q->ndm_family = AF_INET;
+	q->ndm_flags = NTF_PROXY;
+	if (send(fd, &m, m.h.nlmsg_len, 0) != (long)m.h.nlmsg_len)
+		return 0;
+	static char buf[8192];
+	unsigned int a = htonl(addr);
+	int found = 0;
+	for (;;) {
+		long n = recv(fd, buf, sizeof(buf), 0);
+		if (n <= 0)
+			return 0;
+		for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, n);
+		     h = NLMSG_NEXT(h, n)) {
+			if (h->nlmsg_type == NLMSG_DONE || h->nlmsg_type == NLMSG_ERROR)
+				return found;
+			struct ndmsg *nd = NLMSG_DATA(h);
+			if (!(nd->ndm_flags & NTF_PROXY) || nd->ndm_state != NUD_NONE ||
+			    nd->ndm_ifindex != index)
+				continue;
+			int len = h->nlmsg_len - NLMSG_LENGTH(sizeof(*nd));
+			for (struct rtattr *r = (struct rtattr *)((char *)nd + NLMSG_ALIGN(sizeof(*nd)));
+			     RTA_OK(r, len); r = RTA_NEXT(r, len))
+				if (r->rta_type == NDA_DST && RTA_PAYLOAD(r) == 4 &&
+				    memcmp(RTA_DATA(r), &a, 4) == 0)
+					found = 1;
+		}
+	}
+}
+
 /* Gives 1 if the file `path` has the text `want`. */
 static int file_has(const char *path, const char *want)
 {
@@ -6926,6 +6989,21 @@ static void veth_checks(int nl, int index)
 	      nl_neigh(nl, RTM_DELNEIGH, 0, index, 0x0a4d0009, NULL) == -ENOENT);
 	check("RTM_NEWNEIGH without NLM_F_CREATE of a new entry gives ENOENT",
 	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_REPLACE, index, 0x0a4d0009, mac9) == -ENOENT);
+
+	/* ip neigh add proxy and del proxy, as pneigh_create and pneigh_delete in
+	 * net/core/neighbour.c. */
+	check("RTM_NEWNEIGH with NTF_PROXY adds a proxy entry that the NTF_PROXY dump shows",
+	      nl_pneigh(nl, RTM_NEWNEIGH, index, 0x0a4d0021) == 0 &&
+		      nl_pneigh_dumped(nl, index, 0x0a4d0021));
+	check("RTM_NEWNEIGH with NTF_PROXY of an entry that is there gives 0",
+	      nl_pneigh(nl, RTM_NEWNEIGH, index, 0x0a4d0021) == 0);
+	check("/proc/net/arp shows the proxy entry with ATF_PUBL and ATF_PERM",
+	      arp_has("10.77.0.33", "0xc", "00:00:00:00:00:00"));
+	check("RTM_DELNEIGH with NTF_PROXY removes the proxy entry",
+	      nl_pneigh(nl, RTM_DELNEIGH, index, 0x0a4d0021) == 0 &&
+		      !nl_pneigh_dumped(nl, index, 0x0a4d0021));
+	check("RTM_DELNEIGH with NTF_PROXY of an entry that is not there gives ENOENT",
+	      nl_pneigh(nl, RTM_DELNEIGH, index, 0x0a4d0021) == -ENOENT);
 
 	/* arp -s and arp -d, as arp_ioctl in net/ipv4/arp.c. */
 	int s = socket(AF_INET, SOCK_DGRAM, 0);

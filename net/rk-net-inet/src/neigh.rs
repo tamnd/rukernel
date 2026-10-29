@@ -447,3 +447,132 @@ impl<P, A: Copy + Ord> Table<P, A> {
         self.entries.is_empty()
     }
 }
+
+/// An entry of the proxy table, for a dump of `RTM_GETNEIGH` with `NTF_PROXY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProxyInfo<A = Addr> {
+    /// The address.
+    pub addr: A,
+    /// The interface index, or 0 for an entry of each interface.
+    pub ifindex: u32,
+    /// The flags `NTF_*` of the request that made the entry.
+    pub flags: u8,
+}
+
+impl<A> ProxyInfo<A> {
+    /// The entry with the address that `f` gives.
+    pub fn map<B>(self, f: impl FnOnce(A) -> B) -> ProxyInfo<B> {
+        ProxyInfo { addr: f(self.addr), ifindex: self.ifindex, flags: self.flags }
+    }
+}
+
+/// The proxy entries of a neighbour table, as `struct pneigh_entry` and `pneigh_lookup`,
+/// `pneigh_create` and `pneigh_delete` in net/core/neighbour.c of Linux. The host answers the
+/// requests for the address of an entry with its own link address. An entry with the
+/// interface 0 is for each interface.
+pub struct Proxy<A = Addr> {
+    entries: BTreeMap<(A, u32), u8>,
+}
+
+impl<A: Copy + Ord> Default for Proxy<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: Copy + Ord> Proxy<A> {
+    /// An empty table.
+    pub const fn new() -> Self {
+        Self { entries: BTreeMap::new() }
+    }
+
+    /// Adds the entry of `addr` on `ifindex`, or sets the flags of the entry that is there, as
+    /// `pneigh_create` of Linux.
+    pub fn add(&mut self, addr: A, ifindex: u32, flags: u8) {
+        self.entries.insert((addr, ifindex), flags);
+    }
+
+    /// Removes the entry of `addr` on `ifindex`, as `pneigh_delete` of Linux. Gives `false` if
+    /// there is no entry. The interface must be the same, 0 included.
+    pub fn remove(&mut self, addr: A, ifindex: u32) -> bool {
+        self.entries.remove(&(addr, ifindex)).is_some()
+    }
+
+    /// Tells if an entry of `addr` is for `ifindex`: an entry on the interface or an entry for
+    /// each interface, as `pneigh_lookup` of Linux.
+    pub fn lookup(&self, addr: A, ifindex: u32) -> bool {
+        self.entries.contains_key(&(addr, ifindex)) || self.entries.contains_key(&(addr, 0))
+    }
+
+    /// Removes the entries of an interface, as `pneigh_ifdown` of Linux.
+    pub fn flush(&mut self, ifindex: u32) {
+        self.entries.retain(|k, _| k.1 != ifindex);
+    }
+
+    /// The entries, by address and interface.
+    pub fn entries(&self) -> Vec<ProxyInfo<A>> {
+        self.entries
+            .iter()
+            .map(|(&(addr, ifindex), &flags)| ProxyInfo { addr, ifindex, flags })
+            .collect()
+    }
+
+    /// Tells if the table has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The time between two redirects to one host at the start, in milliseconds, as
+/// `ip_rt_redirect_load` of Linux (`HZ / 50`). The time doubles after each redirect.
+pub const REDIRECT_LOAD_MS: u64 = 20;
+/// The most redirects to one host without a pause, `ip_rt_redirect_number` of Linux.
+pub const REDIRECT_NUMBER: u32 = 9;
+/// The pause after which the count of redirects to a host starts again,
+/// `ip_rt_redirect_silence` of Linux.
+pub const REDIRECT_SILENCE_MS: u64 = REDIRECT_LOAD_MS << (REDIRECT_NUMBER + 1);
+/// The most hosts in the redirect table. A full table starts again empty.
+const REDIRECT_HOSTS: usize = 1024;
+
+/// The limit of the ICMP redirects to each host, as the `n_redirects` and `rate_last` fields of
+/// `struct inet_peer` and `ip_rt_send_redirect` in net/ipv4/route.c of Linux.
+pub struct Redirects<A = Addr> {
+    peers: BTreeMap<A, (u32, Option<u64>)>,
+}
+
+impl<A: Copy + Ord> Default for Redirects<A> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: Copy + Ord> Redirects<A> {
+    /// An empty table.
+    pub const fn new() -> Self {
+        Self { peers: BTreeMap::new() }
+    }
+
+    /// Tells if the host can send a redirect to `host` at the time `now`, and records it. The
+    /// first redirect goes at once, and each next one waits two times longer. After
+    /// `REDIRECT_NUMBER` redirects, the host sends no more until the host gets no redirect for
+    /// `REDIRECT_SILENCE_MS`.
+    pub fn allow(&mut self, host: A, now: u64) -> bool {
+        if self.peers.len() >= REDIRECT_HOSTS && !self.peers.contains_key(&host) {
+            self.peers.clear();
+        }
+        let (n, last) = self.peers.entry(host).or_insert((0, None));
+        if last.is_none_or(|l| now > l + REDIRECT_SILENCE_MS) {
+            *n = 0;
+        }
+        if *n >= REDIRECT_NUMBER {
+            *last = Some(now);
+            return false;
+        }
+        if *n == 0 || last.is_some_and(|l| now > l + (REDIRECT_LOAD_MS << *n)) {
+            *last = Some(now);
+            *n += 1;
+            return true;
+        }
+        false
+    }
+}
