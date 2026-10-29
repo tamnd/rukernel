@@ -60,6 +60,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <net/if.h>
+#include <net/if_arp.h>
 #include <netpacket/packet.h>
 #include <linux/rtnetlink.h>
 #include <time.h>
@@ -5130,6 +5131,10 @@ static void veth_peer(int in, int out)
 	if (read(in, &c, 1) != 1)
 		_exit(1);
 	c = if_nametoindex("rkvb") > 0 && if_up_addr("rkvb", 0x0a4d0002) == 0;
+	/* Answer a ping to a multicast group, as net.ipv4.icmp_echo_ignore_broadcasts. */
+	int sysctl = open("/proc/sys/net/ipv4/icmp_echo_ignore_broadcasts", O_WRONLY);
+	c &= sysctl >= 0 && write(sysctl, "0\n", 2) == 2;
+	close(sysctl);
 	int u = socket(AF_INET, SOCK_DGRAM, 0);
 	struct sockaddr_in me = inet_addr4(0, 7777);
 	c &= bind(u, (struct sockaddr *)&me, sizeof(me)) == 0;
@@ -5150,6 +5155,227 @@ static void veth_peer(int in, int out)
 	c = if_nametoindex("rkvb") == 0;
 	write(out, &c, 1);
 	_exit(0);
+}
+
+#ifndef SO_BINDTOIFINDEX
+#define SO_BINDTOIFINDEX 62
+#endif
+
+/* Sends an echo request with `size` bytes of data and the sequence `seq` to dst on the raw
+ * ICMP socket fd, and waits at most ms milliseconds for the reply. Gives 0 if the reply came
+ * with all of the data, 1 if no reply came, or the error of sendto as a negative errno. */
+static int ping_size(int fd, unsigned long dst, int size, int seq, int ms)
+{
+	static unsigned char req[8 + 8192], buf[60 + 8 + 8192];
+	memset(req, 0, 8);
+	req[0] = 8;
+	req[4] = 0x45;
+	req[5] = 0x67;
+	req[6] = seq >> 8;
+	req[7] = seq;
+	for (int i = 0; i < size; i++)
+		req[8 + i] = i * 7;
+	unsigned short sum = inet_sum(req, 8 + size);
+	memcpy(req + 2, &sum, 2);
+	struct sockaddr_in to = inet_addr4(dst, 0), from;
+	if (sendto(fd, req, 8 + size, 0, (struct sockaddr *)&to, sizeof(to)) != 8 + size)
+		return -errno;
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	while (elapsed_us(&t0) < ms * 1000L) {
+		long n = recv_wait(fd, buf, sizeof(buf), &from, 100);
+		if (n < 20)
+			continue;
+		int hl = (buf[0] & 0xf) * 4;
+		if (n == hl + 8 + size && buf[hl] == 0 && memcmp(buf + hl + 4, req + 4, 4) == 0 &&
+		    memcmp(buf + hl + 8, req + 8, size) == 0)
+			return 0;
+	}
+	return 1;
+}
+
+/* Gives 1 if /proc/net/arp has a line for the address `ip` with the flags `flags` and the
+ * hardware address `mac`, as arp_seq_show in net/ipv4/arp.c of Linux. */
+static int arp_has(const char *ip, const char *flags, const char *mac)
+{
+	static char text[4096];
+	if (read_file("/proc/net/arp", text, sizeof(text)) < 0)
+		return 0;
+	int len = strlen(ip);
+	for (char *l = text; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL) {
+		char line[256];
+		snprintf(line, sizeof(line), "%.*s", (int)strcspn(l, "\n"), l);
+		if (strncmp(line, ip, len) == 0 && line[len] == ' ')
+			return strstr(line, flags) && strstr(line, mac);
+	}
+	return 0;
+}
+
+/* Sends RTM_NEWNEIGH or RTM_DELNEIGH for the IPv4 address `addr` on the interface `index` on
+ * the rtnetlink socket fd, as `ip neigh`. A null mac sends no NDA_LLADDR. Gives the error of
+ * the ack. */
+static int nl_neigh(int fd, int type, int flags, int index, unsigned long addr,
+		    const unsigned char *mac)
+{
+	union {
+		struct nlmsghdr h;
+		char buf[256];
+	} m = { 0 };
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	m.h.nlmsg_type = type;
+	m.h.nlmsg_flags = flags;
+	struct ndmsg *nd = NLMSG_DATA(&m.h);
+	nd->ndm_family = AF_INET;
+	nd->ndm_ifindex = index;
+	nd->ndm_state = NUD_PERMANENT;
+	unsigned int a = htonl(addr);
+	nl_put(&m.h, NDA_DST, &a, 4);
+	if (mac)
+		nl_put(&m.h, NDA_LLADDR, mac, 6);
+	return nl_talk(fd, &m.h);
+}
+
+/* Gives 1 if the file `path` has the text `want`. */
+static int file_has(const char *path, const char *want)
+{
+	static char text[8192];
+	return read_file(path, text, sizeof(text)) >= 0 && strstr(text, want) != NULL;
+}
+
+/* The checks of SO_BINDTODEVICE, large pings, multicast and the neighbour table over the veth
+ * pair. rkva has 10.77.0.1/24 and the peer has 10.77.0.2/24. */
+static void veth_checks(int nl, int index)
+{
+	/* ping -s 2048 and ping -s 4064: the packets go in fragments, as ip_do_fragment in
+	 * net/ipv4/ip_output.c of Linux, and the other end puts them together again, as
+	 * net/ipv4/ip_fragment.c. */
+	int icmp = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	check("ping -s 2048 crosses the pair in fragments",
+	      ping_size(icmp, 0x0a4d0002, 2048, 1, 3000) == 0);
+	check("ping -s 4064 crosses the pair in fragments",
+	      ping_size(icmp, 0x0a4d0002, 4064, 2, 3000) == 0);
+	int pmtu = IP_PMTUDISC_DO;
+	check("with IP_PMTUDISC_DO a packet larger than the MTU gives EMSGSIZE",
+	      setsockopt(icmp, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu)) == 0 &&
+		      ping_size(icmp, 0x0a4d0002, 2048, 3, 100) == -EMSGSIZE);
+	pmtu = IP_PMTUDISC_DONT;
+	setsockopt(icmp, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof(pmtu));
+
+	/* SO_BINDTODEVICE and SO_BINDTOIFINDEX, as sock_bindtoindex in net/core/sock.c. */
+	int bound = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	char name[IFNAMSIZ];
+	socklen_t len = sizeof(name);
+	check("a socket without a device gives an empty name for SO_BINDTODEVICE",
+	      getsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, name, &len) == 0 && len == 0);
+	check("SO_BINDTODEVICE of a device that is not there gives ENODEV",
+	      setsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, "rkno", 5) == -1 && errno == ENODEV);
+	check("SO_BINDTODEVICE binds a socket to lo",
+	      setsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3) == 0);
+	len = sizeof(name);
+	check("getsockopt of SO_BINDTODEVICE gives lo",
+	      getsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, name, &len) == 0 && len == 3 &&
+		      strcmp(name, "lo") == 0);
+	int ifi = 0;
+	len = sizeof(ifi);
+	check("getsockopt of SO_BINDTOIFINDEX gives the index of lo",
+	      getsockopt(bound, SOL_SOCKET, SO_BINDTOIFINDEX, &ifi, &len) == 0 &&
+		      ifi == (int)if_nametoindex("lo"));
+	unsigned char buf[256];
+	struct sockaddr_in from;
+	while (recv_wait(bound, buf, sizeof(buf), &from, 0) >= 0)
+		;
+	check("a socket bound to lo does not get the reply that came in on rkva",
+	      ping_size(icmp, 0x0a4d0002, 56, 4, 2000) == 0 &&
+		      recv_wait(bound, buf, sizeof(buf), &from, 300) < 0);
+	check("SO_BINDTOIFINDEX binds the socket to rkva",
+	      setsockopt(bound, SOL_SOCKET, SO_BINDTOIFINDEX, &index, sizeof(index)) == 0);
+	check("a socket bound to rkva sends on rkva and gets the reply",
+	      ping_size(bound, 0x0a4d0002, 56, 5, 2000) == 0);
+	pid_t p = fork();
+	if (p == 0) {
+		int ok = syscall(SYS_setresuid, 1000, 1000, 1000) == 0;
+		int u = socket(AF_INET, SOCK_DGRAM, 0);
+		ok &= setsockopt(u, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3) == 0;
+		ok &= setsockopt(u, SOL_SOCKET, SO_BINDTODEVICE, "rkva", 5) == -1 && errno == EPERM;
+		ok &= setsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, "", 0) == -1 && errno == EPERM;
+		_exit(ok ? 0 : 1);
+	}
+	int status;
+	check("without CAP_NET_RAW a socket binds once, and a change gives EPERM",
+	      waitpid(p, &status, 0) == p && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+	/* The devices that are up are in 224.0.0.1, as ip_mc_up in net/ipv4/igmp.c, and the peer
+	 * answers a ping to the group when icmp_echo_ignore_broadcasts is 0. */
+	check("a ping to 224.0.0.1 on rkva gets a reply from the peer",
+	      ping_size(bound, 0xe0000001, 56, 6, 2000) == 0);
+	len = sizeof(name);
+	check("an empty name for SO_BINDTODEVICE removes the device",
+	      setsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, "", 0) == 0 &&
+		      getsockopt(bound, SOL_SOCKET, SO_BINDTODEVICE, name, &len) == 0 && len == 0);
+	close(bound);
+	close(icmp);
+	check("/proc/net/igmp shows 224.0.0.1 on rkva",
+	      file_has("/proc/net/igmp", "rkva") && file_has("/proc/net/igmp", "010000E0"));
+	check("/proc/net/igmp6 shows ff02::1 on rkva",
+	      file_has("/proc/net/igmp6", "rkva") &&
+		      file_has("/proc/net/igmp6", "ff020000000000000000000000000001"));
+	check("/proc/net/dev_mcast shows 01:00:5e:00:00:01 on rkva",
+	      file_has("/proc/net/dev_mcast", "01005e000001"));
+
+	/* ip maddr add and del, as dev_mc_add_global in net/core/dev_addr_lists.c. */
+	int ms = socket(AF_INET, SOCK_DGRAM, 0);
+	struct ifreq mr = { 0 };
+	strcpy(mr.ifr_name, "rkva");
+	memcpy(mr.ifr_hwaddr.sa_data, "\x66\x66\0\0\0\x66", 6);
+	check("SIOCADDMULTI adds a static link address that /proc/net/dev_mcast shows",
+	      ioctl(ms, SIOCADDMULTI, &mr) == 0 && file_has("/proc/net/dev_mcast", "666600000066"));
+	check("SIOCDELMULTI removes the address",
+	      ioctl(ms, SIOCDELMULTI, &mr) == 0 && !file_has("/proc/net/dev_mcast", "666600000066"));
+	check("SIOCDELMULTI of an address that is not there gives ENOENT",
+	      ioctl(ms, SIOCDELMULTI, &mr) == -1 && errno == ENOENT);
+	close(ms);
+
+	/* ip neigh add, replace and del, as neigh_add and neigh_delete in net/core/neighbour.c. */
+	unsigned char mac9[6] = { 2, 0, 0, 0, 0, 9 }, mac10[6] = { 2, 0, 0, 0, 0, 0x10 };
+	check("RTM_NEWNEIGH adds a permanent entry",
+	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, index, 0x0a4d0009, mac9) == 0 &&
+		      arp_has("10.77.0.9", "0x6", "02:00:00:00:00:09"));
+	check("RTM_NEWNEIGH with NLM_F_EXCL of an entry that is there gives EEXIST",
+	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_EXCL, index, 0x0a4d0009, mac9) ==
+		      -EEXIST);
+	check("RTM_NEWNEIGH with NLM_F_REPLACE changes the address",
+	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_REPLACE, index, 0x0a4d0009, mac10) == 0 &&
+		      arp_has("10.77.0.9", "0x6", "02:00:00:00:00:10"));
+	check("RTM_DELNEIGH removes the entry",
+	      nl_neigh(nl, RTM_DELNEIGH, 0, index, 0x0a4d0009, NULL) == 0 &&
+		      !arp_has("10.77.0.9", "0x", ":"));
+	check("RTM_DELNEIGH of an entry that is not there gives ENOENT",
+	      nl_neigh(nl, RTM_DELNEIGH, 0, index, 0x0a4d0009, NULL) == -ENOENT);
+	check("RTM_NEWNEIGH without NLM_F_CREATE of a new entry gives ENOENT",
+	      nl_neigh(nl, RTM_NEWNEIGH, NLM_F_REPLACE, index, 0x0a4d0009, mac9) == -ENOENT);
+
+	/* arp -s and arp -d, as arp_ioctl in net/ipv4/arp.c. */
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct arpreq r = { 0 };
+	struct sockaddr_in pa = inet_addr4(0x0a4d000b, 0);
+	memcpy(&r.arp_pa, &pa, sizeof(pa));
+	r.arp_ha.sa_family = ARPHRD_ETHER;
+	memcpy(r.arp_ha.sa_data, "\x02\0\0\0\0\x0b", 6);
+	r.arp_flags = ATF_PERM | ATF_COM;
+	strcpy(r.arp_dev, "rkva");
+	check("SIOCSARP adds a permanent entry",
+	      ioctl(s, SIOCSARP, &r) == 0 && arp_has("10.77.0.11", "0x6", "02:00:00:00:00:0b"));
+	memset(&r.arp_ha, 0, sizeof(r.arp_ha));
+	r.arp_flags = 0;
+	check("SIOCGARP gives the address and the flags of the entry",
+	      ioctl(s, SIOCGARP, &r) == 0 && (r.arp_flags & ATF_PERM) &&
+		      memcmp(r.arp_ha.sa_data, "\x02\0\0\0\0\x0b", 6) == 0);
+	check("SIOCDARP removes the entry", ioctl(s, SIOCDARP, &r) == 0 &&
+	      !arp_has("10.77.0.11", "0x", ":"));
+	check("SIOCGARP and SIOCDARP of an entry that is not there give ENXIO",
+	      ioctl(s, SIOCGARP, &r) == -1 && errno == ENXIO && ioctl(s, SIOCDARP, &r) == -1 &&
+		      errno == ENXIO);
+	close(s);
 }
 
 /* The checks of test_veth, in a child with its own network and mount namespaces. */
@@ -5229,6 +5455,7 @@ static int veth_child(void)
 	      n == 6 && memcmp(buf, "rkback", 6) == 0);
 	check("the peer got the datagram from 10.77.0.1", read(done[0], &c, 1) == 1 && c);
 	close(u);
+	veth_checks(nl, index);
 
 	char text[4096];
 	int fd = open("/proc/net/dev", O_RDONLY);

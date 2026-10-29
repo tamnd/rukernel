@@ -178,8 +178,67 @@ pub enum Bad {
     Header,
     /// The payload length is not in the frame.
     Length,
-    /// The packet is a fragment. There is no reassembly.
+    /// The packet is a fragment. `Frag::find` gives its fragment header.
     Fragment,
+}
+
+/// The fragment header of a packet, `struct frag_hdr` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frag {
+    /// The offset of the fragment header in the packet. The headers before it are the part
+    /// that is not fragmented.
+    pub at: usize,
+    /// The offset of the field that names the fragment header.
+    pub nh: usize,
+    /// The next header after the fragment header.
+    pub next: u8,
+    /// The offset of the data of the fragment in the packet, in bytes.
+    pub offset: usize,
+    /// The flag "more fragments".
+    pub more: bool,
+    /// The identification.
+    pub id: u32,
+}
+
+/// The length of a fragment header.
+pub const FRAG_HLEN: usize = 8;
+
+impl Frag {
+    /// Finds the fragment header of `packet` after the extension headers before it, as
+    /// `ipv6_frag_rcv` in net/ipv6/reassembly.c of Linux. `packet` ends at the end of the
+    /// payload.
+    pub fn find(packet: &[u8]) -> Option<Self> {
+        let (mut next, mut at, mut nh) = (*packet.get(6)?, HLEN, 6);
+        while matches!(next, NEXT_HOPOPTS | NEXT_ROUTING | NEXT_DSTOPTS) {
+            let e = packet.get(at..at + 2)?;
+            next = e[0];
+            nh = at;
+            at += (usize::from(e[1]) + 1) * 8;
+        }
+        if next != NEXT_FRAGMENT {
+            return None;
+        }
+        let f = packet.get(at..at + FRAG_HLEN)?;
+        let off = u16::from_be_bytes([f[2], f[3]]);
+        Some(Self {
+            at,
+            nh,
+            next: f[0],
+            offset: usize::from(off & !7),
+            more: off & 1 != 0,
+            id: u32::from_be_bytes([f[4], f[5], f[6], f[7]]),
+        })
+    }
+
+    /// The bytes of a fragment header, as `ip6_frag_next` of Linux.
+    pub fn to_bytes(&self) -> [u8; FRAG_HLEN] {
+        let mut b = [0u8; FRAG_HLEN];
+        b[0] = self.next;
+        let off = (self.offset as u16 & !7) | u16::from(self.more);
+        b[2..4].copy_from_slice(&off.to_be_bytes());
+        b[4..8].copy_from_slice(&self.id.to_be_bytes());
+        b
+    }
 }
 
 /// An IPv6 header, with the extension headers that the host skips.
@@ -268,7 +327,7 @@ impl Header {
         Ok(h)
     }
 
-    /// Skips the extension headers, as `ipv6_skip_exthdr` of Linux. A fragment gives
+    /// Skips the extension headers, as `ipv6_skip_exthdr` of Linux. A fragment header gives
     /// `Bad::Fragment`.
     fn skip_extensions(&mut self, packet: &[u8]) -> Result<(), Bad> {
         let (mut next, mut at, mut nh) = (self.next, HLEN, 6);

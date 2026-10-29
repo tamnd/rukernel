@@ -174,6 +174,14 @@ pub const ARPHRD_CAN: u16 = 280;
 /// The flag of an ARP entry with a known hardware address, `ATF_COM` of linux/if_arp.h, for
 /// /proc/net/arp. The value is written by hand, as the values of `ARPHRD_*`.
 pub const ATF_COM: u32 = 0x02;
+/// The flag of a permanent ARP entry, `ATF_PERM` of linux/if_arp.h.
+pub const ATF_PERM: u32 = 0x04;
+/// The flag of a published ARP entry for proxy ARP, `ATF_PUBL` of linux/if_arp.h.
+pub const ATF_PUBL: u32 = 0x08;
+/// The flag of an ARP request with a netmask, `ATF_NETMASK` of linux/if_arp.h.
+pub const ATF_NETMASK: u32 = 0x20;
+/// The flag of an ARP entry that is not published, `ATF_DONTPUB` of linux/if_arp.h.
+pub const ATF_DONTPUB: u32 = 0x40;
 
 /// The ARP operations: a request.
 pub const ARPOP_REQUEST: u16 = 1;

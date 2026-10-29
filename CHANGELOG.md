@@ -9,6 +9,12 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `inet` boot test makes a veth pair with RTM_NEWLINK and `VETH_INFO_PEER`, with the peer in another network namespace. It checks `IFLA_LINK`, the carrier, /proc/net/dev and /sys/class/net, sends a UDP datagram across the pair, and deletes the pair (#454).
 - Each queue of a virtio-pci device gets its own MSI-X vector, and the configuration gets one more, as `vp_find_vqs_msix` of Linux (#450). This works on arm64 through the GICv3 ITS, with an event ID for each vector, and on x86-64. If the function does not have enough vectors, the device uses one shared vector, and then its INTx pin.
 - The PCI scan on arm64 assigns the I/O BARs from the I/O window of the host and opens the I/O window of each bridge over the I/O BARs behind it, as `pbus_size_io` and `pci_setup_bridge_io` of Linux (#450). A driver can map an I/O BAR with `map_io_bar`. The arm64 boot test `blk` with INTx behind a `pcie-root-port` uses a transitional device and reads its legacy registers through the I/O BAR.
+- `SO_BINDTODEVICE` and `SO_BINDTOIFINDEX` for TCP, UDP, ping and raw sockets of IPv4 and IPv6, with getsockopt, as `sock_bindtoindex` in net/core/sock.c of Linux. A bound socket takes only the packets of its device and sends on it. An empty name removes the device. A change of the device needs `CAP_NET_RAW` (#458).
+- `RTM_DELNEIGH`, and `NLM_F_CREATE`, `NLM_F_EXCL` and `NLM_F_REPLACE` for `RTM_NEWNEIGH`, with the `NUD_PERMANENT`, `NUD_NOARP`, `NUD_REACHABLE` and `NUD_STALE` states, as `neigh_add` and `neigh_delete` in net/core/neighbour.c. `ip neigh add`, `ip neigh replace` and `ip neigh del` work (#458).
+- The `SIOCSARP`, `SIOCGARP` and `SIOCDARP` ioctls, as `arp_ioctl` in net/ipv4/arp.c, for `arp -s` and `arp -d`. /proc/net/arp gives the flags 0x6 for a permanent entry (#458).
+- /proc/net/igmp, /proc/net/igmp6 and /proc/net/dev_mcast in the format of Linux, for `ip maddr show`. `SIOCADDMULTI` and `SIOCDELMULTI` keep a list of link addresses for each device, as `dev_mc_add_global` of Linux, so `ip maddr add` and `ip maddr del` work (#458).
+- A device that goes up joins 224.0.0.1, as `ip_mc_up` in net/ipv4/igmp.c. It answers a ping to the group when `net.ipv4.icmp_echo_ignore_broadcasts` is 0 (#458).
+- The `inet` boot test checks large pings, `IP_PMTUDISC_DO`, `SO_BINDTODEVICE`, a ping to 224.0.0.1, the multicast files, `RTM_NEWNEIGH`, `RTM_DELNEIGH` and the ARP ioctls over the veth pair. The `netns` test sends large pings with IPv4 and IPv6 (#458).
 
 ### Fixed
 
@@ -16,6 +22,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - /sys/class/net/NAME/iflink of a veth device gives the index of the other end, as `veth_get_iflink` of Linux (#454).
 - `populated` of `cgroup.events` changes at once on the path from the cgroup up to the first cgroup whose value does not change, as `cgroup_update_populated` of Linux (#446). Before, the exit of the last task of a cgroup made `refresh_events` go over each cgroup. In the init boot test, the stop of 100 processes, each in its own leaf of a tree of 1110 cgroups, takes 1070 ms, not 7508 ms. A read of a cgroup file counts the dying cgroups only for `cgroup.stat`.
 - tools/ltp/run.py gives cgroup_fj_stress_memory_10_3_each a limit of 600 s, and runs memcontrol03 and memcontrol04 each in their own boot, so the cgroups that they leave do not change the later tests (#446). tools/ltp/notes.txt gives the cause of the `EBUSY` and the segfault in the cleanup of memcontrol04.
+- IPv4 and IPv6 packets that are larger than the MTU go in fragments, as `ip_do_fragment` in net/ipv4/ip_output.c and `ip6_fragment` in net/ipv6/ip6_output.c, and the fragments that come in are put together again, as net/ipv4/ip_fragment.c and net/ipv6/reassembly.c. Before, `ping -s 2048` and `ping -s 4064` over a veth pair failed. `IP_PMTUDISC_DO`, `IP_PMTUDISC_PROBE` and `IPV6_DONTFRAG` still give `EMSGSIZE` (#458).
 
 ## [0.4.11] - 2026-10-29
 

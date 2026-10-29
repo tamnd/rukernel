@@ -100,10 +100,13 @@ fn with_frag(frag: u16) -> Vec<u8> {
 }
 
 #[test]
-fn fragments_are_dropped() {
+fn fragments_are_valid_headers() {
     assert!(Header::parse(&with_frag(DF)).is_ok());
-    assert_eq!(Header::parse(&with_frag(MF)), Err(Bad::Fragment));
-    assert_eq!(Header::parse(&with_frag(185)), Err(Bad::Fragment));
+    assert!(!Header::parse(&with_frag(DF)).unwrap().is_fragment());
+    assert!(Header::parse(&with_frag(MF)).unwrap().is_fragment());
+    let h = Header::parse(&with_frag(185)).unwrap();
+    assert!(h.is_fragment());
+    assert_eq!(h.frag_offset(), 185 * 8);
 }
 
 #[test]
@@ -1016,4 +1019,129 @@ fn optimistic_addresses_are_sources_after_the_preferred_ones() {
     t.insert_addr(Addr6::new(2, preferred, 64)).unwrap();
     assert_eq!(t.select_src(&dst, 2), Some(preferred));
     assert_eq!(t.select_src_strict(&dst, 2), Some(preferred));
+}
+
+#[test]
+fn reassembly_in_order_and_out_of_order() {
+    use crate::frag::{Add, Reasm};
+    let data: Vec<u8> = (0..40u8).collect();
+    let mut r: Reasm<u32> = Reasm::new();
+    assert_eq!(r.add(1, 0, true, b"head", &data[..16], 0), Add::Wait);
+    assert_eq!(r.add(1, 16, true, b"x", &data[16..32], 0), Add::Wait);
+    assert_eq!(
+        r.add(1, 32, false, b"x", &data[32..], 0),
+        Add::Done(b"head".to_vec(), data.clone())
+    );
+    assert!(r.is_empty());
+    // The last part first, and the first part last.
+    assert_eq!(r.add(2, 32, false, b"x", &data[32..], 0), Add::Wait);
+    assert_eq!(r.add(2, 16, true, b"x", &data[16..32], 0), Add::Wait);
+    assert_eq!(r.len(), 1);
+    assert_eq!(r.add(2, 0, true, b"h", &data[..16], 0), Add::Done(b"h".to_vec(), data));
+    assert!(r.is_empty());
+}
+
+#[test]
+fn reassembly_drops_overlaps_and_bad_parts() {
+    use crate::frag::{Add, Reasm};
+    let data = [7u8; 32];
+    let mut r: Reasm<u32> = Reasm::new();
+    assert_eq!(r.add(1, 0, true, b"h", &data[..16], 0), Add::Wait);
+    // A copy of a part is not an overlap.
+    assert_eq!(r.add(1, 0, true, b"h", &data[..16], 0), Add::Wait);
+    // A part that overlaps drops the queue, as RFC 5722.
+    assert_eq!(r.add(1, 8, true, b"h", &data[..16], 0), Add::Fail);
+    assert!(r.is_empty());
+    // A part that is not the last must have a length that is a multiple of 8.
+    assert_eq!(r.add(2, 0, true, b"h", &data[..10], 0), Add::Fail);
+    // A part after the end is not correct.
+    assert_eq!(r.add(3, 8, false, b"h", &data[..8], 0), Add::Wait);
+    assert_eq!(r.add(3, 16, true, b"h", &data[..8], 0), Add::Fail);
+    // The data cannot be larger than 65535 bytes.
+    assert_eq!(r.add(4, 65528, false, b"h", &data[..16], 0), Add::Fail);
+    assert!(r.is_empty());
+}
+
+#[test]
+fn reassembly_expires() {
+    use crate::frag::{Add, Reasm, TIMEOUT_MS};
+    let mut r: Reasm<u32> = Reasm::new();
+    assert_eq!(r.add(1, 0, true, b"h", &[0; 8], 100), Add::Wait);
+    assert_eq!(r.expire(100 + TIMEOUT_MS - 1), 0);
+    assert_eq!(r.expire(100 + TIMEOUT_MS), 1);
+    assert!(r.is_empty());
+}
+
+#[test]
+fn fragment_split() {
+    use crate::frag::split;
+    // 1500 - 20 gives parts of 1480 bytes.
+    assert_eq!(split(4072, 1480), vec![(0, 1480), (1480, 1480), (2960, 1112)]);
+    // A room that is not a multiple of 8 goes down to one.
+    assert_eq!(split(20, 13), vec![(0, 8), (8, 8), (16, 4)]);
+    assert_eq!(split(0, 1480), vec![(0, 0)]);
+}
+
+#[test]
+fn ipv6_fragment_header() {
+    use crate::ipv6::{FRAG_HLEN, Frag, HLEN, NEXT_FRAGMENT};
+    let f = Frag { at: HLEN, nh: 6, next: 58, offset: 1448, more: true, id: 0x1234_5678 };
+    let mut pkt = vec![0u8; HLEN];
+    pkt[0] = 0x60;
+    pkt[6] = NEXT_FRAGMENT;
+    pkt.extend_from_slice(&f.to_bytes());
+    pkt.extend_from_slice(&[0; 16]);
+    assert_eq!(Frag::find(&pkt), Some(f));
+    assert_eq!(f.to_bytes().len(), FRAG_HLEN);
+    // A packet without a fragment header gives nothing.
+    pkt[6] = 58;
+    assert_eq!(Frag::find(&pkt), None);
+}
+
+#[test]
+fn neighbour_admin_entries() {
+    use neigh::Nud;
+    let mac = MacAddr([2, 0, 0, 0, 0, 1]);
+    let other = MacAddr([2, 0, 0, 0, 0, 2]);
+    let key = (2, [10, 0, 0, 5]);
+    let mut t: neigh::Table<u32> = neigh::Table::new();
+    // A new entry needs NLM_F_CREATE.
+    assert_eq!(t.add(key, Some(mac), Nud::Permanent, 0, 0), Err(Errno::ENOENT));
+    assert_eq!(t.add(key, Some(mac), Nud::Permanent, 0, NLM_F_CREATE | NLM_F_EXCL), Ok(vec![]));
+    assert_eq!(
+        t.add(key, Some(mac), Nud::Permanent, 0, NLM_F_CREATE | NLM_F_EXCL),
+        Err(Errno::EEXIST)
+    );
+    // ARP does not change a permanent entry.
+    t.update(key, other, 1, true);
+    assert_eq!(t.lookup(key), Some(mac));
+    assert_eq!(t.entries(2)[0].state, Nud::Permanent);
+    // Without NLM_F_REPLACE the old address stays.
+    assert_eq!(t.add(key, Some(other), Nud::Permanent, 3, NLM_F_CREATE), Ok(vec![]));
+    assert_eq!(t.lookup(key), Some(mac));
+    assert_eq!(t.add(key, Some(other), Nud::Stale, 3, NLM_F_CREATE | NLM_F_REPLACE), Ok(vec![]));
+    assert_eq!(t.lookup(key), Some(other));
+    assert_eq!(t.entries(4)[0].state, Nud::Stale);
+    // A permanent entry does not go away by itself.
+    t.add(key, None, Nud::Permanent, 5, NLM_F_REPLACE).unwrap();
+    t.tick(5 + neigh::GC_MS * 10);
+    assert!(t.contains(key));
+    assert!(t.remove(key));
+    assert!(!t.remove(key));
+    // An entry without an address is not valid.
+    assert_eq!(t.add(key, None, Nud::Reachable, 6, NLM_F_CREATE), Err(Errno::EINVAL));
+}
+
+#[test]
+fn neighbour_admin_entry_sends_the_queue() {
+    use neigh::Nud;
+    let key = (2, [10, 0, 0, 6]);
+    let mut t: neigh::Table<u32> = neigh::Table::new();
+    assert_eq!(t.resolve(key, 0, 7), Resolve::Wait { probe: true });
+    let mac = MacAddr([2, 0, 0, 0, 0, 3]);
+    assert_eq!(t.add(key, Some(mac), Nud::Reachable, 1, NLM_F_CREATE | NLM_F_REPLACE), Ok(vec![7]));
+    assert!(t.remove(key));
+    assert_eq!(t.resolve(key, 2, 8), Resolve::Wait { probe: true });
+    assert!(t.remove(key));
+    assert_eq!(t.dropped, 1);
 }

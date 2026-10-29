@@ -112,6 +112,11 @@ pub(crate) fn joined(ifindex: u32, addr: &Ip) -> bool {
     GROUPS.lock().iter().any(|g| g.ifindex == ifindex && g.addr == *addr)
 }
 
+/// The groups that sockets joined on the interface `ifindex`, with the count of their users.
+pub(crate) fn groups(ifindex: u32) -> Vec<(Ip, u32)> {
+    GROUPS.lock().iter().filter(|g| g.ifindex == ifindex).map(|g| (g.addr, g.users)).collect()
+}
+
 /// The groups of the interface `ifindex` that get reports: the solicited node groups of its
 /// addresses and the groups of the sockets, each one time.
 fn groups_of(ifindex: u32) -> Vec<Ip> {

@@ -7,6 +7,7 @@
 
 use crate::consts::AF_UNSPEC;
 use crate::dev::{self, LinkKind, NetDevice};
+use crate::ether::MacAddr;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -42,6 +43,11 @@ pub fn is_socket_cmd(cmd: u32) -> bool {
 /// Tells if the current process has `CAP_NET_ADMIN`.
 pub fn net_admin() -> bool {
     cred::current().capable(cap::NET_ADMIN)
+}
+
+/// Tells if the current process has `CAP_NET_RAW`.
+pub fn net_raw() -> bool {
+    cred::current().capable(cap::NET_RAW)
 }
 
 /// A `struct ifreq` in kernel memory.
@@ -123,6 +129,13 @@ impl IfReq {
     /// The family of the `struct sockaddr` of the union.
     pub fn family(&self) -> u16 {
         u16::from_ne_bytes([self.buf[16], self.buf[17]])
+    }
+
+    /// The first six bytes of `sa_data` of the `struct sockaddr` of the union, `ifr_hwaddr`.
+    pub fn hwaddr(&self) -> [u8; 6] {
+        let mut a = [0; 6];
+        a.copy_from_slice(&self.buf[DATA + 2..DATA + 8]);
+        a
     }
 
     /// The IPv4 address of the `struct sockaddr_in` of the union.
@@ -322,11 +335,18 @@ fn set(d: &NetDevice, cmd: u32, r: &IfReq) -> Result<()> {
         }
         SIOCADDMULTI | SIOCDELMULTI => {
             // The loopback device has no receive filter. The Ethernet devices take all of the
-            // multicast frames, so the list of addresses has no effect.
+            // multicast frames. The list is for /proc/net/dev_mcast and `ip maddr`, as
+            // `dev_ifsioc` in net/core/dev_ioctl.c of Linux.
             if d.kind() == LinkKind::Loopback || u32::from(r.family()) != AF_UNSPEC {
                 return Err(Errno::EINVAL);
             }
-            Ok(())
+            let addr = MacAddr(r.hwaddr());
+            if cmd == SIOCADDMULTI {
+                d.mc_add(addr);
+                Ok(())
+            } else {
+                d.mc_del(addr)
+            }
         }
         // The drivers cannot change the hardware address and have no MII registers, time
         // stamps, configuration or bonding, as drivers without the operations in Linux.

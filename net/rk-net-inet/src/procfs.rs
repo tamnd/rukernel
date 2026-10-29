@@ -21,7 +21,9 @@ use rk_abi::native::rtnetlink::{
     RT_TABLE_MAIN, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_PROHIBIT,
     RTN_UNREACHABLE,
 };
-use rk_net::consts::{AF_INET, AF_INET6, ATF_COM, RTF_GATEWAY, RTF_HOST, RTF_REJECT, RTF_UP};
+use rk_net::consts::{
+    AF_INET, AF_INET6, ATF_COM, ATF_PERM, RTF_GATEWAY, RTF_HOST, RTF_REJECT, RTF_UP,
+};
 use rk_net::dev;
 use rk_net::ether::MacAddr;
 
@@ -42,6 +44,9 @@ pub(crate) fn init() {
     rk_net::procfs::register("udp6", show_udp6);
     rk_net::procfs::register("raw6", show_raw6);
     rk_net::procfs::register("icmp6", show_icmp6);
+    rk_net::procfs::register("igmp", crate::igmp::show_igmp);
+    rk_net::procfs::register("igmp6", crate::igmp::show_igmp6);
+    rk_net::procfs::register("dev_mcast", crate::igmp::show_dev_mcast);
 }
 
 /// The text of a pointer of `%pK`, as Linux shows it with `kernel.kptr_restrict`.
@@ -388,13 +393,13 @@ pub(crate) fn show_snmp6() -> String {
         ("OutRequests", c(&k.out_requests)),
         ("OutDiscards", 0),
         ("OutNoRoutes", c(&k.out_no_routes)),
-        ("ReasmTimeout", 0),
-        ("ReasmReqds", 0),
-        ("ReasmOKs", 0),
+        ("ReasmTimeout", c(&k.reasm_timeout)),
+        ("ReasmReqds", c(&k.reasm_reqds)),
+        ("ReasmOKs", c(&k.reasm_oks)),
         ("ReasmFails", c(&k.reasm_fails)),
-        ("FragOKs", 0),
+        ("FragOKs", c(&k.frag_oks)),
         ("FragFails", 0),
-        ("FragCreates", 0),
+        ("FragCreates", c(&k.frag_creates)),
         ("InMcastPkts", c(&k.in_mcast)),
         ("OutMcastPkts", c(&k.out_mcast)),
         ("InOctets", c(&k.in_octets)),
@@ -521,7 +526,12 @@ pub(crate) fn show_arp() -> String {
         let Some(d) = dev::by_index(n.ifindex) else { continue };
         let [a, b, c, e] = n.addr;
         let ip = format!("{a}.{b}.{c}.{e}");
-        let flags = if n.state == Nud::Incomplete { 0 } else { ATF_COM };
+        // The flags of `arp_state_to_flags` in net/ipv4/arp.c of Linux.
+        let flags = match n.state {
+            Nud::Incomplete => 0,
+            Nud::Permanent => ATF_PERM | ATF_COM,
+            _ => ATF_COM,
+        };
         let mac = format!("{}", n.mac.unwrap_or(MacAddr::ZERO));
         out.push_str(&format!(
             "{ip:<16} 0x{:<10x}0x{flags:<10x}{mac:<17}     {:<8} {}\n",
@@ -760,13 +770,13 @@ pub(crate) fn show_snmp() -> String {
             ("OutRequests", c(&k.ip_out)),
             ("OutDiscards", 0),
             ("OutNoRoutes", 0),
-            ("ReasmTimeout", 0),
-            ("ReasmReqds", 0),
-            ("ReasmOKs", 0),
+            ("ReasmTimeout", c(&k.ip_reasm_timeout)),
+            ("ReasmReqds", c(&k.ip_reasm_reqds)),
+            ("ReasmOKs", c(&k.ip_reasm_oks)),
             ("ReasmFails", c(&k.ip_reasm_fails)),
-            ("FragOKs", 0),
+            ("FragOKs", c(&k.ip_frag_oks)),
             ("FragFails", 0),
-            ("FragCreates", 0),
+            ("FragCreates", c(&k.ip_frag_creates)),
             ("OutTransmits", c(&k.ip_out)),
         ],
     );
