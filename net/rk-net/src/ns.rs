@@ -536,6 +536,19 @@ impl Socket for NsSocket {
         self.inner.set_option(level, name, value)
     }
 
+    fn option_input(&self, level: u32, name: u32) -> usize {
+        self.inner.option_input(level, name)
+    }
+
+    fn get_option_in(&self, level: u32, name: u32, input: &[u8]) -> Result<Vec<u8>> {
+        let _in = enter(&self.net);
+        self.inner.get_option_in(level, name, input)
+    }
+
+    fn mmap(&self, offset: u64, len: usize) -> Result<crate::SocketMap> {
+        self.inner.mmap(offset, len)
+    }
+
     fn poll(&self) -> u32 {
         let _in = enter(&self.net);
         self.inner.poll()

@@ -219,16 +219,3 @@ fn a_packet_socket_sees_its_device_go_down() {
     let msg = Message { data: alloc::vec![0; HLEN], ..Message::default() };
     assert_eq!(p.send(&NoPaths, msg, 0, true).err(), Some(Errno::ENXIO));
 }
-
-/// `PACKET_VERSION` takes `TPACKET_V1` only, because there are no mapped rings.
-#[test]
-fn a_packet_socket_takes_only_the_first_ring_version() {
-    use crate::Socket;
-    use crate::packet::{PacketSocket, SOL_PACKET};
-
-    let p = PacketSocket::new(crate::consts::SOCK_RAW, 0).unwrap();
-    assert_eq!(p.set_option(SOL_PACKET, 10, &0i32.to_ne_bytes()), Ok(()));
-    assert_eq!(p.set_option(SOL_PACKET, 10, &2i32.to_ne_bytes()), Err(Errno::EINVAL));
-    assert_eq!(p.set_option(SOL_PACKET, 10, &[0u8; 2]), Err(Errno::EINVAL));
-    assert_eq!(p.get_option(SOL_PACKET, 10), Ok(0i32.to_ne_bytes().to_vec()));
-}

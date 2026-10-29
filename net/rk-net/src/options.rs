@@ -23,7 +23,7 @@ const MIN_SNDBUF: u32 = 4608;
 const MIN_RCVBUF: u32 = 2304;
 
 /// The ticks of the timer each second, for the timeouts.
-fn hz() -> u64 {
+pub(crate) fn hz() -> u64 {
     #[cfg(target_os = "none")]
     {
         rk_frame::time::HZ

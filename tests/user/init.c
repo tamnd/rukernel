@@ -5624,6 +5624,141 @@ static void test_packet_lo(void)
 	close(p);
 }
 
+/* The mapped rings of <linux/if_packet.h>. The musl headers do not have them. */
+#define RK_PACKET_RX_RING 5
+#define RK_PACKET_STATISTICS 6
+#define RK_PACKET_VERSION 10
+#define RK_PACKET_HDRLEN 11
+#define RK_TPACKET_V2 1
+#define RK_TPACKET_V3 2
+#define RK_TP_STATUS_USER 1
+
+struct rk_tpacket_req3 {
+	unsigned int block_size, block_nr, frame_size, frame_nr;
+	unsigned int retire_blk_tov, sizeof_priv, feature_req_word;
+};
+
+/* Sends "rkring" to the discard port on lo. */
+static void packet_ring_send(void)
+{
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in to = inet_addr4(INADDR_LOOPBACK, 9);
+	sendto(u, "rkring", 6, 0, (struct sockaddr *)&to, sizeof(to));
+	close(u);
+}
+
+/* Tells if the frame at mac has the datagram of packet_ring_send after an Ethernet, an IPv4
+ * and a UDP header. */
+static int packet_ring_has(const unsigned char *mac, unsigned int snaplen)
+{
+	return snaplen == 14 + 20 + 8 + 6 && memcmp(mac + 42, "rkring", 6) == 0;
+}
+
+/* Opens a packet socket on lo with a receive ring of version, as af_packet.c of Linux. */
+static int packet_ring_open(int version, struct rk_tpacket_req3 *req, unsigned char **ring)
+{
+	int p = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(RK_ETH_P_ALL));
+	if (p < 0)
+		return -1;
+	int ok = setsockopt(p, SOL_PACKET, RK_PACKET_VERSION, &version, sizeof(version)) == 0;
+	socklen_t rl = version == RK_TPACKET_V3 ? sizeof(*req) : 16;
+	ok = ok && setsockopt(p, SOL_PACKET, RK_PACKET_RX_RING, req, rl) == 0;
+	struct sockaddr_ll ll = { .sll_family = AF_PACKET, .sll_protocol = htons(RK_ETH_P_ALL),
+				  .sll_ifindex = if_nametoindex("lo") };
+	ok = ok && bind(p, (struct sockaddr *)&ll, sizeof(ll)) == 0;
+	size_t size = (size_t)req->block_size * req->block_nr;
+	*ring = ok ? mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, p, 0) : MAP_FAILED;
+	if (*ring == MAP_FAILED) {
+		close(p);
+		return -1;
+	}
+	return p;
+}
+
+/* A TPACKET_V2 and a TPACKET_V3 receive ring on lo get a datagram through the mapping. */
+static void test_packet_ring(void)
+{
+	int v = RK_TPACKET_V3;
+	socklen_t vl = sizeof(v);
+	int s = socket(AF_PACKET, SOCK_RAW, 0);
+	check("PACKET_HDRLEN gives 48 for TPACKET_V3",
+	      getsockopt(s, SOL_PACKET, RK_PACKET_HDRLEN, &v, &vl) == 0 && v == 48);
+	close(s);
+
+	struct rk_tpacket_req3 req = { 4096, 1, 2048, 2, 0, 0, 0 };
+	unsigned char *ring;
+	int p = packet_ring_open(RK_TPACKET_V2, &req, &ring);
+	check("a TPACKET_V2 receive ring maps", p >= 0);
+	if (p >= 0) {
+		packet_ring_send();
+		int found = 0;
+		for (int i = 0; i < 4 && !found; i++) {
+			struct pollfd pf = { .fd = p, .events = POLLIN };
+			if (poll(&pf, 1, 1000) != 1)
+				break;
+			for (int f = 0; f < 2; f++) {
+				unsigned char *h = ring + f * 2048;
+				unsigned int status, snaplen;
+				unsigned short mac;
+				memcpy(&status, h, 4);
+				memcpy(&snaplen, h + 8, 4);
+				memcpy(&mac, h + 12, 2);
+				if (!(status & RK_TP_STATUS_USER))
+					continue;
+				found |= packet_ring_has(h + mac, snaplen);
+				/* Gives the frame back to the kernel. */
+				__atomic_store_n((unsigned int *)h, 0, __ATOMIC_RELEASE);
+			}
+		}
+		check("a TPACKET_V2 ring gets the datagram on lo", found);
+		struct { unsigned int packets, drops; } st;
+		socklen_t sl = sizeof(st);
+		check("PACKET_STATISTICS counts the frames of the ring",
+		      getsockopt(p, SOL_PACKET, RK_PACKET_STATISTICS, &st, &sl) == 0 && sl == 8 &&
+			      st.packets >= 1);
+		munmap(ring, 4096);
+		close(p);
+	}
+
+	struct rk_tpacket_req3 req3 = { 4096, 2, 2048, 4, 10, 0, 0 };
+	p = packet_ring_open(RK_TPACKET_V3, &req3, &ring);
+	check("a TPACKET_V3 receive ring maps", p >= 0);
+	if (p < 0)
+		return;
+	packet_ring_send();
+	int found = 0, blocks = 0;
+	for (int i = 0; i < 4 && !found; i++) {
+		struct pollfd pf = { .fd = p, .events = POLLIN };
+		if (poll(&pf, 1, 1000) != 1)
+			break;
+		for (int b = 0; b < 2; b++) {
+			unsigned char *blk = ring + b * 4096;
+			unsigned int status, count, first;
+			memcpy(&status, blk + 8, 4);
+			memcpy(&count, blk + 12, 4);
+			memcpy(&first, blk + 16, 4);
+			if (!(status & RK_TP_STATUS_USER))
+				continue;
+			blocks++;
+			unsigned char *h = blk + first;
+			for (unsigned int k = 0; k < count; k++) {
+				unsigned int next, snaplen;
+				unsigned short mac;
+				memcpy(&next, h, 4);
+				memcpy(&snaplen, h + 12, 4);
+				memcpy(&mac, h + 24, 2);
+				found |= packet_ring_has(h + mac, snaplen);
+				h += next;
+			}
+			__atomic_store_n((unsigned int *)(blk + 8), 0, __ATOMIC_RELEASE);
+		}
+	}
+	printf("init: inet: packet ring: %d blocks of TPACKET_V3\n", blocks);
+	check("a TPACKET_V3 block on lo gets the datagram after the timeout", found);
+	munmap(ring, 8192);
+	close(p);
+}
+
 /* Makes a TUN device, sends a datagram through it, and writes an echo request into it. The
  * stack must send the echo reply back to the TUN file. */
 static void test_tun(void)
@@ -6578,6 +6713,7 @@ static void test_inet(int port)
 	test_inet_dns();
 	test_inet_lo();
 	test_packet_lo();
+	test_packet_ring();
 	test_tun();
 	test_tun_mq();
 	test_tun6();

@@ -371,6 +371,25 @@ impl MmFile for SharedWrite {
     }
 }
 
+/// The pages of a mapping of a socket, as the mapped rings of a packet socket.
+struct SocketPages {
+    map: rk_net::SocketMap,
+    dev: u64,
+    ino: u64,
+}
+
+impl MmFile for SocketPages {
+    fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
+        let index = usize::try_from(index).map_err(|_| Errno::EIO)?;
+        self.map.frames.get(index).cloned().ok_or(Errno::EIO)
+    }
+
+    /// A socket shows as `socket:[INODE]` in `/proc/PID/maps`, as the dentry name of sockfs.
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        (self.dev, self.ino, alloc::format!("socket:[{}]", self.ino).into_bytes())
+    }
+}
+
 /// Tells if a shared mapping that can write `inode` exists, as `mapping_writably_mapped` of
 /// Linux.
 pub(crate) fn writably_mapped(inode: &InodeRef) -> bool {
@@ -408,6 +427,16 @@ pub(crate) fn mmap(
     let mut may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
     let file = match file {
         None => None,
+        // A socket maps its own pages, as the mapped rings of a packet socket.
+        Some(file) if file.inode().is_none() && rk_net::socket_of(&file).is_some() => {
+            let sock = rk_net::socket_of(&file).ok_or(Errno::ENODEV)?;
+            let size = (len as usize).checked_next_multiple_of(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+            let map = sock.mmap(offset, size)?;
+            let meta = file.metadata()?;
+            let pages: Arc<dyn MmFile> =
+                Arc::new(SocketPages { map, dev: meta.dev, ino: meta.ino });
+            Some((pages, offset))
+        }
         Some(file) => {
             let inode = file.inode().ok_or(Errno::ENODEV)?;
             let meta = inode.metadata();

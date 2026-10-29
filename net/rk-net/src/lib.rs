@@ -144,6 +144,18 @@ impl PathOps for NoPaths {
     }
 }
 
+/// The pages of a mapping of a socket, as the mapped rings of a packet socket.
+pub struct SocketMap {
+    /// The pages, in the order of the mapping.
+    #[cfg(target_os = "none")]
+    pub frames: Vec<Arc<rk_frame::mm::Frame>>,
+    /// The count of pages.
+    pub pages: usize,
+    /// A value that the mapping holds while it exists. The socket counts the holders to know if
+    /// it is mapped.
+    pub hold: Arc<dyn Any + Send + Sync>,
+}
+
 /// The operations of a socket. The default of each operation gives the error of Linux for a
 /// family that does not have it.
 pub trait Socket: Send + Sync {
@@ -189,6 +201,20 @@ pub trait Socket: Send + Sync {
     }
     /// `getsockopt`. Gives the value.
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>>;
+    /// The count of bytes of the value of `getsockopt` that the option reads as input, for an
+    /// option such as `PACKET_HDRLEN` of Linux. Most options read none.
+    fn option_input(&self, _level: u32, _name: u32) -> usize {
+        0
+    }
+    /// `getsockopt` for an option that reads `input`, the first bytes of the value of the caller.
+    fn get_option_in(&self, level: u32, name: u32, _input: &[u8]) -> Result<Vec<u8>> {
+        self.get_option(level, name)
+    }
+    /// Gives the pages that a shared `mmap` of `len` bytes at `offset` of the socket file maps,
+    /// as the `mmap` of `proto_ops` of Linux. The default gives `ENODEV`, as `sock_no_mmap`.
+    fn mmap(&self, _offset: u64, _len: usize) -> Result<SocketMap> {
+        Err(Errno::ENODEV)
+    }
     /// `setsockopt`.
     fn set_option(&self, level: u32, name: u32, value: &[u8]) -> Result<()>;
     /// The events of `poll`.

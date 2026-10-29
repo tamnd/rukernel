@@ -366,7 +366,10 @@ pub(crate) fn getsockopt(
     let (_, sock) = socket(cx, fd)?;
     let len: i32 = cx.read_val(lenp)?;
     let len = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
-    let v = sock.get_option(level as u32, name as u32)?;
+    // A few options read their value first, as `PACKET_HDRLEN` of Linux.
+    let need = sock.option_input(level as u32, name as u32);
+    let input = if need > 0 && len > 0 { cx.read_bytes(value, len.min(need))? } else { Vec::new() };
+    let v = sock.get_option_in(level as u32, name as u32, &input)?;
     let n = len.min(v.len());
     if n > 0 {
         cx.write_bytes(value, &v[..n])?;
