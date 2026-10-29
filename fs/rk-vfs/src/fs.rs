@@ -448,24 +448,36 @@ impl FsContext {
             return Err(Errno::EPERM);
         }
         match kind {
-            FileType::Regular | FileType::Directory => {
-                if kind == FileType::Regular && write && flags & o::O_TRUNC != 0 {
-                    // The truncate clears the set-ID bits, as `handle_truncate` of Linux.
-                    let mode = if created { None } else { self.cred.write_kill(&meta) };
-                    let attr = SetAttr { size: Some(0), mode, ..SetAttr::default() };
-                    at.inode().set_attr(&attr)?;
-                    crate::mapped::changed(at.inode(), 0, u64::MAX);
-                    // As `do_open` of Linux, a new file has no truncate and no event of it.
-                    if !created {
-                        crate::notify::change(Some(&at), at.inode(), &attr);
+            FileType::Directory => Ok(File::open_inode(at, flags)),
+            FileType::Regular => {
+                let file = match at.inode().open_file(flags) {
+                    Some(ops) => File::with_ops(ops?, Some(at.clone()), flags),
+                    None => File::open_inode(at.clone(), flags),
+                };
+                // The open breaks the leases that conflict, as `break_lease` in
+                // `do_dentry_open` of Linux. The file counts as open during the wait, so a
+                // holder cannot downgrade to a read lease while an open for a write waits.
+                let finish = || -> Result<()> {
+                    crate::lease::break_lease(at.inode(), flags)?;
+                    if write && flags & o::O_TRUNC != 0 {
+                        // The truncate clears the set-ID bits, as `handle_truncate` of Linux.
+                        let mode = if created { None } else { self.cred.write_kill(&meta) };
+                        let attr = SetAttr { size: Some(0), mode, ..SetAttr::default() };
+                        at.inode().set_attr(&attr)?;
+                        crate::mapped::changed(at.inode(), 0, u64::MAX);
+                        // As `do_open` of Linux, a new file has no truncate and no event of it.
+                        if !created {
+                            crate::notify::change(Some(&at), at.inode(), &attr);
+                        }
                     }
+                    Ok(())
+                };
+                if let Err(e) = finish() {
+                    // The open did not complete, so the close gives no event.
+                    file.set_nonotify();
+                    return Err(e);
                 }
-                if kind == FileType::Regular
-                    && let Some(ops) = at.inode().open_file(flags)
-                {
-                    return Ok(File::with_ops(ops?, Some(at), flags));
-                }
-                Ok(File::open_inode(at, flags))
+                Ok(file)
             }
             FileType::CharDevice => {
                 let ops = device::open_char_at(meta.rdev, &at, flags)?;

@@ -588,6 +588,59 @@ fn file_locks() {
 }
 
 #[test]
+fn file_leases() {
+    use rk_abi::native::fcntl::{F_RDLCK, F_UNLCK, F_WRLCK};
+    use rk_vfs::lease;
+    use rk_vfs::lock::LockKind::{Read, Write};
+    let (fs, root) = setup();
+    write_file(&fs, &root, b"/l", b"data");
+    let nb = o::O_NONBLOCK;
+    // A read lease needs a file that no file can write, and a write open breaks it.
+    let a = fs.open(&root, b"/l", o::O_RDONLY, 0).unwrap();
+    assert_eq!(lease::set(&a, 3, None), Err(Errno::EAGAIN));
+    let w = fs.open(&root, b"/l", o::O_WRONLY, 0).unwrap();
+    assert_eq!(lease::set(&a, 3, Some(Read)), Err(Errno::EAGAIN));
+    drop(w);
+    assert_eq!(lease::set(&a, 3, Some(Read)), Ok(()));
+    assert_eq!(lease::get(&a), F_RDLCK);
+    assert!(fs.open(&root, b"/l", o::O_RDONLY | nb, 0).is_ok());
+    let err = fs.open(&root, b"/l", o::O_WRONLY | nb, 0).map(drop);
+    assert_eq!(err, Err(Errno::EWOULDBLOCK));
+    assert_eq!(lease::get(&a), F_UNLCK);
+    assert_eq!(lease::set(&a, 3, None), Ok(()));
+    assert!(fs.open(&root, b"/l", o::O_RDWR | nb, 0).is_ok());
+    // A write lease needs a file that no other file has open.
+    let b = fs.open(&root, b"/l", o::O_RDONLY, 0).unwrap();
+    assert_eq!(lease::set(&a, 3, Some(Write)), Err(Errno::EAGAIN));
+    drop(b);
+    assert_eq!(lease::set(&a, 3, Some(Write)), Ok(()));
+    assert_eq!(lease::get(&a), F_WRLCK);
+    // A read open asks for a downgrade, and the holder can downgrade.
+    let err = fs.open(&root, b"/l", o::O_RDONLY | nb, 0).map(drop);
+    assert_eq!(err, Err(Errno::EWOULDBLOCK));
+    assert_eq!(lease::get(&a), F_RDLCK);
+    assert_eq!(lease::set(&a, 3, Some(Read)), Ok(()));
+    let b = fs.open(&root, b"/l", o::O_RDONLY | nb, 0).unwrap();
+    // Another file can have a read lease too, but no write lease.
+    assert_eq!(lease::set(&b, 4, Some(Read)), Ok(()));
+    assert_eq!(lease::set(&a, 3, Some(Write)), Err(Errno::EAGAIN));
+    // A truncate by path counts as a writer, so no new read lease comes.
+    let access = rk_vfs::file::WriteAccess::new(a.inode().unwrap()).unwrap();
+    assert_eq!(lease::set(&a, 3, Some(Read)), Err(Errno::EAGAIN));
+    drop(access);
+    // A close removes the lease of the file.
+    drop(a);
+    drop(b);
+    assert!(fs.open(&root, b"/l", o::O_WRONLY | nb, 0).is_ok());
+    // With `fs.leases-enable` at 0, there are no new leases.
+    let a = fs.open(&root, b"/l", o::O_RDONLY, 0).unwrap();
+    lease::ENABLE.store(0, core::sync::atomic::Ordering::Relaxed);
+    let got = lease::set(&a, 3, Some(Read));
+    lease::ENABLE.store(1, core::sync::atomic::Ordering::Relaxed);
+    assert_eq!(got, Err(Errno::EINVAL));
+}
+
+#[test]
 fn mount_options() {
     let root =
         mount(&MountArgs { data: b"size=1m,mode=700", dev: None, read_only: false, lookup: None })

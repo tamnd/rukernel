@@ -3167,6 +3167,83 @@ static int put_file(const char *path, const char *data)
 	return ok ? 0 : -1;
 }
 
+/* The leases of F_SETLEASE and their breaks, as fs/locks.c of Linux (#481). */
+static void test_file_leases(void)
+{
+	struct timespec wait_time = { 5, 0 }, zero = { 0, 0 }, t0, t1;
+	sigset_t set, old;
+	siginfo_t si;
+	int fd, fd2, status;
+	long ms;
+	pid_t pid;
+
+	mkdir("/tmp", 0755);
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	close(open("/tmp/ls", O_RDWR | O_CREAT | O_TRUNC, 0644));
+	sigemptyset(&set);
+	sigaddset(&set, SIGUSR1);
+	sigprocmask(SIG_BLOCK, &set, &old);
+	fd = open("/tmp/ls", O_RDONLY);
+	check("F_SETLEASE F_UNLCK without a lease gives EAGAIN",
+	      fcntl(fd, F_SETLEASE, F_UNLCK) < 0 && errno == EAGAIN);
+	fd2 = open("/tmp/ls", O_RDONLY);
+	check("a write lease while another file is open gives EAGAIN",
+	      fcntl(fd, F_SETLEASE, F_WRLCK) < 0 && errno == EAGAIN);
+	close(fd2);
+	check("a write lease on a file open only for reading",
+	      fcntl(fd, F_SETSIG, SIGUSR1) == 0 && fcntl(fd, F_SETLEASE, F_WRLCK) == 0 &&
+		      fcntl(fd, F_GETLEASE) == F_WRLCK);
+	check("an open with O_NONBLOCK that breaks a lease gives EWOULDBLOCK",
+	      open("/tmp/ls", O_RDONLY | O_NONBLOCK) < 0 && errno == EWOULDBLOCK);
+	check("the lease holder gets the signal of F_SETSIG with its descriptor",
+	      sigtimedwait(&set, &si, &wait_time) == SIGUSR1 && si.si_fd == fd && si.si_code == POLL_MSG);
+	check("F_GETLEASE gives F_RDLCK while a read open breaks a write lease",
+	      fcntl(fd, F_GETLEASE) == F_RDLCK);
+	check("the holder downgrades its lease to a read lease",
+	      fcntl(fd, F_SETLEASE, F_RDLCK) == 0 && fcntl(fd, F_GETLEASE) == F_RDLCK);
+	fd2 = open("/tmp/ls", O_RDONLY | O_NONBLOCK);
+	check("a read open does not break a read lease", fd2 >= 0);
+	close(fd2);
+	pid = fork();
+	if (pid == 0) {
+		/* The open waits until the holder removes the lease. */
+		int c = open("/tmp/ls", O_WRONLY);
+
+		_exit(c >= 0 ? 0 : 1);
+	}
+	check("a write open breaks a read lease, and F_GETLEASE gives F_UNLCK",
+	      sigtimedwait(&set, &si, &wait_time) == SIGUSR1 && fcntl(fd, F_GETLEASE) == F_UNLCK);
+	check("no read lease while the file is open for a write",
+	      fcntl(fd, F_SETLEASE, F_RDLCK) < 0 && errno == EAGAIN);
+	check("the removal of the lease lets the open of the breaker go on",
+	      fcntl(fd, F_SETLEASE, F_UNLCK) == 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0);
+	close(fd);
+
+	/* A holder that does nothing loses its lease after fs.lease-break-time seconds. */
+	check("fs.lease-break-time takes a new value", put_file("/proc/sys/fs/lease-break-time", "1") == 0);
+	fd = open("/tmp/ls", O_RDONLY);
+	fcntl(fd, F_SETSIG, SIGUSR1);
+	check("a read lease", fcntl(fd, F_SETLEASE, F_RDLCK) == 0);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	check("truncate breaks a read lease", truncate("/tmp/ls", 0) == 0);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+	check("the breaker waits for the break time, and the lease goes away",
+	      ms >= 900 && ms < 4000 && fcntl(fd, F_GETLEASE) == F_UNLCK);
+	sigtimedwait(&set, &si, &zero);
+	put_file("/proc/sys/fs/lease-break-time", "45");
+	check("fs.leases-enable 0 makes F_SETLEASE give EINVAL",
+	      put_file("/proc/sys/fs/leases-enable", "0") == 0 && fcntl(fd, F_SETLEASE, F_RDLCK) < 0 &&
+		      errno == EINVAL);
+	put_file("/proc/sys/fs/leases-enable", "1");
+	close(fd);
+	unlink("/tmp/ls");
+	sigprocmask(SIG_SETMASK, &old, NULL);
+	umount("/proc");
+}
+
 /* Counts the entries of the directory at path, without . and .., or gives -1. */
 static int count_entries(const char *path)
 {
@@ -7023,6 +7100,7 @@ static void test_all(void)
 	test_xattr();
 	test_fifo();
 	test_file_locks();
+	test_file_leases();
 	test_fallocate();
 	test_fsize();
 	test_tmpfile();

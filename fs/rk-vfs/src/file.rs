@@ -280,16 +280,21 @@ pub struct File {
     owner_tid: AtomicBool,
     /// The open made the file, as `FMODE_CREATED` of Linux.
     created: AtomicBool,
-    /// The lease of `F_SETLEASE`: `F_RDLCK`, `F_WRLCK` or `F_UNLCK`.
-    lease: AtomicI32,
+    /// The file is a regular file that can only read, and `INODE_READERS` counts it, as
+    /// `i_readcount` of Linux.
+    reader: bool,
 }
 
 /// The number of open files that can write each regular inode, as `i_writecount` of Linux. The
 /// key is the address of the inode.
 static INODE_WRITERS: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap::new());
 
+/// The number of open files that can only read each regular inode, as `i_readcount` of Linux.
+/// The key is the address of the inode, as in `INODE_WRITERS`.
+static INODE_READERS: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap::new());
+
 /// The key of `inode` in `INODE_WRITERS`.
-fn inode_key(inode: &InodeRef) -> usize {
+pub(crate) fn inode_key(inode: &InodeRef) -> usize {
     Arc::as_ptr(inode).cast::<u8>() as usize
 }
 
@@ -365,10 +370,64 @@ pub fn open_for_write(inode: &InodeRef) -> usize {
     INODE_WRITERS.lock().get(&inode_key(inode)).copied().unwrap_or(0)
 }
 
+/// The number of open files that can write the inode `inode`, and the number of open files that
+/// can only read it, for the checks of a lease.
+pub(crate) fn open_counts(inode: &InodeRef) -> (usize, usize) {
+    let key = inode_key(inode);
+    let writers = INODE_WRITERS.lock().get(&key).copied().unwrap_or(0);
+    let readers = INODE_READERS.lock().get(&key).copied().unwrap_or(0);
+    (writers, readers)
+}
+
+/// Adds 1 to the count of `key` in `map`.
+fn count_up(map: &SpinLock<BTreeMap<usize, usize>>, key: usize) {
+    *map.lock().entry(key).or_insert(0) += 1;
+}
+
+/// Removes 1 from the count of `key` in `map`.
+fn count_down(map: &SpinLock<BTreeMap<usize, usize>>, key: usize) {
+    let mut map = map.lock();
+    if let Some(count) = map.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            map.remove(&key);
+        }
+    }
+}
+
+/// The write access of a `truncate` by path, as `get_write_access` in `vfs_truncate` of Linux.
+/// The inode counts one more writer until the value drops, so a lease break sees the truncate as
+/// an open for a write.
+pub struct WriteAccess(usize);
+
+impl WriteAccess {
+    /// Gets the write access of `inode`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ETXTBSY` if a program runs from the inode.
+    pub fn new(inode: &InodeRef) -> Result<Self> {
+        let key = inode_key(inode);
+        let mut writers = INODE_WRITERS.lock();
+        if INODE_DENIED.lock().contains_key(&key) {
+            return Err(Errno::ETXTBSY);
+        }
+        *writers.entry(key).or_insert(0) += 1;
+        Ok(Self(key))
+    }
+}
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        count_down(&INODE_WRITERS, self.0);
+    }
+}
+
 impl Drop for File {
     fn drop(&mut self) {
         if self.locked.load(Ordering::Relaxed) {
             crate::lock::close_file(self);
+            crate::lease::close_file(self);
         }
         // The last close, as `fsnotify_close` in `__fput` of Linux.
         let flags = self.flags();
@@ -383,16 +442,12 @@ impl Drop for File {
         if let Some(location) = &self.location {
             location.mount.remove_open();
         }
-        if self.writer
-            && let Some(inode) = &self.inode
-        {
-            let mut writers = INODE_WRITERS.lock();
-            let key = inode_key(inode);
-            if let Some(count) = writers.get_mut(&key) {
-                *count -= 1;
-                if *count == 0 {
-                    writers.remove(&key);
-                }
+        if let Some(inode) = &self.inode {
+            if self.writer {
+                count_down(&INODE_WRITERS, inode_key(inode));
+            }
+            if self.reader {
+                count_down(&INODE_READERS, inode_key(inode));
             }
         }
     }
@@ -1064,8 +1119,19 @@ impl File {
         if let Some(location) = &location {
             location.mount.add_open();
         }
-        if writer && let Some(inode) = &inode {
-            *INODE_WRITERS.lock().entry(inode_key(inode)).or_insert(0) += 1;
+        // A regular file that can only read, as the test of `i_readcount_inc` in
+        // `do_dentry_open` of Linux.
+        let reader = location.is_some()
+            && OpenFlags(flags).readable()
+            && !OpenFlags(flags).writable()
+            && inode.as_ref().is_some_and(|i| i.metadata().file_type() == Some(FileType::Regular));
+        if let Some(inode) = &inode {
+            if writer {
+                count_up(&INODE_WRITERS, inode_key(inode));
+            }
+            if reader {
+                count_up(&INODE_READERS, inode_key(inode));
+            }
         }
         Arc::new(Self {
             ops,
@@ -1080,7 +1146,7 @@ impl File {
             signum: AtomicU32::new(0),
             owner_tid: AtomicBool::new(false),
             created: AtomicBool::new(false),
-            lease: AtomicI32::new(rk_abi::native::fcntl::F_UNLCK),
+            reader,
         })
     }
 
@@ -1159,14 +1225,10 @@ impl File {
         self.created.store(true, Ordering::Relaxed);
     }
 
-    /// The lease of the file, for `F_GETLEASE`: `F_RDLCK`, `F_WRLCK` or `F_UNLCK`.
-    pub fn lease(&self) -> i32 {
-        self.lease.load(Ordering::Relaxed)
-    }
-
-    /// Sets the lease of the file, for `F_SETLEASE`. The caller examined the conflicts.
-    pub fn set_lease(&self, kind: i32) {
-        self.lease.store(kind, Ordering::Relaxed);
+    /// Tells if the inode counts the file as a writer and as a reader that can only read, for
+    /// the checks of a lease.
+    pub(crate) fn open_counts_as(&self) -> (bool, bool) {
+        (self.writer, self.reader)
     }
 
     /// The signal of `F_SETSIG`. 0 is `SIGIO`.

@@ -1159,8 +1159,8 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             }
             Ok(0)
         }
-        F_SETLEASE => set_lease(cx, &*cx.file(fd)?, arg as i32),
-        F_GETLEASE => Ok(cx.file(fd)?.lease() as u64),
+        F_SETLEASE => set_lease(cx, fd, arg as i32),
+        F_GETLEASE => Ok(rk_vfs::lease::get(&*cx.file(fd)?) as u64),
         F_CREATED_QUERY => Ok(u64::from(cx.file(fd)?.created())),
         F_ADD_SEALS => add_seals(&*cx.file(fd)?, arg as u32),
         F_GET_SEALS => {
@@ -1182,10 +1182,12 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     }
 }
 
-/// `F_SETLEASE`: a lease of the type `kind` on the regular file `file`, as `fcntl_setlease` of
-/// Linux. A read lease needs a file that no open file can write. A write lease needs a file that
-/// only `file` can write. R1 does not break a lease when a conflicting open comes.
-fn set_lease(cx: &Cx<'_>, file: &File, kind: i32) -> SysResult {
+/// `F_SETLEASE`: a lease of the type `kind` on the regular file of the descriptor `fd`, as
+/// `fcntl_setlease` of Linux. The VFS checks the conflicts. A new lease makes the process the
+/// owner of the file for the signal of a break, if the file has no owner, as `__f_setown` in
+/// `do_fcntl_add_lease` of Linux.
+fn set_lease(cx: &Cx<'_>, fd: u64, kind: i32) -> SysResult {
+    let file = cx.file(fd)?;
     let inode = file.inode().ok_or(Errno::EINVAL)?;
     let meta = inode.metadata();
     let cred = cx.process().cred();
@@ -1195,15 +1197,16 @@ fn set_lease(cx: &Cx<'_>, file: &File, kind: i32) -> SysResult {
     if meta.file_type() != Some(rk_vfs::inode::FileType::Regular) {
         return Err(Errno::EINVAL);
     }
-    let writers = rk_vfs::file::open_for_write(inode);
-    let own = usize::from(file.flags().writable());
-    match kind {
-        F_RDLCK if writers != 0 => return Err(Errno::EAGAIN),
-        F_WRLCK if writers != own => return Err(Errno::EAGAIN),
-        F_RDLCK | F_WRLCK | F_UNLCK => {}
+    let kind = match kind {
+        F_RDLCK => Some(rk_vfs::lock::LockKind::Read),
+        F_WRLCK => Some(rk_vfs::lock::LockKind::Write),
+        F_UNLCK => None,
         _ => return Err(Errno::EINVAL),
+    };
+    rk_vfs::lease::set(&file, fd as i32, kind)?;
+    if kind.is_some() && file.owner() == 0 {
+        file.set_owner(cx.process().pid() as i32);
     }
-    file.set_lease(kind);
     Ok(0)
 }
 
@@ -1678,6 +1681,10 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     // The checks of `vfs_truncate` of Linux, in its order.
     at.mount.want_write()?;
     fs.permission(&at, rk_vfs::cred::may::WRITE)?;
+    // The truncate counts as an open for a write, and breaks the leases of the file, as
+    // `get_write_access` and `break_lease` in `vfs_truncate` of Linux.
+    let _access = rk_vfs::file::WriteAccess::new(at.inode())?;
+    rk_vfs::lease::break_lease(at.inode(), rk_abi::native::open::O_WRONLY)?;
     fsize_check(cx, &at.inode().metadata(), size)?;
     let mode = fs.cred().write_kill(&at.inode().metadata());
     let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
