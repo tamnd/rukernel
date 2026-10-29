@@ -12,6 +12,7 @@ use crate::route::{
 use crate::stack::{self, ROUTES};
 use crate::stack6;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_addr::{
@@ -20,19 +21,21 @@ use rk_abi::native::if_addr::{
 };
 use rk_abi::native::neighbour::{
     NDA_CACHEINFO, NDA_DST, NDA_IFINDEX, NDA_LLADDR, NDA_MASTER, NDA_NDM_FLAGS_MASK, NDA_PROBES,
-    NTF_PROXY, NUD_INCOMPLETE, NUD_REACHABLE, NUD_STALE,
+    NTF_PROXY, NUD_DELAY, NUD_INCOMPLETE, NUD_NOARP, NUD_PERMANENT, NUD_PROBE, NUD_REACHABLE,
+    NUD_STALE,
 };
 use rk_abi::native::netlink::{NLM_F_DUMP_FILTERED, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RT_TABLE_MAIN, RTA_CACHEINFO,
     RTA_DEL_REASON, RTA_DPORT, RTA_DST, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK, RTA_METRICS,
     RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC, RTA_TABLE, RTA_UID, RTM_DELADDR,
-    RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY, RTM_F_PREFIX,
-    RTM_GETADDR, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE,
+    RTM_DELNEIGH, RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY,
+    RTM_F_PREFIX, RTM_GETADDR, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE,
     RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
 };
 use rk_net::consts::{AF_INET, AF_INET6, IFNAMSIZ};
-use rk_net::dev;
+use rk_net::dev::{self, NetDevice};
+use rk_net::ether::MacAddr;
 use rk_net::netlink::msg::{Attrs, Builder, attrs};
 use rk_net::netlink::{self, Request};
 use rk_vfs::inode::Result;
@@ -72,6 +75,8 @@ pub(crate) fn init() {
     netlink::register(inet, RTM_DELROUTE, Some(delroute), None, false);
     netlink::register(inet, RTM_GETROUTE, Some(getroute), Some(dump_routes), true);
     netlink::register(0, RTM_GETNEIGH, None, Some(dump_neigh), false);
+    netlink::register(0, RTM_NEWNEIGH, Some(newneigh), None, false);
+    netlink::register(0, RTM_DELNEIGH, Some(delneigh), None, false);
 }
 
 /// Checks the attributes of an address against `ifa_ipv4_policy` of Linux.
@@ -484,6 +489,75 @@ fn dump_routes(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
+/// A request of `RTM_NEWNEIGH` or `RTM_DELNEIGH`: the family, the device, the address, the
+/// link address and the state.
+struct NeighReq {
+    family: u32,
+    dev: Arc<NetDevice>,
+    dst: Ip,
+    lladdr: Option<MacAddr>,
+    state: u32,
+}
+
+/// Reads a request of `RTM_NEWNEIGH` or `RTM_DELNEIGH` with the checks of `neigh_add` and
+/// `neigh_delete` in net/core/neighbour.c of Linux.
+fn neigh_req(req: &Request<'_>) -> Result<NeighReq> {
+    let (h, a) = req.parse(NDMSG_LEN, NDA_MAX)?;
+    let Some(dst) = a.get(NDA_DST) else { return Err(Errno::EINVAL) };
+    let ifindex = u32_at(h, 4);
+    let dev = match ifindex {
+        0 => None,
+        i => Some(dev::by_index(i).ok_or(Errno::ENODEV)?),
+    };
+    let lladdr = a.get(NDA_LLADDR);
+    if dev.is_some() && lladdr.is_some_and(|l| l.len() < 6) {
+        return Err(Errno::EINVAL);
+    }
+    let family = u32::from(h[0]);
+    let dst = match family {
+        AF_INET => ip::mapped(dst.get(..4).ok_or(Errno::EINVAL)?.try_into().unwrap_or_default()),
+        AF_INET6 => dst.get(..16).ok_or(Errno::EINVAL)?.try_into().unwrap_or_default(),
+        _ => return Err(Errno::EAFNOSUPPORT),
+    };
+    // The stack has no proxy entries, `pneigh_*` of Linux.
+    if u32::from(h[10]) & NTF_PROXY != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let Some(dev) = dev else { return Err(Errno::EINVAL) };
+    let lladdr = lladdr.and_then(|l| l.get(..6)).map(|l| MacAddr(l.try_into().unwrap_or([0; 6])));
+    Ok(NeighReq { family, dev, dst, lladdr, state: u32::from(u16::from_ne_bytes([h[8], h[9]])) })
+}
+
+/// `RTM_NEWNEIGH`, as `neigh_add` of Linux: `ip neigh add`, `change` and `replace`. The flags
+/// `NLM_F_CREATE`, `NLM_F_EXCL` and `NLM_F_REPLACE` choose what happens to an entry that is
+/// there or not there.
+fn newneigh(req: &Request<'_>) -> Result<()> {
+    let n = neigh_req(req)?;
+    let nud = match n.state {
+        NUD_PERMANENT => Nud::Permanent,
+        NUD_NOARP => Nud::Noarp,
+        NUD_REACHABLE => Nud::Reachable,
+        NUD_STALE | NUD_DELAY | NUD_PROBE => Nud::Stale,
+        _ => return Err(Errno::EINVAL),
+    };
+    let flags = u32::from(req.hdr.flags);
+    match ip::v4(&n.dst).filter(|_| n.family == AF_INET) {
+        Some(a) => stack::neigh_add(&n.dev, a, n.lladdr, nud, flags),
+        None => stack6::neigh_add(&n.dev, &n.dst, n.lladdr, nud, flags),
+    }
+}
+
+/// `RTM_DELNEIGH`, as `neigh_delete` of Linux: `ip neigh del`.
+fn delneigh(req: &Request<'_>) -> Result<()> {
+    let n = neigh_req(req)?;
+    let ifindex = n.dev.ifindex();
+    let found = match ip::v4(&n.dst).filter(|_| n.family == AF_INET) {
+        Some(a) => stack::neigh_del(ifindex, a),
+        None => stack6::neigh_del(ifindex, &n.dst),
+    };
+    if found { Ok(()) } else { Err(Errno::ENOENT) }
+}
+
 /// The dump of `RTM_GETNEIGH`, as `neigh_dump_info` of Linux with the table of ARP and the
 /// table of neighbour discovery.
 fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
@@ -540,6 +614,8 @@ fn dump_neigh(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
                 Nud::Incomplete => NUD_INCOMPLETE,
                 Nud::Reachable => NUD_REACHABLE,
                 Nud::Stale => NUD_STALE,
+                Nud::Permanent => NUD_PERMANENT,
+                Nud::Noarp => NUD_NOARP,
             };
             let mut h = [0u8; NDMSG_LEN];
             h[0] = *af;

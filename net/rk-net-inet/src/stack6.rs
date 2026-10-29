@@ -2,7 +2,8 @@
 //! UDP over IPv6, and the output of IPv6 through the neighbour table, as net/ipv6/ip6_input.c,
 //! ip6_output.c, icmp.c, ndisc.c and udp.c of Linux.
 //!
-//! The stack has no fragments. An Ethernet device sends router solicitations when it goes up,
+//! A packet larger than the MTU goes out in fragments, and the input puts the fragments
+//! together, as net/ipv6/ip6_output.c and reassembly.c of Linux. An Ethernet device sends router solicitations when it goes up,
 //! and a router advertisement gives the default route and the global address of the device
 //! (SLAAC). A new address goes through duplicate address detection, and the device sends an
 //! MLD report when it joins the solicited node group of the address. `mcast6` has the groups and
@@ -23,11 +24,11 @@ use crate::route::INFINITY;
 use crate::route6::{Next6, PRIO_ADDRCONF, Route6, Table6};
 use crate::socket::Info6;
 use crate::stack::{self, PING_PORTS, UDP_PORTS, count, icmp_types, now_ms};
-use crate::{addrconf, checksum, mcast6, neigh};
+use crate::{addrconf, checksum, frag, mcast6, neigh};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::icmpv6::{
     ICMPV6_ADDR_UNREACH, ICMPV6_ADM_PROHIBITED, ICMPV6_DEST_UNREACH, ICMPV6_ECHO_REPLY,
@@ -56,6 +57,14 @@ static NEIGH6: PerNet<SpinLock<neigh::Table<NetBuf, Ip>>> =
 /// next one in milliseconds.
 static SOLICIT: PerNet<SpinLock<BTreeMap<u32, (u32, u64)>>> =
     PerNet::new(|| SpinLock::new(BTreeMap::new()));
+/// The key of a queue of the reassembly: the source, the destination and the identification,
+/// as `struct frag_v6_compare_key` of Linux.
+type FragKey = (Ip, Ip, u32);
+/// The queues of the reassembly of IPv6.
+static FRAGS6: PerNet<SpinLock<frag::Reasm<FragKey>>> =
+    PerNet::new(|| SpinLock::new(frag::Reasm::new()));
+/// The identification of the next packet in fragments, as `ipv6_select_ident` of Linux.
+static FRAG_ID: AtomicU32 = AtomicU32::new(1);
 /// The time of the next check of the lifetimes of the addresses and routes.
 static NEXT_EXPIRE: PerNet<AtomicU64> = PerNet::new(|| AtomicU64::new(0));
 /// The addresses in duplicate address detection.
@@ -108,8 +117,18 @@ pub(crate) struct Counters6 {
     pub out_requests: AtomicU64,
     /// The packets without a route.
     pub out_no_routes: AtomicU64,
-    /// The fragments that the stack dropped, because it has no reassembly.
+    /// The failures of the reassembly: a bad fragment or a full table.
     pub reasm_fails: AtomicU64,
+    /// The queues of the reassembly that timed out.
+    pub reasm_timeout: AtomicU64,
+    /// The fragments that went to the reassembly.
+    pub reasm_reqds: AtomicU64,
+    /// The packets that the reassembly completed.
+    pub reasm_oks: AtomicU64,
+    /// The packets that the stack sent in fragments.
+    pub frag_oks: AtomicU64,
+    /// The fragments that the stack made.
+    pub frag_creates: AtomicU64,
     /// The multicast packets that the stack received.
     pub in_mcast: AtomicU64,
     /// The multicast packets that the stack sent.
@@ -163,6 +182,11 @@ impl rk_net::ns::Clear for Counters6 {
         self.out_requests.store(0, Ordering::Relaxed);
         self.out_no_routes.store(0, Ordering::Relaxed);
         self.reasm_fails.store(0, Ordering::Relaxed);
+        self.reasm_timeout.store(0, Ordering::Relaxed);
+        self.reasm_reqds.store(0, Ordering::Relaxed);
+        self.reasm_oks.store(0, Ordering::Relaxed);
+        self.frag_oks.store(0, Ordering::Relaxed);
+        self.frag_creates.store(0, Ordering::Relaxed);
         self.in_mcast.store(0, Ordering::Relaxed);
         self.out_mcast.store(0, Ordering::Relaxed);
         self.in_octets.store(0, Ordering::Relaxed);
@@ -205,6 +229,11 @@ fn new_counters6() -> Counters6 {
         out_requests: AtomicU64::new(0),
         out_no_routes: AtomicU64::new(0),
         reasm_fails: AtomicU64::new(0),
+        reasm_timeout: AtomicU64::new(0),
+        reasm_reqds: AtomicU64::new(0),
+        reasm_oks: AtomicU64::new(0),
+        frag_oks: AtomicU64::new(0),
+        frag_creates: AtomicU64::new(0),
         in_mcast: AtomicU64::new(0),
         out_mcast: AtomicU64::new(0),
         in_octets: AtomicU64::new(0),
@@ -253,6 +282,38 @@ pub(crate) fn flush_neigh(ifindex: u32) {
     NEIGH6.lock().flush(ifindex);
 }
 
+/// Adds or changes a neighbour of IPv6 for `RTM_NEWNEIGH`, as `neigh_add` of Linux, and sends
+/// the packets that waited for it.
+///
+/// # Errors
+///
+/// Gives the error of `neigh::Table::add`.
+pub(crate) fn neigh_add(
+    dev: &NetDevice,
+    addr: &Ip,
+    mac: Option<MacAddr>,
+    nud: neigh::Nud,
+    flags: u32,
+) -> Result<()> {
+    let key = (dev.ifindex(), *addr);
+    let (waiting, mac) = {
+        let mut t = NEIGH6.lock();
+        let waiting = t.add(key, mac, nud, now_ms(), flags)?;
+        (waiting, t.lookup(key).unwrap_or(MacAddr::ZERO))
+    };
+    for mut packet in waiting {
+        ether(dev, mac).push(&mut packet);
+        let _ = dev.transmit(packet);
+    }
+    Ok(())
+}
+
+/// Removes a neighbour of IPv6 for `RTM_DELNEIGH`, as `neigh_delete` of Linux. Gives `false`
+/// if there is no entry.
+pub(crate) fn neigh_del(ifindex: u32, addr: &Ip) -> bool {
+    NEIGH6.lock().remove((ifindex, *addr))
+}
+
 /// The neighbours of IPv6, as `neighbours` of `stack`.
 pub(crate) fn neighbours() -> Vec<neigh::Info<Ip>> {
     NEIGH6.lock().entries(now_ms())
@@ -272,7 +333,7 @@ pub(crate) fn path(dst: &Ip, oif: u32) -> Result<Path> {
     let mtu_of = |ifindex| dev::by_index(ifindex).map_or(0, |d| d.mtu());
     match ip::v4(dst) {
         Some(d) => {
-            let n = stack::route(d)?;
+            let n = stack::route_oif(d, oif)?;
             Ok(Path { src: ip::mapped(n.src), mtu: mtu_of(n.ifindex) })
         }
         None => {
@@ -289,8 +350,15 @@ pub(crate) fn path(dst: &Ip, oif: u32) -> Result<Path> {
 pub(crate) fn output_ip(out: &Out6, oif: u32, payload: &[u8]) -> Result<()> {
     match (ip::v4(&out.src), ip::v4(&out.dst)) {
         (Some(src), Some(dst)) => {
-            let next = stack::route(dst)?;
-            let o = stack::Out { src, dst, protocol: out.next, ttl: out.hops, tos: out.tclass };
+            let next = stack::route_oif(dst, oif)?;
+            let o = stack::Out {
+                src,
+                dst,
+                protocol: out.next,
+                ttl: out.hops,
+                tos: out.tclass,
+                df: out.dontfrag,
+            };
             stack::output(&next, &o, payload)
         }
         (None, None) => output(&route(&out.dst, oif)?, out, payload),
@@ -313,31 +381,105 @@ pub(crate) struct Out6 {
     /// The routing header between the IPv6 header and the payload, or nothing. Its next header
     /// is `next`.
     pub ext: Vec<u8>,
+    /// The packet cannot go out in fragments: `IPV6_DONTFRAG`, or `IPV6_PMTUDISC_DO` and
+    /// `IPV6_PMTUDISC_PROBE`. A packet larger than the MTU then gives `EMSGSIZE`.
+    pub dontfrag: bool,
 }
 
-/// Sends a packet with the payload `payload` on the route `next`, as `ip6_xmit` of Linux. The
-/// packet does not get fragments: a packet larger than the MTU gives `EMSGSIZE`.
+/// Sends a packet with the payload `payload` on the route `next`, as `ip6_xmit` and
+/// `ip6_fragment` of Linux. A packet larger than the MTU goes out in fragments, or gives
+/// `EMSGSIZE` if `out.dontfrag` is set.
 pub(crate) fn output(next: &Next6, out: &Out6, payload: &[u8]) -> Result<()> {
     let dev = dev::by_index(next.ifindex).ok_or(Errno::ENETUNREACH)?;
-    let mtu = if next.mtu != 0 { next.mtu.min(dev.mtu()) } else { dev.mtu() };
+    let mtu = if next.mtu != 0 { next.mtu.min(dev.mtu()) } else { dev.mtu() } as usize;
     let len = out.ext.len() + payload.len();
-    if len > usize::from(u16::MAX) || HLEN + len > mtu as usize {
+    if len > usize::from(u16::MAX) || (out.dontfrag && HLEN + len > mtu) {
         return Err(Errno::EMSGSIZE);
     }
     // The fixed header names the routing header, as `ipv6_push_nfrag_opts`.
     let first = if out.ext.is_empty() { out.next } else { ipv6::NEXT_ROUTING };
-    let mut h = Header::new(out.src, out.dst, first, len);
-    h.hops = out.hops;
-    h.tclass = out.tclass;
-    let mut buf = NetBuf::new(HEADROOM, HLEN + len);
-    buf.extend_from_slice(&h.to_bytes());
-    buf.extend_from_slice(&out.ext);
-    buf.extend_from_slice(payload);
     if out.next == PROTO_ICMPV6 {
         count_icmp_out(payload);
     }
     count(&COUNTERS6.out_requests);
-    transmit(&dev, next, buf)
+    let header = |next: u8, len: usize| {
+        let mut h = Header::new(out.src, out.dst, next, len);
+        h.hops = out.hops;
+        h.tclass = out.tclass;
+        h.to_bytes()
+    };
+    if HLEN + len <= mtu {
+        let mut buf = NetBuf::new(HEADROOM, HLEN + len);
+        buf.extend_from_slice(&header(first, len));
+        buf.extend_from_slice(&out.ext);
+        buf.extend_from_slice(payload);
+        return transmit(&dev, next, buf);
+    }
+    // The fragment header goes after the routing header, which is in each fragment. The next
+    // header of the routing header becomes the fragment header.
+    let mut ext = out.ext.clone();
+    let first = match ext.first_mut() {
+        Some(n) => {
+            *n = ipv6::NEXT_FRAGMENT;
+            first
+        }
+        None => ipv6::NEXT_FRAGMENT,
+    };
+    let room = mtu.saturating_sub(HLEN + ext.len() + ipv6::FRAG_HLEN);
+    let id = FRAG_ID.fetch_add(1, Ordering::Relaxed);
+    for (offset, n) in frag::split(payload.len(), room) {
+        let more = offset + n < payload.len();
+        let f = ipv6::Frag { at: 0, nh: 0, next: out.next, offset, more, id };
+        let plen = ext.len() + ipv6::FRAG_HLEN + n;
+        let mut buf = NetBuf::new(HEADROOM, HLEN + plen);
+        buf.extend_from_slice(&header(first, plen));
+        buf.extend_from_slice(&ext);
+        buf.extend_from_slice(&f.to_bytes());
+        buf.extend_from_slice(&payload[offset..offset + n]);
+        count(&COUNTERS6.frag_creates);
+        transmit(&dev, next, buf)?;
+    }
+    count(&COUNTERS6.frag_oks);
+    Ok(())
+}
+
+/// Puts the fragment `packet` in its queue, as `ipv6_frag_rcv` in net/ipv6/reassembly.c of
+/// Linux. Gives the whole packet when the queue is complete. `packet` ends at the end of the
+/// payload.
+fn reassemble(packet: &[u8]) -> Option<NetBuf> {
+    count(&COUNTERS6.reasm_reqds);
+    let Some(f) = ipv6::Frag::find(packet) else {
+        count(&COUNTERS6.in_hdr_errors);
+        return None;
+    };
+    let src: Ip = packet[8..24].try_into().unwrap_or_default();
+    let dst: Ip = packet[24..40].try_into().unwrap_or_default();
+    // The headers before the fragment header stay. The field that named the fragment header
+    // names the next header of the fragment, as `ip6_frag_reasm`.
+    let mut head = packet[..f.at].to_vec();
+    head[f.nh] = f.next;
+    let data = &packet[f.at + ipv6::FRAG_HLEN..];
+    let r = FRAGS6.lock().add((src, dst, f.id), f.offset, f.more, &head, data, now_ms());
+    match r {
+        frag::Add::Wait => None,
+        frag::Add::Fail => {
+            count(&COUNTERS6.reasm_fails);
+            None
+        }
+        frag::Add::Done(mut head, data) => {
+            let len = head.len() - HLEN + data.len();
+            if len > usize::from(u16::MAX) {
+                count(&COUNTERS6.reasm_fails);
+                return None;
+            }
+            count(&COUNTERS6.reasm_oks);
+            head[4..6].copy_from_slice(&(len as u16).to_be_bytes());
+            let mut buf = NetBuf::new(HEADROOM, head.len() + data.len());
+            buf.extend_from_slice(&head);
+            buf.extend_from_slice(&data);
+            Some(buf)
+        }
+    }
 }
 
 /// Sends a packet that has its IPv6 header, for a raw socket with `IPV6_HDRINCL`.
@@ -554,14 +696,22 @@ fn learn(dev: &NetDevice, addr: &Ip, mac: MacAddr, create: bool) {
     }
 }
 
-/// Takes an IPv6 packet, as `ipv6_rcv` and `ip6_input` of Linux. The stack does not forward,
-/// and it drops the fragments.
-pub(crate) fn input(dev: &NetDevice, mut frame: NetBuf) {
+/// Takes an IPv6 packet, as `ipv6_rcv` and `ip6_input` of Linux. The stack does not forward.
+/// The fragments go to `reassemble`.
+pub(crate) fn input(dev: &NetDevice, frame: NetBuf) {
     count(&COUNTERS6.in_receives);
     add(&COUNTERS6.in_octets, frame.len());
-    let h = match Header::parse(frame.data()) {
-        Ok(h) => h,
-        Err(Bad::Fragment) => return count(&COUNTERS6.reasm_fails),
+    let (h, mut frame) = match Header::parse(frame.data()) {
+        Ok(h) => (h, frame),
+        Err(Bad::Fragment) => {
+            let end = HLEN + usize::from(u16::from_be_bytes([frame.data()[4], frame.data()[5]]));
+            let Some(whole) = reassemble(&frame.data()[..end]) else { return };
+            // A packet with a second fragment header is not valid.
+            match Header::parse(whole.data()) {
+                Ok(h) => (h, whole),
+                Err(_) => return count(&COUNTERS6.reasm_fails),
+            }
+        }
         Err(Bad::Length) => return count(&COUNTERS6.in_truncated),
         Err(Bad::Header) => return count(&COUNTERS6.in_hdr_errors),
     };
@@ -589,9 +739,10 @@ pub(crate) fn input(dev: &NetDevice, mut frame: NetBuf) {
     let Some(h) = rthdr_input(dev, &mut frame, h) else { return };
     let packet = frame.data();
     let payload = &packet[h.l4..];
+    let dif = stack::dif_of(dev);
     let raw = stack::raw_sockets(AF_INET6, h.protocol);
     for sock in &raw {
-        sock.deliver_raw6(&h, ifindex, payload);
+        sock.deliver_raw6(&h, ifindex, payload, dif);
     }
     let known = matches!(h.protocol, PROTO_ICMPV6 | PROTO_UDP | PROTO_TCP | NEXT_NONE);
     if known || !raw.is_empty() {
@@ -601,8 +752,8 @@ pub(crate) fn input(dev: &NetDevice, mut frame: NetBuf) {
     }
     match h.protocol {
         PROTO_ICMPV6 => icmp_input(dev, &h, payload, mcast),
-        PROTO_UDP => udp_input(&h, ifindex, packet, mcast),
-        PROTO_TCP => crate::tcp::input(h.src, h.dst, payload, mcast),
+        PROTO_UDP => udp_input(&h, ifindex, packet, mcast, dif),
+        PROTO_TCP => crate::tcp::input(h.src, h.dst, payload, mcast, dif),
         NEXT_NONE => {}
         _ if raw.is_empty() => {
             icmp_error(&h, ifindex, packet, PARAMPROB, ICMPV6_UNK_NEXTHDR as u8, h.nh as u32);
@@ -753,7 +904,9 @@ fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], mcast: bool) {
         }
         ECHO_REPLY if msg.len() >= 8 => {
             let id = u16::from_be_bytes([msg[4], msg[5]]);
-            if let Some(sock) = stack::find_socket(&PING_PORTS, id, h.dst, h.src, 0) {
+            if let Some(sock) =
+                stack::find_socket(&PING_PORTS, id, h.dst, h.src, 0, stack::dif_of(dev))
+            {
                 let info = Some(Info6::of(h, ifindex));
                 sock.deliver(h.src, scope_of(&h.src, ifindex), 0, msg.to_vec(), info);
             }
@@ -779,11 +932,11 @@ fn error_input(kind: u8, code: u8, inner: &[u8]) {
         PROTO_UDP => {
             let sport = u16::from_be_bytes([l4[0], l4[1]]);
             let dport = u16::from_be_bytes([l4[2], l4[3]]);
-            stack::find_socket(&UDP_PORTS, sport, ih.src, ih.dst, dport)
+            stack::find_socket(&UDP_PORTS, sport, ih.src, ih.dst, dport, 0)
         }
         PROTO_ICMPV6 if l4[0] == ECHO_REQUEST => {
             let id = u16::from_be_bytes([l4[4], l4[5]]);
-            stack::find_socket(&PING_PORTS, id, ih.src, ih.dst, 0)
+            stack::find_socket(&PING_PORTS, id, ih.src, ih.dst, 0, 0)
         }
         _ => None,
     };
@@ -807,6 +960,7 @@ fn send_icmp(src: &Ip, dst: &Ip, ifindex: u32, mut msg: Vec<u8>) {
         hops: ipv6::DEFAULT_HOPS,
         tclass: 0,
         ext: Vec::new(),
+        dontfrag: false,
     };
     // An ICMPv6 message that the stack makes is not for a socket, and a lost one is not an
     // error.
@@ -980,7 +1134,7 @@ fn ndisc_ra(dev: &NetDevice, h: &Header, msg: &[u8]) {
 
 /// Takes a UDP datagram over IPv6, as `udpv6_rcv` of Linux. `packet` has the IPv6 header.
 /// IPv6 needs the checksum of UDP.
-fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool) {
+fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool, dif: u32) {
     let d = &packet[h.l4..];
     let Some(u) = UdpHeader::parse(d) else { return count(&COUNTERS6.udp_in_errors) };
     let d = &d[..usize::from(u.len)];
@@ -988,7 +1142,7 @@ fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool) {
         count(&COUNTERS6.udp_in_csum_errors);
         return count(&COUNTERS6.udp_in_errors);
     }
-    let Some(sock) = stack::find_socket(&UDP_PORTS, u.dst, h.dst, h.src, u.src) else {
+    let Some(sock) = stack::find_socket(&UDP_PORTS, u.dst, h.dst, h.src, u.src, dif) else {
         count(&COUNTERS6.udp_no_ports);
         if !mcast {
             let code = ICMPV6_PORT_UNREACH as u8;
@@ -1038,6 +1192,14 @@ pub(crate) fn tick() {
     }
     dad_tick(now);
     mcast6::tick(now);
+    {
+        let mut f = FRAGS6.lock();
+        if !f.is_empty() {
+            let n = f.expire(now);
+            add(&COUNTERS6.reasm_timeout, n);
+            add(&COUNTERS6.reasm_fails, n);
+        }
+    }
     // The lifetimes count in seconds, thus one check each second is enough.
     if NEXT_EXPIRE.load(Ordering::Relaxed) <= now {
         NEXT_EXPIRE.store(now + 1000, Ordering::Relaxed);
@@ -1087,6 +1249,7 @@ pub(crate) fn ns_exit() {
     SOLICIT.reset();
     NEXT_EXPIRE.reset();
     DAD.reset();
+    FRAGS6.reset();
     COUNTERS6.reset();
     mcast6::ns_exit();
     addrconf::ns_exit();

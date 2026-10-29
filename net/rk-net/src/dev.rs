@@ -241,6 +241,9 @@ pub struct NetDevice {
     txqlen: AtomicU32,
     /// The device was up one time, thus it has its queue discipline.
     activated: AtomicBool,
+    /// The link multicast addresses of `SIOCADDMULTI`, as the entries of `dev->mc` with
+    /// `global_use` in Linux.
+    mc: SpinLock<Vec<MacAddr>>,
     counters: Counters,
     driver: Arc<dyn NetDriver>,
 }
@@ -320,6 +323,29 @@ impl NetDevice {
     /// The hardware address.
     pub fn mac(&self) -> MacAddr {
         self.driver.mac()
+    }
+
+    /// Adds the link multicast address `addr`, as `dev_mc_add_global` in net/core/dev_addr_lists.c
+    /// of Linux. An address that is there already does not change.
+    pub fn mc_add(&self, addr: MacAddr) {
+        let mut mc = self.mc.lock();
+        if !mc.contains(&addr) {
+            mc.push(addr);
+        }
+    }
+
+    /// Removes the link multicast address `addr`, as `dev_mc_del_global` of Linux. Gives
+    /// `ENOENT` if the device does not have it.
+    pub fn mc_del(&self, addr: MacAddr) -> Result<()> {
+        let mut mc = self.mc.lock();
+        let at = mc.iter().position(|a| *a == addr).ok_or(Errno::ENOENT)?;
+        mc.remove(at);
+        Ok(())
+    }
+
+    /// The link multicast addresses of `SIOCADDMULTI`.
+    pub fn mc_list(&self) -> Vec<MacAddr> {
+        self.mc.lock().clone()
     }
 
     /// The MTU.
@@ -640,6 +666,7 @@ pub fn register_at(
             mtu: AtomicU32::new(driver.mtu()),
             txqlen: AtomicU32::new(TX_QUEUE_LEN),
             activated: AtomicBool::new(false),
+            mc: SpinLock::new(Vec::new()),
             counters: Counters::default(),
             driver,
         });

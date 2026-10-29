@@ -66,8 +66,6 @@ pub enum Bad {
     Checksum,
     /// The total length is not in the frame.
     Length,
-    /// The packet is a fragment. There is no reassembly.
-    Fragment,
 }
 
 /// An IPv4 header.
@@ -111,7 +109,7 @@ impl Header {
 
     /// Reads and checks the header of `packet`, as `ip_rcv_core` of Linux: the version is 4, the
     /// header length is at least 20, the checksum is right and the total length is in the
-    /// packet. A fragment gives `Bad::Fragment`.
+    /// packet. A fragment is valid too: `is_fragment` tells it.
     pub fn parse(packet: &[u8]) -> Result<Self, Bad> {
         let p = packet.get(..HLEN).ok_or(Bad::Header)?;
         let hlen = usize::from(p[0] & 0xf) * 4;
@@ -128,9 +126,6 @@ impl Header {
             return Err(Bad::Length);
         }
         let frag = be16(6);
-        if frag & (MF | OFFSET_MASK) != 0 {
-            return Err(Bad::Fragment);
-        }
         Ok(Self {
             hlen,
             tos: p[1],
@@ -165,6 +160,16 @@ impl Header {
             src: [p[12], p[13], p[14], p[15]],
             dst: [p[16], p[17], p[18], p[19]],
         })
+    }
+
+    /// Tells if the packet is a fragment: it has the flag "more fragments" or an offset.
+    pub fn is_fragment(&self) -> bool {
+        self.frag & (MF | OFFSET_MASK) != 0
+    }
+
+    /// The offset of the data of a fragment in the packet, in bytes.
+    pub fn frag_offset(&self) -> usize {
+        usize::from(self.frag & OFFSET_MASK) * 8
     }
 
     /// The bytes of the header without options, with the checksum.

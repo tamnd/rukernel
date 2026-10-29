@@ -1854,9 +1854,11 @@ const NETNS_SCRIPT2: &[u8] = b"$N $A ip link set lo up && $N $A ip link set va u
 && ! ip route | grep -q 10.9.0 && ! ping -c 1 -W 1 10.9.0.2 \
 && echo 'netns: second'' part' || exit 1\n";
 
-/// The third line of the `netns` test. The sysctls of /proc/sys/net and a dummy device are in
-/// one namespace only.
-const NETNS_SCRIPT_SYSCTL: &[u8] = b"$N $A cat /proc/sys/net/ipv6/conf/va/disable_ipv6 \
+/// The third line of the `netns` test. Large pings go in fragments, and va is in 224.0.0.1. The
+/// sysctls of /proc/sys/net and a dummy device are in one namespace only.
+const NETNS_SCRIPT_SYSCTL: &[u8] = b"$N $A busybox ping6 -s 2048 -c 1 fd00::2 \
+&& $N $B busybox ping6 -s 4064 -c 1 fd00::1 && $N $A ping -s 4064 -c 1 10.9.0.2 \
+&& $N $A grep -q 010000E0 /proc/net/igmp && $N $A cat /proc/sys/net/ipv6/conf/va/disable_ipv6 \
 && ! test -e /proc/sys/net/ipv6/conf/va \
 && $N $A sh -c 'echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_all' \
 && ! $N $B ping -c 1 -W 1 10.9.0.1 && grep -q 0 /proc/sys/net/ipv4/icmp_echo_ignore_all \

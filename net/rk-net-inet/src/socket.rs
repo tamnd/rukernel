@@ -43,8 +43,8 @@ use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
 use rk_abi::native::socket::{
-    SO_ACCEPTCONN, SO_BINDTODEVICE, SO_BROADCAST, SO_COOKIE, SO_DOMAIN, SO_ERROR, SO_PROTOCOL,
-    SO_REUSEADDR, SO_TYPE, SOL_SOCKET,
+    SO_ACCEPTCONN, SO_BINDTODEVICE, SO_BINDTOIFINDEX, SO_BROADCAST, SO_COOKIE, SO_DOMAIN, SO_ERROR,
+    SO_PROTOCOL, SO_REUSEADDR, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
@@ -542,16 +542,19 @@ impl Dgram {
         self.wait.wake_all();
     }
 
-    /// The score of the socket for a packet from `src` and `sport`, or `None` if the socket
-    /// has another peer. A socket with this peer wins over a socket without a peer.
-    pub(crate) fn score(&self, src: &Ip, sport: u16) -> Option<u32> {
+    /// The score of the socket for a packet from `src` and `sport` that came in on `dif`, or
+    /// `None` if the socket has another peer or another device. A socket with this peer wins
+    /// over a socket without a peer, and a socket on the device wins over a socket on no
+    /// device, as `compute_score` in net/ipv4/udp.c of Linux.
+    pub(crate) fn score(&self, src: &Ip, sport: u16, dif: u32) -> Option<u32> {
         let s = self.state.lock();
-        if s.closed {
+        if s.closed || !stack::dev_match(s.oif, dif) {
             return None;
         }
+        let dev = if s.oif != 0 { 4 } else { 0 };
         match s.remote {
-            None => Some(0),
-            Some((a, p)) if a == *src && (p == sport || self.proto == Proto::Ping) => Some(2),
+            None => Some(dev),
+            Some((a, p)) if a == *src && (p == sport || self.proto == Proto::Ping) => Some(dev + 2),
             Some(_) => None,
         }
     }
@@ -580,11 +583,14 @@ impl Dgram {
     }
 
     /// Gives a copy of a packet to a raw socket, as `raw_v4_input` of Linux. `packet` has the
-    /// IPv4 header.
-    pub(crate) fn deliver_raw(&self, h: &Header, packet: &[u8]) {
+    /// IPv4 header, and it came in on `dif`.
+    pub(crate) fn deliver_raw(&self, h: &Header, packet: &[u8], dif: u32) {
         let (src, dst) = (ip::mapped(h.src), ip::mapped(h.dst));
         {
             let s = self.state.lock();
+            if !stack::dev_match(s.oif, dif) {
+                return;
+            }
             if !ip::is_any(&s.local) && s.local != dst {
                 return;
             }
@@ -604,8 +610,9 @@ impl Dgram {
 
     /// Gives a copy of an IPv6 packet to a raw socket, as `ipv6_raw_deliver` and
     /// `icmpv6_filter` of Linux. `payload` is the packet after the IPv6 headers, which is
-    /// what an IPv6 raw socket reads. The packet came in on `ifindex`.
-    pub(crate) fn deliver_raw6(&self, h: &ipv6::Header, ifindex: u32, payload: &[u8]) {
+    /// what an IPv6 raw socket reads. The packet came in on `ifindex`, and `dif` is the device
+    /// for `stack::dev_match`.
+    pub(crate) fn deliver_raw6(&self, h: &ipv6::Header, ifindex: u32, payload: &[u8], dif: u32) {
         let scope = stack6::scope_of(&h.src, ifindex);
         {
             let s = self.state.lock();
@@ -615,7 +622,7 @@ impl Dgram {
             if s.remote.is_some_and(|(a, _)| a != h.src) {
                 return;
             }
-            if s.oif != 0 && scope != 0 && s.oif != scope {
+            if !stack::dev_match(s.oif, dif) {
                 return;
             }
             if h.protocol == PROTO_ICMPV6
@@ -660,7 +667,7 @@ impl Dgram {
 
     /// Checks that `dst` can take a packet from this socket, and gives the route.
     fn route_to(&self, s: &State, dst: Addr) -> Result<crate::route::Next> {
-        let next = stack::route(dst)?;
+        let next = stack::route_oif(dst, s.oif)?;
         if next.broadcast && s.options.get(SO_BROADCAST).is_ok_and(|v| v == int(0)) {
             return Err(Errno::EACCES);
         }
@@ -673,7 +680,10 @@ impl Dgram {
         } else {
             s.ttl.unwrap_or_else(rk_net::sysctl::default_ttl)
         };
-        Out { src, dst, protocol, ttl, tos: s.tos }
+        // `IP_PMTUDISC_DO` and `IP_PMTUDISC_PROBE` forbid the fragments, as `ip_dont_fragment`
+        // of Linux.
+        let df = matches!(s.mtu_discover, 2 | 3);
+        Out { src, dst, protocol, ttl, tos: s.tos, df }
     }
 
     /// Sends `data` to `dst` and `dport`, and `scope` is the interface of a link local
@@ -785,7 +795,11 @@ impl Dgram {
             s.hops.unwrap_or(ipv6::DEFAULT_HOPS)
         };
         let tclass = s.tclass;
-        let out = |next| Out6 { src, dst: first, next, hops, tclass, ext: ext.clone() };
+        // `IPV6_DONTFRAG`, `IPV6_PMTUDISC_DO` and `IPV6_PMTUDISC_PROBE` forbid the fragments,
+        // as `ip6_sk_ignore_df` and `__ip6_append_data` of Linux.
+        let dontfrag = s.flags6.get(&IPV6_DONTFRAG).is_some_and(|&v| v != 0)
+            || matches!(s.mtu_discover, 2 | 3);
+        let out = |next| Out6 { src, dst: first, next, hops, tclass, ext: ext.clone(), dontfrag };
         match self.proto {
             Proto::Udp => {
                 if dport == 0 {
@@ -1334,7 +1348,7 @@ impl Socket for Dgram {
                 SO_ERROR => int(s.error.take().map_or(0, |e| i32::from(e.get()))),
                 SO_ACCEPTCONN => int(0),
                 SO_COOKIE => self.ino.to_ne_bytes().to_vec(),
-                SO_BINDTODEVICE => Vec::new(),
+                SO_BINDTODEVICE | SO_BINDTOIFINDEX => stack::bound_device(s.oif, name),
                 _ => s.options.get(name)?,
             }),
             IPPROTO_IP => Ok(match name {
@@ -1379,11 +1393,8 @@ impl Socket for Dgram {
                 SO_TYPE | SO_DOMAIN | SO_PROTOCOL | SO_ERROR | SO_ACCEPTCONN | SO_COOKIE => {
                     return Err(Errno::ENOPROTOOPT);
                 }
-                SO_BINDTODEVICE => {
-                    // Only the empty name, which removes the binding, is here.
-                    if value.first().is_some_and(|&b| b != 0) {
-                        return Err(Errno::ENODEV);
-                    }
+                SO_BINDTODEVICE | SO_BINDTOIFINDEX => {
+                    s.oif = stack::bind_device(s.oif, name, value)?;
                 }
                 _ => s.options.set(name, value)?,
             },

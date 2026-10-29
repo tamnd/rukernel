@@ -9,12 +9,18 @@
 //! sends a new request at the next use, as the `STALE` state of Linux. An entry that nobody
 //! uses for `GC_MS` goes away.
 //!
+//! The administrator adds, changes and removes entries with `set` and `remove`, as `neigh_add`
+//! and `neigh_delete` of Linux. A `Permanent` or `Noarp` entry does not change by ARP and does
+//! not go away by itself.
+//!
 //! The table does not send frames itself. Each call gives the work to the caller, and the
 //! caller gives the time in milliseconds. Thus the host tests can run the table.
 
 use crate::ipv4::Addr;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
+use rk_abi::Errno;
+use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE};
 use rk_net::ether::MacAddr;
 
 /// The time between two requests, `retrans_time` of Linux.
@@ -32,8 +38,22 @@ pub const QUEUE_LEN: usize = 8;
 pub type Key<A = Addr> = (u32, A);
 
 enum State<P> {
-    Incomplete { queue: VecDeque<P>, probes: u32, next: u64 },
-    Reachable { mac: MacAddr, confirmed: u64 },
+    Incomplete {
+        queue: VecDeque<P>,
+        probes: u32,
+        next: u64,
+    },
+    /// `stale` is set by the administrator, as `NUD_STALE`, until the next probe.
+    Reachable {
+        mac: MacAddr,
+        confirmed: u64,
+        stale: bool,
+    },
+    /// An entry of the administrator that never changes by itself: `Permanent` or `Noarp`.
+    Static {
+        mac: MacAddr,
+        nud: Nud,
+    },
 }
 
 struct Entry<P> {
@@ -51,6 +71,10 @@ pub enum Nud {
     Reachable,
     /// The reply is older than `REACHABLE_MS`, `NUD_STALE`.
     Stale,
+    /// The administrator set the address, and it does not change, `NUD_PERMANENT`.
+    Permanent,
+    /// The address needs no resolution, `NUD_NOARP`.
+    Noarp,
 }
 
 /// An entry of the table, for a dump of `RTM_GETNEIGH` and for /proc/net/arp.
@@ -141,14 +165,16 @@ impl<P, A: Copy + Ord> Table<P, A> {
         });
         entry.used = now;
         match &mut entry.state {
-            State::Reachable { mac, confirmed } => {
-                let stale = now.saturating_sub(*confirmed) >= REACHABLE_MS;
-                if stale {
+            State::Reachable { mac, confirmed, stale } => {
+                let probe = *stale || now.saturating_sub(*confirmed) >= REACHABLE_MS;
+                if probe {
                     // Send one request each `RETRANS_MS` until a reply comes.
                     *confirmed = now.saturating_sub(REACHABLE_MS - RETRANS_MS);
+                    *stale = false;
                 }
-                Resolve::Send { packet, mac: *mac, probe: stale }
+                Resolve::Send { packet, mac: *mac, probe }
             }
+            State::Static { mac, .. } => Resolve::Send { packet, mac: *mac, probe: false },
             State::Incomplete { queue, probes, next } => {
                 if queue.len() >= QUEUE_LEN {
                     queue.pop_front();
@@ -168,8 +194,94 @@ impl<P, A: Copy + Ord> Table<P, A> {
     /// The hardware address of `key`, if the table knows it.
     pub fn lookup(&self, key: Key<A>) -> Option<MacAddr> {
         match self.entries.get(&key)?.state {
-            State::Reachable { mac, .. } => Some(mac),
+            State::Reachable { mac, .. } | State::Static { mac, .. } => Some(mac),
             State::Incomplete { .. } => None,
+        }
+    }
+
+    /// Tells if the table has an entry for `key`.
+    pub fn contains(&self, key: Key<A>) -> bool {
+        self.entries.contains_key(&key)
+    }
+
+    /// Adds or changes an entry for the administrator, as `neigh_add` and `__neigh_update` of
+    /// Linux with `NEIGH_UPDATE_F_ADMIN`. Without `mac`, the entry keeps its old address. If
+    /// `replace` is false, a different old address stays, as an update without
+    /// `NEIGH_UPDATE_F_OVERRIDE`. Gives the packets that waited for the address, or `None` if
+    /// the state is not valid or the entry has no address.
+    pub fn set(
+        &mut self,
+        key: Key<A>,
+        mac: Option<MacAddr>,
+        nud: Nud,
+        now: u64,
+        replace: bool,
+    ) -> Option<Vec<P>> {
+        let old = self.lookup(key);
+        let mac = match (mac, old) {
+            (Some(_), Some(o)) if !replace => o,
+            (Some(m), _) => m,
+            (None, Some(o)) => o,
+            (None, None) => return None,
+        };
+        let state = match nud {
+            Nud::Permanent | Nud::Noarp => State::Static { mac, nud },
+            Nud::Reachable => State::Reachable { mac, confirmed: now, stale: false },
+            Nud::Stale => State::Reachable { mac, confirmed: now, stale: true },
+            Nud::Incomplete => return None,
+        };
+        match self.entries.get_mut(&key) {
+            Some(entry) => {
+                entry.updated = now;
+                Some(match core::mem::replace(&mut entry.state, state) {
+                    State::Incomplete { queue, .. } => queue.into(),
+                    _ => Vec::new(),
+                })
+            }
+            None => {
+                self.entries.insert(key, Entry { state, used: now, updated: now });
+                Some(Vec::new())
+            }
+        }
+    }
+
+    /// Adds or changes an entry for `RTM_NEWNEIGH` with the netlink flags `flags`, as
+    /// `neigh_add` of Linux: `NLM_F_EXCL` refuses an entry that exists, a new entry needs
+    /// `NLM_F_CREATE`, and `NLM_F_REPLACE` changes the address of an entry.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EEXIST`, `ENOENT`, or `EINVAL` if the entry has no address.
+    pub fn add(
+        &mut self,
+        key: Key<A>,
+        mac: Option<MacAddr>,
+        nud: Nud,
+        now: u64,
+        flags: u32,
+    ) -> Result<Vec<P>, Errno> {
+        let exists = self.contains(key);
+        if exists && flags & NLM_F_EXCL != 0 {
+            return Err(Errno::EEXIST);
+        }
+        if !exists && flags & NLM_F_CREATE == 0 {
+            return Err(Errno::ENOENT);
+        }
+        let replace = !exists || flags & NLM_F_REPLACE != 0;
+        self.set(key, mac, nud, now, replace).ok_or(Errno::EINVAL)
+    }
+
+    /// Removes the entry `key` and drops the packets that wait for it, as `neigh_delete` of
+    /// Linux. Gives `false` if there is no entry.
+    pub fn remove(&mut self, key: Key<A>) -> bool {
+        match self.entries.remove(&key) {
+            Some(e) => {
+                if let State::Incomplete { queue, .. } = e.state {
+                    self.dropped += queue.len() as u64;
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -177,13 +289,16 @@ impl<P, A: Copy + Ord> Table<P, A> {
     /// Linux. If `create` is false, only an entry that exists changes. Gives the packets that
     /// waited for the address, for the caller to send.
     pub fn update(&mut self, key: Key<A>, mac: MacAddr, now: u64, create: bool) -> Vec<P> {
-        let reachable = State::Reachable { mac, confirmed: now };
+        let reachable = State::Reachable { mac, confirmed: now, stale: false };
         match self.entries.get_mut(&key) {
+            // ARP does not change an entry of the administrator, as `__neigh_update` gives
+            // `EPERM` for `NUD_PERMANENT` and `NUD_NOARP` without `NEIGH_UPDATE_F_ADMIN`.
+            Some(Entry { state: State::Static { .. }, .. }) => Vec::new(),
             Some(entry) => {
                 entry.updated = now;
                 match core::mem::replace(&mut entry.state, reachable) {
                     State::Incomplete { queue, .. } => queue.into(),
-                    State::Reachable { .. } => Vec::new(),
+                    _ => Vec::new(),
                 }
             }
             None => {
@@ -216,6 +331,7 @@ impl<P, A: Copy + Ord> Table<P, A> {
                 true
             }
             State::Reachable { .. } => now.saturating_sub(entry.used) < GC_MS,
+            State::Static { .. } => true,
         });
         self.dropped += dropped;
         probes
@@ -239,14 +355,15 @@ impl<P, A: Copy + Ord> Table<P, A> {
             .map(|(&(ifindex, addr), e)| {
                 let (mac, state, probes, confirmed) = match &e.state {
                     State::Incomplete { probes, .. } => (None, Nud::Incomplete, *probes, e.updated),
-                    State::Reachable { mac, confirmed } => {
-                        let state = if ago(*confirmed) < REACHABLE_MS {
+                    State::Reachable { mac, confirmed, stale } => {
+                        let state = if !*stale && ago(*confirmed) < REACHABLE_MS {
                             Nud::Reachable
                         } else {
                             Nud::Stale
                         };
                         (Some(*mac), state, 0, *confirmed)
                     }
+                    State::Static { mac, nud } => (Some(*mac), *nud, 0, e.updated),
                 };
                 Info {
                     ifindex,

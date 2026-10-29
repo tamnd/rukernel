@@ -1,28 +1,31 @@
-//! The ioctls of IPv4 sockets, as `inet_ioctl`, `devinet_ioctl` and `ip_rt_ioctl` of Linux: the
-//! addresses of the interfaces and the routes of `route add`. The other socket ioctls go to the
+//! The ioctls of IPv4 sockets, as `inet_ioctl`, `devinet_ioctl`, `ip_rt_ioctl` and `arp_ioctl`
+//! of Linux: the addresses of the interfaces, the routes of `route add` and the ARP entries of
+//! `arp -s` and `arp -d`. The other socket ioctls go to the
 //! calls of the network devices in rk-net.
 
 use crate::fib;
 use crate::ipv4::{self, Addr};
+use crate::neigh::Nud;
 use crate::route::{IfAddr, Match, RTAX_ADVMSS, RTAX_RTT, RTAX_WINDOW, Route};
 use crate::stack::ROUTES;
 use alloc::string::String;
 use rk_abi::Errno;
-use rk_abi::native::netlink::NLM_F_CREATE;
+use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_MAIN, RTN_UNICAST,
     RTN_UNREACHABLE, RTPROT_BOOT,
 };
 use rk_abi::native::sockios::{
-    SIOCADDRT, SIOCDELRT, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFDSTADDR, SIOCGIFNETMASK,
-    SIOCGIFPFLAGS, SIOCRTMSG, SIOCSIFADDR, SIOCSIFBRDADDR, SIOCSIFDSTADDR, SIOCSIFFLAGS,
-    SIOCSIFNETMASK, SIOCSIFPFLAGS,
+    SIOCADDRT, SIOCDARP, SIOCDELRT, SIOCGARP, SIOCGIFADDR, SIOCGIFBRDADDR, SIOCGIFDSTADDR,
+    SIOCGIFNETMASK, SIOCGIFPFLAGS, SIOCRTMSG, SIOCSARP, SIOCSIFADDR, SIOCSIFBRDADDR,
+    SIOCSIFDSTADDR, SIOCSIFFLAGS, SIOCSIFNETMASK, SIOCSIFPFLAGS,
 };
 use rk_net::consts::{
-    AF_INET, IFF_BROADCAST, IFF_POINTOPOINT, IFF_UP, IFNAMSIZ, RTF_GATEWAY, RTF_HOST, RTF_IRTT,
-    RTF_MTU, RTF_REJECT, RTF_WINDOW,
+    AF_INET, ATF_COM, ATF_DONTPUB, ATF_NETMASK, ATF_PERM, ATF_PUBL, IFF_BROADCAST, IFF_POINTOPOINT,
+    IFF_UP, IFNAMSIZ, RTF_GATEWAY, RTF_HOST, RTF_IRTT, RTF_MTU, RTF_REJECT, RTF_WINDOW,
 };
 use rk_net::dev::{self, NetDevice};
+use rk_net::ether::MacAddr;
 use rk_net::ioctl::{IfReq, net_admin};
 use rk_net::netlink::Origin;
 use rk_vfs::UserMemory;
@@ -30,6 +33,8 @@ use rk_vfs::inode::Result;
 
 /// The size of `struct rtentry` on a 64-bit machine.
 const RTENTRY_LEN: usize = 120;
+/// The size of `struct arpreq`.
+const ARPREQ_LEN: usize = 68;
 
 /// The ioctls of an IPv4 socket. Gives `None` for a call that IPv4 does not take, as
 /// `ENOIOCTLCMD`.
@@ -37,6 +42,7 @@ pub(crate) fn inet_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Option<R
     Some(match cmd {
         SIOCADDRT | SIOCDELRT => rt_ioctl(cmd, arg, mem).map(|()| 0),
         SIOCRTMSG => Err(Errno::EINVAL),
+        SIOCSARP | SIOCDARP | SIOCGARP => arp_ioctl(cmd, arg, mem).map(|()| 0),
         SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCGIFDSTADDR | SIOCGIFPFLAGS => {
             IfReq::read(mem, arg).and_then(|mut r| {
                 devinet_ioctl(cmd, &mut r)?;
@@ -231,6 +237,98 @@ fn set_addr(d: &NetDevice, name: &str, colon: bool, old: Option<IfAddr>, a: Addr
 
 fn sockaddr_at(b: &[u8], at: usize) -> (u16, Addr) {
     (u16::from_ne_bytes([b[at], b[at + 1]]), [b[at + 4], b[at + 5], b[at + 6], b[at + 7]])
+}
+
+/// `SIOCSARP`, `SIOCDARP` and `SIOCGARP`, as `arp_ioctl` in net/ipv4/arp.c of Linux. The stack
+/// has no proxy ARP, thus `ATF_PUBL` gives `EOPNOTSUPP`.
+fn arp_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<()> {
+    if cmd != SIOCGARP && !net_admin() {
+        return Err(Errno::EPERM);
+    }
+    let mut r = [0u8; ARPREQ_LEN];
+    mem.read(arg, &mut r).map_err(|_| Errno::EFAULT)?;
+    let (pa_family, ip) = sockaddr_at(&r, 0);
+    let mut ha_family = u16::from_ne_bytes([r[16], r[17]]);
+    let mut flags = u32::from_ne_bytes([r[32], r[33], r[34], r[35]]);
+    if u32::from(pa_family) != AF_INET {
+        return Err(Errno::EPFNOSUPPORT);
+    }
+    if flags & ATF_PUBL == 0 && flags & (ATF_NETMASK | ATF_DONTPUB) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = &r[52..52 + IFNAMSIZ - 1];
+    let name = &name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())];
+    let mut d = None;
+    if !name.is_empty() {
+        let dv = dev::by_name(&String::from_utf8_lossy(name)).ok_or(Errno::ENODEV)?;
+        let ty = dv.kind().arphrd();
+        if ha_family == 0 {
+            ha_family = ty;
+        }
+        if flags & ATF_COM != 0 && ha_family != ty {
+            return Err(Errno::EINVAL);
+        }
+        d = Some(dv);
+    } else if cmd == SIOCGARP {
+        return Err(Errno::ENODEV);
+    }
+    if flags & ATF_PUBL != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    // Without a device, the route to the address gives it, as `arp_req_dev_by_ip`.
+    let d = match d {
+        Some(d) => d,
+        None => {
+            let next = crate::stack::route(ip)?;
+            dev::by_index(next.ifindex).ok_or(Errno::EINVAL)?
+        }
+    };
+    match cmd {
+        SIOCDARP => {
+            if crate::stack::neigh_del(d.ifindex(), ip) {
+                Ok(())
+            } else {
+                Err(Errno::ENXIO)
+            }
+        }
+        SIOCSARP => {
+            // `arp_req_set`: a permanent entry has its address.
+            if ha_family != d.kind().arphrd() {
+                return Err(Errno::EINVAL);
+            }
+            let nud = if flags & ATF_PERM != 0 {
+                flags |= ATF_COM;
+                Nud::Permanent
+            } else {
+                Nud::Stale
+            };
+            let mac =
+                (flags & ATF_COM != 0).then(|| MacAddr(r[18..24].try_into().unwrap_or([0; 6])));
+            let create = NLM_F_CREATE | NLM_F_REPLACE;
+            crate::stack::neigh_add(&d, ip, mac, nud, create)
+        }
+        _ => {
+            // `arp_req_get`: an entry without `NUD_NOARP` gives its address and flags.
+            let n = crate::stack::neighbours()
+                .into_iter()
+                .find(|n| n.ifindex == d.ifindex() && n.addr == ip && n.state != Nud::Noarp)
+                .ok_or(Errno::ENXIO)?;
+            let mac = n.mac.unwrap_or(MacAddr::ZERO);
+            r[16..18].copy_from_slice(&d.kind().arphrd().to_ne_bytes());
+            r[18..24].copy_from_slice(&mac.0);
+            let flags = match n.state {
+                Nud::Incomplete => 0,
+                Nud::Permanent => ATF_PERM | ATF_COM,
+                _ => ATF_COM,
+            };
+            r[32..36].copy_from_slice(&flags.to_ne_bytes());
+            let dn = d.name();
+            r[52..52 + IFNAMSIZ].fill(0);
+            let len = dn.len().min(IFNAMSIZ - 1);
+            r[52..52 + len].copy_from_slice(&dn.as_bytes()[..len]);
+            mem.write(arg, &r).map_err(|_| Errno::EFAULT)
+        }
+    }
 }
 
 /// `SIOCADDRT` and `SIOCDELRT`, as `ip_rt_ioctl` and `rtentry_to_fib_config` of Linux.

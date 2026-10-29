@@ -28,6 +28,8 @@ mod addrconf;
 pub mod checksum;
 pub mod config;
 pub mod fib;
+pub mod frag;
+mod igmp;
 mod ioctl;
 pub mod ip;
 pub mod ipv4;
@@ -68,6 +70,7 @@ pub fn init() {
     rk_net::ioctl::set_ifconf(fib::ifconf);
     dev::add_notifier(fib::event);
     dev::add_notifier(addrconf::event);
+    dev::add_notifier(igmp::event);
     rk_net::sysctl::add_hook(addrconf::sysctl_hook);
     rk_net::ns::add_ops(ns_init, ns_exit);
     dev::set_rx_kick(stack::poll_now);
@@ -75,6 +78,7 @@ pub fn init() {
         if lo.is_up() {
             fib::event(&lo, Event::Up);
             addrconf::event(&lo, Event::Up);
+            igmp::event(&lo, Event::Up);
         } else {
             lo.set_up(true);
         }
@@ -93,6 +97,7 @@ fn ns_exit() {
     tcp::ns_exit();
     stack6::ns_exit();
     stack::ns_exit();
+    igmp::ns_exit();
 }
 
 /// Configures an Ethernet device from the value of `ip=` on the kernel command line, as

@@ -34,9 +34,9 @@ use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
 use rk_abi::native::socket::{
-    SO_ACCEPTCONN, SO_BINDTODEVICE, SO_COOKIE, SO_DOMAIN, SO_ERROR, SO_KEEPALIVE, SO_LINGER,
-    SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TYPE,
-    SOL_SOCKET,
+    SO_ACCEPTCONN, SO_BINDTODEVICE, SO_BINDTOIFINDEX, SO_COOKIE, SO_DOMAIN, SO_ERROR, SO_KEEPALIVE,
+    SO_LINGER, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE,
+    SO_TYPE, SOL_SOCKET,
 };
 use rk_abi::native::tcp::{
     TCP_CONGESTION, TCP_CORK, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY,
@@ -120,7 +120,8 @@ struct Inner {
     local: Ip,
     port: u16,
     remote: Option<(Ip, u16)>,
-    /// The interface of a link local address, from the scope ID, or 0.
+    /// The interface of a link local address, from the scope ID, or the device of
+    /// `SO_BINDTODEVICE`, or 0. This is `sk_bound_dev_if` of Linux.
     oif: u32,
     /// `IPV6_V6ONLY`.
     v6only: bool,
@@ -352,16 +353,20 @@ fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, seg: &Seg) {
     }
     let &(src, sport, dst, dport) = key;
     let bytes = seg.encode(sport, dport, &src, &dst);
-    let out = Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos, ext: Vec::new() };
+    // A segment fits in the MSS, and TCP sets DF, as `ip_queue_xmit` of Linux.
+    let out =
+        Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos, ext: Vec::new(), dontfrag: true };
     // A lost segment is like a segment that the network lost: the timers send it again.
     let _ = stack6::output_ip(&out, oif, &bytes);
 }
 
 /// The listening socket for a segment to `dst` and `port`. A socket with the address `dst`
-/// wins over a wildcard socket, and an IPv4 wildcard wins over `::`, as `compute_score`.
-fn listener(port: u16, dst: &Ip) -> Option<Arc<Stream>> {
-    let table = LISTEN.lock();
-    let list = table.get(&port)?;
+/// wins over a wildcard socket, and an IPv4 wildcard wins over `::`, as `compute_score`. A
+/// socket on another device than `dif` does not take the segment, as `inet_sk_bound_dev_eq`.
+fn listener(port: u16, dst: &Ip, dif: u32) -> Option<Arc<Stream>> {
+    let list: Listeners = LISTEN.lock().get(&port)?.clone();
+    let list: Listeners =
+        list.into_iter().filter(|(_, _, s)| stack::dev_match(s.oif(), dif)).collect();
     list.iter()
         .find(|(a, _, _)| a == dst)
         .or_else(|| list.iter().find(|(a, _, _)| *a == ip::V4_ANY && ip::v4(dst).is_some()))
@@ -370,8 +375,9 @@ fn listener(port: u16, dst: &Ip) -> Option<Arc<Stream>> {
 }
 
 /// Takes a TCP segment, as `tcp_v4_rcv` and `tcp_v6_rcv` of Linux. `tcp` has the header and
-/// the data. An IPv4 packet has IPv4-mapped addresses.
-pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool) {
+/// the data. An IPv4 packet has IPv4-mapped addresses. The segment came in on `dif`, for
+/// `stack::dev_match`.
+pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool, dif: u32) {
     if broadcast {
         return;
     }
@@ -388,11 +394,11 @@ pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool) {
     add(&COUNTERS.tcp_in_segs, 1);
     let key = (dst, dport, src, sport);
     let found = ESTAB.lock().get(&key).cloned();
-    if let Some(sock) = found {
+    if let Some(sock) = found.filter(|s| stack::dev_match(s.oif(), dif)) {
         sock.segment(seg);
         return;
     }
-    if let Some(l) = listener(dport, &dst)
+    if let Some(l) = listener(dport, &dst, dif)
         && l.syn(&key, &seg)
     {
         return;
@@ -518,6 +524,11 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// The device of the socket, `sk_bound_dev_if` of Linux, or 0.
+    fn oif(&self) -> u32 {
+        self.state.lock().oif
+    }
+
     /// Makes a socket.
     pub fn new() -> Arc<Self> {
         Self::with(Inner::new(AF_INET))
@@ -1258,7 +1269,7 @@ impl Socket for Stream {
                 }
                 SO_ACCEPTCONN => int(i32::from(s.listen.is_some())),
                 SO_COOKIE => self.ino.to_ne_bytes().to_vec(),
-                SO_BINDTODEVICE => Vec::new(),
+                SO_BINDTODEVICE | SO_BINDTOIFINDEX => stack::bound_device(s.oif, name),
                 _ => s.options.get(name)?,
             }),
             IPPROTO_IP => Ok(match name {
@@ -1312,10 +1323,8 @@ impl Socket for Stream {
                     SO_TYPE | SO_DOMAIN | SO_PROTOCOL | SO_ERROR | SO_ACCEPTCONN | SO_COOKIE => {
                         return Err(Errno::ENOPROTOOPT);
                     }
-                    SO_BINDTODEVICE => {
-                        if value.first().is_some_and(|&b| b != 0) {
-                            return Err(Errno::ENODEV);
-                        }
+                    SO_BINDTODEVICE | SO_BINDTOIFINDEX => {
+                        s.oif = stack::bind_device(s.oif, name, value)?;
                     }
                     _ => {
                         s.options.set(name, value)?;
