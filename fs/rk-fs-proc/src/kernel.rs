@@ -373,11 +373,8 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/inotify/max_queued_events", ""),
     ("fs/inotify/max_user_instances", ""),
     ("fs/inotify/max_user_watches", ""),
-    // The time in seconds that a lease holder has to give up its lease, and the switch of the
-    // leases, as `lease_break_time` and `leases_enable` of fs/locks.c of Linux. rukernel does not
-    // break a lease yet, so the files only keep their text.
-    ("fs/lease-break-time", "45"),
-    ("fs/leases-enable", "1"),
+    ("fs/lease-break-time", ""),
+    ("fs/leases-enable", ""),
     ("fs/pipe-max-size", ""),
     // rukernel does not count the pipe pages of each user, so the limits only keep their text.
     ("fs/pipe-user-pages-hard", "0"),
@@ -435,10 +432,11 @@ const READ_ONLY_SYSCTLS: &[&str] = &["kernel/random/entropy_avail", "kernel/rand
 
 static SYSCTL_VALUES: SpinLock<Vec<(&'static str, Vec<u8>)>> = SpinLock::new(Vec::new());
 
-/// The sysctl of `name` that the VFS reads, `fs.protected_*` and `fs.inotify.*`, and its largest
-/// value.
+/// The sysctl of `name` that the VFS reads, `fs.protected_*`, `fs.inotify.*` and the lease
+/// sysctls, and its largest value.
 fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
     use rk_vfs::cred::protected::{FIFOS, HARDLINKS, REGULAR, SYMLINKS};
+    use rk_vfs::lease::{BREAK_TIME, ENABLE};
     use rk_vfs::notify::inotify::{MAX_QUEUED_EVENTS, MAX_USER_INSTANCES, MAX_USER_WATCHES};
     // The inotify limits go from 0 to `INT_MAX`, as `inotify_table` of Linux.
     const INT_MAX: u32 = i32::MAX as u32;
@@ -446,6 +444,11 @@ fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
         "fs/inotify/max_queued_events" => Some((&MAX_QUEUED_EVENTS, INT_MAX)),
         "fs/inotify/max_user_instances" => Some((&MAX_USER_INSTANCES, INT_MAX)),
         "fs/inotify/max_user_watches" => Some((&MAX_USER_WATCHES, INT_MAX)),
+        // The time in seconds that a lease holder has to give up its lease, and the switch of
+        // the leases, as `lease_break_time` and `leases_enable` of fs/locks.c of Linux. Linux
+        // takes any `int`, but a negative value has the effect of 0, so rukernel refuses it.
+        "fs/lease-break-time" => Some((&BREAK_TIME, INT_MAX)),
+        "fs/leases-enable" => Some((&ENABLE, INT_MAX)),
         "fs/protected_fifos" => Some((&FIFOS, 2)),
         "fs/protected_hardlinks" => Some((&HARDLINKS, 1)),
         "fs/protected_regular" => Some((&REGULAR, 2)),
