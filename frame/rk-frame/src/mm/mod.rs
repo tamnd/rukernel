@@ -15,6 +15,9 @@ pub(crate) mod bitmap;
 pub(crate) mod frame;
 #[cfg(target_os = "none")]
 pub(crate) mod heap;
+#[cfg(any(test, target_os = "none"))]
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
+pub(crate) mod pcp;
 #[cfg(target_os = "none")]
 pub use frame::{
     Frame, FrameStats, HUGE_FRAMES, HugeKind, HugeRun, Mapping, PageInfo, alloc_frame,

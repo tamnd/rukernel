@@ -16,6 +16,7 @@
 //! unmap a kernel stack, and the free sends no TLB shootdown to the other CPUs.
 
 use super::frame::{alloc_frame_phys, alloc_run_phys, free_frame_phys};
+use super::pcp::CpuList;
 use crate::addr::PAGE_SIZE;
 use crate::arch::imp::paging;
 use crate::sync::SpinLock;
@@ -30,6 +31,21 @@ const LARGEST_CLASS: usize = CLASSES[CLASSES.len() - 1];
 /// The head of the free list of each class. A free object holds the address of the next free
 /// object in its first word. The value 0 ends the list.
 static FREE: SpinLock<[usize; CLASSES.len()]> = SpinLock::new([0; CLASSES.len()]);
+
+/// A list of a CPU holds up to this many free objects of a class.
+const CPU_HIGH: usize = 32;
+/// A list of a CPU takes or gives back this many objects at a time.
+const CPU_BATCH: usize = 16;
+
+/// The free objects of one CPU, a list for each class, on their own cache lines. An allocation
+/// takes an object from the list of its CPU, so the CPUs share the lock of `FREE` only for a
+/// batch, as the per CPU slabs of the SLUB allocator of Linux (mm/slub.c).
+#[repr(align(64))]
+struct CpuFree(SpinLock<[CpuList<CPU_HIGH>; CLASSES.len()]>);
+
+static CPU_FREE: [CpuFree; crate::cpu::MAX_CPUS] =
+    [const { CpuFree(SpinLock::new([const { CpuList::new() }; CLASSES.len()])) };
+        crate::cpu::MAX_CPUS];
 
 /// A large object of up to this many pages comes from the direct map. A larger object has a guard
 /// page, so a kernel stack must be larger.
@@ -70,10 +86,10 @@ fn class(layout: Layout) -> Option<usize> {
 
 /// Turns interrupts off while it lives, and then turns them back on if they were on. The heap
 /// lock is held with interrupts off, so an interrupt handler can allocate.
-struct IrqOff(bool);
+pub(crate) struct IrqOff(bool);
 
 impl IrqOff {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let on = crate::irq::enabled();
         crate::irq::disable();
         Self(on)
@@ -90,9 +106,21 @@ impl Drop for IrqOff {
 
 fn alloc_small(index: usize) -> *mut u8 {
     let _irq = IrqOff::new();
-    let mut free = FREE.lock();
+    let mut lists = CPU_FREE[crate::cpu::id()].0.lock();
+    let mut global = None;
+    let object = lists[index]
+        .pop_or_refill(CPU_BATCH, || take_global(global.get_or_insert_with(|| FREE.lock()), index));
+    drop(global);
+    let Some(object) = object else { return core::ptr::null_mut() };
+    IN_USE.fetch_add(CLASSES[index] as u64, Ordering::Relaxed);
+    object as *mut u8
+}
+
+/// Takes an object of the class `index` from the global free lists `free`. An empty list gets a
+/// new slab first.
+fn take_global(free: &mut [usize; CLASSES.len()], index: usize) -> Option<usize> {
     if free[index] == 0 {
-        let Some(phys) = alloc_frame_phys() else { return core::ptr::null_mut() };
+        let phys = alloc_frame_phys()?;
         let page = paging::phys_to_virt(phys);
         let size = CLASSES[index];
         // Put the objects of the new slab on the list, the first object at the head.
@@ -107,17 +135,21 @@ fn alloc_small(index: usize) -> *mut u8 {
     // SAFETY: `object` is on the free list, so it is a free object of this class in a slab, and
     // its first word holds the next free object.
     free[index] = unsafe { (object as *const usize).read() };
-    IN_USE.fetch_add(CLASSES[index] as u64, Ordering::Relaxed);
-    object as *mut u8
+    Some(object)
 }
 
 fn dealloc_small(ptr: *mut u8, index: usize) {
     let _irq = IrqOff::new();
-    let mut free = FREE.lock();
-    // SAFETY: the caller gives an object of this class that `alloc_small` gave and that is not
-    // in use now, so the heap owns it again and can write its first word.
-    unsafe { ptr.cast::<usize>().write(free[index]) };
-    free[index] = ptr as usize;
+    let mut lists = CPU_FREE[crate::cpu::id()].0.lock();
+    let mut global = None;
+    lists[index].push_or_drain(ptr as usize, CPU_BATCH, |object| {
+        let free = global.get_or_insert_with(|| FREE.lock());
+        // SAFETY: an object on the list of a CPU is an object of this class that `alloc_small`
+        // gave and that is not in use now, so the heap owns it and can write its first word.
+        unsafe { (object as *mut usize).write(free[index]) };
+        free[index] = object;
+    });
+    drop(global);
     IN_USE.fetch_sub(CLASSES[index] as u64, Ordering::Relaxed);
 }
 

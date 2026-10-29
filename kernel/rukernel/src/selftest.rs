@@ -228,19 +228,21 @@ fn mm_test() -> bool {
     drop(frame);
     ok &= check("a dropped frame is free again", mm::frame_stats().free == start.free);
 
-    // Many frames: each is different, and all come back.
-    let mut last = None;
-    let mut distinct = true;
-    let mut held = 0;
+    // Many frames: each is different, and all come back. The list of each CPU gives the frames
+    // in no fixed order, so the addresses are sorted. The vector has its memory before the count.
+    let mut addrs = alloc::vec::Vec::with_capacity(1000);
+    let before = mm::frame_stats().free;
     for _ in 0..1000 {
         let Some(f) = mm::alloc_frame() else { break };
-        distinct &= last.is_none_or(|l| f.addr() > l);
-        last = Some(f.addr());
-        held += 1;
+        addrs.push(f.addr().get());
         core::mem::forget(f);
     }
-    ok &= check("1000 frames are different", held == 1000 && distinct);
-    ok &= check("1000 frames are counted", mm::frame_stats().free == start.free - 1000);
+    let held = addrs.len();
+    ok &= check("1000 frames are counted", mm::frame_stats().free == before - 1000);
+    addrs.sort_unstable();
+    addrs.dedup();
+    ok &= check("1000 frames are different", held == 1000 && addrs.len() == 1000);
+    drop(addrs);
 
     // The permissions of the kernel image.
     let text = mm::query(VirtAddr::new(mm_test as fn() -> bool as usize));

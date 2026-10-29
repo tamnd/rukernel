@@ -11,7 +11,7 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 /// A spin lock that protects a value of type `T`.
 pub struct SpinLock<T> {
@@ -95,6 +95,122 @@ impl<T> Drop for SpinLockGuard<'_, T> {
     }
 }
 
+/// The state of a [`RwLock`] that a writer holds.
+const WRITER: u32 = 1 << 31;
+/// A writer waits. New readers wait until it had the lock, so a stream of readers cannot keep a
+/// writer out.
+const WRITER_WAITS: u32 = 1 << 30;
+
+/// A spin lock that many readers or one writer can hold, as the `rwlock_t` of Linux. A writer that
+/// waits stops new readers. A CPU that spins does the TLB requests of the other CPUs, as with
+/// [`SpinLock`].
+pub struct RwLock<T> {
+    /// The number of readers in the low bits, and `WRITER` and `WRITER_WAITS`.
+    state: AtomicU32,
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: a writer gets one `&mut T` with no readers, and readers get `&T` at the same time on
+// different CPUs. Thus `T` must be `Send` for the writer and `Sync` for the readers.
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    /// Makes an unlocked lock.
+    pub const fn new(value: T) -> Self {
+        Self { state: AtomicU32::new(0), value: UnsafeCell::new(value) }
+    }
+
+    /// Takes the lock for a read. The CPU spins while a writer holds the lock or waits for it.
+    pub fn read(&self) -> ReadGuard<'_, T> {
+        loop {
+            let s = self.state.load(Ordering::Relaxed);
+            if s & (WRITER | WRITER_WAITS) == 0
+                && self
+                    .state
+                    .compare_exchange_weak(s, s + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return ReadGuard { lock: self };
+            }
+            wait_hint();
+        }
+    }
+
+    /// Takes the lock for a write. The CPU spins until no reader and no writer holds the lock.
+    pub fn write(&self) -> WriteGuard<'_, T> {
+        loop {
+            let s = self.state.load(Ordering::Relaxed);
+            if s & !WRITER_WAITS == 0 {
+                if self
+                    .state
+                    .compare_exchange_weak(s, WRITER, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return WriteGuard { lock: self };
+                }
+            } else if s & WRITER_WAITS == 0 {
+                self.state.fetch_or(WRITER_WAITS, Ordering::Relaxed);
+            }
+            wait_hint();
+        }
+    }
+
+    /// Takes the lock for a write if no reader and no writer holds it.
+    pub fn try_write(&self) -> Option<WriteGuard<'_, T>> {
+        let s = self.state.load(Ordering::Relaxed);
+        (s & !WRITER_WAITS == 0)
+            .then(|| self.state.compare_exchange(s, WRITER, Ordering::Acquire, Ordering::Relaxed))
+            .and_then(Result::ok)
+            .map(|_| WriteGuard { lock: self })
+    }
+}
+
+/// The guard of a [`RwLock`] that a reader holds.
+pub struct ReadGuard<'a, T> {
+    lock: &'a RwLock<T>,
+}
+
+impl<T> Deref for ReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists only while no writer holds the lock.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for ReadGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.state.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// The guard of a [`RwLock`] that a writer holds.
+pub struct WriteGuard<'a, T> {
+    lock: &'a RwLock<T>,
+}
+
+impl<T> Deref for WriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists only while this CPU holds the lock and no reader holds it.
+        unsafe { &*self.lock.value.get() }
+    }
+}
+
+impl<T> DerefMut for WriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as for `deref`, and `&mut self` makes sure that there is one mutable reference.
+        unsafe { &mut *self.lock.value.get() }
+    }
+}
+
+impl<T> Drop for WriteGuard<'_, T> {
+    fn drop(&mut self) {
+        // Another writer can have set `WRITER_WAITS`, and it stays.
+        self.lock.state.fetch_and(!WRITER, Ordering::Release);
+    }
+}
+
 const EMPTY: u8 = 0;
 const RUNNING: u8 = 1;
 const DONE: u8 = 2;
@@ -175,6 +291,60 @@ mod tests {
         assert!(lock.try_lock().is_none());
         drop(guard);
         assert_eq!(*lock.lock(), 2);
+    }
+
+    #[test]
+    fn rwlock_gives_many_readers_or_one_writer() {
+        let lock = RwLock::new(1);
+        let a = lock.read();
+        let b = lock.read();
+        assert_eq!(*a + *b, 2);
+        assert!(lock.try_write().is_none());
+        drop((a, b));
+        let mut w = lock.try_write().unwrap_or_else(|| panic!("the lock is free"));
+        *w = 3;
+        assert!(lock.try_write().is_none());
+        drop(w);
+        assert_eq!(*lock.read(), 3);
+    }
+
+    #[test]
+    fn a_waiting_writer_stops_new_readers() {
+        let lock = RwLock::new(0);
+        let r = lock.read();
+        lock.state.fetch_or(WRITER_WAITS, Ordering::Relaxed);
+        // A new reader would spin now. The writer gets the lock when the reader goes.
+        assert_eq!(lock.state.load(Ordering::Relaxed) & !WRITER_WAITS, 1);
+        drop(r);
+        let w = lock.write();
+        assert_eq!(lock.state.load(Ordering::Relaxed), WRITER);
+        drop(w);
+        assert_eq!(lock.state.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rwlock_counts_on_threads() {
+        extern crate std;
+        let lock = std::sync::Arc::new(RwLock::new(0u64));
+        let threads: std::vec::Vec<_> = (0..4)
+            .map(|i| {
+                let lock = lock.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        if i % 2 == 0 {
+                            *lock.write() += 1;
+                        } else {
+                            let v = *lock.read();
+                            assert!(v <= 4000);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap_or_else(|_| panic!("a thread failed"));
+        }
+        assert_eq!(*lock.read(), 4000);
     }
 
     #[test]

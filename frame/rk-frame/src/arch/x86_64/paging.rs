@@ -114,8 +114,9 @@ fn read_entry(table: u64, index: usize) -> u64 {
 }
 
 fn write_entry(table: u64, index: usize, value: u64) {
-    // SAFETY: as for `read_entry`. The caller holds the `TABLES` lock for a kernel table or the
-    // lock of the `VmSpace` for a user table, or the tables are not in use yet.
+    // SAFETY: as for `read_entry`. The caller holds the `TABLES` lock for a kernel table, the lock
+    // of the block of the entry in the `VmSpace` for a user table, or the tables are not in use
+    // yet. An entry above the blocks changes only in `next_table`.
     unsafe { entry(table, index).write_volatile(value) };
 }
 
@@ -134,9 +135,29 @@ fn next_table(table: u64, index: usize, upper: u64) -> Result<u64, ()> {
         return Ok(e & ADDR_MASK);
     }
     let new = alloc_table_frame().ok_or(())?;
-    // The upper levels allow everything. The last level gives the permissions.
-    write_entry(table, index, new | PRESENT | WRITABLE | upper);
-    Ok(new)
+    // The upper levels allow everything. The last level gives the permissions. Two CPUs can make
+    // the same table of a user address space at the same time, when they hold the locks of two
+    // blocks under it (`VmSpace`). The first one puts its table in the entry, and the other gives
+    // its table back and uses the first one, as `pmd_install` of Linux (mm/memory.c).
+    // SAFETY: as for `read_entry`. The entry is an aligned `u64`, and each other access to it is
+    // a single access of the whole value.
+    let slot = unsafe { AtomicU64::from_ptr(entry(table, index)) };
+    match slot.compare_exchange(
+        e,
+        new | PRESENT | WRITABLE | upper,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(new),
+        Err(other) => {
+            free_frame_phys(new);
+            assert!(
+                other & PRESENT != 0 && other & HUGE == 0,
+                "a table entry changed under a walk"
+            );
+            Ok(other & ADDR_MASK)
+        }
+    }
 }
 
 /// Gives the last level table for `virt`, and makes the tables that are not there.
@@ -556,10 +577,14 @@ pub(crate) fn user_map_new(
     Ok(())
 }
 
-/// Changes the permissions of 4 KiB pages in `root` as `user_protect` does. `pages` gives the
-/// address, the frame and the new permissions of each page, in address order. One walk finds the
-/// last level table for all the pages in it, and one TLB flush at the end is for all the pages.
-pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u64, UserProt)>) {
+/// Changes the permissions of 4 KiB pages in `root` as `user_protect` does, but with no TLB flush.
+/// `pages` gives the address, the frame and the new permissions of each page, in address order.
+/// One walk finds the last level table for all the pages in it. Gives `true` if an entry changed.
+/// The caller then calls `user_flush_all`, one time for all the pages.
+pub(crate) fn user_protect_many(
+    root: u64,
+    pages: impl Iterator<Item = (usize, u64, UserProt)>,
+) -> bool {
     let mut leaf = (usize::MAX, None);
     let mut changed = false;
     for (virt, phys, prot) in pages {
@@ -572,9 +597,13 @@ pub(crate) fn user_protect_many(root: u64, pages: impl Iterator<Item = (usize, u
             changed = true;
         }
     }
-    if changed {
-        flush_user_block(root);
-    }
+    changed
+}
+
+/// Drops all the TLB entries of user pages on each CPU where `root` is active, after
+/// `user_protect_many`.
+pub(crate) fn user_flush_all(root: u64) {
+    flush_user_block(root);
 }
 
 /// Maps the 2 MiB page at `phys` at `virt` in `root` with one huge entry. Gives the physical

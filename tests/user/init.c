@@ -4224,6 +4224,25 @@ static void *par_getpid(void *arg)
 	return (void *)same;
 }
 
+/* The area of par_fault, its size in pages and the number of threads. */
+static volatile char *par_area;
+#define PAR_PAGES 2048
+static int par_threads;
+
+/* Writes the byte `arg` of each page of par_area, from a different start on each CPU. The threads
+ * fault the same pages and different 2 MiB blocks at the same time. Each fault must map the page
+ * once, and no write may be lost, as with the split page table locks of Linux (mm/memory.c). */
+static void *par_fault(void *arg)
+{
+	long i = (long)arg;
+	pin_cpu((int)i);
+	for (int k = 0; k < PAR_PAGES; k++) {
+		int p = (k + (int)i * PAR_PAGES / par_threads) % PAR_PAGES;
+		par_area[p * 4096 + i] = (char)(i + 1);
+	}
+	return NULL;
+}
+
 /* Runs futexes, sockets, faults and system calls on several CPUs at the same time. Before #405,
  * only one CPU at a time ran kernel code, so these races could not occur. */
 static void test_smp_parallel(int cpus)
@@ -4276,6 +4295,25 @@ static void test_smp_parallel(int cpus)
 		same &= (long)r;
 	}
 	check("getpid on each CPU at the same time", same);
+
+	par_threads = n;
+	char *area = mmap(NULL, PAR_PAGES * 4096, PROT_READ | PROT_WRITE,
+			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	int mapped = area != MAP_FAILED;
+	if (mapped) {
+		/* 4 KiB pages, so each write of the first pass is a page fault. */
+		madvise(area, PAR_PAGES * 4096, MADV_NOHUGEPAGE);
+		par_area = area;
+		for (int i = 0; i < n; i++)
+			pthread_create(&t[i], NULL, par_fault, (void *)(long)i);
+		for (int i = 0; i < n; i++)
+			pthread_join(t[i], NULL);
+		for (int p = 0; p < PAR_PAGES && mapped; p++)
+			for (int i = 0; i < n; i++)
+				mapped &= area[p * 4096 + i] == (char)(i + 1);
+		munmap(area, PAR_PAGES * 4096);
+	}
+	check("page faults on each CPU in one address space lose no write", mapped);
 }
 
 static void test_smp(void)

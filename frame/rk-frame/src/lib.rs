@@ -11,11 +11,13 @@
 
 #![no_std]
 
-#[cfg(target_os = "none")]
+#[cfg(any(test, target_os = "none"))]
 extern crate alloc;
 
 pub mod addr;
 pub mod arch;
+#[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub(crate) mod blocks;
 pub mod boot;
 pub mod console;
 pub mod cpu;

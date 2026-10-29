@@ -2,6 +2,13 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The page table of a process has a lock for each 2 MiB block, as the split page table locks of Linux (`pte_lockptr` in include/linux/mm.h), and a new upper table goes in with a compare and swap, as `pmd_install` in mm/memory.c (#468). Page faults in two blocks of one process do not wait for each other. The areas of the VMA backend have a read-write lock, as `mmap_lock`, and a fault takes it for a read.
+- The frame allocator and the heap keep a list of free frames and of free objects for each CPU, as the per-CPU pagesets of mm/page_alloc.c (#468). A list takes and gives back a batch of 32 frames or 16 objects under the global lock. An allocation that finds no free frame or no free run takes back the lists of all the CPUs first.
+
 ## [0.4.13] - 2026-10-29
 
 ### Added
