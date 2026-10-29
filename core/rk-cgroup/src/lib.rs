@@ -29,20 +29,30 @@
 //! functions at the end of this file keep one `Hierarchy` for the kernel, with a lock. The file
 //! system `cgroup2` in rk-fs-cgroup shows it, and rk-proc, rk-mm and rk-sched call the charge
 //! functions.
+//!
+//! The lock of the tree is only for the changes of the tree and for the files. The counts that
+//! the hot paths change (memory, threads, processes, CPU time and pressure) are in the
+//! [`counter::Counters`] of each cgroup, with atomic counts and a lock for each cgroup, as the
+//! `page_counter` of Linux. A charge of a page or of a thread takes no global lock. It takes the
+//! lock of the tree only when the cgroup gets its first task or loses its last one, which can
+//! change `populated` of `cgroup.events`, as Linux takes `css_set_lock` only then.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+mod counter;
 pub mod io;
 pub mod psi;
 
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use counter::{Changed, Counters, Shared};
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 
@@ -114,7 +124,8 @@ const NICE_WEIGHTS: [u64; 40] = [
     70, 56, 45, 36, 29, 23, 18, 15,
 ];
 
-/// The values of the memory controller of one cgroup. The sizes are in bytes.
+/// The values of the memory controller of one cgroup at one time, as `Hierarchy::memory` gives
+/// them. The sizes are in bytes.
 #[derive(Clone, Debug)]
 pub struct Memory {
     /// The bytes that the subtree uses now.
@@ -167,11 +178,26 @@ impl Default for Memory {
     }
 }
 
-/// The values of the cpu controller of one cgroup. The times are in nanoseconds.
+/// The settings of the memory controller of one cgroup that only the tree uses. The counts are
+/// in [`counter::MemCounters`].
+#[derive(Clone, Debug)]
+struct MemConf {
+    min: u64,
+    low: u64,
+    swap_max: u64,
+    oom_group: bool,
+}
+
+impl Default for MemConf {
+    fn default() -> Self {
+        Self { min: 0, low: 0, swap_max: MAX, oom_group: false }
+    }
+}
+
+/// The values of the cpu controller of one cgroup. The times are in nanoseconds. `cpu.weight` is
+/// in [`counter::Counters`].
 #[derive(Clone, Debug)]
 pub struct Cpu {
-    /// `cpu.weight`, from 1 to 10000.
-    pub weight: u32,
     /// The quota of `cpu.max` in each period, or `None` for `max`.
     pub quota: Option<u64>,
     /// The period of `cpu.max`.
@@ -198,7 +224,6 @@ pub struct Cpu {
 impl Default for Cpu {
     fn default() -> Self {
         Self {
-            weight: WEIGHT_DEFAULT,
             quota: None,
             period: PERIOD_DEFAULT_US * 1000,
             usage: 0,
@@ -282,7 +307,6 @@ pub struct Cpuset {
 }
 
 /// A cgroup.
-#[derive(Clone, Debug)]
 struct Node {
     /// The parent, or 0 for the root.
     parent: CgId,
@@ -302,8 +326,9 @@ struct Node {
     max_descendants: u32,
     /// The cgroups below this one that are not removed.
     nr_descendants: u32,
-    /// The processes in this cgroup, without the subtree.
-    nr_procs: u32,
+    /// The value of `Counters::has_tasks` that `populated` counts now. A charge changes the
+    /// counts with no lock of the tree, and `sync_populated` then brings this value up to date.
+    has_tasks: bool,
     /// The children whose subtree has a task, as `nr_populated_domain_children` and
     /// `nr_populated_threaded_children` of Linux together.
     nr_populated_children: u32,
@@ -315,23 +340,15 @@ struct Node {
     ev_frozen: bool,
     /// The count of the changes of `cgroup.events`, for `poll`.
     ev_seq: u64,
-    /// The count of the changes of `memory.events` and `pids.events`, for `poll`.
-    files_seq: u64,
-    /// The threads of the subtree: `pids.current`.
-    pids: u64,
-    pids_max: u64,
-    pids_peak: u64,
-    /// `pids.events`: the forks that the limit of this cgroup refused.
-    pids_events_max: u64,
-    mem: Memory,
-    cpu: Cpu,
+    mem: MemConf,
     cpuset: Cpuset,
     io: io::Io,
-    psi: psi::Psi,
+    /// The counts that the charges change without the lock of the tree.
+    c: Arc<Counters>,
 }
 
 impl Node {
-    fn new(parent: CgId, dom: CgId, name: &[u8], depth: u32, now: u64) -> Self {
+    fn new(parent: CgId, dom: CgId, name: &[u8], depth: u32, c: Arc<Counters>) -> Self {
         Self {
             parent,
             dom,
@@ -344,22 +361,37 @@ impl Node {
             max_depth: u32::MAX,
             max_descendants: u32::MAX,
             nr_descendants: 0,
-            nr_procs: 0,
+            has_tasks: false,
             nr_populated_children: 0,
             freeze: false,
             nr_frozen: 0,
             ev_frozen: false,
             ev_seq: 1,
-            files_seq: 1,
-            pids: 0,
-            pids_max: MAX,
-            pids_peak: 0,
-            pids_events_max: 0,
-            mem: Memory::default(),
-            cpu: Cpu { period_start: now, ..Cpu::default() },
+            mem: MemConf::default(),
             cpuset: Cpuset::default(),
             io: io::Io::default(),
-            psi: psi::Psi::new(now, parent == 0),
+            c,
+        }
+    }
+
+    /// A copy of the memory counts and settings now.
+    fn memory(&self) -> Memory {
+        let m = &self.c.mem;
+        let ld = |a: &core::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        Memory {
+            current: ld(&m.current),
+            peak: ld(&m.peak),
+            min: self.mem.min,
+            low: self.mem.low,
+            high: ld(&m.high),
+            max: ld(&m.max),
+            swap_max: self.mem.swap_max,
+            file: ld(&m.file),
+            file_local: ld(&m.file_local),
+            oom_group: self.mem.oom_group,
+            events: core::array::from_fn(|i| ld(&m.events[i])),
+            events_local: core::array::from_fn(|i| ld(&m.events_local[i])),
+            over_high: ld(&m.over_high),
         }
     }
 }
@@ -566,12 +598,11 @@ pub struct Hierarchy {
     next_ns: u32,
     /// A change can change `cgroup.events`, and `refresh_events` must look again.
     dirty: bool,
-    /// A file that `poll` watches changed since the last `take_notify`.
-    notify: bool,
     /// The cgroups with `cgroup.freeze` 1.
     nr_freeze: u32,
-    /// A cgroup can have pages that it charged over `memory.high`, for `high_delay`.
-    any_over_high: bool,
+    /// The counters of the cgroups, the flags that the charges set, and the map that the charges
+    /// read with no lock of the tree.
+    shared: Arc<Shared>,
     /// A cgroup had a quota in `cpu.max`. The value stays true after the quota goes away, so
     /// it only tells that `throttled_until` must look.
     any_quota: bool,
@@ -583,8 +614,11 @@ impl Hierarchy {
     /// Makes a hierarchy with the root only, at the time `now` in nanoseconds. `online_cpus` has
     /// one bit for each CPU of the machine.
     pub fn new(now: u64, online_cpus: u64) -> Self {
+        let shared = Arc::new(Shared::new());
+        let c = Arc::new(Counters::new(ROOT, None, now));
+        shared.map.write().insert(ROOT, c.clone());
         let mut nodes = BTreeMap::new();
-        nodes.insert(ROOT, Node::new(0, ROOT, b"", 0, now));
+        nodes.insert(ROOT, Node::new(0, ROOT, b"", 0, c));
         let mut namespaces = BTreeMap::new();
         namespaces.insert(0, ROOT);
         Self {
@@ -594,9 +628,8 @@ impl Hierarchy {
             namespaces,
             next_ns: 1,
             dirty: false,
-            notify: false,
             nr_freeze: 0,
-            any_over_high: false,
+            shared,
             any_quota: false,
             io_shares: BTreeMap::new(),
         }
@@ -751,6 +784,7 @@ impl Hierarchy {
             return Err(Errno::EEXIST);
         }
         let depth = p.depth + 1;
+        let pc = p.c.clone();
         for a in self.path_ids(parent) {
             let n = &self.nodes[&a];
             if depth - n.depth > n.max_depth || n.nr_descendants >= n.max_descendants {
@@ -760,15 +794,16 @@ impl Hierarchy {
         let id = self.next;
         self.next += 1;
         // A new cgroup is a domain, also below a threaded cgroup, where it is not valid.
-        let mut node = Node::new(parent, id, name, depth, now);
-        node.cpu.period_start = now;
-        self.nodes.insert(id, node);
+        let c = Arc::new(Counters::new(id, Some(pc), now));
+        self.shared.map.write().insert(id, c.clone());
+        self.nodes.insert(id, Node::new(parent, id, name, depth, c));
         for a in self.path_ids(parent) {
             if let Some(n) = self.nodes.get_mut(&a) {
                 n.nr_descendants += 1;
             }
         }
         self.node_mut(parent)?.children.insert(name.to_vec(), id);
+        self.set_ctrl(id);
         self.empty_changed();
         Ok(id)
     }
@@ -781,10 +816,16 @@ impl Hierarchy {
     pub fn rmdir(&mut self, parent: CgId, name: &[u8]) -> Result<CgId, Errno> {
         let id = self.lookup(parent, name).ok_or(Errno::ENOENT)?;
         let n = self.node(id)?;
-        if !n.children.is_empty() || n.nr_procs > 0 || n.pids > 0 {
+        if !n.children.is_empty()
+            || n.c.nr_procs.load(Ordering::SeqCst) > 0
+            || n.c.pids.current.load(Ordering::SeqCst) > 0
+        {
             return Err(Errno::EBUSY);
         }
-        let keep = n.mem.current > 0;
+        // An uncharge reads `current` and then `dead` with no lock of the tree, so one of the
+        // two sees the cgroup with no charge and lets it go.
+        n.c.dead.store(true, Ordering::SeqCst);
+        let keep = n.c.mem.current.load(Ordering::SeqCst) > 0;
         if n.freeze {
             self.nr_freeze -= 1;
         }
@@ -799,12 +840,11 @@ impl Hierarchy {
                 n.nr_descendants = n.nr_descendants.saturating_sub(1);
             }
         }
-        if keep {
-            let n = self.node_mut(id)?;
-            n.dead = true;
-            n.freeze = false;
-        } else {
-            self.nodes.remove(&id);
+        let n = self.node_mut(id)?;
+        n.dead = true;
+        n.freeze = false;
+        if !keep {
+            self.reap(id);
         }
         self.empty_changed();
         Ok(id)
@@ -813,19 +853,39 @@ impl Hierarchy {
     /// Tells if the subtree of `id` has a process or a thread, the `populated` value of
     /// `cgroup.events`.
     pub fn populated(&self, id: CgId) -> bool {
-        self.nodes.get(&id).is_some_and(|n| n.nr_populated_children > 0) || self.has_tasks(id)
-    }
-
-    /// The threads of `id` without the threads of its subtree.
-    fn own_threads(&self, id: CgId) -> u64 {
-        let Some(n) = self.nodes.get(&id) else { return 0 };
-        let below: u64 = n.children.values().map(|&c| self.pids(c)).sum();
-        n.pids.saturating_sub(below)
+        self.nodes.get(&id).is_some_and(|n| n.nr_populated_children > 0 || n.has_tasks)
     }
 
     /// Tells if `id` itself has a process or a thread, `cgroup_has_tasks` of Linux.
     fn has_tasks(&self, id: CgId) -> bool {
-        self.nodes.get(&id).is_some_and(|n| n.nr_procs > 0) || self.own_threads(id) > 0
+        self.nodes.get(&id).is_some_and(|n| n.c.has_tasks())
+    }
+
+    /// Sets the controllers that work in `id` in its counters, after a change of the tree.
+    fn set_ctrl(&self, id: CgId) {
+        if let Some(n) = self.nodes.get(&id) {
+            let ctrl = if self.parent(id).is_some() { self.controllers(id) } else { 0 };
+            n.c.ctrl.store(ctrl, Ordering::Relaxed);
+        }
+    }
+
+    /// Sets the controllers of each cgroup in its counters again, after a change of
+    /// `cgroup.subtree_control` or `cgroup.type`.
+    fn set_ctrl_all(&self) {
+        for &id in self.nodes.keys() {
+            self.set_ctrl(id);
+        }
+    }
+
+    /// Lets the removed cgroups from `id` up to the root go if they have no charge left.
+    fn reap(&mut self, id: CgId) {
+        for a in self.path_ids(id) {
+            let Some(n) = self.nodes.get(&a) else { continue };
+            if n.dead && n.c.mem.current.load(Ordering::SeqCst) == 0 && n.children.is_empty() {
+                self.nodes.remove(&a);
+                self.shared.map.write().remove(&a);
+            }
+        }
     }
 
     /// The domain of `id`: `id` itself, or the thread root for a threaded cgroup.
@@ -926,6 +986,7 @@ impl Hierarchy {
             stack.extend(n.children.values().copied());
         }
         self.node_mut(parent)?.nr_threaded_children += 1;
+        self.set_ctrl_all();
         self.dirty = true;
         Ok(())
     }
@@ -979,9 +1040,10 @@ impl Hierarchy {
         for &id in ids.iter().rev() {
             let (children_frozen, child_pids) = below.remove(&id).unwrap_or((true, 0));
             let n = &self.nodes[&id];
-            let own = n.pids.saturating_sub(child_pids);
+            let pids = n.c.pids.current.load(Ordering::Relaxed);
+            let own = pids.saturating_sub(child_pids);
             let frozen = freezing[&id] && n.nr_frozen >= own && children_frozen;
-            let (parent, pids) = (n.parent, n.pids);
+            let parent = n.parent;
             let p = below.entry(parent).or_insert((true, 0));
             p.0 &= frozen;
             p.1 += pids;
@@ -989,14 +1051,14 @@ impl Hierarchy {
             if n.ev_frozen != frozen {
                 n.ev_frozen = frozen;
                 n.ev_seq += 1;
-                self.notify = true;
+                self.shared.notify.store(true, Ordering::SeqCst);
             }
         }
     }
 
     /// Tells if a file that `poll` watches changed since the last call.
     pub fn take_notify(&mut self) -> bool {
-        core::mem::take(&mut self.notify)
+        self.shared.notify.swap(false, Ordering::SeqCst)
     }
 
     /// The count of the changes of the file `name` of `id`, for `poll`, or `None` for a file
@@ -1007,7 +1069,9 @@ impl Hierarchy {
         let n = self.nodes.get(&id)?;
         match name {
             "cgroup.events" => Some(n.ev_seq),
-            "memory.events" | "memory.events.local" | "pids.events" => Some(n.files_seq),
+            "memory.events" | "memory.events.local" | "pids.events" => {
+                Some(n.c.files_seq.load(Ordering::Relaxed))
+            }
             _ => None,
         }
     }
@@ -1060,19 +1124,17 @@ impl Hierarchy {
 
     /// Adds a new process to `id`. The caller charged its thread with `charge_pids`.
     pub fn add_process(&mut self, id: CgId) {
-        let had = self.has_tasks(id);
-        if let Some(n) = self.nodes.get_mut(&id) {
-            n.nr_procs += 1;
-            self.tasks_changed(id, had);
+        if let Some(n) = self.nodes.get(&id) {
+            let changed = n.c.count_process(true);
+            self.tasks_changed(id, changed);
         }
     }
 
     /// Removes a process that ended from `id`.
     pub fn remove_process(&mut self, id: CgId) {
-        let had = self.has_tasks(id);
-        if let Some(n) = self.nodes.get_mut(&id) {
-            n.nr_procs = n.nr_procs.saturating_sub(1);
-            self.tasks_changed(id, had);
+        if let Some(n) = self.nodes.get(&id) {
+            let changed = n.c.count_process(false);
+            self.tasks_changed(id, changed);
         }
     }
 
@@ -1125,14 +1187,10 @@ impl Hierarchy {
 
     /// Adds `n` threads to `id` and the cgroups above it, past the limits, as a move does.
     fn force_charge_pids(&mut self, id: CgId, n: u64) {
-        let had = self.has_tasks(id);
-        for a in self.path_ids(id) {
-            if let Some(node) = self.nodes.get_mut(&a) {
-                node.pids += n;
-                node.pids_peak = node.pids_peak.max(node.pids);
-            }
+        if let Some(node) = self.nodes.get(&id) {
+            let changed = node.c.force_charge_pids(n);
+            self.tasks_changed(id, changed);
         }
-        self.tasks_changed(id, had);
     }
 
     /// Adds `n` new threads to `id` and the cgroups above it, as `pids_try_charge` of Linux.
@@ -1142,54 +1200,55 @@ impl Hierarchy {
     /// `EAGAIN` if the threads pass the `pids.max` of a cgroup of the path. That cgroup counts
     /// the event in `pids.events`.
     pub fn charge_pids(&mut self, id: CgId, n: u64) -> Result<(), Errno> {
-        let path = self.path_ids(id);
-        for &a in &path {
-            let on = self.on(a, PIDS);
-            let Some(node) = self.nodes.get_mut(&a) else { continue };
-            if on && node.pids_max != MAX && node.pids + n > node.pids_max {
-                node.pids_events_max += 1;
-                node.files_seq += 1;
-                self.notify = true;
-                return Err(Errno::EAGAIN);
-            }
-        }
-        self.force_charge_pids(id, n);
+        let Some(node) = self.nodes.get(&id) else { return Ok(()) };
+        let changed = node.c.try_charge_pids(n, &self.shared).map_err(|()| Errno::EAGAIN)?;
+        self.tasks_changed(id, changed);
         Ok(())
     }
 
     /// Removes `n` threads that ended from `id` and the cgroups above it.
     pub fn uncharge_pids(&mut self, id: CgId, n: u64) {
-        let had = self.has_tasks(id);
-        for a in self.path_ids(id) {
-            if let Some(node) = self.nodes.get_mut(&a) {
-                node.pids = node.pids.saturating_sub(n);
-            }
+        if let Some(node) = self.nodes.get(&id) {
+            let changed = node.c.uncharge_pids(n);
+            self.tasks_changed(id, changed);
         }
-        self.tasks_changed(id, had);
     }
 
-    /// Updates `cgroup.events` after a change of the tasks of `id`. When `id` gets its first
-    /// task or loses its last one, `update_populated` changes `populated`. The cgroups above
-    /// `id` keep their own tasks, as their counts and the counts of their children change
-    /// together. `frozen` can change only when a cgroup is frozen, and only then
+    /// Updates `cgroup.events` after a change of the tasks of `id`. When `id` got its first
+    /// task or lost its last one (`changed.tasks`), `sync_populated` changes `populated`. The
+    /// cgroups above `id` keep their own tasks, as their counts and the counts of their children
+    /// change together. `frozen` can change only when a cgroup is frozen, and only then
     /// `refresh_events` must go over each cgroup.
-    fn tasks_changed(&mut self, id: CgId, had_tasks: bool) {
-        let has = self.has_tasks(id);
-        if has != had_tasks {
-            self.update_populated(id, had_tasks);
+    fn tasks_changed(&mut self, id: CgId, changed: Changed) {
+        if changed.tasks {
+            self.sync_populated(id);
         }
         if self.nr_freeze > 0 {
             self.dirty = true;
         }
     }
 
-    /// Changes `populated` of `id` and of the cgroups above it after `id` got its first task
-    /// or lost its last one, as `cgroup_update_populated` in kernel/cgroup/cgroup.c of Linux.
-    /// `had_tasks` tells if `id` had tasks before. The walk goes up while the value of a cgroup
-    /// changes, so an exit does not look at the other cgroups.
-    fn update_populated(&mut self, id: CgId, had_tasks: bool) {
+    /// Brings `populated` of `id` and of the cgroups above it up to date with the tasks of `id`
+    /// now. The charges change the counts of the tasks with no lock of the tree, and then call
+    /// this with the lock. A call that finds no change does nothing, so two calls for one change
+    /// count it once.
+    fn sync_populated(&mut self, id: CgId) {
+        let has = self.has_tasks(id);
+        let was = self.populated(id);
+        let Some(n) = self.nodes.get_mut(&id) else { return };
+        if n.has_tasks == has {
+            return;
+        }
+        n.has_tasks = has;
+        self.update_populated(id, was);
+    }
+
+    /// Changes `populated` of the cgroups above `id` after `populated` of `id` changed from
+    /// `was`, as `cgroup_update_populated` in kernel/cgroup/cgroup.c of Linux. The walk goes up
+    /// while the value of a cgroup changes, so an exit does not look at the other cgroups.
+    fn update_populated(&mut self, id: CgId, was: bool) {
         let mut at = id;
-        let mut was = had_tasks || self.nodes.get(&id).is_some_and(|n| n.nr_populated_children > 0);
+        let mut was = was;
         loop {
             let now = self.populated(at);
             if now == was {
@@ -1197,7 +1256,7 @@ impl Hierarchy {
             }
             let Some(n) = self.nodes.get_mut(&at) else { return };
             n.ev_seq += 1;
-            self.notify = true;
+            self.shared.notify.store(true, Ordering::SeqCst);
             let parent = n.parent;
             if parent == 0 {
                 return;
@@ -1224,7 +1283,7 @@ impl Hierarchy {
 
     /// The threads of the subtree of `id`: `pids.current`.
     pub fn pids(&self, id: CgId) -> u64 {
-        self.nodes.get(&id).map_or(0, |n| n.pids)
+        self.nodes.get(&id).map_or(0, |n| n.c.pids.current.load(Ordering::Relaxed))
     }
 
     /// Charges `bytes` of memory to `id` and the cgroups above it.
@@ -1234,28 +1293,8 @@ impl Hierarchy {
     /// Gives the cgroup whose `memory.max` the charge passes. That cgroup and the cgroups above
     /// it count a `max` event, and the caller must free memory or kill a process.
     pub fn charge_memory(&mut self, id: CgId, bytes: u64) -> Result<(), CgId> {
-        let path = self.path_ids(id);
-        for &a in &path {
-            let on = self.on(a, MEMORY);
-            let n = &self.nodes[&a];
-            if on && n.mem.max != MAX && n.mem.current + bytes > n.mem.max {
-                self.memory_event(a, EV_MAX);
-                return Err(a);
-            }
-        }
-        for &a in &path {
-            let on = self.on(a, MEMORY);
-            let Some(n) = self.nodes.get_mut(&a) else { continue };
-            n.mem.current += bytes;
-            n.mem.peak = n.mem.peak.max(n.mem.current);
-            let high = on && n.mem.high != MAX && n.mem.current > n.mem.high;
-            if high {
-                n.mem.over_high += bytes;
-                self.any_over_high = true;
-                self.memory_event(a, EV_HIGH);
-            }
-        }
-        Ok(())
+        let Some(n) = self.nodes.get(&id) else { return Ok(()) };
+        n.c.try_charge_memory(bytes, &self.shared)
     }
 
     /// Removes a charge of `bytes` from `id` and the cgroups above it. A removed cgroup goes
@@ -1268,26 +1307,7 @@ impl Hierarchy {
     /// fail: the page is in the cache already. Gives the highest cgroup whose `memory.max` the
     /// use now passes, and the caller then takes pages back from it with `reclaim_plan`.
     pub fn charge_file(&mut self, id: CgId, bytes: u64) -> Option<CgId> {
-        let mut over = None;
-        if let Some(n) = self.nodes.get_mut(&id) {
-            n.mem.file_local += bytes;
-        }
-        for a in self.path_ids(id) {
-            let on = self.on(a, MEMORY);
-            let Some(n) = self.nodes.get_mut(&a) else { continue };
-            n.mem.current += bytes;
-            n.mem.file += bytes;
-            n.mem.peak = n.mem.peak.max(n.mem.current);
-            if on && n.mem.max != MAX && n.mem.current > n.mem.max {
-                over = Some(a);
-            }
-            if on && n.mem.high != MAX && n.mem.current > n.mem.high {
-                n.mem.over_high += bytes;
-                self.any_over_high = true;
-                self.memory_event(a, EV_HIGH);
-            }
-        }
-        over
+        self.nodes.get(&id)?.c.charge_file(bytes, &self.shared)
     }
 
     /// Removes a charge of `bytes` of the page cache from `id` and the cgroups above it.
@@ -1298,19 +1318,15 @@ impl Hierarchy {
     /// Removes a charge of `bytes`, of the page cache if `file`, from `id` and the cgroups
     /// above it. A removed cgroup goes away when it has no charge left.
     fn uncharge(&mut self, id: CgId, bytes: u64, file: bool) {
-        if file && let Some(n) = self.nodes.get_mut(&id) {
-            n.mem.file_local = n.mem.file_local.saturating_sub(bytes);
+        let Some(n) = self.nodes.get(&id) else { return };
+        if n.c.uncharge_memory(bytes, file).reap {
+            self.reap(id);
         }
-        for a in self.path_ids(id) {
-            let Some(n) = self.nodes.get_mut(&a) else { continue };
-            n.mem.current = n.mem.current.saturating_sub(bytes);
-            if file {
-                n.mem.file = n.mem.file.saturating_sub(bytes);
-            }
-            if n.dead && n.mem.current == 0 && n.children.is_empty() {
-                self.nodes.remove(&a);
-            }
-        }
+    }
+
+    /// The bytes that `id` uses now: `memory.current`.
+    fn current(&self, id: CgId) -> u64 {
+        self.nodes.get(&id).map_or(0, |n| n.c.mem.current.load(Ordering::Relaxed))
     }
 
     /// The effective `memory.min` and `memory.low` of each cgroup below `root` that uses
@@ -1323,7 +1339,10 @@ impl Hierarchy {
         // The cgroups below `root`, with the removed ones, by their parent.
         let mut below: BTreeMap<CgId, Vec<CgId>> = BTreeMap::new();
         for (&id, n) in &self.nodes {
-            if id != root && n.mem.current > 0 && self.is_descendant(id, root) {
+            if id != root
+                && n.c.mem.current.load(Ordering::Relaxed) > 0
+                && self.is_descendant(id, root)
+            {
                 below.entry(n.parent).or_default().push(id);
             }
         }
@@ -1333,9 +1352,9 @@ impl Hierarchy {
         while let Some(parent) = todo.pop() {
             let Some(kids) = below.get(&parent) else { continue };
             let (pmin, plow) = out[&parent];
-            let used = |id: CgId, f: fn(&Memory) -> u64| {
+            let used = |id: CgId, f: fn(&MemConf) -> u64| {
                 let n = &self.nodes[&id];
-                if self.on(id, MEMORY) { n.mem.current.min(f(&n.mem)) } else { 0 }
+                if self.on(id, MEMORY) { self.current(id).min(f(&n.mem)) } else { 0 }
             };
             let sum_min: u64 = kids.iter().map(|&k| used(k, |m| m.min)).sum();
             let sum_low: u64 = kids.iter().map(|&k| used(k, |m| m.low)).sum();
@@ -1376,9 +1395,10 @@ impl Hierarchy {
         let free = |h: &Self, low_pass: bool| -> Vec<(CgId, u64)> {
             prot.iter()
                 .filter_map(|(&id, &(emin, elow))| {
-                    let m = &h.nodes[&id].mem;
+                    let m = &h.nodes[&id].c.mem;
                     let keep = if low_pass { emin } else { emin.max(elow) };
-                    let n = m.file_local.min(m.current.saturating_sub(keep));
+                    let current = m.current.load(Ordering::Relaxed);
+                    let n = m.file_local.load(Ordering::Relaxed).min(current.saturating_sub(keep));
                     (n > 0).then_some((id, n))
                 })
                 .collect()
@@ -1389,7 +1409,7 @@ impl Hierarchy {
             // its use does not pass.
             let low: Vec<CgId> = prot
                 .iter()
-                .filter(|(id, (_, elow))| *elow > 0 && self.nodes[id].mem.current <= *elow)
+                .filter(|(id, (_, elow))| *elow > 0 && self.current(**id) <= *elow)
                 .map(|(&id, _)| id)
                 .collect();
             for id in low {
@@ -1410,16 +1430,9 @@ impl Hierarchy {
     /// Counts the event `ev` of `memory.events` in `id` and the cgroups above it, and of
     /// `memory.events.local` in `id`.
     fn memory_event(&mut self, id: CgId, ev: usize) {
-        if let Some(n) = self.nodes.get_mut(&id) {
-            n.mem.events_local[ev] += 1;
+        if let Some(n) = self.nodes.get(&id) {
+            n.c.memory_event(ev, &self.shared);
         }
-        for a in self.path_ids(id) {
-            if let Some(n) = self.nodes.get_mut(&a) {
-                n.mem.events[ev] += 1;
-                n.files_seq += 1;
-            }
-        }
-        self.notify = true;
     }
 
     /// Counts an OOM in `id`: a charge failed, and the caller looks for a process to kill.
@@ -1457,23 +1470,31 @@ impl Hierarchy {
     /// wait grows with the square of the part of the use over the limit and with the pages that
     /// the cgroup charged while over it. Sets the count of these pages to 0.
     pub fn high_delay(&mut self, id: CgId) -> u64 {
-        if !self.any_over_high {
+        if !self.shared.any_over_high.load(Ordering::SeqCst) {
             return 0;
         }
         let (mut overage, mut pages) = (0u64, 0u64);
         for a in self.path_ids(id) {
             let on = self.on(a, MEMORY);
-            let Some(n) = self.nodes.get_mut(&a) else { continue };
-            let charged = core::mem::take(&mut n.mem.over_high);
-            if !on || n.mem.high == MAX || n.mem.current <= n.mem.high || n.mem.high == 0 {
+            let Some(n) = self.nodes.get(&a) else { continue };
+            let m = &n.c.mem;
+            let charged = m.over_high.swap(0, Ordering::SeqCst);
+            let (current, high) =
+                (m.current.load(Ordering::Relaxed), m.high.load(Ordering::Relaxed));
+            if !on || high == MAX || current <= high || high == 0 {
                 continue;
             }
             // The part over the limit in units of 2^-20, `calculate_overage` of Linux.
-            let over = ((n.mem.current - n.mem.high) << 20) / n.mem.high;
+            let over = ((current - high) << 20) / high;
             overage = overage.max(over);
             pages = pages.max(charged / PAGE_SIZE);
         }
-        self.any_over_high = self.nodes.values().any(|n| n.mem.over_high > 0);
+        // A charge sets the flag after it adds to `over_high`. Clear the flag before the scan,
+        // so a charge during the scan sets it again.
+        self.shared.any_over_high.store(false, Ordering::SeqCst);
+        if self.nodes.values().any(|n| n.c.mem.over_high.load(Ordering::SeqCst) > 0) {
+            self.shared.any_over_high.store(true, Ordering::SeqCst);
+        }
         // `calculate_high_delay` of Linux, in nanoseconds instead of jiffies. Linux handles the
         // pages in batches of `HIGH_BATCH`, and the limit is for one batch. Here a thread can
         // come back after each page, so the limit is for a batch and the wait is for the part of
@@ -1534,16 +1555,17 @@ impl Hierarchy {
         u64::try_from(part).unwrap_or(io::SHARE_UNIT)
     }
 
-    /// The memory of `id`.
-    pub fn memory(&self, id: CgId) -> Option<&Memory> {
-        self.nodes.get(&id).map(|n| &n.mem)
+    /// A copy of the memory counts and settings of `id` now.
+    pub fn memory(&self, id: CgId) -> Option<Memory> {
+        self.nodes.get(&id).map(Node::memory)
     }
 
     /// Tells if the use of `id` is over its `memory.max`, and gives the bytes over the limit.
     pub fn memory_over(&self, id: CgId) -> u64 {
         match self.nodes.get(&id) {
-            Some(n) if n.mem.max != MAX && self.on(id, MEMORY) => {
-                n.mem.current.saturating_sub(n.mem.max)
+            Some(n) if self.on(id, MEMORY) => {
+                let max = n.c.mem.max.load(Ordering::Relaxed);
+                if max == MAX { 0 } else { self.current(id).saturating_sub(max) }
             }
             _ => 0,
         }
@@ -1552,18 +1574,8 @@ impl Hierarchy {
     /// Adds `ns` of CPU time of a thread of `id` at the time `now` to `id` and the cgroups above
     /// it, and to their quotas.
     pub fn charge_cpu(&mut self, id: CgId, ns: u64, now: u64) {
-        // The scheduler calls this often, so the walk up the tree does not make a `Vec`.
-        let mut at = id;
-        while let Some(parent) = self.nodes.get(&at).map(|n| n.parent) {
-            let on = self.on(at, CPU);
-            if let Some(n) = self.nodes.get_mut(&at) {
-                if on {
-                    n.cpu.charge(ns, now);
-                } else {
-                    n.cpu.usage += ns;
-                }
-            }
-            at = parent;
+        if let Some(n) = self.nodes.get(&id) {
+            n.c.charge_cpu(ns, now);
         }
     }
 
@@ -1573,17 +1585,7 @@ impl Hierarchy {
         if !self.any_quota {
             return None;
         }
-        let mut until = None;
-        for a in self.path_ids(id) {
-            if !self.on(a, CPU) {
-                continue;
-            }
-            let Some(n) = self.nodes.get_mut(&a) else { continue };
-            if let Some(t) = n.cpu.throttled_until(now) {
-                until = Some(until.map_or(t, |u: u64| u.max(t)));
-            }
-        }
-        until
+        self.nodes.get(&id)?.c.throttled_until(now)
     }
 
     /// The factor of the weight of a thread of `id` in the fair class, in units of
@@ -1599,15 +1601,7 @@ impl Hierarchy {
         if id == ROOT {
             return WEIGHT_UNIT;
         }
-        let path: Vec<CgId> =
-            self.path_ids(id).into_iter().rev().filter(|&a| a != ROOT && self.on(a, CPU)).collect();
-        let Some(&top) = path.first() else { return WEIGHT_UNIT };
-        let mut f = u128::from(WEIGHT_UNIT);
-        for a in &path {
-            f = f * u128::from(self.nodes[a].cpu.weight) / u128::from(WEIGHT_DEFAULT);
-        }
-        f /= u128::from(self.pids(top).max(1));
-        u64::try_from(f.max(1)).unwrap_or(u64::MAX)
+        self.nodes.get(&id).map_or(WEIGHT_UNIT, |n| n.c.weight_factor())
     }
 
     /// The CPUs that the threads of `id` can use: `cpuset.cpus.effective`.
@@ -1637,28 +1631,24 @@ impl Hierarchy {
     /// Changes the counts of the pressure of `id` and of the cgroups above it with `f` at the
     /// time `now`.
     pub fn psi_change(&mut self, id: CgId, now: u64, f: impl Fn(&mut psi::Counts)) {
-        // The scheduler calls this at each task switch, so the walk up the tree does not make a
-        // `Vec`, as in `charge_cpu`.
-        let mut at = id;
-        while let Some(n) = self.nodes.get_mut(&at) {
-            n.psi.change(now, &f);
-            at = n.parent;
+        if let Some(n) = self.nodes.get(&id) {
+            n.c.psi_change(now, &f);
         }
     }
 
     /// The text of the pressure file of `resource` of `id` at the time `now`.
     pub fn psi_show(&mut self, id: CgId, resource: usize, now: u64) -> Result<String, Errno> {
-        Ok(self.node_mut(id)?.psi.show(now, resource))
+        Ok(self.node(id)?.c.psi.lock().show(now, resource))
     }
 
     /// The total stall time of `resource` in `id` up to `now`, in nanoseconds.
     pub fn psi_total(&mut self, id: CgId, resource: usize, full: bool, now: u64) -> u64 {
-        self.nodes.get_mut(&id).map_or(0, |n| n.psi.total(now, resource, full))
+        self.nodes.get(&id).map_or(0, |n| n.c.psi.lock().total(now, resource, full))
     }
 
     /// The pressure counts of `id`.
     pub fn psi_counts(&self, id: CgId) -> psi::Counts {
-        self.nodes.get(&id).map_or_else(psi::Counts::default, |n| n.psi.counts())
+        self.nodes.get(&id).map_or_else(psi::Counts::default, |n| n.c.psi.lock().counts())
     }
 
     /// Makes a cgroup namespace with the root `root`, and gives its number.
@@ -1695,11 +1685,14 @@ impl Hierarchy {
         let cpus = self.effective_cpus(id);
         let mems = self.effective_mems(id);
         let type_name = self.type_name(id);
-        let n = self.node_mut(id)?;
+        let n = self.node(id)?;
         if let Some(r) = name.strip_suffix(".pressure") {
             let r = psi::NAMES.iter().position(|&x| x == r).ok_or(Errno::ENOENT)?;
-            return Ok(n.psi.show(now, r));
+            return Ok(n.c.psi.lock().show(now, r));
         }
+        let mem = n.memory();
+        let pids = &n.c.pids;
+        let weight = n.c.weight.load(Ordering::Relaxed);
         let events = |e: &[u64; NR_EV]| {
             format!(
                 "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill {}\n",
@@ -1726,30 +1719,34 @@ impl Hierarchy {
                 format!("nr_descendants {}\nnr_dying_descendants {dying}\n", n.nr_descendants)
             }
             "cpu.stat" => {
-                n.cpu.refill(now);
-                let us = n.cpu.usage / 1000;
+                let mut cpu = n.c.cpu.lock();
+                cpu.refill(now);
+                let us = cpu.usage / 1000;
                 let mut out = format!("usage_usec {us}\nuser_usec {us}\nsystem_usec 0\n");
                 if cpu_on {
-                    let mut throttled = n.cpu.throttled;
-                    if let Some(since) = n.cpu.throttled_since {
+                    let mut throttled = cpu.throttled;
+                    if let Some(since) = cpu.throttled_since {
                         throttled += now.saturating_sub(since);
                     }
                     out.push_str(&format!(
                         "nr_periods {}\nnr_throttled {}\nthrottled_usec {}\nnr_bursts 0\n\
                          burst_usec 0\n",
-                        n.cpu.nr_periods,
-                        n.cpu.nr_throttled,
+                        cpu.nr_periods,
+                        cpu.nr_throttled,
                         throttled / 1000
                     ));
                 }
                 out
             }
-            "cpu.weight" => format!("{}\n", n.cpu.weight),
-            "cpu.weight.nice" => format!("{}\n", nice_of_weight(n.cpu.weight)),
-            "cpu.max" => match n.cpu.quota {
-                Some(q) => format!("{} {}\n", q / 1000, n.cpu.period / 1000),
-                None => format!("max {}\n", n.cpu.period / 1000),
-            },
+            "cpu.weight" => format!("{weight}\n"),
+            "cpu.weight.nice" => format!("{}\n", nice_of_weight(weight)),
+            "cpu.max" => {
+                let cpu = n.c.cpu.lock();
+                match cpu.quota {
+                    Some(q) => format!("{} {}\n", q / 1000, cpu.period / 1000),
+                    None => format!("max {}\n", cpu.period / 1000),
+                }
+            }
             "cpu.max.burst" => String::from("0\n"),
             "cpuset.cpus" => show_list(n.cpuset.cpus),
             "cpuset.mems" => show_list(n.cpuset.mems),
@@ -1760,30 +1757,30 @@ impl Hierarchy {
             "io.stat" => n.io.show_stat(),
             "io.max" => n.io.show_max(),
             "io.weight" => n.io.show_weight(),
-            "memory.current" => format!("{}\n", n.mem.current),
-            "memory.peak" => format!("{}\n", n.mem.peak),
-            "memory.min" => show_max(n.mem.min),
-            "memory.low" => show_max(n.mem.low),
-            "memory.high" => show_max(n.mem.high),
-            "memory.max" => show_max(n.mem.max),
-            "memory.oom.group" => format!("{}\n", u8::from(n.mem.oom_group)),
-            "memory.events" => events(&n.mem.events),
-            "memory.events.local" => events(&n.mem.events_local),
-            "memory.stat" => memory_stat(&n.mem),
+            "memory.current" => format!("{}\n", mem.current),
+            "memory.peak" => format!("{}\n", mem.peak),
+            "memory.min" => show_max(mem.min),
+            "memory.low" => show_max(mem.low),
+            "memory.high" => show_max(mem.high),
+            "memory.max" => show_max(mem.max),
+            "memory.oom.group" => format!("{}\n", u8::from(mem.oom_group)),
+            "memory.events" => events(&mem.events),
+            "memory.events.local" => events(&mem.events_local),
+            "memory.stat" => memory_stat(&mem),
             "memory.numa_stat" => {
-                let anon = n.mem.current.saturating_sub(n.mem.file);
-                format!("anon N0={anon}\nfile N0={}\n", n.mem.file)
+                let anon = mem.current.saturating_sub(mem.file);
+                format!("anon N0={anon}\nfile N0={}\n", mem.file)
             }
             "memory.swap.current" | "memory.swap.peak" | "memory.zswap.current" => {
                 String::from("0\n")
             }
-            "memory.swap.max" => show_max(n.mem.swap_max),
+            "memory.swap.max" => show_max(mem.swap_max),
             "memory.swap.high" | "memory.zswap.max" => String::from("max\n"),
             "memory.swap.events" => String::from("high 0\nmax 0\nfail 0\n"),
-            "pids.current" => format!("{}\n", n.pids),
-            "pids.peak" => format!("{}\n", n.pids_peak),
-            "pids.max" => show_max(n.pids_max),
-            "pids.events" => format!("max {}\n", n.pids_events_max),
+            "pids.current" => format!("{}\n", pids.current.load(Ordering::Relaxed)),
+            "pids.peak" => format!("{}\n", pids.peak.load(Ordering::Relaxed)),
+            "pids.max" => show_max(pids.max.load(Ordering::Relaxed)),
+            "pids.events" => format!("max {}\n", pids.events_max.load(Ordering::Relaxed)),
             _ => return Err(Errno::EINVAL),
         };
         Ok(out)
@@ -1855,7 +1852,7 @@ impl Hierarchy {
                 if !(1..=10_000).contains(&w) {
                     return Err(Errno::ERANGE);
                 }
-                n.cpu.weight = w as u32;
+                n.c.weight.store(w as u32, Ordering::Relaxed);
                 Effect::None
             }
             "cpu.weight.nice" => {
@@ -1863,7 +1860,7 @@ impl Hierarchy {
                 if !(-20..=19).contains(&nice) {
                     return Err(Errno::ERANGE);
                 }
-                n.cpu.weight = weight_of_nice(nice);
+                n.c.weight.store(weight_of_nice(nice), Ordering::Relaxed);
                 Effect::None
             }
             "cpu.max" => {
@@ -1876,7 +1873,7 @@ impl Hierarchy {
                 };
                 let period = match words.next() {
                     Some(w) => w.parse::<u64>().map_err(|_| Errno::EINVAL)?,
-                    None => n.cpu.period / 1000,
+                    None => n.c.cpu.lock().period / 1000,
                 };
                 if words.next().is_some()
                     || !(1000..=1_000_000).contains(&period)
@@ -1884,7 +1881,7 @@ impl Hierarchy {
                 {
                     return Err(Errno::EINVAL);
                 }
-                n.cpu.set_max(quota.map(|q| q * 1000), period * 1000, now);
+                n.c.cpu.lock().set_max(quota.map(|q| q * 1000), period * 1000, now);
                 self.any_quota |= quota.is_some();
                 Effect::Throttle
             }
@@ -1933,12 +1930,14 @@ impl Hierarchy {
                 Effect::None
             }
             "memory.high" => {
-                n.mem.high = parse_bytes(data)?;
+                n.c.mem.high.store(parse_bytes(data)?, Ordering::Relaxed);
                 Effect::Throttle
             }
             "memory.max" => {
-                n.mem.max = parse_bytes(data)?;
-                if n.mem.current > n.mem.max { Effect::MemoryOver } else { Effect::None }
+                let max = parse_bytes(data)?;
+                n.c.mem.max.store(max, Ordering::SeqCst);
+                let current = n.c.mem.current.load(Ordering::SeqCst);
+                if current > max { Effect::MemoryOver } else { Effect::None }
             }
             "memory.swap.max" => {
                 n.mem.swap_max = parse_bytes(data)?;
@@ -1949,7 +1948,7 @@ impl Hierarchy {
                 Effect::None
             }
             "memory.peak" | "memory.swap.peak" => {
-                n.mem.peak = n.mem.current;
+                n.c.mem.peak.store(n.c.mem.current.load(Ordering::Relaxed), Ordering::Relaxed);
                 Effect::None
             }
             "memory.oom.group" => {
@@ -1966,7 +1965,7 @@ impl Hierarchy {
                 return Err(Errno::EAGAIN);
             }
             "pids.max" => {
-                n.pids_max = parse_max(data)?;
+                n.c.pids.max.store(parse_max(data)?, Ordering::Relaxed);
                 Effect::None
             }
             _ => return Err(Errno::EINVAL),
@@ -2014,6 +2013,7 @@ impl Hierarchy {
         }
         let n = self.node_mut(id)?;
         n.subtree_control = (n.subtree_control | enable) & !disable;
+        self.set_ctrl_all();
         Ok(())
     }
 
@@ -2128,9 +2128,6 @@ static HIERARCHY: SpinLock<Option<Hierarchy>> = SpinLock::new(None);
 /// check does not take the lock of the hierarchy when no cgroup freezes.
 static ANY_FREEZE: AtomicBool = AtomicBool::new(false);
 
-/// A cgroup charged pages over its `memory.high`. The return to user mode looks at it first.
-static ANY_OVER_HIGH: AtomicBool = AtomicBool::new(false);
-
 /// A cgroup had a quota in `cpu.max`. The return to user mode looks at it first, so that it does
 /// not take the lock of the hierarchy when no cgroup has a quota.
 static ANY_QUOTA: AtomicBool = AtomicBool::new(false);
@@ -2153,7 +2150,6 @@ pub fn with<R>(f: impl FnOnce(&mut Hierarchy) -> R) -> R {
         let r = f(h);
         h.refresh_events();
         ANY_FREEZE.store(h.any_freeze(), Ordering::Relaxed);
-        ANY_OVER_HIGH.store(h.any_over_high, Ordering::Relaxed);
         ANY_QUOTA.store(h.any_quota, Ordering::Relaxed);
         (r, h.take_notify())
     };
@@ -2161,6 +2157,44 @@ pub fn with<R>(f: impl FnOnce(&mut Hierarchy) -> R) -> R {
         f();
     }
     r
+}
+
+/// The state that the hot paths share with the hierarchy. It does not change after the first
+/// call of [`with`].
+static SHARED: Once<Arc<Shared>> = Once::new();
+
+/// The state that the hot paths share with the hierarchy. The caller must not hold the lock of
+/// the hierarchy.
+fn shared() -> &'static Shared {
+    SHARED.call_once(|| with(|h| h.shared.clone()))
+}
+
+/// Calls `f` with the counters of `id`, without the lock of the hierarchy. The read lock of the
+/// map keeps the counters while `f` runs, as the RCU read lock of a lookup in Linux. Then this
+/// takes the lock of the hierarchy only if `f` tells that the tree must change. Gives `None` if
+/// `id` is not a cgroup.
+fn with_counters<R>(id: CgId, f: impl FnOnce(&Counters, &Shared) -> (R, Changed)) -> Option<R> {
+    let sh = shared();
+    let (r, changed) = {
+        let map = sh.map.read();
+        let c = map.get(&id)?;
+        f(c, sh)
+    };
+    // A change of the tasks changes `populated`, and `frozen` if a cgroup freezes. Only these
+    // need the tree, as `css_set_lock` of Linux is taken only for a change of a css_set.
+    if changed.tasks || ANY_FREEZE.load(Ordering::Relaxed) && changed != Changed::default() {
+        with(|h| h.tasks_changed(id, changed));
+    }
+    if changed.reap {
+        with(|h| h.reap(id));
+    }
+    if sh.notify.load(Ordering::Relaxed)
+        && sh.notify.swap(false, Ordering::SeqCst)
+        && let Some(f) = *NOTIFY.lock()
+    {
+        f();
+    }
+    Some(r)
 }
 
 /// The time now in nanoseconds since boot. The host has no clock of the kernel, so the time is
@@ -2185,12 +2219,26 @@ pub fn set_online_cpus(count: usize) {
 ///
 /// `EAGAIN` past a `pids.max`.
 pub fn charge_thread(id: CgId) -> Result<(), Errno> {
-    with(|h| h.charge_pids(id, 1))
+    with_counters(id, |c, sh| match c.try_charge_pids(1, sh) {
+        Ok(changed) => (Ok(()), changed),
+        Err(()) => (Err(Errno::EAGAIN), Changed::default()),
+    })
+    .unwrap_or(Ok(()))
 }
 
 /// Removes a thread that ended from `id`.
 pub fn uncharge_thread(id: CgId) {
-    with(|h| h.uncharge_pids(id, 1));
+    with_counters(id, |c, _| ((), c.uncharge_pids(1)));
+}
+
+/// Adds a new process to `id`. See `Hierarchy::add_process`.
+pub fn add_process(id: CgId) {
+    with_counters(id, |c, _| ((), c.count_process(true)));
+}
+
+/// Removes a process that ended from `id`. See `Hierarchy::remove_process`.
+pub fn remove_process(id: CgId) {
+    with_counters(id, |c, _| ((), c.count_process(false)));
 }
 
 /// The function that drops the clean page cache of a cgroup: it gets the cgroup and the bytes,
@@ -2229,7 +2277,8 @@ pub fn charge_page(id: CgId) -> Result<(), CgId> {
     }
     let mut tries = 0;
     loop {
-        match with(|h| h.charge_memory(id, PAGE_SIZE)) {
+        let r = with_counters(id, |c, sh| (c.try_charge_memory(PAGE_SIZE, sh), Changed::default()));
+        match r.unwrap_or(Ok(())) {
             Ok(()) => return Ok(()),
             Err(over) if tries < 8 && reclaim(over, RECLAIM_BATCH) > 0 => tries += 1,
             Err(over) => return Err(over),
@@ -2241,14 +2290,14 @@ pub fn charge_page(id: CgId) -> Result<(), CgId> {
 /// charge does not take pages back. See [`balance_file`].
 pub fn charge_file(id: CgId, bytes: u64) {
     if id != 0 {
-        with(|h| h.charge_file(id, bytes));
+        with_counters(id, |c, sh| (c.charge_file(bytes, sh), Changed::default()));
     }
 }
 
 /// Removes a charge of `bytes` of the page cache from `id`.
 pub fn uncharge_file(id: CgId, bytes: u64) {
     if id != 0 {
-        with(|h| h.uncharge_file(id, bytes));
+        with_counters(id, |c, _| ((), c.uncharge_memory(bytes, true)));
     }
 }
 
@@ -2259,14 +2308,19 @@ pub fn balance_file(id: CgId) {
         return;
     }
     for _ in 0..64 {
-        let over = with(|h| {
-            h.path_ids(id).into_iter().rev().find_map(|a| {
-                let m = &h.nodes.get(&a)?.mem;
-                (h.on(a, MEMORY) && m.max != MAX && m.current > m.max)
-                    .then(|| (a, m.current - m.max))
-            })
+        // The highest cgroup over its limit, the last one from `id` up.
+        let over = with_counters(id, |c, _| {
+            let over = c
+                .path()
+                .filter_map(|a| {
+                    let max = a.mem.max.load(Ordering::Relaxed);
+                    let current = a.mem.current.load(Ordering::Relaxed);
+                    (a.on(MEMORY) && max != MAX && current > max).then(|| (a.id, current - max))
+                })
+                .last();
+            (over, Changed::default())
         });
-        let Some((cg, excess)) = over else { return };
+        let Some((cg, excess)) = over.flatten() else { return };
         if reclaim(cg, excess.max(RECLAIM_BATCH)) == 0 {
             return;
         }
@@ -2282,13 +2336,15 @@ pub fn charge_pages(id: CgId, n: usize) -> Result<(), CgId> {
     if id == 0 {
         return Ok(());
     }
-    with(|h| h.charge_memory(id, PAGE_SIZE * n as u64))
+    let bytes = PAGE_SIZE * n as u64;
+    with_counters(id, |c, sh| (c.try_charge_memory(bytes, sh), Changed::default()))
+        .unwrap_or(Ok(()))
 }
 
 /// Removes the charge of a page from `id`. rk-frame calls this when a charged frame is free.
 pub fn uncharge_page(id: CgId) {
     if id != 0 {
-        with(|h| h.uncharge_memory(id, PAGE_SIZE));
+        with_counters(id, |c, _| ((), c.uncharge_memory(PAGE_SIZE, false)));
     }
 }
 
@@ -2296,14 +2352,14 @@ pub fn uncharge_page(id: CgId) {
 pub fn charge_cpu(id: CgId, ns: u64) {
     if id != 0 {
         let now = now();
-        with(|h| h.charge_cpu(id, ns, now));
+        with_counters(id, |c, _| (c.charge_cpu(ns, now), Changed::default()));
     }
 }
 
 /// The time in nanoseconds that a thread of `id` waits for `memory.high`. See
 /// `Hierarchy::high_delay`.
 pub fn high_delay(id: CgId) -> u64 {
-    if id == 0 || !ANY_OVER_HIGH.load(Ordering::Relaxed) {
+    if id == 0 || !shared().any_over_high.load(Ordering::Relaxed) {
         return 0;
     }
     with(|h| h.high_delay(id))
@@ -2325,12 +2381,15 @@ pub fn throttled_until(id: CgId) -> Option<u64> {
         return None;
     }
     let now = now();
-    with(|h| h.throttled_until(id, now))
+    with_counters(id, |c, _| (c.throttled_until(now), Changed::default())).flatten()
 }
 
 /// The factor of the weight of a thread of `id`, in units of `WEIGHT_UNIT`.
 pub fn weight_factor(id: CgId) -> u64 {
-    with(|h| h.weight_factor(id))
+    if id == ROOT {
+        return WEIGHT_UNIT;
+    }
+    with_counters(id, |c, _| (c.weight_factor(), Changed::default())).unwrap_or(WEIGHT_UNIT)
 }
 
 /// Tells if `id` or a cgroup above it has `cgroup.freeze` 1, so its threads must freeze.
@@ -2342,7 +2401,7 @@ pub fn frozen(id: CgId) -> bool {
 /// in `cpu.max`. If not, `frozen`, `high_delay` and `throttled_until` give no wait.
 pub fn any_limit() -> bool {
     ANY_FREEZE.load(Ordering::Relaxed)
-        || ANY_OVER_HIGH.load(Ordering::Relaxed)
+        || shared().any_over_high.load(Ordering::Relaxed)
         || ANY_QUOTA.load(Ordering::Relaxed)
 }
 
@@ -2350,7 +2409,7 @@ pub fn any_limit() -> bool {
 pub fn psi_change(id: CgId, f: impl Fn(&mut psi::Counts)) {
     if id != 0 {
         let now = now();
-        with(|h| h.psi_change(id, now, f));
+        with_counters(id, |c, _| (c.psi_change(now, &f), Changed::default()));
     }
 }
 

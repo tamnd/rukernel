@@ -18,6 +18,15 @@
 //! not count for `CACHE_LIMIT`. The memory cgroup takes it back with `reclaim`, and the charged
 //! folios of all caches stay below `MemcgOps::limit`.
 //!
+//! The lock of the cache is not held while the store does a bio, as Linux does the I/O of the
+//! page cache with the folio lock (`PG_locked`) and the writeback flag (`PG_writeback`), and holds
+//! the lock of the xarray of the mapping only for a short time. A folio that a read fills is
+//! locked: a second read of its pages waits for the first one, and the folio does not go from the
+//! cache. The pages that a write back sends are under write back: they become clean when the
+//! write back starts, a `write_back` of their range waits for them, and the folio does not go
+//! from the cache. A write can change a page under write back, because a bio has its own copy of
+//! the data. The page is then dirty again.
+//!
 //! A read in `without_wait` does not read from the store. If a page that it needs is not up to
 //! date, it gives `EAGAIN`, as a read with `IOCB_NOWAIT` in `filemap_read` of Linux.
 
@@ -27,7 +36,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rk_abi::Errno;
-use rk_frame::sync::{Once, SpinLock};
+use rk_frame::sync::{Once, SpinLock, SpinLockGuard};
 
 /// The size of a page.
 pub const PAGE_SIZE: usize = 4096;
@@ -114,11 +123,25 @@ struct Folio {
     uptodate: u16,
     /// A bit for each page that has data that is not in the store.
     dirty: u16,
+    /// A read of the store fills the folio now, as `PG_locked` of Linux.
+    locked: bool,
+    /// A bit for each page that a write back sends to the store now, as `PG_writeback` of Linux.
+    writeback: u16,
     /// The time of the last use, for the choice of the folios to drop.
     used: u64,
 }
 
 impl Folio {
+    /// Tells if the store does a bio of the folio now. The folio must stay in the cache.
+    fn busy(&self) -> bool {
+        self.locked || self.writeback != 0
+    }
+
+    /// The bytes of the pages in `mask`.
+    fn bytes(&self, mask: u16) -> usize {
+        self.runs(mask).into_iter().flatten().map(|p| self.page(p).len()).sum()
+    }
+
     fn pages(&self) -> usize {
         self.data.len().div_ceil(PAGE_SIZE)
     }
@@ -208,11 +231,50 @@ pub fn no_wait() -> bool {
     !tasks.is_empty() && tasks.contains(&task_id())
 }
 
+/// The tasks that wait for the end of a bio of a folio, as the folio wait queues of Linux
+/// (`folio_wait_bit` in mm/filemap.c). The queue blocks the task on the kernel of x86-64 and
+/// aarch64. On the other targets and on the host there are no tasks, so the wait tests the
+/// condition again in a loop.
+struct FolioWait {
+    #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    queue: rk_frame::task::WaitQueue,
+}
+
+impl FolioWait {
+    const fn new() -> Self {
+        Self {
+            #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            queue: rk_frame::task::WaitQueue::new(),
+        }
+    }
+
+    /// Blocks the current task until `cond` is true.
+    fn wait_until(&self, mut cond: impl FnMut() -> bool) {
+        #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        self.queue.wait_until(|| cond().then_some(()));
+        #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        while !cond() {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Wakes each task that waits.
+    fn wake_all(&self) {
+        #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        self.queue.wake_all();
+    }
+}
+
 /// The page cache of one store.
 pub struct PageCache<S> {
     store: S,
     inner: SpinLock<Inner>,
+    /// The tasks that wait for a folio that is locked or under write back.
+    wait: FolioWait,
 }
+
+/// The guard of the lock of a cache.
+type Guard<'a> = SpinLockGuard<'a, Inner>;
 
 /// One write back: the bios, and the folio and the pages of each bio.
 type Batch = (Vec<Bio>, Vec<(u64, u16)>);
@@ -228,7 +290,7 @@ impl<S: Store> PageCache<S> {
             new_charge: false,
             clock: 0,
         };
-        Self { store, inner: SpinLock::new(inner) }
+        Self { store, inner: SpinLock::new(inner), wait: FolioWait::new() }
     }
 
     /// The store under the cache.
@@ -269,60 +331,95 @@ impl<S: Store> PageCache<S> {
                 inner.new_charge = true;
                 CHARGED.fetch_add(len, Ordering::Relaxed);
             }
-            Folio { data: vec![0; len], memcg, uptodate: 0, dirty: 0, used }
+            Folio {
+                data: vec![0; len],
+                memcg,
+                uptodate: 0,
+                dirty: 0,
+                locked: false,
+                writeback: 0,
+                used,
+            }
         });
         folio.used = used;
         folio
     }
 
-    /// Reads the pages of `mask` of the folio `index` that are not up to date.
-    fn fill(&self, inner: &mut Inner, index: u64, mask: u16) -> Result<()> {
-        let folio = self.folio(inner, index);
-        let missing = mask & !folio.uptodate;
-        if missing == 0 {
-            return Ok(());
-        }
-        if no_wait() {
-            return Err(Errno::EAGAIN);
-        }
-        let base = index * (FOLIO_SIZE / SECTOR_SIZE) as u64;
-        let runs = folio.runs(missing);
-        let mut bios: Vec<Bio> = runs
-            .iter()
-            .map(|r| {
-                let bytes = folio.page(r.start).start..folio.page(r.end - 1).end;
-                let sector = base + (bytes.start / SECTOR_SIZE) as u64;
-                Bio::new(Op::Read, sector, vec![0; bytes.len()])
-            })
-            .collect();
-        self.store.submit(&mut bios);
-        for (r, bio) in runs.iter().zip(bios) {
-            bio.result?;
-            let start = folio.page(r.start).start;
-            folio.data[start..start + bio.data.len()].copy_from_slice(&bio.data);
-            for p in r.clone() {
-                folio.uptodate |= 1 << p;
+    /// Reads the pages of `mask` of the folio `index` that are not up to date. The lock of the
+    /// cache is not held during the read, as `filemap_read_folio` of Linux reads with the folio
+    /// locked. A read of the same folio by another task waits for this one. Gives the lock back.
+    fn fill<'a>(&'a self, mut inner: Guard<'a>, index: u64, mask: u16) -> Result<Guard<'a>> {
+        loop {
+            let folio = self.folio(&mut inner, index);
+            let missing = mask & !folio.uptodate;
+            if missing == 0 {
+                return Ok(inner);
             }
+            if no_wait() {
+                return Err(Errno::EAGAIN);
+            }
+            if folio.locked {
+                // Another read fills the folio, `folio_lock` of Linux.
+                drop(inner);
+                self.wait_for(|f| !f.locked, index..index + 1);
+                inner = self.inner.lock();
+                continue;
+            }
+            folio.locked = true;
+            let base = index * (FOLIO_SIZE / SECTOR_SIZE) as u64;
+            let runs = folio.runs(missing);
+            let mut bios: Vec<Bio> = runs
+                .iter()
+                .map(|r| {
+                    let bytes = folio.page(r.start).start..folio.page(r.end - 1).end;
+                    let sector = base + (bytes.start / SECTOR_SIZE) as u64;
+                    Bio::new(Op::Read, sector, vec![0; bytes.len()])
+                })
+                .collect();
+            drop(inner);
+            self.store.submit(&mut bios);
+            inner = self.inner.lock();
+            // A locked folio stays in the cache.
+            let Some(folio) = inner.folios.get_mut(&index) else { return Err(Errno::EIO) };
+            folio.locked = false;
+            let mut result = Ok(());
+            for (r, bio) in runs.iter().zip(bios) {
+                if let Err(e) = bio.result {
+                    result = result.and(Err(e));
+                    continue;
+                }
+                let start = folio.page(r.start).start;
+                for p in r.clone() {
+                    // A write of the whole page during the read has newer data.
+                    if folio.uptodate & 1 << p != 0 {
+                        continue;
+                    }
+                    let bytes = folio.page(p);
+                    let from = bytes.start - start;
+                    folio.data[bytes.clone()].copy_from_slice(&bio.data[from..from + bytes.len()]);
+                    folio.uptodate |= 1 << p;
+                }
+            }
+            self.wait.wake_all();
+            result?;
         }
-        Ok(())
     }
 
-    /// Calls `f` with each folio, and the range of bytes in it, of `len` bytes at `offset`.
-    fn each(
-        offset: u64,
-        len: usize,
-        mut f: impl FnMut(u64, usize, usize, usize) -> Result<()>,
-    ) -> Result<()> {
-        let mut done = 0;
-        while done < len {
-            let at = offset + done as u64;
-            let index = at / FOLIO_SIZE as u64;
-            let start = (at % FOLIO_SIZE as u64) as usize;
-            let n = (FOLIO_SIZE - start).min(len - done);
-            f(index, start, start + n, done)?;
-            done += n;
-        }
-        Ok(())
+    /// Waits until `ready` is true for each folio from `range` in the cache. The caller does not
+    /// hold the lock of the cache.
+    fn wait_for(&self, ready: impl Fn(&Folio) -> bool, range: core::ops::Range<u64>) {
+        self.wait
+            .wait_until(|| self.inner.lock().folios.range(range.clone()).all(|(_, f)| ready(f)));
+    }
+
+    /// The folio, and the range of bytes in it, of the part of `len` bytes at `offset` that
+    /// starts `done` bytes after `offset`.
+    fn span(offset: u64, len: usize, done: usize) -> (u64, usize, usize) {
+        let at = offset + done as u64;
+        let index = at / FOLIO_SIZE as u64;
+        let start = (at % FOLIO_SIZE as u64) as usize;
+        let n = (FOLIO_SIZE - start).min(len - done);
+        (index, start, start + n)
     }
 
     /// Reads up to `buf.len()` bytes at `offset`. Gives the number of bytes, which is 0 at the
@@ -339,17 +436,19 @@ impl<S: Store> PageCache<S> {
         let len = buf.len().min((size - offset) as usize);
         let mut inner = self.inner.lock();
         let no_wait = no_wait();
-        Self::each(offset, len, |index, start, end, done| {
+        let mut done = 0;
+        while done < len {
+            let (index, start, end) = Self::span(offset, len, done);
             // A read fills all the folio, as a small readahead. A read that does not wait needs
             // only its own pages.
             let folio = self.folio(&mut inner, index);
             let mask =
                 if no_wait { folio.mask(start, end) } else { folio.mask(0, folio.data.len()) };
-            self.fill(&mut inner, index, mask)?;
+            inner = self.fill(inner, index, mask)?;
             let folio = self.folio(&mut inner, index);
             buf[done..done + end - start].copy_from_slice(&folio.data[start..end]);
-            Ok(())
-        })?;
+            done += end - start;
+        }
         self.shrink(&mut inner);
         let charged = core::mem::take(&mut inner.new_charge);
         drop(inner);
@@ -376,25 +475,29 @@ impl<S: Store> PageCache<S> {
         }
         let len = buf.len().min((size - offset) as usize);
         let mut inner = self.inner.lock();
-        Self::each(offset, len, |index, start, end, done| {
+        let mut done = 0;
+        while done < len {
+            let (index, start, end) = Self::span(offset, len, done);
             let folio = self.folio(&mut inner, index);
             let all = folio.mask(start, end);
             // A page that the write changes in part must have the other data first.
             let whole = folio.covered(start, end);
-            self.fill(&mut inner, index, all & !whole)?;
+            inner = self.fill(inner, index, all & !whole)?;
             let folio = self.folio(&mut inner, index);
             folio.data[start..end].copy_from_slice(&buf[done..done + end - start]);
             let new = all & !folio.dirty;
             folio.uptodate |= all;
             folio.dirty |= all;
-            let added: usize =
-                folio.runs(new).iter().flat_map(Clone::clone).map(|p| folio.page(p).len()).sum();
+            let added = folio.bytes(new);
             inner.dirty += added;
-            Ok(())
-        })?;
+            done += end - start;
+        }
         if inner.dirty > DIRTY_LIMIT {
+            inner = self.wait_writeback(inner, 0, u64::MAX);
             let batch = Self::collect(&mut inner, 0, u64::MAX);
-            self.send(&mut inner, batch)?;
+            let (back, result) = self.send(inner, batch);
+            inner = back;
+            result?;
         }
         self.shrink(&mut inner);
         let charged = core::mem::take(&mut inner.new_charge);
@@ -405,11 +508,26 @@ impl<S: Store> PageCache<S> {
         Ok(len)
     }
 
-    /// Makes the bios of the dirty pages of the folios from `first` to `end`.
+    /// Waits until no folio from `first` to `end` is under write back, and gives the lock back.
+    /// Then a new write back of a page does not run with an older one, and the older data does
+    /// not come to the store last, as `folio_wait_writeback` in `write_cache_pages` of Linux.
+    fn wait_writeback<'a>(&'a self, mut inner: Guard<'a>, first: u64, end: u64) -> Guard<'a> {
+        while inner.folios.range(first..end).any(|(_, f)| f.writeback != 0) {
+            drop(inner);
+            self.wait_for(|f| f.writeback == 0, first..end);
+            inner = self.inner.lock();
+        }
+        inner
+    }
+
+    /// Makes the bios of the dirty pages of the folios from `first` to `end`. The pages become
+    /// clean and under write back, as `folio_clear_dirty_for_io` and `folio_start_writeback` of
+    /// Linux.
     fn collect(inner: &mut Inner, first: u64, end: u64) -> Batch {
         let mut bios = Vec::new();
         let mut owners = Vec::new();
-        for (&index, folio) in inner.folios.range(first..end) {
+        let mut clean = 0;
+        for (&index, folio) in inner.folios.range_mut(first..end) {
             let base = index * (FOLIO_SIZE / SECTOR_SIZE) as u64;
             for r in folio.runs(folio.dirty) {
                 let bytes = folio.page(r.start).start..folio.page(r.end - 1).end;
@@ -417,26 +535,41 @@ impl<S: Store> PageCache<S> {
                 bios.push(Bio::new(Op::Write, sector, folio.data[bytes].to_vec()));
                 owners.push((index, r.fold(0, |m, p| m | 1 << p)));
             }
+            clean += folio.bytes(folio.dirty);
+            folio.writeback |= folio.dirty;
+            folio.dirty = 0;
         }
+        inner.dirty -= clean;
         (bios, owners)
     }
 
-    /// Writes the bios of `batch` and makes their pages clean. The pages of a failed bio stay
-    /// dirty.
-    fn send(&self, inner: &mut Inner, (mut bios, owners): Batch) -> Result<()> {
+    /// Writes the bios of `batch` with no lock of the cache held, and ends the write back of
+    /// their pages, as `folio_end_writeback` of Linux. The pages of a failed bio become dirty
+    /// again. Gives the lock back.
+    fn send<'a>(&'a self, inner: Guard<'a>, (mut bios, owners): Batch) -> (Guard<'a>, Result<()>) {
+        if bios.is_empty() {
+            return (inner, Ok(()));
+        }
+        drop(inner);
         self.store.submit(&mut bios);
+        let mut inner = self.inner.lock();
         let mut result = Ok(());
         for (bio, (index, mask)) in bios.iter().zip(owners) {
             if let Err(e) = bio.result {
                 result = result.and(Err(e));
-                continue;
             }
-            if let Some(folio) = inner.folios.get_mut(&index) {
-                folio.dirty &= !mask;
-                inner.dirty -= bio.data.len();
+            // A folio under write back stays in the cache.
+            let Some(folio) = inner.folios.get_mut(&index) else { continue };
+            folio.writeback &= !mask;
+            if bio.result.is_err() {
+                let again = mask & !folio.dirty;
+                folio.dirty |= again;
+                let added = folio.bytes(again);
+                inner.dirty += added;
             }
         }
-        result
+        self.wait.wake_all();
+        (inner, result)
     }
 
     /// Writes the dirty pages that have a byte from `offset` up to `offset + len` to the store.
@@ -447,9 +580,14 @@ impl<S: Store> PageCache<S> {
     pub fn write_back(&self, offset: u64, len: u64) -> Result<()> {
         let first = offset / FOLIO_SIZE as u64;
         let end = offset.saturating_add(len).div_ceil(FOLIO_SIZE as u64);
-        let mut inner = self.inner.lock();
+        let mut inner = self.wait_writeback(self.inner.lock(), first, end);
         let batch = Self::collect(&mut inner, first, end);
-        self.send(&mut inner, batch)
+        let (inner, result) = self.send(inner, batch);
+        drop(inner);
+        // A write back of another task can send pages of the range now. The data is in the store
+        // only after it ends, as `__filemap_fdatawait_range` of Linux waits for it.
+        self.wait_for(|f| f.writeback == 0, first..end);
+        result
     }
 
     /// Writes all the dirty pages to the store, and then makes the data durable.
@@ -492,11 +630,18 @@ impl<S: Store> PageCache<S> {
     }
 
     /// Drops the folios that have a byte from `offset` up to `offset + len`, after a write that
-    /// did not go through the cache. Call `write_back` first, because a dirty page goes too.
+    /// did not go through the cache. Call `write_back` first, because a dirty page goes too. A
+    /// folio that the store reads or writes now goes after the bio, as
+    /// `invalidate_inode_pages2_range` of Linux waits for the locked folios.
     pub fn forget(&self, offset: u64, len: u64) {
         let first = offset / FOLIO_SIZE as u64;
         let end = offset.saturating_add(len).div_ceil(FOLIO_SIZE as u64);
         let mut inner = self.inner.lock();
+        while inner.folios.range(first..end).any(|(_, f)| f.busy()) {
+            drop(inner);
+            self.wait_for(|f| !f.busy(), first..end);
+            inner = self.inner.lock();
+        }
         let gone: Vec<u64> = inner.folios.range(first..end).map(|(i, _)| *i).collect();
         for index in gone {
             Self::drop_folio(&mut inner, index);
@@ -506,8 +651,12 @@ impl<S: Store> PageCache<S> {
     /// Drops the clean folios.
     pub fn drop_clean(&self) {
         let mut inner = self.inner.lock();
-        let clean: Vec<u64> =
-            inner.folios.iter().filter(|(_, f)| f.dirty == 0).map(|(i, _)| *i).collect();
+        let clean: Vec<u64> = inner
+            .folios
+            .iter()
+            .filter(|(_, f)| f.dirty == 0 && !f.busy())
+            .map(|(i, _)| *i)
+            .collect();
         for index in clean {
             Self::drop_folio(&mut inner, index);
         }
@@ -522,7 +671,7 @@ impl<S: Store> PageCache<S> {
         let mut clean: Vec<(u64, u64, usize)> = inner
             .folios
             .iter()
-            .filter(|(_, f)| f.dirty == 0 && f.memcg == memcg)
+            .filter(|(_, f)| f.dirty == 0 && !f.busy() && f.memcg == memcg)
             .map(|(i, f)| (f.used, *i, charge_of(f.data.len())))
             .collect();
         clean.sort_unstable();
@@ -568,8 +717,12 @@ impl<S: Store> PageCache<S> {
             return;
         }
         let (low_cache, low_charged) = (CACHE_LIMIT - CACHE_LIMIT / 8, limit - limit / 8);
-        let mut clean: Vec<(u64, u64)> =
-            inner.folios.iter().filter(|(_, f)| f.dirty == 0).map(|(i, f)| (f.used, *i)).collect();
+        let mut clean: Vec<(u64, u64)> = inner
+            .folios
+            .iter()
+            .filter(|(_, f)| f.dirty == 0 && !f.busy())
+            .map(|(i, f)| (f.used, *i))
+            .collect();
         clean.sort_unstable();
         for (_, index) in clean {
             if !over(inner, low_cache, low_charged) {
@@ -603,11 +756,39 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
 
+    extern crate std;
+
+    use core::sync::atomic::AtomicBool;
+    use std::thread;
+    use std::time::Duration;
+
     /// A store in memory that records the writes.
     struct Ram {
         data: SpinLock<Vec<u8>>,
         writes: SpinLock<Vec<(u64, usize)>>,
         reads: SpinLock<usize>,
+        /// A submit waits while this is false.
+        open: AtomicBool,
+        /// The number of submits that waited for `open`.
+        held: AtomicUsize,
+    }
+
+    impl Ram {
+        /// Holds each submit until `open`.
+        fn close(&self) {
+            self.open.store(false, Ordering::SeqCst);
+        }
+
+        fn open(&self) {
+            self.open.store(true, Ordering::SeqCst);
+        }
+
+        /// Waits until `n` submits wait for `open`.
+        fn wait_held(&self, n: usize) {
+            while self.held.load(Ordering::SeqCst) < n {
+                thread::yield_now();
+            }
+        }
     }
 
     impl Store for Arc<Ram> {
@@ -616,6 +797,12 @@ mod tests {
         }
 
         fn submit(&self, bios: &mut [Bio]) {
+            if !self.open.load(Ordering::SeqCst) {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                while !self.open.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+            }
             let mut data = self.data.lock();
             for bio in bios {
                 let at = bio.sector as usize * SECTOR_SIZE;
@@ -644,6 +831,8 @@ mod tests {
             data: SpinLock::new(data),
             writes: SpinLock::new(Vec::new()),
             reads: SpinLock::new(0),
+            open: AtomicBool::new(true),
+            held: AtomicUsize::new(0),
         });
         (ram.clone(), PageCache::new(ram))
     }
@@ -742,5 +931,104 @@ mod tests {
         assert_eq!(c.write(FOLIO_SIZE as u64 + 3 * SECTOR_SIZE as u64, &buf), Err(Errno::ENOSPC));
         assert_eq!(c.write(FOLIO_SIZE as u64, &buf).unwrap(), 3 * SECTOR_SIZE);
         c.sync().unwrap();
+    }
+
+    /// A short time for a thread to reach a wait.
+    fn pause() {
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    #[test]
+    fn the_cache_is_not_locked_during_a_read_of_the_store() {
+        let (ram, c) = cache(2 * FOLIO_SIZE);
+        let c = Arc::new(c);
+        ram.close();
+        let reader = thread::spawn({
+            let c = c.clone();
+            move || {
+                let mut buf = [0u8; 1];
+                c.read(0, &mut buf).unwrap();
+                buf[0]
+            }
+        });
+        ram.wait_held(1);
+        // A folio that the cache has in full does not need the store.
+        c.write(FOLIO_SIZE as u64, &[7; FOLIO_SIZE]).unwrap();
+        let mut buf = [0u8; 1];
+        c.read(FOLIO_SIZE as u64, &mut buf).unwrap();
+        assert_eq!(buf, [7]);
+        ram.open();
+        assert_eq!(reader.join().unwrap(), 0);
+    }
+
+    #[test]
+    fn two_reads_of_one_folio_make_one_read_of_the_store() {
+        let (ram, c) = cache(FOLIO_SIZE);
+        let c = Arc::new(c);
+        ram.close();
+        let read = |at: u64| {
+            let c = c.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 1];
+                c.read(at, &mut buf).unwrap();
+                buf[0]
+            })
+        };
+        let first = read(0);
+        ram.wait_held(1);
+        let second = read(SECTOR_SIZE as u64 * 9);
+        pause();
+        ram.open();
+        assert_eq!(first.join().unwrap(), 0);
+        assert_eq!(second.join().unwrap(), 9);
+        assert_eq!(*ram.reads.lock(), 1);
+    }
+
+    #[test]
+    fn forget_waits_for_a_read_of_the_store() {
+        let (ram, c) = cache(FOLIO_SIZE);
+        let c = Arc::new(c);
+        ram.close();
+        let reader = thread::spawn({
+            let c = c.clone();
+            move || c.read(0, &mut [0u8; 1]).unwrap()
+        });
+        ram.wait_held(1);
+        let done = Arc::new(AtomicBool::new(false));
+        let forget = thread::spawn({
+            let (c, done) = (c.clone(), done.clone());
+            move || {
+                c.forget(0, 1);
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        pause();
+        assert!(!done.load(Ordering::SeqCst));
+        ram.open();
+        reader.join().unwrap();
+        forget.join().unwrap();
+        assert_eq!(c.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn a_write_during_a_write_back_stays_dirty() {
+        let (ram, c) = cache(FOLIO_SIZE);
+        let c = Arc::new(c);
+        c.write(0, &[1; PAGE_SIZE]).unwrap();
+        ram.close();
+        let sync = thread::spawn({
+            let c = c.clone();
+            move || c.sync().unwrap()
+        });
+        ram.wait_held(1);
+        // The page is clean and under write back. A new write makes it dirty again.
+        assert_eq!(c.dirty_bytes(), 0);
+        c.write(0, &[2; PAGE_SIZE]).unwrap();
+        assert_eq!(c.dirty_bytes(), PAGE_SIZE);
+        ram.open();
+        sync.join().unwrap();
+        assert_eq!(c.dirty_bytes(), PAGE_SIZE);
+        c.sync().unwrap();
+        assert!(ram.data.lock()[..PAGE_SIZE].iter().all(|&x| x == 2));
     }
 }

@@ -1614,7 +1614,7 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
     drop(table);
     // The root cgroup has no limits, so the charge cannot fail.
     let _ = rk_cgroup::charge_thread(rk_cgroup::ROOT);
-    rk_cgroup::with(|h| h.add_process(rk_cgroup::ROOT));
+    rk_cgroup::add_process(rk_cgroup::ROOT);
     Ok(thread)
 }
 
@@ -1727,7 +1727,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
     drop(table);
-    rk_cgroup::with(|h| h.add_process(cgroup));
+    rk_cgroup::add_process(cgroup);
     owner.state.lock().children.push(child);
     Ok(thread)
 }
@@ -2060,15 +2060,13 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         process.dead_ticks.fetch_add(thread.user_ticks(), Ordering::Relaxed);
         process.dead_sys_ticks.fetch_add(thread.sys_ticks(), Ordering::Relaxed);
         // The thread leaves its cgroup with the lock held, so a move of the process counts the
-        // threads that stay.
+        // threads that stay. The counts change without the lock of the hierarchy.
         let (cgroup, pcgroup) = (thread.cgroup(), process.cgroup());
         let last = s.threads.is_empty();
-        rk_cgroup::with(|h| {
-            h.uncharge_pids(cgroup, 1);
-            if last {
-                h.remove_process(pcgroup);
-            }
-        });
+        rk_cgroup::uncharge_thread(cgroup);
+        if last {
+            rk_cgroup::remove_process(pcgroup);
+        }
         last
     };
     // The thread leaves its network namespace, as `exit_task_namespaces` of Linux. The
