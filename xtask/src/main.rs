@@ -987,12 +987,14 @@ fn ltp_tests() -> Result<Vec<String>> {
 /// (`TCONF`) when the test does not apply. The output of a test that fails goes to the console.
 /// `LTP_TIMEOUT_MUL` makes the timeouts of the tests 4 times longer, because QEMU without KVM is
 /// slow. For example, `futex_cmp_requeue01` forks 1000 waiters, and each waiter stops after 5
-/// seconds.
+/// seconds. The script mounts sysfs, because some tests read it. For example, madvise02 expects
+/// `EINVAL` for `MADV_MERGEABLE` when /sys/kernel/mm/ksm is not there.
 fn ltp_script(tests: &[String]) -> String {
     let mut script = String::from(concat!(
         "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin:/ltp LTP_TIMEOUT_MUL=4 KCONFIG_PATH=/etc/kconfig\n",
         "export LTP_DEV=/dev/vda\n",
-        "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
+        "mount -t proc proc /proc\nmkdir -p /sys /dev/shm\nmount -t sysfs sysfs /sys\n",
+        "mount -t tmpfs shm /dev/shm\n",
         "failed=0\nfor t in \\\n",
     ));
     for t in tests {

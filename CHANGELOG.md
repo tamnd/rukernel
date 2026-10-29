@@ -30,6 +30,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The documentation of `compat::RESIZE_INODE` in rk-fs-ext4 links to `RESIZE_INO` with a path, so `cargo doc` with `-D warnings` passes in CI (#450).
 - tools/ltp/build.sh builds the LTP directories mq_notify, mq_timedreceive, mq_timedsend, mq_unlink, msgctl, msgget, msgrcv, msgsnd and shmget (#450). tools/ltp/tests.txt has their tests since #342, so the `ltp` boot test stopped with "No such file or directory" in CI.
 - The boot job of CI gives the runner user access to /dev/kvm with a udev rule, so QEMU runs with KVM and the `ltp` boot test ends in its time limit (#450). tools/ltp/tests.txt no longer has clock_gettime04, eventfd06, futex_waitv02, kill11, sendfile07_64 and splice07, which fail in the last full LTP run.
+- The `ltp` boot test mounts sysfs before the tests, so madvise02 finds /sys/kernel/mm/ksm and does not expect `EINVAL` for `MADV_MERGEABLE` (#450).
 
 ## [0.4.11] - 2026-10-29
 
