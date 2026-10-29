@@ -47,6 +47,10 @@ pub const SOL_PACKET: u32 = 263;
 /// The options `PACKET_ADD_MEMBERSHIP` and `PACKET_DROP_MEMBERSHIP` of <linux/if_packet.h>.
 const PACKET_ADD_MEMBERSHIP: u32 = 1;
 const PACKET_DROP_MEMBERSHIP: u32 = 2;
+/// The option `PACKET_VERSION` of <linux/if_packet.h>: the format of the mapped rings.
+const PACKET_VERSION: u32 = 10;
+/// The ring format `TPACKET_V1` of <linux/if_packet.h>, the default.
+const TPACKET_V1: i32 = 0;
 
 /// The types of a received frame, `PACKET_*` of <linux/if_packet.h>: to this host.
 pub const PACKET_HOST: u8 = 0;
@@ -403,7 +407,10 @@ impl Socket for PacketSocket {
 
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
         if level == SOL_PACKET {
-            return Err(Errno::ENOPROTOOPT);
+            return match name {
+                PACKET_VERSION => Ok(TPACKET_V1.to_ne_bytes().to_vec()),
+                _ => Err(Errno::ENOPROTOOPT),
+            };
         }
         if level != SOL_SOCKET {
             return Err(Errno::ENOPROTOOPT);
@@ -429,6 +436,14 @@ impl Socket for PacketSocket {
                     let ifindex =
                         u32::from_ne_bytes([ifindex[0], ifindex[1], ifindex[2], ifindex[3]]);
                     dev::by_index(ifindex).map(|_| ()).ok_or(Errno::ENODEV)
+                }
+                // rukernel has no mapped rings (`PACKET_RX_RING`), so only `TPACKET_V1`, the
+                // format of a socket without a ring, is accepted. `TPACKET_V2` and `TPACKET_V3`
+                // give `EINVAL`, as an unknown version gives in `packet_setsockopt` of Linux,
+                // and a program such as setsockopt02 of LTP then knows that they are missing.
+                PACKET_VERSION => {
+                    let v: [u8; 4] = value.try_into().map_err(|_| Errno::EINVAL)?;
+                    if i32::from_ne_bytes(v) == TPACKET_V1 { Ok(()) } else { Err(Errno::EINVAL) }
                 }
                 _ => Err(Errno::ENOPROTOOPT),
             };

@@ -43,6 +43,15 @@ pub const INIT_PID: Pid = 1;
 /// The longest name of a process, without the zero byte. Linux names it `TASK_COMM_LEN - 1`.
 pub const COMM_LEN: usize = 15;
 
+/// The default value of `/proc/PID/coredump_filter`: anonymous private and shared memory, the
+/// ELF headers and private hugetlb memory. Linux names it `MMF_DUMP_FILTER_DEFAULT`, with
+/// `CONFIG_CORE_DUMP_DEFAULT_ELF_HEADERS`.
+const COREDUMP_FILTER_DEFAULT: u32 = 0x33;
+
+/// The bits of `/proc/PID/coredump_filter`. Linux names it `MMF_DUMP_FILTER_MASK`, with
+/// `MMF_DUMP_FILTER_BITS` 9.
+const COREDUMP_FILTER_MASK: u32 = 0x1ff;
+
 /// The descriptor table that threads share. `clone` with `CLONE_FILES` shares it.
 pub type SharedFiles = Arc<SpinLock<FdTable>>;
 /// The file system context that threads share. `clone` with `CLONE_FS` shares it.
@@ -158,6 +167,9 @@ pub struct Process {
     start_tick: u64,
     /// The value of `/proc/PID/oom_score_adj`.
     oom_score_adj: AtomicI32,
+    /// The value of `/proc/PID/coredump_filter`: the bits `MMF_DUMP_*` of Linux. A child of
+    /// `fork` gets the value of the parent, and `execve` keeps it, as `mm_init` of Linux.
+    coredump_filter: AtomicU32,
     /// The OOM reaper took the private pages of the process. The OOM killers do not wait for
     /// it again, as `MMF_OOM_SKIP` of Linux.
     oom_reaped: AtomicBool,
@@ -821,6 +833,17 @@ impl Process {
         self.oom_score_adj.store(value, Ordering::Relaxed);
     }
 
+    /// The value of `/proc/PID/coredump_filter`.
+    pub fn coredump_filter(&self) -> u32 {
+        self.coredump_filter.load(Ordering::Relaxed)
+    }
+
+    /// Sets the value of `/proc/PID/coredump_filter`. Only the bits of `MMF_DUMP_FILTER_MASK`
+    /// stay, as `proc_coredump_filter_write` in fs/proc/base.c of Linux.
+    pub fn set_coredump_filter(&self, value: u32) {
+        self.coredump_filter.store(value & COREDUMP_FILTER_MASK, Ordering::Relaxed);
+    }
+
     /// The soft and the hard limit of `resource`, which is less than `RLIM_NLIMITS`.
     pub fn limit(&self, resource: usize) -> Limit {
         self.limits.lock()[resource]
@@ -956,6 +979,7 @@ impl Process {
             image: SpinLock::new(Image::default()),
             start_tick: rk_frame::time::ticks(),
             oom_score_adj: AtomicI32::new(0),
+            coredump_filter: AtomicU32::new(COREDUMP_FILTER_DEFAULT),
             oom_reaped: AtomicBool::new(false),
             membarrier: AtomicU32::new(0),
             personality: AtomicU32::new(0),
@@ -1681,6 +1705,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     // The child shares the session keyring. It has no thread keyring and no process keyring.
     child.keys.lock().session = pp.keys.lock().session.clone();
     child.set_oom_score_adj(pp.oom_score_adj());
+    child.set_coredump_filter(pp.coredump_filter());
     child.set_personality(pp.personality());
     child.set_thp_disable(pp.thp_disable());
     child.set_no_ctty(pp.no_ctty());

@@ -1611,6 +1611,65 @@ static void *spin(void *arg)
 	return NULL;
 }
 
+/* struct futex_waitv of <linux/futex.h>, for futex_waitv (449). */
+struct rk_futex_waitv {
+	unsigned long long val;
+	unsigned long long uaddr;
+	unsigned int flags;
+	unsigned int reserved;
+};
+
+static int waitv_words[2];
+
+static void *waitv_waker(void *arg)
+{
+	(void)arg;
+	/* Wake the second word until the waiter is in its queue. */
+	for (int i = 0; i < 1000; i++) {
+		if (syscall(SYS_futex, &waitv_words[1], FUTEX_WAKE_PRIVATE, 1) == 1)
+			return NULL;
+		usleep(1000);
+	}
+	return NULL;
+}
+
+/* futex_waitv, as kernel/futex/syscalls.c of Linux (futex_waitv01 to 03 of LTP, #475). */
+static void test_futex_waitv(void)
+{
+	struct rk_futex_waitv w[2];
+	struct timespec to;
+	pthread_t t;
+
+	for (int i = 0; i < 2; i++) {
+		w[i].val = 0;
+		w[i].uaddr = (unsigned long)&waitv_words[i];
+		w[i].flags = 2 | 128; /* FUTEX2_SIZE_U32 | FUTEX2_PRIVATE */
+		w[i].reserved = 0;
+	}
+	clock_gettime(CLOCK_MONOTONIC, &to);
+	to.tv_nsec += 20 * 1000 * 1000;
+	if (to.tv_nsec >= 1000000000) {
+		to.tv_sec++;
+		to.tv_nsec -= 1000000000;
+	}
+	check("futex_waitv with a timeout gives ETIMEDOUT",
+	      syscall(449, w, 2, 0, &to, CLOCK_MONOTONIC) == -1 && errno == ETIMEDOUT);
+	w[0].val = 1;
+	check("futex_waitv with a different value gives EAGAIN", syscall(449, w, 2, 0, NULL, 0) == -1 && errno == EAGAIN);
+	w[0].val = 0;
+	w[0].flags = 128;
+	check("futex_waitv without FUTEX2_SIZE_U32 gives EINVAL",
+	      syscall(449, w, 2, 0, NULL, 0) == -1 && errno == EINVAL);
+	w[0].flags = 2 | 128;
+	check("futex_waitv of 0 futexes gives EINVAL", syscall(449, w, 0, 0, NULL, 0) == -1 && errno == EINVAL);
+	check("futex_waitv with CLOCK_TAI gives EINVAL", syscall(449, w, 2, 0, &to, CLOCK_TAI) == -1 && errno == EINVAL);
+	pthread_create(&t, NULL, waitv_waker, NULL);
+	clock_gettime(CLOCK_MONOTONIC, &to);
+	to.tv_sec += 5;
+	check("futex_waitv gives the index of the woken futex", syscall(449, w, 2, 0, &to, CLOCK_MONOTONIC) == 1);
+	pthread_join(t, NULL);
+}
+
 static void test_threads(void)
 {
 	pthread_t t[4];
@@ -1648,6 +1707,7 @@ static void test_threads(void)
 	check("futex wait with a timeout", syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 1, &ts) ==
 						   -1 && errno == ETIMEDOUT);
 	check("futex wake with no waiter", syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1) == 0);
+	test_futex_waitv();
 
 	pid_t pid = fork();
 	if (pid == 0) {
@@ -3747,6 +3807,55 @@ static void test_pagemap(void)
 	test_mkclean();
 }
 
+/* Gives the end of the area of /proc/self/maps that holds `addr`, or 0. */
+static unsigned long maps_area_end(unsigned long addr)
+{
+	static char maps[65536];
+	unsigned long a, b;
+
+	if (read_file("/proc/self/maps", maps, sizeof(maps)) <= 0)
+		return 0;
+	for (char *line = maps; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL)
+		if (sscanf(line, "%lx-%lx", &a, &b) == 2 && a <= addr && addr < b)
+			return b;
+	return 0;
+}
+
+/*
+ * vma01 of LTP (#475): an area that a child of fork got with its pages does not join a new area
+ * next to it, because its anon_vma chain is not singular (mm/vma.c of Linux). In the parent the
+ * same two areas join.
+ */
+static void test_fork_area_merge(void)
+{
+	const unsigned long ps = 4096;
+	char *t = mmap(NULL, 6 * ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+	if (t == MAP_FAILED) {
+		check("mmap for the area merge after fork", 0);
+		return;
+	}
+	munmap(t + 3 * ps, 3 * ps);
+	memset(t, 1, ps);
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0) {
+		memset(t, 2, ps);
+		char *u = mmap(t + 3 * ps, 3 * ps, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+		if (u != t + 3 * ps)
+			_exit(2);
+		u[0] = 2;
+		_exit(maps_area_end((unsigned long)t) == (unsigned long)u ? 0 : 1);
+	}
+	check("an area from fork does not join a new area next to it",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	char *u = mmap(t + 3 * ps, 3 * ps, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+	check("an area that is not from fork joins a new area next to it",
+	      u == t + 3 * ps && maps_area_end((unsigned long)t) >= (unsigned long)(t + 6 * ps));
+	munmap(t, 6 * ps);
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -3788,9 +3897,26 @@ static void test_proc(void)
 	check("write /proc/self/oom_score_adj", fd >= 0 && write(fd, "-500\n", 5) == 5);
 	close(fd);
 	check("read /proc/self/oom_score_adj", read_file("/proc/self/oom_score_adj", buf, sizeof(buf)) == 5 && !strcmp(buf, "-500\n"));
+	/* madvise08 of LTP (#475): the default of Linux is 0x33, and a child of fork keeps the value. */
+	check("read /proc/self/coredump_filter",
+	      read_file("/proc/self/coredump_filter", buf, sizeof(buf)) == 9 && !strcmp(buf, "00000033\n"));
+	check("write /proc/self/coredump_filter", put_file("/proc/self/coredump_filter", "0x7f") == 0);
+	pid_t cpid = fork();
+	if (cpid == 0)
+		_exit(read_file("/proc/self/coredump_filter", buf, sizeof(buf)) == 9 && !strcmp(buf, "0000007f\n") ? 0 : 1);
+	int cstatus = 0;
+	check("a child of fork keeps the coredump_filter",
+	      waitpid(cpid, &cstatus, 0) == cpid && WIFEXITED(cstatus) && WEXITSTATUS(cstatus) == 0);
+	check("coredump_filter keeps only the 9 bits of the filter",
+	      put_file("/proc/self/coredump_filter", "0xffff") == 0 &&
+		      read_file("/proc/self/coredump_filter", buf, sizeof(buf)) == 9 && !strcmp(buf, "000001ff\n"));
+	check("coredump_filter refuses a text that is not a number",
+	      put_file("/proc/self/coredump_filter", "x") == -1 && errno == EINVAL);
+	put_file("/proc/self/coredump_filter", "0x33");
 	errno = 0;
 	check("/proc/self/nothing gives ENOENT", open("/proc/self/nothing", O_RDONLY) == -1 && errno == ENOENT);
 	test_pagemap();
+	test_fork_area_merge();
 	check("umount proc", umount("/proc") == 0);
 }
 
@@ -6621,6 +6747,10 @@ static void test_cgroup(void)
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		printf("cg_setns: status %#x\n", status);
 	check("setns joins a cgroup namespace", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/* No user namespaces, as Linux without CONFIG_USER_NS (getxattr05 of LTP, #475). */
+	check("/proc/self/ns/user does not exist", access("/proc/self/ns/user", F_OK) == -1 && errno == ENOENT);
+	check("unshare of CLONE_NEWUSER gives EINVAL", unshare(CLONE_NEWUSER) == -1 && errno == EINVAL);
+	check("NS_GET_USERNS gives EPERM", ioctl(cg_ns_fd, 0xb701) == -1 && errno == EPERM);
 	close(cg_ns_fd);
 
 	test_cgroup_io();

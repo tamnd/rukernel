@@ -11,7 +11,7 @@
 
 use super::{
     Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, SharedAnon, State,
-    charge_commit, map_error, page_prot, uncharge_commit, write_back,
+    charge_commit, map_error, next_fork_anon, page_prot, uncharge_commit, write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
 use crate::pttree::{RangeLock, TREE_END, Tree};
@@ -287,6 +287,10 @@ impl AddressSpace {
         // The child does not get the locks of the parent, as on Linux. Each status of the parent
         // gives one status of the child, so the pages of an area keep one status.
         let mut copies: BTreeMap<usize, Option<Status>> = BTreeMap::new();
+        // A private area of the child gets a new `fork_anon`, so it does not merge with a new
+        // area. The statuses of one run can be different, so the value comes from the value of
+        // the parent and not from the status: the pages of one area keep one value.
+        let mut anons: BTreeMap<u64, u64> = BTreeMap::new();
         // The slots of a node often hold the same status, so the last copy comes first.
         let mut recent: Option<(usize, Option<Status>)> = None;
         let mut map = |s: &Status| {
@@ -301,6 +305,9 @@ impl AddressSpace {
                     let mut v = Vma::clone(s);
                     v.locked = false;
                     v.account &= !v.shared;
+                    if !v.shared && !v.wipe_on_fork {
+                        v.fork_anon = *anons.entry(v.fork_anon).or_insert_with(next_fork_anon);
+                    }
                     Arc::new(v)
                 })
             });
@@ -509,6 +516,7 @@ impl AddressSpace {
                 kind: req.kind,
                 dont_fork: false,
                 wipe_on_fork: false,
+                fork_anon: 0,
             };
             self.state.set(&mut range, start, end, Some(Arc::new(vma)));
             reserve(&mut self.state.va.lock(), start, end);

@@ -225,8 +225,10 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
 fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
     use rk_vfs::nsfs::{NsInode, NsKind, link_text};
     /// The entries: rukernel makes no PID or time namespace for the children, so the
-    /// `*_for_children` links name the namespace of the process.
-    const ENTRIES: [(&[u8], NsKind); 10] = [
+    /// `*_for_children` links name the namespace of the process. There is no `user` link, as on
+    /// Linux without `CONFIG_USER_NS`: rukernel cannot make a user namespace, and a program such
+    /// as getxattr05 of LTP that finds the link expects `unshare(CLONE_NEWUSER)` to work.
+    const ENTRIES: [(&[u8], NsKind); 9] = [
         (b"cgroup", NsKind::Cgroup),
         (b"ipc", NsKind::Ipc),
         (b"mnt", NsKind::Mnt),
@@ -235,7 +237,6 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
         (b"pid_for_children", NsKind::Pid),
         (b"time", NsKind::Time),
         (b"time_for_children", NsKind::Time),
-        (b"user", NsKind::User),
         (b"uts", NsKind::Uts),
     ];
     let path = join(base, b"ns");
@@ -1617,6 +1618,23 @@ fn process_files(
         ),
     ));
     out.push((b"oom_score".to_vec(), file(&join(base, b"oom_score"), || Ok(b"0\n".to_vec()))));
+    // As `proc_coredump_filter_write` in fs/proc/base.c of Linux: the number takes the base of
+    // its prefix, and only the bits of the filter stay.
+    let p_ = w.clone();
+    let p2 = w.clone();
+    out.push((
+        b"coredump_filter".to_vec(),
+        rw_file(
+            &join(base, b"coredump_filter"),
+            move || Ok(text::coredump_filter(alive(&p_)?.coredump_filter())),
+            move |data| {
+                let v = text::parse_unsigned(data).ok_or(Errno::EINVAL)?;
+                let v = u32::try_from(v).map_err(|_| Errno::ERANGE)?;
+                alive(&p2)?.set_coredump_filter(v);
+                Ok(())
+            },
+        ),
+    ));
     // The files of KSM are empty for a process without an address space, as in Linux.
     let p_ = w.clone();
     out.push((

@@ -527,9 +527,49 @@ pub fn parse_number(bytes: &[u8]) -> Option<i64> {
     s.parse().ok()
 }
 
+/// Reads an unsigned number in the base of its prefix, as `kstrtoull` of Linux with the base 0:
+/// `0x` gives base 16, another leading `0` gives base 8, and the rest is base 10. A `+` and a
+/// new line at the end are accepted. Gives `None` for a text that is not a number, and the
+/// number can be larger than any `u32`.
+pub fn parse_unsigned(bytes: &[u8]) -> Option<u64> {
+    let s = core::str::from_utf8(bytes).ok()?;
+    let s = s.strip_suffix('\n').unwrap_or(s);
+    let s = s.strip_prefix('+').unwrap_or(s);
+    let (digits, radix) = if let Some(hex) = s.strip_prefix("0x").or(s.strip_prefix("0X")) {
+        (hex, 16)
+    } else if s.len() > 1 && s.starts_with('0') {
+        (&s[1..], 8)
+    } else {
+        (s, 10)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+/// The text of `/proc/PID/coredump_filter`, as `proc_coredump_filter_read` of Linux.
+pub fn coredump_filter(value: u32) -> Vec<u8> {
+    format!("{value:08x}\n").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsigned_numbers_take_the_base_of_their_prefix() {
+        assert_eq!(parse_unsigned(b"0x33\n"), Some(0x33));
+        assert_eq!(parse_unsigned(b"0X1ff"), Some(0x1ff));
+        assert_eq!(parse_unsigned(b"017"), Some(0o17));
+        assert_eq!(parse_unsigned(b"51"), Some(51));
+        assert_eq!(parse_unsigned(b"+0"), Some(0));
+        assert_eq!(parse_unsigned(b"0x"), None);
+        assert_eq!(parse_unsigned(b"08"), None);
+        assert_eq!(parse_unsigned(b"-1"), None);
+        assert_eq!(parse_unsigned(b" 1"), None);
+        assert_eq!(coredump_filter(0x33), b"00000033\n");
+    }
 
     #[test]
     fn meminfo_has_the_format_of_linux() {

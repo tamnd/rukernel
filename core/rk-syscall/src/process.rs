@@ -245,15 +245,16 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     if nstype == 0 || nstype & !all != 0 {
         return Err(Errno::EINVAL);
     }
-    if nstype & CLONE_NEWNS != 0 {
+    // rukernel has no user namespaces, so `CLONE_NEWUSER` gives `EINVAL`, as `check_setns_flags`
+    // in kernel/nsproxy.c of Linux without `CONFIG_USER_NS`.
+    if nstype & (CLONE_NEWNS | CLONE_NEWUSER) != 0 {
         return Err(Errno::EINVAL);
     }
     if target.is_zombie() {
         return Err(Errno::ESRCH);
     }
-    // The caller is in the user namespace of the target already. A join of another kind needs
-    // `CAP_SYS_ADMIN`, as `validate_nsset` of Linux, and an error changes nothing.
-    if nstype & !CLONE_NEWUSER != 0 && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+    // A join needs `CAP_SYS_ADMIN`, as `validate_nsset` of Linux, and an error changes nothing.
+    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     if nstype & CLONE_NEWCGROUP != 0 {

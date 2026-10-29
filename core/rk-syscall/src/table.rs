@@ -383,6 +383,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SET_ROBUST_LIST => futex::set_robust_list(cx, a[0], a[1]),
         nr::GET_ROBUST_LIST => futex::get_robust_list(cx, a[0], a[1], a[2]),
         nr::FUTEX => futex::futex(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
+        nr::FUTEX_WAITV => futex::futex_waitv(cx, a[0], a[1], a[2], a[3], a[4]),
         nr::UTIMENSAT => fs::utimensat(cx, a[0], a[1], a[2], a[3]),
         nr::DUP3 => fs::dup3(cx, a[0], a[1], a[2]),
         nr::PRLIMIT64 => info::prlimit64(cx, a[0], a[1], a[2], a[3]),

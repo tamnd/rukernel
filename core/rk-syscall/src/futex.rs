@@ -22,16 +22,18 @@
 use crate::cx::{Cx, SysResult};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::futex::{
     FUTEX_BITSET_MATCH_ANY, FUTEX_CLOCK_REALTIME, FUTEX_CMD_MASK, FUTEX_CMP_REQUEUE, FUTEX_LOCK_PI,
     FUTEX_LOCK_PI2, FUTEX_OP_OPARG_SHIFT, FUTEX_OWNER_DIED, FUTEX_PRIVATE_FLAG, FUTEX_REQUEUE,
     FUTEX_TID_MASK, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI, FUTEX_WAIT, FUTEX_WAIT_BITSET,
-    FUTEX_WAITERS, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, ROBUST_LIST_LIMIT,
+    FUTEX_WAITERS, FUTEX_WAITV_MAX, FUTEX_WAKE, FUTEX_WAKE_BITSET, FUTEX_WAKE_OP, FUTEX2_PRIVATE,
+    FUTEX2_SIZE_MASK, FUTEX2_SIZE_U32, ROBUST_LIST_LIMIT,
 };
 use rk_abi::native::time::{CLOCK_MONOTONIC, CLOCK_REALTIME};
-use rk_abi::native::types::{KernelTimespec, RobustListHead};
+use rk_abi::native::types::{FutexWaitv, KernelTimespec, RobustListHead};
 use rk_frame::sync::SpinLock;
 use rk_frame::task::WaitQueue;
 use rk_frame::time::HZ;
@@ -59,8 +61,8 @@ struct Waiter {
     woken: AtomicBool,
     /// `FUTEX_UNLOCK_PI` sets this when it gives the lock to the task.
     owner: AtomicBool,
-    /// The task waits here alone.
-    queue: WaitQueue,
+    /// The task waits here. The waiters of one `futex_waitv` share it.
+    queue: Arc<WaitQueue>,
 }
 
 /// The waiters of each key, in the order that they started to wait.
@@ -94,12 +96,16 @@ fn replace_word(vm: &AddressSpace, addr: usize, old: u32, new: u32) -> Result<bo
 
 impl Waiter {
     fn new(tid: u32, bitset: u32) -> Arc<Self> {
+        Self::with_queue(tid, bitset, Arc::new(WaitQueue::new()))
+    }
+
+    fn with_queue(tid: u32, bitset: u32, queue: Arc<WaitQueue>) -> Arc<Self> {
         Arc::new(Self {
             tid,
             bitset,
             woken: AtomicBool::new(false),
             owner: AtomicBool::new(false),
-            queue: WaitQueue::new(),
+            queue,
         })
     }
 }
@@ -474,6 +480,97 @@ pub(crate) fn futex(
         // musl do not use them.
         _ => Err(Errno::ENOSYS),
     }
+}
+
+/// `futex_waitv`: waits on up to `FUTEX_WAITV_MAX` futexes at the same time, as
+/// `sys_futex_waitv` and `futex_wait_multiple` in kernel/futex of Linux. The timeout is an
+/// absolute time of `clockid`. Gives the index of a futex that a wake woke. A word that does
+/// not have its value gives `EAGAIN`.
+pub(crate) fn futex_waitv(
+    cx: &Cx<'_>,
+    waiters: u64,
+    nr: u64,
+    flags: u64,
+    timeout: u64,
+    clockid: u64,
+) -> SysResult {
+    if flags != 0 || nr == 0 || nr > u64::from(FUTEX_WAITV_MAX) || waiters == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        let clock = u32::try_from(clockid).map_err(|_| Errno::EINVAL)?;
+        if clock != CLOCK_REALTIME && clock != CLOCK_MONOTONIC {
+            return Err(Errno::EINVAL);
+        }
+        deadline(cx, timeout, Some(clock))?
+    };
+    let vm = cx.vm()?;
+    let size = size_of::<FutexWaitv>() as u64;
+    let mut futexes = Vec::with_capacity(nr as usize);
+    for i in 0..nr {
+        let w: FutexWaitv = cx.read_val(waiters.checked_add(i * size).ok_or(Errno::EFAULT)?)?;
+        // As `futex_parse_waitv`: only 32-bit futexes, and the value fits in the word.
+        // `FUTEX2_NUMA` needs a node word after the futex, which rukernel does not have yet.
+        if w.flags & !(FUTEX2_SIZE_MASK | FUTEX2_PRIVATE) != 0
+            || w.__reserved != 0
+            || w.flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32
+            || w.val > u64::from(u32::MAX)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let addr = usize::try_from(w.uaddr).map_err(|_| Errno::EFAULT)?;
+        futexes.push((key(&vm, addr, w.flags & FUTEX2_PRIVATE != 0)?, addr, w.val as u32));
+    }
+    // Each waiter is in its queue before the read of its word, as in `wait`.
+    let queue = Arc::new(WaitQueue::new());
+    let list: Vec<Arc<Waiter>> = futexes
+        .iter()
+        .map(|&(k, ..)| {
+            let w = Waiter::with_queue(cx.thread.tid(), FUTEX_BITSET_MATCH_ANY, queue.clone());
+            self::queue(k, &w);
+            w
+        })
+        .collect();
+    let mut r = Ok(());
+    for &(_, addr, val) in &futexes {
+        match read_word(&vm, addr) {
+            Ok(word) if word == val => {}
+            Ok(_) => r = Err(Errno::EAGAIN),
+            Err(e) => r = Err(e),
+        }
+        if r.is_err() {
+            break;
+        }
+    }
+    let any_woken = || list.iter().any(|w| w.woken.load(Ordering::Acquire));
+    if r.is_ok() {
+        let thread = cx.thread;
+        let cond = || {
+            if any_woken() {
+                Some(Ok(()))
+            } else if thread.signal_pending() {
+                Some(Err(Errno::ERESTARTSYS))
+            } else {
+                None
+            }
+        };
+        r = match deadline {
+            Some(d) => queue.wait_until_timeout(d, cond).unwrap_or(Err(Errno::ETIMEDOUT)),
+            None => queue.wait_until(cond),
+        };
+    }
+    for w in &list {
+        if !w.woken.load(Ordering::Acquire) {
+            remove_waiter(w);
+        }
+    }
+    // A wake that came before the removal wins over the error, as `futex_unqueue_multiple`.
+    if let Some(i) = list.iter().rposition(|w| w.woken.load(Ordering::Acquire)) {
+        return Ok(i as u64);
+    }
+    r.map(|()| 0)
 }
 
 /// Clears the word of `clear_child_tid` and wakes one waiter when a thread ends, as `mm_release`
