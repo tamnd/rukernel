@@ -58,6 +58,8 @@ cargo xtask qemu rk.test=boot
 
 QEMU loads the ELF image directly through the PVH entry note. The build also writes a bzImage next to the ELF image, in `target/x86_64-unknown-none/debug/bzImage`. A loader of the Linux boot protocol, such as QEMU with `-kernel` or GRUB with `linux`, can boot it. The bzImage is also an EFI application, so UEFI firmware can start it directly. The boot test boots the bzImage with the BIOS of QEMU and with OVMF. It finds OVMF in the usual package paths, or `RK_OVMF` gives the path.
 
+`cargo xtask qemu` and the boot tests use the QEMU programs in `PATH`. `RK_QEMU` gives the directory of the programs of a different QEMU build, for example `$HOME/rk-qemu9/install/bin`. Without KVM, the x86-64 CPU model is `max`, and `RK_QEMU_CPU` gives a different model, for example `max,-x2apic`. QEMU 9.0 and later give the x2APIC without KVM, and QEMU 8.2 does not. When the CPU has the x2APIC, the kernel uses it and writes `x2apic enabled` in the boot log.
+
 The `init` and `tty` boot tests run the C programs in `tests/user`. The build compiles them with `musl-gcc` or `zig cc`, or with the command in `RK_USER_CC`. The `busybox` boot test runs the BusyBox shell as init. The shell runs a pipeline, and `^C` stops a job in the foreground. The first run downloads a static BusyBox from busybox.net and checks its SHA-256. `RK_BUSYBOX` gives the path of a different BusyBox. To use the shell yourself, run this command:
 
 ```

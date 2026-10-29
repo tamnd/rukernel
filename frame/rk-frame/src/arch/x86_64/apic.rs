@@ -292,6 +292,9 @@ pub(crate) fn init() {
     if has_x2apic() {
         write_msr(IA32_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
         X2APIC.store(true, Ordering::Relaxed);
+        // The text of `x2apic_enable` in arch/x86/kernel/apic/apic.c of Linux. The `init` boot
+        // test looks for it in the kernel log when the CPU has the x2APIC.
+        crate::println!("x2apic enabled");
     } else {
         write_msr(IA32_APIC_BASE, base | APIC_BASE_ENABLE);
         let virt = crate::mm::frame::vmap_mmio(base & APIC_BASE_ADDR)

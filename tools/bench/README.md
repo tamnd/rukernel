@@ -46,15 +46,21 @@ tools/bench/run.py --rukernel target/x86_64-unknown-none/release/rukernel \
     --linux /boot/vmlinuz-VERSION --cc musl-gcc --runs 10 --out /tmp/bench
 ```
 
-`--arch aarch64` runs arm64 kernels on the `virt` machine of `qemu-system-aarch64` with a GICv3, and the console is `ttyAMA0`. Without KVM on an arm64 host, the CPU is `cortex-a72`, as in the arm64 boot tests. `--rukernel` is then the arm64 ELF file of rukernel, which `run.py` changes into an `Image`, and `--linux` is a Linux arm64 `Image`, for example the uncompressed `vmlinuz` of the arm64 kernel package of Ubuntu. `--cc` must make static arm64 programs. `results-aarch64.md` has the arm64 table.
+`--arch aarch64` runs arm64 kernels on the `virt` machine of `qemu-system-aarch64` with a GICv3, and the console is `ttyAMA0`. Without KVM on an arm64 host, the CPU is `cortex-a72`, as in the arm64 boot tests. `--rukernel` is then the arm64 ELF file of rukernel, which `run.py` changes into an `Image`, and `--linux` is a Linux arm64 `Image`, for example the uncompressed `vmlinuz` of the arm64 kernel package of Ubuntu. `--cc` must make static arm64 programs. `results-aarch64.md` has the arm64 table, with the logs in `logs-aarch64`.
+
+`linux-arm64.sh DIR` builds a Linux arm64 `Image` for the Linux column. It downloads the Linux release that tools/rk-abigen uses (7.3), checks its SHA-256, and builds the `Image` of `defconfig` with `aarch64-linux-gnu-gcc`, or with clang and ld.lld (`LLVM=1`) if that compiler is not there. The build runs with `nice -n 19` and 3 jobs, and `JOBS` changes the number of jobs. The `Image` is `DIR/build/arch/arm64/boot/Image`. On server2 (6 CPUs, load average 15 to 17), the build took about 75 minutes, the `Image` is 50 MiB, and DIR takes 3.6 GiB.
 
 ```
+tools/bench/linux-arm64.sh ~/rk-linux-arm64
 cargo build --release --package rukernel --target aarch64-unknown-none
 tools/bench/run.py --arch aarch64 --rukernel target/aarch64-unknown-none/release/rukernel \
-    --linux Image --cc aarch64-linux-musl-gcc --only cow --table tools/bench/results-aarch64.md
+    --linux ~/rk-linux-arm64/build/arch/arm64/boot/Image --cc aarch64-linux-musl-gcc \
+    --out tools/bench/logs-aarch64 --table tools/bench/results-aarch64.md
 ```
 
-The arm64 `fork` copy of #401, with `run.py --arch aarch64` on server2 (QEMU 8.2.2 with TCG, `cortex-a72`, `-smp 1`, load average 6 to 7), rukernel only, because the host has no Linux arm64 `Image`. The medians of 2 boots of 5 runs each (#442):
+In the first arm64 table (#442), `tcp_stream` is red: 25.7 MB/s on rukernel and 57.5 MB/s on Linux, a ratio of 2.23. Linux is 7 times slower than rukernel on the entry rows (`getpid` 39482 ns on Linux and 5694 ns on rukernel), and the cause is not known yet.
+
+The arm64 `fork` copy of #401, with `run.py --arch aarch64` on server2 (QEMU 8.2.2 with TCG, `cortex-a72`, `-smp 1`, load average 6 to 7), rukernel only, because the host had no Linux arm64 `Image` then. The medians of 2 boots of 5 runs each (#442):
 
 | Benchmark | 212e8b2 (before #401) | fa7f8e5 (#401) |
 |---|---|---|
@@ -67,6 +73,39 @@ The arm64 `fork` copy of #401, with `run.py --arch aarch64` on server2 (QEMU 8.2
 `fork` is 1.3 times faster and `fork_big` 2.7 times faster. `fork_big` also gains from the one entry for each huge page of #401.
 
 `--cc` takes a command with arguments, for example `"zig cc -target x86_64-linux-musl"`. `--bench FILE` uses a program that is already compiled. `--only getpid,fork` runs only some benchmarks. `--reuse` makes the table again from the logs of an earlier run, with no boot. `--reuse-linux` boots only rukernel and takes the Linux values from the earlier log, so two rukernel builds can use the same Linux run. `--smp` and `--memory` change the machine for both kernels. `run.py --help` gives all the options.
+
+`--qemu DIR` uses the QEMU programs in DIR, and the default is the directory in `RK_QEMU`, or `PATH`. `--cpu MODEL` gives the CPU model without KVM, for example `max,-x2apic`.
+
+## The x2APIC
+
+`apic.rs` uses the x2APIC when CPUID gives it. QEMU 8.2.2 with TCG has no x2APIC, so the boot tests and `results.md` use the xAPIC. QEMU 9.2.4 with TCG gives the x2APIC with `-cpu max`. With it, the kernel writes `x2apic enabled` in the boot log, and the `init` boot test checks that the kernel uses the x2APIC if and only if CPUID gives it (#442). On server2 with QEMU 9.2.4 (`RK_QEMU`), the boot tests `init`, `smp` (4 CPUs, with IPIs), `busybox`, `mm`, `task`, `blk` and `inet` pass in x2APIC mode. They found no bug.
+
+`results-x2apic.md` is the table of a run with QEMU 9.2.4 and `-cpu max`, with the logs in `logs-x2apic`. rukernel uses the x2APIC in it. Linux does not, because it uses the x2APIC only with interrupt remapping, and the machine has no IOMMU. Its boot log gives "x2apic: IRQ remapping doesn't support X2APIC mode". The host was busy (load average 13 to 17), so the values are less stable than in `results.md`.
+
+The table below compares the modes on rukernel alone. Each value is the median of 10 runs in one boot, for 3 boots with `-cpu max` (x2APIC) and 3 boots with `-cpu max,-x2apic` (xAPIC) on QEMU 9.2.4, one after the other on server2. The ratio is the median of the x2APIC boots divided by the median of the xAPIC boots, and the inverse for the MB/s rows, so a ratio above 1.00 tells that the x2APIC is slower. All ratios are between 0.82 and 1.13, and the interquartile range of a boot is often 10% to 30%. Thus the mode makes no difference that this harness can see under TCG. With `-smp 1`, the APIC writes in these benchmarks are the EOI of the timer, 250 times each second, so this result is as expected. A difference can show with KVM, where each APIC access is an exit of the VM, and the MMIO exit of an xAPIC access costs more than the MSR exit of an x2APIC access.
+
+| Benchmark | x2APIC | xAPIC | Ratio |
+|---|---|---|---|
+| `getpid` (ns) | 1733, 1410, 1376 | 1838, 1711, 1312 | 0.82 |
+| `null` (ns) | 2178, 1653, 1646 | 2121, 1465, 1198 | 1.13 |
+| `read_zero` (ns) | 3189, 3071, 3243 | 2772, 2956, 3090 | 1.08 |
+| `pipe_rw` (ns) | 9293, 7881, 7319 | 7897, 7882, 7142 | 1.00 |
+| `ctxsw` (ns) | 178603, 150924, 148926 | 152883, 160340, 145623 | 0.99 |
+| `yield` (ns) | 1779, 1862, 1557 | 1768, 2037, 1818 | 0.98 |
+| `thread` (us) | 374, 379, 359 | 350, 371, 297 | 1.07 |
+| `fault` (ns) | 5745, 5122, 6038 | 5039, 5859, 5416 | 1.06 |
+| `mmap` (ns) | 13673, 12328, 12261 | 12129, 12723, 12140 | 1.02 |
+| `fork` (us) | 775, 725, 652 | 689, 664, 683 | 1.06 |
+| `fork_big` (us) | 5348, 4562, 4588 | 4715, 4821, 5010 | 0.95 |
+| `fault_mt` (ns) | 10701, 10011, 10016 | 7676, 8933, 10148 | 1.12 |
+| `mmap_mt` (ns) | 12007, 9289, 10467 | 9109, 9995, 12158 | 1.05 |
+| `cow` (ns) | 17467, 16071, 15747 | 17676, 18434, 17691 | 0.91 |
+| `tcp_rr` (us) | 381, 312, 325 | 319, 341, 334 | 0.97 |
+| `tcp_stream` (MB/s) | 16.6, 18.9, 17.5 | 18.7, 20.4, 18.5 | 1.07 |
+| `udp_rr` (us) | 370, 320, 318 | 333, 315, 344 | 0.96 |
+| `udp_stream` (MB/s) | 3.70, 4.05, 4.26 | 4.08, 3.99, 3.95 | 0.99 |
+
+To build the same QEMU in a home directory, with no system packages, take the release tarball from download.qemu.org and run `configure --prefix=DIR/install --target-list=x86_64-softmmu,aarch64-softmmu --without-default-features --disable-docs --enable-fdt=internal --enable-slirp --enable-tcg`, then `make` and `make install`. The build needs glib, pixman, meson and ninja. Meson downloads dtc and libslirp. Then set `RK_QEMU=DIR/install/bin`.
 
 ## Limits
 
