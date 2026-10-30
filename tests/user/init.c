@@ -5805,6 +5805,17 @@ static void par_fs_run(int n)
 	rmdir(PAR_FS_DIR);
 }
 
+static int par_spin_stop;
+
+/* Runs on a CPU until par_spin_stop is 1, so that the address space is active there. */
+static void *par_spin(void *arg)
+{
+	(void)arg;
+	while (!__atomic_load_n(&par_spin_stop, __ATOMIC_ACQUIRE))
+		;
+	return NULL;
+}
+
 /* Gives the sum of the TLB line of /proc/interrupts, or -1 if the file has no TLB line, as on
  * arm64. */
 static long tlb_shootdowns(void)
@@ -5896,7 +5907,6 @@ static void test_smp_parallel(int cpus)
 		for (int i = 0; i < n; i++)
 			pthread_join(t[i], NULL);
 		long tlb1 = tlb_shootdowns();
-		umount("/proc");
 		printf("init: %d page faults on %d CPUs take %ld TLB shootdowns\n", PAR_PAGES * n, n,
 		       tlb1 - tlb0);
 #ifdef __x86_64__
@@ -5909,7 +5919,25 @@ static void test_smp_parallel(int cpus)
 		for (int p = 0; p < PAR_PAGES && mapped; p++)
 			for (int i = 0; i < n; i++)
 				mapped &= area[p * 4096 + i] == (char)(i + 1);
+		/* Threads of this process run on the other CPUs, so the munmap must drop the TLB
+		 * entries there. One flush is for the whole range, as the mmu_gather of Linux. A
+		 * flush for each page sent one shootdown for each page (#468). */
+		__atomic_store_n(&par_spin_stop, 0, __ATOMIC_RELEASE);
+		for (int i = 1; i < n; i++)
+			pthread_create(&t[i], NULL, par_spin, NULL);
+		long tlb2 = tlb_shootdowns();
 		munmap(area, PAR_PAGES * 4096);
+		long tlb3 = tlb_shootdowns();
+		__atomic_store_n(&par_spin_stop, 1, __ATOMIC_RELEASE);
+		for (int i = 1; i < n; i++)
+			pthread_join(t[i], NULL);
+		umount("/proc");
+		printf("init: a munmap of %d pages on %d CPUs takes %ld TLB shootdowns\n", PAR_PAGES, n,
+		       tlb3 - tlb2);
+#ifdef __x86_64__
+		check("a munmap of many pages sends almost no TLB shootdown",
+		      tlb2 >= 0 && tlb3 - tlb2 < PAR_PAGES / 64);
+#endif
 	}
 	check("page faults on each CPU in one address space lose no write", mapped);
 

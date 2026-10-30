@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - tools/ltp/run.py gives hackbench02 480 s, because its 8 M messages took up to 223 s under QEMU without KVM, near the limit of 240 s (#504).
+- `munmap` and the other removals of a range of pages do one TLB flush for the range, and not one for each 4 KiB page, as the `mmu_gather` of Linux (#468). The frames go after the flush. The `munmap` of the `fault_mt` bench on 4 CPUs sent about 6170 shootdowns in each round, and Linux sends about 9. A range of one page keeps the flush of one entry. The `smp` boot test examines that a `munmap` of 2048 pages with threads on the other CPUs sends almost no shootdown.
 
 ## [0.4.18] - 2026-10-30
 
