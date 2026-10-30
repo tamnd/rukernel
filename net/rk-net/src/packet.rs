@@ -22,6 +22,7 @@ use crate::buf::NetBuf;
 use crate::consts::{MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW};
 use crate::dev::{self, Event, LinkKind, NetDevice};
 use crate::ether::{EthHeader, HLEN, MacAddr};
+use crate::filter::{Skb, SocketFilter};
 use crate::options::{Options, hz, now};
 use crate::{Message, PathOps, Received, Socket, SocketMap, next_ino, ns, wait_for};
 use alloc::collections::VecDeque;
@@ -33,7 +34,8 @@ use rk_abi::Errno;
 use rk_abi::native::if_ether::ETH_P_ALL;
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::socket::{
-    SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
+    SO_ACCEPTCONN, SO_ATTACH_FILTER, SO_DETACH_FILTER, SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER,
+    SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
@@ -131,6 +133,8 @@ pub struct PacketSocket {
     /// The error for the next receive or `SO_ERROR`, as `sk_err` of Linux, or 0.
     err: AtomicU32,
     options: SpinLock<Options>,
+    /// The filter of `SO_ATTACH_FILTER`.
+    filter: SpinLock<SocketFilter>,
     wait: Arc<WaitQueue>,
     /// The index of the namespace of the socket. The socket holds its namespace, so the index
     /// does not change.
@@ -175,6 +179,7 @@ impl PacketSocket {
             stopped: AtomicBool::new(false),
             err: AtomicU32::new(0),
             options: SpinLock::new(Options::default()),
+            filter: SpinLock::new(SocketFilter::default()),
             wait: Arc::new(WaitQueue::new()),
             net: ns::current_index(),
             queue: SpinLock::new((VecDeque::new(), 0)),
@@ -221,6 +226,28 @@ impl PacketSocket {
     fn queue(&self, dev: &NetDevice, frame: &[u8], h: &EthHeader, pkttype: u8) {
         let raw = self.kind == SOCK_RAW && dev.kind().has_header();
         let data = if !raw { &frame[HLEN..] } else { frame };
+        // The filter gives the bytes that the socket keeps, and 0 drops the frame, as
+        // `run_filter` in `packet_rcv` and `tpacket_rcv` of Linux.
+        let len = data.len();
+        let data = match self.filter.lock().get() {
+            Some(f) => {
+                let skb = Skb {
+                    frame,
+                    mac: if dev.kind().has_header() { 0 } else { HLEN },
+                    net: HLEN,
+                    data: frame.len() - len,
+                    protocol: h.ethertype,
+                    pkttype,
+                    ifindex: dev.ifindex(),
+                    hatype: dev.kind().arphrd(),
+                };
+                match f.run(&skb) as usize {
+                    0 => return,
+                    n => &data[..n.min(len)],
+                }
+            }
+            None => data,
+        };
         let mut addr = [0u8; SOCKADDR_LL];
         addr[..2].copy_from_slice(&(AF_PACKET as u16).to_ne_bytes());
         addr[2..4].copy_from_slice(&h.ethertype.to_be_bytes());
@@ -236,6 +263,7 @@ impl PacketSocket {
             if let Some(ring) = rx.as_mut() {
                 let p = Packet {
                     data,
+                    len,
                     maclen: if raw { HLEN } else { 0 },
                     dgram: self.kind == SOCK_DGRAM,
                     addr: &addr,
@@ -666,6 +694,7 @@ impl Socket for PacketSocket {
             SO_PROTOCOL => int(self.protocol()),
             SO_ERROR => int(self.err.swap(0, Ordering::Relaxed)),
             SO_ACCEPTCONN => int(0),
+            SO_LOCK_FILTER => int(u32::from(self.filter.lock().locked())),
             _ => self.options.lock().get(name)?,
         })
     }
@@ -715,6 +744,9 @@ impl Socket for PacketSocket {
         }
         match name {
             SO_TYPE | SO_DOMAIN | SO_PROTOCOL | SO_ERROR | SO_ACCEPTCONN => Err(Errno::ENOPROTOOPT),
+            SO_ATTACH_FILTER | SO_DETACH_FILTER | SO_LOCK_FILTER => {
+                self.filter.lock().set(name, value)
+            }
             _ => self.options.lock().set(name, value),
         }
     }

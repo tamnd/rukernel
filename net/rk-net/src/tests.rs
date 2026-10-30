@@ -1,6 +1,8 @@
 use super::{Options, Timeout};
 use rk_abi::Errno;
-use rk_abi::native::socket::{SO_KEEPALIVE, SO_RCVBUF, SO_RCVTIMEO_OLD, SO_SNDBUF, SO_TYPE};
+use rk_abi::native::socket::{
+    SO_BUSY_POLL, SO_KEEPALIVE, SO_RCVBUF, SO_RCVTIMEO_OLD, SO_SNDBUF, SO_TYPE,
+};
 
 fn timeval(sec: i64, usec: i64) -> [u8; 16] {
     let mut v = [0; 16];
@@ -48,4 +50,15 @@ fn timeouts() {
     assert_eq!(o.set(SO_RCVTIMEO_OLD, &timeval(-1, 0)), Ok(()));
     assert_eq!(o.rcvtimeo.ticks(), Some(1));
     assert_eq!(Timeout::default().ticks(), None);
+}
+
+/// `SO_BUSY_POLL` keeps a time that is not negative, as `sk_setsockopt` of Linux.
+#[test]
+fn busy_poll() {
+    let mut o = Options::default();
+    assert_eq!(o.get(SO_BUSY_POLL), Ok(0_i32.to_ne_bytes().to_vec()));
+    assert_eq!(o.set(SO_BUSY_POLL, &50_i32.to_ne_bytes()), Ok(()));
+    assert_eq!(o.get(SO_BUSY_POLL), Ok(50_i32.to_ne_bytes().to_vec()));
+    assert_eq!(o.set(SO_BUSY_POLL, &(-1_i32).to_ne_bytes()), Err(Errno::EINVAL));
+    assert_eq!(o.get(SO_BUSY_POLL), Ok(50_i32.to_ne_bytes().to_vec()));
 }

@@ -21,6 +21,7 @@ pub mod consts;
 pub mod dev;
 pub mod dummy;
 pub mod ether;
+pub mod filter;
 pub mod ioctl;
 pub mod netlink;
 pub mod ns;
@@ -90,6 +91,9 @@ pub struct Message {
     /// The credentials of `SCM_CREDENTIALS`. Without them the message has the credentials of
     /// the sender.
     pub cred: Option<Cred>,
+    /// The control messages of the protocol levels, as `IPPROTO_IPV6`: the level, the type and
+    /// the data. The socket reads them, as `ip6_datagram_send_ctl` of Linux.
+    pub control: Vec<(u32, u32, Vec<u8>)>,
 }
 
 /// A message that a receive gives.

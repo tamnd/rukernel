@@ -61,6 +61,14 @@ LIMITS = {
     "cgroup_fj_stress_memory_10_3_each": 600,
     "sctp01": 900,
     "sctp01_ipv6": 900,
+    # Each of the 2 tests of mc_commo waits 100 seconds.
+    "mc_commo": 600,
+    # mc_member sleeps 2 x (20 x 10 s + 60 s).
+    "mc_member": 900,
+    # The TCP case with -A 65000 runs netstress 5 times with 2000 requests of random sizes up to
+    # 65000 bytes. Under QEMU without KVM on a busy host the test passes in about 1400 s.
+    "bind_noport01": 1800,
+    "bind_noport01_ipv6": 1800,
 }
 
 # The tests that run in their own boot. memcontrol03 and memcontrol04 can leave cgroups with
@@ -89,9 +97,11 @@ mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup 2>/dev/null
 ip link set lo up 2>/dev/null
 # The drivers that are in the kernel, for tst_require_drivers. rukernel has no modules.
 m=/lib/modules/$(uname -r)
-mkdir -p $m /var/run/netns
+mkdir -p $m /var/run/netns /var/lib/misc /var/lib/dhcp /var/log
 printf "kernel/drivers/net/veth.ko\nkernel/drivers/net/dummy.ko\n" > $m/modules.builtin
 : > $m/modules.dep
+# The RPC tests need rpcbind, from --tools.
+command -v rpcbind >/dev/null && mkdir -p /run && rpcbind
 if ! mount -t ext4 -o ro /dev/vdb /ltp; then
     echo "ltp-error: cannot mount the LTP image"
     exit 1
@@ -164,6 +174,24 @@ def cpio(entries):
 # Documentation/arch/arm64/booting.rst of Linux.
 IMAGE_MAGIC_AT = 0x38
 IMAGE_MAGIC = 0x644D5241
+
+
+def tree(root, names):
+    """Gives the cpio entries of the directories and the files under `root`, with their paths
+    relative to `root`. A directory in `names` is not given again."""
+    entries = []
+    for d, dirs, files in sorted(os.walk(root)):
+        dirs.sort()
+        rel = os.path.relpath(d, root)
+        if rel != "." and rel not in names:
+            entries.append((rel, 0o040755, b""))
+        for name in sorted(files):
+            path = os.path.join(d, name)
+            with open(path, "rb") as f:
+                data = f.read()
+            mode = 0o100755 if os.access(path, os.X_OK) else 0o100644
+            entries.append((os.path.normpath(os.path.join(rel, name)), mode, data))
+    return entries
 
 
 def arm64_image(kernel, path):
@@ -297,6 +325,8 @@ class Batch:
             # The `ip` of iproute2 is in /bin, before the applet of BusyBox in /sbin.
             with open(self.a.ip, "rb") as f:
                 entries.append(("bin/ip", 0o100755, f.read()))
+        if self.a.tools:
+            entries += tree(self.a.tools, {name for name, _, _ in entries})
         entries += [
             ("bin/busybox", 0o100755, busybox),
             ("bin/sh", 0o120777, b"busybox"),
@@ -305,12 +335,19 @@ class Batch:
             ("etc/kconfig", 0o100644, kconfig),
             ("etc/passwd", 0o100644,
              b"root:x:0:0:root:/:/bin/sh\nbin:x:1:1:bin:/bin:/bin/false\n"
-             b"daemon:x:2:2:daemon:/sbin:/bin/false\nnobody:x:65534:65534:nobody:/:/bin/false\n"),
+             b"daemon:x:2:2:daemon:/sbin:/bin/false\nnobody:x:65534:65534:nobody:/:/bin/false\n"
+             # tcpdump, dnsmasq and rpcbind of --tools change to these users after the start.
+             b"tcpdump:x:72:72:tcpdump:/:/bin/false\ndnsmasq:x:73:73:dnsmasq:/:/bin/false\n"
+             b"rpc:x:74:74:rpc:/:/bin/false\n"),
             ("etc/group", 0o100644,
-             b"root:x:0:\nbin:x:1:\ndaemon:x:2:\nusers:x:100:\nnogroup:x:65534:\n"),
+             b"root:x:0:\nbin:x:1:\ndaemon:x:2:\nusers:x:100:\ntcpdump:x:72:\ndnsmasq:x:73:\n"
+             b"rpc:x:74:\nnogroup:x:65534:\n"),
             ("etc/hosts", 0o100644, b"127.0.0.1 localhost\n::1 localhost\n"),
             # getaddrinfo_01 looks up the echo service, as in the netbase files of a distribution.
-            ("etc/services", 0o100644, b"echo\t7/tcp\necho\t7/udp\n"),
+            # rpcbind of --tools looks up its port with the name rpcbind.
+            ("etc/services", 0o100644,
+             b"echo\t7/tcp\necho\t7/udp\nsunrpc\t111/tcp\tportmapper rpcbind\n"
+             b"sunrpc\t111/udp\tportmapper rpcbind\n"),
         ]
         path = os.path.join(self.dir, "initrd.cpio")
         with open(path, "wb") as f:
@@ -436,6 +473,8 @@ def main():
     p.add_argument("--image", help="the ext4 image of the LTP tree (OUT/ltp.img)")
     p.add_argument("--ip", help="a static `ip` program of iproute2, for the tests of the network "
                    "that need veth and netns")
+    p.add_argument("--tools", help="a directory of more programs and libraries for the initramfs, "
+                   "as `build-tools.sh` makes it (OUT_DIR/root)")
     p.add_argument("--batch", type=int, default=60, help="the number of tests in a batch")
     p.add_argument("--jobs", type=int, default=2, help="the number of QEMU at the same time")
     p.add_argument("--timeout", type=int, default=240, help="the time limit of a test in seconds")
@@ -454,6 +493,7 @@ def main():
     a.kernel = os.path.abspath(a.kernel)
     a.busybox = os.path.abspath(a.busybox)
     a.ip = a.ip and os.path.abspath(a.ip)
+    a.tools = a.tools and os.path.abspath(a.tools)
     os.makedirs(a.out, exist_ok=True)
     if a.arch == "aarch64":
         a.kernel = arm64_image(a.kernel, os.path.join(a.out, "Image"))

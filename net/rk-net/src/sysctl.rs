@@ -258,6 +258,8 @@ pub struct Tables {
     texts: Vec<String>,
     /// `net.ipv4.ping_group_range`.
     ping: (u32, u32),
+    /// `net.ipv4.ip_local_reserved_ports`: sorted ranges that do not touch.
+    reserved: Vec<(u16, u16)>,
     all: Conf,
     default: Conf,
     devs: BTreeMap<u32, Conf>,
@@ -274,6 +276,7 @@ impl Tables {
             texts: IPV4_TEXT.iter().map(|t| String::from(t.1)).collect(),
             // The empty range `1 0`, as Linux.
             ping: (1, 0),
+            reserved: Vec::new(),
             all: Conf::new(true),
             default: Conf::new(false),
             devs: BTreeMap::new(),
@@ -377,6 +380,60 @@ pub fn ipv4(name: &str) -> i32 {
     IPV4.iter().position(|p| p.name == name).map_or(0, |at| TABLES.lock().ipv4[at])
 }
 
+/// The value `name` of `net.core` in the current namespace. Gives 0 for a name that is not
+/// there.
+pub fn core(name: &str) -> i32 {
+    CORE.iter().position(|p| p.name == name).map_or(0, |at| TABLES.lock().core[at])
+}
+
+/// Tells if `port` is in `net.ipv4.ip_local_reserved_ports` of the current namespace. The
+/// search for a free ephemeral port skips these ports, as `inet_is_local_reserved_port` of
+/// Linux.
+pub fn local_reserved_port(port: u16) -> bool {
+    TABLES.lock().reserved.iter().any(|&(lo, hi)| (lo..=hi).contains(&port))
+}
+
+/// The text of a list of port ranges, as `proc_do_large_bitmap` of Linux gives it: `a-b` or
+/// `a`, with a comma between them.
+fn ranges_text(list: &[(u16, u16)]) -> String {
+    let parts: Vec<String> = list
+        .iter()
+        .map(|&(lo, hi)| if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") })
+        .collect();
+    parts.join(",")
+}
+
+/// Parses a list of port ranges, as the write of `proc_do_large_bitmap` of Linux: `a` or `a-b`
+/// with a comma between them, and each port below 65536. Gives the ranges sorted and merged.
+fn parse_ranges(data: &[u8]) -> Result<Vec<(u16, u16)>> {
+    let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+    let text = text.strip_suffix('\n').unwrap_or(text).trim_start();
+    let mut list = Vec::new();
+    if text.is_empty() {
+        return Ok(list);
+    }
+    let port = |w: &str| w.parse::<u16>().map_err(|_| Errno::EINVAL);
+    for item in text.split(',') {
+        let (lo, hi) = match item.split_once('-') {
+            Some((a, b)) => (port(a)?, port(b)?),
+            None => (port(item)?, port(item)?),
+        };
+        if lo > hi {
+            return Err(Errno::EINVAL);
+        }
+        list.push((lo, hi));
+    }
+    list.sort_unstable();
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    for (lo, hi) in list {
+        match out.last_mut() {
+            Some(last) if u32::from(lo) <= u32::from(last.1) + 1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    Ok(out)
+}
+
 /// The default TTL of IPv4, `net.ipv4.ip_default_ttl`.
 pub fn default_ttl() -> u8 {
     ipv4("ip_default_ttl").clamp(1, 255) as u8
@@ -449,7 +506,11 @@ pub fn list(path: &str) -> Option<Vec<(String, Entry)>> {
             });
             names(IPV4)
                 .chain(texts)
-                .chain([dir("conf"), (String::from("ping_group_range"), Entry::File(true))])
+                .chain([
+                    dir("conf"),
+                    (String::from("ping_group_range"), Entry::File(true)),
+                    (String::from("ip_local_reserved_ports"), Entry::File(true)),
+                ])
                 .collect()
         }
         ["ipv6"] => names(IPV6).chain([dir("conf")]).collect(),
@@ -495,6 +556,7 @@ pub fn read(path: &str) -> Result<Vec<u8>> {
     let mut t = TABLES.lock();
     let text = match parts[..] {
         ["ipv4", "ping_group_range"] => format!("{}\t{}", t.ping.0, t.ping.1),
+        ["ipv4", "ip_local_reserved_ports"] => ranges_text(&t.reserved),
         ["ipv4", name] if IPV4_TEXT.iter().any(|x| x.0 == name) => {
             let at = IPV4_TEXT.iter().position(|x| x.0 == name).unwrap_or(0);
             t.texts[at].clone()
@@ -534,6 +596,11 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
                 return Err(Errno::EINVAL);
             };
             set_ping_group_range(low, high).ok_or(Errno::EINVAL)
+        }
+        ["ipv4", "ip_local_reserved_ports"] => {
+            let list = parse_ranges(data)?;
+            TABLES.lock().reserved = list;
+            Ok(())
         }
         ["ipv4", "tcp_available_congestion_control"] => Err(Errno::EPERM),
         ["ipv4", name] if IPV4_TEXT.iter().any(|x| x.0 == name) => {
@@ -665,6 +732,22 @@ mod tests {
         write("ipv4/ip_default_ttl", b"65\n").unwrap();
         assert_eq!(default_ttl(), 65);
         write("ipv4/ip_default_ttl", b"64").unwrap();
+    }
+
+    #[test]
+    fn reserved_ports_take_a_list_of_ranges() {
+        // Linux gives an empty line when no port is reserved. libtirpc reads the file and does
+        // not bind a server without it.
+        assert_eq!(read("ipv4/ip_local_reserved_ports").unwrap(), b"\n");
+        write("ipv4/ip_local_reserved_ports", b"50001,40000-40002,40003\n").unwrap();
+        assert_eq!(read("ipv4/ip_local_reserved_ports").unwrap(), b"40000-40003,50001\n");
+        assert!(local_reserved_port(40002));
+        assert!(!local_reserved_port(40004));
+        assert_eq!(write("ipv4/ip_local_reserved_ports", b"70000"), Err(Errno::EINVAL));
+        assert_eq!(write("ipv4/ip_local_reserved_ports", b"9-8"), Err(Errno::EINVAL));
+        write("ipv4/ip_local_reserved_ports", b"\n").unwrap();
+        assert!(!local_reserved_port(40002));
+        assert!(list("ipv4").unwrap().iter().any(|(n, _)| n == "ip_local_reserved_ports"));
     }
 
     #[test]

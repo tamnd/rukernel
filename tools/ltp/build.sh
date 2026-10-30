@@ -24,6 +24,8 @@
 set -eu
 
 LTP_TAG=20260930
+# The libtirpc release of the TI-RPC tests.
+TIRPC=1.3.4
 LTP_DIRS="fork clone exit exit_group wait wait4 waitpid getpid getppid gettid brk mmap munmap mprotect mremap
 msync madvise mlock munlock mincore getrlimit setrlimit execve kill signal sigaction rt_sigaction
 sigprocmask rt_sigprocmask sigaltstack pipe pipe2 poll select futex read write open close dup dup2
@@ -65,7 +67,7 @@ out=${1:?usage: tools/ltp/build.sh [--full] [--arch aarch64] OUT_DIR}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 
-docker run --rm --platform "$platform" -v "$out:/out" -e LTP_TAG="$LTP_TAG" -e LTP_DIRS="$LTP_DIRS" \
+docker run --rm --platform "$platform" -v "$out:/out" -e LTP_TAG="$LTP_TAG" -e TIRPC="$TIRPC" -e LTP_DIRS="$LTP_DIRS" \
 	-e LTP_GROUPS="$LTP_GROUPS" -e FULL="$full" -e LTP_TESTDIRS="${LTP_TESTDIRS:-testcases}" \
 	alpine:3.20 sh -euc '
 # The libraries are for the tests that use them. configure links with -static, so it uses a
@@ -73,8 +75,17 @@ docker run --rm --platform "$platform" -v "$out:/out" -e LTP_TAG="$LTP_TAG" -e L
 apk add --no-cache build-base autoconf automake linux-headers pkgconf bash git >/dev/null
 if [ "$FULL" = 1 ]; then
 	apk add --no-cache libaio-dev libcap-dev libcap-static numactl-dev keyutils-dev acl-dev \
-		acl-static libtirpc-dev libtirpc-static libmnl-dev libmnl-static >/dev/null 2>&1 ||
+		acl-static libmnl-dev libmnl-static >/dev/null 2>&1 ||
 		echo "ltp: some libraries are not there"
+	# The static libtirpc of Alpine needs the GSS-API of Kerberos, which has no static archive,
+	# so the TI-RPC tests (runtest/net.rpc_tests and net.tirpc_tests) did not link. This
+	# libtirpc has no GSS-API.
+	apk add --no-cache bsd-compat-headers >/dev/null
+	wget -q -O /tmp/tirpc.tar.bz2 \
+		"https://downloads.sourceforge.net/project/libtirpc/libtirpc/$TIRPC/libtirpc-$TIRPC.tar.bz2"
+	tar -xjf /tmp/tirpc.tar.bz2 -C /tmp
+	(cd "/tmp/libtirpc-$TIRPC" && ./configure --prefix=/usr --sysconfdir=/etc --disable-gssapi \
+		--enable-static --disable-shared >/dev/null && make -j"$(nproc)" install >/dev/null)
 fi
 git clone --quiet --depth 1 --branch "$LTP_TAG" https://github.com/linux-test-project/ltp /ltp
 cd /ltp

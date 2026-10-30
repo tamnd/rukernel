@@ -296,3 +296,81 @@ fn a_v2_ring_sends_frames() {
     assert_eq!(p.tx.lock().as_ref().unwrap().status(0), ring::TP_STATUS_WRONG_FORMAT);
     dev::unregister(&d);
 }
+
+/// The bytes of a program of classic BPF.
+fn prog(insns: &[(u16, u8, u8, u32)]) -> Vec<u8> {
+    insns
+        .iter()
+        .flat_map(|&(code, jt, jf, k)| crate::filter::Insn { code, jt, jf, k }.to_bytes())
+        .collect()
+}
+
+/// The sizes of the frames in the queue of `p`.
+fn queued(p: &PacketSocket) -> Vec<usize> {
+    p.queue.lock().0.iter().map(|q| q.data.len()).collect()
+}
+
+/// `SO_ATTACH_FILTER` checks the program, the filter cuts and drops frames, and
+/// `SO_LOCK_FILTER` locks it, as net/core/filter.c and `packet_rcv` of Linux.
+#[test]
+fn a_filter_cuts_and_drops_frames() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let (p, d) = bound(SOCK_RAW, b"pkfilt1");
+    assert_eq!(p.set_option(SOL_SOCKET, SO_DETACH_FILTER, &[]), Err(Errno::ENOENT));
+    // An empty program, a jump out of the program, a program without a return at the end and an
+    // unknown ancillary load are not valid.
+    for bad in [
+        prog(&[]),
+        prog(&[(0x15, 1, 0, 0), (0x06, 0, 0, 0)]),
+        prog(&[(0x28, 0, 0, 12)]),
+        prog(&[(0x20, 0, 0, 0xffff_f000 + 64), (0x06, 0, 0, 0)]),
+        prog(&[(0x34, 0, 0, 0), (0x06, 0, 0, 0)]),
+    ] {
+        assert_eq!(p.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &bad), Err(Errno::EINVAL));
+    }
+    // `tcpdump -dd ip` with a snap length of 20: ldh [12]; jeq #0x800; ret #20; ret #0.
+    let ip = prog(&[(0x28, 0, 0, 12), (0x15, 0, 1, 0x800), (0x06, 0, 0, 20), (0x06, 0, 0, 0)]);
+    p.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &ip).unwrap();
+    receive(&d, &frame(&d, 30));
+    let mut arp = frame(&d, 30);
+    arp[12..14].copy_from_slice(&[0x08, 0x06]);
+    receive(&d, &arp);
+    assert_eq!(queued(&p), [20]);
+    // A load at `SKF_NET_OFF` is relative to the network header, and a load at `SKF_AD_OFF`
+    // gets the type of the packet: ld [net + 4]; jeq #0x04050607; ld #pkttype; jeq #HOST;
+    // ret #-1; ret #0.
+    let net = prog(&[
+        (0x20, 0, 0, 0xfff0_0004),
+        (0x15, 0, 3, 0x0405_0607),
+        (0x20, 0, 0, 0xffff_f004),
+        (0x15, 0, 1, u32::from(PACKET_HOST)),
+        (0x06, 0, 0, u32::MAX),
+        (0x06, 0, 0, 0),
+    ]);
+    p.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &net).unwrap();
+    receive(&d, &frame(&d, 30));
+    receive(&d, &frame(&d, 3));
+    assert_eq!(queued(&p), [20, HLEN + 30]);
+    p.set_option(SOL_SOCKET, SO_LOCK_FILTER, &int(1)).unwrap();
+    assert_eq!(p.get_option(SOL_SOCKET, SO_LOCK_FILTER), Ok(int(1).to_vec()));
+    assert_eq!(p.set_option(SOL_SOCKET, SO_DETACH_FILTER, &[]), Err(Errno::EPERM));
+    assert_eq!(p.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &ip), Err(Errno::EPERM));
+    assert_eq!(p.set_option(SOL_SOCKET, SO_LOCK_FILTER, &int(0)), Err(Errno::EPERM));
+    dev::unregister(&d);
+}
+
+/// A ring gets the bytes that the filter keeps, and `tp_len` has the size of the packet, as
+/// `tpacket_rcv` of Linux.
+#[test]
+fn a_ring_takes_the_snap_length_of_the_filter() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let (p, d) = bound(SOCK_DGRAM, b"pkfilt2");
+    p.set_option(SOL_PACKET, PACKET_RESERVE, &int(16)).unwrap();
+    p.set_option(SOL_PACKET, PACKET_RX_RING, &req(PAGE_SIZE as u32, 1, 2048, 2, 0, 0)).unwrap();
+    p.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &prog(&[(0x06, 0, 0, 10)])).unwrap();
+    let f = frame(&d, 30);
+    receive(&d, &f);
+    assert_eq!((get32(&p, 8), get32(&p, 12)), (30, 10));
+    assert_eq!(bytes(&p, 96, 10), f[HLEN..HLEN + 10]);
+    dev::unregister(&d);
+}
