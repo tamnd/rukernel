@@ -2276,8 +2276,9 @@ static void test_mqueue(void)
 	tev.sigev_value.sival_int = 43;
 	check("mq_notify SIGEV_THREAD", mq_notify(q, &tev) == 0);
 	mq_send(q, "t", 1, 0);
-	for (int i = 0; i < 1000 && mq_thread_calls == 0; i++)
-		sched_yield();
+	/* musl starts a new thread for the call, so wait by time and not by a count of yields. */
+	for (int i = 0; i < 2000 && mq_thread_calls == 0; i++)
+		usleep(1000);
 	check("mq_notify SIGEV_THREAD calls the function", mq_thread_calls == 1);
 	mq_close(q);
 	check("mq_unlink", mq_unlink("/rk-test") == 0);
