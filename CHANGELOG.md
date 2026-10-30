@@ -11,6 +11,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - tools/ltp/run.py gives fork13 720 s, because the test forks for 600 s (`.runtime = 600`), and gives hackbench01 900 s, because its 20 M messages took 554 s under QEMU without KVM (#475).
 - The child cache of an overlay directory removes the nodes that no one uses only when its size doubles, and not on each insert, as the dentry cache after #505 (#504). Many nodes in use made each lookup in the directory slow.
 - The check "cpu.max limits a busy loop" of `init` has 3 tries, and each try uses the change of the counters of `cpu.stat` (#504). On a busy host, the time that QEMU does not run the guest counts as CPU time of the busy loop, so one try could go above the limit of 500 ms. A try that fails prints the time and the count of throttles.
+- The arm64 `smp` boot test passes the checks "page faults of one file on each CPU read the right data" and "aio on each CPU while two threads destroy the context" (#504). The test runs init with the argument "only", so the general checks do not make /tmp, and the initramfs does not have it. The two checks could not make their files in /tmp and failed before they started. init now makes /tmp at the start of the `smp` checks. The kernel had no fault here.
 
 ## [0.4.17] - 2026-10-30
 

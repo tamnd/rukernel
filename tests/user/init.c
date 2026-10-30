@@ -5949,6 +5949,9 @@ static void test_smp_parallel(int cpus)
 
 static void test_smp(void)
 {
+	/* With the argument "only", the general checks did not make /tmp, and the initramfs does
+	 * not have it. par_file_run and par_aio_run make their files in /tmp. */
+	mkdir("/tmp", 0755);
 	cpu_set_t set;
 	CPU_ZERO(&set);
 	int cpus = sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
