@@ -241,6 +241,105 @@ pub(crate) mod mem {
     }
 }
 
+// The `memcpy` and `memset` of the kernel, which the compiler calls for copies and fills of
+// slices and of large values. The functions of compiler_builtins are weak, so these replace them,
+// as the assembly functions of arch/arm64/lib of Linux replace the generic ones. The target has
+// `strict-align`, so the `memcpy` of compiler_builtins reads single bytes and joins them with
+// shifts when the source and the destination have a different alignment: about 25 instructions
+// for 8 bytes. Its `memset` writes 8 bytes in each step. A TCP segment starts 40 bytes after the
+// start of the packet, so most copies of the network stack were of the slow type, and on QEMU
+// without KVM they were a large part of the time of the TCP stream on loopback (#465). x86-64
+// uses `rep movsb` and `rep stosb`. These functions read and write 64 bytes with 4 `ldp` and 4
+// `stp` in each step, then the rest with smaller accesses. The kernel runs with the MMU on and
+// SCTLR_EL1.A clear, and the copies are only of normal memory (IoMem uses volatile accesses), so
+// accesses that are not aligned are allowed.
+core::arch::global_asm!(
+    r#"
+    .section .text.memcpy, "ax"
+    .global memcpy
+    .type memcpy, %function
+    .balign 16
+memcpy:                             // x0: dst, x1: src, x2: len. Gives dst in x0.
+    mov     x3, x0
+    cmp     x2, #64
+    b.lo    2f
+1:  ldp     x4, x5, [x1]
+    ldp     x6, x7, [x1, #16]
+    ldp     x8, x9, [x1, #32]
+    ldp     x10, x11, [x1, #48]
+    add     x1, x1, #64
+    sub     x2, x2, #64
+    stp     x4, x5, [x3]
+    stp     x6, x7, [x3, #16]
+    stp     x8, x9, [x3, #32]
+    stp     x10, x11, [x3, #48]
+    add     x3, x3, #64
+    cmp     x2, #64
+    b.hs    1b
+2:  tbz     x2, #5, 3f
+    ldp     x4, x5, [x1]
+    ldp     x6, x7, [x1, #16]
+    add     x1, x1, #32
+    stp     x4, x5, [x3]
+    stp     x6, x7, [x3, #16]
+    add     x3, x3, #32
+3:  tbz     x2, #4, 4f
+    ldp     x4, x5, [x1], #16
+    stp     x4, x5, [x3], #16
+4:  tbz     x2, #3, 5f
+    ldr     x4, [x1], #8
+    str     x4, [x3], #8
+5:  tbz     x2, #2, 6f
+    ldr     w4, [x1], #4
+    str     w4, [x3], #4
+6:  tbz     x2, #1, 7f
+    ldrh    w4, [x1], #2
+    strh    w4, [x3], #2
+7:  tbz     x2, #0, 8f
+    ldrb    w4, [x1]
+    strb    w4, [x3]
+8:  ret
+    .size memcpy, . - memcpy
+
+    .section .text.memset, "ax"
+    .global memset
+    .type memset, %function
+    .balign 16
+memset:                             // x0: dst, w1: the byte, x2: len. Gives dst in x0.
+    and     x1, x1, #0xff
+    mov     x4, #0x0101010101010101
+    mul     x4, x1, x4
+    mov     x3, x0
+    cmp     x2, #64
+    b.lo    2f
+1:  stp     x4, x4, [x3]
+    stp     x4, x4, [x3, #16]
+    stp     x4, x4, [x3, #32]
+    stp     x4, x4, [x3, #48]
+    add     x3, x3, #64
+    sub     x2, x2, #64
+    cmp     x2, #64
+    b.hs    1b
+2:  tbz     x2, #5, 3f
+    stp     x4, x4, [x3]
+    stp     x4, x4, [x3, #16]
+    add     x3, x3, #32
+3:  tbz     x2, #4, 4f
+    stp     x4, x4, [x3], #16
+4:  tbz     x2, #3, 5f
+    str     x4, [x3], #8
+5:  tbz     x2, #2, 6f
+    str     w4, [x3], #4
+6:  tbz     x2, #1, 7f
+    strh    w4, [x3], #2
+7:  tbz     x2, #0, 8f
+    strb    w4, [x3]
+8:  ret
+    .size memset, . - memset
+    .text
+"#
+);
+
 /// Interrupt control on this CPU. The handlers use only atomic values and the GIC, so an
 /// interrupt cannot stop on a lock that the interrupted code holds.
 pub(crate) mod irq {

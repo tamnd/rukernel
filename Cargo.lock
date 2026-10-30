@@ -196,6 +196,7 @@ dependencies = [
  "rk-frame",
  "rk-net",
  "rk-vfs",
+ "zerocopy",
 ]
 
 [[package]]

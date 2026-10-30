@@ -125,9 +125,17 @@ impl NetBuf {
         &mut self.area[end - len..end]
     }
 
-    /// Adds a copy of `bytes` at the end of the data.
+    /// Adds a copy of `bytes` at the end of the data. The copy goes to the tailroom directly,
+    /// with no fill of zeros first as in `put` (#465).
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
-        self.put(bytes.len()).copy_from_slice(bytes);
+        let end = self.tail + bytes.len();
+        if end > self.area.len() {
+            self.area.truncate(self.tail);
+            self.area.extend_from_slice(bytes);
+        } else {
+            self.area[self.tail..end].copy_from_slice(bytes);
+        }
+        self.tail = end;
     }
 
     /// Removes the data after the first `len` bytes, as `skb_trim` of Linux. A receive path uses
