@@ -1593,7 +1593,11 @@ impl Node {
         if let Some(old) = children.get(name).and_then(Weak::upgrade) {
             return Ok(old);
         }
-        children.retain(|_, w| w.strong_count() > 0);
+        // The cache loses the nodes that are not in use when its size doubles, and not on each
+        // insert, so many nodes in use do not make each lookup slow (#504).
+        if children.len().is_power_of_two() {
+            children.retain(|_, w| w.strong_count() > 0);
+        }
         children.insert(name.to_vec(), Arc::downgrade(&node));
         Ok(node)
     }
