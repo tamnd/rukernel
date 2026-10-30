@@ -5360,12 +5360,15 @@ static int par_kill_run(int n)
 			if (p < 0)
 				break;
 			clock_gettime(CLOCK_MONOTONIC, &now);
-			if (now.tv_sec - t0.tv_sec >= 2) {
-				/* A child got away from the kill. */
+			/* A child that got away from the kill waits in pause for all time. About 70
+			 * processes end here, and a busy TCG host can take more than 2 s for that. */
+			if (now.tv_sec - t0.tv_sec >= 10) {
 				ok = 0;
 				kill(-leader, SIGKILL);
+				int left = 0;
 				while (waitpid(-leader, NULL, 0) > 0)
-					;
+					left++;
+				printf("init: kill of a process group: %d processes did not end\n", left);
 				break;
 			}
 			usleep(1000);
