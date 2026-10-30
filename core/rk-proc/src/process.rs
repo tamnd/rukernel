@@ -23,7 +23,7 @@ use core::sync::atomic::{
 };
 use rk_abi::Errno;
 use rk_abi::native::signal::{SA_NOCLDSTOP, SA_NOCLDWAIT, SIGCHLD, SIGCONT, SIGKILL};
-use rk_frame::sync::{SpinLock, SpinLockGuard};
+use rk_frame::sync::{ReadGuard, RwLock, SpinLock, SpinLockGuard, WriteGuard};
 use rk_frame::task::{Task, WaitQueue};
 use rk_frame::vm::VmSpace;
 use rk_mm::AddressSpace;
@@ -158,6 +158,10 @@ pub struct Process {
     stopped: AtomicBool,
     /// The signal that stopped the process last.
     stop_signal: AtomicU32,
+    /// The count of the `SIGCONT` signals that came to the process. It changes with the lock of
+    /// `signals`. A thread that took a stop signal before the last `SIGCONT` does not stop the
+    /// process, as `JOBCTL_STOP_DEQUEUED` in kernel/signal.c of Linux.
+    cont_seq: AtomicU32,
     /// The threads of a stopped process wait here until `SIGCONT` or `SIGKILL` comes.
     stop_wait: WaitQueue,
     vm: SpinLock<Option<Arc<AddressSpace>>>,
@@ -307,6 +311,9 @@ pub struct Thread {
     /// The signal of a group stop that the traced thread did not take yet, or 0. A thread that
     /// is not traced waits for `SIGCONT` in the stopped process instead.
     group_stop: AtomicU32,
+    /// The value of `cont_seq` of the process when the thread took its last signal from a queue.
+    /// [`stop_group`] stops the process only if no `SIGCONT` came after that.
+    stop_seq: AtomicU32,
     /// The `seccomp` mode, for a fast check at each system call.
     seccomp_mode: AtomicU32,
     /// The `seccomp` mode and filters.
@@ -387,6 +394,28 @@ struct Table {
 static TABLE: SpinLock<Table> =
     SpinLock::new(Table { processes: BTreeMap::new(), threads: BTreeMap::new(), next: INIT_PID });
 
+/// The lock of the tree of the processes, as `tasklist_lock` of Linux. `fork` and the exit of a
+/// process hold it for a write while they add a child to its parent, or give the children of a
+/// process to init. A signal to a process group holds it for a read, so that a child that `fork`
+/// makes at the same time is in the group before the signal or does not come. The lock comes
+/// before `TABLE` and before the locks of each process.
+static TASKLIST: RwLock<()> = RwLock::new(());
+
+/// Holds the lock of the tree of the processes for a read, while a caller sends a signal to each
+/// process of a group or of the system, as `__kill_pgrp_info` and `kill_something_info` in
+/// kernel/signal.c of Linux. A `fork` that starts later waits, and fails if the signal came to
+/// its parent.
+pub fn tasklist_read() -> ReadGuard<'static, ()> {
+    TASKLIST.read()
+}
+
+/// Holds the lock of the tree of the processes for a write, while `setpgid` checks the group
+/// and moves a process to it, as kernel/sys.c of Linux. A signal to a group then sees each
+/// process in its old group or in its new group.
+pub fn tasklist_write() -> WriteGuard<'static, ()> {
+    TASKLIST.write()
+}
+
 /// Gives a free ID. An ID is in use while a thread, a process, a process group or a session has
 /// it. Linux also starts again at 300 after a wrap, so that the low IDs stay for the system.
 fn alloc_pid(table: &mut Table) -> Result<Pid, Errno> {
@@ -465,6 +494,9 @@ impl Process {
     ///
     /// Gives `EPERM` if the process leads a process group already.
     pub fn set_sid(&self) -> Result<Pid, Errno> {
+        // The check of the group and the change are one step, as `ksys_setsid` in kernel/sys.c
+        // of Linux does with `tasklist_lock`.
+        let _tasks = TASKLIST.write();
         let in_use = processes().iter().any(|p| p.pid != self.pid && p.pgid() == self.pid);
         let mut s = self.state.lock();
         if s.pgid == self.pid || in_use {
@@ -1065,6 +1097,7 @@ impl Process {
             thread_exit: WaitQueue::new(),
             stopped: AtomicBool::new(false),
             stop_signal: AtomicU32::new(0),
+            cont_seq: AtomicU32::new(0),
             stop_wait: WaitQueue::new(),
             vm: SpinLock::new(Some(vm)),
             files: SpinLock::new(Some(files)),
@@ -1494,7 +1527,14 @@ impl Thread {
             let mut shared = self.process.signals.lock();
             let mut own = self.signals.lock();
             let blocked = own.blocked;
-            own.pending.take(blocked).or_else(|| shared.pending.take(blocked))
+            let info = own.pending.take(blocked).or_else(|| shared.pending.take(blocked));
+            // A `SIGCONT` after this point cancels a stop for the signal, as `dequeue_signal`
+            // sets `JOBCTL_STOP_DEQUEUED` in kernel/signal.c of Linux.
+            if info.is_some() {
+                self.stop_seq
+                    .store(self.process.cont_seq.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            info
         };
         self.took_signal(info)
     }
@@ -1607,6 +1647,7 @@ impl Thread {
             cgroup: AtomicU32::new(rk_cgroup::ROOT),
             ptrace: SpinLock::new(None),
             group_stop: AtomicU32::new(0),
+            stop_seq: AtomicU32::new(0),
             seccomp_mode: AtomicU32::new(0),
             seccomp: SpinLock::new(seccomp::Seccomp::default()),
             no_new_privs: AtomicBool::new(false),
@@ -1801,12 +1842,26 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
         (s.pgid, s.sid, s.comm.clone())
     };
     let actions = pp.signals.lock().actions.clone();
+    // The child goes in the tree with the lock of the tree, as `copy_process` in kernel/fork.c of
+    // Linux. The parent of `CLONE_PARENT` can end, and init then gets its children: with the
+    // lock, the child goes in the list of a live parent.
+    let tasks = TASKLIST.write();
     let (owner, exit_signal) = if share.parent {
         // Linux gives `EINVAL` for init, which has no parent.
         (pp.parent().ok_or(Errno::EINVAL)?, pp.exit_signal)
     } else {
         (pp.clone(), share.exit_signal)
     };
+    // "Process group and session signals need to be delivered to just the parent before the
+    // fork or both the parent and the child after the fork" (kernel/fork.c). A signal to the
+    // group holds the lock for a read, so it came before this point or comes after the child is
+    // in the table. If it came before, the parent takes it first, and `fork` starts again.
+    if parent.is_killed()
+        || pp.group_exit().is_some()
+        || !parent.pending().without(parent.blocked()).is_empty()
+    {
+        return Err(Errno::ERESTARTNOINTR);
+    }
     let mut table = TABLE.lock();
     let pid = alloc_pid(&mut table)?;
     let child = Process::new(
@@ -1852,8 +1907,9 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
     drop(table);
-    rk_cgroup::add_process(cgroup);
     owner.state.lock().children.push(child);
+    drop(tasks);
+    rk_cgroup::add_process(cgroup);
     Ok(thread)
 }
 
@@ -1979,6 +2035,11 @@ fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
     if SigSet::STOP.contains(sig) {
         discard_pending(process, &all, SigSet(SigSet::bit(SIGCONT)));
     } else if sig == SIGCONT {
+        // A thread that took a stop signal already does not stop the process now.
+        {
+            let _shared = process.signals.lock();
+            process.cont_seq.fetch_add(1, Ordering::Relaxed);
+        }
         discard_pending(process, &all, SigSet::STOP);
         continue_group(process);
     }
@@ -2050,6 +2111,12 @@ pub fn stop_group(thread: &Thread, sig: u32) {
     let (others, parent) = {
         let mut s = process.state.lock();
         if s.group_exit.is_some() {
+            return;
+        }
+        // A `SIGCONT` came after the thread took the stop signal. The signal does not stop the
+        // process, as `do_signal_stop` in kernel/signal.c of Linux, which needs
+        // `JOBCTL_STOP_DEQUEUED`.
+        if thread.stop_seq.load(Ordering::Relaxed) != process.cont_seq.load(Ordering::Relaxed) {
             return;
         }
         if process.is_stopped() {
@@ -2253,16 +2320,19 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let deny = process.image.lock().deny.take();
     drop((vm, files, fs, deny));
 
+    // The process becomes a zombie, gives its children to init and tells its parent with the lock
+    // of the tree held, as `exit_notify` in kernel/exit.c of Linux. A child that ends at the same
+    // time then sees its new parent, and a `fork` with `CLONE_PARENT` does not add a child to
+    // the list of this process after init took the list.
+    let tasks = TASKLIST.write();
     let (children, parent, status) = {
         let mut s = process.state.lock();
         let status = s.group_exit.unwrap_or(status);
         s.zombie = Some(status);
         (core::mem::take(&mut s.children), s.parent.upgrade(), status)
     };
-    // A process file descriptor of the process is now readable.
-    process.exit_poll.wake_all();
-    // Each child that asked for it gets its signal, as `reparent_leader` in kernel/exit.c of
-    // Linux.
+    // Each child that asked for it gets its signal, as `forget_original_parent` in
+    // kernel/exit.c of Linux.
     for child in &children {
         let sig = child.pdeath_signal();
         if sig != 0 && !child.is_zombie() {
@@ -2271,20 +2341,40 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     }
     let init = find_process(INIT_PID).filter(|init| !Arc::ptr_eq(init, &process));
     if let Some(init) = &init {
-        let zombies = children.iter().any(|c| c.is_zombie());
+        let mut zombies = Vec::new();
         for child in &children {
-            child.state.lock().parent = Arc::downgrade(init);
+            let mut cs = child.state.lock();
+            cs.parent = Arc::downgrade(init);
+            if let Some(status) = cs.zombie {
+                zombies.push((child.clone(), status));
+            }
         }
         init.state.lock().children.extend(children);
-        if zombies {
+        // init gets the exit signal of each child that is a zombie already, and reaps it at once
+        // if it ignores `SIGCHLD`, as `reparent_leader` in kernel/exit.c of Linux.
+        for (child, status) in &zombies {
+            if notify_parent(child, init, *status) {
+                init.state.lock().children.retain(|c| !Arc::ptr_eq(c, child));
+                TABLE.lock().processes.remove(&child.pid);
+            }
+        }
+        if !zombies.is_empty() {
             init.child_wait.wake_all();
         }
     }
     ptrace::process_exited(&process, parent.as_ref(), status);
+    let autoreap = parent.as_ref().is_some_and(|parent| notify_parent(&process, parent, status));
+    if let Some(parent) = &parent
+        && autoreap
+    {
+        parent.state.lock().children.retain(|c| !Arc::ptr_eq(c, &process));
+    }
+    drop(tasks);
+    // A process file descriptor of the process is now readable.
+    process.exit_poll.wake_all();
     match parent {
         Some(parent) => {
-            if notify_parent(&process, &parent, status) {
-                parent.state.lock().children.retain(|c| !Arc::ptr_eq(c, &process));
+            if autoreap {
                 TABLE.lock().processes.remove(&process.pid);
             }
             parent.child_wait.wake_all();

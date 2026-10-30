@@ -11,7 +11,7 @@
 
 use crate::acl;
 use crate::cred::{Cred, cap, may, protected};
-use crate::dentry::{Location, MountNamespace, MountSource};
+use crate::dentry::{Dentry, DirGuard, DirLock, Location, MountNamespace, MountSource};
 use crate::device;
 use crate::file::File;
 use crate::inode::{
@@ -44,6 +44,39 @@ impl core::fmt::Debug for FsContext {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FsContext").field("umask", &self.umask).finish_non_exhaustive()
     }
+}
+
+/// The lock of the renames between two directories, as `s_vfs_rename_mutex` in fs/namei.c of
+/// Linux. With it, no other rename changes the tree while a rename checks that a directory does
+/// not move under itself.
+static RENAME: DirLock = DirLock::new();
+
+/// The locks of the two parents of a rename.
+struct RenameLocks<'a> {
+    _first: DirGuard<'a>,
+    _second: Option<DirGuard<'a>>,
+    _rename: Option<DirGuard<'static>>,
+}
+
+/// Locks the parents `a` and `b` of a rename, as `lock_rename` in fs/namei.c of Linux. Two
+/// different parents need the rename lock first. Then the parent that is above the other goes
+/// first, as the other operations lock a parent before its child. Two parents that are not above
+/// each other go in the order of their addresses.
+fn lock_rename<'a>(a: &'a Arc<Dentry>, b: &'a Arc<Dentry>) -> RenameLocks<'a> {
+    if Arc::ptr_eq(a, b) {
+        return RenameLocks { _first: a.lock(), _second: None, _rename: None };
+    }
+    let rename = RENAME.lock();
+    let a_first = if b.is_under(a) {
+        true
+    } else if a.is_under(b) {
+        false
+    } else {
+        Arc::as_ptr(a) < Arc::as_ptr(b)
+    };
+    let (first, second) = if a_first { (a, b) } else { (b, a) };
+    let first = first.lock();
+    RenameLocks { _first: first, _second: Some(second.lock()), _rename: Some(rename) }
 }
 
 /// Tells if a lookup error means that the name is not in the directory.
@@ -244,6 +277,10 @@ impl FsContext {
             if parent.trailing_slash {
                 return Err(Errno::EISDIR);
             }
+            // The lookup and the create are one step, as `open_last_lookups` in fs/namei.c of
+            // Linux holds the lock of the directory. The open of the file comes after the lock,
+            // because the open of a FIFO can wait.
+            let _dir = parent.dir.dentry.lock();
             match self.child(&parent) {
                 Ok(_) if flags & o::O_EXCL != 0 => return Err(Errno::EEXIST),
                 Ok(at) if follow && is_type(at.inode(), FileType::Symlink) => {
@@ -258,6 +295,10 @@ impl FsContext {
                 }
                 Err(e) if e == Errno::ENOENT && !parent.is_dot() => {
                     parent.dir.mount.want_write()?;
+                    // A removed directory takes no new name, as `may_create` of Linux.
+                    if parent.dir.dentry.is_dead() {
+                        return Err(Errno::ENOENT);
+                    }
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
                     let dir = parent.dir.inode();
@@ -527,11 +568,17 @@ impl FsContext {
         f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
     ) -> Result<Location> {
         let parent = self.parent(start, path)?;
+        // The check of the name and the create are one step, as `filename_create` of Linux
+        // holds the lock of the directory.
+        let _dir = parent.dir.dentry.lock();
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
         }
         // As `filename_create` of Linux, a name that exists gives `EEXIST` before `EROFS`.
         parent.dir.mount.want_write()?;
+        if parent.dir.dentry.is_dead() {
+            return Err(Errno::ENOENT);
+        }
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         let dir = parent.dir.inode();
@@ -587,12 +634,16 @@ impl FsContext {
         // The checks have the order of `do_linkat` and `vfs_link` of Linux: the new name and its
         // mount first, then the old file.
         let parent = self.parent(start, path)?;
+        let _dir = parent.dir.dentry.lock();
         if parent.is_dot() || self.exists(&parent)? {
             return Err(Errno::EEXIST);
         }
         parent.dir.mount.want_write()?;
         if !Arc::ptr_eq(&parent.dir.mount, &old.mount) {
             return Err(Errno::EXDEV);
+        }
+        if parent.dir.dentry.is_dead() {
+            return Err(Errno::ENOENT);
         }
         self.cred.may_link(protected::get(&protected::HARDLINKS), &**old.inode())?;
         self.may_change(&parent.dir)?;
@@ -624,6 +675,8 @@ impl FsContext {
         }
         // `do_rmdir` and `do_unlinkat` of Linux check the mount before the lookup.
         parent.dir.mount.want_write()?;
+        // The lookup, the checks and the removal are one step with the lock of the directory.
+        let _dir = parent.dir.dentry.lock();
         if parent.trailing_slash && !dir {
             // Linux examines the type for the error: a file with a slash is `ENOTDIR`.
             let at = self.child(&parent)?;
@@ -647,7 +700,12 @@ impl FsContext {
             if at.is_mount_root() || self.ns.mounted_on(&at).is_some() {
                 return Err(Errno::EBUSY);
             }
+            // A create in the directory holds its lock, so the check that the directory is
+            // empty and the removal are one step. After it, no new name goes in the directory,
+            // as `vfs_rmdir` in fs/namei.c of Linux sets `S_DEAD`.
+            let _victim = at.dentry.lock();
             parent.dir.inode().rmdir(&parent.name)?;
+            at.dentry.set_dead();
         } else {
             if is_dir {
                 return Err(Errno::EISDIR);
@@ -692,6 +750,8 @@ impl FsContext {
             return Err(Errno::EXDEV);
         }
         old.dir.mount.want_write()?;
+        // The lookups, the checks and the rename are one step with the locks of the parents.
+        let _locks = lock_rename(&old.dir.dentry, &new.dir.dentry);
         let from = self.child(&old)?;
         let from_dir = is_type(from.inode(), FileType::Directory);
         if exchange {
@@ -710,6 +770,14 @@ impl FsContext {
         }
         if to.as_ref().is_some_and(|to| Arc::ptr_eq(from.inode(), to.inode())) {
             return Ok(());
+        }
+        // A directory above the old parent is not empty, as the `trap` of `lock_rename` in
+        // `do_renameat2` of Linux gives. The lock of the target below needs this check first.
+        if let Some(to) = &to
+            && is_type(to.inode(), FileType::Directory)
+            && old.dir.dentry.is_under(&to.dentry)
+        {
+            return Err(Errno::ENOTEMPTY);
         }
         // The checks of `may_delete` and `may_create` of Linux, in their order: the permission
         // checks come before the checks of the types. A directory that moves to a new parent
@@ -740,6 +808,13 @@ impl FsContext {
                 return Err(Errno::EBUSY);
             }
         }
+        if new.dir.dentry.is_dead() {
+            return Err(Errno::ENOENT);
+        }
+        // A directory that the rename replaces must stay empty until it goes, so its lock is
+        // held, as `vfs_rename` of Linux locks the target.
+        let victim = to.as_ref().filter(|to| is_type(to.inode(), FileType::Directory));
+        let _victim = victim.map(|to| to.dentry.lock());
         if whiteout {
             // The whiteout gets the owner of a new file, as `ext4_whiteout_for_rename` and
             // `shmem_whiteout` of Linux.
@@ -752,6 +827,9 @@ impl FsContext {
         old.dir.dentry.move_child(&old.name, &new.dir.dentry, &new.name);
         if let Some(to) = &to {
             to.dentry.set_unlinked();
+        }
+        if let Some(to) = victim {
+            to.dentry.set_dead();
         }
         let target = to.as_ref().map(Location::inode);
         crate::notify::rename(

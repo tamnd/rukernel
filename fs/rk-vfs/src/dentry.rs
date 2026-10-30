@@ -37,6 +37,62 @@ pub struct Dentry {
     linkable: AtomicBool,
     /// The name was removed, as `d_unlinked` of Linux, for `IN_EXCL_UNLINK`.
     unlinked: AtomicBool,
+    /// The lock of the names in the directory, as `i_rwsem` of Linux. A create, a link, an
+    /// unlink, a rmdir and a rename hold it while they examine the names and change them.
+    lock: DirLock,
+    /// `rmdir` or a rename removed the directory, as `S_DEAD` of Linux. It changes with `lock`
+    /// held, and no new name goes in the directory after it.
+    dead: AtomicBool,
+    /// The count of the changes of `children`. It changes with the lock of `children` held. A
+    /// lookup that did not find a child in the cache adds the inode that the file system gave
+    /// only if no change came in the meantime, as the `d_seq` checks of fs/dcache.c of Linux.
+    seq: AtomicU64,
+}
+
+/// A lock that a task can hold while it blocks, as `inode_lock` of a directory in Linux. The
+/// operations of a file system can wait for a block device with the lock held, so it is not a
+/// spin lock.
+pub struct DirLock {
+    held: AtomicBool,
+    queue: WaitQueue,
+}
+
+impl DirLock {
+    /// Makes an unlocked lock.
+    pub const fn new() -> Self {
+        Self { held: AtomicBool::new(false), queue: WaitQueue::new() }
+    }
+
+    /// Takes the lock. The task waits while another task holds it.
+    pub fn lock(&self) -> DirGuard<'_> {
+        // `wait_until` puts the task in the queue before it tests the condition again, so the
+        // wake of an unlock is not lost.
+        self.queue.wait_until(|| {
+            self.held
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .ok()
+                .map(drop)
+        });
+        DirGuard { lock: self }
+    }
+}
+
+impl Default for DirLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The guard of a [`DirLock`]. The drop releases the lock.
+pub struct DirGuard<'a> {
+    lock: &'a DirLock,
+}
+
+impl Drop for DirGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.held.store(false, Ordering::Release);
+        self.lock.queue.wake_all();
+    }
 }
 
 impl core::fmt::Debug for Dentry {
@@ -58,6 +114,9 @@ impl Dentry {
             children: SpinLock::new(BTreeMap::new()),
             linkable: AtomicBool::new(false),
             unlinked: AtomicBool::new(false),
+            lock: DirLock::new(),
+            dead: AtomicBool::new(false),
+            seq: AtomicU64::new(0),
         })
     }
 
@@ -77,28 +136,80 @@ impl Dentry {
     }
 
     /// Finds the child `name`. The dentry is the same while someone uses it.
+    ///
+    /// The lookup does not hold the lock of the directory. A create, an unlink or a rename on
+    /// another CPU can change the name while the file system looks for it, so the lookup adds
+    /// the inode to the cache only if no change of the cache came in the meantime. Else it looks
+    /// again. Thus the cache keeps no name that an unlink removed, and two lookups give the same
+    /// dentry, as `d_alloc_parallel` in fs/dcache.c of Linux.
     pub fn lookup(self: &Arc<Self>, name: &[u8]) -> Result<Arc<Dentry>> {
-        if let Some(child) = self.children.lock().get(name).and_then(Weak::upgrade) {
-            return Ok(child);
+        loop {
+            let seq = {
+                let children = self.children.lock();
+                if let Some(child) = children.get(name).and_then(Weak::upgrade) {
+                    return Ok(child);
+                }
+                self.seq.load(Ordering::Relaxed)
+            };
+            let inode = self.inode.lookup(name)?;
+            let mut children = self.children.lock();
+            if let Some(child) = children.get(name).and_then(Weak::upgrade) {
+                return Ok(child);
+            }
+            if self.seq.load(Ordering::Relaxed) == seq {
+                let child = self.new_child(name, inode);
+                children.retain(|_, c| c.strong_count() > 0);
+                children.insert(name.to_vec(), Arc::downgrade(&child));
+                return Ok(child);
+            }
         }
-        let inode = self.inode.lookup(name)?;
-        Ok(self.add_child(name, inode))
     }
 
-    /// Adds the dentry of a new inode `name`, after a create in this directory.
+    /// Adds the dentry of a new inode `name`, after a create in this directory. If a lookup
+    /// added a dentry of the same inode already, that dentry stays.
     pub fn add_child(self: &Arc<Self>, name: &[u8], inode: InodeRef) -> Arc<Dentry> {
-        let child = Arc::new(Self {
+        let mut children = self.children.lock();
+        if let Some(child) = children.get(name).and_then(Weak::upgrade)
+            && Arc::ptr_eq(&child.inode, &inode)
+        {
+            return child;
+        }
+        let child = self.new_child(name, inode);
+        children.retain(|_, c| c.strong_count() > 0);
+        children.insert(name.to_vec(), Arc::downgrade(&child));
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        child
+    }
+
+    /// Makes a dentry for the child `name` with the inode `inode`.
+    fn new_child(self: &Arc<Self>, name: &[u8], inode: InodeRef) -> Arc<Dentry> {
+        Arc::new(Self {
             name: SpinLock::new(name.to_vec()),
             parent: SpinLock::new(Some(self.clone())),
             inode,
             children: SpinLock::new(BTreeMap::new()),
             linkable: AtomicBool::new(false),
             unlinked: AtomicBool::new(false),
-        });
-        let mut children = self.children.lock();
-        children.retain(|_, c| c.strong_count() > 0);
-        children.insert(name.to_vec(), Arc::downgrade(&child));
-        child
+            lock: DirLock::new(),
+            dead: AtomicBool::new(false),
+            seq: AtomicU64::new(0),
+        })
+    }
+
+    /// Takes the lock of the names of the directory, as `inode_lock` of Linux.
+    pub fn lock(&self) -> DirGuard<'_> {
+        self.lock.lock()
+    }
+
+    /// Tells if `rmdir` or a rename removed the directory, as `IS_DEADDIR` of Linux. A new name
+    /// cannot go in it.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+
+    /// Records that the directory was removed. The caller holds the lock of the directory.
+    pub(crate) fn set_dead(&self) {
+        self.dead.store(true, Ordering::Release);
     }
 
     /// Makes the dentry of the new inode `inode` that has no name in this directory, for
@@ -114,6 +225,9 @@ impl Dentry {
             children: SpinLock::new(BTreeMap::new()),
             linkable: AtomicBool::new(linkable),
             unlinked: AtomicBool::new(false),
+            lock: DirLock::new(),
+            dead: AtomicBool::new(false),
+            seq: AtomicU64::new(0),
         })
     }
 
@@ -140,35 +254,51 @@ impl Dentry {
 
     /// Removes the child `name` from the cache, after an unlink or a rmdir.
     pub fn forget_child(&self, name: &[u8]) {
-        self.children.lock().remove(name);
+        let mut children = self.children.lock();
+        children.remove(name);
+        self.seq.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Moves the cached child `old` of this dentry to the name `new` of `new_parent`, after a
     /// rename.
     pub fn move_child(self: &Arc<Self>, old: &[u8], new_parent: &Arc<Dentry>, new: &[u8]) {
-        let moved = self.children.lock().remove(old).and_then(|c| c.upgrade());
-        new_parent.children.lock().remove(new);
+        let moved = self.take_child(old);
+        new_parent.take_child(new);
         if let Some(child) = moved {
             *child.name.lock() = new.to_vec();
             *child.parent.lock() = Some(new_parent.clone());
-            new_parent.children.lock().insert(new.to_vec(), Arc::downgrade(&child));
+            new_parent.put_child(new, &child);
         }
+    }
+
+    /// Removes the cached child `name` and gives it, for a rename.
+    fn take_child(&self, name: &[u8]) -> Option<Arc<Dentry>> {
+        let mut children = self.children.lock();
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        children.remove(name).and_then(|c| c.upgrade())
+    }
+
+    /// Puts `child` in the cache with the name `name`, for a rename.
+    fn put_child(&self, name: &[u8], child: &Arc<Dentry>) {
+        let mut children = self.children.lock();
+        self.seq.fetch_add(1, Ordering::Relaxed);
+        children.insert(name.to_vec(), Arc::downgrade(child));
     }
 
     /// Exchanges the cached children `old` of `self` and `new` of `new_parent`, after a
     /// `RENAME_EXCHANGE`.
     pub fn exchange_child(self: &Arc<Self>, old: &[u8], new_parent: &Arc<Dentry>, new: &[u8]) {
-        let first = self.children.lock().remove(old).and_then(|c| c.upgrade());
-        let second = new_parent.children.lock().remove(new).and_then(|c| c.upgrade());
+        let first = self.take_child(old);
+        let second = new_parent.take_child(new);
         if let Some(child) = first {
             *child.name.lock() = new.to_vec();
             *child.parent.lock() = Some(new_parent.clone());
-            new_parent.children.lock().insert(new.to_vec(), Arc::downgrade(&child));
+            new_parent.put_child(new, &child);
         }
         if let Some(child) = second {
             *child.name.lock() = old.to_vec();
             *child.parent.lock() = Some(self.clone());
-            self.children.lock().insert(old.to_vec(), Arc::downgrade(&child));
+            self.put_child(old, &child);
         }
     }
 

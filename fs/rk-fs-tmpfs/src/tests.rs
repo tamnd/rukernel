@@ -1066,3 +1066,121 @@ fn the_size_option_limits_the_data() {
     let bad = MountArgs { data: b"size=1x", dev: None, read_only: false, lookup: None };
     assert!(mount(&bad).is_err());
 }
+
+#[test]
+fn a_removed_directory_takes_no_new_name() {
+    let (fs, root) = setup();
+    fs.mkdir(&root, b"/d", 0o755).unwrap();
+    let d = fs.resolve(&root, b"/d", true).unwrap();
+    fs.remove(&root, b"/d", true).unwrap();
+    // As `IS_DEADDIR` in `may_create` of Linux.
+    assert_eq!(fs.open(&d, b"f", o::O_RDWR | o::O_CREAT, 0o644).err(), Some(Errno::ENOENT));
+    assert_eq!(fs.mkdir(&d, b"x", 0o755).err(), Some(Errno::ENOENT));
+    write_file(&fs, &root, b"/f", b"");
+    let f = fs.resolve(&root, b"/f", false).unwrap();
+    assert_eq!(fs.link(&f, &d, b"g").err(), Some(Errno::ENOENT));
+    assert_eq!(fs.rename(&root, b"/f", &d, b"g", 0).err(), Some(Errno::ENOENT));
+    // A directory that a rename replaced is removed too.
+    fs.mkdir(&root, b"/e", 0o755).unwrap();
+    fs.mkdir(&root, b"/t", 0o755).unwrap();
+    let t = fs.resolve(&root, b"/t", true).unwrap();
+    fs.rename(&root, b"/e", &root, b"/t", 0).unwrap();
+    assert_eq!(fs.mkdir(&t, b"x", 0o755).err(), Some(Errno::ENOENT));
+    assert!(fs.mkdir(&root, b"/t/x", 0o755).is_ok());
+}
+
+#[test]
+fn a_rename_onto_a_directory_above_the_source_is_not_empty() {
+    let (fs, root) = setup();
+    fs.mkdir(&root, b"/p", 0o755).unwrap();
+    fs.mkdir(&root, b"/p/q", 0o755).unwrap();
+    fs.mkdir(&root, b"/p/q/r", 0o755).unwrap();
+    write_file(&fs, &root, b"/p/q/f", b"");
+    // As the `trap` of `lock_rename` in `do_renameat2` of Linux.
+    assert_eq!(fs.rename(&root, b"/p/q/r", &root, b"/p", 0).err(), Some(Errno::ENOTEMPTY));
+    assert_eq!(fs.rename(&root, b"/p/q/f", &root, b"/p", 0).err(), Some(Errno::ENOTEMPTY));
+    assert_eq!(fs.rename(&root, b"/p", &root, b"/p/q/r", 0).err(), Some(Errno::EINVAL));
+}
+
+#[test]
+fn a_lookup_gives_one_dentry_for_a_name() {
+    let (fs, root) = setup();
+    write_file(&fs, &root, b"/a", b"");
+    let first = fs.resolve(&root, b"/a", false).unwrap();
+    let second = fs.resolve(&root, b"/a", false).unwrap();
+    assert!(Arc::ptr_eq(&first.dentry, &second.dentry));
+    fs.remove(&root, b"/a", false).unwrap();
+    assert_eq!(fs.resolve(&root, b"/a", false).err(), Some(Errno::ENOENT));
+}
+
+/// Changes the names of one directory from several threads at the same time, as the smp boot
+/// test does on several CPUs. Each create, link, unlink and rename holds the lock of the
+/// directory, so the names, the link count and the cache stay right.
+#[test]
+fn names_stay_right_when_threads_change_them() {
+    extern crate std;
+    const NAMES: u32 = 6;
+    let (fs, root) = setup();
+    fs.mkdir(&root, b"/d", 0o755).unwrap();
+    write_file(&fs, &root, b"/d/base", b"");
+    let base = fs.resolve(&root, b"/d/base", false).unwrap();
+    let ino = base.inode().metadata().ino;
+    let name = |i: u32| alloc::format!("/d/s{}", i % NAMES).into_bytes();
+    std::thread::scope(|scope| {
+        for t in 0..4u32 {
+            let (fs, root, base, name) = (&fs, &root, &base, &name);
+            scope.spawn(move || {
+                let mut x = t.wrapping_mul(2_654_435_761).wrapping_add(1);
+                for _ in 0..3000 {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    let a = name(x >> 8);
+                    let b = name(x >> 16);
+                    let r = match x % 4 {
+                        0 => fs.link(base, root, &a),
+                        1 => fs.remove(root, &a, false),
+                        2 => fs.rename(root, &a, root, &b, 0),
+                        _ => fs.resolve(root, &a, false).map(|at| {
+                            assert_eq!(at.inode().metadata().ino, ino);
+                        }),
+                    };
+                    assert!(matches!(r, Ok(()) | Err(Errno::EEXIST | Errno::ENOENT)), "{r:?}");
+                }
+            });
+        }
+        // A directory that goes away takes no new file, and its rmdir does not lose one.
+        scope.spawn(|| {
+            for _ in 0..2000 {
+                let r = fs.mkdir(&root, b"/e", 0o755).map(drop);
+                assert!(matches!(r, Ok(()) | Err(Errno::EEXIST)), "{r:?}");
+                let r = fs.remove(&root, b"/e", true);
+                assert!(matches!(r, Ok(()) | Err(Errno::ENOTEMPTY)), "{r:?}");
+            }
+        });
+        for t in 0..2u32 {
+            let (fs, root) = (&fs, &root);
+            scope.spawn(move || {
+                let path = alloc::format!("/e/f{t}").into_bytes();
+                for _ in 0..2000 {
+                    match fs.open(root, &path, o::O_RDWR | o::O_CREAT, 0o644) {
+                        Ok(_) => assert_eq!(fs.remove(root, &path, false), Ok(())),
+                        Err(e) => assert_eq!(e, Errno::ENOENT),
+                    }
+                }
+            });
+        }
+    });
+    let mut count = 0;
+    for n in names(&fs, &root, b"/d") {
+        if n.starts_with(b"s") {
+            let mut path = b"/d/".to_vec();
+            path.extend_from_slice(&n);
+            assert_eq!(fs.resolve(&root, &path, false).unwrap().inode().metadata().ino, ino);
+            count += 1;
+        }
+    }
+    let found = (0..NAMES).filter(|&i| fs.resolve(&root, &name(i), false).is_ok()).count();
+    assert_eq!(found, count);
+    assert_eq!(base.inode().metadata().nlink as usize, 1 + count);
+}
