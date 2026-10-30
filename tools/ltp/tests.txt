@@ -37,7 +37,7 @@
 # kernel, and Linux gives ENOENT, as rukernel does. msgctl05 needs the time_high fields of
 # msqid64_ds, which the x86_64 headers of musl do not have. msgstress01 runs for minutes.
 #
-# clock_gettime04, eventfd06, futex_waitv02 and sendfile07_64 fail in the last full LTP
+# clock_gettime04, eventfd06 and sendfile07_64 fail in the last full LTP
 # run (tools/ltp/syscalls.md). They come back when they pass.
 abort01
 alarm02
@@ -119,6 +119,7 @@ futex_wait06
 futex_wait07
 futex_wait_bitset01
 futex_waitv01
+futex_waitv02
 futex_wake01
 futex_wake02
 futex_wake03

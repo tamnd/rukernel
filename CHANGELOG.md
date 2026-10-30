@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- init examines that `sendmsg` with a bad `msg_control` and `recvmmsg` with a bad vector give `EFAULT`, as net/socket.c of Linux (#496). sendmsg01 and recvmmsg01 of LTP get SIGSEGV in the wrappers of musl before the call, and tools/ltp/notes.txt tells this. tools/ltp/notes.txt also tells that fallocate06 needs a device of 1 GiB, which the runner does not give. madvise08, splice07, futex_waitv02 and futex_waitv03 pass, and futex_waitv02 goes back in the ltp boot test.
+
 ## [0.4.16] - 2026-10-30
 
 ### Added
