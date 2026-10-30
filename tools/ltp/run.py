@@ -67,6 +67,9 @@ LIMITS = {
     "fork13": 720,
     # hackbench01 sends 20 M socket messages. It took 554 s under QEMU without KVM.
     "hackbench01": 900,
+    # hackbench02 sends 8 M socket messages with threads. It took 149 s to 223 s under QEMU without
+    # KVM, near the limit of 240 s.
+    "hackbench02": 480,
     # mc_member sleeps 2 x (20 x 10 s + 60 s).
     "mc_member": 900,
     # The TCP case with -A 65000 runs netstress 5 times with 2000 requests of random sizes up to

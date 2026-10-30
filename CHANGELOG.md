@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- tools/ltp/run.py gives hackbench02 480 s, because its 8 M messages took up to 223 s under QEMU without KVM, near the limit of 240 s (#504).
+
 ## [0.4.18] - 2026-10-30
 
 ### Fixed
