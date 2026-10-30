@@ -5755,6 +5755,28 @@ static void par_fs_run(int n)
 	rmdir(PAR_FS_DIR);
 }
 
+/* Gives the sum of the TLB line of /proc/interrupts, or -1 if the file has no TLB line, as on
+ * arm64. */
+static long tlb_shootdowns(void)
+{
+	static char buf[4096];
+	if (read_small("/proc/interrupts", buf, sizeof(buf)) <= 0)
+		return -1;
+	char *p = strstr(buf, "\nTLB:");
+	if (p == NULL)
+		return -1;
+	long sum = 0;
+	for (p += 5; *p != '\n' && *p != 0;) {
+		char *end;
+		long v = strtol(p, &end, 10);
+		if (end == p)
+			break;
+		sum += v;
+		p = end;
+	}
+	return sum;
+}
+
 /* Runs futexes, sockets, faults and system calls on several CPUs at the same time. Before #405,
  * only one CPU at a time ran kernel code, so these races could not occur. */
 static void test_smp_parallel(int cpus)
@@ -5816,10 +5838,24 @@ static void test_smp_parallel(int cpus)
 		/* 4 KiB pages, so each write of the first pass is a page fault. */
 		madvise(area, PAR_PAGES * 4096, MADV_NOHUGEPAGE);
 		par_area = area;
+		mkdir("/proc", 0555);
+		mount("proc", "/proc", "proc", 0, NULL);
+		long tlb0 = tlb_shootdowns();
 		for (int i = 0; i < n; i++)
 			pthread_create(&t[i], NULL, par_fault, (void *)(long)i);
 		for (int i = 0; i < n; i++)
 			pthread_join(t[i], NULL);
+		long tlb1 = tlb_shootdowns();
+		umount("/proc");
+		printf("init: %d page faults on %d CPUs take %ld TLB shootdowns\n", PAR_PAGES * n, n,
+		       tlb1 - tlb0);
+#ifdef __x86_64__
+		/* A new page needs no TLB flush, as set_pte_at in mm/memory.c of Linux. A
+		 * shootdown for each new page made the CPUs wait for each other. arm64 has no
+		 * TLB line, as its CPUs drop TLB entries with no interrupt. */
+		check("page faults of new pages on each CPU send almost no TLB shootdown",
+		      tlb0 >= 0 && tlb1 - tlb0 < PAR_PAGES / 4);
+#endif
 		for (int p = 0; p < PAR_PAGES && mapped; p++)
 			for (int i = 0; i < n; i++)
 				mapped &= area[p * 4096 + i] == (char)(i + 1);

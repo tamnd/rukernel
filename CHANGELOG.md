@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - init examines that `sendmsg` with a bad `msg_control` and `recvmmsg` with a bad vector give `EFAULT`, as net/socket.c of Linux (#496). sendmsg01 and recvmmsg01 of LTP get SIGSEGV in the wrappers of musl before the call, and tools/ltp/notes.txt tells this. tools/ltp/notes.txt also tells that fallocate06 needs a device of 1 GiB, which the runner does not give. madvise08, splice07, futex_waitv02 and futex_waitv03 pass, and futex_waitv02 goes back in the ltp boot test.
 
+### Fixed
+
+- A new user page on x86-64 does not send a TLB shootdown to the other CPUs, as `set_pte_at` in `finish_fault` and `do_anonymous_page` of Linux (mm/memory.c) (#468). A CPU keeps no TLB entry for an entry that is not present. Before, each page fault of a new page waited until each other CPU of the address space did the interrupt. 8192 page faults on 4 CPUs sent 6171 shootdowns, and now they send 12. Without KVM on a busy host, one `par_file_run` took up to 6 minutes, so the `smp` boot test sometimes went past its timeout of 600 seconds. `/proc/interrupts` has the `TLB` line of Linux, and the `smp` test checks it.
+
 ## [0.4.16] - 2026-10-30
 
 ### Added
