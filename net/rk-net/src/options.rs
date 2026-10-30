@@ -5,10 +5,11 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::socket::{
-    SO_BROADCAST, SO_DEBUG, SO_DONTROUTE, SO_KEEPALIVE, SO_LINGER, SO_MARK, SO_NO_CHECK,
-    SO_OOBINLINE, SO_PRIORITY, SO_RCVBUF, SO_RCVBUFFORCE, SO_RCVLOWAT, SO_RCVTIMEO_NEW,
-    SO_RCVTIMEO_OLD, SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF, SO_SNDBUFFORCE, SO_SNDTIMEO_NEW,
-    SO_SNDTIMEO_OLD, SO_TIMESTAMP_NEW, SO_TIMESTAMP_OLD, SO_TIMESTAMPNS_NEW, SO_TIMESTAMPNS_OLD,
+    SO_BROADCAST, SO_BUSY_POLL, SO_DEBUG, SO_DONTROUTE, SO_KEEPALIVE, SO_LINGER, SO_MARK,
+    SO_NO_CHECK, SO_OOBINLINE, SO_PRIORITY, SO_RCVBUF, SO_RCVBUFFORCE, SO_RCVLOWAT,
+    SO_RCVTIMEO_NEW, SO_RCVTIMEO_OLD, SO_REUSEADDR, SO_REUSEPORT, SO_SNDBUF, SO_SNDBUFFORCE,
+    SO_SNDTIMEO_NEW, SO_SNDTIMEO_OLD, SO_TIMESTAMP_NEW, SO_TIMESTAMP_OLD, SO_TIMESTAMPNS_NEW,
+    SO_TIMESTAMPNS_OLD,
 };
 use rk_vfs::inode::Result;
 
@@ -106,6 +107,11 @@ pub struct Options {
     ints: BTreeMap<u32, i32>,
     /// `SO_LINGER`: the flag and the time.
     linger: (i32, i32),
+    /// `SO_BUSY_POLL`: the time in microseconds that a receive can poll the device, as
+    /// `sk_ll_usec` of Linux. A new socket takes `net.core.busy_read`, as `sock_init_data_uid`
+    /// in net/core/sock.c of Linux. The devices of rukernel have no poll queue, so the value has
+    /// no effect on a receive.
+    busy_poll: i32,
 }
 
 impl Default for Options {
@@ -117,7 +123,20 @@ impl Default for Options {
             sndtimeo: Timeout::default(),
             ints: BTreeMap::new(),
             linger: (0, 0),
+            busy_poll: busy_read(),
         }
+    }
+}
+
+/// The value of `net.core.busy_read` for a new socket. The host has no namespaces.
+fn busy_read() -> i32 {
+    #[cfg(target_os = "none")]
+    {
+        crate::sysctl::core("busy_read")
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
     }
 }
 
@@ -189,6 +208,9 @@ impl Options {
                     SO_PRIORITY | SO_MARK => {
                         self.ints.insert(name, v);
                     }
+                    // `sk_setsockopt` in net/core/sock.c of Linux.
+                    SO_BUSY_POLL if v < 0 => return Err(Errno::EINVAL),
+                    SO_BUSY_POLL => self.busy_poll = v,
                     _ if FLAGS.contains(&name) => {
                         self.ints.insert(name, i32::from(v != 0));
                     }
@@ -218,6 +240,7 @@ impl Options {
             SO_RCVBUF => int(self.rcvbuf as i32),
             SO_RCVLOWAT => int(self.ints.get(&name).copied().unwrap_or(1)),
             SO_PRIORITY | SO_MARK => int(self.ints.get(&name).copied().unwrap_or(0)),
+            SO_BUSY_POLL => int(self.busy_poll),
             _ if FLAGS.contains(&name) => int(self.ints.get(&name).copied().unwrap_or(0)),
             _ => return Err(Errno::ENOPROTOOPT),
         })

@@ -37,8 +37,9 @@ use rk_abi::native::in6::{
 };
 use rk_abi::native::inet::{
     IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MTU_DISCOVER,
-    IP_MULTICAST_ALL, IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_RECVERR, IP_TOS,
-    IP_TTL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_UDP,
+    IP_MULTICAST_ALL, IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_PKTINFO, IP_RECVERR,
+    IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW,
+    IPPROTO_TCP, IPPROTO_UDP,
 };
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -83,6 +84,28 @@ fn control6(s: &State, i: &Info6) -> Vec<(u32, u32, Vec<u8>)> {
     }
     if on(IPV6_2292HOPLIMIT) {
         out.push((IPPROTO_IPV6, IPV6_2292HOPLIMIT, i32::from(i.hops).to_ne_bytes().to_vec()));
+    }
+    out
+}
+
+/// The control messages of a received IPv4 datagram that the flags of `s` ask for, in the order
+/// of `ip_cmsg_recv_offset` in net/ipv4/ip_sockglue.c of Linux.
+fn control4(s: &State, i: &Info6) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    if s.pktinfo {
+        // `struct in_pktinfo`: the interface index, `ipi_spec_dst` and the destination, as
+        // `ip_cmsg_recv_pktinfo`.
+        let mut v = i.ifindex.to_ne_bytes().to_vec();
+        v.extend_from_slice(&ip::v4(&i.spec).unwrap_or(ipv4::ANY));
+        v.extend_from_slice(&ip::v4(&i.dst).unwrap_or(ipv4::ANY));
+        out.push((IPPROTO_IP, IP_PKTINFO, v));
+    }
+    if s.recvttl {
+        out.push((IPPROTO_IP, IP_TTL, i32::from(i.hops).to_ne_bytes().to_vec()));
+    }
+    if s.recvtos {
+        // `ip_cmsg_recv_tos` gives one byte.
+        out.push((IPPROTO_IP, IP_TOS, alloc::vec![i.tclass]));
     }
     out
 }
@@ -183,29 +206,68 @@ struct Datagram {
     scope: u32,
     port: u16,
     data: Vec<u8>,
-    /// The IPv6 header of the datagram, for the control messages.
+    /// The IP header of the datagram, for the control messages.
     info: Option<Info6>,
 }
 
-/// The fields of the IPv6 header of a received datagram that the control messages of
-/// `IPV6_RECVPKTINFO`, `IPV6_RECVHOPLIMIT` and `IPV6_RECVTCLASS` give, as
-/// `ip6_datagram_recv_ctl` of Linux.
+/// The origins of an error of the error queue, `SO_EE_ORIGIN_ICMP` and `SO_EE_ORIGIN_ICMP6` of
+/// <linux/errqueue.h>.
+const SO_EE_ORIGIN_ICMP: u8 = 2;
+const SO_EE_ORIGIN_ICMP6: u8 = 3;
+
+/// An ICMP error about a datagram of the socket, as the `sock_exterr_skb` that `ip_icmp_error`
+/// and `ipv6_icmp_error` of Linux put in the error queue.
+pub(crate) struct IcmpError {
+    /// The error, as `icmp_err_convert` of Linux.
+    pub err: Errno,
+    /// The error is hard: it counts on a connected socket without `IP_RECVERR`.
+    pub hard: bool,
+    /// The destination and the port of the datagram that failed.
+    pub dst: Ip,
+    pub port: u16,
+    /// The type and the code of the ICMP message, and its information: the MTU or the pointer.
+    pub kind: u8,
+    pub code: u8,
+    pub info: u32,
+    /// The sender of the ICMP message, the offender of `SO_EE_OFFENDER`.
+    pub from: Ip,
+    /// The IP header of the ICMP message, for the control messages.
+    pub pkt: Info6,
+    /// The data of the datagram after its UDP or ICMP header.
+    pub payload: Vec<u8>,
+}
+
+/// The fields of the IP header of a received datagram that the control messages give: for IPv6
+/// `IPV6_RECVPKTINFO`, `IPV6_RECVHOPLIMIT` and `IPV6_RECVTCLASS`, as `ip6_datagram_recv_ctl` of
+/// Linux, and for IPv4 `IP_PKTINFO`, `IP_RECVTTL` and `IP_RECVTOS`, as `ip_cmsg_recv_offset`.
 #[derive(Clone, Copy)]
 pub(crate) struct Info6 {
+    /// The packet is IPv4, so the control messages are the ones of IPv4.
+    pub v4: bool,
     /// The destination address.
     pub dst: Ip,
+    /// The local address for a reply, `ipi_spec_dst` of `struct in_pktinfo`. IPv6 does not use
+    /// it.
+    pub spec: Ip,
     /// The interface that took the packet.
     pub ifindex: u32,
-    /// The hop limit.
+    /// The hop limit, or the TTL of IPv4.
     pub hops: u8,
-    /// The traffic class.
+    /// The traffic class, or the TOS of IPv4.
     pub tclass: u8,
 }
 
 impl Info6 {
     /// The fields of `h`, a packet that came in on `ifindex`.
     pub(crate) fn of(h: &ipv6::Header, ifindex: u32) -> Self {
-        Self { dst: h.dst, ifindex, hops: h.hops, tclass: h.tclass }
+        Self { v4: false, dst: h.dst, spec: h.dst, ifindex, hops: h.hops, tclass: h.tclass }
+    }
+
+    /// The fields of `h`, an IPv4 packet that came in on `ifindex`. `spec` is the local address
+    /// for a reply.
+    pub(crate) fn of4(h: &Header, ifindex: u32, spec: Addr) -> Self {
+        let (dst, spec) = (ip::mapped(h.dst), ip::mapped(spec));
+        Self { v4: true, dst, spec, ifindex, hops: h.ttl, tclass: h.tos }
     }
 }
 
@@ -225,11 +287,19 @@ struct State {
     queued: usize,
     /// The error for `SO_ERROR` and the next call.
     error: Option<Errno>,
+    /// The error queue of `IP_RECVERR` and `IPV6_RECVERR`, `sk_error_queue` of Linux, and the
+    /// bytes that it costs.
+    errqueue: VecDeque<IcmpError>,
+    errqueued: usize,
     options: Options,
     /// `IP_TTL`, or `None` for the default.
     ttl: Option<u8>,
     tos: u8,
     recverr: bool,
+    /// `IP_PKTINFO`, `IP_RECVTTL` and `IP_RECVTOS`: the control messages of IPv4.
+    pktinfo: bool,
+    recvttl: bool,
+    recvtos: bool,
     hdrincl: bool,
     mtu_discover: i32,
     multicast_ttl: i32,
@@ -252,6 +322,8 @@ struct State {
     filter6: [u32; 8],
     /// The other options of the level `IPPROTO_IPV6`, which change nothing in the stack.
     flags6: BTreeMap<u32, i32>,
+    /// The interface index of `IPV6_PKTINFO`, `np->sticky_pktinfo.ipi6_ifindex` of Linux.
+    sticky_ifindex: u32,
     shut_rd: bool,
     shut_wr: bool,
     closed: bool,
@@ -521,10 +593,15 @@ impl Dgram {
                 queue: VecDeque::new(),
                 queued: 0,
                 error: None,
+                errqueue: VecDeque::new(),
+                errqueued: 0,
                 options: Options::default(),
                 ttl: None,
                 tos: 0,
                 recverr: false,
+                pktinfo: false,
+                recvttl: false,
+                recvtos: false,
                 hdrincl: proto == Proto::Raw(IPPROTO_RAW as u8),
                 mtu_discover: 0,
                 multicast_ttl: 1,
@@ -539,6 +616,7 @@ impl Dgram {
                 mtu6: 0,
                 filter6: [0; 8],
                 flags6: BTreeMap::new(),
+                sticky_ifindex: 0,
                 shut_rd: false,
                 shut_wr: false,
                 closed: false,
@@ -672,8 +750,8 @@ impl Dgram {
     }
 
     /// Gives a copy of a packet to a raw socket, as `raw_v4_input` of Linux. `packet` has the
-    /// IPv4 header, and it came in on `dif`.
-    pub(crate) fn deliver_raw(&self, h: &Header, packet: &[u8], dif: u32) {
+    /// IPv4 header, and it came in on `dif`. `info` is for the control messages.
+    pub(crate) fn deliver_raw(&self, h: &Header, packet: &[u8], dif: u32, info: Info6) {
         let (src, dst) = (ip::mapped(h.src), ip::mapped(h.dst));
         {
             let s = self.state.lock();
@@ -697,7 +775,7 @@ impl Dgram {
         if !self.mc_allow(h.dst, dif) {
             return;
         }
-        self.deliver(src, 0, 0, packet.to_vec(), None);
+        self.deliver(src, 0, 0, packet.to_vec(), Some(info));
     }
 
     /// Gives a copy of an IPv6 packet to a raw socket, as `ipv6_raw_deliver` and
@@ -727,17 +805,64 @@ impl Dgram {
         self.deliver(h.src, scope, 0, payload.to_vec(), Some(Info6::of(h, ifindex)));
     }
 
-    /// Records an error from an ICMP message about a packet to `dst`, as `udp_err` of Linux.
-    /// Without `IP_RECVERR`, only a hard error on a connected socket counts.
-    pub(crate) fn icmp_error(&self, err: Errno, hard: bool, dst: Ip) {
+    /// Records an error from an ICMP message, as `__udp4_lib_err` and `__udp6_lib_err` of
+    /// Linux. Without `IP_RECVERR`, only a hard error on a connected socket counts. With
+    /// `IP_RECVERR`, the error also goes in the error queue, as `ip_icmp_error`. A full queue
+    /// drops it, as `sock_queue_err_skb`.
+    pub(crate) fn icmp_error(&self, e: IcmpError) {
         let mut s = self.state.lock();
-        let connected = s.remote.is_some_and(|(a, _)| a == dst);
-        if !s.recverr && !(hard && connected) {
-            return;
+        let err = e.err;
+        if s.recverr {
+            let size = e.payload.len() + OVERHEAD;
+            if s.queued + s.errqueued + size < s.options.rcvbuf as usize {
+                s.errqueued += size;
+                s.errqueue.push_back(e);
+            }
+        } else {
+            let connected = s.remote.is_some_and(|(a, _)| a == e.dst);
+            if !(e.hard && connected) {
+                return;
+            }
         }
         s.error = Some(err);
         drop(s);
         self.wake();
+    }
+
+    /// Takes the first error of the error queue for `MSG_ERRQUEUE`, as `ip_recv_error` and
+    /// `ipv6_recv_error` of Linux. The data is the data of the datagram that failed, the
+    /// address is its destination, and the control messages of the ICMP packet come before the
+    /// `struct sock_extended_err` and the offender. The pending error becomes the error of the
+    /// next entry, as `sock_dequeue_err_skb`.
+    fn recv_error(&self, len: usize) -> Result<Received> {
+        let mut s = self.state.lock();
+        let Some(e) = s.errqueue.pop_front() else { return Err(Errno::EAGAIN) };
+        s.errqueued -= e.payload.len() + OVERHEAD;
+        s.error = s.errqueue.front().map(|n| n.err);
+        let af = self.af();
+        let mut control = if e.pkt.v4 { control4(&s, &e.pkt) } else { control6(&s, &e.pkt) };
+        drop(s);
+        let mut ee = Vec::with_capacity(16 + 28);
+        ee.extend_from_slice(&u32::from(e.err.get()).to_ne_bytes());
+        ee.push(if e.pkt.v4 { SO_EE_ORIGIN_ICMP } else { SO_EE_ORIGIN_ICMP6 });
+        ee.extend_from_slice(&[e.kind, e.code, 0]);
+        ee.extend_from_slice(&e.info.to_ne_bytes());
+        ee.extend_from_slice(&0u32.to_ne_bytes());
+        ee.extend_from_slice(&sockaddr::make_in(af, &e.from, 0, 0));
+        let (level, name) =
+            if af == AF_INET6 { (IPPROTO_IPV6, IPV6_RECVERR) } else { (IPPROTO_IP, IP_RECVERR) };
+        control.push((level, name, ee));
+        let full = e.payload.len();
+        let mut data = e.payload;
+        data.truncate(len);
+        Ok(Received {
+            data,
+            len: full,
+            addr: Some(sockaddr::make_in(af, &e.dst, e.port, 0)),
+            flags: MSG_ERRQUEUE | if full > len { MSG_TRUNC } else { 0 },
+            control,
+            ..Received::default()
+        })
     }
 
     /// Gives the socket a port or an identifier if it has none, as `inet_autobind` of Linux.
@@ -787,16 +912,88 @@ impl Dgram {
         Out { src, dst, protocol, ttl, tos: s.tos, df, mc_loop: s.multicast_loop }
     }
 
+    /// Reads `IPV6_PKTINFO` in the control messages of a send on an IPv6 socket, as
+    /// `ip6_datagram_send_ctl` in net/ipv6/datagram.c of Linux. The interface index of the
+    /// `struct in6_pktinfo` goes to `scope`, the interface of the packet. Gives the source
+    /// address of the `struct in6_pktinfo`, or `::`. The other control messages do nothing, and
+    /// a send to an IPv4-mapped `dst` reads none, as `udpv6_sendmsg`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EINVAL` for a short message, for an index that is not the interface of the
+    /// destination or of `SO_BINDTODEVICE`, for a link local source without an interface, and
+    /// for a source that is not local without `IPV6_FREEBIND` or `IPV6_TRANSPARENT`. Gives
+    /// `ENODEV` for an interface that is not there.
+    fn send_pktinfo6(
+        &self,
+        s: &State,
+        dst: &Ip,
+        control: &[(u32, u32, Vec<u8>)],
+        scope: &mut u32,
+    ) -> Result<Ip> {
+        let mut saddr = ip::ANY;
+        if self.af() != AF_INET6 || ip::v4(dst).is_some() {
+            return Ok(saddr);
+        }
+        for (level, kind, data) in control {
+            if *level != IPPROTO_IPV6 || *kind != IPV6_PKTINFO {
+                continue;
+            }
+            let info = data.get(..20).ok_or(Errno::EINVAL)?;
+            let ifindex = u32::from_ne_bytes([info[16], info[17], info[18], info[19]]);
+            let mut oif = if *scope != 0 { *scope } else { s.oif };
+            if ifindex != 0 {
+                if oif != 0 && ifindex != oif {
+                    return Err(Errno::EINVAL);
+                }
+                oif = ifindex;
+                *scope = ifindex;
+            }
+            let mut addr = ip::ANY;
+            addr.copy_from_slice(&info[..16]);
+            if oif != 0 {
+                dev::by_index(oif).ok_or(Errno::ENODEV)?;
+            } else if ipv6::is_link_local(&addr) {
+                return Err(Errno::EINVAL);
+            }
+            if addr != ip::ANY {
+                // A link local source must be on the interface, as `ipv6_chk_addr_and_flags`.
+                let strict = ipv6::is_link_local(&addr);
+                let nonlocal = [IPV6_FREEBIND, IPV6_TRANSPARENT]
+                    .iter()
+                    .any(|o| s.flags6.get(o).is_some_and(|&v| v != 0));
+                let local = stack6::ROUTES6
+                    .lock()
+                    .addrs()
+                    .iter()
+                    .any(|a| a.addr == addr && (!strict || a.ifindex == oif));
+                if !nonlocal && !local {
+                    return Err(Errno::EINVAL);
+                }
+                saddr = addr;
+            }
+        }
+        Ok(saddr)
+    }
+
     /// Sends `data` to `dst` and `dport`, and `scope` is the interface of a link local
-    /// destination. The caller holds the state.
-    fn send_to(&self, s: &mut State, dst: Ip, dport: u16, scope: u32, data: &[u8]) -> Result<()> {
+    /// destination. `saddr` is the source of `IPV6_PKTINFO`, or `::`. The caller holds the state.
+    fn send_to(
+        &self,
+        s: &mut State,
+        dst: Ip,
+        dport: u16,
+        scope: u32,
+        saddr: Ip,
+        data: &[u8],
+    ) -> Result<()> {
         let Some(d4) = ip::v4(&dst) else {
             if self.af() == AF_INET || ip::v4(&s.local).is_some_and(|a| a != ipv4::ANY) {
                 return Err(Errno::ENETUNREACH);
             }
             // A destination of `::` is the local host, as `udpv6_sendmsg` of Linux.
             let dst = if dst == ip::ANY { ip::LOOPBACK } else { dst };
-            return self.send6(s, dst, dport, scope, data);
+            return self.send6(s, dst, dport, scope, saddr, data);
         };
         if self.af() == AF_INET6 {
             // Only UDP of IPv6 sends to an IPv4-mapped address, as `udpv6_sendmsg`.
@@ -873,9 +1070,22 @@ impl Dgram {
 
     /// Sends `data` to the IPv6 address `dst` and `dport`, as `udpv6_sendmsg`,
     /// `ping_v6_sendmsg` and `rawv6_sendmsg` of Linux.
-    fn send6(&self, s: &mut State, dst: Ip, dport: u16, scope: u32, data: &[u8]) -> Result<()> {
+    fn send6(
+        &self,
+        s: &mut State,
+        dst: Ip,
+        dport: u16,
+        scope: u32,
+        saddr: Ip,
+        data: &[u8],
+    ) -> Result<()> {
         let max = usize::from(u16::MAX);
-        let oif = if scope != 0 { scope } else { s.oif };
+        let mut oif = if scope != 0 { scope } else { s.oif };
+        // UDP sends on the interface of `IPV6_PKTINFO` if no other interface is set, as
+        // `udpv6_sendmsg` of Linux.
+        if oif == 0 && self.proto == Proto::Udp {
+            oif = s.sticky_ifindex;
+        }
         if let Proto::Raw(_) = self.proto
             && s.hdrincl
         {
@@ -889,7 +1099,14 @@ impl Dgram {
             _ => (Vec::new(), dst),
         };
         let next = stack6::route(&first, oif)?;
-        let src = if ip::is_any(&s.local) { next.src } else { s.local };
+        // The source of `IPV6_PKTINFO` comes before the local address, as `udpv6_sendmsg`.
+        let src = if saddr != ip::ANY {
+            saddr
+        } else if ip::is_any(&s.local) {
+            next.src
+        } else {
+            s.local
+        };
         let hops = if ipv6::is_multicast(&dst) {
             s.mc_hops as u8
         } else {
@@ -1083,6 +1300,17 @@ impl Dgram {
             s.rthdr = rthdr_of(value).ok_or(Errno::EINVAL)?;
             return Ok(());
         }
+        // `struct in6_pktinfo`: the address and the interface index. The index must be the
+        // device of `SO_BINDTODEVICE`, if the socket has one, as `sk_dev_equal_l3scope`.
+        if name == IPV6_PKTINFO {
+            let index = value.get(16..20).ok_or(Errno::EINVAL)?;
+            let ifindex = u32::from_ne_bytes([index[0], index[1], index[2], index[3]]);
+            if s.oif != 0 && ifindex != s.oif {
+                return Err(Errno::EINVAL);
+            }
+            s.sticky_ifindex = ifindex;
+            return Ok(());
+        }
         if matches!(
             name,
             IPV6_ADD_MEMBERSHIP | IPV6_DROP_MEMBERSHIP | MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP
@@ -1215,6 +1443,9 @@ impl Dgram {
             }
             IP_TOS => s.tos = v as u8,
             IP_RECVERR => s.recverr = v != 0,
+            IP_PKTINFO => s.pktinfo = v != 0,
+            IP_RECVTTL => s.recvttl = v != 0,
+            IP_RECVTOS => s.recvtos = v != 0,
             IP_HDRINCL if matches!(self.proto, Proto::Raw(_)) => s.hdrincl = v != 0,
             IP_MTU_DISCOVER if (0..=5).contains(&v) => s.mtu_discover = v,
             IP_MTU_DISCOVER => return Err(Errno::EINVAL),
@@ -1499,18 +1730,20 @@ impl Socket for Dgram {
                     s.corked = Some((dst, port, scope, data));
                     return Ok(msg.data.len());
                 }
-                self.send_to(&mut s, dst, port, scope, &data)?;
+                self.send_to(&mut s, dst, port, scope, ip::ANY, &data)?;
             } else {
-                let (dst, port, scope) = match to.or(s.remote.map(|(a, p)| (a, p, 0))) {
+                let (dst, port, mut scope) = match to.or(s.remote.map(|(a, p)| (a, p, 0))) {
                     Some(d) => d,
                     None if matches!(self.proto, Proto::Raw(_)) && s.hdrincl => (self.any(), 0, 0),
                     None => return Err(Errno::EDESTADDRREQ),
                 };
+                let saddr = self.send_pktinfo6(&s, &dst, &msg.control, &mut scope)?;
+                // A corked datagram keeps the interface but not the source of `IPV6_PKTINFO`.
                 if more && self.proto == Proto::Udp {
                     s.corked = Some((dst, port, scope, msg.data.clone()));
                     return Ok(msg.data.len());
                 }
-                self.send_to(&mut s, dst, port, scope, &msg.data)?;
+                self.send_to(&mut s, dst, port, scope, saddr, &msg.data)?;
             }
         }
         // The packet on the loopback device arrives now, as `netif_rx` and the softirq on the
@@ -1524,7 +1757,7 @@ impl Socket for Dgram {
             return Err(Errno::EOPNOTSUPP);
         }
         if flags & MSG_ERRQUEUE != 0 {
-            return Err(Errno::EAGAIN);
+            return self.recv_error(len);
         }
         stack::poll();
         let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
@@ -1551,7 +1784,9 @@ impl Socket for Dgram {
                     len: full,
                     addr: Some(sockaddr::make_in(self.af(), &src, port, scope)),
                     flags: trunc,
-                    control: info.map(|i| control6(&s, &i)).unwrap_or_default(),
+                    control: info
+                        .map(|i| if i.v4 { control4(&s, &i) } else { control6(&s, &i) })
+                        .unwrap_or_default(),
                     ..Received::default()
                 }));
             }
@@ -1611,6 +1846,9 @@ impl Socket for Dgram {
                 IP_TTL => int(i32::from(s.ttl.unwrap_or_else(rk_net::sysctl::default_ttl))),
                 IP_TOS => int(i32::from(s.tos)),
                 IP_RECVERR => int(i32::from(s.recverr)),
+                IP_PKTINFO => int(i32::from(s.pktinfo)),
+                IP_RECVTTL => int(i32::from(s.recvttl)),
+                IP_RECVTOS => int(i32::from(s.recvtos)),
                 IP_HDRINCL => int(i32::from(s.hdrincl)),
                 IP_MTU_DISCOVER => int(s.mtu_discover),
                 IP_MULTICAST_TTL => int(s.multicast_ttl),
@@ -1667,7 +1905,7 @@ impl Socket for Dgram {
                 if !s.cork
                     && let Some((dst, port, scope, data)) = s.corked.take()
                 {
-                    let _ = self.send_to(&mut s, dst, port, scope, &data);
+                    let _ = self.send_to(&mut s, dst, port, scope, ip::ANY, &data);
                 }
             }
             SOL_RAW if self.af() == AF_INET6 && name == IPV6_CHECKSUM => {
@@ -1711,7 +1949,7 @@ impl Socket for Dgram {
     fn poll(&self) -> u32 {
         let s = self.state.lock();
         let mut mask = POLLOUT | POLLWRNORM | POLLWRBAND;
-        if s.error.is_some() {
+        if s.error.is_some() || !s.errqueue.is_empty() {
             mask |= POLLERR;
         }
         if !s.queue.is_empty() {

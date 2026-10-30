@@ -241,6 +241,8 @@ pub(super) struct Packet<'a> {
     /// The data that the socket gets: the link header and the payload for `SOCK_RAW`, else the
     /// payload.
     pub(super) data: &'a [u8],
+    /// The size of the packet before the filter cut it, `tp_len` of Linux.
+    pub(super) len: usize,
     /// The size of the link header at the start of `data`.
     pub(super) maclen: usize,
     /// The socket is `SOCK_DGRAM`.
@@ -534,7 +536,7 @@ impl Ring {
             self.put32(at + 4, sec);
             self.put32(at + 8, nsec);
             self.put32(at + 12, snaplen as u32);
-            self.put32(at + 16, p.data.len() as u32);
+            self.put32(at + 16, p.len as u32);
             self.put32(at + 20, status);
             self.put16(at + 24, macoff as u16);
             self.put16(at + 26, netoff as u16);
@@ -554,7 +556,7 @@ impl Ring {
             if self.version == TPACKET_V1 {
                 // `struct tpacket_hdr`: the status is a `long`, and the time has microseconds.
                 self.put32(at + 4, 0);
-                self.put32(at + 8, p.data.len() as u32);
+                self.put32(at + 8, p.len as u32);
                 self.put32(at + 12, snaplen as u32);
                 self.put16(at + 16, macoff as u16);
                 self.put16(at + 18, netoff as u16);
@@ -562,7 +564,7 @@ impl Ring {
                 self.put32(at + 24, nsec / 1000);
             } else {
                 // `struct tpacket2_hdr`.
-                self.put32(at + 4, p.data.len() as u32);
+                self.put32(at + 4, p.len as u32);
                 self.put32(at + 8, snaplen as u32);
                 self.put16(at + 12, macoff as u16);
                 self.put16(at + 14, netoff as u16);

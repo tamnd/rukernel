@@ -80,13 +80,15 @@ impl Ports {
 
     /// Finds a free port for `b`. The search starts at the hint and goes around the range, and
     /// the hint moves past the port, so that a new socket does not get the port of a socket
-    /// that closed a moment before.
+    /// that closed a moment before. The search skips the ports of
+    /// `net.ipv4.ip_local_reserved_ports`, as `inet_is_local_reserved_port` in
+    /// `udp_lib_get_port` and `inet_csk_find_open_port` of Linux.
     fn pick(&mut self, b: &Binding) -> Result<u16, Errno> {
         let (lo, hi) = (*self.range.start(), *self.range.end());
         let count = u32::from(hi - lo) + 1;
         for i in 0..count {
             let port = lo + ((u32::from(self.hint - lo) + i) % count) as u16;
-            if self.free(port, b) {
+            if self.free(port, b) && !rk_net::sysctl::local_reserved_port(port) {
                 self.hint = if port == hi { lo } else { port + 1 };
                 return Ok(port);
             }

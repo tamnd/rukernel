@@ -13,7 +13,7 @@ use rk_abi::native::at::AT_FDCWD;
 use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
-use rk_abi::native::socket::SOL_SOCKET;
+use rk_abi::native::socket::{SO_ATTACH_FILTER, SOL_SOCKET};
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT,
@@ -388,9 +388,35 @@ pub(crate) fn setsockopt(
 ) -> SysResult {
     let (_, sock) = socket(cx, fd)?;
     let len = usize::try_from(len as i32).map_err(|_| Errno::EINVAL)?;
-    let v = if len == 0 { Vec::new() } else { cx.read_bytes(value, len.min(OPTION_MAX))? };
+    let v = if level as u32 == SOL_SOCKET && name as u32 == SO_ATTACH_FILTER {
+        read_fprog(cx, value, len)?
+    } else if len == 0 {
+        Vec::new()
+    } else {
+        cx.read_bytes(value, len.min(OPTION_MAX))?
+    };
     sock.set_option(level as u32, name as u32, &v)?;
     Ok(0)
+}
+
+/// The size of `struct sock_fprog`: the number of instructions, and a pointer to them.
+const FPROG_SIZE: usize = 16;
+
+/// Reads the instructions of the `struct sock_fprog` of `SO_ATTACH_FILTER`, as
+/// `copy_bpf_fprog_from_user` and `__get_filter` in net/core/filter.c of Linux. The socket
+/// checks the program.
+fn read_fprog(cx: &Cx<'_>, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+    if len != FPROG_SIZE {
+        return Err(Errno::EINVAL);
+    }
+    let raw = cx.read_bytes(addr, FPROG_SIZE)?;
+    let n = usize::from(u16::from_ne_bytes([raw[0], raw[1]]));
+    let ptr =
+        u64::from_ne_bytes([raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]]);
+    if ptr == 0 || n == 0 || n > rk_net::filter::BPF_MAXINSNS {
+        return Err(Errno::EINVAL);
+    }
+    cx.read_bytes(ptr, n * rk_net::filter::INSN_SIZE)
 }
 
 /// Sends `SIGPIPE` for `EPIPE`, unless the flags have `MSG_NOSIGNAL`.
@@ -520,7 +546,8 @@ impl MsgHdr {
     }
 }
 
-/// Reads the control messages of a send, as `__scm_send` of Linux.
+/// Reads the control messages of a send, as `__scm_send` of Linux. The messages of the other
+/// levels go to the socket in `msg.control`.
 fn read_control(cx: &Cx<'_>, hdr: &MsgHdr, msg: &mut Message) -> Result<(), Errno> {
     if hdr.controllen == 0 {
         return Ok(());
@@ -575,6 +602,8 @@ fn read_control(cx: &Cx<'_>, hdr: &MsgHdr, msg: &mut Message) -> Result<(), Errn
                 }
                 _ => return Err(Errno::EINVAL),
             }
+        } else {
+            msg.control.push((level, kind, data.to_vec()));
         }
         off += len.next_multiple_of(8);
     }

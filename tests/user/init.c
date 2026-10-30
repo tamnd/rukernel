@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <linux/audit.h>
+#include <linux/errqueue.h>
 #include <linux/filter.h>
 #include <linux/futex.h>
 #include <linux/seccomp.h>
@@ -6076,6 +6077,12 @@ static void test_inet_ping(void)
 						 strcmp(text, "1\t0\n") == 0);
 	close(rfd);
 	check("ping_group_range takes 0 2147483647", write_text(range, "0 2147483647\n") == 0);
+	/* libtirpc reads this file before it binds a server to a free port (#491). */
+	memset(text, 0, sizeof(text));
+	rfd = open("/proc/sys/net/ipv4/ip_local_reserved_ports", O_RDONLY);
+	check("ip_local_reserved_ports is an empty line",
+	      rfd >= 0 && read(rfd, text, sizeof(text) - 1) == 1 && strcmp(text, "\n") == 0);
+	close(rfd);
 	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	check("an ICMP echo socket opens", fd >= 0);
 	if (fd >= 0) {
@@ -6639,6 +6646,103 @@ static void test_packet_lo(void)
 	close(p);
 }
 
+/*
+ * SO_ATTACH_FILTER on an AF_PACKET socket: the filter keeps 20 bytes of the frames of UDP to
+ * port 9 and drops the other frames, as net/core/filter.c and packet_rcv of Linux.
+ */
+static void test_packet_filter(void)
+{
+	int p = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(RK_ETH_P_ALL));
+	if (p < 0) {
+		check("an AF_PACKET socket for a filter opens", 0);
+		return;
+	}
+	struct sockaddr_ll ll = { .sll_family = AF_PACKET, .sll_protocol = htons(RK_ETH_P_ALL),
+				  .sll_ifindex = if_nametoindex("lo") };
+	bind(p, (struct sockaddr *)&ll, sizeof(ll));
+	check("SO_DETACH_FILTER without a filter gives ENOENT",
+	      setsockopt(p, SOL_SOCKET, SO_DETACH_FILTER, NULL, 0) < 0 && errno == ENOENT);
+	struct sock_filter code[] = {
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 12),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x800, 0, 5),
+		BPF_STMT(BPF_LD | BPF_B | BPF_ABS, 23),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 17, 0, 3),
+		BPF_STMT(BPF_LD | BPF_H | BPF_ABS, 36),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, 20),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog bad = { .len = 0, .filter = code };
+	check("SO_ATTACH_FILTER with no instructions gives EINVAL",
+	      setsockopt(p, SOL_SOCKET, SO_ATTACH_FILTER, &bad, sizeof(bad)) < 0 && errno == EINVAL);
+	struct sock_fprog fp = { .len = sizeof(code) / sizeof(code[0]), .filter = code };
+	check("SO_ATTACH_FILTER attaches a filter",
+	      setsockopt(p, SOL_SOCKET, SO_ATTACH_FILTER, &fp, sizeof(fp)) == 0);
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in other = inet_addr4(INADDR_LOOPBACK, 10);
+	struct sockaddr_in to = inet_addr4(INADDR_LOOPBACK, 9);
+	sendto(u, "rkflt", 5, 0, (struct sockaddr *)&other, sizeof(other));
+	sendto(u, "rkflt", 5, 0, (struct sockaddr *)&to, sizeof(to));
+	int frames = 0, cut = 0;
+	for (;;) {
+		struct pollfd pf = { .fd = p, .events = POLLIN };
+		if (poll(&pf, 1, 500) != 1)
+			break;
+		unsigned char buf[256];
+		long n = recv(p, buf, sizeof(buf), 0);
+		if (n < 0)
+			break;
+		frames++;
+		if (n == 20 && buf[12] == 8 && buf[13] == 0)
+			cut++;
+	}
+	printf("init: inet: packet filter: %d frames, %d of 20 bytes\n", frames, cut);
+	check("a socket filter keeps 20 bytes of the frames to port 9 and drops the others",
+	      frames == 2 && cut == 2);
+	int on = 1;
+	check("SO_LOCK_FILTER locks the filter",
+	      setsockopt(p, SOL_SOCKET, SO_LOCK_FILTER, &on, sizeof(on)) == 0 &&
+		      setsockopt(p, SOL_SOCKET, SO_DETACH_FILTER, NULL, 0) < 0 && errno == EPERM);
+	close(u);
+	close(p);
+}
+
+/*
+ * IP_RECVERR: a datagram to a closed port puts the ICMP error in the error queue, and
+ * recvmsg with MSG_ERRQUEUE gives the data, the destination and a struct sock_extended_err,
+ * as ip_icmp_error and ip_recv_error of Linux. tracepath reads the hops in this way.
+ */
+static void test_udp_errqueue(void)
+{
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	int on = 1;
+	setsockopt(u, SOL_IP, IP_RECVERR, &on, sizeof(on));
+	struct sockaddr_in to = inet_addr4(INADDR_LOOPBACK, 9);
+	sendto(u, "rkerr", 5, 0, (struct sockaddr *)&to, sizeof(to));
+	struct pollfd pf = { .fd = u, .events = 0 };
+	check("a socket with IP_RECVERR polls POLLERR after an ICMP error",
+	      poll(&pf, 1, 1000) == 1 && (pf.revents & POLLERR));
+	char data[16], cbuf[256];
+	struct sockaddr_in from;
+	struct iovec iov = { data, sizeof(data) };
+	struct msghdr m = { .msg_name = &from, .msg_namelen = sizeof(from), .msg_iov = &iov,
+			    .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
+	long n = recvmsg(u, &m, MSG_ERRQUEUE);
+	struct sock_extended_err *ee = NULL;
+	for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+		if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_RECVERR)
+			ee = (struct sock_extended_err *)CMSG_DATA(c);
+	struct sockaddr_in *off = ee ? (struct sockaddr_in *)SO_EE_OFFENDER(ee) : NULL;
+	check("MSG_ERRQUEUE gives the data, the destination and the ICMP error",
+	      n == 5 && memcmp(data, "rkerr", 5) == 0 && (m.msg_flags & MSG_ERRQUEUE) &&
+		      from.sin_port == htons(9) && ee && ee->ee_errno == ECONNREFUSED &&
+		      ee->ee_origin == SO_EE_ORIGIN_ICMP && ee->ee_type == 3 && ee->ee_code == 3 &&
+		      off->sin_family == AF_INET && off->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+	check("the error queue is empty after the read",
+	      recvmsg(u, &m, MSG_ERRQUEUE | MSG_DONTWAIT) < 0 && errno == EAGAIN);
+	close(u);
+}
+
 /* The mapped rings of <linux/if_packet.h>. The musl headers do not have them. */
 #define RK_PACKET_RX_RING 5
 #define RK_PACKET_STATISTICS 6
@@ -6948,6 +7052,13 @@ static void test_tun6(void)
 	struct ipv6_mreq m = { .ipv6mr_interface = if_nametoindex("rktun6") };
 	inet_pton(AF_INET6, "ff02::4242", &m.ipv6mr_multiaddr);
 	int s6 = socket(AF_INET6, SOCK_DGRAM, 0);
+	/* The ping of iputils sets IPV6_PKTINFO for -I (#491). */
+	struct in6_pktinfo pi = { .ipi6_ifindex = m.ipv6mr_interface };
+	errno = 0;
+	check("IPV6_PKTINFO takes a struct in6_pktinfo and no shorter value",
+	      setsockopt(s6, IPPROTO_IPV6, IPV6_PKTINFO, &pi, sizeof(pi)) == 0 &&
+		      setsockopt(s6, IPPROTO_IPV6, IPV6_PKTINFO, &pi, sizeof(pi) - 1) == -1 &&
+		      errno == EINVAL);
 	r = setsockopt(s6, IPPROTO_IPV6, IPV6_JOIN_GROUP, &m, sizeof(m));
 	check("IPV6_JOIN_GROUP joins ff02::4242 on rktun6", r == 0);
 	check("the join sends an MLDv2 report", tun_mld(t, 143, 4, &m.ipv6mr_multiaddr));
@@ -6961,6 +7072,43 @@ static void test_tun6(void)
 	      tun_mld_query(t, 24) && tun_mld(t, 131, 0, &m.ipv6mr_multiaddr));
 	r = setsockopt(s6, IPPROTO_IPV6, IPV6_LEAVE_GROUP, &m, sizeof(m));
 	check("the leave sends an MLDv1 done", r == 0 && tun_mld(t, 132, 0, &m.ipv6mr_multiaddr));
+
+	/* The DHCPv6 server of ISC sends to a link local address without a scope, and sets the
+	 * interface with IPV6_PKTINFO in the control message (#491). */
+	struct sockaddr_in6 to = { .sin6_family = AF_INET6, .sin6_port = htons(9) };
+	inet_pton(AF_INET6, "fe80::42", &to.sin6_addr);
+	union {
+		struct cmsghdr h;
+		char b[CMSG_SPACE(sizeof(struct in6_pktinfo))];
+	} cm = { 0 };
+	struct iovec iov = { .iov_base = "rkpi", .iov_len = 4 };
+	struct msghdr mh = { .msg_name = &to, .msg_namelen = sizeof(to), .msg_iov = &iov,
+			     .msg_iovlen = 1, .msg_control = cm.b, .msg_controllen = sizeof(cm.b) };
+	struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+	c->cmsg_level = IPPROTO_IPV6;
+	c->cmsg_type = IPV6_PKTINFO;
+	c->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+	struct in6_pktinfo out = { .ipi6_ifindex = m.ipv6mr_interface };
+	memcpy(CMSG_DATA(c), &out, sizeof(out));
+	int u = socket(AF_INET6, SOCK_DGRAM, 0);
+	int sent = sendmsg(u, &mh, 0) == 4;
+	int seen = 0;
+	unsigned char buf[256];
+	for (int i = 0; i < 20 && sent && !seen; i++) {
+		struct pollfd pf = { .fd = t, .events = POLLIN };
+		if (poll(&pf, 1, 500) < 1)
+			break;
+		ssize_t n = read(t, buf, sizeof(buf));
+		seen = n >= 48 && buf[0] >> 4 == 6 && buf[6] == IPPROTO_UDP &&
+		       memcmp(buf + 24, &to.sin6_addr, 16) == 0 && buf[42] == 0 && buf[43] == 9;
+	}
+	check("sendmsg with IPV6_PKTINFO sends to fe80::42 through rktun6", seen);
+	out.ipi6_ifindex = 9999;
+	memcpy(CMSG_DATA(c), &out, sizeof(out));
+	errno = 0;
+	check("sendmsg with IPV6_PKTINFO of no interface gives ENODEV",
+	      sendmsg(u, &mh, 0) == -1 && errno == ENODEV);
+	close(u);
 	close(s6);
 	close(t);
 }
@@ -7806,6 +7954,8 @@ static void test_inet(int port)
 	test_inet_dns();
 	test_inet_lo();
 	test_packet_lo();
+	test_packet_filter();
+	test_udp_errqueue();
 	test_packet_ring();
 	test_tun();
 	test_tun_mq();

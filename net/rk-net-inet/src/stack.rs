@@ -10,7 +10,7 @@ use crate::ipv4::{
     self, Addr, HLEN, Header, PROTO_ICMP, PROTO_TCP, PROTO_UDP, UDP_HLEN, UdpHeader,
 };
 use crate::ports::{self, Ports};
-use crate::socket::{Dgram, Proto};
+use crate::socket::{Dgram, IcmpError, Info6, Proto};
 use crate::{checksum, frag, igmp, neigh, route};
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::{ETH_P_ARP, ETH_P_IP, ETH_P_IPV6};
-use rk_abi::native::rtnetlink::RT_SCOPE_LINK;
+use rk_abi::native::rtnetlink::{RT_SCOPE_LINK, RT_SCOPE_UNIVERSE};
 use rk_abi::native::socket::SO_BINDTOIFINDEX;
 use rk_frame::sync::SpinLock;
 use rk_net::arp::ArpPacket;
@@ -790,9 +790,10 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
         (h, frame)
     };
     let dif = dif_of(dev);
+    let info = Info6::of4(&h, dev.ifindex(), spec_dst(dev, &h, local && !broadcast && !mcast));
     let raw = raw_sockets(AF_INET, h.protocol);
     for sock in &raw {
-        sock.deliver_raw(&h, frame.data(), dif);
+        sock.deliver_raw(&h, frame.data(), dif, info);
     }
     let packet = frame.data();
     let payload = &packet[h.hlen..];
@@ -805,8 +806,8 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
     }
     let broadcast = broadcast || mcast;
     match h.protocol {
-        PROTO_ICMP => icmp_input(dev, &h, payload, broadcast),
-        PROTO_UDP => udp_input(&h, packet, broadcast, dif),
+        PROTO_ICMP => icmp_input(dev, &h, payload, broadcast, info),
+        PROTO_UDP => udp_input(&h, packet, broadcast, dif, info),
         PROTO_TCP => {
             crate::tcp::input(ip::mapped(h.src), ip::mapped(h.dst), payload, broadcast, dif);
         }
@@ -869,7 +870,7 @@ fn icmp_errno(kind: u8, code: u8) -> (Errno, bool) {
 
 /// Takes an ICMP message, as `icmp_rcv` of Linux. `broadcast` tells that the packet went to a
 /// broadcast address or to a multicast group.
-fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], broadcast: bool) {
+fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], broadcast: bool, info: Info6) {
     count(&COUNTERS.icmp_in);
     if msg.len() < 8 {
         return count(&COUNTERS.icmp_in_errors);
@@ -909,37 +910,46 @@ fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], broadcast: bool) {
             let id = u16::from_be_bytes([msg[4], msg[5]]);
             let (dst, src) = (ip::mapped(h.dst), ip::mapped(h.src));
             if let Some(sock) = find_socket(&PING_PORTS, id, dst, src, 0, dif_of(dev)) {
-                sock.deliver(ip::mapped(h.src), 0, 0, msg.to_vec(), None);
+                sock.deliver(ip::mapped(h.src), 0, 0, msg.to_vec(), Some(info));
             }
         }
         ICMP_DEST_UNREACH | ICMP_TIME_EXCEEDED | ICMP_PARAMETERPROB => {
-            icmp_unreach(msg[0], msg[1], &msg[8..], dif_of(dev));
+            icmp_unreach(msg, dif_of(dev), ip::mapped(h.src), info);
         }
         _ => {}
     }
 }
 
-/// Gives the error of an ICMP error message to the socket of the packet in it, as `udp_err`
-/// and `ping_err` of Linux. `inner` is the start of the packet that failed, and the message
-/// came in on `dif`.
-fn icmp_unreach(kind: u8, code: u8, inner: &[u8], dif: u32) {
+/// Gives the error of the ICMP error message `msg` to the socket of the packet in it, as
+/// `udp_err` and `ping_err` of Linux. The message came in on `dif` from `from`, and `pkt` has
+/// its IP header. The error queue gets the data after the UDP header, or the ICMP echo request.
+/// The information is the MTU of `ICMP_FRAG_NEEDED` or the pointer of `ICMP_PARAMETERPROB`.
+fn icmp_unreach(msg: &[u8], dif: u32, from: Ip, pkt: Info6) {
+    let (kind, code, inner) = (msg[0], msg[1], &msg[8..]);
     let Some(ih) = Header::parse_loose(inner) else { return };
     let Some(l4) = inner.get(ih.hlen..ih.hlen + 8) else { return };
     let (err, hard) = icmp_errno(kind, code);
-    let sock = match ih.protocol {
+    let (dst, src) = (ip::mapped(ih.dst), ip::mapped(ih.src));
+    let (sock, port, payload) = match ih.protocol {
         PROTO_UDP => {
             let sport = u16::from_be_bytes([l4[0], l4[1]]);
             let dport = u16::from_be_bytes([l4[2], l4[3]]);
-            find_socket(&UDP_PORTS, sport, ip::mapped(ih.src), ip::mapped(ih.dst), dport, dif)
+            (find_socket(&UDP_PORTS, sport, src, dst, dport, dif), dport, &inner[ih.hlen + 8..])
         }
         PROTO_ICMP if l4[0] == ICMP_ECHO => {
             let id = u16::from_be_bytes([l4[4], l4[5]]);
-            find_socket(&PING_PORTS, id, ip::mapped(ih.src), ip::mapped(ih.dst), 0, dif)
+            (find_socket(&PING_PORTS, id, src, dst, 0, dif), 0, &inner[ih.hlen..])
         }
-        _ => None,
+        _ => return,
+    };
+    let info = match (kind, code) {
+        (ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED) => u32::from(u16::from_be_bytes([msg[6], msg[7]])),
+        (ICMP_PARAMETERPROB, _) => u32::from(msg[4]),
+        _ => 0,
     };
     if let Some(sock) = sock {
-        sock.icmp_error(err, hard, ip::mapped(ih.dst));
+        let payload = payload.to_vec();
+        sock.icmp_error(IcmpError { err, hard, dst, port, kind, code, info, from, pkt, payload });
     }
 }
 
@@ -1008,9 +1018,20 @@ pub(crate) fn icmp_send(h: &Header, packet: &[u8], kind: u8, code: u8, info: u32
     send_icmp(src, h.src, h.tos, &msg);
 }
 
+/// Gives the local address for a reply to the packet `h` that came in on `dev`, the
+/// `ipi_spec_dst` of `IP_PKTINFO`, as `fib_compute_spec_dst` of Linux: the destination of a
+/// packet to a local unicast address, else an address of the device.
+fn spec_dst(dev: &NetDevice, h: &Header, unicast: bool) -> Addr {
+    if unicast {
+        return h.dst;
+    }
+    let scope = if h.src == ipv4::ANY { RT_SCOPE_LINK } else { RT_SCOPE_UNIVERSE } as u8;
+    ROUTES.lock().select_addr(dev.ifindex(), h.src, scope).unwrap_or(ipv4::ANY)
+}
+
 /// Takes a UDP datagram, as `udp_rcv` of Linux. `packet` has the IPv4 header, and it came in
-/// on `dif`.
-fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32) {
+/// on `dif`. `info` is for the control messages.
+fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32, info: Info6) {
     let d = &packet[h.hlen..];
     let Some(u) = UdpHeader::parse(d) else { return count(&COUNTERS.udp_in_errors) };
     let d = &d[..usize::from(u.len)];
@@ -1022,7 +1043,7 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32) {
     }
     let (dst, src) = (ip::mapped(h.dst), ip::mapped(h.src));
     if broadcast {
-        return udp_mcast_input(h, &d[UDP_HLEN..], u.src, u.dst, dif);
+        return udp_mcast_input(h, &d[UDP_HLEN..], u.src, u.dst, dif, info);
     }
     let found = find_socket(&UDP_PORTS, u.dst, dst, src, u.src, dif);
     let Some(sock) = found else {
@@ -1032,7 +1053,7 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32) {
         }
         return;
     };
-    if sock.deliver(ip::mapped(h.src), 0, u.src, d[UDP_HLEN..].to_vec(), None) {
+    if sock.deliver(ip::mapped(h.src), 0, u.src, d[UDP_HLEN..].to_vec(), Some(info)) {
         count(&COUNTERS.udp_in);
     } else {
         count(&COUNTERS.udp_rcvbuf_errors);
@@ -1042,7 +1063,7 @@ fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32) {
 /// Gives a UDP datagram to a broadcast address or a multicast group to each socket that takes
 /// it, as `__udp4_lib_mcast_deliver` of Linux. A socket takes a datagram to a group if it is in
 /// the group on the device or if it has `IP_MULTICAST_ALL`, as `ip_mc_sf_allow`.
-fn udp_mcast_input(h: &Header, data: &[u8], sport: u16, dport: u16, dif: u32) {
+fn udp_mcast_input(h: &Header, data: &[u8], sport: u16, dport: u16, dif: u32, info: Info6) {
     let (dst, src) = (ip::mapped(h.dst), ip::mapped(h.src));
     let found = UDP_PORTS.lock().find(dport, dst);
     let socks: Vec<Arc<Dgram>> = found
@@ -1054,7 +1075,7 @@ fn udp_mcast_input(h: &Header, data: &[u8], sport: u16, dport: u16, dif: u32) {
         return count(&COUNTERS.udp_no_ports);
     }
     for sock in socks {
-        if sock.deliver(src, 0, sport, data.to_vec(), None) {
+        if sock.deliver(src, 0, sport, data.to_vec(), Some(info)) {
             count(&COUNTERS.udp_in);
         } else {
             count(&COUNTERS.udp_rcvbuf_errors);

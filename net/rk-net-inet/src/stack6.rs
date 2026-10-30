@@ -22,7 +22,7 @@ use crate::ipv6::{
 };
 use crate::route::INFINITY;
 use crate::route6::{Next6, PRIO_ADDRCONF, Route6, Table6};
-use crate::socket::Info6;
+use crate::socket::{IcmpError, Info6};
 use crate::stack::{self, PING_PORTS, UDP_PORTS, count, icmp_types, now_ms};
 use crate::{addrconf, checksum, frag, mcast6, neigh};
 use alloc::boxed::Box;
@@ -937,7 +937,7 @@ fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], mcast: bool) {
             }
         }
         DEST_UNREACH | PKT_TOOBIG | TIME_EXCEED | PARAMPROB if msg.len() >= 8 => {
-            error_input(msg[0], msg[1], &msg[8..]);
+            error_input(msg, h.src, Info6::of(h, ifindex));
         }
         NDISC_NEIGHBOUR_SOLICITATION => ndisc_ns(dev, h, msg),
         NDISC_NEIGHBOUR_ADVERTISEMENT => ndisc_na(dev, h, msg),
@@ -947,26 +947,32 @@ fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], mcast: bool) {
     }
 }
 
-/// Gives the error of an ICMPv6 error message to the socket of the packet in it, as
-/// `__udp6_lib_err` and `ping_err` of Linux. `inner` is the start of the packet that failed.
-fn error_input(kind: u8, code: u8, inner: &[u8]) {
+/// Gives the error of the ICMPv6 error message `msg` from `from` to the socket of the packet in
+/// it, as `__udp6_lib_err` and `ping_err` of Linux. `pkt` has the IPv6 header of the message.
+/// The error queue gets the data after the UDP header, or the echo request, and the
+/// information of the message: the MTU or the pointer, as `ipv6_icmp_error`.
+fn error_input(msg: &[u8], from: Ip, pkt: Info6) {
+    let (kind, code, inner) = (msg[0], msg[1], &msg[8..]);
     let Some(ih) = Header::parse_loose(inner) else { return };
     let Some(l4) = inner.get(ih.l4..ih.l4 + 8) else { return };
     let (err, hard) = icmp_errno(kind, code);
-    let sock = match ih.protocol {
+    let (sock, port, payload) = match ih.protocol {
         PROTO_UDP => {
             let sport = u16::from_be_bytes([l4[0], l4[1]]);
             let dport = u16::from_be_bytes([l4[2], l4[3]]);
-            stack::find_socket(&UDP_PORTS, sport, ih.src, ih.dst, dport, 0)
+            let sock = stack::find_socket(&UDP_PORTS, sport, ih.src, ih.dst, dport, 0);
+            (sock, dport, &inner[ih.l4 + 8..])
         }
         PROTO_ICMPV6 if l4[0] == ECHO_REQUEST => {
             let id = u16::from_be_bytes([l4[4], l4[5]]);
-            stack::find_socket(&PING_PORTS, id, ih.src, ih.dst, 0, 0)
+            (stack::find_socket(&PING_PORTS, id, ih.src, ih.dst, 0, 0), 0, &inner[ih.l4..])
         }
-        _ => None,
+        _ => return,
     };
+    let info = u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]);
     if let Some(sock) = sock {
-        sock.icmp_error(err, hard, ih.dst);
+        let (dst, payload) = (ih.dst, payload.to_vec());
+        sock.icmp_error(IcmpError { err, hard, dst, port, kind, code, info, from, pkt, payload });
     }
 }
 

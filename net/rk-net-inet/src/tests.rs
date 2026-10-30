@@ -17,8 +17,8 @@ use rk_abi::native::rtnetlink::{
     RTN_LOCAL, RTN_UNICAST, RTPROT_KERNEL,
 };
 use rk_net::consts::{
-    ICMP_ECHO, ICMP_ECHOREPLY, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET,
-    SOCK_STREAM,
+    ICMP_DEST_UNREACH, ICMP_ECHO, ICMP_ECHOREPLY, ICMP_PORT_UNREACH, MSG_ERRQUEUE, MSG_PEEK,
+    MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM,
 };
 use rk_net::ether::MacAddr;
 use rk_net::{Message, NoPaths, Socket};
@@ -221,6 +221,17 @@ fn ports_run_out() {
         p.bind(0, Binding::v4(ipv4::ANY, false, id)).unwrap();
     }
     assert_eq!(p.bind(0, Binding::v4(ipv4::ANY, false, 9)), Err(Errno::EADDRINUSE));
+}
+
+#[test]
+fn ports_skip_the_reserved_ports() {
+    rk_net::sysctl::write("ipv4/ip_local_reserved_ports", b"200-201").unwrap();
+    let mut p = Ports::new(200..=202);
+    assert_eq!(p.bind(0, Binding::v4(ipv4::ANY, false, 1)), Ok(202));
+    assert_eq!(p.bind(0, Binding::v4(ipv4::ANY, false, 2)), Err(Errno::EADDRINUSE));
+    // A bind to a reserved port by its number works, as Linux.
+    assert_eq!(p.bind(200, Binding::v4(ipv4::ANY, false, 3)), Ok(200));
+    rk_net::sysctl::write("ipv4/ip_local_reserved_ports", b"").unwrap();
 }
 
 const LO: Link = Link { ifindex: 1, up: true, loopback: true };
@@ -452,6 +463,20 @@ fn ipv6_raw_checksum_option() {
     assert_eq!(udp.set_option(SOL_RAW, IPV6_CHECKSUM, &int(2)), Err(Errno::ENOPROTOOPT));
 }
 
+/// `IPV6_PKTINFO` takes a `struct in6_pktinfo` of 20 bytes, as `do_ipv6_setsockopt` of Linux.
+/// The ping of iputils sets it for `-I`.
+#[test]
+fn ipv6_sticky_pktinfo() {
+    use rk_abi::native::in6::IPV6_PKTINFO;
+    use rk_abi::native::inet::IPPROTO_IPV6;
+    let mut info = [0u8; 20];
+    info[16..20].copy_from_slice(&1u32.to_ne_bytes());
+    for s in [Dgram::new6(Proto::Raw(58)), Dgram::new6(Proto::Udp)] {
+        assert_eq!(s.set_option(IPPROTO_IPV6, IPV6_PKTINFO, &info[..19]), Err(Errno::EINVAL));
+        assert_eq!(s.set_option(IPPROTO_IPV6, IPV6_PKTINFO, &info), Ok(()));
+    }
+}
+
 fn send(s: &Dgram, to: Option<([u8; 4], u16)>, data: &[u8]) -> Result<usize, Errno> {
     let msg = Message {
         data: data.to_vec(),
@@ -486,7 +511,40 @@ fn loopback_sockets() {
     assert_eq!(r.data, b"hello");
     let bport = sockaddr::parse_bind(&b.name()).unwrap().1;
     assert_eq!(r.addr, Some(sockaddr::make(lo, bport)));
+    assert!(r.control.is_empty());
     assert_eq!(a.recv(100, 0, true).err(), Some(Errno::EAGAIN));
+
+    // The control messages of `IP_PKTINFO`, `IP_RECVTTL` and `IP_RECVTOS`, in the order of
+    // `ip_cmsg_recv_offset` of Linux.
+    {
+        use rk_abi::native::inet::{
+            IP_PKTINFO, IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IPPROTO_IP,
+        };
+        let int = |v: i32| v.to_ne_bytes().to_vec();
+        for name in [IP_RECVTOS, IP_RECVTTL, IP_PKTINFO] {
+            assert_eq!(a.get_option(IPPROTO_IP, name), Ok(int(0)));
+            a.set_option(IPPROTO_IP, name, &int(1)).unwrap();
+            assert_eq!(a.get_option(IPPROTO_IP, name), Ok(int(1)));
+        }
+        b.set_option(IPPROTO_IP, IP_TOS, &int(0x10)).unwrap();
+        send(&b, Some((lo, port)), b"cm").unwrap();
+        let r = a.recv(100, 0, true).unwrap();
+        // `struct in_pktinfo`: the loopback device, `ipi_spec_dst` and the destination.
+        let mut info = 1u32.to_ne_bytes().to_vec();
+        info.extend_from_slice(&lo);
+        info.extend_from_slice(&lo);
+        let ttl = int(i32::from(rk_net::sysctl::default_ttl()));
+        let want = [
+            (IPPROTO_IP, IP_PKTINFO, info),
+            (IPPROTO_IP, IP_TTL, ttl),
+            (IPPROTO_IP, IP_TOS, vec![0x10]),
+        ];
+        assert_eq!(r.control, want);
+        for name in [IP_RECVTOS, IP_RECVTTL, IP_PKTINFO] {
+            a.set_option(IPPROTO_IP, name, &int(0)).unwrap();
+        }
+        b.set_option(IPPROTO_IP, IP_TOS, &int(0)).unwrap();
+    }
 
     // A connected socket takes only the datagrams of its peer.
     a.connect(&NoPaths, &sockaddr::make(lo, bport), true).unwrap();
@@ -504,6 +562,36 @@ fn loopback_sockets() {
     assert_eq!(send(&d, None, b"lost"), Ok(4));
     assert_eq!(d.recv(100, 0, true).err(), Some(Errno::ECONNREFUSED));
     assert_eq!(d.recv(100, 0, true).err(), Some(Errno::EAGAIN));
+    assert_eq!(d.recv(100, MSG_ERRQUEUE, true).err(), Some(Errno::EAGAIN));
+
+    // With `IP_RECVERR`, an unconnected socket gets the error too, and the error queue keeps
+    // the data, the destination and a `struct sock_extended_err` with the offender, as
+    // `ip_icmp_error` and `ip_recv_error` of Linux. `IP_RECVTTL` gives the TTL of the ICMP
+    // message first.
+    {
+        use rk_abi::native::inet::{IP_RECVERR, IP_RECVTTL, IP_TTL, IPPROTO_IP};
+        use rk_abi::native::poll::POLLERR;
+        let int = |v: i32| v.to_ne_bytes().to_vec();
+        let f = Dgram::new(Proto::Udp);
+        f.set_option(IPPROTO_IP, IP_RECVERR, &int(1)).unwrap();
+        f.set_option(IPPROTO_IP, IP_RECVTTL, &int(1)).unwrap();
+        assert_eq!(send(&f, Some((lo, 9)), b"probe"), Ok(5));
+        assert_ne!(f.poll() & POLLERR, 0);
+        assert_eq!(f.recv(100, 0, true).err(), Some(Errno::ECONNREFUSED));
+        assert_ne!(f.poll() & POLLERR, 0);
+        let r = f.recv(3, MSG_ERRQUEUE, true).unwrap();
+        assert_eq!((r.data.as_slice(), r.len), (&b"pro"[..], 5));
+        assert_eq!(r.flags, MSG_ERRQUEUE | MSG_TRUNC);
+        assert_eq!(r.addr, Some(sockaddr::make(lo, 9)));
+        let mut ee = (Errno::ECONNREFUSED.get() as u32).to_ne_bytes().to_vec();
+        ee.extend_from_slice(&[2, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0]);
+        ee.extend_from_slice(&[0; 8]);
+        ee.extend_from_slice(&sockaddr::make(lo, 0));
+        let ttl = int(i32::from(rk_net::sysctl::default_ttl()));
+        assert_eq!(r.control, [(IPPROTO_IP, IP_TTL, ttl), (IPPROTO_IP, IP_RECVERR, ee)]);
+        assert_eq!(f.recv(100, MSG_ERRQUEUE, true).err(), Some(Errno::EAGAIN));
+        assert_eq!(f.poll() & POLLERR, 0);
+    }
 
     // A closed socket frees its port.
     a.release();
@@ -941,6 +1029,31 @@ fn ipv6_loopback() {
     let hops = int(i32::from(ipv6::DEFAULT_HOPS));
     let want = [(IPPROTO_IPV6, IPV6_PKTINFO, info), (IPPROTO_IPV6, IPV6_HOPLIMIT, hops)];
     assert_eq!(r.control, want);
+    // `IPV6_PKTINFO` in the control messages of a send sets the interface and the source, as
+    // `ip6_datagram_send_ctl` of Linux. The DHCPv6 server of ISC sends its replies so.
+    let pkt = |a: &Ip, ifindex: u32| {
+        let mut v = a.to_vec();
+        v.extend_from_slice(&ifindex.to_ne_bytes());
+        Message {
+            data: b"pi".to_vec(),
+            addr: Some(make(&lo, port)),
+            control: vec![(IPPROTO_IPV6, IPV6_PKTINFO, v)],
+            ..Message::default()
+        }
+    };
+    let short = Message { control: vec![(IPPROTO_IPV6, IPV6_PKTINFO, vec![0; 19])], ..pkt(&lo, 0) };
+    assert_eq!(b.send(&NoPaths, short, 0, true), Err(Errno::EINVAL));
+    assert_eq!(b.send(&NoPaths, pkt(&ip::ANY, 99), 0, true), Err(Errno::ENODEV));
+    let mut link = [0u8; 16];
+    link[..2].copy_from_slice(&[0xfe, 0x80]);
+    link[15] = 1;
+    assert_eq!(b.send(&NoPaths, pkt(&link, 0), 0, true), Err(Errno::EINVAL));
+    let mut other = lo;
+    other[0] = 0x20;
+    assert_eq!(b.send(&NoPaths, pkt(&other, 0), 0, true), Err(Errno::EINVAL));
+    assert_eq!(b.send(&NoPaths, pkt(&lo, 1), 0, true), Ok(2));
+    let r = a.recv(100, 0, true).unwrap();
+    assert_eq!((r.data, r.addr.map(|a| name(&a).0)), (b"pi".to_vec(), Some(lo)));
 
     // A dual stack socket on `::` takes IPv4 datagrams with a mapped source.
     let d = Dgram::new6(Proto::Udp);
