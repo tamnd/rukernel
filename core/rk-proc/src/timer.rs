@@ -175,21 +175,6 @@ impl Timer {
         abs: bool,
         late: u64,
     ) -> (u64, u64) {
-        if self.info.code == crate::signal::SI_TIMER {
-            match &self.target {
-                Target::Process(p) => {
-                    if let Some(p) = p.upgrade() {
-                        crate::process::discard_timer_signal(&p, None, self.info.pid);
-                    }
-                }
-                Target::Thread(t) => {
-                    if let Some(t) = t.upgrade() {
-                        crate::process::discard_timer_signal(t.process(), Some(&t), self.info.pid);
-                    }
-                }
-                Target::None | Target::Notify(_) => {}
-            }
-        }
         let now = self.now();
         let mut s = self.state.lock();
         let old = s.remaining(now);
@@ -217,6 +202,26 @@ impl Timer {
             EPOCH.fetch_add(1, Ordering::Release);
             WAKE.wake_all();
         }
+        drop(s);
+        // The signal of the old setting goes after the change of the state. `fire` sends a signal
+        // with the lock of the state held, so after this point no signal of the old setting can
+        // come. Before, a timer that fired between the discard and the change left a signal of
+        // the old setting pending.
+        if self.info.code == crate::signal::SI_TIMER {
+            match &self.target {
+                Target::Process(p) => {
+                    if let Some(p) = p.upgrade() {
+                        crate::process::discard_timer_signal(&p, None, self.info.pid);
+                    }
+                }
+                Target::Thread(t) => {
+                    if let Some(t) = t.upgrade() {
+                        crate::process::discard_timer_signal(t.process(), Some(&t), self.info.pid);
+                    }
+                }
+                Target::None | Target::Notify(_) => {}
+            }
+        }
         old
     }
 
@@ -240,8 +245,8 @@ impl Timer {
     /// the queue if it has an interval. `key` is the key in the queue of the timer task, or
     /// `None` for a timer on a CPU clock.
     fn fire(self: &Arc<Self>, key: Option<(u64, u64)>, now: u64) {
+        let mut s = self.state.lock();
         let missed = {
-            let mut s = self.state.lock();
             if s.key != key || s.expires == 0 || now < s.expires {
                 return;
             }
@@ -268,6 +273,8 @@ impl Timer {
         // The count saturates at `INT_MAX`, as `timer_overrun_to_int` in
         // kernel/time/posix-timers.c of Linux.
         info.uid = missed.min(i32::MAX as u64) as u32;
+        // A signal goes with the lock of the state held, so that `arm` discards it or it does not
+        // come. The lock of the state comes before the locks of the signals.
         match &self.target {
             Target::Process(p) => {
                 if let Some(p) = p.upgrade() {
@@ -281,6 +288,7 @@ impl Timer {
             }
             Target::None => {}
             Target::Notify(n) => {
+                drop(s);
                 if let Some(n) = n.upgrade() {
                     n.expire(missed + 1);
                 }
