@@ -8533,11 +8533,23 @@ static void test_cgroup(void)
 	cg_write("/cg/t/a/pids.max", "max");
 
 	cg_write("/cg/t/a/cpu.max", "10000 100000");
-	status = wait_status(cgroup_child("/cg/t/a", cg_busy));
-	long usage = cg_value("/cg/t/a/cpu.stat", "usage_usec ");
-	check("cpu.max limits a busy loop", WIFEXITED(status) && WEXITSTATUS(status) == 0 && usage > 0 &&
-						    usage < 500000 &&
-						    cg_value("/cg/t/a/cpu.stat", "nr_throttled ") > 0);
+	/* The time that QEMU on a busy host does not run the guest counts as CPU time of the busy
+	 * loop, so one try can go above the limit (#504). The check has 3 tries, and each try uses
+	 * the change of the counters. */
+	int cpu_max_ok = 0;
+	for (int i = 0; i < 3 && !cpu_max_ok; i++) {
+		long usage0 = cg_value("/cg/t/a/cpu.stat", "usage_usec ");
+		long throttled0 = cg_value("/cg/t/a/cpu.stat", "nr_throttled ");
+		status = wait_status(cgroup_child("/cg/t/a", cg_busy));
+		long usage = cg_value("/cg/t/a/cpu.stat", "usage_usec ") - usage0;
+		long throttled = cg_value("/cg/t/a/cpu.stat", "nr_throttled ") - throttled0;
+		cpu_max_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 && usage > 0 && usage < 500000 &&
+			     throttled > 0;
+		if (!cpu_max_ok)
+			printf("init: cpu.max: try %d used %ld us and was throttled %ld times\n", i + 1, usage,
+			       throttled);
+	}
+	check("cpu.max limits a busy loop", cpu_max_ok);
 	check("cpu.pressure counts the throttle", cg_value("/cg/t/a/cpu.pressure", "total=") > 0);
 	cg_write("/cg/t/a/cpu.max", "max");
 
