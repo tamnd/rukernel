@@ -10,6 +10,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A create or a lookup in a directory removes the cached names that no one uses only when the cache is twice the size that stayed after the last removal, and not at each insert (#475). Before, each insert examined each name in use, and the events of a fanotify group keep the names of their files in use, so the creates of fanotify05 of LTP took a time for each file that the queue held. init examines a directory with 600 open files and 600 closed files.
 - tools/ltp/run.py gives fork13 720 s, because the test forks for 600 s (`.runtime = 600`), and gives hackbench01 900 s, because its 20 M messages took 554 s under QEMU without KVM (#475).
 - The child cache of an overlay directory removes the nodes that no one uses only when its size doubles, and not on each insert, as the dentry cache after #505 (#504). Many nodes in use made each lookup in the directory slow.
+- The check "cpu.max limits a busy loop" of `init` has 3 tries, and each try uses the change of the counters of `cpu.stat` (#504). On a busy host, the time that QEMU does not run the guest counts as CPU time of the busy loop, so one try could go above the limit of 500 ms. A try that fails prints the time and the count of throttles.
 
 ## [0.4.17] - 2026-10-30
 
