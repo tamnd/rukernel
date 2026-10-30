@@ -47,7 +47,18 @@ pub struct Dentry {
     /// lookup that did not find a child in the cache adds the inode that the file system gave
     /// only if no change came in the meantime, as the `d_seq` checks of fs/dcache.c of Linux.
     seq: AtomicU64,
+    /// The size of `children` at which the next insert removes the children that no one uses.
+    /// It is twice the count of the children that stayed after the last removal, so the
+    /// removals take a fixed mean time for each insert. A removal on each insert takes a time
+    /// for each live child, and many live children (for example the files that the events of
+    /// a fanotify group hold) make each create slow. It changes with the lock of `children`
+    /// held.
+    prune_at: AtomicUsize,
 }
+
+/// The smallest size of the cache of the children of a dentry at which an insert removes the
+/// children that no one uses.
+const PRUNE_MIN: usize = 32;
 
 /// A lock that a task can hold while it blocks, as `inode_lock` of a directory in Linux. The
 /// operations of a file system can wait for a block device with the lock held, so it is not a
@@ -117,6 +128,7 @@ impl Dentry {
             lock: DirLock::new(),
             dead: AtomicBool::new(false),
             seq: AtomicU64::new(0),
+            prune_at: AtomicUsize::new(PRUNE_MIN),
         })
     }
 
@@ -158,8 +170,7 @@ impl Dentry {
             }
             if self.seq.load(Ordering::Relaxed) == seq {
                 let child = self.new_child(name, inode);
-                children.retain(|_, c| c.strong_count() > 0);
-                children.insert(name.to_vec(), Arc::downgrade(&child));
+                self.cache(&mut children, name, &child);
                 return Ok(child);
             }
         }
@@ -175,10 +186,25 @@ impl Dentry {
             return child;
         }
         let child = self.new_child(name, inode);
-        children.retain(|_, c| c.strong_count() > 0);
-        children.insert(name.to_vec(), Arc::downgrade(&child));
+        self.cache(&mut children, name, &child);
         self.seq.fetch_add(1, Ordering::Relaxed);
         child
+    }
+
+    /// Puts `child` in the cache `children` of `self` as `name`. When the cache is at the size
+    /// `prune_at`, it first removes the children that no one uses.
+    fn cache(
+        &self,
+        children: &mut BTreeMap<Vec<u8>, Weak<Dentry>>,
+        name: &[u8],
+        child: &Arc<Dentry>,
+    ) {
+        if children.len() >= self.prune_at.load(Ordering::Relaxed) {
+            children.retain(|_, c| c.strong_count() > 0);
+            let at = (children.len() * 2).max(PRUNE_MIN);
+            self.prune_at.store(at, Ordering::Relaxed);
+        }
+        children.insert(name.to_vec(), Arc::downgrade(child));
     }
 
     /// Makes a dentry for the child `name` with the inode `inode`.
@@ -193,6 +219,7 @@ impl Dentry {
             lock: DirLock::new(),
             dead: AtomicBool::new(false),
             seq: AtomicU64::new(0),
+            prune_at: AtomicUsize::new(PRUNE_MIN),
         })
     }
 
@@ -228,6 +255,7 @@ impl Dentry {
             lock: DirLock::new(),
             dead: AtomicBool::new(false),
             seq: AtomicU64::new(0),
+            prune_at: AtomicUsize::new(PRUNE_MIN),
         })
     }
 

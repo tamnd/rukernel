@@ -63,6 +63,10 @@ LIMITS = {
     "sctp01_ipv6": 900,
     # Each of the 2 tests of mc_commo waits 100 seconds.
     "mc_commo": 600,
+    # fork13 forks until its runtime of 600 s is over (.runtime = 600).
+    "fork13": 720,
+    # hackbench01 sends 20 M socket messages. It took 554 s under QEMU without KVM.
+    "hackbench01": 900,
     # mc_member sleeps 2 x (20 x 10 s + 60 s).
     "mc_member": 900,
     # The TCP case with -A 65000 runs netstress 5 times with 2000 requests of random sizes up to
