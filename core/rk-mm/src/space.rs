@@ -1125,18 +1125,15 @@ impl AddressSpace {
             frame.read_bytes(0, &mut buf[..PAGE_SIZE]);
             return true;
         }
-        let file = {
-            let st = self.state.lock();
-            let Some(vma) = st.vmas.iter().find(|v| v.start <= page && page < v.end) else {
-                return false;
-            };
-            match &vma.backing {
-                Backing::File { file, offset } if !vma.hugetlb => {
-                    (file.clone(), file_index(vma, *offset, page))
-                }
-                _ => return false,
+        // The CortenMM backend locks only the block of the page, and not the whole space for
+        // each page of the dump.
+        let file = self.with_area(page, |vma| match vma {
+            Some(vma @ Vma { backing: Backing::File { file, offset }, hugetlb: false, .. }) => {
+                Some((file.clone(), file_index(vma, *offset, page)))
             }
-        };
+            _ => None,
+        });
+        let Some(file) = file else { return false };
         match file.0.page(file.1) {
             Ok(frame) => {
                 frame.read_bytes(0, &mut buf[..PAGE_SIZE]);

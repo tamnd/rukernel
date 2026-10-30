@@ -31,7 +31,7 @@ use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The end of the user half of the address space. Each user address is below it.
 pub const USER_END: usize = paging::USER_END;
@@ -173,6 +173,32 @@ struct Block {
     status: StatusTable,
 }
 
+/// The locks of one 2 MiB block. `pages` is the lock of the last level table. `held` is the lock
+/// of the status table for the memory manager: the CortenMM backend holds it for the whole change
+/// of the statuses of the block, or for a whole page fault in the block, as the lock of a page
+/// table page of CortenMM. It is the lock of the node of the lowest level of the tree of statuses
+/// of the backend, so a fault finds it with the walk of the page table, with no lock, and does
+/// not walk the tree. A call takes `held` before `pages`, and it does not wait for `held` while it
+/// holds `pages`.
+struct BlockLock {
+    pages: SpinLock<Block>,
+    held: AtomicBool,
+}
+
+impl Default for BlockLock {
+    fn default() -> Self {
+        Self { pages: SpinLock::new(Block::default()), held: AtomicBool::new(false) }
+    }
+}
+
+impl core::ops::Deref for BlockLock {
+    type Target = SpinLock<Block>;
+
+    fn deref(&self) -> &SpinLock<Block> {
+        &self.pages
+    }
+}
+
 // A block of `VmSpace` is the range of one huge page.
 const _: () = assert!(crate::blocks::BLOCK_SIZE == HUGE_PAGE_SIZE);
 
@@ -232,7 +258,7 @@ pub struct VmSpace {
     /// The physical address of the top level table. It does not change.
     root: u64,
     /// The pages of each block.
-    blocks: BlockTree<SpinLock<Block>>,
+    blocks: BlockTree<BlockLock>,
     /// The number of mapped pages that are not in a huge page.
     small: AtomicUsize,
     /// The number of huge pages.
@@ -249,12 +275,12 @@ impl VmSpace {
 
     /// The lock of the block of `addr`, if the block had a page.
     fn block(&self, addr: usize) -> Option<&SpinLock<Block>> {
-        self.blocks.get(addr)
+        self.blocks.get(addr).map(|b| &b.pages)
     }
 
     /// The lock of the block of `addr`, which is below `USER_END`.
     fn block_or_new(&self, addr: usize) -> &SpinLock<Block> {
-        self.blocks.get_or_make(addr, || SpinLock::new(Block::default()))
+        &self.blocks.get_or_make(addr, BlockLock::default).pages
     }
 
     /// Changes the huge page of the block at `block`, if it has one, to 4 KiB pages.
@@ -396,6 +422,56 @@ impl VmSpace {
         true
     }
 
+    /// Holds the status table of the 2 MiB block of `addr` for the memory manager, and waits
+    /// while another call holds it. Without `make`, it gives `false` with no hold if the block
+    /// has no table yet. The CortenMM backend holds the table while it reads or changes the
+    /// statuses of the block, and for a whole page fault in the block. The holder takes no other
+    /// hold of a status table while it waits for this one, except as the tree of the backend
+    /// allows (core/rk-mm/src/pttree.rs).
+    ///
+    /// # Panics
+    ///
+    /// If `make` is set and `addr` is not below `USER_END`.
+    pub fn hold_status(&self, addr: VirtAddr, make: bool) -> bool {
+        let lock = if make {
+            self.blocks.get_or_make(addr.get(), BlockLock::default)
+        } else {
+            match self.blocks.get(addr.get()) {
+                Some(lock) => lock,
+                None => return false,
+            }
+        };
+        while lock
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // The holder can wait for a TLB request of this CPU.
+            while lock.held.load(Ordering::Relaxed) {
+                crate::sync::wait_hint();
+            }
+        }
+        true
+    }
+
+    /// Holds the status table of the block of `addr` as `hold_status` with `make`, if no other
+    /// call holds it. Gives `false` with no hold if one does.
+    ///
+    /// # Panics
+    ///
+    /// If `addr` is not below `USER_END`.
+    pub fn try_hold_status(&self, addr: VirtAddr) -> bool {
+        let lock = self.blocks.get_or_make(addr.get(), BlockLock::default);
+        lock.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+
+    /// Ends the hold of the status table of the block of `addr`, which the caller holds.
+    pub fn release_status(&self, addr: VirtAddr) {
+        if let Some(lock) = self.blocks.get(addr.get()) {
+            lock.held.store(false, Ordering::Release);
+        }
+    }
+
     /// Gives the status of the page at `addr`.
     pub fn status(&self, addr: VirtAddr) -> Option<PageStatus> {
         let a = addr.get();
@@ -413,7 +489,7 @@ impl VmSpace {
         };
         if status.is_none() {
             let _ = self.blocks.each(start, end, |block, lock| {
-                set(block, lock);
+                set(block, &lock.pages);
                 Ok::<(), ()>(())
             });
             return;

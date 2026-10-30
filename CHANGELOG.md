@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- With the `corten` backend, a page fault does not walk the tree of statuses when the status table of the 2 MiB block has the status of the page (#405). The lock of the lowest tree node is now a flag next to the status table, so the fault takes only this flag. An `mmap` or `mprotect` reads the statuses next to the range from the locked range, and does not walk the tree a second time. A core dump finds the area of a page with no frame with a lock of the block of the page only. Before, it locked the whole space and made each area for each such page, so each core dump of the `smp` boot test took 36 to 65 s on a busy host, and the test went past its limit of 600 s. Now a dump takes about 2 s, and the test takes about 300 s.
+
 ## [0.4.19] - 2026-10-30
 
 ### Fixed

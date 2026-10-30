@@ -15,7 +15,10 @@
 //!
 //! Each node has its own lock. A [`RangeLock`] locks the lowest node that covers a range, and
 //! each node below it in the range. Thus two operations on ranges in different nodes do not wait
-//! for each other: a page fault locks one node of the lowest level, which covers 2 MiB.
+//! for each other: a page fault locks one node of the lowest level, which covers 2 MiB. The lock
+//! of a node of the lowest level is the lock of the 2 MiB block in [`Leaves`], next to the
+//! statuses of the block, as CortenMM locks the page table page that keeps the statuses. Thus a
+//! page fault can lock the block with the walk of the page table, and not walk this tree.
 //!
 //! A lock goes down from the root with no lock, as the RCU walk of CortenMM, to the lowest node
 //! that covers the range, and then locks that node and each node below it in the range. Thus an
@@ -104,6 +107,16 @@ pub trait Leaves<S> {
 
     /// Tells if no page of the 2 MiB block at `base` has a status.
     fn is_empty(&self, base: usize) -> bool;
+
+    /// Takes the lock of the 2 MiB block at `base`, which is the lock of its node of the lowest
+    /// level, and waits while another call holds it.
+    fn lock(&self, base: usize);
+
+    /// Takes the lock of the block at `base` if no other call holds it. Gives `false` if one does.
+    fn try_lock(&self, base: usize) -> bool;
+
+    /// Releases the lock of the block at `base`.
+    fn unlock(&self, base: usize);
 }
 
 /// The slots in one chunk of [`Slots`].
@@ -152,7 +165,9 @@ struct Node<S> {
     level: u32,
     /// The first address of the node.
     base: usize,
-    /// The lock of the node. Only the holder changes `slots`.
+    /// The lock of the node. Only the holder changes `slots`. A node of the lowest level uses the
+    /// lock of its block in [`Leaves`], so two nodes of one block, a dead one and a live one, have
+    /// one lock.
     busy: AtomicBool,
     /// The node is not in the tree now. Only the holder sets it.
     dead: AtomicBool,
@@ -163,9 +178,19 @@ struct Node<S> {
 
 impl<S: Clone> Node<S> {
     /// Makes a node with each slot a copy of `fill`. The caller holds the new node. A node of the
-    /// lowest level has no slots, and its pages get the status of `fill` in `leaves`.
-    fn new_held(level: u32, base: usize, fill: &Slot<S>, leaves: &impl Leaves<S>) -> Self {
+    /// lowest level has no slots, and its pages get the status of `fill` in `leaves`. Its lock is
+    /// the lock of its block, which this takes, or which the caller holds already with `locked`.
+    fn new_held(
+        level: u32,
+        base: usize,
+        fill: &Slot<S>,
+        leaves: &impl Leaves<S>,
+        locked: bool,
+    ) -> Self {
         let slots = if level == 1 {
+            if !locked {
+                leaves.lock(base);
+            }
             if let Some(s) = fill.status() {
                 leaves.set(base, base + slot_size(2), Some(s));
             }
@@ -184,7 +209,10 @@ impl<S: Clone> Node<S> {
 }
 
 impl<S> Node<S> {
-    fn acquire(&self) {
+    fn acquire(&self, leaves: &impl Leaves<S>) {
+        if self.level == 1 {
+            return leaves.lock(self.base);
+        }
         while self
             .busy
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -197,19 +225,25 @@ impl<S> Node<S> {
         }
     }
 
-    fn try_acquire(&self) -> bool {
+    fn try_acquire(&self, leaves: &impl Leaves<S>) -> bool {
+        if self.level == 1 {
+            return leaves.try_lock(self.base);
+        }
         self.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
 
-    fn release(&self) {
+    fn release(&self, leaves: &impl Leaves<S>) {
+        if self.level == 1 {
+            return leaves.unlock(self.base);
+        }
         self.busy.store(false, Ordering::Release);
     }
 
     /// Locks the node, and gives `false` with no lock if the node is dead.
-    fn acquire_live(&self) -> bool {
-        self.acquire();
+    fn acquire_live(&self, leaves: &impl Leaves<S>) -> bool {
+        self.acquire(leaves);
         if self.dead.load(Ordering::Relaxed) {
-            self.release();
+            self.release(leaves);
             return false;
         }
         true
@@ -259,8 +293,8 @@ impl<S: Clone, L: Leaves<S>> Tree<S, L> {
     /// Makes a tree with no status. The statuses of the nodes of the lowest level go in `leaves`,
     /// which has no status.
     pub fn new(leaves: L) -> Self {
-        let root = Node::new_held(LEVELS, 0, &Slot::Empty, &leaves);
-        root.release();
+        let root = Node::new_held(LEVELS, 0, &Slot::Empty, &leaves, false);
+        root.release(&leaves);
         Self { root: Arc::new(root), leaves }
     }
 
@@ -298,7 +332,7 @@ impl<S: Clone, L: Leaves<S>> Tree<S, L> {
     ) -> Self {
         assert!(all.held[0].level == LEVELS && all.span() == (0, TREE_END), "a fork of a part");
         let root = copy_node(&all.held[0], &mut map, &leaves);
-        root.release();
+        root.release(&leaves);
         Self { root: Arc::new(root), leaves }
     }
 
@@ -317,13 +351,13 @@ impl<S: Clone, L: Leaves<S>> Tree<S, L> {
 
     /// Locks the whole tree if no other operation holds a node. Gives `None` if one does.
     pub fn try_lock_all(&self) -> Option<RangeLock<'_, S, L>> {
-        if !self.root.try_acquire() {
+        let leaves = &self.leaves;
+        if !self.root.try_acquire(leaves) {
             return None;
         }
         let mut held = Vec::new();
         held.push(self.root.clone());
-        let ok = lock_below(&self.root, 0, TREE_END, &mut held, true);
-        let leaves = &self.leaves;
+        let ok = lock_below(&self.root, leaves, 0, TREE_END, &mut held, true);
         let lock = RangeLock { start: 0, end: TREE_END, held, root: None, prune: false, leaves };
         ok.then_some(lock)
     }
@@ -355,7 +389,7 @@ fn lock_from<'a, S: Clone, L: Leaves<S>>(
             };
             if let Some(c) = child {
                 if held {
-                    node.release();
+                    node.release(leaves);
                     held = false;
                 }
                 node = c;
@@ -363,7 +397,7 @@ fn lock_from<'a, S: Clone, L: Leaves<S>>(
             }
             // The child is missing. Only the holder of the node makes it.
             if !held {
-                if !node.acquire_live() {
+                if !node.acquire_live(leaves) {
                     continue 'walk;
                 }
                 held = true;
@@ -372,21 +406,21 @@ fn lock_from<'a, S: Clone, L: Leaves<S>>(
             let next = {
                 let mut slots = node.slots.lock();
                 let base = node.base + i * slot_size(node.level);
-                let c = Arc::new(Node::new_held(node.level - 1, base, &slots[i], leaves));
+                let c = Arc::new(Node::new_held(node.level - 1, base, &slots[i], leaves, false));
                 slots[i] = Slot::Child(c.clone());
                 c
             };
             made = true;
-            node.release();
+            node.release(leaves);
             node = next;
         }
-        if held || node.acquire_live() {
+        if held || node.acquire_live(leaves) {
             break node;
         }
     };
     let mut held = Vec::new();
     held.push(node.clone());
-    lock_below(&node, start, end, &mut held, false);
+    lock_below(&node, leaves, start, end, &mut held, false);
     RangeLock { start, end, held, root: Some(root.clone()), prune: made, leaves }
 }
 
@@ -434,7 +468,7 @@ fn copy_node<S: Clone>(
     map: &mut impl FnMut(&S) -> Option<S>,
     leaves: &impl Leaves<S>,
 ) -> Node<S> {
-    let copy = Node::new_held(node.level, node.base, &Slot::Empty, leaves);
+    let copy = Node::new_held(node.level, node.base, &Slot::Empty, leaves, false);
     if node.level == 1 {
         return copy;
     }
@@ -447,7 +481,7 @@ fn copy_node<S: Clone>(
                 Slot::Status(s) => map(s).map_or(Slot::Empty, Slot::Status),
                 Slot::Child(c) => {
                     let child = copy_node(c, map, leaves);
-                    child.release();
+                    child.release(leaves);
                     if child.is_empty(leaves) { Slot::Empty } else { Slot::Child(Arc::new(child)) }
                 }
             };
@@ -461,6 +495,7 @@ fn copy_node<S: Clone>(
 /// node is busy.
 fn lock_below<S>(
     node: &Arc<Node<S>>,
+    leaves: &impl Leaves<S>,
     start: usize,
     end: usize,
     held: &mut Vec<Arc<Node<S>>>,
@@ -482,14 +517,14 @@ fn lock_below<S>(
         .collect();
     for child in children {
         if try_only {
-            if !child.try_acquire() {
+            if !child.try_acquire(leaves) {
                 return false;
             }
         } else {
-            child.acquire();
+            child.acquire(leaves);
         }
         held.push(child.clone());
-        if !lock_below(&child, start, end, held, try_only) {
+        if !lock_below(&child, leaves, start, end, held, try_only) {
             return false;
         }
     }
@@ -515,7 +550,7 @@ pub struct RangeLock<'a, S: Clone, L: Leaves<S>> {
 impl<S: Clone, L: Leaves<S>> Drop for RangeLock<'_, S, L> {
     fn drop(&mut self) {
         for node in self.held.iter().rev() {
-            node.release();
+            node.release(self.leaves);
         }
         // `set` removes each empty node below the top node. The top node needs the lock of its
         // parent, so it goes after the unlock.
@@ -676,9 +711,17 @@ fn set_in<S: Clone>(
             // An empty slot stays empty, with no child.
             Slot::Empty if matches!(fill, Slot::Empty) => continue,
             old => {
-                let c = Arc::new(Node::new_held(node.level - 1, lo, old, leaves));
+                // A node of the lowest level that this lock removed before holds the lock of the
+                // block, so the new node takes its place in `held` and its lock.
+                let dead = (node.level == 2)
+                    .then(|| held.iter().position(|n| n.level == 1 && n.base == lo))
+                    .flatten();
+                let c = Arc::new(Node::new_held(node.level - 1, lo, old, leaves, dead.is_some()));
                 slots[i] = Slot::Child(c.clone());
-                held.push(c.clone());
+                match dead {
+                    Some(k) => held[k] = c.clone(),
+                    None => held.push(c.clone()),
+                }
                 c
             }
         };
@@ -763,12 +806,12 @@ mod tests {
     const G1: usize = 1 << 30;
 
     /// The statuses of the pages of the nodes of the lowest level, one for each page, as the
-    /// status tables of the last level page tables keep them.
-    struct Pages(SpinLock<BTreeMap<usize, u32>>);
+    /// status tables of the last level page tables keep them, and the blocks that are locked.
+    struct Pages(SpinLock<BTreeMap<usize, u32>>, SpinLock<alloc::collections::BTreeSet<usize>>);
 
     impl Pages {
         fn new() -> Self {
-            Self(SpinLock::new(BTreeMap::new()))
+            Self(SpinLock::new(BTreeMap::new()), SpinLock::new(alloc::collections::BTreeSet::new()))
         }
 
         /// The number of pages with a status.
@@ -779,7 +822,7 @@ mod tests {
         /// A copy with the status that `map` gives for each status, as `VmSpace::fork_with`.
         fn fork(&self, map: impl Fn(u32) -> Option<u32>) -> Self {
             let pages = self.0.lock().iter().filter_map(|(&a, &s)| Some((a, map(s)?))).collect();
-            Self(SpinLock::new(pages))
+            Self(SpinLock::new(pages), SpinLock::new(alloc::collections::BTreeSet::new()))
         }
     }
 
@@ -826,6 +869,20 @@ mod tests {
 
         fn is_empty(&self, base: usize) -> bool {
             self.0.lock().range(base..base + M2).next().is_none()
+        }
+
+        fn lock(&self, base: usize) {
+            while !self.try_lock(base) {
+                core::hint::spin_loop();
+            }
+        }
+
+        fn try_lock(&self, base: usize) -> bool {
+            self.1.lock().insert(base)
+        }
+
+        fn unlock(&self, base: usize) {
+            assert!(self.1.lock().remove(&base), "the block is not locked");
         }
     }
 
@@ -1064,6 +1121,34 @@ mod tests {
         assert!(t.try_lock_all().is_none());
         drop(r);
         assert!(t.try_lock_all().is_some());
+    }
+
+    #[test]
+    fn a_held_block_stops_a_lock_of_its_node() {
+        // A page fault holds the block in the leaves and not the node of the tree.
+        let t = tree();
+        t.lock(0, TREE_END).set(M2, M2 + P, Some(1));
+        t.leaves().lock(M2);
+        assert!(t.try_lock_all().is_none());
+        t.leaves().unlock(M2);
+        assert!(t.try_lock_all().is_some());
+        assert!(t.leaves().1.lock().is_empty());
+    }
+
+    #[test]
+    fn a_lock_that_makes_a_block_again_keeps_one_lock() {
+        // The second node of the block takes the lock of the first, which the lock holds.
+        let t = tree();
+        let mut r = t.lock(0, G1);
+        r.set(M2 + P, M2 + 2 * P, Some(1));
+        r.set(M2, 2 * M2, Some(2));
+        r.set(M2 + P, M2 + 2 * P, Some(3));
+        drop(r);
+        assert!(t.leaves().1.lock().is_empty());
+        assert_eq!(
+            t.lock(0, G1).runs(0, G1, eq),
+            vec![(M2, M2 + P, 2), (M2 + P, M2 + 2 * P, 3), (M2 + 2 * P, 2 * M2, 2)]
+        );
     }
 
     #[test]
