@@ -16,9 +16,9 @@ use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::SOL_SOCKET;
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
-    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC,
-    MSG_WAITFORONE, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC, SOCK_NONBLOCK,
-    SOCK_STREAM, SOCK_TYPE_MASK, SOMAXCONN,
+    AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT,
+    MSG_NOSIGNAL, MSG_TRUNC, MSG_WAITFORONE, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC,
+    SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK, SOMAXCONN,
 };
 use rk_net::{Cred, Message, NodeId, PathOps, Received, Socket};
 use rk_net_inet::Proto as InetProto;
@@ -777,10 +777,13 @@ pub(crate) fn write_socket(
     file: &File,
     sock: &dyn Socket,
     iovs: &[Iovec],
+    nowait: bool,
 ) -> SysResult {
     let data = gather(cx, iovs)?;
     if data.is_empty() && sock.kind() == SOCK_STREAM {
         return Ok(0);
     }
-    send(cx, file, sock, Message { data, ..Message::default() }, 0)
+    // `IOCB_NOWAIT` is `MSG_DONTWAIT`, as `sock_write_iter` of Linux.
+    let flags = if nowait { MSG_DONTWAIT } else { 0 };
+    send(cx, file, sock, Message { data, ..Message::default() }, flags)
 }

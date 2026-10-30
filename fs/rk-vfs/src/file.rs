@@ -1168,9 +1168,9 @@ impl File {
         OpenFlags(self.flags.load(Ordering::Relaxed))
     }
 
-    /// Tells if a read must not block: the file has `O_NONBLOCK`, or the read is in
+    /// Tells if a read or a write must not block: the file has `O_NONBLOCK`, or the call is in
     /// `blockdev::without_wait`, as a read of `preadv2` with `RWF_NOWAIT`. This is the test of
-    /// `O_NONBLOCK` and `IOCB_NOWAIT` in the reads of Linux.
+    /// `O_NONBLOCK` and `IOCB_NOWAIT` in the reads and writes of Linux.
     pub fn nonblock(&self) -> bool {
         self.flags().nonblock() || crate::blockdev::no_wait()
     }

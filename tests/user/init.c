@@ -4154,6 +4154,48 @@ static void test_core_dump(void)
 	put_file("/proc/sys/kernel/core_pattern", "core");
 }
 
+/* The real time sysctls of the scheduler, as sched_rr_handler and sched_rt_handler in
+ * kernel/sched/rt.c of Linux (#341). The time slice of SCHED_RR comes from
+ * sched_rr_timeslice_ms, and a value of 0 or less sets the default of 100 ms. */
+static void test_sched_sysctls(void)
+{
+	char buf[32];
+	struct timespec ts;
+	struct sched_param sp = { .sched_priority = 1 };
+
+	check("sched_rr_timeslice_ms is 100", read_file("/proc/sys/kernel/sched_rr_timeslice_ms", buf, sizeof(buf)) > 0 &&
+						     !strcmp(buf, "100\n"));
+	check("write 7 to sched_rr_timeslice_ms", put_file("/proc/sys/kernel/sched_rr_timeslice_ms", "7") == 0 &&
+							  read_file("/proc/sys/kernel/sched_rr_timeslice_ms", buf, sizeof(buf)) > 0 &&
+							  !strcmp(buf, "7\n"));
+	int rr = syscall(SYS_sched_setscheduler, 0, SCHED_RR, &sp) == 0;
+	check("SCHED_RR uses the time slice of the sysctl, rounded up to a tick",
+	      rr && syscall(SYS_sched_rr_get_interval, 0, &ts) == 0 && ts.tv_sec == 0 && ts.tv_nsec == 8000000);
+	check("write -1 to sched_rr_timeslice_ms sets the default",
+	      put_file("/proc/sys/kernel/sched_rr_timeslice_ms", "-1") == 0 &&
+		      read_file("/proc/sys/kernel/sched_rr_timeslice_ms", buf, sizeof(buf)) > 0 && !strcmp(buf, "100\n") &&
+		      syscall(SYS_sched_rr_get_interval, 0, &ts) == 0 && ts.tv_sec == 0 && ts.tv_nsec == 100000000);
+	sp.sched_priority = 0;
+	if (rr)
+		syscall(SYS_sched_setscheduler, 0, SCHED_OTHER, &sp);
+	check("sched_rt_period_us is 1000000", read_file("/proc/sys/kernel/sched_rt_period_us", buf, sizeof(buf)) > 0 &&
+						       !strcmp(buf, "1000000\n"));
+	check("sched_rt_runtime_us is 950000", read_file("/proc/sys/kernel/sched_rt_runtime_us", buf, sizeof(buf)) > 0 &&
+						       !strcmp(buf, "950000\n"));
+	int fd = open("/proc/sys/kernel/sched_rt_period_us", O_RDWR);
+	check("sched_rt_period_us of 0 gives EINVAL", fd >= 0 && write(fd, "0", 2) == -1 && errno == EINVAL);
+	check("sched_rt_period_us of -1 gives EINVAL", write(fd, "-1", 2) == -1 && errno == EINVAL);
+	close(fd);
+	fd = open("/proc/sys/kernel/sched_rt_runtime_us", O_RDWR);
+	check("sched_rt_runtime_us of -2 gives EINVAL", fd >= 0 && write(fd, "-2", 2) == -1 && errno == EINVAL);
+	check("sched_rt_runtime_us above the period gives EINVAL", write(fd, "1000001", 7) == -1 && errno == EINVAL);
+	close(fd);
+	check("sched_rt_runtime_us of -1 is no limit", put_file("/proc/sys/kernel/sched_rt_runtime_us", "-1") == 0 &&
+							read_file("/proc/sys/kernel/sched_rt_runtime_us", buf, sizeof(buf)) > 0 &&
+							!strcmp(buf, "-1\n"));
+	put_file("/proc/sys/kernel/sched_rt_runtime_us", "950000");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -4177,6 +4219,7 @@ static void test_proc(void)
 	fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
 	check("/proc/sys/kernel/pid_max", fd >= 0 && read(fd, buf, sizeof(buf)) == 8 && !strncmp(buf, "4194304\n", 8));
 	close(fd);
+	test_sched_sysctls();
 	mkdir("/tmp/sticky", 0777);
 	chmod("/tmp/sticky", 01777);
 	symlink("/proc/self/exe", "/tmp/sticky/link");
@@ -4362,6 +4405,38 @@ static void test_aio(int fd)
 	struct iocb *bl[1] = { &bad };
 	check("io_submit of an unknown command gives EINVAL",
 	      syscall(SYS_io_submit, ctx, 1, bl) == -1 && errno == EINVAL);
+	/* io_cancel reads aio_key first, then checks the key, then finds the context, as fs/aio.c of
+	 * Linux (#341). */
+	check("io_cancel with a NULL iocb gives EFAULT",
+	      syscall(SYS_io_cancel, ctx, NULL, NULL) == -1 && errno == EFAULT);
+	check("io_cancel with a NULL iocb and a zero context gives EFAULT",
+	      syscall(SYS_io_cancel, 0, NULL, NULL) == -1 && errno == EFAULT);
+	struct io_event cev;
+	check("io_cancel of a request that is done gives EINVAL",
+	      syscall(SYS_io_cancel, ctx, &cbs[0], &cev) == -1 && errno == EINVAL);
+	/* A pipe reads and writes as a stream, and RWF_NOWAIT gives an event with -EAGAIN, as
+	 * aio_read of Linux calls read_iter with IOCB_NOWAIT (#341). */
+	int p[2];
+	check("pipe for aio", pipe(p) == 0);
+	struct iocb pr = { .aio_lio_opcode = IOCB_CMD_PREAD, .aio_fildes = p[0], .aio_buf = (unsigned long)bufs[3],
+			   .aio_nbytes = 100, .aio_rw_flags = RWF_NOWAIT };
+	struct iocb *pl[1] = { &pr };
+	ok = syscall(SYS_io_submit, ctx, 1, pl) == 1 && syscall(SYS_io_getevents, ctx, 1, 1, ev, &ts) == 1 &&
+	     ev[0].res == -EAGAIN;
+	check("io_submit of a read with RWF_NOWAIT of an empty pipe gives -EAGAIN", ok);
+	memcpy(bufs[4], "aio", 3);
+	struct iocb pw = { .aio_lio_opcode = IOCB_CMD_PWRITE, .aio_fildes = p[1], .aio_buf = (unsigned long)bufs[4],
+			   .aio_nbytes = 3, .aio_offset = 12345 };
+	pl[0] = &pw;
+	ok = syscall(SYS_io_submit, ctx, 1, pl) == 1 && syscall(SYS_io_getevents, ctx, 1, 1, ev, &ts) == 1 &&
+	     ev[0].res == 3;
+	check("io_submit of a write to a pipe", ok);
+	pl[0] = &pr;
+	ok = syscall(SYS_io_submit, ctx, 1, pl) == 1 && syscall(SYS_io_getevents, ctx, 1, 1, ev, &ts) == 1 &&
+	     ev[0].res == 3 && !memcmp(bufs[3], "aio", 3);
+	check("io_submit of a read with RWF_NOWAIT of a pipe with data", ok);
+	close(p[0]);
+	close(p[1]);
 	check("io_destroy", syscall(SYS_io_destroy, ctx) == 0);
 	check("io_submit after io_destroy gives EINVAL",
 	      syscall(SYS_io_submit, ctx, 1, list) == -1 && errno == EINVAL);

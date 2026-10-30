@@ -168,19 +168,36 @@ pub(crate) fn io_destroy(cx: &Cx<'_>, id: u64) -> SysResult {
     Ok(0)
 }
 
-pub(crate) fn io_cancel(cx: &Cx<'_>, id: u64, _iocb: u64, _result: u64) -> SysResult {
+/// The key that each request has in `aio_key`, as `KIOCB_KEY` of Linux.
+const KIOCB_KEY: u32 = 0;
+/// The offset of `aio_key` in `struct iocb`.
+const AIO_KEY_OFFSET: u64 = 8;
+
+/// Linux first reads `aio_key` of the request (`EFAULT`), then checks the key (`EINVAL`), and
+/// then finds the context, as `io_cancel` in fs/aio.c.
+pub(crate) fn io_cancel(cx: &Cx<'_>, id: u64, iocb: u64, _result: u64) -> SysResult {
+    let key: u32 = cx.read_val(iocb.wrapping_add(AIO_KEY_OFFSET))?;
+    if key != KIOCB_KEY {
+        return Err(Errno::EINVAL);
+    }
     context(cx, id)?;
+    // No request is in progress after `io_submit`, so the request is not in the context.
     Err(Errno::EINVAL)
 }
 
 /// What a request does.
 enum Work {
-    /// A read or a write of a file. `iov` has the user buffers.
+    /// A read or a write of a file. `iov` has the user buffers. A file that cannot seek, as a
+    /// pipe, a socket or a character device, is a stream: the offset has no effect, as
+    /// `aio_read` of Linux calls `read_iter` and does not check `FMODE_PREAD`. `nowait` is
+    /// `RWF_NOWAIT` (`IOCB_NOWAIT` of Linux).
     Rw {
         file: Arc<File>,
         write: bool,
         offset: u64,
         iov: Vec<Iovec>,
+        stream: bool,
+        nowait: bool,
     },
     Sync {
         file: Arc<File>,
@@ -218,6 +235,9 @@ fn read_item(cx: &Cx<'_>, obj: u64) -> Result<Item, Errno> {
         None
     };
     let rw = |write: bool, iov: Vec<Iovec>| {
+        // The flags first, as `kiocb_set_rw_flags` in `aio_prep_rw` of Linux.
+        let flags = iocb.aio_rw_flags as u32 as u64;
+        crate::fs::check_rw_flags(&file, flags, write)?;
         let allowed = if write { file.flags().writable() } else { file.flags().readable() };
         if !allowed {
             return Err(Errno::EBADF);
@@ -225,7 +245,14 @@ fn read_item(cx: &Cx<'_>, obj: u64) -> Result<Item, Errno> {
         if iocb.aio_offset < 0 {
             return Err(Errno::EINVAL);
         }
-        Ok(Work::Rw { file: file.clone(), write, offset: iocb.aio_offset as u64, iov })
+        Ok(Work::Rw {
+            file: file.clone(),
+            write,
+            offset: iocb.aio_offset as u64,
+            iov,
+            stream: !file.ops().seekable(),
+            nowait: flags & crate::fs::rwf::NOWAIT != 0,
+        })
     };
     let one =
         || vec![Iovec { iov_base: iocb.aio_buf, iov_len: iocb.aio_nbytes.min(i64::MAX as u64) }];
@@ -263,15 +290,30 @@ fn scatter(cx: &Cx<'_>, iov: &[Iovec], data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Does a large read or write alone, in parts, as `preadv` and `pwritev` do.
-fn run_large(cx: &Cx<'_>, file: &File, write: bool, offset: u64, iov: &[Iovec]) -> SysResult {
+/// Does a large read or write alone, in parts, as `preadv` and `pwritev` do. With `nowait`, a
+/// read of data that is not in the page cache gives `EAGAIN`, as `preadv2` with `RWF_NOWAIT`.
+fn run_large(
+    cx: &Cx<'_>,
+    file: &File,
+    write: bool,
+    offset: u64,
+    iov: &[Iovec],
+    nowait: bool,
+) -> SysResult {
+    let read_at = |at: u64, b: &mut [u8]| {
+        if nowait {
+            rk_vfs::blockdev::without_wait(|| file.read_at(at, b))
+        } else {
+            file.read_at(at, b)
+        }
+    };
     let mut done = 0u64;
     for v in iov.iter().filter(|v| v.iov_len != 0) {
         let at = offset + done;
         let r = if write {
             crate::fs::write_with(cx, v.iov_base, v.iov_len, |d, b| file.write_at(at + d, b))
         } else {
-            crate::fs::read_with(cx, file, v.iov_base, v.iov_len, |d, b| file.read_at(at + d, b))
+            crate::fs::read_with(cx, file, v.iov_base, v.iov_len, |d, b| read_at(at + d, b))
         };
         let n = match r {
             Ok(n) => n,
@@ -292,15 +334,27 @@ fn run(cx: &Cx<'_>, items: &[Item]) -> Vec<SysResult> {
     let mut results = Vec::with_capacity(items.len());
     let mut i = 0;
     while i < items.len() {
-        let small = |item: &Item| matches!(item.work, Work::Rw { .. }) && item.len() <= BATCH_MAX;
+        // A stream and a request with `RWF_NOWAIT` go alone.
+        let small = |item: &Item| {
+            matches!(item.work, Work::Rw { stream: false, nowait: false, .. })
+                && item.len() <= BATCH_MAX
+        };
         let item = &items[i];
         match &item.work {
             Work::Sync { file } => {
                 results.push(file.sync().map(|()| 0));
                 i += 1;
             }
-            Work::Rw { file, write, offset, iov } if !small(item) => {
-                let r = run_large(cx, file, *write, *offset, iov);
+            Work::Rw { file, write, iov, stream: true, nowait, .. } => {
+                results.push(if *write {
+                    crate::fs::writev_file(cx, file, iov, *nowait)
+                } else {
+                    crate::fs::readv_file(cx, file, iov, *nowait)
+                });
+                i += 1;
+            }
+            Work::Rw { file, write, offset, iov, nowait, .. } if !small(item) => {
+                let r = run_large(cx, file, *write, *offset, iov, *nowait);
                 results.push(if *write { crate::fs::write_sync(file, r) } else { r });
                 i += 1;
             }
@@ -393,8 +447,10 @@ pub(crate) fn io_submit(cx: &Cx<'_>, id: u64, nr: u64, iocbpp: u64) -> SysResult
         .map(|(item, r)| IoEvent {
             data: item.iocb.aio_data,
             obj: item.obj,
+            // A restart code becomes `EINTR`, as `aio_rw_done` of Linux.
             res: match r {
                 Ok(n) => n as i64,
+                Err(e) if e.is_restart() => -i64::from(Errno::EINTR.get()),
                 Err(e) => -i64::from(e.get()),
             },
             res2: 0,
