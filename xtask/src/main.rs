@@ -394,6 +394,12 @@ const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// can take more than `BOOT_TEST_TIMEOUT` (#396).
 const INIT_TEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Gives the time limit of a self test with the kernel command line `cmdline`. The bzImage and the
+/// UEFI runs of `init` run the same checks as the first run, so they get the same limit.
+fn self_test_timeout(cmdline: &str) -> Duration {
+    if cmdline.contains("rk.test=init") { INIT_TEST_TIMEOUT } else { BOOT_TEST_TIMEOUT }
+}
+
 /// The longest time that the `smp` boot test can take. It runs the init checks on `SMP_CPUS` CPUs,
 /// and on a busy host it can take more than 300 s, because a spin of one CPU of the machine uses a
 /// CPU of the host.
@@ -2076,13 +2082,8 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             (qemu_command(&kernel, &cmdline), BOOT_TEST_TIMEOUT)
         } else {
             let cmdline = test_cmdline(test);
-            let timeout = if *test == "smp" {
-                SMP_TEST_TIMEOUT
-            } else if cmdline.contains("rk.test=init") {
-                INIT_TEST_TIMEOUT
-            } else {
-                BOOT_TEST_TIMEOUT
-            };
+            let timeout =
+                if *test == "smp" { SMP_TEST_TIMEOUT } else { self_test_timeout(&cmdline) };
             (qemu_command(&kernel, &cmdline), timeout)
         };
         // The `alpine` test runs fio on the disk.
@@ -2162,8 +2163,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
     }
     let bzimage = build_bzimage()?;
     for test in BZIMAGE_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
-        let cmd = qemu_command(&bzimage, &test_cmdline(test));
-        let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
+        let cmdline = test_cmdline(test);
+        let cmd = qemu_command(&bzimage, &cmdline);
+        let (status, log) = run_with_timeout(cmd, self_test_timeout(&cmdline), test_input(test))?;
         let passed = status == Some(QEMU_PASS)
             && log.contains("booting with linux")
             && log.contains(&pass_line(test));
@@ -2177,10 +2179,12 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
     match find_ovmf()? {
         Some(firmware) => {
             for test in BZIMAGE_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
-                let mut cmd = qemu_command(&bzimage, &test_cmdline(test));
+                let cmdline = test_cmdline(test);
+                let mut cmd = qemu_command(&bzimage, &cmdline);
                 cmd.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", firmware.display()));
-                let (status, log) = run_with_timeout(cmd, BOOT_TEST_TIMEOUT, test_input(test))?;
+                let (status, log) =
+                    run_with_timeout(cmd, self_test_timeout(&cmdline), test_input(test))?;
                 let passed = status == Some(QEMU_PASS)
                     && log.contains("booting with efi")
                     && log.contains(&pass_line(test));
