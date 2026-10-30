@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.19] - 2026-10-30
+
 ### Fixed
 
 - tools/ltp/run.py gives hackbench02 480 s, because its 8 M messages took up to 223 s under QEMU without KVM, near the limit of 240 s (#504).
@@ -1223,6 +1225,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.19]: https://github.com/tamnd/rukernel/releases/tag/v0.4.19
 [0.4.18]: https://github.com/tamnd/rukernel/releases/tag/v0.4.18
 [0.4.17]: https://github.com/tamnd/rukernel/releases/tag/v0.4.17
 [0.4.16]: https://github.com/tamnd/rukernel/releases/tag/v0.4.16
