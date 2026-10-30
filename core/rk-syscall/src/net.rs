@@ -725,11 +725,15 @@ pub(crate) fn recvmmsg(
 ) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
     // As in Linux, the time is examined only after each message, so a receive can still wait.
+    // The time comes from the time stamp counter and not from `uptime_ns`. That clock stops at
+    // the end of a tick until the interrupt of the next tick comes, and a system call runs with
+    // interrupts off. Thus a call that started after a tick was due saw no time pass, and with
+    // a short timeout it waited for a second message forever (#122).
     let end = if timeout == 0 {
         None
     } else {
         let t: rk_abi::native::types::KernelTimespec = cx.read_val(timeout)?;
-        Some(crate::info::uptime_ns().saturating_add(crate::info::timespec_ns(&t)?))
+        Some(rk_frame::time::nanos().saturating_add(crate::info::timespec_ns(&t)?))
     };
     let flags = flags as u32;
     let vlen = (vlen as u32 as u64).min(MMSG_MAX);
@@ -744,7 +748,7 @@ pub(crate) fn recvmmsg(
         }
         done += 1;
         if let Some(end) = end {
-            let left = end.saturating_sub(crate::info::uptime_ns());
+            let left = end.saturating_sub(rk_frame::time::nanos());
             cx.write_val(timeout, &crate::info::timespec(left))?;
             if left == 0 {
                 break;

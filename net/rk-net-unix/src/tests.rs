@@ -113,3 +113,50 @@ fn options() {
     assert_eq!(Unix::new(9).err(), Some(Errno::ESOCKTNOSUPPORT));
     assert_eq!(Unix::new(SOCK_RAW).unwrap().kind(), SOCK_DGRAM);
 }
+
+extern crate std;
+
+/// Runs `f` on a new thread and gives its value. The test fails if `f` does not end in 10
+/// seconds, so a wait that does not end fails the test and does not stop it.
+fn in_thread<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the wait did not end")
+}
+
+/// A `shutdown` of a listener ends a wait in `accept` with `EINVAL`, as `unix_accept` of Linux
+/// (#122). The `shutdown` comes before and during the wait.
+#[test]
+fn shutdown_ends_accept() {
+    let server = Unix::new(SOCK_STREAM).unwrap();
+    server.bind(&NoPaths, &abstract_addr(b"rk-test-accept-shutdown")).unwrap();
+    server.listen(0).unwrap();
+    let s = server.clone();
+    let waiter = std::thread::spawn(move || s.accept(false).err());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    server.shutdown(SHUT_RD).unwrap();
+    assert_eq!(in_thread(move || waiter.join().unwrap()), Some(Errno::EINVAL));
+    let s = server.clone();
+    assert_eq!(in_thread(move || s.accept(false).err()), Some(Errno::EINVAL));
+    assert_eq!(server.accept(true).err(), Some(Errno::EAGAIN));
+}
+
+/// A `shutdown` of a listener with a full backlog ends a wait in `connect` with
+/// `ECONNREFUSED`, as `unix_wait_for_peer` of Linux (#122).
+#[test]
+fn shutdown_ends_connect() {
+    let addr = abstract_addr(b"rk-test-connect-shutdown");
+    let server = Unix::new(SOCK_STREAM).unwrap();
+    server.bind(&NoPaths, &addr).unwrap();
+    server.listen(0).unwrap();
+    let first = Unix::new(SOCK_STREAM).unwrap();
+    first.connect(&NoPaths, &addr, true).unwrap();
+    let second = Unix::new(SOCK_STREAM).unwrap();
+    let a = addr.clone();
+    let waiter = std::thread::spawn(move || second.connect(&NoPaths, &a, false));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    server.shutdown(SHUT_RD).unwrap();
+    assert_eq!(in_thread(move || waiter.join().unwrap()), Err(Errno::ECONNREFUSED));
+}

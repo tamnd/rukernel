@@ -516,10 +516,15 @@ impl Unix {
                 if nonblock {
                     return Err(Errno::EAGAIN);
                 }
+                // A `shutdown` of the listener stops the wait too, as `unix_wait_for_peer` of
+                // Linux, and the next loop gives `ECONNREFUSED`. The `shutdown` wakes the queue,
+                // so without the test of `shut_rd` the task sleeps again and waits forever.
                 wait_for(&other.wait, timeout.1, || {
                     let o = other.state.lock();
-                    let ready =
-                        o.closed || o.conn != Conn::Listening || o.pending.len() <= o.backlog;
+                    let ready = o.closed
+                        || o.shut_rd
+                        || o.conn != Conn::Listening
+                        || o.pending.len() <= o.backlog;
                     Ok(ready.then_some(()))
                 })?;
                 continue;
@@ -1019,7 +1024,14 @@ impl Socket for Unix {
                 new.state.lock().passcred = s.passcred;
                 return Ok(Some(new));
             }
-            if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
+            if nonblock {
+                return Err(Errno::EAGAIN);
+            }
+            // After a `shutdown` for reading, a wait gets no connection. In `unix_accept` of
+            // Linux, `skb_recv_datagram` then gives no message and no error, and `accept` gives
+            // `EINVAL`. The `shutdown` wakes the queue, so without this test the task sleeps
+            // again and waits forever.
+            if s.shut_rd { Err(Errno::EINVAL) } else { Ok(None) }
         })?;
         self.wake();
         Ok(new)

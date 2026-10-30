@@ -2460,6 +2460,30 @@ static void test_unix(void)
 	close(sv[0]);
 	close(sv[1]);
 
+	/*
+	 * recvmmsg with a timeout of 1 ns examines the time after the first message. Some time
+	 * passed, so the time left is 0 and the call stops, as in Linux (#122). Before, the clock
+	 * did not move in a system call that started after a tick was due, and the call waited for
+	 * a second message forever. The socket does not block, so the fault gives a time left
+	 * that is not 0, and not a stop.
+	 */
+	check("socketpair for recvmmsg", socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, sv) == 0);
+	int left0 = 1;
+	for (int i = 0; i < 5000 && left0; i++) {
+		char rb[2][8];
+		struct iovec iv[2] = {{rb[0], sizeof(rb[0])}, {rb[1], sizeof(rb[1])}};
+		struct mmsghdr mm[2] = {{.msg_hdr = {.msg_iov = &iv[0], .msg_iovlen = 1}},
+					{.msg_hdr = {.msg_iov = &iv[1], .msg_iovlen = 1}}};
+		struct timespec t = {0, 1};
+		left0 = send(sv[0], "x", 1, 0) == 1 && recvmmsg(sv[1], mm, 2, 0, &t) == 1 && t.tv_sec == 0 &&
+			t.tv_nsec == 0;
+		if (!left0)
+			printf("init: recvmmsg %d: time left %ld ns\n", i, (long)t.tv_nsec);
+	}
+	check("recvmmsg stops when the timeout passed", left0);
+	close(sv[0]);
+	close(sv[1]);
+
 	srv = socket(AF_UNIX, SOCK_STREAM, 0);
 	check("bind to a path", srv >= 0 && bind(srv, (struct sockaddr *)&addr, sizeof(addr)) == 0);
 	check("bind makes a socket file", stat(addr.sun_path, &st) == 0 && S_ISSOCK(st.st_mode));
