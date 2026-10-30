@@ -156,6 +156,7 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
             &file,
             &*sock,
             &[Iovec { iov_base: buf, iov_len: count }],
+            false,
         );
     }
     let count = fsize_count(cx, &file, write_pos(&file), count)?;
@@ -278,19 +279,25 @@ pub(crate) fn readv(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
 /// with `RWF_NOWAIT`. The copy to user memory is not in it, so a fault there can wait.
 fn readv_with(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, nowait: bool) -> SysResult {
     let file = cx.file(fd)?;
-    if let Some(sock) = rk_net::socket_of(&file) {
-        let iovs = read_iovecs(cx, iov, count)?;
-        return crate::net::read_socket(cx, &*sock, &iovs, nowait || file.nonblock());
+    readv_file(cx, &file, &read_iovecs(cx, iov, count)?, nowait)
+}
+
+/// Reads `file` at its position into the user buffers of `iovs`, as `readv`. A pipe, a socket and
+/// a character device read as a stream. With `nowait`, a read that must wait for data gives
+/// `EAGAIN`, as `IOCB_NOWAIT` of Linux. aio uses this for the files that cannot seek.
+pub(crate) fn readv_file(cx: &Cx<'_>, file: &File, iovs: &[Iovec], nowait: bool) -> SysResult {
+    if let Some(sock) = rk_net::socket_of(file) {
+        return crate::net::read_socket(cx, &*sock, iovs, nowait || file.nonblock());
     }
     let read = |b: &mut [u8]| {
         if nowait { rk_vfs::blockdev::without_wait(|| file.read(b)) } else { file.read(b) }
     };
     let mut done = 0;
-    for v in read_iovecs(cx, iov, count)? {
+    for v in iovs.iter().copied() {
         if v.iov_len == 0 {
             continue;
         }
-        let n = match read_with(cx, &file, v.iov_base, v.iov_len, |_, b| read(b)) {
+        let n = match read_with(cx, file, v.iov_base, v.iov_len, |_, b| read(b)) {
             Ok(n) => n,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
@@ -304,17 +311,17 @@ fn readv_with(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, nowait: bool) -> SysRe
 }
 
 /// The flags of `preadv2` and `pwritev2`, as `RWF_*` of linux/fs.h.
-mod rwf {
-    pub(super) const HIPRI: u64 = 0x1;
-    pub(super) const DSYNC: u64 = 0x2;
-    pub(super) const SYNC: u64 = 0x4;
-    pub(super) const NOWAIT: u64 = 0x8;
-    pub(super) const APPEND: u64 = 0x10;
-    pub(super) const NOAPPEND: u64 = 0x20;
-    pub(super) const ATOMIC: u64 = 0x40;
-    pub(super) const DONTCACHE: u64 = 0x80;
+pub(crate) mod rwf {
+    pub(crate) const HIPRI: u64 = 0x1;
+    pub(crate) const DSYNC: u64 = 0x2;
+    pub(crate) const SYNC: u64 = 0x4;
+    pub(crate) const NOWAIT: u64 = 0x8;
+    pub(crate) const APPEND: u64 = 0x10;
+    pub(crate) const NOAPPEND: u64 = 0x20;
+    pub(crate) const ATOMIC: u64 = 0x40;
+    pub(crate) const DONTCACHE: u64 = 0x80;
     /// The flags that Linux knows, as `RWF_SUPPORTED`.
-    pub(super) const KNOWN: u64 =
+    pub(crate) const KNOWN: u64 =
         HIPRI | DSYNC | SYNC | NOWAIT | APPEND | NOAPPEND | ATOMIC | DONTCACHE;
 }
 
@@ -405,7 +412,7 @@ pub(crate) fn pwritev2(
     let file = cx.file(fd)?;
     let done = if offset as i64 == -1 {
         check_rw_flags(&file, flags, true)?;
-        writev(cx, fd, iov, count)?
+        writev_with(cx, fd, iov, count, flags & rwf::NOWAIT != 0)?
     } else {
         if !file.ops().seekable() {
             return Err(Errno::ESPIPE);
@@ -451,7 +458,7 @@ pub(crate) fn pwritev2(
 
 /// Checks the flags of `preadv2` or `pwritev2` for `file`, as `kiocb_set_rw_flags` of Linux. The
 /// file systems of rukernel have no atomic writes and no uncached I/O.
-fn check_rw_flags(file: &File, flags: u64, write: bool) -> Result<(), Errno> {
+pub(crate) fn check_rw_flags(file: &File, flags: u64, write: bool) -> Result<(), Errno> {
     if flags & !rwf::KNOWN != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -482,23 +489,40 @@ fn takes_nowait(file: &File) -> bool {
 }
 
 pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
+    writev_with(cx, fd, iov, count, false)
+}
+
+fn writev_with(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, nowait: bool) -> SysResult {
     let file = cx.file(fd)?;
     if !file.flags().writable() {
         return Err(Errno::EBADF);
     }
-    if let Some(sock) = rk_net::socket_of(&file) {
-        return crate::net::write_socket(cx, &file, &*sock, &read_iovecs(cx, iov, count)?);
+    writev_file(cx, &file, &read_iovecs(cx, iov, count)?, nowait)
+}
+
+/// Writes the user buffers of `iovs` to `file` at its position, as `writev`. A pipe, a socket and
+/// a character device take the data as a stream. With `nowait`, a write that must wait for room
+/// gives `EAGAIN`, as `IOCB_NOWAIT` in `pipe_write` and `sock_write_iter` of Linux. aio uses this
+/// for the files that cannot seek.
+pub(crate) fn writev_file(cx: &Cx<'_>, file: &File, iovs: &[Iovec], nowait: bool) -> SysResult {
+    if let Some(sock) = rk_net::socket_of(file) {
+        return crate::net::write_socket(cx, file, &*sock, iovs, nowait);
     }
-    let iovs = read_iovecs(cx, iov, count)?;
+    // Only a file that cannot seek, as a pipe, uses `nowait` here. A write of a regular file does
+    // not use it, as `pwritev2` with an offset.
+    let nowait = nowait && !file.ops().seekable();
+    let write = |b: &[u8]| {
+        if nowait { rk_vfs::blockdev::without_wait(|| file.write(b)) } else { file.write(b) }
+    };
     let total = iovs.iter().map(|v| v.iov_len).sum();
-    let room = fsize_count(cx, &file, write_pos(&file), total)?;
+    let room = fsize_count(cx, file, write_pos(file), total)?;
     let mut done = 0;
-    for v in iovs {
+    for v in iovs.iter().copied() {
         let len = v.iov_len.min(room - done);
         if len == 0 {
             continue;
         }
-        let n = match write_with(cx, v.iov_base, len, |_, b| file.write(b)) {
+        let n = match write_with(cx, v.iov_base, len, |_, b| write(b)) {
             Ok(n) => n,
             Err(e) if done == 0 => return sigpipe(cx, Err(e)),
             Err(_) => break,
@@ -508,7 +532,7 @@ pub(crate) fn writev(cx: &Cx<'_>, fd: u64, iov: u64, count: u64) -> SysResult {
             break;
         }
     }
-    write_sync(&file, Ok(done))
+    write_sync(file, Ok(done))
 }
 
 pub(crate) fn openat(cx: &Cx<'_>, dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {

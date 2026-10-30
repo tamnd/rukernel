@@ -34,6 +34,24 @@ pub const LOOP_CTRL_MINOR: u32 = 237;
 pub const MIN_COUNT: u32 = 8;
 /// The limit of the index of a loop device: the minor numbers have 20 bits.
 const MAX_INDEX: u32 = 1 << 20;
+/// The layout of the old `struct loop_info` of `LOOP_SET_STATUS` and `LOOP_GET_STATUS`. Its
+/// `lo_device` and `lo_rdevice` have the type `__kernel_old_dev_t`, which is an `unsigned long`
+/// on x86_64 and an `unsigned int` on the other architectures. The values are the offsets of
+/// `lo_number`, `lo_device`, `lo_inode`, `lo_rdevice`, `lo_offset`, `lo_encrypt_type`,
+/// `lo_encrypt_key_size`, `lo_flags` and `lo_name`, and the size of the structure.
+#[cfg(target_arch = "x86_64")]
+mod old {
+    pub(super) const DEV_SIZE: usize = 8;
+    pub(super) const AT: [usize; 9] = [0, 8, 16, 24, 32, 36, 40, 44, 48];
+    pub(super) const SIZE: usize = 168;
+}
+#[cfg(not(target_arch = "x86_64"))]
+mod old {
+    pub(super) const DEV_SIZE: usize = 4;
+    pub(super) const AT: [usize; 9] = [0, 4, 8, 16, 20, 24, 28, 32, 36];
+    pub(super) const SIZE: usize = 160;
+}
+
 /// The size of the file name in `struct loop_info64`.
 pub const LO_NAME_SIZE: usize = 64;
 /// The largest key size in `struct loop_info64`.
@@ -209,6 +227,41 @@ impl Info64 {
         b[52..56].copy_from_slice(&self.flags.to_ne_bytes());
         b[56..56 + LO_NAME_SIZE].copy_from_slice(&self.file_name);
         b
+    }
+
+    /// Reads the old `struct loop_info`, as `loop_info64_from_old` of Linux. The offset is an
+    /// `int`, and the size limit is 0.
+    fn parse_old(b: &[u8]) -> Self {
+        let [_, _, _, _, offset, encrypt_type, key_size, flags, name] = old::AT;
+        let mut info = Self::empty();
+        info.offset = i64::from(u32_at(b, offset) as i32) as u64;
+        info.encrypt_type = u32_at(b, encrypt_type);
+        info.encrypt_key_size = u32_at(b, key_size);
+        info.flags = u32_at(b, flags);
+        info.file_name.copy_from_slice(&b[name..name + LO_NAME_SIZE]);
+        info
+    }
+
+    /// Gives the bytes of the old `struct loop_info`, as `loop_info64_to_old` of Linux. A value
+    /// that does not fit gives `EOVERFLOW`.
+    fn bytes_old(&self) -> Result<[u8; old::SIZE]> {
+        let [number, device, inode, rdevice, offset, encrypt_type, key_size, flags, name] = old::AT;
+        let dev_fits = |v: u64| old::DEV_SIZE == 8 || v <= u64::from(u32::MAX);
+        if !dev_fits(self.device) || !dev_fits(self.rdevice) || self.offset > i32::MAX as u64 {
+            return Err(Errno::EOVERFLOW);
+        }
+        let mut b = [0u8; old::SIZE];
+        let mut put = |at: usize, v: &[u8]| b[at..at + v.len()].copy_from_slice(v);
+        put(number, &self.number.to_ne_bytes());
+        put(device, &self.device.to_ne_bytes()[..old::DEV_SIZE]);
+        put(inode, &self.inode.to_ne_bytes());
+        put(rdevice, &self.rdevice.to_ne_bytes()[..old::DEV_SIZE]);
+        put(offset, &(self.offset as u32).to_ne_bytes());
+        put(encrypt_type, &self.encrypt_type.to_ne_bytes());
+        put(key_size, &self.encrypt_key_size.to_ne_bytes());
+        put(flags, &self.flags.to_ne_bytes());
+        put(name, &self.file_name);
+        Ok(b)
     }
 
     /// Checks the fields that a caller sets, as `loop_set_status_from_info` of Linux.
@@ -585,6 +638,20 @@ impl BlockOps for LoopDevice {
                 mem.read(arg, &mut b)?;
                 self.set_status(&Info64::parse(&b)).map(|()| 0)
             }
+            // The old structure, as `loop_set_status_old` and `loop_get_status_old` of Linux.
+            LOOP_SET_STATUS => {
+                may_change()?;
+                let mut b = [0u8; old::SIZE];
+                mem.read(arg, &mut b)?;
+                self.set_status(&Info64::parse_old(&b)).map(|()| 0)
+            }
+            LOOP_GET_STATUS => {
+                if arg == 0 {
+                    return Err(Errno::EINVAL);
+                }
+                mem.write(arg, &self.status()?.bytes_old()?)?;
+                Ok(0)
+            }
             LOOP_GET_STATUS64 => {
                 if arg == 0 {
                     return Err(Errno::EINVAL);
@@ -817,6 +884,40 @@ mod tests {
         info.encrypt_type = 0;
         info.sizelimit = u64::MAX;
         assert_eq!(info.check(), Err(Errno::EOVERFLOW));
+    }
+
+    #[test]
+    fn the_old_loop_info_sets_and_gives_the_status() {
+        let (_, rdev) = setup(902, 902, 8192, O_RDWR);
+        let dev = File::with_ops(blockdev::open_block(rdev, O_RDWR).unwrap(), None, O_RDWR);
+        let user = Mem(SpinLock::new(alloc::vec![0u8; old::SIZE]));
+        // The device has no file yet.
+        assert_eq!(dev.ioctl(LOOP_SET_STATUS, 0, &user), Err(Errno::ENXIO));
+        assert_eq!(dev.ioctl(LOOP_GET_STATUS, 0, &user), Err(Errno::EINVAL));
+        dev.ioctl(LOOP_SET_FD, 902, &user).unwrap();
+        // `tst_attach_device` of LTP sets the name with the old structure.
+        let mut b = [0u8; old::SIZE];
+        b[old::AT[4]..old::AT[4] + 4].copy_from_slice(&512u32.to_ne_bytes());
+        b[old::AT[7]..old::AT[7] + 4].copy_from_slice(&LO_FLAGS_AUTOCLEAR.to_ne_bytes());
+        b[old::AT[8]..old::AT[8] + 4].copy_from_slice(b"swap");
+        user.0.lock().copy_from_slice(&b);
+        dev.ioctl(LOOP_SET_STATUS, 0, &user).unwrap();
+        assert_eq!(dev.ops().end(), Some(8192 - 512));
+        // The structure goes at the address 8, because the address 0 gives `EINVAL`.
+        *user.0.lock() = alloc::vec![0u8; 8 + old::SIZE];
+        dev.ioctl(LOOP_GET_STATUS, 8, &user).unwrap();
+        let got = user.0.lock()[8..].to_vec();
+        assert_eq!(u32_at(&got, old::AT[0]), 902);
+        assert_eq!(u64_at(&got, old::AT[2]), 42);
+        assert_eq!(u32_at(&got, old::AT[4]), 512);
+        assert_eq!(u32_at(&got, old::AT[7]), LO_FLAGS_AUTOCLEAR);
+        assert_eq!(&got[old::AT[8]..old::AT[8] + 5], b"swap\0");
+        dev.ioctl(LOOP_CLR_FD, 0, &user).unwrap();
+        drop(dev);
+        assert!(sysfs_files(rdev).is_none());
+        Control
+            .ioctl(&File::with_ops(Arc::new(Control), None, O_RDWR), LOOP_CTL_REMOVE, 902, &user)
+            .unwrap();
     }
 
     #[test]

@@ -200,7 +200,8 @@ impl FileOps for PipeEnd {
         if buf.is_empty() {
             return Ok(0);
         }
-        let nonblock = file.flags().nonblock();
+        // `IOCB_NOWAIT` gives `EAGAIN` as `O_NONBLOCK`, as `pipe_write` of Linux.
+        let nonblock = file.nonblock();
         let packet = file.flags().0 & rk_abi::native::open::O_DIRECT != 0;
         let mut done = 0;
         while done < buf.len() {

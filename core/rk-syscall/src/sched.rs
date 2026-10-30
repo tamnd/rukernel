@@ -44,9 +44,6 @@ const ATTR_SIZE: u32 = size_of::<SchedAttr>() as u32;
 /// A flag of the scheduler governor of Linux. `sched_setattr` accepts it.
 const SCHED_FLAG_SUGOV: u64 = 0x1000_0000;
 
-/// The time slice of `SCHED_RR`: 100 milliseconds. Linux names it `RR_TIMESLICE`.
-const RR_TIMESLICE: u64 = 100_000_000;
-
 /// The time slice of the fair class, `BASE_SLICE` of rk-sched.
 const FAIR_SLICE: u64 = 3_000_000;
 
@@ -418,11 +415,12 @@ pub(crate) fn sched_get_priority_min(policy: u64) -> SysResult {
     }
 }
 
-/// `sched_rr_get_interval`: the time slice of `SCHED_RR` is 100 milliseconds. The other policies
-/// give 0, as Linux gives for a fair slice that is shorter than one timer tick.
+/// `sched_rr_get_interval`: the time slice of `SCHED_RR` comes from
+/// /proc/sys/kernel/sched_rr_timeslice_ms, 100 milliseconds by default. The other policies give
+/// 0, as Linux gives for a fair slice that is shorter than one timer tick.
 pub(crate) fn sched_rr_get_interval(cx: &Cx<'_>, pid: u64, interval: u64) -> SysResult {
     let p = target(cx, pid)?.sched();
-    let slice = if u64::from(p.policy) == SCHED_RR { RR_TIMESLICE } else { 0 };
+    let slice = if u64::from(p.policy) == SCHED_RR { rk_proc::sched::rr_timeslice_ns() } else { 0 };
     cx.write_val(interval, &timespec(slice))?;
     Ok(0)
 }

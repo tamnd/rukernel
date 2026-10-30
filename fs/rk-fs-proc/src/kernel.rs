@@ -405,6 +405,9 @@ const SYSCTLS: &[(&str, &str)] = &[
     // of Linux. The two files only give text.
     ("kernel/random/entropy_avail", "256"),
     ("kernel/random/poolsize", "256"),
+    ("kernel/sched_rr_timeslice_ms", ""),
+    ("kernel/sched_rt_period_us", ""),
+    ("kernel/sched_rt_runtime_us", ""),
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
     ("kernel/version", ""),
@@ -529,6 +532,19 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some((get, _)) = vm_tunable(name) {
         return format!("{}\n", get()).into_bytes();
     }
+    // The real time values of the scheduler, as kernel/sched/rt.c of Linux.
+    match name {
+        "kernel/sched_rr_timeslice_ms" => {
+            return format!("{}\n", rk_proc::sched::rr_timeslice_ms()).into_bytes();
+        }
+        "kernel/sched_rt_period_us" => {
+            return format!("{}\n", rk_proc::sched::rt_bandwidth().0).into_bytes();
+        }
+        "kernel/sched_rt_runtime_us" => {
+            return format!("{}\n", rk_proc::sched::rt_bandwidth().1).into_bytes();
+        }
+        _ => {}
+    }
     // The core dump settings, which the writer of core files reads.
     match name {
         "kernel/core_pattern" => {
@@ -561,6 +577,15 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
         _ => String::from(default),
     };
     format!("{value}\n").into_bytes()
+}
+
+/// Reads an `int` that a program wrote to a sysctl, as `proc_dointvec` of Linux. The text ends at
+/// a NUL byte, and spaces and a new line around the number are accepted. A text that is not a
+/// number, or a number out of the range of `int`, gives `EINVAL`.
+fn parse_int(data: &[u8]) -> Result<i32> {
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    let n = text::parse_number(&data[..end]).ok_or(Errno::EINVAL)?;
+    i32::try_from(n).map_err(|_| Errno::EINVAL)
 }
 
 fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
@@ -610,6 +635,21 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         }
         return set(n).ok_or(Errno::EINVAL);
+    }
+    // `sched_rr_handler` and `sched_rt_handler` in kernel/sched/rt.c of Linux. A time slice of 0
+    // or less sets the default. The checks of the period and the run time are in `rk_proc`.
+    match name {
+        "kernel/sched_rr_timeslice_ms" => {
+            rk_proc::sched::set_rr_timeslice_ms(parse_int(data)?);
+            return Ok(());
+        }
+        "kernel/sched_rt_period_us" => {
+            return rk_proc::sched::set_rt_bandwidth(Some(parse_int(data)?), None);
+        }
+        "kernel/sched_rt_runtime_us" => {
+            return rk_proc::sched::set_rt_bandwidth(None, Some(parse_int(data)?));
+        }
+        _ => {}
     }
     // `core_pattern` is a string of at most 127 bytes, `core_uses_pid` is an `int`, and
     // `suid_dumpable` is 0, 1 or 2, as fs/coredump.c and fs/exec.c of Linux.
