@@ -532,6 +532,55 @@ static void test_files(void)
 	chdir("/");
 }
 
+#define DCACHE_OPEN 600
+#define DCACHE_CLOSED 600
+
+/*
+ * A directory with many names that are in use and many names that are not. The cache of names
+ * removes the names that no one uses only from time to time, so each create takes a fixed mean
+ * time (#475). Each name that is in use stays in the cache and gives its file.
+ */
+static void test_dcache(void)
+{
+	static int fds[DCACHE_OPEN];
+	char name[32];
+	struct stat st, fst;
+	int ok = 1;
+
+	mkdir("/tmp/dc", 0755);
+	for (int i = 0; i < DCACHE_OPEN + DCACHE_CLOSED; i++) {
+		snprintf(name, sizeof(name), "/tmp/dc/f%d", i);
+		int fd = open(name, O_RDWR | O_CREAT | O_EXCL, 0644);
+		ok &= fd >= 0;
+		if (i < DCACHE_OPEN)
+			fds[i] = fd;
+		else if (fd >= 0)
+			close(fd);
+	}
+	check("1200 creates in a directory, with 600 files open", ok);
+	for (int i = 0; i < DCACHE_OPEN; i++) {
+		snprintf(name, sizeof(name), "/tmp/dc/f%d", i);
+		ok &= stat(name, &st) == 0 && fstat(fds[i], &fst) == 0 && st.st_ino == fst.st_ino;
+	}
+	check("each name of an open file gives the file of its descriptor", ok);
+	for (int i = 0; i < DCACHE_OPEN + DCACHE_CLOSED; i += 2) {
+		snprintf(name, sizeof(name), "/tmp/dc/f%d", i);
+		ok &= unlink(name) == 0;
+	}
+	for (int i = 0; i < DCACHE_OPEN + DCACHE_CLOSED; i++) {
+		snprintf(name, sizeof(name), "/tmp/dc/f%d", i);
+		ok &= (stat(name, &st) == 0) == (i % 2 == 1);
+	}
+	check("after the unlink of half the names, only the other names stay", ok);
+	for (int i = 0; i < DCACHE_OPEN; i++)
+		close(fds[i]);
+	for (int i = 1; i < DCACHE_OPEN + DCACHE_CLOSED; i += 2) {
+		snprintf(name, sizeof(name), "/tmp/dc/f%d", i);
+		ok &= unlink(name) == 0;
+	}
+	check("a directory with many removed names is empty", ok && rmdir("/tmp/dc") == 0);
+}
+
 static void test_devices(void)
 {
 	char buf[16];
@@ -8624,6 +8673,7 @@ static void test_all(void)
 	test_memory();
 	test_hugetlbfs();
 	test_files();
+	test_dcache();
 	test_perms();
 	test_devices();
 	test_pty();
