@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.16] - 2026-10-30
+
 ### Added
 
 - The `smp` boot test checks the POSIX message queues, aio and KSM on 4 CPUs at the same time (#468). Threads send and receive on one queue while another thread unlinks it, and threads open and unlink one name at the same time. Threads submit and reap aio on one context while two threads destroy it, and one thread waits in `io_getevents`. Threads write to pages with stores and with `read` while `ksmd` merges them.
@@ -1185,6 +1187,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.16]: https://github.com/tamnd/rukernel/releases/tag/v0.4.16
 [0.4.15]: https://github.com/tamnd/rukernel/releases/tag/v0.4.15
 [0.4.14]: https://github.com/tamnd/rukernel/releases/tag/v0.4.14
 [0.4.13]: https://github.com/tamnd/rukernel/releases/tag/v0.4.13
