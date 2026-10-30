@@ -238,7 +238,11 @@ def table(a, linux, rk):
         "differences, not to compare small ones. The run does not obey all the rules of "
         "spec/19-rukernel-bench.md: it is one machine, in a VM, with no Mann-Whitney test, with "
         f"one Linux build ({a.linux_note}), and with no check of the mitigations. Linux runs "
-        "with `mitigations=off` because rukernel has no mitigations yet. Under TCG, Linux is "
+        "with `mitigations=off` because rukernel has no mitigations yet. "
+        + ("On arm64, Linux also runs with `kpti=0`, because it turns on KPTI for KASLR on a "
+           "CPU with no E0PD, and `mitigations=off` does not stop this. rukernel has no KPTI. "
+           if a.arch == "aarch64" else "")
+        + "Under TCG, Linux is "
         "very slow on the rows that change page tables or switch tasks (`ctxsw`, `thread`, "
         "`fault`, `mmap`, `fork`). The cause is not known yet. Thus a green row in this group "
         "does not show that rukernel is faster on hardware.",
@@ -360,7 +364,12 @@ def main():
     a.only_set = set(a.only.split(",")) if a.only else set()
     args = f"-- {a.runs} {a.scale}" + "".join(f" {n}" for n in sorted(a.only_set))
     console = "ttyAMA0" if a.arch == "aarch64" else "ttyS0"
-    a.linux_cmdline = f"console={console} rdinit=/init mitigations=off quiet panic=-1 {args}"
+    # On arm64, Linux turns on KPTI for KASLR if the CPU has no E0PD, and mitigations=off does not
+    # stop this. QEMU without KVM then flushes all its TLB at each kernel entry and exit, because
+    # the trampoline changes the ASID in TTBR1_EL1. rukernel has no KPTI, so kpti=0 turns it off.
+    kpti = " kpti=0" if a.arch == "aarch64" else ""
+    a.linux_cmdline = (f"console={console} rdinit=/init mitigations=off{kpti} quiet panic=-1 "
+                       f"{args}")
     a.rk_cmdline = f"console={console} rk.test=init rdinit=/init {args}"
     a.date = a.date or datetime.date.today().isoformat()
     a.commit = a.commit or commit()
