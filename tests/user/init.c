@@ -2481,6 +2481,25 @@ static void test_unix(void)
 			printf("init: recvmmsg %d: time left %ld ns\n", i, (long)t.tv_nsec);
 	}
 	check("recvmmsg stops when the timeout passed", left0);
+
+	/*
+	 * A bad msg_control of sendmsg and a bad vector of recvmmsg give EFAULT, as
+	 * ____sys_sendmsg and do_recvmmsg in net/socket.c of Linux. The calls go to the kernel
+	 * directly, because the wrappers of musl read the control data and write the padding of
+	 * each header before the call, and get SIGSEGV first (sendmsg01 and recvmmsg01 of LTP).
+	 */
+	{
+		char b = 'x';
+		struct iovec iv = {&b, 1};
+		struct msghdr mh = {.msg_iov = &iv, .msg_iovlen = 1, .msg_control = (void *)-1,
+				    .msg_controllen = sizeof(struct cmsghdr) + 4};
+		errno = 0;
+		check("sendmsg with a bad msg_control gives EFAULT",
+		      syscall(SYS_sendmsg, sv[0], &mh, 0) == -1 && errno == EFAULT);
+		errno = 0;
+		check("recvmmsg with a bad vector gives EFAULT",
+		      syscall(SYS_recvmmsg, sv[1], (void *)8, 1, 0, NULL) == -1 && errno == EFAULT);
+	}
 	close(sv[0]);
 	close(sv[1]);
 
