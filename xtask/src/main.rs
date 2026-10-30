@@ -1051,8 +1051,10 @@ const KSELFTEST_SCRIPT: &str = concat!(
     "exit $failed\n",
 );
 
-/// The longest time that the `gvisor` boot test can take.
-const GVISOR_TIMEOUT: Duration = Duration::from_secs(1800);
+/// The longest time that the `gvisor` boot test can take. All 20 programs take 1600 to 1900 s on
+/// TCG with 1 CPU when the host is busy, and SendCredsRacesWithPeerReap alone takes 15 to 26
+/// minutes of that.
+const GVISOR_TIMEOUT: Duration = Duration::from_secs(2700);
 
 /// The directory of the gVisor tests that tools/gvisor/build.sh makes: `RK_GVISOR`, or
 /// target/gvisor.
