@@ -5205,6 +5205,434 @@ static void par_ksm_run(int n)
 		umount("/sys");
 }
 
+/* Gives the ms since *t and sets *t to now. */
+static long par_lap(struct timespec *t)
+{
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	long ms = (now.tv_sec - t->tv_sec) * 1000 + (now.tv_nsec - t->tv_nsec) / 1000000;
+	*t = now;
+	return ms;
+}
+
+/* Lets the calling process run on each CPU again, after pin_cpu in its parent. */
+static void par_unpin(void)
+{
+	cpu_set_t all;
+	CPU_ZERO(&all);
+	for (int c = 0; c < 4; c++)
+		CPU_SET(c, &all);
+	sched_setaffinity(0, sizeof(all), &all);
+}
+
+/* The process group of par_reap_run, and the processes of it that par_reap_wait took. */
+#define PAR_REAP_ROUNDS 8
+#define PAR_REAP_KIDS 8
+static pid_t par_reap_group;
+static int par_reap_got;
+
+/* Waits for the processes of par_reap_group until the leader `arg` ends. */
+static void *par_reap_wait(void *arg)
+{
+	pid_t leader = (pid_t)(long)arg;
+	pin_cpu(1);
+	for (;;) {
+		pid_t p = waitpid(-par_reap_group, NULL, 0);
+		if (p > 0)
+			__atomic_fetch_add(&par_reap_got, 1, __ATOMIC_RELAXED);
+		if (p == leader || (p < 0 && errno != EINTR))
+			break;
+	}
+	return NULL;
+}
+
+/* Ends processes on each CPU while their children end, and waits for all of them in a thread of
+ * init, which gets the children. No wake is lost: forget_original_parent and do_notify_parent in
+ * kernel/exit.c of Linux run under tasklist_lock. */
+static void par_reap_run(void)
+{
+	pid_t leader = fork();
+	if (leader == 0) {
+		setpgid(0, 0);
+		for (;;)
+			pause();
+	}
+	int ok = leader > 0;
+	if (!ok) {
+		check("wait and exit of many children on each CPU lose no wake", 0);
+		return;
+	}
+	setpgid(leader, leader);
+	par_reap_group = leader;
+	pthread_t w;
+	pthread_create(&w, NULL, par_reap_wait, (void *)(long)leader);
+	int want = 0;
+	for (int r = 0; r < PAR_REAP_ROUNDS; r++) {
+		pid_t c = fork();
+		if (c == 0) {
+			setpgid(0, leader);
+			par_unpin();
+			for (int k = 0; k < PAR_REAP_KIDS; k++) {
+				pid_t g = fork();
+				if (g == 0) {
+					for (int y = 0; y < k; y++)
+						sched_yield();
+					_exit(0);
+				}
+				if (g < 0)
+					_exit(1);
+			}
+			_exit(0);
+		}
+		if (c > 0) {
+			setpgid(c, leader);
+			want += 1 + PAR_REAP_KIDS;
+		}
+	}
+	/* Each process ends at once, so 3 s is enough. A lost wake leaves a zombie. */
+	for (int k = 0; k < 1500 && __atomic_load_n(&par_reap_got, __ATOMIC_RELAXED) < want; k++)
+		usleep(2000);
+	ok = __atomic_load_n(&par_reap_got, __ATOMIC_RELAXED) == want;
+	kill(leader, SIGKILL);
+	pthread_join(w, NULL);
+	while (waitpid(-leader, NULL, WNOHANG) > 0)
+		;
+	check("wait and exit of many children on each CPU lose no wake", ok);
+}
+
+/* Forks children that wait for a signal, while the main thread kills the process group. */
+static void par_kill_member(int *forks)
+{
+	for (int k = 0; k < 16; k++) {
+		pid_t c = fork();
+		if (c == 0)
+			for (;;)
+				pause();
+		if (c > 0)
+			__atomic_fetch_add(forks, 1, __ATOMIC_RELAXED);
+	}
+	for (;;)
+		pause();
+}
+
+#define PAR_KILL_ROUNDS 4
+
+/* Kills a process group whose `n` members fork on each CPU. A child that a fork makes during the
+ * kill must get the signal too, as copy_process in kernel/fork.c of Linux makes the fork restart
+ * if a signal came, under tasklist_lock, which __kill_pgrp_info holds. */
+static int par_kill_run(int n)
+{
+	int *forks = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (forks == MAP_FAILED)
+		return 0;
+	int ok = 1;
+	for (int r = 0; r < PAR_KILL_ROUNDS; r++) {
+		__atomic_store_n(forks, 0, __ATOMIC_RELAXED);
+		pid_t leader = 0;
+		for (int i = 0; i < n; i++) {
+			pid_t p = fork();
+			if (p == 0) {
+				setpgid(0, leader);
+				par_unpin();
+				par_kill_member(forks);
+			}
+			if (p < 0) {
+				ok = 0;
+				break;
+			}
+			if (i == 0)
+				leader = p;
+			setpgid(p, leader);
+		}
+		if (leader <= 0)
+			break;
+		for (int k = 0; k < 1000 && __atomic_load_n(forks, __ATOMIC_RELAXED) < 4 * n; k++)
+			usleep(1000);
+		if (kill(-leader, SIGKILL) != 0)
+			ok = 0;
+		struct timespec t0, now;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		for (;;) {
+			pid_t p = waitpid(-leader, NULL, WNOHANG);
+			if (p > 0)
+				continue;
+			if (p < 0)
+				break;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			if (now.tv_sec - t0.tv_sec >= 2) {
+				/* A child got away from the kill. */
+				ok = 0;
+				kill(-leader, SIGKILL);
+				while (waitpid(-leader, NULL, 0) > 0)
+					;
+				break;
+			}
+			usleep(1000);
+		}
+	}
+	munmap(forks, 4096);
+	return ok;
+}
+
+#define PAR_STOP_ROUNDS 800
+
+/* Sends SIGSTOP and SIGCONT to a child that runs on another CPU. After the last SIGCONT the child
+ * must run: SIGCONT clears JOBCTL_STOP_DEQUEUED in prepare_signal of kernel/signal.c of Linux, so
+ * a stop signal that the child took before the SIGCONT does not stop it after. */
+static int par_stop_run(int n)
+{
+	volatile long *count = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+				    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if (count == MAP_FAILED)
+		return 0;
+	pid_t c = fork();
+	if (c == 0) {
+		pin_cpu(n - 1);
+		for (;;)
+			(*count)++;
+	}
+	int ok = c > 0;
+	for (int k = 0; ok && k < PAR_STOP_ROUNDS; k++) {
+		ok = kill(c, SIGSTOP) == 0;
+		for (volatile int s = 0; s < k % 500; s++)
+			;
+		ok = ok && kill(c, SIGCONT) == 0;
+	}
+	int moved = 0;
+	for (int k = 0; ok && k < 100 && !moved; k++) {
+		long v = *count;
+		usleep(10000);
+		moved = *count != v;
+	}
+	if (c > 0) {
+		kill(c, SIGKILL);
+		waitpid(c, NULL, 0);
+	}
+	munmap((void *)count, 4096);
+	return ok && moved;
+}
+
+/* The descriptors of par_fd, and the calls that gave a wrong result. */
+static int par_fd_pipe[2], par_fd_bad;
+
+/* Opens and closes descriptors on the CPU `arg`, while the thread on CPU 0 puts a pipe on the
+ * descriptors 200 to 207 with dup2 and the others close them. */
+static void *par_fd(void *arg)
+{
+	int i = (int)(long)arg;
+	pin_cpu(i);
+	for (int k = 0; k < 200; k++) {
+		int target = 200 + (k + i) % 8;
+		if (i == 0) {
+			if (dup2(par_fd_pipe[0], target) != target)
+				__atomic_fetch_add(&par_fd_bad, 1, __ATOMIC_RELAXED);
+			continue;
+		}
+		struct stat st;
+		int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+		int ok = fd >= 0 && fd < 200 && fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) &&
+			 close(fd) == 0;
+		if (fstat(target, &st) == 0)
+			ok = ok && S_ISFIFO(st.st_mode);
+		if (close(target) != 0 && errno != EBADF)
+			ok = 0;
+		if (!ok)
+			__atomic_fetch_add(&par_fd_bad, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+static int par_fd_run(int n)
+{
+	pthread_t t[4];
+	if (pipe(par_fd_pipe) != 0)
+		return 0;
+	for (int i = 0; i < n; i++)
+		pthread_create(&t[i], NULL, par_fd, (void *)(long)i);
+	for (int i = 0; i < n; i++)
+		pthread_join(t[i], NULL);
+	for (int fd = 200; fd < 208; fd++)
+		close(fd);
+	close(par_fd_pipe[0]);
+	close(par_fd_pipe[1]);
+	return par_fd_bad == 0;
+}
+
+/* The directory of the checks of the file systems, the inode of par_fs_links, and the calls that
+ * gave a wrong result. */
+#define PAR_FS_DIR "/tmp/smp-fs"
+#define PAR_FS_NAMES 6
+static ino_t par_fs_ino;
+static int par_fs_bad, par_fs_both, par_fs_r[2], par_fs_why;
+static pthread_barrier_t par_fs_barrier;
+
+/* Links one file to the names s0 to s5, renames and unlinks these names, and looks them up, on
+ * the CPU `arg`. vfs_link, vfs_rename and vfs_unlink in fs/namei.c of Linux hold the lock of the
+ * directory, so each call sees the names of the other calls before or after it. */
+static void *par_fs_links(void *arg)
+{
+	int i = (int)(long)arg;
+	unsigned seed = i + 1;
+	pin_cpu(i);
+	for (int k = 0; k < 250; k++) {
+		char a[64], b[64];
+		struct stat st;
+		int ok;
+		seed = seed * 1103515245 + 12345;
+		snprintf(a, sizeof(a), PAR_FS_DIR "/s%u", (seed >> 8) % PAR_FS_NAMES);
+		snprintf(b, sizeof(b), PAR_FS_DIR "/s%u", (seed >> 16) % PAR_FS_NAMES);
+		switch ((seed >> 24) % 4) {
+		case 0:
+			ok = link(PAR_FS_DIR "/base", a) == 0 || errno == EEXIST;
+			break;
+		case 1:
+			ok = rename(a, b) == 0 || errno == ENOENT;
+			break;
+		case 2:
+			ok = unlink(a) == 0 || errno == ENOENT;
+			break;
+		default:
+			ok = stat(a, &st) == 0 ? st.st_ino == par_fs_ino : errno == ENOENT;
+		}
+		if (!ok) {
+			__atomic_fetch_add(&par_fs_bad, 1, __ATOMIC_RELAXED);
+			par_fs_why = (int)((seed >> 24) % 4) * 1000 + errno;
+		}
+	}
+	return NULL;
+}
+
+/* Moves the directory a into b on CPU 0 while CPU 1 moves b into a. Only one of them can work:
+ * lock_rename in fs/namei.c of Linux takes s_vfs_rename_mutex, so the check that a directory
+ * does not go below itself sees the other rename. */
+static void *par_fs_loop(void *arg)
+{
+	int i = (int)(long)arg;
+	pin_cpu(i);
+	for (int k = 0; k < 30; k++) {
+		pthread_barrier_wait(&par_fs_barrier);
+		int r = i == 0 ? rename(PAR_FS_DIR "/a", PAR_FS_DIR "/b/x")
+			       : rename(PAR_FS_DIR "/b", PAR_FS_DIR "/a/y");
+		par_fs_r[i] = r == 0 ? 0 : errno;
+		pthread_barrier_wait(&par_fs_barrier);
+		if (i == 0) {
+			for (int j = 0; j < 2; j++)
+				if (par_fs_r[j] != 0 && par_fs_r[j] != ENOENT && par_fs_r[j] != EINVAL)
+					par_fs_bad++;
+			if (par_fs_r[0] == 0 && par_fs_r[1] == 0)
+				par_fs_both++;
+			else if (par_fs_r[0] == 0)
+				rename(PAR_FS_DIR "/b/x", PAR_FS_DIR "/a");
+			else if (par_fs_r[1] == 0)
+				rename(PAR_FS_DIR "/a/y", PAR_FS_DIR "/b");
+		}
+		pthread_barrier_wait(&par_fs_barrier);
+	}
+	return NULL;
+}
+
+/* Makes and removes the directory d on CPU 0, while the other CPUs make and remove a file in it.
+ * A file that open made can always be removed: vfs_rmdir in fs/namei.c of Linux locks the
+ * directory that it removes and marks it dead, so no file goes in it after the check that it is
+ * empty. */
+static void *par_fs_rmdir(void *arg)
+{
+	int i = (int)(long)arg;
+	char f[64];
+	snprintf(f, sizeof(f), PAR_FS_DIR "/d/f%d", i);
+	pin_cpu(i);
+	for (int k = 0; k < 150; k++) {
+		int ok = 1;
+		if (i == 0) {
+			ok = mkdir(PAR_FS_DIR "/d", 0755) == 0 || errno == EEXIST;
+			ok = (rmdir(PAR_FS_DIR "/d") == 0 || errno == ENOTEMPTY) && ok;
+		} else {
+			int fd = open(f, O_WRONLY | O_CREAT, 0600);
+			if (fd >= 0) {
+				close(fd);
+				ok = unlink(f) == 0;
+			} else {
+				ok = errno == ENOENT;
+			}
+		}
+		if (!ok)
+			__atomic_fetch_add(&par_fs_bad, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+/* Runs link, rename, unlink, mkdir and rmdir of the same names on `n` CPUs in a tmpfs. */
+static void par_fs_run(int n)
+{
+	pthread_t t[4];
+	struct stat st;
+	mkdir("/tmp", 0755);
+	mkdir(PAR_FS_DIR, 0755);
+	int fd = open(PAR_FS_DIR "/base", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	int ok = fd >= 0 && fstat(fd, &st) == 0;
+	if (fd >= 0)
+		close(fd);
+	par_fs_ino = st.st_ino;
+	par_fs_bad = 0;
+	for (int i = 0; ok && i < n; i++)
+		pthread_create(&t[i], NULL, par_fs_links, (void *)(long)i);
+	for (int i = 0; ok && i < n; i++)
+		pthread_join(t[i], NULL);
+	/* readdir gives the names that the directory has. A lookup must give the same names. */
+	int names = 0;
+	DIR *dir = opendir(PAR_FS_DIR);
+	ok = ok && dir;
+	for (struct dirent *e; dir && (e = readdir(dir));) {
+		if (e->d_name[0] != 's')
+			continue;
+		char p[300];
+		snprintf(p, sizeof(p), PAR_FS_DIR "/%s", e->d_name);
+		ok = ok && stat(p, &st) == 0 && st.st_ino == par_fs_ino;
+		names++;
+	}
+	if (dir)
+		closedir(dir);
+	int links = stat(PAR_FS_DIR "/base", &st) == 0 ? (int)st.st_nlink : -1;
+	ok = ok && links == 1 + names;
+	int found = 0;
+	for (int j = 0; j < PAR_FS_NAMES; j++) {
+		char p[64];
+		snprintf(p, sizeof(p), PAR_FS_DIR "/s%d", j);
+		if (stat(p, &st) == 0)
+			found++;
+		unlink(p);
+	}
+	if (!ok || par_fs_bad || found != names)
+		printf("init: smp-fs: %d bad calls (last %d), %d names in readdir, %d names in "
+		       "lookups, %d links\n",
+		       par_fs_bad, par_fs_why, names, found, links);
+	check("link, rename and unlink of the same names on each CPU keep the names and the link "
+	      "count", ok && par_fs_bad == 0 && found == names);
+	unlink(PAR_FS_DIR "/base");
+
+	par_fs_bad = 0;
+	ok = mkdir(PAR_FS_DIR "/a", 0755) == 0 && mkdir(PAR_FS_DIR "/b", 0755) == 0;
+	pthread_barrier_init(&par_fs_barrier, NULL, 2);
+	for (int i = 0; ok && i < 2; i++)
+		pthread_create(&t[i], NULL, par_fs_loop, (void *)(long)i);
+	for (int i = 0; ok && i < 2; i++)
+		pthread_join(t[i], NULL);
+	pthread_barrier_destroy(&par_fs_barrier);
+	ok = ok && rmdir(PAR_FS_DIR "/a") == 0 && rmdir(PAR_FS_DIR "/b") == 0;
+	check("rename of a into b and of b into a on two CPUs makes no loop",
+	      ok && par_fs_bad == 0 && par_fs_both == 0);
+
+	par_fs_bad = 0;
+	for (int i = 0; i < n; i++)
+		pthread_create(&t[i], NULL, par_fs_rmdir, (void *)(long)i);
+	for (int i = 0; i < n; i++)
+		pthread_join(t[i], NULL);
+	ok = rmdir(PAR_FS_DIR "/d") == 0 || errno == ENOENT;
+	check("rmdir of a directory on one CPU while files are made in it on the others",
+	      ok && par_fs_bad == 0);
+	rmdir(PAR_FS_DIR);
+}
+
 /* Runs futexes, sockets, faults and system calls on several CPUs at the same time. Before #405,
  * only one CPU at a time ran kernel code, so these races could not occur. */
 static void test_smp_parallel(int cpus)
@@ -5288,6 +5716,26 @@ static void test_smp_parallel(int cpus)
 	par_ksm_run(n);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	printf("init: mq, aio and KSM on %d CPUs take %ld ms\n", n,
+	       (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	long part[5];
+	struct timespec tp = t0;
+	par_reap_run();
+	part[0] = par_lap(&tp);
+	check("kill of a process group while its members fork on each CPU", par_kill_run(n));
+	part[1] = par_lap(&tp);
+	check("SIGSTOP and SIGCONT to a process on another CPU leave it running",
+	      par_stop_run(n));
+	part[2] = par_lap(&tp);
+	check("open and close of descriptors on each CPU while another CPU does dup2",
+	      par_fd_run(n));
+	part[3] = par_lap(&tp);
+	par_fs_run(n);
+	part[4] = par_lap(&tp);
+	printf("init: wait, kill, stop, fd and fs parts take %ld, %ld, %ld, %ld and %ld ms\n",
+	       part[0], part[1], part[2], part[3], part[4]);
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	printf("init: processes and file systems on %d CPUs take %ld ms\n", n,
 	       (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
 }
 

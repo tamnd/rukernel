@@ -321,6 +321,8 @@ pub(crate) fn pause(cx: &Cx<'_>) -> SysResult {
 
 /// Sends `info` to each process in the group `pgid`. Gives `ESRCH` if the group is empty.
 pub(crate) fn signal_group(pgid: Pid, info: SigInfo) -> Result<(), Errno> {
+    // A child that a member makes at the same time gets the signal too, or is not made.
+    let _tasks = rk_proc::tasklist_read();
     let members: alloc::vec::Vec<Arc<Process>> =
         rk_proc::processes().into_iter().filter(|p| p.pgid() == pgid && !p.is_zombie()).collect();
     if members.is_empty() {
@@ -347,6 +349,9 @@ pub(crate) fn may_signal(cx: &Cx<'_>, target: &Process, sig: u32) -> Result<(), 
 /// `__kill_pgrp_info` of Linux. Gives `ESRCH` if the group is empty, and `EPERM` if the caller
 /// can signal no process of it.
 fn kill_group(cx: &Cx<'_>, pgid: Pid, info: SigInfo) -> Result<(), Errno> {
+    // A child that a member makes at the same time gets the signal too, or is not made, as with
+    // `tasklist_lock` in kernel/signal.c of Linux.
+    let _tasks = rk_proc::tasklist_read();
     let members: alloc::vec::Vec<Arc<Process>> =
         rk_proc::processes().into_iter().filter(|p| p.pgid() == pgid && !p.is_zombie()).collect();
     let mut result = Err(Errno::ESRCH);
@@ -374,6 +379,7 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
         0 => kill_group(cx, me.pgid(), info)?,
         -1 => {
             // A process that the caller cannot signal does not count, as in Linux.
+            let _tasks = rk_proc::tasklist_read();
             let mut count = 0;
             for p in rk_proc::processes() {
                 if p.pid() != rk_proc::INIT_PID

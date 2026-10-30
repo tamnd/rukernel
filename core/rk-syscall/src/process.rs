@@ -729,6 +729,9 @@ pub(crate) fn setpgid(cx: &Cx<'_>, pid: u64, pgid: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let me = cx.process();
+    // The checks and the change are one step, as `setpgid` in kernel/sys.c of Linux does with
+    // `tasklist_lock`.
+    let _tasks = rk_proc::tasklist_write();
     let target = if pid == 0 || pid as Pid == me.pid() {
         me.clone()
     } else {
