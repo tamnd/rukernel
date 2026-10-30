@@ -1,16 +1,18 @@
 //! The CortenMM backend of the address space. The `corten` feature of rk-mm selects it, per
 //! spec/24-open-questions.md question 1.
 //!
-//! The statuses of the pages in a [`Tree`] are the source of truth, and there is no tree of
-//! areas. The statuses of the pages of a 2 MiB block that do not all have one status are in the
-//! status table of the last level page table of the block in [`VmSpace`], as CortenMM keeps them
-//! in the page table pages. Thus `munmap`, `mprotect` and `fork` write the statuses and the pages
-//! of such a block in one tree. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range,
-//! so these calls on ranges in different nodes do not wait for each other. The other calls are
-//! rare. They lock the whole tree with [`Corten::lock`], which makes the areas from the statuses,
-//! lets the code of the VMA backend change them, and writes the changes back to the tree. The
-//! areas that `/proc/PID/maps` shows come from the statuses in the same way: a run of pages with
-//! the same status is one area.
+//! The statuses of the pages in a [`Tree`] are the source of truth, and there is no tree of areas.
+//! The statuses of the pages of a 2 MiB block that do not all have one status are in the status
+//! table of the last level page table of the block in [`VmSpace`], as CortenMM keeps them in the
+//! page table pages. Thus `munmap`, `mprotect` and `fork` write the statuses and the pages of such
+//! a block in one tree. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of
+//! their range, so these calls on ranges in different nodes do not wait for each other. The lock of
+//! a node of the lowest level is the hold of the status table of its block in [`VmSpace`], so a
+//! page fault on a page with a status in the table holds only that block and does not walk the
+//! tree. The other calls are rare. They lock the whole tree with [`Corten::lock`], which makes the
+//! areas from the statuses, lets the code of the VMA backend change them, and writes the changes
+//! back to the tree. The areas that `/proc/PID/maps` shows come from the statuses in the same way:
+//! a run of pages with the same status is one area.
 
 use super::{
     Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, Prepared,
@@ -75,6 +77,31 @@ impl Leaves<Status> for PageTable {
 
     fn is_empty(&self, base: usize) -> bool {
         !self.0.has_status(VirtAddr::new(base))
+    }
+
+    fn lock(&self, base: usize) {
+        self.0.hold_status(VirtAddr::new(base), true);
+    }
+
+    fn try_lock(&self, base: usize) -> bool {
+        self.0.try_hold_status(VirtAddr::new(base))
+    }
+
+    fn unlock(&self, base: usize) {
+        self.0.release_status(VirtAddr::new(base));
+    }
+}
+
+/// The hold of the status table of one 2 MiB block, which is the lock of the node of the lowest
+/// level of the tree for the block. It ends when it is dropped.
+struct Hold<'a> {
+    vm: &'a VmSpace,
+    addr: usize,
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        self.vm.release_status(VirtAddr::new(self.addr));
     }
 }
 
@@ -148,7 +175,8 @@ pub(super) struct Meta {
 /// The order of the locks is `meta`, then the nodes of the tree, then `va`, then the parts of
 /// `log`, then `guards`. A call can skip a lock, but it does not take them in another order.
 ///
-/// A page fault locks only the nodes of its page, and `guards` if the space has a guard page.
+/// A page fault holds only the status table of its 2 MiB block if the table has the status of the
+/// page, and else it locks the nodes of its page. It locks `guards` if the space has a guard page.
 /// `munmap`, `mprotect` and a `mmap` with a fixed address lock only the nodes of their range and
 /// one part of `log`. `brk` locks `meta` too. Only a `mmap` that searches for a free range locks
 /// `va`, as `vm_unmapped_area` of Linux (mm/mmap.c) searches the free ranges with `mmap_lock`
@@ -235,8 +263,24 @@ impl Corten {
     fn set(&self, range: &mut Locked<'_>, start: usize, end: usize, status: Option<Status>) {
         let (lo, hi) = window(start, end);
         let before = range.runs(lo, hi, same_status).len();
+        // After the change, the range has one status or none, so the count of the runs of the
+        // window comes from the page on each side, with no second walk. The runs join as in
+        // `RangeLock::runs`: the first status of a run represents it.
+        let left = if lo < start { range.get(lo) } else { None };
+        let right = if end < hi { range.get(end) } else { None };
+        let mut after = 0;
+        let mut last: Option<&Status> = None;
+        for s in [left.as_ref(), status.as_ref(), right.as_ref()] {
+            match (last, s) {
+                (Some(l), Some(s)) if same_status(l, s) => {}
+                (_, Some(_)) => {
+                    after += 1;
+                    last = s;
+                }
+                (_, None) => last = None,
+            }
+        }
         range.set(start, end, status);
-        let after = range.runs(lo, hi, same_status).len();
         if after >= before {
             self.count.fetch_add(after - before, Ordering::Relaxed);
         } else {
@@ -247,6 +291,22 @@ impl Corten {
     /// The number of areas.
     fn count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+
+    /// Gives the area of the page at `page`, clipped to the run of its status in its 2 MiB block,
+    /// with the block held, if the status table of the block has the status of the page. Else it
+    /// gives `None` with no hold, and the caller locks the page in the tree. The walk to the block
+    /// is the walk of the page table, which takes no lock, and the hold excludes each call that
+    /// locks the node of the block in the tree. A block with a status in its table has such a node,
+    /// and a status of the block in a slot above it moves to the table only with the node held.
+    fn held_area(&self, page: usize) -> Option<(Hold<'_>, Vma<FileRef>)> {
+        let vm = &*self.tree.leaves().0;
+        if !vm.hold_status(VirtAddr::new(page), false) {
+            return None;
+        }
+        let hold = Hold { vm, addr: page };
+        let (a, b, s) = self.tree.leaves().run_at(page, same_status)?;
+        Some((hold, view(&s, a, b)))
     }
 
     /// Locks the whole address space, and gives its areas.
@@ -449,7 +509,10 @@ impl AddressSpace {
         Ok(Self::with_state(vm, state))
     }
 
-    /// Handles a page fault at `addr` with the lock of the node of its 2 MiB block.
+    /// Handles a page fault at `addr` with the lock of its 2 MiB block. When the status table of
+    /// the block has the status of the page, the fault holds only the block, which it finds with
+    /// the walk of the page table, as a fault of CortenMM locks only the last level page table.
+    /// Else it locks the page in the tree.
     pub(super) fn corten_fault(&self, addr: usize, access: Access) -> Result<(), Errno> {
         let page = addr & !(PAGE_SIZE - 1);
         if page >= USER_END {
@@ -457,24 +520,31 @@ impl AddressSpace {
         }
         let mut prepared = None;
         loop {
-            let range = self.state.tree.lock(page, page + PAGE_SIZE);
+            let (lock, area) = match self.state.held_area(page) {
+                Some((hold, vma)) => ((Some(hold), None), Some(vma)),
+                None => {
+                    let range = self.state.tree.lock(page, page + PAGE_SIZE);
+                    let vma = area_at(&range, page);
+                    ((None, Some(range)), vma)
+                }
+            };
             // A guard page gives `SIGSEGV`, as `handle_pte_marker` of Linux.
             if self.state.is_guard(page) {
                 return Err(Errno::EFAULT);
             }
-            if let Some(vma) = area_at(&range, page) {
-                // The read of the file runs with no lock of the tree, as in `handle_fault`.
+            if let Some(vma) = area {
+                // The read of the file runs with no lock of the block, as in `handle_fault`.
                 if prepared.is_none()
                     && let Some((file, index)) = self.read_first(&vma, addr, access)
                 {
-                    drop(range);
+                    drop(lock);
                     let frame = file.page(index)?;
                     prepared = Some(Prepared { file, index, frame });
                     continue;
                 }
                 return self.fault_area(&vma, addr, access, prepared.as_ref());
             }
-            drop(range);
+            drop(lock);
             // A fault below an area that grows down makes the area larger. This is rare, so it
             // locks the whole space.
             let mut st = self.state.lock();
@@ -494,6 +564,9 @@ impl AddressSpace {
         let page = addr & !(PAGE_SIZE - 1);
         if page >= USER_END {
             return None;
+        }
+        if let Some((_hold, vma)) = self.state.held_area(page) {
+            return Some(vma);
         }
         area_at(&self.state.tree.lock(page, page + PAGE_SIZE), page)
     }

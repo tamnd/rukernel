@@ -734,6 +734,17 @@ fn vm_status_test() -> bool {
         }),
     );
     drop(child);
+    ok &= check(
+        "a hold of a status table excludes a second hold",
+        !space.hold_status(at(512), false)
+            && space.hold_status(at(0), false)
+            && !space.try_hold_status(at(5))
+            && {
+                space.release_status(at(5));
+                space.try_hold_status(at(0))
+            },
+    );
+    space.release_status(at(0));
     space.set_status(at(0), at(8), None);
     ok &= check(
         "a clear removes the statuses",
