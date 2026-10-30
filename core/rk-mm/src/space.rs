@@ -528,14 +528,29 @@ fn next_fork_anon() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Makes the lock of the areas `state` of the page table `vm`. The CortenMM backend keeps the
+/// statuses of the small pages in the page table.
+#[cfg(feature = "corten")]
+#[inline(always)]
+fn new_lock(vm: Arc<VmSpace>, state: State) -> StateLock {
+    StateLock::new(vm, state)
+}
+
+/// Makes the lock of the areas `state`.
+#[cfg(not(feature = "corten"))]
+#[inline(always)]
+fn new_lock(_vm: Arc<VmSpace>, state: State) -> StateLock {
+    StateLock::new(state)
+}
+
 impl AddressSpace {
     /// Makes an empty address space. Gives `ENOMEM` if no frame is free for the page table.
     pub fn new() -> Result<Self, Errno> {
-        Ok(Self::with_vm(VmSpace::new().ok_or(Errno::ENOMEM)?))
+        Ok(Self::with_vm(Arc::new(VmSpace::new().ok_or(Errno::ENOMEM)?)))
     }
 
     /// Makes an address space with no areas that uses the page table `vm`.
-    fn with_vm(vm: VmSpace) -> Self {
+    fn with_vm(vm: Arc<VmSpace>) -> Self {
         let state = State {
             vmas: VmaSet::new(),
             brk_start: 0,
@@ -544,13 +559,13 @@ impl AddressSpace {
             guards: BTreeSet::new(),
             write_backs: Vec::new(),
         };
-        Self::with_state(vm, StateLock::new(state))
+        Self::with_state(vm.clone(), new_lock(vm, state))
     }
 
     /// Makes an address space with the page table `vm` and the areas of `state`.
-    fn with_state(vm: VmSpace, state: StateLock) -> Self {
+    fn with_state(vm: Arc<VmSpace>, state: StateLock) -> Self {
         Self {
-            vm: Arc::new(vm),
+            vm,
             state,
             soft: SoftLock::new(),
             memcg: AtomicU32::new(0),
@@ -1906,7 +1921,7 @@ impl AddressSpace {
             .filter(copied)
             .map(|v| ForkArea { start: v.start, end: v.end, shared: v.shared })
             .collect();
-        let child = Self::with_vm(self.vm.fork(&areas).map_err(map_error)?);
+        let child = Self::with_vm(Arc::new(self.vm.fork(&areas).map_err(map_error)?));
         child.mmap_top.store(self.mmap_top(), Ordering::Relaxed);
         // The private areas of the child go in the commit count. The memory of a shared area is
         // in the count one time.

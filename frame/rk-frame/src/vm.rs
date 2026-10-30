@@ -26,6 +26,7 @@ use crate::arch::imp::paging;
 use crate::blocks::BlockTree;
 use crate::mm::frame::free_frame_phys;
 use crate::mm::{Frame, HUGE_FRAMES};
+use crate::status::{PageStatus, SLOTS, StatusTable};
 use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -167,6 +168,9 @@ struct Block {
     pages: BTreeMap<usize, (Mapped, PageProt)>,
     /// The huge page of the block. Then `pages` is empty.
     huge: Option<Huge>,
+    /// The status of each page of the block, as the metadata array of a page table page of
+    /// CortenMM. The memory manager sets it. A page can have a status and no frame.
+    status: StatusTable,
 }
 
 // A block of `VmSpace` is the range of one huge page.
@@ -176,6 +180,14 @@ const _: () = assert!(crate::blocks::BLOCK_SIZE == HUGE_PAGE_SIZE);
 fn block_of(addr: usize) -> usize {
     addr & !(HUGE_PAGE_SIZE - 1)
 }
+
+/// The index of the page at `addr` in its block.
+fn slot_of(addr: usize) -> usize {
+    (addr - block_of(addr)) / PAGE_SIZE
+}
+
+// A block has one status for each page.
+const _: () = assert!(SLOTS == HUGE_FRAMES);
 
 /// The part of `start..end` in the block at `block`.
 fn clip(block: usize, start: usize, end: usize) -> (usize, usize) {
@@ -384,6 +396,80 @@ impl VmSpace {
         true
     }
 
+    /// Gives the status of the page at `addr`.
+    pub fn status(&self, addr: VirtAddr) -> Option<PageStatus> {
+        let a = addr.get();
+        let b = self.block(a)?.lock();
+        b.status.get(slot_of(a)).cloned()
+    }
+
+    /// Sets the status of each page in the page aligned range `start..end`, or removes it with
+    /// `None`. The frames of the pages do not change.
+    pub fn set_status(&self, start: VirtAddr, end: VirtAddr, status: Option<&PageStatus>) {
+        let (start, end) = (start.get(), end.get().min(USER_END));
+        let set = |block: usize, lock: &SpinLock<Block>| {
+            let (from, to) = clip(block, start, end);
+            lock.lock().status.set(slot_of(from), slot_of(to - 1) + 1, status);
+        };
+        if status.is_none() {
+            let _ = self.blocks.each(start, end, |block, lock| {
+                set(block, lock);
+                Ok::<(), ()>(())
+            });
+            return;
+        }
+        let mut block = block_of(start);
+        while block < end {
+            set(block, self.block_or_new(block));
+            block += HUGE_PAGE_SIZE;
+        }
+    }
+
+    /// Calls `f` with each run of pages in `start..end` that have the same status value, in
+    /// address order. `f` runs with the lock of the block held, so it does not use this space.
+    /// The walk looks at each 2 MiB block of the range, so the range is small: the memory manager
+    /// gives one block. The walk uses a plain loop and not `BlockTree::each`, because it runs deep
+    /// in the stack of `mmap` and the debug kernel has large frames.
+    pub fn status_runs(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        mut f: impl FnMut(usize, usize, &PageStatus),
+    ) {
+        let (mut addr, end) = (start.get(), end.get().min(USER_END));
+        while addr < end {
+            let block = block_of(addr);
+            let to = end.min(block + HUGE_PAGE_SIZE);
+            if let Some(lock) = self.block(addr) {
+                let b = lock.lock();
+                b.status.runs(slot_of(addr), slot_of(to - 1) + 1, |a, z, s| {
+                    f(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
+                });
+            }
+            addr = to;
+        }
+    }
+
+    /// Gives the run of the page at `addr` in its 2 MiB block: the largest range of pages around
+    /// it with statuses that `same` joins, and the status of the first page of the run. `same`
+    /// runs with the lock of the block held, so it does not use this space.
+    pub fn status_run(
+        &self,
+        addr: VirtAddr,
+        same: impl Fn(&PageStatus, &PageStatus) -> bool,
+    ) -> Option<(usize, usize, PageStatus)> {
+        let a = addr.get();
+        let block = block_of(a);
+        let b = self.block(a)?.lock();
+        let (first, end, s) = b.status.run_at(slot_of(a), same)?;
+        Some((block + first * PAGE_SIZE, block + end * PAGE_SIZE, s))
+    }
+
+    /// Tells if a page of the 2 MiB block of `addr` has a status.
+    pub fn has_status(&self, addr: VirtAddr) -> bool {
+        self.block(addr.get()).is_some_and(|lock| !lock.lock().status.is_empty())
+    }
+
     /// Makes the address space of a child of `fork` with the pages of this space in `areas`. The
     /// areas are in address order and do not overlap. The child maps the same frames. A page of a
     /// private area becomes read only in both spaces. A huge page that is all in one area stays a
@@ -398,10 +484,32 @@ impl VmSpace {
     ///
     /// Gives `MapError::NoMemory` if no frame is free for a page table.
     pub fn fork(&self, areas: &[ForkArea]) -> Result<Self, MapError> {
+        self.fork_with(areas, |_| None)
+    }
+
+    /// `fork`, and the child gets the status that `map` gives for each status of this space, or
+    /// no status for `None`. The copy of the statuses is in the same walk of the page table as
+    /// the copy of the pages. `map` gets each run of one status value in a block one time.
+    ///
+    /// # Errors
+    ///
+    /// As for `fork`.
+    pub fn fork_with(
+        &self,
+        areas: &[ForkArea],
+        mut map: impl FnMut(&PageStatus) -> Option<PageStatus>,
+    ) -> Result<Self, MapError> {
         let child = Self::new().ok_or(MapError::NoMemory)?;
         let mut flush = false;
         let copied = self.blocks.each(0, USER_END, |block, lock| {
-            self.fork_block(&child, &mut lock.lock(), block, areas, &mut flush)
+            let mut b = lock.lock();
+            if !b.status.is_empty() {
+                let status = b.status.map(&mut map);
+                if !status.is_empty() {
+                    child.block_or_new(block).lock().status = status;
+                }
+            }
+            self.fork_block(&child, &mut b, block, areas, &mut flush)
         });
         if flush {
             paging::user_flush_all(self.root);

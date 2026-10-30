@@ -2,7 +2,10 @@
 //! spec/24-open-questions.md question 1.
 //!
 //! The statuses of the pages in a [`Tree`] are the source of truth, and there is no tree of
-//! areas. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range,
+//! areas. The statuses of the pages of a 2 MiB block that do not all have one status are in the
+//! status table of the last level page table of the block in [`VmSpace`], as CortenMM keeps them
+//! in the page table pages. Thus `munmap`, `mprotect` and `fork` write the statuses and the pages
+//! of such a block in one tree. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range,
 //! so these calls on ranges in different nodes do not wait for each other. The other calls are
 //! rare. They lock the whole tree with [`Corten::lock`], which makes the areas from the statuses,
 //! lets the code of the VMA backend change them, and writes the changes back to the tree. The
@@ -15,7 +18,7 @@ use super::{
     write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
-use crate::pttree::{RangeLock, TREE_END, Tree};
+use crate::pttree::{Leaves, RangeLock, TREE_END, Tree};
 use crate::rangelog::{RangeLog, reserve};
 use crate::tunables::{self, OVERCOMMIT_NEVER};
 use crate::vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet};
@@ -26,13 +29,60 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
+use rk_frame::status::PageStatus;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
-use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, USER_END};
+use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, USER_END, VmSpace};
 
 /// The status of a page: the area that mapped it. The start and the file offset of the area give
 /// the offset of each page. The end has no meaning, because a later call can change a part of
 /// the pages.
 pub(super) type Status = Arc<Vma<FileRef>>;
+
+/// The status of a page in the status table of the page table.
+fn from_table(s: &PageStatus) -> Option<Status> {
+    s.clone().downcast().ok()
+}
+
+/// The statuses of the pages of the nodes of the lowest level of the tree: the status tables of
+/// the last level page tables of the address space.
+pub(super) struct PageTable(Arc<VmSpace>);
+
+impl Leaves<Status> for PageTable {
+    fn get(&self, addr: usize) -> Option<Status> {
+        self.0.status(VirtAddr::new(addr)).as_ref().and_then(from_table)
+    }
+
+    fn set(&self, start: usize, end: usize, status: Option<&Status>) {
+        let status = status.map(|s| s.clone() as PageStatus);
+        self.0.set_status(VirtAddr::new(start), VirtAddr::new(end), status.as_ref());
+    }
+
+    fn runs(&self, start: usize, end: usize, mut f: impl FnMut(usize, usize, &Status)) {
+        self.0.status_runs(VirtAddr::new(start), VirtAddr::new(end), |a, b, s| {
+            if let Some(s) = from_table(s) {
+                f(a, b, &s);
+            }
+        });
+    }
+
+    fn run_at(&self, addr: usize, same: impl Fn(&Status, &Status) -> bool) -> Option<Run> {
+        let joins = |a: &PageStatus, b: &PageStatus| {
+            from_table(a).zip(from_table(b)).is_some_and(|(a, b)| same(&a, &b))
+        };
+        let (a, b, s) = self.0.status_run(VirtAddr::new(addr), joins)?;
+        Some((a, b, from_table(&s)?))
+    }
+
+    fn is_empty(&self, base: usize) -> bool {
+        !self.0.has_status(VirtAddr::new(base))
+    }
+}
+
+/// A run of pages with one status.
+type Run = (usize, usize, Status);
+
+/// A locked range of the tree.
+type Locked<'a> = RangeLock<'a, Status, PageTable>;
 
 /// Tells if two statuses are the same area, so that two runs of pages next to each other with
 /// them are one area. These are the merge rules of `vma_merge` in Linux, as the VMA backend uses
@@ -55,13 +105,13 @@ fn view(s: &Vma<FileRef>, start: usize, end: usize) -> Vma<FileRef> {
 }
 
 /// The areas in `start..end` of a locked range.
-fn views(range: &RangeLock<Status>, start: usize, end: usize) -> Vec<Vma<FileRef>> {
+fn views(range: &Locked<'_>, start: usize, end: usize) -> Vec<Vma<FileRef>> {
     range.runs(start, end, same_status).into_iter().map(|(a, b, s)| view(&s, a, b)).collect()
 }
 
 /// The area of the page at `addr`, clipped to the span of the lock. A page fault uses it, and
 /// its lock spans the 2 MiB block of the page.
-fn area_at(range: &RangeLock<Status>, addr: usize) -> Option<Vma<FileRef>> {
+fn area_at(range: &Locked<'_>, addr: usize) -> Option<Vma<FileRef>> {
     let (a, b, s) = range.run_at(addr, same_status)?;
     Some(view(&s, a, b))
 }
@@ -104,7 +154,7 @@ pub(super) struct Meta {
 /// `va`, as `vm_unmapped_area` of Linux (mm/mmap.c) searches the free ranges with `mmap_lock`
 /// held.
 pub(super) struct Corten {
-    tree: Tree<Status>,
+    tree: Tree<Status, PageTable>,
     /// The ranges that are mapped or that a `mmap` reserved. The search for a free range uses
     /// them, as the free list of a virtual address allocator. The tree is the source of truth.
     /// Each status is in a range of the set after `log` is applied, when no call is in progress.
@@ -127,15 +177,17 @@ pub(super) struct Corten {
 }
 
 impl Corten {
-    /// Makes the state with the areas of `st`.
-    pub(super) fn new(st: State) -> Self {
-        let c = Self::empty(Tree::new(), VmaSet::new(), Meta { brk_start: 0, brk: 0 });
+    /// Makes the state with the areas of `st`. The statuses of the small pages go in the page
+    /// table `vm`.
+    pub(super) fn new(vm: Arc<VmSpace>, st: State) -> Self {
+        let tree = Tree::new(PageTable(vm));
+        let c = Self::empty(tree, VmaSet::new(), Meta { brk_start: 0, brk: 0 });
         *c.lock() = st;
         c
     }
 
     /// Makes the state with the tree `tree`, the used ranges `va` and the heap `meta`.
-    fn empty(tree: Tree<Status>, va: VmaSet<FileRef>, meta: Meta) -> Self {
+    fn empty(tree: Tree<Status, PageTable>, va: VmaSet<FileRef>, meta: Meta) -> Self {
         Self {
             tree,
             va: SpinLock::new(va),
@@ -180,7 +232,7 @@ impl Corten {
 
     /// Sets the status of `start..end` in `range`, and changes the count of areas. `range` locks
     /// the [`window`] of the range.
-    fn set(&self, range: &mut RangeLock<Status>, start: usize, end: usize, status: Option<Status>) {
+    fn set(&self, range: &mut Locked<'_>, start: usize, end: usize, status: Option<Status>) {
         let (lo, hi) = window(start, end);
         let before = range.runs(lo, hi, same_status).len();
         range.set(start, end, status);
@@ -218,7 +270,7 @@ impl Corten {
 /// The guard of the whole address space. It gives the areas as a [`State`], and writes the
 /// changes back to the tree when it is dropped.
 pub(super) struct Whole<'a> {
-    range: RangeLock<Status>,
+    range: Locked<'a>,
     meta: SpinLockGuard<'a, Meta>,
     va: SpinLockGuard<'a, VmaSet<FileRef>>,
     corten: &'a Corten,
@@ -230,7 +282,7 @@ pub(super) struct Whole<'a> {
 
 impl<'a> Whole<'a> {
     fn new(
-        range: RangeLock<Status>,
+        range: Locked<'a>,
         meta: SpinLockGuard<'a, Meta>,
         va: SpinLockGuard<'a, VmaSet<FileRef>>,
         corten: &'a Corten,
@@ -326,11 +378,6 @@ impl AddressSpace {
             .filter(|r| copied(&r.2))
             .map(|r| ForkArea { start: r.0, end: r.1, shared: r.2.shared })
             .collect();
-        let vm = self.vm.fork(&areas).map_err(map_error)?;
-        // The private areas of the child go in the commit count. The memory of a shared area is
-        // in the count one time.
-        let charge = runs.iter().filter(|r| r.2.account && !r.2.shared && !r.2.dont_fork);
-        charge_commit(charge.map(|r| r.1 - r.0).sum())?;
         // The child does not get the locks of the parent, as on Linux. Each status of the parent
         // gives one status of the child, so the pages of an area keep one status.
         let mut copies: BTreeMap<usize, Option<Status>> = BTreeMap::new();
@@ -361,7 +408,18 @@ impl AddressSpace {
             recent = Some((key, copy.clone()));
             copy.clone()
         };
-        let tree = Tree::fork(&all, &mut map);
+        // The child gets the statuses of the small pages with the pages, in one walk of the page
+        // table.
+        let vm = self.vm.fork_with(&areas, |p| {
+            let s = from_table(p)?;
+            map(&s).map(|c| c as PageStatus)
+        });
+        let vm = Arc::new(vm.map_err(map_error)?);
+        // The private areas of the child go in the commit count. The memory of a shared area is
+        // in the count one time.
+        let charge = runs.iter().filter(|r| r.2.account && !r.2.shared && !r.2.dont_fork);
+        charge_commit(charge.map(|r| r.1 - r.0).sum())?;
+        let tree = Tree::fork(&all, &mut map, PageTable(vm.clone()));
         let mut va = VmaSet::new();
         let mut count = 0;
         let mut last: Option<(usize, Status)> = None;
@@ -442,7 +500,7 @@ impl AddressSpace {
 
     /// Removes the pages of `start..end` in a locked range, as `unmap_locked`. The range locks the
     /// [`window`] of `start..end`.
-    fn clear_locked(&self, range: &mut RangeLock<Status>, start: usize, end: usize) {
+    fn clear_locked(&self, range: &mut Locked<'_>, start: usize, end: usize) {
         // The guard pages of the range go with it, as on Linux.
         if self.state.has_guards.load(Ordering::Acquire) {
             self.state.with_guards(|guards| {
@@ -469,7 +527,7 @@ impl AddressSpace {
 
     /// Tells if `start` or `end` is in a hugetlb area and is not 2 MiB aligned, as `splits_huge`.
     /// The range is locked up to `end` and one page more.
-    fn corten_splits_huge(range: &RangeLock<Status>, start: usize, end: usize) -> bool {
+    fn corten_splits_huge(range: &Locked<'_>, start: usize, end: usize) -> bool {
         [start, end].into_iter().any(|x| {
             !x.is_multiple_of(HPAGE_SIZE) && x < TREE_END && range.get(x).is_some_and(|v| v.hugetlb)
         })

@@ -676,6 +676,69 @@ fn vm_test() -> bool {
         check("the address spaces give back the shared code frame", Arc::strong_count(&code) == 1);
     drop(code);
     ok &= check("the frames and the page tables go back", mm::frame_stats().free == free_before);
+    ok &= vm_status_test();
+    ok
+}
+
+/// The status table of each last level page table keeps the status of each page, also of a page
+/// with no frame, and a `fork` copies it with the pages, as the CortenMM backend of rk-mm uses it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn vm_status_test() -> bool {
+    use alloc::vec::Vec;
+    use rk_frame::status::PageStatus;
+    use rk_frame::vm::VmSpace;
+
+    const BASE: usize = 0x80_0000;
+    const PAGE: usize = 4096;
+
+    let (Some(space), Some(frame)) = (VmSpace::new(), mm::alloc_zeroed_frame()) else {
+        return check("an address space and a frame for the statuses", false);
+    };
+    let at = |n: usize| VirtAddr::new(BASE + n * PAGE);
+    let value = |s: &PageStatus| s.downcast_ref::<u32>().copied();
+    let status = |n: usize| space.status(at(n)).as_ref().and_then(value);
+    let (a, b): (PageStatus, PageStatus) = (Arc::new(1u32), Arc::new(2u32));
+    space.set_status(at(0), at(8), Some(&a));
+    space.set_status(at(2), at(4), Some(&b));
+    let mut ok = check(
+        "a page with no frame has a status",
+        status(1) == Some(1) && status(2) == Some(2) && status(8).is_none(),
+    );
+    let mut runs = Vec::new();
+    space.status_runs(at(0), at(16), |s, e, st| runs.push((s, e, value(st))));
+    ok &= check(
+        "the statuses of the pages are in runs",
+        runs == [
+            (BASE, BASE + 2 * PAGE, Some(1)),
+            (BASE + 2 * PAGE, BASE + 4 * PAGE, Some(2)),
+            (BASE + 4 * PAGE, BASE + 8 * PAGE, Some(1)),
+        ],
+    );
+    ok &= check(
+        "a run of statuses joins the values that the caller joins",
+        space.status_run(at(5), |_, _| true).map(|r| (r.0, r.1)) == Some((BASE, BASE + 8 * PAGE)),
+    );
+    ok &= check(
+        "a map and an unmap of a page keep its status",
+        space.map(at(3), Arc::new(frame), RW).is_ok() && status(3) == Some(2) && {
+            space.unmap_range(at(0), at(8));
+            space.page(at(3)).is_none() && status(3) == Some(2)
+        },
+    );
+    let child =
+        space.fork_with(&[], |s| (value(s) == Some(1)).then(|| Arc::new(11u32) as PageStatus));
+    ok &= check(
+        "fork copies the statuses that the caller keeps",
+        child.as_ref().is_ok_and(|c| {
+            c.status(at(0)).as_ref().and_then(value) == Some(11) && c.status(at(2)).is_none()
+        }),
+    );
+    drop(child);
+    space.set_status(at(0), at(8), None);
+    ok &= check(
+        "a clear removes the statuses",
+        !space.has_status(at(0)) && Arc::strong_count(&a) == 1 && Arc::strong_count(&b) == 1,
+    );
     ok
 }
 
