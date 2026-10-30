@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- The `tcp_stream` row of tools/bench on arm64 is about 3 times faster, and it is not red now (#465). TCP copies the data of its queues with one copy of memory for each part of the queue, and not one byte at a time. The checksum adds aligned 64-bit words, and `NetBuf::extend_from_slice` does not write zeros first. The arm64 kernel has its own `memcpy` and `memset` that copy 16 bytes with each `ldp` and `stp`. The `memcpy` of compiler_builtins does a copy that is not aligned one byte at a time because the target has `strict-align`, and x86-64 uses `rep movsb`. In three runs on a busy host with QEMU TCG, the row gave 18.6 to 19.3 MB/s before and gives 43.4 to 68.2 MB/s now. Linux gives 57.5 MB/s.
+
 ## [0.4.17] - 2026-10-30
 
 ### Added

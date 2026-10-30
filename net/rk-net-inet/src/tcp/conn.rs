@@ -276,6 +276,18 @@ pub struct ProcInfo {
     pub ssthresh: u32,
 }
 
+/// Copies `len` bytes of `q` from the offset `off`. The copy takes the two slices of the queue,
+/// so it is one copy of memory for each slice. An iterator of bytes copies one byte in each
+/// step, and on QEMU without KVM that made the TCP stream on loopback slow (#465).
+fn copy_range(q: &VecDeque<u8>, off: usize, len: usize) -> Vec<u8> {
+    let (a, b) = q.as_slices();
+    let end = off + len;
+    let mut v = Vec::with_capacity(len);
+    v.extend_from_slice(&a[off.min(a.len())..end.min(a.len())]);
+    v.extend_from_slice(&b[off.saturating_sub(a.len())..end.saturating_sub(a.len())]);
+    v
+}
+
 /// The segment that answers `seg` when no connection takes it, as `tcp_v4_send_reset` of
 /// Linux. An RST gets no answer.
 pub fn reset_for(seg: &Seg) -> Option<Seg> {
@@ -665,11 +677,10 @@ impl Conn {
     /// stays. A read that opens the window a lot sends a window update, as `tcp_cleanup_rbuf`.
     pub fn recv(&mut self, len: usize, peek: bool, now: u64) -> Vec<u8> {
         let n = len.min(self.rcvq.len());
-        let data: Vec<u8> = if peek {
-            self.rcvq.iter().take(n).copied().collect()
-        } else {
-            self.rcvq.drain(..n).collect()
-        };
+        let data = copy_range(&self.rcvq, 0, n);
+        if !peek {
+            self.rcvq.drain(..n);
+        }
         if !peek && n > 0 && self.can_receive() {
             let cur = self.rcv_wnd();
             let space = (self.rcvbuf / 2) as u32;
@@ -759,7 +770,7 @@ impl Conn {
     /// Makes a segment of `len` bytes of the send queue from the offset `off`, with a FIN if
     /// `fin`.
     fn data_seg(&self, seq: u32, off: usize, len: usize, fin: bool) -> Seg {
-        let data: Vec<u8> = self.sndq.range(off..off + len).copied().collect();
+        let data = copy_range(&self.sndq, off, len);
         let mut flags = ACK;
         if fin {
             flags |= FIN;

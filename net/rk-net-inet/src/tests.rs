@@ -36,6 +36,36 @@ fn checksum_of_rfc1071_example() {
 }
 
 #[test]
+fn checksum_of_words_is_checksum_of_bytes() {
+    // The sum of 16-bit words, one at a time, as the checksum was before #465.
+    let slow = |d: &[u8]| {
+        let mut sum = 0u32;
+        for w in d.chunks(2) {
+            sum += u32::from(w[0]) << 8 | u32::from(*w.get(1).unwrap_or(&0));
+        }
+        checksum::fold(sum)
+    };
+    let mut x = 0x1234_5678u32;
+    let buf: Vec<u8> = (0..3000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let ones = vec![0xffu8; 3000];
+    for d in [&buf[..], &ones[..]] {
+        for start in 0..17 {
+            for len in (0..64).chain([1499, 1500, 1501, 2047]) {
+                let part = &d[start..start + len];
+                assert_eq!(checksum::checksum(part), slow(part), "start {start} len {len}");
+            }
+        }
+    }
+}
+
+#[test]
 fn udp_checksum_is_never_zero() {
     // The sum of this datagram is 0xffff, so the checksum would be 0, which means "none".
     let src = [0, 0, 0, 0];

@@ -1,18 +1,66 @@
 //! The Internet checksum of RFC 1071, as net/core/utils.c and the `csum_*` functions of Linux.
 
+use zerocopy::FromBytes;
+
 /// Adds the 16-bit words of `data` to `sum`, in network byte order. An odd last byte is the
 /// high byte of a word.
-pub fn add(mut sum: u32, data: &[u8]) -> u32 {
-    let (words, rest) = data.as_chunks::<2>();
-    for w in words {
-        sum = sum.wrapping_add(u32::from(u16::from_be_bytes(*w)));
-        // Fold early, so that a long packet does not overflow the sum.
+///
+/// The middle of `data` goes in aligned 64-bit words, as `do_csum` of Linux. The sum of the
+/// 16-bit words does not depend on the byte order, except for a swap of the two bytes of the
+/// result (RFC 1071 section 2). A part that starts at an odd offset gets a swap too. The words
+/// must be aligned: the arm64 target has `strict-align`, so a load of a word that is not known
+/// to be aligned is 8 loads of single bytes. A loop of 16-bit words used about 4 instructions
+/// for each byte, and on QEMU without KVM the checksums were a large part of the time of the TCP
+/// stream on loopback (#465).
+pub fn add(sum: u32, data: &[u8]) -> u32 {
+    let skip = data.as_ptr().align_offset(8).min(data.len());
+    let (head, rest) = data.split_at(skip);
+    let (body, tail) = rest.split_at(rest.len() / 8 * 8);
+    let odd = head.len() % 2 == 1;
+    let swap = |v: u16| if odd { v.swap_bytes() } else { v };
+    let total = u64::from(sum)
+        + u64::from(add_bytes(head))
+        + u64::from(swap(add_words(body)))
+        + u64::from(swap(add_bytes(tail)));
+    fold16(total)
+}
+
+/// The sum of the 16-bit words of `body`, in network byte order, folded to 16 bits. The length
+/// of `body` is a multiple of 8.
+fn add_words(body: &[u8]) -> u16 {
+    let mut acc = 0u64;
+    let mut add = |w: u64| {
+        let (s, carry) = acc.overflowing_add(w);
+        acc = s + u64::from(carry);
+    };
+    match <[u64]>::ref_from_bytes(body) {
+        Ok(words) => words.iter().for_each(|&w| add(w)),
+        // Not aligned: this does not occur, because `add` aligns `body`.
+        Err(_) => body.as_chunks::<8>().0.iter().for_each(|w| add(u64::from_ne_bytes(*w))),
+    }
+    // The sum of the 16-bit words in the byte order of the CPU, then in network byte order.
+    u16::from_be(fold16((acc & 0xffff_ffff) + (acc >> 32)) as u16)
+}
+
+/// Folds a sum to 16 bits with the end-around carry, as `fold` does, but with no complement.
+fn fold16(mut sum: u64) -> u32 {
+    while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    if let [last] = rest {
-        sum = sum.wrapping_add(u32::from(*last) << 8);
+    sum as u32
+}
+
+/// The sum of the 16-bit words of `data`, in network byte order, folded to 16 bits.
+fn add_bytes(data: &[u8]) -> u16 {
+    let (words, rest) = data.as_chunks::<2>();
+    let mut sum = 0u64;
+    for w in words {
+        sum += u64::from(u16::from_be_bytes(*w));
     }
-    sum
+    if let [last] = rest {
+        sum += u64::from(*last) << 8;
+    }
+    fold16(sum) as u16
 }
 
 /// Folds `sum` to 16 bits and gives the complement, as `csum_fold` of Linux.
