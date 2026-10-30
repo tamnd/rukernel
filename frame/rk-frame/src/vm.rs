@@ -599,9 +599,58 @@ impl VmSpace {
     }
 
     /// Removes the pages in `start..end`. A huge page that is all in the range goes as one, and a
-    /// huge page that is in part in the range is split first.
+    /// huge page that is in part in the range is split first. The 4 KiB pages get one TLB flush
+    /// at the end, as the `mmu_gather` of Linux (`tlb_finish_mmu` in mm/mmu_gather.c), and their
+    /// frames go after that flush, so no CPU can use a frame that was freed. A flush for each
+    /// page sent one shootdown for each page, and the `munmap` of `fault_mt` on 4 CPUs sent about
+    /// 6000 shootdowns where Linux sends about 9 (#468).
     pub fn unmap_range(&self, start: VirtAddr, end: VirtAddr) {
         let (start, end) = (start.get(), end.get());
+        if end - start <= PAGE_SIZE {
+            return self.unmap_range_flush_each(start, end);
+        }
+        let mut freed = Vec::new();
+        let mut flush = false;
+        let _ = self.blocks.each(start, end, |block, lock| {
+            let mut b = lock.lock();
+            let (from, to) = clip(block, start, end);
+            let mut huge = None;
+            if b.huge.is_some() {
+                if (from, to) == (block, block + HUGE_PAGE_SIZE) {
+                    huge = b.huge.take();
+                    if let Some(huge) = &huge {
+                        paging::user_unmap_huge(self.root, block, huge.table);
+                        if huge.thp {
+                            HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        self.huge.fetch_sub(1, Ordering::Relaxed);
+                    }
+                } else {
+                    self.split(&mut b, block);
+                }
+            }
+            let mut gone = b.pages.split_off(&from);
+            let mut after = gone.split_off(&to);
+            b.pages.append(&mut after);
+            flush |= paging::user_unmap_many(self.root, gone.keys().copied());
+            self.small.fetch_sub(gone.len(), Ordering::Relaxed);
+            drop(b);
+            // The huge page had its own flush, so its frames can go now.
+            drop(huge);
+            if !gone.is_empty() {
+                freed.push(gone);
+            }
+            Ok::<(), ()>(())
+        });
+        if flush {
+            paging::user_flush_all(self.root);
+        }
+        drop(freed);
+    }
+
+    /// Removes the pages in `start..end` as `unmap_range` does, with a flush for each 4 KiB page.
+    /// A range of one page uses it, as one `invlpg` costs less than a flush of all the entries.
+    fn unmap_range_flush_each(&self, start: usize, end: usize) {
         let _ = self.blocks.each(start, end, |block, lock| {
             let mut b = lock.lock();
             let (from, to) = clip(block, start, end);

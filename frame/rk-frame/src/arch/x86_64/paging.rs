@@ -554,6 +554,27 @@ pub(crate) fn user_unmap(root: u64, virt: usize) {
     }
 }
 
+/// Removes the mappings of 4 KiB pages in `root` as `user_unmap` does, but with no TLB flush.
+/// `pages` gives the address of each page, in address order. One walk finds the last level table
+/// for all the pages in it. Gives `true` if an entry changed. The caller then calls
+/// `user_flush_all`, one time for all the pages, and frees the frames only after it, as
+/// `tlb_finish_mmu` of Linux frees the pages of a zap after the flush.
+pub(crate) fn user_unmap_many(root: u64, pages: impl Iterator<Item = usize>) -> bool {
+    let mut leaf = (usize::MAX, None);
+    let mut changed = false;
+    for virt in pages {
+        let block = virt & !(HUGE_SIZE as usize - 1);
+        if leaf.0 != block {
+            leaf = (block, user_leaf(root, virt).map(|(table, _)| table));
+        }
+        if let Some(table) = leaf.1 {
+            write_entry(table, indexes(virt)[3], 0);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Changes the permissions of the page at `virt` in `root`, which maps `phys`.
 pub(crate) fn user_protect(root: u64, virt: usize, phys: u64, prot: UserProt) {
     if let Some((table, i)) = user_leaf(root, virt) {
