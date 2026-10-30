@@ -80,7 +80,7 @@ fn text_file(path: &[u8], f: fn() -> Vec<u8>) -> InodeRef {
 }
 
 fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
-    let files: [(&[u8], fn() -> Vec<u8>); 12] = [
+    let files: [(&[u8], fn() -> Vec<u8>); 13] = [
         (b"meminfo", || {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
@@ -109,6 +109,11 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
             format!("0.00 0.00 0.00 {running}/{} {last}\n", all.len()).into_bytes()
         }),
         (b"stat", stat),
+        (b"interrupts", || {
+            let cpus = rk_frame::cpu::count();
+            let tlb: Option<Vec<u64>> = (0..cpus).map(rk_frame::cpu::tlb_shootdowns).collect();
+            text::interrupts(cpus, tlb.as_deref()).into_bytes()
+        }),
         (b"version", || {
             let i = info();
             format!("Linux version {} (rukernel) {}\n", i.release, i.version).into_bytes()

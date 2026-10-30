@@ -37,3 +37,16 @@ pub fn barrier_all() {
     #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
     crate::arch::imp::smp::shootdown(0, crate::arch::imp::smp::BARRIER);
 }
+
+/// Gives the number of TLB shootdowns that the CPU `id` did for another CPU since boot, for the
+/// `TLB` line of `/proc/interrupts`. Gives `None` if the CPUs drop TLB entries with no
+/// interrupt, as arm64 does with a broadcast `tlbi`.
+pub fn tlb_shootdowns(id: usize) -> Option<u64> {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    return Some(crate::arch::imp::smp::tlb_count(id));
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        let _ = id;
+        None
+    }
+}

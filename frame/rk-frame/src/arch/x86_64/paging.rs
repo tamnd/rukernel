@@ -532,11 +532,17 @@ pub(crate) type UserProt = (bool, bool, bool);
 /// Maps one 4 KiB page at `virt` in the user address space `root`. Gives `Err` if no frame is free
 /// for a page table. The caller makes sure that `virt` is page aligned, below `USER_END` and not
 /// mapped.
+///
+/// The function does not flush a TLB. A CPU keeps no TLB entry for an entry that is not present
+/// (Intel SDM volume 3A, 4.10.2.3), and each function that removes a mapping flushes its entry.
+/// Linux also writes a new entry with `set_pte_at` and no flush (`finish_fault` and
+/// `do_anonymous_page` in mm/memory.c), and `update_mmu_cache` of x86 does nothing
+/// (arch/x86/include/asm/pgtable.h). A shootdown for each new page made each page fault wait for
+/// all the other CPUs of the address space.
 pub(crate) fn user_map(root: u64, virt: usize, phys: u64, prot: UserProt) -> Result<(), ()> {
     assert!(virt < USER_END, "{virt:#x} is not in the user half");
     let pt = leaf_table(root, virt, USER)?;
     write_entry(pt, indexes(virt)[3], phys | user_flags(prot.0, prot.1, prot.2));
-    flush_user(root, virt);
     Ok(())
 }
 

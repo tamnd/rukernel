@@ -54,6 +54,15 @@ static FLUSH_ADDR: AtomicU64 = AtomicU64::new(0);
 static FLUSH_PAGES: AtomicU64 = AtomicU64::new(1);
 /// The CPUs that did not do the request yet.
 static PENDING: AtomicU64 = AtomicU64::new(0);
+/// The number of TLB requests that each CPU did for another CPU, as `irq_tlb_count` of Linux
+/// (arch/x86/mm/tlb.c).
+static TLB_COUNTS: [AtomicU64; crate::cpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::cpu::MAX_CPUS];
+
+/// Gives the number of TLB requests that the CPU `id` did for another CPU.
+pub(crate) fn tlb_count(id: usize) -> u64 {
+    TLB_COUNTS.get(id).map_or(0, |c| c.load(Ordering::Relaxed))
+}
 
 /// Tells each other CPU that uses the address space `root` to drop the TLB entry of `addr`. A
 /// `root` of 0 is for a kernel address, and each CPU drops the entry. An `addr` of `LEAVE` tells
@@ -101,12 +110,16 @@ pub(crate) fn shootdown_range(root: u64, addr: u64, pages: u64) {
 /// Does the request of `shootdown` if this CPU has one. The interrupt handler calls it, and so
 /// does each loop that waits with interrupts off for another CPU.
 pub(crate) fn poll() {
-    let bit = 1u64 << cpu::id();
+    let me = cpu::id();
+    let bit = 1u64 << me;
     if PENDING.load(Ordering::Acquire) & bit == 0 {
         return;
     }
     let root = FLUSH_ROOT.load(Ordering::Relaxed);
     let addr = FLUSH_ADDR.load(Ordering::Relaxed);
+    if addr != BARRIER {
+        TLB_COUNTS[me].fetch_add(1, Ordering::Relaxed);
+    }
     if addr == LEAVE {
         paging::leave(root);
     } else if addr == BARRIER {

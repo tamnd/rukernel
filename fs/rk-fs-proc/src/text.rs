@@ -553,9 +553,38 @@ pub fn coredump_filter(value: u32) -> Vec<u8> {
     format!("{value:08x}\n").into_bytes()
 }
 
+/// The text of `/proc/interrupts` with the `TLB` line of x86 only, as `show_interrupts` of Linux
+/// (fs/proc/interrupts.c, kernel/irq/proc.c) and `arch_show_interrupts`
+/// (arch/x86/kernel/irq.c). `tlb` has the count of each CPU, or is `None` if the CPUs drop TLB
+/// entries with no interrupt.
+pub fn interrupts(cpus: usize, tlb: Option<&[u64]>) -> String {
+    let mut out = format!("{:11}", "");
+    for c in 0..cpus {
+        let _ = write!(out, "CPU{c:<8}");
+    }
+    out.push('\n');
+    if let Some(counts) = tlb {
+        out.push_str("TLB: ");
+        for n in counts {
+            let _ = write!(out, "{n:10} ");
+        }
+        out.push_str("  TLB shootdowns\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupts_has_the_format_of_linux() {
+        assert_eq!(
+            interrupts(2, Some(&[0, 1234])),
+            "           CPU0       CPU1       \nTLB:          0       1234   TLB shootdowns\n"
+        );
+        assert_eq!(interrupts(1, None), "           CPU0       \n");
+    }
 
     #[test]
     fn unsigned_numbers_take_the_base_of_their_prefix() {
