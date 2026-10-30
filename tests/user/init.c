@@ -8624,8 +8624,11 @@ static void test_cgroup(void)
 							errno == EINVAL);
 	check("a trigger without an event does not poll POLLPRI", !(poll_events(fd, POLLPRI, 0) & POLLPRI));
 	cg_write("/cg/t/a/cpu.max", "10000 100000");
-	pid = cgroup_child("/cg/t/a", cg_busy);
-	check("a stall polls POLLPRI on the trigger", poll_events(fd, POLLPRI, 3000) & POLLPRI);
+	/* The child spins until the event comes. A busy loop of 1 s of wall time can end with less
+	 * than 50 ms of stall when the host does not run QEMU for a part of that time. */
+	pid = cgroup_child("/cg/t/a", cg_spin);
+	check("a stall polls POLLPRI on the trigger", poll_events(fd, POLLPRI, 10000) & POLLPRI);
+	kill(pid, SIGKILL);
 	wait_status(pid);
 	cg_write("/cg/t/a/cpu.max", "max");
 	close(fd);

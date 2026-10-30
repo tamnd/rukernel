@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - With the `corten` backend, a page fault does not walk the tree of statuses when the status table of the 2 MiB block has the status of the page (#405). The lock of the lowest tree node is now a flag next to the status table, so the fault takes only this flag. An `mmap` or `mprotect` reads the statuses next to the range from the locked range, and does not walk the tree a second time. A core dump finds the area of a page with no frame with a lock of the block of the page only. Before, it locked the whole space and made each area for each such page, so each core dump of the `smp` boot test took 36 to 65 s on a busy host, and the test went past its limit of 600 s. Now a dump takes about 2 s, and the test takes about 300 s.
 - tools/bench/run.py gives Linux `kpti=0` on arm64, because Linux turns on KPTI for KASLR on the `cortex-a72` and `mitigations=off` does not stop this (#465). QEMU without KVM then flushes all its TLB at each kernel entry and exit, and the entry rows of Linux were about 7 times slower than rukernel. With `kpti=0`, `getpid` gives 4310 ns on Linux and 5891 ns on rukernel.
+- The init check "a stall polls POLLPRI on the trigger" gives the child that the cgroup throttles no end, and waits up to 10 s for the event (#468). Before, the child stopped after 1 s of wall time, and in 1 of 9 smp runs on a busy host the stall did not get to the threshold of 50 ms.
 
 ## [0.4.19] - 2026-10-30
 
