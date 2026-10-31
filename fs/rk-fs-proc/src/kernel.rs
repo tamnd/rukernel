@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
-use rk_mm::{Backing, FileRef, Vma, VmaKind};
+use rk_mm::{Backing, FileRef, HugeAdvice, Vma, VmaKind};
 use rk_proc::exec::USER_HZ;
 use rk_proc::signal::{NSIG, SIG_IGN};
 use rk_proc::{Pid, Process, Thread};
@@ -1070,6 +1070,45 @@ fn map_line_of(a: &Vma<FileRef>, heap: Heap) -> MapLine {
     line
 }
 
+/// The flags of `area` for the line `VmFlags` of `/proc/PID/smaps`, in the order of
+/// `show_smap_vma_flags` of Linux. `soft_dirty` is the flag `VM_SOFTDIRTY`.
+///
+/// A shared mapping of a file that is not open for writing has `VM_MAYSHARE` (ms) but not
+/// `VM_SHARED` (sh) or `VM_MAYWRITE` (mw), as `do_mmap` of Linux. The vDSO has the flags of
+/// `_install_special_mapping`, and its data page also has the flags of a mapping of PFNs. The main
+/// stack has `VM_GROWSDOWN` as on Linux, but rukernel maps all of it at the exec. It has no
+/// `VM_SOFTDIRTY`, as `setup_arg_pages` of Linux removes it.
+fn vm_flags(a: &Vma<FileRef>, soft_dirty: bool) -> Vec<&'static str> {
+    let vvar = a.kind == VmaKind::Vvar;
+    let special = vvar || a.kind == VmaKind::Vdso;
+    let flags = [
+        (a.prot.read, "rd"),
+        (a.prot.write, "wr"),
+        (a.prot.exec, "ex"),
+        (a.shared && a.may_write, "sh"),
+        (true, "mr"),
+        (!vvar && (a.may_write || a.kind == VmaKind::Vdso), "mw"),
+        (!vvar, "me"),
+        (a.shared, "ms"),
+        (a.grows_down || a.kind == VmaKind::Stack, "gd"),
+        (vvar, "pf"),
+        (a.locked, "lo"),
+        (vvar, "io"),
+        (a.dont_fork, "dc"),
+        (special, "de"),
+        // Linux counts a shared anonymous area in its shmem file, not with `VM_ACCOUNT`.
+        (a.account && !a.shared, "ac"),
+        (a.hugetlb, "ht"),
+        (a.wipe_on_fork, "wf"),
+        (vvar || a.dont_dump, "dd"),
+        (soft_dirty && a.kind != VmaKind::Stack, "sd"),
+        (a.huge == HugeAdvice::Huge, "hg"),
+        (a.huge == HugeAdvice::NoHuge, "nh"),
+        (a.mergeable, "mg"),
+    ];
+    flags.into_iter().filter(|&(on, _)| on).map(|(_, name)| name).collect()
+}
+
 /// The text of `/proc/PID/maps`, or of `/proc/PID/smaps` with `smaps`.
 fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -1084,8 +1123,9 @@ fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
                 rss: vm.resident_pages(a.start, a.end) as u64 * 4096,
                 anon: matches!(a.backing, Backing::Anon),
                 locked: a.locked,
+                flags: vm_flags(&a, vm.area_soft_dirty(a.start, a.end)),
             };
-            text::smaps_area(&mut out, &area, &line);
+            text::smaps_area(&mut out, &area);
         }
     }
     Ok(out)

@@ -1907,6 +1907,12 @@ impl AddressSpace {
         self.soft.is_dirty(addr, present)
     }
 
+    /// Tells if the area `start..end` has the flag `VM_SOFTDIRTY` of Linux, for the line
+    /// `VmFlags` of `/proc/PID/smaps`. Before the first clear, each area has it.
+    pub fn area_soft_dirty(&self, start: usize, end: usize) -> bool {
+        !self.soft.tracking() || self.soft.with(|soft| soft.area_dirty(start, end))
+    }
+
     /// Sets the high water mark of the pages with a frame to the pages that have a frame now, as a
     /// write of 5 to `/proc/PID/clear_refs` of Linux.
     pub fn reset_hiwater(&self) {

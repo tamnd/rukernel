@@ -458,11 +458,14 @@ pub struct SmapsArea {
     pub anon: bool,
     /// The area is locked.
     pub locked: bool,
+    /// The two letter names of the flags of the area for the line `VmFlags`, in the order of
+    /// `show_smap_vma_flags` of Linux.
+    pub flags: Vec<&'static str>,
 }
 
 /// The lines of `/proc/PID/smaps` after the map line of an area, as `show_smap` of Linux gives
 /// them. The counts that rukernel does not keep are 0.
-pub fn smaps_area(out: &mut Vec<u8>, a: &SmapsArea, m: &MapLine) {
+pub fn smaps_area(out: &mut Vec<u8>, a: &SmapsArea) {
     let kb = |bytes: u64| bytes / 1024;
     let anon = if a.anon { a.rss } else { 0 };
     let locked = if a.locked { a.rss } else { 0 };
@@ -494,23 +497,11 @@ pub fn smaps_area(out: &mut Vec<u8>, a: &SmapsArea, m: &MapLine) {
         let name = format!("{name}:");
         out.extend_from_slice(format!("{name:<16}{:>8} kB\n", kb(value)).as_bytes());
     }
-    out.extend_from_slice(b"THPeligible:    0\nVmFlags:");
-    let flags = [
-        (m.read, "rd"),
-        (m.write, "wr"),
-        (m.exec, "ex"),
-        (m.shared, "sh"),
-        (true, "mr"),
-        (true, "mw"),
-        (true, "me"),
-        (m.shared, "ms"),
-        (a.locked, "lo"),
-    ];
-    for (on, name) in flags {
-        if on {
-            out.push(b' ');
-            out.extend_from_slice(name.as_bytes());
-        }
+    // Each flag has a space after it, as `show_smap_vma_flags` of Linux prints "%c%c ".
+    out.extend_from_slice(format!("{:<16}{:>8}\nVmFlags: ", "THPeligible:", 0).as_bytes());
+    for name in &a.flags {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b' ');
     }
     out.push(b'\n');
 }
@@ -675,14 +666,15 @@ mod tests {
     #[test]
     fn smaps_shows_the_resident_and_locked_bytes() {
         let mut out = Vec::new();
-        let area = SmapsArea { size: 8192, rss: 4096, anon: true, locked: true };
-        let line = MapLine { read: true, write: true, ..MapLine::default() };
-        smaps_area(&mut out, &area, &line);
+        let flags = alloc::vec!["rd", "wr", "mr", "mw", "me", "lo", "ac"];
+        let area = SmapsArea { size: 8192, rss: 4096, anon: true, locked: true, flags };
+        smaps_area(&mut out, &area);
         let text = core::str::from_utf8(&out).unwrap_or("");
         assert!(text.starts_with("Size:                  8 kB\n"));
         assert!(text.contains("\nRss:                   4 kB\n"));
         assert!(text.contains("\nLocked:                4 kB\n"));
-        assert!(text.ends_with("VmFlags: rd wr mr mw me lo\n"));
+        assert!(text.contains("\nTHPeligible:           0\n"));
+        assert!(text.ends_with("VmFlags: rd wr mr mw me lo ac \n"));
     }
 
     #[test]
