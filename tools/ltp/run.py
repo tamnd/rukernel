@@ -76,6 +76,21 @@ LIMITS = {
     # 65000 bytes. Under QEMU without KVM on a busy host the test passes in about 1400 s.
     "bind_noport01": 1800,
     "bind_noport01_ipv6": 1800,
+    # The test does 50 rounds of ping, `ip neigh show` and a delete. On server2 at a load of 30
+    # one round took 4 s to 9 s, so the 50 rounds take more than 240 s.
+    "ipneigh01_arp": 900,
+    "ipneigh01_ip": 900,
+    "ipneigh6_ip": 900,
+    # Each test runs netstress 5 times with busy polling and 5 times without it.
+    "busy_poll01": 900,
+    "busy_poll01_ipv6": 900,
+    "busy_poll02": 900,
+    "busy_poll02_ipv6": 900,
+    "busy_poll03": 900,
+    "busy_poll03_ipv6": 900,
+    # The test runs netstress for UDP, DCCP and UDP-Lite, 5 times each.
+    "dccp01": 900,
+    "dccp01_ipv6": 900,
 }
 
 # The tests that run in their own boot. memcontrol03 and memcontrol04 can leave cgroups with
