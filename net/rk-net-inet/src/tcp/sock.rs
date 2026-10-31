@@ -1185,7 +1185,12 @@ impl Socket for Stream {
             }
             match step {
                 Step::Data(d) => {
-                    buf.extend_from_slice(&d);
+                    // The first data is the buffer, with no copy (#465).
+                    if buf.is_empty() {
+                        buf = d;
+                    } else {
+                        buf.extend_from_slice(&d);
+                    }
                     if peek || buf.len() >= target {
                         return Ok(received(buf));
                     }

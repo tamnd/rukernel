@@ -173,9 +173,12 @@ impl<T> Eevdf<T> {
     }
 
     /// Keeps the lag of `e`, a task that goes to sleep, as `update_entity_lag` of Linux. The lag
-    /// is at most the slice of the task, or one tick if that is more.
+    /// is at most the slice of the task, or one tick if that is more. `e` is not in the queue,
+    /// but the average counts it, as in `dequeue_entity` of Linux. `place` makes the lag larger
+    /// by the weight of `e`, so without `e` in the average a task that sleeps often gets more lag
+    /// at each sleep, and its wakes stop the task that runs each time (#465).
     pub fn save_lag(&self, e: &mut Entity, tick_ns: u64) {
-        e.lag = lag_of(e, self.avg_vruntime(None), tick_ns);
+        e.lag = lag_of(e, self.avg_vruntime(Some(e)), tick_ns);
     }
 
     /// Places `e`, a task that wakes or is new, in the virtual time of the queue, as
@@ -402,9 +405,13 @@ mod glue {
             Load { queued: self.queue.len(), running: self.curr.is_some() }
         }
 
-        /// The entity of the task that runs, if it is not the task `id`.
-        fn curr_except(&self, id: u64) -> Option<Entity> {
-            self.curr.filter(|&(c, _)| c != id).map(|(_, e)| e)
+        /// The entity of the task that runs at the time `now`, if it is not the task `id`. The
+        /// copy is from the last charge, so the task ran for the time since then, as
+        /// `update_curr` of Linux adds it before `place_entity` and `wakeup_preempt`.
+        fn curr_except(&self, id: u64, now: u64) -> Option<Entity> {
+            let (_, mut e) = self.curr.filter(|&(c, _)| c != id)?;
+            e.vruntime = e.vruntime.saturating_add(e.virt(now.saturating_sub(self.curr_at)));
+            Some(e)
         }
     }
 
@@ -460,7 +467,9 @@ mod glue {
             data(&task).cpu.store(cpu, Ordering::Relaxed);
             let mut rq = self.rqs[cpu].lock();
             if let Some(new) = place {
-                let curr = rq.curr_except(task.id());
+                // Without the run time since the last charge, the task that runs is behind its
+                // real place, and a task that wakes often gets more lag at each wake (#465).
+                let curr = rq.curr_except(task.id(), rk_frame::time::nanos());
                 rq.queue.place(&mut e, curr.as_ref(), new);
             }
             rq.queue.push(task, e);
@@ -473,9 +482,7 @@ mod glue {
         fn wakeup_preempt(&self, cpu: usize, id: u64, e: &Entity) -> bool {
             let now = rk_frame::time::nanos();
             let mut rq = self.rqs[cpu].lock();
-            let Some(mut curr) = rq.curr_except(id) else { return false };
-            // The copy is from the last charge, so the task ran for the time since then.
-            curr.vruntime = curr.vruntime.saturating_add(curr.virt(now.saturating_sub(rq.curr_at)));
+            let Some(curr) = rq.curr_except(id, now) else { return false };
             let preempt = rq.queue.wakeup_preempt(&curr, e);
             rq.preempt |= preempt;
             preempt
