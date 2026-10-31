@@ -181,7 +181,7 @@ pub const STACK_TOP: usize = USER_END;
 pub const STACK_SIZE: usize = 8 << 20;
 /// The free bytes that an area that grows down keeps to the area below it. Linux names it
 /// `stack_guard_gap`, and its default is 256 pages.
-const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
+pub const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
 /// The range for `MAP_32BIT`, as in Linux on x86-64.
 const LOW32: (usize, usize) = (0x4000_0000, 0x8000_0000);
 /// The top of the `mmap` area. Linux puts it a gap of 128 MiB below the stack.
