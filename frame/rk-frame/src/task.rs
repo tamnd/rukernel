@@ -257,6 +257,14 @@ fn this_cpu() -> &'static PerCpu {
     &CPUS[cpu::id()]
 }
 
+/// A key of the task on this CPU, as `Task::current` without a new reference to the task. No two
+/// live tasks have the same key. A key is not zero, and its low bit is clear.
+pub(crate) fn current_key() -> usize {
+    let mut current = this_cpu().current.lock();
+    let task = current.get_or_insert_with(|| Task::on_boot_stack(0, RUNNING));
+    Arc::as_ptr(task).addr()
+}
+
 #[cfg(feature = "big-lock")]
 mod big_lock {
     use super::{cpu, smp};

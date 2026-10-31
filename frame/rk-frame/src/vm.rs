@@ -31,6 +31,7 @@ use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The end of the user half of the address space. Each user address is below it.
@@ -212,26 +213,102 @@ struct Block {
     pages: BTreeMap<usize, (Mapped, PageProt)>,
     /// The huge page of the block. Then `pages` is empty.
     huge: Option<Huge>,
-    /// The status of each page of the block, as the metadata array of a page table page of
-    /// CortenMM. The memory manager sets it. A page can have a status and no frame.
-    status: StatusTable,
 }
 
-/// The locks of one 2 MiB block. `pages` is the lock of the last level table. `held` is the lock
-/// of the status table for the memory manager: the CortenMM backend holds it for the whole change
-/// of the statuses of the block, or for a whole page fault in the block, as the lock of a page
-/// table page of CortenMM. It is the lock of the node of the lowest level of the tree of statuses
-/// of the backend, so a fault finds it with the walk of the page table, with no lock, and does
-/// not walk the tree. A call takes `held` before `pages`, and it does not wait for `held` while it
-/// holds `pages`.
+/// The locks of one 2 MiB block. `pages` is the lock of the last level table. `holder` is the
+/// lock of the status table for the memory manager: the CortenMM backend holds it for the whole
+/// change of the statuses of the block, or for a whole page fault in the block, as the lock of a
+/// page table page of CortenMM. It is the lock of the node of the lowest level of the tree of
+/// statuses of the backend, so a fault finds it with the walk of the page table, with no lock, and
+/// does not walk the tree. A call takes `holder` before `pages`, and it does not wait for `holder`
+/// while it holds `pages`.
+///
+/// Only the task that holds the status table reads or changes it, so a reader of the statuses
+/// takes one lock, the hold, and not the lock of the pages too. The calls that change the pages of
+/// another address space, as the write protect of a page for a write back, take only `pages`, and
+/// do not wait for a hold.
 struct BlockLock {
     pages: SpinLock<Block>,
-    held: AtomicBool,
+    /// 0 if no task holds the status table. Else the key of the holder (`task::current_key`),
+    /// with the low bit set while a call of the holder uses the table.
+    holder: AtomicUsize,
+    /// The status table has a status. Only the holder changes it.
+    used: AtomicBool,
+    /// The status of each page of the block, as the metadata array of a page table page of
+    /// CortenMM. The memory manager sets it. A page can have a status and no frame.
+    status: UnsafeCell<StatusTable>,
 }
+
+// SAFETY: `status` is the only field that is not `Sync`. Only the task with its key in `holder`
+// gets a reference to it, in `with_status`, which sets the low bit of `holder` for the life of
+// the reference, so a second reference cannot exist. A task runs on one CPU at a time.
+unsafe impl Sync for BlockLock {}
 
 impl Default for BlockLock {
     fn default() -> Self {
-        Self { pages: SpinLock::new(Block::default()), held: AtomicBool::new(false) }
+        Self {
+            pages: SpinLock::new(Block::default()),
+            holder: AtomicUsize::new(0),
+            used: AtomicBool::new(false),
+            status: UnsafeCell::new(StatusTable::default()),
+        }
+    }
+}
+
+impl BlockLock {
+    /// Holds the status table, and waits while another task holds it.
+    fn hold(&self) {
+        let key = crate::task::current_key();
+        while self
+            .holder
+            .compare_exchange_weak(0, key, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // The holder can wait for a TLB request of this CPU.
+            while self.holder.load(Ordering::Relaxed) != 0 {
+                crate::sync::wait_hint();
+            }
+        }
+    }
+
+    /// Holds the status table if no task holds it.
+    fn try_hold(&self) -> bool {
+        let key = crate::task::current_key();
+        self.holder.compare_exchange(0, key, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+
+    /// Ends the hold of the status table.
+    ///
+    /// # Panics
+    ///
+    /// If the current task does not hold the table.
+    fn release(&self) {
+        let key = crate::task::current_key();
+        let freed = self.holder.compare_exchange(key, 0, Ordering::Release, Ordering::Relaxed);
+        assert!(freed.is_ok(), "a task ends a hold of a status table that it does not hold");
+    }
+
+    /// Calls `f` with the status table. `f` does not use the address space.
+    ///
+    /// # Panics
+    ///
+    /// If the current task does not hold the table, or if `f` is in a call of `f`.
+    fn with_status<R>(&self, f: impl FnOnce(&mut StatusTable) -> R) -> R {
+        let key = crate::task::current_key();
+        let used = self.holder.compare_exchange(key, key | 1, Ordering::Relaxed, Ordering::Relaxed);
+        assert!(used.is_ok(), "a call uses a status table that the task does not hold");
+        // SAFETY: `holder` is `key | 1` until the store below, so no other call of this task or
+        // of another task gets a reference to the table in that time.
+        let table = unsafe { &mut *self.status.get() };
+        let r = f(table);
+        self.used.store(!table.is_empty(), Ordering::Relaxed);
+        self.holder.store(key, Ordering::Relaxed);
+        r
+    }
+
+    /// Tells if the status table has a status. The answer is exact only for the holder.
+    fn has_status(&self) -> bool {
+        self.used.load(Ordering::Relaxed)
     }
 }
 
@@ -485,16 +562,7 @@ impl VmSpace {
                 None => return false,
             }
         };
-        while lock
-            .held
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // The holder can wait for a TLB request of this CPU.
-            while lock.held.load(Ordering::Relaxed) {
-                crate::sync::wait_hint();
-            }
-        }
+        lock.hold();
         true
     }
 
@@ -505,44 +573,38 @@ impl VmSpace {
     ///
     /// If `addr` is not below `USER_END`.
     pub fn try_hold_status(&self, addr: VirtAddr) -> bool {
-        let lock = self.blocks.get_or_make(addr.get(), BlockLock::default);
-        lock.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        self.blocks.get_or_make(addr.get(), BlockLock::default).try_hold()
     }
 
     /// Ends the hold of the status table of the block of `addr`, which the caller holds.
+    ///
+    /// # Panics
+    ///
+    /// If the current task does not hold the table.
     pub fn release_status(&self, addr: VirtAddr) {
         if let Some(lock) = self.blocks.get(addr.get()) {
-            lock.held.store(false, Ordering::Release);
+            lock.release();
         }
     }
 
-    /// Gives the status of the page at `addr`.
+    /// Gives the status of the page at `addr`. The caller holds the status table of the block,
+    /// or the block has no status.
+    ///
+    /// # Panics
+    ///
+    /// If the block has a status and the current task does not hold its table. The same is true
+    /// for each call below that reads or changes the statuses.
     pub fn status(&self, addr: VirtAddr) -> Option<PageStatus> {
         let a = addr.get();
-        let b = self.block(a)?.lock();
-        b.status.get(slot_of(a)).cloned()
+        let lock = self.blocks.get(a).filter(|l| l.has_status())?;
+        lock.with_status(|t| t.get(slot_of(a)).cloned())
     }
 
     /// Sets the status of each page in the page aligned range `start..end`, or removes it with
-    /// `None`. The frames of the pages do not change.
+    /// `None`. The frames of the pages do not change. The caller holds the status table of each
+    /// block of the range.
     pub fn set_status(&self, start: VirtAddr, end: VirtAddr, status: Option<&PageStatus>) {
-        let (start, end) = (start.get(), end.get().min(USER_END));
-        let set = |block: usize, lock: &SpinLock<Block>| {
-            let (from, to) = clip(block, start, end);
-            lock.lock().status.set(slot_of(from), slot_of(to - 1) + 1, status);
-        };
-        if status.is_none() {
-            let _ = self.blocks.each(start, end, |block, lock| {
-                set(block, &lock.pages);
-                Ok::<(), ()>(())
-            });
-            return;
-        }
-        let mut block = block_of(start);
-        while block < end {
-            set(block, self.block_or_new(block));
-            block += HUGE_PAGE_SIZE;
-        }
+        self.change_status(start, end, status, None, |_, _, _| {});
     }
 
     /// Sets the status of each page in the page aligned range `start..end`, or removes it with
@@ -562,18 +624,24 @@ impl VmSpace {
         let mut block = block_of(start);
         while block < end {
             // A block with no lock has no status and no page.
-            let lock =
-                if status.is_some() { Some(self.block_or_new(block)) } else { self.block(block) };
+            let lock = if status.is_some() {
+                Some(self.blocks.get_or_make(block, BlockLock::default))
+            } else {
+                self.blocks.get(block)
+            };
             if let Some(lock) = lock {
                 let (from, to) = clip(block, start, end);
                 let (first, last) = (slot_of(from), slot_of(to - 1) + 1);
-                let mut b = lock.lock();
-                b.status.runs(first, last, |a, z, s| {
-                    old(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
-                });
-                b.status.set(first, last, status);
+                if status.is_some() || lock.has_status() {
+                    lock.with_status(|t| {
+                        t.runs(first, last, |a, z, s| {
+                            old(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
+                        });
+                        t.set(first, last, status);
+                    });
+                }
                 if let Some(c) = change.as_deref_mut() {
-                    self.change_block(&mut b, block, from, to, c);
+                    self.change_block(&mut lock.lock(), block, from, to, c);
                 }
             }
             block += HUGE_PAGE_SIZE;
@@ -679,10 +747,11 @@ impl VmSpace {
         while addr < end {
             let block = block_of(addr);
             let to = end.min(block + HUGE_PAGE_SIZE);
-            if let Some(lock) = self.block(addr) {
-                let b = lock.lock();
-                b.status.runs(slot_of(addr), slot_of(to - 1) + 1, |a, z, s| {
-                    f(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
+            if let Some(lock) = self.blocks.get(addr).filter(|l| l.has_status()) {
+                lock.with_status(|t| {
+                    t.runs(slot_of(addr), slot_of(to - 1) + 1, |a, z, s| {
+                        f(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
+                    });
                 });
             }
             addr = to;
@@ -699,14 +768,15 @@ impl VmSpace {
     ) -> Option<(usize, usize, PageStatus)> {
         let a = addr.get();
         let block = block_of(a);
-        let b = self.block(a)?.lock();
-        let (first, end, s) = b.status.run_at(slot_of(a), same)?;
+        let lock = self.blocks.get(a).filter(|l| l.has_status())?;
+        let (first, end, s) = lock.with_status(|t| t.run_at(slot_of(a), same))?;
         Some((block + first * PAGE_SIZE, block + end * PAGE_SIZE, s))
     }
 
-    /// Tells if a page of the 2 MiB block of `addr` has a status.
+    /// Tells if a page of the 2 MiB block of `addr` has a status. The answer is exact only for
+    /// the holder of the status table, and it takes no lock.
     pub fn has_status(&self, addr: VirtAddr) -> bool {
-        self.block(addr.get()).is_some_and(|lock| !lock.lock().status.is_empty())
+        self.blocks.get(addr.get()).is_some_and(BlockLock::has_status)
     }
 
     /// Makes the address space of a child of `fork` with the pages of this space in `areas`. The
@@ -741,13 +811,17 @@ impl VmSpace {
         let child = Self::new().ok_or(MapError::NoMemory)?;
         let mut flush = false;
         let copied = self.blocks.each(0, USER_END, |block, lock| {
-            let mut b = lock.lock();
-            if !b.status.is_empty() {
-                let status = b.status.map(&mut map);
+            if lock.has_status() {
+                let status = lock.with_status(|t| t.map(&mut map));
                 if !status.is_empty() {
-                    child.block_or_new(block).lock().status = status;
+                    // No other call uses the child yet.
+                    let c = child.blocks.get_or_make(block, BlockLock::default);
+                    c.hold();
+                    c.with_status(|t| *t = status);
+                    c.release();
                 }
             }
+            let mut b = lock.lock();
             self.fork_block(&child, &mut b, block, areas, &mut flush)
         });
         if flush {
