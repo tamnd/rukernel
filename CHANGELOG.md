@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The LTP net tables in tools/ltp are made again from a new run of the net group with the tools of tools/ltp/build-tools.sh. The runner gives ipneigh01_arp, ipneigh01_ip, ipneigh6_ip, the busy_poll tests and dccp01 a limit of 900 s, because on a busy host they take more than 240 s. Now 117 of the 356 net tests pass, before 14 (#491).
+
 ### Fixed
 
 - The kernel maps each segment of a program with the protection of the segment, as `elf_map` of Linux (#405). Before, it mapped each segment writable and then called `mprotect`, so the text and the read-only data were in the commit count and showed `ac` in `VmFlags` of `/proc/PID/smaps`.
