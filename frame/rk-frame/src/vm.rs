@@ -114,6 +114,50 @@ pub struct UserFault {
     pub write: bool,
 }
 
+/// A change of the pages of a range that `VmSpace::change_status` makes in the same walk and
+/// under the same lock of each 2 MiB block as the change of their statuses, as a change of
+/// CortenMM writes the metadata and the entries of a page table page together. `VmSpace::finish`
+/// ends it: it flushes the TLB one time for all the 4 KiB pages, and frees the frames after the
+/// flush, as `tlb_finish_mmu` of Linux.
+pub struct PageChange {
+    op: PageOp,
+    /// The range has one page, so each entry gets its own flush, as one `invlpg` costs less than
+    /// a flush of all the entries.
+    each: bool,
+    /// An entry changed, and the TLB needs a flush.
+    flush: bool,
+    /// The pages that the change removed. Their frames go after the flush.
+    freed: Vec<BTreeMap<usize, (Mapped, PageProt)>>,
+    /// The huge pages that the change removed. They had their own flush.
+    huge: Vec<Huge>,
+}
+
+/// What a [`PageChange`] does to each page.
+#[derive(Clone, Copy)]
+enum PageOp {
+    Unmap,
+    Protect(PageProt),
+}
+
+impl PageChange {
+    fn new(op: PageOp, start: VirtAddr, end: VirtAddr) -> Self {
+        let each = end.get() - start.get() <= PAGE_SIZE;
+        Self { op, each, flush: false, freed: Vec::new(), huge: Vec::new() }
+    }
+
+    /// Removes the pages of `start..end`, as `unmap_range`. The change can cover a part of the
+    /// range in each call.
+    pub fn unmap(start: VirtAddr, end: VirtAddr) -> Self {
+        Self::new(PageOp::Unmap, start, end)
+    }
+
+    /// Gives the pages of `start..end` the permissions `prot`. A huge page that is all in the
+    /// range stays whole if `prot` allows an access, and else it is split.
+    pub fn protect(start: VirtAddr, end: VirtAddr, prot: PageProt) -> Self {
+        Self::new(PageOp::Protect(prot), start, end)
+    }
+}
+
 /// A frame that a page table entry maps. The value counts in the map count of the frame while it
 /// lives, as the reverse map of Linux (mm/rmap.c) does. Other references to the frame, as the
 /// page cache of a file, do not count. See [`Frame::map_count`].
@@ -501,6 +545,125 @@ impl VmSpace {
         }
     }
 
+    /// Sets the status of each page in the page aligned range `start..end`, or removes it with
+    /// `None`, and makes the change `change` to the pages of the range, in one walk with one lock
+    /// of each block. `old` gets each run of the old statuses of the range with one status value,
+    /// in address order, with the lock of the block held, so it does not use this space. The range
+    /// is small: the memory manager gives one block.
+    pub fn change_status(
+        &self,
+        start: VirtAddr,
+        end: VirtAddr,
+        status: Option<&PageStatus>,
+        mut change: Option<&mut PageChange>,
+        mut old: impl FnMut(usize, usize, &PageStatus),
+    ) {
+        let (start, end) = (start.get(), end.get().min(USER_END));
+        let mut block = block_of(start);
+        while block < end {
+            // A block with no lock has no status and no page.
+            let lock =
+                if status.is_some() { Some(self.block_or_new(block)) } else { self.block(block) };
+            if let Some(lock) = lock {
+                let (from, to) = clip(block, start, end);
+                let (first, last) = (slot_of(from), slot_of(to - 1) + 1);
+                let mut b = lock.lock();
+                b.status.runs(first, last, |a, z, s| {
+                    old(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
+                });
+                b.status.set(first, last, status);
+                if let Some(c) = change.as_deref_mut() {
+                    self.change_block(&mut b, block, from, to, c);
+                }
+            }
+            block += HUGE_PAGE_SIZE;
+        }
+    }
+
+    /// Makes the change `change` to the pages of the page aligned range `start..end`, with one
+    /// lock of each block that has a page. The statuses do not change.
+    pub fn change_pages(&self, start: VirtAddr, end: VirtAddr, change: &mut PageChange) {
+        let (start, end) = (start.get(), end.get());
+        let _ = self.blocks.each(start, end, |block, lock| {
+            let (from, to) = clip(block, start, end);
+            self.change_block(&mut lock.lock(), block, from, to, change);
+            Ok::<(), ()>(())
+        });
+    }
+
+    /// Ends the change `change`: one TLB flush for all its 4 KiB pages, and then the free of
+    /// their frames.
+    pub fn finish(&self, change: PageChange) {
+        if change.flush {
+            paging::user_flush_all(self.root);
+        }
+        drop(change);
+    }
+
+    /// Makes the change `c` to the pages of `from..to` in the block at `block`.
+    fn change_block(
+        &self,
+        b: &mut Block,
+        block: usize,
+        from: usize,
+        to: usize,
+        c: &mut PageChange,
+    ) {
+        let whole = (from, to) == (block, block + HUGE_PAGE_SIZE);
+        match c.op {
+            PageOp::Unmap => {
+                if let Some(huge) = b.huge.take_if(|_| whole) {
+                    paging::user_unmap_huge(self.root, block, huge.table);
+                    if huge.thp {
+                        HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    self.huge.fetch_sub(1, Ordering::Relaxed);
+                    c.huge.push(huge);
+                }
+                self.split(b, block);
+                let mut gone = b.pages.split_off(&from);
+                let mut after = gone.split_off(&to);
+                b.pages.append(&mut after);
+                if gone.is_empty() {
+                    return;
+                }
+                if c.each {
+                    gone.keys().for_each(|&a| paging::user_unmap(self.root, a));
+                } else {
+                    c.flush |= paging::user_unmap_many(self.root, gone.keys().copied());
+                }
+                self.small.fetch_sub(gone.len(), Ordering::Relaxed);
+                c.freed.push(gone);
+            }
+            PageOp::Protect(prot) => {
+                if let Some(huge) = &mut b.huge {
+                    // A huge page keeps one entry if its permissions do not change, as `protect`.
+                    if huge.prot == prot {
+                        return;
+                    }
+                    if whole && prot != PageProt::NONE {
+                        huge.prot = prot;
+                        let phys = huge.frames[0].addr().get();
+                        paging::user_protect_huge(self.root, block, phys, prot.bits());
+                        return;
+                    }
+                    self.split(b, block);
+                }
+                let pages = b.pages.range_mut(from..to).filter(|(_, (_, p))| *p != prot);
+                let mut pages = pages.map(|(&a, (f, p))| {
+                    *p = prot;
+                    (a, f.addr().get(), prot.bits())
+                });
+                if c.each {
+                    pages
+                        .for_each(|(a, phys, bits)| paging::user_protect(self.root, a, phys, bits));
+                } else {
+                    c.flush |= paging::user_protect_many(self.root, &mut pages);
+                }
+            }
+        }
+    }
+
     /// Calls `f` with each run of pages in `start..end` that have the same status value, in
     /// address order. `f` runs with the lock of the block held, so it does not use this space.
     /// The walk looks at each 2 MiB block of the range, so the range is small: the memory manager
@@ -681,82 +844,9 @@ impl VmSpace {
     /// page sent one shootdown for each page, and the `munmap` of `fault_mt` on 4 CPUs sent about
     /// 6000 shootdowns where Linux sends about 9 (#468).
     pub fn unmap_range(&self, start: VirtAddr, end: VirtAddr) {
-        let (start, end) = (start.get(), end.get());
-        if end - start <= PAGE_SIZE {
-            return self.unmap_range_flush_each(start, end);
-        }
-        let mut freed = Vec::new();
-        let mut flush = false;
-        let _ = self.blocks.each(start, end, |block, lock| {
-            let mut b = lock.lock();
-            let (from, to) = clip(block, start, end);
-            let mut huge = None;
-            if b.huge.is_some() {
-                if (from, to) == (block, block + HUGE_PAGE_SIZE) {
-                    huge = b.huge.take();
-                    if let Some(huge) = &huge {
-                        paging::user_unmap_huge(self.root, block, huge.table);
-                        if huge.thp {
-                            HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        self.huge.fetch_sub(1, Ordering::Relaxed);
-                    }
-                } else {
-                    self.split(&mut b, block);
-                }
-            }
-            let mut gone = b.pages.split_off(&from);
-            let mut after = gone.split_off(&to);
-            b.pages.append(&mut after);
-            flush |= paging::user_unmap_many(self.root, gone.keys().copied());
-            self.small.fetch_sub(gone.len(), Ordering::Relaxed);
-            drop(b);
-            // The huge page had its own flush, so its frames can go now.
-            drop(huge);
-            if !gone.is_empty() {
-                freed.push(gone);
-            }
-            Ok::<(), ()>(())
-        });
-        if flush {
-            paging::user_flush_all(self.root);
-        }
-        drop(freed);
-    }
-
-    /// Removes the pages in `start..end` as `unmap_range` does, with a flush for each 4 KiB page.
-    /// A range of one page uses it, as one `invlpg` costs less than a flush of all the entries.
-    fn unmap_range_flush_each(&self, start: usize, end: usize) {
-        let _ = self.blocks.each(start, end, |block, lock| {
-            let mut b = lock.lock();
-            let (from, to) = clip(block, start, end);
-            let mut huge = None;
-            if b.huge.is_some() {
-                if (from, to) == (block, block + HUGE_PAGE_SIZE) {
-                    huge = b.huge.take();
-                    if let Some(huge) = &huge {
-                        paging::user_unmap_huge(self.root, block, huge.table);
-                        if huge.thp {
-                            HUGE_MAPPED.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        self.huge.fetch_sub(1, Ordering::Relaxed);
-                    }
-                } else {
-                    self.split(&mut b, block);
-                }
-            }
-            let mut gone = b.pages.split_off(&from);
-            let mut after = gone.split_off(&to);
-            b.pages.append(&mut after);
-            for &a in gone.keys() {
-                paging::user_unmap(self.root, a);
-            }
-            self.small.fetch_sub(gone.len(), Ordering::Relaxed);
-            // The frames go after the lock.
-            drop(b);
-            drop((gone, huge));
-            Ok::<(), ()>(())
-        });
+        let mut change = PageChange::unmap(start, end);
+        self.change_pages(start, end, &mut change);
+        self.finish(change);
     }
 
     /// Removes the page at `addr` and gives its frame.
