@@ -615,6 +615,14 @@ impl AddressSpace {
         self.state.lock().vmas.iter().cloned().collect()
     }
 
+    /// Gives a copy of the areas in address order, and the start and the end of the heap, as
+    /// `start_brk` and `brk` of Linux. All three come from one lock, so `/proc/PID/maps` can name
+    /// the areas of the heap with them.
+    pub fn areas_and_heap(&self) -> (Vec<Vma<FileRef>>, usize, usize) {
+        let st = self.state.lock();
+        (st.vmas.iter().cloned().collect(), st.brk_start, st.brk)
+    }
+
     /// Gives the start of the first area of the kind `kind`, or `None` if there is none. The
     /// signal code of arm64 finds the vDSO with it.
     pub fn find_kind(&self, kind: VmaKind) -> Option<usize> {

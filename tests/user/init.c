@@ -4077,6 +4077,54 @@ static unsigned long maps_area_end(unsigned long addr)
 	return 0;
 }
 
+/* Copies the line of /proc/self/maps of the area that holds `addr` to `out`. Gives 0 if there is
+ * no such area. */
+static int maps_line(unsigned long addr, char *out, size_t len)
+{
+	static char maps[65536];
+	unsigned long a, b;
+
+	if (read_file("/proc/self/maps", maps, sizeof(maps)) <= 0)
+		return 0;
+	for (char *line = maps; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+		if (sscanf(line, "%lx-%lx", &a, &b) != 2 || addr < a || addr >= b)
+			continue;
+		size_t n = strcspn(line, "\n");
+		if (n >= len)
+			n = len - 1;
+		memcpy(out, line, n);
+		out[n] = 0;
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * The names of /proc/PID/maps that the maps diff of tools/mapsdiff found different from Linux
+ * (#405). An area with no file in the heap shows [heap], as vma_is_initial_heap of Linux. The
+ * malloc of musl puts such an area there: a guard page that it maps with MAP_FIXED.
+ */
+static void test_maps_names(void)
+{
+	const unsigned long ps = 4096;
+	char line[512];
+	int status = 0;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		unsigned long b = ((unsigned long)syscall(SYS_brk, 0) + ps - 1) & ~(ps - 1);
+		if ((unsigned long)syscall(SYS_brk, b + 2 * ps) != b + 2 * ps)
+			_exit(2);
+		if (mmap((void *)b, ps, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != (void *)b)
+			_exit(3);
+		int ok = maps_line(b, line, sizeof(line)) && strstr(line, " [heap]") &&
+			 maps_line(b + ps, line, sizeof(line)) && strstr(line, " [heap]");
+		_exit(ok ? 0 : 1);
+	}
+	check("/proc/self/maps names an area that mmap put in the heap [heap]",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 /*
  * vma01 of LTP (#475): an area that a child of fork got with its pages does not join a new area
  * next to it, because its anon_vma chain is not singular (mm/vma.c of Linux). In the parent the
@@ -4360,6 +4408,7 @@ static void test_proc(void)
 	check("/proc/self/nothing gives ENOENT", open("/proc/self/nothing", O_RDONLY) == -1 && errno == ENOENT);
 	test_pagemap();
 	test_fork_area_merge();
+	test_maps_names();
 	check("umount proc", umount("/proc") == 0);
 }
 
