@@ -158,6 +158,41 @@ Only two results are different:
 
 In both cases the CortenMM backend shows the same areas as Linux, and the VMA backend did not merge. Since #405 the VMA backend merges as `vma_merge` of Linux, and it shows 1 area in both cases too. `smaps` was different in the same way. All the other areas, and the maps of the child after `fork`, are the same on the two backends. The binary has no name on either backend (Linux shows `/init`). The areas come from the statuses, so the CortenMM backend needs no shadow structure to make these files.
 
+## The maps diff over the L4 corpus (#405)
+
+tools/mapsdiff runs the diff over a larger set of programs: the Alpine and Debian root file systems of the boot tests. In each image, it runs each ELF program with `--version`, a list of real commands (for example `ls -l`, `tar`, `apt-cache`, `perl`), and 15 cases of `mapsdump.c` that make areas with `mmap`, `mprotect`, `mremap`, `madvise`, `mlock`, `brk`, a memfd, System V shared memory and `fork`. Each program runs under `ptrace` with `ADDR_NO_RANDOMIZE`, and `mapsdump` prints `/proc/PID/maps` and `/proc/PID/smaps` at its exit stop. Linux is the kernel of the host (Ubuntu 6.8.0) with `nokaslr`, under the same QEMU machine. The VMA and corten kernels are compared byte for byte. Linux and rukernel are compared after a normalization of the addresses to sizes and gaps.
+
+The first run found these differences. Each fix has an init check.
+
+| Difference | Programs | Fix |
+|---|---|---|
+| The guard page that the `malloc` of musl maps in the heap had no name `[heap]` | 26 of 37 on Alpine | #519 |
+| A memfd and an unlinked file had no ` (deleted)` | cases | #520 |
+| `VmFlags` had few flags, and `sh` and `mw` on each shared area | all | #521 |
+| `mmap` put an area directly below an area of `MAP_GROWSDOWN` | cases | #525 |
+| Set-user-ID programs kept `ADDR_NO_RANDOMIZE` | 10 on Debian | #526 |
+| Read-only segments of a program that the kernel loads had `ac` | all | #527 |
+
+The result with all fixes (release kernels, server2, load 25 to 35):
+
+| Image | Compare | maps same / different | smaps same / different | VmFlags same / different |
+|---|---|---|---|---|
+| Alpine | VMA and corten | 37 / 0 | 37 / 0 | |
+| Debian | VMA and corten | 256 / 10 | 256 / 10 | |
+| Alpine | Linux and VMA | 33 / 4 | 33 / 0 | 29 / 4 |
+| Debian | Linux and VMA | 247 / 19 | 247 / 0 | 243 / 4 |
+
+Linux and corten give the same counts as Linux and VMA. The 10 Debian programs that differ between VMA and corten are the set-user-ID programs, which now have a random layout on both backends. Thus the two backends show the same maps and smaps for each program with a fixed layout. smaps and VmFlags are compared only for the programs with the same maps.
+
+The differences that stay:
+
+- `nr` (`VM_NORESERVE`) is not shown, because the area does not keep `MAP_NORESERVE` (4 cases).
+- `madvise` with `MADV_RANDOM` or `MADV_SEQUENTIAL` (`rr`, `sr`) and `mlock2` with `MLOCK_ONFAULT` (`lf`) keep no flag on the area, so Linux splits the area and rukernel does not.
+- A private mapping of /dev/zero shows no name. Linux shows `/dev/zero`.
+- A static PIE program (`ldconfig`) and `ld.so` run as a program get a different place. Linux puts the heap of a static PIE at `ELF_ET_DYN_BASE`. rukernel does not randomize `brk`, so the set-user-ID programs still differ from Linux.
+- `find`, `tar` and `update-passwd` make an anonymous area of a different size (1 to 19 pages). The cause is in the program, not in the maps code, and it was not found.
+- `ProtectionKey` and `[vsyscall]` are not compared, because rukernel has neither.
+
 ## Boot tests
 
 With `RK_KERNEL_FEATURES=corten` on server3 (load average below 1.5), each test with the ELF kernel, the bzImage and UEFI:
@@ -183,13 +218,13 @@ There is no `fork` boot test. The `mm`, `vm`, `init` and `busybox` tests use `fo
 
 - Remove the big kernel lock, and give the page table of rk-frame a lock for each node, as spec/25-removing-the-big-kernel-lock.md gives. Then run `fault_mt` and `mmap_mt` again, on hardware or with KVM.
 - Keep the status in the page table pages, as CortenMM does, and remove the separate tree.
-- Run the `maps` and `smaps` differential over the full L4 corpus.
+- Run the `maps` and `smaps` differential over the full L4 corpus. Done in #405 with tools/mapsdiff, see above.
 
 ## Recommendation for question 1
 
 Keep the VMAs as the source of truth for now, and decide again after the big kernel lock goes.
 
 - Scalability: not shown. With the big kernel lock, only one CPU runs kernel code at a time, so the per node locks cannot give scaling. `fault_mt` and `mmap_mt` show no clear gain, and `fork` was 3 to 4 times slower (1.9 times with #405 and #401, and 3.0 times for `fork_big`). The test of document 22 cannot pass or fail until the kernel runs page faults on more than one CPU at the same time.
-- Fidelity: passes, and is better than the VMA backend. The CortenMM backend makes `maps` and `smaps` from the statuses with no shadow structure, and in the two cases that differ it shows the same areas as Linux. This removes the main argument for VMAs in question 1 (the cost of a shadow view). The differential ran on a small set of cases, not the full L4 corpus.
+- Fidelity: passes, and is better than the VMA backend. The CortenMM backend makes `maps` and `smaps` from the statuses with no shadow structure, and in the two cases that differ it shows the same areas as Linux. This removes the main argument for VMAs in question 1 (the cost of a shadow view). The differential over the L4 corpus (#405) found no difference between the two backends for a program with a fixed layout. The differences to Linux that it found were in code that both backends share, and #519 to #527 fixed most of them.
 
 Thus question 1 stays open. Do the follow up items above in this order: the big kernel lock, the page table locks of rk-frame, and the statuses in the page table pages. Then run `fault_mt`, `mmap_mt` and will-it-scale on hardware or with KVM. Until then, the default backend gets the merge rules of Linux, and the `corten` feature stays as the experiment.
