@@ -698,6 +698,8 @@ fn vm_status_test() -> bool {
     let value = |s: &PageStatus| s.downcast_ref::<u32>().copied();
     let status = |n: usize| space.status(at(n)).as_ref().and_then(value);
     let (a, b): (PageStatus, PageStatus) = (Arc::new(1u32), Arc::new(2u32));
+    // Only the holder of the status table of a block reads or changes its statuses.
+    space.hold_status(at(0), true);
     space.set_status(at(0), at(8), Some(&a));
     space.set_status(at(2), at(4), Some(&b));
     let mut ok = check(
@@ -730,7 +732,12 @@ fn vm_status_test() -> bool {
     ok &= check(
         "fork copies the statuses that the caller keeps",
         child.as_ref().is_ok_and(|c| {
-            c.status(at(0)).as_ref().and_then(value) == Some(11) && c.status(at(2)).is_none()
+            c.hold_status(at(0), false) && {
+                let ok = c.status(at(0)).as_ref().and_then(value) == Some(11)
+                    && c.status(at(2)).is_none();
+                c.release_status(at(0));
+                ok
+            }
         }),
     );
     drop(child);
@@ -755,6 +762,7 @@ fn vm_status_test() -> bool {
                 space.page(at(6)).is_none() && status(6) == Some(1)
             },
     );
+    space.release_status(at(0));
     ok &= check(
         "a hold of a status table excludes a second hold",
         !space.hold_status(at(512), false)
@@ -765,8 +773,8 @@ fn vm_status_test() -> bool {
                 space.try_hold_status(at(0))
             },
     );
-    space.release_status(at(0));
     space.set_status(at(0), at(8), None);
+    space.release_status(at(0));
     ok &= check(
         "a clear removes the statuses",
         !space.has_status(at(0)) && Arc::strong_count(&a) == 1 && Arc::strong_count(&b) == 1,

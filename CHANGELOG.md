@@ -9,6 +9,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The LTP net tables in tools/ltp are made again from a new run of the net group with the tools of tools/ltp/build-tools.sh. The runner gives ipneigh01_arp, ipneigh01_ip, ipneigh6_ip, the busy_poll tests and dccp01 a limit of 900 s, because on a busy host they take more than 240 s. Now 117 of the 356 net tests pass, before 14 (#491).
 - tools/mapsdiff runs the maps and smaps diff of rukernel and Linux over the Alpine and Debian images of the boot tests, under QEMU (#405). It compares the VMA and corten backends byte for byte, and each backend with Linux after a normalization of the addresses. tools/bench/cortenmm.md has the result.
 
+### Added
+
+- With the `corten` backend, only the task that holds a 2 MiB block reads or changes the statuses of its pages, so a reader of the statuses takes one lock, the hold of the block, and not the lock of the pages too (#405). The status table moves out of the lock of the pages to the hold. The calls that change the pages of another address space, as the write protect of a page for a write back, still take only the lock of the pages. This is the first step to keep the statuses in the page table pages.
+
 ### Fixed
 
 - The kernel maps each segment of a program with the protection of the segment, as `elf_map` of Linux (#405). Before, it mapped each segment writable and then called `mprotect`, so the text and the read-only data were in the commit count and showed `ac` in `VmFlags` of `/proc/PID/smaps`.
