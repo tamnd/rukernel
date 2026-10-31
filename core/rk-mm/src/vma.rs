@@ -10,6 +10,10 @@ use alloc::vec::Vec;
 /// The size of a page.
 pub const PAGE_SIZE: usize = 4096;
 
+/// The free bytes that an area that grows down keeps to the area below it. Linux names it
+/// `stack_guard_gap`, and its default is 256 pages.
+pub const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
+
 /// Rounds `value` up to a multiple of the page size. Gives `None` on overflow.
 pub fn page_up(value: usize) -> Option<usize> {
     Some(value.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1))
@@ -353,6 +357,9 @@ impl<F: Clone> VmaSet<F> {
     /// The search starts below the free range that the last search found, if that search was for
     /// the same `top` and for `len` bytes or less. So a run of `mmap` calls takes O(log n) for each
     /// call, not O(n).
+    ///
+    /// The range keeps [`STACK_GUARD_GAP`] free below an area that grows down, as `vm_start_gap`
+    /// of Linux, so the area can grow.
     pub fn find_gap(&mut self, len: usize, bottom: usize, top: usize) -> Option<usize> {
         let mut end = match self.gap_hint {
             Some(h) if h.top == top && h.len <= len => h.addr,
@@ -362,7 +369,9 @@ impl<F: Clone> VmaSet<F> {
             if vma.end <= end && end - vma.end >= len {
                 break;
             }
-            end = end.min(vma.start);
+            let floor =
+                if vma.grows_down { vma.start.saturating_sub(STACK_GUARD_GAP) } else { vma.start };
+            end = end.min(floor);
         }
         let start = end.checked_sub(len).filter(|&s| s >= bottom)?;
         // Each free range above `end` and below `top` is shorter than `len`.
@@ -636,6 +645,16 @@ mod tests {
         assert_eq!(s.find_gap(10 * P, 0, 110 * P), Some(100 * P));
         assert_eq!(s.find_gap(80 * P, 0, 100 * P), None);
         assert_eq!(s.find_gap(10 * P, 65 * P, 100 * P), None);
+    }
+
+    #[test]
+    fn the_gap_search_keeps_the_guard_gap_below_a_stack() {
+        let mut s: VmaSet<u32> = VmaSet::new();
+        let mut stack = Vma::anon(1000 * P, 1010 * P, Prot::RW, VmaKind::Normal);
+        stack.grows_down = true;
+        s.insert(stack);
+        let gap = STACK_GUARD_GAP / P;
+        assert_eq!(s.find_gap(P, 0, 1010 * P), Some((1000 - gap - 1) * P));
     }
 
     #[test]

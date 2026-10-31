@@ -8,7 +8,8 @@ use crate::hugetlb::{HPAGE_SIZE, Subpool};
 use crate::softdirty::SoftLock;
 use crate::tunables::{self, OVERCOMMIT_NEVER, ThpMode};
 use crate::vma::{
-    Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet, is_page_aligned, page_up,
+    Backing, HugeAdvice, PAGE_SIZE, Prot, STACK_GUARD_GAP, Vma, VmaKind, VmaSet, is_page_aligned,
+    page_up,
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
@@ -179,9 +180,6 @@ pub const MMAP_MIN_ADDR: usize = 0x1_0000;
 pub const STACK_TOP: usize = USER_END;
 /// The size of the main stack area. The `RLIMIT_STACK` default of Linux is 8 MiB.
 pub const STACK_SIZE: usize = 8 << 20;
-/// The free bytes that an area that grows down keeps to the area below it. Linux names it
-/// `stack_guard_gap`, and its default is 256 pages.
-pub const STACK_GUARD_GAP: usize = 256 * PAGE_SIZE;
 /// The range for `MAP_32BIT`, as in Linux on x86-64.
 const LOW32: (usize, usize) = (0x4000_0000, 0x8000_0000);
 /// The top of the `mmap` area. Linux puts it a gap of 128 MiB below the stack.

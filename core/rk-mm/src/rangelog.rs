@@ -34,6 +34,8 @@ pub struct Change {
     pub end: usize,
     /// `true` if the range is now used, `false` if it is now free.
     pub used: bool,
+    /// The range is now used by an area that grows down.
+    pub grows_down: bool,
 }
 
 /// A part of the log on its own cache line, so two CPUs that add changes do not share a line.
@@ -65,12 +67,25 @@ impl RangeLog {
     /// the page table tree. Gives `true` if the part of the CPU is long, and the caller must then
     /// apply the log.
     pub fn push(&self, cpu: usize, start: usize, end: usize, used: bool) -> bool {
+        self.push_area(cpu, start, end, used, false)
+    }
+
+    /// Adds a change as [`RangeLog::push`] does. `grows_down` tells that the range is now used by
+    /// an area that grows down, so the search keeps the guard gap below it.
+    pub fn push_area(
+        &self,
+        cpu: usize,
+        start: usize,
+        end: usize,
+        used: bool,
+        grows_down: bool,
+    ) -> bool {
         if start >= end {
             return false;
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let mut part = self.parts[cpu % PARTS].0.lock();
-        part.push(Change { seq, start, end, used });
+        part.push(Change { seq, start, end, used, grows_down });
         part.len() > PART_LIMIT
     }
 
@@ -98,7 +113,7 @@ impl RangeLog {
     pub fn apply<F: Clone + PartialEq>(&self, va: &mut VmaSet<F>) {
         for c in self.take() {
             if c.used {
-                reserve(va, c.start, c.end);
+                reserve_area(va, c.start, c.end, c.grows_down);
             } else {
                 va.remove_range(c.start, c.end);
             }
@@ -108,8 +123,21 @@ impl RangeLog {
 
 /// Adds `start..end` to the used ranges `va`. Only the range of the area in the set has a meaning.
 pub fn reserve<F: Clone + PartialEq>(va: &mut VmaSet<F>, start: usize, end: usize) {
+    reserve_area(va, start, end, false);
+}
+
+/// Adds `start..end` to the used ranges `va`. `grows_down` tells that an area that grows down
+/// uses it, so [`VmaSet::find_gap`] keeps the guard gap below it.
+pub fn reserve_area<F: Clone + PartialEq>(
+    va: &mut VmaSet<F>,
+    start: usize,
+    end: usize,
+    grows_down: bool,
+) {
     va.remove_range(start, end);
-    va.insert_merged(Vma::anon(start, end, Prot::default(), VmaKind::Normal));
+    let mut area = Vma::anon(start, end, Prot::default(), VmaKind::Normal);
+    area.grows_down = grows_down;
+    va.insert_merged(area);
 }
 
 #[cfg(test)]

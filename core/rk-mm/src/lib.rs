@@ -26,10 +26,10 @@ mod space;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use space::{
-    Access, AddressSpace, FileRef, MMAP_MIN_ADDR, MMAP_TOP, MmFile, MmapRequest, Remap,
-    STACK_GUARD_GAP, STACK_SIZE, STACK_TOP, WriteMap,
+    Access, AddressSpace, FileRef, MMAP_MIN_ADDR, MMAP_TOP, MmFile, MmapRequest, Remap, STACK_SIZE,
+    STACK_TOP, WriteMap,
 };
-pub use vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet};
+pub use vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, STACK_GUARD_GAP, Vma, VmaKind, VmaSet};
 
 /// The free frames that a page of a process cannot take. The kernel keeps them for its heap and
 /// for its own work when the memory is short, so that the OOM killer can run. A fault that finds

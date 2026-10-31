@@ -22,7 +22,7 @@ use super::{
 };
 use crate::hugetlb::HPAGE_SIZE;
 use crate::pttree::{Leaves, RangeLock, TREE_END, Tree};
-use crate::rangelog::{RangeLog, reserve};
+use crate::rangelog::{RangeLog, reserve_area};
 use crate::tunables::{self, OVERCOMMIT_NEVER};
 use crate::vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -290,7 +290,13 @@ impl Corten {
     /// Records that `start..end` is now used or free in the tree. The caller holds the lock of the
     /// range in the tree, so the changes of one range go in the log in their order.
     fn note(&self, start: usize, end: usize, used: bool) {
-        if self.log.push(rk_frame::cpu::id(), start, end, used) {
+        self.note_area(start, end, used, false);
+    }
+
+    /// Records a change as [`Corten::note`] does. `grows_down` tells that an area that grows down
+    /// now uses the range.
+    fn note_area(&self, start: usize, end: usize, used: bool, grows_down: bool) {
+        if self.log.push_area(rk_frame::cpu::id(), start, end, used, grows_down) {
             // The log of a process that does not search for a free range stays small.
             drop(self.va());
         }
@@ -475,7 +481,7 @@ impl Drop for Whole<'_> {
         }
         let mut va = VmaSet::new();
         for v in &new {
-            reserve(&mut va, v.start, v.end);
+            reserve_area(&mut va, v.start, v.end, v.grows_down);
         }
         // No call adds to the log while the whole tree is locked.
         *self.va = va;
@@ -544,7 +550,7 @@ impl AddressSpace {
         let mut last: Option<(usize, Status)> = None;
         for (start, end, s) in &runs {
             let Some(s) = map(s) else { continue };
-            reserve(&mut va, *start, *end);
+            reserve_area(&mut va, *start, *end, s.grows_down);
             if !last.as_ref().is_some_and(|(e, l)| e == start && same_status(l, &s)) {
                 count += 1;
             }
@@ -701,7 +707,7 @@ impl AddressSpace {
                     && !va.overlaps(hint, hint + len);
                 let gap = va.find_gap(len, bottom, top);
                 let start = if hint_ok { hint } else { gap.ok_or(Errno::ENOMEM)? };
-                reserve(&mut va, start, start + len);
+                reserve_area(&mut va, start, start + len, req.grows_down);
                 start
             };
             let end = start + len;
@@ -716,7 +722,7 @@ impl AddressSpace {
                     // search. Give back the part of the range that has no status, and search again.
                     self.state.note(start, end, false);
                     for v in views(&range, start, end) {
-                        self.state.note(v.start, v.end, true);
+                        self.state.note_area(v.start, v.end, true, v.grows_down);
                     }
                     continue;
                 }
@@ -764,7 +770,7 @@ impl AddressSpace {
                 fork_anon: 0,
             };
             self.state.set(&mut range, start, end, Some(Arc::new(vma)), None);
-            self.state.note(start, end, true);
+            self.state.note_area(start, end, true, req.grows_down);
             drop(range);
             if req.populate || locked {
                 // A page that cannot get its frame now gets it at the first access, as on Linux.

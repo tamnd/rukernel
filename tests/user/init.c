@@ -4214,6 +4214,25 @@ static void test_smaps_flags(void)
 }
 
 /*
+ * mmap keeps the guard gap of 256 pages free below an area of MAP_GROWSDOWN, as vm_start_gap of
+ * Linux, so the area can grow (#405).
+ */
+static void test_growsdown_gap(void)
+{
+	const unsigned long ps = 4096, gap = 256 * ps;
+	char *g = mmap(NULL, 4 * ps, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_GROWSDOWN, -1, 0);
+	char *n = g != MAP_FAILED ? mmap(NULL, ps, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+				  : MAP_FAILED;
+	check("mmap leaves the guard gap below an area of MAP_GROWSDOWN",
+	      n != MAP_FAILED && (n > g || (unsigned long)(g - n) >= gap + ps));
+	if (n != MAP_FAILED)
+		munmap(n, ps);
+	if (g != MAP_FAILED)
+		munmap(g, 4 * ps);
+}
+
+/*
  * vma01 of LTP (#475): an area that a child of fork got with its pages does not join a new area
  * next to it, because its anon_vma chain is not singular (mm/vma.c of Linux). In the parent the
  * same two areas join.
@@ -4499,6 +4518,7 @@ static void test_proc(void)
 	test_maps_names();
 	test_maps_deleted();
 	test_smaps_flags();
+	test_growsdown_gap();
 	check("umount proc", umount("/proc") == 0);
 }
 
