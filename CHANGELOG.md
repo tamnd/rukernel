@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+
+- The scheduler keeps the lag of a task that sleeps as Linux does, and the heap keeps more freed 64 KiB buffers mapped, so `tcp_stream` and `udp_stream` on arm64 are faster (#465). Before, the lag of a task that wakes often became larger at each wake, and each wake stopped the task that ran. Thus `udp_stream` had about 1.5 context switches for each datagram, and each switch flushes all of the TLB of QEMU. Also, one in three of the 64 KiB buffers of a TCP stream on loopback was mapped and unmapped again, with one TLB invalidation for each page. On a shared host with a load of 16 to 25, the median of 9 runs of `udp_stream` went from 4.23 to 5.84 MB/s, and of `tcp_stream` from 48.3 to 55.3 MB/s.
+
 ## [0.4.20] - 2026-11-01
 
 ### Fixed

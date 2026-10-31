@@ -51,10 +51,15 @@ static CPU_FREE: [CpuFree; crate::cpu::MAX_CPUS] =
 /// page, so a kernel stack must be larger.
 pub(crate) const DIRECT_PAGES: usize = 4;
 
-/// The number of freed objects of the heap range that the cache keeps.
-const CACHE_SLOTS: usize = 8;
-/// The cache keeps freed objects of the heap range of up to this many pages.
-const CACHE_PAGES: usize = 16;
+/// The number of freed objects of the heap range that the cache keeps. A TCP stream on the
+/// loopback device has more than 16 buffers of 64 KiB at a time. With 8 slots, one in three of
+/// these buffers was mapped and unmapped again, and on arm64 each unmap sends one TLB
+/// invalidation for each page (#465).
+const CACHE_SLOTS: usize = 32;
+/// The cache keeps freed objects of the heap range of up to this many pages. A packet of 64 KiB
+/// on the loopback device, with its headroom and headers, has 17 pages. The cache holds at most
+/// 4 MiB.
+const CACHE_PAGES: usize = 32;
 
 /// The freed objects of the heap range that stay mapped. A slot is 0, or the address of an object
 /// plus its page count minus one. The address is page aligned, so the count fits below it.
