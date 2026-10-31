@@ -130,9 +130,15 @@ impl MmFile for FilePages {
         self.pages.lock().contains_key(&index)
     }
 
+    /// A file with no link, as a file that `unlink` removed or a file of `memfd_create`, shows
+    /// with ` (deleted)` after the path, as `d_path` of Linux.
     fn name(&self) -> (u64, u64, Vec<u8>) {
         let meta = self.inode.metadata();
-        (meta.dev, meta.ino, self.path.clone())
+        let mut path = self.path.clone();
+        if meta.nlink == 0 && meta.file_type() == Some(rk_vfs::inode::FileType::Regular) {
+            path.extend_from_slice(b" (deleted)");
+        }
+        (meta.dev, meta.ino, path)
     }
 
     fn writes_back(&self) -> bool {
