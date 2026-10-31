@@ -4126,6 +4126,41 @@ static void test_maps_names(void)
 }
 
 /*
+ * A mapping of a file with no link shows ` (deleted)` after the path in /proc/PID/maps, as d_path
+ * of Linux: a memfd, and a file that unlink removed after mmap (#405).
+ */
+static void test_maps_deleted(void)
+{
+	char line[512];
+	int mfd = (int)syscall(SYS_memfd_create, "rkdel", 0);
+	char *m = mfd >= 0 && ftruncate(mfd, 4096) == 0
+			  ? mmap(NULL, 4096, PROT_READ, MAP_SHARED, mfd, 0)
+			  : MAP_FAILED;
+	check("/proc/self/maps shows a memfd as /memfd:NAME (deleted)",
+	      m != MAP_FAILED && maps_line((unsigned long)m, line, sizeof(line)) &&
+		      strstr(line, " /memfd:rkdel (deleted)") != NULL);
+	if (m != MAP_FAILED)
+		munmap(m, 4096);
+	if (mfd >= 0)
+		close(mfd);
+
+	int fd = open("/tmp/maps.del", O_RDWR | O_CREAT | O_TRUNC, 0600);
+	char *f = fd >= 0 && ftruncate(fd, 4096) == 0
+			  ? mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0)
+			  : MAP_FAILED;
+	int named = f != MAP_FAILED && maps_line((unsigned long)f, line, sizeof(line)) &&
+		    strstr(line, " /tmp/maps.del") != NULL && strstr(line, "(deleted)") == NULL;
+	unlink("/tmp/maps.del");
+	check("/proc/self/maps shows a file that unlink removed with (deleted)",
+	      named && maps_line((unsigned long)f, line, sizeof(line)) &&
+		      strstr(line, " /tmp/maps.del (deleted)") != NULL);
+	if (f != MAP_FAILED)
+		munmap(f, 4096);
+	if (fd >= 0)
+		close(fd);
+}
+
+/*
  * vma01 of LTP (#475): an area that a child of fork got with its pages does not join a new area
  * next to it, because its anon_vma chain is not singular (mm/vma.c of Linux). In the parent the
  * same two areas join.
@@ -4409,6 +4444,7 @@ static void test_proc(void)
 	test_pagemap();
 	test_fork_area_merge();
 	test_maps_names();
+	test_maps_deleted();
 	check("umount proc", umount("/proc") == 0);
 }
 
