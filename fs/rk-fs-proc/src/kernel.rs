@@ -1031,8 +1031,18 @@ fn smaps_of(p: &Process) -> Result<Vec<u8>> {
     areas_of(p, true)
 }
 
+/// The start and the end of the heap, as `start_brk` and `brk` of Linux.
+type Heap = (usize, usize);
+
+/// Tells if the area `a` is a part of the heap, as `vma_is_initial_heap` of Linux: an area with
+/// no file that has a part in `start_brk..brk`. Thus a page that `mmap` put in the heap with
+/// `MAP_FIXED`, as the guard page of the malloc of musl, also shows `[heap]`.
+fn in_heap(a: &Vma<FileRef>, (start, end): Heap) -> bool {
+    matches!(a.backing, Backing::Anon) && a.start < end && a.end > start
+}
+
 /// The line of `/proc/PID/maps` for the area `a`.
-fn map_line_of(a: &Vma<FileRef>) -> MapLine {
+fn map_line_of(a: &Vma<FileRef>, heap: Heap) -> MapLine {
     let mut line = MapLine {
         start: a.start,
         end: a.end,
@@ -1054,6 +1064,7 @@ fn map_line_of(a: &Vma<FileRef>) -> MapLine {
         VmaKind::Stack => line.name = b"[stack]".to_vec(),
         VmaKind::Vdso => line.name = b"[vdso]".to_vec(),
         VmaKind::Vvar => line.name = b"[vvar]".to_vec(),
+        VmaKind::Normal if in_heap(a, heap) => line.name = b"[heap]".to_vec(),
         VmaKind::Normal => {}
     }
     line
@@ -1063,8 +1074,9 @@ fn map_line_of(a: &Vma<FileRef>) -> MapLine {
 fn areas_of(p: &Process, smaps: bool) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let Some(vm) = p.vm() else { return Ok(out) };
-    for a in vm.areas() {
-        let line = map_line_of(&a);
+    let (areas, start, end) = vm.areas_and_heap();
+    for a in areas {
+        let line = map_line_of(&a, (start, end));
         text::map_line(&mut out, &line);
         if smaps {
             let area = SmapsArea {
@@ -1141,7 +1153,7 @@ fn procmap_query(p: &Process, arg: usize, mem: &dyn rk_vfs::file::UserMemory) ->
     }
     let q = Query::parse(&raw)?;
     let vm = p.vm().ok_or(Errno::ESRCH)?;
-    let areas = vm.areas();
+    let (areas, start, end) = vm.areas_and_heap();
     let list: Vec<Area> = areas
         .iter()
         .map(|a| {
@@ -1163,7 +1175,7 @@ fn procmap_query(p: &Process, arg: usize, mem: &dyn rk_vfs::file::UserMemory) ->
         .collect();
     let i = procmap::find(&list, &q)?;
     let area = &list[i];
-    let line = map_line_of(&areas[i]);
+    let line = map_line_of(&areas[i], (start, end));
     let mut answer = Answer {
         start: area.start,
         end: area.end,
