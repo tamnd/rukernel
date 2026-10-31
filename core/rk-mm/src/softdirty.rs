@@ -148,6 +148,12 @@ impl SoftDirty {
         !self.in_clean(page) || (present && self.written.contains(&page))
     }
 
+    /// Tells if the area `start..end` has the flag `VM_SOFTDIRTY` of Linux: a map after the last
+    /// clear covered a part of it, so not all of it is in one clean range.
+    pub fn area_dirty(&self, start: usize, end: usize) -> bool {
+        self.clean.range(..=start).next_back().is_none_or(|(_, &e)| e < end)
+    }
+
     /// Tells if any page in `start..end` is clean, so a page there must stay read only until a
     /// write marks it.
     pub fn any_clean(&self, start: usize, end: usize) -> bool {
@@ -292,6 +298,12 @@ mod tests {
         assert!(s.is_dirty(0x15_000, false));
         assert!(!s.is_dirty(0x13_000, true));
         assert!(!s.is_dirty(0x16_000, true));
+        // A written page leaves its area clean, and a new map in the area makes it dirty.
+        assert!(!s.area_dirty(0x10_000, 0x14_000));
+        assert!(s.area_dirty(0x10_000, 0x20_000));
+        assert!(s.area_dirty(0x14_000, 0x16_000));
+        assert!(!s.area_dirty(0x16_000, 0x20_000));
+        assert!(s.area_dirty(0x20_000, 0x21_000));
         assert!(s.written.is_empty());
         assert_eq!(s.clean.len(), 2);
         // A map over all the clean ranges ends the tracking.

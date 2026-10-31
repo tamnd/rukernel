@@ -4160,6 +4160,59 @@ static void test_maps_deleted(void)
 		close(fd);
 }
 
+/* Copies the line VmFlags of /proc/self/smaps of the area that holds `addr` to `out`, without
+ * the new line. Gives 0 if there is no such area. */
+static int smaps_flags(unsigned long addr, char *out, size_t len)
+{
+	static char smaps[262144];
+	unsigned long a, b;
+	int in = 0;
+
+	if (read_file("/proc/self/smaps", smaps, sizeof(smaps)) <= 0)
+		return 0;
+	for (char *line = smaps; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+		if (strncmp(line, "VmFlags:", 8) == 0) {
+			if (!in)
+				continue;
+			size_t n = strcspn(line, "\n");
+			if (n >= len)
+				n = len - 1;
+			memcpy(out, line, n);
+			out[n] = 0;
+			return 1;
+		}
+		if (sscanf(line, "%lx-%lx ", &a, &b) == 2 && strchr(line, ':') > strchr(line, ' '))
+			in = addr >= a && addr < b;
+	}
+	return 0;
+}
+
+/*
+ * The line VmFlags of /proc/PID/smaps has the flags of Linux in the same order, each with a space
+ * after it (#405). A private writable area is in the commit count (ac) and is soft-dirty (sd).
+ */
+static void test_smaps_flags(void)
+{
+	char line[256];
+	char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	check("smaps VmFlags of a private writable area",
+	      p != MAP_FAILED && smaps_flags((unsigned long)p, line, sizeof(line)) &&
+		      strcmp(line, "VmFlags: rd wr mr mw me ac sd ") == 0);
+	check("smaps VmFlags shows MADV_DONTFORK and MADV_DONTDUMP",
+	      p != MAP_FAILED && madvise(p, 4096, MADV_DONTFORK) == 0 &&
+		      madvise(p, 4096, MADV_DONTDUMP) == 0 &&
+		      smaps_flags((unsigned long)p, line, sizeof(line)) &&
+		      strcmp(line, "VmFlags: rd wr mr mw me dc ac dd sd ") == 0);
+	if (p != MAP_FAILED)
+		munmap(p, 4096);
+	char *s = mmap(NULL, 4096, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	check("smaps VmFlags of a shared anonymous area",
+	      s != MAP_FAILED && smaps_flags((unsigned long)s, line, sizeof(line)) &&
+		      strcmp(line, "VmFlags: rd sh mr mw me ms sd ") == 0);
+	if (s != MAP_FAILED)
+		munmap(s, 4096);
+}
+
 /*
  * vma01 of LTP (#475): an area that a child of fork got with its pages does not join a new area
  * next to it, because its anon_vma chain is not singular (mm/vma.c of Linux). In the parent the
@@ -4445,6 +4498,7 @@ static void test_proc(void)
 	test_fork_area_merge();
 	test_maps_names();
 	test_maps_deleted();
+	test_smaps_flags();
 	check("umount proc", umount("/proc") == 0);
 }
 
