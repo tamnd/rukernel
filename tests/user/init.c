@@ -28,6 +28,7 @@
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/mount.h>
+#include <sys/personality.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
@@ -891,6 +892,47 @@ static void test_exec(void)
 	/* A program that runs cannot be opened for write, as deny_write_access of Linux (#385). */
 	int tfd = open("/init", O_WRONLY);
 	check("open for write of the running program gives ETXTBSY", tfd == -1 && errno == ETXTBSY);
+}
+
+/* Runs `path` with the argument "personality" and ADDR_NO_RANDOMIZE in the personality. Gives
+ * the exit status: 8 if the program keeps the flag, 9 if not. */
+static int exec_personality(const char *path)
+{
+	int status = 0;
+	pid_t pid = fork();
+	if (pid == 0) {
+		char *argv[] = { (char *)path, "personality", NULL };
+		char *envp[] = { NULL };
+		personality(ADDR_NO_RANDOMIZE);
+		execve(path, argv, envp);
+		_exit(99);
+	}
+	return waitpid(pid, &status, 0) == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/*
+ * An exec of a set-user-ID file removes ADDR_NO_RANDOMIZE and the other flags of
+ * PER_CLEAR_ON_SETID, as bprm_fill_uid of Linux. The maps diff of tools/mapsdiff found it, as
+ * Linux gave the set-user-ID programs of Debian a random layout (#405).
+ */
+static void test_exec_personality(void)
+{
+	char buf[4096];
+	ssize_t n;
+	int in = open("/bin/hello", O_RDONLY);
+	int out = open("/tmp/hello.suid", O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	int copied = in >= 0 && out >= 0;
+	while (copied && (n = read(in, buf, sizeof(buf))) > 0)
+		copied = write(out, buf, n) == n;
+	if (in >= 0)
+		close(in);
+	if (out >= 0)
+		close(out);
+	check("an exec keeps ADDR_NO_RANDOMIZE", exec_personality("/bin/hello") == 8);
+	check("an exec of a set-user-ID file removes ADDR_NO_RANDOMIZE",
+	      copied && chmod("/tmp/hello.suid", 04755) == 0 &&
+		      exec_personality("/tmp/hello.suid") == 9);
+	unlink("/tmp/hello.suid");
 }
 
 static void test_time(void)
@@ -8892,6 +8934,7 @@ static void test_all(void)
 	test_pty();
 	test_fork();
 	test_exec();
+	test_exec_personality();
 	test_time();
 	test_vdso();
 	test_signals();
