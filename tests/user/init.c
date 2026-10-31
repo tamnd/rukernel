@@ -328,6 +328,14 @@ static void test_memory(void)
 	}
 	char *m = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	check("mmap of anonymous memory", m != MAP_FAILED && m[4096] == 0);
+	/*
+	 * As mmap_base in mm/util.c of Linux, the mmap area is below the stack by the stack size,
+	 * stack_guard_gap and the largest random offset of the stack: 1 GiB on arm64 and 16 GiB on
+	 * x86-64 (#435).
+	 */
+	int local = 0;
+	check("the mmap area is more than 1 GiB below the stack",
+	      m != MAP_FAILED && (unsigned long)&local - (unsigned long)m > (1UL << 30) + (9UL << 20));
 	if (m != MAP_FAILED) {
 		m[8191] = 1;
 		check("munmap", munmap(m, 3 * 4096) == 0);

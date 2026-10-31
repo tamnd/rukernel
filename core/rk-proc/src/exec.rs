@@ -22,7 +22,8 @@ use rk_abi::native::mount::{MS_NOEXEC, MS_NOSUID};
 use rk_frame::mm::{Frame, alloc_frame};
 use rk_frame::sync::Once;
 use rk_mm::{
-    AddressSpace, FileRef, MmFile, MmapRequest, PAGE_SIZE, Prot, STACK_SIZE, STACK_TOP, VmaKind,
+    AddressSpace, FileRef, MMAP_TOP, MmFile, MmapRequest, PAGE_SIZE, Prot, STACK_GUARD_GAP,
+    STACK_SIZE, STACK_TOP, VmaKind,
 };
 use rk_vfs::cred::{Cred, ExecFile};
 use rk_vfs::file::DenyWrite;
@@ -42,11 +43,24 @@ const MMAP_RND_BITS: u32 = 18;
 #[cfg(not(target_arch = "aarch64"))]
 const MMAP_RND_BITS: u32 = 28;
 
-/// The random offset of the `mmap` area for the random value `seed`, as `arch_mmap_rnd` of Linux.
-/// A program that uses an address near the top of the user space, such as LTP hugemmap24, needs a
-/// free range above the `mmap` area.
+/// The largest random offset of the main stack, in pages. Linux names it `STACK_RND_MASK`: 0x3ffff
+/// on arm64 with 4 KiB pages (1 GiB) and 0x3fffff on x86-64 (16 GiB).
+#[cfg(target_arch = "aarch64")]
+const STACK_RND_MASK: usize = 0x3_ffff;
+#[cfg(not(target_arch = "aarch64"))]
+const STACK_RND_MASK: usize = 0x3f_ffff;
+
+/// The distance from [`MMAP_TOP`] to the top of the `mmap` area of a program with a random layout,
+/// for the random value `seed`. This is `mmap_base` in mm/util.c of Linux. The gap below the top
+/// of the stack is the stack size, `stack_guard_gap` and the largest random offset of the stack,
+/// and it is at least the 128 MiB of [`MMAP_TOP`]. Then `arch_mmap_rnd` moves the area down by a
+/// random number of pages. LTP hugemmap24 maps fixed addresses up to 520 MiB above its heap. On
+/// arm64 the random offset is at most 1 GiB, so without the gap these addresses can be on the
+/// stack or past the end of the user space.
 fn mmap_offset(seed: u64) -> usize {
-    (seed & ((1 << MMAP_RND_BITS) - 1)) as usize * PAGE_SIZE
+    let gap = STACK_SIZE + STACK_GUARD_GAP + STACK_RND_MASK * PAGE_SIZE;
+    let pad = gap.saturating_sub(STACK_TOP - MMAP_TOP);
+    pad + (seed & ((1 << MMAP_RND_BITS) - 1)) as usize * PAGE_SIZE
 }
 
 /// The base of a position independent executable. Linux names it `ELF_ET_DYN_BASE`: two thirds of
