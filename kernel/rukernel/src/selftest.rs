@@ -686,7 +686,7 @@ fn vm_test() -> bool {
 fn vm_status_test() -> bool {
     use alloc::vec::Vec;
     use rk_frame::status::PageStatus;
-    use rk_frame::vm::VmSpace;
+    use rk_frame::vm::{PageChange, VmSpace};
 
     const BASE: usize = 0x80_0000;
     const PAGE: usize = 4096;
@@ -734,6 +734,27 @@ fn vm_status_test() -> bool {
         }),
     );
     drop(child);
+    ok &= check(
+        "a change of the statuses changes the pages in the same pass",
+        mm::alloc_zeroed_frame().is_some_and(|f| space.map(at(6), Arc::new(f), RW).is_ok())
+            && {
+                let mut change = PageChange::protect(at(4), at(8), RO);
+                let mut old = Vec::new();
+                space.change_status(at(4), at(8), Some(&b), Some(&mut change), |s, e, st| {
+                    old.push((s, e, value(st)))
+                });
+                space.finish(change);
+                old == [(BASE + 4 * PAGE, BASE + 8 * PAGE, Some(1))]
+                    && space.page(at(6)).is_some_and(|(_, p)| p == RO)
+                    && status(6) == Some(2)
+            }
+            && {
+                let mut change = PageChange::unmap(at(0), at(8));
+                space.change_status(at(0), at(8), Some(&a), Some(&mut change), |_, _, _| {});
+                space.finish(change);
+                space.page(at(6)).is_none() && status(6) == Some(1)
+            },
+    );
     ok &= check(
         "a hold of a status table excludes a second hold",
         !space.hold_status(at(512), false)

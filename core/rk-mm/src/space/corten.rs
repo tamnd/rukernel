@@ -4,12 +4,13 @@
 //! The statuses of the pages in a [`Tree`] are the source of truth, and there is no tree of areas.
 //! The statuses of the pages of a 2 MiB block that do not all have one status are in the status
 //! table of the last level page table of the block in [`VmSpace`], as CortenMM keeps them in the
-//! page table pages. Thus `munmap`, `mprotect` and `fork` write the statuses and the pages of such
-//! a block in one tree. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of
-//! their range, so these calls on ranges in different nodes do not wait for each other. The lock of
-//! a node of the lowest level is the hold of the status table of its block in [`VmSpace`], so a
-//! page fault on a page with a status in the table holds only that block and does not walk the
-//! tree. The other calls are rare. They lock the whole tree with [`Corten::lock`], which makes the
+//! page table pages. `munmap` and `mprotect` change the statuses and the page table entries of each
+//! block in one pass, with one lock of the block, and `fork` copies them in one walk. A page fault,
+//! `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range, so these calls on
+//! ranges in different nodes do not wait for each other. The lock of a node of the lowest level is
+//! the hold of the status table of its block in [`VmSpace`]. Thus a call in one 2 MiB block with a
+//! status in the table holds only that block, which it finds with the walk of the page table, and
+//! does not walk the tree. The other calls are rare. They lock the whole tree with [`Corten::lock`], which makes the
 //! areas from the statuses, lets the code of the VMA backend change them, and writes the changes
 //! back to the tree. The areas that `/proc/PID/maps` shows come from the statuses in the same way:
 //! a run of pages with the same status is one area.
@@ -33,7 +34,7 @@ use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::status::PageStatus;
 use rk_frame::sync::{SpinLock, SpinLockGuard};
-use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, USER_END, VmSpace};
+use rk_frame::vm::{ForkArea, HUGE_PAGE_SIZE, PageChange, USER_END, VmSpace};
 
 /// The status of a page: the area that mapped it. The start and the file offset of the area give
 /// the offset of each page. The end has no meaning, because a later call can change a part of
@@ -50,13 +51,31 @@ fn from_table(s: &PageStatus) -> Option<Status> {
 pub(super) struct PageTable(Arc<VmSpace>);
 
 impl Leaves<Status> for PageTable {
+    type Op = PageChange;
+
     fn get(&self, addr: usize) -> Option<Status> {
         self.0.status(VirtAddr::new(addr)).as_ref().and_then(from_table)
     }
 
-    fn set(&self, start: usize, end: usize, status: Option<&Status>) {
+    fn set(
+        &self,
+        start: usize,
+        end: usize,
+        status: Option<&Status>,
+        op: Option<&mut PageChange>,
+        old: &mut dyn FnMut(usize, usize, &Status),
+    ) {
         let status = status.map(|s| s.clone() as PageStatus);
-        self.0.set_status(VirtAddr::new(start), VirtAddr::new(end), status.as_ref());
+        let (start, end) = (VirtAddr::new(start), VirtAddr::new(end));
+        self.0.change_status(start, end, status.as_ref(), op, |a, b, s| {
+            if let Some(s) = from_table(s) {
+                old(a, b, &s);
+            }
+        });
+    }
+
+    fn change(&self, start: usize, end: usize, op: &mut PageChange) {
+        self.0.change_pages(VirtAddr::new(start), VirtAddr::new(end), op);
     }
 
     fn runs(&self, start: usize, end: usize, mut f: impl FnMut(usize, usize, &Status)) {
@@ -81,6 +100,10 @@ impl Leaves<Status> for PageTable {
 
     fn lock(&self, base: usize) {
         self.0.hold_status(VirtAddr::new(base), true);
+    }
+
+    fn lock_used(&self, base: usize) -> bool {
+        self.0.hold_status(VirtAddr::new(base), false)
     }
 
     fn try_lock(&self, base: usize) -> bool {
@@ -155,6 +178,35 @@ fn area_count<'a>(areas: impl Iterator<Item = &'a Vma<FileRef>>) -> usize {
         last = Some(v);
     }
     n
+}
+
+/// The number of runs in a list of runs in address order, joined as `RangeLock::runs` joins
+/// them: the first status of a run represents it.
+fn run_count<'a>(runs: impl Iterator<Item = (usize, usize, &'a Status)>) -> usize {
+    let mut last: Option<(usize, &Status)> = None;
+    let mut n = 0;
+    for (a, b, s) in runs {
+        match &mut last {
+            Some((end, first)) if *end == a && same_status(first, s) => *end = b,
+            _ => {
+                n += 1;
+                last = Some((b, s));
+            }
+        }
+    }
+    n
+}
+
+/// The runs of `runs`, which are in address order, joined as `RangeLock::runs` joins them.
+fn join(runs: Vec<Run>) -> Vec<Run> {
+    let mut out: Vec<Run> = Vec::new();
+    for (a, b, s) in runs {
+        match out.last_mut() {
+            Some(last) if last.1 == a && same_status(&last.2, &s) => last.1 = b,
+            _ => out.push((a, b, s)),
+        }
+    }
+    out
 }
 
 /// The range of the lock of a change of `start..end`: one page more on each side, if the tree
@@ -258,34 +310,41 @@ impl Corten {
         r
     }
 
-    /// Sets the status of `start..end` in `range`, and changes the count of areas. `range` locks
-    /// the [`window`] of the range.
-    fn set(&self, range: &mut Locked<'_>, start: usize, end: usize, status: Option<Status>) {
+    /// Sets the status of `start..end` in `range`, makes the change `op` to the pages of the
+    /// range in the same pass, and changes the count of areas. Gives the old statuses of the
+    /// range in address order, not joined. `range` locks the [`window`] of the range.
+    fn set(
+        &self,
+        range: &mut Locked<'_>,
+        start: usize,
+        end: usize,
+        status: Option<Status>,
+        op: Option<&mut PageChange>,
+    ) -> Vec<Run> {
         let (lo, hi) = window(start, end);
-        let before = range.runs(lo, hi, same_status).len();
-        // After the change, the range has one status or none, so the count of the runs of the
-        // window comes from the page on each side, with no second walk. The runs join as in
-        // `RangeLock::runs`: the first status of a run represents it.
-        let left = if lo < start { range.get(lo) } else { None };
-        let right = if end < hi { range.get(end) } else { None };
-        let mut after = 0;
-        let mut last: Option<&Status> = None;
-        for s in [left.as_ref(), status.as_ref(), right.as_ref()] {
-            match (last, s) {
-                (Some(l), Some(s)) if same_status(l, s) => {}
-                (_, Some(_)) => {
-                    after += 1;
-                    last = s;
-                }
-                (_, None) => last = None,
-            }
+        // The change gives the old statuses, and the range has one status or none after it, so
+        // the count of the runs of the window before and after the change comes from them and
+        // from the page on each side, with no other walk.
+        let left = if lo < start { range.get(lo).map(|s| (lo, start, s)) } else { None };
+        let right = if end < hi { range.get(end).map(|s| (end, hi, s)) } else { None };
+        let mut old: Vec<Run> = Vec::new();
+        range.change(start, end, status.clone(), op, |a, b, s| match old.last_mut() {
+            Some(last) if last.1 == a && Arc::ptr_eq(&last.2, s) => last.1 = b,
+            _ => old.push((a, b, s.clone())),
+        });
+        fn side(r: &Option<Run>) -> impl Iterator<Item = (usize, usize, &Status)> {
+            r.as_ref().map(|(a, b, s)| (*a, *b, s)).into_iter()
         }
-        range.set(start, end, status);
+        let was = old.iter().map(|(a, b, s)| (*a, *b, s));
+        let before = run_count(side(&left).chain(was).chain(side(&right)));
+        let now = status.iter().map(|s| (start, end, s));
+        let after = run_count(side(&left).chain(now).chain(side(&right)));
         if after >= before {
             self.count.fetch_add(after - before, Ordering::Relaxed);
         } else {
             self.count.fetch_sub(before - after, Ordering::Relaxed);
         }
+        old
     }
 
     /// The number of areas.
@@ -583,18 +642,24 @@ impl AddressSpace {
                 }
             });
         }
-        for vma in views(range, start, end) {
+        // The statuses and the pages of each 2 MiB block go in one pass, as `unmap_pages` with
+        // the change of the tree.
+        self.hiwater.fetch_max(self.page_count(), Ordering::Relaxed);
+        let mut change = PageChange::unmap(VirtAddr::new(start), VirtAddr::new(end));
+        let old = self.state.set(range, start, end, None, Some(&mut change));
+        self.vm.finish(change);
+        self.soft.unmapped(start, end);
+        for (a, b, s) in join(old) {
+            let vma = view(&s, a, b);
             if vma.hugetlb && !vma.shared {
                 self.unreserve_private(vma.start, vma.end);
             }
-            self.unmap_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end));
             if vma.account {
                 uncharge_commit(vma.len());
             }
             // munmap has no error for a failed write back, as on Linux.
             let _ = write_back(&vma, vma.start, vma.end);
         }
-        self.state.set(range, start, end, None);
         self.state.note(start, end, false);
     }
 
@@ -698,7 +763,7 @@ impl AddressSpace {
                 dont_dump: false,
                 fork_anon: 0,
             };
-            self.state.set(&mut range, start, end, Some(Arc::new(vma)));
+            self.state.set(&mut range, start, end, Some(Arc::new(vma)), None);
             self.state.note(start, end, true);
             drop(range);
             if req.populate || locked {
@@ -762,12 +827,25 @@ impl AddressSpace {
                 old.iter().filter(|v| !v.shared && !v.account && !v.hugetlb).map(Vma::len).sum();
             charge_commit(more)?;
         }
+        // The soft-dirty state can give each page its own permissions. This is rare, so then the
+        // pages change one by one after the statuses.
+        let tracking = self.soft.when_tracking(|_| ()).is_some();
         for mut vma in old {
             vma.prot = prot;
             vma.account |= prot.write && !vma.shared && !vma.hugetlb;
-            self.state.set(&mut range, vma.start, vma.end, Some(Arc::new(vma.clone())));
+            let (from, to) = (VirtAddr::new(vma.start), VirtAddr::new(vma.end));
+            let new = page_prot(&vma, false);
+            let status = Some(Arc::new(vma.clone()));
+            if !(new.writable && tracking) {
+                // The statuses and the pages of each 2 MiB block change in one pass.
+                let mut change = PageChange::protect(from, to, new);
+                self.state.set(&mut range, vma.start, vma.end, status, Some(&mut change));
+                self.vm.finish(change);
+                continue;
+            }
+            self.state.set(&mut range, vma.start, vma.end, status, None);
             let mut next = 0;
-            for page in self.vm.mapped_pages(VirtAddr::new(vma.start), VirtAddr::new(vma.end)) {
+            for page in self.vm.mapped_pages(from, to) {
                 let a = page.get();
                 if a < next {
                     continue;
@@ -810,7 +888,7 @@ impl AddressSpace {
             let mut vma = Vma::anon(old_end, new_end, Prot::RW, VmaKind::Heap);
             vma.locked = self.state.lock_future.load(Ordering::Relaxed);
             vma.account = true;
-            self.state.set(&mut range, old_end, new_end, Some(Arc::new(vma)));
+            self.state.set(&mut range, old_end, new_end, Some(Arc::new(vma)), None);
             self.state.note(old_end, new_end, true);
             self.soft.mapped(old_end, new_end);
         } else if new_end < old_end {

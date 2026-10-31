@@ -130,6 +130,21 @@ A first pass of the same A/B, under a load average of 5.6 to 14, gave 2060 (1397
 
 With the changes of both #405 and #401, CortenMM is 1.9 times slower than VMA in `fork` and 3.0 times slower in `fork_big`. #401 removed most of the cost that the two backends share (the large heap objects and their TLB shootdowns), so the ratio grew: after #405 alone it was 1.41 and 1.60. The time that is left on CortenMM is the walk of the statuses: `fork_big` costs 15 ms more than on VMA, and the tree of a process that touched 128 MiB has 64 nodes of the lowest level with 32768 slots, which `fork` and the exit of the child walk. CortenMM with #401 but without #405 gave 6324 us and 18978 us at 212e8b2 (the section above), under a different load. Thus the one walk of #405 gives no clear gain after #401. `mmap` is 3.6 times slower on CortenMM, because `mmap` and `munmap` change both `va` and the tree, and the tree makes and frees nodes.
 
+## One pass for `munmap` and `mprotect`
+
+With the `corten` backend, `munmap` and `mprotect` change the statuses and the page table entries of each 2 MiB block in one pass. The tree gives each block that the change covers to rk-frame (`VmSpace::change_status`), and rk-frame sets the statuses, removes or changes the entries of the block, and gives back the old statuses, with one lock of the block. `mprotect` changes only the entries whose protection is different, and changes a whole huge page in one step. It does not go page by page. There is one TLB flush for the range, and the frames go after the flush. When the soft dirty bits are tracked, `mprotect` of a range that becomes writable keeps the old walk, because the soft dirty check of each page reads the block. A lock of a range in one 2 MiB block starts at the node of the block, as in CortenMM, and does not walk the tree from the root, if the block has a status in its table.
+
+The A/B boots the base a32b5f7 and the change, both with the `corten` feature, one after the other, 3 times each. Host: server2, QEMU 8.2.2 with TCG, `-smp 4 -m 1G`, 5 runs for each row. The load average was between 19 and 32 (other agents built and booted kernels at the same time), so the noise is large. The table gives the median of the 3 medians of each kernel, and the lowest of the 3 medians in parentheses. Times in ns.
+
+| Row | Base | One pass | Ratio |
+|---|---|---|---|
+| `mmap` | 950400 (510000) | 481090 (392400) | 0.51 |
+| `fault` | 278274 (80120) | 89008 (76061) | 0.32 |
+| `fault_mt` | 1018500 (888477) | 1066734 (921414) | 1.05 |
+| `mmap_mt` | 1260682 (837520) | 1189000 (839427) | 0.94 |
+
+`mmap` (an `mmap` and a `munmap` of 64 KiB) was faster in each of the 3 pairs. `fault_mt` and `mmap_mt` show no clear change: the runs of the two kernels overlap. The lowest `fault` medians are almost the same, so the difference of the `fault` medians is mostly the load. Under the big kernel lock, the multi thread rows cannot show a gain from the locks of the blocks.
+
 ## Fidelity of maps and smaps
 
 A test program made the same address space on Linux and on the two backends, and printed `/proc/self/maps` and `/proc/self/smaps`. The program made these areas: anonymous areas next to each other, an area with a part made read only by `mprotect` and then made writable again, a shared anonymous area with a hole, two mappings of one file at offsets that follow each other, the heap after `brk`, and the same after `fork` in the child.
