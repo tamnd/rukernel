@@ -32,16 +32,13 @@ pub struct NetBuf {
 }
 
 impl NetBuf {
-    /// Makes an empty buffer with `headroom` bytes before the data and `capacity` bytes for the
-    /// data.
+    /// Makes an empty buffer with `headroom` bytes before the data and room for `capacity` bytes
+    /// of data. Only the headroom gets zeros. The data comes with `extend_from_slice` or `put`,
+    /// so a large packet does not get a fill of zeros before its copy (#465).
     pub fn new(headroom: usize, capacity: usize) -> Self {
-        Self {
-            area: vec![0; headroom + capacity],
-            head: headroom,
-            tail: headroom,
-            ifindex: 0,
-            protocol: 0,
-        }
+        let mut area = Vec::with_capacity(headroom + capacity);
+        area.resize(headroom, 0);
+        Self { area, head: headroom, tail: headroom, ifindex: 0, protocol: 0 }
     }
 
     /// Makes a buffer with a copy of `data` and no headroom. A driver uses this for a received

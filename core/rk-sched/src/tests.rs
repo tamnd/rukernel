@@ -76,15 +76,34 @@ fn the_share_follows_the_weight() {
 fn a_task_that_wakes_gets_back_its_lag() {
     let mut q = Eevdf::new();
     q.push('a', entity(1000, 4000));
-    q.push('b', entity(3000, 6000));
+    q.push('b', entity(4000, 7000));
     let mut sleeper = entity(1000, 4000);
+    // The average counts the task that goes to sleep: (1000 + 4000 + 1000) / 3.
     q.save_lag(&mut sleeper, 4_000_000);
     assert_eq!(sleeper.lag, 1000);
     q.place(&mut sleeper, None, false);
-    // The lag grows by the weight of the queue with the task over the weight of the queue.
-    assert_eq!(sleeper.vruntime, 2000 - 1500);
+    // The lag grows by the weight of the queue with the task over the weight of the queue, so
+    // the task comes back to its virtual run time.
+    assert_eq!(sleeper.vruntime, 2500 - 1500);
     assert_eq!(sleeper.lag, 0);
     assert_eq!(sleeper.deadline, sleeper.vruntime + BASE_SLICE);
+}
+
+#[test]
+fn a_task_that_sleeps_often_does_not_get_more_lag() {
+    // A task that runs a little and sleeps, against a task that runs all the time, as the
+    // receiver of a stream. Each sleep keeps the lag, so the lag does not grow (#465).
+    let mut q = Eevdf::new();
+    let mut other = entity(10_000_000, 10_000_000 + BASE_SLICE);
+    let mut sleeper = entity(9_000_000, 9_000_000 + BASE_SLICE);
+    let start = other.vruntime - sleeper.vruntime;
+    for _ in 0..20 {
+        q.push('o', other);
+        q.save_lag(&mut sleeper, 4_000_000);
+        other = q.pick(Some(&sleeper)).unwrap().1;
+        q.place(&mut sleeper, Some(&other), false);
+        assert!(other.vruntime - sleeper.vruntime <= start);
+    }
 }
 
 #[test]
