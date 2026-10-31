@@ -4256,6 +4256,18 @@ static void test_smaps_flags(void)
 }
 
 /*
+ * The kernel maps each segment of a program with the protection of the segment, as elf_map of
+ * Linux. So the text of init is not in the commit count and has no ac in VmFlags (#405).
+ */
+static void test_exec_segments(void)
+{
+	char line[256];
+	check("smaps VmFlags of the text of the program has no ac",
+	      smaps_flags((unsigned long)&test_exec_segments, line, sizeof(line)) &&
+		      strstr(line, " ex ") && !strstr(line, " ac "));
+}
+
+/*
  * mmap keeps the guard gap of 256 pages free below an area of MAP_GROWSDOWN, as vm_start_gap of
  * Linux, so the area can grow (#405).
  */
@@ -4560,6 +4572,7 @@ static void test_proc(void)
 	test_maps_names();
 	test_maps_deleted();
 	test_smaps_flags();
+	test_exec_segments();
 	test_growsdown_gap();
 	check("umount proc", umount("/proc") == 0);
 }

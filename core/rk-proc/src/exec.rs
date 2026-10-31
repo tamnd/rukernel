@@ -261,6 +261,11 @@ struct Loaded {
 /// the data of the file, so `/proc/PID/maps` shows the file. A segment whose address and offset
 /// do not agree in the page, or whose first page is in the previous segment, is anonymous memory
 /// with a copy of the data.
+///
+/// A mapping of the file gets the protection of its segment at once, as on Linux, so a segment
+/// that cannot be written is not in the commit count and has no `VM_ACCOUNT` (`ac` in
+/// `/proc/PID/smaps`). Only a segment that the copy of a later segment writes to is writable
+/// until the end.
 fn load_elf(
     space: &AddressSpace,
     at: &Location,
@@ -287,12 +292,20 @@ fn load_elf(
     };
     let page = PAGE_SIZE as u64;
     let mut mapped_end = 0usize;
-    for seg in &header.segments {
+    for (i, seg) in header.segments.iter().enumerate() {
         if seg.memsz == 0 {
             continue;
         }
         let start = (bias as u64 + seg.vaddr) / page * page;
         let end = (bias as u64 + seg.vaddr + seg.memsz).div_ceil(page) * page;
+        let copied_later = header.segments[i + 1..]
+            .iter()
+            .any(|s| s.memsz != 0 && (bias as u64 + s.vaddr) / page * page < end);
+        let prot = if copied_later {
+            Prot::RW
+        } else {
+            Prot { read: seg.flags.read, write: seg.flags.write, exec: seg.flags.exec }
+        };
         let (start, end) = (start as usize, end as usize);
         let data_end = (bias as u64 + seg.vaddr + seg.filesz).div_ceil(page) * page;
         let aligned = seg.vaddr % page == seg.offset % page;
@@ -304,14 +317,14 @@ fn load_elf(
                 addr: start,
                 fixed: true,
                 file: Some((file, seg.offset / page * page)),
-                ..MmapRequest::anon(data_end - start, Prot::RW)
+                ..MmapRequest::anon(data_end - start, prot)
             };
             space.mmap(req)?;
             if data_end < end {
                 let req = MmapRequest {
                     addr: data_end,
                     fixed: true,
-                    ..MmapRequest::anon(end - data_end, Prot::RW)
+                    ..MmapRequest::anon(end - data_end, prot)
                 };
                 space.mmap(req)?;
             }
