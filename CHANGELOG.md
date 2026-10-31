@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.21] - 2026-11-01
+
 ### Added
 
 - The LTP net tables in tools/ltp are made again from a new run of the net group with the tools of tools/ltp/build-tools.sh. The runner gives ipneigh01_arp, ipneigh01_ip, ipneigh6_ip, the busy_poll tests and dccp01 a limit of 900 s, because on a busy host they take more than 240 s. Now 117 of the 356 net tests pass, before 14 (#491).
@@ -1251,6 +1253,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.21]: https://github.com/tamnd/rukernel/compare/v0.4.20...v0.4.21
 [0.4.20]: https://github.com/tamnd/rukernel/compare/v0.4.19...v0.4.20
 [0.4.19]: https://github.com/tamnd/rukernel/releases/tag/v0.4.19
 [0.4.18]: https://github.com/tamnd/rukernel/releases/tag/v0.4.18
