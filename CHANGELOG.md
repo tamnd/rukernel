@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.4.20] - 2026-11-01
+
 ### Fixed
 
 - `/proc/PID/maps` names each area with no file in the range of `brk` `[heap]`, as `vma_is_initial_heap` of Linux (#405). Before, only the area that `brk` made had the name, and the guard page that the `malloc` of musl maps in the heap with `MAP_FIXED` had no name.
@@ -1237,6 +1239,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.4.20]: https://github.com/tamnd/rukernel/compare/v0.4.19...v0.4.20
 [0.4.19]: https://github.com/tamnd/rukernel/releases/tag/v0.4.19
 [0.4.18]: https://github.com/tamnd/rukernel/releases/tag/v0.4.18
 [0.4.17]: https://github.com/tamnd/rukernel/releases/tag/v0.4.17
