@@ -35,6 +35,9 @@ const MAX_SCRIPT_DEPTH: usize = 4;
 const SCRIPT_LINE: usize = 256;
 /// The flag of `personality` that turns off the random layout, as in Linux.
 pub const ADDR_NO_RANDOMIZE: u32 = 0x0004_0000;
+/// The flags of `personality` that an exec with more rights removes, as `PER_CLEAR_ON_SETID` of
+/// Linux: `READ_IMPLIES_EXEC`, `ADDR_NO_RANDOMIZE`, `ADDR_COMPAT_LAYOUT` and `MMAP_PAGE_ZERO`.
+pub const PER_CLEAR_ON_SETID: u32 = 0x0040_0000 | ADDR_NO_RANDOMIZE | 0x0020_0000 | 0x0010_0000;
 
 /// The bits of the random offset of the `mmap` area, in pages. They are the defaults of
 /// `mmap_rnd_bits` of Linux: 28 on x86-64 and 18 on arm64 with 4 KiB pages.
@@ -367,21 +370,23 @@ fn read_headers(inode: &InodeRef) -> Result<ElfHeader, Errno> {
 
 /// What `build` gives: the address space, the start of the program, the file of the program
 /// with the denial of its write, the arguments, the auxiliary vector and the credentials.
-type Built = (AddressSpace, ExecImage, (Location, DenyWrite), Vec<Vec<u8>>, Vec<u8>, Cred);
+type Built = (AddressSpace, ExecImage, (Location, DenyWrite), Vec<Vec<u8>>, Vec<u8>, Cred, u32);
 
 /// Makes the new address space and the initial stack for `args`. `random` gives the 16 bytes of
 /// `AT_RANDOM`. Also gives the file of the program, the arguments, which an interpreter line
-/// changes, the auxiliary vector and the new credentials. With `no_setid`, the set-user-ID and
-/// set-group-ID bits of the file have no effect. With `randomize`, the top of the `mmap` area
-/// gets a random offset.
+/// changes, the auxiliary vector, the new credentials and the flags of `personality` that the
+/// exec removes. With `no_new_privs`, the set-user-ID and set-group-ID bits of the file have no
+/// effect. With `traced`, they change no ID, but they still remove the flags, as on Linux.
+/// Without `ADDR_NO_RANDOMIZE` in `personality` after the removal, the top of the `mmap` area gets
+/// a random offset.
 fn build(
     fs: &FsContext,
     mut args: ExecArgs,
     random: [u8; 16],
     cred: &Cred,
-    no_setid: bool,
+    (no_new_privs, traced): (bool, bool),
     memcg: u32,
-    randomize: bool,
+    personality: u32,
 ) -> Result<Built, Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
@@ -422,13 +427,26 @@ fn build(
     let deny = rk_vfs::file::DenyWrite::new(at.inode())?;
 
     let meta = at.inode().metadata();
+    let nosuid = at.mount.flags() & u64::from(MS_NOSUID) != 0;
     let file = ExecFile {
         mode: meta.mode,
         uid: meta.uid,
         gid: meta.gid,
-        no_setid: no_setid || at.mount.flags() & u64::from(MS_NOSUID) != 0,
+        no_setid: no_new_privs || traced || nosuid,
     };
+    let old_permitted = cred.cap_permitted;
     let (cred, secure) = cred.exec(file);
+    // A file with the set-user-ID bit or the set-group-ID bit, and an exec that gives more
+    // capabilities, remove the flags that make the layout easy to guess, as `bprm_fill_uid` and
+    // `cap_bprm_creds_from_file` of Linux.
+    let setid_file = meta.mode & 0o4000 != 0 || meta.mode & 0o2010 == 0o2010;
+    let per_clear =
+        if (setid_file && !no_new_privs && !nosuid) || cred.cap_permitted & !old_permitted != 0 {
+            PER_CLEAR_ON_SETID
+        } else {
+            0
+        };
+    let randomize = personality & !per_clear & ADDR_NO_RANDOMIZE == 0;
 
     let space = AddressSpace::new()?;
     // The pages of the new program go to the memory cgroup of the process.
@@ -503,7 +521,8 @@ fn build(
     )?;
     space.write(image.sp, &image.bytes)?;
     let start = interp.map_or(entry, |i| i.bias + i.header.entry as usize);
-    Ok((space, ExecImage { entry: start, sp: image.sp }, (at, deny), args.argv, image.auxv, cred))
+    let exec_image = ExecImage { entry: start, sp: image.sp };
+    Ok((space, exec_image, (at, deny), args.argv, image.auxv, cred, per_clear))
 }
 
 /// Runs a new program in the process of `thread`. On success the process has the new address
@@ -536,10 +555,11 @@ pub fn exec(
     let path = args.path.clone();
     // A tracer cannot follow a program that gets more rights, so the bits have no effect then.
     // A tracer with `CAP_SYS_PTRACE` can, as `cap_bprm_creds_from_file` of Linux.
-    let no_setid = thread.no_new_privs() || (thread.is_traced() && !thread.tracer_capable());
-    let randomize = process.personality() & ADDR_NO_RANDOMIZE == 0;
-    let (space, image, (at, deny), argv, auxv, cred) =
-        build(&ctx, args, random, &process.cred(), no_setid, process.memcg(), randomize)?;
+    let traced = thread.is_traced() && !thread.tracer_capable();
+    let setid = (thread.no_new_privs(), traced);
+    let personality = process.personality();
+    let (space, image, (at, deny), argv, auxv, cred, per_clear) =
+        build(&ctx, args, random, &process.cred(), setid, process.memcg(), personality)?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
     release(thread);
@@ -575,6 +595,7 @@ pub fn exec(
         crate::coredump::SUID_DUMP_USER
     };
     process.set_dumpable(dumpable);
+    process.set_personality(personality & !per_clear);
     process.set_cred(cred);
     thread.exec_keys();
     process.set_image(&argv, at, auxv, deny);
