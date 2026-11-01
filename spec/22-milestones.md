@@ -95,7 +95,7 @@ Thirteen milestones, R0 to R12. Each one has an exit criterion a script can chec
 
 - On x86-64 and arm64, LTP `syscalls`, `mm`, `sched` and `net` reach the reference's pass set apart from listed exceptions.
 - The first `rukernel-bench` table is published for the entry, scheduling, memory and networking classes. Red rows are allowed at this milestone, and the table lists them.
-- A decision on CortenMM is recorded (document 24, question 1).
+- A decision on CortenMM is recorded, or the reason for a delay and the test that decides it (document 24, question 1). At the end of R4 the decision moved to R5, because the `will-it-scale` run needs a host with KVM.
 
 **If we stop here:** a credible server kernel for network services in VMs.
 
