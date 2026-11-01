@@ -31,13 +31,15 @@ Each value is the median of the runs. The value in parentheses is the interquart
 | mem | `fork_big` | the same with 128 MiB of written private memory | us | 4439 (31%) | 4977 (24%) | 1.12 |  |
 | mem | `fault_mt` | `fault` in one thread per CPU at the same time, wall time | ns | 7293 (40%) | 11706 (63%) | 1.61 |  |
 | mem | `mmap_mt` | `mmap` in one thread per CPU at the same time, wall time | ns | 59828 (54%) | 24720 (19%) | 0.41 |  |
-| mem | `cow` | write fault that copies a 4 KiB page that a child of fork maps | ns | 32830 (16%) | 22553 (11%) | 0.69 |  |
+| mem | `cow` | write fault that copies a 4 KiB page that a child of fork maps | ns | 117128 (13%) | 24523 (25%) | 0.21 |  |
 | net | `tcp_rr` | TCP round trip of 1 byte on loopback | us | 993 (17%) | 483 (8%) | 0.49 |  |
-| net | `tcp_stream` | TCP throughput on loopback, writes of 64 KiB | MB/s | 149 (35%) | 67.6 (12%) | 2.21 | **red** |
+| net | `tcp_stream` | TCP throughput on loopback, writes of 64 KiB | MB/s | 81.2 (52%) | 71.9 (15%) | 1.13 |  |
 | net | `udp_rr` | UDP round trip of 1 byte on loopback | us | 627 (18%) | 483 (16%) | 0.77 |  |
-| net | `udp_stream` | UDP throughput on loopback, datagrams of 1 KiB | MB/s | 7.77 (12%) | 3.02 (8%) | 2.58 | **red** |
+| net | `udp_stream` | UDP throughput on loopback, datagrams of 1 KiB | MB/s | 4.56 (49%) | 6.68 (4%) | 0.68 |  |
 
-Red rows: `tcp_stream`, `udp_stream`.
+Red rows: none.
+
+The rows `cow`, `tcp_stream` and `udp_stream` come from later runs of run.py with `--only` and `--runs 5`, with rukernel 3cf341a on the same host (#465, #435). The other rows and the logs in `logs-aarch64` are from the run of 9de9f12. `tcp_stream` and `udp_stream` are from a run at a load average of 5.4 to 7.2. A second run at 5.6 to 6.5 gave 45.8 MB/s (126%) on Linux and 72.0 MB/s (13%) on rukernel for `tcp_stream`, and 3.10 MB/s (41%) and 6.05 MB/s (8%) for `udp_stream`. The Linux values of these two rows change much from run to run. `cow` is from a run at a load average of 5.1 to 6.2. A second run at 6.2 to 7.4 gave 121366 ns on Linux and 24534 ns on rukernel.
 
 To make this table again on a host with QEMU and a C compiler for static musl programs:
 

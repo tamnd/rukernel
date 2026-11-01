@@ -6,6 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- tools/bench/results-aarch64.md has new `cow`, `tcp_stream` and `udp_stream` rows from runs at a load average of 5.1 to 7.2 on server2. No row is red now: `tcp_stream` gives 71.9 MB/s on rukernel and 81.2 MB/s on Linux (1.13), `udp_stream` 6.68 and 4.56 MB/s (0.68), and `cow` 24523 ns and 117128 ns (0.21). The Linux values of the two stream rows change much from run to run (#465, #435).
 - With the `corten` backend, the tree of statuses is the page table, as in CortenMM. Each page table page has the status of each of its entries, a lock and a flag that tells if the page is in the tree. Before, the statuses of a range larger than a 2 MiB block were in a second tree of nodes on the heap. Now `fork` copies the statuses of each level in the same walk of the page table as the pages, and the exit of a process frees them with the page table, so each walks one tree and not two. A walk reads the entries of one page table page in one call (#405).
 - spec records the decision of open question 2: rukernel uses its own `rk-frame`, and OSTD stays a reference (#23). Open question 1, CortenMM or VMAs, moves to the end of R5, because the `will-it-scale` run needs a host with KVM (#22).
 
