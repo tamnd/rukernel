@@ -2,15 +2,17 @@
 //! spec/24-open-questions.md question 1.
 //!
 //! The statuses of the pages in a [`Tree`] are the source of truth, and there is no tree of areas.
-//! The statuses of the pages of a 2 MiB block that do not all have one status are in the status
-//! table of the last level page table of the block in [`VmSpace`], as CortenMM keeps them in the
-//! page table pages. `munmap` and `mprotect` change the statuses and the page table entries of each
-//! block in one pass, with one lock of the block, and `fork` copies them in one walk. A page fault,
-//! `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their range, so these calls on
-//! ranges in different nodes do not wait for each other. The lock of a node of the lowest level is
-//! the hold of the status table of its block in [`VmSpace`]. Thus a call in one 2 MiB block with a
-//! status in the table holds only that block, which it finds with the walk of the page table, and
-//! does not walk the tree. The other calls are rare. They lock the whole tree with [`Corten::lock`], which makes the
+//! The nodes of the tree are the page table pages of the address space in [`VmSpace`], as CortenMM
+//! keeps the statuses in the page table pages: the statuses of the pages of a 2 MiB block that do
+//! not all have one status are in the status table of the last level page table of the block, and
+//! a larger range with one status has it in a slot of a table above. Thus there is one tree.
+//! `munmap` and `mprotect` change the statuses and the page table entries of each block in one
+//! pass, with one lock of the block, and `fork` copies the statuses and the pages in one walk of
+//! the page table. A page fault, `mmap`, `munmap`, `mprotect` and `brk` lock only the nodes of their
+//! range, so these calls on ranges in different nodes do not wait for each other. The lock of a
+//! node is the hold of its page table page in [`VmSpace`]. Thus a call in one 2 MiB block with a
+//! live node holds only that block, which it finds with the walk of the page table, and does not
+//! walk the levels above. The other calls are rare. They lock the whole tree with [`Corten::lock`], which makes the
 //! areas from the statuses, lets the code of the VMA backend change them, and writes the changes
 //! back to the tree. The areas that `/proc/PID/maps` shows come from the statuses in the same way:
 //! a run of pages with the same status is one area.
@@ -21,7 +23,7 @@ use super::{
     write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
-use crate::pttree::{Leaves, RangeLock, TREE_END, Tree};
+use crate::pttree::{RangeLock, TREE_END, Table, Tree};
 use crate::rangelog::{RangeLog, reserve_area};
 use crate::tunables::{self, OVERCOMMIT_NEVER};
 use crate::vma::{Backing, HugeAdvice, PAGE_SIZE, Prot, Vma, VmaKind, VmaSet};
@@ -46,12 +48,79 @@ fn from_table(s: &PageStatus) -> Option<Status> {
     s.clone().downcast().ok()
 }
 
-/// The statuses of the pages of the nodes of the lowest level of the tree: the status tables of
-/// the last level page tables of the address space.
+/// The nodes of the tree: the page table pages of the address space, with their statuses, locks
+/// and live flags.
 pub(super) struct PageTable(Arc<VmSpace>);
 
-impl Leaves<Status> for PageTable {
+impl Table<Status> for PageTable {
     type Op = PageChange;
+
+    fn lock(&self, level: u32, base: usize) {
+        self.0.hold_node(level, VirtAddr::new(base), true);
+    }
+
+    fn try_lock(&self, level: u32, base: usize) -> bool {
+        self.0.try_hold_node(level, VirtAddr::new(base))
+    }
+
+    fn unlock(&self, level: u32, base: usize) {
+        self.0.release_node(level, VirtAddr::new(base));
+    }
+
+    fn lock_used(&self, base: usize) -> bool {
+        let addr = VirtAddr::new(base);
+        if !self.0.hold_node(1, addr, false) {
+            return false;
+        }
+        if self.0.node_live(1, addr) {
+            return true;
+        }
+        self.0.release_node(1, addr);
+        false
+    }
+
+    fn live(&self, level: u32, base: usize) -> bool {
+        self.0.node_live(level, VirtAddr::new(base))
+    }
+
+    fn set_live(&self, level: u32, base: usize, live: bool) {
+        self.0.set_node_live(level, VirtAddr::new(base), live);
+    }
+
+    fn is_empty(&self, level: u32, base: usize) -> bool {
+        self.0.node_is_empty(level, VirtAddr::new(base))
+    }
+
+    fn slot(&self, level: u32, addr: usize) -> Option<Status> {
+        self.0.node_status(level, VirtAddr::new(addr)).as_ref().and_then(from_table)
+    }
+
+    fn set_slots(&self, level: u32, start: usize, end: usize, status: Option<&Status>) {
+        let status = status.map(|s| s.clone() as PageStatus);
+        self.0.set_node_status(level, VirtAddr::new(start), VirtAddr::new(end), status.as_ref());
+    }
+
+    fn entries(
+        &self,
+        level: u32,
+        base: usize,
+        first: usize,
+        last: usize,
+        mut f: impl FnMut(usize, Option<&Status>),
+    ) {
+        // The slots of a node often hold the same status, so the last one is kept.
+        let mut seen: Option<(*const (), Option<Status>)> = None;
+        self.0.node_entries(level, VirtAddr::new(base), first, last, |i, p| {
+            let Some(p) = p else { return f(i, None) };
+            let key = Arc::as_ptr(p).cast::<()>();
+            if seen.as_ref().is_none_or(|(k, _)| *k != key) {
+                seen = Some((key, from_table(p)));
+            }
+            if let Some((_, Some(s))) = &seen {
+                f(i, Some(s));
+            }
+        });
+    }
 
     fn get(&self, addr: usize) -> Option<Status> {
         self.0.status(VirtAddr::new(addr)).as_ref().and_then(from_table)
@@ -92,26 +161,6 @@ impl Leaves<Status> for PageTable {
         };
         let (a, b, s) = self.0.status_run(VirtAddr::new(addr), joins)?;
         Some((a, b, from_table(&s)?))
-    }
-
-    fn is_empty(&self, base: usize) -> bool {
-        !self.0.has_status(VirtAddr::new(base))
-    }
-
-    fn lock(&self, base: usize) {
-        self.0.hold_status(VirtAddr::new(base), true);
-    }
-
-    fn lock_used(&self, base: usize) -> bool {
-        self.0.hold_status(VirtAddr::new(base), false)
-    }
-
-    fn try_lock(&self, base: usize) -> bool {
-        self.0.try_hold_status(VirtAddr::new(base))
-    }
-
-    fn unlock(&self, base: usize) {
-        self.0.release_status(VirtAddr::new(base));
     }
 }
 
@@ -365,12 +414,12 @@ impl Corten {
     /// locks the node of the block in the tree. A block with a status in its table has such a node,
     /// and a status of the block in a slot above it moves to the table only with the node held.
     fn held_area(&self, page: usize) -> Option<(Hold<'_>, Vma<FileRef>)> {
-        let vm = &*self.tree.leaves().0;
+        let vm = &*self.tree.table().0;
         if !vm.hold_status(VirtAddr::new(page), false) {
             return None;
         }
         let hold = Hold { vm, addr: page };
-        let (a, b, s) = self.tree.leaves().run_at(page, same_status)?;
+        let (a, b, s) = self.tree.table().run_at(page, same_status)?;
         Some((hold, view(&s, a, b)))
     }
 
@@ -533,8 +582,8 @@ impl AddressSpace {
             recent = Some((key, copy.clone()));
             copy.clone()
         };
-        // The child gets the statuses of the small pages with the pages, in one walk of the page
-        // table.
+        // The child gets the statuses of each node of the tree with the pages, in one walk of the
+        // page table, so its tree is ready.
         let vm = self.vm.fork_with(&areas, |p| {
             let s = from_table(p)?;
             map(&s).map(|c| c as PageStatus)
@@ -544,7 +593,7 @@ impl AddressSpace {
         // in the count one time.
         let charge = runs.iter().filter(|r| r.2.account && !r.2.shared && !r.2.dont_fork);
         charge_commit(charge.map(|r| r.1 - r.0).sum())?;
-        let tree = Tree::fork(&all, &mut map, PageTable(vm.clone()));
+        let tree = Tree::new(PageTable(vm.clone()));
         let mut va = VmaSet::new();
         let mut count = 0;
         let mut last: Option<(usize, Status)> = None;

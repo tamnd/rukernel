@@ -23,7 +23,7 @@
 
 use crate::addr::{PAGE_SIZE, VirtAddr};
 use crate::arch::imp::paging;
-use crate::blocks::BlockTree;
+use crate::blocks::{BlockTree, TOP_LEVEL};
 use crate::mm::frame::free_frame_phys;
 use crate::mm::{Frame, HUGE_FRAMES};
 use crate::status::{PageStatus, SLOTS, StatusTable};
@@ -31,7 +31,7 @@ use crate::sync::SpinLock;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// The end of the user half of the address space. Each user address is below it.
@@ -215,48 +215,45 @@ struct Block {
     huge: Option<Huge>,
 }
 
-/// The locks of one 2 MiB block. `pages` is the lock of the last level table. `holder` is the
-/// lock of the status table for the memory manager: the CortenMM backend holds it for the whole
-/// change of the statuses of the block, or for a whole page fault in the block, as the lock of a
-/// page table page of CortenMM. It is the lock of the node of the lowest level of the tree of
-/// statuses of the backend, so a fault finds it with the walk of the page table, with no lock, and
-/// does not walk the tree. A call takes `holder` before `pages`, and it does not wait for `holder`
-/// while it holds `pages`.
+/// The metadata of one page table page for the memory manager, as the metadata array of a page
+/// table page of CortenMM. It has the status of each entry of the page, the lock of the page, and
+/// the flag that tells if the node of the page is in the tree of the memory manager (it is live).
 ///
-/// Only the task that holds the status table reads or changes it, so a reader of the statuses
+/// `holder` is the lock: the CortenMM backend holds it for the whole change of the statuses of the
+/// page, or for a whole page fault in its block, as the lock of a page table page of CortenMM. A
+/// fault finds the lock of its block with the walk of the page table, with no lock, and does not
+/// walk the tables above. A call takes the hold of a block before the lock of its pages, and it
+/// does not wait for a hold while it holds the lock of the pages.
+///
+/// Only the task that holds the page reads or changes its statuses, so a reader of the statuses
 /// takes one lock, the hold, and not the lock of the pages too. The calls that change the pages of
-/// another address space, as the write protect of a page for a write back, take only `pages`, and
-/// do not wait for a hold.
-struct BlockLock {
-    pages: SpinLock<Block>,
-    /// 0 if no task holds the status table. Else the key of the holder (`task::current_key`),
-    /// with the low bit set while a call of the holder uses the table.
+/// another address space, as the write protect of a page for a write back, take only the lock of
+/// the pages, and do not wait for a hold.
+#[derive(Default)]
+struct Meta {
+    /// 0 if no task holds the page. Else the key of the holder (`task::current_key`), with the
+    /// low bit set while a call of the holder uses the statuses.
     holder: AtomicUsize,
     /// The status table has a status. Only the holder changes it.
     used: AtomicBool,
-    /// The status of each page of the block, as the metadata array of a page table page of
-    /// CortenMM. The memory manager sets it. A page can have a status and no frame.
+    /// The node of the page is in the tree of the memory manager. Only the holder of the page and
+    /// of its parent changes it.
+    live: AtomicBool,
+    /// The number of live nodes below this one, so a check for an empty node does not read the
+    /// 512 entries.
+    live_children: AtomicUsize,
+    /// The status of each entry of the page. The memory manager sets it. A page can have a status
+    /// and no frame.
     status: UnsafeCell<StatusTable>,
 }
 
 // SAFETY: `status` is the only field that is not `Sync`. Only the task with its key in `holder`
 // gets a reference to it, in `with_status`, which sets the low bit of `holder` for the life of
 // the reference, so a second reference cannot exist. A task runs on one CPU at a time.
-unsafe impl Sync for BlockLock {}
+unsafe impl Sync for Meta {}
 
-impl Default for BlockLock {
-    fn default() -> Self {
-        Self {
-            pages: SpinLock::new(Block::default()),
-            holder: AtomicUsize::new(0),
-            used: AtomicBool::new(false),
-            status: UnsafeCell::new(StatusTable::default()),
-        }
-    }
-}
-
-impl BlockLock {
-    /// Holds the status table, and waits while another task holds it.
+impl Meta {
+    /// Holds the page, and waits while another task holds it.
     fn hold(&self) {
         let key = crate::task::current_key();
         while self
@@ -271,28 +268,28 @@ impl BlockLock {
         }
     }
 
-    /// Holds the status table if no task holds it.
+    /// Holds the page if no task holds it.
     fn try_hold(&self) -> bool {
         let key = crate::task::current_key();
         self.holder.compare_exchange(0, key, Ordering::Acquire, Ordering::Relaxed).is_ok()
     }
 
-    /// Ends the hold of the status table.
+    /// Ends the hold of the page.
     ///
     /// # Panics
     ///
-    /// If the current task does not hold the table.
+    /// If the current task does not hold the page.
     fn release(&self) {
         let key = crate::task::current_key();
         let freed = self.holder.compare_exchange(key, 0, Ordering::Release, Ordering::Relaxed);
-        assert!(freed.is_ok(), "a task ends a hold of a status table that it does not hold");
+        assert!(freed.is_ok(), "a task ends a hold of a page table page that it does not hold");
     }
 
     /// Calls `f` with the status table. `f` does not use the address space.
     ///
     /// # Panics
     ///
-    /// If the current task does not hold the table, or if `f` is in a call of `f`.
+    /// If the current task does not hold the page, or if `f` is in a call of `f`.
     fn with_status<R>(&self, f: impl FnOnce(&mut StatusTable) -> R) -> R {
         let key = crate::task::current_key();
         let used = self.holder.compare_exchange(key, key | 1, Ordering::Relaxed, Ordering::Relaxed);
@@ -309,6 +306,28 @@ impl BlockLock {
     /// Tells if the status table has a status. The answer is exact only for the holder.
     fn has_status(&self) -> bool {
         self.used.load(Ordering::Relaxed)
+    }
+
+    fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// Tells if the node has no status and no live node below it.
+    fn is_empty(&self) -> bool {
+        !self.has_status() && self.live_children.load(Ordering::Relaxed) == 0
+    }
+}
+
+/// The locks of one 2 MiB block. `pages` is the lock of the last level table. `meta` has the
+/// statuses of the pages and the hold of the block for the memory manager.
+struct BlockLock {
+    pages: SpinLock<Block>,
+    meta: Meta,
+}
+
+impl Default for BlockLock {
+    fn default() -> Self {
+        Self { pages: SpinLock::new(Block::default()), meta: Meta::default() }
     }
 }
 
@@ -339,6 +358,11 @@ const _: () = assert!(SLOTS == HUGE_FRAMES);
 /// The part of `start..end` in the block at `block`.
 fn clip(block: usize, start: usize, end: usize) -> (usize, usize) {
     (start.max(block), end.min(block + HUGE_PAGE_SIZE))
+}
+
+/// The index of the entry of `addr` in its page table page of `level`. A block is at level 1.
+fn entry_of(level: u32, addr: usize) -> usize {
+    (addr >> (PAGE_SIZE.trailing_zeros() + 9 * (level - 1))) % SLOTS
 }
 
 impl Block {
@@ -379,7 +403,7 @@ pub struct VmSpace {
     /// The physical address of the top level table. It does not change.
     root: u64,
     /// The pages of each block.
-    blocks: BlockTree<BlockLock>,
+    blocks: BlockTree<BlockLock, Meta>,
     /// The number of mapped pages that are not in a huge page.
     small: AtomicUsize,
     /// The number of huge pages.
@@ -562,7 +586,7 @@ impl VmSpace {
                 None => return false,
             }
         };
-        lock.hold();
+        lock.meta.hold();
         true
     }
 
@@ -573,7 +597,7 @@ impl VmSpace {
     ///
     /// If `addr` is not below `USER_END`.
     pub fn try_hold_status(&self, addr: VirtAddr) -> bool {
-        self.blocks.get_or_make(addr.get(), BlockLock::default).try_hold()
+        self.blocks.get_or_make(addr.get(), BlockLock::default).meta.try_hold()
     }
 
     /// Ends the hold of the status table of the block of `addr`, which the caller holds.
@@ -583,7 +607,195 @@ impl VmSpace {
     /// If the current task does not hold the table.
     pub fn release_status(&self, addr: VirtAddr) {
         if let Some(lock) = self.blocks.get(addr.get()) {
-            lock.release();
+            lock.meta.release();
+        }
+    }
+
+    /// The metadata of the page table page of `level` at `addr`, if the page is there. Level 1
+    /// is the last level table of a 2 MiB block.
+    fn meta(&self, level: u32, addr: usize) -> Option<&Meta> {
+        if level == 1 {
+            self.blocks.get(addr).map(|b| &b.meta)
+        } else {
+            self.blocks.meta(level, addr)
+        }
+    }
+
+    /// The metadata of the page table page of `level` at `addr`. The page is made if it is not
+    /// there.
+    fn meta_or_make(&self, level: u32, addr: usize) -> &Meta {
+        if level == 1 {
+            &self.blocks.get_or_make(addr, BlockLock::default).meta
+        } else {
+            self.blocks.meta_or_make(level, addr)
+        }
+    }
+
+    /// Holds the page table page of `level` at `addr` for the memory manager, as `hold_status`
+    /// holds the page of level 1. Level 1 is the last level, and level 4 is the top.
+    ///
+    /// # Panics
+    ///
+    /// If `make` is set and `addr` is not below `USER_END`.
+    pub fn hold_node(&self, level: u32, addr: VirtAddr, make: bool) -> bool {
+        let a = addr.get();
+        let meta = if make { Some(self.meta_or_make(level, a)) } else { self.meta(level, a) };
+        meta.map(Meta::hold).is_some()
+    }
+
+    /// Holds the page table page of `level` at `addr` as `hold_node` with `make`, if no other
+    /// call holds it. Gives `false` with no hold if one does.
+    pub fn try_hold_node(&self, level: u32, addr: VirtAddr) -> bool {
+        self.meta_or_make(level, addr.get()).try_hold()
+    }
+
+    /// Ends the hold of the page table page of `level` at `addr`, which the caller holds.
+    ///
+    /// # Panics
+    ///
+    /// If the current task does not hold the page.
+    pub fn release_node(&self, level: u32, addr: VirtAddr) {
+        if let Some(meta) = self.meta(level, addr.get()) {
+            meta.release();
+        }
+    }
+
+    /// Tells if the page table page of `level` at `addr` is in the tree of the memory manager.
+    /// A walk reads it with no hold.
+    pub fn node_live(&self, level: u32, addr: VirtAddr) -> bool {
+        self.meta(level, addr.get()).is_some_and(Meta::is_live)
+    }
+
+    /// Puts the page table page of `level` at `addr` in the tree of the memory manager, or takes
+    /// it out. The caller holds the page and the page above it.
+    ///
+    /// # Panics
+    ///
+    /// If the current task does not hold the page.
+    pub fn set_node_live(&self, level: u32, addr: VirtAddr, live: bool) {
+        let a = addr.get();
+        let meta = if live { Some(self.meta_or_make(level, a)) } else { self.meta(level, a) };
+        if let Some(meta) = meta {
+            Self::set_live(&self.blocks, meta, level, a, live);
+        }
+    }
+
+    /// Sets the live flag of `meta`, the page of `level` at `addr` in `blocks`, and counts it in
+    /// the page above it.
+    fn set_live(
+        blocks: &BlockTree<BlockLock, Meta>,
+        meta: &Meta,
+        level: u32,
+        addr: usize,
+        live: bool,
+    ) {
+        meta.with_status(|_| {});
+        if meta.live.swap(live, Ordering::Relaxed) == live || level == TOP_LEVEL {
+            return;
+        }
+        let parent = blocks.meta(level + 1, addr).expect("a page table page has a parent");
+        if live {
+            parent.live_children.fetch_add(1, Ordering::Relaxed);
+        } else {
+            parent.live_children.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Tells if the page table page of `level` at `addr` has no status and no page below it in
+    /// the tree. The answer is exact only for the holder.
+    pub fn node_is_empty(&self, level: u32, addr: VirtAddr) -> bool {
+        self.meta(level, addr.get()).is_none_or(Meta::is_empty)
+    }
+
+    /// Gives the status of the entry of `addr` in the page table page of `level`, which is above
+    /// level 1. The caller holds the page.
+    pub fn node_status(&self, level: u32, addr: VirtAddr) -> Option<PageStatus> {
+        let a = addr.get();
+        let meta = self.meta(level, a).filter(|m| m.has_status())?;
+        meta.with_status(|t| t.get(entry_of(level, a)).cloned())
+    }
+
+    /// Sets the status of each entry of the page table page of `level` in `start..end`, or
+    /// removes it with `None`. The range is in one page above level 1, and it is aligned to the
+    /// entries. The caller holds the page.
+    pub fn set_node_status(
+        &self,
+        level: u32,
+        start: VirtAddr,
+        end: VirtAddr,
+        status: Option<&PageStatus>,
+    ) {
+        let (start, end) = (start.get(), end.get());
+        let meta = if status.is_some() {
+            Some(self.meta_or_make(level, start))
+        } else {
+            self.meta(level, start)
+        };
+        if let Some(meta) = meta.filter(|m| status.is_some() || m.has_status()) {
+            let (first, last) = (entry_of(level, start), entry_of(level, end - 1) + 1);
+            meta.with_status(|t| t.set(first, last, status));
+        }
+    }
+
+    /// Calls `f` with the index of each entry from `first` to `last` of the page table page of
+    /// `level` at `addr` that points to a page in the tree of the memory manager, or that has a
+    /// status, in order. `f` gets `None` for an entry that points to a page in the tree, and else
+    /// the status. The level is above 1. The caller holds the page, and `f` does not use the
+    /// address space. One call reads the entries of the page faster than a call of `node_live`
+    /// and `node_status` for each entry.
+    pub fn node_entries(
+        &self,
+        level: u32,
+        addr: VirtAddr,
+        first: usize,
+        last: usize,
+        mut f: impl FnMut(usize, Option<&PageStatus>),
+    ) {
+        let a = addr.get();
+        let Some(meta) = self.meta(level, a) else { return };
+        // A bit for each entry that points to a page in the tree.
+        let bits: [Cell<u64>; SLOTS / 64] = Default::default();
+        if meta.live_children.load(Ordering::Relaxed) != 0 {
+            let mark = |i: usize| bits[i / 64].set(bits[i / 64].get() | 1 << (i % 64));
+            let node = |i, m: &Meta| {
+                if m.is_live() {
+                    mark(i);
+                }
+            };
+            let block = |i, b: &BlockLock| {
+                if b.meta.is_live() {
+                    mark(i);
+                }
+            };
+            self.blocks.children(level, a, first..=last, node, block);
+        }
+        let mut live = bits.map(Cell::into_inner);
+        // Gives the first entry below `end` that points to a page in the tree, and clears its bit.
+        let mut live_below = |end: usize| {
+            let w = live.iter().position(|&w| w != 0)?;
+            let i = w * 64 + live[w].trailing_zeros() as usize;
+            (i < end).then(|| {
+                live[w] &= live[w] - 1;
+                i
+            })
+        };
+        if meta.has_status() {
+            meta.with_status(|t| {
+                t.each(first, last, |i, s| {
+                    while let Some(j) = live_below(i) {
+                        f(j, None);
+                    }
+                    // A live entry has no status, but the order stays right if it has one.
+                    if live_below(i + 1).is_some() {
+                        f(i, None);
+                    } else {
+                        f(i, Some(s));
+                    }
+                });
+            });
+        }
+        while let Some(j) = live_below(SLOTS) {
+            f(j, None);
         }
     }
 
@@ -596,8 +808,8 @@ impl VmSpace {
     /// for each call below that reads or changes the statuses.
     pub fn status(&self, addr: VirtAddr) -> Option<PageStatus> {
         let a = addr.get();
-        let lock = self.blocks.get(a).filter(|l| l.has_status())?;
-        lock.with_status(|t| t.get(slot_of(a)).cloned())
+        let lock = self.blocks.get(a).filter(|l| l.meta.has_status())?;
+        lock.meta.with_status(|t| t.get(slot_of(a)).cloned())
     }
 
     /// Sets the status of each page in the page aligned range `start..end`, or removes it with
@@ -632,8 +844,8 @@ impl VmSpace {
             if let Some(lock) = lock {
                 let (from, to) = clip(block, start, end);
                 let (first, last) = (slot_of(from), slot_of(to - 1) + 1);
-                if status.is_some() || lock.has_status() {
-                    lock.with_status(|t| {
+                if status.is_some() || lock.meta.has_status() {
+                    lock.meta.with_status(|t| {
                         t.runs(first, last, |a, z, s| {
                             old(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
                         });
@@ -747,8 +959,8 @@ impl VmSpace {
         while addr < end {
             let block = block_of(addr);
             let to = end.min(block + HUGE_PAGE_SIZE);
-            if let Some(lock) = self.blocks.get(addr).filter(|l| l.has_status()) {
-                lock.with_status(|t| {
+            if let Some(lock) = self.blocks.get(addr).filter(|l| l.meta.has_status()) {
+                lock.meta.with_status(|t| {
                     t.runs(slot_of(addr), slot_of(to - 1) + 1, |a, z, s| {
                         f(block + a * PAGE_SIZE, block + z * PAGE_SIZE, s)
                     });
@@ -768,15 +980,15 @@ impl VmSpace {
     ) -> Option<(usize, usize, PageStatus)> {
         let a = addr.get();
         let block = block_of(a);
-        let lock = self.blocks.get(a).filter(|l| l.has_status())?;
-        let (first, end, s) = lock.with_status(|t| t.run_at(slot_of(a), same))?;
+        let lock = self.blocks.get(a).filter(|l| l.meta.has_status())?;
+        let (first, end, s) = lock.meta.with_status(|t| t.run_at(slot_of(a), same))?;
         Some((block + first * PAGE_SIZE, block + end * PAGE_SIZE, s))
     }
 
     /// Tells if a page of the 2 MiB block of `addr` has a status. The answer is exact only for
     /// the holder of the status table, and it takes no lock.
     pub fn has_status(&self, addr: VirtAddr) -> bool {
-        self.blocks.get(addr.get()).is_some_and(BlockLock::has_status)
+        self.blocks.get(addr.get()).is_some_and(|l| l.meta.has_status())
     }
 
     /// Makes the address space of a child of `fork` with the pages of this space in `areas`. The
@@ -811,23 +1023,51 @@ impl VmSpace {
         let child = Self::new().ok_or(MapError::NoMemory)?;
         let mut flush = false;
         let copied = self.blocks.each(0, USER_END, |block, lock| {
-            if lock.has_status() {
-                let status = lock.with_status(|t| t.map(&mut map));
-                if !status.is_empty() {
-                    // No other call uses the child yet.
-                    let c = child.blocks.get_or_make(block, BlockLock::default);
-                    c.hold();
-                    c.with_status(|t| *t = status);
-                    c.release();
-                }
-            }
+            child.fork_node(1, block, &lock.meta, &mut map);
             let mut b = lock.lock();
             self.fork_block(&child, &mut b, block, areas, &mut flush)
         });
+        // The pages above the blocks come after the pages below them, so the child knows which
+        // pages below a page are in its tree.
+        if copied.is_ok() {
+            self.blocks.each_node(|level, base, meta| child.fork_node(level, base, meta, &mut map));
+        }
         if flush {
             paging::user_flush_all(self.root);
         }
         copied.map(|()| child)
+    }
+
+    /// Copies the statuses of `meta`, the page table page of `level` at `addr` of the parent, to
+    /// this new space of a child of `fork`. The page of the child is in the tree if the page of
+    /// the parent is, and if it has a status or a page below it in the tree of the child. The top
+    /// is always in the tree. The parent holds each page of its tree. No other call uses the
+    /// child yet.
+    fn fork_node(
+        &self,
+        level: u32,
+        addr: usize,
+        meta: &Meta,
+        map: &mut impl FnMut(&PageStatus) -> Option<PageStatus>,
+    ) {
+        if !meta.is_live() {
+            return;
+        }
+        let status = if meta.has_status() {
+            meta.with_status(|t| t.map(map))
+        } else {
+            StatusTable::default()
+        };
+        let below =
+            self.meta(level, addr).is_some_and(|m| m.live_children.load(Ordering::Relaxed) > 0);
+        if status.is_empty() && !below && level != TOP_LEVEL {
+            return;
+        }
+        let c = self.meta_or_make(level, addr);
+        c.hold();
+        c.with_status(|t| *t = status);
+        Self::set_live(&self.blocks, c, level, addr, true);
+        c.release();
     }
 
     /// Copies the block at `block` to `child`, for `fork`. Sets `flush` if a page of this space
