@@ -11,6 +11,10 @@
 //! from empty to the child, with a compare and swap. If two CPUs make the same child at the same
 //! time, one of them drops its copy. A child stays until the tree is dropped, as the page tables
 //! of a user address space stay until the address space goes.
+//!
+//! Each node above the blocks has a value of type `M` too, the metadata of the page table page of
+//! the same range: the top node for the top level table, a middle node for a table of 512 GiB, and
+//! a node of the lowest level for a table of 1 GiB.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -93,19 +97,38 @@ fn touched(base: usize, shift: u32, n: usize, start: usize, end: usize) -> Range
     first..=last
 }
 
-type Leaf<T> = Box<[Slot<T>]>;
-type Mid<T> = Box<[Slot<Leaf<T>>]>;
+/// A node: the value of its page table page and its slots.
+struct Node<C, M> {
+    meta: M,
+    slots: Box<[Slot<C>]>,
+}
 
-/// A value of type `T` for each 2 MiB block of the addresses below an end.
-pub(crate) struct BlockTree<T> {
-    top: Box<[Slot<Mid<T>>]>,
+impl<C, M: Default> Node<C, M> {
+    fn new(n: usize) -> Self {
+        Self { meta: M::default(), slots: slots(n) }
+    }
+}
+
+type Leaf<T, M> = Node<T, M>;
+type Mid<T, M> = Node<Leaf<T, M>, M>;
+
+/// A value of type `T` for each 2 MiB block of the addresses below an end, and a value of type
+/// `M` for each node above the blocks.
+pub(crate) struct BlockTree<T, M = ()> {
+    top: Node<Mid<T, M>, M>,
     end: usize,
 }
 
-impl<T> BlockTree<T> {
+/// The level of the nodes of the lowest level, as the levels of the page table: a block is at
+/// level 1.
+pub(crate) const LEAF_LEVEL: u32 = 2;
+/// The level of the top node.
+pub(crate) const TOP_LEVEL: u32 = 4;
+
+impl<T, M: Default> BlockTree<T, M> {
     /// Makes a tree for the addresses below `end`, with no value.
     pub(crate) fn new(end: usize) -> Self {
-        Self { top: slots(end.div_ceil(1 << TOP_SHIFT)), end }
+        Self { top: Node::new(end.div_ceil(1 << TOP_SHIFT)), end }
     }
 
     fn index(addr: usize, shift: u32) -> usize {
@@ -114,9 +137,9 @@ impl<T> BlockTree<T> {
 
     /// Gives the value of the block of `addr`, if it has one.
     pub(crate) fn get(&self, addr: usize) -> Option<&T> {
-        let mid = self.top.get(addr >> TOP_SHIFT)?.get()?;
-        let leaf = mid[Self::index(addr, MID_SHIFT)].get()?;
-        leaf[Self::index(addr, BLOCK_SHIFT)].get()
+        let mid = self.top.slots.get(addr >> TOP_SHIFT)?.get()?;
+        let leaf = mid.slots[Self::index(addr, MID_SHIFT)].get()?;
+        leaf.slots[Self::index(addr, BLOCK_SHIFT)].get()
     }
 
     /// Gives the value of the block of `addr`, and makes it with `make` if it has none.
@@ -125,10 +148,99 @@ impl<T> BlockTree<T> {
     ///
     /// If `addr` is not below the end of the tree.
     pub(crate) fn get_or_make(&self, addr: usize, make: impl FnOnce() -> T) -> &T {
+        let leaf = self.leaf_or_make(addr);
+        leaf.slots[Self::index(addr, BLOCK_SHIFT)].get_or_make(make)
+    }
+
+    /// The node of the lowest level of `addr`, which is made if it is not there.
+    fn leaf_or_make(&self, addr: usize) -> &Leaf<T, M> {
         assert!(addr < self.end, "{addr:#x} is outside the tree");
-        let mid = self.top[addr >> TOP_SHIFT].get_or_make(|| slots(FANOUT));
-        let leaf = mid[Self::index(addr, MID_SHIFT)].get_or_make(|| slots(FANOUT));
-        leaf[Self::index(addr, BLOCK_SHIFT)].get_or_make(make)
+        let mid = self.top.slots[addr >> TOP_SHIFT].get_or_make(|| Node::new(FANOUT));
+        mid.slots[Self::index(addr, MID_SHIFT)].get_or_make(|| Node::new(FANOUT))
+    }
+
+    /// Gives the value of the node of `level` that has `addr`, if the node is there. The level
+    /// is from [`LEAF_LEVEL`] to [`TOP_LEVEL`].
+    pub(crate) fn meta(&self, level: u32, addr: usize) -> Option<&M> {
+        if level == TOP_LEVEL {
+            return Some(&self.top.meta);
+        }
+        let mid = self.top.slots.get(addr >> TOP_SHIFT)?.get()?;
+        if level == TOP_LEVEL - 1 {
+            return Some(&mid.meta);
+        }
+        mid.slots[Self::index(addr, MID_SHIFT)].get().map(|leaf| &leaf.meta)
+    }
+
+    /// Gives the value of the node of `level` that has `addr` as `meta`, and makes the node if
+    /// it is not there.
+    ///
+    /// # Panics
+    ///
+    /// If `addr` is not below the end of the tree.
+    pub(crate) fn meta_or_make(&self, level: u32, addr: usize) -> &M {
+        match level {
+            TOP_LEVEL => &self.top.meta,
+            LEAF_LEVEL => &self.leaf_or_make(addr).meta,
+            _ => {
+                assert!(addr < self.end, "{addr:#x} is outside the tree");
+                &self.top.slots[addr >> TOP_SHIFT].get_or_make(|| Node::new(FANOUT)).meta
+            }
+        }
+    }
+
+    /// Calls `node` with the index and the value of each node in the slots `slots` of the node of
+    /// `level` that has `addr`, in order. For a node of [`LEAF_LEVEL`], `block` gets the index and
+    /// the value of each block in the slots. A slot with no node or no block gets no call.
+    pub(crate) fn children(
+        &self,
+        level: u32,
+        addr: usize,
+        slots: RangeInclusive<usize>,
+        mut node: impl FnMut(usize, &M),
+        mut block: impl FnMut(usize, &T),
+    ) {
+        if level == TOP_LEVEL {
+            for i in slots {
+                if let Some(mid) = self.top.slots.get(i).and_then(Slot::get) {
+                    node(i, &mid.meta);
+                }
+            }
+            return;
+        }
+        let Some(mid) = self.top.slots.get(addr >> TOP_SHIFT).and_then(Slot::get) else {
+            return;
+        };
+        if level == TOP_LEVEL - 1 {
+            for i in slots {
+                if let Some(leaf) = mid.slots[i].get() {
+                    node(i, &leaf.meta);
+                }
+            }
+            return;
+        }
+        let Some(leaf) = mid.slots[Self::index(addr, MID_SHIFT)].get() else { return };
+        for i in slots {
+            if let Some(value) = leaf.slots[i].get() {
+                block(i, value);
+            }
+        }
+    }
+
+    /// Calls `f` with the level, the first address and the value of each node above the blocks,
+    /// with each node after the nodes below it, in address order.
+    pub(crate) fn each_node(&self, mut f: impl FnMut(u32, usize, &M)) {
+        for (t, mid) in self.top.slots.iter().enumerate() {
+            let Some(mid) = mid.get() else { continue };
+            let mid_base = t << TOP_SHIFT;
+            for (m, leaf) in mid.slots.iter().enumerate() {
+                if let Some(leaf) = leaf.get() {
+                    f(LEAF_LEVEL, mid_base + (m << MID_SHIFT), &leaf.meta);
+                }
+            }
+            f(TOP_LEVEL - 1, mid_base, &mid.meta);
+        }
+        f(TOP_LEVEL, 0, &self.top.meta);
     }
 
     /// Calls `f` with the address and the value of each block that has a value and that
@@ -147,14 +259,14 @@ impl<T> BlockTree<T> {
         if start >= end {
             return Ok(());
         }
-        for t in touched(0, TOP_SHIFT, self.top.len(), start, end) {
-            let Some(mid) = self.top[t].get() else { continue };
+        for t in touched(0, TOP_SHIFT, self.top.slots.len(), start, end) {
+            let Some(mid) = self.top.slots[t].get() else { continue };
             let mid_base = t << TOP_SHIFT;
             for m in touched(mid_base, MID_SHIFT, FANOUT, start, end) {
-                let Some(leaf) = mid[m].get() else { continue };
+                let Some(leaf) = mid.slots[m].get() else { continue };
                 let leaf_base = mid_base + (m << MID_SHIFT);
                 for b in touched(leaf_base, BLOCK_SHIFT, FANOUT, start, end) {
-                    if let Some(value) = leaf[b].get() {
+                    if let Some(value) = leaf.slots[b].get() {
                         f(leaf_base + (b << BLOCK_SHIFT), value)?;
                     }
                 }
@@ -199,7 +311,7 @@ mod tests {
 
     #[test]
     fn a_block_covers_2_mib() {
-        let tree = BlockTree::new(END);
+        let tree = BlockTree::<_>::new(END);
         assert_eq!(*tree.get_or_make(0x40_0000 + 5, || 7), 7);
         assert_eq!(tree.get(0x40_0000), Some(&7));
         assert_eq!(tree.get(0x5f_ffff), Some(&7));
@@ -211,7 +323,7 @@ mod tests {
 
     #[test]
     fn each_gives_the_blocks_of_a_range_in_order() {
-        let tree = BlockTree::new(END);
+        let tree = BlockTree::<_>::new(END);
         let addrs = [END - 1, 0, 1 << 39, (1 << 30) + BLOCK_SIZE, 1 << 30, 5 * BLOCK_SIZE];
         for (i, &a) in addrs.iter().enumerate() {
             tree.get_or_make(a, || i);
@@ -241,9 +353,48 @@ mod tests {
     }
 
     #[test]
+    fn the_nodes_above_the_blocks_have_values() {
+        let tree = BlockTree::<usize, AtomicUsize>::new(END);
+        let (g1, g512) = (1 << MID_SHIFT, 1 << TOP_SHIFT);
+        assert!(tree.meta(LEAF_LEVEL, g1).is_none());
+        assert!(tree.meta(3, g512).is_none());
+        if let Some(top) = tree.meta(TOP_LEVEL, 0) {
+            top.store(4, Ordering::Relaxed);
+        }
+        tree.meta_or_make(LEAF_LEVEL, g512 + g1 + 5).store(2, Ordering::Relaxed);
+        tree.meta_or_make(3, g512 + 7).fetch_add(3, Ordering::Relaxed);
+        let mut seen = Vec::new();
+        tree.each_node(|l, a, m| seen.push((l, a, m.load(Ordering::Relaxed))));
+        assert_eq!(seen, [(LEAF_LEVEL, g512 + g1, 2), (3, g512, 3), (TOP_LEVEL, 0, 4)]);
+        // A block makes the nodes above it.
+        tree.get_or_make(5 * BLOCK_SIZE, || 1);
+        assert!(tree.meta(LEAF_LEVEL, 0).is_some() && tree.meta(3, 0).is_some());
+        assert!(blocks_of(&tree).eq([5 * BLOCK_SIZE]));
+        // Each node gives the nodes or the blocks below it.
+        let below = |level, addr, slots| {
+            let seen = core::cell::RefCell::new(Vec::new());
+            let node = |i, m: &AtomicUsize| seen.borrow_mut().push((i, m.load(Ordering::Relaxed)));
+            let block = |i, b: &usize| seen.borrow_mut().push((i, *b));
+            tree.children(level, addr, slots, node, block);
+            seen.into_inner()
+        };
+        assert_eq!(below(TOP_LEVEL, 0, 0..=255), [(0, 0), (1, 3)]);
+        assert_eq!(below(3, g512, 0..=511), [(1, 2)]);
+        assert_eq!(below(3, g512, 2..=511), []);
+        assert_eq!(below(LEAF_LEVEL, 0, 0..=511), [(5, 1)]);
+        assert_eq!(below(LEAF_LEVEL, g1, 0..=511), []);
+    }
+
+    fn blocks_of(tree: &BlockTree<usize, AtomicUsize>) -> impl Iterator<Item = usize> {
+        let mut out = Vec::new();
+        tree.each_all(|a, _| out.push(a));
+        out.into_iter()
+    }
+
+    #[test]
     #[should_panic(expected = "outside the tree")]
     fn a_make_past_the_end_panics() {
-        BlockTree::new(END).get_or_make(END, || 0);
+        BlockTree::<_>::new(END).get_or_make(END, || 0);
     }
 
     /// Counts the values that are dropped.
@@ -258,7 +409,7 @@ mod tests {
     #[test]
     fn the_tree_drops_its_values() {
         let dropped = AtomicUsize::new(0);
-        let tree = BlockTree::new(END);
+        let tree = BlockTree::<_>::new(END);
         for i in 0..10 {
             tree.get_or_make(i << 30, || Counted(&dropped));
         }
@@ -272,7 +423,7 @@ mod tests {
     #[test]
     fn threads_make_one_value_for_each_block() {
         extern crate std;
-        let tree = std::sync::Arc::new(BlockTree::new(END));
+        let tree = std::sync::Arc::new(BlockTree::<AtomicUsize>::new(END));
         let made = std::sync::Arc::new(AtomicUsize::new(0));
         let threads: Vec<_> = (0..4)
             .map(|_| {

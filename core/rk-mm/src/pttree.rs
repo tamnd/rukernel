@@ -7,46 +7,44 @@
 //! address space, and there is no tree of areas. spec/24-open-questions.md question 1 is the
 //! experiment.
 //!
-//! CortenMM (SOSP 2025) keeps the status of each page in the page table pages. The statuses of the
-//! pages of a node of the lowest level are in the last level page table of the same 2 MiB, in
-//! [`Leaves`], and the node has no slots. Thus a change of the pages of one 2 MiB block writes one
-//! tree, the page table. The nodes above keep the statuses of their larger slots, which cover
-//! 2 MiB or more, and the locks.
+//! CortenMM (SOSP 2025) keeps the status of each page in the page table pages. The nodes of this
+//! tree are the page table pages of the address space, in [`Table`]: a node of the lowest level is
+//! the last level page table of its 2 MiB block, and a node above is the page table page of the
+//! same range. Each page table page keeps the statuses of its slots, the lock of its node, and a
+//! flag that tells if the node is in the tree now (it is live). A slot of a node points to the
+//! node below when that node is live. Thus a change of the statuses writes one tree, the page
+//! table, and `fork` and the exit of a process walk one tree.
 //!
 //! Each node has its own lock. A [`RangeLock`] locks the lowest node that covers a range, and
 //! each node below it in the range. Thus two operations on ranges in different nodes do not wait
-//! for each other: a page fault locks one node of the lowest level, which covers 2 MiB. The lock
-//! of a node of the lowest level is the lock of the 2 MiB block in [`Leaves`], next to the
-//! statuses of the block, as CortenMM locks the page table page that keeps the statuses. Thus a
-//! page fault can lock the block with the walk of the page table, and not walk this tree.
+//! for each other: a page fault locks one node of the lowest level, which covers 2 MiB. Thus a
+//! page fault can lock the block with the walk of the page table, and not walk the levels above.
 //!
 //! A change of the statuses of a range can also change the pages of the range, as `munmap` and
 //! `mprotect` do, with [`RangeLock::change`]. The change of the pages of each block is in the same
 //! pass and under the same lock as the change of the statuses, as a change of CortenMM writes the
 //! metadata and the entries of one page table page together.
 //!
-//! A lock of a range in one 2 MiB block with statuses in [`Leaves`] takes only the lock of the
-//! block and does not walk the tree, as CortenMM starts at the last level page table. Another lock
-//! goes down from the root with no lock, as the RCU walk of CortenMM, to the lowest node that
-//! covers the range, and then locks that node and each node below it in the range. Thus an
-//! operation does not wait at a node above its range, and a page fault does not wait for a call
-//! on another 2 MiB block. A walk locks a node on the way only to make a missing child. A node
-//! that a holder removes from the tree is dead, and a walk that locks a dead node starts again.
+//! A lock of a range in one 2 MiB block with a live node takes only the lock of the block and does
+//! not walk the tree, as CortenMM starts at the last level page table. Another lock goes down from
+//! the root with no lock, as the RCU walk of CortenMM, to the lowest node that covers the range,
+//! and then locks that node and each node below it in the range. Thus an operation does not wait
+//! at a node above its range, and a page fault does not wait for a call on another 2 MiB block. A
+//! walk locks a node on the way only to make a missing child. A node that a holder removes from the
+//! tree is not live, and a walk that locks a node that is not live starts again.
 //!
 //! An empty node leaves the tree, as an empty page table page of Linux goes in `free_pgtables`.
 //! A `set` that empties a child below the top of its lock removes the child at once. When a lock
 //! drops and its top node is empty, it locks the parent and removes the node, and then the parent
-//! if it is empty too. The nodes that a walk makes and that stay empty go in the same way.
+//! if it is empty too. The nodes that a walk makes and that stay empty go in the same way. The page
+//! table page of a node that leaves the tree stays, with no status, so its lock stays too.
 //!
 //! The protocol has no deadlock. An operation waits for a node only when it holds no node, or
 //! when it holds an ancestor of the node, so each chain of waits goes down the tree. A node that a
 //! holder makes is locked before other operations can see it.
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::ops::{Index, IndexMut};
-use core::sync::atomic::{AtomicBool, Ordering};
-use rk_frame::sync::SpinLock;
+use core::marker::PhantomData;
 
 /// The number of slots in a node.
 pub const FANOUT: usize = 512;
@@ -69,18 +67,10 @@ enum Slot<S> {
     /// Each page of the slot has this status.
     Status(S),
     /// The node of the next level.
-    Child(Arc<Node<S>>),
+    Child(Node),
 }
 
-impl<S: Clone> Slot<S> {
-    /// A copy of an empty slot or a slot with a status, for each slot of a new child.
-    fn leaf_copy(&self) -> Self {
-        match self {
-            Slot::Status(s) => Slot::Status(s.clone()),
-            _ => Slot::Empty,
-        }
-    }
-
+impl<S> Slot<S> {
     /// The status of the slot, if it has one.
     fn status(&self) -> Option<&S> {
         match self {
@@ -90,18 +80,76 @@ impl<S: Clone> Slot<S> {
     }
 }
 
-/// The statuses of the pages of the nodes of the lowest level, in the last level page tables of
-/// the address space. The 2 MiB block of a node of the lowest level has one table.
+/// The page table pages of an address space, which keep the nodes of the tree. The page table
+/// page of the node of `level` at `base` keeps the status of each slot of the node, the lock of
+/// the node, and the flag that tells if the node is live. A slot has a status only if the node
+/// below it is not live.
 ///
-/// A call holds the node of the lowest level of a block, or a node above it and each node below
-/// it in the range, when it reads or changes the statuses of the block. A block with no node of
-/// the lowest level has no status.
-pub trait Leaves<S> {
+/// A call holds a node, or a node above it and each live node below it in the range, when it
+/// reads or changes the statuses of the node or the live flags of its children. A node that is not
+/// live has no status and no live child.
+pub trait Table<S> {
     /// A change of the pages, as `munmap` or `mprotect` makes it, that goes with a change of
     /// their statuses.
     type Op;
 
-    /// The status of the page at `addr`.
+    /// Takes the lock of the node of `level` at `base`, and waits while another call holds it.
+    /// The page table page of the node is made if it is not there.
+    fn lock(&self, level: u32, base: usize);
+
+    /// Takes the lock of the node of `level` at `base` if no other call holds it. Gives `false`
+    /// if one does.
+    fn try_lock(&self, level: u32, base: usize) -> bool;
+
+    /// Releases the lock of the node of `level` at `base`.
+    fn unlock(&self, level: u32, base: usize);
+
+    /// Takes the lock of the node of the lowest level of the 2 MiB block at `base` as `lock`, but
+    /// only if the node is live. Gives `false` with no lock if it is not. A lock in one block uses
+    /// it to start at the block.
+    fn lock_used(&self, base: usize) -> bool;
+
+    /// Tells if the node of `level` at `base` is live. A walk reads it with no lock.
+    fn live(&self, level: u32, base: usize) -> bool;
+
+    /// Marks the node of `level` at `base` live or not live. The caller holds the node and its
+    /// parent.
+    fn set_live(&self, level: u32, base: usize, live: bool);
+
+    /// Tells if the node of `level` at `base` has no status and no live child.
+    fn is_empty(&self, level: u32, base: usize) -> bool;
+
+    /// The status of the slot at `addr` of the node of `level`, which is above the lowest level.
+    fn slot(&self, level: u32, addr: usize) -> Option<S>;
+
+    /// Sets the status of each slot of the node of `level` in `start..end`, or removes it with
+    /// `None`. The range is in one node above the lowest level, and it is aligned to the slots.
+    fn set_slots(&self, level: u32, start: usize, end: usize, status: Option<&S>);
+
+    /// Calls `f` with the index of each slot from `first` to `last` of the node of `level` at
+    /// `base`, which is above the lowest level, that is not empty, in order. `f` gets `None` for
+    /// a slot that points to a live child, and else the status of the slot. The caller holds the
+    /// node, and `f` does not use the table. This default reads each slot with `live` and `slot`.
+    fn entries(
+        &self,
+        level: u32,
+        base: usize,
+        first: usize,
+        last: usize,
+        mut f: impl FnMut(usize, Option<&S>),
+    ) {
+        let size = slot_size(level);
+        for i in first..=last {
+            let child = base + i * size;
+            if self.live(level - 1, child) {
+                f(i, None);
+            } else if let Some(s) = self.slot(level, child) {
+                f(i, Some(&s));
+            }
+        }
+    }
+
+    /// The status of the page at `addr`, which is in a node of the lowest level.
     fn get(&self, addr: usize) -> Option<S>;
 
     /// Sets the status of each page in the page aligned range `start..end`, or removes it with
@@ -118,238 +166,157 @@ pub trait Leaves<S> {
     );
 
     /// Makes the change `op` to the pages of the page aligned range `start..end`, which have no
-    /// status in the leaves: their statuses are in the slots of the nodes above.
+    /// status in the nodes of the lowest level: their statuses are in the slots of the nodes
+    /// above.
     fn change(&self, start: usize, end: usize, op: &mut Self::Op);
 
     /// Calls `f` with ranges of pages in `start..end` with one status, in address order. Two
-    /// ranges next to each other can have the same status.
+    /// ranges next to each other can have the same status. The range is in nodes of the lowest
+    /// level.
     fn runs(&self, start: usize, end: usize, f: impl FnMut(usize, usize, &S));
 
     /// Gives the run of the page at `addr` in its 2 MiB block: the largest range of pages around
     /// it with statuses that `same` joins, and the status of the first page of the run.
     fn run_at(&self, addr: usize, same: impl Fn(&S, &S) -> bool) -> Option<(usize, usize, S)>;
-
-    /// Tells if no page of the 2 MiB block at `base` has a status.
-    fn is_empty(&self, base: usize) -> bool;
-
-    /// Takes the lock of the 2 MiB block at `base`, which is the lock of its node of the lowest
-    /// level, and waits while another call holds it.
-    fn lock(&self, base: usize);
-
-    /// Takes the lock of the block at `base` as `lock`, but only if the block had a status. Gives
-    /// `false` with no lock if it did not. A lock in one block uses it to start at the block.
-    fn lock_used(&self, base: usize) -> bool;
-
-    /// Takes the lock of the block at `base` if no other call holds it. Gives `false` if one does.
-    fn try_lock(&self, base: usize) -> bool;
-
-    /// Releases the lock of the block at `base`.
-    fn unlock(&self, base: usize);
 }
 
-/// The slots in one chunk of [`Slots`].
-const CHUNK: usize = 128;
-
-/// The slots of a node, in chunks of [`CHUNK`] slots. A chunk is 2 KiB, a small allocation of the
-/// kernel heap. An allocation of more than 2 KiB maps pages of the heap, and its free sends a TLB
-/// shootdown to each CPU. With one allocation of 8 KiB for each node, `fork` and `exit` made and
-/// freed about 20 such allocations, and the shootdowns were most of their time.
-struct Slots<S>([Vec<Slot<S>>; FANOUT / CHUNK]);
-
-const _: () = assert!(CHUNK * size_of::<Slot<Arc<()>>>() <= 2048);
-
-impl<S> Slots<S> {
-    /// Gives the slots in order.
-    fn iter(&self) -> impl Iterator<Item = &Slot<S>> {
-        self.0.iter().flatten()
-    }
-
-    /// Gives the slots in order, to change them.
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Slot<S>> {
-        self.0.iter_mut().flatten()
-    }
-
-    /// Gives the slots from `first` to `last`, both included.
-    fn range(&self, first: usize, last: usize) -> impl Iterator<Item = &Slot<S>> {
-        self.iter().skip(first).take(last + 1 - first)
-    }
-}
-
-impl<S> Index<usize> for Slots<S> {
-    type Output = Slot<S>;
-    fn index(&self, i: usize) -> &Slot<S> {
-        &self.0[i / CHUNK][i % CHUNK]
-    }
-}
-
-impl<S> IndexMut<usize> for Slots<S> {
-    fn index_mut(&mut self, i: usize) -> &mut Slot<S> {
-        &mut self.0[i / CHUNK][i % CHUNK]
-    }
-}
-
-/// One node of the tree.
-struct Node<S> {
+/// One node of the tree: the page table page of `level` at `base` in the [`Table`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Node {
     level: u32,
     /// The first address of the node.
     base: usize,
-    /// The lock of the node. Only the holder changes `slots`. A node of the lowest level uses the
-    /// lock of its block in [`Leaves`], so two nodes of one block, a dead one and a live one, have
-    /// one lock.
-    busy: AtomicBool,
-    /// The node is not in the tree now. Only the holder sets it.
-    dead: AtomicBool,
-    /// The slots. A walk reads them with no `busy`, so the spin lock gives safe access. It is held
-    /// only for a short time.
-    slots: SpinLock<Slots<S>>,
 }
 
-impl<S: Clone> Node<S> {
-    /// Makes a node with each slot a copy of `fill`. The caller holds the new node. A node of the
-    /// lowest level has no slots, and its pages get the status of `fill` in `leaves`. Its lock is
-    /// the lock of its block, which this takes, or which the caller holds already with `locked`.
-    fn new_held(
-        level: u32,
-        base: usize,
-        fill: &Slot<S>,
-        leaves: &impl Leaves<S>,
-        locked: bool,
-    ) -> Self {
-        let slots = if level == 1 {
-            if !locked {
-                leaves.lock(base);
-            }
-            if let Some(s) = fill.status() {
-                leaves.set(base, base + slot_size(2), Some(s), None, &mut |_, _, _| {});
-            }
-            Slots(core::array::from_fn(|_| Vec::new()))
-        } else {
-            Slots(core::array::from_fn(|_| (0..CHUNK).map(|_| fill.leaf_copy()).collect()))
-        };
-        Self {
-            level,
-            base,
-            busy: AtomicBool::new(true),
-            dead: AtomicBool::new(false),
-            slots: SpinLock::new(slots),
-        }
-    }
-}
+/// The root of the tree. It is always live.
+const ROOT: Node = Node { level: LEVELS, base: 0 };
 
-impl<S> Node<S> {
-    fn acquire(&self, leaves: &impl Leaves<S>) {
-        if self.level == 1 {
-            return leaves.lock(self.base);
-        }
-        while self
-            .busy
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            // The holder can wait for a TLB request of this CPU, for example in `fork`.
-            while self.busy.load(Ordering::Relaxed) {
-                rk_frame::sync::wait_hint();
-            }
-        }
+impl Node {
+    /// The end of the node.
+    fn end(self) -> usize {
+        self.base + slot_size(self.level) * FANOUT
     }
 
-    fn try_acquire(&self, leaves: &impl Leaves<S>) -> bool {
-        if self.level == 1 {
-            return leaves.try_lock(self.base);
-        }
-        self.busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    /// The index of the slot of `addr`. `addr` is in the node.
+    fn index(self, addr: usize) -> usize {
+        (addr - self.base) / slot_size(self.level)
     }
 
-    fn release(&self, leaves: &impl Leaves<S>) {
-        if self.level == 1 {
-            return leaves.unlock(self.base);
-        }
-        self.busy.store(false, Ordering::Release);
+    /// The node below the slot `i`. The node is above the lowest level.
+    fn child(self, i: usize) -> Node {
+        Node { level: self.level - 1, base: self.base + i * slot_size(self.level) }
     }
 
-    /// Locks the node, and gives `false` with no lock if the node is dead.
-    fn acquire_live(&self, leaves: &impl Leaves<S>) -> bool {
-        self.acquire(leaves);
-        if self.dead.load(Ordering::Relaxed) {
-            self.release(leaves);
+    /// What the slot `i` holds. The caller holds the node. The node is above the lowest level.
+    fn slot<S>(self, table: &impl Table<S>, i: usize) -> Slot<S> {
+        let c = self.child(i);
+        if table.live(c.level, c.base) {
+            return Slot::Child(c);
+        }
+        table.slot(self.level, c.base).map_or(Slot::Empty, Slot::Status)
+    }
+
+    fn acquire<S>(self, table: &impl Table<S>) {
+        table.lock(self.level, self.base);
+    }
+
+    fn try_acquire<S>(self, table: &impl Table<S>) -> bool {
+        table.try_lock(self.level, self.base)
+    }
+
+    fn release<S>(self, table: &impl Table<S>) {
+        table.unlock(self.level, self.base);
+    }
+
+    /// Locks the node, and gives `false` with no lock if the node is not live.
+    fn acquire_live<S>(self, table: &impl Table<S>) -> bool {
+        self.acquire(table);
+        if !table.live(self.level, self.base) {
+            self.release(table);
             return false;
         }
         true
     }
 
-    /// Marks the node and each node below it dead, and removes the statuses of the nodes of the
-    /// lowest level from `leaves`. The caller holds the nodes.
-    fn kill<L: Leaves<S>>(&self, leaves: &L) {
-        self.kill_with(leaves, None, &mut |_, _, _| {});
+    /// Puts the node in the tree, with each slot set to `fill`. The caller holds the parent. The
+    /// node is not live, so it has no status and no live child. This takes the lock of the node,
+    /// or the caller holds it already with `locked`. The caller then holds the node.
+    fn make_held<S>(self, fill: Option<&S>, table: &impl Table<S>, locked: bool) {
+        if !locked {
+            self.acquire(table);
+        }
+        if fill.is_some() {
+            if self.level == 1 {
+                table.set(self.base, self.end(), fill, None, &mut |_, _, _| {});
+            } else {
+                table.set_slots(self.level, self.base, self.end(), fill);
+            }
+        }
+        table.set_live(self.level, self.base, true);
     }
 
-    /// Kills the node as `kill`, makes the change `op` to the pages of the node in the same pass,
-    /// and gives the old statuses of the node to `old`, in address order.
-    fn kill_with<L: Leaves<S>>(
-        &self,
-        leaves: &L,
+    /// Takes the node and each node below it out of the tree, and removes their statuses. The
+    /// caller holds the nodes.
+    fn kill<S, L: Table<S>>(self, table: &L) {
+        self.kill_with(table, None, &mut |_, _, _| {});
+    }
+
+    /// Takes the node out of the tree as `kill`, makes the change `op` to the pages of the node
+    /// in the same pass, and gives the old statuses of the node to `old`, in address order.
+    fn kill_with<S, L: Table<S>>(
+        self,
+        table: &L,
         mut op: Option<&mut L::Op>,
         old: &mut dyn FnMut(usize, usize, &S),
     ) {
-        self.dead.store(true, Ordering::Relaxed);
+        table.set_live(self.level, self.base, false);
         if self.level == 1 {
-            leaves.set(self.base, self.end(), None, op, old);
+            table.set(self.base, self.end(), None, op, old);
             return;
         }
         let size = slot_size(self.level);
-        for (i, slot) in self.slots.lock().iter().enumerate() {
+        for i in 0..FANOUT {
             let lo = self.base + i * size;
-            match slot {
-                Slot::Child(c) => c.kill_with(leaves, op.as_deref_mut(), old),
+            match self.slot(table, i) {
+                Slot::Child(c) => c.kill_with(table, op.as_deref_mut(), old),
                 Slot::Status(s) => {
-                    old(lo, lo + size, s);
+                    old(lo, lo + size, &s);
                     if let Some(op) = op.as_deref_mut() {
-                        leaves.change(lo, lo + size, op);
+                        table.change(lo, lo + size, op);
                     }
                 }
                 // A page with no status has no frame.
                 Slot::Empty => {}
             }
         }
+        table.set_slots(self.level, self.base, self.end(), None);
     }
 
     /// Tells if no slot of the node has a status or a child.
-    fn is_empty(&self, leaves: &impl Leaves<S>) -> bool {
-        if self.level == 1 {
-            return leaves.is_empty(self.base);
-        }
-        self.slots.lock().iter().all(|s| matches!(s, Slot::Empty))
-    }
-
-    /// The end of the node.
-    fn end(&self) -> usize {
-        self.base + slot_size(self.level) * FANOUT
-    }
-
-    /// The index of the slot of `addr`. `addr` is in the node.
-    fn index(&self, addr: usize) -> usize {
-        (addr - self.base) / slot_size(self.level)
+    fn is_empty<S>(self, table: &impl Table<S>) -> bool {
+        table.is_empty(self.level, self.base)
     }
 }
 
 /// The tree of one address space.
 pub struct Tree<S, L> {
-    root: Arc<Node<S>>,
-    leaves: L,
+    table: L,
+    _status: PhantomData<fn() -> S>,
 }
 
-impl<S: Clone, L: Leaves<S>> Tree<S, L> {
-    /// Makes a tree with no status. The statuses of the nodes of the lowest level go in `leaves`,
-    /// which has no status.
-    pub fn new(leaves: L) -> Self {
-        let root = Node::new_held(LEVELS, 0, &Slot::Empty, &leaves, false);
-        root.release(&leaves);
-        Self { root: Arc::new(root), leaves }
+impl<S: Clone, L: Table<S>> Tree<S, L> {
+    /// Makes the tree of the page table pages of `table`. Each node that is live in `table` is in
+    /// the tree, as the copy of `fork` makes them. The root is always in the tree.
+    pub fn new(table: L) -> Self {
+        ROOT.acquire(&table);
+        table.set_live(LEVELS, 0, true);
+        ROOT.release(&table);
+        Self { table, _status: PhantomData }
     }
 
-    /// The statuses of the nodes of the lowest level.
-    pub fn leaves(&self) -> &L {
-        &self.leaves
+    /// The page table pages of the tree.
+    pub fn table(&self) -> &L {
+        &self.table
     }
 
     /// Locks the page aligned range `start..end`. The walk goes down to the lowest node that
@@ -362,90 +329,67 @@ impl<S: Clone, L: Leaves<S>> Tree<S, L> {
     pub fn lock(&self, start: usize, end: usize) -> RangeLock<'_, S, L> {
         // A range in one 2 MiB block starts at the block, as a change of CortenMM locks the last
         // level page table that it finds with the walk of the page table, and does not walk the
-        // tree. A block with a status in the leaves has a live node of the lowest level, and the
-        // lock of the block is the lock of that node. A block with no status there needs the walk.
+        // tree. A block with a live node needs no walk. A block with no live node needs it.
         let base = start & !(slot_size(2) - 1);
-        if start < end && end <= base + slot_size(2) && self.leaves.lock_used(base) {
-            if !self.leaves.is_empty(base) {
-                let root = Some(self.root.clone());
-                let leaves = &self.leaves;
-                return RangeLock {
-                    start,
-                    end,
-                    held: Vec::new(),
-                    block: Some(base),
-                    root,
-                    prune: false,
-                    leaves,
-                };
-            }
-            self.leaves.unlock(base);
+        if start < end && end <= base + slot_size(2) && self.table.lock_used(base) {
+            let table = &self.table;
+            return RangeLock {
+                start,
+                end,
+                held: Vec::new(),
+                block: Some(base),
+                can_prune: true,
+                prune: false,
+                table,
+                _status: PhantomData,
+            };
         }
-        lock_from(&self.root, &self.leaves, start, end, 1)
-    }
-
-    /// Makes a copy of the tree that `all` locks, as `fork` copies the page table. `map` gives
-    /// the status of the copy for each status of the tree, or `None` for a page that the copy does
-    /// not have. A node of the copy with no status does not stay.
-    ///
-    /// The statuses of the nodes of the lowest level are not copied here. The caller copies them
-    /// to `leaves` first, as `VmSpace::fork_with` copies them with the page table, and the copy
-    /// has a node of the lowest level for each block of `leaves` with a status.
-    ///
-    /// # Panics
-    ///
-    /// If `all` does not lock the whole tree.
-    pub fn fork(
-        all: &RangeLock<'_, S, L>,
-        mut map: impl FnMut(&S) -> Option<S>,
-        leaves: L,
-    ) -> Self {
-        assert!(all.held[0].level == LEVELS && all.span() == (0, TREE_END), "a fork of a part");
-        let root = copy_node(&all.held[0], &mut map, &leaves);
-        root.release(&leaves);
-        Self { root: Arc::new(root), leaves }
+        lock_from(&self.table, start, end, 1)
     }
 
     /// The number of nodes in the tree, for the tests.
     #[cfg(test)]
     fn nodes(&self) -> usize {
-        fn count<S>(node: &Node<S>) -> usize {
-            let slots = node.slots.lock();
-            1 + slots
-                .iter()
-                .map(|s| if let Slot::Child(c) = s { count(c) } else { 0 })
+        fn count<S>(table: &impl Table<S>, node: Node) -> usize {
+            if node.level == 1 {
+                return 1;
+            }
+            let children = (0..FANOUT).map(|i| node.child(i));
+            1 + children
+                .filter(|c| table.live(c.level, c.base))
+                .map(|c| count(table, c))
                 .sum::<usize>()
         }
-        count(&self.root)
+        count(&self.table, ROOT)
     }
 
     /// Locks the whole tree if no other operation holds a node. Gives `None` if one does.
     pub fn try_lock_all(&self) -> Option<RangeLock<'_, S, L>> {
-        let leaves = &self.leaves;
-        if !self.root.try_acquire(leaves) {
+        let table = &self.table;
+        if !ROOT.try_acquire(table) {
             return None;
         }
         let mut held = Vec::new();
-        held.push(self.root.clone());
-        let ok = lock_below(&self.root, leaves, 0, TREE_END, &mut held, true);
+        held.push(ROOT);
+        let ok = lock_below(ROOT, table, 0, TREE_END, &mut held, true);
         let lock = RangeLock {
             start: 0,
             end: TREE_END,
             held,
             block: None,
-            root: None,
+            can_prune: false,
             prune: false,
-            leaves,
+            table,
+            _status: PhantomData,
         };
         ok.then_some(lock)
     }
 }
 
-/// Locks the page aligned range `start..end` of the tree of `root`, as [`Tree::lock`]. The walk
-/// stops at a node of `top` or a higher level, so the lock holds a node of that level at least.
-fn lock_from<'a, S: Clone, L: Leaves<S>>(
-    root: &Arc<Node<S>>,
-    leaves: &'a L,
+/// Locks the page aligned range `start..end` of the tree, as [`Tree::lock`]. The walk stops at a
+/// node of `top` or a higher level, so the lock holds a node of that level at least.
+fn lock_from<'a, S: Clone, L: Table<S>>(
+    table: &'a L,
     start: usize,
     end: usize,
     top: u32,
@@ -454,20 +398,17 @@ fn lock_from<'a, S: Clone, L: Leaves<S>>(
     // The walk made a node, which can stay empty.
     let mut made = false;
     let node = 'walk: loop {
-        let mut node = root.clone();
+        let mut node = ROOT;
         let mut held = false;
         while node.level > top {
             let i = node.index(start);
             if i != node.index(end - 1) {
                 break;
             }
-            let child = match &node.slots.lock()[i] {
-                Slot::Child(c) => Some(c.clone()),
-                _ => None,
-            };
-            if let Some(c) = child {
+            let c = node.child(i);
+            if table.live(c.level, c.base) {
                 if held {
-                    node.release(leaves);
+                    node.release(table);
                     held = false;
                 }
                 node = c;
@@ -475,60 +416,57 @@ fn lock_from<'a, S: Clone, L: Leaves<S>>(
             }
             // The child is missing. Only the holder of the node makes it.
             if !held {
-                if !node.acquire_live(leaves) {
+                if !node.acquire_live(table) {
                     continue 'walk;
                 }
                 held = true;
                 continue;
             }
-            let next = {
-                let mut slots = node.slots.lock();
-                let base = node.base + i * slot_size(node.level);
-                let c = Arc::new(Node::new_held(node.level - 1, base, &slots[i], leaves, false));
-                slots[i] = Slot::Child(c.clone());
-                c
-            };
+            // The child starts with the status of the slot.
+            let fill = table.slot(node.level, c.base);
+            c.make_held(fill.as_ref(), table, false);
+            table.set_slots(node.level, c.base, c.end(), None);
             made = true;
-            node.release(leaves);
-            node = next;
+            node.release(table);
+            node = c;
         }
-        if held || node.acquire_live(leaves) {
+        if held || node.acquire_live(table) {
             break node;
         }
     };
     let mut held = Vec::new();
-    held.push(node.clone());
-    lock_below(&node, leaves, start, end, &mut held, false);
-    RangeLock { start, end, held, block: None, root: Some(root.clone()), prune: made, leaves }
+    held.push(node);
+    lock_below(node, table, start, end, &mut held, false);
+    RangeLock {
+        start,
+        end,
+        held,
+        block: None,
+        can_prune: true,
+        prune: made,
+        table,
+        _status: PhantomData,
+    }
 }
 
 /// Removes the empty node of `level` at `base` from the tree, and then each node above it that
 /// becomes empty, as `free_pgtables` of Linux frees the page table pages of a range with no
 /// mapping. The caller holds no node.
-fn prune_up<S: Clone, L: Leaves<S>>(
-    root: &Arc<Node<S>>,
-    leaves: &L,
-    mut base: usize,
-    mut level: u32,
-) {
+fn prune_up<S: Clone, L: Table<S>>(table: &L, mut base: usize, mut level: u32) {
     while level < LEVELS {
         let end = base + slot_size(level) * FANOUT;
-        // The lock holds the parent of the node, and the node if it is there.
-        let mut lock = lock_from(root, leaves, base, end, level + 1);
+        // The lock holds the parent of the node, and the node if it is live.
+        let mut lock = lock_from(table, base, end, level + 1);
         lock.prune = false;
-        let parent = lock.held[0].clone();
-        let empty = {
-            let mut slots = parent.slots.lock();
-            let i = parent.index(base);
-            if let Slot::Child(c) = &slots[i] {
-                if !c.is_empty(leaves) {
-                    return;
-                }
-                c.kill(leaves);
-                slots[i] = Slot::Empty;
+        let parent = lock.held[0];
+        let node = Node { level, base };
+        if table.live(level, base) {
+            if !node.is_empty(table) {
+                return;
             }
-            slots.iter().all(|s| matches!(s, Slot::Empty))
-        };
+            node.kill(table);
+        }
+        let empty = parent.is_empty(table);
         drop(lock);
         if !empty {
             return;
@@ -538,45 +476,15 @@ fn prune_up<S: Clone, L: Leaves<S>>(
     }
 }
 
-/// Makes a copy of `node` and of each node below it, with each status that `map` gives. The copy
-/// is held. A child of the copy with no status is not there. A node of the lowest level gets its
-/// statuses from `leaves`, which has them already.
-fn copy_node<S: Clone>(
-    node: &Node<S>,
-    map: &mut impl FnMut(&S) -> Option<S>,
-    leaves: &impl Leaves<S>,
-) -> Node<S> {
-    let copy = Node::new_held(node.level, node.base, &Slot::Empty, leaves, false);
-    if node.level == 1 {
-        return copy;
-    }
-    {
-        let from = node.slots.lock();
-        let mut to = copy.slots.lock();
-        for (dst, src) in to.iter_mut().zip(from.iter()) {
-            *dst = match src {
-                Slot::Empty => Slot::Empty,
-                Slot::Status(s) => map(s).map_or(Slot::Empty, Slot::Status),
-                Slot::Child(c) => {
-                    let child = copy_node(c, map, leaves);
-                    child.release(leaves);
-                    if child.is_empty(leaves) { Slot::Empty } else { Slot::Child(Arc::new(child)) }
-                }
-            };
-        }
-    }
-    copy
-}
-
-/// Locks each node below `node` that has an address in `start..end`, in the order of the
+/// Locks each live node below `node` that has an address in `start..end`, in the order of the
 /// addresses, and adds it to `held`. With `try_only`, it does not wait, and gives `false` if a
 /// node is busy.
 fn lock_below<S>(
-    node: &Arc<Node<S>>,
-    leaves: &impl Leaves<S>,
+    node: Node,
+    table: &impl Table<S>,
     start: usize,
     end: usize,
-    held: &mut Vec<Arc<Node<S>>>,
+    held: &mut Vec<Node>,
     try_only: bool,
 ) -> bool {
     if node.level == 1 {
@@ -584,25 +492,24 @@ fn lock_below<S>(
     }
     let first = node.index(start.max(node.base));
     let last = node.index(end.min(node.end()) - 1);
-    let children: Vec<Arc<Node<S>>> = node
-        .slots
-        .lock()
-        .range(first, last)
-        .filter_map(|s| match s {
-            Slot::Child(c) => Some(c.clone()),
-            _ => None,
-        })
-        .collect();
-    for child in children {
+    // The caller holds `node`, so no other call makes or removes its children.
+    let mut live = [0u64; FANOUT / 64];
+    table.entries(node.level, node.base, first, last, |i, s| {
+        if s.is_none() {
+            live[i / 64] |= 1 << (i % 64);
+        }
+    });
+    let is_live = |i: &usize| live[i / 64] & (1 << (i % 64)) != 0;
+    for child in (first..=last).filter(is_live).map(|i| node.child(i)) {
         if try_only {
-            if !child.try_acquire(leaves) {
+            if !child.try_acquire(table) {
                 return false;
             }
         } else {
-            child.acquire(leaves);
+            child.acquire(table);
         }
-        held.push(child.clone());
-        if !lock_below(&child, leaves, start, end, held, try_only) {
+        held.push(child);
+        if !lock_below(child, table, start, end, held, try_only) {
             return false;
         }
     }
@@ -611,55 +518,57 @@ fn lock_below<S>(
 
 /// A locked range of the tree. The guard reads and changes the statuses of the pages in the
 /// range. It unlocks the nodes when it is dropped.
-pub struct RangeLock<'a, S: Clone, L: Leaves<S>> {
+pub struct RangeLock<'a, S: Clone, L: Table<S>> {
     start: usize,
     end: usize,
     /// The locked nodes. The first is the top node. It is empty for a lock of one block.
-    held: Vec<Arc<Node<S>>>,
-    /// The 2 MiB block of a lock that holds only the lock of the block in `leaves`, which is the
-    /// lock of its node of the lowest level. Such a lock does not walk the tree.
+    held: Vec<Node>,
+    /// The 2 MiB block of a lock that holds only the node of the lowest level of the block. Such
+    /// a lock does not walk the tree.
     block: Option<usize>,
-    /// The root of the tree, to remove the top node after the unlock if it is empty. It is
-    /// `None` for a lock that does not remove nodes.
-    root: Option<Arc<Node<S>>>,
+    /// The lock can remove empty nodes after the unlock. A lock of the whole tree does not.
+    can_prune: bool,
     /// The walk made a node, or a `set` made pages empty, so the top node can be empty.
     prune: bool,
-    /// The statuses of the nodes of the lowest level.
-    leaves: &'a L,
+    /// The page table pages.
+    table: &'a L,
+    _status: PhantomData<fn() -> S>,
 }
 
-impl<S: Clone, L: Leaves<S>> Drop for RangeLock<'_, S, L> {
+impl<S: Clone, L: Table<S>> Drop for RangeLock<'_, S, L> {
     fn drop(&mut self) {
         for node in self.held.iter().rev() {
-            node.release(self.leaves);
+            node.release(self.table);
         }
         if let Some(base) = self.block {
-            self.leaves.unlock(base);
+            self.table.unlock(1, base);
         }
         // `set` removes each empty node below the top node. The top node needs the lock of its
         // parent, so it goes after the unlock.
-        let Some(root) = self.root.as_ref().filter(|_| self.prune) else { return };
+        if !self.can_prune || !self.prune {
+            return;
+        }
         let (base, level, empty) = match self.block {
-            Some(base) => (base, 1, self.leaves.is_empty(base)),
+            Some(base) => (base, 1, self.table.is_empty(1, base)),
             None => {
-                let top = &self.held[0];
-                (top.base, top.level, top.level < LEVELS && top.is_empty(self.leaves))
+                let top = self.held[0];
+                (top.base, top.level, top.level < LEVELS && top.is_empty(self.table))
             }
         };
         if empty {
-            prune_up(root, self.leaves, base, level);
+            prune_up(self.table, base, level);
         }
     }
 }
 
-impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
+impl<S: Clone, L: Table<S>> RangeLock<'_, S, L> {
     /// The range that the guard can read and change. It is the locked range, or all of the top
     /// node if it is a node of the lowest level, because such a node has no node below it.
     pub fn span(&self) -> (usize, usize) {
         if let Some(base) = self.block {
             return (base, base + slot_size(2));
         }
-        let top = &self.held[0];
+        let top = self.held[0];
         if top.level == 1 { (top.base, top.end()) } else { (self.start, self.end) }
     }
 
@@ -676,19 +585,18 @@ impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
     pub fn get(&self, addr: usize) -> Option<S> {
         self.check(addr, addr + 1);
         if self.block.is_some() {
-            return self.leaves.get(addr);
+            return self.table.get(addr);
         }
-        let mut node = self.held[0].clone();
+        let mut node = self.held[0];
         loop {
             if node.level == 1 {
-                return self.leaves.get(addr);
+                return self.table.get(addr);
             }
-            let next = match &node.slots.lock()[node.index(addr)] {
+            match node.slot(self.table, node.index(addr)) {
                 Slot::Empty => return None,
-                Slot::Status(s) => return Some(s.clone()),
-                Slot::Child(c) => c.clone(),
-            };
-            node = next;
+                Slot::Status(s) => return Some(s),
+                Slot::Child(c) => node = c,
+            }
         }
     }
 
@@ -722,18 +630,14 @@ impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
         self.check(start, end);
         let page = 1 << PAGE_SHIFT;
         assert!(start.is_multiple_of(page) && end.is_multiple_of(page), "the range is not aligned");
-        let fill = match status {
-            Some(s) => Slot::Status(s),
-            None => {
-                self.prune = true;
-                Slot::Empty
-            }
-        };
-        if self.block.is_some() {
-            return self.leaves.set(start, end, fill.status(), op, &mut old);
+        if status.is_none() {
+            self.prune = true;
         }
-        let top = self.held[0].clone();
-        set_in(&top, start, end, &fill, &mut self.held, self.leaves, op, &mut old);
+        if self.block.is_some() {
+            return self.table.set(start, end, status.as_ref(), op, &mut old);
+        }
+        let top = self.held[0];
+        set_in(top, start, end, status.as_ref(), &mut self.held, self.table, op, &mut old);
     }
 
     /// Gives the runs of pages with a status in `start..end`, in address order. A run is the
@@ -762,8 +666,8 @@ impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
             out.push((a, b, s.clone()));
         };
         match self.block {
-            Some(_) => self.leaves.runs(start, end, f),
-            None => collect(&self.held[0], self.leaves, start, end, &same, &mut f),
+            Some(_) => self.table.runs(start, end, f),
+            None => collect(self.held[0], self.table, start, end, &same, &mut f),
         }
         out
     }
@@ -777,16 +681,16 @@ impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
     pub fn run_at(&self, addr: usize, same: impl Fn(&S, &S) -> bool) -> Option<(usize, usize, S)> {
         self.check(addr, addr + 1);
         if self.block.is_some() {
-            return self.leaves.run_at(addr, same);
+            return self.table.run_at(addr, same);
         }
-        let top = &self.held[0];
+        let top = self.held[0];
         if top.level != 1 {
             let (lo, hi) = self.span();
             return self.runs(lo, hi, same).into_iter().find(|r| r.0 <= addr && addr < r.1);
         }
         // The statuses of a node of the lowest level are in the last level page table of its
         // block, so the run is a range of entries of that table.
-        self.leaves.run_at(addr, same)
+        self.table.run_at(addr, same)
     }
 
     /// Tells if a page in `start..end` has a status.
@@ -796,8 +700,8 @@ impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
         let all = &|_: &S, _: &S| true;
         let mut f = |_, _, _: &S| found = true;
         match self.block {
-            Some(_) => self.leaves.runs(start, end, f),
-            None => collect(&self.held[0], self.leaves, start, end, all, &mut f),
+            Some(_) => self.table.runs(start, end, f),
+            None => collect(self.held[0], self.table, start, end, all, &mut f),
         }
         found
     }
@@ -805,68 +709,65 @@ impl<S: Clone, L: Leaves<S>> RangeLock<'_, S, L> {
 
 /// Sets each slot of `node` in `start..end` to `fill`. A slot that the range covers in part gets
 /// a child, which starts with the old value of the slot. The new child goes in `held`, so that
-/// no walk takes it. The nodes below a covered slot leave the tree, and they are dead. The pages
-/// of a node of the lowest level get the status of `fill` in `leaves`. The pages of the range get
-/// the change `op` in the same pass, and `old` gets the old statuses in address order.
+/// no walk takes it. The nodes below a covered slot leave the tree. The pages of a node of the
+/// lowest level get the status of `fill`. The pages of the range get the change `op` in the same
+/// pass, and `old` gets the old statuses in address order.
 #[allow(clippy::too_many_arguments)]
-fn set_in<S: Clone, L: Leaves<S>>(
-    node: &Arc<Node<S>>,
+fn set_in<S: Clone, L: Table<S>>(
+    node: Node,
     start: usize,
     end: usize,
-    fill: &Slot<S>,
-    held: &mut Vec<Arc<Node<S>>>,
-    leaves: &L,
+    fill: Option<&S>,
+    held: &mut Vec<Node>,
+    table: &L,
     mut op: Option<&mut L::Op>,
     old: &mut dyn FnMut(usize, usize, &S),
 ) {
     if node.level == 1 {
-        leaves.set(start.max(node.base), end.min(node.end()), fill.status(), op, old);
+        table.set(start.max(node.base), end.min(node.end()), fill, op, old);
         return;
     }
     let size = slot_size(node.level);
     let first = node.index(start.max(node.base));
     let last = node.index(end.min(node.end()) - 1);
-    let mut slots = node.slots.lock();
     for i in first..=last {
         let lo = node.base + i * size;
         if start <= lo && lo + size <= end {
-            match core::mem::replace(&mut slots[i], fill.leaf_copy()) {
-                Slot::Child(c) => c.kill_with(leaves, op.as_deref_mut(), old),
+            match node.slot(table, i) {
+                Slot::Child(c) => c.kill_with(table, op.as_deref_mut(), old),
                 Slot::Status(s) => {
                     old(lo, lo + size, &s);
                     if let Some(op) = op.as_deref_mut() {
-                        leaves.change(lo, lo + size, op);
+                        table.change(lo, lo + size, op);
                     }
                 }
                 // A page with no status has no frame.
                 Slot::Empty => {}
             }
+            table.set_slots(node.level, lo, lo + size, fill);
             continue;
         }
-        let child = match &slots[i] {
-            Slot::Child(c) => c.clone(),
+        let child = match node.slot(table, i) {
+            Slot::Child(c) => c,
             // An empty slot stays empty, with no child.
-            Slot::Empty if matches!(fill, Slot::Empty) => continue,
+            Slot::Empty if fill.is_none() => continue,
             prev => {
-                // A node of the lowest level that this lock removed before holds the lock of the
-                // block, so the new node takes its place in `held` and its lock.
-                let dead = (node.level == 2)
-                    .then(|| held.iter().position(|n| n.level == 1 && n.base == lo))
-                    .flatten();
-                let c = Arc::new(Node::new_held(node.level - 1, lo, prev, leaves, dead.is_some()));
-                slots[i] = Slot::Child(c.clone());
-                match dead {
-                    Some(k) => held[k] = c.clone(),
-                    None => held.push(c.clone()),
+                // A node that this lock took out of the tree before is still held, so it goes
+                // back with that lock.
+                let c = node.child(i);
+                let locked = held.contains(&c);
+                c.make_held(prev.status(), table, locked);
+                table.set_slots(node.level, lo, lo + size, None);
+                if !locked {
+                    held.push(c);
                 }
                 c
             }
         };
-        set_in(&child, start, end, fill, held, leaves, op.as_deref_mut(), old);
+        set_in(child, start, end, fill, held, table, op.as_deref_mut(), old);
         // A child with no status leaves the tree. The caller holds it, so no walk uses it.
-        if matches!(fill, Slot::Empty) && child.is_empty(leaves) {
-            child.kill(leaves);
-            slots[i] = Slot::Empty;
+        if fill.is_none() && child.is_empty(table) {
+            child.kill(table);
         }
     }
 }
@@ -875,61 +776,53 @@ fn set_in<S: Clone, L: Leaves<S>>(
 /// Slots next to each other with statuses that `same` joins go to `f` as one range, because a
 /// node of the lowest level often has the same status in each slot.
 fn collect<S: Clone>(
-    node: &Arc<Node<S>>,
-    leaves: &impl Leaves<S>,
+    node: Node,
+    table: &impl Table<S>,
     start: usize,
     end: usize,
     same: &impl Fn(&S, &S) -> bool,
     f: &mut impl FnMut(usize, usize, &S),
 ) {
     if node.level == 1 {
-        leaves.runs(start.max(node.base), end.min(node.end()), f);
+        table.runs(start.max(node.base), end.min(node.end()), f);
         return;
     }
     let size = slot_size(node.level);
     let first = node.index(start.max(node.base));
     let last = node.index(end.min(node.end()) - 1);
-    // The children go after the lock of the slots, because `f` can take time. The slots go in
-    // batches of `BATCH`, so that the list is a small allocation of the kernel heap (see
-    // `Slots`).
+    // The slots go in batches of `BATCH`, so that the list is a small allocation of the kernel
+    // heap.
     const BATCH: usize = 64;
     let mut items: Vec<(usize, usize, Slot<S>)> = Vec::with_capacity(BATCH);
     let mut next = first;
     while next <= last {
         let to = (next + BATCH - 1).min(last);
-        {
-            let slots = node.slots.lock();
-            for (i, slot) in slots.range(next, to).enumerate() {
-                let lo = node.base + (next + i) * size;
-                match slot {
-                    Slot::Empty => {}
-                    Slot::Status(s) => match items.last_mut() {
-                        Some((_, hi, Slot::Status(t))) if *hi == lo && same(t, s) => {
-                            *hi = lo + size
-                        }
-                        _ => items.push((lo, lo + size, Slot::Status(s.clone()))),
-                    },
-                    Slot::Child(c) => items.push((lo, lo + size, Slot::Child(c.clone()))),
-                }
+        table.entries(node.level, node.base, next, to, |i, s| {
+            let lo = node.base + i * size;
+            match s {
+                None => items.push((lo, lo + size, Slot::Child(node.child(i)))),
+                Some(s) => match items.last_mut() {
+                    Some((_, hi, Slot::Status(t))) if *hi == lo && same(t, s) => *hi = lo + size,
+                    _ => items.push((lo, lo + size, Slot::Status(s.clone()))),
+                },
             }
-        }
+        });
         next = to + 1;
         for (lo, hi, item) in items.drain(..) {
             match item {
                 Slot::Status(s) => f(lo.max(start), hi.min(end), &s),
-                // A child of the lowest level goes to the leaves here and not in a call of
+                // A child of the lowest level goes to the table here and not in a call of
                 // `collect`, because the frame of `collect` is large in the debug kernel and
                 // `mmap` is deep in the stack.
                 Slot::Child(c) if c.level == 1 => {
-                    leaves.runs(start.max(c.base), end.min(c.end()), &mut *f)
+                    table.runs(start.max(c.base), end.min(c.end()), &mut *f)
                 }
-                Slot::Child(c) => collect(&c, leaves, start, end, same, f),
+                Slot::Child(c) => collect(c, table, start, end, same, f),
                 Slot::Empty => {}
             }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -937,52 +830,127 @@ mod tests {
     use super::*;
     use alloc::collections::{BTreeMap, BTreeSet};
     use alloc::vec;
+    use rk_frame::sync::SpinLock;
 
     const P: usize = 4096;
     const M2: usize = 2 << 20;
     const G1: usize = 1 << 30;
 
-    /// The statuses of the pages of the nodes of the lowest level, one for each page, as the
-    /// status tables of the last level page tables keep them, and the blocks that are locked.
-    /// The third set is the pages with a frame, which the change of the tests removes, as
-    /// `munmap` does.
-    struct Pages(
-        SpinLock<BTreeMap<usize, u32>>,
-        SpinLock<alloc::collections::BTreeSet<usize>>,
-        SpinLock<alloc::collections::BTreeSet<usize>>,
-    );
+    /// The page table pages of the tests. `pages` has the status of each page of the nodes of the
+    /// lowest level, and `slots` the status of each slot of the nodes above, by level and address.
+    /// `held` has the locked nodes and `live` the live nodes. `frames` is the pages with a frame,
+    /// which the change of the tests removes, as `munmap` does.
+    struct Pages {
+        pages: SpinLock<BTreeMap<usize, u32>>,
+        slots: SpinLock<BTreeMap<(u32, usize), u32>>,
+        held: SpinLock<BTreeSet<(u32, usize)>>,
+        live: SpinLock<BTreeSet<(u32, usize)>>,
+        frames: SpinLock<BTreeSet<usize>>,
+    }
 
     impl Pages {
         fn new() -> Self {
-            Self(
-                SpinLock::new(BTreeMap::new()),
-                SpinLock::new(BTreeSet::new()),
-                SpinLock::new(BTreeSet::new()),
-            )
+            Self {
+                pages: SpinLock::new(BTreeMap::new()),
+                slots: SpinLock::new(BTreeMap::new()),
+                held: SpinLock::new(BTreeSet::new()),
+                live: SpinLock::new(BTreeSet::new()),
+                frames: SpinLock::new(BTreeSet::new()),
+            }
         }
 
-        /// The number of pages with a status.
+        /// The number of pages with a status in the nodes of the lowest level.
         fn len(&self) -> usize {
-            self.0.lock().len()
+            self.pages.lock().len()
         }
 
-        /// A copy with the status that `map` gives for each status, as `VmSpace::fork_with`.
+        /// A copy with the status that `map` gives for each status, as `VmSpace::fork_with`. A
+        /// node of the copy with no status and no live child is not live.
         fn fork(&self, map: impl Fn(u32) -> Option<u32>) -> Self {
-            let pages = self.0.lock().iter().filter_map(|(&a, &s)| Some((a, map(s)?))).collect();
-            Self(
-                SpinLock::new(pages),
-                SpinLock::new(BTreeSet::new()),
-                SpinLock::new(BTreeSet::new()),
-            )
+            let copy = Self::new();
+            *copy.pages.lock() =
+                self.pages.lock().iter().filter_map(|(&a, &s)| Some((a, map(s)?))).collect();
+            *copy.slots.lock() =
+                self.slots.lock().iter().filter_map(|(&a, &s)| Some((a, map(s)?))).collect();
+            *copy.live.lock() = self.live.lock().clone();
+            for level in 1..LEVELS {
+                let nodes: Vec<(u32, usize)> =
+                    copy.live.lock().iter().copied().filter(|n| n.0 == level).collect();
+                for (l, base) in nodes {
+                    if copy.is_empty(l, base) {
+                        copy.live.lock().remove(&(l, base));
+                    }
+                }
+            }
+            copy
         }
     }
 
-    impl Leaves<u32> for Pages {
+    impl Table<u32> for Pages {
         /// The number of pages that the change removed.
         type Op = usize;
 
+        fn lock(&self, level: u32, base: usize) {
+            while !self.try_lock(level, base) {
+                core::hint::spin_loop();
+            }
+        }
+
+        fn try_lock(&self, level: u32, base: usize) -> bool {
+            self.held.lock().insert((level, base))
+        }
+
+        fn unlock(&self, level: u32, base: usize) {
+            assert!(self.held.lock().remove(&(level, base)), "the node is not locked");
+        }
+
+        fn lock_used(&self, base: usize) -> bool {
+            self.lock(1, base);
+            if self.live(1, base) {
+                return true;
+            }
+            self.unlock(1, base);
+            false
+        }
+
+        fn live(&self, level: u32, base: usize) -> bool {
+            self.live.lock().contains(&(level, base))
+        }
+
+        fn set_live(&self, level: u32, base: usize, live: bool) {
+            assert!(self.held.lock().contains(&(level, base)), "the node is not locked");
+            if live {
+                self.live.lock().insert((level, base));
+            } else {
+                self.live.lock().remove(&(level, base));
+            }
+        }
+
+        fn is_empty(&self, level: u32, base: usize) -> bool {
+            let end = base + slot_size(level) * FANOUT;
+            if level == 1 {
+                return self.pages.lock().range(base..end).next().is_none();
+            }
+            self.slots.lock().range((level, base)..(level, end)).next().is_none()
+                && self.live.lock().range((level - 1, base)..(level - 1, end)).next().is_none()
+        }
+
+        fn slot(&self, level: u32, addr: usize) -> Option<u32> {
+            self.slots.lock().get(&(level, addr & !(slot_size(level) - 1))).copied()
+        }
+
+        fn set_slots(&self, level: u32, start: usize, end: usize, status: Option<&u32>) {
+            let mut slots = self.slots.lock();
+            for a in (start..end).step_by(slot_size(level)) {
+                match status {
+                    Some(&s) => slots.insert((level, a), s),
+                    None => slots.remove(&(level, a)),
+                };
+            }
+        }
+
         fn get(&self, addr: usize) -> Option<u32> {
-            self.0.lock().get(&(addr & !(P - 1))).copied()
+            self.pages.lock().get(&(addr & !(P - 1))).copied()
         }
 
         fn set(
@@ -994,7 +962,7 @@ mod tests {
             old: &mut dyn FnMut(usize, usize, &u32),
         ) {
             assert_eq!(start & !(M2 - 1), (end - 1) & !(M2 - 1), "a set of more than one block");
-            let mut pages = self.0.lock();
+            let mut pages = self.pages.lock();
             for a in (start..end).step_by(P) {
                 let was = match status {
                     Some(&s) => pages.insert(a, s),
@@ -1010,7 +978,7 @@ mod tests {
         }
 
         fn change(&self, start: usize, end: usize, op: &mut usize) {
-            let mut frames = self.2.lock();
+            let mut frames = self.frames.lock();
             let gone: Vec<usize> = frames.range(start..end).copied().collect();
             for a in &gone {
                 frames.remove(a);
@@ -1019,7 +987,7 @@ mod tests {
         }
 
         fn runs(&self, start: usize, end: usize, mut f: impl FnMut(usize, usize, &u32)) {
-            for (&a, s) in self.0.lock().range(start..end) {
+            for (&a, s) in self.pages.lock().range(start..end) {
                 f(a, a + P, s);
             }
         }
@@ -1029,7 +997,7 @@ mod tests {
             addr: usize,
             same: impl Fn(&u32, &u32) -> bool,
         ) -> Option<(usize, usize, u32)> {
-            let pages = self.0.lock();
+            let pages = self.pages.lock();
             let (page, block) = (addr & !(P - 1), addr & !(M2 - 1));
             let s = *pages.get(&page)?;
             let joins = |a: usize| pages.get(&a).is_some_and(|t| same(&s, t));
@@ -1042,29 +1010,6 @@ mod tests {
                 end += P;
             }
             Some((first, end, *pages.get(&first)?))
-        }
-
-        fn is_empty(&self, base: usize) -> bool {
-            self.0.lock().range(base..base + M2).next().is_none()
-        }
-
-        fn lock(&self, base: usize) {
-            while !self.try_lock(base) {
-                core::hint::spin_loop();
-            }
-        }
-
-        fn try_lock(&self, base: usize) -> bool {
-            self.1.lock().insert(base)
-        }
-
-        fn lock_used(&self, base: usize) -> bool {
-            self.lock(base);
-            true
-        }
-
-        fn unlock(&self, base: usize) {
-            assert!(self.1.lock().remove(&base), "the block is not locked");
         }
     }
 
@@ -1200,7 +1145,7 @@ mod tests {
         all.set(G1 + 3 * P, G1 + 5 * P, Some(2));
         all.set(4 * G1, 5 * G1, Some(2));
         let map = |s: u32| (s != 2).then_some(s + 10);
-        let child = Tree::fork(&all, |&s| map(s), t.leaves().fork(map));
+        let child = Tree::new(t.table().fork(map));
         drop(all);
         assert_eq!(child.lock(0, TREE_END).runs(0, TREE_END, eq), vec![(G1, G1 + 3 * P, 11)]);
         assert_eq!(child.nodes(), 4);
@@ -1212,11 +1157,11 @@ mod tests {
         let t = tree();
         let mut all = t.lock(0, TREE_END);
         all.set(G1 + P, G1 + 3 * P, Some(1));
-        assert_eq!(t.leaves().len(), 2);
-        assert_eq!(t.leaves().get(G1 + 2 * P), Some(1));
+        assert_eq!(t.table().len(), 2);
+        assert_eq!(t.table().get(G1 + 2 * P), Some(1));
         // A map of a whole 2 MiB block keeps one status in the slot of the block.
         all.set(G1 + 2 * M2, G1 + 3 * M2, Some(2));
-        assert_eq!(t.leaves().len(), 2);
+        assert_eq!(t.table().len(), 2);
         assert_eq!(all.get(G1 + 2 * M2 + 5 * P), Some(2));
         assert_eq!(
             all.runs(0, TREE_END, eq),
@@ -1235,12 +1180,12 @@ mod tests {
             all.runs(0, TREE_END, eq),
             vec![(M2, M2 + 2 * P, 1), (M2 + 2 * P, M2 + 4 * P, 2), (M2 + 4 * P, M2 + 8 * P, 1)]
         );
-        assert_eq!(t.leaves().get(M2 + 3 * P), Some(2));
+        assert_eq!(t.table().get(M2 + 3 * P), Some(2));
         // `munmap` removes the statuses from the leaves.
         all.set(M2 + P, M2 + 8 * P, None);
-        assert_eq!(t.leaves().len(), 1);
+        assert_eq!(t.table().len(), 1);
         all.set(M2, M2 + P, None);
-        assert_eq!(t.leaves().len(), 0);
+        assert_eq!(t.table().len(), 0);
         drop(all);
         assert_eq!(t.nodes(), 1);
     }
@@ -1253,10 +1198,10 @@ mod tests {
         all.set(M2 + P, M2 + 2 * P, Some(1));
         all.set(5 * G1 + P, 5 * G1 + 2 * P, Some(1));
         all.set(0, G1, Some(2));
-        assert_eq!(t.leaves().len(), 1);
-        assert_eq!(t.leaves().get(5 * G1 + P), Some(1));
+        assert_eq!(t.table().len(), 1);
+        assert_eq!(t.table().get(5 * G1 + P), Some(1));
         all.set(0, TREE_END, None);
-        assert_eq!(t.leaves().len(), 0);
+        assert_eq!(t.table().len(), 0);
     }
 
     #[test]
@@ -1267,14 +1212,14 @@ mod tests {
         all.set(M2 + 2 * P, M2 + 3 * P, Some(2));
         all.set(3 * M2 + P, 3 * M2 + 2 * P, Some(2));
         let map = |s: u32| (s == 1).then_some(s + 10);
-        let child = Tree::fork(&all, |&s| map(s), t.leaves().fork(map));
+        let child = Tree::new(t.table().fork(map));
         drop(all);
         // The child has a node of the lowest level only for a block with a status.
         assert_eq!(child.nodes(), 4);
-        assert_eq!(child.leaves().len(), 2);
+        assert_eq!(child.table().len(), 2);
         assert_eq!(child.lock(0, TREE_END).runs(0, TREE_END, eq), vec![(M2, M2 + 2 * P, 11)]);
         // The parent keeps its statuses.
-        assert_eq!(t.leaves().len(), 4);
+        assert_eq!(t.table().len(), 4);
     }
 
     #[test]
@@ -1284,10 +1229,10 @@ mod tests {
         // leaves, as a page table walk makes the last level table.
         let t = tree();
         t.lock(0, TREE_END).set(0, G1, Some(7));
-        assert_eq!(t.leaves().len(), 0);
+        assert_eq!(t.table().len(), 0);
         let x = 5 * M2 + 9 * P;
         let r = t.lock(x, x + P);
-        assert_eq!(t.leaves().len(), FANOUT);
+        assert_eq!(t.table().len(), FANOUT);
         assert_eq!(r.get(x), Some(7));
         assert_eq!(r.run_at(x, eq), Some((5 * M2, 6 * M2, 7)));
         drop(r);
@@ -1310,11 +1255,11 @@ mod tests {
         // A page fault holds the block in the leaves and not the node of the tree.
         let t = tree();
         t.lock(0, TREE_END).set(M2, M2 + P, Some(1));
-        t.leaves().lock(M2);
+        t.table().lock(1, M2);
         assert!(t.try_lock_all().is_none());
-        t.leaves().unlock(M2);
+        t.table().unlock(1, M2);
         assert!(t.try_lock_all().is_some());
-        assert!(t.leaves().1.lock().is_empty());
+        assert!(t.table().held.lock().is_empty());
     }
 
     #[test]
@@ -1326,7 +1271,7 @@ mod tests {
         r.set(M2, 2 * M2, Some(2));
         r.set(M2 + P, M2 + 2 * P, Some(3));
         drop(r);
-        assert!(t.leaves().1.lock().is_empty());
+        assert!(t.table().held.lock().is_empty());
         assert_eq!(
             t.lock(0, G1).runs(0, G1, eq),
             vec![(M2, M2 + P, 2), (M2 + P, M2 + 2 * P, 3), (M2 + 2 * P, 2 * M2, 2)]
@@ -1341,7 +1286,7 @@ mod tests {
         let mut all = t.lock(0, TREE_END);
         all.set(0, 2 * M2, Some(1));
         all.set(M2 + P, M2 + 3 * P, Some(2));
-        t.leaves().2.lock().extend((0..2 * M2).step_by(P).chain([5 * M2]));
+        t.table().frames.lock().extend((0..2 * M2).step_by(P).chain([5 * M2]));
         let (mut gone, mut old) = (0, Vec::new());
         all.change(P, 2 * M2, None, Some(&mut gone), |a, b, s| old.push((a, b, *s)));
         assert_eq!(gone, 2 * FANOUT - 1);
@@ -1354,7 +1299,7 @@ mod tests {
         });
         assert_eq!(joined, vec![(P, M2 + P, 1), (M2 + P, M2 + 3 * P, 2), (M2 + 3 * P, 2 * M2, 1)]);
         assert_eq!(all.runs(0, TREE_END, eq), vec![(0, P, 1)]);
-        assert_eq!(*t.leaves().2.lock(), [0, 5 * M2].into_iter().collect());
+        assert_eq!(*t.table().frames.lock(), [0, 5 * M2].into_iter().collect());
     }
 
     #[test]
@@ -1369,7 +1314,7 @@ mod tests {
         assert_eq!(r.runs(M2, 2 * M2, eq), vec![(M2 + P, M2 + 3 * P, 1)]);
         r.set(M2 + 2 * P, M2 + 4 * P, Some(2));
         drop(r);
-        assert!(t.leaves().1.lock().is_empty());
+        assert!(t.table().held.lock().is_empty());
         // A block with no status in the leaves needs the walk.
         let r = t.lock(3 * M2, 3 * M2 + P);
         assert_eq!((r.block, r.held[0].level), (None, 1));
@@ -1380,7 +1325,7 @@ mod tests {
         r.set(M2, 2 * M2, None);
         drop(r);
         assert_eq!(t.nodes(), 1);
-        assert!(t.leaves().1.lock().is_empty());
+        assert!(t.table().held.lock().is_empty());
     }
 
     #[test]

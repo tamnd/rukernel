@@ -702,7 +702,29 @@ fn vm_status_test() -> bool {
     space.hold_status(at(0), true);
     space.set_status(at(0), at(8), Some(&a));
     space.set_status(at(2), at(4), Some(&b));
+    // The page table pages above the block are in the tree, so `fork` copies them. An entry of
+    // a page above the last level has a status for all its pages.
+    for level in [4, 3, 2] {
+        space.hold_node(level, at(0), true);
+    }
+    for level in [4, 3, 2, 1] {
+        space.set_node_live(level, at(0), true);
+    }
+    space.set_node_status(2, at(512), at(1024), Some(&a));
     let mut ok = check(
+        "an entry of a page table page above the last level has a status",
+        space.node_status(2, at(512)).as_ref().and_then(value) == Some(1)
+            && space.node_status(2, at(0)).is_none()
+            && !space.node_is_empty(2, at(0))
+            && !space.node_is_empty(3, at(0)),
+    );
+    let mut entries = Vec::new();
+    space.node_entries(2, at(0), 0, 511, |i, s| entries.push((i, s.and_then(value))));
+    ok &= check(
+        "the entries of a page table page give the pages below it and the statuses",
+        entries == [(BASE >> 21, None), ((BASE >> 21) + 1, Some(1))],
+    );
+    ok &= check(
         "a page with no frame has a status",
         status(1) == Some(1) && status(2) == Some(2) && status(8).is_none(),
     );
@@ -732,12 +754,20 @@ fn vm_status_test() -> bool {
     ok &= check(
         "fork copies the statuses that the caller keeps",
         child.as_ref().is_ok_and(|c| {
-            c.hold_status(at(0), false) && {
-                let ok = c.status(at(0)).as_ref().and_then(value) == Some(11)
-                    && c.status(at(2)).is_none();
-                c.release_status(at(0));
-                ok
-            }
+            c.hold_status(at(0), false)
+                && {
+                    let ok = c.status(at(0)).as_ref().and_then(value) == Some(11)
+                        && c.status(at(2)).is_none();
+                    c.release_status(at(0));
+                    ok
+                }
+                && c.node_live(1, at(0))
+                && c.hold_node(2, at(0), false)
+                && {
+                    let ok = c.node_status(2, at(512)).as_ref().and_then(value) == Some(11);
+                    c.release_node(2, at(0));
+                    ok
+                }
         }),
     );
     drop(child);
@@ -774,7 +804,14 @@ fn vm_status_test() -> bool {
             },
     );
     space.set_status(at(0), at(8), None);
+    space.set_node_status(2, at(512), at(1024), None);
+    for level in [1, 2, 3, 4] {
+        space.set_node_live(level, at(0), false);
+    }
     space.release_status(at(0));
+    for level in [2, 3, 4] {
+        space.release_node(level, at(0));
+    }
     ok &= check(
         "a clear removes the statuses",
         !space.has_status(at(0)) && Arc::strong_count(&a) == 1 && Arc::strong_count(&b) == 1,

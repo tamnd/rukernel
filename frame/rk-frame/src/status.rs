@@ -46,6 +46,24 @@ impl StatusTable {
         self.chunks[i / CHUNK].as_ref()?[i % CHUNK].as_ref()
     }
 
+    /// Calls `f` with the index and the status of each page from the index `first` to `last`
+    /// that has a status, in order. A chunk with no status costs one check.
+    pub(crate) fn each(&self, first: usize, last: usize, mut f: impl FnMut(usize, &PageStatus)) {
+        let mut i = first;
+        while i <= last.min(SLOTS - 1) {
+            let c = i / CHUNK;
+            let to = last.min((c + 1) * CHUNK - 1);
+            if let Some(chunk) = &self.chunks[c] {
+                for j in i..=to {
+                    if let Some(s) = &chunk[j % CHUNK] {
+                        f(j, s);
+                    }
+                }
+            }
+            i = to + 1;
+        }
+    }
+
     /// Tells if no page has a status.
     pub(crate) fn is_empty(&self) -> bool {
         self.chunks.iter().all(Option::is_none)
@@ -183,6 +201,20 @@ mod tests {
         t.set(0, SLOTS, None);
         assert!(t.is_empty());
         assert_eq!(Arc::strong_count(&a), 1);
+    }
+
+    #[test]
+    fn each_gives_the_pages_with_a_status_in_order() {
+        let mut t = StatusTable::default();
+        let (a, b) = (status(1), status(2));
+        t.set(126, 130, Some(&a));
+        t.set(400, 401, Some(&b));
+        let mut seen = Vec::new();
+        t.each(127, SLOTS + 5, |i, s| seen.push((i, value(s))));
+        assert_eq!(seen, [(127, 1), (128, 1), (129, 1), (400, 2)]);
+        seen.clear();
+        t.each(130, 399, |i, s| seen.push((i, value(s))));
+        assert!(seen.is_empty());
     }
 
     #[test]
