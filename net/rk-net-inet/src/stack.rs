@@ -1157,13 +1157,21 @@ fn poll_locked() {
             break;
         }
     }
-    // The timers of the first namespace run at each poll, as before. The timers of the other
-    // namespaces run at most one time in each interval.
+    // The timers count in milliseconds, so the timers of the first namespace run at most one
+    // time in each millisecond. A send polls one time for each packet, and a run of the timers
+    // for each packet took about one tenth of the time of a stream on the loopback device. The
+    // changes of the neighbour tables go to netlink at each poll, as before. The timers of the
+    // other namespaces run at most one time in each interval.
+    let now = now_ms();
     {
         let _in = rk_net::ns::enter_index(0);
-        timers();
+        if timers_due(now) {
+            timers();
+        } else {
+            neigh_notify();
+            crate::stack6::neigh_notify();
+        }
     }
-    let now = now_ms();
     if rk_net::ns::count() > 1 && NEXT_TIMERS.load(Ordering::Relaxed) <= now {
         NEXT_TIMERS.store(now + TIMER_INTERVAL_MS, Ordering::Relaxed);
         for index in rk_net::ns::indices().into_iter().skip(1) {
@@ -1172,6 +1180,15 @@ fn poll_locked() {
         }
     }
     POLLING.store(false, Ordering::Release);
+}
+
+/// The millisecond of the last run of the timers of the first namespace.
+static LAST_TIMERS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Tells if the timers of the first namespace must run at the time `now`, in milliseconds. They
+/// run when the millisecond changes. The host has no timer, so there they run at each poll.
+fn timers_due(now: u64) -> bool {
+    cfg!(not(target_os = "none")) || LAST_TIMERS.swap(now, Ordering::Relaxed) != now
 }
 
 /// Runs the timers of TCP, of the neighbour tables and of IPv6 in the current namespace.
