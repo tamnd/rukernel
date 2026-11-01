@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - With the `corten` backend, the tree of statuses is the page table, as in CortenMM. Each page table page has the status of each of its entries, a lock and a flag that tells if the page is in the tree. Before, the statuses of a range larger than a 2 MiB block were in a second tree of nodes on the heap. Now `fork` copies the statuses of each level in the same walk of the page table as the pages, and the exit of a process frees them with the page table, so each walks one tree and not two. A walk reads the entries of one page table page in one call (#405).
+- spec records the decision of open question 2: rukernel uses its own `rk-frame`, and OSTD stays a reference (#23). Open question 1, CortenMM or VMAs, moves to the end of R5, because the `will-it-scale` run needs a host with KVM (#22).
 
 ## [0.4.21] - 2026-11-01
 

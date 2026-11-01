@@ -23,32 +23,13 @@ These are the decisions the spec has not settled, ranked by how much of the desi
 
 If both pass, CortenMM wins. If fidelity needs a shadow structure that loses the scalability gain, VMAs win and the proofs are done the harder way.
 
-**Deadline:** end of R4.
+**Status at the end of R4.** Both backends exist: VMAs are the default and CortenMM is the `corten` feature. The `maps` and `smaps` differential over the L4 corpus gives the same output on both backends, apart from the set-user-ID programs, whose layout is random (tools/mapsdiff, tools/bench/cortenmm.md). The small `fork` bench is the same on both or a little faster on CortenMM. The `will-it-scale`, `fault_mt` and `mmap_mt` numbers need a host with KVM or hardware, and R4 had none.
+
+**Deadline:** end of R5, after the `will-it-scale` run on a host with KVM.
 
 ## 2. Build on OSTD or write `rk-frame`
 
-**The question.** Asterinas's OSTD is the closest existing thing to `rk-frame`: a framekernel's unsafe base, MPL-2.0, partly verified by `vostd`. Should rukernel start from it rather than write its own?
-
-**For OSTD:**
-
-- Years of work and proofs already exist.
-- It brings a community.
-
-**Against OSTD:**
-
-- Its interfaces are shaped for Asterinas: async free stackful tasks with its own scheduler hooks, and its own frame metadata scheme.
-- rukernel needs LKMM semantics, `PREEMPT_LAZY`, the lock level system, text poking for the BPF JIT and static keys, the VMX/SVM core, and FRED. Some of these change OSTD's core interfaces.
-- MPL-2.0 is compatible with GPL-2.0-only in a combined work, but contributions would be split across licences.
-
-**What decides it.** A prototype in R0:
-
-- port `rk-mm`'s fault path and `rk-sched`'s context switch onto OSTD;
-- list every interface change needed;
-- ask Asterinas whether they would accept those changes upstream.
-
-If they would, rukernel builds on OSTD and contributes back. If not, `rk-frame` is written from scratch with OSTD's proofs as a guide.
-
-**Deadline:** end of R0.
+**Settled in R4.** rukernel uses its own `rk-frame`, and OSTD stays a reference for ideas and proofs. By R4 `rk-frame` was written and every subsystem used it, and the interface changes that rukernel needs (LKMM semantics, `PREEMPT_LAZY`, the lock levels, text poking for the BPF JIT and static keys, the VMX and SVM core, FRED) would change the core interfaces of OSTD. The decision is in the settled decisions of document 00. The number of this question stays, so that the references to the other questions do not change.
 
 ## 3. Kernel unwinding and panic strategy
 
