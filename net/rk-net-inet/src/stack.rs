@@ -561,6 +561,26 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Sends `payload` as `output`. A packet to a unicast address that fits in the MTU gets its
+/// header in the headroom of `payload`, so the data is not copied again, as `ip_queue_xmit` of
+/// Linux with an `sk_buff` that has room for the headers (#465).
+pub(crate) fn output_buf(next: &route::Next, out: &Out, mut payload: NetBuf) -> Result<()> {
+    if ipv4::is_multicast(out.dst) || out.protocol == PROTO_ICMP {
+        return output(next, out, payload.data());
+    }
+    let dev = dev::by_index(next.ifindex).ok_or(Errno::ENETUNREACH)?;
+    let len = payload.len();
+    if HLEN + len > (dev.mtu() as usize).min(ipv4::MAX_LEN) {
+        return output(next, out, payload.data());
+    }
+    let mut header = Header::new(out.src, out.dst, out.protocol, len);
+    header.ttl = out.ttl;
+    header.tos = out.tos;
+    header.id = IP_ID.fetch_add(1, Ordering::Relaxed);
+    payload.push(HLEN).copy_from_slice(&header.to_bytes());
+    transmit(&dev, next, payload)
+}
+
 /// The multicast packets that the host sends to its own groups, with the device that sent
 /// them, as the queue of `dev_loopback_xmit` of Linux. The poll takes them as packets that came
 /// in on the device. The queue is not in the namespace, because the poll takes it for each
@@ -795,6 +815,8 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
     for sock in &raw {
         sock.deliver_raw(&h, frame.data(), dif, info);
     }
+    // A packet that the kernel made and sent on the loopback device has the right checksum.
+    let csum_ok = loopback && frame.csum_ok;
     let packet = frame.data();
     let payload = &packet[h.hlen..];
     // `ip_protocol_deliver_rcu` counts a packet with a handler or a raw socket as delivered.
@@ -807,9 +829,10 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
     let broadcast = broadcast || mcast;
     match h.protocol {
         PROTO_ICMP => icmp_input(dev, &h, payload, broadcast, info),
-        PROTO_UDP => udp_input(&h, packet, broadcast, dif, info),
+        PROTO_UDP => udp_input(&h, packet, broadcast, dif, info, csum_ok),
         PROTO_TCP => {
-            crate::tcp::input(ip::mapped(h.src), ip::mapped(h.dst), payload, broadcast, dif);
+            let (src, dst) = (ip::mapped(h.src), ip::mapped(h.dst));
+            crate::tcp::input(src, dst, payload, broadcast, dif, csum_ok);
         }
         _ if raw.is_empty() && !broadcast => {
             icmp_error(&h, packet, ICMP_DEST_UNREACH, ICMP_PROT_UNREACH);
@@ -1031,11 +1054,12 @@ fn spec_dst(dev: &NetDevice, h: &Header, unicast: bool) -> Addr {
 
 /// Takes a UDP datagram, as `udp_rcv` of Linux. `packet` has the IPv4 header, and it came in
 /// on `dif`. `info` is for the control messages.
-fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32, info: Info6) {
+fn udp_input(h: &Header, packet: &[u8], broadcast: bool, dif: u32, info: Info6, csum_ok: bool) {
     let d = &packet[h.hlen..];
     let Some(u) = UdpHeader::parse(d) else { return count(&COUNTERS.udp_in_errors) };
     let d = &d[..usize::from(u.len)];
     if u.check != 0
+        && !csum_ok
         && checksum::fold(checksum::add(checksum::pseudo(h.src, h.dst, PROTO_UDP, u.len), d)) != 0
     {
         count(&COUNTERS.udp_in_csum_errors);

@@ -49,6 +49,7 @@ use rk_abi::native::socket::{
     SO_PROTOCOL, SO_REUSEADDR, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
+use rk_net::buf::{HEADROOM, NetBuf};
 use rk_net::consts::{
     AF_INET, AF_INET6, ICMP_ECHO, ICMP_FILTER, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_MORE, MSG_OOB,
     MSG_PEEK, MSG_TRUNC, SHUT_RD, SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_RAW,
@@ -1024,14 +1025,17 @@ impl Dgram {
                 self.autobind(s)?;
                 let src = if local == ipv4::ANY { next.src } else { local };
                 let len = (UDP_HLEN + data.len()) as u16;
-                let mut d = Vec::with_capacity(usize::from(len));
+                // The datagram is made in a buffer with room for the headers, so the IP layer
+                // does not copy it again (#465).
+                let mut d = NetBuf::new(HEADROOM, usize::from(len));
                 d.extend_from_slice(
                     &UdpHeader { src: s.port, dst: dport, len, check: 0 }.to_bytes(),
                 );
                 d.extend_from_slice(data);
-                let check = checksum::udp(src, dst, &d);
-                d[6..8].copy_from_slice(&check.to_be_bytes());
-                stack::output(&next, &self.out(s, src, dst, PROTO_UDP), &d)?;
+                let check = checksum::udp(src, dst, d.data());
+                d.data_mut()[6..8].copy_from_slice(&check.to_be_bytes());
+                d.csum_ok = true;
+                stack::output_buf(&next, &self.out(s, src, dst, PROTO_UDP), d)?;
                 stack::count(&stack::COUNTERS.udp_out);
                 Ok(())
             }

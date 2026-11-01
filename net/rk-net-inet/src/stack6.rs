@@ -372,19 +372,35 @@ pub(crate) fn output_ip(out: &Out6, oif: u32, payload: &[u8]) -> Result<()> {
     match (ip::v4(&out.src), ip::v4(&out.dst)) {
         (Some(src), Some(dst)) => {
             let next = stack::route_oif(dst, oif)?;
-            let o = stack::Out {
-                src,
-                dst,
-                protocol: out.next,
-                ttl: out.hops,
-                tos: out.tclass,
-                df: out.dontfrag,
-                mc_loop: true,
-            };
-            stack::output(&next, &o, payload)
+            stack::output(&next, &out4(out, src, dst), payload)
         }
         (None, None) => output(&route(&out.dst, oif)?, out, payload),
         _ => Err(Errno::EAFNOSUPPORT),
+    }
+}
+
+/// Sends `payload` as `output_ip`. An IPv4 packet that fits in the MTU gets its header in the
+/// headroom of `payload`, with no copy of the data.
+pub(crate) fn output_ip_buf(out: &Out6, oif: u32, payload: NetBuf) -> Result<()> {
+    match (ip::v4(&out.src), ip::v4(&out.dst)) {
+        (Some(src), Some(dst)) => {
+            let next = stack::route_oif(dst, oif)?;
+            stack::output_buf(&next, &out4(out, src, dst), payload)
+        }
+        _ => output_ip(out, oif, payload.data()),
+    }
+}
+
+/// The things that an IPv4 packet from `src` to `dst` needs to go out, from `out`.
+fn out4(out: &Out6, src: crate::ipv4::Addr, dst: crate::ipv4::Addr) -> stack::Out {
+    stack::Out {
+        src,
+        dst,
+        protocol: out.next,
+        ttl: out.hops,
+        tos: out.tclass,
+        df: out.dontfrag,
+        mc_loop: true,
     }
 }
 
@@ -778,7 +794,7 @@ pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
     match h.protocol {
         PROTO_ICMPV6 => icmp_input(dev, &h, payload, mcast),
         PROTO_UDP => udp_input(&h, ifindex, packet, mcast, dif),
-        PROTO_TCP => crate::tcp::input(h.src, h.dst, payload, mcast, dif),
+        PROTO_TCP => crate::tcp::input(h.src, h.dst, payload, mcast, dif, false),
         NEXT_NONE => {}
         _ if raw.is_empty() => {
             icmp_error(&h, ifindex, packet, PARAMPROB, ICMPV6_UNK_NEXTHDR as u8, h.nh as u32);

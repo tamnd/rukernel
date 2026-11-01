@@ -5,6 +5,7 @@ use crate::checksum;
 use crate::ip::Ip;
 use crate::ipv4::PROTO_TCP;
 use alloc::vec::Vec;
+use rk_net::buf::{HEADROOM, NetBuf};
 
 /// The length of a header without options.
 pub const HLEN: usize = 20;
@@ -91,40 +92,46 @@ impl Seg {
     }
 
     /// The bytes of the segment with the ports `sport` and `dport` and the checksum for the
-    /// addresses `src` and `dst`.
-    pub fn encode(&self, sport: u16, dport: u16, src: &Ip, dst: &Ip) -> Vec<u8> {
-        let mut opts = Vec::new();
+    /// addresses `src` and `dst`. The buffer has room for the IP and link headers before the
+    /// segment, so that the IP layer puts its header there and does not copy the data again.
+    pub fn encode(&self, sport: u16, dport: u16, src: &Ip, dst: &Ip) -> NetBuf {
+        let mut opts = [0u8; 8];
+        let mut olen = 0;
         if let Some(mss) = self.mss {
-            opts.extend_from_slice(&[OPT_MSS, 4]);
-            opts.extend_from_slice(&mss.to_be_bytes());
+            opts[..4].copy_from_slice(&[OPT_MSS, 4, (mss >> 8) as u8, mss as u8]);
+            olen = 4;
         }
         if let Some(ws) = self.wscale {
-            opts.extend_from_slice(&[OPT_NOP, OPT_WSCALE, 3, ws]);
+            opts[olen..olen + 4].copy_from_slice(&[OPT_NOP, OPT_WSCALE, 3, ws]);
+            olen += 4;
         }
-        let hlen = HLEN + opts.len();
-        let mut b = Vec::with_capacity(hlen + self.data.len());
-        b.extend_from_slice(&sport.to_be_bytes());
-        b.extend_from_slice(&dport.to_be_bytes());
-        b.extend_from_slice(&self.seq.to_be_bytes());
-        b.extend_from_slice(&self.ack.to_be_bytes());
-        b.push(((hlen / 4) as u8) << 4);
-        b.push(self.flags);
-        b.extend_from_slice(&self.wnd.to_be_bytes());
-        b.extend_from_slice(&[0, 0, 0, 0]);
-        b.extend_from_slice(&opts);
+        let hlen = HLEN + olen;
+        let mut h = [0u8; HLEN + 8];
+        h[0..2].copy_from_slice(&sport.to_be_bytes());
+        h[2..4].copy_from_slice(&dport.to_be_bytes());
+        h[4..8].copy_from_slice(&self.seq.to_be_bytes());
+        h[8..12].copy_from_slice(&self.ack.to_be_bytes());
+        h[12] = ((hlen / 4) as u8) << 4;
+        h[13] = self.flags;
+        h[14..16].copy_from_slice(&self.wnd.to_be_bytes());
+        h[HLEN..hlen].copy_from_slice(&opts[..olen]);
+        let mut b = NetBuf::new(HEADROOM, hlen + self.data.len());
+        b.extend_from_slice(&h[..hlen]);
         b.extend_from_slice(&self.data);
-        let sum = checksum::upper(src, dst, PROTO_TCP, &b);
-        b[16..18].copy_from_slice(&sum.to_be_bytes());
+        let sum = checksum::upper(src, dst, PROTO_TCP, b.data());
+        b.data_mut()[16..18].copy_from_slice(&sum.to_be_bytes());
+        b.csum_ok = true;
         b
     }
 }
 
 /// Reads the segment `tcp` (the header and the data) from `src` to `dst`, as `tcp_v4_rcv` and
 /// `tcp_v6_rcv` of Linux. Gives the source port, the destination port and the segment, or `None` for a short
-/// segment, a bad offset or a bad checksum.
-pub fn parse(tcp: &[u8], src: &Ip, dst: &Ip) -> Option<(u16, u16, Seg)> {
+/// segment, a bad offset or a bad checksum. With `csum_ok`, the checksum is known to be right,
+/// as `CHECKSUM_UNNECESSARY` of Linux, and it is not checked.
+pub fn parse(tcp: &[u8], src: &Ip, dst: &Ip, csum_ok: bool) -> Option<(u16, u16, Seg)> {
     let h = tcp.get(..HLEN)?;
-    if !checksum_ok(tcp, src, dst) {
+    if !csum_ok && !checksum_ok(tcp, src, dst) {
         return None;
     }
     let off = usize::from(h[12] >> 4) * 4;

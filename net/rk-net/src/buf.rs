@@ -29,6 +29,10 @@ pub struct NetBuf {
     pub ifindex: u32,
     /// The protocol ID of the link header, for example `ETH_P_IP`, or 0 if it is not known.
     pub protocol: u16,
+    /// The kernel made the TCP or UDP checksum of the packet, so a receive on the loopback
+    /// device does not check it again, as `CHECKSUM_PARTIAL` and `CHECKSUM_UNNECESSARY` of
+    /// Linux (#465).
+    pub csum_ok: bool,
 }
 
 impl NetBuf {
@@ -38,19 +42,26 @@ impl NetBuf {
     pub fn new(headroom: usize, capacity: usize) -> Self {
         let mut area = Vec::with_capacity(headroom + capacity);
         area.resize(headroom, 0);
-        Self { area, head: headroom, tail: headroom, ifindex: 0, protocol: 0 }
+        Self { area, head: headroom, tail: headroom, ifindex: 0, protocol: 0, csum_ok: false }
     }
 
     /// Makes a buffer with a copy of `data` and no headroom. A driver uses this for a received
     /// frame.
     pub fn from_slice(data: &[u8]) -> Self {
-        Self { area: data.to_vec(), head: 0, tail: data.len(), ifindex: 0, protocol: 0 }
+        Self {
+            area: data.to_vec(),
+            head: 0,
+            tail: data.len(),
+            ifindex: 0,
+            protocol: 0,
+            csum_ok: false,
+        }
     }
 
     /// Makes a buffer with `len` bytes of data with the value zero and no headroom. A driver
     /// copies a received frame into the data.
     pub fn zeroed(len: usize) -> Self {
-        Self { area: vec![0; len], head: 0, tail: len, ifindex: 0, protocol: 0 }
+        Self { area: vec![0; len], head: 0, tail: len, ifindex: 0, protocol: 0, csum_ok: false }
     }
 
     /// The number of bytes of data.

@@ -364,7 +364,7 @@ fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, seg: &Seg) {
     let out =
         Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos, ext: Vec::new(), dontfrag: true };
     // A lost segment is like a segment that the network lost: the timers send it again.
-    let _ = stack6::output_ip(&out, oif, &bytes);
+    let _ = stack6::output_ip_buf(&out, oif, bytes);
 }
 
 /// The listening socket for a segment to `dst` and `port`. A socket with the address `dst`
@@ -383,12 +383,13 @@ fn listener(port: u16, dst: &Ip, dif: u32) -> Option<Arc<Stream>> {
 
 /// Takes a TCP segment, as `tcp_v4_rcv` and `tcp_v6_rcv` of Linux. `tcp` has the header and
 /// the data. An IPv4 packet has IPv4-mapped addresses. The segment came in on `dif`, for
-/// `stack::dev_match`.
-pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool, dif: u32) {
+/// `stack::dev_match`. With `csum_ok`, the kernel made the checksum, and it is not checked
+/// again.
+pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool, dif: u32, csum_ok: bool) {
     if broadcast {
         return;
     }
-    let Some((sport, dport, seg)) = seg::parse(tcp, &src, &dst) else {
+    let Some((sport, dport, seg)) = seg::parse(tcp, &src, &dst, csum_ok) else {
         // A segment shorter than its header goes without a count, as `tcp_v4_rcv` of Linux.
         if tcp.len() >= seg::HLEN {
             add(&COUNTERS.tcp_in_errs, 1);
