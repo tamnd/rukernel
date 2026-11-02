@@ -1370,6 +1370,8 @@ static void test_stop(void)
 		int r = nanosleep(&(struct timespec){0, 300 * 1000 * 1000}, NULL);
 		clock_gettime(CLOCK_MONOTONIC, &b);
 		long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
+		if (r != 0 || ms < 290)
+			printf("init: nanosleep after a stop gives %d, errno %d, after %ld ms\n", r, r ? errno : 0, ms);
 		_exit(r == 0 && ms >= 290 ? 0 : 1);
 	}
 	usleep(50 * 1000);
@@ -4686,8 +4688,11 @@ static void hb_receiver(int fd)
 	size_t want = (size_t)HB_FDS * HB_LOOPS * HB_SIZE;
 	while (want > 0) {
 		ssize_t n = read(fd, buf, sizeof(buf));
-		if (n <= 0)
-			_exit(1);
+		if (n <= 0) {
+			printf("init: hackbench receiver %d: read gives %zd, errno %d, %zu bytes left\n",
+			       getpid(), n, n < 0 ? errno : 0, want);
+			_exit(2);
+		}
 		want -= (size_t)n;
 	}
 	_exit(0);
@@ -4696,14 +4701,22 @@ static void hb_receiver(int fd)
 static void hb_sender(const int *fds, int start)
 {
 	char buf[HB_SIZE] = {0}, go;
-	if (read(start, &go, 1) != 1)
-		_exit(1);
+	ssize_t got = read(start, &go, 1);
+	if (got != 1) {
+		printf("init: hackbench sender %d: read of the start pipe gives %zd, errno %d\n",
+		       getpid(), got, got < 0 ? errno : 0);
+		_exit(3);
+	}
 	for (int i = 0; i < HB_LOOPS; i++)
 		for (int j = 0; j < HB_FDS; j++)
 			for (size_t done = 0; done < sizeof(buf);) {
 				ssize_t n = write(fds[j], buf + done, sizeof(buf) - done);
-				if (n <= 0)
-					_exit(1);
+				if (n <= 0) {
+					printf("init: hackbench sender %d: write %d to receiver %d gives "
+					       "%zd, errno %d\n",
+					       getpid(), i, j, n, n < 0 ? errno : 0);
+					_exit(4);
+				}
 				done += (size_t)n;
 			}
 	_exit(0);
@@ -6309,11 +6322,13 @@ static void test_smp(void)
 		return;
 	}
 	int children = 0, ok = 1;
+	pid_t workers[2 * HB_GROUPS * HB_FDS];
 	for (int g = 0; g < HB_GROUPS && ok; g++) {
 		int wr[HB_FDS];
 		for (int r = 0; r < HB_FDS; r++) {
 			int sv[2];
 			if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+				printf("init: hackbench socketpair gives errno %d\n", errno);
 				ok = 0;
 				break;
 			}
@@ -6322,8 +6337,12 @@ static void test_smp(void)
 				close(sv[1]);
 				hb_receiver(sv[0]);
 			}
+			if (pid < 0)
+				printf("init: hackbench fork of a receiver gives errno %d\n", errno);
 			close(sv[0]);
 			wr[r] = sv[1];
+			if (pid > 0)
+				workers[children] = pid;
 			children += pid > 0;
 			ok &= pid > 0;
 		}
@@ -6331,6 +6350,10 @@ static void test_smp(void)
 			pid_t pid = fork();
 			if (pid == 0)
 				hb_sender(wr, start[0]);
+			if (pid < 0)
+				printf("init: hackbench fork of a sender gives errno %d\n", errno);
+			if (pid > 0)
+				workers[children] = pid;
 			children += pid > 0;
 			ok &= pid > 0;
 		}
@@ -6339,13 +6362,40 @@ static void test_smp(void)
 	}
 	struct timespec t0, t1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
-	for (int i = 0; i < HB_GROUPS * HB_FDS; i++)
-		ok &= write(start[1], "g", 1) == 1;
+	for (int i = 0; i < HB_GROUPS * HB_FDS; i++) {
+		ssize_t n = write(start[1], "g", 1);
+		if (n != 1) {
+			printf("init: hackbench start write gives %zd, errno %d\n", n, errno);
+			ok = 0;
+		}
+	}
 	close(start[0]);
 	close(start[1]);
-	int status;
-	for (int i = 0; i < children; i++)
-		ok &= wait(&status) > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	/* A failure prints its cause: the exit status of the worker, or the errno of wait. A worker
+	 * prints the call that failed and its errno before it exits. */
+	for (int i = 0; i < children; i++) {
+		int status = 0;
+		pid_t pid = wait(&status);
+		if (pid <= 0) {
+			printf("init: hackbench wait %d of %d gives %d, errno %d\n", i + 1, children,
+			       pid, errno);
+			ok = 0;
+			break;
+		}
+		int known = 0;
+		for (int k = 0; k < children; k++)
+			known |= workers[k] == pid;
+		if (!known) {
+			printf("init: hackbench wait gives pid %d, which is not a worker, status 0x%x\n",
+			       pid, status);
+			ok = 0;
+		} else if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+			printf("init: hackbench worker %d ends with status 0x%x (exit %d, signal %d)\n",
+			       pid, status, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+			       WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+			ok = 0;
+		}
+	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
 	printf("init: hackbench with %d groups on %d CPUs takes %ld ms\n", HB_GROUPS, cpus, ms);
