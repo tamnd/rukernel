@@ -4775,6 +4775,47 @@ static void test_sysctls(void)
 	umount("/proc");
 }
 
+/* The value of the line "NAME VALUE" of /proc/vmstat in buf, or -1. */
+static long long vmstat_value(const char *buf, const char *name)
+{
+	size_t n = strlen(name);
+	for (const char *p = buf; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL)
+		if (strncmp(p, name, n) == 0 && p[n] == ' ')
+			return atoll(p + n + 1);
+	return -1;
+}
+
+/* /proc/vmstat, /proc/zoneinfo and /proc/buddyinfo, as mm/vmstat.c of Linux. The free blocks
+ * of /proc/buddyinfo are not more than the free pages. */
+static void test_vmstat(void)
+{
+	static char buf[16384];
+	long long free_pages, blocks[11] = {0}, sum = 0;
+
+	/* test_proc unmounts /proc at its end. */
+	mkdir("/proc", 0555);
+	check("mount proc for vmstat", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	check("/proc/vmstat reads", read_small("/proc/vmstat", buf, sizeof(buf)) > 1000);
+	free_pages = vmstat_value(buf, "nr_free_pages");
+	check("/proc/vmstat starts with nr_free_pages", strncmp(buf, "nr_free_pages ", 14) == 0 && free_pages > 0);
+	check("/proc/vmstat counts the page faults", vmstat_value(buf, "pgfault") > 0);
+	check("/proc/vmstat has nr_dirty_threshold", vmstat_value(buf, "nr_dirty_threshold") > 0);
+	check("/proc/vmstat has the THP events", vmstat_value(buf, "thp_fault_alloc") >= 0);
+	check("/proc/buddyinfo has 11 orders",
+	      read_small("/proc/buddyinfo", buf, sizeof(buf)) > 0 &&
+		      sscanf(buf, "Node 0, zone Normal %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld",
+			     &blocks[0], &blocks[1], &blocks[2], &blocks[3], &blocks[4], &blocks[5],
+			     &blocks[6], &blocks[7], &blocks[8], &blocks[9], &blocks[10]) == 11);
+	for (int i = 0; i < 11; i++)
+		sum += blocks[i] << i;
+	check("the blocks of /proc/buddyinfo are free pages", sum > 0 && sum <= free_pages + 4096);
+	check("/proc/zoneinfo has the zone and its free pages",
+	      read_small("/proc/zoneinfo", buf, sizeof(buf)) > 0 &&
+		      strncmp(buf, "Node 0, zone   Normal\n  per-node stats\n", 37) == 0 &&
+		      strstr(buf, "\n  pages free     ") && strstr(buf, "\n  start_pfn:           "));
+	umount("/proc");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -9496,6 +9537,7 @@ static void test_all(void)
 	test_overlay();
 	test_proc();
 	test_sysctls();
+	test_vmstat();
 	test_memfd();
 	test_shm();
 	test_sem();

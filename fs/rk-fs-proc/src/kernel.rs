@@ -76,6 +76,38 @@ fn disks(show: fn(&[text::Disk]) -> String) -> Vec<u8> {
     show(&list).into_bytes()
 }
 
+/// The counts of the memory for `/proc/vmstat`, `/proc/zoneinfo` and `/proc/buddyinfo`.
+fn vm_counts() -> text::VmCounts {
+    let f = rk_frame::mm::frame_stats();
+    let span = rk_frame::mm::frame_span();
+    let mut sectors = [0u64; 2];
+    for (_, rdev) in rk_vfs::blockdev::block_devices() {
+        if let Some(q) = rk_vfs::blockdev::block_queue(rdev) {
+            let s = q.stats();
+            sectors[0] += s.sectors[0];
+            sectors[1] += s.sectors[1];
+        }
+    }
+    let cpus = (0..rk_frame::cpu::count())
+        .map(|cpu| {
+            let (count, high, batch) = rk_frame::mm::cpu_free_frames(cpu);
+            (count as u64, high as u64, batch as u64)
+        })
+        .collect();
+    text::VmCounts {
+        total: f.total as u64,
+        free: f.free as u64,
+        anon_thp: rk_frame::vm::huge_pages_mapped() as u64,
+        faults: rk_frame::trap::counts().page_faults,
+        pgpgin: sectors[0] / 2,
+        pgpgout: sectors[1] / 2,
+        min_free_kbytes: rk_mm::tunables::min_free_kbytes(f.total) as u64,
+        span: (span.start as u64, span.end as u64),
+        blocks: rk_frame::mm::free_blocks().map(|n| n as u64),
+        cpus,
+    }
+}
+
 fn root_list() -> Result<Vec<(Vec<u8>, InodeRef)>> {
     let mut out = root_files();
     for p in rk_proc::processes() {
@@ -190,6 +222,9 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
     out.push((b"pressure".to_vec(), pressure_dir()));
     out.push((b"diskstats".to_vec(), text_file(b"/diskstats", || disks(text::diskstats))));
     out.push((b"partitions".to_vec(), text_file(b"/partitions", || disks(text::partitions))));
+    out.push((b"buddyinfo".to_vec(), text_file(b"/buddyinfo", || text::buddyinfo(&vm_counts()).into_bytes())));
+    out.push((b"vmstat".to_vec(), text_file(b"/vmstat", || text::vmstat(&vm_counts()).into_bytes())));
+    out.push((b"zoneinfo".to_vec(), text_file(b"/zoneinfo", || text::zoneinfo(&vm_counts()).into_bytes())));
     out
 }
 

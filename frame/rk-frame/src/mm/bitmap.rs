@@ -15,7 +15,15 @@ pub(crate) struct FrameBitmap<const WORDS: usize> {
     /// No free frame is below this word. A new bitmap has the value 0, so that the bitmap is all
     /// zeros and goes in the bss and not in the kernel image.
     hint: usize,
+    /// The first frame that `add_free` marked, plus one, or 0 before the first call. The value
+    /// 0 keeps a new bitmap all zeros.
+    first: usize,
+    /// No frame is free at or above this frame: the end of the last run of `add_free`.
+    last: usize,
 }
+
+/// The largest order of a block of free frames in `/proc/buddyinfo`, `MAX_PAGE_ORDER` of Linux.
+pub(crate) const MAX_ORDER: usize = 10;
 
 impl<const WORDS: usize> FrameBitmap<WORDS> {
     /// The number of frames that the bitmap can hold.
@@ -23,7 +31,7 @@ impl<const WORDS: usize> FrameBitmap<WORDS> {
 
     /// Makes a bitmap with no free frames.
     pub(crate) const fn new() -> Self {
-        Self { bits: [0; WORDS], total: 0, free: 0, hint: 0 }
+        Self { bits: [0; WORDS], total: 0, free: 0, hint: 0, first: 0, last: 0 }
     }
 
     /// Marks the frames `start..end` free. Frames past the capacity are ignored. Gives the number
@@ -41,6 +49,10 @@ impl<const WORDS: usize> FrameBitmap<WORDS> {
         self.total += n;
         self.free += n;
         self.hint = self.hint.min(start / 64);
+        if end > start {
+            self.first = if self.first == 0 { start + 1 } else { self.first.min(start + 1) };
+            self.last = self.last.max(end);
+        }
         n
     }
 
@@ -147,6 +159,52 @@ impl<const WORDS: usize> FrameBitmap<WORDS> {
     /// The number of free frames.
     pub(crate) fn free_count(&self) -> usize {
         self.free
+    }
+
+    /// The frames from the first to the last frame that the allocator manages, as the span of
+    /// a zone of Linux.
+    pub(crate) fn span(&self) -> core::ops::Range<usize> {
+        self.first.saturating_sub(1)..self.last
+    }
+
+    /// The free frames as the blocks of a buddy allocator: for each order up to `MAX_ORDER`, the
+    /// number of blocks of `1 << order` free frames, where the first frame number is a multiple
+    /// of `1 << order`. Each free run counts as the largest blocks that make it, from its start.
+    pub(crate) fn free_blocks(&self) -> [usize; MAX_ORDER + 1] {
+        let mut out = [0; MAX_ORDER + 1];
+        let end = self.last;
+        let mut f = 0;
+        while f < end {
+            let word = self.bits[f / 64];
+            if word >> (f % 64) == 0 {
+                f = (f / 64 + 1) * 64;
+                continue;
+            }
+            if word >> (f % 64) & 1 == 0 {
+                f += 1;
+                continue;
+            }
+            let mut order = 0;
+            while order < MAX_ORDER && self.all_free(f, 2 << order, end) {
+                order += 1;
+            }
+            out[order] += 1;
+            f += 1 << order;
+        }
+        out
+    }
+
+    /// Tells if the `n` frames from `start` are free, where `n` is a power of two. A run that
+    /// does not start at a multiple of `n`, or that goes past `end`, gives false.
+    fn all_free(&self, start: usize, n: usize, end: usize) -> bool {
+        if !start.is_multiple_of(n) || start + n > end {
+            return false;
+        }
+        if n >= 64 {
+            return self.bits[start / 64..(start + n) / 64].iter().all(|&w| w == u64::MAX);
+        }
+        let mask = (u64::MAX >> (64 - n)) << (start % 64);
+        self.bits[start / 64] & mask == mask
     }
 }
 
@@ -256,6 +314,25 @@ mod tests {
         assert_eq!(bm.alloc_run(2), Some(36));
         assert_eq!(bm.alloc_run(0), Some(35));
         assert_eq!(bm.free_count(), 37 - 16 - 4 - 1);
+    }
+
+    #[test]
+    fn free_blocks_count_the_aligned_runs() {
+        let mut bm = FrameBitmap::<64>::new();
+        bm.add_free(1, 4);
+        bm.add_free(64, 64 + 1024 + 128 + 1);
+        let mut want = [0; MAX_ORDER + 1];
+        // 1..4 is the block 1 and the block 2..4. 64..1217 is the blocks 64..128, 128..256,
+        // 256..512, 512..1024, 1024..1152, 1152..1216 and 1216.
+        want[0] = 3;
+        want[1] = 1;
+        want[6] = 2;
+        want[7] = 2;
+        want[8] = 1;
+        want[9] = 1;
+        assert_eq!(bm.free_blocks(), want);
+        bm.add_free(2048, 4096);
+        assert_eq!(bm.free_blocks()[MAX_ORDER], 2);
     }
 
     #[test]

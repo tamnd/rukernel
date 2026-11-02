@@ -70,6 +70,173 @@ pub fn partitions(disks: &[Disk]) -> String {
     out
 }
 
+/// The names of `/proc/vmstat` in the order of mm/vmstat.c of Linux 6.8 on x86-64: the counts of
+/// a zone (12), the NUMA events (6), the counts of a node (46), the two dirty limits and the
+/// events.
+const VMSTAT_NAMES: &str = "nr_free_pages nr_zone_inactive_anon nr_zone_active_anon nr_zone_inactive_file \
+     nr_zone_active_file nr_zone_unevictable nr_zone_write_pending nr_mlock nr_bounce \
+     nr_zspages nr_free_cma nr_unaccepted numa_hit numa_miss numa_foreign numa_interleave \
+     numa_local numa_other nr_inactive_anon nr_active_anon nr_inactive_file nr_active_file \
+     nr_unevictable nr_slab_reclaimable nr_slab_unreclaimable nr_isolated_anon \
+     nr_isolated_file workingset_nodes workingset_refault_anon workingset_refault_file \
+     workingset_activate_anon workingset_activate_file workingset_restore_anon \
+     workingset_restore_file workingset_nodereclaim nr_anon_pages nr_mapped nr_file_pages \
+     nr_dirty nr_writeback nr_writeback_temp nr_shmem nr_shmem_hugepages nr_shmem_pmdmapped \
+     nr_file_hugepages nr_file_pmdmapped nr_anon_transparent_hugepages nr_vmscan_write \
+     nr_vmscan_immediate_reclaim nr_dirtied nr_written nr_throttled_written \
+     nr_kernel_misc_reclaimable nr_foll_pin_acquired nr_foll_pin_released nr_kernel_stack \
+     nr_page_table_pages nr_sec_page_table_pages nr_swapcached pgpromote_success \
+     pgpromote_candidate pgdemote_kswapd pgdemote_direct pgdemote_khugepaged \
+     nr_dirty_threshold nr_dirty_background_threshold pgpgin pgpgout pswpin pswpout \
+     pgalloc_dma pgalloc_dma32 pgalloc_normal pgalloc_movable pgalloc_device allocstall_dma \
+     allocstall_dma32 allocstall_normal allocstall_movable allocstall_device pgskip_dma \
+     pgskip_dma32 pgskip_normal pgskip_movable pgskip_device pgfree pgactivate pgdeactivate \
+     pglazyfree pgfault pgmajfault pglazyfreed pgrefill pgreuse pgsteal_kswapd \
+     pgsteal_direct pgsteal_khugepaged pgscan_kswapd pgscan_direct pgscan_khugepaged \
+     pgscan_direct_throttle pgscan_anon pgscan_file pgsteal_anon pgsteal_file \
+     zone_reclaim_failed pginodesteal slabs_scanned kswapd_inodesteal \
+     kswapd_low_wmark_hit_quickly kswapd_high_wmark_hit_quickly pageoutrun pgrotated \
+     drop_pagecache drop_slab oom_kill numa_pte_updates numa_huge_pte_updates \
+     numa_hint_faults numa_hint_faults_local numa_pages_migrated pgmigrate_success \
+     pgmigrate_fail thp_migration_success thp_migration_fail thp_migration_split \
+     compact_migrate_scanned compact_free_scanned compact_isolated compact_stall \
+     compact_fail compact_success compact_daemon_wake compact_daemon_migrate_scanned \
+     compact_daemon_free_scanned htlb_buddy_alloc_success htlb_buddy_alloc_fail \
+     unevictable_pgs_culled unevictable_pgs_scanned unevictable_pgs_rescued \
+     unevictable_pgs_mlocked unevictable_pgs_munlocked unevictable_pgs_cleared \
+     unevictable_pgs_stranded thp_fault_alloc thp_fault_fallback thp_fault_fallback_charge \
+     thp_collapse_alloc thp_collapse_alloc_failed thp_file_alloc thp_file_fallback \
+     thp_file_fallback_charge thp_file_mapped thp_split_page thp_split_page_failed \
+     thp_deferred_split_page thp_split_pmd thp_scan_exceed_none_pte thp_scan_exceed_swap_pte \
+     thp_scan_exceed_share_pte thp_split_pud thp_zero_page_alloc thp_zero_page_alloc_failed \
+     thp_swpout thp_swpout_fallback balloon_inflate balloon_deflate balloon_migrate swap_ra \
+     swap_ra_hit ksm_swpin_copy cow_ksm zswpin zswpout zswpwb direct_map_level2_splits \
+     direct_map_level3_splits nr_unstable";
+
+/// The counts of a zone in `VMSTAT_NAMES`.
+const VM_ZONE_ITEMS: usize = 12;
+
+/// The NUMA events after the counts of a zone in `VMSTAT_NAMES`.
+const VM_NUMA_ITEMS: usize = 6;
+
+/// The counts of a node after the NUMA events in `VMSTAT_NAMES`.
+const VM_NODE_ITEMS: usize = 46;
+
+/// The counts of the memory for `/proc/vmstat`, `/proc/zoneinfo` and `/proc/buddyinfo`, in pages
+/// of 4 KiB unless noted. The machine has one node with one zone, `Normal`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VmCounts {
+    /// The frames that the allocator manages.
+    pub total: u64,
+    /// The free frames.
+    pub free: u64,
+    /// The transparent huge pages that are mapped, in huge pages.
+    pub anon_thp: u64,
+    /// The page faults since boot.
+    pub faults: u64,
+    /// The KiB that the block devices read and wrote.
+    pub pgpgin: u64,
+    /// The KiB that the block devices wrote.
+    pub pgpgout: u64,
+    /// `vm.min_free_kbytes`.
+    pub min_free_kbytes: u64,
+    /// The first frame and the end of the frames of the zone.
+    pub span: (u64, u64),
+    /// The free blocks of each order, from `rk_frame::mm::free_blocks`.
+    pub blocks: [u64; 11],
+    /// The `count`, `high` and `batch` of the free list of each CPU.
+    pub cpus: Vec<(u64, u64, u64)>,
+}
+
+/// The value of the count `name` of `/proc/vmstat`. A count that rukernel does not keep is 0.
+fn vm_value(c: &VmCounts, name: &str) -> u64 {
+    match name {
+        "nr_free_pages" => c.free,
+        "nr_anon_transparent_hugepages" => c.anon_thp,
+        "pgfault" => c.faults,
+        "pgpgin" => c.pgpgin,
+        "pgpgout" => c.pgpgout,
+        // The defaults of vm.dirty_ratio and vm.dirty_background_ratio, 20 and 10 percent of
+        // the free memory, as `global_dirty_limits` of Linux.
+        "nr_dirty_threshold" => c.free / 5,
+        "nr_dirty_background_threshold" => c.free / 10,
+        _ => 0,
+    }
+}
+
+/// The names of `/proc/vmstat` of this architecture. Only x86-64 counts the splits of the direct
+/// map.
+fn vm_names() -> impl Iterator<Item = &'static str> {
+    VMSTAT_NAMES
+        .split(' ')
+        .filter(|n| cfg!(target_arch = "x86_64") || !n.starts_with("direct_map_"))
+}
+
+/// The text of `/proc/vmstat`, as `vmstat_show` of mm/vmstat.c of Linux.
+pub fn vmstat(c: &VmCounts) -> String {
+    let mut out = String::new();
+    for name in vm_names() {
+        let _ = writeln!(out, "{name} {}", vm_value(c, name));
+    }
+    out
+}
+
+/// The text of `/proc/buddyinfo`, as `frag_show_print` of mm/vmstat.c of Linux: the free blocks
+/// of each order of the zone.
+pub fn buddyinfo(c: &VmCounts) -> String {
+    let mut out = format!("Node 0, zone {:>8} ", "Normal");
+    for n in c.blocks {
+        let _ = write!(out, "{n:6} ");
+    }
+    out.push('\n');
+    out
+}
+
+/// The watermarks `min`, `low` and `high` of a zone of `managed` pages with `min_free_kbytes`, as
+/// `__setup_per_zone_wmarks` of Linux with the default `watermark_scale_factor` of 10.
+fn watermarks(managed: u64, min_free_kbytes: u64) -> (u64, u64, u64) {
+    let min = min_free_kbytes / 4;
+    let step = (min / 4).max(managed * 10 / 10_000);
+    (min, min + step, min + 2 * step)
+}
+
+/// The text of `/proc/zoneinfo`, as `zoneinfo_show_print` of mm/vmstat.c of Linux: the counts of
+/// the node, the size and the counts of the zone, and the free list of each CPU.
+pub fn zoneinfo(c: &VmCounts) -> String {
+    let mut names = vm_names();
+    let zone: Vec<&str> = names.by_ref().take(VM_ZONE_ITEMS).collect();
+    let numa: Vec<&str> = names.by_ref().take(VM_NUMA_ITEMS).collect();
+    let node: Vec<&str> = names.take(VM_NODE_ITEMS).collect();
+    let mut out = format!("Node 0, zone {:>8}\n  per-node stats", "Normal");
+    for name in node {
+        let _ = write!(out, "\n      {name:<12} {}", vm_value(c, name));
+    }
+    let (min, low, high) = watermarks(c.total, c.min_free_kbytes);
+    let _ = write!(
+        out,
+        "\n  pages free     {}\n        boost    0\n        min      {min}\n        low      {low}\n        \
+         high     {high}\n        spanned  {}\n        present  {}\n        managed  {}\n        \
+         cma      0\n        protection: (0, 0, 0, 0, 0)",
+        c.free,
+        c.span.1 - c.span.0,
+        c.total,
+        c.total,
+    );
+    for name in zone.into_iter().chain(numa) {
+        let _ = write!(out, "\n      {name:<12} {}", vm_value(c, name));
+    }
+    out.push_str("\n  pagesets");
+    for (cpu, (count, high, batch)) in c.cpus.iter().enumerate() {
+        let _ = write!(
+            out,
+            "\n    cpu: {cpu}\n              count: {count}\n              high:  {high}\n              \
+             batch: {batch}\n  vm stats threshold: 0"
+        );
+    }
+    let _ = writeln!(out, "\n  node_unreclaimable:  0\n  start_pfn:           {}", c.span.0);
+    out
+}
+
 /// The text of `/proc/meminfo`. R1 has no page cache, so the other counts are 0.
 pub fn meminfo(m: MemInfo) -> String {
     let h = m.hugetlb;
@@ -648,6 +815,44 @@ mod tests {
             partitions(&list),
             "major minor  #blocks  name\n\n 254        0       4096 vda\n"
         );
+    }
+
+    #[test]
+    fn vmstat_zoneinfo_and_buddyinfo_have_the_format_of_linux() {
+        let mut blocks = [0; 11];
+        blocks[0] = 3;
+        blocks[10] = 100;
+        let c = VmCounts {
+            total: 131_072,
+            free: 120_000,
+            faults: 42,
+            min_free_kbytes: 5792,
+            span: (1, 131_040),
+            blocks,
+            cpus: alloc::vec![(5, 128, 32)],
+            ..VmCounts::default()
+        };
+        let v = vmstat(&c);
+        assert_eq!(v.lines().count(), 178);
+        assert!(v.starts_with("nr_free_pages 120000\nnr_zone_inactive_anon 0\n"));
+        assert!(v.contains("\npgfault 42\n"));
+        assert!(v.contains("\nnr_dirty_threshold 24000\nnr_dirty_background_threshold 12000\n"));
+        assert!(v.ends_with("\nnr_unstable 0\n"));
+        assert_eq!(
+            buddyinfo(&c),
+            concat!(
+                "Node 0, zone   Normal      3      0      0      0      0      0      0      0",
+                "      0    100 \n"
+            )
+        );
+        let z = zoneinfo(&c);
+        assert!(z.starts_with("Node 0, zone   Normal\n  per-node stats\n      nr_inactive_anon 0\n"));
+        assert!(z.contains("\n      nr_mapped    0\n"));
+        assert!(z.contains("\n  pages free     120000\n        boost    0\n        min      1448\n"));
+        assert!(z.contains("\n        spanned  131039\n        present  131072\n"));
+        assert!(z.contains("\n      nr_free_pages 120000\n"));
+        assert!(z.contains("\n    cpu: 0\n              count: 5\n              high:  128\n"));
+        assert!(z.ends_with("\n  node_unreclaimable:  0\n  start_pfn:           1\n"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub(crate) mod pcp;
 #[cfg(target_os = "none")]
 pub use frame::{
     Frame, FrameStats, HUGE_FRAMES, HugeKind, HugeRun, Mapping, PageInfo, alloc_frame,
-    alloc_huge_frames, alloc_zeroed_frame, frame_stats, phys_huge, phys_huge_mapped, phys_is_anon,
+    alloc_huge_frames, alloc_zeroed_frame, cpu_free_frames, frame_span, frame_stats, free_blocks, phys_huge, phys_huge_mapped, phys_is_anon,
     phys_is_ksm, query, set_huge_return_hook, set_uncharge_hook, translate, vmap,
 };
 #[cfg(target_os = "none")]
