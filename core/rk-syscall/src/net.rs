@@ -429,7 +429,15 @@ fn sigpipe(cx: &Cx<'_>, flags: u32, r: SysResult) -> SysResult {
 }
 
 /// Reads the data of the vectors `iovs` from user memory.
+///
+/// The bytes go from user memory to the result in one copy. One vector, as with `write`, gives
+/// the buffer of `read_bytes` with no second copy (#465).
 fn gather(cx: &Cx<'_>, iovs: &[Iovec]) -> Result<Vec<u8>, Errno> {
+    if let [v] = iovs
+        && v.iov_len > 0
+    {
+        return cx.read_bytes(v.iov_base, (v.iov_len as usize).min(SEND_MAX));
+    }
     let total = iovs.iter().fold(0usize, |t, v| t.saturating_add(v.iov_len as usize));
     let mut data = Vec::with_capacity(total.min(SEND_MAX).min(1 << 20));
     for v in iovs {
