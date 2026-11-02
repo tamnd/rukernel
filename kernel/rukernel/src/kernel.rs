@@ -84,6 +84,18 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
         }
     }
     rk_syscall::init();
+    // `rk.missing=1` logs each name under /proc and /sys that a program looks for and that the
+    // kernel does not have. tools/missing/report.py makes a report from the log.
+    if param(boot.cmdline(), "rk.missing") == Some("1") {
+        rk_vfs::path::set_missing_hook(|path| {
+            let comm = rk_proc::current_thread().map(|t| t.process().comm()).unwrap_or_default();
+            println!(
+                "rk.missing: {} {}",
+                alloc::string::String::from_utf8_lossy(path),
+                alloc::string::String::from_utf8_lossy(&comm)
+            );
+        });
+    }
     rk_vfs::loopdev::init();
     let Some(fs) = rootfs::context() else {
         panic!("no root file system");
