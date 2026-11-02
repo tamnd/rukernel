@@ -1574,7 +1574,12 @@ fn mountinfo_of(p: &Process) -> Result<Vec<u8>> {
 
 /// The target of a link in `/proc/PID/fd`.
 fn fd_target(file: &rk_vfs::File, fs: Option<&rk_vfs::FsContext>) -> Vec<u8> {
+    /// `PID_FS_MAGIC`: a process file descriptor has the name of `pidfs_dname` of Linux.
+    const PID_FS_MAGIC: u64 = 0x5049_4446;
     if let Some(at) = file.location() {
+        if at.inode().fs_magic() == PID_FS_MAGIC {
+            return b"anon_inode:[pidfd]".to_vec();
+        }
         return fs.and_then(|fs| fs.path_of(at).ok()).unwrap_or_else(|| at.absolute_path());
     }
     match file.metadata() {

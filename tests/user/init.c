@@ -2019,6 +2019,116 @@ static void test_signalfd_poll(void)
 	sigprocmask(SIG_SETMASK, &old, NULL);
 }
 
+/* Reads the line that starts with `key` in /proc/self/fdinfo/FD into `out`. */
+static int fdinfo_line(int fd, const char *key, char *out, size_t n)
+{
+	char path[64], buf[512];
+	snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+	int f = open(path, O_RDONLY);
+	if (f < 0)
+		return -1;
+	ssize_t len = read(f, buf, sizeof(buf) - 1);
+	close(f);
+	if (len <= 0)
+		return -1;
+	buf[len] = 0;
+	for (char *line = buf; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+		if (strncmp(line, key, strlen(key)) == 0) {
+			char *end = strchr(line, '\n');
+			size_t l = end ? (size_t)(end - line) : strlen(line);
+			if (l >= n)
+				l = n - 1;
+			memcpy(out, line, l);
+			out[l] = 0;
+			return 0;
+		}
+	}
+	return -1;
+}
+
+/* The inodes of pidfs: fstat, statfs, the fdinfo lines and the file handles of a pidfd. */
+static void test_pidfs(void)
+{
+	struct {
+		unsigned bytes;
+		int type;
+		unsigned char f[128];
+	} fh;
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	int fds[2];
+	char c = 0, line[128], want[64];
+
+	if (pipe(fds) != 0) {
+		check("pipe for pidfs", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		read(fds[0], &c, 1);
+		_exit(3);
+	}
+	int a = syscall(SYS_pidfd_open, pid, 0), b = syscall(SYS_pidfd_open, pid, 0);
+	int self = syscall(SYS_pidfd_open, getpid(), 0);
+	struct stat sa, sb, ss, sh;
+	check("fstat of two pidfds of a process gives one inode",
+	      a >= 0 && b >= 0 && fstat(a, &sa) == 0 && fstat(b, &sb) == 0 && sa.st_dev == sb.st_dev &&
+		      sa.st_ino == sb.st_ino && S_ISREG(sa.st_mode) && (sa.st_mode & 0777) == 0700);
+	check("fstat of pidfds of two processes gives two inodes",
+	      self >= 0 && fstat(self, &ss) == 0 && ss.st_dev == sa.st_dev && ss.st_ino != sa.st_ino);
+	struct statfs sfs;
+	check("fstatfs of a pidfd gives PID_FS_MAGIC", fstatfs(a, &sfs) == 0 && sfs.f_type == 0x50494446);
+	char path[64], target[64];
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", a);
+	ssize_t n = readlink(path, target, sizeof(target) - 1);
+	check("the link of a pidfd is anon_inode:[pidfd]",
+	      n == 18 && memcmp(target, "anon_inode:[pidfd]", 18) == 0);
+	snprintf(want, sizeof(want), "Pid:\t%d", pid);
+	check("fdinfo of a pidfd has the Pid line", fdinfo_line(a, "Pid:", line, sizeof(line)) == 0 &&
+							   strcmp(line, want) == 0);
+	snprintf(want, sizeof(want), "NSpid:\t%d", pid);
+	check("fdinfo of a pidfd has the NSpid line",
+	      fdinfo_line(a, "NSpid:", line, sizeof(line)) == 0 && strcmp(line, want) == 0);
+
+	int mnt = -1;
+	memset(&fh, 0, sizeof(fh));
+	fh.bytes = sizeof(fh.f);
+	int ok = syscall(SYS_name_to_handle_at, a, "", &fh, &mnt, AT_EMPTY_PATH) == 0;
+	check("name_to_handle_at of a pidfd gives FILEID_KERNFS", ok && fh.type == 0xfe && fh.bytes == 8);
+	int h = syscall(SYS_open_by_handle_at, self, &fh, O_CLOEXEC);
+	check("open_by_handle_at in pidfs opens a pidfd of the process",
+	      h >= 0 && fstat(h, &sh) == 0 && sh.st_ino == sa.st_ino && sh.st_dev == sa.st_dev &&
+		      (fcntl(h, F_GETFD) & FD_CLOEXEC));
+	close(h);
+	h = syscall(SYS_open_by_handle_at, -10002, &fh, 0);
+	check("open_by_handle_at with FD_PIDFS_ROOT", h >= 0 && fstat(h, &sh) == 0 && sh.st_ino == sa.st_ino &&
+							       !(fcntl(h, F_GETFD) & FD_CLOEXEC));
+	close(h);
+	check("open_by_handle_at in pidfs with O_TRUNC gives EINVAL",
+	      syscall(SYS_open_by_handle_at, self, &fh, O_TRUNC) == -1 && errno == EINVAL);
+	check("name_to_handle_at of a name under a pidfd gives ENOTDIR",
+	      syscall(SYS_name_to_handle_at, a, "x", &fh, &mnt, 0) == -1 && errno == ENOTDIR);
+	check("fchmod of a pidfd gives EOPNOTSUPP", fchmod(a, 0600) == -1 && errno == EOPNOTSUPP);
+
+	write(fds[1], &c, 1);
+	siginfo_t info;
+	waitid(P_PID, pid, &info, WEXITED | WNOWAIT);
+	h = syscall(SYS_open_by_handle_at, self, &fh, 0);
+	check("open_by_handle_at in pidfs opens a pidfd of a zombie", h >= 0);
+	close(h);
+	waitpid(pid, NULL, 0);
+	check("fdinfo of a pidfd of a reaped process gives Pid -1",
+	      fdinfo_line(a, "Pid:", line, sizeof(line)) == 0 && strcmp(line, "Pid:\t-1") == 0);
+	check("open_by_handle_at in pidfs of a reaped process gives ESTALE",
+	      syscall(SYS_open_by_handle_at, self, &fh, 0) == -1 && errno == ESTALE);
+	close(a);
+	close(b);
+	close(self);
+	close(fds[0]);
+	close(fds[1]);
+	umount("/proc");
+}
+
 static void test_pidfd(void)
 {
 	int fds[2];
@@ -9360,6 +9470,7 @@ static void test_all(void)
 	test_locks();
 	test_clone3();
 	test_pidfd();
+	test_pidfs();
 	test_signalfd_poll();
 	test_seccomp();
 	test_ptrace();
