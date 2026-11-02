@@ -12,6 +12,7 @@
 pub mod link;
 pub mod msg;
 pub mod nsid;
+pub mod policy;
 
 use crate::consts::{
     AF_NETLINK, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOL_NETLINK,
@@ -838,6 +839,22 @@ impl Request<'_> {
     pub fn attr_error(&self, text: &'static str, data: &[u8], e: Errno) -> Errno {
         self.error(text, e);
         self.bad_attr(data);
+        e
+    }
+
+    /// Sets the message, the bad attribute and its policy of the extended ack, as
+    /// `NL_SET_ERR_MSG_ATTR_POL` of Linux. Gives `e`.
+    pub fn policy_error(
+        &self,
+        text: &'static str,
+        data: &[u8],
+        pt: &policy::Policy,
+        e: Errno,
+    ) -> Errno {
+        self.attr_error(text, data, e);
+        let mut x = self.ext.get();
+        x.policy = Some(*pt);
+        self.ext.set(x);
         e
     }
 

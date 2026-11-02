@@ -103,6 +103,11 @@ pub struct Route6 {
     pub addrconf: bool,
     /// The metrics `RTAX_*`.
     pub metrics: Metrics,
+    /// The ID of the nexthop object of the route, `RTA_NH_ID`, or 0. The gateway and the
+    /// interface then come from the nexthop.
+    pub nhid: u32,
+    /// Tells if the nexthop object of the route is a blackhole.
+    pub blackhole: bool,
 }
 
 impl Route6 {
@@ -121,6 +126,8 @@ impl Route6 {
             expires: None,
             addrconf: false,
             metrics: [0; RTAX_MAX as usize],
+            nhid: 0,
+            blackhole: false,
         }
     }
 
@@ -144,6 +151,7 @@ impl Route6 {
             && self.priority == r.priority
             && self.gateway == r.gateway
             && self.ifindex == r.ifindex
+            && self.nhid == r.nhid
     }
 }
 
@@ -164,6 +172,8 @@ pub struct Match6 {
     pub priority: Option<u32>,
     /// The protocol.
     pub protocol: Option<u8>,
+    /// The nexthop object.
+    pub nhid: Option<u32>,
 }
 
 /// The result of a lookup: where a packet goes.
@@ -394,7 +404,8 @@ impl Table6 {
         self.addrs = kept;
         let mut c = Changes6::default();
         self.routes.retain(|r| {
-            if r.ifindex == ifindex {
+            // The routes through nexthop objects go away with their nexthops.
+            if r.ifindex == ifindex && r.nhid == 0 {
                 c.removed.push(r.clone());
                 return false;
             }
@@ -439,6 +450,38 @@ impl Table6 {
         }
     }
 
+    /// Changes the routes through nexthop objects. `f` gives `None` for a route that does not
+    /// change, `Some(true)` for a route that it changed and `Some(false)` for a route to
+    /// remove. Gives the changed routes and the removed routes.
+    pub fn update_nh_routes(
+        &mut self,
+        mut f: impl FnMut(&mut Route6) -> Option<bool>,
+    ) -> (Vec<Route6>, Vec<Route6>) {
+        let (mut changed, mut removed) = (Vec::new(), Vec::new());
+        self.routes.retain_mut(|r| {
+            if r.nhid == 0 {
+                return true;
+            }
+            match f(r) {
+                None => true,
+                Some(true) => {
+                    changed.push(r.clone());
+                    true
+                }
+                Some(false) => {
+                    removed.push(r.clone());
+                    false
+                }
+            }
+        });
+        (changed, removed)
+    }
+
+    /// Tells if a route goes through one of the nexthop objects `ids`.
+    pub fn uses_nh(&self, ids: &[u32]) -> bool {
+        self.routes.iter().any(|r| r.nhid != 0 && ids.contains(&r.nhid))
+    }
+
     /// Removes the first route that `m` takes, as `ip6_route_del` of Linux.
     ///
     /// # Errors
@@ -449,11 +492,15 @@ impl Table6 {
             .routes
             .iter()
             .position(|r| {
+                // A route through a nexthop object needs no check of the gateway and the
+                // interface, as `ip6_route_del` of Linux.
                 r.table == m.table
                     && r.dst == m.dst
                     && r.prefix == m.prefix
-                    && m.gateway.is_none_or(|g| r.gateway == Some(g))
-                    && m.ifindex.is_none_or(|i| r.ifindex == i)
+                    && m.nhid.is_none_or(|id| r.nhid == id)
+                    && (r.nhid != 0
+                        || (m.gateway.is_none_or(|g| r.gateway == Some(g))
+                            && m.ifindex.is_none_or(|i| r.ifindex == i)))
                     && m.priority.is_none_or(|p| r.priority == p)
                     && m.protocol.is_none_or(|p| r.protocol == p)
             })
@@ -624,6 +671,7 @@ impl Table6 {
             Some(RTN_UNREACHABLE) => return Err(Errno::ENETUNREACH),
             Some(RTN_PROHIBIT) => return Err(Errno::EACCES),
             Some(RTN_BLACKHOLE) => return Err(Errno::EINVAL),
+            _ if route.is_some_and(|r| r.blackhole) => return Err(Errno::EINVAL),
             _ => {}
         }
         let (ifindex, hop, mtu) = match route {

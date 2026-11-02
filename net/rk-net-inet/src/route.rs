@@ -171,6 +171,12 @@ pub struct Route {
     pub flags: u32,
     /// The metrics.
     pub metrics: Metrics,
+    /// The ID of the nexthop object of the route, `RTA_NH_ID`, or 0. The gateway, the
+    /// interface and the flags then come from the nexthop.
+    pub nhid: u32,
+    /// Tells if the nexthop object of the route is a blackhole. The route then rejects its
+    /// packets as a route of the type `blackhole`.
+    pub blackhole: bool,
 }
 
 impl Route {
@@ -191,6 +197,8 @@ impl Route {
             ifindex,
             flags: 0,
             metrics: [0; RTAX_MAX as usize],
+            nhid: 0,
+            blackhole: false,
         }
     }
 
@@ -211,6 +219,7 @@ impl Route {
             RTN_BLACKHOLE => Some(Errno::EINVAL),
             RTN_PROHIBIT => Some(Errno::EACCES),
             RTN_THROW => Some(Errno::EAGAIN),
+            _ if self.blackhole => Some(Errno::EINVAL),
             _ => None,
         }
     }
@@ -242,6 +251,8 @@ pub struct Match {
     pub ifindex: Option<u32>,
     /// The priority.
     pub priority: Option<u32>,
+    /// The nexthop object.
+    pub nhid: Option<u32>,
 }
 
 impl Match {
@@ -258,6 +269,12 @@ impl Match {
             && (self.gateway.is_none() || self.gateway == r.gateway)
             && self.ifindex.is_none_or(|i| i == r.ifindex)
             && self.priority.is_none_or(|p| p == r.priority)
+            // A route through a nexthop object matches its ID, or a request without a next
+            // hop, as `fib_nh_match` of Linux.
+            && match self.nhid {
+                Some(id) => r.nhid == id,
+                None => r.nhid == 0 || (self.gateway.is_none() && self.ifindex.is_none()),
+            }
     }
 }
 
@@ -445,10 +462,11 @@ impl Table {
         out
     }
 
-    /// Removes the addresses of an interface, without a change to the routes.
+    /// Removes the addresses and the routes of an interface. The routes through nexthop
+    /// objects go away with their nexthops.
     pub fn remove_iface(&mut self, ifindex: u32) {
         self.addrs.retain(|a| a.ifindex != ifindex);
-        self.routes.retain(|r| r.ifindex != ifindex);
+        self.routes.retain(|r| r.ifindex != ifindex || r.nhid != 0);
     }
 
     /// The routes that the addresses of an interface need, as `fib_add_ifaddr` of Linux.
@@ -481,6 +499,8 @@ impl Table {
                 ifindex: link.ifindex,
                 flags: 0,
                 metrics: [0; RTAX_MAX as usize],
+                nhid: 0,
+                blackhole: false,
             };
             out.push(magic(RTN_LOCAL, a.local, 32, 0));
             if !link.up {
@@ -520,7 +540,8 @@ impl Table {
             let stale_kernel =
                 r.ifindex == link.ifindex && r.protocol == RTPROT_KERNEL as u8 && !want.contains(r);
             let stale_src = r.prefsrc.is_some_and(|s| !locals.contains(&s));
-            if stale_kernel || stale_src || (no_addrs && r.ifindex == link.ifindex) {
+            let flush = no_addrs && r.ifindex == link.ifindex && r.nhid == 0;
+            if stale_kernel || stale_src || flush {
                 let r = self.routes.remove(i);
                 // Linux sends no notification for a flush of the routes of a device.
                 if stale_kernel || !no_addrs {
@@ -540,9 +561,87 @@ impl Table {
     }
 
     /// Removes the routes of an interface that goes down, as `fib_sync_down_dev` of Linux
-    /// without force: the routes with the scope `host` stay. Linux sends no notification.
+    /// without force: the routes with the scope `host` stay. Linux sends no notification. The
+    /// routes through nexthop objects go away with their nexthops.
     pub fn link_down(&mut self, ifindex: u32) {
-        self.routes.retain(|r| r.ifindex != ifindex || r.scope == RT_SCOPE_HOST as u8);
+        self.routes
+            .retain(|r| r.ifindex != ifindex || r.scope == RT_SCOPE_HOST as u8 || r.nhid != 0);
+    }
+
+    /// Changes the routes through nexthop objects. `f` gives `None` for a route that does not
+    /// change, `Some(true)` for a route that it changed and `Some(false)` for a route to
+    /// remove. Gives the changed routes. Linux sends no notification for the removed routes,
+    /// as `fib_table_flush` from `nexthop_flush_dev` and `remove_nexthop`.
+    pub fn update_nh_routes(
+        &mut self,
+        mut f: impl FnMut(&mut Route) -> Option<bool>,
+    ) -> Vec<Route> {
+        let mut changed = Vec::new();
+        self.routes.retain_mut(|r| {
+            if r.nhid == 0 {
+                return true;
+            }
+            match f(r) {
+                None => true,
+                Some(true) => {
+                    changed.push(r.clone());
+                    true
+                }
+                Some(false) => false,
+            }
+        });
+        changed
+    }
+
+    /// The routes through the nexthop objects `ids`, as the `fi_list` of the nexthops of
+    /// Linux.
+    pub fn nh_routes<'a>(&'a self, ids: &'a [u32]) -> impl Iterator<Item = &'a Route> + 'a {
+        self.routes.iter().filter(|r| r.nhid != 0 && ids.contains(&r.nhid))
+    }
+
+    /// Checks the IPv4 gateway of a nexthop object and gives its interface and scope, as
+    /// `fib_check_nh_v4_gw` of Linux in the table `main`. `up` tells if an interface is up,
+    /// and gives `None` for an interface that is not there.
+    ///
+    /// # Errors
+    ///
+    /// Gives the error and the text of the extended ack of Linux.
+    pub fn check_nh_gateway(
+        &self,
+        gw: Addr,
+        oif: u32,
+        onlink: bool,
+        up: impl Fn(u32) -> Option<bool>,
+    ) -> core::result::Result<(u32, u8), (Option<&'static str>, Errno)> {
+        const BAD: &str = "Nexthop has invalid gateway";
+        if onlink {
+            match up(oif) {
+                None => return Err((Some("Nexthop device required for onlink"), Errno::ENODEV)),
+                Some(false) => return Err((Some("Nexthop device is not up"), Errno::ENETDOWN)),
+                Some(true) => {}
+            }
+            if self.addr_type(gw) != RTN_UNICAST {
+                return Err((Some(BAD), Errno::EINVAL));
+            }
+            return Ok((oif, RT_SCOPE_LINK as u8));
+        }
+        let found = match self.rule_lookup(&Flow::v4(gw, oif, self.loopback), RT_SCOPE_LINK as u8) {
+            Ok(r) => match r.error() {
+                Some(e) => return Err((Some(BAD), e)),
+                None => r,
+            },
+            Err(Errno::ESRCH) => return Err((Some(BAD), Errno::ENETUNREACH)),
+            Err(e) => return Err((Some(BAD), e)),
+        };
+        let kind = u32::from(found.kind);
+        if kind != RTN_UNICAST && kind != RTN_LOCAL {
+            return Err((Some(BAD), Errno::EINVAL));
+        }
+        match up(found.ifindex) {
+            Some(true) => Ok((found.ifindex, found.scope)),
+            Some(false) => Err((None, Errno::ENETDOWN)),
+            None => Err((Some("No egress device for nexthop gateway"), Errno::ENODEV)),
+        }
     }
 
     /// Puts a route at its place in the order. A new route goes before the routes with the

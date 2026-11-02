@@ -37,6 +37,7 @@ pub mod ipv4;
 pub mod ipv6;
 mod mcast6;
 pub mod neigh;
+mod nexthop;
 pub mod ports;
 mod procfs;
 pub mod route;
@@ -67,12 +68,14 @@ pub fn init() {
     rk_net::netlink::init();
     rtnl::init();
     rules::init();
+    nexthop::init();
     addrconf::init();
     procfs::init();
     rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af);
     rk_net::ioctl::set_ifconf(fib::ifconf);
     dev::add_notifier(fib::event);
     dev::add_notifier(addrconf::event);
+    dev::add_notifier(nexthop::event);
     dev::add_notifier(igmp::event);
     rk_net::sysctl::add_hook(addrconf::sysctl_hook);
     rk_net::ns::add_ops(ns_init, ns_exit);
@@ -98,6 +101,7 @@ fn ns_init() {}
 /// IPv4 and IPv6 in Linux.
 fn ns_exit() {
     tcp::ns_exit();
+    nexthop::ns_exit();
     stack6::ns_exit();
     stack::ns_exit();
     igmp::ns_exit();

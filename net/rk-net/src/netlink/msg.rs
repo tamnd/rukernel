@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
     NLA_TYPE_MASK, NLM_F_ACK_TLVS, NLM_F_CAPPED, NLM_F_MULTI, NLMSG_DONE, NLMSG_ERROR,
-    NLMSGERR_ATTR_MSG, NLMSGERR_ATTR_OFFS,
+    NLMSGERR_ATTR_MSG, NLMSGERR_ATTR_OFFS, NLMSGERR_ATTR_POLICY,
 };
 use rk_vfs::inode::Result;
 
@@ -264,13 +264,15 @@ pub struct ExtAck {
     pub msg: Option<&'static str>,
     /// The offset of the bad attribute, `NLMSGERR_ATTR_OFFS`.
     pub offs: Option<u32>,
+    /// The policy of the bad attribute, `NLMSGERR_ATTR_POLICY`.
+    pub policy: Option<super::policy::Policy>,
 }
 
 impl ExtAck {
     /// Tells if the ack of the error `err` has attributes, as `netlink_ack_tlv_len` of Linux.
     /// The offset goes only with an error.
     fn has_tlvs(&self, err: i32) -> bool {
-        self.msg.is_some() || (err != 0 && self.offs.is_some())
+        self.msg.is_some() || (err != 0 && (self.offs.is_some() || self.policy.is_some()))
     }
 
     /// Adds the attributes, as `netlink_ack_tlv_fill` of Linux.
@@ -282,6 +284,11 @@ impl ExtAck {
             && let Some(o) = self.offs
         {
             b.u32(NLMSGERR_ATTR_OFFS as u16, o);
+        }
+        if err != 0
+            && let Some(p) = self.policy
+        {
+            p.describe(b, NLMSGERR_ATTR_POLICY as u16);
         }
     }
 }

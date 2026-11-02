@@ -8437,6 +8437,172 @@ static int veth_child(void)
 	return failed;
 }
 
+/* The nexthop messages of <linux/nexthop.h>. musl has no copy of this header. */
+#define RK_RTM_NEWNEXTHOP 104
+#define RK_RTM_DELNEXTHOP 105
+#define RK_RTM_GETNEXTHOP 106
+#define RK_NHA_ID 1
+#define RK_NHA_GROUP 2
+#define RK_NHA_BLACKHOLE 4
+#define RK_NHA_OIF 5
+#define RK_NHA_GATEWAY 6
+#define RK_RTA_NH_ID 30
+
+/* struct nhmsg of <linux/nexthop.h>. */
+struct rk_nhmsg {
+	unsigned char nh_family, nh_scope, nh_protocol, resvd;
+	unsigned int nh_flags;
+};
+
+/* Starts the nexthop request `type` with the family `family` and the id `id` in m. */
+static void nh_msg(struct nlmsghdr *m, int type, int flags, int family, unsigned int id)
+{
+	memset(m, 0, NLMSG_LENGTH(sizeof(struct rk_nhmsg)));
+	m->nlmsg_len = NLMSG_LENGTH(sizeof(struct rk_nhmsg));
+	m->nlmsg_type = type;
+	m->nlmsg_flags = flags;
+	((struct rk_nhmsg *)NLMSG_DATA(m))->nh_family = family;
+	if (id)
+		nl_put(m, RK_NHA_ID, &id, 4);
+}
+
+/* Sends RTM_NEWROUTE or RTM_DELROUTE for 10.0.77.0/24 with the nexthop `id`, and `oif` if it is
+ * not 0. Gives the error of the ack. */
+static int nh_route(int fd, int type, unsigned int id, unsigned int oif)
+{
+	union {
+		struct nlmsghdr h;
+		char buf[256];
+	} m = { 0 };
+	m.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	m.h.nlmsg_type = type;
+	m.h.nlmsg_flags = type == RTM_NEWROUTE ? NLM_F_CREATE | NLM_F_EXCL : 0;
+	struct rtmsg *rt = NLMSG_DATA(&m.h);
+	rt->rtm_family = AF_INET;
+	rt->rtm_dst_len = 24;
+	rt->rtm_table = RT_TABLE_MAIN;
+	rt->rtm_protocol = RTPROT_STATIC;
+	rt->rtm_scope = RT_SCOPE_UNIVERSE;
+	rt->rtm_type = RTN_UNICAST;
+	unsigned int dst = htonl(0x0a004d00);
+	nl_put(&m.h, RTA_DST, &dst, 4);
+	nl_put(&m.h, RK_RTA_NH_ID, &id, 4);
+	if (oif)
+		nl_put(&m.h, RTA_OIF, &oif, 4);
+	return nl_talk(fd, &m.h);
+}
+
+/* Gives the source address that a UDP socket takes for 10.0.77.1, or 0. */
+static unsigned long nh_source(void)
+{
+	int u = socket(AF_INET, SOCK_DGRAM, 0);
+	struct sockaddr_in to = inet_addr4(0x0a004d01, 9), me;
+	socklen_t len = sizeof(me);
+	unsigned long a = 0;
+	if (connect(u, (struct sockaddr *)&to, sizeof(to)) == 0 &&
+	    getsockname(u, (struct sockaddr *)&me, &len) == 0)
+		a = ntohl(me.sin_addr.s_addr);
+	close(u);
+	return a;
+}
+
+/* The nexthop objects of `ip nexthop`, as net/ipv4/nexthop.c of Linux, in a new network
+ * namespace: a gateway, a blackhole, a group, and a route with RTA_NH_ID. */
+static int nexthop_child(void)
+{
+	failed = 0;
+	check("nexthop: unshare of the network namespace", unshare(CLONE_NEWNET) == 0);
+	check("nexthop: lo gets 10.88.0.1/24 and goes up", if_up_addr("lo", 0x0a580001) == 0);
+	int nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	unsigned int lo = if_nametoindex("lo");
+	union {
+		struct nlmsghdr h;
+		char buf[512];
+	} m;
+
+	/* ip nexthop add id 10 via 10.88.0.2 dev lo */
+	unsigned int gw = htonl(0x0a580002);
+	nh_msg(&m.h, RK_RTM_NEWNEXTHOP, NLM_F_CREATE | NLM_F_EXCL, AF_INET, 10);
+	nl_put(&m.h, RK_NHA_OIF, &lo, 4);
+	nl_put(&m.h, RK_NHA_GATEWAY, &gw, 4);
+	check("nexthop: RTM_NEWNEXTHOP adds a gateway", nl_talk(nl, &m.h) == 0);
+	nh_msg(&m.h, RK_RTM_NEWNEXTHOP, NLM_F_CREATE | NLM_F_EXCL, AF_INET, 10);
+	nl_put(&m.h, RK_NHA_OIF, &lo, 4);
+	check("nexthop: the same id again gives EEXIST", nl_talk(nl, &m.h) == -EEXIST);
+	nh_msg(&m.h, RK_RTM_NEWNEXTHOP, NLM_F_CREATE, AF_INET, 11);
+	nl_put(&m.h, RK_NHA_BLACKHOLE, NULL, 0);
+	check("nexthop: RTM_NEWNEXTHOP adds a blackhole", nl_talk(nl, &m.h) == 0);
+	nh_msg(&m.h, RK_RTM_NEWNEXTHOP, NLM_F_CREATE, AF_INET, 12);
+	check("nexthop: a nexthop without a device gives EINVAL", nl_talk(nl, &m.h) == -EINVAL);
+
+	/* ip nexthop add id 20 group 10 */
+	unsigned int grp[4] = { 10, 0, 10, 0 };
+	nh_msg(&m.h, RK_RTM_NEWNEXTHOP, NLM_F_CREATE, AF_UNSPEC, 20);
+	nl_put(&m.h, RK_NHA_GROUP, grp, 16);
+	check("nexthop: a group with an id two times gives EINVAL", nl_talk(nl, &m.h) == -EINVAL);
+	nh_msg(&m.h, RK_RTM_NEWNEXTHOP, NLM_F_CREATE, AF_UNSPEC, 20);
+	nl_put(&m.h, RK_NHA_GROUP, grp, 8);
+	check("nexthop: RTM_NEWNEXTHOP adds a group", nl_talk(nl, &m.h) == 0);
+
+	/* ip nexthop get id 20 */
+	char reply[1024];
+	nh_msg(&m.h, RK_RTM_GETNEXTHOP, 0, AF_UNSPEC, 20);
+	long n = nl_ask(nl, &m.h, reply, sizeof(reply));
+	struct nlmsghdr *r = (struct nlmsghdr *)reply;
+	int group_ok = 0;
+	if (n > 0 && r->nlmsg_type == RK_RTM_NEWNEXTHOP) {
+		int len = r->nlmsg_len - NLMSG_LENGTH(sizeof(struct rk_nhmsg));
+		struct rtattr *a = (struct rtattr *)((char *)NLMSG_DATA(r) + sizeof(struct rk_nhmsg));
+		for (; RTA_OK(a, len); a = RTA_NEXT(a, len))
+			if (a->rta_type == RK_NHA_GROUP)
+				group_ok = RTA_PAYLOAD(a) == 8 && *(unsigned int *)RTA_DATA(a) == 10;
+	}
+	check("nexthop: RTM_GETNEXTHOP gives the group", group_ok);
+
+	/* ip nexthop show */
+	nh_msg(&m.h, RK_RTM_GETNEXTHOP, NLM_F_DUMP, AF_UNSPEC, 0);
+	n = nl_ask(nl, &m.h, reply, sizeof(reply));
+	int count = 0, done = 0;
+	for (int i = 0; i < 4 && !done && n > 0; i++) {
+		for (r = (struct nlmsghdr *)reply; NLMSG_OK(r, n); r = NLMSG_NEXT(r, n)) {
+			count += r->nlmsg_type == RK_RTM_NEWNEXTHOP;
+			done |= r->nlmsg_type == NLMSG_DONE;
+		}
+		if (!done)
+			n = recv(nl, reply, sizeof(reply), 0);
+	}
+	check("nexthop: the dump gives the three nexthops", count == 3);
+
+	/* ip route add 10.0.77.0/24 nhid 20 */
+	check("nexthop: a route with a missing nexthop gives EINVAL",
+	      nh_route(nl, RTM_NEWROUTE, 99, 0) == -EINVAL);
+	check("nexthop: a route with a nexthop and a device gives EINVAL",
+	      nh_route(nl, RTM_NEWROUTE, 20, lo) == -EINVAL);
+	check("nexthop: RTM_NEWROUTE takes RTA_NH_ID", nh_route(nl, RTM_NEWROUTE, 20, 0) == 0);
+	check("nexthop: the route goes through the group", nh_source() == 0x0a580001);
+
+	/* ip nexthop del id 10: the group and the route go away with it. */
+	nh_msg(&m.h, RK_RTM_DELNEXTHOP, 0, AF_UNSPEC, 10);
+	check("nexthop: RTM_DELNEXTHOP removes the gateway", nl_talk(nl, &m.h) == 0);
+	nh_msg(&m.h, RK_RTM_GETNEXTHOP, 0, AF_UNSPEC, 20);
+	check("nexthop: the group goes away with its last member", nl_talk(nl, &m.h) == -ENOENT);
+	check("nexthop: the route goes away with its nexthop", nh_source() == 0);
+	check("nexthop: RTM_NEWROUTE through the blackhole", nh_route(nl, RTM_NEWROUTE, 11, 0) == 0);
+	check("nexthop: RTM_DELROUTE with RTA_NH_ID", nh_route(nl, RTM_DELROUTE, 11, 0) == 0);
+	close(nl);
+	return failed;
+}
+
+static void test_nexthop(void)
+{
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(nexthop_child());
+	int status;
+	check("the checks of the nexthops pass",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 /* A veth pair, as drivers/net/veth.c of Linux, with its ends in two network namespaces. */
 static void test_veth(void)
 {
@@ -8494,6 +8660,7 @@ static void test_inet(int port)
 	test_tun_mq();
 	test_tun6();
 	test_veth();
+	test_nexthop();
 	test_slip();
 	test_tcp_lo();
 	test_tcp_host(port);

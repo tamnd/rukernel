@@ -26,6 +26,7 @@ use crate::fib::{self, IFADDR_LEN, RTMSG_LEN, now_cs};
 use crate::ip::{self, Ip};
 use crate::ipv6;
 use crate::mcast6;
+use crate::nexthop;
 use crate::route::{INFINITY, RTAX_MAX};
 use crate::route6::{Addr6, Changes6, Match6, PRIO_USER, Route6};
 use crate::rules::Flow;
@@ -43,11 +44,12 @@ use rk_abi::native::if_addr::{
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_DUMP_FILTERED, NLM_F_EXCL, NLM_F_MULTI};
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RT_TABLE_MAIN, RTA_CACHEINFO, RTA_DEL_REASON, RTA_DPORT,
-    RTA_DST, RTA_EXPIRES, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK, RTA_METRICS, RTA_OIF,
-    RTA_PREF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC, RTA_TABLE, RTA_UID, RTM_DELADDR,
-    RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_NOTIFY, RTM_F_PREFIX, RTM_GETADDR,
-    RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_BLACKHOLE, RTN_LOCAL, RTN_PROHIBIT, RTN_UNICAST,
-    RTN_UNREACHABLE, RTNLGRP_IPV6_IFADDR, RTNLGRP_IPV6_ROUTE, RTPROT_BOOT,
+    RTA_DST, RTA_ENCAP, RTA_EXPIRES, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK, RTA_METRICS,
+    RTA_MULTIPATH, RTA_NH_ID, RTA_OIF, RTA_PREF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC,
+    RTA_TABLE, RTA_UID, RTM_DELADDR, RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_NOTIFY,
+    RTM_F_PREFIX, RTM_GETADDR, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_BLACKHOLE, RTN_LOCAL,
+    RTN_PROHIBIT, RTN_UNICAST, RTN_UNREACHABLE, RTNLGRP_IPV6_IFADDR, RTNLGRP_IPV6_ROUTE,
+    RTPROT_BOOT,
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{AF_INET6, IFF_NOARP};
@@ -143,7 +145,17 @@ pub(crate) fn fill_route(r: &Route6, ty: u32, portid: u32, seq: u32, flags: u32)
     h[5] = r.protocol;
     h[6] = RT_SCOPE_UNIVERSE as u8;
     h[7] = r.kind;
-    let rflags = if is_prefix_route(r) { RTM_F_PREFIX } else { 0 };
+    let mut rflags = if is_prefix_route(r) { RTM_F_PREFIX } else { 0 };
+    // A route through a nexthop object shows the nexthop, as the compat mode of Linux.
+    let nh = (r.nhid != 0).then(|| nexthop::compat(r.nhid)).flatten();
+    if let Some(c) = &nh {
+        if c.blackhole {
+            h[7] = RTN_BLACKHOLE as u8;
+        }
+        if !c.group {
+            rflags |= c.paths.first().map_or(0, |p| u32::from(p.flags));
+        }
+    }
     h[8..12].copy_from_slice(&rflags.to_ne_bytes());
     b.fixed(&h);
     b.u32(RTA_TABLE as u16, r.table);
@@ -154,13 +166,26 @@ pub(crate) fn fill_route(r: &Route6, ty: u32, portid: u32, seq: u32, flags: u32)
         b.put(RTA_PREFSRC as u16, &s);
     }
     fib::put_metrics(&mut b, &r.metrics);
-    if let Some(gw) = r.gateway {
-        b.put(RTA_GATEWAY as u16, &gw);
-    }
-    if r.ifindex != 0 {
-        b.u32(RTA_OIF as u16, r.ifindex);
-    }
     b.u32(RTA_PRIORITY as u16, r.priority);
+    if r.nhid != 0 {
+        b.u32(RTA_NH_ID as u16, r.nhid);
+    }
+    match &nh {
+        Some(c) if c.group => nexthop::put_multipath(&mut b, &c.paths, AF_INET6),
+        Some(c) => {
+            for p in &c.paths {
+                nexthop::put_path(&mut b, p, AF_INET6);
+            }
+        }
+        None => {
+            if let Some(gw) = r.gateway {
+                b.put(RTA_GATEWAY as u16, &gw);
+            }
+            if r.ifindex != 0 {
+                b.u32(RTA_OIF as u16, r.ifindex);
+            }
+        }
+    }
     put_cacheinfo(&mut b, r.expires);
     // The preference of the route: medium.
     b.u8(RTA_PREF as u16, 0);
@@ -187,7 +212,7 @@ fn notify_addr(a: &Addr6, ty: u32, origin: Origin) {
 }
 
 /// Sends the notification of a route to `RTNLGRP_IPV6_ROUTE`, as `inet6_rt_notify`.
-fn notify_route(r: &Route6, ty: u32, origin: Origin, flags: u32) {
+pub(crate) fn notify_route(r: &Route6, ty: u32, origin: Origin, flags: u32) {
     if netlink::has_listeners(RTNLGRP_IPV6_ROUTE) || origin.echo {
         let m = fill_route(r, ty, origin.portid, origin.seq, flags);
         netlink::notify(RTNLGRP_IPV6_ROUTE, m, origin);
@@ -380,6 +405,7 @@ pub(crate) fn ra_route(r: Route6, delete: bool) {
             ifindex: Some(r.ifindex),
             priority: Some(r.priority),
             protocol: None,
+            nhid: None,
         };
         let gone = ROUTES6.lock().delete_route(&m);
         if let Ok(r) = gone {
@@ -637,8 +663,16 @@ fn to_route(req: &Request<'_>) -> Result<Route6> {
     for ty in [RTA_DST, RTA_SRC, RTA_GATEWAY, RTA_PREFSRC] {
         a.addr6(ty)?;
     }
-    for ty in [RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTA_EXPIRES] {
+    for ty in [RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTA_EXPIRES, RTA_NH_ID] {
         a.u32(ty)?;
+    }
+    let nhid = a.u32(RTA_NH_ID)?.unwrap_or(0);
+    if a.has(RTA_NH_ID)
+        && [RTA_GATEWAY, RTA_OIF, RTA_MULTIPATH, RTA_ENCAP].iter().any(|t| a.has(*t))
+    {
+        return Err(
+            req.error("Nexthop specification and nexthop id are mutually exclusive", Errno::EINVAL)
+        );
     }
     let prefix = h[1];
     // The kernel has no routes by source, as Linux without `CONFIG_IPV6_SUBTREES`.
@@ -656,6 +690,7 @@ fn to_route(req: &Request<'_>) -> Result<Route6> {
     r.kind = h[7];
     r.gateway = a.addr6(RTA_GATEWAY)?.filter(|g| *g != ip::ANY);
     r.prefsrc = a.addr6(RTA_PREFSRC)?.filter(|s| *s != ip::ANY);
+    r.nhid = nhid;
     r.priority = a.u32(RTA_PRIORITY)?.filter(|p| *p != 0).unwrap_or(PRIO_USER);
     if let Some(m) = a.get(RTA_METRICS) {
         r.metrics = crate::rtnl::to_metrics(m)?;
@@ -684,6 +719,13 @@ fn check_route(r: &mut Route6) -> Result<()> {
         _ => return Err(Errno::EINVAL),
     }
     let t = ROUTES6.lock();
+    // `nexthop::check_route6` checks a nexthop object.
+    if r.nhid != 0 {
+        return match r.prefsrc {
+            Some(src) if !t.is_local(&src) => Err(Errno::EINVAL),
+            _ => Ok(()),
+        };
+    }
     if let Some(gw) = r.gateway {
         if t.is_local(&gw) || ipv6::is_multicast(&gw) {
             return Err(Errno::EINVAL);
@@ -716,9 +758,19 @@ fn check_route(r: &mut Route6) -> Result<()> {
 /// `RTM_NEWROUTE`, as `inet6_rtm_newroute` of Linux.
 fn newroute(req: &Request<'_>) -> Result<()> {
     let mut r = to_route(req)?;
+    if r.nhid != 0 {
+        nexthop::check_route6(req, &mut r)?;
+    }
     check_route(&mut r)?;
     let flags = u32::from(req.hdr.flags);
-    ROUTES6.lock().insert_route(r.clone(), flags)?;
+    {
+        let mut t = ROUTES6.lock();
+        // The nexthop can change after the checks: copy it again under the lock.
+        if r.nhid != 0 {
+            nexthop::refresh6(&mut r)?;
+        }
+        t.insert_route(r.clone(), flags)?;
+    }
     notify_route(&r, RTM_NEWROUTE, req.origin(), flags & (NLM_F_CREATE | NLM_F_EXCL));
     Ok(())
 }
@@ -727,6 +779,9 @@ fn newroute(req: &Request<'_>) -> Result<()> {
 fn delroute(req: &Request<'_>) -> Result<()> {
     let (h, a) = req.parse(RTMSG_LEN, RTA_MAX)?;
     let r = to_route(req)?;
+    if r.nhid != 0 {
+        nexthop::exists(req, r.nhid)?;
+    }
     let m = Match6 {
         table: r.table,
         dst: r.dst,
@@ -735,6 +790,7 @@ fn delroute(req: &Request<'_>) -> Result<()> {
         ifindex: (r.ifindex != 0).then_some(r.ifindex),
         priority: a.u32(RTA_PRIORITY)?.filter(|p| *p != 0),
         protocol: (h[5] != 0).then_some(h[5]),
+        nhid: (r.nhid != 0).then_some(r.nhid),
     };
     let gone = ROUTES6.lock().delete_route(&m)?;
     notify_route(&gone, RTM_DELROUTE, req.origin(), 0);
