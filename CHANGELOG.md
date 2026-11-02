@@ -11,6 +11,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - spec records the decision of open question 2: rukernel uses its own `rk-frame`, and OSTD stays a reference (#23). Open question 1, CortenMM or VMAs, moves to the end of R5, because the `will-it-scale` run needs a host with KVM (#22).
 - The kernel option `rk.missing=1` logs each name under /proc and /sys that a program looks for and that the kernel does not have, with the name of the program. `RK_CMDLINE` adds words to the command line of a boot test. tools/missing/report.py makes a report for an image from the boot log, with the Linux code of each missing file, and tools/missing has the reports of the `alpine` and `debian` boot tests (#543).
 
+### Fixed
+
+- The timers of the network stack run at most one time in each millisecond, and not at each poll, so `tcp_stream` and `udp_stream` of tools/bench are faster (#465). Each TCP and UDP send polls the devices, and each poll ran the timers of TCP, of the neighbour tables, of the fragments and of IPv6. On x86_64, these timers took about 10% of the time of `tcp_stream`. The timers count in milliseconds, so a run in the same millisecond had no work. At a load of 0.1 to 1.7, the median of 5 runs on arm64 went from 76.8 to 93.7 MB/s for `tcp_stream` and from 8.56 to 9.58 MB/s for `udp_stream`. Linux gave 100 and 7.63 MB/s.
+
 ## [0.4.21] - 2026-11-01
 
 ### Added
