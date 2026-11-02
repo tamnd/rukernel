@@ -33,11 +33,13 @@ Each value is the median of the runs. The value in parentheses is the interquart
 | mem | `mmap_mt` | `mmap` in one thread per CPU at the same time, wall time | ns | 65703 (23%) | 8382 (17%) | 0.13 |  |
 | mem | `cow` | write fault that copies a 4 KiB page that a child of fork maps | ns | 77460 (12%) | 14776 (6%) | 0.19 |  |
 | net | `tcp_rr` | TCP round trip of 1 byte on loopback | us | 829 (11%) | 277 (6%) | 0.33 |  |
-| net | `tcp_stream` | TCP throughput on loopback, writes of 64 KiB | MB/s | 33.1 (8%) | 22.2 (7%) | 1.49 |  |
+| net | `tcp_stream` | TCP throughput on loopback, writes of 64 KiB | MB/s | 37.3 (15%) | 86.3 (9%) | 0.43 |  |
 | net | `udp_rr` | UDP round trip of 1 byte on loopback | us | 594 (11%) | 294 (9%) | 0.50 |  |
-| net | `udp_stream` | UDP throughput on loopback, datagrams of 1 KiB | MB/s | 6.02 (5%) | 4.73 (5%) | 1.27 |  |
+| net | `udp_stream` | UDP throughput on loopback, datagrams of 1 KiB | MB/s | 6.63 (3%) | 14.8 (8%) | 0.45 |  |
 
 Red rows: none.
+
+The rows `tcp_stream` and `udp_stream` come from a later run of run.py with `--only` and `--runs 5` on server2 at a load average of 0.1 to 1.7, with rukernel 3bb38c1 and the loopback changes of #465 (the timers of the stack, fewer copies, and no second checksum on loopback). Linux is the kernel of the host distribution. The other rows and the logs in `logs` are from the run of the commit above. In the same session, rukernel 3bb38c1 without the changes gave 84.7 MB/s and 10.7 MB/s.
 
 To make this table again on a host with QEMU and a C compiler for static musl programs:
 
