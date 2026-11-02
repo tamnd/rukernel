@@ -293,7 +293,7 @@ pub(crate) fn flush_neigh(ifindex: u32) {
 
 /// Sends the changes of the neighbour table to `RTNLGRP_NEIGH`, as `neigh_update_notify` of
 /// Linux. The caller does not hold the lock of the table.
-fn neigh_notify() {
+pub(crate) fn neigh_notify() {
     let changes = NEIGH6.lock().take_changes();
     for c in changes {
         crate::rtnl::notify_neigh(AF_INET6, c);
