@@ -28,6 +28,7 @@ use crate::ipv6;
 use crate::mcast6;
 use crate::route::{INFINITY, RTAX_MAX};
 use crate::route6::{Addr6, Changes6, Match6, PRIO_USER, Route6};
+use crate::rules::Flow;
 use crate::stack;
 use crate::stack6::{self, ROUTES6};
 use alloc::collections::BTreeMap;
@@ -790,7 +791,19 @@ fn getroute(req: &Request<'_>) -> Result<()> {
     let t = ROUTES6.lock();
     // A lookup of `::` goes to the loopback address, as `ip6_route_output`.
     let to = if dst == ip::ANY { ip::LOOPBACK } else { dst };
-    let (next, route) = t.lookup_route(&to, oif)?;
+    let fl = Flow {
+        dst: to,
+        src: (src != ip::ANY).then_some(src),
+        iif: t.loopback(),
+        oif,
+        mark,
+        uid,
+        proto: a.u8(RTA_IP_PROTO).ok().flatten().unwrap_or(0),
+        sport: a.get(RTA_SPORT).and_then(|d| d.first_chunk()).map_or(0, |p| u16::from_be_bytes(*p)),
+        dport: a.get(RTA_DPORT).and_then(|d| d.first_chunk()).map_or(0, |p| u16::from_be_bytes(*p)),
+        ..Flow::default()
+    };
+    let (next, route) = t.lookup_flow(&fl)?;
     if rflags & RTM_F_FIB_MATCH != 0 {
         let r = route.ok_or(Errno::ENETUNREACH)?;
         let m = fill_route(r, RTM_NEWROUTE, req.portid, req.hdr.seq, 0);

@@ -13,6 +13,7 @@
 use crate::ip::{self, Ip};
 use crate::ipv4::{self, DF, HLEN, Header, MF, OFFSET_MASK};
 use crate::neigh::Redirects;
+use crate::rules::Flow;
 use crate::stack::{self, COUNTERS, ROUTES, count, now_ms};
 use crate::stack6::{self, COUNTERS6, ROUTES6};
 use crate::{frag, ipv6, route};
@@ -106,7 +107,8 @@ pub(crate) fn forward4(dev: &NetDevice, h: &Header, mut frame: NetBuf, host: boo
         if t.is_local(h.src) {
             return true;
         }
-        t.lookup_input(h.dst)
+        // The rules look at the input interface and at the source, as `ip_route_input_slow`.
+        t.lookup_input_flow(&Flow::v4(h.dst, 0, ifindex).with_src4(h.src))
     };
     let next = match r {
         Ok((n, kind)) if u32::from(kind) == RTN_UNICAST && !n.broadcast => n,

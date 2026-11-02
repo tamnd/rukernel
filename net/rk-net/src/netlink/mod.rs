@@ -29,7 +29,7 @@ use rk_abi::native::netlink::{
     NETLINK_ADD_MEMBERSHIP, NETLINK_BROADCAST_ERROR, NETLINK_CAP_ACK, NETLINK_DROP_MEMBERSHIP,
     NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, NETLINK_LIST_MEMBERSHIPS, NETLINK_LISTEN_ALL_NSID,
     NETLINK_NO_ENOBUFS, NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_FILTERED,
-    NLM_F_ECHO, NLM_F_MULTI, NLM_F_REQUEST, NLMSG_MIN_TYPE,
+    NLM_F_ECHO, NLM_F_REQUEST, NLMSG_MIN_TYPE,
 };
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::rtnetlink::{
@@ -93,6 +93,8 @@ struct Dump {
     split: bool,
     /// The flags that the handler added to each message, as `cb->answer_flags` of Linux.
     answer: u16,
+    /// The extended ack for `NLMSG_DONE`, or `None` if the socket did not ask for it.
+    ext: Option<msg::ExtAck>,
 }
 
 struct State {
@@ -323,8 +325,9 @@ impl NetlinkSocket {
         }
         let last = dump.msgs.is_empty() && !(dump.split && !buf.is_empty());
         if last && buf.len() + DONE_LEN <= size {
-            let mut done = msg::done(dump.seq, dump.portid, dump.status);
-            done[6..8].copy_from_slice(&(NLM_F_MULTI as u16 | dump.answer).to_ne_bytes());
+            let mut done = msg::done_ext(dump.seq, dump.portid, dump.status, dump.ext.as_ref());
+            let flags = u16::from_ne_bytes([done[6], done[7]]) | dump.answer;
+            done[6..8].copy_from_slice(&flags.to_ne_bytes());
             buf.extend_from_slice(&done);
             s.dump = None;
         }
@@ -339,8 +342,9 @@ impl NetlinkSocket {
         for m in msg::messages(data) {
             let Some(h) = Header::parse(m) else { break };
             let mut err = 0;
+            let ext = Cell::new(msg::ExtAck::default());
             if h.flags & NLM_F_REQUEST as u16 != 0 && u32::from(h.ty) >= NLMSG_MIN_TYPE {
-                match rtnl_rcv(self, h, m) {
+                match rtnl_rcv(self, h, m, &ext) {
                     Ok(Flow::Done) => {}
                     // A dump that starts sends no ack.
                     Ok(Flow::Dump) => continue,
@@ -348,8 +352,11 @@ impl NetlinkSocket {
                 }
             }
             if h.flags & NLM_F_ACK as u16 != 0 || err != 0 {
-                let cap_ack = self.state.lock().flags & F_CAP_ACK != 0;
-                self.deliver(msg::ack(m, err, portid, cap_ack), 0, 0);
+                let flags = self.state.lock().flags;
+                let cap_ack = flags & F_CAP_ACK != 0;
+                let ext = ext.get();
+                let ext = (flags & F_EXT_ACK != 0).then_some(&ext);
+                self.deliver(msg::ack_ext(m, err, portid, cap_ack, ext), 0, 0);
             }
         }
     }
@@ -362,8 +369,10 @@ impl NetlinkSocket {
         result: Result<Vec<Vec<u8>>>,
         split: bool,
         answer: u16,
+        ext: msg::ExtAck,
     ) -> Result<()> {
         let mut s = self.state.lock();
+        let ext = (s.flags & F_EXT_ACK != 0).then_some(ext);
         if s.dump.is_some() {
             return Err(Errno::EBUSY);
         }
@@ -378,6 +387,7 @@ impl NetlinkSocket {
             status,
             split,
             answer,
+            ext,
         });
         self.dump_step(&mut s);
         drop(s);
@@ -782,6 +792,7 @@ pub struct Request<'a> {
     pub strict: bool,
     sock: &'a NetlinkSocket,
     filtered: Cell<bool>,
+    ext: &'a Cell<msg::ExtAck>,
 }
 
 impl Request<'_> {
@@ -811,6 +822,35 @@ impl Request<'_> {
     /// own messages.
     pub fn set_filtered(&self) {
         self.filtered.set(true);
+    }
+
+    /// Sets the message of the extended ack, as `NL_SET_ERR_MSG` of Linux. Gives `e`, for a
+    /// `return Err(req.error("...", e))`.
+    pub fn error(&self, text: &'static str, e: Errno) -> Errno {
+        let mut x = self.ext.get();
+        x.msg = Some(text);
+        self.ext.set(x);
+        e
+    }
+
+    /// Sets the message of the extended ack and the bad attribute, as `NL_SET_ERR_MSG_ATTR` of
+    /// Linux. `data` is the payload of the attribute in the request. Gives `e`.
+    pub fn attr_error(&self, text: &'static str, data: &[u8], e: Errno) -> Errno {
+        self.error(text, e);
+        self.bad_attr(data);
+        e
+    }
+
+    /// Sets the bad attribute of the extended ack, as `NL_SET_BAD_ATTR` of Linux. The offset is
+    /// the place of the header of the attribute from the start of the message.
+    pub fn bad_attr(&self, data: &[u8]) {
+        let base = self.msg.as_ptr() as usize;
+        let at = (data.as_ptr() as usize).wrapping_sub(base);
+        if at >= HDRLEN + msg::ATTR_HDRLEN && at <= self.msg.len() {
+            let mut x = self.ext.get();
+            x.offs = Some((at - msg::ATTR_HDRLEN) as u32);
+            self.ext.set(x);
+        }
     }
 
     /// The origin of a change that the request makes, for `notify`.
@@ -888,7 +928,7 @@ enum Flow {
 const KIND_GET: u16 = 2;
 
 /// Runs one request, as `rtnetlink_rcv_msg` of Linux.
-fn rtnl_rcv(sock: &NetlinkSocket, h: Header, m: &[u8]) -> Result<Flow> {
+fn rtnl_rcv(sock: &NetlinkSocket, h: Header, m: &[u8], ext: &Cell<msg::ExtAck>) -> Result<Flow> {
     if u32::from(h.ty) > RTM_MAX {
         return Err(Errno::EOPNOTSUPP);
     }
@@ -902,8 +942,15 @@ fn rtnl_rcv(sock: &NetlinkSocket, h: Header, m: &[u8]) -> Result<Flow> {
         return Err(Errno::EPERM);
     }
     let strict = sock.state.lock().flags & F_STRICT_CHK != 0;
-    let req =
-        Request { hdr: h, msg: m, portid: sock.portid(), strict, sock, filtered: Cell::new(false) };
+    let req = Request {
+        hdr: h,
+        msg: m,
+        portid: sock.portid(),
+        strict,
+        sock,
+        filtered: Cell::new(false),
+        ext,
+    };
     let handlers = HANDLERS.lock().clone();
     let find = |f: u8, dump: bool| {
         handlers
@@ -919,7 +966,7 @@ fn rtnl_rcv(sock: &NetlinkSocket, h: Header, m: &[u8]) -> Result<Flow> {
             _ => (dump_all(&handlers, &req, family, h.ty), true),
         };
         let answer = if req.filtered.get() { NLM_F_DUMP_FILTERED as u16 } else { 0 };
-        sock.start_dump(h, result, split, answer)?;
+        sock.start_dump(h, result, split, answer, ext.get())?;
         return Ok(Flow::Dump);
     }
     let Some(doit) = find(family, false).or_else(|| find(0, false)).and_then(|x| x.doit) else {
