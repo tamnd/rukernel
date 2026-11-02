@@ -144,6 +144,54 @@ fn advance(last: u64, now: u64, period: u64) -> (u64, u64) {
     (ticks, last.saturating_add(ticks * period).min(now))
 }
 
+/// Set while a CPU changes the tick count.
+static TICK_BUSY: AtomicBool = AtomicBool::new(false);
+/// A CPU other than CPU 0 added ticks since the last tick of CPU 0.
+static TICK_OTHER: AtomicBool = AtomicBool::new(false);
+
+/// Adds the ticks that passed to the tick count at a timer interrupt. CPU 0 adds at least one
+/// tick at each interrupt, as `advance` tells. Another CPU adds the ticks only if CPU 0 is two
+/// periods or more late, as each CPU of Linux can do `tick_do_update_jiffies64`. One CPU at a
+/// time changes the count and the vDSO, and a CPU that finds another CPU at work does nothing.
+///
+/// Before, only CPU 0 counted the ticks. Under QEMU without KVM, the host can stop one virtual
+/// CPU for more than one second, for example while another CPU spins on a lock that it holds.
+/// The clock then stood still, and the tick count jumped at the next interrupt of CPU 0, so a
+/// timeout that started in that time came too early (#417). Each CPU cannot add only the whole
+/// periods that passed, because the interrupt of a tick can come a little before the end of its
+/// period, and then a sleep of one tick takes two.
+fn tick() {
+    let cpu0 = super::cpu::id() == 0;
+    let period = TSC_HZ.load(Ordering::Relaxed) / HZ;
+    if !cpu0 && period == 0 {
+        return;
+    }
+    if TICK_BUSY.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let last = TICK_TSC.load(Ordering::Relaxed);
+    let now = rdtsc();
+    let late = now.saturating_sub(last);
+    // CPU 0 does not add the tick of a period that another CPU added already.
+    let add = if cpu0 {
+        !(TICK_OTHER.swap(false, Ordering::Relaxed) && late < period)
+    } else {
+        late >= 2 * period
+    };
+    if add {
+        if !cpu0 {
+            TICK_OTHER.store(true, Ordering::Relaxed);
+        }
+        let (ticks, base) = advance(last, now, period);
+        // `clock_ns` reads the tick count before and after the time stamp counter of the tick, so
+        // the counter must change first.
+        TICK_TSC.store(base, Ordering::Release);
+        TICKS.fetch_add(ticks, Ordering::Release);
+        crate::vdso::tick();
+    }
+    TICK_BUSY.store(false, Ordering::Release);
+}
+
 /// The time stamp counter at the last tick and `TSC_MULT`, for the data page of the vDSO.
 pub(crate) fn tsc_state() -> (u64, u64) {
     (TICK_TSC.load(Ordering::Relaxed), TSC_MULT.load(Ordering::Relaxed))
@@ -356,15 +404,7 @@ pub(crate) fn send_ipi(dest: u32, command: u32) {
 pub(crate) fn handle(vector: u8) -> bool {
     match vector {
         TIMER_VECTOR => {
-            if super::cpu::id() == 0 {
-                let period = TSC_HZ.load(Ordering::Relaxed) / HZ;
-                let (ticks, base) = advance(TICK_TSC.load(Ordering::Relaxed), rdtsc(), period);
-                // `clock_ns` reads the tick count before and after the time stamp counter of the
-                // tick, so the counter must change first.
-                TICK_TSC.store(base, Ordering::Release);
-                TICKS.fetch_add(ticks, Ordering::Release);
-                crate::vdso::tick();
-            }
+            tick();
             eoi();
         }
         ERROR_VECTOR => {
