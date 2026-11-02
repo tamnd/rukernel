@@ -5106,6 +5106,47 @@ static void test_vmstat(void)
 	umount("/proc");
 }
 
+/* The files of a process that systemd and the LTP read: limits, loginuid, sessionid,
+ * personality, wchan, schedstat and mountstats. */
+static void test_proc_pid_files(void)
+{
+	char buf[4096], want[128];
+	struct rlimit rl;
+	unsigned long long ns, delay, runs;
+	pid_t pid;
+	int status;
+
+	/* test_proc unmounts /proc at its end. */
+	mkdir("/proc", 0555);
+	check("mount proc for the files of a process", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	getrlimit(RLIMIT_NOFILE, &rl);
+	snprintf(want, sizeof(want), "\nMax open files            %-20llu %-20llu files     \n",
+		 (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max);
+	check("/proc/self/limits", read_file("/proc/self/limits", buf, sizeof(buf)) > 0 &&
+					   !strncmp(buf, "Limit                     Soft Limit           Hard Limit           Units     \n", 79) &&
+					   strstr(buf, want) && strstr(buf, "\nMax cpu time              unlimited            unlimited            seconds   \n"));
+	check("/proc/self/loginuid is not set", read_file("/proc/self/loginuid", buf, sizeof(buf)) == 10 && !strcmp(buf, "4294967295"));
+	check("/proc/self/sessionid is not set", read_file("/proc/self/sessionid", buf, sizeof(buf)) == 10 && !strcmp(buf, "4294967295"));
+	check("/proc/self/personality", read_file("/proc/self/personality", buf, sizeof(buf)) == 9 && !strcmp(buf, "00000000\n"));
+	check("/proc/self/wchan", read_file("/proc/self/wchan", buf, sizeof(buf)) == 1 && !strcmp(buf, "0"));
+	check("/proc/self/schedstat", read_file("/proc/self/schedstat", buf, sizeof(buf)) > 0 &&
+					      sscanf(buf, "%llu %llu %llu", &ns, &delay, &runs) == 3 && buf[strlen(buf) - 1] == '\n');
+	check("/proc/self/mountstats", read_file("/proc/self/mountstats", buf, sizeof(buf)) > 0 &&
+					       strstr(buf, "device proc mounted on /proc with fstype proc\n"));
+	pid = fork();
+	if (pid == 0) {
+		int ok = write_text("/proc/self/loginuid", "1000") == 0 &&
+			 read_file("/proc/self/loginuid", buf, sizeof(buf)) > 0 && !strcmp(buf, "1000") &&
+			 read_file("/proc/self/sessionid", buf, sizeof(buf)) > 0 && strcmp(buf, "4294967295") &&
+			 write_text("/proc/1/loginuid", "1000") < 0 && errno == EPERM;
+		/* Without CAP_AUDIT_CONTROL, a set login UID stays. */
+		ok = ok && setuid(1000) == 0 && write_text("/proc/self/loginuid", "1001") < 0 && errno == EPERM;
+		_exit(ok ? 0 : 1);
+	}
+	check("/proc/self/loginuid is set once", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	umount("/proc");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -9978,6 +10019,7 @@ static void test_all(void)
 	test_proc();
 	test_sysctls();
 	test_vmstat();
+	test_proc_pid_files();
 	test_memfd();
 	test_shm();
 	test_sem();

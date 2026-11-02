@@ -613,6 +613,12 @@ impl AddressSpace {
         self.state.lock().vmas.iter().cloned().collect()
     }
 
+    /// Gives the start and the end of each area, in address order. This does not copy the
+    /// areas, so `/proc/PID/pagemap` can call it for each read.
+    pub fn area_ranges(&self) -> Vec<(usize, usize)> {
+        self.state.lock().vmas.iter().map(|a| (a.start, a.end)).collect()
+    }
+
     /// Gives a copy of the areas in address order, and the start and the end of the heap, as
     /// `start_brk` and `brk` of Linux. All three come from one lock, so `/proc/PID/maps` can name
     /// the areas of the heap with them.

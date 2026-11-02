@@ -1418,17 +1418,31 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
     let admin = rk_proc::current_thread()
         .is_some_and(|t| t.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN));
     let first = offset / ENTRY as u64;
-    let areas: Vec<(usize, usize)> = vm.areas().iter().map(|a| (a.start, a.end)).collect();
+    let areas = vm.area_ranges();
     let zero = rk_mm::ksm::zero_phys();
-    let mut done = 0;
-    for (i, out) in buf.chunks_exact_mut(ENTRY).enumerate() {
-        let Some(addr) = usize::try_from(first + i as u64)
+    let total = buf.len() / ENTRY;
+    let mut k = 0;
+    while k < total {
+        let Some(addr) = usize::try_from(first + k as u64)
             .ok()
             .and_then(|page| page.checked_mul(rk_mm::PAGE_SIZE))
             .filter(|&a| a < rk_frame::vm::USER_END)
         else {
             break;
         };
+        // The pages up to the next area are a hole: no frame maps them, they are not guard
+        // pages and they have no soft-dirty bit, as `pagemap_pte_hole` of Linux. Their entries
+        // are 0, and the read fills them at one time without a walk of the page table, so a read
+        // of the large holes is fast.
+        let next = areas.partition_point(|&(_, end)| end <= addr);
+        let start = areas.get(next).map_or(rk_frame::vm::USER_END, |&(start, _)| start);
+        if addr < start {
+            let end = start.min(rk_frame::vm::USER_END);
+            let n = ((end - addr) / rk_mm::PAGE_SIZE).clamp(1, total - k);
+            buf[k * ENTRY..(k + n) * ENTRY].fill(0);
+            k += n;
+            continue;
+        }
         let mut page = procmap::PageFacts::default();
         if let Some((frame, _)) = vm.vm().page(rk_frame::addr::VirtAddr::new(addr)) {
             let phys = frame.addr().get();
@@ -1445,15 +1459,12 @@ fn pagemap_read(p: &Process, offset: u64, buf: &mut [u8]) -> Result<usize> {
             // A guard page has a marker in place of a frame, as `pte_to_pagemap_entry` of Linux.
             page.guard = vm.is_guard(addr);
         }
-        // A page outside the areas has no soft-dirty bit, as `pagemap_pte_hole` of Linux.
-        let i = areas.partition_point(|&(_, end)| end <= addr);
-        if areas.get(i).is_some_and(|&(start, _)| start <= addr) {
-            page.soft_dirty = vm.soft_dirty(addr, page.present);
-        }
-        out.copy_from_slice(&procmap::pagemap_entry(&page).to_ne_bytes());
-        done += ENTRY;
+        page.soft_dirty = vm.soft_dirty(addr, page.present);
+        buf[k * ENTRY..(k + 1) * ENTRY]
+            .copy_from_slice(&procmap::pagemap_entry(&page).to_ne_bytes());
+        k += 1;
     }
-    Ok(done)
+    Ok(k * ENTRY)
 }
 
 /// Does a write to `/proc/PID/clear_refs`, as `clear_refs_write` in fs/proc/task_mmu.c of Linux.
@@ -1584,6 +1595,30 @@ fn mounts_of(p: &Process) -> Result<Vec<u8>> {
         );
         out.extend_from_slice(&m.root().inode().fs_options());
         out.extend_from_slice(b" 0 0\n");
+    }
+    Ok(out)
+}
+
+/// The text of `/proc/PID/mountstats`, as `show_vfsstat` in fs/proc_namespace.c of Linux. No
+/// file system adds statistics.
+fn mountstats_of(p: &Process) -> Result<Vec<u8>> {
+    let fs = p.fs().ok_or(Errno::ESRCH)?.lock().clone();
+    let mut out = Vec::new();
+    for m in fs.namespace().mounts() {
+        let at = Location { mount: m.clone(), dentry: m.root().clone() };
+        let Ok(path) = fs.path_of(&at) else { continue };
+        let src = m.source();
+        out.extend_from_slice(b"device ");
+        if src.source.is_empty() {
+            out.extend_from_slice(b"no device");
+        } else {
+            text::escape(&mut out, &src.source);
+        }
+        out.extend_from_slice(b" mounted on ");
+        text::escape(&mut out, &path);
+        out.extend_from_slice(b" with fstype ");
+        text::escape(&mut out, src.fstype.as_bytes());
+        out.push(b'\n');
     }
     Ok(out)
 }
@@ -1939,6 +1974,78 @@ fn process_files(
         ),
     ));
     out.push((b"oom_score".to_vec(), file(&join(base, b"oom_score"), || Ok(b"0\n".to_vec()))));
+    // As `proc_pid_limits` in fs/proc/base.c of Linux.
+    let p_ = w.clone();
+    out.push((
+        b"limits".to_vec(),
+        file(&join(base, b"limits"), move || {
+            let p = alive(&p_)?;
+            let l: [(u64, u64); 16] = core::array::from_fn(|r| {
+                let l = p.limit(r);
+                (l.cur, l.max)
+            });
+            Ok(text::limits(&l).into_bytes())
+        }),
+    ));
+    // As `proc_loginuid_read` and `proc_loginuid_write` in fs/proc/base.c of Linux: only the
+    // process itself sets its login UID, and the text has no new line.
+    let p_ = w.clone();
+    let p2 = w.clone();
+    out.push((
+        b"loginuid".to_vec(),
+        rw_file(
+            &join(base, b"loginuid"),
+            move || Ok(format!("{}", alive(&p_)?.audit_ids().0).into_bytes()),
+            move |data| {
+                let p = alive(&p2)?;
+                let me = rk_proc::current_thread().ok_or(Errno::EPERM)?;
+                if !Arc::ptr_eq(me.process(), &p) {
+                    return Err(Errno::EPERM);
+                }
+                let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+                let uid: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+                p.set_loginuid(uid)
+            },
+        ),
+    ));
+    let p_ = w.clone();
+    out.push((
+        b"sessionid".to_vec(),
+        file(&join(base, b"sessionid"), move || {
+            Ok(format!("{}", alive(&p_)?.audit_ids().1).into_bytes())
+        }),
+    ));
+    let p_ = w.clone();
+    out.push((
+        b"personality".to_vec(),
+        ops_file(
+            &join(base, b"personality"),
+            0o400,
+            move || Ok(format!("{:08x}\n", alive(&p_)?.personality()).into_bytes()),
+            || None,
+        ),
+    ));
+    // The kernel has no symbol names, so the text is `0`, as `proc_pid_wchan` of Linux gives
+    // without `kallsyms`.
+    out.push((b"wchan".to_vec(), file(&join(base, b"wchan"), || Ok(b"0".to_vec()))));
+    // As `proc_pid_schedstat` in fs/proc/base.c of Linux: the CPU time of the thread in ns, the
+    // time it waited on a run queue, and the count of its runs. The kernel does not count the
+    // last two yet.
+    let p_ = w.clone();
+    let t_ = t.clone();
+    out.push((
+        b"schedstat".to_vec(),
+        file(&join(base, b"schedstat"), move || {
+            let t = slack_thread(&p_, &t_)?;
+            let ns = (t.user_ticks() + t.sys_ticks()) * (1_000_000_000 / rk_frame::time::HZ);
+            Ok(format!("{ns} 0 0\n").into_bytes())
+        }),
+    ));
+    let p_ = w.clone();
+    out.push((
+        b"mountstats".to_vec(),
+        ops_file(&join(base, b"mountstats"), 0o400, move || mountstats_of(&*alive(&p_)?), || None),
+    ));
     // As `proc_coredump_filter_write` in fs/proc/base.c of Linux: the number takes the base of
     // its prefix, and only the bits of the filter stay.
     let p_ = w.clone();
