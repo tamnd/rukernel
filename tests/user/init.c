@@ -3446,6 +3446,63 @@ static void test_overlay(void)
 	umount("/ov");
 }
 
+/* The files of /sys/devices/system/cpu and node, as drivers/base/cpu.c and topology.c of Linux:
+ * a list is "0-3" or "0", and a mask has one hex digit for each four CPUs. glibc reads online and
+ * possible for get_nprocs and get_nprocs_conf. */
+static void test_sysfs_cpu(void)
+{
+	cpu_set_t set;
+	char want[32], one[32], mask[32], buf[128], path[96];
+	struct dirent *e;
+	DIR *dir;
+	int cpus, dirs = 0;
+
+	CPU_ZERO(&set);
+	cpus = sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
+	if (cpus < 1 || cpus > 60)
+		return;
+	if (cpus == 1)
+		snprintf(want, sizeof(want), "0\n");
+	else
+		snprintf(want, sizeof(want), "0-%d\n", cpus - 1);
+	snprintf(one, sizeof(one), "%d\n", cpus - 1);
+	snprintf(mask, sizeof(mask), "%0*llx\n", (cpus + 3) / 4, (1ULL << cpus) - 1);
+	check("/sys/devices/system/cpu/online lists each CPU",
+	      read_small("/sys/devices/system/cpu/online", buf, sizeof(buf)) > 0 && strcmp(buf, want) == 0);
+	check("/sys/devices/system/cpu/possible lists each CPU",
+	      read_small("/sys/devices/system/cpu/possible", buf, sizeof(buf)) > 0 && strcmp(buf, want) == 0);
+	check("/sys/devices/system/cpu/present lists each CPU",
+	      read_small("/sys/devices/system/cpu/present", buf, sizeof(buf)) > 0 && strcmp(buf, want) == 0);
+	check("/sys/devices/system/cpu/offline is empty",
+	      read_small("/sys/devices/system/cpu/offline", buf, sizeof(buf)) == 1 && strcmp(buf, "\n") == 0);
+	dir = opendir("/sys/devices/system/cpu");
+	while (dir && (e = readdir(dir)))
+		if (strncmp(e->d_name, "cpu", 3) == 0 && e->d_name[3] >= '0' && e->d_name[3] <= '9')
+			dirs++;
+	if (dir)
+		closedir(dir);
+	check("/sys/devices/system/cpu has a cpuN directory for each CPU", dirs == cpus);
+	check("sysconf(_SC_NPROCESSORS_CONF) gives the CPU count", sysconf(_SC_NPROCESSORS_CONF) == cpus);
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpus - 1);
+	check("topology/core_id gives the number of the CPU",
+	      read_small(path, buf, sizeof(buf)) > 0 && strcmp(buf, one) == 0);
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpus - 1);
+	check("topology/physical_package_id is 0",
+	      read_small(path, buf, sizeof(buf)) > 0 && strcmp(buf, "0\n") == 0);
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/package_cpus_list", cpus - 1);
+	check("topology/package_cpus_list lists each CPU",
+	      read_small(path, buf, sizeof(buf)) > 0 && strcmp(buf, want) == 0);
+	snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpus - 1);
+	check("topology/thread_siblings_list is the CPU",
+	      read_small(path, buf, sizeof(buf)) > 0 && strcmp(buf, one) == 0);
+	check("node0/cpumap has a bit for each CPU",
+	      read_small("/sys/devices/system/node/node0/cpumap", buf, sizeof(buf)) > 0 && strcmp(buf, mask) == 0);
+	check("/sys/devices/system/node/online is 0",
+	      read_small("/sys/devices/system/node/online", buf, sizeof(buf)) > 0 && strcmp(buf, "0\n") == 0);
+	snprintf(path, sizeof(path), "/sys/devices/system/node/node0/cpu%d/topology/core_id", cpus - 1);
+	check("node0/cpuN links to the CPU", access(path, R_OK) == 0);
+}
+
 static void test_sysfs(void)
 {
 	struct statfs sfs;
@@ -3473,6 +3530,7 @@ static void test_sysfs(void)
 		check("sysfs has the size of vda",
 		      read_small("/sys/class/block/vda/size", buf, sizeof(buf)) > 0 && atol(buf) > 0);
 	}
+	test_sysfs_cpu();
 	umount("/sys");
 
 	mkdir("/mnt", 0755);
@@ -6288,6 +6346,13 @@ static void test_smp(void)
 	int cpus = sched_getaffinity(0, sizeof(set), &set) == 0 ? CPU_COUNT(&set) : 0;
 	check("sched_getaffinity gives more than one CPU", cpus > 1);
 	check("sysconf gives the CPU count", sysconf(_SC_NPROCESSORS_ONLN) == cpus);
+	mkdir("/sys", 0755);
+	int sys = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
+	check("mount sysfs for the files of the CPUs", sys);
+	if (sys) {
+		test_sysfs_cpu();
+		umount("/sys");
+	}
 	unsigned cpu = 99;
 	check("getcpu gives a CPU of the set", syscall(SYS_getcpu, &cpu, NULL, NULL) == 0 &&
 						     (int)cpu < cpus);

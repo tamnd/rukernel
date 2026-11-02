@@ -23,6 +23,9 @@
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
 //!   `statistics`. `/sys/class/net/NAME` is a link to it.
+//! - `/sys/devices/system/cpu` has a directory `cpuN` with `topology` for each CPU, and the
+//!   files `online`, `possible` and `present`. `/sys/devices/system/node` has the one NUMA node
+//!   `node0`. glibc reads `online` for `get_nprocs` and `possible` for `get_nprocs_conf`.
 //! - A mount of sysfs keeps the network namespace of the task that mounts it, as the namespace
 //!   tag of kernfs in fs/sysfs/mount.c of Linux. The mount shows only the interfaces of that
 //!   namespace, and a mount in another namespace is another file system.
@@ -35,6 +38,7 @@
 
 extern crate alloc;
 
+mod cpu;
 mod mm;
 
 use alloc::collections::BTreeSet;
@@ -365,7 +369,8 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
             .filter(|d| d.block == (kind == "block"))
             .map(|d| (numbers(d), to_device("../../", d)))
             .collect(),
-        ["devices"] => dirs(&mut ["virtual"].into_iter()),
+        ["devices"] => dirs(&mut ["system", "virtual"].into_iter()),
+        ["devices", "system", ref rest @ ..] => cpu::entries(rk_frame::cpu::count(), rest)?,
         ["devices", "virtual", class] if classes.contains(class) => list
             .iter()
             .filter(|d| d.class == class)
