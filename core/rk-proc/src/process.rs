@@ -2355,11 +2355,16 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     // of the tree held, as `exit_notify` in kernel/exit.c of Linux. A child that ends at the same
     // time then sees its new parent, and a `fork` with `CLONE_PARENT` does not add a child to
     // the list of this process after init took the list.
+    //
+    // The process becomes a zombie only after init has its children. `wait_child` does not take
+    // the lock of the tree. Before, init could reap the zombie after the zombie gave away its
+    // children and before init had them, and a `waitpid` of the process group then gave
+    // `ECHILD` while those children were alive. Linux sets `exit_state` after
+    // `forget_original_parent` too (#417).
     let tasks = TASKLIST.write();
     let (children, parent, status) = {
         let mut s = process.state.lock();
         let status = s.group_exit.unwrap_or(status);
-        s.zombie = Some(status);
         (core::mem::take(&mut s.children), s.parent.upgrade(), status)
     };
     // Each child that asked for it gets its signal, as `forget_original_parent` in
@@ -2393,6 +2398,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
             init.child_wait.wake_all();
         }
     }
+    process.state.lock().zombie = Some(status);
     ptrace::process_exited(&process, parent.as_ref(), status);
     let autoreap = parent.as_ref().is_some_and(|parent| notify_parent(&process, parent, status));
     if let Some(parent) = &parent

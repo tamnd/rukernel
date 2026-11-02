@@ -1593,9 +1593,10 @@ fn blk_disk_has_note(path: &Path) -> Result<bool> {
 /// Before #405, the kernel had one lock, so more CPUs made it slower on a host with few free CPUs.
 /// On a host with 6 CPUs and a load of 7 to 10, the `smp` test took 322 s with 8 CPUs and 112 s with 4
 /// CPUs (#396). After the wakeup preemption of #408, the test took 267 s with 8 CPUs and 219 s with
-/// 4 CPUs on the same host, so 8 CPUs are still slower. With 4 CPUs, the test still runs tasks on
-/// several CPUs at the same time.
-const SMP_CPUS: &str = "4";
+/// 4 CPUs on the same host, so 8 CPUs are still slower. With 8 CPUs, about 1 run in 3 failed
+/// (#417). After the fixes of #417, 10 runs with 8 CPUs on an idle host with 4 CPUs passed in 126
+/// to 217 s, with a median of 138 s, and 1 run with 4 CPUs took 100 s.
+const SMP_CPUS: &str = "8";
 
 /// The QEMU program `name`, for example `qemu-system-x86_64`. `RK_QEMU` gives the directory of the
 /// programs of a different QEMU build, for example `$HOME/rk-qemu9/install/bin`. Without it, the

@@ -95,7 +95,15 @@ struct PipeEnd {
 impl PipeEnd {
     /// Makes an end and counts it in the pipe.
     fn new(pipe: Arc<Pipe>, read: bool, write: bool, named: bool) -> Self {
-        {
+        Self::open(pipe, read, write, named).0
+    }
+
+    /// Makes an end and counts it in the pipe, as `new`. Also gives the state of the other end
+    /// at the same time, with the lock of the pipe held: the number of ends of the other type
+    /// that are open, and the count of their opens. A reader looks at the writers, and a writer
+    /// looks at the readers.
+    fn open(pipe: Arc<Pipe>, read: bool, write: bool, named: bool) -> (Self, usize, u64) {
+        let partner = {
             let mut s = pipe.state.lock();
             if read {
                 s.readers += 1;
@@ -105,12 +113,13 @@ impl PipeEnd {
                 s.writers += 1;
                 s.writer_opens += 1;
             }
-        }
+            if read { (s.writers, s.writer_opens) } else { (s.readers, s.reader_opens) }
+        };
         if named {
             pipe.wake_only(true);
             pipe.wake_only(false);
         }
-        Self { pipe, read, write, named }
+        (Self { pipe, read, write, named }, partner.0, partner.1)
     }
 }
 
@@ -556,20 +565,18 @@ fn open_end(pipe: Arc<Pipe>, flags: u32, named: bool) -> Result<Arc<dyn FileOps>
     if named && write && !read && nonblock && pipe.state.lock().readers == 0 {
         return Err(Errno::ENXIO);
     }
-    let (readers, writers) = {
-        let s = pipe.state.lock();
-        (s.reader_opens, s.writer_opens)
-    };
-    let end = PipeEnd::new(pipe.clone(), read, write, named);
-    if named && !nonblock && read != write {
+    // The other end is tested with the lock that counts this end, as `fifo_open` of Linux does
+    // under `pipe->mutex`. If no end of the other type is open, the open waits for the next open
+    // of one, as `wait_for_partner` of Linux, and an end that opens and closes before the wait
+    // also counts. Before, the count of opens was read before this end was counted. Then a
+    // writer that waited for this reader could open, write and close between the two, and the
+    // reader waited for ever (#417).
+    let (end, partners, opens) = PipeEnd::open(pipe.clone(), read, write, named);
+    if named && !nonblock && read != write && partners == 0 {
         pipe.wait.wait_interruptible(|| {
             let s = pipe.state.lock();
-            let ready = if read {
-                s.writers > 0 || s.writer_opens != writers
-            } else {
-                s.readers > 0 || s.reader_opens != readers
-            };
-            Ok(ready.then_some(()))
+            let now = if read { s.writer_opens } else { s.reader_opens };
+            Ok((now != opens).then_some(()))
         })?;
     }
     Ok(Arc::new(end))

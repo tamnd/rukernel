@@ -202,11 +202,13 @@ impl Timer {
             EPOCH.fetch_add(1, Ordering::Release);
             WAKE.wake_all();
         }
-        drop(s);
-        // The signal of the old setting goes after the change of the state. `fire` sends a signal
-        // with the lock of the state held, so after this point no signal of the old setting can
-        // come. Before, a timer that fired between the discard and the change left a signal of
-        // the old setting pending.
+        // The signal of the old setting goes with the lock of the state held, after the change of
+        // the state. `fire` sends a signal with the same lock held, so a signal of the old
+        // setting that came before is discarded here, and a signal of the new setting comes only
+        // after the discard. Before, the discard came after the release of the lock. Then the
+        // timer task on another CPU could fire the new setting first, and the discard lost its
+        // signal (#417). The lock of the state comes before the locks of the signals, as in
+        // `fire`.
         if self.info.code == crate::signal::SI_TIMER {
             match &self.target {
                 Target::Process(p) => {
@@ -222,6 +224,7 @@ impl Timer {
                 Target::None | Target::Notify(_) => {}
             }
         }
+        drop(s);
         old
     }
 
