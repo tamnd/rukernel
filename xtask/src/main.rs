@@ -386,6 +386,16 @@ fn ci() -> Result {
 /// The QEMU exit status for a passed self test: `(0x10 << 1) | 1`, per kernel/rukernel/src/kernel.rs.
 const QEMU_PASS: i32 = 33;
 
+/// The QEMU exit status after a power off with `reboot`: `(0 << 1) | 1`, per
+/// core/rk-syscall/src/info.rs. The `systemd` test ends with `systemctl poweroff`.
+const QEMU_POWER_OFF: i32 = 1;
+
+/// The longest time that the `systemd` boot test can take.
+const SYSTEMD_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// The memory of the `systemd` boot test. The initramfs has all of the Debian tree.
+const SYSTEMD_MEMORY: &str = "2G";
+
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -436,6 +446,7 @@ const BOOT_TESTS: &[&str] = &[
     "gvisor",
     "alpine",
     "debian",
+    "systemd",
     "fstests",
 ];
 
@@ -645,6 +656,7 @@ fn busybox(dir: &Path) -> Result<Option<Vec<u8>>> {
 struct Rootfs {
     /// The name of the boot test.
     name: &'static str,
+    /// The URL of the tarball of the tree. With no URL, only `var` gives the tarball.
     url: &'static str,
     sha256: &'static str,
     var: &'static str,
@@ -854,6 +866,58 @@ echo 'debian: done'
         glibc_programs: &["nptl"],
         debug_tools: false,
     },
+    Rootfs {
+        name: "systemd",
+        url: "",
+        sha256: "",
+        var: "RK_SYSTEMD",
+        // tools/systemd/build.sh makes the tree. The script adds rk-check.service, and then
+        // systemd runs as PID 1. At multi-user.target the service prints the state of the system
+        // and the units that failed, and stops the machine. The test passes if the state is
+        // `running`, or `degraded` with only the units of `allowed` in the failed list.
+        init: r#"#!/bin/sh
+set -e
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+rm -f /.dockerenv
+cat > /etc/systemd/system/rk-check.service << 'END'
+[Unit]
+Description=The check of the systemd boot test of rukernel
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rk-check
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/console
+END
+mkdir -p /etc/systemd/system/multi-user.target.wants /usr/local/bin
+ln -sf ../rk-check.service /etc/systemd/system/multi-user.target.wants/rk-check.service
+cat > /usr/local/bin/rk-check << 'END'
+#!/bin/sh
+allowed=''
+state=$(systemctl is-system-running --wait || true)
+echo "rk-systemd: state $state"
+failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
+other=
+for unit in $failed; do
+    echo "rk-systemd: failed $unit"
+    systemctl status --no-pager --lines=5 "$unit" | sed 's/^/rk-systemd:   /'
+    case " $allowed " in *" $unit "*) ;; *) other="$other $unit" ;; esac
+done
+case $state in
+running) echo 'rk-systemd: pass' ;;
+degraded) [ -n "$other" ] || echo 'rk-systemd: pass' ;;
+esac
+systemctl poweroff
+END
+chmod 755 /usr/local/bin/rk-check
+echo "rk-systemd: $(/usr/lib/systemd/systemd --version | head -n 1)"
+exec /usr/lib/systemd/systemd
+"#,
+        glibc_programs: &[],
+        debug_tools: false,
+    },
 ];
 
 /// Adds each file under `root` to `w`, with its mode, as a path relative to `root`. A directory
@@ -897,6 +961,10 @@ fn build_rootfs_initramfs(kernel: &Path, rootfs: &Rootfs) -> Result<bool> {
     }
     let tarball = match std::env::var_os(rootfs.var) {
         Some(path) => PathBuf::from(path),
+        None if rootfs.url.is_empty() => {
+            println!("{}: skipped, set {}", rootfs.name, rootfs.var);
+            return Ok(false);
+        }
         None => {
             let path = dir.join(format!("{}-rootfs.tar.gz", rootfs.name));
             if !download(rootfs.url, rootfs.sha256, &path, rootfs.name, rootfs.var)? {
@@ -1764,8 +1832,12 @@ fn base_cmdline(test: &str) -> String {
     }
 }
 
-/// The line that the kernel prints when the boot test `test` passes.
+/// The line that the kernel prints when the boot test `test` passes. In the `systemd` test, the
+/// check service prints the line.
 fn pass_line(test: &str) -> String {
+    if test == "systemd" {
+        return String::from("rk-systemd: pass");
+    }
     let test = if matches!(
         test,
         "tty"
@@ -2105,6 +2177,12 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .and_then(|s| s.parse().ok())
                 .map_or(FSTESTS_TIMEOUT, Duration::from_secs);
             (cmd, timeout)
+        } else if *test == "systemd" {
+            let initrd = rootfs_initramfs(&kernel, test);
+            let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
+            // QEMU uses the last `-m`.
+            cmd.args(["-m", SYSTEMD_MEMORY]);
+            (cmd, SYSTEMD_TIMEOUT)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
             (qemu_command_with(&kernel, &initrd, &test_cmdline(test)), ROOTFS_TIMEOUT)
@@ -2160,7 +2238,8 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .args(["-device", "virtio-blk-pci,drive=disk2"]);
         }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
-        let mut passed = status == Some(QEMU_PASS) && log.contains(&pass_line(test));
+        let want = if *test == "systemd" { QEMU_POWER_OFF } else { QEMU_PASS };
+        let mut passed = status == Some(want) && log.contains(&pass_line(test));
         if *test == "blk" && passed && !blk_disk_has_note(&kernel.with_file_name("blk.img"))? {
             println!("boot test blk: the disk image does not have the data that the guest wrote");
             passed = false;
