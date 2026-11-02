@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `SO_PEERPIDFD` and `SO_PASSPIDFD` of Unix sockets, as net/core/sock.c and net/unix/af_unix.c of Linux. `SO_PEERPIDFD` gives a new pidfd of the process that connected, listened or made the socket pair. With `SO_PASSPIDFD`, `recvmsg` gives an `SCM_PIDFD` control message with a new pidfd of the sender. A socket from `accept` takes `SO_PASSCRED` and `SO_PASSPIDFD` of the listener, and the credentials go with each message when either option is set, as `unix_may_passcred`. tools/kselftest/build.sh builds `net/af_unix/scm_pidfd` (#536).
+
 ## [0.5.1] - 2026-11-04
 
 ### Added

@@ -235,6 +235,14 @@ struct State {
     options: Options,
 }
 
+impl State {
+    /// Tells if messages to or from the socket carry the credentials of the sender:
+    /// `SO_PASSCRED` or `SO_PASSPIDFD` is set, as `unix_may_passcred` of Linux.
+    fn may_passcred(&self) -> bool {
+        self.passcred || self.passpidfd
+    }
+}
+
 /// A Unix socket.
 pub struct Unix {
     kind: u32,
@@ -318,7 +326,7 @@ impl Unix {
         for (x, y) in [(&a, &b), (&b, &a)] {
             let mut s = x.state.lock();
             s.peer = Some(y.clone());
-            s.peer_cred = Some(cred);
+            s.peer_cred = Some(cred.clone());
             if kind != SOCK_DGRAM {
                 s.conn = Conn::Connected;
             }
@@ -475,7 +483,7 @@ impl Unix {
             return Ok(());
         }
         let name = Name::parse(addr)?;
-        if self.state.lock().passcred {
+        if self.state.lock().may_passcred() {
             self.autobind()?;
         }
         let other = self.lookup(paths, &name)?;
@@ -500,7 +508,7 @@ impl Unix {
                 Conn::Listening => return Err(Errno::EINVAL),
                 Conn::Unconnected => {}
             }
-            (s.passcred, s.options.sndtimeo)
+            (s.may_passcred(), s.options.sndtimeo)
         };
         if timeout.0 {
             self.autobind()?;
@@ -545,7 +553,7 @@ impl Unix {
             }
             s.conn = Conn::Connected;
             s.peer = Some(server.clone());
-            s.peer_cred = o.listen_cred;
+            s.peer_cred = o.listen_cred.clone();
             o.pending.push_back(server);
             drop(s);
             drop(o);
@@ -554,13 +562,13 @@ impl Unix {
         }
     }
 
-    /// Tells if a message to `peer` gets the credentials of the sender: `SO_PASSCRED` is set on
-    /// this socket or on `peer`.
+    /// Tells if a message to `peer` gets the credentials of the sender: `SO_PASSCRED` or
+    /// `SO_PASSPIDFD` is set on this socket or on `peer`.
     fn may_passcred(&self, peer: &Self) -> bool {
         // The lock of this socket goes before the lock of the peer is taken. Two sockets that
         // send to each other on two CPUs then do not wait for each other.
-        let mine = self.state.lock().passcred;
-        mine || peer.state.lock().passcred
+        let mine = self.state.lock().may_passcred();
+        mine || peer.state.lock().may_passcred()
     }
 
     /// The send of a stream socket: the data goes in pieces into the queue of the peer.
@@ -619,7 +627,7 @@ impl Unix {
                 read: 0,
                 from: from.clone(),
                 rights: rights.take().unwrap_or_default(),
-                cred,
+                cred: cred.clone(),
                 sender: self.this.clone(),
             });
             drop(p);
@@ -638,7 +646,7 @@ impl Unix {
             if self.kind == SOCK_SEQPACKET && s.conn != Conn::Connected {
                 return Err(Errno::ENOTCONN);
             }
-            (s.passcred, s.addr.is_none(), s.options.sndbuf as usize, s.options.sndtimeo)
+            (s.may_passcred(), s.addr.is_none(), s.options.sndbuf as usize, s.options.sndtimeo)
         };
         if len > sndbuf.saturating_sub(32) {
             return Err(Errno::EMSGSIZE);
@@ -698,7 +706,7 @@ impl Unix {
                 return if nonblock { Err(Errno::EAGAIN) } else { Ok(None) };
             }
             let Some(msg) = msg.take() else { return Ok(Some(())) };
-            let cred = msg.cred.or_else(|| (passcred || o.passcred).then(current_cred));
+            let cred = msg.cred.or_else(|| (passcred || o.may_passcred()).then(current_cred));
             let from = if Arc::ptr_eq(&other, &me) { o.addr.clone() } else { my_addr.clone() };
             o.queue.push_back(Packet {
                 data: msg.data,
@@ -735,7 +743,7 @@ impl Unix {
             if let Some(e) = s.error.take() {
                 return Err(e);
             }
-            let passcred = s.passcred;
+            let passcred = s.may_passcred();
             let mut skip = if peek && s.peek_off >= 0 { s.peek_off as usize } else { 0 };
             let mut index = None;
             for (i, p) in s.queue.iter().enumerate() {
@@ -753,7 +761,7 @@ impl Unix {
                     len: p.data.len() - skip,
                     addr: p.from.clone(),
                     rights: Vec::new(),
-                    cred: passcred.then(|| p.cred.unwrap_or(NO_CRED)),
+                    cred: passcred.then(|| p.cred.clone().unwrap_or(NO_CRED)),
                     flags: 0,
                     control: Vec::new(),
                 };
@@ -813,7 +821,7 @@ impl Unix {
         let mut charged: Vec<(Weak<Unix>, usize)> = Vec::new();
         let r = wait_for(&self.wait, timeout, || {
             let mut s = self.state.lock();
-            let passcred = s.passcred;
+            let passcred = s.may_passcred();
             let mut skip = if peek && s.peek_off >= 0 { s.peek_off as usize } else { 0 };
             let mut stop = false;
             let mut i = 0;
@@ -824,7 +832,7 @@ impl Unix {
                 && let Some(p) = s.queue.front_mut()
             {
                 out.addr = p.from.clone();
-                out.cred = passcred.then(|| p.cred.unwrap_or(NO_CRED));
+                out.cred = passcred.then(|| p.cred.clone().unwrap_or(NO_CRED));
                 out.rights = core::mem::take(&mut p.rights);
                 return Ok(Some(()));
             }
@@ -844,8 +852,8 @@ impl Unix {
                 if first {
                     first = false;
                     out.addr = p.from.clone();
-                    cred = p.cred;
-                    out.cred = passcred.then(|| p.cred.unwrap_or(NO_CRED));
+                    cred.clone_from(&p.cred);
+                    out.cred = passcred.then(|| p.cred.clone().unwrap_or(NO_CRED));
                 }
                 let n = (rest - skip).min(len - out.data.len());
                 let start = p.read + skip;
@@ -997,7 +1005,7 @@ impl Socket for Unix {
         s.conn = Conn::Listening;
         // A listener is its own peer, as `init_peercred` in `unix_listen` of Linux.
         s.listen_cred = Some(current_cred());
-        s.peer_cred = s.listen_cred;
+        s.peer_cred = s.listen_cred.clone();
         drop(s);
         self.wake();
         Ok(())
@@ -1020,8 +1028,12 @@ impl Socket for Unix {
                 return Err(Errno::EINVAL);
             }
             if let Some(new) = s.pending.pop_front() {
-                // The new socket gets `SO_PASSCRED` of the listener, as `unix_sock_inherit_flags`.
-                new.state.lock().passcred = s.passcred;
+                // The new socket gets `SO_PASSCRED` and `SO_PASSPIDFD` of the listener, as
+                // `unix_sock_inherit_flags`.
+                let mut n = new.state.lock();
+                n.passcred = s.passcred;
+                n.passpidfd = s.passpidfd;
+                drop(n);
                 return Ok(Some(new));
             }
             if nonblock {
@@ -1104,6 +1116,10 @@ impl Socket for Unix {
         }
     }
 
+    fn peer_cred(&self) -> Option<Cred> {
+        self.state.lock().peer_cred.clone()
+    }
+
     fn get_option(&self, level: u32, name: u32) -> Result<Vec<u8>> {
         if level != SOL_SOCKET {
             return Err(Errno::EOPNOTSUPP);
@@ -1125,7 +1141,12 @@ impl Socket for Unix {
             SO_PEERSEC => return Err(Errno::ENOPROTOOPT),
             SO_PEERCRED => {
                 // No peer gives the pid 0 and the IDs -1, as `cred_to_ucred` of Linux.
-                let c = s.peer_cred.unwrap_or(Cred { pid: 0, uid: u32::MAX, gid: u32::MAX });
+                let c = s.peer_cred.clone().unwrap_or(Cred {
+                    pid: 0,
+                    uid: u32::MAX,
+                    gid: u32::MAX,
+                    process: None,
+                });
                 let mut v = c.pid.to_ne_bytes().to_vec();
                 v.extend_from_slice(&c.uid.to_ne_bytes());
                 v.extend_from_slice(&c.gid.to_ne_bytes());
