@@ -15,7 +15,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
 use rk_abi::Errno;
-use rk_abi::native::open::{O_ACCMODE, O_CLOEXEC, O_EXCL, O_LARGEFILE, O_NONBLOCK, O_RDWR};
+use rk_abi::native::open::{
+    O_ACCMODE, O_CLOEXEC, O_EXCL, O_LARGEFILE, O_NONBLOCK, O_RDONLY, O_RDWR,
+};
 use rk_frame::sync::Once;
 use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo};
 use rk_proc::{Pid, Process};
@@ -23,6 +25,7 @@ use rk_vfs::Location;
 use rk_vfs::file::{File, FileOps, events};
 use rk_vfs::inode::{Inode, InodeRef, Metadata, SetAttr, mode};
 use rk_vfs::wait::PollTable;
+use zerocopy::{Immutable, IntoBytes};
 
 /// `PIDFD_NONBLOCK`: a wait for the process does not block.
 const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
@@ -185,6 +188,186 @@ pub(crate) fn open_by_handle(cx: &Cx<'_>, ty: i32, words: &[u32], flags: u32) ->
         rk_proc::processes().into_iter().find(|p| p.serial() == ino).ok_or(Errno::ESTALE)?;
     let file = new_file(process, flags & (O_NONBLOCK | O_EXCL));
     Ok(cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)? as u64)
+}
+
+/// `PIDFS_IOCTL_MAGIC` of include/uapi/linux/pidfd.h: the type of the `ioctl` commands.
+const PIDFS_IOCTL_MAGIC: u32 = 0xff;
+/// The number of `PIDFD_GET_INFO`, `_IOWR(0xFF, 11, struct pidfd_info)`. The size in the command
+/// is the size of the structure of the caller.
+const PIDFD_GET_INFO_NR: u32 = 11;
+/// `FS_IOC_GETVERSION`, `_IOR('v', 1, long)`.
+const FS_IOC_GETVERSION: u32 = 0x8008_7601;
+
+/// The bits of `pidfd_info.mask`.
+const PIDFD_INFO_PID: u64 = 1 << 0;
+const PIDFD_INFO_CREDS: u64 = 1 << 1;
+const PIDFD_INFO_CGROUPID: u64 = 1 << 2;
+const PIDFD_INFO_EXIT: u64 = 1 << 3;
+const PIDFD_INFO_COREDUMP: u64 = 1 << 4;
+/// `PIDFD_INFO_SIZE_VER0`: the size of the first version of `struct pidfd_info`.
+const PIDFD_INFO_SIZE_VER0: usize = 64;
+
+/// The bits of `pidfd_info.coredump_mask`.
+const PIDFD_COREDUMPED: u32 = 1 << 0;
+const PIDFD_COREDUMP_SKIP: u32 = 1 << 1;
+const PIDFD_COREDUMP_USER: u32 = 1 << 2;
+const PIDFD_COREDUMP_ROOT: u32 = 1 << 3;
+
+/// `struct pidfd_info` of include/uapi/linux/pidfd.h.
+#[derive(Default, IntoBytes, Immutable)]
+#[repr(C)]
+struct PidfdInfo {
+    mask: u64,
+    cgroupid: u64,
+    pid: u32,
+    tgid: u32,
+    ppid: u32,
+    ruid: u32,
+    rgid: u32,
+    euid: u32,
+    egid: u32,
+    suid: u32,
+    sgid: u32,
+    fsuid: u32,
+    fsgid: u32,
+    exit_code: i32,
+    coredump_mask: u32,
+    spare1: u32,
+}
+
+/// The `PIDFD_COREDUMP_*` bit of the `dumpable` value of a process, as `pidfs_coredump_mask` of
+/// Linux.
+fn coredump_mask(dumpable: u8) -> u32 {
+    use rk_proc::coredump::{SUID_DUMP_ROOT, SUID_DUMP_USER};
+    match dumpable {
+        SUID_DUMP_USER => PIDFD_COREDUMP_USER,
+        SUID_DUMP_ROOT => PIDFD_COREDUMP_ROOT,
+        _ => PIDFD_COREDUMP_SKIP,
+    }
+}
+
+/// `PIDFD_GET_INFO`: the IDs, the credentials, the cgroup and the exit status of the process,
+/// as `pidfd_info` in fs/pidfs.c of Linux. `size` is the size of the structure of the caller.
+/// The exit status is there only after the parent reaped the process, and the IDs and the
+/// credentials only before.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a structure smaller than the first version, and `ESRCH` for a reaped
+/// process without `PIDFD_INFO_EXIT` in the mask.
+fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysResult {
+    if arg == 0 || size < PIDFD_INFO_SIZE_VER0 {
+        return Err(Errno::EINVAL);
+    }
+    let mask: u64 = cx.read_val(arg)?;
+    let mut info = PidfdInfo::default();
+    let gone = reaped(process);
+    let status = process.exit_status();
+    if mask & PIDFD_INFO_EXIT != 0
+        && gone
+        && let Some(status) = status
+    {
+        info.mask |= PIDFD_INFO_EXIT | PIDFD_INFO_CGROUPID;
+        info.exit_code = status.0;
+        info.cgroupid = rk_fs_cgroup::cgroup_ino(process.cgroup());
+    }
+    if mask & PIDFD_INFO_COREDUMP != 0 {
+        info.mask |= PIDFD_INFO_COREDUMP;
+        // A process that wrote a core dump has the bit 0x80 in its status, as `WCOREDUMP`.
+        if status.is_some_and(|s| s.0 & 0x80 != 0) {
+            info.coredump_mask = PIDFD_COREDUMPED | coredump_mask(process.dumpable());
+        } else if !gone && process.vm().is_some() {
+            info.coredump_mask = coredump_mask(process.dumpable());
+        }
+    }
+    if gone {
+        if mask & PIDFD_INFO_EXIT == 0 {
+            return Err(Errno::ESRCH);
+        }
+    } else {
+        let c = process.cred();
+        (info.ruid, info.rgid, info.euid, info.egid) = (c.uid, c.gid, c.euid, c.egid);
+        (info.suid, info.sgid, info.fsuid, info.fsgid) = (c.suid, c.sgid, c.fsuid, c.fsgid);
+        info.mask |= PIDFD_INFO_CREDS;
+        if info.cgroupid == 0 {
+            info.cgroupid = rk_fs_cgroup::cgroup_ino(process.cgroup());
+            info.mask |= PIDFD_INFO_CGROUPID;
+        }
+        info.ppid = process.ppid();
+        info.tgid = process.pid();
+        info.pid = process.pid();
+        info.mask |= PIDFD_INFO_PID;
+    }
+    // The caller gets the part of the structure that it knows, and zeros after the part that
+    // the kernel knows, as `copy_struct_to_user` of Linux.
+    let bytes = info.as_bytes();
+    let n = size.min(bytes.len());
+    cx.write_bytes(arg, &bytes[..n])?;
+    if size > n {
+        cx.write_bytes(arg + n as u64, &alloc::vec![0; size - n])?;
+    }
+    Ok(0)
+}
+
+/// The `ioctl` commands of a process file descriptor, as `pidfd_ioctl` in fs/pidfs.c of Linux:
+/// `PIDFD_GET_INFO`, `FS_IOC_GETVERSION`, and the commands that open a file of a namespace of
+/// the process, as a link in `/proc/PID/ns`. Gives `None` if `file` is not a process file
+/// descriptor.
+///
+/// # Errors
+///
+/// Gives `ENOTTY` for another command, `ESRCH` if the process ended, `EINVAL` if `arg` is not 0
+/// for a namespace, `EACCES` if the caller cannot trace the process, and `EOPNOTSUPP` for the
+/// user namespace, as Linux without `CONFIG_USER_NS`.
+pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysResult> {
+    let pidfd = file.ops().as_any().and_then(|a| a.downcast_ref::<PidFd>())?;
+    let process = &pidfd.process;
+    let (ty, nr) = ((cmd >> 8) & 0xff, cmd & 0xff);
+    if cmd == FS_IOC_GETVERSION {
+        if arg == 0 {
+            return Some(Err(Errno::EINVAL));
+        }
+        // The generation of the inode is 0 on a 64 bit kernel, as `pidfs_gen` of Linux.
+        return Some(cx.write_val(arg, &0u32).map(|()| 0));
+    }
+    if ty != PIDFS_IOCTL_MAGIC {
+        return Some(Err(Errno::ENOTTY));
+    }
+    if nr == PIDFD_GET_INFO_NR {
+        return Some(get_info(cx, process, ((cmd >> 16) & 0x3fff) as usize, arg));
+    }
+    use rk_vfs::nsfs::NsKind;
+    let kind = match cmd {
+        0xff01 => NsKind::Cgroup,
+        0xff02 => NsKind::Ipc,
+        0xff03 => NsKind::Mnt,
+        0xff04 => NsKind::Net,
+        // The PID and time namespaces for the children are the namespaces of the process.
+        0xff05 | 0xff06 => NsKind::Pid,
+        0xff07 | 0xff08 => NsKind::Time,
+        0xff09 => NsKind::User,
+        0xff0a => NsKind::Uts,
+        _ => return Some(Err(Errno::ENOTTY)),
+    };
+    Some(open_ns(cx, process, kind, arg))
+}
+
+/// Opens the file of the namespace `kind` of `process` for a `PIDFD_GET_*_NAMESPACE` command,
+/// as `open_namespace` of Linux. The new descriptor has `FD_CLOEXEC`.
+fn open_ns(cx: &Cx<'_>, process: &Arc<Process>, kind: rk_vfs::nsfs::NsKind, arg: u64) -> SysResult {
+    // A zombie has no namespaces, as a task without `nsproxy` on Linux.
+    if reaped(process) || process.is_zombie() {
+        return Err(Errno::ESRCH);
+    }
+    if arg != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if !Arc::ptr_eq(process, cx.process()) && !cx.process().cred().may_ptrace(&process.cred()) {
+        return Err(Errno::EACCES);
+    }
+    let inode: InodeRef = crate::ns::inode_of(process, kind)?;
+    let file = File::open_inode(Location::detached(inode), O_RDONLY);
+    Ok(cx.files()?.lock().insert(file, true)? as u64)
 }
 
 /// Gives the process of the process file descriptor `fd`.

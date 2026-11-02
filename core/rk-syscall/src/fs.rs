@@ -966,6 +966,9 @@ pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     if let Some((kind, id)) = file.inode().and_then(rk_vfs::nsfs::ns_of) {
         return crate::ns::ioctl(cx, kind, id, cmd, arg);
     }
+    if let Some(result) = crate::pidfd::ioctl(cx, &file, cmd, arg) {
+        return result;
+    }
     if let Some(notify) = crate::seccomp::listener_of(&file) {
         return crate::seccomp::listener_ioctl(cx, &notify, cmd, arg);
     }

@@ -2129,6 +2129,120 @@ static void test_pidfs(void)
 	umount("/proc");
 }
 
+/* struct pidfd_info of <linux/pidfd.h>. */
+struct rk_pidfd_info {
+	uint64_t mask, cgroupid;
+	uint32_t pid, tgid, ppid, ruid, rgid, euid, egid, suid, sgid, fsuid, fsgid;
+	int32_t exit_code;
+	uint32_t coredump_mask, spare1;
+};
+
+/* PIDFD_GET_INFO with the structure size n, as _IOWR(0xFF, 11, n). */
+#define RK_PIDFD_GET_INFO(n) (0xc0000000u | ((unsigned)(n) << 16) | 0xff00u | 11u)
+
+/* Tells if the namespace file fd and /proc/self/ns/name have one inode. */
+static int same_ns(int fd, const char *name)
+{
+	char path[64];
+	struct stat a, b;
+
+	snprintf(path, sizeof(path), "/proc/self/ns/%s", name);
+	return fd >= 0 && fstat(fd, &a) == 0 && stat(path, &b) == 0 && a.st_ino == b.st_ino &&
+	       a.st_dev == b.st_dev;
+}
+
+static void test_pidfd_ioctl(void)
+{
+	struct rk_pidfd_info info;
+	int fds[2];
+	char c = 0;
+
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	if (pipe(fds) != 0) {
+		check("pipe for the pidfd ioctls", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		read(fds[0], &c, 1);
+		_exit(5);
+	}
+	int a = syscall(SYS_pidfd_open, pid, 0);
+	memset(&info, 0, sizeof(info));
+	int r = ioctl(a, RK_PIDFD_GET_INFO(sizeof(info)), &info);
+	check("PIDFD_GET_INFO gives the IDs and the credentials of a process",
+	      r == 0 && (info.mask & 7) == 7 && info.pid == (uint32_t)pid && info.tgid == (uint32_t)pid &&
+		      info.ppid == (uint32_t)getpid() && info.ruid == getuid() && info.euid == geteuid() &&
+		      info.rgid == getgid() && info.fsgid == getegid() && info.cgroupid != 0);
+	/* The ID of the cgroup is the inode of its directory, if cgroup2 is at /sys/fs/cgroup. */
+	char cgpath[320] = "/sys/fs/cgroup", cgline[256] = "";
+	FILE *cgf = fopen("/proc/self/cgroup", "r");
+	if (cgf) {
+		if (fgets(cgline, sizeof(cgline), cgf) && strncmp(cgline, "0::", 3) == 0) {
+			cgline[strcspn(cgline, "\n")] = 0;
+			strcat(cgpath, cgline + 3);
+		}
+		fclose(cgf);
+	}
+	struct statfs cgfs;
+	struct stat cg;
+	if (statfs(cgpath, &cgfs) == 0 && cgfs.f_type == 0x63677270 && stat(cgpath, &cg) == 0)
+		check("PIDFD_GET_INFO gives the inode of the cgroup as its ID", info.cgroupid == cg.st_ino);
+	check("PIDFD_GET_INFO with a structure of 32 bytes gives EINVAL",
+	      ioctl(a, RK_PIDFD_GET_INFO(32), &info) == -1 && errno == EINVAL);
+	check("an ioctl of another type on a pidfd gives ENOTTY",
+	      ioctl(a, RK_PIDFD_GET_INFO(64) & ~0xff00u, &info) == -1 && errno == ENOTTY);
+	unsigned gen = 1;
+	check("FS_IOC_GETVERSION of a pidfd gives 0", ioctl(a, 0x80087601u, &gen) == 0 && gen == 0);
+
+	/* The namespace ioctls: _IO(0xFF, 1..10). */
+	static const char *const names[] = { "cgroup", "ipc", "mnt", "net", "pid", "pid_for_children",
+					     "time", "time_for_children", NULL, "uts" };
+	int all = 1;
+	for (unsigned i = 0; i < 10; i++) {
+		if (!names[i])
+			continue;
+		int ns = ioctl(a, 0xff01u + i, 0);
+		if (!same_ns(ns, names[i]) || !(fcntl(ns, F_GETFD) & FD_CLOEXEC))
+			all = 0;
+		close(ns);
+	}
+	check("PIDFD_GET_*_NAMESPACE opens the namespaces of /proc/PID/ns", all);
+	int ns = ioctl(a, 0xff0au, 0);
+	check("setns with a file of PIDFD_GET_UTS_NAMESPACE", ns >= 0 && setns(ns, CLONE_NEWUTS) == 0);
+	close(ns);
+	check("PIDFD_GET_UTS_NAMESPACE with an argument gives EINVAL",
+	      ioctl(a, 0xff0au, 1) == -1 && errno == EINVAL);
+	check("PIDFD_GET_USER_NAMESPACE gives EOPNOTSUPP",
+	      ioctl(a, 0xff09u, 0) == -1 && errno == EOPNOTSUPP);
+
+	write(fds[1], &c, 1);
+	siginfo_t si;
+	waitid(P_PID, pid, &si, WEXITED | WNOWAIT);
+	memset(&info, 0, sizeof(info));
+	info.mask = 8; /* PIDFD_INFO_EXIT */
+	r = ioctl(a, RK_PIDFD_GET_INFO(sizeof(info)), &info);
+	check("PIDFD_GET_INFO of a zombie gives the credentials and no exit status",
+	      r == 0 && (info.mask & 2) && !(info.mask & 8) && info.pid == (uint32_t)pid);
+	check("PIDFD_GET_UTS_NAMESPACE of a zombie gives ESRCH",
+	      ioctl(a, 0xff0au, 0) == -1 && errno == ESRCH);
+	waitpid(pid, NULL, 0);
+	memset(&info, 0, sizeof(info));
+	info.mask = 4; /* PIDFD_INFO_CGROUPID */
+	check("PIDFD_GET_INFO of a reaped process without PIDFD_INFO_EXIT gives ESRCH",
+	      ioctl(a, RK_PIDFD_GET_INFO(sizeof(info)), &info) == -1 && errno == ESRCH);
+	info.mask = 8;
+	r = ioctl(a, RK_PIDFD_GET_INFO(sizeof(info)), &info);
+	check("PIDFD_GET_INFO of a reaped process gives the exit status",
+	      r == 0 && (info.mask & 8) && !(info.mask & 2) && WIFEXITED(info.exit_code) &&
+		      WEXITSTATUS(info.exit_code) == 5);
+	close(a);
+	close(fds[0]);
+	close(fds[1]);
+	umount("/proc");
+}
+
 static void test_pidfd(void)
 {
 	int fds[2];
@@ -9554,6 +9668,7 @@ static void test_all(void)
 	test_clone3();
 	test_pidfd();
 	test_pidfs();
+	test_pidfd_ioctl();
 	test_signalfd_poll();
 	test_seccomp();
 	test_ptrace();

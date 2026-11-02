@@ -3,6 +3,7 @@
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
@@ -67,6 +68,33 @@ pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> S
         }
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// The inode of the namespace of the kind `kind` of `process`, as the links of `/proc/PID/ns`.
+/// The inode of a network, UTS or IPC namespace keeps the namespace.
+///
+/// # Errors
+///
+/// Gives `EOPNOTSUPP` for a user namespace: rukernel has no files of user namespaces, as Linux
+/// without `CONFIG_USER_NS`. Gives `ENOENT` for the mount namespace of a process without a file
+/// system context.
+pub(crate) fn inode_of(process: &Process, kind: NsKind) -> Result<Arc<NsInode>, Errno> {
+    Ok(match kind {
+        NsKind::User => return Err(Errno::EOPNOTSUPP),
+        NsKind::Net => {
+            let net = process.net_ns();
+            NsInode::with_hold(kind, net.id(), net)
+        }
+        NsKind::Uts => {
+            let uts = process.uts_ns();
+            NsInode::with_hold(kind, uts.id(), uts)
+        }
+        NsKind::Ipc => {
+            let ipc = process.ipc_ns();
+            NsInode::with_hold(kind, ipc.id(), ipc)
+        }
+        _ => NsInode::new(kind, rk_proc::ns::ns_id(process, kind)?),
+    })
 }
 
 /// Puts `process` in the namespace `id` of the kind `kind`, other than a cgroup namespace, as
