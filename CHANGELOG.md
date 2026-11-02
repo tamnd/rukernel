@@ -13,6 +13,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- TCP and UDP on loopback copy each byte fewer times, and a packet that the kernel made does not get its checksum checked again on the loopback device, as `CHECKSUM_PARTIAL` of Linux (#465). Before, each byte of a TCP stream went through memory about 12 times, against 2 on Linux: `write` copied the data two times, TCP built each segment in a `Vec` that IP copied into the packet buffer, and the receive side computed the checksum again. Now TCP and UDP build the packet in a buffer with room for the IP and link headers, and `write` with one vector copies one time. At a load of 0.1 to 1.7, the median of 5 runs of `tcp_stream` on arm64 went from 93.7 to 106 MB/s (Linux 100), and `udp_stream` on x86_64 from 12.4 to 14.8 MB/s (Linux 6.63).
 - The timers of the network stack run at most one time in each millisecond, and not at each poll, so `tcp_stream` and `udp_stream` of tools/bench are faster (#465). Each TCP and UDP send polls the devices, and each poll ran the timers of TCP, of the neighbour tables, of the fragments and of IPv6. On x86_64, these timers took about 10% of the time of `tcp_stream`. The timers count in milliseconds, so a run in the same millisecond had no work. At a load of 0.1 to 1.7, the median of 5 runs on arm64 went from 76.8 to 93.7 MB/s for `tcp_stream` and from 8.56 to 9.58 MB/s for `udp_stream`. Linux gave 100 and 7.63 MB/s.
 
 ## [0.4.21] - 2026-11-01
