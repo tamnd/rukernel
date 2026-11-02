@@ -7,7 +7,10 @@
 
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_abi::native::netlink::{NLA_TYPE_MASK, NLM_F_CAPPED, NLM_F_MULTI, NLMSG_DONE, NLMSG_ERROR};
+use rk_abi::native::netlink::{
+    NLA_TYPE_MASK, NLM_F_ACK_TLVS, NLM_F_CAPPED, NLM_F_MULTI, NLMSG_DONE, NLMSG_ERROR,
+    NLMSGERR_ATTR_MSG, NLMSGERR_ATTR_OFFS,
+};
 use rk_vfs::inode::Result;
 
 /// The size of the header of a message, `NLMSG_HDRLEN`.
@@ -250,22 +253,79 @@ impl<'a> Attrs<'a> {
 /// error has a copy of the whole request, unless the socket asked for `NETLINK_CAP_ACK`. An ack
 /// and a capped error have only the header of the request and the flag `NLM_F_CAPPED`.
 pub fn ack(req: &[u8], err: i32, portid: u32, cap_ack: bool) -> Vec<u8> {
+    ack_ext(req, err, portid, cap_ack, None)
+}
+
+/// The extended ack of a request, as `struct netlink_ext_ack` of Linux: a message for the user
+/// and the offset of the bad attribute from the start of the request.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtAck {
+    /// The message, `NLMSGERR_ATTR_MSG`.
+    pub msg: Option<&'static str>,
+    /// The offset of the bad attribute, `NLMSGERR_ATTR_OFFS`.
+    pub offs: Option<u32>,
+}
+
+impl ExtAck {
+    /// Tells if the ack of the error `err` has attributes, as `netlink_ack_tlv_len` of Linux.
+    /// The offset goes only with an error.
+    fn has_tlvs(&self, err: i32) -> bool {
+        self.msg.is_some() || (err != 0 && self.offs.is_some())
+    }
+
+    /// Adds the attributes, as `netlink_ack_tlv_fill` of Linux.
+    fn fill(&self, b: &mut Builder, err: i32) {
+        if let Some(m) = self.msg {
+            b.str(NLMSGERR_ATTR_MSG as u16, m);
+        }
+        if err != 0
+            && let Some(o) = self.offs
+        {
+            b.u32(NLMSGERR_ATTR_OFFS as u16, o);
+        }
+    }
+}
+
+/// Builds the ack as `ack`, with the extended ack `ext` of a socket with `NETLINK_EXT_ACK`.
+/// The ack then has the flag `NLM_F_ACK_TLVS` and the attributes `NLMSGERR_ATTR_*`.
+pub fn ack_ext(req: &[u8], err: i32, portid: u32, cap_ack: bool, ext: Option<&ExtAck>) -> Vec<u8> {
     let h = Header::parse(req).unwrap_or_default();
     let full = err != 0 && !cap_ack;
     let copy = if full { (h.len as usize).min(req.len()) } else { HDRLEN };
-    let flags = if full { 0 } else { NLM_F_CAPPED as u16 };
+    let mut flags = if full { 0 } else { NLM_F_CAPPED as u16 };
+    let ext = ext.filter(|e| e.has_tlvs(err));
+    if ext.is_some() {
+        flags |= NLM_F_ACK_TLVS as u16;
+    }
     let mut b = Builder::new(NLMSG_ERROR as u16, flags, h.seq, portid);
     let mut payload = Vec::with_capacity(4 + copy);
     payload.extend_from_slice(&err.to_ne_bytes());
     payload.extend_from_slice(&req[..copy]);
     b.fixed(&payload);
+    if let Some(e) = ext {
+        e.fill(&mut b, err);
+    }
     b.finish()
 }
 
 /// Builds the message at the end of a dump, as `netlink_dump_done` of Linux.
 pub fn done(seq: u32, portid: u32, status: i32) -> Vec<u8> {
-    let mut b = Builder::new(NLMSG_DONE as u16, NLM_F_MULTI as u16, seq, portid);
+    done_ext(seq, portid, status, None)
+}
+
+/// Builds the message at the end of a dump as `done`, with the extended ack `ext` of a socket
+/// with `NETLINK_EXT_ACK`.
+pub fn done_ext(seq: u32, portid: u32, status: i32, ext: Option<&ExtAck>) -> Vec<u8> {
+    let ext = ext.filter(|e| e.has_tlvs(status));
+    let mut flags = NLM_F_MULTI as u16;
+    if ext.is_some() {
+        flags |= NLM_F_ACK_TLVS as u16;
+    }
+    let mut b = Builder::new(NLMSG_DONE as u16, flags, seq, portid);
     b.fixed(&status.to_ne_bytes());
+    if let Some(e) = ext {
+        e.fill(&mut b, status);
+    }
     b.finish()
 }
 

@@ -11,6 +11,7 @@
 use crate::ip::{self, Ip};
 use crate::ipv6;
 use crate::route::{INFINITY, Metrics, RTAX_MAX};
+use crate::rules::{Flow, Rules, Step};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_addr::{
@@ -196,6 +197,8 @@ pub struct Table6 {
     routes: Vec<Route6>,
     /// The index of the loopback device, or 0.
     loopback: u32,
+    /// The routing rules.
+    pub rules: Rules,
 }
 
 impl Default for Table6 {
@@ -234,12 +237,22 @@ fn common(a: &Ip, b: &Ip) -> u32 {
 impl Table6 {
     /// An empty table.
     pub const fn new() -> Self {
-        Self { addrs: Vec::new(), routes: Vec::new(), loopback: 0 }
+        Self {
+            addrs: Vec::new(),
+            routes: Vec::new(),
+            loopback: 0,
+            rules: Rules::new(rk_net::consts::AF_INET6),
+        }
     }
 
     /// Records the index of the loopback device. A packet to a local address goes on it.
     pub fn set_loopback(&mut self, ifindex: u32) {
         self.loopback = ifindex;
+    }
+
+    /// The index of the loopback device, or 0.
+    pub fn loopback(&self) -> u32 {
+        self.loopback
     }
 
     /// The addresses.
@@ -557,31 +570,55 @@ impl Table6 {
     ///
     /// Gives the errors of `lookup`.
     pub fn lookup_route(&self, dst: &Ip, oif: u32) -> Result<(Next6, Option<&Route6>)> {
+        self.lookup_flow(&Flow { dst: *dst, oif, iif: self.loopback, ..Flow::default() })
+    }
+
+    /// Finds the route for the flow `fl` as `lookup_route`, through the rules, as
+    /// `fib6_rule_lookup` of Linux.
+    ///
+    /// # Errors
+    ///
+    /// Gives the errors of `lookup`, and the error of a rule that rejects.
+    pub fn lookup_flow(&self, fl: &Flow) -> Result<(Next6, Option<&Route6>)> {
+        let (dst, oif) = (&fl.dst, fl.oif);
         if let Some(a) = self.addrs.iter().find(|a| a.addr == *dst) {
             let ifindex = if self.loopback != 0 { self.loopback } else { a.ifindex };
             let next = Next6 { ifindex, hop: *dst, src: *dst, local: true, mtu: 0 };
             let route = self.routes.iter().find(|r| r.same(&Route6::local(a, self.loopback)));
             return Ok((next, route));
         }
-        let route = self
-            .routes
-            .iter()
-            .filter(|r| {
-                let table_ok = r.table == RT_TABLE_MAIN
-                    || (r.table == RT_TABLE_LOCAL && r.kind == RTN_MULTICAST as u8);
-                table_ok
-                    && matches!(
-                        u32::from(r.kind),
-                        RTN_UNICAST
-                            | RTN_MULTICAST
-                            | RTN_UNREACHABLE
-                            | RTN_PROHIBIT
-                            | RTN_BLACKHOLE
-                    )
-                    && (oif == 0 || r.ifindex == oif)
-                    && ipv6::same_net(&r.dst, dst, r.prefix)
-            })
-            .max_by_key(|r| (r.prefix, u32::MAX - r.priority));
+        let in_table = |table: u32| {
+            self.routes
+                .iter()
+                .filter(|r| {
+                    // The local routes of the addresses are in the check above.
+                    let table_ok = r.table == table
+                        && (table != RT_TABLE_LOCAL || r.kind == RTN_MULTICAST as u8);
+                    table_ok
+                        && matches!(
+                            u32::from(r.kind),
+                            RTN_UNICAST
+                                | RTN_MULTICAST
+                                | RTN_UNREACHABLE
+                                | RTN_PROHIBIT
+                                | RTN_BLACKHOLE
+                        )
+                        && (oif == 0 || r.ifindex == oif)
+                        && ipv6::same_net(&r.dst, dst, r.prefix)
+                })
+                .max_by_key(|r| (r.prefix, u32::MAX - r.priority))
+        };
+        let route = match self.rules.lookup(fl, |table| match in_table(table) {
+            None => Step::Next,
+            Some(r) if u32::from(r.kind) == RTN_UNICAST || u32::from(r.kind) == RTN_MULTICAST => {
+                Step::Found(r, Some(r.prefix))
+            }
+            Some(r) => Step::Found(r, None),
+        }) {
+            Ok(r) => Some(r),
+            Err(Errno::ESRCH) => None,
+            Err(e) => return Err(e),
+        };
         // A route that rejects gives the error of `ip6_rt_type_to_error` of Linux.
         match route.map(|r| u32::from(r.kind)) {
             Some(RTN_UNREACHABLE) => return Err(Errno::ENETUNREACH),

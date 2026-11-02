@@ -10,6 +10,7 @@ use crate::route::{
     INFINITY, IfAddr, Match, Metrics, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK, RTAX_FEATURES,
     RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
 };
+use crate::rules::Flow;
 use crate::stack::{self, ROUTES};
 use crate::stack6;
 use alloc::string::String;
@@ -367,7 +368,17 @@ fn getroute(req: &Request<'_>) -> Result<()> {
     }
     // A lookup of 0.0.0.0 goes to the loopback address, as `ip_route_output_key_hash_rcu`.
     let to = if dst == ipv4::ANY { [127, 0, 0, 1] } else { dst };
-    let (next, route) = t.lookup_route(to, oif)?;
+    let mut fl = Flow::v4(to, oif, t.loopback());
+    if src != ipv4::ANY {
+        fl = fl.with_src4(src);
+    }
+    fl.mark = mark;
+    fl.uid = uid;
+    fl.tos = h[3];
+    fl.proto = a.u8(RTA_IP_PROTO).ok().flatten().unwrap_or(0);
+    fl.sport = a.get(RTA_SPORT).and_then(|d| d.first_chunk()).map_or(0, |p| u16::from_be_bytes(*p));
+    fl.dport = a.get(RTA_DPORT).and_then(|d| d.first_chunk()).map_or(0, |p| u16::from_be_bytes(*p));
+    let (next, route) = t.lookup_flow(&fl)?;
     if rflags & RTM_F_FIB_MATCH != 0 {
         let r = route.ok_or(Errno::EHOSTUNREACH)?;
         let m = fib::fill_route(r, RTM_NEWROUTE, req.portid, req.hdr.seq, 0);

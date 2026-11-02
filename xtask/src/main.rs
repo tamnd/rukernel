@@ -1793,7 +1793,7 @@ fn pass_line(test: &str) -> String {
 /// QEMU without `ip=`, through rtnetlink (`ip`) and the interface ioctls (`ifconfig`, `route`).
 /// Then it pings the gateway, looks up routes, and reads the files of /proc/net, the socket
 /// tables and /sys/class/net. The line editor of BusyBox takes at most 1024 bytes, so the
-/// commands are in two lines. The shell exits with 0 only if all of the commands pass.
+/// commands are in three lines. The shell exits with 0 only if all of the commands pass.
 const NETCFG_SCRIPT: &[u8] = b"mkdir -p /proc && mount -t proc proc /proc \
 && ip link set lo up && ip link set eth0 up \
 && ip addr add 10.0.2.15/24 dev eth0 && ip route add default via 10.0.2.2 \
@@ -1822,7 +1822,21 @@ const NETCFG_SCRIPT2: &[u8] =
 && mkdir -p /sys && mount -t sysfs sysfs /sys && ls /sys/class/net /sys/class/net/eth0 \
 && cat /sys/class/net/eth0/address /sys/class/net/eth0/operstate \
 && grep -q 1400 /sys/class/net/eth0/mtu && cat /sys/class/net/lo/statistics/rx_packets \
-&& grep VmData /proc/self/status && exit 0; exit 1\n";
+&& grep VmData /proc/self/status && echo 'netcfg: second'' part' || exit 1\n";
+
+/// The third line of the `netcfg` test (#538). A rule sends the packets from 10.0.2.15 to the
+/// table 100, which has a different default route. `ip route get` gives the route of the table
+/// with the source, and the route of `main` without it. A second rule selects by the
+/// destination. After the rules are deleted, the lookups give the route of `main` again.
+const NETCFG_SCRIPT3: &[u8] = b"ip rule && ip rule | grep -q '^32766:.*from all lookup main' \
+&& ip rule add from 10.0.2.15 lookup 100 && ip route add default via 10.0.2.3 table 100 \
+&& ip rule && ip rule | grep -q '^32765:.*from 10.0.2.15 lookup 100' \
+&& ip route get 1.1.1.1 from 10.0.2.15 && ip route get 1.1.1.1 from 10.0.2.15 | grep -q 'via 10.0.2.3' \
+&& ip route get 1.1.1.1 | grep -q 'via 10.0.2.2' \
+&& ip rule add to 10.0.9.0/24 lookup 100 pref 100 && ip route get 10.0.9.1 | grep -q 'via 10.0.2.3' \
+&& ip rule del pref 100 && ip route get 10.0.9.1 | grep -q 'via 10.0.2.2' \
+&& ip rule del from 10.0.2.15 lookup 100 && ! ip rule | grep -q 'lookup 100' \
+&& ip route get 1.1.1.1 from 10.0.2.15 | grep -q 'via 10.0.2.2' && exit 0; exit 1\n";
 
 /// The commands of the `inet6` test. The shell brings up lo and the interface of the user network
 /// of QEMU, and checks the address `::1` and the link local address that the kernel makes from
@@ -2002,7 +2016,11 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("TICK", b"\x03"),
             ("TICK", b"test $? = 130; exit $?\n"),
         ],
-        "netcfg" => &[("/ # ", NETCFG_SCRIPT), ("netcfg: first part", NETCFG_SCRIPT2)],
+        "netcfg" => &[
+            ("/ # ", NETCFG_SCRIPT),
+            ("netcfg: first part", NETCFG_SCRIPT2),
+            ("netcfg: second part", NETCFG_SCRIPT3),
+        ],
         "netns" => &[
             ("/ # ", NETNS_SCRIPT),
             ("netns: first part", NETNS_SCRIPT2),

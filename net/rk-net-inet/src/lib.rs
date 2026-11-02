@@ -42,6 +42,7 @@ mod procfs;
 pub mod route;
 pub mod route6;
 mod rtnl;
+pub mod rules;
 pub mod sockaddr;
 mod socket;
 mod stack;
@@ -65,6 +66,7 @@ use rk_vfs::inode::Result;
 pub fn init() {
     rk_net::netlink::init();
     rtnl::init();
+    rules::init();
     addrconf::init();
     procfs::init();
     rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af);

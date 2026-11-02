@@ -11,6 +11,7 @@
 //! table `local` and then in the table `main`, as the default rules of Linux.
 
 use crate::ipv4::{self, Addr};
+use crate::rules::{Flow, Rules, Step};
 use alloc::string::String;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -295,8 +296,7 @@ pub struct Changes {
     pub removed: Vec<Route>,
 }
 
-/// The addresses and the routes.
-#[derive(Default)]
+/// The addresses, the routes and the routing rules.
 pub struct Table {
     addrs: Vec<IfAddr>,
     routes: Vec<Route>,
@@ -304,12 +304,34 @@ pub struct Table {
     tables: Vec<u32>,
     /// The interface index of the loopback device.
     loopback: u32,
+    /// The routing rules.
+    pub rules: Rules,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Table {
     /// An empty table.
     pub const fn new() -> Self {
-        Self { addrs: Vec::new(), routes: Vec::new(), tables: Vec::new(), loopback: 0 }
+        Self {
+            addrs: Vec::new(),
+            routes: Vec::new(),
+            tables: Vec::new(),
+            loopback: 0,
+            rules: Rules::new(rk_net::consts::AF_INET),
+        }
+    }
+
+    /// Makes an empty table with the lowest free ID, as `fib_empty_table` of Linux. Gives
+    /// `None` if the IDs up to 4096 are in use.
+    pub fn new_table(&mut self) -> Option<u32> {
+        let id = (1..=4096).find(|&id| !self.has_table(id))?;
+        self.tables.push(id);
+        Some(id)
     }
 
     /// Sets the loopback device, which takes the packets to the local addresses.
@@ -603,10 +625,32 @@ impl Table {
             .min_by_key(|r| (32 - r.prefix, r.priority))
     }
 
-    /// The best route to `dst` in the tables `local` and `main`, as `fib_lookup` of Linux.
+    /// The best route to `dst` from this host through the rules, as `fib_lookup` of Linux.
     fn fib_lookup(&self, dst: Addr, scope: u8, oif: u32) -> Option<&Route> {
-        self.table_lookup(RT_TABLE_LOCAL, dst, scope, oif)
-            .or_else(|| self.table_lookup(RT_TABLE_MAIN, dst, scope, oif))
+        self.rule_lookup(&Flow::v4(dst, oif, self.loopback), scope).ok()
+    }
+
+    /// The route for the flow `fl` through the rules, as `fib_lookup` of Linux with
+    /// `fib_rules_lookup`. A route of the type `throw` sends the lookup to the next rule.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ESRCH` if no rule gives a route, and the error of a rule that rejects.
+    fn rule_lookup(&self, fl: &Flow, scope: u8) -> Result<&Route> {
+        let mut dst = [0; 4];
+        dst.copy_from_slice(&fl.dst[..4]);
+        self.rules.lookup(fl, |table| match self.table_lookup(table, dst, scope, fl.oif) {
+            None => Step::Next,
+            Some(r) if u32::from(r.kind) == RTN_THROW => Step::Next,
+            Some(r) if r.error().is_some() => Step::Found(r, None),
+            Some(r) => Step::Found(r, Some(r.prefix)),
+        })
+    }
+
+    /// The interface index of the loopback device, the input interface of the packets of this
+    /// host, or 0.
+    pub fn loopback(&self) -> u32 {
+        self.loopback
     }
 
     /// The type of the address `a`, as `inet_addr_type` of Linux: `RTN_LOCAL`, `RTN_BROADCAST`,
@@ -728,9 +772,29 @@ impl Table {
     ///
     /// As `lookup`.
     pub fn lookup_route(&self, dst: Addr, oif: u32) -> Result<(Next, Option<&Route>)> {
-        let Some(r) = self.fib_lookup(dst, RT_SCOPE_UNIVERSE as u8, oif) else {
+        self.lookup_flow(&Flow::v4(dst, oif, self.loopback))
+    }
+
+    /// Finds the route for the flow `fl` from this host, as `lookup_route` with the fields of
+    /// the flow that the rules look at.
+    ///
+    /// # Errors
+    ///
+    /// As `lookup`, and the error of a rule of the type `unreachable`, `prohibit` or
+    /// `blackhole`.
+    pub fn lookup_flow(&self, fl: &Flow) -> Result<(Next, Option<&Route>)> {
+        let mut dst = [0; 4];
+        dst.copy_from_slice(&fl.dst[..4]);
+        let oif = fl.oif;
+        let found = self.rule_lookup(fl, RT_SCOPE_UNIVERSE as u8);
+        let Ok(r) = found else {
+            // Without a route, a flow with an output interface goes on its link, as the
+            // `make_route` case of `ip_route_output_key_hash_rcu` of Linux.
             if oif == 0 {
-                return Err(Errno::ENETUNREACH);
+                return Err(match found {
+                    Err(Errno::ESRCH) | Ok(_) => Errno::ENETUNREACH,
+                    Err(e) => e,
+                });
             }
             let src = self.select_addr(oif, ipv4::ANY, RT_SCOPE_LINK as u8).unwrap_or(ipv4::ANY);
             let next = Next { ifindex: oif, hop: dst, src, local: false, broadcast: false };
@@ -767,7 +831,23 @@ impl Table {
     /// Gives `ENETUNREACH` if no route matches, and the error of a route of the type
     /// `unreachable`, `prohibit` or `blackhole`.
     pub fn lookup_input(&self, dst: Addr) -> Result<(Next, u8)> {
-        let r = self.fib_lookup(dst, RT_SCOPE_UNIVERSE as u8, 0).ok_or(Errno::ENETUNREACH)?;
+        self.lookup_input_flow(&Flow::v4(dst, 0, 0))
+    }
+
+    /// Finds the route of a received packet with the flow `fl`, as `lookup_input` with the
+    /// fields of the flow that the rules look at: the input interface and the source.
+    ///
+    /// # Errors
+    ///
+    /// As `lookup_input`, and the error of a rule that rejects.
+    pub fn lookup_input_flow(&self, fl: &Flow) -> Result<(Next, u8)> {
+        let mut dst = [0; 4];
+        dst.copy_from_slice(&fl.dst[..4]);
+        let r = match self.rule_lookup(fl, RT_SCOPE_UNIVERSE as u8) {
+            Ok(r) => r,
+            Err(Errno::ESRCH) => return Err(Errno::ENETUNREACH),
+            Err(e) => return Err(e),
+        };
         if let Some(e) = r.error() {
             return Err(e);
         }
