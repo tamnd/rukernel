@@ -8903,12 +8903,14 @@ static void test_cgroup(void)
 	check("pids.events counts the limit", cg_value("/cg/t/a/pids.events", "max ") >= 1);
 	cg_write("/cg/t/a/pids.max", "max");
 
-	cg_write("/cg/t/a/cpu.max", "10000 100000");
 	/* The time that QEMU on a busy host does not run the guest counts as CPU time of the busy
 	 * loop, so one try can go above the limit (#504). The check has 3 tries, and each try uses
-	 * the change of the counters. */
+	 * the change of the counters. Each try writes cpu.max again, so that it starts a new period
+	 * with the full quota: the debt of a try that went far above the limit kept the next tries
+	 * throttled, and a throttle that lasts counts one time only (#417). */
 	int cpu_max_ok = 0;
 	for (int i = 0; i < 3 && !cpu_max_ok; i++) {
+		cg_write("/cg/t/a/cpu.max", "10000 100000");
 		long usage0 = cg_value("/cg/t/a/cpu.stat", "usage_usec ");
 		long throttled0 = cg_value("/cg/t/a/cpu.stat", "nr_throttled ");
 		status = wait_status(cgroup_child("/cg/t/a", cg_busy));
