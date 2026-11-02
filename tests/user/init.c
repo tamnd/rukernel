@@ -4506,6 +4506,74 @@ static void test_sched_sysctls(void)
 	put_file("/proc/sys/kernel/sched_rt_runtime_us", "950000");
 }
 
+/*
+ * The sysctls that LTP and systemd read: kernel.random.boot_id and uuid, kernel.sem,
+ * fs.nr_open, kernel.ns_last_pid and vm.vfs_cache_pressure (#543).
+ */
+static void test_sysctls(void)
+{
+	char a[64], b[64];
+	int ok;
+
+	/* test_proc unmounts /proc at its end. */
+	mkdir("/proc", 0555);
+	check("mount proc for the sysctls", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	ok = read_file("/proc/sys/kernel/random/boot_id", a, sizeof(a)) == 37 &&
+	     read_file("/proc/sys/kernel/random/boot_id", b, sizeof(b)) == 37 && !strcmp(a, b);
+	ok = ok && a[8] == '-' && a[13] == '-' && a[14] == '4' && a[18] == '-' && a[23] == '-';
+	check("kernel.random.boot_id is one UUID of version 4", ok);
+	ok = read_file("/proc/sys/kernel/random/uuid", a, sizeof(a)) == 37 &&
+	     read_file("/proc/sys/kernel/random/uuid", b, sizeof(b)) == 37 && strcmp(a, b);
+	check("kernel.random.uuid is new at each read", ok);
+	check("kernel.random.uuid is read only", put_file("/proc/sys/kernel/random/uuid", "x") == -1);
+
+	check("kernel.sem has the defaults of Linux",
+	      read_file("/proc/sys/kernel/sem", a, sizeof(a)) > 0 &&
+	      !strcmp(a, "32000\t1024000000\t500\t32000\n"));
+	ok = put_file("/proc/sys/kernel/sem", "250 32000 32 128") == 0 &&
+	     read_file("/proc/sys/kernel/sem", a, sizeof(a)) > 0 && !strcmp(a, "250\t32000\t32\t128\n");
+	check("kernel.sem takes new limits", ok);
+	errno = 0;
+	check("semget above SEMMSL gives EINVAL", semget(IPC_PRIVATE, 251, 0600) == -1 && errno == EINVAL);
+	check("kernel.sem with SEMMNI above IPCMNI gives ERANGE",
+	      put_file("/proc/sys/kernel/sem", "250 32000 32 40000") == -1 && errno == ERANGE);
+	put_file("/proc/sys/kernel/sem", "32000 1024000000 500 32000");
+
+	check("fs.nr_open is 1048576",
+	      read_file("/proc/sys/fs/nr_open", a, sizeof(a)) > 0 && !strcmp(a, "1048576\n"));
+	check("fs.nr_open below 64 gives EINVAL",
+	      put_file("/proc/sys/fs/nr_open", "63") == -1 && errno == EINVAL);
+	dup2(2, 65);
+	ok = put_file("/proc/sys/fs/nr_open", "64") == 0;
+	errno = 0;
+	ok = ok && unshare(CLONE_FILES) == -1 && errno == EMFILE;
+	struct rlimit rl = { 100, 100 };
+	errno = 0;
+	ok = ok && setrlimit(RLIMIT_NOFILE, &rl) == -1 && errno == EPERM;
+	put_file("/proc/sys/fs/nr_open", "1048576");
+	close(65);
+	check("a descriptor above fs.nr_open stops unshare(CLONE_FILES)", ok);
+	check("unshare(CLONE_FILES) works again", unshare(CLONE_FILES) == 0);
+
+	ok = read_file("/proc/sys/kernel/ns_last_pid", a, sizeof(a)) > 0;
+	int next = atoi(a) + 1000;
+	snprintf(b, sizeof(b), "%d", next - 1);
+	ok = ok && put_file("/proc/sys/kernel/ns_last_pid", b) == 0;
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(0);
+	waitpid(pid, NULL, 0);
+	ok = ok && pid == next && read_file("/proc/sys/kernel/ns_last_pid", a, sizeof(a)) > 0 &&
+	     atoi(a) == next;
+	check("kernel.ns_last_pid sets the next process ID", ok);
+
+	check("vm.vfs_cache_pressure is 100",
+	      read_file("/proc/sys/vm/vfs_cache_pressure", a, sizeof(a)) > 0 && !strcmp(a, "100\n"));
+	check("vm.vfs_cache_pressure below 0 gives EINVAL",
+	      put_file("/proc/sys/vm/vfs_cache_pressure", "-1") == -1 && errno == EINVAL);
+	umount("/proc");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -8984,6 +9052,7 @@ static void test_all(void)
 	test_membarrier();
 	test_overlay();
 	test_proc();
+	test_sysctls();
 	test_memfd();
 	test_shm();
 	test_sem();

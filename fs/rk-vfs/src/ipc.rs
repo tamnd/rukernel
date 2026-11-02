@@ -97,6 +97,41 @@ pub static SHMALL: LongTunable = LongTunable::new(u64::MAX - (1 << 24));
 /// The largest number of System V shared memory segments, `kernel.shmmni`.
 pub static SHMMNI: Tunable = Tunable::new(4096, 0, IPCMNI);
 
+/// The limits of the semaphores, `kernel.sem`, as `sem_ctls` of Linux: the largest number of
+/// semaphores in a set (SEMMSL), of semaphores in all sets (SEMMNS), of operations in one
+/// `semop` (SEMOPM) and of sets (SEMMNI). The defaults are the defaults of Linux.
+static SEM: [AtomicI32; 4] = [
+    AtomicI32::new(32000),
+    AtomicI32::new(1_024_000_000),
+    AtomicI32::new(500),
+    AtomicI32::new(32000),
+];
+
+/// The limits of the semaphores, `[SEMMSL, SEMMNS, SEMOPM, SEMMNI]`.
+pub fn sem_limits() -> [i32; 4] {
+    SEM.each_ref().map(|v| v.load(Ordering::Relaxed))
+}
+
+/// Changes the first limits of the semaphores to `values`, as a write of `kernel.sem` with
+/// `proc_ipc_sem_dointvec` of Linux. A write can give fewer than four values.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for more than four values, and `ERANGE` if SEMMNI is not in the range 0 to
+/// `IPCMNI`. Then no limit changes.
+pub fn set_sem_limits(values: &[i32]) -> Result<(), Errno> {
+    if values.len() > SEM.len() {
+        return Err(Errno::EINVAL);
+    }
+    if values.get(3).is_some_and(|&n| !(0..=IPCMNI).contains(&n)) {
+        return Err(Errno::ERANGE);
+    }
+    for (limit, &v) in SEM.iter().zip(values) {
+        limit.store(v, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
 /// The largest number of POSIX message queues, `fs.mqueue.queues_max`.
 pub static MQ_QUEUES_MAX: Tunable = Tunable::new(256, 0, i32::MAX);
 /// The largest number of messages in a POSIX message queue, `fs.mqueue.msg_max`.

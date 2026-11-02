@@ -139,6 +139,9 @@ pub struct Restart {
 /// The user CPU time of all the threads in timer ticks, for the `cpu` line of `/proc/stat`.
 static USER_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// The serial number of the last process that was made.
+static SERIAL: AtomicU64 = AtomicU64::new(0);
+
 /// The user CPU time of all the threads since boot, in timer ticks.
 pub fn user_ticks() -> u64 {
     USER_TICKS.load(Ordering::Relaxed)
@@ -173,6 +176,8 @@ pub struct Process {
     image: SpinLock<Image>,
     /// The tick of the timer when the process was made.
     start_tick: u64,
+    /// A number that no other process of this boot has, also when the PID comes again.
+    serial: u64,
     /// The value of `/proc/PID/oom_score_adj`.
     oom_score_adj: AtomicI32,
     /// The value of `/proc/PID/coredump_filter`: the bits `MMF_DUMP_*` of Linux. A child of
@@ -435,6 +440,24 @@ fn alloc_pid(table: &mut Table) -> Result<Pid, Errno> {
         }
     }
     Err(Errno::EAGAIN)
+}
+
+/// The last ID that the kernel gave, `kernel.ns_last_pid`, as `pid_ns_ctl_handler` in
+/// kernel/pid_namespace.c of Linux.
+pub fn last_pid() -> Pid {
+    TABLE.lock().next - 1
+}
+
+/// Makes `pid + 1` the next ID to try, for a write of `kernel.ns_last_pid`. A checkpoint and
+/// restore tool uses it to make a process with a given ID.
+///
+/// # Errors
+///
+/// Gives `EINVAL` if `pid` is not in the range 0 to `PID_MAX`, as `proc_dointvec_minmax`.
+pub fn set_last_pid(pid: i64) -> Result<(), Errno> {
+    let pid = Pid::try_from(pid).ok().filter(|&p| p <= PID_MAX).ok_or(Errno::EINVAL)?;
+    TABLE.lock().next = if pid + 1 >= PID_MAX { 300 } else { pid + 1 };
+    Ok(())
 }
 
 /// Gives the process with the ID `pid`.
@@ -795,6 +818,12 @@ impl Process {
         self.start_tick
     }
 
+    /// A number that no other process of this boot has. A new process with the same PID has
+    /// another serial number, so `/proc/PID` of the two processes has two inode numbers.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// The user CPU time of the process in timer ticks: the time of its threads, and of the
     /// threads that ended.
     pub fn user_ticks(&self) -> u64 {
@@ -1106,6 +1135,7 @@ impl Process {
             exit_signal,
             image: SpinLock::new(Image::default()),
             start_tick: rk_frame::time::ticks(),
+            serial: SERIAL.fetch_add(1, Ordering::Relaxed) + 1,
             oom_score_adj: AtomicI32::new(0),
             coredump_filter: AtomicU32::new(COREDUMP_FILTER_DEFAULT),
             dumpable: AtomicU8::new(crate::coredump::SUID_DUMP_USER),
@@ -1834,7 +1864,8 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
         child
     };
     let files = pp.files().ok_or(Errno::ESRCH)?;
-    let files = if share.files { files } else { Arc::new(SpinLock::new(files.lock().clone())) };
+    let files =
+        if share.files { files } else { Arc::new(SpinLock::new(files.lock().try_clone()?)) };
     let fs = pp.fs().ok_or(Errno::ESRCH)?;
     let fs = if share.fs { fs } else { Arc::new(SpinLock::new(fs.lock().clone())) };
     let (pgid, sid, comm) = {

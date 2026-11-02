@@ -391,6 +391,14 @@ pub trait Inode: Any + Send + Sync {
         Ok(())
     }
 
+    /// Tells that the inode is gone, so that a lookup does not take its dentry from the cache and
+    /// asks the directory again, as `d_revalidate` of Linux. The directory of a process in procfs
+    /// is gone when the process ended, also when a new process has its PID. The default is
+    /// `false`.
+    fn stale(&self) -> bool {
+        false
+    }
+
     /// Finds the inode of `name` in this directory.
     fn lookup(&self, _name: &[u8]) -> Result<InodeRef> {
         Err(Errno::ENOTDIR)

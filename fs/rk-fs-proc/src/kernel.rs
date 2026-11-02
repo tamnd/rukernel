@@ -2,7 +2,8 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{
-    FindFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file, set_owner,
+    FindFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file, set_gone,
+    set_owner,
 };
 use crate::procmap;
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
@@ -29,6 +30,8 @@ pub struct KernelInfo {
     pub version: &'static str,
     /// The command line of the kernel.
     pub cmdline: String,
+    /// Fills a buffer with random bytes, for `kernel.random.boot_id` and `kernel.random.uuid`.
+    pub random: Option<fn(&mut [u8])>,
 }
 
 static INFO: Once<KernelInfo> = Once::new();
@@ -375,6 +378,7 @@ fn stat() -> Vec<u8> {
 /// does not use it yet.
 const SYSCTLS: &[(&str, &str)] = &[
     ("fs/file-max", ""),
+    ("fs/nr_open", ""),
     ("fs/inotify/max_queued_events", ""),
     ("fs/inotify/max_user_instances", ""),
     ("fs/inotify/max_user_watches", ""),
@@ -399,6 +403,7 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/keys/root_maxbytes", ""),
     ("kernel/keys/root_maxkeys", ""),
     ("kernel/ngroups_max", "65536"),
+    ("kernel/ns_last_pid", ""),
     ("kernel/osrelease", ""),
     ("kernel/ostype", "Linux"),
     ("kernel/overflowgid", "65534"),
@@ -408,9 +413,12 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/printk", "4\t4\t1\t7"),
     // The generator is ready at boot, so the entropy count is full, as `input_pool.init_bits`
     // of Linux. The two files only give text.
+    ("kernel/random/boot_id", ""),
     ("kernel/random/entropy_avail", "256"),
     ("kernel/random/poolsize", "256"),
+    ("kernel/random/uuid", ""),
     ("kernel/sched_rr_timeslice_ms", ""),
+    ("kernel/sem", ""),
     ("kernel/sched_rt_period_us", ""),
     ("kernel/sched_rt_runtime_us", ""),
     ("kernel/tainted", "0"),
@@ -435,10 +443,49 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("vm/overcommit_memory", ""),
     ("vm/overcommit_ratio", ""),
     ("vm/panic_on_oom", "0"),
+    // The kernel has no inode and dentry caches to shrink, so the value only keeps its text.
+    ("vm/vfs_cache_pressure", "100"),
 ];
 
 /// The sysctls that only give text, with the mode 0444 of Linux.
-const READ_ONLY_SYSCTLS: &[&str] = &["kernel/random/entropy_avail", "kernel/random/poolsize"];
+const READ_ONLY_SYSCTLS: &[&str] = &[
+    "kernel/random/boot_id",
+    "kernel/random/entropy_avail",
+    "kernel/random/poolsize",
+    "kernel/random/uuid",
+];
+
+/// Makes a random UUID of version 4 in the text form of `%pU` of Linux, as `proc_do_uuid` in
+/// drivers/char/random.c.
+fn uuid_text(mut uuid: [u8; 16]) -> Vec<u8> {
+    uuid[6] = (uuid[6] & 0x0f) | 0x40;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    let mut out = String::new();
+    for (i, b) in uuid.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out += &format!("{b:02x}");
+    }
+    out.push('\n');
+    out.into_bytes()
+}
+
+/// 16 random bytes from the generator of the kernel.
+fn random_uuid() -> [u8; 16] {
+    let mut uuid = [0; 16];
+    if let Some(fill) = info().random {
+        fill(&mut uuid);
+    }
+    uuid
+}
+
+/// The ID of this boot, `kernel.random.boot_id`. It is random, and it stays the same until the
+/// next boot. journald puts it in each record.
+fn boot_id() -> [u8; 16] {
+    static ID: Once<[u8; 16]> = Once::new();
+    *ID.call_once(random_uuid)
+}
 
 static SYSCTL_VALUES: SpinLock<Vec<(&'static str, Vec<u8>)>> = SpinLock::new(Vec::new());
 
@@ -536,6 +583,17 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     }
     if let Some((get, _)) = vm_tunable(name) {
         return format!("{}\n", get()).into_bytes();
+    }
+    match name {
+        "kernel/random/boot_id" => return uuid_text(boot_id()),
+        "kernel/random/uuid" => return uuid_text(random_uuid()),
+        "fs/nr_open" => return format!("{}\n", rk_vfs::fdtable::nr_open()).into_bytes(),
+        "kernel/ns_last_pid" => return format!("{}\n", rk_proc::last_pid()).into_bytes(),
+        "kernel/sem" => {
+            let [msl, mns, opm, mni] = rk_vfs::ipc::sem_limits();
+            return format!("{msl}\t{mns}\t{opm}\t{mni}\n").into_bytes();
+        }
+        _ => {}
     }
     // The real time values of the scheduler, as kernel/sched/rt.c of Linux.
     match name {
@@ -640,6 +698,43 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         }
         return set(n).ok_or(Errno::EINVAL);
+    }
+    match name {
+        // A value from 64 to `INT_MAX` rounded down to 64, as `sysctl_nr_open` in fs/file.c of
+        // Linux.
+        "fs/nr_open" => {
+            let n = usize::try_from(parse_int(data)?).map_err(|_| Errno::EINVAL)?;
+            let range = rk_vfs::fdtable::NR_OPEN_MIN..=rk_vfs::fdtable::NR_OPEN_MAX;
+            if !range.contains(&n) {
+                return Err(Errno::EINVAL);
+            }
+            rk_vfs::fdtable::NR_OPEN.store(n, Ordering::Relaxed);
+            return Ok(());
+        }
+        // Only a process with `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` sets the next ID, as
+        // `pid_ns_ctl_handler` in kernel/pid_namespace.c of Linux.
+        "kernel/ns_last_pid" => {
+            use rk_vfs::cred::cap;
+            let cred = rk_vfs::cred::current();
+            if !cred.capable(cap::SYS_ADMIN) && !cred.capable(cap::CHECKPOINT_RESTORE) {
+                return Err(Errno::EPERM);
+            }
+            return rk_proc::set_last_pid(i64::from(parse_int(data)?));
+        }
+        // Up to four `int` values, as `proc_ipc_sem_dointvec` in ipc/ipc_sysctl.c of Linux.
+        "kernel/sem" => {
+            let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+            let text = core::str::from_utf8(&data[..end]).map_err(|_| Errno::EINVAL)?;
+            let values: Vec<i32> = text
+                .split_ascii_whitespace()
+                .map(|w| w.parse().map_err(|_| Errno::EINVAL))
+                .collect::<Result<_>>()?;
+            return rk_vfs::ipc::set_sem_limits(&values);
+        }
+        // An `int` of 0 or more, as `vfs_cache_pressure` in fs/dcache.c of Linux. The text is
+        // kept below.
+        "vm/vfs_cache_pressure" if parse_int(data)? < 0 => return Err(Errno::EINVAL),
+        _ => {}
     }
     // `sched_rr_handler` and `sched_rt_handler` in kernel/sched/rt.c of Linux. A time slice of 0
     // or less sets the default. The checks of the period and the run time are in `rk_proc`.
@@ -1858,7 +1953,9 @@ fn owned(w: &Weak<Process>, node: InodeRef) -> InodeRef {
 
 fn process_dir(p: &Arc<Process>) -> InodeRef {
     let w = Arc::downgrade(p);
-    let base = format!("/{}", p.pid()).into_bytes();
+    // The inode numbers come from the serial number too, so that a new process with the same PID
+    // has new inodes, as in Linux.
+    let base = format!("/{}/{}", p.pid(), p.serial()).into_bytes();
     let list_base = base.clone();
     let owner = w.clone();
     let node = dir(
@@ -1873,6 +1970,13 @@ fn process_dir(p: &Arc<Process>) -> InodeRef {
         },
         None,
     );
+    // The directory is gone when the process is not in the table of processes: after the wait
+    // that reaped it, also when a new process has the PID now, as `pid_revalidate` of Linux.
+    let gone = owner.clone();
+    set_gone(&node, move || {
+        gone.upgrade()
+            .is_none_or(|p| rk_proc::find_process(p.pid()).is_none_or(|now| !Arc::ptr_eq(&now, &p)))
+    });
     owned(&owner, node)
 }
 

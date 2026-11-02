@@ -679,7 +679,7 @@ pub(crate) fn close_range(cx: &Cx<'_>, first: u64, last: u64, flags: u64) -> Sys
     }
     if flags & CLOSE_RANGE_UNSHARE != 0 {
         // As `unshare_fd` in `__close_range`: the process takes its own copy of the table.
-        let table = cx.files()?.lock().clone();
+        let table = cx.files()?.lock().try_clone()?;
         cx.process().set_files(Arc::new(SpinLock::new(table)));
     }
     let files = cx.files()?;

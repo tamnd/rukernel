@@ -10,6 +10,21 @@ use rk_abi::Errno;
 /// The default of `RLIMIT_NOFILE`, as Linux.
 pub const NR_OPEN_DEFAULT: usize = 1024;
 
+/// `fs.nr_open`: the largest number of descriptors of a table, and the largest hard limit of
+/// `RLIMIT_NOFILE`, as `sysctl_nr_open` in fs/file.c of Linux.
+pub static NR_OPEN: AtomicUsize = AtomicUsize::new(1 << 20);
+
+/// The smallest value of `fs.nr_open`, `sysctl_nr_open_min` of Linux: the bits of a `long`.
+pub const NR_OPEN_MIN: usize = 64;
+
+/// The largest value of `fs.nr_open`, `sysctl_nr_open_max` of Linux on a 64-bit machine.
+pub const NR_OPEN_MAX: usize = i32::MAX as usize & !(NR_OPEN_MIN - 1);
+
+/// The value of `fs.nr_open`.
+pub fn nr_open() -> usize {
+    NR_OPEN.load(Ordering::Relaxed)
+}
+
 /// One descriptor.
 #[derive(Clone, Debug)]
 pub struct FdEntry {
@@ -82,6 +97,22 @@ impl FdTable {
     /// process. The descriptors at `limit` or above stay open, as on Linux.
     pub fn set_limit(&mut self, limit: usize) {
         self.limit = limit;
+    }
+
+    /// Copies the table for `fork` or `unshare(CLONE_FILES)`, as `dup_fd` of Linux. Linux counts
+    /// the descriptors in words of 64 bits, and a new table has at most `fs.nr_open` descriptors,
+    /// rounded up to a word.
+    ///
+    /// # Errors
+    ///
+    /// Gives `EMFILE` if the copy cannot hold the highest open descriptor.
+    pub fn try_clone(&self) -> Result<Self> {
+        let open = self.entries.iter().rposition(Option::is_some).map_or(0, |fd| fd + 1);
+        let words = |n: usize| n.div_ceil(NR_OPEN_MIN);
+        if words(open) > words(nr_open()) {
+            return Err(Errno::EMFILE);
+        }
+        Ok(self.clone())
     }
 
     /// The owner of the POSIX record locks that the process takes through this table.
