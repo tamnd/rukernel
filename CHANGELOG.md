@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+
+- The arm64 `boot` and `smp` boot tests run with 8 CPUs, not 4, as the x86_64 tests. The arm64 `smp` test takes about 74 s with 8 CPUs and 53 s with 4 on server1 (#417).
+
 ## [0.5.0] - 2026-11-03
 
 ### Added

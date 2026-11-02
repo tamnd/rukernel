@@ -2296,8 +2296,8 @@ const AARCH64_PCI_RUNS: &[(&str, ArmPci)] = &[
     ("inet", ArmPci::Bridge),
 ];
 
-/// The number of CPUs of the arm64 `boot` test. The other arm64 tests have one CPU.
-const AARCH64_SMP_CPUS: &str = "4";
+/// The number of CPUs of the arm64 `boot` and `smp` tests. The other arm64 tests have one CPU.
+const AARCH64_SMP_CPUS: &str = "8";
 
 /// The offset and the value of the magic number in the header of a Linux arm64 `Image`, per
 /// Documentation/arch/arm64/booting.rst of Linux.
