@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.0] - 2026-11-03
+
 ### Added
 
 - tools/bench/results-aarch64.md has new `cow`, `tcp_stream` and `udp_stream` rows from runs at a load average of 5.1 to 7.2 on server2. No row is red now: `tcp_stream` gives 71.9 MB/s on rukernel and 81.2 MB/s on Linux (1.13), `udp_stream` 6.68 and 4.56 MB/s (0.68), and `cow` 24523 ns and 117128 ns (0.21). The Linux values of the two stream rows change much from run to run (#465, #435).
@@ -1278,6 +1280,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.0]: https://github.com/tamnd/rukernel/compare/v0.4.21...v0.5.0
 [0.4.21]: https://github.com/tamnd/rukernel/compare/v0.4.20...v0.4.21
 [0.4.20]: https://github.com/tamnd/rukernel/compare/v0.4.19...v0.4.20
 [0.4.19]: https://github.com/tamnd/rukernel/releases/tag/v0.4.19
