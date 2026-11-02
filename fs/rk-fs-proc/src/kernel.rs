@@ -63,6 +63,19 @@ pub(crate) fn root() -> InodeRef {
     dir(b"/", b"/", 0o555, root_list, Some(find))
 }
 
+/// The text that `show` makes from the block devices, in the order of their numbers.
+fn disks(show: fn(&[text::Disk]) -> String) -> Vec<u8> {
+    let list: Vec<text::Disk> = rk_vfs::blockdev::block_devices()
+        .into_iter()
+        .filter_map(|(name, rdev)| {
+            let q = rk_vfs::blockdev::block_queue(rdev)?;
+            let (major, minor) = (rk_vfs::device::major(rdev), rk_vfs::device::minor(rdev));
+            Some(text::Disk { major, minor, name, sectors: q.sectors(), stats: q.stats().fields() })
+        })
+        .collect();
+    show(&list).into_bytes()
+}
+
 fn root_list() -> Result<Vec<(Vec<u8>, InodeRef)>> {
     let mut out = root_files();
     for p in rk_proc::processes() {
@@ -175,6 +188,8 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
         text_file(b"/cgroups", || rk_cgroup::with(|h| h.proc_cgroups()).into_bytes()),
     ));
     out.push((b"pressure".to_vec(), pressure_dir()));
+    out.push((b"diskstats".to_vec(), text_file(b"/diskstats", || disks(text::diskstats))));
+    out.push((b"partitions".to_vec(), text_file(b"/partitions", || disks(text::partitions))));
     out
 }
 

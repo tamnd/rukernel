@@ -162,6 +162,54 @@ pub struct Stats {
     pub sectors: [u64; 2],
     /// The flush commands.
     pub flushes: u64,
+    /// The time of the requests of each direction, in nanoseconds.
+    pub ticks: [u64; 2],
+    /// The discard requests.
+    pub discards: u64,
+    /// The sectors of the discard requests.
+    pub discard_sectors: u64,
+    /// The time of the discard requests, in nanoseconds.
+    pub discard_ticks: u64,
+    /// The time of the flush commands, in nanoseconds.
+    pub flush_ticks: u64,
+    /// The time in which the device had a request, in nanoseconds.
+    pub busy: u64,
+}
+
+/// Nanoseconds in a millisecond.
+const NS_PER_MS: u64 = 1_000_000;
+
+impl Stats {
+    /// The 17 fields of `/sys/block/DEV/stat` and `/proc/diskstats`, as `part_stat_show` of
+    /// block/genhd.c of Linux: for reads, writes, discards and flushes the requests, the merges,
+    /// the sectors and the time in milliseconds, with the requests in flight, the time in which
+    /// the device was busy and the sum of the times.
+    ///
+    /// Linux counts the busy time in jiffies, so a device that did a request shows at least 1.
+    /// Here the busy time rounds up to the next millisecond for the same effect.
+    pub fn fields(&self) -> [u64; 17] {
+        let ms = |ns: u64| ns / NS_PER_MS;
+        let total = self.ticks[0] + self.ticks[1] + self.discard_ticks + self.flush_ticks;
+        [
+            self.ios[0],
+            self.merges[0],
+            self.sectors[0],
+            ms(self.ticks[0]),
+            self.ios[1],
+            self.merges[1],
+            self.sectors[1],
+            ms(self.ticks[1]),
+            0,
+            self.busy.div_ceil(NS_PER_MS),
+            ms(total),
+            self.discards,
+            0,
+            self.discard_sectors,
+            ms(self.discard_ticks),
+            self.flushes,
+            ms(self.flush_ticks),
+        ]
+    }
 }
 
 /// The requests that wait in a queue.
@@ -298,7 +346,11 @@ impl Queue {
             let c = &mut charge[rq.dir as usize];
             c.0 += rq.sectors * SECTOR_SIZE as u64;
             c.1 += rq.bios.len() as u64;
+            let start = crate::now();
             self.run(&rq, bios);
+            let end = crate::now();
+            stats.ticks[rq.dir as usize] += end.saturating_sub(start);
+            stats.busy += end.saturating_sub(start).max(1);
         }
         drop(stats);
         drop(pending);
@@ -391,8 +443,14 @@ impl Queue {
     ///
     /// Gives the error of the device.
     pub fn flush(&self) -> Result<()> {
-        self.stats.lock().flushes += 1;
-        self.device.flush()
+        let start = now();
+        let r = self.device.flush();
+        let ns = now().saturating_sub(start);
+        let mut stats = self.stats.lock();
+        stats.flushes += 1;
+        stats.flush_ticks += ns;
+        stats.busy += ns.max(1);
+        r
     }
 
     /// Tells if the device can discard sectors.
@@ -415,9 +473,16 @@ impl Queue {
         }
         let start = now();
         self.device.discard(sector, count)?;
+        let ns = now().saturating_sub(start);
+        {
+            let mut stats = self.stats.lock();
+            stats.discards += 1;
+            stats.discard_sectors += count;
+            stats.discard_ticks += ns;
+            stats.busy += ns.max(1);
+        }
         if let Some(account) = ACCOUNT.get() {
             let dev = self.dev.load(Ordering::Relaxed);
-            let ns = now().saturating_sub(start);
             account(dev, IoOp::Discard, count * SECTOR_SIZE as u64, 1, ns);
         }
         Ok(())
@@ -521,6 +586,13 @@ mod tests {
         }
         assert_eq!(q.stats().merges, [2, 0]);
         assert_eq!(q.stats().ios, [1, 0]);
+        let f = q.stats().fields();
+        assert_eq!(f[..4], [1, 2, 3, 0]);
+        assert_eq!(f[4..9], [0; 5]);
+        // A device that did a request was busy for at least one millisecond, as in Linux.
+        assert_eq!(f[9], 1);
+        q.flush().unwrap();
+        assert_eq!(q.stats().fields()[15], 1);
     }
 
     #[test]

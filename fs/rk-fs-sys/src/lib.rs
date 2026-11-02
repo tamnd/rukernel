@@ -6,7 +6,8 @@
 //!
 //! - `/sys/devices/virtual/CLASS/NAME` is the directory of a device. It has the files `dev` and
 //!   `uevent`, and the link `subsystem`. A block device also has `size`, `ro`, `removable` and
-//!   the directory `queue` with the limits of the queue.
+//!   the directory `queue` with the limits of the queue, and `stat` and `inflight` with the
+//!   counts of the queue, as block/genhd.c of Linux.
 //!   A loop device with a file also has the directory `loop`, which `losetup` reads.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
@@ -288,6 +289,8 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     if d.block {
         let size = block_sectors(d.rdev).unwrap_or(0);
         let ro = block_queue(d.rdev).is_some_and(|q| q.read_only());
+        let inflight = format!("{:>8} {:>8}\n", 0, 0);
+        out.push((String::from("inflight"), Kind::File(inflight.into_bytes())));
         if rk_vfs::loopdev::sysfs_files(d.rdev).is_some() {
             out.push((String::from("loop"), Kind::Dir));
         }
@@ -295,6 +298,10 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
         out.push((String::from("removable"), Kind::File(b"0\n".to_vec())));
         out.push((String::from("ro"), Kind::File(format!("{}\n", u8::from(ro)).into_bytes())));
         out.push((String::from("size"), Kind::File(format!("{size}\n").into_bytes())));
+        let fields = block_queue(d.rdev).map_or([0; 17], |q| q.stats().fields());
+        let stat: Vec<String> = fields.iter().map(|v| format!("{v:>8}")).collect();
+        let stat = format!("{}\n", stat.join(" "));
+        out.push((String::from("stat"), Kind::File(stat.into_bytes())));
     }
     let subsystem = format!("../../../../class/{}", d.class);
     out.push((String::from("subsystem"), Kind::Link(subsystem.into_bytes())));
@@ -641,7 +648,7 @@ mod tests {
         );
         assert_eq!(
             names("devices/virtual/block/vda"),
-            ["dev", "queue", "removable", "ro", "size", "subsystem", "uevent"]
+            ["dev", "inflight", "queue", "removable", "ro", "size", "stat", "subsystem", "uevent"]
         );
         assert_eq!(
             get("devices/virtual/block/vda/queue/logical_block_size"),

@@ -3503,6 +3503,37 @@ static void test_sysfs_cpu(void)
 	check("node0/cpuN links to the CPU", access(path, R_OK) == 0);
 }
 
+/* The counts of vda in /sys/block/vda/stat and /proc/diskstats, as block/genhd.c of Linux: 17
+ * numbers, with the reads first and the busy time in the tenth. LTP reads the sectors written
+ * and the busy time, and a busy time of 0 makes it skip fsync04. /proc/partitions gives the
+ * size in KiB. */
+static void test_disk_stats(void)
+{
+	unsigned long long v[17] = {0};
+	char buf[512], *line;
+	int n, proc = access("/proc/self", F_OK) < 0;
+
+	/* The caller may run without /proc. */
+	mkdir("/proc", 0555);
+	if (proc)
+		mount("proc", "/proc", "proc", 0, NULL);
+	n = read_small("/sys/block/vda/stat", buf, sizeof(buf)) > 0 ?
+		    sscanf(buf, "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu "
+				"%llu %llu %llu",
+			   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10],
+			   &v[11], &v[12], &v[13], &v[14], &v[15], &v[16]) :
+		    0;
+	check("/sys/block/vda/stat has 17 counts", n == 17 && strlen(buf) == 17 * 9);
+	check("/sys/block/vda/stat counts the reads and the busy time", v[0] > 0 && v[2] > 0 && v[9] > 0);
+	line = read_small("/proc/diskstats", buf, sizeof(buf)) > 0 ? strstr(buf, " vda ") : NULL;
+	check("/proc/diskstats has a line for vda", line != NULL && strtoull(line + 5, NULL, 10) > 0);
+	check("/proc/partitions has the size of vda in KiB",
+	      read_small("/proc/partitions", buf, sizeof(buf)) > 0 &&
+		      strncmp(buf, "major minor  #blocks  name\n\n", 28) == 0 && strstr(buf, " vda\n") != NULL);
+	if (proc)
+		umount("/proc");
+}
+
 static void test_sysfs(void)
 {
 	struct statfs sfs;
@@ -5086,6 +5117,23 @@ static void test_blk(void)
 	test_aio(fd);
 	test_cache(fd);
 	close(fd);
+
+	/* After the reads and the fsync, the counts of vda are not 0. */
+	int proc = access("/proc/self", F_OK) < 0;
+	mkdir("/proc", 0755);
+	mkdir("/sys", 0755);
+	if (proc)
+		mount("proc", "/proc", "proc", 0, NULL);
+	check("mount sysfs for the counts of vda", mount("sysfs", "/sys", "sysfs", 0, NULL) == 0);
+	test_disk_stats();
+	unsigned long long writes = 0, flushes = 0;
+	if (read_small("/sys/block/vda/stat", (char *)buf, 512) > 0)
+		sscanf((char *)buf, "%*u %*u %*u %*u %llu %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %llu",
+		       &writes, &flushes);
+	check("/sys/block/vda/stat counts the writes and the flush", writes > 0 && flushes > 0);
+	umount("/sys");
+	if (proc)
+		umount("/proc");
 }
 
 /* The rounds of each check of system calls on several CPUs at the same time (#405). */
