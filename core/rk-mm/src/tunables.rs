@@ -126,6 +126,30 @@ pub fn set_overcommit_memory(value: usize) -> Option<()> {
     (value <= OVERCOMMIT_NEVER).then(|| OVERCOMMIT_MEMORY.store(value, Ordering::Relaxed))
 }
 
+/// `vm.memfd_noexec` 0: `memfd_create` without `MFD_EXEC` or `MFD_NOEXEC_SEAL` gives an
+/// executable file, as `MEMFD_NOEXEC_SCOPE_EXEC` of Linux.
+pub const MEMFD_NOEXEC_SCOPE_EXEC: usize = 0;
+/// `vm.memfd_noexec` 1: `memfd_create` without `MFD_EXEC` or `MFD_NOEXEC_SEAL` acts as with
+/// `MFD_NOEXEC_SEAL`.
+pub const MEMFD_NOEXEC_SCOPE_NOEXEC_SEAL: usize = 1;
+/// `vm.memfd_noexec` 2: `memfd_create` without `MFD_NOEXEC_SEAL` gives `EACCES`.
+pub const MEMFD_NOEXEC_SCOPE_NOEXEC_ENFORCED: usize = 2;
+
+/// The value of `vm.memfd_noexec`. Linux keeps it in each PID namespace. The kernel has only the
+/// first PID namespace, which has no parent, so the value has no lower limit.
+static MEMFD_NOEXEC: AtomicUsize = AtomicUsize::new(MEMFD_NOEXEC_SCOPE_EXEC);
+
+/// `vm.memfd_noexec`, as `pidns_memfd_noexec_scope` in kernel/pid_namespace.c of Linux.
+pub fn memfd_noexec() -> usize {
+    MEMFD_NOEXEC.load(Ordering::Relaxed)
+}
+
+/// Sets `vm.memfd_noexec`. Gives `None` for a value that is not 0, 1 or 2.
+pub fn set_memfd_noexec(value: usize) -> Option<()> {
+    (value <= MEMFD_NOEXEC_SCOPE_NOEXEC_ENFORCED)
+        .then(|| MEMFD_NOEXEC.store(value, Ordering::Relaxed))
+}
+
 /// `vm.overcommit_ratio`, the percent of the memory in the commit limit.
 pub fn overcommit_ratio() -> usize {
     OVERCOMMIT_RATIO.load(Ordering::Relaxed)

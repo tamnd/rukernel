@@ -4813,6 +4813,48 @@ static void test_vmstat(void)
 	      read_small("/proc/zoneinfo", buf, sizeof(buf)) > 0 &&
 		      strncmp(buf, "Node 0, zone   Normal\n  per-node stats\n", 37) == 0 &&
 		      strstr(buf, "\n  pages free     ") && strstr(buf, "\n  start_pfn:           "));
+
+	/* vm.memfd_noexec, as kernel/pid_namespace.c and mm/memfd.c of Linux. 1034 is F_GET_SEALS,
+	 * 0x20 is F_SEAL_EXEC, 0x8 is MFD_NOEXEC_SEAL and 0x10 is MFD_EXEC. */
+	struct stat st;
+	int fd, status;
+	check("vm.memfd_noexec is 0", read_small("/proc/sys/vm/memfd_noexec", buf, sizeof(buf)) > 0 &&
+					      !strcmp(buf, "0\n"));
+	fd = (int)syscall(SYS_memfd_create, "rk", 0);
+	check("vm.memfd_noexec 0 gives an executable memfd",
+	      fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0111) == 0111);
+	close(fd);
+	check("vm.memfd_noexec above 2 gives EINVAL",
+	      put_file("/proc/sys/vm/memfd_noexec", "3") == -1 && errno == EINVAL);
+	check("vm.memfd_noexec takes 1", put_file("/proc/sys/vm/memfd_noexec", "1") == 0);
+	fd = (int)syscall(SYS_memfd_create, "rk", 0);
+	check("vm.memfd_noexec 1 seals a memfd without MFD_EXEC",
+	      fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0111) == 0 &&
+		      (fcntl(fd, 1034) & 0x20));
+	close(fd);
+	fd = (int)syscall(SYS_memfd_create, "rk", 0x10);
+	check("vm.memfd_noexec 1 keeps MFD_EXEC",
+	      fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0111) == 0111);
+	close(fd);
+	put_file("/proc/sys/vm/memfd_noexec", "2");
+	errno = 0;
+	check("vm.memfd_noexec 2 refuses MFD_EXEC",
+	      syscall(SYS_memfd_create, "rk", 0x10) == -1 && errno == EACCES);
+	fd = (int)syscall(SYS_memfd_create, "rk", 0);
+	check("vm.memfd_noexec 2 seals a memfd without flags", fd >= 0);
+	close(fd);
+	pid_t pid = fork();
+	if (pid == 0) {
+		/* Root without capabilities: the mode 0644 lets the owner open the file, and the
+		 * write then needs CAP_SYS_ADMIN. */
+		struct { unsigned int version; int pid; } hdr = {0x20080522, 0};
+		unsigned int caps[6] = {0};
+		_exit(syscall(SYS_capset, &hdr, caps) == 0 &&
+		      put_file("/proc/sys/vm/memfd_noexec", "0") == -1 && errno == EPERM ? 0 : 1);
+	}
+	check("vm.memfd_noexec needs CAP_SYS_ADMIN",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	put_file("/proc/sys/vm/memfd_noexec", "0");
 	umount("/proc");
 }
 

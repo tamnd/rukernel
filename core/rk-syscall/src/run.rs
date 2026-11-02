@@ -234,6 +234,7 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
             ReturnReason::Exception(e) => {
                 let info = match e.kind() {
                     ExceptionKind::PageFault { addr, access, .. } => {
+                        rk_frame::trap::count_user_page_fault();
                         page_fault(thread, &e, addr, access)
                     }
                     _ => Some(exception_signal(&e, regs.pc())),

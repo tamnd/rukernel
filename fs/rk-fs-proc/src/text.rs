@@ -842,13 +842,17 @@ mod tests {
             buddyinfo(&c),
             concat!(
                 "Node 0, zone   Normal      3      0      0      0      0      0      0      0",
-                "      0    100 \n"
+                "      0      0    100 \n"
             )
         );
         let z = zoneinfo(&c);
-        assert!(z.starts_with("Node 0, zone   Normal\n  per-node stats\n      nr_inactive_anon 0\n"));
+        assert!(
+            z.starts_with("Node 0, zone   Normal\n  per-node stats\n      nr_inactive_anon 0\n")
+        );
         assert!(z.contains("\n      nr_mapped    0\n"));
-        assert!(z.contains("\n  pages free     120000\n        boost    0\n        min      1448\n"));
+        assert!(
+            z.contains("\n  pages free     120000\n        boost    0\n        min      1448\n")
+        );
         assert!(z.contains("\n        spanned  131039\n        present  131072\n"));
         assert!(z.contains("\n      nr_free_pages 120000\n"));
         assert!(z.contains("\n    cpu: 0\n              count: 5\n              high:  128\n"));

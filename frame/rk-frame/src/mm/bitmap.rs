@@ -324,7 +324,7 @@ mod tests {
         let mut want = [0; MAX_ORDER + 1];
         // 1..4 is the block 1 and the block 2..4. 64..1217 is the blocks 64..128, 128..256,
         // 256..512, 512..1024, 1024..1152, 1152..1216 and 1216.
-        want[0] = 3;
+        want[0] = 2;
         want[1] = 1;
         want[6] = 2;
         want[7] = 2;

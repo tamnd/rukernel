@@ -58,6 +58,21 @@ pub(crate) fn memfd_create(cx: &Cx<'_>, name: u64, flags: u64) -> SysResult {
     if flags & !known != 0 || flags & (MFD_NOEXEC_SEAL | MFD_EXEC) == MFD_NOEXEC_SEAL | MFD_EXEC {
         return Err(Errno::EINVAL);
     }
+    // `vm.memfd_noexec` picks the default and can refuse an executable file, as
+    // `check_sysctl_memfd_noexec` in mm/memfd.c of Linux.
+    let scope = rk_mm::tunables::memfd_noexec();
+    let mut flags = flags;
+    if flags & (MFD_EXEC | MFD_NOEXEC_SEAL) == 0 {
+        flags |= if scope >= rk_mm::tunables::MEMFD_NOEXEC_SCOPE_NOEXEC_SEAL {
+            MFD_NOEXEC_SEAL
+        } else {
+            MFD_EXEC
+        };
+    }
+    if flags & MFD_NOEXEC_SEAL == 0 && scope >= rk_mm::tunables::MEMFD_NOEXEC_SCOPE_NOEXEC_ENFORCED
+    {
+        return Err(Errno::EACCES);
+    }
     // The pool has only pages of 2 MiB. Another size gives `ENODEV`, as `hugetlb_file_setup`.
     if huge {
         crate::mm::hugetlb_size(flags >> MFD_HUGE_SHIFT).map_err(|_| Errno::ENODEV)?;
