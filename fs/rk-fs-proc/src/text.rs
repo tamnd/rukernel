@@ -30,6 +30,46 @@ pub struct MemInfo {
     pub hugetlb: rk_mm::hugetlb::Counts,
 }
 
+/// A block device, for `/proc/diskstats` and `/proc/partitions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Disk {
+    /// The major number of the device.
+    pub major: u32,
+    /// The minor number of the device.
+    pub minor: u32,
+    /// The name of the device, as `vda`.
+    pub name: String,
+    /// The size in sectors of 512 bytes.
+    pub sectors: u64,
+    /// The 17 counts of `/sys/block/DEV/stat`.
+    pub stats: [u64; 17],
+}
+
+/// The text of `/proc/diskstats`, as `diskstats_show` of block/genhd.c of Linux: the numbers,
+/// the name and the 17 counts of each device.
+pub fn diskstats(disks: &[Disk]) -> String {
+    let mut out = String::new();
+    for d in disks {
+        let _ = write!(out, "{:>4} {:>7} {}", d.major, d.minor, d.name);
+        for v in d.stats {
+            let _ = write!(out, " {v}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The text of `/proc/partitions`, as `show_partition` of block/genhd.c of Linux: the size of
+/// each device in blocks of 1 KiB. A device with no sectors, as a loop device without a file, is
+/// not in the list.
+pub fn partitions(disks: &[Disk]) -> String {
+    let mut out = String::from("major minor  #blocks  name\n\n");
+    for d in disks.iter().filter(|d| d.sectors > 0) {
+        let _ = writeln!(out, "{:>4}  {:>7} {:>10} {}", d.major, d.minor, d.sectors >> 1, d.name);
+    }
+    out
+}
+
 /// The text of `/proc/meminfo`. R1 has no page cache, so the other counts are 0.
 pub fn meminfo(m: MemInfo) -> String {
     let h = m.hugetlb;
@@ -589,6 +629,25 @@ mod tests {
         assert_eq!(parse_unsigned(b"-1"), None);
         assert_eq!(parse_unsigned(b" 1"), None);
         assert_eq!(coredump_filter(0x33), b"00000033\n");
+    }
+
+    #[test]
+    fn diskstats_and_partitions_have_the_format_of_linux() {
+        let mut stats = [0; 17];
+        stats[0] = 120;
+        stats[9] = 7;
+        let vda = Disk { major: 254, minor: 0, name: String::from("vda"), sectors: 8192, stats };
+        let loop0 = Disk { major: 7, minor: 0, name: String::from("loop0"), ..Disk::default() };
+        let list = [loop0, vda];
+        assert_eq!(
+            diskstats(&list),
+            "   7       0 loop0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n \
+             254       0 vda 120 0 0 0 0 0 0 0 0 7 0 0 0 0 0 0 0\n"
+        );
+        assert_eq!(
+            partitions(&list),
+            "major minor  #blocks  name\n\n 254        0       4096 vda\n"
+        );
     }
 
     #[test]
