@@ -32,6 +32,7 @@ pub(crate) fn init(boot: &BootInfo) {
             release: rk_syscall::UNAME_RELEASE,
             version: rk_syscall::UNAME_VERSION,
             cmdline: alloc::string::String::from(boot.cmdline()),
+            random: Some(rk_drv_mem::get_random_bytes),
         });
     }
     let root = ROOT.call_once(|| FsContext::new(MountNamespace::new(rk_fs_tmpfs::new(0o755))));

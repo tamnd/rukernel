@@ -138,6 +138,9 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEWIPC != 0 {
         flags |= CLONE_SYSVSEM;
     }
+    // The copy of the descriptor table comes before the other changes, so that an `EMFILE` of
+    // `fs.nr_open` changes nothing, as `unshare_fd` in `ksys_unshare` of Linux.
+    let files = if flags & CLONE_FILES != 0 { Some(cx.files()?.lock().try_clone()?) } else { None };
     if flags & CLONE_NEWCGROUP != 0 {
         new_cgroup_ns(process)?;
     }
@@ -155,8 +158,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEWNET != 0 {
         cx.thread.set_net_ns(new_net_ns(process)?);
     }
-    if flags & CLONE_FILES != 0 {
-        let table = cx.files()?.lock().clone();
+    if let Some(table) = files {
         process.set_files(Arc::new(SpinLock::new(table)));
     }
     if flags & CLONE_FS != 0

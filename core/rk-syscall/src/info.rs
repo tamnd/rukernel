@@ -19,7 +19,7 @@ use rk_frame::sync::SpinLock;
 use rk_frame::time::{HZ, ticks};
 use rk_proc::Restart;
 use rk_proc::exec::USER_HZ;
-use rk_proc::limits::{Limit, NR_OPEN, RLIM_NLIMITS, RLIMIT_NOFILE};
+use rk_proc::limits::{Limit, RLIM_NLIMITS, RLIMIT_NOFILE};
 use rk_vfs::cred::cap;
 use zerocopy::FromZeros;
 
@@ -577,7 +577,7 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
         if n.rlim_cur > n.rlim_max {
             return Err(Errno::EINVAL);
         }
-        if resource == RLIMIT_NOFILE && n.rlim_max > NR_OPEN {
+        if resource == RLIMIT_NOFILE && n.rlim_max > rk_vfs::fdtable::nr_open() as u64 {
             return Err(Errno::EPERM);
         }
         Some(Limit { cur: n.rlim_cur, max: n.rlim_max })

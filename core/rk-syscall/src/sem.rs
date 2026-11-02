@@ -49,11 +49,11 @@ const SEM_STAT_ANY: u32 = 20;
 /// The bit of the command that asks for the 64-bit structures. They are the only structures.
 const IPC_64: u32 = 0x100;
 
-/// The limits, as the defaults of Linux.
-const SEMMSL: i32 = 32000;
-const SEMMNI: usize = 32000;
-const SEMMNS: i32 = SEMMNI as i32 * SEMMSL;
-const SEMOPM: usize = 500;
+/// The limits that `IPC_INFO` gives and that `kernel.sem` does not change, as Linux: SEMMNU and
+/// SEMMAP are the default SEMMNS, and SEMUME is the default SEMOPM. `rk_vfs::ipc::sem_limits`
+/// gives the others.
+const SEMMNS_DEFAULT: i32 = 1_024_000_000;
+const SEMOPM_DEFAULT: i32 = 500;
 const SEMVMX: i32 = 32767;
 const SEMAEM: i32 = SEMVMX;
 
@@ -227,7 +227,8 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
     let key = key as i32;
     let nsems = nsems as i32;
     let flags = flags as u32;
-    if !(0..=SEMMSL).contains(&nsems) {
+    let [semmsl, semmns, _, semmni] = rk_vfs::ipc::sem_limits();
+    if !(0..=semmsl).contains(&nsems) {
         return Err(Errno::EINVAL);
     }
     let c = cx.process().cred();
@@ -256,7 +257,9 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
         return Err(Errno::EINVAL);
     }
     let used: usize = table.sets.values().map(|s| s.members.len()).sum();
-    if table.sets.len() >= SEMMNI || used + nsems as usize > SEMMNS as usize {
+    if table.sets.len() as i64 >= i64::from(semmni)
+        || (used + nsems as usize) as i64 > i64::from(semmns)
+    {
         return Err(Errno::ENOSPC);
     }
     let next = table.next;
@@ -355,7 +358,7 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
     if n < 1 || id < 0 {
         return Err(Errno::EINVAL);
     }
-    if n > SEMOPM {
+    if n as i64 > i64::from(rk_vfs::ipc::sem_limits()[2]) {
         return Err(Errno::E2BIG);
     }
     let size = core::mem::size_of::<SemBuf>();
@@ -444,14 +447,15 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
     let mut table = TABLE.get().lock();
     match cmd {
         IPC_INFO | SEM_INFO => {
+            let [semmsl, semmns, semopm, semmni] = rk_vfs::ipc::sem_limits();
             let mut info = SemInfo {
-                semmap: SEMMNS,
-                semmni: SEMMNI as i32,
-                semmns: SEMMNS,
-                semmnu: SEMMNS,
-                semmsl: SEMMSL,
-                semopm: SEMOPM as i32,
-                semume: SEMOPM as i32,
+                semmap: SEMMNS_DEFAULT,
+                semmni,
+                semmns,
+                semmnu: SEMMNS_DEFAULT,
+                semmsl,
+                semopm,
+                semume: SEMOPM_DEFAULT,
                 semusz: 20,
                 semvmx: SEMVMX,
                 semaem: SEMAEM,

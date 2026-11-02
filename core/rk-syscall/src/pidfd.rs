@@ -89,6 +89,11 @@ fn signal_target_of(cx: &Cx<'_>, fd: u64) -> Result<Arc<Process>, Errno> {
         .ok()
         .and_then(|n| n.parse().ok())
         .ok_or(Errno::EBADF)?;
+    // The directory of a process that ended has no files, also when a new process has the PID
+    // now. The signal does not go to the new process, as `pidfd_send_signal` of Linux.
+    if inode.stale() {
+        return Err(Errno::ESRCH);
+    }
     rk_proc::find_process(pid).ok_or(Errno::ESRCH)
 }
 

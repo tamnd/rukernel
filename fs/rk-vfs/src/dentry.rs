@@ -158,14 +158,18 @@ impl Dentry {
         loop {
             let seq = {
                 let children = self.children.lock();
-                if let Some(child) = children.get(name).and_then(Weak::upgrade) {
+                if let Some(child) = children.get(name).and_then(Weak::upgrade)
+                    && !child.inode.stale()
+                {
                     return Ok(child);
                 }
                 self.seq.load(Ordering::Relaxed)
             };
             let inode = self.inode.lookup(name)?;
             let mut children = self.children.lock();
-            if let Some(child) = children.get(name).and_then(Weak::upgrade) {
+            if let Some(child) = children.get(name).and_then(Weak::upgrade)
+                && !child.inode.stale()
+            {
                 return Ok(child);
             }
             if self.seq.load(Ordering::Relaxed) == seq {

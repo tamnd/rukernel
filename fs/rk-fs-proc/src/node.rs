@@ -83,7 +83,12 @@ pub(crate) struct Node {
     kind: Kind,
     /// The owner and the group. Without it, root owns the file.
     owner: Once<OwnerFn>,
+    /// Tells that the inode is gone, for `Inode::stale`. Without it, the inode stays.
+    gone: Once<GoneFn>,
 }
+
+/// The function that tells that an inode of procfs is gone.
+type GoneFn = Box<dyn Fn() -> bool + Send + Sync>;
 
 /// The device of procfs. Each mount of procfs shows the same files, so they have one device.
 fn dev() -> u64 {
@@ -121,6 +126,7 @@ pub(crate) fn file(
             open: None,
         },
         owner: Once::new(),
+        gone: Once::new(),
     })
 }
 
@@ -136,7 +142,7 @@ pub(crate) fn rw_file(
         text: SpinLock::new(None),
         open: None,
     };
-    Arc::new(Node { ino: ino(path), perm: 0o644, kind, owner: Once::new() })
+    Arc::new(Node { ino: ino(path), perm: 0o644, kind, owner: Once::new(), gone: Once::new() })
 }
 
 /// Makes a file with the permission bits `perm` whose open files have the operations that
@@ -154,7 +160,7 @@ pub(crate) fn ops_file(
         text: SpinLock::new(None),
         open: Some(Box::new(open)),
     };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new() })
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
 }
 
 /// Makes a file that reads and writes at an offset, with the permission bits `perm`.
@@ -165,7 +171,7 @@ pub(crate) fn data_file(
     write: impl Fn(u64, &[u8]) -> Result<usize> + Send + Sync + 'static,
 ) -> InodeRef {
     let kind = Kind::Data { read: Box::new(read), write: Box::new(write) };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new() })
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
 }
 
 /// Makes a symbolic link with the permission bits `perm`.
@@ -179,6 +185,7 @@ pub(crate) fn link(
         perm,
         kind: Kind::Link(Box::new(target), Follow::Path),
         owner: Once::new(),
+        gone: Once::new(),
     })
 }
 
@@ -194,6 +201,7 @@ pub(crate) fn dead_link(
         perm,
         kind: Kind::Link(Box::new(target), Follow::Error(error)),
         owner: Once::new(),
+        gone: Once::new(),
     })
 }
 
@@ -211,6 +219,7 @@ pub(crate) fn jump_link(
         perm,
         kind: Kind::Link(Box::new(target), follow),
         owner: Once::new(),
+        gone: Once::new(),
     })
 }
 
@@ -224,7 +233,7 @@ pub(crate) fn dir(
     find: Option<FindFn>,
 ) -> InodeRef {
     let kind = Kind::Dir { parent: ino(parent), list: Box::new(list), find };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new() })
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
 }
 
 /// Gives `node` the owner and the group that `owner` gives at each `stat`, as the files of a
@@ -233,6 +242,15 @@ pub(crate) fn set_owner(node: &InodeRef, owner: impl Fn() -> (u32, u32) + Send +
     let any: &dyn Any = &**node;
     if let Some(node) = any.downcast_ref::<Node>() {
         node.owner.call_once(|| Box::new(owner));
+    }
+}
+
+/// Makes `node` stale when `gone` gives `true`, so that a lookup makes the inode again. The
+/// function is set one time.
+pub(crate) fn set_gone(node: &InodeRef, gone: impl Fn() -> bool + Send + Sync + 'static) {
+    let any: &dyn Any = &**node;
+    if let Some(node) = any.downcast_ref::<Node>() {
+        node.gone.call_once(|| Box::new(gone));
     }
 }
 
@@ -317,6 +335,10 @@ impl Inode for Node {
     fn open_file(&self, _flags: u32) -> Option<Result<Arc<dyn rk_vfs::file::FileOps>>> {
         let Kind::File { open: Some(open), .. } = &self.kind else { return None };
         open().map(Ok)
+    }
+
+    fn stale(&self) -> bool {
+        self.gone.get().is_some_and(|gone| gone())
     }
 
     fn lookup(&self, name: &[u8]) -> Result<InodeRef> {
