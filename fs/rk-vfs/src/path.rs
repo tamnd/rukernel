@@ -38,6 +38,35 @@ pub const NAME_MAX: usize = 255;
 /// The longest path, with the zero byte at the end.
 pub const PATH_MAX: usize = 4096;
 
+/// The magic numbers of procfs and sysfs, `PROC_SUPER_MAGIC` and `SYSFS_MAGIC` of
+/// `<linux/magic.h>`. A lookup in a directory of these file systems that gives `ENOENT` goes to
+/// the hook of [`set_missing_hook`].
+const TRACED_MAGIC: [u64; 2] = [0x9fa0, 0x6265_6572];
+
+static MISSING: rk_frame::sync::Once<fn(&[u8])> = rk_frame::sync::Once::new();
+
+/// Sets the hook that gets the path of each name under `/proc` and `/sys` that a walk does not
+/// find. The kernel option `rk.missing=1` sets it, so that a boot log shows the files that a
+/// distribution reads and that rukernel does not have. Only the first call has an effect.
+pub fn set_missing_hook(hook: fn(&[u8])) {
+    MISSING.call_once(|| hook);
+}
+
+/// Gives the path of the name `name` in the directory `at` to the hook of [`set_missing_hook`],
+/// if the directory is in procfs or sysfs.
+fn note_missing(at: &Location, name: &[u8]) {
+    let Some(hook) = MISSING.get() else { return };
+    if !TRACED_MAGIC.contains(&at.inode().fs_magic()) {
+        return;
+    }
+    let mut path = at.absolute_path();
+    if path.last() != Some(&b'/') {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    hook(&path);
+}
+
 /// The state of one walk.
 pub struct Walk<'a> {
     ns: &'a MountNamespace,
@@ -272,7 +301,11 @@ impl<'a> Walk<'a> {
 
     /// The child `name` of the directory `at`, in the mount that is on top of it.
     fn child(&self, at: &Location, name: &[u8]) -> Result<Location> {
-        let dentry = at.dentry.lookup(name)?;
+        let dentry = at.dentry.lookup(name).inspect_err(|e| {
+            if *e == Errno::ENOENT {
+                note_missing(at, name);
+            }
+        })?;
         let mut next = Location { mount: at.mount.clone(), dentry };
         while let Some(mount) = self.ns.mounted_on(&next) {
             if self.flags & resolve::NO_XDEV != 0 {

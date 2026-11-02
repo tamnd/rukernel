@@ -1727,9 +1727,21 @@ impl TcpServer {
     }
 }
 
-/// The command line of a boot test. The `tty` test runs init with the argument `tty`, which is
-/// after `--`, as Linux gives the arguments of init.
+/// The command line of a boot test, with the words of `RK_CMDLINE` before the arguments of init.
+/// `RK_CMDLINE=rk.missing=1` logs the files under /proc and /sys that the test looks for and that
+/// the kernel does not have, for tools/missing/report.py.
 fn test_cmdline(test: &str) -> String {
+    let base = base_cmdline(test);
+    let Ok(extra) = std::env::var("RK_CMDLINE") else { return base };
+    match base.split_once(" -- ") {
+        Some((kernel, init)) => format!("{kernel} {extra} -- {init}"),
+        None => format!("{base} {extra}"),
+    }
+}
+
+/// The command line of a boot test without `RK_CMDLINE`. The `tty` test runs init with the
+/// argument `tty`, which is after `--`, as Linux gives the arguments of init.
+fn base_cmdline(test: &str) -> String {
     match test {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "smp" => String::from("console=ttyS0 rk.test=init -- smp"),
