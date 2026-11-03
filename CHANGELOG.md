@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `bpf(2)` with the maps of kernel/bpf of Linux in the new crate rk-bpf: `BPF_MAP_CREATE`, `BPF_MAP_LOOKUP_ELEM`, `BPF_MAP_UPDATE_ELEM`, `BPF_MAP_DELETE_ELEM`, `BPF_MAP_GET_NEXT_KEY` and `BPF_MAP_FREEZE` for the hash, array, per CPU hash, per CPU array and LPM trie maps. The call checks the size and the tail of `union bpf_attr` as `bpf_check_uarg_tail_zero` and `CHECK_ATTR` of Linux. A map is an anonymous file, and `/proc/PID/fdinfo` shows its attributes. The sysctl `kernel.unprivileged_bpf_disabled` starts at 2 (#537).
+
 ## [0.5.2] - 2026-11-04
 
 ### Added

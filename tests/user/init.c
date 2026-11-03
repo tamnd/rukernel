@@ -5149,6 +5149,159 @@ static void test_sysctls(void)
 	umount("/proc");
 }
 
+/* bpf(2) with an attribute in a buffer of union bpf_attr size, 168 bytes (#537). */
+static long bpf_call(int cmd, unsigned char *attr, unsigned int size)
+{
+	return syscall(SYS_bpf, cmd, attr, size, 0, 0);
+}
+
+static void bpf_put32(unsigned char *attr, int off, unsigned int v)
+{
+	memcpy(attr + off, &v, 4);
+}
+
+static void bpf_put64(unsigned char *attr, int off, unsigned long long v)
+{
+	memcpy(attr + off, &v, 8);
+}
+
+/* BPF_MAP_CREATE with the type, the key size, the value size, the count and the flags. */
+static int bpf_map_new(unsigned int type, unsigned int key, unsigned int value, unsigned int n,
+		       unsigned int flags)
+{
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, type);
+	bpf_put32(attr, 4, key);
+	bpf_put32(attr, 8, value);
+	bpf_put32(attr, 12, n);
+	bpf_put32(attr, 16, flags);
+	memcpy(attr + 28, "rk_test", 8);
+	return bpf_call(0, attr, sizeof(attr));
+}
+
+/* A BPF_MAP_*_ELEM command: map_fd, key, value or next_key, flags. */
+static long bpf_elem(int cmd, int fd, const void *key, void *value, unsigned long long flags)
+{
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, fd);
+	bpf_put64(attr, 8, (unsigned long)key);
+	bpf_put64(attr, 16, (unsigned long)value);
+	bpf_put64(attr, 24, flags);
+	return bpf_call(cmd, attr, cmd == 3 ? 16 : cmd == 4 ? 24 : 32);
+}
+
+/*
+ * The maps of bpf(2): hash, array, per CPU array and LPM trie, the size rules of union
+ * bpf_attr, the fdinfo of a map and the sysctl kernel.unprivileged_bpf_disabled (#537).
+ */
+static void test_bpf(void)
+{
+	unsigned char attr[256] = { 0 };
+	char buf[512];
+	unsigned long long key = 7, next = 0;
+	char value[16] = "fifteen bytes..", out[16];
+	int fd, ok;
+
+	mkdir("/proc", 0555);
+	check("mount proc for bpf", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	check("kernel.unprivileged_bpf_disabled is 2",
+	      read_file("/proc/sys/kernel/unprivileged_bpf_disabled", buf, sizeof(buf)) > 0 &&
+	      !strcmp(buf, "2\n"));
+	check("kernel.unprivileged_bpf_disabled above 2 gives EINVAL",
+	      put_file("/proc/sys/kernel/unprivileged_bpf_disabled", "3") == -1 && errno == EINVAL);
+	ok = put_file("/proc/sys/kernel/unprivileged_bpf_disabled", "0") == 0 &&
+	     read_file("/proc/sys/kernel/unprivileged_bpf_disabled", buf, sizeof(buf)) > 0 &&
+	     !strcmp(buf, "0\n");
+	ok = ok && put_file("/proc/sys/kernel/unprivileged_bpf_disabled", "2") == 0;
+	check("kernel.unprivileged_bpf_disabled changes from 2", ok);
+
+	errno = 0;
+	check("bpf with an attribute above a page gives E2BIG",
+	      bpf_call(0, attr, 4097) == -1 && errno == E2BIG);
+	bpf_put32(attr, 0, 1);
+	bpf_put32(attr, 4, 8);
+	bpf_put32(attr, 8, 16);
+	bpf_put32(attr, 12, 2);
+	attr[200] = 1;
+	errno = 0;
+	check("bpf with a tail that is not zero gives E2BIG",
+	      bpf_call(0, attr, sizeof(attr)) == -1 && errno == E2BIG);
+	attr[200] = 0;
+	fd = bpf_call(0, attr, sizeof(attr));
+	check("bpf with a larger zero tail makes a map", fd >= 0);
+	close(fd);
+	errno = 0;
+	check("bpf with an unknown command gives EINVAL", bpf_call(99, attr, 168) == -1 && errno == EINVAL);
+
+	fd = bpf_map_new(1, 8, 16, 2, 0);
+	check("BPF_MAP_CREATE makes a hash map", fd >= 0);
+	errno = 0;
+	check("a lookup in an empty hash map gives ENOENT",
+	      bpf_elem(1, fd, &key, out, 0) == -1 && errno == ENOENT);
+	ok = bpf_elem(2, fd, &key, value, 0) == 0 && bpf_elem(1, fd, &key, out, 0) == 0 &&
+	     !memcmp(out, value, 16);
+	check("BPF_MAP_UPDATE_ELEM and BPF_MAP_LOOKUP_ELEM on a hash map", ok);
+	errno = 0;
+	check("BPF_NOEXIST on a key that exists gives EEXIST",
+	      bpf_elem(2, fd, &key, value, 1) == -1 && errno == EEXIST);
+	ok = bpf_elem(4, fd, NULL, &next, 0) == 0 && next == 7;
+	errno = 0;
+	ok = ok && bpf_elem(4, fd, &key, &next, 0) == -1 && errno == ENOENT;
+	check("BPF_MAP_GET_NEXT_KEY walks the hash map", ok);
+	snprintf(buf, 64, "/proc/self/fdinfo/%d", fd);
+	ok = read_file(buf, buf, sizeof(buf)) > 0 && strstr(buf, "map_type:\t1\nkey_size:\t8\n") &&
+	     strstr(buf, "value_size:\t16\nmax_entries:\t2\n") && strstr(buf, "frozen:\t0\n");
+	check("the fdinfo of a map has its attributes", ok);
+	errno = 0;
+	ok = bpf_elem(3, fd, &key, NULL, 0) == 0 && bpf_elem(3, fd, &key, NULL, 0) == -1 &&
+	     errno == ENOENT;
+	check("BPF_MAP_DELETE_ELEM removes the key", ok);
+	ok = bpf_elem(2, fd, &key, value, 0) == 0 && bpf_elem(22, fd, NULL, NULL, 0) == 0;
+	errno = 0;
+	ok = ok && bpf_elem(2, fd, &key, value, 0) == -1 && errno == EPERM &&
+	     bpf_elem(1, fd, &key, out, 0) == 0;
+	check("BPF_MAP_FREEZE stops the writes of the system calls", ok);
+	close(fd);
+
+	unsigned int index = 0;
+	fd = bpf_map_new(2, 4, 16, 4, 0);
+	memset(out, 1, sizeof(out));
+	ok = fd >= 0 && bpf_elem(1, fd, &index, out, 0) == 0 && !memcmp(out, "\0\0\0\0\0\0\0\0", 8);
+	index = 4;
+	errno = 0;
+	ok = ok && bpf_elem(2, fd, &index, value, 0) == -1 && errno == E2BIG;
+	errno = 0;
+	ok = ok && bpf_elem(3, fd, &index, NULL, 0) == -1 && errno == EINVAL;
+	check("an array map has zero values and a fixed size", ok);
+	close(fd);
+
+	/* BPF_F_ALL_CPUS writes one value to each CPU, BPF_F_CPU reads the value of one CPU. */
+	index = 1;
+	fd = bpf_map_new(6, 4, 8, 2, 0);
+	ok = fd >= 0 && bpf_elem(2, fd, &index, "percpu!", 16) == 0 &&
+	     bpf_elem(1, fd, &index, out, 8) == 0 && !strcmp(out, "percpu!");
+	check("a per CPU array takes BPF_F_ALL_CPUS and BPF_F_CPU", ok);
+	close(fd);
+
+	/* An LPM trie key: the prefix length and an IPv4 address. */
+	unsigned char k8[8] = { 8, 0, 0, 0, 10, 0, 0, 0 }, k32[8] = { 32, 0, 0, 0, 10, 1, 2, 3 };
+	unsigned int v = 0;
+	errno = 0;
+	check("an LPM trie without BPF_F_NO_PREALLOC gives EINVAL",
+	      bpf_map_new(11, 8, 4, 8, 0) == -1 && errno == EINVAL);
+	fd = bpf_map_new(11, 8, 4, 8, 1);
+	ok = fd >= 0 && bpf_elem(2, fd, k8, "\x2a\0\0", 0) == 0 &&
+	     bpf_elem(1, fd, k32, &v, 0) == 0 && v == 42;
+	k32[4] = 11;
+	errno = 0;
+	ok = ok && bpf_elem(1, fd, k32, &v, 0) == -1 && errno == ENOENT;
+	check("an LPM trie finds the longest prefix", ok);
+	close(fd);
+	umount("/proc");
+}
+
 /* The value of the line "NAME VALUE" of /proc/vmstat in buf, or -1. */
 static long long vmstat_value(const char *buf, const char *name)
 {
@@ -10684,6 +10837,7 @@ static void test_all(void)
 	test_overlay();
 	test_proc();
 	test_sysctls();
+	test_bpf();
 	test_vmstat();
 	test_proc_pid_files();
 	test_memfd();

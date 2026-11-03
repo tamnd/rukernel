@@ -7,6 +7,7 @@ members = [
     "core/rk-lib",
     "core/rk-mm",
     "core/rk-sched",
+    "core/rk-bpf",
     "core/rk-cgroup",
     "core/rk-proc",
     "core/rk-syscall",
@@ -49,6 +50,7 @@ rk-abi = { path = "core/rk-abi", version = "0.5.0" }
 rk-lib = { path = "core/rk-lib", version = "0.5.0" }
 rk-mm = { path = "core/rk-mm", version = "0.5.0" }
 rk-sched = { path = "core/rk-sched", version = "0.5.0" }
+rk-bpf = { path = "core/rk-bpf", version = "0.5.0" }
 rk-cgroup = { path = "core/rk-cgroup", version = "0.5.0" }
 rk-proc = { path = "core/rk-proc", version = "0.5.0" }
 rk-syscall = { path = "core/rk-syscall", version = "0.5.0" }

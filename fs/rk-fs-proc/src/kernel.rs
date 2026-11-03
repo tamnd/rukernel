@@ -519,6 +519,8 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("kernel/sched_rt_runtime_us", ""),
     ("kernel/tainted", "0"),
     ("kernel/threads-max", ""),
+    // Who can make BPF maps, which rk-bpf reads.
+    ("kernel/unprivileged_bpf_disabled", ""),
     ("kernel/version", ""),
     ("vm/dirty_background_bytes", "0"),
     ("vm/dirty_background_ratio", "10"),
@@ -687,6 +689,10 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
         "kernel/random/uuid" => return uuid_text(random_uuid()),
         "fs/nr_open" => return format!("{}\n", rk_vfs::fdtable::nr_open()).into_bytes(),
         "kernel/ns_last_pid" => return format!("{}\n", rk_proc::last_pid()).into_bytes(),
+        "kernel/unprivileged_bpf_disabled" => {
+            let v = rk_bpf::UNPRIVILEGED_BPF_DISABLED.load(Ordering::Relaxed);
+            return format!("{v}\n").into_bytes();
+        }
         "kernel/sem" => {
             let [msl, mns, opm, mni] = rk_vfs::ipc::sem_limits();
             return format!("{msl}\t{mns}\t{opm}\t{mni}\n").into_bytes();
@@ -823,6 +829,15 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
                 return Err(Errno::EPERM);
             }
             return rk_proc::set_last_pid(i64::from(parse_int(data)?));
+        }
+        // Only a process with `CAP_SYS_ADMIN` writes it, and the value 1 cannot change, as
+        // `bpf_unpriv_handler` in kernel/bpf/syscall.c of Linux.
+        "kernel/unprivileged_bpf_disabled" => {
+            let admin = rk_vfs::cred::current().capable(rk_vfs::cred::cap::SYS_ADMIN);
+            if !admin {
+                return Err(Errno::EPERM);
+            }
+            return rk_bpf::bpf_unpriv_handler(i64::from(parse_int(data)?), admin);
         }
         // Up to four `int` values, as `proc_ipc_sem_dointvec` in ipc/ipc_sysctl.c of Linux.
         "kernel/sem" => {

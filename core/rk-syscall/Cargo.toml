@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 rk-abi.workspace = true
+rk-bpf.workspace = true
 rk-drv-mem.workspace = true
 rk-drv-tty.workspace = true
 rk-cgroup.workspace = true
