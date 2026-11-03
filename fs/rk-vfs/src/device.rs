@@ -106,9 +106,15 @@ pub struct DeviceInfo {
 
 static DEVICES: SpinLock<Vec<DeviceInfo>> = SpinLock::new(Vec::new());
 
-/// Adds a device to the list of devices. A device with the same type and number takes the place
-/// of the old one.
+/// Adds a device to the list of devices, and sends the event `add`. A device with the same type
+/// and number takes the place of the old one.
 pub fn add_device(info: DeviceInfo) {
+    insert(info.clone());
+    crate::uevent::device(&info, crate::uevent::Action::Add, &[]);
+}
+
+/// Adds a device to the list of devices with no event.
+fn insert(info: DeviceInfo) {
     let mut devices = DEVICES.lock();
     devices.retain(|d| d.block != info.block || d.rdev != info.rdev);
     devices.push(info);
@@ -136,17 +142,19 @@ pub fn set_node_hook(hook: fn(&DeviceInfo, NodeChange)) {
     NODE_HOOK.call_once(|| hook);
 }
 
-/// Adds a device to the list after the boot, and makes its device file with the hook of
-/// [`set_node_hook`].
+/// Adds a device to the list after the boot, makes its device file with the hook of
+/// [`set_node_hook`], and sends the event `add`. The device file is there before the event, as
+/// `device_add` of Linux does.
 pub fn add_device_node(info: DeviceInfo) {
-    add_device(info.clone());
+    insert(info.clone());
     if let Some(hook) = NODE_HOOK.get() {
         hook(&info, NodeChange::Add);
     }
+    crate::uevent::device(&info, crate::uevent::Action::Add, &[]);
 }
 
-/// Removes the device `rdev` of the type `block` from the list, and removes its device file
-/// with the hook of [`set_node_hook`].
+/// Removes the device `rdev` of the type `block` from the list, removes its device file with the
+/// hook of [`set_node_hook`], and sends the event `remove`.
 pub fn remove_device(block: bool, rdev: u64) {
     let gone: Vec<DeviceInfo> = {
         let mut devices = DEVICES.lock();
@@ -158,6 +166,9 @@ pub fn remove_device(block: bool, rdev: u64) {
         for d in &gone {
             hook(d, NodeChange::Remove);
         }
+    }
+    for d in &gone {
+        crate::uevent::device(d, crate::uevent::Action::Remove, &[]);
     }
 }
 

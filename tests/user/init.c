@@ -9963,6 +9963,154 @@ static void test_cgroup(void)
 }
 
 /* Runs the general checks, which each boot of init runs without the argument "only". */
+/* Opens a socket of NETLINK_KOBJECT_UEVENT in the group 1, as udev does. Gives -1 on an error. */
+static int uevent_socket(void)
+{
+	struct sockaddr_nl a = { .nl_family = AF_NETLINK, .nl_groups = 1 };
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+
+	if (fd >= 0 && bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* Reads the events on fd until one has the first string `head`. Gives the size of the event in
+ * buf, or -1 if no such event comes in `ms` milliseconds. */
+static int uevent_wait(int fd, const char *head, char *buf, size_t size, int ms)
+{
+	for (;;) {
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		int n;
+
+		if (poll(&p, 1, ms) != 1)
+			return -1;
+		n = recv(fd, buf, size - 1, 0);
+		if (n <= 0)
+			return -1;
+		buf[n] = 0;
+		if (strcmp(buf, head) == 0)
+			return n;
+	}
+}
+
+/* Tells if the event in buf of n bytes has the string `var`. */
+static int uevent_has(const char *buf, int n, const char *var)
+{
+	for (int i = 0; i < n; i += strlen(buf + i) + 1)
+		if (strcmp(buf + i, var) == 0)
+			return 1;
+	return 0;
+}
+
+/* The value of SEQNUM in the event in buf of n bytes, or -1. */
+static long long uevent_seqnum(const char *buf, int n)
+{
+	for (int i = 0; i < n; i += strlen(buf + i) + 1)
+		if (strncmp(buf + i, "SEQNUM=", 7) == 0)
+			return atoll(buf + i + 7);
+	return -1;
+}
+
+/* A TUN device in a new network namespace: the socket of the namespace gets the events `add` of
+ * the device and its queues, and `remove` when the device goes. Gives 0 or the failed step. */
+static int uevent_netns_child(void)
+{
+	char buf[2048];
+	struct ifreq ifr = { 0 };
+	int in, t, n;
+
+	if (unshare(CLONE_NEWNET) != 0)
+		return 1;
+	in = uevent_socket();
+	t = open("/dev/net/tun", O_RDWR);
+	strcpy(ifr.ifr_name, "uev0");
+	ifr.ifr_flags = RK_IFF_TUN | RK_IFF_NO_PI;
+	if (in < 0 || t < 0 || ioctl(t, RK_TUNSETIFF, &ifr) != 0)
+		return 2;
+	n = uevent_wait(in, "add@/devices/virtual/net/uev0", buf, sizeof(buf), 2000);
+	if (n < 0 || !uevent_has(buf, n, "SUBSYSTEM=net") || !uevent_has(buf, n, "INTERFACE=uev0"))
+		return 3;
+	n = uevent_wait(in, "add@/devices/virtual/net/uev0/queues/tx-0", buf, sizeof(buf), 2000);
+	if (n < 0 || !uevent_has(buf, n, "SUBSYSTEM=queues"))
+		return 4;
+	close(t);
+	if (uevent_wait(in, "remove@/devices/virtual/net/uev0", buf, sizeof(buf), 2000) < 0)
+		return 5;
+	return 0;
+}
+
+/* The events of the devices, as lib/kobject_uevent.c of Linux: a loop device sends `change` with
+ * the variables of the device, and a network device sends its events only to its namespace. */
+static void test_uevent(void)
+{
+	char buf[2048], head[64], var[3][64], path[32];
+	long long seq = -1;
+	int fd = uevent_socket();
+	int file, ctl, dev, n, len, status = -1;
+	pid_t pid;
+
+	if (fd < 0)
+		printf("init: uevent: the socket gives errno %d\n", errno);
+	check("uevent: a socket of NETLINK_KOBJECT_UEVENT joins the group 1", fd >= 0);
+	if (fd < 0)
+		return;
+	mkdir("/sys", 0755);
+	int mounted = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
+	file = open("/ueventfile", O_RDWR | O_CREAT | O_TRUNC, 0644);
+	ctl = open("/dev/loop-control", O_RDWR);
+	n = ctl >= 0 ? ioctl(ctl, LOOP_CTL_GET_FREE) : -1;
+	snprintf(path, sizeof(path), "/dev/loop%d", n);
+	dev = open(path, O_RDWR);
+	check("uevent: LOOP_SET_FD", file >= 0 && ftruncate(file, 65536) == 0 && dev >= 0 &&
+					     ioctl(dev, LOOP_SET_FD, file) == 0);
+	snprintf(head, sizeof(head), "change@/devices/virtual/block/loop%d", n);
+	snprintf(var[0], sizeof(var[0]), "DEVPATH=/devices/virtual/block/loop%d", n);
+	snprintf(var[1], sizeof(var[1]), "MINOR=%d", n);
+	snprintf(var[2], sizeof(var[2]), "DEVNAME=loop%d", n);
+	len = uevent_wait(fd, head, buf, sizeof(buf), 2000);
+	check("uevent: LOOP_SET_FD sends change with the variables of the device",
+	      len > 0 && uevent_has(buf, len, "ACTION=change") && uevent_has(buf, len, var[0]) &&
+		      uevent_has(buf, len, "SUBSYSTEM=block") && uevent_has(buf, len, "MAJOR=7") &&
+		      uevent_has(buf, len, var[1]) && uevent_has(buf, len, var[2]) &&
+		      uevent_has(buf, len, "DEVTYPE=disk"));
+	if (len > 0)
+		seq = uevent_seqnum(buf, len);
+	char text[32] = "";
+	check("uevent: /sys/kernel/uevent_seqnum has the number of the last event",
+	      seq > 0 && read_file("/sys/kernel/uevent_seqnum", text, sizeof(text)) > 0 &&
+		      atoll(text) >= seq);
+	if (dev >= 0) {
+		ioctl(dev, LOOP_CLR_FD, 0);
+		close(dev);
+	}
+	len = uevent_wait(fd, head, buf, sizeof(buf), 2000);
+	check("uevent: the last close after LOOP_CLR_FD sends change with the next number",
+	      len > 0 && uevent_seqnum(buf, len) > seq);
+	if (file >= 0)
+		close(file);
+	if (ctl >= 0)
+		close(ctl);
+	unlink("/ueventfile");
+
+	pid = fork();
+	if (pid == 0)
+		_exit(uevent_netns_child());
+	if (pid > 0)
+		waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: uevent: the child of the namespace failed at step %d\n",
+		       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+	check("uevent: a TUN device in a new namespace sends add and remove there",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("uevent: the first namespace does not get the events of that device",
+	      uevent_wait(fd, "add@/devices/virtual/net/uev0", buf, sizeof(buf), 0) < 0);
+	close(fd);
+	if (mounted)
+		umount("/sys");
+}
+
 static void test_all(void)
 {
 	test_ids();
@@ -10005,6 +10153,7 @@ static void test_all(void)
 	test_atime();
 	test_sysfs();
 	test_loop();
+	test_uevent();
 	test_xattr();
 	test_fifo();
 	test_file_locks();
@@ -10046,6 +10195,8 @@ int main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
+	if (argc > 1 && strcmp(argv[1], "uevent") == 0)
+		test_uevent();
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)
 		test_smp();
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)

@@ -14,6 +14,7 @@ use crate::blockdev::{self, BlockDevice, BlockOps, SECTOR_SIZE};
 use crate::device::{self, CharDevice, DeviceInfo, major, makedev, minor};
 use crate::file::{File, FileOps, UserMemory};
 use crate::inode::{Result, mode};
+use crate::uevent::{self, Action};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
@@ -374,14 +375,25 @@ impl LoopDevice {
     /// Sets the size of the device to `sectors`. A change of the size first writes the dirty
     /// pages of the device and drops its cache, because the cache keeps the size of each folio.
     fn resize(&self, sectors: u64) -> Result<()> {
-        if self.with(|b| b.sectors)? == sectors {
+        let old = self.with(|b| b.sectors)?;
+        if old == sectors {
             return Ok(());
         }
         if let Some(cache) = blockdev::block_cache(self.rdev) {
             cache.write_back(0, u64::MAX)?;
             cache.forget(0, u64::MAX);
         }
-        self.with(|b| b.sectors = sectors)
+        self.with(|b| b.sectors = sectors)?;
+        self.resized(old, sectors);
+        Ok(())
+    }
+
+    /// Sends the event `change` with `RESIZE=1` for a change of the size from `old` to `new`
+    /// sectors, as `set_capacity_and_notify` of Linux. A size of 0 sends no event.
+    fn resized(&self, old: u64, new: u64) {
+        if old != 0 && new != 0 && old != new {
+            uevent::device_number(true, self.rdev, Action::Change, &["RESIZE=1"]);
+        }
     }
 
     /// Gives the device the file of `config`, as `loop_configure` of Linux. `dev` is the open
@@ -427,6 +439,10 @@ impl LoopDevice {
             block_size,
             sectors,
         });
+        drop(inner);
+        // Linux sends one event `change` at the end of `loop_configure`, and not the event of
+        // the new size.
+        uevent::device_number(true, self.rdev, Action::Change, &[]);
         Ok(())
     }
 
@@ -480,7 +496,11 @@ impl LoopDevice {
             inner.rundown = false;
             inner.backing.take()
         };
+        let had = backing.is_some();
         drop(backing);
+        if had {
+            uevent::device_number(true, self.rdev, Action::Change, &[]);
+        }
     }
 
     /// Sets the status, as `loop_set_status` of Linux.
@@ -493,7 +513,8 @@ impl LoopDevice {
         }
         info.check()?;
         let sectors = sectors_of(file_size(&file), info.offset, info.sizelimit);
-        self.with(|b| {
+        let old = self.with(|b| {
+            let old = b.sectors;
             b.offset = info.offset;
             b.sizelimit = info.sizelimit;
             b.file_name = info.name();
@@ -501,7 +522,12 @@ impl LoopDevice {
             if changed {
                 b.sectors = sectors;
             }
-        })
+            old
+        })?;
+        if changed {
+            self.resized(old, sectors);
+        }
+        Ok(())
     }
 
     /// Gives the status, as `loop_get_status` of Linux.
