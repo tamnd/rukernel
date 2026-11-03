@@ -289,6 +289,9 @@ fn notify(dev: &NetDevice, event: Event) {
 /// A registered network device.
 pub struct NetDevice {
     name: SpinLock<String>,
+    /// The alternative names, in the order of their creation, as the list of `name_node` of
+    /// Linux.
+    altnames: SpinLock<Vec<String>>,
     ifindex: AtomicU32,
     /// The index of the namespace, as `dev_net` of Linux.
     net: AtomicUsize,
@@ -324,14 +327,53 @@ pub fn valid_name(name: &[u8]) -> bool {
         && name.iter().all(|&c| c != b'/' && c != b':' && !c.is_ascii_whitespace() && c != 0)
 }
 
+/// Tells if a device of the namespace `net` has the name or the alternative name `name`, as
+/// `netdev_name_in_use` of Linux.
+fn name_in_use(devices: &[Arc<NetDevice>], net: usize, name: &str) -> bool {
+    devices.iter().any(|d| d.net() == net && d.has_name(name))
+}
+
+/// The most units of a name pattern, as `max_netdevices` of `__dev_alloc_name` of Linux.
+const MAX_UNITS: u32 = 8 * 4096;
+
+/// Gives the first free name of the pattern `pat` in the namespace `net`, as `__dev_alloc_name`
+/// of Linux. The pattern must have one `%d` and no other `%`, else this gives `EINVAL`. Gives
+/// `ENFILE` if each unit is in use.
+fn alloc_name(devices: &[Arc<NetDevice>], net: usize, pat: &str) -> Result<String> {
+    let Some((head, tail)) = pat.split_once("%d") else {
+        return Err(Errno::EINVAL);
+    };
+    if head.contains('%') || tail.contains('%') {
+        return Err(Errno::EINVAL);
+    }
+    for unit in 0..MAX_UNITS {
+        let mut name = format!("{head}{unit}{tail}");
+        // `snprintf` of Linux cuts the name to `IFNAMSIZ` bytes with the NUL.
+        while name.len() >= IFNAMSIZ {
+            name.pop();
+        }
+        if !name_in_use(devices, net, &name) {
+            return Ok(name);
+        }
+    }
+    Err(Errno::ENFILE)
+}
+
 impl NetDevice {
     /// The name, for example `eth0`.
     pub fn name(&self) -> String {
         self.name.lock().clone()
     }
 
-    /// Changes the name, as `dev_change_name` of Linux. Gives `EINVAL` for a bad name, `EBUSY`
-    /// if the device is up, and `EEXIST` if another device has the name.
+    /// Tells if `name` is the name or an alternative name of the device.
+    fn has_name(&self, name: &str) -> bool {
+        *self.name.lock() == name || self.altnames.lock().iter().any(|n| n == name)
+    }
+
+    /// Changes the name, as `netif_change_name` of Linux. A device that is up can change its
+    /// name too. A name with `%d` gives the first free unit, as `eth%d` gives `eth0`. Gives
+    /// `EINVAL` for a bad name or pattern, and `EEXIST` if a device of the namespace has the
+    /// name or the alternative name.
     pub fn set_name(&self, name: &[u8]) -> Result<()> {
         if self.name.lock().as_bytes() == name {
             return Ok(());
@@ -342,17 +384,48 @@ impl NetDevice {
         let Ok(name) = core::str::from_utf8(name) else {
             return Err(Errno::EINVAL);
         };
-        if self.is_up() {
-            return Err(Errno::EBUSY);
-        }
         {
             let devices = DEVICES.lock();
-            if devices.iter().any(|d| d.net() == self.net() && *d.name.lock() == name) {
+            let name = if name.contains('%') {
+                alloc_name(&devices, self.net(), name)?
+            } else if name_in_use(&devices, self.net(), name) {
                 return Err(Errno::EEXIST);
-            }
-            *self.name.lock() = String::from(name);
+            } else {
+                String::from(name)
+            };
+            *self.name.lock() = name;
         }
         notify(self, Event::Name);
+        Ok(())
+    }
+
+    /// The alternative names, in the order of their creation.
+    pub fn altnames(&self) -> Vec<String> {
+        self.altnames.lock().clone()
+    }
+
+    /// Adds the alternative name `name`, as `netdev_name_node_alt_create` of Linux. Gives
+    /// `EEXIST` if a device of the namespace has the name or the alternative name.
+    pub fn add_altname(&self, name: &str) -> Result<()> {
+        let devices = DEVICES.lock();
+        if name_in_use(&devices, self.net(), name) {
+            return Err(Errno::EEXIST);
+        }
+        self.altnames.lock().push(String::from(name));
+        Ok(())
+    }
+
+    /// Removes the alternative name `name`, as `netdev_name_node_alt_destroy` of Linux. Gives
+    /// `ENOENT` if no device of the namespace has the name, and `EINVAL` if it is the name of
+    /// the device or a name of another device.
+    pub fn del_altname(&self, name: &str) -> Result<()> {
+        let devices = DEVICES.lock();
+        if !name_in_use(&devices, self.net(), name) {
+            return Err(Errno::ENOENT);
+        }
+        let mut list = self.altnames.lock();
+        let at = list.iter().position(|n| n == name).ok_or(Errno::EINVAL)?;
+        list.remove(at);
         Ok(())
     }
 
@@ -727,7 +800,7 @@ pub fn register_at(
     let dev = {
         let mut devices = DEVICES.lock();
         let kind = driver.kind();
-        let taken = |name: &str| devices.iter().any(|d| d.net() == net && *d.name.lock() == name);
+        let taken = |name: &str| name_in_use(&devices, net, name);
         let name = match (kind, name) {
             (LinkKind::Loopback, _) if taken("lo") => return Err(Errno::EEXIST),
             (LinkKind::Loopback, _) => String::from("lo"),
@@ -760,6 +833,7 @@ pub fn register_at(
         let (f, hw, wanted) = features::initial(f, hw, kind == LinkKind::Loopback);
         let dev = Arc::new(NetDevice {
             name: SpinLock::new(name),
+            altnames: SpinLock::new(Vec::new()),
             ifindex: AtomicU32::new(ifindex),
             net: AtomicUsize::new(net),
             kind,
@@ -804,7 +878,7 @@ pub fn unregister(dev: &Arc<NetDevice>) {
 /// Moves a device to the namespace `to`, as `__dev_change_net_namespace` of Linux. The device
 /// goes down, and it keeps its index if the index is free in `to`. Gives `EINVAL` for the
 /// loopback device and for a TUN or TAP device, which have `NETIF_F_NETNS_LOCAL` on Linux, and
-/// `EEXIST` if `to` has a device with the same name.
+/// `EEXIST` if `to` has a device with the same name or with one of its alternative names.
 pub fn move_to(dev: &Arc<NetDevice>, to: &NetNs) -> Result<()> {
     if dev.kind == LinkKind::Loopback || dev.link_kind() == Some(crate::tun::KIND) {
         return Err(Errno::EINVAL);
@@ -815,8 +889,9 @@ pub fn move_to(dev: &Arc<NetDevice>, to: &NetNs) -> Result<()> {
     }
     {
         let devices = DEVICES.lock();
-        let name = dev.name();
-        if devices.iter().any(|d| d.net() == net && *d.name.lock() == name) {
+        if name_in_use(&devices, net, &dev.name())
+            || dev.altnames().iter().any(|n| name_in_use(&devices, net, n))
+        {
             return Err(Errno::EEXIST);
         }
     }
@@ -834,10 +909,10 @@ pub fn move_to(dev: &Arc<NetDevice>, to: &NetNs) -> Result<()> {
     Ok(())
 }
 
-/// Finds a device of the current namespace by its name.
+/// Finds a device of the current namespace by its name or by an alternative name, as
+/// `__dev_get_by_name` of Linux.
 pub fn by_name(name: &str) -> Option<Arc<NetDevice>> {
-    let net = ns::current_index();
-    DEVICES.lock().iter().find(|d| d.net() == net && *d.name.lock() == name).cloned()
+    by_name_in(ns::current_index(), name)
 }
 
 /// Finds a device of the current namespace by its interface index.
@@ -879,18 +954,25 @@ fn ns_exit() {
         } else if move_to(&dev, &init).is_err() {
             // The first namespace has a device with the same name, as on Linux, which then
             // gives the device the name `devN`.
-            let name = (0..).map(|n| format!("dev{n}")).find(|n| by_name_in(0, n).is_none());
-            if let Some(name) = name {
-                *dev.name.lock() = name;
+            if by_name_in(0, &dev.name()).is_some() {
+                let name = (0..).map(|n| format!("dev{n}")).find(|n| by_name_in(0, n).is_none());
+                if let Some(name) = name {
+                    *dev.name.lock() = name;
+                }
             }
+            // An alternative name that the first namespace has goes away, as in
+            // `__dev_change_net_namespace` of Linux for a namespace that stops.
+            let taken: Vec<String> =
+                dev.altnames().into_iter().filter(|n| by_name_in(0, n).is_some()).collect();
+            dev.altnames.lock().retain(|n| !taken.contains(n));
             let _ = move_to(&dev, &init);
         }
     }
 }
 
-/// Finds a device of the namespace `net` by its name.
+/// Finds a device of the namespace `net` by its name or by an alternative name.
 fn by_name_in(net: usize, name: &str) -> Option<Arc<NetDevice>> {
-    DEVICES.lock().iter().find(|d| d.net() == net && *d.name.lock() == name).cloned()
+    DEVICES.lock().iter().find(|d| d.net() == net && d.has_name(name)).cloned()
 }
 
 /// Registers the loopback device, so that it gets the interface index 1 as on Linux. The kernel
