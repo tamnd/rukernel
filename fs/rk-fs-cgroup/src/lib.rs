@@ -185,6 +185,12 @@ pub fn cgroup_of(inode: &InodeRef) -> Option<CgId> {
     rk_cgroup::with(|h| h.exists(id)).then_some(id)
 }
 
+/// The ID of the cgroup `id` that a program sees: the inode number of its directory, as
+/// `cgroup_id` of Linux. `PIDFD_GET_INFO` gives it.
+pub fn cgroup_ino(id: CgId) -> u64 {
+    Node::ino(id, None)
+}
+
 /// The place of the file `name` in the list of files, plus 1. 0 is for the directory.
 fn file_index(name: &str) -> u64 {
     FILES.iter().position(|f| f.name == name).unwrap_or(FILES.len()) as u64 + 1

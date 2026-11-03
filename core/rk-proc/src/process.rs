@@ -724,6 +724,12 @@ impl Process {
         self.state.lock().zombie.is_some()
     }
 
+    /// The status that the parent gets, after the process ended. It stays after the parent
+    /// reaped the process, for `PIDFD_GET_INFO`.
+    pub fn exit_status(&self) -> Option<WaitStatus> {
+        self.state.lock().zombie
+    }
+
     /// The status of the exit of the group, if the group exits.
     pub fn group_exit(&self) -> Option<WaitStatus> {
         self.state.lock().group_exit
