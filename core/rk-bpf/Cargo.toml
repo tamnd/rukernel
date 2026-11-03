@@ -1,0 +1,18 @@
+[package]
+name = "rk-bpf"
+description = "The eBPF objects of rukernel: the bpf system call, the maps, the verifier and the interpreter."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+rk-vfs.workspace = true
+
+[lints]
+workspace = true

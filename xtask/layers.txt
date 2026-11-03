@@ -12,6 +12,7 @@ rk-cgroup 1
 rk-mm     1
 rk-proc   2
 rk-vfs    2
+rk-bpf    2
 rk-block  2
 rk-net    2
 rk-fs-proc 3

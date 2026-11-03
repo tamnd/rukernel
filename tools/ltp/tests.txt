@@ -45,6 +45,7 @@ alarm03
 alarm05
 alarm06
 alarm07
+bpf_map01
 brk01
 brk02
 clock_gettime01

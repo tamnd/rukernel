@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-bpf"
+version = "0.5.1"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-cgroup"
 version = "0.5.2"
 dependencies = [
@@ -128,6 +137,7 @@ name = "rk-fs-proc"
 version = "0.5.2"
 dependencies = [
  "rk-abi",
+ "rk-bpf",
  "rk-cgroup",
  "rk-frame",
  "rk-fs-cgroup",
@@ -235,6 +245,7 @@ name = "rk-syscall"
 version = "0.5.2"
 dependencies = [
  "rk-abi",
+ "rk-bpf",
  "rk-cgroup",
  "rk-drv-mem",
  "rk-drv-tty",
