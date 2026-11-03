@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.2] - 2026-11-04
+
 ### Added
 
 - `SO_PEERPIDFD` and `SO_PASSPIDFD` of Unix sockets, as net/core/sock.c and net/unix/af_unix.c of Linux. `SO_PEERPIDFD` gives a new pidfd of the process that connected, listened or made the socket pair. With `SO_PASSPIDFD`, `recvmsg` gives an `SCM_PIDFD` control message with a new pidfd of the sender. A socket from `accept` takes `SO_PASSCRED` and `SO_PASSPIDFD` of the listener, and the credentials go with each message when either option is set, as `unix_may_passcred`. tools/kselftest/build.sh builds `net/af_unix/scm_pidfd` (#536).
@@ -11,6 +13,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - Synthetic device events, as `udevadm trigger` asks for. A write of `ACTION [UUID [KEY=VALUE...]]` to the file `uevent` of a device in `/sys` sends the event of that device with `SYNTH_UUID` (`0` without a UUID) and a `SYNTH_ARG_KEY` variable for each pair, as `kobject_synth_uevent` of Linux. An unknown action or a bad argument gives `EINVAL` (#539).
 - The generic netlink family `ethtool`, as net/ethtool/netlink.c of Linux. It has `STRSET_GET`, `LINKINFO_GET` and `LINKINFO_SET`, `LINKMODES_GET` and `LINKMODES_SET`, `LINKSTATE_GET`, `FEATURES_GET` and `FEATURES_SET`, `RINGS_GET` and `CHANNELS_GET`, with the compact and the verbose bitsets, the dumps, the extended ack and the notices of the group `monitor`. A network device now has the offload features of Linux (`hw`, `wanted` and `active`). The ioctl `SIOCETHTOOL` has `ETHTOOL_GDRVINFO`, `ETHTOOL_GLINK`, `ETHTOOL_GPERMADDR` and `ETHTOOL_GLINKSETTINGS`. virtio-net, veth and TUN give their driver data and link settings (#538).
 - Time namespaces, as kernel/time/namespace.c of Linux. `unshare` and `clone3` with `CLONE_NEWTIME` make a namespace for the children, `/proc/PID/timens_offsets` sets its offsets of `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` until the first process goes in, and `setns` with a file of `/proc/PID/ns/time` or a pidfd moves the caller. `clock_gettime` in the vDSO and in the kernel, the absolute times of `clock_nanosleep`, `timer_settime`, `timerfd_settime` and `futex`, the uptime of `sysinfo` and `/proc/uptime`, and the `btime` of `/proc/stat` use the offsets. tools/kselftest/build.sh builds the `timens` tests (#536).
+- Generic netlink, as net/netlink/genetlink.c of Linux. A `NETLINK_GENERIC` socket has its own port IDs and 64 multicast groups, and the family `nlctrl` (ID 16) answers `CTRL_CMD_GETFAMILY` by name or by ID and as a dump, with the operations, their flags and the multicast groups, as `genl ctrl list` reads them. The header checks, the attribute policies and the errors are the same as Linux. Other kernel code can register a family with its operations and groups. `CTRL_CMD_GETPOLICY` is not there yet. The `inet` boot test checks the requests and the errors (#538).
+- `/proc/PID/limits`, `loginuid`, `sessionid`, `personality`, `wchan`, `schedstat` and `mountstats` have the format of Linux. A process sets its login UID once, and it then gets a new audit session ID. To change the login UID again, the process needs `CAP_AUDIT_CONTROL`. A read of `/proc/PID/pagemap` fills the zero entries of a hole at one time, so it is about 2.7 times faster (#543).
 
 ## [0.5.1] - 2026-11-04
 
@@ -21,8 +25,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - Process file descriptors are files of a pidfs, as fs/pidfs.c of Linux. Each pidfd of a process has the same inode, with a serial number of the process that no other process of the boot has as the inode number, and `fstat` and `statfs` give `PID_FS_MAGIC`. `name_to_handle_at` gives a file handle of type `FILEID_KERNFS` for a pidfd, and `open_by_handle_at` opens a new pidfd from it, also with `FD_PIDFS_ROOT`. `fdinfo` of a pidfd gives `Pid` and `NSpid`, with -1 after the parent reaped the process. `/proc/PID/fd` shows a pidfd as `anon_inode:[pidfd]` (#536).
 - procfs has `/proc/vmstat`, `/proc/zoneinfo` and `/proc/buddyinfo`, in the format of mm/vmstat.c of Linux 6.8. The machine shows one node with one zone, `Normal`. The free pages, the page faults, the transparent huge pages, the KiB that the disks read and wrote, the watermarks and the free lists of the CPUs come from the kernel, and the other counts are 0. `/proc/buddyinfo` gives the free frames of the bitmap as the aligned blocks of each order (#543).
 - `vm.memfd_noexec`, as kernel/pid_namespace.c and mm/memfd.c of Linux. With 1, `memfd_create` without `MFD_EXEC` or `MFD_NOEXEC_SEAL` gives a file without the execute bits and with `F_SEAL_EXEC`. With 2, `memfd_create` without `MFD_NOEXEC_SEAL` gives `EACCES`. A write needs `CAP_SYS_ADMIN`. apk of Alpine reads the file (#543).
-- Generic netlink, as net/netlink/genetlink.c of Linux. A `NETLINK_GENERIC` socket has its own port IDs and 64 multicast groups, and the family `nlctrl` (ID 16) answers `CTRL_CMD_GETFAMILY` by name or by ID and as a dump, with the operations, their flags and the multicast groups, as `genl ctrl list` reads them. The header checks, the attribute policies and the errors are the same as Linux. Other kernel code can register a family with its operations and groups. `CTRL_CMD_GETPOLICY` is not there yet. The `inet` boot test checks the requests and the errors (#538).
-- `/proc/PID/limits`, `loginuid`, `sessionid`, `personality`, `wchan`, `schedstat` and `mountstats` have the format of Linux. A process sets its login UID once, and it then gets a new audit session ID. To change the login UID again, the process needs `CAP_AUDIT_CONTROL`. A read of `/proc/PID/pagemap` fills the zero entries of a hole at one time, so it is about 2.7 times faster (#543).
 
 ### Changed
 
@@ -1307,6 +1309,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.2]: https://github.com/tamnd/rukernel/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/tamnd/rukernel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/tamnd/rukernel/compare/v0.4.21...v0.5.0
 [0.4.21]: https://github.com/tamnd/rukernel/compare/v0.4.20...v0.4.21
