@@ -516,6 +516,17 @@ pub(crate) fn writev_file(cx: &Cx<'_>, file: &File, iovs: &[Iovec], nowait: bool
     };
     let total = iovs.iter().map(|v| v.iov_len).sum();
     let room = fsize_count(cx, file, write_pos(file), total)?;
+    if file.ops().gathers_writev() {
+        // Such a file takes small writes, so one more byte than `CHUNK` is enough for it to see
+        // that a write is too large.
+        let max = usize::try_from(room).unwrap_or(usize::MAX).min(CHUNK + 1);
+        let mut buf = Vec::with_capacity(max);
+        for v in iovs {
+            let len = usize::try_from(v.iov_len).unwrap_or(usize::MAX).min(max - buf.len());
+            buf.extend_from_slice(&cx.read_bytes(v.iov_base, len)?);
+        }
+        return sigpipe(cx, write_sync(file, write(&buf).map(|n| n as u64)));
+    }
     let mut done = 0;
     for v in iovs.iter().copied() {
         let len = v.iov_len.min(room - done);

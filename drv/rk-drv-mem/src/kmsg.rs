@@ -163,6 +163,12 @@ impl FileOps for KmsgFile {
         Ok(buf.len())
     }
 
+    /// systemd writes the name, the PID and the text of a message in three buffers of one
+    /// `writev`, and `devkmsg_write` of Linux makes one record of them.
+    fn gathers_writev(&self) -> bool {
+        true
+    }
+
     fn llseek(&self, _file: &File, offset: i64, whence: Whence) -> Option<Result<u64>> {
         if offset != 0 {
             return Some(Err(Errno::ESPIPE));

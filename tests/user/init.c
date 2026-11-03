@@ -3474,6 +3474,23 @@ static void test_syslog(void)
 	check("syslog with a bad action gives EINVAL", klogctl(99, NULL, 0) < 0 && errno == EINVAL);
 	check("syslog read with no buffer gives EINVAL", klogctl(3, NULL, 10) < 0 && errno == EINVAL);
 	check("syslog clears the kernel log", klogctl(5, NULL, 0) == 0 && klogctl(3, buf, sizeof(buf)) == 0);
+	{
+		/* systemd writes a message to /dev/kmsg in parts with one writev, and the kernel makes
+		 * one record of it, as devkmsg_write of Linux. */
+		struct iovec iov[3] = {
+			{ "<5>kmsgtest", 11 }, { "[1]: ", 5 }, { "one record", 10 },
+		};
+		int fd;
+
+		mknod("/tmp/kmsg", S_IFCHR | 0600, makedev(1, 11));
+		fd = open("/tmp/kmsg", O_WRONLY);
+		check("a writev to /dev/kmsg gives the count", fd >= 0 && writev(fd, iov, 3) == 26);
+		n = klogctl(3, buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = 0;
+		check("a writev to /dev/kmsg makes one record", n > 0 && strstr(buf, "kmsgtest[1]: one record") != NULL);
+		close(fd);
+		unlink("/tmp/kmsg");
+	}
 }
 
 static void test_membarrier(void)
