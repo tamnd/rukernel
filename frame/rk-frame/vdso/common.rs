@@ -65,10 +65,28 @@ pub fn realtime_ns() -> u64 {
     now.wrapping_add(offset)
 }
 
+/// The offset of the time namespace of the process for `clock`, in nanoseconds. The page with the
+/// offsets of the namespace is directly below the data page: the offset of `CLOCK_MONOTONIC` and
+/// the offset of `CLOCK_BOOTTIME`. The kernel writes them before the first process goes in the
+/// namespace, so they do not change, as `struct timens_offsets` of Linux.
+fn time_ns_offset(clock: i32) -> u64 {
+    let offsets = (data() as usize).wrapping_sub(PAGE_SIZE) as *const [i64; 2];
+    // CLOCK_BOOTTIME has the second offset. CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW and
+    // CLOCK_MONOTONIC_COARSE have the first.
+    let index = usize::from(clock == 7);
+    // SAFETY: the kernel maps the page of the offsets below the data page.
+    let offset = unsafe { core::ptr::addr_of!((*offsets)[index]).read_volatile() };
+    offset as u64
+}
+
 /// The time of the clock `clock`, which `known` accepts, in nanoseconds.
 fn clock_ns(clock: i32) -> u64 {
     // CLOCK_REALTIME, CLOCK_REALTIME_COARSE and CLOCK_TAI follow the real time.
-    if matches!(clock, 0 | 5 | 11) { realtime_ns() } else { now_and_offset().0 }
+    if matches!(clock, 0 | 5 | 11) {
+        realtime_ns()
+    } else {
+        now_and_offset().0.wrapping_add(time_ns_offset(clock))
+    }
 }
 
 /// The resolution of the clocks, in nanoseconds.

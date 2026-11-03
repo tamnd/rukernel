@@ -112,6 +112,7 @@ pub(crate) fn alarm(cx: &Cx<'_>, seconds: u64) -> SysResult {
 pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysResult {
     let process = cx.process();
     let realtime = crate::info::is_realtime(clock as u32);
+    let clock_id = clock as u32;
     let clock = match clock as u32 {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => Clock::Boot,
         CLOCK_PROCESS_CPUTIME_ID => Clock::ProcessCpu(Arc::downgrade(process)),
@@ -153,7 +154,7 @@ pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysR
             if realtime {
                 Timer::new_realtime(target, info)
             } else {
-                Timer::new(clock, target, info)
+                Timer::with_clock_id(clock, clock_id, target, info)
             }
         })
         .ok_or(Errno::EAGAIN)?;
@@ -201,7 +202,8 @@ pub(crate) fn timer_settime(cx: &Cx<'_>, id: u64, flags: u64, new: u64, old: u64
                 crate::info::boot_ns(CLOCK_REALTIME, value).max(1)
             }
         } else {
-            value.max(1)
+            // An absolute time of a clock of a time namespace is a time of the namespace.
+            cx.thread.time_ns().to_host(timer.clock_id(), value).max(1)
         }
     } else {
         now.saturating_add(value)

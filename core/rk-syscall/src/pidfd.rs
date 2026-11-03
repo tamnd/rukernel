@@ -342,9 +342,10 @@ pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysR
         0xff02 => NsKind::Ipc,
         0xff03 => NsKind::Mnt,
         0xff04 => NsKind::Net,
-        // The PID and time namespaces for the children are the namespaces of the process.
+        // The PID namespace for the children is the namespace of the process.
         0xff05 | 0xff06 => NsKind::Pid,
-        0xff07 | 0xff08 => NsKind::Time,
+        0xff07 => NsKind::Time,
+        0xff08 => return Some(open_time_for_children(cx, process, arg)),
         0xff09 => NsKind::User,
         0xff0a => NsKind::Uts,
         _ => return Some(Err(Errno::ENOTTY)),
@@ -352,9 +353,26 @@ pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysR
     Some(open_ns(cx, process, kind, arg))
 }
 
+/// Opens the file of the time namespace for the children of `process`, for
+/// `PIDFD_GET_TIME_FOR_CHILDREN_NAMESPACE`.
+fn open_time_for_children(cx: &Cx<'_>, process: &Arc<Process>, arg: u64) -> SysResult {
+    open_inode(cx, process, arg, |p| Ok(crate::ns::time_inode(p.time_ns_for_children())))
+}
+
 /// Opens the file of the namespace `kind` of `process` for a `PIDFD_GET_*_NAMESPACE` command,
 /// as `open_namespace` of Linux. The new descriptor has `FD_CLOEXEC`.
 fn open_ns(cx: &Cx<'_>, process: &Arc<Process>, kind: rk_vfs::nsfs::NsKind, arg: u64) -> SysResult {
+    open_inode(cx, process, arg, |p| Ok(crate::ns::inode_of(p, kind)?))
+}
+
+/// Opens the file of a namespace of `process` that `inode` gives, after the checks of
+/// `pidfd_ioctl` of Linux.
+fn open_inode(
+    cx: &Cx<'_>,
+    process: &Arc<Process>,
+    arg: u64,
+    inode: impl FnOnce(&Process) -> Result<InodeRef, Errno>,
+) -> SysResult {
     // A zombie has no namespaces, as a task without `nsproxy` on Linux.
     if reaped(process) || process.is_zombie() {
         return Err(Errno::ESRCH);
@@ -365,7 +383,7 @@ fn open_ns(cx: &Cx<'_>, process: &Arc<Process>, kind: rk_vfs::nsfs::NsKind, arg:
     if !Arc::ptr_eq(process, cx.process()) && !cx.process().cred().may_ptrace(&process.cred()) {
         return Err(Errno::EACCES);
     }
-    let inode: InodeRef = crate::ns::inode_of(process, kind)?;
+    let inode = inode(process)?;
     let file = File::open_inode(Location::detached(inode), O_RDONLY);
     Ok(cx.files()?.lock().insert(file, true)? as u64)
 }

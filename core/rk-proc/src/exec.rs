@@ -391,15 +391,15 @@ type Built = (AddressSpace, ExecImage, (Location, DenyWrite), Vec<Vec<u8>>, Vec<
 /// exec removes. With `no_new_privs`, the set-user-ID and set-group-ID bits of the file have no
 /// effect. With `traced`, they change no ID, but they still remove the flags, as on Linux.
 /// Without `ADDR_NO_RANDOMIZE` in `personality` after the removal, the top of the `mmap` area gets
-/// a random offset.
+/// a random offset. The vDSO gives the clocks of the time namespace `time_ns`.
 fn build(
     fs: &FsContext,
     mut args: ExecArgs,
     random: [u8; 16],
     cred: &Cred,
     (no_new_privs, traced): (bool, bool),
-    memcg: u32,
-    personality: u32,
+    (memcg, personality): (u32, u32),
+    time_ns: &crate::timens::TimeNs,
 ) -> Result<Built, Errno> {
     let mut path = args.path.clone();
     let mut depth = 0;
@@ -500,7 +500,7 @@ fn build(
         ..MmapRequest::anon(STACK_SIZE, Prot::RW)
     };
     space.mmap(stack)?;
-    let vdso = crate::vdso::map(&space)?;
+    let vdso = crate::vdso::map(&space, time_ns)?;
 
     let phdr = main.header.phdr_addr().map_or(0, |a| main.bias + a as usize);
     let entry = main.bias + main.header.entry as usize;
@@ -571,8 +571,18 @@ pub fn exec(
     let traced = thread.is_traced() && !thread.tracer_capable();
     let setid = (thread.no_new_privs(), traced);
     let personality = process.personality();
-    let (space, image, (at, deny), argv, auxv, cred, per_clear) =
-        build(&ctx, args, random, &process.cred(), setid, process.memcg(), personality)?;
+    // The new program runs in the time namespace of the children, as `exec_task_namespaces` of
+    // Linux.
+    let time_ns = thread.time_ns_for_children();
+    let (space, image, (at, deny), argv, auxv, cred, per_clear) = build(
+        &ctx,
+        args,
+        random,
+        &process.cred(),
+        setid,
+        (process.memcg(), personality),
+        &time_ns,
+    )?;
     // The new program is ready, so the exec cannot fail now. The other threads end first.
     crate::process::kill_other_threads(thread);
     release(thread);
@@ -580,6 +590,7 @@ pub fn exec(
     space.activate();
     let old = process.replace_vm(space);
     drop(old);
+    thread.exec_time_ns(time_ns);
     thread.release_vfork();
     if let Some(files) = process.files() {
         // A table that another process shares stays with it, and this process takes a copy.

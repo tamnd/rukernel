@@ -9,7 +9,8 @@
 set -eu
 
 LINUX_TAG=v6.17
-TESTS="seccomp/seccomp_bpf net/af_unix/scm_pidfd"
+TESTS="seccomp/seccomp_bpf net/af_unix/scm_pidfd timens/timens timens/timerfd timens/timer
+	timens/clock_nanosleep timens/procfs timens/exec timens/futex timens/vfork_exec"
 
 out=${1:?usage: tools/kselftest/build.sh OUT_DIR}
 mkdir -p "$out"

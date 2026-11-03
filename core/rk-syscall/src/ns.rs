@@ -93,8 +93,14 @@ pub(crate) fn inode_of(process: &Process, kind: NsKind) -> Result<Arc<NsInode>, 
             let ipc = process.ipc_ns();
             NsInode::with_hold(kind, ipc.id(), ipc)
         }
+        NsKind::Time => time_inode(process.time_ns()),
         _ => NsInode::new(kind, rk_proc::ns::ns_id(process, kind)?),
     })
+}
+
+/// The inode of the time namespace `ns`. The inode keeps the namespace.
+pub(crate) fn time_inode(ns: Arc<rk_proc::timens::TimeNs>) -> Arc<NsInode> {
+    NsInode::with_hold(NsKind::Time, ns.id(), ns)
 }
 
 /// Puts `process` in the namespace `id` of the kind `kind`, other than a cgroup namespace, as

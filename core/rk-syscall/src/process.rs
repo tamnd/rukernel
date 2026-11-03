@@ -23,6 +23,7 @@ use rk_proc::ptrace::{
     self, PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE,
 };
 use rk_proc::signal::{CLD_TRAPPED, SigInfo};
+use rk_proc::timens::TimeNs;
 use rk_proc::{
     ForkShare, Pid, Process, VforkDone, WaitOptions, WaitResult, WaitStatus, WaitTarget,
 };
@@ -72,12 +73,12 @@ const ARCH_SET_CPUID: u64 = 0x1012;
 
 /// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
 /// have yet. They give `EINVAL`, as Linux without the namespace type gives.
-const CLONE_NEW_ANY: u64 = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWTIME;
+const CLONE_NEW_ANY: u64 = CLONE_NEWUSER | CLONE_NEWPID;
 
-/// Checks that `process` can make a new UTS or IPC namespace, as `create_new_namespaces` of
-/// kernel/nsproxy.c of Linux. It needs `CAP_SYS_ADMIN`.
+/// Checks that `process` can make a new UTS, IPC or time namespace, as `create_new_namespaces`
+/// of kernel/nsproxy.c of Linux. It needs `CAP_SYS_ADMIN`.
 fn may_new_ns(process: &Process, flags: u64) -> Result<(), Errno> {
-    if flags & (CLONE_NEWUTS | CLONE_NEWIPC) != 0
+    if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWTIME) != 0
         && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN)
     {
         return Err(Errno::EPERM);
@@ -94,6 +95,15 @@ fn new_uts_ipc_ns(thread: &rk_proc::Thread, flags: u64) {
     if flags & CLONE_NEWIPC != 0 {
         thread.set_ipc_ns(rk_proc::ns::new_ipc());
     }
+}
+
+/// Makes a new time namespace for the children of `thread` for `CLONE_NEWTIME`, with the offsets
+/// of the namespace of its children now, as `copy_time_ns` of Linux.
+fn new_time_ns(thread: &rk_proc::Thread, flags: u64) -> Result<Option<Arc<TimeNs>>, Errno> {
+    if flags & CLONE_NEWTIME == 0 {
+        return Ok(None);
+    }
+    rk_proc::timens::new(&thread.time_ns_for_children()).map(Some)
 }
 
 /// Makes a new network namespace for `CLONE_NEWNET`, as `copy_net_ns` of Linux. It needs
@@ -119,6 +129,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         | CLONE_NEWNET
         | CLONE_NEWUTS
         | CLONE_NEWIPC
+        | CLONE_NEWTIME
         | CLONE_NEW_ANY;
     if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
@@ -141,6 +152,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     // The copy of the descriptor table comes before the other changes, so that an `EMFILE` of
     // `fs.nr_open` changes nothing, as `unshare_fd` in `ksys_unshare` of Linux.
     let files = if flags & CLONE_FILES != 0 { Some(cx.files()?.lock().try_clone()?) } else { None };
+    let time = new_time_ns(cx.thread, flags)?;
     if flags & CLONE_NEWCGROUP != 0 {
         new_cgroup_ns(process)?;
     }
@@ -154,6 +166,10 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         crate::sem::exit(process.pid() as i32);
     }
     new_uts_ipc_ns(cx.thread, flags);
+    // The caller stays in its time namespace, and its new children go in the new one.
+    if let Some(ns) = time {
+        cx.thread.set_time_ns_for_children(ns);
+    }
     // Only the caller gets the new namespace, as `switch_task_namespaces` of Linux.
     if flags & CLONE_NEWNET != 0 {
         cx.thread.set_net_ns(new_net_ns(process)?);
@@ -268,6 +284,22 @@ fn join_ipc_ns(cx: &Cx<'_>, ns: Arc<rk_proc::ns::IpcNs>) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Puts the calling thread and its new children in the time namespace `ns`, as `timens_install`
+/// of kernel/time/namespace.c of Linux.
+///
+/// # Errors
+///
+/// `EUSERS` if the process has more than one thread, and `EPERM` without `CAP_SYS_ADMIN`.
+fn join_time_ns(cx: &Cx<'_>, ns: Arc<TimeNs>) -> Result<(), Errno> {
+    if cx.process().threads().len() > 1 {
+        return Err(Errno::EUSERS);
+    }
+    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    cx.thread.enter_time_ns(ns, true)
+}
+
 /// Puts `process` in the cgroup namespace `ns`, as `cgroupns_install` of Linux.
 ///
 /// # Errors
@@ -307,6 +339,9 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
             rk_vfs::nsfs::NsKind::Ipc => {
                 join_ipc_ns(cx, rk_proc::ns::ipc_by_id(id).ok_or(Errno::EINVAL)?)?;
             }
+            rk_vfs::nsfs::NsKind::Time => {
+                join_time_ns(cx, rk_proc::timens::by_id(id).ok_or(Errno::EINVAL)?)?;
+            }
             kind => crate::ns::install(cx, process, kind, id)?,
         }
         return Ok(0);
@@ -314,7 +349,7 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     let Ok(target) = crate::pidfd::process_of(cx, fd) else {
         return Err(Errno::EINVAL);
     };
-    let all = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWNET | CLONE_NEW_ANY;
+    let all = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWNET | CLONE_NEWTIME | CLONE_NEW_ANY;
     if nstype == 0 || nstype & !all != 0 {
         return Err(Errno::EINVAL);
     }
@@ -341,6 +376,9 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     }
     if nstype & CLONE_NEWIPC != 0 {
         join_ipc_ns(cx, target.ipc_ns())?;
+    }
+    if nstype & CLONE_NEWTIME != 0 {
+        join_time_ns(cx, target.time_ns())?;
     }
     Ok(0)
 }
@@ -375,7 +413,9 @@ pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     let args = <CloneArgs as zerocopy::FromBytes>::read_from_bytes(&bytes[..known])
         .map_err(|_| Errno::EINVAL)?;
     let flags = args.flags;
-    if flags & (CLONE_DETACHED | CSIGNAL) != 0
+    // `CLONE_NEWTIME` has a bit of `CSIGNAL`, and only `clone3` takes it, as
+    // `clone3_args_valid` of Linux.
+    if flags & (CLONE_DETACHED | (CSIGNAL & !CLONE_NEWTIME)) != 0
         || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
         || (flags & CLONE_INTO_CGROUP != 0 && flags & CLONE_THREAD != 0)
         || args.set_tid != 0
@@ -434,6 +474,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     }
     // A new thread can have its own network namespace, as on Linux.
     let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cx.process())?) } else { None };
+    let time = new_time_ns(cx.thread, flags)?;
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread(cx.thread)?
     } else {
@@ -478,6 +519,15 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     // ends. A process file descriptor that the caller cannot get closes again, as
     // `copy_process` in kernel/fork.c of Linux, which installs the descriptor after the write.
     let setup = |cx: &mut Cx<'_>| -> Result<(), Errno> {
+        if let Some(ns) = time {
+            thread.set_time_ns_for_children(ns);
+        }
+        // A new process goes in the time namespace of the children of the caller, as
+        // `timens_on_fork` of Linux. A child that shares the memory stays in the namespace of
+        // the caller until it runs a program.
+        if flags & CLONE_VM == 0 && thread.time_ns_changes() {
+            thread.enter_time_ns(thread.time_ns_for_children(), false)?;
+        }
         if flags & CLONE_PARENT_SETTID != 0 {
             cx.write_val(args.parent_tid, &tid)?;
         }
