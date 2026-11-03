@@ -6,6 +6,7 @@ use crate::ip::{self, Ip};
 use crate::ipv4;
 use crate::ipv4::Addr;
 use crate::neigh::{Change, Info, Nud, ProxyInfo};
+use crate::nexthop;
 use crate::route::{
     INFINITY, IfAddr, Match, Metrics, RTAX_ADVMSS, RTAX_CC_ALGO, RTAX_FEATURE_MASK, RTAX_FEATURES,
     RTAX_HOPLIMIT, RTAX_MAX, RTAX_MTU, Route,
@@ -29,11 +30,12 @@ use rk_abi::native::neighbour::{
 use rk_abi::native::netlink::{NLM_F_DUMP_FILTERED, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE};
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RT_TABLE_MAIN, RTA_CACHEINFO,
-    RTA_DEL_REASON, RTA_DPORT, RTA_DST, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK, RTA_METRICS,
-    RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC, RTA_TABLE, RTA_UID, RTM_DELADDR,
-    RTM_DELNEIGH, RTM_DELROUTE, RTM_F_CLONED, RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY,
-    RTM_F_PREFIX, RTM_GETADDR, RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE,
-    RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST, RTNLGRP_NEIGH,
+    RTA_DEL_REASON, RTA_DPORT, RTA_DST, RTA_ENCAP, RTA_GATEWAY, RTA_IIF, RTA_IP_PROTO, RTA_MARK,
+    RTA_METRICS, RTA_MULTIPATH, RTA_NH_ID, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_SPORT, RTA_SRC,
+    RTA_TABLE, RTA_UID, RTA_VIA, RTM_DELADDR, RTM_DELNEIGH, RTM_DELROUTE, RTM_F_CLONED,
+    RTM_F_FIB_MATCH, RTM_F_LOOKUP_TABLE, RTM_F_NOTIFY, RTM_F_PREFIX, RTM_GETADDR, RTM_GETNEIGH,
+    RTM_GETROUTE, RTM_NEWADDR, RTM_NEWNEIGH, RTM_NEWROUTE, RTN_BROADCAST, RTN_LOCAL, RTN_UNICAST,
+    RTNLGRP_NEIGH,
 };
 use rk_net::consts::{AF_INET, AF_INET6, IFNAMSIZ};
 use rk_net::dev::{self, NetDevice};
@@ -257,8 +259,17 @@ fn to_route(req: &Request<'_>) -> Result<Route> {
     for ty in [RTA_DST, RTA_GATEWAY, RTA_PREFSRC] {
         a.addr4(ty)?;
     }
-    for ty in [RTA_OIF, RTA_PRIORITY, RTA_TABLE] {
+    for ty in [RTA_OIF, RTA_PRIORITY, RTA_TABLE, RTA_NH_ID] {
         a.u32(ty)?;
+    }
+    let nhid = a.u32(RTA_NH_ID)?.unwrap_or(0);
+    if nhid != 0
+        && (a.u32(RTA_OIF)?.unwrap_or(0) != 0
+            || [RTA_GATEWAY, RTA_VIA, RTA_ENCAP, RTA_MULTIPATH].iter().any(|t| a.has(*t)))
+    {
+        return Err(
+            req.error("Nexthop specification and nexthop id are mutually exclusive", Errno::EINVAL)
+        );
     }
     let mut table = a.u32(RTA_TABLE)?.unwrap_or(u32::from(h[4]));
     if table == 0 {
@@ -284,19 +295,30 @@ fn to_route(req: &Request<'_>) -> Result<Route> {
         ifindex: a.u32(RTA_OIF)?.unwrap_or(0),
         flags: u32_at(h, 8),
         metrics: a.get(RTA_METRICS).map_or(Ok([0; RTAX_MAX as usize]), to_metrics)?,
+        nhid,
+        blackhole: false,
     })
 }
 
 /// `RTM_NEWROUTE`, as `inet_rtm_newroute` of Linux.
 fn newroute(req: &Request<'_>) -> Result<()> {
     let mut r = to_route(req)?;
+    if r.nhid != 0 {
+        nexthop::exists(req, r.nhid)?;
+    }
     fib::check_route(&mut r)?;
+    if r.nhid != 0 {
+        nexthop::check_route4(req, &mut r)?;
+    }
     fib::add_route(r, u32::from(req.hdr.flags), req.origin())
 }
 
 /// `RTM_DELROUTE`, as `inet_rtm_delroute` of Linux.
 fn delroute(req: &Request<'_>) -> Result<()> {
     let r = to_route(req)?;
+    if r.nhid != 0 {
+        nexthop::exists(req, r.nhid)?;
+    }
     let nonzero = |v: u8| (v != 0).then_some(v);
     let m = Match {
         table: r.table,
@@ -310,6 +332,7 @@ fn delroute(req: &Request<'_>) -> Result<()> {
         gateway: r.gateway,
         ifindex: (r.ifindex != 0).then_some(r.ifindex),
         priority: (r.priority != 0).then_some(r.priority),
+        nhid: (r.nhid != 0).then_some(r.nhid),
     };
     fib::del_route(&m, req.origin())
 }

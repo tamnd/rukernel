@@ -6,6 +6,7 @@
 //! after the lock is free, because a socket that gets a message takes its own lock.
 
 use crate::ipv4::{self, Addr};
+use crate::nexthop;
 use crate::route::{Changes, IfAddr, Link, Match, Metrics, Route};
 use crate::stack::{self, ROUTES};
 use alloc::string::String;
@@ -18,10 +19,10 @@ use rk_abi::native::if_addr::{
 use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL};
 use rk_abi::native::rtnetlink::{
     RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_NOWHERE, RT_SCOPE_UNIVERSE, RT_TABLE_COMPAT, RTA_DST,
-    RTA_GATEWAY, RTA_METRICS, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_DELADDR,
-    RTM_DELROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_ANYCAST, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL,
-    RTN_MULTICAST, RTN_NAT, RTN_PROHIBIT, RTN_THROW, RTN_UNICAST, RTN_UNREACHABLE, RTN_XRESOLVE,
-    RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV4_ROUTE,
+    RTA_GATEWAY, RTA_METRICS, RTA_NH_ID, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE,
+    RTM_DELADDR, RTM_DELROUTE, RTM_NEWADDR, RTM_NEWROUTE, RTN_ANYCAST, RTN_BLACKHOLE,
+    RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST, RTN_NAT, RTN_PROHIBIT, RTN_THROW, RTN_UNICAST,
+    RTN_UNREACHABLE, RTN_XRESOLVE, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV4_ROUTE,
 };
 use rk_net::consts::{AF_INET, IFNAMSIZ};
 use rk_net::dev::{self, Event, LinkKind, NetDevice};
@@ -117,7 +118,18 @@ pub fn fill_route(r: &Route, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<
     h[5] = r.protocol;
     h[6] = r.scope;
     h[7] = r.kind;
-    h[8..12].copy_from_slice(&r.flags.to_ne_bytes());
+    let mut rflags = r.flags;
+    // A route through a nexthop object shows the nexthop, as the compat mode of Linux.
+    let nh = (r.nhid != 0).then(|| nexthop::compat(r.nhid)).flatten();
+    if let Some(c) = &nh {
+        if c.blackhole {
+            h[7] = RTN_BLACKHOLE as u8;
+        }
+        if let [p] = &c.paths[..] {
+            rflags = u32::from(p.flags);
+        }
+    }
+    h[8..12].copy_from_slice(&rflags.to_ne_bytes());
     b.fixed(&h);
     b.u32(RTA_TABLE as u16, r.table);
     if r.prefix != 0 {
@@ -130,11 +142,20 @@ pub fn fill_route(r: &Route, ty: u32, portid: u32, seq: u32, flags: u32) -> Vec<
     if let Some(s) = r.prefsrc {
         b.put(RTA_PREFSRC as u16, &s);
     }
-    if let Some(gw) = r.gateway {
-        b.put(RTA_GATEWAY as u16, &gw);
+    if r.nhid != 0 {
+        b.u32(RTA_NH_ID as u16, r.nhid);
     }
-    if r.ifindex != 0 {
-        b.u32(RTA_OIF as u16, r.ifindex);
+    match &nh {
+        Some(c) if c.paths.len() == 1 => nexthop::put_path(&mut b, &c.paths[0], AF_INET),
+        Some(c) => nexthop::put_multipath(&mut b, &c.paths, AF_INET),
+        None => {
+            if let Some(gw) = r.gateway {
+                b.put(RTA_GATEWAY as u16, &gw);
+            }
+            if r.ifindex != 0 {
+                b.u32(RTA_OIF as u16, r.ifindex);
+            }
+        }
     }
     b.finish()
 }
@@ -164,7 +185,7 @@ fn notify_addr(a: &IfAddr, ty: u32, origin: Origin) {
 }
 
 /// Sends the notification of a route to `RTNLGRP_IPV4_ROUTE`, as `rtmsg_fib` of Linux.
-fn notify_route(r: &Route, ty: u32, origin: Origin, flags: u32) {
+pub(crate) fn notify_route(r: &Route, ty: u32, origin: Origin, flags: u32) {
     if netlink::has_listeners(RTNLGRP_IPV4_ROUTE) || origin.echo {
         let m = fill_route(r, ty, origin.portid, origin.seq, flags);
         netlink::notify(RTNLGRP_IPV4_ROUTE, m, origin);
@@ -269,8 +290,15 @@ pub fn del_addr(ifindex: u32, pred: impl Fn(&IfAddr) -> bool, origin: Origin) ->
 /// # Errors
 ///
 /// Gives the errors of `route::Table::insert_route`.
-pub fn add_route(r: Route, flags: u32, origin: Origin) -> Result<()> {
-    let notify = ROUTES.lock().insert_route(r.clone(), flags)?;
+pub fn add_route(mut r: Route, flags: u32, origin: Origin) -> Result<()> {
+    let notify = {
+        let mut t = ROUTES.lock();
+        // The nexthop can change after the checks: copy it again under the lock.
+        if r.nhid != 0 {
+            nexthop::refresh4(&mut r)?;
+        }
+        t.insert_route(r.clone(), flags)?
+    };
     if let Some(nlflags) = notify {
         notify_route(&r, RTM_NEWROUTE, origin, nlflags);
     }
@@ -323,7 +351,10 @@ pub fn check_route(r: &mut Route) -> Result<()> {
         {
             return Err(Errno::EINVAL);
         }
-        r.ifindex = t.check_nexthop(r, |i| dev::by_index(i).map(|d| d.is_up()))?;
+        // `nexthop::check_route4` checks a nexthop object.
+        if r.nhid == 0 {
+            r.ifindex = t.check_nexthop(r, |i| dev::by_index(i).map(|d| d.is_up()))?;
+        }
     }
     if let Some(src) = r.prefsrc {
         // `fib_valid_prefsrc`: a `local` route to its own address is valid before the address.

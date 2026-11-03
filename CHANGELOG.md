@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- Nexthop objects, as net/ipv4/nexthop.c of Linux. `RTM_NEWNEXTHOP`, `RTM_DELNEXTHOP` and `RTM_GETNEXTHOP` add, replace, delete, get and dump gateways, blackholes, `fdb` nexthops and groups with weights, with the attribute policies, the checks, the error messages and the notifications of Linux. An IPv4 or IPv6 route can use `RTA_NH_ID`, and its messages show the nexthop as the compat mode of Linux. A change of a nexthop changes its routes, and a nexthop that goes away takes its routes and the groups without other members with it. A packet through a group takes the first member. Resilient groups and encapsulations give `EOPNOTSUPP`. The `inet` boot test checks the nexthops in a new network namespace (#538).
+
 ### Changed
 
 - The arm64 `boot` and `smp` boot tests run with 8 CPUs, not 4, as the x86_64 tests. The arm64 `smp` test takes about 74 s with 8 CPUs and 53 s with 4 on server1 (#417).
