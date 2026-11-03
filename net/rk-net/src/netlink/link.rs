@@ -1,7 +1,8 @@
 //! The messages of the links: `RTM_GETLINK`, `RTM_NEWLINK` and `RTM_SETLINK`, as
 //! net/core/rtnetlink.c of Linux.
 
-use super::msg::{Attrs, Builder};
+use super::msg::{ATTR_HDRLEN, Attrs, Builder};
+use super::policy::{self, Check, Kind, Policy};
 use super::{Origin, Request, notify, register};
 use crate::consts::IFNAMSIZ;
 use crate::dev::{self, Event, LinkKind, NetDevice};
@@ -12,19 +13,25 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_link::{
     IFLA_ADDRESS, IFLA_AF_SPEC, IFLA_ALLMULTI, IFLA_ALT_IFNAME, IFLA_BROADCAST, IFLA_CARRIER,
-    IFLA_CARRIER_CHANGES, IFLA_CARRIER_DOWN_COUNT, IFLA_CARRIER_UP_COUNT, IFLA_EXT_MASK,
-    IFLA_GRO_IPV4_MAX_SIZE, IFLA_GRO_MAX_SIZE, IFLA_GROUP, IFLA_GSO_IPV4_MAX_SIZE,
-    IFLA_GSO_MAX_SEGS, IFLA_GSO_MAX_SIZE, IFLA_HEADROOM, IFLA_IFNAME, IFLA_LINK, IFLA_LINK_NETNSID,
-    IFLA_LINKINFO, IFLA_LINKMODE, IFLA_MAP, IFLA_MASTER, IFLA_MAX_MTU,
+    IFLA_CARRIER_CHANGES, IFLA_CARRIER_DOWN_COUNT, IFLA_CARRIER_UP_COUNT, IFLA_EVENT,
+    IFLA_EXT_MASK, IFLA_GRO_IPV4_MAX_SIZE, IFLA_GRO_MAX_SIZE, IFLA_GROUP, IFLA_GSO_IPV4_MAX_SIZE,
+    IFLA_GSO_MAX_SEGS, IFLA_GSO_MAX_SIZE, IFLA_HEADROOM, IFLA_IFALIAS, IFLA_IFNAME, IFLA_LINK,
+    IFLA_LINK_NETNSID, IFLA_LINKINFO, IFLA_LINKMODE, IFLA_MAP, IFLA_MASTER, IFLA_MAX_MTU,
     IFLA_MAX_PACING_OFFLOAD_HORIZON, IFLA_MIN_MTU, IFLA_MTU, IFLA_NET_NS_FD, IFLA_NET_NS_PID,
-    IFLA_NETNS_IMMUTABLE, IFLA_NUM_RX_QUEUES, IFLA_NUM_TX_QUEUES, IFLA_NUM_VF, IFLA_OPERSTATE,
-    IFLA_PARENT_DEV_BUS_NAME, IFLA_PARENT_DEV_NAME, IFLA_PERM_ADDRESS, IFLA_PROMISCUITY,
-    IFLA_PROTINFO, IFLA_PROTO_DOWN, IFLA_QDISC, IFLA_STATS, IFLA_STATS64, IFLA_TAILROOM,
-    IFLA_TARGET_NETNSID, IFLA_TSO_MAX_SEGS, IFLA_TSO_MAX_SIZE, IFLA_TXQLEN, IFLA_XDP,
-    IFLA_XDP_ATTACHED, XDP_ATTACHED_NONE,
+    IFLA_NETNS_IMMUTABLE, IFLA_NEW_IFINDEX, IFLA_NUM_RX_QUEUES, IFLA_NUM_TX_QUEUES, IFLA_NUM_VF,
+    IFLA_OPERSTATE, IFLA_PARENT_DEV_BUS_NAME, IFLA_PARENT_DEV_NAME, IFLA_PERM_ADDRESS,
+    IFLA_PHYS_PORT_ID, IFLA_PHYS_SWITCH_ID, IFLA_PORT_SELF, IFLA_PROMISCUITY, IFLA_PROP_LIST,
+    IFLA_PROTINFO, IFLA_PROTO_DOWN, IFLA_PROTO_DOWN_REASON, IFLA_QDISC, IFLA_STATS, IFLA_STATS64,
+    IFLA_TAILROOM, IFLA_TARGET_NETNSID, IFLA_TSO_MAX_SEGS, IFLA_TSO_MAX_SIZE, IFLA_TXQLEN,
+    IFLA_VF_PORTS, IFLA_VFINFO_LIST, IFLA_WEIGHT, IFLA_XDP, IFLA_XDP_ATTACHED, XDP_ATTACHED_NONE,
 };
-use rk_abi::native::netlink::{NLM_F_CREATE, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE};
-use rk_abi::native::rtnetlink::{RTM_DELLINK, RTM_GETLINK, RTM_NEWLINK, RTM_SETLINK, RTNLGRP_LINK};
+use rk_abi::native::netlink::{
+    NLA_F_NESTED, NLA_TYPE_MASK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_MULTI, NLM_F_REPLACE,
+};
+use rk_abi::native::rtnetlink::{
+    RTM_DELLINK, RTM_DELLINKPROP, RTM_GETLINK, RTM_NEWLINK, RTM_NEWLINKPROP, RTM_SETLINK,
+    RTNLGRP_LINK,
+};
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
 
@@ -33,6 +40,14 @@ pub const IFINFO_LEN: usize = 16;
 
 /// The largest attribute type of a link, `IFLA_MAX` of Linux 7.3.
 const IFLA_MAX: u16 = 69;
+
+/// The size of an alternative name with its NUL, `ALTIFNAMSIZ` of <linux/if.h>.
+const ALTIFNAMSIZ: usize = 128;
+
+/// The values of `IFLA_EVENT`, `IFLA_EVENT_*` of <linux/if_link.h>. They are in an enum without
+/// a name that rk-abigen does not read, thus they are here by hand.
+const IFLA_EVENT_NONE: u32 = 0;
+const IFLA_EVENT_FEATURES: u32 = 2;
 
 /// The attributes in `IFLA_LINKINFO`, `IFLA_INFO_*` of <linux/if_link.h>. They are in an enum
 /// without a name that rk-abigen does not read, thus they are here by hand.
@@ -73,6 +88,8 @@ pub(super) fn init() {
     register(0, RTM_NEWLINK, Some(newlink), None, false);
     register(0, RTM_SETLINK, Some(setlink), None, false);
     register(0, RTM_DELLINK, Some(dellink), None, false);
+    register(0, RTM_NEWLINKPROP, Some(newlinkprop), None, false);
+    register(0, RTM_DELLINKPROP, Some(dellinkprop), None, false);
     dev::add_notifier(event);
 }
 
@@ -97,9 +114,35 @@ pub fn fill(
     flags: u32,
     ext: u32,
 ) -> Vec<u8> {
+    fill_event(dev, ty, portid, seq, change, flags, ext, IFLA_EVENT_NONE)
+}
+
+/// Builds the message of a link as `fill`, with the value `event` of `IFLA_EVENT` if it is not
+/// `IFLA_EVENT_NONE`.
+#[allow(clippy::too_many_arguments)]
+fn fill_event(
+    dev: &NetDevice,
+    ty: u32,
+    portid: u32,
+    seq: u32,
+    change: u32,
+    flags: u32,
+    ext: u32,
+    event: u32,
+) -> Vec<u8> {
     let mut b = Builder::new(ty as u16, flags as u16, seq, portid);
     b.fixed(&ifinfo(dev, change));
     b.str(IFLA_IFNAME as u16, &dev.name());
+    // The alternative names, as `rtnl_fill_prop_list` of Linux. A device without one has no
+    // `IFLA_PROP_LIST`. The nest has `NLA_F_NESTED`, as `nla_nest_start`.
+    let alt = dev.altnames();
+    if !alt.is_empty() {
+        let list = b.nest((IFLA_PROP_LIST | NLA_F_NESTED) as u16);
+        for name in &alt {
+            b.str(IFLA_ALT_IFNAME as u16, name);
+        }
+        b.end_nest(list);
+    }
     if ext & RTEXT_FILTER_NAME_ONLY != 0 {
         return b.finish();
     }
@@ -132,6 +175,9 @@ pub fn fill(
         .u16(IFLA_HEADROOM as u16, 0)
         .u16(IFLA_TAILROOM as u16, 0)
         .u8(IFLA_PROTO_DOWN as u16, 0);
+    if event != IFLA_EVENT_NONE {
+        b.u32(IFLA_EVENT as u16, event);
+    }
     // The other end of a pair, as `nla_put_iflink` of Linux.
     if let Some(peer) = dev.peer() {
         b.u32(IFLA_LINK as u16, peer.ifindex());
@@ -201,8 +247,8 @@ pub fn fill(
 /// Checks the attributes of a request against `ifla_policy` of Linux. A name of
 /// `IFNAMSIZ` bytes or more without its NUL gives `ERANGE`.
 fn check_policy(a: &Attrs<'_>) -> Result<()> {
-    for ty in [IFLA_IFNAME, IFLA_ALT_IFNAME] {
-        if a.str(ty).is_some_and(|n| n.len() >= IFNAMSIZ) {
+    for (ty, size) in [(IFLA_IFNAME, IFNAMSIZ), (IFLA_ALT_IFNAME, ALTIFNAMSIZ)] {
+        if a.str(ty).is_some_and(|n| n.len() >= size) {
             return Err(Errno::ERANGE);
         }
     }
@@ -470,15 +516,170 @@ fn setlink(req: &Request<'_>) -> Result<()> {
 /// Sends `RTM_NEWLINK` to the group `RTNLGRP_LINK` for a change of a device, as `rtmsg_ifinfo`
 /// of Linux.
 fn event(dev: &NetDevice, e: Event) {
-    let (ty, change) = match e {
-        Event::Flags(c) => (RTM_NEWLINK, c),
-        Event::Mtu | Event::Name | Event::Features => (RTM_NEWLINK, 0),
-        Event::Register => (RTM_NEWLINK, u32::MAX),
-        Event::Unregister => (RTM_DELLINK, u32::MAX),
+    let (ty, change, event) = match e {
+        Event::Flags(c) => (RTM_NEWLINK, c, IFLA_EVENT_NONE),
+        Event::Mtu | Event::Name => (RTM_NEWLINK, 0, IFLA_EVENT_NONE),
+        Event::Features => (RTM_NEWLINK, 0, IFLA_EVENT_FEATURES),
+        Event::Register => (RTM_NEWLINK, u32::MAX, IFLA_EVENT_NONE),
+        Event::Unregister => (RTM_DELLINK, u32::MAX, IFLA_EVENT_NONE),
         Event::Up | Event::Down => return,
     };
     if !super::has_listeners(RTNLGRP_LINK) {
         return;
     }
-    notify(RTNLGRP_LINK, fill(dev, ty, 0, 0, change, 0, 0), Origin::KERNEL);
+    notify_link(dev, ty, change, event);
+}
+
+/// Sends a message of `dev` to the group `RTNLGRP_LINK`, as `rtmsg_ifinfo_event` of Linux.
+fn notify_link(dev: &NetDevice, ty: u32, change: u32, event: u32) {
+    if !super::has_listeners(RTNLGRP_LINK) {
+        return;
+    }
+    let msg = fill_event(dev, ty, 0, 0, change, 0, 0, event);
+    notify(RTNLGRP_LINK, msg, Origin::KERNEL);
+}
+
+/// The smallest size of the offloads, `MAX_TCP_HEADER + 1` of Linux for 64 byte cache lines.
+const GSO_MIN_SIZE: u64 = 321;
+
+/// The policy of the attributes of a link, `ifla_policy` of Linux. Only the `RTM_*LINKPROP`
+/// requests use it now. A signed type of Linux is `U32` here, with the same checks.
+static IFLA_POLICY: [Policy; IFLA_MAX as usize + 1] = ifla_policy();
+
+const fn ifla_policy() -> [Policy; IFLA_MAX as usize + 1] {
+    let string = Policy::of(Kind::String);
+    let binary = Policy::of(Kind::Binary);
+    let u8 = Policy::of(Kind::U8);
+    let u32 = Policy::of(Kind::U32);
+    let nested = Policy::of(Kind::Nested);
+    let reject = Policy::of(Kind::Reject);
+    // `MAX_ADDR_LEN` and `MAX_PHYS_ITEM_ID_LEN` of Linux.
+    let addr = binary.len(32);
+    let mut p = [Policy::NONE; IFLA_MAX as usize + 1];
+    p[IFLA_IFNAME as usize] = string.len(IFNAMSIZ as u16 - 1);
+    p[IFLA_ADDRESS as usize] = addr;
+    p[IFLA_BROADCAST as usize] = addr;
+    // `sizeof(struct rtnl_link_ifmap)`, without a type.
+    p[IFLA_MAP as usize] = Policy::NONE.len(32);
+    p[IFLA_MTU as usize] = u32;
+    p[IFLA_LINK as usize] = u32;
+    p[IFLA_MASTER as usize] = u32;
+    p[IFLA_CARRIER as usize] = u8;
+    p[IFLA_TXQLEN as usize] = u32.check(Check::Range(0, i16::MAX as u64));
+    p[IFLA_WEIGHT as usize] = u32;
+    p[IFLA_OPERSTATE as usize] = u8;
+    p[IFLA_LINKMODE as usize] = u8;
+    p[IFLA_LINKINFO as usize] = nested;
+    p[IFLA_NET_NS_PID as usize] = u32;
+    p[IFLA_NET_NS_FD as usize] = u32;
+    // `IFALIASZ - 1`.
+    p[IFLA_IFALIAS as usize] = binary.len(255);
+    p[IFLA_VFINFO_LIST as usize] = nested;
+    p[IFLA_VF_PORTS as usize] = nested;
+    p[IFLA_PORT_SELF as usize] = nested;
+    p[IFLA_AF_SPEC as usize] = nested;
+    p[IFLA_EXT_MASK as usize] = u32;
+    p[IFLA_PROMISCUITY as usize] = u32;
+    p[IFLA_NUM_TX_QUEUES as usize] = u32;
+    p[IFLA_NUM_RX_QUEUES as usize] = u32;
+    p[IFLA_GSO_MAX_SEGS as usize] = u32;
+    p[IFLA_GSO_MAX_SIZE as usize] = u32.check(Check::Min(GSO_MIN_SIZE));
+    p[IFLA_PHYS_PORT_ID as usize] = addr;
+    p[IFLA_CARRIER_CHANGES as usize] = u32;
+    p[IFLA_PHYS_SWITCH_ID as usize] = addr;
+    p[IFLA_LINK_NETNSID as usize] = u32;
+    p[IFLA_PROTO_DOWN as usize] = u8;
+    p[IFLA_XDP as usize] = nested;
+    p[IFLA_EVENT as usize] = u32;
+    p[IFLA_GROUP as usize] = u32;
+    p[IFLA_TARGET_NETNSID as usize] = u32;
+    p[IFLA_CARRIER_UP_COUNT as usize] = u32;
+    p[IFLA_CARRIER_DOWN_COUNT as usize] = u32;
+    p[IFLA_MIN_MTU as usize] = u32;
+    p[IFLA_MAX_MTU as usize] = u32;
+    p[IFLA_PROP_LIST as usize] = nested;
+    p[IFLA_ALT_IFNAME as usize] = string.len(ALTIFNAMSIZ as u16 - 1);
+    p[IFLA_PERM_ADDRESS as usize] = reject;
+    p[IFLA_PROTO_DOWN_REASON as usize] = nested;
+    p[IFLA_NEW_IFINDEX as usize] = u32.check(Check::Range(1, i32::MAX as u64));
+    p[IFLA_PARENT_DEV_NAME as usize] = Policy::of(Kind::NulString);
+    p[IFLA_GRO_MAX_SIZE as usize] = u32;
+    p[IFLA_TSO_MAX_SIZE as usize] = reject;
+    p[IFLA_TSO_MAX_SEGS as usize] = reject;
+    p[IFLA_ALLMULTI as usize] = reject;
+    p[IFLA_GSO_IPV4_MAX_SIZE as usize] = u32.check(Check::Min(GSO_MIN_SIZE));
+    p[IFLA_GRO_IPV4_MAX_SIZE as usize] = u32;
+    p[IFLA_NETNS_IMMUTABLE as usize] = reject;
+    p[IFLA_HEADROOM as usize] = reject;
+    p[IFLA_TAILROOM as usize] = reject;
+    p
+}
+
+/// The size of the `IFLA_PROP_LIST` of a device with `n` alternative names, as
+/// `rtnl_prop_list_size` of Linux. Each name counts with the largest size.
+fn prop_list_size(n: usize) -> usize {
+    let name = ATTR_HDRLEN + ALTIFNAMSIZ;
+    if n == 0 { 0 } else { ATTR_HDRLEN + n * name }
+}
+
+/// `RTM_NEWLINKPROP`, as `rtnl_newlinkprop` of Linux.
+fn newlinkprop(req: &Request<'_>) -> Result<()> {
+    linkprop(req, true)
+}
+
+/// `RTM_DELLINKPROP`, as `rtnl_dellinkprop` of Linux.
+fn dellinkprop(req: &Request<'_>) -> Result<()> {
+    linkprop(req, false)
+}
+
+/// Adds or removes the alternative names in `IFLA_PROP_LIST`, as `rtnl_linkprop` of Linux.
+/// The device comes from the index, or else from `IFLA_IFNAME` or `IFLA_ALT_IFNAME`. A device
+/// that is up then sends `RTM_NEWLINK`, as `netdev_state_change` of Linux. An error after some
+/// names keeps the changes of those names, without the message.
+fn linkprop(req: &Request<'_>, add: bool) -> Result<()> {
+    let (h, a) = policy::parse(req, IFINFO_LEN, &IFLA_POLICY, policy::STRICT)?;
+    if a.has(IFLA_NET_NS_PID) || a.has(IFLA_NET_NS_FD) {
+        return Err(req.error("specified netns attribute not supported", Errno::EOPNOTSUPP));
+    }
+    let index = i32_at(h, 4);
+    let dev = if index > 0 {
+        dev::by_index(index as u32)
+    } else if a.has(IFLA_IFNAME) || a.has(IFLA_ALT_IFNAME) {
+        by_name(&a)
+    } else {
+        return Err(Errno::EINVAL);
+    };
+    let dev = dev.ok_or(Errno::ENODEV)?;
+    let Some(mut rest) = a.get(IFLA_PROP_LIST) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    while rest.len() >= ATTR_HDRLEN {
+        let len = usize::from(u16::from_ne_bytes([rest[0], rest[1]]));
+        if len < ATTR_HDRLEN || len > rest.len() {
+            break;
+        }
+        let ty = u16::from_ne_bytes([rest[2], rest[3]]) & NLA_TYPE_MASK as u16;
+        if u32::from(ty) == IFLA_ALT_IFNAME {
+            // Each name has the checks of the policy, as `rtnl_alt_ifname` of Linux.
+            policy::validate(req, &rest[..len], &IFLA_POLICY, policy::STRICT)?;
+            if add && prop_list_size(dev.altnames().len()) + ATTR_HDRLEN + ALTIFNAMSIZ >= 0xffff {
+                return Err(req.error("effective property list too long", Errno::EINVAL));
+            }
+            let d = &rest[ATTR_HDRLEN..len];
+            let d = d.split(|&c| c == 0).next().unwrap_or(d);
+            let name = core::str::from_utf8(d).map_err(|_| Errno::EINVAL)?;
+            if add {
+                dev.add_altname(name)?;
+            } else {
+                dev.del_altname(name)?;
+            }
+            changed = true;
+        }
+        rest = &rest[super::msg::align(len).min(rest.len())..];
+    }
+    if changed && dev.is_up() {
+        notify_link(&dev, RTM_NEWLINK, 0, IFLA_EVENT_NONE);
+    }
+    Ok(())
 }

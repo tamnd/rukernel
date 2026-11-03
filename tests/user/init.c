@@ -9872,6 +9872,220 @@ static void test_veth(void)
 /* The errors of socket for protocols that rukernel does not have, as inet_create in
  * net/ipv4/af_inet.c of Linux without the modules, and IPV6_CHECKSUM of a raw ICMPv6 socket, as
  * do_rawv6_setsockopt in net/ipv6/raw.c. */
+/* The link properties of <linux/rtnetlink.h> and <linux/if_link.h>. */
+#define RK_RTM_NEWLINKPROP 108
+#define RK_RTM_DELLINKPROP 109
+#define RK_IFLA_PROP_LIST 52
+#define RK_IFLA_ALT_IFNAME 53
+#define RK_IFLA_EVENT 44
+
+/* Builds a link request of the type `type` for the index `index` in m. */
+static void lp_msg(struct nlmsghdr *m, int type, int index)
+{
+	memset(m, 0, NLMSG_LENGTH(sizeof(struct ifinfomsg)));
+	m->nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg));
+	m->nlmsg_type = type;
+	((struct ifinfomsg *)NLMSG_DATA(m))->ifi_index = index;
+}
+
+/* Sends RTM_NEWLINKPROP (add) or RTM_DELLINKPROP for the alternative name `name` of the device
+ * `index`. Gives the error of the ack, and the message of the extended ack in msg. */
+static int lp_prop(int fd, int add, int index, const char *name, char *msg)
+{
+	union {
+		struct nlmsghdr h;
+		char buf[512];
+	} m;
+	lp_msg(&m.h, add ? RK_RTM_NEWLINKPROP : RK_RTM_DELLINKPROP, index);
+	struct rtattr *list = nl_put(&m.h, RK_IFLA_PROP_LIST | NLA_F_NESTED, NULL, 0);
+	nl_put(&m.h, RK_IFLA_ALT_IFNAME, name, strlen(name) + 1);
+	nl_end(&m.h, list);
+	return eth_ack(fd, &m.h, msg, 128);
+}
+
+/* Reads the link messages of the monitor socket mon until none comes for 500 ms. Gives 1 at the
+ * first RTM_NEWLINK of the device `index` with the ifi_change `change`, the name `name` and, if
+ * `alt` is not null, the alternative name `alt` in IFLA_PROP_LIST. Else gives 0. */
+static int lp_notice(int mon, int index, unsigned int change, const char *name,
+		     const char *alt)
+{
+	char buf[8192];
+	struct pollfd pf = { .fd = mon, .events = POLLIN };
+	while (poll(&pf, 1, 500) == 1) {
+		long n = recv(mon, buf, sizeof(buf), 0);
+		for (struct nlmsghdr *r = (struct nlmsghdr *)buf; n > 0 && NLMSG_OK(r, n);
+		     r = NLMSG_NEXT(r, n)) {
+			struct ifinfomsg *ifi = NLMSG_DATA(r);
+			if (r->nlmsg_type != RTM_NEWLINK || ifi->ifi_index != index ||
+			    ifi->ifi_change != change)
+				continue;
+			int len = r->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+			struct rtattr *a = genl_attr(IFLA_RTA(ifi), len, IFLA_IFNAME);
+			if (!a || strcmp(RTA_DATA(a), name))
+				continue;
+			if (!alt)
+				return 1;
+			struct rtattr *list = genl_attr(IFLA_RTA(ifi), len, RK_IFLA_PROP_LIST);
+			a = list ? genl_attr(RTA_DATA(list), RTA_PAYLOAD(list), RK_IFLA_ALT_IFNAME) :
+				   NULL;
+			return a && strcmp(RTA_DATA(a), alt) == 0;
+		}
+	}
+	return 0;
+}
+
+/* Sets the flags of the device `name` up or down. Gives 0 or -1. */
+static int lp_up(const char *name, int up)
+{
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, name);
+	int r = ioctl(s, SIOCGIFFLAGS, &ifr);
+	ifr.ifr_flags = up ? ifr.ifr_flags | IFF_UP : ifr.ifr_flags & ~IFF_UP;
+	r |= ioctl(s, SIOCSIFFLAGS, &ifr);
+	close(s);
+	return r;
+}
+
+/* The alternative names and the renames of a link, as RTM_NEWLINKPROP, RTM_DELLINKPROP and
+ * do_setlink of net/core/rtnetlink.c of Linux. udevd uses them to name the devices. */
+static void test_linkprop(void)
+{
+	static const char long_alt[] = "rk-alternative-name-of-rkd0";
+	char msg[128], reply[4096];
+	union {
+		struct nlmsghdr h;
+		char buf[512];
+	} m;
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	int one = 1;
+	/* The kernel gives the message of the extended ack only with NETLINK_EXT_ACK, as ip. */
+	setsockopt(fd, SOL_NETLINK, RK_NETLINK_EXT_ACK, &one, sizeof(one));
+	int mon = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK, .nl_groups = RTMGRP_LINK };
+	check("linkprop: a monitor joins RTMGRP_LINK",
+	      bind(mon, (struct sockaddr *)&sa, sizeof(sa)) == 0);
+
+	/* ip link add rkd0 type dummy */
+	lp_msg(&m.h, RTM_NEWLINK, 0);
+	m.h.nlmsg_flags = NLM_F_CREATE | NLM_F_EXCL;
+	nl_put(&m.h, IFLA_IFNAME, "rkd0", 5);
+	struct rtattr *info = nl_put(&m.h, IFLA_LINKINFO, NULL, 0);
+	nl_put(&m.h, IFLA_INFO_KIND, "dummy", 5);
+	nl_end(&m.h, info);
+	check("linkprop: RTM_NEWLINK makes the dummy device rkd0", nl_talk(fd, &m.h) == 0);
+	int index = if_nametoindex("rkd0");
+	check("linkprop: the monitor gets RTM_NEWLINK of rkd0",
+	      index > 0 && lp_notice(mon, index, ~0u, "rkd0", NULL));
+
+	/* ip link property add dev rkd0 altname ... */
+	check("linkprop: RTM_NEWLINKPROP adds an altname of 27 bytes",
+	      lp_prop(fd, 1, index, long_alt, msg) == 0);
+	check("linkprop: RTM_NEWLINKPROP adds the altname rkalt0",
+	      lp_prop(fd, 1, index, "rkalt0", msg) == 0);
+	check("linkprop: a device that is down sends no notice",
+	      !lp_notice(mon, index, 0, "rkd0", NULL));
+	check("linkprop: SIOCGIFINDEX finds a device by its altname",
+	      if_nametoindex("rkalt0") == (unsigned int)index);
+
+	/* ip link show rkalt0 */
+	lp_msg(&m.h, RTM_GETLINK, 0);
+	nl_put(&m.h, RK_IFLA_ALT_IFNAME, long_alt, sizeof(long_alt));
+	long n = nl_ask(fd, &m.h, reply, sizeof(reply));
+	struct nlmsghdr *r = (struct nlmsghdr *)reply;
+	struct ifinfomsg *ifi = NLMSG_DATA(r);
+	int found = 0;
+	if (n > 0 && r->nlmsg_type == RTM_NEWLINK && ifi->ifi_index == index) {
+		int len = r->nlmsg_len - NLMSG_LENGTH(sizeof(*ifi));
+		struct rtattr *list = genl_attr(IFLA_RTA(ifi), len, RK_IFLA_PROP_LIST);
+		int plen = list ? RTA_PAYLOAD(list) : 0;
+		struct rtattr *a = list ? RTA_DATA(list) : NULL;
+		for (; a && RTA_OK(a, plen); a = RTA_NEXT(a, plen))
+			found = found * 10 + (a->rta_type != RK_IFLA_ALT_IFNAME ? 9 :
+					      !strcmp(RTA_DATA(a), long_alt) ? 1 :
+					      !strcmp(RTA_DATA(a), "rkalt0") ? 2 :
+										9);
+		found = found == 12 && (list->rta_type & NLA_F_NESTED) != 0;
+	}
+	check("linkprop: RTM_GETLINK by an altname gives IFLA_PROP_LIST with both names", found);
+
+	/* The errors of rtnl_linkprop and of netdev_name_node_alt_create and _destroy. */
+	check("linkprop: an altname in use gives EEXIST",
+	      lp_prop(fd, 1, index, "rkalt0", msg) == -EEXIST &&
+		      lp_prop(fd, 1, index, "rkd0", msg) == -EEXIST &&
+		      lp_prop(fd, 1, index, "lo", msg) == -EEXIST);
+	check("linkprop: the removal of the name of a device gives EINVAL",
+	      lp_prop(fd, 0, index, "rkd0", msg) == -EINVAL &&
+		      lp_prop(fd, 0, index, "lo", msg) == -EINVAL);
+	check("linkprop: the removal of a name that is not there gives ENOENT",
+	      lp_prop(fd, 0, index, "rknone", msg) == -ENOENT);
+	char big[140];
+	memset(big, 'a', sizeof(big) - 1);
+	big[sizeof(big) - 1] = 0;
+	int e = lp_prop(fd, 1, index, big, msg);
+	check("linkprop: an altname of 139 bytes gives ERANGE with the policy message",
+	      e == -ERANGE && strcmp(msg, "Attribute failed policy validation") == 0);
+	lp_msg(&m.h, RK_RTM_NEWLINKPROP, index);
+	struct rtattr *list = nl_put(&m.h, RK_IFLA_PROP_LIST, NULL, 0);
+	nl_put(&m.h, RK_IFLA_ALT_IFNAME, "rkalt1", 7);
+	nl_end(&m.h, list);
+	e = eth_ack(fd, &m.h, msg, sizeof(msg));
+	check("linkprop: IFLA_PROP_LIST without NLA_F_NESTED gives EINVAL",
+	      e == -EINVAL && strcmp(msg, "NLA_F_NESTED is missing") == 0);
+	lp_msg(&m.h, RK_RTM_NEWLINKPROP, index);
+	unsigned int pid = getpid();
+	nl_put(&m.h, IFLA_NET_NS_PID, &pid, 4);
+	e = eth_ack(fd, &m.h, msg, sizeof(msg));
+	check("linkprop: IFLA_NET_NS_PID gives EOPNOTSUPP",
+	      e == -EOPNOTSUPP && strcmp(msg, "specified netns attribute not supported") == 0);
+	lp_msg(&m.h, RK_RTM_NEWLINKPROP, 0);
+	check("linkprop: a request without a device gives EINVAL", nl_talk(fd, &m.h) == -EINVAL);
+	lp_msg(&m.h, RK_RTM_NEWLINKPROP, 0);
+	nl_put(&m.h, RK_IFLA_ALT_IFNAME, "rknone", 7);
+	check("linkprop: a request for a name that is not there gives ENODEV",
+	      nl_talk(fd, &m.h) == -ENODEV);
+
+	/* ip link set rkd0 name rkalt0 */
+	lp_msg(&m.h, RTM_SETLINK, index);
+	nl_put(&m.h, IFLA_IFNAME, "rkalt0", 7);
+	check("linkprop: a rename to an altname in use gives EEXIST", nl_talk(fd, &m.h) == -EEXIST);
+
+	/* ip link property del dev rkd0 altname rkalt0, while rkd0 is up */
+	check("linkprop: rkd0 goes up", lp_up("rkd0", 1) == 0);
+	while (lp_notice(mon, index, IFF_UP, "rkd0", NULL))
+		;
+	check("linkprop: RTM_DELLINKPROP removes rkalt0", lp_prop(fd, 0, index, "rkalt0", msg) == 0);
+	check("linkprop: a device that is up sends RTM_NEWLINK with the names that are left",
+	      lp_notice(mon, index, 0, "rkd0", long_alt));
+	check("linkprop: SIOCGIFINDEX does not find the removed altname",
+	      if_nametoindex("rkalt0") == 0);
+
+	/* ip link set rkd0 name rkd1, while it is up */
+	lp_msg(&m.h, RTM_SETLINK, index);
+	nl_put(&m.h, IFLA_IFNAME, "rkd1", 5);
+	check("linkprop: RTM_SETLINK renames rkd0 to rkd1 while it is up",
+	      nl_talk(fd, &m.h) == 0 && if_nametoindex("rkd1") == (unsigned int)index &&
+		      if_nametoindex("rkd0") == 0);
+	check("linkprop: the rename sends RTM_NEWLINK with the new name",
+	      lp_notice(mon, index, 0, "rkd1", long_alt));
+	lp_msg(&m.h, RTM_SETLINK, index);
+	nl_put(&m.h, IFLA_IFNAME, "rkp%d", 6);
+	check("linkprop: a rename to rkp%d gives rkp0",
+	      nl_talk(fd, &m.h) == 0 && if_nametoindex("rkp0") == (unsigned int)index);
+	lp_msg(&m.h, RTM_SETLINK, index);
+	nl_put(&m.h, IFLA_IFNAME, "rk%x%d", 7);
+	check("linkprop: a rename to a bad pattern gives EINVAL", nl_talk(fd, &m.h) == -EINVAL);
+
+	/* ip link del rkp0 */
+	lp_msg(&m.h, RTM_DELLINK, index);
+	check("linkprop: RTM_DELLINK removes the device", nl_talk(fd, &m.h) == 0);
+	lp_msg(&m.h, RTM_GETLINK, 0);
+	nl_put(&m.h, RK_IFLA_ALT_IFNAME, long_alt, sizeof(long_alt));
+	check("linkprop: the altname goes away with the device", nl_talk(fd, &m.h) == -ENODEV);
+	close(mon);
+	close(fd);
+}
+
 static void test_inet_protos(void)
 {
 #ifndef SOCK_DCCP
@@ -9918,6 +10132,7 @@ static void test_inet(int port)
 	test_nexthop();
 	test_genl();
 	test_ethtool();
+	test_linkprop();
 	test_slip();
 	test_tcp_lo();
 	test_tcp_host(port);

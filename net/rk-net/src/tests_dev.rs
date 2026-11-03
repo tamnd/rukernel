@@ -185,6 +185,26 @@ fn devices_get_names_indexes_and_counts() {
     );
     let s = lo.stats();
     assert_eq!((s.tx_packets, s.rx_packets, s.rx_bytes), (3, 3, 60));
+
+    // The alternative names and the names are in one set, as the name hash of Linux.
+    eth1.add_altname("enp0s3").unwrap();
+    assert!(Arc::ptr_eq(&dev::by_name("enp0s3").unwrap(), &eth1));
+    assert_eq!(eth1.altnames(), ["enp0s3"]);
+    assert_eq!(eth0.add_altname("enp0s3"), Err(Errno::EEXIST));
+    assert_eq!(eth0.add_altname("eth1"), Err(Errno::EEXIST));
+    assert_eq!(eth0.set_name(b"enp0s3"), Err(Errno::EEXIST));
+    assert_eq!(eth1.del_altname("eth1"), Err(Errno::EINVAL));
+    assert_eq!(eth0.del_altname("enp0s3"), Err(Errno::EINVAL));
+    assert_eq!(eth1.del_altname("enp0s4"), Err(Errno::ENOENT));
+    // A device that is up can change its name. A pattern gives the first free unit, and the
+    // name of the device itself is in use.
+    eth0.set_name(b"eth%d").unwrap();
+    assert_eq!(eth0.name(), "eth2");
+    assert_eq!(eth0.set_name(b"e%d%d"), Err(Errno::EINVAL));
+    assert_eq!(eth0.set_name(b"e%x"), Err(Errno::EINVAL));
+    eth0.set_name(b"eth0").unwrap();
+    eth1.del_altname("enp0s3").unwrap();
+    assert!(dev::by_name("enp0s3").is_none());
 }
 
 /// A packet socket of a device that goes down gets `ENETDOWN` once, and a send after the device
