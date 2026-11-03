@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.1] - 2026-11-04
+
 ### Added
 
 - The `ioctl` commands of a pidfd, as `pidfd_ioctl` in fs/pidfs.c of Linux. `PIDFD_GET_INFO` gives the IDs, the credentials and the cgroup of a process, and its exit status after the parent reaped it (`PIDFD_INFO_EXIT`), and `PIDFD_INFO_COREDUMP`. The size of the structure comes from the command, so an old or a new caller works, as `copy_struct_to_user`. `PIDFD_GET_CGROUP_NAMESPACE` to `PIDFD_GET_UTS_NAMESPACE` open the namespace files of the process, as the links in `/proc/PID/ns`, and `FS_IOC_GETVERSION` gives 0 (#536).
@@ -1296,6 +1298,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.1]: https://github.com/tamnd/rukernel/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/tamnd/rukernel/compare/v0.4.21...v0.5.0
 [0.4.21]: https://github.com/tamnd/rukernel/compare/v0.4.20...v0.4.21
 [0.4.20]: https://github.com/tamnd/rukernel/compare/v0.4.19...v0.4.20
