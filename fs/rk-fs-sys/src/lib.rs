@@ -27,6 +27,9 @@
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
 //!   `statistics`. `/sys/class/net/NAME` is a link to it.
+//! - `/sys/devices/virtual/input/inputN` is the directory of an input device, from
+//!   `rk_vfs::input`, with `name`, `id`, `capabilities` and a directory for each handler, as
+//!   `mouse0` and `event0`. `/sys/class/input` has a link to each of them.
 //! - `/sys/devices/system/cpu` has a directory `cpuN` with `topology` for each CPU, and the
 //!   files `online`, `possible` and `present`. `/sys/devices/system/node` has the one NUMA node
 //!   `node0`. glibc reads `online` for `get_nprocs` and `possible` for `get_nprocs_conf`.
@@ -131,6 +134,8 @@ fn write_uevent(path: &str, ns: &Weak<NetNs>, text: &[u8]) -> Result<()> {
         let _in = rk_net::ns::enter(&ns);
         let d = rk_net::dev::devices().into_iter().find(|d| d.name() == name);
         rk_net::netlink::uevent::synth(&*d.ok_or(Errno::ENODEV)?, action, vars);
+    } else if class == INPUT {
+        rk_vfs::input::synth(name, action, vars)?;
     } else {
         let d = devices().into_iter().find(|d| d.class == class && node_name(d) == name);
         rk_vfs::uevent::synth_device(&d.ok_or(Errno::ENODEV)?, action, vars);
@@ -359,6 +364,24 @@ fn queue_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     ]
 }
 
+/// The class of the input devices. Their directories come from `rk_vfs::input`.
+const INPUT: &str = "input";
+
+/// The entries of a directory of the input devices.
+fn input_entries(list: Vec<(String, rk_vfs::input::SysEntry)>) -> Vec<(String, Kind)> {
+    use rk_vfs::input::SysEntry;
+    list.into_iter()
+        .map(|(name, e)| {
+            let kind = match e {
+                SysEntry::Dir => Kind::Dir,
+                SysEntry::File(text) => Kind::File(text),
+                SysEntry::Link(to) => Kind::Link(to),
+            };
+            (name, kind)
+        })
+        .collect()
+}
+
 /// The entries of the directory at `path`, from the list of devices `list`. Gives `None` if no
 /// directory has the path.
 ///
@@ -366,6 +389,7 @@ fn queue_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
 fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(String, Kind)>> {
     let mut classes: BTreeSet<&str> = list.iter().map(|d| d.class).collect();
     classes.insert(NET);
+    classes.insert(INPUT);
     let net = ns.upgrade().map_or_else(Vec::new, |ns| {
         let _in = rk_net::ns::enter(&ns);
         rk_net::dev::devices()
@@ -376,7 +400,8 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         names.map(|n| (String::from(n), Kind::Dir)).collect()
     };
     let to_device = |up: &str, d: &DeviceInfo| {
-        Kind::Link(format!("{up}devices/virtual/{}/{}", d.class, node_name(d)).into_bytes())
+        let path = rk_vfs::uevent::devpath(d);
+        Kind::Link(format!("{up}{}", path.trim_start_matches('/')).into_bytes())
     };
     let out = match parts[..] {
         [] => dirs(&mut TOP.iter().copied()),
@@ -393,6 +418,8 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
                 (d.name(), Kind::Link(to.into_bytes()))
             })
             .collect(),
+        ["class", INPUT] => input_entries(rk_vfs::input::sysfs_class()),
+        ["devices", "virtual", INPUT, ref rest @ ..] => input_entries(rk_vfs::input::sysfs(rest)?),
         ["devices", "virtual", NET] => net.iter().map(|d| (d.name(), Kind::Dir)).collect(),
         ["devices", "virtual", NET, name] => net_entries(&*net_dev(name)?),
         ["devices", "virtual", NET, name, "statistics"] => net_statistics(&*net_dev(name)?),
@@ -661,8 +688,8 @@ mod tests {
     #[test]
     fn the_top_has_the_directories_of_linux() {
         assert_eq!(names(""), TOP);
-        assert_eq!(names("class"), ["block", "mem", "net", "tty"]);
-        assert_eq!(names("devices/virtual"), ["block", "mem", "net", "tty"]);
+        assert_eq!(names("class"), ["block", "input", "mem", "net", "tty"]);
+        assert_eq!(names("devices/virtual"), ["block", "input", "mem", "net", "tty"]);
         assert!(names("bus").is_empty());
         assert!(entries("nothing", &list(), &init()).is_none());
         assert!(entries("devices/virtual/disk", &list(), &init()).is_none());

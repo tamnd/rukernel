@@ -10994,6 +10994,106 @@ static void test_uevent_synth(void)
 		umount("/sys");
 }
 
+/* The commands and the device structure of <linux/uinput.h>. */
+#define RK_UI_DEV_CREATE 0x5501
+#define RK_UI_DEV_DESTROY 0x5502
+#define RK_UI_SET_EVBIT 0x40045564
+#define RK_UI_SET_KEYBIT 0x40045565
+#define RK_UI_SET_RELBIT 0x40045566
+#define RK_UI_GET_SYSNAME(len) (0x8000552cu | ((unsigned int)(len) << 16))
+
+struct rk_uinput_user_dev {
+	char name[80];
+	unsigned short id[4];
+	unsigned int ff_effects_max;
+	int abs[4][64];
+};
+
+/* Waits for the event `ACTION@/devices/virtual/input/SYS` or `.../SYS/HANDLER` with
+ * `SUBSYSTEM=input`. Gives the length of the event in `buf`, or -1. */
+static int uinput_wait(int fd, const char *action, const char *sys, const char *handler, char *buf,
+		       size_t size)
+{
+	char head[128];
+	int len;
+
+	snprintf(head, sizeof(head), "%s@/devices/virtual/input/%s%s%s", action, sys,
+		 handler[0] ? "/" : "", handler);
+	len = uevent_wait(fd, head, buf, size, 2000);
+	return len > 0 && uevent_has(buf, len, "SUBSYSTEM=input") ? len : -1;
+}
+
+/* A mouse of uinput, as LTP uevent03 makes it: the input device, its handlers in /dev/input,
+ * /proc/bus/input/devices, sysfs and the events in the order of Linux (#539). */
+static void test_uinput(void)
+{
+	char buf[2048], sys[32] = "", text[4096] = "", path[128], h[2][32] = { "", "" }, var[2][96];
+	struct rk_uinput_user_dev dev = { .name = "rk-mouse", .id = { 3, 1, 1, 1 } };
+	struct stat st;
+	int fd = uevent_socket();
+	int u, ok, i;
+
+	mkdir("/sys", 0755);
+	mkdir("/proc", 0555);
+	int sys_mounted = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
+	int proc_mounted = mount("proc", "/proc", "proc", 0, NULL) == 0;
+	u = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+	ok = fd >= 0 && u >= 0 && ioctl(u, RK_UI_SET_EVBIT, 1) == 0 &&
+	     ioctl(u, RK_UI_SET_KEYBIT, 0x110) == 0 && ioctl(u, RK_UI_SET_EVBIT, 2) == 0 &&
+	     ioctl(u, RK_UI_SET_RELBIT, 0) == 0 && ioctl(u, RK_UI_SET_RELBIT, 1) == 0 &&
+	     write(u, &dev, sizeof(dev)) == (ssize_t)sizeof(dev) && ioctl(u, RK_UI_DEV_CREATE) == 0;
+	check("uinput: UI_DEV_CREATE adds a mouse", ok);
+	if (!ok) {
+		if (u >= 0)
+			close(u);
+		goto out;
+	}
+	ok = ioctl(u, RK_UI_GET_SYSNAME(sizeof(sys)), sys) > 0;
+	snprintf(path, sizeof(path), "/sys/devices/virtual/input/%s/name", sys);
+	check("uinput: UI_GET_SYSNAME gives the device in sysfs with its name",
+	      ok && read_file(path, text, sizeof(text)) > 0 && strcmp(text, "rk-mouse\n") == 0);
+	read_file("/proc/bus/input/devices", text, sizeof(text));
+	char *n = strstr(text, "N: Name=\"rk-mouse\"");
+	char *hl = n ? strstr(n, "H: Handlers=") : NULL;
+	ok = hl && sscanf(hl, "H: Handlers=%31s %31s", h[0], h[1]) == 2 &&
+	     strncmp(h[0], "mouse", 5) == 0 && strncmp(h[1], "event", 5) == 0;
+	snprintf(path, sizeof(path), "S: Sysfs=/devices/virtual/input/%s\n", sys);
+	check("uinput: /proc/bus/input/devices has the mouse, its path and its handlers",
+	      ok && strstr(n, path) != NULL);
+	for (i = 0; i < 2; i++) {
+		snprintf(path, sizeof(path), "/dev/input/%s", h[i]);
+		ok = ok && stat(path, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 13;
+		snprintf(var[i], sizeof(var[i]), "DEVNAME=input/%s", h[i]);
+	}
+	check("uinput: each handler has its device file in /dev/input", ok);
+	ioctl(u, RK_UI_DEV_DESTROY);
+	close(u);
+	/* The events wait in the socket. Each wait skips the other events, so the order counts. */
+	int len = uinput_wait(fd, "add", sys, "", buf, sizeof(buf));
+	check("uinput: the mouse sends add with NAME, PROP=0, EV=7, KEY and REL=3",
+	      len > 0 && uevent_has(buf, len, "NAME=\"rk-mouse\"") && uevent_has(buf, len, "PROP=0") &&
+		      uevent_has(buf, len, "EV=7") && uevent_has(buf, len, "KEY=10000 0 0 0 0") &&
+		      uevent_has(buf, len, "REL=3"));
+	ok = 1;
+	for (i = 0; i < 2; i++) {
+		len = uinput_wait(fd, "add", sys, h[i], buf, sizeof(buf));
+		ok = ok && len > 0 && uevent_has(buf, len, var[i]) && uevent_has(buf, len, "MAJOR=13");
+	}
+	check("uinput: then each handler sends add with DEVNAME and MAJOR", ok);
+	ok = 1;
+	for (i = 0; i < 2; i++)
+		ok = ok && uinput_wait(fd, "remove", sys, h[i], buf, sizeof(buf)) > 0;
+	ok = ok && uinput_wait(fd, "remove", sys, "", buf, sizeof(buf)) > 0;
+	check("uinput: UI_DEV_DESTROY sends remove of each handler and then of the mouse", ok);
+out:
+	if (fd >= 0)
+		close(fd);
+	if (proc_mounted)
+		umount("/proc");
+	if (sys_mounted)
+		umount("/sys");
+}
+
 static void test_all(void)
 {
 	test_ids();
@@ -11039,6 +11139,7 @@ static void test_all(void)
 	test_loop();
 	test_uevent();
 	test_uevent_synth();
+	test_uinput();
 	test_xattr();
 	test_fifo();
 	test_file_locks();
@@ -11084,6 +11185,7 @@ int main(int argc, char **argv)
 	if (argc > 1 && strcmp(argv[1], "uevent") == 0) {
 		test_uevent();
 		test_uevent_synth();
+		test_uinput();
 	}
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)
 		test_smp();
