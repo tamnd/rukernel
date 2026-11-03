@@ -160,9 +160,13 @@ pub fn send(event: &Event) {
 }
 
 /// The path of the device `d` in sysfs, below `/sys`. sysfs puts each device in
-/// `/devices/virtual/CLASS/NAME`, where `NAME` is the last part of the name in `/dev`.
+/// `/devices/virtual/CLASS/NAME`, where `NAME` is the last part of the name in `/dev`. A handler
+/// of an input device is in the directory of its input device.
 pub fn devpath(d: &DeviceInfo) -> String {
     let name = d.name.rsplit('/').next().unwrap_or(&d.name);
+    if let Some(parent) = crate::input::parent(d) {
+        return format!("{parent}/{name}");
+    }
     format!("/devices/virtual/{}/{name}", d.class)
 }
 

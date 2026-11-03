@@ -226,6 +226,7 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
     ));
     out.push((b"sys".to_vec(), sys_dir()));
     out.push((b"sysvipc".to_vec(), sysvipc_dir()));
+    out.push((b"bus".to_vec(), bus_dir()));
     out.push((
         b"cgroups".to_vec(),
         text_file(b"/cgroups", || rk_cgroup::with(|h| h.proc_cgroups()).into_bytes()),
@@ -399,6 +400,25 @@ fn time_ns(
         (None, false) => p.time_ns(),
         (None, true) => p.time_ns_for_children(),
     })
+}
+
+/// The directory `/proc/bus` with `input/devices`, the input devices and their handlers, as
+/// drivers/input/input.c of Linux.
+fn bus_dir() -> InodeRef {
+    let input = || {
+        let devices = || rk_vfs::input::proc_devices().into_bytes();
+        let list = alloc::vec![(b"devices".to_vec(), text_file(b"/bus/input/devices", devices))];
+        Ok(list)
+    };
+    dir(
+        b"/bus",
+        b"/",
+        0o555,
+        move || {
+            Ok(alloc::vec![(b"input".to_vec(), dir(b"/bus/input", b"/bus", 0o555, input, None))])
+        },
+        None,
+    )
 }
 
 /// The directory `/proc/sysvipc`, with the System V objects of each kind.

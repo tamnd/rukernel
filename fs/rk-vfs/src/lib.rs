@@ -25,6 +25,7 @@ pub mod file;
 pub mod fs;
 pub mod fstype;
 pub mod inode;
+pub mod input;
 pub mod ipc;
 pub mod lease;
 pub mod lock;
@@ -36,6 +37,7 @@ pub mod path;
 pub mod pipe;
 pub mod swap;
 pub mod uevent;
+pub mod uinput;
 pub mod wait;
 pub mod xattr;
 

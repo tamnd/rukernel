@@ -97,6 +97,7 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
         });
     }
     rk_vfs::loopdev::init();
+    rk_vfs::uinput::init();
     let Some(fs) = rootfs::context() else {
         panic!("no root file system");
     };
