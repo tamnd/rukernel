@@ -9,6 +9,8 @@
 //!   the directory `queue` with the limits of the queue, and `stat` and `inflight` with the
 //!   counts of the queue, as block/genhd.c of Linux.
 //!   A loop device with a file also has the directory `loop`, which `losetup` reads.
+//!   A write of `ACTION [UUID [KEY=VALUE...]]` to `uevent` sends an event of the device, as
+//!   `udevadm trigger` asks for.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
 //! - `/sys/dev/block/MAJ:MIN` and `/sys/dev/char/MAJ:MIN` are links to the same directory.
 //! - `/sys/fs/cgroup` is an empty directory, where cgroup2 is mounted.
@@ -106,6 +108,34 @@ fn write_file(path: &str, text: &[u8]) -> Result<()> {
 /// Tells if the file at `path` takes a write.
 fn writable(path: &str) -> bool {
     path.strip_prefix(THP_DIR).is_some_and(|f| f == "/enabled" || f == "/defrag")
+        || uevent_device(path).is_some()
+}
+
+/// The class and the name of the device of the file `uevent` at `path`.
+fn uevent_device(path: &str) -> Option<(&str, &str)> {
+    match path.split('/').collect::<Vec<_>>()[..] {
+        ["devices", "virtual", class, name, "uevent"] => Some((class, name)),
+        _ => None,
+    }
+}
+
+/// Sends the event that a process writes to the file `uevent` of a device at `path`, as
+/// `uevent_store` of Linux. `ns` is the network namespace of the mount. The event of a network
+/// device goes to the sockets of its namespace, and the event of another device goes to all
+/// namespaces. Gives `EINVAL` for a bad text and `ENODEV` when the device is gone.
+fn write_uevent(path: &str, ns: &Weak<NetNs>, text: &[u8]) -> Result<()> {
+    let (class, name) = uevent_device(path).ok_or(Errno::EACCES)?;
+    let (action, vars) = rk_vfs::uevent::parse_synth(text)?;
+    if class == NET {
+        let ns = ns.upgrade().ok_or(Errno::ENODEV)?;
+        let _in = rk_net::ns::enter(&ns);
+        let d = rk_net::dev::devices().into_iter().find(|d| d.name() == name);
+        rk_net::netlink::uevent::synth(&*d.ok_or(Errno::ENODEV)?, action, vars);
+    } else {
+        let d = devices().into_iter().find(|d| d.class == class && node_name(d) == name);
+        rk_vfs::uevent::synth_device(&d.ok_or(Errno::ENODEV)?, action, vars);
+    }
+    Ok(())
 }
 
 /// The block size that `stat` gives for a sysfs file, as Linux gives.
@@ -494,6 +524,9 @@ impl Inode for Node {
     fn write_at(&self, _offset: u64, buf: &[u8]) -> Result<usize> {
         match self.kind {
             Kind::Mm { writable: true } => mm::write(&self.path, buf),
+            Kind::File(_) if uevent_device(&self.path).is_some() => {
+                write_uevent(&self.path, &self.net, buf).map(|()| buf.len())
+            }
             Kind::File(_) => write_file(&self.path, buf).map(|()| buf.len()),
             Kind::Mm { .. } => Err(Errno::EACCES),
             _ => Err(Errno::EINVAL),
@@ -667,6 +700,26 @@ mod tests {
         assert_eq!(
             get("devices/virtual/mem/null/subsystem"),
             Kind::Link(b"../../../../class/mem".to_vec())
+        );
+    }
+
+    #[test]
+    fn only_the_uevent_file_of_a_device_takes_an_event() {
+        assert!(writable("devices/virtual/mem/null/uevent"));
+        assert!(writable("devices/virtual/net/lo/uevent"));
+        assert!(!writable("devices/virtual/mem/null/dev"));
+        assert!(!writable("devices/system/cpu/cpu0/uevent"));
+        assert_eq!(
+            write_uevent("devices/virtual/mem/null/dev", &init(), b"add"),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            write_uevent("devices/virtual/mem/zz/uevent", &init(), b"add"),
+            Err(Errno::ENODEV)
+        );
+        assert_eq!(
+            write_uevent("devices/virtual/mem/null/uevent", &init(), b"go"),
+            Err(Errno::EINVAL)
         );
     }
 
