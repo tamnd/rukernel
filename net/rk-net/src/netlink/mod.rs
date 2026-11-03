@@ -14,6 +14,7 @@ pub mod link;
 pub mod msg;
 pub mod nsid;
 pub mod policy;
+pub mod uevent;
 
 use crate::consts::{
     AF_NETLINK, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOL_NETLINK,
@@ -29,9 +30,10 @@ use msg::{HDRLEN, Header};
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
     NETLINK_ADD_MEMBERSHIP, NETLINK_BROADCAST_ERROR, NETLINK_CAP_ACK, NETLINK_DROP_MEMBERSHIP,
-    NETLINK_EXT_ACK, NETLINK_GENERIC, NETLINK_GET_STRICT_CHK, NETLINK_LIST_MEMBERSHIPS,
-    NETLINK_LISTEN_ALL_NSID, NETLINK_NO_ENOBUFS, NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK,
-    NLM_F_DUMP, NLM_F_DUMP_FILTERED, NLM_F_ECHO, NLM_F_REQUEST, NLMSG_MIN_TYPE,
+    NETLINK_EXT_ACK, NETLINK_GENERIC, NETLINK_GET_STRICT_CHK, NETLINK_KOBJECT_UEVENT,
+    NETLINK_LIST_MEMBERSHIPS, NETLINK_LISTEN_ALL_NSID, NETLINK_NO_ENOBUFS, NETLINK_PKTINFO,
+    NETLINK_ROUTE, NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_FILTERED, NLM_F_ECHO, NLM_F_REQUEST,
+    NLMSG_MIN_TYPE,
 };
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::rtnetlink::{
@@ -149,7 +151,11 @@ fn lookup(protocol: u32, portid: u32) -> Option<Arc<NetlinkSocket>> {
 
 /// The number of multicast groups of the protocol `protocol`, as `nl_table[].groups` of Linux.
 fn ngroups(protocol: u32) -> u32 {
-    if protocol == NETLINK_GENERIC { genl::NGROUPS } else { RTNLGRP_MAX }
+    match protocol {
+        NETLINK_GENERIC => genl::NGROUPS,
+        NETLINK_KOBJECT_UEVENT => uevent::NGROUPS,
+        _ => RTNLGRP_MAX,
+    }
 }
 
 /// Tells if the current process has `CAP_NET_ADMIN`.
@@ -192,6 +198,9 @@ fn bind_group(protocol: u32, group: u32) -> Result<()> {
     if protocol == NETLINK_GENERIC {
         return genl::bind(group);
     }
+    if protocol == NETLINK_KOBJECT_UEVENT {
+        return Ok(());
+    }
     if (group == RTNLGRP_IPV4_MROUTE_R || group == RTNLGRP_IPV6_MROUTE_R) && !net_admin() {
         return Err(Errno::EPERM);
     }
@@ -199,8 +208,8 @@ fn bind_group(protocol: u32, group: u32) -> Result<()> {
 }
 
 impl NetlinkSocket {
-    /// Makes a socket, as `netlink_create` of Linux. `NETLINK_ROUTE` and `NETLINK_GENERIC` are
-    /// here.
+    /// Makes a socket, as `netlink_create` of Linux. `NETLINK_ROUTE`, `NETLINK_GENERIC` and
+    /// `NETLINK_KOBJECT_UEVENT` are here.
     ///
     /// # Errors
     ///
@@ -210,7 +219,7 @@ impl NetlinkSocket {
         if kind != SOCK_RAW && kind != SOCK_DGRAM {
             return Err(Errno::ESOCKTNOSUPPORT);
         }
-        if protocol != NETLINK_ROUTE && protocol != NETLINK_GENERIC {
+        if ![NETLINK_ROUTE, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT].contains(&protocol) {
             return Err(Errno::EPROTONOSUPPORT);
         }
         let sock = Arc::new_cyclic(|me| Self {
@@ -360,10 +369,10 @@ impl NetlinkSocket {
             let mut err = 0;
             let ext = Cell::new(msg::ExtAck::default());
             if h.flags & NLM_F_REQUEST as u16 != 0 && u32::from(h.ty) >= NLMSG_MIN_TYPE {
-                let r = if self.protocol == NETLINK_GENERIC {
-                    genl::rcv(self, h, m, &ext)
-                } else {
-                    rtnl_rcv(self, h, m, &ext)
+                let r = match self.protocol {
+                    NETLINK_GENERIC => genl::rcv(self, h, m, &ext),
+                    NETLINK_KOBJECT_UEVENT => uevent::rcv(m).map(|()| Flow::Done),
+                    _ => rtnl_rcv(self, h, m, &ext),
                 };
                 match r {
                     Ok(Flow::Done) => {}
@@ -986,6 +995,7 @@ pub fn init() {
     link::init();
     nsid::init();
     genl::init();
+    uevent::init();
 }
 
 /// The result of a message to the kernel.

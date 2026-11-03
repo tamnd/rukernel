@@ -35,6 +35,7 @@ pub mod nsfs;
 pub mod path;
 pub mod pipe;
 pub mod swap;
+pub mod uevent;
 pub mod wait;
 pub mod xattr;
 
