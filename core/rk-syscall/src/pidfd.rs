@@ -1,17 +1,27 @@
-//! Process file descriptors: `pidfd_open`, `pidfd_send_signal` and `pidfd_getfd`.
+//! Process file descriptors: `pidfd_open`, `pidfd_send_signal` and `pidfd_getfd`, and pidfs,
+//! the file system of their inodes.
 //!
-//! A process file descriptor refers to one process, and the ID of the process cannot go to a
-//! new process while the descriptor is open. `poll` gives `POLLIN` when the process ended. This
-//! is the model of kernel/pid.c and kernel/fork.c of Linux.
+//! A process file descriptor refers to one process. `poll` gives `POLLIN` when the process
+//! ended. This is the model of kernel/pid.c and kernel/fork.c of Linux.
+//!
+//! Each descriptor has an inode in the one internal mount of pidfs, as fs/pidfs.c of Linux. The
+//! inode number is the serial number of the process, which no other process of the boot has, so
+//! two descriptors of one process have the same device and inode number in `fstat`, and a file
+//! handle of the inode opens a new descriptor of the process.
 
 use crate::cx::{Cx, SysResult};
+use alloc::format;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::any::Any;
 use rk_abi::Errno;
-use rk_abi::native::open::{O_EXCL, O_NONBLOCK, O_RDWR};
+use rk_abi::native::open::{O_ACCMODE, O_CLOEXEC, O_EXCL, O_LARGEFILE, O_NONBLOCK, O_RDWR};
+use rk_frame::sync::Once;
 use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo};
 use rk_proc::{Pid, Process};
+use rk_vfs::Location;
 use rk_vfs::file::{File, FileOps, events};
+use rk_vfs::inode::{Inode, InodeRef, Metadata, SetAttr, mode};
 use rk_vfs::wait::PollTable;
 
 /// `PIDFD_NONBLOCK`: a wait for the process does not block.
@@ -19,9 +29,98 @@ const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
 /// `PIDFD_THREAD`: the descriptor refers to a thread. rukernel gives the process of the thread.
 const PIDFD_THREAD: u32 = O_EXCL;
 
+/// `PID_FS_MAGIC` of include/uapi/linux/magic.h.
+pub(crate) const PID_FS_MAGIC: u64 = 0x5049_4446;
+/// `FD_PIDFS_ROOT` of include/uapi/linux/fcntl.h: the root of pidfs as the `mountdirfd` of
+/// `open_by_handle_at`.
+pub(crate) const FD_PIDFS_ROOT: i32 = -10002;
+/// `FILEID_KERNFS` of include/linux/exportfs.h: a handle of pidfs is the 64 bit inode number in
+/// two words.
+const FILEID_KERNFS: i32 = 0xfe;
+
+/// The device of pidfs.
+fn dev() -> u64 {
+    static DEV: Once<u64> = Once::new();
+    *DEV.call_once(rk_vfs::inode::anon_dev)
+}
+
+/// The root directory of pidfs. No lookup finds a name in it.
+struct PidfsRoot;
+
+impl Inode for PidfsRoot {
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            dev: dev(),
+            ino: 1,
+            mode: mode::S_IFDIR | 0o755,
+            nlink: 2,
+            ..Metadata::default()
+        }
+    }
+
+    fn set_attr(&self, _attr: &SetAttr) -> rk_vfs::inode::Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn fs_magic(&self) -> u64 {
+        PID_FS_MAGIC
+    }
+}
+
+/// The inode of a process file descriptor. The inode number is the serial number of the
+/// process, as `pid->ino` of Linux.
+struct PidfsInode {
+    ino: u64,
+}
+
+impl Inode for PidfsInode {
+    /// The attributes of an anonymous inode of Linux: a regular file with the mode 0700 of
+    /// `pidfs_init_inode`.
+    fn metadata(&self) -> Metadata {
+        Metadata {
+            dev: dev(),
+            ino: self.ino,
+            mode: mode::S_IFREG | 0o700,
+            nlink: 1,
+            blksize: rk_mm::PAGE_SIZE as u32,
+            ..Metadata::default()
+        }
+    }
+
+    /// pidfs refuses each change of the attributes, as `anon_inode_setattr` of Linux.
+    fn set_attr(&self, _attr: &SetAttr) -> rk_vfs::inode::Result<()> {
+        Err(Errno::EOPNOTSUPP)
+    }
+
+    fn file_handle(&self) -> Option<(i32, Vec<u32>)> {
+        Some((FILEID_KERNFS, alloc::vec![self.ino as u32, (self.ino >> 32) as u32]))
+    }
+
+    fn fs_magic(&self) -> u64 {
+        PID_FS_MAGIC
+    }
+}
+
+/// The root of the internal mount of pidfs, as `pidfs_mnt` of Linux.
+fn root() -> &'static Location {
+    static ROOT: Once<Location> = Once::new();
+    ROOT.call_once(|| Location::detached(Arc::new(PidfsRoot)))
+}
+
+/// Tells if `at` is in the mount of pidfs, so that it is a process file descriptor or the root
+/// of pidfs.
+pub(crate) fn in_pidfs(at: &Location) -> bool {
+    Arc::ptr_eq(&at.mount, &root().mount)
+}
+
 /// The operations of a process file descriptor.
 struct PidFd {
     process: Arc<Process>,
+}
+
+/// Tells if the parent reaped `process`, so that it is not in the table of the processes.
+fn reaped(process: &Arc<Process>) -> bool {
+    rk_proc::find_process(process.pid()).is_none_or(|p| !Arc::ptr_eq(&p, process))
 }
 
 impl FileOps for PidFd {
@@ -40,6 +139,22 @@ impl FileOps for PidFd {
     fn as_any(&self) -> Option<&dyn Any> {
         Some(self)
     }
+
+    /// The ID of the process, or -1 after the parent reaped it, as `pidfd_show_fdinfo` of
+    /// Linux. Each process is in the PID namespace of the system, so `NSpid` has one ID.
+    fn fdinfo(&self, _file: &File) -> Vec<u8> {
+        let nr = if reaped(&self.process) { -1 } else { i64::from(self.process.pid()) };
+        format!("Pid:\t{nr}\nNSpid:\t{nr}\n").into_bytes()
+    }
+}
+
+/// Makes the file of a process file descriptor for `process`, with a new dentry of its inode in
+/// the mount of pidfs, as `pidfs_alloc_file` of Linux.
+fn new_file(process: Arc<Process>, flags: u32) -> Arc<File> {
+    let root = root();
+    let inode: InodeRef = Arc::new(PidfsInode { ino: process.serial() });
+    let at = Location { mount: root.mount.clone(), dentry: root.dentry.tmp_child(inode, false) };
+    File::with_ops(Arc::new(PidFd { process }), Some(at), O_RDWR | flags)
 }
 
 /// Makes a process file descriptor for `process`, for `pidfd_open` and `CLONE_PIDFD`. The
@@ -49,8 +164,27 @@ impl FileOps for PidFd {
 ///
 /// Gives `EMFILE` if the table is full.
 pub(crate) fn open(cx: &Cx<'_>, process: Arc<Process>, flags: u32) -> Result<i32, Errno> {
-    let file = File::with_ops(Arc::new(PidFd { process }), None, O_RDWR | flags);
-    cx.files()?.lock().insert(file, true)
+    cx.files()?.lock().insert(new_file(process, flags), true)
+}
+
+/// `open_by_handle_at` of a handle of pidfs, as `pidfs_export_operations` of Linux. The handle
+/// opens a new descriptor of the process until its parent reaps it. `flags` can have only the
+/// flags of a process file descriptor.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for another flag, and `ESTALE` if no process has the inode number.
+pub(crate) fn open_by_handle(cx: &Cx<'_>, ty: i32, words: &[u32], flags: u32) -> SysResult {
+    let valid = O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_EXCL | O_LARGEFILE;
+    if flags & !valid != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (&[lo, hi, ..], FILEID_KERNFS) = (words, ty) else { return Err(Errno::ESTALE) };
+    let ino = u64::from(lo) | (u64::from(hi) << 32);
+    let process =
+        rk_proc::processes().into_iter().find(|p| p.serial() == ino).ok_or(Errno::ESTALE)?;
+    let file = new_file(process, flags & (O_NONBLOCK | O_EXCL));
+    Ok(cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)? as u64)
 }
 
 /// Gives the process of the process file descriptor `fd`.

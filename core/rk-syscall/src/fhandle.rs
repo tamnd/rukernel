@@ -26,6 +26,19 @@ fn read_head(cx: &Cx<'_>, handle: u64) -> Result<(u32, i32), Errno> {
     Ok((head[0], head[1] as i32))
 }
 
+/// Reads the `size` bytes of the words of the handle `handle`.
+fn read_words(cx: &Cx<'_>, handle: u64, size: u32) -> Result<alloc::vec::Vec<u32>, Errno> {
+    let bytes = cx.read_bytes(handle + 8, size as usize)?;
+    Ok(bytes.chunks_exact(4).map(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect())
+}
+
+/// `open_by_handle_at` in the mount of pidfs. It needs no capability: the handle opens a process
+/// file descriptor, as `pidfs_export_permission` of Linux.
+fn pidfs_open(cx: &Cx<'_>, handle: u64, size: u32, ty: i32, flags: u64) -> SysResult {
+    let words = read_words(cx, handle, size)?;
+    crate::pidfd::open_by_handle(cx, ty & !FILEID_USER_FLAGS_MASK, &words, flags as u32)
+}
+
 /// `name_to_handle_at`. `AT_HANDLE_CONNECTABLE` gives `EINVAL`, as on Linux before 6.13. With
 /// `AT_HANDLE_FID`, a file system that cannot find an inode from a handle gives the inode
 /// number, as `exportfs_encode_inode_fh` of Linux.
@@ -97,11 +110,14 @@ pub(crate) fn open_by_handle_at(
     let mount = match mountdirfd as i32 {
         AT_FDCWD => fs.cwd().clone(),
         fd if fd >= 0 => cx.file(mountdirfd)?.location().ok_or(Errno::EBADF)?.clone(),
+        crate::pidfd::FD_PIDFS_ROOT => return pidfs_open(cx, handle, size, ty, flags),
         _ => return Err(Errno::EBADF),
     };
-    let bytes = cx.read_bytes(handle + 8, size as usize)?;
-    let words: alloc::vec::Vec<u32> =
-        bytes.chunks_exact(4).map(|w| u32::from_ne_bytes([w[0], w[1], w[2], w[3]])).collect();
+    // A process file descriptor as `mountdirfd` names the mount of pidfs.
+    if crate::pidfd::in_pidfs(&mount) {
+        return pidfs_open(cx, handle, size, ty, flags);
+    }
+    let words = read_words(cx, handle, size)?;
     let at = fs.handle_location(&mount, ty & !FILEID_USER_FLAGS_MASK, &words)?;
     if ty & FILEID_IS_DIR != 0 && !at.inode().metadata().is_dir() {
         return Err(Errno::ESTALE);

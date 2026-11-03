@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - Nexthop objects, as net/ipv4/nexthop.c of Linux. `RTM_NEWNEXTHOP`, `RTM_DELNEXTHOP` and `RTM_GETNEXTHOP` add, replace, delete, get and dump gateways, blackholes, `fdb` nexthops and groups with weights, with the attribute policies, the checks, the error messages and the notifications of Linux. An IPv4 or IPv6 route can use `RTA_NH_ID`, and its messages show the nexthop as the compat mode of Linux. A change of a nexthop changes its routes, and a nexthop that goes away takes its routes and the groups without other members with it. A packet through a group takes the first member. Resilient groups and encapsulations give `EOPNOTSUPP`. The `inet` boot test checks the nexthops in a new network namespace (#538).
+- Process file descriptors are files of a pidfs, as fs/pidfs.c of Linux. Each pidfd of a process has the same inode, with a serial number of the process that no other process of the boot has as the inode number, and `fstat` and `statfs` give `PID_FS_MAGIC`. `name_to_handle_at` gives a file handle of type `FILEID_KERNFS` for a pidfd, and `open_by_handle_at` opens a new pidfd from it, also with `FD_PIDFS_ROOT`. `fdinfo` of a pidfd gives `Pid` and `NSpid`, with -1 after the parent reaped the process. `/proc/PID/fd` shows a pidfd as `anon_inode:[pidfd]` (#536).
 
 ### Changed
 
