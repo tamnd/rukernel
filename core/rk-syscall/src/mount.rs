@@ -9,8 +9,9 @@
 //! so `MOUNT_ATTR_IDMAP` cannot make an idmapped mount.
 //!
 //! `MS_SHARED`, `MS_SLAVE`, `MS_PRIVATE` and `MS_UNBINDABLE` change the propagation of a mount,
-//! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. The VFS keeps
-//! the flags of a mount for `/proc/self/mounts`.
+//! as the shared subtrees of Linux, and `MS_REC` changes the mounts under it too. `MS_BIND` with
+//! `MS_REC` also copies the mounts under the source, as `copy_tree` of Linux. The VFS keeps the
+//! flags of a mount for `/proc/self/mounts`.
 //!
 //! The VFS enforces `MS_RDONLY` of a mount, as `mnt_want_write` of Linux. A change of a name, of
 //! the data or of the attributes of a file on a read only mount gives `EROFS`. A remount with
@@ -125,7 +126,7 @@ pub(crate) fn mount(
     if flags & MS_BIND != 0 {
         let source = cx.read_path(source)?;
         let from = fs.resolve(fs.cwd(), &source, true)?;
-        ns.bind(&from, &at)?;
+        ns.bind_tree(&from, &at, flags & MS_REC != 0)?;
         return Ok(0);
     }
     if flags & PROPAGATION != 0 {

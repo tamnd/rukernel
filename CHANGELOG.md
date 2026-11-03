@@ -14,6 +14,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - Generic netlink, as net/netlink/genetlink.c of Linux. A `NETLINK_GENERIC` socket has its own port IDs and 64 multicast groups, and the family `nlctrl` (ID 16) answers `CTRL_CMD_GETFAMILY` by name or by ID and as a dump, with the operations, their flags and the multicast groups, as `genl ctrl list` reads them. The header checks, the attribute policies and the errors are the same as Linux. Other kernel code can register a family with its operations and groups. `CTRL_CMD_GETPOLICY` is not there yet. The `inet` boot test checks the requests and the errors (#538).
 - `/proc/PID/limits`, `loginuid`, `sessionid`, `personality`, `wchan`, `schedstat` and `mountstats` have the format of Linux. A process sets its login UID once, and it then gets a new audit session ID. To change the login UID again, the process needs `CAP_AUDIT_CONTROL`. A read of `/proc/PID/pagemap` fills the zero entries of a hole at one time, so it is about 2.7 times faster (#543).
 
+### Fixed
+
+- `mount` with `MS_BIND` and `MS_REC` copies the mounts under the source, as `copy_tree` of fs/namespace.c of Linux. Before, it made only the mount of the source, so the root that systemd makes for a service with `MS_BIND` and `MS_REC` of `/` had no `/sys/fs/cgroup`, and `systemd-logind` failed at the step `NAMESPACE` (#536).
+- `/proc/PID/mountinfo` can be in an epoll set, and has an event when the mounts change, as `mounts_poll` of fs/proc_namespace.c of Linux. Before, `epoll_ctl` gave `EPERM` for it, so libmount closed its monitor, and systemd failed to see the mounts that it made ("Failed to drain libmount events") (#536).
+
 ## [0.5.1] - 2026-11-04
 
 ### Added

@@ -1560,7 +1560,7 @@ fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
     Ok(done)
 }
 
-/// An open file of `/proc/PID/mounts`. It reads the text of its inode, and has an event of
+/// An open file of `/proc/PID/mounts` or `/proc/PID/mountinfo`. It reads the text of its inode, and has an event of
 /// `POLLPRI` and `POLLERR` when the mounts of the name space change, as `mounts_poll` in
 /// fs/proc_namespace.c of Linux.
 struct MountsFile {
@@ -1998,10 +1998,15 @@ fn process_files(
         ),
     ));
     out.push((b"net".to_vec(), net_dir(base)));
-    let p_ = w.clone();
+    let (p_, p2) = (w.clone(), w.clone());
     out.push((
         b"mountinfo".to_vec(),
-        file(&join(base, b"mountinfo"), move || mountinfo_of(&*alive(&p_)?)),
+        ops_file(
+            &join(base, b"mountinfo"),
+            0o444,
+            move || mountinfo_of(&*alive(&p_)?),
+            move || MountsFile::open(&*p2.upgrade()?),
+        ),
     ));
     let p_ = w.clone();
     out.push((
