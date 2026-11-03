@@ -103,6 +103,9 @@ pub struct Op {
     pub policy: Option<&'static [Policy]>,
     /// The handler of a request for one object.
     pub doit: Option<DoIt>,
+    /// The check before a dump, as `start` of Linux. Its error goes back in the ack, not in
+    /// `NLMSG_DONE`.
+    pub start: Option<DoIt>,
     /// The handler of a dump.
     pub dumpit: Option<DumpIt>,
 }
@@ -381,6 +384,9 @@ pub(super) fn rcv(
         Info { req: &req, family: e.id, cmd, version, user_hdr: &p[GENL_HDRLEN..hdrlen], attrs };
     if dump {
         let Some(dumpit) = op.dumpit else { return Err(Errno::EOPNOTSUPP) };
+        if let Some(start) = op.start {
+            start(&info)?;
+        }
         let result = dumpit(&info);
         let answer = if req.filtered.get() { super::NLM_F_DUMP_FILTERED as u16 } else { 0 };
         sock.start_dump(h, result, false, answer, ext.get())?;
@@ -403,6 +409,7 @@ static CTRL_OPS: [Op; 1] = [Op {
     validate: GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
     policy: Some(&CTRL_POLICY_FAMILY),
     doit: Some(ctrl_getfamily),
+    start: None,
     dumpit: Some(ctrl_dumpfamily),
 }];
 

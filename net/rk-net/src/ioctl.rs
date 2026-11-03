@@ -254,10 +254,7 @@ pub fn dev_ioctl(cmd: u32, arg: usize, mem: &dyn UserMemory) -> Result<usize> {
             }
             true
         }
-        SIOCETHTOOL => {
-            find(&r)?;
-            return Err(Errno::EOPNOTSUPP);
-        }
+        SIOCETHTOOL => return crate::ethtool::ioctl(&r, mem),
         SIOCGMIIPHY | SIOCGMIIREG | SIOCSIFNAME => {
             if !net_admin() {
                 return Err(Errno::EPERM);

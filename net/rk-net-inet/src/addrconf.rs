@@ -517,7 +517,7 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
             IIDS.lock().remove(&ifindex);
             mcast6::forget(ifindex);
         }
-        Event::Flags(_) | Event::Mtu | Event::Name | Event::Register => {}
+        Event::Flags(_) | Event::Mtu | Event::Name | Event::Register | Event::Features => {}
     }
 }
 

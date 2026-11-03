@@ -27,6 +27,9 @@ impl Errno {
     pub const ERESTARTNOHAND: Self = Self(514);
     /// Start the call again with `restart_syscall` if no signal handler runs.
     pub const ERESTART_RESTARTBLOCK: Self = Self(516);
+    /// The buffer is too small, as `ETOOSMALL` of include/linux/errno.h. Linux gives it to user
+    /// space from `ETHTOOL_GPERMADDR`, so user space sees this number.
+    pub const ETOOSMALL: Self = Self(525);
 
     /// Tells if the number is one of the restart numbers of the kernel.
     pub const fn is_restart(self) -> bool {

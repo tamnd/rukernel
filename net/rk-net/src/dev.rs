@@ -15,6 +15,8 @@ use crate::consts::{
     IFF_POINTOPOINT, IFF_PORTSEL, IFF_PROMISC, IFF_RUNNING, IFF_UP, IFNAMSIZ,
 };
 use crate::ether::{HLEN, MacAddr};
+pub use crate::ethtool::{Channels, DrvInfo, LinkSettings, Rings};
+use crate::features;
 use crate::ns::{self, NetNs};
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -125,6 +127,63 @@ pub trait NetDriver: Send + Sync {
         None
     }
 
+    /// The driver, its version and the place of the device on its bus, as `get_drvinfo` of the
+    /// `ethtool_ops` of Linux.
+    fn drvinfo(&self) -> Option<DrvInfo> {
+        None
+    }
+
+    /// Tells if the driver can tell the state of the link to ethtool, as `get_link` of the
+    /// `ethtool_ops` of Linux.
+    fn has_get_link(&self) -> bool {
+        false
+    }
+
+    /// The speed, the duplex and the link modes, as `get_link_ksettings` of Linux.
+    fn link_settings(&self) -> Option<LinkSettings> {
+        None
+    }
+
+    /// Tells if the driver can change the link settings, as `set_link_ksettings` of the
+    /// `ethtool_ops` of Linux.
+    fn has_set_link_settings(&self) -> bool {
+        false
+    }
+
+    /// Changes the speed and the duplex, as `set_link_ksettings` of Linux.
+    fn set_link_settings(&self, _s: &LinkSettings) -> Result<()> {
+        Err(rk_abi::Errno::EOPNOTSUPP)
+    }
+
+    /// The sizes of the rings, as `get_ringparam` of Linux.
+    fn rings(&self) -> Option<Rings> {
+        None
+    }
+
+    /// The numbers of the channels, as `get_channels` of Linux.
+    fn channels(&self) -> Option<Channels> {
+        None
+    }
+
+    /// The names of the statistics of the driver, the string set `ETH_SS_STATS` of
+    /// `get_strings` of Linux.
+    fn stat_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The features that are on and the features that the administrator can change, as
+    /// `dev->features` and `dev->hw_features` that the driver of Linux sets before it registers
+    /// the device.
+    fn features(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// The permanent address, as `dev->perm_addr` of Linux. A device with a random address
+    /// has none.
+    fn perm_addr(&self) -> MacAddr {
+        MacAddr::ZERO
+    }
+
     /// Sends one frame. Gives `ENOBUFS` if the queue of the device is full.
     fn transmit(&self, frame: NetBuf) -> Result<()>;
 
@@ -202,6 +261,8 @@ pub enum Event {
     Register,
     /// The device goes away from the namespace, as `NETDEV_UNREGISTER`. It is down.
     Unregister,
+    /// The active features changed, as `NETDEV_FEAT_CHANGE`.
+    Features,
 }
 
 /// A function that gets the changes of each device, as a `notifier_block` of Linux.
@@ -245,6 +306,12 @@ pub struct NetDevice {
     /// `global_use` in Linux.
     mc: SpinLock<Vec<MacAddr>>,
     counters: Counters,
+    /// The active features, as `dev->features` of Linux.
+    features: AtomicU64,
+    /// The features that the administrator can change, as `dev->hw_features`.
+    hw_features: AtomicU64,
+    /// The features that the administrator asked for, as `dev->wanted_features`.
+    wanted_features: AtomicU64,
     driver: Arc<dyn NetDriver>,
 }
 
@@ -496,6 +563,39 @@ impl NetDevice {
         }
     }
 
+    /// The active features, as `dev->features` of Linux.
+    pub fn features(&self) -> u64 {
+        self.features.load(Ordering::Relaxed)
+    }
+
+    /// The features that the administrator can change, as `dev->hw_features` of Linux.
+    pub fn hw_features(&self) -> u64 {
+        self.hw_features.load(Ordering::Relaxed)
+    }
+
+    /// The features that the administrator asked for, as `dev->wanted_features` of Linux.
+    pub fn wanted_features(&self) -> u64 {
+        self.wanted_features.load(Ordering::Relaxed)
+    }
+
+    /// Asks for the features `wanted` of the features that the administrator can change, and
+    /// gives the new active features, as `__netdev_update_features` of Linux. The caller sends
+    /// the notice of a change with `features_changed`.
+    pub fn set_wanted_features(&self, wanted: u64) -> u64 {
+        let hw = self.hw_features();
+        let w = (self.wanted_features() & !hw) | (wanted & hw);
+        self.wanted_features.store(w, Ordering::Relaxed);
+        let active = features::update(self.features(), hw, w);
+        self.features.store(active, Ordering::Relaxed);
+        active
+    }
+
+    /// Tells each notifier that the active features changed, as `netdev_features_change` of
+    /// Linux.
+    pub fn features_changed(&self) {
+        notify(self, Event::Features);
+    }
+
     /// The parent device and its bus.
     pub fn parent(&self) -> Option<(String, &'static str)> {
         self.driver.parent()
@@ -656,6 +756,8 @@ pub fn register_at(
             }
             i => i,
         };
+        let (f, hw) = driver.features();
+        let (f, hw, wanted) = features::initial(f, hw, kind == LinkKind::Loopback);
         let dev = Arc::new(NetDevice {
             name: SpinLock::new(name),
             ifindex: AtomicU32::new(ifindex),
@@ -668,6 +770,9 @@ pub fn register_at(
             activated: AtomicBool::new(false),
             mc: SpinLock::new(Vec::new()),
             counters: Counters::default(),
+            features: AtomicU64::new(f),
+            hw_features: AtomicU64::new(hw),
+            wanted_features: AtomicU64::new(wanted),
             driver,
         });
         devices.push(dev.clone());
@@ -834,6 +939,26 @@ impl NetDriver for Loopback {
 
     fn mtu(&self) -> u32 {
         LOOPBACK_MTU
+    }
+
+    /// The link is always on, as `always_on` of Linux.
+    fn has_get_link(&self) -> bool {
+        true
+    }
+
+    /// The features of `loopback_setup` of Linux.
+    fn features(&self) -> (u64, u64) {
+        use features::*;
+        let on = SG
+            | FRAGLIST
+            | GSO_SOFTWARE
+            | HW_CSUM
+            | RXCSUM
+            | SCTP_CRC
+            | HIGHDMA
+            | VLAN_CHALLENGED
+            | LOOPBACK;
+        (on, GSO_SOFTWARE)
     }
 
     fn transmit(&self, frame: NetBuf) -> Result<()> {

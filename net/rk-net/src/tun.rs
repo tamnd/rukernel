@@ -17,6 +17,7 @@
 use crate::buf::NetBuf;
 use crate::dev::{self, Event, LinkKind, NetDevice, NetDriver};
 use crate::ether::{EthHeader, HLEN, MacAddr};
+use crate::ethtool::{self, DrvInfo, LinkSettings};
 use crate::ns::{self, NetNs};
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -170,6 +171,9 @@ pub struct Tun {
     gone: AtomicBool,
     /// The frames that the writes gave, for the poll of the device.
     input: SpinLock<VecDeque<NetBuf>>,
+    /// The link settings, as `link_ksettings` of `struct tun_struct` of Linux. A user can
+    /// change them, and the device keeps them.
+    link: SpinLock<LinkSettings>,
 }
 
 /// The TUN and TAP devices, to find the driver of a device.
@@ -192,6 +196,12 @@ impl Tun {
             queues: SpinLock::new(Vec::new()),
             gone: AtomicBool::new(false),
             input: SpinLock::new(VecDeque::new()),
+            link: SpinLock::new(LinkSettings {
+                speed: 10000,
+                duplex: ethtool::DUPLEX_FULL,
+                port: ethtool::PORT_TP,
+                ..LinkSettings::default()
+            }),
         })
     }
 
@@ -276,6 +286,34 @@ impl NetDriver for Tun {
 
     fn link_kind(&self) -> Option<&'static str> {
         Some(KIND)
+    }
+
+    /// The driver data, as `tun_get_drvinfo` of Linux.
+    fn drvinfo(&self) -> Option<DrvInfo> {
+        Some(DrvInfo {
+            driver: String::from(KIND),
+            version: String::from("1.6"),
+            fw_version: String::new(),
+            bus_info: String::from(if self.tap { "tap" } else { "tun" }),
+        })
+    }
+
+    fn has_get_link(&self) -> bool {
+        true
+    }
+
+    fn link_settings(&self) -> Option<LinkSettings> {
+        Some(*self.link.lock())
+    }
+
+    fn has_set_link_settings(&self) -> bool {
+        true
+    }
+
+    /// Keeps the new settings, as `tun_set_link_ksettings` of Linux.
+    fn set_link_settings(&self, s: &LinkSettings) -> Result<()> {
+        *self.link.lock() = *s;
+        Ok(())
     }
 
     /// The carrier is on while a queue is enabled, as `tun_attach` and `__tun_detach` of Linux

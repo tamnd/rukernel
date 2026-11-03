@@ -439,7 +439,7 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
             }
             stack::flush_neigh(ifindex);
         }
-        Event::Flags(_) | Event::Mtu | Event::Register => {}
+        Event::Flags(_) | Event::Mtu | Event::Register | Event::Features => {}
     }
 }
 

@@ -9,7 +9,8 @@ use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
     NLA_TYPE_MASK, NLM_F_ACK_TLVS, NLM_F_CAPPED, NLM_F_MULTI, NLMSG_DONE, NLMSG_ERROR,
-    NLMSGERR_ATTR_MSG, NLMSGERR_ATTR_OFFS, NLMSGERR_ATTR_POLICY,
+    NLMSGERR_ATTR_MISS_NEST, NLMSGERR_ATTR_MISS_TYPE, NLMSGERR_ATTR_MSG, NLMSGERR_ATTR_OFFS,
+    NLMSGERR_ATTR_POLICY,
 };
 use rk_vfs::inode::Result;
 
@@ -266,13 +267,22 @@ pub struct ExtAck {
     pub offs: Option<u32>,
     /// The policy of the bad attribute, `NLMSGERR_ATTR_POLICY`.
     pub policy: Option<super::policy::Policy>,
+    /// The type of an attribute that the request must have, `NLMSGERR_ATTR_MISS_TYPE`.
+    pub miss_type: Option<u32>,
+    /// The offset of the nest that must have the missing attribute, `NLMSGERR_ATTR_MISS_NEST`.
+    pub miss_nest: Option<u32>,
 }
 
 impl ExtAck {
     /// Tells if the ack of the error `err` has attributes, as `netlink_ack_tlv_len` of Linux.
     /// The offset goes only with an error.
     fn has_tlvs(&self, err: i32) -> bool {
-        self.msg.is_some() || (err != 0 && (self.offs.is_some() || self.policy.is_some()))
+        self.msg.is_some()
+            || (err != 0
+                && (self.offs.is_some()
+                    || self.policy.is_some()
+                    || self.miss_type.is_some()
+                    || self.miss_nest.is_some()))
     }
 
     /// Adds the attributes, as `netlink_ack_tlv_fill` of Linux.
@@ -289,6 +299,16 @@ impl ExtAck {
             && let Some(p) = self.policy
         {
             p.describe(b, NLMSGERR_ATTR_POLICY as u16);
+        }
+        if err != 0
+            && let Some(t) = self.miss_type
+        {
+            b.u32(NLMSGERR_ATTR_MISS_TYPE as u16, t);
+        }
+        if err != 0
+            && let Some(o) = self.miss_nest
+        {
+            b.u32(NLMSGERR_ATTR_MISS_NEST as u16, o);
         }
     }
 }
