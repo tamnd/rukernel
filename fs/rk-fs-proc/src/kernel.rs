@@ -76,6 +76,39 @@ fn disks(show: fn(&[text::Disk]) -> String) -> Vec<u8> {
     show(&list).into_bytes()
 }
 
+/// The counts of the memory for `/proc/vmstat`, `/proc/zoneinfo` and `/proc/buddyinfo`.
+fn vm_counts() -> text::VmCounts {
+    let f = rk_frame::mm::frame_stats();
+    let traps = rk_frame::trap::counts();
+    let span = rk_frame::mm::frame_span();
+    let mut sectors = [0u64; 2];
+    for (_, rdev) in rk_vfs::blockdev::block_devices() {
+        if let Some(q) = rk_vfs::blockdev::block_queue(rdev) {
+            let s = q.stats();
+            sectors[0] += s.sectors[0];
+            sectors[1] += s.sectors[1];
+        }
+    }
+    let cpus = (0..rk_frame::cpu::count())
+        .map(|cpu| {
+            let (count, high, batch) = rk_frame::mm::cpu_free_frames(cpu);
+            (count as u64, high as u64, batch as u64)
+        })
+        .collect();
+    text::VmCounts {
+        total: f.total as u64,
+        free: f.free as u64,
+        anon_thp: rk_frame::vm::huge_pages_mapped() as u64,
+        faults: traps.page_faults + traps.user_page_faults,
+        pgpgin: sectors[0] / 2,
+        pgpgout: sectors[1] / 2,
+        min_free_kbytes: rk_mm::tunables::min_free_kbytes(f.total) as u64,
+        span: (span.start as u64, span.end as u64),
+        blocks: rk_frame::mm::free_blocks().map(|n| n as u64),
+        cpus,
+    }
+}
+
 fn root_list() -> Result<Vec<(Vec<u8>, InodeRef)>> {
     let mut out = root_files();
     for p in rk_proc::processes() {
@@ -190,6 +223,18 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
     out.push((b"pressure".to_vec(), pressure_dir()));
     out.push((b"diskstats".to_vec(), text_file(b"/diskstats", || disks(text::diskstats))));
     out.push((b"partitions".to_vec(), text_file(b"/partitions", || disks(text::partitions))));
+    out.push((
+        b"buddyinfo".to_vec(),
+        text_file(b"/buddyinfo", || text::buddyinfo(&vm_counts()).into_bytes()),
+    ));
+    out.push((
+        b"vmstat".to_vec(),
+        text_file(b"/vmstat", || text::vmstat(&vm_counts()).into_bytes()),
+    ));
+    out.push((
+        b"zoneinfo".to_vec(),
+        text_file(b"/zoneinfo", || text::zoneinfo(&vm_counts()).into_bytes()),
+    ));
     out
 }
 
@@ -448,6 +493,7 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("vm/drop_caches", "0"),
     ("vm/hugetlb_shm_group", ""),
     ("vm/max_map_count", ""),
+    ("vm/memfd_noexec", ""),
     ("vm/min_free_kbytes", ""),
     ("vm/mmap_min_addr", "65536"),
     ("vm/compact_memory", "0"),
@@ -555,6 +601,7 @@ fn vm_tunable(name: &str) -> Option<(fn() -> usize, fn(usize) -> Option<()>)> {
             (|| t::min_free_kbytes(total()), |v| Some(t::set_min_free_kbytes(v)))
         }
         "vm/overcommit_kbytes" => (t::overcommit_kbytes, |v| Some(t::set_overcommit_kbytes(v))),
+        "vm/memfd_noexec" => (t::memfd_noexec, t::set_memfd_noexec),
         "vm/overcommit_memory" => (t::overcommit_memory, t::set_overcommit_memory),
         "vm/overcommit_ratio" => (t::overcommit_ratio, |v| Some(t::set_overcommit_ratio(v))),
         "vm/nr_hugepages" | "vm/nr_hugepages_mempolicy" => (
@@ -704,6 +751,11 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
         }
         v.store(n, Ordering::Relaxed);
         return Ok(());
+    }
+    // Only a process with `CAP_SYS_ADMIN` sets the scope of `memfd_create`, as
+    // `pid_mfd_noexec_dointvec_minmax` in kernel/pid_namespace.c of Linux.
+    if name == "vm/memfd_noexec" && !rk_vfs::cred::current().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
     }
     // A value from 0 to `INT_MAX`, as `proc_dointvec_minmax` of Linux.
     if let Some((_, set)) = vm_tunable(name) {

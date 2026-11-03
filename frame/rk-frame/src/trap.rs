@@ -6,7 +6,7 @@
 
 use crate::addr::VirtAddr;
 use crate::arch::imp;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The number of traps of some kinds since boot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +17,16 @@ pub struct TrapCounts {
     pub page_faults: u64,
     /// Faults that an exception table entry handled.
     pub fixups: u64,
+    /// Page faults in user mode, that the kernel counts with `count_user_page_fault`.
+    pub user_page_faults: u64,
+}
+
+/// The page faults in user mode.
+static USER_PAGE_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a page fault in user mode, for `pgfault` of `/proc/vmstat`.
+pub fn count_user_page_fault() {
+    USER_PAGE_FAULTS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Gives the trap counters.
@@ -25,6 +35,7 @@ pub fn counts() -> TrapCounts {
         breakpoints: imp::trap::BREAKPOINTS.load(Ordering::Relaxed),
         page_faults: imp::trap::PAGE_FAULTS.load(Ordering::Relaxed),
         fixups: imp::trap::FIXUPS.load(Ordering::Relaxed),
+        user_page_faults: USER_PAGE_FAULTS.load(Ordering::Relaxed),
     }
 }
 

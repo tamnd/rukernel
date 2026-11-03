@@ -218,6 +218,27 @@ pub fn frame_stats() -> FrameStats {
     FrameStats { total: BITMAP_TOTAL.load(Ordering::Relaxed), free }
 }
 
+/// The free frames of the allocator as the blocks of a buddy allocator, for `/proc/buddyinfo`:
+/// the number of aligned blocks of `1 << order` free frames for each order from 0 to 10. The
+/// frames on the lists of the CPUs are not in the blocks, as on Linux.
+pub fn free_blocks() -> [usize; 11] {
+    let frames = FRAMES.lock();
+    frames.free_blocks()
+}
+
+/// The frames from the first to the last frame that the allocator manages, for the
+/// `start_pfn` and `spanned` of `/proc/zoneinfo`.
+pub fn frame_span() -> core::ops::Range<usize> {
+    FRAMES.lock().span()
+}
+
+/// The free frames on the list of the CPU `cpu`, with the high limit and the batch of the lists,
+/// as the `count`, `high` and `batch` of a per-CPU pageset in `/proc/zoneinfo`.
+pub fn cpu_free_frames(cpu: usize) -> (usize, usize, usize) {
+    let len = PCP.get(cpu).map_or(0, |c| c.len.load(Ordering::Relaxed));
+    (len, PCP_HIGH, PCP_BATCH)
+}
+
 /// One physical page of 4 KiB. The value owns the page: no other `Frame` or `Mapping` has the
 /// same page. The page goes back to the allocator when the value is dropped.
 #[derive(Debug)]

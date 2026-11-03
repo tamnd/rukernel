@@ -4775,6 +4775,89 @@ static void test_sysctls(void)
 	umount("/proc");
 }
 
+/* The value of the line "NAME VALUE" of /proc/vmstat in buf, or -1. */
+static long long vmstat_value(const char *buf, const char *name)
+{
+	size_t n = strlen(name);
+	for (const char *p = buf; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL)
+		if (strncmp(p, name, n) == 0 && p[n] == ' ')
+			return atoll(p + n + 1);
+	return -1;
+}
+
+/* /proc/vmstat, /proc/zoneinfo and /proc/buddyinfo, as mm/vmstat.c of Linux. The free blocks
+ * of /proc/buddyinfo are not more than the free pages. */
+static void test_vmstat(void)
+{
+	static char buf[16384];
+	long long free_pages, blocks[11] = {0}, sum = 0;
+
+	/* test_proc unmounts /proc at its end. */
+	mkdir("/proc", 0555);
+	check("mount proc for vmstat", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	check("/proc/vmstat reads", read_small("/proc/vmstat", buf, sizeof(buf)) > 1000);
+	free_pages = vmstat_value(buf, "nr_free_pages");
+	check("/proc/vmstat starts with nr_free_pages", strncmp(buf, "nr_free_pages ", 14) == 0 && free_pages > 0);
+	check("/proc/vmstat counts the page faults", vmstat_value(buf, "pgfault") > 0);
+	check("/proc/vmstat has nr_dirty_threshold", vmstat_value(buf, "nr_dirty_threshold") > 0);
+	check("/proc/vmstat has the THP events", vmstat_value(buf, "thp_fault_alloc") >= 0);
+	check("/proc/buddyinfo has 11 orders",
+	      read_small("/proc/buddyinfo", buf, sizeof(buf)) > 0 &&
+		      sscanf(buf, "Node 0, zone Normal %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld",
+			     &blocks[0], &blocks[1], &blocks[2], &blocks[3], &blocks[4], &blocks[5],
+			     &blocks[6], &blocks[7], &blocks[8], &blocks[9], &blocks[10]) == 11);
+	for (int i = 0; i < 11; i++)
+		sum += blocks[i] << i;
+	check("the blocks of /proc/buddyinfo are free pages", sum > 0 && sum <= free_pages + 4096);
+	check("/proc/zoneinfo has the zone and its free pages",
+	      read_small("/proc/zoneinfo", buf, sizeof(buf)) > 0 &&
+		      strncmp(buf, "Node 0, zone   Normal\n  per-node stats\n", 37) == 0 &&
+		      strstr(buf, "\n  pages free     ") && strstr(buf, "\n  start_pfn:           "));
+
+	/* vm.memfd_noexec, as kernel/pid_namespace.c and mm/memfd.c of Linux. 1034 is F_GET_SEALS,
+	 * 0x20 is F_SEAL_EXEC, 0x8 is MFD_NOEXEC_SEAL and 0x10 is MFD_EXEC. */
+	struct stat st;
+	int fd, status;
+	check("vm.memfd_noexec is 0", read_small("/proc/sys/vm/memfd_noexec", buf, sizeof(buf)) > 0 &&
+					      !strcmp(buf, "0\n"));
+	fd = (int)syscall(SYS_memfd_create, "rk", 0);
+	check("vm.memfd_noexec 0 gives an executable memfd",
+	      fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0111) == 0111);
+	close(fd);
+	check("vm.memfd_noexec above 2 gives EINVAL",
+	      put_file("/proc/sys/vm/memfd_noexec", "3") == -1 && errno == EINVAL);
+	check("vm.memfd_noexec takes 1", put_file("/proc/sys/vm/memfd_noexec", "1") == 0);
+	fd = (int)syscall(SYS_memfd_create, "rk", 0);
+	check("vm.memfd_noexec 1 seals a memfd without MFD_EXEC",
+	      fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0111) == 0 &&
+		      (fcntl(fd, 1034) & 0x20));
+	close(fd);
+	fd = (int)syscall(SYS_memfd_create, "rk", 0x10);
+	check("vm.memfd_noexec 1 keeps MFD_EXEC",
+	      fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 0111) == 0111);
+	close(fd);
+	put_file("/proc/sys/vm/memfd_noexec", "2");
+	errno = 0;
+	check("vm.memfd_noexec 2 refuses MFD_EXEC",
+	      syscall(SYS_memfd_create, "rk", 0x10) == -1 && errno == EACCES);
+	fd = (int)syscall(SYS_memfd_create, "rk", 0);
+	check("vm.memfd_noexec 2 seals a memfd without flags", fd >= 0);
+	close(fd);
+	pid_t pid = fork();
+	if (pid == 0) {
+		/* Root without capabilities: the mode 0644 lets the owner open the file, and the
+		 * write then needs CAP_SYS_ADMIN. */
+		struct { unsigned int version; int pid; } hdr = {0x20080522, 0};
+		unsigned int caps[6] = {0};
+		_exit(syscall(SYS_capset, &hdr, caps) == 0 &&
+		      put_file("/proc/sys/vm/memfd_noexec", "0") == -1 && errno == EPERM ? 0 : 1);
+	}
+	check("vm.memfd_noexec needs CAP_SYS_ADMIN",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	put_file("/proc/sys/vm/memfd_noexec", "0");
+	umount("/proc");
+}
+
 static void test_proc(void)
 {
 	char buf[4096], want[64], link[256];
@@ -9496,6 +9579,7 @@ static void test_all(void)
 	test_overlay();
 	test_proc();
 	test_sysctls();
+	test_vmstat();
 	test_memfd();
 	test_shm();
 	test_sem();
