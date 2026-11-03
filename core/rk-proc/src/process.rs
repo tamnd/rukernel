@@ -11,6 +11,7 @@ use crate::sched::SchedParams;
 use crate::signal::{
     AltStack, NSIG, Pending, SI_TIMER, SI_USER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
+use crate::timens::TimeNs;
 use crate::timer::Timers;
 use crate::uts::UtsNs;
 use crate::wait::{WaitOptions, WaitResult, WaitStatus, WaitTarget};
@@ -355,6 +356,10 @@ pub struct Thread {
     /// `nsproxy->uts_ns` and `nsproxy->ipc_ns` of Linux.
     uts: SpinLock<Option<Arc<UtsNs>>>,
     ipc: SpinLock<Option<Arc<IpcNs>>>,
+    /// The time namespace of the thread and the time namespace of its new children, or `None`
+    /// for the first one, as `nsproxy->time_ns` and `nsproxy->time_ns_for_children` of Linux.
+    time: SpinLock<Option<Arc<TimeNs>>>,
+    time_children: SpinLock<Option<Arc<TimeNs>>>,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -683,6 +688,20 @@ impl Process {
         let threads = self.threads();
         let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
         leader.map_or_else(crate::uts::init_ns, |t| t.uts_ns())
+    }
+
+    /// The time namespace of the process: the namespace of its leader thread, as for `net_ns`.
+    pub fn time_ns(&self) -> Arc<TimeNs> {
+        let threads = self.threads();
+        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        leader.map_or_else(crate::timens::init_ns, |t| t.time_ns())
+    }
+
+    /// The time namespace of the new children of the process, from its leader thread.
+    pub fn time_ns_for_children(&self) -> Arc<TimeNs> {
+        let threads = self.threads();
+        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        leader.map_or_else(crate::timens::init_ns, |t| t.time_ns_for_children())
     }
 
     /// The IPC namespace of the process: the namespace of its leader thread, as for `net_ns`.
@@ -1730,6 +1749,8 @@ impl Thread {
             net: SpinLock::new(None),
             uts: SpinLock::new(None),
             ipc: SpinLock::new(None),
+            time: SpinLock::new(None),
+            time_children: SpinLock::new(None),
         })
     }
 
@@ -1776,6 +1797,58 @@ impl Thread {
     pub fn set_ipc_ns(&self, ns: Arc<IpcNs>) {
         let old = core::mem::replace(&mut *self.ipc.lock(), (!ns.is_init()).then_some(ns));
         drop(old);
+    }
+
+    /// The time namespace of the thread, as `current->nsproxy->time_ns` of Linux.
+    pub fn time_ns(&self) -> Arc<TimeNs> {
+        self.time.lock().clone().unwrap_or_else(crate::timens::init_ns)
+    }
+
+    /// The time namespace of the new children of the thread, as
+    /// `current->nsproxy->time_ns_for_children` of Linux.
+    pub fn time_ns_for_children(&self) -> Arc<TimeNs> {
+        self.time_children.lock().clone().unwrap_or_else(crate::timens::init_ns)
+    }
+
+    /// Sets the time namespace of the new children of the thread, for `CLONE_NEWTIME`.
+    pub fn set_time_ns_for_children(&self, ns: Arc<TimeNs>) {
+        let old =
+            core::mem::replace(&mut *self.time_children.lock(), (!ns.is_init()).then_some(ns));
+        drop(old);
+    }
+
+    /// Puts the thread in the time namespace `ns`, as `timens_commit` of Linux: the offsets of
+    /// `ns` do not change after this, and the vDSO of the process gives the clocks of `ns`. With
+    /// `children`, the new children of the thread go in `ns` too, as `timens_install`.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOMEM` if no frame is free.
+    pub fn enter_time_ns(&self, ns: Arc<TimeNs>, children: bool) -> Result<(), Errno> {
+        ns.freeze();
+        if let Some(vm) = self.process().vm() {
+            crate::vdso::join_time_ns(&vm, &ns)?;
+        }
+        if children {
+            self.set_time_ns_for_children(ns.clone());
+        }
+        let old = core::mem::replace(&mut *self.time.lock(), (!ns.is_init()).then_some(ns));
+        drop(old);
+        Ok(())
+    }
+
+    /// Puts the thread in the time namespace `ns` of its new program, after `exec` mapped the
+    /// page of the offsets of `ns`.
+    pub(crate) fn exec_time_ns(&self, ns: Arc<TimeNs>) {
+        ns.freeze();
+        let old = core::mem::replace(&mut *self.time.lock(), (!ns.is_init()).then_some(ns));
+        drop(old);
+    }
+
+    /// Tells if the new children of the thread go in another time namespace than the thread.
+    pub fn time_ns_changes(&self) -> bool {
+        let time = self.time.lock().as_ref().map(|ns| ns.id());
+        time != self.time_children.lock().as_ref().map(|ns| ns.id())
     }
 
     /// The slack of the timers of the thread in nanoseconds, for `PR_GET_TIMERSLACK`.
@@ -1970,6 +2043,8 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     *thread.net.lock() = parent.net_ns_opt();
     *thread.uts.lock() = parent.uts.lock().clone();
     *thread.ipc.lock() = parent.ipc.lock().clone();
+    *thread.time.lock() = parent.time.lock().clone();
+    *thread.time_children.lock() = parent.time_children.lock().clone();
     thread.cgroup.store(cgroup, Ordering::Relaxed);
     thread.inherit_seccomp(parent);
     thread.inherit_timer_slack(parent);
@@ -2010,6 +2085,8 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     *new.net.lock() = thread.net_ns_opt();
     *new.uts.lock() = thread.uts.lock().clone();
     *new.ipc.lock() = thread.ipc.lock().clone();
+    *new.time.lock() = thread.time.lock().clone();
+    *new.time_children.lock() = thread.time_children.lock().clone();
     new.cgroup.store(cgroup, Ordering::Relaxed);
     new.inherit_seccomp(thread);
     new.inherit_timer_slack(thread);
@@ -2373,6 +2450,10 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     drop(uts);
     let ipc = thread.ipc.lock().take();
     drop(ipc);
+    let time = thread.time.lock().take();
+    drop(time);
+    let time = thread.time_children.lock().take();
+    drop(time);
     if !last {
         process.thread_exit.wake_all();
         return;

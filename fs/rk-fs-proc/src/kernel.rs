@@ -148,7 +148,17 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
         }),
         (b"cpuinfo", cpuinfo),
         (b"uptime", || {
-            let (s, cs) = uptime();
+            // The time since boot is a time of `CLOCK_BOOTTIME` in the time namespace of the
+            // reader, as `uptime_proc_show` of Linux.
+            let (s, cs) = match rk_proc::current_thread() {
+                Some(t) => {
+                    let ns = t
+                        .time_ns()
+                        .to_ns(rk_proc::timens::CLOCK_BOOTTIME, rk_frame::time::clock_ns());
+                    (ns / 1_000_000_000, ns % 1_000_000_000 / 10_000_000)
+                }
+                None => uptime(),
+            };
             format!("{s}.{cs:02} 0.00\n").into_bytes()
         }),
         (b"loadavg", || {
@@ -292,8 +302,8 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
 /// thread has its own network namespace.
 fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
     use rk_vfs::nsfs::{NsInode, NsKind, link_text};
-    /// The entries: rukernel makes no PID or time namespace for the children, so the
-    /// `*_for_children` links name the namespace of the process. There is no `user` link, as on
+    /// The entries: rukernel makes no PID namespace for the children, so `pid_for_children`
+    /// names the namespace of the process. There is no `user` link, as on
     /// Linux without `CONFIG_USER_NS`: rukernel cannot make a user namespace, and a program such
     /// as getxattr05 of LTP that finds the link expects `unshare(CLONE_NEWUSER)` to work.
     const ENTRIES: [(&[u8], NsKind); 9] = [
@@ -317,6 +327,7 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
             Ok(ENTRIES
                 .iter()
                 .map(|&(name, kind)| {
+                    let children = name == b"time_for_children";
                     let (p_, p_j) = (w.clone(), w.clone());
                     let (t_, t_j) = (t.clone(), t.clone());
                     let link = jump_link(
@@ -328,6 +339,7 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                                 (NsKind::Net, Some(t)) => alive(t)?.net_ns().id(),
                                 (NsKind::Uts, Some(t)) => alive(t)?.uts_ns().id(),
                                 (NsKind::Ipc, Some(t)) => alive(t)?.ipc_ns().id(),
+                                (NsKind::Time, _) => time_ns(&p, t_.as_ref(), children)?.id(),
                                 _ => rk_proc::ns::ns_id(&p, kind)?,
                             };
                             Ok(link_text(kind, id))
@@ -357,6 +369,10 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                                     };
                                     NsInode::with_hold(kind, ipc.id(), ipc)
                                 }
+                                NsKind::Time => {
+                                    let ns = time_ns(&p, t_j.as_ref(), children)?;
+                                    NsInode::with_hold(kind, ns.id(), ns)
+                                }
                                 _ => NsInode::new(kind, rk_proc::ns::ns_id(&p, kind)?),
                             };
                             Ok(rk_vfs::Location::detached(node))
@@ -368,6 +384,21 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
         },
         None,
     )
+}
+
+/// The time namespace of the thread `t`, or of `p` without a thread, or the namespace for its
+/// children if `children` is set.
+fn time_ns(
+    p: &Process,
+    t: Option<&Weak<Thread>>,
+    children: bool,
+) -> Result<Arc<rk_proc::timens::TimeNs>> {
+    Ok(match (t, children) {
+        (Some(t), false) => alive(t)?.time_ns(),
+        (Some(t), true) => alive(t)?.time_ns_for_children(),
+        (None, false) => p.time_ns(),
+        (None, true) => p.time_ns_for_children(),
+    })
 }
 
 /// The directory `/proc/sysvipc`, with the System V objects of each kind.
@@ -413,7 +444,12 @@ fn cpuinfo() -> Vec<u8> {
 fn stat() -> Vec<u8> {
     let all = rk_proc::processes();
     let running = all.iter().filter(|p| p.state_letter() == b'R').count();
-    let boot = rk_vfs::now().sec - uptime().0 as i64;
+    // The time of the boot is the real time less the time since boot in the time namespace of
+    // the reader, as `show_stat` of Linux.
+    let off = rk_proc::current_thread()
+        .map_or(0, |t| t.time_ns().offset(rk_proc::timens::CLOCK_BOOTTIME));
+    let boot =
+        (rk_frame::time::realtime_offset_ns() as i64).wrapping_sub(off).div_euclid(1_000_000_000);
     // The timer does not tick while the kernel runs, so the time that is not user time is idle.
     let hz = rk_frame::time::HZ;
     let total = rk_frame::time::ticks();
@@ -1864,6 +1900,28 @@ fn process_files(
             },
         ),
     ));
+    if t.is_none() {
+        // As `timens_offsets` in fs/proc/base.c of Linux: the offsets of the time namespace for
+        // the children of the process.
+        let p_ = w.clone();
+        let p2 = w.clone();
+        out.push((
+            b"timens_offsets".to_vec(),
+            rw_file(
+                &join(base, b"timens_offsets"),
+                move || {
+                    let ns = alive(&p_)?.time_ns_for_children();
+                    Ok(rk_proc::timens::show_offsets(&ns).into_bytes())
+                },
+                move |data| {
+                    let ns = alive(&p2)?.time_ns_for_children();
+                    let me = rk_proc::current_thread().ok_or(Errno::EPERM)?;
+                    let may = me.process().cred().capable(rk_vfs::cred::cap::SYS_TIME);
+                    rk_proc::timens::write_offsets(&ns, data, rk_frame::time::clock_ns(), may)
+                },
+            ),
+        ));
+    }
     let p_ = w.clone();
     let t_ = t.clone();
     out.push((

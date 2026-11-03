@@ -35,6 +35,8 @@ pub mod ns;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod process;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod timens;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod timer;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod vdso;

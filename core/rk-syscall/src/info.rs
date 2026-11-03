@@ -44,10 +44,14 @@ pub(crate) fn is_realtime(clock: u32) -> bool {
 }
 
 /// Gives the time since boot of the absolute time `ns` of `clock`. The timers of the kernel use
-/// the time since boot.
+/// the time since boot. A time of `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME` is a time of the time
+/// namespace of the current thread.
 pub(crate) fn boot_ns(clock: u32, ns: u64) -> u64 {
     if !is_realtime(clock) {
-        return ns;
+        return match rk_proc::current_thread() {
+            Some(thread) => thread.time_ns().to_host(clock, ns),
+            None => ns,
+        };
     }
     // The offset wraps: a clock set to a time before the time since boot makes it less than 0.
     let offset = rk_frame::time::realtime_offset_ns() as i64;
@@ -133,7 +137,7 @@ fn clock_ns(thread: &rk_proc::Thread, clock: u32) -> Result<u64, Errno> {
     match clock {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI => Ok(realtime_ns()),
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => {
-            Ok(uptime_ns())
+            Ok(thread.time_ns().to_ns(clock, uptime_ns()))
         }
         CLOCK_PROCESS_CPUTIME_ID => Ok(ticks_ns(thread.process().user_ticks())),
         CLOCK_THREAD_CPUTIME_ID => Ok(ticks_ns(thread.user_ticks())),
@@ -634,7 +638,10 @@ pub(crate) fn times(cx: &Cx<'_>, buf: u64) -> SysResult {
 pub(crate) fn sysinfo(cx: &Cx<'_>, buf: u64) -> SysResult {
     let frames = rk_frame::mm::frame_stats();
     let mut s = Sysinfo::new_zeroed();
-    s.uptime = (uptime_ns() / NSEC_PER_SEC) as i64;
+    // The uptime is in the time namespace of the caller, as `timens_add_boottime` in `do_sysinfo`
+    // of Linux. Linux rounds a part of a second up.
+    let boot = cx.thread.time_ns().to_ns(rk_proc::timens::CLOCK_BOOTTIME, uptime_ns());
+    s.uptime = boot.div_ceil(NSEC_PER_SEC) as i64;
     s.totalram = frames.total as u64;
     s.freeram = frames.free as u64;
     s.totalswap = rk_vfs::swap::total_pages();

@@ -108,6 +108,9 @@ pub struct Timer {
     /// The timer takes an absolute time of `CLOCK_REALTIME`. The clock of the timer is the clock
     /// since boot, and the caller changes the absolute time to the time since boot.
     realtime: bool,
+    /// The clock ID of the caller, for the offsets of a time namespace. Linux keeps it in
+    /// `struct k_itimer` and in the context of a timer file.
+    clock_id: u32,
     target: Target,
     /// The signal that the timer sends. The timer sets the time fields of the `siginfo`.
     info: SigInfo,
@@ -123,9 +126,16 @@ impl core::fmt::Debug for Timer {
 impl Timer {
     /// Makes a timer on `clock` that is off. It sends `info` to `target`.
     pub fn new(clock: Clock, target: Target, info: SigInfo) -> Arc<Self> {
+        Self::with_clock_id(clock, 0, target, info)
+    }
+
+    /// Makes a timer on `clock` that is off, for the clock ID `clock_id` of the caller. It sends
+    /// `info` to `target`.
+    pub fn with_clock_id(clock: Clock, clock_id: u32, target: Target, info: SigInfo) -> Arc<Self> {
         Arc::new(Self {
             clock,
             realtime: false,
+            clock_id,
             target,
             info,
             state: SpinLock::new(TimerState::default()),
@@ -137,6 +147,7 @@ impl Timer {
         Arc::new(Self {
             clock: Clock::Boot,
             realtime: true,
+            clock_id: 0,
             target,
             info,
             state: SpinLock::new(TimerState::default()),
@@ -146,6 +157,11 @@ impl Timer {
     /// Gives `true` if the timer takes an absolute time of `CLOCK_REALTIME`.
     pub fn is_realtime(&self) -> bool {
         self.realtime
+    }
+
+    /// The clock ID that the caller gave for the timer.
+    pub fn clock_id(&self) -> u32 {
+        self.clock_id
     }
 
     /// The time of the clock of the timer in nanoseconds.

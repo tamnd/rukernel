@@ -3119,6 +3119,110 @@ static void test_uts_ipc_ns(void)
 	umount("/proc");
 }
 
+#ifndef CLONE_NEWTIME
+#define CLONE_NEWTIME 0x80
+#endif
+
+/* The seconds of `clock` from the vDSO (`clock_gettime` of musl) or from the system call. */
+static long long clock_sec(clockid_t clock, int vdso)
+{
+	struct timespec ts = { 0, 0 };
+	if (vdso)
+		clock_gettime(clock, &ts);
+	else
+		syscall(SYS_clock_gettime, clock, &ts);
+	return ts.tv_sec;
+}
+
+/* unshare(CLONE_NEWTIME) makes a time namespace for the children, with offsets that
+ * /proc/self/timens_offsets sets until the first process goes in, as kernel/time/namespace.c
+ * of Linux. The timens tests of kselftest do the same (#536). */
+static void test_time_ns(void)
+{
+	char buf[256], a[64], b[64];
+	int status = -1, fd, ok;
+	ssize_t n;
+	pid_t pid;
+
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	fd = open("/proc/self/timens_offsets", O_RDONLY);
+	n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+	buf[n > 0 ? n : 0] = 0;
+	close(fd);
+	check("/proc/self/timens_offsets shows the offsets 0",
+	      strcmp(buf, "monotonic           0         0\nboottime            0         0\n") == 0);
+	errno = 0;
+	fd = open("/proc/self/timens_offsets", O_WRONLY);
+	check("the offsets of the first time namespace do not change",
+	      fd >= 0 && write(fd, "monotonic 1 0", 13) == -1 && errno == EACCES);
+	close(fd);
+	pid = fork();
+	if (pid == 0) {
+		long long mono = clock_sec(CLOCK_MONOTONIC, 0), boot = clock_sec(CLOCK_BOOTTIME, 0);
+		const char *off = "monotonic 1000 0\nboottime 2000 0\n";
+		ok = unshare(CLONE_NEWTIME) == 0;
+		memset(a, 0, sizeof(a));
+		memset(b, 0, sizeof(b));
+		ok = ok && readlink("/proc/self/ns/time", a, sizeof(a) - 1) > 0;
+		ok = ok && readlink("/proc/self/ns/time_for_children", b, sizeof(b) - 1) > 0;
+		ok = ok && strcmp(a, b) != 0;
+		if (!ok)
+			_exit(1);
+		fd = open("/proc/self/timens_offsets", O_WRONLY);
+		errno = 0;
+		if (fd < 0 || write(fd, "realtime 1 0", 12) != -1 || errno != EINVAL)
+			_exit(2);
+		if (write(fd, off, strlen(off)) != (ssize_t)strlen(off))
+			_exit(3);
+		/* The caller stays in its time namespace. */
+		if (clock_sec(CLOCK_MONOTONIC, 1) >= mono + 1000)
+			_exit(4);
+		pid = fork();
+		if (pid == 0) {
+			FILE *f = fopen("/proc/uptime", "r");
+			double up = 0;
+			int c = f && fscanf(f, "%lf", &up) == 1;
+			c = c && clock_sec(CLOCK_MONOTONIC, 0) >= mono + 1000;
+			c = c && clock_sec(CLOCK_MONOTONIC, 1) >= mono + 1000;
+			c = c && clock_sec(CLOCK_MONOTONIC, 1) < mono + 1100;
+			c = c && clock_sec(CLOCK_BOOTTIME, 1) >= boot + 2000;
+			c = c && clock_sec(CLOCK_BOOTTIME, 0) >= boot + 2000;
+			c = c && up >= 2000;
+			_exit(c ? 0 : 1);
+		}
+		waitpid(pid, &status, 0);
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			_exit(5);
+		errno = 0;
+		if (write(fd, off, strlen(off)) != -1 || errno != EACCES)
+			_exit(6);
+		/* setns puts the caller in the namespace of its children. */
+		int ns = open("/proc/self/ns/time_for_children", O_RDONLY);
+		if (ns < 0 || setns(ns, CLONE_NEWTIME) != 0)
+			_exit(7);
+		if (clock_sec(CLOCK_MONOTONIC, 1) < mono + 1000 || clock_sec(CLOCK_MONOTONIC, 0) < mono + 1000)
+			_exit(8);
+		/* A sleep to an absolute time of the namespace ends. */
+		struct timespec t;
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		t.tv_nsec += 10000000;
+		if (t.tv_nsec >= 1000000000) {
+			t.tv_sec++;
+			t.tv_nsec -= 1000000000;
+		}
+		if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, NULL) != 0)
+			_exit(9);
+		_exit(0);
+	}
+	waitpid(pid, &status, 0);
+	check("unshare(CLONE_NEWTIME) moves the clocks of the children and setns goes in",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: time namespace child status %d\n", WEXITSTATUS(status));
+	umount("/proc");
+}
+
 /* A walk follows 40 symbolic links and gives ELOOP at the next one, as Linux. */
 static void test_symlink_chain(void)
 {
@@ -10536,6 +10640,7 @@ static void test_all(void)
 	test_mount();
 	test_mount_ns();
 	test_uts_ipc_ns();
+	test_time_ns();
 	test_mount_api();
 	test_symlink_chain();
 	test_splice();

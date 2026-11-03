@@ -26,7 +26,7 @@ pub enum NsKind {
     Mnt,
     /// A PID namespace. rukernel has only the first one.
     Pid,
-    /// A time namespace. rukernel has only the first one.
+    /// A time namespace.
     Time,
     /// A user namespace. rukernel has only the first one.
     User,
@@ -87,6 +87,7 @@ impl NsKind {
             Self::Ipc => 0xF300_0000,
             Self::Uts => 0xF400_0000,
             Self::Net => 0xF800_0000,
+            Self::Time => 0xF500_0000,
             // The other kinds have only the first namespace.
             _ => 0xF200_0000,
         }

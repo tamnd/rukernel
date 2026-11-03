@@ -177,7 +177,7 @@ pub(crate) fn timerfd_create(cx: &Cx<'_>, clock: u64, flags: u64) -> SysResult {
     let timer = if matches!(clock as u32, CLOCK_REALTIME | CLOCK_REALTIME_ALARM) {
         Timer::new_realtime(Target::Notify(weak), SigInfo::new(0, 0, 0))
     } else {
-        Timer::new(Clock::Boot, Target::Notify(weak), SigInfo::new(0, 0, 0))
+        Timer::with_clock_id(Clock::Boot, clock as u32, Target::Notify(weak), SigInfo::new(0, 0, 0))
     };
     let file =
         File::with_ops(Arc::new(TimerFd { timer, ticks }), None, O_RDWR | (flags & TFD_NONBLOCK));
@@ -218,7 +218,9 @@ pub(crate) fn timerfd_settime(cx: &Cx<'_>, fd: u64, flags: u64, new: u64, old: u
         if tfd.timer.is_realtime() {
             crate::info::boot_ns(CLOCK_REALTIME, value).max(1)
         } else {
-            value.max(1)
+            // An absolute time of a clock of a time namespace is a time of the namespace, as
+            // `timens_ktime_to_host` of Linux.
+            cx.thread.time_ns().to_host(tfd.timer.clock_id(), value).max(1)
         }
     } else {
         tfd.timer.now().saturating_add(value)

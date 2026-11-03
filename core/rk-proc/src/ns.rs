@@ -69,6 +69,7 @@ pub fn ns_id(process: &Process, kind: NsKind) -> Result<u32, Errno> {
         NsKind::Net => process.net_ns().id(),
         NsKind::Uts => process.uts_ns().id(),
         NsKind::Ipc => process.ipc_ns().id(),
+        NsKind::Time => process.time_ns().id(),
         _ => 0,
     })
 }
