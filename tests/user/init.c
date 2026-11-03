@@ -77,6 +77,12 @@
 #define AUDIT_ARCH_NATIVE AUDIT_ARCH_X86_64
 #endif
 
+#ifndef SO_PASSPIDFD
+#define SO_PASSPIDFD 76
+#endif
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77
+#endif
 #ifndef CLONE_INTO_CGROUP
 #define CLONE_INTO_CGROUP 0x200000000ULL
 #endif
@@ -2240,6 +2246,134 @@ static void test_pidfd_ioctl(void)
 	close(a);
 	close(fds[0]);
 	close(fds[1]);
+	umount("/proc");
+}
+
+/* Reads one byte from the Unix socket fd with recvmsg and a control buffer of `room` bytes.
+ * Gives the descriptor of SCM_PIDFD or -1, and sets *creds if SCM_CREDENTIALS came. */
+static int recv_pidfd(int fd, size_t room, int *creds, int *flags)
+{
+	union {
+		char buf[CMSG_SPACE(sizeof(struct ucred)) + CMSG_SPACE(sizeof(int))];
+		struct cmsghdr align;
+	} u;
+	char c;
+	struct iovec iov = { .iov_base = &c, .iov_len = 1 };
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = u.buf,
+			      .msg_controllen = room };
+	int pidfd = -1;
+
+	memset(&u, 0, sizeof(u));
+	*creds = 0;
+	if (recvmsg(fd, &msg, 0) != 1)
+		return -2;
+	*flags = msg.msg_flags;
+	for (struct cmsghdr *m = CMSG_FIRSTHDR(&msg); m; m = CMSG_NXTHDR(&msg, m)) {
+		if (m->cmsg_level == SOL_SOCKET && m->cmsg_type == 0x04 /* SCM_PIDFD */)
+			memcpy(&pidfd, CMSG_DATA(m), sizeof(int));
+		if (m->cmsg_level == SOL_SOCKET && m->cmsg_type == SCM_CREDENTIALS)
+			*creds = 1;
+	}
+	return pidfd;
+}
+
+/* Tells if the pidfd fd refers to the process pid, as the `Pid:` line of its fdinfo. */
+static int pidfd_is(int fd, int pid)
+{
+	char line[64], want[32];
+
+	snprintf(want, sizeof(want), "Pid:\t%d", pid);
+	return fd >= 0 && fdinfo_line(fd, "Pid:", line, sizeof(line)) == 0 && strcmp(line, want) == 0;
+}
+
+/* Tells if PIDFD_GET_INFO of fd gives the exit code `code`. */
+static int pidfd_exited(int fd, int code)
+{
+	struct rk_pidfd_info info;
+
+	memset(&info, 0, sizeof(info));
+	info.mask = 8; /* PIDFD_INFO_EXIT */
+	return ioctl(fd, RK_PIDFD_GET_INFO(sizeof(info)), &info) == 0 && (info.mask & 8) &&
+	       WIFEXITED(info.exit_code) && WEXITSTATUS(info.exit_code) == code;
+}
+
+static void scm_pidfd_checks(void)
+{
+	int sv[2], on = 1, pidfd = -1, creds = 0, flags = 0;
+	socklen_t len = sizeof(pidfd);
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+		check("socketpair for SO_PEERPIDFD", 0);
+		return;
+	}
+	int r = getsockopt(sv[0], SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len);
+	check("SO_PEERPIDFD of a socketpair gives a pidfd of the process",
+	      r == 0 && len == sizeof(int) && pidfd_is(pidfd, getpid()) &&
+		      (fcntl(pidfd, F_GETFD) & FD_CLOEXEC));
+	close(pidfd);
+	int lone = socket(AF_UNIX, SOCK_STREAM, 0);
+	check("SO_PEERPIDFD of a socket without a peer gives ENODATA",
+	      getsockopt(lone, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len) == -1 && errno == ENODATA);
+	close(lone);
+
+	/* The child sends one byte and exits with 7. The parent reaps it, and then reads the
+	 * message: SCM_PIDFD still refers to the child. */
+	setsockopt(sv[0], SOL_SOCKET, SO_PASSPIDFD, &on, sizeof(on));
+	pid_t pid = fork();
+	if (pid == 0) {
+		write(sv[1], "x", 1);
+		_exit(7);
+	}
+	waitpid(pid, NULL, 0);
+	pidfd = recv_pidfd(sv[0], 64, &creds, &flags);
+	check("SO_PASSPIDFD gives SCM_PIDFD of the sender after its parent reaped it",
+	      pidfd_is(pidfd, -1) && pidfd_exited(pidfd, 7) && !creds && !(flags & MSG_CTRUNC) &&
+		      (fcntl(pidfd, F_GETFD) & FD_CLOEXEC));
+	close(pidfd);
+	setsockopt(sv[0], SOL_SOCKET, SO_PASSCRED, &on, sizeof(on));
+	write(sv[1], "y", 1);
+	pidfd = recv_pidfd(sv[0], 64, &creds, &flags);
+	check("SO_PASSCRED and SO_PASSPIDFD give SCM_CREDENTIALS and SCM_PIDFD",
+	      pidfd_is(pidfd, getpid()) && creds);
+	close(pidfd);
+	write(sv[1], "z", 1);
+	pidfd = recv_pidfd(sv[0], CMSG_SPACE(sizeof(struct ucred)), &creds, &flags);
+	check("SCM_PIDFD without room gives MSG_CTRUNC", pidfd == -1 && creds && (flags & MSG_CTRUNC));
+	close(sv[0]);
+	close(sv[1]);
+
+	/* SO_PEERPIDFD of an accepted socket refers to the client, also after its parent reaped
+	 * it. */
+	struct sockaddr_un addr = { .sun_family = AF_UNIX };
+	strcpy(addr.sun_path + 1, "rk-peerpidfd");
+	socklen_t alen = offsetof(struct sockaddr_un, sun_path) + 1 + strlen("rk-peerpidfd");
+	int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (bind(srv, (struct sockaddr *)&addr, alen) != 0 || listen(srv, 1) != 0) {
+		check("listen for SO_PEERPIDFD", 0);
+		close(srv);
+		return;
+	}
+	pid = fork();
+	if (pid == 0) {
+		int c = socket(AF_UNIX, SOCK_STREAM, 0);
+		_exit(connect(c, (struct sockaddr *)&addr, alen) == 0 ? 9 : 1);
+	}
+	waitpid(pid, NULL, 0);
+	int conn = accept(srv, NULL, NULL);
+	len = sizeof(pidfd);
+	r = getsockopt(conn, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &len);
+	check("SO_PEERPIDFD of an ended client gives its exit status",
+	      r == 0 && pidfd_is(pidfd, -1) && pidfd_exited(pidfd, 9));
+	close(pidfd);
+	close(conn);
+	close(srv);
+}
+
+static void test_scm_pidfd(void)
+{
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	scm_pidfd_checks();
 	umount("/proc");
 }
 
@@ -9817,6 +9951,7 @@ static void test_all(void)
 	test_pidfd();
 	test_pidfs();
 	test_pidfd_ioctl();
+	test_scm_pidfd();
 	test_signalfd_poll();
 	test_seccomp();
 	test_ptrace();

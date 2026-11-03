@@ -49,8 +49,12 @@ use rk_vfs::wait::PollTable;
 use rk_vfs::wait::{WaitQueue, interrupted};
 use rk_vfs::{File, FileOps, Metadata, UserMemory};
 
+/// A reference to a process, as the `struct pid` that Linux keeps in a socket. The process
+/// layer gives it, and only that layer can read it.
+pub type ProcessRef = Arc<dyn Any + Send + Sync>;
+
 /// The credentials of a process, as `struct ucred` of Linux.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct Cred {
     /// The ID of the process.
     pub pid: i32,
@@ -58,11 +62,23 @@ pub struct Cred {
     pub uid: u32,
     /// The group ID.
     pub gid: u32,
+    /// The process, for `SO_PEERPIDFD` and `SCM_PIDFD`. It stays after the process ended.
+    pub process: Option<ProcessRef>,
 }
+
+/// Two credentials are equal if the IDs are equal. Two messages of a stream with equal
+/// credentials can be joined.
+impl PartialEq for Cred {
+    fn eq(&self, other: &Self) -> bool {
+        (self.pid, self.uid, self.gid) == (other.pid, other.uid, other.gid)
+    }
+}
+
+impl Eq for Cred {}
 
 /// The credentials that `SO_PEERCRED` gives when the socket has no peer: no process, and the
 /// overflow IDs of Linux.
-pub const NO_CRED: Cred = Cred { pid: 0, uid: 65534, gid: 65534 };
+pub const NO_CRED: Cred = Cred { pid: 0, uid: 65534, gid: 65534, process: None };
 
 static CRED_SOURCE: SpinLock<Option<fn() -> Cred>> = SpinLock::new(None);
 
@@ -108,7 +124,8 @@ pub struct Received {
     pub addr: Option<Vec<u8>>,
     /// The files of `SCM_RIGHTS`.
     pub rights: Vec<Arc<File>>,
-    /// The credentials of the sender, if the receiver asked for them with `SO_PASSCRED`.
+    /// The credentials of the sender, if the receiver asked for them with `SO_PASSCRED` or
+    /// `SO_PASSPIDFD`.
     pub cred: Option<Cred>,
     /// The flags for `msg_flags`: `MSG_TRUNC` and `MSG_EOR`.
     pub flags: u32,
@@ -213,6 +230,11 @@ pub trait Socket: Send + Sync {
     /// `getsockopt` for an option that reads `input`, the first bytes of the value of the caller.
     fn get_option_in(&self, level: u32, name: u32, _input: &[u8]) -> Result<Vec<u8>> {
         self.get_option(level, name)
+    }
+    /// The credentials of the peer at the connection, for `SO_PEERPIDFD`. Only a Unix socket
+    /// has them.
+    fn peer_cred(&self) -> Option<Cred> {
+        None
     }
     /// Gives the pages that a shared `mmap` of `len` bytes at `offset` of the socket file maps,
     /// as the `mmap` of `proto_ops` of Linux. The default gives `ENODEV`, as `sock_no_mmap`.

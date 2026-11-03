@@ -13,18 +13,20 @@ use rk_abi::native::at::AT_FDCWD;
 use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
-use rk_abi::native::socket::{SO_ATTACH_FILTER, SOL_SOCKET};
+use rk_abi::native::socket::{
+    SO_ATTACH_FILTER, SO_PASSCRED, SO_PASSPIDFD, SO_PEERPIDFD, SOL_SOCKET,
+};
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT,
     MSG_NOSIGNAL, MSG_TRUNC, MSG_WAITFORONE, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC,
     SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK, SOMAXCONN,
 };
-use rk_net::{Cred, Message, NodeId, PathOps, Received, Socket};
+use rk_net::{Cred, Message, NodeId, PathOps, ProcessRef, Received, Socket};
 use rk_net_inet::Proto as InetProto;
 use rk_net_unix::Unix;
-use rk_proc::Pid;
 use rk_proc::signal::{SI_USER, SigInfo};
+use rk_proc::{Pid, Process};
 use rk_vfs::File;
 use rk_vfs::cred::cap;
 use rk_vfs::inode::mode::{S_IFMT, S_IFSOCK};
@@ -52,7 +54,8 @@ pub(crate) fn current_cred() -> Cred {
     rk_proc::current_thread().map_or(Cred::default(), |t| {
         let process = t.process();
         let c = process.cred();
-        Cred { pid: process.pid() as i32, uid: c.euid, gid: c.egid }
+        let me: ProcessRef = process.clone();
+        Cred { pid: process.pid() as i32, uid: c.euid, gid: c.egid, process: Some(me) }
     })
 }
 
@@ -366,6 +369,9 @@ pub(crate) fn getsockopt(
     let (_, sock) = socket(cx, fd)?;
     let len: i32 = cx.read_val(lenp)?;
     let len = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
+    if level as u32 == SOL_SOCKET && name as u32 == SO_PEERPIDFD {
+        return peer_pidfd(cx, &*sock, value, lenp, len);
+    }
     // A few options read their value first, as `PACKET_HDRLEN` of Linux.
     let need = sock.option_input(level as u32, name as u32);
     let input = if need > 0 && len > 0 { cx.read_bytes(value, len.min(need))? } else { Vec::new() };
@@ -603,10 +609,12 @@ fn read_control(cx: &Cx<'_>, hdr: &MsgHdr, msg: &mut Message) -> Result<(), Errn
                         return Err(Errno::EINVAL);
                     }
                     check_scm_cred(cx, pid, uid, gid)?;
-                    if rk_proc::find_process(pid as Pid).is_none() {
+                    // The message refers to the process of `pid`, as `scm_replace_pid` of Linux.
+                    let Some(target) = rk_proc::find_process(pid as Pid) else {
                         return Err(Errno::ESRCH);
-                    }
-                    msg.cred = Some(Cred { pid, uid, gid });
+                    };
+                    let target: ProcessRef = target;
+                    msg.cred = Some(Cred { pid, uid, gid, process: Some(target) });
                 }
                 _ => return Err(Errno::EINVAL),
             }
@@ -620,7 +628,13 @@ fn read_control(cx: &Cx<'_>, hdr: &MsgHdr, msg: &mut Message) -> Result<(), Errn
 
 /// Writes the control messages of a receive, as `put_cmsg` and `scm_detach_fds` of Linux.
 /// Gives the bytes of the control buffer that the messages use and the flag `MSG_CTRUNC`.
-fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(u64, u32), Errno> {
+fn write_control(
+    cx: &Cx<'_>,
+    sock: &dyn Socket,
+    hdr: &MsgHdr,
+    r: Received,
+    flags: u32,
+) -> Result<(u64, u32), Errno> {
     let mut space = if hdr.control == 0 { 0 } else { hdr.controllen as usize };
     let mut out: Vec<u8> = Vec::new();
     let mut ctrunc = 0;
@@ -649,7 +663,10 @@ fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(
             ctrunc = MSG_CTRUNC;
         }
     }
-    if let Some(c) = r.cred {
+    // A Unix socket gives the credentials for `SO_PASSCRED` or `SO_PASSPIDFD`. Each option
+    // gives its own message, as `scm_recv_unix` of Linux.
+    let cred = r.cred.as_ref();
+    if let Some(c) = cred.filter(|_| flag_option(sock, SO_PASSCRED)) {
         let mut v = Vec::with_capacity(UCRED_SIZE);
         v.extend_from_slice(&c.pid.to_ne_bytes());
         v.extend_from_slice(&c.uid.to_ne_bytes());
@@ -677,10 +694,54 @@ fn write_control(cx: &Cx<'_>, hdr: &MsgHdr, r: Received, flags: u32) -> Result<(
             put(&mut out, &mut space, SOL_SOCKET, SCM_RIGHTS, &fds);
         }
     }
+    if cred.is_some() && flag_option(sock, SO_PASSPIDFD) {
+        if space < cmsg_len(4) {
+            ctrunc = MSG_CTRUNC;
+        } else if let Some(process) = cred.and_then(process_of_cred) {
+            // A failed open gives the error in the message, as `scm_pidfd_recv` of Linux.
+            let fd = crate::pidfd::open(cx, process, 0).unwrap_or_else(|e| -i32::from(e.get()));
+            put(&mut out, &mut space, SOL_SOCKET, SCM_PIDFD, &fd.to_ne_bytes());
+        }
+    }
     if !out.is_empty() {
         cx.write_bytes(hdr.control, &out)?;
     }
     Ok((out.len() as u64, ctrunc))
+}
+
+/// The type of the control message with a process file descriptor of the sender. Linux names it
+/// `SCM_PIDFD`.
+const SCM_PIDFD: u32 = 0x04;
+
+/// Tells if the socket option `name` of the level `SOL_SOCKET` is set.
+fn flag_option(sock: &dyn Socket, name: u32) -> bool {
+    let v = sock.get_option(SOL_SOCKET, name).unwrap_or_default();
+    v.first_chunk::<4>().is_some_and(|b| i32::from_ne_bytes(*b) != 0)
+}
+
+/// The process of the credentials of a socket. It can have ended.
+fn process_of_cred(cred: &Cred) -> Option<Arc<Process>> {
+    cred.process.clone()?.downcast::<Process>().ok()
+}
+
+/// `getsockopt` of `SO_PEERPIDFD`: a new process file descriptor of the peer at the
+/// connection, as `sk_getsockopt` of Linux. The descriptor has `FD_CLOEXEC`. The process can
+/// have ended, as with `PIDFD_STALE` of Linux.
+///
+/// # Errors
+///
+/// Gives `ENODATA` if the socket has no peer credentials.
+fn peer_pidfd(cx: &Cx<'_>, sock: &dyn Socket, value: u64, lenp: u64, len: usize) -> SysResult {
+    let len = len.min(4);
+    let process = sock.peer_cred().as_ref().and_then(process_of_cred).ok_or(Errno::ENODATA)?;
+    let fd = crate::pidfd::open(cx, process, 0)?;
+    let copied = cx.write_bytes(value, &fd.to_ne_bytes()[..len]);
+    if let Err(e) = copied.and_then(|()| cx.write_val(lenp, &(len as i32))) {
+        let entry = cx.files()?.lock().remove(fd);
+        drop(entry);
+        return Err(e);
+    }
+    Ok(0)
 }
 
 /// Sends one `struct msghdr`.
@@ -720,7 +781,7 @@ fn recvmsg_one(
         cx.write_val(addr + 8, &(from.len() as u32))?;
     }
     let msg_flags = r.flags;
-    let (used, ctrunc) = write_control(cx, &hdr, r, flags)?;
+    let (used, ctrunc) = write_control(cx, sock, &hdr, r, flags)?;
     cx.write_val(addr + 40, &used)?;
     cx.write_val(addr + 48, &(msg_flags | ctrunc))?;
     Ok(n)
