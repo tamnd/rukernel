@@ -79,12 +79,14 @@ struct Probe {
 impl Probe {
     /// Starts the driver for the device with the virtio device ID `id` on the transport `t`.
     /// `bus` is the number of the device among all virtio devices, and `place` tells where the
-    /// device is, from the kind of its interrupt.
+    /// device is, from the kind of its interrupt. `bus_info` is the name of the device on its
+    /// bus, as `virtio_bus_name` of Linux gives it.
     fn add(
         &mut self,
         id: u32,
         t: transport::Transport,
         bus: u32,
+        bus_info: alloc::string::String,
         place: impl Fn(&str) -> alloc::string::String,
     ) {
         match id {
@@ -95,7 +97,7 @@ impl Probe {
                 }
             }
             DEVICE_NET => {
-                if let Some((nic, kind)) = net::probe(t, self.nics, bus) {
+                if let Some((nic, kind)) = net::probe(t, self.nics, bus, bus_info) {
                     let place = place(&kind);
                     rk_frame::println!("virtio: {} on {place}, MAC {}", nic.name(), nic.mac());
                     self.nics += 1;
@@ -121,7 +123,10 @@ impl Probe {
             }
             if let Some(t) = pci::PciTransport::new(dev) {
                 let place = |kind: &str| alloc::format!("PCI {:?} with {kind}", dev.address());
-                self.add(id, transport::Transport::Pci(t), this, place);
+                let a = dev.address();
+                let bus_info =
+                    alloc::format!("{:04x}:{:02x}:{:02x}.{:x}", 0, a.bus, a.device, a.function);
+                self.add(id, transport::Transport::Pci(t), this, bus_info, place);
             }
         }
         bus
@@ -153,7 +158,8 @@ pub fn init() {
         };
         if matches!(id, DEVICE_BLK | DEVICE_NET) {
             let place = |_: &str| alloc::format!("MMIO {:#x}", dev.phys());
-            probe.add(id, transport::Transport::Mmio(t), bus, place);
+            let bus_info = alloc::format!("{:x}.virtio_mmio", dev.phys());
+            probe.add(id, transport::Transport::Mmio(t), bus, bus_info, place);
         }
         bus += 1;
     }

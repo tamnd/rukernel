@@ -7,8 +7,10 @@
 use crate::buf::NetBuf;
 use crate::dev::{self, LinkKind, NetDevice, NetDriver};
 use crate::ether::MacAddr;
+use crate::ethtool::{self, DrvInfo, LinkSettings};
 use crate::ns::{self, NetNs};
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_frame::sync::SpinLock;
@@ -72,6 +74,29 @@ impl NetDriver for Veth {
 
     fn link_kind(&self) -> Option<&'static str> {
         Some(KIND)
+    }
+
+    /// The driver data, as `veth_get_drvinfo` of Linux.
+    fn drvinfo(&self) -> Option<DrvInfo> {
+        Some(DrvInfo {
+            driver: String::from(KIND),
+            version: String::from("1.0"),
+            ..DrvInfo::default()
+        })
+    }
+
+    fn has_get_link(&self) -> bool {
+        true
+    }
+
+    /// A fixed link of 10 Gb/s, as `veth_get_link_ksettings` of Linux.
+    fn link_settings(&self) -> Option<LinkSettings> {
+        Some(LinkSettings {
+            speed: 10000,
+            duplex: ethtool::DUPLEX_FULL,
+            port: ethtool::PORT_TP,
+            ..LinkSettings::default()
+        })
     }
 
     fn peer(&self) -> Option<Arc<NetDevice>> {

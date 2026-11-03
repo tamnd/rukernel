@@ -17,6 +17,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::PAGE_SIZE;
 use rk_frame::mm::{Frame, alloc_zeroed_frame};
@@ -24,6 +25,8 @@ use rk_frame::sync::SpinLock;
 use rk_net::buf::NetBuf;
 use rk_net::dev::{LinkKind, NetDevice, NetDriver, register};
 use rk_net::ether::MacAddr;
+use rk_net::ethtool::{self, Channels, DrvInfo, LinkSettings, Rings};
+use rk_net::features;
 use rk_vfs::inode::Result;
 
 /// The device has a MAC address in its configuration.
@@ -72,8 +75,14 @@ impl Ring {
 
 /// Starts the driver for the network device number `index` on the transport `t`, and registers
 /// the device. `bus` is the number of the device among all virtio devices, as the name `virtioN`
-/// of Linux. Gives the device and the kind of its interrupt.
-pub(crate) fn probe(mut t: Transport, index: u32, bus: u32) -> Option<(Arc<NetDevice>, String)> {
+/// of Linux. `bus_info` is the name of the device on its bus, for `ethtool -i`. Gives the device
+/// and the kind of its interrupt.
+pub(crate) fn probe(
+    mut t: Transport,
+    index: u32,
+    bus: u32,
+    bus_info: String,
+) -> Option<(Arc<NetDevice>, String)> {
     let Some(features) = t.negotiate(F_MAC | F_STATUS) else {
         t.fail();
         return None;
@@ -90,6 +99,7 @@ pub(crate) fn probe(mut t: Transport, index: u32, bus: u32) -> Option<(Arc<NetDe
         // A locally administered address. Linux takes a random one.
         MacAddr([0x02, 0, 0, 0, (index >> 8) as u8, index as u8])
     };
+    let queue_max = [t.queue_max(RX_QUEUE), t.queue_max(TX_QUEUE)];
     t.add_status(status::DRIVER_OK);
     while let Some(id) = rx.slots.take() {
         rx.queue.push_avail(id);
@@ -99,6 +109,11 @@ pub(crate) fn probe(mut t: Transport, index: u32, bus: u32) -> Option<(Arc<NetDe
     let driver = VirtioNet {
         mac,
         bus,
+        bus_info,
+        perm: features & F_MAC != 0,
+        queue_max,
+        speed: AtomicU32::new(ethtool::SPEED_UNKNOWN),
+        duplex: AtomicU8::new(ethtool::DUPLEX_UNKNOWN),
         status: features & F_STATUS != 0,
         t,
         rx: SpinLock::new(rx),
@@ -112,6 +127,16 @@ struct VirtioNet {
     mac: MacAddr,
     /// The number of the device on the virtio bus.
     bus: u32,
+    /// The name of the device on its bus.
+    bus_info: String,
+    /// The address comes from the device, so it is the permanent address.
+    perm: bool,
+    /// The largest sizes of the receive queue and of the transmit queue.
+    queue_max: [u16; 2],
+    /// The speed and the duplex that the user set, as `speed` and `duplex` of
+    /// `struct virtnet_info` of Linux. The device does not tell them.
+    speed: AtomicU32,
+    duplex: AtomicU8,
     /// The device has the status of the link.
     status: bool,
     t: Transport,
@@ -130,6 +155,62 @@ impl NetDriver for VirtioNet {
 
     fn parent(&self) -> Option<(String, &'static str)> {
         Some((format!("virtio{}", self.bus), "virtio"))
+    }
+
+    /// The driver data, as `virtnet_get_drvinfo` of Linux.
+    fn drvinfo(&self) -> Option<DrvInfo> {
+        Some(DrvInfo {
+            driver: String::from("virtio_net"),
+            version: String::from("1.0.0"),
+            fw_version: String::new(),
+            bus_info: self.bus_info.clone(),
+        })
+    }
+
+    fn has_get_link(&self) -> bool {
+        true
+    }
+
+    /// The settings of `virtnet_get_link_ksettings` of Linux.
+    fn link_settings(&self) -> Option<LinkSettings> {
+        Some(LinkSettings {
+            speed: self.speed.load(Ordering::Relaxed),
+            duplex: self.duplex.load(Ordering::Relaxed),
+            port: ethtool::PORT_OTHER,
+            ..LinkSettings::default()
+        })
+    }
+
+    fn has_set_link_settings(&self) -> bool {
+        true
+    }
+
+    fn set_link_settings(&self, s: &LinkSettings) -> Result<()> {
+        ethtool::virtdev_set(s, &self.speed, &self.duplex)
+    }
+
+    /// The sizes of the queues, as `virtnet_get_ringparam` of Linux.
+    fn rings(&self) -> Option<Rings> {
+        Some(Rings {
+            rx_max: u32::from(self.queue_max[0]),
+            rx: u32::from(self.rx.lock().queue.size()),
+            tx_max: u32::from(self.queue_max[1]),
+            tx: u32::from(self.tx.lock().queue.size()),
+        })
+    }
+
+    /// One pair of queues, as `virtnet_get_channels` of Linux without `VIRTIO_NET_F_MQ`.
+    fn channels(&self) -> Option<Channels> {
+        Some(Channels { max_combined: 1, combined_count: 1, ..Channels::default() })
+    }
+
+    /// The features of `virtnet_probe` of Linux without the offloads of the device.
+    fn features(&self) -> (u64, u64) {
+        (features::HIGHDMA | features::RXCSUM, 0)
+    }
+
+    fn perm_addr(&self) -> MacAddr {
+        if self.perm { self.mac } else { MacAddr::ZERO }
     }
 
     fn link_up(&self) -> bool {

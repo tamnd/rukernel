@@ -21,6 +21,8 @@ pub mod consts;
 pub mod dev;
 pub mod dummy;
 pub mod ether;
+pub mod ethtool;
+pub mod features;
 pub mod filter;
 pub mod ioctl;
 pub mod netlink;

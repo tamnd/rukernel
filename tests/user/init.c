@@ -9232,6 +9232,353 @@ static void test_genl(void)
 	close(fd);
 }
 
+/* The generic netlink family ethtool, as net/ethtool/netlink.c of Linux, and the ioctl
+ * SIOCETHTOOL: the values of <linux/ethtool_netlink_generated.h> and <linux/ethtool.h>. */
+#define RK_ETHTOOL_MSG_STRSET_GET 1
+#define RK_ETHTOOL_MSG_LINKINFO_GET 2
+#define RK_ETHTOOL_MSG_LINKMODES_GET 4
+#define RK_ETHTOOL_MSG_LINKMODES_SET 5
+#define RK_ETHTOOL_MSG_LINKSTATE_GET 6
+#define RK_ETHTOOL_MSG_FEATURES_GET 11
+#define RK_ETHTOOL_MSG_FEATURES_SET 12
+#define RK_ETHTOOL_MSG_FEATURES_NTF 13
+#define RK_ETHTOOL_MSG_RINGS_GET 15
+#define RK_ETHTOOL_MSG_CHANNELS_GET 17
+#define RK_ETHTOOL_FLAG_COMPACT_BITSETS 1
+#define RK_ETHTOOL_FLAG_OMIT_REPLY 2
+#define RK_SIOCETHTOOL 0x8946
+#define RK_NETLINK_EXT_ACK 11
+
+/* Gives the attribute `type` in the payload of the generic netlink message r, or NULL. */
+static struct rtattr *eth_attr(struct nlmsghdr *r, int type)
+{
+	return genl_attr((struct rtattr *)((char *)NLMSG_DATA(r) + 4),
+			 r->nlmsg_len - NLMSG_LENGTH(4), type);
+}
+
+/* Gives the attribute `type` in the nest a, or NULL. */
+static struct rtattr *eth_in(struct rtattr *a, int type)
+{
+	return a ? genl_attr(RTA_DATA(a), RTA_PAYLOAD(a), type) : NULL;
+}
+
+/* Gives the u32 of the attribute a, or 0xdeadbeef if a is NULL. */
+static unsigned int eth_u32(struct rtattr *a)
+{
+	return a ? *(unsigned int *)RTA_DATA(a) : 0xdeadbeef;
+}
+
+/* Starts the request `cmd` of the family `id` with a header that names the device `dev`.
+ * A null `dev` gives an empty header. */
+static void eth_msg(struct nlmsghdr *m, int id, int cmd, int flags, const char *dev,
+		    unsigned int hflags)
+{
+	genl_msg(m, id, cmd, flags);
+	struct rtattr *h = nl_put(m, 1 | NLA_F_NESTED, NULL, 0);
+	if (dev)
+		nl_put(m, 2, dev, strlen(dev) + 1);
+	if (hflags)
+		nl_put(m, 3, &hflags, 4);
+	nl_end(m, h);
+}
+
+/* Sends m and reads the reply into buf. Gives the reply if it is the command `cmd`. */
+static struct nlmsghdr *eth_get(int fd, struct nlmsghdr *m, char *buf, int size, int cmd)
+{
+	long n = nl_ask(fd, m, buf, size);
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	if (n < (long)NLMSG_LENGTH(4) || r->nlmsg_type == NLMSG_ERROR ||
+	    ((unsigned char *)NLMSG_DATA(r))[0] != cmd)
+		return NULL;
+	return r;
+}
+
+/* Sends m with NLM_F_ACK and gives the error. The text of the extended ack goes to msg. */
+static int eth_ack(int fd, struct nlmsghdr *m, char *msg, int size)
+{
+	char buf[1024];
+	msg[0] = 0;
+	m->nlmsg_flags |= NLM_F_ACK;
+	long n = nl_ask(fd, m, buf, sizeof(buf));
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	if (n < (long)NLMSG_LENGTH(sizeof(struct nlmsgerr)) || r->nlmsg_type != NLMSG_ERROR)
+		return -EPROTO;
+	struct nlmsgerr *e = NLMSG_DATA(r);
+	if (r->nlmsg_flags & NLM_F_ACK_TLVS) {
+		int skip = e->error && !(r->nlmsg_flags & NLM_F_CAPPED) ? e->msg.nlmsg_len :
+									   sizeof(e->msg);
+		int off = NLMSG_LENGTH(sizeof(int)) + NLMSG_ALIGN(skip);
+		struct rtattr *t = genl_attr((struct rtattr *)(buf + off), r->nlmsg_len - off, 1);
+		if (t)
+			snprintf(msg, size, "%s", (char *)RTA_DATA(t));
+	}
+	return e->error;
+}
+
+/* Finds the family ethtool and the ID of its group monitor. Gives the family ID, or 0. */
+static int eth_family(int fd, int *group)
+{
+	union {
+		struct nlmsghdr h;
+		char buf[256];
+	} m;
+	char reply[4096];
+	genl_msg(&m.h, RK_GENL_ID_CTRL, RK_CTRL_CMD_GETFAMILY, 0);
+	nl_put(&m.h, RK_CTRL_ATTR_FAMILY_NAME, "ethtool", 8);
+	long n = nl_ask(fd, &m.h, reply, sizeof(reply));
+	struct nlmsghdr *r = (struct nlmsghdr *)reply;
+	if (n <= 0 || r->nlmsg_type != RK_GENL_ID_CTRL)
+		return 0;
+	struct rtattr *grps = eth_attr(r, RK_CTRL_ATTR_MCAST_GROUPS);
+	struct rtattr *grp = eth_in(grps, 1);
+	struct rtattr *name = eth_in(grp, RK_CTRL_ATTR_MCAST_GRP_NAME);
+	if (!name || strcmp(RTA_DATA(name), "monitor") != 0)
+		return 0;
+	*group = eth_u32(eth_in(grp, RK_CTRL_ATTR_MCAST_GRP_ID));
+	return *(unsigned short *)RTA_DATA(eth_attr(r, RK_CTRL_ATTR_FAMILY_ID));
+}
+
+/* Gives the word `w` of the compact bitset `type` of the reply r. */
+static unsigned int eth_word(struct nlmsghdr *r, int type, int w)
+{
+	struct rtattr *v = eth_in(eth_attr(r, type), 4);
+	return v && RTA_PAYLOAD(v) > 4u * w ? ((unsigned int *)RTA_DATA(v))[w] : 0xdeadbeef;
+}
+
+/* Runs the ethtool command at `data` on the device `dev`. Gives the result of ioctl. */
+static int eth_ioctl(int s, const char *dev, void *data)
+{
+	struct ifreq ifr = { 0 };
+	strcpy(ifr.ifr_name, dev);
+	ifr.ifr_data = data;
+	return ioctl(s, RK_SIOCETHTOOL, &ifr);
+}
+
+/* The family ethtool on eth0, a virtio-net device, as `ethtool eth0`, `ethtool -i eth0`,
+ * `ethtool -k eth0`, `ethtool -K eth0 gro off`, `ethtool -g eth0`, `ethtool -l eth0` and
+ * `ethtool --monitor` use it. */
+static void test_ethtool(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+	int mon = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+	int one = 1, group = 0;
+	setsockopt(fd, SOL_NETLINK, RK_NETLINK_EXT_ACK, &one, sizeof(one));
+	/* A socket with the port ID 0 gets no multicast, so the monitor binds, as libmnl. */
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	bind(mon, (struct sockaddr *)&sa, sizeof(sa));
+	int id = eth_family(fd, &group);
+	check("ethtool: nlctrl has the family ethtool and its group monitor", id >= 0x10);
+	if (id < 0x10)
+		return;
+	check("ethtool: a socket joins the group monitor",
+	      setsockopt(mon, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof(group)) == 0);
+
+	union {
+		struct nlmsghdr h;
+		char buf[512];
+	} m;
+	static char reply[16384];
+	char msg[128];
+	struct nlmsghdr *r;
+
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKINFO_GET, 0, "eth0", 0);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 2);
+	struct rtattr *hdr = r ? eth_attr(r, 1) : NULL;
+	struct rtattr *port = r ? eth_attr(r, 2) : NULL;
+	check("ethtool: LINKINFO_GET of eth0 gives its header and PORT_OTHER",
+	      hdr && eth_u32(eth_in(hdr, 1)) == if_nametoindex("eth0") &&
+		      strcmp(RTA_DATA(eth_in(hdr, 2)), "eth0") == 0 && port &&
+		      *(unsigned char *)RTA_DATA(port) == 0xff);
+
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKMODES_GET, 0, "eth0", RK_ETHTOOL_FLAG_COMPACT_BITSETS);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 4);
+	check("ethtool: LINKMODES_GET of eth0 gives an unknown speed and 125 link modes",
+	      r && eth_u32(eth_attr(r, 5)) == 0xffffffff &&
+		      eth_u32(eth_in(eth_attr(r, 3), 2)) == 125 && eth_word(r, 3, 3) == 0);
+
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKSTATE_GET, 0, "eth0", 0);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 6);
+	check("ethtool: LINKSTATE_GET of eth0 gives the link up",
+	      r && eth_attr(r, 2) && *(unsigned char *)RTA_DATA(eth_attr(r, 2)) == 1);
+
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_RINGS_GET, 0, "eth0", 0);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 16);
+	check("ethtool: RINGS_GET of eth0 gives the sizes of the queues",
+	      r && eth_u32(eth_attr(r, 2)) >= eth_u32(eth_attr(r, 6)) &&
+		      eth_u32(eth_attr(r, 6)) > 0 && eth_u32(eth_attr(r, 9)) > 0);
+
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_CHANNELS_GET, 0, "eth0", 0);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 18);
+	check("ethtool: CHANNELS_GET of eth0 gives one combined channel",
+	      r && eth_u32(eth_attr(r, 5)) == 1 && eth_u32(eth_attr(r, 9)) == 1 &&
+		      !eth_attr(r, 2));
+
+	/* ethtool -k eth0: rx-checksum (bit 40) and rx-gro (bit 14) are on. */
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_FEATURES_GET, 0, "eth0", RK_ETHTOOL_FLAG_COMPACT_BITSETS);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 11);
+	check("ethtool: FEATURES_GET of eth0 gives rx-checksum and rx-gro",
+	      r && (eth_word(r, 4, 0) & (1u << 14)) && (eth_word(r, 4, 1) & (1u << 8)) &&
+		      eth_word(r, 5, 0) == 1u << 10);
+
+	/* ethtool -K eth0 rx-gro off, with the verbose form and the name of the bit. */
+	genl_msg(&m.h, id, RK_ETHTOOL_MSG_FEATURES_SET, 0);
+	struct rtattr *h = nl_put(&m.h, 1 | NLA_F_NESTED, NULL, 0);
+	nl_put(&m.h, 2, "eth0", 5);
+	nl_end(&m.h, h);
+	struct rtattr *set = nl_put(&m.h, 3 | NLA_F_NESTED, NULL, 0);
+	struct rtattr *bits = nl_put(&m.h, 3 | NLA_F_NESTED, NULL, 0);
+	struct rtattr *bit = nl_put(&m.h, 1 | NLA_F_NESTED, NULL, 0);
+	nl_put(&m.h, 2, "rx-gro", 7);
+	nl_end(&m.h, bit);
+	nl_end(&m.h, bits);
+	nl_end(&m.h, set);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 12);
+	check("ethtool: FEATURES_SET of rx-gro off gives the changed active features",
+	      r && eth_in(eth_in(eth_in(eth_attr(r, 4), 3), 1), 2) &&
+		      strcmp(RTA_DATA(eth_in(eth_in(eth_in(eth_attr(r, 4), 3), 1), 2)), "rx-gro") ==
+			      0);
+	long n = recv(mon, reply, sizeof(reply), MSG_DONTWAIT);
+	r = (struct nlmsghdr *)reply;
+	check("ethtool: the group monitor gets FEATURES_NTF without rx-gro",
+	      n > 0 && r->nlmsg_type == id &&
+		      ((unsigned char *)NLMSG_DATA(r))[0] == RK_ETHTOOL_MSG_FEATURES_NTF &&
+		      !(eth_word(r, 4, 0) & (1u << 14)));
+	/* ethtool -K eth0 rx-gro on, with the compact form. Without the reply, the ack is the
+	 * only answer. */
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_FEATURES_SET, 0, "eth0", RK_ETHTOOL_FLAG_OMIT_REPLY);
+	set = nl_put(&m.h, 3 | NLA_F_NESTED, NULL, 0);
+	unsigned int size = 64, words[2] = { 1u << 14, 0 };
+	nl_put(&m.h, 2, &size, 4);
+	nl_put(&m.h, 4, words, 8);
+	nl_put(&m.h, 5, words, 8);
+	nl_end(&m.h, set);
+	check("ethtool: FEATURES_SET of rx-gro on is done", eth_ack(fd, &m.h, msg, sizeof(msg)) == 0);
+	n = recv(mon, reply, sizeof(reply), MSG_DONTWAIT);
+	r = (struct nlmsghdr *)reply;
+	check("ethtool: the group monitor gets FEATURES_NTF with rx-gro",
+	      n > 0 && (eth_word(r, 4, 0) & (1u << 14)));
+
+	/* ethtool -s eth0 speed 1000 duplex full, and back. */
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKMODES_SET, 0, "eth0", 0);
+	unsigned int speed = 1000;
+	unsigned char duplex = 1;
+	nl_put(&m.h, 5, &speed, 4);
+	nl_put(&m.h, 6, &duplex, 1);
+	int err = eth_ack(fd, &m.h, msg, sizeof(msg));
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKMODES_GET, 0, "eth0", 0);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 4);
+	check("ethtool: LINKMODES_SET of eth0 sets the speed and the duplex",
+	      err == 0 && r && eth_u32(eth_attr(r, 5)) == 1000 && eth_attr(r, 6) &&
+		      *(unsigned char *)RTA_DATA(eth_attr(r, 6)) == 1);
+	n = recv(mon, reply, sizeof(reply), MSG_DONTWAIT);
+	r = (struct nlmsghdr *)reply;
+	check("ethtool: the group monitor gets LINKMODES_NTF",
+	      n > 0 && ((unsigned char *)NLMSG_DATA(r))[0] == 5);
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKMODES_SET, 0, "eth0", 0);
+	speed = 0xffffffff;
+	duplex = 0xff;
+	nl_put(&m.h, 5, &speed, 4);
+	nl_put(&m.h, 6, &duplex, 1);
+	eth_ack(fd, &m.h, msg, sizeof(msg));
+
+	/* The errors and the extended ack. */
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKINFO_GET, 0, "nosuch0", 0);
+	check("ethtool: an unknown device gives ENODEV and \"no device matches name\"",
+	      eth_ack(fd, &m.h, msg, sizeof(msg)) == -ENODEV &&
+		      strcmp(msg, "no device matches name") == 0);
+	genl_msg(&m.h, id, RK_ETHTOOL_MSG_LINKINFO_GET, 0);
+	check("ethtool: a request without a header gives EINVAL",
+	      eth_ack(fd, &m.h, msg, sizeof(msg)) == -EINVAL);
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKINFO_GET, 0, NULL, 0);
+	check("ethtool: a header without a device gives EINVAL",
+	      eth_ack(fd, &m.h, msg, sizeof(msg)) == -EINVAL &&
+		      strcmp(msg, "neither ifindex nor name specified") == 0);
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKINFO_GET, 0, "lo", 0);
+	check("ethtool: LINKINFO_GET of lo gives EOPNOTSUPP",
+	      eth_ack(fd, &m.h, msg, sizeof(msg)) == -EOPNOTSUPP);
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_FEATURES_SET, 0, "eth0", RK_ETHTOOL_FLAG_OMIT_REPLY);
+	set = nl_put(&m.h, 3 | NLA_F_NESTED, NULL, 0);
+	words[0] = 1u << 10;
+	nl_put(&m.h, 2, &size, 4);
+	nl_put(&m.h, 4, words, 8);
+	nl_put(&m.h, 5, words, 8);
+	nl_end(&m.h, set);
+	check("ethtool: a change of vlan-challenged gives EINVAL",
+	      eth_ack(fd, &m.h, msg, sizeof(msg)) == -EINVAL &&
+		      strcmp(msg, "attempt to change non-ethtool features") == 0);
+
+	/* ethtool --show-strings: the number of the link modes, without a device. */
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_STRSET_GET, 0, NULL, 0);
+	struct rtattr *sets = nl_put(&m.h, 2 | NLA_F_NESTED, NULL, 0);
+	struct rtattr *ss = nl_put(&m.h, 1 | NLA_F_NESTED, NULL, 0);
+	unsigned int ssid = 9;
+	nl_put(&m.h, 1, &ssid, 4);
+	nl_end(&m.h, ss);
+	nl_end(&m.h, sets);
+	nl_put(&m.h, 3, NULL, 0);
+	r = eth_get(fd, &m.h, reply, sizeof(reply), 1);
+	struct rtattr *s9 = r ? eth_in(eth_attr(r, 2), 1) : NULL;
+	check("ethtool: STRSET_GET gives 125 link modes",
+	      s9 && eth_u32(eth_in(s9, 1)) == 9 && eth_u32(eth_in(s9, 2)) == 125 &&
+		      !eth_in(s9, 3));
+
+	/* A dump of LINKINFO has eth0 and not lo. */
+	eth_msg(&m.h, id, RK_ETHTOOL_MSG_LINKINFO_GET, NLM_F_DUMP, NULL, 0);
+	m.h.nlmsg_flags |= NLM_F_REQUEST;
+	send(fd, &m.h, m.h.nlmsg_len, 0);
+	int eth0 = 0, lo = 0, done = 0;
+	while (!done && (n = recv(fd, reply, sizeof(reply), 0)) > 0) {
+		for (r = (struct nlmsghdr *)reply; NLMSG_OK(r, n); r = NLMSG_NEXT(r, n)) {
+			if (r->nlmsg_type == NLMSG_DONE) {
+				done = 1;
+			} else if (r->nlmsg_type == id) {
+				const char *name = RTA_DATA(eth_in(eth_attr(r, 1), 2));
+				eth0 |= strcmp(name, "eth0") == 0;
+				lo |= strcmp(name, "lo") == 0;
+			} else {
+				done = 1;
+			}
+		}
+	}
+	check("ethtool: the dump of LINKINFO has eth0 and not lo", eth0 && !lo && done);
+	close(mon);
+	close(fd);
+
+	/* ethtool -i eth0 and the other ioctls. */
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	unsigned char info[196] = { 0 };
+	*(unsigned int *)info = 3;
+	check("ethtool: ETHTOOL_GDRVINFO of eth0 gives virtio_net",
+	      eth_ioctl(s, "eth0", info) == 0 && strcmp((char *)info + 4, "virtio_net") == 0 &&
+		      strcmp((char *)info + 36, "1.0.0") == 0 && info[100] != 0);
+	unsigned int link[2] = { 0xa, 0 };
+	check("ethtool: ETHTOOL_GLINK of eth0 gives the link up",
+	      eth_ioctl(s, "eth0", link) == 0 && link[1] == 1);
+	unsigned int perm[4] = { 0x20, 2, 0, 0 };
+	errno = 0;
+	check("ethtool: ETHTOOL_GPERMADDR with a small buffer gives ETOOSMALL",
+	      eth_ioctl(s, "eth0", perm) == -1 && errno == 525);
+	perm[1] = 8;
+	check("ethtool: ETHTOOL_GPERMADDR of eth0 gives 6 bytes",
+	      eth_ioctl(s, "eth0", perm) == 0 && perm[1] == 6);
+	unsigned char ks[48 + 48] = { 0 };
+	*(unsigned int *)ks = 0x4c;
+	check("ethtool: ETHTOOL_GLINKSETTINGS without the size gives -4 words",
+	      eth_ioctl(s, "eth0", ks) == 0 && (signed char)ks[15] == -4);
+	ks[15] = 4;
+	check("ethtool: ETHTOOL_GLINKSETTINGS of eth0 gives PORT_OTHER",
+	      eth_ioctl(s, "eth0", ks) == 0 && *(unsigned int *)(ks + 4) == 0xffffffff &&
+		      ks[9] == 0xff && ks[15] == 4);
+	errno = 0;
+	check("ethtool: ETHTOOL_GDRVINFO of an unknown device gives ENODEV",
+	      eth_ioctl(s, "nosuch0", info) == -1 && errno == ENODEV);
+	errno = 0;
+	*(unsigned int *)info = 3;
+	check("ethtool: ETHTOOL_GDRVINFO of lo gives EOPNOTSUPP",
+	      eth_ioctl(s, "lo", info) == -1 && errno == EOPNOTSUPP);
+	close(s);
+}
+
 /* A veth pair, as drivers/net/veth.c of Linux, with its ends in two network namespaces. */
 static void test_veth(void)
 {
@@ -9291,6 +9638,7 @@ static void test_inet(int port)
 	test_veth();
 	test_nexthop();
 	test_genl();
+	test_ethtool();
 	test_slip();
 	test_tcp_lo();
 	test_tcp_host(port);

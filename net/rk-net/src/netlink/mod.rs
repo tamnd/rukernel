@@ -924,13 +924,31 @@ impl<'a> Request<'a> {
     /// Sets the bad attribute of the extended ack, as `NL_SET_BAD_ATTR` of Linux. The offset is
     /// the place of the header of the attribute from the start of the message.
     pub fn bad_attr(&self, data: &[u8]) {
-        let base = self.msg.as_ptr() as usize;
-        let at = (data.as_ptr() as usize).wrapping_sub(base);
-        if at >= HDRLEN + msg::ATTR_HDRLEN && at <= self.msg.len() {
+        if let Some(o) = self.offset(data) {
             let mut x = self.ext.get();
-            x.offs = Some((at - msg::ATTR_HDRLEN) as u32);
+            x.offs = Some(o);
             self.ext.set(x);
         }
+    }
+
+    /// Sets the missing attribute of the extended ack, as `NL_SET_ERR_ATTR_MISS` of Linux. `ty`
+    /// is the type of the attribute, and `nest` is the payload of the nest that must have it,
+    /// or `None` for the top level. Gives `EINVAL`.
+    pub fn missing(&self, nest: Option<&[u8]>, ty: u32) -> Errno {
+        let mut x = self.ext.get();
+        x.miss_type = Some(ty);
+        x.miss_nest = nest.and_then(|d| self.offset(d));
+        self.ext.set(x);
+        Errno::EINVAL
+    }
+
+    /// The offset of the header of the attribute with the payload `data` from the start of the
+    /// message, if `data` is in the message.
+    fn offset(&self, data: &[u8]) -> Option<u32> {
+        let base = self.msg.as_ptr() as usize;
+        let at = (data.as_ptr() as usize).wrapping_sub(base);
+        (at >= HDRLEN + msg::ATTR_HDRLEN && at <= self.msg.len())
+            .then(|| (at - msg::ATTR_HDRLEN) as u32)
     }
 
     /// The origin of a change that the request makes, for `notify`.
@@ -996,6 +1014,7 @@ pub fn init() {
     nsid::init();
     genl::init();
     uevent::init();
+    crate::ethtool::init();
 }
 
 /// The result of a message to the kernel.
