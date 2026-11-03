@@ -40,6 +40,8 @@ pub mod timer;
 mod vdso;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub use process::AUDIT_UNSET;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use process::{
     COMM_LEN, Delivery, ForkShare, INIT_PID, PID_MAX, Pid, Process, Restart, SharedFiles, SharedFs,
     SyscallInfo, Thread, VforkDone, create_init, current_thread, exit_group, exit_thread,

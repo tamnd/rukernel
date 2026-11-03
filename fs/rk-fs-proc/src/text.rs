@@ -751,6 +751,43 @@ pub fn coredump_filter(value: u32) -> Vec<u8> {
     format!("{value:08x}\n").into_bytes()
 }
 
+/// The names and the units of the resource limits, as `lnames` in fs/proc/base.c of Linux.
+const LIMIT_NAMES: [(&str, &str); 16] = [
+    ("Max cpu time", "seconds"),
+    ("Max file size", "bytes"),
+    ("Max data size", "bytes"),
+    ("Max stack size", "bytes"),
+    ("Max core file size", "bytes"),
+    ("Max resident set", "bytes"),
+    ("Max processes", "processes"),
+    ("Max open files", "files"),
+    ("Max locked memory", "bytes"),
+    ("Max address space", "bytes"),
+    ("Max file locks", "locks"),
+    ("Max pending signals", "signals"),
+    ("Max msgqueue size", "bytes"),
+    ("Max nice priority", ""),
+    ("Max realtime priority", ""),
+    ("Max realtime timeout", "us"),
+];
+
+/// The text of `/proc/PID/limits`, as `proc_pid_limits` in fs/proc/base.c of Linux. `limits` has
+/// the soft and the hard limit of each resource, and `u64::MAX` is no limit.
+pub fn limits(limits: &[(u64, u64); 16]) -> String {
+    let value = |v: u64| if v == u64::MAX { String::from("unlimited") } else { format!("{v}") };
+    let mut out = String::from(
+        "Limit                     Soft Limit           Hard Limit           Units     \n",
+    );
+    for (&(name, unit), &(cur, max)) in LIMIT_NAMES.iter().zip(limits) {
+        out += &format!("{name:<25} {:<20} {:<20} ", value(cur), value(max));
+        if !unit.is_empty() {
+            out += &format!("{unit:<10}");
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The text of `/proc/interrupts` with the `TLB` line of x86 only, as `show_interrupts` of Linux
 /// (fs/proc/interrupts.c, kernel/irq/proc.c) and `arch_show_interrupts`
 /// (arch/x86/kernel/irq.c). `tlb` has the count of each CPU, or is `None` if the CPUs drop TLB
@@ -1045,5 +1082,42 @@ mod tests {
         assert_eq!(number(-3), b"-3\n");
         assert_eq!(parse_number(b" 42\n"), Some(42));
         assert_eq!(parse_number(b"x"), None);
+    }
+
+    #[test]
+    fn limits_are_in_the_columns_of_linux() {
+        let mut l = [(u64::MAX, u64::MAX); 16];
+        l[3].0 = 8388608;
+        l[4].0 = 0;
+        l[7] = (1024, 1048576);
+        l[13] = (0, 0);
+        let text = limits(&l);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 17);
+        assert_eq!(
+            lines[0],
+            "Limit                     Soft Limit           Hard Limit           Units     "
+        );
+        assert_eq!(
+            lines[1],
+            "Max cpu time              unlimited            unlimited            seconds   "
+        );
+        assert_eq!(
+            lines[4],
+            "Max stack size            8388608              unlimited            bytes     "
+        );
+        assert_eq!(
+            lines[8],
+            "Max open files            1024                 1048576              files     "
+        );
+        assert_eq!(
+            lines[14],
+            "Max nice priority         0                    0                    "
+        );
+        assert_eq!(
+            lines[16],
+            "Max realtime timeout      unlimited            unlimited            us        "
+        );
+        assert!(text.ends_with("us        \n"));
     }
 }

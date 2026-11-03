@@ -121,6 +121,8 @@ pub mod cap {
     pub const LEASE: u32 = 28;
     /// Write records to the audit log of the kernel.
     pub const AUDIT_WRITE: u32 = 29;
+    /// Change the audit rules and the login UID that a process has set.
+    pub const AUDIT_CONTROL: u32 = 30;
     /// Set the capabilities of a file.
     pub const SETFCAP: u32 = 31;
     /// Skip the mandatory access control.

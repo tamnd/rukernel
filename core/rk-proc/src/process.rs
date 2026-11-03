@@ -142,6 +142,13 @@ static USER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// The serial number of the last process that was made.
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
+/// The value of `/proc/PID/loginuid` and `/proc/PID/sessionid` that tells that they are not set,
+/// as `AUDIT_UID_UNSET` and `AUDIT_SID_UNSET` of Linux.
+pub const AUDIT_UNSET: u32 = u32::MAX;
+
+/// The last audit session ID, as `session_id` in kernel/auditsc.c of Linux.
+static SESSION_ID: AtomicU32 = AtomicU32::new(0);
+
 /// The user CPU time of all the threads since boot, in timer ticks.
 pub fn user_ticks() -> u64 {
     USER_TICKS.load(Ordering::Relaxed)
@@ -197,6 +204,9 @@ pub struct Process {
     membarrier: AtomicU32,
     /// The execution domain and its flags, as `task_struct.personality` of Linux.
     personality: AtomicU32,
+    /// The login UID and the audit session ID, as `loginuid` and `sessionid` of the
+    /// `task_struct` of Linux. A child of `fork` gets the values of the parent.
+    audit: SpinLock<(u32, u32)>,
     /// The signal that the process gets when its parent ends, or 0, as `pdeath_signal` of Linux.
     /// A new process has none.
     pdeath_signal: AtomicU32,
@@ -868,6 +878,29 @@ impl Process {
         self.personality.store(value, Ordering::Relaxed);
     }
 
+    /// The login UID and the audit session ID, `AUDIT_UNSET` when they are not set.
+    pub fn audit_ids(&self) -> (u32, u32) {
+        *self.audit.lock()
+    }
+
+    /// Sets the login UID, as `audit_set_loginuid` in kernel/auditsc.c of Linux. A process can
+    /// set it once without rights. To change it again, the process needs `CAP_AUDIT_CONTROL`.
+    /// A set login UID gets a new session ID, and `AUDIT_UNSET` unsets the session ID too.
+    pub fn set_loginuid(&self, uid: u32) -> Result<(), Errno> {
+        let capable = self.cred().capable(rk_vfs::cred::cap::AUDIT_CONTROL);
+        let mut audit = self.audit.lock();
+        if audit.0 != AUDIT_UNSET && !capable {
+            return Err(Errno::EPERM);
+        }
+        let sid = if uid == AUDIT_UNSET {
+            AUDIT_UNSET
+        } else {
+            SESSION_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        };
+        *audit = (uid, sid);
+        Ok(())
+    }
+
     /// The signal that the process gets when its parent ends, or 0.
     pub fn pdeath_signal(&self) -> u32 {
         self.pdeath_signal.load(Ordering::Relaxed)
@@ -1149,6 +1182,7 @@ impl Process {
             oom_reaped: AtomicBool::new(false),
             membarrier: AtomicU32::new(0),
             personality: AtomicU32::new(0),
+            audit: SpinLock::new((AUDIT_UNSET, AUDIT_UNSET)),
             pdeath_signal: AtomicU32::new(0),
             thp_disable: AtomicBool::new(false),
             no_ctty: AtomicBool::new(false),
@@ -1922,6 +1956,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     child.set_coredump_filter(pp.coredump_filter());
     child.set_dumpable(pp.dumpable());
     child.set_personality(pp.personality());
+    *child.audit.lock() = *pp.audit.lock();
     child.set_thp_disable(pp.thp_disable());
     child.set_no_ctty(pp.no_ctty());
     child.cgroup.store(cgroup, Ordering::Relaxed);
