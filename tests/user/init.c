@@ -10111,6 +10111,47 @@ static void test_uevent(void)
 		umount("/sys");
 }
 
+/* A write to the file `uevent` of a device in /sys sends a synthetic event of that device. */
+static void test_uevent_synth(void)
+{
+	char buf[2048];
+	int fd = uevent_socket();
+	int len, bad, bad_errno;
+
+	check("uevent: a socket for the synthetic events", fd >= 0);
+	if (fd < 0)
+		return;
+	mkdir("/sys", 0755);
+	int mounted = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
+	len = write_text("/sys/class/mem/null/uevent", "add\n") == 0
+		      ? uevent_wait(fd, "add@/devices/virtual/mem/null", buf, sizeof(buf), 2000)
+		      : -1;
+	check("uevent: a write of add to uevent sends add with SYNTH_UUID=0",
+	      len > 0 && uevent_has(buf, len, "SUBSYSTEM=mem") &&
+		      uevent_has(buf, len, "SYNTH_UUID=0") && uevent_has(buf, len, "MAJOR=1") &&
+		      uevent_has(buf, len, "MINOR=3") && uevent_has(buf, len, "DEVNAME=null"));
+	len = write_text("/sys/class/net/lo/uevent",
+			 "change 01234567-89ab-cdef-0123-456789abcdef A=1 Key2=two") == 0
+		      ? uevent_wait(fd, "change@/devices/virtual/net/lo", buf, sizeof(buf), 2000)
+		      : -1;
+	check("uevent: a write with a UUID and variables sends them with the event",
+	      len > 0 && uevent_has(buf, len, "SUBSYSTEM=net") &&
+		      uevent_has(buf, len, "SYNTH_UUID=01234567-89ab-cdef-0123-456789abcdef") &&
+		      uevent_has(buf, len, "SYNTH_ARG_A=1") &&
+		      uevent_has(buf, len, "SYNTH_ARG_Key2=two") &&
+		      uevent_has(buf, len, "INTERFACE=lo"));
+	bad = write_text("/sys/class/mem/null/uevent", "explode\n");
+	bad_errno = errno;
+	check("uevent: a write of an unknown action gives EINVAL",
+	      bad == -1 && bad_errno == EINVAL);
+	bad = write_text("/sys/class/mem/null/uevent", "add not-a-uuid");
+	bad_errno = errno;
+	check("uevent: a write with a bad UUID gives EINVAL", bad == -1 && bad_errno == EINVAL);
+	close(fd);
+	if (mounted)
+		umount("/sys");
+}
+
 static void test_all(void)
 {
 	test_ids();
@@ -10154,6 +10195,7 @@ static void test_all(void)
 	test_sysfs();
 	test_loop();
 	test_uevent();
+	test_uevent_synth();
 	test_xattr();
 	test_fifo();
 	test_file_locks();
@@ -10195,8 +10237,10 @@ int main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "tty") == 0)
 		test_tty();
-	if (argc > 1 && strcmp(argv[1], "uevent") == 0)
+	if (argc > 1 && strcmp(argv[1], "uevent") == 0) {
 		test_uevent();
+		test_uevent_synth();
+	}
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)
 		test_smp();
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)

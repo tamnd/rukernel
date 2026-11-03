@@ -10,12 +10,17 @@
 //! The netlink layer gives the function that sends the datagrams with [`set_sink`]. An event of a
 //! character or block device goes to the sockets of all network namespaces. An event of a network
 //! device goes only to the sockets of its namespace, and the netlink layer sends it itself.
+//!
+//! A process can ask for an event with a write to the file `uevent` of a device in sysfs, as
+//! `udevadm trigger` does. [`parse_synth`] reads the text of the write.
 
+use crate::Result;
 use crate::device::{DeviceInfo, major, minor};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use rk_abi::Errno;
 use rk_frame::sync::Once;
 
 /// The action of an event, as `enum kobject_action` of Linux.
@@ -182,6 +187,77 @@ pub fn device(d: &DeviceInfo, action: Action, extra: &[&str]) {
     send(&device_event(d, action, extra));
 }
 
+/// Sends the event `action` that a process asks for with a write to the file `uevent` of the
+/// device `d`. `vars` come from [`parse_synth`]. They come before the variables of the device, as
+/// the variables of `kobject_uevent_env` of Linux come before the variables of `dev_uevent`.
+pub fn synth_device(d: &DeviceInfo, action: Action, vars: Vec<String>) {
+    let mut e = device_event(d, action, &[]);
+    e.vars.splice(0..0, vars);
+    send(&e);
+}
+
+/// The length of a UUID as text, `UUID_STRING_LEN` of Linux.
+const UUID_LEN: usize = 36;
+
+/// Tells if `s` is a UUID as text, as `uuid_is_valid` of Linux: 32 hexadecimal digits in groups
+/// of 8, 4, 4, 4 and 12, with a `-` between the groups.
+fn uuid_is_valid(s: &[u8]) -> bool {
+    s.len() == UUID_LEN
+        && s.iter().enumerate().all(|(i, &c)| {
+            if matches!(i, 8 | 13 | 18 | 23) { c == b'-' } else { c.is_ascii_hexdigit() }
+        })
+}
+
+/// Removes one `\n` or one 0 at the end of `s`, as a write with `echo` adds a `\n`.
+fn strip_end(s: &[u8]) -> &[u8] {
+    s.strip_suffix(b"\n").or_else(|| s.strip_suffix(b"\0")).unwrap_or(s)
+}
+
+/// The bytes `s` as text, or `EINVAL`.
+fn as_text(s: &[u8]) -> Result<&str> {
+    core::str::from_utf8(s).map_err(|_| Errno::EINVAL)
+}
+
+/// Reads the text of a write to the file `uevent` of a device, as `kobject_synth_uevent` of Linux.
+/// The text is `ACTION [UUID [KEY=VALUE...]]`, with a space between the words. Gives the action
+/// and the variables of the event: `SYNTH_UUID` with the UUID, or `SYNTH_UUID=0` when the text has
+/// only the action, and `SYNTH_ARG_KEY=VALUE` for each pair. A key has only letters and digits.
+///
+/// Gives `EINVAL` for an unknown action, a bad UUID or a bad pair.
+pub fn parse_synth(text: &[u8]) -> Result<(Action, Vec<String>)> {
+    let text = strip_end(text);
+    let (name, args) = match text.iter().position(|&c| c == b' ') {
+        Some(i) => (&text[..i], Some(&text[i + 1..])),
+        None => (text, None),
+    };
+    let action = Action::from_name(name).ok_or(Errno::EINVAL)?;
+    let Some(args) = args else {
+        return Ok((action, Vec::from([String::from("SYNTH_UUID=0")])));
+    };
+    let args = strip_end(args);
+    let (uuid, rest) = args.split_at_checked(UUID_LEN).ok_or(Errno::EINVAL)?;
+    if !uuid_is_valid(uuid) {
+        return Err(Errno::EINVAL);
+    }
+    let mut vars = Vec::from([format!("SYNTH_UUID={}", as_text(uuid)?)]);
+    if rest.is_empty() {
+        return Ok((action, vars));
+    }
+    // The pairs come after one space at least.
+    if rest[0] != b' ' {
+        return Err(Errno::EINVAL);
+    }
+    for pair in rest.split(|&c| c == b' ').filter(|p| !p.is_empty()) {
+        let eq = pair.iter().position(|&c| c == b'=').ok_or(Errno::EINVAL)?;
+        let (key, value) = (&pair[..eq], &pair[eq + 1..]);
+        if key.is_empty() || !key.iter().all(u8::is_ascii_alphanumeric) {
+            return Err(Errno::EINVAL);
+        }
+        vars.push(format!("SYNTH_ARG_{}={}", as_text(key)?, as_text(value)?));
+    }
+    Ok((action, vars))
+}
+
 /// Sends the event `action` of the device with the number `rdev` and the type `block`, if it is
 /// in the list of devices.
 pub fn device_number(block: bool, rdev: u64, action: Action, extra: &[&str]) {
@@ -251,6 +327,35 @@ mod tests {
         let msg = e.finish();
         assert!(seqnum() > before);
         assert!(strings(&msg).last().unwrap().starts_with("SEQNUM="));
+    }
+
+    #[test]
+    fn a_write_to_uevent_gives_the_action_and_the_synthetic_variables() {
+        let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+        assert_eq!(
+            parse_synth(b"add\n"),
+            Ok((Action::Add, Vec::from([String::from("SYNTH_UUID=0")])))
+        );
+        let text = format!("change {uuid} A=1 Bb2=two\n");
+        let (action, vars) = parse_synth(text.as_bytes()).unwrap();
+        assert_eq!(action, Action::Change);
+        assert_eq!(
+            vars,
+            [format!("SYNTH_UUID={uuid}"), "SYNTH_ARG_A=1".into(), "SYNTH_ARG_Bb2=two".into()]
+        );
+        assert_eq!(parse_synth(format!("remove {uuid}").as_bytes()).unwrap().1.len(), 1);
+        for bad in [
+            String::from("bad"),
+            String::new(),
+            String::from("add "),
+            String::from("add 0123"),
+            format!("add {uuid}X"),
+            format!("add {uuid} A"),
+            format!("add {uuid} A-B=1"),
+            String::from("add 01234567-89ab-cdef-0123-456789abcdeg"),
+        ] {
+            assert_eq!(parse_synth(bad.as_bytes()), Err(Errno::EINVAL), "{bad}");
+        }
     }
 
     #[test]

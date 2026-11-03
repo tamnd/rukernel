@@ -103,6 +103,15 @@ fn netdev_event(d: &NetDevice, event: dev::Event) {
     }
 }
 
+/// Sends the event `action` that a process asks for with a write to the file `uevent` of the
+/// network device `d`, as `uevent_store` of Linux. `vars` come from `rk_vfs::uevent::parse_synth`,
+/// before the variables of the device. It runs in the namespace of the device.
+pub fn synth(d: &NetDevice, action: Action, vars: Vec<String>) {
+    let mut e = net_event(d, action, None);
+    e.vars.splice(0..0, vars);
+    send_here(&e.finish());
+}
+
 /// Runs a message that a process sends to the kernel, as `uevent_net_rcv_skb` of Linux. A
 /// process with `CAP_SYS_ADMIN` can send an event to the sockets of its namespace. The event gets
 /// the next sequence number at its end.
