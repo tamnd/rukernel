@@ -8910,6 +8910,153 @@ static void test_nexthop(void)
 	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+/* Generic netlink, as net/netlink/genetlink.c of Linux: the values of <linux/genetlink.h>. */
+#define RK_GENL_ID_CTRL 0x10
+#define RK_CTRL_CMD_NEWFAMILY 1
+#define RK_CTRL_CMD_GETFAMILY 3
+#define RK_CTRL_ATTR_FAMILY_ID 1
+#define RK_CTRL_ATTR_FAMILY_NAME 2
+#define RK_CTRL_ATTR_VERSION 3
+#define RK_CTRL_ATTR_OPS 6
+#define RK_CTRL_ATTR_MCAST_GROUPS 7
+#define RK_CTRL_ATTR_OP_ID 1
+#define RK_CTRL_ATTR_OP_FLAGS 2
+#define RK_CTRL_ATTR_MCAST_GRP_NAME 1
+#define RK_CTRL_ATTR_MCAST_GRP_ID 2
+
+/* Starts a request to nlctrl with the command `cmd`: the header and struct genlmsghdr. */
+static void genl_msg(struct nlmsghdr *m, int type, int cmd, int flags)
+{
+	memset(m, 0, NLMSG_LENGTH(4));
+	m->nlmsg_len = NLMSG_LENGTH(4);
+	m->nlmsg_type = type;
+	m->nlmsg_flags = flags;
+	unsigned char *g = NLMSG_DATA(m);
+	g[0] = cmd;
+	g[1] = 1;
+}
+
+/* Gives the attribute `type` in the `len` bytes at `a`, or NULL. */
+static struct rtattr *genl_attr(struct rtattr *a, int len, int type)
+{
+	for (; RTA_OK(a, len); a = RTA_NEXT(a, len))
+		if ((a->rta_type & NLA_TYPE_MASK) == type)
+			return a;
+	return NULL;
+}
+
+/* Checks a CTRL_CMD_NEWFAMILY reply of nlctrl: the name, the ID 0x10, the version 2, the
+ * command CTRL_CMD_GETFAMILY with do, dump and a policy, and the group "notify" with the ID
+ * 0x10. */
+static int genl_nlctrl_ok(struct nlmsghdr *r, long n)
+{
+	if (n < (long)NLMSG_LENGTH(4) || r->nlmsg_type != RK_GENL_ID_CTRL)
+		return 0;
+	unsigned char *g = NLMSG_DATA(r);
+	if (g[0] != RK_CTRL_CMD_NEWFAMILY || g[1] != 2)
+		return 0;
+	struct rtattr *a = (struct rtattr *)(g + 4);
+	int len = r->nlmsg_len - NLMSG_LENGTH(4);
+	struct rtattr *name = genl_attr(a, len, RK_CTRL_ATTR_FAMILY_NAME);
+	struct rtattr *id = genl_attr(a, len, RK_CTRL_ATTR_FAMILY_ID);
+	struct rtattr *ver = genl_attr(a, len, RK_CTRL_ATTR_VERSION);
+	struct rtattr *ops = genl_attr(a, len, RK_CTRL_ATTR_OPS);
+	struct rtattr *grps = genl_attr(a, len, RK_CTRL_ATTR_MCAST_GROUPS);
+	if (!name || !id || !ver || !ops || !grps || strcmp(RTA_DATA(name), "nlctrl") != 0 ||
+	    *(unsigned short *)RTA_DATA(id) != RK_GENL_ID_CTRL || *(unsigned int *)RTA_DATA(ver) != 2)
+		return 0;
+	struct rtattr *op = genl_attr(RTA_DATA(ops), RTA_PAYLOAD(ops), 1);
+	struct rtattr *grp = genl_attr(RTA_DATA(grps), RTA_PAYLOAD(grps), 1);
+	if (!op || !grp)
+		return 0;
+	struct rtattr *op_id = genl_attr(RTA_DATA(op), RTA_PAYLOAD(op), RK_CTRL_ATTR_OP_ID);
+	struct rtattr *op_flags = genl_attr(RTA_DATA(op), RTA_PAYLOAD(op), RK_CTRL_ATTR_OP_FLAGS);
+	struct rtattr *grp_id = genl_attr(RTA_DATA(grp), RTA_PAYLOAD(grp), RK_CTRL_ATTR_MCAST_GRP_ID);
+	struct rtattr *grp_name =
+		genl_attr(RTA_DATA(grp), RTA_PAYLOAD(grp), RK_CTRL_ATTR_MCAST_GRP_NAME);
+	return op_id && op_flags && grp_id && grp_name &&
+	       *(unsigned int *)RTA_DATA(op_id) == RK_CTRL_CMD_GETFAMILY &&
+	       *(unsigned int *)RTA_DATA(op_flags) == 0xe &&
+	       *(unsigned int *)RTA_DATA(grp_id) == RK_GENL_ID_CTRL &&
+	       strcmp(RTA_DATA(grp_name), "notify") == 0;
+}
+
+/* The protocol NETLINK_GENERIC and its family nlctrl, as `genl ctrl list` and `genl ctrl get
+ * name nlctrl` use them. */
+static void test_genl(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_GENERIC);
+	check("genl: socket of NETLINK_GENERIC", fd >= 0);
+	if (fd < 0)
+		return;
+	int rt = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	struct sockaddr_nl a = { .nl_family = AF_NETLINK, .nl_pid = 0x7a000001 };
+	check("genl: each protocol has its own port IDs",
+	      bind(rt, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+		      bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0);
+	close(rt);
+
+	union {
+		struct nlmsghdr h;
+		char buf[256];
+	} m;
+	char reply[4096];
+	struct nlmsghdr *r = (struct nlmsghdr *)reply;
+
+	/* genl ctrl get name nlctrl */
+	genl_msg(&m.h, RK_GENL_ID_CTRL, RK_CTRL_CMD_GETFAMILY, 0);
+	nl_put(&m.h, RK_CTRL_ATTR_FAMILY_NAME, "nlctrl", 7);
+	long n = nl_ask(fd, &m.h, reply, sizeof(reply));
+	check("genl: CTRL_CMD_GETFAMILY by the name gives nlctrl", genl_nlctrl_ok(r, n));
+
+	unsigned short id = RK_GENL_ID_CTRL;
+	genl_msg(&m.h, RK_GENL_ID_CTRL, RK_CTRL_CMD_GETFAMILY, 0);
+	nl_put(&m.h, RK_CTRL_ATTR_FAMILY_ID, &id, 2);
+	n = nl_ask(fd, &m.h, reply, sizeof(reply));
+	check("genl: CTRL_CMD_GETFAMILY by the ID gives nlctrl", genl_nlctrl_ok(r, n));
+
+	genl_msg(&m.h, RK_GENL_ID_CTRL, RK_CTRL_CMD_GETFAMILY, 0);
+	nl_put(&m.h, RK_CTRL_ATTR_FAMILY_NAME, "rk-none", 8);
+	check("genl: an unknown family gives ENOENT", nl_talk(fd, &m.h) == -ENOENT);
+	genl_msg(&m.h, RK_GENL_ID_CTRL, RK_CTRL_CMD_GETFAMILY, 0);
+	check("genl: CTRL_CMD_GETFAMILY without a family gives EINVAL",
+	      nl_talk(fd, &m.h) == -EINVAL);
+	genl_msg(&m.h, RK_GENL_ID_CTRL, 99, 0);
+	check("genl: an unknown command gives EOPNOTSUPP", nl_talk(fd, &m.h) == -EOPNOTSUPP);
+	genl_msg(&m.h, 1000, RK_CTRL_CMD_GETFAMILY, 0);
+	check("genl: an unknown family ID gives ENOENT", nl_talk(fd, &m.h) == -ENOENT);
+
+	/* genl ctrl list */
+	genl_msg(&m.h, RK_GENL_ID_CTRL, RK_CTRL_CMD_GETFAMILY, NLM_F_DUMP);
+	n = nl_ask(fd, &m.h, reply, sizeof(reply));
+	int nlctrl = 0, done = 0;
+	for (int i = 0; i < 8 && !done && n > 0; i++) {
+		for (r = (struct nlmsghdr *)reply; NLMSG_OK(r, n); r = NLMSG_NEXT(r, n)) {
+			if (r->nlmsg_type == RK_GENL_ID_CTRL && (r->nlmsg_flags & NLM_F_MULTI))
+				nlctrl |= genl_nlctrl_ok(r, r->nlmsg_len);
+			done |= r->nlmsg_type == NLMSG_DONE;
+		}
+		if (!done)
+			n = recv(fd, reply, sizeof(reply), 0);
+	}
+	check("genl: the dump of the families has nlctrl", nlctrl && done);
+
+	int g = RK_GENL_ID_CTRL;
+	check("genl: a socket joins the group notify",
+	      setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &g, sizeof(g)) == 0);
+	unsigned int groups[4] = { 0 };
+	socklen_t glen = sizeof(groups);
+	check("genl: NETLINK_LIST_MEMBERSHIPS has 64 groups",
+	      getsockopt(fd, SOL_NETLINK, NETLINK_LIST_MEMBERSHIPS, groups, &glen) == 0 &&
+		      glen == 8 && groups[0] == 1u << 15 && groups[1] == 0);
+	g = 65;
+	errno = 0;
+	check("genl: the group 65 gives EINVAL",
+	      setsockopt(fd, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &g, sizeof(g)) == -1 &&
+		      errno == EINVAL);
+	close(fd);
+}
+
 /* A veth pair, as drivers/net/veth.c of Linux, with its ends in two network namespaces. */
 static void test_veth(void)
 {
@@ -8968,6 +9115,7 @@ static void test_inet(int port)
 	test_tun6();
 	test_veth();
 	test_nexthop();
+	test_genl();
 	test_slip();
 	test_tcp_lo();
 	test_tcp_host(port);

@@ -9,6 +9,7 @@
 //! layout of each message is the layout of Linux, because spec/10 section 10.4 asks for replies
 //! that are byte identical.
 
+pub mod genl;
 pub mod link;
 pub mod msg;
 pub mod nsid;
@@ -28,9 +29,9 @@ use msg::{HDRLEN, Header};
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
     NETLINK_ADD_MEMBERSHIP, NETLINK_BROADCAST_ERROR, NETLINK_CAP_ACK, NETLINK_DROP_MEMBERSHIP,
-    NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, NETLINK_LIST_MEMBERSHIPS, NETLINK_LISTEN_ALL_NSID,
-    NETLINK_NO_ENOBUFS, NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_FILTERED,
-    NLM_F_ECHO, NLM_F_REQUEST, NLMSG_MIN_TYPE,
+    NETLINK_EXT_ACK, NETLINK_GENERIC, NETLINK_GET_STRICT_CHK, NETLINK_LIST_MEMBERSHIPS,
+    NETLINK_LISTEN_ALL_NSID, NETLINK_NO_ENOBUFS, NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK,
+    NLM_F_DUMP, NLM_F_DUMP_FILTERED, NLM_F_ECHO, NLM_F_REQUEST, NLMSG_MIN_TYPE,
 };
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::rtnetlink::{
@@ -140,8 +141,15 @@ fn sockets() -> Vec<Arc<NetlinkSocket>> {
 }
 
 /// Finds the bound socket with the port ID `portid`.
-fn lookup(portid: u32) -> Option<Arc<NetlinkSocket>> {
-    sockets().into_iter().find(|s| s.bound.load(Ordering::Acquire) && s.portid() == portid)
+fn lookup(protocol: u32, portid: u32) -> Option<Arc<NetlinkSocket>> {
+    sockets()
+        .into_iter()
+        .find(|s| s.protocol == protocol && s.bound.load(Ordering::Acquire) && s.portid() == portid)
+}
+
+/// The number of multicast groups of the protocol `protocol`, as `nl_table[].groups` of Linux.
+fn ngroups(protocol: u32) -> u32 {
+    if protocol == NETLINK_GENERIC { genl::NGROUPS } else { RTNLGRP_MAX }
 }
 
 /// Tells if the current process has `CAP_NET_ADMIN`.
@@ -180,7 +188,10 @@ fn first_group(groups: u32) -> u32 {
 
 /// Checks a multicast group for `bind` and `NETLINK_ADD_MEMBERSHIP`, as `rtnetlink_bind` of
 /// Linux.
-fn bind_group(group: u32) -> Result<()> {
+fn bind_group(protocol: u32, group: u32) -> Result<()> {
+    if protocol == NETLINK_GENERIC {
+        return genl::bind(group);
+    }
     if (group == RTNLGRP_IPV4_MROUTE_R || group == RTNLGRP_IPV6_MROUTE_R) && !net_admin() {
         return Err(Errno::EPERM);
     }
@@ -188,7 +199,8 @@ fn bind_group(group: u32) -> Result<()> {
 }
 
 impl NetlinkSocket {
-    /// Makes a socket, as `netlink_create` of Linux. Only `NETLINK_ROUTE` is here.
+    /// Makes a socket, as `netlink_create` of Linux. `NETLINK_ROUTE` and `NETLINK_GENERIC` are
+    /// here.
     ///
     /// # Errors
     ///
@@ -198,7 +210,7 @@ impl NetlinkSocket {
         if kind != SOCK_RAW && kind != SOCK_DGRAM {
             return Err(Errno::ESOCKTNOSUPPORT);
         }
-        if protocol != NETLINK_ROUTE {
+        if protocol != NETLINK_ROUTE && protocol != NETLINK_GENERIC {
             return Err(Errno::EPROTONOSUPPORT);
         }
         let sock = Arc::new_cyclic(|me| Self {
@@ -241,14 +253,17 @@ impl NetlinkSocket {
     }
 
     /// Binds the socket to `portid`, as `netlink_insert` of Linux. Gives `EADDRINUSE` if
-    /// another socket has the port ID. A socket that is bound keeps its port ID.
+    /// another socket of the protocol has the port ID. A socket that is bound keeps its port ID.
     fn insert(&self, portid: u32) -> Result<()> {
         let list = SOCKETS.lock();
         if self.bound.load(Ordering::Acquire) {
             return Ok(());
         }
         let taken = list.iter().filter_map(Weak::upgrade).any(|s| {
-            !core::ptr::eq(&*s, self) && s.bound.load(Ordering::Acquire) && s.portid() == portid
+            !core::ptr::eq(&*s, self)
+                && s.protocol == self.protocol
+                && s.bound.load(Ordering::Acquire)
+                && s.portid() == portid
         });
         if taken {
             return Err(Errno::EADDRINUSE);
@@ -345,7 +360,12 @@ impl NetlinkSocket {
             let mut err = 0;
             let ext = Cell::new(msg::ExtAck::default());
             if h.flags & NLM_F_REQUEST as u16 != 0 && u32::from(h.ty) >= NLMSG_MIN_TYPE {
-                match rtnl_rcv(self, h, m, &ext) {
+                let r = if self.protocol == NETLINK_GENERIC {
+                    genl::rcv(self, h, m, &ext)
+                } else {
+                    rtnl_rcv(self, h, m, &ext)
+                };
+                match r {
                     Ok(Flow::Done) => {}
                     // A dump that starts sends no ack.
                     Ok(Flow::Dump) => continue,
@@ -440,7 +460,7 @@ impl Socket for NetlinkSocket {
             return Err(Errno::EINVAL);
         }
         for g in (0..32).filter(|g| groups & (1 << g) != 0) {
-            bind_group(g + 1)?;
+            bind_group(self.protocol, g + 1)?;
         }
         if !bound {
             if portid != 0 { self.insert(portid)? } else { self.autobind()? }
@@ -520,13 +540,13 @@ impl Socket for NetlinkSocket {
         }
         let portid = self.portid();
         if dst_group != 0 {
-            broadcast(Some(self), &msg.data, portid, dst_portid, dst_group);
+            broadcast(self.protocol, Some(self), &msg.data, portid, dst_portid, dst_group);
         }
         if dst_portid == 0 {
             self.input(&msg.data);
             return Ok(len);
         }
-        let Some(peer) = lookup(dst_portid) else {
+        let Some(peer) = lookup(self.protocol, dst_portid) else {
             return Err(Errno::ECONNREFUSED);
         };
         let _ = nonblock;
@@ -623,11 +643,11 @@ impl Socket for NetlinkSocket {
             NETLINK_EXT_ACK => F_EXT_ACK,
             NETLINK_GET_STRICT_CHK => F_STRICT_CHK,
             NETLINK_LIST_MEMBERSHIPS => {
-                // The bitmap has `RTNLGRP_MAX` bits, in words of 32 bits.
+                // The bitmap has a bit for each group of the protocol, in words of 32 bits.
                 if !s.groups_alloc {
                     return Ok(Vec::new());
                 }
-                let words = RTNLGRP_MAX.div_ceil(32) as usize;
+                let words = ngroups(self.protocol).div_ceil(32) as usize;
                 return Ok((0..words)
                     .flat_map(|w| ((s.groups >> (32 * w)) as u32).to_ne_bytes())
                     .collect());
@@ -655,11 +675,11 @@ impl Socket for NetlinkSocket {
             NETLINK_PKTINFO => F_PKTINFO,
             NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
                 self.state.lock().groups_alloc = true;
-                if val == 0 || val > RTNLGRP_MAX {
+                if val == 0 || val > ngroups(self.protocol) {
                     return Err(Errno::EINVAL);
                 }
                 if name == NETLINK_ADD_MEMBERSHIP {
-                    bind_group(val)?;
+                    bind_group(self.protocol, val)?;
                 }
                 self.set_group(val, name == NETLINK_ADD_MEMBERSHIP);
                 return Ok(());
@@ -725,15 +745,26 @@ impl Socket for NetlinkSocket {
     }
 }
 
-/// Sends `data` to each socket in the group `group`, as `netlink_broadcast` of Linux. The
-/// sender `from` and the socket with the port ID `exclude` do not get it.
-fn broadcast(from: Option<&NetlinkSocket>, data: &[u8], portid: u32, exclude: u32, group: u32) {
-    if group == 0 || group > RTNLGRP_MAX {
+/// Sends `data` to each socket of the protocol `protocol` in the group `group`, as
+/// `netlink_broadcast` of Linux. The sender `from` and the socket with the port ID `exclude` do
+/// not get it.
+fn broadcast(
+    protocol: u32,
+    from: Option<&NetlinkSocket>,
+    data: &[u8],
+    portid: u32,
+    exclude: u32,
+    group: u32,
+) {
+    if group == 0 || group > ngroups(protocol) {
         return;
     }
     let bit = 1u64 << (group - 1);
     for s in sockets() {
-        if from.is_some_and(|f| core::ptr::eq(f, &*s)) || s.portid() == exclude {
+        if s.protocol != protocol
+            || from.is_some_and(|f| core::ptr::eq(f, &*s))
+            || s.portid() == exclude
+        {
             continue;
         }
         if s.state.lock().groups & bit != 0 {
@@ -763,9 +794,9 @@ impl Origin {
 /// the group.
 pub fn notify(group: u32, msg: Vec<u8>, origin: Origin) {
     let exclude = if origin.echo { origin.portid } else { 0 };
-    broadcast(None, &msg, 0, exclude, group);
+    broadcast(NETLINK_ROUTE, None, &msg, 0, exclude, group);
     if origin.echo
-        && let Some(s) = lookup(origin.portid)
+        && let Some(s) = lookup(NETLINK_ROUTE, origin.portid)
     {
         s.deliver(msg, 0, 0);
     }
@@ -774,11 +805,16 @@ pub fn notify(group: u32, msg: Vec<u8>, origin: Origin) {
 /// Tells if a socket listens to the group `group`. A family can skip the work of a
 /// notification that no socket gets.
 pub fn has_listeners(group: u32) -> bool {
-    if group == 0 || group > RTNLGRP_MAX {
+    listeners(NETLINK_ROUTE, group)
+}
+
+/// Tells if a socket of the protocol `protocol` listens to the group `group`.
+fn listeners(protocol: u32, group: u32) -> bool {
+    if group == 0 || group > ngroups(protocol) {
         return false;
     }
     let bit = 1u64 << (group - 1);
-    sockets().iter().any(|s| s.state.lock().groups & bit != 0)
+    sockets().iter().any(|s| s.protocol == protocol && s.state.lock().groups & bit != 0)
 }
 
 /// A request that a handler runs.
@@ -796,7 +832,25 @@ pub struct Request<'a> {
     ext: &'a Cell<msg::ExtAck>,
 }
 
-impl Request<'_> {
+impl<'a> Request<'a> {
+    /// A request on the socket `sock`.
+    fn new(
+        sock: &'a NetlinkSocket,
+        hdr: Header,
+        msg: &'a [u8],
+        ext: &'a Cell<msg::ExtAck>,
+    ) -> Self {
+        Self {
+            hdr,
+            msg,
+            portid: sock.portid(),
+            strict: sock.state.lock().flags & F_STRICT_CHK != 0,
+            sock,
+            filtered: Cell::new(false),
+            ext,
+        }
+    }
+
     /// The data of the message after the header, at most `nlmsg_len`.
     pub fn payload(&self) -> &[u8] {
         let end = (self.hdr.len as usize).min(self.msg.len());
@@ -931,6 +985,7 @@ pub fn init() {
     }
     link::init();
     nsid::init();
+    genl::init();
 }
 
 /// The result of a message to the kernel.
@@ -958,16 +1013,7 @@ fn rtnl_rcv(sock: &NetlinkSocket, h: Header, m: &[u8], ext: &Cell<msg::ExtAck>) 
     if kind != KIND_GET && !net_admin() {
         return Err(Errno::EPERM);
     }
-    let strict = sock.state.lock().flags & F_STRICT_CHK != 0;
-    let req = Request {
-        hdr: h,
-        msg: m,
-        portid: sock.portid(),
-        strict,
-        sock,
-        filtered: Cell::new(false),
-        ext,
-    };
+    let req = Request::new(sock, h, m, ext);
     let handlers = HANDLERS.lock().clone();
     let find = |f: u8, dump: bool| {
         handlers
