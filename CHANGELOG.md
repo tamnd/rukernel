@@ -12,6 +12,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The generic netlink family `ethtool`, as net/ethtool/netlink.c of Linux. It has `STRSET_GET`, `LINKINFO_GET` and `LINKINFO_SET`, `LINKMODES_GET` and `LINKMODES_SET`, `LINKSTATE_GET`, `FEATURES_GET` and `FEATURES_SET`, `RINGS_GET` and `CHANNELS_GET`, with the compact and the verbose bitsets, the dumps, the extended ack and the notices of the group `monitor`. A network device now has the offload features of Linux (`hw`, `wanted` and `active`). The ioctl `SIOCETHTOOL` has `ETHTOOL_GDRVINFO`, `ETHTOOL_GLINK`, `ETHTOOL_GPERMADDR` and `ETHTOOL_GLINKSETTINGS`. virtio-net, veth and TUN give their driver data and link settings (#538).
 - Time namespaces, as kernel/time/namespace.c of Linux. `unshare` and `clone3` with `CLONE_NEWTIME` make a namespace for the children, `/proc/PID/timens_offsets` sets its offsets of `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` until the first process goes in, and `setns` with a file of `/proc/PID/ns/time` or a pidfd moves the caller. `clock_gettime` in the vDSO and in the kernel, the absolute times of `clock_nanosleep`, `timer_settime`, `timerfd_settime` and `futex`, the uptime of `sysinfo` and `/proc/uptime`, and the `btime` of `/proc/stat` use the offsets. tools/kselftest/build.sh builds the `timens` tests (#536).
 
+### Fixed
+
+- `mount` with `MS_BIND` and `MS_REC` copies the mounts under the source, as `copy_tree` of fs/namespace.c of Linux. Before, it made only the mount of the source, so the root that systemd makes for a service with `MS_BIND` and `MS_REC` of `/` had no `/sys/fs/cgroup`, and `systemd-logind` failed at the step `NAMESPACE` (#536).
+- `/proc/PID/mountinfo` can be in an epoll set, and has an event when the mounts change, as `mounts_poll` of fs/proc_namespace.c of Linux. Before, `epoll_ctl` gave `EPERM` for it, so libmount closed its monitor, and systemd failed to see the mounts that it made ("Failed to drain libmount events") (#536).
+
 ## [0.5.1] - 2026-11-04
 
 ### Added

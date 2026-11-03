@@ -321,6 +321,51 @@ fn bind_mounts() {
 }
 
 #[test]
+fn recursive_bind_copies_the_mounts_under_the_source() {
+    let (fs, root) = setup();
+    let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
+    fs.mkdir(&root, b"/a", 0o755).unwrap();
+    fs.mkdir(&root, b"/a/d", 0o755).unwrap();
+    fs.mkdir(&root, b"/a/u", 0o755).unwrap();
+    fs.mkdir(&root, b"/b", 0o755).unwrap();
+    fs.mkdir(&root, b"/c", 0o755).unwrap();
+    fs.mount(new(0o755), &root, b"/a/d", tmp.clone()).unwrap();
+    fs.mkdir(&root, b"/a/d/e", 0o755).unwrap();
+    fs.mount(new(0o755), &root, b"/a/d/e", tmp.clone()).unwrap();
+    write_file(&fs, &root, b"/a/d/e/x", b"x");
+    fs.mount(new(0o755), &root, b"/a/u", tmp.clone()).unwrap();
+    write_file(&fs, &root, b"/a/u/y", b"y");
+    let ns = fs.namespace().clone();
+    let u = fs.resolve(&root, b"/a/u", true).unwrap();
+    ns.set_propagation(&u, PropagationType::Unbindable, false).unwrap();
+    let a = fs.resolve(&root, b"/a", true).unwrap();
+    let b = fs.resolve(&root, b"/b", true).unwrap();
+    let c = fs.resolve(&root, b"/c", true).unwrap();
+    let count = ns.mounts().len();
+
+    // Without `MS_REC`, only the tree of the mount of the source goes.
+    ns.bind(&a, &c).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/c/d/e/x").err(), Some(Errno::ENOENT));
+    assert_eq!(ns.mounts().len(), count + 1);
+
+    // With `MS_REC`, the mounts under the source go too, but not an unbindable mount.
+    ns.bind_tree(&a, &b, true).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/b/d/e/x").as_deref(), Ok(&b"x"[..]));
+    assert_eq!(read_file(&fs, &root, b"/b/u/y").err(), Some(Errno::ENOENT));
+    assert_eq!(ns.mounts().len(), count + 4);
+
+    // A recursive bind of the root on a directory under it does not copy the new mount.
+    fs.mkdir(&root, b"/r", 0o755).unwrap();
+    let r = fs.resolve(&root, b"/r", true).unwrap();
+    let count = ns.mounts().len();
+    ns.bind_tree(&root, &r, true).unwrap();
+    assert_eq!(read_file(&fs, &root, b"/r/b/d/e/x").as_deref(), Ok(&b"x"[..]));
+    assert_eq!(read_file(&fs, &root, b"/r/r/b").err(), Some(Errno::ENOENT));
+    // Each mount gets a copy, but not the unbindable mount.
+    assert_eq!(ns.mounts().len(), 2 * count - 1);
+}
+
+#[test]
 fn mounts_propagate_to_peers_and_slaves() {
     let (fs, root) = setup();
     let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };

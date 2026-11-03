@@ -2997,8 +2997,9 @@ static void test_unix(void)
 static void test_mount(void)
 {
 	struct statfs st;
+	struct epoll_event ev;
 	char buf[8] = {0};
-	int fd;
+	int fd, ep;
 
 	mkdir("/mnt", 0755);
 	mkdir("/mnt2", 0755);
@@ -3011,6 +3012,27 @@ static void test_mount(void)
 	fd = open("/mnt2/f", O_RDONLY);
 	check("the bind mount shows the file", fd >= 0 && read(fd, buf, 4) == 4 && !strcmp(buf, "data"));
 	close(fd);
+	/* libmount, and so systemd, watches /proc/self/mountinfo with EPOLLIN | EPOLLET. */
+	mkdir("/mnt/sub", 0755);
+	mkdir("/mnt3", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	ep = epoll_create1(EPOLL_CLOEXEC);
+	fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+	ev.events = EPOLLIN | EPOLLET;
+	ev.data.u64 = 7;
+	check("epoll takes /proc/self/mountinfo", epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) == 0);
+	while (epoll_wait(ep, &ev, 1, 0) > 0)
+		;
+	check("mount tmpfs under the tmpfs", mount("none", "/mnt/sub", "tmpfs", 0, NULL) == 0);
+	check("epoll sees the mount in /proc/self/mountinfo", epoll_wait(ep, &ev, 1, 0) == 1 && ev.data.u64 == 7);
+	close(fd);
+	close(ep);
+	umount("/proc");
+	close(open("/mnt/sub/g", O_CREAT | O_RDWR, 0644));
+	check("mount --rbind copies the mounts under the source",
+	      mount("/mnt", "/mnt3", NULL, MS_BIND | MS_REC, NULL) == 0 && access("/mnt3/sub/g", F_OK) == 0);
+	check("umount the copies", umount("/mnt3/sub") == 0 && umount("/mnt3") == 0 && umount("/mnt/sub") == 0);
+	rmdir("/mnt3");
 	check("mount --make-private", mount(NULL, "/mnt", NULL, MS_PRIVATE, NULL) == 0);
 	check("mount -o remount,ro", mount(NULL, "/mnt", NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0);
 	errno = 0;

@@ -948,8 +948,61 @@ impl MountNamespace {
     /// The new mount is a peer of a shared source, and a slave of the master of a slave source,
     /// as the shared subtrees of Linux.
     pub fn bind(&self, from: &Location, at: &Location) -> Result<Arc<Mount>> {
+        self.bind_tree(from, at, false)
+    }
+
+    /// Mounts the tree at `from` on `at`, as `bind`. If `recursive` is true (`MS_BIND` with
+    /// `MS_REC`), each mount of the name space under `from` also gets a copy at the same place
+    /// in the new mount, as `copy_tree` of Linux. An unbindable mount and the mounts under it
+    /// get no copy. The copies are made before the new mount is attached, so a tree that holds
+    /// `at` does not get a copy of the new mount.
+    pub fn bind_tree(&self, from: &Location, at: &Location, recursive: bool) -> Result<Arc<Mount>> {
         let mount = Self::clone_tree(from)?;
+        let mut copies: Vec<(Arc<Mount>, Arc<Mount>)> =
+            Vec::from([(from.mount.clone(), mount.clone())]);
+        let mut children: Vec<(usize, Arc<Mount>, Location)> = Vec::new();
+        if recursive && self.contains(&from.mount) {
+            let all = self.mounts();
+            // A mount can be in the list before the mount that it is on (after `MS_MOVE`), so
+            // each pass copies the mounts whose parent has a copy, until no mount is new.
+            loop {
+                let mut new = false;
+                for (i, m) in all.iter().enumerate() {
+                    if copies.iter().any(|(o, _)| Arc::ptr_eq(o, m)) {
+                        continue;
+                    }
+                    let Some(place) = m.mountpoint() else { continue };
+                    let Some(parent) = copies
+                        .iter()
+                        .find(|(o, _)| Arc::ptr_eq(o, &place.mount))
+                        .map(|(_, c)| c.clone())
+                    else {
+                        continue;
+                    };
+                    let p = m.propagation();
+                    if p.unbindable
+                        || (Arc::ptr_eq(&place.mount, &from.mount)
+                            && !place.dentry.is_under(&from.dentry))
+                    {
+                        continue;
+                    }
+                    let copy = Mount::new(m.root.clone(), m.source());
+                    copy.set_propagation(p);
+                    copies.push((m.clone(), copy.clone()));
+                    children.push((i, copy, Location { mount: parent, dentry: place.dentry }));
+                    new = true;
+                }
+                if !new {
+                    break;
+                }
+            }
+            // The copies keep the order of the list, so the last mount on a place stays on top.
+            children.sort_by_key(|(i, _, _)| *i);
+        }
         self.attach(&mount, at)?;
+        for (_, copy, place) in &children {
+            self.attach_one(copy, place);
+        }
         Ok(mount)
     }
 
