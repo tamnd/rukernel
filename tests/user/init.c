@@ -11461,6 +11461,10 @@ static void test_nftables(void)
 #define RK_NFT_META_L4PROTO 16
 #define RK_NFTA_COUNTER_PACKETS 2
 #define RK_NFT_MSG_DELCHAIN 5
+#define RK_NFTA_CT_DREG 1
+#define RK_NFTA_CT_KEY 2
+#define RK_NFT_CT_STATE 0
+#define RK_NF_CT_STATE_NEW 8
 
 /* Starts the expression `name` in the rule of the batch b. Gives the nest of its data. */
 static struct rtattr *nft_expr(struct nft_batch *b, const char *name, struct rtattr **elem)
@@ -11640,6 +11644,30 @@ static void test_nft_exprs(void)
 	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
 	nft_str(&b, RK_NFTA_CHAIN_NAME, "sub");
 	check("nft: a chain that a rule jumps to gives EBUSY", nft_send(fd, &b, 1) == -EBUSY);
+
+	/* `udp dport 12 ct state new drop`: the rule turns connection tracking on. */
+	nft_begin(&b, 0);
+	x = nft_rule(&b, "out");
+	nft_udp_dport(&b, 12);
+	d = nft_expr(&b, "ct", &e);
+	nft_be32(&b, RK_NFTA_CT_KEY, RK_NFT_CT_STATE);
+	nft_be32(&b, RK_NFTA_CT_DREG, RK_NFT_REG_1);
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "cmp", &e);
+	nft_be32(&b, RK_NFTA_CMP_SREG, RK_NFT_REG_1);
+	nft_be32(&b, RK_NFTA_CMP_OP, RK_NFT_CMP_EQ);
+	unsigned int ct_new = RK_NF_CT_STATE_NEW;
+	struct rtattr *v = nl_put(b.cur, RK_NFTA_CMP_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &ct_new, 4);
+	nl_end(b.cur, v);
+	nft_expr_end(&b, d, e);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	check("nft: a rule with ct state", nft_send(fd, &b, 1) == 0);
+	check("nft: ct state new drop gives EPERM to sendto", nft_udp_send_port(12) == EPERM);
+	char text[32];
+	check("conntrack: the ct rule tracks the packets",
+	      nft_udp_send_port(13) == 0 && nf_sysctl("nf_conntrack_count", text, sizeof(text)) > 0 && atoi(text) > 0);
 
 	nft_begin(&b, 0);
 	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
