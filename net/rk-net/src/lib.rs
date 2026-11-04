@@ -25,6 +25,7 @@ pub mod ethtool;
 pub mod features;
 pub mod filter;
 pub mod ioctl;
+pub mod netfilter;
 pub mod netlink;
 pub mod ns;
 mod options;

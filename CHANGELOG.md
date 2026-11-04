@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - `SO_ATTACH_FILTER`, `SO_DETACH_FILTER` and `SO_LOCK_FILTER` on netlink sockets, as `sk_filter` in `netlink_unicast` and `netlink_broadcast` of Linux. The classic BPF filter of the socket runs on each datagram before it goes in the queue, so the udev monitor of systemd can attach its filter to a `NETLINK_KOBJECT_UEVENT` socket (#539).
+- The netfilter hooks of IPv4 and IPv6, as net/netfilter/core.c of Linux. Each namespace has a list of hooks for `NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_IN`, `NF_INET_FORWARD`, `NF_INET_LOCAL_OUT` and `NF_INET_POST_ROUTING`, in the order of the priority, with `nf_register_net_hook` and `nf_unregister_net_hook`. The input, forward and output paths of IPv4 and IPv6 run the hooks with the verdicts `NF_ACCEPT`, `NF_DROP` (with an error), `NF_STOLEN` and `NF_QUEUE`. A path with no hook only reads an atomic counter, as `nf_hooks_needed`, and takes no lock. When an output hook is active, the host makes the fragments of a packet after `NF_INET_POST_ROUTING`, as `ip_finish_output` (#542).
 
 ## [0.5.3] - 2026-11-04
 

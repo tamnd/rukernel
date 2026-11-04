@@ -45,6 +45,10 @@ use rk_net::buf::{HEADROOM, NetBuf};
 use rk_net::consts::AF_INET6;
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::ether::{EthHeader, MacAddr};
+use rk_net::netfilter::{
+    NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_IPV6,
+    NfResult, nf_hook, nf_hook_active,
+};
 use rk_net::ns::PerNet;
 use rk_vfs::inode::Result;
 
@@ -446,13 +450,25 @@ pub(crate) fn output(next: &Next6, out: &Out6, payload: &[u8]) -> Result<()> {
         h.tclass = out.tclass;
         h.to_bytes()
     };
-    if HLEN + len <= mtu {
+    if HLEN + len <= mtu || nf_output_active() {
         let mut buf = NetBuf::new(HEADROOM, HLEN + len);
         buf.extend_from_slice(&header(first, len));
         buf.extend_from_slice(&out.ext);
         buf.extend_from_slice(payload);
-        return transmit(&dev, next, buf);
+        return ip6_local_out(&dev, next, out, buf, mtu);
     }
+    fragment(&dev, next, out, payload, mtu)
+}
+
+/// Sends `payload` in fragments of at most `mtu` bytes, as `ip6_fragment` of Linux.
+fn fragment(dev: &NetDevice, next: &Next6, out: &Out6, payload: &[u8], mtu: usize) -> Result<()> {
+    let first = if out.ext.is_empty() { out.next } else { ipv6::NEXT_ROUTING };
+    let header = |next: u8, len: usize| {
+        let mut h = Header::new(out.src, out.dst, next, len);
+        h.hops = out.hops;
+        h.tclass = out.tclass;
+        h.to_bytes()
+    };
     // The fragment header goes after the routing header, which is in each fragment. The next
     // header of the routing header becomes the fragment header.
     let mut ext = out.ext.clone();
@@ -475,7 +491,7 @@ pub(crate) fn output(next: &Next6, out: &Out6, payload: &[u8]) -> Result<()> {
         buf.extend_from_slice(&f.to_bytes());
         buf.extend_from_slice(&payload[offset..offset + n]);
         count(&COUNTERS6.frag_creates);
-        transmit(&dev, next, buf)?;
+        transmit(dev, next, buf)?;
     }
     count(&COUNTERS6.frag_oks);
     Ok(())
@@ -527,7 +543,76 @@ pub(crate) fn output_raw(next: &Next6, packet: &[u8]) -> Result<()> {
         return Err(Errno::EMSGSIZE);
     }
     count(&COUNTERS6.out_requests);
-    transmit(&dev, next, NetBuf::from_slice(packet))
+    let mut skb = NetBuf::from_slice(packet);
+    let out = dev.ifindex();
+    if !nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT, &mut skb, 0, out).to_result()? {
+        return Ok(());
+    }
+    if !nf_hook(NFPROTO_IPV6, NF_INET_POST_ROUTING, &mut skb, 0, out).to_result()? {
+        return Ok(());
+    }
+    transmit(&dev, next, skb)
+}
+
+/// Tells if a namespace has a hook of IPv6 at `NF_INET_LOCAL_OUT` or `NF_INET_POST_ROUTING`.
+/// Then a packet that the host sends is whole when it goes through the hooks, and it gets its
+/// fragments after them, as in `ip6_finish_output` of Linux.
+fn nf_output_active() -> bool {
+    nf_hook_active(NFPROTO_IPV6, NF_INET_LOCAL_OUT)
+        || nf_hook_active(NFPROTO_IPV6, NF_INET_POST_ROUTING)
+}
+
+/// Runs the hooks of IPv6 at `hook` on `skb`, as `NF_HOOK` of Linux. Tells if the packet
+/// continues. A path with no hook gives `true` at once.
+#[inline]
+pub(crate) fn nf_hook6(hook: u8, skb: &mut NetBuf, in_dev: u32, out_dev: u32) -> bool {
+    nf_hook(NFPROTO_IPV6, hook, skb, in_dev, out_dev) == NfResult::Accept
+}
+
+/// Runs the hooks `NF_INET_LOCAL_OUT` and `NF_INET_POST_ROUTING` on a message of neighbour
+/// discovery or MLD that goes out on `dev`, as `ndisc_send_skb` and `mld_sendpack` of Linux.
+/// Tells if the message continues.
+fn nf_local_out(dev: &NetDevice, skb: &mut NetBuf) -> bool {
+    let oif = dev.ifindex();
+    nf_hook6(NF_INET_LOCAL_OUT, skb, 0, oif) && nf_hook6(NF_INET_POST_ROUTING, skb, 0, oif)
+}
+
+/// Sends a whole packet that the host makes through the hooks `NF_INET_LOCAL_OUT` and
+/// `NF_INET_POST_ROUTING`, as `ip6_xmit`, `ip6_output` and `ip6_finish_output` of Linux. A
+/// packet larger than `mtu` goes out in fragments after the hooks. A drop gives the error of the
+/// hook to the sender.
+fn ip6_local_out(
+    dev: &NetDevice,
+    next: &Next6,
+    out: &Out6,
+    mut skb: NetBuf,
+    mtu: usize,
+) -> Result<()> {
+    let oif = dev.ifindex();
+    if !nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT, &mut skb, 0, oif).to_result()? {
+        return Ok(());
+    }
+    if !nf_hook(NFPROTO_IPV6, NF_INET_POST_ROUTING, &mut skb, 0, oif).to_result()? {
+        return Ok(());
+    }
+    if skb.len() <= mtu {
+        return transmit(dev, next, skb);
+    }
+    // The hooks can change the addresses and the payload, but not the headers that the host
+    // put in.
+    let Some(h) = Header::fixed(skb.data()) else { return Ok(()) };
+    let at = HLEN + out.ext.len();
+    let Some(ext) = skb.data().get(HLEN..at) else { return Ok(()) };
+    let o = Out6 {
+        src: h.src,
+        dst: h.dst,
+        next: out.next,
+        hops: h.hops,
+        tclass: h.tclass,
+        ext: ext.to_vec(),
+        dontfrag: out.dontfrag,
+    };
+    fragment(dev, next, &o, &skb.data()[at..], mtu)
 }
 
 /// Counts an ICMPv6 message that goes out, as `icmp6_msg_outstats` of Linux.
@@ -591,6 +676,9 @@ fn send_ndisc(dev: &NetDevice, src: &Ip, dst: &Ip, mac: MacAddr, mut msg: Vec<u8
     count_icmp_out(&msg);
     count(&COUNTERS6.out_requests);
     count(&COUNTERS6.out_transmits);
+    if !nf_local_out(dev, &mut buf) {
+        return;
+    }
     ether(dev, mac).push(&mut buf);
     // A lost message is like a lost frame: the timers send it again.
     let _ = dev.transmit(buf);
@@ -681,6 +769,9 @@ fn dad_conflict(ifindex: u32, addr: &Ip) -> bool {
 
 /// Gives a packet to a multicast group `dst` on `dev`, as `ip6_finish_output2` of Linux.
 pub(crate) fn transmit_mcast(dev: &NetDevice, dst: &Ip, mut buf: NetBuf) -> Result<()> {
+    if !nf_local_out(dev, &mut buf) {
+        return Ok(());
+    }
     count(&COUNTERS6.out_transmits);
     add(&COUNTERS6.out_octets, buf.len());
     let mac = if dev.kind() == LinkKind::Ether { ipv6::multicast_mac(dst) } else { MacAddr::ZERO };
@@ -741,6 +832,22 @@ fn learn(dev: &NetDevice, addr: &Ip, mac: MacAddr, create: bool) {
 pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
     count(&COUNTERS6.in_receives);
     add(&COUNTERS6.in_octets, frame.len());
+    let mut frame = frame;
+    if nf_hook_active(NFPROTO_IPV6, NF_INET_PRE_ROUTING) {
+        // `ipv6_rcv` checks the fixed header and cuts the packet at its payload length before
+        // the hook.
+        let Some(fh) = Header::fixed(frame.data()) else {
+            return count(&COUNTERS6.in_hdr_errors);
+        };
+        let end = HLEN + usize::from(fh.payload_len);
+        if end > frame.len() {
+            return count(&COUNTERS6.in_truncated);
+        }
+        frame.trim(end);
+        if !nf_hook6(NF_INET_PRE_ROUTING, &mut frame, dev.ifindex(), 0) {
+            return;
+        }
+    }
     let Some(frame) = crate::forward::forward6(dev, frame, host) else { return };
     let (h, mut frame) = match Header::parse(frame.data()) {
         Ok(h) => (h, frame),
@@ -777,6 +884,17 @@ pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
         count(&COUNTERS6.in_mcast);
         add(&COUNTERS6.in_mcast_octets, frame.len());
     }
+    let h = if nf_hook_active(NFPROTO_IPV6, NF_INET_LOCAL_IN) {
+        if !nf_hook6(NF_INET_LOCAL_IN, &mut frame, ifindex, 0) {
+            return;
+        }
+        match Header::parse(frame.data()) {
+            Ok(h) => h,
+            Err(_) => return count(&COUNTERS6.in_hdr_errors),
+        }
+    } else {
+        h
+    };
     let Some(h) = rthdr_input(dev, &mut frame, h) else { return };
     let packet = frame.data();
     let payload = &packet[h.l4..];
