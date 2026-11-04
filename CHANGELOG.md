@@ -12,6 +12,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The construction of keys, as security/keys/request_key.c and request_key_auth.c of Linux. A `request_key` with callout information that finds no key makes the key under construction, links it into the destination keyring, and gives the upcall a `.request_key_auth` key (the serial of the key in hex, with the callout information as its payload) in a new session keyring `_req.N`. The helper takes the authority with `KEYCTL_ASSUME_AUTHORITY`, then searches the keyrings of the requestor too and can name `KEY_SPEC_REQKEY_AUTH_KEY` and `KEY_SPEC_REQUESTOR_KEYRING`. It ends the construction with `KEYCTL_INSTANTIATE`, `KEYCTL_INSTANTIATE_IOV`, `KEYCTL_NEGATE` or `KEYCTL_REJECT`. A key that the helper does not instantiate is negative with `ENOKEY` for 60 seconds, and `/proc/keys` shows the flag `U` for a key under construction. The kernel has no upcall yet, so a construction still ends negative (#539).
 - PID namespaces, as kernel/pid.c and kernel/pid_namespace.c of Linux. `clone`, `clone3` and `unshare` take `CLONE_NEWPID`, and `setns` takes a file of `/proc/PID/ns/pid` or a pidfd with `CLONE_NEWPID`, for the children of the caller. A thread has an ID in its namespace and in each ancestor, to a depth of 32. The system calls take and give the IDs of the namespace of the caller, and a signal gives the ID of the sender in the namespace of the target. The first process of a namespace has the ID 1 and gets the orphans of the namespace. It gets no signal with the default action from its namespace, and its exit kills the other processes of the namespace. `/proc/PID/ns/pid` and `/proc/PID/ns/pid_for_children` name the namespaces, `NS_GET_PARENT` and the `NS_GET_*_PIDNS` ioctls of nsfs work, and the fdinfo of a pidfd gives `NSpid`. The LTP options file now has `CONFIG_PID_NS` (#536).
 
+### Fixed
+
+- The `systemd` boot test image now has the `kmod` package. systemd 257 loads libkmod with `dlopen`, and without the library `systemd-modules-load` stops with "Failed to initialize libkmod context: Operation not supported". rukernel has no loadable modules, so as on Linux without `CONFIG_MODULES`, `init_module`, `finit_module` and `delete_module` give `ENOSYS` and `/proc/modules` does not exist. The init boot test checks this (#536).
+
 ## [0.5.3] - 2026-11-04
 
 ### Added
@@ -24,7 +28,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
-- The `systemd` boot test image now has the `kmod` package. systemd 257 loads libkmod with `dlopen`, and without the library `systemd-modules-load` stops with "Failed to initialize libkmod context: Operation not supported". rukernel has no loadable modules, so as on Linux without `CONFIG_MODULES`, `init_module`, `finit_module` and `delete_module` give `ENOSYS` and `/proc/modules` does not exist. The init boot test checks this (#536).
 - A `writev` to `/dev/kmsg` makes one record, as `devkmsg_write` of Linux. systemd writes its messages in 3 parts, and each part was a record of its own (#536).
 - `mount` with `MS_BIND` and `MS_REC` copies the mounts under the source, as `copy_tree` of fs/namespace.c of Linux. Before, it made only the mount of the source, so the root that systemd makes for a service with `MS_BIND` and `MS_REC` of `/` had no `/sys/fs/cgroup`, and `systemd-logind` failed at the step `NAMESPACE` (#536).
 - `/proc/PID/mountinfo` can be in an epoll set, and has an event when the mounts change, as `mounts_poll` of fs/proc_namespace.c of Linux. Before, `epoll_ctl` gave `EPERM` for it, so libmount closed its monitor, and systemd failed to see the mounts that it made ("Failed to drain libmount events") (#536).
