@@ -457,30 +457,57 @@ fn pid_used(t: &Table, pid: Pid) -> bool {
         })
 }
 
+/// The IDs that `clone3` asks for with `set_tid`, one for each level of PID namespace from the
+/// namespace of the child up. A 0 ends the list, so the levels after it get any free ID.
+pub type SetTid = [Pid; pid_namespace::MAX_PID_NS_LEVEL as usize];
+
 /// Gives a free global ID, and an ID in `ns` and in each of its ancestors, as `alloc_pid` in
 /// kernel/pid.c of Linux. Linux also starts again at 300 after a wrap, so that the low IDs stay
-/// for the system.
+/// for the system. `set_tid` gives the IDs that `clone3` asks for: the first one is for `ns`,
+/// the next one for its parent, and the one of the first namespace is the global ID.
 ///
 /// # Errors
 ///
-/// Gives `EAGAIN` if no ID is free, and `ENOMEM` if the init of a namespace ended.
-fn alloc_pid(table: &mut Table, ns: Option<&Arc<PidNamespace>>) -> Result<Pid, Errno> {
-    let mut found = None;
-    for _ in 0..PID_MAX {
-        let pid = table.next;
-        table.next = if pid + 1 >= PID_MAX { 300 } else { pid + 1 };
-        if !pid_used(table, pid) {
-            found = Some(pid);
-            break;
-        }
+/// Gives `EAGAIN` if no ID is free, and `ENOMEM` if the init of a namespace ended. For
+/// `set_tid`, gives `EINVAL` for more IDs than levels, for an ID out of the range, or for an ID
+/// that is not 1 in a namespace without init, and `EEXIST` if an ID is in use.
+fn alloc_pid(
+    table: &mut Table,
+    ns: Option<&Arc<PidNamespace>>,
+    set_tid: &[Pid],
+) -> Result<Pid, Errno> {
+    let size = set_tid.iter().take_while(|&&t| t != 0).count();
+    let levels = pid_namespace::ns_level(ns) as usize + 1;
+    if size > levels || set_tid[..size].iter().any(|&t| t >= PID_MAX) {
+        return Err(Errno::EINVAL);
     }
-    let pid = found.ok_or(Errno::EAGAIN)?;
+    let pid = if size == levels {
+        // The first namespace has its init, so only the check of the ID is left.
+        let want = set_tid[size - 1];
+        if pid_used(table, want) {
+            return Err(Errno::EEXIST);
+        }
+        want
+    } else {
+        let mut found = None;
+        for _ in 0..PID_MAX {
+            let pid = table.next;
+            table.next = if pid + 1 >= PID_MAX { 300 } else { pid + 1 };
+            if !pid_used(table, pid) {
+                found = Some(pid);
+                break;
+            }
+        }
+        found.ok_or(Errno::EAGAIN)?
+    };
     // The old entries of the ID in the namespaces go first.
     pid_namespace::forget(pid);
     let mut done: Vec<&Arc<PidNamespace>> = Vec::new();
     let mut cur = ns;
+    let mut level = 0;
     while let Some(n) = cur {
-        match n.alloc(pid, 0, PID_MAX, |g| pid_used(table, g)) {
+        let want = if level < size { set_tid[level] } else { 0 };
+        match n.alloc(pid, want, PID_MAX, |g| pid_used(table, g)) {
             Ok(_) => done.push(n),
             Err(e) => {
                 for d in done {
@@ -490,6 +517,7 @@ fn alloc_pid(table: &mut Table, ns: Option<&Arc<PidNamespace>>) -> Result<Pid, E
             }
         }
         cur = n.parent();
+        level += 1;
     }
     Ok(pid)
 }
@@ -2052,7 +2080,7 @@ fn create_root(fs: FsContext, init: bool) -> Result<Arc<Thread>, Errno> {
     if init && table.processes.contains_key(&INIT_PID) {
         return Err(Errno::EEXIST);
     }
-    let pid = alloc_pid(&mut table, None)?;
+    let pid = alloc_pid(&mut table, None, &[])?;
     let files = Arc::new(SpinLock::new(FdTable::new()));
     let (group, comm): (Pid, &[u8]) = if init { (pid, b"init") } else { (0, b"kworker/u:umh") };
     let process = Process::new(
@@ -2099,6 +2127,8 @@ pub struct ForkShare {
     /// `CLONE_NEWPID`: the child is the init of a new PID namespace, a child of the namespace
     /// for the children of the caller.
     pub new_pid_ns: bool,
+    /// The IDs of `set_tid` of `clone3`, or zeros.
+    pub set_tid: SetTid,
 }
 
 /// Makes a child process of the process of `parent`, for `fork` and `clone` without
@@ -2177,7 +2207,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
         parent.pid_ns_for_children()
     };
     let mut table = TABLE.lock();
-    let pid = alloc_pid(&mut table, pid_ns.as_ref())?;
+    let pid = alloc_pid(&mut table, pid_ns.as_ref(), &share.set_tid)?;
     let child = Process::new(
         pid,
         Arc::downgrade(&owner),
@@ -2256,12 +2286,21 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
 /// Gives `EAGAIN` if no thread ID is free or the `pids.max` of a cgroup does not allow one more
 /// thread.
 pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
+    new_thread_with(thread, &[])
+}
+
+/// Makes a new thread as `new_thread` does, with the IDs that `clone3` asks for with `set_tid`.
+///
+/// # Errors
+///
+/// Gives the errors of `new_thread`, and the errors of `set_tid` of `alloc_pid`.
+pub fn new_thread_with(thread: &Thread, set_tid: &[Pid]) -> Result<Arc<Thread>, Errno> {
     let process = thread.process.clone();
     // The new thread starts in the cgroup of the thread that makes it, as in Linux.
     let cgroup = thread.cgroup();
     rk_cgroup::charge_thread(cgroup)?;
     let mut table = TABLE.lock();
-    let tid = match alloc_pid(&mut table, process.pid_ns.as_ref()) {
+    let tid = match alloc_pid(&mut table, process.pid_ns.as_ref(), set_tid) {
         Ok(tid) => tid,
         Err(e) => {
             drop(table);
