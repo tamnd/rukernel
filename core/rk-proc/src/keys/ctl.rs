@@ -3,7 +3,7 @@
 //! The system calls copy the strings and the payloads from user memory, and give them here.
 
 use super::{
-    Caller, Kind, LINK, LINK_LOCK, LOOKUP_CREATE, LOOKUP_PARTIAL, NO_GID, Need, Quota, READ,
+    Caller, Kind, LINK, LINK_LOCK, LOOKUP_CREATE, LOOKUP_PARTIAL, NO_GID, Need, Prep, Quota, READ,
     SEARCH, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE, abort_link, all_keys, alloc,
     begin_link, check_cycle, collect, commit_link, insert_link, limits, lookup, permission,
     process_ring, remove_link, set_payload, thread_ring, uncharge, user_rings,
@@ -48,7 +48,8 @@ pub fn add_key(
     if !ring.key.is_keyring() {
         return Err(Errno::ENOTDIR);
     }
-    let (payload, short) = kind.preparse(payload)?;
+    let prep = kind.preparse(payload)?;
+    let short = prep.short;
     let desc = desc.ok_or(Errno::EINVAL)?;
     let _g = LINK_LOCK.lock();
     let replace = begin_link(&ring.key, kind, desc)?;
@@ -59,7 +60,7 @@ pub fn add_key(
         if let Some(key) = old {
             abort_link(&ring.key, replace);
             permission(cx, &key, ring.possessed, WRITE)?;
-            change_payload(&key, payload)?;
+            change_payload(&key, prep.payload)?;
             return Ok(key.serial);
         }
     }
@@ -70,7 +71,7 @@ pub fn add_key(
         cx.cred.fsgid,
         kind.default_perm(),
         Quota::In,
-        payload,
+        prep,
         None,
         false,
     );
@@ -93,7 +94,10 @@ pub fn add_key(
 fn change_payload(key: &Key, payload: Vec<u8>) -> Result<(), Errno> {
     let old = {
         let mut s = key.state.lock();
-        let old = set_payload(&mut s, payload)?;
+        // An update takes the length of the payload in the quota, as `user_update` and
+        // `big_key_update`.
+        let quota = payload.len() as u32;
+        let old = set_payload(&mut s, payload, quota)?;
         if s.negative.take().is_some() {
             s.expiry = 0;
         }
@@ -226,7 +230,7 @@ pub fn join_session(cx: &Caller<'_>, name: Option<&[u8]>) -> Result<i32, Errno> 
             cx.cred.gid,
             SESSION_PERM,
             Quota::In,
-            Vec::new(),
+            Prep::default(),
             None,
             false,
         )?,
@@ -294,7 +298,7 @@ pub(super) fn revoke_key(key: &Key) {
         s.revoked = true;
         let links = core::mem::take(&mut s.links);
         uncharge(&mut s, links.len() as u32 * super::LINK_BYTES);
-        (set_payload(&mut s, Vec::new()), links)
+        (set_payload(&mut s, Vec::new(), 0), links)
     };
     drop(payload);
     drop(links);
@@ -528,8 +532,9 @@ pub fn search(
 /// # Errors
 ///
 /// Gives `ENOKEY` if the lookup fails, the error of a negative key, `EACCES`, `EOPNOTSUPP` for
-/// a type that the caller cannot read, the error of the state of the key, or `EINVAL` for a
-/// keyring and a length that is not a multiple of 4.
+/// a type that the caller cannot read, the error of the state of the key, `EINVAL` for a
+/// keyring and a length that is not a multiple of 4, or the error of a `dns_resolver` key with
+/// the `dnserror` option.
 pub fn read(cx: &Caller<'_>, id: i32, buflen: usize) -> Result<(usize, Vec<u8>), Errno> {
     let r = lookup(cx, id, 0, Need::Defer).map_err(|_| Errno::ENOKEY)?;
     let key = &r.key;
@@ -561,6 +566,9 @@ pub fn read(cx: &Caller<'_>, id: i32, buflen: usize) -> Result<(usize, Vec<u8>),
         return Ok((full, out));
     }
     let s = key.state.lock();
+    if let Some(e) = s.error {
+        return Err(e);
+    }
     let full = s.payload.len();
     let out = if full <= buflen { s.payload.clone() } else { Vec::new() };
     Ok((full, out))

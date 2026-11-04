@@ -314,22 +314,62 @@ fn dns_resolver_keys() {
     let good = add_key(&cx, b"dns_resolver", Some(b"g"), [0, 0, 1, 0, 1, 0].to_vec(), PROC);
     cx.now = 60;
     assert_eq!(read(&cx, good.unwrap(), 16).unwrap().0, 6);
-    let t = add_key(&cx, b"dns_resolver", Some(b"t"), b"1.2.3.4".to_vec(), PROC);
+    // Text ends with a NUL, which the key does not keep.
+    let t = add_key(&cx, b"dns_resolver", Some(b"t"), b"1.2.3.4\0".to_vec(), PROC);
     assert_eq!(read(&cx, t.unwrap(), 16).unwrap(), (7, b"1.2.3.4".to_vec()));
-    assert!(add_key(&cx, b"dns_resolver", Some(b"e"), b"x#dnserror=6#".to_vec(), PROC).is_ok());
+    // A key with `dnserror` is positive with no data, and a read gives the error.
+    let before = usage(5013).qnbytes;
+    let e = add_key(&cx, b"dns_resolver", Some(b"e"), b"x#dnserror=6#\0".to_vec(), PROC).unwrap();
+    assert_eq!(usage(5013).qnbytes, before + LINK_BYTES + 2);
+    assert_eq!(read(&cx, e, 16), Err(Errno::ENXIO));
+    let text = alloc::string::String::from_utf8(keys_text(&cx)).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&alloc::format!("{e:08x} "))).unwrap();
+    assert!(line.ends_with(" e: -6") && line.contains(" I--Q--- "), "{line}");
     for bad in [
         &b"x"[..],
+        b"ab",
         &[0, 0, 1, 0, 1],
         &[0, 1, 1, 0, 1, 0],
         &[0, 0, 2, 0, 1, 0],
-        b"a#",
-        b"a#b=1",
-        b"a#dnserror=512",
-        b"a##",
+        b"a#\0",
+        b"a#b=1\0",
+        b"a#dnserror=512\0",
+        b"a#dnserror=0\0",
+        b"a##\0",
     ] {
         let r = add_key(&cx, b"dns_resolver", Some(b"bad"), bad.to_vec(), PROC);
         assert_eq!(r, Err(Errno::EINVAL), "{bad:?}");
     }
+}
+
+#[test]
+fn big_keys() {
+    let (c, o) = (cred(5014), TestOwner::default());
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    let ring = get_keyring_id(&cx, PROC, true).unwrap();
+    let base = usage(5014).qnbytes;
+    // A new key takes 16 bytes of the quota for its payload, as `big_key_preparse`.
+    let k = add_key(&cx, b"big_key", Some(b"b"), alloc::vec![7; 2000], ring).unwrap();
+    assert_eq!(usage(5014).qnbytes, base + LINK_BYTES + 2 + 16);
+    assert_eq!(describe(&cx, k).unwrap(), b"big_key;5014;5014;3f010000;b\0".to_vec());
+    assert_eq!(read(&cx, k, 4096).unwrap(), (2000, alloc::vec![7; 2000]));
+    assert_eq!(read(&cx, k, 10).unwrap(), (2000, Vec::new()));
+    let text = alloc::string::String::from_utf8(keys_text(&cx)).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&alloc::format!("{k:08x} "))).unwrap();
+    assert!(line.ends_with(" big_key   b: 2000 [file]"), "{line}");
+    // An update takes the length of the payload, as `big_key_update`.
+    update(&cx, k, b"small".to_vec()).unwrap();
+    assert_eq!(usage(5014).qnbytes, base + LINK_BYTES + 2 + 5);
+    let text = alloc::string::String::from_utf8(keys_text(&cx)).unwrap();
+    assert!(text.contains(" b: 5 [buff]\n"));
+    assert_eq!(update(&cx, k, Vec::new()), Err(Errno::EINVAL));
+    assert_eq!(update(&cx, k, alloc::vec![0; 1024 * 1024 + 1]), Err(Errno::EINVAL));
+    // A second add updates the key.
+    assert_eq!(add_key(&cx, b"big_key", Some(b"b"), b"again".to_vec(), ring), Ok(k));
+    assert_eq!(read(&cx, k, 16).unwrap(), (5, b"again".to_vec()));
+    assert_eq!(add_key(&cx, b"big_key", Some(b"e"), Vec::new(), ring), Err(Errno::EINVAL));
+    revoke(&cx, k).unwrap();
+    assert_eq!(usage(5014).qnbytes, base + LINK_BYTES + 2);
 }
 
 /// A helper of the tests in place of `/sbin/request-key`: it runs as root with the session

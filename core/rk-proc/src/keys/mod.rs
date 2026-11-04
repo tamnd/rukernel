@@ -138,6 +138,9 @@ pub enum Kind {
     /// A key with the result of a DNS query, as `net/dns_resolver/dns_key.c`. The type has no
     /// update.
     DnsResolver,
+    /// A key with a large payload, as `security/keys/big_key.c`. The payload takes 16 bytes of
+    /// the quota when the key is made, and its length after an update.
+    BigKey,
     /// The authorization to instantiate a key that `request_key` constructs, as
     /// `security/keys/request_key_auth.c`. The payload is the callout information. A process
     /// cannot make a key of this type.
@@ -152,6 +155,7 @@ impl Kind {
             Kind::Logon => "logon",
             Kind::Keyring => "keyring",
             Kind::DnsResolver => "dns_resolver",
+            Kind::BigKey => "big_key",
             Kind::RequestKeyAuth => ".request_key_auth",
         }
     }
@@ -163,13 +167,14 @@ impl Kind {
             b"logon" => Some(Kind::Logon),
             b"keyring" => Some(Kind::Keyring),
             b"dns_resolver" => Some(Kind::DnsResolver),
+            b"big_key" => Some(Kind::BigKey),
             _ => None,
         }
     }
 
     /// The type can change its payload.
     fn can_update(self) -> bool {
-        matches!(self, Kind::User | Kind::Logon)
+        matches!(self, Kind::User | Kind::Logon | Kind::BigKey)
     }
 
     /// A process can read the payload of the type.
@@ -195,22 +200,25 @@ impl Kind {
         let ok = match self {
             Kind::Keyring => payload.is_empty(),
             Kind::User | Kind::Logon => (1..=MAX_USER_PAYLOAD).contains(&payload.len()),
+            Kind::BigKey => (1..=MAX_BIG_KEY_PAYLOAD).contains(&payload.len()),
             Kind::DnsResolver => return dns_preparse(payload).map(|_| ()),
             Kind::RequestKeyAuth => false,
         };
         if ok { Ok(()) } else { Err(Errno::EINVAL) }
     }
 
-    /// Checks the payload of a new key and gives the payload to keep, as the `preparse` of the
-    /// type. The flag is true if the key expires after one second.
-    fn preparse(self, mut payload: Vec<u8>) -> Result<(Vec<u8>, bool), Errno> {
+    /// Checks the payload of a new key and gives what the key keeps, as the `preparse` of the
+    /// type.
+    fn preparse(self, mut payload: Vec<u8>) -> Result<Prep, Errno> {
         if self != Kind::DnsResolver {
             self.check_payload(&payload)?;
-            return Ok((payload, false));
+            let quota = if self == Kind::BigKey { BIG_KEY_QUOTA } else { payload.len() as u32 };
+            return Ok(Prep { payload, quota, short: false, error: None });
         }
-        let (len, short) = dns_preparse(&payload)?;
-        payload.truncate(len);
-        Ok((payload, short))
+        let dns = dns_preparse(&payload)?;
+        // As Linux, a key with an error keeps no data.
+        payload.truncate(if dns.error.is_some() { 0 } else { dns.len });
+        Ok(Prep { quota: payload.len() as u32, payload, short: dns.short, error: dns.error })
     }
 
     /// Checks the description of a new key, as the `vet_description` of the type. A `logon` key
@@ -223,6 +231,44 @@ impl Kind {
     }
 }
 
+/// The largest payload of a `big_key` key.
+const MAX_BIG_KEY_PAYLOAD: usize = 1024 * 1024;
+/// The bytes of the quota that the payload of a new `big_key` key takes.
+const BIG_KEY_QUOTA: u32 = 16;
+/// The length above which Linux keeps the payload of a `big_key` key in a file, which
+/// `/proc/keys` shows. Linux takes `sizeof(struct inode) + sizeof(struct dentry)`, which depends
+/// on the build. This is the value of an x86-64 build.
+const BIG_KEY_FILE_THRESHOLD: usize = 824;
+
+/// What a new key keeps after the `preparse` of its type, as `struct key_preparsed_payload`.
+#[derive(Default)]
+pub(super) struct Prep {
+    payload: Vec<u8>,
+    /// The bytes of the quota that the payload takes, as `quotalen`.
+    quota: u32,
+    /// The key expires after one second.
+    short: bool,
+    /// The error that a read of the key gives, as `dns_key_error` of a `dns_resolver` key.
+    error: Option<Errno>,
+}
+
+impl Prep {
+    /// A payload that takes its length in the quota.
+    fn new(payload: Vec<u8>) -> Self {
+        Prep { quota: payload.len() as u32, payload, short: false, error: None }
+    }
+}
+
+/// The result of [`dns_preparse`].
+struct Dns {
+    /// The length of the data to keep.
+    len: usize,
+    /// The key expires after one second.
+    short: bool,
+    /// The error of a `dnserror` option.
+    error: Option<Errno>,
+}
+
 /// The option of a `dns_resolver` key with an error number.
 const DNS_ERRORNO_OPTION: &[u8] = b"dnserror";
 /// The longest option of a `dns_resolver` key.
@@ -232,18 +278,19 @@ const DNS_V1_HEADER: usize = 6;
 /// The lookup states `DNS_LOOKUP_GOOD` and `DNS_LOOKUP_GOOD_WITH_BAD`.
 const DNS_LOOKUP_GOOD: [u8; 2] = [1, 2];
 
-/// Checks the payload of a `dns_resolver` key, as `dns_resolver_preparse`. Gives the length of
-/// the result and true if the key expires after one second.
+/// Checks the payload of a `dns_resolver` key, as `dns_resolver_preparse`.
 ///
 /// A payload that starts with 0 is a binary server list: version 1 of the header, with the
 /// content 0 (`DNS_PAYLOAD_IS_SERVER_LIST`). A list with a lookup state that is not good expires
-/// after one second. Other payloads are text: the result, and then options after `#`. The only
-/// option is `dnserror=N` with N from 1 to 511.
+/// after one second. Other payloads are text that ends with a NUL: the result, and then options
+/// after `#`. The only option is `dnserror=N` with N from 1 to 511, and the key keeps the error
+/// `N` in place of the result.
 ///
 /// # Errors
 ///
-/// Gives `EINVAL` for a payload of 1 byte or less, a bad header or a bad option.
-fn dns_preparse(data: &[u8]) -> Result<(usize, bool), Errno> {
+/// Gives `EINVAL` for a payload of 1 byte or less, a bad header, text with no NUL at the end, or
+/// a bad option.
+fn dns_preparse(data: &[u8]) -> Result<Dns, Errno> {
     if data.len() <= 1 {
         return Err(Errno::EINVAL);
     }
@@ -251,11 +298,19 @@ fn dns_preparse(data: &[u8]) -> Result<(usize, bool), Errno> {
         if data.len() < DNS_V1_HEADER || data[1] != 0 || data[2] != 1 {
             return Err(Errno::EINVAL);
         }
-        return Ok((data.len(), !DNS_LOOKUP_GOOD.contains(&data[4])));
+        return Ok(Dns {
+            len: data.len(),
+            short: !DNS_LOOKUP_GOOD.contains(&data[4]),
+            error: None,
+        });
     }
-    let Some(hash) = data.iter().position(|&b| b == b'#') else {
-        return Ok((data.len(), false));
+    let Some((&0, data)) = data.split_last() else {
+        return Err(Errno::EINVAL);
     };
+    let Some(hash) = data.iter().position(|&b| b == b'#') else {
+        return Ok(Dns { len: data.len(), short: false, error: None });
+    };
+    let mut error = None;
     let opts = &data[hash + 1..];
     let count = opts.split(|&b| b == b'#').count();
     for (i, opt) in opts.split(|&b| b == b'#').enumerate() {
@@ -270,16 +325,16 @@ fn dns_preparse(data: &[u8]) -> Result<(usize, bool), Errno> {
             Some(eq) => (&opt[..eq], &opt[eq + 1..]),
             None => (opt, &[][..]),
         };
-        let ok = name == DNS_ERRORNO_OPTION
-            && core::str::from_utf8(value)
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .is_some_and(|n| (1..=511).contains(&n));
-        if !ok {
-            return Err(Errno::EINVAL);
+        let n = core::str::from_utf8(value)
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|n| (1..=511).contains(n));
+        match n {
+            Some(n) if name == DNS_ERRORNO_OPTION => error = Errno::new(n),
+            _ => return Err(Errno::EINVAL),
         }
     }
-    Ok((hash, false))
+    Ok(Dns { len: hash, short: false, error })
 }
 
 /// How a new key counts in the quota of its owner.
@@ -302,6 +357,11 @@ struct State {
     /// The real time in seconds when the key expires, or 0 if it does not expire.
     expiry: u64,
     payload: Vec<u8>,
+    /// The bytes of the quota that the payload takes, as `datalen` of Linux.
+    datalen: u32,
+    /// The error that a read of a positive key gives, as `dns_key_error` of a `dns_resolver`
+    /// key.
+    error: Option<Errno>,
     /// The links of a keyring. At most one key of each type and description.
     links: Vec<Arc<Key>>,
     /// The keyring accepts no new links. Only the reject-all restriction is available.
@@ -524,15 +584,16 @@ fn uncharge(s: &mut State, bytes: u32) {
     }
 }
 
-/// Changes the payload of `s` to `payload`, with the change of the quota, as
+/// Changes the payload of `s` to `payload`, which takes `quota` bytes of the quota, as
 /// `key_payload_reserve`. Gives the old payload, so that the caller frees it after the lock.
-fn set_payload(s: &mut State, payload: Vec<u8>) -> Result<Vec<u8>, Errno> {
-    let (old, new) = (s.payload.len() as u32, payload.len() as u32);
-    if new > old {
-        charge(s, new - old)?;
+fn set_payload(s: &mut State, payload: Vec<u8>, quota: u32) -> Result<Vec<u8>, Errno> {
+    let old = s.datalen;
+    if quota > old {
+        charge(s, quota - old)?;
     } else {
-        uncharge(s, old - new);
+        uncharge(s, old - quota);
     }
+    s.datalen = quota;
     Ok(core::mem::replace(&mut s.payload, payload))
 }
 
@@ -548,7 +609,7 @@ fn alloc(
     gid: u32,
     perm: u32,
     quota: Quota,
-    payload: Vec<u8>,
+    prep: Prep,
     negative: Option<(Errno, u64)>,
     uid_ring: bool,
 ) -> Result<Arc<Key>, Errno> {
@@ -558,7 +619,7 @@ fn alloc(
     kind.check_desc(desc)?;
     let desc_bytes = desc.len() as u32 + 1;
     let (maxkeys, maxbytes) = limits(uid);
-    let bytes = desc_bytes + payload.len() as u32;
+    let bytes = desc_bytes + prep.quota;
     {
         let mut users = USERS.lock();
         let u = users.entry(uid).or_default();
@@ -572,7 +633,7 @@ fn alloc(
             return Err(Errno::EDQUOT);
         }
         // The payload must fit in the bytes in each case, as `key_payload_reserve` checks it.
-        if !payload.is_empty() && u.qnbytes.checked_add(bytes).is_none_or(|n| n > maxbytes) {
+        if prep.quota != 0 && u.qnbytes.checked_add(bytes).is_none_or(|n| n > maxbytes) {
             if u.nkeys == 0 {
                 users.remove(&uid);
             }
@@ -612,7 +673,9 @@ fn alloc(
                 revoked: false,
                 negative,
                 expiry,
-                payload,
+                payload: prep.payload,
+                datalen: prep.quota,
+                error: prep.error,
                 links: Vec::new(),
                 restricted: false,
                 quota_bytes: bytes,
@@ -627,7 +690,7 @@ fn alloc(
 
 /// Makes a keyring of the kernel, which can go over the quota of keys.
 fn kernel_ring(desc: &[u8], uid: u32, gid: u32, perm: u32) -> Result<Arc<Key>, Errno> {
-    alloc(Kind::Keyring, desc, uid, gid, perm, Quota::Overrun, Vec::new(), None, false)
+    alloc(Kind::Keyring, desc, uid, gid, perm, Quota::Overrun, Prep::default(), None, false)
 }
 
 /// The key with the serial number `serial`. An invalidated key is gone, as the garbage collector
@@ -906,7 +969,7 @@ fn user_rings(cx: &Caller<'_>) -> Result<(Arc<Key>, Arc<Key>), Errno> {
         NO_GID,
         perm,
         Quota::Overrun,
-        Vec::new(),
+        Prep::default(),
         None,
         true,
     )?;
@@ -918,7 +981,7 @@ fn user_rings(cx: &Caller<'_>) -> Result<(Arc<Key>, Arc<Key>), Errno> {
         NO_GID,
         perm,
         Quota::Overrun,
-        Vec::new(),
+        Prep::default(),
         None,
         true,
     )?;
@@ -963,7 +1026,7 @@ fn new_session(cx: &Caller<'_>) -> Result<Arc<Key>, Errno> {
         cx.cred.gid,
         SESSION_PERM,
         quota,
-        Vec::new(),
+        Prep::default(),
         None,
         false,
     )?;
