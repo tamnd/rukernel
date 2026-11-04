@@ -17,6 +17,7 @@ use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 use rk_mm::{Backing, FileRef, HugeAdvice, Vma, VmaKind};
 use rk_proc::exec::USER_HZ;
+use rk_proc::pid_namespace::{self, PidNamespace};
 use rk_proc::signal::{NSIG, SIG_IGN};
 use rk_proc::{Pid, Process, Thread};
 use rk_vfs::{InodeRef, Location, Result};
@@ -45,22 +46,32 @@ fn info() -> KernelInfo {
     INFO.get().cloned().unwrap_or_default()
 }
 
-/// Makes the root directory of procfs.
-pub(crate) fn root() -> InodeRef {
-    let find: FindFn = Box::new(|name: &[u8]| {
-        if let Some(pid) = parse_pid(name) {
+/// The PID namespace of a mount of procfs, or `None` for the first namespace.
+type PidNs = Option<Arc<PidNamespace>>;
+
+/// Makes the root directory of a mount of procfs. The mount shows the processes of the PID
+/// namespace `ns` with their IDs in it, as the `pid_ns` of the superblock of Linux.
+pub(crate) fn root(ns: PidNs) -> InodeRef {
+    let find_ns = ns.clone();
+    let find: FindFn = Box::new(move |name: &[u8]| {
+        if let Some(nr) = parse_pid(name) {
+            let pid = pid_namespace::find_pid_ns(nr, find_ns.as_ref()).ok_or(Errno::ENOENT)?;
             if let Some(p) = rk_proc::find_process(pid) {
-                return Ok(process_dir(&p));
+                return Ok(process_dir(&p, &find_ns));
             }
             // A thread that is not the leader has a directory too, which `ls` does not show.
             if let Some(t) = rk_proc::find_thread(pid) {
-                return Ok(thread_dir(&t, &join(b"/", name), b"/"));
+                return Ok(thread_dir(&t, &join(b"/", name), b"/", &find_ns));
             }
             return Err(Errno::ENOENT);
         }
-        root_files().into_iter().find(|(n, _)| n == name).map(|(_, i)| i).ok_or(Errno::ENOENT)
+        root_files(&find_ns)
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| i)
+            .ok_or(Errno::ENOENT)
     });
-    dir(b"/", b"/", 0o555, root_list, Some(find))
+    dir(b"/", b"/", 0o555, move || root_list(&ns), Some(find))
 }
 
 /// The text that `show` makes from the block devices, in the order of their numbers.
@@ -109,10 +120,15 @@ fn vm_counts() -> text::VmCounts {
     }
 }
 
-fn root_list() -> Result<Vec<(Vec<u8>, InodeRef)>> {
-    let mut out = root_files();
+/// The entries of the root: the files, and a directory for each process of the namespace `ns`,
+/// with its ID in `ns`.
+fn root_list(ns: &PidNs) -> Result<Vec<(Vec<u8>, InodeRef)>> {
+    let mut out = root_files(ns);
     for p in rk_proc::processes() {
-        out.push((format!("{}", p.pid()).into_bytes(), process_dir(&p)));
+        let nr = pid_namespace::pid_nr_ns(p.pid(), ns.as_ref());
+        if nr != 0 {
+            out.push((format!("{nr}").into_bytes(), process_dir(&p, ns)));
+        }
     }
     Ok(out)
 }
@@ -128,7 +144,7 @@ fn text_file(path: &[u8], f: fn() -> Vec<u8>) -> InodeRef {
     file(path, move || Ok(f()))
 }
 
-fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
+fn root_files(ns: &PidNs) -> Vec<(Vec<u8>, InodeRef)> {
     let files: [(&[u8], fn() -> Vec<u8>); 13] = [
         (b"meminfo", || {
             let f = rk_frame::mm::frame_stats();
@@ -206,18 +222,32 @@ fn root_files() -> Vec<(Vec<u8>, InodeRef)> {
         files.iter().map(|&(name, f)| (name.to_vec(), text_file(&join(b"/", name), f))).collect();
     out.push((b"mounts".to_vec(), link(b"/mounts", 0o777, || Ok(b"self/mounts".to_vec()))));
     out.push((b"net".to_vec(), link(b"/net", 0o777, || Ok(b"self/net".to_vec()))));
+    // `self` and `thread-self` give the IDs of the caller in the namespace of the mount, and
+    // they do not exist for a caller that the namespace does not see, as `proc_self_get_link`
+    // of Linux.
+    let self_ns = ns.clone();
     out.push((
         b"self".to_vec(),
-        link(b"/self", 0o777, || {
+        link(b"/self", 0o777, move || {
             let t = rk_proc::current_thread().ok_or(Errno::ENOENT)?;
-            Ok(format!("{}", t.process().pid()).into_bytes())
+            let tgid = pid_namespace::pid_nr_ns(t.process().pid(), self_ns.as_ref());
+            if tgid == 0 {
+                return Err(Errno::ENOENT);
+            }
+            Ok(format!("{tgid}").into_bytes())
         }),
     ));
+    let thread_ns = ns.clone();
     out.push((
         b"thread-self".to_vec(),
-        link(b"/thread-self", 0o777, || {
+        link(b"/thread-self", 0o777, move || {
             let t = rk_proc::current_thread().ok_or(Errno::ENOENT)?;
-            Ok(format!("{}/task/{}", t.process().pid(), t.tid()).into_bytes())
+            let tgid = pid_namespace::pid_nr_ns(t.process().pid(), thread_ns.as_ref());
+            let tid = pid_namespace::pid_nr_ns(t.tid(), thread_ns.as_ref());
+            if tgid == 0 || tid == 0 {
+                return Err(Errno::ENOENT);
+            }
+            Ok(format!("{tgid}/task/{tid}").into_bytes())
         }),
     ));
     out.push((
@@ -1149,20 +1179,23 @@ fn syscall_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
     text.into_bytes()
 }
 
-fn stat_of(p: &Process, t: Option<&Thread>) -> text::Stat {
+/// The values of `/proc/PID/stat`, with the IDs in the PID namespace `ns` of the mount, as
+/// `do_task_stat` of Linux. An ID that `ns` does not see is 0.
+fn stat_of(p: &Process, t: Option<&Thread>, ns: &PidNs) -> text::Stat {
+    let nr = |id: Pid| pid_namespace::pid_nr_ns(id, ns.as_ref());
     let (ignored, caught) = actions(p);
     let threads = p.threads();
     let leader = threads.iter().find(|t| t.tid() == p.pid()).cloned();
     let vsize = p.vm().map_or(0, |vm| vm.areas().iter().map(|a| (a.end - a.start) as u64).sum());
     let thread = t.or(leader.as_deref());
     text::Stat {
-        pid: t.map_or(p.pid(), Thread::tid),
+        pid: nr(t.map_or(p.pid(), Thread::tid)),
         comm: p.comm(),
         // Linux gives the state of the leader for the process, if the leader is there.
         state: thread.map_or_else(|| p.state_letter(), thread_state),
-        ppid: p.ppid(),
-        pgid: p.pgid(),
-        sid: p.sid(),
+        ppid: nr(p.ppid()),
+        pgid: nr(p.pgid()),
+        sid: nr(p.sid()),
         threads: threads.len(),
         // Linux gives the time of the thread in the stat of a thread.
         utime: t.map_or_else(|| p.user_ticks(), Thread::user_ticks) * USER_HZ / rk_frame::time::HZ,
@@ -1245,14 +1278,20 @@ fn mem_sizes(p: &Process) -> text::MemSizes {
     m
 }
 
-fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
-    let s = stat_of(p, t);
+/// The text of `/proc/PID/status`, with the IDs in the PID namespace `ns` of the mount, as
+/// `proc_pid_status` of Linux.
+fn status_of(p: &Process, t: Option<&Thread>, ns: &PidNs) -> Vec<u8> {
+    let s = stat_of(p, t, ns);
+    let nr = |id: Pid| pid_namespace::pid_nr_ns(id, ns.as_ref());
+    let tid = t.map_or(p.pid(), Thread::tid);
+    // An ID for each namespace from `ns` down to the namespace of the process.
+    let levels = |id: Pid| pid_namespace::numbers(id, p.pid_ns(), ns.as_ref());
     let threads = p.threads();
     let thread = t.or_else(|| threads.iter().find(|t| t.tid() == p.pid()).map(|t| &**t));
     let umask = p.fs().map_or(0o022, |fs| fs.lock().umask());
     let x = text::Status {
-        tid: t.map_or(p.pid(), Thread::tid),
-        tracer: thread.map_or(0, Thread::tracer_pid),
+        tid: nr(tid),
+        tracer: nr(thread.map_or(0, Thread::tracer_pid)),
         umask,
         shared_pending: p.shared_pending().0,
         locked: p.vm().map_or(0, |vm| vm.locked_bytes() as u64),
@@ -1260,9 +1299,10 @@ fn status_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
         mem: mem_sizes(p),
         cred: (*p.cred()).clone(),
         no_new_privs: thread.is_some_and(Thread::no_new_privs),
+        ns_ids: [levels(p.pid()), levels(tid), levels(p.pgid()), levels(p.sid())],
     };
     let mut s = s;
-    s.pid = p.pid();
+    s.pid = nr(p.pid());
     text::status(&s, &x)
 }
 
@@ -1907,26 +1947,29 @@ fn process_files(
     w: &Weak<Process>,
     t: Option<Weak<Thread>>,
     base: &[u8],
+    ns: &PidNs,
 ) -> Vec<(Vec<u8>, InodeRef)> {
     let mut out: Vec<(Vec<u8>, InodeRef)> = Vec::new();
     let p_ = w.clone();
     let t_ = t.clone();
+    let ns_ = ns.clone();
     out.push((
         b"stat".to_vec(),
         file(&join(base, b"stat"), move || {
             let p = alive(&p_)?;
             let t = t_.as_ref().map(alive).transpose()?;
-            Ok(text::stat(&stat_of(&p, t.as_deref())))
+            Ok(text::stat(&stat_of(&p, t.as_deref(), &ns_)))
         }),
     ));
     let p_ = w.clone();
     let t_ = t.clone();
+    let ns_ = ns.clone();
     out.push((
         b"status".to_vec(),
         file(&join(base, b"status"), move || {
             let p = alive(&p_)?;
             let t = t_.as_ref().map(alive).transpose()?;
-            Ok(status_of(&p, t.as_deref()))
+            Ok(status_of(&p, t.as_deref(), &ns_))
         }),
     ));
     let p_ = w.clone();
@@ -2267,21 +2310,22 @@ fn owned(w: &Weak<Process>, node: InodeRef) -> InodeRef {
     node
 }
 
-fn process_dir(p: &Arc<Process>) -> InodeRef {
+fn process_dir(p: &Arc<Process>, ns: &PidNs) -> InodeRef {
     let w = Arc::downgrade(p);
     // The inode numbers come from the serial number too, so that a new process with the same PID
     // has new inodes, as in Linux.
     let base = format!("/{}/{}", p.pid(), p.serial()).into_bytes();
     let list_base = base.clone();
     let owner = w.clone();
+    let ns = ns.clone();
     let node = dir(
         &base,
         b"/",
         0o555,
         move || {
             alive(&w)?;
-            let mut out = process_files(&w, None, &list_base);
-            out.push((b"task".to_vec(), owned(&w, task_dir(w.clone(), &list_base))));
+            let mut out = process_files(&w, None, &list_base, &ns);
+            out.push((b"task".to_vec(), owned(&w, task_dir(w.clone(), &list_base, ns.clone()))));
             Ok(out)
         },
         None,
@@ -2296,7 +2340,9 @@ fn process_dir(p: &Arc<Process>) -> InodeRef {
     owned(&owner, node)
 }
 
-fn task_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
+/// The `task` directory of a process, with the ID of each thread in the namespace `ns` of the
+/// mount.
+fn task_dir(w: Weak<Process>, base: &[u8], ns: PidNs) -> InodeRef {
     let path = join(base, b"task");
     let me = path.clone();
     dir(
@@ -2307,9 +2353,11 @@ fn task_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
             let p = alive(&w)?;
             Ok(p.threads()
                 .iter()
+                .filter(|t| pid_namespace::pid_nr_ns(t.tid(), ns.as_ref()) != 0)
                 .map(|t| {
-                    let name = format!("{}", t.tid()).into_bytes();
-                    let node = thread_dir(t, &join(&me, &name), &me);
+                    let name =
+                        format!("{}", pid_namespace::pid_nr_ns(t.tid(), ns.as_ref())).into_bytes();
+                    let node = thread_dir(t, &join(&me, &name), &me, &ns);
                     (name, owned(&w, node))
                 })
                 .collect())
@@ -2318,17 +2366,18 @@ fn task_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
     )
 }
 
-fn thread_dir(t: &Arc<Thread>, path: &[u8], parent: &[u8]) -> InodeRef {
+fn thread_dir(t: &Arc<Thread>, path: &[u8], parent: &[u8], ns: &PidNs) -> InodeRef {
     let tw = Arc::downgrade(t);
     let pw = Arc::downgrade(t.process());
     let base = path.to_vec();
+    let ns = ns.clone();
     dir(
         path,
         parent,
         0o555,
         move || {
             alive(&tw)?;
-            Ok(process_files(&pw, Some(tw.clone()), &base))
+            Ok(process_files(&pw, Some(tw.clone()), &base, &ns))
         },
         None,
     )
