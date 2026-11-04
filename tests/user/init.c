@@ -10931,6 +10931,179 @@ static void test_nftables(void)
 	close(fd);
 }
 
+/* The expressions of nf_tables, as net/netfilter/nft_*.c of Linux: the values of
+ * <linux/netfilter/nf_tables.h>. */
+#define RK_NFTA_EXPR_DATA 2
+#define RK_NFTA_DATA_VERDICT 2
+#define RK_NFTA_VERDICT_CODE 1
+#define RK_NFTA_VERDICT_CHAIN 2
+#define RK_NFT_JUMP (-3)
+#define RK_NFT_REG_VERDICT 0
+#define RK_NFT_REG_1 1
+#define RK_NFTA_IMMEDIATE_DREG 1
+#define RK_NFTA_IMMEDIATE_DATA 2
+#define RK_NFTA_CMP_SREG 1
+#define RK_NFTA_CMP_OP 2
+#define RK_NFTA_CMP_DATA 3
+#define RK_NFT_CMP_EQ 0
+#define RK_NFTA_PAYLOAD_DREG 1
+#define RK_NFTA_PAYLOAD_BASE 2
+#define RK_NFTA_PAYLOAD_OFFSET 3
+#define RK_NFTA_PAYLOAD_LEN 4
+#define RK_NFT_PAYLOAD_TRANSPORT_HEADER 2
+#define RK_NFTA_META_DREG 1
+#define RK_NFTA_META_KEY 2
+#define RK_NFT_META_L4PROTO 16
+#define RK_NFTA_COUNTER_PACKETS 2
+#define RK_NFT_MSG_DELCHAIN 5
+
+/* Starts the expression `name` in the rule of the batch b. Gives the nest of its data. */
+static struct rtattr *nft_expr(struct nft_batch *b, const char *name, struct rtattr **elem)
+{
+	*elem = nl_put(b->cur, RK_NFTA_LIST_ELEM | NLA_F_NESTED, NULL, 0);
+	nft_str(b, RK_NFTA_EXPR_NAME, name);
+	return nl_put(b->cur, RK_NFTA_EXPR_DATA | NLA_F_NESTED, NULL, 0);
+}
+
+static void nft_expr_end(struct nft_batch *b, struct rtattr *data, struct rtattr *elem)
+{
+	nl_end(b->cur, data);
+	nl_end(b->cur, elem);
+}
+
+/* `udp dport PORT`: meta l4proto, cmp, payload, cmp. */
+static void nft_udp_dport(struct nft_batch *b, unsigned short port)
+{
+	struct rtattr *e, *d;
+	unsigned char udp = IPPROTO_UDP;
+	unsigned short p = htons(port);
+
+	d = nft_expr(b, "meta", &e);
+	nft_be32(b, RK_NFTA_META_KEY, RK_NFT_META_L4PROTO);
+	nft_be32(b, RK_NFTA_META_DREG, RK_NFT_REG_1);
+	nft_expr_end(b, d, e);
+	d = nft_expr(b, "cmp", &e);
+	nft_be32(b, RK_NFTA_CMP_SREG, RK_NFT_REG_1);
+	nft_be32(b, RK_NFTA_CMP_OP, RK_NFT_CMP_EQ);
+	struct rtattr *v = nl_put(b->cur, RK_NFTA_CMP_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b->cur, RK_NFTA_DATA_VALUE, &udp, 1);
+	nl_end(b->cur, v);
+	nft_expr_end(b, d, e);
+	d = nft_expr(b, "payload", &e);
+	nft_be32(b, RK_NFTA_PAYLOAD_DREG, RK_NFT_REG_1);
+	nft_be32(b, RK_NFTA_PAYLOAD_BASE, RK_NFT_PAYLOAD_TRANSPORT_HEADER);
+	nft_be32(b, RK_NFTA_PAYLOAD_OFFSET, 2);
+	nft_be32(b, RK_NFTA_PAYLOAD_LEN, 2);
+	nft_expr_end(b, d, e);
+	d = nft_expr(b, "cmp", &e);
+	nft_be32(b, RK_NFTA_CMP_SREG, RK_NFT_REG_1);
+	nft_be32(b, RK_NFTA_CMP_OP, RK_NFT_CMP_EQ);
+	v = nl_put(b->cur, RK_NFTA_CMP_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b->cur, RK_NFTA_DATA_VALUE, &p, 2);
+	nl_end(b->cur, v);
+	nft_expr_end(b, d, e);
+}
+
+/* `immediate` of the verdict `code`, with the chain `chain` for a jump. */
+static void nft_verdict(struct nft_batch *b, int code, const char *chain)
+{
+	struct rtattr *e, *d = nft_expr(b, "immediate", &e);
+	nft_be32(b, RK_NFTA_IMMEDIATE_DREG, RK_NFT_REG_VERDICT);
+	struct rtattr *data = nl_put(b->cur, RK_NFTA_IMMEDIATE_DATA | NLA_F_NESTED, NULL, 0);
+	struct rtattr *v = nl_put(b->cur, RK_NFTA_DATA_VERDICT | NLA_F_NESTED, NULL, 0);
+	nft_be32(b, RK_NFTA_VERDICT_CODE, (unsigned int)code);
+	if (chain)
+		nft_str(b, RK_NFTA_VERDICT_CHAIN, chain);
+	nl_end(b->cur, v);
+	nl_end(b->cur, data);
+	nft_expr_end(b, d, e);
+}
+
+/* Starts a rule at the end of the chain `chain` of the table rkx. Gives the nest of the
+ * expressions. */
+static struct rtattr *nft_rule(struct nft_batch *b, const char *chain)
+{
+	nft_msg(b, RK_NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, AF_INET);
+	nft_str(b, RK_NFTA_RULE_TABLE, "rkx");
+	nft_str(b, RK_NFTA_RULE_CHAIN, chain);
+	return nl_put(b->cur, RK_NFTA_RULE_EXPRESSIONS | NLA_F_NESTED, NULL, 0);
+}
+
+/* Sends one UDP datagram to 127.0.0.1 port `port`. Gives 0, or the errno of sendto. */
+static int nft_udp_send_port(unsigned short port)
+{
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	errno = 0;
+	int err = sendto(s, "x", 1, 0, (struct sockaddr *)&a, sizeof(a)) == 1 ? 0 : errno;
+	close(s);
+	return err;
+}
+
+/* The rules run on the packets: `nft add rule ip rkx out udp dport 9 counter drop` and a jump
+ * to a chain. */
+static void test_nft_exprs(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	struct rtattr *x, *e, *d;
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "out");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "sub");
+	x = nft_rule(&b, "out");
+	nft_udp_dport(&b, 9);
+	d = nft_expr(&b, "counter", &e);
+	nft_expr_end(&b, d, e);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	x = nft_rule(&b, "out");
+	nft_verdict(&b, RK_NFT_JUMP, "sub");
+	nl_end(b.cur, x);
+	x = nft_rule(&b, "sub");
+	nft_udp_dport(&b, 10);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	check("nft: rules with meta, payload, cmp, counter, immediate and a jump",
+	      nft_send(fd, &b, 1) == 0);
+	check("nft: udp dport 9 drop gives EPERM to sendto", nft_udp_send_port(9) == EPERM);
+	check("nft: a rule in the chain of a jump drops udp dport 10", nft_udp_send_port(10) == EPERM);
+	check("nft: the other ports get the policy accept", nft_udp_send_port(11) == 0);
+
+	nft_begin(&b, 0);
+	x = nft_rule(&b, "sub");
+	nft_verdict(&b, RK_NFT_JUMP, "sub");
+	nl_end(b.cur, x);
+	check("nft: a jump of a chain to itself gives ELOOP", nft_send(fd, &b, 1) == -ELOOP);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELCHAIN, 0, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "sub");
+	check("nft: a chain that a rule jumps to gives EBUSY", nft_send(fd, &b, 1) == -EBUSY);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of the rules goes", nft_send(fd, &b, 1) == 0);
+	check("nft: udp dport 9 goes out after the table is gone", nft_udp_send_port(9) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -10948,6 +11121,7 @@ static void test_inet(int port)
 	test_nexthop();
 	test_genl();
 	test_nftables();
+	test_nft_exprs();
 	test_ethtool();
 	test_linkprop();
 	test_slip();
