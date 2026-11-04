@@ -110,7 +110,10 @@ impl NetDriver for Veth {
 
     /// Puts the frame in the queue of the other end, as `veth_xmit` of Linux. A frame to an end
     /// that is down goes away.
-    fn transmit(&self, frame: NetBuf) -> Result<()> {
+    fn transmit(&self, mut frame: NetBuf) -> Result<()> {
+        // The frame goes to another namespace, so it drops its connection, as
+        // `skb_scrub_packet` of Linux.
+        frame.nfct.reset();
         let Some(peer) = self.peer.lock().upgrade() else { return Ok(()) };
         if !self.link_up() {
             return Ok(());

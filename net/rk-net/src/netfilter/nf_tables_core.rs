@@ -13,13 +13,13 @@
 //! of the chain and runs it with no lock on the objects.
 
 use super::{
-    NF_DROP, NFPROTO_IPV4, NFPROTO_IPV6, NFT_BREAK, NFT_CONTINUE, NFT_DATA_VALUE_MAXLEN, NFT_GOTO,
-    NFT_JUMP, NFT_RETURN, NFT_SET_ELEM_INTERVAL_END, NFT_SET_INTERVAL, NFT_SET_MAP, NFT_SET_OBJECT,
+    NF_DROP, NFPROTO_IPV6, NFT_BREAK, NFT_CONTINUE, NFT_DATA_VALUE_MAXLEN, NFT_GOTO, NFT_JUMP,
+    NFT_RETURN, NFT_SET_ELEM_INTERVAL_END, NFT_SET_INTERVAL, NFT_SET_MAP, NFT_SET_OBJECT,
     NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftData, NftTable, be32, be64,
     nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
-use crate::netfilter::NfHookState;
+use crate::netfilter::{NfHookState, NfPktinfo as NftPktinfo, nf_pktinfo as nft_pktinfo};
 use crate::netlink::msg::Attrs;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -465,62 +465,6 @@ pub(super) fn nft_prog(table: &NftTable, c: usize) -> NftProg {
     prog
 }
 
-/// The data of a packet for the expressions, as `struct nft_pktinfo` of Linux.
-struct NftPktinfo {
-    /// The offset of the transport header, or `None` for a fragment that is not the first.
-    thoff: Option<usize>,
-    l4proto: u8,
-}
-
-/// Finds the transport header, as `nft_set_pktinfo_ipv4` and `nft_set_pktinfo_ipv6` of Linux.
-fn nft_pktinfo(pf: u8, d: &[u8]) -> NftPktinfo {
-    let none = NftPktinfo { thoff: None, l4proto: 0 };
-    match pf {
-        NFPROTO_IPV4 => {
-            if d.len() < 20 {
-                return none;
-            }
-            let ihl = usize::from(d[0] & 0xf) * 4;
-            let frag = u16::from_be_bytes([d[6], d[7]]) & 0x1fff;
-            NftPktinfo { thoff: (ihl >= 20 && frag == 0).then_some(ihl), l4proto: d[9] }
-        }
-        NFPROTO_IPV6 => {
-            if d.len() < 40 {
-                return none;
-            }
-            let (mut next, mut off) = (d[6], 40);
-            loop {
-                match next {
-                    // Hop by hop, routing, destination options.
-                    0 | 43 | 60 => {
-                        let Some(h) = d.get(off..off + 2) else { return none };
-                        next = h[0];
-                        off += (usize::from(h[1]) + 1) * 8;
-                    }
-                    // A fragment header: a fragment that is not the first has no transport
-                    // header.
-                    44 => {
-                        let Some(h) = d.get(off..off + 8) else { return none };
-                        if u16::from_be_bytes([h[2], h[3]]) & 0xfff8 != 0 {
-                            return NftPktinfo { thoff: None, l4proto: h[0] };
-                        }
-                        next = h[0];
-                        off += 8;
-                    }
-                    // The authentication header counts its length in words of 4 bytes.
-                    51 => {
-                        let Some(h) = d.get(off..off + 2) else { return none };
-                        next = h[0];
-                        off += (usize::from(h[1]) + 2) * 4;
-                    }
-                    _ => return NftPktinfo { thoff: Some(off), l4proto: next },
-                }
-            }
-        }
-        _ => none,
-    }
-}
-
 /// The registers, as `struct nft_regs` of Linux.
 struct NftRegs {
     verdict: u32,
@@ -668,7 +612,7 @@ pub(super) fn nft_do_chain(prog: &NftProg, policy: u32, skb: &NetBuf, state: &Nf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netfilter::{NF_ACCEPT, NF_INET_LOCAL_OUT};
+    use crate::netfilter::{NF_ACCEPT, NF_INET_LOCAL_OUT, NFPROTO_IPV4};
     use alloc::vec;
 
     const R1: usize = NFT_REG_SIZE;

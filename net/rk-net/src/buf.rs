@@ -8,6 +8,7 @@
 //! data and the clones of the design come later. They add to this type and do not change the
 //! operations here.
 
+use crate::netfilter::nf_conntrack::NfCt;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -33,6 +34,9 @@ pub struct NetBuf {
     /// device does not check it again, as `CHECKSUM_PARTIAL` and `CHECKSUM_UNNECESSARY` of
     /// Linux (#465).
     pub csum_ok: bool,
+    /// The connection of the packet and the state of the packet in it, as `skb->_nfct` of
+    /// Linux.
+    pub nfct: NfCt,
 }
 
 impl NetBuf {
@@ -42,7 +46,15 @@ impl NetBuf {
     pub fn new(headroom: usize, capacity: usize) -> Self {
         let mut area = Vec::with_capacity(headroom + capacity);
         area.resize(headroom, 0);
-        Self { area, head: headroom, tail: headroom, ifindex: 0, protocol: 0, csum_ok: false }
+        Self {
+            area,
+            head: headroom,
+            tail: headroom,
+            ifindex: 0,
+            protocol: 0,
+            csum_ok: false,
+            nfct: NfCt::default(),
+        }
     }
 
     /// Makes a buffer with a copy of `data` and no headroom. A driver uses this for a received
@@ -55,13 +67,22 @@ impl NetBuf {
             ifindex: 0,
             protocol: 0,
             csum_ok: false,
+            nfct: NfCt::default(),
         }
     }
 
     /// Makes a buffer with `len` bytes of data with the value zero and no headroom. A driver
     /// copies a received frame into the data.
     pub fn zeroed(len: usize) -> Self {
-        Self { area: vec![0; len], head: 0, tail: len, ifindex: 0, protocol: 0, csum_ok: false }
+        Self {
+            area: vec![0; len],
+            head: 0,
+            tail: len,
+            ifindex: 0,
+            protocol: 0,
+            csum_ok: false,
+            nfct: NfCt::default(),
+        }
     }
 
     /// The number of bytes of data.
