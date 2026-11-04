@@ -12045,6 +12045,60 @@ static void test_dns_key(void)
 }
 
 /*
+ * The helper of the upcall of request_key, when init runs as /sbin/request-key. Its arguments
+ * are "create KEY UID GID THREAD PROCESS SESSION", as call_sbin_request_key of Linux gives
+ * them. It takes the authority of the key, reads the callout information from the
+ * authorization key, and instantiates or rejects the key. It instantiates with "bad" if the
+ * arguments, the environment, the parent or the file descriptors are not those of Linux.
+ */
+static int request_key_helper(int argc, char **argv)
+{
+	char callout[64] = "";
+	if (argc != 8 || strcmp(argv[1], "create") != 0)
+		return 1;
+	long key = atol(argv[2]);
+	if (syscall(SYS_keyctl, 16 /* KEYCTL_ASSUME_AUTHORITY */, key) <= 0)
+		return 1;
+	long n = syscall(SYS_keyctl, 11 /* KEYCTL_READ */, -7 /* KEY_SPEC_REQKEY_AUTH_KEY */,
+			 callout, sizeof(callout) - 1);
+	if (n < 0)
+		return 1;
+	if (strcmp(callout, "rk-reject") == 0)
+		return syscall(SYS_keyctl, 19 /* KEYCTL_REJECT */, key, 30, EKEYREJECTED, 0) != 0;
+	const char *path = getenv("PATH");
+	const char *home = getenv("HOME");
+	int good = strcmp(callout, "rk-callout") == 0 && getppid() == 0 && getuid() == 0 &&
+		   path && strcmp(path, "/sbin:/bin:/usr/sbin:/usr/bin") == 0 && home &&
+		   strcmp(home, "/") == 0 && fcntl(0, F_GETFD) == -1;
+	const char *payload = good ? "made by request-key" : "bad";
+	return syscall(SYS_keyctl, 12 /* KEYCTL_INSTANTIATE */, key, payload, strlen(payload),
+		       -2 /* KEY_SPEC_PROCESS_KEYRING */) != 0;
+}
+
+/*
+ * The upcall of request_key: the kernel runs /sbin/request-key, here a link to init, and the
+ * helper instantiates or rejects the key (#539).
+ */
+static void test_request_key(void)
+{
+	char buf[64] = "";
+	mkdir("/sbin", 0755);
+	if (symlink("/init", "/sbin/request-key") != 0 && errno != EEXIST) {
+		check("keys: a link /sbin/request-key", 0);
+		return;
+	}
+	long key = syscall(SYS_request_key, "user", "rk-upcall", "rk-callout", -2);
+	long n = key > 0 ? syscall(SYS_keyctl, 11 /* KEYCTL_READ */, key, buf, sizeof(buf) - 1) : -1;
+	check("keys: request_key runs /sbin/request-key, which instantiates the key",
+	      n == 19 && strcmp(buf, "made by request-key") == 0);
+	errno = 0;
+	check("keys: a reject of /sbin/request-key gives EKEYREJECTED",
+	      syscall(SYS_request_key, "user", "rk-upcall-reject", "rk-reject", -2) == -1 &&
+		      errno == EKEYREJECTED);
+	unlink("/sbin/request-key");
+}
+
+/*
  * The filter of a uevent socket, as the monitor of libudev. udevd sends its events to the group
  * 2 with the header "libudev". The filter of the listener keeps only the datagrams that start
  * with "libu", so the other datagram does not come.
@@ -12207,6 +12261,7 @@ static void test_all(void)
 	test_uevent_filter();
 	test_uinput();
 	test_dns_key();
+	test_request_key();
 	test_xattr();
 	test_fifo();
 	test_file_locks();
@@ -12235,6 +12290,9 @@ static void test_all(void)
 
 int main(int argc, char **argv)
 {
+	const char *name = strrchr(argv[0], '/');
+	if (strcmp(name ? name + 1 : argv[0], "request-key") == 0)
+		return request_key_helper(argc, argv);
 	setvbuf(stdout, NULL, _IONBF, 0);
 	/*
 	 * With the first argument "only", init does not run the general checks. It runs only the
@@ -12257,8 +12315,10 @@ int main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "pidns") == 0)
 		test_pid_ns();
-	if (argc > 1 && strcmp(argv[1], "keys") == 0)
+	if (argc > 1 && strcmp(argv[1], "keys") == 0) {
 		test_dns_key();
+		test_request_key();
+	}
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)
 		test_smp();
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)

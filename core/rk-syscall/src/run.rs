@@ -70,6 +70,9 @@ pub fn spawn_init(
     envp: Vec<Vec<u8>>,
 ) -> Result<(), Errno> {
     let console = fs.open(&fs.root().clone(), b"/dev/console", rk_abi::native::open::O_RDWR, 0);
+    // The helpers of the kernel start in the file system of the boot, as children of kthreadd.
+    crate::umh::set_fs(&fs);
+    rk_proc::keys::set_upcall(crate::keys::upcall);
     let thread = rk_proc::create_init(fs)?;
     let process = thread.process().clone();
     if let (Ok(console), Some(files)) = (console, process.files()) {
@@ -150,7 +153,7 @@ fn page_fault(
 }
 
 /// Runs the user thread until it ends.
-fn run(thread: Arc<Thread>, mut regs: UserContext) {
+pub(crate) fn run(thread: Arc<Thread>, mut regs: UserContext) {
     let status = 'run: {
         // A new traced thread stops for its tracer before its first instruction.
         if let Some(status) = crate::signal::deliver(&thread, &mut regs, None) {
