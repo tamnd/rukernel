@@ -14,7 +14,7 @@ use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::{
-    SO_ATTACH_FILTER, SO_PASSCRED, SO_PASSPIDFD, SO_PEERPIDFD, SOL_SOCKET,
+    SO_ATTACH_BPF, SO_ATTACH_FILTER, SO_PASSCRED, SO_PASSPIDFD, SO_PEERPIDFD, SOL_SOCKET,
 };
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
@@ -394,6 +394,15 @@ pub(crate) fn setsockopt(
 ) -> SysResult {
     let (_, sock) = socket(cx, fd)?;
     let len = usize::try_from(len as i32).map_err(|_| Errno::EINVAL)?;
+    if level as u32 == SOL_SOCKET && name as u32 == SO_ATTACH_BPF {
+        // `sk_setsockopt` of Linux: the value is the descriptor of a program.
+        if len != 4 {
+            return Err(Errno::EINVAL);
+        }
+        let ufd: u32 = cx.read_val(value)?;
+        sock.attach_bpf(crate::bpf::sk_filter_of(cx, ufd)?)?;
+        return Ok(0);
+    }
     let v = if level as u32 == SOL_SOCKET && name as u32 == SO_ATTACH_FILTER {
         read_fprog(cx, value, len)?
     } else if len == 0 {

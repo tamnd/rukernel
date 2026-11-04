@@ -27,15 +27,16 @@ use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
 };
 use rk_abi::native::socket::{
-    SO_ACCEPTCONN, SO_BINDTODEVICE, SO_COOKIE, SO_DOMAIN, SO_ERROR, SO_PASSCRED, SO_PASSPIDFD,
-    SO_PASSSEC, SO_PEEK_OFF, SO_PEERCRED, SO_PEERGROUPS, SO_PEERSEC, SO_PROTOCOL, SO_SNDLOWAT,
-    SO_TYPE, SOL_SOCKET,
+    SO_ACCEPTCONN, SO_BINDTODEVICE, SO_COOKIE, SO_DETACH_BPF, SO_DOMAIN, SO_ERROR, SO_PASSCRED,
+    SO_PASSPIDFD, SO_PASSSEC, SO_PEEK_OFF, SO_PEERCRED, SO_PEERGROUPS, SO_PEERSEC, SO_PROTOCOL,
+    SO_SNDLOWAT, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
     AF_UNIX, AF_UNSPEC, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, SHUT_RD,
     SHUT_RDWR, SHUT_WR, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM,
 };
+use rk_net::filter::SkFilter;
 use rk_net::{
     Cred, Message, NO_CRED, NodeId, Options, PathOps, Received, Socket, current_cred, wait_for,
 };
@@ -233,6 +234,8 @@ struct State {
     passpidfd: bool,
     peek_off: i32,
     options: Options,
+    /// The program of `SO_ATTACH_BPF`, which filters the datagrams that the socket receives.
+    bpf_filter: Option<Arc<dyn SkFilter>>,
 }
 
 impl State {
@@ -303,6 +306,7 @@ impl Unix {
                 passpidfd: false,
                 peek_off: -1,
                 options: Options::default(),
+                bpf_filter: None,
             }),
             wait: Arc::new(WaitQueue::new()),
             inflight: AtomicUsize::new(0),
@@ -663,6 +667,17 @@ impl Unix {
         };
         if self.state.lock().shut_wr {
             return Err(Errno::EPIPE);
+        }
+        // The filter of the receiver, as `sk_filter` in `unix_dgram_sendmsg` of Linux. The
+        // sender does not see a dropped datagram.
+        let mut msg = msg;
+        let filter = other.state.lock().bpf_filter.clone();
+        if let Some(f) = filter {
+            let keep = f.run(&msg.data) as usize;
+            if keep == 0 {
+                return Ok(len);
+            }
+            msg.data.truncate(keep);
         }
         // Wait for space in the send buffer, then for space in the queue of the receiver.
         wait_for(&self.wait, timeout, || {
@@ -1173,6 +1188,9 @@ impl Socket for Unix {
                 let Some(v) = value.first_chunk::<4>() else { return Err(Errno::EINVAL) };
                 s.peek_off = i32::from_ne_bytes(*v);
             }
+            SO_DETACH_BPF => {
+                s.bpf_filter.take().ok_or(Errno::ENOENT)?;
+            }
             SO_BINDTODEVICE => {
                 if value.first().is_some_and(|&b| b != 0) {
                     return Err(Errno::ENODEV);
@@ -1186,6 +1204,11 @@ impl Socket for Unix {
         }
         drop(s);
         self.wake();
+        Ok(())
+    }
+
+    fn attach_bpf(&self, prog: Arc<dyn SkFilter>) -> Result<()> {
+        self.state.lock().bpf_filter = Some(prog);
         Ok(())
     }
 

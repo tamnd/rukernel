@@ -5,7 +5,10 @@ use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
 use rk_abi::Errno;
 use rk_bpf::map::MapEnv;
+use rk_bpf::prog::prog_type::BPF_PROG_TYPE_SOCKET_FILTER;
+use rk_bpf::prog::{BpfProg, bpf_prog_of, run_socket_filter};
 use rk_bpf::syscall::Env;
+use rk_net::filter::SkFilter;
 use rk_vfs::file::File;
 
 /// The pages of free memory that a new map leaves for the rest of the system.
@@ -70,4 +73,50 @@ pub(crate) fn bpf(
         size_common as u32,
     )?;
     Ok(r as u64)
+}
+
+/// What the helpers of a program that filters packets see. The filter runs in the call that
+/// sends the packet, so it does not give the task to the helpers.
+struct FilterHelperEnv;
+
+impl rk_bpf::helpers::HelperEnv for FilterHelperEnv {
+    fn map_env(&self) -> MapEnv {
+        MapEnv { nr_cpus: rk_frame::cpu::count(), cpu: rk_frame::cpu::id() }
+    }
+
+    fn ktime_get_ns(&self) -> u64 {
+        crate::info::uptime_ns()
+    }
+
+    fn current_pid_tgid(&self) -> Option<u64> {
+        None
+    }
+
+    fn current_uid_gid(&self) -> Option<u64> {
+        None
+    }
+
+    fn current_cgroup_id(&self) -> u64 {
+        0
+    }
+}
+
+/// A socket filter of `SO_ATTACH_BPF`.
+struct BpfSkFilter(Arc<BpfProg>);
+
+impl SkFilter for BpfSkFilter {
+    fn run(&self, data: &[u8]) -> u32 {
+        run_socket_filter(&self.0, data, 0, &FilterHelperEnv)
+    }
+}
+
+/// The socket filter of the program file `ufd`, as `sk_attach_bpf` and `bpf_prog_get_type` of
+/// Linux. A descriptor that is not a socket filter program gives `EINVAL`.
+pub(crate) fn sk_filter_of(cx: &Cx<'_>, ufd: u32) -> Result<Arc<dyn SkFilter>, Errno> {
+    let file = cx.fdget(u64::from(ufd))?;
+    let prog = bpf_prog_of(&file).ok_or(Errno::EINVAL)?;
+    if prog.prog_type != BPF_PROG_TYPE_SOCKET_FILTER {
+        return Err(Errno::EINVAL);
+    }
+    Ok(Arc::new(BpfSkFilter(prog)))
 }

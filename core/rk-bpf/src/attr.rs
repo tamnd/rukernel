@@ -30,6 +30,8 @@ pub mod last_field {
     pub const BPF_MAP_GET_NEXT_KEY: usize = 24;
     /// `BPF_MAP_FREEZE`: `map_fd`.
     pub const BPF_MAP_FREEZE: usize = 4;
+    /// `BPF_PROG_LOAD`: `keyring_id`.
+    pub const BPF_PROG_LOAD: usize = 168;
 }
 
 /// Checks the size of an argument that a program gives, as `bpf_check_uarg_tail_zero` of Linux.
@@ -149,6 +151,84 @@ pub mod map_elem {
     pub const VALUE: usize = 16;
     /// `flags`.
     pub const FLAGS: usize = 24;
+}
+
+/// The fields of `BPF_PROG_LOAD`.
+pub mod prog_load {
+    /// `prog_type`.
+    pub const PROG_TYPE: usize = 0;
+    /// `insn_cnt`.
+    pub const INSN_CNT: usize = 4;
+    /// `insns`.
+    pub const INSNS: usize = 8;
+    /// `license`.
+    pub const LICENSE: usize = 16;
+    /// `log_level`.
+    pub const LOG_LEVEL: usize = 24;
+    /// `log_size`.
+    pub const LOG_SIZE: usize = 28;
+    /// `log_buf`.
+    pub const LOG_BUF: usize = 32;
+    /// `kern_version`.
+    pub const KERN_VERSION: usize = 40;
+    /// `prog_flags`.
+    pub const PROG_FLAGS: usize = 44;
+    /// `prog_name`, 16 bytes.
+    pub const PROG_NAME: usize = 48;
+    /// `prog_ifindex`.
+    pub const PROG_IFINDEX: usize = 64;
+    /// `expected_attach_type`.
+    pub const EXPECTED_ATTACH_TYPE: usize = 68;
+    /// `prog_btf_fd`.
+    pub const PROG_BTF_FD: usize = 72;
+    /// `func_info_rec_size`.
+    pub const FUNC_INFO_REC_SIZE: usize = 76;
+    /// `func_info`.
+    pub const FUNC_INFO: usize = 80;
+    /// `func_info_cnt`.
+    pub const FUNC_INFO_CNT: usize = 88;
+    /// `line_info_rec_size`.
+    pub const LINE_INFO_REC_SIZE: usize = 92;
+    /// `line_info`.
+    pub const LINE_INFO: usize = 96;
+    /// `line_info_cnt`.
+    pub const LINE_INFO_CNT: usize = 104;
+    /// `attach_btf_id`.
+    pub const ATTACH_BTF_ID: usize = 108;
+    /// `attach_prog_fd`.
+    pub const ATTACH_PROG_FD: usize = 112;
+    /// `core_relo_cnt`.
+    pub const CORE_RELO_CNT: usize = 116;
+    /// `fd_array`.
+    pub const FD_ARRAY: usize = 120;
+    /// `core_relos`.
+    pub const CORE_RELOS: usize = 128;
+    /// `core_relo_rec_size`.
+    pub const CORE_RELO_REC_SIZE: usize = 136;
+    /// `log_true_size`.
+    pub const LOG_TRUE_SIZE: usize = 140;
+    /// `prog_token_fd`.
+    pub const PROG_TOKEN_FD: usize = 144;
+    /// `fd_array_cnt`.
+    pub const FD_ARRAY_CNT: usize = 148;
+    /// `signature`.
+    pub const SIGNATURE: usize = 152;
+    /// `signature_size`.
+    pub const SIGNATURE_SIZE: usize = 160;
+    /// `keyring_id`.
+    pub const KEYRING_ID: usize = 164;
+}
+
+/// The fields of `struct bpf_common_attr`.
+pub mod common {
+    /// `log_buf`.
+    pub const LOG_BUF: usize = 0;
+    /// `log_size`.
+    pub const LOG_SIZE: usize = 8;
+    /// `log_level`.
+    pub const LOG_LEVEL: usize = 12;
+    /// `log_true_size`.
+    pub const LOG_TRUE_SIZE: usize = 16;
 }
 
 #[cfg(test)]

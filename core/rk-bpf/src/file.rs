@@ -23,17 +23,21 @@ fn anon_inode_dev() -> u64 {
     *DEV.call_once(rk_vfs::inode::anon_dev)
 }
 
+/// The attributes of the anonymous inode. It has the mode 0600 and no file type, as in Linux.
+pub(crate) fn anon_inode_metadata() -> Metadata {
+    Metadata {
+        dev: anon_inode_dev(),
+        ino: 1,
+        mode: 0o600,
+        nlink: 1,
+        blksize: 4096,
+        ..Metadata::default()
+    }
+}
+
 impl FileOps for BpfMapFile {
     fn metadata(&self) -> Option<Metadata> {
-        // The anonymous inode of Linux has the mode 0600 and no file type.
-        Some(Metadata {
-            dev: anon_inode_dev(),
-            ino: 1,
-            mode: 0o600,
-            nlink: 1,
-            blksize: 4096,
-            ..Metadata::default()
-        })
+        Some(anon_inode_metadata())
     }
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {

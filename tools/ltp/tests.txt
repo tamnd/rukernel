@@ -46,6 +46,10 @@ alarm05
 alarm06
 alarm07
 bpf_map01
+bpf_prog01
+bpf_prog02
+bpf_prog03
+bpf_prog04
 brk01
 brk02
 clock_gettime01

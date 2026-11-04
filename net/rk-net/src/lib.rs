@@ -246,6 +246,11 @@ pub trait Socket: Send + Sync {
     }
     /// `setsockopt`.
     fn set_option(&self, level: u32, name: u32, value: &[u8]) -> Result<()>;
+    /// `SO_ATTACH_BPF`: the eBPF program that filters the packets that the socket receives, as
+    /// `sk_attach_bpf` of Linux. The default gives `ENOPROTOOPT`.
+    fn attach_bpf(&self, _prog: Arc<dyn filter::SkFilter>) -> Result<()> {
+        Err(Errno::ENOPROTOOPT)
+    }
     /// The events of `poll`.
     fn poll(&self) -> u32;
     /// Adds to `table` the queues that a new event of the socket wakes, as `poll_wait` of Linux.
