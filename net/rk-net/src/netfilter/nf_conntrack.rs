@@ -11,8 +11,9 @@
 //! connection in the table (`__nf_conntrack_confirm`). So a packet that a hook drops makes no
 //! connection.
 //!
-//! The trackers here are the generic one (the addresses only), UDP, UDP-Lite, ICMP and
-//! ICMPv6. TCP, SCTP and DCCP have their ports in the tuple, with the generic timeout. An ICMP
+//! The trackers here are the generic one (the addresses only), TCP (in `proto_tcp`), UDP,
+//! UDP-Lite, ICMP and ICMPv6. SCTP and DCCP have their ports in the tuple, with the generic
+//! timeout. An ICMP
 //! error belongs to the connection of the packet in it, as `IP_CT_RELATED`.
 //!
 //! The hooks are there while a user needs them, as `nf_ct_netns_get` and `nf_ct_netns_put` of
@@ -39,6 +40,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
+
+pub mod proto_tcp;
 
 /// The state of a packet of a connection that has seen packets in both directions.
 pub const IP_CT_ESTABLISHED: u8 = 0;
@@ -204,6 +207,8 @@ pub struct NfConn {
     /// The tick after which a UDP connection with a reply is a stream, as
     /// `ct->proto.udp.stream_ts` of Linux.
     udp_stream_ts: AtomicU64,
+    /// The state of a TCP connection, as `ct->proto.tcp` of Linux.
+    tcp: SpinLock<proto_tcp::TcpState>,
 }
 
 impl NfConn {
@@ -487,14 +492,42 @@ fn init_conntrack(tuple: &NfConntrackTuple) -> Option<Arc<NfConn>> {
         mark: AtomicU32::new(0),
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         udp_stream_ts: AtomicU64::new(t + UDP_STREAM_DELAY_SECS * crate::options::hz()),
+        tcp: SpinLock::new(proto_tcp::TcpState::default()),
     }))
 }
 
+/// The length of the IP packet `d` from its header, or the bytes that are there.
+fn ip_len(pf: u8, d: &[u8]) -> usize {
+    let len = match pf {
+        NFPROTO_IPV4 => usize::from(u16::from_be_bytes([d[2], d[3]])),
+        _ => 40 + usize::from(u16::from_be_bytes([d[4], d[5]])),
+    };
+    len.min(d.len())
+}
+
+/// Removes a connection from the table, as `nf_ct_kill` of Linux. The packets that have it keep
+/// it.
+pub fn nf_ct_kill(ct: &NfConn) {
+    if ct.is_confirmed() {
+        CT.lock().remove(ct);
+    } else {
+        ct.set_status(IPS_DYING);
+    }
+}
+
 /// The work of the tracker of the protocol for a packet, as `nf_conntrack_handle_packet` of
-/// Linux. Gives `false` for a packet that is not valid for the connection.
-fn handle_packet(ct: &NfConn, ctinfo: u8) -> bool {
+/// Linux. `d` is the packet and `thoff` the offset of its transport header.
+fn handle_packet(ct: &NfConn, ctinfo: u8, d: &[u8], thoff: usize) -> proto_tcp::Verdict {
+    use proto_tcp::Verdict;
     let tuple = &ct.tuple[IP_CT_DIR_ORIGINAL];
+    let ok = |b: bool| if b { Verdict::Accept } else { Verdict::Invalid };
     match tuple.protonum {
+        IPPROTO_TCP => {
+            let dir = if ctinfo >= IP_CT_IS_REPLY { IP_CT_DIR_REPLY } else { IP_CT_DIR_ORIGINAL };
+            let len = ip_len(tuple.l3num, d).saturating_sub(thoff);
+            let l4 = d.get(thoff..).unwrap_or_default();
+            proto_tcp::tcp_packet(ct, dir, l4, len, !ct.is_confirmed())
+        }
         IPPROTO_UDP | IPPROTO_UDPLITE => {
             // `nf_conntrack_udp_packet`: a connection with a reply that lives for 2 s gets the
             // timeout of a stream and stays.
@@ -512,19 +545,19 @@ fn handle_packet(ct: &NfConn, ctinfo: u8) -> bool {
             } else {
                 ct.refresh(timeout("nf_conntrack_udp_timeout"));
             }
-            true
+            ok(true)
         }
         _ if is_icmp(tuple.l3num, tuple.protonum) => {
             // `icmp_packet`: only a request starts a connection.
             if ctinfo == IP_CT_NEW && !icmp_valid_new(tuple.l3num, tuple.icmp_type()) {
-                return false;
+                return ok(false);
             }
             ct.refresh(new_timeout(tuple.l3num, tuple.protonum));
-            true
+            ok(true)
         }
         _ => {
             ct.refresh(timeout("nf_conntrack_generic_timeout"));
-            true
+            ok(true)
         }
     }
 }
@@ -567,29 +600,40 @@ pub fn nf_conntrack_in(skb: &mut NetBuf, state: &NfHookState) -> u32 {
         }
         return NF_ACCEPT;
     }
-    let found = CT.lock().find(&tuple);
-    let (ct, ctinfo) = match found {
-        Some((ct, IP_CT_DIR_REPLY)) => {
-            ct.set_status(IPS_SEEN_REPLY);
-            (ct, IP_CT_ESTABLISHED_REPLY)
-        }
-        Some((ct, _)) => {
-            let info =
-                if ct.status() & IPS_SEEN_REPLY != 0 { IP_CT_ESTABLISHED } else { IP_CT_NEW };
-            (ct, info)
-        }
-        None => {
-            if nf_conntrack_count_full() {
-                return NF_DROP;
+    // A segment that opens a closed TCP connection again removes it, and the lookup runs
+    // again, as `NF_REPEAT` of Linux.
+    for _ in 0..2 {
+        let found = CT.lock().find(&tuple);
+        let (ct, ctinfo) = match found {
+            Some((ct, IP_CT_DIR_REPLY)) => (ct, IP_CT_ESTABLISHED_REPLY),
+            Some((ct, _)) => {
+                let info =
+                    if ct.status() & IPS_SEEN_REPLY != 0 { IP_CT_ESTABLISHED } else { IP_CT_NEW };
+                (ct, info)
             }
-            let Some(ct) = init_conntrack(&tuple) else { return NF_ACCEPT };
-            (ct, IP_CT_NEW)
+            None => {
+                if nf_conntrack_count_full() {
+                    return NF_DROP;
+                }
+                let Some(ct) = init_conntrack(&tuple) else { return NF_ACCEPT };
+                (ct, IP_CT_NEW)
+            }
+        };
+        match handle_packet(&ct, ctinfo, skb.data(), thoff) {
+            proto_tcp::Verdict::Accept => {}
+            proto_tcp::Verdict::Invalid => return NF_ACCEPT,
+            proto_tcp::Verdict::Repeat => {
+                nf_ct_kill(&ct);
+                continue;
+            }
+            proto_tcp::Verdict::Kill => nf_ct_kill(&ct),
         }
-    };
-    if !handle_packet(&ct, ctinfo) {
+        if ctinfo == IP_CT_ESTABLISHED_REPLY {
+            ct.set_status(IPS_SEEN_REPLY);
+        }
+        skb.nfct.set(ct, ctinfo);
         return NF_ACCEPT;
     }
-    skb.nfct.set(ct, ctinfo);
     NF_ACCEPT
 }
 
@@ -933,6 +977,115 @@ mod tests {
         assert_eq!(nf_conntrack_confirm(&mut y), NF_ACCEPT);
         assert_eq!(x.nfct, y.nfct);
         assert_eq!(nf_conntrack_count(), 2);
+    }
+
+    /// A TCP header with no options and `data` bytes of data.
+    fn tcp(sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, data: usize) -> Vec<u8> {
+        let mut h = vec![0u8; 20 + data];
+        h[0..2].copy_from_slice(&sport.to_be_bytes());
+        h[2..4].copy_from_slice(&dport.to_be_bytes());
+        h[4..8].copy_from_slice(&seq.to_be_bytes());
+        h[8..12].copy_from_slice(&ack.to_be_bytes());
+        h[12] = 5 << 4;
+        h[13] = flags;
+        h[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        h
+    }
+
+    const SYN: u8 = 0x02;
+    const ACK: u8 = 0x10;
+    const FIN: u8 = 0x01;
+    const RST: u8 = 0x04;
+
+    /// Runs the hooks of a segment that comes in.
+    fn came_in(l4: &[u8]) -> NetBuf {
+        let mut skb = ip4(IPPROTO_TCP, B, A, l4);
+        nf_conntrack_in(&mut skb, &state(NF_INET_PRE_ROUTING));
+        nf_conntrack_confirm(&mut skb);
+        skb
+    }
+
+    fn tcp_out(l4: &[u8]) -> NetBuf {
+        out(ip4(IPPROTO_TCP, A, B, l4))
+    }
+
+    #[test]
+    fn a_tcp_connection_goes_through_its_states() {
+        use proto_tcp::*;
+        let _s = SERIAL.lock();
+        fresh(50_000);
+        let hz = crate::options::hz();
+        let syn = tcp_out(&tcp(5000, 80, 100, 0, SYN, 0));
+        assert_eq!(info(&syn), Some(IP_CT_NEW));
+        let (ct, _) = syn.nfct.get().unwrap();
+        let ct = ct.clone();
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_SYN_SENT);
+        assert_eq!(ct.expires(), 120 * hz);
+        let sa = came_in(&tcp(80, 5000, 900, 101, SYN | ACK, 0));
+        assert_eq!(info(&sa), Some(IP_CT_ESTABLISHED_REPLY));
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_SYN_RECV);
+        let a = tcp_out(&tcp(5000, 80, 101, 901, ACK, 0));
+        assert_eq!(info(&a), Some(IP_CT_ESTABLISHED));
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_ESTABLISHED);
+        assert!(ct.status() & IPS_ASSURED != 0);
+        assert_eq!(ct.expires(), 432_000 * hz);
+        // Data that the other end did not take yet gets the timeout of 300 s.
+        let _ = tcp_out(&tcp(5000, 80, 101, 901, ACK, 10));
+        assert_eq!(ct.expires(), 300 * hz);
+        let _ = came_in(&tcp(80, 5000, 901, 111, ACK, 0));
+        assert_eq!(ct.expires(), 432_000 * hz);
+        // A segment far out of the window is invalid.
+        let bad = came_in(&tcp(80, 5000, 901 + 0x4000_0000, 111, ACK, 0));
+        assert_eq!(info(&bad), None);
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_ESTABLISHED);
+        // The close.
+        let _ = tcp_out(&tcp(5000, 80, 111, 901, FIN | ACK, 0));
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_FIN_WAIT);
+        let _ = came_in(&tcp(80, 5000, 901, 112, FIN | ACK, 0));
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_LAST_ACK);
+        let _ = tcp_out(&tcp(5000, 80, 112, 902, ACK, 0));
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_TIME_WAIT);
+        assert_eq!(ct.expires(), 120 * hz);
+        // A SYN of the same ports opens a new connection.
+        let again = tcp_out(&tcp(5000, 80, 5000, 0, SYN, 0));
+        assert_eq!(info(&again), Some(IP_CT_NEW));
+        assert!(!Arc::ptr_eq(again.nfct.get().unwrap().0, &ct));
+        assert!(ct.status() & IPS_DYING != 0);
+        assert_eq!(nf_conntrack_count(), 1);
+    }
+
+    #[test]
+    fn a_rst_for_a_syn_ends_the_connection_and_a_lone_ack_is_picked_up() {
+        use proto_tcp::*;
+        let _s = SERIAL.lock();
+        fresh(60_000);
+        let hz = crate::options::hz();
+        let syn = tcp_out(&tcp(5001, 81, 100, 0, SYN, 0));
+        let ct = syn.nfct.get().unwrap().0.clone();
+        let rst = came_in(&tcp(81, 5001, 0, 101, RST | ACK, 0));
+        assert_eq!(info(&rst), Some(IP_CT_ESTABLISHED_REPLY));
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_CLOSE);
+        assert_eq!(nf_conntrack_count(), 0);
+        // A FIN alone, or a SYN with a FIN, is not valid.
+        assert_eq!(info(&tcp_out(&tcp(5002, 81, 1, 0, FIN, 0))), None);
+        assert_eq!(info(&tcp_out(&tcp(5002, 81, 1, 0, SYN | FIN, 0))), None);
+        // An ACK in the middle of a connection starts one, with a short timeout until the
+        // reply.
+        let mid = tcp_out(&tcp(5003, 81, 7000, 8000, ACK, 0));
+        assert_eq!(info(&mid), Some(IP_CT_NEW));
+        let ct = mid.nfct.get().unwrap().0.clone();
+        assert_eq!(tcp_state(&ct), TCP_CONNTRACK_ESTABLISHED);
+        assert_eq!(ct.expires(), 300 * hz);
+        // The reply makes `IPS_SEEN_REPLY`, and the next segment makes the connection assured.
+        let _ = came_in(&tcp(81, 5003, 8000, 7000, ACK, 0));
+        assert!(ct.status() & IPS_ASSURED == 0);
+        let _ = tcp_out(&tcp(5003, 81, 7000, 8000, ACK, 0));
+        assert!(ct.status() & IPS_ASSURED != 0);
+        assert_eq!(ct.expires(), 432_000 * hz);
+        // With `nf_conntrack_tcp_loose` 0 the ACK is not valid.
+        sysctl::write("netfilter/nf_conntrack_tcp_loose", b"0").unwrap();
+        assert_eq!(info(&tcp_out(&tcp(5004, 81, 7000, 8000, ACK, 0))), None);
+        sysctl::write("netfilter/nf_conntrack_tcp_loose", b"1").unwrap();
     }
 
     #[test]
