@@ -97,6 +97,7 @@ name = "rk-fs-cgroup"
 version = "0.5.5"
 dependencies = [
  "rk-abi",
+ "rk-bpf",
  "rk-cgroup",
  "rk-frame",
  "rk-proc",

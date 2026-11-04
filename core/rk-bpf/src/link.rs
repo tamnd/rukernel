@@ -284,6 +284,7 @@ mod tests {
             run_cnt: core::sync::atomic::AtomicU64::new(0),
             load_time: 0,
             uid: 0,
+            enforce_expected_attach_type: false,
         })
     }
 

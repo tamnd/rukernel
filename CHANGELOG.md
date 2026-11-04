@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The cgroup programs of kernel/bpf/cgroup.c of Linux: `BPF_PROG_ATTACH`, `BPF_PROG_DETACH` and `BPF_PROG_QUERY` of bpf(2), and `BPF_LINK_CREATE` for a cgroup, with the flags `BPF_F_ALLOW_OVERRIDE`, `BPF_F_ALLOW_MULTI`, `BPF_F_REPLACE`, `BPF_F_BEFORE` and `BPF_F_AFTER` and the effective arrays of the ancestors. The verifier takes the program types `BPF_PROG_TYPE_CGROUP_SKB`, `BPF_PROG_TYPE_CGROUP_SOCK` and `BPF_PROG_TYPE_CGROUP_DEVICE` with their contexts and checks the return code. The rmdir of a cgroup detaches its programs. The kernel does not run the programs at the hooks yet (#537).
+
 ## [0.5.5] - 2026-11-04
 
 ### Added

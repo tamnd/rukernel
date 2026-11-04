@@ -23,6 +23,7 @@ use crate::map::BpfMap;
 use crate::prog::prog_type::*;
 use crate::prog::sk_buff;
 use crate::tnum::{TNUM_UNKNOWN, Tnum};
+use crate::uapi::attach_type::*;
 use crate::uapi::flags::{BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -245,9 +246,11 @@ struct Env<'a> {
     insns: &'a [BpfInsn],
     maps: &'a [Arc<BpfMap>],
     prog_type: u32,
+    expected_attach_type: u32,
     bpf_capable: bool,
     allow_ptr_leaks: bool,
     log: &'a mut BpfVerifierLog,
+    enforce_expected_attach_type: bool,
     id_gen: u32,
     insn_processed: u32,
 }
@@ -267,12 +270,16 @@ pub struct Verified {
     pub used_maps: Vec<Arc<BpfMap>>,
     /// The number of instructions that the verifier looked at, `insn_processed` of Linux.
     pub insn_processed: u32,
+    /// The program can attach only at its expected attach type.
+    pub enforce_expected_attach_type: bool,
 }
 
 /// What the verifier needs of the loader.
 pub struct VerifierOpts {
     /// The type of the program.
     pub prog_type: u32,
+    /// The attach type that the program expects.
+    pub expected_attach_type: u32,
     /// The loader has `CAP_BPF` or `CAP_SYS_ADMIN`.
     pub bpf_capable: bool,
     /// The loader has `CAP_PERFMON`, so a program can show addresses, `allow_ptr_leaks` of Linux.
@@ -281,7 +288,13 @@ pub struct VerifierOpts {
 
 /// Tells if the verifier knows the program type, as `find_prog_type` of Linux.
 pub fn prog_type_known(prog_type: u32) -> bool {
-    prog_type == BPF_PROG_TYPE_SOCKET_FILTER
+    matches!(
+        prog_type,
+        BPF_PROG_TYPE_SOCKET_FILTER
+            | BPF_PROG_TYPE_CGROUP_SKB
+            | BPF_PROG_TYPE_CGROUP_SOCK
+            | BPF_PROG_TYPE_CGROUP_DEVICE
+    )
 }
 
 /// Checks the program, as `bpf_check` of Linux. `map_by_fd` gives the map of a file
@@ -297,9 +310,11 @@ pub fn bpf_check(
         insns: &insns,
         maps: &used_maps,
         prog_type: opts.prog_type,
+        expected_attach_type: opts.expected_attach_type,
         bpf_capable: opts.bpf_capable,
         allow_ptr_leaks: opts.allow_ptr_leaks,
         log,
+        enforce_expected_attach_type: false,
         id_gen: 0,
         insn_processed: 0,
     };
@@ -307,7 +322,8 @@ pub fn bpf_check(
     print_verification_stats(&mut env);
     r?;
     let insn_processed = env.insn_processed;
-    Ok(Verified { insns, used_maps, insn_processed })
+    let enforce_expected_attach_type = env.enforce_expected_attach_type;
+    Ok(Verified { insns, used_maps, insn_processed, enforce_expected_attach_type })
 }
 
 /// The last line of the log, `print_verification_stats` of Linux.
@@ -1126,27 +1142,58 @@ impl Env<'_> {
         Ok(())
     }
 
-    /// `sk_filter_is_valid_access` and `bpf_skb_is_valid_access` of Linux.
+    /// The `is_valid_access` of the program type, as `bpf_verifier_ops` of Linux.
     fn is_valid_ctx_access(&self, off: i32, size: u32, t: Access) -> bool {
-        use sk_buff::*;
-        if self.prog_type != BPF_PROG_TYPE_SOCKET_FILTER {
-            return false;
-        }
-        if off < 0 || off as u32 >= SIZE || !(off as u32).is_multiple_of(size) {
+        if off < 0 || !(off as u32).is_multiple_of(size) {
             return false;
         }
         let off = off as u32;
-        if (CB..CB_END).contains(&off) {
-            return off + size <= CB_END;
+        match self.prog_type {
+            BPF_PROG_TYPE_SOCKET_FILTER => skb_is_valid_access(off, size, t, false),
+            BPF_PROG_TYPE_CGROUP_SKB => skb_is_valid_access(off, size, t, true),
+            BPF_PROG_TYPE_CGROUP_SOCK => {
+                sock_filter_is_valid_access(off, size, t, self.expected_attach_type)
+            }
+            BPF_PROG_TYPE_CGROUP_DEVICE => cgroup_dev_is_valid_access(off, size, t),
+            _ => false,
         }
-        if t == Access::Write {
-            return false;
+    }
+
+    /// Checks the value of R0 at the exit, `check_return_code` of Linux. A program of a cgroup
+    /// gives 0 or 1, and an egress program of `BPF_PROG_TYPE_CGROUP_SKB` can also give 2 or 3
+    /// to tell about congestion.
+    fn check_return_code(&mut self, r0: Reg) -> Result<()> {
+        let (lo, hi) = match self.prog_type {
+            BPF_PROG_TYPE_CGROUP_SKB if self.expected_attach_type == BPF_CGROUP_INET_EGRESS => {
+                (0, 3)
+            }
+            BPF_PROG_TYPE_CGROUP_SKB | BPF_PROG_TYPE_CGROUP_SOCK | BPF_PROG_TYPE_CGROUP_DEVICE => {
+                (0, 1)
+            }
+            _ => return Ok(()),
+        };
+        // The 32-bit value is the result, as `return_32bit` of Linux.
+        let (min, max) = if r0.umax <= u64::from(u32::MAX) {
+            (r0.umin as i64, r0.umax as i64)
+        } else {
+            (r0.smin, r0.smax)
+        };
+        if min < lo || max > hi {
+            verbose!(
+                self,
+                "At program exit the register R0 has smin={} smax={} should have been in [{}, {}]\n",
+                min,
+                max,
+                lo,
+                hi
+            );
+            return Err(Errno::EINVAL);
         }
-        // The 32-bit fields that a socket filter can read. A narrow read must be in the field,
-        // as `bpf_ctx_narrow_access_ok` of Linux.
-        let field = off & !3;
-        let readable = field < CB || matches!(field, HASH | NAPI_ID | GSO_SEGS | GSO_SIZE);
-        readable && size <= 4
+        // A value of 2 or 3 is only for egress, `enforce_attach_type_range` of Linux.
+        if hi == 3 && max >= 2 {
+            self.enforce_expected_attach_type = true;
+        }
+        Ok(())
     }
 
     /// `BPF_STX | BPF_ATOMIC`, `check_atomic` of Linux.
@@ -1245,6 +1292,7 @@ impl Env<'_> {
                     verbose!(self, "R0 leaks addr as return value\n");
                     return Err(Errno::EACCES);
                 }
+                self.check_return_code(r0)?;
                 Ok(Next::Exit)
             }
             BPF_JA => {
@@ -1929,6 +1977,92 @@ fn stack_write(st: &mut State, off: i64, size: u32, v: Reg) {
     }
 }
 
+/// `bpf_skb_is_valid_access` of Linux with the rules of `sk_filter_is_valid_access` or, for
+/// `cgroup` true, of `cg_skb_is_valid_access`. rukernel has no packet pointers in the verifier,
+/// so `data` and `data_end` are not readable, as for a loader without `CAP_BPF`. `tstamp`,
+/// `hwtstamp` and `sk` are not readable either.
+fn skb_is_valid_access(off: u32, size: u32, t: Access, cgroup: bool) -> bool {
+    use sk_buff::*;
+    if off >= SIZE {
+        return false;
+    }
+    if (CB..CB_END).contains(&off) {
+        return off + size <= CB_END;
+    }
+    let field = off & !3;
+    if t == Access::Write {
+        // A cgroup program can also write `mark` and `priority`.
+        return cgroup && matches!(field, MARK | PRIORITY) && size == 4;
+    }
+    let readable = field < CB
+        || matches!(field, HASH | NAPI_ID | GSO_SEGS | GSO_SIZE)
+        || (cgroup && (FAMILY..=LOCAL_PORT).contains(&field));
+    if !readable {
+        return false;
+    }
+    // The addresses can only be read whole. For the other fields a narrow read must be in the
+    // field, as `bpf_ctx_narrow_access_ok` of Linux.
+    if (REMOTE_IP4..REMOTE_PORT).contains(&field) {
+        return size == 4;
+    }
+    size <= 4
+}
+
+/// `sock_filter_is_valid_access` of Linux: `bpf_sock_is_valid_access` and
+/// `__sock_filter_check_attach_type`.
+fn sock_filter_is_valid_access(off: u32, size: u32, t: Access, attach_type: u32) -> bool {
+    use crate::prog::bpf_sock::*;
+    if off >= SIZE {
+        return false;
+    }
+    let field = off & !3;
+    // `bpf_sock_is_valid_access`.
+    let size_ok = match field {
+        STATE | FAMILY | TYPE | PROTOCOL | SRC_PORT | RX_QUEUE_MAPPING | SRC_IP4 | DST_IP4 => {
+            size <= 4
+        }
+        _ if (SRC_IP6..SRC_IP6 + 16).contains(&field)
+            || (DST_IP6..DST_IP6 + 16).contains(&field) =>
+        {
+            size <= 4
+        }
+        // `dst_port` is a 16-bit field, and a 32-bit read of it is also allowed.
+        DST_PORT => size == 4 || off + size <= DST_PORT + 2,
+        _ => size == 4 && off == field,
+    };
+    if !size_ok {
+        return false;
+    }
+    // `__sock_filter_check_attach_type`.
+    let full = |types: &[u32]| types.contains(&attach_type);
+    match field {
+        BOUND_DEV_IF | MARK | PRIORITY => {
+            full(&[BPF_CGROUP_INET_SOCK_CREATE, BPF_CGROUP_INET_SOCK_RELEASE])
+        }
+        SRC_IP4 => full(&[BPF_CGROUP_INET4_POST_BIND]) && t == Access::Read,
+        _ if (SRC_IP6..SRC_IP6 + 16).contains(&field) => {
+            full(&[BPF_CGROUP_INET6_POST_BIND]) && t == Access::Read
+        }
+        SRC_PORT => {
+            full(&[BPF_CGROUP_INET4_POST_BIND, BPF_CGROUP_INET6_POST_BIND]) && t == Access::Read
+        }
+        _ => t == Access::Read,
+    }
+}
+
+/// `cgroup_dev_is_valid_access` of Linux: the context is read only, and only `access_type` can
+/// be read with a narrow load.
+fn cgroup_dev_is_valid_access(off: u32, size: u32, t: Access) -> bool {
+    use crate::prog::bpf_cgroup_dev_ctx::*;
+    if t == Access::Write || off + size > SIZE {
+        return false;
+    }
+    if off < MAJOR {
+        return size <= 4;
+    }
+    size == 4
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1953,6 +2087,7 @@ mod tests {
         let map = array_map();
         let opts = VerifierOpts {
             prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
+            expected_attach_type: 0,
             bpf_capable: caps,
             allow_ptr_leaks: caps,
         };
