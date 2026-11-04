@@ -874,8 +874,9 @@ echo 'debian: done'
         // tools/systemd/build.sh makes the tree. The script adds rk-check.service, and then
         // systemd runs as PID 1. At multi-user.target the service prints the state of the system
         // and the units that failed, and stops the machine. The test passes if the state is
-        // `running`, or `degraded` with only the units of `allowed` in the failed list, and
-        // sys-fs-bpf.mount is active.
+        // `running`, or `degraded` with only the units of `allowed` in the failed list,
+        // sys-fs-bpf.mount is active, and rk-bpfpin can pin a map in /sys/fs/bpf and read it
+        // again.
         init: r#"#!/bin/sh
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -903,6 +904,7 @@ echo "rk-systemd: state $state"
 bpf=$(systemctl is-active sys-fs-bpf.mount || true)
 echo "rk-systemd: sys-fs-bpf.mount $bpf"
 [ "$bpf" = active ] || other="$other sys-fs-bpf.mount"
+/usr/local/bin/rk-bpfpin || other="$other rk-bpfpin"
 failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
 for unit in $failed; do
     echo "rk-systemd: failed $unit"
@@ -918,7 +920,7 @@ chmod 755 /usr/local/bin/rk-check
 echo "rk-systemd: $(/usr/lib/systemd/systemd --version | head -n 1)"
 exec /usr/lib/systemd/systemd
 "#,
-        glibc_programs: &[],
+        glibc_programs: &["bpfpin"],
         debug_tools: false,
     },
 ];
