@@ -8,10 +8,16 @@
 //! unregisters the hooks of the base chains, and increments the generation, all in one step. An
 //! abort drops the copy. The dumps and the requests for one object read the committed objects.
 //!
-//! The rules keep their expressions as the program sent them. The expressions do not run yet,
-//! so a rule with expressions gives `ENOENT`, as an expression type that Linux does not know.
-//! A base chain gives its policy to each packet.
+//! A rule keeps its expressions as the program sent them, for the dumps, and as the parsed
+//! expressions of nf_tables_core.rs. At the commit each base chain gets the program of its
+//! rules, and a packet runs it.
 
+#[path = "nf_tables_core.rs"]
+mod nf_tables_core;
+
+use self::nf_tables_core::{
+    NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain, nft_prog,
+};
 use crate::buf::NetBuf;
 use crate::netfilter::{
     NF_ACCEPT, NF_DROP, NF_INET_NUMHOOKS, NF_QUEUE, NFPROTO_ARP, NFPROTO_BRIDGE, NFPROTO_INET,
@@ -151,10 +157,8 @@ const NFTA_RULE_POSITION_ID: u32 = 10;
 const NFTA_RULE_CHAIN_ID: u32 = 11;
 const NFTA_RULE_MAX: u16 = 11;
 
-// The attributes of a list and of an expression, `NFTA_LIST_*` and `NFTA_EXPR_*`.
+// The attributes of a list, `NFTA_LIST_*`.
 const NFTA_LIST_ELEM: u16 = 1;
-const NFTA_EXPR_NAME: u32 = 1;
-const NFTA_EXPR_MAX: u16 = 2;
 /// The most expressions in one rule, `NFT_MAX_EXPRS`.
 const NFT_MAX_EXPRS: usize = 128;
 
@@ -369,6 +373,8 @@ impl NftSet {
 struct NftRule {
     handle: u64,
     exprs: Vec<u8>,
+    /// The expressions of `exprs`.
+    parsed: Vec<NftExpr>,
     udata: Option<Vec<u8>>,
     /// The ID in the batch that made the rule, for `NFTA_RULE_POSITION_ID`.
     txn_id: Option<u32>,
@@ -428,6 +434,13 @@ impl NftTable {
     /// The number of rules and references of the chain `handle`, as `chain->use` of Linux.
     fn chain_use(&self, handle: u64) -> u32 {
         let rules = self.chains.iter().find(|c| c.handle == handle).map_or(0, |c| c.rules.len());
+        let jumps = self
+            .chains
+            .iter()
+            .flat_map(|c| c.rules.iter())
+            .flat_map(|r| r.parsed.iter())
+            .filter(|e| e.jump_target() == Some(handle))
+            .count();
         let refs = self
             .sets
             .iter()
@@ -436,7 +449,16 @@ impl NftTable {
                 |e| matches!(e.data, Some(NftData::Verdict { chain: Some(h), .. }) if h == handle),
             )
             .count();
-        (rules + refs) as u32
+        (rules + refs + jumps) as u32
+    }
+
+    /// The set `handle` has a rule that looks it up, as `set->use` of Linux.
+    fn set_in_use(&self, handle: u64) -> bool {
+        self.chains
+            .iter()
+            .flat_map(|c| c.rules.iter())
+            .flat_map(|r| r.parsed.iter())
+            .any(|e| matches!(e, NftExpr::Lookup { set, .. } if *set == handle))
     }
 
     /// A new handle, as `nf_tables_alloc_handle` of Linux.
@@ -454,13 +476,22 @@ impl NftTable {
 pub struct NftHookOps {
     /// The committed policy of the chain. A packet reads it without a lock.
     policy: AtomicU32,
+    /// The committed program of the chain. A packet holds the lock only to take a reference.
+    prog: SpinLock<Arc<NftProg>>,
+}
+
+impl NftHookOps {
+    fn new(policy: u32) -> Self {
+        Self { policy: AtomicU32::new(policy), prog: SpinLock::new(Arc::new(NftProg::default())) }
+    }
 }
 
 impl NfHookFn for NftHookOps {
-    /// Runs the chain on `skb`. A rule has no expressions yet, so each rule continues, and the
-    /// packet gets the policy of the chain.
-    fn hook(&self, _skb: &mut NetBuf, _state: &NfHookState) -> u32 {
-        self.policy.load(Ordering::Acquire)
+    /// Runs the rules of the chain on `skb`. At the end of the chain the packet gets the
+    /// policy of the chain.
+    fn hook(&self, skb: &mut NetBuf, state: &NfHookState) -> u32 {
+        let prog = self.prog.lock().clone();
+        nft_do_chain(&prog, self.policy.load(Ordering::Acquire), skb, state)
     }
 }
 
@@ -1748,7 +1779,7 @@ impl NftBatch {
             if flags & NFT_CHAIN_HW_OFFLOAD != 0 {
                 return Err(Errno::EOPNOTSUPP);
             }
-            let ops = Arc::new(NftHookOps { policy: AtomicU32::new(policy) });
+            let ops = Arc::new(NftHookOps::new(policy));
             (Some(NftBaseChain { hooknum, priority, ty, policy, ops }), flags | NFT_CHAIN_BASE)
         } else {
             if flags & NFT_CHAIN_BASE != 0 {
@@ -1861,7 +1892,7 @@ impl NftBatch {
             return Err(Errno::EBUSY);
         }
         use_count -= chain.rules.len() as u32;
-        // Some elements jump to the chain, so it cannot go with its rules.
+        // Some elements or rules jump to the chain, so it cannot go with its rules.
         if use_count > 0 {
             return Err(bad(info, nla, attr, Errno::EBUSY));
         }
@@ -1922,11 +1953,17 @@ impl NftBatch {
             0
         };
         let exprs = nla.get(NFTA_RULE_EXPRESSIONS).unwrap_or(&[]);
+        let mut parsed = Vec::new();
         for (n, (ty, e)) in msg::attrs(exprs).enumerate() {
             if ty != NFTA_LIST_ELEM || n == NFT_MAX_EXPRS {
                 return Err(Errno::EINVAL);
             }
-            nf_tables_expr_parse(e).inspect_err(|_| info.req.bad_attr(e))?;
+            let expr = nf_tables_expr_parse(table, e).inspect_err(|_| info.req.bad_attr(e))?;
+            // A jump that comes back to the chain is a loop, as `nft_chain_validate` of Linux.
+            if let Some(target) = expr.jump_target() {
+                nft_check_loops(table, chain.handle, target)?;
+            }
+            parsed.push(expr);
         }
         let udata = match nla.get(NFTA_RULE_USERDATA) {
             Some(d) if d.len() > NFT_USERDATA_MAXLEN => return Err(Errno::ERANGE),
@@ -1936,7 +1973,7 @@ impl NftBatch {
         let txn_id = be32(nla, NFTA_RULE_ID)?;
         let table = &mut self.tables[t];
         let handle = if handle == 0 { table.alloc_handle() } else { handle };
-        let rule = NftRule { handle, exprs: exprs.to_vec(), udata, txn_id };
+        let rule = NftRule { handle, exprs: exprs.to_vec(), parsed, udata, txn_id };
         let at = if let (true, Some(o)) = (ctx.has(NLM_F_REPLACE), old) {
             self.notify_rule(&ctx, NFT_MSG_DELRULE, t, c, o);
             self.tables[t].chains[c].rules[o] = rule;
@@ -2167,7 +2204,9 @@ impl NftBatch {
             Err(Errno::ENOENT) if ctx.ty == NFT_MSG_DESTROYSET => return Ok(()),
             Err(e) => return Err(bad(info, nla, attr, e)),
         };
-        if ctx.has(NLM_F_NONREC) && !table.sets[s].elems.is_empty() {
+        if (ctx.has(NLM_F_NONREC) && !table.sets[s].elems.is_empty())
+            || table.set_in_use(table.sets[s].handle)
+        {
             return Err(bad(info, nla, attr, Errno::EBUSY));
         }
         self.notify_set(&ctx, NFT_MSG_DELSET, t, s);
@@ -2312,16 +2351,6 @@ impl NftBatch {
     }
 }
 
-/// Reads an expression of a rule, as `nf_tables_expr_parse` of Linux. No expression type is
-/// here yet, so each name gives `ENOENT`.
-fn nf_tables_expr_parse(nla: &[u8]) -> Result<()> {
-    let tb = Attrs::parse(nla, NFTA_EXPR_MAX);
-    if !tb.has(NFTA_EXPR_NAME) {
-        return Err(Errno::EINVAL);
-    }
-    Err(Errno::ENOENT)
-}
-
 /// Reads the description of a set: the size and the lengths of the fields of a concatenated
 /// key, as `nf_tables_set_desc_parse` and `nft_set_desc_concat` of Linux.
 fn nf_tables_set_desc_parse(nla: &[u8], klen: u32) -> Result<(u32, Vec<u8>)> {
@@ -2371,12 +2400,15 @@ fn nf_tables_set_alloc_name(table: &NftTable, name: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// The hooks of the base chains of the tables that are not dormant.
-fn nft_wanted_hooks(tables: &[NftTable]) -> Vec<(Arc<NftHookOps>, u8, u8, i32, u32)> {
+type WantedHook = (Arc<NftHookOps>, u8, u8, i32, u32, Arc<NftProg>);
+
+fn nft_wanted_hooks(tables: &[NftTable]) -> Vec<WantedHook> {
     let mut out = Vec::new();
     for t in tables.iter().filter(|t| t.flags & NFT_TABLE_F_DORMANT == 0) {
-        for c in &t.chains {
+        for (i, c) in t.chains.iter().enumerate() {
             if let Some(b) = &c.base {
-                out.push((b.ops.clone(), t.family, b.hooknum, b.priority, b.policy));
+                let prog = Arc::new(nft_prog(t, i));
+                out.push((b.ops.clone(), t.family, b.hooknum, b.priority, b.policy, prog));
             }
         }
     }
@@ -2396,6 +2428,7 @@ fn nft_sync_hooks(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
         .map(|w| NfHookOps { hook: w.0.clone(), pf: w.1, hooknum: w.2, priority: w.3 })
         .collect();
     for w in &want {
+        *w.0.prog.lock() = w.5.clone();
         w.0.policy.store(w.4, Ordering::Release);
     }
     nf_register_net_hooks(&new)?;
