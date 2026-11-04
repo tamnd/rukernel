@@ -70,6 +70,9 @@ pub struct BpfProg {
     pub load_time: u64,
     /// The real user ID of the process that loaded the program, `aux->user` of Linux.
     pub uid: u32,
+    /// The program can attach only at `expected_attach_type`, `enforce_expected_attach_type`
+    /// of Linux. An egress program of a cgroup that can give 2 or 3 has it.
+    pub enforce_expected_attach_type: bool,
 }
 
 /// Reserves a new program ID, as `bpf_prog_alloc_id` of Linux. [`bpf_prog_publish_id`] makes the
@@ -226,6 +229,160 @@ pub struct SkBuff<'a> {
     pub hash: u32,
     /// The control buffer `cb[0]` to `cb[4]`.
     pub cb: [u8; 20],
+    /// The family of the socket, for a program of a cgroup.
+    pub family: u32,
+    /// The remote address of the socket, in network byte order. An IPv4 address is in the first
+    /// 4 bytes.
+    pub remote_ip: [u8; 16],
+    /// The local address of the socket, as `remote_ip`.
+    pub local_ip: [u8; 16],
+    /// The remote port, in network byte order in the low 16 bits.
+    pub remote_port: u32,
+    /// The local port, in host byte order.
+    pub local_port: u32,
+}
+
+/// The offsets in `struct bpf_sock`, the context of `BPF_PROG_TYPE_CGROUP_SOCK`.
+#[allow(missing_docs)]
+pub mod bpf_sock {
+    pub const BOUND_DEV_IF: u32 = 0;
+    pub const FAMILY: u32 = 4;
+    pub const TYPE: u32 = 8;
+    pub const PROTOCOL: u32 = 12;
+    pub const MARK: u32 = 16;
+    pub const PRIORITY: u32 = 20;
+    pub const SRC_IP4: u32 = 24;
+    pub const SRC_IP6: u32 = 28;
+    pub const SRC_PORT: u32 = 44;
+    pub const DST_PORT: u32 = 48;
+    pub const DST_IP4: u32 = 52;
+    pub const DST_IP6: u32 = 56;
+    pub const STATE: u32 = 72;
+    pub const RX_QUEUE_MAPPING: u32 = 76;
+    /// `sizeof(struct bpf_sock)`.
+    pub const SIZE: u32 = 80;
+}
+
+/// The `struct bpf_sock` of a socket, as the fields that `bpf_sock_convert_ctx_access` of
+/// Linux reads. The addresses and `dst_port` are in network byte order, and `src_port` is in
+/// host byte order.
+#[derive(Debug, Default)]
+pub struct BpfSock {
+    /// `sk_bound_dev_if`.
+    pub bound_dev_if: u32,
+    /// `sk_family`.
+    pub family: u32,
+    /// `sk_type`.
+    pub sock_type: u32,
+    /// `sk_protocol`.
+    pub protocol: u32,
+    /// `sk_mark`.
+    pub mark: u32,
+    /// `sk_priority`.
+    pub priority: u32,
+    /// The local address. An IPv4 address is in the first 4 bytes.
+    pub src_ip: [u8; 16],
+    /// The local port.
+    pub src_port: u32,
+    /// The remote port, as the bytes in network byte order read in the order of the machine.
+    pub dst_port: u16,
+    /// The remote address.
+    pub dst_ip: [u8; 16],
+    /// `sk_state`.
+    pub state: u32,
+}
+
+impl ProgCtx for BpfSock {
+    fn load(&self, off: u32, size: u32) -> Option<u64> {
+        use bpf_sock::*;
+        let word = |b: &[u8; 16], at: u32| {
+            u32::from_ne_bytes(b[at as usize..at as usize + 4].try_into().unwrap())
+        };
+        let field = off & !3;
+        let v: u32 = match field {
+            BOUND_DEV_IF => self.bound_dev_if,
+            FAMILY => self.family,
+            TYPE => self.sock_type,
+            PROTOCOL => self.protocol,
+            MARK => self.mark,
+            PRIORITY => self.priority,
+            SRC_IP4 => word(&self.src_ip, 0),
+            f if (SRC_IP6..SRC_PORT).contains(&f) => word(&self.src_ip, f - SRC_IP6),
+            SRC_PORT => self.src_port,
+            DST_PORT => u32::from(self.dst_port),
+            DST_IP4 => word(&self.dst_ip, 0),
+            f if (DST_IP6..STATE).contains(&f) => word(&self.dst_ip, f - DST_IP6),
+            STATE => self.state,
+            // rukernel has no receive queues, as a socket without one in Linux.
+            RX_QUEUE_MAPPING => u32::MAX,
+            _ => return None,
+        };
+        let v = u64::from(v >> ((off - field) * 8));
+        Some(if size >= 4 { v } else { v & ((1u64 << (size * 8)) - 1) })
+    }
+
+    fn store(&mut self, off: u32, _size: u32, value: u64) -> Option<()> {
+        use bpf_sock::*;
+        let value = value as u32;
+        match off {
+            BOUND_DEV_IF => self.bound_dev_if = value,
+            MARK => self.mark = value,
+            PRIORITY => self.priority = value,
+            _ => return None,
+        }
+        Some(())
+    }
+}
+
+/// The offsets in `struct bpf_cgroup_dev_ctx`, the context of `BPF_PROG_TYPE_CGROUP_DEVICE`.
+#[allow(missing_docs)]
+pub mod bpf_cgroup_dev_ctx {
+    pub const ACCESS_TYPE: u32 = 0;
+    pub const MAJOR: u32 = 4;
+    pub const MINOR: u32 = 8;
+    /// `sizeof(struct bpf_cgroup_dev_ctx)`.
+    pub const SIZE: u32 = 12;
+}
+
+/// The types of a device, `BPF_DEVCG_DEV_*` of Linux.
+pub const BPF_DEVCG_DEV_BLOCK: u32 = 1 << 0;
+/// A character device.
+pub const BPF_DEVCG_DEV_CHAR: u32 = 1 << 1;
+/// The accesses to a device, `BPF_DEVCG_ACC_*` of Linux: `mknod`.
+pub const BPF_DEVCG_ACC_MKNOD: u32 = 1 << 0;
+/// A read.
+pub const BPF_DEVCG_ACC_READ: u32 = 1 << 1;
+/// A write.
+pub const BPF_DEVCG_ACC_WRITE: u32 = 1 << 2;
+
+/// The context of a device program, `struct bpf_cgroup_dev_ctx` of Linux.
+#[derive(Debug, Default)]
+pub struct BpfCgroupDevCtx {
+    /// The access in the high 16 bits and the type of the device in the low 16 bits.
+    pub access_type: u32,
+    /// The major number.
+    pub major: u32,
+    /// The minor number.
+    pub minor: u32,
+}
+
+impl ProgCtx for BpfCgroupDevCtx {
+    fn load(&self, off: u32, size: u32) -> Option<u64> {
+        use bpf_cgroup_dev_ctx::*;
+        let field = off & !3;
+        let v = match field {
+            ACCESS_TYPE => self.access_type,
+            MAJOR => self.major,
+            MINOR => self.minor,
+            _ => return None,
+        };
+        let v = u64::from(v >> ((off - field) * 8));
+        Some(if size >= 4 { v } else { v & ((1u64 << (size * 8)) - 1) })
+    }
+
+    fn store(&mut self, _off: u32, _size: u32, _value: u64) -> Option<()> {
+        None
+    }
 }
 
 /// The offsets in `struct __sk_buff`. Each name is the field of Linux in capitals.
@@ -247,7 +404,16 @@ pub mod sk_buff {
     pub const CB_END: u32 = 68;
     pub const HASH: u32 = 68;
     pub const TC_CLASSID: u32 = 72;
+    pub const DATA: u32 = 76;
+    pub const DATA_END: u32 = 80;
     pub const NAPI_ID: u32 = 84;
+    pub const FAMILY: u32 = 88;
+    pub const REMOTE_IP4: u32 = 92;
+    pub const LOCAL_IP4: u32 = 96;
+    pub const REMOTE_IP6: u32 = 100;
+    pub const LOCAL_IP6: u32 = 116;
+    pub const REMOTE_PORT: u32 = 132;
+    pub const LOCAL_PORT: u32 = 136;
     pub const GSO_SEGS: u32 = 164;
     pub const GSO_SIZE: u32 = 176;
     /// `sizeof(struct __sk_buff)`.
@@ -275,6 +441,19 @@ impl ProgCtx for SkBuff<'_> {
             INGRESS_IFINDEX => self.ingress_ifindex,
             IFINDEX => self.ifindex,
             HASH => self.hash,
+            FAMILY => self.family,
+            REMOTE_PORT => self.remote_port,
+            LOCAL_PORT => self.local_port,
+            REMOTE_IP4 => u32::from_ne_bytes(self.remote_ip[..4].try_into().ok()?),
+            LOCAL_IP4 => u32::from_ne_bytes(self.local_ip[..4].try_into().ok()?),
+            f if (REMOTE_IP6..LOCAL_IP6).contains(&f) => {
+                let at = (f - REMOTE_IP6) as usize;
+                u32::from_ne_bytes(self.remote_ip[at..at + 4].try_into().ok()?)
+            }
+            f if (LOCAL_IP6..REMOTE_PORT).contains(&f) => {
+                let at = (f - LOCAL_IP6) as usize;
+                u32::from_ne_bytes(self.local_ip[at..at + 4].try_into().ok()?)
+            }
             QUEUE_MAPPING | VLAN_PRESENT | VLAN_TCI | VLAN_PROTO | TC_INDEX | NAPI_ID
             | GSO_SEGS | GSO_SIZE => 0,
             _ => return None,
@@ -286,8 +465,14 @@ impl ProgCtx for SkBuff<'_> {
 
     fn store(&mut self, off: u32, size: u32, value: u64) -> Option<()> {
         use sk_buff::*;
+        match off {
+            MARK => self.mark = value as u32,
+            PRIORITY => self.priority = value as u32,
+            _ if (CB..CB_END).contains(&off) => {}
+            _ => return None,
+        }
         if !(CB..CB_END).contains(&off) {
-            return None;
+            return Some(());
         }
         let at = (off - CB) as usize;
         let b = self.cb.get_mut(at..at + size as usize)?;

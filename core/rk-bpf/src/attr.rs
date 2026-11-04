@@ -44,6 +44,12 @@ pub mod last_field {
     pub const BPF_LINK_GET_FD_BY_ID: usize = 4;
     /// `BPF_OBJ_GET_INFO_BY_FD`: `info.info`.
     pub const BPF_OBJ_GET_INFO_BY_FD: usize = 16;
+    /// `BPF_PROG_ATTACH`: `expected_revision`.
+    pub const BPF_PROG_ATTACH: usize = 32;
+    /// `BPF_PROG_DETACH`: `expected_revision`.
+    pub const BPF_PROG_DETACH: usize = 32;
+    /// `BPF_PROG_QUERY`: `query.revision`.
+    pub const BPF_PROG_QUERY: usize = 64;
     /// `BPF_LINK_CREATE`: `link_create.uprobe_multi.path_fd`.
     pub const BPF_LINK_CREATE: usize = 64;
     /// `BPF_LINK_UPDATE`: `link_update.old_prog_fd`.
@@ -201,6 +207,24 @@ pub mod info {
     pub const INFO_LEN: usize = 4;
     /// `info`.
     pub const INFO: usize = 8;
+}
+
+/// The fields of `BPF_PROG_ATTACH` and `BPF_PROG_DETACH`.
+pub mod prog_attach {
+    /// `target_fd`.
+    pub const TARGET_FD: usize = 0;
+    /// `attach_bpf_fd`.
+    pub const ATTACH_BPF_FD: usize = 4;
+    /// `attach_type`.
+    pub const ATTACH_TYPE: usize = 8;
+    /// `attach_flags`.
+    pub const ATTACH_FLAGS: usize = 12;
+    /// `replace_bpf_fd`.
+    pub const REPLACE_BPF_FD: usize = 16;
+    /// `relative_fd` or `relative_id`.
+    pub const RELATIVE_FD: usize = 20;
+    /// `expected_revision`.
+    pub const EXPECTED_REVISION: usize = 24;
 }
 
 /// The fields of `BPF_LINK_CREATE`, `link_create`.

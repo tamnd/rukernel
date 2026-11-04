@@ -10,6 +10,7 @@
 extern crate alloc;
 
 pub mod attr;
+pub mod cgroup;
 pub mod core;
 pub mod file;
 pub mod helpers;

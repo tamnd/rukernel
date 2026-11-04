@@ -411,7 +411,11 @@ impl Inode for Node {
             }
             h.rmdir(self.id, name)
         })
-        .map(|id| ATTRS.lock().retain(|&ino, _| ino >> INO_SHIFT != u64::from(id)))
+        .map(|id| {
+            ATTRS.lock().retain(|&ino, _| ino >> INO_SHIFT != u64::from(id));
+            // `cgroup_bpf_offline` of Linux: the programs of the cgroup go away.
+            rk_bpf::cgroup::cgroup_bpf_offline(id);
+        })
     }
 
     fn rename(&self, _: &[u8], _: &InodeRef, _: &[u8]) -> Result<()> {

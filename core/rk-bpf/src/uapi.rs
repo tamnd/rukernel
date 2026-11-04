@@ -18,6 +18,10 @@ pub mod cmd {
     pub const BPF_OBJ_PIN: u32 = 6;
     /// Gives a descriptor of a pinned object.
     pub const BPF_OBJ_GET: u32 = 7;
+    /// Attaches a program to a hook.
+    pub const BPF_PROG_ATTACH: u32 = 8;
+    /// Detaches a program from a hook.
+    pub const BPF_PROG_DETACH: u32 = 9;
     /// Gives the program ID after `start_id`.
     pub const BPF_PROG_GET_NEXT_ID: u32 = 11;
     /// Gives the map ID after `start_id`.
@@ -28,6 +32,8 @@ pub mod cmd {
     pub const BPF_MAP_GET_FD_BY_ID: u32 = 14;
     /// Copies the information of a program, a map or a link.
     pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
+    /// Gives the programs of a hook.
+    pub const BPF_PROG_QUERY: u32 = 16;
     /// Makes the map read only for system calls.
     pub const BPF_MAP_FREEZE: u32 = 22;
     /// Attaches a program to a hook with a link.
@@ -167,6 +173,8 @@ pub mod attach_flags {
     pub const BPF_F_ID: u32 = 1 << 5;
     /// The program runs before the programs of the parent cgroups.
     pub const BPF_F_PREORDER: u32 = 1 << 6;
+    /// The attach or the anchor is a link.
+    pub const BPF_F_LINK: u32 = 1 << 13;
 }
 
 /// The length of the name of a map or a program, with its zero byte, `BPF_OBJ_NAME_LEN`.

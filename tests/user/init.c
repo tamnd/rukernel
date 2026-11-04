@@ -5628,6 +5628,139 @@ static void test_bpf_ids(void)
 	check("the ID of a closed map is free", bpf_id(14, map_id, NULL) == -1 && errno == ENOENT);
 }
 
+/* BPF_PROG_LOAD of a program of the type and the expected attach type that returns ret. */
+static int bpf_prog_ret(unsigned int type, unsigned int expected, int ret)
+{
+	unsigned long long insns[] = {
+		bpf_insn(0xb7, 0, 0, 0, ret),	/* r0 = ret */
+		bpf_insn(0x95, 0, 0, 0, 0),	/* exit */
+	};
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, type);
+	bpf_put32(attr, 4, 2);
+	bpf_put64(attr, 8, (unsigned long)insns);
+	bpf_put64(attr, 16, (unsigned long)"GPL");
+	bpf_put32(attr, 68, expected);
+	return bpf_call(5, attr, sizeof(attr));
+}
+
+/* BPF_PROG_ATTACH or BPF_PROG_DETACH: target_fd, attach_bpf_fd, attach_type and attach_flags. */
+static long bpf_attach(int cmd, int target, int prog, unsigned int type, unsigned int flags)
+{
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, target);
+	bpf_put32(attr, 4, prog);
+	bpf_put32(attr, 8, type);
+	bpf_put32(attr, 12, flags);
+	return bpf_call(cmd, attr, 32);
+}
+
+/* BPF_PROG_QUERY: target_fd, attach_type, query_flags, prog_ids and prog_cnt. */
+static long bpf_query(int target, unsigned int type, unsigned int qflags, unsigned int *ids,
+		      unsigned int *cnt, unsigned int *flags)
+{
+	unsigned char attr[168] = { 0 };
+	long r;
+
+	bpf_put32(attr, 0, target);
+	bpf_put32(attr, 4, type);
+	bpf_put32(attr, 8, qflags);
+	bpf_put64(attr, 16, (unsigned long)ids);
+	bpf_put32(attr, 24, *cnt);
+	r = bpf_call(16, attr, 64);
+	memcpy(flags, attr + 12, 4);
+	memcpy(cnt, attr + 24, 4);
+	return r;
+}
+
+/*
+ * The programs of the cgroups: BPF_PROG_ATTACH, BPF_PROG_DETACH, BPF_PROG_QUERY and the links of
+ * a cgroup, as systemd uses them for IPAccounting= and DeviceAllow= (#537).
+ */
+static void test_bpf_cgroup(void)
+{
+	unsigned char info[64] = { 0 }, attr[168] = { 0 };
+	unsigned int ids[4] = { 0 }, cnt = 4, flags = 0, len = sizeof(info), id = 0;
+	unsigned long long cg_id = 0;
+	struct stat st;
+	int skb, egress, sock, dev, cg, child, link, ok;
+
+	mkdir("/bpfcg", 0755);
+	if (mount("none", "/bpfcg", "cgroup2", 0, NULL) != 0) {
+		check("mount cgroup2 for the cgroup programs", 0);
+		return;
+	}
+	mkdir("/bpfcg/rk_bpf", 0755);
+	cg = open("/bpfcg", O_RDONLY | O_DIRECTORY);
+	child = open("/bpfcg/rk_bpf", O_RDONLY | O_DIRECTORY);
+	skb = bpf_prog_ret(8, 0, 1);
+	errno = 0;
+	ok = bpf_prog_ret(8, 0, 2) == -1 && errno == EINVAL;
+	egress = bpf_prog_ret(8, 1, 3);
+	sock = bpf_prog_ret(9, 0, 1);
+	dev = bpf_prog_ret(15, 0, 1);
+	ok = ok && skb >= 0 && egress >= 0 && sock >= 0 && dev >= 0;
+	check("BPF_PROG_LOAD of the cgroup types checks the return value", ok);
+
+	errno = 0;
+	ok = bpf_attach(8, child, egress, 0, 0) == -1 && errno == EINVAL;
+	errno = 0;
+	ok = ok && bpf_attach(8, skb, skb, 1, 1 << 1) == -1 && errno == EBADF;
+	check("BPF_PROG_ATTACH checks the attach type and the cgroup", ok);
+	ok = bpf_attach(8, cg, skb, 1, 1 << 1) == 0 && bpf_attach(8, child, egress, 1, 1 << 1) == 0;
+	ok = ok && bpf_attach(8, child, sock, 2, 0) == 0 && bpf_attach(8, child, dev, 6, 0) == 0;
+	ok = ok && bpf_query(child, 1, 1, ids, &cnt, &flags) == 0 && cnt == 2 && flags == 0;
+	len = sizeof(info);
+	ok = ok && bpf_info(egress, info, &len) == 0 && !memcmp(ids, info + 4, 4);
+	cnt = 4;
+	ok = ok && bpf_query(child, 1, 0, ids, &cnt, &flags) == 0 && cnt == 1 && flags == 2;
+	check("BPF_PROG_QUERY gives the programs and the effective programs of a cgroup", ok);
+	errno = 0;
+	ok = bpf_attach(8, child, skb, 2, 0) == -1 && errno == EINVAL;
+	errno = 0;
+	ok = ok && bpf_attach(8, child, dev, 6, 1) == -1 && errno == EPERM;
+	check("BPF_PROG_ATTACH keeps the flags of a cgroup", ok);
+
+	/* LINK_CREATE: prog_fd, target_fd and attach_type. */
+	bpf_put32(attr, 0, skb);
+	bpf_put32(attr, 4, child);
+	bpf_put32(attr, 8, 0);
+	link = bpf_call(28, attr, 64);
+	len = sizeof(info);
+	memset(info, 0, sizeof(info));
+	ok = link >= 0 && bpf_info(link, info, &len) == 0 && info[0] == 3;
+	memcpy(&cg_id, info + 16, 8);
+	ok = ok && stat("/bpfcg/rk_bpf", &st) == 0 && cg_id == st.st_ino;
+	cnt = 4;
+	ok = ok && bpf_query(child, 0, 0, ids, &cnt, &flags) == 0 && cnt == 1 && flags == 2;
+	check("BPF_LINK_CREATE attaches a program to a cgroup", ok);
+	memcpy(&id, info + 4, 4);
+	close(link);
+	cnt = 4;
+	ok = bpf_query(child, 0, 0, ids, &cnt, &flags) == 0 && cnt == 0;
+	errno = 0;
+	ok = ok && bpf_id(30, id, NULL) == -1 && errno == ENOENT;
+	check("the close of the last descriptor of a link detaches it", ok);
+
+	ok = bpf_attach(9, child, dev, 6, 0) == 0 && bpf_attach(9, child, egress, 1, 0) == 0;
+	errno = 0;
+	ok = ok && bpf_attach(9, child, egress, 1, 0) == -1 && errno == ENOENT;
+	check("BPF_PROG_DETACH detaches a program from a cgroup", ok);
+	close(child);
+	check("rmdir of a cgroup with programs", rmdir("/bpfcg/rk_bpf") == 0);
+	ok = bpf_attach(9, cg, skb, 1, 0) == 0;
+	check("BPF_PROG_DETACH of the root", ok);
+	close(cg);
+	close(skb);
+	close(egress);
+	close(sock);
+	close(dev);
+	umount("/bpfcg");
+	rmdir("/bpfcg");
+}
+
 /* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
 static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 {
@@ -5796,6 +5929,7 @@ static void test_bpf(void)
 	close(fd);
 	test_bpf_prog();
 	test_bpf_ids();
+	test_bpf_cgroup();
 	test_bpffs();
 	umount("/proc");
 }

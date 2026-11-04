@@ -80,6 +80,20 @@ impl Env for BpfEnv<'_, '_> {
     fn uid(&self) -> u32 {
         self.0.process().cred().uid
     }
+
+    fn cgroup_get_from_fd(&self, fd: u32) -> Result<rk_cgroup::CgId, Errno> {
+        let file = self.fdget(fd as i32)?;
+        let inode = file.inode().ok_or(Errno::EBADF)?;
+        rk_fs_cgroup::cgroup_of(inode).ok_or(Errno::EBADF)
+    }
+
+    fn cgroup_parent(&self, id: rk_cgroup::CgId) -> Option<rk_cgroup::CgId> {
+        rk_cgroup::with(|h| h.parent(id))
+    }
+
+    fn cgroup_id(&self, id: rk_cgroup::CgId) -> u64 {
+        rk_fs_cgroup::cgroup_ino(id)
+    }
 }
 
 pub(crate) fn bpf(

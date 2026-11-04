@@ -7,7 +7,11 @@
 use crate::UNPRIVILEGED_BPF_DISABLED;
 use crate::attr::{
     BPF_ATTR_SIZE, BPF_COMMON_ATTR_SIZE, BpfAttr, bpf_check_uarg_tail_zero, common, get_id, info,
-    last_field, link_create, link_update, map_create, map_elem, obj, prog_load,
+    last_field, link_create, link_update, map_create, map_elem, obj, prog_attach, prog_load,
+};
+use crate::cgroup::{
+    Anchor, AttachArgs, BPF_F_QUERY_EFFECTIVE, CgId, CgroupEnv, cgroup_bpf_attach,
+    cgroup_bpf_detach, cgroup_bpf_link_attach, cgroup_bpf_query, query,
 };
 use crate::file::{BpfMapFile, bpf_map_of};
 use crate::idr::{ID_MAX, Idr};
@@ -26,7 +30,7 @@ use crate::prog::{
     BpfProg, BpfProgFile, PROG_IDR, bpf_prog_alloc_id, bpf_prog_calc_tag, bpf_prog_of,
     bpf_prog_publish_id,
 };
-use crate::uapi::attach_flags::BPF_F_REPLACE;
+use crate::uapi::attach_flags::*;
 use crate::uapi::attach_type::*;
 use crate::uapi::cmd::*;
 use crate::uapi::elem::{BPF_F_CPU, BPF_F_LOCK};
@@ -95,6 +99,31 @@ pub trait Env {
     fn boot_ns(&self) -> u64;
     /// The real user ID of the caller.
     fn uid(&self) -> u32;
+    /// The cgroup of the cgroup2 directory `fd`, `cgroup_get_from_fd` of Linux. Another file
+    /// gives `EBADF`.
+    fn cgroup_get_from_fd(&self, fd: u32) -> Result<CgId>;
+    /// The parent of a cgroup, or `None` for the root.
+    fn cgroup_parent(&self, id: CgId) -> Option<CgId>;
+    /// The ID of a cgroup that a program sees: the inode number of its directory.
+    fn cgroup_id(&self, id: CgId) -> u64;
+}
+
+/// The cgroups of an [`Env`], for the cgroup programs.
+struct EnvCgroups<'a>(&'a dyn Env);
+
+impl CgroupEnv for EnvCgroups<'_> {
+    fn cgroup_parent(&self, id: CgId) -> Option<CgId> {
+        self.0.cgroup_parent(id)
+    }
+
+    fn cgroup_id(&self, id: CgId) -> u64 {
+        self.0.cgroup_id(id)
+    }
+}
+
+/// `bpf_net_capable` of Linux.
+fn bpf_net_capable(env: &dyn Env) -> bool {
+    env.capable(CAP_NET_ADMIN) || env.capable(CAP_SYS_ADMIN)
 }
 
 /// `bpf_capable` of Linux.
@@ -160,6 +189,9 @@ pub fn sys_bpf(
         BPF_MAP_GET_FD_BY_ID => bpf_map_get_fd_by_id(env, &attr),
         BPF_LINK_GET_FD_BY_ID => bpf_link_get_fd_by_id(env, &attr),
         BPF_OBJ_GET_INFO_BY_FD => bpf_obj_get_info_by_fd(env, &attr, uattr),
+        BPF_PROG_ATTACH => bpf_prog_attach(env, &attr),
+        BPF_PROG_DETACH => bpf_prog_detach(env, &attr),
+        BPF_PROG_QUERY => bpf_prog_query(env, &attr, uattr, size),
         BPF_LINK_CREATE => link_create_cmd(env, &attr),
         BPF_LINK_UPDATE => link_update_cmd(env, &attr),
         BPF_LINK_DETACH => link_detach(env, &attr),
@@ -334,11 +366,19 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
     {
         return Err(Errno::EPERM);
     }
-    // rukernel has no BTF, so a program cannot name a function to attach to. A socket filter
-    // has no attach type, as `bpf_prog_load_check_attach` of Linux.
+    if is_net_admin_prog_type(prog_type) && !env.capable(CAP_NET_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    // rukernel has no BTF, so a program cannot name a function to attach to.
     if attr.u32(ATTACH_PROG_FD) != 0 || attr.u32(ATTACH_BTF_ID) != 0 {
         return Err(Errno::EINVAL);
     }
+    // `bpf_prog_load_fixup_attach_type`.
+    let mut expected_attach_type = attr.u32(EXPECTED_ATTACH_TYPE);
+    if prog_type == BPF_PROG_TYPE_CGROUP_SOCK && expected_attach_type == 0 {
+        expected_attach_type = BPF_CGROUP_INET_SOCK_CREATE;
+    }
+    bpf_prog_load_check_attach(prog_type, expected_attach_type)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(insn_cnt as usize * INSN_SIZE).map_err(|_| Errno::ENOMEM)?;
     bytes.resize(insn_cnt as usize * INSN_SIZE, 0);
@@ -357,6 +397,7 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
     let mut log = BpfVerifierLog::new(log_attr.level);
     let opts = VerifierOpts {
         prog_type,
+        expected_attach_type,
         bpf_capable: bpf_cap,
         allow_ptr_leaks: env.capable(CAP_PERFMON) || env.capable(CAP_SYS_ADMIN),
     };
@@ -371,7 +412,7 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
     let tag = bpf_prog_calc_tag(&v.insns);
     let prog = BpfProg {
         prog_type,
-        expected_attach_type: attr.u32(EXPECTED_ATTACH_TYPE),
+        expected_attach_type,
         insns: v.insns,
         used_maps: v.used_maps,
         id: bpf_prog_alloc_id(),
@@ -382,10 +423,37 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
         run_cnt: core::sync::atomic::AtomicU64::new(0),
         load_time: env.boot_ns(),
         uid: env.uid(),
+        enforce_expected_attach_type: v.enforce_expected_attach_type,
     };
     let prog = Arc::new(prog);
     bpf_prog_publish_id(&prog);
     bpf_prog_new_fd(env, prog)
+}
+
+/// The program types that need `CAP_NET_ADMIN`, a part of `is_net_admin_prog_type` of Linux.
+fn is_net_admin_prog_type(prog_type: u32) -> bool {
+    matches!(
+        prog_type,
+        BPF_PROG_TYPE_CGROUP_DEVICE | BPF_PROG_TYPE_CGROUP_SOCK | BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+    )
+}
+
+/// Checks the expected attach type of a new program, `bpf_prog_load_check_attach` of Linux.
+fn bpf_prog_load_check_attach(prog_type: u32, expected_attach_type: u32) -> Result<()> {
+    let ok = match prog_type {
+        BPF_PROG_TYPE_CGROUP_SOCK => matches!(
+            expected_attach_type,
+            BPF_CGROUP_INET_SOCK_CREATE
+                | BPF_CGROUP_INET_SOCK_RELEASE
+                | BPF_CGROUP_INET4_POST_BIND
+                | BPF_CGROUP_INET6_POST_BIND
+        ),
+        BPF_PROG_TYPE_CGROUP_SKB => {
+            matches!(expected_attach_type, BPF_CGROUP_INET_INGRESS | BPF_CGROUP_INET_EGRESS)
+        }
+        _ => true,
+    };
+    if ok { Ok(()) } else { Err(Errno::EINVAL) }
 }
 
 /// The flags of the file of a new map, `bpf_get_file_flag` of Linux.
@@ -1107,6 +1175,9 @@ pub fn bpf_prog_attach_check_attach_type(
             if !env.capable(CAP_NET_ADMIN) {
                 return Err(Errno::EPERM);
             }
+            if prog.enforce_expected_attach_type && prog.expected_attach_type != attach_type {
+                return Err(Errno::EINVAL);
+            }
             if attach_type_to_prog_type(attach_type) != prog.prog_type {
                 return Err(Errno::EINVAL);
             }
@@ -1131,8 +1202,223 @@ fn link_create_cmd(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     }
     let prog = bpf_prog_get(env, attr.u32(link_create::PROG_FD))?;
     bpf_prog_attach_check_attach_type(env, &prog, attach_type)?;
-    // rukernel has no hook for links yet.
-    Err(Errno::EINVAL)
+    match prog.prog_type {
+        BPF_PROG_TYPE_CGROUP_SKB | BPF_PROG_TYPE_CGROUP_SOCK | BPF_PROG_TYPE_CGROUP_DEVICE => {
+            let cg = EnvCgroups(env);
+            let flags = attr.u32(link_create::FLAGS);
+            if flags & !crate::cgroup::BPF_F_LINK_ATTACH_MASK != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let cgrp = env.cgroup_get_from_fd(attr.u32(link_create::TARGET_FD))?;
+            let get_anchor = |f, id_or_fd| bpf_get_anchor(env, f, id_or_fd);
+            let link = cgroup_bpf_link_attach(
+                &cg,
+                cgrp,
+                prog,
+                attach_type,
+                flags,
+                attr.u32(link_create::RELATIVE_FD),
+                &get_anchor,
+                attr.u64(link_create::EXPECTED_REVISION),
+                crate::link::bpf_link_settle,
+            )?;
+            bpf_link_new_fd(env, link)
+        }
+        // rukernel has no other hook for links yet.
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// The program type of a descriptor, `bpf_prog_get_type` of Linux. Another type gives
+/// `EINVAL`.
+fn bpf_prog_get_type(env: &dyn Env, fd: u32, prog_type: u32) -> Result<Arc<BpfProg>> {
+    let prog = bpf_prog_get(env, fd)?;
+    if prog.prog_type != prog_type {
+        return Err(Errno::EINVAL);
+    }
+    Ok(prog)
+}
+
+/// The anchor of `relative_fd` or `relative_id`, `bpf_get_anchor_link` and
+/// `bpf_get_anchor_prog` of Linux.
+fn bpf_get_anchor(env: &dyn Env, flags: u32, id_or_fd: u32) -> Result<Anchor> {
+    let by_id = flags & BPF_F_ID != 0;
+    if flags & BPF_F_LINK != 0 {
+        if by_id {
+            return bpf_link_by_id(id_or_fd).map(Anchor::Link);
+        }
+        if id_or_fd == 0 {
+            return Err(Errno::EINVAL);
+        }
+        return bpf_link_get_from_fd(env, id_or_fd).map(Anchor::Link);
+    }
+    if by_id {
+        let prog = if id_or_fd == 0 { None } else { PROG_IDR.find(id_or_fd) };
+        return prog.map(Anchor::Prog).ok_or(Errno::ENOENT);
+    }
+    if id_or_fd == 0 {
+        return Err(Errno::EINVAL);
+    }
+    bpf_prog_get(env, id_or_fd).map(Anchor::Prog)
+}
+
+/// Tells if a program type is a type of the cgroups that rukernel has, `is_cgroup_prog_type`
+/// of Linux.
+fn is_cgroup_prog_type(prog_type: u32) -> bool {
+    matches!(
+        prog_type,
+        BPF_PROG_TYPE_CGROUP_SKB
+            | BPF_PROG_TYPE_CGROUP_SOCK
+            | BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+            | BPF_PROG_TYPE_CGROUP_DEVICE
+    )
+}
+
+/// The attach flags of a program that is not of a cgroup, `BPF_F_ATTACH_MASK_BASE` of Linux.
+const BPF_F_ATTACH_MASK_BASE: u32 =
+    BPF_F_ALLOW_OVERRIDE | BPF_F_ALLOW_MULTI | BPF_F_REPLACE | BPF_F_PREORDER;
+
+/// The attach flags of a list of programs, `BPF_F_ATTACH_MASK_MPROG` of Linux.
+const BPF_F_ATTACH_MASK_MPROG: u32 =
+    BPF_F_REPLACE | BPF_F_BEFORE | BPF_F_AFTER | BPF_F_ID | BPF_F_LINK;
+
+/// `BPF_PROG_ATTACH`: `bpf_prog_attach` and `cgroup_bpf_prog_attach` of Linux.
+fn bpf_prog_attach(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    use prog_attach::*;
+    if attr.check_attr(last_field::BPF_PROG_ATTACH) {
+        return Err(Errno::EINVAL);
+    }
+    let attach_type = attr.u32(ATTACH_TYPE);
+    let flags = attr.u32(ATTACH_FLAGS);
+    let ptype = attach_type_to_prog_type(attach_type);
+    if ptype == BPF_PROG_TYPE_UNSPEC {
+        return Err(Errno::EINVAL);
+    }
+    if is_cgroup_prog_type(ptype) {
+        if flags & !(BPF_F_ATTACH_MASK_BASE | BPF_F_ATTACH_MASK_MPROG) != 0 {
+            return Err(Errno::EINVAL);
+        }
+    } else if flags & !BPF_F_ATTACH_MASK_BASE != 0
+        || attr.u32(RELATIVE_FD) != 0
+        || attr.u64(EXPECTED_REVISION) != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let prog = bpf_prog_get_type(env, attr.u32(ATTACH_BPF_FD), ptype)?;
+    if bpf_prog_attach_check_attach_type(env, &prog, attach_type).is_err() {
+        return Err(Errno::EINVAL);
+    }
+    // rukernel has no hook of `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` yet.
+    if ptype == BPF_PROG_TYPE_CGROUP_SOCK_ADDR {
+        return Err(Errno::EINVAL);
+    }
+    let cgrp = env.cgroup_get_from_fd(attr.u32(TARGET_FD))?;
+    let replace_prog = if flags & BPF_F_ALLOW_MULTI != 0 && flags & BPF_F_REPLACE != 0 {
+        Some(bpf_prog_get_type(env, attr.u32(REPLACE_BPF_FD), ptype)?)
+    } else {
+        None
+    };
+    let get_anchor = |f, id_or_fd| bpf_get_anchor(env, f, id_or_fd);
+    cgroup_bpf_attach(
+        &EnvCgroups(env),
+        AttachArgs {
+            cgrp,
+            prog: Some(prog),
+            replace_prog,
+            link: None,
+            attach_type,
+            flags,
+            relative: attr.u32(RELATIVE_FD),
+            get_anchor: &get_anchor,
+            revision: attr.u64(EXPECTED_REVISION),
+        },
+    )?;
+    Ok(0)
+}
+
+/// `BPF_PROG_DETACH`: `bpf_prog_detach` and `cgroup_bpf_prog_detach` of Linux.
+fn bpf_prog_detach(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    use prog_attach::*;
+    if attr.check_attr(last_field::BPF_PROG_DETACH) {
+        return Err(Errno::EINVAL);
+    }
+    let attach_type = attr.u32(ATTACH_TYPE);
+    let ptype = attach_type_to_prog_type(attach_type);
+    if !is_cgroup_prog_type(ptype) || ptype == BPF_PROG_TYPE_CGROUP_SOCK_ADDR {
+        return Err(Errno::EINVAL);
+    }
+    if attr.u32(ATTACH_FLAGS) != 0 || attr.u32(RELATIVE_FD) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let cgrp = env.cgroup_get_from_fd(attr.u32(TARGET_FD))?;
+    // A bad descriptor detaches the only program, as in Linux.
+    let prog = bpf_prog_get_type(env, attr.u32(ATTACH_BPF_FD), ptype).ok();
+    cgroup_bpf_detach(
+        cgrp,
+        prog.as_ref(),
+        attach_type,
+        attr.u64(EXPECTED_REVISION),
+        bpf_net_capable(env),
+    )?;
+    Ok(0)
+}
+
+/// `BPF_PROG_QUERY`: `bpf_prog_query` and `__cgroup_bpf_query` of Linux.
+fn bpf_prog_query(env: &dyn Env, attr: &BpfAttr, uattr: u64, size: u32) -> Result<i64> {
+    use query::*;
+    if !bpf_net_capable(env) {
+        return Err(Errno::EPERM);
+    }
+    if attr.check_attr(last_field::BPF_PROG_QUERY) {
+        return Err(Errno::EINVAL);
+    }
+    let query_flags = attr.u32(QUERY_FLAGS);
+    if query_flags & !BPF_F_QUERY_EFFECTIVE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let attach_type = attr.u32(ATTACH_TYPE);
+    if crate::cgroup::to_cgroup_bpf_attach_type(attach_type).is_none() {
+        // The other cgroup types, and the types of other hooks, which rukernel does not have.
+        return Err(Errno::EINVAL);
+    }
+    let cgrp = env.cgroup_get_from_fd(attr.u32(TARGET_FD))?;
+    let effective = query_flags & BPF_F_QUERY_EFFECTIVE != 0;
+    let prog_attach_flags = attr.u64(PROG_ATTACH_FLAGS);
+    if effective && prog_attach_flags != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let q = cgroup_bpf_query(&EnvCgroups(env), cgrp, attach_type, effective)?;
+    let put =
+        |off: usize, b: &[u8]| env.copy_to_user(uattr + off as u64, b).map_err(|_| Errno::EFAULT);
+    put(ATTACH_FLAGS, &q.attach_flags.to_ne_bytes())?;
+    put(PROG_CNT, &q.prog_cnt.to_ne_bytes())?;
+    if size as usize >= REVISION + 8 {
+        put(REVISION, &q.revision.to_ne_bytes())?;
+    }
+    let prog_ids = attr.u64(PROG_IDS);
+    let mut cnt = q.prog_cnt;
+    if attr.u32(PROG_CNT) == 0 || prog_ids == 0 || cnt == 0 {
+        return Ok(0);
+    }
+    let mut ret = Ok(0);
+    if attr.u32(PROG_CNT) < cnt {
+        cnt = attr.u32(PROG_CNT);
+        ret = Err(Errno::ENOSPC);
+    }
+    let cnt = cnt as usize;
+    let mut ids = Vec::with_capacity(cnt * 4);
+    for id in &q.prog_ids[..cnt] {
+        ids.extend_from_slice(&id.to_ne_bytes());
+    }
+    env.copy_to_user(prog_ids, &ids).map_err(|_| Errno::EFAULT)?;
+    if prog_attach_flags != 0 {
+        let mut flags = Vec::with_capacity(cnt * 4);
+        for f in &q.prog_attach_flags[..cnt] {
+            flags.extend_from_slice(&f.to_ne_bytes());
+        }
+        env.copy_to_user(prog_attach_flags, &flags).map_err(|_| Errno::EFAULT)?;
+    }
+    ret
 }
 
 /// `BPF_LINK_UPDATE`: `link_update` of Linux. With `BPF_F_REPLACE` the link must have the
@@ -1282,6 +1568,20 @@ mod tests {
 
         fn uid(&self) -> u32 {
             1000
+        }
+
+        // The descriptors from 5000 are the cgroups 5000 and up, each one the child of the
+        // one before.
+        fn cgroup_get_from_fd(&self, fd: u32) -> Result<CgId> {
+            if fd >= 5000 { Ok(fd) } else { Err(Errno::EBADF) }
+        }
+
+        fn cgroup_parent(&self, id: CgId) -> Option<CgId> {
+            (id > 5000).then(|| id - 1)
+        }
+
+        fn cgroup_id(&self, id: CgId) -> u64 {
+            u64::from(id)
         }
     }
 
@@ -1726,5 +2026,104 @@ mod tests {
         detach.set_u32(link_update::LINK_FD, fd as u32);
         assert_eq!(env.call(BPF_LINK_DETACH, &detach), Ok(0));
         assert!(released.load(Ordering::Relaxed) && link.prog().is_none());
+    }
+
+    fn load_type(env: &FakeEnv, prog_type: u32, expected: u32, insns: &[[u8; 8]]) -> Result<i64> {
+        env.put(INSNS, &insns.concat());
+        env.put(LICENSE, b"GPL\0");
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(prog_load::PROG_TYPE, prog_type);
+        a.set_u32(prog_load::EXPECTED_ATTACH_TYPE, expected);
+        a.set_u32(prog_load::INSN_CNT, insns.len() as u32);
+        a.set_u64(prog_load::INSNS, INSNS);
+        a.set_u64(prog_load::LICENSE, LICENSE);
+        env.call(BPF_PROG_LOAD, &a)
+    }
+
+    fn attach_attr(target: u32, prog: i64, attach_type: u32, flags: u32) -> BpfAttr {
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(prog_attach::TARGET_FD, target);
+        a.set_u32(prog_attach::ATTACH_BPF_FD, prog as u32);
+        a.set_u32(prog_attach::ATTACH_TYPE, attach_type);
+        a.set_u32(prog_attach::ATTACH_FLAGS, flags);
+        a
+    }
+
+    #[test]
+    fn cgroup_programs_attach_query_and_detach() {
+        let env = FakeEnv::new();
+        let ret1 = [insn(0xb7, 0, 0, 0, 1), insn(0x95, 0, 0, 0, 0)];
+        let ret2 = [insn(0xb7, 0, 0, 0, 2), insn(0x95, 0, 0, 0, 0)];
+        // An ingress program gives 0 or 1. An egress program can give 2, and then it can only
+        // attach at egress.
+        assert_eq!(load_type(&env, BPF_PROG_TYPE_CGROUP_SKB, 0, &ret2), Err(Errno::EINVAL));
+        let egress =
+            load_type(&env, BPF_PROG_TYPE_CGROUP_SKB, BPF_CGROUP_INET_EGRESS, &ret2).unwrap();
+        let skb = load_type(&env, BPF_PROG_TYPE_CGROUP_SKB, 0, &ret1).unwrap();
+        assert_eq!(load_type(&env, BPF_PROG_TYPE_CGROUP_SOCK, 99, &ret1), Err(Errno::EINVAL));
+        let sock = load_type(&env, BPF_PROG_TYPE_CGROUP_SOCK, 0, &ret1).unwrap();
+        let sock_prog = bpf_prog_of(&env.fdget(sock as i32).unwrap()).unwrap();
+        assert_eq!(sock_prog.expected_attach_type, BPF_CGROUP_INET_SOCK_CREATE);
+        // A device program cannot write its context.
+        let st = [insn(0xb7, 0, 0, 0, 1), insn(0x63, 1, 0, 0, 0), insn(0x95, 0, 0, 0, 0)];
+        assert_eq!(load_type(&env, BPF_PROG_TYPE_CGROUP_DEVICE, 0, &st), Err(Errno::EACCES));
+
+        let ingress = attach_attr(5100, egress, BPF_CGROUP_INET_INGRESS, 0);
+        assert_eq!(env.call(BPF_PROG_ATTACH, &ingress), Err(Errno::EINVAL));
+        let bad_fd = attach_attr(7, skb, BPF_CGROUP_INET_EGRESS, BPF_F_ALLOW_MULTI);
+        assert_eq!(env.call(BPF_PROG_ATTACH, &bad_fd), Err(Errno::EBADF));
+        let a = attach_attr(5100, skb, BPF_CGROUP_INET_EGRESS, BPF_F_ALLOW_MULTI);
+        assert_eq!(env.call(BPF_PROG_ATTACH, &a), Ok(0));
+        let b = attach_attr(5101, egress, BPF_CGROUP_INET_EGRESS, BPF_F_ALLOW_MULTI);
+        assert_eq!(env.call(BPF_PROG_ATTACH, &b), Ok(0));
+        let sk = attach_attr(5101, sock, BPF_CGROUP_INET_SOCK_CREATE, 0);
+        assert_eq!(env.call(BPF_PROG_ATTACH, &sk), Ok(0));
+
+        let ids = BASE + 0x900;
+        let mut q = BpfAttr::zeroed();
+        q.set_u32(query::TARGET_FD, 5101);
+        q.set_u32(query::ATTACH_TYPE, BPF_CGROUP_INET_EGRESS);
+        q.set_u32(query::QUERY_FLAGS, BPF_F_QUERY_EFFECTIVE);
+        q.set_u64(query::PROG_IDS, ids);
+        q.set_u32(query::PROG_CNT, 1);
+        assert_eq!(env.call(BPF_PROG_QUERY, &q), Err(Errno::ENOSPC));
+        assert_eq!(get_u32(&env, BASE + query::PROG_CNT as u64), 2);
+        q.set_u32(query::PROG_CNT, 8);
+        assert_eq!(env.call(BPF_PROG_QUERY, &q), Ok(0));
+        let egress_prog = bpf_prog_of(&env.fdget(egress as i32).unwrap()).unwrap();
+        let skb_prog = bpf_prog_of(&env.fdget(skb as i32).unwrap()).unwrap();
+        assert_eq!([get_u32(&env, ids), get_u32(&env, ids + 4)], [egress_prog.id, skb_prog.id]);
+        q.set_u32(query::QUERY_FLAGS, 0);
+        assert_eq!(env.call(BPF_PROG_QUERY, &q), Ok(0));
+        assert_eq!(get_u32(&env, BASE + query::ATTACH_FLAGS as u64), BPF_F_ALLOW_MULTI);
+        assert_eq!(get_u32(&env, BASE + query::PROG_CNT as u64), 1);
+        env.caps.set(false);
+        assert_eq!(env.call(BPF_PROG_QUERY, &q), Err(Errno::EPERM));
+        env.caps.set(true);
+
+        // A link of a cgroup.
+        let mut l = BpfAttr::zeroed();
+        l.set_u32(link_create::PROG_FD, skb as u32);
+        l.set_u32(link_create::TARGET_FD, 5102);
+        l.set_u32(link_create::ATTACH_TYPE, BPF_CGROUP_INET_INGRESS);
+        let link = env.call(BPF_LINK_CREATE, &l).unwrap();
+        let link = bpf_link_of(&env.fdget(link as i32).unwrap()).unwrap();
+        assert_eq!(
+            alloc::string::String::from_utf8(link.show_fdinfo()).unwrap().lines().last(),
+            Some("attach_type:\t0")
+        );
+        let d = attach_attr(5102, skb, BPF_CGROUP_INET_INGRESS, 0);
+        assert_eq!(env.call(BPF_PROG_DETACH, &d), Err(Errno::ENOENT));
+        let mut detach = BpfAttr::zeroed();
+        detach.set_u32(link_update::LINK_FD, link.id());
+        let fd = bpf_link_new_fd(&env, link.clone()).unwrap();
+        detach.set_u32(link_update::LINK_FD, fd as u32);
+        assert_eq!(env.call(BPF_LINK_DETACH, &detach), Ok(0));
+        assert!(link.prog().is_none());
+
+        let d = attach_attr(5100, skb, BPF_CGROUP_INET_EGRESS, 0);
+        assert_eq!(env.call(BPF_PROG_DETACH, &d), Ok(0));
+        assert_eq!(env.call(BPF_PROG_DETACH, &d), Err(Errno::ENOENT));
+        crate::cgroup::cgroup_bpf_offline(5101);
     }
 }
