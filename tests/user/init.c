@@ -5448,6 +5448,65 @@ static void test_bpf_prog(void)
 	close(map);
 }
 
+/* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
+static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
+{
+	unsigned char attr[168] = { 0 };
+
+	bpf_put64(attr, 0, (unsigned long)path);
+	bpf_put32(attr, 8, fd);
+	bpf_put32(attr, 12, flags);
+	return bpf_call(cmd, attr, 20);
+}
+
+/*
+ * bpffs at /sys/fs/bpf: BPF_OBJ_PIN keeps a map after its last descriptor closes, and
+ * BPF_OBJ_GET gives a new descriptor of the same map (#537).
+ */
+static void test_bpffs(void)
+{
+	struct statfs sfs;
+	struct stat st;
+	unsigned int index = 0;
+	unsigned long long val = 42, out = 0;
+	int map, fd, sys, ok;
+
+	mkdir("/sys", 0755);
+	sys = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
+	check("mount bpf on /sys/fs/bpf",
+	      sys && mount("bpf", "/sys/fs/bpf", "bpf", 0, NULL) == 0);
+	check("statfs of bpffs gives BPF_FS_MAGIC",
+	      statfs("/sys/fs/bpf", &sfs) == 0 && sfs.f_type == 0xcafe4a11);
+	map = bpf_map_new(2, 4, 8, 1, 0);
+	ok = map >= 0 && bpf_elem(2, map, &index, &val, 0) == 0;
+	ok = ok && bpf_obj(6, "/sys/fs/bpf/rk_map", map, 0) == 0;
+	ok = ok && stat("/sys/fs/bpf/rk_map", &st) == 0 && S_ISREG(st.st_mode) &&
+	     (st.st_mode & 0777) == 0600;
+	check("BPF_OBJ_PIN makes a file in bpffs", ok);
+	close(map);
+	fd = bpf_obj(7, "/sys/fs/bpf/rk_map", 0, 0);
+	ok = fd >= 0 && bpf_elem(1, fd, &index, &out, 0) == 0 && out == 42;
+	check("BPF_OBJ_GET gives the pinned map", ok);
+	errno = 0;
+	check("BPF_OBJ_PIN of a name that exists gives EEXIST",
+	      bpf_obj(6, "/sys/fs/bpf/rk_map", fd, 0) == -1 && errno == EEXIST);
+	errno = 0;
+	check("open of a pinned object gives EIO",
+	      open("/sys/fs/bpf/rk_map", O_RDONLY) == -1 && errno == EIO);
+	errno = 0;
+	check("BPF_OBJ_PIN outside bpffs gives EPERM",
+	      bpf_obj(6, "/rk_map", fd, 0) == -1 && errno == EPERM);
+	close(fd);
+	ok = unlink("/sys/fs/bpf/rk_map") == 0;
+	errno = 0;
+	ok = ok && bpf_obj(7, "/sys/fs/bpf/rk_map", 0, 0) == -1 && errno == ENOENT;
+	check("unlink removes the pin", ok);
+	if (sys) {
+		umount("/sys/fs/bpf");
+		umount("/sys");
+	}
+}
+
 /*
  * The maps of bpf(2): hash, array, per CPU array and LPM trie, the size rules of union
  * bpf_attr, the fdinfo of a map and the sysctl kernel.unprivileged_bpf_disabled (#537).
@@ -5556,6 +5615,7 @@ static void test_bpf(void)
 	check("an LPM trie finds the longest prefix", ok);
 	close(fd);
 	test_bpf_prog();
+	test_bpffs();
 	umount("/proc");
 }
 

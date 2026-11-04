@@ -32,6 +32,8 @@ pub mod last_field {
     pub const BPF_MAP_FREEZE: usize = 4;
     /// `BPF_PROG_LOAD`: `keyring_id`.
     pub const BPF_PROG_LOAD: usize = 168;
+    /// `BPF_OBJ_PIN` and `BPF_OBJ_GET`: `path_fd`.
+    pub const BPF_OBJ: usize = 20;
 }
 
 /// Checks the size of an argument that a program gives, as `bpf_check_uarg_tail_zero` of Linux.
@@ -151,6 +153,18 @@ pub mod map_elem {
     pub const VALUE: usize = 16;
     /// `flags`.
     pub const FLAGS: usize = 24;
+}
+
+/// The fields of `BPF_OBJ_PIN` and `BPF_OBJ_GET`.
+pub mod obj {
+    /// `pathname`.
+    pub const PATHNAME: usize = 0;
+    /// `bpf_fd`.
+    pub const BPF_FD: usize = 8;
+    /// `file_flags`.
+    pub const FILE_FLAGS: usize = 12;
+    /// `path_fd`.
+    pub const PATH_FD: usize = 16;
 }
 
 /// The fields of `BPF_PROG_LOAD`.
