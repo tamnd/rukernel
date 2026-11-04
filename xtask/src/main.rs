@@ -874,7 +874,8 @@ echo 'debian: done'
         // tools/systemd/build.sh makes the tree. The script adds rk-check.service, and then
         // systemd runs as PID 1. At multi-user.target the service prints the state of the system
         // and the units that failed, and stops the machine. The test passes if the state is
-        // `running`, or `degraded` with only the units of `allowed` in the failed list.
+        // `running`, or `degraded` with only the units of `allowed` in the failed list, and
+        // sys-fs-bpf.mount is active.
         init: r#"#!/bin/sh
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -896,18 +897,20 @@ ln -sf ../rk-check.service /etc/systemd/system/multi-user.target.wants/rk-check.
 cat > /usr/local/bin/rk-check << 'END'
 #!/bin/sh
 allowed=''
+other=
 state=$(systemctl is-system-running --wait || true)
 echo "rk-systemd: state $state"
+bpf=$(systemctl is-active sys-fs-bpf.mount || true)
+echo "rk-systemd: sys-fs-bpf.mount $bpf"
+[ "$bpf" = active ] || other="$other sys-fs-bpf.mount"
 failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
-other=
 for unit in $failed; do
     echo "rk-systemd: failed $unit"
     systemctl status --no-pager --lines=5 "$unit" | sed 's/^/rk-systemd:   /'
     case " $allowed " in *" $unit "*) ;; *) other="$other $unit" ;; esac
 done
 case $state in
-running) echo 'rk-systemd: pass' ;;
-degraded) [ -n "$other" ] || echo 'rk-systemd: pass' ;;
+running | degraded) [ -n "$other" ] || echo 'rk-systemd: pass' ;;
 esac
 systemctl poweroff
 END

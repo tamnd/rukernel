@@ -72,6 +72,14 @@ impl Env for BpfEnv<'_, '_> {
         fs.permission(&at, mask)?;
         bpf_obj_of(at.inode())
     }
+
+    fn boot_ns(&self) -> u64 {
+        crate::info::uptime_ns()
+    }
+
+    fn uid(&self) -> u32 {
+        self.0.process().cred().uid
+    }
 }
 
 pub(crate) fn bpf(

@@ -5,13 +5,14 @@
 
 use crate::core::bpf_prog_run;
 use crate::helpers::HelperEnv;
+use crate::idr::Idr;
 use crate::insn::{BpfInsn, INSN_SIZE};
 use crate::map::BpfMap;
 use crate::uapi::BPF_OBJ_NAME_LEN;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use rk_vfs::file::{File, FileOps};
 use rk_vfs::inode::Metadata;
 
@@ -39,8 +40,8 @@ pub mod prog_flags {
     pub const BPF_F_TEST_REG_INVARIANTS: u32 = 1 << 7;
 }
 
-/// The next program ID, as `prog_idr` of Linux.
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// The IDs of the programs, `prog_idr` of Linux.
+pub static PROG_IDR: Idr<BpfProg> = Idr::new();
 
 /// A program that the verifier accepted.
 pub struct BpfProg {
@@ -65,11 +66,28 @@ pub struct BpfProg {
     pub verified_insns: u32,
     /// The number of runs, `run_cnt` of `bpf_prog_stats`.
     pub run_cnt: AtomicU64,
+    /// The time of the load in nanoseconds after the boot, `load_time` of Linux.
+    pub load_time: u64,
+    /// The real user ID of the process that loaded the program, `aux->user` of Linux.
+    pub uid: u32,
 }
 
-/// A new program ID, `bpf_prog_alloc_id` of Linux.
+/// Reserves a new program ID, as `bpf_prog_alloc_id` of Linux. [`bpf_prog_publish_id`] makes the
+/// ID find the program.
 pub fn bpf_prog_alloc_id() -> u32 {
-    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    PROG_IDR.alloc().unwrap_or(0)
+}
+
+/// Makes the ID of a new program find the program.
+pub fn bpf_prog_publish_id(prog: &Arc<BpfProg>) {
+    PROG_IDR.publish(prog.id, prog);
+}
+
+impl Drop for BpfProg {
+    /// `bpf_prog_free_id` of Linux.
+    fn drop(&mut self) {
+        PROG_IDR.remove(self.id);
+    }
 }
 
 impl BpfProg {

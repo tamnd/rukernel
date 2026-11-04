@@ -9,6 +9,7 @@ pub mod arraymap;
 pub mod hashtab;
 pub mod lpm_trie;
 
+use crate::idr::Idr;
 use crate::uapi::BPF_OBJ_NAME_LEN;
 use crate::uapi::elem::{BPF_F_ALL_CPUS, BPF_F_CPU, BPF_F_LOCK};
 use crate::uapi::flags::{BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG};
@@ -125,8 +126,21 @@ pub struct BpfMap {
     pub ops: Box<dyn BpfMapOps>,
 }
 
-/// The next map ID. Linux uses `idr_alloc_cyclic` from 1.
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+/// The IDs of the maps, `map_idr` of Linux.
+pub static MAP_IDR: Idr<BpfMap> = Idr::new();
+
+/// Makes the ID of a new map find the map, the `idr_alloc_cyclic` of `bpf_map_alloc_id` of
+/// Linux. [`BpfMap::new`] reserves the ID.
+pub fn bpf_map_publish_id(map: &Arc<BpfMap>) {
+    MAP_IDR.publish(map.id, map);
+}
+
+impl Drop for BpfMap {
+    /// `bpf_map_free_id` of Linux.
+    fn drop(&mut self) {
+        MAP_IDR.remove(self.id);
+    }
+}
 
 /// Tells if the map type has one value for each CPU, `bpf_map_is_percpu_map` of Linux.
 pub fn bpf_map_is_percpu_map(map_type: u32) -> bool {
@@ -185,7 +199,8 @@ pub fn map_alloc(attr: &MapAttr, nr_cpus: usize, avail: u64) -> Result<Box<dyn B
 }
 
 impl BpfMap {
-    /// Makes a map with the operations `ops` and a new ID.
+    /// Makes a map with the operations `ops` and a new ID. [`bpf_map_publish_id`] makes the ID
+    /// find the map.
     pub fn new(
         attr: &MapAttr,
         name: [u8; BPF_OBJ_NAME_LEN],
@@ -199,7 +214,7 @@ impl BpfMap {
             max_entries: attr.max_entries,
             map_flags: attr.map_flags,
             map_extra: 0,
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: MAP_IDR.alloc().unwrap_or(0),
             name,
             nr_cpus,
             frozen: AtomicBool::new(false),

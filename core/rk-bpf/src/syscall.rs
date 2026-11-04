@@ -6,25 +6,35 @@
 
 use crate::UNPRIVILEGED_BPF_DISABLED;
 use crate::attr::{
-    BPF_ATTR_SIZE, BPF_COMMON_ATTR_SIZE, BpfAttr, bpf_check_uarg_tail_zero, common, last_field,
-    map_create, map_elem, obj, prog_load,
+    BPF_ATTR_SIZE, BPF_COMMON_ATTR_SIZE, BpfAttr, bpf_check_uarg_tail_zero, common, get_id, info,
+    last_field, link_create, link_update, map_create, map_elem, obj, prog_load,
 };
 use crate::file::{BpfMapFile, bpf_map_of};
+use crate::idr::{ID_MAX, Idr};
 use crate::inode::BpfObj;
 use crate::insn::{BPF_COMPLEXITY_LIMIT_INSNS, BPF_MAXINSNS, INSN_SIZE, decode};
+use crate::link::{
+    BPF_LINK_INFO_SIZE, BpfLink, BpfLinkFile, LINK_IDR, bpf_link_by_id, bpf_link_of,
+};
 use crate::map::{
-    BpfMap, MapAttr, MapEnv, bpf_map_type_known, bpf_obj_name_cpy, map_alloc, map_alloc_check,
+    BpfMap, MAP_IDR, MapAttr, MapEnv, bpf_map_publish_id, bpf_map_type_known, bpf_obj_name_cpy,
+    map_alloc, map_alloc_check,
 };
 use crate::prog::prog_flags::*;
 use crate::prog::prog_type::*;
-use crate::prog::{BpfProg, BpfProgFile, bpf_prog_alloc_id, bpf_prog_calc_tag, bpf_prog_of};
-use crate::uapi::CAP_BPF;
+use crate::prog::{
+    BpfProg, BpfProgFile, PROG_IDR, bpf_prog_alloc_id, bpf_prog_calc_tag, bpf_prog_of,
+    bpf_prog_publish_id,
+};
+use crate::uapi::attach_flags::BPF_F_REPLACE;
+use crate::uapi::attach_type::*;
 use crate::uapi::cmd::*;
 use crate::uapi::elem::{BPF_F_CPU, BPF_F_LOCK};
 use crate::uapi::flags::{
     BPF_F_NUMA_NODE, BPF_F_PATH_FD, BPF_F_RDONLY, BPF_F_TOKEN_FD, BPF_F_WRONLY, BPF_F_ZERO_SEED,
 };
 use crate::uapi::map_type::*;
+use crate::uapi::{BPF_TAG_SIZE, CAP_BPF};
 use crate::verifier::{BPF_LOG_FIXED, BPF_LOG_MASK, BpfVerifierLog, VerifierOpts, bpf_check};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -40,6 +50,9 @@ pub type Result<T> = core::result::Result<T, Errno>;
 
 /// `CAP_SYS_ADMIN`.
 const CAP_SYS_ADMIN: u32 = 21;
+
+/// `CAP_NET_ADMIN`.
+const CAP_NET_ADMIN: u32 = 12;
 
 /// `CAP_PERFMON`.
 const CAP_PERFMON: u32 = 38;
@@ -78,6 +91,10 @@ pub trait Env {
     /// `bpf_obj_do_get` of Linux. The walk follows symbolic links, and the caller must have the
     /// access `mask` to the file. A file that is not a pinned object gives `EACCES`.
     fn obj_get(&self, path_fd: i32, pathname: u64, mask: u32) -> Result<BpfObj>;
+    /// The nanoseconds after the boot, `ktime_get_boottime_ns` of Linux.
+    fn boot_ns(&self) -> u64;
+    /// The real user ID of the caller.
+    fn uid(&self) -> u32;
 }
 
 /// `bpf_capable` of Linux.
@@ -136,6 +153,16 @@ pub fn sys_bpf(
         BPF_MAP_FREEZE => map_freeze(env, &attr),
         BPF_OBJ_PIN => bpf_obj_pin(env, &attr),
         BPF_OBJ_GET => bpf_obj_get(env, &attr),
+        BPF_PROG_GET_NEXT_ID => bpf_obj_get_next_id(env, &attr, uattr, &PROG_IDR),
+        BPF_MAP_GET_NEXT_ID => bpf_obj_get_next_id(env, &attr, uattr, &MAP_IDR),
+        BPF_LINK_GET_NEXT_ID => bpf_obj_get_next_id(env, &attr, uattr, &LINK_IDR),
+        BPF_PROG_GET_FD_BY_ID => bpf_prog_get_fd_by_id(env, &attr),
+        BPF_MAP_GET_FD_BY_ID => bpf_map_get_fd_by_id(env, &attr),
+        BPF_LINK_GET_FD_BY_ID => bpf_link_get_fd_by_id(env, &attr),
+        BPF_OBJ_GET_INFO_BY_FD => bpf_obj_get_info_by_fd(env, &attr, uattr),
+        BPF_LINK_CREATE => link_create_cmd(env, &attr),
+        BPF_LINK_UPDATE => link_update_cmd(env, &attr),
+        BPF_LINK_DETACH => link_detach(env, &attr),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -353,9 +380,12 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
         gpl_compatible,
         verified_insns: v.insn_processed,
         run_cnt: core::sync::atomic::AtomicU64::new(0),
+        load_time: env.boot_ns(),
+        uid: env.uid(),
     };
-    let file = File::with_ops(Arc::new(BpfProgFile { prog: Arc::new(prog) }), None, O_RDWR);
-    env.fd_install(file).map(i64::from)
+    let prog = Arc::new(prog);
+    bpf_prog_publish_id(&prog);
+    bpf_prog_new_fd(env, prog)
 }
 
 /// The flags of the file of a new map, `bpf_get_file_flag` of Linux.
@@ -463,8 +493,8 @@ fn map_create(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     }
     let f_flags = bpf_get_file_flag(a.map_flags)?;
     let map = Arc::new(BpfMap::new(&a, name, menv.nr_cpus, ops));
-    let file = File::with_ops(Arc::new(BpfMapFile { map }), None, f_flags);
-    env.fd_install(file).map(i64::from)
+    bpf_map_publish_id(&map);
+    bpf_map_new_fd(env, map, f_flags)
 }
 
 /// The map of a descriptor, `__bpf_map_get` of Linux.
@@ -629,12 +659,15 @@ fn obj_path_fd(attr: &BpfAttr) -> Result<i32> {
     }
 }
 
-/// The map or the program of a descriptor, `bpf_fd_probe_obj` of Linux. A descriptor of
-/// another file gives `EINVAL`.
+/// The map, the program or the link of a descriptor, `bpf_fd_probe_obj` of Linux. A descriptor
+/// of another file gives `EINVAL`.
 fn bpf_fd_probe_obj(env: &dyn Env, fd: u32) -> Result<BpfObj> {
     let file = env.fdget(fd as i32)?;
     if let Some(map) = bpf_map_of(&file) {
         return Ok(BpfObj::Map(map));
+    }
+    if let Some(link) = bpf_link_of(&file) {
+        return Ok(BpfObj::Link(link));
     }
     bpf_prog_of(&file).map(BpfObj::Prog).ok_or(Errno::EINVAL)
 }
@@ -650,8 +683,8 @@ fn bpf_obj_pin(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     Ok(0)
 }
 
-/// `BPF_OBJ_GET`, `bpf_obj_get` and `bpf_obj_get_user` of Linux. A program needs a file that
-/// can be read and written.
+/// `BPF_OBJ_GET`, `bpf_obj_get` and `bpf_obj_get_user` of Linux. A program and a link need a
+/// file that can be read and written.
 fn bpf_obj_get(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     let flags = attr.u32(obj::FILE_FLAGS);
     if attr.check_attr(last_field::BPF_OBJ)
@@ -662,16 +695,478 @@ fn bpf_obj_get(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     }
     let path_fd = obj_path_fd(attr)?;
     let f_flags = bpf_get_file_flag(flags)?;
-    let file = match env.obj_get(path_fd, attr.u64(obj::PATHNAME), acc_mode(f_flags))? {
-        BpfObj::Prog(prog) => {
-            if f_flags != O_RDWR {
+    match env.obj_get(path_fd, attr.u64(obj::PATHNAME), acc_mode(f_flags))? {
+        BpfObj::Prog(_) | BpfObj::Link(_) if f_flags != O_RDWR => Err(Errno::EINVAL),
+        BpfObj::Prog(prog) => bpf_prog_new_fd(env, prog),
+        BpfObj::Link(link) => bpf_link_new_fd(env, link),
+        BpfObj::Map(map) => bpf_map_new_fd(env, map, f_flags),
+    }
+}
+
+/// A new descriptor of a program, `bpf_prog_new_fd` of Linux.
+fn bpf_prog_new_fd(env: &dyn Env, prog: Arc<BpfProg>) -> Result<i64> {
+    let file = File::with_ops(Arc::new(BpfProgFile { prog }), None, O_RDWR);
+    env.fd_install(file).map(i64::from)
+}
+
+/// A new descriptor of a map with the flags `f_flags`, `bpf_map_new_fd` of Linux.
+fn bpf_map_new_fd(env: &dyn Env, map: Arc<BpfMap>, f_flags: u32) -> Result<i64> {
+    let file = File::with_ops(Arc::new(BpfMapFile { map }), None, f_flags);
+    env.fd_install(file).map(i64::from)
+}
+
+/// A new descriptor of a link, `bpf_link_new_fd` of Linux.
+fn bpf_link_new_fd(env: &dyn Env, link: Arc<BpfLink>) -> Result<i64> {
+    let file = File::with_ops(Arc::new(BpfLinkFile { link }), None, O_RDWR);
+    env.fd_install(file).map(i64::from)
+}
+
+/// `BPF_PROG_GET_NEXT_ID`, `BPF_MAP_GET_NEXT_ID` and `BPF_LINK_GET_NEXT_ID`:
+/// `bpf_obj_get_next_id` of Linux. Writes the first ID after `start_id` to `next_id`.
+fn bpf_obj_get_next_id<T>(env: &dyn Env, attr: &BpfAttr, uattr: u64, idr: &Idr<T>) -> Result<i64> {
+    let start = attr.u32(get_id::START_ID);
+    if attr.check_attr(last_field::BPF_OBJ_GET_NEXT_ID) || start >= ID_MAX {
+        return Err(Errno::EINVAL);
+    }
+    if !env.capable(CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let next = idr.get_next(start).ok_or(Errno::ENOENT)?;
+    env.copy_to_user(uattr + get_id::NEXT_ID as u64, &next.to_ne_bytes())?;
+    Ok(0)
+}
+
+/// `BPF_PROG_GET_FD_BY_ID`: `bpf_prog_get_fd_by_id` of Linux.
+fn bpf_prog_get_fd_by_id(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    if attr.check_attr(last_field::BPF_PROG_GET_FD_BY_ID) {
+        return Err(Errno::EINVAL);
+    }
+    if !env.capable(CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let id = attr.u32(get_id::START_ID);
+    let prog = if id == 0 { None } else { PROG_IDR.find(id) };
+    bpf_prog_new_fd(env, prog.ok_or(Errno::ENOENT)?)
+}
+
+/// `BPF_MAP_GET_FD_BY_ID`: `bpf_map_get_fd_by_id` of Linux. `open_flags` can have
+/// `BPF_F_RDONLY` or `BPF_F_WRONLY`.
+fn bpf_map_get_fd_by_id(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    let open_flags = attr.u32(get_id::OPEN_FLAGS);
+    if attr.check_attr(last_field::BPF_MAP_GET_FD_BY_ID)
+        || open_flags & !(BPF_F_RDONLY | BPF_F_WRONLY) != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    if !env.capable(CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let f_flags = bpf_get_file_flag(open_flags)?;
+    let map = MAP_IDR.find(attr.u32(get_id::START_ID)).ok_or(Errno::ENOENT)?;
+    bpf_map_new_fd(env, map, f_flags)
+}
+
+/// `BPF_LINK_GET_FD_BY_ID`: `bpf_link_get_fd_by_id` of Linux.
+fn bpf_link_get_fd_by_id(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    if attr.check_attr(last_field::BPF_LINK_GET_FD_BY_ID) {
+        return Err(Errno::EINVAL);
+    }
+    if !env.capable(CAP_SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let link = bpf_link_by_id(attr.u32(get_id::START_ID))?;
+    bpf_link_new_fd(env, link)
+}
+
+/// The size of `struct bpf_prog_info` of Linux 7.3.
+const BPF_PROG_INFO_SIZE: usize = 232;
+
+/// The size of `struct bpf_map_info` of Linux 7.3.
+const BPF_MAP_INFO_SIZE: usize = 104;
+
+/// The offsets in `struct bpf_prog_info`.
+mod prog_info {
+    pub(super) const TYPE: usize = 0;
+    pub(super) const ID: usize = 4;
+    pub(super) const TAG: usize = 8;
+    pub(super) const JITED_PROG_LEN: usize = 16;
+    pub(super) const XLATED_PROG_LEN: usize = 20;
+    pub(super) const XLATED_PROG_INSNS: usize = 32;
+    pub(super) const LOAD_TIME: usize = 40;
+    pub(super) const CREATED_BY_UID: usize = 48;
+    pub(super) const NR_MAP_IDS: usize = 52;
+    pub(super) const MAP_IDS: usize = 56;
+    pub(super) const NAME: usize = 64;
+    pub(super) const GPL_COMPATIBLE: usize = 84;
+    pub(super) const NR_JITED_KSYMS: usize = 104;
+    pub(super) const NR_JITED_FUNC_LENS: usize = 108;
+    pub(super) const JITED_KSYMS: usize = 112;
+    pub(super) const JITED_FUNC_LENS: usize = 120;
+    pub(super) const FUNC_INFO_REC_SIZE: usize = 132;
+    pub(super) const NR_FUNC_INFO: usize = 144;
+    pub(super) const NR_LINE_INFO: usize = 148;
+    pub(super) const NR_JITED_LINE_INFO: usize = 168;
+    pub(super) const LINE_INFO_REC_SIZE: usize = 172;
+    pub(super) const JITED_LINE_INFO_REC_SIZE: usize = 176;
+    pub(super) const NR_PROG_TAGS: usize = 180;
+    pub(super) const PROG_TAGS: usize = 184;
+    pub(super) const RUN_TIME_NS: usize = 192;
+    pub(super) const RUN_CNT: usize = 200;
+    pub(super) const VERIFIED_INSNS: usize = 216;
+    /// The end of `attach_btf_id`, the last field.
+    pub(super) const END: usize = 228;
+}
+
+/// The offsets in `struct bpf_map_info`.
+mod map_info {
+    pub(super) const TYPE: usize = 0;
+    pub(super) const ID: usize = 4;
+    pub(super) const KEY_SIZE: usize = 8;
+    pub(super) const VALUE_SIZE: usize = 12;
+    pub(super) const MAX_ENTRIES: usize = 16;
+    pub(super) const MAP_FLAGS: usize = 20;
+    pub(super) const NAME: usize = 24;
+    pub(super) const MAP_EXTRA: usize = 80;
+    pub(super) const HASH: usize = 88;
+    pub(super) const HASH_SIZE: usize = 96;
+    /// The end of `hash_size`, the last field.
+    pub(super) const END: usize = 100;
+}
+
+/// The bytes of a `struct bpf_*_info`.
+struct InfoBuf<'a> {
+    buf: &'a mut [u8],
+}
+
+impl InfoBuf<'_> {
+    fn u32(&self, off: usize) -> u32 {
+        info_u32(self.buf, off)
+    }
+
+    fn u64(&self, off: usize) -> u64 {
+        u64::from_ne_bytes(self.buf[off..off + 8].try_into().unwrap_or([0; 8]))
+    }
+
+    fn set_u32(&mut self, off: usize, v: u32) {
+        self.buf[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+
+    fn set_u64(&mut self, off: usize, v: u64) {
+        self.buf[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+    }
+}
+
+/// The `u32` at `off` in `buf`.
+fn info_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap_or([0; 4]))
+}
+
+/// Copies the `struct bpf_*_info` of `size` bytes from the program, as the start of the
+/// `*_get_info_by_fd` functions of Linux. The kernel knows the first `known` bytes, and the
+/// bytes after them must be zero. Gives `size` bytes, of which the program gave the first
+/// `min(info_len, size)`.
+fn info_copy_in(env: &dyn Env, attr: &BpfAttr, known: usize, size: usize) -> Result<Vec<u8>> {
+    let uinfo = attr.u64(info::INFO);
+    let info_len = attr.u32(info::INFO_LEN) as usize;
+    bpf_check_uarg_tail_zero(known, info_len, |rest| {
+        env.copy_from_user(uinfo.wrapping_add(known as u64), rest)
+    })?;
+    let mut buf = kvzalloc(size)?;
+    env.copy_from_user(uinfo, &mut buf[..info_len.min(size)])?;
+    Ok(buf)
+}
+
+/// Copies the first `len` bytes of the info back and writes `info_len`, as the end of the
+/// `*_get_info_by_fd` functions of Linux.
+fn info_copy_out(env: &dyn Env, attr: &BpfAttr, uattr: u64, buf: &[u8], len: usize) -> Result<i64> {
+    env.copy_to_user(attr.u64(info::INFO), &buf[..len]).map_err(|_| Errno::EFAULT)?;
+    env.copy_to_user(uattr + info::INFO_LEN as u64, &(len as u32).to_ne_bytes())
+        .map_err(|_| Errno::EFAULT)?;
+    Ok(0)
+}
+
+/// The instructions of a program for `xlated_prog_insns`, as `bpf_insn_prepare_dump` of Linux.
+/// A load of a map has the map ID in place of the index of the map.
+fn bpf_insn_prepare_dump(prog: &BpfProg) -> Vec<u8> {
+    use crate::insn::BPF_PSEUDO_MAP_FD;
+    let mut out = Vec::with_capacity(prog.insns.len() * INSN_SIZE);
+    for insn in &prog.insns {
+        let mut i = *insn;
+        if i.is_ld_imm64()
+            && i.src_reg == BPF_PSEUDO_MAP_FD
+            && let Some(map) = prog.used_maps.get(i.imm as usize)
+        {
+            i.imm = map.id as i32;
+        }
+        out.extend_from_slice(&i.to_bytes());
+    }
+    out
+}
+
+/// The info of a program, `bpf_prog_get_info_by_fd` of Linux. rukernel has no JIT, so the
+/// JIT fields have one function of length 0.
+fn bpf_prog_get_info_by_fd(
+    env: &dyn Env,
+    prog: &BpfProg,
+    attr: &BpfAttr,
+    uattr: u64,
+) -> Result<i64> {
+    use prog_info::*;
+    let len = (attr.u32(info::INFO_LEN) as usize).min(BPF_PROG_INFO_SIZE);
+    let mut raw = info_copy_in(env, attr, END, BPF_PROG_INFO_SIZE)?;
+    let mut info = InfoBuf { buf: &mut raw };
+    info.set_u32(TYPE, prog.prog_type);
+    info.set_u32(ID, prog.id);
+    info.set_u64(LOAD_TIME, prog.load_time);
+    info.set_u32(CREATED_BY_UID, prog.uid);
+    info.set_u32(GPL_COMPATIBLE, u32::from(prog.gpl_compatible));
+    info.buf[TAG..TAG + BPF_TAG_SIZE].copy_from_slice(&prog.tag);
+    info.buf[NAME..NAME + 16].copy_from_slice(&prog.name);
+
+    let ulen = info.u32(NR_MAP_IDS) as usize;
+    info.set_u32(NR_MAP_IDS, prog.used_maps.len() as u32);
+    let ulen = ulen.min(prog.used_maps.len());
+    if ulen != 0 {
+        let ids: Vec<u8> = prog.used_maps[..ulen].iter().flat_map(|m| m.id.to_ne_bytes()).collect();
+        env.copy_to_user(info.u64(MAP_IDS), &ids).map_err(|_| Errno::EFAULT)?;
+    }
+
+    // `set_info_rec_size`: a size must be the one of the kernel, or 0 with a count of 0.
+    let rec = [(NR_FUNC_INFO, FUNC_INFO_REC_SIZE, 8), (NR_LINE_INFO, LINE_INFO_REC_SIZE, 16)];
+    for (nr, rec_size, want) in
+        rec.into_iter().chain([(NR_JITED_LINE_INFO, JITED_LINE_INFO_REC_SIZE, 8)])
+    {
+        if (info.u32(nr) != 0 || info.u32(rec_size) != 0) && info.u32(rec_size) != want {
+            return Err(Errno::EINVAL);
+        }
+        info.set_u32(rec_size, want);
+    }
+
+    info.set_u64(RUN_TIME_NS, 0);
+    info.set_u64(RUN_CNT, prog.run_cnt.load(Ordering::Relaxed));
+    info.set_u32(VERIFIED_INSNS, prog.verified_insns);
+
+    if !bpf_capable(env) {
+        for f in [
+            JITED_PROG_LEN,
+            XLATED_PROG_LEN,
+            NR_JITED_KSYMS,
+            NR_JITED_FUNC_LENS,
+            NR_FUNC_INFO,
+            NR_LINE_INFO,
+            NR_JITED_LINE_INFO,
+        ] {
+            info.set_u32(f, 0);
+        }
+        return info_copy_out(env, attr, uattr, info.buf, len);
+    }
+
+    let ulen = info.u32(XLATED_PROG_LEN) as usize;
+    let insns = bpf_insn_prepare_dump(prog);
+    info.set_u32(XLATED_PROG_LEN, insns.len() as u32);
+    if ulen != 0 {
+        let n = ulen.min(insns.len());
+        env.copy_to_user(info.u64(XLATED_PROG_INSNS), &insns[..n]).map_err(|_| Errno::EFAULT)?;
+    }
+    info.set_u32(JITED_PROG_LEN, 0);
+    // One function: the address of the code and its length are 0 without a JIT.
+    if info.u32(NR_JITED_KSYMS) != 0 {
+        env.copy_to_user(info.u64(JITED_KSYMS), &0u64.to_ne_bytes()).map_err(|_| Errno::EFAULT)?;
+    }
+    info.set_u32(NR_JITED_KSYMS, 1);
+    if info.u32(NR_JITED_FUNC_LENS) != 0 {
+        env.copy_to_user(info.u64(JITED_FUNC_LENS), &0u32.to_ne_bytes())
+            .map_err(|_| Errno::EFAULT)?;
+    }
+    info.set_u32(NR_JITED_FUNC_LENS, 1);
+    // rukernel has no BTF, so the programs have no function and line information.
+    info.set_u32(NR_FUNC_INFO, 0);
+    info.set_u32(NR_LINE_INFO, 0);
+    info.set_u32(NR_JITED_LINE_INFO, 0);
+    if info.u32(NR_PROG_TAGS) != 0 {
+        env.copy_to_user(info.u64(PROG_TAGS), &prog.tag).map_err(|_| Errno::EFAULT)?;
+    }
+    info.set_u32(NR_PROG_TAGS, 1);
+    info_copy_out(env, attr, uattr, info.buf, len)
+}
+
+/// The info of a map, `bpf_map_get_info_by_fd` of Linux. Only `hash` and `hash_size` come from
+/// the program.
+fn bpf_map_get_info_by_fd(env: &dyn Env, map: &BpfMap, attr: &BpfAttr, uattr: u64) -> Result<i64> {
+    use map_info::*;
+    let len = (attr.u32(info::INFO_LEN) as usize).min(BPF_MAP_INFO_SIZE);
+    let given = info_copy_in(env, attr, END, BPF_MAP_INFO_SIZE)?;
+    let hash = u64::from_ne_bytes(given[HASH..HASH + 8].try_into().unwrap_or([0; 8]));
+    let hash_size = info_u32(&given, HASH_SIZE);
+    let mut raw = kvzalloc(BPF_MAP_INFO_SIZE)?;
+    let mut info = InfoBuf { buf: &mut raw };
+    info.set_u32(TYPE, map.map_type);
+    info.set_u32(ID, map.id);
+    info.set_u32(KEY_SIZE, map.key_size);
+    info.set_u32(VALUE_SIZE, map.value_size);
+    info.set_u32(MAX_ENTRIES, map.max_entries);
+    info.set_u32(MAP_FLAGS, map.map_flags);
+    info.set_u64(MAP_EXTRA, map.map_extra);
+    info.buf[NAME..NAME + 16].copy_from_slice(&map.name);
+    // rukernel has no `map_get_hash` for its map types.
+    if hash != 0 || hash_size != 0 {
+        return Err(Errno::EINVAL);
+    }
+    info_copy_out(env, attr, uattr, info.buf, len)
+}
+
+/// The info of a link, `bpf_link_get_info_by_fd` of Linux.
+fn bpf_link_get_info_by_fd(
+    env: &dyn Env,
+    link: &BpfLink,
+    attr: &BpfAttr,
+    uattr: u64,
+) -> Result<i64> {
+    let len = (attr.u32(info::INFO_LEN) as usize).min(BPF_LINK_INFO_SIZE);
+    let raw = info_copy_in(env, attr, BPF_LINK_INFO_SIZE, BPF_LINK_INFO_SIZE)?;
+    let mut info = [0u8; BPF_LINK_INFO_SIZE];
+    info.copy_from_slice(&raw);
+    link.fill_info(&mut info)?;
+    info_copy_out(env, attr, uattr, &info, len)
+}
+
+/// `BPF_OBJ_GET_INFO_BY_FD`: `bpf_obj_get_info_by_fd` of Linux. A bad descriptor gives
+/// `EBADFD`, and a file that is not a BPF object gives `EINVAL`.
+fn bpf_obj_get_info_by_fd(env: &dyn Env, attr: &BpfAttr, uattr: u64) -> Result<i64> {
+    if attr.check_attr(last_field::BPF_OBJ_GET_INFO_BY_FD) {
+        return Err(Errno::EINVAL);
+    }
+    let file = env.fdget(attr.u32(info::BPF_FD) as i32).map_err(|_| Errno::EBADFD)?;
+    if let Some(prog) = bpf_prog_of(&file) {
+        return bpf_prog_get_info_by_fd(env, &prog, attr, uattr);
+    }
+    if let Some(map) = bpf_map_of(&file) {
+        return bpf_map_get_info_by_fd(env, &map, attr, uattr);
+    }
+    if let Some(link) = bpf_link_of(&file) {
+        return bpf_link_get_info_by_fd(env, &link, attr, uattr);
+    }
+    Err(Errno::EINVAL)
+}
+
+/// The program of a descriptor, `bpf_prog_get` of Linux.
+fn bpf_prog_get(env: &dyn Env, fd: u32) -> Result<Arc<BpfProg>> {
+    bpf_prog_of(&*env.fdget(fd as i32)?).ok_or(Errno::EINVAL)
+}
+
+/// The link of a descriptor, `bpf_link_get_from_fd` of Linux.
+fn bpf_link_get_from_fd(env: &dyn Env, fd: u32) -> Result<Arc<BpfLink>> {
+    bpf_link_of(&*env.fdget(fd as i32)?).ok_or(Errno::EINVAL)
+}
+
+/// The program type of an attach type, `attach_type_to_prog_type` of Linux. An attach type of
+/// a program type that rukernel does not have gives `BPF_PROG_TYPE_UNSPEC`.
+pub fn attach_type_to_prog_type(attach_type: u32) -> u32 {
+    match attach_type {
+        BPF_CGROUP_INET_INGRESS | BPF_CGROUP_INET_EGRESS => BPF_PROG_TYPE_CGROUP_SKB,
+        BPF_CGROUP_INET_SOCK_CREATE
+        | BPF_CGROUP_INET_SOCK_RELEASE
+        | BPF_CGROUP_INET4_POST_BIND
+        | BPF_CGROUP_INET6_POST_BIND => BPF_PROG_TYPE_CGROUP_SOCK,
+        BPF_CGROUP_INET4_BIND
+        | BPF_CGROUP_INET6_BIND
+        | BPF_CGROUP_INET4_CONNECT
+        | BPF_CGROUP_INET6_CONNECT
+        | BPF_CGROUP_UNIX_CONNECT
+        | BPF_CGROUP_INET4_GETPEERNAME
+        | BPF_CGROUP_INET6_GETPEERNAME
+        | BPF_CGROUP_UNIX_GETPEERNAME
+        | BPF_CGROUP_INET4_GETSOCKNAME
+        | BPF_CGROUP_INET6_GETSOCKNAME
+        | BPF_CGROUP_UNIX_GETSOCKNAME
+        | BPF_CGROUP_UDP4_SENDMSG
+        | BPF_CGROUP_UDP6_SENDMSG
+        | BPF_CGROUP_UNIX_SENDMSG
+        | BPF_CGROUP_UDP4_RECVMSG
+        | BPF_CGROUP_UDP6_RECVMSG
+        | BPF_CGROUP_UNIX_RECVMSG => BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+        BPF_CGROUP_DEVICE => BPF_PROG_TYPE_CGROUP_DEVICE,
+        _ => BPF_PROG_TYPE_UNSPEC,
+    }
+}
+
+/// Checks that `prog` can attach at `attach_type`, `bpf_prog_attach_check_attach_type` of
+/// Linux.
+pub fn bpf_prog_attach_check_attach_type(
+    env: &dyn Env,
+    prog: &BpfProg,
+    attach_type: u32,
+) -> Result<()> {
+    match prog.prog_type {
+        BPF_PROG_TYPE_CGROUP_SOCK | BPF_PROG_TYPE_CGROUP_SOCK_ADDR => {
+            if attach_type == prog.expected_attach_type { Ok(()) } else { Err(Errno::EINVAL) }
+        }
+        BPF_PROG_TYPE_CGROUP_SKB => {
+            // A process without `CAP_BPF` can load a program of this type, so the attach checks
+            // the right.
+            if !env.capable(CAP_NET_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            if attach_type_to_prog_type(attach_type) != prog.prog_type {
                 return Err(Errno::EINVAL);
             }
-            File::with_ops(Arc::new(BpfProgFile { prog }), None, O_RDWR)
+            Ok(())
         }
-        BpfObj::Map(map) => File::with_ops(Arc::new(BpfMapFile { map }), None, f_flags),
+        t => {
+            let ptype = attach_type_to_prog_type(attach_type);
+            if ptype == BPF_PROG_TYPE_UNSPEC || ptype != t { Err(Errno::EINVAL) } else { Ok(()) }
+        }
+    }
+}
+
+/// `BPF_LINK_CREATE`: `link_create` of Linux.
+fn link_create_cmd(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    if attr.check_attr(last_field::BPF_LINK_CREATE) {
+        return Err(Errno::EINVAL);
+    }
+    let attach_type = attr.u32(link_create::ATTACH_TYPE);
+    // rukernel has no `struct_ops` maps.
+    if attach_type == BPF_STRUCT_OPS {
+        return Err(Errno::EINVAL);
+    }
+    let prog = bpf_prog_get(env, attr.u32(link_create::PROG_FD))?;
+    bpf_prog_attach_check_attach_type(env, &prog, attach_type)?;
+    // rukernel has no hook for links yet.
+    Err(Errno::EINVAL)
+}
+
+/// `BPF_LINK_UPDATE`: `link_update` of Linux. With `BPF_F_REPLACE` the link must have the
+/// program of `old_prog_fd`.
+fn link_update_cmd(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    use link_update::*;
+    if attr.check_attr(last_field::BPF_LINK_UPDATE) {
+        return Err(Errno::EINVAL);
+    }
+    let flags = attr.u32(FLAGS);
+    if flags & !BPF_F_REPLACE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let link = bpf_link_get_from_fd(env, attr.u32(LINK_FD))?;
+    let new_prog = bpf_prog_get(env, attr.u32(NEW_PROG_FD))?;
+    let old_prog = if flags & BPF_F_REPLACE != 0 {
+        Some(bpf_prog_get(env, attr.u32(OLD_PROG_FD))?)
+    } else if attr.u32(OLD_PROG_FD) != 0 {
+        return Err(Errno::EINVAL);
+    } else {
+        None
     };
-    env.fd_install(file).map(i64::from)
+    link.ops.update_prog(&link, new_prog, old_prog.as_ref())?;
+    Ok(0)
+}
+
+/// `BPF_LINK_DETACH`: `link_detach` of Linux.
+fn link_detach(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    if attr.check_attr(last_field::BPF_LINK_DETACH) {
+        return Err(Errno::EINVAL);
+    }
+    let link = bpf_link_get_from_fd(env, attr.u32(link_update::LINK_FD))?;
+    link.ops.detach(&link)?;
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -779,6 +1274,14 @@ mod tests {
         fn obj_get(&self, path_fd: i32, pathname: u64, _mask: u32) -> Result<BpfObj> {
             assert_eq!(path_fd, AT_FDCWD);
             bpf_obj_of(&self.bpffs.lookup(&self.cstr(pathname))?)
+        }
+
+        fn boot_ns(&self) -> u64 {
+            1234
+        }
+
+        fn uid(&self) -> u32 {
+            1000
         }
     }
 
@@ -1023,5 +1526,205 @@ mod tests {
         let b = bpf_map_of(&env.fdget(got as i32).unwrap()).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert!(!env.fdget(got as i32).unwrap().flags().writable());
+    }
+
+    fn info_attr(fd: i64, info_len: u32, info: u64) -> BpfAttr {
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(info::BPF_FD, fd as u32);
+        a.set_u32(info::INFO_LEN, info_len);
+        a.set_u64(info::INFO, info);
+        a
+    }
+
+    fn id_attr(id: u32, open_flags: u32) -> BpfAttr {
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(get_id::START_ID, id);
+        a.set_u32(get_id::OPEN_FLAGS, open_flags);
+        a
+    }
+
+    const INFO: u64 = BASE + 0x600;
+
+    fn get_u32(env: &FakeEnv, addr: u64) -> u32 {
+        u32::from_ne_bytes(env.get(addr, 4).try_into().unwrap())
+    }
+
+    #[test]
+    fn a_map_has_an_id_and_an_info() {
+        let env = FakeEnv::new();
+        let fd = env.call(BPF_MAP_CREATE, &create(BPF_MAP_TYPE_ARRAY, 4, 8, 3, 0)).unwrap();
+        env.put(INFO, &[0; BPF_MAP_INFO_SIZE]);
+        let info_len = BPF_MAP_INFO_SIZE as u32 + 8;
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(fd, info_len, INFO)), Ok(0));
+        assert_eq!(get_u32(&env, BASE + info::INFO_LEN as u64), BPF_MAP_INFO_SIZE as u32);
+        let id = get_u32(&env, INFO + map_info::ID as u64);
+        assert_ne!(id, 0);
+        assert_eq!(get_u32(&env, INFO + map_info::TYPE as u64), BPF_MAP_TYPE_ARRAY);
+        assert_eq!(get_u32(&env, INFO + map_info::MAX_ENTRIES as u64), 3);
+        // A short info gets only its bytes.
+        env.put(INFO, &[0xff; 8]);
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(fd, 4, INFO)), Ok(0));
+        assert_eq!(env.get(INFO, 8), [2, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
+        // A hash size without a hash gives EINVAL, and a bad descriptor gives EBADFD.
+        env.put(INFO, &[0; BPF_MAP_INFO_SIZE]);
+        env.put(INFO + map_info::HASH_SIZE as u64, &32u32.to_ne_bytes());
+        let len = BPF_MAP_INFO_SIZE as u32;
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(fd, len, INFO)), Err(Errno::EINVAL));
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(99, 8, INFO)), Err(Errno::EBADFD));
+
+        let got = env.call(BPF_MAP_GET_FD_BY_ID, &id_attr(id, BPF_F_RDONLY)).unwrap();
+        let a = bpf_map_of(&env.fdget(fd as i32).unwrap()).unwrap();
+        let b = bpf_map_of(&env.fdget(got as i32).unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!env.fdget(got as i32).unwrap().flags().writable());
+        assert_eq!(env.call(BPF_MAP_GET_FD_BY_ID, &id_attr(id, 4)), Err(Errno::EINVAL));
+        assert_eq!(env.call(BPF_MAP_GET_NEXT_ID, &id_attr(id - 1, 0)), Ok(0));
+        assert_eq!(get_u32(&env, BASE + get_id::NEXT_ID as u64), id);
+        assert_eq!(env.call(BPF_MAP_GET_NEXT_ID, &id_attr(ID_MAX, 0)), Err(Errno::EINVAL));
+        env.caps.set(false);
+        assert_eq!(env.call(BPF_MAP_GET_FD_BY_ID, &id_attr(id, 0)), Err(Errno::EPERM));
+        assert_eq!(env.call(BPF_MAP_GET_NEXT_ID, &id_attr(0, 0)), Err(Errno::EPERM));
+        env.caps.set(true);
+        drop((a, b));
+        env.files.borrow_mut().clear();
+        assert_eq!(env.call(BPF_MAP_GET_FD_BY_ID, &id_attr(id, 0)), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn a_prog_has_an_id_and_an_info() {
+        let env = FakeEnv::new();
+        let map = env.call(BPF_MAP_CREATE, &create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, 0)).unwrap();
+        let insns = [
+            insn(0x18, 1, 1, 0, map as i32),
+            insn(0, 0, 0, 0, 0),
+            insn(0xb7, 0, 0, 0, 0),
+            insn(0x95, 0, 0, 0, 0),
+        ];
+        let fd = load(&env, &insns, 0).unwrap();
+        let map_id = bpf_map_of(&env.fdget(map as i32).unwrap()).unwrap().id;
+        let xlated = BASE + 0x100;
+        let map_ids = BASE + 0x200;
+        env.put(INFO, &[0; BPF_PROG_INFO_SIZE]);
+        env.put(INFO + prog_info::XLATED_PROG_LEN as u64, &32u32.to_ne_bytes());
+        env.put(INFO + prog_info::XLATED_PROG_INSNS as u64, &xlated.to_ne_bytes());
+        env.put(INFO + prog_info::NR_MAP_IDS as u64, &4u32.to_ne_bytes());
+        env.put(INFO + prog_info::MAP_IDS as u64, &map_ids.to_ne_bytes());
+        let len = BPF_PROG_INFO_SIZE as u32;
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(fd, len, INFO)), Ok(0));
+        let id = get_u32(&env, INFO + prog_info::ID as u64);
+        assert_ne!(id, 0);
+        assert_eq!(get_u32(&env, INFO + prog_info::TYPE as u64), BPF_PROG_TYPE_SOCKET_FILTER);
+        assert_eq!(get_u32(&env, INFO + prog_info::CREATED_BY_UID as u64), 1000);
+        assert_eq!(get_u32(&env, INFO + prog_info::LOAD_TIME as u64), 1234);
+        assert_eq!(get_u32(&env, INFO + prog_info::NR_MAP_IDS as u64), 1);
+        assert_eq!(get_u32(&env, map_ids), map_id);
+        assert_eq!(get_u32(&env, INFO + prog_info::XLATED_PROG_LEN as u64), 32);
+        // The dump has the ID of the map in the load of the map.
+        assert_eq!(get_u32(&env, xlated + 4), map_id);
+        assert_eq!(get_u32(&env, INFO + prog_info::FUNC_INFO_REC_SIZE as u64), 8);
+        assert_eq!(get_u32(&env, INFO + prog_info::NR_JITED_KSYMS as u64), 1);
+        // A bad size of a record gives EINVAL.
+        env.put(INFO + prog_info::LINE_INFO_REC_SIZE as u64, &4u32.to_ne_bytes());
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(fd, len, INFO)), Err(Errno::EINVAL));
+        // A byte after the fields that the kernel knows gives E2BIG.
+        env.put(INFO, &[0; BPF_PROG_INFO_SIZE + 8]);
+        env.put(INFO + BPF_PROG_INFO_SIZE as u64, &[1]);
+        let long = info_attr(fd, len + 8, INFO);
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &long), Err(Errno::E2BIG));
+
+        let got = env.call(BPF_PROG_GET_FD_BY_ID, &id_attr(id, 0)).unwrap();
+        let a = bpf_prog_of(&env.fdget(fd as i32).unwrap()).unwrap();
+        let b = bpf_prog_of(&env.fdget(got as i32).unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(env.call(BPF_PROG_GET_FD_BY_ID, &id_attr(0, 0)), Err(Errno::ENOENT));
+        assert_eq!(env.call(BPF_PROG_GET_NEXT_ID, &id_attr(id - 1, 0)), Ok(0));
+        assert_eq!(get_u32(&env, BASE + get_id::NEXT_ID as u64), id);
+        // A socket filter has no link.
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(link_create::PROG_FD, fd as u32);
+        a.set_u32(link_create::ATTACH_TYPE, BPF_CGROUP_INET_INGRESS);
+        assert_eq!(env.call(BPF_LINK_CREATE, &a), Err(Errno::EINVAL));
+    }
+
+    /// A hook that records the release of its link and can update its program.
+    struct TestOps(Arc<core::sync::atomic::AtomicBool>);
+
+    impl crate::link::BpfLinkOps for TestOps {
+        fn release(&self, _link: &BpfLink) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+
+        fn detach(&self, link: &BpfLink) -> Result<()> {
+            link.release_once();
+            Ok(())
+        }
+
+        fn update_prog(
+            &self,
+            link: &BpfLink,
+            new: Arc<BpfProg>,
+            old: Option<&Arc<BpfProg>>,
+        ) -> Result<()> {
+            if let Some(old) = old
+                && !link.prog().is_some_and(|p| Arc::ptr_eq(&p, old))
+            {
+                return Err(Errno::EPERM);
+            }
+            link.set_prog(Some(new));
+            Ok(())
+        }
+    }
+
+    fn link_attr(link_fd: i64, new_fd: i64, flags: u32, old_fd: i64) -> BpfAttr {
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(link_update::LINK_FD, link_fd as u32);
+        a.set_u32(link_update::NEW_PROG_FD, new_fd as u32);
+        a.set_u32(link_update::FLAGS, flags);
+        a.set_u32(link_update::OLD_PROG_FD, old_fd as u32);
+        a
+    }
+
+    #[test]
+    fn a_link_can_be_updated_pinned_and_detached() {
+        let env = FakeEnv::new();
+        let ret = [insn(0xb7, 0, 0, 0, 0), insn(0x95, 0, 0, 0, 0)];
+        let p1 = load(&env, &ret, 0).unwrap();
+        let p2 = load(&env, &ret, 0).unwrap();
+        let prog1 = bpf_prog_of(&env.fdget(p1 as i32).unwrap()).unwrap();
+        let prog2 = bpf_prog_of(&env.fdget(p2 as i32).unwrap()).unwrap();
+        let released = Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let link =
+            Arc::new(BpfLink::new(1, alloc::boxed::Box::new(TestOps(released.clone())), prog1, 3));
+        let id = crate::link::bpf_link_settle(&link).unwrap();
+        let fd = bpf_link_new_fd(&env, link.clone()).unwrap();
+
+        assert_eq!(env.call(BPF_LINK_UPDATE, &link_attr(fd, p2, 0, p1)), Err(Errno::EINVAL));
+        assert_eq!(env.call(BPF_LINK_UPDATE, &link_attr(fd, p2, 8, 0)), Err(Errno::EINVAL));
+        let replace = link_attr(fd, p2, BPF_F_REPLACE, p2);
+        assert_eq!(env.call(BPF_LINK_UPDATE, &replace), Err(Errno::EPERM));
+        assert_eq!(env.call(BPF_LINK_UPDATE, &link_attr(fd, p2, BPF_F_REPLACE, p1)), Ok(0));
+        assert!(Arc::ptr_eq(&link.prog().unwrap(), &prog2));
+        assert_eq!(env.call(BPF_LINK_UPDATE, &link_attr(p1, p2, 0, 0)), Err(Errno::EINVAL));
+
+        env.put(INFO, &[0; BPF_LINK_INFO_SIZE]);
+        let len = BPF_LINK_INFO_SIZE as u32;
+        assert_eq!(env.call(BPF_OBJ_GET_INFO_BY_FD, &info_attr(fd, len, INFO)), Ok(0));
+        assert_eq!(get_u32(&env, INFO + 4), id);
+        assert_eq!(get_u32(&env, INFO + 8), prog2.id);
+
+        let path = BASE + 1024;
+        env.put(path, b"l\0");
+        assert_eq!(env.call(BPF_OBJ_PIN, &obj(path, fd, 0)), Ok(0));
+        assert_eq!(env.call(BPF_OBJ_GET, &obj(path, 0, BPF_F_RDONLY)), Err(Errno::EINVAL));
+        let got = env.call(BPF_OBJ_GET, &obj(path, 0, 0)).unwrap();
+        assert!(Arc::ptr_eq(&bpf_link_of(&env.fdget(got as i32).unwrap()).unwrap(), &link));
+        let by_id = env.call(BPF_LINK_GET_FD_BY_ID, &id_attr(id, 0)).unwrap();
+        assert!(Arc::ptr_eq(&bpf_link_of(&env.fdget(by_id as i32).unwrap()).unwrap(), &link));
+        assert_eq!(env.call(BPF_LINK_GET_FD_BY_ID, &id_attr(0, 0)), Err(Errno::ENOENT));
+
+        let mut detach = BpfAttr::zeroed();
+        detach.set_u32(link_update::LINK_FD, fd as u32);
+        assert_eq!(env.call(BPF_LINK_DETACH, &detach), Ok(0));
+        assert!(released.load(Ordering::Relaxed) && link.prog().is_none());
     }
 }
