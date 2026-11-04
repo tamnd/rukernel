@@ -8,11 +8,16 @@ use rk_abi::native::keyctl::KEYCTL_MOVE_EXCL;
 struct TestOwner {
     rings: SpinLock<[Option<Arc<Key>>; 3]>,
     reqkey: SpinLock<u8>,
+    auth: SpinLock<Option<Arc<Key>>>,
 }
 
 impl Default for TestOwner {
     fn default() -> Self {
-        Self { rings: SpinLock::new([None, None, None]), reqkey: SpinLock::new(0) }
+        Self {
+            rings: SpinLock::new([None, None, None]),
+            reqkey: SpinLock::new(0),
+            auth: SpinLock::new(None),
+        }
     }
 }
 
@@ -44,6 +49,14 @@ impl Owner for TestOwner {
 
     fn set_reqkey(&self, value: u8) {
         *self.reqkey.lock() = value;
+    }
+
+    fn auth(&self) -> Option<Arc<Key>> {
+        self.auth.lock().clone()
+    }
+
+    fn set_auth(&self, auth: Option<Arc<Key>>) {
+        *self.auth.lock() = auth;
     }
 }
 
@@ -317,4 +330,80 @@ fn dns_resolver_keys() {
         let r = add_key(&cx, b"dns_resolver", Some(b"bad"), bad.to_vec(), PROC);
         assert_eq!(r, Err(Errno::EINVAL), "{bad:?}");
     }
+}
+
+/// A helper of the tests in place of `/sbin/request-key`: it runs as root with the session
+/// keyring of the request, assumes the authority, and acts on the callout.
+fn helper(req: &Request) -> Result<i32, Errno> {
+    let (c, o) = (Cred::root(), TestOwner::default());
+    o.set_ring(Slot::Session, req.session.clone(), true);
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    let id = req.key;
+    assert_eq!(instantiate(&cx, id, b"v".to_vec(), 0), Err(Errno::EPERM));
+    assert_eq!(read(&cx, KEY_SPEC_REQKEY_AUTH_KEY, 16), Err(Errno::ENOKEY));
+    let auth = assume_authority(&cx, id).unwrap();
+    // The payload of the authorization key is the callout.
+    let callout = read(&cx, KEY_SPEC_REQKEY_AUTH_KEY, 64).unwrap().1;
+    assert_eq!(read(&cx, auth, 64).unwrap().1, callout);
+    let args = req.args();
+    assert_eq!(args[0], b"create".to_vec());
+    assert_eq!(args[1], alloc::format!("{id}").into_bytes());
+    assert_eq!(get_keyring_id(&cx, KEY_SPEC_REQUESTOR_KEYRING, false), Ok(req.rings[1]));
+    match callout.as_slice() {
+        b"inst" => {
+            assert_eq!(instantiate(&cx, id + 1, b"v".to_vec(), 0), Err(Errno::EPERM));
+            let bad = instantiate(&cx, id, b"v".to_vec(), KEY_SPEC_REQKEY_AUTH_KEY);
+            assert_eq!(bad, Err(Errno::EINVAL));
+            instantiate(&cx, id, b"v".to_vec(), 0).unwrap();
+            // The authority ends with the construction.
+            assert!(o.auth().is_none());
+            assert_eq!(instantiate(&cx, id, b"w".to_vec(), 0), Err(Errno::EPERM));
+            assert_eq!(assume_authority(&cx, id), Err(Errno::ENOKEY));
+        }
+        b"rej" => {
+            reject(&cx, id, 30, Errno::EKEYREJECTED, KEY_SPEC_REQUESTOR_KEYRING).unwrap();
+        }
+        b"neg" => reject(&cx, id, 30, Errno::ENOKEY, 0).unwrap(),
+        // The helper finds a key of the requestor with the authority of the requestor.
+        b"search" => {
+            let found = request_key(&cx, b"user", b"secret", None, 0).unwrap();
+            instantiate(&cx, id, alloc::format!("{found}").into_bytes(), 0).unwrap();
+        }
+        b"none" => {}
+        _ => return Err(Errno::ENOENT),
+    }
+    Ok(0)
+}
+
+#[test]
+fn construction_by_the_helper() {
+    set_upcall(helper);
+    let (c, o) = (cred(5101), TestOwner::default());
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    let k = request_key(&cx, b"user", b"a", Some(b"inst"), PROC).unwrap();
+    assert_eq!(read(&cx, k, 16).unwrap().1, b"v".to_vec());
+    assert_eq!(read(&cx, PROC, 64).unwrap().1, k.to_ne_bytes().to_vec());
+    assert_eq!(request_key(&cx, b"user", b"a", Some(b"inst"), PROC), Ok(k));
+    // A reject and a negate make negative keys with their errors.
+    assert_eq!(request_key(&cx, b"user", b"r", Some(b"rej"), PROC), Err(Errno::EKEYREJECTED));
+    assert_eq!(search(&cx, PROC, b"user", b"r", 0), Err(Errno::EKEYREJECTED));
+    assert_eq!(request_key(&cx, b"user", b"n", Some(b"neg"), PROC), Err(Errno::ENOKEY));
+    // A helper that does not instantiate the key leaves it negative.
+    assert_eq!(request_key(&cx, b"user", b"x", Some(b"none"), PROC), Err(Errno::ENOKEY));
+    let text = alloc::string::String::from_utf8(keys_text(&cx)).unwrap();
+    assert!(text.lines().any(|l| l.contains(" I--Q-N- ") && l.ends_with(" user      x")));
+    let s = add_key(&cx, b"user", Some(b"secret"), b"s".to_vec(), PROC).unwrap();
+    let k = request_key(&cx, b"user", b"f", Some(b"search"), PROC).unwrap();
+    assert_eq!(read(&cx, k, 16).unwrap().1, alloc::format!("{s}").into_bytes());
+}
+
+#[test]
+fn assume_authority_errors() {
+    let (c, o) = (cred(5102), TestOwner::default());
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    assert_eq!(assume_authority(&cx, -1), Err(Errno::EINVAL));
+    assert_eq!(assume_authority(&cx, 0), Ok(0));
+    assert_eq!(assume_authority(&cx, i32::MAX), Err(Errno::ENOKEY));
+    assert_eq!(reject(&cx, 1, 0, Errno::ENOKEY, 0), Err(Errno::EPERM));
+    assert_eq!(get_keyring_id(&cx, KEY_SPEC_REQUESTOR_KEYRING, false), Err(Errno::ENOKEY));
 }

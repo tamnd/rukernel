@@ -10,9 +10,11 @@
 //! The functions here do not touch user memory or the clock. The system calls copy the strings
 //! and the payload, and give the time in a `Caller`, so the host tests can run them.
 //!
-//! There is no upcall to `/sbin/request-key`: `request_key` makes a negative key and gives
-//! `ENOKEY`. There is no request key authorization key, so `KEYCTL_INSTANTIATE` and its family
-//! give `EPERM`.
+//! `request_key` constructs a key that it does not find, as `security/keys/request_key.c`: it
+//! makes the key without a payload, an authorization key of the type `.request_key_auth`, and
+//! asks the upcall of [`set_upcall`] to run `/sbin/request-key`. The helper assumes the authority
+//! and instantiates, negates or rejects the key. Without an upcall, or if the helper does not
+//! instantiate the key, the key is negative with `ENOKEY`.
 //!
 //! The locks: each key has its own lock, and the code takes one key lock at a time. `LINK_LOCK`
 //! makes link, unlink and move one operation at a time, so the cycle check stays true. The table of
@@ -24,12 +26,16 @@
 //! the data, but no reference to the key. Thus a walk of all the keys, as `/proc/keys` and the
 //! garbage collector, keeps no key alive, and a lookup by serial does not find a dead key.
 
+mod construct;
 mod ctl;
 mod text;
 
 #[cfg(test)]
 mod tests;
 
+pub use construct::{
+    Request, Upcall, assume_authority, check_authority, instantiate, reject, set_upcall,
+};
 pub use ctl::{
     Parent, add_key, capabilities, chown, clear, describe, get_keyring_id, get_security,
     invalidate, join_session, link, move_key, read, request_key, restrict, revoke, search,
@@ -132,6 +138,10 @@ pub enum Kind {
     /// A key with the result of a DNS query, as `net/dns_resolver/dns_key.c`. The type has no
     /// update.
     DnsResolver,
+    /// The authorization to instantiate a key that `request_key` constructs, as
+    /// `security/keys/request_key_auth.c`. The payload is the callout information. A process
+    /// cannot make a key of this type.
+    RequestKeyAuth,
 }
 
 impl Kind {
@@ -142,6 +152,7 @@ impl Kind {
             Kind::Logon => "logon",
             Kind::Keyring => "keyring",
             Kind::DnsResolver => "dns_resolver",
+            Kind::RequestKeyAuth => ".request_key_auth",
         }
     }
 
@@ -185,6 +196,7 @@ impl Kind {
             Kind::Keyring => payload.is_empty(),
             Kind::User | Kind::Logon => (1..=MAX_USER_PAYLOAD).contains(&payload.len()),
             Kind::DnsResolver => return dns_preparse(payload).map(|_| ()),
+            Kind::RequestKeyAuth => false,
         };
         if ok { Ok(()) } else { Err(Errno::EINVAL) }
     }
@@ -296,6 +308,11 @@ struct State {
     restricted: bool,
     /// The bytes of the quota of the owner that the key takes.
     quota_bytes: u32,
+    /// The key is under construction: it has no payload and no error yet, as
+    /// `KEY_IS_UNINSTANTIATED` with `KEY_FLAG_USER_CONSTRUCT` of Linux.
+    pending: bool,
+    /// The request of an authorization key, as `struct request_key_auth`.
+    auth: Option<alloc::boxed::Box<construct::Auth>>,
 }
 
 /// A key or a keyring. A reference to it keeps the key alive. When the last reference goes, the
@@ -599,6 +616,8 @@ fn alloc(
                 links: Vec::new(),
                 restricted: false,
                 quota_bytes: bytes,
+                pending: false,
+                auth: None,
             }),
         }),
     });
@@ -640,6 +659,10 @@ pub trait Owner {
     fn reqkey(&self) -> u8;
     /// Sets the default keyring of `request_key`.
     fn set_reqkey(&self, value: u8);
+    /// The authorization key that the thread assumed, as `cred->request_key_auth` of Linux.
+    fn auth(&self) -> Option<Arc<Key>>;
+    /// Sets the authorization key that the thread assumed, or drops it.
+    fn set_auth(&self, auth: Option<Arc<Key>>);
 }
 
 /// The context of a key operation.
@@ -701,6 +724,7 @@ fn permission(cx: &Caller<'_>, key: &KeyData, possessed: bool, mask: u32) -> Res
 }
 
 /// What a search looks for.
+#[derive(Clone, Copy)]
 struct Search<'a> {
     cx: &'a Caller<'a>,
     /// This one key, for the check of possession.
@@ -811,9 +835,40 @@ impl Search<'_> {
         }
     }
 
-    /// Searches the keyrings of the caller, as `search_cred_keyrings_rcu`. A keyring with no key
-    /// or a negative key gives the error over the other errors.
+    /// Searches the keyrings of the caller, as `search_process_keyrings_rcu`. A thread with an
+    /// authorization key searches the keyrings of the process that asked for the key too, with
+    /// its credentials, but not for an authorization key.
     fn in_process(&self) -> Result<Arc<Key>, Errno> {
+        let err = match self.in_cred_rings() {
+            Ok(k) => return Ok(k),
+            Err(e) => e,
+        };
+        if self.kind == Kind::RequestKeyAuth {
+            return Err(err);
+        }
+        let Some(requestor) =
+            self.cx.owner.auth().and_then(|a| construct::requestor(&a, self.cx.now))
+        else {
+            return Err(err);
+        };
+        let cx = Caller { cred: &requestor.cred, now: self.cx.now, owner: &requestor };
+        let s = Search { cx: &cx, ..*self };
+        let ret = match s.in_cred_rings() {
+            Ok(k) => return Ok(k),
+            Err(e) => e,
+        };
+        Err(if err == Errno::ENOKEY || ret == Errno::ENOKEY {
+            Errno::ENOKEY
+        } else if err == Errno::EACCES {
+            ret
+        } else {
+            err
+        })
+    }
+
+    /// Searches the keyrings of the credentials of the search, as `search_cred_keyrings_rcu`. A
+    /// keyring with no key or a negative key gives the error over the other errors.
+    fn in_cred_rings(&self) -> Result<Arc<Key>, Errno> {
         let owner = self.cx.owner;
         let session = owner.ring(Slot::Session).or_else(|| user_rings_of(self.cx.cred.uid));
         let rings = [owner.ring(Slot::Thread), owner.ring(Slot::Process), session];
@@ -951,7 +1006,17 @@ pub fn lookup(cx: &Caller<'_>, id: i32, flags: u32, need: Need) -> Result<KeyRef
         KEY_SPEC_USER_KEYRING => (user_rings(cx)?.0, true),
         KEY_SPEC_USER_SESSION_KEYRING => (user_rings(cx)?.1, true),
         KEY_SPEC_GROUP_KEYRING => return Err(Errno::EINVAL),
-        KEY_SPEC_REQKEY_AUTH_KEY | KEY_SPEC_REQUESTOR_KEYRING => return Err(Errno::ENOKEY),
+        KEY_SPEC_REQKEY_AUTH_KEY => (cx.owner.auth().ok_or(Errno::ENOKEY)?, true),
+        KEY_SPEC_REQUESTOR_KEYRING => {
+            let auth = cx.owner.auth().ok_or(Errno::ENOKEY)?;
+            let s = auth.state.lock();
+            if s.revoked {
+                return Err(Errno::EKEYREVOKED);
+            }
+            let dest = s.auth.as_ref().and_then(|a| a.dest.clone());
+            drop(s);
+            (dest.ok_or(Errno::ENOKEY)?, true)
+        }
         _ if id < 1 => return Err(Errno::EINVAL),
         _ => {
             let key = find(id).ok_or(Errno::ENOKEY)?;
@@ -961,6 +1026,8 @@ pub fn lookup(cx: &Caller<'_>, id: i32, flags: u32, need: Need) -> Result<KeyRef
     };
     if need != Need::Unlink {
         if flags & LOOKUP_PARTIAL == 0 {
+            // A key under construction is complete after the wait, as `wait_for_key_construction`.
+            construct::wait(&key);
             if need != Need::Defer {
                 if let Some(e) = key.state.lock().negative {
                     return Err(e);

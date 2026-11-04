@@ -3,10 +3,10 @@
 //! The system calls copy the strings and the payloads from user memory, and give them here.
 
 use super::{
-    Caller, Kind, LINK, LINK_LOCK, LOOKUP_CREATE, LOOKUP_PARTIAL, NEGATIVE_TIMEOUT, NO_GID, Need,
-    Quota, READ, SEARCH, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE, abort_link,
-    all_keys, alloc, begin_link, check_cycle, collect, commit_link, insert_link, limits, lookup,
-    permission, process_ring, remove_link, set_payload, thread_ring, uncharge, user_rings,
+    Caller, Kind, LINK, LINK_LOCK, LOOKUP_CREATE, LOOKUP_PARTIAL, NO_GID, Need, Quota, READ,
+    SEARCH, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE, abort_link, all_keys, alloc,
+    begin_link, check_cycle, collect, commit_link, insert_link, limits, lookup, permission,
+    process_ring, remove_link, set_payload, thread_ring, uncharge, user_rings,
 };
 use super::{GRP_ALL, Key, OTH_ALL, POS_ALL, USR_ALL};
 use alloc::sync::Arc;
@@ -103,9 +103,9 @@ fn change_payload(key: &Key, payload: Vec<u8>) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Finds a key, as `request_key`. There is no upcall: if no key matches, and the caller gives
-/// callout information, a negative key goes in the destination keyring and the call gives
-/// `ENOKEY`.
+/// Finds a key, as `request_key`. If no key matches and the caller gives callout information,
+/// the key is constructed in the destination keyring: see [`super::construct`]. The call waits
+/// for a key under construction, and gives the error of a negative key.
 ///
 /// # Errors
 ///
@@ -139,14 +139,14 @@ pub fn request_key(
             if let Some(d) = &dest {
                 insert_link(d, &key)?;
             }
-            return Ok(key.serial);
+            return super::construct::result(&key);
         }
         Err(Errno::EAGAIN) => {}
         Err(e) => return Err(e),
     }
-    if callout.is_none() {
+    let Some(callout) = callout else {
         return Err(Errno::ENOKEY);
-    }
+    };
     if kind == Kind::Keyring {
         return Err(Errno::EPERM);
     }
@@ -158,20 +158,8 @@ pub fn request_key(
             d
         }
     };
-    let expiry = cx.now + NEGATIVE_TIMEOUT;
-    let key = alloc(
-        kind,
-        desc,
-        cx.cred.fsuid,
-        cx.cred.fsgid,
-        kind.default_perm(),
-        Quota::In,
-        Vec::new(),
-        Some((Errno::ENOKEY, expiry)),
-        false,
-    )?;
-    insert_link(&dest, &key)?;
-    Err(Errno::ENOKEY)
+    let key = super::construct::construct(cx, kind, desc, callout, dest)?;
+    super::construct::result(&key)
 }
 
 /// The default keyring of `request_key`, as `construct_get_dest_keyring`.
@@ -291,10 +279,17 @@ pub fn revoke(cx: &Caller<'_>, id: i32) -> Result<(), Errno> {
         Err(Errno::EACCES) => lookup(cx, id, 0, Need::Perm(SETATTR))?,
         r => r?,
     };
+    revoke_key(&r.key);
+    Ok(())
+}
+
+/// Revokes `key`, as `key_revoke`. The payload and the links of a keyring go at once, and an
+/// authorization key drops the credentials of its requestor.
+pub(super) fn revoke_key(key: &Key) {
     let (payload, links) = {
-        let mut s = r.key.state.lock();
+        let mut s = key.state.lock();
         if s.revoked {
-            return Ok(());
+            return;
         }
         s.revoked = true;
         let links = core::mem::take(&mut s.links);
@@ -303,7 +298,9 @@ pub fn revoke(cx: &Caller<'_>, id: i32) -> Result<(), Errno> {
     };
     drop(payload);
     drop(links);
-    Ok(())
+    if key.kind == Kind::RequestKeyAuth {
+        super::construct::revoke_auth(key);
+    }
 }
 
 /// Changes the owner and the group of a key, as `KEYCTL_CHOWN`. `u32::MAX` keeps the value.
