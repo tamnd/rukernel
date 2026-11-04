@@ -7,9 +7,11 @@
 use crate::keys::{self, Key, Slot};
 use crate::limits::{Limit, RLIM_NLIMITS, RLIMIT_CORE, RLIMIT_NOFILE};
 use crate::ns::IpcNs;
+use crate::pid_namespace::{self, PidNamespace};
 use crate::sched::SchedParams;
 use crate::signal::{
-    AltStack, NSIG, Pending, SI_TIMER, SI_USER, SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
+    AltStack, CLD_CONTINUED, CLD_EXITED, NSIG, Pending, SI_KERNEL, SI_TIMER, SI_TKILL, SI_USER,
+    SIG_DFL, SIG_IGN, SigAction, SigInfo, SigSet,
 };
 use crate::timens::TimeNs;
 use crate::timer::Timers;
@@ -256,6 +258,9 @@ pub struct Process {
     /// The exit of the process wakes this queue, for its process file descriptors, as
     /// `pid.wait_pidfd` of Linux.
     exit_poll: Arc<PollQueue>,
+    /// The PID namespace of the process, `task_active_pid_ns` of Linux, or `None` for the first
+    /// namespace. It does not change.
+    pid_ns: Option<Arc<PidNamespace>>,
 }
 
 /// The keyrings of a process.
@@ -362,6 +367,9 @@ pub struct Thread {
     /// for the first one, as `nsproxy->time_ns` and `nsproxy->time_ns_for_children` of Linux.
     time: SpinLock<Option<Arc<TimeNs>>>,
     time_children: SpinLock<Option<Arc<TimeNs>>>,
+    /// The PID namespace of the new children of the thread, or `None` for the first one, as
+    /// `nsproxy->pid_ns_for_children` of Linux.
+    pid_children: SpinLock<Option<Arc<PidNamespace>>>,
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -438,43 +446,115 @@ pub fn tasklist_write() -> WriteGuard<'static, ()> {
     TASKLIST.write()
 }
 
-/// Gives a free ID. An ID is in use while a thread, a process, a process group or a session has
-/// it. Linux also starts again at 300 after a wrap, so that the low IDs stay for the system.
-fn alloc_pid(table: &mut Table) -> Result<Pid, Errno> {
-    let used = |t: &Table, pid: Pid| {
-        t.threads.contains_key(&pid)
-            || t.processes.contains_key(&pid)
-            || t.processes.values().filter_map(Weak::upgrade).any(|p| {
-                let s = p.state.lock();
-                s.pgid == pid || s.sid == pid
-            })
-    };
+/// Tells if the global ID `pid` is in use: a thread, a process, a process group or a session
+/// has it.
+fn pid_used(t: &Table, pid: Pid) -> bool {
+    t.threads.contains_key(&pid)
+        || t.processes.contains_key(&pid)
+        || t.processes.values().filter_map(Weak::upgrade).any(|p| {
+            let s = p.state.lock();
+            s.pgid == pid || s.sid == pid
+        })
+}
+
+/// Gives a free global ID, and an ID in `ns` and in each of its ancestors, as `alloc_pid` in
+/// kernel/pid.c of Linux. Linux also starts again at 300 after a wrap, so that the low IDs stay
+/// for the system.
+///
+/// # Errors
+///
+/// Gives `EAGAIN` if no ID is free, and `ENOMEM` if the init of a namespace ended.
+fn alloc_pid(table: &mut Table, ns: Option<&Arc<PidNamespace>>) -> Result<Pid, Errno> {
+    let mut found = None;
     for _ in 0..PID_MAX {
         let pid = table.next;
         table.next = if pid + 1 >= PID_MAX { 300 } else { pid + 1 };
-        if !used(table, pid) {
-            return Ok(pid);
+        if !pid_used(table, pid) {
+            found = Some(pid);
+            break;
         }
     }
-    Err(Errno::EAGAIN)
+    let pid = found.ok_or(Errno::EAGAIN)?;
+    // The old entries of the ID in the namespaces go first.
+    pid_namespace::forget(pid);
+    let mut done: Vec<&Arc<PidNamespace>> = Vec::new();
+    let mut cur = ns;
+    while let Some(n) = cur {
+        match n.alloc(pid, 0, PID_MAX, |g| pid_used(table, g)) {
+            Ok(_) => done.push(n),
+            Err(e) => {
+                for d in done {
+                    d.free(pid);
+                }
+                return Err(e);
+            }
+        }
+        cur = n.parent();
+    }
+    Ok(pid)
 }
 
-/// The last ID that the kernel gave, `kernel.ns_last_pid`, as `pid_ns_ctl_handler` in
-/// kernel/pid_namespace.c of Linux.
+/// The PID namespace of the caller, or `None` for the first one or a kernel task.
+fn current_pid_ns() -> Option<Arc<PidNamespace>> {
+    current_thread().and_then(|t| t.process.pid_ns.clone())
+}
+
+/// The last ID that the kernel gave in the namespace of the caller, `kernel.ns_last_pid`, as
+/// `pid_ns_ctl_handler` in kernel/pid_namespace.c of Linux.
 pub fn last_pid() -> Pid {
-    TABLE.lock().next - 1
+    match current_pid_ns() {
+        Some(ns) => ns.last_pid(),
+        None => TABLE.lock().next - 1,
+    }
 }
 
-/// Makes `pid + 1` the next ID to try, for a write of `kernel.ns_last_pid`. A checkpoint and
-/// restore tool uses it to make a process with a given ID.
+/// Makes `pid + 1` the next ID to try in the namespace of the caller, for a write of
+/// `kernel.ns_last_pid`. A checkpoint and restore tool uses it to make a process with a given
+/// ID.
 ///
 /// # Errors
 ///
 /// Gives `EINVAL` if `pid` is not in the range 0 to `PID_MAX`, as `proc_dointvec_minmax`.
 pub fn set_last_pid(pid: i64) -> Result<(), Errno> {
     let pid = Pid::try_from(pid).ok().filter(|&p| p <= PID_MAX).ok_or(Errno::EINVAL)?;
-    TABLE.lock().next = if pid + 1 >= PID_MAX { 300 } else { pid + 1 };
+    match current_pid_ns() {
+        Some(ns) => ns.set_last_pid(pid),
+        None => TABLE.lock().next = if pid + 1 >= PID_MAX { 300 } else { pid + 1 },
+    }
     Ok(())
+}
+
+/// The ID of the global ID `pid` in the PID namespace of `viewer`, or 0 if it is not in the
+/// namespace, as `pid_vnr` of Linux.
+pub fn pid_vnr(viewer: &Process, pid: Pid) -> Pid {
+    pid_namespace::pid_nr_ns(pid, viewer.pid_ns.as_ref())
+}
+
+/// The global ID of the ID `nr` of the PID namespace of `viewer`, as `find_vpid` of Linux.
+pub fn find_vpid(viewer: &Process, nr: Pid) -> Option<Pid> {
+    pid_namespace::find_pid_ns(nr, viewer.pid_ns.as_ref())
+}
+
+/// The thread with the ID `nr` in the PID namespace of `viewer`, as `find_task_by_vpid` of
+/// Linux.
+pub fn find_task_by_vpid(viewer: &Process, nr: Pid) -> Option<Arc<Thread>> {
+    find_thread(find_vpid(viewer, nr)?)
+}
+
+/// The process with the ID `nr` in the PID namespace of `viewer`.
+pub fn find_process_by_vpid(viewer: &Process, nr: Pid) -> Option<Arc<Process>> {
+    find_process(find_vpid(viewer, nr)?)
+}
+
+/// Removes `process` from the table after its parent reaped it, as `release_task` of Linux. A
+/// namespace init that waits for the processes of its namespace to go then looks again.
+fn release_process(process: &Process) {
+    TABLE.lock().processes.remove(&process.pid);
+    let mut ns = process.pid_ns.as_ref();
+    while let Some(n) = ns {
+        n.wait().wake_all();
+        ns = n.parent();
+    }
 }
 
 /// Gives the process with the ID `pid`.
@@ -501,6 +581,18 @@ impl Process {
     /// The process ID.
     pub fn pid(&self) -> Pid {
         self.pid
+    }
+
+    /// The PID namespace of the process, or `None` for the first one, as
+    /// `task_active_pid_ns` of Linux.
+    pub fn pid_ns(&self) -> Option<&Arc<PidNamespace>> {
+        self.pid_ns.as_ref()
+    }
+
+    /// Tells if the process is the init of a PID namespace other than the first one. Such a
+    /// process has `SIGNAL_UNKILLABLE` in Linux.
+    pub fn is_child_reaper(&self) -> bool {
+        self.pid_ns.as_ref().is_some_and(|ns| ns.is_child_reaper(self))
     }
 
     /// The ID of the parent, or 0 for init.
@@ -704,6 +796,14 @@ impl Process {
         let threads = self.threads();
         let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
         leader.map_or_else(crate::timens::init_ns, |t| t.time_ns_for_children())
+    }
+
+    /// The PID namespace of the new children of the process, from its leader thread. `None` is
+    /// the first namespace.
+    pub fn pid_ns_for_children(&self) -> Option<Arc<PidNamespace>> {
+        let threads = self.threads();
+        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        leader.and_then(|t| t.pid_ns_for_children())
     }
 
     /// The IPC namespace of the process: the namespace of its leader thread, as for `net_ns`.
@@ -1167,6 +1267,7 @@ impl Process {
         fs: SharedFs,
         actions: Box<[SigAction; NSIG as usize]>,
         exit_signal: u32,
+        pid_ns: Option<Arc<PidNamespace>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             pid,
@@ -1227,6 +1328,7 @@ impl Process {
             cgns: AtomicU32::new(0),
             signal_poll: Arc::new(PollQueue::new()),
             exit_poll: Arc::new(PollQueue::new()),
+            pid_ns,
         })
     }
 }
@@ -1661,6 +1763,17 @@ impl Thread {
         if action.ignores(sig) {
             return None;
         }
+        // The init of a PID namespace takes only `SIGKILL` and `SIGSTOP`, and the signals of an
+        // exception, with the default action, as `get_signal` of Linux with
+        // `SIGNAL_UNKILLABLE`.
+        if (action.is_fatal(sig) || action.is_stop(sig))
+            && sig != SIGKILL
+            && sig != rk_abi::native::signal::SIGSTOP
+            && !info.from_exception()
+            && self.process.is_child_reaper()
+        {
+            return None;
+        }
         if action.is_fatal(sig) {
             return Some(Delivery::Fatal(self.process.fatal_status(sig), info));
         }
@@ -1723,7 +1836,7 @@ impl Thread {
                 own.blocked.remove(sig);
             }
         }
-        self.send_signal(info);
+        deliver_signal(&self.process, Some(self), info, true);
     }
 
     fn new(tid: Pid, process: Arc<Process>, blocked: SigSet) -> Arc<Self> {
@@ -1762,6 +1875,7 @@ impl Thread {
             ipc: SpinLock::new(None),
             time: SpinLock::new(None),
             time_children: SpinLock::new(None),
+            pid_children: SpinLock::new(None),
         })
     }
 
@@ -1790,6 +1904,18 @@ impl Thread {
     /// The UTS namespace of the thread, as `current->nsproxy->uts_ns` of Linux.
     pub fn uts_ns(&self) -> Arc<UtsNs> {
         self.uts.lock().clone().unwrap_or_else(crate::uts::init_ns)
+    }
+
+    /// The PID namespace of the new children of the thread, or `None` for the first one, as
+    /// `nsproxy->pid_ns_for_children` of Linux.
+    pub fn pid_ns_for_children(&self) -> Option<Arc<PidNamespace>> {
+        self.pid_children.lock().clone()
+    }
+
+    /// Sets the PID namespace of the new children of the thread, for `unshare` and `setns`.
+    pub fn set_pid_ns_for_children(&self, ns: Option<Arc<PidNamespace>>) {
+        let old = core::mem::replace(&mut *self.pid_children.lock(), ns);
+        drop(old);
     }
 
     /// Puts the thread in the UTS namespace `ns`, for `CLONE_NEWUTS`, `unshare` and `setns`.
@@ -1909,7 +2035,7 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
     if table.processes.contains_key(&INIT_PID) {
         return Err(Errno::EEXIST);
     }
-    let pid = alloc_pid(&mut table)?;
+    let pid = alloc_pid(&mut table, None)?;
     let files = Arc::new(SpinLock::new(FdTable::new()));
     let process = Process::new(
         pid,
@@ -1923,6 +2049,7 @@ pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
         Box::new([SigAction::default(); NSIG as usize]),
         // As in Linux. A tracer of init waits for it as for a child of `fork`.
         SIGCHLD,
+        None,
     );
     let thread = Thread::new(pid, process.clone(), SigSet::EMPTY);
     process.state.lock().threads.push(thread.clone());
@@ -1951,6 +2078,9 @@ pub struct ForkShare {
     pub parent: bool,
     /// `CLONE_INTO_CGROUP`: the cgroup of the child. `None` gives the cgroup of the caller.
     pub cgroup: Option<u32>,
+    /// `CLONE_NEWPID`: the child is the init of a new PID namespace, a child of the namespace
+    /// for the children of the caller.
+    pub new_pid_ns: bool,
 }
 
 /// Makes a child process of the process of `parent`, for `fork` and `clone` without
@@ -2002,7 +2132,11 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     // lock, the child goes in the list of a live parent.
     let tasks = TASKLIST.write();
     let (owner, exit_signal) = if share.parent {
-        // Linux gives `EINVAL` for init, which has no parent.
+        // Linux gives `EINVAL` for init, which has no parent, and for the init of a PID
+        // namespace, which has `SIGNAL_UNKILLABLE`.
+        if pp.is_child_reaper() {
+            return Err(Errno::EINVAL);
+        }
         (pp.parent().ok_or(Errno::EINVAL)?, pp.exit_signal)
     } else {
         (pp.clone(), share.exit_signal)
@@ -2017,8 +2151,15 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     {
         return Err(Errno::ERESTARTNOINTR);
     }
+    // The child goes in the namespace for the children of the caller, or in a new child of it,
+    // as `copy_pid_ns` of Linux.
+    let pid_ns = if share.new_pid_ns {
+        Some(pid_namespace::create_pid_namespace(parent.pid_ns_for_children().as_ref())?)
+    } else {
+        parent.pid_ns_for_children()
+    };
     let mut table = TABLE.lock();
-    let pid = alloc_pid(&mut table)?;
+    let pid = alloc_pid(&mut table, pid_ns.as_ref())?;
     let child = Process::new(
         pid,
         Arc::downgrade(&owner),
@@ -2030,7 +2171,15 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
         fs,
         actions,
         exit_signal,
+        pid_ns.clone(),
     );
+    // The process with the ID 1 is the init of its namespace, as `alloc_pid` sets
+    // `child_reaper` of Linux.
+    if let Some(ns) = &pid_ns
+        && pid_namespace::pid_nr_ns(pid, Some(ns)) == 1
+    {
+        ns.set_child_reaper(&child);
+    }
     *child.image.lock() = pp.image.lock().clone();
     *child.limits.lock() = *pp.limits.lock();
     *child.cred.lock() = pp.cred();
@@ -2056,6 +2205,7 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     *thread.ipc.lock() = parent.ipc.lock().clone();
     *thread.time.lock() = parent.time.lock().clone();
     *thread.time_children.lock() = parent.time_children.lock().clone();
+    *thread.pid_children.lock() = pid_ns;
     thread.cgroup.store(cgroup, Ordering::Relaxed);
     thread.inherit_seccomp(parent);
     thread.inherit_timer_slack(parent);
@@ -2093,7 +2243,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     let cgroup = thread.cgroup();
     rk_cgroup::charge_thread(cgroup)?;
     let mut table = TABLE.lock();
-    let tid = match alloc_pid(&mut table) {
+    let tid = match alloc_pid(&mut table, process.pid_ns.as_ref()) {
         Ok(tid) => tid,
         Err(e) => {
             drop(table);
@@ -2107,6 +2257,7 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     *new.ipc.lock() = thread.ipc.lock().clone();
     *new.time.lock() = thread.time.lock().clone();
     *new.time_children.lock() = thread.time_children.lock().clone();
+    *new.pid_children.lock() = thread.pid_ns_for_children();
     new.cgroup.store(cgroup, Ordering::Relaxed);
     new.inherit_seccomp(thread);
     new.inherit_timer_slack(thread);
@@ -2190,8 +2341,52 @@ pub fn start_core_dump(thread: &Thread, status: WaitStatus) -> bool {
 /// process with a thread that does not block it, start the exit of the group at once. Each other
 /// signal goes in the queue, and a thread that does not block it wakes up.
 fn deliver(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo) {
+    deliver_signal(process, thread, info, false);
+}
+
+/// `si_code` of a message queue notification, `SI_MESGQ`.
+const SI_MESGQ: i32 = -3;
+
+/// Tells if `info` has the global ID of the sender, or of the child for `SIGCHLD`, which
+/// `deliver_signal` changes to an ID in the namespace of the target.
+fn has_sender_pid(info: &SigInfo) -> bool {
+    info.pid != 0
+        && (matches!(info.code, SI_USER | SI_TKILL | SI_MESGQ)
+            || (info.signo == SIGCHLD && (CLD_EXITED..=CLD_CONTINUED).contains(&info.code)))
+        && !info.from_exception()
+}
+
+/// Does the work of `deliver`. `forced` is set for `force_signal`.
+///
+/// The ID of the sender changes to its ID in the PID namespace of `process`, or 0 if the sender
+/// is not in the namespace, as `__send_signal_locked` of Linux. The init of a namespace takes
+/// only the signals that it has a handler for, and `SIGKILL` and `SIGSTOP` from an ancestor
+/// namespace or from the kernel, as `sig_task_ignored` with `SIGNAL_UNKILLABLE`.
+fn deliver_signal(process: &Process, thread: Option<&Arc<Thread>>, info: SigInfo, forced: bool) {
     let sig = info.signo;
     if sig == 0 || sig > NSIG || process.is_zombie() || process.group_exit().is_some() {
+        return;
+    }
+    let mut info = info;
+    let mut force = info.code == SI_KERNEL || (info.code == SI_USER && info.pid == 0);
+    if let Some(ns) = &process.pid_ns
+        && has_sender_pid(&info)
+    {
+        info.pid = pid_namespace::pid_nr_ns(info.pid, Some(ns));
+        force |= info.pid == 0;
+    }
+    // A blocked signal is not ignored, because the handler can change before the unblock, as
+    // `sig_ignored` of Linux. `get_signal` then drops it if the handler is still the default.
+    if process.is_child_reaper()
+        && !forced
+        && !info.from_exception()
+        && process.action(sig).handler == SIG_DFL
+        && !(force && (sig == SIGKILL || sig == rk_abi::native::signal::SIGSTOP))
+        && !thread
+            .cloned()
+            .or_else(|| process.threads().into_iter().next())
+            .is_some_and(|t| t.blocked().contains(sig) || t.is_traced())
+    {
         return;
     }
     if sig == SIGKILL {
@@ -2475,6 +2670,8 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     drop(time);
     let time = thread.time_children.lock().take();
     drop(time);
+    let pid_ns = thread.pid_children.lock().take();
+    drop(pid_ns);
     if !last {
         process.thread_exit.wake_all();
         return;
@@ -2504,6 +2701,13 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     // children and before init had them, and a `waitpid` of the process group then gave
     // `ECHILD` while those children were alive. Linux sets `exit_state` after
     // `forget_original_parent` too (#417).
+    // The init of a PID namespace ends each other process of the namespace first, as
+    // `find_child_reaper` of Linux.
+    if let Some(ns) = process.pid_ns.clone()
+        && ns.is_child_reaper(&process)
+    {
+        zap_pid_ns_processes(&process, &ns);
+    }
     let tasks = TASKLIST.write();
     let (children, parent, status) = {
         let mut s = process.state.lock();
@@ -2518,7 +2722,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
             deliver(child, None, SigInfo::new(sig, SI_USER, process.pid));
         }
     }
-    let init = find_process(INIT_PID).filter(|init| !Arc::ptr_eq(init, &process));
+    let init = find_new_reaper(&process);
     if let Some(init) = &init {
         let mut zombies = Vec::new();
         for child in &children {
@@ -2534,7 +2738,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
         for (child, status) in &zombies {
             if notify_parent(child, init, *status) {
                 init.state.lock().children.retain(|c| !Arc::ptr_eq(c, child));
-                TABLE.lock().processes.remove(&child.pid);
+                release_process(child);
             }
         }
         if !zombies.is_empty() {
@@ -2555,7 +2759,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     match parent {
         Some(parent) => {
             if autoreap {
-                TABLE.lock().processes.remove(&process.pid);
+                release_process(&process);
             }
             parent.child_wait.wake_all();
         }
@@ -2564,10 +2768,45 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
             *INIT_EXIT.lock() = Some(status);
             INIT_EXIT_WAIT.wake_all();
         }
-        None => {
-            TABLE.lock().processes.remove(&process.pid);
+        None => release_process(&process),
+    }
+}
+
+/// The process that gets the children of `process` when it ends: the init of its PID
+/// namespace, as `find_new_reaper` in kernel/exit.c of Linux. The init of a namespace ends its
+/// children first, so it keeps none.
+fn find_new_reaper(process: &Arc<Process>) -> Option<Arc<Process>> {
+    let reaper = match &process.pid_ns {
+        Some(ns) => ns.child_reaper(),
+        None => find_process(INIT_PID),
+    };
+    reaper.filter(|r| !Arc::ptr_eq(r, process))
+}
+
+/// Ends each other process of the PID namespace `ns` of its init `process`, and waits until
+/// they are gone, as `zap_pid_ns_processes` in kernel/pid_namespace.c of Linux. The init reaps
+/// its children. A process of a namespace below goes when the init of that namespace ends.
+fn zap_pid_ns_processes(process: &Arc<Process>, ns: &Arc<PidNamespace>) {
+    ns.disable_pid_allocation();
+    // The children that end now are reaped at once.
+    process.signals.lock().actions[SIGCHLD as usize - 1].handler = SIG_IGN;
+    let others = || {
+        processes()
+            .into_iter()
+            .filter(|p| !Arc::ptr_eq(p, process) && pid_namespace::pid_nr_ns(p.pid, Some(ns)) != 0)
+            .collect::<Vec<_>>()
+    };
+    {
+        let _tasks = TASKLIST.read();
+        for p in others() {
+            if !p.is_zombie() {
+                kill_group(&p, WaitStatus::signaled(SIGKILL, false));
+            }
         }
     }
+    let options = WaitOptions { exited: true, all: true, ..WaitOptions::default() };
+    while wait_child(process, WaitTarget::Any, options, || false).is_ok() {}
+    ns.wait().wait_until(|| others().is_empty().then_some(()));
 }
 
 /// Waits for a child of `process` that matches `target` to end, stop or continue, as `options`
@@ -2653,7 +2892,7 @@ pub fn wait_child(
                 let rss = child.maxrss.load(Ordering::Relaxed);
                 let rss = rss.max(child.cmaxrss.load(Ordering::Relaxed));
                 process.cmaxrss.fetch_max(rss, Ordering::Relaxed);
-                TABLE.lock().processes.remove(&child.pid);
+                release_process(&child);
             }
             let uid = child.cred().uid;
             return Some(Ok(Some(WaitResult {

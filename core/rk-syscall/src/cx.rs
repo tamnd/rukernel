@@ -50,6 +50,29 @@ impl Cx<'_> {
         self.thread.process()
     }
 
+    /// The ID of the global ID `pid` in the PID namespace of the caller, or 0 if it is not in
+    /// the namespace, as `pid_vnr` of Linux.
+    pub(crate) fn vnr(&self, pid: rk_proc::Pid) -> rk_proc::Pid {
+        rk_proc::pid_vnr(self.process(), pid)
+    }
+
+    /// The global ID of the ID `nr` of the PID namespace of the caller, as `find_vpid` of
+    /// Linux. An ID that no thread, process group or session of the namespace has gives `None`.
+    pub(crate) fn find_vpid(&self, nr: u64) -> Option<rk_proc::Pid> {
+        let nr = rk_proc::Pid::try_from(nr).ok().filter(|&n| n != 0 && (n as i32) > 0)?;
+        rk_proc::find_vpid(self.process(), nr)
+    }
+
+    /// The thread with the ID `nr` in the PID namespace of the caller.
+    pub(crate) fn find_task_by_vpid(&self, nr: u64) -> Option<Arc<rk_proc::Thread>> {
+        rk_proc::find_thread(self.find_vpid(nr)?)
+    }
+
+    /// The process with the ID `nr` in the PID namespace of the caller.
+    pub(crate) fn find_process_by_vpid(&self, nr: u64) -> Option<Arc<Process>> {
+        rk_proc::find_process(self.find_vpid(nr)?)
+    }
+
     /// The address space.
     pub(crate) fn vm(&self) -> Result<Arc<AddressSpace>, Errno> {
         self.process().vm().ok_or(Errno::ESRCH)

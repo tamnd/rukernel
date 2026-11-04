@@ -70,6 +70,7 @@ pub fn ns_id(process: &Process, kind: NsKind) -> Result<u32, Errno> {
         NsKind::Uts => process.uts_ns().id(),
         NsKind::Ipc => process.ipc_ns().id(),
         NsKind::Time => process.time_ns().id(),
+        NsKind::Pid => crate::pid_namespace::ns_id(process.pid_ns()),
         _ => 0,
     })
 }

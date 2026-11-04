@@ -273,6 +273,12 @@ impl SigInfo {
         self.signo == SIGSYS && self.code == SYS_SECCOMP
     }
 
+    /// Tells if an exception or `seccomp` caused the signal. The kernel then forces it, also on
+    /// the init of a PID namespace, as `force_sig_info_to_task` of Linux.
+    pub const fn from_exception(&self) -> bool {
+        self.is_fault() || self.is_seccomp()
+    }
+
     /// Tells if the union of `siginfo_t` holds the status of a child.
     const fn is_child(&self) -> bool {
         self.signo == SIGCHLD && self.code > 0

@@ -368,6 +368,15 @@ fn kill_group(cx: &Cx<'_>, pgid: Pid, info: SigInfo) -> Result<(), Errno> {
     result
 }
 
+/// The process with the ID `nr` in the PID namespace of the caller. Linux finds a process from
+/// any of its thread IDs, as `kill` does.
+fn find_target(cx: &Cx<'_>, nr: u64) -> Result<Arc<Process>, Errno> {
+    let pid = cx.find_vpid(nr).ok_or(Errno::ESRCH)?;
+    rk_proc::find_process(pid)
+        .or_else(|| rk_proc::find_thread(pid).map(|t| t.process().clone()))
+        .ok_or(Errno::ESRCH)
+}
+
 pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
     if sig > u64::from(NSIG) {
         return Err(Errno::EINVAL);
@@ -378,11 +387,13 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
     match pid as i32 {
         0 => kill_group(cx, me.pgid(), info)?,
         -1 => {
-            // A process that the caller cannot signal does not count, as in Linux.
+            // A process that the caller cannot signal does not count, as in Linux. Only the
+            // processes of the PID namespace of the caller get the signal, and not its init, as
+            // `task_pid_vnr(p) > 1` in `kill_something_info`.
             let _tasks = rk_proc::tasklist_read();
             let mut count = 0;
             for p in rk_proc::processes() {
-                if p.pid() != rk_proc::INIT_PID
+                if cx.vnr(p.pid()) > 1
                     && p.pid() != me.pid()
                     && !p.is_zombie()
                     && may_signal(cx, &p, info.signo).is_ok()
@@ -396,14 +407,12 @@ pub(crate) fn kill(cx: &Cx<'_>, pid: u64, sig: u64) -> SysResult {
             }
         }
         p if p > 0 => {
-            let target = rk_proc::find_process(p as Pid)
-                .or_else(|| rk_proc::find_thread(p as Pid).map(|t| t.process().clone()))
-                .ok_or(Errno::ESRCH)?;
+            let target = find_target(cx, p as u64)?;
             may_signal(cx, &target, info.signo)?;
             rk_proc::send_signal(&target, info);
         }
         i32::MIN => return Err(Errno::ESRCH),
-        p => kill_group(cx, p.unsigned_abs(), info)?,
+        p => kill_group(cx, cx.find_vpid(u64::from(p.unsigned_abs())).ok_or(Errno::ESRCH)?, info)?,
     }
     Ok(0)
 }
@@ -437,8 +446,8 @@ fn signal_thread(cx: &Cx<'_>, tgid: Option<u64>, tid: u64, sig: u64) -> SysResul
     if sig > u64::from(NSIG) {
         return Err(Errno::EINVAL);
     }
-    let thread = rk_proc::find_thread(tid as Pid).ok_or(Errno::ESRCH)?;
-    if tgid.is_some_and(|g| thread.process().pid() != g as Pid) {
+    let thread = cx.find_task_by_vpid(tid).ok_or(Errno::ESRCH)?;
+    if tgid.is_some_and(|g| cx.vnr(thread.process().pid()) != g as Pid) {
         return Err(Errno::ESRCH);
     }
     may_signal(cx, thread.process(), sig as u32)?;
@@ -518,20 +527,25 @@ fn queue_info(cx: &Cx<'_>, target: Pid, sig: u64, uinfo: u64) -> Result<SigInfo,
     let mut raw = [0u8; SIGINFO_SIZE];
     raw.copy_from_slice(&b);
     let mut info = SigInfo::from_bytes(&raw);
-    if (info.code >= 0 || info.code == SI_TKILL) && target != cx.process().pid() {
+    if (info.code >= 0 || info.code == SI_TKILL) && target != cx.vnr(cx.process().pid()) {
         return Err(Errno::EPERM);
     }
     info.signo = sig as u32;
+    // The kernel changes the ID of the sender of these codes to the ID in the namespace of the
+    // target, so the ID that the caller gives goes to a global ID first.
+    if info.code >= 0 || info.code == SI_TKILL {
+        info.pid = cx.find_vpid(u64::from(info.pid)).unwrap_or(0);
+    }
     Ok(info)
 }
 
 pub(crate) fn rt_sigqueueinfo(cx: &Cx<'_>, tgid: u64, sig: u64, uinfo: u64) -> SysResult {
     let info = queue_info(cx, tgid as Pid, sig, uinfo)?;
     // Linux finds the process from any of its thread IDs, as `kill` does.
-    let target = rk_proc::find_process(tgid as Pid)
-        .or_else(|| rk_proc::find_thread(tgid as Pid).map(|t| t.process().clone()))
-        .filter(|p| tgid as i32 > 0 && !p.is_zombie())
-        .ok_or(Errno::ESRCH)?;
+    if tgid as i32 <= 0 {
+        return Err(Errno::ESRCH);
+    }
+    let target = find_target(cx, tgid).ok().filter(|p| !p.is_zombie()).ok_or(Errno::ESRCH)?;
     may_signal(cx, &target, sig as u32)?;
     if sig != 0 {
         check_queue(&target, sig as u32, info.code)?;
@@ -551,8 +565,9 @@ pub(crate) fn rt_tgsigqueueinfo(
         return Err(Errno::EINVAL);
     }
     let info = queue_info(cx, tgid as Pid, sig, uinfo)?;
-    let thread = rk_proc::find_thread(tid as Pid)
-        .filter(|t| t.process().pid() == tgid as Pid)
+    let thread = cx
+        .find_task_by_vpid(tid)
+        .filter(|t| cx.vnr(t.process().pid()) == tgid as Pid)
         .ok_or(Errno::ESRCH)?;
     may_signal(cx, thread.process(), sig as u32)?;
     if sig != 0 {

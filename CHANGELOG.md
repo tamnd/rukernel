@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- PID namespaces, as kernel/pid.c and kernel/pid_namespace.c of Linux. `clone`, `clone3` and `unshare` take `CLONE_NEWPID`, and `setns` takes a file of `/proc/PID/ns/pid` or a pidfd with `CLONE_NEWPID`, for the children of the caller. A thread has an ID in its namespace and in each ancestor, to a depth of 32. The system calls take and give the IDs of the namespace of the caller, and a signal gives the ID of the sender in the namespace of the target. The first process of a namespace has the ID 1 and gets the orphans of the namespace. It gets no signal with the default action from its namespace, and its exit kills the other processes of the namespace. `/proc/PID/ns/pid` and `/proc/PID/ns/pid_for_children` name the namespaces, `NS_GET_PARENT` and the `NS_GET_*_PIDNS` ioctls of nsfs work, and the fdinfo of a pidfd gives `NSpid`. The LTP options file now has `CONFIG_PID_NS` (#536).
+
 ## [0.5.4] - 2026-11-04
 
 ### Added

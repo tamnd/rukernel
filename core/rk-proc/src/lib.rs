@@ -33,6 +33,8 @@ pub mod exec;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod ns;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod pid_namespace;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod process;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod timens;
@@ -47,9 +49,10 @@ pub use process::AUDIT_UNSET;
 pub use process::{
     COMM_LEN, Delivery, ForkShare, INIT_PID, PID_MAX, Pid, Process, Restart, SharedFiles, SharedFs,
     SyscallInfo, Thread, VforkDone, create_init, current_thread, exit_group, exit_thread,
-    find_process, find_thread, fork, kill_group, last_pid, new_thread, processes, send_signal,
-    set_last_pid, start_core_dump, stop_group, tasklist_read, tasklist_write, user_ticks,
-    wait_child, wait_for_init,
+    find_process, find_process_by_vpid, find_task_by_vpid, find_thread, find_vpid, fork,
+    kill_group, last_pid, new_thread, pid_vnr, processes, send_signal, set_last_pid,
+    start_core_dump, stop_group, tasklist_read, tasklist_write, user_ticks, wait_child,
+    wait_for_init,
 };
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use process::{ptrace, seccomp};

@@ -19,6 +19,7 @@ use rk_abi::native::wait::{
 use rk_frame::sync::SpinLock;
 use rk_frame::task::yield_now;
 use rk_proc::exec::{ExecArgs, exec};
+use rk_proc::pid_namespace::{self, PidNamespace};
 use rk_proc::ptrace::{
     self, PTRACE_EVENT_CLONE, PTRACE_EVENT_FORK, PTRACE_EVENT_VFORK, PTRACE_EVENT_VFORK_DONE,
 };
@@ -73,7 +74,31 @@ const ARCH_SET_CPUID: u64 = 0x1012;
 
 /// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
 /// have yet. They give `EINVAL`, as Linux without the namespace type gives.
-const CLONE_NEW_ANY: u64 = CLONE_NEWUSER | CLONE_NEWPID;
+const CLONE_NEW_ANY: u64 = CLONE_NEWUSER;
+
+/// Makes a new PID namespace for the children of `thread`, for `CLONE_NEWPID`, as `copy_pid_ns`
+/// of Linux. It needs `CAP_SYS_ADMIN`.
+///
+/// # Errors
+///
+/// Gives `EPERM` without `CAP_SYS_ADMIN`, `EINVAL` if the children of the thread go in another
+/// namespace already after `unshare` or `setns`, and `ENOSPC` if the namespace is too deep.
+fn new_pid_ns(thread: &rk_proc::Thread) -> Result<Arc<PidNamespace>, Errno> {
+    may_new_pid_ns(thread)?;
+    pid_namespace::create_pid_namespace(thread.pid_ns_for_children().as_ref())
+}
+
+/// Checks that `thread` can make a new PID namespace for its children. See `new_pid_ns`.
+fn may_new_pid_ns(thread: &rk_proc::Thread) -> Result<(), Errno> {
+    if !thread.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    let children = thread.pid_ns_for_children();
+    if !pid_namespace::same(children.as_ref(), thread.process().pid_ns()) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
 
 /// Checks that `process` can make a new UTS, IPC or time namespace, as `create_new_namespaces`
 /// of kernel/nsproxy.c of Linux. It needs `CAP_SYS_ADMIN`.
@@ -130,6 +155,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         | CLONE_NEWUTS
         | CLONE_NEWIPC
         | CLONE_NEWTIME
+        | CLONE_NEWPID
         | CLONE_NEW_ANY;
     if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
@@ -153,6 +179,8 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     // `fs.nr_open` changes nothing, as `unshare_fd` in `ksys_unshare` of Linux.
     let files = if flags & CLONE_FILES != 0 { Some(cx.files()?.lock().try_clone()?) } else { None };
     let time = new_time_ns(cx.thread, flags)?;
+    // The caller stays in its PID namespace, and its new children go in the new one.
+    let pid_ns = if flags & CLONE_NEWPID != 0 { Some(new_pid_ns(cx.thread)?) } else { None };
     if flags & CLONE_NEWCGROUP != 0 {
         new_cgroup_ns(process)?;
     }
@@ -169,6 +197,9 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     // The caller stays in its time namespace, and its new children go in the new one.
     if let Some(ns) = time {
         cx.thread.set_time_ns_for_children(ns);
+    }
+    if let Some(ns) = pid_ns {
+        cx.thread.set_pid_ns_for_children(Some(ns));
     }
     // Only the caller gets the new namespace, as `switch_task_namespaces` of Linux.
     if flags & CLONE_NEWNET != 0 {
@@ -342,6 +373,11 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
             rk_vfs::nsfs::NsKind::Time => {
                 join_time_ns(cx, rk_proc::timens::by_id(id).ok_or(Errno::EINVAL)?)?;
             }
+            rk_vfs::nsfs::NsKind::Pid => {
+                let ns = pid_namespace::by_id(id).ok_or(Errno::EINVAL)?;
+                may_join_pid_ns(cx, ns.as_ref())?;
+                cx.thread.set_pid_ns_for_children(ns);
+            }
             kind => crate::ns::install(cx, process, kind, id)?,
         }
         return Ok(0);
@@ -349,7 +385,14 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     let Ok(target) = crate::pidfd::process_of(cx, fd) else {
         return Err(Errno::EINVAL);
     };
-    let all = CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWNET | CLONE_NEWTIME | CLONE_NEW_ANY;
+    let all = CLONE_NEWNS
+        | CLONE_NEWCGROUP
+        | CLONE_NEWNET
+        | CLONE_NEWTIME
+        | CLONE_NEWPID
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEW_ANY;
     if nstype == 0 || nstype & !all != 0 {
         return Err(Errno::EINVAL);
     }
@@ -364,6 +407,9 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     // A join needs `CAP_SYS_ADMIN`, as `validate_nsset` of Linux, and an error changes nothing.
     if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
+    }
+    if nstype & CLONE_NEWPID != 0 {
+        may_join_pid_ns(cx, target.pid_ns())?;
     }
     if nstype & CLONE_NEWCGROUP != 0 {
         join_cgroup_ns(process, target.cgroup_ns())?;
@@ -380,7 +426,26 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     if nstype & CLONE_NEWTIME != 0 {
         join_time_ns(cx, target.time_ns())?;
     }
+    if nstype & CLONE_NEWPID != 0 {
+        cx.thread.set_pid_ns_for_children(target.pid_ns().cloned());
+    }
     Ok(0)
+}
+
+/// Checks that the caller can put its new children in the PID namespace `ns`, as
+/// `pidns_install` of Linux: `ns` is the namespace of the caller or a descendant of it.
+///
+/// # Errors
+///
+/// Gives `EPERM` without `CAP_SYS_ADMIN`, and `EINVAL` for another namespace.
+fn may_join_pid_ns(cx: &Cx<'_>, ns: Option<&Arc<PidNamespace>>) -> Result<(), Errno> {
+    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    if !pid_namespace::is_descendant(ns, cx.process().pid_ns()) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
 }
 
 /// The cgroup of the directory that `fd` opens, for `CLONE_INTO_CGROUP`.
@@ -452,6 +517,20 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     if flags & CLONE_NEW_ANY != 0 {
         return Err(Errno::EINVAL);
     }
+    // A new thread stays in the PID namespace of its process, as `copy_process` of Linux checks.
+    if flags & CLONE_THREAD != 0
+        && (flags & CLONE_NEWPID != 0
+            || !pid_namespace::same(
+                cx.thread.pid_ns_for_children().as_ref(),
+                cx.process().pid_ns(),
+            ))
+    {
+        return Err(Errno::EINVAL);
+    }
+    // `fork` makes the namespace.
+    if flags & CLONE_NEWPID != 0 {
+        may_new_pid_ns(cx.thread)?;
+    }
     // A new IPC namespace cannot share the semaphore undo list, as `copy_process` of Linux.
     if flags & (CLONE_NEWIPC | CLONE_SYSVSEM) == CLONE_NEWIPC | CLONE_SYSVSEM {
         return Err(Errno::EINVAL);
@@ -485,6 +564,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
             exit_signal: args.exit_signal as u32,
             parent: flags & CLONE_PARENT != 0,
             cgroup,
+            new_pid_ns: flags & CLONE_NEWPID != 0,
         };
         rk_proc::fork(cx.thread, share)?
     };
@@ -506,7 +586,10 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
         // A handler goes back to the default action, and an ignored signal stays ignored.
         thread.process().reset_actions();
     }
-    let tid = thread.tid();
+    // The caller gets the ID in its namespace, and the child writes its ID in its own namespace,
+    // as `schedule_tail` of Linux.
+    let tid = cx.vnr(thread.tid());
+    let child_tid = rk_proc::pid_vnr(thread.process(), thread.tid());
     let mut regs = *cx.regs;
     regs.set_syscall_return(0);
     if stack != 0 {
@@ -541,7 +624,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
         if flags & CLONE_CHILD_SETTID != 0
             && let Some(vm) = thread.process().vm()
         {
-            vm.write(args.child_tid as usize, &tid.to_ne_bytes())?;
+            vm.write(args.child_tid as usize, &child_tid.to_ne_bytes())?;
         }
         Ok(())
     };
@@ -701,15 +784,21 @@ pub(crate) fn wait4(cx: &Cx<'_>, pid: u64, status: u64, options: u64, rusage: u6
     let target = match pid {
         -1 => WaitTarget::Any,
         0 => WaitTarget::Pgid(cx.process().pgid()),
-        p if p > 0 => WaitTarget::Pid(p as Pid),
+        p if p > 0 => WaitTarget::Pid(global(cx, p)),
         i32::MIN => return Err(Errno::ESRCH),
-        p => WaitTarget::Pgid(p.unsigned_abs()),
+        p => WaitTarget::Pgid(global(cx, -p)),
     };
     let found = wait_child(cx, target, options | WEXITED)?;
     let Some(r) = found else { return Ok(0) };
     cx.write_opt(status, &r.status.0)?;
     cx.write_opt(rusage, &crate::info::rusage(r.ticks, r.sys_ticks))?;
-    Ok(u64::from(r.pid))
+    Ok(u64::from(cx.vnr(r.pid)))
+}
+
+/// The global ID of the ID `nr` of the PID namespace of the caller, or 0, which no child has,
+/// if the namespace has no such ID, as `find_get_pid` in `kernel_wait4` of Linux.
+fn global(cx: &Cx<'_>, nr: i32) -> Pid {
+    cx.find_vpid(nr as u64).unwrap_or(0)
 }
 
 /// The fields of `siginfo_t` that `waitid` writes: `si_signo`, `si_errno`, `si_code`, `si_pid`,
@@ -736,9 +825,9 @@ pub(crate) fn waitid(
     let mut nonblock = false;
     let target = match idtype as u32 {
         P_ALL => WaitTarget::Any,
-        P_PID if id > 0 => WaitTarget::Pid(id as Pid),
+        P_PID if id > 0 => WaitTarget::Pid(global(cx, id)),
         P_PGID if id == 0 => WaitTarget::Pgid(cx.process().pgid()),
-        P_PGID if id > 0 => WaitTarget::Pgid(id as Pid),
+        P_PGID if id > 0 => WaitTarget::Pgid(global(cx, id)),
         P_PIDFD => {
             let fd = id as u32 as u64;
             let pid = crate::pidfd::process_of(cx, fd)?.pid();
@@ -757,7 +846,7 @@ pub(crate) fn waitid(
     }
     if let Some(r) = result {
         let (code, value) = r.status.child_code();
-        info = SigInfo::new(SIGCHLD, code, r.pid);
+        info = SigInfo::new(SIGCHLD, code, cx.vnr(r.pid));
         info.uid = r.uid;
         info.status = value;
         if r.trapped {
@@ -784,10 +873,11 @@ pub(crate) fn setpgid(cx: &Cx<'_>, pid: u64, pgid: u64) -> SysResult {
     // The checks and the change are one step, as `setpgid` in kernel/sys.c of Linux does with
     // `tasklist_lock`.
     let _tasks = rk_proc::tasklist_write();
-    let target = if pid == 0 || pid as Pid == me.pid() {
+    let target = if pid == 0 || cx.find_vpid(pid as u64) == Some(me.pid()) {
         me.clone()
     } else {
-        me.children().into_iter().find(|c| c.pid() == pid as Pid).ok_or(Errno::ESRCH)?
+        let pid = cx.find_vpid(pid as u64).ok_or(Errno::ESRCH)?;
+        me.children().into_iter().find(|c| c.pid() == pid).ok_or(Errno::ESRCH)?
     };
     if target.sid() != me.sid() {
         return Err(Errno::EPERM);
@@ -799,7 +889,8 @@ pub(crate) fn setpgid(cx: &Cx<'_>, pid: u64, pgid: u64) -> SysResult {
     if target.sid() == target.pid() {
         return Err(Errno::EPERM);
     }
-    let pgid = if pgid == 0 { target.pid() } else { pgid as Pid };
+    let pgid =
+        if pgid == 0 { target.pid() } else { cx.find_vpid(pgid as u64).ok_or(Errno::EPERM)? };
     if pgid != target.pid()
         && !rk_proc::processes().iter().any(|p| p.pgid() == pgid && p.sid() == me.sid())
     {
@@ -813,15 +904,17 @@ fn find(cx: &Cx<'_>, pid: u64) -> Result<alloc::sync::Arc<Process>, Errno> {
     if pid as i32 == 0 {
         return Ok(cx.process().clone());
     }
-    rk_proc::find_process(pid as Pid).ok_or(Errno::ESRCH)
+    cx.find_process_by_vpid(pid).ok_or(Errno::ESRCH)
 }
 
+/// `getpgid`. A group outside the PID namespace of the caller gives 0, as `pid_vnr` of Linux.
 pub(crate) fn getpgid(cx: &Cx<'_>, pid: u64) -> SysResult {
-    Ok(u64::from(find(cx, pid)?.pgid()))
+    Ok(u64::from(cx.vnr(find(cx, pid)?.pgid())))
 }
 
+/// `getsid`. A session outside the PID namespace of the caller gives 0.
 pub(crate) fn getsid(cx: &Cx<'_>, pid: u64) -> SysResult {
-    Ok(u64::from(find(cx, pid)?.sid()))
+    Ok(u64::from(cx.vnr(find(cx, pid)?.sid())))
 }
 
 pub(crate) fn prctl(cx: &mut Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
@@ -1006,8 +1099,9 @@ fn kcmp_order<T: ?Sized>(a: *const T, b: *const T) -> u64 {
 /// `kcmp`: tells if two processes share a kernel object. rukernel has no credentials, so each
 /// process can examine each other process.
 pub(crate) fn kcmp(pid1: u64, pid2: u64, kind: u64, idx1: u64, idx2: u64) -> SysResult {
+    let me = rk_proc::current_thread().ok_or(Errno::ESRCH)?;
     let find = |pid: u64| {
-        rk_proc::find_thread(pid as Pid)
+        rk_proc::find_task_by_vpid(me.process(), pid as Pid)
             .map(|t| t.process().clone())
             .filter(|p| !p.is_zombie())
             .ok_or(Errno::ESRCH)

@@ -88,6 +88,7 @@ impl NsKind {
             Self::Uts => 0xF400_0000,
             Self::Net => 0xF800_0000,
             Self::Time => 0xF500_0000,
+            Self::Pid => 0xF600_0000,
             // The other kinds have only the first namespace.
             _ => 0xF200_0000,
         }

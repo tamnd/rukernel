@@ -2838,8 +2838,6 @@ static void test_memfd(void)
 	errno = 0;
 	check("memfd_create with an unknown flag gives EINVAL",
 	      syscall(SYS_memfd_create, "rk", 0x100) == -1 && errno == EINVAL);
-	errno = 0;
-	check("unshare of the PID name space gives EINVAL", unshare(CLONE_NEWPID) == -1 && errno == EINVAL);
 	check("unshare of the file table", unshare(CLONE_FILES | CLONE_FS) == 0);
 }
 
@@ -3262,6 +3260,140 @@ static void test_modules(void)
 	mount("proc", "/proc", "proc", 0, NULL);
 	errno = 0;
 	check("/proc/modules does not exist", stat("/proc/modules", &st) == -1 && errno == ENOENT);
+	umount("/proc");
+}
+
+/* The inode number of the file `path`, or 0. */
+static ino_t ino_of(const char *path)
+{
+	struct stat st;
+	return stat(path, &st) == 0 ? st.st_ino : 0;
+}
+
+/* The init of a new PID namespace: it has the ID 1, its child has the ID 2, a signal of a child
+ * with the default action does not stop it, and its exit kills the other processes of the
+ * namespace, as kernel/pid_namespace.c of Linux. It writes its status to `out`. */
+static int pid_ns_init(int in, int out)
+{
+	int status = -1;
+	char c = 0;
+	pid_t pid;
+
+	if (getpid() != 1 || getppid() != 0)
+		return 1;
+	pid = fork();
+	if (pid == 0) {
+		/* SIGTERM from a process of the namespace does not stop its init. */
+		kill(1, SIGTERM);
+		_exit(getpid() == 2 && getppid() == 1 ? 0 : 1);
+	}
+	if (pid != 2 || waitpid(pid, &status, 0) != 2 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return 2;
+	errno = 0;
+	if (kill(-1, 0) != -1 || errno != ESRCH)
+		return 3;
+	/* A child that the exit of init kills. */
+	pid = fork();
+	if (pid == 0) {
+		for (;;)
+			pause();
+	}
+	if (pid != 3)
+		return 4;
+	write(out, "r", 1);
+	read(in, &c, 1);
+	return 0;
+}
+
+/* PID namespaces: clone, unshare and setns with CLONE_NEWPID, the IDs in each namespace, the
+ * /proc/PID/ns/pid files and their ioctls, and the end of a namespace (#536). */
+static void test_pid_ns(void)
+{
+	int status = -1;
+	pid_t pid;
+
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	errno = 0;
+	check("clone with CLONE_NEWPID and CLONE_THREAD gives EINVAL",
+	      syscall(SYS_clone, CLONE_NEWPID | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, 0, 0, 0) == -1 &&
+		      errno == EINVAL);
+	pid = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, 0, 0, 0, 0);
+	if (pid == 0)
+		_exit(getpid() == 1 && getppid() == 0 ? 0 : 1);
+	check("clone with CLONE_NEWPID gives the child the ID 1 in its namespace",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	pid = fork();
+	if (pid == 0) {
+		int self = open("/proc/self/ns/pid", O_RDONLY), in[2], out[2], code = 0;
+		char path[64], buf[256], c = 0;
+		ino_t ino = ino_of("/proc/self/ns/pid");
+		pid_t child, me = getpid();
+		if (self < 0 || ino == 0 || unshare(CLONE_NEWPID) != 0 || getpid() != me)
+			_exit(10);
+		errno = 0;
+		if (readlink("/proc/self/ns/pid_for_children", buf, sizeof(buf)) != -1 || errno != ENOENT)
+			_exit(11);
+		errno = 0;
+		if (unshare(CLONE_NEWPID) != -1 || errno != EINVAL)
+			_exit(12);
+		/* setns to the namespace of the caller, and then a new namespace again. */
+		if (setns(self, CLONE_NEWPID) != 0 || ino_of("/proc/self/ns/pid_for_children") != ino)
+			_exit(13);
+		if (unshare(CLONE_NEWPID) != 0 || pipe(in) != 0 || pipe(out) != 0)
+			_exit(14);
+		child = fork();
+		if (child == 0)
+			_exit(pid_ns_init(in[0], out[1]));
+		if (child < 0 || read(out[0], &c, 1) != 1)
+			_exit(15);
+		/* The file of the namespace of the child, and its parent. */
+		snprintf(path, sizeof(path), "/proc/%d/ns/pid", child);
+		int ns = open(path, O_RDONLY);
+		struct stat st;
+		int parent = ns >= 0 ? ioctl(ns, 0xb702) : -1;
+		if (ns < 0 || ino_of(path) == ino || ino_of("/proc/self/ns/pid_for_children") != ino_of(path))
+			code = 16;
+		else if (parent < 0 || fstat(parent, &st) != 0 || st.st_ino != ino)
+			code = 17;
+		else if (ioctl(ns, 0x8004b706, 1) != child || ioctl(ns, 0x8004b708, child) != 1)
+			code = 18;
+		else if (ioctl(ns, 0x8004b706, 3) <= 0 || ioctl(ns, 0x8004b708, me) != -1 || errno != ESRCH)
+			code = 19;
+		/* The ID of the child in each namespace, from the view of the caller. */
+		int fd = syscall(SYS_pidfd_open, child, 0);
+		snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+		int info = open(path, O_RDONLY);
+		ssize_t n = info >= 0 ? read(info, buf, sizeof(buf) - 1) : -1;
+		buf[n > 0 ? n : 0] = 0;
+		snprintf(path, sizeof(path), "Pid:\t%d\nNSpid:\t%d\t1\n", child, child);
+		if (!code && (fd < 0 || !strstr(buf, path)))
+			code = 20;
+		/* This child is in the namespace of the first child, so the parent namespace is not
+		 * the namespace of the caller or a descendant of it. */
+		pid_t other = fork();
+		if (other == 0) {
+			int ok = getpid() == 4 && setns(ns, CLONE_NEWPID) == 0;
+			errno = 0;
+			_exit(ok && setns(parent, CLONE_NEWPID) == -1 && errno == EINVAL ? 0 : 1);
+		}
+		waitpid(other, &status, 0);
+		if (!code && (!WIFEXITED(status) || WEXITSTATUS(status) != 0))
+			code = 21;
+		/* The end of the init ends the namespace: its child goes, and a fork fails. */
+		write(in[1], "x", 1);
+		if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			code = code ? code : 22;
+		errno = 0;
+		if (!code && (fork() != -1 || errno != ENOMEM))
+			code = 23;
+		_exit(code);
+	}
+	waitpid(pid, &status, 0);
+	check("unshare and setns with CLONE_NEWPID, the IDs in a namespace, and the end of its init",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: PID namespace child status %d\n", WEXITSTATUS(status));
 	umount("/proc");
 }
 
@@ -11329,6 +11461,7 @@ static void test_all(void)
 	test_uts_ipc_ns();
 	test_time_ns();
 	test_modules();
+	test_pid_ns();
 	test_mount_api();
 	test_symlink_chain();
 	test_splice();
@@ -11388,6 +11521,8 @@ int main(int argc, char **argv)
 		test_uevent_filter();
 		test_uinput();
 	}
+	if (argc > 1 && strcmp(argv[1], "pidns") == 0)
+		test_pid_ns();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0)
 		test_dns_key();
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)

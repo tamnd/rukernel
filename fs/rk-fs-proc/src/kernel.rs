@@ -303,8 +303,7 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
 /// thread has its own network namespace.
 fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
     use rk_vfs::nsfs::{NsInode, NsKind, link_text};
-    /// The entries: rukernel makes no PID namespace for the children, so `pid_for_children`
-    /// names the namespace of the process. There is no `user` link, as on
+    /// The entries. There is no `user` link, as on
     /// Linux without `CONFIG_USER_NS`: rukernel cannot make a user namespace, and a program such
     /// as getxattr05 of LTP that finds the link expects `unshare(CLONE_NEWUSER)` to work.
     const ENTRIES: [(&[u8], NsKind); 9] = [
@@ -329,6 +328,7 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                 .iter()
                 .map(|&(name, kind)| {
                     let children = name == b"time_for_children";
+                    let pid_children = name == b"pid_for_children";
                     let (p_, p_j) = (w.clone(), w.clone());
                     let (t_, t_j) = (t.clone(), t.clone());
                     let link = jump_link(
@@ -341,6 +341,10 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                                 (NsKind::Uts, Some(t)) => alive(t)?.uts_ns().id(),
                                 (NsKind::Ipc, Some(t)) => alive(t)?.ipc_ns().id(),
                                 (NsKind::Time, _) => time_ns(&p, t_.as_ref(), children)?.id(),
+                                (NsKind::Pid, _) if pid_children => {
+                                    let ns = pid_ns_for_children(&p, t_.as_ref())?;
+                                    rk_proc::pid_namespace::ns_id(ns.as_ref())
+                                }
                                 _ => rk_proc::ns::ns_id(&p, kind)?,
                             };
                             Ok(link_text(kind, id))
@@ -374,6 +378,18 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                                     let ns = time_ns(&p, t_j.as_ref(), children)?;
                                     NsInode::with_hold(kind, ns.id(), ns)
                                 }
+                                // The file keeps the PID namespace, as on Linux.
+                                NsKind::Pid => {
+                                    let ns = if pid_children {
+                                        pid_ns_for_children(&p, t_j.as_ref())?
+                                    } else {
+                                        p.pid_ns().cloned()
+                                    };
+                                    match ns {
+                                        Some(ns) => NsInode::with_hold(kind, ns.id(), ns),
+                                        None => NsInode::new(kind, 0),
+                                    }
+                                }
                                 _ => NsInode::new(kind, rk_proc::ns::ns_id(&p, kind)?),
                             };
                             Ok(rk_vfs::Location::detached(node))
@@ -385,6 +401,29 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
         },
         None,
     )
+}
+
+/// The PID namespace for the children of the thread `t`, or of `p` without a thread, as
+/// `pidns_for_children_get` of Linux. `None` is the first namespace.
+///
+/// # Errors
+///
+/// Gives `ENOENT` for a new namespace whose init did not start yet.
+fn pid_ns_for_children(
+    p: &Process,
+    t: Option<&Weak<Thread>>,
+) -> Result<Option<Arc<rk_proc::pid_namespace::PidNamespace>>> {
+    let ns = match t {
+        Some(t) => alive(t)?.pid_ns_for_children(),
+        None => p.pid_ns_for_children(),
+    };
+    if let Some(n) = &ns
+        && !rk_proc::pid_namespace::same(ns.as_ref(), p.pid_ns())
+        && !n.has_child_reaper()
+    {
+        return Err(Errno::ENOENT);
+    }
+    Ok(ns)
 }
 
 /// The time namespace of the thread `t`, or of `p` without a thread, or the namespace for its

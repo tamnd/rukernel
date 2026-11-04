@@ -6,9 +6,14 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_abi::native::open::O_RDONLY;
 use rk_frame::sync::SpinLock;
 use rk_proc::Process;
+use rk_proc::pid_namespace::{self, PidNamespace};
+use rk_vfs::Location;
 use rk_vfs::cred::cap;
+use rk_vfs::file::File;
+use rk_vfs::inode::InodeRef;
 use rk_vfs::nsfs::{NsInode, NsKind};
 
 /// `NS_GET_USERNS` of include/uapi/linux/nsfs.h.
@@ -31,13 +36,14 @@ const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
 const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
 
 /// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. rukernel has
-/// only the user namespace and the PID namespace of the system, so these have no parent.
+/// only the user namespace of the system, so it has no parent.
 pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         // rukernel has no user namespace files, as Linux without `CONFIG_USER_NS`, where
         // `ns_get_owner` gives `EPERM`.
         NS_GET_USERNS => Err(Errno::EPERM),
-        NS_GET_PARENT if matches!(kind, NsKind::Pid | NsKind::User) => Err(Errno::EPERM),
+        NS_GET_PARENT if kind == NsKind::Pid => pid_parent(cx, id),
+        NS_GET_PARENT if kind == NsKind::User => Err(Errno::EPERM),
         NS_GET_PARENT => Err(Errno::EINVAL),
         NS_GET_NSTYPE => Ok(kind.clone_flag()),
         NS_GET_OWNER_UID if kind != NsKind::User => Err(Errno::EINVAL),
@@ -57,17 +63,74 @@ pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> S
             if kind != NsKind::Pid {
                 return Err(Errno::EINVAL);
             }
-            // Each process is in the PID namespace of the system, so an ID is the same in each
-            // namespace.
-            let id = arg as i32;
-            let thread = rk_proc::find_thread(id as rk_proc::Pid).ok_or(Errno::ESRCH)?;
-            if matches!(cmd, NS_GET_TGID_FROM_PIDNS | NS_GET_TGID_IN_PIDNS) {
-                return Ok(u64::from(thread.process().pid()));
+            // The file keeps the namespace, so the search finds it.
+            let ns = pid_namespace::by_id(id).ok_or(Errno::ESRCH)?;
+            let nr = arg as i32;
+            if nr <= 0 {
+                return Err(Errno::ESRCH);
             }
-            Ok(id as u64)
+            let thread = if matches!(cmd, NS_GET_PID_IN_PIDNS | NS_GET_TGID_IN_PIDNS) {
+                cx.find_task_by_vpid(nr as u64)
+            } else {
+                pid_namespace::find_pid_ns(nr as rk_proc::Pid, ns.as_ref())
+                    .and_then(rk_proc::find_thread)
+            };
+            let thread = thread.ok_or(Errno::ESRCH)?;
+            let ret = match cmd {
+                NS_GET_PID_FROM_PIDNS => cx.vnr(thread.tid()),
+                NS_GET_TGID_FROM_PIDNS => cx.vnr(thread.process().pid()),
+                NS_GET_PID_IN_PIDNS => pid_namespace::pid_nr_ns(thread.tid(), ns.as_ref()),
+                _ => pid_namespace::pid_nr_ns(thread.process().pid(), ns.as_ref()),
+            };
+            if ret == 0 {
+                return Err(Errno::ESRCH);
+            }
+            Ok(u64::from(ret))
         }
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// Opens the file of the parent of the PID namespace `id`, for `NS_GET_PARENT`, as `pidns_get_parent`
+/// of Linux. The caller must see the parent: it is the PID namespace of the caller or a
+/// descendant of it.
+///
+/// # Errors
+///
+/// Gives `EPERM` for the first namespace and for a parent out of the view of the caller.
+fn pid_parent(cx: &Cx<'_>, id: u32) -> SysResult {
+    let ns = pid_namespace::by_id(id).flatten().ok_or(Errno::EPERM)?;
+    let parent = ns.parent().cloned();
+    if !pid_namespace::is_descendant(parent.as_ref(), cx.process().pid_ns()) {
+        return Err(Errno::EPERM);
+    }
+    let file = File::open_inode(Location::detached(pid_inode(parent)), O_RDONLY);
+    Ok(cx.files()?.lock().insert(file, true)? as u64)
+}
+
+/// The inode of the PID namespace `ns`. The inode keeps the namespace.
+pub(crate) fn pid_inode(ns: Option<Arc<PidNamespace>>) -> Arc<NsInode> {
+    match ns {
+        Some(ns) => NsInode::with_hold(NsKind::Pid, ns.id(), ns),
+        None => NsInode::new(NsKind::Pid, 0),
+    }
+}
+
+/// The inode of the PID namespace for the children of `process`, as `pidns_for_children_get`
+/// of Linux.
+///
+/// # Errors
+///
+/// Gives `ENOENT` for a new namespace whose init did not start yet.
+pub(crate) fn pid_for_children_inode(process: &Process) -> Result<InodeRef, Errno> {
+    let ns = process.pid_ns_for_children();
+    if let Some(n) = &ns
+        && !pid_namespace::same(ns.as_ref(), process.pid_ns())
+        && !n.has_child_reaper()
+    {
+        return Err(Errno::ENOENT);
+    }
+    Ok(pid_inode(ns))
 }
 
 /// The inode of the namespace of the kind `kind` of `process`, as the links of `/proc/PID/ns`.
@@ -94,6 +157,7 @@ pub(crate) fn inode_of(process: &Process, kind: NsKind) -> Result<Arc<NsInode>, 
             NsInode::with_hold(kind, ipc.id(), ipc)
         }
         NsKind::Time => time_inode(process.time_ns()),
+        NsKind::Pid => pid_inode(process.pid_ns().cloned()),
         _ => NsInode::new(kind, rk_proc::ns::ns_id(process, kind)?),
     })
 }
