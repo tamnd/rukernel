@@ -172,3 +172,45 @@ fn an_ipc_object_keeps_its_class_and_the_hooks_allow_it() {
         assert!(hook_index(hook).is_some(), "{hook}");
     }
 }
+
+/// A `struct lsm_ctx` with the ID `id`, the entry size `len` and the context `ctx`.
+fn lsm_ctx(id: u64, len: u64, ctx: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in [id, 0, len, ctx.len() as u64] {
+        out.extend_from_slice(&v.to_ne_bytes());
+    }
+    out.extend_from_slice(ctx);
+    out
+}
+
+#[test]
+fn the_self_attributes_and_the_proc_attributes_follow_linux() {
+    let cred = Cred::root();
+    let task = Task { pid: 1, cred: &cred, security: None };
+    assert_eq!(getselfattr(attr::UNDEF, &task, None, 64), Err(Errno::EINVAL));
+    // The capability module has no attributes, so there is no entry.
+    let out = getselfattr(attr::CURRENT, &task, None, 64).unwrap();
+    assert_eq!((out.count, out.total, out.too_big), (0, 0, false));
+    assert_eq!(module_ids(), [id::CAPABILITY]);
+    assert!(attr_modules().is_empty());
+    assert_eq!(getprocattr(&task, 0, "current"), Err(Errno::EINVAL));
+    assert_eq!(setprocattr(0, "current", b"x"), Err(Errno::EINVAL));
+    let ok = lsm_ctx(id::CAPABILITY, 40, b"unconfin");
+    assert_eq!(setselfattr(attr::CURRENT, &ok, 0), Err(Errno::EOPNOTSUPP));
+    assert_eq!(setselfattr(attr::CURRENT, &ok, 1), Err(Errno::EINVAL));
+    assert_eq!(setselfattr(attr::CURRENT, &ok[..31], 0), Err(Errno::EINVAL));
+    assert_eq!(setselfattr(attr::CURRENT, &[0; 4097], 0), Err(Errno::E2BIG));
+    // The entry is larger than the buffer, or smaller than its context.
+    assert_eq!(setselfattr(attr::CURRENT, &lsm_ctx(100, 48, b"unconfin"), 0), Err(Errno::EINVAL));
+    assert_eq!(setselfattr(attr::CURRENT, &lsm_ctx(100, 32, b"unconfin"), 0), Err(Errno::EINVAL));
+    assert_eq!(
+        setselfattr(attr::CURRENT, &lsm_ctx(999, 40, b"unconfin"), 0),
+        Err(Errno::EOPNOTSUPP)
+    );
+    let mut entries = Vec::new();
+    push_ctx(&mut entries, id::APPARMOR, b"unconfined\0");
+    assert_eq!(entries.len(), 48);
+    assert_eq!(entries[..32], lsm_ctx(id::APPARMOR, 48, b"unconfined\0")[..32]);
+    assert_eq!(&entries[32..43], b"unconfined\0");
+    assert_eq!(entries[43..], [0; 5]);
+}

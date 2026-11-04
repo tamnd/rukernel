@@ -2003,6 +2003,117 @@ fn slack_thread(w: &Weak<Process>, t: &Option<Weak<Thread>>) -> Result<Arc<Threa
     main.cloned().ok_or(Errno::ESRCH)
 }
 
+/// The files of `/proc/PID/attr` that all modules share, with their permission bits, as
+/// `attr_dir_stuff` of fs/proc/base.c of Linux.
+const ATTR_FILES: [(&str, u32); 6] = [
+    ("current", 0o666),
+    ("prev", 0o444),
+    ("exec", 0o666),
+    ("fscreate", 0o666),
+    ("keycreate", 0o666),
+    ("sockcreate", 0o666),
+];
+
+/// The files of a module directory in `/proc/PID/attr`, as the `apparmor` directory of Linux.
+const ATTR_MODULE_FILES: [(&str, u32); 3] = [("current", 0o666), ("prev", 0o444), ("exec", 0o666)];
+
+/// The thread of an `attr` file: the thread `t`, or the main thread of the process `w`.
+fn attr_thread(w: &Weak<Process>, t: &Option<Weak<Thread>>) -> Result<Arc<Thread>> {
+    slack_thread(w, t)
+}
+
+/// A file of `/proc/PID/attr`, as `proc_pid_attr_read` and `proc_pid_attr_write` of Linux.
+/// `lsmid` is the module of a module directory, or 0. Only the task itself can write, and a
+/// write must start at the offset 0 and be at most one page.
+fn attr_file(
+    path: &[u8],
+    perm: u32,
+    w: &Weak<Process>,
+    t: &Option<Weak<Thread>>,
+    lsmid: u64,
+    name: &'static str,
+) -> InodeRef {
+    let (p_, t_) = (w.clone(), t.clone());
+    let (p2, t2) = (w.clone(), t.clone());
+    data_file(
+        path,
+        perm,
+        move |offset, buf| {
+            let thread = attr_thread(&p_, &t_)?;
+            let cred = thread.process().cred();
+            let task = rk_vfs::security::Task {
+                pid: thread.tid(),
+                cred: &cred,
+                security: Some(thread.security()),
+            };
+            let text = rk_vfs::security::getprocattr(&task, lsmid, name)?;
+            let start = usize::try_from(offset).unwrap_or(usize::MAX).min(text.len());
+            let n = buf.len().min(text.len() - start);
+            buf[..n].copy_from_slice(&text[start..start + n]);
+            Ok(n)
+        },
+        move |offset, data| {
+            let thread = attr_thread(&p2, &t2)?;
+            let me = rk_proc::current_thread().ok_or(Errno::EACCES)?;
+            if !Arc::ptr_eq(&me, &thread) {
+                return Err(Errno::EACCES);
+            }
+            if offset != 0 {
+                return Err(Errno::EINVAL);
+            }
+            let data = &data[..data.len().min(rk_mm::PAGE_SIZE)];
+            rk_vfs::security::setprocattr(lsmid, name, data)
+        },
+    )
+}
+
+/// The directory `/proc/PID/attr`: the files that all modules share, and a directory for each
+/// active module that has its own files, as `proc_attr_dir_operations` of Linux.
+fn attr_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
+    let path = join(base, b"attr");
+    let path_ = path.clone();
+    dir(
+        &path,
+        base,
+        0o555,
+        move || {
+            let mut out: Vec<(Vec<u8>, InodeRef)> = ATTR_FILES
+                .iter()
+                .map(|&(name, perm)| {
+                    let file = attr_file(&join(&path_, name.as_bytes()), perm, &w, &t, 0, name);
+                    (name.as_bytes().to_vec(), file)
+                })
+                .collect();
+            for (lsmid, module) in rk_vfs::security::attr_modules() {
+                let mpath = join(&path_, module.as_bytes());
+                let mpath_ = mpath.clone();
+                let (w_, t_) = (w.clone(), t.clone());
+                let mdir = dir(
+                    &mpath,
+                    &path_,
+                    0o555,
+                    move || {
+                        Ok(ATTR_MODULE_FILES
+                            .iter()
+                            .map(|&(name, perm)| {
+                                let p = join(&mpath_, name.as_bytes());
+                                (
+                                    name.as_bytes().to_vec(),
+                                    attr_file(&p, perm, &w_, &t_, lsmid, name),
+                                )
+                            })
+                            .collect())
+                    },
+                    None,
+                );
+                out.push((module.as_bytes().to_vec(), mdir));
+            }
+            Ok(out)
+        },
+        None,
+    )
+}
+
 /// The files of a process directory, from the process `w`. `t` is the thread of a directory in
 /// `task`, or `None` for the directory of the process.
 /// Copies the part of `text` at `offset` to `buf`, for a read of a file of text.
@@ -2254,6 +2365,7 @@ fn process_files(
         file(&join(base, b"cgroup"), move || Ok(cgroup_of(&*alive(&p_)?))),
     ));
     out.push((b"ns".to_vec(), ns_dir(base, w.clone(), t.clone())));
+    out.push((b"attr".to_vec(), attr_dir(base, w.clone(), t.clone())));
     let p_ = w.clone();
     let p2 = w.clone();
     out.push((

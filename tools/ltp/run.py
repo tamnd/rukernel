@@ -115,6 +115,8 @@ mount -t tmpfs tmp /tmp
 [ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
 # systemd mounts cgroup2 with nsdelegate, and the cgroup tests of LTP use the mount that they find.
 mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup 2>/dev/null
+# systemd mounts securityfs, and the lsm_* tests read /sys/kernel/security/lsm.
+mount -t securityfs securityfs /sys/kernel/security 2>/dev/null
 # The tests of IPv6 and the sockets send to ::1 and 127.0.0.1, as on a system where lo is up.
 ip link set lo up 2>/dev/null
 # The drivers that are in the kernel, for tst_require_drivers and for modprobe of busybox, which

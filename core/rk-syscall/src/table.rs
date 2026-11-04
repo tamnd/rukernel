@@ -2,8 +2,8 @@
 
 use crate::cx::{Cx, SysResult};
 use crate::{
-    aio, bpf, cred, epoll, eventfd, fanotify, fhandle, fs, futex, info, inotify, keys, memfd, mm,
-    mount, mqueue, msg, net, pidfd, poll, process, ptrace, sched, seccomp, sem, shm, signal,
+    aio, bpf, cred, epoll, eventfd, fanotify, fhandle, fs, futex, info, inotify, keys, lsm, memfd,
+    mm, mount, mqueue, msg, net, pidfd, poll, process, ptrace, sched, seccomp, sem, shm, signal,
     signalfd, splice, statmount, swap, timer, timerfd, xattr,
 };
 use rk_abi::Errno;
@@ -301,6 +301,9 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::PIVOT_ROOT => mount::pivot_root(cx, a[0], a[1]),
         nr::STATMOUNT => statmount::statmount(cx, a[0], a[1], a[2], a[3]),
         nr::LISTMOUNT => statmount::listmount(cx, a[0], a[1], a[2], a[3]),
+        nr::LSM_GET_SELF_ATTR => lsm::lsm_get_self_attr(cx, a[0], a[1], a[2], a[3]),
+        nr::LSM_SET_SELF_ATTR => lsm::lsm_set_self_attr(cx, a[0], a[1], a[2], a[3]),
+        nr::LSM_LIST_MODULES => lsm::lsm_list_modules(cx, a[0], a[1], a[2]),
         nr::FSTATFS => fs::fstatfs(cx, a[0], a[1]),
         nr::PRCTL => process::prctl(cx, a[0], [a[1], a[2], a[3], a[4]]),
         nr::SECCOMP => seccomp::seccomp(cx, a[0], a[1], a[2]),
