@@ -8,6 +8,7 @@
 
 use crate::acl::{self, Acl};
 use crate::inode::{FileType, Inode, Metadata, Result, SetAttr, mode};
+use crate::user_ns::{self, UserNs};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -230,6 +231,8 @@ pub struct Cred {
     pub cap_ambient: u64,
     /// The bits of `PR_SET_SECUREBITS`.
     pub securebits: u32,
+    /// The user namespace, in which the capabilities apply.
+    pub user_ns: Arc<UserNs>,
 }
 
 /// The file that an `execve` runs, for [`Cred::exec`].
@@ -271,12 +274,66 @@ impl Cred {
             cap_bset: cap::ALL,
             cap_ambient: 0,
             securebits: 0,
+            user_ns: user_ns::init().clone(),
         }
     }
 
-    /// The process has the capability in its effective set.
+    /// The process has the capability in the first user namespace, as `capable` of Linux.
     pub fn capable(&self, cap: u32) -> bool {
+        self.ns_capable(user_ns::init(), cap)
+    }
+
+    /// The process has the capability in its own user namespace: the capability is in its
+    /// effective set, as `ns_capable(current_user_ns(), cap)` of Linux.
+    pub fn has_cap(&self, cap: u32) -> bool {
         self.cap_effective & cap::bit(cap) != 0
+    }
+
+    /// The process has the capability in the user namespace `ns`, as `ns_capable` and
+    /// `cap_capable` of Linux. The capabilities apply in the namespace of the process and in the
+    /// namespaces below it. The owner of a namespace has all the capabilities in it, if the
+    /// process is in the parent of the namespace.
+    pub fn ns_capable(&self, ns: &UserNs, cap: u32) -> bool {
+        let mut ns = ns;
+        loop {
+            if *ns == *self.user_ns {
+                return self.has_cap(cap);
+            }
+            if ns.level() <= self.user_ns.level() {
+                return false;
+            }
+            let Some(parent) = ns.parent() else { return false };
+            if **parent == *self.user_ns && ns.owner() == self.euid {
+                return true;
+            }
+            ns = parent;
+        }
+    }
+
+    /// The process has the capability in its user namespace, and the namespace maps the owner
+    /// and the group of the file `meta`, as `capable_wrt_inode_uidgid` of Linux.
+    pub fn capable_wrt_inode(&self, meta: &Metadata, cap: u32) -> bool {
+        self.has_cap(cap) && self.user_ns.has_uid(meta.uid) && self.user_ns.has_gid(meta.gid)
+    }
+
+    /// The kernel user ID of root in the user namespace of the process, or `INVALID_ID` if the
+    /// namespace does not map root.
+    fn root_uid(&self) -> u32 {
+        self.user_ns.make_kuid(0)
+    }
+
+    /// The credentials in the new user namespace `ns`, as `set_cred_user_ns` of Linux: all the
+    /// capabilities, and no securebits.
+    pub fn in_user_ns(&self, ns: Arc<UserNs>) -> Self {
+        let mut c = self.clone();
+        c.securebits = 0;
+        c.cap_inheritable = 0;
+        c.cap_permitted = cap::ALL;
+        c.cap_effective = cap::ALL;
+        c.cap_bset = cap::ALL;
+        c.cap_ambient = 0;
+        c.user_ns = ns;
+        c
     }
 
     /// The group is the file system group or a supplementary group.
@@ -330,18 +387,20 @@ impl Cred {
             return Ok(());
         }
         if meta.is_dir() {
-            if (mask & may::WRITE == 0 && self.capable(cap::DAC_READ_SEARCH))
-                || self.capable(cap::DAC_OVERRIDE)
+            if (mask & may::WRITE == 0 && self.capable_wrt_inode(meta, cap::DAC_READ_SEARCH))
+                || self.capable_wrt_inode(meta, cap::DAC_OVERRIDE)
             {
                 return Ok(());
             }
             return Err(Errno::EACCES);
         }
-        if mask == may::READ && self.capable(cap::DAC_READ_SEARCH) {
+        if mask == may::READ && self.capable_wrt_inode(meta, cap::DAC_READ_SEARCH) {
             return Ok(());
         }
         // A file runs with `CAP_DAC_OVERRIDE` only if it has an execute bit.
-        if (mask & may::EXEC == 0 || meta.mode & 0o111 != 0) && self.capable(cap::DAC_OVERRIDE) {
+        if (mask & may::EXEC == 0 || meta.mode & 0o111 != 0)
+            && self.capable_wrt_inode(meta, cap::DAC_OVERRIDE)
+        {
             return Ok(());
         }
         Err(Errno::EACCES)
@@ -349,7 +408,7 @@ impl Cred {
 
     /// The process owns the file or has `CAP_FOWNER`, as `inode_owner_or_capable` of Linux.
     pub fn owns(&self, meta: &Metadata) -> bool {
-        self.fsuid == meta.uid || self.capable(cap::FOWNER)
+        self.fsuid == meta.uid || self.capable_wrt_inode(meta, cap::FOWNER)
     }
 
     /// Checks that the process can remove or rename the file `child` from the directory `dir`.
@@ -363,7 +422,7 @@ impl Cred {
         if dir.mode & mode::S_ISVTX == 0
             || self.fsuid == child.uid
             || self.fsuid == dir.uid
-            || self.capable(cap::FOWNER)
+            || self.capable_wrt_inode(child, cap::FOWNER)
         {
             return Ok(());
         }
@@ -476,7 +535,7 @@ impl Cred {
             && dir.mode & mode::S_ISGID != 0
             && perm & (mode::S_ISGID | 0o010) == mode::S_ISGID | 0o010
             && !self.in_group(dir.gid)
-            && !self.capable(cap::FSETID)
+            && !self.capable_wrt_inode(dir, cap::FSETID)
         {
             perm & !mode::S_ISGID
         } else {
@@ -495,7 +554,7 @@ impl Cred {
     ///
     /// Gives `EPERM` if the process cannot make the change.
     pub fn setattr_prepare(&self, meta: &Metadata, attr: &mut SetAttr) -> Result<()> {
-        let chown = self.capable(cap::CHOWN);
+        let chown = self.capable_wrt_inode(meta, cap::CHOWN);
         if let Some(uid) = attr.uid
             && !(self.fsuid == meta.uid && uid == meta.uid)
             && !chown
@@ -512,7 +571,9 @@ impl Cred {
             if !self.owns(meta) {
                 return Err(Errno::EPERM);
             }
-            if !self.in_group(attr.gid.unwrap_or(meta.gid)) && !self.capable(cap::FSETID) {
+            if !self.in_group(attr.gid.unwrap_or(meta.gid))
+                && !self.capable_wrt_inode(meta, cap::FSETID)
+            {
                 attr.mode = Some(perm & !mode::S_ISGID);
             }
         }
@@ -532,7 +593,10 @@ impl Cred {
         }
         let perm = meta.mode & 0o7777;
         let mut kill = kill_bits(perm);
-        if perm & mode::S_ISGID != 0 && !self.in_group(meta.gid) && !self.capable(cap::FSETID) {
+        if perm & mode::S_ISGID != 0
+            && !self.in_group(meta.gid)
+            && !self.capable_wrt_inode(meta, cap::FSETID)
+        {
             kill |= mode::S_ISGID;
         }
         if kill != 0 {
@@ -637,7 +701,7 @@ impl Cred {
             || self.euid == target.uid
             || self.uid == target.suid
             || self.uid == target.uid
-            || self.capable(cap::KILL)
+            || self.ns_capable(&target.user_ns, cap::KILL)
     }
 
     /// Tells if the real user and group IDs of the process are all the user and group IDs of
@@ -651,7 +715,7 @@ impl Cred {
     /// `__ptrace_may_access` and `cap_ptrace_access_check` of Linux: it has the same IDs and at
     /// least the permitted capabilities of the target, or it has `CAP_SYS_PTRACE`.
     pub fn may_ptrace(&self, target: &Self) -> bool {
-        self.capable(cap::SYS_PTRACE)
+        self.ns_capable(&target.user_ns, cap::SYS_PTRACE)
             || (self.same_ids(target) && target.cap_permitted & !self.cap_permitted == 0)
     }
 
@@ -662,7 +726,7 @@ impl Cred {
         c.fsuid = c.uid;
         c.fsgid = c.gid;
         if c.securebits & secure::NO_SETUID_FIXUP == 0 {
-            c.cap_effective = if c.uid == 0 { c.cap_permitted } else { 0 };
+            c.cap_effective = if c.uid == c.root_uid() { c.cap_permitted } else { 0 };
         }
         c
     }
@@ -677,7 +741,7 @@ impl Cred {
             return Err(Errno::EINVAL);
         }
         let mut new = self.clone();
-        if self.capable(cap::SETUID) {
+        if self.has_cap(cap::SETUID) {
             new.uid = uid;
             new.suid = uid;
         } else if uid != self.uid && uid != self.suid {
@@ -695,7 +759,7 @@ impl Cred {
     ///
     /// Gives `EPERM` if the caller has no `CAP_SETUID` and an ID is not allowed.
     pub fn setreuid(&self, ruid: u32, euid: u32) -> Result<Self> {
-        let free = self.capable(cap::SETUID);
+        let free = self.has_cap(cap::SETUID);
         let mut new = self.clone();
         if ruid != KEEP {
             if !free && ruid != self.uid && ruid != self.euid {
@@ -731,7 +795,7 @@ impl Cred {
             return Ok(self.clone());
         }
         let old = [self.uid, self.euid, self.suid];
-        if !self.capable(cap::SETUID)
+        if !self.has_cap(cap::SETUID)
             && [ruid, euid, suid].iter().any(|id| *id != KEEP && !old.contains(id))
         {
             return Err(Errno::EPERM);
@@ -751,16 +815,17 @@ impl Cred {
     /// always gives the old file system user ID.
     pub fn setfsuid(&self, uid: u32) -> Option<Self> {
         let allowed = [self.uid, self.euid, self.suid, self.fsuid].contains(&uid)
-            || self.capable(cap::SETUID);
+            || self.has_cap(cap::SETUID);
         if uid == KEEP || !allowed || uid == self.fsuid {
             return None;
         }
         let mut new = self.clone();
         new.fsuid = uid;
         if self.securebits & secure::NO_SETUID_FIXUP == 0 {
-            if self.fsuid == 0 {
+            let root = self.root_uid();
+            if self.fsuid == root {
                 new.cap_effective &= !cap::FS_SET;
-            } else if uid == 0 {
+            } else if uid == root {
                 new.cap_effective |= new.cap_permitted & cap::FS_SET;
             }
         }
@@ -777,7 +842,7 @@ impl Cred {
             return Err(Errno::EINVAL);
         }
         let mut new = self.clone();
-        if self.capable(cap::SETGID) {
+        if self.has_cap(cap::SETGID) {
             new.gid = gid;
             new.sgid = gid;
         } else if gid != self.gid && gid != self.sgid {
@@ -794,7 +859,7 @@ impl Cred {
     ///
     /// Gives `EPERM` if the caller has no `CAP_SETGID` and an ID is not allowed.
     pub fn setregid(&self, rgid: u32, egid: u32) -> Result<Self> {
-        let free = self.capable(cap::SETGID);
+        let free = self.has_cap(cap::SETGID);
         let mut new = self.clone();
         if rgid != KEEP {
             if !free && rgid != self.gid && rgid != self.egid {
@@ -829,7 +894,7 @@ impl Cred {
             return Ok(self.clone());
         }
         let old = [self.gid, self.egid, self.sgid];
-        if !self.capable(cap::SETGID)
+        if !self.has_cap(cap::SETGID)
             && [rgid, egid, sgid].iter().any(|id| *id != KEEP && !old.contains(id))
         {
             return Err(Errno::EPERM);
@@ -847,7 +912,7 @@ impl Cred {
     /// The new credentials after `setfsgid`, or `None` if the call changes nothing.
     pub fn setfsgid(&self, gid: u32) -> Option<Self> {
         let allowed = [self.gid, self.egid, self.sgid, self.fsgid].contains(&gid)
-            || self.capable(cap::SETGID);
+            || self.has_cap(cap::SETGID);
         if gid == KEEP || !allowed || gid == self.fsgid {
             return None;
         }
@@ -860,9 +925,10 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Gives `EPERM` if the caller has no `CAP_SETGID`.
+    /// Gives `EPERM` if the caller has no `CAP_SETGID`, or if its user namespace has no group
+    /// map or denies `setgroups`.
     pub fn setgroups(&self, mut groups: Vec<u32>) -> Result<Self> {
-        if !self.capable(cap::SETGID) {
+        if !self.has_cap(cap::SETGID) || !self.user_ns.may_setgroups() {
             return Err(Errno::EPERM);
         }
         groups.sort_unstable();
@@ -880,7 +946,7 @@ impl Cred {
         let (effective, permitted, inheritable) =
             (effective & cap::ALL, permitted & cap::ALL, inheritable & cap::ALL);
         let subset = |a: u64, b: u64| a & !b == 0;
-        if (!self.capable(cap::SETPCAP)
+        if (!self.has_cap(cap::SETPCAP)
             && !subset(inheritable, self.cap_inheritable | self.cap_permitted))
             || !subset(inheritable, self.cap_inheritable | self.cap_bset)
             || !subset(permitted, self.cap_permitted)
@@ -907,7 +973,7 @@ impl Cred {
         if ((old & secure::ALL_LOCKS) >> 1) & (old ^ bits) != 0
             || old & secure::ALL_LOCKS & !bits != 0
             || bits & !(secure::ALL_LOCKS | secure::ALL_BITS) != 0
-            || !self.capable(cap::SETPCAP)
+            || !self.has_cap(cap::SETPCAP)
         {
             return Err(Errno::EPERM);
         }
@@ -943,7 +1009,7 @@ impl Cred {
     /// Gives `EPERM` without `CAP_SETPCAP`, or `EINVAL` for an unknown capability. Linux does
     /// the checks in this order.
     pub fn drop_bset(&self, c: u64) -> Result<Self> {
-        if !self.capable(cap::SETPCAP) {
+        if !self.has_cap(cap::SETPCAP) {
             return Err(Errno::EPERM);
         }
         let c = valid_cap(c)?;
@@ -982,21 +1048,25 @@ impl Cred {
     /// file without the `security.capability` attribute.
     pub fn exec(&self, file: ExecFile) -> (Self, bool) {
         let mut new = self.clone();
-        if !file.no_setid && file.mode & 0o4000 != 0 {
+        // The bits have no effect if the namespace does not map the owner or the group.
+        let no_setid =
+            file.no_setid || !self.user_ns.has_uid(file.uid) || !self.user_ns.has_gid(file.gid);
+        if !no_setid && file.mode & 0o4000 != 0 {
             new.euid = file.uid;
         }
-        if !file.no_setid && file.mode & 0o2010 == 0o2010 {
+        if !no_setid && file.mode & 0o2010 == 0o2010 {
             new.egid = file.gid;
         }
+        let root = self.root_uid();
         let setid = new.euid != self.uid || new.egid != self.gid;
         if setid {
             new.cap_ambient = 0;
         }
         let mut permitted = 0;
         let mut raise = false;
-        if self.securebits & secure::NOROOT == 0 && (new.euid == 0 || new.uid == 0) {
+        if self.securebits & secure::NOROOT == 0 && (new.euid == root || new.uid == root) {
             permitted = self.cap_bset | self.cap_inheritable;
-            raise = new.euid == 0;
+            raise = new.euid == root;
         }
         new.cap_permitted = permitted | new.cap_ambient;
         new.cap_effective = if raise { new.cap_permitted } else { new.cap_ambient };
@@ -1006,7 +1076,7 @@ impl Cred {
         new.fsgid = new.egid;
         new.securebits &= !secure::KEEP_CAPS;
         let grew = new.cap_permitted & !new.cap_ambient != 0;
-        let secure = setid || (new.uid != 0 && (raise || grew));
+        let secure = setid || (new.uid != root && (raise || grew));
         (new, secure)
     }
 
@@ -1016,8 +1086,9 @@ impl Cred {
         if self.securebits & secure::NO_SETUID_FIXUP != 0 {
             return;
         }
-        let was_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
-        let is_root = self.uid == 0 || self.euid == 0 || self.suid == 0;
+        let root = old.root_uid();
+        let was_root = old.uid == root || old.euid == root || old.suid == root;
+        let is_root = self.uid == root || self.euid == root || self.suid == root;
         if was_root && !is_root {
             if self.securebits & secure::KEEP_CAPS == 0 {
                 self.cap_permitted = 0;
@@ -1025,10 +1096,10 @@ impl Cred {
             }
             self.cap_ambient = 0;
         }
-        if old.euid == 0 && self.euid != 0 {
+        if old.euid == root && self.euid != root {
             self.cap_effective = 0;
         }
-        if old.euid != 0 && self.euid == 0 {
+        if old.euid != root && self.euid == root {
             self.cap_effective = self.cap_permitted;
         }
     }

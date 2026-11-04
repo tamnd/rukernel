@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2220,8 +2221,11 @@ static void test_pidfd_ioctl(void)
 	close(ns);
 	check("PIDFD_GET_UTS_NAMESPACE with an argument gives EINVAL",
 	      ioctl(a, 0xff0au, 1) == -1 && errno == EINVAL);
-	check("PIDFD_GET_USER_NAMESPACE gives EOPNOTSUPP",
-	      ioctl(a, 0xff09u, 0) == -1 && errno == EOPNOTSUPP);
+	struct stat ust, pst;
+	ns = ioctl(a, 0xff09u, 0);
+	check("PIDFD_GET_USER_NAMESPACE opens the user namespace of the process",
+	      ns >= 0 && fstat(ns, &pst) == 0 && stat("/proc/self/ns/user", &ust) == 0 && pst.st_ino == ust.st_ino);
+	close(ns);
 
 	write(fds[1], &c, 1);
 	siginfo_t si;
@@ -12083,10 +12087,12 @@ static void test_cgroup(void)
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		printf("cg_setns: status %#x\n", status);
 	check("setns joins a cgroup namespace", WIFEXITED(status) && WEXITSTATUS(status) == 0);
-	/* No user namespaces, as Linux without CONFIG_USER_NS (getxattr05 of LTP, #475). */
-	check("/proc/self/ns/user does not exist", access("/proc/self/ns/user", F_OK) == -1 && errno == ENOENT);
-	check("unshare of CLONE_NEWUSER gives EINVAL", unshare(CLONE_NEWUSER) == -1 && errno == EINVAL);
-	check("NS_GET_USERNS gives EPERM", ioctl(cg_ns_fd, 0xb701) == -1 && errno == EPERM);
+	/* The first user namespace owns the cgroup namespace. */
+	struct stat ust, ost;
+	int owner = ioctl(cg_ns_fd, 0xb701);
+	check("NS_GET_USERNS gives the first user namespace",
+	      owner >= 0 && fstat(owner, &ost) == 0 && stat("/proc/self/ns/user", &ust) == 0 && ost.st_ino == ust.st_ino);
+	close(owner);
 	close(cg_ns_fd);
 
 	test_cgroup_io();
@@ -12592,6 +12598,194 @@ static void test_all(void)
 	test_cgroup();
 }
 
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER 0x10000000
+#endif
+#define USERNS_GET_PARENT 0xb702
+#define USERNS_GET_OWNER_UID 0xb704
+
+/* Writes `text` to the file `path` in one write, without O_CREAT and O_TRUNC. Gives 0 or the
+ * errno of the open or of the write. */
+static int userns_write(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY);
+	int err = 0;
+
+	if (fd < 0)
+		return errno;
+	if (write(fd, text, strlen(text)) != (ssize_t)strlen(text))
+		err = errno;
+	close(fd);
+	return err;
+}
+
+/* The inode number of the file `path`, or 0. */
+static ino_t userns_ino(const char *path)
+{
+	struct stat st;
+	return stat(path, &st) == 0 ? st.st_ino : 0;
+}
+
+/* The child of test_user_ns: an unprivileged user that makes a user namespace and maps itself
+ * to root in it. It tells the parent on `ready` and waits on `done`. */
+static void userns_child(int ready, int done)
+{
+	char buf[128];
+	int code = 1;
+
+	mkdir("/tmp", 01777);
+	if (setgroups(0, NULL) != 0 || setresgid(100, 100, 100) != 0 || setresuid(1000, 1000, 1000) != 0)
+		_exit(code);
+	code++;
+	if (unshare(CLONE_NEWUSER) != 0 || getuid() != 65534 || getgid() != 65534)
+		_exit(code);
+	code++;
+	/* The group map of an unprivileged owner needs "deny" in setgroups first. */
+	if (userns_write("/proc/self/gid_map", "0 100 1") != EPERM)
+		_exit(code);
+	code++;
+	if (userns_write("/proc/self/uid_map", "0 1001 1") != EPERM)
+		_exit(code);
+	code++;
+	if (userns_write("/proc/self/uid_map", "0 1000 1\n") != 0 || userns_write("/proc/self/setgroups", "deny") != 0 ||
+	    userns_write("/proc/self/gid_map", "0 100 1") != 0)
+		_exit(code);
+	code++;
+	if (getuid() != 0 || geteuid() != 0 || getgid() != 0)
+		_exit(code);
+	code++;
+	/* A map is written one time. */
+	if (userns_write("/proc/self/uid_map", "0 1000 1") != EPERM)
+		_exit(code);
+	code++;
+	if (read_file("/proc/self/uid_map", buf, sizeof(buf)) <= 0 || strcmp(buf, "         0       1000          1\n") != 0)
+		_exit(code);
+	code++;
+	if (read_file("/proc/self/setgroups", buf, sizeof(buf)) <= 0 || strcmp(buf, "deny\n") != 0)
+		_exit(code);
+	code++;
+	/* setgroups is denied, and an ID out of the map is not valid. */
+	errno = 0;
+	if (setgroups(0, NULL) != -1 || errno != EPERM)
+		_exit(code);
+	code++;
+	errno = 0;
+	if (setuid(5) != -1 || errno != EINVAL)
+		_exit(code);
+	code++;
+	/* Root of the namespace has the capabilities only in it: not for the host name of the
+	 * first UTS namespace, and not for a file of an owner out of the map. */
+	errno = 0;
+	if (sethostname("x", 1) != -1 || errno != EPERM)
+		_exit(code);
+	code++;
+	errno = 0;
+	if (open("/tmp/userns.secret", O_RDONLY) != -1 || errno != EACCES)
+		_exit(code);
+	code++;
+	/* The parent of the namespace is out of the view of the child. */
+	int fd = open("/proc/self/ns/user", O_RDONLY);
+	errno = 0;
+	if (fd < 0 || ioctl(fd, USERNS_GET_PARENT) != -1 || errno != EPERM)
+		_exit(code);
+	close(fd);
+	code++;
+	if (write(ready, "r", 1) != 1 || read(done, buf, 1) != 1)
+		_exit(code);
+	_exit(0);
+}
+
+/* User namespaces, as kernel/user_namespace.c of Linux (#536): unshare(CLONE_NEWUSER), the ID
+ * maps of /proc/PID, the capabilities in a namespace, the ioctls of nsfs, setns and the limits. */
+static void test_user_ns(void)
+{
+	char a[64], b[64];
+	int ready[2], done[2], status = -1, ok;
+	pid_t pid, sub;
+
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	mkdir("/tmp", 01777);
+	close(open("/tmp/userns.secret", O_WRONLY | O_CREAT | O_TRUNC, 0600));
+	memset(a, 0, sizeof(a));
+	check("/proc/self/ns/user is the first user namespace",
+	      readlink("/proc/self/ns/user", a, sizeof(a) - 1) > 0 && strcmp(a, "user:[4026531837]") == 0);
+	check("clone with CLONE_NEWUSER and CLONE_FS gives EINVAL",
+	      syscall(SYS_clone, CLONE_NEWUSER | CLONE_FS | SIGCHLD, 0, 0, 0, 0) == -1 && errno == EINVAL);
+	if (pipe(ready) != 0 || pipe(done) != 0)
+		return;
+	pid = fork();
+	if (pid == 0)
+		userns_child(ready[1], done[0]);
+	ok = read(ready[0], a, 1) == 1;
+	check("an unprivileged user makes a user namespace and maps itself to root in it", ok);
+	if (ok) {
+		char path[64];
+		int fd, pfd;
+		uid_t owner = 0;
+
+		snprintf(path, sizeof(path), "/proc/%d/ns/user", pid);
+		memset(b, 0, sizeof(b));
+		check("the user namespace of the child has its own inode",
+		      readlink(path, b, sizeof(b) - 1) > 0 && strcmp(a, b) != 0 && strncmp(b, "user:[", 6) == 0);
+		fd = open(path, O_RDONLY);
+		check("NS_GET_OWNER_UID gives the user that made the namespace",
+		      fd >= 0 && ioctl(fd, USERNS_GET_OWNER_UID, &owner) == 0 && owner == 1000);
+		pfd = ioctl(fd, USERNS_GET_PARENT);
+		struct stat st;
+		check("NS_GET_PARENT gives the first user namespace",
+		      pfd >= 0 && fstat(pfd, &st) == 0 && st.st_ino == userns_ino("/proc/self/ns/user"));
+		close(pfd);
+		snprintf(path, sizeof(path), "/proc/%d/uid_map", pid);
+		check("uid_map shows the IDs of the namespace of the reader",
+		      read_file(path, b, sizeof(b)) > 0 && strcmp(b, "         0       1000          1\n") == 0);
+		/* Root of the parent namespace can join it, and has no ID in it. */
+		sub = fork();
+		if (sub == 0)
+			_exit(setns(fd, CLONE_NEWUSER) != 0 ? 1 : getuid() != 65534 ? 2 : setns(fd, CLONE_NEWUSER) != -1 ? 3 : 0);
+		waitpid(sub, &status, 0);
+		check("setns joins the user namespace", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		close(fd);
+	}
+	if (write(done[1], "d", 1) != 1)
+		kill(pid, SIGKILL);
+	waitpid(pid, &status, 0);
+	check("the checks in the user namespace pass", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: the child of the user namespace exited with %d\n", WEXITSTATUS(status));
+	close(ready[0]);
+	close(ready[1]);
+	close(done[0]);
+	close(done[1]);
+	/* user.max_user_namespaces limits the namespaces of each user. */
+	char max[32] = "";
+	ok = read_file("/proc/sys/user/max_user_namespaces", max, sizeof(max)) > 0 && atoi(max) > 0;
+	ok = ok && userns_write("/proc/sys/user/max_user_namespaces", "0") == 0;
+	pid = fork();
+	if (pid == 0)
+		_exit(unshare(CLONE_NEWUSER) == -1 && errno == ENOSPC ? 0 : 1);
+	waitpid(pid, &status, 0);
+	ok = ok && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	ok = ok && userns_write("/proc/sys/user/max_user_namespaces", max) == 0;
+	check("user.max_user_namespaces 0 gives ENOSPC", ok);
+	/* A namespace of the level 33 can have no child, as create_user_ns of Linux. */
+	pid = fork();
+	if (pid == 0) {
+		int level;
+		for (level = 1; level <= 33; level++) {
+			if (unshare(CLONE_NEWUSER) != 0 || userns_write("/proc/self/uid_map", "0 0 1") != 0 ||
+			    userns_write("/proc/self/setgroups", "deny") != 0 || userns_write("/proc/self/gid_map", "0 0 1") != 0)
+				_exit(level);
+		}
+		_exit(unshare(CLONE_NEWUSER) == -1 && errno == ENOSPC ? 0 : 100);
+	}
+	waitpid(pid, &status, 0);
+	check("user namespaces nest to the level 33", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: the nest of user namespaces exited with %d\n", WEXITSTATUS(status));
+	unlink("/tmp/userns.secret");
+}
+
 int main(int argc, char **argv)
 {
 	const char *name = strrchr(argv[0], '/');
@@ -12621,6 +12815,8 @@ int main(int argc, char **argv)
 		test_pid_ns();
 	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
 		test_bpf();
+	if (argc > 1 && strcmp(argv[1], "userns") == 0)
+		test_user_ns();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0) {
 		test_dns_key();
 		test_request_key();

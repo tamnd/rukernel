@@ -1254,11 +1254,20 @@ impl Process {
     /// the permitted capabilities grow, as `commit_creds` in kernel/cred.c of Linux.
     fn cred_dump_rule(&self, old: &Cred, new: &Cred) {
         let ids = |c: &Cred| [c.euid, c.egid, c.fsuid, c.fsgid];
+        // In another user namespace, the new capabilities are a subset of the old ones only in
+        // a child namespace of the owner, as `cred_cap_issubset` of Linux.
+        let new_caps = if new.user_ns == old.user_ns {
+            new.cap_permitted
+        } else if new.user_ns.parent() == Some(&old.user_ns) && new.user_ns.owner() == new.euid {
+            old.cap_permitted
+        } else {
+            u64::MAX
+        };
         if crate::coredump::cred_change_drops_dumpable(
             ids(old),
             ids(new),
             old.cap_permitted,
-            new.cap_permitted,
+            new_caps,
         ) {
             self.set_dumpable(crate::coredump::suid_dumpable());
         }

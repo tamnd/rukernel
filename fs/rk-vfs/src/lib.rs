@@ -38,6 +38,7 @@ pub mod pipe;
 pub mod swap;
 pub mod uevent;
 pub mod uinput;
+pub mod user_ns;
 pub mod wait;
 pub mod xattr;
 

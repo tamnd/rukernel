@@ -28,6 +28,7 @@ use rk_proc::timens::TimeNs;
 use rk_proc::{
     ForkShare, Pid, Process, VforkDone, WaitOptions, WaitResult, WaitStatus, WaitTarget,
 };
+use rk_vfs::cred::Cred;
 use zerocopy::FromZeros;
 
 /// The number of signals. Linux names it `_NSIG`.
@@ -72,25 +73,35 @@ const ARCH_GET_CPUID: u64 = 0x1011;
 #[cfg(target_arch = "x86_64")]
 const ARCH_SET_CPUID: u64 = 0x1012;
 
-/// The flags of `unshare` and `clone` that make a new namespace of a type that rukernel does not
-/// have yet. They give `EINVAL`, as Linux without the namespace type gives.
-const CLONE_NEW_ANY: u64 = CLONE_NEWUSER;
+/// The credentials in a new user namespace for `CLONE_NEWUSER`, as `create_user_ns` of Linux,
+/// or `None` without the flag.
+///
+/// # Errors
+///
+/// Gives the errors of [`rk_vfs::user_ns::create`].
+fn new_user_ns(process: &Process, flags: u64) -> Result<Option<Cred>, Errno> {
+    if flags & CLONE_NEWUSER == 0 {
+        return Ok(None);
+    }
+    rk_vfs::user_ns::create(&process.cred()).map(Some)
+}
 
 /// Makes a new PID namespace for the children of `thread`, for `CLONE_NEWPID`, as `copy_pid_ns`
-/// of Linux. It needs `CAP_SYS_ADMIN`.
+/// of Linux. It needs `CAP_SYS_ADMIN` in the user namespace of `cred`, the credentials that the
+/// process has after the call.
 ///
 /// # Errors
 ///
 /// Gives `EPERM` without `CAP_SYS_ADMIN`, `EINVAL` if the children of the thread go in another
 /// namespace already after `unshare` or `setns`, and `ENOSPC` if the namespace is too deep.
-fn new_pid_ns(thread: &rk_proc::Thread) -> Result<Arc<PidNamespace>, Errno> {
-    may_new_pid_ns(thread)?;
+fn new_pid_ns(thread: &rk_proc::Thread, cred: &Cred) -> Result<Arc<PidNamespace>, Errno> {
+    may_new_pid_ns(thread, cred)?;
     pid_namespace::create_pid_namespace(thread.pid_ns_for_children().as_ref())
 }
 
 /// Checks that `thread` can make a new PID namespace for its children. See `new_pid_ns`.
-fn may_new_pid_ns(thread: &rk_proc::Thread) -> Result<(), Errno> {
-    if !thread.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+fn may_new_pid_ns(thread: &rk_proc::Thread, cred: &Cred) -> Result<(), Errno> {
+    if !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let children = thread.pid_ns_for_children();
@@ -100,11 +111,12 @@ fn may_new_pid_ns(thread: &rk_proc::Thread) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Checks that `process` can make a new UTS, IPC or time namespace, as `create_new_namespaces`
-/// of kernel/nsproxy.c of Linux. It needs `CAP_SYS_ADMIN`.
-fn may_new_ns(process: &Process, flags: u64) -> Result<(), Errno> {
+/// Checks that a process with the credentials `cred` can make a new UTS, IPC or time namespace,
+/// as `create_new_namespaces` of kernel/nsproxy.c of Linux. It needs `CAP_SYS_ADMIN` in its user
+/// namespace.
+fn may_new_ns(cred: &Cred, flags: u64) -> Result<(), Errno> {
     if flags & (CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWTIME) != 0
-        && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN)
+        && !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN)
     {
         return Err(Errno::EPERM);
     }
@@ -132,9 +144,9 @@ fn new_time_ns(thread: &rk_proc::Thread, flags: u64) -> Result<Option<Arc<TimeNs
 }
 
 /// Makes a new network namespace for `CLONE_NEWNET`, as `copy_net_ns` of Linux. It needs
-/// `CAP_SYS_ADMIN`.
-fn new_net_ns(process: &Process) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
-    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+/// `CAP_SYS_ADMIN` in the user namespace of `cred`.
+fn new_net_ns(cred: &Cred) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
+    if !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     rk_net::ns::new()
@@ -156,21 +168,33 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
         | CLONE_NEWIPC
         | CLONE_NEWTIME
         | CLONE_NEWPID
-        | CLONE_NEW_ANY;
-    if flags & !known != 0 || flags & CLONE_NEW_ANY != 0 {
+        | CLONE_NEWUSER;
+    if flags & !known != 0 {
         return Err(Errno::EINVAL);
     }
     let process = cx.process();
+    let mut flags = flags;
+    // A new user namespace is for the whole process, and the process leaves its shared file
+    // system context, as `check_unshare_flags` of Linux.
+    if flags & CLONE_NEWUSER != 0 {
+        flags |= CLONE_THREAD | CLONE_FS;
+        if process.threads().len() > 1 {
+            return Err(Errno::EINVAL);
+        }
+    }
+    // The checks of the other namespaces use the credentials in the new user namespace.
+    let old_cred = process.cred();
+    let new_cred = new_user_ns(process, flags)?;
+    let cred = new_cred.as_ref().unwrap_or(&*old_cred);
     // A new mount name space needs `CAP_SYS_ADMIN`, and the process leaves its shared file
     // system context too, as `unshare_fs` of Linux.
-    let mut flags = flags;
     if flags & CLONE_NEWNS != 0 {
-        if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        if !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
             return Err(Errno::EPERM);
         }
         flags |= CLONE_FS;
     }
-    may_new_ns(process, flags)?;
+    may_new_ns(cred, flags)?;
     // A new IPC namespace leaves the semaphore undo list too, as `ksys_unshare` of Linux.
     if flags & CLONE_NEWIPC != 0 {
         flags |= CLONE_SYSVSEM;
@@ -180,9 +204,9 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     let files = if flags & CLONE_FILES != 0 { Some(cx.files()?.lock().try_clone()?) } else { None };
     let time = new_time_ns(cx.thread, flags)?;
     // The caller stays in its PID namespace, and its new children go in the new one.
-    let pid_ns = if flags & CLONE_NEWPID != 0 { Some(new_pid_ns(cx.thread)?) } else { None };
+    let pid_ns = if flags & CLONE_NEWPID != 0 { Some(new_pid_ns(cx.thread, cred)?) } else { None };
     if flags & CLONE_NEWCGROUP != 0 {
-        new_cgroup_ns(process)?;
+        new_cgroup_ns(process, cred)?;
     }
     // A process with more than one thread cannot leave its group, its handlers or its memory.
     if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && process.threads().len() > 1 {
@@ -203,7 +227,10 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     }
     // Only the caller gets the new namespace, as `switch_task_namespaces` of Linux.
     if flags & CLONE_NEWNET != 0 {
-        cx.thread.set_net_ns(new_net_ns(process)?);
+        cx.thread.set_net_ns(new_net_ns(cred)?);
+    }
+    if let Some(c) = new_cred {
+        process.set_cred(c);
     }
     if let Some(table) = files {
         process.set_files(Arc::new(SpinLock::new(table)));
@@ -259,9 +286,9 @@ const CLONE_ARGS_MAX: u64 = 4096;
 ///
 /// # Errors
 ///
-/// `EPERM` without `CAP_SYS_ADMIN`.
-fn new_cgroup_ns(process: &Process) -> Result<(), Errno> {
-    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+/// `EPERM` without `CAP_SYS_ADMIN` in the user namespace of `cred`.
+fn new_cgroup_ns(process: &Process, cred: &Cred) -> Result<(), Errno> {
+    if !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let root = process.cgroup();
@@ -392,21 +419,26 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
         | CLONE_NEWPID
         | CLONE_NEWUTS
         | CLONE_NEWIPC
-        | CLONE_NEW_ANY;
+        | CLONE_NEWUSER;
     if nstype == 0 || nstype & !all != 0 {
         return Err(Errno::EINVAL);
     }
-    // rukernel has no user namespaces, so `CLONE_NEWUSER` gives `EINVAL`, as `check_setns_flags`
-    // in kernel/nsproxy.c of Linux without `CONFIG_USER_NS`.
-    if nstype & (CLONE_NEWNS | CLONE_NEWUSER) != 0 {
+    if nstype & CLONE_NEWNS != 0 {
         return Err(Errno::EINVAL);
     }
     if target.is_zombie() {
         return Err(Errno::ESRCH);
     }
     // A join needs `CAP_SYS_ADMIN`, as `validate_nsset` of Linux, and an error changes nothing.
-    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+    if nstype & !CLONE_NEWUSER != 0 && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
+    }
+    // The user namespace comes first, as `validate_nsset` of Linux.
+    if nstype & CLONE_NEWUSER != 0 {
+        let ns = target.cred().user_ns.clone();
+        if ns != process.cred().user_ns {
+            crate::ns::join_user_ns(cx, process, ns)?;
+        }
     }
     if nstype & CLONE_NEWPID != 0 {
         may_join_pid_ns(cx, target.pid_ns())?;
@@ -533,7 +565,9 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     if flags & CLONE_PIDFD != 0 && flags & (CLONE_THREAD | CLONE_DETACHED) != 0 {
         return Err(Errno::EINVAL);
     }
-    if flags & CLONE_NEW_ANY != 0 {
+    // A new user namespace is for a new process with its own file system context, as
+    // `copy_process` of Linux.
+    if flags & CLONE_NEWUSER != 0 && flags & (CLONE_THREAD | CLONE_FS) != 0 {
         return Err(Errno::EINVAL);
     }
     // A new thread stays in the PID namespace of its process, as `copy_process` of Linux checks.
@@ -546,16 +580,21 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     {
         return Err(Errno::EINVAL);
     }
+    // The checks of the other namespaces use the credentials of the child in its new user
+    // namespace, as `copy_creds` comes before `copy_namespaces` in Linux.
+    let old_cred = cx.process().cred();
+    let new_cred = new_user_ns(cx.process(), flags)?;
+    let cred = new_cred.as_ref().unwrap_or(&*old_cred);
     // `fork` makes the namespace.
     if flags & CLONE_NEWPID != 0 {
-        may_new_pid_ns(cx.thread)?;
+        may_new_pid_ns(cx.thread, cred)?;
     }
     // A new IPC namespace cannot share the semaphore undo list, as `copy_process` of Linux.
     if flags & (CLONE_NEWIPC | CLONE_SYSVSEM) == CLONE_NEWIPC | CLONE_SYSVSEM {
         return Err(Errno::EINVAL);
     }
-    may_new_ns(cx.process(), flags)?;
-    if flags & CLONE_NEWCGROUP != 0 && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+    may_new_ns(cred, flags)?;
+    if flags & CLONE_NEWCGROUP != 0 && !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
     let cgroup =
@@ -566,12 +605,12 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
         if flags & (CLONE_FS | CLONE_THREAD) != 0 {
             return Err(Errno::EINVAL);
         }
-        if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+        if !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
             return Err(Errno::EPERM);
         }
     }
     // A new thread can have its own network namespace, as on Linux.
-    let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cx.process())?) } else { None };
+    let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cred)?) } else { None };
     let time = new_time_ns(cx.thread, flags)?;
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread_with(cx.thread, set_tid)?
@@ -588,6 +627,9 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
         };
         rk_proc::fork(cx.thread, share)?
     };
+    if let Some(c) = new_cred {
+        thread.process().set_cred(c);
+    }
     if flags & CLONE_NEWNS != 0
         && let Some(fs) = thread.process().fs()
     {
