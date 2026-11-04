@@ -12,8 +12,8 @@
 
 use super::{
     Caller, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_REQUESTOR_KEYRING, Key, Kind, LINK, LINK_LOCK,
-    LOOKUP_CREATE, NEGATIVE_TIMEOUT, Need, Owner, POS, POS_ALL, Quota, READ, SEARCH, Search, Slot,
-    USERS, USR, VIEW, WRITE, abort_link, alloc, begin_link, commit_link, insert_link, lookup,
+    LOOKUP_CREATE, NEGATIVE_TIMEOUT, Need, Owner, POS, POS_ALL, Prep, Quota, READ, SEARCH, Search,
+    Slot, USERS, USR, VIEW, WRITE, abort_link, alloc, begin_link, commit_link, insert_link, lookup,
     set_payload, user_rings,
 };
 use alloc::boxed::Box;
@@ -180,7 +180,7 @@ pub(super) fn construct(
         cx.cred.fsgid,
         kind.default_perm(),
         Quota::In,
-        Vec::new(),
+        Prep::default(),
         None,
         false,
     )?;
@@ -213,7 +213,7 @@ fn upcall(cx: &Caller<'_>, key: &Arc<Key>, callout: &[u8], dest: Arc<Key>) -> Re
         cx.cred.fsgid,
         AUTH_PERM,
         Quota::Overrun,
-        callout.to_vec(),
+        Prep::new(callout.to_vec()),
         None,
         false,
     )?;
@@ -232,7 +232,7 @@ fn upcall(cx: &Caller<'_>, key: &Arc<Key>, callout: &[u8], dest: Arc<Key>) -> Re
         cx.cred.fsgid,
         REQ_PERM,
         Quota::Overrun,
-        Vec::new(),
+        Prep::default(),
         None,
         false,
     )?;
@@ -267,16 +267,17 @@ fn set_pending(key: &Key) {
 
 /// Ends the construction of `key` with a payload or an error. Gives `EBUSY` if the key is not
 /// under construction.
-fn finish(key: &Key, result: Result<(Vec<u8>, bool), (Errno, u64)>, now: u64) -> Result<(), Errno> {
+fn finish(key: &Key, result: Result<Prep, (Errno, u64)>, now: u64) -> Result<(), Errno> {
     let (uid, old) = {
         let mut s = key.state.lock();
         if !s.pending {
             return Err(Errno::EBUSY);
         }
         let old = match result {
-            Ok((payload, short)) => {
-                let old = set_payload(&mut s, payload)?;
-                if short {
+            Ok(prep) => {
+                let old = set_payload(&mut s, prep.payload, prep.quota)?;
+                s.error = prep.error;
+                if prep.short {
                     s.expiry = now + 1;
                 }
                 old
@@ -372,7 +373,7 @@ fn end(
     auth: &Key,
     target: &Arc<Key>,
     ring: Option<Arc<Key>>,
-    result: Result<(Vec<u8>, bool), (Errno, u64)>,
+    result: Result<Prep, (Errno, u64)>,
 ) -> Result<(), Errno> {
     let guard = LINK_LOCK.lock();
     let replace = match &ring {

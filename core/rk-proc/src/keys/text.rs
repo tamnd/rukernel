@@ -1,7 +1,8 @@
 //! The text of `/proc/keys` and `/proc/key-users`.
 
 use super::{
-    Caller, KeyData, NO_GID, POS, VIEW, all_keys, all_usage, is_possessed, limits, permission,
+    BIG_KEY_FILE_THRESHOLD, Caller, KeyData, Kind, NO_GID, POS, VIEW, all_keys, all_usage,
+    is_possessed, limits, permission,
 };
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -66,8 +67,14 @@ fn key_line(out: &mut String, key: &KeyData, now: u64) {
             } else {
                 let _ = write!(out, ": {links}");
             }
+        } else if let Some(e) = s.error {
+            let _ = write!(out, ": -{}", e.get());
+        } else if key.kind == Kind::BigKey {
+            let len = s.payload.len();
+            let at = if len > BIG_KEY_FILE_THRESHOLD { "file" } else { "buff" };
+            let _ = write!(out, ": {len} [{at}]");
         } else {
-            let _ = write!(out, ": {}", s.payload.len());
+            let _ = write!(out, ": {}", s.datalen);
         }
     }
     out.push('\n');
