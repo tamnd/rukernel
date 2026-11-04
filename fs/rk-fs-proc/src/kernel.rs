@@ -333,10 +333,8 @@ fn cgroup_of(p: &Process) -> Vec<u8> {
 /// thread has its own network namespace.
 fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
     use rk_vfs::nsfs::{NsInode, NsKind, link_text};
-    /// The entries. There is no `user` link, as on
-    /// Linux without `CONFIG_USER_NS`: rukernel cannot make a user namespace, and a program such
-    /// as getxattr05 of LTP that finds the link expects `unshare(CLONE_NEWUSER)` to work.
-    const ENTRIES: [(&[u8], NsKind); 9] = [
+    /// The entries.
+    const ENTRIES: [(&[u8], NsKind); 10] = [
         (b"cgroup", NsKind::Cgroup),
         (b"ipc", NsKind::Ipc),
         (b"mnt", NsKind::Mnt),
@@ -345,6 +343,7 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
         (b"pid_for_children", NsKind::Pid),
         (b"time", NsKind::Time),
         (b"time_for_children", NsKind::Time),
+        (b"user", NsKind::User),
         (b"uts", NsKind::Uts),
     ];
     let path = join(base, b"ns");
@@ -371,6 +370,7 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                                 (NsKind::Uts, Some(t)) => alive(t)?.uts_ns().id(),
                                 (NsKind::Ipc, Some(t)) => alive(t)?.ipc_ns().id(),
                                 (NsKind::Time, _) => time_ns(&p, t_.as_ref(), children)?.id(),
+                                (NsKind::User, _) => p.cred().user_ns.id(),
                                 (NsKind::Pid, _) if pid_children => {
                                     let ns = pid_ns_for_children(&p, t_.as_ref())?;
                                     rk_proc::pid_namespace::ns_id(ns.as_ref())
@@ -406,6 +406,11 @@ fn ns_dir(base: &[u8], w: Weak<Process>, t: Option<Weak<Thread>>) -> InodeRef {
                                 }
                                 NsKind::Time => {
                                     let ns = time_ns(&p, t_j.as_ref(), children)?;
+                                    NsInode::with_hold(kind, ns.id(), ns)
+                                }
+                                // The file keeps the user namespace, as on Linux.
+                                NsKind::User => {
+                                    let ns = p.cred().user_ns.clone();
                                     NsInode::with_hold(kind, ns.id(), ns)
                                 }
                                 // The file keeps the PID namespace, as on Linux.
@@ -578,6 +583,7 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/protected_regular", ""),
     ("fs/protected_symlinks", ""),
     ("fs/suid_dumpable", ""),
+    ("kernel/cap_last_cap", ""),
     ("kernel/core_pattern", ""),
     ("kernel/core_uses_pid", ""),
     ("kernel/domainname", ""),
@@ -611,6 +617,19 @@ const SYSCTLS: &[(&str, &str)] = &[
     // Who can make BPF maps, which rk-bpf reads.
     ("kernel/unprivileged_bpf_disabled", ""),
     ("kernel/version", ""),
+    // The limits of the user namespace of the reader, as kernel/ucount.c of Linux.
+    ("user/max_cgroup_namespaces", ""),
+    ("user/max_fanotify_groups", ""),
+    ("user/max_fanotify_marks", ""),
+    ("user/max_inotify_instances", ""),
+    ("user/max_inotify_watches", ""),
+    ("user/max_ipc_namespaces", ""),
+    ("user/max_mnt_namespaces", ""),
+    ("user/max_net_namespaces", ""),
+    ("user/max_pid_namespaces", ""),
+    ("user/max_time_namespaces", ""),
+    ("user/max_user_namespaces", ""),
+    ("user/max_uts_namespaces", ""),
     ("vm/dirty_background_bytes", "0"),
     ("vm/dirty_background_ratio", "10"),
     ("vm/dirty_bytes", "0"),
@@ -637,6 +656,7 @@ const SYSCTLS: &[(&str, &str)] = &[
 
 /// The sysctls that only give text, with the mode 0444 of Linux.
 const READ_ONLY_SYSCTLS: &[&str] = &[
+    "kernel/cap_last_cap",
     "kernel/random/boot_id",
     "kernel/random/entropy_avail",
     "kernel/random/poolsize",
@@ -757,7 +777,35 @@ fn uts_name(name: &str) -> Option<fn() -> rk_proc::uts::Field> {
     }
 }
 
+/// The limit of the `user.max_*` sysctl `name` in the user namespace of the caller, as the
+/// `ucount_sysctls` of Linux. In the first namespace, the inotify limits are those of
+/// `fs.inotify`, as Linux keeps them in the same place.
+fn user_limit(name: &str) -> Option<(Arc<rk_vfs::user_ns::UserNs>, rk_vfs::user_ns::UcountKind)> {
+    let kind = rk_vfs::user_ns::UcountKind::by_name(name.strip_prefix("user/")?)?;
+    Some((rk_vfs::cred::current().user_ns.clone(), kind))
+}
+
+/// The atomic value of the limit `kind` in the first user namespace, if `fs.inotify` keeps it.
+fn inotify_alias(
+    ns: &rk_vfs::user_ns::UserNs,
+    kind: rk_vfs::user_ns::UcountKind,
+) -> Option<&'static AtomicU32> {
+    use rk_vfs::notify::inotify::{MAX_USER_INSTANCES, MAX_USER_WATCHES};
+    use rk_vfs::user_ns::UcountKind;
+    match kind {
+        _ if !ns.is_init() => None,
+        UcountKind::InotifyInstances => Some(&MAX_USER_INSTANCES),
+        UcountKind::InotifyWatches => Some(&MAX_USER_WATCHES),
+        _ => None,
+    }
+}
+
 fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
+    if let Some((ns, kind)) = user_limit(name) {
+        let v =
+            inotify_alias(&ns, kind).map_or_else(|| ns.max(kind), |a| a.load(Ordering::Relaxed));
+        return format!("{v}\n").into_bytes();
+    }
     if let Some(t) = rk_vfs::ipc::sysctl(name) {
         return format!("{}\n", t.get()).into_bytes();
     }
@@ -778,6 +826,7 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
         "kernel/random/uuid" => return uuid_text(random_uuid()),
         "fs/nr_open" => return format!("{}\n", rk_vfs::fdtable::nr_open()).into_bytes(),
         "kernel/ns_last_pid" => return format!("{}\n", rk_proc::last_pid()).into_bytes(),
+        "kernel/cap_last_cap" => return format!("{}\n", rk_vfs::cred::cap::LAST).into_bytes(),
         "kernel/unprivileged_bpf_disabled" => {
             let v = rk_bpf::UNPRIVILEGED_BPF_DISABLED.load(Ordering::Relaxed);
             return format!("{v}\n").into_bytes();
@@ -845,6 +894,19 @@ fn parse_int(data: &[u8]) -> Result<i32> {
 }
 
 fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
+    // A value from 0 to `INT_MAX`, as `proc_dointvec_minmax` of Linux.
+    if let Some((ns, kind)) = user_limit(name) {
+        let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
+        let n: u32 = text.trim().parse().map_err(|_| Errno::EINVAL)?;
+        if n > i32::MAX as u32 {
+            return Err(Errno::EINVAL);
+        }
+        match inotify_alias(&ns, kind) {
+            Some(a) => a.store(n, Ordering::Relaxed),
+            None => ns.set_max(kind, n),
+        }
+        return Ok(());
+    }
     // The limits of the IPC objects, which the system calls read.
     if let Some(t) = rk_vfs::ipc::sysctl(name) {
         let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
@@ -1943,6 +2005,61 @@ fn slack_thread(w: &Weak<Process>, t: &Option<Weak<Thread>>) -> Result<Arc<Threa
 
 /// The files of a process directory, from the process `w`. `t` is the thread of a directory in
 /// `task`, or `None` for the directory of the process.
+/// Copies the part of `text` at `offset` to `buf`, for a read of a file of text.
+fn read_text(text: &[u8], offset: u64, buf: &mut [u8]) -> usize {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(text.len());
+    let n = buf.len().min(text.len() - start);
+    buf[..n].copy_from_slice(&text[start..start + n]);
+    n
+}
+
+/// The files of the user namespace of the process: `uid_map`, `gid_map`, `projid_map` and
+/// `setgroups`, as fs/proc/base.c and kernel/user_namespace.c of Linux. The writer is the
+/// process that calls `write`.
+fn user_ns_files(w: &Weak<Process>, base: &[u8], out: &mut Vec<(Vec<u8>, InodeRef)>) {
+    use rk_vfs::user_ns::{self, IdKind};
+    let me = rk_vfs::cred::current;
+    for (name, kind) in
+        [(&b"uid_map"[..], IdKind::Uid), (b"gid_map", IdKind::Gid), (b"projid_map", IdKind::Projid)]
+    {
+        let (p_, p2) = (w.clone(), w.clone());
+        out.push((
+            name.to_vec(),
+            data_file(
+                &join(base, name),
+                0o644,
+                move |offset, buf| {
+                    let ns = alive(&p_)?.cred().user_ns.clone();
+                    let text = user_ns::show_map(&ns, kind, &me().user_ns);
+                    Ok(read_text(&text, offset, buf))
+                },
+                move |offset, data| {
+                    let ns = alive(&p2)?.cred().user_ns.clone();
+                    user_ns::write_map(&ns, kind, &me(), offset, data)?;
+                    Ok(data.len())
+                },
+            ),
+        ));
+    }
+    let (p_, p2) = (w.clone(), w.clone());
+    out.push((
+        b"setgroups".to_vec(),
+        data_file(
+            &join(base, b"setgroups"),
+            0o644,
+            move |offset, buf| {
+                let ns = alive(&p_)?.cred().user_ns.clone();
+                Ok(read_text(user_ns::show_setgroups(&ns), offset, buf))
+            },
+            move |offset, data| {
+                let ns = alive(&p2)?.cred().user_ns.clone();
+                user_ns::write_setgroups(&ns, &me(), offset, data)?;
+                Ok(data.len())
+            },
+        ),
+    ));
+}
+
 fn process_files(
     w: &Weak<Process>,
     t: Option<Weak<Thread>>,
@@ -2039,6 +2156,7 @@ fn process_files(
             ),
         ));
     }
+    user_ns_files(w, base, &mut out);
     let p_ = w.clone();
     let t_ = t.clone();
     out.push((

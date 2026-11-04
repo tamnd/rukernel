@@ -5,7 +5,8 @@ use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_vfs::cred::{Cred, NGROUPS_MAX, cap, secure, valid_cap};
+use rk_vfs::cred::{Cred, KEEP, NGROUPS_MAX, cap, secure, valid_cap};
+use rk_vfs::user_ns::{INVALID_ID, IdKind};
 
 /// The `option` values of `prctl` for the capabilities.
 const PR_GET_KEEPCAPS: u64 = 7;
@@ -38,29 +39,59 @@ fn id(arg: u64) -> u32 {
     arg as u32
 }
 
+/// The kernel ID of the ID `arg` of the kind `kind` in the user namespace of `c`, as
+/// `make_kuid` of Linux. -1 stays -1, the value of no change.
+///
+/// # Errors
+///
+/// Gives `EINVAL` if the namespace does not map the ID.
+fn down(c: &Cred, kind: IdKind, arg: u64) -> Result<u32, Errno> {
+    let v = id(arg);
+    if v == KEEP {
+        return Ok(KEEP);
+    }
+    match c.user_ns.make_kid(kind, v) {
+        INVALID_ID => Err(Errno::EINVAL),
+        k => Ok(k),
+    }
+}
+
+/// The ID that `c` sees for the kernel ID `k`, as `from_kuid_munged` of Linux.
+fn up(c: &Cred, kind: IdKind, k: u32) -> u32 {
+    c.user_ns.from_kid_munged(kind, k)
+}
+
 /// `getuid`, `geteuid`, `getgid` and `getegid`.
 pub(crate) fn getuid(cx: &Cx<'_>) -> SysResult {
-    Ok(u64::from(cred(cx).uid))
+    let c = cred(cx);
+    Ok(u64::from(up(&c, IdKind::Uid, c.uid)))
 }
 
 pub(crate) fn geteuid(cx: &Cx<'_>) -> SysResult {
-    Ok(u64::from(cred(cx).euid))
+    let c = cred(cx);
+    Ok(u64::from(up(&c, IdKind::Uid, c.euid)))
 }
 
 pub(crate) fn getgid(cx: &Cx<'_>) -> SysResult {
-    Ok(u64::from(cred(cx).gid))
+    let c = cred(cx);
+    Ok(u64::from(up(&c, IdKind::Gid, c.gid)))
 }
 
 pub(crate) fn getegid(cx: &Cx<'_>) -> SysResult {
-    Ok(u64::from(cred(cx).egid))
+    let c = cred(cx);
+    Ok(u64::from(up(&c, IdKind::Gid, c.egid)))
 }
 
 /// `getresuid` and `getresgid`.
 pub(crate) fn getresid(cx: &Cx<'_>, group: bool, r: u64, e: u64, s: u64) -> SysResult {
     let c = cred(cx);
-    let ids = if group { [c.gid, c.egid, c.sgid] } else { [c.uid, c.euid, c.suid] };
+    let (kind, ids) = if group {
+        (IdKind::Gid, [c.gid, c.egid, c.sgid])
+    } else {
+        (IdKind::Uid, [c.uid, c.euid, c.suid])
+    };
     for (addr, id) in [r, e, s].into_iter().zip(ids) {
-        cx.write_val(addr, &id)?;
+        cx.write_val(addr, &up(&c, kind, id))?;
     }
     Ok(0)
 }
@@ -70,36 +101,47 @@ fn change(cx: &Cx<'_>, f: impl FnOnce(&Cred) -> Result<Cred, Errno>) -> SysResul
     cx.process().change_cred(f).map(|()| 0)
 }
 
+// The `set*id` calls take the IDs of the user namespace of the caller. An ID that the
+// namespace does not map gives `EINVAL`, as `make_kuid` and `uid_valid` in kernel/sys.c of
+// Linux.
+
 pub(crate) fn setuid(cx: &Cx<'_>, uid: u64) -> SysResult {
-    change(cx, |c| c.setuid(id(uid)))
+    change(cx, |c| c.setuid(down(c, IdKind::Uid, uid)?))
 }
 
 pub(crate) fn setreuid(cx: &Cx<'_>, ruid: u64, euid: u64) -> SysResult {
-    change(cx, |c| c.setreuid(id(ruid), id(euid)))
+    change(cx, |c| c.setreuid(down(c, IdKind::Uid, ruid)?, down(c, IdKind::Uid, euid)?))
 }
 
 pub(crate) fn setresuid(cx: &Cx<'_>, ruid: u64, euid: u64, suid: u64) -> SysResult {
-    change(cx, |c| c.setresuid(id(ruid), id(euid), id(suid)))
+    change(cx, |c| {
+        let k = |arg| down(c, IdKind::Uid, arg);
+        c.setresuid(k(ruid)?, k(euid)?, k(suid)?)
+    })
 }
 
 pub(crate) fn setgid(cx: &Cx<'_>, gid: u64) -> SysResult {
-    change(cx, |c| c.setgid(id(gid)))
+    change(cx, |c| c.setgid(down(c, IdKind::Gid, gid)?))
 }
 
 pub(crate) fn setregid(cx: &Cx<'_>, rgid: u64, egid: u64) -> SysResult {
-    change(cx, |c| c.setregid(id(rgid), id(egid)))
+    change(cx, |c| c.setregid(down(c, IdKind::Gid, rgid)?, down(c, IdKind::Gid, egid)?))
 }
 
 pub(crate) fn setresgid(cx: &Cx<'_>, rgid: u64, egid: u64, sgid: u64) -> SysResult {
-    change(cx, |c| c.setresgid(id(rgid), id(egid), id(sgid)))
+    change(cx, |c| {
+        let k = |arg| down(c, IdKind::Gid, arg);
+        c.setresgid(k(rgid)?, k(egid)?, k(sgid)?)
+    })
 }
 
-/// `setfsuid` and `setfsgid` give the old ID, also when they change nothing.
+/// `setfsuid` and `setfsgid` give the old ID, also when they change nothing. An ID that the
+/// namespace does not map changes nothing.
 pub(crate) fn setfsuid(cx: &Cx<'_>, uid: u64) -> SysResult {
     let mut old = 0;
     let _ = cx.process().change_cred(|c| {
-        old = c.fsuid;
-        c.setfsuid(id(uid)).ok_or(Errno::EPERM)
+        old = up(c, IdKind::Uid, c.fsuid);
+        c.setfsuid(c.user_ns.make_kuid(id(uid))).ok_or(Errno::EPERM)
     });
     Ok(u64::from(old))
 }
@@ -107,8 +149,8 @@ pub(crate) fn setfsuid(cx: &Cx<'_>, uid: u64) -> SysResult {
 pub(crate) fn setfsgid(cx: &Cx<'_>, gid: u64) -> SysResult {
     let mut old = 0;
     let _ = cx.process().change_cred(|c| {
-        old = c.fsgid;
-        c.setfsgid(id(gid)).ok_or(Errno::EPERM)
+        old = up(c, IdKind::Gid, c.fsgid);
+        c.setfsgid(c.user_ns.make_kgid(id(gid))).ok_or(Errno::EPERM)
     });
     Ok(u64::from(old))
 }
@@ -127,15 +169,17 @@ pub(crate) fn getgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
     if (size as usize) < n {
         return Err(Errno::EINVAL);
     }
-    let bytes: Vec<u8> = c.groups.iter().flat_map(|g| g.to_ne_bytes()).collect();
+    let bytes: Vec<u8> =
+        c.groups.iter().flat_map(|&g| up(&c, IdKind::Gid, g).to_ne_bytes()).collect();
     cx.write_bytes(list, &bytes)?;
     Ok(n as u64)
 }
 
-/// `setgroups`. As Linux, the check of `CAP_SETGID` comes before the checks of the size and of
-/// the list.
+/// `setgroups`. As Linux, the check of `CAP_SETGID` and of the user namespace comes before the
+/// checks of the size and of the list, as `may_setgroups`.
 pub(crate) fn setgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
-    if !cred(cx).capable(cap::SETGID) {
+    let c = cred(cx);
+    if !c.has_cap(cap::SETGID) || !c.user_ns.may_setgroups() {
         return Err(Errno::EPERM);
     }
     let size = size as i32;
@@ -143,7 +187,15 @@ pub(crate) fn setgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let bytes = cx.read_bytes(list, 4 * size as usize)?;
-    let groups = bytes.as_chunks::<4>().0.iter().map(|b| u32::from_ne_bytes(*b)).collect();
+    let groups = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| match c.user_ns.make_kgid(u32::from_ne_bytes(*b)) {
+            INVALID_ID => Err(Errno::EINVAL),
+            k => Ok(k),
+        })
+        .collect::<Result<Vec<u32>, Errno>>()?;
     change(cx, |c| c.setgroups(groups))
 }
 

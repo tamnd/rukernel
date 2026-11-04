@@ -15,6 +15,7 @@ use rk_vfs::cred::cap;
 use rk_vfs::file::File;
 use rk_vfs::inode::InodeRef;
 use rk_vfs::nsfs::{NsInode, NsKind};
+use rk_vfs::user_ns::{self, UserNs};
 
 /// `NS_GET_USERNS` of include/uapi/linux/nsfs.h.
 const NS_GET_USERNS: u32 = 0xb701;
@@ -35,20 +36,22 @@ const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
 /// `NS_GET_TGID_IN_PIDNS`: `_IOR(0xb7, 9, int)`.
 const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
 
-/// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. rukernel has
-/// only the user namespace of the system, so it has no parent.
+/// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. The first user
+/// namespace owns the namespaces of the other kinds.
 pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
-        // rukernel has no user namespace files, as Linux without `CONFIG_USER_NS`, where
-        // `ns_get_owner` gives `EPERM`.
-        NS_GET_USERNS => Err(Errno::EPERM),
+        NS_GET_USERNS if kind == NsKind::User => user_owner(cx, id),
+        NS_GET_USERNS => open_user_ns(cx, Some(user_ns::init().clone())),
         NS_GET_PARENT if kind == NsKind::Pid => pid_parent(cx, id),
-        NS_GET_PARENT if kind == NsKind::User => Err(Errno::EPERM),
+        NS_GET_PARENT if kind == NsKind::User => user_owner(cx, id),
         NS_GET_PARENT => Err(Errno::EINVAL),
         NS_GET_NSTYPE => Ok(kind.clone_flag()),
         NS_GET_OWNER_UID if kind != NsKind::User => Err(Errno::EINVAL),
         NS_GET_OWNER_UID => {
-            cx.write_val(arg, &0u32)?;
+            let ns = user_ns::by_id(id).ok_or(Errno::EINVAL)?;
+            let me = cx.process().cred();
+            let uid = me.user_ns.from_kid_munged(user_ns::IdKind::Uid, ns.owner());
+            cx.write_val(arg, &uid)?;
             Ok(0)
         }
         NS_GET_MNTNS_ID if kind != NsKind::Mnt => Err(Errno::EINVAL),
@@ -89,6 +92,60 @@ pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> S
         }
         _ => Err(Errno::ENOTTY),
     }
+}
+
+/// Opens the file of the parent of the user namespace `id`, for `NS_GET_USERNS` and
+/// `NS_GET_PARENT`, as `userns_owner` and `ns_get_owner` of Linux.
+///
+/// # Errors
+///
+/// Gives `EPERM` for the first namespace and for a parent out of the view of the caller.
+fn user_owner(cx: &Cx<'_>, id: u32) -> SysResult {
+    let ns = user_ns::by_id(id).ok_or(Errno::EPERM)?;
+    open_user_ns(cx, ns.parent().cloned())
+}
+
+/// Opens the file of the user namespace `ns`, if the caller sees it: it is the user namespace of
+/// the caller or a namespace below it.
+///
+/// # Errors
+///
+/// Gives `EPERM` for `None` and for a namespace out of the view of the caller.
+fn open_user_ns(cx: &Cx<'_>, ns: Option<Arc<UserNs>>) -> SysResult {
+    let ns = ns.ok_or(Errno::EPERM)?;
+    if !ns.is_in(&cx.process().cred().user_ns) {
+        return Err(Errno::EPERM);
+    }
+    let file = File::open_inode(Location::detached(user_inode(ns)), O_RDONLY);
+    Ok(cx.files()?.lock().insert(file, true)? as u64)
+}
+
+/// The inode of the user namespace `ns`. The inode keeps the namespace.
+pub(crate) fn user_inode(ns: Arc<UserNs>) -> Arc<NsInode> {
+    NsInode::with_hold(NsKind::User, ns.id(), ns)
+}
+
+/// Puts `process` in the user namespace `ns`, as `userns_install` of Linux. The process gets all
+/// the capabilities in the namespace.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for the namespace of the process, for a process with more than one thread or
+/// a shared file system context, and `EPERM` without `CAP_SYS_ADMIN` in `ns`.
+pub(crate) fn join_user_ns(cx: &Cx<'_>, process: &Process, ns: Arc<UserNs>) -> Result<(), Errno> {
+    let cred = process.cred();
+    if ns == cred.user_ns || process.threads().len() > 1 {
+        return Err(Errno::EINVAL);
+    }
+    // The process and this function hold the context: a third holder shares it.
+    if Arc::strong_count(&cx.fs_shared()?) > 2 {
+        return Err(Errno::EINVAL);
+    }
+    if !cred.ns_capable(&ns, cap::SYS_ADMIN) {
+        return Err(Errno::EPERM);
+    }
+    process.set_cred(cred.in_user_ns(ns));
+    Ok(())
 }
 
 /// Opens the file of the parent of the PID namespace `id`, for `NS_GET_PARENT`, as `pidns_get_parent`
@@ -134,16 +191,14 @@ pub(crate) fn pid_for_children_inode(process: &Process) -> Result<InodeRef, Errn
 }
 
 /// The inode of the namespace of the kind `kind` of `process`, as the links of `/proc/PID/ns`.
-/// The inode of a network, UTS or IPC namespace keeps the namespace.
+/// The inode of a user, network, UTS or IPC namespace keeps the namespace.
 ///
 /// # Errors
 ///
-/// Gives `EOPNOTSUPP` for a user namespace: rukernel has no files of user namespaces, as Linux
-/// without `CONFIG_USER_NS`. Gives `ENOENT` for the mount namespace of a process without a file
-/// system context.
+/// Gives `ENOENT` for the mount namespace of a process without a file system context.
 pub(crate) fn inode_of(process: &Process, kind: NsKind) -> Result<Arc<NsInode>, Errno> {
     Ok(match kind {
-        NsKind::User => return Err(Errno::EOPNOTSUPP),
+        NsKind::User => user_inode(process.cred().user_ns.clone()),
         NsKind::Net => {
             let net = process.net_ns();
             NsInode::with_hold(kind, net.id(), net)
@@ -172,12 +227,12 @@ pub(crate) fn time_inode(ns: Arc<rk_proc::timens::TimeNs>) -> Arc<NsInode> {
 ///
 /// # Errors
 ///
-/// Gives `EINVAL` for a user namespace: the caller is in the only one, as `userns_install`.
-/// Gives `EPERM` without `CAP_SYS_ADMIN`, and also without `CAP_SYS_CHROOT` for a mount
-/// namespace, as `mntns_install`.
+/// Gives the errors of [`join_user_ns`] for a user namespace. Gives `EPERM` without
+/// `CAP_SYS_ADMIN`, and also without `CAP_SYS_CHROOT` for a mount namespace, as `mntns_install`.
 pub(crate) fn install(cx: &Cx<'_>, process: &Process, kind: NsKind, id: u32) -> Result<(), Errno> {
     if kind == NsKind::User {
-        return Err(Errno::EINVAL);
+        // The file keeps the namespace, so the search finds it.
+        return join_user_ns(cx, process, user_ns::by_id(id).ok_or(Errno::EINVAL)?);
     }
     let cred = process.cred();
     if !cred.capable(cap::SYS_ADMIN) {
