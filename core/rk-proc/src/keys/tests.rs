@@ -279,3 +279,42 @@ fn walk_keeps_no_key_alive() {
     collect();
     drop(walk);
 }
+
+#[test]
+fn dns_resolver_keys() {
+    let (c, o) = (cred(5013), TestOwner::default());
+    let mut cx = Caller { cred: &c, now: 50, owner: &o };
+    // The payload of keyctl05: a binary server list with no good lookup expires after 1 second.
+    let list = [0, 0, 1, 0xff, 0, 0];
+    let k = add_key(&cx, b"dns_resolver", Some(b"desc"), list.to_vec(), PROC).unwrap();
+    // A type with no update gets no write permission, and a second add makes a new key.
+    assert_eq!(describe(&cx, k).unwrap(), b"dns_resolver;5013;5013;3b010000;desc\0".to_vec());
+    assert_eq!(update(&cx, k, list.to_vec()), Err(Errno::EACCES));
+    set_perm(&cx, k, 0x3f00_0000).unwrap();
+    assert_eq!(update(&cx, k, list.to_vec()), Err(Errno::EOPNOTSUPP));
+    assert_eq!(read(&cx, k, 16).unwrap(), (6, list.to_vec()));
+    cx.now = 51;
+    assert_eq!(read(&cx, k, 16), Err(Errno::EKEYEXPIRED));
+    let k2 = add_key(&cx, b"dns_resolver", Some(b"desc"), list.to_vec(), PROC).unwrap();
+    assert_ne!(k2, k);
+    // A good lookup does not expire. The text form keeps the data before the options.
+    let good = add_key(&cx, b"dns_resolver", Some(b"g"), [0, 0, 1, 0, 1, 0].to_vec(), PROC);
+    cx.now = 60;
+    assert_eq!(read(&cx, good.unwrap(), 16).unwrap().0, 6);
+    let t = add_key(&cx, b"dns_resolver", Some(b"t"), b"1.2.3.4".to_vec(), PROC);
+    assert_eq!(read(&cx, t.unwrap(), 16).unwrap(), (7, b"1.2.3.4".to_vec()));
+    assert!(add_key(&cx, b"dns_resolver", Some(b"e"), b"x#dnserror=6#".to_vec(), PROC).is_ok());
+    for bad in [
+        &b"x"[..],
+        &[0, 0, 1, 0, 1],
+        &[0, 1, 1, 0, 1, 0],
+        &[0, 0, 2, 0, 1, 0],
+        b"a#",
+        b"a#b=1",
+        b"a#dnserror=512",
+        b"a##",
+    ] {
+        let r = add_key(&cx, b"dns_resolver", Some(b"bad"), bad.to_vec(), PROC);
+        assert_eq!(r, Err(Errno::EINVAL), "{bad:?}");
+    }
+}

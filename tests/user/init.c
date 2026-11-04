@@ -11042,6 +11042,34 @@ static int uinput_wait(int fd, const char *action, const char *sys, const char *
 
 /* A mouse of uinput, as LTP uevent03 makes it: the input device, its handlers in /dev/input,
  * /proc/bus/input/devices, sysfs and the events in the order of Linux (#539). */
+/*
+ * A dns_resolver key, as keyctl05 of LTP. The type has no update, so a new key has no write
+ * permission, and KEYCTL_UPDATE gives EOPNOTSUPP after KEYCTL_SETPERM gives it. The server
+ * list has a good lookup (status 1). A list with no good lookup expires after one second.
+ */
+static void test_dns_key(void)
+{
+	static const char list[] = { 0, 0, 1, (char)0xff, 1, 0 };
+	char desc[128] = "";
+	long ring = syscall(SYS_keyctl, 1 /* KEYCTL_JOIN_SESSION_KEYRING */, "rk-dns");
+	long key = syscall(SYS_add_key, "dns_resolver", "desc", list, sizeof(list), -3);
+
+	check("keys: add_key of a dns_resolver server list", ring > 0 && key > 0);
+	if (key <= 0)
+		return;
+	long n = syscall(SYS_keyctl, 6 /* KEYCTL_DESCRIBE */, key, desc, sizeof(desc));
+	check("keys: a dns_resolver key has no write permission",
+	      n > 0 && strcmp(desc, "dns_resolver;0;0;3b010000;desc") == 0);
+	errno = 0;
+	check("keys: KEYCTL_UPDATE of a dns_resolver key gives EOPNOTSUPP",
+	      syscall(SYS_keyctl, 5 /* KEYCTL_SETPERM */, key, 0x3f000000) == 0 &&
+		      syscall(SYS_keyctl, 2 /* KEYCTL_UPDATE */, key, list, sizeof(list)) == -1 &&
+		      errno == EOPNOTSUPP);
+	errno = 0;
+	check("keys: add_key of a short server list gives EINVAL",
+	      syscall(SYS_add_key, "dns_resolver", "d", list, 5, -3) == -1 && errno == EINVAL);
+}
+
 static void test_uinput(void)
 {
 	char buf[2048], sys[32] = "", text[4096] = "", path[128], h[2][32] = { "", "" }, var[2][96];
@@ -11157,6 +11185,7 @@ static void test_all(void)
 	test_uevent();
 	test_uevent_synth();
 	test_uinput();
+	test_dns_key();
 	test_xattr();
 	test_fifo();
 	test_file_locks();
@@ -11204,6 +11233,8 @@ int main(int argc, char **argv)
 		test_uevent_synth();
 		test_uinput();
 	}
+	if (argc > 1 && strcmp(argv[1], "keys") == 0)
+		test_dns_key();
 	if (argc > 1 && strcmp(argv[1], "smp") == 0)
 		test_smp();
 	if (argc > 1 && strcmp(argv[1], "blk") == 0)

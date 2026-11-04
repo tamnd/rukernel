@@ -129,6 +129,9 @@ pub enum Kind {
     Logon,
     /// A key that holds links to other keys.
     Keyring,
+    /// A key with the result of a DNS query, as `net/dns_resolver/dns_key.c`. The type has no
+    /// update.
+    DnsResolver,
 }
 
 impl Kind {
@@ -138,6 +141,7 @@ impl Kind {
             Kind::User => "user",
             Kind::Logon => "logon",
             Kind::Keyring => "keyring",
+            Kind::DnsResolver => "dns_resolver",
         }
     }
 
@@ -147,13 +151,14 @@ impl Kind {
             b"user" => Some(Kind::User),
             b"logon" => Some(Kind::Logon),
             b"keyring" => Some(Kind::Keyring),
+            b"dns_resolver" => Some(Kind::DnsResolver),
             _ => None,
         }
     }
 
     /// The type can change its payload.
     fn can_update(self) -> bool {
-        self != Kind::Keyring
+        matches!(self, Kind::User | Kind::Logon)
     }
 
     /// A process can read the payload of the type.
@@ -161,13 +166,17 @@ impl Kind {
         self != Kind::Logon
     }
 
-    /// The permissions of a new key of this type from `add_key` or `request_key`.
+    /// The permissions of a new key of this type from `add_key` or `request_key`. Only a keyring
+    /// or a type with an update gets the write permission.
     fn default_perm(self) -> u32 {
         let mut perm = ((VIEW | SEARCH | LINK | SETATTR) << POS) | (VIEW << USR);
         if self.can_read() {
             perm |= READ << POS;
         }
-        perm | (WRITE << POS)
+        if self == Kind::Keyring || self.can_update() {
+            perm |= WRITE << POS;
+        }
+        perm
     }
 
     /// Checks the payload of a new key or of an update, as the `preparse` of the type.
@@ -175,8 +184,21 @@ impl Kind {
         let ok = match self {
             Kind::Keyring => payload.is_empty(),
             Kind::User | Kind::Logon => (1..=MAX_USER_PAYLOAD).contains(&payload.len()),
+            Kind::DnsResolver => return dns_preparse(payload).map(|_| ()),
         };
         if ok { Ok(()) } else { Err(Errno::EINVAL) }
+    }
+
+    /// Checks the payload of a new key and gives the payload to keep, as the `preparse` of the
+    /// type. The flag is true if the key expires after one second.
+    fn preparse(self, mut payload: Vec<u8>) -> Result<(Vec<u8>, bool), Errno> {
+        if self != Kind::DnsResolver {
+            self.check_payload(&payload)?;
+            return Ok((payload, false));
+        }
+        let (len, short) = dns_preparse(&payload)?;
+        payload.truncate(len);
+        Ok((payload, short))
     }
 
     /// Checks the description of a new key, as the `vet_description` of the type. A `logon` key
@@ -187,6 +209,65 @@ impl Kind {
         }
         Ok(())
     }
+}
+
+/// The option of a `dns_resolver` key with an error number.
+const DNS_ERRORNO_OPTION: &[u8] = b"dnserror";
+/// The longest option of a `dns_resolver` key.
+const DNS_MAX_OPTION: usize = 128;
+/// The size of `struct dns_server_list_v1_header`.
+const DNS_V1_HEADER: usize = 6;
+/// The lookup states `DNS_LOOKUP_GOOD` and `DNS_LOOKUP_GOOD_WITH_BAD`.
+const DNS_LOOKUP_GOOD: [u8; 2] = [1, 2];
+
+/// Checks the payload of a `dns_resolver` key, as `dns_resolver_preparse`. Gives the length of
+/// the result and true if the key expires after one second.
+///
+/// A payload that starts with 0 is a binary server list: version 1 of the header, with the
+/// content 0 (`DNS_PAYLOAD_IS_SERVER_LIST`). A list with a lookup state that is not good expires
+/// after one second. Other payloads are text: the result, and then options after `#`. The only
+/// option is `dnserror=N` with N from 1 to 511.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a payload of 1 byte or less, a bad header or a bad option.
+fn dns_preparse(data: &[u8]) -> Result<(usize, bool), Errno> {
+    if data.len() <= 1 {
+        return Err(Errno::EINVAL);
+    }
+    if data[0] == 0 {
+        if data.len() < DNS_V1_HEADER || data[1] != 0 || data[2] != 1 {
+            return Err(Errno::EINVAL);
+        }
+        return Ok((data.len(), !DNS_LOOKUP_GOOD.contains(&data[4])));
+    }
+    let Some(hash) = data.iter().position(|&b| b == b'#') else {
+        return Ok((data.len(), false));
+    };
+    let opts = &data[hash + 1..];
+    let count = opts.split(|&b| b == b'#').count();
+    for (i, opt) in opts.split(|&b| b == b'#').enumerate() {
+        // Linux stops at the end of the data, so one `#` at the end after an option is accepted.
+        if opt.is_empty() && i > 0 && i + 1 == count {
+            break;
+        }
+        if opt.is_empty() || opt.len() > DNS_MAX_OPTION {
+            return Err(Errno::EINVAL);
+        }
+        let (name, value) = match opt.iter().position(|&b| b == b'=') {
+            Some(eq) => (&opt[..eq], &opt[eq + 1..]),
+            None => (opt, &[][..]),
+        };
+        let ok = name == DNS_ERRORNO_OPTION
+            && core::str::from_utf8(value)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .is_some_and(|n| (1..=511).contains(&n));
+        if !ok {
+            return Err(Errno::EINVAL);
+        }
+    }
+    Ok((hash, false))
 }
 
 /// How a new key counts in the quota of its owner.
