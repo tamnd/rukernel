@@ -130,6 +130,12 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// Tells if `writev` gives all of its buffers to one `write`, as a file of Linux that copies
+    /// the whole `iov_iter` in its `write_iter`. `/dev/kmsg` makes one record of each `writev`.
+    fn gathers_writev(&self) -> bool {
+        false
+    }
+
     /// Moves the position for `lseek`, for a file that gives its own meaning to the position, as
     /// `/dev/kmsg`. `None` uses the `lseek` of the VFS.
     fn llseek(&self, _file: &File, _offset: i64, _whence: Whence) -> Option<Result<u64>> {
