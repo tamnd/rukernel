@@ -32,9 +32,10 @@ use rk_vfs::fstype::FsType;
 pub const FS_TYPE: FsType = FsType { name: "proc", nodev: true, make: mount };
 
 /// Makes the root of a mount of procfs. procfs takes no options yet, so `data` has no effect.
+/// The mount shows the PID namespace of the caller, as `proc_fill_super` of Linux.
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn mount(_args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
-    Ok(kernel::root())
+    Ok(kernel::root(rk_proc::current_thread().and_then(|t| t.process().pid_ns().cloned())))
 }
 
 /// A host build has no processes, so it has no procfs.

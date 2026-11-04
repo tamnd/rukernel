@@ -565,6 +565,10 @@ pub struct Status {
     pub cred: Cred,
     /// The thread has no_new_privs.
     pub no_new_privs: bool,
+    /// The IDs of the lines `NStgid`, `NSpid`, `NSpgid` and `NSsid`, one for each PID namespace
+    /// from the namespace of the mount down to the namespace of the process. An empty list gives
+    /// the single ID of `Stat` or of `tid`.
+    pub ns_ids: [Vec<u32>; 4],
 }
 
 /// The sizes of the kinds of memory of a process in bytes, as `task_mem` of Linux.
@@ -596,6 +600,13 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
     let c = &x.cred;
     let groups: Vec<String> = c.groups.iter().map(|g| format!("{g}")).collect();
     let groups = groups.join(" ");
+    let ns_list = |ids: &Vec<u32>, one: u32| {
+        if ids.is_empty() {
+            return format!("{one}");
+        }
+        let ids: Vec<String> = ids.iter().map(|id| format!("{id}")).collect();
+        ids.join("\t")
+    };
     let text = format!(
         "\nUmask:\t{:04o}\nState:\t{}\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n\
          Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nFDSize:\t64\nGroups:\t{}\nNStgid:\t{}\nNSpid:\t{}\n\
@@ -625,10 +636,10 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         c.sgid,
         c.fsgid,
         groups,
-        s.pid,
-        x.tid,
-        s.pgid,
-        s.sid,
+        ns_list(&x.ns_ids[0], s.pid),
+        ns_list(&x.ns_ids[1], x.tid),
+        ns_list(&x.ns_ids[2], s.pgid),
+        ns_list(&x.ns_ids[3], s.sid),
         x.locked / 1024,
         m.rss_anon / 1024,
         m.rss_file / 1024,

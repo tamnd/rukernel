@@ -3323,6 +3323,58 @@ static void test_pid_ns(void)
 		_exit(getpid() == 1 && getppid() == 0 ? 0 : 1);
 	check("clone with CLONE_NEWPID gives the child the ID 1 in its namespace",
 	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	/* A procfs that the child mounts shows its namespace, and the parent sees the ID of the
+	 * child in each namespace. */
+	int sync[2] = {-1, -1};
+	if (pipe(sync) != 0)
+		sync[0] = sync[1] = -1;
+	pid = syscall(SYS_clone, CLONE_NEWPID | CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0);
+	if (pid == 0) {
+		char buf[512], c;
+		int code = 0, fd, others = 0;
+		ssize_t n = -1;
+		struct dirent *e;
+		DIR *d;
+		mkdir("/pidns-proc", 0755);
+		if (read(sync[0], &c, 1) != 1)
+			_exit(1);
+		if (mount("proc", "/pidns-proc", "proc", 0, NULL) != 0)
+			_exit(100 + errno);
+		n = readlink("/pidns-proc/self", buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = 0;
+		if (strcmp(buf, "1") != 0)
+			code = 2;
+		fd = open("/pidns-proc/self/status", O_RDONLY);
+		n = fd >= 0 ? read(fd, buf, sizeof(buf) - 1) : -1;
+		buf[n > 0 ? n : 0] = 0;
+		if (!code && (!strstr(buf, "\nPid:\t1\n") || !strstr(buf, "\nNSpid:\t1\n") ||
+			      !strstr(buf, "\nPPid:\t0\n")))
+			code = 3;
+		d = opendir("/pidns-proc");
+		while (d && (e = readdir(d)))
+			if (e->d_name[0] >= '0' && e->d_name[0] <= '9' && strcmp(e->d_name, "1") != 0)
+				others++;
+		if (!code && (!d || others != 0))
+			code = 4;
+		_exit(code);
+	}
+	char want[64], got[1024] = {0};
+	snprintf(want, sizeof(want), "/proc/%d/status", pid);
+	int sfd = pid > 0 ? open(want, O_RDONLY) : -1;
+	ssize_t sn = sfd >= 0 ? read(sfd, got, sizeof(got) - 1) : -1;
+	got[sn > 0 ? sn : 0] = 0;
+	snprintf(want, sizeof(want), "\nNSpid:\t%d\t1\n", pid);
+	int seen = strstr(got, want) != NULL;
+	if (sfd >= 0)
+		close(sfd);
+	write(sync[1], "x", 1);
+	status = -1;
+	check("procfs in a PID namespace shows only its processes, and status gives the ID in each one",
+	      pid > 0 && seen && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (!seen || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: procfs PID namespace seen %d status %d\n", seen, WEXITSTATUS(status));
+	close(sync[0]);
+	close(sync[1]);
 	pid = fork();
 	if (pid == 0) {
 		int self = open("/proc/self/ns/pid", O_RDONLY), in[2], out[2], code = 0;
