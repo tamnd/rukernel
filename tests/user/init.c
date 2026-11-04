@@ -10372,6 +10372,453 @@ static void test_inet_protos(void)
 	close(s);
 }
 
+
+/* The protocol NETLINK_NETFILTER with the subsystem nf_tables, as net/netfilter/nfnetlink.c and
+ * net/netfilter/nf_tables_api.c of Linux: the values of <linux/netfilter/nfnetlink.h> and
+ * <linux/netfilter/nf_tables.h>. The images have no nft, so the test makes the messages. */
+#define RK_NETLINK_NETFILTER 12
+#define RK_NFNL_SUBSYS_NFTABLES 10
+#define RK_NFNL_MSG_BATCH_BEGIN 0x10
+#define RK_NFNL_MSG_BATCH_END 0x11
+#define RK_NFNL_BATCH_GENID 1
+#define RK_NFNLGRP_NFTABLES 7
+#define RK_NFT_MSG_NEWTABLE 0
+#define RK_NFT_MSG_GETTABLE 1
+#define RK_NFT_MSG_DELTABLE 2
+#define RK_NFT_MSG_NEWCHAIN 3
+#define RK_NFT_MSG_GETCHAIN 4
+#define RK_NFT_MSG_NEWRULE 6
+#define RK_NFT_MSG_GETRULE 7
+#define RK_NFT_MSG_NEWSET 9
+#define RK_NFT_MSG_NEWSETELEM 12
+#define RK_NFT_MSG_GETSETELEM 13
+#define RK_NFT_MSG_NEWGEN 15
+#define RK_NFT_MSG_GETGEN 16
+#define RK_NFT_MSG_DESTROYTABLE 26
+#define RK_NFTA_TABLE_NAME 1
+#define RK_NFTA_TABLE_FLAGS 2
+#define RK_NFTA_TABLE_USE 3
+#define RK_NFT_TABLE_F_OWNER 2
+#define RK_NFTA_CHAIN_TABLE 1
+#define RK_NFTA_CHAIN_NAME 3
+#define RK_NFTA_CHAIN_HOOK 4
+#define RK_NFTA_CHAIN_POLICY 5
+#define RK_NFTA_CHAIN_USE 6
+#define RK_NFTA_CHAIN_TYPE 7
+#define RK_NFTA_HOOK_HOOKNUM 1
+#define RK_NFTA_HOOK_PRIORITY 2
+#define RK_NFTA_RULE_TABLE 1
+#define RK_NFTA_RULE_CHAIN 2
+#define RK_NFTA_RULE_HANDLE 3
+#define RK_NFTA_RULE_EXPRESSIONS 4
+#define RK_NFTA_LIST_ELEM 1
+#define RK_NFTA_EXPR_NAME 1
+#define RK_NFTA_SET_TABLE 1
+#define RK_NFTA_SET_NAME 2
+#define RK_NFTA_SET_KEY_LEN 5
+#define RK_NFTA_SET_DESC 9
+#define RK_NFTA_SET_ID 10
+#define RK_NFTA_SET_DESC_SIZE 1
+#define RK_NFTA_SET_ELEM_LIST_TABLE 1
+#define RK_NFTA_SET_ELEM_LIST_SET 2
+#define RK_NFTA_SET_ELEM_LIST_ELEMENTS 3
+#define RK_NFTA_SET_ELEM_KEY 1
+#define RK_NFTA_DATA_VALUE 1
+#define RK_NFTA_GEN_ID 1
+#define RK_NF_INET_LOCAL_OUT 3
+#define RK_ERESTART 85
+#define RK_NF_DROP 0
+#define RK_NF_ACCEPT 1
+
+/* A batch of nf_tables messages. `cur` is the message that gets the attributes. */
+struct nft_batch {
+	char buf[4096];
+	int len;
+	struct nlmsghdr *cur;
+};
+
+/* Ends the current message of the batch b. */
+static void nft_close(struct nft_batch *b)
+{
+	if (b->cur)
+		b->len += NLMSG_ALIGN(b->cur->nlmsg_len);
+	b->cur = NULL;
+}
+
+/* Starts the message `type` with `flags` and struct nfgenmsg of `family` and `res_id`. */
+static struct nlmsghdr *nft_start(struct nft_batch *b, int type, int flags, int family, int res_id)
+{
+	nft_close(b);
+	struct nlmsghdr *m = (struct nlmsghdr *)(b->buf + b->len);
+	memset(m, 0, NLMSG_LENGTH(4));
+	m->nlmsg_len = NLMSG_LENGTH(4);
+	m->nlmsg_type = type;
+	m->nlmsg_flags = NLM_F_REQUEST | flags;
+	m->nlmsg_seq = b->len + 1;
+	unsigned char *g = NLMSG_DATA(m);
+	g[0] = family;
+	g[2] = res_id >> 8;
+	g[3] = res_id;
+	b->cur = m;
+	return m;
+}
+
+/* Starts a batch: NFNL_MSG_BATCH_BEGIN, with the generation `genid` if it is not 0. */
+static void nft_begin(struct nft_batch *b, unsigned int genid)
+{
+	b->len = 0;
+	b->cur = NULL;
+	struct nlmsghdr *m =
+		nft_start(b, RK_NFNL_MSG_BATCH_BEGIN, 0, AF_UNSPEC, RK_NFNL_SUBSYS_NFTABLES);
+	if (genid) {
+		unsigned int v = htonl(genid);
+		nl_put(m, RK_NFNL_BATCH_GENID, &v, 4);
+	}
+}
+
+/* Starts the nf_tables message `msg` of the family `family` in the batch b. */
+static struct nlmsghdr *nft_msg(struct nft_batch *b, int msg, int flags, int family)
+{
+	return nft_start(b, RK_NFNL_SUBSYS_NFTABLES << 8 | msg, flags, family, 0);
+}
+
+static void nft_str(struct nft_batch *b, int type, const char *s)
+{
+	nl_put(b->cur, type, s, strlen(s) + 1);
+}
+
+static void nft_be32(struct nft_batch *b, int type, unsigned int v)
+{
+	v = htonl(v);
+	nl_put(b->cur, type, &v, 4);
+}
+
+/* Sends the batch b on fd, with NFNL_MSG_BATCH_END if `end` is set, and reads the acks. Gives
+ * the first error, or 0. */
+static int nft_send(int fd, struct nft_batch *b, int end)
+{
+	if (end)
+		nft_start(b, RK_NFNL_MSG_BATCH_END, 0, AF_UNSPEC, RK_NFNL_SUBSYS_NFTABLES);
+	nft_close(b);
+	if (send(fd, b->buf, b->len, 0) != b->len)
+		return -EPROTO;
+	char buf[4096];
+	int err = 0;
+	long n;
+	while ((n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT)) > 0)
+		for (struct nlmsghdr *r = (struct nlmsghdr *)buf; NLMSG_OK(r, n); r = NLMSG_NEXT(r, n))
+			if (r->nlmsg_type == NLMSG_ERROR && !err)
+				err = ((struct nlmsgerr *)NLMSG_DATA(r))->error;
+	return err;
+}
+
+/* Gives the attribute `type` of the nf_tables message r, or NULL. */
+static struct rtattr *nft_attr(struct nlmsghdr *r, int type)
+{
+	return genl_attr((struct rtattr *)((char *)NLMSG_DATA(r) + 4), r->nlmsg_len - NLMSG_LENGTH(4),
+			 type);
+}
+
+static unsigned int nft_attr_be32(struct nlmsghdr *r, int type)
+{
+	struct rtattr *a = nft_attr(r, type);
+	return a ? ntohl(*(unsigned int *)RTA_DATA(a)) : 0xffffffffu;
+}
+
+/* Sends the request in b alone (not in a batch) and reads the reply into buf. Gives the length,
+ * or a negative errno from an error message. */
+static long nft_get(int fd, struct nft_batch *b, char *buf, int size)
+{
+	nft_close(b);
+	if (send(fd, b->buf, b->len, 0) != b->len)
+		return -EPROTO;
+	long n = recv(fd, buf, size, 0);
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	if (n >= (long)NLMSG_LENGTH(sizeof(struct nlmsgerr)) && r->nlmsg_type == NLMSG_ERROR)
+		return ((struct nlmsgerr *)NLMSG_DATA(r))->error;
+	return n;
+}
+
+/* Gives the generation of nf_tables, as NFT_MSG_GETGEN. */
+static unsigned int nft_genid(int fd)
+{
+	struct nft_batch b = { .len = 0 };
+	char buf[512];
+	nft_msg(&b, RK_NFT_MSG_GETGEN, 0, AF_UNSPEC);
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	if (nft_get(fd, &b, buf, sizeof(buf)) <= 0 ||
+	    r->nlmsg_type != (RK_NFNL_SUBSYS_NFTABLES << 8 | RK_NFT_MSG_NEWGEN))
+		return 0;
+	return nft_attr_be32(r, RK_NFTA_GEN_ID);
+}
+
+/* Gets the table `name` of the family ip into buf. Gives the length, or a negative errno. */
+static long nft_gettable(int fd, const char *name, char *buf, int size)
+{
+	struct nft_batch b = { .len = 0 };
+	nft_msg(&b, RK_NFT_MSG_GETTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, name);
+	return nft_get(fd, &b, buf, size);
+}
+
+/* Counts the messages of a dump of `msg` of the family ip until NLMSG_DONE. A table name that is
+ * not NULL limits the dump of the rules. Gives -1 if the dump does not end well. */
+static int nft_dump_count(int fd, int msg, const char *table, const char *chain)
+{
+	struct nft_batch b = { .len = 0 };
+	nft_msg(&b, msg, NLM_F_DUMP, AF_INET);
+	if (table)
+		nft_str(&b, RK_NFTA_RULE_TABLE, table);
+	if (chain)
+		nft_str(&b, RK_NFTA_RULE_CHAIN, chain);
+	nft_close(&b);
+	if (send(fd, b.buf, b.len, 0) != b.len)
+		return -1;
+	char buf[8192];
+	int count = 0;
+	for (;;) {
+		long n = recv(fd, buf, sizeof(buf), 0);
+		if (n <= 0)
+			return -1;
+		for (struct nlmsghdr *r = (struct nlmsghdr *)buf; NLMSG_OK(r, n); r = NLMSG_NEXT(r, n)) {
+			if (r->nlmsg_type == NLMSG_DONE)
+				return count;
+			if (r->nlmsg_type != (RK_NFNL_SUBSYS_NFTABLES << 8 | (msg - 1)) ||
+			    !(r->nlmsg_flags & NLM_F_MULTI))
+				return -1;
+			count++;
+		}
+	}
+}
+
+/* Adds the base chain `name` of the hook LOCAL_OUT with the policy `policy` to the table rkt. */
+static void nft_outchain(struct nft_batch *b, const char *name, unsigned int policy)
+{
+	nft_msg(b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(b, RK_NFTA_CHAIN_TABLE, "rkt");
+	nft_str(b, RK_NFTA_CHAIN_NAME, name);
+	struct rtattr *h = nl_put(b->cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b->cur, h);
+	nft_str(b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(b, RK_NFTA_CHAIN_POLICY, policy);
+}
+
+/* Adds the element `key` to the set s of the table rkt. */
+static void nft_elem(struct nft_batch *b, int msg, unsigned int key)
+{
+	nft_msg(b, msg, NLM_F_CREATE, AF_INET);
+	nft_str(b, RK_NFTA_SET_ELEM_LIST_TABLE, "rkt");
+	nft_str(b, RK_NFTA_SET_ELEM_LIST_SET, "s");
+	struct rtattr *l = nl_put(b->cur, RK_NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED, NULL, 0);
+	struct rtattr *e = nl_put(b->cur, RK_NFTA_LIST_ELEM | NLA_F_NESTED, NULL, 0);
+	struct rtattr *k = nl_put(b->cur, RK_NFTA_SET_ELEM_KEY | NLA_F_NESTED, NULL, 0);
+	nl_put(b->cur, RK_NFTA_DATA_VALUE, &key, 4);
+	nl_end(b->cur, k);
+	nl_end(b->cur, e);
+	nl_end(b->cur, l);
+}
+
+/* Sends one UDP datagram from a new socket of `family` to the loopback address. Gives 0, or the
+ * errno of sendto. */
+static int nft_udp_send(int family)
+{
+	int s = socket(family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_in a4 = { .sin_family = AF_INET, .sin_port = htons(9) };
+	struct sockaddr_in6 a6 = { .sin6_family = AF_INET6, .sin6_port = htons(9) };
+	a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	a6.sin6_addr = in6addr_loopback;
+	errno = 0;
+	long n = family == AF_INET ? sendto(s, "x", 1, 0, (struct sockaddr *)&a4, sizeof(a4))
+				   : sendto(s, "x", 1, 0, (struct sockaddr *)&a6, sizeof(a6));
+	int err = n == 1 ? 0 : errno;
+	close(s);
+	return err;
+}
+
+/* The objects of nf_tables and their batches, as `nft add table`, `nft add chain`, `nft add
+ * rule`, `nft add set`, `nft add element` and `nft list ruleset`. */
+static void test_nftables(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	check("nft: socket of NETLINK_NETFILTER", fd >= 0);
+	if (fd < 0)
+		return;
+	int mon = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	/* A socket with the port ID 0 gets no multicast, so the monitor binds, as libmnl. */
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	bind(mon, (struct sockaddr *)&sa, sizeof(sa));
+	int g = RK_NFNLGRP_NFTABLES;
+	check("nft: a socket joins the group NFNLGRP_NFTABLES",
+	      setsockopt(mon, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &g, sizeof(g)) == 0);
+	static struct nft_batch b;
+	char buf[2048];
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	unsigned int gen = nft_genid(fd);
+	check("nft: NFT_MSG_GETGEN gives a generation", gen != 0);
+
+	nft_begin(&b, gen);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt");
+	nft_outchain(&b, "out", RK_NF_ACCEPT);
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "sub");
+	nft_msg(&b, RK_NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, AF_INET);
+	nft_str(&b, RK_NFTA_RULE_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_RULE_CHAIN, "sub");
+	nft_msg(&b, RK_NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, AF_INET);
+	nft_str(&b, RK_NFTA_RULE_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_RULE_CHAIN, "sub");
+	nft_msg(&b, RK_NFT_MSG_NEWSET, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_SET_NAME, "s");
+	nft_be32(&b, RK_NFTA_SET_KEY_LEN, 4);
+	nft_be32(&b, RK_NFTA_SET_ID, 1);
+	struct rtattr *d = nl_put(b.cur, RK_NFTA_SET_DESC | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_SET_DESC_SIZE, 2);
+	nl_end(b.cur, d);
+	nft_elem(&b, RK_NFT_MSG_NEWSETELEM, htonl(0x0a000001));
+	check("nft: a batch adds a table, two chains, two rules, a set and an element",
+	      nft_send(fd, &b, 1) == 0);
+	check("nft: the commit makes a new generation", nft_genid(fd) == gen + 1);
+
+	int newtable = 0, newgen = 0, events = 0;
+	long n;
+	while ((n = recv(mon, buf, sizeof(buf), MSG_DONTWAIT)) > 0)
+		for (struct nlmsghdr *e = r; NLMSG_OK(e, n); e = NLMSG_NEXT(e, n), events++) {
+			int t = e->nlmsg_type & 0xff;
+			if (t == RK_NFT_MSG_NEWTABLE && events == 0)
+				newtable = 1;
+			if (t == RK_NFT_MSG_NEWGEN && nft_attr_be32(e, RK_NFTA_GEN_ID) == gen + 1)
+				newgen = 1;
+		}
+	check("nft: the group gets the seven changes and NFT_MSG_NEWGEN",
+	      newtable && newgen && events == 8);
+
+	check("nft: NFT_MSG_GETTABLE gives the table with 3 objects",
+	      nft_gettable(fd, "rkt", buf, sizeof(buf)) > 0 &&
+		      r->nlmsg_type == (RK_NFNL_SUBSYS_NFTABLES << 8 | RK_NFT_MSG_NEWTABLE) &&
+		      nft_attr_be32(r, RK_NFTA_TABLE_USE) == 3);
+	b.len = 0;
+	b.cur = NULL;
+	nft_msg(&b, RK_NFT_MSG_GETCHAIN, 0, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "out");
+	check("nft: NFT_MSG_GETCHAIN gives the base chain with its hook and policy",
+	      nft_get(fd, &b, buf, sizeof(buf)) > 0 &&
+		      r->nlmsg_type == (RK_NFNL_SUBSYS_NFTABLES << 8 | RK_NFT_MSG_NEWCHAIN) &&
+		      nft_attr(r, RK_NFTA_CHAIN_HOOK) &&
+		      nft_attr_be32(r, RK_NFTA_CHAIN_POLICY) == RK_NF_ACCEPT &&
+		      nft_attr_be32(r, RK_NFTA_CHAIN_USE) == 0);
+	check("nft: the dump of the chains has 2 chains",
+	      nft_dump_count(fd, RK_NFT_MSG_GETCHAIN, NULL, NULL) == 2);
+	check("nft: the dump of the rules of rkt sub has 2 rules",
+	      nft_dump_count(fd, RK_NFT_MSG_GETRULE, "rkt", "sub") == 2);
+	check("nft: the dump of the rules of rkt out has no rules",
+	      nft_dump_count(fd, RK_NFT_MSG_GETRULE, "rkt", "out") == 0);
+
+	b.len = 0;
+	b.cur = NULL;
+	nft_elem(&b, RK_NFT_MSG_GETSETELEM, htonl(0x0a000001));
+	check("nft: NFT_MSG_GETSETELEM finds the element",
+	      nft_get(fd, &b, buf, sizeof(buf)) > 0 &&
+		      r->nlmsg_type == (RK_NFNL_SUBSYS_NFTABLES << 8 | RK_NFT_MSG_NEWSETELEM));
+	b.len = 0;
+	b.cur = NULL;
+	nft_elem(&b, RK_NFT_MSG_GETSETELEM, htonl(0x0a000002));
+	check("nft: NFT_MSG_GETSETELEM of another key gives ENOENT",
+	      nft_get(fd, &b, buf, sizeof(buf)) == -ENOENT);
+
+	gen = nft_genid(fd);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_EXCL, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt");
+	check("nft: NLM_F_EXCL on a table that is there gives EEXIST",
+	      nft_send(fd, &b, 1) == -EEXIST);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "c2");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "nope");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "c3");
+	check("nft: a chain in a table that is not there gives ENOENT",
+	      nft_send(fd, &b, 1) == -ENOENT);
+	check("nft: the abort drops the chain of the same batch",
+	      nft_dump_count(fd, RK_NFT_MSG_GETCHAIN, NULL, NULL) == 2);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt2");
+	check("nft: a batch without NFNL_MSG_BATCH_END gives no error", nft_send(fd, &b, 0) == 0);
+	check("nft: a batch without NFNL_MSG_BATCH_END changes nothing",
+	      nft_gettable(fd, "rkt2", buf, sizeof(buf)) == -ENOENT && nft_genid(fd) == gen);
+	nft_begin(&b, gen + 5);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt2");
+	check("nft: a batch of an old generation gives ERESTART",
+	      nft_send(fd, &b, 1) == -RK_ERESTART);
+	nft_begin(&b, 0);
+	nft_elem(&b, RK_NFT_MSG_NEWSETELEM, htonl(0x0a000002));
+	nft_elem(&b, RK_NFT_MSG_NEWSETELEM, htonl(0x0a000003));
+	check("nft: an element past the size of the set gives ENFILE",
+	      nft_send(fd, &b, 1) == -ENFILE);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, AF_INET);
+	nft_str(&b, RK_NFTA_RULE_TABLE, "rkt");
+	nft_str(&b, RK_NFTA_RULE_CHAIN, "sub");
+	struct rtattr *x = nl_put(b.cur, RK_NFTA_RULE_EXPRESSIONS | NLA_F_NESTED, NULL, 0);
+	struct rtattr *e = nl_put(b.cur, RK_NFTA_LIST_ELEM | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_EXPR_NAME, "rkx", 4);
+	nl_end(b.cur, e);
+	nl_end(b.cur, x);
+	check("nft: an expression that is not known gives ENOENT", nft_send(fd, &b, 1) == -ENOENT);
+	b.len = 0;
+	b.cur = NULL;
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE | NLM_F_ACK, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt2");
+	check("nft: a change out of a batch gives EINVAL",
+	      nft_get(fd, &b, buf, sizeof(buf)) == -EINVAL);
+	check("nft: the generation did not change", nft_genid(fd) == gen);
+
+	check("nft: the chain with the policy accept lets UDP go out", nft_udp_send(AF_INET) == 0);
+	nft_begin(&b, 0);
+	nft_outchain(&b, "out", RK_NF_DROP);
+	check("nft: the policy of a base chain changes to drop", nft_send(fd, &b, 1) == 0);
+	check("nft: the policy drop of LOCAL_OUT gives EPERM to sendto",
+	      nft_udp_send(AF_INET) == EPERM);
+	check("nft: a table of the family ip does not drop IPv6", nft_udp_send(AF_INET6) == 0);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt");
+	nft_msg(&b, RK_NFT_MSG_DESTROYTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkt");
+	check("nft: NFT_MSG_DELTABLE removes the table, and NFT_MSG_DESTROYTABLE ignores ENOENT",
+	      nft_send(fd, &b, 1) == 0);
+	check("nft: the table is gone", nft_gettable(fd, "rkt", buf, sizeof(buf)) == -ENOENT);
+	check("nft: UDP goes out after the table is gone", nft_udp_send(AF_INET) == 0);
+
+	int own = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkown");
+	nft_be32(&b, RK_NFTA_TABLE_FLAGS, RK_NFT_TABLE_F_OWNER);
+	check("nft: a socket makes a table with NFT_TABLE_F_OWNER", nft_send(own, &b, 1) == 0);
+	check("nft: another socket reads the table", nft_gettable(fd, "rkown", buf, sizeof(buf)) > 0);
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkown");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "c");
+	check("nft: another socket gets EPERM for a change of the table",
+	      nft_send(fd, &b, 1) == -EPERM);
+	close(own);
+	check("nft: the table of the owner goes when its socket closes",
+	      nft_gettable(fd, "rkown", buf, sizeof(buf)) == -ENOENT);
+	close(mon);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -10388,6 +10835,7 @@ static void test_inet(int port)
 	test_veth();
 	test_nexthop();
 	test_genl();
+	test_nftables();
 	test_ethtool();
 	test_linkprop();
 	test_slip();
