@@ -5209,6 +5209,93 @@ static long bpf_elem(int cmd, int fd, const void *key, void *value, unsigned lon
 	return bpf_call(cmd, attr, cmd == 3 ? 16 : cmd == 4 ? 24 : 32);
 }
 
+#ifndef SO_ATTACH_BPF
+#define SO_ATTACH_BPF 50
+#endif
+
+/* One eBPF instruction: the opcode, the registers, the offset and the immediate. */
+static unsigned long long bpf_insn(unsigned code, unsigned dst, unsigned src, int off, int imm)
+{
+	return code | dst << 8 | src << 12 | (unsigned long long)(unsigned short)off << 16 |
+	       (unsigned long long)(unsigned)imm << 32;
+}
+
+/* BPF_PROG_LOAD of a socket filter with a log of level 1. */
+static int bpf_prog_new(const unsigned long long *insns, unsigned n, char *log, unsigned size)
+{
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, 1);
+	bpf_put32(attr, 4, n);
+	bpf_put64(attr, 8, (unsigned long)insns);
+	bpf_put64(attr, 16, (unsigned long)"GPL");
+	bpf_put32(attr, 24, log ? 1 : 0);
+	bpf_put32(attr, 28, size);
+	bpf_put64(attr, 32, (unsigned long)log);
+	return bpf_call(5, attr, sizeof(attr));
+}
+
+/*
+ * BPF_PROG_LOAD, the verifier and SO_ATTACH_BPF, as bpf_prog01 of LTP does it: the program adds
+ * 1 to the value of key 0 of an array map for each datagram, and drops the datagram (#537).
+ */
+static void test_bpf_prog(void)
+{
+	static char log[4096];
+	unsigned int index = 0;
+	unsigned long long val = 0;
+	char buf[512];
+	int map, prog, sk[2], ok;
+
+	map = bpf_map_new(2, 4, 8, 1, 0);
+	unsigned long long insns[] = {
+		bpf_insn(0x18, 1, 1, 0, map), 0,	/* r1 = the map */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -8),		/* r2 += -8 */
+		bpf_insn(0x7a, 2, 0, 0, 0),		/* *(u64 *)r2 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 1),		/* r0 = map_lookup_elem(r1, r2) */
+		bpf_insn(0x15, 0, 0, 2, 0),		/* if r0 == 0 goto exit */
+		bpf_insn(0xb7, 1, 0, 0, 1),		/* r1 = 1 */
+		bpf_insn(0xdb, 0, 1, 0, 0),		/* lock *(u64 *)r0 += r1 */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	prog = bpf_prog_new(insns, 11, log, sizeof(log));
+	check("BPF_PROG_LOAD loads a socket filter", map >= 0 && prog >= 0);
+	check("the log of the verifier has the count of instructions",
+	      strstr(log, "processed ") != NULL);
+	snprintf(buf, 64, "/proc/self/fdinfo/%d", prog);
+	ok = read_file(buf, buf, sizeof(buf)) > 0 && strstr(buf, "prog_type:\t1\n") &&
+	     strstr(buf, "prog_jited:\t0\n");
+	check("the fdinfo of a program has its type", ok);
+	ok = socketpair(AF_UNIX, SOCK_DGRAM, 0, sk) == 0 &&
+	     setsockopt(sk[1], SOL_SOCKET, SO_ATTACH_BPF, &prog, sizeof(prog)) == 0;
+	ok = ok && write(sk[0], "x", 1) == 1 && write(sk[0], "y", 1) == 1;
+	ok = ok && bpf_elem(1, map, &index, &val, 0) == 0 && val == 2;
+	check("SO_ATTACH_BPF runs the program for each datagram", ok);
+	ok = recv(sk[1], buf, sizeof(buf), MSG_DONTWAIT) == -1 && errno == EAGAIN;
+	check("a socket filter that gives 0 drops the datagram", ok);
+	close(sk[0]);
+	close(sk[1]);
+	close(prog);
+
+	/* A store through the result of the lookup without the NULL check. */
+	insns[6] = bpf_insn(0xb7, 3, 0, 0, 0);
+	errno = 0;
+	ok = bpf_prog_new(insns, 11, log, sizeof(log)) == -1 && errno == EACCES &&
+	     strstr(log, "R0 invalid mem access 'map_value_or_null'");
+	check("the verifier refuses a map value that can be NULL", ok);
+	errno = 0;
+	ok = bpf_prog_new(insns, 11, log, 16) == -1 && errno == ENOSPC && strlen(log) == 15;
+	check("a log that does not fit gives ENOSPC", ok);
+	insns[10] = bpf_insn(0x05, 0, 0, -1, 0);
+	errno = 0;
+	ok = bpf_prog_new(insns, 11, log, sizeof(log)) == -1 && errno == EINVAL &&
+	     strstr(log, "back-edge from insn 10 to 10");
+	check("the verifier refuses a loop", ok);
+	close(map);
+}
+
 /*
  * The maps of bpf(2): hash, array, per CPU array and LPM trie, the size rules of union
  * bpf_attr, the fdinfo of a map and the sysctl kernel.unprivileged_bpf_disabled (#537).
@@ -5316,6 +5403,7 @@ static void test_bpf(void)
 	ok = ok && bpf_elem(1, fd, k32, &v, 0) == -1 && errno == ENOENT;
 	check("an LPM trie finds the longest prefix", ok);
 	close(fd);
+	test_bpf_prog();
 	umount("/proc");
 }
 

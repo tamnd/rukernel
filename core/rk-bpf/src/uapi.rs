@@ -38,6 +38,8 @@ pub mod map_type {
     pub const BPF_MAP_TYPE_LRU_PERCPU_HASH: u32 = 10;
     /// A trie that finds the longest prefix that matches a key.
     pub const BPF_MAP_TYPE_LPM_TRIE: u32 = 11;
+    /// A ring buffer that programs write and a process reads.
+    pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
     /// The last map type of Linux 7.3, `BPF_MAP_TYPE_RHASH`.
     pub const LAST: u32 = 34;
 }

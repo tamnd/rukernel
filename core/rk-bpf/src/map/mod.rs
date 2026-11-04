@@ -152,6 +152,7 @@ pub fn bpf_map_type_known(map_type: u32) -> bool {
             | BPF_MAP_TYPE_ARRAY
             | BPF_MAP_TYPE_PERCPU_ARRAY
             | BPF_MAP_TYPE_LPM_TRIE
+            | BPF_MAP_TYPE_RINGBUF
     )
 }
 
@@ -161,6 +162,9 @@ pub fn map_alloc_check(attr: &MapAttr) -> Result<()> {
         BPF_MAP_TYPE_HASH | BPF_MAP_TYPE_PERCPU_HASH => hashtab::htab_map_alloc_check(attr),
         BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY => arraymap::array_map_alloc_check(attr),
         // The trie has no `map_alloc_check`: `trie_alloc` checks the attributes.
+        // `ringbuf_map_alloc` checks the attributes of a ring buffer. rukernel does not have
+        // ring buffers yet, so the check of the capabilities comes first and then `map_alloc`
+        // gives `EINVAL`.
         _ => Ok(()),
     }
 }

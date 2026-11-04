@@ -10,13 +10,19 @@
 extern crate alloc;
 
 pub mod attr;
+pub mod core;
 pub mod file;
+pub mod helpers;
+pub mod insn;
 pub mod map;
+pub mod prog;
 pub mod syscall;
+pub mod tnum;
 pub mod uapi;
 pub mod value;
+pub mod verifier;
 
-use core::sync::atomic::AtomicU32;
+use ::core::sync::atomic::AtomicU32;
 
 /// The sysctl `kernel.unprivileged_bpf_disabled`, `sysctl_unprivileged_bpf_disabled` of Linux.
 /// With 0 a process without `CAP_BPF` can make maps. With 1 it cannot, and the value cannot
@@ -27,7 +33,7 @@ pub static UNPRIVILEGED_BPF_DISABLED: AtomicU32 = AtomicU32::new(2);
 /// Writes the sysctl `kernel.unprivileged_bpf_disabled`, as `bpf_unpriv_handler` in
 /// kernel/bpf/syscall.c of Linux. `admin` tells if the writer has `CAP_SYS_ADMIN`.
 pub fn bpf_unpriv_handler(value: i64, admin: bool) -> Result<(), rk_abi::Errno> {
-    use core::sync::atomic::Ordering;
+    use ::core::sync::atomic::Ordering;
     use rk_abi::Errno;
     if !admin {
         return Err(Errno::EPERM);

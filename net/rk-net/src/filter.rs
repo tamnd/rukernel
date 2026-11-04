@@ -397,6 +397,13 @@ fn random() -> u32 {
     s
 }
 
+/// An eBPF program of `SO_ATTACH_BPF`, `struct sk_filter` with a program of `bpf(2)` in Linux.
+/// The system call layer makes it from a program file.
+pub trait SkFilter: Send + Sync {
+    /// Runs the program on a packet and gives the number of bytes to keep. 0 drops the packet.
+    fn run(&self, data: &[u8]) -> u32;
+}
+
 /// The filter of a socket and its lock: `sk_filter` and `SOCK_FILTER_LOCKED` of Linux.
 #[derive(Debug, Default)]
 pub struct SocketFilter {

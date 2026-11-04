@@ -6,13 +6,17 @@
 
 use crate::UNPRIVILEGED_BPF_DISABLED;
 use crate::attr::{
-    BPF_ATTR_SIZE, BPF_COMMON_ATTR_SIZE, BpfAttr, bpf_check_uarg_tail_zero, last_field, map_create,
-    map_elem,
+    BPF_ATTR_SIZE, BPF_COMMON_ATTR_SIZE, BpfAttr, bpf_check_uarg_tail_zero, common, last_field,
+    map_create, map_elem, prog_load,
 };
 use crate::file::{BpfMapFile, bpf_map_of};
+use crate::insn::{BPF_COMPLEXITY_LIMIT_INSNS, BPF_MAXINSNS, INSN_SIZE, decode};
 use crate::map::{
     BpfMap, MapAttr, MapEnv, bpf_map_type_known, bpf_obj_name_cpy, map_alloc, map_alloc_check,
 };
+use crate::prog::prog_flags::*;
+use crate::prog::prog_type::*;
+use crate::prog::{BpfProg, BpfProgFile, bpf_prog_alloc_id, bpf_prog_calc_tag};
 use crate::uapi::CAP_BPF;
 use crate::uapi::cmd::*;
 use crate::uapi::elem::{BPF_F_CPU, BPF_F_LOCK};
@@ -20,6 +24,7 @@ use crate::uapi::flags::{
     BPF_F_NUMA_NODE, BPF_F_RDONLY, BPF_F_TOKEN_FD, BPF_F_WRONLY, BPF_F_ZERO_SEED,
 };
 use crate::uapi::map_type::*;
+use crate::verifier::{BPF_LOG_FIXED, BPF_LOG_MASK, BpfVerifierLog, VerifierOpts, bpf_check};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -32,6 +37,9 @@ pub type Result<T> = core::result::Result<T, Errno>;
 
 /// `CAP_SYS_ADMIN`.
 const CAP_SYS_ADMIN: u32 = 21;
+
+/// `CAP_PERFMON`.
+const CAP_PERFMON: u32 = 38;
 
 /// `BPF_MAP_TYPE_STRUCT_OPS`, `BPF_MAP_TYPE_BLOOM_FILTER`, `BPF_MAP_TYPE_ARENA` and
 /// `BPF_MAP_TYPE_RHASH`, which the checks of `map_create_alloc` name.
@@ -89,14 +97,26 @@ pub fn sys_bpf(
     let mut attr = BpfAttr::zeroed();
     copy_uarg(env, uattr, size, BPF_ATTR_SIZE, &mut attr.0)?;
     let mut cmd = cmd;
+    // `struct bpf_common_attr` has the log of the verifier. The map commands of rukernel do not
+    // write a log, so for them the attributes are only checked.
+    let mut common = BpfAttr::zeroed();
+    let mut size_common = size_common;
     if cmd & BPF_COMMON_ATTRS != 0 {
-        // `struct bpf_common_attr` has the log of the verifier. The map commands of rukernel do
-        // not write a log, so the attributes are only checked.
-        let mut common = [0u8; 24];
-        copy_uarg(env, uattr_common, size_common, BPF_COMMON_ATTR_SIZE, &mut common)?;
+        copy_uarg(env, uattr_common, size_common, BPF_COMMON_ATTR_SIZE, &mut common.0[..24])?;
         cmd &= !BPF_COMMON_ATTRS;
+    } else {
+        size_common = 0;
     }
     match cmd {
+        BPF_PROG_LOAD => {
+            let true_size_at = if size as usize >= prog_load::LOG_TRUE_SIZE + 4 {
+                Some(uattr + prog_load::LOG_TRUE_SIZE as u64)
+            } else {
+                None
+            };
+            let log = bpf_log_attr_init(&attr, true_size_at, &common, uattr_common, size_common)?;
+            bpf_prog_load(env, &attr, &log)
+        }
         BPF_MAP_CREATE => map_create(env, &attr),
         BPF_MAP_LOOKUP_ELEM => map_lookup_elem(env, &attr),
         BPF_MAP_UPDATE_ELEM => map_update_elem(env, &attr),
@@ -105,6 +125,224 @@ pub fn sys_bpf(
         BPF_MAP_FREEZE => map_freeze(env, &attr),
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// Where the verifier writes its log, `struct bpf_log_attr` of Linux.
+#[derive(Debug, Default)]
+struct BpfLogAttr {
+    /// The buffer of the program, or 0.
+    ubuf: u64,
+    /// The size of the buffer.
+    size: u32,
+    /// The log level.
+    level: u32,
+    /// The address of `log_true_size`, if the program gave it.
+    true_size_at: Option<u64>,
+}
+
+/// `bpf_verifier_log_attr_valid` of Linux.
+fn bpf_verifier_log_attr_valid(level: u32, ubuf: u64, size: u32) -> bool {
+    // The buffer and its size are both set or both not set.
+    if (ubuf == 0) != (size == 0) {
+        return false;
+    }
+    // A buffer needs a log level.
+    if ubuf != 0 && level == 0 {
+        return false;
+    }
+    if level & !BPF_LOG_MASK != 0 {
+        return false;
+    }
+    size <= u32::MAX >> 2
+}
+
+/// Finds the log of the verifier in `union bpf_attr` or in `struct bpf_common_attr`, as
+/// `bpf_log_attr_init` of Linux. When both have a log, they must be the same.
+fn bpf_log_attr_init(
+    attr: &BpfAttr,
+    true_size_at: Option<u64>,
+    common_attr: &BpfAttr,
+    uattr_common: u64,
+    size_common: u32,
+) -> Result<BpfLogAttr> {
+    let ubuf = attr.u64(prog_load::LOG_BUF);
+    let size = attr.u32(prog_load::LOG_SIZE);
+    let level = attr.u32(prog_load::LOG_LEVEL);
+    let ubuf_common = common_attr.u64(common::LOG_BUF);
+    let size_c = common_attr.u32(common::LOG_SIZE);
+    let level_c = common_attr.u32(common::LOG_LEVEL);
+    if !bpf_verifier_log_attr_valid(level_c, ubuf_common, size_c)
+        || !bpf_verifier_log_attr_valid(level, ubuf, size)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if ubuf != 0 && ubuf_common != 0 && (ubuf != ubuf_common || size != size_c || level != level_c)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if ubuf == 0 && ubuf_common != 0 {
+        let at = (size_common as usize >= common::LOG_TRUE_SIZE + 4)
+            .then(|| uattr_common + common::LOG_TRUE_SIZE as u64);
+        return Ok(BpfLogAttr {
+            ubuf: ubuf_common,
+            size: size_c,
+            level: level_c,
+            true_size_at: at,
+        });
+    }
+    Ok(BpfLogAttr { ubuf, size, level, true_size_at })
+}
+
+/// Copies the log to the buffer of the program and writes `log_true_size`, as
+/// `bpf_log_attr_finalize` and `bpf_vlog_finalize` of Linux. A log that does not fit gives
+/// `ENOSPC`. Without `BPF_LOG_FIXED` the buffer has the end of the log.
+fn bpf_log_attr_finalize(env: &dyn Env, attr: &BpfLogAttr, log: &BpfVerifierLog) -> Result<()> {
+    let text = log.text.as_bytes();
+    let true_size = if log.level == 0 || text.is_empty() { 0 } else { text.len() as u32 + 1 };
+    let mut err = Ok(());
+    if log.level != 0 && attr.ubuf != 0 {
+        let cap = attr.size as usize - 1;
+        let part = if text.len() <= cap {
+            text
+        } else if log.level & BPF_LOG_FIXED != 0 {
+            &text[..cap]
+        } else {
+            &text[text.len() - cap..]
+        };
+        let mut out = Vec::new();
+        out.try_reserve_exact(part.len() + 1).map_err(|_| Errno::ENOMEM)?;
+        out.extend_from_slice(part);
+        out.push(0);
+        if env.copy_to_user(attr.ubuf, &out).is_err() {
+            err = Err(Errno::EFAULT);
+        } else if true_size > attr.size {
+            err = Err(Errno::ENOSPC);
+        }
+    }
+    if let Some(at) = attr.true_size_at {
+        env.copy_to_user(at, &true_size.to_ne_bytes()).map_err(|_| Errno::EFAULT)?;
+    }
+    err
+}
+
+/// Copies a string of at most `max` bytes from the program, as `strncpy_from_user` of Linux.
+/// The copy stops at the first zero byte, so a short string at the end of the memory works.
+fn strncpy_from_user(env: &dyn Env, addr: u64, max: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = addr;
+    while out.len() < max {
+        // Do not read past the page of `at`.
+        let in_page = 4096 - (at % 4096) as usize;
+        let mut chunk = alloc::vec![0u8; in_page.min(max - out.len())];
+        env.copy_from_user(at, &mut chunk)?;
+        if let Some(n) = chunk.iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..n]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk);
+        at += chunk.len() as u64;
+    }
+    Ok(out)
+}
+
+/// `license_is_gpl_compatible` of Linux.
+fn license_is_gpl_compatible(license: &[u8]) -> bool {
+    matches!(
+        license,
+        b"GPL"
+            | b"GPL v2"
+            | b"GPL and additional rights"
+            | b"Dual BSD/GPL"
+            | b"Dual MIT/GPL"
+            | b"Dual MPL/GPL"
+    )
+}
+
+/// `BPF_PROG_LOAD`: `bpf_prog_load` of Linux.
+fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result<i64> {
+    use prog_load::*;
+    if attr.check_attr(last_field::BPF_PROG_LOAD) {
+        return Err(Errno::EINVAL);
+    }
+    let prog_flags = attr.u32(PROG_FLAGS);
+    let allowed = BPF_F_STRICT_ALIGNMENT
+        | BPF_F_ANY_ALIGNMENT
+        | BPF_F_TEST_STATE_FREQ
+        | BPF_F_SLEEPABLE
+        | BPF_F_TEST_RND_HI32
+        | BPF_F_XDP_HAS_FRAGS
+        | BPF_F_XDP_DEV_BOUND_ONLY
+        | BPF_F_TEST_REG_INVARIANTS
+        | BPF_F_TOKEN_FD;
+    if prog_flags & !allowed != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if prog_flags & BPF_F_TOKEN_FD != 0 {
+        return Err(no_object_fd(env, attr.u32(PROG_TOKEN_FD)));
+    }
+    let prog_type = attr.u32(PROG_TYPE);
+    let bpf_cap = bpf_capable(env);
+    if UNPRIVILEGED_BPF_DISABLED.load(Ordering::Relaxed) != 0 && !bpf_cap {
+        return Err(Errno::EPERM);
+    }
+    let insn_cnt = attr.u32(INSN_CNT);
+    let limit = if bpf_cap { BPF_COMPLEXITY_LIMIT_INSNS } else { BPF_MAXINSNS };
+    if insn_cnt == 0 || insn_cnt > limit {
+        return Err(Errno::E2BIG);
+    }
+    if prog_type != BPF_PROG_TYPE_SOCKET_FILTER && prog_type != BPF_PROG_TYPE_CGROUP_SKB && !bpf_cap
+    {
+        return Err(Errno::EPERM);
+    }
+    // rukernel has no BTF, so a program cannot name a function to attach to. A socket filter
+    // has no attach type, as `bpf_prog_load_check_attach` of Linux.
+    if attr.u32(ATTACH_PROG_FD) != 0 || attr.u32(ATTACH_BTF_ID) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(insn_cnt as usize * INSN_SIZE).map_err(|_| Errno::ENOMEM)?;
+    bytes.resize(insn_cnt as usize * INSN_SIZE, 0);
+    env.copy_from_user(attr.u64(INSNS), &mut bytes).map_err(|_| Errno::EFAULT)?;
+    let license = strncpy_from_user(env, attr.u64(LICENSE), 127).map_err(|_| Errno::EFAULT)?;
+    let gpl_compatible = license_is_gpl_compatible(&license);
+    if !crate::verifier::prog_type_known(prog_type) {
+        return Err(Errno::EINVAL);
+    }
+    // rukernel cannot give a program to a network device.
+    if attr.u32(PROG_IFINDEX) != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let name = bpf_obj_name_cpy(&attr.0[PROG_NAME..PROG_NAME + 16])?;
+
+    let mut log = BpfVerifierLog::new(log_attr.level);
+    let opts = VerifierOpts {
+        prog_type,
+        bpf_capable: bpf_cap,
+        allow_ptr_leaks: env.capable(CAP_PERFMON) || env.capable(CAP_SYS_ADMIN),
+    };
+    let map_by_fd = |fd: i32| -> Result<Arc<BpfMap>> {
+        let file = env.fdget(fd)?;
+        bpf_map_of(&file).ok_or(Errno::EINVAL)
+    };
+    let r = bpf_check(decode(&bytes), &opts, &map_by_fd, &mut log);
+    // The error of the log comes before the error of the verifier.
+    bpf_log_attr_finalize(env, log_attr, &log)?;
+    let v = r?;
+    let tag = bpf_prog_calc_tag(&v.insns);
+    let prog = BpfProg {
+        prog_type,
+        expected_attach_type: attr.u32(EXPECTED_ATTACH_TYPE),
+        insns: v.insns,
+        used_maps: v.used_maps,
+        id: bpf_prog_alloc_id(),
+        name,
+        tag,
+        gpl_compatible,
+        verified_insns: v.insn_processed,
+        run_cnt: core::sync::atomic::AtomicU64::new(0),
+    };
+    let file = File::with_ops(Arc::new(BpfProgFile { prog: Arc::new(prog) }), None, O_RDWR);
+    env.fd_install(file).map(i64::from)
 }
 
 /// The flags of the file of a new map, `bpf_get_file_flag` of Linux.
@@ -578,5 +816,81 @@ mod tests {
             env.call(BPF_MAP_LOOKUP_ELEM, &elem(fd, KEY, VAL, BPF_F_CPU | (2 << 32))),
             Err(Errno::ERANGE)
         );
+    }
+
+    /// The instructions of a program: the opcode, the registers, the offset and the immediate.
+    fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[0] = code;
+        b[1] = (src << 4) | dst;
+        b[2..4].copy_from_slice(&off.to_ne_bytes());
+        b[4..8].copy_from_slice(&imm.to_ne_bytes());
+        b
+    }
+
+    const INSNS: u64 = BASE + 0xa00;
+    const LICENSE: u64 = BASE + 0xbf0;
+    const LOG: u64 = BASE + 0xc00;
+
+    fn load(env: &FakeEnv, insns: &[[u8; 8]], log_size: u32) -> Result<i64> {
+        env.put(INSNS, &insns.concat());
+        env.put(LICENSE, b"GPL\0");
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(prog_load::PROG_TYPE, BPF_PROG_TYPE_SOCKET_FILTER);
+        a.set_u32(prog_load::INSN_CNT, insns.len() as u32);
+        a.set_u64(prog_load::INSNS, INSNS);
+        a.set_u64(prog_load::LICENSE, LICENSE);
+        if log_size != 0 {
+            a.set_u32(prog_load::LOG_LEVEL, 1);
+            a.set_u32(prog_load::LOG_SIZE, log_size);
+            a.set_u64(prog_load::LOG_BUF, LOG);
+        }
+        env.call(BPF_PROG_LOAD, &a)
+    }
+
+    fn log_text(env: &FakeEnv) -> alloc::string::String {
+        let b = env.get(LOG, 0x300);
+        let n = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        alloc::string::String::from_utf8_lossy(&b[..n]).into_owned()
+    }
+
+    #[test]
+    fn prog_load_checks_and_logs() {
+        let env = FakeEnv::new();
+        let map = env.call(BPF_MAP_CREATE, &create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, 0)).unwrap();
+        let good = [
+            insn(0x18, 1, 1, 0, map as i32),
+            insn(0, 0, 0, 0, 0),
+            insn(0xbf, 2, 10, 0, 0),
+            insn(0x07, 2, 0, 0, -8),
+            insn(0x7a, 2, 0, 0, 0),
+            insn(0x85, 0, 0, 0, 1),
+            insn(0x15, 0, 0, 2, 0),
+            insn(0xb7, 1, 0, 0, 1),
+            insn(0xdb, 0, 1, 0, 0),
+            insn(0xb7, 0, 0, 0, 0),
+            insn(0x95, 0, 0, 0, 0),
+        ];
+        let fd = load(&env, &good, 0x200).unwrap();
+        assert!(log_text(&env).starts_with("processed "));
+        let file = env.fdget(fd as i32).unwrap();
+        let prog = crate::prog::bpf_prog_of(&file).unwrap();
+        assert_eq!(prog.used_maps.len(), 1);
+
+        let mut bad = good;
+        bad[6] = insn(0xb7, 3, 0, 0, 0);
+        assert_eq!(load(&env, &bad, 0x200), Err(Errno::EACCES));
+        assert!(log_text(&env).contains("R0 invalid mem access 'map_value_or_null'"));
+        // A small log keeps the end of the text and gives ENOSPC.
+        assert_eq!(load(&env, &bad, 8), Err(Errno::ENOSPC));
+        assert_eq!(log_text(&env).len(), 7);
+        // A log buffer without a level gives EINVAL.
+        let mut a = BpfAttr::zeroed();
+        a.set_u32(prog_load::LOG_SIZE, 8);
+        a.set_u64(prog_load::LOG_BUF, LOG);
+        assert_eq!(env.call(BPF_PROG_LOAD, &a), Err(Errno::EINVAL));
+        assert_eq!(load(&env, &[], 0), Err(Errno::E2BIG));
+        env.caps.set(false);
+        assert_eq!(load(&env, &good, 0), Err(Errno::EPERM));
     }
 }
