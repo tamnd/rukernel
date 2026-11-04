@@ -11329,6 +11329,11 @@ static void test_nf_conntrack_sysctl(void)
 	check("conntrack: nf_conntrack_udp_timeout_stream is 120",
 	      nf_sysctl("nf_conntrack_udp_timeout_stream", text, sizeof(text)) > 0 &&
 		      strcmp(text, "120\n") == 0);
+	check("conntrack: nf_conntrack_tcp_timeout_established is 432000",
+	      nf_sysctl("nf_conntrack_tcp_timeout_established", text, sizeof(text)) > 0 &&
+		      strcmp(text, "432000\n") == 0);
+	check("conntrack: nf_conntrack_tcp_loose is 1",
+	      nf_sysctl("nf_conntrack_tcp_loose", text, sizeof(text)) > 0 && strcmp(text, "1\n") == 0);
 	check("conntrack: nf_conntrack_count is a number",
 	      nf_sysctl("nf_conntrack_count", text, sizeof(text)) > 0 && text[0] >= '0' &&
 		      text[0] <= '9');
