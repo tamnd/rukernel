@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.4] - 2026-11-04
+
 ### Added
 
 - `SO_ATTACH_FILTER`, `SO_DETACH_FILTER` and `SO_LOCK_FILTER` on netlink sockets, as `sk_filter` in `netlink_unicast` and `netlink_broadcast` of Linux. The classic BPF filter of the socket runs on each datagram before it goes in the queue, so the udev monitor of systemd can attach its filter to a `NETLINK_KOBJECT_UEVENT` socket (#539).
@@ -1335,6 +1337,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.4]: https://github.com/tamnd/rukernel/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/tamnd/rukernel/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/tamnd/rukernel/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/tamnd/rukernel/compare/v0.5.0...v0.5.1
