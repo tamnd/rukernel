@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- The cgroup programs of kernel/bpf/cgroup.c of Linux: `BPF_PROG_ATTACH`, `BPF_PROG_DETACH` and `BPF_PROG_QUERY` of bpf(2), and `BPF_LINK_CREATE` for a cgroup, with the flags `BPF_F_ALLOW_OVERRIDE`, `BPF_F_ALLOW_MULTI`, `BPF_F_REPLACE`, `BPF_F_BEFORE` and `BPF_F_AFTER` and the effective arrays of the ancestors. The verifier takes the program types `BPF_PROG_TYPE_CGROUP_SKB`, `BPF_PROG_TYPE_CGROUP_SOCK` and `BPF_PROG_TYPE_CGROUP_DEVICE` with their contexts and checks the return code. The rmdir of a cgroup detaches its programs. The kernel does not run the programs at the hooks yet (#537).
+
 ## [0.5.5] - 2026-11-04
 
 ### Added
@@ -15,7 +21,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `big_key` key type, as security/keys/big_key.c of Linux. A payload has from 1 byte to 1 MiB, a new key takes 16 bytes of the quota for it and an update takes its length, and `/proc/keys` shows the length with `[buff]` or `[file]` (#539).
 - `set_tid` of `clone3`, as `alloc_pid` in kernel/pid.c of Linux. The caller with `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` gives the IDs of the child, one for each level of PID namespace from the namespace of the child up. An ID in use gives `EEXIST`, and more IDs than levels, an ID out of the range, or an ID that is not 1 in a namespace without init give `EINVAL` (#536).
 - The IDs of the BPF objects and the BPF links of kernel/bpf/syscall.c of Linux: `BPF_PROG_GET_NEXT_ID`, `BPF_MAP_GET_NEXT_ID`, `BPF_LINK_GET_NEXT_ID`, `BPF_PROG_GET_FD_BY_ID`, `BPF_MAP_GET_FD_BY_ID`, `BPF_LINK_GET_FD_BY_ID` and `BPF_OBJ_GET_INFO_BY_FD` for maps, programs and links. A link is an anonymous file with `BPF_LINK_UPDATE` and `BPF_LINK_DETACH`, and bpffs can pin it. `BPF_LINK_CREATE` checks the program and the attach type, and gives `EINVAL` until the cgroup hooks come. The systemd boot test checks that sys-fs-bpf.mount is active (#537).
-- The cgroup programs of kernel/bpf/cgroup.c of Linux: `BPF_PROG_ATTACH`, `BPF_PROG_DETACH` and `BPF_PROG_QUERY` of bpf(2), and `BPF_LINK_CREATE` for a cgroup, with the flags `BPF_F_ALLOW_OVERRIDE`, `BPF_F_ALLOW_MULTI`, `BPF_F_REPLACE`, `BPF_F_BEFORE` and `BPF_F_AFTER` and the effective arrays of the ancestors. The verifier takes the program types `BPF_PROG_TYPE_CGROUP_SKB`, `BPF_PROG_TYPE_CGROUP_SOCK` and `BPF_PROG_TYPE_CGROUP_DEVICE` with their contexts and checks the return code. The rmdir of a cgroup detaches its programs. The kernel does not run the programs at the hooks yet (#537).
 
 ### Fixed
 
