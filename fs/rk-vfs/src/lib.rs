@@ -35,6 +35,7 @@ pub mod notify;
 pub mod nsfs;
 pub mod path;
 pub mod pipe;
+pub mod security;
 pub mod swap;
 pub mod uevent;
 pub mod uinput;

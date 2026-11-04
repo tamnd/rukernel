@@ -1,0 +1,570 @@
+//! The Linux Security Module framework, as security/security.c and security/lsm_init.c of Linux.
+//!
+//! An LSM implements some of the hooks of [`SecurityHooks`]. The kernel calls the functions of
+//! this module at the points where Linux calls `security_*`. Each function calls the hook of each
+//! active module in the order of the boot, and the first error stops the call, as `call_int_hook`
+//! of Linux.
+//!
+//! At boot, [`init`] makes the order of the modules from `lsm=` or the default list, as
+//! `lsm_order_parse` of Linux, and gives each module the offsets of its parts of the security
+//! blobs. The capability module is always the first module.
+
+pub mod blob;
+pub mod capability;
+pub mod hooks;
+#[cfg(test)]
+mod tests;
+
+pub use blob::{Blob, BlobSizes};
+pub use hooks::{HOOK_COUNT, HOOK_NAMES, SecurityHooks, hook_index};
+
+use crate::cred::Cred;
+use crate::dentry::Location;
+use crate::file::File;
+use crate::inode::{Inode, Result};
+use alloc::string::String;
+use alloc::vec::Vec;
+use rk_frame::sync::{Once, SpinLock};
+
+/// The IDs of the modules, `LSM_ID_*` of include/uapi/linux/lsm.h.
+pub mod id {
+    /// The capability module.
+    pub const CAPABILITY: u64 = 100;
+    /// SELinux.
+    pub const SELINUX: u64 = 101;
+    /// Smack.
+    pub const SMACK: u64 = 102;
+    /// TOMOYO.
+    pub const TOMOYO: u64 = 103;
+    /// AppArmor.
+    pub const APPARMOR: u64 = 104;
+    /// Yama.
+    pub const YAMA: u64 = 105;
+    /// LoadPin.
+    pub const LOADPIN: u64 = 106;
+    /// SafeSetID.
+    pub const SAFESETID: u64 = 107;
+    /// Lockdown.
+    pub const LOCKDOWN: u64 = 108;
+    /// The BPF LSM.
+    pub const BPF: u64 = 109;
+    /// Landlock.
+    pub const LANDLOCK: u64 = 110;
+    /// IMA.
+    pub const IMA: u64 = 111;
+    /// EVM.
+    pub const EVM: u64 = 112;
+    /// IPE.
+    pub const IPE: u64 = 113;
+}
+
+/// The attributes of `lsm_get_self_attr`, `LSM_ATTR_*` of include/uapi/linux/lsm.h.
+pub mod attr {
+    /// The current context of the task.
+    pub const CURRENT: u64 = 100;
+    /// The context for the next `execve`.
+    pub const EXEC: u64 = 101;
+    /// The context of the files that the task makes.
+    pub const FSCREATE: u64 = 102;
+    /// The context of the keys that the task makes.
+    pub const KEYCREATE: u64 = 103;
+    /// The context before the last `execve`.
+    pub const PREV: u64 = 104;
+    /// The context of the sockets that the task makes.
+    pub const SOCKCREATE: u64 = 105;
+}
+
+/// The name and the number of a module, as `struct lsm_id` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LsmId {
+    /// The name in `lsm=` and in /sys/kernel/security/lsm.
+    pub name: &'static str,
+    /// The `LSM_ID_*` value.
+    pub id: u64,
+}
+
+/// The place of a module in the order, as `enum lsm_order` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// Always first, as the capability module.
+    First,
+    /// In the order of `lsm=` or of the default list.
+    Mutable,
+    /// Always last, as IMA and EVM.
+    Last,
+}
+
+/// The module can be active only if no other exclusive module is active, `LSM_FLAG_EXCLUSIVE`.
+pub const FLAG_EXCLUSIVE: u32 = 1 << 1;
+/// The module is a major module that `security=` selects, `LSM_FLAG_LEGACY_MAJOR`.
+pub const FLAG_LEGACY_MAJOR: u32 = 1 << 0;
+
+/// The description of a module, as `struct lsm_info` of Linux.
+pub struct LsmInfo {
+    /// The name and the number.
+    pub id: LsmId,
+    /// The place in the order.
+    pub order: Order,
+    /// The `FLAG_*` bits.
+    pub flags: u32,
+    /// The size of the part of each blob that the module uses.
+    pub blobs: BlobSizes,
+    /// The hooks.
+    pub hooks: &'static dyn SecurityHooks,
+}
+
+/// An active module and the offsets of its parts of the blobs.
+#[derive(Clone, Copy)]
+pub struct Active {
+    /// The module.
+    pub info: &'static LsmInfo,
+    /// The byte offset of the part of the module in each blob. A module that asked for no space
+    /// in a blob has the offset 0 there.
+    pub offsets: BlobSizes,
+}
+
+/// The modules after the boot order, and the sizes of the blobs.
+pub struct State {
+    /// The active modules in the order of the calls.
+    pub active: Vec<Active>,
+    /// The size of each blob.
+    pub sizes: BlobSizes,
+}
+
+impl State {
+    /// The names of the active modules, separated by commas, as /sys/kernel/security/lsm.
+    pub fn names(&self) -> String {
+        let mut s = String::new();
+        for (i, a) in self.active.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(a.info.id.name);
+        }
+        s
+    }
+}
+
+/// The default order of the modules, `CONFIG_LSM` of Linux. A name without a module is skipped.
+pub const DEFAULT_LSM: &str =
+    "landlock,lockdown,yama,loadpin,safesetid,integrity,selinux,smack,tomoyo,apparmor,ipe,bpf";
+
+/// The most modules that can be active, as `MAX_LSM_COUNT` of Linux.
+pub const MAX_LSM_COUNT: usize = 16;
+
+/// Makes the order of the modules from `available`, as `lsm_order_parse` and `lsm_prepare` of
+/// Linux. `lsm` is the value of `lsm=`, or `None` for the default list. `legacy` is the value of
+/// `security=`, which has no effect with `lsm=`.
+pub fn prepare(available: &[&'static LsmInfo], lsm: Option<&str>, legacy: Option<&str>) -> State {
+    let (list, legacy) = match lsm {
+        Some(l) => (l, None),
+        None => (DEFAULT_LSM, legacy),
+    };
+    let mut disabled = Vec::new();
+    if let Some(legacy) = legacy {
+        for m in available {
+            if m.flags & FLAG_LEGACY_MAJOR != 0 && m.id.name != legacy {
+                disabled.push(m.id.name);
+            }
+        }
+    }
+    let mut order: Vec<&'static LsmInfo> = Vec::new();
+    let mut exclusive = false;
+    let mut append = |m: &'static LsmInfo| {
+        if order.iter().any(|o| o.id.name == m.id.name)
+            || disabled.contains(&m.id.name)
+            || order.len() == MAX_LSM_COUNT
+        {
+            return;
+        }
+        if m.flags & FLAG_EXCLUSIVE != 0 {
+            if exclusive {
+                return;
+            }
+            exclusive = true;
+        }
+        order.push(m);
+    };
+    for &m in available.iter().filter(|m| m.order == Order::First) {
+        append(m);
+    }
+    for name in list.split(',') {
+        for &m in available.iter().filter(|m| m.order == Order::Mutable && m.id.name == name) {
+            append(m);
+        }
+    }
+    if let Some(legacy) = legacy {
+        for &m in available.iter().filter(|m| m.id.name == legacy) {
+            append(m);
+        }
+    }
+    for &m in available.iter().filter(|m| m.order == Order::Last) {
+        append(m);
+    }
+    let mut sizes = BlobSizes::NONE;
+    let active = order.into_iter().map(|info| Active { info, offsets: sizes.add(&info.blobs) });
+    let active = active.collect();
+    State { active, sizes }
+}
+
+/// The state after [`init`].
+static STATE: Once<State> = Once::new();
+
+/// The modules that other crates give before [`init`].
+static REGISTERED: SpinLock<Vec<&'static LsmInfo>> = SpinLock::new(Vec::new());
+
+/// The modules before [`init`]: only the capability module, with no blobs.
+static EARLY: [Active; 1] = [Active { info: &capability::LSM, offsets: BlobSizes::NONE }];
+
+/// Adds a module that [`init`] can make active, as `DEFINE_LSM` of Linux. A call after [`init`]
+/// has no effect.
+pub fn register(info: &'static LsmInfo) {
+    REGISTERED.lock().push(info);
+}
+
+/// Makes the modules active, as `security_init` of Linux. `lsm` and `security` are the values
+/// of the `lsm=` and `security=` parameters of the command line. Gives the names of the active
+/// modules for the message `LSM: initializing lsm=...` of the boot.
+pub fn init(lsm: Option<&str>, security: Option<&str>) -> String {
+    let state = STATE.call_once(|| {
+        let mut available: Vec<&'static LsmInfo> = alloc::vec![&capability::LSM];
+        available.extend(REGISTERED.lock().iter().copied());
+        prepare(&available, lsm, security)
+    });
+    state.names()
+}
+
+/// The active modules in the order of the calls.
+pub fn modules() -> &'static [Active] {
+    STATE.get().map_or(&EARLY[..], |s| &s.active[..])
+}
+
+/// The size of each blob. It is 0 before [`init`].
+pub fn sizes() -> BlobSizes {
+    STATE.get().map_or(BlobSizes::NONE, |s| s.sizes)
+}
+
+/// The names of the active modules, separated by commas.
+pub fn lsm_names() -> String {
+    STATE.get().map_or_else(|| String::from(capability::LSM.id.name), State::names)
+}
+
+/// Calls `f` for each module in `mods` and gives the first error, as `call_int_hook` of Linux.
+pub fn first_error(
+    mods: &[Active],
+    mut f: impl FnMut(&dyn SecurityHooks) -> Result<()>,
+) -> Result<()> {
+    for m in mods {
+        f(m.info.hooks)?;
+    }
+    Ok(())
+}
+
+/// Calls the hook `$hook` of each active module with the arguments, and gives the first error,
+/// as `call_int_hook` of Linux.
+macro_rules! call_int_hook {
+    ($hook:ident $(, $arg:expr)*) => {
+        first_error(modules(), |h| h.$hook($($arg),*))
+    };
+}
+
+/// Calls the hook `$hook` of each active module with the arguments, as `call_void_hook` of
+/// Linux.
+macro_rules! call_void_hook {
+    ($hook:ident $(, $arg:expr)*) => {
+        for m in modules() {
+            m.info.hooks.$hook($($arg),*);
+        }
+    };
+}
+
+/// A task for the hooks: a thread with its credentials, as the `task_struct` argument of the
+/// hooks of Linux.
+pub struct Task<'a> {
+    /// The thread ID.
+    pub pid: u32,
+    /// The credentials of the task.
+    pub cred: &'a Cred,
+    /// The task blob, or `None` if the caller has only the process.
+    pub security: Option<&'a Blob>,
+}
+
+/// An `execve` for the hooks, as `struct linux_binprm` of Linux.
+pub struct Bprm<'a> {
+    /// The name of the file that the caller gave.
+    pub filename: &'a [u8],
+    /// The file that runs. For a script, it is the interpreter after `bprm_creds_from_file`.
+    pub file: &'a Location,
+    /// The new credentials. The hooks can change them.
+    pub cred: &'a mut Cred,
+    /// The program gets the secure mode of `AT_SECURE`. A hook can set it.
+    pub secureexec: bool,
+}
+
+/// A socket for the hooks, as `struct socket` of Linux.
+pub struct Sock<'a> {
+    /// The address family, `AF_*`.
+    pub family: u32,
+    /// The type, `SOCK_*`.
+    pub kind: u32,
+    /// The protocol.
+    pub protocol: u32,
+    /// The socket blob.
+    pub security: &'a Blob,
+}
+
+/// `security_capable`: the task with `cred` has the capability `cap`. `opts` has the
+/// `CAP_OPT_*` bits.
+pub fn capable(cred: &Cred, cap: u32, opts: u32) -> bool {
+    call_int_hook!(capable, cred, cap, opts).is_ok()
+}
+
+/// `security_capget`.
+pub fn capget(target: &Task<'_>) -> Result<()> {
+    call_int_hook!(capget, target)
+}
+
+/// `security_capset`.
+pub fn capset(new: &Cred, old: &Cred) -> Result<()> {
+    call_int_hook!(capset, new, old)
+}
+
+/// `security_ptrace_access_check`.
+pub fn ptrace_access_check(cred: &Cred, child: &Task<'_>, mode: u32) -> Result<()> {
+    call_int_hook!(ptrace_access_check, cred, child, mode)
+}
+
+/// `security_ptrace_traceme`.
+pub fn ptrace_traceme(parent: &Task<'_>) -> Result<()> {
+    call_int_hook!(ptrace_traceme, parent)
+}
+
+/// `security_bprm_creds_for_exec`.
+pub fn bprm_creds_for_exec(bprm: &mut Bprm<'_>) -> Result<()> {
+    call_int_hook!(bprm_creds_for_exec, &mut *bprm)
+}
+
+/// `security_bprm_creds_from_file`.
+pub fn bprm_creds_from_file(bprm: &mut Bprm<'_>) -> Result<()> {
+    call_int_hook!(bprm_creds_from_file, &mut *bprm)
+}
+
+/// `security_bprm_check`.
+pub fn bprm_check(bprm: &mut Bprm<'_>) -> Result<()> {
+    call_int_hook!(bprm_check_security, &mut *bprm)
+}
+
+/// `security_bprm_committing_creds`.
+pub fn bprm_committing_creds(bprm: &Bprm<'_>) {
+    call_void_hook!(bprm_committing_creds, bprm);
+}
+
+/// `security_bprm_committed_creds`.
+pub fn bprm_committed_creds(filename: &[u8], file: &Location) {
+    call_void_hook!(bprm_committed_creds, filename, file);
+}
+
+/// The `sb_alloc_security` hooks, for [`blob::superblock_alloc`].
+fn sb_alloc_security(dev: u64, blob: &Blob) {
+    call_void_hook!(sb_alloc_security, dev, blob);
+}
+
+/// The `sb_free_security` hooks, for [`blob::superblock_free`].
+fn sb_free_security(dev: u64, blob: &Blob) {
+    call_void_hook!(sb_free_security, dev, blob);
+}
+
+/// The `inode_alloc_security` hooks, for [`blob::inode_attach`].
+fn inode_alloc_security(inode: &dyn Inode, blob: &Blob) {
+    call_void_hook!(inode_alloc_security, inode, blob);
+}
+
+/// `security_d_instantiate`.
+fn d_instantiate(inode: &dyn Inode) {
+    call_void_hook!(d_instantiate, inode);
+}
+
+/// `security_inode_permission`.
+pub fn inode_permission(cred: &Cred, inode: &dyn Inode, mask: u32) -> Result<()> {
+    call_int_hook!(inode_permission, cred, inode, mask)
+}
+
+/// `security_file_permission`.
+pub fn file_permission(file: &File, mask: u32) -> Result<()> {
+    call_int_hook!(file_permission, file, mask)
+}
+
+/// `security_file_alloc`.
+pub fn file_alloc(file: &File) {
+    call_void_hook!(file_alloc_security, file);
+}
+
+/// `security_file_free`.
+pub fn file_free(file: &File) {
+    call_void_hook!(file_free_security, file);
+}
+
+/// `security_file_ioctl`.
+pub fn file_ioctl(file: &File, cmd: u32, arg: u64) -> Result<()> {
+    call_int_hook!(file_ioctl, file, cmd, arg)
+}
+
+/// `security_mmap_file`.
+pub fn mmap_file(file: Option<&File>, reqprot: u64, prot: u64, flags: u64) -> Result<()> {
+    call_int_hook!(mmap_file, file, reqprot, prot, flags)
+}
+
+/// `security_file_mprotect`.
+pub fn file_mprotect(file: Option<&File>, reqprot: u64, prot: u64) -> Result<()> {
+    call_int_hook!(file_mprotect, file, reqprot, prot)
+}
+
+/// `security_file_lock`.
+pub fn file_lock(file: &File, cmd: u32) -> Result<()> {
+    call_int_hook!(file_lock, file, cmd)
+}
+
+/// `security_file_fcntl`.
+pub fn file_fcntl(file: &File, cmd: u32, arg: u64) -> Result<()> {
+    call_int_hook!(file_fcntl, file, cmd, arg)
+}
+
+/// `security_file_open`.
+pub fn file_open(file: &File, cred: &Cred) -> Result<()> {
+    call_int_hook!(file_open, file, cred)
+}
+
+/// `security_task_alloc`.
+pub fn task_alloc(child: &Task<'_>, clone_flags: u64) -> Result<()> {
+    call_int_hook!(task_alloc, child, clone_flags)
+}
+
+/// `security_task_free`.
+pub fn task_free(blob: &Blob) {
+    call_void_hook!(task_free, blob);
+}
+
+/// `security_task_fix_setuid`.
+pub fn task_fix_setuid(new: &mut Cred, old: &Cred, flags: u32) -> Result<()> {
+    call_int_hook!(task_fix_setuid, &mut *new, old, flags)
+}
+
+/// `security_task_fix_setgid`.
+pub fn task_fix_setgid(new: &mut Cred, old: &Cred, flags: u32) -> Result<()> {
+    call_int_hook!(task_fix_setgid, &mut *new, old, flags)
+}
+
+/// `security_task_fix_setgroups`.
+pub fn task_fix_setgroups(new: &mut Cred, old: &Cred) -> Result<()> {
+    call_int_hook!(task_fix_setgroups, &mut *new, old)
+}
+
+/// `security_task_setpgid`.
+pub fn task_setpgid(target: &Task<'_>, pgid: u32) -> Result<()> {
+    call_int_hook!(task_setpgid, target, pgid)
+}
+
+/// `security_task_getpgid`.
+pub fn task_getpgid(target: &Task<'_>) -> Result<()> {
+    call_int_hook!(task_getpgid, target)
+}
+
+/// `security_task_getsid`.
+pub fn task_getsid(target: &Task<'_>) -> Result<()> {
+    call_int_hook!(task_getsid, target)
+}
+
+/// `security_task_setnice`.
+pub fn task_setnice(target: &Task<'_>, nice: i32) -> Result<()> {
+    call_int_hook!(task_setnice, target, nice)
+}
+
+/// `security_task_prlimit`.
+pub fn task_prlimit(cred: &Cred, tcred: &Cred, flags: u32) -> Result<()> {
+    call_int_hook!(task_prlimit, cred, tcred, flags)
+}
+
+/// `security_task_setscheduler`.
+pub fn task_setscheduler(target: &Task<'_>) -> Result<()> {
+    call_int_hook!(task_setscheduler, target)
+}
+
+/// `security_task_getscheduler`.
+pub fn task_getscheduler(target: &Task<'_>) -> Result<()> {
+    call_int_hook!(task_getscheduler, target)
+}
+
+/// `security_task_kill`.
+pub fn task_kill(target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
+    call_int_hook!(task_kill, target, sig, cred)
+}
+
+/// `security_socket_create`.
+pub fn socket_create(family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
+    call_int_hook!(socket_create, family, kind, protocol, kern)
+}
+
+/// `security_socket_post_create`.
+pub fn socket_post_create(sock: &Sock<'_>, kern: bool) -> Result<()> {
+    call_int_hook!(socket_post_create, sock, kern)
+}
+
+/// `security_socket_socketpair`.
+pub fn socket_socketpair(a: &Sock<'_>, b: &Sock<'_>) -> Result<()> {
+    call_int_hook!(socket_socketpair, a, b)
+}
+
+/// `security_socket_bind`.
+pub fn socket_bind(sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
+    call_int_hook!(socket_bind, sock, addr)
+}
+
+/// `security_socket_connect`.
+pub fn socket_connect(sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
+    call_int_hook!(socket_connect, sock, addr)
+}
+
+/// `security_socket_listen`.
+pub fn socket_listen(sock: &Sock<'_>, backlog: i32) -> Result<()> {
+    call_int_hook!(socket_listen, sock, backlog)
+}
+
+/// `security_socket_accept`.
+pub fn socket_accept(sock: &Sock<'_>) -> Result<()> {
+    call_int_hook!(socket_accept, sock)
+}
+
+/// `security_socket_sendmsg`.
+pub fn socket_sendmsg(sock: &Sock<'_>, len: usize) -> Result<()> {
+    call_int_hook!(socket_sendmsg, sock, len)
+}
+
+/// `security_socket_recvmsg`.
+pub fn socket_recvmsg(sock: &Sock<'_>, len: usize, flags: u32) -> Result<()> {
+    call_int_hook!(socket_recvmsg, sock, len, flags)
+}
+
+/// `security_socket_getsockname`.
+pub fn socket_getsockname(sock: &Sock<'_>) -> Result<()> {
+    call_int_hook!(socket_getsockname, sock)
+}
+
+/// `security_socket_getpeername`.
+pub fn socket_getpeername(sock: &Sock<'_>) -> Result<()> {
+    call_int_hook!(socket_getpeername, sock)
+}
+
+/// `security_socket_getsockopt`.
+pub fn socket_getsockopt(sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
+    call_int_hook!(socket_getsockopt, sock, level, name)
+}
+
+/// `security_socket_setsockopt`.
+pub fn socket_setsockopt(sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
+    call_int_hook!(socket_setsockopt, sock, level, name)
+}
+
+/// `security_socket_shutdown`.
+pub fn socket_shutdown(sock: &Sock<'_>, how: i32) -> Result<()> {
+    call_int_hook!(socket_shutdown, sock, how)
+}

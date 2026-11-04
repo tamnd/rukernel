@@ -233,6 +233,8 @@ pub struct Cred {
     pub securebits: u32,
     /// The user namespace, in which the capabilities apply.
     pub user_ns: Arc<UserNs>,
+    /// The credentials blob of the security modules, as `cred->security` of Linux.
+    pub security: crate::security::Blob,
 }
 
 /// The file that an `execve` runs, for [`Cred::exec`].
@@ -275,12 +277,14 @@ impl Cred {
             cap_ambient: 0,
             securebits: 0,
             user_ns: user_ns::init().clone(),
+            security: crate::security::Blob::cred(),
         }
     }
 
-    /// The process has the capability in the first user namespace, as `capable` of Linux.
+    /// The process has the capability in the first user namespace, and no security module
+    /// denies it, as `capable` and `security_capable` of Linux.
     pub fn capable(&self, cap: u32) -> bool {
-        self.ns_capable(user_ns::init(), cap)
+        self.ns_capable(user_ns::init(), cap) && crate::security::capable(self, cap, 0)
     }
 
     /// The process has the capability in its own user namespace: the capability is in its
@@ -361,7 +365,8 @@ impl Cred {
     ///
     /// Gives `EACCES` if the access is not allowed, and `EIO` for a damaged ACL.
     pub fn inode_permission(&self, inode: &dyn Inode, mask: u32) -> Result<()> {
-        self.check(&inode.metadata(), mask, || acl::access(inode))
+        self.check(&inode.metadata(), mask, || acl::access(inode))?;
+        crate::security::inode_permission(self, inode, mask)
     }
 
     /// The check of [`Cred::permission`]. `acl` gives the access ACL. The ACL applies only to

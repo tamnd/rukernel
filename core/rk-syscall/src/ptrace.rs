@@ -112,17 +112,38 @@ fn check_seccomp_access(cx: &Cx<'_>) -> Result<(), Errno> {
 /// Checks that the caller can attach to `thread`, with the rules of `ptrace_may_access` of
 /// Linux.
 fn may_attach(cx: &Cx<'_>, thread: &Thread) -> Result<(), Errno> {
-    if cx.process().cred().may_ptrace(&thread.process().cred()) {
-        Ok(())
-    } else {
-        Err(Errno::EPERM)
+    let (cred, tcred) = (cx.process().cred(), thread.process().cred());
+    if !cred.may_ptrace(&tcred) {
+        return Err(Errno::EPERM);
     }
+    // As `security_ptrace_access_check` with `PTRACE_MODE_ATTACH_REALCREDS` in
+    // `__ptrace_may_access` of Linux.
+    let mode = PTRACE_MODE_ATTACH | PTRACE_MODE_REALCREDS;
+    rk_vfs::security::ptrace_access_check(&cred, &crate::sched::lsm_task(thread, &tcred), mode)
+}
+
+/// The `PTRACE_MODE_*` bits of the `ptrace_access_check` hook, as include/linux/ptrace.h of
+/// Linux.
+const PTRACE_MODE_ATTACH: u32 = 0x02;
+const PTRACE_MODE_REALCREDS: u32 = 0x10;
+
+/// As `security_ptrace_traceme` in `ptrace_traceme` of Linux: the parent becomes the tracer.
+fn may_traceme(cx: &Cx<'_>) -> Result<(), Errno> {
+    let Some(parent) = cx.process().parent() else {
+        return Ok(());
+    };
+    let cred = parent.cred();
+    let task = rk_vfs::security::Task { pid: parent.pid(), cred: &cred, security: None };
+    rk_vfs::security::ptrace_traceme(&task)
 }
 
 pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) -> SysResult {
     let pid = pid as u32 as Pid;
     match request {
-        PTRACE_TRACEME => return ptrace::trace_me(cx.thread).map(|()| 0),
+        PTRACE_TRACEME => {
+            may_traceme(cx)?;
+            return ptrace::trace_me(cx.thread).map(|()| 0);
+        }
         PTRACE_ATTACH => {
             let thread = cx.find_task_by_vpid(u64::from(pid)).ok_or(Errno::ESRCH)?;
             may_attach(cx, &thread)?;

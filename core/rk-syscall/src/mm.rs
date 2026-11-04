@@ -413,6 +413,7 @@ pub(crate) fn mmap(
     offset: u64,
 ) -> SysResult {
     let flags = flags as u32;
+    let reqprot = prot;
     // Linux looks up the descriptor before it checks the other arguments.
     let file = if flags & MAP_ANONYMOUS != 0 { None } else { Some(cx.fdget(fd)?) };
     let prot = Prot::from_bits(prot as u32).ok_or(Errno::EINVAL)?;
@@ -430,6 +431,8 @@ pub(crate) fn mmap(
     if len == 0 || offset as usize % PAGE_SIZE != 0 {
         return Err(Errno::EINVAL);
     }
+    // As `security_mmap_file` in `vm_mmap_pgoff` of Linux.
+    rk_vfs::security::mmap_file(file.as_deref(), reqprot, reqprot, u64::from(flags))?;
     let mut may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
     let file = match file {
         None => None,

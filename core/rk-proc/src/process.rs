@@ -341,6 +341,8 @@ pub struct Thread {
     seccomp_mode: AtomicU32,
     /// The `seccomp` mode and filters.
     seccomp: SpinLock<seccomp::Seccomp>,
+    /// The task blob of the security modules, as `task->security` of Linux.
+    security: rk_vfs::security::Blob,
     /// The no_new_privs bit of `PR_SET_NO_NEW_PRIVS`.
     no_new_privs: AtomicBool,
     /// The thread waits, and only a fatal signal stops the wait. `/proc` shows the state `D`.
@@ -370,6 +372,13 @@ pub struct Thread {
     /// The PID namespace of the new children of the thread, or `None` for the first one, as
     /// `nsproxy->pid_ns_for_children` of Linux.
     pid_children: SpinLock<Option<Arc<PidNamespace>>>,
+}
+
+/// The task goes away, as `security_task_free` in `__put_task_struct` of Linux.
+impl Drop for Thread {
+    fn drop(&mut self) {
+        rk_vfs::security::task_free(&self.security);
+    }
 }
 
 /// The system call that a thread makes, as `/proc/PID/syscall` shows it.
@@ -1900,6 +1909,7 @@ impl Thread {
             stop_seq: AtomicU32::new(0),
             seccomp_mode: AtomicU32::new(0),
             seccomp: SpinLock::new(seccomp::Seccomp::default()),
+            security: rk_vfs::security::Blob::task(),
             no_new_privs: AtomicBool::new(false),
             killable_wait: AtomicBool::new(false),
             syscall: SpinLock::new(SyscallInfo { nr: -1, ..SyscallInfo::default() }),
@@ -1914,6 +1924,11 @@ impl Thread {
             time_children: SpinLock::new(None),
             pid_children: SpinLock::new(None),
         })
+    }
+
+    /// The task blob of the security modules.
+    pub fn security(&self) -> &rk_vfs::security::Blob {
+        &self.security
     }
 
     /// The network namespace of the thread, as `current->nsproxy->net_ns` of Linux.
