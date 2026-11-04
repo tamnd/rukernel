@@ -2030,19 +2030,37 @@ const TIMER_SLACK_NS: u64 = 50_000;
 ///
 /// Gives `ENOMEM` if no memory is free, or `EEXIST` if init is there already.
 pub fn create_init(fs: FsContext) -> Result<Arc<Thread>, Errno> {
+    create_root(fs, true)
+}
+
+/// Makes the process of a user mode helper, as `call_usermodehelper_exec_async` in kernel/umh.c
+/// of Linux. It has no parent, as a child of kthreadd, so it goes away at its end. It has the
+/// credentials of root, no open file, and the process group and session 0. Its thread does not
+/// run yet: the caller spawns a task for it after `exec`.
+///
+/// # Errors
+///
+/// Gives `ENOMEM` if no memory is free, or `EAGAIN` if no process ID is free.
+pub fn create_helper(fs: FsContext) -> Result<Arc<Thread>, Errno> {
+    create_root(fs, false)
+}
+
+/// Makes a process with no parent: init, or a helper.
+fn create_root(fs: FsContext, init: bool) -> Result<Arc<Thread>, Errno> {
     let vm = Arc::new(AddressSpace::new()?);
     let mut table = TABLE.lock();
-    if table.processes.contains_key(&INIT_PID) {
+    if init && table.processes.contains_key(&INIT_PID) {
         return Err(Errno::EEXIST);
     }
     let pid = alloc_pid(&mut table, None)?;
     let files = Arc::new(SpinLock::new(FdTable::new()));
+    let (group, comm): (Pid, &[u8]) = if init { (pid, b"init") } else { (0, b"kworker/u:umh") };
     let process = Process::new(
         pid,
         Weak::new(),
-        pid,
-        pid,
-        b"init".to_vec(),
+        group,
+        group,
+        comm.to_vec(),
         vm,
         files,
         Arc::new(SpinLock::new(fs)),

@@ -6,7 +6,7 @@ use crate::cx::{Cx, SysResult};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::keyctl::*;
-use rk_proc::keys::{self, MAX_DESC, MAX_PAYLOAD, MAX_TYPE, Parent};
+use rk_proc::keys::{self, MAX_DESC, MAX_PAYLOAD, MAX_TYPE, Owner as _, Parent};
 
 /// The size of a page, the limit of the callout information and of a restriction.
 const PAGE_SIZE: usize = 4096;
@@ -152,6 +152,21 @@ fn check_reject_error(error: u64) -> Result<(), Errno> {
         return Err(Errno::EINVAL);
     }
     Ok(())
+}
+
+/// The path of the helper that constructs keys.
+const REQUEST_KEY: &[u8] = b"/sbin/request-key";
+
+/// The upcall of the key service: runs `/sbin/request-key create KEY UID GID THREAD PROCESS
+/// SESSION` with the session keyring of the request and waits for its end, as
+/// `call_sbin_request_key` in security/keys/request_key.c of Linux.
+pub(crate) fn upcall(req: &keys::Request) -> Result<i32, Errno> {
+    let mut argv = alloc::vec![REQUEST_KEY.to_vec()];
+    argv.extend(req.args());
+    let envp = alloc::vec![b"HOME=/".to_vec(), b"PATH=/sbin:/bin:/usr/sbin:/usr/bin".to_vec()];
+    crate::umh::call(REQUEST_KEY, argv, envp, |thread| {
+        thread.set_ring(keys::Slot::Session, req.session.clone(), true);
+    })
 }
 
 /// `keyctl(KEYCTL_INSTANTIATE)` and `keyctl(KEYCTL_INSTANTIATE_IOV)`: the payload is in the user
