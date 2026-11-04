@@ -134,7 +134,7 @@ pub(crate) fn timer_create(cx: &Cx<'_>, clock: u64, sevp: u64, idp: u64) -> SysR
         SIGEV_NONE => Target::None,
         SIGEV_SIGNAL => Target::Process(Arc::downgrade(process)),
         n if n == SIGEV_SIGNAL | SIGEV_THREAD_ID => {
-            let thread = rk_proc::find_thread(tid as Pid)
+            let thread = rk_proc::find_task_by_vpid(process, tid as Pid)
                 .filter(|t| Arc::ptr_eq(t.process(), process))
                 .ok_or(Errno::EINVAL)?;
             Target::Thread(Arc::downgrade(&thread))

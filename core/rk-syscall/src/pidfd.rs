@@ -19,6 +19,7 @@ use rk_abi::native::open::{
     O_ACCMODE, O_CLOEXEC, O_EXCL, O_LARGEFILE, O_NONBLOCK, O_RDONLY, O_RDWR,
 };
 use rk_frame::sync::Once;
+use rk_proc::pid_namespace;
 use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo};
 use rk_proc::{Pid, Process};
 use rk_vfs::Location;
@@ -143,11 +144,28 @@ impl FileOps for PidFd {
         Some(self)
     }
 
-    /// The ID of the process, or -1 after the parent reaped it, as `pidfd_show_fdinfo` of
-    /// Linux. Each process is in the PID namespace of the system, so `NSpid` has one ID.
+    /// The ID of the process in the PID namespace of the reader, or 0 if the reader does not
+    /// see it, or -1 after the parent reaped it, as `pidfd_show_fdinfo` of Linux. `NSpid` gives
+    /// the ID in each namespace from the namespace of the reader down to the namespace of the
+    /// process.
     fn fdinfo(&self, _file: &File) -> Vec<u8> {
-        let nr = if reaped(&self.process) { -1 } else { i64::from(self.process.pid()) };
-        format!("Pid:\t{nr}\nNSpid:\t{nr}\n").into_bytes()
+        let p = &self.process;
+        if reaped(p) {
+            return b"Pid:\t-1\nNSpid:\t-1\n".to_vec();
+        }
+        let viewer = rk_proc::current_thread().map(|t| t.process().clone());
+        let ns = viewer.as_ref().and_then(|v| v.pid_ns().cloned());
+        let nr = pid_namespace::pid_nr_ns(p.pid(), ns.as_ref());
+        let mut out = format!("Pid:\t{nr}\nNSpid:");
+        if nr == 0 {
+            out.push_str("\t0");
+        } else {
+            for n in pid_namespace::numbers(p.pid(), p.pid_ns(), ns.as_ref()) {
+                out.push_str(&format!("\t{n}"));
+            }
+        }
+        out.push('\n');
+        out.into_bytes()
     }
 }
 
@@ -293,9 +311,14 @@ fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysRe
             info.cgroupid = rk_fs_cgroup::cgroup_ino(process.cgroup());
             info.mask |= PIDFD_INFO_CGROUPID;
         }
-        info.ppid = process.ppid();
-        info.tgid = process.pid();
-        info.pid = process.pid();
+        // The IDs in the PID namespace of the caller, as `pidfd_info` of Linux. A process that
+        // the caller does not see gives `ESRCH`.
+        info.pid = cx.vnr(process.pid());
+        if info.pid == 0 {
+            return Err(Errno::ESRCH);
+        }
+        info.ppid = cx.vnr(process.ppid());
+        info.tgid = info.pid;
         info.mask |= PIDFD_INFO_PID;
     }
     // The caller gets the part of the structure that it knows, and zeros after the part that
@@ -342,8 +365,8 @@ pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysR
         0xff02 => NsKind::Ipc,
         0xff03 => NsKind::Mnt,
         0xff04 => NsKind::Net,
-        // The PID namespace for the children is the namespace of the process.
-        0xff05 | 0xff06 => NsKind::Pid,
+        0xff05 => NsKind::Pid,
+        0xff06 => return Some(open_pid_for_children(cx, process, arg)),
         0xff07 => NsKind::Time,
         0xff08 => return Some(open_time_for_children(cx, process, arg)),
         0xff09 => NsKind::User,
@@ -357,6 +380,12 @@ pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysR
 /// `PIDFD_GET_TIME_FOR_CHILDREN_NAMESPACE`.
 fn open_time_for_children(cx: &Cx<'_>, process: &Arc<Process>, arg: u64) -> SysResult {
     open_inode(cx, process, arg, |p| Ok(crate::ns::time_inode(p.time_ns_for_children())))
+}
+
+/// Opens the file of the PID namespace for the children of `process`, for
+/// `PIDFD_GET_PID_FOR_CHILDREN_NAMESPACE`.
+fn open_pid_for_children(cx: &Cx<'_>, process: &Arc<Process>, arg: u64) -> SysResult {
+    open_inode(cx, process, arg, crate::ns::pid_for_children_inode)
 }
 
 /// Opens the file of the namespace `kind` of `process` for a `PIDFD_GET_*_NAMESPACE` command,
@@ -438,10 +467,11 @@ pub(crate) fn pidfd_open(cx: &Cx<'_>, pid: u64, flags: u64) -> SysResult {
     if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 || pid <= 0 {
         return Err(Errno::EINVAL);
     }
-    let process = match rk_proc::find_process(pid as Pid) {
+    let pid = cx.find_vpid(pid as u64).ok_or(Errno::ESRCH)?;
+    let process = match rk_proc::find_process(pid) {
         Some(p) => p,
         // The ID of a thread that is not the leader gives `ENOENT`, as in Linux.
-        None => match rk_proc::find_thread(pid as Pid) {
+        None => match rk_proc::find_thread(pid) {
             Some(t) if flags & PIDFD_THREAD != 0 => t.process().clone(),
             Some(_) => return Err(Errno::ENOENT),
             None => return Err(Errno::ESRCH),

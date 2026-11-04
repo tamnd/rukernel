@@ -161,7 +161,8 @@ fn cpu_clock_ns(thread: &rk_proc::Thread, clock: i32) -> Result<u64, Errno> {
         let ticks = match id {
             0 => thread.user_ticks(),
             id => {
-                let t = rk_proc::find_thread(id as u32).ok_or(Errno::EINVAL)?;
+                let t =
+                    rk_proc::find_task_by_vpid(thread.process(), id as u32).ok_or(Errno::EINVAL)?;
                 // A thread clock is only for the threads of the same process.
                 if !alloc::sync::Arc::ptr_eq(t.process(), thread.process()) {
                     return Err(Errno::EINVAL);
@@ -173,7 +174,7 @@ fn cpu_clock_ns(thread: &rk_proc::Thread, clock: i32) -> Result<u64, Errno> {
     }
     let process = match id {
         0 => thread.process().clone(),
-        id => rk_proc::find_process(id as u32).ok_or(Errno::EINVAL)?,
+        id => rk_proc::find_process_by_vpid(thread.process(), id as u32).ok_or(Errno::EINVAL)?,
     };
     Ok(ticks_ns(process.user_ticks()))
 }
@@ -564,7 +565,7 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
         usize::try_from(resource).ok().filter(|&r| r < RLIM_NLIMITS).ok_or(Errno::EINVAL)?;
     let process = match pid as i32 {
         0 => cx.thread.process().clone(),
-        p => rk_proc::find_process(p as u32).ok_or(Errno::ESRCH)?,
+        p => cx.find_process_by_vpid(p as u32 as u64).ok_or(Errno::ESRCH)?,
     };
     let cred = cx.process().cred();
     // Another process must have the IDs of the caller, as `check_prlimit_permission` of Linux.

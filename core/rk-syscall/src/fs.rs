@@ -1138,13 +1138,15 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             if who == i32::MIN {
                 return Err(Errno::EINVAL);
             }
+            // The file keeps the global ID, as `f_setown` of Linux keeps a `struct pid`.
+            let who = owner_global(cx, who)?;
             if who > 0 && rk_proc::find_process(who as u32).is_none() {
                 return Err(Errno::ESRCH);
             }
             file.set_owner(who);
             Ok(0)
         }
-        F_GETOWN => Ok(i64::from(cx.file(fd)?.owner()) as u64),
+        F_GETOWN => Ok(i64::from(owner_vnr(cx, cx.file(fd)?.owner())) as u64),
         F_SETSIG => {
             let file = cx.file(fd)?;
             let sig = arg as u32;
@@ -1157,7 +1159,7 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         F_GETSIG => Ok(u64::from(cx.file(fd)?.signum())),
         F_GETOWN_EX => {
             let file = cx.file(fd)?;
-            let owner = file.owner();
+            let owner = owner_vnr(cx, file.owner());
             let (kind, pid) = if file.owner_is_thread() {
                 (F_OWNER_TID, owner)
             } else if owner < 0 {
@@ -1179,6 +1181,7 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
             if pid < 0 {
                 return Err(Errno::EINVAL);
             }
+            let pid = owner_global(cx, pid)?;
             match kind {
                 F_OWNER_TID => {
                     if pid > 0 && rk_proc::find_thread(pid as u32).is_none() {
@@ -1218,6 +1221,27 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
         }
         _ => Err(Errno::EINVAL),
     }
+}
+
+/// The global ID of the owner `who` of the PID namespace of the caller: a process or a
+/// thread, or a process group if it is negative, as `find_vpid` in `f_setown` of Linux.
+///
+/// # Errors
+///
+/// Gives `ESRCH` if no process, thread or process group of the namespace has the ID.
+fn owner_global(cx: &Cx<'_>, who: i32) -> Result<i32, Errno> {
+    if who == 0 {
+        return Ok(0);
+    }
+    let pid = cx.find_vpid(u64::from(who.unsigned_abs())).ok_or(Errno::ESRCH)? as i32;
+    Ok(if who < 0 { -pid } else { pid })
+}
+
+/// The ID of the owner `owner` of a file in the PID namespace of the caller, or 0 if the caller
+/// does not see it, as `f_getown` of Linux.
+fn owner_vnr(cx: &Cx<'_>, owner: i32) -> i32 {
+    let pid = cx.vnr(owner.unsigned_abs()) as i32;
+    if owner < 0 { -pid } else { pid }
 }
 
 /// `F_SETLEASE`: a lease of the type `kind` on the regular file of the descriptor `fd`, as

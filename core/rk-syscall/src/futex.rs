@@ -205,7 +205,7 @@ fn wait(
     // The waiter is in the queue before the read of the word, as in `futex_wait_setup` of Linux
     // (kernel/futex/waitwake.c). A thread that changes the word and then calls `FUTEX_WAKE` on
     // another CPU finds the waiter, or the read sees the new word. Thus no wake is lost.
-    let waiter = Waiter::new(thread.tid(), bitset);
+    let waiter = Waiter::new(vtid(thread), bitset);
     queue(key, &waiter);
     let word = read_word(vm, addr);
     if word.as_ref().is_ok_and(|&w| w == val) {
@@ -235,7 +235,7 @@ fn lock_pi(
     trylock: bool,
 ) -> SysResult {
     let key = key(vm, addr, private)?;
-    let tid = thread.tid();
+    let tid = vtid(thread);
     loop {
         let word = read_word(vm, addr)?;
         let owner = word & FUTEX_TID_MASK;
@@ -253,7 +253,7 @@ fn lock_pi(
         if trylock {
             return Err(Errno::EAGAIN);
         }
-        if rk_proc::find_thread(owner).is_none() {
+        if rk_proc::find_task_by_vpid(thread.process(), owner).is_none() {
             return Err(Errno::ESRCH);
         }
         // The waiter is in the queue before the word gets `FUTEX_WAITERS`. An unlock that
@@ -283,7 +283,7 @@ fn lock_pi(
 fn unlock_pi(thread: &Thread, vm: &Arc<AddressSpace>, addr: usize, private: bool) -> SysResult {
     let key = key(vm, addr, private)?;
     let word = read_word(vm, addr)?;
-    if word & FUTEX_TID_MASK != thread.tid() {
+    if word & FUTEX_TID_MASK != vtid(thread) {
         return Err(Errno::EPERM);
     }
     // A thread that waits on another CPU can add `FUTEX_WAITERS` to the word at any time, so
@@ -295,7 +295,7 @@ fn unlock_pi(thread: &Thread, vm: &Arc<AddressSpace>, addr: usize, private: bool
         let mut table = FUTEXES.lock();
         loop {
             let word = read_word(vm, addr)?;
-            if word & FUTEX_TID_MASK != thread.tid() {
+            if word & FUTEX_TID_MASK != vtid(thread) {
                 return Err(Errno::EPERM);
             }
             let queue = table.get(&key);
@@ -528,7 +528,7 @@ pub(crate) fn futex_waitv(
     let list: Vec<Arc<Waiter>> = futexes
         .iter()
         .map(|&(k, ..)| {
-            let w = Waiter::with_queue(cx.thread.tid(), FUTEX_BITSET_MATCH_ANY, queue.clone());
+            let w = Waiter::with_queue(vtid(cx.thread), FUTEX_BITSET_MATCH_ANY, queue.clone());
             self::queue(k, &w);
             w
         })
@@ -612,6 +612,12 @@ fn futex_death(vm: &Arc<AddressSpace>, addr: usize, tid: u32, pi: bool, pending:
     }
 }
 
+/// The ID of `thread` in its PID namespace, which the futex words have, as `task_pid_vnr` in
+/// kernel/futex of Linux.
+fn vtid(thread: &Thread) -> u32 {
+    rk_proc::pid_vnr(thread.process(), thread.tid())
+}
+
 /// Walks the robust list of `thread` when it exits or calls `execve`, as `exit_robust_list` of
 /// Linux does. Each entry of the list is in a lock that the thread holds. Bit 0 of an entry tells
 /// that the lock is a priority inheritance futex. A list that is not correct stops the walk.
@@ -634,7 +640,7 @@ pub(crate) fn exit_robust_list(thread: &Thread) {
     let offset = h.futex_offset as isize;
     let pending = h.list_op_pending as usize;
     let futex_addr = |entry: usize| (entry & !1).wrapping_add_signed(offset);
-    let tid = thread.tid();
+    let tid = vtid(thread);
     let mut entry = h.list.next as usize;
     for _ in 0..ROBUST_LIST_LIMIT {
         if entry & !1 == head {
@@ -665,7 +671,7 @@ pub(crate) fn get_robust_list(cx: &Cx<'_>, tid: u64, head: u64, len: u64) -> Sys
     let head_addr = match tid as u32 {
         0 => cx.thread.robust_list(),
         tid => {
-            let thread = rk_proc::find_thread(tid).ok_or(Errno::ESRCH)?;
+            let thread = cx.find_task_by_vpid(u64::from(tid)).ok_or(Errno::ESRCH)?;
             // `ptrace_may_access` with `PTRACE_MODE_READ_REALCREDS`, as kernel/futex/syscalls.c
             // of Linux. A thread of the same process can always read it.
             if !Arc::ptr_eq(thread.process(), cx.process())

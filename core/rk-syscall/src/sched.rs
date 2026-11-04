@@ -18,7 +18,7 @@ use rk_abi::native::sched::{
 use rk_abi::native::types::SchedAttr;
 use rk_proc::limits::{RLIMIT_NICE, RLIMIT_RTPRIO};
 use rk_proc::sched::SchedParams;
-use rk_proc::{Thread, find_thread, processes};
+use rk_proc::{Thread, processes};
 use rk_vfs::cred::cap;
 use zerocopy::{FromZeros, IntoBytes};
 
@@ -60,7 +60,7 @@ const KEEP_POLICY: i64 = -1;
 fn affinity_target(cx: &Cx<'_>, pid: u64) -> Result<Arc<Thread>, Errno> {
     match pid as i32 {
         0 => Ok(cx.thread.clone()),
-        p if p > 0 => find_thread(p as u32).ok_or(Errno::ESRCH),
+        p if p > 0 => cx.find_task_by_vpid(p as u64).ok_or(Errno::ESRCH),
         _ => Err(Errno::ESRCH),
     }
 }
@@ -70,7 +70,7 @@ fn target(cx: &Cx<'_>, pid: u64) -> Result<Arc<Thread>, Errno> {
     match pid as i32 {
         p if p < 0 => Err(Errno::EINVAL),
         0 => Ok(cx.thread.clone()),
-        p => find_thread(p as u32).ok_or(Errno::ESRCH),
+        p => cx.find_task_by_vpid(p as u64).ok_or(Errno::ESRCH),
     }
 }
 
@@ -80,11 +80,18 @@ fn prio_targets(cx: &Cx<'_>, which: u64, who: u64) -> Result<Vec<Arc<Thread>>, E
     match which as i32 {
         PRIO_PROCESS => Ok(match who {
             0 => alloc::vec![cx.thread.clone()],
-            w if w > 0 => find_thread(w as u32).into_iter().collect(),
+            w if w > 0 => cx.find_task_by_vpid(w as u64).into_iter().collect(),
             _ => Vec::new(),
         }),
         PRIO_PGRP => {
-            let pgid = if who == 0 { cx.process().pgid() } else { who as u32 };
+            let pgid = match who {
+                0 => cx.process().pgid(),
+                w if w > 0 => match cx.find_vpid(w as u64) {
+                    Some(pgid) => pgid,
+                    None => return Ok(Vec::new()),
+                },
+                _ => return Ok(Vec::new()),
+            };
             Ok(processes()
                 .into_iter()
                 .filter(|p| p.pgid() == pgid)

@@ -66,8 +66,6 @@ sched_setscheduler04	sched_getscheduler and sched_getparam of musl give ENOSYS a
 clone08	The clone wrapper of musl gives EINVAL for CLONE_THREAD, CLONE_SETTLS and CLONE_CHILD_CLEARTID, and does not call the kernel. This fails on Linux with musl too.
 clone10	The clone wrapper of musl gives EINVAL for CLONE_THREAD, CLONE_SETTLS and CLONE_CHILD_CLEARTID, and does not call the kernel. This fails on Linux with musl too.
 clone09	The test needs CLONE_NEWNET. The network name space is the work of #372.
-ioctl_ns01	The test needs CLONE_NEWPID. rukernel has only the first PID name space.
-ioctl_ns05	The test needs CLONE_NEWPID. rukernel has only the first PID name space (TCONF).
 ioctl_ns06	The test needs CLONE_NEWUSER. rukernel has only the first user name space.
 prctl09	The test sleeps 25 ms many times and checks the time with a small margin. Under QEMU without KVM on a busy host, a sleep can take up to 200 ms. It passes when the host is less busy.
 hugemmap07	The test calls brk to set the break back, and the musl libc gives ENOMEM for each brk call, so the cleanup gives TBROK. An LTP tree from build.sh before #415 does not have the brk and sbrk of build.sh. With them the test passes.

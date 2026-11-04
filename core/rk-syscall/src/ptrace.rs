@@ -124,7 +124,7 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
     match request {
         PTRACE_TRACEME => return ptrace::trace_me(cx.thread).map(|()| 0),
         PTRACE_ATTACH => {
-            let thread = rk_proc::find_thread(pid).ok_or(Errno::ESRCH)?;
+            let thread = cx.find_task_by_vpid(u64::from(pid)).ok_or(Errno::ESRCH)?;
             may_attach(cx, &thread)?;
             ptrace::attach(cx.process(), &thread, false, 0)?;
             thread.send_signal(SigInfo::new(SIGSTOP, SI_USER, cx.process().pid()));
@@ -135,7 +135,7 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
                 return Err(Errno::EIO);
             }
             check_suspend_seccomp(cx, data)?;
-            let thread = rk_proc::find_thread(pid).ok_or(Errno::ESRCH)?;
+            let thread = cx.find_task_by_vpid(u64::from(pid)).ok_or(Errno::ESRCH)?;
             may_attach(cx, &thread)?;
             ptrace::attach(cx.process(), &thread, true, data as u32)?;
             return Ok(0);
@@ -143,6 +143,8 @@ pub(crate) fn ptrace(cx: &Cx<'_>, request: u64, pid: u64, addr: u64, data: u64) 
         _ => {}
     }
     let tracer = cx.process();
+    // The tracee by its global ID. An ID that the tracer does not see finds no tracee.
+    let pid = cx.find_vpid(u64::from(pid)).unwrap_or(0);
     match request {
         PTRACE_KILL => ptrace::kill(tracer, pid).map(|()| 0),
         PTRACE_INTERRUPT => ptrace::interrupt(tracer, pid).map(|()| 0),
@@ -400,7 +402,7 @@ fn process_vm(
     }
     let local = read_iovecs(cx, local.0, local.1)?;
     let remote = read_iovecs(cx, remote.0, remote.1)?;
-    let thread: Arc<Thread> = rk_proc::find_thread(pid as u32).ok_or(Errno::ESRCH)?;
+    let thread: Arc<Thread> = cx.find_task_by_vpid(u64::from(pid as u32)).ok_or(Errno::ESRCH)?;
     // `mm_access` with `PTRACE_MODE_ATTACH_REALCREDS`, as mm/process_vm_access.c of Linux.
     if !Arc::ptr_eq(thread.process(), cx.process()) {
         may_attach(cx, &thread)?;

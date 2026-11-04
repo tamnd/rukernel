@@ -118,7 +118,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::DUP => fs::dup(cx, a[0]),
         #[cfg(target_arch = "x86_64")]
         nr::DUP2 => fs::dup2(cx, a[0], a[1]),
-        nr::GETPID => Ok(u64::from(cx.process().pid())),
+        nr::GETPID => Ok(u64::from(cx.vnr(cx.process().pid()))),
         #[cfg(target_arch = "x86_64")]
         nr::CLONE => process::clone(cx, a[0], a[1], a[2], a[3], a[4]),
         // arm64 has the order of `CONFIG_CLONE_BACKWARDS`: the TLS comes before the child TID.
@@ -275,10 +275,10 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::GETGROUPS => cred::getgroups(cx, a[0], a[1]),
         nr::SETGROUPS => cred::setgroups(cx, a[0], a[1]),
         nr::SETPGID => process::setpgid(cx, a[0], a[1]),
-        nr::GETPPID => Ok(u64::from(cx.process().ppid())),
+        nr::GETPPID => Ok(u64::from(cx.vnr(cx.process().ppid()))),
         #[cfg(target_arch = "x86_64")]
-        nr::GETPGRP => Ok(u64::from(cx.process().pgid())),
-        nr::SETSID => cx.process().set_sid().map(u64::from),
+        nr::GETPGRP => Ok(u64::from(cx.vnr(cx.process().pgid()))),
+        nr::SETSID => cx.process().set_sid().map(|sid| u64::from(cx.vnr(sid))),
         nr::GETPGID => process::getpgid(cx, a[0]),
         nr::GETSID => process::getsid(cx, a[0]),
         nr::SIGALTSTACK => signal::sigaltstack(cx, a[0], a[1]),
@@ -326,7 +326,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
             }
             rk_vfs::blockdev::sync_all().map(|()| 0)
         }),
-        nr::GETTID => Ok(u64::from(cx.thread.tid())),
+        nr::GETTID => Ok(u64::from(cx.vnr(cx.thread.tid()))),
         nr::TKILL => signal::tkill(cx, a[0], a[1]),
         #[cfg(target_arch = "x86_64")]
         nr::ALARM => timer::alarm(cx, a[0]),
@@ -344,7 +344,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::TIME => info::time(cx, a[0]),
         nr::SET_TID_ADDRESS => {
             cx.thread.set_clear_child_tid(a[0] as usize);
-            Ok(u64::from(cx.thread.tid()))
+            Ok(u64::from(cx.vnr(cx.thread.tid())))
         }
         nr::GETDENTS64 => fs::getdents64(cx, a[0], a[1], a[2]),
         nr::CLOCK_GETTIME => info::clock_gettime(cx, a[0], a[1]),

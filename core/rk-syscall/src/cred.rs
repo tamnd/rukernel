@@ -178,7 +178,7 @@ pub(crate) fn capget(cx: &Cx<'_>, header: u64, data: u64) -> SysResult {
     let c = if pid == 0 {
         cred(cx)
     } else {
-        rk_proc::find_thread(pid as rk_proc::Pid).ok_or(Errno::ESRCH)?.process().cred()
+        cx.find_task_by_vpid(pid as u64).ok_or(Errno::ESRCH)?.process().cred()
     };
     let mut out = [0u32; 6];
     for (i, set) in out.chunks_mut(3).take(sets).enumerate() {
