@@ -14,6 +14,10 @@ pub mod cmd {
     pub const BPF_MAP_GET_NEXT_KEY: u32 = 4;
     /// Loads a program.
     pub const BPF_PROG_LOAD: u32 = 5;
+    /// Pins a map or a program in bpffs.
+    pub const BPF_OBJ_PIN: u32 = 6;
+    /// Gives a descriptor of a pinned object.
+    pub const BPF_OBJ_GET: u32 = 7;
     /// Makes the map read only for system calls.
     pub const BPF_MAP_FREEZE: u32 = 22;
     /// The flag of the command that tells that the call has `struct bpf_common_attr`.
@@ -84,6 +88,8 @@ pub mod flags {
     pub const BPF_F_PRESERVE_ELEMS: u32 = 1 << 11;
     /// The map can be an inner map with a different `max_entries`.
     pub const BPF_F_INNER_MAP: u32 = 1 << 12;
+    /// `path_fd` has the directory of `pathname`, for `BPF_OBJ_PIN` and `BPF_OBJ_GET`.
+    pub const BPF_F_PATH_FD: u32 = 1 << 14;
     /// `map_token_fd` has a BPF token.
     pub const BPF_F_TOKEN_FD: u32 = 1 << 16;
     /// The flags of the access, `BPF_F_ACCESS_MASK`.

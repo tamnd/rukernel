@@ -4,6 +4,7 @@
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
 use rk_abi::Errno;
+use rk_bpf::inode::{BpfObj, bpf_mkobj, bpf_obj_of};
 use rk_bpf::map::MapEnv;
 use rk_bpf::prog::prog_type::BPF_PROG_TYPE_SOCKET_FILTER;
 use rk_bpf::prog::{BpfProg, bpf_prog_of, run_socket_filter};
@@ -53,6 +54,23 @@ impl Env for BpfEnv<'_, '_> {
             return Err(Errno::EBADF);
         }
         self.0.fdget(fd as u64)
+    }
+
+    fn obj_pin(&self, path_fd: i32, pathname: u64, obj: BpfObj) -> Result<(), Errno> {
+        let path = self.0.read_path(pathname)?;
+        let fs = self.0.fs()?;
+        let start = self.0.dir_start(&fs, path_fd as u64, &path)?;
+        fs.mkobj(&start, &path, 0o600, |dir, name, perm| bpf_mkobj(dir, name, perm, obj))?;
+        Ok(())
+    }
+
+    fn obj_get(&self, path_fd: i32, pathname: u64, mask: u32) -> Result<BpfObj, Errno> {
+        let path = self.0.read_path(pathname)?;
+        let fs = self.0.fs()?;
+        let start = self.0.dir_start(&fs, path_fd as u64, &path)?;
+        let at = fs.resolve(&start, &path, true)?;
+        fs.permission(&at, mask)?;
+        bpf_obj_of(at.inode())
     }
 }
 

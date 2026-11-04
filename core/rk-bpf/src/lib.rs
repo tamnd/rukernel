@@ -13,6 +13,7 @@ pub mod attr;
 pub mod core;
 pub mod file;
 pub mod helpers;
+pub mod inode;
 pub mod insn;
 pub mod map;
 pub mod prog;

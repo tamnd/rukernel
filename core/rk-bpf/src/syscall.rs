@@ -7,21 +7,22 @@
 use crate::UNPRIVILEGED_BPF_DISABLED;
 use crate::attr::{
     BPF_ATTR_SIZE, BPF_COMMON_ATTR_SIZE, BpfAttr, bpf_check_uarg_tail_zero, common, last_field,
-    map_create, map_elem, prog_load,
+    map_create, map_elem, obj, prog_load,
 };
 use crate::file::{BpfMapFile, bpf_map_of};
+use crate::inode::BpfObj;
 use crate::insn::{BPF_COMPLEXITY_LIMIT_INSNS, BPF_MAXINSNS, INSN_SIZE, decode};
 use crate::map::{
     BpfMap, MapAttr, MapEnv, bpf_map_type_known, bpf_obj_name_cpy, map_alloc, map_alloc_check,
 };
 use crate::prog::prog_flags::*;
 use crate::prog::prog_type::*;
-use crate::prog::{BpfProg, BpfProgFile, bpf_prog_alloc_id, bpf_prog_calc_tag};
+use crate::prog::{BpfProg, BpfProgFile, bpf_prog_alloc_id, bpf_prog_calc_tag, bpf_prog_of};
 use crate::uapi::CAP_BPF;
 use crate::uapi::cmd::*;
 use crate::uapi::elem::{BPF_F_CPU, BPF_F_LOCK};
 use crate::uapi::flags::{
-    BPF_F_NUMA_NODE, BPF_F_RDONLY, BPF_F_TOKEN_FD, BPF_F_WRONLY, BPF_F_ZERO_SEED,
+    BPF_F_NUMA_NODE, BPF_F_PATH_FD, BPF_F_RDONLY, BPF_F_TOKEN_FD, BPF_F_WRONLY, BPF_F_ZERO_SEED,
 };
 use crate::uapi::map_type::*;
 use crate::verifier::{BPF_LOG_FIXED, BPF_LOG_MASK, BpfVerifierLog, VerifierOpts, bpf_check};
@@ -29,7 +30,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::Errno;
+use rk_abi::native::at::AT_FDCWD;
 use rk_abi::native::open::{O_RDONLY, O_RDWR, O_WRONLY};
+use rk_vfs::cred::may;
 use rk_vfs::file::File;
 
 /// The result of the call.
@@ -67,6 +70,14 @@ pub trait Env {
     fn fd_install(&self, file: Arc<File>) -> Result<i32>;
     /// The file of the descriptor `fd`. A bad descriptor gives `EBADF`.
     fn fdget(&self, fd: i32) -> Result<Arc<File>>;
+    /// Makes the file of the user path `pathname` in the directory `path_fd` that pins `obj`, as
+    /// `bpf_obj_do_pin` of Linux. The file has the mode 0600 after the umask. A directory that is
+    /// not on bpffs gives `EPERM`.
+    fn obj_pin(&self, path_fd: i32, pathname: u64, obj: BpfObj) -> Result<()>;
+    /// The object of the file of the user path `pathname` in the directory `path_fd`, as
+    /// `bpf_obj_do_get` of Linux. The walk follows symbolic links, and the caller must have the
+    /// access `mask` to the file. A file that is not a pinned object gives `EACCES`.
+    fn obj_get(&self, path_fd: i32, pathname: u64, mask: u32) -> Result<BpfObj>;
 }
 
 /// `bpf_capable` of Linux.
@@ -123,6 +134,8 @@ pub fn sys_bpf(
         BPF_MAP_DELETE_ELEM => map_delete_elem(env, &attr),
         BPF_MAP_GET_NEXT_KEY => map_get_next_key(env, &attr),
         BPF_MAP_FREEZE => map_freeze(env, &attr),
+        BPF_OBJ_PIN => bpf_obj_pin(env, &attr),
+        BPF_OBJ_GET => bpf_obj_get(env, &attr),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -594,19 +607,89 @@ fn map_freeze(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     Ok(0)
 }
 
+/// The kind of access of the flags of a file, `ACC_MODE` of Linux: `MAY_READ` and `MAY_WRITE`.
+fn acc_mode(f_flags: u32) -> u32 {
+    match f_flags & 3 {
+        O_RDONLY => may::READ,
+        O_WRONLY => may::WRITE,
+        _ => may::READ | may::WRITE,
+    }
+}
+
+/// The directory of `pathname` for `BPF_OBJ_PIN` and `BPF_OBJ_GET`: `path_fd` with
+/// `BPF_F_PATH_FD`, or else the current directory. A `path_fd` without the flag gives `EINVAL`.
+fn obj_path_fd(attr: &BpfAttr) -> Result<i32> {
+    let path_fd = attr.u32(obj::PATH_FD) as i32;
+    if attr.u32(obj::FILE_FLAGS) & BPF_F_PATH_FD != 0 {
+        Ok(path_fd)
+    } else if path_fd != 0 {
+        Err(Errno::EINVAL)
+    } else {
+        Ok(AT_FDCWD)
+    }
+}
+
+/// The map or the program of a descriptor, `bpf_fd_probe_obj` of Linux. A descriptor of
+/// another file gives `EINVAL`.
+fn bpf_fd_probe_obj(env: &dyn Env, fd: u32) -> Result<BpfObj> {
+    let file = env.fdget(fd as i32)?;
+    if let Some(map) = bpf_map_of(&file) {
+        return Ok(BpfObj::Map(map));
+    }
+    bpf_prog_of(&file).map(BpfObj::Prog).ok_or(Errno::EINVAL)
+}
+
+/// `BPF_OBJ_PIN`, `bpf_obj_pin` and `bpf_obj_pin_user` of Linux.
+fn bpf_obj_pin(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    if attr.check_attr(last_field::BPF_OBJ) || attr.u32(obj::FILE_FLAGS) & !BPF_F_PATH_FD != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let path_fd = obj_path_fd(attr)?;
+    let obj = bpf_fd_probe_obj(env, attr.u32(obj::BPF_FD))?;
+    env.obj_pin(path_fd, attr.u64(obj::PATHNAME), obj)?;
+    Ok(0)
+}
+
+/// `BPF_OBJ_GET`, `bpf_obj_get` and `bpf_obj_get_user` of Linux. A program needs a file that
+/// can be read and written.
+fn bpf_obj_get(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
+    let flags = attr.u32(obj::FILE_FLAGS);
+    if attr.check_attr(last_field::BPF_OBJ)
+        || attr.u32(obj::BPF_FD) != 0
+        || flags & !(BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_PATH_FD) != 0
+    {
+        return Err(Errno::EINVAL);
+    }
+    let path_fd = obj_path_fd(attr)?;
+    let f_flags = bpf_get_file_flag(flags)?;
+    let file = match env.obj_get(path_fd, attr.u64(obj::PATHNAME), acc_mode(f_flags))? {
+        BpfObj::Prog(prog) => {
+            if f_flags != O_RDWR {
+                return Err(Errno::EINVAL);
+            }
+            File::with_ops(Arc::new(BpfProgFile { prog }), None, O_RDWR)
+        }
+        BpfObj::Map(map) => File::with_ops(Arc::new(BpfMapFile { map }), None, f_flags),
+    };
+    env.fd_install(file).map(i64::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inode::{Options, bpf_mkobj, bpf_obj_of};
     use crate::uapi::elem::{BPF_ANY, BPF_NOEXIST};
     use crate::uapi::flags::BPF_F_NO_PREALLOC;
     use alloc::collections::BTreeMap;
     use core::cell::{Cell, RefCell};
+    use rk_vfs::InodeRef;
 
     /// A process with a flat memory from address 0x1000 and a table of descriptors.
     struct FakeEnv {
         mem: RefCell<Vec<u8>>,
         files: RefCell<BTreeMap<i32, Arc<File>>>,
         caps: Cell<bool>,
+        bpffs: InodeRef,
     }
 
     const BASE: u64 = 0x1000;
@@ -617,7 +700,14 @@ mod tests {
                 mem: RefCell::new(alloc::vec![0; 4096]),
                 files: RefCell::new(BTreeMap::new()),
                 caps: Cell::new(true),
+                bpffs: crate::inode::new(Options::default()),
             }
+        }
+
+        fn cstr(&self, addr: u64) -> Vec<u8> {
+            let r = self.range(addr, 0).unwrap();
+            let mem = self.mem.borrow();
+            mem[r.start..].iter().take_while(|&&b| b != 0).copied().collect()
         }
 
         fn range(&self, addr: u64, len: usize) -> Result<core::ops::Range<usize>> {
@@ -678,6 +768,17 @@ mod tests {
 
         fn fdget(&self, fd: i32) -> Result<Arc<File>> {
             self.files.borrow().get(&fd).cloned().ok_or(Errno::EBADF)
+        }
+
+        fn obj_pin(&self, path_fd: i32, pathname: u64, obj: BpfObj) -> Result<()> {
+            assert_eq!(path_fd, AT_FDCWD);
+            let name = self.cstr(pathname);
+            bpf_mkobj(&self.bpffs, &name, 0o600, obj).map(drop)
+        }
+
+        fn obj_get(&self, path_fd: i32, pathname: u64, _mask: u32) -> Result<BpfObj> {
+            assert_eq!(path_fd, AT_FDCWD);
+            bpf_obj_of(&self.bpffs.lookup(&self.cstr(pathname))?)
         }
     }
 
@@ -892,5 +993,35 @@ mod tests {
         assert_eq!(load(&env, &[], 0), Err(Errno::E2BIG));
         env.caps.set(false);
         assert_eq!(load(&env, &good, 0), Err(Errno::EPERM));
+    }
+
+    fn obj(pathname: u64, fd: i64, flags: u32) -> BpfAttr {
+        let mut a = BpfAttr::zeroed();
+        a.set_u64(obj::PATHNAME, pathname);
+        a.set_u32(obj::BPF_FD, fd as u32);
+        a.set_u32(obj::FILE_FLAGS, flags);
+        a
+    }
+
+    #[test]
+    fn obj_pin_and_obj_get_give_the_same_map() {
+        let env = FakeEnv::new();
+        let fd = env.call(BPF_MAP_CREATE, &create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, 0)).unwrap();
+        let path = BASE + 1024;
+        env.put(path, b"m\0");
+        assert_eq!(env.call(BPF_OBJ_PIN, &obj(path, fd, 0)), Ok(0));
+        assert_eq!(env.call(BPF_OBJ_PIN, &obj(path, fd, 0)), Err(Errno::EEXIST));
+        assert_eq!(env.call(BPF_OBJ_PIN, &obj(path, fd, 1)), Err(Errno::EINVAL));
+        assert_eq!(env.call(BPF_OBJ_GET, &obj(path, fd, 0)), Err(Errno::EINVAL));
+        let both = BPF_F_RDONLY | BPF_F_WRONLY;
+        assert_eq!(env.call(BPF_OBJ_GET, &obj(path, 0, both)), Err(Errno::EINVAL));
+        let mut path_fd = obj(path, 0, 0);
+        path_fd.set_u32(obj::PATH_FD, 3);
+        assert_eq!(env.call(BPF_OBJ_GET, &path_fd), Err(Errno::EINVAL));
+        let got = env.call(BPF_OBJ_GET, &obj(path, 0, BPF_F_RDONLY)).unwrap();
+        let a = bpf_map_of(&env.fdget(fd as i32).unwrap()).unwrap();
+        let b = bpf_map_of(&env.fdget(got as i32).unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(!env.fdget(got as i32).unwrap().flags().writable());
     }
 }

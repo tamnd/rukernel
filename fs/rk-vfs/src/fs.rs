@@ -594,6 +594,23 @@ impl FsContext {
         Ok(Location { mount: parent.dir.mount, dentry })
     }
 
+    /// Makes a regular file with the inode that `f` makes, as `vfs_mkobj` of Linux, for a file
+    /// that a system call makes in a pseudo file system, as a pinned BPF object. `f` gets the
+    /// directory, the name and the permission bits after the umask.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `mknodat` and of `f`.
+    pub fn mkobj(
+        &self,
+        start: &Location,
+        path: &[u8],
+        perm: u32,
+        f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
+    ) -> Result<Location> {
+        self.make(start, path, FileType::Regular, perm & mode::PERM_MASK, f)
+    }
+
     /// `mkdirat`.
     pub fn mkdir(&self, start: &Location, path: &[u8], perm: u32) -> Result<Location> {
         self.make(start, path, FileType::Directory, perm & 0o1777, |dir, name, perm| {

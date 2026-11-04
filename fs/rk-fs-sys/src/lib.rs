@@ -455,9 +455,10 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
                 .map(|(n, text)| (String::from(n), Kind::File(text.into_bytes())))
                 .collect()
         }
-        // `/sys/fs/cgroup` is the place where the init system mounts cgroup2.
-        ["fs"] => dirs(&mut ["cgroup", "ext4"].into_iter()),
-        ["fs", "cgroup"] => Vec::new(),
+        // `/sys/fs/cgroup` is the place where the init system mounts cgroup2, and `/sys/fs/bpf`
+        // is the place for bpffs.
+        ["fs"] => dirs(&mut ["bpf", "cgroup", "ext4"].into_iter()),
+        ["fs", "bpf"] | ["fs", "cgroup"] => Vec::new(),
         ["fs", "ext4"] => dirs(&mut ["features"].into_iter()),
         ["fs", "ext4", "features"] => EXT4_FEATURES
             .iter()
@@ -759,7 +760,8 @@ mod tests {
 
     #[test]
     fn ext4_tells_its_features() {
-        assert_eq!(names("fs"), ["cgroup", "ext4"]);
+        assert_eq!(names("fs"), ["bpf", "cgroup", "ext4"]);
+        assert!(names("fs/bpf").is_empty());
         assert!(names("fs/cgroup").is_empty());
         assert_eq!(names("fs/ext4/features"), ["meta_bg_resize"]);
         assert_eq!(get("fs/ext4/features/meta_bg_resize"), Kind::File(b"supported\n".to_vec()));

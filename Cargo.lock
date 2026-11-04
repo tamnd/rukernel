@@ -276,6 +276,7 @@ name = "rukernel"
 version = "0.5.4"
 dependencies = [
  "rk-abi",
+ "rk-bpf",
  "rk-cgroup",
  "rk-drv-mem",
  "rk-drv-tty",
