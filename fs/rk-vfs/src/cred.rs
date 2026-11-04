@@ -185,7 +185,7 @@ pub mod may {
 /// The owner, the creator and the mode of a System V IPC object, as `struct kern_ipc_perm` of
 /// Linux.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IpcOwner {
+pub struct IpcOwner<'a> {
     /// The user ID of the owner.
     pub uid: u32,
     /// The group ID of the owner.
@@ -196,6 +196,8 @@ pub struct IpcOwner {
     pub cgid: u32,
     /// The permission bits.
     pub mode: u32,
+    /// The security part of the object, for the hooks of the security modules.
+    pub security: Option<&'a crate::security::IpcSecurity>,
 }
 
 /// The credentials of a process.
@@ -676,7 +678,7 @@ impl Cred {
     /// # Errors
     ///
     /// Gives `EACCES` if the access is not allowed.
-    pub fn ipc_permission(&self, ipc: &IpcOwner, flag: u32) -> Result<()> {
+    pub fn ipc_permission(&self, ipc: &IpcOwner<'_>, flag: u32) -> Result<()> {
         let requested = (flag >> 6) | (flag >> 3) | flag;
         let granted = if self.euid == ipc.cuid || self.euid == ipc.uid {
             ipc.mode >> 6
@@ -688,13 +690,13 @@ impl Cred {
         if requested & !granted & 0o7 != 0 && !self.capable(cap::IPC_OWNER) {
             return Err(Errno::EACCES);
         }
-        Ok(())
+        crate::security::ipc_permission(self, ipc, flag)
     }
 
     /// Tells if the process can change or remove a System V IPC object with `IPC_SET` or
     /// `IPC_RMID`, as `ipcctl_obtain_check` of Linux: its effective user ID is the owner or the
     /// creator, or it has `CAP_SYS_ADMIN`.
-    pub fn ipc_owns(&self, ipc: &IpcOwner) -> bool {
+    pub fn ipc_owns(&self, ipc: &IpcOwner<'_>) -> bool {
         self.euid == ipc.cuid || self.euid == ipc.uid || self.capable(cap::SYS_ADMIN)
     }
 
@@ -1491,7 +1493,8 @@ mod tests {
 
     #[test]
     fn ipc_objects_check_the_owner_and_the_creator() {
-        let ipc = IpcOwner { uid: 1000, gid: 50, cuid: 2000, cgid: 60, mode: 0o640 };
+        let ipc =
+            IpcOwner { uid: 1000, gid: 50, cuid: 2000, cgid: 60, mode: 0o640, security: None };
         let (owner, creator, other) = (user(1000), user(2000), user(3000));
         assert_eq!(owner.ipc_permission(&ipc, 0o666), Ok(()));
         assert_eq!(creator.ipc_permission(&ipc, 0o600), Ok(()));

@@ -224,37 +224,52 @@ pub fn inode_blob(inode: &dyn Inode) -> Option<Arc<Blob>> {
     (weak.strong_count() > 0).then(|| blob.clone())
 }
 
-/// The blobs of the super blocks, by the device number of the file system.
-static SUPERS: SpinLock<BTreeMap<u64, Arc<Blob>>> = SpinLock::new(BTreeMap::new());
+/// The blobs of the super blocks, by the device number of the file system. An entry holds a
+/// weak reference to the root of the file system, so the blob goes when the file system goes.
+static SUPERS: SpinLock<BTreeMap<u64, (Weak<dyn Inode>, Arc<Blob>)>> =
+    SpinLock::new(BTreeMap::new());
 
-/// Gives the file system with the device number `dev` a new blob, as `security_sb_alloc` of
-/// Linux, and runs the `sb_alloc_security` hooks. The blob of an old file system with the same
-/// number goes away.
-pub fn superblock_alloc(dev: u64) {
+/// Gives the file system with the root `root` its blob if a module asks for super block space
+/// and the file system has none yet, as `security_sb_alloc` of Linux. Then the
+/// `sb_alloc_security` hooks run. The mount code calls it when it makes a file system. The
+/// blobs of the file systems that went away go first, and their `sb_free_security` hooks run,
+/// as `security_sb_free` of Linux.
+pub fn superblock_attach(root: &InodeRef) {
     let size = super::sizes().superblock;
     if size == 0 {
         return;
     }
-    let blob = Arc::new(Blob::new(size));
-    SUPERS.lock().insert(dev, blob.clone());
+    let dev = root.metadata().dev;
+    let (blob, gone) = {
+        let mut t = SUPERS.lock();
+        if let Some((weak, _)) = t.get(&dev)
+            && weak.strong_count() > 0
+        {
+            return;
+        }
+        let dead: Vec<u64> =
+            t.iter().filter(|(_, (w, _))| w.strong_count() == 0).map(|(d, _)| *d).collect();
+        let gone: Vec<(u64, Arc<Blob>)> =
+            dead.into_iter().filter_map(|d| t.remove(&d).map(|(_, b)| (d, b))).collect();
+        let blob = Arc::new(Blob::new(size));
+        t.insert(dev, (Arc::downgrade(root), blob.clone()));
+        (blob, gone)
+    };
+    for (d, b) in &gone {
+        super::sb_free_security(*d, b);
+    }
     super::sb_alloc_security(dev, &blob);
 }
 
-/// Removes the blob of the file system `dev` and runs the `sb_free_security` hooks, as
-/// `security_sb_free` of Linux.
-pub fn superblock_free(dev: u64) {
-    let blob = SUPERS.lock().remove(&dev);
-    if let Some(blob) = blob {
-        super::sb_free_security(dev, &blob);
-    }
-}
-
-/// The blob of the file system `dev`, or `None`.
+/// The blob of the file system `dev`, or `None` if no module asks for super block space or the
+/// file system has no blob.
 pub fn superblock_blob(dev: u64) -> Option<Arc<Blob>> {
-    SUPERS.lock().get(&dev).cloned()
+    let t = SUPERS.lock();
+    let (weak, blob) = t.get(&dev)?;
+    (weak.strong_count() > 0).then(|| blob.clone())
 }
 
-/// The class of a System V IPC object, for the key of its blob.
+/// The class of a System V IPC object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum IpcClass {
     /// A message queue.
@@ -265,28 +280,36 @@ pub enum IpcClass {
     Shm,
 }
 
-/// The blobs of the System V IPC objects, by the class and the ID. The namespace of the object
-/// is the first part of the key, as an address.
-static IPCS: SpinLock<BTreeMap<(usize, IpcClass, i32), Arc<Blob>>> = SpinLock::new(BTreeMap::new());
+/// The security part of a System V IPC object: its class and its blob, as the `security` field
+/// of `struct kern_ipc_perm` of Linux. The object keeps it in its table entry. When it is
+/// dropped, the `*_free_security` hooks of its class run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IpcSecurity {
+    class: IpcClass,
+    blob: Blob,
+}
 
-/// Gives a new IPC object its blob, as the `*_alloc_security` hooks of Linux. `ns` tells the
-/// IPC namespace apart, for example by its address.
-pub fn ipc_alloc(ns: usize, class: IpcClass, id: i32) -> Option<Arc<Blob>> {
-    let size = super::sizes().ipc;
-    if size == 0 {
-        return None;
+impl IpcSecurity {
+    /// The part of a new object of the class `class`, with a blob of the size of the IPC blob.
+    /// The caller then calls [`super::ipc_alloc`].
+    pub fn new(class: IpcClass) -> Self {
+        Self { class, blob: Blob::new(super::sizes().ipc) }
     }
-    let blob = Arc::new(Blob::new(size));
-    IPCS.lock().insert((ns, class, id), blob.clone());
-    Some(blob)
+
+    /// The class of the object.
+    pub fn class(&self) -> IpcClass {
+        self.class
+    }
+
+    /// The blob of the object.
+    pub fn blob(&self) -> &Blob {
+        &self.blob
+    }
 }
 
-/// Removes the blob of an IPC object, as the `*_free_security` hooks of Linux.
-pub fn ipc_free(ns: usize, class: IpcClass, id: i32) -> Option<Arc<Blob>> {
-    IPCS.lock().remove(&(ns, class, id))
-}
-
-/// The blob of an IPC object, or `None`.
-pub fn ipc_blob(ns: usize, class: IpcClass, id: i32) -> Option<Arc<Blob>> {
-    IPCS.lock().get(&(ns, class, id)).cloned()
+/// As Linux, the free hooks also run for an object whose alloc hooks failed.
+impl Drop for IpcSecurity {
+    fn drop(&mut self) {
+        super::ipc_free(self);
+    }
 }

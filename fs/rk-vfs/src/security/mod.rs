@@ -15,10 +15,10 @@ pub mod hooks;
 #[cfg(test)]
 mod tests;
 
-pub use blob::{Blob, BlobSizes};
+pub use blob::{Blob, BlobSizes, IpcClass, IpcSecurity};
 pub use hooks::{HOOK_COUNT, HOOK_NAMES, SecurityHooks, hook_index};
 
-use crate::cred::Cred;
+use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
 use crate::inode::{Inode, Result};
@@ -364,12 +364,12 @@ pub fn bprm_committed_creds(filename: &[u8], file: &Location) {
     call_void_hook!(bprm_committed_creds, filename, file);
 }
 
-/// The `sb_alloc_security` hooks, for [`blob::superblock_alloc`].
+/// The `sb_alloc_security` hooks, for [`blob::superblock_attach`].
 fn sb_alloc_security(dev: u64, blob: &Blob) {
     call_void_hook!(sb_alloc_security, dev, blob);
 }
 
-/// The `sb_free_security` hooks, for [`blob::superblock_free`].
+/// The `sb_free_security` hooks, for [`blob::superblock_attach`].
 fn sb_free_security(dev: u64, blob: &Blob) {
     call_void_hook!(sb_free_security, dev, blob);
 }
@@ -567,4 +567,40 @@ pub fn socket_setsockopt(sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
 /// `security_socket_shutdown`.
 pub fn socket_shutdown(sock: &Sock<'_>, how: i32) -> Result<()> {
     call_int_hook!(socket_shutdown, sock, how)
+}
+
+/// `security_ipc_permission`, for [`Cred::ipc_permission`].
+pub fn ipc_permission(cred: &Cred, ipc: &IpcOwner<'_>, flag: u32) -> Result<()> {
+    call_int_hook!(ipc_permission, cred, ipc, flag)
+}
+
+/// `security_msg_queue_alloc`, `security_sem_alloc` or `security_shm_alloc`, by the class of
+/// `ipc`. The caller makes the object only if the hooks give no error.
+pub fn ipc_alloc(ipc: &IpcSecurity) -> Result<()> {
+    match ipc.class() {
+        IpcClass::Msg => call_int_hook!(msg_queue_alloc_security, ipc),
+        IpcClass::Sem => call_int_hook!(sem_alloc_security, ipc),
+        IpcClass::Shm => call_int_hook!(shm_alloc_security, ipc),
+    }
+}
+
+/// `security_msg_queue_free`, `security_sem_free` or `security_shm_free`, for the drop of
+/// [`IpcSecurity`].
+fn ipc_free(ipc: &IpcSecurity) {
+    match ipc.class() {
+        IpcClass::Msg => call_void_hook!(msg_queue_free_security, ipc),
+        IpcClass::Sem => call_void_hook!(sem_free_security, ipc),
+        IpcClass::Shm => call_void_hook!(shm_free_security, ipc),
+    }
+}
+
+/// `security_msg_queue_associate`, `security_sem_associate` or `security_shm_associate`, by
+/// the class of `ipc`. An object with no security part has no hooks.
+pub fn ipc_associate(ipc: &IpcOwner<'_>, flag: u32) -> Result<()> {
+    match ipc.security.map(IpcSecurity::class) {
+        Some(IpcClass::Msg) => call_int_hook!(msg_queue_associate, ipc, flag),
+        Some(IpcClass::Sem) => call_int_hook!(sem_associate, ipc, flag),
+        Some(IpcClass::Shm) => call_int_hook!(shm_associate, ipc, flag),
+        None => Ok(()),
+    }
 }

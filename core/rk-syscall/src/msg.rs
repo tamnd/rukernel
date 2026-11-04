@@ -21,6 +21,7 @@ use rk_abi::Errno;
 use rk_vfs::WaitQueue;
 use rk_vfs::cred::{IpcOwner, cap};
 use rk_vfs::ipc::{MSG_NEXT_ID, MSGMAX, MSGMNB, MSGMNI, Msg, MsgQueue, Search};
+use rk_vfs::security::{IpcClass, IpcSecurity};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new queue.
@@ -68,14 +69,16 @@ struct IpcPerm {
 }
 
 impl IpcPerm {
-    /// The owner, the creator and the mode, for the permission checks.
-    fn owner(&self) -> IpcOwner {
+    /// The owner, the creator, the mode and the security part `security`, for the permission
+    /// checks.
+    fn owner<'a>(&self, security: &'a IpcSecurity) -> IpcOwner<'a> {
         IpcOwner {
             uid: self.uid,
             gid: self.gid,
             cuid: self.cuid,
             cgid: self.cgid,
             mode: u32::from(self.mode),
+            security: Some(security),
         }
     }
 }
@@ -113,6 +116,8 @@ struct MsgInfo {
 
 /// A queue in the table.
 struct Queue {
+    /// The security part, as the `security` field of `struct kern_ipc_perm` of Linux.
+    security: IpcSecurity,
     perm: IpcPerm,
     msgs: MsgQueue,
     stime: i64,
@@ -123,6 +128,11 @@ struct Queue {
 }
 
 impl Queue {
+    /// The owner, the creator, the mode and the security part, for the permission checks.
+    fn owner(&self) -> IpcOwner<'_> {
+        self.perm.owner(&self.security)
+    }
+
     fn ds(&self) -> MsqidDs {
         MsqidDs {
             perm: self.perm,
@@ -182,16 +192,14 @@ pub(crate) fn msgget(cx: &Cx<'_>, key: u64, flags: u64) -> SysResult {
     let c = cx.process().cred();
     let mut table = TABLE.get().lock();
     if key != IPC_PRIVATE {
-        let found = table
-            .queues
-            .iter()
-            .find(|(_, q)| q.perm.key == key)
-            .map(|(id, q)| (*id, q.perm.owner()));
+        let found =
+            table.queues.iter().find(|(_, q)| q.perm.key == key).map(|(id, q)| (*id, q.owner()));
         if let Some((id, owner)) = found {
             if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
                 return Err(Errno::EEXIST);
             }
             c.ipc_permission(&owner, flags & 0o777)?;
+            rk_vfs::security::ipc_associate(&owner, flags)?;
             return Ok(id as u64);
         }
         if flags & IPC_CREAT == 0 {
@@ -201,6 +209,9 @@ pub(crate) fn msgget(cx: &Cx<'_>, key: u64, flags: u64) -> SysResult {
     if table.queues.len() >= MSGMNI.get() as usize {
         return Err(Errno::ENOSPC);
     }
+    // The modules see the new object before it gets its ID, as `newque` of Linux.
+    let security = IpcSecurity::new(IpcClass::Msg);
+    rk_vfs::security::ipc_alloc(&security)?;
     let id = rk_vfs::ipc::alloc_id(&MSG_NEXT_ID, table.next, |id| table.queues.contains_key(&id));
     table.next = id.wrapping_add(1) & i32::MAX;
     // The owner and the creator are the effective IDs of the caller, as `ipc_addid` of Linux.
@@ -215,6 +226,7 @@ pub(crate) fn msgget(cx: &Cx<'_>, key: u64, flags: u64) -> SysResult {
     };
     let qbytes = MSGMNB.get().max(0) as usize;
     let queue = Queue {
+        security,
         perm,
         msgs: MsgQueue::new(qbytes),
         stime: 0,
@@ -246,7 +258,7 @@ pub(crate) fn msgsnd(cx: &Cx<'_>, id: u64, msgp: u64, msgsz: u64, flags: u64) ->
     let mut step = || {
         let mut table = TABLE.get().lock();
         let Some(q) = table.queues.get_mut(&id) else { return Some(Err(Errno::EIDRM)) };
-        if let Err(e) = c.ipc_permission(&q.perm.owner(), 0o222) {
+        if let Err(e) = c.ipc_permission(&q.owner(), 0o222) {
             return Some(Err(e));
         }
         let len = msg.as_ref().map_or(0, |m| m.text.len());
@@ -306,7 +318,7 @@ pub(crate) fn msgrcv(
     let mut step = || {
         let mut table = TABLE.get().lock();
         let Some(q) = table.queues.get_mut(&id) else { return Some(Err(Errno::EIDRM)) };
-        if let Err(e) = c.ipc_permission(&q.perm.owner(), 0o444) {
+        if let Err(e) = c.ipc_permission(&q.owner(), 0o444) {
             return Some(Err(e));
         }
         if let Some(i) = q.msgs.find(search) {
@@ -387,7 +399,7 @@ pub(crate) fn msgctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
             let q = table.get(id)?;
             if cmd != MSG_STAT_ANY {
-                c.ipc_permission(&q.perm.owner(), 0o444)?;
+                c.ipc_permission(&q.owner(), 0o444)?;
             }
             let ds = q.ds();
             drop(table);
@@ -397,7 +409,7 @@ pub(crate) fn msgctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         IPC_SET => {
             let ds = new.ok_or(Errno::EINVAL)?;
             let q = table.get(id)?;
-            if !c.ipc_owns(&q.perm.owner()) {
+            if !c.ipc_owns(&q.owner()) {
                 return Err(Errno::EPERM);
             }
             // A limit above `msgmnb` needs `CAP_SYS_RESOURCE`, as `msgctl_down` of Linux.
@@ -419,7 +431,7 @@ pub(crate) fn msgctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
             Ok(0)
         }
         IPC_RMID => {
-            if !c.ipc_owns(&table.get(id)?.perm.owner()) {
+            if !c.ipc_owns(&table.get(id)?.owner()) {
                 return Err(Errno::EPERM);
             }
             table.queues.remove(&id);
