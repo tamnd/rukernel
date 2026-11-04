@@ -3375,6 +3375,47 @@ static void test_pid_ns(void)
 		printf("init: procfs PID namespace seen %d status %d\n", seen, WEXITSTATUS(status));
 	close(sync[0]);
 	close(sync[1]);
+	/* clone3 with set_tid gives the child the IDs that the caller asks for, one for each level
+	 * from the namespace of the child up. */
+	{
+		struct clone_args ca;
+		pid_t tids[2] = {1, 0}, free_id = 0;
+		int ok = 1;
+		for (pid_t t = 4000; t < 4100 && !free_id; t++)
+			if (kill(t, 0) == -1 && errno == ESRCH && getpgid(t) == -1)
+				free_id = t;
+		memset(&ca, 0, sizeof(ca));
+		ca.exit_signal = SIGCHLD;
+		ca.set_tid = (uint64_t)(uintptr_t)tids;
+		ca.set_tid_size = 1;
+		tids[0] = free_id;
+		pid = syscall(SYS_clone3, &ca, sizeof(ca));
+		if (pid == 0)
+			_exit(getpid() == free_id ? 0 : 1);
+		ok &= free_id > 0 && pid == free_id && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0;
+		tids[0] = 1;
+		errno = 0;
+		ok &= syscall(SYS_clone3, &ca, sizeof(ca)) == -1 && errno == EEXIST;
+		ca.set_tid_size = 2;
+		errno = 0;
+		ok &= syscall(SYS_clone3, &ca, sizeof(ca)) == -1 && errno == EINVAL;
+		ca.flags = CLONE_NEWPID;
+		tids[0] = 2;
+		tids[1] = free_id;
+		errno = 0;
+		ok &= syscall(SYS_clone3, &ca, sizeof(ca)) == -1 && errno == EINVAL;
+		tids[0] = 1;
+		pid = syscall(SYS_clone3, &ca, sizeof(ca));
+		if (pid == 0)
+			_exit(getpid() == 1 ? 0 : 1);
+		ok &= pid == free_id && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0;
+		ca.set_tid_size = 0;
+		errno = 0;
+		ok &= syscall(SYS_clone3, &ca, sizeof(ca)) == -1 && errno == EINVAL;
+		check("clone3 with set_tid gives the IDs of each level, and EEXIST or EINVAL for a bad list", ok);
+	}
 	pid = fork();
 	if (pid == 0) {
 		int self = open("/proc/self/ns/pid", O_RDONLY), in[2], out[2], code = 0;

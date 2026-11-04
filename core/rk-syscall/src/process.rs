@@ -249,7 +249,7 @@ pub(crate) fn clone(
         return Err(Errno::EINVAL);
     }
     // `clone` takes the low 32 bits of the flags. The bits above are only for `clone3`.
-    do_clone(cx, &CloneArgs { flags: args.flags & 0xffff_ffff, ..args }, stack)
+    do_clone(cx, &CloneArgs { flags: args.flags & 0xffff_ffff, ..args }, stack, &Default::default())
 }
 
 /// The largest `struct clone_args` that `clone3` reads. Linux gives `E2BIG` for a larger one.
@@ -460,8 +460,7 @@ fn cgroup_of_fd(cx: &Cx<'_>, fd: u64) -> Result<u32, Errno> {
 }
 
 /// `clone3`, as `copy_clone_args_from_user` and `clone3_args_valid` of Linux check it. The stack
-/// of `clone3` is the lowest address and a size, and the new thread starts at the top. `set_tid`
-/// is not in R2, so it gives `EINVAL`.
+/// of `clone3` is the lowest address and a size, and the new thread starts at the top.
 pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     if size > CLONE_ARGS_MAX {
         return Err(Errno::E2BIG);
@@ -483,8 +482,8 @@ pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     if flags & (CLONE_DETACHED | (CSIGNAL & !CLONE_NEWTIME)) != 0
         || flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
         || (flags & CLONE_INTO_CGROUP != 0 && flags & CLONE_THREAD != 0)
-        || args.set_tid != 0
-        || args.set_tid_size != 0
+        || args.set_tid_size > u64::from(pid_namespace::MAX_PID_NS_LEVEL)
+        || (args.set_tid == 0) != (args.set_tid_size == 0)
         || args.exit_signal >= NSIG
         || (flags & CLONE_SIGHAND != 0 && flags & CLONE_CLEAR_SIGHAND != 0)
         || (flags & (CLONE_THREAD | CLONE_PARENT) != 0 && args.exit_signal != 0)
@@ -497,13 +496,33 @@ pub(crate) fn clone3(cx: &mut Cx<'_>, uargs: u64, size: u64) -> SysResult {
     } else {
         args.stack.checked_add(args.stack_size).ok_or(Errno::EINVAL)?
     };
-    do_clone(cx, &args, top)
+    // The IDs of `set_tid`, from the namespace of the child up, as `copy_clone_args_from_user`.
+    // A valid ID is at least 1, so a 0 in the list gives `EINVAL`.
+    let mut set_tid: rk_proc::SetTid = Default::default();
+    if args.set_tid_size != 0 {
+        let n = args.set_tid_size as usize;
+        let mut raw = alloc::vec![0u8; n * 4];
+        cx.vm()?.read(args.set_tid as usize, &mut raw)?;
+        for (i, b) in raw.chunks_exact(4).enumerate() {
+            let tid = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+            set_tid[i] = u32::try_from(tid).ok().filter(|&t| t >= 1).ok_or(Errno::EINVAL)?;
+        }
+        // The caller needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`, as
+        // `checkpoint_restore_ns_capable` in `alloc_pid` of Linux.
+        let cred = cx.process().cred();
+        if !cred.capable(rk_vfs::cred::cap::CHECKPOINT_RESTORE)
+            && !cred.capable(rk_vfs::cred::cap::SYS_ADMIN)
+        {
+            return Err(Errno::EPERM);
+        }
+    }
+    do_clone(cx, &args, top, &set_tid)
 }
 
 /// Makes a new thread or process for `clone` and `clone3`. `stack` is the stack pointer of the
 /// new thread, or 0 for the stack pointer of the caller. A tracer that asked for the event of the
 /// call traces the new thread too.
-fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
+fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::SetTid) -> SysResult {
     let flags = args.flags;
     if flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0 {
         return Err(Errno::EINVAL);
@@ -555,7 +574,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
     let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cx.process())?) } else { None };
     let time = new_time_ns(cx.thread, flags)?;
     let thread = if flags & CLONE_THREAD != 0 {
-        rk_proc::new_thread(cx.thread)?
+        rk_proc::new_thread_with(cx.thread, set_tid)?
     } else {
         let share = ForkShare {
             vm: flags & CLONE_VM != 0,
@@ -565,6 +584,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64) -> SysResult {
             parent: flags & CLONE_PARENT != 0,
             cgroup,
             new_pid_ns: flags & CLONE_NEWPID != 0,
+            set_tid: *set_tid,
         };
         rk_proc::fork(cx.thread, share)?
     };
