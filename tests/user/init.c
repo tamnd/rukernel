@@ -5765,6 +5765,86 @@ static void test_bpf_cgroup(void)
 	rmdir("/bpfcg");
 }
 
+static int cg_write(const char *path, const char *s);
+
+/*
+ * The hooks of the cgroup programs: a device program that refuses the major number 1 and a
+ * socket program that refuses each socket stop the tasks of the cgroup only (#537).
+ */
+static void test_bpf_cgroup_hooks(void)
+{
+	unsigned long long insns[] = {
+		bpf_insn(0x61, 2, 1, 4, 0),	/* r2 = ctx->major */
+		bpf_insn(0xb7, 0, 0, 0, 1),	/* r0 = 1 */
+		bpf_insn(0x55, 2, 0, 1, 1),	/* if r2 != 1 goto +1 */
+		bpf_insn(0xb7, 0, 0, 0, 0),	/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),	/* exit */
+	};
+	unsigned char attr[168] = { 0 };
+	int dev, sock, child, fd, status, ok;
+	pid_t pid;
+
+	mkdir("/bpfcg", 0755);
+	if (mount("none", "/bpfcg", "cgroup2", 0, NULL) != 0) {
+		check("mount cgroup2 for the hooks of the cgroup programs", 0);
+		return;
+	}
+	mkdir("/bpfcg/rk_hook", 0755);
+	child = open("/bpfcg/rk_hook", O_RDONLY | O_DIRECTORY);
+	bpf_put32(attr, 0, 15);
+	bpf_put32(attr, 4, 5);
+	bpf_put64(attr, 8, (unsigned long)insns);
+	bpf_put64(attr, 16, (unsigned long)"GPL");
+	dev = bpf_call(5, attr, sizeof(attr));
+	sock = bpf_prog_ret(9, 0, 0);
+	ok = dev >= 0 && sock >= 0 && bpf_attach(8, child, dev, 6, 0) == 0 &&
+	     bpf_attach(8, child, sock, 2, 0) == 0;
+	check("BPF_PROG_ATTACH of a device and a socket program", ok);
+	pid = fork();
+	if (pid == 0) {
+		int r = 0;
+
+		if (cg_write("/bpfcg/rk_hook/cgroup.procs", "0") != 0)
+			_exit(1);
+		errno = 0;
+		if (open("/dev/null", O_RDONLY) != -1 || errno != EPERM)
+			r |= 2;
+		errno = 0;
+		if (mknod("/rk_hook_null", S_IFCHR | 0600, makedev(1, 3)) != -1 || errno != EPERM)
+			r |= 4;
+		fd = open("/dev/console", O_RDONLY);
+		if (fd < 0)
+			r |= 8;
+		close(fd);
+		errno = 0;
+		if (socket(AF_INET, SOCK_DGRAM, 0) != -1 || errno != EPERM)
+			r |= 16;
+		fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+		if (fd < 0)
+			r |= 32;
+		close(fd);
+		_exit(r);
+	}
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	if (ok && WEXITSTATUS(status) != 0)
+		printf("rk-bpf: the hook check gave %d\n", WEXITSTATUS(status));
+	check("the device and the socket programs refuse the access of a task in the cgroup",
+	      ok && WEXITSTATUS(status) == 0);
+	fd = open("/dev/null", O_RDONLY);
+	ok = fd >= 0;
+	close(fd);
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	ok = ok && fd >= 0;
+	close(fd);
+	check("the programs of a cgroup do not stop a task in another cgroup", ok);
+	close(child);
+	close(dev);
+	close(sock);
+	check("rmdir of a cgroup with a device program", rmdir("/bpfcg/rk_hook") == 0);
+	umount("/bpfcg");
+	rmdir("/bpfcg");
+}
+
 /* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
 static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 {
@@ -5934,6 +6014,7 @@ static void test_bpf(void)
 	test_bpf_prog();
 	test_bpf_ids();
 	test_bpf_cgroup();
+	test_bpf_cgroup_hooks();
 	test_bpffs();
 	umount("/proc");
 }

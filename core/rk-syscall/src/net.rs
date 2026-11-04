@@ -200,10 +200,15 @@ fn family_socket(
                 }
                 _ => {}
             }
-            if family == AF_INET6 {
-                return Ok(rk_net_inet::new_socket6(proto));
-            }
-            Ok(rk_net_inet::new_socket(proto))
+            let sock = if family == AF_INET6 {
+                rk_net_inet::new_socket6(proto)
+            } else {
+                rk_net_inet::new_socket(proto)
+            };
+            // The programs of `BPF_CGROUP_INET_SOCK_CREATE` can refuse the socket, as
+            // `inet_create` of Linux.
+            crate::bpf::cgroup_run_inet_sock(&*sock)?;
+            Ok(sock)
         }
         // A packet socket needs `CAP_NET_RAW`, as `packet_create` of Linux.
         rk_net::packet::AF_PACKET => {

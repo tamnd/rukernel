@@ -470,6 +470,12 @@ impl FsContext {
         if !created {
             self.cred.inode_permission(&**at.inode(), open_mask(flags))?;
         }
+        // The device controller checks the open of a device, as `devcgroup_inode_permission` in
+        // `inode_permission` of Linux.
+        if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+            let block = kind == FileType::BlockDevice;
+            device::devcgroup_inode_permission(block, meta.rdev, open_mask(flags))?;
+        }
         // A mount with `MS_NODEV` does not open a device, as `may_open_dev` of Linux.
         let nodev = u64::from(rk_abi::native::mount::MS_NODEV);
         if matches!(kind, FileType::CharDevice | FileType::BlockDevice)
@@ -633,6 +639,9 @@ impl FsContext {
                 && !self.cred.capable(cap::MKNOD)
             {
                 return Err(Errno::EPERM);
+            }
+            if matches!(kind, FileType::CharDevice | FileType::BlockDevice) {
+                device::devcgroup_inode_mknod(kind == FileType::BlockDevice, rdev)?;
             }
             dir.create(name, kind, perm, rdev)
         })

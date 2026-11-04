@@ -134,6 +134,69 @@ pub enum NodeChange {
     Remove,
 }
 
+/// The types of a device and the accesses of the device controller, `DEVCG_DEV_*` and
+/// `DEVCG_ACC_*` of Linux.
+pub mod devcg {
+    /// A block device.
+    pub const DEV_BLOCK: u32 = 1;
+    /// A character device.
+    pub const DEV_CHAR: u32 = 2;
+    /// `mknod`.
+    pub const ACC_MKNOD: u32 = 1;
+    /// A read.
+    pub const ACC_READ: u32 = 2;
+    /// A write.
+    pub const ACC_WRITE: u32 = 4;
+}
+
+/// The check of the device controller: the type, the major and minor numbers and the access.
+type DevcgroupCheck = fn(u32, u32, u32, u32) -> Result<()>;
+
+static DEVCGROUP: Once<DevcgroupCheck> = Once::new();
+
+/// Sets the check of the device controller of the cgroup of the current task, the device
+/// programs of cgroup2. Only the first call has an effect.
+pub fn set_devcgroup_check(check: DevcgroupCheck) {
+    DEVCGROUP.call_once(|| check);
+}
+
+/// `devcgroup_check_permission` of Linux: gives `EPERM` if the device controller refuses the
+/// access `access` of the type of [`devcg`] to the device `rdev`.
+pub fn devcgroup_check_permission(dev_type: u32, rdev: u64, access: u32) -> Result<()> {
+    match DEVCGROUP.get() {
+        Some(check) => check(dev_type, major(rdev), minor(rdev), access),
+        None => Ok(()),
+    }
+}
+
+/// `devcgroup_inode_permission` of Linux, for the open of a device file with the access mask
+/// `mask` of `MAY_*`.
+pub fn devcgroup_inode_permission(block: bool, rdev: u64, mask: u32) -> Result<()> {
+    use crate::cred::may;
+    let mut access = 0;
+    if mask & may::WRITE != 0 {
+        access |= devcg::ACC_WRITE;
+    }
+    if mask & may::READ != 0 {
+        access |= devcg::ACC_READ;
+    }
+    if access == 0 {
+        return Ok(());
+    }
+    let dev_type = if block { devcg::DEV_BLOCK } else { devcg::DEV_CHAR };
+    devcgroup_check_permission(dev_type, rdev, access)
+}
+
+/// `devcgroup_inode_mknod` of Linux, for `mknod` of a device file. The whiteout device 0:0 needs
+/// no check.
+pub fn devcgroup_inode_mknod(block: bool, rdev: u64) -> Result<()> {
+    if !block && rdev == 0 {
+        return Ok(());
+    }
+    let dev_type = if block { devcg::DEV_BLOCK } else { devcg::DEV_CHAR };
+    devcgroup_check_permission(dev_type, rdev, devcg::ACC_MKNOD)
+}
+
 static NODE_HOOK: Once<fn(&DeviceInfo, NodeChange)> = Once::new();
 
 /// Sets the function that makes and removes the device files of the devices that a driver adds
