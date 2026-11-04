@@ -11837,6 +11837,103 @@ static void test_nft_exprs(void)
 	close(fd);
 }
 
+#define RK_NFTA_NAT_TYPE 1
+#define RK_NFTA_NAT_FAMILY 2
+#define RK_NFTA_NAT_REG_ADDR_MIN 3
+#define RK_NFTA_NAT_REG_PROTO_MIN 5
+#define RK_NFT_NAT_SNAT 0
+#define RK_NFT_NAT_DNAT 1
+#define RK_NFT_REG_2 2
+
+/* `immediate` of `len` bytes of `data` to the register `reg`. */
+static void nft_imm(struct nft_batch *b, int reg, const void *data, int len)
+{
+	struct rtattr *e, *d = nft_expr(b, "immediate", &e);
+	nft_be32(b, RK_NFTA_IMMEDIATE_DREG, reg);
+	struct rtattr *v = nl_put(b->cur, RK_NFTA_IMMEDIATE_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b->cur, RK_NFTA_DATA_VALUE, data, len);
+	nl_end(b->cur, v);
+	nft_expr_end(b, d, e);
+}
+
+/* A rule of the chain nout of the table rkx: `udp dport 14 snat|dnat to 127.0.0.1:15`. */
+static void nft_nat_rule(struct nft_batch *b, int type)
+{
+	unsigned int addr = htonl(INADDR_LOOPBACK);
+	unsigned short port = htons(15);
+	struct rtattr *x = nft_rule(b, "nout"), *e, *d;
+
+	nft_udp_dport(b, 14);
+	nft_imm(b, RK_NFT_REG_1, &addr, 4);
+	nft_imm(b, RK_NFT_REG_2, &port, 2);
+	d = nft_expr(b, "nat", &e);
+	nft_be32(b, RK_NFTA_NAT_TYPE, type);
+	nft_be32(b, RK_NFTA_NAT_FAMILY, AF_INET);
+	nft_be32(b, RK_NFTA_NAT_REG_ADDR_MIN, RK_NFT_REG_1);
+	nft_be32(b, RK_NFTA_NAT_REG_PROTO_MIN, RK_NFT_REG_2);
+	nft_expr_end(b, d, e);
+	nl_end(b->cur, x);
+}
+
+/* NAT: `nft add chain ip rkx nout { type nat hook output priority -100; }` and
+ * `udp dport 14 dnat to 127.0.0.1:15`. A datagram to port 14 comes to the socket of port 15,
+ * and the reply comes back from port 14. */
+static void test_nft_nat(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "nout");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, (unsigned int)-100);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "nat");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	check("nft: a chain of the type nat", nft_send(fd, &b, 1) == 0);
+	nft_begin(&b, 0);
+	nft_nat_rule(&b, RK_NFT_NAT_SNAT);
+	check("nft: snat in a nat chain of the hook output gives EOPNOTSUPP",
+	      nft_send(fd, &b, 1) == -EOPNOTSUPP);
+	nft_begin(&b, 0);
+	nft_nat_rule(&b, RK_NFT_NAT_DNAT);
+	check("nft: a rule with dnat", nft_send(fd, &b, 1) == 0);
+
+	int r = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(15) }, from;
+	struct timeval tv = { .tv_sec = 2 };
+	socklen_t fl = sizeof(from);
+	char buf[8];
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	setsockopt(r, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	int ok = bind(r, (struct sockaddr *)&a, sizeof(a)) == 0;
+	a.sin_port = htons(14);
+	ok = ok && sendto(s, "n", 1, 0, (struct sockaddr *)&a, sizeof(a)) == 1;
+	ok = ok && recvfrom(r, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl) == 1 && buf[0] == 'n';
+	check("nat: dnat brings udp dport 14 to the socket of port 15", ok);
+	ok = ok && sendto(r, "m", 1, 0, (struct sockaddr *)&from, fl) == 1;
+	fl = sizeof(from);
+	ok = ok && recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl) == 1 && buf[0] == 'm';
+	check("nat: the reply comes back from port 14", ok && from.sin_port == htons(14));
+	close(r);
+	close(s);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of nat goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -11855,6 +11952,7 @@ static void test_inet(int port)
 	test_genl();
 	test_nftables();
 	test_nft_exprs();
+	test_nft_nat();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();

@@ -15,13 +15,19 @@
 use super::{
     NF_DROP, NFPROTO_IPV6, NFT_BREAK, NFT_CONTINUE, NFT_DATA_VALUE_MAXLEN, NFT_GOTO, NFT_JUMP,
     NFT_RETURN, NFT_SET_ELEM_INTERVAL_END, NFT_SET_INTERVAL, NFT_SET_MAP, NFT_SET_OBJECT,
-    NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftData, NftTable, be32, be64,
+    NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftChainType, NftData, NftTable, be32, be64,
     nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
+use crate::netfilter::nf_nat::{
+    NF_NAT_MANIP_DST, NF_NAT_MANIP_SRC, NF_NAT_RANGE_MAP_IPS, NF_NAT_RANGE_MASK,
+    NF_NAT_RANGE_NETMAP, NF_NAT_RANGE_PROTO_OFFSET, NF_NAT_RANGE_PROTO_SPECIFIED, NfNatRange,
+    hook2manip, nf_nat_masquerade, nf_nat_setup_info,
+};
 use crate::netfilter::{
-    NFPROTO_INET, NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo, nf_pktinfo as nft_pktinfo,
+    NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_INET,
+    NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo, nf_pktinfo as nft_pktinfo,
 };
 use crate::netlink::msg::Attrs;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -97,6 +103,20 @@ const NFT_CT_SRC_IP6: u32 = 21;
 const NFT_CT_DST_IP6: u32 = 22;
 const NFT_CT_ID: u32 = 23;
 
+// `NFTA_NAT_*`, `enum nft_nat_types` and `NFTA_MASQ_*`.
+const NFTA_NAT_TYPE: u32 = 1;
+const NFTA_NAT_FAMILY: u32 = 2;
+const NFTA_NAT_REG_ADDR_MIN: u32 = 3;
+const NFTA_NAT_REG_ADDR_MAX: u32 = 4;
+const NFTA_NAT_REG_PROTO_MIN: u32 = 5;
+const NFTA_NAT_REG_PROTO_MAX: u32 = 6;
+const NFTA_NAT_FLAGS: u32 = 7;
+const NFT_NAT_SNAT: u32 = 0;
+const NFT_NAT_DNAT: u32 = 1;
+const NFTA_MASQ_FLAGS: u32 = 1;
+const NFTA_MASQ_REG_PROTO_MIN: u32 = 2;
+const NFTA_MASQ_REG_PROTO_MAX: u32 = 3;
+
 /// The bits of `ct state`, as `NF_CT_STATE_INVALID_BIT` and `NF_CT_STATE_BIT` of Linux.
 const NF_CT_STATE_INVALID_BIT: u32 = 1 << 0;
 
@@ -169,6 +189,18 @@ pub(super) enum NftExpr {
     Ct { key: u32, dir: usize, len: usize, dreg: usize },
     /// `ct mark set`, as `nft_ct_set_eval`.
     CtSet { sreg: usize },
+    /// `snat` and `dnat`, as nft_nat.c. `addr` and `proto` are the registers of the first and
+    /// the last address and port; an address has `alen` bytes.
+    Nat {
+        mtype: u8,
+        family: u8,
+        alen: usize,
+        addr: Option<(usize, usize)>,
+        proto: Option<(usize, usize)>,
+        flags: u32,
+    },
+    /// `masquerade`, as nft_masq.c.
+    Masq { flags: u32, proto: Option<(usize, usize)> },
 }
 
 impl NftExpr {
@@ -350,6 +382,8 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
             })
         }
         b"ct" => nft_ct_init(table, data),
+        b"nat" => nft_nat_init(table, data),
+        b"masq" => nft_masq_init(table, data),
         _ => Err(Errno::ENOENT),
     }
 }
@@ -404,6 +438,127 @@ fn nft_ct_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
     Ok(NftExpr::Ct { key, dir: dir.unwrap_or(0), len, dreg })
 }
 
+/// Reads the registers of the first and the last value of a range. The last is the first if
+/// it is not there.
+fn nft_range_regs(a: &Attrs<'_>, min: u32, max: u32, len: usize) -> Result<(usize, usize)> {
+    let lo = nft_parse_register(a, min, len)?;
+    let hi = if a.has(max) { nft_parse_register(a, max, len)? } else { lo };
+    Ok((lo, hi))
+}
+
+/// The flags of a range that this NAT does.
+fn nft_nat_flags(flags: u32) -> Result<u32> {
+    if flags & !NF_NAT_RANGE_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if flags & (NF_NAT_RANGE_NETMAP | NF_NAT_RANGE_PROTO_OFFSET) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(flags)
+}
+
+/// Reads a `nat` expression, as `nft_nat_init` of Linux.
+fn nft_nat_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
+    if !matches!(table.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let a = Attrs::parse(data, 7);
+    let Some(ty) = be32(&a, NFTA_NAT_TYPE)? else { return Err(Errno::EINVAL) };
+    if !a.has(NFTA_NAT_REG_ADDR_MIN) && !a.has(NFTA_NAT_REG_PROTO_MIN) {
+        return Err(Errno::EINVAL);
+    }
+    let mtype = match ty {
+        NFT_NAT_SNAT => NF_NAT_MANIP_SRC,
+        NFT_NAT_DNAT => NF_NAT_MANIP_DST,
+        _ => return Err(Errno::EOPNOTSUPP),
+    };
+    let Some(family) = be32(&a, NFTA_NAT_FAMILY)? else { return Err(Errno::EINVAL) };
+    if table.family != NFPROTO_INET && u32::from(table.family) != family {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let alen = match family as u8 {
+        NFPROTO_IPV4 if family <= 0xff => 4,
+        NFPROTO_IPV6 if family <= 0xff => 16,
+        _ if a.has(NFTA_NAT_REG_ADDR_MIN) => return Err(Errno::EAFNOSUPPORT),
+        _ => 0,
+    };
+    let mut flags = 0;
+    let addr = if a.has(NFTA_NAT_REG_ADDR_MIN) {
+        flags |= NF_NAT_RANGE_MAP_IPS;
+        Some(nft_range_regs(&a, NFTA_NAT_REG_ADDR_MIN, NFTA_NAT_REG_ADDR_MAX, alen)?)
+    } else {
+        None
+    };
+    let proto = if a.has(NFTA_NAT_REG_PROTO_MIN) {
+        flags |= NF_NAT_RANGE_PROTO_SPECIFIED;
+        Some(nft_range_regs(&a, NFTA_NAT_REG_PROTO_MIN, NFTA_NAT_REG_PROTO_MAX, 2)?)
+    } else {
+        None
+    };
+    flags |= nft_nat_flags(be32(&a, NFTA_NAT_FLAGS)?.unwrap_or(0))?;
+    Ok(NftExpr::Nat { mtype, family: family as u8, alen, addr, proto, flags })
+}
+
+/// Reads a `masq` expression, as `nft_masq_init` of Linux.
+fn nft_masq_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
+    if !matches!(table.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let a = Attrs::parse(data, 3);
+    let flags = nft_nat_flags(be32(&a, NFTA_MASQ_FLAGS)?.unwrap_or(0))?;
+    let proto = if a.has(NFTA_MASQ_REG_PROTO_MIN) {
+        Some(nft_range_regs(&a, NFTA_MASQ_REG_PROTO_MIN, NFTA_MASQ_REG_PROTO_MAX, 2)?)
+    } else {
+        None
+    };
+    Ok(NftExpr::Masq { flags, proto })
+}
+
+/// The hooks of a base chain that can have the expression, as the `validate` of nft_nat.c and
+/// nft_masq.c of Linux. Gives `None` for an expression that any chain can have.
+fn nft_expr_hooks(e: &NftExpr) -> Option<u32> {
+    match e {
+        NftExpr::Nat { mtype: NF_NAT_MANIP_SRC, .. } => {
+            Some(1 << NF_INET_POST_ROUTING | 1 << NF_INET_LOCAL_IN)
+        }
+        NftExpr::Nat { .. } => Some(1 << NF_INET_PRE_ROUTING | 1 << NF_INET_LOCAL_OUT),
+        NftExpr::Masq { .. } => Some(1 << NF_INET_POST_ROUTING),
+        _ => None,
+    }
+}
+
+/// Checks that an expression of a rule of a base chain of the type `ty` at `hooknum` can be
+/// there, as `nft_chain_validate_chaintype` and `nft_chain_validate_hooks` of Linux. A chain
+/// that a jump reaches checks this when a packet gets there.
+pub(super) fn nft_expr_validate(e: &NftExpr, base: Option<(&NftChainType, u8)>) -> Result<()> {
+    match (nft_expr_hooks(e), base) {
+        (Some(mask), Some((ty, hook))) if !ty.nat || mask & 1 << hook == 0 => {
+            Err(Errno::EOPNOTSUPP)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The range of a `nat` or `masq` expression from the registers.
+fn nft_nat_range(
+    regs: &NftRegs,
+    flags: u32,
+    alen: usize,
+    addr: Option<(usize, usize)>,
+    proto: Option<(usize, usize)>,
+) -> NfNatRange {
+    let mut r = NfNatRange { flags, ..NfNatRange::default() };
+    if let Some((lo, hi)) = addr {
+        r.min_addr[..alen].copy_from_slice(&regs.data[lo..lo + alen]);
+        r.max_addr[..alen].copy_from_slice(&regs.data[hi..hi + alen]);
+    }
+    if let Some((lo, hi)) = proto {
+        r.min_proto = u16::from_be_bytes([regs.data[lo], regs.data[lo + 1]]);
+        r.max_proto = u16::from_be_bytes([regs.data[hi], regs.data[hi + 1]]);
+    }
+    r
+}
+
 /// Loads the key `key` of the connection of `skb`, as `nft_ct_get_eval` of Linux. A packet
 /// with no connection has the state invalid and no other key.
 fn nft_ct_get(key: u32, dir: usize, len: usize, skb: &NetBuf) -> Option<Vec<u8>> {
@@ -411,7 +566,7 @@ fn nft_ct_get(key: u32, dir: usize, len: usize, skb: &NetBuf) -> Option<Vec<u8>>
         return (key == NFT_CT_STATE).then(|| NF_CT_STATE_INVALID_BIT.to_ne_bytes().to_vec());
     };
     let u32v = |v: u32| Some(v.to_ne_bytes().to_vec());
-    let t = &ct.tuple[dir];
+    let t = &ct.tuple(dir);
     let v4 = t.l3num == NFPROTO_IPV4;
     match key {
         NFT_CT_STATE => u32v(1 << (u32::from(ctinfo % IP_CT_IS_REPLY) + 1)),
@@ -443,7 +598,12 @@ fn nft_ct_get(key: u32, dir: usize, len: usize, skb: &NetBuf) -> Option<Vec<u8>>
 
 /// Tells if a rule has a `ct` expression, so that its table needs connection tracking.
 pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
-    exprs.iter().any(|e| matches!(e, NftExpr::Ct { .. } | NftExpr::CtSet { .. }))
+    exprs.iter().any(|e| {
+        matches!(
+            e,
+            NftExpr::Ct { .. } | NftExpr::CtSet { .. } | NftExpr::Nat { .. } | NftExpr::Masq { .. }
+        )
+    })
 }
 
 /// Tells if the chain `target` of `table` can reach the chain `from` with jumps, so that a
@@ -498,6 +658,8 @@ impl ProgSet {
 pub(super) struct NftProg {
     chains: Vec<Vec<Vec<ProgExpr>>>,
     sets: Vec<ProgSet>,
+    /// The base chain has the type `nat`.
+    nat: bool,
 }
 
 /// The keys of the set `s` of `table`.
@@ -542,7 +704,10 @@ fn prog_set(table: &NftTable, s: usize) -> ProgSet {
 /// Makes the program of the chain `c` of `table`, as the rules of `nf_tables_commit_chain`
 /// of Linux.
 pub(super) fn nft_prog(table: &NftTable, c: usize) -> NftProg {
-    let mut prog = NftProg::default();
+    let mut prog = NftProg {
+        nat: table.chains[c].base.as_ref().is_some_and(|b| b.ty.nat),
+        ..NftProg::default()
+    };
     let mut chain_at: BTreeMap<u64, usize> = BTreeMap::new();
     let mut set_at: BTreeMap<u64, usize> = BTreeMap::new();
     let mut todo = alloc::vec![table.chains[c].handle];
@@ -699,6 +864,30 @@ fn nft_eval(
                     }
                 }
             }
+            // A chain that is not of the type `nat`, or a hook of the other change, can reach a
+            // rule of NAT only with a jump; the rule does not match there.
+            e @ (NftExpr::Nat { .. } | NftExpr::Masq { .. })
+                if !prog.nat
+                    || nft_expr_hooks(e).is_some_and(|m| m & 1 << state.hook == 0)
+                    || skb.nfct.get().is_none() =>
+            {
+                regs.verdict = NFT_BREAK;
+            }
+            NftExpr::Nat { mtype, family, alen, addr, proto, flags } => {
+                if (*family == NFPROTO_INET || *family == state.pf)
+                    && hook2manip(state.hook) == *mtype
+                    && let Some((ct, _)) = skb.nfct.get()
+                {
+                    let r = nft_nat_range(regs, *flags, *alen, *addr, *proto);
+                    regs.verdict = nf_nat_setup_info(ct, &r, *mtype);
+                }
+            }
+            NftExpr::Masq { flags, proto } => {
+                if let Some((ct, _)) = skb.nfct.get() {
+                    let r = nft_nat_range(regs, *flags, 0, None, *proto);
+                    regs.verdict = nf_nat_masquerade(ct, &r, state, skb.data());
+                }
+            }
         },
     }
 }
@@ -790,7 +979,7 @@ mod tests {
     fn a_rule_drops_the_packets_that_match_and_the_rest_get_the_policy() {
         let mut r = dport(9);
         r.push(verdict(NF_DROP, 0));
-        let prog = NftProg { chains: vec![vec![r]], sets: vec![] };
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
         let s = state(NFPROTO_IPV4);
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(10), &s), NF_ACCEPT);
@@ -804,13 +993,13 @@ mod tests {
         let mut ret = dport(9);
         ret.push(verdict(NFT_RETURN, 0));
         let c1 = vec![ret, vec![verdict(NF_ACCEPT, 0)]];
-        let prog = NftProg { chains: vec![c0, c1], sets: vec![] };
+        let prog = NftProg { chains: vec![c0, c1], sets: vec![], nat: false };
         let s = state(NFPROTO_IPV4);
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
         assert_eq!(nft_do_chain(&prog, NF_DROP, &udp4(10), &s), NF_ACCEPT);
         // A goto to an empty chain ends with the policy of the base chain.
         let c0 = vec![vec![verdict(NFT_GOTO, 1)], vec![verdict(NF_DROP, 0)]];
-        let prog = NftProg { chains: vec![c0, vec![]], sets: vec![] };
+        let prog = NftProg { chains: vec![c0, vec![]], sets: vec![], nat: false };
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_ACCEPT);
     }
 
@@ -843,7 +1032,7 @@ mod tests {
         ]);
         let mut invalid = state_is(NF_CT_STATE_INVALID_BIT);
         invalid.push(verdict(NF_DROP, 0));
-        let prog = NftProg { chains: vec![vec![r, invalid]], sets: vec![] };
+        let prog = NftProg { chains: vec![vec![r, invalid]], sets: vec![], nat: false };
         // No connection: the state is invalid, and the other keys break the rule.
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
         let mut p = udp4(9);
@@ -859,7 +1048,7 @@ mod tests {
             e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: vec![0] }),
             verdict(NF_DROP, 0),
         ]);
-        let prog = NftProg { chains: vec![vec![regs]], sets: vec![] };
+        let prog = NftProg { chains: vec![vec![regs]], sets: vec![], nat: false };
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &q, &s), NF_DROP);
     }
 
@@ -885,7 +1074,7 @@ mod tests {
             e(NftExpr::Counter { packets: packets.clone(), bytes: bytes.clone() }),
             verdict(NF_DROP, 0),
         ];
-        let prog = NftProg { chains: vec![vec![r]], sets: vec![] };
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(1), &s), NF_DROP);
         assert_eq!((packets.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed)), (1, 28));
 
@@ -900,7 +1089,7 @@ mod tests {
         r.push(ProgExpr::Lookup { set: 0, sreg: R1, len: 2, invert: false });
         r.push(ProgExpr::Lookup { set: 1, sreg: R1, len: 2, invert: true });
         r.push(verdict(NF_DROP, 0));
-        let prog = NftProg { chains: vec![vec![r]], sets: vec![range, seven] };
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![range, seven], nat: false };
         let v: Vec<u32> = [4, 5, 7, 9, 10]
             .iter()
             .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &udp4(p), &s))

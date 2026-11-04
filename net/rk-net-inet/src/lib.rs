@@ -67,6 +67,7 @@ use rk_vfs::inode::Result;
 pub fn init() {
     rk_net::netlink::init();
     rk_net::netfilter::init();
+    rk_net::netfilter::nf_nat::nf_nat_set_src_fn(stack::nat_src);
     rtnl::init();
     rules::init();
     nexthop::init();
