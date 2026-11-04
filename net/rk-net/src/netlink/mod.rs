@@ -19,6 +19,7 @@ pub mod uevent;
 use crate::consts::{
     AF_NETLINK, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOL_NETLINK,
 };
+use crate::filter::{Skb, SocketFilter};
 use crate::{Message, Options, PathOps, Received, Socket, current_cred, next_ino, wait_for};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
@@ -41,7 +42,8 @@ use rk_abi::native::rtnetlink::{
     RTNLGRP_IPV6_MROUTE_R, RTNLGRP_MAX,
 };
 use rk_abi::native::socket::{
-    SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
+    SO_ACCEPTCONN, SO_ATTACH_FILTER, SO_DETACH_FILTER, SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER,
+    SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
 use rk_vfs::cred::{self, cap};
@@ -132,6 +134,8 @@ pub struct NetlinkSocket {
     state: SpinLock<State>,
     wait: Arc<WaitQueue>,
     events: AtomicU64,
+    /// The filter of `SO_ATTACH_FILTER`.
+    filter: SpinLock<SocketFilter>,
 }
 
 /// The netlink sockets, for the port IDs and for the multicast groups.
@@ -244,6 +248,7 @@ impl NetlinkSocket {
             }),
             wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
+            filter: SpinLock::new(SocketFilter::default()),
         });
         let mut list = SOCKETS.lock();
         list.retain(|w| w.strong_count() > 0);
@@ -302,7 +307,30 @@ impl NetlinkSocket {
     /// Puts a datagram in the receive queue, as `__netlink_sendskb` of Linux. A full queue drops
     /// the datagram and sets the error `ENOBUFS`, as `netlink_overrun`. Gives `false` if the
     /// queue was full.
-    fn deliver(&self, data: Vec<u8>, portid: u32, group: u32) -> bool {
+    fn deliver(&self, mut data: Vec<u8>, portid: u32, group: u32) -> bool {
+        // The filter of the socket gives the bytes to keep, and 0 drops the datagram without an
+        // error, as `sk_filter` in `netlink_unicast` and `netlink_broadcast` of Linux.
+        if let Some(f) = self.filter.lock().get() {
+            let skb = Skb {
+                frame: &data,
+                mac: 0,
+                net: 0,
+                data: 0,
+                protocol: 0,
+                pkttype: 0,
+                ifindex: 0,
+                hatype: 0,
+            };
+            match f.run(&skb) as usize {
+                0 => return true,
+                keep => data.truncate(keep),
+            }
+        }
+        self.queue(data, portid, group)
+    }
+
+    /// Puts a datagram in the receive queue with no filter, as `__netlink_sendskb` of Linux.
+    fn queue(&self, data: Vec<u8>, portid: u32, group: u32) -> bool {
         let mut s = self.state.lock();
         if s.rmem > s.options.rcvbuf as usize {
             if s.flags & F_NO_ENOBUFS == 0 {
@@ -323,7 +351,7 @@ impl NetlinkSocket {
     /// `netlink_sendskb` of Linux. `mq_notify` sends its cookie to the socket of the process
     /// in this way. Gives `false` if the queue was full.
     pub fn send_from_kernel(&self, data: Vec<u8>) -> bool {
-        self.deliver(data, 0, 0)
+        self.queue(data, 0, 0)
     }
 
     /// Sends the next datagram of the dump that runs, as `netlink_dump` of Linux. The datagram
@@ -637,6 +665,7 @@ impl Socket for NetlinkSocket {
                 SO_PROTOCOL => int(self.protocol as i32),
                 SO_ERROR => int(s.error.take().map_or(0, |e| i32::from(e.get()))),
                 SO_ACCEPTCONN => int(0),
+                SO_LOCK_FILTER => int(i32::from(self.filter.lock().locked())),
                 _ => s.options.get(name)?,
             });
         }
@@ -671,6 +700,9 @@ impl Socket for NetlinkSocket {
             return match name {
                 SO_TYPE | SO_DOMAIN | SO_PROTOCOL | SO_ERROR | SO_ACCEPTCONN => {
                     Err(Errno::ENOPROTOOPT)
+                }
+                SO_ATTACH_FILTER | SO_DETACH_FILTER | SO_LOCK_FILTER => {
+                    self.filter.lock().set(name, value)
                 }
                 _ => self.state.lock().options.set(name, value),
             };

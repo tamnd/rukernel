@@ -11070,6 +11070,50 @@ static void test_dns_key(void)
 	      syscall(SYS_add_key, "dns_resolver", "d", list, 5, -3) == -1 && errno == EINVAL);
 }
 
+/*
+ * The filter of a uevent socket, as the monitor of libudev. udevd sends its events to the group
+ * 2 with the header "libudev". The filter of the listener keeps only the datagrams that start
+ * with "libu", so the other datagram does not come.
+ */
+static void test_uevent_filter(void)
+{
+	struct sock_filter code[] = {
+		BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0x6c696275 /* "libu" */, 0, 1),
+		BPF_STMT(BPF_RET | BPF_K, 0xffffffff),
+		BPF_STMT(BPF_RET | BPF_K, 0),
+	};
+	struct sock_fprog prog = { .len = sizeof(code) / sizeof(code[0]), .filter = code };
+	struct sockaddr_nl udev = { .nl_family = AF_NETLINK, .nl_groups = 2 };
+	static const char ev[] = "add@/devices/virtual/mem/rkflt\0ACTION=add";
+	static const char lib[] = "libudev\0rk-filter";
+	char buf[256];
+	int one = 1;
+	int l = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+	int u = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_KOBJECT_UEVENT);
+
+	int ok = l >= 0 && u >= 0 && bind(l, (struct sockaddr *)&udev, sizeof(udev)) == 0 &&
+		 setsockopt(l, SOL_SOCKET, SO_ATTACH_FILTER, &prog, sizeof(prog)) == 0;
+	check("uevent: SO_ATTACH_FILTER on a uevent socket", ok);
+	if (ok) {
+		ok = sendto(u, ev, sizeof(ev), 0, (struct sockaddr *)&udev, sizeof(udev)) > 0 &&
+		     sendto(u, lib, sizeof(lib), 0, (struct sockaddr *)&udev, sizeof(udev)) > 0;
+		struct pollfd p = { .fd = l, .events = POLLIN };
+		int n = ok && poll(&p, 1, 1000) == 1 ? recv(l, buf, sizeof(buf), MSG_DONTWAIT) : -1;
+		check("uevent: the filter keeps the event of udevd and drops the other datagram",
+		      n == (int)sizeof(lib) && memcmp(buf, lib, sizeof(lib)) == 0 &&
+			      recv(l, buf, sizeof(buf), MSG_DONTWAIT) == -1 && errno == EAGAIN);
+		check("uevent: SO_LOCK_FILTER keeps the filter",
+		      setsockopt(l, SOL_SOCKET, SO_LOCK_FILTER, &one, sizeof(one)) == 0 &&
+			      setsockopt(l, SOL_SOCKET, SO_DETACH_FILTER, &one, sizeof(one)) == -1 &&
+			      errno == EPERM);
+	}
+	if (l >= 0)
+		close(l);
+	if (u >= 0)
+		close(u);
+}
+
 static void test_uinput(void)
 {
 	char buf[2048], sys[32] = "", text[4096] = "", path[128], h[2][32] = { "", "" }, var[2][96];
@@ -11184,6 +11228,7 @@ static void test_all(void)
 	test_loop();
 	test_uevent();
 	test_uevent_synth();
+	test_uevent_filter();
 	test_uinput();
 	test_dns_key();
 	test_xattr();
@@ -11231,6 +11276,7 @@ int main(int argc, char **argv)
 	if (argc > 1 && strcmp(argv[1], "uevent") == 0) {
 		test_uevent();
 		test_uevent_synth();
+		test_uevent_filter();
 		test_uinput();
 	}
 	if (argc > 1 && strcmp(argv[1], "keys") == 0)
