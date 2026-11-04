@@ -10,6 +10,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The netfilter hooks of IPv4 and IPv6, as net/netfilter/core.c of Linux. Each namespace has a list of hooks for `NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_IN`, `NF_INET_FORWARD`, `NF_INET_LOCAL_OUT` and `NF_INET_POST_ROUTING`, in the order of the priority, with `nf_register_net_hook` and `nf_unregister_net_hook`. The input, forward and output paths of IPv4 and IPv6 run the hooks with the verdicts `NF_ACCEPT`, `NF_DROP` (with an error), `NF_STOLEN` and `NF_QUEUE`. A path with no hook only reads an atomic counter, as `nf_hooks_needed`, and takes no lock. When an output hook is active, the host makes the fragments of a packet after `NF_INET_POST_ROUTING`, as `ip_finish_output` (#542).
 - `BPF_PROG_LOAD` of `bpf(2)` for socket filters, with the interpreter of RFC 9669 and a first verifier, as kernel/bpf/core.c, verifier.c and log.c of Linux. The verifier follows each path of the program with the types and the bounds of the registers and of the stack, and refuses a program that it cannot prove safe: loops, reads of registers or stack that are not set, accesses out of the bounds of the stack, of the context or of a map value, a map value that can be NULL, and addresses that leak without `CAP_PERFMON`. The log of the verifier goes to `log_buf` or to `struct bpf_common_attr`, with `log_true_size` and `ENOSPC` as in Linux. The helpers are the map helpers, `ktime_get_ns`, `get_prandom_u32`, `get_smp_processor_id`, `skb_load_bytes` and a few more. `SO_ATTACH_BPF` attaches a program to a Unix datagram socket, and `/proc/PID/fdinfo` shows the program (#537).
 
+### Fixed
+
+- The `systemd` boot test image now has the `kmod` package. systemd 257 loads libkmod with `dlopen`, and without the library `systemd-modules-load` stops with "Failed to initialize libkmod context: Operation not supported". rukernel has no loadable modules, so as on Linux without `CONFIG_MODULES`, `init_module`, `finit_module` and `delete_module` give `ENOSYS` and `/proc/modules` does not exist. The init boot test checks this (#536).
+
 ## [0.5.3] - 2026-11-04
 
 ### Added
@@ -22,7 +26,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
-- The `systemd` boot test image now has the `kmod` package. systemd 257 loads libkmod with `dlopen`, and without the library `systemd-modules-load` stops with "Failed to initialize libkmod context: Operation not supported". rukernel has no loadable modules, so as on Linux without `CONFIG_MODULES`, `init_module`, `finit_module` and `delete_module` give `ENOSYS` and `/proc/modules` does not exist. The init boot test checks this (#536).
 - A `writev` to `/dev/kmsg` makes one record, as `devkmsg_write` of Linux. systemd writes its messages in 3 parts, and each part was a record of its own (#536).
 - `mount` with `MS_BIND` and `MS_REC` copies the mounts under the source, as `copy_tree` of fs/namespace.c of Linux. Before, it made only the mount of the source, so the root that systemd makes for a service with `MS_BIND` and `MS_REC` of `/` had no `/sys/fs/cgroup`, and `systemd-logind` failed at the step `NAMESPACE` (#536).
 - `/proc/PID/mountinfo` can be in an epoll set, and has an event when the mounts change, as `mounts_poll` of fs/proc_namespace.c of Linux. Before, `epoll_ctl` gave `EPERM` for it, so libmount closed its monitor, and systemd failed to see the mounts that it made ("Failed to drain libmount events") (#536).
