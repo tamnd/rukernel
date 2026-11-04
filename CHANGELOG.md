@@ -2,7 +2,7 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.5.5] - 2026-11-04
 
 ### Added
 
@@ -1354,6 +1354,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.5]: https://github.com/tamnd/rukernel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/tamnd/rukernel/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/tamnd/rukernel/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/tamnd/rukernel/compare/v0.5.1...v0.5.2
