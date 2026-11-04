@@ -3245,6 +3245,26 @@ static void test_time_ns(void)
 	umount("/proc");
 }
 
+/* rukernel has no loadable modules. As Linux without CONFIG_MODULES, the module calls give
+ * ENOSYS and /proc/modules does not exist. libkmod and systemd-modules-load start with this and
+ * load nothing (#536). */
+static void test_modules(void)
+{
+	struct stat st;
+
+	errno = 0;
+	check("init_module gives ENOSYS", syscall(SYS_init_module, NULL, 0, "") == -1 && errno == ENOSYS);
+	errno = 0;
+	check("finit_module gives ENOSYS", syscall(SYS_finit_module, -1, "", 0) == -1 && errno == ENOSYS);
+	errno = 0;
+	check("delete_module gives ENOSYS", syscall(SYS_delete_module, "x", 0) == -1 && errno == ENOSYS);
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	errno = 0;
+	check("/proc/modules does not exist", stat("/proc/modules", &st) == -1 && errno == ENOENT);
+	umount("/proc");
+}
+
 /* A walk follows 40 symbolic links and gives ELOOP at the next one, as Linux. */
 static void test_symlink_chain(void)
 {
@@ -11308,6 +11328,7 @@ static void test_all(void)
 	test_mount_ns();
 	test_uts_ipc_ns();
 	test_time_ns();
+	test_modules();
 	test_mount_api();
 	test_symlink_chain();
 	test_splice();
