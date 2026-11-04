@@ -23,6 +23,7 @@ use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
 
+pub mod nf_conntrack;
 pub mod nf_tables_api;
 
 /// The verdict that drops the packet.
@@ -359,6 +360,65 @@ fn nf_hook_slow(skb: &mut NetBuf, state: &NfHookState, entries: &[NfHookEntry]) 
     NfResult::Accept
 }
 
+/// The transport header of a packet, as the fields `thoff` and `tprot` of `struct nft_pktinfo`
+/// of Linux.
+pub(crate) struct NfPktinfo {
+    /// The offset of the transport header, or `None` for a fragment that is not the first.
+    pub(crate) thoff: Option<usize>,
+    /// The protocol of the transport header.
+    pub(crate) l4proto: u8,
+}
+
+/// Finds the transport header of the packet `d` of the family `pf`, as `nft_set_pktinfo_ipv4`
+/// and `nft_set_pktinfo_ipv6` of Linux.
+pub(crate) fn nf_pktinfo(pf: u8, d: &[u8]) -> NfPktinfo {
+    let none = NfPktinfo { thoff: None, l4proto: 0 };
+    match pf {
+        NFPROTO_IPV4 => {
+            if d.len() < 20 {
+                return none;
+            }
+            let ihl = usize::from(d[0] & 0xf) * 4;
+            let frag = u16::from_be_bytes([d[6], d[7]]) & 0x1fff;
+            NfPktinfo { thoff: (ihl >= 20 && frag == 0).then_some(ihl), l4proto: d[9] }
+        }
+        NFPROTO_IPV6 => {
+            if d.len() < 40 {
+                return none;
+            }
+            let (mut next, mut off) = (d[6], 40);
+            loop {
+                match next {
+                    // Hop by hop, routing, destination options.
+                    0 | 43 | 60 => {
+                        let Some(h) = d.get(off..off + 2) else { return none };
+                        next = h[0];
+                        off += (usize::from(h[1]) + 1) * 8;
+                    }
+                    // A fragment header: a fragment that is not the first has no transport
+                    // header.
+                    44 => {
+                        let Some(h) = d.get(off..off + 8) else { return none };
+                        if u16::from_be_bytes([h[2], h[3]]) & 0xfff8 != 0 {
+                            return NfPktinfo { thoff: None, l4proto: h[0] };
+                        }
+                        next = h[0];
+                        off += 8;
+                    }
+                    // The authentication header counts its length in words of 4 bytes.
+                    51 => {
+                        let Some(h) = d.get(off..off + 2) else { return none };
+                        next = h[0];
+                        off += (usize::from(h[1]) + 2) * 4;
+                    }
+                    _ => return NfPktinfo { thoff: Some(off), l4proto: next },
+                }
+            }
+        }
+        _ => none,
+    }
+}
+
 /// Removes the hooks of the current namespace that stops, so that the counters of
 /// `nf_hook_active` are correct, as `netfilter_net_exit` of Linux.
 fn ns_exit() {
@@ -379,6 +439,7 @@ fn ns_exit() {
 /// boot.
 pub fn init() {
     ns::add_ops(|| {}, ns_exit);
+    nf_conntrack::init();
 }
 
 #[cfg(test)]

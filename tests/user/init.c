@@ -11306,6 +11306,41 @@ static int nft_udp_send_port(unsigned short port)
 
 /* The rules run on the packets: `nft add rule ip rkx out udp dport 9 counter drop` and a jump
  * to a chain. */
+/* Reads a file of /proc/sys/net/netfilter into `text`. Gives the length or -1. */
+static long nf_sysctl(const char *name, char *text, int size)
+{
+	char path[96];
+	snprintf(path, sizeof(path), "/proc/sys/net/netfilter/%s", name);
+	memset(text, 0, size);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	long n = read(fd, text, size - 1);
+	close(fd);
+	return n;
+}
+
+/* The values of connection tracking, as nf_ct_sysctl_table of Linux. */
+static void test_nf_conntrack_sysctl(void)
+{
+	char text[32];
+	check("conntrack: nf_conntrack_max is 4096",
+	      nf_sysctl("nf_conntrack_max", text, sizeof(text)) > 0 && strcmp(text, "4096\n") == 0);
+	check("conntrack: nf_conntrack_udp_timeout_stream is 120",
+	      nf_sysctl("nf_conntrack_udp_timeout_stream", text, sizeof(text)) > 0 &&
+		      strcmp(text, "120\n") == 0);
+	check("conntrack: nf_conntrack_count is a number",
+	      nf_sysctl("nf_conntrack_count", text, sizeof(text)) > 0 && text[0] >= '0' &&
+		      text[0] <= '9');
+	check("conntrack: nf_conntrack_count takes no write",
+	      write_text("/proc/sys/net/netfilter/nf_conntrack_count", "5\n") != 0);
+	check("conntrack: nf_conntrack_icmp_timeout takes 20",
+	      write_text("/proc/sys/net/netfilter/nf_conntrack_icmp_timeout", "20\n") == 0 &&
+		      nf_sysctl("nf_conntrack_icmp_timeout", text, sizeof(text)) > 0 &&
+		      strcmp(text, "20\n") == 0);
+	write_text("/proc/sys/net/netfilter/nf_conntrack_icmp_timeout", "30\n");
+}
+
 static void test_nft_exprs(void)
 {
 	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
@@ -11385,6 +11420,7 @@ static void test_inet(int port)
 	test_genl();
 	test_nftables();
 	test_nft_exprs();
+	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();
 	test_slip();

@@ -90,6 +90,27 @@ const IPV6: &[Param] = &[
 /// The integer values of `net.unix`, as `unix_table` of Linux.
 const UNIX: &[Param] = &[p("max_dgram_qlen", 10, INT_MIN, INT_MAX)];
 
+/// The values of `net.netfilter`, as `nf_ct_sysctl_table` of Linux, with the defaults of a
+/// machine with 512 MiB of memory. The timeouts are in seconds.
+const NETFILTER: &[Param] = &[
+    p("nf_conntrack_acct", 0, 0, 1),
+    p("nf_conntrack_buckets", 4096, 0, INT_MAX),
+    p("nf_conntrack_checksum", 1, 0, 1),
+    p("nf_conntrack_events", 2, 0, 2),
+    p("nf_conntrack_expect_max", 16, 1, INT_MAX),
+    p("nf_conntrack_generic_timeout", 600, 0, INT_MAX),
+    p("nf_conntrack_icmp_timeout", 30, 0, INT_MAX),
+    p("nf_conntrack_icmpv6_timeout", 30, 0, INT_MAX),
+    p("nf_conntrack_log_invalid", 0, 0, 255),
+    p("nf_conntrack_max", 4096, INT_MIN, INT_MAX),
+    p("nf_conntrack_timestamp", 0, 0, 1),
+    p("nf_conntrack_udp_timeout", 30, 0, INT_MAX),
+    p("nf_conntrack_udp_timeout_stream", 120, 0, INT_MAX),
+];
+
+/// The values of `net.netfilter` that a write does not change.
+const NETFILTER_RO: &[&str] = &["nf_conntrack_buckets", "nf_conntrack_count"];
+
 /// The values of `net.ipv4.conf.*`, as `DEVINET_SYSCTL_*` and `ipv4_devconf_dflt` of Linux.
 const IPV4_CONF: &[Param] = &[
     p("accept_local", 0, 0, 1),
@@ -255,6 +276,7 @@ pub struct Tables {
     ipv4: Vec<i32>,
     ipv6: Vec<i32>,
     unix: Vec<i32>,
+    netfilter: Vec<i32>,
     texts: Vec<String>,
     /// `net.ipv4.ping_group_range`.
     ping: (u32, u32),
@@ -273,6 +295,7 @@ impl Tables {
             ipv4: defaults(IPV4),
             ipv6: defaults(IPV6),
             unix: defaults(UNIX),
+            netfilter: defaults(NETFILTER),
             texts: IPV4_TEXT.iter().map(|t| String::from(t.1)).collect(),
             // The empty range `1 0`, as Linux.
             ping: (1, 0),
@@ -386,6 +409,12 @@ pub fn core(name: &str) -> i32 {
     CORE.iter().position(|p| p.name == name).map_or(0, |at| TABLES.lock().core[at])
 }
 
+/// The value `name` of `net.netfilter` in the current namespace. Gives 0 for a name that is
+/// not there.
+pub fn netfilter(name: &str) -> i32 {
+    NETFILTER.iter().position(|p| p.name == name).map_or(0, |at| TABLES.lock().netfilter[at])
+}
+
 /// Tells if `port` is in `net.ipv4.ip_local_reserved_ports` of the current namespace. The
 /// search for a free ephemeral port skips these ports, as `inet_is_local_reserved_port` of
 /// Linux.
@@ -497,7 +526,13 @@ pub fn list(path: &str) -> Option<Vec<(String, Entry)>> {
     let parts: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
     let dir = |n: &str| (String::from(n), Entry::Dir);
     let mut out: Vec<(String, Entry)> = match parts[..] {
-        [] => ["core", "ipv4", "ipv6", "unix"].into_iter().map(dir).collect(),
+        [] => ["core", "ipv4", "ipv6", "netfilter", "unix"].into_iter().map(dir).collect(),
+        ["netfilter"] => NETFILTER
+            .iter()
+            .map(|p| p.name)
+            .chain(["nf_conntrack_count"])
+            .map(|n| (String::from(n), Entry::File(!NETFILTER_RO.contains(&n))))
+            .collect(),
         ["core"] => names(CORE).collect(),
         ["unix"] => names(UNIX).collect(),
         ["ipv4"] => {
@@ -540,6 +575,7 @@ fn global<'a>(t: &'a mut Tables, dir: &str) -> Option<(&'static [Param], &'a mut
         "ipv4" => (IPV4, &mut t.ipv4),
         "ipv6" => (IPV6, &mut t.ipv6),
         "unix" => (UNIX, &mut t.unix),
+        "netfilter" => (NETFILTER, &mut t.netfilter),
         _ => return None,
     })
 }
@@ -548,6 +584,11 @@ fn global<'a>(t: &'a mut Tables, dir: &str) -> Option<(&'static [Param], &'a mut
 /// has the path.
 pub fn read(path: &str) -> Result<Vec<u8>> {
     let parts: Vec<&str> = path.split('/').collect();
+    // The count of the connections takes the lock of the table of connections.
+    if parts[..] == ["netfilter", "nf_conntrack_count"] {
+        let n = crate::netfilter::nf_conntrack::nf_conntrack_count();
+        return Ok(format!("{n}\n").into_bytes());
+    }
     // The lookup of a device takes the lock of the devices, so it comes first.
     let dev_scope = match parts[..] {
         [_, "conf", s, _] => Some(scope(s).ok_or(Errno::ENOENT)?),
@@ -603,6 +644,7 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
             Ok(())
         }
         ["ipv4", "tcp_available_congestion_control"] => Err(Errno::EPERM),
+        ["netfilter", name] if NETFILTER_RO.contains(&name) => Err(Errno::EPERM),
         ["ipv4", name] if IPV4_TEXT.iter().any(|x| x.0 == name) => {
             let at = IPV4_TEXT.iter().position(|x| x.0 == name).unwrap_or(0);
             let text = core::str::from_utf8(data).map_err(|_| Errno::EINVAL)?;
@@ -732,6 +774,21 @@ mod tests {
         write("ipv4/ip_default_ttl", b"65\n").unwrap();
         assert_eq!(default_ttl(), 65);
         write("ipv4/ip_default_ttl", b"64").unwrap();
+    }
+
+    #[test]
+    fn netfilter_has_the_values_of_conntrack() {
+        assert!(list("").unwrap().contains(&(String::from("netfilter"), Entry::Dir)));
+        let nf = list("netfilter").unwrap();
+        assert!(nf.contains(&(String::from("nf_conntrack_count"), Entry::File(false))));
+        assert!(nf.contains(&(String::from("nf_conntrack_max"), Entry::File(true))));
+        assert_eq!(read("netfilter/nf_conntrack_udp_timeout_stream").unwrap(), b"120\n");
+        assert_eq!(read("netfilter/nf_conntrack_buckets").unwrap(), b"4096\n");
+        assert_eq!(write("netfilter/nf_conntrack_count", b"1"), Err(Errno::EPERM));
+        assert_eq!(write("netfilter/nf_conntrack_log_invalid", b"256"), Err(Errno::EINVAL));
+        write("netfilter/nf_conntrack_generic_timeout", b"300\n").unwrap();
+        assert_eq!(netfilter("nf_conntrack_generic_timeout"), 300);
+        write("netfilter/nf_conntrack_generic_timeout", b"600").unwrap();
     }
 
     #[test]
