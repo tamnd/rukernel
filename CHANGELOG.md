@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.5] - 2026-11-04
+
 ### Added
 
 - PID namespaces, as kernel/pid.c and kernel/pid_namespace.c of Linux. `clone`, `clone3` and `unshare` take `CLONE_NEWPID`, and `setns` takes a file of `/proc/PID/ns/pid` or a pidfd with `CLONE_NEWPID`, for the children of the caller. A thread has an ID in its namespace and in each ancestor, to a depth of 32. The system calls take and give the IDs of the namespace of the caller, and a signal gives the ID of the sender in the namespace of the target. The first process of a namespace has the ID 1 and gets the orphans of the namespace. It gets no signal with the default action from its namespace, and its exit kills the other processes of the namespace. `/proc/PID/ns/pid` and `/proc/PID/ns/pid_for_children` name the namespaces, `NS_GET_PARENT` and the `NS_GET_*_PIDNS` ioctls of nsfs work, and the fdinfo of a pidfd gives `NSpid`. The LTP options file now has `CONFIG_PID_NS` (#536).
@@ -1354,6 +1356,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.5]: https://github.com/tamnd/rukernel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/tamnd/rukernel/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/tamnd/rukernel/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/tamnd/rukernel/compare/v0.5.1...v0.5.2
