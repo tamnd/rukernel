@@ -30,6 +30,7 @@ use rk_net::consts::{
     ICMP_PKT_FILTERED, ICMP_REDIR_HOST, ICMP_REDIRECT, ICMP_TIME_EXCEEDED,
 };
 use rk_net::dev::{self, LinkKind, NetDevice};
+use rk_net::netfilter::{NF_INET_FORWARD, NF_INET_POST_ROUTING, NFPROTO_IPV4, nf_hook_active};
 use rk_net::ns::PerNet;
 use rk_net::sysctl::{Family, Scope, conf};
 
@@ -155,12 +156,17 @@ pub(crate) fn forward4(dev: &NetDevice, h: &Header, mut frame: NetBuf, host: boo
             u32::from_be_bytes(next.hop),
         );
     }
+    let Some(h) = stack::nf_hook4(NF_INET_FORWARD, &mut frame, *h, ifindex, next.ifindex) else {
+        return true;
+    };
     count(&COUNTERS.ip_forw_datagrams);
     // A lost packet is like a lost frame.
-    if v == Verdict::Send {
+    if nf_hook_active(NFPROTO_IPV4, NF_INET_POST_ROUTING) {
+        let _ = stack::ip_output(&out, &next, frame, ifindex);
+    } else if v == Verdict::Send {
         let _ = stack::xmit(&out, &next, frame);
     } else {
-        fragment(&out, &next, h, frame.data(), mtu);
+        fragment(&out, &next, &h, frame.data(), mtu);
     }
     true
 }
@@ -192,7 +198,7 @@ fn redirect(dev: &NetDevice, h: &Header, next: &route::Next) -> bool {
 /// `ip_do_fragment` in net/ipv4/ip_output.c of Linux. The first fragment has all the options
 /// and the next fragments have only the options that have the copy flag. A fragment of a
 /// fragment keeps the offset and the flag "more fragments" of the packet.
-fn fragment(out: &NetDevice, next: &route::Next, h: &Header, packet: &[u8], mtu: usize) {
+pub(crate) fn fragment(out: &NetDevice, next: &route::Next, h: &Header, packet: &[u8], mtu: usize) {
     let (head, data) = packet.split_at(h.hlen);
     let mut later = head.to_vec();
     ipv4::options_fragment(&mut later[HLEN..]);
@@ -298,7 +304,13 @@ pub(crate) fn forward6(dev: &NetDevice, mut frame: NetBuf, host: bool) -> Option
         return None;
     }
     frame.data_mut()[7] -= 1;
+    if !stack6::nf_hook6(NF_INET_FORWARD, &mut frame, ifindex, next.ifindex) {
+        return None;
+    }
     count(&COUNTERS6.out_forw_datagrams);
+    if !stack6::nf_hook6(NF_INET_POST_ROUTING, &mut frame, ifindex, next.ifindex) {
+        return None;
+    }
     let _ = stack6::transmit(&out, &next, frame);
     None
 }

@@ -32,6 +32,10 @@ use rk_net::consts::{
 };
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::ether::{EthHeader, MacAddr};
+use rk_net::netfilter::{
+    NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_IPV4,
+    nf_hook, nf_hook_active,
+};
 use rk_net::ns::PerNet;
 use rk_vfs::inode::Result;
 
@@ -539,11 +543,11 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
             return Ok(());
         }
     }
-    if HLEN + payload.len() <= mtu {
+    if HLEN + payload.len() <= mtu || nf_output_active() {
         let mut buf = NetBuf::new(HEADROOM, HLEN + payload.len());
         buf.extend_from_slice(&header.to_bytes());
         buf.extend_from_slice(payload);
-        return transmit(&dev, next, buf);
+        return ip_local_out(&dev, next, buf);
     }
     let parts = frag::split(payload.len(), mtu.saturating_sub(HLEN));
     let last = parts.len() - 1;
@@ -565,7 +569,7 @@ pub(crate) fn output(next: &route::Next, out: &Out, payload: &[u8]) -> Result<()
 /// header in the headroom of `payload`, so the data is not copied again, as `ip_queue_xmit` of
 /// Linux with an `sk_buff` that has room for the headers (#465).
 pub(crate) fn output_buf(next: &route::Next, out: &Out, mut payload: NetBuf) -> Result<()> {
-    if ipv4::is_multicast(out.dst) || out.protocol == PROTO_ICMP {
+    if ipv4::is_multicast(out.dst) || out.protocol == PROTO_ICMP || nf_output_active() {
         return output(next, out, payload.data());
     }
     let dev = dev::by_index(next.ifindex).ok_or(Errno::ENETUNREACH)?;
@@ -629,7 +633,71 @@ pub(crate) fn output_raw(next: &route::Next, packet: &[u8]) -> Result<()> {
     {
         count_icmp_out(packet.get(h.hlen..).unwrap_or_default());
     }
-    transmit(&dev, next, NetBuf::from_slice(packet))
+    ip_local_out(&dev, next, NetBuf::from_slice(packet))
+}
+
+/// Tells if a namespace has a hook of IPv4 at `NF_INET_LOCAL_OUT` or `NF_INET_POST_ROUTING`.
+/// Then a packet that the host sends is whole when it goes through the hooks, and it gets its
+/// fragments after them, as in `ip_finish_output` of Linux.
+fn nf_output_active() -> bool {
+    nf_hook_active(NFPROTO_IPV4, NF_INET_LOCAL_OUT)
+        || nf_hook_active(NFPROTO_IPV4, NF_INET_POST_ROUTING)
+}
+
+/// Runs the hooks of IPv4 at `hook` on `skb`, as `NF_HOOK` of Linux. Gives the header of the
+/// packet after the hooks, which can change it, or `None` if a hook dropped or took the packet.
+/// A path with no hook gives `h` back at once.
+pub(crate) fn nf_hook4(
+    hook: u8,
+    skb: &mut NetBuf,
+    h: Header,
+    in_dev: u32,
+    out_dev: u32,
+) -> Option<Header> {
+    if !nf_hook_active(NFPROTO_IPV4, hook) {
+        return Some(h);
+    }
+    if nf_hook(NFPROTO_IPV4, hook, skb, in_dev, out_dev) != rk_net::netfilter::NfResult::Accept {
+        return None;
+    }
+    Header::parse_loose(skb.data())
+}
+
+/// Sends a whole packet that the host makes through the hooks `NF_INET_LOCAL_OUT` and
+/// `NF_INET_POST_ROUTING`, as `ip_local_out` and `ip_output` of Linux. A packet larger than the
+/// MTU goes out in fragments after the hooks, as `ip_finish_output`. A drop gives the error of
+/// the hook to the sender.
+fn ip_local_out(dev: &NetDevice, next: &route::Next, mut skb: NetBuf) -> Result<()> {
+    let out = dev.ifindex();
+    if !nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT, &mut skb, 0, out).to_result()? {
+        return Ok(());
+    }
+    ip_output(dev, next, skb, 0)
+}
+
+/// Gives a whole packet to `NF_INET_POST_ROUTING` and then to the link, in fragments if it is
+/// larger than the MTU, as `ip_output` and `ip_finish_output` of Linux. `in_dev` is the device
+/// of a forwarded packet, or 0.
+pub(crate) fn ip_output(
+    dev: &NetDevice,
+    next: &route::Next,
+    mut skb: NetBuf,
+    in_dev: u32,
+) -> Result<()> {
+    let out = dev.ifindex();
+    if !nf_hook(NFPROTO_IPV4, NF_INET_POST_ROUTING, &mut skb, in_dev, out).to_result()? {
+        return Ok(());
+    }
+    if in_dev == 0 {
+        count(&COUNTERS.ip_out);
+    }
+    let mtu = dev.mtu() as usize;
+    if skb.len() <= mtu {
+        return xmit(dev, next, skb);
+    }
+    let Some(h) = Header::parse_loose(skb.data()) else { return Ok(()) };
+    crate::forward::fragment(dev, next, &h, skb.data(), mtu);
+    Ok(())
 }
 
 /// Gives a packet that the host makes to the link, and counts it.
@@ -782,6 +850,7 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
         return count(&COUNTERS.ip_in_hdr_errors);
     };
     frame.trim(usize::from(h.total_len));
+    let Some(h) = nf_hook4(NF_INET_PRE_ROUTING, &mut frame, h, dev.ifindex(), 0) else { return };
     let loopback = dev.kind() == LinkKind::Loopback;
     // An address of 127.0.0.0/8 from a real link is a martian, as `ip_route_input_slow`.
     if !loopback && (ipv4::is_loopback(h.src) || ipv4::is_loopback(h.dst)) {
@@ -801,7 +870,7 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
         }
         return count(&COUNTERS.ip_in_addr_errors);
     }
-    let (h, frame) = if h.is_fragment() {
+    let (h, mut frame) = if h.is_fragment() {
         match reassemble(&h, frame.data()) {
             Some(x) => x,
             None => return,
@@ -809,6 +878,7 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
     } else {
         (h, frame)
     };
+    let Some(h) = nf_hook4(NF_INET_LOCAL_IN, &mut frame, h, dev.ifindex(), 0) else { return };
     let dif = dif_of(dev);
     let info = Info6::of4(&h, dev.ifindex(), spec_dst(dev, &h, local && !broadcast && !mcast));
     let raw = raw_sockets(AF_INET, h.protocol);

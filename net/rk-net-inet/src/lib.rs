@@ -66,6 +66,7 @@ use rk_vfs::inode::Result;
 /// one time, after the drivers.
 pub fn init() {
     rk_net::netlink::init();
+    rk_net::netfilter::init();
     rtnl::init();
     rules::init();
     nexthop::init();
