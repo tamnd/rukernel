@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds the root file system of the `systemd` boot test: Debian 13 with the systemd,
+# Builds the root file system of the `systemd` boot test: Debian 13 with the systemd, kmod,
 # systemd-sysv and dbus packages, in a Debian container.
 #
 # Usage: tools/systemd/build.sh OUT_FILE
@@ -14,7 +14,7 @@ trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
 
 docker run --platform linux/amd64 --name "$name" debian:trixie sh -euc '
 apt-get update -qq >/dev/null
-DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends systemd \
+DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends systemd kmod \
 	systemd-sysv dbus >/dev/null
 apt-get clean
 rm -rf /var/lib/apt/lists/*
