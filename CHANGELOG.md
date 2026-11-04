@@ -2,6 +2,12 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- `SO_ATTACH_FILTER`, `SO_DETACH_FILTER` and `SO_LOCK_FILTER` on netlink sockets, as `sk_filter` in `netlink_unicast` and `netlink_broadcast` of Linux. The classic BPF filter of the socket runs on each datagram before it goes in the queue, so the udev monitor of systemd can attach its filter to a `NETLINK_KOBJECT_UEVENT` socket (#539).
+
 ## [0.5.3] - 2026-11-04
 
 ### Added

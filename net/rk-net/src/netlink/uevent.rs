@@ -228,4 +228,40 @@ mod tests {
         assert_eq!(add[5], format!("IFINDEX={}", d2.ifindex()));
         dev::unregister(&d2);
     }
+
+    #[test]
+    fn the_filter_of_a_socket_drops_the_events_that_it_does_not_take() {
+        use crate::filter::Insn;
+        use rk_abi::native::socket::{
+            SO_ATTACH_FILTER, SO_DETACH_FILTER, SO_LOCK_FILTER, SOL_SOCKET,
+        };
+        let _serial = crate::TEST_DEVICES.lock();
+        let s = listener(NETLINK_KOBJECT_UEVENT);
+        // ldb [0]; jeq #'a', drop, keep: the filter drops the events with the action `add`.
+        let prog: Vec<u8> = [
+            Insn { code: 0x30, jt: 0, jf: 0, k: 0 },
+            Insn { code: 0x15, jt: 0, jf: 1, k: u32::from(b'a') },
+            Insn { code: 0x06, jt: 0, jf: 0, k: 0 },
+            Insn { code: 0x06, jt: 0, jf: 0, k: u32::MAX },
+        ]
+        .into_iter()
+        .flat_map(Insn::to_bytes)
+        .collect();
+        s.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &prog).unwrap();
+        let path = String::from("/devices/virtual/block/uevflt1");
+        send_all(Event::new(Action::Add, path.clone(), "block").finish());
+        send_all(Event::new(Action::Change, path.clone(), "block").finish());
+        let events: Vec<String> = got(&s, "uevflt1").into_iter().map(|e| e[0].clone()).collect();
+        assert_eq!(events, ["change@/devices/virtual/block/uevflt1"]);
+        // A locked filter stays. Without it, each event comes again.
+        s.set_option(SOL_SOCKET, SO_LOCK_FILTER, &1i32.to_ne_bytes()).unwrap();
+        assert_eq!(s.get_option(SOL_SOCKET, SO_LOCK_FILTER).unwrap(), 1i32.to_ne_bytes());
+        assert_eq!(s.set_option(SOL_SOCKET, SO_DETACH_FILTER, &[]), Err(Errno::EPERM));
+        let open = listener(NETLINK_KOBJECT_UEVENT);
+        open.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &prog).unwrap();
+        open.set_option(SOL_SOCKET, SO_DETACH_FILTER, &[]).unwrap();
+        assert_eq!(open.set_option(SOL_SOCKET, SO_DETACH_FILTER, &[]), Err(Errno::ENOENT));
+        send_all(Event::new(Action::Add, path, "block").finish());
+        assert_eq!(got(&open, "uevflt1").len(), 1);
+    }
 }
