@@ -360,6 +360,7 @@ fn net_ns_of_fd(fd: i32) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
 /// the credentials of the VFS checks and the signals of the console. The boot code calls this one time, before `spawn_init`.
 pub fn init() {
     rk_vfs::ipc::set_sysvipc(crate::msg::sysvipc);
+    crate::bpf::init();
     crate::mqueue::register();
     crate::ns::init();
     rk_vfs::inode::set_clock(crate::info::realtime);

@@ -4,11 +4,13 @@
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
 use rk_abi::Errno;
+use rk_bpf::cgroup::{CgroupEnv, atype, bpf_prog_run_array_cg, cgroup_bpf_enabled};
 use rk_bpf::inode::{BpfObj, bpf_mkobj, bpf_obj_of};
 use rk_bpf::map::MapEnv;
 use rk_bpf::prog::prog_type::BPF_PROG_TYPE_SOCKET_FILTER;
-use rk_bpf::prog::{BpfProg, bpf_prog_of, run_socket_filter};
+use rk_bpf::prog::{BpfCgroupDevCtx, BpfProg, BpfSock, bpf_prog_of, run_socket_filter};
 use rk_bpf::syscall::Env;
+use rk_net::Socket;
 use rk_net::filter::SkFilter;
 use rk_vfs::file::File;
 
@@ -139,6 +141,105 @@ impl rk_bpf::helpers::HelperEnv for FilterHelperEnv {
     fn current_cgroup_id(&self) -> u64 {
         0
     }
+}
+
+/// What the helpers of a cgroup program see: the current task, as the programs of Linux that
+/// run in the call of the task.
+struct TaskHelperEnv;
+
+impl rk_bpf::helpers::HelperEnv for TaskHelperEnv {
+    fn map_env(&self) -> MapEnv {
+        MapEnv { nr_cpus: rk_frame::cpu::count(), cpu: rk_frame::cpu::id() }
+    }
+
+    fn ktime_get_ns(&self) -> u64 {
+        crate::info::uptime_ns()
+    }
+
+    fn current_pid_tgid(&self) -> Option<u64> {
+        let t = rk_proc::current_thread()?;
+        Some(u64::from(t.process().pid()) << 32 | u64::from(t.tid()))
+    }
+
+    fn current_uid_gid(&self) -> Option<u64> {
+        let cred = rk_proc::current_thread()?.process().cred();
+        Some(u64::from(cred.gid) << 32 | u64::from(cred.uid))
+    }
+
+    fn current_cgroup_id(&self) -> u64 {
+        rk_fs_cgroup::cgroup_ino(current_cgroup())
+    }
+}
+
+/// The cgroup of the current task. A kernel thread is in the root cgroup.
+fn current_cgroup() -> rk_cgroup::CgId {
+    rk_proc::current_thread().map_or(rk_cgroup::ROOT, |t| t.process().cgroup())
+}
+
+/// The cgroup tree for the cgroup programs.
+struct Cgroups;
+
+impl CgroupEnv for Cgroups {
+    fn cgroup_parent(&self, id: rk_cgroup::CgId) -> Option<rk_cgroup::CgId> {
+        rk_cgroup::with(|h| h.parent(id))
+    }
+
+    fn cgroup_id(&self, id: rk_cgroup::CgId) -> u64 {
+        rk_fs_cgroup::cgroup_ino(id)
+    }
+}
+
+/// Runs the device programs of the cgroup of the current task, as
+/// `__cgroup_bpf_check_dev_permission` of Linux. A program that gives 0 refuses the access with
+/// `EPERM`.
+fn cgroup_bpf_check_dev_permission(
+    dev_type: u32,
+    major: u32,
+    minor: u32,
+    access: u32,
+) -> Result<(), Errno> {
+    if !cgroup_bpf_enabled(atype::CGROUP_DEVICE) {
+        return Ok(());
+    }
+    let mut ctx = BpfCgroupDevCtx { access_type: (access << 16) | dev_type, major, minor };
+    bpf_prog_run_array_cg(&Cgroups, current_cgroup(), atype::CGROUP_DEVICE, |prog| {
+        prog.run(&mut ctx, &TaskHelperEnv)
+    })
+}
+
+/// Runs the programs of `BPF_CGROUP_INET_SOCK_CREATE` of the cgroup of the current task on a new
+/// socket, as `BPF_CGROUP_RUN_PROG_INET_SOCK` in `inet_create` of Linux. A program that gives 0
+/// refuses the socket with `EPERM`. The fields that a program writes go to the socket.
+pub(crate) fn cgroup_run_inet_sock(sock: &dyn Socket) -> Result<(), Errno> {
+    use rk_abi::native::socket::{SO_BINDTOIFINDEX, SO_MARK, SO_PRIORITY, SOL_SOCKET};
+    if !cgroup_bpf_enabled(atype::CGROUP_INET_SOCK_CREATE) {
+        return Ok(());
+    }
+    // A new socket is in the state `TCP_CLOSE`.
+    let mut ctx = BpfSock {
+        family: sock.family(),
+        sock_type: sock.kind(),
+        protocol: sock.protocol(),
+        state: 7,
+        ..BpfSock::default()
+    };
+    let atype = atype::CGROUP_INET_SOCK_CREATE;
+    bpf_prog_run_array_cg(&Cgroups, current_cgroup(), atype, |prog| {
+        prog.run(&mut ctx, &TaskHelperEnv)
+    })?;
+    for (name, value) in
+        [(SO_BINDTOIFINDEX, ctx.bound_dev_if), (SO_MARK, ctx.mark), (SO_PRIORITY, ctx.priority)]
+    {
+        if value != 0 {
+            let _ = sock.set_option(SOL_SOCKET, name, &value.to_ne_bytes());
+        }
+    }
+    Ok(())
+}
+
+/// Connects the hooks of the cgroup programs to the VFS. The boot code calls this one time.
+pub(crate) fn init() {
+    rk_vfs::device::set_devcgroup_check(cgroup_bpf_check_dev_permission);
 }
 
 /// A socket filter of `SO_ATTACH_BPF`.
