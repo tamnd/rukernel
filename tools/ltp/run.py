@@ -117,10 +117,11 @@ mount -t tmpfs tmp /tmp
 mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup 2>/dev/null
 # The tests of IPv6 and the sockets send to ::1 and 127.0.0.1, as on a system where lo is up.
 ip link set lo up 2>/dev/null
-# The drivers that are in the kernel, for tst_require_drivers. rukernel has no modules.
+# The drivers that are in the kernel, for tst_require_drivers and for modprobe of busybox, which
+# gives 0 for a module in modules.builtin. rukernel has no modules.
 m=/lib/modules/$(uname -r)
 mkdir -p $m /var/run/netns /var/lib/misc /var/lib/dhcp /var/log
-printf "kernel/drivers/net/veth.ko\nkernel/drivers/net/dummy.ko\n" > $m/modules.builtin
+printf "kernel/drivers/net/veth.ko\nkernel/drivers/net/dummy.ko\nkernel/net/dns_resolver/dns_resolver.ko\n" > $m/modules.builtin
 : > $m/modules.dep
 # The RPC tests need rpcbind, from --tools.
 command -v rpcbind >/dev/null && mkdir -p /run && rpcbind

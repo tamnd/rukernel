@@ -48,7 +48,7 @@ pub fn add_key(
     if !ring.key.is_keyring() {
         return Err(Errno::ENOTDIR);
     }
-    kind.check_payload(&payload)?;
+    let (payload, short) = kind.preparse(payload)?;
     let desc = desc.ok_or(Errno::EINVAL)?;
     let _g = LINK_LOCK.lock();
     let replace = begin_link(&ring.key, kind, desc)?;
@@ -81,6 +81,9 @@ pub fn add_key(
             return Err(e);
         }
     };
+    if short {
+        key.state.lock().expiry = cx.now + 1;
+    }
     commit_link(&ring.key, &key);
     Ok(key.serial)
 }
