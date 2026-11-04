@@ -27,6 +27,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
+- The `systemd` boot test image now has the `kmod` package. systemd 257 loads libkmod with `dlopen`, and without the library `systemd-modules-load` stops with "Failed to initialize libkmod context: Operation not supported". rukernel has no loadable modules, so as on Linux without `CONFIG_MODULES`, `init_module`, `finit_module` and `delete_module` give `ENOSYS` and `/proc/modules` does not exist. The init boot test checks this (#536).
 - A `writev` to `/dev/kmsg` makes one record, as `devkmsg_write` of Linux. systemd writes its messages in 3 parts, and each part was a record of its own (#536).
 - `mount` with `MS_BIND` and `MS_REC` copies the mounts under the source, as `copy_tree` of fs/namespace.c of Linux. Before, it made only the mount of the source, so the root that systemd makes for a service with `MS_BIND` and `MS_REC` of `/` had no `/sys/fs/cgroup`, and `systemd-logind` failed at the step `NAMESPACE` (#536).
 - `/proc/PID/mountinfo` can be in an epoll set, and has an event when the mounts change, as `mounts_poll` of fs/proc_namespace.c of Linux. Before, `epoll_ctl` gave `EPERM` for it, so libmount closed its monitor, and systemd failed to see the mounts that it made ("Failed to drain libmount events") (#536).
