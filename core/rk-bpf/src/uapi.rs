@@ -18,8 +18,28 @@ pub mod cmd {
     pub const BPF_OBJ_PIN: u32 = 6;
     /// Gives a descriptor of a pinned object.
     pub const BPF_OBJ_GET: u32 = 7;
+    /// Gives the program ID after `start_id`.
+    pub const BPF_PROG_GET_NEXT_ID: u32 = 11;
+    /// Gives the map ID after `start_id`.
+    pub const BPF_MAP_GET_NEXT_ID: u32 = 12;
+    /// Gives a descriptor of the program of an ID.
+    pub const BPF_PROG_GET_FD_BY_ID: u32 = 13;
+    /// Gives a descriptor of the map of an ID.
+    pub const BPF_MAP_GET_FD_BY_ID: u32 = 14;
+    /// Copies the information of a program, a map or a link.
+    pub const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
     /// Makes the map read only for system calls.
     pub const BPF_MAP_FREEZE: u32 = 22;
+    /// Attaches a program to a hook with a link.
+    pub const BPF_LINK_CREATE: u32 = 28;
+    /// Puts a new program in a link.
+    pub const BPF_LINK_UPDATE: u32 = 29;
+    /// Gives a descriptor of the link of an ID.
+    pub const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+    /// Gives the link ID after `start_id`.
+    pub const BPF_LINK_GET_NEXT_ID: u32 = 31;
+    /// Detaches a link from its hook.
+    pub const BPF_LINK_DETACH: u32 = 34;
     /// The flag of the command that tells that the call has `struct bpf_common_attr`.
     pub const BPF_COMMON_ATTRS: u32 = 1 << 16;
 }
@@ -97,8 +117,63 @@ pub mod flags {
         BPF_F_RDONLY | BPF_F_RDONLY_PROG | BPF_F_WRONLY | BPF_F_WRONLY_PROG;
 }
 
+/// The attach types, `enum bpf_attach_type`.
+#[allow(missing_docs)]
+pub mod attach_type {
+    pub const BPF_CGROUP_INET_INGRESS: u32 = 0;
+    pub const BPF_CGROUP_INET_EGRESS: u32 = 1;
+    pub const BPF_CGROUP_INET_SOCK_CREATE: u32 = 2;
+    pub const BPF_CGROUP_SOCK_OPS: u32 = 3;
+    pub const BPF_CGROUP_DEVICE: u32 = 6;
+    pub const BPF_CGROUP_INET4_BIND: u32 = 8;
+    pub const BPF_CGROUP_INET6_BIND: u32 = 9;
+    pub const BPF_CGROUP_INET4_CONNECT: u32 = 10;
+    pub const BPF_CGROUP_INET6_CONNECT: u32 = 11;
+    pub const BPF_CGROUP_INET4_POST_BIND: u32 = 12;
+    pub const BPF_CGROUP_INET6_POST_BIND: u32 = 13;
+    pub const BPF_CGROUP_UDP4_SENDMSG: u32 = 14;
+    pub const BPF_CGROUP_UDP6_SENDMSG: u32 = 15;
+    pub const BPF_CGROUP_SYSCTL: u32 = 18;
+    pub const BPF_CGROUP_UDP4_RECVMSG: u32 = 19;
+    pub const BPF_CGROUP_UDP6_RECVMSG: u32 = 20;
+    pub const BPF_CGROUP_GETSOCKOPT: u32 = 21;
+    pub const BPF_CGROUP_SETSOCKOPT: u32 = 22;
+    pub const BPF_CGROUP_INET4_GETPEERNAME: u32 = 29;
+    pub const BPF_CGROUP_INET6_GETPEERNAME: u32 = 30;
+    pub const BPF_CGROUP_INET4_GETSOCKNAME: u32 = 31;
+    pub const BPF_CGROUP_INET6_GETSOCKNAME: u32 = 32;
+    pub const BPF_CGROUP_INET_SOCK_RELEASE: u32 = 34;
+    pub const BPF_STRUCT_OPS: u32 = 44;
+    pub const BPF_CGROUP_UNIX_CONNECT: u32 = 50;
+    pub const BPF_CGROUP_UNIX_SENDMSG: u32 = 51;
+    pub const BPF_CGROUP_UNIX_RECVMSG: u32 = 52;
+    pub const BPF_CGROUP_UNIX_GETPEERNAME: u32 = 53;
+    pub const BPF_CGROUP_UNIX_GETSOCKNAME: u32 = 54;
+}
+
+/// The flags of `BPF_PROG_ATTACH`, `BPF_LINK_CREATE` and `BPF_LINK_UPDATE`.
+pub mod attach_flags {
+    /// A program of a child cgroup can override this one.
+    pub const BPF_F_ALLOW_OVERRIDE: u32 = 1 << 0;
+    /// The cgroup can have more than one program, and all of them run.
+    pub const BPF_F_ALLOW_MULTI: u32 = 1 << 1;
+    /// The call replaces the program of `replace_bpf_fd` or of `old_prog_fd`.
+    pub const BPF_F_REPLACE: u32 = 1 << 2;
+    /// The program goes before the relative program.
+    pub const BPF_F_BEFORE: u32 = 1 << 3;
+    /// The program goes after the relative program.
+    pub const BPF_F_AFTER: u32 = 1 << 4;
+    /// `relative_id` has an ID, not a descriptor.
+    pub const BPF_F_ID: u32 = 1 << 5;
+    /// The program runs before the programs of the parent cgroups.
+    pub const BPF_F_PREORDER: u32 = 1 << 6;
+}
+
 /// The length of the name of a map or a program, with its zero byte, `BPF_OBJ_NAME_LEN`.
 pub const BPF_OBJ_NAME_LEN: usize = 16;
+
+/// The size of a program tag, `BPF_TAG_SIZE`.
+pub const BPF_TAG_SIZE: usize = 8;
 
 /// The capability that allows the use of BPF, `CAP_BPF` of include/uapi/linux/capability.h.
 pub const CAP_BPF: u32 = 39;

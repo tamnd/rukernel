@@ -1,11 +1,12 @@
 //! bpffs, the file system of the pinned BPF objects, kernel/bpf/inode.c of Linux.
 //!
-//! `BPF_OBJ_PIN` puts a map or a program in a file of bpffs, and the object stays after the last
-//! file descriptor closes. `BPF_OBJ_GET` gives a new file descriptor for the object of a file.
-//! An `unlink` of the file drops the reference of the pin. bpffs also has directories and
+//! `BPF_OBJ_PIN` puts a map, a program or a link in a file of bpffs, and the object stays after
+//! the last file descriptor closes. `BPF_OBJ_GET` gives a new file descriptor for the object of a
+//! file. An `unlink` of the file drops the reference of the pin. bpffs also has directories and
 //! symbolic links. A name with a dot is not valid, and an `open` of a pinned object gives `EIO`,
 //! as in Linux.
 
+use crate::link::BpfLink;
 use crate::map::BpfMap;
 use crate::prog::BpfProg;
 use alloc::collections::BTreeMap;
@@ -33,6 +34,8 @@ pub enum BpfObj {
     Prog(Arc<BpfProg>),
     /// A map, `BPF_TYPE_MAP`.
     Map(Arc<BpfMap>),
+    /// A link, `BPF_TYPE_LINK`.
+    Link(Arc<BpfLink>),
 }
 
 /// The options of a mount, `struct bpf_mount_opts` of Linux.

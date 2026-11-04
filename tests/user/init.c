@@ -5541,6 +5541,93 @@ static void test_bpf_prog(void)
 	close(map);
 }
 
+/* A BPF_*_GET_NEXT_ID or BPF_*_GET_FD_BY_ID command: start_id or the ID, and open_flags. */
+static long bpf_id(int cmd, unsigned int id, unsigned int *next)
+{
+	unsigned char attr[168] = { 0 };
+	long r;
+
+	bpf_put32(attr, 0, id);
+	r = bpf_call(cmd, attr, cmd == 14 ? 12 : 8);
+	if (next)
+		memcpy(next, attr + 4, 4);
+	return r;
+}
+
+/* BPF_OBJ_GET_INFO_BY_FD: bpf_fd, info_len and info. Gives info_len in len. */
+static long bpf_info(int fd, void *info, unsigned int *len)
+{
+	unsigned char attr[168] = { 0 };
+	long r;
+
+	bpf_put32(attr, 0, fd);
+	bpf_put32(attr, 4, *len);
+	bpf_put64(attr, 8, (unsigned long)info);
+	r = bpf_call(15, attr, 16);
+	memcpy(len, attr + 4, 4);
+	return r;
+}
+
+/*
+ * The IDs of the maps and the programs, BPF_OBJ_GET_INFO_BY_FD, and the link commands, as
+ * bpftool and systemd use them (#537).
+ */
+static void test_bpf_ids(void)
+{
+	unsigned char minfo[104] = { 0 }, pinfo[232] = { 0 }, attr[168] = { 0 };
+	unsigned int len = sizeof(minfo), map_id, prog_id, next = 0, ids[2] = { 0 };
+	int map, prog, fd, ok;
+
+	map = bpf_map_new(2, 4, 8, 1, 0);
+	unsigned long long insns[] = {
+		bpf_insn(0x18, 1, 1, 0, map), 0,	/* r1 = the map */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	prog = bpf_prog_new(insns, 4, NULL, 0);
+	ok = map >= 0 && bpf_info(map, minfo, &len) == 0 && len == sizeof(minfo);
+	memcpy(&map_id, minfo + 4, 4);
+	ok = ok && minfo[0] == 2 && map_id != 0 && !strcmp((char *)minfo + 24, "rk_test");
+	check("BPF_OBJ_GET_INFO_BY_FD gives the type, the ID and the name of a map", ok);
+
+	len = sizeof(pinfo);
+	bpf_put32(pinfo, 52, 2);
+	bpf_put64(pinfo, 56, (unsigned long)ids);
+	ok = prog >= 0 && bpf_info(prog, pinfo, &len) == 0 && len == sizeof(pinfo);
+	memcpy(&prog_id, pinfo + 4, 4);
+	ok = ok && pinfo[0] == 1 && prog_id != 0 && pinfo[52] == 1 && ids[0] == map_id;
+	check("BPF_OBJ_GET_INFO_BY_FD gives the type, the ID and the maps of a program", ok);
+
+	ok = bpf_id(12, map_id - 1, &next) == 0 && next == map_id;
+	ok = ok && bpf_id(11, prog_id - 1, &next) == 0 && next == prog_id;
+	check("BPF_MAP_GET_NEXT_ID and BPF_PROG_GET_NEXT_ID find the new objects", ok);
+	fd = bpf_id(14, map_id, NULL);
+	len = sizeof(minfo);
+	memset(minfo, 0, sizeof(minfo));
+	ok = fd >= 0 && bpf_info(fd, minfo, &len) == 0 && !memcmp(minfo + 4, &map_id, 4);
+	close(fd);
+	fd = bpf_id(13, prog_id, NULL);
+	ok = ok && fd >= 0;
+	close(fd);
+	check("BPF_MAP_GET_FD_BY_ID and BPF_PROG_GET_FD_BY_ID open the objects", ok);
+	errno = 0;
+	ok = bpf_id(30, 0, NULL) == -1 && errno == ENOENT;
+	errno = 0;
+	ok = ok && bpf_info(-1, minfo, &len) == -1 && errno == EBADFD;
+	check("BPF_LINK_GET_FD_BY_ID of ID 0 gives ENOENT, and a bad descriptor gives EBADFD", ok);
+
+	/* LINK_CREATE: prog_fd, target_fd, attach_type. A socket filter has no link. */
+	bpf_put32(attr, 0, prog);
+	bpf_put32(attr, 8, 0);
+	errno = 0;
+	check("BPF_LINK_CREATE of a socket filter gives EINVAL",
+	      bpf_call(28, attr, 64) == -1 && errno == EINVAL);
+	close(prog);
+	close(map);
+	errno = 0;
+	check("the ID of a closed map is free", bpf_id(14, map_id, NULL) == -1 && errno == ENOENT);
+}
+
 /* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
 static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 {
@@ -5708,6 +5795,7 @@ static void test_bpf(void)
 	check("an LPM trie finds the longest prefix", ok);
 	close(fd);
 	test_bpf_prog();
+	test_bpf_ids();
 	test_bpffs();
 	umount("/proc");
 }
@@ -12356,6 +12444,8 @@ int main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "pidns") == 0)
 		test_pid_ns();
+	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
+		test_bpf();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0) {
 		test_dns_key();
 		test_request_key();

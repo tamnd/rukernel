@@ -34,6 +34,22 @@ pub mod last_field {
     pub const BPF_PROG_LOAD: usize = 168;
     /// `BPF_OBJ_PIN` and `BPF_OBJ_GET`: `path_fd`.
     pub const BPF_OBJ: usize = 20;
+    /// `BPF_*_GET_NEXT_ID`: `next_id`.
+    pub const BPF_OBJ_GET_NEXT_ID: usize = 8;
+    /// `BPF_PROG_GET_FD_BY_ID`: `prog_id`.
+    pub const BPF_PROG_GET_FD_BY_ID: usize = 4;
+    /// `BPF_MAP_GET_FD_BY_ID`: `open_flags`.
+    pub const BPF_MAP_GET_FD_BY_ID: usize = 12;
+    /// `BPF_LINK_GET_FD_BY_ID`: `link_id`.
+    pub const BPF_LINK_GET_FD_BY_ID: usize = 4;
+    /// `BPF_OBJ_GET_INFO_BY_FD`: `info.info`.
+    pub const BPF_OBJ_GET_INFO_BY_FD: usize = 16;
+    /// `BPF_LINK_CREATE`: `link_create.uprobe_multi.path_fd`.
+    pub const BPF_LINK_CREATE: usize = 64;
+    /// `BPF_LINK_UPDATE`: `link_update.old_prog_fd`.
+    pub const BPF_LINK_UPDATE: usize = 16;
+    /// `BPF_LINK_DETACH`: `link_detach.link_fd`.
+    pub const BPF_LINK_DETACH: usize = 4;
 }
 
 /// Checks the size of an argument that a program gives, as `bpf_check_uarg_tail_zero` of Linux.
@@ -165,6 +181,54 @@ pub mod obj {
     pub const FILE_FLAGS: usize = 12;
     /// `path_fd`.
     pub const PATH_FD: usize = 16;
+}
+
+/// The fields of the `BPF_*_GET_NEXT_ID` and `BPF_*_GET_FD_BY_ID` commands.
+pub mod get_id {
+    /// `start_id`, `prog_id`, `map_id` or `link_id`.
+    pub const START_ID: usize = 0;
+    /// `next_id`.
+    pub const NEXT_ID: usize = 4;
+    /// `open_flags`.
+    pub const OPEN_FLAGS: usize = 8;
+}
+
+/// The fields of `BPF_OBJ_GET_INFO_BY_FD`, `info`.
+pub mod info {
+    /// `bpf_fd`.
+    pub const BPF_FD: usize = 0;
+    /// `info_len`.
+    pub const INFO_LEN: usize = 4;
+    /// `info`.
+    pub const INFO: usize = 8;
+}
+
+/// The fields of `BPF_LINK_CREATE`, `link_create`.
+pub mod link_create {
+    /// `prog_fd`.
+    pub const PROG_FD: usize = 0;
+    /// `target_fd`.
+    pub const TARGET_FD: usize = 4;
+    /// `attach_type`.
+    pub const ATTACH_TYPE: usize = 8;
+    /// `flags`.
+    pub const FLAGS: usize = 12;
+    /// `cgroup.relative_fd` or `cgroup.relative_id`.
+    pub const RELATIVE_FD: usize = 16;
+    /// `cgroup.expected_revision`.
+    pub const EXPECTED_REVISION: usize = 24;
+}
+
+/// The fields of `BPF_LINK_UPDATE` and `BPF_LINK_DETACH`.
+pub mod link_update {
+    /// `link_fd`.
+    pub const LINK_FD: usize = 0;
+    /// `new_prog_fd`.
+    pub const NEW_PROG_FD: usize = 4;
+    /// `flags`.
+    pub const FLAGS: usize = 8;
+    /// `old_prog_fd`.
+    pub const OLD_PROG_FD: usize = 12;
 }
 
 /// The fields of `BPF_PROG_LOAD`.

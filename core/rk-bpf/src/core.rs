@@ -560,6 +560,8 @@ mod tests {
             gpl_compatible: true,
             verified_insns: 0,
             run_cnt: core::sync::atomic::AtomicU64::new(0),
+            load_time: 0,
+            uid: 0,
         }
     }
 
