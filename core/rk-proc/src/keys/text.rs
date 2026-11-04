@@ -43,10 +43,12 @@ fn key_line(out: &mut String, key: &KeyData, now: u64) {
     let _ = write!(
         out,
         // The flags are instantiated, revoked, dead, quota, user construction, negative and
-        // invalidated. A key here is never dead or under construction.
-        "{:08x} I{}-Q-{}{} {:5} {:>4} {:08x} {:5} {:5} {:<9.9} ",
+        // invalidated. A key here is never dead.
+        "{:08x} {}{}-Q{}{}{} {:5} {:>4} {:08x} {:5} {:5} {:<9.9} ",
         key.serial,
+        flag(!s.pending, 'I'),
         flag(s.revoked, 'R'),
+        flag(s.pending, 'U'),
         flag(s.negative.is_some(), 'N'),
         flag(key.is_invalidated(), 'i'),
         key.usage(),
@@ -57,7 +59,7 @@ fn key_line(out: &mut String, key: &KeyData, now: u64) {
         key.kind.name(),
     );
     out.push_str(&String::from_utf8_lossy(&key.desc));
-    if s.negative.is_none() {
+    if s.negative.is_none() && !s.pending {
         if key.is_keyring() {
             if links == 0 {
                 out.push_str(": empty");

@@ -272,6 +272,8 @@ struct ThreadKeys {
     ring: Option<Arc<Key>>,
     /// The default keyring of `request_key`, a `KEY_REQKEY_DEFL_*` value.
     reqkey: u8,
+    /// The authorization key that the thread assumed, as `cred->request_key_auth`.
+    auth: Option<Arc<Key>>,
 }
 
 // `Arc` puts two counts before the process. The largest slab class of the kernel heap is 2048
@@ -1259,6 +1261,15 @@ impl keys::Owner for Thread {
     fn set_reqkey(&self, value: u8) {
         self.keys.lock().reqkey = value;
     }
+
+    fn auth(&self) -> Option<Arc<Key>> {
+        self.keys.lock().auth.clone()
+    }
+
+    fn set_auth(&self, auth: Option<Arc<Key>>) {
+        // The old key goes after the lock.
+        let _old = core::mem::replace(&mut self.keys.lock().auth, auth);
+    }
 }
 
 impl Thread {
@@ -2049,7 +2060,16 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     thread.inherit_seccomp(parent);
     thread.inherit_timer_slack(parent);
     *thread.sched.lock() = parent.sched().forked();
-    thread.keys.lock().reqkey = parent.keys.lock().reqkey;
+    {
+        // The credentials of the child have the authority of the parent, as `copy_creds`.
+        let (reqkey, auth) = {
+            let k = parent.keys.lock();
+            (k.reqkey, k.auth.clone())
+        };
+        let mut k = thread.keys.lock();
+        k.reqkey = reqkey;
+        k.auth = auth;
+    }
     child.state.lock().threads.push(thread.clone());
     table.processes.insert(pid, Arc::downgrade(&child));
     table.threads.insert(pid, Arc::downgrade(&thread));
@@ -2094,14 +2114,15 @@ pub fn new_thread(thread: &Thread) -> Result<Arc<Thread>, Errno> {
     table.threads.insert(tid, Arc::downgrade(&new));
     drop(table);
     // A thread with a thread keyring gives a new empty one to the new thread, as Linux does.
-    let reqkey = {
+    let (ring, reqkey, auth) = {
         let k = thread.keys.lock();
-        (k.ring.is_some(), k.reqkey)
+        (k.ring.is_some(), k.reqkey, k.auth.clone())
     };
-    if reqkey.0 {
+    if ring {
         new.keys.lock().ring = keys::new_thread_ring(&process.cred());
     }
-    new.keys.lock().reqkey = reqkey.1;
+    new.keys.lock().reqkey = reqkey;
+    new.keys.lock().auth = auth;
     let mut s = process.state.lock();
     // A thread on another CPU can start the exit of the group after the checks of `clone`. That
     // thread kills the threads in the list, so a thread that comes after it is killed here.

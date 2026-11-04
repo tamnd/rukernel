@@ -154,6 +154,24 @@ fn check_reject_error(error: u64) -> Result<(), Errno> {
     Ok(())
 }
 
+/// `keyctl(KEYCTL_INSTANTIATE)` and `keyctl(KEYCTL_INSTANTIATE_IOV)`: the payload is in the user
+/// buffers `parts`. As `keyctl_instantiate_key_common`, the payload is copied after the check of
+/// the authority.
+fn instantiate(cx: &Cx<'_>, id: i32, parts: &[(u64, u64)], ring: i32) -> SysResult {
+    let len = parts.iter().fold(0u64, |n, p| n.saturating_add(p.1));
+    if len > MAX_PAYLOAD as u64 {
+        return Err(Errno::EINVAL);
+    }
+    let t = cx.thread;
+    t.with_keys(|k| keys::check_authority(k, id))?;
+    let mut payload = Vec::with_capacity(len as usize);
+    for &(addr, n) in parts.iter().filter(|p| p.1 != 0) {
+        payload.extend_from_slice(&cx.read_bytes(addr, n as usize)?);
+    }
+    t.with_keys(|k| keys::instantiate(k, id, payload, ring))?;
+    Ok(0)
+}
+
 /// `keyctl(operation, arg2, arg3, arg4, arg5)`.
 pub(crate) fn keyctl(cx: &mut Cx<'_>, op: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> SysResult {
     let id = a2 as i32;
@@ -197,26 +215,29 @@ pub(crate) fn keyctl(cx: &mut Cx<'_>, op: u64, a2: u64, a3: u64, a4: u64, a5: u6
             Ok(full as u64)
         }
         KEYCTL_INSTANTIATE => {
-            // There is no authorization key of a request, so the caller cannot instantiate.
-            if a4 > MAX_PAYLOAD as u64 {
-                return Err(Errno::EINVAL);
-            }
-            Err(Errno::EPERM)
+            let len = if a3 == 0 { 0 } else { a4 };
+            instantiate(cx, id, &[(a3, len)], a5 as i32)
         }
-        KEYCTL_INSTANTIATE_IOV | KEYCTL_NEGATE => Err(Errno::EPERM),
+        KEYCTL_INSTANTIATE_IOV => {
+            let count = if a3 == 0 { 0 } else { a4 };
+            let iovs = crate::fs::read_iovecs(cx, a3, count)?;
+            let parts: Vec<(u64, u64)> = iovs.iter().map(|v| (v.iov_base, v.iov_len)).collect();
+            instantiate(cx, id, &parts, a5 as i32)
+        }
+        KEYCTL_NEGATE => {
+            t.with_keys(|k| keys::reject(k, id, a3 as u32, Errno::ENOKEY, a4 as i32)).map(|()| 0)
+        }
         KEYCTL_REJECT => {
             check_reject_error(a4)?;
-            Err(Errno::EPERM)
+            let error = Errno::new(a4 as u16).ok_or(Errno::EINVAL)?;
+            t.with_keys(|k| keys::reject(k, id, a3 as u32, error, a5 as i32)).map(|()| 0)
         }
         KEYCTL_SET_REQKEY_KEYRING => {
             let old = t.with_keys(|k| keys::set_reqkey(k, id))?;
             Ok(old as u64)
         }
         KEYCTL_SET_TIMEOUT => t.with_keys(|k| keys::set_timeout(k, id, a3 as u32)).map(|()| 0),
-        // There is no authorization key to assume. ID 0 drops the authority that is not there.
-        KEYCTL_ASSUME_AUTHORITY if id < 0 => Err(Errno::EINVAL),
-        KEYCTL_ASSUME_AUTHORITY if id == 0 => Ok(0),
-        KEYCTL_ASSUME_AUTHORITY => Err(Errno::ENOKEY),
+        KEYCTL_ASSUME_AUTHORITY => serial(t.with_keys(|k| keys::assume_authority(k, id))?),
         KEYCTL_GET_SECURITY => {
             let label = t.with_keys(|k| keys::get_security(k, id))?;
             if a3 != 0 && a4 > 0 {
