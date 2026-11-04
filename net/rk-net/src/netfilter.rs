@@ -23,6 +23,8 @@ use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
 
+pub mod nf_tables_api;
+
 /// The verdict that drops the packet.
 pub const NF_DROP: u32 = 0;
 /// The verdict that gives the packet to the next hook.

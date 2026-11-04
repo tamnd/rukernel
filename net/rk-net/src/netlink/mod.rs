@@ -12,6 +12,7 @@
 pub mod genl;
 pub mod link;
 pub mod msg;
+pub mod nfnetlink;
 pub mod nsid;
 pub mod policy;
 pub mod uevent;
@@ -157,6 +158,7 @@ fn lookup(protocol: u32, portid: u32) -> Option<Arc<NetlinkSocket>> {
 fn ngroups(protocol: u32) -> u32 {
     match protocol {
         NETLINK_GENERIC => genl::NGROUPS,
+        nfnetlink::NETLINK_NETFILTER => nfnetlink::NGROUPS,
         NETLINK_KOBJECT_UEVENT => uevent::NGROUPS,
         _ => RTNLGRP_MAX,
     }
@@ -202,6 +204,9 @@ fn bind_group(protocol: u32, group: u32) -> Result<()> {
     if protocol == NETLINK_GENERIC {
         return genl::bind(group);
     }
+    if protocol == nfnetlink::NETLINK_NETFILTER {
+        return nfnetlink::bind(group);
+    }
     if protocol == NETLINK_KOBJECT_UEVENT {
         return Ok(());
     }
@@ -223,7 +228,9 @@ impl NetlinkSocket {
         if kind != SOCK_RAW && kind != SOCK_DGRAM {
             return Err(Errno::ESOCKTNOSUPPORT);
         }
-        if ![NETLINK_ROUTE, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT].contains(&protocol) {
+        if ![NETLINK_ROUTE, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT, nfnetlink::NETLINK_NETFILTER]
+            .contains(&protocol)
+        {
             return Err(Errno::EPROTONOSUPPORT);
         }
         let sock = Arc::new_cyclic(|me| Self {
@@ -391,6 +398,10 @@ impl NetlinkSocket {
     /// Runs each message of a request to the kernel, as `netlink_rcv_skb` of Linux. The kernel
     /// sends an ack for a message with `NLM_F_ACK` and for each error.
     fn input(&self, data: &[u8]) {
+        // A batch of netfilter runs as one transaction.
+        if self.protocol == nfnetlink::NETLINK_NETFILTER && nfnetlink::rcv(self, data) {
+            return;
+        }
         let portid = self.portid();
         for m in msg::messages(data) {
             let Some(h) = Header::parse(m) else { break };
@@ -399,6 +410,7 @@ impl NetlinkSocket {
             if h.flags & NLM_F_REQUEST as u16 != 0 && u32::from(h.ty) >= NLMSG_MIN_TYPE {
                 let r = match self.protocol {
                     NETLINK_GENERIC => genl::rcv(self, h, m, &ext),
+                    nfnetlink::NETLINK_NETFILTER => nfnetlink::rcv_msg(self, h, m, &ext),
                     NETLINK_KOBJECT_UEVENT => uevent::rcv(m).map(|()| Flow::Done),
                     _ => rtnl_rcv(self, h, m, &ext),
                 };
@@ -779,6 +791,9 @@ impl Socket for NetlinkSocket {
     fn release(&self) {
         let me = self.me.as_ptr();
         SOCKETS.lock().retain(|w| w.strong_count() > 0 && w.as_ptr() != me);
+        if self.protocol == nfnetlink::NETLINK_NETFILTER && self.bound.load(Ordering::Acquire) {
+            crate::netfilter::nf_tables_api::nft_release_portid(self.portid());
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
