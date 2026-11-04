@@ -5896,6 +5896,111 @@ static void test_bpf_cgroup_hooks(void)
 	rmdir("/bpfcg");
 }
 
+/*
+ * A UDP socket of the family sends a datagram to itself on the loopback address. Gives -1 if
+ * the send fails, 0 if no datagram comes in 200 ms, and 1 if the datagram comes in.
+ */
+static int udp_self(int family)
+{
+	struct sockaddr_storage ss = { 0 };
+	struct timeval tv = { 0, 200000 };
+	socklen_t len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	char c = 0;
+	int fd, r;
+
+	ss.ss_family = family;
+	if (family == AF_INET)
+		((struct sockaddr_in *)&ss)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	else
+		((struct sockaddr_in6 *)&ss)->sin6_addr = in6addr_loopback;
+	fd = socket(family, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	if (bind(fd, (struct sockaddr *)&ss, len) != 0 ||
+	    getsockname(fd, (struct sockaddr *)&ss, &len) != 0) {
+		close(fd);
+		return -2;
+	}
+	if (sendto(fd, "x", 1, 0, (struct sockaddr *)&ss, len) != 1) {
+		r = errno;
+		close(fd);
+		errno = r;
+		return -1;
+	}
+	r = recv(fd, &c, 1, 0) == 1 && c == 'x';
+	close(fd);
+	return r;
+}
+
+/*
+ * The packet programs of a cgroup: a program of BPF_CGROUP_INET_INGRESS that gives 0 drops the
+ * packets to the sockets of the cgroup, and a program of BPF_CGROUP_INET_EGRESS that gives 0
+ * makes a send of a socket of the cgroup give EPERM, for IPv4 and IPv6 (#537).
+ */
+static void test_bpf_cgroup_skb(void)
+{
+	int cg, in, out, status, ok;
+	pid_t pid;
+
+	mkdir("/bpfcg", 0755);
+	if (mount("none", "/bpfcg", "cgroup2", 0, NULL) != 0) {
+		check("mount cgroup2 for the packet programs", 0);
+		return;
+	}
+	mkdir("/bpfcg/rk_skb", 0755);
+	cg = open("/bpfcg/rk_skb", O_RDONLY | O_DIRECTORY);
+	in = bpf_prog_ret(8, 0, 0);
+	out = bpf_prog_ret(8, 1, 0);
+	ok = in >= 0 && out >= 0 && bpf_attach(8, cg, in, 0, 0) == 0;
+	check("BPF_PROG_ATTACH of a program of BPF_CGROUP_INET_INGRESS", ok);
+	pid = fork();
+	if (pid == 0) {
+		int r = 0;
+
+		if (cg_write("/bpfcg/rk_skb/cgroup.procs", "0") != 0)
+			_exit(1);
+		if (udp_self(AF_INET) != 0)
+			r |= 2;
+		if (udp_self(AF_INET6) != 0)
+			r |= 4;
+		_exit(r);
+	}
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	if (ok && WEXITSTATUS(status) != 0)
+		printf("rk-bpf: the ingress check gave %d\n", WEXITSTATUS(status));
+	check("the ingress program drops the datagrams to a socket of the cgroup",
+	      ok && WEXITSTATUS(status) == 0);
+	ok = bpf_attach(9, cg, in, 0, 0) == 0 && bpf_attach(8, cg, out, 1, 0) == 0;
+	pid = fork();
+	if (pid == 0) {
+		int r = 0;
+
+		if (cg_write("/bpfcg/rk_skb/cgroup.procs", "0") != 0)
+			_exit(1);
+		errno = 0;
+		if (udp_self(AF_INET) != -1 || errno != EPERM)
+			r |= 2;
+		errno = 0;
+		if (udp_self(AF_INET6) != -1 || errno != EPERM)
+			r |= 4;
+		_exit(r);
+	}
+	ok = ok && pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	if (ok && WEXITSTATUS(status) != 0)
+		printf("rk-bpf: the egress check gave %d\n", WEXITSTATUS(status));
+	check("the egress program makes a send of a socket of the cgroup give EPERM",
+	      ok && WEXITSTATUS(status) == 0);
+	check("the packet programs of a cgroup do not stop a socket in another cgroup",
+	      udp_self(AF_INET) == 1 && udp_self(AF_INET6) == 1);
+	close(cg);
+	close(in);
+	close(out);
+	check("rmdir of a cgroup with a packet program", rmdir("/bpfcg/rk_skb") == 0);
+	umount("/bpfcg");
+	rmdir("/bpfcg");
+}
+
 /* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
 static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 {
@@ -6066,6 +6171,7 @@ static void test_bpf(void)
 	test_bpf_ids();
 	test_bpf_cgroup();
 	test_bpf_cgroup_hooks();
+	test_bpf_cgroup_skb();
 	test_bpffs();
 	umount("/proc");
 }

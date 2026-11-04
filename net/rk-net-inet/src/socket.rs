@@ -551,6 +551,8 @@ pub struct Dgram {
     uid: u32,
     /// The datagrams that the socket dropped, `sk_drops` of Linux.
     drops: AtomicU32,
+    /// The cgroup of the creator, `sk_cgrp_data` of Linux, for the cgroup programs.
+    cgroup: u32,
     state: SpinLock<State>,
     wait: Arc<WaitQueue>,
     events: AtomicU64,
@@ -585,6 +587,7 @@ impl Dgram {
             ino: rk_net::next_ino(),
             uid: rk_vfs::cred::current().fsuid,
             drops: AtomicU32::new(0),
+            cgroup: rk_net::filter::sock_cgroup_current(),
             state: SpinLock::new(State {
                 local: if v6 { ip::ANY } else { ip::V4_ANY },
                 port: 0,
@@ -728,16 +731,22 @@ impl Dgram {
     }
 
     /// Puts a datagram in the receive queue, as `__udp_queue_rcv_skb` of Linux. Gives `false`
-    /// if the socket dropped it: a full receive buffer or a shut down socket.
+    /// if the socket dropped it: a full receive buffer, a shut down socket, or a program of
+    /// `BPF_CGROUP_INET_INGRESS` that drops `packet`, the IP packet of the datagram.
     /// `scope` is the interface of a link local source, and `info` has the IPv6 header.
     pub(crate) fn deliver(
         &self,
+        packet: &[u8],
         src: Ip,
         scope: u32,
         port: u16,
         data: Vec<u8>,
         info: Option<Info6>,
     ) -> bool {
+        if !rk_net::filter::cgroup_skb_ingress(self.cgroup, packet) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         let mut s = self.state.lock();
         if s.closed || s.shut_rd || s.queued > s.options.rcvbuf as usize {
             self.drops.fetch_add(1, Ordering::Relaxed);
@@ -776,14 +785,21 @@ impl Dgram {
         if !self.mc_allow(h.dst, dif) {
             return;
         }
-        self.deliver(src, 0, 0, packet.to_vec(), Some(info));
+        self.deliver(packet, src, 0, 0, packet.to_vec(), Some(info));
     }
 
     /// Gives a copy of an IPv6 packet to a raw socket, as `ipv6_raw_deliver` and
     /// `icmpv6_filter` of Linux. `payload` is the packet after the IPv6 headers, which is
     /// what an IPv6 raw socket reads. The packet came in on `ifindex`, and `dif` is the device
-    /// for `stack::dev_match`.
-    pub(crate) fn deliver_raw6(&self, h: &ipv6::Header, ifindex: u32, payload: &[u8], dif: u32) {
+    /// for `stack::dev_match`. `packet` is the full packet.
+    pub(crate) fn deliver_raw6(
+        &self,
+        h: &ipv6::Header,
+        ifindex: u32,
+        packet: &[u8],
+        payload: &[u8],
+        dif: u32,
+    ) {
         let scope = stack6::scope_of(&h.src, ifindex);
         {
             let s = self.state.lock();
@@ -803,7 +819,7 @@ impl Dgram {
                 return;
             }
         }
-        self.deliver(h.src, scope, 0, payload.to_vec(), Some(Info6::of(h, ifindex)));
+        self.deliver(packet, h.src, scope, 0, payload.to_vec(), Some(Info6::of(h, ifindex)));
     }
 
     /// Records an error from an ICMP message, as `__udp4_lib_err` and `__udp6_lib_err` of
@@ -910,7 +926,8 @@ impl Dgram {
         // `IP_PMTUDISC_DO` and `IP_PMTUDISC_PROBE` forbid the fragments, as `ip_dont_fragment`
         // of Linux.
         let df = matches!(s.mtu_discover, 2 | 3);
-        Out { src, dst, protocol, ttl, tos: s.tos, df, mc_loop: s.multicast_loop }
+        let mc_loop = s.multicast_loop;
+        Out { src, dst, protocol, ttl, tos: s.tos, df, mc_loop, cgroup: self.cgroup }
     }
 
     /// Reads `IPV6_PKTINFO` in the control messages of a send on an IPv6 socket, as
@@ -1121,7 +1138,9 @@ impl Dgram {
         // as `ip6_sk_ignore_df` and `__ip6_append_data` of Linux.
         let dontfrag = s.flags6.get(&IPV6_DONTFRAG).is_some_and(|&v| v != 0)
             || matches!(s.mtu_discover, 2 | 3);
-        let out = |next| Out6 { src, dst: first, next, hops, tclass, ext: ext.clone(), dontfrag };
+        let cgroup = self.cgroup;
+        let out =
+            |next| Out6 { src, dst: first, next, hops, tclass, ext: ext.clone(), dontfrag, cgroup };
         match self.proto {
             Proto::Udp => {
                 if dport == 0 {
@@ -1192,6 +1211,7 @@ impl Dgram {
         if h.src == ip::ANY {
             p[8..24].copy_from_slice(&next.src);
         }
+        rk_net::filter::cgroup_skb_egress(self.cgroup, &p)?;
         stack6::output_raw(&next, &p)
     }
 
@@ -1211,6 +1231,7 @@ impl Dgram {
         p[10..12].fill(0);
         let sum = checksum::checksum(&p[..h.hlen]);
         p[10..12].copy_from_slice(&sum.to_be_bytes());
+        rk_net::filter::cgroup_skb_egress(self.cgroup, &p)?;
         stack::output_raw(&next, &p)
     }
 
