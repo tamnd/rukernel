@@ -430,11 +430,26 @@ fn build(
             path = interp;
             continue;
         }
-        if !elf::is_elf(&head[..n]) {
-            return Err(Errno::ENOEXEC);
+        // A program of another machine is not an error yet: binfmt_misc can know its format.
+        if elf::is_elf(&head[..n]) {
+            match read_headers(at.inode()) {
+                Ok(header) => break (at, header),
+                Err(Errno::ENOEXEC) => {}
+                Err(e) => return Err(e),
+            }
         }
-        let header = read_headers(at.inode())?;
-        break (at, header);
+        // As `load_misc_binary` of Linux: the interpreter gets the path of the file as its
+        // second argument. Without the flag `P`, the old `argv[0]` is not there.
+        let (interp, flags) = rk_vfs::binfmt::find(&head, &path).ok_or(Errno::ENOEXEC)?;
+        depth += 1;
+        if depth > MAX_SCRIPT_DEPTH {
+            return Err(Errno::ELOOP);
+        }
+        let skip = usize::from(flags & rk_vfs::binfmt::PRESERVE_ARGV0 == 0);
+        let mut argv = vec![interp.clone(), path.clone()];
+        argv.extend(args.argv.iter().skip(skip).cloned());
+        args.argv = argv;
+        path = interp;
     };
     // A file that is open for a write does not run, and a write of the file of the program
     // fails while it runs, as `exe_file_deny_write_access` in `do_open_execat` of Linux.
