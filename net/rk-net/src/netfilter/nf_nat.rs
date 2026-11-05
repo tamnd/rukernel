@@ -330,7 +330,7 @@ fn csum_replace(sum: u16, old: &[u8], new: &[u8]) -> u16 {
 }
 
 /// The sum of the 16-bit words of `d`, with an odd last byte as the high byte of a word.
-fn csum_add(mut s: u32, d: &[u8]) -> u32 {
+pub(super) fn csum_add(mut s: u32, d: &[u8]) -> u32 {
     let (words, rest) = d.as_chunks::<2>();
     for w in words {
         s = s.wrapping_add(u32::from(u16::from_be_bytes(*w)));
@@ -344,7 +344,8 @@ fn csum_add(mut s: u32, d: &[u8]) -> u32 {
     s
 }
 
-fn csum_fold(mut s: u32) -> u16 {
+/// Folds a sum of words to the checksum of RFC 1071.
+pub(super) fn csum_fold(mut s: u32) -> u16 {
     while s > 0xffff {
         s = (s & 0xffff) + (s >> 16);
     }

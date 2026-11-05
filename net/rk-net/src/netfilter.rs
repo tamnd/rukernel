@@ -25,6 +25,7 @@ use rk_vfs::inode::Result;
 
 pub mod nf_conntrack;
 pub mod nf_nat;
+pub mod nf_reject;
 pub mod nf_tables_api;
 
 /// The verdict that drops the packet.

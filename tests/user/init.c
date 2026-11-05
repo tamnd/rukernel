@@ -11769,11 +11769,10 @@ static void nft_expr_end(struct nft_batch *b, struct rtattr *data, struct rtattr
 	nl_end(b->cur, elem);
 }
 
-/* `udp dport PORT`: meta l4proto, cmp, payload, cmp. */
-static void nft_udp_dport(struct nft_batch *b, unsigned short port)
+/* `PROTO dport PORT` for UDP or TCP: meta l4proto, cmp, payload, cmp. */
+static void nft_dport(struct nft_batch *b, unsigned char udp, unsigned short port)
 {
 	struct rtattr *e, *d;
-	unsigned char udp = IPPROTO_UDP;
 	unsigned short p = htons(port);
 
 	d = nft_expr(b, "meta", &e);
@@ -11800,6 +11799,12 @@ static void nft_udp_dport(struct nft_batch *b, unsigned short port)
 	nl_put(b->cur, RK_NFTA_DATA_VALUE, &p, 2);
 	nl_end(b->cur, v);
 	nft_expr_end(b, d, e);
+}
+
+/* `udp dport PORT`. */
+static void nft_udp_dport(struct nft_batch *b, unsigned short port)
+{
+	nft_dport(b, IPPROTO_UDP, port);
 }
 
 /* `immediate` of the verdict `code`, with the chain `chain` for a jump. */
@@ -12141,6 +12146,86 @@ static void test_nft_limit_log(void)
 	close(fd);
 }
 
+/* `udp dport 20 reject` (port unreachable) and `tcp dport 21 reject with tcp reset`, with a
+ * socket on each port: the datagram gets EPERM and the ICMP error gives ECONNREFUSED to the
+ * connected socket, and the connect gets the RST. */
+static void test_nft_reject(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	struct rtattr *x, *e, *d;
+	unsigned char code = 3;
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "out");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	x = nft_rule(&b, "out");
+	nft_udp_dport(&b, 20);
+	d = nft_expr(&b, "reject", &e);
+	nft_be32(&b, 1, 0); /* NFTA_REJECT_TYPE: NFT_REJECT_ICMP_UNREACH */
+	nl_put(b.cur, 2, &code, 1); /* NFTA_REJECT_ICMP_CODE: ICMP_PORT_UNREACH */
+	nft_expr_end(&b, d, e);
+	nl_end(b.cur, x);
+	x = nft_rule(&b, "out");
+	nft_dport(&b, IPPROTO_TCP, 21);
+	d = nft_expr(&b, "reject", &e);
+	nft_be32(&b, 1, 1); /* NFTA_REJECT_TYPE: NFT_REJECT_TCP_RST */
+	nft_expr_end(&b, d, e);
+	nl_end(b.cur, x);
+	check("nft: rules with reject", nft_send(fd, &b, 1) == 0);
+
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(20) };
+	struct timeval tv = { .tv_sec = 2 };
+	char buf[4];
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int r = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	int ok = bind(r, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+		 connect(s, (struct sockaddr *)&a, sizeof(a)) == 0;
+	errno = 0;
+	check("nft: reject of udp dport 20 gives EPERM to send",
+	      ok && send(s, "r", 1, 0) < 0 && errno == EPERM);
+	errno = 0;
+	check("nft: the port unreachable of reject gives ECONNREFUSED",
+	      ok && recv(s, buf, sizeof(buf), 0) < 0 && errno == ECONNREFUSED);
+	close(r);
+	close(s);
+
+	int l = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int c = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	int one = 1;
+	a.sin_port = htons(21);
+	setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	ok = bind(l, (struct sockaddr *)&a, sizeof(a)) == 0 && listen(l, 1) == 0;
+	errno = 0;
+	int cr = connect(c, (struct sockaddr *)&a, sizeof(a));
+	if (!ok || cr == 0 || errno != ECONNREFUSED)
+		printf("nft: reject connect gives %d errno %d\n", cr, errno);
+	check("nft: reject with tcp reset gives ECONNREFUSED to connect",
+	      ok && cr < 0 && errno == ECONNREFUSED);
+	close(c);
+	close(l);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of reject goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -12161,6 +12246,7 @@ static void test_inet(int port)
 	test_nft_exprs();
 	test_nft_nat();
 	test_nft_limit_log();
+	test_nft_reject();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();
