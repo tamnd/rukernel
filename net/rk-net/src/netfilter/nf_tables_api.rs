@@ -16,8 +16,8 @@
 mod nf_tables_core;
 
 use self::nf_tables_core::{
-    NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain, nft_expr_validate,
-    nft_prog, nft_rule_needs_ct,
+    NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain, nft_expr_targets,
+    nft_expr_validate, nft_prog, nft_rule_needs_ct,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
@@ -1990,7 +1990,8 @@ impl NftBatch {
             let expr = nf_tables_expr_parse(table, e).inspect_err(|_| info.req.bad_attr(e))?;
             nft_expr_validate(&expr, chain.base.as_ref().map(|b| (b.ty, b.hooknum)))?;
             // A jump that comes back to the chain is a loop, as `nft_chain_validate` of Linux.
-            if let Some(target) = expr.jump_target() {
+            // The jumps of a verdict map count.
+            for target in nft_expr_targets(table, &expr) {
                 nft_check_loops(table, chain.handle, target)?;
             }
             parsed.push(expr);
@@ -2312,6 +2313,18 @@ impl NftBatch {
             Some(d) => Some(nft_setelem_parse_data(table, set, d)?),
             None => None,
         };
+        // A jump of an element of a verdict map that a chain looks up must not come back to
+        // the chain, as `nft_setelem_validate` of Linux.
+        if let Some(NftData::Verdict { chain: Some(target), .. }) = data {
+            for c in &table.chains {
+                let looks_up = c.rules.iter().flat_map(|r| r.parsed.iter()).any(|e| {
+                    matches!(e, NftExpr::Lookup { set: h, dreg: Some(_), .. } if *h == set.handle)
+                });
+                if looks_up {
+                    nft_check_loops(table, c.handle, target)?;
+                }
+            }
+        }
         let udata = nla_udata(&ea, NFTA_SET_ELEM_USERDATA)?;
         if let Some(old) = set.elems.get(&key) {
             // An element that is there gives `EBUSY` if its data is not the same, and
@@ -2675,5 +2688,59 @@ mod tests {
         // A chain that a jump reaches checks at the packet, and other expressions go anywhere.
         assert!(nft_expr_validate(&masq, None).is_ok());
         assert!(ok(&NftExpr::CtSet { sreg: 8 }, &NFT_CHAIN_FILTER, NF_INET_LOCAL_OUT));
+    }
+
+    #[test]
+    fn the_jumps_of_a_verdict_map_count_for_the_loops_and_the_program() {
+        use super::nf_tables_core::NftImm;
+        let jump = |h| NftExpr::Immediate {
+            dreg: 0,
+            data: NftImm::Verdict { code: NFT_JUMP, chain: Some(h) },
+        };
+        let rule = |e: NftExpr| NftRule {
+            handle: 1,
+            exprs: Vec::new(),
+            parsed: alloc::vec![e],
+            udata: None,
+            txn_id: None,
+        };
+        let chain = |handle, rules: Vec<NftRule>| NftChain {
+            name: format!("c{handle}").into_bytes(),
+            handle,
+            flags: 0,
+            udata: None,
+            base: None,
+            rules,
+            txn_id: None,
+        };
+        let accept = || NftExpr::Immediate {
+            dreg: 0,
+            data: NftImm::Verdict { code: crate::netfilter::NF_ACCEPT, chain: None },
+        };
+        let mut t = table();
+        let mut m = set(b"m");
+        m.flags = NFT_SET_MAP;
+        m.dtype = NFT_DATA_VERDICT;
+        let key = ElemKey { catchall: false, key: alloc::vec![1, 0, 0, 0], end: false };
+        let elem = NftElem {
+            key_end: None,
+            data: Some(NftData::Verdict { code: NFT_JUMP, chain: Some(11) }),
+            flags: 0,
+            udata: None,
+        };
+        m.elems.insert(key, elem);
+        t.sets.push(m);
+        let vmap = NftExpr::Lookup { set: 1, sreg: 8, len: 4, invert: false, dreg: Some(0) };
+        // c10: vmap to c11, jump c12. c11: jump c13. c12 and c13 accept.
+        t.chains.push(chain(10, alloc::vec![rule(vmap), rule(jump(12))]));
+        t.chains.push(chain(11, alloc::vec![rule(jump(13))]));
+        t.chains.push(chain(12, alloc::vec![rule(accept())]));
+        t.chains.push(chain(13, alloc::vec![rule(accept())]));
+        assert_eq!(nft_expr_targets(&t, &t.chains[0].rules[0].parsed[0]), [11]);
+        // A jump from c13 to c10 comes back through the map.
+        assert_eq!(nft_check_loops(&t, 13, 10), Err(Errno::ELOOP));
+        assert_eq!(nft_check_loops(&t, 12, 13), Ok(()));
+        // Each chain gets its own place in the program.
+        assert_eq!(nft_prog(&t, 0).rules_of_chains(), [2, 1, 1, 1]);
     }
 }

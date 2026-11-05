@@ -12253,6 +12253,161 @@ static void test_nft_reject(void)
 	close(fd);
 }
 
+/* `udp dport` in the register 1, with no compare. */
+static void nft_udp_dport_load(struct nft_batch *b)
+{
+	struct rtattr *e, *d, *v;
+	unsigned char udp = IPPROTO_UDP;
+
+	d = nft_expr(b, "meta", &e);
+	nft_be32(b, RK_NFTA_META_KEY, RK_NFT_META_L4PROTO);
+	nft_be32(b, RK_NFTA_META_DREG, RK_NFT_REG_1);
+	nft_expr_end(b, d, e);
+	d = nft_expr(b, "cmp", &e);
+	nft_be32(b, RK_NFTA_CMP_SREG, RK_NFT_REG_1);
+	nft_be32(b, RK_NFTA_CMP_OP, RK_NFT_CMP_EQ);
+	v = nl_put(b->cur, RK_NFTA_CMP_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b->cur, RK_NFTA_DATA_VALUE, &udp, 1);
+	nl_end(b->cur, v);
+	nft_expr_end(b, d, e);
+	d = nft_expr(b, "payload", &e);
+	nft_be32(b, RK_NFTA_PAYLOAD_DREG, RK_NFT_REG_1);
+	nft_be32(b, RK_NFTA_PAYLOAD_BASE, RK_NFT_PAYLOAD_TRANSPORT_HEADER);
+	nft_be32(b, RK_NFTA_PAYLOAD_OFFSET, 2);
+	nft_be32(b, RK_NFTA_PAYLOAD_LEN, 2);
+	nft_expr_end(b, d, e);
+}
+
+/* `lookup` of the register 1 in the map `set` of the table rkx, with the data in `dreg`. */
+static void nft_lookup(struct nft_batch *b, const char *set, int dreg)
+{
+	struct rtattr *e, *d = nft_expr(b, "lookup", &e);
+	nft_str(b, 1, set);           /* NFTA_LOOKUP_SET */
+	nft_be32(b, 2, RK_NFT_REG_1); /* NFTA_LOOKUP_SREG */
+	nft_be32(b, 3, dreg);         /* NFTA_LOOKUP_DREG */
+	nft_expr_end(b, d, e);
+}
+
+/* An element of the map `set` of the table rkx: the port `key` with the verdict `code` and the
+ * chain `chain`, or with the port `value` if `code` is 1. */
+static void nft_map_elem(struct nft_batch *b, const char *set, unsigned short key, int code,
+			 const char *chain, unsigned short value)
+{
+	unsigned short k = htons(key), v = htons(value);
+
+	nft_msg(b, RK_NFT_MSG_NEWSETELEM, NLM_F_CREATE, AF_INET);
+	nft_str(b, RK_NFTA_SET_ELEM_LIST_TABLE, "rkx");
+	nft_str(b, RK_NFTA_SET_ELEM_LIST_SET, set);
+	struct rtattr *l = nl_put(b->cur, RK_NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED, NULL, 0);
+	struct rtattr *e = nl_put(b->cur, RK_NFTA_LIST_ELEM | NLA_F_NESTED, NULL, 0);
+	struct rtattr *a = nl_put(b->cur, RK_NFTA_SET_ELEM_KEY | NLA_F_NESTED, NULL, 0);
+	nl_put(b->cur, RK_NFTA_DATA_VALUE, &k, 2);
+	nl_end(b->cur, a);
+	a = nl_put(b->cur, 2 | NLA_F_NESTED, NULL, 0); /* NFTA_SET_ELEM_DATA */
+	if (code == 1) {
+		nl_put(b->cur, RK_NFTA_DATA_VALUE, &v, 2);
+	} else {
+		struct rtattr *vd = nl_put(b->cur, RK_NFTA_DATA_VERDICT | NLA_F_NESTED, NULL, 0);
+		nft_be32(b, RK_NFTA_VERDICT_CODE, (unsigned int)code);
+		if (chain)
+			nft_str(b, RK_NFTA_VERDICT_CHAIN, chain);
+		nl_end(b->cur, vd);
+	}
+	nl_end(b->cur, a);
+	nl_end(b->cur, e);
+	nl_end(b->cur, l);
+}
+
+/* Maps: `udp dport vmap { 23 : jump sub, 24 : drop }`, with sub that drops, and
+ * `udp dport map { 25 : 99, 26 : 98 } == 99 drop`. A rule of sub that looks up the vmap would
+ * jump back to sub and gives ELOOP. */
+static void test_nft_maps(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	struct rtattr *x, *v;
+	unsigned short n99 = htons(99);
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "out");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "sub");
+	x = nft_rule(&b, "sub");
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	nft_msg(&b, RK_NFT_MSG_NEWSET, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_NAME, "vm");
+	nft_be32(&b, 3, 0x8);         /* NFTA_SET_FLAGS: NFT_SET_MAP */
+	nft_be32(&b, RK_NFTA_SET_KEY_LEN, 2);
+	nft_be32(&b, 6, 0xffffff00);  /* NFTA_SET_DATA_TYPE: NFT_DATA_VERDICT */
+	nft_be32(&b, RK_NFTA_SET_ID, 1);
+	nft_msg(&b, RK_NFT_MSG_NEWSET, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_NAME, "pm");
+	nft_be32(&b, 3, 0x8);
+	nft_be32(&b, RK_NFTA_SET_KEY_LEN, 2);
+	nft_be32(&b, 6, 13);          /* NFTA_SET_DATA_TYPE: inet_service */
+	nft_be32(&b, 7, 2);           /* NFTA_SET_DATA_LEN */
+	nft_be32(&b, RK_NFTA_SET_ID, 2);
+	nft_map_elem(&b, "vm", 23, RK_NFT_JUMP, "sub", 0);
+	nft_map_elem(&b, "vm", 24, RK_NF_DROP, NULL, 0);
+	nft_map_elem(&b, "pm", 25, 1, NULL, 99);
+	nft_map_elem(&b, "pm", 26, 1, NULL, 98);
+	x = nft_rule(&b, "out");
+	nft_udp_dport_load(&b);
+	nft_lookup(&b, "vm", RK_NFT_REG_VERDICT);
+	nl_end(b.cur, x);
+	x = nft_rule(&b, "out");
+	nft_udp_dport_load(&b);
+	nft_lookup(&b, "pm", RK_NFT_REG_2);
+	struct rtattr *e, *d = nft_expr(&b, "cmp", &e);
+	nft_be32(&b, RK_NFTA_CMP_SREG, RK_NFT_REG_2);
+	nft_be32(&b, RK_NFTA_CMP_OP, RK_NFT_CMP_EQ);
+	v = nl_put(b.cur, RK_NFTA_CMP_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &n99, 2);
+	nl_end(b.cur, v);
+	nft_expr_end(&b, d, e);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	int err = nft_send(fd, &b, 1);
+	if (err)
+		printf("nft: the batch of maps gives %d\n", err);
+	check("nft: a verdict map and a map, with rules that look them up", err == 0);
+	check("nft: vmap jump to a chain that drops", nft_udp_send_port(23) == EPERM);
+	check("nft: vmap drop", nft_udp_send_port(24) == EPERM);
+	check("nft: the data of a map goes to a register",
+	      nft_udp_send_port(25) == EPERM && nft_udp_send_port(26) == 0);
+	check("nft: a key that no map has passes", nft_udp_send_port(27) == 0);
+
+	nft_begin(&b, 0);
+	x = nft_rule(&b, "sub");
+	nft_udp_dport_load(&b);
+	nft_lookup(&b, "vm", RK_NFT_REG_VERDICT);
+	nl_end(b.cur, x);
+	check("nft: a vmap that jumps back to the chain of the rule gives ELOOP",
+	      nft_send(fd, &b, 1) == -ELOOP);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of maps goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -12274,6 +12429,7 @@ static void test_inet(int port)
 	test_nft_nat();
 	test_nft_limit_log();
 	test_nft_reject();
+	test_nft_maps();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();

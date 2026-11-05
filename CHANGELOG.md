@@ -29,6 +29,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The systemd boot test runs rk-bpfpin, which pins an array map in /sys/fs/bpf, gets it again with `BPF_OBJ_GET` and reads a value (#537).
 - The `reject` expression of nf_tables, as net/netfilter/nft_reject*.c, net/ipv4/netfilter/nf_reject_ipv4.c and net/ipv6/netfilter/nf_reject_ipv6.c of Linux: an ICMP or ICMPv6 "destination unreachable" with a code, the codes of `icmpx` that each family turns into its own, or a TCP RST, then the drop of the packet. `reject` is for the hooks prerouting, input, forward and output (#542).
 - The `redir` expression of nf_tables, as net/netfilter/nft_redir.c and nf_nat_redirect.c of Linux: `redirect` and `redirect to :port` send a packet to the host, to 127.0.0.1 or ::1 at the hook output and to an address of the host at prerouting, with the reply that comes back from the first address and port (#542).
+- The maps of nf_tables, as the `lookup` with `NFTA_LOOKUP_DREG` of net/netfilter/nft_lookup.c of Linux: a map gives the data of the element of the key to a register, and a verdict map gives its verdict, with a jump or a goto to a chain. The jumps of a verdict map count for the loops of the chains, when a rule looks the map up and when an element comes. A lookup of the keys of a map with no register works for a named map (#542).
 
 ## [0.5.6] - 2026-11-05
 
