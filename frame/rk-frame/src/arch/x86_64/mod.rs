@@ -12,6 +12,7 @@ pub(crate) mod msi;
 pub(crate) mod paging;
 pub(crate) mod rtc;
 pub(crate) mod serial;
+pub(crate) mod smbios;
 pub(crate) mod smp;
 pub(crate) mod task;
 pub(crate) mod trap;

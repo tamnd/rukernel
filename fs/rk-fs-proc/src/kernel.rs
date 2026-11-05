@@ -222,6 +222,13 @@ fn root_files(ns: &PidNs) -> Vec<(Vec<u8>, InodeRef)> {
         files.iter().map(|&(name, f)| (name.to_vec(), text_file(&join(b"/", name), f))).collect();
     out.push((b"mounts".to_vec(), link(b"/mounts", 0o777, || Ok(b"self/mounts".to_vec()))));
     out.push((b"net".to_vec(), link(b"/net", 0o777, || Ok(b"self/net".to_vec()))));
+    // A machine with a device tree has `/proc/device-tree`, as `proc_device_tree_init` of Linux.
+    if rk_frame::firmware::device_tree().is_some() {
+        out.push((
+            b"device-tree".to_vec(),
+            link(b"/device-tree", 0o777, || Ok(b"/sys/firmware/devicetree/base".to_vec())),
+        ));
+    }
     // `self` and `thread-self` give the IDs of the caller in the namespace of the mount, and
     // they do not exist for a caller that the namespace does not see, as `proc_self_get_link`
     // of Linux.

@@ -7,7 +7,7 @@ use super::paging;
 use crate::mm::frame::query;
 
 /// Reads a value at the physical address `addr`, if the direct map has it.
-fn read<T: Copy>(addr: u64) -> Option<T> {
+pub(super) fn read<T: Copy>(addr: u64) -> Option<T> {
     let virt = paging::phys_to_virt(addr);
     let last = virt.checked_add(size_of::<T>() - 1)?;
     query(crate::addr::VirtAddr::new(virt))?;
