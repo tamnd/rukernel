@@ -1003,6 +1003,12 @@ fn lsm_process<'a>(p: &Process, cred: &'a rk_vfs::cred::Cred) -> rk_vfs::securit
 }
 
 pub(crate) fn prctl(cx: &mut Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {
+    // The modules handle their options first, as `security_task_prctl` in `prctl` of Linux.
+    if let Ok(op) = u32::try_from(option)
+        && let Some(r) = rk_vfs::security::task_prctl(op, args)
+    {
+        return r;
+    }
     let arg2 = args[0];
     let [_, arg3, arg4, arg5] = args;
     match option {

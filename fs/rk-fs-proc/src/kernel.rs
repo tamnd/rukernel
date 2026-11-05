@@ -617,6 +617,8 @@ const SYSCTLS: &[(&str, &str)] = &[
     // Who can make BPF maps, which rk-bpf reads.
     ("kernel/unprivileged_bpf_disabled", ""),
     ("kernel/version", ""),
+    // Yama, when it is an active module.
+    ("kernel/yama/ptrace_scope", ""),
     // The limits of the user namespace of the reader, as kernel/ucount.c of Linux.
     ("user/max_cgroup_namespaces", ""),
     ("user/max_fanotify_groups", ""),
@@ -827,6 +829,9 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
         "fs/nr_open" => return format!("{}\n", rk_vfs::fdtable::nr_open()).into_bytes(),
         "kernel/ns_last_pid" => return format!("{}\n", rk_proc::last_pid()).into_bytes(),
         "kernel/cap_last_cap" => return format!("{}\n", rk_vfs::cred::cap::LAST).into_bytes(),
+        "kernel/yama/ptrace_scope" => {
+            return format!("{}\n", rk_proc::yama::ptrace_scope()).into_bytes();
+        }
         "kernel/unprivileged_bpf_disabled" => {
             let v = rk_bpf::UNPRIVILEGED_BPF_DISABLED.load(Ordering::Relaxed);
             return format!("{v}\n").into_bytes();
@@ -981,6 +986,10 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             }
             return rk_proc::set_last_pid(i64::from(parse_int(data)?));
         }
+        // `yama_dointvec_minmax` in security/yama/yama_lsm.c of Linux.
+        "kernel/yama/ptrace_scope" => {
+            return rk_proc::yama::set_ptrace_scope(i64::from(parse_int(data)?));
+        }
         // Only a process with `CAP_SYS_ADMIN` writes it, and the value 1 cannot change, as
         // `bpf_unpriv_handler` in kernel/bpf/syscall.c of Linux.
         "kernel/unprivileged_bpf_disabled" => {
@@ -1109,6 +1118,10 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
             }
             let ipc = rk_vfs::ipc::SYSCTL_NAMES.iter().map(|&n| (n, ""));
             for (name, default) in SYSCTLS.iter().copied().chain(ipc) {
+                // The files of Yama are there only when Yama is active.
+                if name.starts_with("kernel/yama/") && !rk_proc::yama::active() {
+                    continue;
+                }
                 let rest = if prefix.is_empty() {
                     name
                 } else {

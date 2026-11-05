@@ -3704,6 +3704,58 @@ static void test_xattr(void)
  * file, exec, task and socket paths keep the old results. The checks of the capabilities go
  * through the capable hook of the capability module now.
  */
+/* A child of the user 1000 that tries PTRACE_ATTACH to target. Gives 0 if it attached, 1 for EPERM, and another value for another result. */
+static int lsm_try_attach(pid_t target)
+{
+	int status;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		if (setresgid(1000, 1000, 1000) != 0 || setresuid(1000, 1000, 1000) != 0)
+			_exit(3);
+		if (ptrace(PTRACE_ATTACH, target, 0, 0) < 0)
+			_exit(errno == EPERM ? 1 : 2);
+		waitpid(target, &status, __WALL);
+		ptrace(PTRACE_DETACH, target, 0, 0);
+		_exit(0);
+	}
+	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status))
+		return -1;
+	return WEXITSTATUS(status);
+}
+
+/* A process of the user 1000 that waits. With any, it lets any process attach. It writes 'r' to ready when it is ready, or 'f' after an error. */
+static pid_t lsm_tracee(int any, int ready)
+{
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		int ok = setresgid(1000, 1000, 1000) == 0 && setresuid(1000, 1000, 1000) == 0;
+
+		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+		if (any && prctl(0x59616d61, -1UL, 0, 0, 0) != 0)
+			ok = 0;
+		if (write(ready, ok ? "r" : "f", 1) != 1)
+			_exit(1);
+		for (;;)
+			pause();
+	}
+	return pid;
+}
+
+/* Writes text to the file path. Gives 0, or the errno value. */
+static int lsm_write_file(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY), r = 0;
+
+	if (fd < 0)
+		return errno;
+	if (write(fd, text, strlen(text)) < 0)
+		r = errno;
+	close(fd);
+	return r;
+}
+
 static void test_lsm(void)
 {
 	static char buf[65536];
@@ -3780,14 +3832,14 @@ static void test_lsm(void)
 		fd = open("/lsmsec/lsm", O_RDONLY);
 		n = fd >= 0 ? read(fd, buf, 64) : -1;
 		close(fd);
-		check("lsm: /sys/kernel/security/lsm names the capability module", n == 10 && memcmp(buf, "capability", 10) == 0);
+		check("lsm: /sys/kernel/security/lsm names the capability module and Yama", n == 15 && memcmp(buf, "capability,yama", 15) == 0);
 		fd = open("/lsmsec/lsm", O_WRONLY);
 		check("lsm: securityfs does not take a write to lsm", fd >= 0 && write(fd, "x", 1) < 0 && errno == EINVAL);
 		close(fd);
 		umount("/lsmsec");
-		check("lsm: lsm_list_modules gives the capability module", syscall(461, ids, &size, 0) == 1 && size == 8 && ids[0] == 100);
-		size = 4;
-		check("lsm: lsm_list_modules gives E2BIG and the size for a small buffer", syscall(461, ids, &size, 0) < 0 && errno == E2BIG && size == 8);
+		check("lsm: lsm_list_modules gives the capability module and Yama", syscall(461, ids, &size, 0) == 2 && size == 16 && ids[0] == 100 && ids[1] == 105);
+		size = 8;
+		check("lsm: lsm_list_modules gives E2BIG and the size for a small buffer", syscall(461, ids, &size, 0) < 0 && errno == E2BIG && size == 16);
 		check("lsm: lsm_list_modules takes no flags", syscall(461, ids, &size, 1) < 0 && errno == EINVAL);
 		size = sizeof(ctx);
 		check("lsm: lsm_get_self_attr gives EOPNOTSUPP with no module that has the attribute", syscall(459, 100, ctx, &size, 0) < 0 && errno == EOPNOTSUPP && size == 0);
@@ -3810,6 +3862,39 @@ static void test_lsm(void)
 
 			check("lsm: /proc/self/attr has the modes of Linux", stat("/proc/self/attr", &st) == 0 && (st.st_mode & 07777) == 0555 && stat("/proc/self/attr/prev", &st) == 0 && (st.st_mode & 07777) == 0444 && stat("/proc/self/attr/exec", &st) == 0 && (st.st_mode & 07777) == 0666);
 		}
+	}
+	{
+		/* Yama, as security/yama/yama_lsm.c of Linux. Two processes of the user 1000 are the tracees. The second one lets any process attach with PR_SET_PTRACER. A sibling of the user 1000 tries to attach. */
+		int ready[2], status;
+		pid_t t1, t2;
+		char c[2];
+		int fd;
+
+		fd = open("/proc/sys/kernel/yama/ptrace_scope", O_RDONLY);
+		n = fd >= 0 ? read(fd, buf, 64) : -1;
+		close(fd);
+		check("lsm: kernel.yama.ptrace_scope is 1 at boot", n == 2 && memcmp(buf, "1\n", 2) == 0);
+		check("lsm: PR_SET_PTRACER gives EINVAL for a process that does not exist", prctl(0x59616d61, 999999, 0, 0, 0) < 0 && errno == EINVAL);
+		check("lsm: PR_SET_PTRACER with 0 removes the exception", prctl(0x59616d61, 0, 0, 0, 0) == 0);
+		if (pipe(ready) != 0)
+			ready[0] = ready[1] = -1;
+		t1 = lsm_tracee(0, ready[1]);
+		t2 = lsm_tracee(1, ready[1]);
+		check("lsm: the tracees of Yama start", t1 > 0 && t2 > 0 && read(ready[0], c, 1) == 1 && read(ready[0], c + 1, 1) == 1 && c[0] == 'r' && c[1] == 'r');
+		check("lsm: Yama scope 1 stops PTRACE_ATTACH to a process that is not a descendant", lsm_try_attach(t1) == 1);
+		check("lsm: Yama scope 1 lets the process named by PR_SET_PTRACER attach", lsm_try_attach(t2) == 0);
+		check("lsm: kernel.yama.ptrace_scope takes 0", lsm_write_file("/proc/sys/kernel/yama/ptrace_scope", "0") == 0);
+		check("lsm: Yama scope 0 lets a sibling attach", lsm_try_attach(t1) == 0);
+		check("lsm: kernel.yama.ptrace_scope takes 2", lsm_write_file("/proc/sys/kernel/yama/ptrace_scope", "2") == 0);
+		check("lsm: Yama scope 2 stops PTRACE_ATTACH with no CAP_SYS_PTRACE", lsm_try_attach(t2) == 1);
+		check("lsm: kernel.yama.ptrace_scope gives EINVAL for 4 and -1", lsm_write_file("/proc/sys/kernel/yama/ptrace_scope", "4") == EINVAL && lsm_write_file("/proc/sys/kernel/yama/ptrace_scope", "-1") == EINVAL);
+		check("lsm: kernel.yama.ptrace_scope goes back to 1", lsm_write_file("/proc/sys/kernel/yama/ptrace_scope", "1") == 0);
+		kill(t1, SIGKILL);
+		kill(t2, SIGKILL);
+		waitpid(t1, &status, 0);
+		waitpid(t2, &status, 0);
+		close(ready[0]);
+		close(ready[1]);
 	}
 }
 

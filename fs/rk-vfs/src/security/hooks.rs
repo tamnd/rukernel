@@ -488,6 +488,12 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `task_prctl`: the caller calls `prctl(option, args...)`. A module that does not handle
+    /// the option gives `None`, as `-ENOSYS` of Linux.
+    fn task_prctl(&self, option: u32, args: [u64; 4]) -> Option<Result<u64>> {
+        None
+    }
+
     /// `socket_create`: the caller makes a socket. `kern` is true for a socket of the kernel.
     fn socket_create(&self, family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
         Ok(())

@@ -505,6 +505,21 @@ pub fn task_kill(target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
     call_int_hook!(task_kill, target, sig, cred)
 }
 
+/// `security_task_prctl`: gives `None` if no module handles the option. The first result other
+/// than `Ok(0)` stops the calls, as in Linux.
+pub fn task_prctl(option: u32, args: [u64; 4]) -> Option<Result<u64>> {
+    let mut rc = None;
+    for m in modules() {
+        if let Some(r) = m.info.hooks.task_prctl(option, args) {
+            if r != Ok(0) {
+                return Some(r);
+            }
+            rc = Some(r);
+        }
+    }
+    rc
+}
+
 /// `security_socket_create`.
 pub fn socket_create(family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
     call_int_hook!(socket_create, family, kind, protocol, kern)
