@@ -5,15 +5,16 @@
 //! `NFNL_SUBSYS_NFT_COMPAT`.
 //!
 //! The extensions here are the matches `state`, `conntrack` (revisions 1, 2 and 3), `comment`,
-//! `icmp` and `icmp6`, and the target `REJECT` of IPv4 and IPv6, as xt_state.c, xt_conntrack.c,
-//! xt_comment.c, ip_tables.c, ip6_tables.c, ipt_REJECT.c and ip6t_REJECT.c. An other extension
-//! gives `ENOENT`, as an extension that Linux cannot load.
+//! `icmp`, `icmp6`, `tcp`, `udp`, `udplite`, `multiport` (revision 1) and `connmark` (revision
+//! 1), and the targets `REJECT` and `LOG` of IPv4 and IPv6, as xt_state.c, xt_conntrack.c,
+//! xt_comment.c, ip_tables.c, ip6_tables.c, xt_tcpudp.c, xt_multiport.c, xt_connmark.c,
+//! ipt_REJECT.c, ip6t_REJECT.c and xt_LOG.c. An other extension gives `ENOENT`, as an extension that Linux cannot load.
 
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
 use crate::netfilter::nf_conntrack::{IPS_DST_NAT, IPS_SRC_NAT, NfConntrackTuple};
 use crate::netfilter::nf_reject::{NfReject, nf_send_reject};
-use crate::netfilter::nf_tables_api::{NFT_BREAK, NFT_CONTINUE};
+use crate::netfilter::nf_tables_api::{NFT_BREAK, NFT_CONTINUE, NftLog, nft_log_eval};
 use crate::netfilter::{
     NF_DROP, NF_INET_FORWARD, NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NFPROTO_ARP, NFPROTO_BRIDGE,
     NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NFPROTO_UNSPEC, NfHookState,
@@ -53,6 +54,10 @@ const NFT_RULE_COMPAT_F_MASK: u32 = NFT_RULE_COMPAT_F_INV;
 
 const IPPROTO_ICMP: u16 = 1;
 const IPPROTO_TCP: u16 = 6;
+const IPPROTO_UDP: u16 = 17;
+const IPPROTO_DCCP: u16 = 33;
+const IPPROTO_SCTP: u16 = 132;
+const IPPROTO_UDPLITE: u16 = 136;
 const IPPROTO_ICMPV6: u16 = 58;
 
 /// The alignment of the data of an extension, `XT_ALIGN` of a 64-bit kernel.
@@ -146,7 +151,7 @@ const fn ext(name: &'static str, revision: u8, family: u8, size: usize, kind: Xt
 const REJECT_HOOKS: u32 = 1 << NF_INET_LOCAL_IN | 1 << NF_INET_FORWARD | 1 << NF_INET_LOCAL_OUT;
 
 /// The extensions, as the lists `xt[af].match` and `xt[af].target` of Linux.
-static XT_EXTS: [XtExt; 9] = [
+static XT_EXTS: [XtExt; 20] = [
     XtExt { conntrack: true, ..ext("state", 0, NFPROTO_UNSPEC, 4, XtKind::Match(state_mt)) },
     XtExt {
         conntrack: true,
@@ -182,6 +187,53 @@ static XT_EXTS: [XtExt; 9] = [
         hooks: REJECT_HOOKS,
         check: Some(reject_tg6_check),
         ..ext("REJECT", 0, NFPROTO_IPV6, 4, XtKind::Target(reject_tg6))
+    },
+    XtExt {
+        proto: IPPROTO_TCP,
+        check: Some(tcp_mt_check),
+        ..ext("tcp", 0, NFPROTO_IPV4, 12, XtKind::Match(tcp_mt))
+    },
+    XtExt {
+        proto: IPPROTO_TCP,
+        check: Some(tcp_mt_check),
+        ..ext("tcp", 0, NFPROTO_IPV6, 12, XtKind::Match(tcp_mt))
+    },
+    XtExt {
+        proto: IPPROTO_UDP,
+        check: Some(udp_mt_check),
+        ..ext("udp", 0, NFPROTO_IPV4, 10, XtKind::Match(udp_mt))
+    },
+    XtExt {
+        proto: IPPROTO_UDP,
+        check: Some(udp_mt_check),
+        ..ext("udp", 0, NFPROTO_IPV6, 10, XtKind::Match(udp_mt))
+    },
+    XtExt {
+        proto: IPPROTO_UDPLITE,
+        check: Some(udp_mt_check),
+        ..ext("udplite", 0, NFPROTO_IPV4, 10, XtKind::Match(udp_mt))
+    },
+    XtExt {
+        proto: IPPROTO_UDPLITE,
+        check: Some(udp_mt_check),
+        ..ext("udplite", 0, NFPROTO_IPV6, 10, XtKind::Match(udp_mt))
+    },
+    XtExt {
+        check: Some(multiport_mt_check),
+        ..ext("multiport", 1, NFPROTO_IPV4, 48, XtKind::Match(multiport_mt))
+    },
+    XtExt {
+        check: Some(multiport_mt_check),
+        ..ext("multiport", 1, NFPROTO_IPV6, 48, XtKind::Match(multiport_mt))
+    },
+    XtExt { conntrack: true, ..ext("connmark", 1, NFPROTO_UNSPEC, 12, XtKind::Match(connmark_mt)) },
+    XtExt {
+        check: Some(log_tg_check),
+        ..ext("LOG", 0, NFPROTO_IPV4, XT_LOG_INFO_SIZE, XtKind::Target(log_tg))
+    },
+    XtExt {
+        check: Some(log_tg_check),
+        ..ext("LOG", 0, NFPROTO_IPV6, XT_LOG_INFO_SIZE, XtKind::Target(log_tg))
     },
 ];
 
@@ -647,12 +699,168 @@ fn reject_send(par: &XtAction<'_>, how: Option<NfReject>) -> u32 {
     NF_DROP
 }
 
+// xt_LOG.c. `struct xt_log_info` is the level, the flags of nf_log and a prefix of 30 bytes
+// that ends with a NUL.
+const XT_LOG_INFO_SIZE: usize = 32;
+
+fn log_tg_check(info: &[u8], _: &XtCheck) -> Result<()> {
+    if info[0] >= 8 || info[XT_LOG_INFO_SIZE - 1] != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// The `log` of the data of the target `LOG`.
+fn log_info(info: &[u8]) -> NftLog {
+    let p = &info[2..XT_LOG_INFO_SIZE];
+    NftLog::new(p.split(|&c| c == 0).next().unwrap_or(p), info[0], info[1])
+}
+
+/// Writes the packet to the kernel log and goes on, as `log_tg` of Linux.
+fn log_tg(info: &[u8], par: &XtAction<'_>) -> u32 {
+    nft_log_eval(&log_info(info), par.skb, par.state);
+    NFT_CONTINUE
+}
+
+// xt_tcpudp.c. `struct xt_tcp` is the ranges of the source and the destination ports, the
+// option, the mask and the value of the flags, and the inverted tests. `struct xt_udp` is the
+// two ranges and the inverted tests.
+const XT_TCP_INV_SRCPT: u8 = 0x01;
+const XT_TCP_INV_DSTPT: u8 = 0x02;
+const XT_TCP_INV_FLAGS: u8 = 0x04;
+const XT_TCP_INV_OPTION: u8 = 0x08;
+const XT_TCP_INV_MASK: u8 = 0x0f;
+const XT_UDP_INV_MASK: u8 = 0x03;
+
+/// The port is in the range `[min, max]`, inverted by `inv`.
+fn port_match(info: &[u8], at: usize, port: u16, inv: bool) -> bool {
+    (port >= ne16(info, at) && port <= ne16(info, at + 2)) != inv
+}
+
+fn tcp_mt_check(info: &[u8], _: &XtCheck) -> Result<()> {
+    if info[11] & !XT_TCP_INV_MASK != 0 { Err(Errno::EINVAL) } else { Ok(()) }
+}
+
+fn udp_mt_check(info: &[u8], _: &XtCheck) -> Result<()> {
+    if info[8] & !XT_UDP_INV_MASK != 0 { Err(Errno::EINVAL) } else { Ok(()) }
+}
+
+/// Finds the option `option` in the options of the TCP header `opts`, as `tcp_find_option`.
+fn tcp_find_option(option: u8, opts: &[u8], inv: bool) -> bool {
+    let mut i = 0;
+    while i < opts.len() {
+        if opts[i] == option {
+            return !inv;
+        }
+        i += if opts[i] < 2 { 1 } else { opts.get(i + 1).map_or(1, |&l| usize::from(l).max(1)) };
+    }
+    inv
+}
+
+fn tcp_mt(info: &[u8], par: &XtAction<'_>) -> bool {
+    let inv = info[11];
+    if par.thoff.is_none() {
+        return false;
+    }
+    let Some(th) = par.th(20) else { return false };
+    if !port_match(info, 0, be16(th, 0), inv & XT_TCP_INV_SRCPT != 0)
+        || !port_match(info, 4, be16(th, 2), inv & XT_TCP_INV_DSTPT != 0)
+        || ((th[13] & info[9]) == info[10]) == (inv & XT_TCP_INV_FLAGS != 0)
+    {
+        return false;
+    }
+    if info[8] != 0 {
+        let doff = usize::from(th[12] >> 4) * 4;
+        if doff < 20 {
+            par.hotdrop.set(true);
+            return false;
+        }
+        let Some(h) = par.th(doff) else { return false };
+        return tcp_find_option(info[8], &h[20..], inv & XT_TCP_INV_OPTION != 0);
+    }
+    true
+}
+
+fn udp_mt(info: &[u8], par: &XtAction<'_>) -> bool {
+    let inv = info[8];
+    if par.thoff.is_none() {
+        return false;
+    }
+    let Some(uh) = par.th(8) else { return false };
+    port_match(info, 0, be16(uh, 0), inv & XT_TCP_INV_SRCPT != 0)
+        && port_match(info, 4, be16(uh, 2), inv & XT_TCP_INV_DSTPT != 0)
+}
+
+// xt_multiport.c. `struct xt_multiport_v1` is the flags, the count, 15 ports, 15 flags of a
+// range (the port and the next port are a range), and the inversion.
+const XT_MULTI_PORTS: u8 = 15;
+const XT_MULTIPORT_SOURCE: u8 = 0;
+const XT_MULTIPORT_DESTINATION: u8 = 1;
+const XT_MULTIPORT_EITHER: u8 = 2;
+const MP_PORTS: usize = 2;
+const MP_PFLAGS: usize = 32;
+const MP_INVERT: usize = 47;
+
+fn multiport_mt_check(info: &[u8], c: &XtCheck) -> Result<()> {
+    let proto_ok = matches!(
+        c.proto,
+        IPPROTO_TCP | IPPROTO_UDP | IPPROTO_UDPLITE | IPPROTO_SCTP | IPPROTO_DCCP
+    );
+    if proto_ok && !c.inv && info[0] <= XT_MULTIPORT_EITHER && info[1] <= XT_MULTI_PORTS {
+        Ok(())
+    } else {
+        Err(Errno::EINVAL)
+    }
+}
+
+fn multiport_mt(info: &[u8], par: &XtAction<'_>) -> bool {
+    if par.thoff.is_none() {
+        return false;
+    }
+    let Some(h) = par.th(4) else { return false };
+    let (src, dst) = (be16(h, 0), be16(h, 2));
+    let invert = info[MP_INVERT] != 0;
+    let port = |i: usize| ne16(info, MP_PORTS + 2 * i);
+    let count = usize::from(info[1]);
+    let mut i = 0;
+    while i < count {
+        let s = port(i);
+        // A range has the next port as its end. iptables does not put a range at the end of
+        // the list.
+        let e = if info[MP_PFLAGS + i] != 0 && i + 1 < usize::from(XT_MULTI_PORTS) {
+            i += 1;
+            port(i)
+        } else {
+            s
+        };
+        let hit = |p: u16| p >= s && p <= e;
+        let m = match info[0] {
+            XT_MULTIPORT_SOURCE => hit(src),
+            XT_MULTIPORT_DESTINATION => hit(dst),
+            _ => hit(src) || hit(dst),
+        };
+        if m {
+            return !invert;
+        }
+        i += 1;
+    }
+    invert
+}
+
+// xt_connmark.c. `struct xt_connmark_mtinfo1` is the mark, the mask and the inversion.
+fn connmark_mt(info: &[u8], par: &XtAction<'_>) -> bool {
+    let Some((ct, _)) = par.skb.nfct.get() else { return false };
+    let mark = ct.mark.load(core::sync::atomic::Ordering::Relaxed);
+    ((mark & ne32(info, 4)) == ne32(info, 0)) != (info[8] != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::consts::SOCK_RAW;
     use crate::netfilter::nf_conntrack::tests::{SERIAL, fresh, ip4, state, udp};
     use crate::netfilter::nf_conntrack::{nf_conntrack_confirm, nf_conntrack_in};
+    use crate::netfilter::nf_tables_api::nft_log_line;
     use crate::netfilter::{NF_ACCEPT, NF_INET_LOCAL_OUT};
     use crate::netlink::NetlinkSocket;
     use crate::netlink::msg::{self, Builder, HDRLEN, Header};
@@ -818,6 +1026,93 @@ mod tests {
     }
 
     #[test]
+    fn tcp_udp_and_multiport_match_the_ports() {
+        let v4 = NFPROTO_IPV4;
+        let (c6, c17) = (compat(6, 0), compat(17, 0));
+        // struct xt_tcp: the ranges of the ports, the option, the flags and the inversions.
+        let tcpm = |dport: (u16, u16), opt: u8, flags: (u8, u8), inv: u8| {
+            let mut d = Vec::new();
+            for p in [0, 0xffff, dport.0, dport.1] {
+                d.extend_from_slice(&u16::to_ne_bytes(p));
+            }
+            d.extend_from_slice(&[opt, flags.0, flags.1, inv, 0, 0, 0, 0]);
+            init(false, v4, &xt("tcp", 0, &d), Some(&c6)).unwrap()
+        };
+        // A SYN from port 4000 to port 80 with the option MSS and a NOP.
+        let mut th = vec![0x0f, 0xa0, 0, 80, 0, 0, 0, 1, 0, 0, 0, 0, 0x60, 0x02, 0xff, 0xff];
+        th.extend_from_slice(&[0, 0, 0, 0, 1, 2, 4, 0]);
+        let syn = ip4(6, A, B, &th);
+        let all = (0, 0);
+        assert_eq!(run(&tcpm((80, 80), 0, all, 0), &syn), NFT_CONTINUE);
+        assert_eq!(run(&tcpm((81, 90), 0, all, 0), &syn), NFT_BREAK);
+        assert_eq!(run(&tcpm((81, 90), 0, all, XT_TCP_INV_DSTPT), &syn), NFT_CONTINUE);
+        // --syn: the flags SYN, RST, ACK and FIN are SYN alone.
+        assert_eq!(run(&tcpm((0, 0xffff), 0, (0x17, 0x02), 0), &syn), NFT_CONTINUE);
+        assert_eq!(run(&tcpm((0, 0xffff), 0, (0x17, 0x10), 0), &syn), NFT_BREAK);
+        assert_eq!(run(&tcpm((0, 0xffff), 0, (0x17, 0x02), XT_TCP_INV_FLAGS), &syn), NFT_BREAK);
+        // --tcp-option 2 (the MSS) is there, 8 is not.
+        assert_eq!(run(&tcpm((0, 0xffff), 2, all, 0), &syn), NFT_CONTINUE);
+        assert_eq!(run(&tcpm((0, 0xffff), 8, all, 0), &syn), NFT_BREAK);
+        assert_eq!(run(&tcpm((0, 0xffff), 8, all, XT_TCP_INV_OPTION), &syn), NFT_CONTINUE);
+        // A short header drops the packet.
+        assert_eq!(run(&tcpm((80, 80), 0, all, 0), &ip4(6, A, B, &th[..12])), NF_DROP);
+        // tcp needs the protocol TCP and knows only its inversions.
+        let mut d = vec![0u8; 16];
+        assert_eq!(init(false, v4, &xt("tcp", 0, &d), Some(&c17)).unwrap_err(), Errno::EINVAL);
+        d[11] = 0x10;
+        assert_eq!(init(false, v4, &xt("tcp", 0, &d), Some(&c6)).unwrap_err(), Errno::EINVAL);
+
+        // struct xt_udp: --dport 9, and ! --sport 4000.
+        let udpm = |sport: (u16, u16), dport: (u16, u16), inv: u8| {
+            let mut d = Vec::new();
+            for p in [sport.0, sport.1, dport.0, dport.1] {
+                d.extend_from_slice(&u16::to_ne_bytes(p));
+            }
+            d.extend_from_slice(&[inv, 0, 0, 0, 0, 0, 0, 0]);
+            init(false, v4, &xt("udp", 0, &d), Some(&c17)).unwrap()
+        };
+        let dg = ip4(17, A, B, &udp(4000, 9));
+        let any = (0, 0xffff);
+        assert_eq!(run(&udpm(any, (9, 9), 0), &dg), NFT_CONTINUE);
+        assert_eq!(run(&udpm((4000, 4000), any, XT_TCP_INV_SRCPT), &dg), NFT_BREAK);
+        assert_eq!(run(&udpm((4001, 4001), any, XT_TCP_INV_SRCPT), &dg), NFT_CONTINUE);
+        let mut d = vec![0u8; 16];
+        d[8] = 4;
+        assert_eq!(init(false, v4, &xt("udp", 0, &d), Some(&c17)).unwrap_err(), Errno::EINVAL);
+        assert_eq!(xt_find_revision(NFPROTO_IPV6, b"udplite", 0, false), Ok(0));
+
+        // struct xt_multiport_v1: --dports 7,9:11 and --ports 4000.
+        let mp = |flags: u8, ports: &[u16], ranges: &[usize], invert: bool| {
+            let mut d = vec![0u8; 48];
+            d[0] = flags;
+            d[1] = ports.len() as u8;
+            for (i, p) in ports.iter().enumerate() {
+                d[MP_PORTS + 2 * i..MP_PORTS + 2 * i + 2].copy_from_slice(&p.to_ne_bytes());
+            }
+            for &i in ranges {
+                d[MP_PFLAGS + i] = 1;
+            }
+            d[MP_INVERT] = u8::from(invert);
+            xt("multiport", 1, &d)
+        };
+        let m = |d: &[u8]| init(false, v4, d, Some(&c17)).unwrap();
+        let dst = XT_MULTIPORT_DESTINATION;
+        assert_eq!(run(&m(&mp(dst, &[7, 9, 11], &[1], false)), &dg), NFT_CONTINUE);
+        assert_eq!(run(&m(&mp(dst, &[7, 10, 11], &[1], false)), &dg), NFT_BREAK);
+        assert_eq!(run(&m(&mp(dst, &[7, 10, 11], &[1], true)), &dg), NFT_CONTINUE);
+        assert_eq!(run(&m(&mp(XT_MULTIPORT_SOURCE, &[9], &[], false)), &dg), NFT_BREAK);
+        assert_eq!(run(&m(&mp(XT_MULTIPORT_EITHER, &[4000], &[], false)), &dg), NFT_CONTINUE);
+        // multiport needs a protocol with ports, not inverted, and a known flag.
+        let d = mp(dst, &[9], &[], false);
+        for c in [compat(1, 0), compat(17, NFT_RULE_COMPAT_F_INV)] {
+            assert_eq!(init(false, v4, &d, Some(&c)).unwrap_err(), Errno::EINVAL);
+        }
+        assert_eq!(init(false, v4, &d, None).unwrap_err(), Errno::EINVAL);
+        let d = mp(3, &[9], &[], false);
+        assert_eq!(init(false, v4, &d, Some(&c17)).unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
     fn state_and_conntrack_match_the_connection() {
         let _s = SERIAL.lock();
         fresh(5000);
@@ -877,6 +1172,47 @@ mod tests {
         let x = init(false, v4, &xt("comment", 0, &[0; 256]), None).unwrap();
         assert_eq!(run(&x, &q), NFT_CONTINUE);
         assert_eq!(x.hooks(), 0);
+        // connmark: the mark of the connection with a mask, and a packet with no connection
+        // does not match.
+        let cm = |mark: u32, mask: u32, inv: u8| {
+            let d = [&mark.to_ne_bytes()[..], &mask.to_ne_bytes(), &[inv, 0, 0, 0, 0, 0, 0, 0]];
+            init(false, v4, &xt("connmark", 1, &d.concat()), None).unwrap()
+        };
+        let (c, _) = p.nfct.get().unwrap();
+        c.mark.store(0x1234, core::sync::atomic::Ordering::Relaxed);
+        assert!(cm(0x34, 0xff, 0).needs_ct());
+        assert_eq!(run(&cm(0x34, 0xff, 0), &p), NFT_CONTINUE);
+        assert_eq!(run(&cm(0x35, 0xff, 0), &p), NFT_BREAK);
+        assert_eq!(run(&cm(0x35, 0xff, 1), &p), NFT_CONTINUE);
+        assert_eq!(run(&cm(0, 0, 0), &q), NFT_BREAK);
+    }
+
+    #[test]
+    fn log_writes_the_packet_and_goes_on() {
+        let log = |level: u8, flags: u8, prefix: &[u8]| {
+            let mut d = vec![level, flags];
+            d.extend_from_slice(prefix);
+            d.resize(XT_LOG_INFO_SIZE, 0);
+            d
+        };
+        let d = log(4, 0, b"ltp: ");
+        let x = init(true, NFPROTO_IPV4, &xt("LOG", 0, &d), None).unwrap();
+        let p = ip4(17, A, B, &udp(4000, 9));
+        assert_eq!(run(&x, &p), NFT_CONTINUE);
+        assert_eq!(x.hooks(), 0);
+        let line = nft_log_line(&log_info(&d), &p, &state(NF_INET_LOCAL_OUT));
+        assert!(line.starts_with(b"ltp: IN="));
+        assert!(init(true, NFPROTO_IPV6, &xt("LOG", 0, &d), None).is_ok());
+        // A level of 8 or more, and a prefix with no NUL at the end.
+        assert_eq!(
+            init(true, NFPROTO_IPV4, &xt("LOG", 0, &log(8, 0, b"")), None).unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(
+            init(true, NFPROTO_IPV4, &xt("LOG", 0, &log(4, 0, &[b'a'; 30])), None).unwrap_err(),
+            Errno::EINVAL
+        );
+        assert_eq!(xt_find_revision(NFPROTO_IPV4, b"LOG", 0, true), Ok(0));
     }
 
     /// Sends `NFNL_MSG_COMPAT_GET` and gives the reply or the error.

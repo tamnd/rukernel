@@ -13401,8 +13401,11 @@ static void nft_xt(struct nft_batch *b, const char *kind, const char *name, unsi
 
 /* The table filter with the chain OUTPUT, and a rule as iptables-nft makes it for `-p PROTO
  * --dport PORT -m conntrack --ctstate NEW -m comment --comment rk -j REJECT --reject-with
- * WITH`, with the protocol `cproto` in NFTA_RULE_COMPAT. Gives the error of the batch. */
-static int nft_compat_rule(int fd, int proto, int cproto, unsigned short port, unsigned int with)
+ * WITH`, with the protocol `cproto` in NFTA_RULE_COMPAT. If `multiport` is set, the rule has
+ * `-m multiport --dports PORT-2,PORT:PORT+1` and not `--dport PORT`. Gives the error of the
+ * batch. */
+static int nft_compat_rule(int fd, int proto, int cproto, unsigned short port, unsigned int with,
+			   int multiport)
 {
 	static struct nft_batch b;
 	unsigned char ct[168] = { 0 }, comment[256] = "rk";
@@ -13427,7 +13430,16 @@ static int nft_compat_rule(int fd, int proto, int cproto, unsigned short port, u
 	nft_str(&b, RK_NFTA_RULE_TABLE, "filter");
 	nft_str(&b, RK_NFTA_RULE_CHAIN, "OUTPUT");
 	struct rtattr *x = nl_put(b.cur, RK_NFTA_RULE_EXPRESSIONS | NLA_F_NESTED, NULL, 0);
-	nft_dport(&b, proto, port);
+	if (multiport) {
+		/* -m multiport --dports PORT-2,PORT:PORT+1: struct xt_multiport_v1. */
+		unsigned char mp[48] = { 1, 3 };
+		unsigned short ports[3] = { port - 2, port, port + 1 };
+		memcpy(mp + 2, ports, sizeof(ports));
+		mp[32 + 1] = 1;
+		nft_xt(&b, "match", "multiport", 1, mp, sizeof(mp));
+	} else {
+		nft_dport(&b, proto, port);
+	}
 	nft_xt(&b, "match", "conntrack", 3, ct, sizeof(ct));
 	nft_xt(&b, "match", "comment", 0, comment, sizeof(comment));
 	nft_xt(&b, "target", "REJECT", 0, reject, sizeof(reject));
@@ -13456,9 +13468,13 @@ static void test_nft_compat(void)
 	check("nft_compat: an unknown extension gives ENOENT",
 	      nft_compat_rev(fd, AF_INET, "rk-none", 0, 0) == -ENOENT);
 	check("nft_compat: the TCP RST of REJECT needs the protocol TCP",
-	      nft_compat_rule(fd, IPPROTO_TCP, IPPROTO_UDP, 22, 7) == -EINVAL);
-	check("nft_compat: a rule with conntrack, comment and REJECT",
-	      nft_compat_rule(fd, IPPROTO_UDP, IPPROTO_UDP, 22, 3) == 0);
+	      nft_compat_rule(fd, IPPROTO_TCP, IPPROTO_UDP, 22, 7, 0) == -EINVAL);
+	check("nft_compat: multiport needs a protocol with ports",
+	      nft_compat_rule(fd, IPPROTO_UDP, IPPROTO_ICMP, 22, 3, 1) == -EINVAL);
+	check("nft_compat: the best revision of multiport is 1",
+	      nft_compat_rev(fd, AF_INET, "multiport", 1, 0) == 1);
+	check("nft_compat: a rule with multiport, conntrack, comment and REJECT",
+	      nft_compat_rule(fd, IPPROTO_UDP, IPPROTO_UDP, 22, 3, 1) == 0);
 	check("nft_compat: the chain OUTPUT has the rule",
 	      nft_dump_count(fd, RK_NFT_MSG_GETRULE, "filter", "OUTPUT") == 1);
 
