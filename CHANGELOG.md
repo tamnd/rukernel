@@ -28,6 +28,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The expressions `byteorder`, `range`, `limit` and `log` of nf_tables, as net/netfilter/nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c and nf_log_syslog.c of Linux. `limit` is a bucket of tokens for packets or bytes with a burst and `limit rate over`, and `log` writes the line of nf_log (the devices, the IP header, and the ports, flags and sequence numbers of TCP, UDP and ICMP) to the kernel log at its level. A `log` with a group (nfnetlink_log) gives `ENOENT` and the audit level gives `EOPNOTSUPP` (#542).
 - The systemd boot test runs rk-bpfpin, which pins an array map in /sys/fs/bpf, gets it again with `BPF_OBJ_GET` and reads a value (#537).
 - The `reject` expression of nf_tables, as net/netfilter/nft_reject*.c, net/ipv4/netfilter/nf_reject_ipv4.c and net/ipv6/netfilter/nf_reject_ipv6.c of Linux: an ICMP or ICMPv6 "destination unreachable" with a code, the codes of `icmpx` that each family turns into its own, or a TCP RST, then the drop of the packet. `reject` is for the hooks prerouting, input, forward and output (#542).
+- The `redir` expression of nf_tables, as net/netfilter/nft_redir.c and nf_nat_redirect.c of Linux: `redirect` and `redirect to :port` send a packet to the host, to 127.0.0.1 or ::1 at the hook output and to an address of the host at prerouting, with the reply that comes back from the first address and port (#542).
 
 ## [0.5.6] - 2026-11-05
 

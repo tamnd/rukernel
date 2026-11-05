@@ -5,7 +5,7 @@
 //! `meta` load data of the packet, `immediate` loads a value or sets the verdict, `bitwise`
 //! masks a register, `cmp` and `lookup` end the rule when the data does not match, and
 //! `counter` counts the packets. The expressions here are `immediate`, `cmp`, `payload`,
-//! `meta`, `bitwise`, `counter`, `lookup`, `ct`, `nat` and `masq`, and in nft_exprs.rs
+//! `meta`, `bitwise`, `counter`, `lookup`, `ct`, `nat`, `masq` and `redir`, and in nft_exprs.rs
 //! `byteorder`, `range`, `limit` and `log`. Another name gives `ENOENT`, as a module that Linux
 //! cannot load.
 //!
@@ -24,7 +24,7 @@ use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_
 use crate::netfilter::nf_nat::{
     NF_NAT_MANIP_DST, NF_NAT_MANIP_SRC, NF_NAT_RANGE_MAP_IPS, NF_NAT_RANGE_MASK,
     NF_NAT_RANGE_NETMAP, NF_NAT_RANGE_PROTO_OFFSET, NF_NAT_RANGE_PROTO_SPECIFIED, NfNatRange,
-    hook2manip, nf_nat_masquerade, nf_nat_setup_info,
+    hook2manip, nf_nat_masquerade, nf_nat_redirect, nf_nat_setup_info,
 };
 use crate::netfilter::{
     NF_INET_FORWARD, NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING,
@@ -114,7 +114,7 @@ const NFT_CT_SRC_IP6: u32 = 21;
 const NFT_CT_DST_IP6: u32 = 22;
 const NFT_CT_ID: u32 = 23;
 
-// `NFTA_NAT_*`, `enum nft_nat_types` and `NFTA_MASQ_*`.
+// `NFTA_NAT_*`, `enum nft_nat_types`, `NFTA_MASQ_*` and `NFTA_REDIR_*`.
 const NFTA_NAT_TYPE: u32 = 1;
 const NFTA_NAT_FAMILY: u32 = 2;
 const NFTA_NAT_REG_ADDR_MIN: u32 = 3;
@@ -127,6 +127,9 @@ const NFT_NAT_DNAT: u32 = 1;
 const NFTA_MASQ_FLAGS: u32 = 1;
 const NFTA_MASQ_REG_PROTO_MIN: u32 = 2;
 const NFTA_MASQ_REG_PROTO_MAX: u32 = 3;
+const NFTA_REDIR_REG_PROTO_MIN: u32 = 1;
+const NFTA_REDIR_REG_PROTO_MAX: u32 = 2;
+const NFTA_REDIR_FLAGS: u32 = 3;
 
 /// The bits of `ct state`, as `NF_CT_STATE_INVALID_BIT` and `NF_CT_STATE_BIT` of Linux.
 const NF_CT_STATE_INVALID_BIT: u32 = 1 << 0;
@@ -212,6 +215,8 @@ pub(super) enum NftExpr {
     },
     /// `masquerade`, as nft_masq.c.
     Masq { flags: u32, proto: Option<(usize, usize)> },
+    /// `redirect`, as nft_redir.c.
+    Redir { flags: u32, proto: Option<(usize, usize)> },
     /// `byteorder`, as nft_byteorder.c.
     Byteorder(NftByteorder),
     /// `range`, as nft_range.c.
@@ -405,6 +410,7 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
         b"ct" => nft_ct_init(table, data),
         b"nat" => nft_nat_init(table, data),
         b"masq" => nft_masq_init(table, data),
+        b"redir" => nft_redir_init(table, data),
         b"byteorder" => Ok(NftExpr::Byteorder(nft_byteorder_init(data)?)),
         b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
@@ -540,6 +546,23 @@ fn nft_masq_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
     Ok(NftExpr::Masq { flags, proto })
 }
 
+/// Reads a `redir` expression, as `nft_redir_init` of Linux. A port range sets
+/// `NF_NAT_RANGE_PROTO_SPECIFIED`.
+fn nft_redir_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
+    if !matches!(table.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let a = Attrs::parse(data, 3);
+    let mut flags = nft_nat_flags(be32(&a, NFTA_REDIR_FLAGS)?.unwrap_or(0))?;
+    let proto = if a.has(NFTA_REDIR_REG_PROTO_MIN) {
+        flags |= NF_NAT_RANGE_PROTO_SPECIFIED;
+        Some(nft_range_regs(&a, NFTA_REDIR_REG_PROTO_MIN, NFTA_REDIR_REG_PROTO_MAX, 2)?)
+    } else {
+        None
+    };
+    Ok(NftExpr::Redir { flags, proto })
+}
+
 /// The hooks of a base chain that can have the expression, and if the chain must have the type
 /// `nat`, as the `validate` of nft_nat.c, nft_masq.c and nft_reject.c of Linux. Gives `None`
 /// for an expression that any chain can have.
@@ -550,6 +573,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
         }
         NftExpr::Nat { .. } => Some((1 << NF_INET_PRE_ROUTING | 1 << NF_INET_LOCAL_OUT, true)),
         NftExpr::Masq { .. } => Some((1 << NF_INET_POST_ROUTING, true)),
+        NftExpr::Redir { .. } => Some((1 << NF_INET_PRE_ROUTING | 1 << NF_INET_LOCAL_OUT, true)),
         NftExpr::Reject(_) => Some((
             1 << NF_INET_PRE_ROUTING
                 | 1 << NF_INET_LOCAL_IN
@@ -635,7 +659,11 @@ pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
     exprs.iter().any(|e| {
         matches!(
             e,
-            NftExpr::Ct { .. } | NftExpr::CtSet { .. } | NftExpr::Nat { .. } | NftExpr::Masq { .. }
+            NftExpr::Ct { .. }
+                | NftExpr::CtSet { .. }
+                | NftExpr::Nat { .. }
+                | NftExpr::Masq { .. }
+                | NftExpr::Redir { .. }
         )
     })
 }
@@ -900,7 +928,7 @@ fn nft_eval(
             }
             // A chain that is not of the type `nat`, or a hook of the other change, can reach a
             // rule of NAT only with a jump; the rule does not match there.
-            e @ (NftExpr::Nat { .. } | NftExpr::Masq { .. })
+            e @ (NftExpr::Nat { .. } | NftExpr::Masq { .. } | NftExpr::Redir { .. })
                 if !prog.nat
                     || nft_expr_hooks(e).is_some_and(|(m, _)| m & 1 << state.hook == 0)
                     || skb.nfct.get().is_none() =>
@@ -914,6 +942,12 @@ fn nft_eval(
                 {
                     let r = nft_nat_range(regs, *flags, *alen, *addr, *proto);
                     regs.verdict = nf_nat_setup_info(ct, &r, *mtype);
+                }
+            }
+            NftExpr::Redir { flags, proto } => {
+                if let Some((ct, _)) = skb.nfct.get() {
+                    let r = nft_nat_range(regs, *flags, 0, None, *proto);
+                    regs.verdict = nf_nat_redirect(ct, &r, state, skb.data());
                 }
             }
             NftExpr::Masq { flags, proto } => {
