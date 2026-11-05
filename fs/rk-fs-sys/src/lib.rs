@@ -465,11 +465,13 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
             .map(|&n| (String::from(n), Kind::File(b"supported\n".to_vec())))
             .collect(),
         ["kernel"] => {
-            let mut out = dirs(&mut ["mm"].into_iter());
+            let mut out = dirs(&mut ["mm", "security"].into_iter());
             let seqnum = format!("{}\n", rk_vfs::uevent::seqnum());
             out.push((String::from("uevent_seqnum"), Kind::File(seqnum.into_bytes())));
             out
         }
+        // The mount point of securityfs, as `securityfs_init` of Linux makes it.
+        ["kernel", "security"] => Vec::new(),
         ["kernel", "mm", "transparent_hugepage"] => thp_entries(),
         ["kernel", "mm", ref rest @ ..] => mm::entries(rest)?,
         [top] if TOP.contains(&top) => Vec::new(),
@@ -769,7 +771,8 @@ mod tests {
 
     #[test]
     fn ksm_has_the_files_of_linux() {
-        assert_eq!(names("kernel"), ["mm", "uevent_seqnum"]);
+        assert_eq!(names("kernel"), ["mm", "security", "uevent_seqnum"]);
+        assert!(names("kernel/security").is_empty());
         assert_eq!(names("kernel/mm"), ["hugepages", "ksm", "transparent_hugepage"]);
         let files = names("kernel/mm/ksm");
         for f in ["run", "pages_to_scan", "sleep_millisecs", "full_scans", "pages_shared"] {

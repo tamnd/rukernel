@@ -12,6 +12,7 @@
 pub mod blob;
 pub mod capability;
 pub mod hooks;
+pub mod securityfs;
 #[cfg(test)]
 mod tests;
 
@@ -24,10 +25,13 @@ use crate::file::File;
 use crate::inode::{Inode, Result};
 use alloc::string::String;
 use alloc::vec::Vec;
+use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 
 /// The IDs of the modules, `LSM_ID_*` of include/uapi/linux/lsm.h.
 pub mod id {
+    /// No module, `LSM_ID_UNDEF`.
+    pub const UNDEF: u64 = 0;
     /// The capability module.
     pub const CAPABILITY: u64 = 100;
     /// SELinux.
@@ -60,6 +64,8 @@ pub mod id {
 
 /// The attributes of `lsm_get_self_attr`, `LSM_ATTR_*` of include/uapi/linux/lsm.h.
 pub mod attr {
+    /// No attribute, `LSM_ATTR_UNDEF`.
+    pub const UNDEF: u64 = 0;
     /// The current context of the task.
     pub const CURRENT: u64 = 100;
     /// The context for the next `execve`.
@@ -603,4 +609,151 @@ pub fn ipc_associate(ipc: &IpcOwner<'_>, flag: u32) -> Result<()> {
         Some(IpcClass::Shm) => call_int_hook!(shm_associate, ipc, flag),
         None => Ok(()),
     }
+}
+
+/// `security_getprocattr`: the text of the attribute `name` of `task` for a file of
+/// `/proc/PID/attr`. `lsmid` is the ID of the module of a module directory, or 0 for the
+/// first module that has the attribute. With no such module, the result is `EINVAL`.
+pub fn getprocattr(task: &Task<'_>, lsmid: u64, name: &str) -> Result<Vec<u8>> {
+    for m in modules() {
+        if lsmid != 0 && lsmid != m.info.id.id {
+            continue;
+        }
+        if let Some(r) = m.info.hooks.getprocattr(task, name) {
+            return r;
+        }
+    }
+    Err(Errno::EINVAL)
+}
+
+/// `security_setprocattr`: a write of `value` to the attribute `name` of the caller, as
+/// [`getprocattr`]. Gives the count of bytes that the module took.
+pub fn setprocattr(lsmid: u64, name: &str, value: &[u8]) -> Result<usize> {
+    for m in modules() {
+        if lsmid != 0 && lsmid != m.info.id.id {
+            continue;
+        }
+        if let Some(r) = m.info.hooks.setprocattr(name, value) {
+            return r;
+        }
+    }
+    Err(Errno::EINVAL)
+}
+
+/// The size of the header of `struct lsm_ctx` of `<linux/lsm.h>`: the ID, the flags, the size
+/// of the entry and the size of the context.
+pub const LSM_CTX_HEADER: usize = 32;
+
+/// `LSM_FLAG_SINGLE`: `lsm_get_self_attr` gives the attribute of one module.
+pub const LSM_FLAG_SINGLE: u32 = 1;
+
+/// The result of [`getselfattr`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SelfAttr {
+    /// The `struct lsm_ctx` entries that fit, one after the other.
+    pub entries: Vec<u8>,
+    /// The size of all the entries, also of the entries that did not fit.
+    pub total: u32,
+    /// The count of entries.
+    pub count: u32,
+    /// An entry did not fit in the room.
+    pub too_big: bool,
+}
+
+/// Adds the `struct lsm_ctx` entry of the module `id` with the context `ctx` to `out`, as
+/// `lsm_fill_user_ctx` of Linux. The entry size is a multiple of 8.
+fn push_ctx(out: &mut Vec<u8>, id: u64, ctx: &[u8]) {
+    let len = (LSM_CTX_HEADER + ctx.len()).next_multiple_of(8);
+    for v in [id, 0, len as u64, ctx.len() as u64] {
+        out.extend_from_slice(&v.to_ne_bytes());
+    }
+    out.extend_from_slice(ctx);
+    out.resize(out.len() + len - LSM_CTX_HEADER - ctx.len(), 0);
+}
+
+/// `security_getselfattr`: the attribute `attr` (an `LSM_ATTR_*` value) of `task` from each
+/// module that has it, or from the module `single` only. `room` is the size of the buffer of
+/// the caller. A module that gives `EOPNOTSUPP` has no entry. An entry that does not fit sets
+/// `too_big`, and the next entries get no room, as Linux.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for `LSM_ATTR_UNDEF`, and the first error of a module that is not
+/// `EOPNOTSUPP`.
+pub fn getselfattr(attr: u64, task: &Task<'_>, single: Option<u64>, room: u32) -> Result<SelfAttr> {
+    if attr == attr::UNDEF {
+        return Err(Errno::EINVAL);
+    }
+    let mut out = SelfAttr::default();
+    let mut left = room as usize;
+    for m in modules() {
+        if single.is_some_and(|id| id != m.info.id.id) {
+            continue;
+        }
+        let ctx = match m.info.hooks.getselfattr(attr, task) {
+            Err(Errno::EOPNOTSUPP) => continue,
+            r => r?,
+        };
+        let len = (LSM_CTX_HEADER + ctx.len()).next_multiple_of(8);
+        if len > left {
+            left = 0;
+            out.too_big = true;
+        } else {
+            left -= len;
+            push_ctx(&mut out.entries, m.info.id.id, &ctx);
+            out.count += 1;
+        }
+        out.total = out.total.saturating_add(u32::try_from(len).unwrap_or(u32::MAX));
+        if single.is_some() {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// `security_setselfattr`: sets the attribute `attr` of the caller from the `struct lsm_ctx`
+/// in `buf`, through the module with the ID of the entry.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for flags, for a buffer smaller than the header or than the entry, and for an
+/// entry smaller than its context. Gives `E2BIG` for a buffer larger than a page, and
+/// `EOPNOTSUPP` if no active module has the ID or the module cannot set the attribute.
+pub fn setselfattr(attr: u64, buf: &[u8], flags: u32) -> Result<()> {
+    if flags != 0 || buf.len() < LSM_CTX_HEADER {
+        return Err(Errno::EINVAL);
+    }
+    if buf.len() > 4096 {
+        return Err(Errno::E2BIG);
+    }
+    let word = |i: usize| {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[i * 8..i * 8 + 8]);
+        u64::from_ne_bytes(b)
+    };
+    let (id, ctx_flags, len, ctx_len) = (word(0), word(1), word(2), word(3));
+    let need = (LSM_CTX_HEADER as u64).checked_add(ctx_len);
+    if (buf.len() as u64) < len || need.is_none_or(|n| len < n) {
+        return Err(Errno::EINVAL);
+    }
+    let ctx = &buf[LSM_CTX_HEADER..LSM_CTX_HEADER + ctx_len as usize];
+    match modules().iter().find(|m| m.info.id.id == id) {
+        Some(m) => m.info.hooks.setselfattr(attr, ctx, ctx_flags),
+        None => Err(Errno::EOPNOTSUPP),
+    }
+}
+
+/// The IDs of the active modules in order, for `lsm_list_modules`.
+pub fn module_ids() -> Vec<u64> {
+    modules().iter().map(|m| m.info.id.id).collect()
+}
+
+/// The modules that have their own directory in `/proc/PID/attr`: each active module other
+/// than the capability module, with its ID and its name.
+pub fn attr_modules() -> Vec<(u64, &'static str)> {
+    modules()
+        .iter()
+        .filter(|m| m.info.id.id != id::CAPABILITY)
+        .map(|m| (m.info.id.id, m.info.id.name))
+        .collect()
 }

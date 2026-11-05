@@ -3767,6 +3767,50 @@ static void test_lsm(void)
 		check("lsm: IPC_RMID removes the objects and runs the free hooks", msgctl(q, IPC_RMID, NULL) == 0 && semctl(m, 0, IPC_RMID) == 0 && shmctl(h, IPC_RMID, NULL) == 0);
 		check("lsm: a removed object is not found by its key", msgget(0x15a1, 0600) < 0 && errno == ENOENT);
 	}
+	{
+		/* securityfs, the lsm_* system calls and /proc/PID/attr, as security/inode.c, security/lsm_syscalls.c and fs/proc/base.c of Linux. The numbers are the same on x86_64 and arm64. */
+		unsigned long long ids[4] = { 0 }, ctx[8] = { 0 };
+		unsigned int size = sizeof(ids);
+		struct statfs sf;
+		int fd;
+
+		mkdir("/lsmsec", 0755);
+		check("lsm: securityfs mounts", mount("securityfs", "/lsmsec", "securityfs", 0, NULL) == 0);
+		check("lsm: securityfs has the magic of Linux", statfs("/lsmsec", &sf) == 0 && sf.f_type == 0x73636673);
+		fd = open("/lsmsec/lsm", O_RDONLY);
+		n = fd >= 0 ? read(fd, buf, 64) : -1;
+		close(fd);
+		check("lsm: /sys/kernel/security/lsm names the capability module", n == 10 && memcmp(buf, "capability", 10) == 0);
+		fd = open("/lsmsec/lsm", O_WRONLY);
+		check("lsm: securityfs does not take a write to lsm", fd >= 0 && write(fd, "x", 1) < 0 && errno == EINVAL);
+		close(fd);
+		umount("/lsmsec");
+		check("lsm: lsm_list_modules gives the capability module", syscall(461, ids, &size, 0) == 1 && size == 8 && ids[0] == 100);
+		size = 4;
+		check("lsm: lsm_list_modules gives E2BIG and the size for a small buffer", syscall(461, ids, &size, 0) < 0 && errno == E2BIG && size == 8);
+		check("lsm: lsm_list_modules takes no flags", syscall(461, ids, &size, 1) < 0 && errno == EINVAL);
+		size = sizeof(ctx);
+		check("lsm: lsm_get_self_attr gives EOPNOTSUPP with no module that has the attribute", syscall(459, 100, ctx, &size, 0) < 0 && errno == EOPNOTSUPP && size == 0);
+		check("lsm: lsm_get_self_attr gives EINVAL for LSM_ATTR_UNDEF", syscall(459, 0, ctx, &size, 0) < 0 && errno == EINVAL);
+		ctx[0] = 100;
+		ctx[2] = 40;
+		ctx[3] = 8;
+		check("lsm: lsm_set_self_attr gives EOPNOTSUPP for the capability module", syscall(460, 100, ctx, 40, 0) < 0 && errno == EOPNOTSUPP);
+		check("lsm: lsm_set_self_attr gives EINVAL for a short buffer", syscall(460, 100, ctx, 16, 0) < 0 && errno == EINVAL);
+		mkdir("/proc", 0555);
+		mount("proc", "/proc", "proc", 0, NULL);
+		fd = open("/proc/self/attr/current", O_RDONLY);
+		check("lsm: /proc/self/attr/current gives EINVAL with no module that has it", fd >= 0 && read(fd, buf, 64) < 0 && errno == EINVAL);
+		close(fd);
+		fd = open("/proc/self/attr/current", O_WRONLY);
+		check("lsm: a write to /proc/self/attr/current gives EINVAL", fd >= 0 && write(fd, "x", 1) < 0 && errno == EINVAL);
+		close(fd);
+		{
+			struct stat st;
+
+			check("lsm: /proc/self/attr has the modes of Linux", stat("/proc/self/attr", &st) == 0 && (st.st_mode & 07777) == 0555 && stat("/proc/self/attr/prev", &st) == 0 && (st.st_mode & 07777) == 0444 && stat("/proc/self/attr/exec", &st) == 0 && (st.st_mode & 07777) == 0666);
+		}
+	}
 }
 
 static void test_syslog(void)

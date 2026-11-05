@@ -12,6 +12,7 @@ use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
 use crate::inode::{Inode, Result};
+use alloc::vec::Vec;
 
 /// The names of the LSM hooks of Linux, in the order of include/linux/lsm_hook_defs.h.
 pub static HOOK_NAMES: [&str; HOOK_COUNT] = [
@@ -600,5 +601,30 @@ pub trait SecurityHooks: Sync {
     /// `shm_associate`: `shmget` finds the segment `ipc` by its key, with the flags `shmflg`.
     fn shm_associate(&self, ipc: &IpcOwner<'_>, shmflg: u32) -> Result<()> {
         Ok(())
+    }
+
+    /// `getselfattr`: the context of the attribute `attr` (an `LSM_ATTR_*` value) of `task`, for
+    /// `lsm_get_self_attr`. `EOPNOTSUPP` tells that the module does not have the attribute.
+    fn getselfattr(&self, attr: u64, task: &Task<'_>) -> Result<Vec<u8>> {
+        Err(rk_abi::Errno::EOPNOTSUPP)
+    }
+
+    /// `setselfattr`: sets the attribute `attr` of the caller to the context `ctx`, for
+    /// `lsm_set_self_attr`. `flags` are the flags of the `struct lsm_ctx`.
+    fn setselfattr(&self, attr: u64, ctx: &[u8], flags: u64) -> Result<()> {
+        Err(rk_abi::Errno::EOPNOTSUPP)
+    }
+
+    /// `getprocattr`: the text of the attribute `name` of `task`, for a read of
+    /// `/proc/PID/attr/NAME`. `None` tells that the module does not have the hook, so the next
+    /// module gets the call.
+    fn getprocattr(&self, task: &Task<'_>, name: &str) -> Option<Result<Vec<u8>>> {
+        None
+    }
+
+    /// `setprocattr`: a write of `value` to `/proc/self/attr/NAME`. It gives the count of bytes
+    /// that the module took. `None` is as for [`Self::getprocattr`].
+    fn setprocattr(&self, name: &str, value: &[u8]) -> Option<Result<usize>> {
+        None
     }
 }
