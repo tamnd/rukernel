@@ -673,6 +673,43 @@ pub fn nf_nat_masquerade(ct: &NfConn, r: &NfNatRange, state: &NfHookState, d: &[
     nf_nat_setup_info(ct, &range, NF_NAT_MANIP_SRC)
 }
 
+/// Sets up redirect for a new connection: the destination becomes the host, as
+/// `nf_nat_redirect_ipv4` and `nf_nat_redirect_ipv6` of Linux. A packet of the host goes to
+/// the loopback address; a packet that comes in goes to an address of its device, and a device
+/// with no address drops it.
+pub fn nf_nat_redirect(ct: &NfConn, r: &NfNatRange, state: &NfHookState, d: &[u8]) -> u32 {
+    let v6 = state.pf == NFPROTO_IPV6;
+    let mut newdst = [0u8; 16];
+    if state.hook == NF_INET_LOCAL_OUT {
+        if v6 {
+            newdst[15] = 1;
+        } else {
+            newdst[..4].copy_from_slice(&[127, 0, 0, 1]);
+        }
+    } else {
+        // The address of the device for the sender of the packet.
+        let mut from = [0u8; 16];
+        match state.pf {
+            NFPROTO_IPV4 if d.len() >= 20 => from[..4].copy_from_slice(&d[12..16]),
+            NFPROTO_IPV6 if d.len() >= 40 => from.copy_from_slice(&d[8..24]),
+            _ => return NF_DROP,
+        }
+        let f = *SRC_FN.lock();
+        match f.and_then(|f| f(state.pf, state.in_dev, &from)) {
+            Some(a) => newdst = a,
+            None => return NF_DROP,
+        }
+    }
+    let range = NfNatRange {
+        flags: r.flags | NF_NAT_RANGE_MAP_IPS,
+        min_addr: newdst,
+        max_addr: newdst,
+        min_proto: r.min_proto,
+        max_proto: r.max_proto,
+    };
+    nf_nat_setup_info(ct, &range, NF_NAT_MANIP_DST)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +932,44 @@ mod tests {
         st.out_dev = 4;
         let ct = q.nfct.get().unwrap().0.clone();
         assert_eq!(nf_nat_masquerade(&ct, &NfNatRange::default(), &st, q.data()), NF_DROP);
+    }
+
+    #[test]
+    fn redirect_sends_the_packet_to_the_host() {
+        let _s = SERIAL.lock();
+        fresh(80_000);
+        nf_nat_set_src_fn(|pf, ifindex, from| {
+            (pf == NFPROTO_IPV4 && ifindex == 2 && from[..4] == N).then(|| addr(C))
+        });
+        // `redirect to :8080` at prerouting: the address of the device that the packet came in
+        // on, and the port.
+        let mut st = state(NF_INET_PRE_ROUTING);
+        st.in_dev = 2;
+        let mut p = pkt(IPPROTO_UDP, N, B, udp(4005, 80));
+        nf_conntrack_in(&mut p, &st);
+        let ct = p.nfct.get().unwrap().0.clone();
+        let r = NfNatRange {
+            flags: NF_NAT_RANGE_PROTO_SPECIFIED,
+            min_proto: 8080,
+            max_proto: 8080,
+            ..NfNatRange::default()
+        };
+        assert_eq!(nf_nat_redirect(&ct, &r, &st, p.data()), NF_ACCEPT);
+        assert_eq!(nf_nat_packet(&ct, IP_CT_NEW, NF_INET_PRE_ROUTING, &mut p), NF_ACCEPT);
+        assert_eq!(dst(&p), (C, 8080));
+        assert!(sums_ok(p.data()));
+        // A packet of the host goes to 127.0.0.1, and a device with no address drops.
+        let mut q = pkt(IPPROTO_UDP, A, B, udp(4006, 80));
+        let out = state(NF_INET_LOCAL_OUT);
+        nf_conntrack_in(&mut q, &out);
+        let ct = q.nfct.get().unwrap().0.clone();
+        assert_eq!(nf_nat_redirect(&ct, &NfNatRange::default(), &out, q.data()), NF_ACCEPT);
+        assert_eq!(nf_nat_packet(&ct, IP_CT_NEW, NF_INET_LOCAL_OUT, &mut q), NF_ACCEPT);
+        assert_eq!(dst(&q), ([127, 0, 0, 1], 80));
+        let mut z = pkt(IPPROTO_UDP, A, B, udp(4007, 80));
+        nf_conntrack_in(&mut z, &st);
+        let ct = z.nfct.get().unwrap().0.clone();
+        assert_eq!(nf_nat_redirect(&ct, &NfNatRange::default(), &st, z.data()), NF_DROP);
     }
 
     #[test]

@@ -12058,6 +12058,33 @@ static void test_nft_nat(void)
 	fl = sizeof(from);
 	ok = ok && recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl) == 1 && buf[0] == 'm';
 	check("nat: the reply comes back from port 14", ok && from.sin_port == htons(14));
+	close(s);
+
+	/* `udp dport 22 redirect to :15`: a datagram to port 22 comes to the socket of port 15
+	 * of the host, and the reply comes back from port 22. */
+	unsigned short p15 = htons(15);
+	nft_begin(&b, 0);
+	struct rtattr *x = nft_rule(&b, "nout"), *e, *d;
+	nft_udp_dport(&b, 22);
+	nft_imm(&b, RK_NFT_REG_2, &p15, 2);
+	d = nft_expr(&b, "redir", &e);
+	nft_be32(&b, 1, RK_NFT_REG_2); /* NFTA_REDIR_REG_PROTO_MIN */
+	nft_be32(&b, 3, 2);            /* NFTA_REDIR_FLAGS: NF_NAT_RANGE_PROTO_SPECIFIED */
+	nft_expr_end(&b, d, e);
+	nl_end(b.cur, x);
+	check("nft: a rule with redirect", nft_send(fd, &b, 1) == 0);
+	s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	a.sin_port = htons(22);
+	fl = sizeof(from);
+	ok = sendto(s, "d", 1, 0, (struct sockaddr *)&a, sizeof(a)) == 1;
+	ok = ok && recvfrom(r, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl) == 1 && buf[0] == 'd';
+	check("nat: redirect brings udp dport 22 to the socket of port 15", ok);
+	ok = ok && sendto(r, "e", 1, 0, (struct sockaddr *)&from, fl) == 1;
+	fl = sizeof(from);
+	ok = ok && recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl) == 1 && buf[0] == 'e';
+	check("nat: the reply of redirect comes back from port 22",
+	      ok && from.sin_port == htons(22));
 	close(r);
 	close(s);
 
