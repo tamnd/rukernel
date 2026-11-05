@@ -185,7 +185,7 @@ fn nfnetlink_find_client(ty: u16, ss: &NfnlSubsystem) -> Option<&'static NfnlCal
 /// of Linux.
 pub fn nfnetlink_send(data: Vec<u8>, portid: u32, group: u32, echo: bool) {
     let exclude = if echo { portid } else { 0 };
-    broadcast(NETLINK_NETFILTER, None, &data, 0, exclude, group);
+    broadcast(NETLINK_NETFILTER, None, &data, 0, exclude, group, super::Creds::KERNEL);
     if echo && let Some(s) = lookup(NETLINK_NETFILTER, portid) {
         s.deliver(data, 0, 0);
     }

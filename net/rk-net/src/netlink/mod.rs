@@ -21,7 +21,7 @@ use crate::consts::{
     AF_NETLINK, MSG_DONTWAIT, MSG_OOB, MSG_PEEK, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOL_NETLINK,
 };
 use crate::filter::{Skb, SocketFilter};
-use crate::{Message, Options, PathOps, Received, Socket, current_cred, next_ino, wait_for};
+use crate::{Cred, Message, Options, PathOps, Received, Socket, current_cred, next_ino, wait_for};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -44,7 +44,7 @@ use rk_abi::native::rtnetlink::{
 };
 use rk_abi::native::socket::{
     SO_ACCEPTCONN, SO_ATTACH_FILTER, SO_DETACH_FILTER, SO_DOMAIN, SO_ERROR, SO_LOCK_FILTER,
-    SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
+    SO_PASSCRED, SO_PROTOCOL, SO_TYPE, SOL_SOCKET,
 };
 use rk_frame::sync::SpinLock;
 use rk_vfs::cred::{self, cap};
@@ -77,6 +77,20 @@ const F_CAP_ACK: u32 = 1 << 4;
 const F_EXT_ACK: u32 = 1 << 5;
 const F_STRICT_CHK: u32 = 1 << 6;
 
+/// The credentials of the sender of a datagram, as `NETLINK_CREDS` of Linux: the process ID,
+/// the user ID and the group ID. A receiver with `SO_PASSCRED` gets them in `SCM_CREDENTIALS`.
+#[derive(Clone, Copy, Default)]
+struct Creds {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+impl Creds {
+    /// The credentials of a datagram from the kernel: all zero, as in Linux.
+    const KERNEL: Self = Self { pid: 0, uid: 0, gid: 0 };
+}
+
 /// One datagram in the receive queue.
 struct Datagram {
     data: Vec<u8>,
@@ -84,6 +98,8 @@ struct Datagram {
     portid: u32,
     /// The multicast group, or 0 for a unicast datagram.
     group: u32,
+    /// The credentials of the sender.
+    creds: Creds,
 }
 
 /// A dump that runs.
@@ -120,6 +136,8 @@ struct State {
     /// The largest size that a receive asked for, as `nlk->max_recvmsg_len`.
     max_recvmsg_len: usize,
     flags: u32,
+    /// `SO_PASSCRED`: a receive gives the credentials of the sender.
+    passcred: bool,
     options: Options,
 }
 
@@ -251,6 +269,7 @@ impl NetlinkSocket {
                 dump: None,
                 max_recvmsg_len: 0,
                 flags: 0,
+                passcred: false,
                 options: Options::default(),
             }),
             wait: Arc::new(WaitQueue::new()),
@@ -311,10 +330,15 @@ impl NetlinkSocket {
         }
     }
 
-    /// Puts a datagram in the receive queue, as `__netlink_sendskb` of Linux. A full queue drops
-    /// the datagram and sets the error `ENOBUFS`, as `netlink_overrun`. Gives `false` if the
-    /// queue was full.
-    fn deliver(&self, mut data: Vec<u8>, portid: u32, group: u32) -> bool {
+    /// Puts a datagram from the kernel in the receive queue. See `deliver_from`.
+    fn deliver(&self, data: Vec<u8>, portid: u32, group: u32) -> bool {
+        self.deliver_from(data, portid, group, Creds::KERNEL)
+    }
+
+    /// Puts a datagram with the credentials `creds` of the sender in the receive queue, as
+    /// `__netlink_sendskb` of Linux. A full queue drops the datagram and sets the error
+    /// `ENOBUFS`, as `netlink_overrun`. Gives `false` if the queue was full.
+    fn deliver_from(&self, mut data: Vec<u8>, portid: u32, group: u32, creds: Creds) -> bool {
         // The filter of the socket gives the bytes to keep, and 0 drops the datagram without an
         // error, as `sk_filter` in `netlink_unicast` and `netlink_broadcast` of Linux.
         if let Some(f) = self.filter.lock().get() {
@@ -333,11 +357,11 @@ impl NetlinkSocket {
                 keep => data.truncate(keep),
             }
         }
-        self.queue(data, portid, group)
+        self.queue(data, portid, group, creds)
     }
 
     /// Puts a datagram in the receive queue with no filter, as `__netlink_sendskb` of Linux.
-    fn queue(&self, data: Vec<u8>, portid: u32, group: u32) -> bool {
+    fn queue(&self, data: Vec<u8>, portid: u32, group: u32, creds: Creds) -> bool {
         let mut s = self.state.lock();
         if s.rmem > s.options.rcvbuf as usize {
             if s.flags & F_NO_ENOBUFS == 0 {
@@ -348,7 +372,7 @@ impl NetlinkSocket {
             return false;
         }
         s.rmem += data.len() + OVERHEAD;
-        s.queue.push_back(Datagram { data, portid, group });
+        s.queue.push_back(Datagram { data, portid, group, creds });
         drop(s);
         self.wake();
         true
@@ -358,7 +382,7 @@ impl NetlinkSocket {
     /// `netlink_sendskb` of Linux. `mq_notify` sends its cookie to the socket of the process
     /// in this way. Gives `false` if the queue was full.
     pub fn send_from_kernel(&self, data: Vec<u8>) -> bool {
-        self.queue(data, 0, 0)
+        self.queue(data, 0, 0, Creds::KERNEL)
     }
 
     /// Sends the next datagram of the dump that runs, as `netlink_dump` of Linux. The datagram
@@ -392,7 +416,7 @@ impl NetlinkSocket {
             s.dump = None;
         }
         s.rmem += buf.len() + OVERHEAD;
-        s.queue.push_back(Datagram { data: buf, portid: 0, group: 0 });
+        s.queue.push_back(Datagram { data: buf, portid: 0, group: 0, creds: Creds::KERNEL });
     }
 
     /// Runs each message of a request to the kernel, as `netlink_rcv_skb` of Linux. The kernel
@@ -588,8 +612,12 @@ impl Socket for NetlinkSocket {
             return Err(Errno::EMSGSIZE);
         }
         let portid = self.portid();
+        // The datagram has the credentials of `SCM_CREDENTIALS`, or else those of the sender, as
+        // `scm_send` in `netlink_sendmsg` of Linux.
+        let c = msg.cred.unwrap_or_else(current_cred);
+        let creds = Creds { pid: c.pid, uid: c.uid, gid: c.gid };
         if dst_group != 0 {
-            broadcast(self.protocol, Some(self), &msg.data, portid, dst_portid, dst_group);
+            broadcast(self.protocol, Some(self), &msg.data, portid, dst_portid, dst_group, creds);
         }
         if dst_portid == 0 {
             self.input(&msg.data);
@@ -599,7 +627,7 @@ impl Socket for NetlinkSocket {
             return Err(Errno::ECONNREFUSED);
         };
         let _ = nonblock;
-        if !peer.deliver(msg.data, portid, 0) {
+        if !peer.deliver_from(msg.data, portid, 0, creds) {
             return Err(Errno::EAGAIN);
         }
         Ok(len)
@@ -621,6 +649,7 @@ impl Socket for NetlinkSocket {
                     data: d.data.clone(),
                     portid: d.portid,
                     group: d.group,
+                    creds: d.creds,
                 })
             } else {
                 let d = s.queue.pop_front();
@@ -652,6 +681,14 @@ impl Socket for NetlinkSocket {
             data,
             len: full,
             addr: Some(sockaddr(d.portid, group_mask(d.group))),
+            // The system call layer gives them in `SCM_CREDENTIALS` if `SO_PASSCRED` is set, as
+            // `scm_recv` in `netlink_recvmsg` of Linux.
+            cred: Some(Cred {
+                pid: d.creds.pid,
+                uid: d.creds.uid,
+                gid: d.creds.gid,
+                process: None,
+            }),
             flags: rflags,
             ..Received::default()
         })
@@ -678,6 +715,7 @@ impl Socket for NetlinkSocket {
                 SO_ERROR => int(s.error.take().map_or(0, |e| i32::from(e.get()))),
                 SO_ACCEPTCONN => int(0),
                 SO_LOCK_FILTER => int(i32::from(self.filter.lock().locked())),
+                SO_PASSCRED => int(i32::from(s.passcred)),
                 _ => s.options.get(name)?,
             });
         }
@@ -715,6 +753,11 @@ impl Socket for NetlinkSocket {
                 }
                 SO_ATTACH_FILTER | SO_DETACH_FILTER | SO_LOCK_FILTER => {
                     self.filter.lock().set(name, value)
+                }
+                // The udev monitor of systemd sets it and needs the credentials of each uevent.
+                SO_PASSCRED => {
+                    self.state.lock().passcred = crate::options::int_of(value)? != 0;
+                    Ok(())
                 }
                 _ => self.state.lock().options.set(name, value),
             };
@@ -811,6 +854,7 @@ fn broadcast(
     portid: u32,
     exclude: u32,
     group: u32,
+    creds: Creds,
 ) {
     if group == 0 || group > ngroups(protocol) {
         return;
@@ -824,7 +868,7 @@ fn broadcast(
             continue;
         }
         if s.state.lock().groups & bit != 0 {
-            s.deliver(data.to_vec(), portid, group);
+            s.deliver_from(data.to_vec(), portid, group, creds);
         }
     }
 }
@@ -850,7 +894,7 @@ impl Origin {
 /// the group.
 pub fn notify(group: u32, msg: Vec<u8>, origin: Origin) {
     let exclude = if origin.echo { origin.portid } else { 0 };
-    broadcast(NETLINK_ROUTE, None, &msg, 0, exclude, group);
+    broadcast(NETLINK_ROUTE, None, &msg, 0, exclude, group, Creds::KERNEL);
     if origin.echo
         && let Some(s) = lookup(NETLINK_ROUTE, origin.portid)
     {
