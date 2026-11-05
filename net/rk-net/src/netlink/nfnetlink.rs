@@ -26,6 +26,8 @@ pub const NETLINK_NETFILTER: u32 = 12;
 pub const NFNL_SUBSYS_CTNETLINK: u8 = 1;
 /// The subsystem nf_tables.
 pub const NFNL_SUBSYS_NFTABLES: u8 = 10;
+/// The subsystem of the xtables extensions in nf_tables.
+pub const NFNL_SUBSYS_NFT_COMPAT: u8 = 11;
 /// The number of subsystems, `NFNL_SUBSYS_COUNT`.
 const NFNL_SUBSYS_COUNT: u16 = 13;
 
@@ -176,6 +178,7 @@ pub struct NfnlSubsystem {
 static SUBSYSTEMS: &[&NfnlSubsystem] = &[
     &crate::netfilter::nf_conntrack::nf_conntrack_netlink::CTNETLINK_SUBSYS,
     &crate::netfilter::nf_tables_api::NF_TABLES_SUBSYS,
+    &crate::netfilter::nft_compat::NFT_COMPAT_SUBSYS,
 ];
 
 fn nfnetlink_get_subsys(subsys_id: u16) -> Option<&'static NfnlSubsystem> {

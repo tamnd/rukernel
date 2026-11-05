@@ -153,6 +153,7 @@ const NFTA_RULE_TABLE: u32 = 1;
 const NFTA_RULE_CHAIN: u32 = 2;
 const NFTA_RULE_HANDLE: u32 = 3;
 const NFTA_RULE_EXPRESSIONS: u32 = 4;
+const NFTA_RULE_COMPAT: u32 = 5;
 const NFTA_RULE_POSITION: u32 = 6;
 const NFTA_RULE_USERDATA: u32 = 7;
 const NFTA_RULE_ID: u32 = 9;
@@ -2150,12 +2151,14 @@ impl NftBatch {
             0
         };
         let exprs = nla.get(NFTA_RULE_EXPRESSIONS).unwrap_or(&[]);
+        let compat = nla.get(NFTA_RULE_COMPAT);
         let mut parsed = Vec::new();
         for (n, (ty, e)) in msg::attrs(exprs).enumerate() {
             if ty != NFTA_LIST_ELEM || n == NFT_MAX_EXPRS {
                 return Err(Errno::EINVAL);
             }
-            let expr = nf_tables_expr_parse(table, e).inspect_err(|_| info.req.bad_attr(e))?;
+            let expr =
+                nf_tables_expr_parse(table, e, compat).inspect_err(|_| info.req.bad_attr(e))?;
             nft_expr_validate(&expr, chain.base.as_ref().map(|b| (b.ty, b.hooknum)))?;
             // A jump that comes back to the chain is a loop, as `nft_chain_validate` of Linux.
             // The jumps of a verdict map count.
