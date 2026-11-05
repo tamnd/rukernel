@@ -293,6 +293,7 @@ pub fn prog_type_known(prog_type: u32) -> bool {
         BPF_PROG_TYPE_SOCKET_FILTER
             | BPF_PROG_TYPE_CGROUP_SKB
             | BPF_PROG_TYPE_CGROUP_SOCK
+            | BPF_PROG_TYPE_CGROUP_SOCK_ADDR
             | BPF_PROG_TYPE_CGROUP_DEVICE
     )
 }
@@ -1154,6 +1155,9 @@ impl Env<'_> {
             BPF_PROG_TYPE_CGROUP_SOCK => {
                 sock_filter_is_valid_access(off, size, t, self.expected_attach_type)
             }
+            BPF_PROG_TYPE_CGROUP_SOCK_ADDR => {
+                sock_addr_is_valid_access(off, size, t, self.expected_attach_type)
+            }
             BPF_PROG_TYPE_CGROUP_DEVICE => cgroup_dev_is_valid_access(off, size, t),
             _ => false,
         }
@@ -1167,9 +1171,36 @@ impl Env<'_> {
             BPF_PROG_TYPE_CGROUP_SKB if self.expected_attach_type == BPF_CGROUP_INET_EGRESS => {
                 (0, 3)
             }
-            BPF_PROG_TYPE_CGROUP_SKB | BPF_PROG_TYPE_CGROUP_SOCK | BPF_PROG_TYPE_CGROUP_DEVICE => {
-                (0, 1)
+            // A program of `bind` can give 2 or 3 to bind a low port without
+            // `CAP_NET_BIND_SERVICE`.
+            BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+                if matches!(
+                    self.expected_attach_type,
+                    BPF_CGROUP_INET4_BIND | BPF_CGROUP_INET6_BIND
+                ) =>
+            {
+                (0, 3)
             }
+            BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+                if matches!(
+                    self.expected_attach_type,
+                    BPF_CGROUP_UDP4_RECVMSG
+                        | BPF_CGROUP_UDP6_RECVMSG
+                        | BPF_CGROUP_INET4_GETPEERNAME
+                        | BPF_CGROUP_INET6_GETPEERNAME
+                        | BPF_CGROUP_INET4_GETSOCKNAME
+                        | BPF_CGROUP_INET6_GETSOCKNAME
+                        | BPF_CGROUP_UNIX_RECVMSG
+                        | BPF_CGROUP_UNIX_GETPEERNAME
+                        | BPF_CGROUP_UNIX_GETSOCKNAME
+                ) =>
+            {
+                (1, 1)
+            }
+            BPF_PROG_TYPE_CGROUP_SKB
+            | BPF_PROG_TYPE_CGROUP_SOCK
+            | BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+            | BPF_PROG_TYPE_CGROUP_DEVICE => (0, 1),
             _ => return Ok(()),
         };
         // The 32-bit value is the result, as `return_32bit` of Linux.
@@ -1190,7 +1221,7 @@ impl Env<'_> {
             return Err(Errno::EINVAL);
         }
         // A value of 2 or 3 is only for egress, `enforce_attach_type_range` of Linux.
-        if hi == 3 && max >= 2 {
+        if self.prog_type == BPF_PROG_TYPE_CGROUP_SKB && hi == 3 && max >= 2 {
             self.enforce_expected_attach_type = true;
         }
         Ok(())
@@ -2050,6 +2081,59 @@ fn sock_filter_is_valid_access(off: u32, size: u32, t: Access, attach_type: u32)
     }
 }
 
+/// `sock_addr_is_valid_access` of Linux. A field of an address is only for the attach types
+/// of its family. rukernel has no `PTR_TO_SOCKET`, so the field `sk` cannot be read.
+fn sock_addr_is_valid_access(off: u32, size: u32, t: Access, attach_type: u32) -> bool {
+    use crate::prog::bpf_sock_addr::*;
+    if off >= SIZE {
+        return false;
+    }
+    let field = off & !3;
+    let is = |types: &[u32]| types.contains(&attach_type);
+    let family_ok = match field {
+        USER_IP4 => is(&[
+            BPF_CGROUP_INET4_BIND,
+            BPF_CGROUP_INET4_CONNECT,
+            BPF_CGROUP_INET4_GETPEERNAME,
+            BPF_CGROUP_INET4_GETSOCKNAME,
+            BPF_CGROUP_UDP4_SENDMSG,
+            BPF_CGROUP_UDP4_RECVMSG,
+        ]),
+        f if (USER_IP6..USER_PORT).contains(&f) => is(&[
+            BPF_CGROUP_INET6_BIND,
+            BPF_CGROUP_INET6_CONNECT,
+            BPF_CGROUP_INET6_GETPEERNAME,
+            BPF_CGROUP_INET6_GETSOCKNAME,
+            BPF_CGROUP_UDP6_SENDMSG,
+            BPF_CGROUP_UDP6_RECVMSG,
+        ]),
+        MSG_SRC_IP4 => is(&[BPF_CGROUP_UDP4_SENDMSG]),
+        f if (MSG_SRC_IP6..SK).contains(&f) => is(&[BPF_CGROUP_UDP6_SENDMSG]),
+        _ => true,
+    };
+    if !family_ok {
+        return false;
+    }
+    // An 8-byte access of an IPv6 address, `bpf_ctx_wide_access_ok` of Linux.
+    let wide = size == 8
+        && off.is_multiple_of(8)
+        && ((USER_IP6..USER_PORT).contains(&off) || (MSG_SRC_IP6..SK).contains(&off));
+    match field {
+        USER_IP4 | USER_PORT | MSG_SRC_IP4 => {
+            if t == Access::Read {
+                size <= 4
+            } else {
+                size == 4
+            }
+        }
+        f if (USER_IP6..USER_PORT).contains(&f) || (MSG_SRC_IP6..SK).contains(&f) => {
+            wide || if t == Access::Read { size <= 4 } else { size == 4 }
+        }
+        USER_FAMILY | FAMILY | TYPE | PROTOCOL => t == Access::Read && size == 4,
+        _ => false,
+    }
+}
+
 /// `cgroup_dev_is_valid_access` of Linux: the context is read only, and only `access_type` can
 /// be read with a narrow load.
 fn cgroup_dev_is_valid_access(off: u32, size: u32, t: Access) -> bool {
@@ -2373,5 +2457,22 @@ mod tests {
         let (r, log) = check(&[mov64_imm(0, 1), alu64_imm(BPF_LSH, 0, 64), exit()], true);
         assert_eq!(r.err(), Some(Errno::EINVAL));
         assert!(log.contains("invalid shift 64"), "{log}");
+    }
+
+    #[test]
+    fn sock_addr_access() {
+        use crate::prog::bpf_sock_addr::*;
+        let v4 = BPF_CGROUP_INET4_CONNECT;
+        let v6 = BPF_CGROUP_INET6_BIND;
+        assert!(sock_addr_is_valid_access(USER_IP4, 4, Access::Write, v4));
+        assert!(sock_addr_is_valid_access(USER_IP4 + 2, 2, Access::Read, v4));
+        assert!(!sock_addr_is_valid_access(USER_IP4, 2, Access::Write, v4));
+        assert!(!sock_addr_is_valid_access(USER_IP6, 4, Access::Read, v4));
+        assert!(sock_addr_is_valid_access(USER_IP6, 8, Access::Write, v6));
+        assert!(!sock_addr_is_valid_access(USER_IP4, 4, Access::Read, v6));
+        assert!(sock_addr_is_valid_access(USER_PORT, 4, Access::Write, v6));
+        assert!(!sock_addr_is_valid_access(FAMILY, 4, Access::Write, v6));
+        assert!(!sock_addr_is_valid_access(MSG_SRC_IP4, 4, Access::Read, v4));
+        assert!(!sock_addr_is_valid_access(SK, 8, Access::Read, v4));
     }
 }

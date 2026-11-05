@@ -8,7 +8,9 @@ use rk_bpf::cgroup::{CgroupEnv, atype, bpf_prog_run_array_cg, cgroup_bpf_enabled
 use rk_bpf::inode::{BpfObj, bpf_mkobj, bpf_obj_of};
 use rk_bpf::map::MapEnv;
 use rk_bpf::prog::prog_type::BPF_PROG_TYPE_SOCKET_FILTER;
-use rk_bpf::prog::{BpfCgroupDevCtx, BpfProg, BpfSock, bpf_prog_of, run_socket_filter};
+use rk_bpf::prog::{
+    BpfCgroupDevCtx, BpfProg, BpfSock, BpfSockAddr, bpf_prog_of, run_socket_filter,
+};
 use rk_bpf::syscall::Env;
 use rk_net::Socket;
 use rk_net::filter::SkFilter;
@@ -235,6 +237,64 @@ pub(crate) fn cgroup_run_inet_sock(sock: &dyn Socket) -> Result<(), Errno> {
         }
     }
     Ok(())
+}
+
+/// A program of `bind` gave a value with bit 1 set: the bind of a port below 1024 does not
+/// need `CAP_NET_BIND_SERVICE`, `BPF_RET_BIND_NO_CAP_NET_BIND_SERVICE` of Linux.
+pub(crate) const BIND_NO_CAP_NET_BIND_SERVICE: u32 = 1;
+
+/// Runs the programs of `BPF_CGROUP_INET4_BIND`, `BPF_CGROUP_INET6_BIND`,
+/// `BPF_CGROUP_INET4_CONNECT` or `BPF_CGROUP_INET6_CONNECT` of the cgroup of the current task
+/// on the address of `bind` or `connect`, as `__cgroup_bpf_run_filter_sock_addr` of Linux. A
+/// program can change the address and the port in `addr`. A program that gives 0 refuses the
+/// call with `EPERM`. Gives the flags of the programs of `bind`.
+pub(crate) fn cgroup_run_sock_addr(
+    sock: &dyn Socket,
+    addr: &mut [u8],
+    connect: bool,
+) -> Result<u32, Errno> {
+    use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
+    use rk_net::consts::{AF_INET, AF_INET6};
+    let family = sock.family();
+    // `inet_bind_sk` and the `pre_connect` of TCP and UDP. A raw socket and a ping socket have
+    // their own `bind` and no `pre_connect`.
+    if !matches!(sock.protocol(), IPPROTO_TCP | IPPROTO_UDP) {
+        return Ok(0);
+    }
+    let (atype, ip_off, ip_len, min_len) = match (family, connect) {
+        (AF_INET, false) => (atype::CGROUP_INET4_BIND, 4, 4, 16),
+        (AF_INET, true) => (atype::CGROUP_INET4_CONNECT, 4, 4, 16),
+        // `SIN6_LEN_RFC2133`.
+        (AF_INET6, false) => (atype::CGROUP_INET6_BIND, 8, 16, 24),
+        (AF_INET6, true) => (atype::CGROUP_INET6_CONNECT, 8, 16, 24),
+        _ => return Ok(0),
+    };
+    if !cgroup_bpf_enabled(atype) || addr.len() < min_len {
+        return Ok(0);
+    }
+    let user_family = u32::from(u16::from_ne_bytes([addr[0], addr[1]]));
+    // A `connect` to `AF_UNSPEC` disconnects the socket before the programs run.
+    if connect && user_family == 0 {
+        return Ok(0);
+    }
+    let mut ctx = BpfSockAddr {
+        user_family,
+        user_port: u32::from(u16::from_ne_bytes([addr[2], addr[3]])),
+        family,
+        sock_type: sock.kind(),
+        protocol: sock.protocol(),
+        ..BpfSockAddr::default()
+    };
+    ctx.user_ip[..ip_len].copy_from_slice(&addr[ip_off..ip_off + ip_len]);
+    let mut flags = 0;
+    bpf_prog_run_array_cg(&Cgroups, current_cgroup(), atype, |prog| {
+        let ret = prog.run(&mut ctx, &TaskHelperEnv);
+        flags |= (ret >> 1) as u32;
+        ret & 1
+    })?;
+    addr[2..4].copy_from_slice(&(ctx.user_port as u16).to_ne_bytes());
+    addr[ip_off..ip_off + ip_len].copy_from_slice(&ctx.user_ip[..ip_len]);
+    Ok(if connect { 0 } else { flags & BIND_NO_CAP_NET_BIND_SERVICE })
 }
 
 /// Connects the hooks of the cgroup programs to the VFS. The boot code calls this one time.

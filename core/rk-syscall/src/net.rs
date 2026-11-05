@@ -319,11 +319,14 @@ fn write_addr(cx: &Cx<'_>, addr: u64, lenp: u64, value: &[u8]) -> Result<(), Err
 
 pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    let addr = read_addr(cx, addr, len)?;
+    let mut addr = read_addr(cx, addr, len)?;
     rk_vfs::security::socket_bind(&lsm_sock(&file, &*sock), &addr)?;
+    // The programs of the cgroup can change the address, as `inet_bind_sk` of Linux.
+    let flags = crate::bpf::cgroup_run_sock_addr(&*sock, &mut addr, false)?;
     // A UDP or TCP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and
     // its sysctl `net.ipv4.ip_unprivileged_port_start`.
-    if matches!(sock.family(), AF_INET | AF_INET6)
+    if flags & crate::bpf::BIND_NO_CAP_NET_BIND_SERVICE == 0
+        && matches!(sock.family(), AF_INET | AF_INET6)
         && matches!(sock.protocol(), IPPROTO_UDP | IPPROTO_TCP)
         && rk_net_inet::sockaddr::port_of(&addr).is_some_and(|p| p != 0 && p < 1024)
         && !cx.process().cred().capable(cap::NET_BIND_SERVICE)
@@ -336,8 +339,11 @@ pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
 
 pub(crate) fn connect(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    let addr = read_addr(cx, addr, len)?;
+    let mut addr = read_addr(cx, addr, len)?;
     rk_vfs::security::socket_connect(&lsm_sock(&file, &*sock), &addr)?;
+    // The programs of the cgroup can change the address, as the `pre_connect` of TCP and UDP
+    // in Linux.
+    crate::bpf::cgroup_run_sock_addr(&*sock, &mut addr, true)?;
     sock.connect(&Paths { cx }, &addr, file.flags().nonblock())?;
     Ok(0)
 }

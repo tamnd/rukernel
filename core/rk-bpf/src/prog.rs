@@ -334,6 +334,101 @@ impl ProgCtx for BpfSock {
     }
 }
 
+/// The offsets in `struct bpf_sock_addr`, the context of `BPF_PROG_TYPE_CGROUP_SOCK_ADDR`.
+#[allow(missing_docs)]
+pub mod bpf_sock_addr {
+    pub const USER_FAMILY: u32 = 0;
+    pub const USER_IP4: u32 = 4;
+    pub const USER_IP6: u32 = 8;
+    pub const USER_PORT: u32 = 24;
+    pub const FAMILY: u32 = 28;
+    pub const TYPE: u32 = 32;
+    pub const PROTOCOL: u32 = 36;
+    pub const MSG_SRC_IP4: u32 = 40;
+    pub const MSG_SRC_IP6: u32 = 44;
+    pub const SK: u32 = 64;
+    /// `sizeof(struct bpf_sock_addr)`.
+    pub const SIZE: u32 = 72;
+}
+
+/// The `struct bpf_sock_addr` of a call of `bind` or `connect`, as the `struct
+/// bpf_sock_addr_kern` that `sock_addr_convert_ctx_access` of Linux reads. A program can change
+/// the address and the port, and the system call then uses them. The addresses and the port are
+/// in network byte order.
+#[derive(Debug, Default)]
+pub struct BpfSockAddr {
+    /// The family of the address that the user gave.
+    pub user_family: u32,
+    /// The address that the user gave. An IPv4 address is in the first 4 bytes.
+    pub user_ip: [u8; 16],
+    /// The port that the user gave, as the bytes in network byte order read in the order of
+    /// the machine.
+    pub user_port: u32,
+    /// `sk_family`.
+    pub family: u32,
+    /// `sk_type`.
+    pub sock_type: u32,
+    /// `sk_protocol`.
+    pub protocol: u32,
+    /// The source address of `sendmsg`. An IPv4 address is in the first 4 bytes.
+    pub msg_src_ip: [u8; 16],
+}
+
+impl ProgCtx for BpfSockAddr {
+    fn load(&self, off: u32, size: u32) -> Option<u64> {
+        use bpf_sock_addr::*;
+        let word = |b: &[u8; 16], at: u32| {
+            u32::from_ne_bytes(b[at as usize..at as usize + 4].try_into().unwrap())
+        };
+        // A read of 8 bytes of an IPv6 address, as `bpf_ctx_wide_access_ok` of Linux.
+        if size == 8 {
+            let (b, at) = match off {
+                f if (USER_IP6..USER_PORT).contains(&f) => (&self.user_ip, f - USER_IP6),
+                f if (MSG_SRC_IP6..SK).contains(&f) => (&self.msg_src_ip, f - MSG_SRC_IP6),
+                _ => return None,
+            };
+            return Some(u64::from(word(b, at)) | u64::from(word(b, at + 4)) << 32);
+        }
+        let field = off & !3;
+        let v: u32 = match field {
+            USER_FAMILY => self.user_family,
+            USER_IP4 => word(&self.user_ip, 0),
+            f if (USER_IP6..USER_PORT).contains(&f) => word(&self.user_ip, f - USER_IP6),
+            USER_PORT => self.user_port,
+            FAMILY => self.family,
+            TYPE => self.sock_type,
+            PROTOCOL => self.protocol,
+            MSG_SRC_IP4 => word(&self.msg_src_ip, 0),
+            f if (MSG_SRC_IP6..SK).contains(&f) => word(&self.msg_src_ip, f - MSG_SRC_IP6),
+            _ => return None,
+        };
+        let v = u64::from(v >> ((off - field) * 8));
+        Some(if size >= 4 { v } else { v & ((1u64 << (size * 8)) - 1) })
+    }
+
+    fn store(&mut self, off: u32, size: u32, value: u64) -> Option<()> {
+        use bpf_sock_addr::*;
+        let put = |b: &mut [u8; 16], at: u32, v: u32| {
+            b[at as usize..at as usize + 4].copy_from_slice(&v.to_ne_bytes());
+        };
+        let words: &[u32] =
+            if size == 8 { &[value as u32, (value >> 32) as u32] } else { &[value as u32] };
+        for (i, &v) in words.iter().enumerate() {
+            match off + i as u32 * 4 {
+                USER_IP4 => put(&mut self.user_ip, 0, v),
+                f if (USER_IP6..USER_PORT).contains(&f) => put(&mut self.user_ip, f - USER_IP6, v),
+                USER_PORT => self.user_port = v,
+                MSG_SRC_IP4 => put(&mut self.msg_src_ip, 0, v),
+                f if (MSG_SRC_IP6..SK).contains(&f) => {
+                    put(&mut self.msg_src_ip, f - MSG_SRC_IP6, v);
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+}
+
 /// The offsets in `struct bpf_cgroup_dev_ctx`, the context of `BPF_PROG_TYPE_CGROUP_DEVICE`.
 #[allow(missing_docs)]
 pub mod bpf_cgroup_dev_ctx {
@@ -535,5 +630,19 @@ mod tests {
         let skb = SkBuff { data: &[1, 2, 3], protocol: 0x0800, ..SkBuff::default() };
         assert_eq!(skb.load(sk_buff::LEN, 4), Some(3));
         assert_eq!(skb.load(sk_buff::PROTOCOL, 2), Some(0x0800));
+    }
+
+    #[test]
+    fn sock_addr_ctx() {
+        use bpf_sock_addr::*;
+        let mut ctx = BpfSockAddr { user_port: 0x5000, ..BpfSockAddr::default() };
+        assert_eq!(ctx.load(USER_PORT, 4), Some(0x5000));
+        ctx.store(USER_PORT, 4, 0x5911).unwrap();
+        assert_eq!(ctx.user_port, 0x5911);
+        ctx.store(USER_IP6, 8, 0x0403_0201_0000_0000).unwrap();
+        assert_eq!(&ctx.user_ip[..8], &[0, 0, 0, 0, 1, 2, 3, 4]);
+        assert_eq!(ctx.load(USER_IP6 + 4, 4), Some(0x0403_0201));
+        assert_eq!(ctx.load(USER_IP6, 8), Some(0x0403_0201_0000_0000));
+        assert!(ctx.store(FAMILY, 4, 1).is_none());
     }
 }
