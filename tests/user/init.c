@@ -13241,6 +13241,130 @@ static void test_nft_dynset(void)
 	close(fd);
 }
 
+#define RK_CT_NEW (1 << 8 | 0)
+#define RK_CT_GET (1 << 8 | 1)
+#define RK_CT_DELETE (1 << 8 | 2)
+#define RK_CT_GET_STATS (1 << 8 | 5)
+
+/* Puts CTA_TUPLE_ORIG of the UDP flow from 127.0.0.1 port `sport` to 127.0.0.1 port `dport`. */
+static void ct_tuple(struct nft_batch *b, unsigned short sport, unsigned short dport)
+{
+	unsigned int lo = htonl(INADDR_LOOPBACK);
+	unsigned char proto = IPPROTO_UDP;
+	unsigned short s = htons(sport), d = htons(dport);
+	struct rtattr *t = nl_put(b->cur, 1 | NLA_F_NESTED, NULL, 0); /* CTA_TUPLE_ORIG */
+	struct rtattr *ip = nl_put(b->cur, 1 | NLA_F_NESTED, NULL, 0); /* CTA_TUPLE_IP */
+	nl_put(b->cur, 1, &lo, 4); /* CTA_IP_V4_SRC */
+	nl_put(b->cur, 2, &lo, 4); /* CTA_IP_V4_DST */
+	nl_end(b->cur, ip);
+	struct rtattr *p = nl_put(b->cur, 2 | NLA_F_NESTED, NULL, 0); /* CTA_TUPLE_PROTO */
+	nl_put(b->cur, 1, &proto, 1); /* CTA_PROTO_NUM */
+	nl_put(b->cur, 2, &s, 2);     /* CTA_PROTO_SRC_PORT */
+	nl_put(b->cur, 3, &d, 2);     /* CTA_PROTO_DST_PORT */
+	nl_end(b->cur, p);
+	nl_end(b->cur, t);
+}
+
+/* Counts the connections in a ctnetlink dump of AF_INET, as `conntrack -L`. Sets `found` if one
+ * has the original source port `sport`. Gives -1 if the dump does not end well. */
+static int ct_dump(int fd, unsigned short sport, int *found)
+{
+	struct nft_batch b = { .len = 0 };
+	char buf[8192];
+	int count = 0;
+
+	*found = 0;
+	nft_start(&b, RK_CT_GET, NLM_F_DUMP, AF_INET, 0);
+	nft_close(&b);
+	if (send(fd, b.buf, b.len, 0) != b.len)
+		return -1;
+	for (;;) {
+		long n = recv(fd, buf, sizeof(buf), 0);
+		if (n <= 0)
+			return -1;
+		for (struct nlmsghdr *r = (struct nlmsghdr *)buf; NLMSG_OK(r, n); r = NLMSG_NEXT(r, n)) {
+			if (r->nlmsg_type == NLMSG_DONE)
+				return count;
+			if (r->nlmsg_type != RK_CT_NEW)
+				return -1;
+			count++;
+			struct rtattr *t = nft_attr(r, 1);
+			struct rtattr *p = t ? genl_attr(RTA_DATA(t), RTA_PAYLOAD(t), 2) : NULL;
+			struct rtattr *s = p ? genl_attr(RTA_DATA(p), RTA_PAYLOAD(p), 2) : NULL;
+			if (s && ntohs(*(unsigned short *)RTA_DATA(s)) == sport)
+				*found = 1;
+		}
+	}
+}
+
+/* Sends a ctnetlink request of `type` for the flow from port `sport` to port 43 and reads the
+ * reply into buf. Gives the length, or a negative errno. */
+static long ct_ask(int fd, int type, int flags, unsigned short sport, char *buf, int size)
+{
+	struct nft_batch b = { .len = 0 };
+	nft_start(&b, type, flags, AF_INET, 0);
+	if (sport)
+		ct_tuple(&b, sport, 43);
+	return nft_get(fd, &b, buf, size);
+}
+
+/* ctnetlink, as `conntrack -L`, `-G`, `-C` and `-D`: a nat chain turns on conntrack, a UDP
+ * datagram from port 4242 to port 43 makes a connection, and the dump, the get, the count and
+ * the delete see it. */
+static void test_nft_ctnetlink(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	char buf[4096];
+	int found;
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "nout");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, (unsigned int)-100);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "nat");
+	check("ctnetlink: a nat chain for conntrack", nft_send(fd, &b, 1) == 0);
+
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(4242) };
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int ok = bind(s, (struct sockaddr *)&a, sizeof(a)) == 0;
+	a.sin_port = htons(43);
+	ok = ok && sendto(s, "c", 1, 0, (struct sockaddr *)&a, sizeof(a)) == 1;
+	close(s);
+	check("ctnetlink: the dump has the connection of port 4242",
+	      ok && ct_dump(fd, 4242, &found) >= 1 && found);
+
+	long n = ct_ask(fd, RK_CT_GET, 0, 4242, buf, sizeof(buf));
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	check("ctnetlink: a get gives the connection with its ID and timeout",
+	      n > 0 && r->nlmsg_type == RK_CT_NEW && nft_attr(r, 12) && nft_attr_be32(r, 7) <= 30);
+	n = ct_ask(fd, RK_CT_GET_STATS, 0, 0, buf, sizeof(buf));
+	check("ctnetlink: the count of the connections is at least 1",
+	      n > 0 && r->nlmsg_type == RK_CT_GET_STATS && nft_attr_be32(r, 1) >= 1 &&
+		      nft_attr_be32(r, 2) == 4096);
+	check("ctnetlink: a get of a tuple with no connection gives ENOENT",
+	      ct_ask(fd, RK_CT_GET, 0, 4243, buf, sizeof(buf)) == -ENOENT);
+	check("ctnetlink: the delete of the connection",
+	      ct_ask(fd, RK_CT_DELETE, NLM_F_ACK, 4242, buf, sizeof(buf)) == 0 &&
+		      ct_ask(fd, RK_CT_GET, 0, 4242, buf, sizeof(buf)) == -ENOENT &&
+		      ct_dump(fd, 4242, &found) >= 0 && !found);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("ctnetlink: the table goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 /*
  * `init masq IFNAME` adds `nft add table ip rkx`, the chain post of the type nat on the hook
  * postrouting, and the rule `meta oif IFNAME masquerade` in the network namespace of init, and
@@ -13313,6 +13437,7 @@ static void test_inet(int port)
 	test_nft_maps();
 	test_nft_timeout();
 	test_nft_dynset();
+	test_nft_ctnetlink();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();
