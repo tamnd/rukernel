@@ -2081,6 +2081,23 @@ const NETNS_SCRIPT_PROXY: &[u8] = b"$N $R sh -c 'echo 1 > /proc/sys/net/ipv4/ip_
 && $N $R busybox arp -i ra -d 10.10.2.2 pub && ! $N $R grep -q '^10.10.2.2 .* 0xc ' /proc/net/arp \
 && echo 'netns: proxy'' part' || exit 1\n";
 
+/// The eighth line of the `netns` test: masquerade (#542). First a TCP server in B sees the
+/// address 10.10.1.1 of A as the address of the client. Then B has no route back to A, so a ping
+/// from A to B fails. `/init masq rb` adds `meta oif rb masquerade` in R. Then the ping passes,
+/// and the TCP server sees the address 10.10.2.254 of R. tcpsvd of BusyBox gives the address and
+/// the port of the client in `TCPREMOTEADDR`.
+const NETNS_SCRIPT_MASQ: &[u8] = b"$N $A ip addr del 10.10.1.1/16 dev fa \
+&& $N $A ip addr add 10.10.1.1/24 dev fa && $N $A ip route add default via 10.10.1.254 \
+&& $N $A ping -c 1 10.10.2.1 \
+&& { $N $B busybox tcpsvd 0.0.0.0 5001 sh -c 'echo ${TCPREMOTEADDR%:*}' </dev/null & } && T=$! \
+&& { for i in 1 2 3 4 5; do $N $B grep -q ':1389 ' /proc/net/tcp && break; sleep 1; done; } \
+&& { D=$($N $A busybox nc -w 3 10.10.2.1 5001 </dev/null); echo \"masq: direct $D\"; } \
+&& $N $B ip route del default && ! $N $A ping -c 1 -W 1 10.10.2.1 \
+&& $N $R /init masq rb && $N $A ping -c 1 10.10.2.1 \
+&& { M=$($N $A busybox nc -w 3 10.10.2.1 5001 </dev/null); echo \"masq: client $M\"; } \
+&& [ \"$D\" = 10.10.1.1 ] && [ \"$M\" = 10.10.2.254 ] && kill $T \
+&& echo 'netns: masq'' part' || exit 1\n";
+
 /// The last line of the `netns` test. When the three processes end, the namespaces go, and the
 /// veth pairs go with them.
 const NETNS_SCRIPT3: &[u8] = b"kill $A $B $R; wait; sleep 1; ip link \
@@ -2113,7 +2130,8 @@ fn test_input(test: &str) -> &'static [(&'static str, &'static [u8])] {
             ("netns: router part", NETNS_SCRIPT_FORWARD),
             ("netns: forward part", NETNS_SCRIPT_FORWARD6),
             ("netns: forward6 part", NETNS_SCRIPT_PROXY),
-            ("netns: proxy part", NETNS_SCRIPT3),
+            ("netns: proxy part", NETNS_SCRIPT_MASQ),
+            ("netns: masq part", NETNS_SCRIPT3),
         ],
         "inet6" => &[
             ("/ # ", INET6_SCRIPT),

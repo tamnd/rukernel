@@ -13241,6 +13241,54 @@ static void test_nft_dynset(void)
 	close(fd);
 }
 
+/*
+ * `init masq IFNAME` adds `nft add table ip rkx`, the chain post of the type nat on the hook
+ * postrouting, and the rule `meta oif IFNAME masquerade` in the network namespace of init, and
+ * exits. The `netns` boot test runs it in the router namespace. Gives 0 when the batch passes.
+ */
+static int nft_masq(const char *ifname)
+{
+	unsigned int oif = if_nametoindex(ifname);
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+
+	if (oif == 0 || fd < 0) {
+		printf("masq: no device %s or no NETLINK_NETFILTER\n", ifname);
+		return 1;
+	}
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "post");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, 4); /* NF_INET_POST_ROUTING */
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 100);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "nat");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	struct rtattr *x = nft_rule(&b, "post"), *e, *d;
+	d = nft_expr(&b, "meta", &e);
+	nft_be32(&b, RK_NFTA_META_KEY, 5); /* NFT_META_OIF */
+	nft_be32(&b, RK_NFTA_META_DREG, RK_NFT_REG_1);
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "cmp", &e);
+	nft_be32(&b, RK_NFTA_CMP_SREG, RK_NFT_REG_1);
+	nft_be32(&b, RK_NFTA_CMP_OP, RK_NFT_CMP_EQ);
+	struct rtattr *v = nl_put(b.cur, RK_NFTA_CMP_DATA | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &oif, 4);
+	nl_end(b.cur, v);
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "masq", &e);
+	nft_expr_end(&b, d, e);
+	nl_end(b.cur, x);
+	int err = nft_send(fd, &b, 1);
+	close(fd);
+	printf("masq: %s %d\n", ifname, err);
+	return err != 0;
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -14925,6 +14973,8 @@ int main(int argc, char **argv)
 	if (strcmp(name ? name + 1 : argv[0], "request-key") == 0)
 		return request_key_helper(argc, argv);
 	setvbuf(stdout, NULL, _IONBF, 0);
+	if (argc > 2 && strcmp(argv[1], "masq") == 0)
+		return nft_masq(argv[2]);
 	/*
 	 * With the first argument "only", init does not run the general checks. It runs only the
 	 * checks of the next argument. The arm64 boot tests use this, because QEMU emulates each
