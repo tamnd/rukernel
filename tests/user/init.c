@@ -13530,6 +13530,32 @@ static void test_user_ns(void)
 		printf("init: the child of the user namespace exited with %d\n", WEXITSTATUS(status));
 	close(ready[0]);
 	close(done[1]);
+	/* PIDFD_GET_INFO of a process out of the PID namespace of the caller gives EREMOTE, also
+	 * for the exit status, as pid_in_current_pidns of Linux. */
+	pid = fork();
+	if (pid == 0)
+		_exit(7);
+	int pidfd = syscall(SYS_pidfd_open, pid, 0);
+	waitpid(pid, &status, 0);
+	sub = fork();
+	if (sub == 0) {
+		if (unshare(CLONE_NEWPID) != 0)
+			_exit(1);
+		pid_t inner = fork();
+		if (inner == 0) {
+			struct rk_pidfd_info info;
+			memset(&info, 0, sizeof(info));
+			info.mask = 8; /* PIDFD_INFO_EXIT */
+			_exit(ioctl(pidfd, RK_PIDFD_GET_INFO(sizeof(info)), &info) == -1 && errno == EREMOTE ? 0 : 2);
+		}
+		int st2 = 0;
+		waitpid(inner, &st2, 0);
+		_exit(WIFEXITED(st2) ? WEXITSTATUS(st2) : 3);
+	}
+	waitpid(sub, &status, 0);
+	check("PIDFD_GET_INFO of a process out of the PID namespace gives EREMOTE",
+	      pidfd >= 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(pidfd);
 	/* user.max_user_namespaces limits the namespaces of each user. */
 	char max[32] = "";
 	ok = read_file("/proc/sys/user/max_user_namespaces", max, sizeof(max)) > 0 && atoi(max) > 0;
