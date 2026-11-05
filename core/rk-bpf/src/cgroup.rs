@@ -52,8 +52,12 @@ pub mod atype {
     pub const CGROUP_INET4_POST_BIND: usize = 4;
     pub const CGROUP_INET6_POST_BIND: usize = 5;
     pub const CGROUP_DEVICE: usize = 6;
+    pub const CGROUP_INET4_BIND: usize = 7;
+    pub const CGROUP_INET6_BIND: usize = 8;
+    pub const CGROUP_INET4_CONNECT: usize = 9;
+    pub const CGROUP_INET6_CONNECT: usize = 10;
     /// The count of the attach types, `MAX_CGROUP_BPF_ATTACH_TYPE`.
-    pub const MAX_CGROUP_BPF_ATTACH_TYPE: usize = 7;
+    pub const MAX_CGROUP_BPF_ATTACH_TYPE: usize = 11;
 }
 
 use atype::*;
@@ -69,6 +73,10 @@ pub fn to_cgroup_bpf_attach_type(attach_type: u32) -> Option<usize> {
         BPF_CGROUP_INET4_POST_BIND => CGROUP_INET4_POST_BIND,
         BPF_CGROUP_INET6_POST_BIND => CGROUP_INET6_POST_BIND,
         BPF_CGROUP_DEVICE => CGROUP_DEVICE,
+        BPF_CGROUP_INET4_BIND => CGROUP_INET4_BIND,
+        BPF_CGROUP_INET6_BIND => CGROUP_INET6_BIND,
+        BPF_CGROUP_INET4_CONNECT => CGROUP_INET4_CONNECT,
+        BPF_CGROUP_INET6_CONNECT => CGROUP_INET6_CONNECT,
         _ => return None,
     })
 }

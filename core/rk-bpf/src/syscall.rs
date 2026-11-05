@@ -451,6 +451,9 @@ fn bpf_prog_load_check_attach(prog_type: u32, expected_attach_type: u32) -> Resu
         BPF_PROG_TYPE_CGROUP_SKB => {
             matches!(expected_attach_type, BPF_CGROUP_INET_INGRESS | BPF_CGROUP_INET_EGRESS)
         }
+        BPF_PROG_TYPE_CGROUP_SOCK_ADDR => {
+            attach_type_to_prog_type(expected_attach_type) == BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+        }
         _ => true,
     };
     if ok { Ok(()) } else { Err(Errno::EINVAL) }
@@ -1203,7 +1206,10 @@ fn link_create_cmd(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     let prog = bpf_prog_get(env, attr.u32(link_create::PROG_FD))?;
     bpf_prog_attach_check_attach_type(env, &prog, attach_type)?;
     match prog.prog_type {
-        BPF_PROG_TYPE_CGROUP_SKB | BPF_PROG_TYPE_CGROUP_SOCK | BPF_PROG_TYPE_CGROUP_DEVICE => {
+        BPF_PROG_TYPE_CGROUP_SKB
+        | BPF_PROG_TYPE_CGROUP_SOCK
+        | BPF_PROG_TYPE_CGROUP_SOCK_ADDR
+        | BPF_PROG_TYPE_CGROUP_DEVICE => {
             let cg = EnvCgroups(env);
             let flags = attr.u32(link_create::FLAGS);
             if flags & !crate::cgroup::BPF_F_LINK_ATTACH_MASK != 0 {
@@ -1308,10 +1314,6 @@ fn bpf_prog_attach(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     if bpf_prog_attach_check_attach_type(env, &prog, attach_type).is_err() {
         return Err(Errno::EINVAL);
     }
-    // rukernel has no hook of `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` yet.
-    if ptype == BPF_PROG_TYPE_CGROUP_SOCK_ADDR {
-        return Err(Errno::EINVAL);
-    }
     let cgrp = env.cgroup_get_from_fd(attr.u32(TARGET_FD))?;
     let replace_prog = if flags & BPF_F_ALLOW_MULTI != 0 && flags & BPF_F_REPLACE != 0 {
         Some(bpf_prog_get_type(env, attr.u32(REPLACE_BPF_FD), ptype)?)
@@ -1344,7 +1346,7 @@ fn bpf_prog_detach(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     }
     let attach_type = attr.u32(ATTACH_TYPE);
     let ptype = attach_type_to_prog_type(attach_type);
-    if !is_cgroup_prog_type(ptype) || ptype == BPF_PROG_TYPE_CGROUP_SOCK_ADDR {
+    if !is_cgroup_prog_type(ptype) {
         return Err(Errno::EINVAL);
     }
     if attr.u32(ATTACH_FLAGS) != 0 || attr.u32(RELATIVE_FD) != 0 {

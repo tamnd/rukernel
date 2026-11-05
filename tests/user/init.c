@@ -6001,6 +6001,146 @@ static void test_bpf_cgroup_skb(void)
 	rmdir("/bpfcg");
 }
 
+/*
+ * A program of BPF_PROG_TYPE_CGROUP_SOCK_ADDR that sets user_port of struct bpf_sock_addr to
+ * the port in network byte order, if port is not 0, and gives ret.
+ */
+static int bpf_prog_port(unsigned int expected, unsigned short port, int ret)
+{
+	unsigned long long insns[] = {
+		bpf_insn(0xb7, 2, 0, 0, htons(port)),	/* r2 = htons(port) */
+		bpf_insn(0x63, 1, 2, 24, 0),		/* *(u32 *)(r1 + 24) = r2 */
+		bpf_insn(0xb7, 0, 0, 0, ret),		/* r0 = ret */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	unsigned char attr[168] = { 0 };
+	int skip = port == 0 ? 2 : 0;
+
+	bpf_put32(attr, 0, 18);
+	bpf_put32(attr, 4, 4 - skip);
+	bpf_put64(attr, 8, (unsigned long)(insns + skip));
+	bpf_put64(attr, 16, (unsigned long)"GPL");
+	bpf_put32(attr, 68, expected);
+	return bpf_call(5, attr, sizeof(attr));
+}
+
+/* The local port of a new socket of the family and type after a bind to the loopback address. */
+static int bind_port(int family, int type)
+{
+	struct sockaddr_storage ss = { 0 };
+	socklen_t len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	int fd = socket(family, type, 0), port = -1;
+
+	ss.ss_family = family;
+	if (family == AF_INET)
+		((struct sockaddr_in *)&ss)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	else
+		((struct sockaddr_in6 *)&ss)->sin6_addr = in6addr_loopback;
+	if (fd >= 0 && bind(fd, (struct sockaddr *)&ss, len) == 0 &&
+	    getsockname(fd, (struct sockaddr *)&ss, &len) == 0)
+		port = ntohs(((struct sockaddr_in *)&ss)->sin_port);
+	if (fd >= 0)
+		close(fd);
+	return port;
+}
+
+/* A connect of a new TCP socket of the family to the loopback address and port 9: the errno. */
+static int connect_errno(int family)
+{
+	struct sockaddr_storage ss = { 0 };
+	socklen_t len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	int fd = socket(family, SOCK_STREAM, 0), e;
+
+	ss.ss_family = family;
+	((struct sockaddr_in *)&ss)->sin_port = htons(9);
+	if (family == AF_INET)
+		((struct sockaddr_in *)&ss)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	else
+		((struct sockaddr_in6 *)&ss)->sin6_addr = in6addr_loopback;
+	errno = 0;
+	e = connect(fd, (struct sockaddr *)&ss, len) == 0 ? 0 : errno;
+	close(fd);
+	return e;
+}
+
+/*
+ * The address programs of a cgroup: a program of BPF_CGROUP_INET4_BIND or BPF_CGROUP_INET6_BIND
+ * changes the port of bind, and a program of BPF_CGROUP_INET4_CONNECT or
+ * BPF_CGROUP_INET6_CONNECT that gives 0 makes connect give EPERM (#537).
+ */
+static void test_bpf_cgroup_sock_addr(void)
+{
+	int cg, b4, b6, c4, c6, bad, status, ok;
+	pid_t pid;
+
+	mkdir("/bpfcg", 0755);
+	if (mount("none", "/bpfcg", "cgroup2", 0, NULL) != 0) {
+		check("mount cgroup2 for the address programs", 0);
+		return;
+	}
+	mkdir("/bpfcg/rk_sa", 0755);
+	cg = open("/bpfcg/rk_sa", O_RDONLY | O_DIRECTORY);
+	b4 = bpf_prog_port(8, 4441, 1);
+	b6 = bpf_prog_port(9, 4446, 1);
+	c4 = bpf_prog_port(10, 0, 0);
+	c6 = bpf_prog_port(11, 0, 0);
+	/* user_ip6 is not in the context of BPF_CGROUP_INET4_BIND. */
+	{
+		unsigned long long insns[] = {
+			bpf_insn(0x61, 0, 1, 8, 0),	/* r0 = *(u32 *)(r1 + 8) */
+			bpf_insn(0xb7, 0, 0, 0, 1),	/* r0 = 1 */
+			bpf_insn(0x95, 0, 0, 0, 0),	/* exit */
+		};
+		unsigned char attr[168] = { 0 };
+
+		bpf_put32(attr, 0, 18);
+		bpf_put32(attr, 4, 3);
+		bpf_put64(attr, 8, (unsigned long)insns);
+		bpf_put64(attr, 16, (unsigned long)"GPL");
+		bpf_put32(attr, 68, 8);
+		bad = bpf_call(5, attr, sizeof(attr));
+	}
+	check("BPF_PROG_LOAD of BPF_PROG_TYPE_CGROUP_SOCK_ADDR",
+	      b4 >= 0 && b6 >= 0 && c4 >= 0 && c6 >= 0);
+	check("a program of BPF_CGROUP_INET4_BIND cannot read user_ip6", bad < 0 && errno == EACCES);
+	ok = bpf_attach(8, cg, b4, 8, 0) == 0 && bpf_attach(8, cg, b6, 9, 0) == 0 &&
+	     bpf_attach(8, cg, c4, 10, 0) == 0 && bpf_attach(8, cg, c6, 11, 0) == 0;
+	check("BPF_PROG_ATTACH of the bind and connect programs", ok);
+	pid = fork();
+	if (pid == 0) {
+		int r = 0;
+
+		if (cg_write("/bpfcg/rk_sa/cgroup.procs", "0") != 0)
+			_exit(1);
+		if (bind_port(AF_INET, SOCK_DGRAM) != 4441 || bind_port(AF_INET, SOCK_STREAM) != 4441)
+			r |= 2;
+		if (bind_port(AF_INET6, SOCK_DGRAM) != 4446)
+			r |= 4;
+		if (connect_errno(AF_INET) != EPERM || connect_errno(AF_INET6) != EPERM)
+			r |= 8;
+		_exit(r);
+	}
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	if (ok && WEXITSTATUS(status) != 0)
+		printf("rk-bpf: the address check gave %d\n", WEXITSTATUS(status));
+	check("the bind programs change the port and the connect programs give EPERM",
+	      ok && WEXITSTATUS(status) == 0);
+	check("the address programs of a cgroup do not change a socket in another cgroup",
+	      bind_port(AF_INET, SOCK_DGRAM) != 4441 && connect_errno(AF_INET) != EPERM);
+	ok = bpf_attach(9, cg, c4, 10, 0) == 0 && bpf_attach(9, cg, c6, 11, 0) == 0;
+	check("BPF_PROG_DETACH of the connect programs", ok);
+	close(cg);
+	close(b4);
+	close(b6);
+	close(c4);
+	close(c6);
+	if (bad >= 0)
+		close(bad);
+	check("rmdir of a cgroup with an address program", rmdir("/bpfcg/rk_sa") == 0);
+	umount("/bpfcg");
+	rmdir("/bpfcg");
+}
+
 /* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
 static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 {
@@ -6172,6 +6312,7 @@ static void test_bpf(void)
 	test_bpf_cgroup();
 	test_bpf_cgroup_hooks();
 	test_bpf_cgroup_skb();
+	test_bpf_cgroup_sock_addr();
 	test_bpffs();
 	umount("/proc");
 }
