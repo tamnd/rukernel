@@ -11,7 +11,7 @@
 //! the rules give `EOPNOTSUPP`.
 
 use super::msg::{self, HDRLEN, Header};
-use super::{F_CAP_ACK, F_EXT_ACK, NetlinkSocket, broadcast};
+use super::{Creds, F_CAP_ACK, F_EXT_ACK, NetlinkSocket, broadcast};
 use crate::ns;
 use alloc::format;
 use alloc::string::String;
@@ -214,14 +214,14 @@ fn log(ty: u16, text: &str) {
     record[0..4].copy_from_slice(&full.to_ne_bytes());
     {
         let _in = ns::enter(&ns::init_ns());
-        broadcast(NETLINK_AUDIT, None, &record, 0, 0, NLGRP_READLOG);
+        broadcast(NETLINK_AUDIT, None, &record, 0, 0, NLGRP_READLOG, Creds::KERNEL);
     }
     match auditd() {
         Some((_, sock)) => {
             // The record for auditd has the length of the text in `nlmsg_len`, as
             // `audit_log_end` of Linux. auditd reads the record in this way.
             record[0..4].copy_from_slice(&(body.len() as u32).to_ne_bytes());
-            if !sock.queue(record, 0, 0) {
+            if !sock.send_from_kernel(record) {
                 LOST.fetch_add(1, Ordering::Relaxed);
             }
         }
