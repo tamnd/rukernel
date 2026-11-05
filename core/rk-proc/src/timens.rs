@@ -17,6 +17,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_frame::mm::{Frame, alloc_zeroed_frame};
 use rk_frame::sync::{Once, SpinLock};
+use rk_vfs::user_ns::{self, UserNs};
 
 /// The index of the offset of `CLOCK_MONOTONIC`.
 pub const MONOTONIC: usize = 0;
@@ -42,6 +43,8 @@ pub struct TimeNs {
     frozen: AtomicBool,
     /// The page of the vDSO with the offsets, or `None` if no frame was free.
     page: Option<Arc<Frame>>,
+    /// The user namespace that owns the namespace, `user_ns` of Linux.
+    user_ns: Arc<UserNs>,
 }
 
 /// The time namespaces other than the first one, for `by_id`.
@@ -59,23 +62,26 @@ pub fn init_ns() -> Arc<TimeNs> {
             offsets: SpinLock::new([0; 2]),
             frozen: AtomicBool::new(true),
             page: alloc_zeroed_frame().map(Arc::new),
+            user_ns: user_ns::init().clone(),
         })
     })
     .clone()
 }
 
-/// Makes a new time namespace with the offsets of `parent`, as `clone_time_ns` of Linux.
+/// Makes a new time namespace with the offsets of `parent`, which the user namespace `owner`
+/// owns, as `clone_time_ns` of Linux.
 ///
 /// # Errors
 ///
 /// Gives `ENOMEM` if no frame is free for the page of the vDSO.
-pub fn new(parent: &TimeNs) -> Result<Arc<TimeNs>, Errno> {
+pub fn new(parent: &TimeNs, owner: Arc<UserNs>) -> Result<Arc<TimeNs>, Errno> {
     let page = alloc_zeroed_frame().ok_or(Errno::ENOMEM)?;
     let ns = Arc::new(TimeNs {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         offsets: SpinLock::new(parent.offsets()),
         frozen: AtomicBool::new(false),
         page: Some(Arc::new(page)),
+        user_ns: owner,
     });
     let mut live = LIVE.lock();
     live.retain(|w| w.strong_count() > 0);
@@ -191,6 +197,11 @@ impl TimeNs {
     /// The ID of the namespace.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// The user namespace that owns the namespace.
+    pub fn user_ns(&self) -> &Arc<UserNs> {
+        &self.user_ns
     }
 
     /// Tells if this is the first namespace.

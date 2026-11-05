@@ -195,7 +195,9 @@ pub(crate) fn open(cx: &Cx<'_>, process: Arc<Process>, flags: u32) -> Result<i32
 ///
 /// # Errors
 ///
-/// Gives `EINVAL` for another flag, and `ESTALE` if no process has the inode number.
+/// Gives `EINVAL` for another flag, and `ESTALE` if no process has the inode number, or if the
+/// process is out of the PID namespace of the caller and its descendants, as
+/// `pidfs_fh_to_dentry` of Linux.
 pub(crate) fn open_by_handle(cx: &Cx<'_>, ty: i32, words: &[u32], flags: u32) -> SysResult {
     let valid = O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_EXCL | O_LARGEFILE;
     if flags & !valid != 0 {
@@ -205,6 +207,9 @@ pub(crate) fn open_by_handle(cx: &Cx<'_>, ty: i32, words: &[u32], flags: u32) ->
     let ino = u64::from(lo) | (u64::from(hi) << 32);
     let process =
         rk_proc::processes().into_iter().find(|p| p.serial() == ino).ok_or(Errno::ESTALE)?;
+    if !rk_proc::pid_namespace::is_descendant(process.pid_ns(), cx.process().pid_ns()) {
+        return Err(Errno::ESTALE);
+    }
     let file = new_file(process, flags & (O_NONBLOCK | O_EXCL));
     Ok(cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)? as u64)
 }
@@ -352,8 +357,7 @@ fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysRe
 /// # Errors
 ///
 /// Gives `ENOTTY` for another command, `ESRCH` if the process ended, `EINVAL` if `arg` is not 0
-/// for a namespace, `EACCES` if the caller cannot trace the process, and `EOPNOTSUPP` for the
-/// user namespace, as Linux without `CONFIG_USER_NS`.
+/// for a namespace, and `EACCES` if the caller cannot trace the process.
 pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysResult> {
     let pidfd = file.ops().as_any().and_then(|a| a.downcast_ref::<PidFd>())?;
     let process = &pidfd.process;

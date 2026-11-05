@@ -11,7 +11,7 @@ use rk_frame::sync::SpinLock;
 use rk_proc::Process;
 use rk_proc::pid_namespace::{self, PidNamespace};
 use rk_vfs::Location;
-use rk_vfs::cred::cap;
+use rk_vfs::cred::{Cred, cap};
 use rk_vfs::file::File;
 use rk_vfs::inode::InodeRef;
 use rk_vfs::nsfs::{NsInode, NsKind};
@@ -36,14 +36,31 @@ const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
 /// `NS_GET_TGID_IN_PIDNS`: `_IOR(0xb7, 9, int)`.
 const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
 
-/// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. A network
-/// namespace has an owner, and the first user namespace owns the namespaces of the other kinds.
+/// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. A network, PID,
+/// UTS, IPC or time namespace has an owner, and the first user namespace owns the namespaces of
+/// the other kinds.
 pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         NS_GET_USERNS if kind == NsKind::User => user_owner(cx, id),
         NS_GET_USERNS if kind == NsKind::Net => {
             let net = rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?;
             open_user_ns(cx, Some(net.user_ns().clone()))
+        }
+        NS_GET_USERNS if kind == NsKind::Pid => {
+            let ns = pid_namespace::by_id(id).ok_or(Errno::EINVAL)?;
+            open_user_ns(cx, Some(pid_namespace::owner(ns.as_ref())))
+        }
+        NS_GET_USERNS if kind == NsKind::Uts => {
+            let ns = rk_proc::uts::by_id(id).ok_or(Errno::EINVAL)?;
+            open_user_ns(cx, Some(ns.user_ns().clone()))
+        }
+        NS_GET_USERNS if kind == NsKind::Ipc => {
+            let ns = rk_proc::ns::ipc_by_id(id).ok_or(Errno::EINVAL)?;
+            open_user_ns(cx, Some(ns.user_ns().clone()))
+        }
+        NS_GET_USERNS if kind == NsKind::Time => {
+            let ns = rk_proc::timens::by_id(id).ok_or(Errno::EINVAL)?;
+            open_user_ns(cx, Some(ns.user_ns().clone()))
         }
         NS_GET_USERNS => open_user_ns(cx, Some(user_ns::init().clone())),
         NS_GET_PARENT if kind == NsKind::Pid => pid_parent(cx, id),
@@ -137,6 +154,18 @@ pub(crate) fn user_inode(ns: Arc<UserNs>) -> Arc<NsInode> {
 /// Gives `EINVAL` for the namespace of the process, for a process with more than one thread or
 /// a shared file system context, and `EPERM` without `CAP_SYS_ADMIN` in `ns`.
 pub(crate) fn join_user_ns(cx: &Cx<'_>, process: &Process, ns: Arc<UserNs>) -> Result<(), Errno> {
+    let cred = user_ns_cred(cx, process, ns)?;
+    process.set_cred(cred);
+    Ok(())
+}
+
+/// The credentials of `process` in the user namespace `ns`, after the checks of `userns_install`
+/// of Linux. See [`join_user_ns`].
+///
+/// # Errors
+///
+/// Gives the errors of [`join_user_ns`].
+pub(crate) fn user_ns_cred(cx: &Cx<'_>, process: &Process, ns: Arc<UserNs>) -> Result<Cred, Errno> {
     let cred = process.cred();
     if ns == cred.user_ns || process.threads().len() > 1 {
         return Err(Errno::EINVAL);
@@ -148,8 +177,7 @@ pub(crate) fn join_user_ns(cx: &Cx<'_>, process: &Process, ns: Arc<UserNs>) -> R
     if !cred.ns_capable(&ns, cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    process.set_cred(cred.in_user_ns(ns));
-    Ok(())
+    Ok(cred.in_user_ns(ns))
 }
 
 /// Opens the file of the parent of the PID namespace `id`, for `NS_GET_PARENT`, as `pidns_get_parent`

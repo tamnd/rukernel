@@ -13,6 +13,7 @@ use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 use rk_vfs::MountNamespace;
 use rk_vfs::nsfs::NsKind;
+use rk_vfs::user_ns::{self, UserNs};
 
 /// The IDs of the mount namespaces other than the first one.
 static MNT_IDS: SpinLock<Vec<(Weak<MountNamespace>, u32)>> = SpinLock::new(Vec::new());
@@ -80,6 +81,8 @@ pub fn ns_id(process: &Process, kind: NsKind) -> Result<u32, Errno> {
 pub struct IpcNs {
     /// The ID of the namespace for nsfs. The first namespace has the ID 0.
     id: u32,
+    /// The user namespace that owns the namespace, `user_ns` of Linux.
+    user_ns: Arc<UserNs>,
 }
 
 /// The IPC namespaces other than the first one, for `ipc_by_id`.
@@ -101,12 +104,13 @@ pub fn on_ipc_exit(f: fn(u32)) {
 /// The first IPC namespace, `init_ipc_ns` of Linux.
 pub fn init_ipc() -> Arc<IpcNs> {
     static INIT: Once<Arc<IpcNs>> = Once::new();
-    INIT.call_once(|| Arc::new(IpcNs { id: 0 })).clone()
+    INIT.call_once(|| Arc::new(IpcNs { id: 0, user_ns: user_ns::init().clone() })).clone()
 }
 
-/// Makes a new IPC namespace with no objects, as `create_ipc_ns` of Linux.
-pub fn new_ipc() -> Arc<IpcNs> {
-    let ns = Arc::new(IpcNs { id: IPC_NEXT_ID.fetch_add(1, Ordering::Relaxed) });
+/// Makes a new IPC namespace with no objects, which the user namespace `owner` owns, as
+/// `create_ipc_ns` of Linux.
+pub fn new_ipc(owner: Arc<UserNs>) -> Arc<IpcNs> {
+    let ns = Arc::new(IpcNs { id: IPC_NEXT_ID.fetch_add(1, Ordering::Relaxed), user_ns: owner });
     let mut live = IPC_LIVE.lock();
     live.retain(|w| w.strong_count() > 0);
     live.push(Arc::downgrade(&ns));
@@ -125,6 +129,11 @@ impl IpcNs {
     /// The ID of the namespace.
     pub fn id(&self) -> u32 {
         self.id
+    }
+
+    /// The user namespace that owns the namespace.
+    pub fn user_ns(&self) -> &Arc<UserNs> {
+        &self.user_ns
     }
 
     /// Tells if this is the first namespace.

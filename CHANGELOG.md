@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - A netlink socket takes `SO_PASSCRED` and gives the `SCM_CREDENTIALS` of the sender, as `netlink_recvmsg` of Linux. A message from the kernel has the PID, UID and GID 0. Before, `setsockopt(SO_PASSCRED)` gave `ENOPROTOOPT`, and systemd-logind stopped at the start because the device monitor of systemd sets this option on its `NETLINK_KOBJECT_UEVENT` socket (#539).
 
+### Added
+
+- The PID, UTS, IPC and time namespaces have an owner user namespace, as the `user_ns` of their structures in Linux: the user namespace of the process that makes them. `NS_GET_USERNS` gives the owner. `setns` needs `CAP_SYS_ADMIN` in the owner and in the user namespace of the caller, as `pidns_install`, `utsns_install`, `ipcns_install`, `timens_install` and `netns_install` of Linux. Before, it needed the capability in the first user namespace, so a process that joined a user namespace could not join the other namespaces of a process in it. With a pidfd, `setns` checks all the namespaces with the credentials in the new user namespace, and an error changes nothing, as `validate_nsset` of Linux. `open_by_handle_at` of a pidfs handle gives `ESTALE` for a process out of the PID namespace of the caller and of the namespaces below it. The kselftests pidfd_fdinfo_test and pidfd_file_handle_test run in the `kselftest` boot test (#536).
+
 ## [0.5.7] - 2026-11-05
 
 ### Added

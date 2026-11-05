@@ -9,6 +9,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use rk_frame::sync::{Once, SpinLock};
+use rk_vfs::user_ns::{self, UserNs};
 
 /// The most bytes of a name, `__NEW_UTS_LEN`.
 pub const NAME_MAX: usize = 64;
@@ -48,6 +49,8 @@ pub struct UtsNs {
     id: u32,
     /// The host name and the NIS domain name.
     names: SpinLock<(Field, Field)>,
+    /// The user namespace that owns the namespace, `user_ns` of Linux.
+    user_ns: Arc<UserNs>,
 }
 
 /// The UTS namespaces other than the first one, for `by_id`.
@@ -59,7 +62,14 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// The first UTS namespace, `init_uts_ns` of Linux.
 pub fn init_ns() -> Arc<UtsNs> {
     static INIT: Once<Arc<UtsNs>> = Once::new();
-    INIT.call_once(|| Arc::new(UtsNs { id: 0, names: SpinLock::new((DEFAULT, DEFAULT)) })).clone()
+    INIT.call_once(|| {
+        Arc::new(UtsNs {
+            id: 0,
+            names: SpinLock::new((DEFAULT, DEFAULT)),
+            user_ns: user_ns::init().clone(),
+        })
+    })
+    .clone()
 }
 
 /// The UTS namespace with the ID `id`, while it exists.
@@ -81,17 +91,24 @@ impl UtsNs {
         self.id == 0
     }
 
-    /// Makes a new namespace with a copy of the names of this one, as `clone_uts_ns` of Linux.
-    pub fn copy(&self) -> Arc<UtsNs> {
+    /// Makes a new namespace with a copy of the names of this one, which the user namespace
+    /// `owner` owns, as `clone_uts_ns` of Linux.
+    pub fn copy(&self, owner: Arc<UserNs>) -> Arc<UtsNs> {
         let names = *self.names.lock();
         let ns = Arc::new(UtsNs {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             names: SpinLock::new(names),
+            user_ns: owner,
         });
         let mut live = LIVE.lock();
         live.retain(|w| w.strong_count() > 0);
         live.push(Arc::downgrade(&ns));
         ns
+    }
+
+    /// The user namespace that owns the namespace.
+    pub fn user_ns(&self) -> &Arc<UserNs> {
+        &self.user_ns
     }
 
     /// The host name.
@@ -173,9 +190,9 @@ mod tests {
 
     #[test]
     fn a_new_namespace_has_a_copy_of_the_names() {
-        let parent = init_ns().copy();
+        let parent = init_ns().copy(user_ns::init().clone());
         assert!(parent.set_hostname(b"parent"));
-        let child = parent.copy();
+        let child = parent.copy(user_ns::init().clone());
         assert_ne!(child.id(), parent.id());
         assert!(!child.is_init());
         assert_eq!(bytes(&child.hostname()), b"parent");
