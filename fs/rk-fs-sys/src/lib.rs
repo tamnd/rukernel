@@ -36,18 +36,25 @@
 //! - `/sys/devices/system/cpu` has a directory `cpuN` with `topology` for each CPU, and the
 //!   files `online`, `possible` and `present`. `/sys/devices/system/node` has the one NUMA node
 //!   `node0`. glibc reads `online` for `get_nprocs` and `possible` for `get_nprocs_conf`.
+//! - `/sys/devices/pci0000:00` has a directory for each PCI function, and
+//!   `/sys/devices/platform` has the virtio MMIO devices of the device tree, from
+//!   `rk_vfs::bus`. The virtio device on a transport is the directory `virtioN` of the
+//!   transport. `/sys/bus/pci`, `/sys/bus/platform` and `/sys/bus/virtio` have links to them,
+//!   and `/sys/module` has the modules of their drivers.
 //! - A mount of sysfs keeps the network namespace of the task that mounts it, as the namespace
 //!   tag of kernfs in fs/sysfs/mount.c of Linux. The mount shows only the interfaces of that
 //!   namespace, and a mount in another namespace is another file system.
 //!
-//! Linux puts a device of a bus below the directory of the bus. This kernel puts all devices in
-//! `/sys/devices/virtual`. A program that follows the links does not see the difference.
+//! Linux puts a device of a class below the directory of its parent on a bus. This kernel puts
+//! the devices of the classes in `/sys/devices/virtual`. A program that follows the links does
+//! not see the difference.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+mod bus;
 mod cpu;
 mod firmware;
 pub mod kfs;
@@ -75,8 +82,7 @@ pub const SYSFS_MAGIC: u64 = 0x6265_6572;
 /// The file system type of sysfs, for `mount -t sysfs`.
 pub const FS_TYPE: FsType = FsType { name: "sysfs", nodev: true, make: mount };
 
-/// The directories at the top of sysfs. Only `block`, `class`, `dev`, `devices`, `fs` and `kernel`
-/// have entries.
+/// The directories at the top of sysfs. `power` has no entries.
 const TOP: [&str; 10] =
     ["block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module", "power"];
 
@@ -117,6 +123,7 @@ fn write_file(path: &str, text: &[u8]) -> Result<()> {
 fn writable(path: &str) -> bool {
     path.strip_prefix(THP_DIR).is_some_and(|f| f == "/enabled" || f == "/defrag")
         || uevent_device(path).is_some()
+        || bus::is_uevent(path)
 }
 
 /// The class and the name of the device of the file `uevent` at `path`.
@@ -479,7 +486,17 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
             .filter(|d| d.block == (kind == "block"))
             .map(|d| (numbers(d), to_device("../../", d)))
             .collect(),
-        ["devices"] => dirs(&mut ["system", "virtual"].into_iter()),
+        ["devices"] => {
+            let mut names = bus::devices_top();
+            names.extend(["system", "virtual"]);
+            names.sort_unstable();
+            dirs(&mut names.into_iter())
+        }
+        ["devices", top, ..] if bus::devices_top().iter().any(|t| *t == top) => {
+            bus::devices_entries(&parts[1..])?
+        }
+        ["bus", ref rest @ ..] => bus::bus_entries(rest)?,
+        ["module", ref rest @ ..] => bus::module_entries(rest)?,
         ["devices", "system", ref rest @ ..] => cpu::entries(rk_frame::cpu::count(), rest)?,
         ["devices", "virtual", class] if classes.contains(class) => list
             .iter()
@@ -612,6 +629,9 @@ impl Inode for Node {
             Kind::Mm { writable: true } => mm::write(&self.path, buf),
             Kind::File(_) if uevent_device(&self.path).is_some() => {
                 write_uevent(&self.path, &self.net, buf).map(|()| buf.len())
+            }
+            Kind::File(_) if bus::is_uevent(&self.path) => {
+                bus::write_uevent(&self.path, buf).map(|()| buf.len())
             }
             Kind::File(_) => write_file(&self.path, buf).map(|()| buf.len()),
             Kind::Mm { .. } => Err(Errno::EACCES),
@@ -749,7 +769,8 @@ mod tests {
         assert_eq!(names(""), TOP);
         assert_eq!(names("class"), ["block", "input", "mem", "net", "tty"]);
         assert_eq!(names("devices/virtual"), ["block", "input", "mem", "net", "tty"]);
-        assert!(names("bus").is_empty());
+        assert_eq!(names("bus"), ["pci", "platform", "virtio"]);
+        assert!(names("power").is_empty());
         assert!(entries("nothing", &list(), &init()).is_none());
         assert!(entries("devices/virtual/disk", &list(), &init()).is_none());
     }
