@@ -17,8 +17,10 @@ mod nf_tables_core;
 
 use self::nf_tables_core::{
     NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain, nft_prog,
+    nft_rule_needs_ct,
 };
 use crate::buf::NetBuf;
+use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
 use crate::netfilter::{
     NF_ACCEPT, NF_DROP, NF_INET_NUMHOOKS, NF_QUEUE, NFPROTO_ARP, NFPROTO_BRIDGE, NFPROTO_INET,
     NFPROTO_IPV4, NFPROTO_IPV6, NFPROTO_NETDEV, NFPROTO_UNSPEC, NfHookFn, NfHookOps, NfHookState,
@@ -504,11 +506,14 @@ struct NftablesPernet {
     tables: Vec<NftTable>,
     /// The hooks in the hook lists of the namespace.
     hooks: Vec<NfHookOps>,
+    /// The families for which the tables use connection tracking, with a user of
+    /// `nf_ct_netns_get` for each.
+    ct: Vec<u8>,
 }
 
 impl Default for NftablesPernet {
     fn default() -> Self {
-        Self { base_seq: 1, table_handle: 0, tables: Vec::new(), hooks: Vec::new() }
+        Self { base_seq: 1, table_handle: 0, tables: Vec::new(), hooks: Vec::new(), ct: Vec::new() }
     }
 }
 
@@ -2415,9 +2420,39 @@ fn nft_wanted_hooks(tables: &[NftTable]) -> Vec<WantedHook> {
     out
 }
 
+/// Takes a user of connection tracking for each family with a table that has a `ct`
+/// expression, and gives back the users of the families without one. Linux takes a user in
+/// the `init` of each expression and gives it back in its `destroy`; one user for each family
+/// does the same for the hooks.
+fn nft_sync_ct(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
+    let mut want: Vec<u8> = Vec::new();
+    for t in tables {
+        let uses = t.chains.iter().flat_map(|c| &c.rules).any(|r| nft_rule_needs_ct(&r.parsed));
+        if uses && !want.contains(&t.family) {
+            want.push(t.family);
+        }
+    }
+    for &f in &want {
+        if net.ct.contains(&f) {
+            continue;
+        }
+        nf_ct_netns_get(f)?;
+        net.ct.push(f);
+    }
+    net.ct.retain(|f| {
+        let keep = want.contains(f);
+        if !keep {
+            nf_ct_netns_put(*f);
+        }
+        keep
+    });
+    Ok(())
+}
+
 /// Puts the hooks of `tables` in the hook lists, and removes the hooks that are not in
 /// `tables` any more. The state of each base chain goes to its hook.
 fn nft_sync_hooks(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
+    nft_sync_ct(net, tables)?;
     let want = nft_wanted_hooks(tables);
     let same = |ops: &NfHookOps, w: &Arc<NftHookOps>| {
         Arc::as_ptr(&ops.hook).cast::<u8>() == Arc::as_ptr(w).cast::<u8>()

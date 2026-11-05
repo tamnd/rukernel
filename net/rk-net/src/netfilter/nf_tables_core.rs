@@ -19,7 +19,10 @@ use super::{
     nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
-use crate::netfilter::{NfHookState, NfPktinfo as NftPktinfo, nf_pktinfo as nft_pktinfo};
+use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
+use crate::netfilter::{
+    NFPROTO_INET, NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo, nf_pktinfo as nft_pktinfo,
+};
 use crate::netlink::msg::Attrs;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -72,6 +75,31 @@ const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
 const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = 2;
 
 // `NFTA_META_*` and `enum nft_meta_keys`.
+/// The attributes and the keys of `ct`, as nft_ct.c of Linux.
+const NFTA_CT_DREG: u32 = 1;
+const NFTA_CT_KEY: u32 = 2;
+const NFTA_CT_DIRECTION: u32 = 3;
+const NFTA_CT_SREG: u32 = 4;
+const NFT_CT_STATE: u32 = 0;
+const NFT_CT_DIRECTION: u32 = 1;
+const NFT_CT_STATUS: u32 = 2;
+const NFT_CT_MARK: u32 = 3;
+const NFT_CT_EXPIRATION: u32 = 5;
+const NFT_CT_L3PROTOCOL: u32 = 7;
+const NFT_CT_SRC: u32 = 8;
+const NFT_CT_DST: u32 = 9;
+const NFT_CT_PROTOCOL: u32 = 10;
+const NFT_CT_PROTO_SRC: u32 = 11;
+const NFT_CT_PROTO_DST: u32 = 12;
+const NFT_CT_SRC_IP: u32 = 19;
+const NFT_CT_DST_IP: u32 = 20;
+const NFT_CT_SRC_IP6: u32 = 21;
+const NFT_CT_DST_IP6: u32 = 22;
+const NFT_CT_ID: u32 = 23;
+
+/// The bits of `ct state`, as `NF_CT_STATE_INVALID_BIT` and `NF_CT_STATE_BIT` of Linux.
+const NF_CT_STATE_INVALID_BIT: u32 = 1 << 0;
+
 const NFTA_META_DREG: u32 = 1;
 const NFTA_META_KEY: u32 = 2;
 const NFTA_META_SREG: u32 = 3;
@@ -136,6 +164,11 @@ pub(super) enum NftExpr {
     Counter { packets: Arc<AtomicU64>, bytes: Arc<AtomicU64> },
     /// `lookup` in the set `set` (a handle), as nft_lookup.c.
     Lookup { set: u64, sreg: usize, len: usize, invert: bool },
+    /// `ct` that loads a key of the connection of the packet, as `nft_ct_get_eval`. `dir` is
+    /// the direction of the tuple for the keys of a tuple.
+    Ct { key: u32, dir: usize, len: usize, dreg: usize },
+    /// `ct mark set`, as `nft_ct_set_eval`.
+    CtSet { sreg: usize },
 }
 
 impl NftExpr {
@@ -316,8 +349,101 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
                 invert: flags & NFT_LOOKUP_F_INV != 0,
             })
         }
+        b"ct" => nft_ct_init(table, data),
         _ => Err(Errno::ENOENT),
     }
+}
+
+/// Reads a `ct` expression, as `nft_ct_get_init` and `nft_ct_set_init` of Linux. The keys that
+/// need a direction are the ones of a tuple.
+fn nft_ct_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
+    // Connection tracking is for IPv4 and IPv6.
+    if !matches!(table.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let a = Attrs::parse(data, 4);
+    let Some(key) = be32(&a, NFTA_CT_KEY)? else { return Err(Errno::EINVAL) };
+    let dir = match a.get(NFTA_CT_DIRECTION) {
+        None => None,
+        Some(&[d]) if usize::from(d) <= 1 => Some(usize::from(d)),
+        Some(_) => return Err(Errno::EINVAL),
+    };
+    if a.has(NFTA_CT_SREG) {
+        if a.has(NFTA_CT_DREG) {
+            return Err(Errno::EINVAL);
+        }
+        // The other keys of `nft_ct_set_init` come later.
+        if key != NFT_CT_MARK {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if dir.is_some() {
+            return Err(Errno::EINVAL);
+        }
+        let sreg = nft_parse_register(&a, NFTA_CT_SREG, 4)?;
+        return Ok(NftExpr::CtSet { sreg });
+    }
+    let addr_len = match table.family {
+        NFPROTO_IPV4 => 4,
+        _ => 16,
+    };
+    let (len, needs_dir) = match key {
+        NFT_CT_DIRECTION => (1, false),
+        NFT_CT_STATE | NFT_CT_STATUS | NFT_CT_MARK | NFT_CT_EXPIRATION | NFT_CT_ID => (4, false),
+        // For compatibility, Linux takes a direction for these.
+        NFT_CT_L3PROTOCOL | NFT_CT_PROTOCOL => (1, dir.is_some()),
+        NFT_CT_SRC | NFT_CT_DST => (addr_len, true),
+        NFT_CT_SRC_IP | NFT_CT_DST_IP => (4, true),
+        NFT_CT_SRC_IP6 | NFT_CT_DST_IP6 => (16, true),
+        NFT_CT_PROTO_SRC | NFT_CT_PROTO_DST => (2, true),
+        _ => return Err(Errno::EOPNOTSUPP),
+    };
+    if needs_dir != dir.is_some() {
+        return Err(Errno::EINVAL);
+    }
+    let dreg = nft_parse_register(&a, NFTA_CT_DREG, len)?;
+    Ok(NftExpr::Ct { key, dir: dir.unwrap_or(0), len, dreg })
+}
+
+/// Loads the key `key` of the connection of `skb`, as `nft_ct_get_eval` of Linux. A packet
+/// with no connection has the state invalid and no other key.
+fn nft_ct_get(key: u32, dir: usize, len: usize, skb: &NetBuf) -> Option<Vec<u8>> {
+    let Some((ct, ctinfo)) = skb.nfct.get() else {
+        return (key == NFT_CT_STATE).then(|| NF_CT_STATE_INVALID_BIT.to_ne_bytes().to_vec());
+    };
+    let u32v = |v: u32| Some(v.to_ne_bytes().to_vec());
+    let t = &ct.tuple[dir];
+    let v4 = t.l3num == NFPROTO_IPV4;
+    match key {
+        NFT_CT_STATE => u32v(1 << (u32::from(ctinfo % IP_CT_IS_REPLY) + 1)),
+        NFT_CT_DIRECTION => {
+            let d = if ctinfo >= IP_CT_IS_REPLY { IP_CT_DIR_REPLY } else { IP_CT_DIR_ORIGINAL };
+            Some(alloc::vec![d as u8])
+        }
+        NFT_CT_STATUS => u32v(ct.status()),
+        NFT_CT_MARK => u32v(ct.mark.load(Ordering::Relaxed)),
+        NFT_CT_EXPIRATION => {
+            let ms = ct.expires().saturating_mul(1000) / crate::options::hz();
+            u32v(u32::try_from(ms).unwrap_or(u32::MAX))
+        }
+        NFT_CT_ID => u32v(ct.id),
+        NFT_CT_L3PROTOCOL => Some(alloc::vec![t.l3num]),
+        NFT_CT_PROTOCOL => Some(alloc::vec![t.protonum]),
+        NFT_CT_SRC => Some(t.src[..len].to_vec()),
+        NFT_CT_DST => Some(t.dst[..len].to_vec()),
+        NFT_CT_SRC_IP if v4 => Some(t.src[..4].to_vec()),
+        NFT_CT_DST_IP if v4 => Some(t.dst[..4].to_vec()),
+        NFT_CT_SRC_IP6 if !v4 => Some(t.src.to_vec()),
+        NFT_CT_DST_IP6 if !v4 => Some(t.dst.to_vec()),
+        // The ports are in the order of the network, as `tuple->src.u.all`.
+        NFT_CT_PROTO_SRC => Some(t.src_u.to_be_bytes().to_vec()),
+        NFT_CT_PROTO_DST => Some(t.dst_u.to_be_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+/// Tells if a rule has a `ct` expression, so that its table needs connection tracking.
+pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
+    exprs.iter().any(|e| matches!(e, NftExpr::Ct { .. } | NftExpr::CtSet { .. }))
 }
 
 /// Tells if the chain `target` of `table` can reach the chain `from` with jumps, so that a
@@ -560,6 +686,19 @@ fn nft_eval(
                 bytes.fetch_add(skb.len() as u64, Ordering::Relaxed);
             }
             NftExpr::Lookup { .. } => regs.verdict = NFT_BREAK,
+            NftExpr::Ct { key, dir, len, dreg } => match nft_ct_get(*key, *dir, *len, skb) {
+                Some(v) => regs.store(*dreg, &v),
+                None => regs.verdict = NFT_BREAK,
+            },
+            NftExpr::CtSet { sreg } => {
+                if let Some((ct, _)) = skb.nfct.get() {
+                    let r = &regs.data[*sreg..*sreg + 4];
+                    let v = u32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
+                    if ct.mark.load(Ordering::Relaxed) != v {
+                        ct.mark.store(v, Ordering::Relaxed);
+                    }
+                }
+            }
         },
     }
 }
@@ -612,7 +751,7 @@ pub(super) fn nft_do_chain(prog: &NftProg, policy: u32, skb: &NetBuf, state: &Nf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netfilter::{NF_ACCEPT, NF_INET_LOCAL_OUT, NFPROTO_IPV4};
+    use crate::netfilter::{NF_ACCEPT, NF_INET_LOCAL_OUT};
     use alloc::vec;
 
     const R1: usize = NFT_REG_SIZE;
@@ -673,6 +812,55 @@ mod tests {
         let c0 = vec![vec![verdict(NFT_GOTO, 1)], vec![verdict(NF_DROP, 0)]];
         let prog = NftProg { chains: vec![c0, vec![]], sets: vec![] };
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_ACCEPT);
+    }
+
+    #[test]
+    fn ct_reads_the_connection_and_sets_its_mark() {
+        use crate::netfilter::nf_conntrack::nf_conntrack_in;
+        let s = state(NFPROTO_IPV4);
+        // ct state & (new | invalid) != 0: ct mark set 7, drop for port 9.
+        let state_is = |bits: u32| {
+            vec![
+                e(NftExpr::Ct { key: NFT_CT_STATE, dir: 0, len: 4, dreg: R1 }),
+                e(NftExpr::Bitwise {
+                    sreg: R1,
+                    dreg: R1,
+                    mask: bits.to_ne_bytes().to_vec(),
+                    xor: vec![0; 4],
+                }),
+                e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_NEQ, data: vec![0; 4] }),
+            ]
+        };
+        let mut r = state_is(1 << 3);
+        r.extend([
+            e(NftExpr::Ct { key: NFT_CT_SRC, dir: 1, len: 4, dreg: R1 }),
+            e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: vec![10, 0, 0, 2] }),
+            e(NftExpr::Ct { key: NFT_CT_PROTO_DST, dir: 0, len: 2, dreg: R1 }),
+            e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: 9u16.to_be_bytes().to_vec() }),
+            e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(7u32.to_ne_bytes().to_vec()) }),
+            e(NftExpr::CtSet { sreg: R1 }),
+            verdict(NF_DROP, 0),
+        ]);
+        let mut invalid = state_is(NF_CT_STATE_INVALID_BIT);
+        invalid.push(verdict(NF_DROP, 0));
+        let prog = NftProg { chains: vec![vec![r, invalid]], sets: vec![] };
+        // No connection: the state is invalid, and the other keys break the rule.
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
+        let mut p = udp4(9);
+        p.data_mut()[3] = 28;
+        assert_eq!(nf_conntrack_in(&mut p, &s), NF_ACCEPT);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &p, &s), NF_DROP);
+        assert_eq!(p.nfct.get().unwrap().0.mark.load(Ordering::Relaxed), 7);
+        let mut q = udp4(10);
+        nf_conntrack_in(&mut q, &s);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &q, &s), NF_ACCEPT);
+        let mut regs = vec![e(NftExpr::Ct { key: NFT_CT_DIRECTION, dir: 0, len: 1, dreg: R1 })];
+        regs.extend([
+            e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: vec![0] }),
+            verdict(NF_DROP, 0),
+        ]);
+        let prog = NftProg { chains: vec![vec![regs]], sets: vec![] };
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &q, &s), NF_DROP);
     }
 
     #[test]
