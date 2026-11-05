@@ -12063,6 +12063,84 @@ static void test_nft_nat(void)
 	close(fd);
 }
 
+/* `udp dport 16-17 limit rate over 1/minute burst 2 packets log prefix "rk-nft: " drop`, with
+ * the port in the order of the host: payload, byteorder, range, limit, log. */
+static void test_nft_limit_log(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	static char klog[65537];
+	struct rtattr *x, *e, *d, *v;
+	unsigned short lo = 16, hi = 17;
+	unsigned long long rate = __builtin_bswap64(1), unit = __builtin_bswap64(60);
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "out");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	x = nft_rule(&b, "out");
+	d = nft_expr(&b, "payload", &e);
+	nft_be32(&b, RK_NFTA_PAYLOAD_DREG, RK_NFT_REG_1);
+	nft_be32(&b, RK_NFTA_PAYLOAD_BASE, RK_NFT_PAYLOAD_TRANSPORT_HEADER);
+	nft_be32(&b, RK_NFTA_PAYLOAD_OFFSET, 2);
+	nft_be32(&b, RK_NFTA_PAYLOAD_LEN, 2);
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "byteorder", &e);
+	nft_be32(&b, 1, RK_NFT_REG_1); /* NFTA_BYTEORDER_SREG */
+	nft_be32(&b, 2, RK_NFT_REG_1); /* NFTA_BYTEORDER_DREG */
+	nft_be32(&b, 3, 0);            /* NFTA_BYTEORDER_OP: NFT_BYTEORDER_NTOH */
+	nft_be32(&b, 4, 2);            /* NFTA_BYTEORDER_LEN */
+	nft_be32(&b, 5, 2);            /* NFTA_BYTEORDER_SIZE */
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "range", &e);
+	nft_be32(&b, 1, RK_NFT_REG_1); /* NFTA_RANGE_SREG */
+	nft_be32(&b, 2, 0);            /* NFTA_RANGE_OP: NFT_RANGE_EQ */
+	v = nl_put(b.cur, 3 | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &lo, 2);
+	nl_end(b.cur, v);
+	v = nl_put(b.cur, 4 | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &hi, 2);
+	nl_end(b.cur, v);
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "limit", &e);
+	nl_put(b.cur, 1, &rate, 8);  /* NFTA_LIMIT_RATE */
+	nl_put(b.cur, 2, &unit, 8);  /* NFTA_LIMIT_UNIT */
+	nft_be32(&b, 3, 2);          /* NFTA_LIMIT_BURST */
+	nft_be32(&b, 5, 1);          /* NFTA_LIMIT_FLAGS: NFT_LIMIT_F_INV */
+	nft_expr_end(&b, d, e);
+	d = nft_expr(&b, "log", &e);
+	nft_str(&b, 2, "rk-nft: "); /* NFTA_LOG_PREFIX */
+	nft_expr_end(&b, d, e);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	check("nft: a rule with byteorder, range, limit and log", nft_send(fd, &b, 1) == 0);
+	check("nft: limit over lets the burst of 2 through",
+	      nft_udp_send_port(16) == 0 && nft_udp_send_port(17) == 0);
+	check("nft: limit over drops the third packet", nft_udp_send_port(16) == EPERM);
+	check("nft: range does not match udp dport 18", nft_udp_send_port(18) == 0);
+	long n = klogctl(3, klog, sizeof(klog) - 1);
+	klog[n > 0 ? n : 0] = 0;
+	char *line = n > 0 ? strstr(klog, "rk-nft: IN= OUT=lo SRC=127.0.0.1 DST=127.0.0.1") : NULL;
+	check("nft: log writes the packet to the kernel log",
+	      line && strstr(line, "PROTO=UDP") && strstr(line, "DPT=16 LEN=9"));
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of limit goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -12082,6 +12160,7 @@ static void test_inet(int port)
 	test_nftables();
 	test_nft_exprs();
 	test_nft_nat();
+	test_nft_limit_log();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();

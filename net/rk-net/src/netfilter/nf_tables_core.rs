@@ -5,8 +5,9 @@
 //! `meta` load data of the packet, `immediate` loads a value or sets the verdict, `bitwise`
 //! masks a register, `cmp` and `lookup` end the rule when the data does not match, and
 //! `counter` counts the packets. The expressions here are `immediate`, `cmp`, `payload`,
-//! `meta`, `bitwise`, `counter` and `lookup`. Another name gives `ENOENT`, as a module that
-//! Linux cannot load.
+//! `meta`, `bitwise`, `counter`, `lookup`, `ct`, `nat` and `masq`, and in nft_exprs.rs
+//! `byteorder`, `range`, `limit` and `log`. Another name gives `ENOENT`, as a module that Linux
+//! cannot load.
 //!
 //! At the commit each base chain gets a program: its rules and the rules of the chains that it
 //! can jump to, with the keys of the sets that the rules look up. A packet takes the program
@@ -36,6 +37,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_vfs::inode::Result;
+
+#[path = "nft_exprs.rs"]
+mod nft_exprs;
+
+use self::nft_exprs::{
+    NftByteorder, NftLimit, NftLog, NftRange, nft_byteorder_eval, nft_byteorder_init,
+    nft_limit_eval, nft_limit_init, nft_log_eval, nft_log_init, nft_range_eval, nft_range_init,
+};
 
 // The attributes of an expression, `NFTA_EXPR_*`.
 const NFTA_EXPR_NAME: u32 = 1;
@@ -201,6 +210,14 @@ pub(super) enum NftExpr {
     },
     /// `masquerade`, as nft_masq.c.
     Masq { flags: u32, proto: Option<(usize, usize)> },
+    /// `byteorder`, as nft_byteorder.c.
+    Byteorder(NftByteorder),
+    /// `range`, as nft_range.c.
+    Range(NftRange),
+    /// `limit`, as nft_limit.c. The copies of the rule share the bucket.
+    Limit(Arc<NftLimit>),
+    /// `log`, as nft_log.c.
+    Log(NftLog),
 }
 
 impl NftExpr {
@@ -384,6 +401,10 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
         b"ct" => nft_ct_init(table, data),
         b"nat" => nft_nat_init(table, data),
         b"masq" => nft_masq_init(table, data),
+        b"byteorder" => Ok(NftExpr::Byteorder(nft_byteorder_init(data)?)),
+        b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
+        b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
+        b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
         _ => Err(Errno::ENOENT),
     }
 }
@@ -888,6 +909,10 @@ fn nft_eval(
                     regs.verdict = nf_nat_masquerade(ct, &r, state, skb.data());
                 }
             }
+            NftExpr::Byteorder(b) => nft_byteorder_eval(b, regs),
+            NftExpr::Range(r) => nft_range_eval(r, regs),
+            NftExpr::Limit(l) => nft_limit_eval(l, regs, skb),
+            NftExpr::Log(l) => nft_log_eval(l, skb, state),
         },
     }
 }
