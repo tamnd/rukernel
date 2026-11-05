@@ -14,10 +14,10 @@
 //! of the chain and runs it with no lock on the objects.
 
 use super::{
-    NF_DROP, NFPROTO_IPV6, NFT_BREAK, NFT_CONTINUE, NFT_DATA_VALUE_MAXLEN, NFT_GOTO, NFT_JUMP,
-    NFT_RETURN, NFT_SET_ELEM_INTERVAL_END, NFT_SET_INTERVAL, NFT_SET_MAP, NFT_SET_OBJECT,
-    NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftChainType, NftData, NftTable, be32, be64,
-    nft_set_lookup_global, nft_verdict_init,
+    NF_DROP, NFPROTO_IPV6, NFT_BREAK, NFT_CONTINUE, NFT_DATA_VALUE_MAXLEN, NFT_DATA_VERDICT,
+    NFT_GOTO, NFT_JUMP, NFT_RETURN, NFT_SET_ANONYMOUS, NFT_SET_ELEM_INTERVAL_END, NFT_SET_INTERVAL,
+    NFT_SET_MAP, NFT_SET_OBJECT, NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftChainType,
+    NftData, NftTable, be32, be64, nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
@@ -32,7 +32,7 @@ use crate::netfilter::{
     nf_pktinfo as nft_pktinfo,
 };
 use crate::netlink::msg::Attrs;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -196,8 +196,9 @@ pub(super) enum NftExpr {
     Bitwise { sreg: usize, dreg: usize, mask: Vec<u8>, xor: Vec<u8> },
     /// `counter`, as nft_counter.c. The copies of the rule share the counters.
     Counter { packets: Arc<AtomicU64>, bytes: Arc<AtomicU64> },
-    /// `lookup` in the set `set` (a handle), as nft_lookup.c.
-    Lookup { set: u64, sreg: usize, len: usize, invert: bool },
+    /// `lookup` in the set `set` (a handle), as nft_lookup.c. A lookup in a map has `dreg`, the
+    /// register that gets the data of the element; a verdict map sets the verdict.
+    Lookup { set: u64, sreg: usize, len: usize, invert: bool, dreg: Option<usize> },
     /// `ct` that loads a key of the connection of the packet, as `nft_ct_get_eval`. `dir` is
     /// the direction of the tuple for the keys of a tuple.
     Ct { key: u32, dir: usize, len: usize, dreg: usize },
@@ -390,8 +391,8 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
             }
             let s = nft_set_lookup_global(table, name, be32(&a, NFTA_LOOKUP_SET_ID)?)?;
             let set = &table.sets[s];
-            if a.has(NFTA_LOOKUP_DREG) || set.flags & (NFT_SET_MAP | NFT_SET_OBJECT) != 0 {
-                // The maps come later.
+            if set.flags & NFT_SET_OBJECT != 0 {
+                // The maps of objects come later.
                 return Err(Errno::EOPNOTSUPP);
             }
             let len = set.klen as usize;
@@ -400,12 +401,29 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
             if flags & !NFT_LOOKUP_F_INV != 0 {
                 return Err(Errno::EINVAL);
             }
-            Ok(NftExpr::Lookup {
-                set: set.handle,
-                sreg,
-                len,
-                invert: flags & NFT_LOOKUP_F_INV != 0,
-            })
+            let invert = flags & NFT_LOOKUP_F_INV != 0;
+            let dreg = match be32(&a, NFTA_LOOKUP_DREG)? {
+                Some(_) if invert || set.flags & NFT_SET_MAP == 0 => return Err(Errno::EINVAL),
+                // A verdict map stores in the register of the verdict, and only there, as
+                // `nft_validate_register_store` of Linux.
+                Some(r) if set.dtype == NFT_DATA_VERDICT => {
+                    if r != NFT_REG_VERDICT {
+                        return Err(Errno::EINVAL);
+                    }
+                    Some(0)
+                }
+                Some(NFT_REG_VERDICT) => return Err(Errno::EINVAL),
+                Some(_) => Some(nft_parse_register(&a, NFTA_LOOKUP_DREG, set.dlen as usize)?),
+                // A lookup of the keys of a map: it makes no sense for an anonymous map, that
+                // only the rule uses.
+                None if set.flags & (NFT_SET_MAP | NFT_SET_ANONYMOUS)
+                    == NFT_SET_MAP | NFT_SET_ANONYMOUS =>
+                {
+                    return Err(Errno::EINVAL);
+                }
+                None => None,
+            };
+            Ok(NftExpr::Lookup { set: set.handle, sreg, len, invert, dreg })
         }
         b"ct" => nft_ct_init(table, data),
         b"nat" => nft_nat_init(table, data),
@@ -668,9 +686,28 @@ pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
     })
 }
 
+/// The chains that the expression `e` of `table` can jump to: the chain of a verdict, and the
+/// chains of the verdicts of a verdict map.
+pub(super) fn nft_expr_targets(table: &NftTable, e: &NftExpr) -> Vec<u64> {
+    match e {
+        NftExpr::Lookup { set, dreg: Some(_), .. } => table
+            .sets
+            .iter()
+            .filter(|s| s.handle == *set)
+            .flat_map(|s| s.elems.values())
+            .filter_map(|el| match el.data {
+                Some(NftData::Verdict { chain, .. }) => chain,
+                _ => None,
+            })
+            .collect(),
+        e => e.jump_target().into_iter().collect(),
+    }
+}
+
 /// Tells if the chain `target` of `table` can reach the chain `from` with jumps, so that a
 /// jump from `from` to `target` makes a loop, as `nf_tables_check_loops` of Linux. A jump
-/// stack deeper than `NFT_JUMP_STACK_SIZE` also gives `ELOOP`.
+/// stack deeper than `NFT_JUMP_STACK_SIZE` also gives `ELOOP`. The jumps of the verdict maps
+/// count.
 pub(super) fn nft_check_loops(table: &NftTable, from: u64, target: u64) -> Result<()> {
     fn walk(table: &NftTable, from: u64, at: u64, depth: usize) -> Result<()> {
         if at == from || depth >= NFT_JUMP_STACK_SIZE {
@@ -678,8 +715,10 @@ pub(super) fn nft_check_loops(table: &NftTable, from: u64, target: u64) -> Resul
         }
         let Some(chain) = table.chains.iter().find(|c| c.handle == at) else { return Ok(()) };
         for r in &chain.rules {
-            for t in r.parsed.iter().filter_map(NftExpr::jump_target) {
-                walk(table, from, t, depth + 1)?;
+            for e in &r.parsed {
+                for t in nft_expr_targets(table, e) {
+                    walk(table, from, t, depth + 1)?;
+                }
             }
         }
         Ok(())
@@ -692,26 +731,45 @@ pub(super) fn nft_check_loops(table: &NftTable, from: u64, target: u64) -> Resul
 enum ProgExpr {
     Expr(NftExpr),
     Verdict { code: u32, chain: usize },
-    Lookup { set: usize, sreg: usize, len: usize, invert: bool },
+    Lookup { set: usize, sreg: usize, len: usize, invert: bool, dreg: Option<usize> },
 }
 
-/// The keys of a set, for `lookup`.
+/// The data of an element of a set in a program.
+#[derive(Clone, Debug, Default)]
+enum ProgData {
+    /// An element of a set, or of a map that the rule looks up with no register.
+    #[default]
+    None,
+    /// The value of an element of a map.
+    Value(Vec<u8>),
+    /// The verdict of an element of a verdict map, with the chain as an index in the program.
+    Verdict { code: u32, chain: usize },
+}
+
+/// The elements of a set, for `lookup`.
 #[derive(Debug, Default)]
 struct ProgSet {
-    keys: BTreeSet<Vec<u8>>,
-    /// The ranges of a set with `NFT_SET_INTERVAL`: the start, the end, and if the range has
-    /// its end.
-    ranges: Vec<(Vec<u8>, Vec<u8>, bool)>,
-    catchall: bool,
+    keys: BTreeMap<Vec<u8>, ProgData>,
+    /// The ranges of a set with `NFT_SET_INTERVAL`: the start, the end, if the range has its
+    /// end, and the data.
+    ranges: Vec<(Vec<u8>, Vec<u8>, bool, ProgData)>,
+    /// The catch-all element, for a key that no other element has.
+    catchall: Option<ProgData>,
 }
 
 impl ProgSet {
-    fn contains(&self, key: &[u8]) -> bool {
-        self.catchall
-            || self.keys.contains(key)
-            || self.ranges.iter().any(|(s, e, with_end)| {
-                s.as_slice() <= key && (key < e.as_slice() || (*with_end && key == e.as_slice()))
+    /// The data of the element of `key`, as the `lookup` of the backends of sets of Linux.
+    fn find(&self, key: &[u8]) -> Option<&ProgData> {
+        self.keys
+            .get(key)
+            .or_else(|| {
+                self.ranges.iter().find_map(|(s, e, with_end, d)| {
+                    let inside = s.as_slice() <= key
+                        && (key < e.as_slice() || (*with_end && key == e.as_slice()));
+                    inside.then_some(d)
+                })
             })
+            .or(self.catchall.as_ref())
     }
 }
 
@@ -724,39 +782,72 @@ pub(super) struct NftProg {
     nat: bool,
 }
 
-/// The keys of the set `s` of `table`.
-fn prog_set(table: &NftTable, s: usize) -> ProgSet {
+impl NftProg {
+    /// The number of rules of each chain of the program.
+    #[cfg(test)]
+    pub(super) fn rules_of_chains(&self) -> Vec<usize> {
+        self.chains.iter().map(Vec::len).collect()
+    }
+}
+
+/// The chains of a program that is made: their indexes, and the chains that still need their
+/// rules.
+struct ProgChains {
+    at: BTreeMap<u64, usize>,
+    todo: Vec<u64>,
+}
+
+impl ProgChains {
+    /// The index of the chain `h` in the program.
+    fn index(&mut self, h: u64) -> usize {
+        let next = self.at.len();
+        *self.at.entry(h).or_insert_with(|| {
+            self.todo.push(h);
+            next
+        })
+    }
+}
+
+/// The elements of the set `s` of `table`.
+fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
     let set = &table.sets[s];
     let mut p = ProgSet::default();
+    let mut data = |e: &super::NftElem| match &e.data {
+        Some(NftData::Value(v)) => ProgData::Value(v.clone()),
+        Some(NftData::Verdict { code, chain }) => {
+            ProgData::Verdict { code: *code, chain: chain.map_or(0, |h| chains.index(h)) }
+        }
+        None => ProgData::None,
+    };
     if set.flags & NFT_SET_INTERVAL != 0 {
         // The elements are in the order of the keys: a start, then the element with
         // `NFT_SET_ELEM_INTERVAL_END` that ends the range. A start with `NFTA_SET_ELEM_KEY_END`
-        // is a range with its end.
-        let mut start: Option<&Vec<u8>> = None;
+        // is a range with its end. The start has the data of the range.
+        let mut start: Option<(&Vec<u8>, ProgData)> = None;
         for (k, e) in &set.elems {
             if k.catchall {
-                p.catchall = true;
+                p.catchall = Some(data(e));
             } else if k.end || e.flags & NFT_SET_ELEM_INTERVAL_END != 0 {
-                if let Some(s) = start.take() {
-                    p.ranges.push((s.clone(), k.key.clone(), false));
+                if let Some((s, d)) = start.take() {
+                    p.ranges.push((s.clone(), k.key.clone(), false, d));
                 }
             } else if let Some(end) = &e.key_end {
-                p.ranges.push((k.key.clone(), end.clone(), true));
+                p.ranges.push((k.key.clone(), end.clone(), true, data(e)));
                 start = None;
             } else {
-                start = Some(&k.key);
+                start = Some((&k.key, data(e)));
             }
         }
         // A start with no end goes to the last key.
-        if let Some(s) = start {
-            p.ranges.push((s.clone(), alloc::vec![0xff; s.len()], true));
+        if let Some((s, d)) = start {
+            p.ranges.push((s.clone(), alloc::vec![0xff; s.len()], true, d));
         }
     } else {
-        for k in set.elems.keys() {
+        for (k, e) in &set.elems {
             if k.catchall {
-                p.catchall = true;
+                p.catchall = Some(data(e));
             } else {
-                p.keys.insert(k.key.clone());
+                p.keys.insert(k.key.clone(), data(e));
             }
         }
     }
@@ -770,12 +861,10 @@ pub(super) fn nft_prog(table: &NftTable, c: usize) -> NftProg {
         nat: table.chains[c].base.as_ref().is_some_and(|b| b.ty.nat),
         ..NftProg::default()
     };
-    let mut chain_at: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut chains = ProgChains { at: BTreeMap::new(), todo: Vec::new() };
+    chains.index(table.chains[c].handle);
     let mut set_at: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut todo = alloc::vec![table.chains[c].handle];
-    chain_at.insert(table.chains[c].handle, 0);
-    prog.chains.push(Vec::new());
-    while let Some(h) = todo.pop() {
+    while let Some(h) = chains.todo.pop() {
         let Some(chain) = table.chains.iter().find(|ch| ch.handle == h) else { continue };
         let mut rules = Vec::with_capacity(chain.rules.len());
         for r in &chain.rules {
@@ -784,32 +873,32 @@ pub(super) fn nft_prog(table: &NftTable, c: usize) -> NftProg {
                 out.push(match e {
                     NftExpr::Immediate {
                         data: NftImm::Verdict { code, chain: Some(t) }, ..
-                    } => {
-                        let next = prog.chains.len() + todo.len();
-                        let at = *chain_at.entry(*t).or_insert_with(|| {
-                            todo.push(*t);
-                            next
-                        });
-                        ProgExpr::Verdict { code: *code, chain: at }
-                    }
-                    NftExpr::Lookup { set, sreg, len, invert } => {
+                    } => ProgExpr::Verdict { code: *code, chain: chains.index(*t) },
+                    NftExpr::Lookup { set, sreg, len, invert, dreg } => {
                         let at = match set_at.get(set) {
                             Some(&at) => at,
                             None => {
                                 let s = table.sets.iter().position(|s| s.handle == *set);
-                                prog.sets.push(s.map(|s| prog_set(table, s)).unwrap_or_default());
+                                let p = s.map(|s| prog_set(table, s, &mut chains));
+                                prog.sets.push(p.unwrap_or_default());
                                 set_at.insert(*set, prog.sets.len() - 1);
                                 prog.sets.len() - 1
                             }
                         };
-                        ProgExpr::Lookup { set: at, sreg: *sreg, len: *len, invert: *invert }
+                        ProgExpr::Lookup {
+                            set: at,
+                            sreg: *sreg,
+                            len: *len,
+                            invert: *invert,
+                            dreg: *dreg,
+                        }
                     }
                     e => ProgExpr::Expr(e.clone()),
                 });
             }
             rules.push(out);
         }
-        let at = chain_at[&h];
+        let at = chains.at[&h];
         if at >= prog.chains.len() {
             prog.chains.resize_with(at + 1, Vec::new);
         }
@@ -849,10 +938,19 @@ fn nft_eval(
             regs.verdict = *code;
             regs.chain = *chain;
         }
-        ProgExpr::Lookup { set, sreg, len, invert } => {
-            let found = prog.sets[*set].contains(&regs.data[*sreg..*sreg + *len]);
-            if found == *invert {
+        ProgExpr::Lookup { set, sreg, len, invert, dreg } => {
+            let found = prog.sets[*set].find(&regs.data[*sreg..*sreg + *len]);
+            if found.is_some() == *invert {
                 regs.verdict = NFT_BREAK;
+                return;
+            }
+            match (found, dreg) {
+                (Some(ProgData::Value(v)), Some(dreg)) => regs.store(*dreg, v),
+                (Some(&ProgData::Verdict { code, chain }), Some(_)) => {
+                    regs.verdict = code;
+                    regs.chain = chain;
+                }
+                _ => {}
             }
         }
         ProgExpr::Expr(e) => match e {
@@ -1160,14 +1258,22 @@ mod tests {
 
         // udp dport in { 5-9 }, and not in { 7 } with NFT_LOOKUP_F_INV.
         let range = ProgSet {
-            ranges: vec![(5u16.to_be_bytes().to_vec(), 9u16.to_be_bytes().to_vec(), true)],
+            ranges: vec![(
+                5u16.to_be_bytes().to_vec(),
+                9u16.to_be_bytes().to_vec(),
+                true,
+                ProgData::None,
+            )],
             ..ProgSet::default()
         };
-        let seven = ProgSet { keys: [7u16.to_be_bytes().to_vec()].into(), ..ProgSet::default() };
+        let seven = ProgSet {
+            keys: [(7u16.to_be_bytes().to_vec(), ProgData::None)].into(),
+            ..ProgSet::default()
+        };
         let mut r = dport(0);
         r.pop();
-        r.push(ProgExpr::Lookup { set: 0, sreg: R1, len: 2, invert: false });
-        r.push(ProgExpr::Lookup { set: 1, sreg: R1, len: 2, invert: true });
+        r.push(ProgExpr::Lookup { set: 0, sreg: R1, len: 2, invert: false, dreg: None });
+        r.push(ProgExpr::Lookup { set: 1, sreg: R1, len: 2, invert: true, dreg: None });
         r.push(verdict(NF_DROP, 0));
         let prog = NftProg { chains: vec![vec![r]], sets: vec![range, seven], nat: false };
         let v: Vec<u32> = [4, 5, 7, 9, 10]
@@ -1175,6 +1281,56 @@ mod tests {
             .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &udp4(p), &s))
             .collect();
         assert_eq!(v, [NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_DROP, NF_ACCEPT]);
+    }
+
+    #[test]
+    fn a_map_loads_the_data_and_a_verdict_map_sets_the_verdict() {
+        let s = state(NFPROTO_IPV4);
+        const R2: usize = 2 * NFT_REG_SIZE;
+        // udp dport map { 7 : 70, 8 : 80 } in R2, R2 == 80: drop.
+        let map = ProgSet {
+            keys: [
+                (7u16.to_be_bytes().to_vec(), ProgData::Value(70u16.to_be_bytes().to_vec())),
+                (8u16.to_be_bytes().to_vec(), ProgData::Value(80u16.to_be_bytes().to_vec())),
+            ]
+            .into(),
+            ..ProgSet::default()
+        };
+        // udp dport vmap { 1-3 : jump c1, 9 : accept, * : goto c2 }.
+        let vmap = ProgSet {
+            keys: [(9u16.to_be_bytes().to_vec(), ProgData::Verdict { code: NF_ACCEPT, chain: 0 })]
+                .into(),
+            ranges: vec![(
+                1u16.to_be_bytes().to_vec(),
+                3u16.to_be_bytes().to_vec(),
+                true,
+                ProgData::Verdict { code: NFT_JUMP, chain: 1 },
+            )],
+            catchall: Some(ProgData::Verdict { code: NFT_GOTO, chain: 2 }),
+        };
+        let mut r0 = dport(0);
+        r0.pop();
+        r0.push(ProgExpr::Lookup { set: 0, sreg: R1, len: 2, invert: false, dreg: Some(R2) });
+        r0.push(e(NftExpr::Cmp { sreg: R2, op: NFT_CMP_EQ, data: 80u16.to_be_bytes().to_vec() }));
+        r0.push(verdict(NF_DROP, 0));
+        let mut r1 = dport(0);
+        r1.pop();
+        r1.push(ProgExpr::Lookup { set: 1, sreg: R1, len: 2, invert: false, dreg: Some(0) });
+        // c1 drops port 2 and returns, c2 drops all.
+        let mut c1 = dport(2);
+        c1.push(verdict(NF_DROP, 0));
+        let c2 = vec![verdict(NF_DROP, 0)];
+        let prog = NftProg {
+            chains: vec![vec![r0, r1, vec![verdict(NF_ACCEPT, 0)]], vec![c1], vec![c2]],
+            sets: vec![map, vmap],
+            nat: false,
+        };
+        let v: Vec<u32> = [7, 8, 1, 2, 9, 5]
+            .iter()
+            .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &udp4(p), &s))
+            .collect();
+        // 7 matches no element of the vmap and takes the catch-all.
+        assert_eq!(v, [NF_DROP, NF_DROP, NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_DROP]);
     }
 
     #[test]
