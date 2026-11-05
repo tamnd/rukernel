@@ -1,8 +1,9 @@
 //! Process file descriptors: `pidfd_open`, `pidfd_send_signal` and `pidfd_getfd`, and pidfs,
 //! the file system of their inodes.
 //!
-//! A process file descriptor refers to one process. `poll` gives `POLLIN` when the process
-//! ended. This is the model of kernel/pid.c and kernel/fork.c of Linux.
+//! A process file descriptor refers to one process, or to one thread with `PIDFD_THREAD`. `poll`
+//! gives `POLLIN` when the process or the thread ended, and `POLLHUP` too when it has gone. This
+//! is the model of kernel/pid.c and kernel/fork.c of Linux.
 //!
 //! Each descriptor has an inode in the one internal mount of pidfs, as fs/pidfs.c of Linux. The
 //! inode number is the serial number of the process, which no other process of the boot has, so
@@ -20,8 +21,8 @@ use rk_abi::native::open::{
 };
 use rk_frame::sync::Once;
 use rk_proc::pid_namespace;
-use rk_proc::signal::{NSIG, SI_USER, SIGINFO_SIZE, SigInfo};
-use rk_proc::{Pid, Process};
+use rk_proc::signal::{NSIG, SI_TKILL, SI_USER, SIGINFO_SIZE, SigInfo};
+use rk_proc::{Pid, Process, Thread, WaitStatus};
 use rk_vfs::Location;
 use rk_vfs::file::{File, FileOps, events};
 use rk_vfs::inode::{Inode, InodeRef, Metadata, SetAttr, mode};
@@ -31,8 +32,17 @@ use zerocopy::{Immutable, IntoBytes};
 
 /// `PIDFD_NONBLOCK`: a wait for the process does not block.
 const PIDFD_NONBLOCK: u32 = O_NONBLOCK;
-/// `PIDFD_THREAD`: the descriptor refers to a thread. rukernel gives the process of the thread.
+/// `PIDFD_THREAD`: the descriptor refers to a thread.
 const PIDFD_THREAD: u32 = O_EXCL;
+/// The flags of `pidfd_send_signal`: the signal goes to the thread, to the process, or to the
+/// process group of the ID of the descriptor.
+const PIDFD_SIGNAL_THREAD: u64 = 1 << 0;
+const PIDFD_SIGNAL_THREAD_GROUP: u64 = 1 << 1;
+const PIDFD_SIGNAL_PROCESS_GROUP: u64 = 1 << 2;
+/// The descriptors `PIDFD_SELF_THREAD` and `PIDFD_SELF_THREAD_GROUP` of `pidfd_send_signal`:
+/// the calling thread and its process.
+const PIDFD_SELF_THREAD: i32 = -10000;
+const PIDFD_SELF_THREAD_GROUP: i32 = -10001;
 
 /// `PID_FS_MAGIC` of include/uapi/linux/magic.h.
 pub(crate) const PID_FS_MAGIC: u64 = 0x5049_4446;
@@ -118,9 +128,39 @@ pub(crate) fn in_pidfs(at: &Location) -> bool {
     Arc::ptr_eq(&at.mount, &root().mount)
 }
 
-/// The operations of a process file descriptor.
+/// The operations of a process file descriptor. A descriptor with `PIDFD_THREAD` of a thread that
+/// is not the leader of its process has the thread, as a pidfd of a task that is not a thread
+/// group leader in Linux. A descriptor of the leader waits for the process, also with
+/// `PIDFD_THREAD`, as `delay_group_leader` of Linux.
 struct PidFd {
     process: Arc<Process>,
+    thread: Option<Arc<Thread>>,
+    /// The descriptor has `PIDFD_THREAD`, so a signal goes to the thread by default.
+    per_thread: bool,
+}
+
+impl PidFd {
+    /// The ID of the thread or the process.
+    fn pid(&self) -> Pid {
+        self.thread.as_ref().map_or(self.process.pid(), |t| t.tid())
+    }
+
+    /// The thread or the process has gone: the thread ended, or the parent reaped the process.
+    /// Linux releases a thread that is not the leader at its exit, as `release_task`.
+    fn gone(&self) -> bool {
+        match &self.thread {
+            Some(t) => t.exit_status().is_some(),
+            None => reaped(&self.process),
+        }
+    }
+
+    /// The status of the exit of the thread or the process, after it ended.
+    fn exit_status(&self) -> Option<WaitStatus> {
+        match &self.thread {
+            Some(t) => t.exit_status(),
+            None => self.process.exit_status(),
+        }
+    }
 }
 
 /// Tells if the parent reaped `process`, so that it is not in the table of the processes.
@@ -137,31 +177,40 @@ impl FileOps for PidFd {
         table.add(self.process.exit_poll());
     }
 
+    /// `POLLIN` when the thread or the process ended, and `POLLHUP` too after it has gone, as
+    /// `pidfd_poll` of Linux. The leader of a process that ended before its other threads gives
+    /// nothing until the process ends.
     fn poll(&self, _file: &File) -> u32 {
-        if self.process.is_zombie() { events::POLLIN } else { 0 }
+        if self.gone() {
+            events::POLLIN | events::POLLHUP
+        } else if self.thread.is_none() && self.process.is_zombie() {
+            events::POLLIN
+        } else {
+            0
+        }
     }
 
     fn as_any(&self) -> Option<&dyn Any> {
         Some(self)
     }
 
-    /// The ID of the process in the PID namespace of the reader, or 0 if the reader does not
-    /// see it, or -1 after the parent reaped it, as `pidfd_show_fdinfo` of Linux. `NSpid` gives
-    /// the ID in each namespace from the namespace of the reader down to the namespace of the
-    /// process.
+    /// The ID of the process or the thread in the PID namespace of the reader, or 0 if the
+    /// reader does not see it, or -1 after it has gone, as `pidfd_show_fdinfo` of Linux. `NSpid`
+    /// gives the ID in each namespace from the namespace of the reader down to the namespace of
+    /// the process.
     fn fdinfo(&self, _file: &File) -> Vec<u8> {
         let p = &self.process;
-        if reaped(p) {
+        if self.gone() {
             return b"Pid:\t-1\nNSpid:\t-1\n".to_vec();
         }
         let viewer = rk_proc::current_thread().map(|t| t.process().clone());
         let ns = viewer.as_ref().and_then(|v| v.pid_ns().cloned());
-        let nr = pid_namespace::pid_nr_ns(p.pid(), ns.as_ref());
+        let nr = pid_namespace::pid_nr_ns(self.pid(), ns.as_ref());
         let mut out = format!("Pid:\t{nr}\nNSpid:");
         if nr == 0 {
             out.push_str("\t0");
         } else {
-            for n in pid_namespace::numbers(p.pid(), p.pid_ns(), ns.as_ref()) {
+            for n in pid_namespace::numbers(self.pid(), p.pid_ns(), ns.as_ref()) {
                 out.push_str(&format!("\t{n}"));
             }
         }
@@ -172,11 +221,12 @@ impl FileOps for PidFd {
 
 /// Makes the file of a process file descriptor for `process`, with a new dentry of its inode in
 /// the mount of pidfs, as `pidfs_alloc_file` of Linux.
-fn new_file(process: Arc<Process>, flags: u32) -> Arc<File> {
+fn new_file(process: Arc<Process>, thread: Option<Arc<Thread>>, flags: u32) -> Arc<File> {
     let root = root();
     let inode: InodeRef = Arc::new(PidfsInode { ino: process.serial() });
     let at = Location { mount: root.mount.clone(), dentry: root.dentry.tmp_child(inode, false) };
-    File::with_ops(Arc::new(PidFd { process }), Some(at), O_RDWR | flags)
+    let per_thread = flags & PIDFD_THREAD != 0;
+    File::with_ops(Arc::new(PidFd { process, thread, per_thread }), Some(at), O_RDWR | flags)
 }
 
 /// Makes a process file descriptor for `process`, for `pidfd_open` and `CLONE_PIDFD`. The
@@ -186,7 +236,7 @@ fn new_file(process: Arc<Process>, flags: u32) -> Arc<File> {
 ///
 /// Gives `EMFILE` if the table is full.
 pub(crate) fn open(cx: &Cx<'_>, process: Arc<Process>, flags: u32) -> Result<i32, Errno> {
-    cx.files()?.lock().insert(new_file(process, flags), true)
+    cx.files()?.lock().insert(new_file(process, None, flags), true)
 }
 
 /// `open_by_handle_at` of a handle of pidfs, as `pidfs_export_operations` of Linux. The handle
@@ -210,7 +260,7 @@ pub(crate) fn open_by_handle(cx: &Cx<'_>, ty: i32, words: &[u32], flags: u32) ->
     if !rk_proc::pid_namespace::is_descendant(process.pid_ns(), cx.process().pid_ns()) {
         return Err(Errno::ESTALE);
     }
-    let file = new_file(process, flags & (O_NONBLOCK | O_EXCL));
+    let file = new_file(process, None, flags & (O_NONBLOCK | O_EXCL));
     Ok(cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)? as u64)
 }
 
@@ -272,15 +322,16 @@ fn coredump_mask(dumpable: u8) -> u32 {
 
 /// `PIDFD_GET_INFO`: the IDs, the credentials, the cgroup and the exit status of the process,
 /// as `pidfd_info` in fs/pidfs.c of Linux. `size` is the size of the structure of the caller.
-/// The exit status is there only after the parent reaped the process, and the IDs and the
-/// credentials only before.
+/// The exit status is there only after the process or the thread has gone, and the IDs and the
+/// credentials only before. A descriptor of a thread gives the ID of the thread in `pid`.
 ///
 /// # Errors
 ///
 /// Gives `EINVAL` for a structure smaller than the first version, `EREMOTE` for a process out of
 /// the PID namespace of the caller, and `ESRCH` for a reaped process without `PIDFD_INFO_EXIT`
 /// in the mask.
-fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysResult {
+fn get_info(cx: &Cx<'_>, pidfd: &PidFd, size: usize, arg: u64) -> SysResult {
+    let process = &pidfd.process;
     if arg == 0 || size < PIDFD_INFO_SIZE_VER0 {
         return Err(Errno::EINVAL);
     }
@@ -291,8 +342,8 @@ fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysRe
         return Err(Errno::EREMOTE);
     }
     let mut info = PidfdInfo::default();
-    let gone = reaped(process);
-    let status = process.exit_status();
+    let gone = pidfd.gone();
+    let status = pidfd.exit_status();
     if mask & PIDFD_INFO_EXIT != 0
         && gone
         && let Some(status) = status
@@ -330,12 +381,12 @@ fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysRe
         }
         // The IDs in the PID namespace of the caller, as `pidfd_info` of Linux. A process that
         // the caller does not see gives `ESRCH`.
-        info.pid = cx.vnr(process.pid());
+        info.pid = cx.vnr(pidfd.pid());
         if info.pid == 0 {
             return Err(Errno::ESRCH);
         }
         info.ppid = cx.vnr(process.ppid());
-        info.tgid = info.pid;
+        info.tgid = cx.vnr(process.pid());
         info.mask |= PIDFD_INFO_PID;
     }
     // The caller gets the part of the structure that it knows, and zeros after the part that
@@ -373,7 +424,7 @@ pub(crate) fn ioctl(cx: &Cx<'_>, file: &File, cmd: u32, arg: u64) -> Option<SysR
         return Some(Err(Errno::ENOTTY));
     }
     if nr == PIDFD_GET_INFO_NR {
-        return Some(get_info(cx, process, ((cmd >> 16) & 0x3fff) as usize, arg));
+        return Some(get_info(cx, pidfd, ((cmd >> 16) & 0x3fff) as usize, arg));
     }
     use rk_vfs::nsfs::NsKind;
     let kind = match cmd {
@@ -444,19 +495,41 @@ pub(crate) fn process_of(cx: &Cx<'_>, fd: u64) -> Result<Arc<Process>, Errno> {
     Ok(pidfd.process.clone())
 }
 
-/// The process of `fd` for `pidfd_send_signal`: a process file descriptor, or a directory
-/// `/proc/PID` of a process, as `pidfd_to_pid` and `tgid_pidfd_to_pid` of Linux.
+/// The scope of a signal of `pidfd_send_signal`, as `enum pid_type` of Linux.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// One thread, as `PIDTYPE_PID`.
+    Thread,
+    /// The process, as `PIDTYPE_TGID`.
+    Process,
+    /// The process group, as `PIDTYPE_PGID`.
+    Group,
+}
+
+/// The target of `pidfd_send_signal`: the process, the thread of a descriptor of a thread that
+/// is not the leader, and the scope that the descriptor gives.
+type SignalTarget = (Arc<Process>, Option<Arc<Thread>>, Scope);
+
+/// The target of `fd` for `pidfd_send_signal`: `PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP`,
+/// a process file descriptor, or a directory `/proc/PID` of a process, as `pidfd_to_pid` and
+/// `tgid_pidfd_to_pid` of Linux. A descriptor with `PIDFD_THREAD` gives the scope of a thread.
 ///
 /// # Errors
 ///
 /// Gives `EBADF` for another file, and `ESRCH` if the process of the directory ended.
-fn signal_target_of(cx: &Cx<'_>, fd: u64) -> Result<Arc<Process>, Errno> {
+fn signal_target_of(cx: &Cx<'_>, fd: u64) -> Result<SignalTarget, Errno> {
     /// `PROC_SUPER_MAGIC` of include/uapi/linux/magic.h.
     const PROC_SUPER_MAGIC: u64 = 0x9fa0;
-    if let Ok(process) = process_of(cx, fd) {
-        return Ok(process);
+    match fd as i32 {
+        PIDFD_SELF_THREAD => return Ok((cx.process().clone(), self_thread(cx), Scope::Thread)),
+        PIDFD_SELF_THREAD_GROUP => return Ok((cx.process().clone(), None, Scope::Process)),
+        _ => {}
     }
     let file = cx.file(fd)?;
+    if let Some(pidfd) = file.ops().as_any().and_then(|a| a.downcast_ref::<PidFd>()) {
+        let scope = if pidfd.per_thread { Scope::Thread } else { Scope::Process };
+        return Ok((pidfd.process.clone(), pidfd.thread.clone(), scope));
+    }
     let at = file.location().ok_or(Errno::EBADF)?;
     let inode = at.inode();
     let is_dir =
@@ -474,7 +547,13 @@ fn signal_target_of(cx: &Cx<'_>, fd: u64) -> Result<Arc<Process>, Errno> {
     if inode.stale() {
         return Err(Errno::ESRCH);
     }
-    rk_proc::find_process(pid).ok_or(Errno::ESRCH)
+    Ok((rk_proc::find_process(pid).ok_or(Errno::ESRCH)?, None, Scope::Process))
+}
+
+/// The calling thread, if it is not the leader of its process. The leader stands for the
+/// process in `SignalTarget`.
+fn self_thread(cx: &Cx<'_>) -> Option<Arc<Thread>> {
+    (cx.thread.tid() != cx.process().pid()).then(|| cx.thread.clone())
 }
 
 pub(crate) fn pidfd_open(cx: &Cx<'_>, pid: u64, flags: u64) -> SysResult {
@@ -484,18 +563,28 @@ pub(crate) fn pidfd_open(cx: &Cx<'_>, pid: u64, flags: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let pid = cx.find_vpid(pid as u64).ok_or(Errno::ESRCH)?;
-    let process = match rk_proc::find_process(pid) {
-        Some(p) => p,
-        // The ID of a thread that is not the leader gives `ENOENT`, as in Linux.
+    let (process, thread) = match rk_proc::find_process(pid) {
+        Some(p) => (p, None),
+        // The ID of a thread that is not the leader gives `ENOENT` without `PIDFD_THREAD`, as in
+        // Linux.
         None => match rk_proc::find_thread(pid) {
-            Some(t) if flags & PIDFD_THREAD != 0 => t.process().clone(),
+            Some(t) if flags & PIDFD_THREAD != 0 => (t.process().clone(), Some(t)),
             Some(_) => return Err(Errno::ENOENT),
             None => return Err(Errno::ESRCH),
         },
     };
-    Ok(open(cx, process, flags & PIDFD_NONBLOCK)? as u64)
+    let file = new_file(process, thread, flags & (PIDFD_NONBLOCK | PIDFD_THREAD));
+    Ok(cx.files()?.lock().insert(file, true)? as u64)
 }
 
+/// Sends a signal to the thread, the process or the process group of a process file descriptor,
+/// as `pidfd_send_signal` in kernel/signal.c of Linux. `flags` can give one scope. Without it,
+/// a descriptor with `PIDFD_THREAD` sends to the thread, and another one to the process.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for an unknown flag, more than one flag or a bad signal, `ESRCH` if the thread
+/// or the process ended, and `EPERM` for a `siginfo_t` of the kernel to another thread.
 pub(crate) fn pidfd_send_signal(
     cx: &Cx<'_>,
     fd: u64,
@@ -503,15 +592,27 @@ pub(crate) fn pidfd_send_signal(
     uinfo: u64,
     flags: u64,
 ) -> SysResult {
-    if flags != 0 || sig > u64::from(NSIG) {
+    let scopes = PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP | PIDFD_SIGNAL_PROCESS_GROUP;
+    if flags & !scopes != 0 || flags.count_ones() > 1 || sig > u64::from(NSIG) {
         return Err(Errno::EINVAL);
     }
-    let process = signal_target_of(cx, fd)?;
-    if process.is_zombie() {
+    let (process, thread, scope) = signal_target_of(cx, fd)?;
+    let scope = match flags {
+        PIDFD_SIGNAL_THREAD => Scope::Thread,
+        PIDFD_SIGNAL_THREAD_GROUP => Scope::Process,
+        PIDFD_SIGNAL_PROCESS_GROUP => Scope::Group,
+        _ => scope,
+    };
+    // The ID of the descriptor: the thread, or the leader of the process.
+    let id = thread.as_ref().map_or(process.pid(), |t| t.tid());
+    // A thread that ended has gone, as the task of a thread that is not the leader in Linux.
+    if thread.as_ref().is_some_and(|t| t.exit_status().is_some()) {
         return Err(Errno::ESRCH);
     }
     let info = if uinfo == 0 {
-        let mut info = SigInfo::new(sig as u32, SI_USER, cx.process().pid());
+        // As `prepare_kill_siginfo` of Linux.
+        let code = if scope == Scope::Thread { SI_TKILL } else { SI_USER };
+        let mut info = SigInfo::new(sig as u32, code, cx.process().pid());
         info.uid = cx.process().cred().uid;
         info
     } else {
@@ -519,20 +620,39 @@ pub(crate) fn pidfd_send_signal(
         let mut raw = [0u8; SIGINFO_SIZE];
         raw.copy_from_slice(&b);
         let mut info = SigInfo::from_bytes(&raw);
-        // As `rt_sigqueueinfo`: only the kernel sends a signal with a code of 0 or more to
-        // another process.
         if info.signo != sig as u32 {
             return Err(Errno::EINVAL);
         }
-        if info.code >= 0 && !Arc::ptr_eq(&process, cx.process()) {
+        // As `rt_sigqueueinfo`: only the kernel and `kill` send a signal with a code of 0 or
+        // more, or `SI_TKILL`, to another thread than the caller, or to a process group.
+        let to_self = id == cx.thread.tid() && scope != Scope::Group;
+        if (info.code >= 0 || info.code == SI_TKILL) && !to_self {
             return Err(Errno::EPERM);
         }
         info.signo = sig as u32;
         info
     };
+    if scope == Scope::Group {
+        // The group with the ID of the descriptor, as `kill_pgrp_info` of Linux.
+        crate::signal::kill_group(cx, id, info)?;
+        return Ok(0);
+    }
+    if process.is_zombie() {
+        return Err(Errno::ESRCH);
+    }
     // The permission of `kill`, as `check_kill_permission` in kernel/signal.c of Linux.
     crate::signal::may_signal(cx, &process, sig as u32)?;
-    if sig != 0 {
+    if sig == 0 {
+        return Ok(0);
+    }
+    if scope == Scope::Thread {
+        // The leader of a process that has other threads can end before them.
+        let thread = match thread {
+            Some(t) => t,
+            None => rk_proc::find_thread(process.pid()).ok_or(Errno::ESRCH)?,
+        };
+        thread.send_signal(info);
+    } else {
         rk_proc::send_signal(&process, info);
     }
     Ok(0)

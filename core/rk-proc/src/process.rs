@@ -372,6 +372,9 @@ pub struct Thread {
     /// The PID namespace of the new children of the thread, or `None` for the first one, as
     /// `nsproxy->pid_ns_for_children` of Linux.
     pid_children: SpinLock<Option<Arc<PidNamespace>>>,
+    /// The status of the exit of the thread, after it ended, for `PIDFD_INFO_EXIT` of a pidfd of
+    /// the thread.
+    exit: SpinLock<Option<WaitStatus>>,
 }
 
 /// The task goes away, as `security_task_free` in `__put_task_struct` of Linux.
@@ -587,6 +590,8 @@ pub fn find_process_by_vpid(viewer: &Process, nr: Pid) -> Option<Arc<Process>> {
 /// namespace init that waits for the processes of its namespace to go then looks again.
 fn release_process(process: &Process) {
     TABLE.lock().processes.remove(&process.pid);
+    // A pidfd of the process now gives `POLLHUP`, as the task has gone in Linux.
+    process.exit_poll.wake_all();
     let mut ns = process.pid_ns.as_ref();
     while let Some(n) = ns {
         n.wait().wake_all();
@@ -1455,6 +1460,12 @@ impl Thread {
         self.tid
     }
 
+    /// The status of the exit of the thread, or `None` while it runs. The status of the group
+    /// goes first, as for `exit_thread`.
+    pub fn exit_status(&self) -> Option<WaitStatus> {
+        *self.exit.lock()
+    }
+
     /// The process.
     pub fn process(&self) -> &Arc<Process> {
         &self.process
@@ -1923,6 +1934,7 @@ impl Thread {
             time: SpinLock::new(None),
             time_children: SpinLock::new(None),
             pid_children: SpinLock::new(None),
+            exit: SpinLock::new(None),
         })
     }
 
@@ -2722,6 +2734,7 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let thread_status = process.group_exit().unwrap_or(status);
     ptrace::thread_exited(thread, thread_status);
     TABLE.lock().threads.remove(&thread.tid);
+    *thread.exit.lock() = Some(thread_status);
     thread.release_seccomp();
     let last = {
         let mut s = process.state.lock();
@@ -2756,6 +2769,8 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     drop(pid_ns);
     if !last {
         process.thread_exit.wake_all();
+        // A pidfd of the thread is now readable.
+        process.exit_poll.wake_all();
         return;
     }
     process.timers().clear(false);
