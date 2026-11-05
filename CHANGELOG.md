@@ -2,7 +2,7 @@
 
 This file records each release. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The version numbers follow [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [0.5.7] - 2026-11-05
 
 ### Added
 
@@ -17,7 +17,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The systemd boot test runs rk-bpfpin, which pins an array map in /sys/fs/bpf, gets it again with `BPF_OBJ_GET` and reads a value (#537).
 - The `reject` expression of nf_tables, as net/netfilter/nft_reject*.c, net/ipv4/netfilter/nf_reject_ipv4.c and net/ipv6/netfilter/nf_reject_ipv6.c of Linux: an ICMP or ICMPv6 "destination unreachable" with a code, the codes of `icmpx` that each family turns into its own, or a TCP RST, then the drop of the packet. `reject` is for the hooks prerouting, input, forward and output (#542).
 
-## [0.5.6] - 2026-11-09
+## [0.5.6] - 2026-11-05
 
 ### Added
 
@@ -1382,6 +1382,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.7]: https://github.com/tamnd/rukernel/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/tamnd/rukernel/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/tamnd/rukernel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/tamnd/rukernel/compare/v0.5.3...v0.5.4
