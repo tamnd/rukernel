@@ -599,9 +599,23 @@ fn ip6_local_out(
     mtu: usize,
 ) -> Result<()> {
     let oif = dev.ifindex();
+    let dst = skb.data().get(24..40).map(<[u8]>::to_vec);
     if !nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT, &mut skb, 0, oif).to_result()? {
         return Ok(());
     }
+    // A hook that changed the destination, as DNAT, gives the packet a new route, as
+    // `ip6_route_me_harder` of Linux.
+    let rerouted;
+    let (dev, next) = match skb.data().get(24..40) {
+        Some(d) if Some(d) != dst.as_deref() => {
+            let d: Ip = d.try_into().map_err(|_| Errno::EINVAL)?;
+            let n = route(&d, 0)?;
+            rerouted = (dev::by_index(n.ifindex).ok_or(Errno::ENETUNREACH)?, n);
+            (&*rerouted.0, &rerouted.1)
+        }
+        _ => (dev, next),
+    };
+    let oif = dev.ifindex();
     if !nf_hook(NFPROTO_IPV6, NF_INET_POST_ROUTING, &mut skb, 0, oif).to_result()? {
         return Ok(());
     }

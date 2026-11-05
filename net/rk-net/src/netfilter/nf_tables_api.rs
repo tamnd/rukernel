@@ -16,15 +16,16 @@
 mod nf_tables_core;
 
 use self::nf_tables_core::{
-    NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain, nft_prog,
-    nft_rule_needs_ct,
+    NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain, nft_expr_validate,
+    nft_prog, nft_rule_needs_ct,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
+use crate::netfilter::nf_nat::nf_nat_inet_fn;
 use crate::netfilter::{
-    NF_ACCEPT, NF_DROP, NF_INET_NUMHOOKS, NF_QUEUE, NFPROTO_ARP, NFPROTO_BRIDGE, NFPROTO_INET,
-    NFPROTO_IPV4, NFPROTO_IPV6, NFPROTO_NETDEV, NFPROTO_UNSPEC, NfHookFn, NfHookOps, NfHookState,
-    nf_register_net_hooks, nf_unregister_net_hook,
+    NF_ACCEPT, NF_DROP, NF_INET_NUMHOOKS, NF_IP_PRI_CONNTRACK, NF_QUEUE, NFPROTO_ARP,
+    NFPROTO_BRIDGE, NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NFPROTO_NETDEV, NFPROTO_UNSPEC,
+    NfHookFn, NfHookOps, NfHookState, nf_register_net_hooks, nf_unregister_net_hook,
 };
 use crate::netlink::msg::{self, Attrs, Builder};
 use crate::netlink::nfnetlink::{
@@ -296,13 +297,20 @@ struct NftChainType {
     name: &'static str,
     /// The hooks that the type takes, one bit for each hook.
     hook_mask: u32,
+    /// The chains of the type run at the hooks of NAT, as `NFT_CHAIN_T_NAT`.
+    nat: bool,
 }
 
 /// The type `filter` of the families `ip`, `ip6` and `inet`, as nft_chain_filter.c of Linux.
-/// The other families have no hooks here, and the types `nat` and `route` come later.
-static NFT_CHAIN_FILTER: NftChainType = NftChainType { name: "filter", hook_mask: 0x1f };
+/// The other families have no hooks here, and the type `route` comes later.
+static NFT_CHAIN_FILTER: NftChainType =
+    NftChainType { name: "filter", hook_mask: 0x1f, nat: false };
 
-static NFT_CHAIN_TYPES_INET: [&NftChainType; 1] = [&NFT_CHAIN_FILTER];
+/// The type `nat`, as nft_chain_nat.c of Linux: `NF_INET_PRE_ROUTING`, `NF_INET_LOCAL_IN`,
+/// `NF_INET_LOCAL_OUT` and `NF_INET_POST_ROUTING`.
+static NFT_CHAIN_NAT: NftChainType = NftChainType { name: "nat", hook_mask: 0x1b, nat: true };
+
+static NFT_CHAIN_TYPES_INET: [&NftChainType; 2] = [&NFT_CHAIN_FILTER, &NFT_CHAIN_NAT];
 
 /// The types of the family `family`, as `chain_type[family]` of Linux.
 fn nft_chain_types(family: u8) -> &'static [&'static NftChainType] {
@@ -480,11 +488,17 @@ pub struct NftHookOps {
     policy: AtomicU32,
     /// The committed program of the chain. A packet holds the lock only to take a reference.
     prog: SpinLock<Arc<NftProg>>,
+    /// The chain has the type `nat`.
+    nat: bool,
 }
 
 impl NftHookOps {
-    fn new(policy: u32) -> Self {
-        Self { policy: AtomicU32::new(policy), prog: SpinLock::new(Arc::new(NftProg::default())) }
+    fn new(policy: u32, nat: bool) -> Self {
+        Self {
+            policy: AtomicU32::new(policy),
+            prog: SpinLock::new(Arc::new(NftProg::default())),
+            nat,
+        }
     }
 }
 
@@ -493,7 +507,13 @@ impl NfHookFn for NftHookOps {
     /// policy of the chain.
     fn hook(&self, skb: &mut NetBuf, state: &NfHookState) -> u32 {
         let prog = self.prog.lock().clone();
-        nft_do_chain(&prog, self.policy.load(Ordering::Acquire), skb, state)
+        let policy = self.policy.load(Ordering::Acquire);
+        // A chain of NAT runs on the first packet of a connection, then each packet gets the
+        // change of its connection, as `nft_nat_do_chain` and `nf_nat_inet_fn` of Linux.
+        if self.nat {
+            return nf_nat_inet_fn(skb, state, |skb| nft_do_chain(&prog, policy, skb, state));
+        }
+        nft_do_chain(&prog, policy, skb, state)
     }
 }
 
@@ -1763,6 +1783,10 @@ impl NftBatch {
         if num >= u32::from(NF_INET_NUMHOOKS) || ty.hook_mask & (1 << num) == 0 {
             return Err(Errno::EOPNOTSUPP);
         }
+        // A chain of NAT needs the connection of the packet.
+        if ty.nat && prio as i32 <= NF_IP_PRI_CONNTRACK {
+            return Err(Errno::EOPNOTSUPP);
+        }
         Ok((num as u8, prio as i32, ty))
     }
 
@@ -1784,7 +1808,7 @@ impl NftBatch {
             if flags & NFT_CHAIN_HW_OFFLOAD != 0 {
                 return Err(Errno::EOPNOTSUPP);
             }
-            let ops = Arc::new(NftHookOps::new(policy));
+            let ops = Arc::new(NftHookOps::new(policy, ty.nat));
             (Some(NftBaseChain { hooknum, priority, ty, policy, ops }), flags | NFT_CHAIN_BASE)
         } else {
             if flags & NFT_CHAIN_BASE != 0 {
@@ -1964,6 +1988,7 @@ impl NftBatch {
                 return Err(Errno::EINVAL);
             }
             let expr = nf_tables_expr_parse(table, e).inspect_err(|_| info.req.bad_attr(e))?;
+            nft_expr_validate(&expr, chain.base.as_ref().map(|b| (b.ty, b.hooknum)))?;
             // A jump that comes back to the chain is a loop, as `nft_chain_validate` of Linux.
             if let Some(target) = expr.jump_target() {
                 nft_check_loops(table, chain.handle, target)?;
@@ -2427,7 +2452,9 @@ fn nft_wanted_hooks(tables: &[NftTable]) -> Vec<WantedHook> {
 fn nft_sync_ct(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
     let mut want: Vec<u8> = Vec::new();
     for t in tables {
-        let uses = t.chains.iter().flat_map(|c| &c.rules).any(|r| nft_rule_needs_ct(&r.parsed));
+        // A rule with a `ct` expression or NAT, and a chain of NAT.
+        let uses = t.chains.iter().flat_map(|c| &c.rules).any(|r| nft_rule_needs_ct(&r.parsed))
+            || t.chains.iter().any(|c| c.base.as_ref().is_some_and(|b| b.ty.nat));
         if uses && !want.contains(&t.family) {
             want.push(t.family);
         }
@@ -2622,5 +2649,31 @@ mod tests {
         let desc = &m[msg::HDRLEN..];
         assert_eq!(nf_tables_set_desc_parse(desc, 8).unwrap(), (0, alloc::vec![4, 2]));
         assert_eq!(nf_tables_set_desc_parse(desc, 12), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn nat_expressions_need_a_nat_chain_at_their_hooks() {
+        use super::super::nf_nat::{NF_NAT_MANIP_DST, NF_NAT_MANIP_SRC};
+        use crate::netfilter::{NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING};
+        let nat = |mtype| NftExpr::Nat {
+            mtype,
+            family: NFPROTO_IPV4,
+            alen: 4,
+            addr: None,
+            proto: None,
+            flags: 0,
+        };
+        let masq = NftExpr::Masq { flags: 0, proto: None };
+        let ok = |e: &NftExpr, ty, hook| nft_expr_validate(e, Some((ty, hook))).is_ok();
+        assert!(ok(&nat(NF_NAT_MANIP_SRC), &NFT_CHAIN_NAT, NF_INET_POST_ROUTING));
+        assert!(!ok(&nat(NF_NAT_MANIP_SRC), &NFT_CHAIN_NAT, NF_INET_PRE_ROUTING));
+        assert!(!ok(&nat(NF_NAT_MANIP_SRC), &NFT_CHAIN_FILTER, NF_INET_POST_ROUTING));
+        assert!(ok(&nat(NF_NAT_MANIP_DST), &NFT_CHAIN_NAT, NF_INET_LOCAL_OUT));
+        assert!(!ok(&nat(NF_NAT_MANIP_DST), &NFT_CHAIN_NAT, NF_INET_POST_ROUTING));
+        assert!(ok(&masq, &NFT_CHAIN_NAT, NF_INET_POST_ROUTING));
+        assert!(!ok(&masq, &NFT_CHAIN_NAT, NF_INET_LOCAL_OUT));
+        // A chain that a jump reaches checks at the packet, and other expressions go anywhere.
+        assert!(nft_expr_validate(&masq, None).is_ok());
+        assert!(ok(&NftExpr::CtSet { sreg: 8 }, &NFT_CHAIN_FILTER, NF_INET_LOCAL_OUT));
     }
 }

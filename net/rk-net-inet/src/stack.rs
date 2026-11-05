@@ -681,10 +681,34 @@ pub(crate) fn nf_hook4(
 /// the hook to the sender.
 fn ip_local_out(dev: &NetDevice, next: &route::Next, mut skb: NetBuf) -> Result<()> {
     let out = dev.ifindex();
+    let dst = Header::parse_loose(skb.data()).map(|h| h.dst);
     if !nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT, &mut skb, 0, out).to_result()? {
         return Ok(());
     }
+    // A hook that changed the destination, as DNAT, gives the packet a new route, as
+    // `ip_route_me_harder` of Linux.
+    if let Some(h) = Header::parse_loose(skb.data())
+        && Some(h.dst) != dst
+    {
+        let next = route(h.dst)?;
+        let dev = dev::by_index(next.ifindex).ok_or(Errno::ENETUNREACH)?;
+        return ip_output(&dev, &next, skb, 0);
+    }
     ip_output(dev, next, skb, 0)
+}
+
+/// The source address of a packet that goes out on `ifindex` to `dst`, for masquerade, as
+/// `inet_select_addr` and `ipv6_dev_get_saddr` of Linux.
+pub(crate) fn nat_src(pf: u8, ifindex: u32, dst: &[u8; 16]) -> Option<[u8; 16]> {
+    let mut a = [0u8; 16];
+    if pf == rk_net::netfilter::NFPROTO_IPV6 {
+        let n = crate::stack6::ROUTES6.lock().lookup(dst, ifindex).ok()?;
+        return Some(n.src);
+    }
+    let d: Addr = dst[..4].try_into().ok()?;
+    let src = ROUTES.lock().select_addr(ifindex, d, RT_SCOPE_UNIVERSE as u8)?;
+    a[..4].copy_from_slice(&src);
+    Some(a)
 }
 
 /// Gives a whole packet to `NF_INET_POST_ROUTING` and then to the link, in fragments if it is

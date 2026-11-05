@@ -85,6 +85,10 @@ pub const IPS_DST_NAT_DONE: u32 = 1 << 8;
 pub const IPS_DYING: u32 = 1 << 9;
 /// The timeout of the connection does not change.
 pub const IPS_FIXED_TIMEOUT: u32 = 1 << 10;
+/// The bits of the NAT of a connection.
+pub const IPS_NAT_MASK: u32 = IPS_SRC_NAT | IPS_DST_NAT;
+/// The bits of the NAT that is set up.
+pub const IPS_NAT_DONE_MASK: u32 = IPS_SRC_NAT_DONE | IPS_DST_NAT_DONE;
 
 /// The priority of the hook that puts the new connections in the table, the last one.
 pub const NF_IP_PRI_CONNTRACK_CONFIRM: i32 = i32::MAX;
@@ -194,8 +198,9 @@ fn icmp_is_error(l3num: u8, t: u8) -> bool {
 
 /// A connection, as `struct nf_conn` of Linux.
 pub struct NfConn {
-    /// The tuples of the two directions, `IP_CT_DIR_ORIGINAL` and `IP_CT_DIR_REPLY`.
-    pub tuple: [NfConntrackTuple; 2],
+    /// The tuples of the two directions, `IP_CT_DIR_ORIGINAL` and `IP_CT_DIR_REPLY`. NAT
+    /// changes the reply tuple of a connection before it goes in the table.
+    tuple: SpinLock<[NfConntrackTuple; 2]>,
     /// The `IPS_*` bits.
     status: AtomicU32,
     /// The tick of the timer at which the connection ends.
@@ -217,7 +222,24 @@ impl NfConn {
         self.status.load(Ordering::Relaxed)
     }
 
-    fn set_status(&self, bits: u32) -> u32 {
+    /// The tuple of the direction `dir`.
+    pub fn tuple(&self, dir: usize) -> NfConntrackTuple {
+        self.tuple.lock()[dir]
+    }
+
+    /// The tuples of the two directions.
+    pub fn tuples(&self) -> [NfConntrackTuple; 2] {
+        *self.tuple.lock()
+    }
+
+    /// Sets the reply tuple of a connection that is not in the table yet, as
+    /// `nf_conntrack_alter_reply` of Linux.
+    pub(crate) fn alter_reply(&self, reply: NfConntrackTuple) {
+        debug_assert!(!self.is_confirmed());
+        self.tuple.lock()[IP_CT_DIR_REPLY] = reply;
+    }
+
+    pub(crate) fn set_status(&self, bits: u32) -> u32 {
         self.status.fetch_or(bits, Ordering::Relaxed)
     }
 
@@ -248,7 +270,7 @@ impl fmt::Debug for NfConn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NfConn")
             .field("id", &self.id)
-            .field("tuple", &self.tuple[IP_CT_DIR_ORIGINAL])
+            .field("tuple", &self.tuple(IP_CT_DIR_ORIGINAL))
             .field("status", &self.status())
             .finish()
     }
@@ -333,7 +355,7 @@ impl CtTable {
 
     fn remove(&mut self, ct: &NfConn) {
         ct.set_status(IPS_DYING);
-        for t in &ct.tuple {
+        for t in &ct.tuples() {
             if self.hash.get(t).is_some_and(|(c, _)| core::ptr::eq(&**c, ct)) {
                 self.hash.remove(t);
             }
@@ -392,6 +414,12 @@ pub fn nf_conntrack_count() -> usize {
 /// as `nf_conntrack_find_get` of Linux.
 pub fn nf_conntrack_find_get(tuple: &NfConntrackTuple) -> Option<(Arc<NfConn>, usize)> {
     CT.lock().find(tuple)
+}
+
+/// Tells if a connection other than `ignored` has the tuple `tuple`, as
+/// `nf_conntrack_tuple_taken` of Linux. NAT uses this to find a free tuple.
+pub fn nf_conntrack_tuple_taken(tuple: &NfConntrackTuple, ignored: &NfConn) -> bool {
+    CT.lock().find(tuple).is_some_and(|(c, _)| !core::ptr::eq(&*c, ignored))
 }
 
 /// Gives the tuple of the packet `d` of the family `pf` and the offset of its transport
@@ -486,7 +514,7 @@ fn init_conntrack(tuple: &NfConntrackTuple) -> Option<Arc<NfConn>> {
     let reply = tuple.invert()?;
     let t = now();
     Some(Arc::new(NfConn {
-        tuple: [*tuple, reply],
+        tuple: SpinLock::new([*tuple, reply]),
         status: AtomicU32::new(0),
         timeout: AtomicU64::new(t + new_timeout(tuple.l3num, tuple.protonum)),
         mark: AtomicU32::new(0),
@@ -519,7 +547,7 @@ pub fn nf_ct_kill(ct: &NfConn) {
 /// Linux. `d` is the packet and `thoff` the offset of its transport header.
 fn handle_packet(ct: &NfConn, ctinfo: u8, d: &[u8], thoff: usize) -> proto_tcp::Verdict {
     use proto_tcp::Verdict;
-    let tuple = &ct.tuple[IP_CT_DIR_ORIGINAL];
+    let tuple = &ct.tuple(IP_CT_DIR_ORIGINAL);
     let ok = |b: bool| if b { Verdict::Accept } else { Verdict::Invalid };
     match tuple.protonum {
         IPPROTO_TCP => {
@@ -665,7 +693,7 @@ pub fn nf_conntrack_confirm(skb: &mut NetBuf) -> u32 {
     if ct.status() & IPS_DYING != 0 {
         return NF_DROP;
     }
-    let [orig, reply] = ct.tuple;
+    let [orig, reply] = ct.tuples();
     if let Some((old, dir)) = t.find(&orig) {
         drop(t);
         let info = if dir == IP_CT_DIR_REPLY { IP_CT_ESTABLISHED_REPLY } else { info };
@@ -679,7 +707,9 @@ pub fn nf_conntrack_confirm(skb: &mut NetBuf) -> u32 {
     if t.inserts >= 64 {
         t.gc();
     }
-    ct.set_status(IPS_CONFIRMED);
+    // A connection that no rule of NAT changed keeps its tuples, and the rules of NAT do not
+    // run for its next packets, as `nf_nat_alloc_null_binding` of Linux.
+    ct.set_status(IPS_CONFIRMED | IPS_NAT_DONE_MASK);
     t.hash.insert(orig, (ct.clone(), IP_CT_DIR_ORIGINAL));
     t.hash.insert(reply, (ct, IP_CT_DIR_REPLY));
     NF_ACCEPT
@@ -704,7 +734,8 @@ impl NfHookFn for ConntrackConfirm {
     }
 }
 
-/// The hooks of connection tracking for the family `pf`, as `ipv4_conntrack_ops` of Linux.
+/// The hooks of connection tracking for the family `pf`, as `ipv4_conntrack_ops` of Linux, and
+/// the hooks of NAT, as `nf_nat_ipv4_ops`.
 fn conntrack_ops(pf: u8) -> Vec<NfHookOps> {
     let input: Arc<dyn NfHookFn> = Arc::new(ConntrackIn);
     let confirm: Arc<dyn NfHookFn> = Arc::new(ConntrackConfirm);
@@ -714,12 +745,14 @@ fn conntrack_ops(pf: u8) -> Vec<NfHookOps> {
         hooknum,
         priority,
     };
-    alloc::vec![
+    let mut ops = alloc::vec![
         op(&input, NF_INET_PRE_ROUTING, NF_IP_PRI_CONNTRACK),
         op(&input, NF_INET_LOCAL_OUT, NF_IP_PRI_CONNTRACK),
         op(&confirm, NF_INET_POST_ROUTING, NF_IP_PRI_CONNTRACK_CONFIRM),
         op(&confirm, NF_INET_LOCAL_IN, NF_IP_PRI_CONNTRACK_CONFIRM),
-    ]
+    ];
+    ops.extend(super::nf_nat::nf_nat_ops(pf));
+    ops
 }
 
 fn families(pf: u8) -> &'static [(u8, usize)] {
@@ -799,20 +832,20 @@ pub(super) fn init() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::netfilter::NF_INET_FORWARD;
     use alloc::vec;
 
     // The tests set the time, so they run one at a time.
-    static SERIAL: SpinLock<()> = SpinLock::new(());
+    pub(crate) static SERIAL: SpinLock<()> = SpinLock::new(());
 
-    fn state(hook: u8) -> NfHookState {
+    pub(crate) fn state(hook: u8) -> NfHookState {
         NfHookState { hook, pf: NFPROTO_IPV4, in_dev: 0, out_dev: 0 }
     }
 
     /// An IPv4 packet of `proto` from `src` to `dst` with the transport header `l4`.
-    fn ip4(proto: u8, src: [u8; 4], dst: [u8; 4], l4: &[u8]) -> NetBuf {
+    pub(crate) fn ip4(proto: u8, src: [u8; 4], dst: [u8; 4], l4: &[u8]) -> NetBuf {
         let mut p = vec![0u8; 20];
         p[0] = 0x45;
         p[2..4].copy_from_slice(&((20 + l4.len()) as u16).to_be_bytes());
@@ -823,7 +856,7 @@ mod tests {
         NetBuf::from_slice(&p)
     }
 
-    fn udp(sport: u16, dport: u16) -> Vec<u8> {
+    pub(crate) fn udp(sport: u16, dport: u16) -> Vec<u8> {
         let mut h = vec![0u8; 8];
         h[0..2].copy_from_slice(&sport.to_be_bytes());
         h[2..4].copy_from_slice(&dport.to_be_bytes());
@@ -844,12 +877,12 @@ mod tests {
         skb.nfct.get().map(|(_, i)| i)
     }
 
-    fn set_time(t: u64) {
+    pub(crate) fn set_time(t: u64) {
         TEST_NOW.store(t, Ordering::Relaxed);
     }
 
     /// Sets the time and empties the table, for a test that counts the connections.
-    fn fresh(t: u64) {
+    pub(crate) fn fresh(t: u64) {
         set_time(t);
         *CT.lock() = CtTable::default();
     }
@@ -865,7 +898,7 @@ mod tests {
         assert_eq!(info(&a), Some(IP_CT_NEW));
         let (ct, _) = a.nfct.get().unwrap();
         assert!(ct.is_confirmed());
-        assert_eq!(ct.tuple[IP_CT_DIR_REPLY].src_u, 53);
+        assert_eq!(ct.tuple(IP_CT_DIR_REPLY).src_u, 53);
         assert_eq!(ct.expires(), 30 * hz);
         assert_eq!(nf_conntrack_count(), before + 1);
         // A second packet before the reply is new too.
@@ -901,7 +934,7 @@ mod tests {
         nf_conntrack_in(&mut a, &state(NF_INET_LOCAL_OUT));
         assert_eq!(info(&a), Some(IP_CT_NEW));
         // No confirm: the packet went away before `NF_INET_POST_ROUTING`.
-        let t = a.nfct.get().unwrap().0.tuple[IP_CT_DIR_ORIGINAL];
+        let t = a.nfct.get().unwrap().0.tuple(IP_CT_DIR_ORIGINAL);
         assert!(nf_conntrack_find_get(&t).is_none());
         // A packet with a connection keeps it, as on the loopback device.
         let ct = a.nfct.clone();
@@ -1122,7 +1155,8 @@ mod tests {
         nf_ct_netns_get(NFPROTO_IPV6).unwrap();
         nf_ct_netns_get(NFPROTO_IPV6).unwrap();
         assert!(nf_ct_active(NFPROTO_IPV6));
-        assert_eq!(super::super::hook_count(NFPROTO_IPV6, NF_INET_LOCAL_IN), h + 1);
+        // The confirm and the change of the source of NAT.
+        assert_eq!(super::super::hook_count(NFPROTO_IPV6, NF_INET_LOCAL_IN), h + 2);
         nf_ct_netns_put(NFPROTO_IPV6);
         assert!(nf_ct_active(NFPROTO_IPV6));
         nf_ct_netns_put(NFPROTO_IPV6);
