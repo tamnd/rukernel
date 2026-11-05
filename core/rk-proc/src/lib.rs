@@ -42,6 +42,8 @@ pub mod timens;
 pub mod timer;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod vdso;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod yama;
 
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use process::AUDIT_UNSET;

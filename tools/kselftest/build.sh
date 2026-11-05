@@ -10,7 +10,8 @@ set -eu
 
 LINUX_TAG=v6.17
 TESTS="seccomp/seccomp_bpf net/af_unix/scm_pidfd timens/timens timens/timerfd timens/timer
-	timens/clock_nanosleep timens/procfs timens/exec timens/futex timens/vfork_exec"
+	timens/clock_nanosleep timens/procfs timens/exec timens/futex timens/vfork_exec
+	lsm/lsm_get_self_attr_test lsm/lsm_set_self_attr_test lsm/lsm_list_modules_test"
 
 out=${1:?usage: tools/kselftest/build.sh OUT_DIR}
 mkdir -p "$out"
@@ -27,7 +28,10 @@ cd /linux
 git sparse-checkout set --no-cone /tools/testing/selftests/ >/dev/null
 cd tools/testing/selftests
 for t in $TESTS; do
-	gcc -static -O2 -Wall -D_GNU_SOURCE -I. -o "/out/${t##*/}" "$t.c" \
+	# The tests of lsm also need lsm/common.c, as their Makefile.
+	extra=
+	case $t in lsm/*) extra=lsm/common.c ;; esac
+	gcc -static -O2 -Wall -D_GNU_SOURCE -I. -o "/out/${t##*/}" "$t.c" $extra \
 		-lcap -lpthread
 	strip "/out/${t##*/}"
 done

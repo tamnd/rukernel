@@ -1110,6 +1110,9 @@ fn kselftest_dir() -> Option<PathBuf> {
 const KSELFTEST_SCRIPT: &str = concat!(
     "#!/bin/sh\nexport TMPDIR=/tmp PATH=/bin\n",
     "mount -t proc proc /proc\nmkdir -p /dev/shm\nmount -t tmpfs shm /dev/shm\n",
+    // The tests of lsm read /sys/kernel/security/lsm.
+    "mkdir -p /sys\nmount -t sysfs sysfs /sys\n",
+    "mount -t securityfs securityfs /sys/kernel/security\n",
     "failed=0\nfor p in /kselftest/*; do\n",
     "    t=${p##*/}\n",
     "    [ \"$t\" = run ] && continue\n",
