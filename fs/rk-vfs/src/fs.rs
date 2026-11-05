@@ -413,6 +413,13 @@ impl FsContext {
     /// so that `open` with `O_CREAT` and the mode 0 gives a descriptor that can write.
     fn open_inode(&self, at: Location, flags: u32, created: bool) -> Result<Arc<File>> {
         let file = self.open_file(at, flags, created)?;
+        // As `security_file_open` in `do_dentry_open` of Linux. A file of `O_PATH` has no check.
+        if !file.flags().is_path()
+            && let Err(e) = crate::security::file_open(&file, &self.cred)
+        {
+            file.set_nonotify();
+            return Err(e);
+        }
         // As `fsnotify_open_perm` and `fsnotify_open` of Linux. A file of `O_PATH` has no
         // events. A file that a group denies closes without an event.
         if !file.flags().is_path()

@@ -118,6 +118,7 @@ impl core::fmt::Debug for Dentry {
 impl Dentry {
     /// Makes the root dentry of a file system.
     pub fn new_root(inode: InodeRef) -> Arc<Self> {
+        crate::security::blob::inode_attach(&inode);
         Arc::new(Self {
             name: SpinLock::new(Vec::from(&b"/"[..])),
             parent: SpinLock::new(None),
@@ -213,6 +214,7 @@ impl Dentry {
 
     /// Makes a dentry for the child `name` with the inode `inode`.
     fn new_child(self: &Arc<Self>, name: &[u8], inode: InodeRef) -> Arc<Dentry> {
+        crate::security::blob::inode_attach(&inode);
         Arc::new(Self {
             name: SpinLock::new(name.to_vec()),
             parent: SpinLock::new(Some(self.clone())),
@@ -249,6 +251,7 @@ impl Dentry {
     /// that it found without a path.
     pub fn tmp_child(self: &Arc<Self>, inode: InodeRef, linkable: bool) -> Arc<Dentry> {
         let name = alloc::format!("#{}", inode.metadata().ino);
+        crate::security::blob::inode_attach(&inode);
         Arc::new(Self {
             name: SpinLock::new(name.into_bytes()),
             parent: SpinLock::new(Some(self.clone())),

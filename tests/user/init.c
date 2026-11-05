@@ -3699,6 +3699,57 @@ static void test_xattr(void)
 	unlink("/tmp/xa");
 }
 
+/*
+ * The LSM framework (#540): the kernel starts the capability module first, and the hooks of the
+ * file, exec, task and socket paths keep the old results. The checks of the capabilities go
+ * through the capable hook of the capability module now.
+ */
+static void test_lsm(void)
+{
+	static char buf[65536];
+	int n, status;
+	pid_t pid;
+
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("lsm: the boot log names the capability module first", n > 0 && strstr(buf, "LSM: initializing lsm=capability") != NULL);
+	pid = fork();
+	if (pid == 0) {
+		struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(80), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+		gid_t g = 1000;
+		int ok = 1, s, fd;
+
+		ok &= syscall(SYS_setgroups, 1, &g) == 0;
+		ok &= setresgid(1000, 1000, 1000) == 0 && setresuid(1000, 1000, 1000) == 0;
+		/* The capable hook denies what needs a capability. */
+		ok &= syscall(SYS_setgroups, 1, &g) < 0 && errno == EPERM;
+		s = socket(AF_INET, SOCK_DGRAM, 0);
+		ok &= s >= 0;
+		ok &= bind(s, (struct sockaddr *)&a, sizeof(a)) < 0 && errno == EACCES;
+		a.sin_port = htons(40000);
+		ok &= bind(s, (struct sockaddr *)&a, sizeof(a)) == 0;
+		ok &= sendto(s, "x", 1, 0, (struct sockaddr *)&a, sizeof(a)) == 1;
+		ok &= recv(s, buf, sizeof(buf), 0) == 1;
+		close(s);
+		ok &= kill(1, 0) < 0 && errno == EPERM;
+		ok &= kill(getpid(), 0) == 0;
+		/* The file hooks allow the open, the read, the ioctl, the fcntl and the lock. */
+		fd = open("/init", O_RDONLY);
+		ok &= fd >= 0 && read(fd, buf, 16) == 16;
+		ok &= fcntl(fd, F_GETFL) >= 0 && flock(fd, LOCK_SH) == 0;
+		close(fd);
+		ok &= getsid(getpid()) > 0 && getpgid(getpid()) > 0;
+		ok &= syscall(SYS_sched_getscheduler, getpid()) == SCHED_OTHER;
+		ok &= setpriority(PRIO_PROCESS, 0, 5) == 0;
+		_exit(ok ? 0 : 1);
+	}
+	check("lsm: a user without capabilities gets the old denials and the old results", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	pid = fork();
+	if (pid == 0)
+		_exit(0);
+	check("lsm: fork and wait go through the task hooks", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void test_syslog(void)
 {
 	static char buf[65536];
@@ -12661,6 +12712,7 @@ static void test_all(void)
 	test_fsize();
 	test_tmpfile();
 	test_iflags();
+	test_lsm();
 	test_syslog();
 	test_membarrier();
 	test_overlay();
@@ -12898,6 +12950,8 @@ int main(int argc, char **argv)
 		test_bpf();
 	if (argc > 1 && strcmp(argv[1], "userns") == 0)
 		test_user_ns();
+	if (argc > 1 && strcmp(argv[1], "lsm") == 0)
+		test_lsm();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0) {
 		test_dns_key();
 		test_request_key();

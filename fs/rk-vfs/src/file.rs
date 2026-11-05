@@ -289,6 +289,8 @@ pub struct File {
     /// The file is a regular file that can only read, and `INODE_READERS` counts it, as
     /// `i_readcount` of Linux.
     reader: bool,
+    /// The file blob of the security modules, as `f_security` of Linux.
+    security: crate::security::Blob,
 }
 
 /// The number of open files that can write each regular inode, as `i_writecount` of Linux. The
@@ -456,6 +458,7 @@ impl Drop for File {
                 count_down(&INODE_READERS, inode_key(inode));
             }
         }
+        crate::security::file_free(self);
     }
 }
 
@@ -1139,7 +1142,7 @@ impl File {
                 count_up(&INODE_READERS, inode_key(inode));
             }
         }
-        Arc::new(Self {
+        let file = Arc::new(Self {
             ops,
             location,
             inode,
@@ -1153,7 +1156,15 @@ impl File {
             owner_tid: AtomicBool::new(false),
             created: AtomicBool::new(false),
             reader,
-        })
+            security: crate::security::Blob::file(),
+        });
+        crate::security::file_alloc(&file);
+        file
+    }
+
+    /// The file blob of the security modules.
+    pub fn security(&self) -> &crate::security::Blob {
+        &self.security
     }
 
     /// Checks that a change of the file can start, as `mnt_want_write_file` of Linux. A file
@@ -1288,9 +1299,10 @@ impl File {
         Ok(n)
     }
 
-    /// The permission event before a read, as `fsnotify_file_area_perm` in `rw_verify_area` of
-    /// Linux.
+    /// The checks before a read, as `security_file_permission` and `fsnotify_file_area_perm` in
+    /// `rw_verify_area` of Linux.
     fn access_perm(&self) -> Result<()> {
+        crate::security::file_permission(self, crate::cred::may::READ)?;
         match &self.location {
             Some(at) if !self.nonotify() => crate::notify::access_perm(at),
             _ => Ok(()),
@@ -1332,6 +1344,7 @@ impl File {
         if !self.flags().writable() {
             return Err(Errno::EBADF);
         }
+        crate::security::file_permission(self, crate::cred::may::WRITE)?;
         self.remove_privs()?;
         let n = self.ops.write(self, buf)?;
         self.notify_modify(n);
@@ -1354,6 +1367,7 @@ impl File {
         if !self.flags().writable() {
             return Err(Errno::EBADF);
         }
+        crate::security::file_permission(self, crate::cred::may::WRITE)?;
         self.remove_privs()?;
         let n = self.ops.write_at(self, offset, buf)?;
         self.notify_modify(n);

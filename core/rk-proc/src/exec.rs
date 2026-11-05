@@ -27,6 +27,7 @@ use rk_mm::{
 };
 use rk_vfs::cred::{Cred, ExecFile};
 use rk_vfs::file::DenyWrite;
+use rk_vfs::security::{self, Bprm};
 use rk_vfs::{FileType, FsContext, InodeRef, Location};
 
 /// The most interpreters in a chain of `#!` scripts. Linux names it `BINPRM_MAX_RECURSION`.
@@ -448,7 +449,14 @@ fn build(
         no_setid: no_new_privs || traced || nosuid,
     };
     let old_permitted = cred.cap_permitted;
-    let (cred, secure) = cred.exec(file);
+    let (mut cred, secure) = cred.exec(file);
+    // The checks and the changes of the security modules, as `bprm_creds_for_exec`,
+    // `bprm_creds_from_file` and `bprm_check` in `bprm_execve` of Linux.
+    let mut bprm = Bprm { filename: &args.path, file: &at, cred: &mut cred, secureexec: secure };
+    security::bprm_creds_for_exec(&mut bprm)?;
+    security::bprm_creds_from_file(&mut bprm)?;
+    security::bprm_check(&mut bprm)?;
+    let secure = bprm.secureexec;
     // A file with the set-user-ID bit or the set-group-ID bit, and an exec that gives more
     // capabilities, remove the flags that make the layout easy to guess, as `bprm_fill_uid` and
     // `cap_bprm_creds_from_file` of Linux.
@@ -620,7 +628,11 @@ pub fn exec(
     };
     process.set_dumpable(dumpable);
     process.set_personality(personality & !per_clear);
+    let mut cred = cred;
+    let bprm = Bprm { filename: &path, file: &at, cred: &mut cred, secureexec: false };
+    security::bprm_committing_creds(&bprm);
     process.set_cred(cred);
+    security::bprm_committed_creds(&path, &at);
     thread.exec_keys();
     process.set_image(&argv, at, auxv, deny);
     Ok(image)

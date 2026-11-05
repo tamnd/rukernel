@@ -575,6 +575,12 @@ pub(crate) fn prlimit64(cx: &Cx<'_>, pid: u64, resource: u64, new: u64, old: u64
     {
         return Err(Errno::EPERM);
     }
+    // As `security_task_prlimit` with `LSM_PRLIMIT_READ` and `LSM_PRLIMIT_WRITE` in
+    // `check_prlimit_permission` of Linux.
+    let flags = u32::from(old != 0) | u32::from(new != 0) << 1;
+    if flags != 0 {
+        rk_vfs::security::task_prlimit(&cred, &process.cred(), flags)?;
+    }
     let new = if new == 0 {
         None
     } else {

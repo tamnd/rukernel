@@ -101,35 +101,64 @@ fn change(cx: &Cx<'_>, f: impl FnOnce(&Cred) -> Result<Cred, Errno>) -> SysResul
     cx.process().change_cred(f).map(|()| 0)
 }
 
+/// The `flags` of the `task_fix_setuid` and `task_fix_setgid` hooks, `LSM_SETID_*` of Linux.
+const LSM_SETID_ID: u32 = 1;
+const LSM_SETID_RE: u32 = 2;
+const LSM_SETID_RES: u32 = 3;
+
+/// Changes the user IDs (`uid`) or the group IDs of the caller with `f`, and calls the
+/// `task_fix_setuid` or `task_fix_setgid` hooks with the new and the old credentials, as
+/// `__sys_setuid` and the other calls of Linux.
+fn change_ids(
+    cx: &Cx<'_>,
+    uid: bool,
+    flags: u32,
+    f: impl FnOnce(&Cred) -> Result<Cred, Errno>,
+) -> SysResult {
+    change(cx, |c| {
+        let mut new = f(c)?;
+        if uid {
+            rk_vfs::security::task_fix_setuid(&mut new, c, flags)?;
+        } else {
+            rk_vfs::security::task_fix_setgid(&mut new, c, flags)?;
+        }
+        Ok(new)
+    })
+}
+
 // The `set*id` calls take the IDs of the user namespace of the caller. An ID that the
 // namespace does not map gives `EINVAL`, as `make_kuid` and `uid_valid` in kernel/sys.c of
 // Linux.
 
 pub(crate) fn setuid(cx: &Cx<'_>, uid: u64) -> SysResult {
-    change(cx, |c| c.setuid(down(c, IdKind::Uid, uid)?))
+    change_ids(cx, true, LSM_SETID_ID, |c| c.setuid(down(c, IdKind::Uid, uid)?))
 }
 
 pub(crate) fn setreuid(cx: &Cx<'_>, ruid: u64, euid: u64) -> SysResult {
-    change(cx, |c| c.setreuid(down(c, IdKind::Uid, ruid)?, down(c, IdKind::Uid, euid)?))
+    change_ids(cx, true, LSM_SETID_RE, |c| {
+        c.setreuid(down(c, IdKind::Uid, ruid)?, down(c, IdKind::Uid, euid)?)
+    })
 }
 
 pub(crate) fn setresuid(cx: &Cx<'_>, ruid: u64, euid: u64, suid: u64) -> SysResult {
-    change(cx, |c| {
+    change_ids(cx, true, LSM_SETID_RES, |c| {
         let k = |arg| down(c, IdKind::Uid, arg);
         c.setresuid(k(ruid)?, k(euid)?, k(suid)?)
     })
 }
 
 pub(crate) fn setgid(cx: &Cx<'_>, gid: u64) -> SysResult {
-    change(cx, |c| c.setgid(down(c, IdKind::Gid, gid)?))
+    change_ids(cx, false, LSM_SETID_ID, |c| c.setgid(down(c, IdKind::Gid, gid)?))
 }
 
 pub(crate) fn setregid(cx: &Cx<'_>, rgid: u64, egid: u64) -> SysResult {
-    change(cx, |c| c.setregid(down(c, IdKind::Gid, rgid)?, down(c, IdKind::Gid, egid)?))
+    change_ids(cx, false, LSM_SETID_RE, |c| {
+        c.setregid(down(c, IdKind::Gid, rgid)?, down(c, IdKind::Gid, egid)?)
+    })
 }
 
 pub(crate) fn setresgid(cx: &Cx<'_>, rgid: u64, egid: u64, sgid: u64) -> SysResult {
-    change(cx, |c| {
+    change_ids(cx, false, LSM_SETID_RES, |c| {
         let k = |arg| down(c, IdKind::Gid, arg);
         c.setresgid(k(rgid)?, k(egid)?, k(sgid)?)
     })
@@ -196,7 +225,11 @@ pub(crate) fn setgroups(cx: &Cx<'_>, size: u64, list: u64) -> SysResult {
             k => Ok(k),
         })
         .collect::<Result<Vec<u32>, Errno>>()?;
-    change(cx, |c| c.setgroups(groups))
+    change(cx, |c| {
+        let mut new = c.setgroups(groups)?;
+        rk_vfs::security::task_fix_setgroups(&mut new, c)?;
+        Ok(new)
+    })
 }
 
 /// Reads the header of `capget` and `capset`, and gives the number of 32-bit sets of the
@@ -227,11 +260,13 @@ pub(crate) fn capget(cx: &Cx<'_>, header: u64, data: u64) -> SysResult {
     if pid < 0 {
         return Err(Errno::EINVAL);
     }
-    let c = if pid == 0 {
-        cred(cx)
+    let (c, tid) = if pid == 0 {
+        (cred(cx), cx.thread.tid())
     } else {
-        cx.find_task_by_vpid(pid as u64).ok_or(Errno::ESRCH)?.process().cred()
+        let t = cx.find_task_by_vpid(pid as u64).ok_or(Errno::ESRCH)?;
+        (t.process().cred(), t.tid())
     };
+    rk_vfs::security::capget(&rk_vfs::security::Task { pid: tid, cred: &c, security: None })?;
     let mut out = [0u32; 6];
     for (i, set) in out.chunks_mut(3).take(sets).enumerate() {
         let part = |bits: u64| (bits >> (32 * i)) as u32;
@@ -267,7 +302,11 @@ pub(crate) fn capset(cx: &Cx<'_>, header: u64, data: u64) -> SysResult {
             *bits |= word(3 * s + k) << (32 * s);
         }
     }
-    change(cx, |c| c.capset(set[0], set[1], set[2]))
+    change(cx, |c| {
+        let new = c.capset(set[0], set[1], set[2])?;
+        rk_vfs::security::capset(&new, c)?;
+        Ok(new)
+    })
 }
 
 /// The capability options of `prctl`, or `None` for another option.

@@ -140,7 +140,7 @@ pub(crate) fn read(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
     if let Some(sock) = rk_net::socket_of(&file) {
         let iov = [Iovec { iov_base: buf, iov_len: count }];
-        return crate::net::read_socket(cx, &*sock, &iov, file.nonblock());
+        return crate::net::read_socket(cx, &file, &*sock, &iov, file.nonblock());
     }
     read_with(cx, &file, buf, count, |_, b| file.read(b))
 }
@@ -287,7 +287,7 @@ fn readv_with(cx: &Cx<'_>, fd: u64, iov: u64, count: u64, nowait: bool) -> SysRe
 /// `EAGAIN`, as `IOCB_NOWAIT` of Linux. aio uses this for the files that cannot seek.
 pub(crate) fn readv_file(cx: &Cx<'_>, file: &File, iovs: &[Iovec], nowait: bool) -> SysResult {
     if let Some(sock) = rk_net::socket_of(file) {
-        return crate::net::read_socket(cx, &*sock, iovs, nowait || file.nonblock());
+        return crate::net::read_socket(cx, file, &*sock, iovs, nowait || file.nonblock());
     }
     let read = |b: &mut [u8]| {
         if nowait { rk_vfs::blockdev::without_wait(|| file.read(b)) } else { file.read(b) }
@@ -947,6 +947,8 @@ pub(crate) fn getdents64(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResul
 
 pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     let cmd = cmd as u32;
+    // As `security_file_ioctl` in the `ioctl` call of Linux.
+    rk_vfs::security::file_ioctl(&*cx.fdget(fd)?, cmd, arg)?;
     match cmd {
         FIOCLEX | FIONCLEX => {
             cx.files()?.lock().set_cloexec(fd as i32, cmd == FIOCLEX)?;
@@ -1088,6 +1090,8 @@ pub(crate) fn fcntl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
     if !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
         cx.fdget(fd)?;
     }
+    // As `security_file_fcntl` in the `fcntl` call of Linux.
+    rk_vfs::security::file_fcntl(&*cx.file(fd)?, cmd as u32, arg)?;
     match cmd {
         F_DUPFD => dup_from(cx, fd, arg, false),
         F_DUPFD_CLOEXEC => dup_from(cx, fd, arg, true),
@@ -1400,6 +1404,7 @@ pub(crate) fn flock(cx: &Cx<'_>, fd: u64, op: u64) -> SysResult {
         LOCK_UN => None,
         _ => return Err(Errno::EINVAL),
     };
+    rk_vfs::security::file_lock(&file, op)?;
     lock::flock(&file, kind, op & LOCK_NB == 0)?;
     Ok(0)
 }

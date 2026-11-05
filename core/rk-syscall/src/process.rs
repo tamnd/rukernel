@@ -612,6 +612,13 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     // A new thread can have its own network namespace, as on Linux.
     let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cred)?) } else { None };
     let time = new_time_ns(cx.thread, flags)?;
+    // The task blob of the child starts as a copy of the blob of the parent, and the security
+    // modules can deny the new task, as `security_task_alloc` in `copy_process` of Linux. The
+    // child has no ID yet.
+    let blob = rk_vfs::security::Blob::task();
+    blob.copy_from(cx.thread.security());
+    let task = rk_vfs::security::Task { pid: 0, cred: &cx.process().cred(), security: Some(&blob) };
+    rk_vfs::security::task_alloc(&task, flags)?;
     let thread = if flags & CLONE_THREAD != 0 {
         rk_proc::new_thread_with(cx.thread, set_tid)?
     } else {
@@ -630,6 +637,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     if let Some(c) = new_cred {
         thread.process().set_cred(c);
     }
+    thread.security().copy_from(&blob);
     if flags & CLONE_NEWNS != 0
         && let Some(fs) = thread.process().fs()
     {
@@ -958,6 +966,7 @@ pub(crate) fn setpgid(cx: &Cx<'_>, pid: u64, pgid: u64) -> SysResult {
     {
         return Err(Errno::EPERM);
     }
+    rk_vfs::security::task_setpgid(&lsm_process(&target, &target.cred()), pgid)?;
     target.set_pgid(pgid);
     Ok(0)
 }
@@ -971,12 +980,26 @@ fn find(cx: &Cx<'_>, pid: u64) -> Result<alloc::sync::Arc<Process>, Errno> {
 
 /// `getpgid`. A group outside the PID namespace of the caller gives 0, as `pid_vnr` of Linux.
 pub(crate) fn getpgid(cx: &Cx<'_>, pid: u64) -> SysResult {
-    Ok(u64::from(cx.vnr(find(cx, pid)?.pgid())))
+    let p = find(cx, pid)?;
+    if pid as i32 != 0 {
+        rk_vfs::security::task_getpgid(&lsm_process(&p, &p.cred()))?;
+    }
+    Ok(u64::from(cx.vnr(p.pgid())))
 }
 
 /// `getsid`. A session outside the PID namespace of the caller gives 0.
 pub(crate) fn getsid(cx: &Cx<'_>, pid: u64) -> SysResult {
-    Ok(u64::from(cx.vnr(find(cx, pid)?.sid())))
+    let p = find(cx, pid)?;
+    if pid as i32 != 0 {
+        rk_vfs::security::task_getsid(&lsm_process(&p, &p.cred()))?;
+    }
+    Ok(u64::from(cx.vnr(p.sid())))
+}
+
+/// The view of the process `p` with the credentials `cred` for the hooks of the security
+/// modules.
+fn lsm_process<'a>(p: &Process, cred: &'a rk_vfs::cred::Cred) -> rk_vfs::security::Task<'a> {
+    rk_vfs::security::Task { pid: p.pid(), cred, security: None }
 }
 
 pub(crate) fn prctl(cx: &mut Cx<'_>, option: u64, args: [u64; 4]) -> SysResult {

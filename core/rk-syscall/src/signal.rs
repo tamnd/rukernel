@@ -338,11 +338,13 @@ pub(crate) fn signal_group(pgid: Pid, info: SigInfo) -> Result<(), Errno> {
 /// process in the same session can always send `SIGCONT`.
 pub(crate) fn may_signal(cx: &Cx<'_>, target: &Process, sig: u32) -> Result<(), Errno> {
     let me = cx.process();
-    if me.cred().may_kill(&target.cred()) || (sig == SIGCONT && me.sid() == target.sid()) {
-        Ok(())
-    } else {
-        Err(Errno::EPERM)
+    let (cred, tcred) = (me.cred(), target.cred());
+    if !cred.may_kill(&tcred) && !(sig == SIGCONT && me.sid() == target.sid()) {
+        return Err(Errno::EPERM);
     }
+    // As `security_task_kill` in `check_kill_permission` of Linux.
+    let task = rk_vfs::security::Task { pid: target.pid(), cred: &tcred, security: None };
+    rk_vfs::security::task_kill(&task, sig, &cred)
 }
 
 /// Sends `info` to each process in the group `pgid` that the caller can signal, as

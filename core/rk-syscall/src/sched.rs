@@ -140,9 +140,21 @@ pub(crate) fn setpriority(cx: &Cx<'_>, which: u64, who: u64, nice: u64) -> SysRe
             result = Err(Errno::EACCES);
             continue;
         }
+        if let Err(e) = rk_vfs::security::task_setnice(&lsm_task(&thread, &target), nice) {
+            result = Err(e);
+            continue;
+        }
         thread.set_sched(SchedParams { nice, ..thread.sched() });
     }
     result
+}
+
+/// The view of `thread` with the credentials `cred` for the hooks of the security modules.
+pub(crate) fn lsm_task<'a>(
+    thread: &'a Thread,
+    cred: &'a rk_vfs::cred::Cred,
+) -> rk_vfs::security::Task<'a> {
+    rk_vfs::security::Task { pid: thread.tid(), cred, security: Some(thread.security()) }
 }
 
 /// Tells if `policy` is a policy that rukernel knows.
@@ -232,6 +244,7 @@ fn set_scheduler(
         return Err(Errno::EINVAL);
     }
     check_permission(cred, thread, policy, attr, reset_on_fork)?;
+    rk_vfs::security::task_setscheduler(&lsm_task(thread, &thread.process().cred()))?;
     // rukernel has no utilization clamps. Linux without `CONFIG_UCLAMP_TASK` gives this error.
     if attr.sched_flags & SCHED_FLAG_UTIL_CLAMP != 0 {
         return Err(Errno::EOPNOTSUPP);
@@ -317,7 +330,9 @@ pub(crate) fn sched_setparam(cx: &Cx<'_>, pid: u64, param: u64) -> SysResult {
 }
 
 pub(crate) fn sched_getscheduler(cx: &Cx<'_>, pid: u64) -> SysResult {
-    let p = target(cx, pid)?.sched();
+    let thread = target(cx, pid)?;
+    rk_vfs::security::task_getscheduler(&lsm_task(&thread, &thread.process().cred()))?;
+    let p = thread.sched();
     let flag = if p.reset_on_fork { SCHED_RESET_ON_FORK } else { 0 };
     Ok(u64::from(p.policy) | flag)
 }

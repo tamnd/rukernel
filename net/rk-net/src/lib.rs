@@ -307,6 +307,8 @@ fn sock_dev() -> u64 {
 /// The operations of the file of a socket.
 struct SocketFile {
     socket: Arc<dyn Socket>,
+    /// The socket blob of the security modules, as `sk_security` of Linux.
+    security: rk_vfs::security::Blob,
 }
 
 impl Drop for SocketFile {
@@ -383,7 +385,15 @@ impl FileOps for SocketFile {
 
 /// Makes the file of `socket`. `flags` can hold `O_NONBLOCK`.
 pub fn new_file(socket: Arc<dyn Socket>, flags: u32) -> Arc<File> {
-    File::with_ops(Arc::new(SocketFile { socket }), None, O_RDWR | flags)
+    let security = rk_vfs::security::Blob::sock();
+    File::with_ops(Arc::new(SocketFile { socket, security }), None, O_RDWR | flags)
+}
+
+/// Gives the socket blob of the security modules of `file`, or `None` if the file is not a
+/// socket.
+pub fn sock_security(file: &File) -> Option<&rk_vfs::security::Blob> {
+    let ops = file.ops().as_any()?.downcast_ref::<SocketFile>()?;
+    Some(&ops.security)
 }
 
 /// Gives the socket of `file`, or `None` if the file is not a socket.

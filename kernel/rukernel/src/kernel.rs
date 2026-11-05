@@ -46,6 +46,11 @@ fn main(boot: &'static BootInfo) -> ! {
         rk_frame::mm::set_uncharge_hook(rk_cgroup::uncharge_page);
         rk_cgroup::set_online_cpus(rk_frame::cpu::count());
     }
+    // The security modules start before the first file and the first task, as `security_init`
+    // in `start_kernel` of Linux.
+    let lsm =
+        rk_vfs::security::init(param(boot.cmdline(), "lsm"), param(boot.cmdline(), "security"));
+    println!("LSM: initializing lsm={lsm}");
     rootfs::init(boot);
 
     let test = param(boot.cmdline(), "rk.test");
