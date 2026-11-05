@@ -454,3 +454,59 @@ impl SocketFilter {
         self.locked
     }
 }
+
+/// The hooks of the cgroup programs of `BPF_PROG_TYPE_CGROUP_SKB`, as
+/// `BPF_CGROUP_RUN_PROG_INET_INGRESS` and `BPF_CGROUP_RUN_PROG_INET_EGRESS` of Linux. The system
+/// call layer sets them at boot.
+#[derive(Clone, Copy)]
+pub struct CgroupSkbHooks {
+    /// The cgroup of the current task, for `sock_cgroup_data` of a new socket.
+    pub current: fn() -> u32,
+    /// Runs the programs of the cgroup on a packet from its IP header. `egress` tells the
+    /// direction. Gives `false` if a program drops the packet.
+    pub run: fn(cgroup: u32, egress: bool, packet: &[u8]) -> bool,
+    /// Tells if a cgroup has a program of the direction, as `cgroup_bpf_enabled` of Linux.
+    pub enabled: fn(egress: bool) -> bool,
+}
+
+static CGROUP_SKB: rk_frame::sync::Once<CgroupSkbHooks> = rk_frame::sync::Once::new();
+
+/// Sets the hooks of the cgroup programs. Only the first call has an effect.
+pub fn set_cgroup_skb_hooks(hooks: CgroupSkbHooks) {
+    CGROUP_SKB.call_once(|| hooks);
+}
+
+/// The cgroup of the current task, `cgroup_sk_alloc` of Linux. A socket keeps it for its life.
+/// 0 is no cgroup.
+pub fn sock_cgroup_current() -> u32 {
+    CGROUP_SKB.get().map_or(0, |h| (h.current)())
+}
+
+/// Tells if the packets of a socket in `cgroup` must go through the programs of the direction
+/// `egress`. A path with no program then needs no copy of the packet.
+pub fn cgroup_skb_enabled(cgroup: u32, egress: bool) -> bool {
+    cgroup != 0 && CGROUP_SKB.get().is_some_and(|h| (h.enabled)(egress))
+}
+
+/// Runs the programs of `BPF_CGROUP_INET_INGRESS` of the cgroup of a socket on a packet that
+/// the socket gets, as `sk_filter_trim_cap` of Linux. Gives `false` if the socket drops it.
+pub fn cgroup_skb_ingress(cgroup: u32, packet: &[u8]) -> bool {
+    match CGROUP_SKB.get() {
+        Some(h) if cgroup != 0 => (h.run)(cgroup, false, packet),
+        _ => true,
+    }
+}
+
+/// Runs the programs of `BPF_CGROUP_INET_EGRESS` of the cgroup of a socket on a packet that the
+/// socket sends, as `ip_finish_output` of Linux. A program that drops the packet gives `EPERM`
+/// to the sender.
+///
+/// # Errors
+///
+/// Gives `EPERM` if a program drops the packet.
+pub fn cgroup_skb_egress(cgroup: u32, packet: &[u8]) -> Result<()> {
+    match CGROUP_SKB.get() {
+        Some(h) if cgroup != 0 && !(h.run)(cgroup, true, packet) => Err(Errno::EPERM),
+        _ => Ok(()),
+    }
+}

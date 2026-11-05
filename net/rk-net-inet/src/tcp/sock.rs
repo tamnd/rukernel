@@ -173,6 +173,10 @@ struct Inner {
     /// The owner, the file system user ID of the creator as `sk_uid` of Linux. A connection of
     /// a listening socket has the owner of the listening socket.
     uid: u32,
+    /// The cgroup of the creator, `sk_cgrp_data` of Linux, for the programs of
+    /// `BPF_PROG_TYPE_CGROUP_SKB`. A connection of a listening socket has the cgroup of the
+    /// listening socket.
+    cgroup: u32,
     /// The state at the last `collect`, for the counters of /proc/net/snmp.
     counted: State,
 }
@@ -215,6 +219,7 @@ impl Inner {
             shut_rd: false,
             shut_wr: false,
             uid: rk_vfs::cred::current().fsuid,
+            cgroup: rk_net::filter::sock_cgroup_current(),
             counted: State::Closed,
         }
     }
@@ -324,6 +329,8 @@ struct Tx {
     oif: u32,
     ttl: u8,
     tos: u8,
+    /// The cgroup of the socket.
+    cgroup: u32,
     /// Remove the connection from `ESTAB`.
     unhash: bool,
     /// Remove the binding from `PORTS`.
@@ -353,7 +360,8 @@ fn add(c: &AtomicU64, n: u64) {
 }
 
 /// Sends the segment `seg` of the connection `key` on the interface `oif` or on the route.
-fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, seg: &Seg) {
+/// `cgroup` is the cgroup of the socket, or 0.
+fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, cgroup: u32, seg: &Seg) {
     add(&COUNTERS.tcp_out_segs, 1);
     if seg.has(RST) {
         add(&COUNTERS.tcp_out_rsts, 1);
@@ -361,8 +369,16 @@ fn transmit(key: &Key, oif: u32, ttl: u8, tos: u8, seg: &Seg) {
     let &(src, sport, dst, dport) = key;
     let bytes = seg.encode(sport, dport, &src, &dst);
     // A segment fits in the MSS, and TCP sets DF, as `ip_queue_xmit` of Linux.
-    let out =
-        Out6 { src, dst, next: PROTO_TCP, hops: ttl, tclass: tos, ext: Vec::new(), dontfrag: true };
+    let out = Out6 {
+        src,
+        dst,
+        next: PROTO_TCP,
+        hops: ttl,
+        tclass: tos,
+        ext: Vec::new(),
+        dontfrag: true,
+        cgroup,
+    };
     // A lost segment is like a segment that the network lost: the timers send it again.
     let _ = stack6::output_ip_buf(&out, oif, bytes);
 }
@@ -382,10 +398,18 @@ fn listener(port: u16, dst: &Ip, dif: u32) -> Option<Arc<Stream>> {
 }
 
 /// Takes a TCP segment, as `tcp_v4_rcv` and `tcp_v6_rcv` of Linux. `tcp` has the header and
-/// the data. An IPv4 packet has IPv4-mapped addresses. The segment came in on `dif`, for
-/// `stack::dev_match`. With `csum_ok`, the kernel made the checksum, and it is not checked
-/// again.
-pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool, dif: u32, csum_ok: bool) {
+/// the data, and `packet` is the IP packet that has it. An IPv4 packet has IPv4-mapped
+/// addresses. The segment came in on `dif`, for `stack::dev_match`. With `csum_ok`, the kernel
+/// made the checksum, and it is not checked again.
+pub(crate) fn input(
+    src: Ip,
+    dst: Ip,
+    packet: &[u8],
+    tcp: &[u8],
+    broadcast: bool,
+    dif: u32,
+    csum_ok: bool,
+) {
     if broadcast {
         return;
     }
@@ -403,17 +427,23 @@ pub(crate) fn input(src: Ip, dst: Ip, tcp: &[u8], broadcast: bool, dif: u32, csu
     let key = (dst, dport, src, sport);
     let found = ESTAB.lock().get(&key).cloned();
     if let Some(sock) = found.filter(|s| stack::dev_match(s.oif(), dif)) {
-        sock.segment(seg);
+        // The programs of the cgroup can drop the segment, as `tcp_filter` of Linux.
+        if rk_net::filter::cgroup_skb_ingress(sock.cgroup(), packet) {
+            sock.segment(seg);
+        }
         return;
     }
-    if let Some(l) = listener(dport, &dst, dif)
-        && l.syn(&key, &seg)
-    {
-        return;
+    if let Some(l) = listener(dport, &dst, dif) {
+        if !rk_net::filter::cgroup_skb_ingress(l.cgroup(), packet) {
+            return;
+        }
+        if l.syn(&key, &seg) {
+            return;
+        }
     }
     // No socket: an RST, as `tcp_v4_send_reset`.
     if let Some(rst) = super::conn::reset_for(&seg) {
-        transmit(&key, 0, ipv4::DEFAULT_TTL, 0, &rst);
+        transmit(&key, 0, ipv4::DEFAULT_TTL, 0, 0, &rst);
     }
 }
 
@@ -537,6 +567,11 @@ impl Stream {
         self.state.lock().oif
     }
 
+    /// The cgroup of the socket, for the programs of `BPF_PROG_TYPE_CGROUP_SKB`.
+    fn cgroup(&self) -> u32 {
+        self.state.lock().cgroup
+    }
+
     /// Makes a socket.
     pub fn new() -> Arc<Self> {
         Self::with(Inner::new(AF_INET))
@@ -589,7 +624,8 @@ impl Stream {
             s.tw_reuse = true;
         }
         let (ttl, tos) = s.ip_options();
-        Tx { segs, key: s.key(), oif: s.oif, ttl, tos, unhash, unbind, reuse }
+        let cgroup = s.cgroup;
+        Tx { segs, key: s.key(), oif: s.oif, ttl, tos, cgroup, unhash, unbind, reuse }
     }
 
     /// Does the work of `collect` without the lock, and wakes the waiters.
@@ -599,7 +635,7 @@ impl Stream {
             PORTS.lock().set_reuse(port, self.ino, true);
         }
         for seg in &tx.segs {
-            transmit(&tx.key, tx.oif, tx.ttl, tx.tos, seg);
+            transmit(&tx.key, tx.oif, tx.ttl, tx.tos, tx.cgroup, seg);
         }
         if tx.unhash {
             let removed = {
@@ -728,6 +764,7 @@ impl Stream {
             c.syn_retries = s.syn_retries;
             c.algo = s.algo;
             c.uid = s.uid;
+            c.cgroup = s.cgroup;
             c.conn = Some(Conn::accept(&c.config(&remote), seg, now));
             c.tune(now);
             (Stream::with(c), s.reuse(), s.v6only)

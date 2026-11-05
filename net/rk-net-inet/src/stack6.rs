@@ -405,6 +405,7 @@ fn out4(out: &Out6, src: crate::ipv4::Addr, dst: crate::ipv4::Addr) -> stack::Ou
         tos: out.tclass,
         df: out.dontfrag,
         mc_loop: true,
+        cgroup: out.cgroup,
     }
 }
 
@@ -426,6 +427,8 @@ pub(crate) struct Out6 {
     /// The packet cannot go out in fragments: `IPV6_DONTFRAG`, or `IPV6_PMTUDISC_DO` and
     /// `IPV6_PMTUDISC_PROBE`. A packet larger than the MTU then gives `EMSGSIZE`.
     pub dontfrag: bool,
+    /// The cgroup of the socket, for the programs of `BPF_CGROUP_INET_EGRESS`, or 0.
+    pub cgroup: u32,
 }
 
 /// Sends a packet with the payload `payload` on the route `next`, as `ip6_xmit` and
@@ -440,16 +443,23 @@ pub(crate) fn output(next: &Next6, out: &Out6, payload: &[u8]) -> Result<()> {
     }
     // The fixed header names the routing header, as `ipv6_push_nfrag_opts`.
     let first = if out.ext.is_empty() { out.next } else { ipv6::NEXT_ROUTING };
-    if out.next == PROTO_ICMPV6 {
-        count_icmp_out(payload);
-    }
-    count(&COUNTERS6.out_requests);
     let header = |next: u8, len: usize| {
         let mut h = Header::new(out.src, out.dst, next, len);
         h.hops = out.hops;
         h.tclass = out.tclass;
         h.to_bytes()
     };
+    if rk_net::filter::cgroup_skb_enabled(out.cgroup, true) {
+        let mut packet = Vec::with_capacity(HLEN + len);
+        packet.extend_from_slice(&header(first, len));
+        packet.extend_from_slice(&out.ext);
+        packet.extend_from_slice(payload);
+        rk_net::filter::cgroup_skb_egress(out.cgroup, &packet)?;
+    }
+    if out.next == PROTO_ICMPV6 {
+        count_icmp_out(payload);
+    }
+    count(&COUNTERS6.out_requests);
     if HLEN + len <= mtu || nf_output_active() {
         let mut buf = NetBuf::new(HEADROOM, HLEN + len);
         buf.extend_from_slice(&header(first, len));
@@ -611,6 +621,7 @@ fn ip6_local_out(
         tclass: h.tclass,
         ext: ext.to_vec(),
         dontfrag: out.dontfrag,
+        cgroup: out.cgroup,
     };
     fragment(dev, next, &o, &skb.data()[at..], mtu)
 }
@@ -901,7 +912,7 @@ pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
     let dif = stack::dif_of(dev);
     let raw = stack::raw_sockets(AF_INET6, h.protocol);
     for sock in &raw {
-        sock.deliver_raw6(&h, ifindex, payload, dif);
+        sock.deliver_raw6(&h, ifindex, packet, payload, dif);
     }
     let known = matches!(h.protocol, PROTO_ICMPV6 | PROTO_UDP | PROTO_TCP | NEXT_NONE);
     if known || !raw.is_empty() {
@@ -910,9 +921,9 @@ pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
         count(&COUNTERS6.in_unknown_protos);
     }
     match h.protocol {
-        PROTO_ICMPV6 => icmp_input(dev, &h, payload, mcast),
+        PROTO_ICMPV6 => icmp_input(dev, &h, packet, mcast),
         PROTO_UDP => udp_input(&h, ifindex, packet, mcast, dif),
-        PROTO_TCP => crate::tcp::input(h.src, h.dst, payload, mcast, dif, false),
+        PROTO_TCP => crate::tcp::input(h.src, h.dst, packet, payload, mcast, dif, false),
         NEXT_NONE => {}
         _ if raw.is_empty() => {
             icmp_error(&h, ifindex, packet, PARAMPROB, ICMPV6_UNK_NEXTHDR as u8, h.nh as u32);
@@ -1039,8 +1050,9 @@ fn icmp_errno(kind: u8, code: u8) -> (Errno, bool) {
     }
 }
 
-/// Takes an ICMPv6 message, as `icmpv6_rcv` of Linux.
-fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], mcast: bool) {
+/// Takes an ICMPv6 message, as `icmpv6_rcv` of Linux. `packet` has the IPv6 headers.
+fn icmp_input(dev: &NetDevice, h: &Header, packet: &[u8], mcast: bool) {
+    let msg = &packet[h.l4..];
     count(&COUNTERS6.icmp_in);
     if msg.len() < 4 {
         return count(&COUNTERS6.icmp_in_errors);
@@ -1067,7 +1079,7 @@ fn icmp_input(dev: &NetDevice, h: &Header, msg: &[u8], mcast: bool) {
                 stack::find_socket(&PING_PORTS, id, h.dst, h.src, 0, stack::dif_of(dev))
             {
                 let info = Some(Info6::of(h, ifindex));
-                sock.deliver(h.src, scope_of(&h.src, ifindex), 0, msg.to_vec(), info);
+                sock.deliver(packet, h.src, scope_of(&h.src, ifindex), 0, msg.to_vec(), info);
             }
         }
         DEST_UNREACH | PKT_TOOBIG | TIME_EXCEED | PARAMPROB if msg.len() >= 8 => {
@@ -1126,6 +1138,7 @@ fn send_icmp(src: &Ip, dst: &Ip, ifindex: u32, mut msg: Vec<u8>) {
         tclass: 0,
         ext: Vec::new(),
         dontfrag: false,
+        cgroup: 0,
     };
     // An ICMPv6 message that the stack makes is not for a socket, and a lost one is not an
     // error.
@@ -1325,7 +1338,8 @@ fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool, dif: u32) {
         return;
     };
     let info = Some(Info6::of(h, ifindex));
-    if sock.deliver(h.src, scope_of(&h.src, ifindex), u.src, d[UDP_HLEN..].to_vec(), info) {
+    let (scope, data) = (scope_of(&h.src, ifindex), d[UDP_HLEN..].to_vec());
+    if sock.deliver(packet, h.src, scope, u.src, data, info) {
         count(&COUNTERS6.udp_in);
     } else {
         count(&COUNTERS6.udp_rcvbuf_errors);

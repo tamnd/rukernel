@@ -240,6 +240,67 @@ pub(crate) fn cgroup_run_inet_sock(sock: &dyn Socket) -> Result<(), Errno> {
 /// Connects the hooks of the cgroup programs to the VFS. The boot code calls this one time.
 pub(crate) fn init() {
     rk_vfs::device::set_devcgroup_check(cgroup_bpf_check_dev_permission);
+    rk_net::filter::set_cgroup_skb_hooks(rk_net::filter::CgroupSkbHooks {
+        current: current_cgroup,
+        run: cgroup_bpf_run_filter_skb,
+        enabled: |egress| {
+            cgroup_bpf_enabled(if egress {
+                atype::CGROUP_INET_EGRESS
+            } else {
+                atype::CGROUP_INET_INGRESS
+            })
+        },
+    });
+}
+
+/// Runs the programs of `BPF_CGROUP_INET_INGRESS` or `BPF_CGROUP_INET_EGRESS` of `cgroup` on
+/// `packet`, which starts at its IP header, as `__cgroup_bpf_run_filter_skb` of Linux. The
+/// addresses and the ports of the socket come from the packet. Gives `false` if a program drops
+/// the packet: a return value with the bit 0 clear. The congestion bit of the values 2 and 3
+/// has no effect.
+fn cgroup_bpf_run_filter_skb(cgroup: rk_cgroup::CgId, egress: bool, packet: &[u8]) -> bool {
+    use rk_abi::native::if_ether::{ETH_P_IP, ETH_P_IPV6};
+    use rk_net::consts::{AF_INET, AF_INET6};
+    let atype = if egress { atype::CGROUP_INET_EGRESS } else { atype::CGROUP_INET_INGRESS };
+    if !cgroup_bpf_enabled(atype) {
+        return true;
+    }
+    let mut skb = rk_bpf::prog::SkBuff { data: packet, ..Default::default() };
+    // The source and destination addresses, and the offset and protocol of the transport
+    // header.
+    let (src, dst, l4, proto) = match packet.first().map(|b| b >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            skb.protocol = (ETH_P_IP as u16).to_be();
+            skb.family = AF_INET;
+            let (mut s, mut d) = ([0u8; 16], [0u8; 16]);
+            s[..4].copy_from_slice(&packet[12..16]);
+            d[..4].copy_from_slice(&packet[16..20]);
+            (s, d, usize::from(packet[0] & 0xf) * 4, packet[9])
+        }
+        Some(6) if packet.len() >= 40 => {
+            skb.protocol = (ETH_P_IPV6 as u16).to_be();
+            skb.family = AF_INET6;
+            let s: [u8; 16] = packet[8..24].try_into().unwrap_or_default();
+            let d: [u8; 16] = packet[24..40].try_into().unwrap_or_default();
+            (s, d, 40, packet[6])
+        }
+        _ => return true,
+    };
+    // The ports of TCP and UDP.
+    let (sport, dport) = match packet.get(l4..l4 + 4) {
+        Some(p) if matches!(proto, 6 | 17) => ([p[0], p[1]], [p[2], p[3]]),
+        _ => ([0; 2], [0; 2]),
+    };
+    let (local, remote, lport, rport) =
+        if egress { (src, dst, sport, dport) } else { (dst, src, dport, sport) };
+    skb.local_ip = local;
+    skb.remote_ip = remote;
+    skb.local_port = u32::from(u16::from_be_bytes(lport));
+    skb.remote_port = u32::from(u16::from_ne_bytes(rport));
+    // A packet that comes in has no task, as the filter of a socket.
+    let env: &dyn rk_bpf::helpers::HelperEnv =
+        if egress { &TaskHelperEnv } else { &FilterHelperEnv };
+    bpf_prog_run_array_cg(&Cgroups, cgroup, atype, |prog| prog.run(&mut skb, env)).is_ok()
 }
 
 /// A socket filter of `SO_ATTACH_BPF`.
