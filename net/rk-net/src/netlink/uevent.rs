@@ -28,7 +28,7 @@ const GROUP: u32 = 1;
 
 /// Sends the datagram `msg` to the sockets of the current namespace in the group 1.
 fn send_here(msg: &[u8]) {
-    broadcast(NETLINK_KOBJECT_UEVENT, None, msg, 0, 0, GROUP);
+    broadcast(NETLINK_KOBJECT_UEVENT, None, msg, 0, 0, GROUP, super::Creds::KERNEL);
 }
 
 /// Sends the datagram `msg` to the sockets of each namespace.
@@ -227,6 +227,44 @@ mod tests {
         assert_eq!(add[4], "INTERFACE=uev7");
         assert_eq!(add[5], format!("IFINDEX={}", d2.ifindex()));
         dev::unregister(&d2);
+    }
+
+    #[test]
+    fn a_socket_with_so_passcred_gets_the_credentials_of_the_sender() {
+        use crate::{Cred, Message};
+        use rk_abi::native::socket::{SO_PASSCRED, SOL_SOCKET};
+        let _serial = crate::TEST_DEVICES.lock();
+        // The udev monitor of systemd sets `SO_PASSCRED` and refuses an event without the
+        // credentials of the sender.
+        let s = listener(NETLINK_KOBJECT_UEVENT);
+        assert_eq!(s.get_option(SOL_SOCKET, SO_PASSCRED).unwrap(), 0i32.to_ne_bytes());
+        s.set_option(SOL_SOCKET, SO_PASSCRED, &1i32.to_ne_bytes()).unwrap();
+        assert_eq!(s.get_option(SOL_SOCKET, SO_PASSCRED).unwrap(), 1i32.to_ne_bytes());
+        assert_eq!(s.set_option(SOL_SOCKET, SO_PASSCRED, &[1]), Err(Errno::EINVAL));
+        // An event of the kernel has the process ID 0, the user 0 and the group 0.
+        send_all(
+            Event::new(Action::Add, String::from("/devices/virtual/block/uevcred1"), "block")
+                .finish(),
+        );
+        let r = s.recv(65536, 0, true).unwrap();
+        let c = r.cred.unwrap();
+        assert_eq!((c.pid, c.uid, c.gid), (0, 0, 0));
+        // A datagram of a process has the credentials of `SCM_CREDENTIALS`.
+        let from = listener(NETLINK_KOBJECT_UEVENT);
+        let cred = Cred { pid: 42, uid: 1000, gid: 100, process: None };
+        let m = Message {
+            data: b"x".to_vec(),
+            addr: Some(sockaddr(s.portid(), 0)),
+            cred: Some(cred),
+            ..Message::default()
+        };
+        from.send(&NoPaths, m, 0, true).unwrap();
+        let r = s.recv(65536, 0, true).unwrap();
+        assert_eq!(r.data, b"x");
+        let c = r.cred.unwrap();
+        assert_eq!((c.pid, c.uid, c.gid), (42, 1000, 100));
+        s.set_option(SOL_SOCKET, SO_PASSCRED, &0i32.to_ne_bytes()).unwrap();
+        assert_eq!(s.get_option(SOL_SOCKET, SO_PASSCRED).unwrap(), 0i32.to_ne_bytes());
     }
 
     #[test]

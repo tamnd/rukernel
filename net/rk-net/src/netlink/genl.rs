@@ -235,7 +235,7 @@ fn group_id(id: u16, grp: usize) -> Option<u32> {
 /// `genlmsg_multicast_netns` of Linux.
 pub fn multicast(id: u16, grp: usize, msg: Vec<u8>) {
     if let Some(group) = group_id(id, grp) {
-        broadcast(NETLINK_GENERIC, None, &msg, 0, 0, group);
+        broadcast(NETLINK_GENERIC, None, &msg, 0, 0, group, super::Creds::KERNEL);
     }
 }
 
