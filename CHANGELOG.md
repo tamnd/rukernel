@@ -4,13 +4,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
-### Fixed
-
-- A netlink socket takes `SO_PASSCRED` and gives the `SCM_CREDENTIALS` of the sender, as `netlink_recvmsg` of Linux. A message from the kernel has the PID, UID and GID 0. Before, `setsockopt(SO_PASSCRED)` gave `ENOPROTOOPT`, and systemd-logind stopped at the start because the device monitor of systemd sets this option on its `NETLINK_KOBJECT_UEVENT` socket (#539).
-
 ### Added
 
 - The PID, UTS, IPC and time namespaces have an owner user namespace, as the `user_ns` of their structures in Linux: the user namespace of the process that makes them. `NS_GET_USERNS` gives the owner. `setns` needs `CAP_SYS_ADMIN` in the owner and in the user namespace of the caller, as `pidns_install`, `utsns_install`, `ipcns_install`, `timens_install` and `netns_install` of Linux. Before, it needed the capability in the first user namespace, so a process that joined a user namespace could not join the other namespaces of a process in it. With a pidfd, `setns` checks all the namespaces with the credentials in the new user namespace, and an error changes nothing, as `validate_nsset` of Linux. `open_by_handle_at` of a pidfs handle gives `ESTALE` for a process out of the PID namespace of the caller and of the namespaces below it. The kselftests pidfd_fdinfo_test and pidfd_file_handle_test run in the `kselftest` boot test (#536).
+- The netlink protocol `NETLINK_AUDIT`, as kernel/audit.c of Linux. `AUDIT_GET` gives `struct audit_status`, and `AUDIT_SET` changes `enabled`, `failure`, the process ID of auditd, `rate_limit`, `backlog_limit`, `backlog_wait_time` and `lost`, with the `CONFIG_CHANGE` records. A process with `CAP_AUDIT_WRITE` sends the user messages, and the kernel makes a record of each with the process, the user, the login user and the session. A record goes to auditd, or to the kernel log if auditd is not there, and a copy goes to the group `AUDIT_NLGRP_READLOG` for a reader with `CAP_AUDIT_READ`. There are no audit rules yet: `AUDIT_LIST_RULES` gives an empty list (#540).
+
+### Fixed
+
+- A netlink socket takes `SO_PASSCRED` and gives the `SCM_CREDENTIALS` of the sender, as `netlink_recvmsg` of Linux. A message from the kernel has the PID, UID and GID 0. Before, `setsockopt(SO_PASSCRED)` gave `ENOPROTOOPT`, and systemd-logind stopped at the start because the device monitor of systemd sets this option on its `NETLINK_KOBJECT_UEVENT` socket (#539).
 
 ## [0.5.7] - 2026-11-05
 
@@ -26,7 +27,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The expressions `byteorder`, `range`, `limit` and `log` of nf_tables, as net/netfilter/nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c and nf_log_syslog.c of Linux. `limit` is a bucket of tokens for packets or bytes with a burst and `limit rate over`, and `log` writes the line of nf_log (the devices, the IP header, and the ports, flags and sequence numbers of TCP, UDP and ICMP) to the kernel log at its level. A `log` with a group (nfnetlink_log) gives `ENOENT` and the audit level gives `EOPNOTSUPP` (#542).
 - The systemd boot test runs rk-bpfpin, which pins an array map in /sys/fs/bpf, gets it again with `BPF_OBJ_GET` and reads a value (#537).
 - The `reject` expression of nf_tables, as net/netfilter/nft_reject*.c, net/ipv4/netfilter/nf_reject_ipv4.c and net/ipv6/netfilter/nf_reject_ipv6.c of Linux: an ICMP or ICMPv6 "destination unreachable" with a code, the codes of `icmpx` that each family turns into its own, or a TCP RST, then the drop of the packet. `reject` is for the hooks prerouting, input, forward and output (#542).
-- The netlink protocol `NETLINK_AUDIT`, as kernel/audit.c of Linux. `AUDIT_GET` gives `struct audit_status`, and `AUDIT_SET` changes `enabled`, `failure`, the process ID of auditd, `rate_limit`, `backlog_limit`, `backlog_wait_time` and `lost`, with the `CONFIG_CHANGE` records. A process with `CAP_AUDIT_WRITE` sends the user messages, and the kernel makes a record of each with the process, the user, the login user and the session. A record goes to auditd, or to the kernel log if auditd is not there, and a copy goes to the group `AUDIT_NLGRP_READLOG` for a reader with `CAP_AUDIT_READ`. There are no audit rules yet: `AUDIT_LIST_RULES` gives an empty list (#540).
 
 ## [0.5.6] - 2026-11-05
 
