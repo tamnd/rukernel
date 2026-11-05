@@ -25,6 +25,7 @@ use rk_proc::{Pid, Process};
 use rk_vfs::Location;
 use rk_vfs::file::{File, FileOps, events};
 use rk_vfs::inode::{Inode, InodeRef, Metadata, SetAttr, mode};
+use rk_vfs::user_ns::IdKind;
 use rk_vfs::wait::PollTable;
 use zerocopy::{Immutable, IntoBytes};
 
@@ -271,13 +272,19 @@ fn coredump_mask(dumpable: u8) -> u32 {
 ///
 /// # Errors
 ///
-/// Gives `EINVAL` for a structure smaller than the first version, and `ESRCH` for a reaped
-/// process without `PIDFD_INFO_EXIT` in the mask.
+/// Gives `EINVAL` for a structure smaller than the first version, `EREMOTE` for a process out of
+/// the PID namespace of the caller, and `ESRCH` for a reaped process without `PIDFD_INFO_EXIT`
+/// in the mask.
 fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysResult {
     if arg == 0 || size < PIDFD_INFO_SIZE_VER0 {
         return Err(Errno::EINVAL);
     }
     let mask: u64 = cx.read_val(arg)?;
+    // Only a process in the PID namespace of the caller or in a namespace below it gives its
+    // information, as `pid_in_current_pidns` of Linux.
+    if !pid_namespace::is_descendant(process.pid_ns(), cx.process().pid_ns()) {
+        return Err(Errno::EREMOTE);
+    }
     let mut info = PidfdInfo::default();
     let gone = reaped(process);
     let status = process.exit_status();
@@ -303,9 +310,14 @@ fn get_info(cx: &Cx<'_>, process: &Arc<Process>, size: usize, arg: u64) -> SysRe
             return Err(Errno::ESRCH);
         }
     } else {
+        // The credentials in the user namespace of the caller, as `from_kuid_munged` of Linux.
         let c = process.cred();
-        (info.ruid, info.rgid, info.euid, info.egid) = (c.uid, c.gid, c.euid, c.egid);
-        (info.suid, info.sgid, info.fsuid, info.fsgid) = (c.suid, c.sgid, c.fsuid, c.fsgid);
+        let me = cx.process().cred();
+        let u = |id| me.user_ns.from_kid_munged(IdKind::Uid, id);
+        let g = |id| me.user_ns.from_kid_munged(IdKind::Gid, id);
+        (info.ruid, info.rgid, info.euid, info.egid) = (u(c.uid), g(c.gid), u(c.euid), g(c.egid));
+        (info.suid, info.sgid, info.fsuid, info.fsgid) =
+            (u(c.suid), g(c.sgid), u(c.fsuid), g(c.fsgid));
         info.mask |= PIDFD_INFO_CREDS;
         if info.cgroupid == 0 {
             info.cgroupid = rk_fs_cgroup::cgroup_ino(process.cgroup());
