@@ -763,12 +763,14 @@ pub fn module_ids() -> Vec<u64> {
     modules().iter().map(|m| m.info.id.id).collect()
 }
 
-/// The modules that have their own directory in `/proc/PID/attr`: each active module other
-/// than the capability module, with its ID and its name.
+/// The modules that have their own directory in `/proc/PID/attr`, with their IDs and their
+/// names. Only Smack and AppArmor have one, as `attr_dir_stuff` of fs/proc/base.c of Linux. Yama
+/// and the other modules have no attributes there, so LTP proc01 fails on a read of a directory
+/// for them.
 pub fn attr_modules() -> Vec<(u64, &'static str)> {
     modules()
         .iter()
-        .filter(|m| m.info.id.id != id::CAPABILITY)
+        .filter(|m| matches!(m.info.id.id, id::SMACK | id::APPARMOR))
         .map(|m| (m.info.id.id, m.info.id.name))
         .collect()
 }

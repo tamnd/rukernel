@@ -3861,6 +3861,8 @@ static void test_lsm(void)
 			struct stat st;
 
 			check("lsm: /proc/self/attr has the modes of Linux", stat("/proc/self/attr", &st) == 0 && (st.st_mode & 07777) == 0555 && stat("/proc/self/attr/prev", &st) == 0 && (st.st_mode & 07777) == 0444 && stat("/proc/self/attr/exec", &st) == 0 && (st.st_mode & 07777) == 0666);
+			/* Only Smack and AppArmor have a directory, as attr_dir_stuff of fs/proc/base.c. LTP proc01 reads each file of the other directories. */
+			check("lsm: /proc/self/attr has no directory for Yama", stat("/proc/self/attr/yama", &st) < 0 && errno == ENOENT);
 		}
 	}
 	{
@@ -3896,6 +3898,8 @@ static void test_lsm(void)
 		close(ready[0]);
 		close(ready[1]);
 	}
+	/* test_proc mounts proc again and checks the result. */
+	umount("/proc");
 }
 
 static void test_syslog(void)
