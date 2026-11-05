@@ -12924,6 +12924,181 @@ static void test_cgroup(void)
 }
 
 /* Runs the general checks, which each boot of init runs without the argument "only". */
+/* Sends an audit message of the type `type` with `len` bytes of `data` to the kernel, with
+ * NLM_F_ACK. Gives 0, or -1 on an error of send. */
+static int audit_send(int fd, int type, const void *data, int len)
+{
+	char buf[256];
+	struct nlmsghdr *h = (struct nlmsghdr *)buf;
+	struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+
+	memset(buf, 0, sizeof(buf));
+	h->nlmsg_len = NLMSG_LENGTH(len);
+	h->nlmsg_type = type;
+	h->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+	h->nlmsg_seq = 77;
+	memcpy(NLMSG_DATA(h), data, len);
+	return sendto(fd, buf, h->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0 ? -1 : 0;
+}
+
+/* Reads messages on fd until one has the type `type`. Gives its size in buf, or -1 if no such
+ * message comes in 1 second. */
+static int audit_wait(int fd, int type, char *buf, int size)
+{
+	for (;;) {
+		struct pollfd p = { .fd = fd, .events = POLLIN };
+		int n;
+
+		if (poll(&p, 1, 1000) != 1)
+			return -1;
+		n = recv(fd, buf, size - 1, 0);
+		if (n < (int)NLMSG_HDRLEN)
+			return -1;
+		buf[n] = 0;
+		if (((struct nlmsghdr *)buf)->nlmsg_type == type)
+			return n;
+	}
+}
+
+/* Gives the error of the next ack on fd, or -9999 if no ack comes. */
+static int audit_ack(int fd)
+{
+	char buf[512];
+
+	if (audit_wait(fd, NLMSG_ERROR, buf, sizeof(buf)) < 0)
+		return -9999;
+	return ((struct nlmsgerr *)NLMSG_DATA((struct nlmsghdr *)buf))->error;
+}
+
+/* NETLINK_AUDIT (#540, item 7): AUDIT_GET, AUDIT_SET and the user messages, as auditd,
+ * auditctl and the PAM modules use them. */
+static void test_audit(void)
+{
+	enum { A_GET = 1000, A_SET = 1001, A_LIST = 1002, A_LIST_RULES = 1013, A_USER_MSG = 1100,
+	       A_CONFIG_CHANGE = 1305, S_ENABLED = 1, S_PID = 4, S_BACKLOG = 0x10 };
+	struct sockaddr_nl g = { .nl_family = AF_NETLINK, .nl_groups = 1 };
+	uint32_t st[11], set[11];
+	char buf[1024];
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_AUDIT);
+	int rd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_AUDIT);
+	int n, ok;
+	pid_t pid;
+
+	check("audit: a socket of NETLINK_AUDIT opens", fd >= 0 && rd >= 0);
+	check("audit: a socket joins the group AUDIT_NLGRP_READLOG",
+	      bind(rd, (struct sockaddr *)&g, sizeof(g)) == 0);
+
+	/* AUDIT_GET gives struct audit_status, then the ack. */
+	audit_send(fd, A_GET, NULL, 0);
+	n = audit_wait(fd, A_GET, buf, sizeof(buf));
+	check("audit: AUDIT_GET gives struct audit_status",
+	      n == (int)(NLMSG_HDRLEN + sizeof(st)) && ((struct nlmsghdr *)buf)->nlmsg_seq == 77 &&
+	      ((struct nlmsghdr *)buf)->nlmsg_pid == 0);
+	memcpy(st, buf + NLMSG_HDRLEN, sizeof(st));
+	check("audit: the status is off, with failure 1, backlog_limit 64 and no auditd",
+	      st[1] == 0 && st[2] == 1 && st[3] == 0 && st[5] == 64 && st[8] == 0x7f);
+	check("audit: the ack of AUDIT_GET has the error 0", audit_ack(fd) == 0);
+
+	/* AUDIT_SET */
+	memset(set, 0, sizeof(set));
+	set[0] = S_ENABLED;
+	set[1] = 3;
+	audit_send(fd, A_SET, set, sizeof(set));
+	check("audit: AUDIT_SET of enabled 3 gives EINVAL", audit_ack(fd) == -EINVAL);
+	set[0] = S_BACKLOG;
+	set[5] = 320;
+	audit_send(fd, A_SET, set, sizeof(set));
+	check("audit: AUDIT_SET of backlog_limit works", audit_ack(fd) == 0);
+	audit_send(fd, A_GET, NULL, 0);
+	n = audit_wait(fd, A_GET, buf, sizeof(buf));
+	memcpy(st, buf + NLMSG_HDRLEN, sizeof(st));
+	check("audit: AUDIT_GET gives the new backlog_limit", n > 0 && st[5] == 320);
+	audit_ack(fd);
+	set[5] = 64;
+	audit_send(fd, A_SET, set, sizeof(set));
+	audit_ack(fd);
+	set[0] = S_PID;
+	set[3] = getpid() + 1;
+	audit_send(fd, A_SET, set, sizeof(set));
+	check("audit: AUDIT_SET of a pid that is not the caller gives EINVAL", audit_ack(fd) == -EINVAL);
+	audit_send(fd, A_LIST, NULL, 0);
+	check("audit: the old AUDIT_LIST gives EOPNOTSUPP", audit_ack(fd) == -EOPNOTSUPP);
+	audit_send(fd, A_LIST_RULES, NULL, 0);
+	check("audit: AUDIT_LIST_RULES gives an empty list", audit_wait(fd, NLMSG_DONE, buf, sizeof(buf)) > 0);
+	audit_ack(fd);
+
+	/* A user message while audit is off makes no record. */
+	audit_send(fd, A_USER_MSG, "off", 4);
+	check("audit: a user message works", audit_ack(fd) == 0);
+	check("audit: a user message while audit is off makes no record",
+	      audit_wait(rd, A_USER_MSG, buf, sizeof(buf)) < 0);
+
+	set[0] = S_ENABLED;
+	set[1] = 1;
+	audit_send(fd, A_SET, set, sizeof(set));
+	check("audit: AUDIT_SET of enabled 1 works", audit_ack(fd) == 0);
+	audit_send(fd, A_USER_MSG, "op=test", 8);
+	audit_ack(fd);
+	n = audit_wait(rd, A_USER_MSG, buf, sizeof(buf));
+	snprintf((char *)set, sizeof(set), "pid=%d uid=0 ", getpid());
+	check("audit: the record goes to the group with the full length",
+	      n > 0 && ((struct nlmsghdr *)buf)->nlmsg_len == (uint32_t)n);
+	check("audit: the record has the time, the process and the message",
+	      n > 0 && strncmp(buf + NLMSG_HDRLEN, "audit(", 6) == 0 &&
+	      strstr(buf + NLMSG_HDRLEN, (char *)set) && strstr(buf + NLMSG_HDRLEN, " msg='op=test'"));
+	audit_send(fd, A_USER_MSG, "x", 1);
+	check("audit: a user message of one byte gives EINVAL", audit_ack(fd) == -EINVAL);
+
+	/* auditd: the process registers its socket, and the records then go to it. */
+	memset(set, 0, sizeof(set));
+	set[0] = S_PID;
+	set[3] = getpid();
+	audit_send(fd, A_SET, set, sizeof(set));
+	n = audit_wait(fd, A_CONFIG_CHANGE, buf, sizeof(buf));
+	check("audit: the registration of auditd makes a CONFIG_CHANGE record for auditd",
+	      n > 0 && strstr(buf + NLMSG_HDRLEN, "op=set audit_pid=") &&
+	      ((struct nlmsghdr *)buf)->nlmsg_len == (uint32_t)(n - NLMSG_HDRLEN));
+	check("audit: AUDIT_SET of the pid of the caller works", audit_ack(fd) == 0);
+	pid = fork();
+	if (pid == 0) {
+		int c = socket(AF_NETLINK, SOCK_RAW, NETLINK_AUDIT);
+		uint32_t s2[11] = { S_PID };
+
+		audit_send(c, A_SET, s2, sizeof(s2));
+		ok = audit_ack(c) == -EACCES;
+		s2[3] = getpid();
+		audit_send(c, A_SET, s2, sizeof(s2));
+		ok = ok && audit_ack(c) == -EEXIST;
+		if (setuid(1000) != 0)
+			_exit(2);
+		audit_send(c, A_GET, NULL, 0);
+		ok = ok && audit_ack(c) == -EPERM;
+		audit_send(c, A_USER_MSG, "user", 5);
+		ok = ok && audit_ack(c) == -EPERM;
+		_exit(ok ? 0 : 1);
+	}
+	check("audit: another process cannot stop or replace auditd, and a user without the capabilities gets EPERM",
+	      pid > 0 && waitpid(pid, &n, 0) == pid && WIFEXITED(n) && WEXITSTATUS(n) == 0);
+	audit_send(fd, A_USER_MSG, "to auditd", 10);
+	n = audit_wait(fd, A_USER_MSG, buf, sizeof(buf));
+	check("audit: a record goes to auditd", n > 0 && strstr(buf + NLMSG_HDRLEN, " msg='to auditd'"));
+	audit_ack(fd);
+	set[3] = 0;
+	audit_send(fd, A_SET, set, sizeof(set));
+	audit_wait(fd, A_CONFIG_CHANGE, buf, sizeof(buf));
+	check("audit: auditd stops itself", audit_ack(fd) == 0);
+	set[0] = S_ENABLED;
+	set[1] = 0;
+	audit_send(fd, A_SET, set, sizeof(set));
+	audit_ack(fd);
+	audit_send(fd, A_GET, NULL, 0);
+	n = audit_wait(fd, A_GET, buf, sizeof(buf));
+	memcpy(st, buf + NLMSG_HDRLEN, sizeof(st));
+	check("audit: the status is off again with no auditd", n > 0 && st[1] == 0 && st[3] == 0);
+	close(fd);
+	close(rd);
+}
+
 /* Opens a socket of NETLINK_KOBJECT_UEVENT in the group 1, as udev does. Gives -1 on an error. */
 static int uevent_socket(void)
 {
@@ -13755,6 +13930,8 @@ int main(int argc, char **argv)
 		test_user_ns();
 	if (argc > 1 && strcmp(argv[1], "lsm") == 0)
 		test_lsm();
+	if (argc > 1 && strcmp(argv[1], "audit") == 0)
+		test_audit();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0) {
 		test_dns_key();
 		test_request_key();
