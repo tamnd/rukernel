@@ -30,6 +30,7 @@ use rk_proc::{Pid, Process};
 use rk_vfs::File;
 use rk_vfs::cred::cap;
 use rk_vfs::inode::mode::{S_IFMT, S_IFSOCK};
+use rk_vfs::user_ns::{self, IdKind};
 
 /// The size of `struct sockaddr_storage`, the longest address.
 const SOCKADDR_MAX: usize = 128;
@@ -62,13 +63,19 @@ pub(crate) fn current_cred() -> Cred {
 /// Checks the credentials that a sender gives in `SCM_CREDENTIALS`, as `scm_check_creds` of
 /// Linux. The pid must be the pid of the sender, or the sender must have `CAP_SYS_ADMIN`. The
 /// user ID must be the real, effective or saved user ID, or the sender must have `CAP_SETUID`.
-/// The group ID has the same rule with `CAP_SETGID`.
-fn check_scm_cred(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<(), Errno> {
+/// The group ID has the same rule with `CAP_SETGID`. The IDs are those of the user namespace of
+/// the sender, and the function gives the kernel IDs. An ID that the namespace does not map
+/// gives `EINVAL`.
+fn check_scm_cred(cx: &Cx<'_>, pid: i32, uid: u32, gid: u32) -> Result<(u32, u32), Errno> {
     let c = cx.process().cred();
+    let (uid, gid) = (c.user_ns.make_kuid(uid), c.user_ns.make_kgid(gid));
+    if uid == user_ns::INVALID_ID || gid == user_ns::INVALID_ID {
+        return Err(Errno::EINVAL);
+    }
     let pid_ok = pid as u32 == cx.process().pid() || c.capable(cap::SYS_ADMIN);
-    let uid_ok = [c.uid, c.euid, c.suid].contains(&uid) || c.capable(cap::SETUID);
-    let gid_ok = [c.gid, c.egid, c.sgid].contains(&gid) || c.capable(cap::SETGID);
-    if pid_ok && uid_ok && gid_ok { Ok(()) } else { Err(Errno::EPERM) }
+    let uid_ok = [c.uid, c.euid, c.suid].contains(&uid) || c.has_cap(cap::SETUID);
+    let gid_ok = [c.gid, c.egid, c.sgid].contains(&gid) || c.has_cap(cap::SETGID);
+    if pid_ok && uid_ok && gid_ok { Ok((uid, gid)) } else { Err(Errno::EPERM) }
 }
 
 /// The length of a control message with `len` bytes of data, as `CMSG_LEN`.
@@ -201,7 +208,9 @@ fn family_socket(
             let process = cx.process();
             let cred = process.cred();
             match proto {
-                InetProto::Raw(_) if !cred.capable(cap::NET_RAW) => return Err(Errno::EPERM),
+                InetProto::Raw(_) if !rk_net::ns::capable(cap::NET_RAW) => {
+                    return Err(Errno::EPERM);
+                }
                 // An echo socket needs a group in `net.ipv4.ping_group_range`, as
                 // `ping_init_sock` of Linux.
                 InetProto::Ping => {
@@ -224,7 +233,7 @@ fn family_socket(
         }
         // A packet socket needs `CAP_NET_RAW`, as `packet_create` of Linux.
         rk_net::packet::AF_PACKET => {
-            if !cx.process().cred().capable(cap::NET_RAW) {
+            if !rk_net::ns::capable(cap::NET_RAW) {
                 return Err(Errno::EPERM);
             }
             let protocol = u32::try_from(protocol).map_err(|_| Errno::EINVAL)?;
@@ -660,7 +669,7 @@ fn read_control(cx: &Cx<'_>, hdr: &MsgHdr, msg: &mut Message) -> Result<(), Errn
                     if uid == u32::MAX || gid == u32::MAX {
                         return Err(Errno::EINVAL);
                     }
-                    check_scm_cred(cx, pid, uid, gid)?;
+                    let (uid, gid) = check_scm_cred(cx, pid, uid, gid)?;
                     // The message refers to the process of `pid`, as `scm_replace_pid` of Linux.
                     let Some(target) = rk_proc::find_process(pid as Pid) else {
                         return Err(Errno::ESRCH);
@@ -719,10 +728,13 @@ fn write_control(
     // gives its own message, as `scm_recv_unix` of Linux.
     let cred = r.cred.as_ref();
     if let Some(c) = cred.filter(|_| flag_option(sock, SO_PASSCRED)) {
+        // The receiver sees the IDs of its user namespace, as `scm_recv_unix` of Linux.
+        let me = cx.process().cred();
+        let ns = &me.user_ns;
         let mut v = Vec::with_capacity(UCRED_SIZE);
         v.extend_from_slice(&c.pid.to_ne_bytes());
-        v.extend_from_slice(&c.uid.to_ne_bytes());
-        v.extend_from_slice(&c.gid.to_ne_bytes());
+        v.extend_from_slice(&ns.from_kid_munged(IdKind::Uid, c.uid).to_ne_bytes());
+        v.extend_from_slice(&ns.from_kid_munged(IdKind::Gid, c.gid).to_ne_bytes());
         if !put(&mut out, &mut space, SOL_SOCKET, SCM_CREDENTIALS, &v) {
             ctrunc = MSG_CTRUNC;
         }

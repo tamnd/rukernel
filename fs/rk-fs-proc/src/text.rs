@@ -10,6 +10,7 @@ use rk_abi::native::mount::{
     MS_RELATIME, MS_SYNCHRONOUS,
 };
 use rk_vfs::cred::Cred;
+use rk_vfs::user_ns::IdKind;
 
 /// The memory counts for `/proc/meminfo`, in KiB.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -598,7 +599,11 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
     let rss = x.rss / 1024;
     let m = &x.mem;
     let c = &x.cred;
-    let groups: Vec<String> = c.groups.iter().map(|g| format!("{g}")).collect();
+    // The reader sees the IDs of its user namespace, as `task_state` of Linux.
+    let me = rk_vfs::cred::current();
+    let u = |id| me.user_ns.from_kid_munged(IdKind::Uid, id);
+    let g = |id| me.user_ns.from_kid_munged(IdKind::Gid, id);
+    let groups: Vec<String> = c.groups.iter().map(|&id| format!("{}", g(id))).collect();
     let groups = groups.join(" ");
     let ns_list = |ids: &Vec<u32>, one: u32| {
         if ids.is_empty() {
@@ -627,14 +632,14 @@ pub fn status(s: &Stat, x: &Status) -> Vec<u8> {
         x.tid,
         s.ppid,
         x.tracer,
-        c.uid,
-        c.euid,
-        c.suid,
-        c.fsuid,
-        c.gid,
-        c.egid,
-        c.sgid,
-        c.fsgid,
+        u(c.uid),
+        u(c.euid),
+        u(c.suid),
+        u(c.fsuid),
+        g(c.gid),
+        g(c.egid),
+        g(c.sgid),
+        g(c.fsgid),
         groups,
         ns_list(&x.ns_ids[0], s.pid),
         ns_list(&x.ns_ids[1], x.tid),

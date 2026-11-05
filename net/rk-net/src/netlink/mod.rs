@@ -164,9 +164,9 @@ fn ngroups(protocol: u32) -> u32 {
     }
 }
 
-/// Tells if the current process has `CAP_NET_ADMIN`.
+/// Tells if the current process has `CAP_NET_ADMIN` in the owner of the network namespace.
 fn net_admin() -> bool {
-    cred::current().capable(cap::NET_ADMIN)
+    crate::ns::capable(cap::NET_ADMIN)
 }
 
 /// The bytes of a `struct sockaddr_nl`.
