@@ -412,6 +412,7 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::COPY_FILE_RANGE => splice::copy_file_range(cx, a[0], a[1], a[2], a[3], a[4], a[5]),
         nr::FADVISE64 => splice::fadvise64(cx, a[0], a[1], a[2], a[3]),
         nr::PIDFD_GETFD => pidfd::pidfd_getfd(cx, a[0], a[1], a[2]),
+        nr::PROCESS_MRELEASE => pidfd::process_mrelease(cx, a[0], a[1]),
         _ => Err(Errno::ENOSYS),
     }
 }

@@ -2226,6 +2226,49 @@ static void test_pidfd_thread(void)
 		close(fds[i]);
 }
 
+/* process_mrelease frees the memory of a process that SIGKILL ended (#536). The number is 448
+ * on x86_64 and arm64. */
+static void test_process_mrelease(void)
+{
+	int fds[2];
+	char c = 0;
+
+	errno = 0;
+	check("process_mrelease of a bad descriptor gives EBADF",
+	      syscall(448, -1, 0) == -1 && errno == EBADF);
+	if (pipe(fds) != 0) {
+		check("pipe for process_mrelease", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		char *m = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m != MAP_FAILED)
+			memset(m, 1, 1 << 20);
+		write(fds[1], &c, 1);
+		for (;;)
+			pause();
+	}
+	read(fds[0], &c, 1);
+	int fd = syscall(SYS_pidfd_open, pid, 0);
+	errno = 0;
+	check("process_mrelease with a flag gives EINVAL", syscall(448, fd, 1) == -1 && errno == EINVAL);
+	errno = 0;
+	check("process_mrelease of a running process gives EINVAL",
+	      syscall(448, fd, 0) == -1 && errno == EINVAL);
+	kill(pid, SIGKILL);
+	errno = 0;
+	long r = syscall(448, fd, 0);
+	check("process_mrelease of a killed process", r == 0 || errno == ESRCH);
+	waitpid(pid, NULL, 0);
+	errno = 0;
+	check("process_mrelease of a reaped process gives ESRCH",
+	      syscall(448, fd, 0) == -1 && errno == ESRCH);
+	close(fd);
+	close(fds[0]);
+	close(fds[1]);
+}
+
 static void test_pidfd_ioctl(void)
 {
 	struct rk_pidfd_info info;
@@ -13851,6 +13894,7 @@ static void test_all(void)
 	test_pidfs();
 	test_pidfd_ioctl();
 	test_pidfd_thread();
+	test_process_mrelease();
 	test_scm_pidfd();
 	test_signalfd_poll();
 	test_seccomp();
@@ -14182,6 +14226,13 @@ int main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "pidns") == 0)
 		test_pid_ns();
+	if (argc > 1 && strcmp(argv[1], "pidfd") == 0) {
+		test_pidfd();
+		test_pidfs();
+		test_pidfd_ioctl();
+		test_pidfd_thread();
+		test_process_mrelease();
+	}
 	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
 		test_bpf();
 	if (argc > 1 && strcmp(argv[1], "userns") == 0)

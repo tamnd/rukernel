@@ -658,6 +658,38 @@ pub(crate) fn pidfd_send_signal(
     Ok(0)
 }
 
+/// Frees the memory of a process that a signal ended, before its last thread ends, as
+/// `process_mrelease` in mm/oom_kill.c of Linux. The private areas lose their pages, as
+/// [`rk_mm::AddressSpace::reap`] tells.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a flag, or if the process does not exit or shares its memory with another
+/// process that does not exit (`task_will_free_mem` of Linux), `EBADF` if `fd` is not a process
+/// file descriptor, and `ESRCH` if the process has no memory now.
+pub(crate) fn process_mrelease(cx: &Cx<'_>, fd: u64, flags: u64) -> SysResult {
+    if flags as u32 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let process = process_of(cx, fd)?;
+    let vm = process.vm().ok_or(Errno::ESRCH)?;
+    if process.group_exit().is_none() {
+        return Err(Errno::EINVAL);
+    }
+    // A child of `vfork` or of `clone` with `CLONE_VM` and without `CLONE_THREAD` shares the
+    // memory.
+    let shared = rk_proc::processes().into_iter().any(|p| {
+        !Arc::ptr_eq(&p, &process)
+            && p.group_exit().is_none()
+            && p.vm().is_some_and(|v| Arc::ptr_eq(&v, &vm))
+    });
+    if shared {
+        return Err(Errno::EINVAL);
+    }
+    vm.reap();
+    Ok(0)
+}
+
 pub(crate) fn pidfd_getfd(cx: &Cx<'_>, fd: u64, target: u64, flags: u64) -> SysResult {
     if flags != 0 {
         return Err(Errno::EINVAL);
