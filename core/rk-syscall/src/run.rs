@@ -429,6 +429,28 @@ pub fn init() {
         },
     });
     rk_net::set_cred_source(crate::net::current_cred);
+    rk_net::netlink::audit::set_task_source(|| {
+        rk_proc::current_thread().map_or(
+            rk_net::netlink::audit::Task {
+                pid: 0,
+                uid: 0,
+                auid: rk_proc::AUDIT_UNSET,
+                ses: rk_proc::AUDIT_UNSET,
+                init_pid_ns: true,
+            },
+            |t| {
+                let p = t.process();
+                let (auid, ses) = p.audit_ids();
+                rk_net::netlink::audit::Task {
+                    pid: p.pid() as i32,
+                    uid: p.cred().uid,
+                    auid,
+                    ses,
+                    init_pid_ns: p.pid_ns().is_none(),
+                }
+            },
+        )
+    });
     rk_net::ns::set_source(|| rk_proc::current_thread().and_then(|t| t.net_ns_opt()));
     rk_net::ns::set_resolver(rk_net::ns::Resolver { by_pid: net_ns_of_pid, by_fd: net_ns_of_fd });
     rk_net_unix::init();

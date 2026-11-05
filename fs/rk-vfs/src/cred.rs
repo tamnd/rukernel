@@ -130,6 +130,8 @@ pub mod cap {
     pub const MAC_OVERRIDE: u32 = 32;
     /// Read and clear the kernel log.
     pub const SYSLOG: u32 = 34;
+    /// Read the audit log through the multicast group of the netlink socket.
+    pub const AUDIT_READ: u32 = 37;
     /// Set the next process ID and do the other work of a checkpoint and restore tool.
     pub const CHECKPOINT_RESTORE: u32 = 40;
     /// The highest capability of Linux, `CAP_CHECKPOINT_RESTORE`.

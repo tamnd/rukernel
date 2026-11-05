@@ -9,6 +9,7 @@
 //! layout of each message is the layout of Linux, because spec/10 section 10.4 asks for replies
 //! that are byte identical.
 
+pub mod audit;
 pub mod genl;
 pub mod link;
 pub mod msg;
@@ -31,11 +32,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use msg::{HDRLEN, Header};
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
-    NETLINK_ADD_MEMBERSHIP, NETLINK_BROADCAST_ERROR, NETLINK_CAP_ACK, NETLINK_DROP_MEMBERSHIP,
-    NETLINK_EXT_ACK, NETLINK_GENERIC, NETLINK_GET_STRICT_CHK, NETLINK_KOBJECT_UEVENT,
-    NETLINK_LIST_MEMBERSHIPS, NETLINK_LISTEN_ALL_NSID, NETLINK_NO_ENOBUFS, NETLINK_PKTINFO,
-    NETLINK_ROUTE, NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_FILTERED, NLM_F_ECHO, NLM_F_REQUEST,
-    NLMSG_MIN_TYPE,
+    NETLINK_ADD_MEMBERSHIP, NETLINK_AUDIT, NETLINK_BROADCAST_ERROR, NETLINK_CAP_ACK,
+    NETLINK_DROP_MEMBERSHIP, NETLINK_EXT_ACK, NETLINK_GENERIC, NETLINK_GET_STRICT_CHK,
+    NETLINK_KOBJECT_UEVENT, NETLINK_LIST_MEMBERSHIPS, NETLINK_LISTEN_ALL_NSID, NETLINK_NO_ENOBUFS,
+    NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_DUMP, NLM_F_DUMP_FILTERED, NLM_F_ECHO,
+    NLM_F_REQUEST, NLMSG_MIN_TYPE,
 };
 use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use rk_abi::native::rtnetlink::{
@@ -178,6 +179,7 @@ fn ngroups(protocol: u32) -> u32 {
         NETLINK_GENERIC => genl::NGROUPS,
         nfnetlink::NETLINK_NETFILTER => nfnetlink::NGROUPS,
         NETLINK_KOBJECT_UEVENT => uevent::NGROUPS,
+        NETLINK_AUDIT => audit::NGROUPS,
         _ => RTNLGRP_MAX,
     }
 }
@@ -228,6 +230,9 @@ fn bind_group(protocol: u32, group: u32) -> Result<()> {
     if protocol == NETLINK_KOBJECT_UEVENT {
         return Ok(());
     }
+    if protocol == NETLINK_AUDIT {
+        return audit::bind(group);
+    }
     if (group == RTNLGRP_IPV4_MROUTE_R || group == RTNLGRP_IPV6_MROUTE_R) && !net_admin() {
         return Err(Errno::EPERM);
     }
@@ -235,8 +240,8 @@ fn bind_group(protocol: u32, group: u32) -> Result<()> {
 }
 
 impl NetlinkSocket {
-    /// Makes a socket, as `netlink_create` of Linux. `NETLINK_ROUTE`, `NETLINK_GENERIC` and
-    /// `NETLINK_KOBJECT_UEVENT` are here.
+    /// Makes a socket, as `netlink_create` of Linux. `NETLINK_ROUTE`, `NETLINK_GENERIC`,
+    /// `NETLINK_KOBJECT_UEVENT`, `NETLINK_NETFILTER` and `NETLINK_AUDIT` are here.
     ///
     /// # Errors
     ///
@@ -246,8 +251,14 @@ impl NetlinkSocket {
         if kind != SOCK_RAW && kind != SOCK_DGRAM {
             return Err(Errno::ESOCKTNOSUPPORT);
         }
-        if ![NETLINK_ROUTE, NETLINK_GENERIC, NETLINK_KOBJECT_UEVENT, nfnetlink::NETLINK_NETFILTER]
-            .contains(&protocol)
+        if ![
+            NETLINK_ROUTE,
+            NETLINK_GENERIC,
+            NETLINK_KOBJECT_UEVENT,
+            nfnetlink::NETLINK_NETFILTER,
+            NETLINK_AUDIT,
+        ]
+        .contains(&protocol)
         {
             return Err(Errno::EPROTONOSUPPORT);
         }
@@ -424,6 +435,11 @@ impl NetlinkSocket {
     fn input(&self, data: &[u8]) {
         // A batch of netfilter runs as one transaction.
         if self.protocol == nfnetlink::NETLINK_NETFILTER && nfnetlink::rcv(self, data) {
+            return;
+        }
+        // audit has its own loop, with a positive result in the ack.
+        if self.protocol == NETLINK_AUDIT {
+            audit::rcv(self, data);
             return;
         }
         let portid = self.portid();
