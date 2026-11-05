@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.7] - 2026-11-05
+
 ### Added
 
 - The address programs of cgroup2, `BPF_PROG_TYPE_CGROUP_SOCK_ADDR`: `BPF_CGROUP_INET4_BIND`, `BPF_CGROUP_INET6_BIND`, `BPF_CGROUP_INET4_CONNECT` and `BPF_CGROUP_INET6_CONNECT` run on the address of `bind` and `connect` of a TCP or UDP socket, as `__cgroup_bpf_run_filter_sock_addr` of Linux. A program can change the address and the port. A program that gives 0 makes the call give `EPERM`, and a bind program that gives 3 lets a bind to a port below 1024 skip the check of `CAP_NET_BIND_SERVICE` (#537).
@@ -16,7 +18,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The expressions `byteorder`, `range`, `limit` and `log` of nf_tables, as net/netfilter/nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c and nf_log_syslog.c of Linux. `limit` is a bucket of tokens for packets or bytes with a burst and `limit rate over`, and `log` writes the line of nf_log (the devices, the IP header, and the ports, flags and sequence numbers of TCP, UDP and ICMP) to the kernel log at its level. A `log` with a group (nfnetlink_log) gives `ENOENT` and the audit level gives `EOPNOTSUPP` (#542).
 - The systemd boot test runs rk-bpfpin, which pins an array map in /sys/fs/bpf, gets it again with `BPF_OBJ_GET` and reads a value (#537).
 
-## [0.5.6] - 2026-11-09
+## [0.5.6] - 2026-11-05
 
 ### Added
 
@@ -1381,6 +1383,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.7]: https://github.com/tamnd/rukernel/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/tamnd/rukernel/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/tamnd/rukernel/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/tamnd/rukernel/compare/v0.5.3...v0.5.4
