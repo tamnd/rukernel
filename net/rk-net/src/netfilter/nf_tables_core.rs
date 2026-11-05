@@ -27,8 +27,9 @@ use crate::netfilter::nf_nat::{
     hook2manip, nf_nat_masquerade, nf_nat_setup_info,
 };
 use crate::netfilter::{
-    NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_INET,
-    NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo, nf_pktinfo as nft_pktinfo,
+    NF_INET_FORWARD, NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING,
+    NF_INET_PRE_ROUTING, NFPROTO_INET, NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo,
+    nf_pktinfo as nft_pktinfo,
 };
 use crate::netlink::msg::Attrs;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -42,8 +43,9 @@ use rk_vfs::inode::Result;
 mod nft_exprs;
 
 use self::nft_exprs::{
-    NftByteorder, NftLimit, NftLog, NftRange, nft_byteorder_eval, nft_byteorder_init,
+    NftByteorder, NftLimit, NftLog, NftRange, NftReject, nft_byteorder_eval, nft_byteorder_init,
     nft_limit_eval, nft_limit_init, nft_log_eval, nft_log_init, nft_range_eval, nft_range_init,
+    nft_reject_eval, nft_reject_init,
 };
 
 // The attributes of an expression, `NFTA_EXPR_*`.
@@ -218,6 +220,8 @@ pub(super) enum NftExpr {
     Limit(Arc<NftLimit>),
     /// `log`, as nft_log.c.
     Log(NftLog),
+    /// `reject`, as nft_reject.c.
+    Reject(NftReject),
 }
 
 impl NftExpr {
@@ -405,6 +409,7 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
         b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
+        b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
         _ => Err(Errno::ENOENT),
     }
 }
@@ -535,15 +540,23 @@ fn nft_masq_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
     Ok(NftExpr::Masq { flags, proto })
 }
 
-/// The hooks of a base chain that can have the expression, as the `validate` of nft_nat.c and
-/// nft_masq.c of Linux. Gives `None` for an expression that any chain can have.
-fn nft_expr_hooks(e: &NftExpr) -> Option<u32> {
+/// The hooks of a base chain that can have the expression, and if the chain must have the type
+/// `nat`, as the `validate` of nft_nat.c, nft_masq.c and nft_reject.c of Linux. Gives `None`
+/// for an expression that any chain can have.
+fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
     match e {
         NftExpr::Nat { mtype: NF_NAT_MANIP_SRC, .. } => {
-            Some(1 << NF_INET_POST_ROUTING | 1 << NF_INET_LOCAL_IN)
+            Some((1 << NF_INET_POST_ROUTING | 1 << NF_INET_LOCAL_IN, true))
         }
-        NftExpr::Nat { .. } => Some(1 << NF_INET_PRE_ROUTING | 1 << NF_INET_LOCAL_OUT),
-        NftExpr::Masq { .. } => Some(1 << NF_INET_POST_ROUTING),
+        NftExpr::Nat { .. } => Some((1 << NF_INET_PRE_ROUTING | 1 << NF_INET_LOCAL_OUT, true)),
+        NftExpr::Masq { .. } => Some((1 << NF_INET_POST_ROUTING, true)),
+        NftExpr::Reject(_) => Some((
+            1 << NF_INET_PRE_ROUTING
+                | 1 << NF_INET_LOCAL_IN
+                | 1 << NF_INET_FORWARD
+                | 1 << NF_INET_LOCAL_OUT,
+            false,
+        )),
         _ => None,
     }
 }
@@ -553,7 +566,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<u32> {
 /// that a jump reaches checks this when a packet gets there.
 pub(super) fn nft_expr_validate(e: &NftExpr, base: Option<(&NftChainType, u8)>) -> Result<()> {
     match (nft_expr_hooks(e), base) {
-        (Some(mask), Some((ty, hook))) if !ty.nat || mask & 1 << hook == 0 => {
+        (Some((mask, nat)), Some((ty, hook))) if (nat && !ty.nat) || mask & 1 << hook == 0 => {
             Err(Errno::EOPNOTSUPP)
         }
         _ => Ok(()),
@@ -889,7 +902,7 @@ fn nft_eval(
             // rule of NAT only with a jump; the rule does not match there.
             e @ (NftExpr::Nat { .. } | NftExpr::Masq { .. })
                 if !prog.nat
-                    || nft_expr_hooks(e).is_some_and(|m| m & 1 << state.hook == 0)
+                    || nft_expr_hooks(e).is_some_and(|(m, _)| m & 1 << state.hook == 0)
                     || skb.nfct.get().is_none() =>
             {
                 regs.verdict = NFT_BREAK;
@@ -913,6 +926,14 @@ fn nft_eval(
             NftExpr::Range(r) => nft_range_eval(r, regs),
             NftExpr::Limit(l) => nft_limit_eval(l, regs, skb),
             NftExpr::Log(l) => nft_log_eval(l, skb, state),
+            // A chain that a jump reaches from a hook with no `reject` does not reject.
+            NftExpr::Reject(r) => {
+                regs.verdict = if nft_expr_hooks(e).is_some_and(|(m, _)| m & 1 << state.hook == 0) {
+                    NFT_BREAK
+                } else {
+                    nft_reject_eval(r, skb, state)
+                };
+            }
         },
     }
 }

@@ -1188,6 +1188,30 @@ pub(crate) fn icmp_error(h: &Header, ifindex: u32, packet: &[u8], kind: u8, code
     send_icmp(&src, &h.src, ifindex, msg);
 }
 
+/// Sends an ICMPv6 error "destination unreachable" with `code` about `packet`, for the
+/// `reject` of nf_tables, as `nf_send_unreach6` of Linux.
+pub(crate) fn icmp_unreach(h: &Header, ifindex: u32, packet: &[u8], code: u8) {
+    icmp_error(h, ifindex, packet, DEST_UNREACH, code, 0);
+}
+
+/// Sends the TCP segment `tcp` of an RST of `reject` from `src` to `dst`, as `nf_send_reset6`
+/// of Linux.
+pub(crate) fn send_rst(src: &Ip, dst: &Ip, tcp: &[u8]) {
+    let Ok(next) = route(dst, scope_of(dst, 0)) else { return };
+    let out = Out6 {
+        src: *src,
+        dst: *dst,
+        next: PROTO_TCP,
+        hops: ipv6::DEFAULT_HOPS,
+        tclass: 0,
+        ext: Vec::new(),
+        dontfrag: false,
+        cgroup: 0,
+    };
+    // A lost RST is not an error.
+    let _ = output(&next, &out, tcp);
+}
+
 /// Takes a neighbour solicitation, as `ndisc_recv_ns` of Linux: it learns the address of the
 /// sender and answers for a local address.
 fn ndisc_ns(dev: &NetDevice, h: &Header, msg: &[u8]) {

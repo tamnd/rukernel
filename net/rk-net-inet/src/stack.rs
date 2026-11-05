@@ -32,6 +32,7 @@ use rk_net::consts::{
 };
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::ether::{EthHeader, MacAddr};
+use rk_net::netfilter::nf_reject::{NfReject, nf_reject_tcp_rst};
 use rk_net::netfilter::{
     NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_IPV4,
     nf_hook, nf_hook_active,
@@ -709,6 +710,48 @@ pub(crate) fn nat_src(pf: u8, ifindex: u32, dst: &[u8; 16]) -> Option<[u8; 16]> 
     let src = ROUTES.lock().select_addr(ifindex, d, RT_SCOPE_UNIVERSE as u8)?;
     a[..4].copy_from_slice(&src);
     Some(a)
+}
+
+/// Sends the answer of the nf_tables expression `reject` to `packet`, as `nf_send_unreach`,
+/// `nf_send_reset` and their IPv6 forms in nf_reject_ipv4.c and nf_reject_ipv6.c of Linux. The
+/// answer goes out as a packet of the host, through `NF_INET_LOCAL_OUT`.
+pub(crate) fn nf_reject(pf: u8, _hook: u8, in_dev: u32, packet: &[u8], how: NfReject) {
+    match how {
+        NfReject::Unreach(code) if pf == rk_net::netfilter::NFPROTO_IPV6 => {
+            if let Some(h) = crate::ipv6::Header::parse_loose(packet) {
+                crate::stack6::icmp_unreach(&h, in_dev, packet, code);
+            }
+        }
+        NfReject::Unreach(code) => {
+            if let Some(h) = Header::parse_loose(packet) {
+                icmp_send(&h, packet, ICMP_DEST_UNREACH, code, 0);
+            }
+        }
+        NfReject::TcpReset => {
+            let Some(rst) = nf_reject_tcp_rst(pf, packet) else { return };
+            if pf == rk_net::netfilter::NFPROTO_IPV6 {
+                return crate::stack6::send_rst(&rst.src, &rst.dst, &rst.tcp);
+            }
+            let (src, dst): (Addr, Addr) = (
+                rst.src[..4].try_into().unwrap_or_default(),
+                rst.dst[..4].try_into().unwrap_or_default(),
+            );
+            let Ok(next) = route(dst) else { return };
+            let ttl = rk_net::sysctl::default_ttl();
+            let out = Out {
+                src,
+                dst,
+                protocol: PROTO_TCP,
+                ttl,
+                tos: 0,
+                df: true,
+                mc_loop: false,
+                cgroup: 0,
+            };
+            // A lost RST is not an error.
+            let _ = output(&next, &out, &rst.tcp);
+        }
+    }
 }
 
 /// Gives a whole packet to `NF_INET_POST_ROUTING` and then to the link, in fragments if it is

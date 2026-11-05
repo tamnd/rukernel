@@ -68,6 +68,7 @@ pub fn init() {
     rk_net::netlink::init();
     rk_net::netfilter::init();
     rk_net::netfilter::nf_nat::nf_nat_set_src_fn(stack::nat_src);
+    rk_net::netfilter::nf_reject::nf_reject_set_fn(stack::nf_reject);
     rtnl::init();
     rules::init();
     nexthop::init();

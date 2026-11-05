@@ -1,9 +1,11 @@
-//! The expressions `byteorder`, `range`, `limit` and `log` of nf_tables, as nft_byteorder.c,
-//! nft_range.c, nft_limit.c, nft_log.c and nf_log_syslog.c of Linux.
+//! The expressions `byteorder`, `range`, `limit`, `log` and `reject` of nf_tables, as
+//! nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c, nf_log_syslog.c, nft_reject.c,
+//! nft_reject_ipv4.c, nft_reject_ipv6.c and nft_reject_inet.c of Linux.
 
 use super::{NFT_BREAK, NftRegs, be32, be64, len_attr, nft_parse_register, nft_value};
 use crate::buf::NetBuf;
-use crate::netfilter::{NFPROTO_IPV6, NfHookState};
+use crate::netfilter::nf_reject::{NfReject, nf_send_reject};
+use crate::netfilter::{NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NfHookState};
 use crate::netlink::msg::Attrs;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -57,6 +59,19 @@ const NF_LOG_TCPSEQ: u32 = 0x01;
 const NF_LOG_MASK: u32 = 0x2f;
 /// `NF_LOG_PREFIXLEN`: a prefix has fewer bytes.
 const NF_LOG_PREFIXLEN: usize = 128;
+
+// `NFTA_REJECT_*`, `enum nft_reject_types` and `enum nft_reject_inet_code`.
+const NFTA_REJECT_TYPE: u32 = 1;
+const NFTA_REJECT_ICMP_CODE: u32 = 2;
+const NFT_REJECT_ICMP_UNREACH: u32 = 0;
+const NFT_REJECT_TCP_RST: u32 = 1;
+const NFT_REJECT_ICMPX_UNREACH: u32 = 2;
+const NFT_REJECT_ICMPX_MAX: u8 = 3;
+/// The ICMP codes of the codes of `NFT_REJECT_ICMPX_UNREACH`, as `icmp_code_v4` of Linux:
+/// no route, port, host and administratively prohibited.
+const ICMPX_V4: [u8; 4] = [0, 3, 1, 13];
+/// The ICMPv6 codes of the codes of `NFT_REJECT_ICMPX_UNREACH`, as `icmp_code_v6` of Linux.
+const ICMPX_V6: [u8; 4] = [0, 4, 3, 1];
 
 /// `byteorder`, as nft_byteorder.c.
 #[derive(Clone, Debug)]
@@ -272,6 +287,55 @@ pub(super) fn nft_limit_eval(l: &NftLimit, regs: &mut NftRegs, skb: &NetBuf) {
     if over != l.invert {
         regs.verdict = NFT_BREAK;
     }
+}
+
+/// `reject`, as nft_reject.c and its forms for each family.
+#[derive(Clone, Debug)]
+pub(crate) struct NftReject {
+    ty: u32,
+    code: u8,
+}
+
+/// Reads a `reject` of a table of the family `family`, as `nft_reject_init` of Linux. A table
+/// of the family ARP has no `reject`.
+pub(super) fn nft_reject_init(family: u8, data: &[u8]) -> Result<NftReject> {
+    if !matches!(family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let a = Attrs::parse(data, 2);
+    let Some(ty) = be32(&a, NFTA_REJECT_TYPE)? else { return Err(Errno::EINVAL) };
+    let code = match ty {
+        NFT_REJECT_ICMP_UNREACH | NFT_REJECT_ICMPX_UNREACH => {
+            let Some(code) = a.u8(NFTA_REJECT_ICMP_CODE)? else { return Err(Errno::EINVAL) };
+            if ty == NFT_REJECT_ICMPX_UNREACH && code > NFT_REJECT_ICMPX_MAX {
+                return Err(Errno::EINVAL);
+            }
+            code
+        }
+        NFT_REJECT_TCP_RST => 0,
+        _ => return Err(Errno::EINVAL),
+    };
+    Ok(NftReject { ty, code })
+}
+
+/// Sends the answer of `reject` and drops the packet, as `nft_reject_inet_eval` and the eval
+/// of the other families of Linux. `NFT_REJECT_ICMPX_UNREACH` takes the code of the family of
+/// the packet.
+pub(super) fn nft_reject_eval(e: &NftReject, skb: &NetBuf, state: &NfHookState) -> u32 {
+    let v6 = state.pf == NFPROTO_IPV6;
+    let how = match e.ty {
+        NFT_REJECT_TCP_RST => Some(NfReject::TcpReset),
+        NFT_REJECT_ICMP_UNREACH => Some(NfReject::Unreach(e.code)),
+        NFT_REJECT_ICMPX_UNREACH => {
+            let map = if v6 { &ICMPX_V6 } else { &ICMPX_V4 };
+            Some(NfReject::Unreach(map[usize::from(e.code)]))
+        }
+        _ => None,
+    };
+    if let Some(how) = how {
+        nf_send_reject(state.pf, state.hook, state.in_dev, skb.data(), how);
+    }
+    super::NF_DROP
 }
 
 /// `log` to the kernel log, as nft_log.c with `NF_LOG_TYPE_LOG`.
@@ -677,5 +741,42 @@ mod tests {
             nft_log_init(&attrs(&[(6, &0x40u32.to_be_bytes())])).unwrap_err(),
             Errno::EINVAL
         );
+    }
+
+    #[test]
+    fn reject_sends_the_answer_of_the_family_and_drops() {
+        use crate::netfilter::nf_reject::nf_reject_set_fn;
+        static SENT: SpinLock<Vec<(u8, NfReject)>> = SpinLock::new(Vec::new());
+        nf_reject_set_fn(|pf, _, _, _, how| SENT.lock().push((pf, how)));
+        let be = |v: u32| v.to_be_bytes();
+        let icmpx = nft_reject_init(NFPROTO_INET, &attrs(&[(1, &be(2)), (2, &[1])])).unwrap();
+        let rst = nft_reject_init(NFPROTO_IPV4, &attrs(&[(1, &be(1))])).unwrap();
+        let skb = NetBuf::from_slice(&[0x45; 20]);
+        let mut s =
+            NfHookState { hook: NF_INET_LOCAL_OUT, pf: NFPROTO_IPV4, in_dev: 0, out_dev: 1 };
+        assert_eq!(nft_reject_eval(&icmpx, &skb, &s), super::super::NF_DROP);
+        s.pf = NFPROTO_IPV6;
+        nft_reject_eval(&icmpx, &skb, &s);
+        nft_reject_eval(&rst, &skb, &s);
+        assert_eq!(
+            *SENT.lock(),
+            [
+                (NFPROTO_IPV4, NfReject::Unreach(3)),
+                (NFPROTO_IPV6, NfReject::Unreach(4)),
+                (NFPROTO_IPV6, NfReject::TcpReset)
+            ]
+        );
+        // An ICMP type needs a code, an icmpx code is at most 3, and ARP has no reject.
+        assert_eq!(
+            nft_reject_init(NFPROTO_IPV4, &attrs(&[(1, &be(0))])).unwrap_err(),
+            Errno::EINVAL
+        );
+        let big = attrs(&[(1, &be(2)), (2, &[4])]);
+        assert_eq!(nft_reject_init(NFPROTO_INET, &big).unwrap_err(), Errno::EINVAL);
+        assert_eq!(nft_reject_init(3, &attrs(&[(1, &be(1))])).unwrap_err(), Errno::EOPNOTSUPP);
+        // No reject at the hook postrouting.
+        let e = super::super::NftExpr::Reject(rst);
+        let (mask, nat) = super::super::nft_expr_hooks(&e).unwrap();
+        assert!(!nat && mask & 1 << crate::netfilter::NF_INET_POST_ROUTING == 0);
     }
 }
