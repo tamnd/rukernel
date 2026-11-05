@@ -20,6 +20,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_frame::task::WaitQueue;
+use rk_vfs::user_ns::{self, UserNs};
 
 /// The deepest level of a namespace, `MAX_PID_NS_LEVEL` of Linux.
 pub const MAX_PID_NS_LEVEL: u32 = 32;
@@ -35,6 +36,8 @@ pub struct PidNamespace {
     level: u32,
     /// The parent, or `None` for a child of the first namespace.
     parent: Option<Arc<PidNamespace>>,
+    /// The user namespace that owns the namespace, `user_ns` of Linux.
+    user_ns: Arc<UserNs>,
     inner: SpinLock<Inner>,
     /// `zap_pid_ns_processes` waits here until the other processes of the namespace are gone.
     wait: WaitQueue,
@@ -59,13 +62,15 @@ static LIVE: SpinLock<Vec<Weak<PidNamespace>>> = SpinLock::new(Vec::new());
 /// The next ID for a namespace.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-/// Makes a child namespace of `parent`, as `create_pid_namespace` of Linux.
+/// Makes a child namespace of `parent` that the user namespace `owner` owns, as
+/// `create_pid_namespace` of Linux.
 ///
 /// # Errors
 ///
 /// Gives `ENOSPC` if the new namespace is deeper than `MAX_PID_NS_LEVEL`.
 pub fn create_pid_namespace(
     parent: Option<&Arc<PidNamespace>>,
+    owner: Arc<UserNs>,
 ) -> Result<Arc<PidNamespace>, Errno> {
     let level = parent.map_or(0, |p| p.level) + 1;
     if level > MAX_PID_NS_LEVEL {
@@ -75,6 +80,7 @@ pub fn create_pid_namespace(
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         level,
         parent: parent.cloned(),
+        user_ns: owner,
         inner: SpinLock::new(Inner {
             to_global: BTreeMap::new(),
             to_local: BTreeMap::new(),
@@ -102,6 +108,12 @@ pub fn by_id(id: u32) -> Option<Option<Arc<PidNamespace>>> {
 /// The nsfs ID of the namespace `ns`.
 pub fn ns_id(ns: Option<&Arc<PidNamespace>>) -> u32 {
     ns.map_or(0, |ns| ns.id)
+}
+
+/// The user namespace that owns the namespace `ns`. The first user namespace owns the first
+/// PID namespace.
+pub fn owner(ns: Option<&Arc<PidNamespace>>) -> Arc<UserNs> {
+    ns.map_or_else(|| user_ns::init().clone(), |ns| ns.user_ns.clone())
 }
 
 /// The level of the namespace `ns`.

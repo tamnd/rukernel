@@ -2133,7 +2133,7 @@ fn create_root(fs: FsContext, init: bool) -> Result<Arc<Thread>, Errno> {
 }
 
 /// What a new process shares with its parent. The other parts are copies.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct ForkShare {
     /// `CLONE_VM`: the address space.
     pub vm: bool,
@@ -2149,8 +2149,9 @@ pub struct ForkShare {
     /// `CLONE_INTO_CGROUP`: the cgroup of the child. `None` gives the cgroup of the caller.
     pub cgroup: Option<u32>,
     /// `CLONE_NEWPID`: the child is the init of a new PID namespace, a child of the namespace
-    /// for the children of the caller.
-    pub new_pid_ns: bool,
+    /// for the children of the caller. The value is the user namespace that owns the new
+    /// namespace: the user namespace of the child.
+    pub new_pid_ns: Option<Arc<rk_vfs::user_ns::UserNs>>,
     /// The IDs of `set_tid` of `clone3`, or zeros.
     pub set_tid: SetTid,
 }
@@ -2225,8 +2226,8 @@ fn fork_charged(parent: &Thread, share: ForkShare, cgroup: u32) -> Result<Arc<Th
     }
     // The child goes in the namespace for the children of the caller, or in a new child of it,
     // as `copy_pid_ns` of Linux.
-    let pid_ns = if share.new_pid_ns {
-        Some(pid_namespace::create_pid_namespace(parent.pid_ns_for_children().as_ref())?)
+    let pid_ns = if let Some(user_ns) = share.new_pid_ns {
+        Some(pid_namespace::create_pid_namespace(parent.pid_ns_for_children().as_ref(), user_ns)?)
     } else {
         parent.pid_ns_for_children()
     };

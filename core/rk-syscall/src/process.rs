@@ -29,6 +29,7 @@ use rk_proc::{
     ForkShare, Pid, Process, VforkDone, WaitOptions, WaitResult, WaitStatus, WaitTarget,
 };
 use rk_vfs::cred::Cred;
+use rk_vfs::user_ns::UserNs;
 use zerocopy::FromZeros;
 
 /// The number of signals. Linux names it `_NSIG`.
@@ -96,7 +97,7 @@ fn new_user_ns(process: &Process, flags: u64) -> Result<Option<Cred>, Errno> {
 /// namespace already after `unshare` or `setns`, and `ENOSPC` if the namespace is too deep.
 fn new_pid_ns(thread: &rk_proc::Thread, cred: &Cred) -> Result<Arc<PidNamespace>, Errno> {
     may_new_pid_ns(thread, cred)?;
-    pid_namespace::create_pid_namespace(thread.pid_ns_for_children().as_ref())
+    pid_namespace::create_pid_namespace(thread.pid_ns_for_children().as_ref(), cred.user_ns.clone())
 }
 
 /// Checks that `thread` can make a new PID namespace for its children. See `new_pid_ns`.
@@ -124,23 +125,29 @@ fn may_new_ns(cred: &Cred, flags: u64) -> Result<(), Errno> {
 }
 
 /// Puts `thread` in a new UTS namespace with a copy of the names, and in a new IPC namespace
-/// with no objects, as `flags` asks, as `copy_utsname` and `copy_ipcs` of Linux.
-fn new_uts_ipc_ns(thread: &rk_proc::Thread, flags: u64) {
+/// with no objects, as `flags` asks, as `copy_utsname` and `copy_ipcs` of Linux. The user
+/// namespace `owner` owns the new namespaces.
+fn new_uts_ipc_ns(thread: &rk_proc::Thread, flags: u64, owner: &Arc<UserNs>) {
     if flags & CLONE_NEWUTS != 0 {
-        thread.set_uts_ns(thread.uts_ns().copy());
+        thread.set_uts_ns(thread.uts_ns().copy(owner.clone()));
     }
     if flags & CLONE_NEWIPC != 0 {
-        thread.set_ipc_ns(rk_proc::ns::new_ipc());
+        thread.set_ipc_ns(rk_proc::ns::new_ipc(owner.clone()));
     }
 }
 
 /// Makes a new time namespace for the children of `thread` for `CLONE_NEWTIME`, with the offsets
-/// of the namespace of its children now, as `copy_time_ns` of Linux.
-fn new_time_ns(thread: &rk_proc::Thread, flags: u64) -> Result<Option<Arc<TimeNs>>, Errno> {
+/// of the namespace of its children now, as `copy_time_ns` of Linux. The user namespace of `cred`
+/// owns the new namespace.
+fn new_time_ns(
+    thread: &rk_proc::Thread,
+    flags: u64,
+    cred: &Cred,
+) -> Result<Option<Arc<TimeNs>>, Errno> {
     if flags & CLONE_NEWTIME == 0 {
         return Ok(None);
     }
-    rk_proc::timens::new(&thread.time_ns_for_children()).map(Some)
+    rk_proc::timens::new(&thread.time_ns_for_children(), cred.user_ns.clone()).map(Some)
 }
 
 /// Makes a new network namespace for `CLONE_NEWNET`, as `copy_net_ns` of Linux. It needs
@@ -202,7 +209,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     // The copy of the descriptor table comes before the other changes, so that an `EMFILE` of
     // `fs.nr_open` changes nothing, as `unshare_fd` in `ksys_unshare` of Linux.
     let files = if flags & CLONE_FILES != 0 { Some(cx.files()?.lock().try_clone()?) } else { None };
-    let time = new_time_ns(cx.thread, flags)?;
+    let time = new_time_ns(cx.thread, flags, cred)?;
     // The caller stays in its PID namespace, and its new children go in the new one.
     let pid_ns = if flags & CLONE_NEWPID != 0 { Some(new_pid_ns(cx.thread, cred)?) } else { None };
     if flags & CLONE_NEWCGROUP != 0 {
@@ -217,7 +224,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_SYSVSEM != 0 && process.threads().len() <= 1 {
         crate::sem::exit(process.pid() as i32);
     }
-    new_uts_ipc_ns(cx.thread, flags);
+    new_uts_ipc_ns(cx.thread, flags, &cred.user_ns);
     // The caller stays in its time namespace, and its new children go in the new one.
     if let Some(ns) = time {
         cx.thread.set_time_ns_for_children(ns);
@@ -297,87 +304,69 @@ fn new_cgroup_ns(process: &Process, cred: &Cred) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Puts the calling thread in the network namespace `ns`, as `netns_install` of Linux. The other
-/// threads of the process keep their namespace.
+/// Checks that a process with the credentials `cred` can join a namespace that the user namespace
+/// `owner` owns, as `netns_install`, `utsns_install`, `ipcns_install`, `timens_install` and
+/// `pidns_install` of Linux: it needs `CAP_SYS_ADMIN` in `owner` and in its own user namespace.
 ///
 /// # Errors
 ///
-/// `EPERM` without `CAP_SYS_ADMIN`.
-fn join_net_ns(cx: &Cx<'_>, ns: Arc<rk_net::ns::NetNs>) -> Result<(), Errno> {
-    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+/// `EPERM` without the capabilities.
+fn may_install(cred: &Cred, owner: &UserNs) -> Result<(), Errno> {
+    let cap = rk_vfs::cred::cap::SYS_ADMIN;
+    if !cred.ns_capable(owner, cap)
+        || !cred.has_cap(cap)
+        || !rk_vfs::security::capable(cred, cap, 0)
+    {
         return Err(Errno::EPERM);
     }
-    cx.thread.set_net_ns(ns);
     Ok(())
 }
 
-/// Puts the calling thread in the UTS namespace `ns`, as `utsns_install` of kernel/utsname.c
-/// of Linux.
+/// Checks that a process can join a cgroup namespace, as `cgroupns_install` of Linux. A cgroup
+/// namespace has no owner in rukernel, so the process needs `CAP_SYS_ADMIN` in the first user
+/// namespace with its credentials `old` before the call, and in its user namespace with its
+/// credentials `cred` after the call.
 ///
 /// # Errors
 ///
-/// `EPERM` without `CAP_SYS_ADMIN`.
-fn join_uts_ns(cx: &Cx<'_>, ns: Arc<rk_proc::uts::UtsNs>) -> Result<(), Errno> {
-    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+/// `EPERM` without the capabilities.
+fn may_join_cgroup_ns(old: &Cred, cred: &Cred) -> Result<(), Errno> {
+    if !old.capable(rk_vfs::cred::cap::SYS_ADMIN) || !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    cx.thread.set_uts_ns(ns);
     Ok(())
 }
 
-/// Puts the calling thread in the IPC namespace `ns`, as `ipcns_install` of ipc/namespace.c of
-/// Linux. The process leaves the semaphore undo list of the old namespace, as `exit_sem`.
-///
-/// # Errors
-///
-/// `EPERM` without `CAP_SYS_ADMIN`.
-fn join_ipc_ns(cx: &Cx<'_>, ns: Arc<rk_proc::ns::IpcNs>) -> Result<(), Errno> {
-    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
-    }
-    if cx.process().threads().len() <= 1 {
-        crate::sem::exit(cx.process().pid() as i32);
-    }
-    cx.thread.set_ipc_ns(ns);
-    Ok(())
-}
-
-/// Puts the calling thread and its new children in the time namespace `ns`, as `timens_install`
-/// of kernel/time/namespace.c of Linux.
+/// Checks that a process with the credentials `cred` can join the time namespace `ns`, as
+/// `timens_install` of kernel/time/namespace.c of Linux.
 ///
 /// # Errors
 ///
 /// `EUSERS` if the process has more than one thread, and `EPERM` without `CAP_SYS_ADMIN`.
-fn join_time_ns(cx: &Cx<'_>, ns: Arc<TimeNs>) -> Result<(), Errno> {
-    if cx.process().threads().len() > 1 {
+fn may_join_time_ns(process: &Process, cred: &Cred, ns: &TimeNs) -> Result<(), Errno> {
+    if process.threads().len() > 1 {
         return Err(Errno::EUSERS);
     }
-    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
-    }
-    cx.thread.enter_time_ns(ns, true)
+    may_install(cred, ns.user_ns())
 }
 
-/// Puts `process` in the cgroup namespace `ns`, as `cgroupns_install` of Linux.
-///
-/// # Errors
-///
-/// `EPERM` without `CAP_SYS_ADMIN`.
-fn join_cgroup_ns(process: &Process, ns: u32) -> Result<(), Errno> {
-    if !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
+/// Puts the calling thread in the IPC namespace `ns`, as `ipcns_install` of ipc/namespace.c of
+/// Linux. The process leaves the semaphore undo list of the old namespace, as `exit_sem`.
+fn join_ipc_ns(cx: &Cx<'_>, ns: Arc<rk_proc::ns::IpcNs>) {
+    if cx.process().threads().len() <= 1 {
+        crate::sem::exit(cx.process().pid() as i32);
     }
-    process.set_cgroup_ns(ns);
-    Ok(())
+    cx.thread.set_ipc_ns(ns);
 }
 
 /// `setns`: joins the namespace of a file of `/proc/PID/ns`, or the namespaces of the process of
 /// a process file descriptor, as `setns` of `kernel/nsproxy.c` of Linux.
 ///
-/// A process can change its cgroup, network, UTS and IPC namespaces, and its mount namespace
-/// through a file. The other kinds that `unshare` cannot make are the same for each process, so a
-/// join changes nothing, but it needs `CAP_SYS_ADMIN` as in Linux. A mount namespace through a
-/// process file descriptor gives `EINVAL`.
+/// A join of a namespace needs `CAP_SYS_ADMIN` in the user namespace that owns it, and in the
+/// user namespace of the caller. With a process file descriptor, the caller joins the user
+/// namespace first, and the checks of the other kinds use the credentials in it, as
+/// `validate_nsset` of Linux. An error changes nothing. A mount namespace through a process file
+/// descriptor gives `EINVAL`.
 pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     let file = cx.file(fd)?;
     let process = cx.process();
@@ -385,24 +374,36 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
         if nstype != 0 && nstype != kind.clone_flag() {
             return Err(Errno::EINVAL);
         }
+        let cred = process.cred();
         match kind {
-            rk_vfs::nsfs::NsKind::Cgroup => join_cgroup_ns(process, id)?,
+            rk_vfs::nsfs::NsKind::Cgroup => {
+                may_join_cgroup_ns(&cred, &cred)?;
+                process.set_cgroup_ns(id);
+            }
             // The file keeps the namespace, so the search finds it.
             rk_vfs::nsfs::NsKind::Net => {
-                join_net_ns(cx, rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?)?;
+                let ns = rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?;
+                may_install(&cred, ns.user_ns())?;
+                cx.thread.set_net_ns(ns);
             }
             rk_vfs::nsfs::NsKind::Uts => {
-                join_uts_ns(cx, rk_proc::uts::by_id(id).ok_or(Errno::EINVAL)?)?;
+                let ns = rk_proc::uts::by_id(id).ok_or(Errno::EINVAL)?;
+                may_install(&cred, ns.user_ns())?;
+                cx.thread.set_uts_ns(ns);
             }
             rk_vfs::nsfs::NsKind::Ipc => {
-                join_ipc_ns(cx, rk_proc::ns::ipc_by_id(id).ok_or(Errno::EINVAL)?)?;
+                let ns = rk_proc::ns::ipc_by_id(id).ok_or(Errno::EINVAL)?;
+                may_install(&cred, ns.user_ns())?;
+                join_ipc_ns(cx, ns);
             }
             rk_vfs::nsfs::NsKind::Time => {
-                join_time_ns(cx, rk_proc::timens::by_id(id).ok_or(Errno::EINVAL)?)?;
+                let ns = rk_proc::timens::by_id(id).ok_or(Errno::EINVAL)?;
+                may_join_time_ns(process, &cred, &ns)?;
+                cx.thread.enter_time_ns(ns, true)?;
             }
             rk_vfs::nsfs::NsKind::Pid => {
                 let ns = pid_namespace::by_id(id).ok_or(Errno::EINVAL)?;
-                may_join_pid_ns(cx, ns.as_ref())?;
+                may_join_pid_ns(cx, &cred, ns.as_ref())?;
                 cx.thread.set_pid_ns_for_children(ns);
             }
             kind => crate::ns::install(cx, process, kind, id)?,
@@ -429,34 +430,56 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     if target.is_zombie() {
         return Err(Errno::ESRCH);
     }
-    // A join needs `CAP_SYS_ADMIN`, as `validate_nsset` of Linux, and an error changes nothing.
-    if nstype & !CLONE_NEWUSER != 0 && !process.cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
-    }
-    // The user namespace comes first, as `validate_nsset` of Linux.
+    // The user namespace comes first, and the other checks use the credentials in it.
+    let old = process.cred();
+    let mut new_cred = None;
     if nstype & CLONE_NEWUSER != 0 {
         let ns = target.cred().user_ns.clone();
-        if ns != process.cred().user_ns {
-            crate::ns::join_user_ns(cx, process, ns)?;
+        if ns != old.user_ns {
+            new_cred = Some(crate::ns::user_ns_cred(cx, process, ns)?);
         }
     }
+    let cred = new_cred.as_ref().unwrap_or(&*old);
     if nstype & CLONE_NEWPID != 0 {
-        may_join_pid_ns(cx, target.pid_ns())?;
+        may_join_pid_ns(cx, cred, target.pid_ns())?;
     }
     if nstype & CLONE_NEWCGROUP != 0 {
-        join_cgroup_ns(process, target.cgroup_ns())?;
+        may_join_cgroup_ns(&old, cred)?;
+    }
+    let net = target.net_ns();
+    if nstype & CLONE_NEWNET != 0 {
+        may_install(cred, net.user_ns())?;
+    }
+    let uts = target.uts_ns();
+    if nstype & CLONE_NEWUTS != 0 {
+        may_install(cred, uts.user_ns())?;
+    }
+    let ipc = target.ipc_ns();
+    if nstype & CLONE_NEWIPC != 0 {
+        may_install(cred, ipc.user_ns())?;
+    }
+    let time = target.time_ns();
+    if nstype & CLONE_NEWTIME != 0 {
+        may_join_time_ns(process, cred, &time)?;
+    }
+    // All the checks passed, so the caller joins the namespaces, as `commit_nsset` of Linux.
+    if let Some(c) = new_cred {
+        process.set_cred(c);
+    }
+    if nstype & CLONE_NEWCGROUP != 0 {
+        process.set_cgroup_ns(target.cgroup_ns());
     }
     if nstype & CLONE_NEWNET != 0 {
-        join_net_ns(cx, target.net_ns())?;
+        cx.thread.set_net_ns(net);
     }
     if nstype & CLONE_NEWUTS != 0 {
-        join_uts_ns(cx, target.uts_ns())?;
+        cx.thread.set_uts_ns(uts);
     }
     if nstype & CLONE_NEWIPC != 0 {
-        join_ipc_ns(cx, target.ipc_ns())?;
+        join_ipc_ns(cx, ipc);
     }
     if nstype & CLONE_NEWTIME != 0 {
-        join_time_ns(cx, target.time_ns())?;
+        cx.thread.enter_time_ns(time, true)?;
     }
     if nstype & CLONE_NEWPID != 0 {
         cx.thread.set_pid_ns_for_children(target.pid_ns().cloned());
@@ -464,16 +487,15 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     Ok(0)
 }
 
-/// Checks that the caller can put its new children in the PID namespace `ns`, as
-/// `pidns_install` of Linux: `ns` is the namespace of the caller or a descendant of it.
+/// Checks that a process with the credentials `cred` can put its new children in the PID
+/// namespace `ns`, as `pidns_install` of Linux: `ns` is the namespace of the caller or a
+/// descendant of it.
 ///
 /// # Errors
 ///
 /// Gives `EPERM` without `CAP_SYS_ADMIN`, and `EINVAL` for another namespace.
-fn may_join_pid_ns(cx: &Cx<'_>, ns: Option<&Arc<PidNamespace>>) -> Result<(), Errno> {
-    if !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
-        return Err(Errno::EPERM);
-    }
+fn may_join_pid_ns(cx: &Cx<'_>, cred: &Cred, ns: Option<&Arc<PidNamespace>>) -> Result<(), Errno> {
+    may_install(cred, &pid_namespace::owner(ns))?;
     if !pid_namespace::is_descendant(ns, cx.process().pid_ns()) {
         return Err(Errno::EINVAL);
     }
@@ -611,7 +633,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     }
     // A new thread can have its own network namespace, as on Linux.
     let net = if flags & CLONE_NEWNET != 0 { Some(new_net_ns(cred)?) } else { None };
-    let time = new_time_ns(cx.thread, flags)?;
+    let time = new_time_ns(cx.thread, flags, cred)?;
     // The task blob of the child starts as a copy of the blob of the parent, and the security
     // modules can deny the new task, as `security_task_alloc` in `copy_process` of Linux. The
     // child has no ID yet.
@@ -629,11 +651,12 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
             exit_signal: args.exit_signal as u32,
             parent: flags & CLONE_PARENT != 0,
             cgroup,
-            new_pid_ns: flags & CLONE_NEWPID != 0,
+            new_pid_ns: (flags & CLONE_NEWPID != 0).then(|| cred.user_ns.clone()),
             set_tid: *set_tid,
         };
         rk_proc::fork(cx.thread, share)?
     };
+    let owner = cred.user_ns.clone();
     if let Some(c) = new_cred {
         thread.process().set_cred(c);
     }
@@ -646,7 +669,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     if let Some(net) = net {
         thread.set_net_ns(net);
     }
-    new_uts_ipc_ns(&thread, flags);
+    new_uts_ipc_ns(&thread, flags, &owner);
     if flags & CLONE_NEWCGROUP != 0 {
         let process = thread.process();
         let ns = rk_cgroup::with(|h| h.new_namespace(process.cgroup()));
