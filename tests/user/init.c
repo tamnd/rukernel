@@ -13072,6 +13072,52 @@ static void test_uevent(void)
 		umount("/sys");
 }
 
+/* The device monitor of systemd sets SO_PASSCRED on its socket, and it takes only the events
+ * with the credentials of root. An event of the kernel has the PID, UID and GID 0, as
+ * netlink_recvmsg of Linux. Gives 0, or the step that failed. */
+static int uevent_passcred(int fd)
+{
+	union {
+		struct cmsghdr h;
+		char b[CMSG_SPACE(sizeof(struct ucred))];
+	} c;
+	char buf[2048];
+	struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) - 1 };
+	struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	struct cmsghdr *m;
+	struct ucred u;
+	int on = 1, got = 0;
+	socklen_t len = sizeof(got);
+
+	if (setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) != 0)
+		return 1;
+	if (getsockopt(fd, SOL_SOCKET, SO_PASSCRED, &got, &len) != 0 || got != 1)
+		return 2;
+	if (write_text("/sys/class/mem/null/uevent", "change\n") != 0)
+		return 3;
+	for (;;) {
+		msg.msg_control = c.b;
+		msg.msg_controllen = sizeof(c.b);
+		if (poll(&p, 1, 2000) != 1)
+			return 4;
+		int n = recvmsg(fd, &msg, 0);
+		if (n <= 0)
+			return 5;
+		buf[n] = 0;
+		if (strcmp(buf, "change@/devices/virtual/mem/null") == 0)
+			break;
+	}
+	m = CMSG_FIRSTHDR(&msg);
+	if (!m || m->cmsg_level != SOL_SOCKET || m->cmsg_type != SCM_CREDENTIALS)
+		return 6;
+	memcpy(&u, CMSG_DATA(m), sizeof(u));
+	if (u.pid != 0 || u.uid != 0 || u.gid != 0)
+		return 7;
+	on = 0;
+	return setsockopt(fd, SOL_SOCKET, SO_PASSCRED, &on, sizeof(on)) == 0 ? 0 : 8;
+}
+
 /* A write to the file `uevent` of a device in /sys sends a synthetic event of that device. */
 static void test_uevent_synth(void)
 {
@@ -13101,6 +13147,10 @@ static void test_uevent_synth(void)
 		      uevent_has(buf, len, "SYNTH_ARG_A=1") &&
 		      uevent_has(buf, len, "SYNTH_ARG_Key2=two") &&
 		      uevent_has(buf, len, "INTERFACE=lo"));
+	int step = uevent_passcred(fd);
+	if (step != 0)
+		printf("init: uevent: SO_PASSCRED failed at step %d\n", step);
+	check("uevent: SO_PASSCRED gives the credentials of the kernel, PID, UID and GID 0", step == 0);
 	bad = write_text("/sys/class/mem/null/uevent", "explode\n");
 	bad_errno = errno;
 	check("uevent: a write of an unknown action gives EINVAL",
