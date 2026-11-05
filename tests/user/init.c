@@ -13208,12 +13208,50 @@ static void userns_child(int ready, int done)
 	if (open("/tmp/userns.secret", O_RDONLY) != -1 || errno != EACCES)
 		_exit(code);
 	code++;
+	/* stat, chown and /proc/PID/status give the IDs of the namespace. */
+	struct stat st;
+	if (stat("/tmp/userns.secret", &st) != 0 || st.st_uid != 65534 || st.st_gid != 65534)
+		_exit(code);
+	code++;
+	int mfd = open("/tmp/userns.mine", O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	if (mfd < 0 || fstat(mfd, &st) != 0 || st.st_uid != 0 || st.st_gid != 0)
+		_exit(code);
+	close(mfd);
+	code++;
+	errno = 0;
+	if (chown("/tmp/userns.mine", 5, -1) != -1 || errno != EINVAL || chown("/tmp/userns.mine", 0, 0) != 0)
+		_exit(code);
+	code++;
+	char text[4096];
+	if (read_file("/proc/self/status", text, sizeof(text)) <= 0 || !strstr(text, "\nUid:\t0\t0\t0\t0\n") ||
+	    !strstr(text, "\nGid:\t0\t0\t0\t0\n"))
+		_exit(code);
+	code++;
 	/* The parent of the namespace is out of the view of the child. */
 	int fd = open("/proc/self/ns/user", O_RDONLY);
 	errno = 0;
 	if (fd < 0 || ioctl(fd, USERNS_GET_PARENT) != -1 || errno != EPERM)
 		_exit(code);
 	close(fd);
+	code++;
+	/* A raw socket needs CAP_NET_RAW in the owner of the network namespace. */
+	errno = 0;
+	int raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (raw != -1 || errno != EPERM)
+		_exit(code);
+	code++;
+	if (unshare(CLONE_NEWNET) != 0 || (raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)) < 0)
+		_exit(code);
+	close(raw);
+	code++;
+	/* NS_GET_USERNS of the network namespace gives its owner. */
+	struct stat nst;
+	int net = open("/proc/self/ns/net", O_RDONLY);
+	int owner = net < 0 ? -1 : ioctl(net, 0xb701);
+	if (owner < 0 || fstat(owner, &nst) != 0 || stat("/proc/self/ns/user", &st) != 0 || nst.st_ino != st.st_ino)
+		_exit(code);
+	close(owner);
+	close(net);
 	code++;
 	if (write(ready, "r", 1) != 1 || read(done, buf, 1) != 1)
 		_exit(code);
@@ -13231,6 +13269,7 @@ static void test_user_ns(void)
 	mkdir("/proc", 0755);
 	mount("proc", "/proc", "proc", 0, NULL);
 	mkdir("/tmp", 01777);
+	chmod("/tmp", 01777);
 	close(open("/tmp/userns.secret", O_WRONLY | O_CREAT | O_TRUNC, 0600));
 	memset(a, 0, sizeof(a));
 	check("/proc/self/ns/user is the first user namespace",
@@ -13242,6 +13281,9 @@ static void test_user_ns(void)
 	pid = fork();
 	if (pid == 0)
 		userns_child(ready[1], done[0]);
+	/* The parent closes its ends, so that the read sees the exit of a child that fails. */
+	close(ready[1]);
+	close(done[0]);
 	ok = read(ready[0], a, 1) == 1;
 	check("an unprivileged user makes a user namespace and maps itself to root in it", ok);
 	if (ok) {
@@ -13272,15 +13314,13 @@ static void test_user_ns(void)
 		check("setns joins the user namespace", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 		close(fd);
 	}
-	if (write(done[1], "d", 1) != 1)
+	if (ok && write(done[1], "d", 1) != 1)
 		kill(pid, SIGKILL);
 	waitpid(pid, &status, 0);
 	check("the checks in the user namespace pass", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		printf("init: the child of the user namespace exited with %d\n", WEXITSTATUS(status));
 	close(ready[0]);
-	close(ready[1]);
-	close(done[0]);
 	close(done[1]);
 	/* user.max_user_namespaces limits the namespaces of each user. */
 	char max[32] = "";
@@ -13309,6 +13349,7 @@ static void test_user_ns(void)
 	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		printf("init: the nest of user namespaces exited with %d\n", WEXITSTATUS(status));
 	unlink("/tmp/userns.secret");
+	unlink("/tmp/userns.mine");
 }
 
 int main(int argc, char **argv)

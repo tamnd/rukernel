@@ -149,7 +149,7 @@ fn new_net_ns(cred: &Cred) -> Result<Arc<rk_net::ns::NetNs>, Errno> {
     if !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    rk_net::ns::new()
+    rk_net::ns::new_in(cred.user_ns.clone())
 }
 
 /// `unshare`: the process gets its own copy of the parts that it shares, as kernel/fork.c of

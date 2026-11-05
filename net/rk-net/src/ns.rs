@@ -21,6 +21,7 @@ use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
 use rk_vfs::UserMemory;
 use rk_vfs::inode::Result;
+use rk_vfs::user_ns::{self, UserNs};
 use rk_vfs::wait::PollTable;
 
 /// The most namespaces at one time.
@@ -31,6 +32,9 @@ const MAX_NS: usize = 4096;
 pub struct NetNs {
     index: usize,
     generation: u64,
+    /// The user namespace that owns the namespace, in which `CAP_NET_ADMIN` and `CAP_NET_RAW`
+    /// apply.
+    user_ns: Arc<UserNs>,
 }
 
 impl NetNs {
@@ -49,6 +53,11 @@ impl NetNs {
     /// Tells if this is the first namespace, `init_net` of Linux.
     pub fn is_init(&self) -> bool {
         self.index == 0
+    }
+
+    /// The user namespace that owns the namespace, `net->user_ns` of Linux.
+    pub fn user_ns(&self) -> &Arc<UserNs> {
+        &self.user_ns
     }
 }
 
@@ -94,7 +103,8 @@ static INIT: Once<Arc<NetNs>> = Once::new();
 
 /// The first namespace, `init_net` of Linux.
 pub fn init_ns() -> Arc<NetNs> {
-    INIT.call_once(|| Arc::new(NetNs { index: 0, generation: 0 })).clone()
+    INIT.call_once(|| Arc::new(NetNs { index: 0, generation: 0, user_ns: user_ns::init().clone() }))
+        .clone()
 }
 
 /// The count of namespaces that exist now, with the first one.
@@ -132,9 +142,15 @@ pub fn add_device_ops(init: fn(), exit: fn()) {
     OPS.lock().push(Ops { init, exit, device: true });
 }
 
-/// Makes a new namespace, as `copy_net_ns` of Linux. Gives `ENOSPC` if too many namespaces
-/// exist.
+/// Makes a new namespace that the first user namespace owns. Gives `ENOSPC` if too many
+/// namespaces exist.
 pub fn new() -> Result<Arc<NetNs>> {
+    new_in(user_ns::init().clone())
+}
+
+/// Makes a new namespace that the user namespace `owner` owns, as `copy_net_ns` of Linux. Gives
+/// `ENOSPC` if too many namespaces exist.
+pub fn new_in(owner: Arc<UserNs>) -> Result<Arc<NetNs>> {
     let generation = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
     let ns = {
         let mut reg = REGISTRY.lock();
@@ -149,7 +165,7 @@ pub fn new() -> Result<Arc<NetNs>> {
             }
             None => return Err(Errno::ENOSPC),
         };
-        let ns = Arc::new(NetNs { index, generation });
+        let ns = Arc::new(NetNs { index, generation, user_ns: owner });
         reg[index] = Some(Entry { generation, ns: Arc::downgrade(&ns) });
         ns
     };
@@ -278,6 +294,12 @@ pub fn current_index() -> usize {
 /// `enter` set.
 pub fn current() -> Arc<NetNs> {
     by_index(current_index()).unwrap_or_else(init_ns)
+}
+
+/// Tells if the current process has the capability `cap` in the user namespace that owns the
+/// current network namespace, as `ns_capable(net->user_ns, cap)` of Linux.
+pub fn capable(cap: u32) -> bool {
+    rk_vfs::cred::current().ns_capable(current().user_ns(), cap)
 }
 
 /// The guard of `enter`. The task leaves the namespace when the guard goes.

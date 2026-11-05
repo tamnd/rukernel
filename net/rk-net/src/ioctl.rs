@@ -23,7 +23,7 @@ use rk_abi::native::sockios::{
 };
 use rk_frame::sync::SpinLock;
 use rk_vfs::UserMemory;
-use rk_vfs::cred::{self, cap};
+use rk_vfs::cred::cap;
 use rk_vfs::inode::Result;
 
 /// The size of `struct ifreq` on a 64-bit machine.
@@ -40,14 +40,14 @@ pub fn is_socket_cmd(cmd: u32) -> bool {
     (cmd >> 8) & 0xff == SOCK_IOC_TYPE
 }
 
-/// Tells if the current process has `CAP_NET_ADMIN`.
+/// Tells if the current process has `CAP_NET_ADMIN` in the owner of the network namespace.
 pub fn net_admin() -> bool {
-    cred::current().capable(cap::NET_ADMIN)
+    crate::ns::capable(cap::NET_ADMIN)
 }
 
-/// Tells if the current process has `CAP_NET_RAW`.
+/// Tells if the current process has `CAP_NET_RAW` in the owner of the network namespace.
 pub fn net_raw() -> bool {
-    cred::current().capable(cap::NET_RAW)
+    crate::ns::capable(cap::NET_RAW)
 }
 
 /// A `struct ifreq` in kernel memory.

@@ -35,6 +35,7 @@ use rk_vfs::device::{major, minor};
 use rk_vfs::file::O_ASYNC;
 use rk_vfs::inode::{Metadata, SetAttr, Timespec};
 use rk_vfs::lock::{self, LockKind, Owner, RecordLock};
+use rk_vfs::user_ns::{self, IdKind};
 use rk_vfs::{File, Location, Whence};
 use zerocopy::FromZeros;
 
@@ -47,6 +48,14 @@ const UIO_MAXIOV: u64 = 1024;
 /// The magic number of tmpfs, for `statfs`.
 const TMPFS_MAGIC: i64 = 0x0102_1994;
 
+/// The owner and the group of a file in the user namespace of the caller, as `from_kuid_munged`
+/// in `cp_new_stat` of Linux.
+fn ids_of(m: &Metadata) -> (u32, u32) {
+    let cred = rk_vfs::cred::current();
+    let ns = &cred.user_ns;
+    (ns.from_kid_munged(IdKind::Uid, m.uid), ns.from_kid_munged(IdKind::Gid, m.gid))
+}
+
 fn stat_of(m: &Metadata) -> Stat {
     // The layout of `struct stat` is not the same on each architecture, so the casts go to the
     // type of the field.
@@ -55,8 +64,7 @@ fn stat_of(m: &Metadata) -> Stat {
     st.st_ino = m.ino;
     st.st_nlink = m.nlink as _;
     st.st_mode = m.mode;
-    st.st_uid = m.uid;
-    st.st_gid = m.gid;
+    (st.st_uid, st.st_gid) = ids_of(m);
     st.st_rdev = m.rdev;
     st.st_size = m.size as i64;
     st.st_blksize = m.blksize as _;
@@ -825,8 +833,7 @@ pub(crate) fn statx(
     }
     s.stx_blksize = meta.blksize;
     s.stx_nlink = meta.nlink;
-    s.stx_uid = meta.uid;
-    s.stx_gid = meta.gid;
+    (s.stx_uid, s.stx_gid) = ids_of(&meta);
     s.stx_mode = meta.mode as u16;
     s.stx_ino = meta.ino;
     s.stx_size = meta.size;
@@ -1659,9 +1666,20 @@ pub(crate) fn fchmod(cx: &Cx<'_>, fd: u64, mode: u64) -> SysResult {
     set_attr_fd(cx, fd, false, &attr, Change::Plain)
 }
 
-/// The owner of `chown`: -1 keeps the value.
-fn owner(id: u64) -> Option<u32> {
-    if id as u32 == u32::MAX { None } else { Some(id as u32) }
+/// The new owner and group of `chown`, as `chown_common` of Linux: -1 keeps the value, and the
+/// other IDs are those of the user namespace of the caller. An ID that the namespace does not map
+/// gives `EINVAL`.
+fn owners(cx: &Cx<'_>, uid: u64, gid: u64) -> Result<SetAttr, Errno> {
+    let cred = cx.process().cred();
+    let ns = &cred.user_ns;
+    let map = |id: u64, kind| match id as u32 {
+        u32::MAX => Ok(None),
+        id => match ns.make_kid(kind, id) {
+            user_ns::INVALID_ID => Err(Errno::EINVAL),
+            kid => Ok(Some(kid)),
+        },
+    };
+    Ok(SetAttr { uid: map(uid, IdKind::Uid)?, gid: map(gid, IdKind::Gid)?, ..SetAttr::default() })
 }
 
 pub(crate) fn fchownat(
@@ -1677,7 +1695,7 @@ pub(crate) fn fchownat(
     if flags & !(AT_SYMLINK_NOFOLLOW as u32 | AT_EMPTY_PATH as u32) != 0 {
         return Err(Errno::EINVAL);
     }
-    let attr = SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() };
+    let attr = owners(cx, uid, gid)?;
     if flags & AT_EMPTY_PATH as u32 != 0 && cx.read_path_opt(path, true)?.is_empty() {
         return set_attr_fd(cx, dirfd, true, &attr, Change::Owner);
     }
@@ -1686,7 +1704,7 @@ pub(crate) fn fchownat(
 }
 
 pub(crate) fn fchown(cx: &Cx<'_>, fd: u64, uid: u64, gid: u64) -> SysResult {
-    let attr = SetAttr { uid: owner(uid), gid: owner(gid), ..SetAttr::default() };
+    let attr = owners(cx, uid, gid)?;
     set_attr_fd(cx, fd, false, &attr, Change::Owner)
 }
 

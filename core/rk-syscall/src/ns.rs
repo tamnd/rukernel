@@ -36,11 +36,15 @@ const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
 /// `NS_GET_TGID_IN_PIDNS`: `_IOR(0xb7, 9, int)`.
 const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
 
-/// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. The first user
-/// namespace owns the namespaces of the other kinds.
+/// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. A network
+/// namespace has an owner, and the first user namespace owns the namespaces of the other kinds.
 pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         NS_GET_USERNS if kind == NsKind::User => user_owner(cx, id),
+        NS_GET_USERNS if kind == NsKind::Net => {
+            let net = rk_net::ns::by_id(id).ok_or(Errno::EINVAL)?;
+            open_user_ns(cx, Some(net.user_ns().clone()))
+        }
         NS_GET_USERNS => open_user_ns(cx, Some(user_ns::init().clone())),
         NS_GET_PARENT if kind == NsKind::Pid => pid_parent(cx, id),
         NS_GET_PARENT if kind == NsKind::User => user_owner(cx, id),
