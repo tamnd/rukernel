@@ -26,6 +26,7 @@ use rk_mm::vma::Backing;
 use rk_mm::{MmFile, MmapRequest, PAGE_SIZE, Prot, VmaKind};
 use rk_vfs::cred::{IpcOwner, cap};
 use rk_vfs::ipc::{SHM_NEXT_ID, SHMALL, SHMMAX, SHMMNI};
+use rk_vfs::security::{IpcClass, IpcSecurity};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new segment.
@@ -99,14 +100,16 @@ struct IpcPerm {
 }
 
 impl IpcPerm {
-    /// The owner, the creator and the mode, for the permission checks.
-    fn owner(&self) -> IpcOwner {
+    /// The owner, the creator, the mode and the security part `security`, for the permission
+    /// checks.
+    fn owner<'a>(&self, security: &'a IpcSecurity) -> IpcOwner<'a> {
         IpcOwner {
             uid: self.uid,
             gid: self.gid,
             cuid: self.cuid,
             cgid: self.cgid,
             mode: u32::from(self.mode),
+            security: Some(security),
         }
     }
 }
@@ -219,6 +222,8 @@ impl MmFile for ShmPages {
 
 /// A segment in the table.
 struct Segment {
+    /// The security part, as the `security` field of `struct kern_ipc_perm` of Linux.
+    security: IpcSecurity,
     pages: Arc<ShmPages>,
     perm: IpcPerm,
     atime: i64,
@@ -229,6 +234,11 @@ struct Segment {
 }
 
 impl Segment {
+    /// The owner, the creator, the mode and the security part, for the permission checks.
+    fn owner(&self) -> IpcOwner<'_> {
+        self.perm.owner(&self.security)
+    }
+
     /// The number of areas that hold the segment.
     fn nattch(&self) -> u64 {
         Arc::strong_count(&self.pages) as u64 - 1
@@ -299,7 +309,7 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
             .segments
             .iter()
             .find(|(_, s)| s.perm.key == key && s.perm.mode & SHM_DEST == 0)
-            .map(|(id, s)| (*id, s.pages.size, s.perm.owner()));
+            .map(|(id, s)| (*id, s.pages.size, s.owner()));
         if let Some((id, segsz, owner)) = found {
             if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
                 return Err(Errno::EEXIST);
@@ -308,6 +318,7 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
                 return Err(Errno::EINVAL);
             }
             c.ipc_permission(&owner, flags & 0o777)?;
+            rk_vfs::security::ipc_associate(&owner, flags)?;
             return Ok(id as u64);
         }
         if flags & IPC_CREAT == 0 {
@@ -325,6 +336,9 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
     if table.segments.len() as u64 >= shmmni() {
         return Err(Errno::ENOSPC);
     }
+    // The modules see the new object before it gets its ID, as `newseg` of Linux.
+    let security = IpcSecurity::new(IpcClass::Shm);
+    rk_vfs::security::ipc_alloc(&security)?;
     let huge = if flags & SHM_HUGETLB != 0 { Some(huge_segment(cx, size, flags)?) } else { None };
     let next = table.next;
     let id = rk_vfs::ipc::alloc_id(&SHM_NEXT_ID, next, |id| table.segments.contains_key(&id));
@@ -341,7 +355,8 @@ pub(crate) fn shmget(cx: &Cx<'_>, key: u64, size: u64, flags: u64) -> SysResult 
         mode: (flags & 0o777) as u16,
         ..IpcPerm::default()
     };
-    let segment = Segment { pages, perm, atime: 0, dtime: 0, ctime: now(), cpid: pid(cx), lpid: 0 };
+    let segment =
+        Segment { security, pages, perm, atime: 0, dtime: 0, ctime: now(), cpid: pid(cx), lpid: 0 };
     table.segments.insert(id, segment);
     Ok(id as u64)
 }
@@ -394,7 +409,7 @@ pub(crate) fn shmat(cx: &Cx<'_>, id: u64, addr: u64, flags: u64) -> SysResult {
     let pages = {
         let mut table = TABLE.get().lock();
         let s = table.get(id as i32)?;
-        c.ipc_permission(&s.perm.owner(), access)?;
+        c.ipc_permission(&s.owner(), access)?;
         s.pages.clone()
     };
     let len = usize::try_from(pages.map_len()).map_err(|_| Errno::ENOMEM)?;
@@ -498,7 +513,7 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
             let s = table.get(id)?;
             if cmd != SHM_STAT_ANY {
-                c.ipc_permission(&s.perm.owner(), 0o444)?;
+                c.ipc_permission(&s.owner(), 0o444)?;
             }
             let ds = s.ds();
             drop(table);
@@ -508,7 +523,7 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         IPC_SET => {
             let ds = new.ok_or(Errno::EINVAL)?;
             let s = table.get(id)?;
-            if !c.ipc_owns(&s.perm.owner()) {
+            if !c.ipc_owns(&s.owner()) {
                 return Err(Errno::EPERM);
             }
             // -1 is not a valid ID, as `ipc_update_perm` of Linux.
@@ -523,7 +538,7 @@ pub(crate) fn shmctl(cx: &Cx<'_>, id: u64, cmd: u64, buf: u64) -> SysResult {
         }
         IPC_RMID => {
             let s = table.get(id)?;
-            if !c.ipc_owns(&s.perm.owner()) {
+            if !c.ipc_owns(&s.owner()) {
                 return Err(Errno::EPERM);
             }
             s.perm.mode |= SHM_DEST;

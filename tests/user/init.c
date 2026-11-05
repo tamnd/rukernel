@@ -3748,6 +3748,25 @@ static void test_lsm(void)
 	if (pid == 0)
 		_exit(0);
 	check("lsm: fork and wait go through the task hooks", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	{
+		/* Each System V object gets its security part, and the associate and permission hooks run on each lookup by the key. */
+		int q = msgget(0x15a1, IPC_CREAT | 0600), m = semget(0x15a2, 1, IPC_CREAT | 0600), h = shmget(0x15a3, 4096, IPC_CREAT | 0600);
+
+		check("lsm: msgget, semget and shmget make objects through the alloc hooks", q >= 0 && m >= 0 && h >= 0);
+		check("lsm: the lookup by the key gives the same objects", msgget(0x15a1, 0600) == q && semget(0x15a2, 1, 0600) == m && shmget(0x15a3, 4096, 0600) == h);
+		pid = fork();
+		if (pid == 0) {
+			int ok = setresgid(1000, 1000, 1000) == 0 && setresuid(1000, 1000, 1000) == 0;
+
+			ok &= msgget(0x15a1, 0400) < 0 && errno == EACCES;
+			ok &= semget(0x15a2, 1, 0400) < 0 && errno == EACCES;
+			ok &= shmget(0x15a3, 4096, 0400) < 0 && errno == EACCES;
+			_exit(ok ? 0 : 1);
+		}
+		check("lsm: a user that is not the owner gets EACCES from the IPC checks", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		check("lsm: IPC_RMID removes the objects and runs the free hooks", msgctl(q, IPC_RMID, NULL) == 0 && semctl(m, 0, IPC_RMID) == 0 && shmctl(h, IPC_RMID, NULL) == 0);
+		check("lsm: a removed object is not found by its key", msgget(0x15a1, 0600) < 0 && errno == ENOENT);
+	}
 }
 
 static void test_syslog(void)

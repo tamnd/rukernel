@@ -21,6 +21,7 @@ use rk_abi::Errno;
 use rk_vfs::WaitQueue;
 use rk_vfs::cred::IpcOwner;
 use rk_vfs::ipc::SEM_NEXT_ID;
+use rk_vfs::security::{IpcClass, IpcSecurity};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The key that always makes a new set.
@@ -75,14 +76,16 @@ struct IpcPerm {
 }
 
 impl IpcPerm {
-    /// The owner, the creator and the mode, for the permission checks.
-    fn owner(&self) -> IpcOwner {
+    /// The owner, the creator, the mode and the security part `security`, for the permission
+    /// checks.
+    fn owner<'a>(&self, security: &'a IpcSecurity) -> IpcOwner<'a> {
         IpcOwner {
             uid: self.uid,
             gid: self.gid,
             cuid: self.cuid,
             cgid: self.cgid,
             mode: u32::from(self.mode),
+            security: Some(security),
         }
     }
 }
@@ -154,6 +157,8 @@ struct Sem {
 
 /// A set in the table.
 struct Set {
+    /// The security part, as the `security` field of `struct kern_ipc_perm` of Linux.
+    security: IpcSecurity,
     perm: IpcPerm,
     members: Vec<Sem>,
     otime: i64,
@@ -161,6 +166,11 @@ struct Set {
 }
 
 impl Set {
+    /// The owner, the creator, the mode and the security part, for the permission checks.
+    fn owner(&self) -> IpcOwner<'_> {
+        self.perm.owner(&self.security)
+    }
+
     fn ds(&self) -> SemidDs {
         SemidDs {
             perm: self.perm,
@@ -238,7 +248,7 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
             .sets
             .iter()
             .find(|(_, s)| s.perm.key == key)
-            .map(|(id, s)| (*id, s.members.len(), s.perm.owner()));
+            .map(|(id, s)| (*id, s.members.len(), s.owner()));
         if let Some((id, len, owner)) = found {
             if flags & (IPC_CREAT | IPC_EXCL) == IPC_CREAT | IPC_EXCL {
                 return Err(Errno::EEXIST);
@@ -247,6 +257,7 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
                 return Err(Errno::EINVAL);
             }
             c.ipc_permission(&owner, flags & 0o777)?;
+            rk_vfs::security::ipc_associate(&owner, flags)?;
             return Ok(id as u64);
         }
         if flags & IPC_CREAT == 0 {
@@ -262,6 +273,9 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
     {
         return Err(Errno::ENOSPC);
     }
+    // The modules see the new object before it gets its ID, as `newary` of Linux.
+    let security = IpcSecurity::new(IpcClass::Sem);
+    rk_vfs::security::ipc_alloc(&security)?;
     let next = table.next;
     let id = rk_vfs::ipc::alloc_id(&SEM_NEXT_ID, next, |id| table.sets.contains_key(&id));
     table.next = id.wrapping_add(1) & i32::MAX;
@@ -275,7 +289,13 @@ pub(crate) fn semget(cx: &Cx<'_>, key: u64, nsems: u64, flags: u64) -> SysResult
         mode: (flags & 0o777) as u16,
         ..IpcPerm::default()
     };
-    let set = Set { perm, members: vec![Sem::default(); nsems as usize], otime: 0, ctime: now() };
+    let set = Set {
+        security,
+        perm,
+        members: vec![Sem::default(); nsems as usize],
+        otime: 0,
+        ctime: now(),
+    };
     table.sets.insert(id, set);
     Ok(id as u64)
 }
@@ -376,7 +396,7 @@ fn do_semop(cx: &Cx<'_>, id: u64, sops: u64, nsops: u64, deadline: Option<u64>) 
         if ops.iter().any(|s| usize::from(s.num) >= set.members.len()) {
             return Err(Errno::EFBIG);
         }
-        c.ipc_permission(&set.perm.owner(), access)?;
+        c.ipc_permission(&set.owner(), access)?;
     }
     let thread = cx.thread;
     // The semaphore that the task waits for, so the end of the wait takes the count away.
@@ -472,7 +492,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
         IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
             let s = table.get(id)?;
             if cmd != SEM_STAT_ANY {
-                c.ipc_permission(&s.perm.owner(), 0o444)?;
+                c.ipc_permission(&s.owner(), 0o444)?;
             }
             let ds = s.ds();
             drop(table);
@@ -482,7 +502,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
         IPC_SET => {
             let ds = new.ok_or(Errno::EINVAL)?;
             let s = table.get(id)?;
-            if !c.ipc_owns(&s.perm.owner()) {
+            if !c.ipc_owns(&s.owner()) {
                 return Err(Errno::EPERM);
             }
             // -1 is not a valid ID, as `ipc_update_perm` of Linux.
@@ -496,7 +516,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             Ok(0)
         }
         IPC_RMID => {
-            if !c.ipc_owns(&table.get(id)?.perm.owner()) {
+            if !c.ipc_owns(&table.get(id)?.owner()) {
                 return Err(Errno::EPERM);
             }
             table.sets.remove(&id);
@@ -508,7 +528,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
         }
         GETVAL | GETPID | GETNCNT | GETZCNT => {
             let s = table.get(id)?;
-            c.ipc_permission(&s.perm.owner(), 0o444)?;
+            c.ipc_permission(&s.owner(), 0o444)?;
             let sem =
                 usize::try_from(num).ok().and_then(|n| s.members.get(n)).ok_or(Errno::EINVAL)?;
             Ok(match cmd {
@@ -520,7 +540,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
         }
         GETALL => {
             let s = table.get(id)?;
-            c.ipc_permission(&s.perm.owner(), 0o444)?;
+            c.ipc_permission(&s.owner(), 0o444)?;
             let vals: Vec<u16> = s.members.iter().map(|s| s.val as u16).collect();
             drop(table);
             cx.write_bytes(arg, vals.as_bytes())?;
@@ -531,7 +551,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
             let s = table.get(id)?;
             let n =
                 usize::try_from(num).ok().filter(|&n| n < s.members.len()).ok_or(Errno::EINVAL)?;
-            c.ipc_permission(&s.perm.owner(), 0o222)?;
+            c.ipc_permission(&s.owner(), 0o222)?;
             s.members[n].val = val;
             s.members[n].pid = pid(cx);
             s.ctime = now();
@@ -542,7 +562,7 @@ pub(crate) fn semctl(cx: &Cx<'_>, id: u64, num: u64, cmd: u64, arg: u64) -> SysR
         }
         SETALL => {
             let s = table.get(id)?;
-            c.ipc_permission(&s.perm.owner(), 0o222)?;
+            c.ipc_permission(&s.owner(), 0o222)?;
             let len = s.members.len();
             drop(table);
             let bytes = cx.read_bytes(arg, len * 2)?;

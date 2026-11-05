@@ -92,9 +92,14 @@ static SUPERS: SpinLock<Vec<Super>> = SpinLock::new(Vec::new());
 ///
 /// Gives `EACCES` for a new read and write file system on a read only device, or the error of
 /// the constructor of the type.
+///
+/// The super block of the file system gets its blob for the security modules here, as
+/// `alloc_super` of Linux.
 pub fn get_tree(ty: FsType, args: &MountArgs<'_>, mounted: bool) -> Result<InodeRef> {
     let Some(dev) = args.dev.filter(|_| !ty.nodev) else {
-        return (ty.make)(args);
+        let root = (ty.make)(args)?;
+        crate::security::blob::superblock_attach(&root);
+        return Ok(root);
     };
     {
         let mut supers = SUPERS.lock();
@@ -116,6 +121,8 @@ pub fn get_tree(ty: FsType, args: &MountArgs<'_>, mounted: bool) -> Result<Inode
     supers.retain(|s| !(s.name == ty.name && s.dev == dev));
     let read_only = args.read_only;
     supers.push(Super { name: ty.name, dev, read_only, root: alloc::sync::Arc::downgrade(&root) });
+    drop(supers);
+    crate::security::blob::superblock_attach(&root);
     Ok(root)
 }
 

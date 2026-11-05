@@ -6,9 +6,9 @@
 //! default that allows the operation, so a module implements only the hooks that it uses, as a
 //! module of Linux puts only some hooks in its `security_hook_list`.
 
-use super::blob::Blob;
+use super::blob::{Blob, IpcSecurity};
 use super::{Bprm, Sock, Task};
-use crate::cred::Cred;
+use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
 use crate::inode::{Inode, Result};
@@ -554,6 +554,51 @@ pub trait SecurityHooks: Sync {
 
     /// `socket_shutdown`: the caller stops a direction of `sock`. `how` is `SHUT_*`.
     fn socket_shutdown(&self, sock: &Sock<'_>, how: i32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `ipc_permission`: the access `flag` (the permission bits, as 0o444 for a read) to the
+    /// System V IPC object `ipc`, after the check of the mode.
+    fn ipc_permission(&self, cred: &Cred, ipc: &IpcOwner<'_>, flag: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `msg_queue_alloc_security`: a new message queue.
+    fn msg_queue_alloc_security(&self, ipc: &IpcSecurity) -> Result<()> {
+        Ok(())
+    }
+
+    /// `msg_queue_free_security`: a message queue goes away.
+    fn msg_queue_free_security(&self, ipc: &IpcSecurity) {}
+
+    /// `msg_queue_associate`: `msgget` finds the queue `ipc` by its key, with the flags `msqflg`.
+    fn msg_queue_associate(&self, ipc: &IpcOwner<'_>, msqflg: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `sem_alloc_security`: a new semaphore set.
+    fn sem_alloc_security(&self, ipc: &IpcSecurity) -> Result<()> {
+        Ok(())
+    }
+
+    /// `sem_free_security`: a semaphore set goes away.
+    fn sem_free_security(&self, ipc: &IpcSecurity) {}
+
+    /// `sem_associate`: `semget` finds the set `ipc` by its key, with the flags `semflg`.
+    fn sem_associate(&self, ipc: &IpcOwner<'_>, semflg: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `shm_alloc_security`: a new shared memory segment.
+    fn shm_alloc_security(&self, ipc: &IpcSecurity) -> Result<()> {
+        Ok(())
+    }
+
+    /// `shm_free_security`: a shared memory segment goes away.
+    fn shm_free_security(&self, ipc: &IpcSecurity) {}
+
+    /// `shm_associate`: `shmget` finds the segment `ipc` by its key, with the flags `shmflg`.
+    fn shm_associate(&self, ipc: &IpcOwner<'_>, shmflg: u32) -> Result<()> {
         Ok(())
     }
 }

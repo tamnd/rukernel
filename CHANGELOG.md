@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The address programs of cgroup2, `BPF_PROG_TYPE_CGROUP_SOCK_ADDR`: `BPF_CGROUP_INET4_BIND`, `BPF_CGROUP_INET6_BIND`, `BPF_CGROUP_INET4_CONNECT` and `BPF_CGROUP_INET6_CONNECT` run on the address of `bind` and `connect` of a TCP or UDP socket, as `__cgroup_bpf_run_filter_sock_addr` of Linux. A program can change the address and the port. A program that gives 0 makes the call give `EPERM`, and a bind program that gives 3 lets a bind to a port below 1024 skip the check of `CAP_NET_BIND_SERVICE` (#537).
+- The super blocks and the System V IPC objects get their security blobs. A new file system gets its blob in `get_tree`, as `alloc_super` of Linux, and the blob goes with the file system. Each message queue, semaphore set and shared memory segment has a security part with the `msg_queue_*`, `sem_*` and `shm_*` alloc, free and associate hooks, and the IPC permission check calls the `ipc_permission` hook after the mode check, as `ipcperms` of Linux (#540).
 
 ## [0.5.6] - 2026-11-09
 

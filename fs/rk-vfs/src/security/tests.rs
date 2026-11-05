@@ -152,3 +152,23 @@ fn a_blob_keeps_words_and_a_copy_has_the_same_values() {
     assert!(Blob::EMPTY.is_empty());
     assert_eq!(Blob::cred().len(), 0);
 }
+
+#[test]
+fn an_ipc_object_keeps_its_class_and_the_hooks_allow_it() {
+    let sec = IpcSecurity::new(IpcClass::Sem);
+    assert_eq!(sec.class(), IpcClass::Sem);
+    assert!(sec.blob().is_empty());
+    assert_eq!(ipc_alloc(&sec), Ok(()));
+    let owner = IpcOwner { uid: 1000, mode: 0o600, security: Some(&sec), ..IpcOwner::default() };
+    assert_eq!(ipc_associate(&owner, 0o600), Ok(()));
+    let mut c = Cred::root();
+    c.euid = 1000;
+    assert_eq!(c.ipc_permission(&owner, 0o400), Ok(()));
+    c.euid = 2000;
+    c.cap_effective = 0;
+    assert_eq!(c.ipc_permission(&owner, 0o400), Err(Errno::EACCES));
+    for hook in ["ipc_permission", "msg_queue_alloc_security", "sem_associate", "shm_free_security"]
+    {
+        assert!(hook_index(hook).is_some(), "{hook}");
+    }
+}
