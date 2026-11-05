@@ -14,10 +14,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A netlink socket takes `SO_PASSCRED` and gives the `SCM_CREDENTIALS` of the sender, as `netlink_recvmsg` of Linux. A message from the kernel has the PID, UID and GID 0. Before, `setsockopt(SO_PASSCRED)` gave `ENOPROTOOPT`, and systemd-logind stopped at the start because the device monitor of systemd sets this option on its `NETLINK_KOBJECT_UEVENT` socket (#539).
 - The `systemd` boot test reads /proc/self/mountinfo to check that /sys/fs/bpf is a bpf file system. Before, it checked that `sys-fs-bpf.mount` is active, but systemd mounts /sys/fs/bpf itself as an API file system and makes no unit for it, also on Linux. So the check always failed (#537).
 
-### Fixed
-
-- A netlink socket takes `SO_PASSCRED` and gives the `SCM_CREDENTIALS` of the sender, as `netlink_recvmsg` of Linux. A message from the kernel has the PID, UID and GID 0. Before, `setsockopt(SO_PASSCRED)` gave `ENOPROTOOPT`, and systemd-logind stopped at the start because the device monitor of systemd sets this option on its `NETLINK_KOBJECT_UEVENT` socket (#539).
-
 ## [0.5.7] - 2026-11-05
 
 ### Added
