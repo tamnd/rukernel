@@ -2226,6 +2226,64 @@ static void test_pidfd_thread(void)
 		close(fds[i]);
 }
 
+/* A thread that ends with SYS_exit a second after its start. */
+static void *pidfd_late_thread(void *arg)
+{
+	(void)arg;
+	sleep(1);
+	syscall(SYS_exit, 0);
+	return NULL;
+}
+
+/* The leader of a process ends with SYS_exit before its other threads. The pidfd of the process
+ * gets POLLIN only when the last thread ends, as delay_group_leader of Linux (#536). */
+static void test_pidfd_leader_exit(void)
+{
+	pid_t pid = fork();
+	if (pid == 0) {
+		pthread_t t1, t2;
+		pthread_create(&t1, NULL, pidfd_late_thread, NULL);
+		pthread_create(&t2, NULL, pidfd_late_thread, NULL);
+		syscall(SYS_exit, 0);
+	}
+	int fd = syscall(SYS_pidfd_open, pid, 0);
+	usleep(300000);
+	struct pollfd p = {.fd = fd, .events = POLLIN};
+	check("poll of a pidfd gives 0 after the leader ended before its threads",
+	      fd >= 0 && poll(&p, 1, 0) == 0);
+	int ep = epoll_create1(EPOLL_CLOEXEC);
+	struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd}, out;
+	epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+	int n = epoll_wait(ep, &out, 1, 5000);
+	check("epoll of a pidfd gives EPOLLIN after the last thread ended",
+	      n == 1 && (out.events & EPOLLIN));
+	if (n != 1) {
+		char path[64], buf[512];
+		snprintf(path, sizeof(path), "/proc/%d/status", pid);
+		int sfd = open(path, O_RDONLY);
+		ssize_t len = sfd >= 0 ? read(sfd, buf, sizeof(buf) - 1) : -1;
+		if (len > 0) {
+			buf[len] = 0;
+			printf("init: status of the process: %s\n", buf);
+		}
+		close(sfd);
+	}
+	int status = -1, r = 0;
+	for (int i = 0; i < 50 && r == 0; i++) {
+		r = waitpid(pid, &status, WNOHANG);
+		if (r == 0)
+			usleep(100000);
+	}
+	if (r == 0) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+	}
+	check("waitpid of a process whose leader ended first gives its status",
+	      r == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(ep);
+	close(fd);
+}
+
 /* process_mrelease frees the memory of a process that SIGKILL ended (#536). The number is 448
  * on x86_64 and arm64. */
 static void test_process_mrelease(void)
@@ -13894,6 +13952,7 @@ static void test_all(void)
 	test_pidfs();
 	test_pidfd_ioctl();
 	test_pidfd_thread();
+	test_pidfd_leader_exit();
 	test_process_mrelease();
 	test_scm_pidfd();
 	test_signalfd_poll();
@@ -14231,6 +14290,7 @@ int main(int argc, char **argv)
 		test_pidfs();
 		test_pidfd_ioctl();
 		test_pidfd_thread();
+	test_pidfd_leader_exit();
 		test_process_mrelease();
 	}
 	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
