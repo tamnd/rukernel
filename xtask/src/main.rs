@@ -880,7 +880,11 @@ echo 'debian: done'
         // the program to the root cgroup in /sys/fs/bpf and get them again. systemd mounts
         // /sys/fs/bpf itself at the start (mount_table in src/shared/mount-setup.c) and makes no
         // unit for an API file system, also on Linux, so the check reads /proc/self/mountinfo and
-        // not the state of sys-fs-bpf.mount.
+        // not the state of sys-fs-bpf.mount. rk-ipacct.service has `IPAccounting=yes` and pings
+        // the gateway of the user network of QEMU with rk-cgunit, and `systemctl show` must give
+        // `IPIngressBytes` and `IPEgressBytes` that are not zero. rk-dev.service has
+        // `DevicePolicy=closed`, and the open of /dev/vda must give `EPERM`. systemd does these
+        // with programs of `BPF_PROG_TYPE_CGROUP_SKB` and `BPF_PROG_TYPE_CGROUP_DEVICE`.
         init: r#"#!/bin/sh
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -899,6 +903,29 @@ TTYPath=/dev/console
 END
 mkdir -p /etc/systemd/system/multi-user.target.wants /usr/local/bin
 ln -sf ../rk-check.service /etc/systemd/system/multi-user.target.wants/rk-check.service
+cat > /etc/systemd/system/rk-ipacct.service << 'END'
+[Unit]
+Description=The IP accounting check of the systemd boot test of rukernel
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+IPAccounting=yes
+ExecStart=/usr/local/bin/rk-cgunit ping
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/console
+END
+cat > /etc/systemd/system/rk-dev.service << 'END'
+[Unit]
+Description=The device policy check of the systemd boot test of rukernel
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+DevicePolicy=closed
+ExecStart=/usr/local/bin/rk-cgunit open /dev/vda
+END
 cat > /usr/local/bin/rk-check << 'END'
 #!/bin/sh
 allowed=''
@@ -909,6 +936,18 @@ bpf=$(awk '$5 == "/sys/fs/bpf" { sub(/.* - /, ""); print $1 }' /proc/self/mounti
 echo "rk-systemd: /sys/fs/bpf ${bpf:-not mounted}"
 [ "$bpf" = bpf ] || other="$other /sys/fs/bpf"
 /usr/local/bin/rk-bpfpin || other="$other rk-bpfpin"
+systemctl start rk-ipacct.service || other="$other rk-ipacct.service"
+acct=$(systemctl show -p IPIngressBytes,IPEgressBytes --value rk-ipacct.service | tr '\n' ' ')
+echo "rk-systemd: IPIngressBytes and IPEgressBytes $acct"
+for bytes in $acct; do
+    case $bytes in 0 | *[!0-9]* | 18446744073709551615) other="$other IPAccounting" ;; esac
+done
+[ -n "$acct" ] || other="$other IPAccounting"
+if systemctl start rk-dev.service; then
+    echo 'rk-systemd: DevicePolicy=closed: the open of /dev/vda gives EPERM'
+else
+    other="$other rk-dev.service"
+fi
 failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
 for unit in $failed; do
     echo "rk-systemd: failed $unit"
@@ -924,7 +963,7 @@ chmod 755 /usr/local/bin/rk-check
 echo "rk-systemd: $(/usr/lib/systemd/systemd --version | head -n 1)"
 exec /usr/lib/systemd/systemd
 "#,
-        glibc_programs: &["bpfpin"],
+        glibc_programs: &["bpfpin", "cgunit"],
         debug_tools: false,
     },
 ];
@@ -2236,8 +2275,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 if *test == "smp" { SMP_TEST_TIMEOUT } else { self_test_timeout(&cmdline) };
             (qemu_command(&kernel, &cmdline), timeout)
         };
-        // The `alpine` test runs fio on the disk.
-        if matches!(*test, "blk" | "alpine") {
+        // The `alpine` test runs fio on the disk. In the `systemd` test, a unit with
+        // `DevicePolicy=closed` opens the disk.
+        if matches!(*test, "blk" | "alpine" | "systemd") {
             let disk = kernel.with_file_name("blk.img");
             write_blk_disk(&disk)?;
             cmd.arg("-drive")
@@ -2257,8 +2297,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         // The `net` test sends an ARP request to the gateway of the user network of QEMU. The
         // `inet` test pings the gateway and asks the DNS server of QEMU. The `netcfg` test sets up
         // the network with BusyBox. The `inet6` test uses the IPv6 network of QEMU: the prefix
-        // fec0::/64 and the router fec0::2.
-        if matches!(*test, "net" | "inet" | "netcfg" | "inet6") {
+        // fec0::/64 and the router fec0::2. In the `systemd` test, a unit with `IPAccounting=yes`
+        // pings the gateway.
+        if matches!(*test, "net" | "inet" | "netcfg" | "inet6" | "systemd") {
             cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.
