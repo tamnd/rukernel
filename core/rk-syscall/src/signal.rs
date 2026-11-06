@@ -350,7 +350,7 @@ pub(crate) fn may_signal(cx: &Cx<'_>, target: &Process, sig: u32) -> Result<(), 
 /// Sends `info` to each process in the group `pgid` that the caller can signal, as
 /// `__kill_pgrp_info` of Linux. Gives `ESRCH` if the group is empty, and `EPERM` if the caller
 /// can signal no process of it.
-fn kill_group(cx: &Cx<'_>, pgid: Pid, info: SigInfo) -> Result<(), Errno> {
+pub(crate) fn kill_group(cx: &Cx<'_>, pgid: Pid, info: SigInfo) -> Result<(), Errno> {
     // A child that a member makes at the same time gets the signal too, or is not made, as with
     // `tasklist_lock` in kernel/signal.c of Linux.
     let _tasks = rk_proc::tasklist_read();

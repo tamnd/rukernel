@@ -2158,6 +2158,175 @@ static int same_ns(int fd, const char *name)
 	       a.st_dev == b.st_dev;
 }
 
+/* A thread for the pidfd of a thread: it gives its ID and waits for a byte. */
+static void *pidfd_thread(void *arg)
+{
+	int *fds = arg;
+	pid_t tid = gettid();
+	char c;
+
+	write(fds[1], &tid, sizeof(tid));
+	read(fds[2], &c, 1);
+	return NULL;
+}
+
+/* A pidfd of a thread with PIDFD_THREAD, PIDFD_SELF_* and the scope flags of
+ * pidfd_send_signal (#536). */
+static void test_pidfd_thread(void)
+{
+	struct rk_pidfd_info info;
+	int fds[4], t = -1;
+	pid_t tid = 0;
+	pthread_t th;
+	char c = 0;
+
+	if (pipe(fds) != 0 || pipe(fds + 2) != 0) {
+		check("pipes for the pidfd of a thread", 0);
+		return;
+	}
+	/* fds[1] and fds[2] go to the thread: it writes to the first pipe and reads the second. */
+	int tfds[3] = { fds[0], fds[1], fds[2] };
+	if (pthread_create(&th, NULL, pidfd_thread, tfds) != 0) {
+		check("pthread_create for the pidfd of a thread", 0);
+		return;
+	}
+	read(fds[0], &tid, sizeof(tid));
+	errno = 0;
+	check("pidfd_open of a thread without PIDFD_THREAD gives ENOENT",
+	      syscall(SYS_pidfd_open, tid, 0) == -1 && errno == ENOENT);
+	t = syscall(SYS_pidfd_open, tid, O_EXCL /* PIDFD_THREAD */);
+	memset(&info, 0, sizeof(info));
+	check("PIDFD_GET_INFO of a pidfd of a thread gives the ID of the thread",
+	      t >= 0 && ioctl(t, RK_PIDFD_GET_INFO(sizeof(info)), &info) == 0 &&
+		      info.pid == (uint32_t)tid && info.tgid == (uint32_t)getpid());
+	struct pollfd p = {.fd = t, .events = POLLIN};
+	check("poll of a pidfd of a running thread gives 0", poll(&p, 1, 0) == 0);
+	check("pidfd_send_signal to PIDFD_SELF_THREAD_GROUP and PIDFD_SELF_THREAD",
+	      syscall(SYS_pidfd_send_signal, -10001, 0, NULL, 0) == 0 &&
+		      syscall(SYS_pidfd_send_signal, -10000, 0, NULL, 0) == 0);
+	errno = 0;
+	check("pidfd_send_signal with two scope flags gives EINVAL",
+	      syscall(SYS_pidfd_send_signal, t, 0, NULL, 3) == -1 && errno == EINVAL);
+	check("pidfd_send_signal with PIDFD_SIGNAL_THREAD_GROUP to a pidfd of a thread",
+	      syscall(SYS_pidfd_send_signal, t, 0, NULL, 2) == 0);
+	write(fds[3], &c, 1);
+	pthread_join(th, NULL);
+	check("poll of a pidfd of a thread gives POLLIN and POLLHUP after its exit",
+	      poll(&p, 1, 5000) == 1 && (p.revents & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
+	memset(&info, 0, sizeof(info));
+	info.mask = 8; /* PIDFD_INFO_EXIT */
+	check("PIDFD_GET_INFO of a pidfd of a thread gives its exit status after its exit",
+	      ioctl(t, RK_PIDFD_GET_INFO(sizeof(info)), &info) == 0 && (info.mask & 8) &&
+		      !(info.mask & 2) && WIFEXITED(info.exit_code) && WEXITSTATUS(info.exit_code) == 0);
+	errno = 0;
+	check("pidfd_send_signal to a pidfd of a thread that ended gives ESRCH",
+	      syscall(SYS_pidfd_send_signal, t, 0, NULL, 0) == -1 && errno == ESRCH);
+	close(t);
+	for (int i = 0; i < 4; i++)
+		close(fds[i]);
+}
+
+/* A thread that ends with SYS_exit a second after its start. */
+static void *pidfd_late_thread(void *arg)
+{
+	(void)arg;
+	sleep(1);
+	syscall(SYS_exit, 0);
+	return NULL;
+}
+
+/* The leader of a process ends with SYS_exit before its other threads. The pidfd of the process
+ * gets POLLIN only when the last thread ends, as delay_group_leader of Linux (#536). */
+static void test_pidfd_leader_exit(void)
+{
+	pid_t pid = fork();
+	if (pid == 0) {
+		pthread_t t1, t2;
+		pthread_create(&t1, NULL, pidfd_late_thread, NULL);
+		pthread_create(&t2, NULL, pidfd_late_thread, NULL);
+		syscall(SYS_exit, 0);
+	}
+	int fd = syscall(SYS_pidfd_open, pid, 0);
+	usleep(300000);
+	struct pollfd p = {.fd = fd, .events = POLLIN};
+	check("poll of a pidfd gives 0 after the leader ended before its threads",
+	      fd >= 0 && poll(&p, 1, 0) == 0);
+	int ep = epoll_create1(EPOLL_CLOEXEC);
+	struct epoll_event ev = {.events = EPOLLIN, .data.fd = fd}, out;
+	epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+	int n = epoll_wait(ep, &out, 1, 5000);
+	check("epoll of a pidfd gives EPOLLIN after the last thread ended",
+	      n == 1 && (out.events & EPOLLIN));
+	if (n != 1) {
+		char path[64], buf[512];
+		snprintf(path, sizeof(path), "/proc/%d/status", pid);
+		int sfd = open(path, O_RDONLY);
+		ssize_t len = sfd >= 0 ? read(sfd, buf, sizeof(buf) - 1) : -1;
+		if (len > 0) {
+			buf[len] = 0;
+			printf("init: status of the process: %s\n", buf);
+		}
+		close(sfd);
+	}
+	int status = -1, r = 0;
+	for (int i = 0; i < 50 && r == 0; i++) {
+		r = waitpid(pid, &status, WNOHANG);
+		if (r == 0)
+			usleep(100000);
+	}
+	if (r == 0) {
+		kill(pid, SIGKILL);
+		waitpid(pid, NULL, 0);
+	}
+	check("waitpid of a process whose leader ended first gives its status",
+	      r == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	close(ep);
+	close(fd);
+}
+
+/* process_mrelease frees the memory of a process that SIGKILL ended (#536). The number is 448
+ * on x86_64 and arm64. */
+static void test_process_mrelease(void)
+{
+	int fds[2];
+	char c = 0;
+
+	errno = 0;
+	check("process_mrelease of a bad descriptor gives EBADF",
+	      syscall(448, -1, 0) == -1 && errno == EBADF);
+	if (pipe(fds) != 0) {
+		check("pipe for process_mrelease", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		char *m = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m != MAP_FAILED)
+			memset(m, 1, 1 << 20);
+		write(fds[1], &c, 1);
+		for (;;)
+			pause();
+	}
+	read(fds[0], &c, 1);
+	int fd = syscall(SYS_pidfd_open, pid, 0);
+	errno = 0;
+	check("process_mrelease with a flag gives EINVAL", syscall(448, fd, 1) == -1 && errno == EINVAL);
+	errno = 0;
+	check("process_mrelease of a running process gives EINVAL",
+	      syscall(448, fd, 0) == -1 && errno == EINVAL);
+	kill(pid, SIGKILL);
+	errno = 0;
+	long r = syscall(448, fd, 0);
+	check("process_mrelease of a killed process", r == 0 || errno == ESRCH);
+	waitpid(pid, NULL, 0);
+	errno = 0;
+	check("process_mrelease of a reaped process gives ESRCH",
+	      syscall(448, fd, 0) == -1 && errno == ESRCH);
+	close(fd);
+	close(fds[0]);
+	close(fds[1]);
+}
+
 static void test_pidfd_ioctl(void)
 {
 	struct rk_pidfd_info info;
@@ -2406,6 +2575,8 @@ static void test_pidfd(void)
 	memset(&info, 0, sizeof(info));
 	check("waitid with P_PIDFD", waitid(P_PIDFD, pidfd, &info, WEXITED) == 0 &&
 					     info.si_pid == pid && info.si_status == 7);
+	check("poll of a pidfd of a reaped process gives POLLHUP",
+	      poll(&p, 1, 0) == 1 && (p.revents & POLLHUP));
 	close(pidfd);
 	check("pidfd_open of no process gives ESRCH",
 	      syscall(SYS_pidfd_open, 99999, 0) == -1 && errno == ESRCH);
@@ -13780,6 +13951,9 @@ static void test_all(void)
 	test_pidfd();
 	test_pidfs();
 	test_pidfd_ioctl();
+	test_pidfd_thread();
+	test_pidfd_leader_exit();
+	test_process_mrelease();
 	test_scm_pidfd();
 	test_signalfd_poll();
 	test_seccomp();
@@ -14111,6 +14285,14 @@ int main(int argc, char **argv)
 	}
 	if (argc > 1 && strcmp(argv[1], "pidns") == 0)
 		test_pid_ns();
+	if (argc > 1 && strcmp(argv[1], "pidfd") == 0) {
+		test_pidfd();
+		test_pidfs();
+		test_pidfd_ioctl();
+		test_pidfd_thread();
+	test_pidfd_leader_exit();
+		test_process_mrelease();
+	}
 	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
 		test_bpf();
 	if (argc > 1 && strcmp(argv[1], "userns") == 0)
