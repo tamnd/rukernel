@@ -6915,8 +6915,8 @@ static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 }
 
 /*
- * bpffs at /sys/fs/bpf: BPF_OBJ_PIN keeps a map after its last descriptor closes, and
- * BPF_OBJ_GET gives a new descriptor of the same map (#537).
+ * bpffs at /sys/fs/bpf: BPF_OBJ_PIN keeps a map, a program and a link after their last
+ * descriptors close, and BPF_OBJ_GET gives a new descriptor of the same object (#537).
  */
 static void test_bpffs(void)
 {
@@ -6924,7 +6924,9 @@ static void test_bpffs(void)
 	struct stat st;
 	unsigned int index = 0;
 	unsigned long long val = 42, out = 0;
-	int map, fd, sys, ok;
+	unsigned char info[232] = { 0 }, attr[168];
+	unsigned int len, id = 0, ids[4] = { 0 }, cnt, flags;
+	int map, fd, sys, prog, link, cg, cgm, ok;
 
 	mkdir("/sys", 0755);
 	sys = mount("sysfs", "/sys", "sysfs", 0, NULL) == 0;
@@ -6956,6 +6958,52 @@ static void test_bpffs(void)
 	errno = 0;
 	ok = ok && bpf_obj(7, "/sys/fs/bpf/rk_map", 0, 0) == -1 && errno == ENOENT;
 	check("unlink removes the pin", ok);
+	/* A program, and a link of the program to a cgroup, as systemd pins them. */
+	prog = bpf_prog_ret(8, 1, 1);
+	len = sizeof(info);
+	memset(info, 0, sizeof(info));
+	ok = prog >= 0 && bpf_info(prog, info, &len) == 0;
+	memcpy(&id, info + 4, 4);
+	ok = ok && bpf_obj(6, "/sys/fs/bpf/rk_prog", prog, 0) == 0;
+	close(prog);
+	prog = bpf_obj(7, "/sys/fs/bpf/rk_prog", 0, 0);
+	len = sizeof(info);
+	memset(info, 0, sizeof(info));
+	ok = ok && prog >= 0 && bpf_info(prog, info, &len) == 0 && !memcmp(info, "\x08\0\0\0", 4) &&
+	     !memcmp(info + 4, &id, 4);
+	check("BPF_OBJ_GET gives the pinned program", ok);
+	unlink("/sys/fs/bpf/rk_prog");
+	mkdir("/bpfcg", 0755);
+	cgm = mount("none", "/bpfcg", "cgroup2", 0, NULL) == 0;
+	mkdir("/bpfcg/rk_pin", 0755);
+	cg = open("/bpfcg/rk_pin", O_RDONLY | O_DIRECTORY);
+	memset(attr, 0, sizeof(attr));
+	bpf_put32(attr, 0, prog);
+	bpf_put32(attr, 4, cg);
+	bpf_put32(attr, 8, 1);
+	link = bpf_call(28, attr, 64);
+	ok = cgm && cg >= 0 && link >= 0 && bpf_obj(6, "/sys/fs/bpf/rk_link", link, 0) == 0;
+	close(link);
+	close(prog);
+	cnt = 4;
+	ok = ok && bpf_query(cg, 1, 0, ids, &cnt, &flags) == 0 && cnt == 1 && ids[0] == id;
+	check("a pinned link keeps the program attached after its descriptors close", ok);
+	link = bpf_obj(7, "/sys/fs/bpf/rk_link", 0, 0);
+	len = sizeof(info);
+	memset(info, 0, sizeof(info));
+	ok = link >= 0 && bpf_info(link, info, &len) == 0 && !memcmp(info, "\x03\0\0\0", 4) &&
+	     !memcmp(info + 8, &id, 4);
+	check("BPF_OBJ_GET gives the pinned link", ok);
+	close(link);
+	cnt = 4;
+	ok = unlink("/sys/fs/bpf/rk_link") == 0 && bpf_query(cg, 1, 0, ids, &cnt, &flags) == 0 &&
+	     cnt == 0;
+	check("unlink of the last pin of a link detaches the program", ok);
+	close(cg);
+	rmdir("/bpfcg/rk_pin");
+	if (cgm)
+		umount("/bpfcg");
+	rmdir("/bpfcg");
 	if (sys) {
 		umount("/sys/fs/bpf");
 		umount("/sys");
