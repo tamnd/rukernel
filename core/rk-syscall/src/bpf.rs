@@ -243,58 +243,231 @@ pub(crate) fn cgroup_run_inet_sock(sock: &dyn Socket) -> Result<(), Errno> {
 /// need `CAP_NET_BIND_SERVICE`, `BPF_RET_BIND_NO_CAP_NET_BIND_SERVICE` of Linux.
 pub(crate) const BIND_NO_CAP_NET_BIND_SERVICE: u32 = 1;
 
-/// Runs the programs of `BPF_CGROUP_INET4_BIND`, `BPF_CGROUP_INET6_BIND`,
-/// `BPF_CGROUP_INET4_CONNECT` or `BPF_CGROUP_INET6_CONNECT` of the cgroup of the current task
-/// on the address of `bind` or `connect`, as `__cgroup_bpf_run_filter_sock_addr` of Linux. A
-/// program can change the address and the port in `addr`. A program that gives 0 refuses the
-/// call with `EPERM`. Gives the flags of the programs of `bind`.
+/// The cgroup of a socket for its programs: the cgroup of its creator, or the cgroup of the
+/// current task for a socket that keeps none.
+fn sock_cgroup(sock: &dyn Socket) -> rk_cgroup::CgId {
+    match sock.cgroup() {
+        0 => current_cgroup(),
+        id => id,
+    }
+}
+
+/// The calls that run the programs of `BPF_PROG_TYPE_CGROUP_SOCK_ADDR`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SockAddrHook {
+    /// `bind`, as `inet_bind_sk` and `inet6_bind_sk` of Linux.
+    Bind,
+    /// `connect`, as the `pre_connect` of TCP and UDP and `unix_stream_connect` of Linux.
+    Connect,
+    /// A send to an address, as `udp_sendmsg`, `udpv6_sendmsg` and `unix_dgram_sendmsg`.
+    Sendmsg,
+    /// The address of a receive, as `udp_recvmsg`, `udpv6_recvmsg` and `unix_dgram_recvmsg`.
+    Recvmsg,
+    /// `getpeername` and the address of `accept`, as `inet_getname` and `unix_getname`.
+    Getpeername,
+    /// `getsockname`, as `inet_getname` and `unix_getname`.
+    Getsockname,
+}
+
+/// Runs the programs of `BPF_PROG_TYPE_CGROUP_SOCK_ADDR` of the cgroup of `sock` on the address
+/// `addr` of the call `hook`, as `__cgroup_bpf_run_filter_sock_addr` of Linux. A program can
+/// change the address and the port in `addr`. A program that gives 0 refuses the call with
+/// `EPERM`. `msg_src` is the source address of a send, which a program of `sendmsg` can change.
+/// Gives the flags of the programs of `bind`.
+///
+/// The programs of a Unix socket can read the family, the type and the protocol. rukernel has no
+/// kfuncs, so they cannot change the path with `bpf_sock_addr_set_sun_path`.
 pub(crate) fn cgroup_run_sock_addr(
     sock: &dyn Socket,
     addr: &mut [u8],
-    connect: bool,
+    hook: SockAddrHook,
+    msg_src: Option<&mut [u8; 16]>,
 ) -> Result<u32, Errno> {
+    use SockAddrHook::*;
     use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
-    use rk_net::consts::{AF_INET, AF_INET6};
+    use rk_net::consts::{AF_INET, AF_INET6, AF_UNIX, SOCK_STREAM};
     let family = sock.family();
-    // `inet_bind_sk` and the `pre_connect` of TCP and UDP. A raw socket and a ping socket have
-    // their own `bind` and no `pre_connect`.
-    if !matches!(sock.protocol(), IPPROTO_TCP | IPPROTO_UDP) {
-        return Ok(0);
-    }
-    let (atype, ip_off, ip_len, min_len) = match (family, connect) {
-        (AF_INET, false) => (atype::CGROUP_INET4_BIND, 4, 4, 16),
-        (AF_INET, true) => (atype::CGROUP_INET4_CONNECT, 4, 4, 16),
-        // `SIN6_LEN_RFC2133`.
-        (AF_INET6, false) => (atype::CGROUP_INET6_BIND, 8, 16, 24),
-        (AF_INET6, true) => (atype::CGROUP_INET6_CONNECT, 8, 16, 24),
+    let protocol = sock.protocol();
+    // `bind` and `connect` run the programs for TCP and UDP only: a raw socket and an echo
+    // socket have their own `bind` and no `pre_connect`. A send and a receive run them for UDP
+    // only, and `getsockname` and `getpeername` for each socket of the family.
+    let tcp_udp = matches!(protocol, IPPROTO_TCP | IPPROTO_UDP);
+    let udp = protocol == IPPROTO_UDP;
+    let atype = match (family, hook) {
+        (AF_INET, Bind) if tcp_udp => atype::CGROUP_INET4_BIND,
+        (AF_INET, Connect) if tcp_udp => atype::CGROUP_INET4_CONNECT,
+        (AF_INET, Sendmsg) if udp => atype::CGROUP_UDP4_SENDMSG,
+        (AF_INET, Recvmsg) if udp => atype::CGROUP_UDP4_RECVMSG,
+        (AF_INET, Getpeername) => atype::CGROUP_INET4_GETPEERNAME,
+        (AF_INET, Getsockname) => atype::CGROUP_INET4_GETSOCKNAME,
+        (AF_INET6, Bind) if tcp_udp => atype::CGROUP_INET6_BIND,
+        (AF_INET6, Connect) if tcp_udp => atype::CGROUP_INET6_CONNECT,
+        (AF_INET6, Sendmsg) if udp => atype::CGROUP_UDP6_SENDMSG,
+        (AF_INET6, Recvmsg) if udp => atype::CGROUP_UDP6_RECVMSG,
+        (AF_INET6, Getpeername) => atype::CGROUP_INET6_GETPEERNAME,
+        (AF_INET6, Getsockname) => atype::CGROUP_INET6_GETSOCKNAME,
+        (AF_UNIX, Connect) => atype::CGROUP_UNIX_CONNECT,
+        // A send on a Unix stream socket takes no address.
+        (AF_UNIX, Sendmsg) if sock.kind() != SOCK_STREAM => atype::CGROUP_UNIX_SENDMSG,
+        (AF_UNIX, Recvmsg) => atype::CGROUP_UNIX_RECVMSG,
+        (AF_UNIX, Getpeername) => atype::CGROUP_UNIX_GETPEERNAME,
+        (AF_UNIX, Getsockname) => atype::CGROUP_UNIX_GETSOCKNAME,
         _ => return Ok(0),
     };
-    if !cgroup_bpf_enabled(atype) || addr.len() < min_len {
+    if !cgroup_bpf_enabled(atype) {
+        return Ok(0);
+    }
+    // The offset and the size of the IP address, and the shortest address. A Unix address that
+    // the user gives needs a path, as `unix_validate_addr` of Linux.
+    let (ip_off, ip_len, min_len) = match family {
+        AF_INET => (4, 4, 16),
+        // `SIN6_LEN_RFC2133`.
+        AF_INET6 => (8, 16, 24),
+        _ if matches!(hook, Connect | Sendmsg) => (0, 0, 3),
+        _ => (0, 0, 2),
+    };
+    if addr.len() < min_len {
         return Ok(0);
     }
     let user_family = u32::from(u16::from_ne_bytes([addr[0], addr[1]]));
-    // A `connect` to `AF_UNSPEC` disconnects the socket before the programs run.
-    if connect && user_family == 0 {
+    // A `connect` to `AF_UNSPEC` disconnects the socket before the programs run, and a Unix
+    // address of another family gives `EINVAL` before them.
+    if hook == Connect && user_family == 0
+        || family == AF_UNIX && matches!(hook, Connect | Sendmsg) && user_family != AF_UNIX
+    {
         return Ok(0);
     }
     let mut ctx = BpfSockAddr {
         user_family,
-        user_port: u32::from(u16::from_ne_bytes([addr[2], addr[3]])),
+        user_port: addr.get(2..4).map_or(0, |p| u32::from(u16::from_ne_bytes([p[0], p[1]]))),
         family,
         sock_type: sock.kind(),
-        protocol: sock.protocol(),
+        protocol,
         ..BpfSockAddr::default()
     };
     ctx.user_ip[..ip_len].copy_from_slice(&addr[ip_off..ip_off + ip_len]);
+    if let Some(src) = &msg_src {
+        ctx.msg_src_ip = **src;
+    }
     let mut flags = 0;
-    bpf_prog_run_array_cg(&Cgroups, current_cgroup(), atype, |prog| {
+    bpf_prog_run_array_cg(&Cgroups, sock_cgroup(sock), atype, |prog| {
         let ret = prog.run(&mut ctx, &TaskHelperEnv);
         flags |= (ret >> 1) as u32;
         ret & 1
     })?;
+    if family == AF_UNIX {
+        return Ok(0);
+    }
     addr[2..4].copy_from_slice(&(ctx.user_port as u16).to_ne_bytes());
     addr[ip_off..ip_off + ip_len].copy_from_slice(&ctx.user_ip[..ip_len]);
-    Ok(if connect { 0 } else { flags & BIND_NO_CAP_NET_BIND_SERVICE })
+    if let Some(src) = msg_src {
+        *src = ctx.msg_src_ip;
+    }
+    // A program of `sendmsg` that sets the port 0 makes the send give `EINVAL`, as
+    // `udp_sendmsg` of Linux.
+    if hook == Sendmsg && ctx.user_port as u16 == 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(if hook == Bind { flags & BIND_NO_CAP_NET_BIND_SERVICE } else { 0 })
+}
+
+/// The `struct bpf_sock` of an IPv4 or IPv6 socket, from its addresses and its options. A
+/// stream socket that has a peer is in the state `TCP_ESTABLISHED`, a listening socket in
+/// `TCP_LISTEN`, and the other sockets in `TCP_CLOSE`, as a UDP socket of Linux.
+fn bpf_sock_of(sock: &dyn Socket) -> BpfSock {
+    use rk_abi::native::socket::{
+        SO_ACCEPTCONN, SO_BINDTOIFINDEX, SO_MARK, SO_PRIORITY, SOL_SOCKET,
+    };
+    use rk_net::consts::AF_INET;
+    let opt = |name| {
+        sock.get_option(SOL_SOCKET, name)
+            .ok()
+            .and_then(|v| v.first_chunk::<4>().map(|b| u32::from_ne_bytes(*b)))
+            .unwrap_or(0)
+    };
+    // The address and the port of a `struct sockaddr_in` or `struct sockaddr_in6`.
+    let split = |a: &[u8]| -> ([u8; 16], u16) {
+        let mut ip = [0u8; 16];
+        let (off, len) = if sock.family() == AF_INET { (4, 4) } else { (8, 16) };
+        if let Some(b) = a.get(off..off + len) {
+            ip[..len].copy_from_slice(b);
+        }
+        (ip, a.get(2..4).map_or(0, |p| u16::from_ne_bytes([p[0], p[1]])))
+    };
+    let (src_ip, src_port) = split(&sock.name());
+    let peer = sock.peer_name().ok();
+    let (dst_ip, dst_port) = peer.as_deref().map_or(([0; 16], 0), split);
+    let state = if peer.is_some() {
+        1
+    } else if opt(SO_ACCEPTCONN) != 0 {
+        10
+    } else {
+        7
+    };
+    BpfSock {
+        bound_dev_if: opt(SO_BINDTOIFINDEX),
+        family: sock.family(),
+        sock_type: sock.kind(),
+        protocol: sock.protocol(),
+        mark: opt(SO_MARK),
+        priority: opt(SO_PRIORITY),
+        src_ip,
+        src_port: u32::from(u16::from_be(src_port)),
+        dst_port,
+        dst_ip,
+        state,
+    }
+}
+
+/// Runs the programs of `BPF_CGROUP_INET_SOCK_RELEASE` of the cgroup of a socket of IPv4 or
+/// IPv6 that closes, as `inet_release` of Linux. The return value of the programs has no
+/// effect.
+fn cgroup_run_inet_sock_release(sock: &dyn Socket) {
+    use rk_net::consts::{AF_INET, AF_INET6};
+    if !cgroup_bpf_enabled(atype::CGROUP_INET_SOCK_RELEASE)
+        || !matches!(sock.family(), AF_INET | AF_INET6)
+    {
+        return;
+    }
+    let mut ctx = bpf_sock_of(sock);
+    let atype = atype::CGROUP_INET_SOCK_RELEASE;
+    let _ = bpf_prog_run_array_cg(&Cgroups, sock_cgroup(sock), atype, |prog| {
+        prog.run(&mut ctx, &TaskHelperEnv)
+    });
+}
+
+/// Runs the programs of `BPF_CGROUP_INET4_POST_BIND` or `BPF_CGROUP_INET6_POST_BIND` of
+/// `cgroup` on a socket after a bind, as `BPF_CGROUP_RUN_PROG_INET4_POST_BIND` in `__inet_bind`
+/// and `BPF_CGROUP_RUN_PROG_INET6_POST_BIND` in `__inet6_bind` of Linux. Gives `false` if a
+/// program gives 0.
+fn cgroup_run_post_bind(cgroup: rk_cgroup::CgId, sk: &rk_net::filter::PostBind) -> bool {
+    use rk_net::consts::AF_INET;
+    let atype = if sk.family == AF_INET {
+        atype::CGROUP_INET4_POST_BIND
+    } else {
+        atype::CGROUP_INET6_POST_BIND
+    };
+    if !cgroup_bpf_enabled(atype) {
+        return true;
+    }
+    let mut src_ip = sk.addr;
+    if sk.family == AF_INET {
+        src_ip = [0; 16];
+        src_ip[..4].copy_from_slice(&sk.addr[12..]);
+    }
+    // A new socket is in the state `TCP_CLOSE`.
+    let mut ctx = BpfSock {
+        bound_dev_if: sk.bound_dev_if,
+        family: sk.family,
+        sock_type: sk.kind,
+        protocol: sk.protocol,
+        src_ip,
+        src_port: u32::from(sk.port),
+        state: 7,
+        ..BpfSock::default()
+    };
+    bpf_prog_run_array_cg(&Cgroups, cgroup, atype, |prog| prog.run(&mut ctx, &TaskHelperEnv))
+        .is_ok()
 }
 
 /// Connects the hooks of the cgroup programs to the VFS. The boot code calls this one time.
@@ -310,6 +483,8 @@ pub(crate) fn init() {
                 atype::CGROUP_INET_INGRESS
             })
         },
+        post_bind: cgroup_run_post_bind,
+        release: cgroup_run_inet_sock_release,
     });
 }
 
