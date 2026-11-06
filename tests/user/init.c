@@ -4647,6 +4647,56 @@ static void test_kfs(void)
 	rmdir("/bfm");
 }
 
+/* The firmware tables, as drivers/firmware/dmi-id.c and drivers/of/kobj.c of Linux: the SMBIOS
+ * fields of QEMU on x86_64, and the device tree of QEMU virt on arm64. systemd-detect-virt reads
+ * them. */
+static void test_sysfs_firmware(void)
+{
+	struct stat st;
+	char buf[256];
+	DIR *dir = NULL;
+	struct dirent *e = NULL;
+	int qemu = 0;
+	ssize_t n = 0;
+
+#if defined(__x86_64__)
+	check("dmi: /sys/class/dmi/id links to the DMI device",
+	      (n = readlink("/sys/class/dmi/id", buf, sizeof(buf) - 1)) > 0 &&
+		      (buf[n] = 0, strcmp(buf, "../../devices/virtual/dmi/id") == 0));
+	check("dmi: sys_vendor is QEMU", read_small("/sys/class/dmi/id/sys_vendor", buf, sizeof(buf)) > 0 && strcmp(buf, "QEMU\n") == 0);
+	check("dmi: bios_vendor is there", read_small("/sys/class/dmi/id/bios_vendor", buf, sizeof(buf)) > 1);
+	check("dmi: modalias has the vendor",
+	      read_small("/sys/class/dmi/id/modalias", buf, sizeof(buf)) > 0 && strncmp(buf, "dmi:bvn", 7) == 0 && strstr(buf, ":svnQEMU:") != NULL);
+	check("dmi: product_uuid is for root only", stat("/sys/class/dmi/id/product_uuid", &st) != 0 || (st.st_mode & 0777) == 0400);
+	check("dmi: the structure table has its size", stat("/sys/firmware/dmi/tables/DMI", &st) == 0 && st.st_size > 0 && (st.st_mode & 0777) == 0400);
+	check("dmi: the entry point starts with _SM",
+	      read_small("/sys/firmware/dmi/tables/smbios_entry_point", buf, sizeof(buf)) >= 24 && strncmp(buf, "_SM", 3) == 0);
+#elif defined(__aarch64__)
+	mkdir("/proc", 0555);
+	mount("proc", "/proc", "proc", 0, NULL);
+	check("fdt: /proc/device-tree links to the device tree",
+	      (n = readlink("/proc/device-tree", buf, sizeof(buf) - 1)) > 0 &&
+		      (buf[n] = 0, strcmp(buf, "/sys/firmware/devicetree/base") == 0));
+	check("fdt: the root is compatible with linux,dummy-virt",
+	      read_small("/proc/device-tree/compatible", buf, sizeof(buf)) == 17 && strcmp(buf, "linux,dummy-virt") == 0);
+	dir = opendir("/proc/device-tree");
+	while (dir && (e = readdir(dir)) != NULL)
+		qemu |= strstr(e->d_name, "fw-cfg") != NULL;
+	if (dir)
+		closedir(dir);
+	check("fdt: the tree has the fw-cfg node of QEMU", qemu);
+	check("fdt: a node has the property name",
+	      read_small("/sys/firmware/devicetree/base/cpus/name", buf, sizeof(buf)) == 5 && strcmp(buf, "cpus") == 0);
+	check("fdt: /sys/firmware/fdt has the size of the tree", stat("/sys/firmware/fdt", &st) == 0 && st.st_size > 64 && (st.st_mode & 0777) == 0400);
+#endif
+	(void)st;
+	(void)buf;
+	(void)dir;
+	(void)e;
+	(void)qemu;
+	(void)n;
+}
+
 /* The files of /sys/devices/system/cpu and node, as drivers/base/cpu.c and topology.c of Linux:
  * a list is "0-3" or "0", and a mask has one hex digit for each four CPUs. glibc reads online and
  * possible for get_nprocs and get_nprocs_conf. */
@@ -4763,6 +4813,7 @@ static void test_sysfs(void)
 		      read_small("/sys/class/block/vda/size", buf, sizeof(buf)) > 0 && atol(buf) > 0);
 	}
 	test_sysfs_cpu();
+	test_sysfs_firmware();
 	umount("/sys");
 
 	mkdir("/mnt", 0755);

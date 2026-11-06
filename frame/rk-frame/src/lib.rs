@@ -24,6 +24,7 @@ pub mod cpu;
 pub mod date;
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) mod fdt;
+pub mod firmware;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub mod iomem;
 #[cfg(target_os = "none")]

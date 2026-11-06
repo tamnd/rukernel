@@ -18,6 +18,9 @@ const EXT_CMD_LINE_PTR: u64 = 0x0c8;
 /// `efi_loader_signature`: "EL64" when the EFI stub of a 64 bit kernel made the structure.
 const EFI_LOADER_SIGNATURE: u64 = 0x1c0;
 /// The EFI memory map that the EFI stub gives: the address, the size and the size of one entry.
+/// `efi_systab` and `efi_systab_hi`: the EFI system table.
+const EFI_SYSTAB: u64 = 0x1c4;
+const EFI_SYSTAB_HI: u64 = 0x1d8;
 const EFI_MEMDESC_SIZE: u64 = 0x1c8;
 const EFI_MEMMAP: u64 = 0x1d0;
 const EFI_MEMMAP_SIZE: u64 = 0x1d4;
@@ -43,6 +46,14 @@ const EL64: u32 = 0x3436_4c45;
 const BIOS_ROM: core::ops::Range<u64> = 0xe_0000..0x10_0000;
 /// "RSD PTR ", the signature of the RSDP.
 const RSDP_SIGNATURE: u64 = 0x2052_5450_2044_5352;
+/// `SMBIOS3_TABLE_GUID`, f2fd1544-9794-4a2c-992e-e5bbcf20e394, in the byte order of EFI.
+const SMBIOS3_GUID: [u8; 16] = [
+    0x44, 0x15, 0xfd, 0xf2, 0x94, 0x97, 0x2c, 0x4a, 0x99, 0x2e, 0xe5, 0xbb, 0xcf, 0x20, 0xe3, 0x94,
+];
+/// `SMBIOS_TABLE_GUID`, eb9d2d31-2d88-11d3-9a16-0090273fc14d, in the byte order of EFI.
+const SMBIOS_GUID: [u8; 16] = [
+    0x31, 0x2d, 0x9d, 0xeb, 0x88, 0x2d, 0xd3, 0x11, 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d,
+];
 
 fn read_u32(base: u64, offset: u64) -> u32 {
     read_phys::<u32>(base + offset).unwrap_or(0)
@@ -98,7 +109,32 @@ pub(super) fn read(base: u64) -> BootInfo {
         }
         rsdp => info.set_rsdp(PhysAddr::new(rsdp)),
     }
+    if protocol == "efi" {
+        let systab =
+            u64::from(read_u32(base, EFI_SYSTAB)) | u64::from(read_u32(base, EFI_SYSTAB_HI)) << 32;
+        if let Some(smbios) =
+            efi_table(systab, &SMBIOS3_GUID).or_else(|| efi_table(systab, &SMBIOS_GUID))
+        {
+            info.set_smbios(PhysAddr::new(smbios));
+        }
+    }
     info
+}
+
+/// Finds a table in the configuration table of the EFI system table at `systab`, as
+/// `efi_config_parse_tables` of Linux. The firmware has the SMBIOS entry point there, and not in
+/// the BIOS area.
+fn efi_table(systab: u64, guid: &[u8; 16]) -> Option<u64> {
+    if systab == 0 {
+        return None;
+    }
+    let count = read_u64(systab, 0x68).min(256);
+    let tables = read_u64(systab, 0x70);
+    (0..count)
+        .map(|i| tables + i * 24)
+        .find(|&at| read_phys::<[u8; 16]>(at).as_ref() == Some(guid))
+        .map(|at| read_u64(at, 16))
+        .filter(|&addr| addr != 0)
 }
 
 /// Finds the RSDP in the BIOS area, on a 16 byte boundary, as the ACPI specification tells. A

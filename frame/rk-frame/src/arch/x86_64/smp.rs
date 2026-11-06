@@ -320,6 +320,9 @@ extern "C" fn ap_entry() -> ! {
 /// Starts each CPU that the ACPI MADT gives, up to `cpu::MAX_CPUS`. Gives the number of CPUs that
 /// run.
 pub(crate) fn start_cpus() -> usize {
+    // Copy the SMBIOS tables now, as `dmi_setup` of Linux at boot. An EFI firmware can put them
+    // in memory that the kernel uses later.
+    let _ = crate::firmware::smbios();
     let me = apic::id();
     cpu::init(0, me);
     let mut ids = [0u32; cpu::MAX_CPUS];

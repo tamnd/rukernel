@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The files of the firmware tables in sysfs, for `systemd-detect-virt`. On x86_64, the kernel finds the SMBIOS entry point `_SM3_` or `_SM_` in the configuration table of EFI or in the BIOS area, as `dmi_scan_machine` of Linux. `/sys/class/dmi/id` links to `/sys/devices/virtual/dmi/id`, which has the fields of the BIOS, the system, the board and the chassis, `modalias` and `uevent`, as drivers/firmware/dmi-id.c of Linux. The serial numbers and the UUID are for root only. `/sys/firmware/dmi/tables` has the entry point and the structure table. On arm64, `/sys/firmware/devicetree/base` has a directory for each node of the device tree and a file for each property, with the property `name` that Linux adds, and `/sys/firmware/fdt` has the device tree. `/proc/device-tree` links to `/sys/firmware/devicetree/base` (#543).
+
 ## [0.5.8] - 2026-11-06
 
 ### Added

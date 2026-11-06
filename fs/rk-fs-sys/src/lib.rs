@@ -49,6 +49,7 @@
 extern crate alloc;
 
 mod cpu;
+mod firmware;
 pub mod kfs;
 mod mm;
 
@@ -371,6 +372,9 @@ fn queue_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
 /// The class of the input devices. Their directories come from `rk_vfs::input`.
 const INPUT: &str = "input";
 
+/// The class of the DMI device, which has the fields of the SMBIOS tables.
+const DMI: &str = "dmi";
+
 /// The entries of a directory of the input devices.
 fn input_entries(list: Vec<(String, rk_vfs::input::SysEntry)>) -> Vec<(String, Kind)> {
     use rk_vfs::input::SysEntry;
@@ -394,6 +398,11 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
     let mut classes: BTreeSet<&str> = list.iter().map(|d| d.class).collect();
     classes.insert(NET);
     classes.insert(INPUT);
+    let smbios = rk_frame::firmware::smbios();
+    if smbios.is_some() {
+        classes.insert(DMI);
+    }
+    let fdt = rk_frame::firmware::device_tree();
     let net = ns.upgrade().map_or_else(Vec::new, |ns| {
         let _in = rk_net::ns::enter(&ns);
         rk_net::dev::devices()
@@ -423,6 +432,38 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
             })
             .collect(),
         ["class", INPUT] => input_entries(rk_vfs::input::sysfs_class()),
+        // The DMI device of drivers/firmware/dmi-id.c, from the SMBIOS tables.
+        ["class", DMI] if smbios.is_some() => {
+            Vec::from([(String::from("id"), Kind::Link(b"../../devices/virtual/dmi/id".to_vec()))])
+        }
+        ["devices", "virtual", DMI] if smbios.is_some() => dirs(&mut ["id"].into_iter()),
+        ["devices", "virtual", DMI, "id", ref rest @ ..] => {
+            let s = smbios?;
+            firmware::dmi_entries(s.entry, s.table, rest)?
+        }
+        ["firmware"] => {
+            let mut out = Vec::new();
+            if fdt.is_some() {
+                out.push((String::from("devicetree"), Kind::Dir));
+            }
+            if smbios.is_some() {
+                out.push((String::from("dmi"), Kind::Dir));
+            }
+            if let Some(blob) = fdt {
+                out.push((String::from("fdt"), Kind::File(blob.to_vec())));
+            }
+            out
+        }
+        ["firmware", "dmi"] if smbios.is_some() => dirs(&mut ["tables"].into_iter()),
+        ["firmware", "dmi", "tables"] => {
+            let s = smbios?;
+            Vec::from([
+                (String::from("DMI"), Kind::File(s.table.to_vec())),
+                (String::from("smbios_entry_point"), Kind::File(s.entry.to_vec())),
+            ])
+        }
+        ["firmware", "devicetree"] if fdt.is_some() => dirs(&mut ["base"].into_iter()),
+        ["firmware", "devicetree", "base", ref rest @ ..] => firmware::fdt_entries(fdt?, rest)?,
         ["devices", "virtual", INPUT, ref rest @ ..] => input_entries(rk_vfs::input::sysfs(rest)?),
         ["devices", "virtual", NET] => net.iter().map(|d| (d.name(), Kind::Dir)).collect(),
         ["devices", "virtual", NET, name] => net_entries(&*net_dev(name)?),
@@ -512,6 +553,14 @@ impl Inode for Node {
         let (kind, perm, nlink, size) = match &self.kind {
             Kind::Dir => (mode::S_IFDIR, 0o755, 2, 0),
             Kind::File(_) if writable(&self.path) => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
+            // The binary files of the firmware have their size, as the `bin_attribute` of Linux.
+            Kind::File(text) if self.path.starts_with("firmware/") => {
+                let perm = if firmware::private(&self.path) { 0o400 } else { 0o444 };
+                (mode::S_IFREG, perm, 1, text.len() as u64)
+            }
+            Kind::File(_) if firmware::private(&self.path) => {
+                (mode::S_IFREG, 0o400, 1, BLOCK_SIZE as u64)
+            }
             Kind::File(_) | Kind::Mm { writable: false } => {
                 (mode::S_IFREG, 0o444, 1, BLOCK_SIZE as u64)
             }

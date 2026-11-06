@@ -81,6 +81,7 @@ pub struct BootInfo {
     regions: [MemoryRegion; MAX_REGIONS],
     region_count: usize,
     rsdp: Option<PhysAddr>,
+    smbios: Option<PhysAddr>,
     initrd: Option<(PhysAddr, u64)>,
 }
 
@@ -96,6 +97,7 @@ impl BootInfo {
             regions: [EMPTY; MAX_REGIONS],
             region_count: 0,
             rsdp: None,
+            smbios: None,
             initrd: None,
         }
     }
@@ -122,6 +124,11 @@ impl BootInfo {
     /// The physical address of the ACPI RSDP, if the boot loader gave it.
     pub fn rsdp(&self) -> Option<PhysAddr> {
         self.rsdp
+    }
+
+    /// The physical address of the SMBIOS entry point, if the EFI firmware gave it.
+    pub fn smbios(&self) -> Option<PhysAddr> {
+        self.smbios
     }
 
     /// The physical address and the length of the initramfs, if the boot loader gave one.
@@ -181,6 +188,11 @@ impl BootInfo {
     /// Records the ACPI RSDP.
     pub fn set_rsdp(&mut self, rsdp: PhysAddr) {
         self.rsdp = Some(rsdp);
+    }
+
+    /// Records the SMBIOS entry point.
+    pub fn set_smbios(&mut self, smbios: PhysAddr) {
+        self.smbios = Some(smbios);
     }
 
     /// Records the initramfs.

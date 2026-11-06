@@ -22,6 +22,7 @@
 
 use super::paging;
 use crate::boot::BootInfo;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// The flags field of the image header: little endian, 4 KiB pages, and any physical address.
 const IMAGE_FLAGS: u64 = (1 << 1) | (1 << 3);
@@ -466,5 +467,26 @@ fn read_device_tree(dtb: u64, info: &mut BootInfo) -> Result<crate::fdt::Platfor
     // SAFETY: as above, and `size` is at most 2 MiB. The memory is the device tree that the loader
     // gave, and no code writes it.
     let bytes = unsafe { core::slice::from_raw_parts(virt.cast::<u8>(), size) };
-    crate::fdt::read(bytes, dtb, info)
+    let platform = crate::fdt::read(bytes, dtb, info)?;
+    DEVICE_TREE.store(dtb, Ordering::Relaxed);
+    DEVICE_TREE_SIZE.store(size, Ordering::Relaxed);
+    Ok(platform)
+}
+
+/// The physical address and the size of the device tree that `read_device_tree` read. The size
+/// is 0 before.
+static DEVICE_TREE: AtomicU64 = AtomicU64::new(0);
+static DEVICE_TREE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Gives the bytes of the device tree, for `/sys/firmware`.
+pub(crate) fn device_tree() -> Option<&'static [u8]> {
+    let size = DEVICE_TREE_SIZE.load(Ordering::Relaxed);
+    if size == 0 {
+        return None;
+    }
+    let virt = paging::phys_to_virt(DEVICE_TREE.load(Ordering::Relaxed));
+    // SAFETY: `fdt::read` keeps the memory of the device tree as reserved memory, so no frame of
+    // it is given out, and the direct map has each memory range of the device tree. No code
+    // writes the device tree, and `size` is its size from its header.
+    Some(unsafe { core::slice::from_raw_parts(virt as *const u8, size) })
 }
