@@ -15,6 +15,7 @@
 extern crate alloc;
 
 pub mod acl;
+pub mod binfmt;
 pub mod blockdev;
 pub mod cpio;
 pub mod cred;

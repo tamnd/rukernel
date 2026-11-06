@@ -30,6 +30,15 @@ pub(crate) fn init(boot: &BootInfo) {
         rk_vfs::fstype::register(rk_fs_proc::FS_TYPE);
         rk_vfs::fstype::register(rk_fs_sys::FS_TYPE);
         rk_vfs::fstype::register(rk_fs_cgroup::FS_TYPE);
+        for t in [
+            rk_fs_sys::kfs::CONFIGFS,
+            rk_fs_sys::kfs::DEBUGFS,
+            rk_fs_sys::kfs::TRACEFS,
+            rk_fs_sys::kfs::FUSECTL,
+            rk_fs_sys::kfs::BINFMT_MISC,
+        ] {
+            rk_vfs::fstype::register(t);
+        }
         rk_fs_proc::set_kernel_info(rk_fs_proc::KernelInfo {
             release: rk_syscall::UNAME_RELEASE,
             version: rk_syscall::UNAME_VERSION,

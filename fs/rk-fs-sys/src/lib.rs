@@ -16,6 +16,9 @@
 //! - `/sys/fs/cgroup` is an empty directory, where cgroup2 is mounted.
 //! - `/sys/fs/ext4/features` has a file for each feature of ext4 that programs look for. The
 //!   online resize of `resize2fs` reads `meta_bg_resize`.
+//! - `/sys/kernel/config`, `/sys/kernel/debug`, `/sys/kernel/tracing` and
+//!   `/sys/fs/fuse/connections` are empty directories, where configfs, debugfs, tracefs and
+//!   fusectl of the module `kfs` are mounted.
 //! - `/sys/kernel/uevent_seqnum` has the sequence number of the last event of the devices.
 //! - `/sys/kernel/mm/ksm` has the files of Kernel Samepage Merging. A write to some of them
 //!   changes the settings of KSM.
@@ -46,6 +49,7 @@
 extern crate alloc;
 
 mod cpu;
+pub mod kfs;
 mod mm;
 
 use alloc::collections::BTreeSet;
@@ -457,21 +461,24 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         }
         // `/sys/fs/cgroup` is the place where the init system mounts cgroup2, and `/sys/fs/bpf`
         // is the place for bpffs.
-        ["fs"] => dirs(&mut ["bpf", "cgroup", "ext4"].into_iter()),
-        ["fs", "bpf"] | ["fs", "cgroup"] => Vec::new(),
+        // `/sys/fs/fuse/connections` is the place of fusectl.
+        ["fs"] => dirs(&mut ["bpf", "cgroup", "ext4", "fuse"].into_iter()),
+        ["fs", "bpf"] | ["fs", "cgroup"] | ["fs", "fuse", "connections"] => Vec::new(),
+        ["fs", "fuse"] => dirs(&mut ["connections"].into_iter()),
         ["fs", "ext4"] => dirs(&mut ["features"].into_iter()),
         ["fs", "ext4", "features"] => EXT4_FEATURES
             .iter()
             .map(|&n| (String::from(n), Kind::File(b"supported\n".to_vec())))
             .collect(),
         ["kernel"] => {
-            let mut out = dirs(&mut ["mm", "security"].into_iter());
+            let mut out = dirs(&mut ["config", "debug", "mm", "security", "tracing"].into_iter());
             let seqnum = format!("{}\n", rk_vfs::uevent::seqnum());
             out.push((String::from("uevent_seqnum"), Kind::File(seqnum.into_bytes())));
             out
         }
-        // The mount point of securityfs, as `securityfs_init` of Linux makes it.
-        ["kernel", "security"] => Vec::new(),
+        // The mount points of securityfs, configfs, debugfs and tracefs, as
+        // `sysfs_create_mount_point` of Linux makes them.
+        ["kernel", "security" | "config" | "debug" | "tracing"] => Vec::new(),
         ["kernel", "mm", "transparent_hugepage"] => thp_entries(),
         ["kernel", "mm", ref rest @ ..] => mm::entries(rest)?,
         [top] if TOP.contains(&top) => Vec::new(),
@@ -762,7 +769,8 @@ mod tests {
 
     #[test]
     fn ext4_tells_its_features() {
-        assert_eq!(names("fs"), ["bpf", "cgroup", "ext4"]);
+        assert_eq!(names("fs"), ["bpf", "cgroup", "ext4", "fuse"]);
+        assert!(names("fs/fuse/connections").is_empty());
         assert!(names("fs/bpf").is_empty());
         assert!(names("fs/cgroup").is_empty());
         assert_eq!(names("fs/ext4/features"), ["meta_bg_resize"]);
@@ -771,8 +779,13 @@ mod tests {
 
     #[test]
     fn ksm_has_the_files_of_linux() {
-        assert_eq!(names("kernel"), ["mm", "security", "uevent_seqnum"]);
-        assert!(names("kernel/security").is_empty());
+        assert_eq!(
+            names("kernel"),
+            ["config", "debug", "mm", "security", "tracing", "uevent_seqnum"]
+        );
+        for d in ["security", "config", "debug", "tracing"] {
+            assert!(names(&format!("kernel/{d}")).is_empty());
+        }
         assert_eq!(names("kernel/mm"), ["hugepages", "ksm", "transparent_hugepage"]);
         let files = names("kernel/mm/ksm");
         for f in ["run", "pages_to_scan", "sleep_millisecs", "full_scans", "pages_shared"] {

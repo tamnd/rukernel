@@ -4570,6 +4570,83 @@ static void test_overlay(void)
 	umount("/ov");
 }
 
+/* The file systems that systemd mounts under /sys, as fs/debugfs, fs/tracefs, fs/configfs,
+ * fs/fuse/control.c and fs/binfmt_misc.c of Linux. A format of binfmt_misc runs /bin/hello for a
+ * file that starts with "RKT1". */
+static void test_kfs(void)
+{
+	struct statfs sfs;
+	struct stat st;
+	char buf[256];
+	pid_t pid;
+	int fd, status = 0;
+
+	mkdir("/sys", 0755);
+	if (mount("sysfs", "/sys", "sysfs", 0, NULL) != 0)
+		return;
+	check("kfs: debugfs mounts on /sys/kernel/debug",
+	      mount("debugfs", "/sys/kernel/debug", "debugfs", 0, NULL) == 0 &&
+		      statfs("/sys/kernel/debug", &sfs) == 0 && sfs.f_type == 0x64626720);
+	check("kfs: debugfs has the directory tracing",
+	      stat("/sys/kernel/debug/tracing", &st) == 0 && S_ISDIR(st.st_mode));
+	check("kfs: tracefs mounts on /sys/kernel/tracing",
+	      mount("tracefs", "/sys/kernel/tracing", "tracefs", 0, NULL) == 0 &&
+		      statfs("/sys/kernel/tracing", &sfs) == 0 && sfs.f_type == 0x74726163);
+	check("kfs: the tracer is nop",
+	      read_small("/sys/kernel/tracing/current_tracer", buf, sizeof(buf)) == 4 && strcmp(buf, "nop\n") == 0);
+	check("kfs: tracing_on is 1", read_small("/sys/kernel/tracing/tracing_on", buf, sizeof(buf)) == 2 && buf[0] == '1');
+	fd = open("/sys/kernel/tracing/trace_marker", O_WRONLY);
+	check("kfs: trace_marker takes a mark", fd >= 0 && write(fd, "rk\n", 3) == 3);
+	close(fd);
+	check("kfs: the trace has the header of Linux",
+	      read_small("/sys/kernel/tracing/trace", buf, sizeof(buf)) > 0 && strncmp(buf, "# tracer: nop\n", 14) == 0);
+	check("kfs: current_tracer does not take an unknown tracer",
+	      put_file("/sys/kernel/tracing/current_tracer", "function\n") < 0 && errno == EINVAL);
+	check("kfs: configfs mounts on /sys/kernel/config",
+	      mount("configfs", "/sys/kernel/config", "configfs", 0, NULL) == 0 &&
+		      statfs("/sys/kernel/config", &sfs) == 0 && sfs.f_type == 0x62656570);
+	check("kfs: fusectl mounts on /sys/fs/fuse/connections",
+	      mount("fusectl", "/sys/fs/fuse/connections", "fusectl", 0, NULL) == 0 &&
+		      statfs("/sys/fs/fuse/connections", &sfs) == 0 && sfs.f_type == 0x65735543);
+	umount("/sys/fs/fuse/connections");
+	umount("/sys/kernel/config");
+	umount("/sys/kernel/tracing");
+	umount("/sys/kernel/debug");
+	umount("/sys");
+
+	mkdir("/bfm", 0755);
+	check("kfs: binfmt_misc mounts",
+	      mount("binfmt_misc", "/bfm", "binfmt_misc", 0, NULL) == 0 && statfs("/bfm", &sfs) == 0 &&
+		      sfs.f_type == 0x42494e4d);
+	check("kfs: binfmt_misc is enabled", read_small("/bfm/status", buf, sizeof(buf)) == 8 && strcmp(buf, "enabled\n") == 0);
+	fd = open("/bfm/register", O_WRONLY);
+	check("kfs: binfmt_misc registers a format", fd >= 0 && write(fd, ":rkt:M::RKT1::/bin/hello:", 25) == 25);
+	close(fd);
+	check("kfs: binfmt_misc shows the format",
+	      read_small("/bfm/rkt", buf, sizeof(buf)) > 0 &&
+		      strcmp(buf, "enabled\ninterpreter /bin/hello\nflags: \noffset 0\nmagic 524b5431\n") == 0);
+	mkdir("/tmp/bfm", 0755);
+	put_file("/tmp/bfm/arg", "RKT1 a file of a format that binfmt_misc knows\n");
+	chmod("/tmp/bfm/arg", 0755);
+	/* The interpreter gets the path in argv[1], so that "arg" makes /bin/hello exit with 7. */
+	pid = fork();
+	if (pid == 0) {
+		char *argv[] = { "x", NULL };
+		char *envp[] = { NULL };
+		if (chdir("/tmp/bfm") == 0)
+			execve("arg", argv, envp);
+		_exit(99);
+	}
+	check("kfs: execve runs the interpreter of the format",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 7);
+	check("kfs: a disabled format is not used", put_file("/bfm/rkt", "0") == 0 && execve("/tmp/bfm/arg", NULL, NULL) < 0 && errno == ENOEXEC);
+	check("kfs: -1 removes the format", put_file("/bfm/rkt", "-1") == 0 && stat("/bfm/rkt", &st) < 0 && errno == ENOENT);
+	unlink("/tmp/bfm/arg");
+	rmdir("/tmp/bfm");
+	umount("/bfm");
+	rmdir("/bfm");
+}
+
 /* The files of /sys/devices/system/cpu and node, as drivers/base/cpu.c and topology.c of Linux:
  * a list is "0-3" or "0", and a mask has one hex digit for each four CPUs. glibc reads online and
  * possible for get_nprocs and get_nprocs_conf. */
@@ -13969,6 +14046,7 @@ static void test_all(void)
 	test_splice();
 	test_atime();
 	test_sysfs();
+	test_kfs();
 	test_loop();
 	test_uevent();
 	test_uevent_synth();
