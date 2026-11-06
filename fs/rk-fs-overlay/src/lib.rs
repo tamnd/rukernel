@@ -51,7 +51,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use params::{Options, Redirect, Uuid};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
@@ -1225,6 +1225,9 @@ struct Node {
     unused: SpinLock<BTreeMap<Vec<u8>, Saved>>,
     /// The joined entries of the directory, which `read_dir` makes again at position 0.
     entries: SpinLock<Vec<DirEntry>>,
+    /// The links of a lower file that a removal through the node took, as `drop_nlink` in
+    /// `ovl_do_remove` of Linux. The lower inode keeps its count, so the node shows its own.
+    unlinked: AtomicU32,
 }
 
 impl Node {
@@ -1252,6 +1255,7 @@ impl Node {
             children: SpinLock::new(BTreeMap::new()),
             unused: SpinLock::new(BTreeMap::new()),
             entries: SpinLock::new(Vec::new()),
+            unlinked: AtomicU32::new(0),
         }))
         .inspect(|node| node.make_live())
     }
@@ -1302,6 +1306,7 @@ impl Node {
             children: SpinLock::new(BTreeMap::new()),
             unused: SpinLock::new(saved.unused),
             entries: SpinLock::new(Vec::new()),
+            unlinked: AtomicU32::new(0),
         });
         node.make_live();
         // The unused children of the node can go away again in an eviction.
@@ -2444,6 +2449,7 @@ impl Inode for Node {
         if let (Some(index), Some(lower)) = (self.index_upper(), self.top()) {
             m.nlink = self.fs.union_nlink(lower, &index, m.nlink);
         }
+        m.nlink = m.nlink.saturating_sub(self.unlinked.load(Ordering::Relaxed));
         // A directory joins layers, so it has the device of the mount. Another file shows the
         // device of its layer, as Linux without the `xino` feature.
         let (dev, ino) = self.identity();
@@ -2572,12 +2578,18 @@ impl Inode for Node {
         let dir = self.copy_up()?;
         let index = node.nlink_start()?;
         Node::check_upper(&dir, name, &node)?;
-        if node.upper().is_some() {
+        let upper = node.upper().is_some();
+        if upper {
             dir.unlink(name)?;
         }
         self.white_out(&dir, name)?;
-        if let Some(index) = index {
-            node.nlink_end(&index);
+        match index {
+            Some(index) => node.nlink_end(&index),
+            // A file with an upper inode has the count of the upper inode.
+            None if !upper => {
+                node.unlinked.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
         }
         self.forget(name);
         Ok(())
@@ -2776,6 +2788,12 @@ impl Inode for Node {
 
     fn fs_fsid(&self) -> u64 {
         self.fs.fsid
+    }
+
+    /// The inode that `ovl_open` and `ovl_dir_open` of Linux open as the real file: the data
+    /// inode of a file, and the upper or the top lower inode of a directory.
+    fn real_file(&self) -> Option<InodeRef> {
+        if self.is_dir() { Some(self.real()) } else { self.data().ok() }
     }
 
     fn fs_stat(&self) -> Option<FsStat> {

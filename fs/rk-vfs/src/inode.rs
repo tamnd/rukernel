@@ -550,6 +550,13 @@ pub trait Inode: Any + Send + Sync {
         self.metadata().dev
     }
 
+    /// The inode of another file system that an open file of this inode reads and writes, as
+    /// the real file of a file of overlayfs in Linux. The open, the access, the modification and
+    /// the close of the file are then also events of this inode. The default gives `None`.
+    fn real_file(&self) -> Option<InodeRef> {
+        None
+    }
+
     /// The counts of the file system, for `statfs`. `None` gives counts of 0, as for a file
     /// system without a size.
     fn fs_stat(&self) -> Option<FsStat> {

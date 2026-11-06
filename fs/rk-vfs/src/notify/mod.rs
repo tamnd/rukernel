@@ -531,18 +531,29 @@ fn file_event(location: Option<&Location>, inode: Option<&InodeRef>, mask: u32) 
 }
 
 /// The events of an open file: an access, a modification, an open and a close. Only these
-/// events have the path that fanotify needs.
+/// events have the path that fanotify needs. The real file of an overlayfs file gets the event
+/// too, as a file of Linux that `backing_file_open` opens.
 fn open_file_event(location: Option<&Location>, inode: Option<&InodeRef>, mask: u32) {
     if none() {
         return;
     }
-    match (location, inode) {
+    let file = match (location, inode) {
         (Some(at), _) => {
             dentry_send(&at.dentry, mask);
             let _ = path_event(at, mask);
+            at.dentry.inode()
         }
-        (None, Some(inode)) => inode_event(inode, mask),
-        (None, None) => {}
+        (None, Some(inode)) => {
+            inode_event(inode, mask);
+            inode
+        }
+        (None, None) => return,
+    };
+    // The real file has no path in a mount of the tree, so a mount mark does not get the event.
+    let mut real = file.real_file();
+    while let Some(r) = real {
+        inode_event(&r, mask);
+        real = r.real_file();
     }
 }
 
