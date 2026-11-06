@@ -465,6 +465,14 @@ fn uncharge(links: &[(Arc<UserNs>, u32)], kind: UcountKind) {
     }
 }
 
+impl Charge {
+    /// Counts one object of the kind `kind` for the same user in the same namespace, as
+    /// `inc_ucount` of Linux with the `ucounts` of an object. Gives `None` at a limit.
+    pub fn again(&self, kind: UcountKind) -> Option<Charge> {
+        charge(&self.ns, self.uid, kind)
+    }
+}
+
 impl Drop for Charge {
     fn drop(&mut self) {
         uncharge(&chain(&self.ns, self.uid), self.kind);
@@ -846,5 +854,20 @@ mod tests {
         }
         assert_eq!(deep.user_ns.level(), MAX_LEVEL);
         assert_eq!(create(&deep).map(|_| ()), Err(Errno::ENOSPC));
+    }
+
+    #[test]
+    fn a_group_and_its_marks_count_in_the_namespace_of_the_group() {
+        let c = child(&Cred::root());
+        c.user_ns.set_max(UcountKind::FanotifyMarks, 2);
+        let group = charge(&c.user_ns, 7, UcountKind::FanotifyGroups).unwrap();
+        let marks: Vec<_> = (0..2).map(|_| group.again(UcountKind::FanotifyMarks)).collect();
+        assert!(marks.iter().all(Option::is_some));
+        assert!(group.again(UcountKind::FanotifyMarks).is_none());
+        assert_eq!(c.user_ns.count(7, UcountKind::FanotifyMarks), 2);
+        assert_eq!(c.user_ns.count(7, UcountKind::FanotifyGroups), 1);
+        drop(marks);
+        assert_eq!(c.user_ns.count(7, UcountKind::FanotifyMarks), 0);
+        assert!(group.again(UcountKind::FanotifyMarks).is_some());
     }
 }

@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The limits of the fanotify groups and marks of a user, as the ucounts of Linux. Each group counts for its user in its user namespace and in the namespaces above it, and each mark of a group without `FAN_UNLIMITED_MARKS` counts for the same user. A group over the limit gives `EMFILE`, and a mark over the limit gives `ENOSPC`. `/proc/sys/fs/fanotify/max_user_groups` and `max_user_marks` are the limits of the first namespace, `/proc/sys/user/max_fanotify_groups` and `max_fanotify_marks` the limits of the namespace of the caller, and `/proc/sys/fs/fanotify/max_queued_events` the size of the queue of a new group. LTP fanotify17 now passes (#539).
+
 ## [0.5.9] - 2026-11-07
 
 ### Added

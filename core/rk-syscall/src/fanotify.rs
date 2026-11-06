@@ -25,6 +25,7 @@ use rk_vfs::notify::Object;
 use rk_vfs::notify::fanotify::{
     EVENT_FLAGS, FD_EVENTS, FID_BITS, Fanotify, FanotifyFile, Kind, PATH_EVENTS, PERM_EVENTS,
 };
+use rk_vfs::user_ns::UcountKind;
 
 /// The bits of the classes that need a privilege, `FANOTIFY_PERM_CLASSES` of Linux.
 const PERM_CLASSES: u32 = FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
@@ -131,7 +132,12 @@ pub(crate) fn fanotify_init(cx: &Cx<'_>, flags: u64, event_f_flags: u64) -> SysR
     }
     f_flags |= o::O_LARGEFILE;
     let unlimited = flags & FAN_UNLIMITED_QUEUE != 0;
-    let ops = FanotifyFile::new(flags, f_flags, priority, unlimited, !cred.capable(cap::SYS_ADMIN));
+    // Each group counts for the user in its namespace and in the namespaces above it, as
+    // `inc_ucount` in `fanotify_init` of Linux.
+    let charge = rk_vfs::user_ns::charge(&cred.user_ns, cred.euid, UcountKind::FanotifyGroups)
+        .ok_or(Errno::EMFILE)?;
+    let unpriv = !cred.capable(cap::SYS_ADMIN);
+    let ops = FanotifyFile::new(flags, f_flags, priority, unlimited, unpriv, Some(charge));
     let nonblock = if flags & FAN_NONBLOCK != 0 { o::O_NONBLOCK } else { 0 };
     let file = File::with_ops(Arc::new(ops), None, o::O_RDWR | nonblock);
     file.set_nonotify();
