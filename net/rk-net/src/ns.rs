@@ -610,6 +610,10 @@ impl Socket for NsSocket {
         Some(&self.net)
     }
 
+    fn cgroup(&self) -> u32 {
+        self.inner.cgroup()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()
     }

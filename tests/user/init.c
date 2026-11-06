@@ -6541,6 +6541,235 @@ static void test_bpf_cgroup_sock_addr(void)
 	rmdir("/bpfcg");
 }
 
+/* A bind of fd to the loopback address of the family and the port: 0 or the errno. */
+static int bind_to(int fd, int family, unsigned short port)
+{
+	struct sockaddr_storage ss = { 0 };
+	socklen_t len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+
+	ss.ss_family = family;
+	((struct sockaddr_in *)&ss)->sin_port = htons(port);
+	if (family == AF_INET)
+		((struct sockaddr_in *)&ss)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	else
+		((struct sockaddr_in6 *)&ss)->sin6_addr = in6addr_loopback;
+	errno = 0;
+	return bind(fd, (struct sockaddr *)&ss, len) == 0 ? 0 : errno;
+}
+
+/*
+ * A UDP send of the family to the loopback address and port 9 from a new socket, and a receive
+ * on a socket that has the port rport. Gives the source port of the receive, or -1.
+ */
+static int udp_redirect(int family, unsigned short rport)
+{
+	struct sockaddr_storage ss = { 0 }, from;
+	struct timeval tv = { 0, 500000 };
+	socklen_t len = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	socklen_t flen = sizeof(from);
+	int in = socket(family, SOCK_DGRAM, 0), out = socket(family, SOCK_DGRAM, 0), port = -1;
+	char c = 0;
+
+	ss.ss_family = family;
+	((struct sockaddr_in *)&ss)->sin_port = htons(9);
+	if (family == AF_INET)
+		((struct sockaddr_in *)&ss)->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	else
+		((struct sockaddr_in6 *)&ss)->sin6_addr = in6addr_loopback;
+	setsockopt(in, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	if (in >= 0 && out >= 0 && bind_to(in, family, rport) == 0 &&
+	    sendto(out, "x", 1, 0, (struct sockaddr *)&ss, len) == 1 &&
+	    recvfrom(in, &c, 1, 0, (struct sockaddr *)&from, &flen) == 1 && c == 'x')
+		port = ntohs(((struct sockaddr_in *)&from)->sin_port);
+	close(in);
+	close(out);
+	return port;
+}
+
+/*
+ * A program of BPF_PROG_TYPE_CGROUP_SOCK of the expected attach type. If map is not -1, it adds
+ * 1 to the value of key 0 of the array map and gives 1. Else it gives 0 for the src_port port
+ * and 1 for the other ports.
+ */
+static int bpf_prog_sock(unsigned int expected, int map, unsigned int port)
+{
+	unsigned long long count[] = {
+		bpf_insn(0x18, 1, 1, 0, map), 0,	/* r1 = the map */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -8),		/* r2 += -8 */
+		bpf_insn(0x7a, 2, 0, 0, 0),		/* *(u64 *)r2 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 1),		/* r0 = map_lookup_elem(r1, r2) */
+		bpf_insn(0x15, 0, 0, 2, 0),		/* if r0 == 0 goto +2 */
+		bpf_insn(0xb7, 1, 0, 0, 1),		/* r1 = 1 */
+		bpf_insn(0xdb, 0, 1, 0, 0),		/* lock *(u64 *)r0 += r1 */
+		bpf_insn(0xb7, 0, 0, 0, 1),		/* r0 = 1 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	unsigned long long refuse[] = {
+		bpf_insn(0x61, 2, 1, 44, 0),		/* r2 = ctx->src_port */
+		bpf_insn(0xb7, 0, 0, 0, 1),		/* r0 = 1 */
+		bpf_insn(0x55, 2, 0, 1, port),		/* if r2 != port goto +1 */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, 9);
+	bpf_put32(attr, 4, map >= 0 ? 11 : 5);
+	bpf_put64(attr, 8, (unsigned long)(map >= 0 ? count : refuse));
+	bpf_put64(attr, 16, (unsigned long)"GPL");
+	bpf_put32(attr, 68, expected);
+	return bpf_call(5, attr, sizeof(attr));
+}
+
+/*
+ * The other address and socket programs of a cgroup: the programs of sendmsg, recvmsg,
+ * getsockname and getpeername change the port, the Unix programs of connect and sendmsg that
+ * give 0 refuse the call, a program of post_bind refuses a port, and a program of
+ * BPF_CGROUP_INET_SOCK_RELEASE runs at the close of each IPv4 and IPv6 socket (#537).
+ */
+static void test_bpf_cgroup_sock_msg(void)
+{
+	/* The attach types and the ports of the programs that change the port. */
+	static const unsigned int port_types[][2] = {
+		{ 14, 4460 }, { 15, 4461 }, { 19, 4462 }, { 20, 4463 }, { 31, 4464 }, { 29, 4465 },
+		{ 32, 4464 }, { 30, 4465 },
+	};
+	/* The Unix attach types and the return values of their programs. */
+	static const unsigned int unix_types[][2] = {
+		{ 50, 0 }, { 51, 0 }, { 52, 1 }, { 53, 1 }, { 54, 1 },
+	};
+	int progs[8], uprogs[5], cg, pb4, pb6, rel, map, bad, status, ok, i;
+	unsigned int index = 0;
+	unsigned long long count = 0;
+	pid_t pid;
+
+	mkdir("/bpfcg", 0755);
+	if (mount("none", "/bpfcg", "cgroup2", 0, NULL) != 0) {
+		check("mount cgroup2 for the message programs", 0);
+		return;
+	}
+	mkdir("/bpfcg/rk_msg", 0755);
+	cg = open("/bpfcg/rk_msg", O_RDONLY | O_DIRECTORY);
+	ok = cg >= 0;
+	for (i = 0; i < 8; i++) {
+		progs[i] = bpf_prog_port(port_types[i][0], port_types[i][1], 1);
+		ok = ok && progs[i] >= 0 && bpf_attach(8, cg, progs[i], port_types[i][0], 0) == 0;
+	}
+	check("BPF_PROG_ATTACH of the sendmsg, recvmsg, getsockname and getpeername programs", ok);
+	ok = 1;
+	for (i = 0; i < 5; i++) {
+		uprogs[i] = bpf_prog_ret(18, unix_types[i][0], unix_types[i][1]);
+		ok = ok && uprogs[i] >= 0 && bpf_attach(8, cg, uprogs[i], unix_types[i][0], 0) == 0;
+	}
+	check("BPF_PROG_ATTACH of the Unix address programs", ok);
+	errno = 0;
+	bad = bpf_prog_ret(18, 52, 0);
+	check("a program of BPF_CGROUP_UNIX_RECVMSG that gives 0 gives EINVAL",
+	      bad == -1 && errno == EINVAL);
+	pb4 = bpf_prog_sock(12, -1, 4466);
+	pb6 = bpf_prog_sock(13, -1, 4466);
+	ok = pb4 >= 0 && pb6 >= 0 && bpf_attach(8, cg, pb4, 12, 0) == 0 &&
+	     bpf_attach(8, cg, pb6, 13, 0) == 0;
+	check("BPF_PROG_ATTACH of the post_bind programs", ok);
+	pid = fork();
+	if (pid == 0) {
+		struct sockaddr_un un = { .sun_family = AF_UNIX, .sun_path = "/rk_none" };
+		struct sockaddr_in sin;
+		socklen_t len = sizeof(sin);
+		int r = 0, fd, a, b, sk[2];
+		char c;
+
+		if (cg_write("/bpfcg/rk_msg/cgroup.procs", "0") != 0)
+			_exit(1);
+		if (udp_redirect(AF_INET, 4460) != 4462)
+			r |= 2;
+		if (udp_redirect(AF_INET6, 4461) != 4463)
+			r |= 4;
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		a = socket(AF_INET, SOCK_DGRAM, 0);
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_port = htons(4467);
+		sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (bind_to(fd, AF_INET, 4467) != 0 ||
+		    getsockname(fd, (struct sockaddr *)&sin, &len) != 0 || ntohs(sin.sin_port) != 4464)
+			r |= 8;
+		sin.sin_port = htons(4467);
+		len = sizeof(sin);
+		if (connect(a, (struct sockaddr *)&sin, sizeof(sin)) != 0 ||
+		    getpeername(a, (struct sockaddr *)&sin, &len) != 0 || ntohs(sin.sin_port) != 4465)
+			r |= 8;
+		close(fd);
+		close(a);
+		fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		errno = 0;
+		if (connect(fd, (struct sockaddr *)&un, sizeof(un)) != -1 || errno != EPERM)
+			r |= 16;
+		close(fd);
+		fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+		errno = 0;
+		if (sendto(fd, "x", 1, 0, (struct sockaddr *)&un, sizeof(un)) != -1 || errno != EPERM)
+			r |= 16;
+		close(fd);
+		len = sizeof(un);
+		if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sk) != 0 || write(sk[0], "x", 1) != 1 ||
+		    recvfrom(sk[1], &c, 1, 0, (struct sockaddr *)&un, &len) != 1 ||
+		    getsockname(sk[0], (struct sockaddr *)&un, &len) != 0)
+			r |= 32;
+		a = socket(AF_INET, SOCK_STREAM, 0);
+		b = socket(AF_INET6, SOCK_DGRAM, 0);
+		if (bind_to(a, AF_INET, 4466) != EPERM || bind_to(b, AF_INET6, 4466) != EPERM)
+			r |= 64;
+		/* The refused socket does not keep the port, and it can bind again. */
+		fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (bpf_attach(9, cg, pb4, 12, 0) != 0 || bind_to(fd, AF_INET, 4466) != 0 ||
+		    bind_to(a, AF_INET, 4468) != 0)
+			r |= 128;
+		_exit(r);
+	}
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status);
+	if (ok && WEXITSTATUS(status) != 0)
+		printf("rk-bpf: the message check gave %d\n", WEXITSTATUS(status));
+	check("the message, name, Unix and post_bind programs act on the tasks of the cgroup",
+	      ok && WEXITSTATUS(status) == 0);
+	check("the message programs of a cgroup do not change a socket in another cgroup",
+	      udp_redirect(AF_INET, 4460) == -1);
+	map = bpf_map_new(2, 4, 8, 1, 0);
+	rel = bpf_prog_sock(34, map, 0);
+	ok = map >= 0 && rel >= 0 && bpf_attach(8, cg, rel, 34, 0) == 0;
+	check("BPF_PROG_ATTACH of a BPF_CGROUP_INET_SOCK_RELEASE program", ok);
+	pid = fork();
+	if (pid == 0) {
+		if (cg_write("/bpfcg/rk_msg/cgroup.procs", "0") != 0)
+			_exit(1);
+		close(socket(AF_INET, SOCK_DGRAM, 0));
+		close(socket(AF_INET6, SOCK_STREAM, 0));
+		close(socket(AF_UNIX, SOCK_DGRAM, 0));
+		_exit(0);
+	}
+	ok = pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+	     WEXITSTATUS(status) == 0;
+	close(socket(AF_INET, SOCK_DGRAM, 0));
+	ok = ok && bpf_elem(1, map, &index, &count, 0) == 0;
+	if (ok && count != 2)
+		printf("rk-bpf: the release program ran %llu times\n", count);
+	check("the release program runs at the close of each IPv4 and IPv6 socket of the cgroup",
+	      ok && count == 2);
+	for (i = 0; i < 8; i++)
+		close(progs[i]);
+	for (i = 0; i < 5; i++)
+		close(uprogs[i]);
+	close(pb4);
+	close(pb6);
+	close(rel);
+	close(map);
+	close(cg);
+	check("rmdir of a cgroup with the message programs", rmdir("/bpfcg/rk_msg") == 0);
+	umount("/bpfcg");
+	rmdir("/bpfcg");
+}
+
 /* BPF_OBJ_PIN or BPF_OBJ_GET: pathname, bpf_fd and file_flags. */
 static long bpf_obj(int cmd, const char *path, int fd, unsigned int flags)
 {
@@ -6713,6 +6942,7 @@ static void test_bpf(void)
 	test_bpf_cgroup_hooks();
 	test_bpf_cgroup_skb();
 	test_bpf_cgroup_sock_addr();
+	test_bpf_cgroup_sock_msg();
 	test_bpffs();
 	umount("/proc");
 }

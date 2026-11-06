@@ -280,6 +280,11 @@ pub trait Socket: Send + Sync {
     fn netns(&self) -> Option<&Arc<ns::NetNs>> {
         None
     }
+    /// The cgroup of the task that made the socket, `sk_cgrp_data` of Linux, for the cgroup
+    /// programs. 0 is no cgroup: the programs then use the cgroup of the current task.
+    fn cgroup(&self) -> u32 {
+        0
+    }
     /// The socket as `Any`, for the operations of one family.
     fn as_any(&self) -> &dyn Any;
 }
@@ -313,6 +318,9 @@ struct SocketFile {
 
 impl Drop for SocketFile {
     fn drop(&mut self) {
+        // The programs of `BPF_CGROUP_INET_SOCK_RELEASE` run before the socket closes, as
+        // `inet_release` of Linux.
+        filter::cgroup_sock_release(&*self.socket);
         self.socket.release();
     }
 }

@@ -56,8 +56,21 @@ pub mod atype {
     pub const CGROUP_INET6_BIND: usize = 8;
     pub const CGROUP_INET4_CONNECT: usize = 9;
     pub const CGROUP_INET6_CONNECT: usize = 10;
+    pub const CGROUP_UNIX_CONNECT: usize = 11;
+    pub const CGROUP_INET4_GETPEERNAME: usize = 12;
+    pub const CGROUP_INET6_GETPEERNAME: usize = 13;
+    pub const CGROUP_UNIX_GETPEERNAME: usize = 14;
+    pub const CGROUP_INET4_GETSOCKNAME: usize = 15;
+    pub const CGROUP_INET6_GETSOCKNAME: usize = 16;
+    pub const CGROUP_UNIX_GETSOCKNAME: usize = 17;
+    pub const CGROUP_UDP4_SENDMSG: usize = 18;
+    pub const CGROUP_UDP6_SENDMSG: usize = 19;
+    pub const CGROUP_UNIX_SENDMSG: usize = 20;
+    pub const CGROUP_UDP4_RECVMSG: usize = 21;
+    pub const CGROUP_UDP6_RECVMSG: usize = 22;
+    pub const CGROUP_UNIX_RECVMSG: usize = 23;
     /// The count of the attach types, `MAX_CGROUP_BPF_ATTACH_TYPE`.
-    pub const MAX_CGROUP_BPF_ATTACH_TYPE: usize = 11;
+    pub const MAX_CGROUP_BPF_ATTACH_TYPE: usize = 24;
 }
 
 use atype::*;
@@ -77,6 +90,19 @@ pub fn to_cgroup_bpf_attach_type(attach_type: u32) -> Option<usize> {
         BPF_CGROUP_INET6_BIND => CGROUP_INET6_BIND,
         BPF_CGROUP_INET4_CONNECT => CGROUP_INET4_CONNECT,
         BPF_CGROUP_INET6_CONNECT => CGROUP_INET6_CONNECT,
+        BPF_CGROUP_UNIX_CONNECT => CGROUP_UNIX_CONNECT,
+        BPF_CGROUP_INET4_GETPEERNAME => CGROUP_INET4_GETPEERNAME,
+        BPF_CGROUP_INET6_GETPEERNAME => CGROUP_INET6_GETPEERNAME,
+        BPF_CGROUP_UNIX_GETPEERNAME => CGROUP_UNIX_GETPEERNAME,
+        BPF_CGROUP_INET4_GETSOCKNAME => CGROUP_INET4_GETSOCKNAME,
+        BPF_CGROUP_INET6_GETSOCKNAME => CGROUP_INET6_GETSOCKNAME,
+        BPF_CGROUP_UNIX_GETSOCKNAME => CGROUP_UNIX_GETSOCKNAME,
+        BPF_CGROUP_UDP4_SENDMSG => CGROUP_UDP4_SENDMSG,
+        BPF_CGROUP_UDP6_SENDMSG => CGROUP_UDP6_SENDMSG,
+        BPF_CGROUP_UNIX_SENDMSG => CGROUP_UNIX_SENDMSG,
+        BPF_CGROUP_UDP4_RECVMSG => CGROUP_UDP4_RECVMSG,
+        BPF_CGROUP_UDP6_RECVMSG => CGROUP_UDP6_RECVMSG,
+        BPF_CGROUP_UNIX_RECVMSG => CGROUP_UNIX_RECVMSG,
         _ => return None,
     })
 }
@@ -787,6 +813,21 @@ mod tests {
         cgroup_bpf_detach(2000, Some(&b), BPF_CGROUP_INET_EGRESS, 0, false).unwrap();
         let q = cgroup_bpf_query(&env, 2000, BPF_CGROUP_INET_EGRESS, false).unwrap();
         assert_eq!((q.attach_flags, q.prog_cnt, q.revision), (0, 0, 5));
+    }
+
+    #[test]
+    fn each_cgroup_attach_type_has_its_own_list() {
+        use crate::prog::prog_type::BPF_PROG_TYPE_UNSPEC;
+        let mut seen = [false; MAX_CGROUP_BPF_ATTACH_TYPE];
+        for t in 0..64 {
+            if crate::syscall::attach_type_to_prog_type(t) == BPF_PROG_TYPE_UNSPEC {
+                continue;
+            }
+            let a = to_cgroup_bpf_attach_type(t).unwrap();
+            assert!(!seen[a], "attach type {t}");
+            seen[a] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
     }
 
     #[test]

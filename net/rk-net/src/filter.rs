@@ -456,8 +456,9 @@ impl SocketFilter {
 }
 
 /// The hooks of the cgroup programs of `BPF_PROG_TYPE_CGROUP_SKB`, as
-/// `BPF_CGROUP_RUN_PROG_INET_INGRESS` and `BPF_CGROUP_RUN_PROG_INET_EGRESS` of Linux. The system
-/// call layer sets them at boot.
+/// `BPF_CGROUP_RUN_PROG_INET_INGRESS` and `BPF_CGROUP_RUN_PROG_INET_EGRESS` of Linux, and of the
+/// programs of `BPF_PROG_TYPE_CGROUP_SOCK` that run in the network code. The system call layer
+/// sets them at boot.
 #[derive(Clone, Copy)]
 pub struct CgroupSkbHooks {
     /// The cgroup of the current task, for `sock_cgroup_data` of a new socket.
@@ -467,6 +468,28 @@ pub struct CgroupSkbHooks {
     pub run: fn(cgroup: u32, egress: bool, packet: &[u8]) -> bool,
     /// Tells if a cgroup has a program of the direction, as `cgroup_bpf_enabled` of Linux.
     pub enabled: fn(egress: bool) -> bool,
+    /// Runs the programs of `BPF_CGROUP_INET4_POST_BIND` or `BPF_CGROUP_INET6_POST_BIND` of the
+    /// cgroup on a socket after a bind. Gives `false` if a program refuses the bind.
+    pub post_bind: fn(cgroup: u32, sock: &PostBind) -> bool,
+    /// Runs the programs of `BPF_CGROUP_INET_SOCK_RELEASE` on a socket that closes.
+    pub release: fn(sock: &dyn crate::Socket),
+}
+
+/// A socket after a bind, for the programs of `BPF_CGROUP_INET4_POST_BIND` and
+/// `BPF_CGROUP_INET6_POST_BIND`.
+pub struct PostBind {
+    /// The family of the socket.
+    pub family: u32,
+    /// The type of the socket.
+    pub kind: u32,
+    /// The protocol of the socket.
+    pub protocol: u32,
+    /// The local address, in the IPv6 form. An IPv4 address is an IPv4-mapped address.
+    pub addr: [u8; 16],
+    /// The local port.
+    pub port: u16,
+    /// The interface of the socket, or 0.
+    pub bound_dev_if: u32,
 }
 
 static CGROUP_SKB: rk_frame::sync::Once<CgroupSkbHooks> = rk_frame::sync::Once::new();
@@ -494,6 +517,28 @@ pub fn cgroup_skb_ingress(cgroup: u32, packet: &[u8]) -> bool {
     match CGROUP_SKB.get() {
         Some(h) if cgroup != 0 => (h.run)(cgroup, false, packet),
         _ => true,
+    }
+}
+
+/// Runs the programs of `BPF_CGROUP_INET4_POST_BIND` or `BPF_CGROUP_INET6_POST_BIND` of the
+/// cgroup of a socket after a bind, as `__inet_bind` and `__inet6_bind` of Linux. The caller
+/// undoes the bind if a program refuses it.
+///
+/// # Errors
+///
+/// Gives `EPERM` if a program refuses the bind.
+pub fn cgroup_post_bind(cgroup: u32, sock: &PostBind) -> Result<()> {
+    match CGROUP_SKB.get() {
+        Some(h) if cgroup != 0 && !(h.post_bind)(cgroup, sock) => Err(Errno::EPERM),
+        _ => Ok(()),
+    }
+}
+
+/// Runs the programs of `BPF_CGROUP_INET_SOCK_RELEASE` on a socket of IPv4 or IPv6 that closes,
+/// as `inet_release` of Linux. The socket file calls this before it closes the socket.
+pub fn cgroup_sock_release(sock: &dyn crate::Socket) {
+    if let Some(h) = CGROUP_SKB.get() {
+        (h.release)(sock);
     }
 }
 

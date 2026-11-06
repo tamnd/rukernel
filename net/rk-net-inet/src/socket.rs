@@ -1622,6 +1622,10 @@ impl Socket for Dgram {
         self.ino
     }
 
+    fn cgroup(&self) -> u32 {
+        self.cgroup
+    }
+
     fn bind(&self, _paths: &dyn PathOps, addr: &[u8]) -> Result<()> {
         let (addr, port, scope) = sockaddr::parse_bind_in(self.af(), addr)?;
         let mut s = self.state.lock();
@@ -1676,7 +1680,24 @@ impl Socket for Dgram {
             && (port != 0 || !s.bind_no_port)
         {
             let reuse = s.options.get(SO_REUSEADDR).is_ok_and(|v| v != int(0));
-            s.port = table.lock().bind(port, Binding { addr, reuse, id: self.ino, v6only })?;
+            let got = table.lock().bind(port, Binding { addr, reuse, id: self.ino, v6only })?;
+            // The programs of the cgroup can refuse the bind of a UDP socket, as
+            // `__inet_bind` of Linux. A raw socket and an echo socket have their own bind.
+            if self.proto == Proto::Udp {
+                let post = rk_net::filter::PostBind {
+                    family: self.af(),
+                    kind: SOCK_DGRAM,
+                    protocol: IPPROTO_UDP,
+                    addr,
+                    port: got,
+                    bound_dev_if: s.oif,
+                };
+                if let Err(e) = rk_net::filter::cgroup_post_bind(self.cgroup, &post) {
+                    table.lock().unbind(got, self.ino);
+                    return Err(e);
+                }
+            }
+            s.port = got;
         }
         s.v6only = v6only;
         s.local = addr;

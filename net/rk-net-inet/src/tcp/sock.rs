@@ -960,6 +960,10 @@ impl Socket for Stream {
         self.ino
     }
 
+    fn cgroup(&self) -> u32 {
+        self.state.lock().cgroup
+    }
+
     fn bind(&self, _paths: &dyn PathOps, addr: &[u8]) -> Result<()> {
         let (addr, port, scope) = sockaddr::parse_bind_in(self.af(), addr)?;
         let mut s = self.state.lock();
@@ -999,7 +1003,21 @@ impl Socket for Stream {
         }
         if port != 0 || !s.bind_no_port {
             let b = Binding { addr, reuse: s.reuse(), id: self.ino, v6only };
-            s.port = PORTS.lock().bind(port, b)?;
+            let got = PORTS.lock().bind(port, b)?;
+            // The programs of the cgroup can refuse the bind, as `__inet_bind` of Linux.
+            let post = rk_net::filter::PostBind {
+                family: self.af(),
+                kind: SOCK_STREAM,
+                protocol: IPPROTO_TCP,
+                addr,
+                port: got,
+                bound_dev_if: oif,
+            };
+            if let Err(e) = rk_net::filter::cgroup_post_bind(s.cgroup, &post) {
+                PORTS.lock().unbind(got, self.ino);
+                return Err(e);
+            }
+            s.port = got;
             s.bound = true;
         }
         s.lock_addr = !ip::is_any(&addr);

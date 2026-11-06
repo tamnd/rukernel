@@ -3,6 +3,7 @@
 //! These calls copy the addresses, the data and the control messages between user memory and
 //! the kernel. The socket of the family does the work, as net/socket.c of Linux does it.
 
+use crate::bpf::{SockAddrHook, cgroup_run_sock_addr};
 use crate::cx::{Cx, SysResult};
 use crate::fs::read_iovecs;
 use alloc::sync::Arc;
@@ -331,7 +332,7 @@ pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let mut addr = read_addr(cx, addr, len)?;
     rk_vfs::security::socket_bind(&lsm_sock(&file, &*sock), &addr)?;
     // The programs of the cgroup can change the address, as `inet_bind_sk` of Linux.
-    let flags = crate::bpf::cgroup_run_sock_addr(&*sock, &mut addr, false)?;
+    let flags = cgroup_run_sock_addr(&*sock, &mut addr, SockAddrHook::Bind, None)?;
     // A UDP or TCP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and
     // its sysctl `net.ipv4.ip_unprivileged_port_start`.
     if flags & crate::bpf::BIND_NO_CAP_NET_BIND_SERVICE == 0
@@ -351,8 +352,8 @@ pub(crate) fn connect(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let mut addr = read_addr(cx, addr, len)?;
     rk_vfs::security::socket_connect(&lsm_sock(&file, &*sock), &addr)?;
     // The programs of the cgroup can change the address, as the `pre_connect` of TCP and UDP
-    // in Linux.
-    crate::bpf::cgroup_run_sock_addr(&*sock, &mut addr, true)?;
+    // and `unix_stream_connect` of Linux.
+    cgroup_run_sock_addr(&*sock, &mut addr, SockAddrHook::Connect, None)?;
     sock.connect(&Paths { cx }, &addr, file.flags().nonblock())?;
     Ok(0)
 }
@@ -373,7 +374,12 @@ pub(crate) fn accept4(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64, flags: u64) ->
     let (file, sock) = socket(cx, fd)?;
     rk_vfs::security::socket_accept(&lsm_sock(&file, &*sock))?;
     let new = sock.accept(file.flags().nonblock())?;
-    let peer = new.peer_name().unwrap_or_else(|_| (AF_UNIX as u16).to_ne_bytes().to_vec());
+    let mut peer = new.peer_name().unwrap_or_else(|_| (AF_UNIX as u16).to_ne_bytes().to_vec());
+    // `inet_getname` and `unix_getname` run the programs of `getpeername` on the address that
+    // `accept` gives, as `do_accept` of Linux.
+    if addr != 0 {
+        let _ = cgroup_run_sock_addr(&*new, &mut peer, SockAddrHook::Getpeername, None);
+    }
     let new_fd = install(cx, new, flags)?;
     if addr != 0
         && let Err(e) = write_addr(cx, addr, lenp, &peer)
@@ -387,14 +393,19 @@ pub(crate) fn accept4(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64, flags: u64) ->
 pub(crate) fn getsockname(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
     rk_vfs::security::socket_getsockname(&lsm_sock(&file, &*sock))?;
-    write_addr(cx, addr, lenp, &sock.name())?;
+    let mut name = sock.name();
+    // The programs of the cgroup can change the address, as `inet_getname` of Linux.
+    let _ = cgroup_run_sock_addr(&*sock, &mut name, SockAddrHook::Getsockname, None);
+    write_addr(cx, addr, lenp, &name)?;
     Ok(0)
 }
 
 pub(crate) fn getpeername(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
     rk_vfs::security::socket_getpeername(&lsm_sock(&file, &*sock))?;
-    write_addr(cx, addr, lenp, &sock.peer_name()?)?;
+    let mut peer = sock.peer_name()?;
+    let _ = cgroup_run_sock_addr(&*sock, &mut peer, SockAddrHook::Getpeername, None);
+    write_addr(cx, addr, lenp, &peer)?;
     Ok(0)
 }
 
@@ -530,10 +541,56 @@ fn scatter(cx: &Cx<'_>, iovs: &[Iovec], data: &[u8]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Runs the programs of `sendmsg` of the cgroup on the address of a send, as `udp_sendmsg`,
+/// `udpv6_sendmsg` and `unix_dgram_sendmsg` of Linux. A send without an address runs no
+/// program. A program can change the source address of `IPV6_PKTINFO`. rukernel has no
+/// `IP_PKTINFO` on a send, so the source address of IPv4 has no effect.
+fn cgroup_sendmsg(sock: &dyn Socket, msg: &mut Message) -> Result<(), Errno> {
+    use rk_abi::native::in6::IPV6_PKTINFO;
+    use rk_abi::native::inet::IPPROTO_IPV6;
+    let Some(addr) = msg.addr.as_mut() else {
+        return Ok(());
+    };
+    if sock.family() != AF_INET6 {
+        cgroup_run_sock_addr(sock, addr, SockAddrHook::Sendmsg, None)?;
+        return Ok(());
+    }
+    let pktinfo = msg.control.iter().position(|(level, kind, data)| {
+        *level == IPPROTO_IPV6 && *kind == IPV6_PKTINFO && data.len() >= 20
+    });
+    let mut src = [0u8; 16];
+    if let Some(i) = pktinfo {
+        src.copy_from_slice(&msg.control[i].2[..16]);
+    }
+    let old = src;
+    cgroup_run_sock_addr(sock, addr, SockAddrHook::Sendmsg, Some(&mut src))?;
+    if src != old {
+        match pktinfo {
+            Some(i) => msg.control[i].2[..16].copy_from_slice(&src),
+            None => {
+                // `struct in6_pktinfo` with no interface.
+                let mut data = src.to_vec();
+                data.extend_from_slice(&0u32.to_ne_bytes());
+                msg.control.push((IPPROTO_IPV6, IPV6_PKTINFO, data));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs the programs of `recvmsg` of the cgroup on the source address of a receive, as
+/// `udp_recvmsg`, `udpv6_recvmsg` and `unix_dgram_recvmsg` of Linux.
+fn cgroup_recvmsg(sock: &dyn Socket, r: &mut Received) {
+    if let Some(addr) = r.addr.as_mut() {
+        let _ = cgroup_run_sock_addr(sock, addr, SockAddrHook::Recvmsg, None);
+    }
+}
+
 /// Sends the bytes of `msg` on `sock`.
-fn send(cx: &Cx<'_>, file: &File, sock: &dyn Socket, msg: Message, flags: u32) -> SysResult {
+fn send(cx: &Cx<'_>, file: &File, sock: &dyn Socket, mut msg: Message, flags: u32) -> SysResult {
     // As `security_socket_sendmsg` in `sock_sendmsg` of Linux.
     rk_vfs::security::socket_sendmsg(&lsm_sock(file, sock), msg.data.len())?;
+    cgroup_sendmsg(sock, &mut msg)?;
     let r = sock.send(&Paths { cx }, msg, flags, file.flags().nonblock()).map(|n| n as u64);
     sigpipe(cx, flags, r)
 }
@@ -569,11 +626,12 @@ pub(crate) fn recvfrom(
     let (file, sock) = socket(cx, fd)?;
     let len = (len as usize).min(SEND_MAX);
     rk_vfs::security::socket_recvmsg(&lsm_sock(&file, &*sock), len, flags)?;
-    let r = sock.recv(len, flags & !MSG_CMSG_CLOEXEC, file.flags().nonblock())?;
+    let mut r = sock.recv(len, flags & !MSG_CMSG_CLOEXEC, file.flags().nonblock())?;
     if !r.data.is_empty() {
         cx.write_bytes(buf, &r.data)?;
     }
     if addr != 0 && lenp != 0 {
+        cgroup_recvmsg(&*sock, &mut r);
         write_addr(cx, addr, lenp, r.addr.as_deref().unwrap_or(&[]))?;
     }
     Ok(result_len(&*sock, &r, flags))
@@ -834,10 +892,11 @@ fn recvmsg_one(
     let len = iovs.iter().fold(0usize, |t, v| t.saturating_add(v.iov_len as usize));
     let nonblock = nonblock || file.flags().nonblock();
     rk_vfs::security::socket_recvmsg(&lsm_sock(file, sock), len.min(SEND_MAX), flags)?;
-    let r = sock.recv(len.min(SEND_MAX), flags & !MSG_CMSG_CLOEXEC, nonblock)?;
+    let mut r = sock.recv(len.min(SEND_MAX), flags & !MSG_CMSG_CLOEXEC, nonblock)?;
     scatter(cx, &iovs, &r.data)?;
     let n = result_len(sock, &r, flags);
     if hdr.name != 0 {
+        cgroup_recvmsg(sock, &mut r);
         let from = r.addr.clone().unwrap_or_default();
         let room = (hdr.namelen as usize).min(from.len());
         if room > 0 {
