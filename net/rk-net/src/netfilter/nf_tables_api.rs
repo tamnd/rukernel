@@ -345,6 +345,48 @@ struct NftElem {
     data: Option<NftData>,
     flags: u32,
     udata: Option<Vec<u8>>,
+    /// The timeout in milliseconds, or 0.
+    timeout: u64,
+    /// The time of the clock in nanoseconds when the element expires, or 0.
+    expires: u64,
+}
+
+impl NftElem {
+    /// The element has expired at `now`, as `nft_set_elem_expired` of Linux.
+    fn expired(&self, now: u64) -> bool {
+        self.expires != 0 && now >= self.expires
+    }
+}
+
+/// The nanoseconds of the clock since boot, for the timeouts of the elements. A unit test sets
+/// the time.
+#[cfg(not(test))]
+fn nft_now_ns() -> u64 {
+    #[cfg(target_os = "none")]
+    {
+        rk_frame::time::clock_ns()
+    }
+    #[cfg(not(target_os = "none"))]
+    {
+        0
+    }
+}
+
+#[cfg(test)]
+static NFT_TEST_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn nft_now_ns() -> u64 {
+    NFT_TEST_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reads a time in milliseconds, as `nf_msecs_to_jiffies64` of Linux: a time that does not fit
+/// in nanoseconds gives `ERANGE`.
+fn nft_msecs(a: &Attrs<'_>, ty: u32) -> Result<Option<u64>> {
+    match be64(a, ty)? {
+        Some(ms) if ms.checked_mul(1_000_000).is_none() => Err(Errno::ERANGE),
+        v => Ok(v),
+    }
 }
 
 /// A set, as `struct nft_set` of Linux.
@@ -361,6 +403,10 @@ struct NftSet {
     size: u32,
     field_len: Vec<u8>,
     udata: Option<Vec<u8>>,
+    /// The timeout of the elements in milliseconds, or 0.
+    timeout: u64,
+    /// `NFTA_SET_GC_INTERVAL`, kept for the dump.
+    gc_int: u32,
     elems: BTreeMap<ElemKey, NftElem>,
     /// The ID in the batch that made the set, for `NFTA_SET_ELEM_LIST_SET_ID`.
     txn_id: Option<u32>,
@@ -374,7 +420,19 @@ impl NftSet {
 
     /// The number of elements that count for the size of the set.
     fn nelems(&self) -> usize {
-        self.elems.keys().filter(|k| !k.catchall).count()
+        let now = nft_now_ns();
+        self.elems.iter().filter(|(k, e)| !k.catchall && !e.expired(now)).count()
+    }
+
+    /// The elements that have not expired.
+    fn live_elems(&self) -> impl Iterator<Item = (&ElemKey, &NftElem)> {
+        let now = nft_now_ns();
+        self.elems.iter().filter(move |(_, e)| !e.expired(now))
+    }
+
+    /// The element of `key` if it has not expired.
+    fn live_elem(&self, key: &ElemKey) -> Option<(&ElemKey, &NftElem)> {
+        self.elems.get_key_value(key).filter(|(_, e)| !e.expired(nft_now_ns()))
     }
 }
 
@@ -880,6 +938,12 @@ fn nf_tables_fill_set(
         b.put(NFTA_SET_DATA_TYPE as u16, &set.dtype.to_be_bytes())
             .put(NFTA_SET_DATA_LEN as u16, &set.dlen.to_be_bytes());
     }
+    if set.timeout != 0 {
+        b.put(NFTA_SET_TIMEOUT as u16, &set.timeout.to_be_bytes());
+    }
+    if set.gc_int != 0 {
+        b.put(NFTA_SET_GC_INTERVAL as u16, &set.gc_int.to_be_bytes());
+    }
     if set.policy != NFT_SET_POL_PERFORMANCE {
         b.put(NFTA_SET_POLICY as u16, &set.policy.to_be_bytes());
     }
@@ -923,7 +987,13 @@ fn nft_data_dump(b: &mut Builder, attr: u32, data: &NftData, table: &NftTable) {
 }
 
 /// Adds one element in a list, as `nf_tables_fill_setelem` of Linux.
-fn nf_tables_fill_setelem(b: &mut Builder, table: &NftTable, key: &ElemKey, elem: &NftElem) {
+fn nf_tables_fill_setelem(
+    b: &mut Builder,
+    table: &NftTable,
+    set: &NftSet,
+    key: &ElemKey,
+    elem: &NftElem,
+) {
     let nest = b.nest(NFTA_LIST_ELEM);
     if !key.catchall {
         nft_data_dump(b, NFTA_SET_ELEM_KEY, &NftData::Value(key.key.clone()), table);
@@ -936,6 +1006,14 @@ fn nf_tables_fill_setelem(b: &mut Builder, table: &NftTable, key: &ElemKey, elem
     }
     if elem.flags != 0 {
         b.put(NFTA_SET_ELEM_FLAGS as u16, &elem.flags.to_be_bytes());
+    }
+    // The timeout when it is not the one of the set, and the time left.
+    if elem.timeout != 0 && elem.timeout != set.timeout {
+        b.put(NFTA_SET_ELEM_TIMEOUT as u16, &elem.timeout.to_be_bytes());
+    }
+    if elem.expires != 0 {
+        let left = elem.expires.saturating_sub(nft_now_ns()) / 1_000_000;
+        b.put(NFTA_SET_ELEM_EXPIRATION as u16, &left.to_be_bytes());
     }
     if let Some(u) = &elem.udata {
         b.put(NFTA_SET_ELEM_USERDATA as u16, u);
@@ -968,7 +1046,7 @@ fn nf_tables_fill_setelem_info(
         .put(NFTA_SET_ELEM_LIST_SET as u16, &cstr(&set.name));
     let nest = b.nest(NFTA_SET_ELEM_LIST_ELEMENTS as u16);
     for (k, e) in elems {
-        nf_tables_fill_setelem(&mut b, table, k, e);
+        nf_tables_fill_setelem(&mut b, table, set, k, e);
     }
     b.end_nest(nest);
     b.finish()
@@ -1220,7 +1298,7 @@ fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8
     let mut out = Vec::new();
     let mut part: Vec<(&ElemKey, &NftElem)> = Vec::new();
     let mut size = 0;
-    for (k, e) in &set.elems {
+    for (k, e) in set.live_elems() {
         let len = k.key.len() + e.key_end.as_ref().map_or(0, Vec::len) + 64;
         if !part.is_empty() && size + len > ELEM_DUMP_SIZE {
             out.push(nf_tables_fill_setelem_info(
@@ -1272,7 +1350,7 @@ fn nf_tables_getsetelem(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
         let flags = nft_setelem_parse_flags(set, &ea)?;
         let key =
             nft_setelem_parse_elemkey(set, &ea, flags).inspect_err(|_| info.req.bad_attr(attr))?;
-        let Some((k, e)) = set.elems.get_key_value(&key) else {
+        let Some((k, e)) = set.live_elem(&key) else {
             info.req.bad_attr(attr);
             return Err(Errno::ENOENT);
         };
@@ -2118,8 +2196,8 @@ impl NftBatch {
         {
             return Err(Errno::EOPNOTSUPP);
         }
-        // The timeouts, the objects and the expressions of the sets come later.
-        if flags & (NFT_SET_TIMEOUT | NFT_SET_OBJECT | NFT_SET_EXPR) != 0
+        // The objects and the expressions of the sets come later.
+        if flags & (NFT_SET_OBJECT | NFT_SET_EXPR) != 0
             || nla.has(NFTA_SET_EXPR)
             || nla.has(NFTA_SET_EXPRESSIONS)
         {
@@ -2147,10 +2225,17 @@ impl NftBatch {
         } else if flags & NFT_SET_MAP != 0 {
             return Err(Errno::EINVAL);
         }
-        if nla.has(NFTA_SET_OBJ_TYPE) || nla.has(NFTA_SET_TIMEOUT) || nla.has(NFTA_SET_GC_INTERVAL)
+        if nla.has(NFTA_SET_OBJ_TYPE) {
+            return Err(Errno::EINVAL);
+        }
+        // The timeout and the interval of the garbage collection need `NFT_SET_TIMEOUT`.
+        if flags & NFT_SET_TIMEOUT == 0
+            && (nla.has(NFTA_SET_TIMEOUT) || nla.has(NFTA_SET_GC_INTERVAL))
         {
             return Err(Errno::EINVAL);
         }
+        let timeout = nft_msecs(nla, NFTA_SET_TIMEOUT)?.unwrap_or(0);
+        let gc_int = be32(nla, NFTA_SET_GC_INTERVAL)?.unwrap_or(0);
         let policy = be32(nla, NFTA_SET_POLICY)?.unwrap_or(NFT_SET_POL_PERFORMANCE);
         if policy != NFT_SET_POL_PERFORMANCE && policy != NFT_SET_POL_MEMORY {
             return Err(Errno::EOPNOTSUPP);
@@ -2182,6 +2267,8 @@ impl NftBatch {
                     || set.klen != klen
                     || set.dlen != dlen
                     || set.field_len != field_len
+                    || set.timeout != timeout
+                    || set.gc_int != gc_int
                 {
                     return Err(bad(info, nla, NFTA_SET_NAME, Errno::EEXIST));
                 }
@@ -2209,6 +2296,8 @@ impl NftBatch {
             size,
             field_len,
             udata,
+            timeout,
+            gc_int,
             elems: BTreeMap::new(),
             txn_id: Some(id),
         });
@@ -2299,9 +2388,26 @@ impl NftBatch {
         if end && extra.iter().any(|&a| ea.has(a)) {
             return Err(Errno::EINVAL);
         }
-        if ea.has(NFTA_SET_ELEM_TIMEOUT) || ea.has(NFTA_SET_ELEM_EXPIRATION) {
+        // The timeout, as `nft_add_set_elem` of Linux: the one of the element or of the set,
+        // and the expiration that is left of it.
+        if set.flags & NFT_SET_TIMEOUT == 0
+            && (ea.has(NFTA_SET_ELEM_TIMEOUT) || ea.has(NFTA_SET_ELEM_EXPIRATION))
+        {
             return Err(Errno::EINVAL);
         }
+        let timeout = match nft_msecs(&ea, NFTA_SET_ELEM_TIMEOUT)? {
+            Some(t) => t,
+            None if !end => set.timeout,
+            None => 0,
+        };
+        let expiration = match nft_msecs(&ea, NFTA_SET_ELEM_EXPIRATION)? {
+            Some(_) if timeout == 0 => return Err(Errno::EOPNOTSUPP),
+            Some(e) if e > timeout => return Err(Errno::ERANGE),
+            Some(e) => e,
+            None => timeout,
+        };
+        let expires =
+            if timeout == 0 { 0 } else { nft_now_ns().saturating_add(expiration * 1_000_000) };
         if ea.has(NFTA_SET_ELEM_EXPR) || ea.has(NFTA_SET_ELEM_EXPRESSIONS) {
             return Err(Errno::EOPNOTSUPP);
         }
@@ -2326,7 +2432,7 @@ impl NftBatch {
             }
         }
         let udata = nla_udata(&ea, NFTA_SET_ELEM_USERDATA)?;
-        if let Some(old) = set.elems.get(&key) {
+        if let Some((_, old)) = set.live_elem(&key) {
             // An element that is there gives `EBUSY` if its data is not the same, and
             // `EEXIST` with `NLM_F_EXCL`.
             if old.data != data {
@@ -2340,8 +2446,12 @@ impl NftBatch {
         if !key.catchall && set.size != 0 && set.nelems() >= set.size as usize {
             return Err(Errno::ENFILE);
         }
-        let elem = NftElem { key_end, data, flags, udata };
-        self.tables[t].sets[s].elems.insert(key.clone(), elem);
+        let elem = NftElem { key_end, data, flags, udata, timeout, expires };
+        // The elements that have expired go, as the garbage collection of Linux.
+        let now = nft_now_ns();
+        let elems = &mut self.tables[t].sets[s].elems;
+        elems.retain(|_, e| !e.expired(now));
+        elems.insert(key.clone(), elem);
         self.notify_setelem(ctx, NFT_MSG_NEWSETELEM, t, s, &key);
         Ok(())
     }
@@ -2385,7 +2495,7 @@ impl NftBatch {
         let ea = Attrs::parse(attr, NFTA_SET_ELEM_MAX);
         let flags = nft_setelem_parse_flags(set, &ea)?;
         let key = nft_setelem_parse_elemkey(set, &ea, flags)?;
-        if !set.elems.contains_key(&key) {
+        if set.live_elem(&key).is_none() {
             return Err(Errno::ENOENT);
         }
         self.notify_setelem(ctx, NFT_MSG_DELSETELEM, t, s, &key);
@@ -2631,6 +2741,8 @@ mod tests {
             size: 0,
             field_len: Vec::new(),
             udata: None,
+            timeout: 0,
+            gc_int: 0,
             elems: BTreeMap::new(),
             txn_id: None,
         }
@@ -2727,6 +2839,8 @@ mod tests {
             data: Some(NftData::Verdict { code: NFT_JUMP, chain: Some(11) }),
             flags: 0,
             udata: None,
+            timeout: 0,
+            expires: 0,
         };
         m.elems.insert(key, elem);
         t.sets.push(m);

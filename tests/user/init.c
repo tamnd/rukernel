@@ -12660,6 +12660,73 @@ static void test_nft_maps(void)
 	close(fd);
 }
 
+/* Timeouts: `nft add set ip rkx t { type inet_service; flags timeout; }`, an element with a
+ * timeout of 5s, and `udp dport @t drop`. The element drops until it expires. */
+static void test_nft_timeout(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	unsigned short k = htons(30);
+	unsigned long long ms = __builtin_bswap64(5000);
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "out");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	nft_msg(&b, RK_NFT_MSG_NEWSET, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_NAME, "t");
+	nft_be32(&b, 3, 0x10); /* NFTA_SET_FLAGS: NFT_SET_TIMEOUT */
+	nft_be32(&b, RK_NFTA_SET_KEY_LEN, 2);
+	nft_be32(&b, RK_NFTA_SET_ID, 1);
+	nft_msg(&b, RK_NFT_MSG_NEWSETELEM, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_ELEM_LIST_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_ELEM_LIST_SET, "t");
+	struct rtattr *l = nl_put(b.cur, RK_NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED, NULL, 0);
+	struct rtattr *el = nl_put(b.cur, RK_NFTA_LIST_ELEM | NLA_F_NESTED, NULL, 0);
+	struct rtattr *a = nl_put(b.cur, RK_NFTA_SET_ELEM_KEY | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &k, 2);
+	nl_end(b.cur, a);
+	nl_put(b.cur, 4, &ms, 8); /* NFTA_SET_ELEM_TIMEOUT */
+	nl_end(b.cur, el);
+	nl_end(b.cur, l);
+	struct rtattr *x = nft_rule(&b, "out");
+	nft_udp_dport_load(&b);
+	struct rtattr *e, *d = nft_expr(&b, "lookup", &e);
+	nft_str(&b, 1, "t");           /* NFTA_LOOKUP_SET */
+	nft_be32(&b, 2, RK_NFT_REG_1); /* NFTA_LOOKUP_SREG */
+	nft_expr_end(&b, d, e);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	int err = nft_send(fd, &b, 1);
+	if (err)
+		printf("nft: the batch of the timeout gives %d\n", err);
+	check("nft: a set with timeouts and an element of 5s", err == 0);
+	/* The timeout leaves time for a slow machine, as the emulator under load. */
+	err = nft_udp_send_port(30);
+	if (err != EPERM)
+		printf("nft: the send before the timeout gives %d\n", err);
+	check("nft: the element drops before it expires", err == EPERM);
+	usleep(5500000);
+	check("nft: the element has expired after its timeout", nft_udp_send_port(30) == 0);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of the timeout goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -12682,6 +12749,7 @@ static void test_inet(int port)
 	test_nft_limit_log();
 	test_nft_reject();
 	test_nft_maps();
+	test_nft_timeout();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();

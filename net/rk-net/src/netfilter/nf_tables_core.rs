@@ -755,21 +755,36 @@ struct ProgSet {
     ranges: Vec<(Vec<u8>, Vec<u8>, bool, ProgData)>,
     /// The catch-all element, for a key that no other element has.
     catchall: Option<ProgData>,
+    /// The time in nanoseconds when the elements with a timeout expire, by the start of their
+    /// key, and of the catch-all element. Empty for a set with no timeouts.
+    expires: BTreeMap<Vec<u8>, u64>,
+    catchall_expires: u64,
 }
 
 impl ProgSet {
-    /// The data of the element of `key`, as the `lookup` of the backends of sets of Linux.
+    /// The data of the element of `key`, as the `lookup` of the backends of sets of Linux. An
+    /// element that has expired does not match.
     fn find(&self, key: &[u8]) -> Option<&ProgData> {
+        let now = if self.expires.is_empty() && self.catchall_expires == 0 {
+            0
+        } else {
+            super::nft_now_ns()
+        };
+        let live = |k: &[u8]| self.expires.get(k).is_none_or(|&t| now < t);
         self.keys
             .get(key)
+            .filter(|_| live(key))
             .or_else(|| {
                 self.ranges.iter().find_map(|(s, e, with_end, d)| {
                     let inside = s.as_slice() <= key
                         && (key < e.as_slice() || (*with_end && key == e.as_slice()));
-                    inside.then_some(d)
+                    (inside && live(s)).then_some(d)
                 })
             })
-            .or(self.catchall.as_ref())
+            .or(self
+                .catchall
+                .as_ref()
+                .filter(|_| self.catchall_expires == 0 || now < self.catchall_expires))
     }
 }
 
@@ -812,6 +827,14 @@ impl ProgChains {
 fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
     let set = &table.sets[s];
     let mut p = ProgSet::default();
+    let now = super::nft_now_ns();
+    for (k, e) in set.elems.iter().filter(|(_, e)| e.expires != 0) {
+        if k.catchall {
+            p.catchall_expires = e.expires;
+        } else {
+            p.expires.insert(k.key.clone(), e.expires);
+        }
+    }
     let mut data = |e: &super::NftElem| match &e.data {
         Some(NftData::Value(v)) => ProgData::Value(v.clone()),
         Some(NftData::Verdict { code, chain }) => {
@@ -824,7 +847,7 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
         // `NFT_SET_ELEM_INTERVAL_END` that ends the range. A start with `NFTA_SET_ELEM_KEY_END`
         // is a range with its end. The start has the data of the range.
         let mut start: Option<(&Vec<u8>, ProgData)> = None;
-        for (k, e) in &set.elems {
+        for (k, e) in set.elems.iter().filter(|(_, e)| !e.expired(now)) {
             if k.catchall {
                 p.catchall = Some(data(e));
             } else if k.end || e.flags & NFT_SET_ELEM_INTERVAL_END != 0 {
@@ -843,7 +866,7 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
             p.ranges.push((s.clone(), alloc::vec![0xff; s.len()], true, d));
         }
     } else {
-        for (k, e) in &set.elems {
+        for (k, e) in set.elems.iter().filter(|(_, e)| !e.expired(now)) {
             if k.catchall {
                 p.catchall = Some(data(e));
             } else {
@@ -1307,6 +1330,7 @@ mod tests {
                 ProgData::Verdict { code: NFT_JUMP, chain: 1 },
             )],
             catchall: Some(ProgData::Verdict { code: NFT_GOTO, chain: 2 }),
+            ..ProgSet::default()
         };
         let mut r0 = dport(0);
         r0.pop();
@@ -1331,6 +1355,30 @@ mod tests {
             .collect();
         // 7 matches no element of the vmap and takes the catch-all.
         assert_eq!(v, [NF_DROP, NF_DROP, NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_DROP]);
+    }
+
+    #[test]
+    fn an_element_matches_until_it_expires() {
+        use core::sync::atomic::Ordering;
+        let k = |p: u16| p.to_be_bytes().to_vec();
+        let set = ProgSet {
+            keys: [(k(1), ProgData::None), (k(2), ProgData::None)].into(),
+            ranges: vec![(k(10), k(20), true, ProgData::None)],
+            catchall: Some(ProgData::Value(k(7))),
+            expires: [(k(1), 5_000), (k(10), 8_000)].into(),
+            catchall_expires: 9_000,
+        };
+        super::super::NFT_TEST_NS.store(4_999, Ordering::Relaxed);
+        assert!(matches!(set.find(&k(1)), Some(ProgData::None)));
+        assert!(matches!(set.find(&k(15)), Some(ProgData::None)));
+        super::super::NFT_TEST_NS.store(5_000, Ordering::Relaxed);
+        // 1 has expired and takes the catch-all; 2 has no timeout.
+        assert!(matches!(set.find(&k(1)), Some(ProgData::Value(_))));
+        assert!(matches!(set.find(&k(2)), Some(ProgData::None)));
+        super::super::NFT_TEST_NS.store(9_000, Ordering::Relaxed);
+        assert!(set.find(&k(15)).is_none());
+        assert!(matches!(set.find(&k(2)), Some(ProgData::None)));
+        super::super::NFT_TEST_NS.store(0, Ordering::Relaxed);
     }
 
     #[test]
