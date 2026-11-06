@@ -13,6 +13,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The `dynset` expression of nf_tables, as net/netfilter/nft_dynset.c of Linux: a rule adds the key of a packet to a set, starts the timeout of its element again, or removes it, with `NFT_DYNSET_F_INV` and the data of a map. The elements go in a list of the set that the lookups see, the dumps show and the next commit puts in the set. A set of intervals gives `EOPNOTSUPP`, as do the expressions of the elements (#542).
 - rk-bpfpin of the `systemd` boot test also pins a program of `BPF_PROG_TYPE_CGROUP_SKB` and a link of the program to the root cgroup in /sys/fs/bpf, gets them again with `BPF_OBJ_GET`, and checks that the pinned link keeps the program attached until the unlink of its pin. The `init` boot test checks the same for bpffs (#537).
 - A masquerade part in the `netns` boot test: `init masq IFNAME` adds `meta oif IFNAME masquerade` in the router namespace, and a ping and a TCP connection go from one namespace to the other with the address of the router as the source (#542).
+- ctnetlink, the subsystem of `NETLINK_NETFILTER` for the connections, as net/netfilter/nf_conntrack_netlink.c of Linux: the dump of the connections (`conntrack -L`) with the filters of the family, `CTA_MARK` and `CTA_STATUS`, the get of one connection, the delete of one connection or of all of them, and `IPCTNL_MSG_CT_GET_STATS`. `IPCTNL_MSG_CT_NEW`, `CTA_FILTER`, the statistics of each CPU and the events give `EOPNOTSUPP` (#542).
 
 ## [0.5.8] - 2026-11-06
 

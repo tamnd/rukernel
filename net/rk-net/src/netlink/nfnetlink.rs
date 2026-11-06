@@ -22,6 +22,8 @@ pub const NETLINK_NETFILTER: u32 = 12;
 
 // The subsystems, `NFNL_SUBSYS_*` of <linux/netfilter/nfnetlink.h>. rk-abigen does not take
 // this header yet, so the values are written by hand.
+/// The subsystem ctnetlink, for the connections of conntrack.
+pub const NFNL_SUBSYS_CTNETLINK: u8 = 1;
 /// The subsystem nf_tables.
 pub const NFNL_SUBSYS_NFTABLES: u8 = 10;
 /// The number of subsystems, `NFNL_SUBSYS_COUNT`.
@@ -120,6 +122,8 @@ pub enum NfnlCbType {
     Unspec,
     /// The handler does not change the state. It runs out of a batch.
     Rcu,
+    /// The handler can change the state. It runs out of a batch.
+    Mutex,
     /// The handler changes the state. It runs only in a batch.
     Batch,
 }
@@ -169,7 +173,10 @@ pub struct NfnlSubsystem {
 }
 
 /// The subsystems.
-static SUBSYSTEMS: &[&NfnlSubsystem] = &[&crate::netfilter::nf_tables_api::NF_TABLES_SUBSYS];
+static SUBSYSTEMS: &[&NfnlSubsystem] = &[
+    &crate::netfilter::nf_conntrack::nf_conntrack_netlink::CTNETLINK_SUBSYS,
+    &crate::netfilter::nf_tables_api::NF_TABLES_SUBSYS,
+];
 
 fn nfnetlink_get_subsys(subsys_id: u16) -> Option<&'static NfnlSubsystem> {
     SUBSYSTEMS.iter().copied().find(|s| u16::from(s.subsys_id) == subsys_id)
@@ -391,7 +398,7 @@ pub(super) fn rcv_msg(
     let req = Request::new(sock, h, m, ext);
     let (fixed, attrs) = req.parse(NFGENMSG_LEN, nc.attr_count)?;
     let Some(nfmsg) = NfGenMsg::parse(fixed) else { return Err(Errno::EINVAL) };
-    if nc.kind != NfnlCbType::Rcu {
+    if !matches!(nc.kind, NfnlCbType::Rcu | NfnlCbType::Mutex) {
         return Err(Errno::EINVAL);
     }
     let info = NfnlInfo { req: &req, nlh: h, nfmsg };
