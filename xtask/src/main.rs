@@ -876,10 +876,11 @@ echo 'debian: done'
         // systemd runs as PID 1. At multi-user.target the service prints the state of the system
         // and the units that failed, and stops the machine. The test passes if the state is
         // `running`, or `degraded` with only the units of `allowed` in the failed list,
-        // /sys/fs/bpf is a bpf file system, and rk-bpfpin can pin a map in /sys/fs/bpf and read
-        // it again. systemd mounts /sys/fs/bpf itself at the start (mount_table in
-        // src/shared/mount-setup.c) and makes no unit for an API file system, so the check reads
-        // /proc/self/mountinfo and not the state of sys-fs-bpf.mount.
+        // /sys/fs/bpf is a bpf file system, and rk-bpfpin can pin a map, a program and a link of
+        // the program to the root cgroup in /sys/fs/bpf and get them again. systemd mounts
+        // /sys/fs/bpf itself at the start (mount_table in src/shared/mount-setup.c) and makes no
+        // unit for an API file system, also on Linux, so the check reads /proc/self/mountinfo and
+        // not the state of sys-fs-bpf.mount.
         init: r#"#!/bin/sh
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
