@@ -4785,6 +4785,87 @@ static void test_disk_stats(void)
 		umount("/proc");
 }
 
+/* The devices on the buses: /sys/devices/pci0000:00, /sys/devices/platform, /sys/bus and
+ * /sys/module, as udev and systemd read them. */
+static void test_sysfs_bus(void)
+{
+	char buf[256], path[160], link[160], name[64];
+	struct dirent *e;
+	struct stat st;
+	DIR *dir;
+	ssize_t n;
+	int fd, ok;
+
+	check("/sys/bus has pci, platform and virtio",
+	      stat("/sys/bus/pci/devices", &st) == 0 && stat("/sys/bus/platform/drivers", &st) == 0 &&
+		      stat("/sys/bus/virtio/drivers/virtio_net", &st) == 0);
+	n = readlink("/sys/module/virtio_net/drivers/virtio:virtio_net", link, sizeof(link) - 1);
+	check("/sys/module/virtio_net links to its driver",
+	      n > 0 && (link[n] = 0, strcmp(link, "../../../bus/virtio/drivers/virtio_net") == 0));
+	/* Each function on the PCI bus has the files of pci-sysfs.c. */
+	name[0] = 0;
+	dir = opendir("/sys/devices/pci0000:00");
+	while (dir && (e = readdir(dir)) != NULL)
+		if (strncmp(e->d_name, "0000:", 5) == 0 && name[0] == 0)
+			snprintf(name, sizeof(name), "%.63s", e->d_name);
+	if (dir)
+		closedir(dir);
+#ifdef __x86_64__
+	check("/sys/devices/pci0000:00 has the functions of the bus", name[0] != 0);
+#endif
+	if (name[0] != 0) {
+		snprintf(path, sizeof(path), "/sys/devices/pci0000:00/%s/vendor", name);
+		check("a PCI function has its vendor",
+		      read_small(path, buf, sizeof(buf)) == 7 && strncmp(buf, "0x", 2) == 0);
+		snprintf(path, sizeof(path), "/sys/devices/pci0000:00/%s/modalias", name);
+		check("a PCI function has its modalias",
+		      read_small(path, buf, sizeof(buf)) > 0 && strncmp(buf, "pci:v0000", 9) == 0);
+		snprintf(path, sizeof(path), "/sys/devices/pci0000:00/%s/uevent", name);
+		snprintf(link, sizeof(link), "PCI_SLOT_NAME=%s\n", name);
+		check("a PCI function has its uevent",
+		      read_small(path, buf, sizeof(buf)) > 0 && strstr(buf, link) != NULL);
+		snprintf(path, sizeof(path), "/sys/devices/pci0000:00/%s/subsystem", name);
+		n = readlink(path, link, sizeof(link) - 1);
+		check("a PCI function links to its bus",
+		      n > 0 && (link[n] = 0, strcmp(link, "../../../bus/pci") == 0));
+		snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/class", name);
+		check("/sys/bus/pci/devices links to the function",
+		      read_small(path, buf, sizeof(buf)) == 9 && strncmp(buf, "0x", 2) == 0);
+	}
+#ifdef __aarch64__
+	/* The first virtio-mmio transport of the virt machine. */
+	check("/sys/devices/platform has the virtio-mmio transports",
+	      read_small("/sys/devices/platform/a000000.virtio_mmio/modalias", buf, sizeof(buf)) > 0 &&
+		      strcmp(buf, "of:Nvirtio_mmioT(null)Cvirtio,mmio\n") == 0);
+#endif
+	/* A virtio device is below its transport, with its driver. */
+	name[0] = 0;
+	dir = opendir("/sys/bus/virtio/devices");
+	while (dir && (e = readdir(dir)) != NULL)
+		if (strncmp(e->d_name, "virtio", 6) == 0 && name[0] == 0)
+			snprintf(name, sizeof(name), "%.63s", e->d_name);
+	if (dir)
+		closedir(dir);
+	if (name[0] != 0) {
+		snprintf(path, sizeof(path), "/sys/bus/virtio/devices/%s", name);
+		n = readlink(path, link, sizeof(link) - 1);
+		ok = n > 0 && (link[n] = 0, strncmp(link, "../../../devices/p", 18) == 0);
+		check("/sys/bus/virtio/devices links to the transport", ok);
+		snprintf(path, sizeof(path), "/sys/bus/virtio/devices/%s/modalias", name);
+		check("a virtio device has its modalias",
+		      read_small(path, buf, sizeof(buf)) > 0 && strncmp(buf, "virtio:d0000000", 15) == 0);
+		snprintf(path, sizeof(path), "/sys/bus/virtio/devices/%s/subsystem", name);
+		n = readlink(path, link, sizeof(link) - 1);
+		check("a virtio device links to its bus",
+		      n > 0 && (link[n] = 0, strcmp(link, "../../../../bus/virtio") == 0));
+		snprintf(path, sizeof(path), "/sys/bus/virtio/devices/%s/uevent", name);
+		fd = open(path, O_WRONLY);
+		check("the uevent of a virtio device takes a write", fd >= 0 && write(fd, "change", 6) == 6);
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
 static void test_sysfs(void)
 {
 	struct statfs sfs;
@@ -4814,6 +4895,7 @@ static void test_sysfs(void)
 	}
 	test_sysfs_cpu();
 	test_sysfs_firmware();
+	test_sysfs_bus();
 	umount("/sys");
 
 	mkdir("/mnt", 0755);

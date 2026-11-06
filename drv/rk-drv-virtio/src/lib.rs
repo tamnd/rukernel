@@ -80,7 +80,7 @@ impl Probe {
     /// Starts the driver for the device with the virtio device ID `id` on the transport `t`.
     /// `bus` is the number of the device among all virtio devices, and `place` tells where the
     /// device is, from the kind of its interrupt. `bus_info` is the name of the device on its
-    /// bus, as `virtio_bus_name` of Linux gives it.
+    /// bus, as `virtio_bus_name` of Linux gives it. `on` is the transport, for sysfs.
     fn add(
         &mut self,
         id: u32,
@@ -88,23 +88,29 @@ impl Probe {
         bus: u32,
         bus_info: alloc::string::String,
         place: impl Fn(&str) -> alloc::string::String,
+        on: rk_vfs::bus::Transport,
     ) {
-        match id {
-            DEVICE_BLK => {
-                if let Some((name, kind)) = blk::probe(t, self.disks) {
-                    rk_frame::println!("virtio: {name} on {}", place(&kind));
-                    self.disks += 1;
-                }
-            }
-            DEVICE_NET => {
-                if let Some((nic, kind)) = net::probe(t, self.nics, bus, bus_info) {
-                    let place = place(&kind);
-                    rk_frame::println!("virtio: {} on {place}, MAC {}", nic.name(), nic.mac());
-                    self.nics += 1;
-                }
-            }
-            _ => {}
-        }
+        let driver = match id {
+            DEVICE_BLK => blk::probe(t, self.disks).map(|(name, kind)| {
+                rk_frame::println!("virtio: {name} on {}", place(&kind));
+                self.disks += 1;
+                "virtio_blk"
+            }),
+            DEVICE_NET => net::probe(t, self.nics, bus, bus_info).map(|(nic, kind)| {
+                let place = place(&kind);
+                rk_frame::println!("virtio: {} on {place}, MAC {}", nic.name(), nic.mac());
+                self.nics += 1;
+                "virtio_net"
+            }),
+            _ => None,
+        };
+        rk_vfs::bus::add_virtio(rk_vfs::bus::VirtioDevice {
+            index: bus,
+            transport: on,
+            device: id,
+            vendor: u32::from(VIRTIO_VENDOR),
+            driver,
+        });
     }
 }
 
@@ -113,21 +119,38 @@ impl Probe {
     /// Starts a driver for each virtio device on the PCI bus. `bus` is the number of the first
     /// device among all virtio devices, and the call gives the number after the last device.
     fn pci(&mut self, mut bus: u32) -> u32 {
-        let virtio = rk_frame::pci::devices().iter().filter(|d| d.vendor_id() == VIRTIO_VENDOR);
-        for dev in virtio {
-            let this = bus;
-            bus += 1;
-            let Some(id) = pci::device_type(dev) else { continue };
-            if !matches!(id, DEVICE_BLK | DEVICE_NET) {
-                continue;
+        for dev in rk_frame::pci::devices() {
+            let a = dev.address();
+            let mut driver = None;
+            if dev.vendor_id() == VIRTIO_VENDOR {
+                let this = bus;
+                bus += 1;
+                if let Some(id) = pci::device_type(dev)
+                    && matches!(id, DEVICE_BLK | DEVICE_NET)
+                    && let Some(t) = pci::PciTransport::new(dev)
+                {
+                    let place = |kind: &str| alloc::format!("PCI {:?} with {kind}", dev.address());
+                    let bus_info =
+                        alloc::format!("{:04x}:{:02x}:{:02x}.{:x}", 0, a.bus, a.device, a.function);
+                    let on = rk_vfs::bus::Transport::Pci(a.bus, a.device, a.function);
+                    self.add(id, transport::Transport::Pci(t), this, bus_info, place, on);
+                    driver = Some("virtio-pci");
+                }
             }
-            if let Some(t) = pci::PciTransport::new(dev) {
-                let place = |kind: &str| alloc::format!("PCI {:?} with {kind}", dev.address());
-                let a = dev.address();
-                let bus_info =
-                    alloc::format!("{:04x}:{:02x}:{:02x}.{:x}", 0, a.bus, a.device, a.function);
-                self.add(id, transport::Transport::Pci(t), this, bus_info, place);
-            }
+            let subsystem = dev.read_config(0x2c);
+            rk_vfs::bus::add_pci(rk_vfs::bus::PciFunction {
+                bus: a.bus,
+                slot: a.device,
+                function: a.function,
+                vendor: dev.vendor_id(),
+                device: dev.device_id(),
+                class: dev.class(),
+                revision: dev.read_config_u8(0x08),
+                subsystem_vendor: subsystem as u16,
+                subsystem_device: (subsystem >> 16) as u16,
+                irq: dev.read_config_u8(0x3c),
+                driver,
+            });
         }
         bus
     }
@@ -151,15 +174,30 @@ pub fn init() {
     let mut probe = Probe::default();
     let mut bus = 0u32;
     for dev in rk_frame::iomem::virtio_mmio_devices() {
-        let Some(regs) = dev.map() else { continue };
-        // A transport without a device does not get its line.
-        let Some((id, t)) = mmio::MmioTransport::new(regs, dev.phys(), || dev.irq()) else {
+        // Each node of the device tree is a platform device. The driver takes the ones that have
+        // a device, as `virtio_mmio_probe` of Linux.
+        let mut platform = rk_vfs::bus::PlatformDevice {
+            phys: dev.phys(),
+            node: "virtio_mmio",
+            compatible: "virtio,mmio",
+            driver: None,
+        };
+        let Some(regs) = dev.map() else {
+            rk_vfs::bus::add_platform(platform);
             continue;
         };
+        // A transport without a device does not get its line.
+        let Some((id, t)) = mmio::MmioTransport::new(regs, dev.phys(), || dev.irq()) else {
+            rk_vfs::bus::add_platform(platform);
+            continue;
+        };
+        platform.driver = Some("virtio-mmio");
+        rk_vfs::bus::add_platform(platform);
         if matches!(id, DEVICE_BLK | DEVICE_NET) {
             let place = |_: &str| alloc::format!("MMIO {:#x}", dev.phys());
             let bus_info = alloc::format!("{:x}.virtio_mmio", dev.phys());
-            probe.add(id, transport::Transport::Mmio(t), bus, bus_info, place);
+            let on = rk_vfs::bus::Transport::Mmio(dev.phys());
+            probe.add(id, transport::Transport::Mmio(t), bus, bus_info, place, on);
         }
         bus += 1;
     }
