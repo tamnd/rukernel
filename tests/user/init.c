@@ -13008,6 +13008,109 @@ static void test_nft_timeout(void)
 	close(fd);
 }
 
+/* The chain out of the table rkx at LOCAL_OUT, that accepts. */
+static void nft_rkx_out(struct nft_batch *b)
+{
+	nft_msg(b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(b, RK_NFTA_TABLE_NAME, "rkx");
+	nft_msg(b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(b, RK_NFTA_CHAIN_TABLE, "rkx");
+	nft_str(b, RK_NFTA_CHAIN_NAME, "out");
+	struct rtattr *h = nl_put(b->cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b->cur, h);
+	nft_str(b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+}
+
+/* A rule of out with `udp dport 40 add @set { udp dport }`. */
+static void nft_dynset_rule(struct nft_batch *b, const char *set)
+{
+	struct rtattr *x = nft_rule(b, "out");
+	nft_udp_dport(b, 40);
+	struct rtattr *e, *d = nft_expr(b, "dynset", &e);
+	nft_str(b, 1, set);           /* NFTA_DYNSET_SET_NAME */
+	nft_be32(b, 3, 0);            /* NFTA_DYNSET_OP: NFT_DYNSET_OP_ADD */
+	nft_be32(b, 4, RK_NFT_REG_1); /* NFTA_DYNSET_SREG_KEY */
+	nft_expr_end(b, d, e);
+	nl_end(b->cur, x);
+}
+
+/* Dynamic sets: `nft add set ip rkx d { type inet_service; flags dynamic; }`,
+ * `udp dport @d drop` and `udp dport 40 add @d { udp dport }`. The first datagram to port 40
+ * passes and adds the port, the next is dropped. A dump shows the element, and a batch that
+ * removes it lets the next datagram pass again. */
+static void test_nft_dynset(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+	unsigned short k = htons(40);
+
+	if (fd < 0)
+		return;
+	nft_begin(&b, 0);
+	nft_rkx_out(&b);
+	nft_msg(&b, RK_NFT_MSG_NEWSET, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_NAME, "d");
+	nft_be32(&b, 3, 0x20); /* NFTA_SET_FLAGS: NFT_SET_EVAL */
+	nft_be32(&b, RK_NFTA_SET_KEY_LEN, 2);
+	nft_be32(&b, RK_NFTA_SET_ID, 1);
+	nft_msg(&b, RK_NFT_MSG_NEWSET, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_SET_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_NAME, "i");
+	nft_be32(&b, 3, 0x4); /* NFTA_SET_FLAGS: NFT_SET_INTERVAL */
+	nft_be32(&b, RK_NFTA_SET_KEY_LEN, 2);
+	nft_be32(&b, RK_NFTA_SET_ID, 2);
+	struct rtattr *x = nft_rule(&b, "out");
+	nft_udp_dport_load(&b);
+	struct rtattr *e, *d = nft_expr(&b, "lookup", &e);
+	nft_str(&b, 1, "d");           /* NFTA_LOOKUP_SET */
+	nft_be32(&b, 2, RK_NFT_REG_1); /* NFTA_LOOKUP_SREG */
+	nft_expr_end(&b, d, e);
+	nft_verdict(&b, RK_NF_DROP, NULL);
+	nl_end(b.cur, x);
+	nft_dynset_rule(&b, "d");
+	int err = nft_send(fd, &b, 1);
+	if (err)
+		printf("nft: the batch of dynset gives %d\n", err);
+	check("nft: a dynamic set and a rule that adds to it", err == 0);
+	check("nft: dynset adds the port and the next datagram is dropped",
+	      nft_udp_send_port(40) == 0 && nft_udp_send_port(40) == EPERM);
+	check("nft: the dump of the set shows the element of dynset",
+	      nft_dump_count(fd, RK_NFT_MSG_GETSETELEM, "rkx", "d") == 1);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWSETELEM + 2, 0, AF_INET); /* NFT_MSG_DELSETELEM */
+	nft_str(&b, RK_NFTA_SET_ELEM_LIST_TABLE, "rkx");
+	nft_str(&b, RK_NFTA_SET_ELEM_LIST_SET, "d");
+	struct rtattr *l = nl_put(b.cur, RK_NFTA_SET_ELEM_LIST_ELEMENTS | NLA_F_NESTED, NULL, 0);
+	struct rtattr *el = nl_put(b.cur, RK_NFTA_LIST_ELEM | NLA_F_NESTED, NULL, 0);
+	struct rtattr *a = nl_put(b.cur, RK_NFTA_SET_ELEM_KEY | NLA_F_NESTED, NULL, 0);
+	nl_put(b.cur, RK_NFTA_DATA_VALUE, &k, 2);
+	nl_end(b.cur, a);
+	nl_end(b.cur, el);
+	nl_end(b.cur, l);
+	err = nft_send(fd, &b, 1);
+	if (err)
+		printf("nft: the removal of the element of dynset gives %d\n", err);
+	check("nft: a batch removes the element of dynset",
+	      err == 0 && nft_dump_count(fd, RK_NFT_MSG_GETSETELEM, "rkx", "d") == 0 &&
+		      nft_udp_send_port(40) == 0);
+
+	nft_begin(&b, 0);
+	nft_dynset_rule(&b, "i");
+	check("nft: dynset on a set of intervals gives EOPNOTSUPP",
+	      nft_send(fd, &b, 1) == -EOPNOTSUPP);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "rkx");
+	check("nft: the table of dynset goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 static void test_inet(int port)
 {
 	test_inet_protos();
@@ -13031,6 +13134,7 @@ static void test_inet(int port)
 	test_nft_reject();
 	test_nft_maps();
 	test_nft_timeout();
+	test_nft_dynset();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();
