@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.8] - 2026-11-06
+
 ### Added
 
 - The other programs of cgroup2 for sockets, as kernel/bpf/cgroup.c of Linux. `BPF_CGROUP_UDP4_SENDMSG` and `BPF_CGROUP_UDP6_SENDMSG` run on the address of a UDP send, and a program of `BPF_CGROUP_UDP6_SENDMSG` can change the source address of `IPV6_PKTINFO`. `BPF_CGROUP_UDP4_RECVMSG` and `BPF_CGROUP_UDP6_RECVMSG` run on the source address of a UDP receive. The programs of `getsockname` and `getpeername` run on the address that `getsockname`, `getpeername` and `accept` give. The Unix programs of `connect`, `sendmsg`, `recvmsg`, `getsockname` and `getpeername` run on the calls of a Unix socket, and a program that gives 0 makes `connect` and `sendmsg` give `EPERM`. `BPF_CGROUP_INET4_POST_BIND` and `BPF_CGROUP_INET6_POST_BIND` run after the bind of a TCP or UDP socket, and a program that gives 0 frees the port and makes `bind` give `EPERM`. `BPF_CGROUP_INET_SOCK_RELEASE` runs at the last close of an IPv4 or IPv6 socket. The programs use the cgroup of the socket (#537).
@@ -14,6 +16,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A pidfd with `PIDFD_THREAD` of a thread that is not the leader refers to the thread, as in Linux. `PIDFD_GET_INFO` gives the ID of the thread and, after its exit, its exit status, and `poll` gives `POLLIN` and `POLLHUP` when the thread ends. A pidfd of a process gives `POLLHUP` after the parent reaps it. `pidfd_send_signal` takes `PIDFD_SELF_THREAD`, `PIDFD_SELF_THREAD_GROUP` and the flags `PIDFD_SIGNAL_THREAD`, `PIDFD_SIGNAL_THREAD_GROUP` and `PIDFD_SIGNAL_PROCESS_GROUP`. Without a flag, a pidfd with `PIDFD_THREAD` sends the signal to the thread (#536).
 - `process_mrelease` frees the pages of the private areas of a process that a signal ended, before its last thread ends, as `__oom_reap_task_mm` of Linux. It gives `EINVAL` for a process that does not exit, or that shares its memory with a process that does not exit (#536).
 - The timeouts of the sets of nf_tables, as `NFT_SET_TIMEOUT` of Linux: a set has a timeout for its elements and an element can have its own, with `NFTA_SET_ELEM_EXPIRATION` for the time that is left. An element that has expired does not match, is not in a dump and goes when an element comes (#542).
+- The `redir` expression of nf_tables, as net/netfilter/nft_redir.c and nf_nat_redirect.c of Linux: `redirect` and `redirect to :port` send a packet to the host, to 127.0.0.1 or ::1 at the hook output and to an address of the host at prerouting, with the reply that comes back from the first address and port (#542).
+- The maps of nf_tables, as the `lookup` with `NFTA_LOOKUP_DREG` of net/netfilter/nft_lookup.c of Linux: a map gives the data of the element of the key to a register, and a verdict map gives its verdict, with a jump or a goto to a chain. The jumps of a verdict map count for the loops of the chains, when a rule looks the map up and when an element comes. A lookup of the keys of a map with no register works for a named map (#542).
 
 ### Fixed
 
@@ -35,8 +39,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The expressions `byteorder`, `range`, `limit` and `log` of nf_tables, as net/netfilter/nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c and nf_log_syslog.c of Linux. `limit` is a bucket of tokens for packets or bytes with a burst and `limit rate over`, and `log` writes the line of nf_log (the devices, the IP header, and the ports, flags and sequence numbers of TCP, UDP and ICMP) to the kernel log at its level. A `log` with a group (nfnetlink_log) gives `ENOENT` and the audit level gives `EOPNOTSUPP` (#542).
 - The systemd boot test runs rk-bpfpin, which pins an array map in /sys/fs/bpf, gets it again with `BPF_OBJ_GET` and reads a value (#537).
 - The `reject` expression of nf_tables, as net/netfilter/nft_reject*.c, net/ipv4/netfilter/nf_reject_ipv4.c and net/ipv6/netfilter/nf_reject_ipv6.c of Linux: an ICMP or ICMPv6 "destination unreachable" with a code, the codes of `icmpx` that each family turns into its own, or a TCP RST, then the drop of the packet. `reject` is for the hooks prerouting, input, forward and output (#542).
-- The `redir` expression of nf_tables, as net/netfilter/nft_redir.c and nf_nat_redirect.c of Linux: `redirect` and `redirect to :port` send a packet to the host, to 127.0.0.1 or ::1 at the hook output and to an address of the host at prerouting, with the reply that comes back from the first address and port (#542).
-- The maps of nf_tables, as the `lookup` with `NFTA_LOOKUP_DREG` of net/netfilter/nft_lookup.c of Linux: a map gives the data of the element of the key to a register, and a verdict map gives its verdict, with a jump or a goto to a chain. The jumps of a verdict map count for the loops of the chains, when a rule looks the map up and when an element comes. A lookup of the keys of a map with no register works for a named map (#542).
 
 ## [0.5.6] - 2026-11-05
 
@@ -1403,6 +1405,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.8]: https://github.com/tamnd/rukernel/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/tamnd/rukernel/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/tamnd/rukernel/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/tamnd/rukernel/compare/v0.5.4...v0.5.5
