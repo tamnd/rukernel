@@ -1,9 +1,8 @@
 //! fanotify: `fanotify_init` and `fanotify_mark`, as fs/notify/fanotify/fanotify_user.c of
 //! Linux. The group, its queue and its marks are in `rk_vfs::notify::fanotify`.
 //!
-//! The groups that report a file handle (`FAN_REPORT_FID` and the other FID bits), the groups of
-//! mount events (`FAN_REPORT_MNT`) and `FAN_REPORT_PIDFD` are not supported: `fanotify_init`
-//! gives `EINVAL` for them.
+//! The groups of mount events (`FAN_REPORT_MNT`) and `FAN_REPORT_PIDFD` are not supported:
+//! `fanotify_init` gives `EINVAL` for them.
 
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
@@ -15,22 +14,20 @@ use rk_abi::native::fanotify::{
     FAN_MARK_FLUSH, FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK, FAN_MARK_IGNORED_SURV_MODIFY,
     FAN_MARK_INODE, FAN_MARK_MNTNS, FAN_MARK_MOUNT, FAN_MARK_ONLYDIR, FAN_MARK_REMOVE,
     FAN_MNT_ATTACH, FAN_MNT_DETACH, FAN_MOVE, FAN_MOVE_SELF, FAN_NONBLOCK, FAN_ONDIR,
-    FAN_PRE_ACCESS, FAN_RENAME, FAN_REPORT_DFID_NAME_TARGET, FAN_REPORT_FD_ERROR, FAN_REPORT_MNT,
-    FAN_REPORT_PIDFD, FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FAN_UNLIMITED_QUEUE,
+    FAN_PRE_ACCESS, FAN_RENAME, FAN_REPORT_DIR_FID, FAN_REPORT_FD_ERROR, FAN_REPORT_FID,
+    FAN_REPORT_MNT, FAN_REPORT_NAME, FAN_REPORT_PIDFD, FAN_REPORT_TARGET_FID, FAN_REPORT_TID,
+    FAN_UNLIMITED_MARKS, FAN_UNLIMITED_QUEUE,
 };
 use rk_abi::native::open as o;
 use rk_vfs::cred::{cap, may};
 use rk_vfs::file::File;
 use rk_vfs::notify::Object;
 use rk_vfs::notify::fanotify::{
-    EVENT_FLAGS, FD_EVENTS, Fanotify, FanotifyFile, Kind, PATH_EVENTS, PERM_EVENTS,
+    EVENT_FLAGS, FD_EVENTS, FID_BITS, Fanotify, FanotifyFile, Kind, PATH_EVENTS, PERM_EVENTS,
 };
 
 /// The bits of the classes that need a privilege, `FANOTIFY_PERM_CLASSES` of Linux.
 const PERM_CLASSES: u32 = FAN_CLASS_CONTENT | FAN_CLASS_PRE_CONTENT;
-
-/// The bits that report a file handle, `FANOTIFY_FID_BITS` of Linux.
-const FID_BITS: u32 = FAN_REPORT_DFID_NAME_TARGET;
 
 /// The flags of `fanotify_init` that need `CAP_SYS_ADMIN`, `FANOTIFY_ADMIN_INIT_FLAGS` of Linux.
 const ADMIN_INIT_FLAGS: u32 = PERM_CLASSES
@@ -102,10 +99,25 @@ pub(crate) fn fanotify_init(cx: &Cx<'_>, flags: u64, event_f_flags: u64) -> SysR
     if flags & !(ADMIN_INIT_FLAGS | USER_INIT_FLAGS | FAN_ENABLE_AUDIT) != 0 {
         return Err(Errno::EINVAL);
     }
-    if flags & (FID_BITS | FAN_REPORT_MNT | FAN_REPORT_PIDFD) != 0 {
+    if flags & (FAN_REPORT_MNT | FAN_REPORT_PIDFD) != 0 {
         return Err(Errno::EINVAL);
     }
     if f_flags & !EVENT_F_BITS != 0 || f_flags & o::O_ACCMODE == o::O_ACCMODE {
+        return Err(Errno::EINVAL);
+    }
+    // A group that reports a file handle is of the notification class. The name needs the
+    // handle of the directory, and `FAN_REPORT_TARGET_FID` needs the name and the handle of the
+    // file.
+    let fid_mode = flags & FID_BITS;
+    if fid_mode != 0 && flags & FAN_ALL_CLASS_BITS != FAN_CLASS_NOTIF {
+        return Err(Errno::EINVAL);
+    }
+    if fid_mode & FAN_REPORT_NAME != 0 && fid_mode & FAN_REPORT_DIR_FID == 0 {
+        return Err(Errno::EINVAL);
+    }
+    if fid_mode & FAN_REPORT_TARGET_FID != 0
+        && fid_mode & (FAN_REPORT_NAME | FAN_REPORT_FID) != FAN_REPORT_NAME | FAN_REPORT_FID
+    {
         return Err(Errno::EINVAL);
     }
     let priority = match flags & FAN_ALL_CLASS_BITS {
@@ -118,7 +130,8 @@ pub(crate) fn fanotify_init(cx: &Cx<'_>, flags: u64, event_f_flags: u64) -> SysR
         return Err(Errno::EPERM);
     }
     f_flags |= o::O_LARGEFILE;
-    let ops = FanotifyFile::new(flags, f_flags, priority, flags & FAN_UNLIMITED_QUEUE != 0);
+    let unlimited = flags & FAN_UNLIMITED_QUEUE != 0;
+    let ops = FanotifyFile::new(flags, f_flags, priority, unlimited, !cred.capable(cap::SYS_ADMIN));
     let nonblock = if flags & FAN_NONBLOCK != 0 { o::O_NONBLOCK } else { 0 };
     let file = File::with_ops(Arc::new(ops), None, o::O_RDWR | nonblock);
     file.set_nonotify();
@@ -134,6 +147,27 @@ fn group(cx: &Cx<'_>, fd: u64) -> Result<Arc<Fanotify>, Errno> {
         .and_then(|a| a.downcast_ref::<FanotifyFile>())
         .map(|f| f.group().clone())
         .ok_or(Errno::EINVAL)
+}
+
+/// Tells if the file system of `at` can report file handles for a mark of the kind `kind`, as
+/// `fanotify_test_fsid` and `fanotify_test_fid` of Linux.
+///
+/// # Errors
+///
+/// Gives `ENODEV` for a file system with an ID of 0 and `EOPNOTSUPP` for a file system that
+/// cannot find an inode from a handle. A mark on an inode allows both, because the handle then
+/// has the inode number, as `AT_HANDLE_FID`.
+fn test_fid(at: &rk_vfs::dentry::Location, kind: Kind) -> Result<(), Errno> {
+    if kind == Kind::Inode {
+        return Ok(());
+    }
+    if at.inode().fs_fsid() == 0 {
+        return Err(Errno::ENODEV);
+    }
+    if at.inode().file_handle().is_none() {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(())
 }
 
 pub(crate) fn fanotify_mark(
@@ -186,7 +220,10 @@ pub(crate) fn fanotify_mark(
     if mask & MOUNT_EVENTS != 0 || mark_type == FAN_MARK_MNTNS {
         return Err(Errno::EINVAL);
     }
-    if mark_type != FAN_MARK_INODE && !cx.process().cred().capable(cap::SYS_ADMIN) {
+    // A user without `CAP_SYS_ADMIN` and a group that such a user made can mark inodes only.
+    if mark_type != FAN_MARK_INODE
+        && (g.unprivileged() || !cx.process().cred().capable(cap::SYS_ADMIN))
+    {
         return Err(Errno::EPERM);
     }
     // The permission events need a class above notification, and the pre-content events the
@@ -203,8 +240,15 @@ pub(crate) fn fanotify_mark(
     if flags & FAN_MARK_EVICTABLE != 0 && mark_type != FAN_MARK_INODE {
         return Err(Errno::EINVAL);
     }
-    // A group that reports a descriptor gets only the events that have a file.
-    if mask & !(FD_EVENTS | MOUNT_EVENTS | EVENT_FLAGS) != 0 {
+    // A group that reports a descriptor gets only the events that have a file. A mount mark
+    // gets only these events too, because the other events have no path.
+    let fid_mode = g.init_flags() & FID_BITS;
+    if mask & !(FD_EVENTS | MOUNT_EVENTS | EVENT_FLAGS) != 0
+        && (fid_mode == 0 || mark_type == FAN_MARK_MOUNT)
+    {
+        return Err(Errno::EINVAL);
+    }
+    if mask & FAN_RENAME != 0 && fid_mode & FAN_REPORT_NAME == 0 {
         return Err(Errno::EINVAL);
     }
     if mask & FAN_PRE_ACCESS != 0 && mask & FAN_ONDIR != 0 {
@@ -218,7 +262,10 @@ pub(crate) fn fanotify_mark(
     let fs = cx.fs()?;
     let at = if path == 0 {
         let file = cx.file(dfd)?;
-        let at = file.location().ok_or(Errno::EBADF)?.clone();
+        // A file without a path, as a pipe, is on an internal file system. A mark on its mount
+        // or on its file system gives `EINVAL`, as for `SB_NOUSER` in Linux.
+        let none = if mark_type == FAN_MARK_INODE { Errno::EBADF } else { Errno::EINVAL };
+        let at = file.location().ok_or(none)?.clone();
         if flags & FAN_MARK_ONLYDIR != 0 && !at.inode().metadata().is_dir() {
             return Err(Errno::ENOTDIR);
         }
@@ -238,13 +285,18 @@ pub(crate) fn fanotify_mark(
         if mask & FAN_PRE_ACCESS != 0 {
             return Err(Errno::EOPNOTSUPP);
         }
-        let strict = flags & FAN_MARK_IGNORE != 0 || mask & FAN_RENAME != 0;
+        let strict = g.init_flags() & FAN_REPORT_TARGET_FID != 0
+            || flags & FAN_MARK_IGNORE != 0
+            || mask & FAN_RENAME != 0;
         if strict && mark_type == FAN_MARK_INODE && !is_dir && mask & DIRONLY_EVENT_BITS != 0 {
             return Err(Errno::ENOTDIR);
         }
     }
     // A mark needs the read permission of the file.
     fs.permission(&at, may::READ)?;
+    if fid_mode != 0 {
+        test_fid(&at, kind)?;
+    }
     let object = match kind {
         Kind::Inode => Object::Inode(at.inode().clone()),
         Kind::Mount => Object::Mount(at.mount.clone()),
@@ -262,10 +314,14 @@ pub(crate) fn fanotify_mark(
         }
     }
     // The event flag for children has no effect on a mount, a file system and a file that is not
-    // a directory.
+    // a directory. A group that reports the handle of the directory gets the events of a file
+    // with its parent, so a new mark there gets the flag.
     if kind != Kind::Inode || !is_dir {
         mask &= !FAN_EVENT_ON_CHILD;
         umask = FAN_EVENT_ON_CHILD;
+        if fid_mode & FAN_REPORT_DIR_FID != 0 && cmd == FAN_MARK_ADD && ignore == 0 {
+            mask |= FAN_EVENT_ON_CHILD;
+        }
     }
     if cmd == FAN_MARK_ADD {
         g.add_mark(object, mask, flags)?;

@@ -6,10 +6,16 @@
 //! `struct fanotify_event_metadata` with a new descriptor of the file of the event. A process
 //! that causes a permission event waits until the listener writes `struct fanotify_response`.
 //!
-//! The groups report a descriptor only. The groups that report a file handle (`FAN_REPORT_FID`
-//! and the other FID bits), the mount events and the pre-content events are not supported.
+//! A group with `FAN_REPORT_FID`, `FAN_REPORT_DIR_FID`, `FAN_REPORT_NAME` or
+//! `FAN_REPORT_TARGET_FID` reports file handles in place of a descriptor, as `name_to_handle_at`
+//! gives them. Such a group also gets the events of the entries of directories, the changes of
+//! the attributes and the events of the file itself. Each event then has info records after the
+//! metadata: the handle of the directory and the name of the entry, the new directory and the
+//! new name of a rename, and the handle of the file.
+//!
+//! The mount events and the pre-content events are not supported.
 
-use super::{Found, Group, Mark, Object, add_object_mark, destroy_mark, mask};
+use super::{Found, FsEvent, Group, Mark, Object, add_object_mark, destroy_mark, mask};
 use crate::dentry::Location;
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::Result;
@@ -22,9 +28,12 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::fanotify::{
     FAN_ALLOW, FAN_AUDIT, FAN_DENY, FAN_ENABLE_AUDIT, FAN_ERRNO_MASK, FAN_ERRNO_SHIFT,
-    FAN_EVENT_METADATA_LEN, FAN_INFO, FAN_MARK_EVICTABLE, FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK,
-    FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_FD_ERROR,
-    FAN_REPORT_TID, FANOTIFY_METADATA_VERSION,
+    FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
+    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_EVENT_METADATA_LEN,
+    FAN_INFO, FAN_MARK_EVICTABLE, FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK,
+    FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET,
+    FAN_REPORT_DIR_FID, FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_NAME,
+    FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FANOTIFY_METADATA_VERSION,
 };
 use rk_abi::native::open as o;
 use rk_abi::native::types::{FanotifyEventMetadata, FanotifyResponse};
@@ -53,6 +62,20 @@ const ALL_FS_EVENTS: u32 = 0x00ff_ffff | mask::RENAME;
 /// The events that a read gives in a group that reports a descriptor, `FANOTIFY_OUTGOING_EVENTS`
 /// of Linux without the event flags.
 const USER_EVENTS: u32 = FD_EVENTS | mask::Q_OVERFLOW;
+
+/// The bits that report a file handle, `FANOTIFY_FID_BITS` of Linux.
+pub const FID_BITS: u32 = FAN_REPORT_DFID_NAME_TARGET;
+
+/// The events of a file and of an entry of a directory, `FANOTIFY_INODE_EVENTS` of Linux.
+pub const INODE_EVENTS: u32 = mask::DIRENT | mask::ATTRIB | mask::MOVE_SELF | mask::DELETE_SELF;
+
+/// The events and the flags that a read gives in a group that reports a file handle,
+/// `FANOTIFY_OUTGOING_EVENTS` of Linux.
+const FID_USER_EVENTS: u32 = USER_EVENTS | INODE_EVENTS | FAN_ONDIR;
+
+/// The size of `struct fanotify_event_info_fid` and `struct file_handle` before the handle,
+/// `FANOTIFY_FID_INFO_HDR_LEN` of Linux.
+const FID_INFO_HDR_LEN: usize = 20;
 
 /// The most events in the queue, without `FAN_UNLIMITED_QUEUE`.
 pub const MAX_EVENTS: usize = 16384;
@@ -128,10 +151,54 @@ struct Perm {
     state: SpinLock<PermState>,
 }
 
-/// An event in the queue, as `struct fanotify_path_event` of Linux.
+/// A file handle, as `struct fanotify_fh` of Linux.
+#[derive(Clone, PartialEq, Eq)]
+struct Fh {
+    ty: i32,
+    bytes: Vec<u8>,
+}
+
+impl Fh {
+    /// The handle of `inode`, as `fanotify_encode_fh` of Linux. It is the handle that
+    /// `name_to_handle_at` gives. A file system that cannot find an inode from a handle gives
+    /// the inode number, as `AT_HANDLE_FID`.
+    fn of(inode: &crate::inode::InodeRef) -> Self {
+        let (ty, words) = inode.file_handle().unwrap_or_else(|| {
+            (crate::inode::fileid::INO32_GEN, alloc::vec![inode.metadata().ino as u32, 0])
+        });
+        let bytes = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+        Self { ty, bytes }
+    }
+}
+
+/// The handles and the names of an event of a group that reports a file handle, as
+/// `struct fanotify_fid_event` and `struct fanotify_name_event` of Linux.
+#[derive(Clone, PartialEq, Eq)]
+struct Fid {
+    /// The ID of the file system, as `f_fsid` of `statfs`.
+    fsid: [i32; 2],
+    /// The event has the directory and the name, `FANOTIFY_EVENT_TYPE_FID_NAME` of Linux.
+    named: bool,
+    /// The directory and the name of the entry. The name can be empty.
+    dir: Option<(Fh, Vec<u8>)>,
+    /// The new directory and the new name of a rename.
+    dir2: Option<(Fh, Vec<u8>)>,
+    /// The handle of the file: the object of the event, or the child of a named event.
+    object: Option<Fh>,
+}
+
+/// The object of an event in the queue.
+enum Info {
+    /// The path of the file, for a group that reports a descriptor.
+    Path(Location),
+    /// The handles, for a group that reports a file handle.
+    Fid(Fid),
+}
+
+/// An event in the queue, as `struct fanotify_event` of Linux.
 struct Event {
     mask: u32,
-    at: Location,
+    info: Info,
     pid: i32,
     perm: Option<Arc<Perm>>,
 }
@@ -163,6 +230,8 @@ pub struct Fanotify {
     f_flags: u32,
     /// The class: 0 for notification, 1 for content and 2 for pre-content.
     priority: u32,
+    /// A user without `CAP_SYS_ADMIN` made the group, `FANOTIFY_UNPRIV` of Linux.
+    unpriv: bool,
     max_events: usize,
     state: SpinLock<State>,
     /// The readers wait here.
@@ -217,6 +286,12 @@ impl Fanotify {
         self.flags
     }
 
+    /// Tells if a user without `CAP_SYS_ADMIN` made the group. Such a group has no marks on a
+    /// mount or a file system, and its events from other processes have the pid 0.
+    pub fn unprivileged(&self) -> bool {
+        self.unpriv
+    }
+
     /// The class of the group: 0 for notification, 1 for content and 2 for pre-content.
     pub fn priority(&self) -> u32 {
         self.priority
@@ -227,21 +302,152 @@ impl Fanotify {
         self.wait.wake_all();
     }
 
-    /// Joins the event with an event of the same file in the queue, as `fanotify_merge` of
-    /// Linux. A permission event never joins.
-    fn merge(st: &mut State, m: u32, at: &Location, pid: i32) -> bool {
+    /// Joins the event with an event of the same object in the queue, as `fanotify_merge` and
+    /// `fanotify_should_merge` of Linux. A permission event never joins. The two events must
+    /// both be on a directory or both on another file, and both be a rename or not.
+    fn merge(st: &mut State, m: u32, info: &Info, pid: i32) -> bool {
+        let kind = mask::ISDIR | mask::RENAME;
         for item in st.queue.iter_mut().rev().take(MAX_MERGE) {
-            if let Item::Event(e) = item
-                && e.perm.is_none()
-                && e.pid == pid
-                && Arc::ptr_eq(&e.at.dentry, &at.dentry)
-                && Arc::ptr_eq(&e.at.mount, &at.mount)
-            {
+            let Item::Event(e) = item else { continue };
+            if e.perm.is_some() || e.pid != pid || (e.mask ^ m) & kind != 0 {
+                continue;
+            }
+            let same = match (&e.info, info) {
+                (Info::Path(a), Info::Path(b)) => {
+                    Arc::ptr_eq(&a.dentry, &b.dentry) && Arc::ptr_eq(&a.mount, &b.mount)
+                }
+                // A named event without a directory does not join, as Linux.
+                (Info::Fid(a), Info::Fid(b)) => a == b && (!a.named || a.dir.is_some()),
+                _ => false,
+            };
+            if same {
                 e.mask |= m;
                 return true;
             }
         }
         false
+    }
+
+    /// The handles of the event `ev` with the events `m`, as `fanotify_alloc_event` of Linux.
+    /// `matched` has a bit for each place of a mark that wants the event, by [`found_bit`].
+    fn fid_info(&self, ev: &FsEvent<'_>, m: u32, matched: u32) -> Option<Fid> {
+        let fid_mode = self.flags & FID_BITS;
+        let dirent = m & mask::DIRENT != 0;
+        let ondir = m & FAN_ONDIR != 0;
+        // As `fanotify_fid_inode` and `fanotify_dfid_inode` of Linux.
+        let mut id =
+            if dirent && fid_mode & FAN_REPORT_TARGET_FID == 0 { ev.dir } else { ev.inode };
+        let mut dirid = if dirent {
+            ev.dir
+        } else if ev.inode.is_some_and(|i| i.metadata().is_dir()) {
+            ev.inode
+        } else {
+            ev.dir
+        };
+        let mut child = None;
+        let mut named = false;
+        let mut name = ev.name;
+        let mut moved = None;
+        if fid_mode & FAN_REPORT_DIR_FID != 0
+            && let Some(d) = dirid
+        {
+            // As `fanotify_report_child_fid` of Linux.
+            let report_child = if dirent {
+                fid_mode & FAN_REPORT_TARGET_FID != 0
+            } else {
+                fid_mode & FAN_REPORT_FID != 0 && !ondir
+            };
+            if report_child && id.is_some_and(|i| !Arc::ptr_eq(i, d)) {
+                child = id;
+            }
+            id = Some(d);
+            if fid_mode & FAN_REPORT_NAME == 0 {
+                named = child.is_some();
+                name = None;
+            } else if dirent || !ondir {
+                named = true;
+            }
+            // A rename has the old directory and name if the mark of the old directory or of
+            // the file system wants it, and the new ones if the mark of the new directory or of
+            // the file system wants it.
+            if m & mask::RENAME != 0 {
+                let fs = matched & found_bit(Found::Fs) != 0;
+                if !fs && matched & found_bit(Found::Inode) == 0 {
+                    dirid = None;
+                    name = None;
+                }
+                if fs || matched & found_bit(Found::NewDir) != 0 {
+                    moved = ev.moved;
+                }
+            }
+        }
+        let fsid_of = ev.dir.or(ev.inode)?.fs_fsid();
+        let fsid = [fsid_of as i32, (fsid_of >> 32) as i32];
+        if named && (name.is_some() || moved.is_some() || child.is_some()) {
+            return Some(Fid {
+                fsid,
+                named: true,
+                dir: dirid.map(|d| (Fh::of(d), name.unwrap_or_default().to_vec())),
+                dir2: moved.map(|(d, n)| (Fh::of(d), n.to_vec())),
+                object: child.map(Fh::of),
+            });
+        }
+        Some(Fid { fsid, named: false, dir: None, dir2: None, object: id.map(Fh::of) })
+    }
+
+    /// The size of the event in a read, as `fanotify_event_len` of Linux.
+    fn event_len(&self, item: &Item) -> usize {
+        let Item::Event(Event { info: Info::Fid(fid), mask: m, .. }) = item else {
+            return META_LEN;
+        };
+        let mut len = META_LEN;
+        let mut dot = 0;
+        if fid.dir.is_some() || fid.dir2.is_some() {
+            for (fh, name) in fid.dir.iter().chain(&fid.dir2) {
+                len += fid_info_len(fh.bytes.len(), name.len());
+            }
+        } else if self.flags & FAN_REPORT_NAME != 0 && m & FAN_ONDIR != 0 {
+            dot = 1;
+        }
+        if let Some(fh) = &fid.object {
+            len += fid_info_len(fh.bytes.len(), dot);
+        }
+        len
+    }
+
+    /// Puts the info records of `fid` in `out`, as `copy_info_records_to_user` of Linux: the
+    /// directory and the name, then the new directory and the new name, then the file.
+    fn put_records(&self, fid: &Fid, m: u32, out: &mut Vec<u8>) {
+        let fid_mode = self.flags & FID_BITS;
+        let mut first = 0;
+        if let Some((fh, name)) = &fid.dir {
+            first = if m & mask::RENAME != 0 {
+                FAN_EVENT_INFO_TYPE_OLD_DFID_NAME
+            } else if name.is_empty() {
+                FAN_EVENT_INFO_TYPE_DFID
+            } else {
+                FAN_EVENT_INFO_TYPE_DFID_NAME
+            };
+            put_fid(out, first, fid.fsid, fh, name);
+        }
+        if let Some((fh, name)) = &fid.dir2 {
+            first = FAN_EVENT_INFO_TYPE_NEW_DFID_NAME;
+            put_fid(out, first, fid.fsid, fh, name);
+        }
+        if let Some(fh) = &fid.object {
+            let (ty, name): (u32, &[u8]) = if fid_mode == FAN_REPORT_FID || first != 0 {
+                (FAN_EVENT_INFO_TYPE_FID, b"")
+            } else if fid_mode & FAN_REPORT_NAME != 0 && m & FAN_ONDIR != 0 {
+                // A directory without a name has the name ".".
+                (FAN_EVENT_INFO_TYPE_DFID_NAME, b".")
+            } else if m & (mask::DIRENT | FAN_ONDIR) != 0 {
+                (FAN_EVENT_INFO_TYPE_DFID, b"")
+            } else {
+                // A file without a directory, as for `FAN_DELETE_SELF`.
+                (FAN_EVENT_INFO_TYPE_FID, b"")
+            };
+            put_fid(out, ty, fid.fsid, fh, name);
+        }
     }
 
     /// Waits for the answer to the permission event `perm`, as `fanotify_get_response` of Linux.
@@ -496,6 +702,40 @@ fn kernel_dev(dev: u64) -> u64 {
     (major << 20) | minor
 }
 
+/// The bit of a place of a mark in the match mask of an event, as the iterator types of Linux.
+fn found_bit(found: Found) -> u32 {
+    1 << found as u32
+}
+
+/// The size of an info record with a handle of `fh_len` bytes and a name of `name_len` bytes, as
+/// `fanotify_fid_info_len` of Linux. A name has a null after it.
+fn fid_info_len(fh_len: usize, name_len: usize) -> usize {
+    let name = if name_len == 0 { 0 } else { name_len + 1 };
+    (FID_INFO_HDR_LEN + fh_len + name).next_multiple_of(4)
+}
+
+/// Puts an info record of the type `ty` in `out`, as `copy_fid_info_to_user` of Linux:
+/// `struct fanotify_event_info_fid`, the `struct file_handle` with the handle, and the name with
+/// a null. Zeros fill the record to a size that is a multiple of 4.
+fn put_fid(out: &mut Vec<u8>, ty: u32, fsid: [i32; 2], fh: &Fh, name: &[u8]) {
+    let len = fid_info_len(fh.bytes.len(), name.len());
+    let start = out.len();
+    out.push(ty as u8);
+    out.push(0);
+    out.extend_from_slice(&(len as u16).to_ne_bytes());
+    out.extend_from_slice(&fsid[0].to_ne_bytes());
+    out.extend_from_slice(&fsid[1].to_ne_bytes());
+    out.extend_from_slice(&(fh.bytes.len() as u32).to_ne_bytes());
+    let ty = if fh.bytes.is_empty() { crate::inode::fileid::INVALID } else { fh.ty };
+    out.extend_from_slice(&ty.to_ne_bytes());
+    out.extend_from_slice(&fh.bytes);
+    if !name.is_empty() {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    out.resize(start + len, 0);
+}
+
 impl Group for Fanotify {
     fn handle_event(&self, _mark: &Arc<Mark>, _mask: u32, _name: Option<&[u8]>, _cookie: u32) {}
 
@@ -511,11 +751,20 @@ impl Group for Fanotify {
         self.priority
     }
 
-    fn handle_path(&self, at: &Location, m: u32, marks: &[(Found, Arc<Mark>)]) -> Result<()> {
-        // A group that reports a descriptor gets the events of regular files and directories
-        // only, as `fanotify_group_event_mask` of Linux.
-        let meta = at.inode().metadata();
-        if !meta.is_dir() && meta.file_type() != Some(crate::inode::FileType::Regular) {
+    fn handle_path(&self, ev: &FsEvent<'_>, marks: &[(Found, Arc<Mark>)]) -> Result<()> {
+        let m = ev.mask;
+        let ondir = m & mask::ISDIR != 0;
+        let fid_mode = self.flags & FID_BITS;
+        // As `fanotify_group_event_mask` of Linux. A group that reports a descriptor gets the
+        // events of a path to a regular file or a directory only. A group that reports only the
+        // handle of the directory needs a directory.
+        if fid_mode == 0 {
+            let Some(at) = ev.path else { return Ok(()) };
+            let meta = at.inode().metadata();
+            if !meta.is_dir() && meta.file_type() != Some(crate::inode::FileType::Regular) {
+                return Ok(());
+            }
+        } else if fid_mode & FAN_REPORT_FID == 0 && ev.dir.is_none() && !ondir {
             return Ok(());
         }
         // A modification clears the ignore masks, as `send_to_group` of Linux. A mark on the
@@ -532,9 +781,9 @@ impl Group for Fanotify {
                 }
             }
         }
-        let ondir = m & mask::ISDIR != 0;
         let mut want = 0;
         let mut ignore = 0;
+        let mut matched = 0;
         for (found, mark) in marks {
             if !mark.alive() {
                 continue;
@@ -543,12 +792,33 @@ impl Group for Fanotify {
             ignore |= effective_ignore(mark, ondir, parent);
             if applicable(mark.mask(), ondir, parent) {
                 want |= mark.mask();
+                matched |= found_bit(*found);
             }
         }
-        let test = m & want & !ignore & USER_EVENTS;
+        let test = m & want & !ignore;
+        // A group that reports a file handle gets `FAN_ONDIR`, but not an event with the flags
+        // only.
+        let test = if fid_mode == 0 {
+            test & USER_EVENTS
+        } else if test & !EVENT_FLAGS == 0 {
+            0
+        } else {
+            test & FID_USER_EVENTS
+        };
         if test == 0 {
             return Ok(());
         }
+        let info = if fid_mode == 0 {
+            match ev.path {
+                Some(at) => Info::Path(at.clone()),
+                None => return Ok(()),
+            }
+        } else {
+            match self.fid_info(ev, test, matched) {
+                Some(fid) => Info::Fid(fid),
+                None => return Ok(()),
+            }
+        };
         let (tgid, tid) = HOOKS.get().map_or((0, 0), |h| (h.current)());
         let pid = if self.flags & FAN_REPORT_TID != 0 { tid } else { tgid };
         let perm = (test & PERM_EVENTS != 0)
@@ -558,7 +828,7 @@ impl Group for Fanotify {
             if st.closed {
                 return Ok(());
             }
-            if perm.is_none() && Self::merge(&mut st, test, at, pid) {
+            if perm.is_none() && Self::merge(&mut st, test, &info, pid) {
                 return Ok(());
             }
             // A full queue gets one overflow event. A permission event that does not go in the
@@ -573,7 +843,7 @@ impl Group for Fanotify {
                 self.wake();
                 return Ok(());
             }
-            let event = Event { mask: test, at: at.clone(), pid, perm: perm.clone() };
+            let event = Event { mask: test, info, pid, perm: perm.clone() };
             st.queue.push_back(Item::Event(event));
         }
         self.wake();
@@ -593,12 +863,14 @@ impl FanotifyFile {
     /// Makes a new group, as `fanotify_init` of Linux after the checks of the flags. `flags` are
     /// the flags of the group, `f_flags` the flags of the files of the events, and `priority` the
     /// class: 0 for notification, 1 for content and 2 for pre-content.
-    pub fn new(flags: u32, f_flags: u32, priority: u32, unlimited: bool) -> Self {
+    /// `unpriv` tells that a user without `CAP_SYS_ADMIN` makes the group.
+    pub fn new(flags: u32, f_flags: u32, priority: u32, unlimited: bool, unpriv: bool) -> Self {
         let group = Arc::new_cyclic(|me| Fanotify {
             me: me.clone(),
             flags,
             f_flags,
             priority,
+            unpriv,
             max_events: if unlimited { usize::MAX } else { MAX_EVENTS },
             state: SpinLock::new(State {
                 queue: VecDeque::new(),
@@ -672,7 +944,10 @@ impl FileOps for FanotifyFile {
                         Ok(None)
                     };
                 }
-                if room < META_LEN {
+                // A buffer that is too small for the next event gives `EINVAL`, as
+                // `get_one_event` of Linux.
+                let need = st.queue.front().map_or(META_LEN, |item| g.event_len(item));
+                if room < need {
                     return if empty { Err(Errno::EINVAL) } else { Ok(Some(None)) };
                 }
                 let item = st.queue.pop_front();
@@ -691,18 +966,23 @@ impl FileOps for FanotifyFile {
                 Err(e) if out.is_empty() => return Err(e),
                 Err(_) => break,
             };
-            let (m, fd, pid, perm) = match item {
+            let mut fid = None;
+            let (m, fd, mut pid, perm) = match item {
                 // An event without a file has `-EBADF` with `FAN_REPORT_FD_ERROR`, as Linux.
                 Item::Overflow if g.flags & FAN_REPORT_FD_ERROR != 0 => {
                     (mask::Q_OVERFLOW, -i32::from(Errno::EBADF.get()), 0, None)
                 }
                 Item::Overflow => (mask::Q_OVERFLOW, FAN_NOFD as i32, 0, None),
-                Item::Event(e) => {
-                    let fd = match g.open_fd(&e.at) {
+                Item::Event(Event { info: Info::Fid(f), mask: m, pid, perm }) => {
+                    fid = Some(f);
+                    (m, FAN_NOFD as i32, pid, perm)
+                }
+                Item::Event(Event { info: Info::Path(at), mask: m, pid, perm }) => {
+                    let fd = match g.open_fd(&at) {
                         Ok(fd) => fd,
                         Err(err) if g.flags & FAN_REPORT_FD_ERROR != 0 => -i32::from(err.get()),
                         Err(err) => {
-                            if let Some(p) = &e.perm {
+                            if let Some(p) = &perm {
                                 Fanotify::finish(p, FAN_DENY);
                                 g.access_wait.wake_all();
                             }
@@ -712,11 +992,20 @@ impl FileOps for FanotifyFile {
                             break;
                         }
                     };
-                    (e.mask, fd, e.pid, e.perm)
+                    (m, fd, pid, perm)
                 }
             };
+            // An unprivileged group shows the pid of the reader only, as `copy_event_to_user` of
+            // Linux.
+            if g.unpriv && HOOKS.get().map_or(0, |h| (h.current)().0) != pid {
+                pid = 0;
+            }
+            let mut records = Vec::new();
+            if let Some(f) = &fid {
+                g.put_records(f, m, &mut records);
+            }
             let meta = FanotifyEventMetadata {
-                event_len: FAN_EVENT_METADATA_LEN,
+                event_len: FAN_EVENT_METADATA_LEN + records.len() as u32,
                 vers: FANOTIFY_METADATA_VERSION as u8,
                 reserved: 0,
                 metadata_len: FAN_EVENT_METADATA_LEN as u16,
@@ -725,6 +1014,7 @@ impl FileOps for FanotifyFile {
                 pid,
             };
             encode(&meta, &mut out);
+            out.extend_from_slice(&records);
             if let Some(p) = perm {
                 if fd >= 0 {
                     g.state.lock().access.push((fd, p));
@@ -799,6 +1089,25 @@ mod tests {
         assert!(!applicable(mask::OPEN, true, false));
         assert!(!applicable(mask::OPEN, false, true));
         assert!(applicable(mask::OPEN | mask::EVENT_ON_CHILD, false, true));
+    }
+
+    #[test]
+    fn a_record_has_the_handle_and_the_name_with_a_null() {
+        let fh = Fh { ty: 1, bytes: alloc::vec![1, 2, 3, 4, 5, 6, 7, 8] };
+        let mut out = Vec::new();
+        put_fid(&mut out, FAN_EVENT_INFO_TYPE_DFID_NAME, [7, 9], &fh, b"ab");
+        assert_eq!(out.len(), 32);
+        assert_eq!(out[0], FAN_EVENT_INFO_TYPE_DFID_NAME as u8);
+        assert_eq!(u16::from_ne_bytes([out[2], out[3]]), 32);
+        assert_eq!(i32::from_ne_bytes([out[4], out[5], out[6], out[7]]), 7);
+        assert_eq!(u32::from_ne_bytes([out[12], out[13], out[14], out[15]]), 8);
+        assert_eq!(&out[20..28], &fh.bytes[..]);
+        assert_eq!(&out[28..], b"ab\0\0");
+        assert_eq!(fid_info_len(8, 0), 28);
+        let empty = Fh { ty: 1, bytes: Vec::new() };
+        let mut out = Vec::new();
+        put_fid(&mut out, FAN_EVENT_INFO_TYPE_FID, [0, 0], &empty, b"");
+        assert_eq!(i32::from_ne_bytes([out[16], out[17], out[18], out[19]]), 0xff);
     }
 
     #[test]

@@ -2,6 +2,8 @@
 # report.py puts the note in the table, and the note gives the cause of the test in the work that
 # remains. Without a note, the table shows the reason from the log. A test name can have the
 # runtest file before it, as net.ipv6:ping601, when two runtest files have the same name.
+fanotify13	The first variant passes on ext2 and tmpfs (#539). The overlayfs variants need the open and close events of the real file under an overlayfs file. The overlayfs of rukernel opens no real file, so a mark on the base file system gets no event and the read gives EAGAIN (TBROK).
+fanotify17	The test needs the limits of the fanotify groups and marks of a user: /proc/sys/fs/fanotify/max_user_groups and max_user_marks, EMFILE at the groups limit and ENOSPC at the marks limit. rukernel has no such limits (#539).
 fanotify05	The test makes 3 x 16385 files on ext2 while a fanotify group holds an event for each file. Before #475, each create in a directory examined each cached name in use, and the events keep their names in use, so the creates took a time that grew with the count of files (3.3, 8.7, 12.7 and 22.5 s for each 4096 files). The cache now removes unused names only when it doubles in size, the times stay at about 3 s for each 4096 files, and the test passed on server2 in a boot of 142 s (#475). Under QEMU without KVM on a very busy host, it can still take more than the time limit of the test (172 s, TBROK).
 ksm02	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).
 ksm02_1	The test needs a NUMA system with a node that has memory and CPUs. rukernel has no NUMA (TCONF).

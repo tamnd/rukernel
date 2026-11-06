@@ -7,10 +7,11 @@
 //! the inode, and to each mark of the parent directory that wants the events of its children.
 //!
 //! The marks do not depend on inotify: dnotify and fanotify are other groups. An inotify mark and
-//! a dnotify mark are on an inode. A fanotify mark can also be on a mount or on a file system,
-//! and fanotify gets the events of an open file with their path, as `FSNOTIFY_EVENT_PATH` of
-//! Linux. A global count of the marks lets each hook return at once when no group has a mark,
-//! which is the usual case.
+//! a dnotify mark are on an inode. A fanotify mark can also be on a mount or on a file system.
+//! fanotify gets each event with its objects in an [`FsEvent`], as the arguments of `fsnotify` of
+//! Linux: the path of an open file, the file, its directory and its name, and the new directory
+//! and the new name of a rename. A global count of the marks lets each hook return at once when
+//! no group has a mark, which is the usual case.
 //!
 //! The constants are the `FS_*` values of include/linux/fsnotify_backend.h, which are the same as
 //! the `IN_*` values of include/uapi/linux/inotify.h.
@@ -75,7 +76,8 @@ pub mod mask {
     pub const EXCL_UNLINK: u32 = 0x0400_0000;
     /// The mark of a directory wants the events of its children.
     pub const EVENT_ON_CHILD: u32 = 0x0800_0000;
-    /// A file moved in its directory, `FS_RENAME`. Only dnotify uses it here.
+    /// A file moved, `FS_RENAME`: one event with the old and the new name. dnotify gets it only
+    /// for a move in one directory.
     pub const RENAME: u32 = 0x1000_0000;
     /// The dnotify entry stays after its first event, `FS_DN_MULTISHOT`.
     pub const DN_MULTISHOT: u32 = 0x2000_0000;
@@ -88,6 +90,34 @@ pub mod mask {
     /// The events of a file that the mark of its parent also gets, with the name of the file,
     /// as `FS_EVENTS_POSS_ON_CHILD` of Linux.
     pub const ON_CHILD: u32 = ACCESS | MODIFY | ATTRIB | CLOSE_WRITE | CLOSE_NOWRITE | OPEN;
+    /// The events of an entry of a directory, `ALL_FSNOTIFY_DIRENT_EVENTS` of Linux.
+    pub const DIRENT: u32 = MOVED_FROM | MOVED_TO | CREATE | DELETE | RENAME;
+}
+
+/// An event for the groups that get the objects of the event, as fanotify. The fields are the
+/// arguments of `fsnotify` of Linux.
+#[derive(Clone, Copy)]
+pub struct FsEvent<'a> {
+    /// The event, with `ISDIR` if the subject is a directory.
+    pub mask: u32,
+    /// The path of the file, for the events of an open file, as `FSNOTIFY_EVENT_PATH`.
+    pub path: Option<&'a Location>,
+    /// The subject of the event: the file, or the entry of a directory for an event of an entry.
+    pub inode: Option<&'a InodeRef>,
+    /// The directory: the parent of the file, or the directory of the entry.
+    pub dir: Option<&'a InodeRef>,
+    /// The name of the file or of the entry in `dir`.
+    pub name: Option<&'a [u8]>,
+    /// The new directory and the new name of a rename, for `RENAME`.
+    pub moved: Option<(&'a InodeRef, &'a [u8])>,
+}
+
+impl FsEvent<'_> {
+    /// Tells if the event is about an entry of `dir`, as the events of
+    /// `ALL_FSNOTIFY_DIRENT_EVENTS` of Linux.
+    pub fn dirent(&self) -> bool {
+        self.mask & mask::DIRENT != 0
+    }
 }
 
 /// A group of marks: the receiver of the events, as `struct fsnotify_group` of Linux.
@@ -100,8 +130,8 @@ pub trait Group: Send + Sync {
     /// The mark goes away, as `freeing_mark` of Linux. inotify queues `IN_IGNORED` here.
     fn freeing_mark(&self, mark: &Arc<Mark>);
 
-    /// Tells if the group gets the events of an open file with their path, as fanotify. Such a
-    /// group gets its events from `handle_path` and not from `handle_event`.
+    /// Tells if the group gets the events with their objects, as fanotify. Such a group gets its
+    /// events from `handle_path` and not from `handle_event`.
     fn wants_paths(&self) -> bool {
         false
     }
@@ -112,15 +142,14 @@ pub trait Group: Send + Sync {
         0
     }
 
-    /// Takes the event `mask` of the file at `at`. `marks` are the marks of the group that the
-    /// event found. An error of a permission event stops the operation, as
-    /// `fanotify_handle_event` of Linux.
+    /// Takes the event `ev`. `marks` are the marks of the group that the event found. An error
+    /// of a permission event stops the operation, as `fanotify_handle_event` of Linux.
     ///
     /// # Errors
     ///
     /// Gives the error of the answer to a permission event.
-    fn handle_path(&self, at: &Location, mask: u32, marks: &[(Found, Arc<Mark>)]) -> Result<()> {
-        let _ = (at, mask, marks);
+    fn handle_path(&self, ev: &FsEvent<'_>, marks: &[(Found, Arc<Mark>)]) -> Result<()> {
+        let _ = (ev, marks);
         Ok(())
     }
 }
@@ -158,6 +187,8 @@ pub enum Found {
     Inode,
     /// The mark is on the parent directory of the file.
     Parent,
+    /// The mark is on the new directory of a rename, `FSNOTIFY_ITER_TYPE_INODE2` of Linux.
+    NewDir,
     /// The mark is on the mount of the file.
     Mount,
     /// The mark is on the file system of the file.
@@ -316,14 +347,18 @@ fn marks_of(inode: &InodeRef) -> Vec<Arc<Mark>> {
     MARKS.lock().get(&(0, key(inode))).cloned().unwrap_or_default()
 }
 
-/// Gives the event `mask` of the file at `at` to the groups that get the events of a path, as
-/// `fsnotify` of Linux with `FSNOTIFY_EVENT_PATH`. Each group gets its marks on the inode, on the
-/// parent, on the mount and on the file system together, so it can join their masks.
-fn path_event(at: &Location, mask: u32) -> Result<()> {
+/// Gives the event `ev` to the groups that get the objects of the events, as `fsnotify` of
+/// Linux. An event of an entry finds the marks of the directory, of the new directory of a rename
+/// and of the file system. Another event finds the marks of the file, of its parent, of its mount
+/// if it has a path, and of the file system. Each group gets its marks together, so it can join
+/// their masks.
+fn fan_event(ev: &FsEvent<'_>) -> Result<()> {
     if PATH_COUNT.load(Ordering::Acquire) == 0 {
         return Ok(());
     }
-    let inode = at.inode();
+    let Some(subject) = (if ev.dirent() { ev.dir } else { ev.inode }) else {
+        return Ok(());
+    };
     let mut found: Vec<(Found, Arc<Mark>)> = Vec::new();
     {
         let marks = MARKS.lock();
@@ -334,25 +369,68 @@ fn path_event(at: &Location, mask: u32) -> Result<()> {
                 }
             }
         };
-        add(Found::Inode, (0, key(inode)));
-        if let Some(parent) = at.dentry.parent()
-            && !Arc::ptr_eq(&parent, &at.dentry)
-        {
-            add(Found::Parent, (0, key(parent.inode())));
+        add(Found::Inode, (0, key(subject)));
+        if ev.dirent() {
+            if ev.mask & mask::RENAME != 0
+                && let Some((new_dir, _)) = ev.moved
+            {
+                add(Found::NewDir, (0, key(new_dir)));
+            }
+        } else if let Some(dir) = ev.dir {
+            add(Found::Parent, (0, key(dir)));
         }
-        add(Found::Mount, (1, Arc::as_ptr(&at.mount) as usize));
-        add(Found::Fs, (2, inode.fs_id() as usize));
+        if let Some(at) = ev.path {
+            add(Found::Mount, (1, Arc::as_ptr(&at.mount) as usize));
+        }
+        add(Found::Fs, (2, subject.fs_id() as usize));
     }
-    let mask = mask | dir_bit(inode);
     found.sort_by_key(|(_, m)| core::cmp::Reverse(m.group.priority()));
     while let Some((_, first)) = found.first() {
         let group = first.group.clone();
         let (mine, rest): (Vec<_>, Vec<_>) =
             found.into_iter().partition(|(_, m)| Arc::ptr_eq(&m.group, &group));
         found = rest;
-        group.handle_path(at, mask, &mine)?;
+        group.handle_path(ev, &mine)?;
     }
     Ok(())
+}
+
+/// Gives the event `mask` of the file of `dentry` to the groups that get the objects of the
+/// events, with the parent and the name of the file. `path` is the path of an open file.
+fn fan_dentry(dentry: &Dentry, path: Option<&Location>, mask: u32) -> Result<()> {
+    if PATH_COUNT.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let inode = dentry.inode();
+    let parent = dentry.parent().filter(|p| !core::ptr::eq(&**p, dentry));
+    let name = parent.as_ref().map(|_| dentry.name());
+    fan_event(&FsEvent {
+        mask: mask | dir_bit(inode),
+        path,
+        inode: Some(inode),
+        dir: parent.as_ref().map(|p| p.inode()),
+        name: name.as_deref(),
+        moved: None,
+    })
+}
+
+/// Gives the event `mask` of the file at `at` to the groups that get the objects of the events,
+/// as `fsnotify` of Linux with `FSNOTIFY_EVENT_PATH`.
+fn path_event(at: &Location, mask: u32) -> Result<()> {
+    fan_dentry(&at.dentry, Some(at), mask)
+}
+
+/// An event of the entry `name` of `dir` for the groups that get the objects of the events, as
+/// `fsnotify_name` of Linux. `inode` is the file of the entry.
+fn fan_name(dir: &InodeRef, mask: u32, name: &[u8], inode: &InodeRef) {
+    let _ = fan_event(&FsEvent {
+        mask,
+        path: None,
+        inode: Some(inode),
+        dir: Some(dir),
+        name: Some(name),
+        moved: None,
+    });
 }
 
 /// Gives the event to the marks of `to`. `child` is the dentry of the subject for an event
@@ -395,6 +473,12 @@ pub fn dentry_event(dentry: &Dentry, mask: u32) {
     if none() {
         return;
     }
+    dentry_send(dentry, mask);
+    let _ = fan_dentry(dentry, None, mask);
+}
+
+/// The part of [`dentry_event`] for the groups that get the events of the inodes.
+fn dentry_send(dentry: &Dentry, mask: u32) {
     let inode = dentry.inode();
     let mask = mask | dir_bit(inode);
     if mask & mask::ON_CHILD != 0
@@ -412,10 +496,20 @@ pub fn inode_event(inode: &InodeRef, mask: u32) {
     if none() {
         return;
     }
-    send(inode, mask | dir_bit(inode), None, 0, false, None);
+    let mask = mask | dir_bit(inode);
+    send(inode, mask, None, 0, false, None);
+    let _ = fan_event(&FsEvent {
+        mask,
+        path: None,
+        inode: Some(inode),
+        dir: None,
+        name: None,
+        moved: None,
+    });
 }
 
-/// An event of the directory `dir` about its child `name`, as `fsnotify_name` of Linux.
+/// An event of the directory `dir` about its child `name`, as `fsnotify_name` of Linux, for the
+/// groups that get the events of the inodes.
 pub fn name_event(dir: &InodeRef, mask: u32, name: &[u8], cookie: u32) {
     if none() {
         return;
@@ -444,7 +538,7 @@ fn open_file_event(location: Option<&Location>, inode: Option<&InodeRef>, mask: 
     }
     match (location, inode) {
         (Some(at), _) => {
-            dentry_event(&at.dentry, mask);
+            dentry_send(&at.dentry, mask);
             let _ = path_event(at, mask);
         }
         (None, Some(inode)) => inode_event(inode, mask),
@@ -546,13 +640,16 @@ pub fn create(dir: &InodeRef, child: &Dentry) {
         return;
     }
     let m = mask::CREATE | dir_bit(child.inode());
-    name_event(dir, m, &child.name(), 0);
+    let name = child.name();
+    name_event(dir, m, &name, 0);
+    fan_name(dir, m, &name, child.inode());
 }
 
 /// A new link `name` of `inode` in the directory `dir`, as `fsnotify_link` of Linux.
 pub fn link(dir: &InodeRef, name: &[u8], inode: &InodeRef) {
     inode_event(inode, mask::ATTRIB);
     name_event(dir, mask::CREATE, name, 0);
+    fan_name(dir, mask::CREATE, name, inode);
 }
 
 /// The file `inode` has no link and no name, as `fsnotify_inoderemove` of Linux: its marks get
@@ -582,6 +679,7 @@ pub fn remove(dir: &InodeRef, name: &[u8], inode: &InodeRef, is_dir: bool) {
     }
     let m = mask::DELETE | if is_dir { mask::ISDIR } else { 0 };
     name_event(dir, m, name, 0);
+    fan_name(dir, m, name, inode);
 }
 
 /// A rename of `moved` from `old_name` in `old_dir` to `new_name` in `new_dir`, as
@@ -600,13 +698,23 @@ pub fn rename(
     }
     let cookie = COOKIE.fetch_add(1, Ordering::Relaxed).wrapping_add(1).max(1);
     let isdir = dir_bit(moved);
-    // The event with the two names. Only dnotify takes it, and only for a move in one
-    // directory, as `fsnotify_handle_event` of Linux.
+    // The event with the two names. dnotify takes it only for a move in one directory, as
+    // `fsnotify_handle_event` of Linux.
     if Arc::ptr_eq(old_dir, new_dir) {
         name_event(old_dir, mask::RENAME | isdir, old_name, 0);
     }
+    let _ = fan_event(&FsEvent {
+        mask: mask::RENAME | isdir,
+        path: None,
+        inode: Some(moved),
+        dir: Some(old_dir),
+        name: Some(old_name),
+        moved: Some((new_dir, new_name)),
+    });
     name_event(old_dir, mask::MOVED_FROM | isdir, old_name, cookie);
+    fan_name(old_dir, mask::MOVED_FROM | isdir, old_name, moved);
     name_event(new_dir, mask::MOVED_TO | isdir, new_name, cookie);
+    fan_name(new_dir, mask::MOVED_TO | isdir, new_name, moved);
     if let Some(target) = target {
         inode_event(target, mask::ATTRIB);
         if target.metadata().is_dir() || target.metadata().nlink == 0 {
