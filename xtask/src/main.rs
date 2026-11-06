@@ -390,8 +390,9 @@ const QEMU_PASS: i32 = 33;
 /// core/rk-syscall/src/info.rs. The `systemd` test ends with `systemctl poweroff`.
 const QEMU_POWER_OFF: i32 = 1;
 
-/// The longest time that the `systemd` boot test can take.
-const SYSTEMD_TIMEOUT: Duration = Duration::from_secs(900);
+/// The longest time that the `systemd` boot test can take. On an idle host without KVM, the test
+/// takes about 150 s. With QEMU on a fifth of a CPU, it takes about 870 s.
+const SYSTEMD_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// The memory of the `systemd` boot test. The initramfs has all of the Debian tree.
 const SYSTEMD_MEMORY: &str = "2G";
@@ -2192,6 +2193,17 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
             // QEMU uses the last `-m`.
             cmd.args(["-m", SYSTEMD_MEMORY]);
+            // systemd stops the generators after 90 s (`DEFAULT_TIMEOUT_USEC` in
+            // `manager_execute_generators`). Without KVM, the debug kernel needs about 15 s of the
+            // host for them, and on a busy host the guest gets a small part of a CPU. Then the
+            // alarm stops (sd-exec-strv) and systemd gives "Failed to fork off sandboxing
+            // environment for executing generators: Protocol error". With `-icount`, the clock of
+            // the guest counts the instructions that it runs (1 ns each), so the load of the
+            // host does not change the time that the guest sees. With `sleep=off`, an idle guest
+            // goes at once to its next timer.
+            if !cmd.get_args().any(|a| a == "kvm") {
+                cmd.args(["-icount", "shift=0,sleep=off"]);
+            }
             (cmd, SYSTEMD_TIMEOUT)
         } else if ROOTFS.iter().any(|r| r.name == *test) {
             let initrd = rootfs_initramfs(&kernel, test);
