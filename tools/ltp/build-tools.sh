@@ -28,13 +28,17 @@
 #   starts rpcbind. libtirpc reads /etc/netconfig, and rpcinfo reads the names of the programs
 #   in /etc/rpc. Alpine has no /etc/rpc, so the script writes the first lines of the file of
 #   glibc.
+# - iptables, ip6tables, iptables-translate and ip6tables-translate of iptables-nft, and nft of
+#   nftables (iptables, ip6tables, nft and nft6 of net.tcp_cmds and net.ipv6, #542). The programs
+#   of iptables are copies of xtables-nft-multi, which runs the program of its name. It loads its
+#   extensions from /usr/lib/xtables, so the script copies that directory.
 set -eu
 
 ALPINE=alpine:3.20
 PACKAGES="net-tools traceroute iproute2-ss ethtool tcpdump iputils-tracepath iputils-ping
-dhcp-server-vanilla dhclient dnsmasq rpcbind procps-ng"
+dhcp-server-vanilla dhclient dnsmasq rpcbind procps-ng iptables nftables"
 PROGRAMS="netstat traceroute ss ethtool tcpdump tracepath ping dhcpd dhclient dnsmasq rpcbind rpcinfo
-ps"
+ps iptables ip6tables iptables-translate ip6tables-translate nft"
 
 out=${1:?usage: tools/ltp/build-tools.sh OUT_DIR}
 mkdir -p "$out"
@@ -52,6 +56,11 @@ for p in $PROGRAMS; do
 	libs="$libs $(ldd "$f" | awk "/=>/ { print \$3; next } { print \$1 }")"
 done
 cp /out/root/bin/traceroute /out/root/bin/traceroute6
+mkdir -p /out/root/usr/lib
+cp -r /usr/lib/xtables /out/root/usr/lib/
+for f in /usr/lib/xtables/*.so; do
+	libs="$libs $(ldd "$f" | awk "/=>/ { print \$3; next } { print \$1 }")"
+done
 mkdir -p /out/root/usr/libexec
 mv /out/root/bin/tracepath /out/root/usr/libexec/
 cat > /out/root/bin/tracepath <<"EOF"

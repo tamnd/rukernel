@@ -123,7 +123,9 @@ ip link set lo up 2>/dev/null
 # gives 0 for a module in modules.builtin. rukernel has no modules.
 m=/lib/modules/$(uname -r)
 mkdir -p $m /var/run/netns /var/lib/misc /var/lib/dhcp /var/log
-printf "kernel/drivers/net/veth.ko\nkernel/drivers/net/dummy.ko\nkernel/net/dns_resolver/dns_resolver.ko\n" > $m/modules.builtin
+printf "%s\n" kernel/drivers/net/veth.ko kernel/drivers/net/dummy.ko \
+    kernel/net/dns_resolver/dns_resolver.ko kernel/net/netfilter/nf_tables.ko \
+    kernel/net/ipv4/netfilter/ip_tables.ko kernel/net/ipv6/netfilter/ip6_tables.ko > $m/modules.builtin
 : > $m/modules.dep
 # The RPC tests need rpcbind, from --tools.
 command -v rpcbind >/dev/null && mkdir -p /run && rpcbind
