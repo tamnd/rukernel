@@ -37,6 +37,9 @@ pub struct NetBuf {
     /// The connection of the packet and the state of the packet in it, as `skb->_nfct` of
     /// Linux.
     pub nfct: NfCt,
+    /// The mark of the packet, as `skb->mark` of Linux. A rule of nf_tables sets it with
+    /// `meta mark set` and reads it with `meta mark`.
+    pub mark: u32,
 }
 
 impl NetBuf {
@@ -54,6 +57,7 @@ impl NetBuf {
             protocol: 0,
             csum_ok: false,
             nfct: NfCt::default(),
+            mark: 0,
         }
     }
 
@@ -68,6 +72,7 @@ impl NetBuf {
             protocol: 0,
             csum_ok: false,
             nfct: NfCt::default(),
+            mark: 0,
         }
     }
 
@@ -82,6 +87,7 @@ impl NetBuf {
             protocol: 0,
             csum_ok: false,
             nfct: NfCt::default(),
+            mark: 0,
         }
     }
 
