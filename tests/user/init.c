@@ -4350,6 +4350,14 @@ static void test_iflags(void)
 		/* STATX_ATTR_COMPRESSED: tmpfs does not keep it, as shmem_getattr of Linux. */
 		check("statx on tmpfs has no compressed attribute in the mask",
 		      statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &stx) == 0 && !(stx.stx_attributes_mask & 0x4));
+		/* STATX_ATTR_MOUNT_ROOT, as vfs_statx_path of Linux. systemd 261 needs it in the mask. */
+		const unsigned long long mroot = 0x2000;
+		check("statx gives STATX_ATTR_MOUNT_ROOT for the root of a mount",
+		      statx(AT_FDCWD, "/", 0, STATX_TYPE, &stx) == 0 &&
+		      (stx.stx_attributes_mask & mroot) && (stx.stx_attributes & mroot));
+		check("statx gives no STATX_ATTR_MOUNT_ROOT below the root of a mount",
+		      statx(fd, "", AT_EMPTY_PATH, STATX_TYPE, &stx) == 0 && (stx.stx_attributes_mask & mroot) &&
+		      !(stx.stx_attributes & mroot));
 	}
 	fsx.fsx_projid = 1;
 	check("FS_IOC_FSSETXATTR with a project id gives EOPNOTSUPP",
