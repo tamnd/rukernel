@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.10] - 2026-11-07
+
 ### Added
 
 - XFS file handles, as fs/xfs/xfs_export.c of Linux: `name_to_handle_at` gives the handle `FILEID_INO32_GEN | XFS_FILEID_TYPE_64FLAG` with the inode number of 64 bits and the generation, and `open_by_handle_at` finds the inode again. A bad or free inode and another generation give `ESTALE`. A fanotify group that reports file handles can now mark a mount or a file system of XFS (#539).
@@ -1429,6 +1431,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.10]: https://github.com/tamnd/rukernel/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/tamnd/rukernel/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/tamnd/rukernel/compare/v0.5.7...v0.5.8
 [0.5.7]: https://github.com/tamnd/rukernel/compare/v0.5.6...v0.5.7
