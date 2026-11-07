@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- tools/systemd/build.sh takes an optional docker image, and makes the tree of the `systemd` boot test also from Ubuntu 26.04 and 26.10, Fedora 44 and Arch. tools/missing has the reports of the missing files of these images, from the `systemd` boot test with `rk.missing=1`, and report.py takes `--test NAME` for the name of the boot test. The initramfs of a root file system has each group of hard links once, as one inode, so the Ubuntu tree with the 115 hard links of its Rust coreutils is 150 MB and not 1.5 GB (#543).
+
 ## [0.5.12] - 2026-11-08
 
 ### Added

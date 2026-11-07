@@ -12,7 +12,8 @@ file.
     tools/missing/report.py alpine alpine.log
 
 `--note TEXT` before the image adds a paragraph to the report, for example to tell that the boot
-did not end.
+did not end. `--test NAME` before the image gives the boot test when it is not IMAGE, for example
+`--test systemd ubuntu-26.04` for the tree of tools/systemd/build.sh from `ubuntu:26.04`.
 """
 
 import collections
@@ -140,11 +141,17 @@ def source(path):
 def main():
     args = sys.argv[1:]
     note = None
-    if args[:1] == ["--note"] and len(args) > 1:
-        note, args = args[1], args[2:]
+    test = None
+    while args[:1] in (["--note"], ["--test"]) and len(args) > 1:
+        if args[0] == "--note":
+            note = args[1]
+        else:
+            test = args[1]
+        args = args[2:]
     if len(args) < 2:
-        sys.exit("usage: report.py [--note TEXT] IMAGE LOG...")
+        sys.exit("usage: report.py [--note TEXT] [--test NAME] IMAGE LOG...")
     image = args[0]
+    test = f"`{test}` boot test with the image `{image}`" if test else f"`{image}` boot test"
     found = collections.OrderedDict()
     for log in args[1:]:
         with open(log, errors="replace") as f:
@@ -162,7 +169,7 @@ def main():
     out = [
         f"# The missing files of {image}",
         "",
-        f"The files under /proc and /sys that the `{image}` boot test looks for and that rukernel "
+        f"The files under /proc and /sys that the {test} looks for and that rukernel "
         "does not have, from a boot with `rk.missing=1`. `report.py` made this file "
         f"on {datetime.date.today().isoformat()}. PID, TID and FD stand for a number, and cpuN for "
         "the number of a CPU.",
