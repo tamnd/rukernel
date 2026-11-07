@@ -1018,9 +1018,27 @@ exec /usr/lib/systemd/systemd
 ];
 
 /// Adds each file under `root` to `w`, with its mode, as a path relative to `root`. A directory
-/// comes before its contents.
+/// comes before its contents. The files of a group of hard links share an inode number in the
+/// archive, and only the first of them has the data, so that the kernel makes them hard links, as
+/// init/initramfs.c of Linux does. The Rust coreutils of Ubuntu are one program of 12 MB with 115
+/// hard links.
 fn add_tree(w: &mut rk_vfs::cpio::Writer, root: &Path, dir: &Path) -> Result {
-    use std::os::unix::fs::PermissionsExt;
+    add_tree_with(w, root, dir, &mut BTreeMap::new())
+}
+
+/// The first inode number in the archive of a group of hard links. The entries of `Writer::add`
+/// count from 1, so the numbers of the groups do not meet them.
+const HARD_LINK_INO: u32 = 0x8000_0000;
+
+/// Adds the files under `dir` as `add_tree`. `links` maps the device and inode of the first file
+/// of each group of hard links to its inode number in the archive.
+fn add_tree_with(
+    w: &mut rk_vfs::cpio::Writer,
+    root: &Path,
+    dir: &Path,
+    links: &mut BTreeMap<(u64, u64), u32>,
+) -> Result {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let mut entries: Vec<_> = fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(std::result::Result::ok)
@@ -1037,7 +1055,20 @@ fn add_tree(w: &mut rk_vfs::cpio::Writer, root: &Path, dir: &Path) -> Result {
             w.add(name.as_bytes(), 0o120_000 | mode, target.to_string_lossy().as_bytes());
         } else if meta.is_dir() {
             w.add(name.as_bytes(), 0o040_000 | mode, b"");
-            add_tree(w, root, &path)?;
+            add_tree_with(w, root, &path, links)?;
+        } else if meta.is_file() && meta.nlink() > 1 {
+            let nlink = u32::try_from(meta.nlink()).unwrap_or(u32::MAX);
+            let next = HARD_LINK_INO + links.len() as u32;
+            match links.entry((meta.dev(), meta.ino())) {
+                std::collections::btree_map::Entry::Occupied(e) => {
+                    w.add_raw(*e.get(), name.as_bytes(), 0o100_000 | mode, nlink, (0, 0), b"");
+                }
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(next);
+                    let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    w.add_raw(next, name.as_bytes(), 0o100_000 | mode, nlink, (0, 0), &bytes);
+                }
+            }
         } else if meta.is_file() {
             let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             w.add(name.as_bytes(), 0o100_000 | mode, &bytes);
