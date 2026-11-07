@@ -4,11 +4,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- fanotify groups with `FAN_REPORT_PIDFD`, as fs/notify/fanotify/fanotify_user.c of Linux. Each event has an info record with a new process file descriptor of the process of the event, after the records of the handles. With `FAN_REPORT_TID`, the descriptor refers to the thread and has `PIDFD_THREAD`. A process that has gone or that the reader does not see gives `FAN_NOPIDFD`, another error gives `FAN_EPIDFD`, and with `FAN_REPORT_FD_ERROR` the record has the negative error. The pid of an event is now the ID in the PID namespace of the reader, or 0 if the reader does not see the process. LTP fanotify21 now passes (#539).
+
 ## [0.5.10] - 2026-11-07
 
 ### Added
 
-- fanotify groups with `FAN_REPORT_PIDFD`, as fs/notify/fanotify/fanotify_user.c of Linux. Each event has an info record with a new process file descriptor of the process of the event, after the records of the handles. With `FAN_REPORT_TID`, the descriptor refers to the thread and has `PIDFD_THREAD`. A process that has gone or that the reader does not see gives `FAN_NOPIDFD`, another error gives `FAN_EPIDFD`, and with `FAN_REPORT_FD_ERROR` the record has the negative error. The pid of an event is now the ID in the PID namespace of the reader, or 0 if the reader does not see the process. LTP fanotify21 now passes (#539).
 - XFS file handles, as fs/xfs/xfs_export.c of Linux: `name_to_handle_at` gives the handle `FILEID_INO32_GEN | XFS_FILEID_TYPE_64FLAG` with the inode number of 64 bits and the generation, and `open_by_handle_at` finds the inode again. A bad or free inode and another generation give `ESTALE`. A fanotify group that reports file handles can now mark a mount or a file system of XFS (#539).
 - The limits of the fanotify groups and marks of a user, as the ucounts of Linux. Each group counts for its user in its user namespace and in the namespaces above it, and each mark of a group without `FAN_UNLIMITED_MARKS` counts for the same user. A group over the limit gives `EMFILE`, and a mark over the limit gives `ENOSPC`. `/proc/sys/fs/fanotify/max_user_groups` and `max_user_marks` are the limits of the first namespace, `/proc/sys/user/max_fanotify_groups` and `max_fanotify_marks` the limits of the namespace of the caller, and `/proc/sys/fs/fanotify/max_queued_events` the size of the queue of a new group. LTP fanotify17 now passes (#539).
 - nft_compat of nf_tables, as net/netfilter/nft_compat.c and x_tables.c of Linux, so that iptables-nft can use the xtables extensions: the expressions `match` and `target`, `NFTA_RULE_COMPAT`, and `NFNL_MSG_COMPAT_GET` for the best revision of an extension. The extensions are the matches `state`, `conntrack` (revisions 1 to 3), `comment`, `icmp` and `icmp6`, and the target `REJECT` of IPv4 and IPv6. Each extension checks its size, table, hooks and protocol as Linux does. An unknown extension gives `ENOENT` (#542).
