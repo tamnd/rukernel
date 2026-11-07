@@ -236,6 +236,8 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     if flags & CLONE_NEWNET != 0 {
         cx.thread.set_net_ns(new_net_ns(cred)?);
     }
+    // The user namespace of the caller after the call owns a new mount namespace.
+    let owner = cred.user_ns.clone();
     if let Some(c) = new_cred {
         process.set_cred(c);
     }
@@ -247,7 +249,7 @@ pub(crate) fn unshare(cx: &Cx<'_>, flags: u64) -> SysResult {
     {
         let mut context = fs.lock().clone();
         if flags & CLONE_NEWNS != 0 {
-            context.unshare_namespace();
+            context.unshare_namespace(owner);
         }
         process.set_fs(Arc::new(SpinLock::new(context)));
     }
@@ -300,6 +302,7 @@ fn new_cgroup_ns(process: &Process, cred: &Cred) -> Result<(), Errno> {
     }
     let root = process.cgroup();
     let ns = rk_cgroup::with(|h| h.new_namespace(root));
+    crate::ns::set_cgroup_owner(ns, &cred.user_ns);
     process.set_cgroup_ns(ns);
     Ok(())
 }
@@ -322,16 +325,19 @@ fn may_install(cred: &Cred, owner: &UserNs) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Checks that a process can join a cgroup namespace, as `cgroupns_install` of Linux. A cgroup
-/// namespace has no owner in rukernel, so the process needs `CAP_SYS_ADMIN` in the first user
-/// namespace with its credentials `old` before the call, and in its user namespace with its
-/// credentials `cred` after the call.
+/// Checks that a process can join the cgroup namespace `ns`, as `cgroupns_install` of Linux.
+/// With its credentials `old` before the call, the process needs `CAP_SYS_ADMIN` in the owner of
+/// `ns` and in the user namespace of its credentials `cred` after the call.
 ///
 /// # Errors
 ///
 /// `EPERM` without the capabilities.
-fn may_join_cgroup_ns(old: &Cred, cred: &Cred) -> Result<(), Errno> {
-    if !old.capable(rk_vfs::cred::cap::SYS_ADMIN) || !cred.has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
+fn may_join_cgroup_ns(old: &Cred, cred: &Cred, ns: u32) -> Result<(), Errno> {
+    let cap = rk_vfs::cred::cap::SYS_ADMIN;
+    if !old.ns_capable(&crate::ns::cgroup_owner(ns), cap)
+        || !old.ns_capable(&cred.user_ns, cap)
+        || !rk_vfs::security::capable(old, cap, 0)
+    {
         return Err(Errno::EPERM);
     }
     Ok(())
@@ -377,7 +383,7 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
         let cred = process.cred();
         match kind {
             rk_vfs::nsfs::NsKind::Cgroup => {
-                may_join_cgroup_ns(&cred, &cred)?;
+                may_join_cgroup_ns(&cred, &cred, id)?;
                 process.set_cgroup_ns(id);
             }
             // The file keeps the namespace, so the search finds it.
@@ -424,9 +430,6 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     if nstype == 0 || nstype & !all != 0 {
         return Err(Errno::EINVAL);
     }
-    if nstype & CLONE_NEWNS != 0 {
-        return Err(Errno::EINVAL);
-    }
     if target.is_zombie() {
         return Err(Errno::ESRCH);
     }
@@ -440,11 +443,20 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
         }
     }
     let cred = new_cred.as_ref().unwrap_or(&*old);
+    // The mount namespace comes after the user namespace, as `validate_nsset` of Linux. A
+    // target without a file system context has no mount namespace.
+    let mnt = if nstype & CLONE_NEWNS != 0 {
+        let ns = target.fs().ok_or(Errno::EINVAL)?.lock().namespace().clone();
+        crate::ns::may_join_mnt_ns(cred, &ns)?;
+        Some((ns, cx.fs_shared()?))
+    } else {
+        None
+    };
     if nstype & CLONE_NEWPID != 0 {
         may_join_pid_ns(cx, cred, target.pid_ns())?;
     }
     if nstype & CLONE_NEWCGROUP != 0 {
-        may_join_cgroup_ns(&old, cred)?;
+        may_join_cgroup_ns(&old, cred, target.cgroup_ns())?;
     }
     let net = target.net_ns();
     if nstype & CLONE_NEWNET != 0 {
@@ -465,6 +477,9 @@ pub(crate) fn setns(cx: &Cx<'_>, fd: u64, nstype: u64) -> SysResult {
     // All the checks passed, so the caller joins the namespaces, as `commit_nsset` of Linux.
     if let Some(c) = new_cred {
         process.set_cred(c);
+    }
+    if let Some((ns, fs)) = mnt {
+        fs.lock().set_namespace(ns);
     }
     if nstype & CLONE_NEWCGROUP != 0 {
         process.set_cgroup_ns(target.cgroup_ns());
@@ -664,7 +679,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     if flags & CLONE_NEWNS != 0
         && let Some(fs) = thread.process().fs()
     {
-        fs.lock().unshare_namespace();
+        fs.lock().unshare_namespace(owner.clone());
     }
     if let Some(net) = net {
         thread.set_net_ns(net);
@@ -673,6 +688,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     if flags & CLONE_NEWCGROUP != 0 {
         let process = thread.process();
         let ns = rk_cgroup::with(|h| h.new_namespace(process.cgroup()));
+        crate::ns::set_cgroup_owner(ns, &owner);
         process.set_cgroup_ns(ns);
     }
     if flags & CLONE_CLEAR_SIGHAND != 0 {

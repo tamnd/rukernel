@@ -2291,6 +2291,53 @@ static void test_pidfd_exec_thread(void)
 		close(fds[i]);
 }
 
+/* A mount namespace has an owner user namespace, and setns with a pidfd joins the mount
+ * namespace of the process, as mntns_install of Linux (#536). */
+static void test_pidfd_setns_mnt(void)
+{
+	char path[64], ok = 0;
+	struct stat a, b;
+	int fds[2], status = 0;
+
+	/* The checks open /proc/PID/ns, and the "only pidfd" run does not mount /proc before. */
+	if (access("/proc/self/ns", F_OK) != 0)
+		mount("proc", "/proc", "proc", 0, NULL);
+	if (pipe(fds) != 0) {
+		check("a pipe for the setns of a mount namespace", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		ok = unshare(CLONE_NEWUSER) == 0 && unshare(CLONE_NEWNS) == 0;
+		write(fds[1], &ok, 1);
+		for (;;)
+			pause();
+	}
+	read(fds[0], &ok, 1);
+	snprintf(path, sizeof(path), "/proc/%d/ns/mnt", pid);
+	int mnt = open(path, O_RDONLY);
+	snprintf(path, sizeof(path), "/proc/%d/ns/user", pid);
+	int user = open(path, O_RDONLY);
+	int owner = mnt < 0 ? -1 : ioctl(mnt, 0xb701);
+	check("NS_GET_USERNS of a mount namespace gives the user namespace that owns it",
+	      ok && owner >= 0 && user >= 0 && fstat(owner, &a) == 0 && fstat(user, &b) == 0 &&
+		      a.st_ino == b.st_ino);
+	int pfd = syscall(SYS_pidfd_open, pid, 0);
+	pid_t j = fork();
+	if (j == 0)
+		_exit(setns(pfd, CLONE_NEWUSER | CLONE_NEWNS) == 0 && same_ns(mnt, "mnt") ? 0 : 1);
+	check("setns with a pidfd and CLONE_NEWUSER | CLONE_NEWNS joins the mount namespace",
+	      pfd >= 0 && waitpid(j, &status, 0) == j && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
+	close(owner);
+	close(user);
+	close(mnt);
+	close(pfd);
+	close(fds[0]);
+	close(fds[1]);
+}
+
 /* A thread that ends with SYS_exit a second after its start. */
 static void *pidfd_late_thread(void *arg)
 {
@@ -15009,6 +15056,7 @@ static void test_all(void)
 	test_pidfd_ioctl();
 	test_pidfd_thread();
 	test_pidfd_exec_thread();
+	test_pidfd_setns_mnt();
 	test_pidfd_leader_exit();
 	test_process_mrelease();
 	test_scm_pidfd();
@@ -15440,6 +15488,7 @@ int main(int argc, char **argv)
 		test_pidfd_ioctl();
 		test_pidfd_thread();
 		test_pidfd_exec_thread();
+		test_pidfd_setns_mnt();
 		test_pidfd_leader_exit();
 		test_process_mrelease();
 	}

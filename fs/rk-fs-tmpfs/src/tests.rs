@@ -449,7 +449,7 @@ fn mount_setattr_changes_the_flags_and_the_propagation() {
     ns.set_attr(&at, MountAttr { set: ro, ..MountAttr::default() }, true).unwrap();
     assert_eq!(detached.flags(), noexec | ro);
     let mut copy = fs.clone();
-    copy.unshare_namespace();
+    copy.unshare_namespace(rk_vfs::user_ns::init().clone());
     assert!(!d.mount.is_detached());
     assert_eq!(copy.namespace().set_attr(&d, attr, false), Err(Errno::EINVAL));
 }
@@ -488,7 +488,7 @@ fn a_copy_of_the_name_space_has_its_own_mounts() {
     let tmp = MountSource { source: b"none".to_vec(), fstype: "tmpfs", flags: 0 };
     fs.mkdir(&root, b"/a", 0o755).unwrap();
     let mut copy = fs.clone();
-    copy.unshare_namespace();
+    copy.unshare_namespace(rk_vfs::user_ns::init().clone());
     let top = copy.root().clone();
     assert!(!top.same(&root));
     assert!(copy.namespace().contains(&top.mount));

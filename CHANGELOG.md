@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The AppArmor module, as security/apparmor of Linux, with its securityfs tree in /sys/kernel/security/apparmor: `features/`, `profiles`, `revision`, `.ns_name`, `.ns_level`, `.stacked`, `.load`, `.replace`, `.remove` and `policy/`. The module is on with `apparmor=1` or when `lsm=` names it. /sys/module/apparmor/parameters/enabled shows the state. A write to a securityfs file of the tree comes in one piece, not in 64 KiB pieces. The load of a policy gives EPROTO for now (#540)
+- A mount namespace and a cgroup namespace have an owner user namespace, as `user_ns` of `struct mnt_namespace` and `struct cgroup_namespace` of Linux: the user namespace of the process that made them. `NS_GET_USERNS` of a mount or a cgroup namespace gives the owner. `setns` of a mount namespace needs `CAP_SYS_ADMIN` in the owner and `CAP_SYS_CHROOT` and `CAP_SYS_ADMIN` in the user namespace of the caller, as `mntns_install`. `setns` with a pidfd now takes `CLONE_NEWNS`, and joins the mount namespace after the user namespace. kselftest pidfd_setns_test is in tools/kselftest/build.sh (#536).
 
 ## [0.5.13] - 2026-11-08
 
