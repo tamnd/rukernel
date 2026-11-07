@@ -9,6 +9,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - tools/systemd/build.sh takes an optional docker image, and makes the tree of the `systemd` boot test also from Ubuntu 26.04 and 26.10, Fedora 44 and Arch. tools/missing has the reports of the missing files of these images, from the `systemd` boot test with `rk.missing=1`, and report.py takes `--test NAME` for the name of the boot test. The initramfs of a root file system has each group of hard links once, as one inode, so the Ubuntu tree with the 115 hard links of its Rust coreutils is 150 MB and not 1.5 GB (#543).
 - The file `name_assign_type` of a network interface in sysfs, as on Linux: 2 for lo, 1 for a name that the kernel gives with `eth%d`, 3 for a name that the user gives at creation, and 4 after a rename. udevd now renames eth0 to the same name as on Linux, `enp0s3` for virtio-net-pci on x86_64 and `enp0s1` for virtio-net-pci on arm64, and the `udevd` boot test checks the name that `net_id` gives (#538).
 
+### Fixed
+
+- An `execve` of a thread that is not the leader gives the thread the ID of the leader, as `exchange_tids` in `de_thread` of Linux. Before this change, the new program had a thread ID that was not its process ID. A `PIDFD_THREAD` pidfd of the old ID of the thread now gives `POLLHUP`, `PIDFD_GET_INFO` gives the exit of the old leader, and `pidfd_send_signal` gives `ESRCH`. kselftest pidfd_info_test and its helper pidfd_exec_helper are in tools/kselftest/build.sh, and the `kselftest` boot test runs the tests in /kselftest (#536).
+
 ## [0.5.12] - 2026-11-08
 
 ### Added

@@ -1258,9 +1258,11 @@ const KSELFTEST_SCRIPT: &str = concat!(
     // The tests of lsm read /sys/kernel/security/lsm.
     "mkdir -p /sys\nmount -t sysfs sysfs /sys\n",
     "mount -t securityfs securityfs /sys/kernel/security\n",
-    "failed=0\nfor p in /kselftest/*; do\n",
+    // pidfd_info_test runs `pidfd_exec_helper` from the working directory, and the helper is not
+    // a test.
+    "cd /kselftest\nfailed=0\nfor p in /kselftest/*; do\n",
     "    t=${p##*/}\n",
-    "    [ \"$t\" = run ] && continue\n",
+    "    case $t in run | pidfd_exec_helper) continue ;; esac\n",
     // The `attached` variant of the URETPROBE tests of seccomp_bpf needs the uprobes of perf,
     // which rukernel does not have.
     "    args=\n    [ \"$t\" = seccomp_bpf ] && args='-V attached'\n",

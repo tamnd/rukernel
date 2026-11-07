@@ -340,7 +340,7 @@ impl Thread {
     pub fn seccomp_sync_conflict(&self) -> Option<Pid> {
         let own = self.seccomp().filter;
         self.process.threads().into_iter().find_map(|t| {
-            if t.tid == self.tid || t.is_killed() {
+            if t.tid() == self.tid() || t.is_killed() {
                 return None;
             }
             let s = t.seccomp();
@@ -353,7 +353,7 @@ impl Thread {
                 },
                 _ => false,
             };
-            (!ok).then_some(t.tid)
+            (!ok).then_some(t.tid())
         })
     }
 
@@ -364,7 +364,7 @@ impl Thread {
         let own = self.seccomp();
         let nnp = self.no_new_privs();
         for t in self.process.threads() {
-            if t.tid == self.tid || t.is_killed() {
+            if t.tid() == self.tid() || t.is_killed() {
                 continue;
             }
             t.set_seccomp(Seccomp { mode: SECCOMP_MODE_FILTER, filter: own.filter.clone() });

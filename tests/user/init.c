@@ -2226,6 +2226,71 @@ static void test_pidfd_thread(void)
 		close(fds[i]);
 }
 
+/* A thread that sends its ID on the pipe fds[1], waits for a byte on the pipe fds[2], and then
+ * runs /bin/hello with the argument "tid". */
+static void *pidfd_exec_thread(void *arg)
+{
+	int *fds = arg;
+	pid_t tid = gettid();
+	char c;
+	char *argv[] = { "/bin/hello", "tid", NULL };
+	char *envp[] = { NULL };
+
+	write(fds[1], &tid, sizeof(tid));
+	read(fds[2], &c, 1);
+	execve(argv[0], argv, envp);
+	return NULL;
+}
+
+/* An execve of a thread that is not the leader gives the thread the ID of the leader, as
+ * de_thread of Linux. A pidfd of the old ID of the thread then sees the exit of the old leader,
+ * and the pidfd of the process still sees the process (#536). */
+static void test_pidfd_exec_thread(void)
+{
+	struct rk_pidfd_info info;
+	int fds[4], status = 0;
+	pid_t tid = 0;
+	char c = 0;
+
+	if (pipe(fds) != 0 || pipe(fds + 2) != 0) {
+		check("pipes for the execve of a thread", 0);
+		return;
+	}
+	pid_t pid = fork();
+	if (pid == 0) {
+		pthread_t th;
+		pthread_create(&th, NULL, pidfd_exec_thread, fds);
+		for (;;)
+			pause();
+	}
+	read(fds[0], &tid, sizeof(tid));
+	int t = syscall(SYS_pidfd_open, tid, O_EXCL /* PIDFD_THREAD */);
+	int p = syscall(SYS_pidfd_open, pid, 0);
+	write(fds[3], &c, 1);
+	struct pollfd pf = {.fd = t, .events = POLLIN};
+	check("poll of a pidfd of a thread gives POLLHUP after an execve gave it the ID of the leader",
+	      t >= 0 && tid != pid && poll(&pf, 1, 5000) == 1 && (pf.revents & POLLHUP));
+	memset(&info, 0, sizeof(info));
+	info.mask = 8; /* PIDFD_INFO_EXIT */
+	check("PIDFD_GET_INFO of the old ID of the thread gives the exit of the old leader",
+	      ioctl(t, RK_PIDFD_GET_INFO(sizeof(info)), &info) == 0 && (info.mask & 8) &&
+		      WIFEXITED(info.exit_code) && WEXITSTATUS(info.exit_code) == 0);
+	errno = 0;
+	check("pidfd_send_signal to the old ID of the thread gives ESRCH",
+	      syscall(SYS_pidfd_send_signal, t, 0, NULL, 0) == -1 && errno == ESRCH);
+	memset(&info, 0, sizeof(info));
+	info.mask = 8;
+	check("PIDFD_GET_INFO of the process after the execve of a thread gives the process",
+	      p >= 0 && ioctl(p, RK_PIDFD_GET_INFO(sizeof(info)), &info) == 0 &&
+		      info.pid == (uint32_t)pid);
+	check("the program of an execve of a thread runs with the ID of the leader",
+	      waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 10);
+	close(t);
+	close(p);
+	for (int i = 0; i < 4; i++)
+		close(fds[i]);
+}
+
 /* A thread that ends with SYS_exit a second after its start. */
 static void *pidfd_late_thread(void *arg)
 {
@@ -14943,6 +15008,7 @@ static void test_all(void)
 	test_pidfs();
 	test_pidfd_ioctl();
 	test_pidfd_thread();
+	test_pidfd_exec_thread();
 	test_pidfd_leader_exit();
 	test_process_mrelease();
 	test_scm_pidfd();
@@ -15284,7 +15350,8 @@ int main(int argc, char **argv)
 		test_pidfs();
 		test_pidfd_ioctl();
 		test_pidfd_thread();
-	test_pidfd_leader_exit();
+		test_pidfd_exec_thread();
+		test_pidfd_leader_exit();
 		test_process_mrelease();
 	}
 	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
