@@ -135,6 +135,9 @@ pub(crate) fn in_pidfs(at: &Location) -> bool {
 struct PidFd {
     process: Arc<Process>,
     thread: Option<Arc<Thread>>,
+    /// The ID of the thread when the descriptor was made. An `execve` can give the thread the ID
+    /// of the leader, and then the descriptor refers to the old ID, which has gone.
+    tid: Pid,
     /// The descriptor has `PIDFD_THREAD`, so a signal goes to the thread by default.
     per_thread: bool,
 }
@@ -142,14 +145,15 @@ struct PidFd {
 impl PidFd {
     /// The ID of the thread or the process.
     fn pid(&self) -> Pid {
-        self.thread.as_ref().map_or(self.process.pid(), |t| t.tid())
+        if self.thread.is_some() { self.tid } else { self.process.pid() }
     }
 
-    /// The thread or the process has gone: the thread ended, or the parent reaped the process.
-    /// Linux releases a thread that is not the leader at its exit, as `release_task`.
+    /// The thread or the process has gone: the thread ended or took the ID of the leader at an
+    /// `execve`, or the parent reaped the process. Linux releases a thread that is not the leader
+    /// at its exit, as `release_task`.
     fn gone(&self) -> bool {
         match &self.thread {
-            Some(t) => t.exit_status().is_some(),
+            Some(t) => t.exit_status_of(self.tid).is_some(),
             None => reaped(&self.process),
         }
     }
@@ -157,7 +161,7 @@ impl PidFd {
     /// The status of the exit of the thread or the process, after it ended.
     fn exit_status(&self) -> Option<WaitStatus> {
         match &self.thread {
-            Some(t) => t.exit_status(),
+            Some(t) => t.exit_status_of(self.tid),
             None => self.process.exit_status(),
         }
     }
@@ -226,7 +230,9 @@ fn new_file(process: Arc<Process>, thread: Option<Arc<Thread>>, flags: u32) -> A
     let inode: InodeRef = Arc::new(PidfsInode { ino: process.serial() });
     let at = Location { mount: root.mount.clone(), dentry: root.dentry.tmp_child(inode, false) };
     let per_thread = flags & PIDFD_THREAD != 0;
-    File::with_ops(Arc::new(PidFd { process, thread, per_thread }), Some(at), O_RDWR | flags)
+    let tid = thread.as_ref().map_or(process.pid(), |t| t.tid());
+    let pidfd = PidFd { process, thread, tid, per_thread };
+    File::with_ops(Arc::new(pidfd), Some(at), O_RDWR | flags)
 }
 
 /// Makes a process file descriptor for `process`, for `pidfd_open` and `CLONE_PIDFD`. The
@@ -527,6 +533,10 @@ fn signal_target_of(cx: &Cx<'_>, fd: u64) -> Result<SignalTarget, Errno> {
     }
     let file = cx.file(fd)?;
     if let Some(pidfd) = file.ops().as_any().and_then(|a| a.downcast_ref::<PidFd>()) {
+        // The old ID of a thread that took the ID of the leader at an `execve` has gone.
+        if pidfd.thread.is_some() && pidfd.gone() {
+            return Err(Errno::ESRCH);
+        }
         let scope = if pidfd.per_thread { Scope::Thread } else { Scope::Process };
         return Ok((pidfd.process.clone(), pidfd.thread.clone(), scope));
     }

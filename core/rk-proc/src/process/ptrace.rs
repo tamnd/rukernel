@@ -357,7 +357,7 @@ pub fn attach_child(parent: &Thread, child: &Arc<Thread>) {
 
 /// Gives the tracee `tid` of `tracer`.
 fn tracee(tracer: &Process, tid: Pid) -> Option<Arc<Thread>> {
-    tracer.state.lock().tracees.iter().find(|t| t.tid == tid).cloned()
+    tracer.state.lock().tracees.iter().find(|t| t.tid() == tid).cloned()
 }
 
 /// Runs `f` on the tracing state and the stop of the stopped tracee `tid` of `tracer`.
@@ -499,7 +499,7 @@ pub fn stop(
         let sysgood = if pt.options & PTRACE_O_TRACESYSGOOD != 0 { 0x80 } else { 0 };
         // The signal information of a stop that is not a signal has the ID of the tracee, as
         // `ptrace_do_notify` of Linux gives it.
-        let tid = thread.tid;
+        let tid = thread.tid();
         let (status, info) = match kind {
             StopKind::Signal => (WaitStatus::stopped(sig), info),
             StopKind::Group if pt.seized => {
@@ -533,7 +533,7 @@ pub fn stop(
         });
         tracer
     };
-    notify_tracer(&tracer, thread.tid, CLD_TRAPPED, (sig & 0x7f) as i32);
+    notify_tracer(&tracer, thread.tid(), CLD_TRAPPED, (sig & 0x7f) as i32);
     let queue = WaitQueue::new();
     queue.wait_until(|| {
         if thread.is_killed() {
@@ -614,7 +614,7 @@ pub(super) fn thread_exited(thread: &Thread, status: WaitStatus) {
         let mut guard = thread.ptrace.lock();
         let Some(pt) = guard.as_mut().filter(|p| !p.detached) else { return };
         let tracer = pt.tracer.upgrade();
-        if thread.tid == thread.process.pid {
+        if thread.tid() == thread.process.pid {
             *thread.process.leader_tracer.lock() = pt.tracer.clone();
             return;
         }
@@ -624,7 +624,7 @@ pub(super) fn thread_exited(thread: &Thread, status: WaitStatus) {
     };
     if let Some(tracer) = tracer {
         let (code, value) = status.child_code();
-        notify_tracer(&tracer, thread.tid, code, value);
+        notify_tracer(&tracer, thread.tid(), code, value);
     }
 }
 
@@ -703,7 +703,7 @@ pub(super) fn group_continued(threads: &[Arc<Thread>]) {
 /// Tells if the wait `options` takes `thread`: a thread that is not the leader of its process is
 /// a clone child for `__WCLONE`, as `eligible_child` of Linux tells.
 fn eligible(thread: &Thread, options: WaitOptions) -> bool {
-    let clone = thread.tid != thread.process.pid || thread.process.exit_signal != SIGCHLD;
+    let clone = thread.tid() != thread.process.pid || thread.process.exit_signal != SIGCHLD;
     options.all || clone == options.clone
 }
 
@@ -734,7 +734,7 @@ pub(super) fn wait_tracee(
         i += 1;
         let matches = match target {
             WaitTarget::Any => true,
-            WaitTarget::Pid(pid) => t.tid == pid,
+            WaitTarget::Pid(pid) => t.tid() == pid,
             WaitTarget::Pgid(pgid) => t.process.pgid() == pgid,
         };
         if !matches || !eligible(&t, options) {
@@ -743,7 +743,7 @@ pub(super) fn wait_tracee(
         if matches!(found, Found::None) {
             found = Found::Waiting;
         }
-        let leader = t.tid == t.process.pid;
+        let leader = t.tid() == t.process.pid;
         let mut guard = t.ptrace.lock();
         let Some(pt) = guard.as_mut() else { continue };
         if let Some(status) = pt.exit {
@@ -755,7 +755,7 @@ pub(super) fn wait_tracee(
                 s.tracees.remove(i - 1);
             }
             return Found::Report(WaitResult {
-                pid: t.tid,
+                pid: t.tid(),
                 uid: t.process.cred().uid,
                 status,
                 ticks: t.user_ticks(),
@@ -778,7 +778,7 @@ pub(super) fn wait_tracee(
                 let sys_ticks = t.process.sys_ticks() + t.process.child_sys_ticks();
                 let uid = t.process.cred().uid;
                 return Found::Report(WaitResult {
-                    pid: t.tid,
+                    pid: t.tid(),
                     uid,
                     status,
                     ticks,
@@ -794,7 +794,7 @@ pub(super) fn wait_tracee(
             let status = stop.status;
             drop(guard);
             return Found::Report(WaitResult {
-                pid: t.tid,
+                pid: t.tid(),
                 uid: t.process.cred().uid,
                 status,
                 ticks: t.user_ticks(),

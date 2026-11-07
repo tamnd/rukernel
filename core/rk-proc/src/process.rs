@@ -245,6 +245,9 @@ pub struct Process {
     /// The tracer of the leader thread after the leader ended. The tracer gets the exit of the
     /// process.
     leader_tracer: SpinLock<Weak<Process>>,
+    /// The status of the exit of the leader thread, if it ended before the other threads. An
+    /// `execve` of another thread then gives the status to the old ID of that thread.
+    leader_exit: SpinLock<Option<WaitStatus>>,
     /// The cgroup of the process: the cgroup of its leader thread, for `cgroup.procs` and the
     /// memory controller. In a threaded subtree, the other threads can be in other cgroups.
     cgroup: AtomicU32,
@@ -294,7 +297,9 @@ impl core::fmt::Debug for Process {
 
 /// A thread of a process.
 pub struct Thread {
-    tid: Pid,
+    /// The thread ID. An `execve` of a thread that is not the leader gives it the ID of the
+    /// leader, as `exchange_tids` in `de_thread` of Linux.
+    tid: AtomicU32,
     process: Arc<Process>,
     task: SpinLock<Weak<Task>>,
     /// The address that `set_tid_address` or `CLONE_CHILD_CLEARTID` gave. At the exit, the kernel
@@ -375,6 +380,10 @@ pub struct Thread {
     /// The status of the exit of the thread, after it ended, for `PIDFD_INFO_EXIT` of a pidfd of
     /// the thread.
     exit: SpinLock<Option<WaitStatus>>,
+    /// The ID that the thread had before an `execve` gave it the ID of the leader, and the status
+    /// of the exit of the old leader. In Linux the old leader takes the old ID of the thread and
+    /// ends with it, so a pidfd of that ID sees the exit of the old leader.
+    former: SpinLock<Option<(Pid, WaitStatus)>>,
 }
 
 /// The task goes away, as `security_task_free` in `__put_task_struct` of Linux.
@@ -423,7 +432,7 @@ impl VforkDone {
 
 impl core::fmt::Debug for Thread {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Thread").field("tid", &self.tid).finish_non_exhaustive()
+        f.debug_struct("Thread").field("tid", &self.tid()).finish_non_exhaustive()
     }
 }
 
@@ -784,11 +793,11 @@ impl Process {
     /// `ESRCH` for a thread that ended, and the errors of `Hierarchy::can_attach_thread`.
     pub(crate) fn move_thread_cgroup(&self, thread: &Thread, to: u32) -> Result<(), Errno> {
         let s = self.state.lock();
-        if !s.threads.iter().any(|t| t.tid == thread.tid) {
+        if !s.threads.iter().any(|t| t.tid() == thread.tid()) {
             return Err(Errno::ESRCH);
         }
         let from = thread.cgroup();
-        let leader = thread.tid == self.pid;
+        let leader = thread.tid() == self.pid;
         let pfrom = self.cgroup();
         rk_cgroup::with(|h| {
             h.can_attach_thread(from, to)?;
@@ -815,28 +824,28 @@ impl Process {
     /// Linux is a part of each task. A process without threads has the first namespace.
     pub fn net_ns(&self) -> Arc<NetNs> {
         let threads = self.threads();
-        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        let leader = threads.iter().find(|t| t.tid() == self.pid).or_else(|| threads.first());
         leader.map_or_else(rk_net::ns::init_ns, |t| t.net_ns())
     }
 
     /// The UTS namespace of the process: the namespace of its leader thread, as for `net_ns`.
     pub fn uts_ns(&self) -> Arc<UtsNs> {
         let threads = self.threads();
-        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        let leader = threads.iter().find(|t| t.tid() == self.pid).or_else(|| threads.first());
         leader.map_or_else(crate::uts::init_ns, |t| t.uts_ns())
     }
 
     /// The time namespace of the process: the namespace of its leader thread, as for `net_ns`.
     pub fn time_ns(&self) -> Arc<TimeNs> {
         let threads = self.threads();
-        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        let leader = threads.iter().find(|t| t.tid() == self.pid).or_else(|| threads.first());
         leader.map_or_else(crate::timens::init_ns, |t| t.time_ns())
     }
 
     /// The time namespace of the new children of the process, from its leader thread.
     pub fn time_ns_for_children(&self) -> Arc<TimeNs> {
         let threads = self.threads();
-        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        let leader = threads.iter().find(|t| t.tid() == self.pid).or_else(|| threads.first());
         leader.map_or_else(crate::timens::init_ns, |t| t.time_ns_for_children())
     }
 
@@ -844,14 +853,14 @@ impl Process {
     /// the first namespace.
     pub fn pid_ns_for_children(&self) -> Option<Arc<PidNamespace>> {
         let threads = self.threads();
-        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        let leader = threads.iter().find(|t| t.tid() == self.pid).or_else(|| threads.first());
         leader.and_then(|t| t.pid_ns_for_children())
     }
 
     /// The IPC namespace of the process: the namespace of its leader thread, as for `net_ns`.
     pub fn ipc_ns(&self) -> Arc<IpcNs> {
         let threads = self.threads();
-        let leader = threads.iter().find(|t| t.tid == self.pid).or_else(|| threads.first());
+        let leader = threads.iter().find(|t| t.tid() == self.pid).or_else(|| threads.first());
         leader.map_or_else(crate::ns::init_ipc, |t| t.ipc_ns())
     }
 
@@ -1374,6 +1383,7 @@ impl Process {
             maxrss: AtomicU64::new(0),
             cmaxrss: AtomicU64::new(0),
             leader_tracer: SpinLock::new(Weak::new()),
+            leader_exit: SpinLock::new(None),
             keys: SpinLock::new(ProcessKeys::default()),
             cgroup: AtomicU32::new(rk_cgroup::ROOT),
             cgns: AtomicU32::new(0),
@@ -1457,7 +1467,17 @@ impl Thread {
 
     /// The thread ID.
     pub fn tid(&self) -> Pid {
-        self.tid
+        self.tid.load(Ordering::Acquire)
+    }
+
+    /// The status of the exit of the thread with the ID `tid`, or `None` while it runs. After an
+    /// `execve` gave the thread the ID of the leader, its old ID has the status of the exit of
+    /// the old leader, as a pidfd of that ID sees in Linux.
+    pub fn exit_status_of(&self, tid: Pid) -> Option<WaitStatus> {
+        match *self.former.lock() {
+            Some((old, status)) if old == tid => Some(status),
+            _ => self.exit_status(),
+        }
     }
 
     /// The status of the exit of the thread, or `None` while it runs. The status of the group
@@ -1898,7 +1918,7 @@ impl Thread {
 
     fn new(tid: Pid, process: Arc<Process>, blocked: SigSet) -> Arc<Self> {
         Arc::new(Self {
-            tid,
+            tid: AtomicU32::new(tid),
             process,
             task: SpinLock::new(Weak::new()),
             clear_child_tid: AtomicUsize::new(0),
@@ -1935,6 +1955,7 @@ impl Thread {
             time_children: SpinLock::new(None),
             pid_children: SpinLock::new(None),
             exit: SpinLock::new(None),
+            former: SpinLock::new(None),
         })
     }
 
@@ -2396,7 +2417,7 @@ pub fn exit_group(thread: &Thread, status: WaitStatus) {
     let others: Vec<Arc<Thread>> = {
         let mut s = thread.process.state.lock();
         s.group_exit.get_or_insert(status);
-        s.threads.iter().filter(|t| t.tid != thread.tid).cloned().collect()
+        s.threads.iter().filter(|t| t.tid() != thread.tid()).cloned().collect()
     };
     for t in others {
         t.kill();
@@ -2416,7 +2437,7 @@ pub fn start_core_dump(thread: &Thread, status: WaitStatus) -> bool {
         }
         s.group_exit = Some(status);
         *process.core_threads.lock() = Some(Vec::new());
-        s.threads.iter().filter(|t| t.tid != thread.tid).cloned().collect()
+        s.threads.iter().filter(|t| t.tid() != thread.tid()).cloned().collect()
     };
     if others.is_empty() {
         return true;
@@ -2591,7 +2612,7 @@ pub fn stop_group(thread: &Thread, sig: u32) {
             t.group_stop.store(sig, Ordering::Release);
         }
         let others: Vec<Arc<Thread>> =
-            s.threads.iter().filter(|t| t.tid != thread.tid).cloned().collect();
+            s.threads.iter().filter(|t| t.tid() != thread.tid()).cloned().collect();
         (others, s.parent.upgrade())
     };
     for t in others {
@@ -2709,19 +2730,42 @@ pub fn kill_group(process: &Process, status: WaitStatus) {
 
 /// Ends each other thread of the process of `thread`, and waits until they are gone, as
 /// `de_thread` of Linux does. `execve` calls it before it replaces the program, because the other
-/// threads cannot run in the new program.
+/// threads cannot run in the new program. Then the thread takes the ID of the leader.
 pub(crate) fn kill_other_threads(thread: &Thread) {
     let process = &thread.process;
     let others: Vec<Arc<Thread>> =
-        process.state.lock().threads.iter().filter(|t| t.tid != thread.tid).cloned().collect();
-    if others.is_empty() {
+        process.state.lock().threads.iter().filter(|t| t.tid() != thread.tid()).cloned().collect();
+    if !others.is_empty() {
+        for t in &others {
+            t.kill();
+        }
+        drop(others);
+        process.thread_exit.wait_until(|| (process.state.lock().threads.len() <= 1).then_some(()));
+    }
+    take_leader_id(thread);
+}
+
+/// Gives the ID of the leader to `thread`, the last thread of its process, at an `execve`, as
+/// `exchange_tids` in `de_thread` of Linux. Then `getpid` and `gettid` give the same ID. The old
+/// ID of the thread is free again, and a pidfd of it sees the exit of the old leader.
+fn take_leader_id(thread: &Thread) {
+    let process = &thread.process;
+    let old = thread.tid();
+    if old == process.pid {
         return;
     }
-    for t in &others {
-        t.kill();
+    let status = process.leader_exit.lock().take().unwrap_or(WaitStatus::exited(0));
+    *thread.former.lock() = Some((old, status));
+    {
+        let mut table = TABLE.lock();
+        let me = table.threads.remove(&old);
+        thread.tid.store(process.pid, Ordering::Release);
+        if let Some(me) = me {
+            table.threads.insert(process.pid, me);
+        }
     }
-    drop(others);
-    process.thread_exit.wait_until(|| (process.state.lock().threads.len() <= 1).then_some(()));
+    // A pidfd of the old ID now gives `POLLIN` and `POLLHUP`.
+    process.exit_poll.wake_all();
 }
 
 /// Ends `thread`. The caller then ends the task. If this is the last thread of its process, the
@@ -2733,12 +2777,12 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let process = thread.process.clone();
     let thread_status = process.group_exit().unwrap_or(status);
     ptrace::thread_exited(thread, thread_status);
-    TABLE.lock().threads.remove(&thread.tid);
+    TABLE.lock().threads.remove(&thread.tid());
     *thread.exit.lock() = Some(thread_status);
     thread.release_seccomp();
     let last = {
         let mut s = process.state.lock();
-        s.threads.retain(|t| t.tid != thread.tid);
+        s.threads.retain(|t| t.tid() != thread.tid());
         process.dead_ticks.fetch_add(thread.user_ticks(), Ordering::Relaxed);
         process.dead_sys_ticks.fetch_add(thread.sys_ticks(), Ordering::Relaxed);
         // The thread leaves its cgroup with the lock held, so a move of the process counts the
@@ -2768,6 +2812,9 @@ pub fn exit_thread(thread: &Arc<Thread>, status: WaitStatus) {
     let pid_ns = thread.pid_children.lock().take();
     drop(pid_ns);
     if !last {
+        if thread.tid() == process.pid {
+            *process.leader_exit.lock() = Some(thread_status);
+        }
         process.thread_exit.wake_all();
         // A pidfd of the thread is now readable.
         process.exit_poll.wake_all();
