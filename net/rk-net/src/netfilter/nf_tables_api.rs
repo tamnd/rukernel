@@ -20,9 +20,10 @@ pub(crate) use self::nf_tables_core::nft_log_line;
 pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
-    NftDynset, NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain,
-    nft_expr_dump, nft_expr_needs_validate, nft_expr_targets, nft_expr_validate, nft_prog,
-    nft_rule_needs_ct, nft_table_validate,
+    NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr, NftObj, NftProg, nf_tables_dump_obj,
+    nf_tables_expr_parse, nf_tables_getobj, nft_check_loops, nft_do_chain, nft_expr_dump,
+    nft_expr_needs_validate, nft_expr_targets, nft_expr_validate, nft_obj_commit, nft_prog,
+    nft_rule_needs_ct, nft_setelem_parse_obj, nft_table_validate,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
@@ -89,6 +90,14 @@ pub const NFT_MSG_DELSETELEM: u8 = 14;
 pub const NFT_MSG_NEWGEN: u8 = 15;
 /// Gets the generation.
 pub const NFT_MSG_GETGEN: u8 = 16;
+/// Makes an object, or changes a quota.
+pub const NFT_MSG_NEWOBJ: u8 = 18;
+/// Gets or dumps the objects.
+pub const NFT_MSG_GETOBJ: u8 = 19;
+/// Deletes an object.
+pub const NFT_MSG_DELOBJ: u8 = 20;
+/// Gets or dumps the objects, and resets them.
+pub const NFT_MSG_GETOBJ_RESET: u8 = 21;
 /// Deletes a table, with no error if it is not there.
 pub const NFT_MSG_DESTROYTABLE: u8 = 26;
 /// Deletes a chain, with no error if it is not there.
@@ -99,6 +108,8 @@ pub const NFT_MSG_DESTROYRULE: u8 = 28;
 pub const NFT_MSG_DESTROYSET: u8 = 29;
 /// Deletes elements, with no error if they are not there.
 pub const NFT_MSG_DESTROYSETELEM: u8 = 30;
+/// Deletes an object, with no error if it is not there.
+pub const NFT_MSG_DESTROYOBJ: u8 = 31;
 /// The number of messages, `NFT_MSG_MAX`.
 const NFT_MSG_MAX: usize = 34;
 
@@ -334,6 +345,8 @@ enum NftData {
     Value(Vec<u8>),
     /// A verdict, and the handle of the chain of `NFT_JUMP` and `NFT_GOTO`.
     Verdict { code: u32, chain: Option<u64> },
+    /// The handle of the object of an element of a map of objects.
+    Obj(u64),
 }
 
 /// The key of an element. A catch-all element has no key, and the end of an interval has the
@@ -444,6 +457,8 @@ struct NftSet {
     klen: u32,
     dtype: u32,
     dlen: u32,
+    /// The type of the objects of a map of objects, or 0.
+    objtype: u32,
     policy: u32,
     size: u32,
     field_len: Vec<u8>,
@@ -574,7 +589,8 @@ struct NftTable {
     nlpid: u32,
     chains: Vec<NftChain>,
     sets: Vec<NftSet>,
-    /// The last handle of a chain, a rule or a set, as `table->hgenerator`.
+    objs: Vec<NftObj>,
+    /// The last handle of a chain, a rule, a set or an object, as `table->hgenerator`.
     hgenerator: u64,
 }
 
@@ -586,7 +602,7 @@ impl NftTable {
 
     /// The number of objects in the table, as `table->use` of Linux.
     fn use_count(&self) -> u32 {
-        (self.chains.len() + self.sets.len()) as u32
+        (self.chains.len() + self.sets.len() + self.objs.len()) as u32
     }
 
     /// The number of rules and references of the chain `handle`, as `chain->use` of Linux.
@@ -613,8 +629,9 @@ impl NftTable {
     /// The set `handle` has a rule that looks it up, as `set->use` of Linux.
     fn set_in_use(&self, handle: u64) -> bool {
         self.chains.iter().flat_map(|c| c.rules.iter()).flat_map(|r| r.parsed.iter()).any(|e| {
-            matches!(e, NftExpr::Lookup { set, .. } | NftExpr::Dynset(NftDynset { set, .. })
-                    if *set == handle)
+            matches!(e, NftExpr::Lookup { set, .. }
+                | NftExpr::Dynset(NftDynset { set, .. })
+                | NftExpr::ObjrefMap { set, .. } if *set == handle)
         })
     }
 
@@ -727,6 +744,13 @@ static NF_TABLES_CB: [NfnlCallback; NFT_MSG_MAX] = {
     cb[NFT_MSG_DELSETELEM as usize] = batch(NFTA_SET_ELEM_LIST_MAX);
     cb[NFT_MSG_DESTROYSETELEM as usize] = batch(NFTA_SET_ELEM_LIST_MAX);
     cb[NFT_MSG_GETGEN as usize] = rcu(Some(nf_tables_getgen), None, 0);
+    cb[NFT_MSG_NEWOBJ as usize] = batch(NFTA_OBJ_MAX);
+    cb[NFT_MSG_GETOBJ as usize] =
+        rcu(Some(nf_tables_getobj), Some(nf_tables_dump_obj), NFTA_OBJ_MAX);
+    cb[NFT_MSG_DELOBJ as usize] = batch(NFTA_OBJ_MAX);
+    cb[NFT_MSG_GETOBJ_RESET as usize] =
+        rcu(Some(nf_tables_getobj), Some(nf_tables_dump_obj), NFTA_OBJ_MAX);
+    cb[NFT_MSG_DESTROYOBJ as usize] = batch(NFTA_OBJ_MAX);
     cb
 };
 
@@ -1027,6 +1051,9 @@ fn nf_tables_fill_set(
         b.put(NFTA_SET_DATA_TYPE as u16, &set.dtype.to_be_bytes())
             .put(NFTA_SET_DATA_LEN as u16, &set.dlen.to_be_bytes());
     }
+    if set.flags & NFT_SET_OBJECT != 0 {
+        b.put(NFTA_SET_OBJ_TYPE as u16, &set.objtype.to_be_bytes());
+    }
     if set.timeout != 0 {
         b.put(NFTA_SET_TIMEOUT as u16, &set.timeout.to_be_bytes());
     }
@@ -1071,6 +1098,8 @@ fn nft_data_dump(b: &mut Builder, attr: u32, data: &NftData, table: &NftTable) {
             }
             b.end_nest(v);
         }
+        // The object of an element goes in `NFTA_SET_ELEM_OBJREF`.
+        NftData::Obj(_) => {}
     }
     b.end_nest(nest);
 }
@@ -1090,8 +1119,12 @@ fn nf_tables_fill_setelem(
     if let Some(k) = &elem.key_end {
         nft_data_dump(b, NFTA_SET_ELEM_KEY_END, &NftData::Value(k.clone()), table);
     }
-    if let Some(d) = &elem.data {
-        nft_data_dump(b, NFTA_SET_ELEM_DATA, d, table);
+    match &elem.data {
+        Some(NftData::Obj(h)) => {
+            b.put(NFTA_SET_ELEM_OBJREF as u16, &cstr(table.obj_name(*h)));
+        }
+        Some(d) => nft_data_dump(b, NFTA_SET_ELEM_DATA, d, table),
+        None => {}
     }
     if elem.flags != 0 {
         b.put(NFTA_SET_ELEM_FLAGS as u16, &elem.flags.to_be_bytes());
@@ -1767,6 +1800,7 @@ impl NftBatch {
             nlpid: if flags & NFT_TABLE_F_OWNER != 0 { ctx.portid } else { 0 },
             chains: Vec::new(),
             sets: Vec::new(),
+            objs: Vec::new(),
             hgenerator: 0,
         });
         let t = self.tables.len() - 1;
@@ -1854,7 +1888,7 @@ impl NftBatch {
         Ok(())
     }
 
-    /// Removes a table with its rules, sets and chains, as `nft_flush_table` of Linux.
+    /// Removes a table with its rules, sets, objects and chains, as `nft_flush_table` of Linux.
     fn nft_flush_table(&mut self, ctx: &NftCtx, t: usize) {
         for c in 0..self.tables[t].chains.len() {
             while !self.tables[t].chains[c].rules.is_empty() {
@@ -1865,6 +1899,10 @@ impl NftBatch {
         while !self.tables[t].sets.is_empty() {
             self.notify_set(ctx, NFT_MSG_DELSET, t, 0);
             self.tables[t].sets.remove(0);
+        }
+        while !self.tables[t].objs.is_empty() {
+            self.notify_obj(ctx, NFT_MSG_DELOBJ, t, 0);
+            self.tables[t].objs.remove(0);
         }
         while !self.tables[t].chains.is_empty() {
             self.notify_chain(ctx, NFT_MSG_DELCHAIN, t, 0);
@@ -2306,11 +2344,8 @@ impl NftBatch {
         {
             return Err(Errno::EOPNOTSUPP);
         }
-        // The objects and the expressions of the sets come later.
-        if flags & (NFT_SET_OBJECT | NFT_SET_EXPR) != 0
-            || nla.has(NFTA_SET_EXPR)
-            || nla.has(NFTA_SET_EXPRESSIONS)
-        {
+        // The expressions of the sets come later.
+        if flags & NFT_SET_EXPR != 0 || nla.has(NFTA_SET_EXPR) || nla.has(NFTA_SET_EXPRESSIONS) {
             return Err(Errno::EOPNOTSUPP);
         }
         let (mut dtype, mut dlen) = (0, 0);
@@ -2335,9 +2370,13 @@ impl NftBatch {
         } else if flags & NFT_SET_MAP != 0 {
             return Err(Errno::EINVAL);
         }
-        if nla.has(NFTA_SET_OBJ_TYPE) {
-            return Err(Errno::EINVAL);
-        }
+        let objtype = match be32(nla, NFTA_SET_OBJ_TYPE)? {
+            Some(_) if flags & NFT_SET_OBJECT == 0 => return Err(Errno::EINVAL),
+            Some(ty) if ty == 0 || ty > NFT_OBJECT_MAX => return Err(Errno::EOPNOTSUPP),
+            Some(ty) => ty,
+            None if flags & NFT_SET_OBJECT != 0 => return Err(Errno::EINVAL),
+            None => 0,
+        };
         // The timeout and the interval of the garbage collection need `NFT_SET_TIMEOUT`.
         if flags & NFT_SET_TIMEOUT == 0
             && (nla.has(NFTA_SET_TIMEOUT) || nla.has(NFTA_SET_GC_INTERVAL))
@@ -2376,6 +2415,7 @@ impl NftBatch {
                     || set.flags != flags
                     || set.klen != klen
                     || set.dlen != dlen
+                    || set.objtype != objtype
                     || set.field_len != field_len
                     || set.timeout != timeout
                     || set.gc_int != gc_int
@@ -2402,6 +2442,7 @@ impl NftBatch {
             klen,
             dtype,
             dlen,
+            objtype,
             policy,
             size,
             field_len,
@@ -2486,11 +2527,16 @@ impl NftBatch {
         } else if ea.has(NFTA_SET_ELEM_DATA) {
             return Err(Errno::EINVAL);
         }
-        if ea.has(NFTA_SET_ELEM_OBJREF) {
+        if set.flags & NFT_SET_OBJECT != 0 {
+            if !ea.has(NFTA_SET_ELEM_OBJREF) && !end {
+                return Err(Errno::EINVAL);
+            }
+        } else if ea.has(NFTA_SET_ELEM_OBJREF) {
             return Err(Errno::EINVAL);
         }
         let extra = [
             NFTA_SET_ELEM_DATA,
+            NFTA_SET_ELEM_OBJREF,
             NFTA_SET_ELEM_TIMEOUT,
             NFTA_SET_ELEM_EXPIRATION,
             NFTA_SET_ELEM_USERDATA,
@@ -2530,6 +2576,9 @@ impl NftBatch {
         };
         let data = match ea.get(NFTA_SET_ELEM_DATA) {
             Some(d) => Some(nft_setelem_parse_data(table, set, d)?),
+            None if ea.has(NFTA_SET_ELEM_OBJREF) => {
+                Some(nft_setelem_parse_obj(table, &ea, set.objtype)?)
+            }
             None => None,
         };
         // A jump of an element of a verdict map that a chain looks up must not come back to
@@ -2763,6 +2812,8 @@ impl NfnlBatch for NftBatch {
             NFT_MSG_DELSET | NFT_MSG_DESTROYSET => self.nf_tables_delset(info, nla),
             NFT_MSG_NEWSETELEM => self.nf_tables_newsetelem(info, nla),
             NFT_MSG_DELSETELEM | NFT_MSG_DESTROYSETELEM => self.nf_tables_delsetelem(info, nla),
+            NFT_MSG_NEWOBJ => self.nf_tables_newobj(info, nla),
+            NFT_MSG_DELOBJ | NFT_MSG_DESTROYOBJ => self.nf_tables_delobj(info, nla),
             _ => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -2807,6 +2858,7 @@ impl NfnlBatch for NftBatch {
             **g = NftDynElems::default();
         }
         drop(dynamic);
+        nft_obj_commit(&mut tables);
         self.net.tables = tables;
         self.net.table_handle = self.table_handle;
         self.net.base_seq = self.next_seq;
@@ -2865,6 +2917,7 @@ mod tests {
             nlpid: 0,
             chains: Vec::new(),
             sets: Vec::new(),
+            objs: Vec::new(),
             hgenerator: 0,
         }
     }
@@ -2878,6 +2931,7 @@ mod tests {
             klen: 4,
             dtype: 0,
             dlen: 0,
+            objtype: 0,
             policy: 0,
             size: 0,
             field_len: Vec::new(),

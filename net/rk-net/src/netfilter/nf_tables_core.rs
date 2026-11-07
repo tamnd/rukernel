@@ -5,8 +5,9 @@
 //! `meta` load data of the packet, `immediate` loads a value or sets the verdict, `bitwise`
 //! masks a register, `cmp` and `lookup` end the rule when the data does not match, and
 //! `counter` counts the packets. The expressions here are `immediate`, `cmp`, `payload`,
-//! `meta`, `bitwise`, `counter`, `lookup`, `dynset`, `ct`, `nat`, `masq` and `redir`, and in
-//! nft_exprs.rs `byteorder`, `range`, `limit`, `log` and `reject`. `match` and `target` run
+//! `meta`, `bitwise`, `counter`, `lookup`, `dynset`, `ct`, `nat`, `masq` and `redir`, in
+//! nft_exprs.rs `byteorder`, `range`, `limit`, `log` and `reject`, and in nft_objects.rs
+//! `quota` and `objref`. `match` and `target` run
 //! the xtables extensions of nft_compat.rs. Another name gives `ENOENT`, as a module that
 //! Linux cannot load.
 //!
@@ -48,6 +49,8 @@ use rk_vfs::inode::Result;
 
 #[path = "nft_exprs.rs"]
 mod nft_exprs;
+#[path = "nft_objects.rs"]
+mod nft_objects;
 
 #[cfg(test)]
 pub(crate) use self::nft_exprs::nft_log_line;
@@ -57,6 +60,14 @@ use self::nft_exprs::{
     nft_reject_init,
 };
 pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
+pub(super) use self::nft_objects::{
+    NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftObj, nf_tables_dump_obj, nf_tables_getobj, nft_obj_commit,
+    nft_setelem_parse_obj,
+};
+use self::nft_objects::{
+    NFTA_OBJREF_SET_ID, NFTA_OBJREF_SET_NAME, NftObjState, NftQuota, nft_obj_eval, nft_objref_init,
+    nft_quota_eval, nft_quota_init,
+};
 
 // The attributes of an expression, `NFTA_EXPR_*`.
 const NFTA_EXPR_NAME: u32 = 1;
@@ -263,6 +274,13 @@ pub(super) enum NftExpr {
     Range(NftRange),
     /// `limit`, as nft_limit.c. The copies of the rule share the bucket.
     Limit(Arc<NftLimit>),
+    /// `quota`, as nft_quota.c. The copies of the rule share the bytes.
+    Quota(Arc<NftQuota>),
+    /// `objref` with the object `obj` (a handle), as nft_objref.c.
+    Objref { obj: u64 },
+    /// `objref` with the object of the element of the key of the packet in the map of objects
+    /// `set` (a handle).
+    ObjrefMap { set: u64, sreg: usize, len: usize },
     /// `log`, as nft_log.c.
     Log(NftLog),
     /// `reject`, as nft_reject.c.
@@ -419,7 +437,8 @@ fn nla_raw(b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
 }
 
 /// The bytes of an expression of a rule in a dump, from `nla`, the bytes that the rule gave, as
-/// the `dump` of each expression of Linux. A `lookup` and a `dynset` give the name of their set:
+/// the `dump` of each expression of Linux. A `lookup`, a `dynset` and an `objref` with a map
+/// give the name of their set:
 /// the rule can give a name with `%d` or only the ID of the set in the batch, as `nft` does for
 /// an anonymous set, and `nft` then finds the set in the dump with its real name. The ID is not
 /// in the dump. The other expressions give the bytes of the rule.
@@ -427,6 +446,7 @@ pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec
     let (set, name_ty, id_ty) = match expr {
         NftExpr::Lookup { set, .. } => (*set, NFTA_LOOKUP_SET, NFTA_LOOKUP_SET_ID),
         NftExpr::Dynset(d) => (d.set, NFTA_DYNSET_SET_NAME, NFTA_DYNSET_SET_ID),
+        NftExpr::ObjrefMap { set, .. } => (*set, NFTA_OBJREF_SET_NAME, NFTA_OBJREF_SET_ID),
         _ => return nla.to_vec(),
     };
     let Some(set) = table.sets.iter().find(|s| s.handle == set) else { return nla.to_vec() };
@@ -595,10 +615,6 @@ pub(super) fn nf_tables_expr_parse(
             }
             let s = nft_set_lookup_global(table, name, be32(&a, NFTA_LOOKUP_SET_ID)?)?;
             let set = &table.sets[s];
-            if set.flags & NFT_SET_OBJECT != 0 {
-                // The maps of objects come later.
-                return Err(Errno::EOPNOTSUPP);
-            }
             let len = set.klen as usize;
             let sreg = nft_parse_register(&a, NFTA_LOOKUP_SREG, len)?;
             let flags = be32(&a, NFTA_LOOKUP_FLAGS)?.unwrap_or(0);
@@ -636,6 +652,8 @@ pub(super) fn nf_tables_expr_parse(
         b"byteorder" => Ok(NftExpr::Byteorder(nft_byteorder_init(data)?)),
         b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
+        b"quota" => Ok(NftExpr::Quota(nft_quota_init(data)?)),
+        b"objref" => nft_objref_init(table, data),
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
         b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
@@ -978,9 +996,29 @@ pub(super) fn nft_table_validate(table: &NftTable) -> Result<()> {
 #[derive(Debug)]
 enum ProgExpr {
     Expr(NftExpr),
-    Verdict { code: u32, chain: usize },
-    Lookup { set: usize, sreg: usize, len: usize, invert: bool, dreg: Option<usize> },
-    Dynset { set: usize, d: NftDynset },
+    Verdict {
+        code: u32,
+        chain: usize,
+    },
+    Lookup {
+        set: usize,
+        sreg: usize,
+        len: usize,
+        invert: bool,
+        dreg: Option<usize>,
+    },
+    Dynset {
+        set: usize,
+        d: NftDynset,
+    },
+    /// `objref` with its object.
+    Obj(NftObjState),
+    /// `objref` with a map of objects.
+    ObjMap {
+        set: usize,
+        sreg: usize,
+        len: usize,
+    },
 }
 
 /// The data of an element of a set in a program.
@@ -993,6 +1031,8 @@ enum ProgData {
     Value(Vec<u8>),
     /// The verdict of an element of a verdict map, with the chain as an index in the program.
     Verdict { code: u32, chain: usize },
+    /// The object of an element of a map of objects.
+    Obj(NftObjState),
 }
 
 /// The elements of a set, for `lookup` and `dynset`.
@@ -1205,6 +1245,11 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
         Some(NftData::Verdict { code, chain }) => {
             ProgData::Verdict { code: *code, chain: chain.map_or(0, |h| chains.index(h)) }
         }
+        Some(NftData::Obj(h)) => table
+            .objs
+            .iter()
+            .find(|o| o.handle == *h)
+            .map_or(ProgData::None, |o| ProgData::Obj(o.state().clone())),
         None => ProgData::None,
     };
     if set.flags & NFT_SET_INTERVAL != 0 {
@@ -1282,6 +1327,15 @@ pub(super) fn nft_prog(table: &NftTable, c: usize) -> NftProg {
                         set: set_index(d.set, &mut prog, &mut chains),
                         d: d.clone(),
                     },
+                    NftExpr::Objref { obj } => match table.objs.iter().find(|o| o.handle == *obj) {
+                        Some(o) => ProgExpr::Obj(o.state().clone()),
+                        None => ProgExpr::Expr(e.clone()),
+                    },
+                    NftExpr::ObjrefMap { set, sreg, len } => ProgExpr::ObjMap {
+                        set: set_index(*set, &mut prog, &mut chains),
+                        sreg: *sreg,
+                        len: *len,
+                    },
                     e => ProgExpr::Expr(e.clone()),
                 });
             }
@@ -1343,6 +1397,15 @@ fn nft_eval(
             }
         }
         ProgExpr::Dynset { set, d } => nft_dynset_eval(d, &prog.sets[*set], regs),
+        ProgExpr::Obj(o) => nft_obj_eval(o, regs, skb),
+        // As `nft_objref_map_eval` of Linux: a key with no element ends the rule.
+        ProgExpr::ObjMap { set, sreg, len } => {
+            let found = prog.sets[*set].find(&regs.data[*sreg..*sreg + *len]);
+            match found {
+                Some(ProgData::Obj(o)) => nft_obj_eval(&o, regs, skb),
+                _ => regs.verdict = NFT_BREAK,
+            }
+        }
         ProgExpr::Expr(e) => match e {
             NftExpr::Immediate { dreg, data: NftImm::Value(v) } => regs.store(*dreg, v),
             NftExpr::Immediate { data: NftImm::Verdict { code, .. }, .. } => regs.verdict = *code,
@@ -1453,7 +1516,10 @@ fn nft_eval(
                 packets.fetch_add(1, Ordering::Relaxed);
                 bytes.fetch_add(skb.len() as u64, Ordering::Relaxed);
             }
-            NftExpr::Lookup { .. } | NftExpr::Dynset(_) => regs.verdict = NFT_BREAK,
+            NftExpr::Lookup { .. }
+            | NftExpr::Dynset(_)
+            | NftExpr::Objref { .. }
+            | NftExpr::ObjrefMap { .. } => regs.verdict = NFT_BREAK,
             NftExpr::Ct { key, dir, len, dreg } => match nft_ct_get(*key, *dir, *len, skb) {
                 Some(v) => regs.store(*dreg, &v),
                 None => regs.verdict = NFT_BREAK,
@@ -1500,6 +1566,7 @@ fn nft_eval(
             NftExpr::Byteorder(b) => nft_byteorder_eval(b, regs),
             NftExpr::Range(r) => nft_range_eval(r, regs),
             NftExpr::Limit(l) => nft_limit_eval(l, regs, skb),
+            NftExpr::Quota(q) => nft_quota_eval(q, regs, skb),
             NftExpr::Log(l) => nft_log_eval(l, skb, state),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {
