@@ -41,8 +41,8 @@ const DATA_FRAMES: usize = 128;
 const SECTORS_PER_FRAME: usize = PAGE_SIZE / SECTOR_SIZE;
 
 /// Starts the driver for the disk number `index` on the transport `t`, and gives the name of the
-/// disk and the kind of its interrupt.
-pub(crate) fn probe(mut t: Transport, index: u32) -> Option<(String, String)> {
+/// disk and the kind of its interrupt. `bus` is the number of the virtio device.
+pub(crate) fn probe(mut t: Transport, index: u32, bus: u32) -> Option<(String, String)> {
     if index >= 26 {
         t.fail();
         return None;
@@ -77,7 +77,9 @@ pub(crate) fn probe(mut t: Transport, index: u32) -> Option<(String, String)> {
         state: SpinLock::new(State { t, queue, req, data }),
     };
     let name = format!("vd{}", char::from(b'a' + index as u8));
-    register_block(makedev(crate::VIRTBLK_MAJOR, index * 16), &name, Arc::new(disk));
+    let rdev = makedev(crate::VIRTBLK_MAJOR, index * 16);
+    rk_vfs::bus::set_block_parent(rdev, bus);
+    register_block(rdev, &name, Arc::new(disk));
     Some((name, kind))
 }
 

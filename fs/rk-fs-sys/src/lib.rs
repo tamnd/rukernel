@@ -45,9 +45,11 @@
 //!   tag of kernfs in fs/sysfs/mount.c of Linux. The mount shows only the interfaces of that
 //!   namespace, and a mount in another namespace is another file system.
 //!
-//! Linux puts a device of a class below the directory of its parent on a bus. This kernel puts
-//! the devices of the classes in `/sys/devices/virtual`. A program that follows the links does
-//! not see the difference.
+//! Linux puts a device of a class below the directory of its parent on a bus. This kernel does
+//! that for the disks and the interfaces of the virtio devices, as
+//! `/sys/devices/pci0000:00/0000:00:02.0/virtio1/block/vda`, with the module `placed`. udev
+//! reads the parents for the names of `path_id` and `net_id`. The other devices of the classes
+//! are in `/sys/devices/virtual`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -59,6 +61,7 @@ mod cpu;
 mod firmware;
 pub mod kfs;
 mod mm;
+mod placed;
 
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -301,9 +304,10 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
     if d.is_up() {
         out.push(file("carrier", format!("{}\n", u8::from(d.carrier()))));
     }
+    out.extend([file("dev_id", String::from("0x0\n")), file("dev_port", String::from("0\n"))]);
+    let path = placed::net_path(d);
+    out.extend(placed::device_link(&path));
     out.extend([
-        file("dev_id", String::from("0x0\n")),
-        file("dev_port", String::from("0\n")),
         file("dormant", String::from("0\n")),
         file("flags", format!("{flags:#x}\n")),
         file("ifindex", format!("{index}\n")),
@@ -311,7 +315,10 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
         file("mtu", format!("{}\n", d.mtu())),
         file("operstate", format!("{}\n", OPERSTATES[usize::from(d.operstate()).min(6)])),
         (String::from("statistics"), Kind::Dir),
-        (String::from("subsystem"), Kind::Link(b"../../../../class/net".to_vec())),
+        (
+            String::from("subsystem"),
+            Kind::Link(format!("{}class/net", placed::up(&path)).into_bytes()),
+        ),
         file("tx_queue_len", format!("{}\n", d.txqlen())),
         file("type", format!("{}\n", d.kind().arphrd())),
         file("uevent", format!("INTERFACE={}\nIFINDEX={index}\n", d.name())),
@@ -332,8 +339,10 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     if d.block {
         uevent.push_str("DEVTYPE=disk\n");
     }
+    let path = rk_vfs::uevent::devpath(d);
     let mut out = Vec::new();
     out.push((String::from("dev"), Kind::File(format!("{}\n", numbers(d)).into_bytes())));
+    out.extend(placed::device_link(&path));
     if d.block {
         let size = block_sectors(d.rdev).unwrap_or(0);
         let ro = block_queue(d.rdev).is_some_and(|q| q.read_only());
@@ -351,7 +360,7 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
         let stat = format!("{}\n", stat.join(" "));
         out.push((String::from("stat"), Kind::File(stat.into_bytes())));
     }
-    let subsystem = format!("../../../../class/{}", d.class);
+    let subsystem = format!("{}class/{}", placed::up(&path), d.class);
     out.push((String::from("subsystem"), Kind::Link(subsystem.into_bytes())));
     out.push((String::from("uevent"), Kind::File(uevent.into_bytes())));
     out
@@ -397,6 +406,12 @@ fn input_entries(list: Vec<(String, rk_vfs::input::SysEntry)>) -> Vec<(String, K
         .collect()
 }
 
+/// The device of `list` with the directory `/sys/devices/virtual/CLASS/NAME`.
+fn virtual_device<'a>(list: &'a [DeviceInfo], class: &str, name: &str) -> Option<&'a DeviceInfo> {
+    let found = list.iter().find(|d| d.class == class && node_name(d) == name)?;
+    placed::is_virtual(&rk_vfs::uevent::devpath(found)).then_some(found)
+}
+
 /// The entries of the directory at `path`, from the list of devices `list`. Gives `None` if no
 /// directory has the path.
 ///
@@ -410,11 +425,11 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         classes.insert(DMI);
     }
     let fdt = rk_frame::firmware::device_tree();
-    let net = ns.upgrade().map_or_else(Vec::new, |ns| {
-        let _in = rk_net::ns::enter(&ns);
-        rk_net::dev::devices()
-    });
-    let net_dev = |name: &str| net.iter().find(|d| d.name() == name).cloned();
+    let net = placed::net_devices(ns);
+    // The interfaces in `/sys/devices/virtual/net`.
+    let net_dev = |name: &str| {
+        net.iter().find(|d| d.name() == name && placed::is_virtual(&placed::net_path(d))).cloned()
+    };
     let parts: Vec<&str> = if path.is_empty() { Vec::new() } else { path.split('/').collect() };
     let dirs = |names: &mut dyn Iterator<Item = &str>| -> Vec<(String, Kind)> {
         names.map(|n| (String::from(n), Kind::Dir)).collect()
@@ -434,7 +449,7 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         ["class", NET] => net
             .iter()
             .map(|d| {
-                let to = format!("../../devices/virtual/{NET}/{}", d.name());
+                let to = format!("../..{}", placed::net_path(d));
                 (d.name(), Kind::Link(to.into_bytes()))
             })
             .collect(),
@@ -472,7 +487,10 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         ["firmware", "devicetree"] if fdt.is_some() => dirs(&mut ["base"].into_iter()),
         ["firmware", "devicetree", "base", ref rest @ ..] => firmware::fdt_entries(fdt?, rest)?,
         ["devices", "virtual", INPUT, ref rest @ ..] => input_entries(rk_vfs::input::sysfs(rest)?),
-        ["devices", "virtual", NET] => net.iter().map(|d| (d.name(), Kind::Dir)).collect(),
+        ["devices", "virtual", NET] => {
+            let here = net.iter().filter(|d| placed::is_virtual(&placed::net_path(d)));
+            here.map(|d| (d.name(), Kind::Dir)).collect()
+        }
         ["devices", "virtual", NET, name] => net_entries(&*net_dev(name)?),
         ["devices", "virtual", NET, name, "statistics"] => net_statistics(&*net_dev(name)?),
         ["class", class] => list
@@ -493,24 +511,28 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
             dirs(&mut names.into_iter())
         }
         ["devices", top, ..] if bus::devices_top().iter().any(|t| *t == top) => {
-            bus::devices_entries(&parts[1..])?
+            let below = placed::all(list, &net);
+            if let Some(out) = placed::entries(path, &below) {
+                return Some(out);
+            }
+            let mut out = bus::devices_entries(&parts[1..])?;
+            out.extend(placed::classes(path, &below));
+            out
         }
         ["bus", ref rest @ ..] => bus::bus_entries(rest)?,
         ["module", ref rest @ ..] => bus::module_entries(rest)?,
         ["devices", "system", ref rest @ ..] => cpu::entries(rk_frame::cpu::count(), rest)?,
         ["devices", "virtual", class] if classes.contains(class) => list
             .iter()
-            .filter(|d| d.class == class)
+            .filter(|d| d.class == class && placed::is_virtual(&rk_vfs::uevent::devpath(d)))
             .map(|d| (String::from(node_name(d)), Kind::Dir))
             .collect(),
-        ["devices", "virtual", class, name] => {
-            device_entries(list.iter().find(|d| d.class == class && node_name(d) == name)?)
+        ["devices", "virtual", class, name] => device_entries(virtual_device(list, class, name)?),
+        ["devices", "virtual", class, name, "queue"] => {
+            queue_entries(virtual_device(list, class, name).filter(|d| d.block)?)
         }
-        ["devices", "virtual", class, name, "queue"] => queue_entries(
-            list.iter().find(|d| d.class == class && node_name(d) == name && d.block)?,
-        ),
         ["devices", "virtual", class, name, "loop"] => {
-            let d = list.iter().find(|d| d.class == class && node_name(d) == name && d.block)?;
+            let d = virtual_device(list, class, name).filter(|d| d.block)?;
             let files = rk_vfs::loopdev::sysfs_files(d.rdev)?;
             files
                 .into_iter()
@@ -569,7 +591,9 @@ impl Inode for Node {
     fn metadata(&self) -> Metadata {
         let (kind, perm, nlink, size) = match &self.kind {
             Kind::Dir => (mode::S_IFDIR, 0o755, 2, 0),
-            Kind::File(_) if writable(&self.path) => (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64),
+            Kind::File(_) if writable(&self.path) || placed::is_uevent(&self.path, &self.net) => {
+                (mode::S_IFREG, 0o644, 1, BLOCK_SIZE as u64)
+            }
             // The binary files of the firmware have their size, as the `bin_attribute` of Linux.
             Kind::File(text) if self.path.starts_with("firmware/") => {
                 let perm = if firmware::private(&self.path) { 0o400 } else { 0o444 };
@@ -629,6 +653,9 @@ impl Inode for Node {
             Kind::Mm { writable: true } => mm::write(&self.path, buf),
             Kind::File(_) if uevent_device(&self.path).is_some() => {
                 write_uevent(&self.path, &self.net, buf).map(|()| buf.len())
+            }
+            Kind::File(_) if placed::is_uevent(&self.path, &self.net) => {
+                placed::write_uevent(&self.path, &self.net, buf).map(|()| buf.len())
             }
             Kind::File(_) if bus::is_uevent(&self.path) => {
                 bus::write_uevent(&self.path, buf).map(|()| buf.len())
@@ -828,6 +855,63 @@ mod tests {
             write_uevent("devices/virtual/mem/null/uevent", &init(), b"go"),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn a_disk_of_a_virtio_device_is_in_its_directory() {
+        use rk_vfs::bus::{PciFunction, Transport, VirtioDevice};
+        rk_vfs::bus::add_pci(PciFunction {
+            bus: 0,
+            slot: 5,
+            function: 0,
+            vendor: 0x1af4,
+            device: 0x1001,
+            class: 0x01_0000,
+            revision: 0,
+            subsystem_vendor: 0x1af4,
+            subsystem_device: 2,
+            irq: 10,
+            driver: Some("virtio-pci"),
+        });
+        rk_vfs::bus::add_virtio(VirtioDevice {
+            index: 21,
+            transport: Transport::Pci(0, 5, 0),
+            device: 2,
+            vendor: 0x1af4,
+            driver: Some("virtio_blk"),
+        });
+        rk_vfs::bus::set_block_parent(makedev(254, 32), 21);
+        let mut list = list();
+        list.push(DeviceInfo {
+            name: String::from("vdc"),
+            class: "block",
+            rdev: makedev(254, 32),
+            block: true,
+            perm: 0o660,
+        });
+        let ent = |path: &str| entries(path, &list, &init());
+        let has = |path: &str, name: &str| ent(path).unwrap().iter().any(|(n, _)| n == name);
+        let get = |path: &str, name: &str| {
+            ent(path).unwrap().into_iter().find(|(n, _)| n == name).unwrap().1
+        };
+        let dir = "devices/pci0000:00/0000:00:05.0/virtio21";
+        assert!(has(dir, "block"));
+        assert!(has(dir, "modalias"));
+        let names: Vec<String> =
+            ent(&format!("{dir}/block")).unwrap().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["vdc"]);
+        let vdc = format!("{dir}/block/vdc");
+        assert_eq!(get(&vdc, "device"), Kind::Link(b"../../../virtio21".to_vec()));
+        assert_eq!(get(&vdc, "subsystem"), Kind::Link(b"../../../../../../class/block".to_vec()));
+        assert_eq!(get(&vdc, "dev"), Kind::File(b"254:32\n".to_vec()));
+        assert!(has(&format!("{vdc}/queue"), "logical_block_size"));
+        assert_eq!(get("block", "vdc"), Kind::Link(format!("../{vdc}").into_bytes()));
+        assert_eq!(get("dev/block", "254:32"), Kind::Link(format!("../../{vdc}").into_bytes()));
+        assert!(!has("devices/virtual/block", "vdc"));
+        assert!(has("devices/virtual/block", "vda"));
+        assert_eq!(ent("devices/virtual/block/vdc"), None);
+        assert_eq!(ent(&format!("{dir}/block/vdd")), None);
+        assert!(!has("devices/virtual/block/vda", "device"));
     }
 
     #[test]

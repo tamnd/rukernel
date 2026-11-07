@@ -3,6 +3,10 @@
 //!
 //! The drivers give the lists when they start. sysfs reads them, as drivers/pci/pci-sysfs.c,
 //! drivers/base/platform.c and drivers/virtio/virtio.c of Linux show them.
+//!
+//! A disk of a virtio device has its directory in the directory of the virtio device, as
+//! `/devices/pci0000:00/0000:00:02.0/virtio1/block/vda`. [`set_block_parent`] gives the virtio
+//! device of a disk.
 
 use alloc::format;
 use alloc::string::String;
@@ -173,10 +177,17 @@ struct Buses {
     pci: Vec<PciFunction>,
     platform: Vec<PlatformDevice>,
     virtio: Vec<VirtioDevice>,
+    /// The number of the block device and the number of its virtio device, for each disk of a
+    /// virtio device.
+    disks: Vec<(u64, u32)>,
 }
 
-static BUSES: SpinLock<Buses> =
-    SpinLock::new(Buses { pci: Vec::new(), platform: Vec::new(), virtio: Vec::new() });
+static BUSES: SpinLock<Buses> = SpinLock::new(Buses {
+    pci: Vec::new(),
+    platform: Vec::new(),
+    virtio: Vec::new(),
+    disks: Vec::new(),
+});
 
 /// Adds a function on the PCI bus. A function with the same name is changed.
 pub fn add_pci(f: PciFunction) {
@@ -200,6 +211,39 @@ pub fn add_virtio(d: VirtioDevice) {
     b.virtio.retain(|g| g.index != d.index);
     b.virtio.push(d);
     b.virtio.sort_by_key(|g| g.index);
+}
+
+/// Puts the block device with the number `rdev` below the virtio device with the number `index`.
+/// The driver calls it before it adds the disk, so the event of the disk has the path of Linux.
+pub fn set_block_parent(rdev: u64, index: u32) {
+    let mut b = BUSES.lock();
+    b.disks.retain(|&(r, _)| r != rdev);
+    b.disks.push((rdev, index));
+}
+
+/// The path of the directory of the virtio device of the block device `rdev` below `/sys`, if
+/// the disk is on a virtio device.
+#[must_use]
+pub fn block_parent(rdev: u64) -> Option<String> {
+    let b = BUSES.lock();
+    let &(_, index) = b.disks.iter().find(|&&(r, _)| r == rdev)?;
+    let d = b.virtio.iter().find(|d| d.index == index)?.clone();
+    drop(b);
+    Some(virtio_path(&d))
+}
+
+/// The path of the directory of the virtio device with the name `name` below `/sys`, as
+/// `/devices/pci0000:00/0000:00:03.0/virtio2`.
+#[must_use]
+pub fn virtio_named(name: &str) -> Option<String> {
+    let d = virtio().into_iter().find(|d| d.name() == name)?;
+    Some(virtio_path(&d))
+}
+
+/// The path of the directory of the virtio device `d` below `/sys`.
+#[must_use]
+pub fn virtio_path(d: &VirtioDevice) -> String {
+    format!("{}/{}", transport_path(d.transport), d.name())
 }
 
 /// The functions on the PCI bus, in the order of the bus.
@@ -281,6 +325,7 @@ mod tests {
         };
         assert_eq!(v.modalias(), "virtio:d00000001v00001AF4");
         assert_eq!(transport_path(v.transport), "/devices/pci0000:00/0000:00:02.0");
+        assert_eq!(virtio_path(&v), "/devices/pci0000:00/0000:00:02.0/virtio0");
         let p = PlatformDevice {
             phys: 0xa00_0000,
             node: "virtio_mmio",
@@ -289,5 +334,26 @@ mod tests {
         };
         assert_eq!(p.name(), "a000000.virtio_mmio");
         assert_eq!(p.modalias(), "of:Nvirtio_mmioT(null)Cvirtio,mmio");
+    }
+
+    #[test]
+    fn a_disk_is_below_its_virtio_device() {
+        add_virtio(VirtioDevice {
+            index: 41,
+            transport: Transport::Pci(0, 9, 0),
+            device: 2,
+            vendor: 0x1af4,
+            driver: Some("virtio_blk"),
+        });
+        set_block_parent(0xfe_0000_00f0, 41);
+        assert_eq!(
+            block_parent(0xfe_0000_00f0).as_deref(),
+            Some("/devices/pci0000:00/0000:00:09.0/virtio41")
+        );
+        assert_eq!(
+            virtio_named("virtio41").as_deref(),
+            Some("/devices/pci0000:00/0000:00:09.0/virtio41")
+        );
+        assert_eq!(block_parent(0xfe_0000_00e0), None);
     }
 }

@@ -4892,6 +4892,25 @@ static void test_sysfs(void)
 			      strstr(buf, "DEVNAME=vda\nDEVTYPE=disk\n") != NULL);
 		check("sysfs has the size of vda",
 		      read_small("/sys/class/block/vda/size", buf, sizeof(buf)) > 0 && atol(buf) > 0);
+		/* As on Linux, the disk is below its virtio device, where path_id of udev looks. */
+		n = readlink("/sys/block/vda", buf, sizeof(buf) - 1);
+		check("/sys/block/vda is below its virtio device",
+		      n > 0 && (buf[n] = 0, strstr(buf, "/virtio") != NULL) && strstr(buf, "/block/vda") != NULL);
+		check("/sys/block/vda/device is the virtio device",
+		      read_small("/sys/block/vda/device/modalias", buf, sizeof(buf)) > 0 &&
+			      strncmp(buf, "virtio:d00000002", 16) == 0);
+		fd = open("/sys/block/vda/uevent", O_WRONLY);
+		check("the uevent of vda takes a write", fd >= 0 && write(fd, "change", 6) == 6);
+		if (fd >= 0)
+			close(fd);
+	}
+	if (stat("/sys/class/net/eth0", &st) == 0) {
+		n = readlink("/sys/class/net/eth0", buf, sizeof(buf) - 1);
+		check("/sys/class/net/eth0 is below its virtio device",
+		      n > 0 && (buf[n] = 0, strstr(buf, "/virtio") != NULL) && strstr(buf, "/net/eth0") != NULL);
+		check("/sys/class/net/eth0/device is the virtio device",
+		      read_small("/sys/class/net/eth0/device/modalias", buf, sizeof(buf)) > 0 &&
+			      strncmp(buf, "virtio:d00000001", 16) == 0);
 	}
 	test_sysfs_cpu();
 	test_sysfs_firmware();
