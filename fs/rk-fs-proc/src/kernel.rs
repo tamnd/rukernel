@@ -579,6 +579,9 @@ const SYSCTLS: &[(&str, &str)] = &[
     ("fs/inotify/max_queued_events", ""),
     ("fs/inotify/max_user_instances", ""),
     ("fs/inotify/max_user_watches", ""),
+    ("fs/fanotify/max_queued_events", ""),
+    ("fs/fanotify/max_user_groups", ""),
+    ("fs/fanotify/max_user_marks", ""),
     ("fs/lease-break-time", ""),
     ("fs/leases-enable", ""),
     ("fs/pipe-max-size", ""),
@@ -712,9 +715,13 @@ fn protected(name: &str) -> Option<(&'static AtomicU32, u32)> {
     use rk_vfs::cred::protected::{FIFOS, HARDLINKS, REGULAR, SYMLINKS};
     use rk_vfs::lease::{BREAK_TIME, ENABLE};
     use rk_vfs::notify::inotify::{MAX_QUEUED_EVENTS, MAX_USER_INSTANCES, MAX_USER_WATCHES};
-    // The inotify limits go from 0 to `INT_MAX`, as `inotify_table` of Linux.
+    // The inotify and fanotify limits go from 0 to `INT_MAX`, as `inotify_table` and
+    // `fanotify_table` of Linux.
     const INT_MAX: u32 = i32::MAX as u32;
     match name {
+        "fs/fanotify/max_queued_events" => {
+            Some((&rk_vfs::notify::fanotify::MAX_QUEUED_EVENTS, INT_MAX))
+        }
         "fs/inotify/max_queued_events" => Some((&MAX_QUEUED_EVENTS, INT_MAX)),
         "fs/inotify/max_user_instances" => Some((&MAX_USER_INSTANCES, INT_MAX)),
         "fs/inotify/max_user_watches" => Some((&MAX_USER_WATCHES, INT_MAX)),
@@ -788,9 +795,21 @@ fn uts_name(name: &str) -> Option<fn() -> rk_proc::uts::Field> {
 
 /// The limit of the `user.max_*` sysctl `name` in the user namespace of the caller, as the
 /// `ucount_sysctls` of Linux. In the first namespace, the inotify limits are those of
-/// `fs.inotify`, as Linux keeps them in the same place.
+/// `fs.inotify`, as Linux keeps them in the same place. `fs.fanotify.max_user_groups` and
+/// `fs.fanotify.max_user_marks` are the fanotify limits of the first namespace, as
+/// `fanotify_table` of Linux.
 fn user_limit(name: &str) -> Option<(Arc<rk_vfs::user_ns::UserNs>, rk_vfs::user_ns::UcountKind)> {
-    let kind = rk_vfs::user_ns::UcountKind::by_name(name.strip_prefix("user/")?)?;
+    use rk_vfs::user_ns::UcountKind;
+    match name {
+        "fs/fanotify/max_user_groups" => {
+            return Some((rk_vfs::user_ns::init().clone(), UcountKind::FanotifyGroups));
+        }
+        "fs/fanotify/max_user_marks" => {
+            return Some((rk_vfs::user_ns::init().clone(), UcountKind::FanotifyMarks));
+        }
+        _ => {}
+    }
+    let kind = UcountKind::by_name(name.strip_prefix("user/")?)?;
     Some((rk_vfs::cred::current().user_ns.clone(), kind))
 }
 

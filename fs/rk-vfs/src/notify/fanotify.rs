@@ -19,12 +19,13 @@ use super::{Found, FsEvent, Group, Mark, Object, add_object_mark, destroy_mark, 
 use crate::dentry::Location;
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::Result;
+use crate::user_ns::{Charge, UcountKind};
 use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::fanotify::{
     FAN_ALLOW, FAN_AUDIT, FAN_DENY, FAN_ENABLE_AUDIT, FAN_ERRNO_MASK, FAN_ERRNO_SHIFT,
@@ -33,7 +34,7 @@ use rk_abi::native::fanotify::{
     FAN_INFO, FAN_MARK_EVICTABLE, FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK,
     FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET,
     FAN_REPORT_DIR_FID, FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_NAME,
-    FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FANOTIFY_METADATA_VERSION,
+    FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FANOTIFY_METADATA_VERSION,
 };
 use rk_abi::native::open as o;
 use rk_abi::native::types::{FanotifyEventMetadata, FanotifyResponse};
@@ -77,8 +78,9 @@ const FID_USER_EVENTS: u32 = USER_EVENTS | INODE_EVENTS | FAN_ONDIR;
 /// `FANOTIFY_FID_INFO_HDR_LEN` of Linux.
 const FID_INFO_HDR_LEN: usize = 20;
 
-/// The most events in the queue, without `FAN_UNLIMITED_QUEUE`.
-pub const MAX_EVENTS: usize = 16384;
+/// `fs.fanotify.max_queued_events`: the most events in the queue of a new group without
+/// `FAN_UNLIMITED_QUEUE`.
+pub static MAX_QUEUED_EVENTS: AtomicU32 = AtomicU32::new(16384);
 
 /// The events after which the merge stops, `FANOTIFY_MAX_MERGE_EVENTS` of Linux.
 const MAX_MERGE: usize = 128;
@@ -216,6 +218,11 @@ struct State {
     /// The permission events that a read gave, by the descriptor of the event.
     access: Vec<(i32, Arc<Perm>)>,
     marks: Vec<Arc<Mark>>,
+    /// The count of the group for its user, `fanotify_data.ucounts` of Linux.
+    charge: Option<Charge>,
+    /// The counts of the marks for the user of the group, one for each mark. A group with
+    /// `FAN_UNLIMITED_MARKS` has none.
+    mark_charges: Vec<Charge>,
     /// The file of the group is closed: no event goes in the queue.
     closed: bool,
 }
@@ -573,11 +580,22 @@ impl Fanotify {
             }
             None => {
                 let group: Arc<dyn Group> = self.me.upgrade().ok_or(Errno::EBADF)?;
+                // Each mark counts for the user of the group in all the namespaces above it, as
+                // `fanotify_add_new_mark` of Linux.
+                let charge = match &self.state.lock().charge {
+                    Some(c) if self.flags & FAN_UNLIMITED_MARKS == 0 => {
+                        Some(c.again(UcountKind::FanotifyMarks).ok_or(Errno::ENOSPC)?)
+                    }
+                    _ => None,
+                };
                 let mark = add_object_mark(group, object, 0, 0);
                 if flags & FAN_MARK_EVICTABLE != 0 {
                     mark.set_flags(mark_flags::NO_IREF);
                 }
-                self.state.lock().marks.push(mark.clone());
+                let mut st = self.state.lock();
+                st.marks.push(mark.clone());
+                st.mark_charges.extend(charge);
+                drop(st);
                 mark
             }
         };
@@ -683,6 +701,8 @@ impl Fanotify {
                 }
             }
             st.overflow = false;
+            st.mark_charges.clear();
+            st.charge = None;
             (perms, core::mem::take(&mut st.marks))
         };
         for perm in &perms {
@@ -740,7 +760,12 @@ impl Group for Fanotify {
     fn handle_event(&self, _mark: &Arc<Mark>, _mask: u32, _name: Option<&[u8]>, _cookie: u32) {}
 
     fn freeing_mark(&self, mark: &Arc<Mark>) {
-        self.state.lock().marks.retain(|m| !Arc::ptr_eq(m, mark));
+        let mut st = self.state.lock();
+        let before = st.marks.len();
+        st.marks.retain(|m| !Arc::ptr_eq(m, mark));
+        if st.marks.len() < before {
+            st.mark_charges.pop();
+        }
     }
 
     fn wants_paths(&self) -> bool {
@@ -863,20 +888,34 @@ impl FanotifyFile {
     /// Makes a new group, as `fanotify_init` of Linux after the checks of the flags. `flags` are
     /// the flags of the group, `f_flags` the flags of the files of the events, and `priority` the
     /// class: 0 for notification, 1 for content and 2 for pre-content.
-    /// `unpriv` tells that a user without `CAP_SYS_ADMIN` makes the group.
-    pub fn new(flags: u32, f_flags: u32, priority: u32, unlimited: bool, unpriv: bool) -> Self {
+    /// `unpriv` tells that a user without `CAP_SYS_ADMIN` makes the group, and `charge` is the
+    /// count of the group for its user. The marks of the group then count for the same user.
+    pub fn new(
+        flags: u32,
+        f_flags: u32,
+        priority: u32,
+        unlimited: bool,
+        unpriv: bool,
+        charge: Option<Charge>,
+    ) -> Self {
         let group = Arc::new_cyclic(|me| Fanotify {
             me: me.clone(),
             flags,
             f_flags,
             priority,
             unpriv,
-            max_events: if unlimited { usize::MAX } else { MAX_EVENTS },
+            max_events: if unlimited {
+                usize::MAX
+            } else {
+                MAX_QUEUED_EVENTS.load(Ordering::Relaxed) as usize
+            },
             state: SpinLock::new(State {
                 queue: VecDeque::new(),
                 overflow: false,
                 access: Vec::new(),
                 marks: Vec::new(),
+                charge,
+                mark_charges: Vec::new(),
                 closed: false,
             }),
             wait: Arc::new(WaitQueue::new()),
