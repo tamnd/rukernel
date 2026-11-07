@@ -126,8 +126,11 @@ def main():
     for d in dirs + [None]:
         ts = [t for t in tests if d is None or t.split("/")[1] == d]
         both = sum(1 for t in ts if cell(ref, t) == "pass" and cell(rk, t) == "pass")
+        ran = sum(1 for t in ts if t in a64)
+        arm = ("no run" if not ran else str(passes(a64, ts)) if ran == len(ts)
+               else f"{passes(a64, ts)} of {ran} that ran")
         o.append(f"| {d or 'all'} | {len(ts)} | {passes(ref, ts)} | {passes(rk, ts)} | {both} | "
-                 f"{passes(a64, ts) if any(t in a64 for t in ts) else 'no run'} |")
+                 f"{arm} |")
     o += ["", "## Work that remains", "",
           "These tests pass on Linux and do not pass on rukernel x86_64.", ""]
     todo = [t for t in tests if cell(ref, t) == "pass" and cell(rk, t) != "pass"]
