@@ -6,10 +6,13 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_vfs::inode::fileid;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, Timespec};
 
 /// The magic number of an inode, `XFS_DINODE_MAGIC`.
 const INODE_MAGIC: u16 = 0x494e;
+/// The flag of a file handle type with an inode number of 64 bits, `XFS_FILEID_TYPE_64FLAG`.
+const FILEID_64FLAG: i32 = 0x80;
 /// The formats of a fork, `XFS_DINODE_FMT_*`: a device number, data in the inode, a list of
 /// extents, and a tree of extents.
 pub(crate) const FMT_DEV: u8 = 0;
@@ -110,6 +113,11 @@ impl Node {
             _ => Vec::new(),
         };
         Ok(Arc::new(node))
+    }
+
+    /// The generation of the inode, `di_gen`.
+    fn generation(&self) -> u32 {
+        be32(&self.raw, 92)
     }
 
     /// The type and the permission bits.
@@ -390,6 +398,40 @@ impl Inode for Node {
             return Err(Errno::ENOTDIR);
         }
         self.entry_at(pos)
+    }
+
+    /// The handle has the inode number of 64 bits and the generation, as `xfs_fs_encode_fh` of
+    /// Linux for a file system with `inode64`.
+    fn file_handle(&self) -> Option<(i32, Vec<u32>)> {
+        let ino = self.ino.to_ne_bytes();
+        let word = |at: usize| u32::from_ne_bytes([ino[at], ino[at + 1], ino[at + 2], ino[at + 3]]);
+        Some((fileid::INO32_GEN | FILEID_64FLAG, vec![word(0), word(4), self.generation()]))
+    }
+
+    /// Finds the inode of a handle, as `xfs_fs_fh_to_dentry` and `xfs_nfs_get_inode` of Linux.
+    /// The handle can have the inode number in 32 or 64 bits.
+    fn inode_by_handle(&self, ty: i32, fid: &[u32]) -> Result<InodeRef> {
+        let (ino, generation) = match (ty & !FILEID_64FLAG, ty & FILEID_64FLAG != 0, fid) {
+            (fileid::INO32_GEN | fileid::INO32_GEN_PARENT, false, &[ino, generation, ..]) => {
+                (u64::from(ino), generation)
+            }
+            (fileid::INO32_GEN | fileid::INO32_GEN_PARENT, true, &[lo, hi, generation, ..]) => {
+                let (lo, hi) = (lo.to_ne_bytes(), hi.to_ne_bytes());
+                let b = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
+                (u64::from_ne_bytes(b), generation)
+            }
+            _ => return Err(Errno::ESTALE),
+        };
+        // A bad inode number, a bad inode, a free inode and another generation give `ESTALE`.
+        let node = match self.fs.inode(ino) {
+            Ok(node) => node,
+            Err(Errno::EUCLEAN) => return Err(Errno::ESTALE),
+            Err(e) => return Err(e),
+        };
+        if node.mode() == 0 || node.generation() != generation {
+            return Err(Errno::ESTALE);
+        }
+        Ok(node)
     }
 
     fn fs_id(&self) -> u64 {

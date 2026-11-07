@@ -309,3 +309,21 @@ fn refuses_bad_disks() {
     let fs = mount(img).unwrap();
     assert_eq!(fs.root().unwrap().lookup(b"d").unwrap().read_dir(0).err(), Some(Errno::EUCLEAN));
 }
+
+#[test]
+fn a_file_handle_finds_its_inode() {
+    let mut img = image();
+    img.put32(BIG as usize * 512 + 92, 7);
+    let fs = mount(img).unwrap();
+    let root = fs.root().unwrap();
+    let big = root.lookup(b"big").unwrap();
+    let (ty, fid) = big.file_handle().unwrap();
+    assert_eq!(ty, 0x81);
+    assert_eq!(fid, [BIG as u32, 0, 7]);
+    assert!(Arc::ptr_eq(&root.inode_by_handle(ty, &fid).unwrap(), &big));
+    assert_eq!(root.inode_by_handle(1, &[BIG as u32, 7]).unwrap().metadata().ino, BIG);
+    assert_eq!(root.inode_by_handle(ty, &[BIG as u32, 0, 8]).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(ty, &[0, 0, 0]).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(ty, &[BIG as u32, 0]).err(), Some(Errno::ESTALE));
+    assert_eq!(root.inode_by_handle(3, &[BIG as u32, 7]).err(), Some(Errno::ESTALE));
+}
