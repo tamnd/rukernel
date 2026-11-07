@@ -28,13 +28,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::fanotify::{
-    FAN_ALLOW, FAN_AUDIT, FAN_DENY, FAN_ENABLE_AUDIT, FAN_ERRNO_MASK, FAN_ERRNO_SHIFT,
+    FAN_ALLOW, FAN_AUDIT, FAN_DENY, FAN_ENABLE_AUDIT, FAN_EPIDFD, FAN_ERRNO_MASK, FAN_ERRNO_SHIFT,
     FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
-    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME, FAN_EVENT_METADATA_LEN,
-    FAN_INFO, FAN_MARK_EVICTABLE, FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK,
-    FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET,
-    FAN_REPORT_DIR_FID, FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_NAME,
-    FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FANOTIFY_METADATA_VERSION,
+    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
+    FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_METADATA_LEN, FAN_INFO, FAN_MARK_EVICTABLE,
+    FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK, FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_NOPIDFD,
+    FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET, FAN_REPORT_DIR_FID,
+    FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_NAME, FAN_REPORT_PIDFD, FAN_REPORT_TARGET_FID,
+    FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FANOTIFY_METADATA_VERSION,
 };
 use rk_abi::native::open as o;
 use rk_abi::native::types::{FanotifyEventMetadata, FanotifyResponse};
@@ -78,6 +79,9 @@ const FID_USER_EVENTS: u32 = USER_EVENTS | INODE_EVENTS | FAN_ONDIR;
 /// `FANOTIFY_FID_INFO_HDR_LEN` of Linux.
 const FID_INFO_HDR_LEN: usize = 20;
 
+/// The size of `struct fanotify_event_info_pidfd`, `FANOTIFY_PIDFD_INFO_LEN` of Linux.
+const PIDFD_INFO_LEN: usize = 8;
+
 /// `fs.fanotify.max_queued_events`: the most events in the queue of a new group without
 /// `FAN_UNLIMITED_QUEUE`.
 pub static MAX_QUEUED_EVENTS: AtomicU32 = AtomicU32::new(16384);
@@ -104,6 +108,13 @@ pub struct Hooks {
     pub current: fn() -> (i32, i32),
     /// Tells if a fatal signal is pending for the current task.
     pub fatal: fn() -> bool,
+    /// The ID in the PID namespace of the current task of the thread or the process with the
+    /// global ID `pid`, or 0 if the task does not see it, as `pid_vnr` of Linux.
+    pub vpid: fn(i32) -> i32,
+    /// Makes the file of a process file descriptor for the process with the global ID `pid`, or
+    /// for the thread with this ID and `PIDFD_THREAD` if the flag is set, as `pidfd_prepare` of
+    /// Linux.
+    pub pidfd: fn(i32, bool) -> Result<Arc<File>>,
 }
 
 static HOOKS: Once<Hooks> = Once::new();
@@ -404,10 +415,11 @@ impl Fanotify {
 
     /// The size of the event in a read, as `fanotify_event_len` of Linux.
     fn event_len(&self, item: &Item) -> usize {
+        let pidfd = if self.flags & FAN_REPORT_PIDFD != 0 { PIDFD_INFO_LEN } else { 0 };
         let Item::Event(Event { info: Info::Fid(fid), mask: m, .. }) = item else {
-            return META_LEN;
+            return META_LEN + pidfd;
         };
-        let mut len = META_LEN;
+        let mut len = META_LEN + pidfd;
         let mut dot = 0;
         if fid.dir.is_some() || fid.dir2.is_some() {
             for (fh, name) in fid.dir.iter().chain(&fid.dir2) {
@@ -482,6 +494,25 @@ impl Fanotify {
             PermState::Answered(_) | PermState::Canceled => {}
         }
         Err(Errno::ERESTARTSYS)
+    }
+
+    /// Makes a process file descriptor for the listener, for an event of the process with the
+    /// global ID `global` that the listener sees as `pid`, as `copy_event_to_user` of Linux.
+    /// The descriptor refers to the thread with `FAN_REPORT_TID`, and has `FD_CLOEXEC`. A
+    /// process that has gone or that the listener does not see gives `FAN_NOPIDFD`, and another
+    /// error gives `FAN_EPIDFD`. With `FAN_REPORT_FD_ERROR`, the value is the negative error.
+    fn open_pidfd(&self, global: i32, pid: i32) -> i32 {
+        let made = match HOOKS.get() {
+            Some(h) if pid != 0 => (h.pidfd)(global, self.flags & FAN_REPORT_TID != 0)
+                .and_then(|file| (h.install)(file, true)),
+            _ => Err(Errno::ESRCH),
+        };
+        match made {
+            Ok(fd) => fd,
+            Err(err) if self.flags & FAN_REPORT_FD_ERROR != 0 => -i32::from(err.get()),
+            Err(Errno::ESRCH) => FAN_NOPIDFD as i32,
+            Err(_) => FAN_EPIDFD as i32,
+        }
     }
 
     /// Opens the file of an event for the listener, as `create_fd` of Linux.
@@ -1034,14 +1065,26 @@ impl FileOps for FanotifyFile {
                     (m, fd, pid, perm)
                 }
             };
-            // An unprivileged group shows the pid of the reader only, as `copy_event_to_user` of
-            // Linux.
+            // The pid is the ID in the PID namespace of the reader. An unprivileged group shows
+            // the pid of the reader only, as `copy_event_to_user` of Linux.
+            let global = pid;
             if g.unpriv && HOOKS.get().map_or(0, |h| (h.current)().0) != pid {
                 pid = 0;
+            }
+            if pid != 0 {
+                pid = HOOKS.get().map_or(pid, |h| (h.vpid)(pid));
             }
             let mut records = Vec::new();
             if let Some(f) = &fid {
                 g.put_records(f, m, &mut records);
+            }
+            // The record of the process file descriptor comes after the records of the handles.
+            if g.flags & FAN_REPORT_PIDFD != 0 {
+                let pidfd = g.open_pidfd(global, pid);
+                records.push(FAN_EVENT_INFO_TYPE_PIDFD as u8);
+                records.push(0);
+                records.extend_from_slice(&(PIDFD_INFO_LEN as u16).to_ne_bytes());
+                records.extend_from_slice(&pidfd.to_ne_bytes());
             }
             let meta = FanotifyEventMetadata {
                 event_len: FAN_EVENT_METADATA_LEN + records.len() as u32,

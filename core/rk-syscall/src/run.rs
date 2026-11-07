@@ -467,6 +467,11 @@ pub fn init() {
             rk_proc::current_thread().map_or((0, 0), |t| (t.process().pid() as i32, t.tid() as i32))
         },
         fatal: || rk_proc::current_thread().is_some_and(|t| t.fatal_signal_pending()),
+        vpid: |pid| {
+            let ns = rk_proc::current_thread().and_then(|t| t.process().pid_ns().cloned());
+            rk_proc::pid_namespace::pid_nr_ns(pid as rk_proc::Pid, ns.as_ref()) as i32
+        },
+        pidfd: crate::pidfd::fanotify_pidfd,
     });
     rk_vfs::loopdev::set_file_lookup(|fd| {
         let files = rk_proc::current_thread().and_then(|t| t.process().files());
