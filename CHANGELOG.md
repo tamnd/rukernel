@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The commit of nf_tables checks the chains that each base chain reaches with its jumps and verdict maps, as `nft_table_validate` and `nft_chain_validate` of Linux. A `masquerade`, `snat`, `dnat`, `redirect`, `reject` or xtables extension in a chain that a base chain of an other type or hook reaches gives `EOPNOTSUPP` (`EINVAL` for an extension), and a jump to the depth 16 gives `EMLINK`. Before, these rules did not match the packets. Linux runs the batch again to give the error to the message of the rule; rukernel gives it to the batch (#542).
+- tools/nftables/report.md has the results of rukernel after the names of the sets in the dump, the `meta` keys and the check of the chains at commit: 277 of the 380 tests pass on x86_64, and 215 before. The arm64 column of the summary gives the count of the tests that ran when a directory did not run in full (#542).
 
 ## [0.5.11] - 2026-11-07
 
