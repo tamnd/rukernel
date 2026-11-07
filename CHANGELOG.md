@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - fanotify groups with `FAN_REPORT_PIDFD`, as fs/notify/fanotify/fanotify_user.c of Linux. Each event has an info record with a new process file descriptor of the process of the event, after the records of the handles. With `FAN_REPORT_TID`, the descriptor refers to the thread and has `PIDFD_THREAD`. A process that has gone or that the reader does not see gives `FAN_NOPIDFD`, another error gives `FAN_EPIDFD`, and with `FAN_REPORT_FD_ERROR` the record has the negative error. The pid of an event is now the ID in the PID namespace of the reader, or 0 if the reader does not see the process. LTP fanotify21 now passes (#539).
+- tools/nftables runs tests/shell of nftables 1.0.9 on rukernel and on a Linux reference kernel under QEMU, in batches, with `nft` of Alpine. `build.sh` builds the root file system, `run.py` runs the tests and records the result of each test, and `report.py` makes `report.md`, with the tests that pass on Linux and do not pass on rukernel (#542).
 
 ## [0.5.10] - 2026-11-07
 
