@@ -21,7 +21,8 @@ pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
     NftDynset, NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain,
-    nft_expr_dump, nft_expr_targets, nft_expr_validate, nft_prog, nft_rule_needs_ct,
+    nft_expr_dump, nft_expr_needs_validate, nft_expr_targets, nft_expr_validate, nft_prog,
+    nft_rule_needs_ct, nft_table_validate,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
@@ -1581,6 +1582,9 @@ struct NftBatch {
     changed: bool,
     /// The tables whose flags changed in the batch.
     updated: Vec<u64>,
+    /// The batch added a rule or an element that the commit must check, as
+    /// `NFT_VALIDATE_NEED` of Linux.
+    validate: bool,
 }
 
 /// Starts a batch, as `nf_tables_valid_genid` of Linux. A batch with a generation that is not
@@ -1608,6 +1612,7 @@ fn nf_tables_begin(genid: u32) -> Option<Box<dyn NfnlBatch>> {
         listen: nfnetlink_has_listeners(NFNLGRP_NFTABLES),
         changed: false,
         updated: Vec::new(),
+        validate: false,
         net,
     }))
 }
@@ -2182,6 +2187,9 @@ impl NftBatch {
             _ => None,
         };
         let txn_id = be32(nla, NFTA_RULE_ID)?;
+        if parsed.iter().any(nft_expr_needs_validate) {
+            self.validate = true;
+        }
         let table = &mut self.tables[t];
         let handle = if handle == 0 { table.alloc_handle() } else { handle };
         let rule = NftRule { handle, exprs, parsed, udata, txn_id };
@@ -2551,6 +2559,9 @@ impl NftBatch {
         if !key.catchall && set.size != 0 && set.nelems() >= set.size as usize {
             return Err(Errno::ENFILE);
         }
+        if matches!(data, Some(NftData::Verdict { chain: Some(_), .. })) {
+            self.validate = true;
+        }
         let elem = NftElem { key_end, data, flags, udata, timeout, expires };
         // The elements that have expired go, as the garbage collection of Linux.
         let now = nft_now_ns();
@@ -2761,6 +2772,14 @@ impl NfnlBatch for NftBatch {
     fn commit(mut self: Box<Self>, batch: Origin) -> Result<()> {
         if !self.changed {
             return Ok(());
+        }
+        // Each base chain must be able to have the expressions of the chains that it reaches,
+        // and the jumps must not go too deep, as `nf_tables_validate` of Linux. Linux then runs
+        // the batch again to give the error to the message; here the error goes to the batch.
+        if self.validate {
+            for t in &self.tables {
+                nft_table_validate(t)?;
+            }
         }
         for t in &mut self.tables {
             for c in &mut t.chains {
@@ -3006,6 +3025,81 @@ mod tests {
         assert_eq!(nft_check_loops(&t, 12, 13), Ok(()));
         // Each chain gets its own place in the program.
         assert_eq!(nft_prog(&t, 0).rules_of_chains(), [2, 1, 1, 1]);
+    }
+
+    #[test]
+    fn the_commit_checks_the_chains_that_a_base_chain_reaches() {
+        use super::nf_tables_core::NftImm;
+        use crate::netfilter::{NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING};
+        let jump = |h| NftExpr::Immediate {
+            dreg: 0,
+            data: NftImm::Verdict { code: NFT_JUMP, chain: Some(h) },
+        };
+        let rule = |e: NftExpr| NftRule {
+            handle: 1,
+            exprs: Vec::new(),
+            parsed: alloc::vec![e],
+            udata: None,
+            txn_id: None,
+        };
+        let chain = |handle, rules: Vec<NftRule>| NftChain {
+            name: format!("c{handle}").into_bytes(),
+            handle,
+            flags: 0,
+            udata: None,
+            base: None,
+            rules,
+            txn_id: None,
+        };
+        let base = |ty: &'static NftChainType, hooknum| NftBaseChain {
+            hooknum,
+            priority: 0,
+            ty,
+            policy: NF_ACCEPT,
+            ops: Arc::new(NftHookOps::new(NF_ACCEPT, ty.nat)),
+        };
+        // c1, nat at the output hook: tcp dport vmap { 1 : jump c2 }. c2: masquerade.
+        let mut t = table();
+        let mut m = set(b"m");
+        m.flags = NFT_SET_MAP;
+        m.dtype = NFT_DATA_VERDICT;
+        let key = ElemKey { catchall: false, key: alloc::vec![1, 0, 0, 0], end: false };
+        let elem = NftElem {
+            key_end: None,
+            data: Some(NftData::Verdict { code: NFT_JUMP, chain: Some(2) }),
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires: 0,
+        };
+        m.elems.insert(key, elem);
+        t.sets.push(m);
+        let vmap = NftExpr::Lookup { set: 1, sreg: 8, len: 4, invert: false, dreg: Some(0) };
+        assert!(nft_expr_needs_validate(&vmap));
+        let mut c1 = chain(1, alloc::vec![rule(vmap)]);
+        c1.base = Some(base(&NFT_CHAIN_NAT, NF_INET_LOCAL_OUT));
+        t.chains.push(c1);
+        t.chains.push(chain(2, alloc::vec![rule(NftExpr::Masq { flags: 0, proto: None })]));
+        assert_eq!(nft_table_validate(&t), Err(Errno::EOPNOTSUPP));
+        t.chains[0].base = Some(base(&NFT_CHAIN_NAT, NF_INET_POST_ROUTING));
+        assert_eq!(nft_table_validate(&t), Ok(()));
+        // A filter chain cannot reach masquerade.
+        t.chains[0].base = Some(base(&NFT_CHAIN_FILTER, NF_INET_POST_ROUTING));
+        assert_eq!(nft_table_validate(&t), Err(Errno::EOPNOTSUPP));
+
+        // c10 at the input hook jumps to c11, c11 to c12, and so on: 15 jumps are the most.
+        let mut t = table();
+        let mut c10 = chain(10, alloc::vec![rule(jump(11))]);
+        c10.base = Some(base(&NFT_CHAIN_FILTER, NF_INET_LOCAL_IN));
+        t.chains.push(c10);
+        for h in 11..25 {
+            t.chains.push(chain(h, alloc::vec![rule(jump(h + 1))]));
+        }
+        t.chains.push(chain(25, Vec::new()));
+        assert_eq!(nft_table_validate(&t), Ok(()));
+        t.chains.last_mut().unwrap().rules.push(rule(jump(26)));
+        t.chains.push(chain(26, Vec::new()));
+        assert_eq!(nft_table_validate(&t), Err(Errno::EMLINK));
     }
 
     #[test]

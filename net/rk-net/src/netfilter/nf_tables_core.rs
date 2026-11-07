@@ -38,7 +38,7 @@ use crate::netfilter::{
     nf_pktinfo as nft_pktinfo,
 };
 use crate::netlink::msg::{ATTR_HDRLEN, Attrs, Builder, HDRLEN};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -935,6 +935,43 @@ pub(super) fn nft_check_loops(table: &NftTable, from: u64, target: u64) -> Resul
         Ok(())
     }
     walk(table, from, target, 1)
+}
+
+/// Tells if the expression `e` can make a chain wrong for a base chain that reaches it: an
+/// expression that only some base chains can have, a jump or a lookup in a map. The commit then
+/// checks the table, as `NFT_VALIDATE_NEED` of Linux.
+pub(super) fn nft_expr_needs_validate(e: &NftExpr) -> bool {
+    nft_expr_hooks(e).is_some()
+        || e.jump_target().is_some()
+        || matches!(e, NftExpr::Lookup { dreg: Some(_), .. })
+}
+
+/// Checks the chains that each base chain of `table` reaches with its jumps, as
+/// `nft_table_validate` and `nft_chain_validate` of Linux. Each expression must be one that the
+/// base chain can have, else `EOPNOTSUPP` (`EINVAL` for an extension of xtables). A chain at the
+/// depth `NFT_JUMP_STACK_SIZE` gives `EMLINK`. The jumps of the verdict maps count.
+pub(super) fn nft_table_validate(table: &NftTable) -> Result<()> {
+    fn walk(table: &NftTable, base: (&NftChainType, u8), at: u64, level: usize) -> Result<()> {
+        if level == NFT_JUMP_STACK_SIZE {
+            return Err(Errno::EMLINK);
+        }
+        let Some(chain) = table.chains.iter().find(|c| c.handle == at) else { return Ok(()) };
+        for e in chain.rules.iter().flat_map(|r| &r.parsed) {
+            nft_expr_validate(e, Some(base))?;
+            // Many elements of a verdict map can jump to the same chain.
+            let targets: BTreeSet<u64> = nft_expr_targets(table, e).into_iter().collect();
+            for t in targets {
+                walk(table, base, t, level + 1)?;
+            }
+        }
+        Ok(())
+    }
+    for c in &table.chains {
+        if let Some(b) = &c.base {
+            walk(table, (b.ty, b.hooknum), c.handle, 0)?;
+        }
+    }
+    Ok(())
 }
 
 /// An expression of a program, with the jumps and the sets as indexes in the program.

@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The commit of nf_tables checks the chains that each base chain reaches with its jumps and verdict maps, as `nft_table_validate` and `nft_chain_validate` of Linux. A `masquerade`, `snat`, `dnat`, `redirect`, `reject` or xtables extension in a chain that a base chain of an other type or hook reaches gives `EOPNOTSUPP` (`EINVAL` for an extension), and a jump to the depth 16 gives `EMLINK`. Before, these rules did not match the packets. Linux runs the batch again to give the error to the message of the rule; rukernel gives it to the batch (#542).
+
 ## [0.5.11] - 2026-11-07
 
 ### Added
