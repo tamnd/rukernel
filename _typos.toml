@@ -2,7 +2,9 @@
 
 [files]
 # The generated ABI has the names of Linux, for example `creat`. The fstests tables copy the
-# descriptions of the tests from fstests as they are, and the LTP tables copy them from LTP.
+# descriptions of the tests from fstests as they are, and the LTP tables copy them from LTP. The
+# reports of tools/missing have the program names of the kernel log, which the kernel cuts at 15
+# characters, for example `systemd-rc-loca`.
 extend-exclude = [
     "LICENSE",
     "abi/",
@@ -14,6 +16,7 @@ extend-exclude = [
     "tools/ltp/mm.md",
     "tools/ltp/sched.md",
     "tools/ltp/net.md",
+    "tools/missing/*.md",
 ]
 
 [default.extend-words]

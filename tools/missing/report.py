@@ -115,7 +115,11 @@ LINE = re.compile(r"rk\.missing: (/\S*) ?(.*)$")
 
 def normal(path):
     """Gives the path in the form of the report, or None for a name that is missing on Linux
-    too: a process, a thread or a file descriptor that is not there now."""
+    too: a process, a thread or a file descriptor that is not there now. A procfs or a sysfs that
+    is mounted at another path, as /run/systemd/mount-rootfs/proc for a sandbox of systemd, gives
+    the path under /proc or /sys."""
+    if not re.match(r"/(proc|sys)(/|$)", path):
+        path = re.sub(r"^/\S*?(?=/(proc|sys)/)", "", path)
     path = re.sub(r"^/proc/\d+(?=/|$)", "/proc/PID", path)
     path = re.sub(r"/task/\d+(?=/|$)", "/task/TID", path)
     path = re.sub(r"/(fd|fdinfo)/\d+$", r"/\1/FD", path)
