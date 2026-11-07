@@ -400,7 +400,8 @@ const SYSTEMD_MEMORY: &str = "2G";
 /// The boot tests that boot the tree of the `systemd` test with another check. The init script
 /// of the tree gets the name of the test as its argument. In the `udevd` test, the check asks
 /// udevd for the events of all devices with `udevadm trigger` and waits for them with
-/// `udevadm settle`. Then /dev/disk/by-path must have a link to vda, from `path_id` of udev.
+/// `udevadm settle`. Then /dev/disk/by-path must have a link to vda, from `path_id` of udev, and
+/// the interface of the virtio-net-pci device must have its predictable name from `net_id`.
 const SYSTEMD_TESTS: &[&str] = &["udevd"];
 
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
@@ -996,6 +997,25 @@ for link in /dev/disk/by-path/*; do
 done
 [ -n "$vda" ] || other="$other /dev/disk/by-path"
 echo "rk-udevd: interfaces $(ls /sys/class/net | tr '\n' ' ')"
+# udevd renames an interface with a name of the kernel to its predictable name, as on Linux:
+# the first of the names of `net_id` for the policies of 99-default.link. The interface of the
+# virtio-net-pci device must have a name of `net_id`.
+named=
+for dev in /sys/class/net/*; do
+    name=${dev##*/}
+    [ "$name" != lo ] || continue
+    props=$(udevadm info -q property "$dev")
+    want=
+    for key in ID_NET_NAME_ONBOARD ID_NET_NAME_SLOT ID_NET_NAME_PATH; do
+        [ -n "$want" ] || want=$(echo "$props" | sed -n "s/^$key=//p")
+    done
+    assign=$(cat "$dev/name_assign_type")
+    echo "rk-udevd: $name: name_assign_type $assign, net_id name ${want:-none}"
+    [ -n "$want" ] || continue
+    named=$name
+    [ "$name" = "$want" ] && [ "$assign" = 4 ] || other="$other $name"
+done
+[ -n "$named" ] || other="$other net_id"
 for unit in $(systemctl list-units --failed --no-legend --plain | awk '{print $1}'); do
     echo "rk-udevd: failed $unit"
     systemctl status --no-pager --lines=5 "$unit" | sed 's/^/rk-udevd:   /'
