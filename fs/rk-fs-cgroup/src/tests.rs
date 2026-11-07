@@ -123,3 +123,35 @@ fn chown_and_chmod_change_one_inode() {
     root.rmdir(b"fs-c").unwrap();
     assert!(ATTRS.lock().keys().all(|&ino| ino >> INO_SHIFT != m.ino >> INO_SHIFT));
 }
+
+#[test]
+fn a_cgroup_keeps_user_and_trusted_xattrs() {
+    let root = root();
+    let dir = root.create(b"fs-x", FileType::Directory, 0o755, 0).unwrap();
+    dir.set_xattr(b"user.oomd_avoid", b"1", 0).unwrap();
+    dir.set_xattr(b"trusted.invocation_id", b"abc", 0).unwrap();
+    assert_eq!(dir.get_xattr(b"user.oomd_avoid").unwrap(), b"1");
+    assert_eq!(
+        dir.list_xattr().unwrap(),
+        [b"trusted.invocation_id".to_vec(), b"user.oomd_avoid".to_vec()]
+    );
+    assert_eq!(dir.set_xattr(b"security.a", b"", 0), Err(Errno::EOPNOTSUPP));
+    // A new lookup of the directory sees the attributes, and a file has its own.
+    let again = root.lookup(b"fs-x").unwrap();
+    assert_eq!(again.get_xattr(b"trusted.invocation_id").unwrap(), b"abc");
+    let procs = dir.lookup(b"cgroup.procs").unwrap();
+    assert_eq!(procs.get_xattr(b"user.oomd_avoid"), Err(Errno::ENODATA));
+    // The `user.` attributes of one inode have at most 128 KiB of values.
+    let big = alloc::vec![0u8; 60 << 10];
+    dir.set_xattr(b"user.big", &big, 0).unwrap();
+    dir.set_xattr(b"user.big2", &big, 0).unwrap();
+    assert_eq!(dir.set_xattr(b"user.big3", &big[..10 << 10], 0), Err(Errno::ENOSPC));
+    dir.set_xattr(b"user.big2", &big[..1000], 0).unwrap();
+    dir.set_xattr(b"user.big3", &big[..10 << 10], 0).unwrap();
+    dir.remove_xattr(b"user.big").unwrap();
+    assert_eq!(dir.remove_xattr(b"user.big"), Err(Errno::ENODATA));
+    root.rmdir(b"fs-x").unwrap();
+    let dir = root.create(b"fs-x", FileType::Directory, 0o755, 0).unwrap();
+    assert_eq!(dir.list_xattr().unwrap(), Vec::<Vec<u8>>::new());
+    root.rmdir(b"fs-x").unwrap();
+}

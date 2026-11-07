@@ -14193,7 +14193,7 @@ static void test_cgroup(void)
 	check("mount cgroup2", mount("none", "/cg", "cgroup2", 0, NULL) == 0);
 	check("statfs of cgroup2 gives CGROUP2_SUPER_MAGIC", statfs("/cg", &sfs) == 0 && sfs.f_type == 0x63677270);
 	check("the root has the controllers", read_file("/cg/cgroup.controllers", buf, sizeof(buf)) > 0 &&
-						      strcmp(buf, "cpuset cpu io memory pids\n") == 0);
+						      strcmp(buf, "cpuset cpu io memory hugetlb pids rdma misc\n") == 0);
 	check("/proc/self/cgroup is the root", read_file("/proc/self/cgroup", buf, sizeof(buf)) > 0 &&
 						       strcmp(buf, "0::/\n") == 0);
 	check("/proc/cgroups has memory", read_file("/proc/cgroups", buf, sizeof(buf)) > 0 &&
@@ -15504,6 +15504,11 @@ int main(int argc, char **argv)
 		test_bpf();
 	if (argc > 1 && strcmp(argv[1], "userns") == 0)
 		test_user_ns();
+	/* The checks of cgroup read /proc, and the "only cgroup" run has no /proc before. */
+	if (argc > 1 && strcmp(argv[1], "cgroup") == 0) {
+		mkdir("/proc", 0555);
+		test_cgroup();
+	}
 	if (argc > 1 && strcmp(argv[1], "lsm") == 0)
 		test_lsm();
 	if (argc > 1 && strcmp(argv[1], "apparmor") == 0)

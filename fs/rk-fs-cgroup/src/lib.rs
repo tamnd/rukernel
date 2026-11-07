@@ -12,7 +12,10 @@
 //! directory or a file, and a new cgroup and its files belong to the process that makes it. A
 //! write of `cgroup.procs` or `cgroup.threads` checks the credentials and the cgroup namespace of
 //! the process that opened the file, as `cgroup_procs_write_permission` of Linux. The mount
-//! option `nsdelegate` makes each cgroup namespace a delegation boundary.
+//! option `nsdelegate` makes each cgroup namespace a delegation boundary, and the option
+//! `memory_recursiveprot` gives the protection of a cgroup to its children too.
+//!
+//! A directory or a file keeps `user.` and `trusted.` extended attributes, as kernfs.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -42,6 +45,7 @@ use rk_vfs::file::{File, FileOps};
 use rk_vfs::fstype::{FsType, MountArgs};
 use rk_vfs::inode::mode;
 use rk_vfs::wait::{PollTable, WaitQueue};
+use rk_vfs::xattr::Xattrs;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, now};
 
 /// The magic number of cgroup2, `CGROUP2_SUPER_MAGIC` of `<linux/magic.h>`.
@@ -72,6 +76,10 @@ const _: () = assert!(FILES.len() as u64 + 2 < CHILD_POS);
 /// root.
 static NS_DELEGATE: AtomicBool = AtomicBool::new(false);
 
+/// The mount option `memory_recursiveprot`, for the options of the mount. rk-cgroup keeps it too,
+/// for the protection of the memory.
+static RECURSIVE_PROT: AtomicBool = AtomicBool::new(false);
+
 /// The waits of `poll` on `cgroup.events` and the other files with events wait here. A change of
 /// such a file wakes them.
 static EVENTS: WaitQueue = WaitQueue::new();
@@ -84,6 +92,18 @@ fn wake_events() {
 /// The owner and the mode that `chown` and `chmod` gave, and the owner of each cgroup that a
 /// process that is not root made, by inode number. Other inodes belong to root.
 static ATTRS: SpinLock<BTreeMap<u64, Attr>> = SpinLock::new(BTreeMap::new());
+
+/// The extended attributes of each directory and file, by inode number, as kernfs keeps the
+/// `user.` and `trusted.` attributes that systemd and systemd-oomd write. `rmdir` removes the
+/// attributes of the cgroup.
+static XATTRS: SpinLock<BTreeMap<u64, Xattrs>> = SpinLock::new(BTreeMap::new());
+
+/// The most `user.` attributes of one inode, `KERNFS_MAX_USER_XATTRS` of Linux.
+const MAX_USER_XATTRS: usize = 128;
+
+/// The most bytes in the values of the `user.` attributes of one inode,
+/// `KERNFS_USER_XATTR_SIZE_LIMIT` of Linux.
+const USER_XATTR_SIZE: usize = 128 << 10;
 
 /// The owner and the mode of a directory or a file of cgroup2.
 #[derive(Clone, Copy)]
@@ -100,14 +120,17 @@ const DELEGATABLE: [&str; 3] = ["cgroup.procs", "cgroup.threads", "cgroup.subtre
 
 /// Makes the root of a mount: the root of the cgroup namespace of the caller. The option
 /// `nsdelegate` changes only from the initial cgroup namespace, and each mount from there sets
-/// it or clears it, as `apply_cgroup_root_flags` of Linux. cgroup2 takes the other options of
-/// Linux, but they have no effect here.
+/// it or clears it, as `apply_cgroup_root_flags` of Linux. `memory_recursiveprot` changes in the
+/// same way. cgroup2 takes the other options of Linux, but they have no effect here.
 fn mount(args: &MountArgs<'_>) -> Result<InodeRef> {
     rk_cgroup::set_notify(wake_events);
     let (ns, root) = procs::namespace();
     if ns == 0 {
-        let on = args.data.split(|&b| b == b',').any(|o| o == b"nsdelegate");
-        NS_DELEGATE.store(on, Ordering::Relaxed);
+        let has = |name: &[u8]| args.data.split(|&b| b == b',').any(|o| o == name);
+        NS_DELEGATE.store(has(b"nsdelegate"), Ordering::Relaxed);
+        let recursive = has(b"memory_recursiveprot");
+        RECURSIVE_PROT.store(recursive, Ordering::Relaxed);
+        rk_cgroup::with(|h| h.set_recursive_prot(recursive));
     }
     Ok(Arc::new(Node { id: root, file: None }))
 }
@@ -413,6 +436,7 @@ impl Inode for Node {
         })
         .map(|id| {
             ATTRS.lock().retain(|&ino, _| ino >> INO_SHIFT != u64::from(id));
+            XATTRS.lock().retain(|&ino, _| ino >> INO_SHIFT != u64::from(id));
             // `cgroup_bpf_offline` of Linux: the programs of the cgroup go away.
             rk_bpf::cgroup::cgroup_bpf_offline(id);
         })
@@ -477,7 +501,54 @@ impl Inode for Node {
     }
 
     fn fs_options(&self) -> Vec<u8> {
-        if NS_DELEGATE.load(Ordering::Relaxed) { b",nsdelegate".to_vec() } else { Vec::new() }
+        let mut out = Vec::new();
+        if NS_DELEGATE.load(Ordering::Relaxed) {
+            out.extend_from_slice(b",nsdelegate");
+        }
+        if RECURSIVE_PROT.load(Ordering::Relaxed) {
+            out.extend_from_slice(b",memory_recursiveprot");
+        }
+        out
+    }
+
+    fn get_xattr(&self, name: &[u8]) -> Result<Vec<u8>> {
+        let ino = Self::ino(self.id, self.file);
+        XATTRS.lock().get(&ino).map_or(Err(Errno::ENODATA), |x| x.get(name))
+    }
+
+    /// Sets a `user.` or a `trusted.` attribute, as `kernfs_xattr_set` of Linux. The `user.`
+    /// attributes of one inode have limits on their number and on the size of their values.
+    fn set_xattr(&self, name: &[u8], value: &[u8], flags: u32) -> Result<()> {
+        let user = name.starts_with(b"user.");
+        if !user && !name.starts_with(b"trusted.") {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        self.live()?;
+        let ino = Self::ino(self.id, self.file);
+        let mut all = XATTRS.lock();
+        let x = all.entry(ino).or_default();
+        if user {
+            let others: Vec<Vec<u8>> = x
+                .names()
+                .into_iter()
+                .filter(|n| n.starts_with(b"user.") && n.as_slice() != name)
+                .collect();
+            let size: usize = others.iter().map(|n| x.get(n).map_or(0, |v| v.len())).sum();
+            if others.len() >= MAX_USER_XATTRS || size + value.len() > USER_XATTR_SIZE {
+                return Err(Errno::ENOSPC);
+            }
+        }
+        x.set(name, value, flags)
+    }
+
+    fn list_xattr(&self) -> Result<Vec<Vec<u8>>> {
+        let ino = Self::ino(self.id, self.file);
+        Ok(XATTRS.lock().get(&ino).map_or_else(Vec::new, Xattrs::names))
+    }
+
+    fn remove_xattr(&self, name: &[u8]) -> Result<()> {
+        let ino = Self::ino(self.id, self.file);
+        XATTRS.lock().get_mut(&ino).map_or(Err(Errno::ENODATA), |x| x.remove(name))
     }
 
     fn open_file(&self, _flags: u32) -> Option<Result<Arc<dyn FileOps>>> {
