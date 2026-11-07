@@ -13365,6 +13365,128 @@ static void test_nft_ctnetlink(void)
 	close(fd);
 }
 
+#define RK_NFNL_SUBSYS_NFT_COMPAT 11
+#define RK_NFTA_RULE_COMPAT 5
+
+/* Asks the best revision of the xtables extension `name` (a target if `target` is set) of the
+ * family `family`, as NFNL_MSG_COMPAT_GET of iptables-nft. Gives the revision, or a negative
+ * errno. */
+static long nft_compat_rev(int fd, int family, const char *name, unsigned int rev, int target)
+{
+	struct nft_batch b = { .len = 0 };
+	char buf[512];
+	nft_start(&b, RK_NFNL_SUBSYS_NFT_COMPAT << 8, 0, family, 0);
+	nft_str(&b, 1, name);	  /* NFTA_COMPAT_NAME */
+	nft_be32(&b, 2, rev);	  /* NFTA_COMPAT_REV */
+	nft_be32(&b, 3, target); /* NFTA_COMPAT_TYPE */
+	long n = nft_get(fd, &b, buf, sizeof(buf));
+	struct nlmsghdr *r = (struct nlmsghdr *)buf;
+	if (n <= 0)
+		return n;
+	if (r->nlmsg_type != RK_NFNL_SUBSYS_NFT_COMPAT << 8 || nft_attr_be32(r, 3) != (unsigned)target)
+		return -EPROTO;
+	return nft_attr_be32(r, 2);
+}
+
+/* The expression `match` or `target` of the extension `name` with `len` bytes of data. */
+static void nft_xt(struct nft_batch *b, const char *kind, const char *name, unsigned int rev,
+		   const void *info, int len)
+{
+	struct rtattr *e, *d = nft_expr(b, kind, &e);
+	nft_str(b, 1, name); /* NFTA_MATCH_NAME */
+	nft_be32(b, 2, rev); /* NFTA_MATCH_REV */
+	nl_put(b->cur, 3, info, len); /* NFTA_MATCH_INFO */
+	nft_expr_end(b, d, e);
+}
+
+/* The table filter with the chain OUTPUT, and a rule as iptables-nft makes it for `-p PROTO
+ * --dport PORT -m conntrack --ctstate NEW -m comment --comment rk -j REJECT --reject-with
+ * WITH`, with the protocol `cproto` in NFTA_RULE_COMPAT. Gives the error of the batch. */
+static int nft_compat_rule(int fd, int proto, int cproto, unsigned short port, unsigned int with)
+{
+	static struct nft_batch b;
+	unsigned char ct[168] = { 0 }, comment[256] = "rk";
+	unsigned int reject[2] = { with, 0 };
+	unsigned short flags = 1, state = 1 << 3; /* XT_CONNTRACK_STATE, the state NEW */
+
+	memcpy(ct + 146, &flags, 2); /* match_flags */
+	memcpy(ct + 150, &state, 2); /* state_mask */
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_NEWTABLE, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "filter");
+	nft_msg(&b, RK_NFT_MSG_NEWCHAIN, NLM_F_CREATE, AF_INET);
+	nft_str(&b, RK_NFTA_CHAIN_TABLE, "filter");
+	nft_str(&b, RK_NFTA_CHAIN_NAME, "OUTPUT");
+	struct rtattr *h = nl_put(b.cur, RK_NFTA_CHAIN_HOOK | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, RK_NFTA_HOOK_HOOKNUM, RK_NF_INET_LOCAL_OUT);
+	nft_be32(&b, RK_NFTA_HOOK_PRIORITY, 0);
+	nl_end(b.cur, h);
+	nft_str(&b, RK_NFTA_CHAIN_TYPE, "filter");
+	nft_be32(&b, RK_NFTA_CHAIN_POLICY, RK_NF_ACCEPT);
+	nft_msg(&b, RK_NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND, AF_INET);
+	nft_str(&b, RK_NFTA_RULE_TABLE, "filter");
+	nft_str(&b, RK_NFTA_RULE_CHAIN, "OUTPUT");
+	struct rtattr *x = nl_put(b.cur, RK_NFTA_RULE_EXPRESSIONS | NLA_F_NESTED, NULL, 0);
+	nft_dport(&b, proto, port);
+	nft_xt(&b, "match", "conntrack", 3, ct, sizeof(ct));
+	nft_xt(&b, "match", "comment", 0, comment, sizeof(comment));
+	nft_xt(&b, "target", "REJECT", 0, reject, sizeof(reject));
+	nl_end(b.cur, x);
+	x = nl_put(b.cur, RK_NFTA_RULE_COMPAT | NLA_F_NESTED, NULL, 0);
+	nft_be32(&b, 1, cproto); /* NFTA_RULE_COMPAT_PROTO */
+	nft_be32(&b, 2, 0);	 /* NFTA_RULE_COMPAT_FLAGS */
+	nl_end(b.cur, x);
+	return nft_send(fd, &b, 1);
+}
+
+/* nft_compat, as iptables-nft: the best revision of an extension, and a rule with the matches
+ * conntrack and comment and the target REJECT. A new UDP flow to port 22 gets EPERM and then
+ * ECONNREFUSED from the port unreachable. */
+static void test_nft_compat(void)
+{
+	int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, RK_NETLINK_NETFILTER);
+	static struct nft_batch b;
+
+	if (fd < 0)
+		return;
+	check("nft_compat: the best revision of conntrack is 3",
+	      nft_compat_rev(fd, AF_INET, "conntrack", 1, 0) == 3);
+	check("nft_compat: REJECT of IPv6 is a target",
+	      nft_compat_rev(fd, AF_INET6, "REJECT", 0, 1) == 0);
+	check("nft_compat: an unknown extension gives ENOENT",
+	      nft_compat_rev(fd, AF_INET, "rk-none", 0, 0) == -ENOENT);
+	check("nft_compat: the TCP RST of REJECT needs the protocol TCP",
+	      nft_compat_rule(fd, IPPROTO_TCP, IPPROTO_UDP, 22, 7) == -EINVAL);
+	check("nft_compat: a rule with conntrack, comment and REJECT",
+	      nft_compat_rule(fd, IPPROTO_UDP, IPPROTO_UDP, 22, 3) == 0);
+	check("nft_compat: the chain OUTPUT has the rule",
+	      nft_dump_count(fd, RK_NFT_MSG_GETRULE, "filter", "OUTPUT") == 1);
+
+	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(22) };
+	struct timeval tv = { .tv_sec = 2 };
+	char buf[4];
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int r = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	int s = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	int ok = bind(r, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+		 connect(s, (struct sockaddr *)&a, sizeof(a)) == 0;
+	errno = 0;
+	check("nft_compat: REJECT of a new flow to udp port 22 gives EPERM to send",
+	      ok && send(s, "r", 1, 0) < 0 && errno == EPERM);
+	errno = 0;
+	check("nft_compat: the port unreachable of REJECT gives ECONNREFUSED",
+	      ok && recv(s, buf, sizeof(buf), 0) < 0 && errno == ECONNREFUSED);
+	close(r);
+	close(s);
+
+	nft_begin(&b, 0);
+	nft_msg(&b, RK_NFT_MSG_DELTABLE, 0, AF_INET);
+	nft_str(&b, RK_NFTA_TABLE_NAME, "filter");
+	check("nft_compat: the table goes", nft_send(fd, &b, 1) == 0);
+	close(fd);
+}
+
 /*
  * `init masq IFNAME` adds `nft add table ip rkx`, the chain post of the type nat on the hook
  * postrouting, and the rule `meta oif IFNAME masquerade` in the network namespace of init, and
@@ -13438,6 +13560,7 @@ static void test_inet(int port)
 	test_nft_timeout();
 	test_nft_dynset();
 	test_nft_ctnetlink();
+	test_nft_compat();
 	test_nf_conntrack_sysctl();
 	test_ethtool();
 	test_linkprop();

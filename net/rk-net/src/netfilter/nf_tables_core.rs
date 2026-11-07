@@ -6,8 +6,9 @@
 //! masks a register, `cmp` and `lookup` end the rule when the data does not match, and
 //! `counter` counts the packets. The expressions here are `immediate`, `cmp`, `payload`,
 //! `meta`, `bitwise`, `counter`, `lookup`, `dynset`, `ct`, `nat`, `masq` and `redir`, and in
-//! nft_exprs.rs `byteorder`, `range`, `limit`, `log` and `reject`. Another name gives
-//! `ENOENT`, as a module that Linux cannot load.
+//! nft_exprs.rs `byteorder`, `range`, `limit`, `log` and `reject`. `match` and `target` run
+//! the xtables extensions of nft_compat.rs. Another name gives `ENOENT`, as a module that
+//! Linux cannot load.
 //!
 //! At the commit each base chain gets a program: its rules and the rules of the chains that it
 //! can jump to, with the keys of the sets that the rules look up. A packet takes the program
@@ -29,6 +30,7 @@ use crate::netfilter::nf_nat::{
     NF_NAT_RANGE_NETMAP, NF_NAT_RANGE_PROTO_OFFSET, NF_NAT_RANGE_PROTO_SPECIFIED, NfNatRange,
     hook2manip, nf_nat_masquerade, nf_nat_redirect, nf_nat_setup_info,
 };
+use crate::netfilter::nft_compat::{NftXt, nft_xt_init};
 use crate::netfilter::{
     NF_INET_FORWARD, NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING,
     NF_INET_PRE_ROUTING, NFPROTO_INET, NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo,
@@ -249,6 +251,8 @@ pub(super) enum NftExpr {
     Reject(NftReject),
     /// `dynset`, as nft_dynset.c.
     Dynset(NftDynset),
+    /// `match` and `target`, an extension of xtables, as nft_compat.c.
+    Xt(NftXt),
 }
 
 /// `dynset`: adds the key of a packet to a set, updates the timeout of its element, or removes
@@ -382,7 +386,11 @@ fn len_attr(a: &Attrs<'_>, ty: u32) -> Result<usize> {
 
 /// Reads an expression of a rule of `table`, as `nf_tables_expr_parse` and the `init` of each
 /// expression of Linux.
-pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftExpr> {
+pub(super) fn nf_tables_expr_parse(
+    table: &NftTable,
+    nla: &[u8],
+    compat: Option<&[u8]>,
+) -> Result<NftExpr> {
     let tb = Attrs::parse(nla, NFTA_EXPR_MAX);
     let Some(name) = tb.str(NFTA_EXPR_NAME) else { return Err(Errno::EINVAL) };
     let name = name.split(|&c| c == 0).next().unwrap_or(name);
@@ -531,6 +539,10 @@ pub(super) fn nf_tables_expr_parse(table: &NftTable, nla: &[u8]) -> Result<NftEx
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
         b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
+        b"match" | b"target" => {
+            let target = name == b"target";
+            Ok(NftExpr::Xt(nft_xt_init(target, &table.name, table.family, data, compat)?))
+        }
         _ => Err(Errno::ENOENT),
     }
 }
@@ -696,6 +708,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
                 | 1 << NF_INET_LOCAL_OUT,
             false,
         )),
+        NftExpr::Xt(x) if x.hooks() != 0 => Some((x.hooks(), false)),
         _ => None,
     }
 }
@@ -706,7 +719,8 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
 pub(super) fn nft_expr_validate(e: &NftExpr, base: Option<(&NftChainType, u8)>) -> Result<()> {
     match (nft_expr_hooks(e), base) {
         (Some((mask, nat)), Some((ty, hook))) if (nat && !ty.nat) || mask & 1 << hook == 0 => {
-            Err(Errno::EOPNOTSUPP)
+            // `nft_match_validate` and `nft_target_validate` give `EINVAL`.
+            Err(if matches!(e, NftExpr::Xt(_)) { Errno::EINVAL } else { Errno::EOPNOTSUPP })
         }
         _ => Ok(()),
     }
@@ -779,7 +793,7 @@ pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
                 | NftExpr::Nat { .. }
                 | NftExpr::Masq { .. }
                 | NftExpr::Redir { .. }
-        )
+        ) || matches!(e, NftExpr::Xt(x) if x.needs_ct())
     })
 }
 
@@ -1303,6 +1317,13 @@ fn nft_eval(
                     NFT_BREAK
                 } else {
                     nft_reject_eval(r, skb, state)
+                };
+            }
+            NftExpr::Xt(x) => {
+                regs.verdict = if x.hooks() != 0 && x.hooks() & 1 << state.hook == 0 {
+                    NFT_BREAK
+                } else {
+                    x.eval(skb, state, pkt.thoff)
                 };
             }
         },
