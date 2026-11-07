@@ -5,12 +5,15 @@
 //! `subsystem`. The virtio device on a transport is the directory `virtioN` of the function or of
 //! the platform device. `/sys/bus/BUS/devices` has a link to each device, and
 //! `/sys/bus/BUS/drivers` has a directory for each driver. `/sys/module` has the drivers that are
-//! modules on Linux. They are in the kernel here, as with `=y` on Linux.
+//! modules on Linux. They are in the kernel here, as with `=y` on Linux. It also has the
+//! parameters of the parts of the kernel that add them with [`add_param`], as the parameter
+//! `enabled` of AppArmor.
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use rk_abi::Errno;
+use rk_frame::sync::SpinLock;
 use rk_vfs::Result;
 use rk_vfs::bus::{PCI_ROOT, PciFunction, PlatformDevice, Transport, VirtioDevice};
 
@@ -258,22 +261,71 @@ pub(crate) fn bus_entries(rest: &[&str]) -> Option<Vec<(String, Kind)>> {
     Some(out)
 }
 
+/// A parameter of a module, the file `/sys/module/MODULE/parameters/NAME`, as `module_param`
+/// of Linux. The file can be read by all and takes no write, as a parameter with the mode 0444.
+#[derive(Clone, Copy)]
+pub struct Param {
+    /// The name of the module.
+    pub module: &'static str,
+    /// The name of the parameter.
+    pub name: &'static str,
+    /// Gives the text of the file, with a new line at the end.
+    pub read: fn() -> String,
+}
+
+/// The parameters that [`add_param`] added.
+static PARAMS: SpinLock<Vec<Param>> = SpinLock::new(Vec::new());
+
+/// Adds the parameter `param`. A parameter with the same module and name is replaced.
+pub fn add_param(param: Param) {
+    let mut params = PARAMS.lock();
+    params.retain(|p| (p.module, p.name) != (param.module, param.name));
+    params.push(param);
+}
+
+/// The parameters of the module `m`.
+fn params(m: &str) -> Vec<Param> {
+    PARAMS.lock().iter().filter(|p| p.module == m).copied().collect()
+}
+
 /// The entries of the directory `rest` below `/sys/module`.
 pub(crate) fn module_entries(rest: &[&str]) -> Option<Vec<(String, Kind)>> {
     let out = match rest {
         [] => {
             let mut names: Vec<&str> =
                 BUSES.iter().flat_map(|(_, d)| d.iter().map(|x| x.1)).collect();
+            names.extend(PARAMS.lock().iter().map(|p| p.module));
             names.sort_unstable();
+            names.dedup();
             names.into_iter().map(dir).collect()
         }
         [m] => {
-            drivers(m).next()?;
-            Vec::from([dir("drivers"), file("uevent", String::new())])
+            let mut out = Vec::new();
+            if drivers(m).next().is_some() {
+                out.push(dir("drivers"));
+            }
+            if !params(m).is_empty() {
+                out.push(dir("parameters"));
+            }
+            if out.is_empty() {
+                return None;
+            }
+            out.push(file("uevent", String::new()));
+            out
         }
-        [m, "drivers"] => drivers(m)
-            .map(|(b, d)| link(&format!("{b}:{d}"), format!("../../../bus/{b}/drivers/{d}")))
-            .collect(),
+        [m, "drivers"] => {
+            drivers(m).next()?;
+            drivers(m)
+                .map(|(b, d)| link(&format!("{b}:{d}"), format!("../../../bus/{b}/drivers/{d}")))
+                .collect()
+        }
+        [m, "parameters"] => {
+            let params = params(m);
+            if params.is_empty() {
+                return None;
+            }
+            params.into_iter().map(|p| file(p.name, (p.read)())).collect()
+        }
         _ => return None,
     };
     Some(out)
@@ -387,5 +439,20 @@ mod tests {
         assert!(!is_uevent("devices/pci0000:00/0000:00:09.0/uevent"));
         assert_eq!(devices_entries(&[PCI_ROOT, "0000:00:09.0"]), None);
         assert_eq!(bus_entries(&["usb"]), None);
+    }
+
+    fn yes() -> String {
+        String::from("Y\n")
+    }
+
+    #[test]
+    fn a_module_has_the_parameters_that_the_kernel_added() {
+        assert_eq!(module_entries(&["test_param"]), None);
+        add_param(Param { module: "test_param", name: "enabled", read: yes });
+        assert!(names(&module_entries(&[]).unwrap()).contains(&"test_param"));
+        assert_eq!(names(&module_entries(&["test_param"]).unwrap()), ["parameters", "uevent"]);
+        let p = module_entries(&["test_param", "parameters"]).unwrap();
+        assert_eq!(p, [(String::from("enabled"), Kind::File(b"Y\n".to_vec()))]);
+        assert_eq!(module_entries(&["test_param", "drivers"]), None);
     }
 }

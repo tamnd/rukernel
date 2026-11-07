@@ -63,6 +63,8 @@ pub mod kfs;
 mod mm;
 mod placed;
 
+pub use bus::{Param, add_param};
+
 use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::String;

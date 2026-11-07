@@ -27,6 +27,7 @@ members = [
     "net/rk-net",
     "net/rk-net-inet",
     "net/rk-net-unix",
+    "sec/rk-lsm-apparmor",
     "tools/rk-abigen",
     "xtask",
 ]
@@ -70,6 +71,7 @@ rk-fs-xfs = { path = "fs/rk-fs-xfs", version = "0.5.0" }
 rk-net = { path = "net/rk-net", version = "0.5.0" }
 rk-net-inet = { path = "net/rk-net-inet", version = "0.5.0" }
 rk-net-unix = { path = "net/rk-net-unix", version = "0.5.0" }
+rk-lsm-apparmor = { path = "sec/rk-lsm-apparmor", version = "0.5.0" }
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 
 [workspace.lints.rust]
