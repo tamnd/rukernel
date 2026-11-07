@@ -443,6 +443,7 @@ const BOOT_TESTS: &[&str] = &[
     "tty",
     "smp",
     "blk",
+    "apparmor",
     "net",
     "inet",
     "netcfg",
@@ -1870,7 +1871,9 @@ fn qemu(args: &[String]) -> Result {
 /// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
-        "init" | "tty" | "smp" | "blk" | "inet" => kernel.with_file_name("user-init").exists(),
+        "init" | "tty" | "smp" | "blk" | "apparmor" | "inet" => {
+            kernel.with_file_name("user-init").exists()
+        }
         "busybox" | "netcfg" | "inet6" | "netns" => kernel.with_file_name("busybox-ready").exists(),
         "ltp" => kernel.with_file_name("initramfs-ltp.cpio").exists(),
         "kselftest" | "gvisor" | "fstests" => {
@@ -1969,6 +1972,8 @@ fn base_cmdline(test: &str) -> String {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "smp" => String::from("console=ttyS0 rk.test=init -- smp"),
         "blk" => String::from("console=ttyS0 rk.test=init -- blk"),
+        // AppArmor is active only with `apparmor=1`. The other checks of init run without it.
+        "apparmor" => String::from("console=ttyS0 rk.test=init apparmor=1 -- only apparmor"),
         // The address, the netmask and the gateway of the user network of QEMU.
         "inet" => {
             String::from("console=ttyS0 rk.test=init ip=10.0.2.15::10.0.2.2:255.255.255.0 -- inet")
@@ -2001,6 +2006,7 @@ fn pass_line(test: &str) -> String {
         "tty"
             | "smp"
             | "blk"
+            | "apparmor"
             | "inet"
             | "netcfg"
             | "inet6"
@@ -2516,7 +2522,7 @@ const AARCH64_TESTS: &[&str] =
 /// also needs an arm64 BusyBox from `RK_BUSYBOX_AARCH64`, which tools/busybox/build.sh makes. The
 /// `blk` and `inet` tests also run with virtio-pci devices on the PCI bus of the ECAM host, see
 /// `AARCH64_PCI_RUNS`.
-const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "inet", "busybox"];
+const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "apparmor", "inet", "busybox"];
 
 /// The time limit of each test of `AARCH64_USER_TESTS`. QEMU emulates each instruction, and the
 /// `init` test runs all of the general checks of init.

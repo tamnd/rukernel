@@ -144,6 +144,27 @@ pub(crate) fn write_with(
     Ok(done as u64)
 }
 
+/// Writes up to `count` bytes from user memory at `buf` to `file` with `f`. A file that takes
+/// each write whole gets all the bytes in one call. Another file gets them in steps, as
+/// [`write_with`].
+fn write_file_with(
+    cx: &Cx<'_>,
+    file: &File,
+    buf: u64,
+    count: u64,
+    mut f: impl FnMut(u64, &[u8]) -> Result<usize, Errno>,
+) -> SysResult {
+    if !file.ops().whole_write() {
+        return write_with(cx, buf, count, f);
+    }
+    let count = (count as usize).min(MAX_RW_COUNT);
+    let mut data = Vec::new();
+    data.try_reserve_exact(count).map_err(|_| Errno::ENOMEM)?;
+    data.resize(count, 0);
+    cx.vm()?.read(buf as usize, &mut data)?;
+    f(0, &data).map(|n| n as u64)
+}
+
 pub(crate) fn read(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
     let file = cx.file(fd)?;
     if let Some(sock) = rk_net::socket_of(&file) {
@@ -168,7 +189,7 @@ pub(crate) fn write(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
         );
     }
     let count = fsize_count(cx, &file, write_pos(&file), count)?;
-    sigpipe(cx, write_sync(&file, write_with(cx, buf, count, |_, b| file.write(b))))
+    sigpipe(cx, write_sync(&file, write_file_with(cx, &file, buf, count, |_, b| file.write(b))))
 }
 
 /// Makes a write that wrote some bytes durable for `O_SYNC`, `O_DSYNC` and `S_SYNC`, as
@@ -252,7 +273,8 @@ pub(crate) fn pwrite(cx: &Cx<'_>, fd: u64, buf: u64, count: u64, offset: u64) ->
     // A file with `O_APPEND` takes the write at the end, as `generic_write_checks` of Linux.
     let offset = if file.flags().append() { write_pos(&file) } else { offset };
     let count = fsize_count(cx, &file, offset, count)?;
-    write_sync(&file, write_with(cx, buf, count, |done, b| file.write_at(offset + done, b)))
+    let write = |done, b: &[u8]| file.write_at(offset + done, b);
+    write_sync(&file, write_file_with(cx, &file, buf, count, write))
 }
 
 pub(crate) fn read_iovecs(
@@ -445,7 +467,9 @@ pub(crate) fn pwritev2(
                 continue;
             }
             let at = offset + done;
-            let n = match write_with(cx, v.iov_base, len, |d, b| file.write_at(at + d, b)) {
+            let n = match write_file_with(cx, &file, v.iov_base, len, |d, b| {
+                file.write_at(at + d, b)
+            }) {
                 Ok(n) => n,
                 Err(e) if done == 0 => return sigpipe(cx, Err(e)),
                 Err(_) => break,
@@ -541,7 +565,7 @@ pub(crate) fn writev_file(cx: &Cx<'_>, file: &File, iovs: &[Iovec], nowait: bool
         if len == 0 {
             continue;
         }
-        let n = match write_with(cx, v.iov_base, len, |_, b| write(b)) {
+        let n = match write_file_with(cx, file, v.iov_base, len, |_, b| write(b)) {
             Ok(n) => n,
             Err(e) if done == 0 => return sigpipe(cx, Err(e)),
             Err(_) => break,

@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The AppArmor module, as security/apparmor of Linux, with its securityfs tree in /sys/kernel/security/apparmor: `features/`, `profiles`, `revision`, `.ns_name`, `.ns_level`, `.stacked`, `.load`, `.replace`, `.remove` and `policy/`. The module is on with `apparmor=1` or when `lsm=` names it. /sys/module/apparmor/parameters/enabled shows the state. A write to a securityfs file of the tree comes in one piece, not in 64 KiB pieces. The load of a policy gives EPROTO for now (#540)
+
 ## [0.5.13] - 2026-11-08
 
 ### Added

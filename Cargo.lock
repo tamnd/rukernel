@@ -182,6 +182,16 @@ name = "rk-lib"
 version = "0.5.13"
 
 [[package]]
+name = "rk-lsm-apparmor"
+version = "0.5.12"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-fs-sys",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-mm"
 version = "0.5.13"
 dependencies = [
@@ -291,6 +301,7 @@ dependencies = [
  "rk-fs-sys",
  "rk-fs-tmpfs",
  "rk-fs-xfs",
+ "rk-lsm-apparmor",
  "rk-mm",
  "rk-net",
  "rk-net-inet",

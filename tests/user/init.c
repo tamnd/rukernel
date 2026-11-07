@@ -15316,6 +15316,95 @@ static void test_user_ns(void)
 	unlink("/tmp/userns.mine");
 }
 
+/* Reads up to size - 1 bytes of the file at path to buf and ends them with 0. Gives the count or -1. */
+static int aa_read(const char *path, char *buf, int size)
+{
+	int fd = open(path, O_RDONLY), n;
+
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, size - 1);
+	close(fd);
+	buf[n > 0 ? n : 0] = 0;
+	return n;
+}
+
+/* Writes len bytes of data to the file at path in one write. Gives 0 or the errno of the open or the write. */
+static int aa_write(const char *path, const char *data, size_t len, int flags)
+{
+	int fd = open(path, O_WRONLY | flags), r = 0;
+
+	if (fd < 0)
+		return errno;
+	if (write(fd, data, len) < 0)
+		r = errno;
+	close(fd);
+	return r;
+}
+
+/* AppArmor with apparmor=1, as security/apparmor of Linux: the module, its parameter and its files in securityfs. */
+static void test_apparmor(void)
+{
+	static char buf[65536], big[200000];
+	unsigned long long ids[4] = { 0 };
+	unsigned int size = sizeof(ids);
+	struct stat st;
+	int n, status, fd, ok;
+	pid_t pid;
+	DIR *d;
+	struct dirent *e;
+
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("apparmor: the boot log names AppArmor after Yama", n > 0 && strstr(buf, "LSM: initializing lsm=capability,yama,apparmor") != NULL);
+	check("apparmor: lsm_list_modules gives AppArmor last", syscall(461, ids, &size, 0) == 3 && ids[0] == 100 && ids[1] == 105 && ids[2] == 104);
+	mkdir("/sys", 0755);
+	check("apparmor: sysfs mounts", mount("sysfs", "/sys", "sysfs", 0, NULL) == 0);
+	check("apparmor: the parameter enabled is Y", aa_read("/sys/module/apparmor/parameters/enabled", buf, 64) == 2 && strcmp(buf, "Y\n") == 0);
+	check("apparmor: securityfs mounts", mount("securityfs", "/sys/kernel/security", "securityfs", 0, NULL) == 0);
+	check("apparmor: lsm names AppArmor", aa_read("/sys/kernel/security/lsm", buf, 64) == 24 && strcmp(buf, "capability,yama,apparmor") == 0);
+	check("apparmor: the directory apparmor is there", stat("/sys/kernel/security/apparmor", &st) == 0 && S_ISDIR(st.st_mode));
+	check("apparmor: .load can be written by all, as on Linux", stat("/sys/kernel/security/apparmor/.load", &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 07777) == 0666);
+	check("apparmor: policy/.load has the mode 0640", stat("/sys/kernel/security/apparmor/policy/.load", &st) == 0 && (st.st_mode & 07777) == 0640);
+	check("apparmor: policy has profiles, raw_data and namespaces", stat("/sys/kernel/security/apparmor/policy/profiles", &st) == 0 && S_ISDIR(st.st_mode) && stat("/sys/kernel/security/apparmor/policy/raw_data", &st) == 0 && stat("/sys/kernel/security/apparmor/policy/namespaces", &st) == 0);
+	ok = 0;
+	d = opendir("/sys/kernel/security/apparmor");
+	while (d && (e = readdir(d)) != NULL)
+		ok += strcmp(e->d_name, "features") == 0 || strcmp(e->d_name, "policy") == 0 || strcmp(e->d_name, "profiles") == 0;
+	if (d)
+		closedir(d);
+	check("apparmor: the directory lists features, policy and profiles", ok == 3);
+	check("apparmor: features/domain/version is 1.2", aa_read("/sys/kernel/security/apparmor/features/domain/version", buf, 64) == 4 && strcmp(buf, "1.2\n") == 0);
+	check("apparmor: features/policy/versions/v9 is yes", aa_read("/sys/kernel/security/apparmor/features/policy/versions/v9", buf, 64) == 4 && strcmp(buf, "yes\n") == 0);
+	check("apparmor: features/capability is 0xffffff", aa_read("/sys/kernel/security/apparmor/features/capability", buf, 64) == 9 && strcmp(buf, "0xffffff\n") == 0);
+	check("apparmor: features/policy/outofband is 0x000001", aa_read("/sys/kernel/security/apparmor/features/policy/outofband", buf, 64) == 9 && strcmp(buf, "0x000001\n") == 0);
+	check("apparmor: features has no compressed_load", stat("/sys/kernel/security/apparmor/features/policy/compressed_load", &st) < 0 && errno == ENOENT);
+	check("apparmor: profiles is empty", aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
+	check("apparmor: .ns_name is root", aa_read("/sys/kernel/security/apparmor/.ns_name", buf, 64) == 5 && strcmp(buf, "root\n") == 0);
+	check("apparmor: .ns_level is 0 and .stacked is no", aa_read("/sys/kernel/security/apparmor/.ns_level", buf, 64) == 2 && strcmp(buf, "0\n") == 0 && aa_read("/sys/kernel/security/apparmor/.stacked", buf, 64) == 3 && strcmp(buf, "no\n") == 0);
+	check("apparmor: revision is 0", aa_read("/sys/kernel/security/apparmor/revision", buf, 64) == 2 && strcmp(buf, "0\n") == 0);
+	check("apparmor: a load of a policy that does not unpack gives EPROTO", aa_write("/sys/kernel/security/apparmor/.load", "x", 1, 0) == EPROTO);
+	memset(big, 'x', sizeof(big));
+	check("apparmor: a large replace with O_TRUNC gives EPROTO", aa_write("/sys/kernel/security/apparmor/.replace", big, sizeof(big), O_TRUNC) == EPROTO);
+	fd = open("/sys/kernel/security/apparmor/.load", O_WRONLY);
+	check("apparmor: a load at an offset that is not 0 gives ESPIPE", fd >= 0 && pwrite(fd, "x", 1, 1) < 0 && errno == ESPIPE);
+	close(fd);
+	check("apparmor: a remove of a profile that is not there gives ENOENT", aa_write("/sys/kernel/security/apparmor/policy/.remove", "/bin/none\n", 10, 0) == ENOENT);
+	check("apparmor: a read of .load gives EINVAL", aa_read("/sys/kernel/security/apparmor/.load", buf, 64) < 0 && errno == EINVAL);
+	pid = fork();
+	if (pid == 0) {
+		ok = setresgid(1000, 1000, 1000) == 0 && setresuid(1000, 1000, 1000) == 0;
+		ok &= open("/sys/kernel/security/apparmor/profiles", O_RDONLY) < 0 && errno == EACCES;
+		ok &= aa_write("/sys/kernel/security/apparmor/.load", "x", 1, 0) == EACCES;
+		ok &= aa_write("/sys/kernel/security/apparmor/.remove", "/bin/none", 9, 0) == EACCES;
+		ok &= aa_read("/sys/kernel/security/apparmor/features/domain/stack", buf, 64) == 4;
+		_exit(ok ? 0 : 1);
+	}
+	check("apparmor: a user cannot see or change the policy, and can read the features", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	umount("/sys/kernel/security");
+	umount("/sys");
+}
+
 int main(int argc, char **argv)
 {
 	const char *name = strrchr(argv[0], '/');
@@ -15360,6 +15449,8 @@ int main(int argc, char **argv)
 		test_user_ns();
 	if (argc > 1 && strcmp(argv[1], "lsm") == 0)
 		test_lsm();
+	if (argc > 1 && strcmp(argv[1], "apparmor") == 0)
+		test_apparmor();
 	if (argc > 1 && strcmp(argv[1], "audit") == 0)
 		test_audit();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0) {

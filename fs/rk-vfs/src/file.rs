@@ -136,6 +136,13 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// Tells if each `write` gives all of its bytes in one call, as a file of Linux whose
+    /// `write` copies the whole user buffer. A policy load of AppArmor is such a write. The
+    /// write of another file comes in steps of 64 KiB.
+    fn whole_write(&self) -> bool {
+        false
+    }
+
     /// Moves the position for `lseek`, for a file that gives its own meaning to the position, as
     /// `/dev/kmsg`. `None` uses the `lseek` of the VFS.
     fn llseek(&self, _file: &File, _offset: i64, _whence: Whence) -> Option<Result<u64>> {
