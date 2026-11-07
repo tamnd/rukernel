@@ -832,7 +832,8 @@ pub(crate) fn statx(
     if flags & sync == sync || mask as u32 & STATX__RESERVED != 0 || flags & !valid != 0 {
         return Err(Errno::EINVAL);
     }
-    let (meta, inode, mnt_id) = lookup(cx, dirfd, path, flags)?;
+    let (meta, inode, at) = lookup_at(cx, dirfd, path, flags)?;
+    let mnt_id = at.as_ref().map_or(0, |at| at.mount.id());
     let mut s = Statx::new_zeroed();
     // The unique ID if the caller asks for it, else the ID of mountinfo, as `vfs_statx_path` of
     // Linux.
@@ -854,6 +855,12 @@ pub(crate) fn statx(
                 & u64::from(inode.statx_attributes_mask());
         s.stx_attributes = u64::from(f) & known;
         s.stx_attributes_mask = known;
+    }
+    // Each file tells if it is the root of its mount, as `vfs_statx_path` of Linux. systemd 261
+    // needs the bit in the mask to tell if a path is a mount point.
+    s.stx_attributes_mask |= STATX_ATTR_MOUNT_ROOT;
+    if at.as_ref().is_some_and(Location::is_mount_root) {
+        s.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
     }
     s.stx_blksize = meta.blksize;
     s.stx_nlink = meta.nlink;
@@ -892,6 +899,7 @@ const STATX_ATTR_COMPRESSED: u64 = 0x4;
 const STATX_ATTR_IMMUTABLE: u64 = 0x10;
 const STATX_ATTR_APPEND: u64 = 0x20;
 const STATX_ATTR_NODUMP: u64 = 0x40;
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
 
 /// The bits of `f_flags` of `statfs`, as `ST_*` of Linux. `ST_VALID` tells that the field is
 /// set.

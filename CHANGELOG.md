@@ -13,6 +13,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- `statx` gives `STATX_ATTR_MOUNT_ROOT` in `stx_attributes_mask` for each file, and in `stx_attributes` for the root of a mount, as `vfs_statx_path` of Linux. systemd 261 of Ubuntu 26.10 and systemd 262 of Arch need it to tell if /proc, /sys and /dev are mount points, and else stop at the start with `Protocol driver not attached`. tools/missing has the reports of these two images (#543).
 - tools/systemd/build.sh takes an optional docker image, and makes the tree of the `systemd` boot test also from Ubuntu 26.04 and 26.10, Fedora 44 and Arch. tools/missing has the reports of the missing files of these images, from the `systemd` boot test with `rk.missing=1`, and report.py takes `--test NAME` for the name of the boot test. The initramfs of a root file system has each group of hard links once, as one inode, so the Ubuntu tree with the 115 hard links of its Rust coreutils is 150 MB and not 1.5 GB (#543).
 - The file `name_assign_type` of a network interface in sysfs, as on Linux: 2 for lo, 1 for a name that the kernel gives with `eth%d`, 3 for a name that the user gives at creation, and 4 after a rename. udevd now renames eth0 to the same name as on Linux, `enp0s3` for virtio-net-pci on x86_64 and `enp0s1` for virtio-net-pci on arm64, and the `udevd` boot test checks the name that `net_id` gives (#538).
 
