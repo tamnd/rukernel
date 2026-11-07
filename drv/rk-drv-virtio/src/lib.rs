@@ -90,8 +90,18 @@ impl Probe {
         place: impl Fn(&str) -> alloc::string::String,
         on: rk_vfs::bus::Transport,
     ) {
-        let driver = match id {
-            DEVICE_BLK => blk::probe(t, self.disks).map(|(name, kind)| {
+        let mut dev = rk_vfs::bus::VirtioDevice {
+            index: bus,
+            transport: on,
+            device: id,
+            vendor: u32::from(VIRTIO_VENDOR),
+            driver: None,
+        };
+        // The disk and the interface are in the directory of the virtio device, so the device
+        // must be on the bus before the driver adds them and sends their events.
+        rk_vfs::bus::add_virtio(dev.clone());
+        dev.driver = match id {
+            DEVICE_BLK => blk::probe(t, self.disks, bus).map(|(name, kind)| {
                 rk_frame::println!("virtio: {name} on {}", place(&kind));
                 self.disks += 1;
                 "virtio_blk"
@@ -104,13 +114,7 @@ impl Probe {
             }),
             _ => None,
         };
-        rk_vfs::bus::add_virtio(rk_vfs::bus::VirtioDevice {
-            index: bus,
-            transport: on,
-            device: id,
-            vendor: u32::from(VIRTIO_VENDOR),
-            driver,
-        });
+        rk_vfs::bus::add_virtio(dev);
     }
 }
 

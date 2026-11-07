@@ -161,11 +161,15 @@ pub fn send(event: &Event) {
 
 /// The path of the device `d` in sysfs, below `/sys`. sysfs puts each device in
 /// `/devices/virtual/CLASS/NAME`, where `NAME` is the last part of the name in `/dev`. A handler
-/// of an input device is in the directory of its input device.
+/// of an input device is in the directory of its input device. A disk of a virtio device is in
+/// `VIRTIO/block/NAME`, where `VIRTIO` is the directory of the virtio device.
 pub fn devpath(d: &DeviceInfo) -> String {
     let name = d.name.rsplit('/').next().unwrap_or(&d.name);
     if let Some(parent) = crate::input::parent(d) {
         return format!("{parent}/{name}");
+    }
+    if let Some(parent) = crate::bus::block_parent(d.rdev).filter(|_| d.block) {
+        return format!("{parent}/{}/{name}", d.class);
     }
     format!("/devices/virtual/{}/{name}", d.class)
 }
@@ -322,6 +326,26 @@ mod tests {
         let s = strings(&msg);
         assert_eq!(s[6], "DEVNAME=net/tun");
         assert_eq!(s[7], "X=1");
+    }
+
+    #[test]
+    fn a_disk_of_a_virtio_device_is_in_its_directory() {
+        crate::bus::add_virtio(crate::bus::VirtioDevice {
+            index: 1,
+            transport: crate::bus::Transport::Pci(0, 2, 0),
+            device: 2,
+            vendor: 0x1af4,
+            driver: Some("virtio_blk"),
+        });
+        crate::bus::set_block_parent(makedev(254, 0), 1);
+        let d = DeviceInfo {
+            name: String::from("vda"),
+            class: "block",
+            rdev: makedev(254, 0),
+            block: true,
+            perm: 0o660,
+        };
+        assert_eq!(devpath(&d), "/devices/pci0000:00/0000:00:02.0/virtio1/block/vda");
     }
 
     #[test]

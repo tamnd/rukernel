@@ -47,16 +47,23 @@ fn key(d: &NetDevice) -> usize {
     core::ptr::from_ref(d) as usize
 }
 
-/// The path of the network device with the name `name` in sysfs.
-fn net_path(name: &str) -> String {
-    format!("/devices/virtual/net/{name}")
+/// The path of the network device `d` with the name `name` in sysfs, below `/sys`. An interface
+/// of a virtio device is in `VIRTIO/net/NAME`, where `VIRTIO` is the directory of the virtio
+/// device, as on Linux. Another interface is in `/devices/virtual/net/NAME`.
+#[must_use]
+pub fn path(d: &NetDevice, name: &str) -> String {
+    let parent = d.parent().filter(|(_, bus)| *bus == "virtio");
+    match parent.and_then(|(p, _)| rk_vfs::bus::virtio_named(&p)) {
+        Some(parent) => format!("{parent}/net/{name}"),
+        None => format!("/devices/virtual/net/{name}"),
+    }
 }
 
 /// The event `action` of the network device `d`, with the variables of `netdev_uevent` of
 /// Linux. `old` is the old path for the event `move`.
 fn net_event(d: &NetDevice, action: Action, old: Option<&str>) -> Event {
     let name = d.name();
-    let mut e = Event::new(action, net_path(&name), "net");
+    let mut e = Event::new(action, path(d, &name), "net");
     if let Some(old) = old {
         e.add(format!("DEVPATH_OLD={old}"));
     }
@@ -73,8 +80,8 @@ fn net_event(d: &NetDevice, action: Action, old: Option<&str>) -> Event {
 /// and `remove_queue_kobjects` of Linux.
 fn queue_events(d: &NetDevice, action: Action) {
     for q in ["rx-0", "tx-0"] {
-        let path = format!("{}/queues/{q}", net_path(&d.name()));
-        send_here(&Event::new(action, path, "queues").finish());
+        let queue = format!("{}/queues/{q}", path(d, &d.name()));
+        send_here(&Event::new(action, queue, "queues").finish());
     }
 }
 
@@ -96,7 +103,7 @@ fn netdev_event(d: &NetDevice, event: dev::Event) {
         dev::Event::Name => {
             let old = NAMES.lock().insert(key(d), d.name());
             if let Some(old) = old {
-                send_here(&net_event(d, Action::Move, Some(&net_path(&old))).finish());
+                send_here(&net_event(d, Action::Move, Some(&path(d, &old))).finish());
             }
         }
         _ => {}

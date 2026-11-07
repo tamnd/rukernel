@@ -397,6 +397,12 @@ const SYSTEMD_TIMEOUT: Duration = Duration::from_secs(1800);
 /// The memory of the `systemd` boot test. The initramfs has all of the Debian tree.
 const SYSTEMD_MEMORY: &str = "2G";
 
+/// The boot tests that boot the tree of the `systemd` test with another check. The init script
+/// of the tree gets the name of the test as its argument. In the `udevd` test, the check asks
+/// udevd for the events of all devices with `udevadm trigger` and waits for them with
+/// `udevadm settle`. Then /dev/disk/by-path must have a link to vda, from `path_id` of udev.
+const SYSTEMD_TESTS: &[&str] = &["udevd"];
+
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -448,6 +454,7 @@ const BOOT_TESTS: &[&str] = &[
     "alpine",
     "debian",
     "systemd",
+    "udevd",
     "fstests",
 ];
 
@@ -731,7 +738,7 @@ if [ -x /usr/bin/gdb ]; then
     grep -q 'rk: (groupid=0, jobs=1): err= 0' /tmp/fio.log || { cat /tmp/fio.log; exit 1; }
     echo 'alpine: fio done'
     udevadm info --query=all --name=/dev/vda > /tmp/udev.log 2>&1 || { cat /tmp/udev.log; exit 1; }
-    grep -q '^P: /devices/virtual/block/vda$' /tmp/udev.log
+    grep -q '^P: /devices/pci0000:00/[^/]*/virtio[0-9]*/block/vda$' /tmp/udev.log
     grep -q '^E: DEVNAME=/dev/vda$' /tmp/udev.log
     grep -q '^E: DEVTYPE=disk$' /tmp/udev.log
     grep -q '^E: SUBSYSTEM=block$' /tmp/udev.log
@@ -964,6 +971,43 @@ running | degraded) [ -n "$other" ] || echo 'rk-systemd: pass' ;;
 esac
 systemctl poweroff
 END
+# The `udevd` test: udevd makes the links of the disk from the events that a write to each file
+# `uevent` asks for.
+if [ "${1:-}" = udevd ]; then
+cat > /usr/local/bin/rk-check << 'END'
+#!/bin/sh
+other=
+state=$(systemctl is-system-running --wait || true)
+echo "rk-udevd: state $state"
+echo "rk-udevd: udevadm $(udevadm --version)"
+systemctl is-active -q systemd-udevd.service || other="$other systemd-udevd.service"
+udevadm trigger --action=add || other="$other trigger"
+if udevadm settle --timeout=120; then
+    echo 'rk-udevd: udevadm settle ends'
+else
+    other="$other settle"
+fi
+udevadm info -q property /dev/vda | grep '^ID_PATH' | sed 's/^/rk-udevd: vda: /'
+vda=
+for link in /dev/disk/by-path/*; do
+    [ -L "$link" ] || continue
+    echo "rk-udevd: $link -> $(readlink "$link")"
+    [ "$(readlink -f "$link")" = /dev/vda ] && vda="$vda $link"
+done
+[ -n "$vda" ] || other="$other /dev/disk/by-path"
+echo "rk-udevd: interfaces $(ls /sys/class/net | tr '\n' ' ')"
+for unit in $(systemctl list-units --failed --no-legend --plain | awk '{print $1}'); do
+    echo "rk-udevd: failed $unit"
+    systemctl status --no-pager --lines=5 "$unit" | sed 's/^/rk-udevd:   /'
+    other="$other $unit"
+done
+[ -z "$other" ] || echo "rk-udevd: bad:$other"
+case $state in
+running | degraded) [ -n "$other" ] || echo 'rk-udevd: pass' ;;
+esac
+systemctl poweroff
+END
+fi
 chmod 755 /usr/local/bin/rk-check
 echo "rk-systemd: $(/usr/lib/systemd/systemd --version | head -n 1)"
 exec /usr/lib/systemd/systemd
@@ -1780,6 +1824,7 @@ fn can_run(kernel: &Path, test: &str) -> bool {
             kernel.with_file_name(format!("initramfs-{test}.cpio")).exists()
         }
         t if ROOTFS.iter().any(|r| r.name == t) => rootfs_initramfs(kernel, t).exists(),
+        t if SYSTEMD_TESTS.contains(&t) => rootfs_initramfs(kernel, "systemd").exists(),
         _ => true,
     }
 }
@@ -1884,15 +1929,19 @@ fn base_cmdline(test: &str) -> String {
         t if t == "fstests" || ROOTFS.iter().any(|r| r.name == t) => {
             String::from("console=ttyS0 rk.test=init rdinit=/init")
         }
+        // The init script of the `systemd` tree gets the name of the test.
+        t if SYSTEMD_TESTS.contains(&t) => {
+            format!("console=ttyS0 rk.test=init rdinit=/init -- {t}")
+        }
         _ => format!("console=ttyS0 rk.test={test}"),
     }
 }
 
-/// The line that the kernel prints when the boot test `test` passes. In the `systemd` test, the
-/// check service prints the line.
+/// The line that the kernel prints when the boot test `test` passes. In the `systemd` test and
+/// the tests of `SYSTEMD_TESTS`, the check service prints the line.
 fn pass_line(test: &str) -> String {
-    if test == "systemd" {
-        return String::from("rk-systemd: pass");
+    if test == "systemd" || SYSTEMD_TESTS.contains(&test) {
+        return format!("rk-{test}: pass");
     }
     let test = if matches!(
         test,
@@ -2251,8 +2300,8 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .and_then(|s| s.parse().ok())
                 .map_or(FSTESTS_TIMEOUT, Duration::from_secs);
             (cmd, timeout)
-        } else if *test == "systemd" {
-            let initrd = rootfs_initramfs(&kernel, test);
+        } else if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
+            let initrd = rootfs_initramfs(&kernel, "systemd");
             let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
             // QEMU uses the last `-m`.
             cmd.args(["-m", SYSTEMD_MEMORY]);
@@ -2282,7 +2331,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         };
         // The `alpine` test runs fio on the disk. In the `systemd` test, a unit with
         // `DevicePolicy=closed` opens the disk.
-        if matches!(*test, "blk" | "alpine" | "systemd") {
+        if matches!(*test, "blk" | "alpine" | "systemd" | "udevd") {
             let disk = kernel.with_file_name("blk.img");
             write_blk_disk(&disk)?;
             cmd.arg("-drive")
@@ -2304,7 +2353,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         // the network with BusyBox. The `inet6` test uses the IPv6 network of QEMU: the prefix
         // fec0::/64 and the router fec0::2. In the `systemd` test, a unit with `IPAccounting=yes`
         // pings the gateway.
-        if matches!(*test, "net" | "inet" | "netcfg" | "inet6" | "systemd") {
+        if matches!(*test, "net" | "inet" | "netcfg" | "inet6" | "systemd" | "udevd") {
             cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.
@@ -2325,7 +2374,11 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .args(["-device", "virtio-blk-pci,drive=disk2"]);
         }
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
-        let want = if *test == "systemd" { QEMU_POWER_OFF } else { QEMU_PASS };
+        let want = if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
+            QEMU_POWER_OFF
+        } else {
+            QEMU_PASS
+        };
         let mut passed = status == Some(want) && log.contains(&pass_line(test));
         if *test == "blk" && passed && !blk_disk_has_note(&kernel.with_file_name("blk.img"))? {
             println!("boot test blk: the disk image does not have the data that the guest wrote");
