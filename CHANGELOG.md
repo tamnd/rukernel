@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.11] - 2026-11-07
+
 ### Added
 
 - fanotify groups with `FAN_REPORT_PIDFD`, as fs/notify/fanotify/fanotify_user.c of Linux. Each event has an info record with a new process file descriptor of the process of the event, after the records of the handles. With `FAN_REPORT_TID`, the descriptor refers to the thread and has `PIDFD_THREAD`. A process that has gone or that the reader does not see gives `FAN_NOPIDFD`, another error gives `FAN_EPIDFD`, and with `FAN_REPORT_FD_ERROR` the record has the negative error. The pid of an event is now the ID in the PID namespace of the reader, or 0 if the reader does not see the process. LTP fanotify21 now passes (#539).
@@ -1439,6 +1441,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.11]: https://github.com/tamnd/rukernel/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/tamnd/rukernel/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/tamnd/rukernel/compare/v0.5.8...v0.5.9
 [0.5.8]: https://github.com/tamnd/rukernel/compare/v0.5.7...v0.5.8
