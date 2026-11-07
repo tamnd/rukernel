@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The commit of nf_tables checks the chains that each base chain reaches with its jumps and verdict maps, as `nft_table_validate` and `nft_chain_validate` of Linux. A `masquerade`, `snat`, `dnat`, `redirect`, `reject` or xtables extension in a chain that a base chain of an other type or hook reaches gives `EOPNOTSUPP` (`EINVAL` for an extension), and a jump to the depth 16 gives `EMLINK`. Before, these rules did not match the packets. Linux runs the batch again to give the error to the message of the rule; rukernel gives it to the batch (#542).
+
 ## [0.5.11] - 2026-11-07
 
 ### Added
@@ -13,7 +17,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The dump of a rule of nf_tables gives the name of the set of each `lookup` and `dynset` expression, as the `dump` of nft_lookup.c and nft_dynset.c of Linux, and not the name with `%d` or the ID of the set in the batch. Before this change, `nft list ruleset` gave "Unknown set '__set%d' in lookup expression" for a rule with an anonymous set or map (#542).
 - The disks and the network interfaces of the virtio devices are in the directories of their virtio devices in sysfs, as on Linux: `/sys/block/vda` links to `/sys/devices/pci0000:00/0000:00:02.0/virtio1/block/vda`, and the interface has the link `device`. A write of `add`, `change` or `remove` to their `uevent` files sends the event, with the optional UUID and variables, as `kobject_synth_uevent` of Linux. The new `udevd` boot test boots the image of the `systemd` boot test, runs `udevadm trigger --action=add` and `udevadm settle`, and checks the links of vda in /dev/disk/by-path. tools/systemd/build.sh now installs udev, and takes an optional architecture (#539).
 - The `meta` keys `mark`, `iifname`, `oifname`, `iiftype` and `oiftype` of nf_tables, and `meta mark set`, as net/netfilter/nft_meta.c of Linux. A packet has a mark, as `skb->mark` of Linux, which a rule sets and reads. A packet with no device does not match `iifname`, `oifname`, `iiftype` and `oiftype`. A rule that sets an other key gives `EOPNOTSUPP`. The `bitwise` expression also has the shifts `NFT_BITWISE_LSHIFT` and `NFT_BITWISE_RSHIFT`, as `meta mark set meta mark << 2` uses (#542).
-- The commit of nf_tables checks the chains that each base chain reaches with its jumps and verdict maps, as `nft_table_validate` and `nft_chain_validate` of Linux. A `masquerade`, `snat`, `dnat`, `redirect`, `reject` or xtables extension in a chain that a base chain of an other type or hook reaches gives `EOPNOTSUPP` (`EINVAL` for an extension), and a jump to the depth 16 gives `EMLINK`. Before, these rules did not match the packets. Linux runs the batch again to give the error to the message of the rule; rukernel gives it to the batch (#542).
 
 ## [0.5.10] - 2026-11-07
 
