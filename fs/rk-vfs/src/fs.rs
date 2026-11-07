@@ -18,6 +18,7 @@ use crate::inode::{
     FileType, InodeRef, Result, SetAttr, check_fixed, check_immutable, iflags, mode,
 };
 use crate::path::{Parent, Walk, resolve};
+use crate::user_ns::UserNs;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -210,9 +211,10 @@ impl FsContext {
     }
 
     /// Puts the context in a copy of its mount name space, for `CLONE_NEWNS`. The root and the
-    /// current directory go to the copies of their mounts.
-    pub fn unshare_namespace(&mut self) {
-        let ns = self.ns.copy(&mut [&mut self.root, &mut self.cwd]);
+    /// current directory go to the copies of their mounts. The user namespace `owner` owns the
+    /// copy.
+    pub fn unshare_namespace(&mut self, owner: Arc<UserNs>) {
+        let ns = self.ns.copy(owner, &mut [&mut self.root, &mut self.cwd]);
         self.ns = ns;
     }
 

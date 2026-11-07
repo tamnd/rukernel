@@ -3,19 +3,19 @@
 
 use crate::cx::{Cx, SysResult};
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::open::O_RDONLY;
 use rk_frame::sync::SpinLock;
 use rk_proc::Process;
 use rk_proc::pid_namespace::{self, PidNamespace};
-use rk_vfs::Location;
 use rk_vfs::cred::{Cred, cap};
 use rk_vfs::file::File;
 use rk_vfs::inode::InodeRef;
 use rk_vfs::nsfs::{NsInode, NsKind};
 use rk_vfs::user_ns::{self, UserNs};
+use rk_vfs::{Location, MountNamespace};
 
 /// `NS_GET_USERNS` of include/uapi/linux/nsfs.h.
 const NS_GET_USERNS: u32 = 0xb701;
@@ -37,8 +37,8 @@ const NS_GET_PID_IN_PIDNS: u32 = 0x8004_b708;
 const NS_GET_TGID_IN_PIDNS: u32 = 0x8004_b709;
 
 /// The `ioctl` commands of a file of nsfs, as `ns_ioctl` in fs/nsfs.c of Linux. A network, PID,
-/// UTS, IPC or time namespace has an owner, and the first user namespace owns the namespaces of
-/// the other kinds.
+/// UTS, IPC, time, mount or cgroup namespace has an owner, and the first user namespace owns
+/// the namespaces of the other kinds.
 pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         NS_GET_USERNS if kind == NsKind::User => user_owner(cx, id),
@@ -61,6 +61,11 @@ pub(crate) fn ioctl(cx: &Cx<'_>, kind: NsKind, id: u32, cmd: u32, arg: u64) -> S
         NS_GET_USERNS if kind == NsKind::Time => {
             let ns = rk_proc::timens::by_id(id).ok_or(Errno::EINVAL)?;
             open_user_ns(cx, Some(ns.user_ns().clone()))
+        }
+        NS_GET_USERNS if kind == NsKind::Cgroup => open_user_ns(cx, Some(cgroup_owner(id))),
+        NS_GET_USERNS if kind == NsKind::Mnt => {
+            let ns = rk_proc::ns::mnt_ns(id).ok_or(Errno::EINVAL)?;
+            open_user_ns(cx, Some(ns.owner().clone()))
         }
         NS_GET_USERNS => open_user_ns(cx, Some(user_ns::init().clone())),
         NS_GET_PARENT if kind == NsKind::Pid => pid_parent(cx, id),
@@ -259,26 +264,62 @@ pub(crate) fn time_inode(ns: Arc<rk_proc::timens::TimeNs>) -> Arc<NsInode> {
 ///
 /// # Errors
 ///
-/// Gives the errors of [`join_user_ns`] for a user namespace. Gives `EPERM` without
-/// `CAP_SYS_ADMIN`, and also without `CAP_SYS_CHROOT` for a mount namespace, as `mntns_install`.
+/// Gives the errors of [`join_user_ns`] for a user namespace, and the errors of
+/// [`may_join_mnt_ns`] for a mount namespace. Gives `EPERM` without `CAP_SYS_ADMIN` for the
+/// other kinds.
 pub(crate) fn install(cx: &Cx<'_>, process: &Process, kind: NsKind, id: u32) -> Result<(), Errno> {
     if kind == NsKind::User {
         // The file keeps the namespace, so the search finds it.
         return join_user_ns(cx, process, user_ns::by_id(id).ok_or(Errno::EINVAL)?);
     }
     let cred = process.cred();
+    if kind == NsKind::Mnt {
+        let ns = rk_proc::ns::mnt_ns(id).ok_or(Errno::EINVAL)?;
+        may_join_mnt_ns(&cred, &ns)?;
+        cx.fs_shared()?.lock().set_namespace(ns);
+        return Ok(());
+    }
     if !cred.capable(cap::SYS_ADMIN) {
         return Err(Errno::EPERM);
     }
-    if kind == NsKind::Mnt {
-        if !cred.capable(cap::SYS_CHROOT) {
-            return Err(Errno::EPERM);
-        }
-        let ns = rk_proc::ns::mnt_ns(id).ok_or(Errno::EINVAL)?;
-        cx.fs_shared()?.lock().set_namespace(ns);
-    }
     // The caller is in the only namespace of the other kinds.
     Ok(())
+}
+
+/// Checks that a process with the credentials `cred` can join the mount namespace `ns`, as
+/// `mntns_install` of Linux.
+///
+/// # Errors
+///
+/// Gives `EPERM` without `CAP_SYS_ADMIN` in the owner of `ns`, or without `CAP_SYS_CHROOT` and
+/// `CAP_SYS_ADMIN` in the user namespace of `cred`.
+pub(crate) fn may_join_mnt_ns(cred: &Cred, ns: &MountNamespace) -> Result<(), Errno> {
+    if !cred.ns_capable(ns.owner(), cap::SYS_ADMIN)
+        || !cred.has_cap(cap::SYS_CHROOT)
+        || !cred.has_cap(cap::SYS_ADMIN)
+        || !rk_vfs::security::capable(cred, cap::SYS_ADMIN, 0)
+    {
+        return Err(Errno::EPERM);
+    }
+    Ok(())
+}
+
+/// The owners of the cgroup namespaces, as `user_ns` of `struct cgroup_namespace` of Linux.
+static CGROUP_OWNERS: SpinLock<BTreeMap<u32, Weak<UserNs>>> = SpinLock::new(BTreeMap::new());
+
+/// Gives the user namespace `owner` the new cgroup namespace `ns`. The entries of the owners that
+/// went away go.
+pub(crate) fn set_cgroup_owner(ns: u32, owner: &Arc<UserNs>) {
+    let mut owners = CGROUP_OWNERS.lock();
+    owners.retain(|_, o| o.strong_count() > 0);
+    owners.insert(ns, Arc::downgrade(owner));
+}
+
+/// The user namespace that owns the cgroup namespace `ns`. The first user namespace owns the
+/// first cgroup namespace, and also a namespace whose owner went away.
+pub(crate) fn cgroup_owner(ns: u32) -> Arc<UserNs> {
+    let owner = CGROUP_OWNERS.lock().get(&ns).and_then(Weak::upgrade);
+    owner.unwrap_or_else(|| user_ns::init().clone())
 }
 
 /// The ID of the IPC namespace of the caller, or 0 for a kernel task.

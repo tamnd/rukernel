@@ -10,6 +10,7 @@
 //! mounts that are slaves of the group.
 
 use crate::inode::{InodeRef, Result};
+use crate::user_ns::{self, UserNs};
 use crate::wait::WaitQueue;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
@@ -866,6 +867,9 @@ pub struct MountNamespace {
     me: Weak<MountNamespace>,
     /// The count of the changes of the mounts, as `event` of `struct mnt_namespace` of Linux.
     event: AtomicU64,
+    /// The user namespace that owns the name space, as `user_ns` of `struct mnt_namespace` of
+    /// Linux.
+    owner: Arc<UserNs>,
 }
 
 /// The waits of `poll` on `/proc/PID/mounts` wait here for a change of the mounts of a name
@@ -875,7 +879,8 @@ static NS_POLL: WaitQueue = WaitQueue::new();
 static NEXT_MOUNT_ID: AtomicU64 = AtomicU64::new(1);
 
 impl MountNamespace {
-    /// Makes a name space with the root `root`. The root mount has the source `rootfs`.
+    /// Makes a name space with the root `root`. The root mount has the source `rootfs`, and the
+    /// first user namespace owns the name space.
     pub fn new(root: InodeRef) -> Arc<Self> {
         let mount = Mount::new(Dentry::new_root(root), MountSource::rootfs());
         let ns = Arc::new_cyclic(|me| Self {
@@ -883,6 +888,7 @@ impl MountNamespace {
             mounts: SpinLock::new(Vec::from([mount.clone()])),
             me: me.clone(),
             event: AtomicU64::new(0),
+            owner: user_ns::init().clone(),
         });
         *mount.ns.lock() = ns.me.clone();
         ATTACHED.lock().push(Arc::downgrade(&mount));
@@ -891,8 +897,9 @@ impl MountNamespace {
 
     /// Makes a copy of the name space with a copy of each mount, for `CLONE_NEWNS`, as
     /// `copy_mnt_ns` of Linux. A copy has the propagation of its mount, so a copy of a shared
-    /// mount is a peer of the mount. `locations` go to the same places in the copy.
-    pub fn copy(&self, locations: &mut [&mut Location]) -> Arc<Self> {
+    /// mount is a peer of the mount. `locations` go to the same places in the copy, and the user
+    /// namespace `owner` owns the copy.
+    pub fn copy(&self, owner: Arc<UserNs>, locations: &mut [&mut Location]) -> Arc<Self> {
         let old = self.mounts();
         let new: Vec<Arc<Mount>> = old
             .iter()
@@ -922,6 +929,7 @@ impl MountNamespace {
             mounts: SpinLock::new(new.clone()),
             me: me.clone(),
             event: AtomicU64::new(0),
+            owner,
         });
         let mut all = ATTACHED.lock();
         for m in &new {
@@ -929,6 +937,11 @@ impl MountNamespace {
             all.push(Arc::downgrade(m));
         }
         ns
+    }
+
+    /// The user namespace that owns the name space.
+    pub fn owner(&self) -> &Arc<UserNs> {
+        &self.owner
     }
 
     /// The root of the name space.
