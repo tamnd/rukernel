@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.12] - 2026-11-08
+
 ### Added
 
 - The commit of nf_tables checks the chains that each base chain reaches with its jumps and verdict maps, as `nft_table_validate` and `nft_chain_validate` of Linux. A `masquerade`, `snat`, `dnat`, `redirect`, `reject` or xtables extension in a chain that a base chain of an other type or hook reaches gives `EOPNOTSUPP` (`EINVAL` for an extension), and a jump to the depth 16 gives `EMLINK`. Before, these rules did not match the packets. Linux runs the batch again to give the error to the message of the rule; rukernel gives it to the batch (#542).
@@ -1447,6 +1449,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.12]: https://github.com/tamnd/rukernel/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/tamnd/rukernel/compare/v0.5.10...v0.5.11
 [0.5.10]: https://github.com/tamnd/rukernel/compare/v0.5.9...v0.5.10
 [0.5.9]: https://github.com/tamnd/rukernel/compare/v0.5.8...v0.5.9
