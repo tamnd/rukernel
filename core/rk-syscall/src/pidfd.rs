@@ -563,18 +563,41 @@ pub(crate) fn pidfd_open(cx: &Cx<'_>, pid: u64, flags: u64) -> SysResult {
         return Err(Errno::EINVAL);
     }
     let pid = cx.find_vpid(pid as u64).ok_or(Errno::ESRCH)?;
-    let (process, thread) = match rk_proc::find_process(pid) {
-        Some(p) => (p, None),
-        // The ID of a thread that is not the leader gives `ENOENT` without `PIDFD_THREAD`, as in
-        // Linux.
-        None => match rk_proc::find_thread(pid) {
-            Some(t) if flags & PIDFD_THREAD != 0 => (t.process().clone(), Some(t)),
-            Some(_) => return Err(Errno::ENOENT),
-            None => return Err(Errno::ESRCH),
-        },
-    };
+    let (process, thread) = find(pid, flags & PIDFD_THREAD != 0)?;
     let file = new_file(process, thread, flags & (PIDFD_NONBLOCK | PIDFD_THREAD));
     Ok(cx.files()?.lock().insert(file, true)? as u64)
+}
+
+/// Finds the process with the global ID `pid`, or with `thread` also a thread that is not the
+/// leader of its process.
+///
+/// # Errors
+///
+/// Gives `ESRCH` if no process or thread has the ID, and `ENOENT` for a thread that is not the
+/// leader without `thread`, as `pidfd_open` of Linux without `PIDFD_THREAD`.
+fn find(pid: Pid, thread: bool) -> Result<(Arc<Process>, Option<Arc<Thread>>), Errno> {
+    match rk_proc::find_process(pid) {
+        Some(p) => Ok((p, None)),
+        None => match rk_proc::find_thread(pid) {
+            Some(t) if thread => Ok((t.process().clone(), Some(t))),
+            Some(_) => Err(Errno::ENOENT),
+            None => Err(Errno::ESRCH),
+        },
+    }
+}
+
+/// Makes the file of a process file descriptor for an event of fanotify, as `pidfd_prepare` of
+/// Linux with `PIDFD_STALE`. `pid` is a global ID. With `thread`, the descriptor has
+/// `PIDFD_THREAD` and can refer to a thread that is not the leader.
+///
+/// # Errors
+///
+/// Gives `ESRCH` if no process or thread has the ID, and `ENOENT` for a thread that is not the
+/// leader without `thread`.
+pub(crate) fn fanotify_pidfd(pid: i32, thread: bool) -> Result<Arc<File>, Errno> {
+    let pid = Pid::try_from(pid).map_err(|_| Errno::ESRCH)?;
+    let (process, t) = find(pid, thread)?;
+    Ok(new_file(process, t, if thread { PIDFD_THREAD } else { 0 }))
 }
 
 /// Sends a signal to the thread, the process or the process group of a process file descriptor,

@@ -1,8 +1,8 @@
 //! fanotify: `fanotify_init` and `fanotify_mark`, as fs/notify/fanotify/fanotify_user.c of
 //! Linux. The group, its queue and its marks are in `rk_vfs::notify::fanotify`.
 //!
-//! The groups of mount events (`FAN_REPORT_MNT`) and `FAN_REPORT_PIDFD` are not supported:
-//! `fanotify_init` gives `EINVAL` for them.
+//! The groups of mount events (`FAN_REPORT_MNT`) are not supported: `fanotify_init` gives
+//! `EINVAL` for them.
 
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
@@ -100,7 +100,7 @@ pub(crate) fn fanotify_init(cx: &Cx<'_>, flags: u64, event_f_flags: u64) -> SysR
     if flags & !(ADMIN_INIT_FLAGS | USER_INIT_FLAGS | FAN_ENABLE_AUDIT) != 0 {
         return Err(Errno::EINVAL);
     }
-    if flags & (FAN_REPORT_MNT | FAN_REPORT_PIDFD) != 0 {
+    if flags & FAN_REPORT_MNT != 0 {
         return Err(Errno::EINVAL);
     }
     if f_flags & !EVENT_F_BITS != 0 || f_flags & o::O_ACCMODE == o::O_ACCMODE {
