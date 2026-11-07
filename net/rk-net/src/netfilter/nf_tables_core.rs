@@ -24,6 +24,7 @@ use super::{
     NftTable, be32, be64, cstr, nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
+use crate::consts::IFNAMSIZ;
 use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
 use crate::netfilter::nf_nat::{
     NF_NAT_MANIP_DST, NF_NAT_MANIP_SRC, NF_NAT_RANGE_MAP_IPS, NF_NAT_RANGE_MASK,
@@ -100,7 +101,6 @@ const NFT_PAYLOAD_LL_HEADER: u32 = 0;
 const NFT_PAYLOAD_NETWORK_HEADER: u32 = 1;
 const NFT_PAYLOAD_TRANSPORT_HEADER: u32 = 2;
 
-// `NFTA_META_*` and `enum nft_meta_keys`.
 /// The attributes and the keys of `ct`, as nft_ct.c of Linux.
 const NFTA_CT_DREG: u32 = 1;
 const NFTA_CT_KEY: u32 = 2;
@@ -143,13 +143,19 @@ const NFTA_REDIR_FLAGS: u32 = 3;
 /// The bits of `ct state`, as `NF_CT_STATE_INVALID_BIT` and `NF_CT_STATE_BIT` of Linux.
 const NF_CT_STATE_INVALID_BIT: u32 = 1 << 0;
 
+// `NFTA_META_*` and `enum nft_meta_keys`.
 const NFTA_META_DREG: u32 = 1;
 const NFTA_META_KEY: u32 = 2;
 const NFTA_META_SREG: u32 = 3;
 const NFT_META_LEN: u32 = 0;
 const NFT_META_PROTOCOL: u32 = 1;
+const NFT_META_MARK: u32 = 3;
 const NFT_META_IIF: u32 = 4;
 const NFT_META_OIF: u32 = 5;
+const NFT_META_IIFNAME: u32 = 6;
+const NFT_META_OIFNAME: u32 = 7;
+const NFT_META_IIFTYPE: u32 = 8;
+const NFT_META_OIFTYPE: u32 = 9;
 const NFT_META_NFPROTO: u32 = 15;
 const NFT_META_L4PROTO: u32 = 16;
 
@@ -160,7 +166,10 @@ const NFTA_BITWISE_LEN: u32 = 3;
 const NFTA_BITWISE_MASK: u32 = 4;
 const NFTA_BITWISE_XOR: u32 = 5;
 const NFTA_BITWISE_OP: u32 = 6;
+const NFTA_BITWISE_DATA: u32 = 7;
 const NFT_BITWISE_BOOL: u32 = 0;
+const NFT_BITWISE_LSHIFT: u32 = 1;
+const NFT_BITWISE_RSHIFT: u32 = 2;
 
 // `NFTA_COUNTER_*`.
 const NFTA_COUNTER_BYTES: u32 = 1;
@@ -215,10 +224,15 @@ pub(super) enum NftExpr {
     Cmp { sreg: usize, op: u32, data: Vec<u8> },
     /// `payload`, as nft_payload.c.
     Payload { base: u32, offset: usize, len: usize, dreg: usize },
-    /// `meta`, as nft_meta.c.
+    /// `meta` that loads a key of the packet, as `nft_meta_get_eval`.
     Meta { key: u32, dreg: usize },
+    /// `meta mark set`, as `nft_meta_set_eval`.
+    MetaSet { sreg: usize },
     /// `bitwise` with `NFT_BITWISE_BOOL`, as nft_bitwise.c.
     Bitwise { sreg: usize, dreg: usize, mask: Vec<u8>, xor: Vec<u8> },
+    /// `bitwise` with `NFT_BITWISE_LSHIFT` or `NFT_BITWISE_RSHIFT`, as nft_bitwise.c. The
+    /// shift is less than 32 bits, and it moves the bits across the words of 4 bytes.
+    Shift { sreg: usize, dreg: usize, len: usize, left: bool, shift: u32 },
     /// `counter`, as nft_counter.c. The copies of the rule share the counters.
     Counter { packets: Arc<AtomicU64>, bytes: Arc<AtomicU64> },
     /// `lookup` in the set `set` (a handle), as nft_lookup.c. A lookup in a map has `dreg`, the
@@ -502,28 +516,59 @@ pub(super) fn nf_tables_expr_parse(
             Ok(NftExpr::Payload { base, offset: offset as usize, len, dreg })
         }
         b"meta" => {
+            // As `nft_meta_select_ops`, `nft_meta_get_init` and `nft_meta_set_init` of Linux.
             let a = Attrs::parse(data, 3);
-            if a.has(NFTA_META_SREG) {
-                return Err(Errno::EOPNOTSUPP);
+            let Some(key) = be32(&a, NFTA_META_KEY)? else { return Err(Errno::EINVAL) };
+            if a.has(NFTA_META_DREG) == a.has(NFTA_META_SREG) {
+                return Err(Errno::EINVAL);
             }
-            let (key, len) = match be32(&a, NFTA_META_KEY)? {
-                Some(k @ (NFT_META_LEN | NFT_META_IIF | NFT_META_OIF)) => (k, 4),
-                Some(NFT_META_PROTOCOL) => (NFT_META_PROTOCOL, 2),
-                Some(k @ (NFT_META_NFPROTO | NFT_META_L4PROTO)) => (k, 1),
-                Some(_) => return Err(Errno::EOPNOTSUPP),
-                None => return Err(Errno::EINVAL),
+            if a.has(NFTA_META_SREG) {
+                // Of the keys that a rule can set, only the mark is here.
+                if key != NFT_META_MARK {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                let sreg = nft_parse_register(&a, NFTA_META_SREG, 4)?;
+                return Ok(NftExpr::MetaSet { sreg });
+            }
+            let len = match key {
+                NFT_META_LEN | NFT_META_MARK | NFT_META_IIF | NFT_META_OIF => 4,
+                NFT_META_IIFNAME | NFT_META_OIFNAME => IFNAMSIZ,
+                NFT_META_PROTOCOL | NFT_META_IIFTYPE | NFT_META_OIFTYPE => 2,
+                NFT_META_NFPROTO | NFT_META_L4PROTO => 1,
+                _ => return Err(Errno::EOPNOTSUPP),
             };
             let dreg = nft_parse_register(&a, NFTA_META_DREG, len)?;
             Ok(NftExpr::Meta { key, dreg })
         }
         b"bitwise" => {
             let a = Attrs::parse(data, 7);
-            if be32(&a, NFTA_BITWISE_OP)?.unwrap_or(NFT_BITWISE_BOOL) != NFT_BITWISE_BOOL {
+            let op = be32(&a, NFTA_BITWISE_OP)?.unwrap_or(NFT_BITWISE_BOOL);
+            if !matches!(op, NFT_BITWISE_BOOL | NFT_BITWISE_LSHIFT | NFT_BITWISE_RSHIFT) {
                 return Err(Errno::EOPNOTSUPP);
             }
             let len = len_attr(&a, NFTA_BITWISE_LEN)?;
             let sreg = nft_parse_register(&a, NFTA_BITWISE_SREG, len)?;
             let dreg = nft_parse_register(&a, NFTA_BITWISE_DREG, len)?;
+            if op != NFT_BITWISE_BOOL {
+                // As `nft_bitwise_init_shift` of Linux: the data is the shift, in bits.
+                if a.has(NFTA_BITWISE_MASK) || a.has(NFTA_BITWISE_XOR) {
+                    return Err(Errno::EINVAL);
+                }
+                let Some(d) = a.get(NFTA_BITWISE_DATA) else { return Err(Errno::EINVAL) };
+                let d = nft_value(d)?;
+                let [b0, b1, b2, b3] = d[..] else { return Err(Errno::EINVAL) };
+                let shift = u32::from_ne_bytes([b0, b1, b2, b3]);
+                if shift >= u32::BITS {
+                    return Err(Errno::EINVAL);
+                }
+                return Ok(NftExpr::Shift {
+                    sreg,
+                    dreg,
+                    len,
+                    left: op == NFT_BITWISE_LSHIFT,
+                    shift,
+                });
+            }
             let (Some(m), Some(x)) = (a.get(NFTA_BITWISE_MASK), a.get(NFTA_BITWISE_XOR)) else {
                 return Err(Errno::EINVAL);
             };
@@ -1236,7 +1281,7 @@ fn nft_eval(
     e: &ProgExpr,
     prog: &NftProg,
     regs: &mut NftRegs,
-    skb: &NetBuf,
+    skb: &mut NetBuf,
     state: &NfHookState,
     pkt: &NftPktinfo,
 ) {
@@ -1303,16 +1348,69 @@ fn nft_eval(
                 NFT_META_OIF if state.out_dev != 0 => {
                     regs.store(*dreg, &state.out_dev.to_ne_bytes());
                 }
+                NFT_META_MARK => regs.store(*dreg, &skb.mark.to_ne_bytes()),
                 NFT_META_NFPROTO => regs.store(*dreg, &[state.pf]),
                 NFT_META_L4PROTO if pkt.thoff.is_some() => regs.store(*dreg, &[pkt.l4proto]),
+                // The name and the type of the device, as `nft_meta_store_ifname` and
+                // `nft_meta_store_iftype`. A packet with no device does not match.
+                NFT_META_IIFNAME | NFT_META_OIFNAME | NFT_META_IIFTYPE | NFT_META_OIFTYPE => {
+                    let ifindex = match *key {
+                        NFT_META_IIFNAME | NFT_META_IIFTYPE => state.in_dev,
+                        _ => state.out_dev,
+                    };
+                    let dev = if ifindex == 0 { None } else { crate::dev::by_index(ifindex) };
+                    match (dev, *key) {
+                        (Some(d), NFT_META_IIFNAME | NFT_META_OIFNAME) => {
+                            let mut name = [0u8; IFNAMSIZ];
+                            let n = d.name();
+                            let len = n.len().min(IFNAMSIZ);
+                            name[..len].copy_from_slice(&n.as_bytes()[..len]);
+                            regs.store(*dreg, &name);
+                        }
+                        (Some(d), _) => regs.store(*dreg, &d.kind().arphrd().to_ne_bytes()),
+                        (None, _) => regs.verdict = NFT_BREAK,
+                    }
+                }
                 _ => regs.verdict = NFT_BREAK,
             },
+            NftExpr::MetaSet { sreg } => {
+                let r = &regs.data[*sreg..*sreg + 4];
+                skb.mark = u32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
+            }
             NftExpr::Bitwise { sreg, dreg, mask, xor } => {
                 let mut v = [0u8; NFT_REGS_LEN];
                 for i in 0..mask.len() {
                     v[i] = (regs.data[sreg + i] & mask[i]) ^ xor[i];
                 }
                 regs.store(*dreg, &v[..mask.len()]);
+            }
+            NftExpr::Shift { sreg, dreg, len, left, shift } => {
+                // As `nft_bitwise_eval_lshift` and `nft_bitwise_eval_rshift` of Linux: the
+                // carry moves the bits that leave a word into the next word.
+                let words = len.div_ceil(NFT_REG32_SIZE);
+                let word = |i: usize| {
+                    let r = &regs.data[sreg + i * 4..sreg + i * 4 + 4];
+                    u32::from_ne_bytes([r[0], r[1], r[2], r[3]])
+                };
+                let back = u32::BITS - shift;
+                let mut v = [0u8; NFT_REGS_LEN];
+                let mut carry = 0u32;
+                let mut put =
+                    |i: usize, w: u32| v[i * 4..i * 4 + 4].copy_from_slice(&w.to_ne_bytes());
+                if *left {
+                    for i in (0..words).rev() {
+                        let w = word(i);
+                        put(i, w << shift | carry);
+                        carry = w.checked_shr(back).unwrap_or(0);
+                    }
+                } else {
+                    for i in 0..words {
+                        let w = word(i);
+                        put(i, carry | w >> shift);
+                        carry = w.checked_shl(back).unwrap_or(0);
+                    }
+                }
+                regs.store(*dreg, &v[..words * NFT_REG32_SIZE]);
             }
             NftExpr::Counter { packets, bytes } => {
                 packets.fetch_add(1, Ordering::Relaxed);
@@ -1387,7 +1485,12 @@ fn nft_eval(
 
 /// Runs the program of a base chain on a packet, as `nft_do_chain` of Linux. Gives the
 /// verdict, or `policy` at the end of the base chain.
-pub(super) fn nft_do_chain(prog: &NftProg, policy: u32, skb: &NetBuf, state: &NfHookState) -> u32 {
+pub(super) fn nft_do_chain(
+    prog: &NftProg,
+    policy: u32,
+    skb: &mut NetBuf,
+    state: &NfHookState,
+) -> u32 {
     let pkt = nft_pktinfo(state.pf, skb.data());
     let mut regs = NftRegs { verdict: NFT_CONTINUE, chain: 0, data: [0; NFT_REGS_LEN] };
     let mut stack: Vec<(usize, usize)> = Vec::new();
@@ -1474,8 +1577,8 @@ mod tests {
         r.push(verdict(NF_DROP, 0));
         let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
         let s = state(NFPROTO_IPV4);
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(10), &s), NF_ACCEPT);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_DROP);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(10), &s), NF_ACCEPT);
     }
 
     #[test]
@@ -1488,12 +1591,12 @@ mod tests {
         let c1 = vec![ret, vec![verdict(NF_ACCEPT, 0)]];
         let prog = NftProg { chains: vec![c0, c1], sets: vec![], nat: false };
         let s = state(NFPROTO_IPV4);
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
-        assert_eq!(nft_do_chain(&prog, NF_DROP, &udp4(10), &s), NF_ACCEPT);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_DROP);
+        assert_eq!(nft_do_chain(&prog, NF_DROP, &mut udp4(10), &s), NF_ACCEPT);
         // A goto to an empty chain ends with the policy of the base chain.
         let c0 = vec![vec![verdict(NFT_GOTO, 1)], vec![verdict(NF_DROP, 0)]];
         let prog = NftProg { chains: vec![c0, vec![]], sets: vec![], nat: false };
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_ACCEPT);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_ACCEPT);
     }
 
     #[test]
@@ -1527,22 +1630,88 @@ mod tests {
         invalid.push(verdict(NF_DROP, 0));
         let prog = NftProg { chains: vec![vec![r, invalid]], sets: vec![], nat: false };
         // No connection: the state is invalid, and the other keys break the rule.
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(9), &s), NF_DROP);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_DROP);
         let mut p = udp4(9);
         p.data_mut()[3] = 28;
         assert_eq!(nf_conntrack_in(&mut p, &s), NF_ACCEPT);
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &p, &s), NF_DROP);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_DROP);
         assert_eq!(p.nfct.get().unwrap().0.mark.load(Ordering::Relaxed), 7);
         let mut q = udp4(10);
         nf_conntrack_in(&mut q, &s);
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &q, &s), NF_ACCEPT);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut q, &s), NF_ACCEPT);
         let mut regs = vec![e(NftExpr::Ct { key: NFT_CT_DIRECTION, dir: 0, len: 1, dreg: R1 })];
         regs.extend([
             e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: vec![0] }),
             verdict(NF_DROP, 0),
         ]);
         let prog = NftProg { chains: vec![vec![regs]], sets: vec![], nat: false };
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &q, &s), NF_DROP);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut q, &s), NF_DROP);
+    }
+
+    #[test]
+    fn meta_mark_set_marks_the_packet_and_meta_mark_reads_it() {
+        let s = state(NFPROTO_IPV4);
+        // meta mark set 5; meta mark 5 drop; meta iifname "lo" drop.
+        let set = vec![
+            e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(5u32.to_ne_bytes().to_vec()) }),
+            e(NftExpr::MetaSet { sreg: R1 }),
+        ];
+        let read = || {
+            vec![
+                e(NftExpr::Meta { key: NFT_META_MARK, dreg: R1 }),
+                e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: 5u32.to_ne_bytes().to_vec() }),
+                verdict(NF_DROP, 0),
+            ]
+        };
+        let mut lo = [0u8; IFNAMSIZ];
+        lo[..2].copy_from_slice(b"lo");
+        let name = vec![
+            e(NftExpr::Meta { key: NFT_META_IIFNAME, dreg: R1 }),
+            e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: lo.to_vec() }),
+            verdict(NF_DROP, 0),
+        ];
+        let prog = NftProg { chains: vec![vec![read()]], sets: vec![], nat: false };
+        let mut p = udp4(9);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
+        let prog = NftProg { chains: vec![vec![set, read()]], sets: vec![], nat: false };
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_DROP);
+        assert_eq!(p.mark, 5);
+        // meta mark set (meta mark | 0x10) << 8, then >> 4.
+        let shift = |left, shift| NftExpr::Shift { sreg: R1, dreg: R1, len: 4, left, shift };
+        let set = vec![
+            e(NftExpr::Meta { key: NFT_META_MARK, dreg: R1 }),
+            e(NftExpr::Bitwise {
+                sreg: R1,
+                dreg: R1,
+                mask: (!0x10u32).to_ne_bytes().to_vec(),
+                xor: 0x10u32.to_ne_bytes().to_vec(),
+            }),
+            e(shift(true, 8)),
+            e(shift(false, 4)),
+            e(NftExpr::MetaSet { sreg: R1 }),
+        ];
+        let prog = NftProg { chains: vec![vec![set]], sets: vec![], nat: false };
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
+        assert_eq!(p.mark, 0x150);
+        // A shift of 8 bits over two words carries the bits into the next word.
+        let mut regs = NftRegs { verdict: NFT_CONTINUE, chain: 0, data: [0; NFT_REGS_LEN] };
+        regs.data[R1..R1 + 8].copy_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+        let pkt = nft_pktinfo(NFPROTO_IPV4, p.data());
+        let wide = |left| e(NftExpr::Shift { sreg: R1, dreg: R1, len: 8, left, shift: 8 });
+        let prog = NftProg { chains: vec![], sets: vec![], nat: false };
+        nft_eval(&wide(true), &prog, &mut regs, &mut p, &s, &pkt);
+        nft_eval(&wide(false), &prog, &mut regs, &mut p, &s, &pkt);
+        let w = |i: usize| {
+            u32::from_ne_bytes(regs.data[R1 + i * 4..R1 + i * 4 + 4].try_into().unwrap())
+        };
+        let (a, b) = (
+            u32::from_ne_bytes([0x12, 0x34, 0x56, 0x78]),
+            u32::from_ne_bytes([0x9a, 0xbc, 0xde, 0xf0]),
+        );
+        assert_eq!((w(0), w(1)), (a & 0x00ff_ffff, b));
+        // The packet has no input device, so the name does not match.
+        let prog = NftProg { chains: vec![vec![name]], sets: vec![], nat: false };
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_ACCEPT);
     }
 
     #[test]
@@ -1568,7 +1737,7 @@ mod tests {
             verdict(NF_DROP, 0),
         ];
         let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
-        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &udp4(1), &s), NF_DROP);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(1), &s), NF_DROP);
         assert_eq!((packets.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed)), (1, 28));
 
         // udp dport in { 5-9 }, and not in { 7 } with NFT_LOOKUP_F_INV.
@@ -1593,7 +1762,7 @@ mod tests {
         let prog = NftProg { chains: vec![vec![r]], sets: vec![range, seven], nat: false };
         let v: Vec<u32> = [4, 5, 7, 9, 10]
             .iter()
-            .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &udp4(p), &s))
+            .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &mut udp4(p), &s))
             .collect();
         assert_eq!(v, [NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_DROP, NF_ACCEPT]);
     }
@@ -1643,7 +1812,7 @@ mod tests {
         };
         let v: Vec<u32> = [7, 8, 1, 2, 9, 5]
             .iter()
-            .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &udp4(p), &s))
+            .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &mut udp4(p), &s))
             .collect();
         // 7 matches no element of the vmap and takes the catch-all.
         assert_eq!(v, [NF_DROP, NF_DROP, NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_DROP]);
@@ -1736,8 +1905,10 @@ mod tests {
         let prog =
             NftProg { chains: vec![vec![r2, r0, r1, r3]], sets: vec![set0, set1], nat: false };
         let s = state(NFPROTO_IPV4);
-        let v: Vec<u32> =
-            [5, 5, 6, 6, 7].iter().map(|&p| nft_do_chain(&prog, NF_ACCEPT, &udp4(p), &s)).collect();
+        let v: Vec<u32> = [5, 5, 6, 6, 7]
+            .iter()
+            .map(|&p| nft_do_chain(&prog, NF_ACCEPT, &mut udp4(p), &s))
+            .collect();
         // 5 is added and dropped the next time; 6 is removed before the lookup.
         assert_eq!(v, [NF_ACCEPT, NF_DROP, NF_ACCEPT, NF_ACCEPT, NF_DROP]);
         let d = prog.sets[0].dynamic.as_ref().unwrap().0.lock();
