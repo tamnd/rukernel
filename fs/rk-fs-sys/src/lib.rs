@@ -313,6 +313,7 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
         file("ifindex", format!("{index}\n")),
         file("iflink", format!("{iflink}\n")),
         file("mtu", format!("{}\n", d.mtu())),
+        file("name_assign_type", format!("{}\n", d.name_assign_type())),
         file("operstate", format!("{}\n", OPERSTATES[usize::from(d.operstate()).min(6)])),
         (String::from("statistics"), Kind::Dir),
         (
@@ -774,6 +775,7 @@ mod tests {
         let lo = "devices/virtual/net/lo";
         assert_eq!(get(&format!("{lo}/mtu")), Kind::File(b"65536\n".to_vec()));
         assert_eq!(get(&format!("{lo}/type")), Kind::File(b"772\n".to_vec()));
+        assert_eq!(get(&format!("{lo}/name_assign_type")), Kind::File(b"2\n".to_vec()));
         assert_eq!(get(&format!("{lo}/address")), Kind::File(b"00:00:00:00:00:00\n".to_vec()));
         assert!(names(&format!("{lo}/statistics")).contains(&String::from("rx_bytes")));
     }

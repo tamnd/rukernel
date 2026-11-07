@@ -210,7 +210,9 @@ mod tests {
         };
         {
             let _in = ns::enter(&other);
+            assert_eq!(d.name_assign_type(), dev::NET_NAME_USER);
             d.set_name(b"uev8").unwrap();
+            assert_eq!(d.name_assign_type(), dev::NET_NAME_RENAMED);
             dev::unregister(&d);
         }
         assert!(got(&here, "uev").is_empty());

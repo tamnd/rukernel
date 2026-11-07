@@ -23,7 +23,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::ETH_DATA_LEN;
 use rk_frame::sync::SpinLock;
@@ -289,6 +289,9 @@ fn notify(dev: &NetDevice, event: Event) {
 /// A registered network device.
 pub struct NetDevice {
     name: SpinLock<String>,
+    /// How the device got its name, one of the `NET_NAME_*` values, as `dev->name_assign_type`
+    /// of Linux.
+    name_assign_type: AtomicU8,
     /// The alternative names, in the order of their creation, as the list of `name_node` of
     /// Linux.
     altnames: SpinLock<Vec<String>>,
@@ -317,6 +320,15 @@ pub struct NetDevice {
     wanted_features: AtomicU64,
     driver: Arc<dyn NetDriver>,
 }
+
+/// The kernel gave the name with the next free number, as `eth0`, as `NET_NAME_ENUM` of Linux.
+pub const NET_NAME_ENUM: u8 = 1;
+/// The kernel gave a name that does not change, as `lo`.
+pub const NET_NAME_PREDICTABLE: u8 = 2;
+/// A process gave the name when it made the device.
+pub const NET_NAME_USER: u8 = 3;
+/// A process changed the name.
+pub const NET_NAME_RENAMED: u8 = 4;
 
 /// Tells if `name` is a valid name of a device, as `dev_valid_name` of Linux.
 pub fn valid_name(name: &[u8]) -> bool {
@@ -395,8 +407,16 @@ impl NetDevice {
             };
             *self.name.lock() = name;
         }
+        self.name_assign_type.store(NET_NAME_RENAMED, Ordering::Relaxed);
         notify(self, Event::Name);
         Ok(())
+    }
+
+    /// How the device got its name: `NET_NAME_ENUM`, `NET_NAME_PREDICTABLE`, `NET_NAME_USER` or
+    /// `NET_NAME_RENAMED`. udev reads it in `name_assign_type` of sysfs, and it renames only a
+    /// device with a name of the kernel.
+    pub fn name_assign_type(&self) -> u8 {
+        self.name_assign_type.load(Ordering::Relaxed)
     }
 
     /// The alternative names, in the order of their creation.
@@ -801,6 +821,11 @@ pub fn register_at(
         let mut devices = DEVICES.lock();
         let kind = driver.kind();
         let taken = |name: &str| name_in_use(&devices, net, name);
+        let assign = match (kind, name) {
+            (LinkKind::Loopback, _) => NET_NAME_PREDICTABLE,
+            (_, Some(_)) => NET_NAME_USER,
+            (_, None) => NET_NAME_ENUM,
+        };
         let name = match (kind, name) {
             (LinkKind::Loopback, _) if taken("lo") => return Err(Errno::EEXIST),
             (LinkKind::Loopback, _) => String::from("lo"),
@@ -833,6 +858,7 @@ pub fn register_at(
         let (f, hw, wanted) = features::initial(f, hw, kind == LinkKind::Loopback);
         let dev = Arc::new(NetDevice {
             name: SpinLock::new(name),
+            name_assign_type: AtomicU8::new(assign),
             altnames: SpinLock::new(Vec::new()),
             ifindex: AtomicU32::new(ifindex),
             net: AtomicUsize::new(net),
