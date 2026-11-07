@@ -21,7 +21,7 @@ pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
     NftDynset, NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain,
-    nft_expr_targets, nft_expr_validate, nft_prog, nft_rule_needs_ct,
+    nft_expr_dump, nft_expr_targets, nft_expr_validate, nft_prog, nft_rule_needs_ct,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
@@ -46,7 +46,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
-    NLM_F_APPEND, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI, NLM_F_NONREC, NLM_F_REPLACE,
+    NLA_F_NESTED, NLM_F_APPEND, NLM_F_CREATE, NLM_F_ECHO, NLM_F_EXCL, NLM_F_MULTI, NLM_F_NONREC,
+    NLM_F_REPLACE,
 };
 use rk_frame::sync::{SpinLock, SpinLockGuard};
 use rk_vfs::inode::Result;
@@ -2157,6 +2158,8 @@ impl NftBatch {
         let exprs = nla.get(NFTA_RULE_EXPRESSIONS).unwrap_or(&[]);
         let compat = nla.get(NFTA_RULE_COMPAT);
         let mut parsed = Vec::new();
+        // The expressions as a dump gives them, as `nf_tables_fill_expr_info` of Linux.
+        let mut dump = Builder::new(0, 0, 0, 0);
         for (n, (ty, e)) in msg::attrs(exprs).enumerate() {
             if ty != NFTA_LIST_ELEM || n == NFT_MAX_EXPRS {
                 return Err(Errno::EINVAL);
@@ -2169,8 +2172,10 @@ impl NftBatch {
             for target in nft_expr_targets(table, &expr) {
                 nft_check_loops(table, chain.handle, target)?;
             }
+            dump.put(NFTA_LIST_ELEM | NLA_F_NESTED as u16, &nft_expr_dump(table, e, &expr));
             parsed.push(expr);
         }
+        let exprs = dump.finish()[msg::HDRLEN..].to_vec();
         let udata = match nla.get(NFTA_RULE_USERDATA) {
             Some(d) if d.len() > NFT_USERDATA_MAXLEN => return Err(Errno::ERANGE),
             Some(d) if !d.is_empty() => Some(d.to_vec()),
@@ -2179,7 +2184,7 @@ impl NftBatch {
         let txn_id = be32(nla, NFTA_RULE_ID)?;
         let table = &mut self.tables[t];
         let handle = if handle == 0 { table.alloc_handle() } else { handle };
-        let rule = NftRule { handle, exprs: exprs.to_vec(), parsed, udata, txn_id };
+        let rule = NftRule { handle, exprs, parsed, udata, txn_id };
         let at = if let (true, Some(o)) = (ctx.has(NLM_F_REPLACE), old) {
             self.notify_rule(&ctx, NFT_MSG_DELRULE, t, c, o);
             self.tables[t].chains[c].rules[o] = rule;
@@ -2878,6 +2883,31 @@ mod tests {
         assert_eq!(nf_tables_set_alloc_name(&t, b"plain").unwrap(), b"plain");
         assert_eq!(nf_tables_set_alloc_name(&t, b"bad%x"), Err(Errno::EINVAL));
         assert_eq!(nf_tables_set_alloc_name(&t, b"%d%d"), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn the_dump_of_a_lookup_gives_the_name_of_its_set() {
+        // `lookup` of an anonymous set, as `nft` gives it: a name with `%d` and the ID.
+        let expr = |name: &[u8], id: Option<u32>| {
+            let mut b = Builder::new(0, 0, 0, 0);
+            b.put(1, b"lookup\0");
+            let d = b.nest(2 | NLA_F_NESTED as u16);
+            b.put(1, name);
+            b.put(2, &8u32.to_be_bytes());
+            if let Some(id) = id {
+                b.put(4, &id.to_be_bytes());
+            }
+            b.end_nest(d);
+            b.finish()[msg::HDRLEN..].to_vec()
+        };
+        let mut t = table();
+        t.sets.push(set(b"__set0"));
+        let lookup = NftExpr::Lookup { set: 1, sreg: 8, len: 4, invert: false, dreg: None };
+        let got = nft_expr_dump(&t, &expr(b"__set%d\0", Some(7)), &lookup);
+        assert_eq!(got, expr(b"__set0\0", None));
+        // Another expression keeps its bytes.
+        let raw = expr(b"x\0", Some(7));
+        assert_eq!(nft_expr_dump(&t, &raw, &NftExpr::CtSet { sreg: 8 }), raw);
     }
 
     #[test]

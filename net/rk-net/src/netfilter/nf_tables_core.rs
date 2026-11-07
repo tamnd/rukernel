@@ -21,7 +21,7 @@ use super::{
     NFT_DATA_VERDICT, NFT_GOTO, NFT_JUMP, NFT_RETURN, NFT_SET_ANONYMOUS, NFT_SET_CONSTANT,
     NFT_SET_ELEM_INTERVAL_END, NFT_SET_EVAL, NFT_SET_INTERVAL, NFT_SET_MAP, NFT_SET_OBJECT,
     NFT_SET_TIMEOUT, NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftChainType, NftData,
-    NftTable, be32, be64, nft_set_lookup_global, nft_verdict_init,
+    NftTable, be32, be64, cstr, nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{IP_CT_DIR_ORIGINAL, IP_CT_DIR_REPLY, IP_CT_IS_REPLY};
@@ -36,12 +36,13 @@ use crate::netfilter::{
     NF_INET_PRE_ROUTING, NFPROTO_INET, NFPROTO_IPV4, NfHookState, NfPktinfo as NftPktinfo,
     nf_pktinfo as nft_pktinfo,
 };
-use crate::netlink::msg::Attrs;
+use crate::netlink::msg::{ATTR_HDRLEN, Attrs, Builder, HDRLEN};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use rk_abi::Errno;
+use rk_abi::native::netlink::NLA_TYPE_MASK;
 use rk_vfs::inode::Result;
 
 #[path = "nft_exprs.rs"]
@@ -385,6 +386,57 @@ fn len_attr(a: &Attrs<'_>, ty: u32) -> Result<usize> {
         Some(_) => Err(Errno::ERANGE),
         None => Err(Errno::EINVAL),
     }
+}
+
+/// The attributes in `b` with their types as they are, with the flags: each item is the type
+/// and the payload.
+fn nla_raw(b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+    let mut rest = b;
+    core::iter::from_fn(move || {
+        let len = u16::from_ne_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+        let ty = u16::from_ne_bytes([*rest.get(2)?, *rest.get(3)?]);
+        if len < ATTR_HDRLEN || len > rest.len() {
+            return None;
+        }
+        let data = &rest[ATTR_HDRLEN..len];
+        rest = &rest[len.next_multiple_of(4).min(rest.len())..];
+        Some((ty, data))
+    })
+}
+
+/// The bytes of an expression of a rule in a dump, from `nla`, the bytes that the rule gave, as
+/// the `dump` of each expression of Linux. A `lookup` and a `dynset` give the name of their set:
+/// the rule can give a name with `%d` or only the ID of the set in the batch, as `nft` does for
+/// an anonymous set, and `nft` then finds the set in the dump with its real name. The ID is not
+/// in the dump. The other expressions give the bytes of the rule.
+pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec<u8> {
+    let (set, name_ty, id_ty) = match expr {
+        NftExpr::Lookup { set, .. } => (*set, NFTA_LOOKUP_SET, NFTA_LOOKUP_SET_ID),
+        NftExpr::Dynset(d) => (d.set, NFTA_DYNSET_SET_NAME, NFTA_DYNSET_SET_ID),
+        _ => return nla.to_vec(),
+    };
+    let Some(set) = table.sets.iter().find(|s| s.handle == set) else { return nla.to_vec() };
+    let mut b = Builder::new(0, 0, 0, 0);
+    for (ty, data) in nla_raw(nla) {
+        if u32::from(ty & NLA_TYPE_MASK as u16) != NFTA_EXPR_DATA {
+            b.put(ty, data);
+            continue;
+        }
+        let at = b.nest(ty);
+        for (t, v) in nla_raw(data) {
+            match u32::from(t & NLA_TYPE_MASK as u16) {
+                n if n == name_ty => {
+                    b.put(t, &cstr(&set.name));
+                }
+                n if n == id_ty => {}
+                _ => {
+                    b.put(t, v);
+                }
+            }
+        }
+        b.end_nest(at);
+    }
+    b.finish()[HDRLEN..].to_vec()
 }
 
 /// Reads an expression of a rule of `table`, as `nf_tables_expr_parse` and the `init` of each
