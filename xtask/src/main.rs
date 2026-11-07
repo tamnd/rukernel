@@ -885,6 +885,8 @@ echo 'debian: done'
         // `IPIngressBytes` and `IPEgressBytes` that are not zero. rk-dev.service has
         // `DevicePolicy=closed`, and the open of /dev/vda must give `EPERM`. systemd does these
         // with programs of `BPF_PROG_TYPE_CGROUP_SKB` and `BPF_PROG_TYPE_CGROUP_DEVICE`.
+        // `systemd-detect-virt` must give `qemu` with TCG or `kvm` with KVM, as on Linux. It reads
+        // CPUID and /sys/class/dmi/id.
         init: r#"#!/bin/sh
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -932,6 +934,9 @@ allowed=''
 other=
 state=$(systemctl is-system-running --wait || true)
 echo "rk-systemd: state $state"
+virt=$(systemd-detect-virt || true)
+echo "rk-systemd: systemd-detect-virt $virt"
+case $virt in qemu | kvm) ;; *) other="$other systemd-detect-virt" ;; esac
 bpf=$(awk '$5 == "/sys/fs/bpf" { sub(/.* - /, ""); print $1 }' /proc/self/mountinfo)
 echo "rk-systemd: /sys/fs/bpf ${bpf:-not mounted}"
 [ "$bpf" = bpf ] || other="$other /sys/fs/bpf"

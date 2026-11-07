@@ -11,6 +11,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - nft_compat of nf_tables, as net/netfilter/nft_compat.c and x_tables.c of Linux, so that iptables-nft can use the xtables extensions: the expressions `match` and `target`, `NFTA_RULE_COMPAT`, and `NFNL_MSG_COMPAT_GET` for the best revision of an extension. The extensions are the matches `state`, `conntrack` (revisions 1 to 3), `comment`, `icmp` and `icmp6`, and the target `REJECT` of IPv4 and IPv6. Each extension checks its size, table, hooks and protocol as Linux does. An unknown extension gives `ENOENT` (#542).
 - tools/missing/systemd.md, the report of the files under /proc and /sys that the `systemd` boot test looks for and that rukernel does not have. tools/missing/report.py gives the path under /proc or /sys for a lookup in a procfs or a sysfs that is mounted at another path (#543).
 - The xtables matches `tcp`, `udp`, `udplite`, `multiport` (revision 1) and `connmark` (revision 1) and the target `LOG` for nft_compat, as net/netfilter/xt_tcpudp.c, xt_multiport.c, xt_connmark.c and xt_LOG.c of Linux: the ranges of the ports, the TCP flags and options, a list of ports and ranges, and the mark of the connection. The target `LOG` of xt_LOG.c writes the packet to the kernel log, as the `log` expression (#542).
+- The `systemd` boot test checks that `systemd-detect-virt` gives `qemu` or `kvm`, as on Linux in QEMU. It reads CPUID and the DMI fields of /sys/class/dmi/id (#543).
 
 ## [0.5.9] - 2026-11-07
 
