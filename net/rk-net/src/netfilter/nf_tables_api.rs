@@ -15,6 +15,10 @@
 #[path = "nf_tables_core.rs"]
 mod nf_tables_core;
 
+#[cfg(test)]
+pub(crate) use self::nf_tables_core::nft_log_line;
+pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
+
 use self::nf_tables_core::{
     NftDynset, NftExpr, NftProg, nf_tables_expr_parse, nft_check_loops, nft_do_chain,
     nft_expr_targets, nft_expr_validate, nft_prog, nft_rule_needs_ct,

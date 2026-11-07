@@ -47,11 +47,14 @@ use rk_vfs::inode::Result;
 #[path = "nft_exprs.rs"]
 mod nft_exprs;
 
+#[cfg(test)]
+pub(crate) use self::nft_exprs::nft_log_line;
 use self::nft_exprs::{
-    NftByteorder, NftLimit, NftLog, NftRange, NftReject, nft_byteorder_eval, nft_byteorder_init,
-    nft_limit_eval, nft_limit_init, nft_log_eval, nft_log_init, nft_range_eval, nft_range_init,
-    nft_reject_eval, nft_reject_init,
+    NftByteorder, NftLimit, NftRange, NftReject, nft_byteorder_eval, nft_byteorder_init,
+    nft_limit_eval, nft_limit_init, nft_log_init, nft_range_eval, nft_range_init, nft_reject_eval,
+    nft_reject_init,
 };
+pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
 
 // The attributes of an expression, `NFTA_EXPR_*`.
 const NFTA_EXPR_NAME: u32 = 1;

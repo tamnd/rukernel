@@ -346,6 +346,18 @@ pub(crate) struct NftLog {
     flags: u32,
 }
 
+impl NftLog {
+    /// A `log` to the kernel log with a prefix, a level and the flags of nf_log, as the target
+    /// `LOG` of xtables makes it in `log_tg` of xt_LOG.c of Linux.
+    pub(crate) fn new(prefix: &[u8], level: u8, flags: u8) -> NftLog {
+        NftLog {
+            prefix: prefix.to_vec(),
+            level: level.into(),
+            flags: u32::from(flags) & NF_LOG_MASK,
+        }
+    }
+}
+
 /// Reads a `log`, as `nft_log_init` of Linux. A group sends the packets to nfnetlink_log,
 /// which is not here, and gives `ENOENT` as a logger that Linux cannot load.
 pub(super) fn nft_log_init(data: &[u8]) -> Result<NftLog> {
@@ -402,7 +414,7 @@ fn dev_name(ifindex: u32) -> alloc::string::String {
 /// Writes the line of the packet, as `nf_log_ip_packet`, `nf_log_ip6_packet`,
 /// `dump_ipv4_packet` and `dump_ipv6_packet` of nf_log_syslog.c of Linux, with no MAC
 /// address and no options.
-pub(super) fn nft_log_line(l: &NftLog, skb: &NetBuf, state: &NfHookState) -> Vec<u8> {
+pub(crate) fn nft_log_line(l: &NftLog, skb: &NetBuf, state: &NfHookState) -> Vec<u8> {
     let mut w = Line(l.prefix.clone());
     let _ = write!(w, "IN={} OUT={} ", dev_name(state.in_dev), dev_name(state.out_dev));
     let d = skb.data();
@@ -534,7 +546,7 @@ pub(super) fn nft_log_line(l: &NftLog, skb: &NetBuf, state: &NfHookState) -> Vec
 }
 
 /// Writes the packet to the kernel log at the level of the expression, as `nft_log_eval`.
-pub(super) fn nft_log_eval(l: &NftLog, skb: &NetBuf, state: &NfHookState) {
+pub(crate) fn nft_log_eval(l: &NftLog, skb: &NetBuf, state: &NfHookState) {
     let line = nft_log_line(l, skb, state);
     rk_frame::console::log_emit(l.level, &line);
 }
