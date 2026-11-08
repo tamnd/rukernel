@@ -82,8 +82,13 @@ fn statx_time(t: Timespec) -> StatxTimestamp {
     StatxTimestamp { tv_sec: t.sec, tv_nsec: t.nsec, __reserved: 0 }
 }
 
-/// Reads up to `count` bytes with `f` to user memory at `buf`. A regular file reads in steps
-/// until the count or the end of the file. Another file reads one time.
+/// Reads up to `count` bytes with `f` to user memory at `buf`. A file with an inode reads in
+/// steps until the count or the end of the file. Another file reads one time.
+///
+/// The kernel does not preempt a task, so a long read lets the other tasks run between the
+/// steps, as `cond_resched` in Linux. A fatal signal ends a long read with the bytes that it
+/// read, as in `filemap_read`. Each signal ends a long read of a file that is not a regular
+/// file, for example `/dev/urandom` as `get_random_bytes_user` in Linux.
 pub(crate) fn read_with(
     cx: &Cx<'_>,
     file: &File,
@@ -105,8 +110,14 @@ pub(crate) fn read_with(
         };
         vm.write(buf as usize + done, &chunk[..got])?;
         done += got;
-        if got < n || !regular {
+        if got < n || !regular || done == count {
             break;
+        }
+        if cx.thread.is_killed() || (cx.thread.signal_pending() && !is_regular(file)) {
+            break;
+        }
+        if rk_frame::task::should_yield() {
+            rk_frame::task::yield_now();
         }
     }
     Ok(done as u64)

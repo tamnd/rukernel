@@ -172,4 +172,6 @@ pub(crate) mod irq {
     pub(crate) fn wait() {
         core::hint::spin_loop();
     }
+
+    pub(crate) fn poll() {}
 }

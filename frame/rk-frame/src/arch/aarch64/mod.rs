@@ -363,6 +363,14 @@ pub(crate) mod irq {
         daif & (1 << 7) == 0
     }
 
+    /// Lets this CPU take the interrupts that wait, and then stops it from taking interrupts. The
+    /// `isb` after the change of the mask makes the CPU take them before the mask is set again.
+    pub(crate) fn poll() {
+        // SAFETY: as for `enable`. The handlers change only atomic values, so the asm block has
+        // no `nomem`, and the compiler reads the values again after it.
+        unsafe { core::arch::asm!("msr daifclr, #2", "isb", "msr daifset, #2", options(nostack)) };
+    }
+
     /// Waits for the next interrupt, then lets this CPU take it. A pending interrupt wakes `wfi`
     /// also when it is masked, so no interrupt is lost between the check and the wait.
     pub(crate) fn wait() {
