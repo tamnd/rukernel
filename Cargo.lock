@@ -188,6 +188,8 @@ dependencies = [
  "rk-abi",
  "rk-frame",
  "rk-fs-sys",
+ "rk-net",
+ "rk-proc",
  "rk-vfs",
 ]
 

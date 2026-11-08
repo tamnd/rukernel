@@ -13,6 +13,8 @@ publish.workspace = true
 rk-abi.workspace = true
 rk-frame.workspace = true
 rk-fs-sys.workspace = true
+rk-net.workspace = true
+rk-proc.workspace = true
 rk-vfs.workspace = true
 
 [lints]
