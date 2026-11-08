@@ -6056,6 +6056,44 @@ static void test_core_dump(void)
 /* The real time sysctls of the scheduler, as sched_rr_handler and sched_rt_handler in
  * kernel/sched/rt.c of Linux (#341). The time slice of SCHED_RR comes from
  * sched_rr_timeslice_ms, and a value of 0 or less sets the default of 100 ms. */
+/* The I/O priority calls, as block/ioprio.c of Linux. The class is in the bits 13 to 15. */
+static void test_ioprio(void)
+{
+	int be4 = 2 << 13 | 4, idle = 3 << 13, rt = 1 << 13, status;
+	pid_t pid;
+
+	check("ioprio_get of a new process gives 0", syscall(SYS_ioprio_get, 1, 0) == 0);
+	check("ioprio_set of the best effort class",
+	      syscall(SYS_ioprio_set, 1, 0, be4) == 0 && syscall(SYS_ioprio_get, 1, getpid()) == be4);
+	check("ioprio_set of the class none with a level gives EINVAL",
+	      syscall(SYS_ioprio_set, 1, 0, 3) == -1 && errno == EINVAL);
+	check("ioprio_set of the class 7 gives EINVAL",
+	      syscall(SYS_ioprio_set, 1, 0, 7 << 13) == -1 && errno == EINVAL);
+	check("ioprio_set with a bad which gives EINVAL",
+	      syscall(SYS_ioprio_set, 4, 0, be4) == -1 && errno == EINVAL &&
+		      syscall(SYS_ioprio_get, 0, 0) == -1 && errno == EINVAL);
+	check("ioprio_get of a missing process gives ESRCH",
+	      syscall(SYS_ioprio_get, 1, 999999) == -1 && errno == ESRCH);
+	check("ioprio_get of the process group gives the best value",
+	      syscall(SYS_ioprio_get, 2, 0) >= 0 && syscall(SYS_ioprio_get, 2, 0) <= be4);
+	pid = fork();
+	if (pid == 0) {
+		int ok = syscall(SYS_ioprio_get, 1, 0) == be4;
+
+		ok &= syscall(SYS_ioprio_set, 1, 0, idle) == 0;
+		ok &= setresuid(1000, 1000, 1000) == 0;
+		ok &= syscall(SYS_ioprio_set, 1, 0, rt) == -1 && errno == EPERM;
+		ok &= syscall(SYS_ioprio_set, 1, 1, be4) == -1 && errno == EPERM;
+		ok &= syscall(SYS_ioprio_set, 1, 0, be4) == 0;
+		ok &= syscall(SYS_ioprio_get, 3, 0) == be4;
+		_exit(ok ? 0 : 1);
+	}
+	check("a child gets the I/O priority, and a user cannot set the real time class",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0);
+	check("ioprio_set back to the class none", syscall(SYS_ioprio_set, 1, 0, 0) == 0);
+}
+
 static void test_sched_sysctls(void)
 {
 	char buf[32];
@@ -7439,6 +7477,7 @@ static void test_proc(void)
 	fd = open("/proc/sys/kernel/pid_max", O_RDONLY);
 	check("/proc/sys/kernel/pid_max", fd >= 0 && read(fd, buf, sizeof(buf)) == 8 && !strncmp(buf, "4194304\n", 8));
 	close(fd);
+	test_ioprio();
 	test_sched_sysctls();
 	mkdir("/tmp/sticky", 0777);
 	chmod("/tmp/sticky", 01777);

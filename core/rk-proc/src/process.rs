@@ -363,6 +363,9 @@ pub struct Thread {
     timer_slack: SpinLock<(u64, u64)>,
     /// The I/O privilege level that `iopl` set, as `iopl_emul` of Linux.
     iopl: AtomicU32,
+    /// The I/O priority that `ioprio_set` set, as `io_context->ioprio` of Linux. 0 is
+    /// `IOPRIO_DEFAULT`: the priority comes from the nice value.
+    ioprio: AtomicU32,
     /// The network namespace of the thread, or `None` for the first namespace, as
     /// `nsproxy->net_ns` of Linux.
     net: SpinLock<Option<Arc<NetNs>>>,
@@ -1948,6 +1951,7 @@ impl Thread {
             keys: SpinLock::new(ThreadKeys::default()),
             timer_slack: SpinLock::new((TIMER_SLACK_NS, TIMER_SLACK_NS)),
             iopl: AtomicU32::new(0),
+            ioprio: AtomicU32::new(0),
             net: SpinLock::new(None),
             uts: SpinLock::new(None),
             ipc: SpinLock::new(None),
@@ -2086,12 +2090,28 @@ impl Thread {
     }
 
     /// Gives the slack of `parent` to the new thread: both values of the new thread are the
-    /// current value of `parent`, as `copy_process` of Linux.
+    /// current value of `parent`, as `copy_process` of Linux. The new thread also gets the I/O
+    /// privilege level and the I/O priority of `parent`.
     fn inherit_timer_slack(&self, parent: &Thread) {
         let ns = parent.timer_slack();
         *self.timer_slack.lock() = (ns, ns);
         // A new task also gets the I/O privilege level, as `copy_thread` of Linux.
         self.set_iopl(parent.iopl());
+        // The new task gets the I/O priority only if its class is valid, as `copy_io` of Linux.
+        let ioprio = parent.ioprio();
+        if (1..=3).contains(&(ioprio >> 13 & 7)) {
+            self.set_ioprio(ioprio);
+        }
+    }
+
+    /// The I/O priority that `ioprio_set` set, or 0.
+    pub fn ioprio(&self) -> u32 {
+        self.ioprio.load(Ordering::Relaxed)
+    }
+
+    /// Sets the I/O priority, for `ioprio_set`.
+    pub fn set_ioprio(&self, ioprio: u32) {
+        self.ioprio.store(ioprio, Ordering::Relaxed);
     }
 
     /// The I/O privilege level that `iopl` set.

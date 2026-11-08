@@ -485,6 +485,16 @@ pub fn task_setnice(target: &Task<'_>, nice: i32) -> Result<()> {
     call_int_hook!(task_setnice, target, nice)
 }
 
+/// `security_task_setioprio`.
+pub fn task_setioprio(target: &Task<'_>, ioprio: i32) -> Result<()> {
+    call_int_hook!(task_setioprio, target, ioprio)
+}
+
+/// `security_task_getioprio`.
+pub fn task_getioprio(target: &Task<'_>) -> Result<()> {
+    call_int_hook!(task_getioprio, target)
+}
+
 /// `security_task_prlimit`.
 pub fn task_prlimit(cred: &Cred, tcred: &Cred, flags: u32) -> Result<()> {
     call_int_hook!(task_prlimit, cred, tcred, flags)

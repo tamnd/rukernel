@@ -4,13 +4,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `ioprio_set` and `ioprio_get`, as block/ioprio.c of Linux. The calls check the class, the level and the permissions, keep the value for each thread, and give it to a new child if its class is valid. `ioprio_get` of a process group or a user gives the best value. Before, the calls gave `ENOSYS`, so systemd failed to start a unit with `IOSchedulingClass=` or `IOSchedulingPriority=` with 211/IOPRIO (#543).
+- AppArmor attaches a profile at `execve`, as domain.c of Linux. The cred of a task holds its label. A program that matches the attachment of a profile gets that profile, and two profiles with the same match give a conflict. The exec rules of a profile give the next label, with the `ix`, `px`, `cx` and `ux` fallbacks. In complain mode, an exec with no rule makes a learning profile `PARENT//null-NAME` and logs it with `apparmor="ALLOWED"`, as on Linux. `/proc/PID/attr/current` and `/proc/PID/attr/apparmor/current` show the label and the mode (#540)
+
 ### Fixed
 
 - The console and the pseudo terminals take `TCGETS2`, `TCSETS2`, `TCSETSW2` and `TCSETSF2` with `struct termios2`, and keep the input and output speeds, as drivers/tty/tty_ioctl.c of Linux. glibc 2.42 and later use these calls in `isatty` and `tcgetattr`. Before, `isatty` of such a program gave `ENOTTY`, so systemd 259 and later failed to start a unit with `StandardOutput=tty` with "Inappropriate ioctl for device" on /dev/console (#543).
-
-### Added
-
-- AppArmor attaches a profile at `execve`, as domain.c of Linux. The cred of a task holds its label. A program that matches the attachment of a profile gets that profile, and two profiles with the same match give a conflict. The exec rules of a profile give the next label, with the `ix`, `px`, `cx` and `ux` fallbacks. In complain mode, an exec with no rule makes a learning profile `PARENT//null-NAME` and logs it with `apparmor="ALLOWED"`, as on Linux. `/proc/PID/attr/current` and `/proc/PID/attr/apparmor/current` show the label and the mode (#540)
 
 ## [0.5.15] - 2026-11-08
 
