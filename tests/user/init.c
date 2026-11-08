@@ -5183,6 +5183,28 @@ static void test_mount_api(void)
 	close(tfd);
 	close(mfd);
 	close(fd);
+	/* After fsmount, the context of fsopen changes its file system, as the context of fspick. systemd makes the
+	 * file system of the credentials of a unit read only in this way. */
+	fd = syscall(SYS_fsopen, "tmpfs", 1);
+	check("fsopen and FSCONFIG_CMD_CREATE", fd >= 0 && syscall(SYS_fsconfig, fd, RK_FSCONFIG_CMD_CREATE, NULL, NULL, 0) == 0);
+	errno = 0;
+	check("FSCONFIG_CMD_RECONFIGURE before fsmount gives EBUSY",
+	      syscall(SYS_fsconfig, fd, RK_FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) == -1 && errno == EBUSY);
+	mfd = syscall(SYS_fsmount, fd, 1, 0);
+	f = openat(mfd, "c", O_CREAT | O_WRONLY, 0600);
+	errno = 0;
+	check("FSCONFIG_CMD_RECONFIGURE to read only with a file open for a write gives EBUSY",
+	      mfd >= 0 && f >= 0 && syscall(SYS_fsconfig, fd, RK_FSCONFIG_SET_FLAG, "ro", NULL, 0) == 0 &&
+		      syscall(SYS_fsconfig, fd, RK_FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) == -1 && errno == EBUSY);
+	close(f);
+	errno = 0;
+	check("FSCONFIG_CMD_RECONFIGURE after fsmount makes the file system read only",
+	      syscall(SYS_fsconfig, fd, RK_FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) == 0 &&
+		      openat(mfd, "d", O_CREAT | O_WRONLY, 0600) == -1 && errno == EROFS);
+	errno = 0;
+	check("a second fsmount of a context gives EBUSY", syscall(SYS_fsmount, fd, 1, 0) == -1 && errno == EBUSY);
+	close(mfd);
+	close(fd);
 	check("umount the clone", umount("/mnt2") == 0);
 	check("umount the mount of fsmount", umount("/mnt") == 0 && access("/mnt/f", F_OK) == -1);
 	rmdir("/mnt");

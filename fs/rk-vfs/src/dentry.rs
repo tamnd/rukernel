@@ -515,7 +515,7 @@ impl core::fmt::Debug for Mount {
 
 impl Mount {
     fn new(root: Arc<Dentry>, source: MountSource) -> Arc<Self> {
-        Arc::new(Self {
+        let mount = Arc::new(Self {
             id: NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed),
             root,
             mountpoint: SpinLock::new(None),
@@ -526,7 +526,12 @@ impl Mount {
             opens: AtomicUsize::new(0),
             entries: AtomicU64::new(0),
             expiry: AtomicU64::new(0),
-        })
+        });
+        let mut all = ALL.lock();
+        all.retain(|m| m.strong_count() > 0);
+        all.push(Arc::downgrade(&mount));
+        drop(all);
+        mount
     }
 
     /// The mount ID, as `/proc/self/mountinfo` shows it.
@@ -713,6 +718,10 @@ pub const UNIQUE_ID_OFFSET: u64 = 1 << 31;
 /// The mounts of each name space, for the propagation between name spaces.
 static ATTACHED: SpinLock<Vec<Weak<Mount>>> = SpinLock::new(Vec::new());
 
+/// Each mount, also a mount that is not attached, as `s_mounts` of `struct super_block` of
+/// Linux.
+static ALL: SpinLock<Vec<Weak<Mount>>> = SpinLock::new(Vec::new());
+
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
 fn new_group() -> u64 {
@@ -721,10 +730,12 @@ fn new_group() -> u64 {
 
 /// Tells if a mount of the file system of `root` has a file that is open for a write. A
 /// remount that makes the file system read only gives `EBUSY` then, as
-/// `sb_prepare_remount_readonly` of Linux.
+/// `sb_prepare_remount_readonly` of Linux. The mounts that are not attached count too, as the
+/// mount of `fsmount` before `move_mount`.
 pub fn fs_has_writers(root: &InodeRef) -> bool {
     let id = root.fs_id();
-    attached().iter().any(|m| m.has_writers() && m.root.inode().fs_id() == id)
+    let all: Vec<Arc<Mount>> = ALL.lock().iter().filter_map(Weak::upgrade).collect();
+    all.iter().any(|m| m.has_writers() && m.root.inode().fs_id() == id)
 }
 
 /// The mounts that are in a name space.
