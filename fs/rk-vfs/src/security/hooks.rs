@@ -467,6 +467,16 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `task_setioprio`: the I/O priority of `target` becomes `ioprio`.
+    fn task_setioprio(&self, target: &Task<'_>, ioprio: i32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `task_getioprio`: the caller reads the I/O priority of `target`.
+    fn task_getioprio(&self, target: &Task<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// `task_prlimit`: the caller with `cred` reads or changes the limits of the task with
     /// `tcred`. `flags` has `LSM_PRLIMIT_READ` and `LSM_PRLIMIT_WRITE`.
     fn task_prlimit(&self, cred: &Cred, tcred: &Cred, flags: u32) -> Result<()> {

@@ -1,6 +1,8 @@
-//! The scheduling calls: `getpriority`, `setpriority`, the `sched_*` calls and `getcpu`.
+//! The scheduling calls: `getpriority`, `setpriority`, `ioprio_set`, `ioprio_get`, the `sched_*`
+//! calls and `getcpu`.
 //!
-//! The checks and the errors are as in kernel/sys.c and kernel/sched/syscalls.c of Linux. The
+//! The checks and the errors are as in kernel/sys.c, block/ioprio.c and kernel/sched/syscalls.c
+//! of Linux. The
 //! scheduler of rukernel has only the fair class, so a real time policy and `SCHED_DEADLINE` only
 //! give the thread the largest share of the CPU.
 
@@ -147,6 +149,137 @@ pub(crate) fn setpriority(cx: &Cx<'_>, which: u64, who: u64, nice: u64) -> SysRe
         thread.set_sched(SchedParams { nice, ..thread.sched() });
     }
     result
+}
+
+/// The values of `which` of `ioprio_set` and `ioprio_get`.
+const IOPRIO_WHO_PROCESS: i32 = 1;
+const IOPRIO_WHO_PGRP: i32 = 2;
+const IOPRIO_WHO_USER: i32 = 3;
+
+/// The classes of an I/O priority. The class is in the bits 13 to 15, and the level is in the
+/// bits 0 to 2.
+const IOPRIO_CLASS_NONE: u32 = 0;
+const IOPRIO_CLASS_RT: u32 = 1;
+const IOPRIO_CLASS_BE: u32 = 2;
+const IOPRIO_CLASS_IDLE: u32 = 3;
+const IOPRIO_CLASS_SHIFT: u32 = 13;
+
+/// The class of the I/O priority `ioprio`.
+fn ioprio_class(ioprio: u32) -> u32 {
+    ioprio >> IOPRIO_CLASS_SHIFT & 7
+}
+
+/// Checks the class and the level of `ioprio`, as `ioprio_check_cap` of Linux. The real time
+/// class needs `CAP_SYS_ADMIN` or `CAP_SYS_NICE`.
+fn ioprio_check_cap(cx: &Cx<'_>, ioprio: u32) -> Result<(), Errno> {
+    match ioprio_class(ioprio) {
+        IOPRIO_CLASS_RT => {
+            let cred = cx.process().cred();
+            if !cred.capable(cap::SYS_ADMIN) && !cred.capable(cap::SYS_NICE) {
+                return Err(Errno::EPERM);
+            }
+        }
+        IOPRIO_CLASS_BE | IOPRIO_CLASS_IDLE => {}
+        IOPRIO_CLASS_NONE if ioprio & 7 == 0 => {}
+        _ => return Err(Errno::EINVAL),
+    }
+    Ok(())
+}
+
+/// The threads that `which` and `who` of `ioprio_set` and `ioprio_get` select. As in Linux, a
+/// user ID of 0 is the user of the caller only for `ioprio_get`. A thread that has no ID in the
+/// PID namespace of the caller is not a member of a user.
+fn ioprio_targets(cx: &Cx<'_>, which: u64, who: u64, set: bool) -> Result<Vec<Arc<Thread>>, Errno> {
+    let who = who as i32;
+    match which as i32 {
+        IOPRIO_WHO_PROCESS => Ok(match who {
+            0 => alloc::vec![cx.thread.clone()],
+            w => cx.find_task_by_vpid(u64::from(w as u32)).into_iter().collect(),
+        }),
+        IOPRIO_WHO_PGRP => {
+            let pgid = match who {
+                0 => cx.process().pgid(),
+                w => match cx.find_vpid(u64::from(w as u32)) {
+                    Some(pgid) => pgid,
+                    None => return Ok(Vec::new()),
+                },
+            };
+            Ok(processes()
+                .into_iter()
+                .filter(|p| p.pgid() == pgid)
+                .flat_map(|p| p.threads())
+                .collect())
+        }
+        IOPRIO_WHO_USER => {
+            let uid = if who == 0 && !set { cx.process().cred().uid } else { who as u32 };
+            Ok(processes()
+                .into_iter()
+                .filter(|p| p.cred().uid == uid)
+                .flat_map(|p| p.threads())
+                .filter(|t| cx.vnr(t.tid()) != 0)
+                .collect())
+        }
+        _ => Err(Errno::EINVAL),
+    }
+}
+
+/// `ioprio_set`: sets the I/O priority of each thread that `which` and `who` select, as
+/// block/ioprio.c of Linux. rukernel keeps the value but does not use it to order the I/O.
+pub(crate) fn ioprio_set(cx: &Cx<'_>, which: u64, who: u64, ioprio: u64) -> SysResult {
+    let ioprio = ioprio as u32;
+    ioprio_check_cap(cx, ioprio)?;
+    let threads = ioprio_targets(cx, which, who, true)?;
+    if threads.is_empty() {
+        return Err(Errno::ESRCH);
+    }
+    let cred = cx.process().cred();
+    for thread in threads {
+        // The checks of `set_task_ioprio` of Linux. The first error stops the loop.
+        let target = thread.process().cred();
+        if target.uid != cred.euid && target.uid != cred.uid && !cred.capable(cap::SYS_NICE) {
+            return Err(Errno::EPERM);
+        }
+        rk_vfs::security::task_setioprio(&lsm_task(&thread, &target), ioprio as i32)?;
+        thread.set_ioprio(ioprio & 0xffff);
+    }
+    Ok(0)
+}
+
+/// The I/O priority of `thread` for `ioprio_get` of a group: a thread with no class gets the
+/// class and the level that its policy and its nice value give, as `__get_task_ioprio` of Linux.
+fn effective_ioprio(thread: &Thread) -> u32 {
+    let ioprio = thread.ioprio();
+    if ioprio_class(ioprio) != IOPRIO_CLASS_NONE {
+        return ioprio;
+    }
+    let sched = thread.sched();
+    let class = if u64::from(sched.policy) == SCHED_IDLE {
+        IOPRIO_CLASS_IDLE
+    } else if sched.is_rt() || sched.is_deadline() {
+        IOPRIO_CLASS_RT
+    } else {
+        IOPRIO_CLASS_BE
+    };
+    class << IOPRIO_CLASS_SHIFT | ((sched.nice + 20) / 5) as u32
+}
+
+/// `ioprio_get`: gives the I/O priority of the thread that `which` and `who` select. For a
+/// process group or a user, it gives the best (the smallest) priority of the threads, as
+/// block/ioprio.c of Linux. A thread that the security modules hide is skipped.
+pub(crate) fn ioprio_get(cx: &Cx<'_>, which: u64, who: u64) -> SysResult {
+    let threads = ioprio_targets(cx, which, who, false)?;
+    if which as i32 == IOPRIO_WHO_PROCESS {
+        let thread = threads.first().ok_or(Errno::ESRCH)?;
+        rk_vfs::security::task_getioprio(&lsm_task(thread, &thread.process().cred()))?;
+        return Ok(u64::from(thread.ioprio()));
+    }
+    threads
+        .iter()
+        .filter(|t| rk_vfs::security::task_getioprio(&lsm_task(t, &t.process().cred())).is_ok())
+        .map(|t| effective_ioprio(t))
+        .min()
+        .map(u64::from)
+        .ok_or(Errno::ESRCH)
 }
 
 /// The view of `thread` with the credentials `cred` for the hooks of the security modules.

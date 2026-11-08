@@ -100,6 +100,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
         nr::SCHED_YIELD => process::sched_yield(),
         nr::GETPRIORITY => sched::getpriority(cx, a[0], a[1]),
         nr::SETPRIORITY => sched::setpriority(cx, a[0], a[1], a[2]),
+        nr::IOPRIO_SET => sched::ioprio_set(cx, a[0], a[1], a[2]),
+        nr::IOPRIO_GET => sched::ioprio_get(cx, a[0], a[1]),
         nr::SCHED_SETPARAM => sched::sched_setparam(cx, a[0], a[1]),
         nr::SCHED_GETPARAM => sched::sched_getparam(cx, a[0], a[1]),
         nr::SCHED_SETSCHEDULER => sched::sched_setscheduler(cx, a[0], a[1], a[2]),

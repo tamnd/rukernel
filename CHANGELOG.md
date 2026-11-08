@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `ioprio_set` and `ioprio_get`, as block/ioprio.c of Linux. The calls check the class, the level and the permissions, keep the value for each thread, and give it to a new child if its class is valid. `ioprio_get` of a process group or a user gives the best value. Before, the calls gave `ENOSYS`, so systemd failed to start a unit with `IOSchedulingClass=` or `IOSchedulingPriority=` with 211/IOPRIO (#543).
+
 ### Fixed
 
 - The console and the pseudo terminals take `TCGETS2`, `TCSETS2`, `TCSETSW2` and `TCSETSF2` with `struct termios2`, and keep the input and output speeds, as drivers/tty/tty_ioctl.c of Linux. glibc 2.42 and later use these calls in `isatty` and `tcgetattr`. Before, `isatty` of such a program gave `ENOTTY`, so systemd 259 and later failed to start a unit with `StandardOutput=tty` with "Inappropriate ioctl for device" on /dev/console (#543).
