@@ -4,6 +4,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The kselftest boot test runs `test_core` and `test_cpuset` of the cgroup selftests. tools/kselftest/build.sh builds them with cgroup/lib/cgroup_util.c, and the init script of the test mounts cgroup2 at /sys/fs/cgroup with `nsdelegate`, as systemd mounts it (#536).
+
+### Fixed
+
+- `/proc/PID/task/TID/cgroup` shows the cgroup of the thread `TID`, as `proc_cgroup_show` of Linux. In a threaded subtree, a thread can be in another cgroup than its process. Before, the file showed the cgroup of the process, and `test_cgcore_thread_migration` failed (#536).
+
 ## [0.5.18] - 2026-11-09
 
 ### Added
