@@ -163,6 +163,25 @@ pub(crate) fn ops_file(
     Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
 }
 
+/// Makes a file of /proc/sys with the permission bits `perm`. It gives text, takes writes if
+/// `write` is there, and its open files have the operations that `open` makes.
+#[cfg_attr(test, expect(dead_code, reason = "only the files of the kernel module use it"))]
+pub(crate) fn sysctl_file(
+    path: &[u8],
+    perm: u32,
+    read: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
+    write: Option<WriteFn>,
+    open: impl Fn() -> Option<Arc<dyn rk_vfs::file::FileOps>> + Send + Sync + 'static,
+) -> InodeRef {
+    let kind = Kind::File {
+        read: Box::new(read),
+        write,
+        text: SpinLock::new(None),
+        open: Some(Box::new(open)),
+    };
+    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
+}
+
 /// Makes a file that reads and writes at an offset, with the permission bits `perm`.
 pub(crate) fn data_file(
     path: &[u8],

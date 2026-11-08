@@ -4,12 +4,17 @@
 //! Each thread is in a UTS namespace, which has its own names, as kernel/utsname.c of Linux. A
 //! name has at most `NAME_MAX` bytes, as the fields of `struct new_utsname` have 65 bytes with the
 //! null byte.
+//!
+//! A change of a name is an event of `poll` on /proc/sys/kernel/hostname or
+//! /proc/sys/kernel/domainname, as `uts_proc_notify` of Linux. The events are global, so a change
+//! in any namespace is an event.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_frame::sync::{Once, SpinLock};
 use rk_vfs::user_ns::{self, UserNs};
+use rk_vfs::wait::WaitQueue;
 
 /// The most bytes of a name, `__NEW_UTS_LEN`.
 pub const NAME_MAX: usize = 64;
@@ -51,6 +56,38 @@ pub struct UtsNs {
     names: SpinLock<(Field, Field)>,
     /// The user namespace that owns the namespace, `user_ns` of Linux.
     user_ns: Arc<UserNs>,
+}
+
+/// A name with an event of `poll`, as `enum uts_proc` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Name {
+    /// The host name, `UTS_PROC_HOSTNAME`.
+    Host,
+    /// The NIS domain name, `UTS_PROC_DOMAINNAME`.
+    Domain,
+}
+
+/// The count of the changes of each name, the `event` of `hostname_poll` and `domainname_poll`
+/// of Linux.
+static EVENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The waits of `poll` for a change of a name.
+static POLL: WaitQueue = WaitQueue::new();
+
+/// The count of the changes of `name`.
+pub fn event(name: Name) -> u64 {
+    EVENTS[name as usize].load(Ordering::Relaxed)
+}
+
+/// The queue that a change of a name wakes.
+pub fn poll_queue() -> &'static WaitQueue {
+    &POLL
+}
+
+/// Counts a change of `name` and wakes the waits, as `uts_proc_notify` of Linux.
+fn notify(name: Name) {
+    EVENTS[name as usize].fetch_add(1, Ordering::Relaxed);
+    POLL.wake_all();
 }
 
 /// The UTS namespaces other than the first one, for `by_id`.
@@ -123,12 +160,18 @@ impl UtsNs {
 
     /// Sets the host name. Gives `false` if `name` is longer than `NAME_MAX`.
     pub fn set_hostname(&self, name: &[u8]) -> bool {
-        field(name).map(|f| self.names.lock().0 = f).is_some()
+        let Some(f) = field(name) else { return false };
+        self.names.lock().0 = f;
+        notify(Name::Host);
+        true
     }
 
     /// Sets the NIS domain name. Gives `false` if `name` is longer than `NAME_MAX`.
     pub fn set_domainname(&self, name: &[u8]) -> bool {
-        field(name).map(|f| self.names.lock().1 = f).is_some()
+        let Some(f) = field(name) else { return false };
+        self.names.lock().1 = f;
+        notify(Name::Domain);
+        true
     }
 }
 
@@ -186,6 +229,17 @@ mod tests {
         assert_eq!(bytes(&domainname()), b"example.org");
         assert!(!set_domainname(&[b'x'; 65]));
         assert_eq!(bytes(&domainname()), b"example.org");
+    }
+
+    #[test]
+    fn a_change_is_an_event() {
+        let ns = init_ns().copy(user_ns::init().clone());
+        let (host, domain) = (event(Name::Host), event(Name::Domain));
+        assert!(ns.set_hostname(b"h"));
+        assert!(event(Name::Host) > host);
+        assert!(!ns.set_domainname(&[b'x'; 65]));
+        assert!(ns.set_domainname(b"d"));
+        assert!(event(Name::Domain) > domain);
     }
 
     #[test]
