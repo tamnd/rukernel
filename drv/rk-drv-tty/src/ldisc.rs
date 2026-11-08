@@ -9,11 +9,11 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use rk_abi::native::signal::{SIGINT, SIGQUIT, SIGTSTP};
 use rk_abi::native::termbits::{
-    B38400, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL, HUPCL, ICANON, ICRNL, IEXTEN,
-    IGNCR, INLCR, ISIG, ISTRIP, IXON, NOFLSH, ONLCR, OPOST, VEOF, VEOL, VEOL2, VERASE, VINTR,
-    VKILL, VMIN, VQUIT, VSUSP, VWERASE,
+    B0, B38400, BOTHER, CBAUD, CBAUDEX, CREAD, CS8, ECHO, ECHOCTL, ECHOE, ECHOK, ECHOKE, ECHONL,
+    HUPCL, IBSHIFT, ICANON, ICRNL, IEXTEN, IGNCR, INLCR, ISIG, ISTRIP, IXON, NOFLSH, ONLCR, OPOST,
+    VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VMIN, VQUIT, VSUSP, VWERASE,
 };
-use rk_abi::native::types::Termios;
+use rk_abi::native::types::{Termios, Termios2};
 
 /// The most bytes that the line discipline keeps. Linux names it `N_TTY_BUF_SIZE`.
 pub const BUF_SIZE: usize = 4096;
@@ -32,10 +32,34 @@ pub const fn default_termios() -> Termios {
     }
 }
 
+/// The speed of a new terminal, as `tty_std_termios` in Linux.
+const DEFAULT_SPEED: u32 = 38400;
+
+/// The speeds of the values of `CBAUD`, as `baud_table` of drivers/tty/tty_baudrate.c of Linux.
+/// The values with `CBAUDEX` come after `B38400`.
+const BAUD_TABLE: [u32; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600,
+    115_200, 230_400, 460_800, 500_000, 576_000, 921_600, 1_000_000, 1_152_000, 1_500_000,
+    2_000_000, 2_500_000, 3_000_000, 3_500_000, 4_000_000,
+];
+
+/// Gives the speed of the value `cbaud` of `CBAUD`, or `other` for `BOTHER`, as
+/// `tty_termios_baud_rate` of Linux.
+fn baud_rate(cbaud: u32, other: u32) -> u32 {
+    let cbaud = cbaud & CBAUD;
+    if cbaud == BOTHER {
+        return other;
+    }
+    let index = if cbaud & CBAUDEX != 0 { (cbaud & !CBAUDEX) + 15 } else { cbaud };
+    BAUD_TABLE.get(index as usize).copied().unwrap_or(0)
+}
+
 /// The input and the line of one terminal.
 #[derive(Clone, Debug)]
 pub struct LineDiscipline {
     termios: Termios,
+    /// The input and the output speed, `c_ispeed` and `c_ospeed` of `struct ktermios`.
+    speeds: (u32, u32),
     /// The line that the user edits, in canonical mode.
     line: Vec<u8>,
     /// The lines that a read can take, in canonical mode. A line that `VEOF` ended has no line
@@ -61,6 +85,7 @@ impl LineDiscipline {
     pub const fn new() -> Self {
         Self {
             termios: default_termios(),
+            speeds: (DEFAULT_SPEED, DEFAULT_SPEED),
             line: Vec::new(),
             lines: VecDeque::new(),
             raw: VecDeque::new(),
@@ -72,10 +97,45 @@ impl LineDiscipline {
         self.termios
     }
 
+    /// The `termios` with the speeds, for `TCGETS2`.
+    pub fn termios2(&self) -> Termios2 {
+        let t = self.termios;
+        Termios2 {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+            c_ispeed: self.speeds.0,
+            c_ospeed: self.speeds.1,
+        }
+    }
+
+    /// Sets the `termios` and the speeds, for `TCSETS2`.
+    pub fn set_termios2(&mut self, t: Termios2) {
+        let termios = Termios {
+            c_iflag: t.c_iflag,
+            c_oflag: t.c_oflag,
+            c_cflag: t.c_cflag,
+            c_lflag: t.c_lflag,
+            c_line: t.c_line,
+            c_cc: t.c_cc,
+        };
+        self.speeds = (t.c_ispeed, t.c_ospeed);
+        self.set_termios(termios);
+    }
+
     /// Sets the `termios`, for `TCSETS`. A change to non canonical mode gives the bytes of the
-    /// line that the user edits to the reader.
+    /// line that the user edits to the reader. The speeds come from the `Bnnn` values of
+    /// `c_cflag`, or stay for `BOTHER`, as `set_termios` in drivers/tty/tty_ioctl.c of Linux.
     pub fn set_termios(&mut self, termios: Termios) {
         let was_canon = self.canonical();
+        let (ispeed, ospeed) = self.speeds;
+        let ospeed = baud_rate(termios.c_cflag, ospeed);
+        let input = (termios.c_cflag >> IBSHIFT) & CBAUD;
+        let ispeed = if input == B0 { ospeed } else { baud_rate(input, ispeed) };
+        self.speeds = (ispeed, ospeed);
         self.termios = termios;
         if was_canon && !self.canonical() {
             for line in self.lines.drain(..) {

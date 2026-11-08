@@ -78,6 +78,37 @@ fn raw_mode() {
 }
 
 #[test]
+fn termios2_speeds() {
+    use rk_abi::native::termbits::{B9600, BOTHER, CBAUD, IBSHIFT};
+    let mut ld = LineDiscipline::new();
+    let t = ld.termios2();
+    assert_eq!((t.c_ispeed, t.c_ospeed), (38400, 38400));
+    assert_eq!(t.c_cflag, default_termios().c_cflag);
+    // `TCSETS` with `B9600` sets both speeds, because the input speed is `B0`.
+    let mut old = default_termios();
+    old.c_cflag = (old.c_cflag & !CBAUD) | B9600;
+    ld.set_termios(old);
+    let t = ld.termios2();
+    assert_eq!((t.c_ispeed, t.c_ospeed), (9600, 9600));
+    // `TCSETS2` with `BOTHER` takes the speeds of the structure.
+    let mut t = ld.termios2();
+    t.c_cflag = (t.c_cflag & !CBAUD) | BOTHER | (BOTHER << IBSHIFT);
+    t.c_ispeed = 12345;
+    t.c_ospeed = 54321;
+    ld.set_termios2(t);
+    let t = ld.termios2();
+    assert_eq!((t.c_ispeed, t.c_ospeed), (12345, 54321));
+    assert_eq!(ld.termios().c_cflag & CBAUD, BOTHER);
+    // `TCSETS2` with a `Bnnn` value takes the speed of the value.
+    let mut t = ld.termios2();
+    t.c_cflag = (t.c_cflag & !(CBAUD | CBAUD << IBSHIFT)) | B9600;
+    t.c_ospeed = 1;
+    ld.set_termios2(t);
+    assert_eq!(ld.termios2().c_ospeed, 9600);
+    assert_eq!(ld.termios2().c_ispeed, 9600);
+}
+
+#[test]
 fn output_processing() {
     let ld = LineDiscipline::new();
     let mut out = Vec::new();
@@ -158,6 +189,11 @@ fn pseudo_terminal_pair() {
     assert_eq!(master.ioctl(&mf, 0x5400 | 0xff, BASE, &mem), Err(Errno::ENOTTY));
     assert_eq!(master.ioctl(&mf, TCGETA, BASE, &mem), Ok(0));
     assert_eq!(slave.ioctl(&sf, TCGETS, BASE, &mem), Ok(0));
+    // glibc 2.42 and later use `TCGETS2` for `isatty` and `tcgetattr`.
+    assert_eq!(crate::TCGETS2, 0x802c_542a);
+    assert_eq!(slave.ioctl(&sf, crate::TCGETS2, BASE, &mem), Ok(0));
+    assert_eq!(&mem.0.borrow()[36..44], &[0, 0x96, 0, 0, 0, 0x96, 0, 0]);
+    assert_eq!(slave.ioctl(&sf, crate::TCSETSW2, BASE, &mem), Ok(0));
     // Only `N_TTY` is a line discipline.
     mem.set_int(15);
     assert_eq!(master.ioctl(&mf, TIOCSETD, BASE, &mem), Err(Errno::EINVAL));

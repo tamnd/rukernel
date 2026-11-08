@@ -35,13 +35,27 @@ use rk_abi::native::open::O_NOCTTY;
 use rk_abi::native::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM};
 use rk_abi::native::signal::{SIGCONT, SIGHUP, SIGTTOU};
 use rk_abi::native::termbits::{TCIFLUSH, TCIOFLUSH};
-use rk_abi::native::types::{Termios, Winsize};
+use rk_abi::native::types::{Termios, Termios2, Winsize};
 use rk_frame::sync::SpinLock;
 use rk_vfs::device::{self, CharDevice, makedev};
 use rk_vfs::inode::Result;
 use rk_vfs::wait::PollTable;
 use rk_vfs::{File, FileOps, UserMemory, WaitQueue};
 use zerocopy::{FromZeros, IntoBytes};
+
+/// Gives the number of an `ioctl` of `struct termios2`, as `_IOC(dir, 'T', nr, struct termios2)`
+/// of Linux. `dir` is 2 for a read and 1 for a write.
+const fn termios2_ioctl(dir: u32, nr: u32) -> u32 {
+    dir << 30 | (size_of::<Termios2>() as u32) << 16 | (b'T' as u32) << 8 | nr
+}
+
+/// The `ioctl` calls of `struct termios2` from `<asm/ioctls.h>`, which the generated constants
+/// do not have. glibc 2.42 and later use them for `tcgetattr` and `tcsetattr`, so `isatty` of
+/// such a program needs `TCGETS2`.
+pub(crate) const TCGETS2: u32 = termios2_ioctl(2, 0x2a);
+pub(crate) const TCSETS2: u32 = termios2_ioctl(1, 0x2b);
+pub(crate) const TCSETSW2: u32 = termios2_ioctl(1, 0x2c);
+pub(crate) const TCSETSF2: u32 = termios2_ioctl(1, 0x2d);
 
 /// The device number of `/dev/tty`, the controlling terminal of the caller.
 pub const TTY_RDEV: u64 = makedev(5, 0);
@@ -472,6 +486,15 @@ impl FileOps for ConsoleFile {
                     tty.ldisc.flush_input();
                 }
                 tty.ldisc.set_termios(t);
+            }
+            TCGETS2 => mem.write(arg, tty.ldisc.termios2().as_bytes())?,
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                let mut t = Termios2::new_zeroed();
+                mem.read(arg, t.as_mut_bytes())?;
+                if cmd == TCSETSF2 {
+                    tty.ldisc.flush_input();
+                }
+                tty.ldisc.set_termios2(t);
             }
             TIOCGWINSZ => mem.write(arg, tty.winsize.as_bytes())?,
             TIOCSWINSZ => {

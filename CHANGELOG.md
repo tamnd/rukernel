@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- The console and the pseudo terminals take `TCGETS2`, `TCSETS2`, `TCSETSW2` and `TCSETSF2` with `struct termios2`, and keep the input and output speeds, as drivers/tty/tty_ioctl.c of Linux. glibc 2.42 and later use these calls in `isatty` and `tcgetattr`. Before, `isatty` of such a program gave `ENOTTY`, so systemd 259 and later failed to start a unit with `StandardOutput=tty` with "Inappropriate ioctl for device" on /dev/console (#543).
+
 ## [0.5.15] - 2026-11-08
 
 ### Added
