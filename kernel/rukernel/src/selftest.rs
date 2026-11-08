@@ -31,6 +31,8 @@ pub(crate) fn run(name: &str) -> bool {
         "fault" => fault_test(),
         #[cfg(target_arch = "x86_64")]
         "net" => net_test(),
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        "tpm" => tpm_test(),
         other => {
             println!("rk.test: unknown test {other}");
             false
@@ -1205,4 +1207,54 @@ fn net_test() -> bool {
         None => ok &= check("the gateway answers the ARP request", false),
     }
     ok
+}
+
+/// The kernel finds the TPM of the machine: the CRB of the ACPI `TPM2` table on x86-64, and the
+/// FIFO interface of the device tree on arm64. The driver starts it as Linux does. Then the test
+/// sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read`. `cargo xtask boot-test` gives the
+/// machine a new swtpm for this test.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn tpm_test() -> bool {
+    use rk_drv_tpm::cmd;
+
+    let Some(chip) = rk_drv_tpm::init() else {
+        return check("the kernel finds a TPM 2.0 and starts it", false);
+    };
+    let mut ok = check("the kernel finds a TPM 2.0 and starts it", true);
+    println!("rk.test: the TPM has the interface {}", chip.name());
+    // The firmware or the driver started the TPM, so a second start gives TPM_RC_INITIALIZE.
+    let rc = chip.startup();
+    println!("rk.test: TPM2_Startup(TPM_SU_CLEAR) gives {rc:x?}");
+    ok &= check("TPM2_Startup is done", rc.is_ok());
+    let (mut a, mut b) = ([0u8; 8], [0u8; 8]);
+    let random = chip.get_random(&mut a).and_then(|()| chip.get_random(&mut b));
+    println!("rk.test: TPM2_GetRandom(8) gives {a:02x?} and {b:02x?}");
+    ok &= check(
+        "TPM2_GetRandom gives 8 bytes, and the next 8 bytes differ",
+        random.is_ok() && a != b,
+    );
+    let rsp = chip.command(&cmd::pcr_read(cmd::ALG_SHA256, &[0, 7]));
+    let digests = rsp.as_ref().ok().filter(|(rc, _)| *rc == cmd::RC_SUCCESS).and_then(|(_, r)| {
+        let (pcrs, d) = cmd::parse_pcr_read(r)?;
+        (pcrs == [0, 7] && d.iter().all(|d| d.len() == cmd::SHA256_SIZE))
+            .then(|| d.iter().map(|d| d.to_vec()).collect::<alloc::vec::Vec<_>>())
+    });
+    ok &= check("TPM2_PCR_Read gives the SHA-256 PCRs 0 and 7", digests.is_some());
+    for (pcr, digest) in [0, 7].into_iter().zip(digests.iter().flatten()) {
+        println!("rk.test: sha256 PCR {pcr}: {}", Hex(digest));
+        let one = chip.pcr_read(cmd::ALG_SHA256, pcr);
+        ok &= check("a TPM2_PCR_Read of one PCR gives the same value", one.as_ref() == Ok(digest));
+    }
+    ok
+}
+
+/// Prints bytes as hexadecimal digits.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct Hex<'a>(&'a [u8]);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl core::fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
 }

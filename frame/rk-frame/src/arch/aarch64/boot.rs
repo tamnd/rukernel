@@ -442,6 +442,9 @@ fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
         super::rtc::set_base(base);
     }
     crate::iomem::virtio_mmio::set(&platform.virtio_mmio[..platform.virtio_mmio_count]);
+    if let Some((phys, len)) = platform.tpm_tis {
+        crate::tpm::set_tis(phys, len);
+    }
     // The scan of the PCI bus comes later, at the first `pci::devices`. It assigns the BARs,
     // because no firmware assigns them before `-kernel`.
     if let Some((ecam, len)) = platform.pci_ecam {

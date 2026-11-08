@@ -1,6 +1,6 @@
 //! x86-64.
 
-mod acpi;
+pub(crate) mod acpi;
 pub(crate) mod apic;
 mod boot;
 mod boot_params;
