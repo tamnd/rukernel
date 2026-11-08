@@ -8,13 +8,16 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The console and the pseudo terminals take `TCGETS2`, `TCSETS2`, `TCSETSW2` and `TCSETSF2` with `struct termios2`, and keep the input and output speeds, as drivers/tty/tty_ioctl.c of Linux. glibc 2.42 and later use these calls in `isatty` and `tcgetattr`. Before, `isatty` of such a program gave `ENOTTY`, so systemd 259 and later failed to start a unit with `StandardOutput=tty` with "Inappropriate ioctl for device" on /dev/console (#543).
 
+### Added
+
+- AppArmor attaches a profile at `execve`, as domain.c of Linux. The cred of a task holds its label. A program that matches the attachment of a profile gets that profile, and two profiles with the same match give a conflict. The exec rules of a profile give the next label, with the `ix`, `px`, `cx` and `ux` fallbacks. In complain mode, an exec with no rule makes a learning profile `PARENT//null-NAME` and logs it with `apparmor="ALLOWED"`, as on Linux. `/proc/PID/attr/current` and `/proc/PID/attr/apparmor/current` show the label and the mode (#540)
+
 ## [0.5.15] - 2026-11-08
 
 ### Added
 
 - The `hugetlb`, `rdma` and `misc` controllers of cgroup2, the mount option `memory_recursiveprot`, and the `user.` and `trusted.` extended attributes of the cgroup directories and files, as kernel/cgroup and kernfs of Linux. `cgroup.controllers` of the root lists `cpuset cpu io memory hugetlb pids rdma misc`, as on Linux. The controllers have the files of Linux: `hugetlb.2MB.*` with the counts 0 and a limit that is rounded down to a huge page, and `rdma.*` and `misc.*` with no device and no resource. With `memory_recursiveprot`, a child gets a part of the `memory.min` and `memory.low` protection that its siblings do not use, as `effective_protection`. The `user.` attributes have the limits of kernfs, 128 attributes and 128 KiB of values for each inode, and `rmdir` removes the attributes of the cgroup. The init boot test takes `-- only cgroup` (#536).
 - AppArmor unpacks a binary policy of `apparmor_parser`, as policy_unpack.c of Linux: the header, the profiles, the hats, the flags, the capabilities, the rlimits and the DFA tables with their checks. `.load`, `.replace` and `.remove` change the tree of profiles, and `profiles` and `revision` show it. The kernel log has the audit records of the changes and of the failures, as on Linux (#540)
-- AppArmor attaches a profile at `execve`, as domain.c of Linux. The cred of a task holds its label. A program that matches the attachment of a profile gets that profile, and two profiles with the same match give a conflict. The exec rules of a profile give the next label, with the `ix`, `px`, `cx` and `ux` fallbacks. In complain mode, an exec with no rule makes a learning profile `PARENT//null-NAME` and logs it with `apparmor="ALLOWED"`, as on Linux. `/proc/PID/attr/current` and `/proc/PID/attr/apparmor/current` show the label and the mode (#540)
 
 ### Fixed
 
