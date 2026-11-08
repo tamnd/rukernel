@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The `hugetlb`, `rdma` and `misc` controllers of cgroup2, the mount option `memory_recursiveprot`, and the `user.` and `trusted.` extended attributes of the cgroup directories and files, as kernel/cgroup and kernfs of Linux. `cgroup.controllers` of the root lists `cpuset cpu io memory hugetlb pids rdma misc`, as on Linux. The controllers have the files of Linux: `hugetlb.2MB.*` with the counts 0 and a limit that is rounded down to a huge page, and `rdma.*` and `misc.*` with no device and no resource. With `memory_recursiveprot`, a child gets a part of the `memory.min` and `memory.low` protection that its siblings do not use, as `effective_protection`. The `user.` attributes have the limits of kernfs, 128 attributes and 128 KiB of values for each inode, and `rmdir` removes the attributes of the cgroup. The init boot test takes `-- only cgroup` (#536).
+
 ## [0.5.14] - 2026-11-08
 
 ### Added

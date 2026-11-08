@@ -75,15 +75,32 @@ pub const MEMORY: u8 = 1 << 2;
 pub const PIDS: u8 = 1 << 3;
 /// The bit of the io controller.
 pub const IO: u8 = 1 << 4;
+/// The bit of the hugetlb controller. rukernel has no huge pages, so the counts stay 0.
+pub const HUGETLB: u8 = 1 << 5;
+/// The bit of the rdma controller. rukernel has no RDMA device, so the files are empty.
+pub const RDMA: u8 = 1 << 6;
+/// The bit of the misc controller. rukernel has no misc resource, so the files are empty.
+pub const MISC: u8 = 1 << 7;
 /// The bits of all controllers.
-pub const ALL: u8 = CPUSET | CPU | IO | MEMORY | PIDS;
+pub const ALL: u8 = CPUSET | CPU | IO | MEMORY | HUGETLB | PIDS | RDMA | MISC;
 /// The bits of the threaded controllers, `cgrp_dfl_threaded_ss_mask` of Linux. Only these
 /// controllers work in a threaded subtree. The others are domain controllers.
 pub const THREADED: u8 = CPUSET | CPU | PIDS;
 
 /// The controllers in the order of Linux, with their names.
-pub const CONTROLLERS: [(u8, &str); 5] =
-    [(CPUSET, "cpuset"), (CPU, "cpu"), (IO, "io"), (MEMORY, "memory"), (PIDS, "pids")];
+pub const CONTROLLERS: [(u8, &str); 8] = [
+    (CPUSET, "cpuset"),
+    (CPU, "cpu"),
+    (IO, "io"),
+    (MEMORY, "memory"),
+    (HUGETLB, "hugetlb"),
+    (PIDS, "pids"),
+    (RDMA, "rdma"),
+    (MISC, "misc"),
+];
+
+/// The size of a huge page of the hugetlb controller, 2 MiB, in the names of its files.
+const HPAGE_SIZE: u64 = 2 << 20;
 
 /// The value `max`: no limit.
 pub const MAX: u64 = u64::MAX;
@@ -343,6 +360,8 @@ struct Node {
     mem: MemConf,
     cpuset: Cpuset,
     io: io::Io,
+    /// `hugetlb.2MB.max` and `hugetlb.2MB.rsvd.max` in bytes.
+    hugetlb_max: [u64; 2],
     /// The counts that the charges change without the lock of the tree.
     c: Arc<Counters>,
 }
@@ -370,6 +389,7 @@ impl Node {
             mem: MemConf::default(),
             cpuset: Cpuset::default(),
             io: io::Io::default(),
+            hugetlb_max: [MAX; 2],
             c,
         }
     }
@@ -416,7 +436,7 @@ const fn file(name: &'static str, ctrl: u8, root: bool, child: bool, perm: u32) 
 }
 
 /// The files of a cgroup, as Linux names them.
-pub const FILES: [FileInfo; 50] = [
+pub const FILES: [FileInfo; 65] = [
     file("cgroup.controllers", 0, true, true, 0o444),
     file("cgroup.events", 0, false, true, 0o444),
     file("cgroup.freeze", 0, false, true, 0o644),
@@ -464,9 +484,24 @@ pub const FILES: [FileInfo; 50] = [
     file("memory.swap.peak", MEMORY, false, true, 0o644),
     file("memory.zswap.current", MEMORY, false, true, 0o444),
     file("memory.zswap.max", MEMORY, false, true, 0o644),
+    file("hugetlb.2MB.current", HUGETLB, false, true, 0o444),
+    file("hugetlb.2MB.events", HUGETLB, false, true, 0o444),
+    file("hugetlb.2MB.events.local", HUGETLB, false, true, 0o444),
+    file("hugetlb.2MB.max", HUGETLB, false, true, 0o644),
+    file("hugetlb.2MB.numa_stat", HUGETLB, true, true, 0o444),
+    file("hugetlb.2MB.rsvd.current", HUGETLB, false, true, 0o444),
+    file("hugetlb.2MB.rsvd.max", HUGETLB, false, true, 0o644),
     file("pids.current", PIDS, false, true, 0o444),
     file("pids.events", PIDS, false, true, 0o444),
     file("pids.max", PIDS, false, true, 0o644),
+    file("rdma.current", RDMA, false, true, 0o444),
+    file("rdma.max", RDMA, false, true, 0o644),
+    file("misc.capacity", MISC, true, false, 0o444),
+    file("misc.current", MISC, true, true, 0o444),
+    file("misc.events", MISC, false, true, 0o444),
+    file("misc.events.local", MISC, false, true, 0o444),
+    file("misc.max", MISC, false, true, 0o644),
+    file("misc.peak", MISC, true, true, 0o444),
 ];
 
 /// The files of the pids controller that come after the others: `pids.peak`.
@@ -608,6 +643,8 @@ pub struct Hierarchy {
     any_quota: bool,
     /// The share of each device for `io.weight`.
     io_shares: BTreeMap<u64, io::Share>,
+    /// The mount option `memory_recursiveprot`, `CGRP_ROOT_MEMORY_RECURSIVE_PROT` of Linux.
+    recursive_prot: bool,
 }
 
 impl Hierarchy {
@@ -632,7 +669,19 @@ impl Hierarchy {
             shared,
             any_quota: false,
             io_shares: BTreeMap::new(),
+            recursive_prot: false,
         }
+    }
+
+    /// Sets the mount option `memory_recursiveprot`. With it, the children of a protected
+    /// cgroup also share the protection that their siblings do not use, as Linux.
+    pub fn set_recursive_prot(&mut self, on: bool) {
+        self.recursive_prot = on;
+    }
+
+    /// The mount option `memory_recursiveprot`.
+    pub fn recursive_prot(&self) -> bool {
+        self.recursive_prot
     }
 
     /// Sets the CPUs of the machine, when the CPUs start.
@@ -1334,7 +1383,10 @@ impl Hierarchy {
     /// of `root` has its own values. A cgroup lower down gets its part of the effective value
     /// of its parent: if the protected use of the children, `min(current, memory.min)`, is
     /// above the effective value of the parent, each child gets the part of its protected use.
-    /// `root` itself has no protection. The removed cgroups count with their parent.
+    /// With `memory_recursiveprot`, a child also gets a part of the effective value that the
+    /// protected use of the children leaves, by its use that is not protected, as
+    /// `effective_protection` in mm/page_counter.c of Linux. `root` itself has no protection.
+    /// The removed cgroups count with their parent.
     fn protection(&self, root: CgId) -> BTreeMap<CgId, (u64, u64)> {
         // The cgroups below `root`, with the removed ones, by their parent.
         let mut below: BTreeMap<CgId, Vec<CgId>> = BTreeMap::new();
@@ -1358,8 +1410,10 @@ impl Hierarchy {
             };
             let sum_min: u64 = kids.iter().map(|&k| used(k, |m| m.min)).sum();
             let sum_low: u64 = kids.iter().map(|&k| used(k, |m| m.low)).sum();
+            let parent_usage = self.current(parent);
             for &k in kids {
                 let n = &self.nodes[&k];
+                let usage = self.current(k);
                 let prot = if !self.on(k, MEMORY) {
                     (0, 0)
                 } else if parent == root {
@@ -1368,6 +1422,11 @@ impl Hierarchy {
                     let part = |own: u64, sum: u64, parent_e: u64| {
                         if sum > parent_e {
                             (u128::from(own) * u128::from(parent_e) / u128::from(sum)) as u64
+                        } else if self.recursive_prot && parent_usage > sum {
+                            let unclaimed = u128::from(parent_e - sum)
+                                * u128::from(usage.saturating_sub(own))
+                                / u128::from(parent_usage - sum);
+                            own.saturating_add(unclaimed as u64)
                         } else {
                             own
                         }
@@ -1781,6 +1840,14 @@ impl Hierarchy {
             "pids.peak" => format!("{}\n", pids.peak.load(Ordering::Relaxed)),
             "pids.max" => show_max(pids.max.load(Ordering::Relaxed)),
             "pids.events" => format!("max {}\n", pids.events_max.load(Ordering::Relaxed)),
+            "hugetlb.2MB.current" | "hugetlb.2MB.rsvd.current" => String::from("0\n"),
+            "hugetlb.2MB.events" | "hugetlb.2MB.events.local" => String::from("max 0\n"),
+            "hugetlb.2MB.max" => show_max(n.hugetlb_max[0]),
+            "hugetlb.2MB.rsvd.max" => show_max(n.hugetlb_max[1]),
+            "hugetlb.2MB.numa_stat" => String::from("total=0 N0=0\n"),
+            // Linux shows one line for each device or resource, and there are none.
+            "rdma.current" | "rdma.max" | "misc.capacity" | "misc.current" | "misc.events"
+            | "misc.events.local" | "misc.max" | "misc.peak" => String::new(),
             _ => return Err(Errno::EINVAL),
         };
         Ok(out)
@@ -1968,6 +2035,30 @@ impl Hierarchy {
                 n.c.pids.max.store(parse_max(data)?, Ordering::Relaxed);
                 Effect::None
             }
+            // The limit is rounded down to a huge page, as `hugetlb_cgroup_write` of Linux.
+            "hugetlb.2MB.max" | "hugetlb.2MB.rsvd.max" => {
+                let v = parse_bytes(data)?;
+                let i = usize::from(name == "hugetlb.2MB.rsvd.max");
+                n.hugetlb_max[i] = if v == MAX { MAX } else { v / HPAGE_SIZE * HPAGE_SIZE };
+                Effect::None
+            }
+            // A line has a device and its limits, as `rdmacg_resource_set_max` of Linux. Valid
+            // limits give `ENODEV`, because there is no device.
+            "rdma.max" => {
+                let mut words = text(data)?.split_ascii_whitespace();
+                words.next().ok_or(Errno::EINVAL)?;
+                for w in words {
+                    let (key, v) = w.split_once('=').ok_or(Errno::EINVAL)?;
+                    if !matches!(key, "hca_handle" | "hca_object")
+                        || (v != "max" && v.parse::<u32>().is_err())
+                    {
+                        return Err(Errno::EINVAL);
+                    }
+                }
+                return Err(Errno::ENODEV);
+            }
+            // There is no resource with the name, as `misc_cg_max_write` of Linux.
+            "misc.max" => return Err(Errno::EINVAL),
             _ => return Err(Errno::EINVAL),
         };
         Ok(effect)

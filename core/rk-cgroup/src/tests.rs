@@ -53,7 +53,10 @@ fn the_limits_of_the_hierarchy_hold() {
 fn subtree_control_gives_the_controllers_to_the_children() {
     let mut h = Hierarchy::new(0, 1);
     let a = h.mkdir(ROOT, b"a", 0).unwrap();
-    assert_eq!(h.read(ROOT, "cgroup.controllers", 0).unwrap(), "cpuset cpu io memory pids\n");
+    assert_eq!(
+        h.read(ROOT, "cgroup.controllers", 0).unwrap(),
+        "cpuset cpu io memory hugetlb pids rdma misc\n"
+    );
     assert_eq!(h.read(a, "cgroup.controllers", 0).unwrap(), "\n");
     assert!(!names(&h, a).contains(&"pids.max"));
     h.write(ROOT, "cgroup.subtree_control", b"+pids +memory", 0).unwrap();
@@ -594,6 +597,29 @@ fn memory_min_and_low_protect_the_page_cache() {
 }
 
 #[test]
+fn memory_recursiveprot_shares_the_protection_of_the_parent() {
+    const M: u64 = 1 << 20;
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    h.write(a, "memory.low", b"100M", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    let c = h.mkdir(a, b"c", 0).unwrap();
+    h.write(c, "memory.low", b"10M", 0).unwrap();
+    assert_eq!(h.charge_file(b, 60 * M), None);
+    assert_eq!(h.charge_file(c, 40 * M), None);
+    // Without the option, only the setting of a child protects it.
+    let p = h.protection(ROOT);
+    assert_eq!((p[&a], p[&b], p[&c]), ((0, 100 * M), (0, 0), (0, 10 * M)));
+    // With it, the 90 MiB that C does not claim go to B and C by their use that is not
+    // protected: 60 MiB and 30 MiB of 90 MiB.
+    h.set_recursive_prot(true);
+    let p = h.protection(ROOT);
+    assert_eq!((p[&b], p[&c]), ((0, 60 * M), (0, 40 * M)));
+}
+
+#[test]
 fn events_change_only_with_the_first_and_the_last_task() {
     let mut h = Hierarchy::new(0, 1);
     let a = h.mkdir(ROOT, b"a", 0).unwrap();
@@ -794,4 +820,30 @@ fn populated_follows_the_counts_that_change_without_the_lock() {
     h.tasks_changed(b, changed);
     assert!(!h.populated(a) && !h.populated(ROOT));
     assert_eq!(h.nodes[&a].nr_populated_children, 0);
+}
+
+#[test]
+fn hugetlb_rdma_and_misc_have_the_files_of_linux() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let root: Vec<&str> = h.files(ROOT).iter().map(|f| f.name).collect();
+    assert!(root.contains(&"hugetlb.2MB.numa_stat") && root.contains(&"misc.capacity"));
+    assert!(!root.contains(&"hugetlb.2MB.max") && !root.contains(&"rdma.max"));
+    assert_eq!(h.read(a, "hugetlb.2MB.max", 0), Err(Errno::ENOENT));
+    h.write(ROOT, "cgroup.subtree_control", b"+hugetlb +rdma +misc", 0).unwrap();
+    assert_eq!(h.read(a, "cgroup.controllers", 0).unwrap(), "hugetlb rdma misc\n");
+    assert_eq!(h.read(a, "hugetlb.2MB.max", 0).unwrap(), "max\n");
+    h.write(a, "hugetlb.2MB.max", b"5M", 0).unwrap();
+    assert_eq!(h.read(a, "hugetlb.2MB.max", 0).unwrap(), "4194304\n");
+    assert_eq!(h.read(a, "hugetlb.2MB.rsvd.max", 0).unwrap(), "max\n");
+    assert_eq!(h.read(a, "hugetlb.2MB.events", 0).unwrap(), "max 0\n");
+    assert_eq!(h.read(a, "rdma.max", 0).unwrap(), "");
+    assert_eq!(
+        h.write(a, "rdma.max", b"mlx4_0 hca_handle=2 hca_object=max", 0),
+        Err(Errno::ENODEV)
+    );
+    assert_eq!(h.write(a, "rdma.max", b"mlx4_0 hca_handle=x", 0), Err(Errno::EINVAL));
+    assert_eq!(h.read(a, "misc.current", 0).unwrap(), "");
+    assert_eq!(h.write(a, "misc.max", b"sev 1", 0), Err(Errno::EINVAL));
+    assert_eq!(h.read(a, "misc.capacity", 0), Err(Errno::ENOENT));
 }
