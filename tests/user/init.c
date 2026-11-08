@@ -3374,6 +3374,38 @@ static void test_mount_ns(void)
  * not see the shared memory of the parent. setns with the file of the namespace of the parent
  * puts each one back, as kernel/utsname.c and ipc/namespace.c of Linux. setns02 of LTP does the
  * same (#481). */
+/* A change of the host name is an event of POLLPRI and POLLERR on /proc/sys/kernel/hostname, as
+ * proc_sys_poll of Linux. systemd-journald puts the file in its epoll set. */
+static void test_hostname_poll(void)
+{
+	struct utsname u;
+	struct epoll_event ev = {.events = EPOLLPRI}, out;
+	struct pollfd p;
+	int fd, ep, other, n;
+
+	mkdir("/proc", 0755);
+	mount("proc", "/proc", "proc", 0, NULL);
+	uname(&u);
+	fd = open("/proc/sys/kernel/hostname", O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+	other = open("/proc/sys/kernel/ostype", O_RDONLY | O_CLOEXEC);
+	ep = epoll_create1(EPOLL_CLOEXEC);
+	check("epoll_ctl adds /proc/sys/kernel/hostname and another sysctl",
+	      fd >= 0 && other >= 0 && ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) == 0 &&
+		      epoll_ctl(ep, EPOLL_CTL_ADD, other, &ev) == 0);
+	check("the host name file has no event before a change", epoll_wait(ep, &out, 1, 0) == 0);
+	sethostname(u.nodename, strlen(u.nodename));
+	n = epoll_wait(ep, &out, 1, 0);
+	check("sethostname gives POLLPRI and POLLERR on the host name file",
+	      n == 1 && (out.events & (EPOLLPRI | EPOLLERR)) == (EPOLLPRI | EPOLLERR));
+	p.fd = fd;
+	p.events = POLLIN | POLLPRI;
+	check("the event goes after poll sees it", poll(&p, 1, 0) == 1 && !(p.revents & POLLPRI));
+	close(other);
+	close(ep);
+	close(fd);
+	umount("/proc");
+}
+
 static void test_uts_ipc_ns(void)
 {
 	struct utsname u;
@@ -15138,6 +15170,7 @@ static void test_all(void)
 	test_mount();
 	test_mount_ns();
 	test_uts_ipc_ns();
+	test_hostname_poll();
 	test_time_ns();
 	test_modules();
 	test_pid_ns();

@@ -2,8 +2,8 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{
-    FindFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file, set_gone,
-    set_owner,
+    FindFn, WriteFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file,
+    set_gone, set_owner, sysctl_file,
 };
 use crate::procmap;
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
@@ -1166,10 +1166,12 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
                     None => {
                         let fpath = format!("{list_path}/{rest}");
                         let read = move || Ok(sysctl_read(name, default));
+                        let open = move || SysctlFile::open(name);
                         let node = if READ_ONLY_SYSCTLS.contains(&name) {
-                            file(fpath.as_bytes(), read)
+                            sysctl_file(fpath.as_bytes(), 0o444, read, None, open)
                         } else {
-                            rw_file(fpath.as_bytes(), read, move |data| sysctl_write(name, data))
+                            let write: WriteFn = Box::new(move |data| sysctl_write(name, data));
+                            sysctl_file(fpath.as_bytes(), 0o644, read, Some(write), open)
                         };
                         out.push((rest.as_bytes().to_vec(), node));
                     }
@@ -1773,6 +1775,85 @@ fn kpageflags_read(offset: u64, buf: &mut [u8]) -> Result<usize> {
         done += ENTRY;
     }
     Ok(done)
+}
+
+/// An open file of /proc/sys. It reads and writes the text of its inode. Each file can go in an
+/// epoll set, as `proc_sys_poll` of Linux. The host name and the NIS domain name also have an
+/// event of `POLLPRI` and `POLLERR` after a change since the open or the last `poll`.
+/// systemd-journald watches the host name so.
+struct SysctlFile {
+    /// The name with events, for kernel/hostname and kernel/domainname.
+    name: Option<rk_proc::uts::Name>,
+    /// The count of the changes that `poll` saw last.
+    seen: AtomicU64,
+}
+
+impl SysctlFile {
+    /// Opens the sysctl `sysctl`. The changes before the open have no event.
+    fn open(sysctl: &str) -> Option<Arc<dyn rk_vfs::file::FileOps>> {
+        use rk_proc::uts::{self, Name};
+        let name = match sysctl {
+            "kernel/hostname" => Some(Name::Host),
+            "kernel/domainname" => Some(Name::Domain),
+            _ => None,
+        };
+        Some(Arc::new(Self { name, seen: AtomicU64::new(name.map_or(0, uts::event)) }))
+    }
+}
+
+impl rk_vfs::file::FileOps for SysctlFile {
+    fn read(&self, file: &rk_vfs::file::File, buf: &mut [u8]) -> Result<usize> {
+        let pos = file.pos();
+        let n = file.inode().ok_or(Errno::EINVAL)?.read_at(pos, buf)?;
+        file.set_pos(pos + n as u64);
+        Ok(n)
+    }
+
+    fn write(&self, file: &rk_vfs::file::File, buf: &[u8]) -> Result<usize> {
+        let pos = file.pos();
+        let n = file.inode().ok_or(Errno::EINVAL)?.write_at(pos, buf)?;
+        file.set_pos(pos + n as u64);
+        Ok(n)
+    }
+
+    fn read_at(&self, file: &rk_vfs::file::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        file.inode().ok_or(Errno::EINVAL)?.read_at(offset, buf)
+    }
+
+    fn write_at(&self, file: &rk_vfs::file::File, offset: u64, buf: &[u8]) -> Result<usize> {
+        file.inode().ok_or(Errno::EINVAL)?.write_at(offset, buf)
+    }
+
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn poll(&self, _file: &rk_vfs::file::File) -> u32 {
+        use rk_abi::native::poll::{POLLERR, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM};
+        let Some(name) = self.name else {
+            return POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+        };
+        let event = rk_proc::uts::event(name);
+        if self.seen.swap(event, Ordering::Relaxed) == event {
+            POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM
+        } else {
+            POLLIN | POLLRDNORM | POLLERR | POLLPRI
+        }
+    }
+
+    fn pollable(&self) -> bool {
+        true
+    }
+
+    fn poll_wait(&self, _file: &rk_vfs::file::File, table: &mut rk_vfs::wait::PollTable) {
+        if self.name.is_some() {
+            table.add_static(rk_proc::uts::poll_queue());
+        }
+    }
+
+    fn event_count(&self) -> u64 {
+        self.name.map_or(0, rk_proc::uts::event)
+    }
 }
 
 /// An open file of `/proc/PID/mounts` or `/proc/PID/mountinfo`. It reads the text of its inode, and has an event of
