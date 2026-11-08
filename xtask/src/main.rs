@@ -1236,6 +1236,74 @@ fn rootfs_initramfs(kernel: &Path, name: &str) -> PathBuf {
     kernel.with_file_name(format!("initramfs-{name}.cpio"))
 }
 
+/// The script that runs as /init in the `tpm` boot test, after the checks of the kernel. It runs
+/// `tpm2_getrandom 8` and `tpm2_pcrread sha256:0,7` of tpm2-tools on /dev/tpm0, and compares the
+/// PCRs with the files of `pcr-sha256` in sysfs. `set -e` stops it at the first command that
+/// fails.
+const TPM_INIT: &str = "#!/bin/sh
+/bin/busybox mkdir -p /proc /sys /tmp /sbin /usr/sbin
+/bin/busybox --install -s
+set -e
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin TPM2TOOLS_TCTI=device:/dev/tpm0
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+test -c /dev/tpm0
+ls -l /dev/tpm0 | grep -q ' 10, *224 '
+grep -qx 2 /sys/class/tpm/tpm0/tpm_version_major
+grep -qx 10:224 /sys/class/tpm/tpm0/dev
+grep -qx MAJOR=10 /sys/class/tpm/tpm0/uevent
+grep -qx DEVNAME=tpm0 /sys/class/tpm/tpm0/uevent
+test \"$(ls /sys/class/tpm/tpm0/pcr-sha256 | wc -l)\" -eq 24
+tpm2_getrandom 8 > /tmp/a
+tpm2_getrandom 8 > /tmp/b
+test \"$(wc -c < /tmp/a)\" -eq 8 && test \"$(wc -c < /tmp/b)\" -eq 8
+if cmp -s /tmp/a /tmp/b; then echo 'tpm: two runs of tpm2_getrandom give the same bytes'; exit 1; fi
+echo \"tpm: tpm2_getrandom 8 gives$(od -An -tx1 /tmp/a)\"
+tpm2_pcrread sha256:0,7 > /tmp/pcrs
+cat /tmp/pcrs
+for pcr in 0 7; do
+    want=$(cat /sys/class/tpm/tpm0/pcr-sha256/$pcr)
+    test ${#want} -eq 64
+    grep -q \"^ *$pcr *: *0x$want$\" /tmp/pcrs
+done
+echo 'tpm: the PCRs of tpm2_pcrread are the PCRs of pcr-sha256'
+";
+
+/// The line of `TPM_INIT` after all of its checks.
+const TPM_TOOLS_PASS: &str = "tpm: the PCRs of tpm2_pcrread are the PCRs of pcr-sha256";
+
+/// The command line of the `tpm` boot test with tpm2-tools: init runs after the checks of the
+/// kernel.
+fn tpm_cmdline(test: &str) -> String {
+    format!("{} rdinit=/init", test_cmdline(test))
+}
+
+/// The directory of tpm2-tools that tools/tpm/build.sh makes: `RK_TPM_TOOLS`, or
+/// target/tpm-tools. It has a root file system tree for each architecture.
+fn tpm_tools_dir() -> Option<PathBuf> {
+    let dir = std::env::var_os("RK_TPM_TOOLS")
+        .map_or_else(|| workspace_root().join("target/tpm-tools"), PathBuf::from);
+    dir.join("VERSION").exists().then_some(dir)
+}
+
+/// Writes the initramfs of the `tpm` boot test for `arch` next to the kernel: the tree of
+/// tools/tpm/build.sh and `TPM_INIT` as /init. Gives `None` if there is no tree, and the test
+/// then checks only the kernel.
+fn tpm_initramfs(kernel: &Path, arch: &str) -> Result<Option<PathBuf>> {
+    let Some(root) = tpm_tools_dir().map(|d| d.join(arch).join("root")).filter(|r| r.is_dir())
+    else {
+        println!("boot test tpm: tpm2-tools skipped, run tools/tpm/build.sh");
+        return Ok(None);
+    };
+    let mut w = rk_vfs::cpio::Writer::new();
+    w.add(b".", 0o040_755, b"");
+    add_tree(&mut w, &root, &root)?;
+    w.add(b"init", 0o100_755, TPM_INIT.as_bytes());
+    let path = kernel.with_file_name("initramfs-tpm.cpio");
+    fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(path))
+}
+
 /// The directory of gdb, strace and their test program that tools/debug/build.sh makes:
 /// `RK_DEBUG_TOOLS`, or target/debug-tools.
 fn debug_tools_dir() -> Option<PathBuf> {
@@ -2524,7 +2592,11 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         // The `inet` test connects to a TCP server on the host. The guest gets the port on the
         // command line of init.
         let server = if *test == "inet" { Some(TcpServer::start()?) } else { None };
-        let (mut cmd, timeout) = if *test == "ltp" {
+        // The `tpm` test runs tpm2-tools after the checks of the kernel, if they are there.
+        let tpm_initrd = if *test == "tpm" { tpm_initramfs(&kernel, "x86_64")? } else { None };
+        let (mut cmd, timeout) = if let Some(initrd) = &tpm_initrd {
+            (qemu_command_with(&kernel, initrd, &tpm_cmdline(test)), ROOTFS_TIMEOUT)
+        } else if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
             let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
             let disk = kernel.with_file_name("ltp.img");
@@ -2643,6 +2715,10 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             QEMU_PASS
         };
         let mut passed = status == Some(want) && log.contains(&pass_line(test));
+        if tpm_initrd.is_some() && passed && !log.contains(TPM_TOOLS_PASS) {
+            println!("boot test tpm: the log does not have \"{TPM_TOOLS_PASS}\"");
+            passed = false;
+        }
         if *test == "blk" && passed && !blk_disk_has_note(&kernel.with_file_name("blk.img"))? {
             println!("boot test blk: the disk image does not have the data that the guest wrote");
             passed = false;
@@ -2917,6 +2993,10 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         if let Some(server) = &server {
             cmdline = format!("{cmdline} {}", server.port);
         }
+        let tpm_initrd = if *test == "tpm" { tpm_initramfs(&elf_path, "aarch64")? } else { None };
+        if tpm_initrd.is_some() {
+            cmdline = tpm_cmdline(test).replace("console=ttyS0", "console=ttyAMA0");
+        }
         let mut cmd = Command::new(&qemu);
         let machine = if gic == "3" {
             String::from("virt,gic-version=3,its=on")
@@ -2932,6 +3012,9 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             .arg("-append")
             .arg(cmdline);
         if let Some((initrd, _)) = initrd.as_ref().filter(|_| user_tests.contains(test)) {
+            cmd.arg("-initrd").arg(initrd);
+        }
+        if let Some(initrd) = &tpm_initrd {
             cmd.arg("-initrd").arg(initrd);
         }
         // The `virt` machine has a virtio-net-pci device by default. The PCI runs remove it, so
@@ -2957,8 +3040,11 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
         // gives the result.
         // QEMU emulates each arm64 instruction on an x86-64 host, so init has more time.
-        let timeout =
-            if user_tests.contains(test) { AARCH64_USER_TIMEOUT } else { BOOT_TEST_TIMEOUT };
+        let timeout = if user_tests.contains(test) || tpm_initrd.is_some() {
+            AARCH64_USER_TIMEOUT
+        } else {
+            BOOT_TEST_TIMEOUT
+        };
         let input = if *test == "busybox" { AARCH64_BUSYBOX_INPUT } else { test_input(test) };
         let dir = elf_path.with_file_name("swtpm");
         let _tpm = Swtpm::attach_for(&mut cmd, dir, AARCH64_TPM_DEVICE, test)?;
@@ -2966,7 +3052,8 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         let mut passed = status == Some(0)
             && log.contains("aarch64 booting with linux")
             && log.contains(&format!("smp: {smp} CPUs run"))
-            && log.contains(&pass_line(test));
+            && log.contains(&pass_line(test))
+            && (tpm_initrd.is_none() || log.contains(TPM_TOOLS_PASS));
         // The driver tells the bus of the device and the kind of its interrupt. virtio-blk has
         // one queue and virtio-net two, and the configuration has one more MSI-X vector.
         let (device, msix) =

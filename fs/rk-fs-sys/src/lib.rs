@@ -8,7 +8,8 @@
 //!   `uevent`, and the link `subsystem`. A block device also has `size`, `ro`, `removable` and
 //!   the directory `queue` with the limits of the queue, and `stat` and `inflight` with the
 //!   counts of the queue, as block/genhd.c of Linux.
-//!   A loop device with a file also has the directory `loop`, which `losetup` reads.
+//!   A loop device with a file also has the directory `loop`, which `losetup` reads. The
+//!   driver of a class can give more files, as `tpm_version_major` and `pcr-sha256` of a TPM.
 //!   A write of `ACTION [UUID [KEY=VALUE...]]` to `uevent` sends an event of the device, as
 //!   `udevadm trigger` asks for.
 //! - `/sys/class/CLASS/NAME` and `/sys/block/NAME` are links to the directory of the device.
@@ -366,6 +367,11 @@ fn device_entries(d: &DeviceInfo) -> Vec<(String, Kind)> {
     let subsystem = format!("{}class/{}", placed::up(&path), d.class);
     out.push((String::from("subsystem"), Kind::Link(subsystem.into_bytes())));
     out.push((String::from("uevent"), Kind::File(uevent.into_bytes())));
+    // The attributes of the class, as `tpm_version_major` of a TPM.
+    if let Some(attrs) = rk_vfs::device::class_attrs(d, &[]) {
+        out.extend(input_entries(attrs));
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+    }
     out
 }
 
@@ -394,7 +400,7 @@ const INPUT: &str = "input";
 /// The class of the DMI device, which has the fields of the SMBIOS tables.
 const DMI: &str = "dmi";
 
-/// The entries of a directory of the input devices.
+/// The entries of a directory of the input devices, or of the attributes of a class.
 fn input_entries(list: Vec<(String, rk_vfs::input::SysEntry)>) -> Vec<(String, Kind)> {
     use rk_vfs::input::SysEntry;
     list.into_iter()
@@ -541,6 +547,10 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
                 .into_iter()
                 .map(|(n, text)| (String::from(n), Kind::File(text.into_bytes())))
                 .collect()
+        }
+        // A directory of the attributes of the class, as `pcr-sha256` of a TPM.
+        ["devices", "virtual", class, name, ref rest @ ..] => {
+            input_entries(rk_vfs::device::class_attrs(virtual_device(list, class, name)?, rest)?)
         }
         // `/sys/fs/cgroup` is the place where the init system mounts cgroup2, and `/sys/fs/bpf`
         // is the place for bpffs.
@@ -839,6 +849,45 @@ mod tests {
             get("devices/virtual/mem/null/subsystem"),
             Kind::Link(b"../../../../class/mem".to_vec())
         );
+    }
+
+    #[test]
+    fn a_class_gives_its_attributes() {
+        use rk_vfs::input::SysEntry;
+        fn attrs(d: &DeviceInfo, rest: &[&str]) -> Option<Vec<(String, SysEntry)>> {
+            let file = |name: &str, text: String| (String::from(name), SysEntry::File(text.into()));
+            match rest {
+                [] => Some(alloc::vec![
+                    file("version", format!("{}\n", rk_vfs::device::minor(d.rdev))),
+                    (String::from("banks"), SysEntry::Dir),
+                ]),
+                ["banks"] => Some(alloc::vec![file("0", String::from("00\n"))]),
+                _ => None,
+            }
+        }
+        rk_vfs::device::set_class_attrs("attrs", attrs);
+        let mut list = list();
+        list.push(DeviceInfo {
+            name: String::from("thing0"),
+            class: "attrs",
+            rdev: makedev(10, 7),
+            block: false,
+            perm: 0o600,
+        });
+        let at = |path: &str| entries(path, &list, &init());
+        let names =
+            |path: &str| -> Vec<String> { at(path).unwrap().into_iter().map(|(n, _)| n).collect() };
+        let dir = "devices/virtual/attrs/thing0";
+        assert_eq!(names(dir), ["banks", "dev", "subsystem", "uevent", "version"]);
+        let version = at(dir).unwrap().into_iter().find(|(n, _)| n == "version").unwrap().1;
+        assert_eq!(version, Kind::File(b"7\n".to_vec()));
+        assert_eq!(
+            at(&format!("{dir}/banks")).unwrap(),
+            [(String::from("0"), Kind::File(b"00\n".to_vec()))]
+        );
+        assert!(at(&format!("{dir}/nothing")).is_none());
+        // The other classes have no more files.
+        assert_eq!(names("devices/virtual/tty/ttyS0"), ["dev", "subsystem", "uevent"]);
     }
 
     #[test]
