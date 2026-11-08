@@ -23,9 +23,9 @@
 
 use crate::netldisc::{LineOut, N_TTY, NR_LDISCS, NetLine, Proto};
 use crate::{
-    Caller, HUNG_POLL, Tty, caller, check_change, check_vhangup, finish_leave_ctty,
-    hang_up_session, hung_ioctl, leave_ctty, read_pgrp, send_signals, session_has_tty, set_ctty,
-    set_pgrp,
+    Caller, HUNG_POLL, TCGETS2, TCSETS2, TCSETSF2, TCSETSW2, Tty, caller, check_change,
+    check_vhangup, finish_leave_ctty, hang_up_session, hung_ioctl, leave_ctty, read_pgrp,
+    send_signals, session_has_tty, set_ctty, set_pgrp,
 };
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
@@ -44,7 +44,7 @@ use rk_abi::native::poll::{POLLHUP, POLLIN, POLLOUT};
 use rk_abi::native::signal::{SIGHUP, SIGWINCH};
 use rk_abi::native::sockios::SIOCGIFNAME;
 use rk_abi::native::termbits::{TCIFLUSH, TCIOFLUSH, TCOFLUSH};
-use rk_abi::native::types::{Termio, Termios, Winsize};
+use rk_abi::native::types::{Termio, Termios, Termios2, Winsize};
 use rk_frame::sync::SpinLock;
 use rk_vfs::device::{self, CharDevice, makedev, minor};
 use rk_vfs::fstype::{FsType, MountArgs};
@@ -529,6 +529,15 @@ fn tty_ioctl(
                     st.tty.ldisc.flush_input();
                 }
                 st.tty.ldisc.set_termios(t);
+            }
+            TCGETS2 => mem.write(arg, st.tty.ldisc.termios2().as_bytes())?,
+            TCSETS2 | TCSETSW2 | TCSETSF2 => {
+                let mut t = Termios2::new_zeroed();
+                mem.read(arg, t.as_mut_bytes())?;
+                if cmd == TCSETSF2 {
+                    st.tty.ldisc.flush_input();
+                }
+                st.tty.ldisc.set_termios2(t);
             }
             TCGETA => mem.write(arg, to_termio(&st.tty.ldisc.termios()).as_bytes())?,
             TCSETA | TCSETAW | TCSETAF => {

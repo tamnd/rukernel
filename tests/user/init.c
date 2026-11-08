@@ -608,6 +608,9 @@ static void test_devices(void)
 	check("/dev/null", fd >= 0 && write(fd, buf, sizeof(buf)) == sizeof(buf));
 	close(fd);
 	check("isatty of the console", isatty(1));
+	/* TCGETS2, which isatty and tcgetattr of glibc 2.42 and later use: struct termios2 with the speeds. */
+	unsigned int t2[11] = { 0 };
+	check("TCGETS2 on the console", ioctl(1, 0x802c542a, t2) == 0 && t2[9] == 38400 && t2[10] == 38400);
 	/* RNDGETENTCNT, as random_ioctl in drivers/char/random.c of Linux (#385). */
 	int bits = -1;
 	fd = open("/dev/urandom", O_RDONLY);
