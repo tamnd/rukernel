@@ -60,6 +60,8 @@ QEMU loads the ELF image directly through the PVH entry note. The build also wri
 
 `cargo xtask qemu` and the boot tests use the QEMU programs in `PATH`. `RK_QEMU` gives the directory of the programs of a different QEMU build, for example `$HOME/rk-qemu9/install/bin`. Without KVM, the x86-64 CPU model is `max`, and `RK_QEMU_CPU` gives a different model, for example `max,-x2apic`. QEMU 9.0 and later give the x2APIC without KVM, and QEMU 8.2 does not. When the CPU has the x2APIC, the kernel uses it and writes `x2apic enabled` in the boot log.
 
+With `RK_TPM=1`, `cargo xtask qemu` and each boot test give the machine a TPM 2.0 from swtpm: `-tpmdev emulator` with `-device tpm-crb` on x86-64 and `-device tpm-tis-device` on the arm64 `virt` machine. Each machine gets a new swtpm process with a new state, in the directory `swtpm` next to the kernel. The process stops with the machine. `RK_SWTPM` gives the path of a different swtpm program. With a TPM, QEMU puts the initramfs of `-initrd` over a part of the ACPI tables of SeaBIOS. Thus the x86-64 machine gets the initramfs from `-device loader` at 64 MiB, and the kernel finds it from `initrdmem=ADDRESS,SIZE` on the command line, as Linux does.
+
 The `init` and `tty` boot tests run the C programs in `tests/user`. The build compiles them with `musl-gcc` or `zig cc`, or with the command in `RK_USER_CC`. The `busybox` boot test runs the BusyBox shell as init. The shell runs a pipeline, and `^C` stops a job in the foreground. The first run downloads a static BusyBox from busybox.net and checks its SHA-256. `RK_BUSYBOX` gives the path of a different BusyBox. To use the shell yourself, run this command:
 
 ```
