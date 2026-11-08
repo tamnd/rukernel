@@ -80,9 +80,14 @@ static WAITING: SpinLock<BTreeMap<usize, usize>> = SpinLock::new(BTreeMap::new()
 /// The tasks that wait for a lock. Each release wakes all of them.
 static LOCK_WAIT: WaitQueue = WaitQueue::new();
 
+/// The key of the file of `file`. A file without an inode, as a socket, uses the device and the
+/// inode number that `fstat` gives, because each file of Linux has an inode and a lock is on the
+/// inode. systemd locks a socket with `lockf` for the namespace of `PrivateNetwork=`.
 fn key(file: &File) -> Result<Key> {
-    let inode = file.inode().ok_or(Errno::EBADF)?;
-    let m = inode.metadata();
+    let m = match file.inode() {
+        Some(inode) => inode.metadata(),
+        None => file.metadata()?,
+    };
     Ok((m.dev, m.ino))
 }
 
@@ -95,7 +100,7 @@ pub fn file_id(file: &File) -> usize {
 ///
 /// # Errors
 ///
-/// Gives `EBADF` if the file has no inode.
+/// Gives `EBADF` if the file has no inode and no attributes.
 pub fn test(file: &File, lock: &RecordLock) -> Result<Option<RecordLock>> {
     let key = key(file)?;
     let locks = LOCKS.lock();

@@ -4354,6 +4354,30 @@ static void test_file_locks(void)
 	close(fd2);
 	close(fd);
 	unlink("/tmp/lk");
+
+	/* A socket takes a lock, as each file of Linux. systemd locks one end of a socket pair
+	 * with lockf for the namespace of PrivateNetwork=. */
+	int sp[2], sp2[2];
+	check("lockf F_LOCK on a socket",
+	      socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sp) == 0 && lockf(sp[0], F_LOCK, 0) == 0);
+	check("socketpair for the locks of another socket",
+	      socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sp2) == 0);
+	pid = fork();
+	if (pid == 0) {
+		int ok = lockf(sp[0], F_TLOCK, 0) < 0 && (errno == EAGAIN || errno == EACCES);
+		ok = ok && lockf(sp2[0], F_TLOCK, 0) == 0;
+		_exit(ok ? 0 : 1);
+	}
+	status = -1;
+	waitpid(pid, &status, 0);
+	check("the lock of a socket conflicts only with the locks of the same socket",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("lockf F_ULOCK on a socket", lockf(sp[0], F_ULOCK, 0) == 0);
+	check("flock on a socket", flock(sp[1], LOCK_EX | LOCK_NB) == 0 && flock(sp[1], LOCK_UN) == 0);
+	close(sp[0]);
+	close(sp[1]);
+	close(sp2[0]);
+	close(sp2[1]);
 }
 
 static void test_iflags(void)

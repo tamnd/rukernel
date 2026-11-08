@@ -31,6 +31,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `FSCONFIG_CMD_RECONFIGURE` on the context of `fsopen` after `fsmount` changes the new file system, as Linux does after `vfs_clean_context`. Before, it gave `EBUSY`, so the units with credentials, for example systemd-journald of systemd 261 and 262, failed with status 243/CREDENTIALS and "Failed to set up credentials: Device or resource busy". A second `fsmount` of a context now gives `EBUSY` (#543).
 
+### Fixed
+
+- `fcntl` record locks, `lockf` and `flock` work on a socket, as on Linux, where each file has an inode. They gave `EBADF` before. systemd locks a socket with `lockf` to keep the namespace of `PrivateNetwork=`, so e2scrub_reap.service of Ubuntu 26.10 failed with status 225/NETWORK (#543).
+
 ## [0.5.14] - 2026-11-08
 
 ### Added
