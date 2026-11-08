@@ -117,7 +117,7 @@ pub(crate) fn mount(
         }
         // A remount without `MS_BIND` also changes the file system, as `do_remount` of Linux.
         if flags & MS_BIND == 0 {
-            remount_super(&at.mount, at.inode(), flags & MS_RDONLY != 0)?;
+            remount_super(at.mount.source().fstype, at.inode(), flags & MS_RDONLY != 0)?;
         }
         let old = at.mount.flags() as u32;
         at.mount.set_flags(u64::from(atime_flags(flags, Some(old)) & KEPT))?;
@@ -176,8 +176,7 @@ pub(crate) fn mount(
 /// remount, as `reconfigure_super` of Linux. Gives `EBUSY` if the file system becomes read only
 /// and a file of one of its mounts is open for a write, and `EACCES` if it becomes writable on a
 /// read only device.
-fn remount_super(mount: &Mount, root: &InodeRef, read_only: bool) -> Result<(), Errno> {
-    let ty = mount.source().fstype;
+fn remount_super(ty: &str, root: &InodeRef, read_only: bool) -> Result<(), Errno> {
     let on_disk = fstype::find(ty.as_bytes()).is_some_and(|t| !t.nodev);
     if !read_only && on_disk && rk_vfs::blockdev::block_read_only(root.metadata().dev) {
         return Err(Errno::EACCES);
@@ -313,6 +312,11 @@ struct Config {
     read_only: bool,
     /// The root of the file system, after `FSCONFIG_CMD_CREATE`.
     root: Option<InodeRef>,
+    /// Tells if `fsmount` made the mount of the context. Then `FSCONFIG_CMD_RECONFIGURE` changes
+    /// the file system, as a context of `fspick` does. Linux puts the context in this state with
+    /// `vfs_clean_context`. systemd makes the file system of the credentials of a unit read only
+    /// in this way.
+    mounted: bool,
 }
 
 /// A file system context, the file of `fsopen` and `fspick`.
@@ -461,11 +465,22 @@ pub(crate) fn fsconfig(
         // The file systems of R3 take only flags and strings.
         FSCONFIG_SET_BINARY | FSCONFIG_SET_FD => return Err(Errno::EOPNOTSUPP),
         FSCONFIG_CMD_RECONFIGURE => {
-            let mount = ctx.picked.as_ref().ok_or(Errno::EBUSY)?;
-            let read_only = ctx.config.lock().read_only;
-            remount_super(mount, mount.root().inode(), read_only)?;
-            let flags = mount.source().flags & !u64::from(MS_RDONLY);
-            mount.set_flags(flags | if read_only { u64::from(MS_RDONLY) } else { 0 })?;
+            let (read_only, root) = {
+                let config = ctx.config.lock();
+                (config.read_only, config.root.clone().filter(|_| config.mounted))
+            };
+            if let Some(mount) = &ctx.picked {
+                remount_super(mount.source().fstype, mount.root().inode(), read_only)?;
+                let flags = mount.source().flags & !u64::from(MS_RDONLY);
+                mount.set_flags(flags | if read_only { u64::from(MS_RDONLY) } else { 0 })?;
+            } else {
+                // The context of `fsopen` changes its file system only after `fsmount`. The flags
+                // of the mount stay, as in Linux.
+                let (Some(ty), Some(root)) = (ctx.ty, root) else {
+                    return Err(Errno::EBUSY);
+                };
+                remount_super(ty.name, &root, read_only)?;
+            }
         }
         _ => {
             let ty = ctx.ty.ok_or(Errno::EBUSY)?;
@@ -596,11 +611,16 @@ pub(crate) fn fsmount(cx: &Cx<'_>, fd: u64, flags: u64, attr: u64) -> SysResult 
     let (root, source, read_only) = {
         let config = ctx.config.lock();
         let root = config.root.clone().ok_or(Errno::EINVAL)?;
+        // A context gives one mount, as the phase `FS_CONTEXT_AWAITING_MOUNT` of Linux.
+        if config.mounted {
+            return Err(Errno::EBUSY);
+        }
         (root, config.source.clone().unwrap_or_default(), config.read_only)
     };
     if !root.metadata().is_dir() {
         return Err(Errno::ENOTDIR);
     }
+    ctx.config.lock().mounted = true;
     let ro = if read_only { MS_RDONLY } else { 0 };
     let source = MountSource { source, fstype: ty.name, flags: u64::from((attr | ro) & KEPT) };
     let mount = MountNamespace::detached(rk_vfs::Dentry::new_root(root), source);
