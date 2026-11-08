@@ -659,6 +659,83 @@ fn loopback_sockets() {
     ipv6_groups();
     ipv4_groups();
     bind_no_port();
+    resolved_options();
+}
+
+/// The options that systemd-resolved sets on its sockets: `IP_UNICAST_IF` on UDP and TCP, and
+/// the flags of the control messages, `IP_MTU_DISCOVER` and `TCP_FASTOPEN` on TCP, as Linux.
+/// The `loopback_sockets` test calls this.
+fn resolved_options() {
+    use rk_abi::native::in6::{IPV6_MTU_DISCOVER, IPV6_RECVHOPLIMIT, IPV6_RECVPKTINFO};
+    use rk_abi::native::inet::{
+        IP_FREEBIND, IP_MTU_DISCOVER, IP_PKTINFO, IP_RECVTTL, IP_UNICAST_IF, IPPROTO_IP,
+        IPPROTO_IPV6, IPPROTO_TCP,
+    };
+    use rk_abi::native::socket::SO_BINDTOIFINDEX;
+    use rk_abi::native::socket::SOL_SOCKET;
+    use rk_abi::native::tcp::TCP_FASTOPEN;
+    let lo = ipv4::LOOPBACK;
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+    // The index is in the byte order of the network, and only 4 bytes are valid.
+    let be = |i: u32| i.to_be_bytes().to_vec();
+
+    let u = Dgram::new(Proto::Udp);
+    assert_eq!(u.get_option(IPPROTO_IP, IP_UNICAST_IF), Ok(be(0)));
+    u.set_option(IPPROTO_IP, IP_UNICAST_IF, &be(1)).unwrap();
+    assert_eq!(u.get_option(IPPROTO_IP, IP_UNICAST_IF), Ok(be(1)));
+    assert_eq!(u.set_option(IPPROTO_IP, IP_UNICAST_IF, &[1]), Err(Errno::EINVAL));
+    assert_eq!(u.set_option(IPPROTO_IP, IP_UNICAST_IF, &be(99)), Err(Errno::EADDRNOTAVAIL));
+    assert_eq!(send(&u, Some((lo, 9)), b"x"), Ok(1));
+    u.set_option(IPPROTO_IP, IP_UNICAST_IF, &be(0)).unwrap();
+    // A socket with a device gives `EINVAL`, as the VRF check of Linux.
+    u.set_option(SOL_SOCKET, SO_BINDTOIFINDEX, &int(1)).unwrap();
+    assert_eq!(u.set_option(IPPROTO_IP, IP_UNICAST_IF, &be(1)), Err(Errno::EINVAL));
+    u.release();
+
+    // `IP_FREEBIND` lets a socket bind to an address that is not local, as the DHCP client of
+    // systemd-networkd does before it has the address.
+    let f = Dgram::new(Proto::Udp);
+    let away = sockaddr::make([10, 9, 9, 8], 0);
+    assert_eq!(f.bind(&NoPaths, &away), Err(Errno::EADDRNOTAVAIL));
+    assert_eq!(f.get_option(IPPROTO_IP, IP_FREEBIND), Ok(int(0)));
+    f.set_option(IPPROTO_IP, IP_FREEBIND, &int(5)).unwrap();
+    assert_eq!(f.get_option(IPPROTO_IP, IP_FREEBIND), Ok(int(1)));
+    f.bind(&NoPaths, &away).unwrap();
+    f.release();
+
+    let t = crate::Stream::new();
+    for name in [IP_PKTINFO, IP_RECVTTL] {
+        assert_eq!(t.get_option(IPPROTO_IP, name), Ok(int(0)));
+        t.set_option(IPPROTO_IP, name, &int(7)).unwrap();
+        assert_eq!(t.get_option(IPPROTO_IP, name), Ok(int(1)));
+    }
+    assert_eq!(t.get_option(IPPROTO_IP, IP_MTU_DISCOVER), Ok(int(1)));
+    t.set_option(IPPROTO_IP, IP_MTU_DISCOVER, &int(0)).unwrap();
+    assert_eq!(t.get_option(IPPROTO_IP, IP_MTU_DISCOVER), Ok(int(0)));
+    assert_eq!(t.set_option(IPPROTO_IP, IP_MTU_DISCOVER, &int(6)), Err(Errno::EINVAL));
+    t.set_option(IPPROTO_IP, IP_UNICAST_IF, &be(1)).unwrap();
+    assert_eq!(t.get_option(IPPROTO_IP, IP_UNICAST_IF), Ok(be(1)));
+    t.set_option(IPPROTO_TCP, TCP_FASTOPEN, &int(5)).unwrap();
+    assert_eq!(t.get_option(IPPROTO_TCP, TCP_FASTOPEN), Ok(int(5)));
+    assert_eq!(t.set_option(IPPROTO_TCP, TCP_FASTOPEN, &int(-1)), Err(Errno::EINVAL));
+    t.bind(&NoPaths, &sockaddr::make(lo, 0)).unwrap();
+    t.listen(4).unwrap();
+    t.set_option(IPPROTO_TCP, TCP_FASTOPEN, &int(1 << 20)).unwrap();
+    assert_eq!(t.get_option(IPPROTO_TCP, TCP_FASTOPEN), Ok(int(4096)));
+    // An IPv4 socket has no options of IPv6.
+    assert_eq!(t.set_option(IPPROTO_IPV6, IPV6_RECVPKTINFO, &int(1)), Err(Errno::ENOPROTOOPT));
+    t.release();
+
+    let t6 = crate::Stream::new6();
+    for name in [IPV6_RECVPKTINFO, IPV6_RECVHOPLIMIT] {
+        t6.set_option(IPPROTO_IPV6, name, &int(1)).unwrap();
+        assert_eq!(t6.get_option(IPPROTO_IPV6, name), Ok(int(1)));
+        t6.set_option(IPPROTO_IPV6, name, &int(0)).unwrap();
+        assert_eq!(t6.get_option(IPPROTO_IPV6, name), Ok(int(0)));
+    }
+    t6.set_option(IPPROTO_IPV6, IPV6_MTU_DISCOVER, &int(2)).unwrap();
+    assert_eq!(t6.get_option(IPPROTO_IPV6, IPV6_MTU_DISCOVER), Ok(int(2)));
+    t6.release();
 }
 
 /// The IPv4 multicast options over the loopback device, as net/ipv4/ip_sockglue.c and

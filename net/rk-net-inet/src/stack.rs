@@ -331,6 +331,31 @@ pub(crate) fn bind_device(bound: u32, name: u32, value: &[u8]) -> Result<u32> {
     Ok(ifindex)
 }
 
+/// Gives the interface of `IP_UNICAST_IF` with the value `value`, as `do_ip_setsockopt` of Linux.
+/// The value is the index in the byte order of the network. `bound` is the device of the
+/// socket. The index 0 removes the setting.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a value that is not 4 bytes or for a socket with a device, and
+/// `EADDRNOTAVAIL` for an interface that is not there.
+pub(crate) fn unicast_if(bound: u32, value: &[u8]) -> Result<u32> {
+    let raw: [u8; 4] = value.try_into().map_err(|_| Errno::EINVAL)?;
+    let ifindex = u32::from_be_bytes(raw);
+    if ifindex == 0 {
+        return Ok(0);
+    }
+    if dev::by_index(ifindex).is_none() {
+        return Err(Errno::EADDRNOTAVAIL);
+    }
+    // Linux compares the device of the socket with the VRF of the interface, and an interface
+    // without a VRF has 0. Thus a socket with a device gives `EINVAL`.
+    if bound != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(ifindex)
+}
+
 /// The value of `SO_BINDTODEVICE` or `SO_BINDTOIFINDEX` for a socket on the device `bound`, as
 /// `sock_getbindtodevice` of Linux: the name with its zero, or no bytes if the socket has no
 /// device.
