@@ -61,6 +61,8 @@ const PACKET_DROP_MEMBERSHIP: u32 = 2;
 /// The options of the mapped rings of <linux/if_packet.h>.
 const PACKET_RX_RING: u32 = 5;
 const PACKET_STATISTICS: u32 = 6;
+/// The option that adds a `struct tpacket_auxdata` to each receive, of <linux/if_packet.h>.
+const PACKET_AUXDATA: u32 = 8;
 const PACKET_VERSION: u32 = 10;
 const PACKET_HDRLEN: u32 = 11;
 const PACKET_RESERVE: u32 = 12;
@@ -99,6 +101,10 @@ pub enum Direction {
 struct Queued {
     data: Vec<u8>,
     addr: [u8; SOCKADDR_LL],
+    /// The size of the frame before the filter cut it, `origlen` of Linux.
+    len: usize,
+    /// The offset of the network header in `data`, `skb_network_offset` of Linux.
+    net: u16,
 }
 
 /// The options of the rings of a socket.
@@ -112,6 +118,19 @@ struct RingCfg {
     loss: bool,
     /// The value of `PACKET_TIMESTAMP`. The frames always have a software time stamp.
     tstamp: i32,
+}
+
+/// Gives the `struct tpacket_auxdata` of a frame, as `packet_recvmsg` of Linux. The frame has
+/// no VLAN tag, and the checksum is complete, so the status is only `TP_STATUS_USER`.
+fn auxdata(f: &Queued) -> Vec<u8> {
+    let mut a = Vec::with_capacity(20);
+    a.extend_from_slice(&ring::TP_STATUS_USER.to_ne_bytes());
+    a.extend_from_slice(&(f.len as u32).to_ne_bytes());
+    a.extend_from_slice(&(f.data.len() as u32).to_ne_bytes());
+    a.extend_from_slice(&0u16.to_ne_bytes());
+    a.extend_from_slice(&f.net.to_ne_bytes());
+    a.extend_from_slice(&[0; 4]);
+    a
 }
 
 /// The packet sockets of all namespaces, for `tap`.
@@ -150,6 +169,8 @@ pub struct PacketSocket {
     tx: SpinLock<Option<Ring>>,
     /// The counts of `PACKET_STATISTICS`.
     stats: Stats,
+    /// Each receive gives a `PACKET_AUXDATA` control message.
+    auxdata: AtomicBool,
     /// Each mapping of the rings holds a clone, so the socket is mapped while the count is more
     /// than 1, as `po->mapped` of Linux.
     maps: Arc<()>,
@@ -188,6 +209,7 @@ impl PacketSocket {
             rx: SpinLock::new(None),
             tx: SpinLock::new(None),
             stats: Stats::default(),
+            auxdata: AtomicBool::new(false),
             maps: Arc::new(()),
         });
         COUNT.fetch_add(1, Ordering::Relaxed);
@@ -286,7 +308,12 @@ impl PacketSocket {
                 self.stats.drops.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            q.0.push_back(Queued { data: data.to_vec(), addr });
+            q.0.push_back(Queued {
+                data: data.to_vec(),
+                addr,
+                len,
+                net: if raw { HLEN as u16 } else { 0 },
+            });
             q.1 += size;
             self.stats.packets.fetch_add(1, Ordering::Relaxed);
         }
@@ -634,7 +661,7 @@ impl Socket for PacketSocket {
             let mut q = self.queue.lock();
             if flags & MSG_PEEK != 0 {
                 if let Some(f) = q.0.front() {
-                    return Ok(Some(Queued { data: f.data.clone(), addr: f.addr }));
+                    return Ok(Some(Queued { data: f.data.clone(), ..*f }));
                 }
             } else if let Some(f) = q.0.pop_front() {
                 q.1 = q.1.saturating_sub(f.data.len() + FRAME_OVERHEAD);
@@ -643,6 +670,10 @@ impl Socket for PacketSocket {
             if nonblock { Err(Errno::EAGAIN) } else { Ok(None) }
         })?;
         let full = item.data.len();
+        let mut control = Vec::new();
+        if self.auxdata.load(Ordering::Relaxed) {
+            control.push((SOL_PACKET, PACKET_AUXDATA, auxdata(&item)));
+        }
         let mut data = item.data;
         data.truncate(len);
         Ok(Received {
@@ -650,6 +681,7 @@ impl Socket for PacketSocket {
             data,
             len: full,
             addr: Some(item.addr.to_vec()),
+            control,
             ..Received::default()
         })
     }
@@ -679,6 +711,7 @@ impl Socket for PacketSocket {
                 PACKET_LOSS => Ok(int(i32::from(cfg.loss))),
                 PACKET_TIMESTAMP => Ok(int(cfg.tstamp)),
                 PACKET_STATISTICS => Ok(self.stats.take(cfg.version)),
+                PACKET_AUXDATA => Ok(int(i32::from(self.auxdata.load(Ordering::Relaxed)))),
                 // `PACKET_HDRLEN` reads the version from the value, see `get_option_in`.
                 PACKET_HDRLEN => Err(Errno::EINVAL),
                 _ => Err(Errno::ENOPROTOOPT),
@@ -711,6 +744,13 @@ impl Socket for PacketSocket {
                     dev::by_index(ifindex).map(|_| ()).ok_or(Errno::ENODEV)
                 }
                 PACKET_RX_RING | PACKET_TX_RING => self.set_ring(value, name == PACKET_TX_RING),
+                // Linux reads an `int` and a shorter value gives `EINVAL`.
+                PACKET_AUXDATA => {
+                    let v = value.get(..4).ok_or(Errno::EINVAL)?;
+                    let v = i32::from_ne_bytes([v[0], v[1], v[2], v[3]]);
+                    self.auxdata.store(v != 0, Ordering::Relaxed);
+                    Ok(())
+                }
                 // The options of the rings, as `packet_setsockopt` of Linux. The value must be
                 // an `int`, and a socket with a ring cannot change the format or the reserve.
                 PACKET_VERSION | PACKET_RESERVE | PACKET_LOSS | PACKET_TIMESTAMP => {

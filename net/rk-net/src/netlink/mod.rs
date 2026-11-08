@@ -693,6 +693,13 @@ impl Socket for NetlinkSocket {
             data.truncate(len);
             rflags |= MSG_TRUNC;
         }
+        // With `NETLINK_PKTINFO` each datagram has a `struct nl_pktinfo` with its group, 0 for a
+        // unicast, as `netlink_cmsg_recv_pktinfo` of Linux. sd-netlink drops a notification
+        // without it.
+        let mut control = Vec::new();
+        if self.state.lock().flags & F_PKTINFO != 0 {
+            control.push((SOL_NETLINK, NETLINK_PKTINFO, d.group.to_ne_bytes().to_vec()));
+        }
         Ok(Received {
             data,
             len: full,
@@ -706,6 +713,7 @@ impl Socket for NetlinkSocket {
                 process: None,
             }),
             flags: rflags,
+            control,
             ..Received::default()
         })
     }

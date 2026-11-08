@@ -36,10 +36,10 @@ use rk_abi::native::in6::{
     IPV6_UNICAST_HOPS, IPV6_UNICAST_IF, IPV6_V6ONLY,
 };
 use rk_abi::native::inet::{
-    IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_HDRINCL, IP_MTU_DISCOVER,
-    IP_MULTICAST_ALL, IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_PKTINFO, IP_RECVERR,
-    IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IPPROTO_ICMP, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW,
-    IPPROTO_TCP, IPPROTO_UDP,
+    IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_FREEBIND, IP_HDRINCL,
+    IP_MTU_DISCOVER, IP_MULTICAST_ALL, IP_MULTICAST_IF, IP_MULTICAST_LOOP, IP_MULTICAST_TTL,
+    IP_PKTINFO, IP_RECVERR, IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IP_UNICAST_IF, IPPROTO_ICMP,
+    IPPROTO_IP, IPPROTO_IPV6, IPPROTO_RAW, IPPROTO_TCP, IPPROTO_UDP,
 };
 use rk_abi::native::poll::{
     POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP, POLLRDNORM, POLLWRBAND, POLLWRNORM,
@@ -349,6 +349,19 @@ struct State {
     mc_all: bool,
     /// `IP_BIND_ADDRESS_NO_PORT`: `bind` with the port 0 gives no port, and `connect` gives it.
     bind_no_port: bool,
+    /// `IP_UNICAST_IF`: the interface of a datagram to a unicast address for a socket without a
+    /// device, or 0.
+    uc_index: u32,
+}
+
+impl State {
+    /// Tells if the socket can use an address that is not local, with `IP_FREEBIND`,
+    /// `IPV6_FREEBIND` or `IPV6_TRANSPARENT`, as `inet_can_nonlocal_bind` of Linux.
+    fn nonlocal(&self) -> bool {
+        [IPV6_FREEBIND, IPV6_TRANSPARENT]
+            .iter()
+            .any(|o| self.flags6.get(o).is_some_and(|&v| v != 0))
+    }
 }
 
 /// A multicast group of IPv4 that a socket joined, `struct ip_mreqn` of Linux.
@@ -633,6 +646,7 @@ impl Dgram {
                 mc_addr: ipv4::ANY,
                 mc_all: true,
                 bind_no_port: false,
+                uc_index: 0,
             }),
             wait: Arc::new(WaitQueue::new()),
             events: AtomicU64::new(0),
@@ -902,14 +916,15 @@ impl Dgram {
     /// Checks that `dst` can take a packet from this socket, and gives the route.
     /// A packet to a group goes through the interface of the socket or of `IP_MULTICAST_IF`,
     /// and its source is the local address or the address of `IP_MULTICAST_IF`, as
-    /// `udp_sendmsg` of Linux.
+    /// `udp_sendmsg` of Linux. A packet to a unicast address goes through the interface of the
+    /// socket or of `IP_UNICAST_IF`.
     fn route_to(&self, s: &State, dst: Addr) -> Result<crate::route::Next> {
         let next = if ipv4::is_multicast(dst) {
             let oif = if s.oif != 0 { s.oif } else { s.mc_index };
             let local = Self::local4(s);
             stack::route_mc(dst, oif, if local == ipv4::ANY { s.mc_addr } else { local })?
         } else {
-            stack::route_oif(dst, s.oif)?
+            stack::route_oif(dst, if s.oif != 0 { s.oif } else { s.uc_index })?
         };
         if next.broadcast && s.options.get(SO_BROADCAST).is_ok_and(|v| v == int(0)) {
             return Err(Errno::EACCES);
@@ -977,9 +992,7 @@ impl Dgram {
             if addr != ip::ANY {
                 // A link local source must be on the interface, as `ipv6_chk_addr_and_flags`.
                 let strict = ipv6::is_link_local(&addr);
-                let nonlocal = [IPV6_FREEBIND, IPV6_TRANSPARENT]
-                    .iter()
-                    .any(|o| s.flags6.get(o).is_some_and(|&v| v != 0));
+                let nonlocal = s.nonlocal();
                 let local = stack6::ROUTES6
                     .lock()
                     .addrs()
@@ -1437,6 +1450,10 @@ impl Dgram {
     fn set_option4(&self, s: &mut State, name: u32, value: &[u8]) -> Result<()> {
         match name {
             IP_MULTICAST_IF => return Self::set_mc_if(s, value),
+            IP_UNICAST_IF => {
+                s.uc_index = stack::unicast_if(s.oif, value)?;
+                return Ok(());
+            }
             IP_ADD_MEMBERSHIP => return Self::join4(s, mreqn(value)?),
             IP_DROP_MEMBERSHIP => return Self::leave4(s, mreqn(value)?),
             MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
@@ -1484,6 +1501,10 @@ impl Dgram {
             IP_MULTICAST_LOOP => s.multicast_loop = v != 0,
             IP_MULTICAST_ALL => s.mc_all = v != 0,
             IP_BIND_ADDRESS_NO_PORT => s.bind_no_port = v != 0,
+            // `IP_FREEBIND` and `IPV6_FREEBIND` are one flag, `inet->freebind` of Linux.
+            IP_FREEBIND => {
+                s.flags6.insert(IPV6_FREEBIND, i32::from(v != 0));
+            }
             _ => return Err(Errno::ENOPROTOOPT),
         }
         Ok(())
@@ -1639,6 +1660,7 @@ impl Socket for Dgram {
                 let ok = {
                     let routes = stack::ROUTES.lock();
                     a4 == ipv4::ANY
+                        || s.nonlocal()
                         || routes.is_local(a4)
                         || (self.proto == Proto::Udp
                             && (routes.is_broadcast(a4) || ipv4::is_multicast(a4)))
@@ -1655,6 +1677,7 @@ impl Socket for Dgram {
                     return Err(Errno::EINVAL);
                 }
                 let ok = ipv6::is_multicast(&addr) && self.proto == Proto::Udp
+                    || s.nonlocal()
                     || stack6::ROUTES6
                         .lock()
                         .addrs()
@@ -1903,6 +1926,11 @@ impl Socket for Dgram {
                 IP_MULTICAST_IF => s.mc_addr.to_vec(),
                 IP_MULTICAST_ALL => int(i32::from(s.mc_all)),
                 IP_BIND_ADDRESS_NO_PORT => int(i32::from(s.bind_no_port)),
+                IP_FREEBIND => {
+                    int(i32::from(s.flags6.get(&IPV6_FREEBIND).is_some_and(|&v| v != 0)))
+                }
+                // `do_ip_getsockopt` gives the index in the byte order of the network.
+                IP_UNICAST_IF => s.uc_index.to_be_bytes().to_vec(),
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
             IPPROTO_IPV6 if self.af() == AF_INET6 => self.get_option6(&s, name),

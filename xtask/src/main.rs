@@ -401,8 +401,11 @@ const SYSTEMD_MEMORY: &str = "2G";
 /// of the tree gets the name of the test as its argument. In the `udevd` test, the check asks
 /// udevd for the events of all devices with `udevadm trigger` and waits for them with
 /// `udevadm settle`. Then /dev/disk/by-path must have a link to vda, from `path_id` of udev, and
-/// the interface of the virtio-net-pci device must have its predictable name from `net_id`.
-const SYSTEMD_TESTS: &[&str] = &["udevd"];
+/// the interface of the virtio-net-pci device must have its predictable name from `net_id`. In
+/// the `networkd` test, systemd-networkd gets an IPv4 address with DHCP from the user network of
+/// QEMU and sets a static IPv6 address, `networkctl` must give `routable` for the interface, and
+/// `resolvectl query` must give an address.
+const SYSTEMD_TESTS: &[&str] = &["udevd", "networkd"];
 
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -457,6 +460,7 @@ const BOOT_TESTS: &[&str] = &[
     "debian",
     "systemd",
     "udevd",
+    "networkd",
     "fstests",
 ];
 
@@ -1025,6 +1029,68 @@ done
 [ -z "$other" ] || echo "rk-udevd: bad:$other"
 case $state in
 running | degraded) [ -n "$other" ] || echo 'rk-udevd: pass' ;;
+esac
+systemctl poweroff
+END
+fi
+# The `networkd` test: systemd-networkd sets up the interface with DHCP of the user network of
+# QEMU and a static IPv6 address, and systemd-resolved asks the DNS server of QEMU.
+if [ "${1:-}" = networkd ]; then
+mkdir -p /etc/systemd/network /etc/systemd/system/sockets.target.wants
+cat > /etc/systemd/network/50-rk.network << 'END'
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=ipv4
+Address=fec0::10/64
+IPv6AcceptRA=no
+LinkLocalAddressing=ipv6
+END
+for unit in systemd-networkd.service systemd-resolved.service; do
+    ln -sf /usr/lib/systemd/system/$unit /etc/systemd/system/multi-user.target.wants/$unit
+done
+ln -sf /usr/lib/systemd/system/systemd-networkd.socket \
+    /etc/systemd/system/sockets.target.wants/systemd-networkd.socket
+cat > /usr/local/bin/rk-check << 'END'
+#!/bin/sh
+other=
+state=$(systemctl is-system-running --wait || true)
+echo "rk-networkd: state $state"
+for unit in systemd-networkd.service systemd-resolved.service; do
+    systemctl is-active -q $unit || other="$other $unit"
+done
+/usr/lib/systemd/systemd-networkd-wait-online --timeout=120 -o routable || other="$other wait-online"
+iface=
+for dev in /sys/class/net/*; do
+    [ "${dev##*/}" = lo ] || iface=${dev##*/}
+done
+networkctl status --no-pager "$iface" | sed 's/^/rk-networkd:   /'
+oper=$(networkctl list --no-legend "$iface" | awk '{print $4}')
+echo "rk-networkd: $iface: $oper"
+[ "$oper" = routable ] || other="$other routable"
+networkctl status --no-pager "$iface" | grep -q 'fec0::10' || other="$other fec0::10"
+resolvectl status --no-pager | sed 's/^/rk-networkd:   /'
+# The DNS server of QEMU sends the query to the DNS server of the host. Without an answer from
+# the host, `_gateway` checks the local names of systemd-resolved.
+for name in debian.org _gateway; do
+    addr=$(resolvectl query --legend=no "$name" | head -n 1)
+    echo "rk-networkd: resolvectl query $name: ${addr:-no address}"
+    [ -z "$addr" ] || break
+done
+[ -n "$addr" ] || other="$other resolvectl"
+for unit in $(systemctl list-units --failed --no-legend --plain | awk '{print $1}'); do
+    echo "rk-networkd: failed $unit"
+    systemctl status --no-pager --lines=5 "$unit" | sed 's/^/rk-networkd:   /'
+    other="$other $unit"
+done
+if [ -n "$other" ]; then
+    echo "rk-networkd: bad:$other"
+    journalctl -b --no-pager -o short-monotonic -u systemd-networkd -u systemd-resolved |
+        tail -n 150 | sed 's/^/rk-networkd: log: /'
+fi
+case $state in
+running | degraded) [ -n "$other" ] || echo 'rk-networkd: pass' ;;
 esac
 systemctl poweroff
 END
@@ -2416,8 +2482,8 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         // `inet` test pings the gateway and asks the DNS server of QEMU. The `netcfg` test sets up
         // the network with BusyBox. The `inet6` test uses the IPv6 network of QEMU: the prefix
         // fec0::/64 and the router fec0::2. In the `systemd` test, a unit with `IPAccounting=yes`
-        // pings the gateway.
-        if matches!(*test, "net" | "inet" | "netcfg" | "inet6" | "systemd" | "udevd") {
+        // pings the gateway. In the `networkd` test, systemd-networkd asks DHCP for an address.
+        if matches!(*test, "net" | "inet" | "netcfg" | "inet6" | "systemd" | "udevd" | "networkd") {
             cmd.args(["-netdev", "user,id=n0", "-device", "virtio-net-pci,netdev=n0"]);
         }
         // The `alpine` test makes an ext4 file system on a second disk and mounts it.

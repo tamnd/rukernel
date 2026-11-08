@@ -28,9 +28,13 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
-use rk_abi::native::in6::{IPV6_ADDRFORM, IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY};
+use rk_abi::native::in6::{
+    IPV6_ADDRFORM, IPV6_FREEBIND, IPV6_MTU_DISCOVER, IPV6_RECVERR, IPV6_RECVHOPLIMIT,
+    IPV6_RECVPKTINFO, IPV6_RECVTCLASS, IPV6_TCLASS, IPV6_UNICAST_HOPS, IPV6_V6ONLY,
+};
 use rk_abi::native::inet::{
-    IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_TOS, IP_TTL, IPPROTO_IP,
+    IP_ADD_MEMBERSHIP, IP_BIND_ADDRESS_NO_PORT, IP_DROP_MEMBERSHIP, IP_FREEBIND, IP_MTU_DISCOVER,
+    IP_PKTINFO, IP_RECVERR, IP_RECVTOS, IP_RECVTTL, IP_TOS, IP_TTL, IP_UNICAST_IF, IPPROTO_IP,
     IPPROTO_IPV6, IPPROTO_TCP,
 };
 use rk_abi::native::poll::{
@@ -42,8 +46,8 @@ use rk_abi::native::socket::{
     SO_TYPE, SOL_SOCKET,
 };
 use rk_abi::native::tcp::{
-    TCP_CONGESTION, TCP_CORK, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY,
-    TCP_QUICKACK, TCP_SYNCNT,
+    TCP_CONGESTION, TCP_CORK, TCP_FASTOPEN, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG,
+    TCP_NODELAY, TCP_QUICKACK, TCP_SYNCNT,
 };
 use rk_frame::sync::SpinLock;
 use rk_net::consts::{
@@ -80,6 +84,24 @@ const SOMAXCONN: u32 = 4096;
 const MIN_MAXSEG: i32 = 88;
 /// The length of the name of `TCP_CONGESTION`, `TCP_CA_NAME_MAX` of Linux.
 const CA_NAME_MAX: usize = 16;
+/// The largest value of `IP_MTU_DISCOVER` and `IPV6_MTU_DISCOVER`, `IP_PMTUDISC_OMIT` of Linux.
+const PMTUDISC_OMIT: i32 = 5;
+
+/// Tells if `name` of the level `level` is a flag that a TCP socket keeps for `getsockopt` and
+/// does not use. The flags of the control messages, as `IP_PKTINFO`, have no effect on a stream
+/// on Linux too.
+fn is_ip_flag(level: u32, name: u32) -> bool {
+    match level {
+        IPPROTO_IP => {
+            matches!(name, IP_PKTINFO | IP_RECVTTL | IP_RECVTOS | IP_RECVERR | IP_FREEBIND)
+        }
+        IPPROTO_IPV6 => matches!(
+            name,
+            IPV6_RECVPKTINFO | IPV6_RECVHOPLIMIT | IPV6_RECVTCLASS | IPV6_RECVERR | IPV6_FREEBIND
+        ),
+        _ => false,
+    }
+}
 /// The bytes of the IPv4 header and the TCP header without options.
 const HEADERS: u32 = 40;
 /// The bytes of the IPv6 header and the TCP header without options.
@@ -160,6 +182,17 @@ struct Inner {
     /// `IP_BIND_ADDRESS_NO_PORT`: `bind` to the port 0 sets only the address, and `connect`
     /// gives the port, as `__inet_bind` of Linux.
     bind_no_port: bool,
+    /// The options of `is_ip_flag` that are set, and `IP_MTU_DISCOVER` and `IPV6_MTU_DISCOVER`:
+    /// the level and the name, and the value. A connection of a listening socket copies them, as
+    /// `sk_clone_lock` of Linux.
+    ip_flags: BTreeMap<(u32, u32), i32>,
+    /// The interface of `IP_UNICAST_IF`, or 0. TCP keeps it for `getsockopt` and routes only
+    /// with the device of the socket, as `tcp_v4_connect` of Linux.
+    uc_index: u32,
+    /// `TCP_FASTOPEN`: the length of the queue of the connections with data in the SYN. The
+    /// server side of TCP Fast Open is off, as with the default `net.ipv4.tcp_fastopen` of
+    /// Linux, so a SYN with data gets no cookie, and the client sends the data again.
+    fastopen: u32,
     quickack: bool,
     /// `TCP_MAXSEG`, or 0.
     maxseg: u32,
@@ -209,6 +242,9 @@ impl Inner {
             cork: false,
             mc_groups: Vec::new(),
             bind_no_port: false,
+            ip_flags: BTreeMap::new(),
+            uc_index: 0,
+            fastopen: 0,
             quickack: false,
             maxseg: 0,
             keepidle: super::conn::KEEPIDLE,
@@ -221,6 +257,25 @@ impl Inner {
             uid: rk_vfs::cred::current().fsuid,
             cgroup: rk_net::filter::sock_cgroup_current(),
             counted: State::Closed,
+        }
+    }
+
+    /// The value of the option `name` of `is_ip_flag`, or of `IP_MTU_DISCOVER` or
+    /// `IPV6_MTU_DISCOVER`. The default of these two is `IP_PMTUDISC_WANT`, as `inet_create` and
+    /// `inet6_create` of Linux.
+    fn ip_flag(&self, level: u32, name: u32) -> i32 {
+        let mtu = (IPPROTO_IP, IP_MTU_DISCOVER) == (level, name)
+            || (IPPROTO_IPV6, IPV6_MTU_DISCOVER) == (level, name);
+        let default = i32::from(mtu);
+        self.ip_flags.get(&(level, name)).copied().unwrap_or(default)
+    }
+
+    /// Sets the option `name` of `is_ip_flag` to `v`, as a flag of 0 or 1.
+    fn set_ip_flag(&mut self, level: u32, name: u32, v: i32) {
+        if v != 0 {
+            self.ip_flags.insert((level, name), 1);
+        } else {
+            self.ip_flags.remove(&(level, name));
         }
     }
 
@@ -756,6 +811,8 @@ impl Stream {
             }
             c.ttl = s.ttl;
             c.tos = s.tos;
+            c.ip_flags = s.ip_flags.clone();
+            c.uc_index = s.uc_index;
             c.nodelay = s.nodelay;
             c.maxseg = s.maxseg;
             c.keepidle = s.keepidle;
@@ -1346,12 +1403,20 @@ impl Socket for Stream {
                 IP_TTL => int(i32::from(s.ttl())),
                 IP_TOS => int(i32::from(s.tos)),
                 IP_BIND_ADDRESS_NO_PORT => int(i32::from(s.bind_no_port)),
+                // `do_ip_getsockopt` gives the index in the byte order of the network.
+                IP_UNICAST_IF => s.uc_index.to_be_bytes().to_vec(),
+                _ if name == IP_MTU_DISCOVER || is_ip_flag(level, name) => {
+                    int(s.ip_flag(level, name))
+                }
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
             IPPROTO_IPV6 if self.af() == AF_INET6 => Ok(match name {
                 IPV6_V6ONLY => int(i32::from(s.v6only)),
                 IPV6_UNICAST_HOPS => int(i32::from(s.hops.unwrap_or(ipv6::DEFAULT_HOPS))),
                 IPV6_TCLASS => int(i32::from(s.tclass)),
+                _ if name == IPV6_MTU_DISCOVER || is_ip_flag(level, name) => {
+                    int(s.ip_flag(level, name))
+                }
                 _ => return Err(Errno::ENOPROTOOPT),
             }),
             IPPROTO_TCP => Ok(match name {
@@ -1371,6 +1436,7 @@ impl Socket for Stream {
                 TCP_KEEPCNT => int(s.keepcnt as i32),
                 TCP_SYNCNT => int(s.syn_retries as i32),
                 TCP_QUICKACK => int(i32::from(s.quickack)),
+                TCP_FASTOPEN => int(s.fastopen as i32),
                 TCP_CONGESTION => {
                     let mut v = s.algo.name().to_vec();
                     v.resize(CA_NAME_MAX, 0);
@@ -1429,6 +1495,9 @@ impl Socket for Stream {
                 IPPROTO_IP if matches!(name, IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP) => {
                     return Err(Errno::EPROTO);
                 }
+                IPPROTO_IP if name == IP_UNICAST_IF => {
+                    s.uc_index = stack::unicast_if(s.oif, value)?
+                }
                 IPPROTO_IP => {
                     let v = crate::socket::ip_int(value)?;
                     match name {
@@ -1441,6 +1510,11 @@ impl Socket for Stream {
                         }
                         IP_TOS => s.tos = v as u8,
                         IP_BIND_ADDRESS_NO_PORT => s.bind_no_port = v != 0,
+                        IP_MTU_DISCOVER if (0..=PMTUDISC_OMIT).contains(&v) => {
+                            s.ip_flags.insert((level, name), v);
+                        }
+                        IP_MTU_DISCOVER => return Err(Errno::EINVAL),
+                        _ if is_ip_flag(level, name) => s.set_ip_flag(level, name, v),
                         _ => return Err(Errno::ENOPROTOOPT),
                     }
                 }
@@ -1477,6 +1551,11 @@ impl Socket for Stream {
                                 _ => return Err(Errno::EINVAL),
                             };
                         }
+                        IPV6_MTU_DISCOVER if (0..=PMTUDISC_OMIT).contains(&v) => {
+                            s.ip_flags.insert((level, name), v);
+                        }
+                        IPV6_MTU_DISCOVER => return Err(Errno::EINVAL),
+                        _ if is_ip_flag(level, name) => s.set_ip_flag(level, name, v),
                         _ => return Err(Errno::ENOPROTOOPT),
                     }
                 }
@@ -1500,6 +1579,12 @@ impl Socket for Stream {
                         TCP_KEEPINTVL if (1..=32767).contains(&v) => s.keepintvl = v as u32,
                         TCP_KEEPCNT if (1..=127).contains(&v) => s.keepcnt = v as u32,
                         TCP_SYNCNT if (1..=127).contains(&v) => s.syn_retries = v as u32,
+                        // A closed or a listening socket, as `do_tcp_setsockopt` of Linux. The
+                        // length is at most `net.core.somaxconn`, as `fastopen_queue_tune`.
+                        TCP_FASTOPEN if v >= 0 && s.state() == State::Closed => {
+                            s.fastopen = (v as u32).min(SOMAXCONN);
+                        }
+                        TCP_FASTOPEN => return Err(Errno::EINVAL),
                         TCP_MAXSEG | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT | TCP_SYNCNT => {
                             return Err(Errno::EINVAL);
                         }

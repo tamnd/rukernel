@@ -374,3 +374,35 @@ fn a_ring_takes_the_snap_length_of_the_filter() {
     assert_eq!(bytes(&p, 96, 10), f[HLEN..HLEN + 10]);
     dev::unregister(&d);
 }
+
+/// `PACKET_AUXDATA` adds a `struct tpacket_auxdata` to each receive: the size before the
+/// filter, the size after it and the offset of the network header, as `packet_recvmsg` of Linux.
+/// systemd-networkd sets it on the socket of its DHCP client.
+#[test]
+fn auxdata_gives_the_sizes_of_the_frame() {
+    let _serial = crate::TEST_DEVICES.lock();
+    for (kind, name, net) in [(SOCK_DGRAM, &b"pkaux1"[..], 0u16), (SOCK_RAW, b"pkaux2", 14)] {
+        let (p, d) = bound(kind, name);
+        assert_eq!(p.get_option(SOL_PACKET, PACKET_AUXDATA), Ok(int(0).to_vec()));
+        assert_eq!(p.set_option(SOL_PACKET, PACKET_AUXDATA, &[1]), Err(Errno::EINVAL));
+        receive(&d, &frame(&d, 30));
+        assert!(p.recv(100, 0, true).unwrap().control.is_empty());
+        p.set_option(SOL_PACKET, PACKET_AUXDATA, &int(1)).unwrap();
+        assert_eq!(p.get_option(SOL_PACKET, PACKET_AUXDATA), Ok(int(1).to_vec()));
+        // ret #12 keeps 12 bytes.
+        p.set_option(SOL_SOCKET, SO_ATTACH_FILTER, &prog(&[(0x06, 0, 0, 12)])).unwrap();
+        receive(&d, &frame(&d, 30));
+        let r = p.recv(100, 0, true).unwrap();
+        assert_eq!(r.data.len(), 12);
+        let full = 30 + if kind == SOCK_RAW { HLEN as u32 } else { 0 };
+        let mut aux = Vec::new();
+        for v in [TP_STATUS_USER, full, 12] {
+            aux.extend_from_slice(&v.to_ne_bytes());
+        }
+        for v in [0u16, net, 0, 0] {
+            aux.extend_from_slice(&v.to_ne_bytes());
+        }
+        assert_eq!(r.control, [(SOL_PACKET, PACKET_AUXDATA, aux)]);
+        dev::unregister(&d);
+    }
+}

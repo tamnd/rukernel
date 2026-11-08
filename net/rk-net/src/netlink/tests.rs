@@ -1,13 +1,15 @@
 use super::msg::{self, Attrs, Builder, HDRLEN, Header};
 use super::{ADDR_LEN, NetlinkSocket, link};
-use crate::consts::{AF_NETLINK, IFF_UP, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM};
+use crate::consts::{
+    AF_NETLINK, IFF_UP, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_NETLINK,
+};
 use crate::{Message, NoPaths, Socket, dev};
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::if_link::{IFLA_IFNAME, IFLA_MTU};
 use rk_abi::native::netlink::{
-    NETLINK_ROUTE, NLM_F_ACK, NLM_F_CAPPED, NLM_F_DUMP, NLM_F_MULTI, NLM_F_REQUEST, NLMSG_DONE,
-    NLMSG_ERROR,
+    NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CAPPED, NLM_F_DUMP, NLM_F_MULTI,
+    NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR,
 };
 use rk_abi::native::rtnetlink::{RTM_GETLINK, RTM_NEWLINK, RTM_SETLINK, RTNLGRP_LINK};
 
@@ -218,4 +220,31 @@ fn a_link_change_goes_to_the_link_group() {
     assert_eq!(h.ty, RTM_NEWLINK as u16);
     let r = s.recv(16, 0, true);
     assert!(r.is_err());
+}
+
+#[test]
+fn pktinfo_gives_the_group_of_each_datagram() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let s = socket();
+    s.bind(&NoPaths, &addr(0, 1 << (RTNLGRP_LINK - 1))).unwrap();
+    s.set_option(SOL_NETLINK, NETLINK_PKTINFO, &1i32.to_ne_bytes()).unwrap();
+    let lo = dev::by_name("lo").unwrap();
+    let up = lo.is_up();
+    recv_all(&s);
+    // A notification has the group of the link changes.
+    lo.change_flags(lo.flags() ^ IFF_UP).unwrap();
+    lo.change_flags(if up { lo.flags() | IFF_UP } else { lo.flags() & !IFF_UP }).unwrap();
+    let r = s.recv(65536, 0, true).unwrap();
+    let info = RTNLGRP_LINK.to_ne_bytes().to_vec();
+    assert_eq!(r.control, [(SOL_NETLINK, NETLINK_PKTINFO, info)]);
+    recv_all(&s);
+    // An answer to a request is a unicast, with the group 0.
+    send(&s, link_req(RTM_GETLINK, NLM_F_ACK, lo.ifindex() as i32, 0, 0).finish());
+    let r = s.recv(65536, 0, true).unwrap();
+    assert_eq!(r.control, [(SOL_NETLINK, NETLINK_PKTINFO, 0u32.to_ne_bytes().to_vec())]);
+    recv_all(&s);
+    // Without the option, no control message comes.
+    s.set_option(SOL_NETLINK, NETLINK_PKTINFO, &0i32.to_ne_bytes()).unwrap();
+    send(&s, link_req(RTM_GETLINK, NLM_F_ACK, lo.ifindex() as i32, 0, 0).finish());
+    assert!(s.recv(65536, 0, true).unwrap().control.is_empty());
 }
