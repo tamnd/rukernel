@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.16] - 2026-11-09
+
 ### Added
 
 - `ioprio_set` and `ioprio_get`, as block/ioprio.c of Linux. The calls check the class, the level and the permissions, keep the value for each thread, and give it to a new child if its class is valid. `ioprio_get` of a process group or a user gives the best value. Before, the calls gave `ENOSYS`, so systemd failed to start a unit with `IOSchedulingClass=` or `IOSchedulingPriority=` with 211/IOPRIO (#543).
@@ -1489,6 +1491,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.16]: https://github.com/tamnd/rukernel/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/tamnd/rukernel/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/tamnd/rukernel/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/tamnd/rukernel/compare/v0.5.12...v0.5.13
