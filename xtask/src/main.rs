@@ -1557,6 +1557,10 @@ fn build_kernel() -> Result<PathBuf> {
 /// kernel/rukernel/src/selftest.rs and tests/user/init.c. With no user programs, `/init` is a
 /// script that cannot run. With BusyBox, /bin has BusyBox and a link for each applet of
 /// `BUSYBOX_APPLETS`.
+/// The AppArmor policy of the boot test `apparmor`: the profile `rk_test` from
+/// `apparmor_parser` 4.0.1, which attaches to /usr/bin/rk-test.
+const AA_TEST_POLICY: &[u8] = include_bytes!("../../sec/rk-lsm-apparmor/tests/rk_test.bin");
+
 fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>, busybox: Option<&[u8]>) -> Vec<u8> {
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
@@ -1569,6 +1573,7 @@ fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>, busybox: Option<&[u8]>) -> 
             w.add(b"init", 0o100_755, init);
             w.add(b"bin", 0o040_755, b"");
             w.add(b"bin/hello", 0o100_755, hello);
+            w.add(b"etc/rk_test.aa", 0o100_644, AA_TEST_POLICY);
         }
         None => w.add(b"init", 0o100_755, b"#!/bin/sh\n"),
     }

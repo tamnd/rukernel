@@ -56,6 +56,8 @@ pub fn untrusted(out: &mut String, s: &[u8]) {
 pub struct Data<'a> {
     /// The operation, `op`.
     pub op: Option<&'a str>,
+    /// The class of the rule, `class`, as `aa_class_names` of Linux.
+    pub class: Option<&'a str>,
     /// The text that tells why, `info`.
     pub info: Option<&'a str>,
     /// The error number, negative, or 0.
@@ -87,6 +89,9 @@ fn text(kind: Kind, d: &Data<'_>, pid: u32, comm: &[u8]) -> String {
     let mut s = format!("apparmor=\"{}\"", kind.name());
     if let Some(op) = d.op {
         let _ = write!(s, " operation=\"{op}\"");
+    }
+    if let Some(class) = d.class {
+        let _ = write!(s, " class=\"{class}\"");
     }
     if let Some(info) = d.info {
         let _ = write!(s, " info=\"{info}\"");
@@ -135,6 +140,7 @@ mod tests {
         );
         let d = Data {
             op: Some("profile_replace"),
+            class: None,
             info: Some("profile already exists"),
             error: -17,
             profile: Some("unconfined"),

@@ -4,7 +4,8 @@
 //! profiles through the files of `/sys/kernel/security/apparmor`. This crate has the module and
 //! its files ([`fs`]), the features that the kernel tells the compiler ([`features`]), the
 //! unpack of the binary policy ([`unpack`]) with its DFA tables ([`dfa`]), the policy namespace
-//! that holds the profiles ([`policy`]) and the audit records ([`audit`]).
+//! that holds the profiles ([`policy`]), the audit records ([`audit`]) and the label of a task
+//! with its change at an exec ([`domain`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -18,21 +19,35 @@ extern crate alloc;
 
 pub mod audit;
 pub mod dfa;
+pub mod domain;
 pub mod features;
 pub mod fs;
 pub mod policy;
 pub mod unpack;
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use rk_vfs::inode::Result;
 use rk_vfs::security::{
-    BlobSizes, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, id,
+    BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
+    id,
 };
 
-/// The hooks of AppArmor. The module has no hook yet, so each hook allows the operation.
+/// The hooks of AppArmor. Each profile acts in complain mode, so each hook allows the
+/// operation.
 struct AppArmor;
 
-impl SecurityHooks for AppArmor {}
+impl SecurityHooks for AppArmor {
+    fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {
+        domain::bprm_creds_for_exec(bprm);
+        Ok(())
+    }
+
+    fn getprocattr(&self, task: &Task<'_>, name: &str) -> Option<Result<Vec<u8>>> {
+        Some(domain::getprocattr(task, name))
+    }
+}
 
 /// The description of the module, as `DEFINE_LSM(apparmor)` of Linux. AppArmor is a major
 /// module that `security=apparmor` selects, and it cannot be active with another exclusive
@@ -41,7 +56,7 @@ pub static LSM: LsmInfo = LsmInfo {
     id: LsmId { name: "apparmor", id: id::APPARMOR },
     order: Order::Mutable,
     flags: FLAG_LEGACY_MAJOR | FLAG_EXCLUSIVE,
-    blobs: BlobSizes::NONE,
+    blobs: BlobSizes { cred: domain::CRED_BLOB, ..BlobSizes::NONE },
     hooks: &AppArmor,
 };
 

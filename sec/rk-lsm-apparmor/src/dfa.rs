@@ -297,6 +297,40 @@ impl Dfa {
         self.step(state, self.class(c))
     }
 
+    /// The state after the bytes `s` and the count of bytes before a loop of the DFA,
+    /// `aa_dfa_leftmatch` of Linux. The count tells how long the match without a pattern is: a
+    /// longer count is a better attach.
+    pub fn leftmatch(&self, start: State, s: &[u8]) -> (State, u32) {
+        /// The size of the history, `WB_HISTORY_SIZE` of Linux.
+        const HISTORY: usize = 32;
+        if start == NOMATCH {
+            return (NOMATCH, 0);
+        }
+        let mut history = [0; HISTORY];
+        let (mut pos, mut len, mut count) = (0, 0, 0u32);
+        let mut state = start;
+        for (i, &c) in s.iter().enumerate() {
+            history[pos] = state;
+            state = self.next(state, c);
+            // A state that came before is a loop, as `is_loop` of Linux.
+            if history[pos] >= state {
+                let mut p = pos;
+                for adjust in 0..len {
+                    if history[p] == state {
+                        let state = self.match_bytes(state, &s[i + 1..]);
+                        let count = count.saturating_sub(adjust as u32);
+                        return (state, if state == NOMATCH { 0 } else { count });
+                    }
+                    p = (p + HISTORY - 1) % HISTORY;
+                }
+            }
+            pos = (pos + 1) % HISTORY;
+            len = (len + 1).min(HISTORY);
+            count += 1;
+        }
+        (state, if state == NOMATCH { 0 } else { count })
+    }
+
     /// The state after the bytes `s`, `aa_dfa_match_len` of Linux.
     pub fn match_bytes(&self, start: State, s: &[u8]) -> State {
         if start == NOMATCH {

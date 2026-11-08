@@ -15424,6 +15424,71 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
 }
 
 /*
+ * The program of the AppArmor exec checks, as /usr/bin/rk-test and /tmp/rk-sub. It writes its
+ * label from /proc/self/attr/current to stdout. With the argument "sub", it then runs
+ * /tmp/rk-sub with the same stdout.
+ */
+static int aa_label_helper(int argc, char **argv)
+{
+	char buf[256];
+	int n = aa_read("/proc/self/attr/current", buf, sizeof(buf));
+	char *args[] = { "rk-sub", NULL };
+
+	if (n > 0 && write(1, buf, n) != n)
+		return 1;
+	if (argc > 1 && strcmp(argv[1], "sub") == 0) {
+		execv("/tmp/rk-sub", args);
+		return 1;
+	}
+	return n > 0 ? 0 : 1;
+}
+
+/* Copies the file src to dst with the mode 0755. Gives 0, or -1 on an error. */
+static int aa_copy(const char *src, const char *dst)
+{
+	static char buf[65536];
+	int in = open(src, O_RDONLY), out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755), r = 0;
+	ssize_t n;
+
+	if (in < 0 || out < 0)
+		r = -1;
+	while (r == 0 && (n = read(in, buf, sizeof(buf))) > 0)
+		if (write(out, buf, n) != n)
+			r = -1;
+	if (in >= 0)
+		close(in);
+	if (out >= 0)
+		close(out);
+	return r;
+}
+
+/* Runs /usr/bin/rk-test with the arguments argv and puts its stdout in buf. Gives the count of bytes, or -1. */
+static int aa_run(char *const argv[], char *buf, int size)
+{
+	int p[2], n = 0, r, status;
+	pid_t pid;
+
+	if (pipe(p) < 0)
+		return -1;
+	pid = fork();
+	if (pid == 0) {
+		dup2(p[1], 1);
+		close(p[0]);
+		close(p[1]);
+		execv("/usr/bin/rk-test", argv);
+		_exit(127);
+	}
+	close(p[1]);
+	while (n < size - 1 && (r = read(p[0], buf + n, size - 1 - n)) > 0)
+		n += r;
+	close(p[0]);
+	buf[n] = 0;
+	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		return -1;
+	return n;
+}
+
+/*
  * A policy with one profile rk_min in complain mode and no rules, in the binary format of
  * apparmor_parser: the version 7, then the profile with its name, its flags and empty tables.
  */
@@ -15431,7 +15496,7 @@ static const unsigned char aa_min[] = "\x04\x08\x00" "version\x00" "\x02\x07\x00
 	"\x05\x07\x00" "rk_min\x00" "\x04\x06\x00" "flags\x00" "\x07" "\x02\x00\x00\x00\x00" "\x02\x01\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08"
 	"\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08";
 
-/* AppArmor with apparmor=1, as security/apparmor of Linux: the module, its parameter, its files in securityfs and the load of a policy. */
+/* AppArmor with apparmor=1, as security/apparmor of Linux: the module, its parameter, its files in securityfs, the load of a policy and the attach at exec. */
 static void test_apparmor(void)
 {
 	static char buf[65536], big[200000];
@@ -15487,6 +15552,38 @@ static void test_apparmor(void)
 	check("apparmor: the kernel log has the failures", strstr(buf, "apparmor=\"STATUS\" info=\"invalid profile format\" error=-93 profile=\"unconfined\" pid=") != NULL && strstr(buf, "operation=\"profile_replace\" info=\"profile already exists\" error=-17 profile=\"unconfined\" name=\"rk_min\"") != NULL);
 	check("apparmor: a remove of the profile works", aa_write("/sys/kernel/security/apparmor/.remove", "rk_min", 6, 0) == 0);
 	check("apparmor: profiles is empty after the remove", aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
+	/* The policy rk_test of apparmor_parser 4.0.1 attaches to /usr/bin/rk-test. Its rules do not allow an exec of /tmp/rk-sub. */
+	mkdir("/proc", 0555);
+	check("apparmor: proc mounts", mount("proc", "/proc", "proc", 0, NULL) == 0);
+	check("apparmor: the label of init is unconfined", aa_read("/proc/self/attr/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
+	check("apparmor: attr/apparmor/current gives the same label", aa_read("/proc/self/attr/apparmor/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
+	check("apparmor: attr/prev and attr/exec give ENOENT", aa_read("/proc/self/attr/prev", buf, 64) < 0 && errno == ENOENT && aa_read("/proc/self/attr/apparmor/exec", buf, 64) < 0 && errno == ENOENT);
+	fd = open("/etc/rk_test.aa", O_RDONLY);
+	n = fd >= 0 ? read(fd, big, sizeof(big)) : -1;
+	if (fd >= 0)
+		close(fd);
+	check("apparmor: a load of the policy rk_test works", n > 0 && aa_write("/sys/kernel/security/apparmor/.load", big, n, 0) == 0);
+	mkdir("/usr", 0755);
+	mkdir("/usr/bin", 0755);
+	mkdir("/tmp", 01777);
+	check("apparmor: the test programs are there", aa_copy("/init", "/usr/bin/rk-test") == 0 && aa_copy("/init", "/tmp/rk-sub") == 0);
+	{
+		char *one[] = { "rk-test", NULL }, *two[] = { "rk-test", "sub", NULL };
+
+		n = aa_run(one, buf, 256);
+		check("apparmor: an exec of /usr/bin/rk-test attaches rk_test", n == 19 && strcmp(buf, "rk_test (complain)\n") == 0);
+		n = aa_run(two, buf, 256);
+		check("apparmor: an exec without a rule gives a learning profile", n > 0 && strcmp(buf, "rk_test (complain)\nrk_test//null-/tmp/rk-sub (complain)\n") == 0);
+	}
+	check("apparmor: the label of init stays unconfined", aa_read("/proc/self/attr/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
+	check("apparmor: profiles lists the learning profile", aa_read("/sys/kernel/security/apparmor/profiles", buf, 256) > 0 && strstr(buf, "rk_test (complain)\n") != NULL && strstr(buf, "rk_test//hat1 (enforce)\n") != NULL && strstr(buf, "rk_test//null-/tmp/rk-sub (complain)\n") != NULL);
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("apparmor: the kernel log has the exec of the learning profile, as on Linux", n > 0 && strstr(buf, "apparmor=\"ALLOWED\" operation=\"exec\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-sub\" pid=") != NULL && strstr(buf, " requested_mask=\"x\" denied_mask=\"x\" fsuid=0 ouid=0 target=\"rk_test//null-/tmp/rk-sub\"") != NULL);
+	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
+	unlink("/usr/bin/rk-test");
+	unlink("/tmp/rk-sub");
+	umount("/proc");
 	fd = open("/sys/kernel/security/apparmor/.load", O_WRONLY);
 	check("apparmor: a load at an offset that is not 0 gives ESPIPE", fd >= 0 && pwrite(fd, "x", 1, 1) < 0 && errno == ESPIPE);
 	close(fd);
@@ -15511,6 +15608,8 @@ int main(int argc, char **argv)
 	const char *name = strrchr(argv[0], '/');
 	if (strcmp(name ? name + 1 : argv[0], "request-key") == 0)
 		return request_key_helper(argc, argv);
+	if (strcmp(name ? name + 1 : argv[0], "rk-test") == 0 || strcmp(name ? name + 1 : argv[0], "rk-sub") == 0)
+		return aa_label_helper(argc, argv);
 	setvbuf(stdout, NULL, _IONBF, 0);
 	if (argc > 2 && strcmp(argv[1], "masq") == 0)
 		return nft_masq(argv[2]);

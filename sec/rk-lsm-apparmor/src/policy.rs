@@ -74,6 +74,11 @@ impl Profile {
     pub fn parent(&self) -> Option<&str> {
         parent_of(&self.name)
     }
+
+    /// The name without the names of the parents, `base.name` of Linux.
+    pub fn base_name(&self) -> &str {
+        self.name.rfind("//").map_or(&self.name, |i| &self.name[i + 2..])
+    }
 }
 
 /// The name of the parent of the profile `name`.
@@ -115,6 +120,26 @@ impl Ns {
     /// The profile with the name `name`, `__lookup_profile` of Linux.
     pub fn lookup(&self, name: &str) -> Option<Arc<Profile>> {
         self.profiles.lock().iter().find(|p| p.name == name).cloned()
+    }
+
+    /// The profiles with the parent `parent`, the newest first, as the list of profiles of a
+    /// namespace or of a profile of Linux.
+    pub fn children(&self, parent: Option<&str>) -> Vec<Arc<Profile>> {
+        self.profiles.lock().iter().filter(|p| p.parent() == parent).cloned().collect()
+    }
+
+    /// The learning profile of `parent` for the program `base`, as `aa_new_learning_profile`
+    /// of Linux: `PARENT//null-BASE` in complain mode with no rules. A profile with this name
+    /// that is there comes back.
+    pub fn learning(&self, parent: &Profile, base: &str) -> Arc<Profile> {
+        let name = format!("{}//null-{base}", parent.name);
+        let mut list = self.profiles.lock();
+        if let Some(p) = list.iter().find(|p| p.name == name) {
+            return p.clone();
+        }
+        let p = Arc::new(Profile::null(&name));
+        list.insert(0, p.clone());
+        p
     }
 }
 
@@ -185,7 +210,7 @@ const SUBJECT: &str = "unconfined";
 fn status(op: &str, fail: Option<(&str, Errno)>, name: Option<&str>) {
     let info = fail.map(|f| f.0);
     let error = fail.map_or(0, |f| -i32::from(f.1.get()));
-    let d = audit::Data { op: Some(op), info, error, profile: Some(SUBJECT), name };
+    let d = audit::Data { op: Some(op), class: None, info, error, profile: Some(SUBJECT), name };
     audit::log(Kind::Status, &d, "");
 }
 
@@ -194,7 +219,14 @@ fn status(op: &str, fail: Option<(&str, Errno)>, name: Option<&str>) {
 fn unpack_status(e: &unpack::Error) {
     let error = -i32::from(e.errno.get());
     let name = e.name.as_deref();
-    let d = audit::Data { op: None, info: Some(e.info), error, profile: Some(SUBJECT), name };
+    let d = audit::Data {
+        op: None,
+        class: None,
+        info: Some(e.info),
+        error,
+        profile: Some(SUBJECT),
+        name,
+    };
     let mut tail = String::new();
     if let Some(n) = name {
         tail.push_str(" name=");
