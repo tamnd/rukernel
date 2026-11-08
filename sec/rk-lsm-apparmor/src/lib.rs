@@ -2,8 +2,9 @@
 //!
 //! AppArmor confines a program with a profile. The policy compiler `apparmor_parser` loads the
 //! profiles through the files of `/sys/kernel/security/apparmor`. This crate has the module and
-//! its files ([`fs`]), the features that the kernel tells the compiler ([`features`]) and the
-//! policy namespace that holds the profiles ([`policy`]).
+//! its files ([`fs`]), the features that the kernel tells the compiler ([`features`]), the
+//! unpack of the binary policy ([`unpack`]) with its DFA tables ([`dfa`]), the policy namespace
+//! that holds the profiles ([`policy`]) and the audit records ([`audit`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -15,9 +16,12 @@
 
 extern crate alloc;
 
+pub mod audit;
+pub mod dfa;
 pub mod features;
 pub mod fs;
 pub mod policy;
+pub mod unpack;
 
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};

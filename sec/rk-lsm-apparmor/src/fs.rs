@@ -137,7 +137,7 @@ impl Tree for AppArmorFs {
         policy::may_manage(&rk_vfs::cred::current(), change)?;
         match change {
             Change::Remove => policy::remove(&ROOT, data),
-            _ => policy::replace(&ROOT, change, data),
+            _ => policy::replace(&ROOT, change, data).map_err(|e| e.errno),
         }
     }
 }
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn a_write_must_be_whole_and_the_policy_cannot_unpack_yet() {
         assert_eq!(TREE.write(".load", 1, b"x"), Err(Errno::ESPIPE));
-        assert_eq!(TREE.write(".replace", 0, b"x"), Err(Errno::EPROTO));
+        assert_eq!(TREE.write(".replace", 0, b"x"), Err(Errno::EPROTONOSUPPORT));
         assert_eq!(TREE.write("policy/.remove", 0, b"/bin/true"), Err(Errno::ENOENT));
         assert_eq!(TREE.write("profiles", 0, b"x"), Err(Errno::EINVAL));
         assert_eq!(TREE.write(".access", 0, b"label\0x"), Err(Errno::EINVAL));

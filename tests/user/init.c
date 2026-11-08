@@ -15398,7 +15398,15 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
 	return r;
 }
 
-/* AppArmor with apparmor=1, as security/apparmor of Linux: the module, its parameter and its files in securityfs. */
+/*
+ * A policy with one profile rk_min in complain mode and no rules, in the binary format of
+ * apparmor_parser: the version 7, then the profile with its name, its flags and empty tables.
+ */
+static const unsigned char aa_min[] = "\x04\x08\x00" "version\x00" "\x02\x07\x00\x00\x00" "\x04\x08\x00" "profile\x00" "\x07"
+	"\x05\x07\x00" "rk_min\x00" "\x04\x06\x00" "flags\x00" "\x07" "\x02\x00\x00\x00\x00" "\x02\x01\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08"
+	"\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08";
+
+/* AppArmor with apparmor=1, as security/apparmor of Linux: the module, its parameter, its files in securityfs and the load of a policy. */
 static void test_apparmor(void)
 {
 	static char buf[65536], big[200000];
@@ -15439,9 +15447,21 @@ static void test_apparmor(void)
 	check("apparmor: .ns_name is root", aa_read("/sys/kernel/security/apparmor/.ns_name", buf, 64) == 5 && strcmp(buf, "root\n") == 0);
 	check("apparmor: .ns_level is 0 and .stacked is no", aa_read("/sys/kernel/security/apparmor/.ns_level", buf, 64) == 2 && strcmp(buf, "0\n") == 0 && aa_read("/sys/kernel/security/apparmor/.stacked", buf, 64) == 3 && strcmp(buf, "no\n") == 0);
 	check("apparmor: revision is 0", aa_read("/sys/kernel/security/apparmor/revision", buf, 64) == 2 && strcmp(buf, "0\n") == 0);
-	check("apparmor: a load of a policy that does not unpack gives EPROTO", aa_write("/sys/kernel/security/apparmor/.load", "x", 1, 0) == EPROTO);
+	check("apparmor: a load of data that is not a policy gives EPROTONOSUPPORT", aa_write("/sys/kernel/security/apparmor/.load", "x", 1, 0) == EPROTONOSUPPORT);
 	memset(big, 'x', sizeof(big));
-	check("apparmor: a large replace with O_TRUNC gives EPROTO", aa_write("/sys/kernel/security/apparmor/.replace", big, sizeof(big), O_TRUNC) == EPROTO);
+	check("apparmor: a large replace with O_TRUNC gives EPROTONOSUPPORT", aa_write("/sys/kernel/security/apparmor/.replace", big, sizeof(big), O_TRUNC) == EPROTONOSUPPORT);
+	check("apparmor: a load of a cut policy gives EPROTO", aa_write("/sys/kernel/security/apparmor/.load", (const char *)aa_min, sizeof(aa_min) - 2, 0) == EPROTO);
+	check("apparmor: a load of a policy works", aa_write("/sys/kernel/security/apparmor/.load", (const char *)aa_min, sizeof(aa_min) - 1, 0) == 0);
+	check("apparmor: profiles lists the new profile", aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 18 && strcmp(buf, "rk_min (complain)\n") == 0);
+	check("apparmor: a load of a profile that is there gives EEXIST", aa_write("/sys/kernel/security/apparmor/.load", (const char *)aa_min, sizeof(aa_min) - 1, 0) == EEXIST);
+	check("apparmor: a replace of the profile works", aa_write("/sys/kernel/security/apparmor/policy/.replace", (const char *)aa_min, sizeof(aa_min) - 1, 0) == 0);
+	check("apparmor: revision is 2 after a load and a replace", aa_read("/sys/kernel/security/apparmor/revision", buf, 64) == 2 && strcmp(buf, "2\n") == 0);
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("apparmor: the kernel log has the load, as on Linux", n > 0 && strstr(buf, "audit: type=1400 audit(") != NULL && strstr(buf, "apparmor=\"STATUS\" operation=\"profile_load\" profile=\"unconfined\" name=\"rk_min\" pid=") != NULL);
+	check("apparmor: the kernel log has the failures", strstr(buf, "apparmor=\"STATUS\" info=\"invalid profile format\" error=-93 profile=\"unconfined\" pid=") != NULL && strstr(buf, "operation=\"profile_replace\" info=\"profile already exists\" error=-17 profile=\"unconfined\" name=\"rk_min\"") != NULL);
+	check("apparmor: a remove of the profile works", aa_write("/sys/kernel/security/apparmor/.remove", "rk_min", 6, 0) == 0);
+	check("apparmor: profiles is empty after the remove", aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
 	fd = open("/sys/kernel/security/apparmor/.load", O_WRONLY);
 	check("apparmor: a load at an offset that is not 0 gives ESPIPE", fd >= 0 && pwrite(fd, "x", 1, 1) < 0 && errno == ESPIPE);
 	close(fd);

@@ -232,6 +232,14 @@ fn log(ty: u16, text: &str) {
     }
 }
 
+/// The type of the records of the security modules, `AUDIT_AVC` of Linux.
+const AVC: u16 = 1400;
+
+/// Sends an `AVC` record of a security module, as `common_lsm_audit` of Linux.
+pub fn log_avc(text: &str) {
+    log(AVC, text);
+}
+
 /// Sends a `CONFIG_CHANGE` record, as `audit_log_config_change` of Linux.
 fn log_config_change(name: &str, new: u32, old: u32, res: bool) {
     let t = task();
