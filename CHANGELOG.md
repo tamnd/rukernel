@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.14] - 2026-11-08
+
 ### Added
 
 - The AppArmor module, as security/apparmor of Linux, with its securityfs tree in /sys/kernel/security/apparmor: `features/`, `profiles`, `revision`, `.ns_name`, `.ns_level`, `.stacked`, `.load`, `.replace`, `.remove` and `policy/`. The module is on with `apparmor=1` or when `lsm=` names it. /sys/module/apparmor/parameters/enabled shows the state. A write to a securityfs file of the tree comes in one piece, not in 64 KiB pieces. The load of a policy gives EPROTO for now (#540)
@@ -1466,6 +1468,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.14]: https://github.com/tamnd/rukernel/compare/v0.5.13...v0.5.14
 [0.5.13]: https://github.com/tamnd/rukernel/compare/v0.5.12...v0.5.13
 [0.5.12]: https://github.com/tamnd/rukernel/compare/v0.5.11...v0.5.12
 [0.5.11]: https://github.com/tamnd/rukernel/compare/v0.5.10...v0.5.11
