@@ -537,7 +537,14 @@ impl Task {
 /// `TIF_NEED_RESCHED`, so a task that makes many system calls does not pay for the check each
 /// time. A change of the nice value, the CPUs or the group of the task makes it look again before
 /// the next tick.
+///
+/// The kernel runs with interrupts off, so the function first lets in the interrupts that wait,
+/// and the tick count changes in a long loop of the kernel. The check also wakes the tasks whose
+/// timeout is over. A task that runs long in the kernel does not go back to user mode, where the
+/// bottom half runs, and a task that sleeps must get the CPU all the same, as the timer softirq of
+/// Linux runs at the end of each interrupt.
 pub fn should_yield() -> bool {
+    crate::irq::poll();
     let now = crate::time::ticks();
     let this = this_cpu();
     // The first check does not copy the `Arc` of the task.
@@ -549,6 +556,7 @@ pub fn should_yield() -> bool {
     if !check {
         return false;
     }
+    wake_timers(now);
     let current = Task::current();
     let ran = now.wrapping_sub(current.start_tick.load(Ordering::Relaxed));
     scheduler().should_yield(&current, ran)
@@ -808,18 +816,25 @@ pub fn add_bottom_half(f: fn()) {
     *slot = Some(f);
 }
 
-/// Runs the bottom half: it wakes each task whose timeout is over, and then calls each function
-/// of `add_bottom_half`.
-pub(crate) fn run_bottom_half() {
-    let now = crate::time::ticks();
+/// Wakes each task whose timeout is over at the tick `now`.
+fn wake_timers(now: u64) {
     let expired = {
         let mut timers = TIMERS.lock();
+        if timers.first_key_value().is_none_or(|(&(tick, _), _)| tick > now) {
+            return;
+        }
         let later = timers.split_off(&(now + 1, 0));
         core::mem::replace(&mut *timers, later)
     };
     for task in expired.values().filter_map(Weak::upgrade) {
         task.wake();
     }
+}
+
+/// Runs the bottom half: it wakes each task whose timeout is over, and then calls each function
+/// of `add_bottom_half`.
+pub(crate) fn run_bottom_half() {
+    wake_timers(crate::time::ticks());
     // One CPU at a time runs the functions, as a tasklet of Linux runs on one CPU at a time. The
     // functions were written for one CPU, for example the read of the console in rk-drv-tty. A CPU
     // that finds them in use goes on, because the other CPU runs them now, and the next interrupt

@@ -231,6 +231,14 @@ pub(crate) mod irq {
         flags & (1 << 9) != 0
     }
 
+    /// Lets this CPU take the interrupts that wait, and then stops it from taking interrupts. `sti`
+    /// takes effect after the next instruction, so the CPU takes the interrupts after the `nop`.
+    pub(crate) fn poll() {
+        // SAFETY: as for `enable`. The handlers change only atomic values, so the asm block has
+        // no `nomem`, and the compiler reads the values again after it.
+        unsafe { core::arch::asm!("sti", "nop", "cli", options(nostack)) };
+    }
+
     /// Lets this CPU take interrupts and waits for the next one. `sti` takes effect after the next
     /// instruction, so an interrupt that comes before `hlt` still wakes the CPU.
     pub(crate) fn wait() {

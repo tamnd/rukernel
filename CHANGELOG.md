@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - The `systemd` boot test and the tests of the `systemd` tree boot with `systemd.firstboot=no`, so systemd-firstboot.service does not ask on the console for the settings that the tree does not have. The tree of Arch has no time zone, so its boot stopped at the question of the time zone (#543).
+- A long `read` lets the other tasks run between its steps of 64 KiB, as `cond_resched` in Linux, and a fatal signal ends it with the bytes that it read. A signal also ends a long read of a file that is not a regular file, for example /dev/urandom, as `get_random_bytes_user` of Linux. The check for a yield first lets in the interrupts that wait, because the kernel runs with interrupts off, and then wakes the tasks whose timeout is over, as the timer softirq of Linux runs at the end of each interrupt. Before, the timer ticks came only in user mode or in the idle task, so a task that slept in `usleep` did not wake while another task read 100 MB from /dev/urandom, and `test_cgcore_destroy` of the cgroup kselftests did not end (#536).
 
 ## [0.5.17] - 2026-11-09
 

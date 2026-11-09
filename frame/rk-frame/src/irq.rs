@@ -19,6 +19,15 @@ pub fn enabled() -> bool {
     imp::irq::enabled()
 }
 
+/// Lets this CPU take the interrupts that wait, if interrupts are off. Interrupts are off after
+/// the call. The kernel runs with interrupts off, so a long loop of the kernel calls this to see
+/// the timer ticks, as the interrupts of Linux come in the kernel when they are on.
+pub fn poll() {
+    if !enabled() {
+        imp::irq::poll();
+    }
+}
+
 /// Lets this CPU take interrupts and waits for the next one. Interrupts stay on after the wait.
 pub fn wait() {
     imp::irq::wait();
