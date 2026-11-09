@@ -324,10 +324,12 @@ fn pressure(r: usize) -> Vec<u8> {
 }
 
 /// The text of `/proc/PID/cgroup`: the path of the cgroup of `p` from the root of the cgroup
-/// namespace of the caller, as cgroup v2 of Linux shows it.
-fn cgroup_of(p: &Process) -> Vec<u8> {
+/// namespace of the caller, as cgroup v2 of Linux shows it. In a directory of `task`, the file
+/// shows the cgroup of the thread `t`, which can be another cgroup in a threaded subtree.
+fn cgroup_of(p: &Process, t: Option<&Thread>) -> Vec<u8> {
     let ns = rk_proc::current_thread().map_or(0, |t| t.process().cgroup_ns());
-    let path = rk_cgroup::with(|h| h.path_from(p.cgroup(), h.namespace_root(ns)));
+    let cg = t.map_or_else(|| p.cgroup(), Thread::cgroup);
+    let path = rk_cgroup::with(|h| h.path_from(cg, h.namespace_root(ns)));
     let mut out = b"0::".to_vec();
     out.extend_from_slice(&path);
     out.push(b'\n');
@@ -2480,9 +2482,13 @@ fn process_files(
         file(&join(base, b"statm"), move || Ok(text::statm(&statm_of(&*alive(&p_)?)))),
     ));
     let p_ = w.clone();
+    let t_ = t.clone();
     out.push((
         b"cgroup".to_vec(),
-        file(&join(base, b"cgroup"), move || Ok(cgroup_of(&*alive(&p_)?))),
+        file(&join(base, b"cgroup"), move || {
+            let t = t_.as_ref().map(alive).transpose()?;
+            Ok(cgroup_of(&*alive(&p_)?, t.as_deref()))
+        }),
     ));
     out.push((b"ns".to_vec(), ns_dir(base, w.clone(), t.clone())));
     out.push((b"attr".to_vec(), attr_dir(base, w.clone(), t.clone())));

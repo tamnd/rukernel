@@ -1325,6 +1325,9 @@ const KSELFTEST_SCRIPT: &str = concat!(
     // The tests of lsm read /sys/kernel/security/lsm.
     "mkdir -p /sys\nmount -t sysfs sysfs /sys\n",
     "mount -t securityfs securityfs /sys/kernel/security\n",
+    // The tests of cgroup look for a cgroup2 mount in /proc/mounts. `nsdelegate`, as systemd
+    // mounts it, lets `test_cgcore_lesser_ns_open` run.
+    "mount -t cgroup2 -o nsdelegate cgroup2 /sys/fs/cgroup\n",
     // pidfd_info_test runs `pidfd_exec_helper` from the working directory, and the helper is not
     // a test.
     "cd /kselftest\nfailed=0\nfor p in /kselftest/*; do\n",

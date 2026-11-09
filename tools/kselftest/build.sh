@@ -13,7 +13,8 @@ TESTS="seccomp/seccomp_bpf net/af_unix/scm_pidfd timens/timens timens/timerfd ti
 	timens/clock_nanosleep timens/procfs timens/exec timens/futex timens/vfork_exec
 	lsm/lsm_get_self_attr_test lsm/lsm_set_self_attr_test lsm/lsm_list_modules_test
 	pidfd/pidfd_fdinfo_test pidfd/pidfd_file_handle_test pidfd/pidfd_info_test
-	pidfd/pidfd_exec_helper pidfd/pidfd_setns_test"
+	pidfd/pidfd_exec_helper pidfd/pidfd_setns_test
+	cgroup/test_core cgroup/test_cpuset"
 
 out=${1:?usage: tools/kselftest/build.sh OUT_DIR}
 mkdir -p "$out"
@@ -31,8 +32,12 @@ git sparse-checkout set --no-cone /tools/testing/selftests/ >/dev/null
 cd tools/testing/selftests
 for t in $TESTS; do
 	# The tests of lsm also need lsm/common.c, as their Makefile.
+	# The tests of cgroup need cgroup/lib/cgroup_util.c and its header.
 	extra=
-	case $t in lsm/*) extra=lsm/common.c ;; esac
+	case $t in
+	lsm/*) extra=lsm/common.c ;;
+	cgroup/*) extra="cgroup/lib/cgroup_util.c -Icgroup/lib/include" ;;
+	esac
 	gcc -static -O2 -Wall -D_GNU_SOURCE -I. -o "/out/${t##*/}" "$t.c" $extra \
 		-lcap -lpthread
 	strip "/out/${t##*/}"
