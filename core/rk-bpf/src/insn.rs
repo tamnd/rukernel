@@ -98,8 +98,20 @@ pub const BPF_CMPXCHG: i32 = 0xf0 | BPF_FETCH;
 pub const BPF_PSEUDO_MAP_FD: u8 = 1;
 /// The source register of `BPF_LD | BPF_IMM | BPF_DW` that has the address of a map value.
 pub const BPF_PSEUDO_MAP_VALUE: u8 = 2;
+/// The source register of `BPF_LD | BPF_IMM | BPF_DW` that has the address of a function of
+/// the program, for a callback.
+pub const BPF_PSEUDO_FUNC: u8 = 4;
+/// The source register of `BPF_LD | BPF_IMM | BPF_DW` that has an index in `fd_array`.
+pub const BPF_PSEUDO_MAP_IDX: u8 = 5;
+/// The source register of `BPF_LD | BPF_IMM | BPF_DW` that has the address of a map value, with
+/// the map as an index in `fd_array`.
+pub const BPF_PSEUDO_MAP_IDX_VALUE: u8 = 6;
 /// The source register of `BPF_CALL` for a call to a function of the program.
 pub const BPF_PSEUDO_CALL: u8 = 1;
+/// The source register of `BPF_CALL` for a call to a function of the kernel.
+pub const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
+/// The most frames of calls to functions of the program, `MAX_CALL_FRAMES` of Linux.
+pub const MAX_CALL_FRAMES: usize = 8;
 
 /// The class of an opcode.
 pub const fn bpf_class(code: u8) -> u8 {
@@ -242,6 +254,15 @@ pub mod asm {
     }
     pub fn call(func: i32) -> BpfInsn {
         BpfInsn { code: BPF_JMP | BPF_CALL, dst_reg: 0, src_reg: 0, off: 0, imm: func }
+    }
+    pub fn call_local(off: i32) -> BpfInsn {
+        BpfInsn { code: BPF_JMP | BPF_CALL, dst_reg: 0, src_reg: BPF_PSEUDO_CALL, off: 0, imm: off }
+    }
+    pub fn ld_abs(size: u8, imm: i32) -> BpfInsn {
+        BpfInsn { code: BPF_LD | size | BPF_ABS, dst_reg: 0, src_reg: 0, off: 0, imm }
+    }
+    pub fn ld_ind(size: u8, src: u8, imm: i32) -> BpfInsn {
+        BpfInsn { code: BPF_LD | size | BPF_IND, dst_reg: 0, src_reg: src, off: 0, imm }
     }
     pub fn exit() -> BpfInsn {
         BpfInsn { code: BPF_JMP | BPF_EXIT, dst_reg: 0, src_reg: 0, off: 0, imm: 0 }

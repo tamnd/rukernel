@@ -12,11 +12,15 @@
 //!   `BPF_COMPLEXITY_LIMIT_INSNS`.
 //! - A scalar has a tnum and the unsigned and signed bounds. A pointer is to the context, to the
 //!   stack, to a map, or to a map value that can be NULL until the program checks it.
-//! - Calls to functions of the program, kfuncs, tail calls and `BPF_LD_[ABS|IND]` are refused.
+//! - A call of a function of the program gets a new frame, and the verifier checks the function
+//!   again at each call, as Linux does for a static function. Recursion is a back edge.
+//! - `BPF_LD_[ABS|IND]` and tail calls are allowed only in the main program, because rukernel
+//!   has no BTF. Kernel functions and callbacks are refused.
 //!
 //! The messages of the log are the messages of Linux, so the tools that read them still work.
 #![allow(non_upper_case_globals)]
 
+use crate::helpers::func::BPF_FUNC_tail_call;
 use crate::helpers::{ArgType, BpfFuncProto, RetType, get_func_proto};
 use crate::insn::*;
 use crate::map::BpfMap;
@@ -25,6 +29,7 @@ use crate::prog::sk_buff;
 use crate::tnum::{TNUM_UNKNOWN, Tnum};
 use crate::uapi::attach_type::*;
 use crate::uapi::flags::{BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG};
+use crate::uapi::map_type::BPF_MAP_TYPE_ARRAY;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -121,6 +126,8 @@ struct Reg {
     map: usize,
     /// The ID that the NULL check uses.
     id: u32,
+    /// The frame of a pointer to the stack, 0 for the main program.
+    frameno: u32,
 }
 
 impl Reg {
@@ -134,6 +141,7 @@ impl Reg {
         smax: i64::MAX,
         map: 0,
         id: 0,
+        frameno: 0,
     };
 
     /// An unknown scalar, `mark_reg_unknown` of Linux.
@@ -232,14 +240,71 @@ impl StackSlot {
     }
 }
 
-/// The state of a path, `struct bpf_verifier_state` of Linux.
+/// The state of a path, `struct bpf_verifier_state` of Linux. `regs` and `stack` are of the
+/// frame that runs now.
 #[derive(Clone, Debug)]
 struct State {
     regs: [Reg; MAX_BPF_REG],
     /// The slots of the stack. They are on the heap, because a state is large and the kernel
     /// stack is small.
     stack: Vec<StackSlot>,
+    /// The function of the program that runs now.
+    subprog: usize,
+    /// The frames of the callers, the main program first.
+    callers: Vec<Frame>,
 }
+
+/// The state of a caller, `struct bpf_func_state` of Linux.
+#[derive(Clone, Debug)]
+struct Frame {
+    regs: [Reg; MAX_BPF_REG],
+    stack: Vec<StackSlot>,
+    subprog: usize,
+    /// The instruction of the call.
+    callsite: usize,
+}
+
+impl State {
+    /// The number of the frame that runs now, `curframe` of Linux.
+    fn curframe(&self) -> u32 {
+        self.callers.len() as u32
+    }
+
+    /// The stack of the frame `frameno`.
+    fn stack_of(&mut self, frameno: u32) -> &mut Vec<StackSlot> {
+        match self.callers.get_mut(frameno as usize) {
+            Some(f) => &mut f.stack,
+            None => &mut self.stack,
+        }
+    }
+
+    /// The function of the program of the frame `frameno`.
+    fn subprog_of(&self, frameno: u32) -> usize {
+        self.callers.get(frameno as usize).map_or(self.subprog, |f| f.subprog)
+    }
+}
+
+/// A function of the program, `struct bpf_subprog_info` of Linux.
+#[derive(Clone, Copy, Debug, Default)]
+struct Subprog {
+    /// The first instruction.
+    start: usize,
+    /// The bytes of the stack that the function uses.
+    stack_depth: u32,
+    has_tail_call: bool,
+    has_ld_abs: bool,
+}
+
+/// The most functions of a program, `BPF_MAX_SUBPROGS` of Linux.
+const BPF_MAX_SUBPROGS: usize = 256;
+/// The most maps of a program, `MAX_USED_MAPS` of Linux.
+const MAX_USED_MAPS: usize = 64;
+/// `ENOTSUPP` of include/linux/errno.h. Linux gives this number of the kernel to user space
+/// when the kernel cannot call a kernel function.
+const ENOTSUPP: Errno = match Errno::new(524) {
+    Some(e) => e,
+    None => Errno::EINVAL,
+};
 
 /// The verifier, `struct bpf_verifier_env` of Linux.
 struct Env<'a> {
@@ -253,6 +318,8 @@ struct Env<'a> {
     enforce_expected_attach_type: bool,
     id_gen: u32,
     insn_processed: u32,
+    /// The functions of the program, ordered by their first instruction.
+    subprogs: Vec<Subprog>,
 }
 
 /// What the program does with a memory access.
@@ -299,14 +366,43 @@ pub fn prog_type_known(prog_type: u32) -> bool {
 }
 
 /// Checks the program, as `bpf_check` of Linux. `map_by_fd` gives the map of a file
-/// descriptor. The messages go to `log`.
+/// descriptor. `fd_array` gives the descriptor at an index of the `fd_array` of the loader, if
+/// the loader gave one. The messages go to `log`.
 pub fn bpf_check(
     mut insns: Vec<BpfInsn>,
     opts: &VerifierOpts,
     map_by_fd: &dyn Fn(i32) -> Result<Arc<BpfMap>>,
+    fd_array: Option<&dyn Fn(u32) -> Result<i32>>,
     log: &mut BpfVerifierLog,
 ) -> Result<Verified> {
-    let used_maps = resolve_pseudo_ldimm64(&mut insns, map_by_fd, log)?;
+    let (r, subprogs) = {
+        let mut env = Env {
+            insns: &insns,
+            maps: &[],
+            prog_type: opts.prog_type,
+            expected_attach_type: opts.expected_attach_type,
+            bpf_capable: opts.bpf_capable,
+            allow_ptr_leaks: opts.allow_ptr_leaks,
+            log: &mut *log,
+            enforce_expected_attach_type: false,
+            id_gen: 0,
+            insn_processed: 0,
+            subprogs: Vec::new(),
+        };
+        let r = env
+            .add_subprogs()
+            .and_then(|()| env.check_subprogs())
+            .and_then(|()| env.check_abnormal_return());
+        (r, env.subprogs)
+    };
+    let used_maps =
+        match r.and_then(|()| resolve_pseudo_ldimm64(&mut insns, map_by_fd, fd_array, log)) {
+            Ok(m) => m,
+            Err(e) => {
+                print_verification_stats(log, 0);
+                return Err(e);
+            }
+        };
     let mut env = Env {
         insns: &insns,
         maps: &used_maps,
@@ -318,9 +414,14 @@ pub fn bpf_check(
         enforce_expected_attach_type: false,
         id_gen: 0,
         insn_processed: 0,
+        subprogs,
     };
-    let r = env.check_subprogs().and_then(|()| env.check_cfg()).and_then(|()| env.do_check());
-    print_verification_stats(&mut env);
+    let r = env
+        .check_cfg()
+        .and_then(|()| env.do_check())
+        .and_then(|()| env.check_max_stack_depth())
+        .and_then(|()| env.fixup_call_args());
+    print_verification_stats(env.log, env.insn_processed);
     r?;
     let insn_processed = env.insn_processed;
     let enforce_expected_attach_type = env.enforce_expected_attach_type;
@@ -328,14 +429,12 @@ pub fn bpf_check(
 }
 
 /// The last line of the log, `print_verification_stats` of Linux.
-fn print_verification_stats(env: &mut Env<'_>) {
-    verbose!(
-        env,
+fn print_verification_stats(log: &mut BpfVerifierLog, insn_processed: u32) {
+    log.write(format_args!(
         "processed {} insns (limit {}) max_states_per_insn 0 total_states 0 peak_states 0 \
          mark_read 0\n",
-        env.insn_processed,
-        BPF_COMPLEXITY_LIMIT_INSNS
-    );
+        insn_processed, BPF_COMPLEXITY_LIMIT_INSNS
+    ));
 }
 
 /// Tells if the opcode is an instruction of RFC 9669, as `bpf_opcode_in_insntable` of Linux.
@@ -375,11 +474,14 @@ fn bpf_opcode_in_insntable(code: u8) -> bool {
     }
 }
 
-/// Checks the opcodes and puts the maps of `BPF_PSEUDO_MAP_FD` in `used_maps`, as
-/// `resolve_pseudo_ldimm64` of Linux.
+/// Checks the opcodes and puts the maps of the 64-bit loads in `used_maps`, as
+/// `resolve_pseudo_ldimm64` of Linux. A load of a map gets the index of the map in
+/// `used_maps`. A load with the map as an index in `fd_array` becomes a load with
+/// `BPF_PSEUDO_MAP_FD` or `BPF_PSEUDO_MAP_VALUE`.
 fn resolve_pseudo_ldimm64(
     insns: &mut [BpfInsn],
     map_by_fd: &dyn Fn(i32) -> Result<Arc<BpfMap>>,
+    fd_array: Option<&dyn Fn(u32) -> Result<i32>>,
     log: &mut BpfVerifierLog,
 ) -> Result<Vec<Arc<BpfMap>>> {
     let mut used: Vec<Arc<BpfMap>> = Vec::new();
@@ -387,10 +489,6 @@ fn resolve_pseudo_ldimm64(
     let mut i = 0;
     while i < n {
         let insn = insns[i];
-        if !bpf_opcode_in_insntable(insn.code) {
-            log.write(format_args!("unknown opcode {:02x}\n", insn.code));
-            return Err(Errno::EINVAL);
-        }
         if bpf_class(insn.code) == BPF_LDX
             && (!matches!(bpf_mode(insn.code), BPF_MEM | BPF_MEMSX) || insn.imm != 0)
         {
@@ -407,34 +505,84 @@ fn resolve_pseudo_ldimm64(
                 log.write(format_args!("invalid bpf_ld_imm64 insn\n"));
                 return Err(Errno::EINVAL);
             }
-            match insn.src_reg {
-                0 => {}
-                BPF_PSEUDO_MAP_FD => {
-                    if insns[i + 1].imm != 0 || insn.off != 0 {
-                        log.write(format_args!("unrecognized bpf_ld_imm64 insn\n"));
-                        return Err(Errno::EINVAL);
-                    }
-                    let fd = insn.imm;
-                    let map = map_by_fd(fd).inspect_err(|_| {
-                        log.write(format_args!("fd {fd} is not pointing to valid bpf_map\n"));
-                    })?;
-                    // Two loads of one map use one entry of `used_maps`.
-                    let idx = match used.iter().position(|m| Arc::ptr_eq(m, &map)) {
-                        Some(idx) => idx,
-                        None => {
-                            used.push(map);
-                            used.len() - 1
-                        }
-                    };
-                    insns[i].imm = idx as i32;
+            let src = insn.src_reg;
+            let ok = match src {
+                0 => {
+                    i += 2;
+                    continue;
                 }
-                _ => {
-                    log.write(format_args!("unrecognized bpf_ld_imm64 insn\n"));
+                BPF_PSEUDO_MAP_VALUE | BPF_PSEUDO_MAP_IDX_VALUE => true,
+                BPF_PSEUDO_MAP_FD | BPF_PSEUDO_MAP_IDX => insns[i + 1].imm == 0,
+                _ => false,
+            };
+            if !ok {
+                log.write(format_args!("unrecognized bpf_ld_imm64 insn\n"));
+                return Err(Errno::EINVAL);
+            }
+            let fd = if matches!(src, BPF_PSEUDO_MAP_IDX | BPF_PSEUDO_MAP_IDX_VALUE) {
+                let Some(fd_array) = fd_array else {
+                    log.write(format_args!("fd_idx without fd_array is invalid\n"));
+                    return Err(Errno::EPROTO);
+                };
+                fd_array(insn.imm as u32)?
+            } else {
+                insn.imm
+            };
+            let map = map_by_fd(fd).inspect_err(|_| {
+                log.write(format_args!("fd {fd} is not pointing to valid bpf_map\n"));
+            })?;
+            // Two loads of one map use one entry of `used_maps`, as `__add_used_map`.
+            let idx = match used.iter().position(|m| Arc::ptr_eq(m, &map)) {
+                Some(idx) => idx,
+                None => {
+                    if used.len() >= MAX_USED_MAPS {
+                        log.write(format_args!(
+                            "The total number of maps per program has reached the limit of {}\n",
+                            MAX_USED_MAPS
+                        ));
+                        return Err(Errno::E2BIG);
+                    }
+                    used.push(map.clone());
+                    used.len() - 1
+                }
+            };
+            if matches!(src, BPF_PSEUDO_MAP_VALUE | BPF_PSEUDO_MAP_IDX_VALUE) {
+                let off = insns[i + 1].imm as u32;
+                if i64::from(off) >= BPF_MAX_VAR_OFF {
+                    log.write(format_args!("direct value offset of {off} is not allowed\n"));
                     return Err(Errno::EINVAL);
                 }
+                // `array_map_direct_value_addr`: only an array of one value has a fixed
+                // address.
+                if map.map_type != BPF_MAP_TYPE_ARRAY {
+                    log.write(format_args!("no direct value access support for this map type\n"));
+                    return Err(Errno::EINVAL);
+                }
+                let err = if map.max_entries != 1 {
+                    Some(Errno::EOPNOTSUPP)
+                } else if off >= map.value_size {
+                    Some(Errno::EINVAL)
+                } else {
+                    None
+                };
+                if let Some(e) = err {
+                    log.write(format_args!(
+                        "invalid access to map value pointer, value_size={} off={}\n",
+                        map.value_size, off
+                    ));
+                    return Err(e);
+                }
+                insns[i].src_reg = BPF_PSEUDO_MAP_VALUE;
+            } else {
+                insns[i].src_reg = BPF_PSEUDO_MAP_FD;
             }
+            insns[i].imm = idx as i32;
             i += 2;
             continue;
+        }
+        if !bpf_opcode_in_insntable(insn.code) {
+            log.write(format_args!("unknown opcode {:02x}\n", insn.code));
+            return Err(Errno::EINVAL);
         }
         i += 1;
     }
@@ -452,6 +600,11 @@ fn successors(insns: &[BpfInsn], i: usize) -> [Option<i64>; 2] {
     }
     match bpf_op(insn.code) {
         BPF_EXIT => [None, None],
+        // `visit_func_call_insn`: a call of a function of the program goes on after the call
+        // and in the function.
+        BPF_CALL if insn.src_reg == BPF_PSEUDO_CALL => {
+            [Some(next), Some(i as i64 + 1 + insn.imm as i64)]
+        }
         BPF_CALL => [Some(next), None],
         BPF_JA => {
             let off = if class == BPF_JMP32 { insn.imm as i64 } else { insn.off as i64 };
@@ -462,39 +615,209 @@ fn successors(insns: &[BpfInsn], i: usize) -> [Option<i64>; 2] {
 }
 
 impl Env<'_> {
-    /// Checks the jumps and the end of the program, as `check_subprogs` of Linux.
+    /// Finds the functions of the program, as `add_subprog_and_kfunc` of Linux.
+    fn add_subprogs(&mut self) -> Result<()> {
+        self.subprogs = vec![Subprog::default()];
+        let insns = self.insns;
+        for (i, insn) in insns.iter().enumerate() {
+            let call = insn.code == BPF_JMP | BPF_CALL
+                && matches!(insn.src_reg, BPF_PSEUDO_CALL | BPF_PSEUDO_KFUNC_CALL);
+            let func = insn.is_ld_imm64() && insn.src_reg == BPF_PSEUDO_FUNC;
+            if !call && !func {
+                continue;
+            }
+            if !self.bpf_capable {
+                verbose!(
+                    self,
+                    "loading/calling other bpf or kernel functions are allowed for CAP_BPF and \
+                     CAP_SYS_ADMIN\n"
+                );
+                return Err(Errno::EPERM);
+            }
+            if call && insn.src_reg == BPF_PSEUDO_KFUNC_CALL {
+                // `add_kfunc_call`: rukernel has no BTF of the kernel.
+                verbose!(
+                    self,
+                    "calling kernel function is not supported without CONFIG_DEBUG_INFO_BTF\n"
+                );
+                return Err(ENOTSUPP);
+            }
+            self.add_subprog(i as i64 + insn.imm as i64 + 1)?;
+        }
+        if self.log.level & BPF_LOG_LEVEL2 != 0 {
+            for (i, sp) in self.subprogs.iter().enumerate() {
+                self.log.write(format_args!("func#{} @{}\n", i, sp.start));
+            }
+        }
+        Ok(())
+    }
+
+    /// `add_subprog` of Linux.
+    fn add_subprog(&mut self, off: i64) -> Result<()> {
+        if off < 0 || off >= self.insns.len() as i64 {
+            verbose!(self, "call to invalid destination\n");
+            return Err(Errno::EINVAL);
+        }
+        let off = off as usize;
+        let Err(at) = self.subprogs.binary_search_by_key(&off, |sp| sp.start) else {
+            return Ok(());
+        };
+        if self.subprogs.len() >= BPF_MAX_SUBPROGS {
+            verbose!(self, "too many subprograms\n");
+            return Err(Errno::E2BIG);
+        }
+        self.subprogs.insert(at, Subprog { start: off, ..Subprog::default() });
+        Ok(())
+    }
+
+    /// The instruction after the last one of the function `idx`.
+    fn subprog_end(&self, idx: usize) -> usize {
+        self.subprogs.get(idx + 1).map_or(self.insns.len(), |sp| sp.start)
+    }
+
+    /// The function that starts at `off`, `find_subprog` of Linux.
+    fn find_subprog(&self, off: usize) -> Option<usize> {
+        self.subprogs.binary_search_by_key(&off, |sp| sp.start).ok()
+    }
+
+    /// Checks that each jump stays in its function and that each function ends with an exit or
+    /// a jump, as `check_subprogs` of Linux.
     fn check_subprogs(&mut self) -> Result<()> {
-        let n = self.insns.len();
-        for (i, insn) in self.insns.iter().enumerate() {
-            let class = bpf_class(insn.code);
-            if class == BPF_JMP && bpf_op(insn.code) == BPF_CALL && insn.src_reg != 0 {
-                verbose!(self, "function calls to other bpf functions are not supported\n");
-                return Err(Errno::EINVAL);
+        let insns = self.insns;
+        let mut cur = 0;
+        let mut start = 0;
+        let mut end = self.subprog_end(0);
+        for (i, insn) in insns.iter().enumerate() {
+            let code = insn.code;
+            let class = bpf_class(code);
+            if code == BPF_JMP | BPF_CALL && insn.src_reg == 0 && insn.imm == BPF_FUNC_tail_call {
+                self.subprogs[cur].has_tail_call = true;
+            }
+            if class == BPF_LD && matches!(bpf_mode(code), BPF_ABS | BPF_IND) {
+                self.subprogs[cur].has_ld_abs = true;
             }
             if (class == BPF_JMP || class == BPF_JMP32)
-                && !matches!(bpf_op(insn.code), BPF_CALL | BPF_EXIT)
+                && !matches!(bpf_op(code), BPF_CALL | BPF_EXIT)
             {
-                let off = if class == BPF_JMP32 && bpf_op(insn.code) == BPF_JA {
-                    insn.imm as i64
-                } else {
-                    insn.off as i64
-                };
+                let off =
+                    if code == BPF_JMP32 | BPF_JA { insn.imm as i64 } else { insn.off as i64 };
                 let target = i as i64 + off + 1;
-                if target < 0 || target >= n as i64 {
+                if target < start as i64 || target >= end as i64 {
                     verbose!(self, "jump out of range from insn {} to {}\n", i, target);
                     return Err(Errno::EINVAL);
                 }
             }
+            if i == end - 1 {
+                let last_ok = code == BPF_JMP | BPF_EXIT
+                    || code == BPF_JMP32 | BPF_JA
+                    || code == BPF_JMP | BPF_JA;
+                if !last_ok {
+                    verbose!(self, "last insn is not an exit or jmp\n");
+                    return Err(Errno::EINVAL);
+                }
+                start = end;
+                cur += 1;
+                end = self.subprog_end(cur);
+            }
         }
-        let last = self.insns[n - 1];
-        let class = bpf_class(last.code);
-        if !((class == BPF_JMP || class == BPF_JMP32)
-            && matches!(bpf_op(last.code), BPF_EXIT | BPF_JA))
-        {
-            verbose!(self, "last insn is not an exit or jmp\n");
+        Ok(())
+    }
+
+    /// Refuses `BPF_LD_[ABS|IND]` and tail calls in a function that is not the main program,
+    /// as `check_abnormal_return` of Linux. Linux allows them only with BTF, which rukernel
+    /// does not have. It also refuses callbacks, as `fixup_call_args` of Linux without a JIT.
+    fn check_abnormal_return(&mut self) -> Result<()> {
+        for i in 1..self.subprogs.len() {
+            if self.subprogs[i].has_ld_abs {
+                verbose!(self, "LD_ABS is not allowed in subprogs without BTF\n");
+                return Err(Errno::EINVAL);
+            }
+            if self.subprogs[i].has_tail_call {
+                verbose!(self, "tail_call is not allowed in subprogs without BTF\n");
+                return Err(Errno::EINVAL);
+            }
+        }
+        if self.insns.iter().any(|i| i.is_ld_imm64() && i.src_reg == BPF_PSEUDO_FUNC) {
+            verbose!(self, "callbacks are not allowed in non-JITed programs\n");
             return Err(Errno::EINVAL);
         }
         Ok(())
+    }
+
+    /// The checks of `fixup_call_args` of Linux without a JIT: the interpreter cannot run a
+    /// tail call in a program with functions.
+    fn fixup_call_args(&mut self) -> Result<()> {
+        if self.subprogs.len() > 1 && self.subprogs[0].has_tail_call {
+            verbose!(
+                self,
+                "tail_calls are not allowed in non-JITed programs with bpf-to-bpf calls\n"
+            );
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Checks the stack of each chain of calls, as `check_max_stack_depth` of Linux. The
+    /// interpreter rounds the stack of each function up to 32 bytes.
+    fn check_max_stack_depth(&mut self) -> Result<()> {
+        let round = |d: u32| d.max(1).next_multiple_of(32);
+        let insns = self.insns;
+        let mut ret_insn = [0usize; MAX_CALL_FRAMES];
+        let mut ret_prog = [0usize; MAX_CALL_FRAMES];
+        let (mut depth, mut frame, mut idx, mut i) = (0u32, 0usize, 0usize, 0usize);
+        let mut enter = true;
+        loop {
+            if enter {
+                depth += round(self.subprogs[idx].stack_depth);
+                if depth > MAX_BPF_STACK as u32 {
+                    verbose!(
+                        self,
+                        "combined stack size of {} calls is {}. Too large\n",
+                        frame + 1,
+                        depth
+                    );
+                    return Err(Errno::EACCES);
+                }
+            }
+            enter = false;
+            let end = self.subprog_end(idx);
+            while i < end {
+                let insn = insns[i];
+                if insn.code == BPF_JMP | BPF_CALL && insn.src_reg == BPF_PSEUDO_CALL {
+                    ret_insn[frame] = i + 1;
+                    ret_prog[frame] = idx;
+                    let next = (i as i64 + insn.imm as i64 + 1) as usize;
+                    idx = self.find_subprog(next).ok_or(Errno::EFAULT)?;
+                    i = next;
+                    frame += 1;
+                    if frame >= MAX_CALL_FRAMES {
+                        verbose!(self, "the call stack of {} frames is too deep !\n", frame);
+                        return Err(Errno::E2BIG);
+                    }
+                    enter = true;
+                    break;
+                }
+                i += 1;
+            }
+            if enter {
+                continue;
+            }
+            if frame == 0 {
+                return Ok(());
+            }
+            depth -= round(self.subprogs[idx].stack_depth);
+            frame -= 1;
+            i = ret_insn[frame];
+            idx = ret_prog[frame];
+        }
+    }
+
+    /// Notes that the function `subprog` uses `size` bytes of its stack, as
+    /// `grow_stack_state` of Linux.
+    fn grow_stack(&mut self, subprog: usize, size: i64) {
+        let size = (size.max(0) as u32).next_multiple_of(8);
+        let sp = &mut self.subprogs[subprog];
+        sp.stack_depth = sp.stack_depth.max(size);
     }
 
     /// Refuses loops and dead code, as `check_cfg` of Linux.
@@ -561,8 +884,9 @@ impl Env<'_> {
         let mut regs = [Reg::NOT_INIT; MAX_BPF_REG];
         regs[1] = Reg::ptr(RegType::PtrToCtx);
         regs[BPF_REG_FP as usize] = Reg::ptr(RegType::PtrToStack);
-        let mut pending: Vec<(usize, State)> =
-            vec![(0, State { regs, stack: vec![StackSlot::EMPTY; SLOTS] })];
+        let st =
+            State { regs, stack: vec![StackSlot::EMPTY; SLOTS], subprog: 0, callers: Vec::new() };
+        let mut pending: Vec<(usize, State)> = vec![(0, st)];
         while let Some((mut pc, mut st)) = pending.pop() {
             loop {
                 self.insn_processed += 1;
@@ -698,12 +1022,22 @@ impl Env<'_> {
                     0 => {
                         Reg::known(u64::from(insn.imm as u32) | (u64::from(next.imm as u32) << 32))
                     }
+                    // `resolve_pseudo_ldimm64` checked the offset of the value.
+                    BPF_PSEUDO_MAP_VALUE => Reg {
+                        map: insn.imm as usize,
+                        off: next.imm,
+                        ..Reg::ptr(RegType::PtrToMapValue)
+                    },
                     _ => Reg { map: insn.imm as usize, ..Reg::ptr(RegType::ConstPtrToMap) },
                 };
                 Ok(Next::Go(pc + 2))
             }
+            BPF_LD if matches!(bpf_mode(insn.code), BPF_ABS | BPF_IND) => {
+                self.check_ld_abs(insn, st)?;
+                Ok(Next::Go(pc + 1))
+            }
             BPF_LD => {
-                verbose!(self, "BPF_LD_[ABS|IND] instructions are not supported\n");
+                verbose!(self, "invalid BPF_LD mode\n");
                 Err(Errno::EINVAL)
             }
             _ => self.check_jmp(pc, insn, st),
@@ -989,6 +1323,10 @@ impl Env<'_> {
         match reg.ty {
             RegType::PtrToStack => {
                 let off = self.check_stack_off(regno, reg, off, size)?;
+                let frameno = reg.frameno;
+                self.grow_stack(st.subprog_of(frameno), -off);
+                let cur = st.curframe();
+                let stack = st.stack_of(frameno);
                 if t == Access::Write {
                     let v = val.map(|(_, v)| v).unwrap_or_else(Reg::unknown);
                     if !self.allow_ptr_leaks {
@@ -998,16 +1336,23 @@ impl Env<'_> {
                             verbose!(self, "invalid size of register spill\n");
                             return Err(Errno::EACCES);
                         }
-                        let slot = &st.stack[(MAX_BPF_STACK as i64 + off) as usize / 8];
+                        let slot = &stack[(MAX_BPF_STACK as i64 + off) as usize / 8];
                         if size != 8 && slot.is_spill() && slot.spilled.is_pointer() {
                             verbose!(self, "attempt to corrupt spilled pointer on stack\n");
                             return Err(Errno::EACCES);
                         }
                     }
-                    stack_write(st, off, size, v);
+                    if v.ty == RegType::PtrToStack && size == 8 && frameno != cur {
+                        verbose!(
+                            self,
+                            "cannot spill pointers to stack into stack frame of the caller\n"
+                        );
+                        return Err(Errno::EINVAL);
+                    }
+                    stack_write(stack, off, size, v);
                     Ok(Reg::NOT_INIT)
                 } else {
-                    self.stack_read(st, off, size)
+                    self.stack_read(stack, off, size)
                 }
             }
             RegType::PtrToMapValue => {
@@ -1086,9 +1431,9 @@ impl Env<'_> {
     }
 
     /// Reads the stack, as `check_stack_read_fixed_off` of Linux.
-    fn stack_read(&mut self, st: &State, off: i64, size: u32) -> Result<Reg> {
+    fn stack_read(&mut self, stack: &[StackSlot], off: i64, size: u32) -> Result<Reg> {
         let start = (MAX_BPF_STACK as i64 + off) as usize;
-        let slot = &st.stack[start / 8];
+        let slot = &stack[start / 8];
         if slot.is_spill() {
             if size == 8 {
                 return Ok(slot.spilled);
@@ -1100,7 +1445,7 @@ impl Env<'_> {
             return Ok(Reg::unknown_of_size(size));
         }
         for b in start..start + size as usize {
-            if st.stack[b / 8].slot_type[b % 8] == STACK_INVALID {
+            if stack[b / 8].slot_type[b % 8] == STACK_INVALID {
                 verbose!(self, "invalid read from stack off {}+{} size {}\n", off, b - start, size);
                 return Err(Errno::EACCES);
             }
@@ -1302,9 +1647,15 @@ impl Env<'_> {
         let op = bpf_op(insn.code);
         match op {
             BPF_CALL => {
-                if insn.off != 0 || insn.dst_reg != 0 || insn.src_reg != 0 {
+                if insn.off != 0
+                    || insn.dst_reg != 0
+                    || !matches!(insn.src_reg, 0 | BPF_PSEUDO_CALL)
+                {
                     verbose!(self, "BPF_CALL uses reserved fields\n");
                     return Err(Errno::EINVAL);
+                }
+                if insn.src_reg == BPF_PSEUDO_CALL {
+                    return self.check_func_call(pc, insn, st);
                 }
                 self.check_helper_call(insn.imm, st)?;
                 Ok(Next::Go(pc + 1))
@@ -1313,6 +1664,9 @@ impl Env<'_> {
                 if insn.imm != 0 || insn.src_reg != 0 || insn.dst_reg != 0 || insn.off != 0 {
                     verbose!(self, "BPF_EXIT uses reserved fields\n");
                     return Err(Errno::EINVAL);
+                }
+                if !st.callers.is_empty() {
+                    return self.prepare_func_exit(st);
                 }
                 let r0 = st.regs[0];
                 if r0.ty == RegType::NotInit {
@@ -1438,6 +1792,102 @@ impl Env<'_> {
                 Ok(Next::Branch(pc + 1, target, alloc::boxed::Box::new(other)))
             }
         }
+    }
+
+    /// A call of a function of the program, `check_func_call` of Linux. Without BTF each
+    /// function is static, so the verifier checks it again at each call, in a new frame.
+    fn check_func_call(&mut self, pc: usize, insn: BpfInsn, st: &mut State) -> Result<Next> {
+        let target = (pc as i64 + insn.imm as i64 + 1) as usize;
+        let subprog = self.find_subprog(target).ok_or(Errno::EFAULT)?;
+        // `setup_func_entry`.
+        let cur = st.curframe() as usize;
+        if cur + 1 >= MAX_CALL_FRAMES {
+            verbose!(self, "the call stack of {} frames is too deep\n", cur + 2);
+            return Err(Errno::E2BIG);
+        }
+        // The function gets R1 to R5 and a new frame pointer, as `set_callee_state`.
+        let mut regs = [Reg::NOT_INIT; MAX_BPF_REG];
+        regs[1..=5].copy_from_slice(&st.regs[1..=5]);
+        regs[BPF_REG_FP as usize] =
+            Reg { frameno: cur as u32 + 1, ..Reg::ptr(RegType::PtrToStack) };
+        // `clear_caller_saved_regs`.
+        let mut caller_regs = st.regs;
+        for r in caller_regs.iter_mut().take(6) {
+            *r = Reg::NOT_INIT;
+        }
+        let stack = core::mem::replace(&mut st.stack, vec![StackSlot::EMPTY; SLOTS]);
+        st.callers.push(Frame { regs: caller_regs, stack, subprog: st.subprog, callsite: pc });
+        st.regs = regs;
+        st.subprog = subprog;
+        Ok(Next::Go(target))
+    }
+
+    /// The exit of a function of the program, `prepare_func_exit` of Linux.
+    fn prepare_func_exit(&mut self, st: &mut State) -> Result<Next> {
+        let r0 = st.regs[0];
+        if r0.ty == RegType::PtrToStack {
+            verbose!(self, "cannot return stack pointer to the caller\n");
+            return Err(Errno::EINVAL);
+        }
+        let caller = st.callers.pop().ok_or(Errno::EFAULT)?;
+        st.regs = caller.regs;
+        st.regs[0] = r0;
+        st.stack = caller.stack;
+        st.subprog = caller.subprog;
+        Ok(Next::Go(caller.callsite + 1))
+    }
+
+    /// `BPF_LD | BPF_ABS` and `BPF_LD | BPF_IND`, `check_ld_abs` of Linux. The load reads the
+    /// packet of the context in R6, and the interpreter ends the program with 0 when the load
+    /// is out of the packet.
+    fn check_ld_abs(&mut self, insn: BpfInsn, st: &mut State) -> Result<()> {
+        const CTX_REG: u8 = 6;
+        let mode = bpf_mode(insn.code);
+        // `may_access_skb`.
+        if self.prog_type != BPF_PROG_TYPE_SOCKET_FILTER {
+            verbose!(self, "BPF_LD_[ABS|IND] instructions not allowed for this program type\n");
+            return Err(Errno::EINVAL);
+        }
+        if insn.dst_reg != 0
+            || insn.off != 0
+            || bpf_size(insn.code) == BPF_DW
+            || (mode == BPF_ABS && insn.src_reg != 0)
+        {
+            verbose!(self, "BPF_LD_[ABS|IND] uses reserved fields\n");
+            return Err(Errno::EINVAL);
+        }
+        let ctx = self.read_reg(st, CTX_REG)?;
+        if ctx.ty != RegType::PtrToCtx {
+            verbose!(self, "at the time of BPF_LD_ABS|IND R6 != pointer to skb\n");
+            return Err(Errno::EINVAL);
+        }
+        if mode == BPF_IND {
+            self.read_reg(st, insn.src_reg)?;
+        }
+        // `check_ptr_off_reg`.
+        if ctx.off != 0 {
+            verbose!(
+                self,
+                "dereference of modified ctx ptr R{} off={} disallowed\n",
+                CTX_REG,
+                ctx.off
+            );
+            return Err(Errno::EACCES);
+        }
+        if !ctx.var.is_const() || ctx.var.value != 0 {
+            verbose!(
+                self,
+                "variable ctx access var_off=({:#x}; {:#x}) disallowed\n",
+                ctx.var.value,
+                ctx.var.mask
+            );
+            return Err(Errno::EACCES);
+        }
+        for r in st.regs.iter_mut().take(6) {
+            *r = Reg::NOT_INIT;
+        }
+        st.regs[0] = Reg::unknown();
+        Ok(())
     }
 
     /// `check_helper_call` of Linux.
@@ -1589,9 +2039,11 @@ impl Env<'_> {
                     );
                     return Err(Errno::EACCES);
                 }
+                self.grow_stack(st.subprog_of(reg.frameno), -off);
                 let start = (MAX_BPF_STACK as i64 + off) as usize;
+                let stack = st.stack_of(reg.frameno);
                 for b in start..start + size as usize {
-                    let slot = &mut st.stack[b / 8];
+                    let slot = &mut stack[b / 8];
                     if t == Access::Write {
                         if slot.is_spill() {
                             slot.slot_type = [STACK_MISC; 8];
@@ -1981,19 +2433,22 @@ fn mark_ptr_or_null_regs(st: &mut State, id: u32, is_null: bool) {
             };
         }
     };
-    st.regs.iter_mut().for_each(mark);
-    for slot in st.stack.iter_mut() {
-        if slot.is_spill() {
-            mark(&mut slot.spilled);
+    let frames = st.callers.iter_mut().map(|f| (&mut f.regs, &mut f.stack));
+    for (regs, stack) in frames.chain(core::iter::once((&mut st.regs, &mut st.stack))) {
+        regs.iter_mut().for_each(mark);
+        for slot in stack.iter_mut() {
+            if slot.is_spill() {
+                mark(&mut slot.spilled);
+            }
         }
     }
 }
 
 /// Writes the stack, as `check_stack_write_fixed_off` of Linux. A write of 8 bytes spills the
 /// register. A smaller write makes the bytes `STACK_MISC`.
-fn stack_write(st: &mut State, off: i64, size: u32, v: Reg) {
+fn stack_write(stack: &mut [StackSlot], off: i64, size: u32, v: Reg) {
     let start = (MAX_BPF_STACK as i64 + off) as usize;
-    let slot = &mut st.stack[start / 8];
+    let slot = &mut stack[start / 8];
     if size == 8 {
         slot.slot_type = [STACK_SPILL; 8];
         slot.spilled = v;
@@ -2152,14 +2607,17 @@ mod tests {
     use super::*;
     use crate::insn::asm::*;
     use crate::map::{BpfMap, MapAttr, map_alloc};
-    use crate::uapi::map_type::BPF_MAP_TYPE_ARRAY;
 
     fn array_map() -> Arc<BpfMap> {
+        array_map_of(4)
+    }
+
+    fn array_map_of(max_entries: u32) -> Arc<BpfMap> {
         let attr = MapAttr {
             map_type: BPF_MAP_TYPE_ARRAY,
             key_size: 4,
             value_size: 8,
-            max_entries: 4,
+            max_entries,
             map_flags: 0,
             numa_node: 0,
         };
@@ -2168,7 +2626,16 @@ mod tests {
     }
 
     fn check(insns: &[BpfInsn], caps: bool) -> (Result<Verified>, String) {
-        let map = array_map();
+        check_with(insns, caps, array_map(), None)
+    }
+
+    /// Checks with the map `map` at descriptor 3 and the loader's `fd_array`.
+    fn check_with(
+        insns: &[BpfInsn],
+        caps: bool,
+        map: Arc<BpfMap>,
+        fd_array: Option<&dyn Fn(u32) -> Result<i32>>,
+    ) -> (Result<Verified>, String) {
         let opts = VerifierOpts {
             prog_type: BPF_PROG_TYPE_SOCKET_FILTER,
             expected_attach_type: 0,
@@ -2180,6 +2647,7 @@ mod tests {
             insns.to_vec(),
             &opts,
             &|fd| if fd == 3 { Ok(map.clone()) } else { Err(Errno::EBADF) },
+            fd_array,
             &mut log,
         );
         (r, log.text)
@@ -2474,5 +2942,195 @@ mod tests {
         assert!(!sock_addr_is_valid_access(FAMILY, 4, Access::Write, v6));
         assert!(!sock_addr_is_valid_access(MSG_SRC_IP4, 4, Access::Read, v4));
         assert!(!sock_addr_is_valid_access(SK, 8, Access::Read, v4));
+    }
+
+    #[test]
+    fn calls_of_functions_of_the_program() {
+        // main calls f(5), and f returns its argument + 1.
+        let p = [
+            mov64_imm(1, 5),
+            call_local(1),
+            exit(),
+            mov64_reg(0, 1),
+            alu64_imm(BPF_ADD, 0, 1),
+            exit(),
+        ];
+        let (r, log) = check(&p, true);
+        assert!(r.is_ok(), "{log}");
+        // Only a loader with CAP_BPF can call a function.
+        let (r, log) = check(&p, false);
+        assert_eq!(r.err(), Some(Errno::EPERM));
+        assert!(log.contains("loading/calling other bpf or kernel functions are allowed"), "{log}");
+        // The call clears R1 to R5 of the caller.
+        let q = [mov64_imm(1, 5), call_local(2), mov64_reg(0, 1), exit(), mov64_reg(0, 1), exit()];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("R1 !read_ok"), "{log}");
+        // The function does not get R6 of the caller.
+        let q = [mov64_imm(6, 1), call_local(1), exit(), mov64_reg(0, 6), exit()];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("R6 !read_ok"), "{log}");
+        // A destination that is not an instruction.
+        let (r, log) = check(&[call_local(5), exit()], true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("call to invalid destination"), "{log}");
+        // A jump out of its function.
+        let q = [mov64_imm(0, 0), call_local(1), exit(), jmp_imm(BPF_JA, 0, 0, -2), exit()];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("jump out of range from insn 3 to 2"), "{log}");
+        // A kernel function needs BTF.
+        let kfunc = BpfInsn { src_reg: BPF_PSEUDO_KFUNC_CALL, ..call(1) };
+        let (r, log) = check(&[kfunc, mov64_imm(0, 0), exit()], true);
+        assert_eq!(r.err(), Some(ENOTSUPP));
+        assert!(log.contains("without CONFIG_DEBUG_INFO_BTF"), "{log}");
+    }
+
+    #[test]
+    fn functions_and_the_stack_of_the_caller() {
+        // f reads the stack of main through a pointer.
+        let p = [
+            st_mem(BPF_DW, BPF_REG_FP, -8, 7),
+            mov64_reg(1, BPF_REG_FP),
+            alu64_imm(BPF_ADD, 1, -8),
+            call_local(1),
+            exit(),
+            ldx_mem(BPF_DW, 0, 1, 0),
+            exit(),
+        ];
+        let (r, log) = check(&p, true);
+        assert!(r.is_ok(), "{log}");
+        // f writes its frame pointer in the stack of main.
+        let mut q = p.to_vec();
+        q[5] = stx_mem(BPF_DW, 1, BPF_REG_FP, 0);
+        q.insert(6, mov64_imm(0, 0));
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(
+            log.contains("cannot spill pointers to stack into stack frame of the caller"),
+            "{log}"
+        );
+        // f returns its frame pointer.
+        let q = [call_local(1), exit(), mov64_reg(0, BPF_REG_FP), exit()];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("cannot return stack pointer to the caller"), "{log}");
+        // The stack of main and f is more than 512 bytes.
+        let q = [
+            st_mem(BPF_DW, BPF_REG_FP, -512, 0),
+            call_local(1),
+            exit(),
+            st_mem(BPF_DW, BPF_REG_FP, -8, 0),
+            mov64_imm(0, 0),
+            exit(),
+        ];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("combined stack size of 2 calls is 544. Too large"), "{log}");
+    }
+
+    #[test]
+    fn recursion_and_deep_calls_are_refused() {
+        let (r, log) = check(&[call_local(1), exit(), call_local(-1), exit()], true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("back-edge from insn 2 to 2"), "{log}");
+        // A chain of `n` functions after main.
+        let chain = |n: usize| {
+            let mut p = Vec::new();
+            for _ in 0..n {
+                p.extend([call_local(1), exit()]);
+            }
+            p.extend([mov64_imm(0, 0), exit()]);
+            p
+        };
+        let (r, log) = check(&chain(7), true);
+        assert!(r.is_ok(), "{log}");
+        let (r, log) = check(&chain(8), true);
+        assert_eq!(r.err(), Some(Errno::E2BIG));
+        assert!(log.contains("the call stack of 9 frames is too deep"), "{log}");
+    }
+
+    #[test]
+    fn packet_loads_of_a_socket_filter() {
+        let p = [mov64_reg(6, 1), ld_abs(BPF_H, 12), mov64_imm(2, 1), ld_ind(BPF_B, 2, 0), exit()];
+        let (r, log) = check(&p, false);
+        assert!(r.is_ok(), "{log}");
+        // R6 must be the context.
+        let (r, log) = check(&[mov64_imm(6, 0), ld_abs(BPF_B, 0), exit()], false);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("at the time of BPF_LD_ABS|IND R6 != pointer to skb"), "{log}");
+        // The load clears R1 to R5.
+        let (r, log) = check(&[mov64_reg(6, 1), ld_abs(BPF_B, 0), mov64_reg(0, 1), exit()], false);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("R1 !read_ok"), "{log}");
+        // A load of 8 bytes is not an instruction.
+        let (r, log) = check(&[mov64_reg(6, 1), ld_abs(BPF_DW, 0), exit()], false);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("unknown opcode 38"), "{log}");
+        let (r, log) =
+            check(&[mov64_reg(6, 1), ld_abs(BPF_B, 0), ld_ind(BPF_W, 2, 0), exit()], false);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("R2 !read_ok"), "{log}");
+        // Only in the main program.
+        let q = [mov64_reg(6, 1), call_local(1), exit(), ld_abs(BPF_B, 0), exit()];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("LD_ABS is not allowed in subprogs without BTF"), "{log}");
+        let q = [
+            call_local(1),
+            exit(),
+            call(crate::helpers::func::BPF_FUNC_tail_call),
+            mov64_imm(0, 0),
+            exit(),
+        ];
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("tail_call is not allowed in subprogs without BTF"), "{log}");
+    }
+
+    #[test]
+    fn direct_loads_of_a_map_value() {
+        // R1 = &value[0] + 4, and a read of 4 bytes there.
+        let mut p = ld_imm64(1, BPF_PSEUDO_MAP_VALUE, 3).to_vec();
+        p[1].imm = 4;
+        p.extend([ldx_mem(BPF_W, 0, 1, 0), exit()]);
+        let (r, log) = check_with(&p, true, array_map_of(1), None);
+        let v = r.unwrap_or_else(|e| panic!("{e:?} {log}"));
+        assert_eq!(v.insns[0].src_reg, BPF_PSEUDO_MAP_VALUE);
+        assert_eq!(v.insns[0].imm, 0);
+        // A read of 8 bytes there is out of the value.
+        let mut q = p.clone();
+        q[2] = ldx_mem(BPF_DW, 0, 1, 0);
+        let (r, log) = check_with(&q, true, array_map_of(1), None);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("invalid access to map value"), "{log}");
+        // An array of more than one value has no fixed address.
+        let (r, log) = check_with(&p, true, array_map_of(4), None);
+        assert_eq!(r.err(), Some(Errno::EOPNOTSUPP));
+        assert!(log.contains("invalid access to map value pointer, value_size=8 off=4"), "{log}");
+        // The offset is out of the value.
+        let mut q = p.clone();
+        q[1].imm = 8;
+        let (r, _) = check_with(&q, true, array_map_of(1), None);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        // The map is an index in fd_array.
+        let mut q = p.clone();
+        q[0].src_reg = BPF_PSEUDO_MAP_IDX_VALUE;
+        q[0].imm = 2;
+        let (r, log) = check_with(&q, true, array_map_of(1), None);
+        assert_eq!(r.err(), Some(Errno::EPROTO));
+        assert!(log.contains("fd_idx without fd_array is invalid"), "{log}");
+        let fds = |i: u32| if i == 2 { Ok(3) } else { Err(Errno::EFAULT) };
+        let (r, log) = check_with(&q, true, array_map_of(1), Some(&fds));
+        let v = r.unwrap_or_else(|e| panic!("{e:?} {log}"));
+        assert_eq!(v.insns[0].src_reg, BPF_PSEUDO_MAP_VALUE);
+        // A map load with a value in the second half is wrong.
+        let mut q = ld_map(1).to_vec();
+        q[1].imm = 1;
+        q.extend([mov64_imm(0, 0), exit()]);
+        let (r, log) = check(&q, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("unrecognized bpf_ld_imm64 insn"), "{log}");
     }
 }

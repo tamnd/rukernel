@@ -66,6 +66,14 @@ struct Value {
     size: usize,
 }
 
+/// The bytes of the stack of all the frames. The frame `k` has the bytes from `k * 512` to
+/// `(k + 1) * 512`, and its frame pointer is at the end.
+const STACK_SIZE: usize = MAX_BPF_STACK * MAX_CALL_FRAMES;
+
+/// `SKF_NET_OFF` of include/uapi/linux/filter.h: a negative offset of a packet load that
+/// starts at the network header.
+const SKF_NET_OFF: i32 = -0x100000;
+
 /// The state of one run.
 struct Run<'a> {
     prog: &'a BpfProg,
@@ -73,11 +81,29 @@ struct Run<'a> {
     env: &'a dyn HelperEnv,
     stack: Vec<u8>,
     values: Vec<Value>,
+    /// The entry of `values` of the value of each map of the program that a
+    /// `BPF_PSEUDO_MAP_VALUE` load gave.
+    direct: Vec<Option<usize>>,
+}
+
+/// The state of a caller, for a call of a function of the program.
+struct CallFrame {
+    /// The instruction after the call.
+    ret: usize,
+    /// The registers of the caller. The call keeps them, except R0.
+    regs: [u64; MAX_BPF_REG],
 }
 
 /// Runs `prog` with the context `ctx` and gives R0, as `bpf_prog_run` of Linux.
 pub fn bpf_prog_run(prog: &BpfProg, ctx: &mut dyn ProgCtx, env: &dyn HelperEnv) -> Result<u64> {
-    let mut run = Run { prog, ctx, env, stack: vec![0; MAX_BPF_STACK], values: Vec::new() };
+    let mut run = Run {
+        prog,
+        ctx,
+        env,
+        stack: vec![0; STACK_SIZE],
+        values: Vec::new(),
+        direct: vec![None; prog.used_maps.len()],
+    };
     run.exec()
 }
 
@@ -199,6 +225,7 @@ impl Run<'_> {
         regs[BPF_REG_FP as usize] = region_addr(REGION_STACK, MAX_BPF_STACK as u32);
         let mut pc = 0usize;
         let mut steps = 0u64;
+        let mut frames: Vec<CallFrame> = Vec::new();
         loop {
             steps += 1;
             if steps > MAX_STEPS {
@@ -237,9 +264,29 @@ impl Run<'_> {
                                 if class == BPF_JMP32 { insn.imm as i64 } else { insn.off as i64 };
                             pc = (pc as i64 + off) as usize;
                         }
-                        BPF_EXIT => return Ok(regs[0]),
+                        BPF_EXIT => match frames.pop() {
+                            // The end of a function: the caller gets its registers back and R0.
+                            Some(f) => {
+                                let r0 = regs[0];
+                                regs = f.regs;
+                                regs[0] = r0;
+                                pc = f.ret;
+                            }
+                            None => return Ok(regs[0]),
+                        },
                         BPF_CALL if class == BPF_JMP && insn.src_reg == 0 => {
                             regs[0] = self.call(insn.imm, &regs)?;
+                        }
+                        // A call of a function of the program, `JMP_CALL_ARGS` of Linux: the
+                        // function gets R1 to R5 and a new frame of the stack.
+                        BPF_CALL if class == BPF_JMP && insn.src_reg == BPF_PSEUDO_CALL => {
+                            if frames.len() + 1 >= MAX_CALL_FRAMES {
+                                return Err(Fault);
+                            }
+                            frames.push(CallFrame { ret: pc, regs });
+                            let fp = (frames.len() + 1) * MAX_BPF_STACK;
+                            regs[BPF_REG_FP as usize] = region_addr(REGION_STACK, fp as u32);
+                            pc = (pc as i64 + insn.imm as i64) as usize;
                         }
                         _ => {
                             let b = if bpf_src(insn.code) == BPF_X {
@@ -279,8 +326,27 @@ impl Run<'_> {
                     regs[d] = match insn.src_reg {
                         0 => u64::from(insn.imm as u32) | (u64::from(next.imm as u32) << 32),
                         BPF_PSEUDO_MAP_FD => map_addr(insn.imm as usize),
+                        BPF_PSEUDO_MAP_VALUE => {
+                            self.direct_value(insn.imm as usize, next.imm as u32)?
+                        }
                         _ => return Err(Fault),
                     };
+                }
+                BPF_LD if matches!(bpf_mode(insn.code), BPF_ABS | BPF_IND) => {
+                    let off = if bpf_mode(insn.code) == BPF_IND {
+                        regs[s].wrapping_add(insn.imm as i64 as u64) as i32
+                    } else {
+                        insn.imm
+                    };
+                    let size = bpf_size_to_bytes(bpf_size(insn.code));
+                    match self.ld_abs(off, size) {
+                        Some(v) => regs[0] = v,
+                        // The load is out of the packet, so the program ends with 0, as
+                        // `bpf_gen_ld_abs` of Linux.
+                        None => return Ok(0),
+                    }
+                    // The load is a call of a helper, so R1 to R5 are not kept.
+                    regs[1..=5].fill(0);
                 }
                 _ => return Err(Fault),
             }
@@ -295,7 +361,7 @@ impl Run<'_> {
         let end = off.checked_add(size).ok_or(Fault)?;
         let nmaps = self.prog.used_maps.len();
         match idx {
-            REGION_STACK if end <= MAX_BPF_STACK => Ok(Loc::Stack(off)),
+            REGION_STACK if end <= STACK_SIZE => Ok(Loc::Stack(off)),
             REGION_CTX => Ok(Loc::Ctx(off as u32)),
             i if (REGION_MAP0..REGION_MAP0 + nmaps).contains(&i) && off == 0 => {
                 Ok(Loc::Map(i - REGION_MAP0))
@@ -426,6 +492,44 @@ impl Run<'_> {
             regs[s] = old;
         }
         Ok(())
+    }
+
+    /// The address of the byte `off` of the value of the map `i` of the program, for a
+    /// `BPF_PSEUDO_MAP_VALUE` load, as `array_map_direct_value_addr` of Linux. The verifier
+    /// allows it only for an array of one value.
+    fn direct_value(&mut self, i: usize, off: u32) -> Result<u64> {
+        let v = match *self.direct.get(i).ok_or(Fault)? {
+            Some(v) => v,
+            None => {
+                let map = &self.prog.used_maps[i];
+                let elem = map.ops.map_lookup_elem(&0u32.to_le_bytes()).ok_or(Fault)?;
+                if self.values.len() >= MAX_VALUES {
+                    return Err(Fault);
+                }
+                self.values.push(Value { elem, cpu: 0, size: map.value_size as usize });
+                self.direct[i] = Some(self.values.len() - 1);
+                self.values.len() - 1
+            }
+        };
+        Ok(region_addr(REGION_MAP0 + self.prog.used_maps.len() + v, off))
+    }
+
+    /// `BPF_LD | BPF_ABS` and `BPF_LD | BPF_IND`: reads `size` bytes of the packet at `off` in
+    /// network byte order, as `bpf_skb_load_helper_8_no_cache` and the other sizes in
+    /// net/core/filter.c of Linux. A negative offset from `SKF_NET_OFF` starts at the network
+    /// header, which is the start of the data of a socket. The data has no link layer header,
+    /// so a lower offset, such as `SKF_LL_OFF`, fails, as in Linux when the header is not set.
+    fn ld_abs(&self, off: i32, size: u32) -> Option<u64> {
+        let data = self.ctx.skb_data()?;
+        let start = if off >= 0 {
+            off as usize
+        } else if off >= SKF_NET_OFF {
+            (off - SKF_NET_OFF) as usize
+        } else {
+            return None;
+        };
+        let b = data.get(start..start.checked_add(size as usize)?)?;
+        Some(b.iter().fold(0u64, |v, &x| (v << 8) | u64::from(x)))
     }
 
     /// The map of an argument.
@@ -687,8 +791,95 @@ mod tests {
 
     #[test]
     fn an_access_out_of_the_stack_is_a_fault() {
-        let p = prog(&[ldx_mem(BPF_DW, 0, BPF_REG_FP, 0), exit()], Vec::new());
+        // The frame pointer of the main program is at the end of its frame, and the frames
+        // of the calls come after it.
+        let end = (STACK_SIZE - MAX_BPF_STACK) as i16;
+        let p = prog(&[ldx_mem(BPF_DW, 0, BPF_REG_FP, end), exit()], Vec::new());
         let mut skb = SkBuff::default();
         assert_eq!(bpf_prog_run(&p, &mut skb, &NoEnv), Err(Fault));
+    }
+
+    #[test]
+    fn calls_of_functions_of_the_program() {
+        // main: R6 = 100, R0 = f(5) + R6. f: R6 = 1, R0 = R1 * 2 + the stack of f.
+        let r = run(&[
+            mov64_imm(6, 100),
+            st_mem(BPF_DW, BPF_REG_FP, -8, 1000),
+            mov64_imm(1, 5),
+            call_local(4),
+            alu64_reg(BPF_ADD, 0, 6),
+            ldx_mem(BPF_DW, 1, BPF_REG_FP, -8),
+            alu64_reg(BPF_ADD, 0, 1),
+            exit(),
+            mov64_imm(6, 1),
+            st_mem(BPF_DW, BPF_REG_FP, -8, 7),
+            mov64_reg(0, 1),
+            alu64_imm(BPF_MUL, 0, 2),
+            ldx_mem(BPF_DW, 1, BPF_REG_FP, -8),
+            alu64_reg(BPF_ADD, 0, 1),
+            exit(),
+        ]);
+        // f gives 17, main keeps its R6 and its stack.
+        assert_eq!(r, 17 + 100 + 1000);
+        // f reads the stack of main through a pointer.
+        let r = run(&[
+            st_mem(BPF_DW, BPF_REG_FP, -8, 42),
+            mov64_reg(1, BPF_REG_FP),
+            alu64_imm(BPF_ADD, 1, -8),
+            call_local(1),
+            exit(),
+            ldx_mem(BPF_DW, 0, 1, 0),
+            exit(),
+        ]);
+        assert_eq!(r, 42);
+    }
+
+    #[test]
+    fn packet_loads() {
+        let ld = |p: &[BpfInsn]| {
+            let mut insns = vec![mov64_reg(6, 1)];
+            insns.extend_from_slice(p);
+            run(&insns)
+        };
+        // The data is "abcdefgh", and the loads are in network byte order.
+        assert_eq!(ld(&[ld_abs(BPF_B, 1), exit()]), u64::from(b'b'));
+        assert_eq!(ld(&[ld_abs(BPF_H, 0), exit()]), 0x6162);
+        assert_eq!(ld(&[ld_abs(BPF_W, 4), exit()]), 0x6566_6768);
+        assert_eq!(ld(&[mov64_imm(2, 3), ld_ind(BPF_B, 2, 2), exit()]), u64::from(b'f'));
+        assert_eq!(ld(&[ld_abs(BPF_B, -0x100000 + 2), exit()]), u64::from(b'c'));
+        // A load out of the packet ends the program with 0.
+        assert_eq!(ld(&[ld_abs(BPF_W, 6), mov64_imm(0, 9), exit()]), 0);
+        assert_eq!(ld(&[ld_abs(BPF_B, -0x200000), mov64_imm(0, 9), exit()]), 0);
+        assert_eq!(ld(&[mov64_imm(2, -1), ld_ind(BPF_B, 2, 0), mov64_imm(0, 9), exit()]), 0);
+    }
+
+    #[test]
+    fn direct_loads_of_a_map_value() {
+        use crate::map::{MapAttr, map_alloc};
+        use crate::uapi::map_type::BPF_MAP_TYPE_ARRAY;
+        let attr = MapAttr {
+            map_type: BPF_MAP_TYPE_ARRAY,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+            map_flags: 0,
+            numa_node: 0,
+        };
+        let ops = map_alloc(&attr, 1, u64::MAX).unwrap();
+        let map = Arc::new(BpfMap::new(&attr, [0; 16], 1, ops));
+        let [a, mut b] = ld_imm64(1, BPF_PSEUDO_MAP_VALUE, 0);
+        b.imm = 4;
+        let [c, d] = ld_imm64(2, BPF_PSEUDO_MAP_VALUE, 0);
+        // Write 5 at byte 4 and read it through a second load of the value.
+        let p = prog(
+            &[a, b, st_mem(BPF_W, 1, 0, 5), c, d, ldx_mem(BPF_W, 0, 2, 4), exit()],
+            vec![map.clone()],
+        );
+        let mut skb = SkBuff::default();
+        assert_eq!(bpf_prog_run(&p, &mut skb, &NoEnv), Ok(5));
+        let elem = map.ops.map_lookup_elem(&0u32.to_le_bytes()).unwrap();
+        let mut v = [0u8; 4];
+        elem.value(0).read(4, &mut v);
+        assert_eq!(u32::from_le_bytes(v), 5);
     }
 }

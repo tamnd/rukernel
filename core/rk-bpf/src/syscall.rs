@@ -405,7 +405,17 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
         let file = env.fdget(fd)?;
         bpf_map_of(&file).ok_or(Errno::EINVAL)
     };
-    let r = bpf_check(decode(&bytes), &opts, &map_by_fd, &mut log);
+    // `fd_array`: the descriptors of the maps that a load gives by index.
+    let fd_array_addr = attr.u64(FD_ARRAY);
+    let fd_at = |idx: u32| -> Result<i32> {
+        let mut b = [0u8; 4];
+        let addr = fd_array_addr.wrapping_add(u64::from(idx) * 4);
+        env.copy_from_user(addr, &mut b).map_err(|_| Errno::EFAULT)?;
+        Ok(i32::from_ne_bytes(b))
+    };
+    let fd_array: Option<&dyn Fn(u32) -> Result<i32>> =
+        if fd_array_addr == 0 { None } else { Some(&fd_at) };
+    let r = bpf_check(decode(&bytes), &opts, &map_by_fd, fd_array, &mut log);
     // The error of the log comes before the error of the verifier.
     bpf_log_attr_finalize(env, log_attr, &log)?;
     let v = r?;
@@ -957,14 +967,15 @@ fn info_copy_out(env: &dyn Env, attr: &BpfAttr, uattr: u64, buf: &[u8], len: usi
 }
 
 /// The instructions of a program for `xlated_prog_insns`, as `bpf_insn_prepare_dump` of Linux.
-/// A load of a map has the map ID in place of the index of the map.
+/// A load of a map or of a map value has the map ID in place of the index of the map. The
+/// second half of a load of a map value keeps the offset in the value.
 fn bpf_insn_prepare_dump(prog: &BpfProg) -> Vec<u8> {
-    use crate::insn::BPF_PSEUDO_MAP_FD;
+    use crate::insn::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE};
     let mut out = Vec::with_capacity(prog.insns.len() * INSN_SIZE);
     for insn in &prog.insns {
         let mut i = *insn;
         if i.is_ld_imm64()
-            && i.src_reg == BPF_PSEUDO_MAP_FD
+            && matches!(i.src_reg, BPF_PSEUDO_MAP_FD | BPF_PSEUDO_MAP_VALUE)
             && let Some(map) = prog.used_maps.get(i.imm as usize)
         {
             i.imm = map.id as i32;

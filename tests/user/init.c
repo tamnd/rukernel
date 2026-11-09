@@ -6387,6 +6387,55 @@ static void test_bpf_prog(void)
 	close(map);
 }
 
+/*
+ * The instructions that systemd and LTP use beyond bpf_prog01: BPF_LD_ABS, a call of a function
+ * of the program and a load of the address of a map value. The socket filter stores twice the
+ * first byte of each datagram in the value of an array of one value (#537).
+ */
+static void test_bpf_interp(void)
+{
+	static char log[4096];
+	unsigned int index = 0;
+	unsigned long long val = 0;
+	int map, prog, sk[2], ok;
+
+	map = bpf_map_new(2, 4, 8, 1, 0);
+	unsigned long long insns[] = {
+		bpf_insn(0xbf, 6, 1, 0, 0),		/* r6 = r1 */
+		bpf_insn(0x30, 0, 0, 0, 0),		/* r0 = the byte at 0 */
+		bpf_insn(0xbf, 1, 0, 0, 0),		/* r1 = r0 */
+		bpf_insn(0x85, 0, 1, 0, 5),		/* r0 = f(r1) */
+		bpf_insn(0x18, 2, 2, 0, map), 0,	/* r2 = the value of the map */
+		bpf_insn(0x7b, 2, 0, 0, 0),		/* *(u64 *)r2 = r0 */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+		bpf_insn(0xbf, 0, 1, 0, 0),		/* f: r0 = r1 */
+		bpf_insn(0x27, 0, 0, 0, 2),		/* r0 *= 2 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	prog = bpf_prog_new(insns, 12, log, sizeof(log));
+	check("the verifier accepts BPF_LD_ABS, a call and a map value", map >= 0 && prog >= 0);
+	ok = socketpair(AF_UNIX, SOCK_DGRAM, 0, sk) == 0 &&
+	     setsockopt(sk[1], SOL_SOCKET, SO_ATTACH_BPF, &prog, sizeof(prog)) == 0;
+	ok = ok && write(sk[0], "A", 1) == 1;
+	ok = ok && bpf_elem(1, map, &index, &val, 0) == 0 && val == 0x82;
+	check("the interpreter runs BPF_LD_ABS, a call and a map value", ok);
+	/* An empty datagram: the load is out of the packet, so the program stops with 0. */
+	ok = ok && write(sk[0], "", 0) == 0;
+	ok = ok && bpf_elem(1, map, &index, &val, 0) == 0 && val == 0x82;
+	check("a BPF_LD_ABS out of the packet stops the program", ok);
+	close(sk[0]);
+	close(sk[1]);
+	close(prog);
+	/* A call to itself is a loop. */
+	insns[10] = bpf_insn(0x85, 0, 1, 0, -2);
+	errno = 0;
+	ok = bpf_prog_new(insns, 12, log, sizeof(log)) == -1 && errno == EINVAL &&
+	     strstr(log, "back-edge from insn 10 to 9");
+	check("the verifier refuses recursion", ok);
+	close(map);
+}
+
 /* A BPF_*_GET_NEXT_ID or BPF_*_GET_FD_BY_ID command: start_id or the ID, and open_flags. */
 static long bpf_id(int cmd, unsigned int id, unsigned int *next)
 {
@@ -7376,6 +7425,7 @@ static void test_bpf(void)
 	check("an LPM trie finds the longest prefix", ok);
 	close(fd);
 	test_bpf_prog();
+	test_bpf_interp();
 	test_bpf_ids();
 	test_bpf_cgroup();
 	test_bpf_cgroup_hooks();

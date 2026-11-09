@@ -131,7 +131,7 @@ impl BpfProg {
 /// The tag of a program: the first 8 bytes of the SHA-1 of the instructions, with the map
 /// descriptors set to zero, as `bpf_prog_calc_tag` of Linux.
 pub fn bpf_prog_calc_tag(insns: &[BpfInsn]) -> [u8; 8] {
-    use crate::insn::BPF_PSEUDO_MAP_FD;
+    use crate::insn::{BPF_PSEUDO_MAP_FD, BPF_PSEUDO_MAP_VALUE};
     let mut bytes = Vec::with_capacity(insns.len() * INSN_SIZE);
     let mut was_ld_map = false;
     for insn in insns {
@@ -139,7 +139,7 @@ pub fn bpf_prog_calc_tag(insns: &[BpfInsn]) -> [u8; 8] {
         if was_ld_map {
             i.imm = 0;
             was_ld_map = false;
-        } else if i.is_ld_imm64() && i.src_reg == BPF_PSEUDO_MAP_FD {
+        } else if i.is_ld_imm64() && matches!(i.src_reg, BPF_PSEUDO_MAP_FD | BPF_PSEUDO_MAP_VALUE) {
             i.imm = 0;
             was_ld_map = true;
         }
@@ -201,7 +201,7 @@ pub trait ProgCtx {
     fn load(&self, off: u32, size: u32) -> Option<u64>;
     /// Writes the low `size` bytes of `value` at `off`. The verifier checked the access.
     fn store(&mut self, off: u32, size: u32, value: u64) -> Option<()>;
-    /// The data of the packet, for `bpf_skb_load_bytes`.
+    /// The data of the packet, for `bpf_skb_load_bytes` and `BPF_LD_[ABS|IND]`.
     fn skb_data(&self) -> Option<&[u8]> {
         None
     }
