@@ -29,7 +29,7 @@ use crate::prog::sk_buff;
 use crate::tnum::{TNUM_UNKNOWN, Tnum};
 use crate::uapi::attach_type::*;
 use crate::uapi::flags::{BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG};
-use crate::uapi::map_type::BPF_MAP_TYPE_ARRAY;
+use crate::uapi::map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PROG_ARRAY};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -1913,7 +1913,41 @@ impl Env<'_> {
                     ..Reg::ptr(RegType::PtrToMapValueOrNull)
                 }
             }
+            RetType::Void => Reg::NOT_INIT,
         };
+        self.check_map_func_compatibility(map, func_id, &fn_)
+    }
+
+    /// Checks that the helper `func_id` can use the map of its arguments, as
+    /// `check_map_func_compatibility` of Linux. Only `bpf_tail_call` can use a program array, and
+    /// `bpf_tail_call` needs a program array.
+    fn check_map_func_compatibility(
+        &mut self,
+        map: Option<usize>,
+        func_id: i32,
+        fn_: &BpfFuncProto,
+    ) -> Result<()> {
+        let Some(m) = map else {
+            return Ok(());
+        };
+        let map_type = self.maps[m].map_type;
+        let is_prog_array = map_type == BPF_MAP_TYPE_PROG_ARRAY;
+        if is_prog_array != (func_id == BPF_FUNC_tail_call) {
+            verbose!(
+                self,
+                "cannot pass map_type {} into func bpf_{}#{}\n",
+                map_type,
+                fn_.name,
+                func_id
+            );
+            return Err(Errno::EINVAL);
+        }
+        // rukernel has no JIT, so a program with functions cannot use tail calls, as
+        // `allow_tail_call_in_subprogs` of Linux without a JIT.
+        if func_id == BPF_FUNC_tail_call && self.subprogs.len() > 1 {
+            verbose!(self, "mixing of tail_calls and bpf-to-bpf calls is not supported\n");
+            return Err(Errno::EINVAL);
+        }
         Ok(())
     }
 
@@ -2659,6 +2693,66 @@ mod tests {
 
     fn concat(parts: &[&[BpfInsn]]) -> Vec<BpfInsn> {
         parts.iter().flat_map(|p| p.iter().copied()).collect()
+    }
+
+    fn prog_array() -> Arc<BpfMap> {
+        let attr = MapAttr {
+            map_type: BPF_MAP_TYPE_PROG_ARRAY,
+            key_size: 4,
+            value_size: 4,
+            max_entries: 2,
+            map_flags: 0,
+            numa_node: 0,
+        };
+        let ops = map_alloc(&attr, 1, u64::MAX).unwrap();
+        Arc::new(BpfMap::new(&attr, [0; 16], 1, ops))
+    }
+
+    #[test]
+    fn a_tail_call_needs_a_program_array() {
+        use crate::helpers::func::BPF_FUNC_map_lookup_elem;
+        let tail = concat(&[
+            &ld_map(2),
+            &[mov64_imm(3, 0), call(BPF_FUNC_tail_call), mov64_imm(0, 0), exit()],
+        ]);
+        let (r, log) = check_with(&tail, false, prog_array(), None);
+        assert!(r.is_ok(), "{log}");
+        // R0 is not set after a tail call.
+        let mut p = tail.clone();
+        p.remove(4);
+        let (r, log) = check_with(&p, false, prog_array(), None);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("R0 !read_ok"), "{log}");
+        let (r, log) = check(&tail, false);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("cannot pass map_type 2 into func bpf_tail_call#12\n"), "{log}");
+        let lookup = concat(&[
+            &ld_map(1),
+            &[
+                mov64_reg(2, BPF_REG_FP),
+                alu64_imm(BPF_ADD, 2, -8),
+                st_mem(BPF_DW, 2, 0, 0),
+                call(BPF_FUNC_map_lookup_elem),
+                mov64_imm(0, 0),
+                exit(),
+            ],
+        ]);
+        let (r, log) = check_with(&lookup, false, prog_array(), None);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("cannot pass map_type 3 into func bpf_map_lookup_elem#1\n"), "{log}");
+        // A program with functions cannot use tail calls without a JIT.
+        let mixed = concat(&[
+            &[mov64_reg(6, 1), call_local(7), mov64_reg(1, 6)],
+            &ld_map(2),
+            &[mov64_imm(3, 0), call(BPF_FUNC_tail_call), mov64_imm(0, 0), exit()],
+            &[mov64_imm(0, 0), exit()],
+        ]);
+        let (r, log) = check_with(&mixed, true, prog_array(), None);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(
+            log.contains("mixing of tail_calls and bpf-to-bpf calls is not supported\n"),
+            "{log}"
+        );
     }
 
     /// The program of bpf_prog01 of LTP.

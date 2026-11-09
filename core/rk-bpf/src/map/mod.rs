@@ -8,6 +8,7 @@
 pub mod arraymap;
 pub mod hashtab;
 pub mod lpm_trie;
+pub mod prog_array;
 
 use crate::idr::Idr;
 use crate::uapi::BPF_OBJ_NAME_LEN;
@@ -19,7 +20,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 
@@ -94,6 +95,12 @@ pub trait BpfMapOps: Send + Sync {
     fn map_get_next_key(&self, key: Option<&[u8]>, next: &mut [u8]) -> Result<()>;
     /// The bytes that the map uses, as `map_mem_usage`.
     fn map_mem_usage(&self) -> u64;
+    /// The last descriptor or pin of the map closed, as `map_release_uref`.
+    fn map_release_uref(&self) {}
+    /// The program array, for a map of `BPF_MAP_TYPE_PROG_ARRAY`.
+    fn as_prog_array(&self) -> Option<&prog_array::ProgArray> {
+        None
+    }
 }
 
 /// A map, `struct bpf_map` of Linux.
@@ -122,6 +129,9 @@ pub struct BpfMap {
     pub freeze_mutex: SpinLock<()>,
     /// The count of the system calls that write the map now, `writecnt` of Linux.
     pub writecnt: AtomicU32,
+    /// The count of the descriptors and pins of the map, `usercnt` of Linux. The programs that
+    /// use the map do not count.
+    pub usercnt: AtomicU64,
     /// The operations of the type.
     pub ops: Box<dyn BpfMapOps>,
 }
@@ -166,6 +176,7 @@ pub fn bpf_map_type_known(map_type: u32) -> bool {
             | BPF_MAP_TYPE_ARRAY
             | BPF_MAP_TYPE_PERCPU_ARRAY
             | BPF_MAP_TYPE_LPM_TRIE
+            | BPF_MAP_TYPE_PROG_ARRAY
             | BPF_MAP_TYPE_RINGBUF
     )
 }
@@ -175,6 +186,7 @@ pub fn map_alloc_check(attr: &MapAttr) -> Result<()> {
     match attr.map_type {
         BPF_MAP_TYPE_HASH | BPF_MAP_TYPE_PERCPU_HASH => hashtab::htab_map_alloc_check(attr),
         BPF_MAP_TYPE_ARRAY | BPF_MAP_TYPE_PERCPU_ARRAY => arraymap::array_map_alloc_check(attr),
+        BPF_MAP_TYPE_PROG_ARRAY => prog_array::fd_array_map_alloc_check(attr),
         // The trie has no `map_alloc_check`: `trie_alloc` checks the attributes.
         // `ringbuf_map_alloc` checks the attributes of a ring buffer. rukernel does not have
         // ring buffers yet, so the check of the capabilities comes first and then `map_alloc`
@@ -194,6 +206,7 @@ pub fn map_alloc(attr: &MapAttr, nr_cpus: usize, avail: u64) -> Result<Box<dyn B
             Ok(Box::new(arraymap::BpfArray::alloc(attr, nr_cpus, avail)?))
         }
         BPF_MAP_TYPE_LPM_TRIE => Ok(Box::new(lpm_trie::LpmTrie::alloc(attr, avail)?)),
+        BPF_MAP_TYPE_PROG_ARRAY => Ok(Box::new(prog_array::ProgArray::alloc(attr, avail)?)),
         _ => Err(Errno::EINVAL),
     }
 }
@@ -220,6 +233,7 @@ impl BpfMap {
             frozen: AtomicBool::new(false),
             freeze_mutex: SpinLock::new(()),
             writecnt: AtomicU32::new(0),
+            usercnt: AtomicU64::new(0),
             ops,
         }
     }
@@ -227,6 +241,20 @@ impl BpfMap {
     /// Tells if the map has one value for each CPU.
     pub fn is_percpu(&self) -> bool {
         bpf_map_is_percpu_map(self.map_type)
+    }
+
+    /// Counts a new descriptor or pin of the map, the `usercnt` of `bpf_map_inc_with_uref` of
+    /// Linux.
+    pub fn inc_uref(&self) {
+        self.usercnt.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A descriptor or pin of the map closed, `bpf_map_put_uref` of Linux. After the last one,
+    /// a program array removes its programs.
+    pub fn put_uref(&self) {
+        if self.usercnt.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.ops.map_release_uref();
+        }
     }
 
     /// Checks the flags of a lookup or an update from a system call, as
@@ -266,6 +294,11 @@ impl BpfMap {
 
     /// Copies the value of `key` to `out` for a system call, as `bpf_map_copy_value` of Linux.
     pub fn bpf_map_copy_value(&self, key: &[u8], out: &mut [u8], flags: u64) -> Result<()> {
+        if let Some(progs) = self.ops.as_prog_array() {
+            // `bpf_fd_array_map_lookup_elem`: the ID of the program.
+            out[..4].copy_from_slice(&progs.fd_lookup(key)?.to_ne_bytes());
+            return Ok(());
+        }
         let elem = self.ops.map_lookup_elem(key).ok_or(Errno::ENOENT)?;
         if !self.is_percpu() {
             elem.value(0).read(0, &mut out[..self.value_size as usize]);
@@ -295,7 +328,7 @@ impl BpfMap {
 
     /// The text of `/proc/PID/fdinfo` after the common lines, as `bpf_map_show_fdinfo` of Linux.
     pub fn show_fdinfo(&self) -> Vec<u8> {
-        format!(
+        let mut out = format!(
             "map_type:\t{}\nkey_size:\t{}\nvalue_size:\t{}\nmax_entries:\t{}\nmap_flags:\t{:#x}\n\
              map_extra:\t{:#x}\nmemlock:\t{}\nmap_id:\t{}\nfrozen:\t{}\n",
             self.map_type,
@@ -307,8 +340,12 @@ impl BpfMap {
             self.ops.map_mem_usage(),
             self.id,
             u32::from(self.frozen.load(Ordering::Relaxed)),
-        )
-        .into_bytes()
+        );
+        // `bpf_map_show_fdinfo` of Linux: the owner of a program array, after the first program.
+        if let Some(owner) = self.ops.as_prog_array().and_then(|a| a.owner()) {
+            out.push_str(&format!("owner_prog_type:\t{owner}\nowner_jited:\t0\n"));
+        }
+        out.into_bytes()
     }
 }
 

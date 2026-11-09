@@ -122,6 +122,15 @@ struct Node {
     data: SpinLock<Data>,
 }
 
+impl Drop for Node {
+    /// The inode is freed, `bpf_free_inode` of Linux.
+    fn drop(&mut self) {
+        if let Data::Obj(BpfObj::Map(map)) = &*self.data.lock() {
+            map.put_uref();
+        }
+    }
+}
+
 /// The file system type for `mount -t bpf`.
 pub const FS_TYPE: rk_vfs::fstype::FsType =
     rk_vfs::fstype::FsType { name: "bpf", nodev: true, make: mount };
@@ -174,6 +183,10 @@ pub fn bpf_mkobj(dir: &InodeRef, name: &[u8], perm: u32, obj: BpfObj) -> Result<
     let dir = node_of(dir).ok_or(Errno::EPERM)?;
     dir.check_rw()?;
     check_name(name)?;
+    if let BpfObj::Map(map) = &obj {
+        // A pin counts in `usercnt` until the inode is freed, as `bpf_any_get` of Linux.
+        map.inc_uref();
+    }
     let child = Node::new(&dir.fs, mode::S_IFREG | (perm & mode::PERM_MASK), Data::Obj(obj));
     dir.insert(name, child.clone())?;
     Ok(child)

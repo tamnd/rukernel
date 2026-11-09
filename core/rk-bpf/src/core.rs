@@ -74,9 +74,16 @@ const STACK_SIZE: usize = MAX_BPF_STACK * MAX_CALL_FRAMES;
 /// starts at the network header.
 const SKF_NET_OFF: i32 = -0x100000;
 
+/// The most tail calls of one run, `MAX_TAIL_CALL_CNT` of Linux.
+pub const MAX_TAIL_CALL_CNT: u32 = 33;
+
 /// The state of one run.
 struct Run<'a> {
     prog: &'a BpfProg,
+    /// The program of the last tail call. It runs in place of `prog`.
+    tail: Option<Arc<BpfProg>>,
+    /// The count of the tail calls, `tail_call_cnt` of Linux.
+    tail_call_cnt: u32,
     ctx: &'a mut dyn ProgCtx,
     env: &'a dyn HelperEnv,
     stack: Vec<u8>,
@@ -98,6 +105,8 @@ struct CallFrame {
 pub fn bpf_prog_run(prog: &BpfProg, ctx: &mut dyn ProgCtx, env: &dyn HelperEnv) -> Result<u64> {
     let mut run = Run {
         prog,
+        tail: None,
+        tail_call_cnt: 0,
         ctx,
         env,
         stack: vec![0; STACK_SIZE],
@@ -218,8 +227,12 @@ fn neg_errno(e: Errno) -> u64 {
 }
 
 impl Run<'_> {
+    /// The program that runs now.
+    fn cur(&self) -> &BpfProg {
+        self.tail.as_deref().unwrap_or(self.prog)
+    }
+
     fn exec(&mut self) -> Result<u64> {
-        let insns = &self.prog.insns;
         let mut regs = [0u64; MAX_BPF_REG];
         regs[1] = region_addr(REGION_CTX, 0);
         regs[BPF_REG_FP as usize] = region_addr(REGION_STACK, MAX_BPF_STACK as u32);
@@ -231,7 +244,7 @@ impl Run<'_> {
             if steps > MAX_STEPS {
                 return Err(Fault);
             }
-            let insn = *insns.get(pc).ok_or(Fault)?;
+            let insn = *self.cur().insns.get(pc).ok_or(Fault)?;
             pc += 1;
             let d = insn.dst_reg as usize;
             let s = insn.src_reg as usize;
@@ -274,6 +287,20 @@ impl Run<'_> {
                             }
                             None => return Ok(regs[0]),
                         },
+                        BPF_CALL
+                            if class == BPF_JMP
+                                && insn.src_reg == 0
+                                && insn.imm == BPF_FUNC_tail_call =>
+                        {
+                            if let Some(prog) = self.tail_call(&regs)? {
+                                // The registers and the stack stay. The verifier of the new
+                                // program lets it read only R1, R10 and what it writes.
+                                self.direct = vec![None; prog.used_maps.len()];
+                                self.values.clear();
+                                self.tail = Some(prog);
+                                pc = 0;
+                            }
+                        }
                         BPF_CALL if class == BPF_JMP && insn.src_reg == 0 => {
                             regs[0] = self.call(insn.imm, &regs)?;
                         }
@@ -321,7 +348,7 @@ impl Run<'_> {
                     }
                 }
                 BPF_LD if insn.is_ld_imm64() => {
-                    let next = *insns.get(pc).ok_or(Fault)?;
+                    let next = *self.cur().insns.get(pc).ok_or(Fault)?;
                     pc += 1;
                     regs[d] = match insn.src_reg {
                         0 => u64::from(insn.imm as u32) | (u64::from(next.imm as u32) << 32),
@@ -359,7 +386,7 @@ impl Run<'_> {
         let idx = (rel >> 32) as usize;
         let off = rel as u32 as usize;
         let end = off.checked_add(size).ok_or(Fault)?;
-        let nmaps = self.prog.used_maps.len();
+        let nmaps = self.cur().used_maps.len();
         match idx {
             REGION_STACK if end <= STACK_SIZE => Ok(Loc::Stack(off)),
             REGION_CTX => Ok(Loc::Ctx(off as u32)),
@@ -501,7 +528,7 @@ impl Run<'_> {
         let v = match *self.direct.get(i).ok_or(Fault)? {
             Some(v) => v,
             None => {
-                let map = &self.prog.used_maps[i];
+                let map = self.cur().used_maps[i].clone();
                 let elem = map.ops.map_lookup_elem(&0u32.to_le_bytes()).ok_or(Fault)?;
                 if self.values.len() >= MAX_VALUES {
                     return Err(Fault);
@@ -511,7 +538,7 @@ impl Run<'_> {
                 self.values.len() - 1
             }
         };
-        Ok(region_addr(REGION_MAP0 + self.prog.used_maps.len() + v, off))
+        Ok(region_addr(REGION_MAP0 + self.cur().used_maps.len() + v, off))
     }
 
     /// `BPF_LD | BPF_ABS` and `BPF_LD | BPF_IND`: reads `size` bytes of the packet at `off` in
@@ -532,10 +559,25 @@ impl Run<'_> {
         Some(b.iter().fold(0u64, |v, &x| (v << 8) | u64::from(x)))
     }
 
+    /// `bpf_tail_call`, as `JMP_TAIL_CALL` of Linux: the program at the index R3 of the
+    /// program array R2. An index out of the array, too many tail calls or an empty slot give
+    /// `None`, and the caller continues.
+    fn tail_call(&mut self, regs: &[u64; MAX_BPF_REG]) -> Result<Option<Arc<BpfProg>>> {
+        let map = self.map_arg(regs[2])?;
+        let array = map.ops.as_prog_array().ok_or(Fault)?;
+        let index = regs[3] as u32;
+        if index >= map.max_entries || self.tail_call_cnt >= MAX_TAIL_CALL_CNT {
+            return Ok(None);
+        }
+        // Linux counts the call before it reads the slot.
+        self.tail_call_cnt += 1;
+        Ok(array.get(index))
+    }
+
     /// The map of an argument.
     fn map_arg(&self, addr: u64) -> Result<Arc<BpfMap>> {
         match self.locate(addr, 0)? {
-            Loc::Map(i) => Ok(self.prog.used_maps[i].clone()),
+            Loc::Map(i) => Ok(self.cur().used_maps[i].clone()),
             _ => Err(Fault),
         }
     }
@@ -562,7 +604,7 @@ impl Run<'_> {
                         let cpu = if map.is_percpu() { env.map_env().cpu } else { 0 };
                         let size = map.value_size as usize;
                         self.values.push(Value { elem, cpu, size });
-                        let idx = REGION_MAP0 + self.prog.used_maps.len() + self.values.len() - 1;
+                        let idx = REGION_MAP0 + self.cur().used_maps.len() + self.values.len() - 1;
                         region_addr(idx, 0)
                     }
                     None => 0,
@@ -855,18 +897,7 @@ mod tests {
 
     #[test]
     fn direct_loads_of_a_map_value() {
-        use crate::map::{MapAttr, map_alloc};
-        use crate::uapi::map_type::BPF_MAP_TYPE_ARRAY;
-        let attr = MapAttr {
-            map_type: BPF_MAP_TYPE_ARRAY,
-            key_size: 4,
-            value_size: 8,
-            max_entries: 1,
-            map_flags: 0,
-            numa_node: 0,
-        };
-        let ops = map_alloc(&attr, 1, u64::MAX).unwrap();
-        let map = Arc::new(BpfMap::new(&attr, [0; 16], 1, ops));
+        let map = new_map(crate::uapi::map_type::BPF_MAP_TYPE_ARRAY, 8, 1);
         let [a, mut b] = ld_imm64(1, BPF_PSEUDO_MAP_VALUE, 0);
         b.imm = 4;
         let [c, d] = ld_imm64(2, BPF_PSEUDO_MAP_VALUE, 0);
@@ -881,5 +912,63 @@ mod tests {
         let mut v = [0u8; 4];
         elem.value(0).read(4, &mut v);
         assert_eq!(u32::from_le_bytes(v), 5);
+    }
+
+    fn new_map(map_type: u32, value_size: u32, max_entries: u32) -> Arc<BpfMap> {
+        use crate::map::{MapAttr, map_alloc};
+        let attr =
+            MapAttr { map_type, key_size: 4, value_size, max_entries, map_flags: 0, numa_node: 0 };
+        let ops = map_alloc(&attr, 1, u64::MAX).unwrap();
+        Arc::new(BpfMap::new(&attr, [0; 16], 1, ops))
+    }
+
+    /// A tail call to the index `index` of the program array, the map 0 of the program. A
+    /// failed tail call gives 7.
+    fn tail_call_to(index: i32) -> Vec<BpfInsn> {
+        let [a, b] = ld_imm64(2, BPF_PSEUDO_MAP_FD, 0);
+        vec![a, b, mov64_imm(3, index), call(BPF_FUNC_tail_call), mov64_imm(0, 7), exit()]
+    }
+
+    #[test]
+    fn a_tail_call_runs_the_program_of_the_slot() {
+        use crate::uapi::map_type::BPF_MAP_TYPE_PROG_ARRAY;
+        let pa = new_map(BPF_MAP_TYPE_PROG_ARRAY, 4, 2);
+        let progs = pa.ops.as_prog_array().unwrap();
+        let callee = Arc::new(prog(&[mov64_imm(0, 42), exit()], Vec::new()));
+        progs.fd_update(&0u32.to_ne_bytes(), &[0; 4], 0, &|_| Ok(callee.clone())).unwrap();
+        let mut skb = SkBuff::default();
+        let mut go =
+            |index| bpf_prog_run(&prog(&tail_call_to(index), vec![pa.clone()]), &mut skb, &NoEnv);
+        assert_eq!(go(0), Ok(42));
+        // An empty slot and an index out of the array continue after the call.
+        assert_eq!(go(1), Ok(7));
+        assert_eq!(go(2), Ok(7));
+        assert_eq!(go(-1), Ok(7));
+        progs.fd_update(&1u32.to_ne_bytes(), &[0; 4], 0, &|_| Ok(callee.clone())).unwrap();
+        assert_eq!(go(1), Ok(42));
+        pa.ops.map_release_uref();
+        assert_eq!(go(0), Ok(7));
+    }
+
+    #[test]
+    fn a_run_does_at_most_33_tail_calls() {
+        use crate::uapi::map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PROG_ARRAY};
+        let pa = new_map(BPF_MAP_TYPE_PROG_ARRAY, 4, 1);
+        let count = new_map(BPF_MAP_TYPE_ARRAY, 8, 1);
+        // The program adds 1 to the value of the map 1 and does a tail call to itself.
+        let [a, b] = ld_imm64(2, BPF_PSEUDO_MAP_VALUE, 1);
+        let mut insns = vec![a, b, mov64_imm(3, 1), atomic(BPF_DW, 2, 3, 0, BPF_ADD as i32)];
+        insns.extend(tail_call_to(0));
+        let p = Arc::new(prog(&insns, vec![pa.clone(), count.clone()]));
+        let progs = pa.ops.as_prog_array().unwrap();
+        progs.fd_update(&0u32.to_ne_bytes(), &[0; 4], 0, &|_| Ok(p.clone())).unwrap();
+        let mut skb = SkBuff::default();
+        assert_eq!(bpf_prog_run(&p, &mut skb, &NoEnv), Ok(7));
+        let elem = count.ops.map_lookup_elem(&0u32.to_ne_bytes()).unwrap();
+        let mut v = [0u8; 8];
+        elem.value(0).read(0, &mut v);
+        // The first run and 33 tail calls.
+        assert_eq!(u64::from_ne_bytes(v), 1 + u64::from(MAX_TAIL_CALL_CNT));
+        pa.ops.map_release_uref();
     }
 }
