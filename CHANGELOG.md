@@ -4,14 +4,14 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- A task can change its AppArmor label, as procattr.c and domain.c of Linux. A write to `/proc/PID/attr/current` takes `changehat`, `permhat`, `changeprofile` and `permprofile`, and a write to `/proc/PID/attr/exec` takes `exec`, the label for the next `execve`. `lsm_set_self_attr` takes the same commands, and `lsm_get_self_attr` gives the current label, the label before a hat and the label for the next exec. A hat keeps the label before it with a token, and a wrong token kills the task. In complain mode, a missing hat or profile gives a learning profile `PARENT//null-NAME`. The kernel log gets the records of Linux. `/proc/PID/attr/prev` and `/proc/PID/attr/exec` give EINVAL when there is no label, as on Linux (#540)
+
 ### Fixed
 
 - The `systemd` boot test and the tests of the `systemd` tree boot with `systemd.firstboot=no`, so systemd-firstboot.service does not ask on the console for the settings that the tree does not have. The tree of Arch has no time zone, so its boot stopped at the question of the time zone (#543).
 - A long `read` lets the other tasks run between its steps of 64 KiB, as `cond_resched` in Linux, and a fatal signal ends it with the bytes that it read. A signal also ends a long read of a file that is not a regular file, for example /dev/urandom, as `get_random_bytes_user` of Linux. The check for a yield first lets in the interrupts that wait, because the kernel runs with interrupts off, and then wakes the tasks whose timeout is over, as the timer softirq of Linux runs at the end of each interrupt. Before, the timer ticks came only in user mode or in the idle task, so a task that slept in `usleep` did not wake while another task read 100 MB from /dev/urandom, and `test_cgcore_destroy` of the cgroup kselftests did not end (#536).
-
-### Added
-
-- A task can change its AppArmor label, as procattr.c and domain.c of Linux. A write to `/proc/PID/attr/current` takes `changehat`, `permhat`, `changeprofile` and `permprofile`, and a write to `/proc/PID/attr/exec` takes `exec`, the label for the next `execve`. `lsm_set_self_attr` takes the same commands, and `lsm_get_self_attr` gives the current label, the label before a hat and the label for the next exec. A hat keeps the label before it with a token, and a wrong token kills the task. In complain mode, a missing hat or profile gives a learning profile `PARENT//null-NAME`. The kernel log gets the records of Linux. `/proc/PID/attr/prev` and `/proc/PID/attr/exec` give EINVAL when there is no label, as on Linux (#540)
 
 ## [0.5.17] - 2026-11-09
 
