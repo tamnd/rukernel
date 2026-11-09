@@ -139,6 +139,13 @@ fn memory_max_refuses_a_charge_and_counts_the_events() {
     h.uncharge_memory(a, PAGE_SIZE);
     assert_eq!(h.memory_over(a), 0);
     assert_eq!(h.read(a, "memory.peak", 0).unwrap(), "8192\n");
+    // A write of `memory.peak` starts a new local peak and keeps the global peak.
+    h.write(a, "memory.peak", b"reset", 0).unwrap();
+    assert_eq!(h.local_peak(a, false), Some((4096, 4096)));
+    assert_eq!(h.read(a, "memory.peak", 0).unwrap(), "8192\n");
+    h.uncharge_memory(a, PAGE_SIZE);
+    assert_eq!(h.local_peak(a, false), Some((0, 4096)));
+    assert_eq!(h.local_peak(a, true), Some((0, 0)));
     assert_eq!(parse_bytes(b"1M\n"), Ok(1 << 20));
     assert_eq!(parse_bytes(b"4097"), Ok(4096));
     assert_eq!(parse_bytes(b"max"), Ok(MAX));

@@ -143,6 +143,15 @@ static ATTRS: SpinLock<BTreeMap<u64, Attr>> = SpinLock::new(BTreeMap::new());
 /// attributes of the cgroup.
 static XATTRS: SpinLock<BTreeMap<u64, Xattrs>> = SpinLock::new(BTreeMap::new());
 
+/// The open files of `memory.peak` (false) and `memory.swap.peak` (true) of each cgroup that had
+/// a write, with their peaks: the list of watchers of `peak_write` of Linux. A write of one file
+/// raises the peaks of the others to the use now.
+static PEAK_FILES: SpinLock<BTreeMap<(CgId, bool), Vec<Weak<AtomicU64>>>> =
+    SpinLock::new(BTreeMap::new());
+
+/// The peak of an open file of `memory.peak` that had no write, `OFP_PEAK_UNSET` of Linux.
+const PEAK_UNSET: u64 = u64::MAX;
+
 /// The most `user.` attributes of one inode, `KERNFS_MAX_USER_XATTRS` of Linux.
 const MAX_USER_XATTRS: usize = 128;
 
@@ -619,6 +628,9 @@ struct OpenFile {
     seen: AtomicU64,
     /// The trigger of a pressure file, after a write of it.
     trigger: SpinLock<Option<Arc<PsiTrigger>>>,
+    /// The peak of a file of `memory.peak` or `memory.swap.peak` after its last write, or
+    /// `PEAK_UNSET`.
+    peak: Arc<AtomicU64>,
 }
 
 impl OpenFile {
@@ -628,7 +640,49 @@ impl OpenFile {
             access: Access::current(),
             seen: AtomicU64::new(0),
             trigger: SpinLock::new(None),
+            peak: Arc::new(AtomicU64::new(PEAK_UNSET)),
         }
+    }
+
+    /// Tells if this is `memory.peak` (false) or `memory.swap.peak` (true).
+    fn peak_file(&self) -> Option<bool> {
+        match self.name() {
+            "memory.peak" => Some(false),
+            "memory.swap.peak" => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The text of a file of a peak that had a write: the larger of the peak of the file and
+    /// the local peak of the cgroup, as `peak_show` of Linux. Gives `None` for another file.
+    fn peak_text(&self) -> Option<Result<String>> {
+        let swap = self.peak_file()?;
+        let fd = self.peak.load(Ordering::Relaxed);
+        if fd == PEAK_UNSET {
+            return None;
+        }
+        let local = rk_cgroup::with(|h| h.local_peak(self.node.id, swap));
+        Some(local.map(|(_, local)| format!("{}\n", fd.max(local))).ok_or(Errno::ENODEV))
+    }
+
+    /// Does a write of a file of a peak, as `peak_write` of Linux: the cgroup starts a new local
+    /// peak, this file gets the use now, and each other file with a write gets the use now if
+    /// it is larger than its peak.
+    fn peak_write(&self, swap: bool, buf: &[u8]) -> Result<usize> {
+        self.node.command(self.name(), buf, &self.access)?;
+        let id = self.node.id;
+        let usage = rk_cgroup::with(|h| h.local_peak(id, swap)).map_or(0, |(u, _)| u);
+        let mut files = PEAK_FILES.lock();
+        let list = files.entry((id, swap)).or_default();
+        list.retain(|w| w.strong_count() > 0);
+        for peer in list.iter().filter_map(Weak::upgrade) {
+            peer.fetch_max(usage, Ordering::Relaxed);
+        }
+        if self.peak.load(Ordering::Relaxed) == PEAK_UNSET {
+            list.push(Arc::downgrade(&self.peak));
+        }
+        self.peak.store(usage, Ordering::Relaxed);
+        Ok(buf.len())
     }
 
     /// The name of the file.
@@ -652,7 +706,10 @@ impl OpenFile {
     /// Reads the text at `offset`. A read sets the count of events that `poll` compares.
     fn read_text(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let seq = self.seq();
-        let text = self.node.text(self.name())?;
+        let text = match self.peak_text() {
+            Some(text) => text?,
+            None => self.node.text(self.name())?,
+        };
         self.seen.store(seq, Ordering::Relaxed);
         let text = text.as_bytes();
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(text.len());
@@ -664,6 +721,9 @@ impl OpenFile {
     /// Does a write. A write of a pressure file makes the trigger of this open file, as
     /// `cgroup_pressure_write` of Linux.
     fn command(&self, buf: &[u8]) -> Result<usize> {
+        if let Some(swap) = self.peak_file() {
+            return self.peak_write(swap, buf);
+        }
         let Some(resource) = self.pressure() else {
             self.node.command(self.name(), buf, &self.access)?;
             return Ok(buf.len());
