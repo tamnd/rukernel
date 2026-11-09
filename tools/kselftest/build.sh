@@ -33,12 +33,16 @@ cd tools/testing/selftests
 for t in $TESTS; do
 	# The tests of lsm also need lsm/common.c, as their Makefile.
 	# The tests of cgroup need cgroup/lib/cgroup_util.c and its header.
+	# The tests of cgroup build without optimization, as their Makefile: at -O2, gcc removes
+	# the malloc, the writes and the free of alloc_anon of test_memcontrol, so the test does
+	# not use the memory that it must use.
 	extra=
+	opt=-O2
 	case $t in
 	lsm/*) extra=lsm/common.c ;;
-	cgroup/*) extra="cgroup/lib/cgroup_util.c -Icgroup/lib/include" ;;
+	cgroup/*) extra="cgroup/lib/cgroup_util.c -Icgroup/lib/include" opt= ;;
 	esac
-	gcc -static -O2 -Wall -D_GNU_SOURCE -I. -o "/out/${t##*/}" "$t.c" $extra \
+	gcc -static $opt -Wall -D_GNU_SOURCE -I. -o "/out/${t##*/}" "$t.c" $extra \
 		-lcap -lpthread
 	strip "/out/${t##*/}"
 done
