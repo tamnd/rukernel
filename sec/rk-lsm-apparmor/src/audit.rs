@@ -24,6 +24,8 @@ pub enum Kind {
     Denied,
     /// A change of the policy.
     Status,
+    /// An operation that the policy denies, and the kernel kills the task.
+    Killed,
 }
 
 impl Kind {
@@ -33,6 +35,7 @@ impl Kind {
             Self::Allowed => "ALLOWED",
             Self::Denied => "DENIED",
             Self::Status => "STATUS",
+            Self::Killed => "KILLED",
         }
     }
 }
