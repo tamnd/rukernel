@@ -2055,12 +2055,16 @@ fn base_cmdline(test: &str) -> String {
         "ltp" => String::from("console=ttyS0 rk.test=init rdinit=/ltp/run"),
         "kselftest" => String::from("console=ttyS0 rk.test=init rdinit=/kselftest/run"),
         "gvisor" => String::from("console=ttyS0 rk.test=init rdinit=/gvisor/run"),
+        // The init script of the `systemd` tree gets the name of the test. With
+        // `systemd.firstboot=no`, systemd-firstboot.service does not ask on the console for the
+        // settings that the tree does not have. The tree of Arch has no time zone, so without it
+        // the boot stops at the question of the time zone.
+        "systemd" => String::from("console=ttyS0 rk.test=init rdinit=/init systemd.firstboot=no"),
+        t if SYSTEMD_TESTS.contains(&t) => {
+            format!("console=ttyS0 rk.test=init rdinit=/init systemd.firstboot=no -- {t}")
+        }
         t if t == "fstests" || ROOTFS.iter().any(|r| r.name == t) => {
             String::from("console=ttyS0 rk.test=init rdinit=/init")
-        }
-        // The init script of the `systemd` tree gets the name of the test.
-        t if SYSTEMD_TESTS.contains(&t) => {
-            format!("console=ttyS0 rk.test=init rdinit=/init -- {t}")
         }
         _ => format!("console=ttyS0 rk.test={test}"),
     }

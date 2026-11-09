@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- The `systemd` boot test and the tests of the `systemd` tree boot with `systemd.firstboot=no`, so systemd-firstboot.service does not ask on the console for the settings that the tree does not have. The tree of Arch has no time zone, so its boot stopped at the question of the time zone (#543).
+
 ## [0.5.17] - 2026-11-09
 
 ### Added
