@@ -173,11 +173,16 @@ pub fn wait_limits(thread: &Thread) -> bool {
     if !rk_cgroup::any_limit() && !thread.has_io_delay() {
         return false;
     }
-    if wait_frozen(thread) {
-        return true;
+    // A throttled thread waits for one period at a time, and then looks at the freezer and the
+    // quota again.
+    loop {
+        if wait_frozen(thread) {
+            return true;
+        }
+        if !wait_throttled(thread) {
+            return false;
+        }
     }
-    wait_throttled(thread);
-    false
 }
 
 /// Keeps `thread` waiting while its cgroup is frozen, as the freezer of Linux
@@ -221,20 +226,27 @@ pub(crate) fn stopped<R>(thread: &Thread, mut wait: impl FnMut(CgId) -> Option<R
     }
 }
 
-/// Keeps `thread` waiting while its cgroup has used its CPU quota for this period, as the
-/// throttle of `cpu.max`. The thread counts as a task that can run in the pressure of the CPU
-/// while it waits, as a throttled task of Linux. A kill ends the wait.
-pub fn wait_throttled(thread: &Thread) {
+/// Keeps `thread` waiting to the end of the period while its cgroup has used its CPU quota, as
+/// the throttle of `cpu.max`. The thread counts as a task that can run in the pressure of the CPU
+/// while it waits, as a throttled task of Linux. A kill ends the wait. Gives true if the thread
+/// waited for the quota. The caller then calls again, because a cgroup that ran past its quota
+/// pays for the difference in the next periods, and stays throttled until its time is above 0,
+/// as `distribute_cfs_runtime` of Linux unthrottles a group only then.
+pub fn wait_throttled(thread: &Thread) -> bool {
     let cg = thread.cgroup();
     wait_over_high(thread, cg);
     wait_io(thread, cg);
-    let Some(until) = rk_cgroup::throttled_until(cg) else { return };
+    if thread.is_killed() {
+        return false;
+    }
+    let Some(until) = rk_cgroup::throttled_until(cg) else { return false };
     let now = rk_frame::time::nanos();
     let ticks = until.saturating_sub(now).div_ceil(TICK_NS).max(1);
     let deadline = rk_frame::time::ticks() + ticks;
     rk_cgroup::psi_change(cg, |c| c.runnable += 1);
     throttle_wait(thread, deadline);
     rk_cgroup::psi_change(cg, |c| c.runnable = c.runnable.saturating_sub(1));
+    true
 }
 
 /// Keeps `thread` waiting when its cgroup charged pages over `memory.high`, as

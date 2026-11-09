@@ -269,14 +269,19 @@ impl Cpu {
             self.nr_periods += 1;
         }
         self.used = false;
+        let start = self.period_start;
         self.period_start += n * self.period;
-        let quota = i64::try_from(quota).unwrap_or(i64::MAX);
+        let debt = self.runtime.min(0);
         let n = i64::try_from(n).unwrap_or(i64::MAX);
-        self.runtime = self.runtime.min(0).saturating_add(quota.saturating_mul(n)).min(quota);
+        let q = i64::try_from(quota).unwrap_or(i64::MAX);
+        self.runtime = debt.saturating_add(q.saturating_mul(n)).min(q);
         if self.runtime > 0
             && let Some(since) = self.throttled_since.take()
         {
-            self.throttled += end.saturating_sub(since);
+            // The throttle ended at the end of the first period with time above 0.
+            let periods = paid_after(debt, quota);
+            let until = start.saturating_add(periods.saturating_mul(self.period));
+            self.throttled += until.saturating_sub(since);
         }
     }
 
@@ -295,11 +300,18 @@ impl Cpu {
         }
     }
 
-    /// The end of the period, if the cgroup used its quota and must wait.
+    /// The end of the period in which the time of the cgroup goes above 0 again, if the cgroup
+    /// used its quota and must wait. A cgroup that ran past its quota waits for the periods that
+    /// pay for the difference, as a throttled group of Linux runs again only when
+    /// `distribute_cfs_runtime` gives it time above 0. Its threads do not wake in each period,
+    /// because the CPU time of such a wake also counts against the quota.
     fn throttled_until(&mut self, now: u64) -> Option<u64> {
-        self.quota?;
+        let quota = self.quota?;
         self.refill(now);
-        (self.runtime <= 0).then_some(self.period_start + self.period)
+        (self.runtime <= 0).then(|| {
+            let periods = paid_after(self.runtime, quota);
+            self.period_start.saturating_add(periods.saturating_mul(self.period))
+        })
     }
 
     /// Sets the quota and the period of `cpu.max`. A new period starts now.
@@ -312,6 +324,12 @@ impl Cpu {
             self.throttled += now.saturating_sub(since);
         }
     }
+}
+
+/// The number of periods with the quota `quota` after which the time `runtime`, 0 or below, is
+/// above 0 again.
+fn paid_after(runtime: i64, quota: u64) -> u64 {
+    runtime.unsigned_abs() / quota.max(1) + 1
 }
 
 /// The values of the cpuset controller of one cgroup.
