@@ -15525,6 +15525,7 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
  * /tmp/rk-sub with the same stdout. With the argument "files", it does the file operations
  * that the file checks log: an open with a create in /tmp, an exclusive lock of that file, an
  * open of /etc/rk_test.aa, an executable map of it and an open of the directory /usr/bin.
+ * With the argument "exec", it checks that it has no label for the next exec.
  */
 static int aa_label_helper(int argc, char **argv)
 {
@@ -15538,6 +15539,8 @@ static int aa_label_helper(int argc, char **argv)
 		execv("/tmp/rk-sub", args);
 		return 1;
 	}
+	if (argc > 1 && strcmp(argv[1], "exec") == 0)
+		return n > 0 && aa_read("/proc/self/attr/exec", buf, sizeof(buf)) < 0 && errno == EINVAL ? 0 : 1;
 	if (argc > 1 && strcmp(argv[1], "files") == 0) {
 		int w = open("/tmp/rk-aa-w", O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		int r = open("/etc/rk_test.aa", O_RDONLY);
@@ -15574,8 +15577,11 @@ static int aa_copy(const char *src, const char *dst)
 	return r;
 }
 
-/* Runs /usr/bin/rk-test with the arguments argv and puts its stdout in buf. Gives the count of bytes, or -1. */
-static int aa_run(char *const argv[], char *buf, int size)
+/*
+ * Runs the program path with the arguments argv and puts its stdout in buf. With onexec, the
+ * child first writes onexec to /proc/self/attr/exec. Gives the count of bytes, or -1.
+ */
+static int aa_run_at(const char *path, const char *onexec, char *const argv[], char *buf, int size)
 {
 	int p[2], n = 0, r, status;
 	pid_t pid;
@@ -15587,7 +15593,9 @@ static int aa_run(char *const argv[], char *buf, int size)
 		dup2(p[1], 1);
 		close(p[0]);
 		close(p[1]);
-		execv("/usr/bin/rk-test", argv);
+		if (onexec && aa_write("/proc/self/attr/exec", onexec, strlen(onexec), 0) != 0)
+			_exit(126);
+		execv(path, argv);
 		_exit(127);
 	}
 	close(p[1]);
@@ -15598,6 +15606,83 @@ static int aa_run(char *const argv[], char *buf, int size)
 	if (pid < 0 || waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
 		return -1;
 	return n;
+}
+
+/* Runs /usr/bin/rk-test with the arguments argv and puts its stdout in buf. Gives the count of bytes, or -1. */
+static int aa_run(char *const argv[], char *buf, int size)
+{
+	return aa_run_at("/usr/bin/rk-test", NULL, argv, buf, size);
+}
+
+/* Writes the command cmd to /proc/self/attr/current, as libapparmor does. Gives 0 or the errno. */
+static int aa_cmd(const char *cmd)
+{
+	return aa_write("/proc/self/attr/current", cmd, strlen(cmd), 0);
+}
+
+/* The label of the caller from /proc/self/attr/NAME is text. */
+static int aa_label_is(const char *name, const char *text)
+{
+	char path[64], buf[256];
+
+	snprintf(path, sizeof(path), "/proc/self/attr/%s", name);
+	return aa_read(path, buf, sizeof(buf)) == (int)strlen(text) && strcmp(buf, text) == 0;
+}
+
+/*
+ * The changes of the label that a task asks for: change_profile, change_hat and
+ * change_onexec, through /proc/self/attr and lsm_set_self_attr. The policy rk_test is loaded.
+ * Gives 0, or the number of the first check that failed.
+ */
+static int aa_changes(void)
+{
+	unsigned long long ctx[16] = { 0 };
+	unsigned int size = sizeof(ctx);
+	const char *exec = "exec rk_test";
+
+	/* unconfined has no hats, and a command must be known. */
+	if (aa_cmd("changehat 0000000000000007^hat1") != EPERM)
+		return 1;
+	if (aa_cmd("bogus x") != EINVAL || aa_cmd("changehat") != EINVAL)
+		return 2;
+	if (aa_cmd("changeprofile rk_none") != ENOENT)
+		return 3;
+	/* lsm_set_self_attr takes the commands of attr/exec too. */
+	ctx[0] = 104;
+	ctx[2] = 32 + strlen(exec);
+	ctx[3] = strlen(exec);
+	memcpy(&ctx[4], exec, strlen(exec));
+	if (syscall(460, 101, ctx, (size_t)ctx[2], 0) != 0 || !aa_label_is("exec", "rk_test (complain)\n"))
+		return 4;
+	memset(ctx, 0, sizeof(ctx));
+	if (syscall(459, 101, ctx, &size, 0) != 1 || ctx[0] != 104 || ctx[3] != 18 || memcmp(&ctx[4], "rk_test (complain)", 18) != 0)
+		return 5;
+	size = sizeof(ctx);
+	if (syscall(459, 104, ctx, &size, 0) != -1 || errno != ENOENT)
+		return 6;
+	/* unconfined can change to each profile. */
+	if (aa_cmd("changeprofile rk_test") != 0 || !aa_label_is("current", "rk_test (complain)\n"))
+		return 7;
+	/* A hat keeps the label before it, and a change to a hat clears the label for the exec. */
+	if (aa_cmd("changehat 0000000000000007^hat1") != 0 || !aa_label_is("current", "rk_test//hat1 (enforce)\n") || !aa_label_is("prev", "rk_test (complain)\n") || !aa_label_is("apparmor/prev", "rk_test (complain)\n"))
+		return 8;
+	if (aa_read("/proc/self/attr/exec", (char *)ctx, 64) >= 0 || errno != EINVAL)
+		return 9;
+	if (aa_cmd("changehat 0000000000000007^") != 0 || !aa_label_is("current", "rk_test (complain)\n") || aa_read("/proc/self/attr/prev", (char *)ctx, 64) >= 0 || errno != EINVAL)
+		return 10;
+	/* In complain mode, a missing hat gives a learning hat. permhat only checks. */
+	if (aa_cmd("permhat 0000000000000005^nohat") != 0 || !aa_label_is("current", "rk_test (complain)\n"))
+		return 11;
+	if (aa_cmd("changehat 0000000000000005^nohat") != 0 || !aa_label_is("current", "rk_test//null-nohat (complain)\n"))
+		return 12;
+	if (aa_cmd("changehat 0000000000000005^") != 0 || !aa_label_is("current", "rk_test (complain)\n"))
+		return 13;
+	/* The rules of rk_test have no change_profile rule: as on Linux, also in complain mode, a change gives EACCES. */
+	if (aa_cmd("changeprofile rk_test//hat1") != EACCES || !aa_label_is("current", "rk_test (complain)\n"))
+		return 14;
+	if (aa_cmd("permprofile rk_none") != ENOENT || aa_cmd("changeprofile rk_none") != 0 || !aa_label_is("current", "rk_test//null-rk_none (complain)\n"))
+		return 15;
+	return 0;
 }
 
 /*
@@ -15669,7 +15754,7 @@ static void test_apparmor(void)
 	check("apparmor: proc mounts", mount("proc", "/proc", "proc", 0, NULL) == 0);
 	check("apparmor: the label of init is unconfined", aa_read("/proc/self/attr/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
 	check("apparmor: attr/apparmor/current gives the same label", aa_read("/proc/self/attr/apparmor/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
-	check("apparmor: attr/prev and attr/exec give ENOENT", aa_read("/proc/self/attr/prev", buf, 64) < 0 && errno == ENOENT && aa_read("/proc/self/attr/apparmor/exec", buf, 64) < 0 && errno == ENOENT);
+	check("apparmor: attr/prev and attr/exec give EINVAL, as on Linux", aa_read("/proc/self/attr/prev", buf, 64) < 0 && errno == EINVAL && aa_read("/proc/self/attr/apparmor/exec", buf, 64) < 0 && errno == EINVAL);
 	fd = open("/etc/rk_test.aa", O_RDONLY);
 	n = fd >= 0 ? read(fd, big, sizeof(big)) : -1;
 	if (fd >= 0)
@@ -15692,6 +15777,26 @@ static void test_apparmor(void)
 
 		check("apparmor: the file operations of rk_test work", aa_run(three, buf, 256) == 19);
 	}
+	{
+		char *four[] = { "rk-sub", "exec", NULL };
+
+		n = aa_run_at("/tmp/rk-sub", "exec rk_test", four, buf, 256);
+		check("apparmor: change_onexec gives the label at the next exec", n == 19 && strcmp(buf, "rk_test (complain)\n") == 0);
+	}
+	pid = fork();
+	if (pid == 0)
+		_exit(aa_changes());
+	check("apparmor: change_profile and change_hat work as on Linux", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: the AppArmor changes failed at the check %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+	pid = fork();
+	if (pid == 0) {
+		aa_cmd("changeprofile rk_test");
+		aa_cmd("changehat 0000000000000007^hat1");
+		aa_cmd("changehat 0000000000000008^");
+		_exit(0);
+	}
+	check("apparmor: a wrong token of a hat kills the task", pid > 0 && waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
 	check("apparmor: the label of init stays unconfined", aa_read("/proc/self/attr/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
 	check("apparmor: profiles lists the learning profile", aa_read("/sys/kernel/security/apparmor/profiles", buf, 256) > 0 && strstr(buf, "rk_test (complain)\n") != NULL && strstr(buf, "rk_test//hat1 (enforce)\n") != NULL && strstr(buf, "rk_test//null-/tmp/rk-sub (complain)\n") != NULL);
 	n = klogctl(3, buf, sizeof(buf) - 1);
@@ -15710,6 +15815,9 @@ static void test_apparmor(void)
 	}
 	check("apparmor: the kernel log has the lock and the map, as on Linux", strstr(buf, "operation=\"file_lock\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "operation=\"file_mmap\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, " requested_mask=\"k\" denied_mask=\"k\"") != NULL && strstr(buf, " requested_mask=\"rm\" denied_mask=\"rm\"") != NULL);
 	check("apparmor: the name of a directory ends with a slash", strstr(buf, "operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/usr/bin/\" pid=") != NULL);
+	check("apparmor: the kernel log has the failures of the changes, as on Linux", strstr(buf, "apparmor=\"DENIED\" operation=\"change_hat\" class=\"file\" info=\"unconfined can not change_hat\" error=-1 profile=\"unconfined\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"setprocattr\" info=\"current\" error=-22 profile=\"unconfined\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"unconfined\" name=\"rk_none\" pid=") != NULL);
+	check("apparmor: the kernel log has the learning hat and the missing profile", strstr(buf, "apparmor=\"ALLOWED\" operation=\"change_hat\" class=\"file\" profile=\"rk_test\" name=\"nohat\" pid=") != NULL && strstr(buf, " target=\"rk_test//null-nohat\"") != NULL && strstr(buf, "apparmor=\"ALLOWED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"rk_test\" name=\"rk_none\" pid=") != NULL);
+	check("apparmor: the kernel log has the kill of a wrong token", strstr(buf, "apparmor=\"KILLED\" operation=\"change_hat\" class=\"file\" info=\"failed token match\" error=-13 profile=\"rk_test//hat1\" pid=") != NULL);
 	check("apparmor: an open that the rules allow has no record", strstr(buf, "name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\"") == NULL);
 	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
 	unlink("/usr/bin/rk-test");

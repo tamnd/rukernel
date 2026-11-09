@@ -5,7 +5,8 @@
 //! its files ([`fs`]), the features that the kernel tells the compiler ([`features`]), the
 //! unpack of the binary policy ([`unpack`]) with its DFA tables ([`dfa`]), the policy namespace
 //! that holds the profiles ([`policy`]), the audit records ([`audit`]), the label of a task
-//! with its change at an exec ([`domain`]) and the checks of the open files ([`file`]).
+//! with its change at an exec ([`domain`]), the changes that a task asks for with
+//! `change_hat` and `change_profile` ([`task`]) and the checks of the open files ([`file`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -24,6 +25,7 @@ pub mod features;
 pub mod file;
 pub mod fs;
 pub mod policy;
+pub mod task;
 pub mod unpack;
 
 use alloc::string::String;
@@ -33,8 +35,8 @@ use rk_vfs::cred::Cred;
 use rk_vfs::file::File;
 use rk_vfs::inode::Result;
 use rk_vfs::security::{
-    BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
-    id,
+    self, BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks,
+    Task, id,
 };
 
 /// The hooks of AppArmor. Each profile acts in complain mode, so each hook allows the
@@ -43,8 +45,7 @@ struct AppArmor;
 
 impl SecurityHooks for AppArmor {
     fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {
-        domain::bprm_creds_for_exec(bprm);
-        Ok(())
+        domain::bprm_creds_for_exec(bprm)
     }
 
     fn file_alloc_security(&self, f: &File) {
@@ -71,8 +72,26 @@ impl SecurityHooks for AppArmor {
         Ok(())
     }
 
+    fn getselfattr(&self, attr: u64, task: &Task<'_>) -> Result<Vec<u8>> {
+        domain::getselfattr(attr, task)
+    }
+
+    fn setselfattr(&self, attr: u64, ctx: &[u8], _flags: u64) -> Result<()> {
+        if attr != security::attr::CURRENT && attr != security::attr::EXEC {
+            return Err(rk_abi::Errno::EOPNOTSUPP);
+        }
+        task::setattr(attr, ctx).map(|_| ())
+    }
+
     fn getprocattr(&self, task: &Task<'_>, name: &str) -> Option<Result<Vec<u8>>> {
         Some(domain::getprocattr(task, name))
+    }
+
+    fn setprocattr(&self, name: &str, value: &[u8]) -> Option<Result<usize>> {
+        Some(match task::attr_of_name(name) {
+            security::attr::UNDEF => Err(rk_abi::Errno::EINVAL),
+            attr => task::setattr(attr, value),
+        })
     }
 }
 

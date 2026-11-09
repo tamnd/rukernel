@@ -62,12 +62,14 @@ pub struct Profile {
     /// The rules, from the unpack of the policy. A profile that the load made for a missing
     /// parent of a hat has no rules, as a profile with `FLAG_NULL` of Linux.
     pub rules: Option<Box<Unpacked>>,
+    /// The profile is a hat, `FLAG_HAT` of Linux. A task can change to it with `change_hat`.
+    pub hat: bool,
 }
 
 impl Profile {
     /// A profile for a missing parent, as `aa_alloc_null` of Linux. It is in complain mode.
-    fn null(name: &str) -> Self {
-        Self { name: String::from(name), mode: Mode::Complain, rules: None }
+    fn null(name: &str, hat: bool) -> Self {
+        Self { name: String::from(name), mode: Mode::Complain, rules: None, hat }
     }
 
     /// The name of the parent, if the profile is a hat or a child profile.
@@ -128,16 +130,16 @@ impl Ns {
         self.profiles.lock().iter().filter(|p| p.parent() == parent).cloned().collect()
     }
 
-    /// The learning profile of `parent` for the program `base`, as `aa_new_learning_profile`
-    /// of Linux: `PARENT//null-BASE` in complain mode with no rules. A profile with this name
-    /// that is there comes back.
-    pub fn learning(&self, parent: &Profile, base: &str) -> Arc<Profile> {
+    /// The learning profile of `parent` for the program or the hat `base`, as
+    /// `aa_new_learning_profile` of Linux: `PARENT//null-BASE` in complain mode with no rules.
+    /// `hat` tells if it is a hat. A profile with this name that is there comes back.
+    pub fn learning(&self, parent: &Profile, hat: bool, base: &str) -> Arc<Profile> {
         let name = format!("{}//null-{base}", parent.name);
         let mut list = self.profiles.lock();
         if let Some(p) = list.iter().find(|p| p.name == name) {
             return p.clone();
         }
-        let p = Arc::new(Profile::null(&name));
+        let p = Arc::new(Profile::null(&name, hat));
         list.insert(0, p.clone());
         p
     }
@@ -299,11 +301,12 @@ pub fn replace(ns: &Ns, change: Change, data: &[u8]) -> core::result::Result<usi
         let mut parent = parent_of(&p.name);
         while let Some(name) = parent {
             if !list.iter().any(|q| q.name == name) {
-                list.insert(0, Arc::new(Profile::null(name)));
+                list.insert(0, Arc::new(Profile::null(name, false)));
             }
             parent = parent_of(name);
         }
-        let new = Arc::new(Profile { name: p.name.clone(), mode: p.mode, rules: Some(p) });
+        let hat = p.hat;
+        let new = Arc::new(Profile { name: p.name.clone(), mode: p.mode, rules: Some(p), hat });
         let old = list.iter().position(|q| q.name == new.name);
         let op = if old.is_some() { Change::Replace } else { Change::Load };
         status(op.op(), None, Some(&new.name));
@@ -411,7 +414,7 @@ mod tests {
         {
             let mut l = ns.profiles.lock();
             for n in ["b//x", "a", "b", "a//y", "a//y//z"] {
-                l.insert(0, Arc::new(Profile::null(n)));
+                l.insert(0, Arc::new(Profile::null(n, false)));
             }
         }
         let order: Vec<String> = ns.profiles().iter().map(|p| p.name.clone()).collect();

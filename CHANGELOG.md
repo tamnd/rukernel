@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- A task can change its AppArmor label, as procattr.c and domain.c of Linux. A write to `/proc/PID/attr/current` takes `changehat`, `permhat`, `changeprofile` and `permprofile`, and a write to `/proc/PID/attr/exec` takes `exec`, the label for the next `execve`. `lsm_set_self_attr` takes the same commands, and `lsm_get_self_attr` gives the current label, the label before a hat and the label for the next exec. A hat keeps the label before it with a token, and a wrong token kills the task. In complain mode, a missing hat or profile gives a learning profile `PARENT//null-NAME`. The kernel log gets the records of Linux. `/proc/PID/attr/prev` and `/proc/PID/attr/exec` give EINVAL when there is no label, as on Linux (#540)
+
 ### Fixed
 
 - The `systemd` boot test and the tests of the `systemd` tree boot with `systemd.firstboot=no`, so systemd-firstboot.service does not ask on the console for the settings that the tree does not have. The tree of Arch has no time zone, so its boot stopped at the question of the time zone (#543).
