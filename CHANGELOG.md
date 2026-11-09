@@ -7,9 +7,13 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The kselftest boot test runs `test_core` and `test_cpuset` of the cgroup selftests. tools/kselftest/build.sh builds them with cgroup/lib/cgroup_util.c, and the init script of the test mounts cgroup2 at /sys/fs/cgroup with `nsdelegate`, as systemd mounts it (#536).
+- The kselftest boot test runs `test_freezer` and `test_kill` of the cgroup selftests (#536).
 
 ### Fixed
 
+- A thread that a signal or a tracer stopped, or that waits for its `vfork` child, counts as frozen in its cgroup, as `cgroup_enter_frozen` in `do_signal_stop`, `ptrace_stop` and `wait_for_vfork_done` of Linux. A thread that moves to another cgroup in such a wait moves its count. A stop of the group or a request of `PTRACE_INTERRUPT` ends the wait in the freezer, and the thread takes the stop, as `JOBCTL_PENDING_MASK` ends the freezer trap of Linux. Before, a freeze of a cgroup with a stopped, traced or `vfork` thread did not end, and `test_freezer` of the cgroup kselftests failed (#536).
+- A change of `cgroup.events` and of the other files with events of cgroup2 sends `IN_MODIFY` to the inotify marks of the file, as `kernfs_notify` of Linux. A write of `cgroup.freeze` in a cgroup that a cgroup above it keeps frozen also tells an event, as `cgroup_freeze` of Linux, so that a reader does not wait for a change that does not come (#536).
+- The scheduler does not call the notice function of rk-cgroup, because that function now sends inotify events, which must not run in the scheduler. As `kernfs_notify` of Linux defers its work, a change of a file with events that comes from a CPU charge waits for the next call outside the scheduler (#536).
 - `/proc/PID/task/TID/cgroup` shows the cgroup of the thread `TID`, as `proc_cgroup_show` of Linux. In a threaded subtree, a thread can be in another cgroup than its process. Before, the file showed the cgroup of the process, and `test_cgcore_thread_migration` failed (#536).
 
 ## [0.5.18] - 2026-11-09

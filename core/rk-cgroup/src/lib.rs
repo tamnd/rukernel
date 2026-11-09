@@ -1058,11 +1058,16 @@ impl Hierarchy {
         self.nr_freeze > 0
     }
 
-    /// Counts a thread of `id` that starts (`on` true) or stops waiting in the freezer.
+    /// Counts a thread of `id` that starts (`on` true) or stops waiting in the freezer, or in a
+    /// stop of a signal or of a tracer. When no cgroup freezes, `frozen` of `cgroup.events` does
+    /// not change, so `refresh_events` has no work. A write of `cgroup.freeze` makes it compute
+    /// the values again with the counts.
     pub fn thread_frozen(&mut self, id: CgId, on: bool) {
         if let Some(n) = self.nodes.get_mut(&id) {
             n.nr_frozen = if on { n.nr_frozen + 1 } else { n.nr_frozen.saturating_sub(1) };
-            self.dirty = true;
+            if self.nr_freeze > 0 {
+                self.dirty = true;
+            }
         }
     }
 
@@ -1904,6 +1909,14 @@ impl Hierarchy {
                     self.nr_freeze -= 1;
                 }
                 self.dirty = true;
+                // When a cgroup above has `cgroup.freeze` 1, the state of the subtree does not
+                // change. `cgroup.events` tells the change all the same, as `cgroup_freeze` of
+                // Linux, so that a reader does not wait for a change that does not come.
+                let locked = self.path_ids(id).iter().skip(1).any(|i| self.nodes[i].freeze);
+                if locked && let Some(n) = self.nodes.get_mut(&id) {
+                    n.ev_seq += 1;
+                    self.shared.notify.store(true, Ordering::SeqCst);
+                }
                 return Ok(Effect::Freeze);
             }
             "cgroup.max.depth" => {
@@ -2244,10 +2257,19 @@ pub fn with<R>(f: impl FnOnce(&mut Hierarchy) -> R) -> R {
         ANY_QUOTA.store(h.any_quota, Ordering::Relaxed);
         (r, h.take_notify())
     };
-    if notify && let Some(f) = *NOTIFY.lock() {
-        f();
+    if notify {
+        call_notify();
     }
     r
+}
+
+/// Calls the function of [`set_notify`]. The lock of `NOTIFY` is free during the call, so the
+/// function can call [`with`].
+fn call_notify() {
+    let f = *NOTIFY.lock();
+    if let Some(f) = f {
+        f();
+    }
 }
 
 /// The state that the hot paths share with the hierarchy. It does not change after the first
@@ -2265,6 +2287,22 @@ fn shared() -> &'static Shared {
 /// takes the lock of the hierarchy only if `f` tells that the tree must change. Gives `None` if
 /// `id` is not a cgroup.
 fn with_counters<R>(id: CgId, f: impl FnOnce(&Counters, &Shared) -> (R, Changed)) -> Option<R> {
+    counters(id, true, f)
+}
+
+/// [`with_counters`] for the scheduler: a change of a file with events waits for the next call
+/// that can tell it. The function of [`set_notify`] wakes tasks and sends inotify events, and the
+/// scheduler must not do that.
+fn sched_counters<R>(id: CgId, f: impl FnOnce(&Counters, &Shared) -> (R, Changed)) -> Option<R> {
+    counters(id, false, f)
+}
+
+/// [`with_counters`], which calls the function of [`set_notify`] only if `notify` is set.
+fn counters<R>(
+    id: CgId,
+    notify: bool,
+    f: impl FnOnce(&Counters, &Shared) -> (R, Changed),
+) -> Option<R> {
     let sh = shared();
     let (r, changed) = {
         let map = sh.map.read();
@@ -2279,11 +2317,8 @@ fn with_counters<R>(id: CgId, f: impl FnOnce(&Counters, &Shared) -> (R, Changed)
     if changed.reap {
         with(|h| h.reap(id));
     }
-    if sh.notify.load(Ordering::Relaxed)
-        && sh.notify.swap(false, Ordering::SeqCst)
-        && let Some(f) = *NOTIFY.lock()
-    {
-        f();
+    if notify && sh.notify.load(Ordering::Relaxed) && sh.notify.swap(false, Ordering::SeqCst) {
+        call_notify();
     }
     Some(r)
 }
@@ -2443,7 +2478,7 @@ pub fn uncharge_page(id: CgId) {
 pub fn charge_cpu(id: CgId, ns: u64) {
     if id != 0 {
         let now = now();
-        with_counters(id, |c, _| (c.charge_cpu(ns, now), Changed::default()));
+        sched_counters(id, |c, _| (c.charge_cpu(ns, now), Changed::default()));
     }
 }
 
@@ -2472,7 +2507,7 @@ pub fn throttled_until(id: CgId) -> Option<u64> {
         return None;
     }
     let now = now();
-    with_counters(id, |c, _| (c.throttled_until(now), Changed::default())).flatten()
+    sched_counters(id, |c, _| (c.throttled_until(now), Changed::default())).flatten()
 }
 
 /// The factor of the weight of a thread of `id`, in units of `WEIGHT_UNIT`.
@@ -2480,7 +2515,7 @@ pub fn weight_factor(id: CgId) -> u64 {
     if id == ROOT {
         return WEIGHT_UNIT;
     }
-    with_counters(id, |c, _| (c.weight_factor(), Changed::default())).unwrap_or(WEIGHT_UNIT)
+    sched_counters(id, |c, _| (c.weight_factor(), Changed::default())).unwrap_or(WEIGHT_UNIT)
 }
 
 /// Tells if `id` or a cgroup above it has `cgroup.freeze` 1, so its threads must freeze.
@@ -2500,7 +2535,7 @@ pub fn any_limit() -> bool {
 pub fn psi_change(id: CgId, f: impl Fn(&mut psi::Counts)) {
     if id != 0 {
         let now = now();
-        with_counters(id, |c, _| (c.psi_change(now, &f), Changed::default()));
+        sched_counters(id, |c, _| (c.psi_change(now, &f), Changed::default()));
     }
 }
 

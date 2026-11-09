@@ -93,9 +93,12 @@ fn moved(threads: &[Arc<Thread>], to: CgId) {
     // A thread that waits in a frozen cgroup checks the state of its new cgroup, and a thread
     // that moves to a frozen cgroup stops its wait to freeze, as `cgroup_freezer_migrate_task`
     // of Linux.
+    // A stopped or traced thread, or a thread that waits for its `vfork` child, moves its
+    // frozen count, as `stopped` tells.
     THAW.wake_all();
-    if rk_cgroup::frozen(to) {
-        for t in threads {
+    let frozen = rk_cgroup::frozen(to);
+    for t in threads {
+        if frozen || t.process().is_stopped() || t.is_traced() || t.in_vfork_wait() {
             t.wake();
         }
     }
@@ -165,26 +168,56 @@ pub fn freeze_changed(id: CgId) {
 /// Keeps `thread` waiting while its cgroup is frozen or over a limit, before the return to user
 /// mode: `wait_frozen` and then `wait_throttled`. When no cgroup is frozen, over `memory.high` or
 /// has a CPU quota, and the thread has no wait for `io.max`, this returns after a few loads.
-pub fn wait_limits(thread: &Thread) {
+/// Gives true if a stop ended the wait in the freezer, as `wait_frozen` tells.
+pub fn wait_limits(thread: &Thread) -> bool {
     if !rk_cgroup::any_limit() && !thread.has_io_delay() {
-        return;
+        return false;
     }
-    wait_frozen(thread);
+    if wait_frozen(thread) {
+        return true;
+    }
     wait_throttled(thread);
+    false
 }
 
 /// Keeps `thread` waiting while its cgroup is frozen, as the freezer of Linux
 /// (`do_freezer_trap`). The thread counts as frozen in its cgroup while it waits, so that
-/// `cgroup.events` tells when the whole cgroup is frozen. A kill ends the wait.
-pub fn wait_frozen(thread: &Thread) {
+/// `cgroup.events` tells when the whole cgroup is frozen. A kill ends the wait. A stop of the
+/// group or a request of `PTRACE_INTERRUPT` ends it too, as `JOBCTL_PENDING_MASK` ends the trap
+/// of Linux. Gives true then, and the caller must take the stop before the thread returns to
+/// user mode. The thread counts as frozen in that stop too, and comes back here after it.
+pub fn wait_frozen(thread: &Thread) -> bool {
+    let stop = || thread.process().is_stopped() || thread.stop_requested();
     let mut cg = thread.cgroup();
     while !thread.is_killed() && rk_cgroup::frozen(cg) {
+        if stop() {
+            return true;
+        }
         rk_cgroup::with(|h| h.thread_frozen(cg, true));
         THAW.wait_until(|| {
-            (thread.is_killed() || thread.cgroup() != cg || !rk_cgroup::frozen(cg)).then_some(())
+            (thread.is_killed() || thread.cgroup() != cg || !rk_cgroup::frozen(cg) || stop())
+                .then_some(())
         });
         rk_cgroup::with(|h| h.thread_frozen(cg, false));
         cg = thread.cgroup();
+    }
+    false
+}
+
+/// Runs the wait `wait` of a stopped or traced `thread`. The thread counts as frozen in its
+/// cgroup during the wait, as `cgroup_enter_frozen` and `cgroup_leave_frozen` of Linux around
+/// the stops of `do_signal_stop` and `ptrace_stop`: a stopped thread does not run user code, so
+/// a freeze does not wait for it. `wait` gets the cgroup of the count. It gives `None` if the
+/// thread moved to another cgroup, and then the count moves and the wait starts again.
+pub(crate) fn stopped<R>(thread: &Thread, mut wait: impl FnMut(CgId) -> Option<R>) -> R {
+    loop {
+        let cg = thread.cgroup();
+        rk_cgroup::with(|h| h.thread_frozen(cg, true));
+        let r = wait(cg);
+        rk_cgroup::with(|h| h.thread_frozen(cg, false));
+        if let Some(r) = r {
+            return r;
+        }
     }
 }
 

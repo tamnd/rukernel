@@ -533,17 +533,24 @@ pub fn stop(
         });
         tracer
     };
-    notify_tracer(&tracer, thread.tid(), CLD_TRAPPED, (sig & 0x7f) as i32);
+    // The thread counts as frozen in its cgroup during the stop, as `ptrace_stop` of Linux. The
+    // count comes before the tracer knows of the stop, so that the tracer sees it.
     let queue = WaitQueue::new();
-    queue.wait_until(|| {
-        if thread.is_killed() {
-            return Some(());
+    let mut tracer = Some(tracer);
+    crate::cgroup::stopped(thread, |cg| {
+        if let Some(tracer) = tracer.take() {
+            notify_tracer(&tracer, thread.tid(), CLD_TRAPPED, (sig & 0x7f) as i32);
         }
-        let pt = thread.ptrace.lock();
-        match pt.as_ref().and_then(|p| p.stop) {
-            Some(s) if s.resume.is_none() => None,
-            _ => Some(()),
-        }
+        queue.wait_until(|| {
+            if thread.is_killed() {
+                return Some(Some(()));
+            }
+            let pt = thread.ptrace.lock();
+            match pt.as_ref().and_then(|p| p.stop) {
+                Some(s) if s.resume.is_none() => (thread.cgroup() != cg).then_some(None),
+                _ => Some(Some(())),
+            }
+        })
     });
     let stop = {
         let mut guard = thread.ptrace.lock();

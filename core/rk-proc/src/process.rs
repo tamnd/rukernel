@@ -319,6 +319,8 @@ pub struct Thread {
     ptraced: AtomicBool,
     /// The parent of a `vfork` child waits on this.
     vfork_done: SpinLock<Option<Arc<VforkDone>>>,
+    /// The thread waits for its `vfork` child, in [`VforkDone::wait`].
+    vfork_wait: AtomicBool,
     /// The call that `restart_syscall` continues.
     restart: SpinLock<Option<Restart>>,
     /// The user CPU time of the thread in whole timer ticks.
@@ -422,9 +424,22 @@ impl VforkDone {
         Arc::new(Self { done: AtomicBool::new(false), wait: WaitQueue::new() })
     }
 
-    /// Waits until the child calls `execve` or ends.
-    pub fn wait(&self) {
-        self.wait.wait_until(|| self.done.load(Ordering::Acquire).then_some(()));
+    /// Makes `parent` wait until the child calls `execve` or ends. The parent counts as frozen
+    /// in its cgroup during the wait, as `cgroup_enter_frozen` in `wait_for_vfork_done` of Linux:
+    /// the parent does not run user code until the child lets it continue, so a freeze does not
+    /// wait for it.
+    pub fn wait(&self, parent: &Thread) {
+        parent.vfork_wait.store(true, Ordering::Release);
+        crate::cgroup::stopped(parent, |cg| {
+            self.wait.wait_until(|| {
+                if self.done.load(Ordering::Acquire) {
+                    Some(Some(()))
+                } else {
+                    (parent.cgroup() != cg).then_some(None)
+                }
+            })
+        });
+        parent.vfork_wait.store(false, Ordering::Release);
     }
 
     fn complete(&self) {
@@ -1764,10 +1779,29 @@ impl Thread {
     /// Waits while the process is stopped. The wait ends when `SIGCONT` continues the process,
     /// the group exits or a tracer traces the thread. A traced thread stops for its tracer
     /// instead.
+    /// The thread counts as frozen in its cgroup during the wait.
     pub fn wait_while_stopped(&self) {
-        self.process.stop_wait.wait_until(|| {
-            (!self.process.is_stopped() || self.is_killed() || self.is_traced()).then_some(())
+        let done = || !self.process.is_stopped() || self.is_killed() || self.is_traced();
+        if done() {
+            return;
+        }
+        crate::cgroup::stopped(self, |cg| {
+            self.process.stop_wait.wait_until(|| {
+                if done() { Some(Some(())) } else { (self.cgroup() != cg).then_some(None) }
+            })
         });
+    }
+
+    /// Tells if the thread waits for its `vfork` child.
+    pub(crate) fn in_vfork_wait(&self) -> bool {
+        self.vfork_wait.load(Ordering::Acquire)
+    }
+
+    /// Tells if the traced thread must stop for its tracer: a stop of the group that it did not
+    /// take, or a request of `PTRACE_INTERRUPT`.
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.is_traced()
+            && (self.group_stop.load(Ordering::Acquire) != 0 || self.interrupt_pending())
     }
 
     /// Takes the signal of the group stop that the traced thread did not take yet.
@@ -1931,6 +1965,7 @@ impl Thread {
             signal_work: AtomicBool::new(true),
             ptraced: AtomicBool::new(false),
             vfork_done: SpinLock::new(None),
+            vfork_wait: AtomicBool::new(false),
             restart: SpinLock::new(None),
             user_ticks: AtomicU64::new(0),
             user_rest: AtomicU64::new(0),
