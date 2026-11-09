@@ -378,6 +378,8 @@ pub fn init() {
     // limit takes its clean cache back. The charged cache of all cgroups stays below a quarter
     // of the memory.
     rk_cgroup::set_reclaim(rk_vfs::blockdev::reclaim_memcg);
+    // A long populate waits for `memory.high` after each batch of pages.
+    rk_mm::set_populate_hook(rk_proc::cgroup::populate_wait);
     rk_vfs::blockdev::set_memcg_ops(rk_vfs::blockdev::MemcgOps {
         current: || rk_proc::current_thread().map_or(0, |t| t.process().memcg()),
         charge: rk_cgroup::charge_file,

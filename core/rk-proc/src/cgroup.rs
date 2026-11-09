@@ -251,6 +251,18 @@ fn wait_over_high(thread: &Thread, cg: CgId) {
     rk_cgroup::psi_change(cg, |c| c.memstall = c.memstall.saturating_sub(1));
 }
 
+/// Keeps the current thread waiting for `memory.high` in the middle of a long populate in the
+/// kernel, as `try_charge_memcg` of Linux calls `mem_cgroup_handle_over_high` after a batch of
+/// pages over the limit. Without it, a single `mlock` of many pages goes up to `memory.max` before
+/// the wait at the return to user mode. Gives false if the thread has a kill.
+pub fn populate_wait() -> bool {
+    let Some(thread) = crate::current_thread() else { return true };
+    if rk_cgroup::any_limit() {
+        wait_over_high(&thread, thread.cgroup());
+    }
+    !thread.is_killed()
+}
+
 /// Charges an I/O of the current thread to its cgroup, for `io.stat`. Kernel work goes to the
 /// root. The delay of `io.max` waits until the thread goes back to user mode, so the thread does
 /// not wait with the locks of a file system. The block layer calls this after each batch, with

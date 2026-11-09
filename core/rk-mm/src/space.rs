@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
 use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
-use rk_frame::sync::SpinLock;
+use rk_frame::sync::{Once, SpinLock};
 #[cfg(not(feature = "corten"))]
 use rk_frame::vm::ForkArea;
 use rk_frame::vm::{HUGE_PAGE_SIZE, MapError, PageProt, USER_END, UserFault, VmSpace};
@@ -975,7 +975,14 @@ impl AddressSpace {
     /// write gets a frame of its own, so that a later write does not copy it.
     fn populate(&self, start: usize, end: usize) -> Result<(), Errno> {
         let mut at = start;
+        let mut pages = 0;
         while at < end {
+            // A long populate in one system call waits for `memory.high` after each batch, and
+            // stops at a kill.
+            pages += 1;
+            if pages % POPULATE_BATCH == 0 && POPULATE_HOOK.get().is_some_and(|hook| !hook()) {
+                return Err(Errno::EINTR);
+            }
             let (access, step) = match self.with_area(at, |v| v.map(|v| (v.prot, v.hugetlb, v.end)))
             {
                 Some((prot, _, end)) if !prot.write && !prot.read && !prot.exec => {
@@ -2279,6 +2286,22 @@ fn only_enomem(r: Result<(), Errno>) -> Result<(), Errno> {
         Err(Errno::ENOMEM) => Err(Errno::ENOMEM),
         _ => Ok(()),
     }
+}
+
+/// The pages of a populate between two calls of the hook of [`set_populate_hook`], as
+/// `MEMCG_CHARGE_BATCH` of Linux.
+const POPULATE_BATCH: usize = 64;
+
+/// The hook of [`set_populate_hook`].
+static POPULATE_HOOK: Once<fn() -> bool> = Once::new();
+
+/// Sets the function that a populate of many pages (`mlock`, `MAP_POPULATE`, `MAP_LOCKED`) calls
+/// after each batch of pages. The function keeps the thread waiting while its memory cgroup is
+/// over `memory.high`, as `try_charge_memcg` of Linux calls `mem_cgroup_handle_over_high` when a
+/// task charged more than `MEMCG_CHARGE_BATCH` pages over the limit in one entry to the kernel.
+/// It gives false if the thread has a kill, and then the populate stops.
+pub fn set_populate_hook(hook: fn() -> bool) {
+    POPULATE_HOOK.call_once(|| hook);
 }
 
 /// Tells if `vma` allows `access`.
