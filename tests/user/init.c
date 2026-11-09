@@ -15522,7 +15522,9 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
 /*
  * The program of the AppArmor exec checks, as /usr/bin/rk-test and /tmp/rk-sub. It writes its
  * label from /proc/self/attr/current to stdout. With the argument "sub", it then runs
- * /tmp/rk-sub with the same stdout.
+ * /tmp/rk-sub with the same stdout. With the argument "files", it does the file operations
+ * that the file checks log: an open with a create in /tmp, an exclusive lock of that file, an
+ * open of /etc/rk_test.aa, an executable map of it and an open of the directory /usr/bin.
  */
 static int aa_label_helper(int argc, char **argv)
 {
@@ -15535,6 +15537,20 @@ static int aa_label_helper(int argc, char **argv)
 	if (argc > 1 && strcmp(argv[1], "sub") == 0) {
 		execv("/tmp/rk-sub", args);
 		return 1;
+	}
+	if (argc > 1 && strcmp(argv[1], "files") == 0) {
+		int w = open("/tmp/rk-aa-w", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		int r = open("/etc/rk_test.aa", O_RDONLY);
+		int d = open("/usr/bin", O_RDONLY | O_DIRECTORY);
+		void *m = r >= 0 ? mmap(NULL, 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, r, 0) : MAP_FAILED;
+		int ok = w >= 0 && r >= 0 && d >= 0 && m != MAP_FAILED && flock(w, LOCK_EX) == 0 && write(w, "x", 1) == 1;
+
+		if (m != MAP_FAILED)
+			munmap(m, 4096);
+		close(w);
+		close(r);
+		close(d);
+		return n > 0 && ok ? 0 : 1;
 	}
 	return n > 0 ? 0 : 1;
 }
@@ -15671,14 +15687,34 @@ static void test_apparmor(void)
 		n = aa_run(two, buf, 256);
 		check("apparmor: an exec without a rule gives a learning profile", n > 0 && strcmp(buf, "rk_test (complain)\nrk_test//null-/tmp/rk-sub (complain)\n") == 0);
 	}
+	{
+		char *three[] = { "rk-test", "files", NULL };
+
+		check("apparmor: the file operations of rk_test work", aa_run(three, buf, 256) == 19);
+	}
 	check("apparmor: the label of init stays unconfined", aa_read("/proc/self/attr/current", buf, 64) == 11 && strcmp(buf, "unconfined\n") == 0);
 	check("apparmor: profiles lists the learning profile", aa_read("/sys/kernel/security/apparmor/profiles", buf, 256) > 0 && strstr(buf, "rk_test (complain)\n") != NULL && strstr(buf, "rk_test//hat1 (enforce)\n") != NULL && strstr(buf, "rk_test//null-/tmp/rk-sub (complain)\n") != NULL);
 	n = klogctl(3, buf, sizeof(buf) - 1);
 	buf[n > 0 ? n : 0] = 0;
 	check("apparmor: the kernel log has the exec of the learning profile, as on Linux", n > 0 && strstr(buf, "apparmor=\"ALLOWED\" operation=\"exec\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-sub\" pid=") != NULL && strstr(buf, " requested_mask=\"x\" denied_mask=\"x\" fsuid=0 ouid=0 target=\"rk_test//null-/tmp/rk-sub\"") != NULL);
+	check("apparmor: the kernel log has the open that the rules do not allow, as on Linux", strstr(buf, "apparmor=\"ALLOWED\" operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL);
+	{
+		char *p = strstr(buf, "operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=");
+		char *e = p ? strchr(p, '\n') : NULL;
+
+		if (e)
+			*e = 0;
+		check("apparmor: the open has the masks and the owners", p != NULL && strstr(p, " requested_mask=\"r\" denied_mask=\"r\" fsuid=0 ouid=0") != NULL);
+		if (e)
+			*e = '\n';
+	}
+	check("apparmor: the kernel log has the lock and the map, as on Linux", strstr(buf, "operation=\"file_lock\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "operation=\"file_mmap\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, " requested_mask=\"k\" denied_mask=\"k\"") != NULL && strstr(buf, " requested_mask=\"rm\" denied_mask=\"rm\"") != NULL);
+	check("apparmor: the name of a directory ends with a slash", strstr(buf, "operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/usr/bin/\" pid=") != NULL);
+	check("apparmor: an open that the rules allow has no record", strstr(buf, "name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\"") == NULL);
 	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
 	unlink("/usr/bin/rk-test");
 	unlink("/tmp/rk-sub");
+	unlink("/tmp/rk-aa-w");
 	umount("/proc");
 	fd = open("/sys/kernel/security/apparmor/.load", O_WRONLY);
 	check("apparmor: a load at an offset that is not 0 gives ESPIPE", fd >= 0 && pwrite(fd, "x", 1, 1) < 0 && errno == ESPIPE);

@@ -417,8 +417,10 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
-    /// `file_open`: `file` is opened, after the permission checks of the VFS.
-    fn file_open(&self, file: &File, cred: &Cred) -> Result<()> {
+    /// `file_open`: `file` is opened, after the permission checks of the VFS. `flags` are the
+    /// flags of the open call, with `O_CREAT` and `O_TRUNC`, as `f_flags` in `do_dentry_open`
+    /// of Linux.
+    fn file_open(&self, file: &File, cred: &Cred, flags: u32) -> Result<()> {
         Ok(())
     }
 

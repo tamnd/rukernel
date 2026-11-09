@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - Each file of /proc/sys can go in an epoll set, as `proc_sys_poll` of Linux. A change of the host name or of the NIS domain name gives `POLLPRI` and `POLLERR` on /proc/sys/kernel/hostname or /proc/sys/kernel/domainname, as `uts_proc_notify` of Linux. systemd-journald of systemd 261 and 262 stopped with "Failed to register hostname fd in event loop" before (#543).
+- AppArmor checks the open files with the file rules of the profiles, as file.c of Linux: an open, a read, a write, an `flock` and an `mmap`. The name of a file is its path from the root, with a `/` at the end for a directory. An open file keeps the label of its task and the permissions that the rules checked, so a read or a write checks the rules again only for a new label or a new permission. In complain mode, an operation that the rules do not allow goes on, and the kernel log gets an `apparmor="ALLOWED"` record with the masks, as on Linux. The `file_open` hook gets the flags of the open call, with `O_CREAT` and `O_TRUNC` (#540)
 
 ### Fixed
 

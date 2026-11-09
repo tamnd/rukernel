@@ -58,12 +58,22 @@ fn intern(name: &str) -> u64 {
     i
 }
 
-/// The profile of `cred`, `aa_get_newest_cred_label` of Linux. `None` is `unconfined`.
-pub fn profile_of(cred: &Cred) -> Option<Arc<Profile>> {
-    let i = cred.security.load(cred_offset()?);
-    let i = usize::try_from(i).ok()?.checked_sub(1)?;
+/// The number of the label of `cred`. 0 is `unconfined`.
+pub fn label_id(cred: &Cred) -> u64 {
+    cred_offset().map_or(0, |off| cred.security.load(off))
+}
+
+/// The newest profile of the label number `id`, `aa_get_newest_label` of Linux. `None` is
+/// `unconfined`.
+pub fn profile_by_id(id: u64) -> Option<Arc<Profile>> {
+    let i = usize::try_from(id).ok()?.checked_sub(1)?;
     let name = NAMES.lock().names.get(i)?.clone();
     ROOT.lookup(&name)
+}
+
+/// The profile of `cred`, `aa_get_newest_cred_label` of Linux. `None` is `unconfined`.
+pub fn profile_of(cred: &Cred) -> Option<Arc<Profile>> {
+    profile_by_id(label_id(cred))
 }
 
 /// Sets the profile of `cred`, `set_cred_label` of Linux. `None` is `unconfined`.
