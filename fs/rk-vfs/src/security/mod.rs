@@ -436,8 +436,8 @@ pub fn file_fcntl(file: &File, cmd: u32, arg: u64) -> Result<()> {
 }
 
 /// `security_file_open`.
-pub fn file_open(file: &File, cred: &Cred) -> Result<()> {
-    call_int_hook!(file_open, file, cred)
+pub fn file_open(file: &File, cred: &Cred, flags: u32) -> Result<()> {
+    call_int_hook!(file_open, file, cred, flags)
 }
 
 /// `security_task_alloc`.

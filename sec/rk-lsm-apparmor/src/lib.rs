@@ -4,8 +4,8 @@
 //! profiles through the files of `/sys/kernel/security/apparmor`. This crate has the module and
 //! its files ([`fs`]), the features that the kernel tells the compiler ([`features`]), the
 //! unpack of the binary policy ([`unpack`]) with its DFA tables ([`dfa`]), the policy namespace
-//! that holds the profiles ([`policy`]), the audit records ([`audit`]) and the label of a task
-//! with its change at an exec ([`domain`]).
+//! that holds the profiles ([`policy`]), the audit records ([`audit`]), the label of a task
+//! with its change at an exec ([`domain`]) and the checks of the open files ([`file`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -21,6 +21,7 @@ pub mod audit;
 pub mod dfa;
 pub mod domain;
 pub mod features;
+pub mod file;
 pub mod fs;
 pub mod policy;
 pub mod unpack;
@@ -28,6 +29,8 @@ pub mod unpack;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use rk_vfs::cred::Cred;
+use rk_vfs::file::File;
 use rk_vfs::inode::Result;
 use rk_vfs::security::{
     BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks, Task,
@@ -44,6 +47,30 @@ impl SecurityHooks for AppArmor {
         Ok(())
     }
 
+    fn file_alloc_security(&self, f: &File) {
+        file::file_alloc(f);
+    }
+
+    fn file_open(&self, f: &File, cred: &Cred, flags: u32) -> Result<()> {
+        file::file_open(f, cred, flags);
+        Ok(())
+    }
+
+    fn file_permission(&self, f: &File, mask: u32) -> Result<()> {
+        file::file_perm(file::op::FPERM, f, mask);
+        Ok(())
+    }
+
+    fn file_lock(&self, f: &File, cmd: u32) -> Result<()> {
+        file::file_lock(f, cmd);
+        Ok(())
+    }
+
+    fn mmap_file(&self, f: Option<&File>, _reqprot: u64, prot: u64, flags: u64) -> Result<()> {
+        file::mmap_file(f, prot, flags);
+        Ok(())
+    }
+
     fn getprocattr(&self, task: &Task<'_>, name: &str) -> Option<Result<Vec<u8>>> {
         Some(domain::getprocattr(task, name))
     }
@@ -56,7 +83,7 @@ pub static LSM: LsmInfo = LsmInfo {
     id: LsmId { name: "apparmor", id: id::APPARMOR },
     order: Order::Mutable,
     flags: FLAG_LEGACY_MAJOR | FLAG_EXCLUSIVE,
-    blobs: BlobSizes { cred: domain::CRED_BLOB, ..BlobSizes::NONE },
+    blobs: BlobSizes { cred: domain::CRED_BLOB, file: file::FILE_BLOB, ..BlobSizes::NONE },
     hooks: &AppArmor,
 };
 

@@ -417,7 +417,7 @@ impl FsContext {
         let file = self.open_file(at, flags, created)?;
         // As `security_file_open` in `do_dentry_open` of Linux. A file of `O_PATH` has no check.
         if !file.flags().is_path()
-            && let Err(e) = crate::security::file_open(&file, &self.cred)
+            && let Err(e) = crate::security::file_open(&file, &self.cred, flags)
         {
             file.set_nonotify();
             return Err(e);
