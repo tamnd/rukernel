@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.18] - 2026-11-09
+
 ### Added
 
 - A task can change its AppArmor label, as procattr.c and domain.c of Linux. A write to `/proc/PID/attr/current` takes `changehat`, `permhat`, `changeprofile` and `permprofile`, and a write to `/proc/PID/attr/exec` takes `exec`, the label for the next `execve`. `lsm_set_self_attr` takes the same commands, and `lsm_get_self_attr` gives the current label, the label before a hat and the label for the next exec. A hat keeps the label before it with a token, and a wrong token kills the task. In complain mode, a missing hat or profile gives a learning profile `PARENT//null-NAME`. The kernel log gets the records of Linux. `/proc/PID/attr/prev` and `/proc/PID/attr/exec` give EINVAL when there is no label, as on Linux (#540)
@@ -1516,6 +1518,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.18]: https://github.com/tamnd/rukernel/compare/v0.5.17...v0.5.18
 [0.5.17]: https://github.com/tamnd/rukernel/compare/v0.5.16...v0.5.17
 [0.5.16]: https://github.com/tamnd/rukernel/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/tamnd/rukernel/compare/v0.5.14...v0.5.15
