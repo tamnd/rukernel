@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- A kill of the processes of a cgroup with `memory.oom.group` counts the victim again in `oom_kill` of `memory.events`, as `oom_kill_memcg_member` of Linux kills each process of the group, the victim too. It also counts a process that is on its way out. Before, the count was one less than on Linux, and `test_memcg_oom_group_score_events` of the cgroup kselftests failed (#536).
+
 ## [0.5.20] - 2026-11-11
 
 ### Added
