@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - Each file of /proc/sys can go in an epoll set, as `proc_sys_poll` of Linux. A change of the host name or of the NIS domain name gives `POLLPRI` and `POLLERR` on /proc/sys/kernel/hostname or /proc/sys/kernel/domainname, as `uts_proc_notify` of Linux. systemd-journald of systemd 261 and 262 stopped with "Failed to register hostname fd in event loop" before (#543).
 
+### Fixed
+
+- `fcntl` record locks, `lockf` and `flock` work on a socket, as on Linux, where each file has an inode. They gave `EBADF` before. systemd locks a socket with `lockf` to keep the namespace of `PrivateNetwork=`, so e2scrub_reap.service of Ubuntu 26.10 failed with status 225/NETWORK (#543).
+
 ## [0.5.16] - 2026-11-09
 
 ### Added
@@ -33,7 +37,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
-- `fcntl` record locks, `lockf` and `flock` work on a socket, as on Linux, where each file has an inode. They gave `EBADF` before. systemd locks a socket with `lockf` to keep the namespace of `PrivateNetwork=`, so e2scrub_reap.service of Ubuntu 26.10 failed with status 225/NETWORK (#543).
 
 ## [0.5.14] - 2026-11-08
 
