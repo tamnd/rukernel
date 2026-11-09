@@ -1901,10 +1901,109 @@ fn qemu_program(name: &str) -> PathBuf {
     }
 }
 
+/// The TPM device of QEMU for the x86-64 machine: the Command Response Buffer interface. QEMU
+/// gives its address in the ACPI `TPM2` table.
+const X86_TPM_DEVICE: &str = "tpm-crb";
+
+/// The TPM device of QEMU for the arm64 `virt` machine: the FIFO interface of the TCG PC Client
+/// specification on the platform bus. QEMU adds a device tree node with the compatible string
+/// `tcg,tpm-tis-mmio` for it.
+const AARCH64_TPM_DEVICE: &str = "tpm-tis-device";
+
+/// Tells if the machine of each boot test and of `cargo xtask qemu` has a TPM 2.0. `RK_TPM=1` asks
+/// for it.
+fn tpm_wanted() -> bool {
+    std::env::var("RK_TPM").is_ok_and(|v| v == "1")
+}
+
+/// A TPM 2.0 for one QEMU machine: a swtpm process that QEMU connects to through the socket of
+/// its control channel, as `-tpmdev emulator` needs. The state of the TPM is new for each machine,
+/// so each boot finds a TPM that was never started. `RK_SWTPM` gives the path of a different swtpm
+/// program. The drop stops the process and removes the state.
+struct Swtpm {
+    child: std::process::Child,
+    dir: PathBuf,
+}
+
+impl Swtpm {
+    /// Starts swtpm with its state in the new directory `dir`, and adds the TPM to the QEMU command
+    /// `cmd` as the device `device`.
+    fn attach(cmd: &mut Command, dir: PathBuf, device: &str) -> Result<Self> {
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let sock = dir.join("swtpm.sock");
+        let program = std::env::var_os("RK_SWTPM").map_or(PathBuf::from("swtpm"), PathBuf::from);
+        // QEMU sends the init command of the control channel at the start of the machine, and
+        // `--terminate` stops swtpm when QEMU closes the channel.
+        let child = Command::new(&program)
+            .args(["socket", "--tpm2", "--terminate"])
+            .arg("--tpmstate")
+            .arg(format!("dir={}", dir.display()))
+            .arg("--ctrl")
+            .arg(format!("type=unixio,path={}", sock.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("cannot run {}: {e}, set RK_SWTPM", program.display()))?;
+        let mut tpm = Self { child, dir };
+        let start = Instant::now();
+        while !sock.exists() {
+            if let Some(status) = tpm.child.try_wait().map_err(|e| e.to_string())? {
+                return Err(format!("swtpm exited with {status} before it made its socket"));
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err(String::from("swtpm did not make its socket in 10 s"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cmd.arg("-chardev")
+            .arg(format!("socket,id=chrtpm,path={}", sock.display()))
+            .args(["-tpmdev", "emulator,id=tpm0,chardev=chrtpm"])
+            .args(["-device", &format!("{device},tpmdev=tpm0")]);
+        Ok(tpm)
+    }
+
+    /// Adds a TPM to the QEMU command `cmd` if `tpm_wanted` tells so, with its state in `dir`.
+    fn attach_if_wanted(cmd: &mut Command, dir: PathBuf, device: &str) -> Result<Option<Self>> {
+        if tpm_wanted() { Self::attach(cmd, dir, device).map(Some) } else { Ok(None) }
+    }
+}
+
+impl Drop for Swtpm {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The physical address of the initramfs of an x86-64 machine with a TPM. The kernel image ends
+/// below it.
+const INITRD_ADDRESS: u64 = 64 << 20;
+
+/// Adds the kernel argument `arg` to the command line `cmdline`, before the arguments of init
+/// after `--`.
+fn with_kernel_arg(cmdline: &str, arg: &str) -> String {
+    match cmdline.split_once(" -- ") {
+        Some((kernel, init)) => format!("{kernel} {arg} -- {init}"),
+        None => format!("{cmdline} {arg}"),
+    }
+}
+
 /// The QEMU command for the x86-64 kernel with the initramfs `initrd`. The machine has one CPU, or
 /// the number of CPUs in `RK_SMP`. The `smp` boot test has `SMP_CPUS` CPUs. Without KVM, the CPU
 /// model is `max`, or the model in `RK_QEMU_CPU`, for example `max,-x2apic`.
 fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
+    qemu_command_for(kernel, initrd, cmdline, tpm_wanted())
+}
+
+/// Makes the QEMU command of `qemu_command_with`. With `loader`, the machine gets the initramfs
+/// at `INITRD_ADDRESS` from `-device loader`, and the kernel finds it from `initrdmem=` on the
+/// command line, as Linux does. A machine with a TPM that starts with SeaBIOS needs this: QEMU
+/// 8.2 puts the initramfs of `-initrd` over a part of the ACPI tables. `x86_load_linux` puts the
+/// end of the initramfs 160 KiB below the top of the memory under 4 GiB, but SeaBIOS puts the
+/// 128 KiB of the ACPI tables and the 64 KiB of the TPM log there.
+fn qemu_command_for(kernel: &Path, initrd: &Path, cmdline: &str, loader: bool) -> Command {
     let smp = if cmdline.ends_with("-- smp") {
         String::from(SMP_CPUS)
     } else {
@@ -1915,10 +2014,24 @@ fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
         .args(["-serial", "stdio", "-no-reboot", "-monitor", "none"])
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
         .arg("-kernel")
-        .arg(kernel)
-        .arg("-initrd")
-        .arg(initrd)
-        .args(["-append", cmdline]);
+        .arg(kernel);
+    match fs::metadata(initrd) {
+        Ok(m) if loader => {
+            cmd.arg("-device")
+                .arg(format!(
+                    "loader,file={},addr={INITRD_ADDRESS:#x},force-raw=on",
+                    initrd.display()
+                ))
+                .arg("-append")
+                .arg(with_kernel_arg(
+                    cmdline,
+                    &format!("initrdmem={INITRD_ADDRESS:#x},{}", m.len()),
+                ));
+        }
+        _ => {
+            cmd.arg("-initrd").arg(initrd).args(["-append", cmdline]);
+        }
+    }
     if fs::OpenOptions::new().read(true).write(true).open("/dev/kvm").is_ok() {
         cmd.args(["-accel", "kvm", "-cpu", "host"]);
     } else {
@@ -1931,9 +2044,9 @@ fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
 fn qemu(args: &[String]) -> Result {
     let kernel = build_kernel()?;
     let cmdline = if args.is_empty() { String::from("console=ttyS0") } else { args.join(" ") };
-    let status = qemu_command(&kernel, &cmdline)
-        .status()
-        .map_err(|e| format!("cannot run qemu-system-x86_64: {e}"))?;
+    let mut cmd = qemu_command(&kernel, &cmdline);
+    let _tpm = Swtpm::attach_if_wanted(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE)?;
+    let status = cmd.status().map_err(|e| format!("cannot run qemu-system-x86_64: {e}"))?;
     println!("qemu exited with {status}");
     Ok(())
 }
@@ -2030,10 +2143,7 @@ impl TcpServer {
 fn test_cmdline(test: &str) -> String {
     let base = base_cmdline(test);
     let Ok(extra) = std::env::var("RK_CMDLINE") else { return base };
-    match base.split_once(" -- ") {
-        Some((kernel, init)) => format!("{kernel} {extra} -- {init}"),
-        None => format!("{base} {extra}"),
-    }
+    with_kernel_arg(&base, &extra)
 }
 
 /// The command line of a boot test without `RK_CMDLINE`. The `tty` test runs init with the
@@ -2507,6 +2617,8 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .arg(format!("if=none,id=disk2,format=raw,cache=unsafe,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk2"]);
         }
+        let _tpm =
+            Swtpm::attach_if_wanted(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE)?;
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
         let want = if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
             QEMU_POWER_OFF
@@ -2548,7 +2660,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
     let bzimage = build_bzimage()?;
     for test in BZIMAGE_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
         let cmdline = test_cmdline(test);
-        let cmd = qemu_command(&bzimage, &cmdline);
+        let mut cmd = qemu_command(&bzimage, &cmdline);
+        let _tpm =
+            Swtpm::attach_if_wanted(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE)?;
         let (status, log) = run_with_timeout(cmd, self_test_timeout(&cmdline), test_input(test))?;
         let passed = status == Some(QEMU_PASS)
             && log.contains("booting with linux")
@@ -2564,9 +2678,14 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         Some(firmware) => {
             for test in BZIMAGE_TESTS.iter().filter(named).filter(|t| can_run(&kernel, t)) {
                 let cmdline = test_cmdline(test);
-                let mut cmd = qemu_command(&bzimage, &cmdline);
+                let initrd = kernel.with_file_name("initramfs.cpio");
+                // The EFI firmware puts the ACPI tables and the initramfs in memory that it
+                // allocates, so `-initrd` is correct with a TPM.
+                let mut cmd = qemu_command_for(&bzimage, &initrd, &cmdline, false);
                 cmd.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", firmware.display()));
+                let dir = kernel.with_file_name("swtpm");
+                let _tpm = Swtpm::attach_if_wanted(&mut cmd, dir, X86_TPM_DEVICE)?;
                 let (status, log) =
                     run_with_timeout(cmd, self_test_timeout(&cmdline), test_input(test))?;
                 let passed = status == Some(QEMU_PASS)
@@ -2824,6 +2943,8 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         let timeout =
             if user_tests.contains(test) { AARCH64_USER_TIMEOUT } else { BOOT_TEST_TIMEOUT };
         let input = if *test == "busybox" { AARCH64_BUSYBOX_INPUT } else { test_input(test) };
+        let dir = elf_path.with_file_name("swtpm");
+        let _tpm = Swtpm::attach_if_wanted(&mut cmd, dir, AARCH64_TPM_DEVICE)?;
         let (status, log) = run_with_timeout(cmd, timeout, input)?;
         let mut passed = status == Some(0)
             && log.contains("aarch64 booting with linux")

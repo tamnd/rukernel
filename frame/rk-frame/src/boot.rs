@@ -202,10 +202,45 @@ impl BootInfo {
         }
     }
 
+    /// Records the initramfs of `initrdmem=ADDRESS,SIZE` on the command line, if the boot
+    /// protocol gave no initramfs, as `early_initrdmem` of Linux. The boot loader or QEMU (with
+    /// `-device loader`) put it in memory at the address. The numbers have the form of `memparse`:
+    /// decimal or `0x` hexadecimal, with an optional `K`, `M` or `G`.
+    pub fn initrd_from_cmdline(&mut self) {
+        if self.initrd.is_some() {
+            return;
+        }
+        let Some(arg) = self.cmdline().split(' ').find_map(|w| w.strip_prefix("initrdmem=")) else {
+            return;
+        };
+        if let Some((start, len)) = arg.split_once(',')
+            && let (Some(start), Some(len)) = (memparse(start), memparse(len))
+            && start.checked_add(len).is_some()
+        {
+            self.set_initrd(PhysAddr::new(start), len);
+        }
+    }
+
     /// The number of bytes of usable memory in the map.
     pub fn usable_bytes(&self) -> u64 {
         self.memory().iter().filter(|r| r.kind == MemoryKind::Usable).map(|r| r.len).sum()
     }
+}
+
+/// Reads a number as `memparse` of Linux: decimal or `0x` hexadecimal, with an optional `K`,
+/// `M` or `G`.
+fn memparse(s: &str) -> Option<u64> {
+    let (digits, shift) = match s.as_bytes().last()? {
+        b'K' | b'k' => (&s[..s.len() - 1], 10),
+        b'M' | b'm' => (&s[..s.len() - 1], 20),
+        b'G' | b'g' => (&s[..s.len() - 1], 30),
+        _ => (s, 0),
+    };
+    let n = match digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok()?,
+        None => digits.parse().ok()?,
+    };
+    n.checked_mul(1 << shift)
 }
 
 // Only x86-64 and arm64 have an entry point now. riscv64 gets one later.
@@ -281,6 +316,40 @@ mod tests {
         info.push_region(PhysAddr::new(0x200000), 0, MemoryKind::Usable);
         assert_eq!(info.memory().len(), 3);
         assert_eq!(info.usable_bytes(), 0x9f000 + 0x7ff00000);
+    }
+
+    #[test]
+    fn initrdmem_gives_the_initramfs() {
+        let mut info = BootInfo::new("test");
+        for b in b"console=ttyS0 initrdmem=0x4000000,1614696 rk.test=init" {
+            info.push_cmdline_byte(*b);
+        }
+        info.initrd_from_cmdline();
+        assert_eq!(info.initrd(), Some((PhysAddr::new(0x400_0000), 1_614_696)));
+        // The initramfs of the boot protocol comes first.
+        let mut info = BootInfo::new("test");
+        for b in b"initrdmem=64M,4K" {
+            info.push_cmdline_byte(*b);
+        }
+        info.initrd_from_cmdline();
+        assert_eq!(info.initrd(), Some((PhysAddr::new(64 << 20), 4096)));
+        info.set_initrd(PhysAddr::new(0x1000), 1);
+        info.initrd_from_cmdline();
+        assert_eq!(info.initrd(), Some((PhysAddr::new(0x1000), 1)));
+        // A bad value gives no initramfs.
+        for bad in
+            ["initrdmem=0x10", "initrdmem=x,1", "initrdmem=1,", "initrdmem=0xffffffffffffffff,2"]
+        {
+            let mut info = BootInfo::new("test");
+            for b in bad.as_bytes() {
+                info.push_cmdline_byte(*b);
+            }
+            info.initrd_from_cmdline();
+            assert_eq!(info.initrd(), None, "{bad}");
+        }
+        assert_eq!(memparse("1G"), Some(1 << 30));
+        assert_eq!(memparse("0x20k"), Some(32 << 10));
+        assert_eq!(memparse(""), None);
     }
 
     #[test]

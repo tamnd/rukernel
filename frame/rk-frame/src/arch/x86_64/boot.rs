@@ -601,13 +601,14 @@ const BOOT_IDENTITY_LIMIT: u64 = 1 << 30;
 extern "C" fn rk_frame_x86_64_entry(boot: u64, protocol: u32) -> ! {
     super::serial::init();
     super::init_cpu();
-    let info = if protocol == PROTOCOL_LINUX {
+    let mut info = if protocol == PROTOCOL_LINUX {
         super::boot_params::read(boot)
     } else {
         let mut info = BootInfo::new("pvh");
         read_start_info(boot, &mut info);
         info
     };
+    info.initrd_from_cmdline();
     crate::mm::frame::init(&info, super::paging::kernel_phys());
     super::paging::init(&info);
     super::apic::init();
