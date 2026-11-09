@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.17] - 2026-11-09
+
 ### Added
 
 - Each file of /proc/sys can go in an epoll set, as `proc_sys_poll` of Linux. A change of the host name or of the NIS domain name gives `POLLPRI` and `POLLERR` on /proc/sys/kernel/hostname or /proc/sys/kernel/domainname, as `uts_proc_notify` of Linux. systemd-journald of systemd 261 and 262 stopped with "Failed to register hostname fd in event loop" before (#543).
@@ -1503,6 +1505,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.17]: https://github.com/tamnd/rukernel/compare/v0.5.16...v0.5.17
 [0.5.16]: https://github.com/tamnd/rukernel/compare/v0.5.15...v0.5.16
 [0.5.15]: https://github.com/tamnd/rukernel/compare/v0.5.14...v0.5.15
 [0.5.14]: https://github.com/tamnd/rukernel/compare/v0.5.13...v0.5.14
