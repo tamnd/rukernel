@@ -42,6 +42,8 @@ pub mod sync;
 pub mod task;
 #[cfg(target_os = "none")]
 pub mod time;
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub mod tpm;
 #[cfg(target_os = "none")]
 pub mod trap;
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]

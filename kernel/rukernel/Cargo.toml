@@ -21,6 +21,7 @@ rk-bpf.workspace = true
 rk-drv-mem.workspace = true
 rk-drv-virtio.workspace = true
 rk-drv-tty.workspace = true
+rk-drv-tpm.workspace = true
 rk-frame.workspace = true
 rk-fs-proc.workspace = true
 rk-fs-sys.workspace = true

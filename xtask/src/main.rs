@@ -448,6 +448,7 @@ const BOOT_TESTS: &[&str] = &[
     "blk",
     "apparmor",
     "net",
+    "tpm",
     "inet",
     "netcfg",
     "inet6",
@@ -1919,6 +1920,12 @@ fn tpm_wanted() -> bool {
     std::env::var("RK_TPM").is_ok_and(|v| v == "1")
 }
 
+/// Tells if the machine of the boot test `test` gets a TPM: with `RK_TPM=1`, and always for the
+/// `tpm` test.
+fn tpm_for(test: &str) -> bool {
+    tpm_wanted() || test == "tpm"
+}
+
 /// A TPM 2.0 for one QEMU machine: a swtpm process that QEMU connects to through the socket of
 /// its control channel, as `-tpmdev emulator` needs. The state of the TPM is new for each machine,
 /// so each boot finds a TPM that was never started. `RK_SWTPM` gives the path of a different swtpm
@@ -1966,9 +1973,15 @@ impl Swtpm {
         Ok(tpm)
     }
 
-    /// Adds a TPM to the QEMU command `cmd` if `tpm_wanted` tells so, with its state in `dir`.
-    fn attach_if_wanted(cmd: &mut Command, dir: PathBuf, device: &str) -> Result<Option<Self>> {
-        if tpm_wanted() { Self::attach(cmd, dir, device).map(Some) } else { Ok(None) }
+    /// Adds a TPM to the QEMU command `cmd` if `tpm_for` tells so for the boot test `test`, with
+    /// its state in `dir`.
+    fn attach_for(
+        cmd: &mut Command,
+        dir: PathBuf,
+        device: &str,
+        test: &str,
+    ) -> Result<Option<Self>> {
+        if tpm_for(test) { Self::attach(cmd, dir, device).map(Some) } else { Ok(None) }
     }
 }
 
@@ -1997,7 +2010,8 @@ fn with_kernel_arg(cmdline: &str, arg: &str) -> String {
 /// the number of CPUs in `RK_SMP`. The `smp` boot test has `SMP_CPUS` CPUs. Without KVM, the CPU
 /// model is `max`, or the model in `RK_QEMU_CPU`, for example `max,-x2apic`.
 fn qemu_command_with(kernel: &Path, initrd: &Path, cmdline: &str) -> Command {
-    qemu_command_for(kernel, initrd, cmdline, tpm_wanted())
+    let test = cmdline.split(' ').find_map(|w| w.strip_prefix("rk.test=")).unwrap_or("");
+    qemu_command_for(kernel, initrd, cmdline, tpm_for(test))
 }
 
 /// Makes the QEMU command of `qemu_command_with`. With `loader`, the machine gets the initramfs
@@ -2048,7 +2062,7 @@ fn qemu(args: &[String]) -> Result {
     let kernel = build_kernel()?;
     let cmdline = if args.is_empty() { String::from("console=ttyS0") } else { args.join(" ") };
     let mut cmd = qemu_command(&kernel, &cmdline);
-    let _tpm = Swtpm::attach_if_wanted(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE)?;
+    let _tpm = Swtpm::attach_for(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE, "")?;
     let status = cmd.status().map_err(|e| format!("cannot run qemu-system-x86_64: {e}"))?;
     println!("qemu exited with {status}");
     Ok(())
@@ -2621,7 +2635,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .args(["-device", "virtio-blk-pci,drive=disk2"]);
         }
         let _tpm =
-            Swtpm::attach_if_wanted(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE)?;
+            Swtpm::attach_for(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE, test)?;
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
         let want = if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
             QEMU_POWER_OFF
@@ -2665,7 +2679,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         let cmdline = test_cmdline(test);
         let mut cmd = qemu_command(&bzimage, &cmdline);
         let _tpm =
-            Swtpm::attach_if_wanted(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE)?;
+            Swtpm::attach_for(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE, test)?;
         let (status, log) = run_with_timeout(cmd, self_test_timeout(&cmdline), test_input(test))?;
         let passed = status == Some(QEMU_PASS)
             && log.contains("booting with linux")
@@ -2688,7 +2702,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 cmd.arg("-drive")
                     .arg(format!("if=pflash,format=raw,readonly=on,file={}", firmware.display()));
                 let dir = kernel.with_file_name("swtpm");
-                let _tpm = Swtpm::attach_if_wanted(&mut cmd, dir, X86_TPM_DEVICE)?;
+                let _tpm = Swtpm::attach_for(&mut cmd, dir, X86_TPM_DEVICE, test)?;
                 let (status, log) =
                     run_with_timeout(cmd, self_test_timeout(&cmdline), test_input(test))?;
                 let passed = status == Some(QEMU_PASS)
@@ -2712,7 +2726,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
 /// The `boot` test shows the first console line and starts `AARCH64_SMP_CPUS` CPUs, and the
 /// `timer` test waits for timer ticks.
 const AARCH64_TESTS: &[&str] =
-    &["boot", "trap", "mm", "heap", "timer", "task", "syscall", "vm", "fault"];
+    &["boot", "trap", "mm", "heap", "timer", "task", "syscall", "vm", "fault", "tpm"];
 
 /// The tests that `boot-test aarch64` runs with the user programs of tests/user in the initramfs,
 /// as the x86-64 tests of the same names. They need `find_user_cc_aarch64`. The `busybox` test
@@ -2947,7 +2961,7 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             if user_tests.contains(test) { AARCH64_USER_TIMEOUT } else { BOOT_TEST_TIMEOUT };
         let input = if *test == "busybox" { AARCH64_BUSYBOX_INPUT } else { test_input(test) };
         let dir = elf_path.with_file_name("swtpm");
-        let _tpm = Swtpm::attach_if_wanted(&mut cmd, dir, AARCH64_TPM_DEVICE)?;
+        let _tpm = Swtpm::attach_for(&mut cmd, dir, AARCH64_TPM_DEVICE, test)?;
         let (status, log) = run_with_timeout(cmd, timeout, input)?;
         let mut passed = status == Some(0)
             && log.contains("aarch64 booting with linux")

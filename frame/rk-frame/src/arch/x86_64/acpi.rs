@@ -1,4 +1,5 @@
-//! The ACPI tables that the kernel reads: the MADT, for the local APIC ID of each CPU.
+//! The ACPI tables that the kernel reads: the MADT, for the local APIC ID of each CPU, and the
+//! `TPM2` table, for the TPM.
 //!
 //! The RSDP points to the RSDT or the XSDT, which point to the other tables. The kernel reads the
 //! tables through the direct map. A table that is not in the direct map is not read.
@@ -84,4 +85,20 @@ pub(crate) fn local_apic_ids(ids: &mut [u32]) -> usize {
         at += u64::from(len);
     }
     n
+}
+
+/// The offsets in the `TPM2` table of the address of the CRB control area and of the start method,
+/// after the header and the platform class.
+const TPM2_CONTROL_AREA: u64 = 40;
+const TPM2_START_METHOD: u64 = 48;
+
+/// Gives the address of the CRB control area and the start method of the `TPM2` table, as
+/// `crb_acpi_add` of Linux reads them. A machine without the table gives `None`.
+pub(crate) fn tpm2() -> Option<(u64, u32)> {
+    let table = find_table(b"TPM2")?;
+    let header = read::<Header>(table)?;
+    if u64::from(header.length) < TPM2_START_METHOD + 4 {
+        return None;
+    }
+    Some((read::<u64>(table + TPM2_CONTROL_AREA)?, read::<u32>(table + TPM2_START_METHOD)?))
 }

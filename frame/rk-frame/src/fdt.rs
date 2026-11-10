@@ -108,6 +108,9 @@ pub(crate) struct Platform {
     pub(crate) virtio_mmio: [(u64, u64, Option<Irq>); MAX_VIRTIO_MMIO],
     /// The number of devices in `virtio_mmio`.
     pub(crate) virtio_mmio_count: usize,
+    /// The physical address and the size of the registers of a TPM with the FIFO interface
+    /// (`tcg,tpm-tis-mmio`).
+    pub(crate) tpm_tis: Option<(u64, u64)>,
 }
 
 impl Default for Platform {
@@ -132,6 +135,7 @@ impl Default for Platform {
             cpu_count: 0,
             virtio_mmio: [(0, 0, None); MAX_VIRTIO_MMIO],
             virtio_mmio_count: 0,
+            tpm_tis: None,
         }
     }
 }
@@ -214,6 +218,8 @@ impl<'a> Node<'a> {
                     (r.0, r.1, gic_irq(self.interrupts, 0));
                 platform.virtio_mmio_count += 1;
             }
+        } else if self.is("tcg,tpm-tis-mmio") && platform.tpm_tis.is_none() {
+            platform.tpm_tis = first;
         } else if self.is("pci-host-ecam-generic") && platform.pci_ecam.is_none() {
             platform.pci_ecam = first;
             self.pci_windows(platform, addr_cells);
@@ -250,14 +256,43 @@ impl<'a> Node<'a> {
     }
 
     /// Keeps the device of this node at depth 2 in `platform`, if rk-frame drives it. `cells` are
-    /// the `#address-cells` and `#size-cells` of the parent.
-    fn finish_child(&self, platform: &mut Platform, cells: (u32, u32)) {
+    /// the `#address-cells` and `#size-cells` of the parent, `parent` is the parent, and
+    /// `root_cells` is the `#address-cells` of the root node.
+    fn finish_child(
+        &self,
+        platform: &mut Platform,
+        cells: (u32, u32),
+        parent: &Node<'_>,
+        root_cells: u32,
+    ) {
         if self.name.is_empty() || !self.enabled() {
             return;
         }
         if self.is("arm,gic-v3-its") && platform.gic_its.is_none() {
             platform.gic_its = self.reg(0, cells.0, cells.1).map(|r| r.0);
+        } else if self.is("tcg,tpm-tis-mmio") && platform.tpm_tis.is_none() && parent.enabled() {
+            // QEMU `virt` puts the TPM on its platform bus, a `simple-bus` with `ranges`.
+            platform.tpm_tis = self.reg(0, cells.0, cells.1).and_then(|(start, len)| {
+                Some((parent.translate(start, len, cells, root_cells)?, len))
+            });
         }
+    }
+
+    /// Gives the address of the parent bus for the address `start` of a child of this node, from
+    /// the `ranges` of this node. An entry has the child address in `bus.0`, the parent address in
+    /// `parent_cells` and the size in `bus.1`. An empty `ranges` maps each address to itself.
+    fn translate(&self, start: u64, len: u64, bus: (u32, u32), parent_cells: u32) -> Option<u64> {
+        if self.ranges.is_empty() {
+            return Some(start);
+        }
+        let stride = 4 * (bus.0 + parent_cells + bus.1) as usize;
+        (0..self.ranges.len()).step_by(stride.max(4)).find_map(|at| {
+            let child = cells(self.ranges, at, bus.0)?;
+            let parent = cells(self.ranges, at + 4 * bus.0 as usize, parent_cells)?;
+            let size = cells(self.ranges, at + 4 * (bus.0 + parent_cells) as usize, bus.1)?;
+            let off = start.checked_sub(child)?;
+            (off.checked_add(len)? <= size).then(|| parent.checked_add(off)).flatten()
+        })
     }
 
     /// Keeps the memory windows of the `ranges` of a PCI host. An entry has the PCI address in
@@ -478,13 +513,13 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
     let mut later = Later::default();
     walk(structs, strings, |depth, name, prop, value| {
         if depth == 1 && !core::ptr::eq(name, node.name) {
-            child.finish_child(&mut platform, child_cells);
+            child.finish_child(&mut platform, child_cells, &node, addr_cells);
             child = Node::default();
             node.finish(&mut platform, &mut later, addr_cells, size_cells);
             node = Node { name, ..Node::default() };
         }
         if depth == 2 && !core::ptr::eq(name, child.name) {
-            child.finish_child(&mut platform, child_cells);
+            child.finish_child(&mut platform, child_cells, &node, addr_cells);
             child = Node { name, ..Node::default() };
             // The properties of the parent come before its children.
             child_cells = (node.address_cells.unwrap_or(2), node.size_cells.unwrap_or(1));
@@ -548,7 +583,7 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
             _ => {}
         }
     })?;
-    child.finish_child(&mut platform, child_cells);
+    child.finish_child(&mut platform, child_cells, &node, addr_cells);
     node.finish(&mut platform, &mut later, addr_cells, size_cells);
     later.finish(&mut platform);
     if let (Some(start), Some(end)) = (initrd_start, initrd_end) {
@@ -855,6 +890,48 @@ mod tests {
         assert_eq!(p.gic_v3, Some((0x0800_0000, 0x080a_0000, 0xf6_0000)));
         assert_eq!(p.gic_its, Some(0x0808_0000));
         assert_eq!(p.pci_msi_map, Some((0, 0x100, 0x1_0000)));
+    }
+
+    #[test]
+    fn reads_a_tpm_on_the_platform_bus() {
+        let mut b = Builder::default();
+        b.begin("");
+        b.prop("#address-cells", &be(&[2]));
+        b.prop("#size-cells", &be(&[2]));
+        // The node of QEMU `virt` with `-device tpm-tis-device`.
+        b.begin("platform-bus@c000000");
+        b.prop("compatible", b"qemu,platform\0simple-bus\0");
+        b.prop("ranges", &be(&[0, 0, 0x0c00_0000, 0x0200_0000]));
+        b.prop("#address-cells", &be(&[1]));
+        b.prop("#size-cells", &be(&[1]));
+        b.begin("tpm_tis@0");
+        b.prop("reg", &be(&[0, 0x5000]));
+        b.prop("compatible", b"tcg,tpm-tis-mmio\0");
+        b.end();
+        b.end();
+        b.end();
+        let blob = b.finish(&[]);
+        let mut info = BootInfo::new("test");
+        let p = read(&blob, 0x5000_0000, &mut info).unwrap();
+        assert_eq!(p.tpm_tis, Some((0x0c00_0000, 0x5000)));
+
+        // A TPM at depth 1, and a TPM outside the ranges of its bus.
+        let mut b = Builder::default();
+        b.begin("");
+        b.prop("#address-cells", &be(&[2]));
+        b.prop("#size-cells", &be(&[2]));
+        b.begin("tpm@fed40000");
+        b.prop("compatible", b"tcg,tpm-tis-mmio\0");
+        b.prop("reg", &be(&[0, 0xfed4_0000, 0, 0x5000]));
+        b.end();
+        b.end();
+        let blob = b.finish(&[]);
+        let p = read(&blob, 0x5000_0000, &mut BootInfo::new("test")).unwrap();
+        assert_eq!(p.tpm_tis, Some((0xfed4_0000, 0x5000)));
+        let ranges = be(&[0, 0, 0x0c00_0000, 0x1_0000]);
+        let bus = Node { ranges: &ranges, ..Node::default() };
+        assert_eq!(bus.translate(0x800, 0x5000, (1, 1), 2), Some(0x0c00_0800));
+        assert_eq!(bus.translate(0xf000, 0x5000, (1, 1), 2), None);
     }
 
     #[test]

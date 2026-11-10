@@ -67,6 +67,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-drv-tpm"
+version = "0.5.18"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-drv-tty"
 version = "0.5.18"
 dependencies = [
@@ -292,6 +301,7 @@ dependencies = [
  "rk-bpf",
  "rk-cgroup",
  "rk-drv-mem",
+ "rk-drv-tpm",
  "rk-drv-tty",
  "rk-drv-virtio",
  "rk-frame",

@@ -62,6 +62,8 @@ QEMU loads the ELF image directly through the PVH entry note. The build also wri
 
 With `RK_TPM=1`, `cargo xtask qemu` and each boot test give the machine a TPM 2.0 from swtpm: `-tpmdev emulator` with `-device tpm-crb` on x86-64 and `-device tpm-tis-device` on the arm64 `virt` machine. Each machine gets a new swtpm process with a new state, in the directory `swtpm` next to the kernel. The process stops with the machine. `RK_SWTPM` gives the path of a different swtpm program. With a TPM, QEMU puts the initramfs of `-initrd` over a part of the ACPI tables of SeaBIOS. Thus the x86-64 machine gets the initramfs from `-device loader` at 64 MiB, and the kernel finds it from `initrdmem=ADDRESS,SIZE` on the command line, as Linux does.
 
+The `tpm` boot test always gives the machine a TPM, on x86-64 and on arm64. The kernel finds the CRB of the ACPI `TPM2` table on x86-64 and the `tcg,tpm-tis-mmio` node of the device tree on arm64, and rk-drv-tpm starts the TPM as Linux does. Then the test sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read` from the kernel. The test needs swtpm.
+
 The `init` and `tty` boot tests run the C programs in `tests/user`. The build compiles them with `musl-gcc` or `zig cc`, or with the command in `RK_USER_CC`. The `busybox` boot test runs the BusyBox shell as init. The shell runs a pipeline, and `^C` stops a job in the foreground. The first run downloads a static BusyBox from busybox.net and checks its SHA-256. `RK_BUSYBOX` gives the path of a different BusyBox. To use the shell yourself, run this command:
 
 ```
@@ -139,6 +141,7 @@ cargo xtask boot-test alpine
 | `core/rk-syscall/` | The system call table and the system calls of R1 |
 | `drv/rk-drv-mem/` | The memory devices: `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom` |
 | `drv/rk-drv-tty/` | The console tty on the serial port |
+| `drv/rk-drv-tpm/` | The TPM 2.0 driver: the CRB and the FIFO (TIS) interfaces |
 | `tests/user/` | The C test programs that run in user mode |
 | `xtask/` | The build checks |
 
