@@ -11,6 +11,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - A write of `memory.peak` starts a new peak for the open file only, as `peak_write` of Linux. A read of that open file shows the largest use after the write, and the other readers of `memory.peak` still see the largest use since the cgroup was made. Each other open file with a write gets the use now if it is larger than its value. Before, a write reset the peak of the cgroup for all readers, and `test_memcg_current_peak` of the cgroup kselftests failed. `memory.swap.peak` stays 0, because rukernel has no swap (#536).
+- A populate of many pages in one system call, as `mlock`, `MAP_POPULATE` and `MAP_LOCKED` do, waits for `memory.high` after each batch of 64 pages, as `try_charge_memcg` of Linux calls `mem_cgroup_handle_over_high`. A kill stops the populate. Before, the wait came only at the return to user mode, so one `mlock` of 200 MB in a cgroup with `memory.high` 30M went up to `memory.max` at once, and `test_memcg_high_sync` of the cgroup kselftests failed (#536).
 
 ## [0.5.19] - 2026-11-10
 
