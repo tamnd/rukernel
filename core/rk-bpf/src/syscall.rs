@@ -419,6 +419,10 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
     // The error of the log comes before the error of the verifier.
     bpf_log_attr_finalize(env, log_attr, &log)?;
     let v = r?;
+    // `bpf_check_tail_call` of Linux: a program can only use the program arrays of its type.
+    if v.used_maps.iter().filter_map(|m| m.ops.as_prog_array()).any(|a| !a.compatible(prog_type)) {
+        return Err(Errno::EINVAL);
+    }
     let tag = bpf_prog_calc_tag(&v.insns);
     let prog = BpfProg {
         prog_type,
@@ -663,7 +667,12 @@ fn map_update_elem(env: &dyn Env, attr: &BpfAttr) -> Result<i64> {
     let key = bpf_copy_key(env, attr.u64(map_elem::KEY), map.key_size)?;
     let mut value = kvzalloc(map.bpf_map_value_size(flags))?;
     env.copy_from_user(attr.u64(map_elem::VALUE), &mut value)?;
-    map.bpf_map_update_value(&key, &value, flags, env.map_env())?;
+    if let Some(progs) = map.ops.as_prog_array() {
+        // `bpf_fd_array_map_update_elem` of Linux: the value is the descriptor of a program.
+        progs.fd_update(&key, &value, flags, &|ufd| bpf_prog_get(env, ufd))?;
+    } else {
+        map.bpf_map_update_value(&key, &value, flags, env.map_env())?;
+    }
     Ok(0)
 }
 
@@ -792,7 +801,7 @@ fn bpf_prog_new_fd(env: &dyn Env, prog: Arc<BpfProg>) -> Result<i64> {
 
 /// A new descriptor of a map with the flags `f_flags`, `bpf_map_new_fd` of Linux.
 fn bpf_map_new_fd(env: &dyn Env, map: Arc<BpfMap>, f_flags: u32) -> Result<i64> {
-    let file = File::with_ops(Arc::new(BpfMapFile { map }), None, f_flags);
+    let file = File::with_ops(Arc::new(BpfMapFile::new(map)), None, f_flags);
     env.fd_install(file).map(i64::from)
 }
 

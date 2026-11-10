@@ -68,6 +68,8 @@ pub enum RetType {
     Integer,
     /// A value of the map of the first argument or NULL, `RET_PTR_TO_MAP_VALUE_OR_NULL`.
     PtrToMapValueOrNull,
+    /// No result, `RET_VOID`. R0 is not initialized after the call.
+    Void,
 }
 
 /// The proto of a helper, `struct bpf_func_proto` of Linux.
@@ -117,6 +119,8 @@ pub fn get_func_proto(prog_type: u32, func_id: i32, bpf_capable: bool) -> Option
         BPF_FUNC_map_lookup_elem => MAP_LOOKUP_ELEM,
         BPF_FUNC_map_update_elem => MAP_UPDATE_ELEM,
         BPF_FUNC_map_delete_elem => MAP_DELETE_ELEM,
+        // `bpf_tail_call_proto`. The interpreter runs the call, as `JMP_TAIL_CALL` of Linux.
+        BPF_FUNC_tail_call => proto("tail_call", Void, &[PtrToCtx, ConstMapPtr, Anything]),
         BPF_FUNC_get_prandom_u32 => proto("get_prandom_u32", Integer, &[]),
         BPF_FUNC_get_smp_processor_id => proto("get_smp_processor_id", Integer, &[]),
         BPF_FUNC_get_numa_node_id => proto("get_numa_node_id", Integer, &[]),

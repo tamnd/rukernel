@@ -6436,6 +6436,106 @@ static void test_bpf_interp(void)
 	close(map);
 }
 
+/*
+ * BPF_MAP_TYPE_PROG_ARRAY and bpf_tail_call: the socket filter does a tail call to the slot 0
+ * of the array. The program in the slot stores 0x55 in an array map. When the tail call fails,
+ * the caller continues and stores 0x77 (#537).
+ */
+static void test_bpf_tail_call(void)
+{
+	static char log[4096];
+	unsigned int index = 0, two = 2, fd, id = 0;
+	unsigned long long val = 0, zero = 0;
+	char buf[512];
+	int pa, cnt, callee, caller, sk[2], ok;
+
+	errno = 0;
+	ok = bpf_map_new(3, 4, 8, 2, 0) == -1 && errno == EINVAL;
+	check("a program array has values of 4 bytes", ok);
+	pa = bpf_map_new(3, 4, 4, 2, 0);
+	cnt = bpf_map_new(2, 4, 8, 1, 0);
+	unsigned long long callee_insns[] = {
+		bpf_insn(0x18, 1, 2, 0, cnt), 0,	/* r1 = the value of cnt */
+		bpf_insn(0x7a, 1, 0, 0, 0x55),		/* *(u64 *)r1 = 0x55 */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	unsigned long long insns[] = {
+		bpf_insn(0x18, 2, 1, 0, pa), 0,		/* r2 = the program array */
+		bpf_insn(0xb7, 3, 0, 0, 0),		/* r3 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 12),		/* bpf_tail_call(r1, r2, r3) */
+		bpf_insn(0x18, 1, 2, 0, cnt), 0,	/* r1 = the value of cnt */
+		bpf_insn(0x7a, 1, 0, 0, 0x77),		/* *(u64 *)r1 = 0x77 */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	callee = bpf_prog_new(callee_insns, 5, log, sizeof(log));
+	caller = bpf_prog_new(insns, 9, log, sizeof(log));
+	check("the verifier accepts bpf_tail_call with a program array",
+	      pa >= 0 && cnt >= 0 && callee >= 0 && caller >= 0);
+	ok = socketpair(AF_UNIX, SOCK_DGRAM, 0, sk) == 0 &&
+	     setsockopt(sk[1], SOL_SOCKET, SO_ATTACH_BPF, &caller, sizeof(caller)) == 0;
+	ok = ok && write(sk[0], "a", 1) == 1;
+	ok = ok && bpf_elem(1, cnt, &index, &val, 0) == 0 && val == 0x77;
+	check("a tail call to an empty slot continues", ok);
+
+	fd = callee;
+	errno = 0;
+	ok = bpf_elem(2, pa, &index, &fd, 1) == -1 && errno == EINVAL;
+	errno = 0;
+	ok = ok && bpf_elem(2, pa, &two, &fd, 0) == -1 && errno == E2BIG;
+	fd = cnt;
+	errno = 0;
+	ok = ok && bpf_elem(2, pa, &index, &fd, 0) == -1 && errno == EINVAL;
+	fd = 999;
+	errno = 0;
+	ok = ok && bpf_elem(2, pa, &index, &fd, 0) == -1 && errno == EBADF;
+	errno = 0;
+	ok = ok && bpf_elem(1, pa, &index, &id, 0) == -1 && errno == ENOENT;
+	check("the errors of the updates of a program array", ok);
+	fd = callee;
+	ok = bpf_elem(2, pa, &index, &fd, 0) == 0 && bpf_elem(1, pa, &index, &id, 0) == 0 &&
+	     id != 0;
+	snprintf(buf, 64, "/proc/self/fdinfo/%d", pa);
+	ok = ok && read_file(buf, buf, sizeof(buf)) > 0 && strstr(buf, "owner_prog_type:\t1\n");
+	check("a program array gives the ID of the program in a slot", ok);
+	ok = bpf_elem(2, cnt, &index, &zero, 0) == 0 && write(sk[0], "b", 1) == 1;
+	ok = ok && bpf_elem(1, cnt, &index, &val, 0) == 0 && val == 0x55;
+	check("a tail call runs the program in the slot", ok);
+	ok = bpf_elem(3, pa, &index, NULL, 0) == 0;
+	errno = 0;
+	ok = ok && bpf_elem(3, pa, &index, NULL, 0) == -1 && errno == ENOENT;
+	ok = ok && write(sk[0], "c", 1) == 1;
+	ok = ok && bpf_elem(1, cnt, &index, &val, 0) == 0 && val == 0x77;
+	check("a delete empties the slot of a program array", ok);
+
+	unsigned long long lookup[] = {
+		bpf_insn(0x18, 1, 1, 0, pa), 0,		/* r1 = the program array */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -8),		/* r2 += -8 */
+		bpf_insn(0x7a, 2, 0, 0, 0),		/* *(u64 *)r2 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 1),		/* r0 = map_lookup_elem(r1, r2) */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	errno = 0;
+	ok = bpf_prog_new(lookup, 8, log, sizeof(log)) == -1 && errno == EINVAL &&
+	     strstr(log, "cannot pass map_type 3 into func bpf_map_lookup_elem#1");
+	check("the verifier refuses a lookup in a program array", ok);
+
+	/* The last close of the array empties it, but the caller still uses the array. */
+	ok = bpf_elem(2, pa, &index, &fd, 0) == 0 && bpf_elem(2, cnt, &index, &zero, 0) == 0;
+	close(pa);
+	ok = ok && write(sk[0], "d", 1) == 1;
+	ok = ok && bpf_elem(1, cnt, &index, &val, 0) == 0 && val == 0x77;
+	check("the last close of a program array removes its programs", ok);
+	close(sk[0]);
+	close(sk[1]);
+	close(caller);
+	close(callee);
+	close(cnt);
+}
+
 /* A BPF_*_GET_NEXT_ID or BPF_*_GET_FD_BY_ID command: start_id or the ID, and open_flags. */
 static long bpf_id(int cmd, unsigned int id, unsigned int *next)
 {
@@ -7426,6 +7526,7 @@ static void test_bpf(void)
 	close(fd);
 	test_bpf_prog();
 	test_bpf_interp();
+	test_bpf_tail_call();
 	test_bpf_ids();
 	test_bpf_cgroup();
 	test_bpf_cgroup_hooks();

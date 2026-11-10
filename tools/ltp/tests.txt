@@ -50,6 +50,9 @@ bpf_prog01
 bpf_prog02
 bpf_prog03
 bpf_prog04
+bpf_prog05
+bpf_prog06
+bpf_prog07
 brk01
 brk02
 clock_gettime01

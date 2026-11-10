@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `BPF_MAP_TYPE_PROG_ARRAY` and the helper `bpf_tail_call`, as kernel/bpf/arraymap.c and `JMP_TAIL_CALL` of Linux. A system call writes the descriptor of a program to a slot and reads the ID of the program. All programs of an array and all programs that use it have one type. A tail call to an empty slot or to an index out of the array continues after the call, and a run does at most 33 tail calls. The last close of the array removes its programs. The verifier refuses a program array with another helper, a tail call with another map, and a tail call in a program with functions, with the messages of Linux. The `ltp` boot test also runs bpf_prog05, bpf_prog06 and bpf_prog07. They do not apply, as on Linux, because they drop `CAP_BPF` and `kernel.unprivileged_bpf_disabled` is 2 (#537).
+
 ### Fixed
 
 - A write of `memory.peak` starts a new peak for the open file only, as `peak_write` of Linux. A read of that open file shows the largest use after the write, and the other readers of `memory.peak` still see the largest use since the cgroup was made. Each other open file with a write gets the use now if it is larger than its value. Before, a write reset the peak of the cgroup for all readers, and `test_memcg_current_peak` of the cgroup kselftests failed. `memory.swap.peak` stays 0, because rukernel has no swap (#536).

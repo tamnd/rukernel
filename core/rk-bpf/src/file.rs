@@ -17,6 +17,22 @@ pub struct BpfMapFile {
     pub map: Arc<BpfMap>,
 }
 
+impl BpfMapFile {
+    /// Makes the file of a new descriptor of `map`. The descriptor counts in `usercnt`, as
+    /// `bpf_map_inc_with_uref` of Linux.
+    pub fn new(map: Arc<BpfMap>) -> Self {
+        map.inc_uref();
+        Self { map }
+    }
+}
+
+impl Drop for BpfMapFile {
+    /// The last close of the file, `bpf_map_release` of Linux.
+    fn drop(&mut self) {
+        self.map.put_uref();
+    }
+}
+
 /// The device of the anonymous inode, which all files of anon_inode_getfd of Linux share.
 fn anon_inode_dev() -> u64 {
     static DEV: Once<u64> = Once::new();
