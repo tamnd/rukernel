@@ -45,6 +45,10 @@ pub(crate) struct MemCounters {
     pub(crate) current: AtomicU64,
     /// The largest value of `current`: `memory.peak`.
     pub(crate) peak: AtomicU64,
+    /// The largest value of `current` after the last write of `memory.peak`, as
+    /// `local_watermark` of the page counter of Linux. An open file of `memory.peak` that had a
+    /// write shows this value.
+    pub(crate) local_peak: AtomicU64,
     /// `memory.high`.
     pub(crate) high: AtomicU64,
     /// `memory.max`.
@@ -205,6 +209,7 @@ impl Counters {
         for c in self.path() {
             let current = c.mem.current.load(Ordering::Relaxed);
             c.mem.peak.fetch_max(current, Ordering::Relaxed);
+            c.mem.local_peak.fetch_max(current, Ordering::Relaxed);
             Self::over_high(c, bytes, current, sh);
         }
         Ok(())
@@ -219,6 +224,7 @@ impl Counters {
             let current = c.mem.current.fetch_add(bytes, Ordering::SeqCst) + bytes;
             c.mem.file.fetch_add(bytes, Ordering::Relaxed);
             c.mem.peak.fetch_max(current, Ordering::Relaxed);
+            c.mem.local_peak.fetch_max(current, Ordering::Relaxed);
             let max = c.mem.max.load(Ordering::Relaxed);
             if c.on(MEMORY) && max != MAX && current > max {
                 over = Some(c.id);

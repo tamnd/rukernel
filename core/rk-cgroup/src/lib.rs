@@ -1858,6 +1858,17 @@ impl Hierarchy {
         Ok(out)
     }
 
+    /// The usage now and the local peak of `memory.peak` of `id`, or of `memory.swap.peak` if
+    /// `swap`, for an open file that had a write, as `peak_show` and `peak_write` of Linux.
+    pub fn local_peak(&self, id: CgId, swap: bool) -> Option<(u64, u64)> {
+        let m = &self.nodes.get(&id)?.c.mem;
+        Some(if swap {
+            (0, 0)
+        } else {
+            (m.current.load(Ordering::Relaxed), m.local_peak.load(Ordering::Relaxed))
+        })
+    }
+
     /// Writes `data` to the file `name` of `id` at the time `now`, and tells what the caller
     /// must do then. `cgroup.procs` and `cgroup.threads` need the processes, so rk-fs-cgroup
     /// writes them.
@@ -2027,10 +2038,15 @@ impl Hierarchy {
                 parse_bytes(data)?;
                 Effect::None
             }
-            "memory.peak" | "memory.swap.peak" => {
-                n.c.mem.peak.store(n.c.mem.current.load(Ordering::Relaxed), Ordering::Relaxed);
+            // A write starts a new local peak, as `peak_write` of Linux. The open file keeps
+            // the value, and `memory.peak` of the other readers does not change. rukernel has no
+            // swap, so `memory.swap.peak` stays 0.
+            "memory.peak" => {
+                let current = n.c.mem.current.load(Ordering::Relaxed);
+                n.c.mem.local_peak.store(current, Ordering::Relaxed);
                 Effect::None
             }
+            "memory.swap.peak" => Effect::None,
             "memory.oom.group" => {
                 n.mem.oom_group = match text(data)? {
                     "0" => false,
