@@ -64,6 +64,8 @@ With `RK_TPM=1`, `cargo xtask qemu` and each boot test give the machine a TPM 2.
 
 The `tpm` boot test always gives the machine a TPM, on x86-64 and on arm64. The kernel finds the CRB of the ACPI `TPM2` table on x86-64 and the `tcg,tpm-tis-mmio` node of the device tree on arm64, and rk-drv-tpm starts the TPM as Linux does. Then the test sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read` from the kernel. The test needs swtpm.
 
+The driver gives the TPM as `/dev/tpm0` (10:224), which takes one command at a time, and as `/sys/class/tpm/tpm0` with `dev`, `uevent`, `tpm_version_major` and `pcr-sha256`. `tools/tpm/build.sh target/tpm-tools` installs tpm2-tools from Alpine for x86-64 and for arm64 with docker. With that tree, or the tree that `RK_TPM_TOOLS` gives, the `tpm` boot test runs init after the checks of the kernel. Init runs `tpm2_getrandom 8` and `tpm2_pcrread sha256:0,7` on `/dev/tpm0`, and compares the PCRs with the files of `pcr-sha256`.
+
 The `init` and `tty` boot tests run the C programs in `tests/user`. The build compiles them with `musl-gcc` or `zig cc`, or with the command in `RK_USER_CC`. The `busybox` boot test runs the BusyBox shell as init. The shell runs a pipeline, and `^C` stops a job in the foreground. The first run downloads a static BusyBox from busybox.net and checks its SHA-256. `RK_BUSYBOX` gives the path of a different BusyBox. To use the shell yourself, run this command:
 
 ```

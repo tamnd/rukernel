@@ -5,11 +5,13 @@
 //! number to the table with `register_char`.
 //!
 //! The kernel also keeps a list of the devices with their names, as the device model of Linux
-//! does. devtmpfs makes a device file for each one, and sysfs shows each one.
+//! does. devtmpfs makes a device file for each one, and sysfs shows each one. A driver can give
+//! the devices of its class more files in sysfs with `set_class_attrs`.
 
 use crate::dentry::Location;
 use crate::file::FileOps;
 use crate::inode::Result;
+use crate::input::SysEntry;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -233,6 +235,27 @@ pub fn remove_device(block: bool, rdev: u64) {
     for d in &gone {
         crate::uevent::device(d, crate::uevent::Action::Remove, &[]);
     }
+}
+
+/// The function that gives the attributes of the devices of a class in sysfs, as the attribute
+/// groups of a class of Linux. It gives the entries of the directory `rest` below the directory
+/// of the device `d`, or `None` if there is no such directory. An empty `rest` is the directory
+/// of the device.
+pub type ClassAttrs = fn(d: &DeviceInfo, rest: &[&str]) -> Option<Vec<(String, SysEntry)>>;
+
+/// The attributes of the classes, by the name of the class.
+static CLASS_ATTRS: SpinLock<BTreeMap<&'static str, ClassAttrs>> = SpinLock::new(BTreeMap::new());
+
+/// Gives the devices of the class `class` the attributes of `attrs` in sysfs.
+pub fn set_class_attrs(class: &'static str, attrs: ClassAttrs) {
+    CLASS_ATTRS.lock().insert(class, attrs);
+}
+
+/// Gives the entries of the directory `rest` below the directory of the device `d` in sysfs,
+/// from the attributes of its class. Gives `None` if the class has no such directory.
+pub fn class_attrs(d: &DeviceInfo, rest: &[&str]) -> Option<Vec<(String, SysEntry)>> {
+    let attrs = *CLASS_ATTRS.lock().get(d.class)?;
+    attrs(d, rest)
 }
 
 /// The names of the major numbers, as `register_blkdev` and `register_chrdev` of Linux keep them.

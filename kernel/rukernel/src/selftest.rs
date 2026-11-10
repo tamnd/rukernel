@@ -1245,6 +1245,26 @@ fn tpm_test() -> bool {
         let one = chip.pcr_read(cmd::ALG_SHA256, pcr);
         ok &= check("a TPM2_PCR_Read of one PCR gives the same value", one.as_ref() == Ok(digest));
     }
+    let devices = rk_vfs::device::devices();
+    let tpm0 = devices.iter().find(|d| d.name == "tpm0" && d.class == "tpm");
+    ok &= check(
+        "the TPM is /dev/tpm0 with the number 10:224",
+        tpm0.is_some_and(|d| d.rdev == rk_drv_tpm::dev::TPM0_RDEV && !d.block),
+    );
+    let files = tpm0.and_then(|d| rk_vfs::device::class_attrs(d, &["pcr-sha256"]));
+    let sysfs_digest = |pcr: usize| {
+        let (_, entry) = files.as_ref()?.get(pcr)?;
+        match entry {
+            rk_vfs::input::SysEntry::File(text) => Some(text.clone()),
+            _ => None,
+        }
+    };
+    let same = [0, 7].into_iter().zip(digests.iter().flatten()).all(|(pcr, digest)| {
+        sysfs_digest(pcr) == Some(alloc::format!("{}\n", Hex(digest)).to_uppercase().into_bytes())
+    });
+    ok &= check("pcr-sha256 in sysfs has the 24 PCRs, and PCRs 0 and 7 are the same", {
+        files.as_ref().is_some_and(|f| f.len() == 24) && same
+    });
     ok
 }
 

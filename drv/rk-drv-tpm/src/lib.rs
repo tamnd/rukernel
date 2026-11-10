@@ -9,7 +9,8 @@
 //! TPM without an interrupt.
 //!
 //! The chip sends one command at a time. At boot `init` does the startup of Linux
-//! (`tpm2_auto_startup`): `TPM2_SelfTest`, and `TPM2_Startup` if the TPM is not started.
+//! (`tpm2_auto_startup`): `TPM2_SelfTest`, and `TPM2_Startup` if the TPM is not started. Then it
+//! adds `/dev/tpm0` and its directory in sysfs, with `dev`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -18,6 +19,7 @@ extern crate alloc;
 
 pub mod cmd;
 pub mod crb;
+pub mod dev;
 #[cfg(test)]
 mod tests;
 pub mod tis;
@@ -288,6 +290,30 @@ impl Chip {
             _ => Err(Errno::EIO),
         }
     }
+
+    /// Reads all of the PCRs of the bank `alg`, in the order of their numbers. Each command reads
+    /// 8 PCRs, the most that a PC Client TPM reads in one command.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `transmit`, and `EIO` for an error of the TPM or a response without the
+    /// PCRs.
+    pub fn pcr_read_bank(&self, alg: u16) -> Result<Vec<Vec<u8>>> {
+        let all: Vec<u32> = (0..cmd::PCR_COUNT).collect();
+        let mut out = Vec::with_capacity(all.len());
+        for want in all.chunks(8) {
+            let (rc, rsp) = self.command(&cmd::pcr_read(alg, want))?;
+            if rc != cmd::RC_SUCCESS {
+                return Err(Errno::EIO);
+            }
+            let (pcrs, digests) = cmd::parse_pcr_read(&rsp).ok_or(Errno::EIO)?;
+            if pcrs != want {
+                return Err(Errno::EIO);
+            }
+            out.extend(digests.iter().map(|d| d.to_vec()));
+        }
+        Ok(out)
+    }
 }
 
 /// The TPM of the machine, after `init`.
@@ -314,8 +340,9 @@ impl Clock for KernelClock {
     }
 }
 
-/// Finds the TPM of the machine, makes its driver and starts it. Does nothing if there is no TPM
-/// or if it does not answer. Gives the chip.
+/// Finds the TPM of the machine, makes its driver, starts it and adds `/dev/tpm0`. Does nothing if
+/// there is no TPM or if it does not answer. A second call gives the chip of the first. Gives the
+/// chip.
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn init() -> Option<Arc<Chip>> {
     use rk_frame::println;
@@ -367,5 +394,6 @@ pub fn init() -> Option<Arc<Chip>> {
     }
     let chip = Arc::new(chip);
     *CHIP.lock() = Some(chip.clone());
+    dev::register(chip.clone());
     Some(chip)
 }

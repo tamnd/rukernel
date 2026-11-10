@@ -418,3 +418,62 @@ fn rejects_a_bad_command() {
     c[5] = 13;
     assert_eq!(chip.command(&c), Err(Errno::E2BIG));
 }
+
+#[test]
+fn reads_all_of_a_pcr_bank() {
+    let chip = crb_chip(crb_model());
+    chip.auto_startup().unwrap();
+    let bank = chip.pcr_read_bank(cmd::ALG_SHA256).unwrap();
+    assert_eq!(bank.len(), 24);
+    assert!(bank.iter().enumerate().all(|(i, d)| *d == [i as u8; 32]));
+}
+
+#[test]
+fn the_device_sends_one_command_at_a_time() {
+    use rk_vfs::device::CharDevice;
+    use rk_vfs::file::File;
+
+    let chip = Arc::new(crb_chip(crb_model()));
+    chip.auto_startup().unwrap();
+    let device = dev::TpmDevice::new(chip.clone());
+    let ops = device.open(0).unwrap();
+    assert_eq!(device.open(0).err(), Some(Errno::EBUSY));
+    let file = File::with_ops(ops.clone(), None, 2);
+    let pollin = rk_abi::native::poll::POLLIN;
+    assert_eq!(ops.poll(&file) & pollin, 0);
+    let c = cmd::get_random(4);
+    assert_eq!(ops.write(&file, &c), Ok(c.len()));
+    assert_ne!(ops.poll(&file) & pollin, 0);
+    // A second command must wait for the read of the response.
+    assert_eq!(ops.write(&file, &c), Err(Errno::EBUSY));
+    let mut head = [0u8; 4];
+    assert_eq!(ops.read(&file, &mut head), Ok(4));
+    let mut rest = [0u8; 64];
+    assert_eq!(ops.read(&file, &mut rest), Ok(12));
+    assert_eq!(head, [0x80, 1, 0, 0]);
+    assert_eq!(rest[..12], [0, 16, 0, 0, 0, 0, 0, 4, 0, 1, 2, 3]);
+    assert_eq!(ops.read(&file, &mut rest), Ok(0));
+    assert_eq!(ops.write(&file, &[0u8; 4]), Err(Errno::EINVAL));
+    assert_eq!(ops.write(&file, &[0u8; cmd::BUFSIZE + 1]), Err(Errno::E2BIG));
+    drop(file);
+    drop(ops);
+    assert!(device.open(0).is_ok());
+}
+
+#[test]
+fn the_sysfs_files_have_the_pcrs() {
+    use alloc::string::String;
+
+    let chip = crb_chip(crb_model());
+    chip.auto_startup().unwrap();
+    let names = |rest: &[&str]| -> Vec<String> {
+        dev::sysfs(&chip, rest).unwrap().into_iter().map(|(n, _)| n).collect()
+    };
+    assert_eq!(names(&[]), ["pcr-sha256", "tpm_version_major"]);
+    let pcrs = dev::sysfs(&chip, &["pcr-sha256"]).unwrap();
+    assert_eq!(pcrs.len(), 24);
+    assert_eq!(pcrs[10].0, "10");
+    let want = alloc::format!("{}\n", "0A".repeat(32));
+    assert_eq!(pcrs[10].1, rk_vfs::input::SysEntry::File(want.into_bytes()));
+    assert!(dev::sysfs(&chip, &["pcr-sha1"]).is_none());
+}

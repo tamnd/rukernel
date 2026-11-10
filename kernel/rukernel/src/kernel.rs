@@ -62,7 +62,11 @@ fn main(boot: &'static BootInfo) -> ! {
     if let Some(test) = test.filter(|&t| t != "init") {
         let passed = selftest::run(test);
         println!("rk.test={test}: {}", if passed { "pass" } else { "fail" });
-        arch::qemu_exit(if passed { EXIT_PASS } else { EXIT_FAIL });
+        // With `rdinit=`, init runs after a test that passes, and init gives the result. The
+        // `tpm` test checks the driver in the kernel, and then the tools of the TPM in init.
+        if !passed || param(boot.cmdline(), "rdinit").is_none() {
+            arch::qemu_exit(if passed { EXIT_PASS } else { EXIT_FAIL });
+        }
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -86,6 +90,8 @@ fn run_init(boot: &'static BootInfo, test: bool) -> ! {
     rk_net::dev::init();
     rk_net::tun::init();
     rk_drv_virtio::init();
+    // The TPM gets `/dev/tpm0` before `make_dev` makes the device files.
+    let _ = rk_drv_tpm::init();
     rk_net_inet::init();
     if let Some(ip) = param(boot.cmdline(), "ip") {
         match rk_net_inet::configure(ip) {

@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - `BPF_MAP_TYPE_PROG_ARRAY` and the helper `bpf_tail_call`, as kernel/bpf/arraymap.c and `JMP_TAIL_CALL` of Linux. A system call writes the descriptor of a program to a slot and reads the ID of the program. All programs of an array and all programs that use it have one type. A tail call to an empty slot or to an index out of the array continues after the call, and a run does at most 33 tail calls. The last close of the array removes its programs. The verifier refuses a program array with another helper, a tail call with another map, and a tail call in a program with functions, with the messages of Linux. The `ltp` boot test also runs bpf_prog05, bpf_prog06 and bpf_prog07. They do not apply, as on Linux, because they drop `CAP_BPF` and `kernel.unprivileged_bpf_disabled` is 2 (#537).
+- `/dev/tpm0` (10:224) for the TPM, as tpm-dev.c of Linux: one open file at a time, a write sends one command and a read gives its response. `/sys/class/tpm/tpm0` has `dev`, `uevent`, `tpm_version_major` and the directory `pcr-sha256` with the digest of each PCR, from a new hook for the attributes of a class in sysfs. `tools/tpm/build.sh` installs tpm2-tools from Alpine, and with it the `tpm` boot test runs `tpm2_getrandom 8` and `tpm2_pcrread sha256:0,7` on `/dev/tpm0` and compares the PCRs with `pcr-sha256` (#541).
 
 ### Fixed
 
