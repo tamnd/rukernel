@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.19] - 2026-11-10
+
 ### Added
 
 - The kselftest boot test runs `test_core` and `test_cpuset` of the cgroup selftests. tools/kselftest/build.sh builds them with cgroup/lib/cgroup_util.c, and the init script of the test mounts cgroup2 at /sys/fs/cgroup with `nsdelegate`, as systemd mounts it (#536).
@@ -1531,6 +1533,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.19]: https://github.com/tamnd/rukernel/compare/v0.5.18...v0.5.19
 [0.5.18]: https://github.com/tamnd/rukernel/compare/v0.5.17...v0.5.18
 [0.5.17]: https://github.com/tamnd/rukernel/compare/v0.5.16...v0.5.17
 [0.5.16]: https://github.com/tamnd/rukernel/compare/v0.5.15...v0.5.16
