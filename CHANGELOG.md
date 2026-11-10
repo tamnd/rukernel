@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- A write of `memory.peak` starts a new peak for the open file only, as `peak_write` of Linux. A read of that open file shows the largest use after the write, and the other readers of `memory.peak` still see the largest use since the cgroup was made. Each other open file with a write gets the use now if it is larger than its value. Before, a write reset the peak of the cgroup for all readers, and `test_memcg_current_peak` of the cgroup kselftests failed. `memory.swap.peak` stays 0, because rukernel has no swap (#536).
+
 ## [0.5.19] - 2026-11-10
 
 ### Added
@@ -18,7 +22,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A change of `cgroup.events` and of the other files with events of cgroup2 sends `IN_MODIFY` to the inotify marks of the file, as `kernfs_notify` of Linux. A write of `cgroup.freeze` in a cgroup that a cgroup above it keeps frozen also tells an event, as `cgroup_freeze` of Linux, so that a reader does not wait for a change that does not come (#536).
 - The scheduler does not call the notice function of rk-cgroup, because that function now sends inotify events, which must not run in the scheduler. As `kernfs_notify` of Linux defers its work, a change of a file with events that comes from a CPU charge waits for the next call outside the scheduler (#536).
 - `/proc/PID/task/TID/cgroup` shows the cgroup of the thread `TID`, as `proc_cgroup_show` of Linux. In a threaded subtree, a thread can be in another cgroup than its process. Before, the file showed the cgroup of the process, and `test_cgcore_thread_migration` failed (#536).
-- A write of `memory.peak` starts a new peak for the open file only, as `peak_write` of Linux. A read of that open file shows the largest use after the write, and the other readers of `memory.peak` still see the largest use since the cgroup was made. Each other open file with a write gets the use now if it is larger than its value. Before, a write reset the peak of the cgroup for all readers, and `test_memcg_current_peak` of the cgroup kselftests failed. `memory.swap.peak` stays 0, because rukernel has no swap (#536).
 
 ## [0.5.18] - 2026-11-09
 
