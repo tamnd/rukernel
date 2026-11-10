@@ -767,7 +767,7 @@ fn do_clone(cx: &mut Cx<'_>, args: &CloneArgs, stack: u64, set_tid: &rk_proc::Se
     }
     ptrace::event(cx.thread, cx.regs, cx.number, event, u64::from(tid));
     if let Some(done) = vfork {
-        done.wait();
+        done.wait(cx.thread);
         ptrace::event(cx.thread, cx.regs, cx.number, PTRACE_EVENT_VFORK_DONE, u64::from(tid));
     }
     Ok(u64::from(tid))

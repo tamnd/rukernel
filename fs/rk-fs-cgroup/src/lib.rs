@@ -32,7 +32,7 @@ mod procs;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rk_abi::Errno;
@@ -84,9 +84,54 @@ static RECURSIVE_PROT: AtomicBool = AtomicBool::new(false);
 /// such a file wakes them.
 static EVENTS: WaitQueue = WaitQueue::new();
 
-/// Wakes the waits of `poll` on the files with events. rk-cgroup calls it after a change.
+/// The inodes of the files with events that a lookup gave, by cgroup and file name, with the
+/// count of events at the last notice to inotify. A change of such a file sends `IN_MODIFY` to the
+/// marks of its inode, as `kernfs_notify` of Linux. A mark holds its inode, so the inode of a
+/// watched file stays here, and a new lookup gives the same inode.
+static EVENT_INODES: SpinLock<BTreeMap<(CgId, &'static str), (Weak<Node>, u64)>> =
+    SpinLock::new(BTreeMap::new());
+
+/// Wakes the waits of `poll` on the files with events, and sends `IN_MODIFY` to the watched files
+/// that changed. rk-cgroup calls it after a change, without the lock of the hierarchy.
 fn wake_events() {
     EVENTS.wake_all();
+    if rk_vfs::notify::mark_count() == 0 {
+        return;
+    }
+    let watched: Vec<((CgId, &'static str), Arc<Node>, u64)> = EVENT_INODES
+        .lock()
+        .iter()
+        .filter_map(|(&k, (w, seq))| w.upgrade().map(|n| (k, n, *seq)))
+        .collect();
+    if watched.is_empty() {
+        return;
+    }
+    let now: Vec<Option<u64>> = rk_cgroup::with(|h| {
+        watched.iter().map(|((id, name), _, _)| h.event_seq(*id, name)).collect()
+    });
+    for ((key, node, seq), now) in watched.into_iter().zip(now) {
+        let Some(now) = now.filter(|&n| n != seq) else { continue };
+        if let Some(e) = EVENT_INODES.lock().get_mut(&key) {
+            e.1 = now;
+        }
+        rk_vfs::notify::inode_event(&(node as InodeRef), rk_vfs::notify::mask::MODIFY);
+    }
+}
+
+/// The inode of the file `name` of the cgroup `id`, which has events with the count `seq`. The
+/// inode that an earlier lookup gave stays the same while a mark holds it.
+fn event_inode(id: CgId, name: &'static str, seq: u64) -> InodeRef {
+    let mut all = EVENT_INODES.lock();
+    if let Some((w, last)) = all.get_mut(&(id, name))
+        && let Some(n) = w.upgrade()
+    {
+        *last = seq;
+        return n;
+    }
+    all.retain(|_, (w, _)| w.strong_count() > 0);
+    let n = Arc::new(Node { id, file: Some(name) });
+    all.insert((id, name), (Arc::downgrade(&n), seq));
+    n
 }
 
 /// The owner and the mode that `chown` and `chmod` gave, and the owner of each cgroup that a
@@ -387,6 +432,9 @@ impl Inode for Node {
                 return Ok(Arc::new(Node { id, file: None }) as InodeRef);
             }
             let f = h.file(self.id, name).ok_or(Errno::ENOENT)?;
+            if let Some(seq) = h.event_seq(self.id, f.name) {
+                return Ok(event_inode(self.id, f.name, seq));
+            }
             Ok(Arc::new(Node { id: self.id, file: Some(f.name) }) as InodeRef)
         })
     }

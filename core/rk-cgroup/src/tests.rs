@@ -372,6 +372,26 @@ fn a_cgroup_is_frozen_when_each_thread_waits() {
 }
 
 #[test]
+fn a_freeze_under_a_frozen_cgroup_tells_the_readers() {
+    let mut h = Hierarchy::new(0, 1);
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    h.write(a, "cgroup.freeze", b"1", 0).unwrap();
+    let seq = h.event_seq(b, "cgroup.events").unwrap();
+    h.take_notify();
+    // The state of `b` does not change, but a reader of its `cgroup.events` sees an event.
+    h.write(b, "cgroup.freeze", b"1", 0).unwrap();
+    assert_eq!(h.read(b, "cgroup.events", 0).unwrap(), "populated 0\nfrozen 1\n");
+    assert_eq!(h.event_seq(b, "cgroup.events"), Some(seq + 1));
+    assert!(h.take_notify());
+    h.write(b, "cgroup.freeze", b"0", 0).unwrap();
+    assert_eq!(h.event_seq(b, "cgroup.events"), Some(seq + 2));
+    // A write of the same value does nothing.
+    h.write(b, "cgroup.freeze", b"0", 0).unwrap();
+    assert_eq!(h.event_seq(b, "cgroup.events"), Some(seq + 2));
+}
+
+#[test]
 fn memory_high_makes_a_delay_that_grows_with_the_use() {
     let mut h = Hierarchy::new(0, 1);
     h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();

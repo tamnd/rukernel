@@ -194,8 +194,14 @@ fn run_loop(thread: &Arc<Thread>, regs: &mut UserContext) -> WaitStatus {
         if thread.is_killed() {
             break process.group_exit().unwrap_or(WaitStatus::exited(0));
         }
-        // A thread of a frozen cgroup, or of a cgroup without CPU quota, waits here.
-        rk_proc::cgroup::wait_limits(thread);
+        // A thread of a frozen cgroup, or of a cgroup without CPU quota, waits here. A stop ends
+        // the wait in the freezer: the thread takes the stop, and then waits in the freezer again.
+        if rk_proc::cgroup::wait_limits(thread) {
+            if let Some(status) = crate::signal::deliver(thread, regs, None) {
+                break status;
+            }
+            continue;
+        }
         if thread.is_killed() {
             break process.group_exit().unwrap_or(WaitStatus::exited(0));
         }
