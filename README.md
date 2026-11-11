@@ -148,6 +148,7 @@ cargo xtask boot-test alpine
 | `drv/rk-drv-mem/` | The memory devices: `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random` and `/dev/urandom` |
 | `drv/rk-drv-tty/` | The console tty on the serial port |
 | `drv/rk-drv-tpm/` | The TPM 2.0 driver: the CRB and the FIFO (TIS) interfaces |
+| `sec/rk-crypto/` | The crypto API: SHA-1, SHA-2, HMAC, AES and the modes ECB, CBC, CTR and XTS |
 | `tests/user/` | The C test programs that run in user mode |
 | `xtask/` | The build checks |
 

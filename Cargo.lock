@@ -57,6 +57,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-crypto"
+version = "0.5.21"
+dependencies = [
+ "rk-abi",
+]
+
+[[package]]
 name = "rk-drv-mem"
 version = "0.5.21"
 dependencies = [
