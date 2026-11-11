@@ -15840,8 +15840,8 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
  * With the argument "exec", it checks that it has no label for the next exec. With the argument
  * "deny", it checks that rk_test in enforce mode denies an open, a lock, a stat, a change of the
  * attributes, a truncate to the size argv[2], a link, a rename, a create, a remove and an exec
- * with EACCES, and chroot and sethostname with EPERM, because the rules allow no capability. It
- * gives 0 or the number of the first check that failed. It does not read its
+ * with EACCES, chroot and sethostname with EPERM, because the rules allow no capability, and a
+ * signal to the parent with EACCES. It gives 0 or the number of the first check that failed. It does not read its
  * label, because the rules do not allow it. The names are in /etc, which has no rule.
  */
 static int aa_label_helper(int argc, char **argv)
@@ -15884,6 +15884,8 @@ static int aa_label_helper(int argc, char **argv)
 			return 16;
 		if (sethostname("rk-aa", 5) == 0 || errno != EPERM)
 			return 17;
+		if (kill(getppid(), 0) == 0 || errno != EACCES)
+			return 18;
 		execv("/tmp/rk-sub", args);
 		return errno == EACCES ? 0 : 5;
 	}
@@ -16211,7 +16213,7 @@ static void test_apparmor(void)
 			execv("/usr/bin/rk-test", five);
 			_exit(127);
 		}
-		check("apparmor: in enforce mode, an open, a lock, a path operation and an exec that the rules do not allow give EACCES, and a capability gives EPERM", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		check("apparmor: in enforce mode, an open, a lock, a path operation and an exec that the rules do not allow give EACCES, a capability gives EPERM and a signal gives EACCES", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 			printf("init: the AppArmor enforce checks failed at the check %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 		pid = fork();
@@ -16230,6 +16232,7 @@ static void test_apparmor(void)
 		check("apparmor: the kernel log has the denials of the path operations, as on Linux", strstr(buf, "operation=\"getattr\"") == NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"chmod\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "operation=\"truncate\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "operation=\"rename_src\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "operation=\"unlink\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL);
 		check("apparmor: the kernel log has the denials of the link and the creates, as on Linux", strstr(buf, "operation=\"link\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-l\" pid=") != NULL && strstr(buf, " requested_mask=\"l\" denied_mask=\"l\" fsuid=0 ouid=0 target=\"/etc/rk_test.aa\"") != NULL && strstr(buf, "operation=\"mkdir\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-d/\" pid=") != NULL && strstr(buf, "operation=\"rmdir\" class=\"file\" profile=\"rk_test\" name=\"/usr/bin/\" pid=") != NULL && strstr(buf, "operation=\"symlink\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-s\" pid=") != NULL && strstr(buf, "operation=\"mknod\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-n\" pid=") != NULL);
 		check("apparmor: the kernel log has the denials of the capabilities, as on Linux", strstr(buf, "apparmor=\"DENIED\" operation=\"capable\" class=\"cap\" profile=\"rk_test\" pid=") != NULL && strstr(buf, " capability=18  capname=\"sys_chroot\"") != NULL && strstr(buf, " capability=21  capname=\"sys_admin\"") != NULL);
+		check("apparmor: the kernel log has the denial of the signal, as on Linux", strstr(buf, "apparmor=\"DENIED\" operation=\"signal\" class=\"signal\" profile=\"rk_test\" pid=") != NULL && strstr(buf, " requested_mask=\"send\" denied_mask=\"send\" signal=exists peer=\"unconfined\"") != NULL);
 		check("apparmor: the kernel log has the missing profile in enforce mode", strstr(buf, "apparmor=\"DENIED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"rk_test\" name=\"rk_none\" pid=") != NULL);
 	}
 	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);

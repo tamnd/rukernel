@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - A socket has the owner and the mode of its inode, as sockfs of Linux. A new socket has the file system user and group IDs of the process and the mode 0777. `fchown`, `fchmod` and `fchownat` with `AT_EMPTY_PATH` change them. After the release of the socket, a change of the owner gives `ENOENT`, as `sockfs_setattr` of Linux for CVE-2019-8912. LTP af_alg07 tests this (#541).
 - AppArmor checks the capabilities, as capability.c of Linux. A capability that the profile does not allow gives `EPERM` and a record of the class `cap`, with the rules `audit` and `quiet` and the skip of a repeated record. Each check of a capability calls the `capable` hook of the security modules after the check of the capability module, also the checks in a user namespace and the checks of a file, as `ns_capable` and `capable_wrt_inode_uidgid` of Linux (#540).
+- AppArmor checks the signals, as ipc.c of Linux. The rules of the sender must allow the send to the label of the target, and the rules of the target must allow the receive from the label of the sender. A denial gives `EACCES` and a record of the class `signal`. The match of the label of the other task, `aa_label_match` of Linux, is in the new module `label` (#540).
 
 ### Fixed
 

@@ -6,8 +6,9 @@
 //! unpack of the binary policy ([`unpack`]) with its DFA tables ([`dfa`]), the policy namespace
 //! that holds the profiles ([`policy`]), the audit records ([`audit`]), the label of a task
 //! with its change at an exec ([`domain`]), the changes that a task asks for with
-//! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]) and the
-//! checks of the capabilities ([`capability`]).
+//! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]), the checks
+//! of the capabilities ([`capability`]) and the checks of the signals ([`ipc`]) with the label of
+//! the other task ([`label`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -26,6 +27,8 @@ pub mod domain;
 pub mod features;
 pub mod file;
 pub mod fs;
+pub mod ipc;
+pub mod label;
 pub mod policy;
 pub mod task;
 pub mod unpack;
@@ -50,6 +53,10 @@ struct AppArmor;
 impl SecurityHooks for AppArmor {
     fn capable(&self, cred: &Cred, cap: u32, opts: u32) -> Result<()> {
         capability::capable(cred, cap, opts)
+    }
+
+    fn task_kill(&self, target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
+        ipc::task_kill(cred, target.cred, sig)
     }
 
     fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {
