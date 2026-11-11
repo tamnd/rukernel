@@ -7,8 +7,8 @@
 //! that holds the profiles ([`policy`]), the audit records ([`audit`]), the label of a task
 //! with its change at an exec ([`domain`]), the changes that a task asks for with
 //! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]), the checks
-//! of the capabilities ([`capability`]) and the checks of the signals ([`ipc`]) with the label of
-//! the other task ([`label`]).
+//! of the capabilities ([`capability`]), and the checks of the signals ([`ipc`]) and of `ptrace`
+//! ([`ptrace`]) with the label of the other task ([`label`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -30,6 +30,7 @@ pub mod fs;
 pub mod ipc;
 pub mod label;
 pub mod policy;
+pub mod ptrace;
 pub mod task;
 pub mod unpack;
 
@@ -53,6 +54,14 @@ struct AppArmor;
 impl SecurityHooks for AppArmor {
     fn capable(&self, cred: &Cred, cap: u32, opts: u32) -> Result<()> {
         capability::capable(cred, cap, opts)
+    }
+
+    fn ptrace_access_check(&self, cred: &Cred, child: &Task<'_>, mode: u32) -> Result<()> {
+        ptrace::access_check(cred, child.cred, mode)
+    }
+
+    fn ptrace_traceme(&self, parent: &Task<'_>) -> Result<()> {
+        ptrace::traceme(parent.cred)
     }
 
     fn task_kill(&self, target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {

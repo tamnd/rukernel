@@ -306,6 +306,9 @@ pub struct Bprm<'a> {
     pub cred: &'a mut Cred,
     /// The program gets the secure mode of `AT_SECURE`. A hook can set it.
     pub secureexec: bool,
+    /// The credentials of the tracer if a tracer traces the task, as `LSM_UNSAFE_PTRACE` and
+    /// `ptrace_parent` of Linux.
+    pub tracer: Option<&'a Cred>,
 }
 
 /// A socket for the hooks, as `struct socket` of Linux.
