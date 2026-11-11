@@ -39,8 +39,7 @@ use rk_vfs::security::{
     Task, id,
 };
 
-/// The hooks of AppArmor. Each profile acts in complain mode, so each hook allows the
-/// operation.
+/// The hooks of AppArmor. A hook gives the error of a denial of a profile in enforce mode.
 struct AppArmor;
 
 impl SecurityHooks for AppArmor {
@@ -53,23 +52,19 @@ impl SecurityHooks for AppArmor {
     }
 
     fn file_open(&self, f: &File, cred: &Cred, flags: u32) -> Result<()> {
-        file::file_open(f, cred, flags);
-        Ok(())
+        file::file_open(f, cred, flags)
     }
 
     fn file_permission(&self, f: &File, mask: u32) -> Result<()> {
-        file::file_perm(file::op::FPERM, f, mask);
-        Ok(())
+        file::file_perm(file::op::FPERM, f, mask)
     }
 
     fn file_lock(&self, f: &File, cmd: u32) -> Result<()> {
-        file::file_lock(f, cmd);
-        Ok(())
+        file::file_lock(f, cmd)
     }
 
     fn mmap_file(&self, f: Option<&File>, _reqprot: u64, prot: u64, flags: u64) -> Result<()> {
-        file::mmap_file(f, prot, flags);
-        Ok(())
+        file::mmap_file(f, prot, flags)
     }
 
     fn getselfattr(&self, attr: u64, task: &Task<'_>) -> Result<Vec<u8>> {

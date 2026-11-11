@@ -5,8 +5,9 @@
 //! of the file checks the policy again only if the task has an other label, or if it asks for
 //! more permissions. A file that an unconfined task made has no check, as on Linux.
 //!
-//! As in [`crate::domain`], each profile acts in complain mode: the log tells what the policy
-//! does not allow, and the operation goes on.
+//! An access that the policy does not allow gives `EACCES` for a profile in enforce mode, as
+//! in [`crate::domain`]. Each profile of a stack makes its record, and the access gives the error
+//! of the last profile that denies it, as `fn_for_each` of Linux.
 
 use crate::domain::{self, FileAudit, audit_file, str_perms};
 use crate::policy::{Mode, Profile};
@@ -19,7 +20,7 @@ use rk_abi::native::open as o;
 use rk_vfs::cred::Cred;
 use rk_vfs::dentry::Location;
 use rk_vfs::file::File;
-use rk_vfs::inode::FileType;
+use rk_vfs::inode::{FileType, Result};
 use rk_vfs::security::id;
 
 /// The size of the part of AppArmor in the blob of a file: the label and the permissions.
@@ -109,10 +110,14 @@ pub fn path_name(path: Vec<u8>, dir: bool) -> Vec<u8> {
 
 /// Checks the permissions `request` on the file at `at` for the profile `p`, and logs the
 /// result, as `profile_path_perm` and `__aa_path_perm` of Linux. `fsuid` is the file system
-/// user ID of the task. Tells if the policy allows the request.
-fn path_perm(op: &'static str, p: &Profile, at: &Location, request: u32, fsuid: u32) -> bool {
+/// user ID of the task.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the request, except in complain mode.
+fn path_perm(op: &'static str, p: &Profile, at: &Location, request: u32, fsuid: u32) -> Result<()> {
     if p.mode == Mode::Unconfined {
-        return true;
+        return Ok(());
     }
     let meta = at.inode().metadata();
     let dir = meta.file_type() == Some(FileType::Directory);
@@ -121,8 +126,29 @@ fn path_perm(op: &'static str, p: &Profile, at: &Location, request: u32, fsuid: 
     let perms = p.rules.as_ref().map_or(Perms::default(), |r| str_perms(&r.file, &name, owner));
     let error = (request & !perms.allow != 0).then_some(Errno::EACCES);
     let a = FileAudit { op, request, name: &name, target: None, ouid: meta.uid, info: None, error };
-    audit_file(Some(p), &perms, &a);
-    error.is_none()
+    audit_file(Some(p), &perms, &a)
+}
+
+/// The check of each profile of `l` that is not unconfined, `fn_for_each_confined` of Linux.
+/// Each profile makes its record, so the check does not stop at the first denial.
+///
+/// # Errors
+///
+/// Gives the error of the last profile that denies the request.
+fn label_path_perm(
+    op: &'static str,
+    l: &[Arc<Profile>],
+    at: &Location,
+    request: u32,
+    fsuid: u32,
+) -> Result<()> {
+    let mut result = Ok(());
+    for p in l.iter().filter(|p| p.mode != Mode::Unconfined) {
+        if let Err(e) = path_perm(op, p, at, request, fsuid) {
+            result = Err(e);
+        }
+    }
+    result
 }
 
 /// `apparmor_file_alloc_security` of Linux: the file gets the label of the task.
@@ -136,26 +162,33 @@ pub fn file_alloc(file: &File) {
 
 /// `apparmor_file_open` of Linux: the check of an open with the flags `flags` by a task with
 /// `cred`. The file keeps the permissions of the open.
-pub fn file_open(file: &File, cred: &Cred, flags: u32) {
-    let Some(off) = file_offset() else { return };
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the open.
+pub fn file_open(file: &File, cred: &Cred, flags: u32) -> Result<()> {
+    let Some(off) = file_offset() else { return Ok(()) };
     // A file that is not in the tree of a file system has no path to check.
-    let Some(at) = file.location() else { return };
+    let Some(at) = file.location() else { return Ok(()) };
     let request = map_open_flags(flags);
     // Each profile of a stack checks the open.
-    for p in domain::label_of(cred).iter().filter(|p| p.mode != Mode::Unconfined) {
-        path_perm(op::OPEN, p, at, request, cred.fsuid);
-    }
+    let result = label_path_perm(op::OPEN, &domain::label_of(cred), at, request, cred.fsuid);
     file.security().store(off + ALLOW, u64::from(request));
+    result
 }
 
 /// The check of the permissions `request` on an open file, `aa_file_perm` and
 /// `__file_path_perm` of Linux.
-pub fn file_perm(op: &'static str, file: &File, request: u32) {
-    let Some(off) = file_offset() else { return };
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the access.
+pub fn file_perm(op: &'static str, file: &File, request: u32) -> Result<()> {
+    let Some(off) = file_offset() else { return Ok(()) };
     let cred = rk_vfs::cred::current();
     let label = domain::label_id(&cred);
     if label == 0 {
-        return;
+        return Ok(());
     }
     let blob = file.security();
     let flabel = blob.load(off + LABEL);
@@ -164,49 +197,49 @@ pub fn file_perm(op: &'static str, file: &File, request: u32) {
     // A file of an unconfined task goes to the others with no check, as `__file_is_delegated`.
     // The same label with no new permission needs no check.
     if flabel == 0 || (denied == 0 && flabel == label) {
-        return;
+        return Ok(());
     }
-    let Some(at) = file.location() else { return };
+    let Some(at) = file.location() else { return Ok(()) };
     // The newest version of the label of the task. A profile that was removed goes out of
     // the label. Each profile of a stack checks the access.
     let l = domain::label_by_id(label);
-    // Each profile makes its record, so the check does not stop at the first denial.
-    let check = |l: &[Arc<Profile>]| {
-        let confined = l.iter().filter(|p| p.mode != Mode::Unconfined);
-        confined.filter(|p| !path_perm(op, p, at, request, cred.fsuid)).count() == 0
-    };
-    let mut ok = true;
+    let check = |l: &[Arc<Profile>]| label_path_perm(op, l, at, request, cred.fsuid);
     if flabel != label {
-        ok = check(&l);
+        check(&l)?;
     }
-    if denied != 0 && ok {
+    if denied != 0 {
         // The label of the file also checks the new permissions.
-        ok = if flabel == label { check(&l) } else { check(&domain::label_by_id(flabel)) };
+        if flabel == label { check(&l) } else { check(&domain::label_by_id(flabel)) }?;
     }
     // As `update_file_ctx` of Linux. This kernel keeps one label for a file, so the file gets
     // the label of the task.
-    if ok {
-        blob.store(off + LABEL, label);
-        blob.store(off + ALLOW, u64::from(allow | request));
-    }
+    blob.store(off + LABEL, label);
+    blob.store(off + ALLOW, u64::from(allow | request));
+    Ok(())
 }
 
 /// `apparmor_file_lock` of Linux: a `flock` with the operation `cmd`. An exclusive lock also
 /// asks for a write.
-pub fn file_lock(file: &File, cmd: u32) {
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the lock.
+pub fn file_lock(file: &File, cmd: u32) -> Result<()> {
     let mut mask = perm::LOCK;
     if cmd & !LOCK_NB == LOCK_EX {
         mask |= perm::WRITE;
     }
-    file_perm(op::FLOCK, file, mask);
+    file_perm(op::FLOCK, file, mask)
 }
 
 /// `apparmor_mmap_file` of Linux: a map of `file` with the protection `prot` and the flags
 /// `flags`.
-pub fn mmap_file(file: Option<&File>, prot: u64, flags: u64) {
-    if let Some(file) = file {
-        file_perm(op::FMMAP, file, map_mmap_prot(prot, flags));
-    }
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the map.
+pub fn mmap_file(file: Option<&File>, prot: u64, flags: u64) -> Result<()> {
+    file.map_or(Ok(()), |file| file_perm(op::FMMAP, file, map_mmap_prot(prot, flags)))
 }
 
 #[cfg(test)]

@@ -86,6 +86,20 @@ fn current() -> (u32, alloc::vec::Vec<u8>) {
     (0, alloc::vec::Vec::new())
 }
 
+/// Sends `SIGKILL` to the current process, as `aa_audit` of Linux does after a record of the
+/// kind `KILLED`.
+#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn kill_current() {
+    use rk_abi::native::signal::SIGKILL;
+    if let Some(t) = rk_proc::current_thread() {
+        rk_proc::send_signal(t.process(), rk_proc::signal::SigInfo::new(SIGKILL, 0, 0));
+    }
+}
+
+/// A build for the host has no process.
+#[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+pub fn kill_current() {}
+
 /// The text of a record without its fields after `comm`, as `audit_pre` of Linux and
 /// `dump_common_audit_data` of Linux.
 fn text(kind: Kind, d: &Data<'_>, pid: u32, comm: &[u8]) -> String {
