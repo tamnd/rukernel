@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.20] - 2026-11-11
+
 ### Added
 
 - `BPF_MAP_TYPE_PROG_ARRAY` and the helper `bpf_tail_call`, as kernel/bpf/arraymap.c and `JMP_TAIL_CALL` of Linux. A system call writes the descriptor of a program to a slot and reads the ID of the program. All programs of an array and all programs that use it have one type. A tail call to an empty slot or to an index out of the array continues after the call, and a run does at most 33 tail calls. The last close of the array removes its programs. The verifier refuses a program array with another helper, a tail call with another map, and a tail call in a program with functions, with the messages of Linux. The `ltp` boot test also runs bpf_prog05, bpf_prog06 and bpf_prog07. They do not apply, as on Linux, because they drop `CAP_BPF` and `kernel.unprivileged_bpf_disabled` is 2 (#537).
@@ -1544,6 +1546,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.20]: https://github.com/tamnd/rukernel/compare/v0.5.19...v0.5.20
 [0.5.19]: https://github.com/tamnd/rukernel/compare/v0.5.18...v0.5.19
 [0.5.18]: https://github.com/tamnd/rukernel/compare/v0.5.17...v0.5.18
 [0.5.17]: https://github.com/tamnd/rukernel/compare/v0.5.16...v0.5.17
