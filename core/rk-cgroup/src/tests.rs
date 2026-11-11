@@ -199,6 +199,28 @@ fn cpu_max_throttles_a_cgroup_for_the_rest_of_the_period() {
 }
 
 #[test]
+fn cpu_max_throttles_a_cgroup_until_the_next_periods_pay_for_its_debt() {
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+cpu", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cpu.max", b"20000 100000", 0).unwrap();
+    let ms = 1_000_000;
+    // The cgroup runs 50 ms past its quota, so it waits for 3 periods of 20 ms each.
+    h.charge_cpu(a, 70 * ms, 30 * ms);
+    assert_eq!(h.throttled_until(a, 30 * ms), Some(300 * ms));
+    assert_eq!(h.throttled_until(a, 200 * ms), Some(300 * ms));
+    assert_eq!(h.throttled_until(a, 300 * ms), None);
+    let stat = h.read(a, "cpu.stat", 300 * ms).unwrap();
+    assert!(stat.contains("nr_throttled 1\nthrottled_usec 270000\n"), "{stat}");
+    // A wait that ends late counts the throttle up to the end of the period that paid.
+    h.charge_cpu(a, 30 * ms, 310 * ms);
+    assert_eq!(h.throttled_until(a, 310 * ms), Some(500 * ms));
+    assert_eq!(h.throttled_until(a, 650 * ms), None);
+    let stat = h.read(a, "cpu.stat", 650 * ms).unwrap();
+    assert!(stat.contains("nr_throttled 2\nthrottled_usec 460000\n"), "{stat}");
+}
+
+#[test]
 fn cpu_weight_scales_the_threads_of_a_group() {
     let mut h = Hierarchy::new(0, 1);
     let a = h.mkdir(ROOT, b"a", 0).unwrap();

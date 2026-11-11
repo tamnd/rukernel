@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - A kill of the processes of a cgroup with `memory.oom.group` counts the victim again in `oom_kill` of `memory.events`, as `oom_kill_memcg_member` of Linux kills each process of the group, the victim too. It also counts a process that is on its way out. Before, the count was one less than on Linux, and `test_memcg_oom_group_score_events` of the cgroup kselftests failed (#536).
+- A cgroup that ran past its `cpu.max` quota stays throttled until the next periods pay for the difference, as `distribute_cfs_runtime` of Linux unthrottles a group only when its time is above 0. Its threads wait once, up to the end of the period that pays, and do not wake in each period, because the CPU time of such a wake also counts against the quota. `throttled_usec` counts the throttle up to the end of that period. Before, a thread waited only to the end of one period and then ran again, so a cgroup that ran past its quota got more CPU time than its quota over many periods (#536).
 
 ## [0.5.20] - 2026-11-11
 
