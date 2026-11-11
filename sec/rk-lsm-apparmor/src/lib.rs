@@ -9,7 +9,7 @@
 //! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]), the checks
 //! of the capabilities ([`capability`]), the checks of the signals ([`ipc`]) and of `ptrace`
 //! ([`ptrace`]) with the label of the other task ([`label`]), the checks of the sockets
-//! ([`net`]) and the checks of the user namespaces ([`ns`]).
+//! ([`net`]), of the user namespaces ([`ns`]) and of the mounts ([`mount`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -30,6 +30,7 @@ pub mod file;
 pub mod fs;
 pub mod ipc;
 pub mod label;
+pub mod mount;
 pub mod net;
 pub mod ns;
 pub mod policy;
@@ -202,6 +203,22 @@ impl SecurityHooks for AppArmor {
 
     fn inode_getattr(&self, at: &Location) -> Result<()> {
         file::path_cond(file::op::GETATTR, at, perm::GETATTR)
+    }
+
+    fn sb_mount(&self, req: &security::MountReq<'_>) -> Result<()> {
+        mount::sb_mount(req)
+    }
+
+    fn sb_umount(&self, root: &Location, _flags: u32) -> Result<()> {
+        mount::sb_umount(root)
+    }
+
+    fn sb_pivotroot(&self, old: &Location, new: &Location) -> Result<()> {
+        mount::sb_pivotroot(old, new)
+    }
+
+    fn move_mount(&self, from: &Location, to: &Location) -> Result<()> {
+        mount::move_mount(from, to)
     }
 
     fn file_truncate(&self, f: &File) -> Result<()> {

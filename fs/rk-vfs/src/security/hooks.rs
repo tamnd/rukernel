@@ -489,6 +489,27 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `sb_mount`: `mount(2)` on `req.at`, before the check of `CAP_SYS_ADMIN`.
+    fn sb_mount(&self, req: &super::MountReq<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// `sb_umount`: `umount2` of the mount with the root `root`, with the `MNT_*` flags `flags`.
+    fn sb_umount(&self, root: &Location, flags: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `sb_pivotroot`: `pivot_root` with the new root `new` and the place `old` for the old
+    /// root.
+    fn sb_pivotroot(&self, old: &Location, new: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `move_mount`: `move_mount(2)` of the mount at `from` to `to`.
+    fn move_mount(&self, from: &Location, to: &Location) -> Result<()> {
+        Ok(())
+    }
+
     /// `file_truncate`: `ftruncate` of `file`.
     fn file_truncate(&self, file: &File) -> Result<()> {
         Ok(())

@@ -556,6 +556,55 @@ pub fn inode_getattr(at: &Location) -> Result<()> {
     call_int_hook!(inode_getattr, at)
 }
 
+/// The arguments of `mount(2)` for the `sb_mount` hook, as `security_sb_mount` of Linux gives
+/// them.
+pub struct MountReq<'a> {
+    /// The place of the mount.
+    pub at: &'a Location,
+    /// The source, `dev_name`, as the caller gives it.
+    pub dev_name: Option<&'a [u8]>,
+    /// The type of the file system.
+    pub fstype: Option<&'a [u8]>,
+    /// The `MS_*` flags without the magic number.
+    pub flags: u32,
+    /// The options, the data of `mount(2)`.
+    pub data: Option<&'a [u8]>,
+    /// The flags of the type `fstype`, or `None` if there is no such type, as `get_fs_type`.
+    pub fs_flags: Option<FsFlags>,
+    /// Looks up a path as the caller sees it, as `kern_path` with `LOOKUP_FOLLOW`.
+    pub lookup: &'a dyn Fn(&[u8]) -> Result<Location>,
+}
+
+/// The flags of a type of a file system that the `sb_mount` hook reads, as `fs_flags` of
+/// `struct file_system_type` of Linux.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FsFlags {
+    /// `FS_REQUIRES_DEV`: the source is a block device.
+    pub requires_dev: bool,
+    /// `FS_BINARY_MOUNTDATA`: the data is not text.
+    pub binary: bool,
+}
+
+/// `security_sb_mount`.
+pub fn sb_mount(req: &MountReq<'_>) -> Result<()> {
+    call_int_hook!(sb_mount, req)
+}
+
+/// `security_sb_umount`.
+pub fn sb_umount(root: &Location, flags: u32) -> Result<()> {
+    call_int_hook!(sb_umount, root, flags)
+}
+
+/// `security_sb_pivotroot`.
+pub fn sb_pivotroot(old: &Location, new: &Location) -> Result<()> {
+    call_int_hook!(sb_pivotroot, old, new)
+}
+
+/// `security_move_mount`.
+pub fn move_mount(from: &Location, to: &Location) -> Result<()> {
+    call_int_hook!(move_mount, from, to)
+}
+
 /// `security_file_truncate`.
 pub fn file_truncate(file: &File) -> Result<()> {
     call_int_hook!(file_truncate, file)
