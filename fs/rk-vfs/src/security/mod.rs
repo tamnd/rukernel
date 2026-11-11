@@ -299,7 +299,8 @@ pub struct Task<'a> {
 pub struct Bprm<'a> {
     /// The name of the file that the caller gave.
     pub filename: &'a [u8],
-    /// The file that runs. For a script, it is the interpreter after `bprm_creds_from_file`.
+    /// The file that runs. For a script, it is the script in `bprm_creds_for_exec`, and the
+    /// interpreter in the hooks after it.
     pub file: &'a Location,
     /// The new credentials. The hooks can change them.
     pub cred: &'a mut Cred,

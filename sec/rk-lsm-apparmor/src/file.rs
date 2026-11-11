@@ -11,6 +11,7 @@
 use crate::domain::{self, FileAudit, audit_file, str_perms};
 use crate::policy::{Mode, Profile};
 use crate::unpack::{Perms, perm};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::mman::{MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
@@ -139,12 +140,11 @@ pub fn file_open(file: &File, cred: &Cred, flags: u32) {
     let Some(off) = file_offset() else { return };
     // A file that is not in the tree of a file system has no path to check.
     let Some(at) = file.location() else { return };
-    let Some(p) = domain::profile_of(cred) else { return };
-    if p.mode == Mode::Unconfined {
-        return;
-    }
     let request = map_open_flags(flags);
-    path_perm(op::OPEN, &p, at, request, cred.fsuid);
+    // Each profile of a stack checks the open.
+    for p in domain::label_of(cred).iter().filter(|p| p.mode != Mode::Unconfined) {
+        path_perm(op::OPEN, p, at, request, cred.fsuid);
+    }
     file.security().store(off + ALLOW, u64::from(request));
 }
 
@@ -167,19 +167,21 @@ pub fn file_perm(op: &'static str, file: &File, request: u32) {
         return;
     }
     let Some(at) = file.location() else { return };
-    // The newest version of the profile of the task. A profile that was removed is
-    // `unconfined`.
-    let Some(p) = domain::profile_by_id(label) else { return };
+    // The newest version of the label of the task. A profile that was removed goes out of
+    // the label. Each profile of a stack checks the access.
+    let l = domain::label_by_id(label);
+    // Each profile makes its record, so the check does not stop at the first denial.
+    let check = |l: &[Arc<Profile>]| {
+        let confined = l.iter().filter(|p| p.mode != Mode::Unconfined);
+        confined.filter(|p| !path_perm(op, p, at, request, cred.fsuid)).count() == 0
+    };
     let mut ok = true;
     if flabel != label {
-        ok = path_perm(op, &p, at, request, cred.fsuid);
+        ok = check(&l);
     }
     if denied != 0 && ok {
-        // The profile of the file also checks the new permissions.
-        let fp = if flabel == label { Some(p.clone()) } else { domain::profile_by_id(flabel) };
-        if let Some(fp) = fp {
-            ok = path_perm(op, &fp, at, request, cred.fsuid);
-        }
+        // The label of the file also checks the new permissions.
+        ok = if flabel == label { check(&l) } else { check(&domain::label_by_id(flabel)) };
     }
     // As `update_file_ctx` of Linux. This kernel keeps one label for a file, so the file gets
     // the label of the task.

@@ -11,6 +11,7 @@
 //! changeprofile NAME      changes to the profile NAME
 //! permprofile NAME        only does the checks of changeprofile
 //! exec NAME               changes to the profile NAME at the next exec (attr/exec only)
+//! stack NAME              puts the profile NAME on a stack, now or at the next exec
 //! ```
 //!
 //! After `changehat TOKEN^`, the names of more hats can follow, each after a 0 byte. The task
@@ -19,12 +20,17 @@
 //! Each profile acts in complain mode for the `change_profile` rules: a change that the rules
 //! do not allow gives an `ALLOWED` record and goes on. A hat or a profile that is not there
 //! gives a learning profile in complain mode, and an error in the other modes, as on Linux. A
-//! wrong token kills the task, also in complain mode, as on Linux. A stack (`stack` or
-//! `&NAME`) is not there yet and gives `EINVAL`.
+//! wrong token kills the task, also in complain mode, as on Linux.
+//!
+//! `changeprofile &NAME` and `exec &NAME` put the profile NAME on a stack with the label of the
+//! task, and NAME can itself be a stack `A//&B`. As on Linux, a stack has no check of the
+//! `change_profile` rules, because a stack only adds limits. A stack that is not there gives
+//! `ENOENT` and no learning profile. A stack for the next exec goes on the label of the task at
+//! the exec, as on Linux. A task with a stack can not change its hat, and gets `EPERM`.
 
 use crate::audit::{self, Kind};
 use crate::domain::{self, FileAudit, slot};
-use crate::policy::{Mode, Ns, Profile, ROOT};
+use crate::policy::{self, Mode, Ns, Profile};
 use crate::unpack::{Pdb, Perms, class, perm};
 use alloc::format;
 use alloc::string::String;
@@ -139,9 +145,11 @@ pub fn setattr(attr: u64, value: &[u8]) -> Result<usize> {
             let (token, hats) = parse_hats(args, value.len() - cmd.args).ok_or(Errno::EINVAL)?;
             change_hat(&hats, token, cmd.name == b"permhat")
         }
-        (attr::CURRENT, b"changeprofile") => change_profile(cstr(args), false, false),
-        (attr::CURRENT, b"permprofile") => change_profile(cstr(args), false, true),
-        (attr::EXEC, b"exec") => change_profile(cstr(args), true, false),
+        (attr::CURRENT, b"changeprofile") => change_profile(cstr(args), false, false, false),
+        (attr::CURRENT, b"permprofile") => change_profile(cstr(args), false, false, true),
+        (attr::CURRENT, b"stack") => change_profile(cstr(args), true, false, false),
+        (attr::EXEC, b"exec") => change_profile(cstr(args), false, true, false),
+        (attr::EXEC, b"stack") => change_profile(cstr(args), true, true, false),
         _ => {
             bad_command(attr);
             Err(Errno::EINVAL)
@@ -154,6 +162,7 @@ pub fn setattr(attr: u64, value: &[u8]) -> Result<usize> {
 /// denial in each mode.
 fn bad_command(attr: u64) {
     let p = domain::profile_of(&rk_vfs::cred::current());
+    let fq = p.as_deref().map(Profile::fqname);
     let d = audit::Data {
         op: Some("setprocattr"),
         info: Some(match attr {
@@ -162,7 +171,7 @@ fn bad_command(attr: u64) {
             _ => "invalid",
         }),
         error: -i32::from(Errno::EINVAL.get()),
-        profile: Some(p.as_ref().map_or("unconfined", |p| p.name.as_str())),
+        profile: Some(fq.as_deref().unwrap_or("unconfined")),
         ..audit::Data::default()
     };
     audit::log(Kind::Denied, &d, "");
@@ -232,9 +241,9 @@ fn audit_hat(
 
 /// The record of a wrong token, and the kill of the caller, as the label `kill` of
 /// `aa_change_hat` of Linux. Gives `EACCES`.
-fn token_fail(p: Option<&Profile>, target: Option<&Profile>) -> Errno {
+fn token_fail(p: Option<&Profile>, target: &[Arc<Profile>]) -> Errno {
     let perms = Perms { kill: perm::CHANGEHAT, ..Perms::default() };
-    let target = domain::label_text_plain(target);
+    let target = domain::label_text_plain(target, p);
     audit_hat(
         p,
         &perms,
@@ -302,9 +311,19 @@ fn find_hat(ns: &Ns, p: &Profile, hats: &[&[u8]]) -> Result<Arc<Profile>> {
 /// `aa_change_hat` of Linux. `test` only does the checks.
 fn change_hat(hats: &[&[u8]], token: u64, test: bool) -> Result<()> {
     let cred = rk_vfs::cred::current();
-    let label = domain::profile_of(&cred);
+    let full = domain::label_of(&cred);
+    let label = full.first().cloned();
+    if full.len() > 1 {
+        // A change of the hat of each profile of a stack is not there yet.
+        let p = label.as_deref();
+        let info = Some("stack can not change_hat");
+        audit_hat(p, &Perms::default(), b"", None, info, Errno::EPERM, domain::mode_kind(p));
+        return Err(Errno::EPERM);
+    }
     let unconfined = label.as_ref().is_none_or(|p| p.mode == Mode::Unconfined);
-    if unconfined && label.as_ref().is_none_or(|p| ROOT.children(Some(&p.name)).is_empty()) {
+    let no_hats =
+        |p: &Profile| policy::with_ns(p.ns.as_deref(), |ns| ns.children(Some(&p.name)).is_empty());
+    if unconfined && label.as_deref().is_none_or(no_hats) {
         let p = label.as_deref();
         let info = Some("unconfined can not change_hat");
         audit_hat(p, &Perms::default(), b"", None, info, Errno::EPERM, domain::mode_kind(p));
@@ -313,17 +332,17 @@ fn change_hat(hats: &[&[u8]], token: u64, test: bool) -> Result<()> {
     let previous = domain::ref_label(domain::load(&cred, slot::PREVIOUS));
     let same_token = domain::load(&cred, slot::TOKEN) == token;
     if let Some(p) = label.as_ref().filter(|_| !hats.is_empty()) {
-        let hat = find_hat(&ROOT, p, hats)?;
+        let hat = policy::with_ns(p.ns.as_deref(), |ns| find_hat(ns, p, hats))?;
         if test {
             return Ok(());
         }
         // `aa_set_current_hat`: the first change keeps the label and the token.
         if previous.is_some() && !same_token {
-            return Err(token_fail(Some(p), Some(&hat)));
+            return Err(token_fail(Some(p), core::slice::from_ref(&hat)));
         }
         let new = Cred::clone(&cred);
         if previous.is_none() {
-            domain::store(&new, slot::PREVIOUS, domain::label_ref(Some(p)));
+            domain::store(&new, slot::PREVIOUS, domain::label_ref(&full));
             domain::store(&new, slot::TOKEN, token);
         }
         domain::set_profile(&new, Some(&hat));
@@ -332,36 +351,54 @@ fn change_hat(hats: &[&[u8]], token: u64, test: bool) -> Result<()> {
     } else if let Some(prev) = previous.filter(|_| !test) {
         // `aa_restore_previous_label`.
         if !same_token {
-            return Err(token_fail(label.as_deref(), prev.as_deref()));
+            return Err(token_fail(label.as_deref(), &prev));
         }
         let new = Cred::clone(&cred);
-        domain::set_profile(&new, prev.as_deref());
+        domain::set_label(&new, &prev);
         domain::clear_trans(&new);
         commit(new);
     }
     Ok(())
 }
 
-/// The label with the name `name`, as `aa_label_parse` of Linux for a label of one profile in
-/// the root namespace. `Some(None)` is `unconfined`.
-fn parse_label(name: &str) -> Option<Option<Arc<Profile>>> {
+/// The profile with the name `name`, as `aa_label_parse` of Linux for one component of a label:
+/// `NAME` in the namespace of the profile `view`, or `:NS:NAME` or `:NS://NAME` in the child
+/// namespace `NS`. `Some(None)` is `unconfined`.
+fn parse_profile(name: &str, view: Option<&Profile>) -> Option<Option<Arc<Profile>>> {
     if name == "unconfined" {
         return Some(None);
     }
-    if name.starts_with(':') || name.contains("//&") {
-        return None;
+    if name.starts_with(':') {
+        return policy::lookup_fq(name).map(Some);
     }
-    ROOT.lookup(name).map(Some)
+    policy::with_ns(view.and_then(|v| v.ns.as_deref()), |ns| ns.lookup(name)).map(Some)
 }
 
-/// The change to the profile `fqname` now, or at the next exec with `onexec`, as
-/// `aa_change_profile` of Linux. `test` only does the checks.
-fn change_profile(fqname: &[u8], onexec: bool, test: bool) -> Result<()> {
-    if fqname.is_empty() || fqname[0] == b'&' {
+/// The label with the name `name`, `aa_label_parse` of Linux: the profiles of the components
+/// with `//&` between them. An empty label is `unconfined`. Gives `None` if a profile is not
+/// there.
+fn parse_label(name: &str, view: Option<&Profile>) -> Option<domain::Label> {
+    let mut out = Vec::new();
+    for part in name.split(domain::STACK) {
+        out.extend(parse_profile(part, view)?);
+    }
+    Some(out)
+}
+
+/// The change to the label `fqname` now, or at the next exec with `onexec`, as
+/// `aa_change_profile` of Linux. `test` only does the checks. A name that starts with `&` puts
+/// the label on a stack with the label of the task, as `stack`.
+fn change_profile(fqname: &[u8], stack: bool, onexec: bool, test: bool) -> Result<()> {
+    let (stack, fqname) = match fqname {
+        [b'&', rest @ ..] => (true, rest),
+        _ => (stack, fqname),
+    };
+    if fqname.is_empty() {
         return Err(Errno::EINVAL);
     }
     let cred = rk_vfs::cred::current();
-    let label = domain::profile_of(&cred);
+    let full = domain::label_of(&cred);
+    let label = full.first().cloned();
     let (op, request) = if onexec {
         ("change_onexec", perm::ONEXEC)
     } else {
@@ -370,14 +407,14 @@ fn change_profile(fqname: &[u8], onexec: bool, test: bool) -> Result<()> {
     let name = String::from_utf8_lossy(fqname);
     let mut a =
         FileAudit { op, request, name: fqname, target: None, ouid: 0, info: None, error: None };
-    let confined = label.as_ref().filter(|p| p.mode != Mode::Unconfined);
     let complain = label.as_ref().is_some_and(|p| p.mode == Mode::Complain);
-    let target = match (parse_label(&name), label.as_ref()) {
+    let target = match (parse_label(&name, label.as_deref()), label.as_ref()) {
         (Some(t), _) => {
-            if let Some(p) = confined {
+            // As on Linux, a stack is always a subset, so only a change has the check.
+            for p in full.iter().filter(|p| p.mode != Mode::Unconfined && !stack) {
                 let empty = Pdb::default();
                 let file = p.rules.as_ref().map_or(&empty, |r| &r.file);
-                let target = domain::label_text_plain(t.as_deref());
+                let target = domain::label_text_plain(&t, Some(p));
                 let fsuid = cred.fsuid;
                 let start = file.start[class::FILE];
                 let (perms, ok) = domain::change_perms(file, start, &target, request, fsuid)
@@ -391,7 +428,9 @@ fn change_profile(fqname: &[u8], onexec: bool, test: bool) -> Result<()> {
             t
         }
         // In complain mode, a profile that is not there gives a learning profile.
-        (None, Some(p)) if complain && !test => Some(ROOT.learning(p, false, &name)),
+        (None, Some(p)) if complain && !test && !stack && !name.contains(domain::STACK) => {
+            alloc::vec![policy::with_ns(p.ns.as_deref(), |ns| ns.learning(p, false, &name))]
+        }
         (None, _) => {
             a.info = Some("label not found");
             a.error = Some(Errno::ENOENT);
@@ -405,13 +444,17 @@ fn change_profile(fqname: &[u8], onexec: bool, test: bool) -> Result<()> {
     }
     let new = Cred::clone(&cred);
     if onexec {
-        domain::store(&new, slot::ONEXEC, domain::label_ref(target.as_deref()));
+        // As `aa_set_current_onexec` of Linux, the label for the exec is the target only, and
+        // the token tells if it goes on a stack. The exec makes the stack.
+        domain::store(&new, slot::ONEXEC, domain::label_ref(&target));
+        domain::store(&new, slot::TOKEN, u64::from(stack));
     } else {
+        let target = if stack { domain::merge(&full, &target) } else { target };
         // `aa_replace_current_label`: a change to `unconfined` clears the context.
-        if target.is_none() {
+        if target.is_empty() {
             domain::clear_trans(&new);
         }
-        domain::set_profile(&new, target.as_deref());
+        domain::set_label(&new, &target);
     }
     commit(new);
     Ok(())
@@ -468,5 +511,19 @@ mod tests {
         assert_eq!(find_hat(&ns, &hat, &[b"x"]).unwrap_err(), Errno::ECHILD);
         assert_eq!(find_hat(&ns, &hat, &[b"null-none"]).unwrap().name, "rk_test//null-none");
         assert_eq!(find_hat(&ns, &p, &[b"null-none"]).unwrap().name, "rk_test//null-none");
+    }
+
+    #[test]
+    fn a_stack_parses_as_on_linux() {
+        assert!(replace(&policy::ROOT, Change::Load, RK_TEST).is_ok());
+        let names = |l: &[Arc<Profile>]| l.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        let l = parse_label("rk_test//&rk_test//hat1", None).unwrap();
+        assert_eq!(names(&l), ["rk_test", "rk_test//hat1"]);
+        assert_eq!(domain::label_text_plain(&l, None), "rk_test//&rk_test//hat1");
+        assert!(parse_label("unconfined", None).unwrap().is_empty());
+        assert!(parse_label("rk_test//&none", None).is_none());
+        // The stack of a label with a part of it adds only the new profiles.
+        let one = parse_label("rk_test", None).unwrap();
+        assert_eq!(names(&domain::merge(&one, &l)), ["rk_test", "rk_test//hat1"]);
     }
 }
