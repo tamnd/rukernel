@@ -301,6 +301,9 @@ impl FsContext {
                     if parent.dir.dentry.is_dead() {
                         return Err(Errno::ENOENT);
                     }
+                    // `may_o_create` of Linux asks the LSM for a `mknod` first.
+                    let new_mode = mode::S_IFREG | (perm & mode::PERM_MASK & !self.umask);
+                    crate::security::path_mknod(&parent.dir, &parent.name, new_mode, 0)?;
                     self.may_change(&parent.dir)?;
                     check_immutable(&**parent.dir.inode())?;
                     let dir = parent.dir.inode();
@@ -431,9 +434,49 @@ impl FsContext {
                 file.set_nonotify();
                 return Err(e);
             }
+        }
+        // The truncate comes after the checks of the open, as `handle_truncate` in `do_open` of
+        // Linux.
+        if let Err(e) = self.open_truncate(&file, flags, created) {
+            // The open did not complete, so the close gives no event.
+            file.set_nonotify();
+            return Err(e);
+        }
+        if !file.flags().is_path()
+            && let Some(at) = file.location()
+        {
             crate::notify::open(at, false);
         }
         Ok(file)
+    }
+
+    /// The truncate of an open of a regular file with `O_TRUNC` for a write. The truncate
+    /// clears the set-ID bits, as `handle_truncate` of Linux.
+    fn open_truncate(&self, file: &File, flags: u32, created: bool) -> Result<()> {
+        let write = matches!(flags & o::O_ACCMODE, o::O_WRONLY | o::O_RDWR);
+        if !write || flags & o::O_TRUNC == 0 || file.flags().is_path() {
+            return Ok(());
+        }
+        let Some(at) = file.location() else {
+            return Ok(());
+        };
+        let meta = at.inode().metadata();
+        if meta.file_type() != Some(FileType::Regular) {
+            return Ok(());
+        }
+        // As `do_open` of Linux, a new file has no truncate, so it has no LSM check and no
+        // event of it.
+        if !created {
+            crate::security::file_truncate(file)?;
+        }
+        let mode = if created { None } else { self.cred.write_kill(&meta) };
+        let attr = SetAttr { size: Some(0), mode, ..SetAttr::default() };
+        at.inode().set_attr(&attr)?;
+        crate::mapped::changed(at.inode(), 0, u64::MAX);
+        if !created {
+            crate::notify::change(Some(at), at.inode(), &attr);
+        }
+        Ok(())
     }
 
     /// The part of `open_inode` that makes the open file.
@@ -513,22 +556,7 @@ impl FsContext {
                 // The open breaks the leases that conflict, as `break_lease` in
                 // `do_dentry_open` of Linux. The file counts as open during the wait, so a
                 // holder cannot downgrade to a read lease while an open for a write waits.
-                let finish = || -> Result<()> {
-                    crate::lease::break_lease(at.inode(), flags)?;
-                    if write && flags & o::O_TRUNC != 0 {
-                        // The truncate clears the set-ID bits, as `handle_truncate` of Linux.
-                        let mode = if created { None } else { self.cred.write_kill(&meta) };
-                        let attr = SetAttr { size: Some(0), mode, ..SetAttr::default() };
-                        at.inode().set_attr(&attr)?;
-                        crate::mapped::changed(at.inode(), 0, u64::MAX);
-                        // As `do_open` of Linux, a new file has no truncate and no event of it.
-                        if !created {
-                            crate::notify::change(Some(&at), at.inode(), &attr);
-                        }
-                    }
-                    Ok(())
-                };
-                if let Err(e) = finish() {
+                if let Err(e) = crate::lease::break_lease(at.inode(), flags) {
                     // The open did not complete, so the close gives no event.
                     file.set_nonotify();
                     return Err(e);
@@ -571,15 +599,16 @@ impl FsContext {
         if absent(&r) { Ok(false) } else { r.map(|_| true) }
     }
 
-    /// Makes a new inode of the type `kind` for `mkdirat`, `mknodat` and `symlinkat`. `f` gets
-    /// the directory, the name and the permission bits after the umask or the default ACL of the
-    /// directory masks `perm`.
+    /// Makes a new inode of the type `kind` for `mkdirat`, `mknodat` and `symlinkat`. `check` is
+    /// the LSM check, which gets the directory and the name. `f` gets the directory, the name and
+    /// the permission bits after the umask or the default ACL of the directory masks `perm`.
     fn make(
         &self,
         start: &Location,
         path: &[u8],
         kind: FileType,
         perm: u32,
+        check: impl FnOnce(&Location, &[u8]) -> Result<()>,
         f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
     ) -> Result<Location> {
         let parent = self.parent(start, path)?;
@@ -591,6 +620,8 @@ impl FsContext {
         }
         // As `filename_create` of Linux, a name that exists gives `EEXIST` before `EROFS`.
         parent.dir.mount.want_write()?;
+        // The LSM check comes before the checks of `may_create`, as `do_mkdirat` of Linux.
+        check(&parent.dir, &parent.name)?;
         if parent.dir.dentry.is_dead() {
             return Err(Errno::ENOENT);
         }
@@ -623,12 +654,15 @@ impl FsContext {
         perm: u32,
         f: impl FnOnce(&InodeRef, &[u8], u32) -> Result<InodeRef>,
     ) -> Result<Location> {
-        self.make(start, path, FileType::Regular, perm & mode::PERM_MASK, f)
+        self.make(start, path, FileType::Regular, perm & mode::PERM_MASK, |_, _| Ok(()), f)
     }
 
     /// `mkdirat`.
     pub fn mkdir(&self, start: &Location, path: &[u8], perm: u32) -> Result<Location> {
-        self.make(start, path, FileType::Directory, perm & 0o1777, |dir, name, perm| {
+        let check = |dir: &Location, name: &[u8]| {
+            crate::security::path_mkdir(dir, name, mode::S_IFDIR | (perm & 0o1777))
+        };
+        self.make(start, path, FileType::Directory, perm & 0o1777, check, |dir, name, perm| {
             dir.create(name, FileType::Directory, perm, 0)
         })
     }
@@ -643,7 +677,11 @@ impl FsContext {
         if matches!(kind, FileType::Directory | FileType::Symlink) {
             return Err(Errno::EINVAL);
         }
-        self.make(start, path, kind, mode & mode::PERM_MASK, |dir, name, perm| {
+        let check = |dir: &Location, name: &[u8]| {
+            let full = kind.mode_bits() | (mode & mode::PERM_MASK);
+            crate::security::path_mknod(dir, name, full, rdev)
+        };
+        self.make(start, path, kind, mode & mode::PERM_MASK, check, |dir, name, perm| {
             if matches!(kind, FileType::CharDevice | FileType::BlockDevice)
                 && !self.cred.capable(cap::MKNOD)
             {
@@ -661,7 +699,10 @@ impl FsContext {
         if target.is_empty() {
             return Err(Errno::ENOENT);
         }
-        self.make(start, path, FileType::Symlink, 0o777, |dir, name, _| dir.symlink(name, target))
+        let check = |dir: &Location, name: &[u8]| crate::security::path_symlink(dir, name, target);
+        self.make(start, path, FileType::Symlink, 0o777, check, |dir, name, _| {
+            dir.symlink(name, target)
+        })
     }
 
     /// `linkat`. `old` is the location of the file, after the walk of the old path.
@@ -681,6 +722,7 @@ impl FsContext {
             return Err(Errno::ENOENT);
         }
         self.cred.may_link(protected::get(&protected::HARDLINKS), &**old.inode())?;
+        crate::security::path_link(old, &parent.dir, &parent.name)?;
         self.may_change(&parent.dir)?;
         check_immutable(&**parent.dir.inode())?;
         check_fixed(&**old.inode())?;
@@ -723,6 +765,12 @@ impl FsContext {
         }
         let at = self.child(&parent)?;
         let is_dir = is_type(at.inode(), FileType::Directory);
+        // The LSM check comes before `may_delete`, as `do_rmdir` and `do_unlinkat` of Linux.
+        if dir {
+            crate::security::path_rmdir(&parent.dir, &at)?;
+        } else {
+            crate::security::path_unlink(&parent.dir, &at)?;
+        }
         // The checks of `may_delete` of Linux.
         self.may_change(&parent.dir)?;
         check_fixed(&**parent.dir.inode())?;
@@ -790,7 +838,7 @@ impl FsContext {
         let from = self.child(&old)?;
         let from_dir = is_type(from.inode(), FileType::Directory);
         if exchange {
-            return self.exchange(&old, &new, &from);
+            return self.exchange(&old, &new, &from, flags);
         }
         if (old.trailing_slash || new.trailing_slash) && !from_dir {
             return Err(Errno::ENOTDIR);
@@ -803,9 +851,6 @@ impl FsContext {
         if from_dir && new.dir.dentry.is_under(&from.dentry) {
             return Err(Errno::EINVAL);
         }
-        if to.as_ref().is_some_and(|to| Arc::ptr_eq(from.inode(), to.inode())) {
-            return Ok(());
-        }
         // A directory above the old parent is not empty, as the `trap` of `lock_rename` in
         // `do_renameat2` of Linux gives. The lock of the target below needs this check first.
         if let Some(to) = &to
@@ -813,6 +858,11 @@ impl FsContext {
             && old.dir.dentry.is_under(&to.dentry)
         {
             return Err(Errno::ENOTEMPTY);
+        }
+        // The LSM check comes before `vfs_rename`, as `do_renameat2` of Linux.
+        crate::security::path_rename(&from, &new.dir, &new.name, to.as_ref(), flags)?;
+        if to.as_ref().is_some_and(|to| Arc::ptr_eq(from.inode(), to.inode())) {
+            return Ok(());
         }
         // The checks of `may_delete` and `may_create` of Linux, in their order: the permission
         // checks come before the checks of the types. A directory that moves to a new parent
@@ -880,13 +930,21 @@ impl FsContext {
 
     /// The part of `renameat2` for `RENAME_EXCHANGE`, which exchanges `from`, the child of `old`,
     /// and the child of `new`. The caller examined the flags and the mounts of the parents.
-    fn exchange(&self, old: &Parent, new: &Parent, from: &Location) -> Result<()> {
+    fn exchange(&self, old: &Parent, new: &Parent, from: &Location, flags: u32) -> Result<()> {
         let to = self.child(new)?;
         let from_dir = is_type(from.inode(), FileType::Directory);
         let to_dir = is_type(to.inode(), FileType::Directory);
         if (old.trailing_slash && !from_dir) || (new.trailing_slash && !to_dir) {
             return Err(Errno::ENOTDIR);
         }
+        if from_dir && new.dir.dentry.is_under(&from.dentry) {
+            return Err(Errno::EINVAL);
+        }
+        if to_dir && old.dir.dentry.is_under(&to.dentry) {
+            return Err(Errno::EINVAL);
+        }
+        // The LSM check comes before `vfs_rename`, as `do_renameat2` of Linux.
+        crate::security::path_rename(from, &new.dir, &new.name, Some(&to), flags)?;
         if Arc::ptr_eq(from.inode(), to.inode()) {
             return Ok(());
         }
@@ -894,12 +952,6 @@ impl FsContext {
             if at.is_mount_root() || self.ns.mounted_on(at).is_some() {
                 return Err(Errno::EBUSY);
             }
-        }
-        if from_dir && new.dir.dentry.is_under(&from.dentry) {
-            return Err(Errno::EINVAL);
-        }
-        if to_dir && old.dir.dentry.is_under(&to.dentry) {
-            return Err(Errno::EINVAL);
         }
         // Each name is deleted from its directory and made in the other, as `may_delete` and
         // `may_create` of Linux examine for an exchange.

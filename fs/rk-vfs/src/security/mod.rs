@@ -441,6 +441,72 @@ pub fn file_open(file: &File, cred: &Cred, flags: u32) -> Result<()> {
     call_int_hook!(file_open, file, cred, flags)
 }
 
+/// `security_path_unlink`.
+pub fn path_unlink(dir: &Location, at: &Location) -> Result<()> {
+    call_int_hook!(path_unlink, dir, at)
+}
+
+/// `security_path_mkdir`.
+pub fn path_mkdir(dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+    call_int_hook!(path_mkdir, dir, name, mode)
+}
+
+/// `security_path_rmdir`.
+pub fn path_rmdir(dir: &Location, at: &Location) -> Result<()> {
+    call_int_hook!(path_rmdir, dir, at)
+}
+
+/// `security_path_mknod`.
+pub fn path_mknod(dir: &Location, name: &[u8], mode: u32, dev: u64) -> Result<()> {
+    call_int_hook!(path_mknod, dir, name, mode, dev)
+}
+
+/// `security_path_truncate`.
+pub fn path_truncate(at: &Location) -> Result<()> {
+    call_int_hook!(path_truncate, at)
+}
+
+/// `security_path_symlink`.
+pub fn path_symlink(dir: &Location, name: &[u8], target: &[u8]) -> Result<()> {
+    call_int_hook!(path_symlink, dir, name, target)
+}
+
+/// `security_path_link`.
+pub fn path_link(old: &Location, dir: &Location, name: &[u8]) -> Result<()> {
+    call_int_hook!(path_link, old, dir, name)
+}
+
+/// `security_path_rename`.
+pub fn path_rename(
+    old: &Location,
+    dir: &Location,
+    name: &[u8],
+    new: Option<&Location>,
+    flags: u32,
+) -> Result<()> {
+    call_int_hook!(path_rename, old, dir, name, new, flags)
+}
+
+/// `security_path_chmod`.
+pub fn path_chmod(at: &Location, mode: u32) -> Result<()> {
+    call_int_hook!(path_chmod, at, mode)
+}
+
+/// `security_path_chown`.
+pub fn path_chown(at: &Location, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+    call_int_hook!(path_chown, at, uid, gid)
+}
+
+/// `security_inode_getattr`.
+pub fn inode_getattr(at: &Location) -> Result<()> {
+    call_int_hook!(inode_getattr, at)
+}
+
+/// `security_file_truncate`.
+pub fn file_truncate(file: &File) -> Result<()> {
+    call_int_hook!(file_truncate, file)
+}
+
 /// `security_task_alloc`.
 pub fn task_alloc(child: &Task<'_>, clone_flags: u64) -> Result<()> {
     call_int_hook!(task_alloc, child, clone_flags)

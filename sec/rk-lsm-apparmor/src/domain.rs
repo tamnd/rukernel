@@ -258,15 +258,22 @@ fn accum(a: &mut Perms, b: &Perms) {
 /// The permissions of the file rules for the path `name`, `aa_str_perms` of Linux. `owner`
 /// tells if the file system user ID of the task is the owner of the file.
 pub fn str_perms(pdb: &Pdb, name: &[u8], owner: bool) -> Perms {
-    let Some(d) = pdb.dfa.as_ref() else { return Perms::default() };
-    lookup_fperms(pdb, d.match_bytes(pdb.start[class::FILE], name), owner)
+    str_perms_at(pdb, pdb.start[class::FILE], name, owner).1
+}
+
+/// As [`str_perms`], but from the state `start`. Also gives the state after the name, for the
+/// second name of a pair of names.
+pub fn str_perms_at(pdb: &Pdb, start: State, name: &[u8], owner: bool) -> (State, Perms) {
+    let Some(d) = pdb.dfa.as_ref() else { return (NOMATCH, Perms::default()) };
+    let state = d.match_bytes(start, name);
+    (state, lookup_fperms(pdb, state, owner))
 }
 
 /// The characters of the file permissions in the log, `aa_file_perm_chrs` of Linux.
 const FILE_PERM_CHRS: &[u8] = b"xwracd         km l     ";
 
 /// The permissions that the log of a file operation shows, `AA_AUDIT_FILE_MASK` of Linux.
-const AUDIT_FILE_MASK: u32 = perm::READ
+pub const AUDIT_FILE_MASK: u32 = perm::READ
     | perm::WRITE
     | perm::EXEC
     | perm::APPEND
