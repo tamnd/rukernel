@@ -47,6 +47,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::ops::Bound::{Excluded, Included, Unbounded};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::netlink::{
@@ -361,11 +362,25 @@ enum NftData {
 
 /// The key of an element. A catch-all element has no key, and the end of an interval has the
 /// key of its end.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ElemKey {
     catchall: bool,
     key: Vec<u8>,
     end: bool,
+}
+
+/// The catch-all elements come last. At the same key, the end of a range comes before the start
+/// of the next range, as `nft_rbtree_cmp` of Linux: the end of a range is not in the range.
+impl Ord for ElemKey {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        (self.catchall, &self.key, !self.end).cmp(&(o.catchall, &o.key, !o.end))
+    }
+}
+
+impl PartialOrd for ElemKey {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
 }
 
 /// An element of a set, as `struct nft_set_ext` of Linux.
@@ -381,6 +396,17 @@ struct NftElem {
     expires: u64,
     /// The stateful expressions of the element, as `NFT_SET_EXT_EXPRESSIONS` of Linux.
     exprs: Vec<NftObjState>,
+    /// The number of the insert of the element, for the order of the dump of a set of
+    /// nft_set_pipapo.c.
+    seq: u64,
+}
+
+/// The number of the next insert of an element.
+static NFT_ELEM_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// The number of a new insert of an element.
+fn nft_elem_seq() -> u64 {
+    NFT_ELEM_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 impl NftElem {
@@ -506,8 +532,19 @@ impl NftSet {
         if self.flags & NFT_SET_MAP != 0 { self.dtype } else { NFT_DATA_VALUE }
     }
 
+    /// The set has ranges of keys of more than one field, as the sets that
+    /// `nft_pipapo_estimate` of Linux takes. Its dump has the elements in the order of their
+    /// inserts, as `nft_pipapo_walk`, and the catch-all elements last.
+    fn is_pipapo(&self) -> bool {
+        self.flags & NFT_SET_INTERVAL != 0 && self.field_len.len() >= 2
+    }
+
     /// The number of elements that count for the size of the set.
     fn nelems(&self) -> usize {
+        // The catch-all elements come last. Only a set with timeouts has elements that expire.
+        if self.flags & NFT_SET_TIMEOUT == 0 {
+            return self.elems.len() - self.elems.keys().rev().take_while(|k| k.catchall).count();
+        }
         let now = nft_now_ns();
         self.elems.iter().filter(|(k, e)| !k.catchall && !e.expired(now)).count()
     }
@@ -536,6 +573,135 @@ impl NftSet {
         nft_dyn_apply(&mut elems, &self.dynamic.0.lock(), &BTreeSet::new());
         elems
     }
+}
+
+/// The key is in the range from `start` to `end`, with the two ends in the range. A key of more
+/// than one field, with the lengths `fields` in bytes that are multiples of 4, must be in the
+/// range in each field, as the match of nft_set_pipapo.c of Linux.
+fn nft_range_has(fields: &[usize], start: &[u8], end: &[u8], key: &[u8]) -> bool {
+    if fields.is_empty() {
+        return start <= key && key <= end;
+    }
+    let mut at = 0;
+    fields.iter().all(|&len| {
+        let f = at..(at + len).min(key.len()).min(start.len()).min(end.len());
+        at += len;
+        start[f.clone()] <= key[f.clone()] && key[f.clone()] <= end[f]
+    })
+}
+
+/// The lengths in bytes of the fields of the key of `set`, each one in 32-bit registers, or
+/// nothing for a key of one field.
+fn nft_set_fields(set: &NftSet) -> Vec<usize> {
+    if set.field_len.len() < 2 {
+        return Vec::new();
+    }
+    set.field_len.iter().map(|&l| usize::from(l).div_ceil(4) * 4).collect()
+}
+
+/// Finds the element of `key` for `NFT_MSG_GETSETELEM`, as the `get` operations of the
+/// backends of sets of Linux. In a set with `NFT_SET_INTERVAL`, a start that is not an element
+/// gives the start of the range that has it, and an end gives the end of the range that has
+/// it, as `__nft_rbtree_get`. An element with `NFTA_SET_ELEM_KEY_END` has the keys of its range
+/// in each field, as `nft_pipapo_get`.
+fn nft_setelem_get<'a>(
+    set: &NftSet,
+    view: &'a BTreeMap<ElemKey, NftElem>,
+    key: &ElemKey,
+) -> Option<(ElemKey, &'a NftElem)> {
+    if let Some(e) = view.get(key) {
+        return Some((key.clone(), e));
+    }
+    if set.flags & NFT_SET_INTERVAL == 0 || key.catchall {
+        return None;
+    }
+    let is_end = |k: &ElemKey, e: &NftElem| k.end || e.flags & NFT_SET_ELEM_INTERVAL_END != 0;
+    if view.values().any(|e| e.key_end.is_some()) {
+        let fields = nft_set_fields(set);
+        return view
+            .iter()
+            .filter(|(k, _)| !k.catchall)
+            .find(|(k, e)| {
+                e.key_end.as_ref().is_some_and(|end| nft_range_has(&fields, &k.key, end, &key.key))
+            })
+            .map(|(k, e)| (k.clone(), e));
+    }
+    let (k, e) = if key.end {
+        // The first element after the key must be the end of its range.
+        let after = (Excluded(key.clone()), Unbounded);
+        view.range(after).find(|(k, _)| !k.catchall).filter(|(k, e)| is_end(k, e))?
+    } else {
+        // The key just after the end of a range is not in the range.
+        let end = ElemKey { end: true, ..key.clone() };
+        if view.contains_key(&end) {
+            return None;
+        }
+        let start = ElemKey { catchall: false, key: Vec::new(), end: false };
+        let before = (Included(start), Excluded(key.clone()));
+        view.range(before).next_back().filter(|(k, e)| !is_end(k, e))?
+    };
+    Some((k.clone(), e))
+}
+
+/// Checks that a new element of a set with `NFT_SET_INTERVAL` does not overlap a range of the
+/// set. An overlap gives `EEXIST`, as `nft_add_set_elem` of Linux gives for `ENOTEMPTY` of the
+/// backends. An element that is the same as one of the set is not an overlap.
+///
+/// An element with `NFTA_SET_ELEM_KEY_END` overlaps a range that has its start or its end, as
+/// `nft_pipapo_insert`. Else, as `__nft_rbtree_insert`, a start overlaps if the closest element
+/// below it is a start, and an end overlaps if the closest element below it or above it is an
+/// end. Anonymous sets can have two starts in a row.
+fn nft_set_overlap(set: &NftSet, key: &ElemKey, key_end: Option<&[u8]>) -> Result<()> {
+    let now = nft_now_ns();
+    let overlap = Err(Errno::EEXIST);
+    if let Some(end) = key_end {
+        // As `nft_pipapo_insert` of Linux: the first element in the order of the inserts that
+        // has the first key must be the same range. Then no element can have the last key.
+        let fields = nft_set_fields(set);
+        let has = |k: &ElemKey, e: &NftElem, x: &[u8]| {
+            e.key_end.as_deref().is_some_and(|e_end| nft_range_has(&fields, &k.key, e_end, x))
+        };
+        let live = || set.live_elems().filter(|(k, _)| !k.catchall);
+        let first = live().filter(|(k, e)| has(k, e, &key.key)).min_by_key(|(_, e)| e.seq);
+        if let Some((k, e)) = first {
+            let same = k.key == key.key && e.key_end.as_deref() == Some(end);
+            return if same { Ok(()) } else { overlap };
+        }
+        if live().any(|(k, e)| has(k, e, end)) {
+            return overlap;
+        }
+        return Ok(());
+    }
+    if set.live_elem(key).is_some() {
+        return Ok(());
+    }
+    let live = |k: &ElemKey| set.live_elem(k).map(|(k, e)| (k.end, e));
+    let at = |key: &Vec<u8>, end| ElemKey { catchall: false, key: key.clone(), end };
+    let is_end = |(end, e): (bool, &NftElem)| end || e.flags & NFT_SET_ELEM_INTERVAL_END != 0;
+    // The closest element below the key: the end at the key, or the start at the key below
+    // before the end there.
+    let below = live(&at(&key.key, true)).or_else(|| {
+        let (k, _) = set.elems.range(..at(&key.key, false)).rev().find(|(_, e)| !e.expired(now))?;
+        live(&at(&k.key, false)).or_else(|| live(k))
+    });
+    // The closest element above the key: the start at the key, or the end at the key above
+    // after the start there.
+    let above = live(&at(&key.key, false)).or_else(|| {
+        let (k, _) = set
+            .elems
+            .range((Excluded(at(&key.key, true)), Unbounded))
+            .find(|(k, e)| !k.catchall && !e.expired(now))?;
+        live(&at(&k.key, true)).or_else(|| live(k))
+    });
+    let below_end = below.map(is_end);
+    if key.end {
+        if below_end == Some(true) || above.map(is_end) == Some(true) {
+            return overlap;
+        }
+    } else if set.flags & NFT_SET_ANONYMOUS == 0 && below_end == Some(false) {
+        return overlap;
+    }
+    Ok(())
 }
 
 /// Puts the elements of `dynset` in `elems`, apart from the keys in `skip`.
@@ -1452,7 +1618,11 @@ fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8
     let mut part: Vec<(&ElemKey, &NftElem)> = Vec::new();
     let mut size = 0;
     let view = set.view();
-    for (k, e) in &view {
+    let mut elems: Vec<(&ElemKey, &NftElem)> = view.iter().collect();
+    if set.is_pipapo() {
+        elems.sort_by_key(|(k, e)| (k.catchall, e.seq));
+    }
+    for (k, e) in elems {
         let len = k.key.len() + e.key_end.as_ref().map_or(0, Vec::len) + 64;
         if !part.is_empty() && size + len > ELEM_DUMP_SIZE {
             out.push(nf_tables_fill_setelem_info(
@@ -1505,7 +1675,7 @@ fn nf_tables_getsetelem(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
         let flags = nft_setelem_parse_flags(set, &ea)?;
         let key =
             nft_setelem_parse_elemkey(set, &ea, flags).inspect_err(|_| info.req.bad_attr(attr))?;
-        let Some(e) = view.get(&key) else {
+        let Some((key, e)) = nft_setelem_get(set, &view, &key) else {
             info.req.bad_attr(attr);
             return Err(Errno::ENOENT);
         };
@@ -2650,6 +2820,9 @@ impl NftBatch {
             }
         }
         let udata = nla_udata(&ea, NFTA_SET_ELEM_USERDATA)?;
+        if set.flags & NFT_SET_INTERVAL != 0 && !key.catchall {
+            nft_set_overlap(set, &key, key_end.as_deref())?;
+        }
         if let Some((_, old)) = set.live_elem(&key) {
             // An element that is there gives `EBUSY` if its data is not the same, and
             // `EEXIST` with `NLM_F_EXCL`.
@@ -2667,11 +2840,15 @@ impl NftBatch {
         if matches!(data, Some(NftData::Verdict { chain: Some(_), .. })) {
             self.validate = true;
         }
-        let elem = NftElem { key_end, data, flags, udata, timeout, expires, exprs };
-        // The elements that have expired go, as the garbage collection of Linux.
-        let now = nft_now_ns();
+        let seq = nft_elem_seq();
+        let elem = NftElem { key_end, data, flags, udata, timeout, expires, exprs, seq };
+        // The elements that have expired go, as the garbage collection of Linux. Only a set
+        // with timeouts has them.
         let set = &mut self.tables[t].sets[s];
-        set.elems.retain(|_, e| !e.expired(now));
+        if set.flags & NFT_SET_TIMEOUT != 0 {
+            let now = nft_now_ns();
+            set.elems.retain(|_, e| !e.expired(now));
+        }
         set.elems.insert(key.clone(), elem);
         set.touched.insert(key.key.clone());
         self.notify_setelem(ctx, NFT_MSG_NEWSETELEM, t, s, &key);
@@ -3128,6 +3305,7 @@ mod tests {
             timeout: 0,
             expires: 0,
             exprs: Vec::new(),
+            seq: 0,
         };
         m.elems.insert(key, elem);
         t.sets.push(m);
@@ -3190,6 +3368,7 @@ mod tests {
             timeout: 0,
             expires: 0,
             exprs: Vec::new(),
+            seq: 0,
         };
         m.elems.insert(key, elem);
         t.sets.push(m);
@@ -3232,6 +3411,7 @@ mod tests {
             timeout: if expires == 0 { 0 } else { 60_000 },
             expires,
             exprs: Vec::new(),
+            seq: 0,
         };
         let mut s = set(b"d");
         s.elems.insert(k(1), elem(0));
@@ -3257,5 +3437,140 @@ mod tests {
         f.flushed = true;
         f.merge_dynamic(&d.0.lock());
         assert!(f.elems.is_empty());
+    }
+
+    #[test]
+    fn a_get_of_an_interval_gives_the_range_that_has_the_key() {
+        let k = |p: u8, end| ElemKey { catchall: false, key: alloc::vec![0, p], end };
+        let elem = |key_end: Option<Vec<u8>>| NftElem {
+            key_end,
+            data: None,
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires: 0,
+            exprs: Vec::new(),
+            seq: 0,
+        };
+        // The ranges 10, 20-30, 40-49 and 50-59, as the starts and the ends after them. The
+        // range 50-59 starts at the end of the range 40-49.
+        let mut s = set(b"s");
+        s.flags = NFT_SET_INTERVAL;
+        s.klen = 2;
+        let ranges = [(10, 11), (20, 31), (40, 50), (50, 60)];
+        for (key, end) in ranges.into_iter().flat_map(|(a, b)| [(a, false), (b, true)]) {
+            s.elems.insert(k(key, end), elem(None));
+        }
+        let v = s.view();
+        let get = |key, end| nft_setelem_get(&s, &v, &k(key, end)).map(|(k, _)| (k.key[1], k.end));
+        assert_eq!(get(10, false), Some((10, false)));
+        assert_eq!(get(22, false), Some((20, false)));
+        assert_eq!(get(25, true), Some((31, true)));
+        assert_eq!(get(15, false), None);
+        assert_eq!(get(11, false), None);
+        assert_eq!(get(5, false), None);
+        assert_eq!(get(15, true), None);
+        assert_eq!(get(35, true), None);
+        assert_eq!(get(45, false), Some((40, false)));
+        assert_eq!(get(55, false), Some((50, false)));
+        assert_eq!(get(45, true), Some((50, true)));
+        assert_eq!(get(52, true), Some((60, true)));
+        // In a set of two fields, each field of the key must be in the range.
+        let mut c = set(b"c");
+        c.flags = NFT_SET_INTERVAL | NFT_SET_CONCAT;
+        c.klen = 8;
+        c.field_len = alloc::vec![4, 2];
+        let key = |a: u8, p: u8| alloc::vec![10, 1, a, 0, 0, p, 0, 0];
+        let start = ElemKey { catchall: false, key: key(0, 1), end: false };
+        c.elems.insert(start.clone(), elem(Some(key(255, 100))));
+        let v = c.view();
+        let get = |a, p| {
+            let k = ElemKey { catchall: false, key: key(a, p), end: false };
+            nft_setelem_get(&c, &v, &k).map(|(k, _)| k)
+        };
+        assert_eq!(get(5, 50), Some(start.clone()));
+        assert_eq!(get(5, 150), None);
+        assert!(!nft_range_has(&nft_set_fields(&c), &key(0, 1), &key(255, 100), &key(5, 0)));
+        assert!(nft_range_has(&[], &key(0, 1), &key(255, 100), &key(5, 0)));
+    }
+
+    #[test]
+    fn an_element_that_overlaps_a_range_gives_eexist() {
+        let elem = |key_end| NftElem {
+            key_end,
+            data: None,
+            flags: 0,
+            udata: None,
+            timeout: 0,
+            expires: 0,
+            exprs: Vec::new(),
+            seq: 0,
+        };
+        // The ranges of sets/0044interval_overlap_0 of nftables: the first and the last key,
+        // and if the set takes the range. A range that a set does not take changes nothing.
+        let k = |p: u16, end| ElemKey { catchall: false, key: p.to_be_bytes().to_vec(), end };
+        let mut s = set(b"s");
+        s.flags = NFT_SET_INTERVAL;
+        s.klen = 2;
+        let simple = [
+            (0, 2, true),
+            (0, 2, true),
+            (0, 1, false),
+            (0, 3, false),
+            (3, 10, true),
+            (3, 9, false),
+            (4, 10, false),
+            (4, 9, false),
+            (20, 30, true),
+            (11, 12, true),
+            (13, 19, true),
+            (25, 40, false),
+            (50, 60, true),
+            (31, 49, true),
+            (59, 60, false),
+        ];
+        for (a, b, ok) in simple {
+            let mut n = s.clone();
+            let mut add = |key: ElemKey| {
+                nft_set_overlap(&n, &key, None)?;
+                n.elems.insert(key, elem(None));
+                Ok::<(), Errno>(())
+            };
+            let r = add(k(a, false)).and_then(|()| add(k(b + 1, true)));
+            assert_eq!(r.is_ok(), ok, "{a}-{b}");
+            if ok {
+                s = n;
+            }
+        }
+        // A set of two fields.
+        let key = |a: u8, b: u8| alloc::vec![0, a, 0, 0, 0, b, 0, 0];
+        let mut c = set(b"c");
+        c.flags = NFT_SET_INTERVAL | NFT_SET_CONCAT;
+        c.klen = 8;
+        c.field_len = alloc::vec![2, 2];
+        let concat = [
+            ((0, 2), (0, 3), true),
+            ((0, 2), (0, 3), true),
+            ((0, 1), (0, 2), false),
+            ((10, 20), (30, 40), true),
+            ((15, 20), (50, 60), true),
+            ((3, 9), (4, 29), true),
+            ((3, 9), (4, 29), true),
+            ((11, 19), (30, 40), false),
+            ((15, 20), (49, 61), true),
+        ];
+        // The second pass adds the ranges again, as the test does before they expire.
+        for (seq, ((a1, a2), (b1, b2), ok)) in concat.iter().chain(&concat).copied().enumerate() {
+            let (start, end) = (key(a1, b1), key(a2, b2));
+            let start = ElemKey { catchall: false, key: start, end: false };
+            assert_eq!(
+                nft_set_overlap(&c, &start, Some(&end)).is_ok(),
+                ok,
+                "{a1}-{a2} . {b1}-{b2}"
+            );
+            if ok && !c.elems.contains_key(&start) {
+                c.elems.insert(start, NftElem { seq: seq as u64, ..elem(Some(end)) });
+            }
+        }
     }
 }
