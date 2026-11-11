@@ -17,8 +17,8 @@
 //! After `changehat TOKEN^`, the names of more hats can follow, each after a 0 byte. The task
 //! goes to the first hat that is there.
 //!
-//! Each profile acts in complain mode for the `change_profile` rules: a change that the rules
-//! do not allow gives an `ALLOWED` record and goes on. A hat or a profile that is not there
+//! A change that the `change_profile` rules do not allow gives `EACCES` and a `DENIED` record.
+//! In complain mode, it gives an `ALLOWED` record and goes on. A hat or a profile that is not there
 //! gives a learning profile in complain mode, and an error in the other modes, as on Linux. A
 //! wrong token kills the task, also in complain mode, as on Linux.
 //!
@@ -203,20 +203,6 @@ fn commit(new: Cred) {
 #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 fn commit(_new: Cred) {}
 
-/// Sends `SIGKILL` to the caller, as `aa_audit` of Linux does for a record of the kind
-/// `KILLED`.
-#[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn kill_current() {
-    use rk_abi::native::signal::SIGKILL;
-    if let Some(t) = rk_proc::current_thread() {
-        rk_proc::send_signal(t.process(), rk_proc::signal::SigInfo::new(SIGKILL, 0, 0));
-    }
-}
-
-/// A build for the host has no process.
-#[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-fn kill_current() {}
-
 /// A record of `change_hat` for the profile `p`.
 fn audit_hat(
     p: Option<&Profile>,
@@ -236,11 +222,12 @@ fn audit_hat(
         info,
         error: Some(error),
     };
-    domain::audit_file_as(p, perms, &a, Some(kind));
+    // The caller gives the error of the change.
+    let _ = domain::audit_file_as(p, perms, &a, Some(kind));
 }
 
 /// The record of a wrong token, and the kill of the caller, as the label `kill` of
-/// `aa_change_hat` of Linux. Gives `EACCES`.
+/// `aa_change_hat` of Linux. The record of the kind `KILLED` kills the caller. Gives `EACCES`.
 fn token_fail(p: Option<&Profile>, target: &[Arc<Profile>]) -> Errno {
     let perms = Perms { kill: perm::CHANGEHAT, ..Perms::default() };
     let target = domain::label_text_plain(target, p);
@@ -253,7 +240,6 @@ fn token_fail(p: Option<&Profile>, target: &[Arc<Profile>]) -> Errno {
         Errno::EACCES,
         Kind::Killed,
     );
-    kill_current();
     Errno::EACCES
 }
 
@@ -420,9 +406,9 @@ fn change_profile(fqname: &[u8], stack: bool, onexec: bool, test: bool) -> Resul
                 let (perms, ok) = domain::change_perms(file, start, &target, request, fsuid)
                     .ok_or(Errno::EACCES)?;
                 if !ok {
-                    // As in complain mode, the change goes on.
+                    // In complain mode, the change goes on.
                     let a = FileAudit { target: Some(&target), error: Some(Errno::EACCES), ..a };
-                    domain::audit_file(Some(p), &perms, &a);
+                    domain::audit_file(Some(p), &perms, &a)?;
                 }
             }
             t
@@ -435,7 +421,7 @@ fn change_profile(fqname: &[u8], stack: bool, onexec: bool, test: bool) -> Resul
             a.info = Some("label not found");
             a.error = Some(Errno::ENOENT);
             let p = label.as_deref();
-            domain::audit_file_as(p, &Perms::default(), &a, Some(domain::mode_kind(p)));
+            let _ = domain::audit_file_as(p, &Perms::default(), &a, Some(domain::mode_kind(p)));
             return Err(Errno::ENOENT);
         }
     };

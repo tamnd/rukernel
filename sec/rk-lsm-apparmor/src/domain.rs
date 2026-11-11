@@ -12,9 +12,10 @@
 //! Each profile of a stack checks each operation, and the exec of a task with a stack changes
 //! each profile of the stack, as on Linux.
 //!
-//! This kernel does not deny an operation. Each profile acts as a profile in complain mode: the
-//! log tells what the policy does not allow, and the operation goes on. Linux also stops some
-//! operations in complain mode, and this kernel does the same: see [`crate::task`].
+//! A profile in enforce mode denies an operation that its rules do not allow: the operation
+//! gives `EACCES` and the log gets a `DENIED` record. A profile in complain mode gives an
+//! `ALLOWED` record and the operation goes on. A profile in kill mode also kills the task. A
+//! `deny` rule denies in each mode, as on Linux.
 
 use crate::audit::{self, Kind};
 use crate::dfa::{NOMATCH, State};
@@ -328,20 +329,56 @@ pub struct FileAudit<'a> {
 }
 
 /// Logs a file operation of a task with the profile `p` (`None` for `unconfined`), as
-/// `aa_audit_file` and `aa_audit` of Linux. Each profile acts in complain mode, so a denial
-/// gives a record of the kind `ALLOWED`. A failure of `unconfined` gives `DENIED`.
-pub fn audit_file(p: Option<&Profile>, perms: &Perms, a: &FileAudit<'_>) {
-    audit_file_as(p, perms, a, None);
+/// `aa_audit_file` and `aa_audit` of Linux. Gives the error of the operation: a denial of a
+/// profile in complain mode gives an `ALLOWED` record and no error, and a denial of the other
+/// modes gives a `DENIED` record and the error. A failure of `unconfined` gives `DENIED`.
+///
+/// # Errors
+///
+/// Gives the error of `a`, except for a denial that complain mode allows.
+pub fn audit_file(p: Option<&Profile>, perms: &Perms, a: &FileAudit<'_>) -> Result<()> {
+    audit_file_as(p, perms, a, None)
 }
 
-/// The kind of the record of a failure that is not a check of a permission, as `aa_audit` of
-/// Linux: `ALLOWED` for a profile in complain mode, and `DENIED` for the others.
+/// The kind of the record of a failure, as `aa_audit` of Linux: `ALLOWED` for a profile in
+/// complain mode, `KILLED` for a profile in kill mode, and `DENIED` for the others.
 pub fn mode_kind(p: Option<&Profile>) -> Kind {
-    if p.is_some_and(|p| p.mode == Mode::Complain) { Kind::Allowed } else { Kind::Denied }
+    match p.map(|p| p.mode) {
+        Some(Mode::Complain) => Kind::Allowed,
+        Some(Mode::Kill) => Kind::Killed,
+        _ => Kind::Denied,
+    }
+}
+
+/// The result of a record of the kind `kind` with the error `error`, as the end of `aa_audit`
+/// of Linux: complain mode allows a denial, `complain_error`. A record of the kind `KILLED`
+/// kills the task.
+///
+/// # Errors
+///
+/// Gives `error`, except for a denial that complain mode allows.
+pub fn outcome(kind: Kind, error: Option<Errno>) -> Result<()> {
+    if kind == Kind::Killed {
+        audit::kill_current();
+    }
+    match error {
+        Some(Errno::EACCES | Errno::EPERM) if kind == Kind::Allowed => Ok(()),
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// As [`audit_file`], but a failure gives a record of the kind `kind` if it is there.
-pub fn audit_file_as(p: Option<&Profile>, perms: &Perms, a: &FileAudit<'_>, kind: Option<Kind>) {
+///
+/// # Errors
+///
+/// Gives the error of `a`, except for a denial that complain mode allows.
+pub fn audit_file_as(
+    p: Option<&Profile>,
+    perms: &Perms,
+    a: &FileAudit<'_>,
+    kind: Option<Kind>,
+) -> Result<()> {
     let audit_all = p.and_then(|p| p.rules.as_ref()).is_some_and(|r| r.audit);
     let mut request = a.request;
     let kind = if a.error.is_none() {
@@ -349,17 +386,26 @@ pub fn audit_file_as(p: Option<&Profile>, perms: &Perms, a: &FileAudit<'_>, kind
         request &= if audit_all { 0xffff } else { perms.audit };
         Kind::Audit
     } else {
-        // Only the permissions that the policy does not allow. A rule with `quiet` hides
-        // them, but not with the audit mode `all`.
+        // Only the permissions that the policy does not allow.
         request &= !perms.allow;
+        let kill = request & perms.kill != 0;
+        // A rule with `quiet` hides them, but not with the audit mode `all`. As on Linux, a
+        // denial with no record gives its error also in complain mode: a `deny` rule denies in
+        // each mode.
         if !audit_all {
             request &= !perms.quiet;
         }
-        // `unconfined` is not in complain mode, so its failures are denials.
-        kind.unwrap_or(if p.is_some() { Kind::Allowed } else { Kind::Denied })
+        if request == 0 {
+            return a.error.map_or(Ok(()), Err);
+        }
+        match kind {
+            Some(k) => k,
+            None if kill => Kind::Killed,
+            None => mode_kind(p),
+        }
     };
     if request == 0 {
-        return;
+        return Ok(());
     }
     let denied = request & !perms.allow;
     let mut tail = String::new();
@@ -388,6 +434,7 @@ pub fn audit_file_as(p: Option<&Profile>, perms: &Perms, a: &FileAudit<'_>, kind
         name: (!a.name.is_empty()).then_some(name.as_ref()),
     };
     audit::log(kind, &d, &tail);
+    outcome(kind, a.error)
 }
 
 /// The text of a conflict of two attachments, `CONFLICTING_ATTACH_STR` of Linux.
@@ -462,19 +509,23 @@ struct Transition {
 
 /// The label for the exec of `name` from `p` with the transition `xindex`, `x_to_label` of
 /// Linux. `None` if no label is there. A stack (`&NAME`) is not there yet: the transition takes
-/// the attach of the program, without the stack.
-fn x_to_label(p: &Arc<Profile>, name: &[u8], xindex: u32) -> Option<Transition> {
+/// the attach of the program, without the stack. Also gives the name of the lookup, for the
+/// record of a failure.
+fn x_to_label(p: &Arc<Profile>, name: &[u8], xindex: u32) -> (Option<Transition>, Option<String>) {
     let mut info = None;
     let mut new: Option<Option<Arc<Profile>>> = None;
     let mut by_name = xindex & x::TYPE_MASK == x::NAME;
+    let mut lookup = None;
     if xindex & x::TYPE_MASK == x::TABLE {
         let (found, n) = x_table_lookup(p, xindex);
         by_name = found.is_some() && n.as_deref().is_some_and(|n| n.starts_with('&'));
         if !by_name {
             new = found.map(Some);
+            lookup = n;
         }
     }
     if by_name {
+        lookup = Some(String::from_utf8_lossy(name).into_owned());
         let parent = if xindex & x::CHILD != 0 { Some(p.name.as_str()) } else { None };
         let list = policy::with_ns(p.ns.as_deref(), |ns| ns.children(parent));
         let (found, i) = find_attach(&list, name);
@@ -499,13 +550,22 @@ fn x_to_label(p: &Arc<Profile>, name: &[u8], xindex: u32) -> Option<Transition> 
             new = Some(None);
         }
     }
-    new.map(|new| Transition { new, info })
+    (new.map(|new| Transition { new, info }), lookup)
 }
 
 /// The new label of an exec of the file `name` with the owner `ouid` from the profile `p`,
-/// `profile_transition` of Linux for a profile in complain mode. Gives the new profile and if
-/// the program gets `AT_SECURE`.
-fn profile_transition(p: &Arc<Profile>, name: &[u8], ouid: u32) -> (Option<Arc<Profile>>, bool) {
+/// `profile_transition` of Linux. Gives the new profile and if the program gets `AT_SECURE`.
+/// In complain mode, an exec with no exec rule gets a learning profile.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the rules do not allow the exec, or if the profile of the transition is
+/// not there.
+fn profile_transition(
+    p: &Arc<Profile>,
+    name: &[u8],
+    ouid: u32,
+) -> Result<(Option<Arc<Profile>>, bool)> {
     let owner = rk_vfs::cred::current().fsuid == ouid;
     let mut perms = p.rules.as_ref().map_or(Perms::default(), |r| str_perms(&r.file, name, owner));
     let mut a = FileAudit {
@@ -518,13 +578,14 @@ fn profile_transition(p: &Arc<Profile>, name: &[u8], ouid: u32) -> (Option<Arc<P
         error: None,
     };
     let mut found = None;
+    let mut lookup = None;
     if perms.allow & perm::EXEC != 0 {
         match x_to_label(p, name, perms.xindex) {
-            Some(t) => found = Some(t),
-            None => {
-                // In complain mode, a missing transition makes a learning profile.
+            (Some(t), _) => found = Some(t),
+            (None, l) => {
                 a.info = Some("profile transition not found");
                 perms.allow &= !perm::EXEC;
+                lookup = l;
             }
         }
     }
@@ -540,18 +601,25 @@ fn profile_transition(p: &Arc<Profile>, name: &[u8], ouid: u32) -> (Option<Arc<P
             let target = t.new.as_ref().map_or(String::from("unconfined"), |n| n.name.clone());
             (t.new, secure, target)
         }
-        None => {
-            // No exec permission: a learning profile, as `aa_new_learning_profile` of Linux.
+        // In complain mode, a missing transition makes a learning profile, as
+        // `aa_new_learning_profile` of Linux.
+        None if p.mode == Mode::Complain => {
             let base = String::from_utf8_lossy(name);
             let learn = policy::with_ns(p.ns.as_deref(), |ns| ns.learning(p, false, &base));
             a.error = Some(Errno::EACCES);
             let target = learn.name.clone();
             (Some(learn), false, target)
         }
+        None => {
+            a.error = Some(Errno::EACCES);
+            a.target = lookup.as_deref();
+            audit_file(Some(p), &perms, &a)?;
+            return Err(Errno::EACCES);
+        }
     };
     a.target = Some(&target);
-    audit_file(Some(p), &perms, &a);
-    (new, secure)
+    audit_file(Some(p), &perms, &a)?;
+    Ok((new, secure))
 }
 
 /// The check of an exec of the file `name` with the owner `ouid` from the profile `p` with a
@@ -614,7 +682,7 @@ fn profile_onexec(
         info,
         error,
     };
-    audit_file(Some(p), &perms, &a);
+    audit_file(Some(p), &perms, &a)?;
     Ok(secure)
 }
 
@@ -698,7 +766,7 @@ pub fn bprm_creds_for_exec(bprm: &mut Bprm<'_>) -> Result<()> {
         let (next, s) = if p.mode == Mode::Unconfined {
             (Some(attach_unconfined(Some(p), &name, ouid).unwrap_or_else(|| p.clone())), false)
         } else {
-            profile_transition(p, &name, ouid)
+            profile_transition(p, &name, ouid)?
         };
         secure |= s;
         new = merge(&new, next.as_slice());
@@ -729,7 +797,8 @@ fn attach_unconfined(old: Option<&Profile>, name: &[u8], ouid: u32) -> Option<Ar
             info: Some(info),
             error: None,
         };
-        audit_file(old, &perms, &a);
+        // The record has no error, so it gives no error.
+        let _ = audit_file(old, &perms, &a);
     }
     found
 }

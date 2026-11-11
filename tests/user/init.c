@@ -15676,14 +15676,29 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
  * /tmp/rk-sub with the same stdout. With the argument "files", it does the file operations
  * that the file checks log: an open with a create in /tmp, an exclusive lock of that file, an
  * open of /etc/rk_test.aa, an executable map of it and an open of the directory /usr/bin.
- * With the argument "exec", it checks that it has no label for the next exec.
+ * With the argument "exec", it checks that it has no label for the next exec. With the argument
+ * "deny", it checks that rk_test in enforce mode denies an open, a lock and an exec with EACCES,
+ * and gives 0 or the number of the first check that failed. It does not read its label, because
+ * the rules do not allow it.
  */
 static int aa_label_helper(int argc, char **argv)
 {
 	char buf[256];
-	int n = aa_read("/proc/self/attr/current", buf, sizeof(buf));
+	int n, w;
 	char *args[] = { "rk-sub", NULL };
 
+	if (argc > 1 && strcmp(argv[1], "deny") == 0) {
+		if (open("/etc/rk_test.aa", O_RDONLY) >= 0 || errno != EACCES)
+			return 2;
+		w = open("/tmp/rk-aa-w", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (w < 0 || write(w, "x", 1) != 1)
+			return 3;
+		if (flock(w, LOCK_EX) == 0 || errno != EACCES)
+			return 4;
+		execv("/tmp/rk-sub", args);
+		return errno == EACCES ? 0 : 5;
+	}
+	n = aa_read("/proc/self/attr/current", buf, sizeof(buf));
 	if (n > 0 && write(1, buf, n) != n)
 		return 1;
 	if (argc > 1 && strcmp(argv[1], "sub") == 0) {
@@ -15781,6 +15796,18 @@ static int aa_label_is(const char *name, const char *text)
 }
 
 /*
+ * The attribute attr of the caller from lsm_get_self_attr is text. The rules of a hat in enforce
+ * mode can deny the read of /proc/self/attr, but not this call.
+ */
+static int aa_self_is(unsigned int attr, const char *text)
+{
+	unsigned long long ctx[16] = { 0 };
+	unsigned int size = sizeof(ctx);
+
+	return syscall(459, attr, ctx, &size, 0) == 1 && ctx[3] == strlen(text) && memcmp(&ctx[4], text, strlen(text)) == 0;
+}
+
+/*
  * The changes of the label that a task asks for: change_profile, change_hat and
  * change_onexec, through /proc/self/attr and lsm_set_self_attr. The policy rk_test is loaded.
  * Gives 0, or the number of the first check that failed.
@@ -15814,10 +15841,11 @@ static int aa_changes(void)
 	/* unconfined can change to each profile. */
 	if (aa_cmd("changeprofile rk_test") != 0 || !aa_label_is("current", "rk_test (complain)\n"))
 		return 7;
-	/* A hat keeps the label before it, and a change to a hat clears the label for the exec. */
-	if (aa_cmd("changehat 0000000000000007^hat1") != 0 || !aa_label_is("current", "rk_test//hat1 (enforce)\n") || !aa_label_is("prev", "rk_test (complain)\n") || !aa_label_is("apparmor/prev", "rk_test (complain)\n"))
+	/* A hat keeps the label before it, and a change to a hat clears the label for the exec. The hat is in enforce mode, and its rules do not allow a read of /proc/self/attr. */
+	if (aa_cmd("changehat 0000000000000007^hat1") != 0 || !aa_self_is(100, "rk_test//hat1 (enforce)") || !aa_self_is(104, "rk_test (complain)") || aa_label_is("current", "rk_test//hat1 (enforce)\n") || errno != EACCES)
 		return 8;
-	if (aa_read("/proc/self/attr/exec", (char *)ctx, 64) >= 0 || errno != EINVAL)
+	size = sizeof(ctx);
+	if (syscall(459, 101, ctx, &size, 0) != -1 || errno != ENOENT)
 		return 9;
 	if (aa_cmd("changehat 0000000000000007^") != 0 || !aa_label_is("current", "rk_test (complain)\n") || aa_read("/proc/self/attr/prev", (char *)ctx, 64) >= 0 || errno != EINVAL)
 		return 10;
@@ -15970,6 +15998,45 @@ static void test_apparmor(void)
 	check("apparmor: the kernel log has the learning hat and the missing profile", strstr(buf, "apparmor=\"ALLOWED\" operation=\"change_hat\" class=\"file\" profile=\"rk_test\" name=\"nohat\" pid=") != NULL && strstr(buf, " target=\"rk_test//null-nohat\"") != NULL && strstr(buf, "apparmor=\"ALLOWED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"rk_test\" name=\"rk_none\" pid=") != NULL);
 	check("apparmor: the kernel log has the kill of a wrong token", strstr(buf, "apparmor=\"KILLED\" operation=\"change_hat\" class=\"file\" info=\"failed token match\" error=-13 profile=\"rk_test//hat1\" pid=") != NULL);
 	check("apparmor: an open that the rules allow has no record", strstr(buf, "name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\"") == NULL);
+	{
+		/* The flags of rk_test: not a hat, and the mode 1 (complain). The mode 0 is enforce. */
+		static const char flags[] = "flags\0\x07\x02\0\0\0\0\x02\x01";
+		char *five[] = { "rk-test", "deny", NULL };
+		int i, at = -1;
+
+		fd = open("/etc/rk_test.aa", O_RDONLY);
+		n = fd >= 0 ? read(fd, big, sizeof(big)) : -1;
+		if (fd >= 0)
+			close(fd);
+		for (i = 0; at < 0 && i + (int)sizeof(flags) - 1 <= n; i++)
+			if (memcmp(big + i, flags, sizeof(flags) - 1) == 0)
+				at = i;
+		if (at >= 0)
+			big[at + sizeof(flags) - 2] = 0;
+		check("apparmor: a replace of rk_test in enforce mode works", at >= 0 && aa_write("/sys/kernel/security/apparmor/.replace", big, n, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 256) > 0 && strstr(buf, "rk_test (enforce)\n") != NULL);
+		pid = fork();
+		if (pid == 0) {
+			execv("/usr/bin/rk-test", five);
+			_exit(127);
+		}
+		check("apparmor: in enforce mode, an open, a lock and an exec that the rules do not allow give EACCES", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+			printf("init: the AppArmor enforce checks failed at the check %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+		pid = fork();
+		if (pid == 0) {
+			/* The rules of rk_test do not allow an open of attr/current, so the files are open before the change. */
+			int one = open("/proc/self/attr/current", O_WRONLY), two = open("/proc/self/attr/current", O_WRONLY);
+
+			if (one < 0 || two < 0 || write(one, "changeprofile rk_test", 21) != 21)
+				_exit(2);
+			_exit(write(two, "changeprofile rk_test//hat1", 27) < 0 && errno == EACCES && write(two, "changeprofile rk_none", 21) < 0 && errno == ENOENT ? 0 : 1);
+		}
+		check("apparmor: in enforce mode, a change_profile that the rules do not allow gives EACCES", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		n = klogctl(3, buf, sizeof(buf) - 1);
+		buf[n > 0 ? n : 0] = 0;
+		check("apparmor: the kernel log has the denials, as on Linux", n > 0 && strstr(buf, "apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"file_lock\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"exec\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-sub\" pid=") != NULL);
+		check("apparmor: the kernel log has the missing profile in enforce mode", strstr(buf, "apparmor=\"DENIED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"rk_test\" name=\"rk_none\" pid=") != NULL);
+	}
 	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
 	unlink("/usr/bin/rk-test");
 	unlink("/tmp/rk-sub");
