@@ -532,6 +532,7 @@ mod tests {
             chains: Vec::new(),
             sets: Vec::new(),
             objs: alloc::vec![obj(1, NFT_OBJECT_COUNTER), obj(2, NFT_OBJECT_QUOTA)],
+            flowtables: Vec::new(),
             hgenerator: 2,
         };
         assert_eq!(nft_obj_lookup(&t, Some(b"c"), NFT_OBJECT_QUOTA), Ok(1));
