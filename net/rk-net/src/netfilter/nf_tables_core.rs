@@ -49,6 +49,8 @@ use rk_vfs::inode::Result;
 
 #[path = "nft_exprs.rs"]
 mod nft_exprs;
+#[path = "nft_flowtable.rs"]
+mod nft_flowtable;
 #[path = "nft_objects.rs"]
 mod nft_objects;
 
@@ -60,6 +62,10 @@ use self::nft_exprs::{
     nft_reject_init,
 };
 pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
+use self::nft_flowtable::nft_flow_offload_init;
+pub(super) use self::nft_flowtable::{
+    NFTA_FLOWTABLE_MAX, NftFlowtable, nf_tables_dump_flowtable, nf_tables_getflowtable,
+};
 pub(super) use self::nft_objects::{
     NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftObj, nf_tables_dump_obj, nf_tables_getobj, nft_obj_commit,
     nft_setelem_parse_obj,
@@ -278,6 +284,8 @@ pub(super) enum NftExpr {
     Quota(Arc<NftQuota>),
     /// `objref` with the object `obj` (a handle), as nft_objref.c.
     Objref { obj: u64 },
+    /// `flow_offload`, as nft_flow_offload.c, with the handle of its flowtable.
+    FlowOffload { flowtable: u64 },
     /// `objref` with the object of the element of the key of the packet in the map of objects
     /// `set` (a handle).
     ObjrefMap { set: u64, sreg: usize, len: usize },
@@ -654,6 +662,7 @@ pub(super) fn nf_tables_expr_parse(
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
         b"quota" => Ok(NftExpr::Quota(nft_quota_init(data)?)),
         b"objref" => nft_objref_init(table, data),
+        b"flow_offload" => nft_flow_offload_init(table, data),
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
         b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
@@ -827,6 +836,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
             false,
         )),
         NftExpr::Xt(x) if x.hooks() != 0 => Some((x.hooks(), false)),
+        NftExpr::FlowOffload { .. } => Some((1 << NF_INET_FORWARD, false)),
         _ => None,
     }
 }
@@ -911,6 +921,7 @@ pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
                 | NftExpr::Nat { .. }
                 | NftExpr::Masq { .. }
                 | NftExpr::Redir { .. }
+                | NftExpr::FlowOffload { .. }
         ) || matches!(e, NftExpr::Xt(x) if x.needs_ct())
     })
 }
@@ -1516,6 +1527,8 @@ fn nft_eval(
                 packets.fetch_add(1, Ordering::Relaxed);
                 bytes.fetch_add(skb.len() as u64, Ordering::Relaxed);
             }
+            // The packets of the flowtable go through the hooks as before.
+            NftExpr::FlowOffload { .. } => {}
             NftExpr::Lookup { .. }
             | NftExpr::Dynset(_)
             | NftExpr::Objref { .. }

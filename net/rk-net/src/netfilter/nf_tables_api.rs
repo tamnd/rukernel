@@ -20,8 +20,9 @@ pub(crate) use self::nf_tables_core::nft_log_line;
 pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
-    NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr, NftObj, NftProg, nf_tables_dump_obj,
-    nf_tables_expr_parse, nf_tables_getobj, nft_check_loops, nft_do_chain, nft_expr_dump,
+    NFT_OBJECT_MAX, NFTA_FLOWTABLE_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr, NftFlowtable, NftObj,
+    NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj, nf_tables_expr_parse,
+    nf_tables_getflowtable, nf_tables_getobj, nft_check_loops, nft_do_chain, nft_expr_dump,
     nft_expr_needs_validate, nft_expr_targets, nft_expr_validate, nft_obj_commit, nft_prog,
     nft_rule_needs_ct, nft_setelem_parse_obj, nft_table_validate,
 };
@@ -98,6 +99,12 @@ pub const NFT_MSG_GETOBJ: u8 = 19;
 pub const NFT_MSG_DELOBJ: u8 = 20;
 /// Gets or dumps the objects, and resets them.
 pub const NFT_MSG_GETOBJ_RESET: u8 = 21;
+/// Makes a flowtable, or adds devices to it.
+pub const NFT_MSG_NEWFLOWTABLE: u8 = 22;
+/// Gets or dumps the flowtables.
+pub const NFT_MSG_GETFLOWTABLE: u8 = 23;
+/// Deletes a flowtable, or devices of it.
+pub const NFT_MSG_DELFLOWTABLE: u8 = 24;
 /// Deletes a table, with no error if it is not there.
 pub const NFT_MSG_DESTROYTABLE: u8 = 26;
 /// Deletes a chain, with no error if it is not there.
@@ -110,6 +117,8 @@ pub const NFT_MSG_DESTROYSET: u8 = 29;
 pub const NFT_MSG_DESTROYSETELEM: u8 = 30;
 /// Deletes an object, with no error if it is not there.
 pub const NFT_MSG_DESTROYOBJ: u8 = 31;
+/// Deletes a flowtable, with no error if it is not there.
+pub const NFT_MSG_DESTROYFLOWTABLE: u8 = 32;
 /// The number of messages, `NFT_MSG_MAX`.
 const NFT_MSG_MAX: usize = 34;
 
@@ -590,7 +599,9 @@ struct NftTable {
     chains: Vec<NftChain>,
     sets: Vec<NftSet>,
     objs: Vec<NftObj>,
-    /// The last handle of a chain, a rule, a set or an object, as `table->hgenerator`.
+    flowtables: Vec<NftFlowtable>,
+    /// The last handle of a chain, a rule, a set, an object or a flowtable, as
+    /// `table->hgenerator`.
     hgenerator: u64,
 }
 
@@ -602,7 +613,7 @@ impl NftTable {
 
     /// The number of objects in the table, as `table->use` of Linux.
     fn use_count(&self) -> u32 {
-        (self.chains.len() + self.sets.len() + self.objs.len()) as u32
+        (self.chains.len() + self.sets.len() + self.objs.len() + self.flowtables.len()) as u32
     }
 
     /// The number of rules and references of the chain `handle`, as `chain->use` of Linux.
@@ -751,6 +762,11 @@ static NF_TABLES_CB: [NfnlCallback; NFT_MSG_MAX] = {
     cb[NFT_MSG_GETOBJ_RESET as usize] =
         rcu(Some(nf_tables_getobj), Some(nf_tables_dump_obj), NFTA_OBJ_MAX);
     cb[NFT_MSG_DESTROYOBJ as usize] = batch(NFTA_OBJ_MAX);
+    cb[NFT_MSG_NEWFLOWTABLE as usize] = batch(NFTA_FLOWTABLE_MAX);
+    cb[NFT_MSG_GETFLOWTABLE as usize] =
+        rcu(Some(nf_tables_getflowtable), Some(nf_tables_dump_flowtable), NFTA_FLOWTABLE_MAX);
+    cb[NFT_MSG_DELFLOWTABLE as usize] = batch(NFTA_FLOWTABLE_MAX);
+    cb[NFT_MSG_DESTROYFLOWTABLE as usize] = batch(NFTA_FLOWTABLE_MAX);
     cb
 };
 
@@ -1801,6 +1817,7 @@ impl NftBatch {
             chains: Vec::new(),
             sets: Vec::new(),
             objs: Vec::new(),
+            flowtables: Vec::new(),
             hgenerator: 0,
         });
         let t = self.tables.len() - 1;
@@ -1888,7 +1905,8 @@ impl NftBatch {
         Ok(())
     }
 
-    /// Removes a table with its rules, sets, objects and chains, as `nft_flush_table` of Linux.
+    /// Removes a table with its rules, sets, flowtables, objects and chains, as `nft_flush_table`
+    /// of Linux.
     fn nft_flush_table(&mut self, ctx: &NftCtx, t: usize) {
         for c in 0..self.tables[t].chains.len() {
             while !self.tables[t].chains[c].rules.is_empty() {
@@ -1899,6 +1917,9 @@ impl NftBatch {
         while !self.tables[t].sets.is_empty() {
             self.notify_set(ctx, NFT_MSG_DELSET, t, 0);
             self.tables[t].sets.remove(0);
+        }
+        while !self.tables[t].flowtables.is_empty() {
+            self.nft_delflowtable(ctx, t, 0);
         }
         while !self.tables[t].objs.is_empty() {
             self.notify_obj(ctx, NFT_MSG_DELOBJ, t, 0);
@@ -2814,6 +2835,10 @@ impl NfnlBatch for NftBatch {
             NFT_MSG_DELSETELEM | NFT_MSG_DESTROYSETELEM => self.nf_tables_delsetelem(info, nla),
             NFT_MSG_NEWOBJ => self.nf_tables_newobj(info, nla),
             NFT_MSG_DELOBJ | NFT_MSG_DESTROYOBJ => self.nf_tables_delobj(info, nla),
+            NFT_MSG_NEWFLOWTABLE => self.nf_tables_newflowtable(info, nla),
+            NFT_MSG_DELFLOWTABLE | NFT_MSG_DESTROYFLOWTABLE => {
+                self.nf_tables_delflowtable(info, nla)
+            }
             _ => Err(Errno::EOPNOTSUPP),
         }
     }
@@ -2918,6 +2943,7 @@ mod tests {
             chains: Vec::new(),
             sets: Vec::new(),
             objs: Vec::new(),
+            flowtables: Vec::new(),
             hgenerator: 0,
         }
     }
