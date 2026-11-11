@@ -326,6 +326,16 @@ pub fn capable(cred: &Cred, cap: u32, opts: u32) -> bool {
     call_int_hook!(capable, cred, cap, opts).is_ok()
 }
 
+/// `security_capable` after the capability module: the other active modules check the
+/// capability `cap` of the task with `cred`. The caller has done the check of the capability
+/// module, `cap_capable` of Linux, in the user namespace of the request.
+pub fn capable_lsm(cred: &Cred, cap: u32, opts: u32) -> bool {
+    modules()
+        .iter()
+        .filter(|m| m.info.id.id != id::CAPABILITY)
+        .all(|m| m.info.hooks.capable(cred, cap, opts).is_ok())
+}
+
 /// `security_capget`.
 pub fn capget(target: &Task<'_>) -> Result<()> {
     call_int_hook!(capget, target)

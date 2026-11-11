@@ -107,13 +107,26 @@ impl Profile {
 
     /// The name without the names of the parents, `base.name` of Linux.
     pub fn base_name(&self) -> &str {
-        self.name.rfind("//").map_or(&self.name, |i| &self.name[i + 2..])
+        last_sep(&self.name).map_or(&self.name, |i| &self.name[i + 2..])
     }
 }
 
 /// The name of the parent of the profile `name`.
 fn parent_of(name: &str) -> Option<&str> {
-    name.rfind("//").map(|i| &name[..i])
+    last_sep(name).map(|i| &name[..i])
+}
+
+/// The position of the last `//` that separates the names of a profile and its parent. As
+/// `aa_split_fqname` of Linux, the search goes from the start, so in `P///bin/x` the parent is `P`
+/// and the hat is `/bin/x`, which is the name of a program.
+fn last_sep(name: &str) -> Option<usize> {
+    let mut at = 0;
+    let mut last = None;
+    while let Some(i) = name[at..].find("//") {
+        last = Some(at + i);
+        at += i + 2;
+    }
+    last
 }
 
 /// A policy namespace, `struct aa_ns` of Linux.
@@ -492,6 +505,14 @@ mod tests {
 
     fn names(ns: &Ns) -> Vec<String> {
         ns.profiles().iter().map(|p| alloc::format!("{} ({})", p.name, p.mode.name())).collect()
+    }
+
+    #[test]
+    fn a_hat_with_the_name_of_a_program_has_the_right_parent() {
+        assert_eq!(parent_of("/bin/w///bin/x"), Some("/bin/w"));
+        assert_eq!(parent_of("a//b//c"), Some("a//b"));
+        assert_eq!(parent_of("/bin/w"), None);
+        assert_eq!(&"/bin/w///bin/x"[last_sep("/bin/w///bin/x").unwrap() + 2..], "/bin/x");
     }
 
     #[test]
