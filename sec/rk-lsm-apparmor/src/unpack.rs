@@ -53,6 +53,8 @@ pub mod class {
     pub const NET: usize = 14;
     /// The rules of a label, `AA_CLASS_LABEL`.
     pub const LABEL: usize = 16;
+    /// The user namespace rules, `AA_CLASS_NS`.
+    pub const NS: usize = 21;
     /// The last class, `AA_CLASS_LAST`.
     pub const LAST: usize = 32;
 }

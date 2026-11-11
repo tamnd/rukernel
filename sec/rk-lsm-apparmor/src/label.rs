@@ -147,6 +147,23 @@ pub fn check_perms(
     class: &str,
     tail: impl FnOnce(u32, u32) -> String,
 ) -> Result<()> {
+    check_perms_info(Some(p), perms, request, op, class, None, tail)
+}
+
+/// [`check_perms`] with the text `info` in the record. `None` for `p` is `unconfined`.
+///
+/// # Errors
+///
+/// Gives the errors of [`check_perms`].
+pub fn check_perms_info(
+    p: Option<&Profile>,
+    perms: &Perms,
+    request: u32,
+    op: &str,
+    class: &str,
+    info: Option<&str>,
+    tail: impl FnOnce(u32, u32) -> String,
+) -> Result<()> {
     let mut request = request;
     let mut denied = request & (!perms.allow | perms.deny);
     let (kind, error) = if denied == 0 {
@@ -171,11 +188,11 @@ pub fn check_perms(
         }
         (kind, Some(error))
     };
-    let fq = p.fqname();
+    let fq = p.map_or(alloc::borrow::Cow::Borrowed("unconfined"), Profile::fqname);
     let d = audit::Data {
         op: Some(op),
         class: Some(class),
-        info: None,
+        info,
         error: error.map_or(0, |e| -i32::from(e.get())),
         profile: Some(&fq),
         name: None,

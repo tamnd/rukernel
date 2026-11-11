@@ -851,6 +851,9 @@ fn sysctl_read(name: &'static str, default: &'static str) -> Vec<u8> {
     if let Some((get, _)) = vm_tunable(name) {
         return format!("{}\n", get()).into_bytes();
     }
+    if let Some(t) = rk_vfs::security::sysctl(name) {
+        return format!("{}\n", (t.get)()).into_bytes();
+    }
     match name {
         "kernel/random/boot_id" => return uuid_text(boot_id()),
         "kernel/random/uuid" => return uuid_text(random_uuid()),
@@ -991,6 +994,10 @@ fn sysctl_write(name: &'static str, data: &[u8]) -> Result<()> {
             return Err(Errno::EINVAL);
         }
         return set(n).ok_or(Errno::EINVAL);
+    }
+    // The checks of a file of a security module are in its function.
+    if let Some(t) = rk_vfs::security::sysctl(name) {
+        return (t.set)(parse_int(data)?);
     }
     match name {
         // A value from 64 to `INT_MAX` rounded down to 64, as `sysctl_nr_open` in fs/file.c of
@@ -1145,7 +1152,8 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
                 out.push((b"net".to_vec(), sys_net_dir(String::new())));
             }
             let ipc = rk_vfs::ipc::SYSCTL_NAMES.iter().map(|&n| (n, ""));
-            for (name, default) in SYSCTLS.iter().copied().chain(ipc) {
+            let lsm = rk_vfs::security::sysctls().into_iter().map(|t| (t.name, ""));
+            for (name, default) in SYSCTLS.iter().copied().chain(ipc).chain(lsm) {
                 // The files of Yama are there only when Yama is active.
                 if name.starts_with("kernel/yama/") && !rk_proc::yama::active() {
                     continue;
@@ -1173,7 +1181,8 @@ fn sys_subdir(prefix: &'static str) -> InodeRef {
                             sysctl_file(fpath.as_bytes(), 0o444, read, None, open)
                         } else {
                             let write: WriteFn = Box::new(move |data| sysctl_write(name, data));
-                            sysctl_file(fpath.as_bytes(), 0o644, read, Some(write), open)
+                            let mode = rk_vfs::security::sysctl(name).map_or(0o644, |t| t.mode);
+                            sysctl_file(fpath.as_bytes(), mode, read, Some(write), open)
                         };
                         out.push((rest.as_bytes().to_vec(), node));
                     }

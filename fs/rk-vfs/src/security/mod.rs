@@ -129,6 +129,37 @@ pub struct Active {
     pub offsets: BlobSizes,
 }
 
+/// A file of a security module below `/proc/sys`, as a `ctl_table` entry that a module of Linux
+/// gives to `register_sysctl`. The value is one `int`.
+pub struct Sysctl {
+    /// The path below `/proc/sys`, for example `kernel/apparmor_restrict_unprivileged_userns`.
+    pub name: &'static str,
+    /// The mode of the file.
+    pub mode: u32,
+    /// Gives the value.
+    pub get: fn() -> i32,
+    /// Sets the value, with the checks of the module.
+    pub set: fn(i32) -> Result<()>,
+}
+
+/// The files that the modules give below `/proc/sys`.
+static SYSCTLS: SpinLock<Vec<&'static Sysctl>> = SpinLock::new(Vec::new());
+
+/// Adds the files `table` below `/proc/sys`, as `register_sysctl` of Linux.
+pub fn register_sysctls(table: &'static [Sysctl]) {
+    SYSCTLS.lock().extend(table.iter());
+}
+
+/// The files that the modules give below `/proc/sys`.
+pub fn sysctls() -> Vec<&'static Sysctl> {
+    SYSCTLS.lock().clone()
+}
+
+/// The file `name` of a module below `/proc/sys`.
+pub fn sysctl(name: &str) -> Option<&'static Sysctl> {
+    SYSCTLS.lock().iter().copied().find(|s| s.name == name)
+}
+
 /// The modules after the boot order, and the sizes of the blobs.
 pub struct State {
     /// The active modules in the order of the calls.
@@ -603,6 +634,12 @@ pub fn task_getscheduler(target: &Task<'_>) -> Result<()> {
 /// `security_task_kill`.
 pub fn task_kill(target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
     call_int_hook!(task_kill, target, sig, cred)
+}
+
+/// `security_create_user_ns`: the task with the credentials `cred` makes a user namespace, and
+/// `new` are its credentials in the namespace.
+pub fn userns_create(cred: &Cred, new: &Cred) -> Result<()> {
+    call_int_hook!(userns_create, cred, new)
 }
 
 /// `security_task_prctl`: gives `None` if no module handles the option. The first result other

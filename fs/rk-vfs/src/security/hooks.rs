@@ -570,6 +570,12 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `userns_create`: the task with the credentials `cred` makes a user namespace. `new` are
+    /// its credentials in the namespace. The module can change the part of `new` in the blob.
+    fn userns_create(&self, cred: &Cred, new: &Cred) -> Result<()> {
+        Ok(())
+    }
+
     /// `task_prctl`: the caller calls `prctl(option, args...)`. A module that does not handle
     /// the option gives `None`, as `-ENOSYS` of Linux.
     fn task_prctl(&self, option: u32, args: [u64; 4]) -> Option<Result<u64>> {
