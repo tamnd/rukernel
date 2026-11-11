@@ -1238,7 +1238,9 @@ fn rootfs_initramfs(kernel: &Path, name: &str) -> PathBuf {
 
 /// The script that runs as /init in the `tpm` boot test, after the checks of the kernel. It runs
 /// `tpm2_getrandom 8` and `tpm2_pcrread sha256:0,7` of tpm2-tools on /dev/tpm0, and compares the
-/// PCRs with the files of `pcr-sha256` in sysfs. Then, if the initramfs has the tpm2 kselftests,
+/// PCRs with the files of `pcr-sha256` in sysfs. On x86-64, `tpm2_eventlog` replays the event log
+/// of SeaBIOS in securityfs, and the SHA-256 PCRs of the log must be the PCRs of `tpm2_pcrread`.
+/// On arm64, QEMU `virt` has no firmware and no log. Then, if the initramfs has the tpm2 kselftests,
 /// it runs test_smoke.sh, test_space.sh and test_async.sh on /dev/tpm0 and /dev/tpmrm0. `set -e`
 /// stops it at the first command that fails.
 const TPM_INIT: &str = "#!/bin/sh
@@ -1269,6 +1271,20 @@ for pcr in 0 7; do
     test ${#want} -eq 64
     grep -q \"^ *$pcr *: *0x$want$\" /tmp/pcrs
 done
+mount -t securityfs securityfs /sys/kernel/security
+log=/sys/kernel/security/tpm0/binary_bios_measurements
+if [ \"$(uname -m)\" = x86_64 ]; then
+    sha256() { awk '/^ *sha256:$/ { s = 1; next } /^ *[a-z0-9]+:$/ { s = 0 } s && /0x/ { gsub(/ /, \"\"); print toupper($0) }'; }
+    tpm2_eventlog $log > /tmp/eventlog
+    sed -n '/^pcrs:/,$p' /tmp/eventlog | sha256 > /tmp/logpcrs
+    cat /tmp/logpcrs
+    grep -q '^0:0X' /tmp/logpcrs
+    tpm2_pcrread sha256:$(cut -d: -f1 /tmp/logpcrs | tr '\\n' , | sed 's/,$//') | sha256 > /tmp/tpmpcrs
+    cmp /tmp/logpcrs /tmp/tpmpcrs || { cat /tmp/tpmpcrs; exit 1; }
+    echo \"tpm: tpm2_eventlog replays $(grep -c . /tmp/logpcrs) SHA-256 PCRs of the event log, and they are the PCRs of tpm2_pcrread\"
+else
+    test ! -e /sys/kernel/security/tpm0
+fi
 echo 'tpm: the PCRs of tpm2_pcrread are the PCRs of pcr-sha256'
 test -d /kselftest/tpm2 || exit 0
 cd /kselftest/tpm2

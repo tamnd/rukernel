@@ -759,3 +759,85 @@ fn sessions_stay_saved_and_go_when_the_file_closes() {
     assert!(model.lock().unwrap().sessions.is_empty());
     assert_eq!(model.lock().unwrap().seen.last(), Some(&cmd::CC_FLUSH_CONTEXT));
 }
+
+/// The first event of a log of TPM 2.0 with SHA-1 and SHA-256, as SeaBIOS writes it.
+fn log_header() -> Vec<u8> {
+    let mut spec = Vec::new();
+    spec.extend_from_slice(eventlog::SPEC_ID_SIGNATURE);
+    spec.extend_from_slice(&0u32.to_le_bytes()); // The platform class.
+    spec.extend_from_slice(&[0, 2, 0, 2]); // The version 2.0, the errata and the size of UINTN.
+    spec.extend_from_slice(&2u32.to_le_bytes());
+    spec.extend_from_slice(&[0x04, 0, 20, 0, 0x0b, 0, 32, 0]);
+    spec.push(0); // The size of the vendor data.
+    let mut e = Vec::new();
+    e.extend_from_slice(&0u32.to_le_bytes());
+    e.extend_from_slice(&eventlog::EV_NO_ACTION.to_le_bytes());
+    e.extend_from_slice(&[0; 20]);
+    e.extend_from_slice(&(spec.len() as u32).to_le_bytes());
+    e.extend_from_slice(&spec);
+    e
+}
+
+/// An event of the crypto agile format with a digest for each algorithm in `algs`.
+fn log_event(pcr: u32, event_type: u32, algs: &[(u16, usize)], data: &[u8]) -> Vec<u8> {
+    let mut e = Vec::new();
+    e.extend_from_slice(&pcr.to_le_bytes());
+    e.extend_from_slice(&event_type.to_le_bytes());
+    e.extend_from_slice(&(algs.len() as u32).to_le_bytes());
+    for &(alg, size) in algs {
+        e.extend_from_slice(&alg.to_le_bytes());
+        e.extend(core::iter::repeat_n(pcr as u8 + 1, size));
+    }
+    e.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    e.extend_from_slice(data);
+    e
+}
+
+const LOG_ALGS: [(u16, usize); 2] = [(0x0004, 20), (0x000b, 32)];
+
+#[test]
+fn the_event_log_has_the_events_up_to_the_free_space() {
+    let header = log_header();
+    let a = log_event(0, 8, &LOG_ALGS, b"SeaBIOS");
+    let b = log_event(7, 4, &LOG_ALGS, &[0; 4]);
+    let mut log = [header.clone(), a.clone(), b.clone()].concat();
+    let used = log.len();
+    // The rest of the log area is free, with zeros.
+    log.resize(0x1_0000, 0);
+    assert!(eventlog::is_tpm2_log(&log));
+    let (bytes, count) = eventlog::measurements(&log);
+    assert_eq!(count, 3);
+    assert_eq!(bytes, log[..used]);
+
+    // An event with an algorithm that the first event does not give ends the log.
+    let mut bad =
+        [header.clone(), a.clone(), log_event(1, 1, &[(0x0004, 20), (0x0012, 32)], b"x")].concat();
+    bad.resize(0x1000, 0);
+    assert_eq!(eventlog::measurements(&bad), ([header.clone(), a.clone()].concat(), 2));
+    // So does an event with one digest only.
+    let mut bad = [header.clone(), log_event(1, 1, &LOG_ALGS[..1], b"x")].concat();
+    bad.resize(0x1000, 0);
+    assert_eq!(eventlog::measurements(&bad), (header.clone(), 1));
+
+    // As Linux, an event that ends at the end of the area is not given.
+    let full = [header.clone(), a.clone(), b].concat();
+    assert_eq!(eventlog::measurements(&full), ([header.clone(), a.clone()].concat(), 2));
+    // An event that goes past the end of the area is not given.
+    assert_eq!(eventlog::measurements(&full[..full.len() - 2]).1, 2);
+}
+
+#[test]
+fn a_log_without_the_spec_id_event_gives_no_file() {
+    let mut log = log_header();
+    log[HEADER_SIGNATURE] = b'X';
+    log.resize(0x1000, 0);
+    assert!(!eventlog::is_tpm2_log(&log));
+    assert_eq!(eventlog::register(&log), None);
+    assert!(eventlog::binary_bios_measurements().is_none());
+    // A log of the SHA-1 format of TPM 1.2 does not have the signature either.
+    assert!(!eventlog::is_tpm2_log(&[0; 0x1000]));
+    assert!(!eventlog::is_tpm2_log(&log_header()[..40]));
+}
+
+/// The offset of the signature in the first event.
+const HEADER_SIGNATURE: usize = 32;

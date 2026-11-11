@@ -443,7 +443,7 @@ fn use_devices(platform: &crate::fdt::Platform, info: &BootInfo) {
     }
     crate::iomem::virtio_mmio::set(&platform.virtio_mmio[..platform.virtio_mmio_count]);
     if let Some((phys, len)) = platform.tpm_tis {
-        crate::tpm::set_tis(phys, len);
+        crate::tpm::set_tis(phys, len, platform.tpm_log);
     }
     // The scan of the PCI bus comes later, at the first `pci::devices`. It assigns the BARs,
     // because no firmware assigns them before `-kernel`.

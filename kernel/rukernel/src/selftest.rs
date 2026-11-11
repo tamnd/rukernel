@@ -1211,8 +1211,9 @@ fn net_test() -> bool {
 
 /// The kernel finds the TPM of the machine: the CRB of the ACPI `TPM2` table on x86-64, and the
 /// FIFO interface of the device tree on arm64. The driver starts it as Linux does. Then the test
-/// sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read`, and finds /dev/tpm0 and
-/// /dev/tpmrm0. `cargo xtask boot-test` gives the machine a new swtpm for this test.
+/// sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read`, and finds /dev/tpm0, /dev/tpmrm0
+/// and the event log of the firmware. `cargo xtask boot-test` gives the machine a new swtpm for
+/// this test.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn tpm_test() -> bool {
     use rk_drv_tpm::cmd;
@@ -1271,6 +1272,23 @@ fn tpm_test() -> bool {
         chip.has_cc_attrs()
             && tpmrm0.is_some_and(|d| d.rdev == rk_drv_tpm::dev::TPMRM0_RDEV && !d.block),
     );
+    let log = rk_drv_tpm::eventlog::binary_bios_measurements();
+    if let Some(log) = log {
+        println!("rk.test: binary_bios_measurements has {} bytes", log.len());
+    }
+    // SeaBIOS writes its measurements to the log area of the ACPI table. QEMU `virt` with
+    // `-kernel` has no firmware, so arm64 has no log.
+    #[cfg(target_arch = "x86_64")]
+    {
+        ok &= check(
+            "the event log of SeaBIOS is tpm0/binary_bios_measurements in securityfs",
+            log.is_some_and(rk_drv_tpm::eventlog::is_tpm2_log),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ok &= check("QEMU virt gives no event log, so securityfs has no tpm0", log.is_none());
+    }
     ok
 }
 

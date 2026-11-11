@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The event log of the firmware at `/sys/kernel/security/tpm0/binary_bios_measurements`, as drivers/char/tpm/eventlog of Linux. The kernel copies the log area of the ACPI `TPM2` table on x86-64, or the area of `linux,sml-base` and `linux,sml-size` of the device tree node of the TPM on arm64. The file has the first event and each next event of the crypto agile format, up to the first event that is not valid, as `tpm2_binary_bios_measurements_show` of Linux. On x86-64 the `tpm` boot test replays the log of SeaBIOS with `tpm2_eventlog`, and the SHA-256 PCRs of the log must be the PCRs of `tpm2_pcrread` (#541).
+
 ## [0.5.21] - 2026-11-11
 
 ### Added
