@@ -18,6 +18,12 @@ pub const ST_NO_SESSIONS: u16 = 0x8001;
 pub const CC_SELF_TEST: u32 = 0x143;
 /// The command code of `TPM2_Startup`.
 pub const CC_STARTUP: u32 = 0x144;
+/// The command code of `TPM2_ContextLoad`.
+pub const CC_CONTEXT_LOAD: u32 = 0x161;
+/// The command code of `TPM2_ContextSave`.
+pub const CC_CONTEXT_SAVE: u32 = 0x162;
+/// The command code of `TPM2_FlushContext`.
+pub const CC_FLUSH_CONTEXT: u32 = 0x165;
 /// The command code of `TPM2_GetCapability`.
 pub const CC_GET_CAPABILITY: u32 = 0x17a;
 /// The command code of `TPM2_GetRandom`.
@@ -27,12 +33,44 @@ pub const CC_PCR_READ: u32 = 0x17e;
 
 /// The response code of a command that the TPM did with no error.
 pub const RC_SUCCESS: u32 = 0;
+/// The handle is not correct, or the context of a session is not valid now.
+pub const RC_HANDLE: u32 = 0x08b;
+/// The context does not pass the integrity check of the TPM.
+pub const RC_INTEGRITY: u32 = 0x09f;
+/// The TPM does not have the command.
+pub const RC_COMMAND_CODE: u32 = 0x143;
+/// The first handle of the command is not loaded.
+pub const RC_REFERENCE_H0: u32 = 0x910;
+/// The layer of the response codes that the resource manager makes, as
+/// `TSS2_RESMGR_TPM_RC_LAYER` of Linux.
+pub const RC_RESMGR_LAYER: u32 = 11 << 16;
 /// The TPM did not get `TPM2_Startup`, or it got it already.
 pub const RC_INITIALIZE: u32 = 0x100;
 /// The self test of the TPM runs.
 pub const RC_TESTING: u32 = 0x90a;
 /// The TPM is busy. Send the command again later.
 pub const RC_RETRY: u32 = 0x922;
+
+/// The capability of the loaded handles.
+pub const CAP_HANDLES: u32 = 1;
+/// The capability of the attributes of the commands.
+pub const CAP_COMMANDS: u32 = 2;
+/// The first command code of TPM 2.0, `TPM2_CC_FIRST` of Linux.
+pub const CC_FIRST: u32 = 0x11f;
+
+/// The first bit of the number of handles of a command in its attributes (3 bits).
+pub const CC_ATTR_CHANDLES: u32 = 25;
+/// The bit of the attributes of a command that tells that its response has a handle.
+pub const CC_ATTR_RHANDLE: u32 = 28;
+/// The bit of the attributes of a command that tells that it is a command of the vendor.
+pub const CC_ATTR_VENDOR: u32 = 29;
+
+/// The type of the handles of the transient objects (the top byte of the handle).
+pub const HT_TRANSIENT: u32 = 0x8000_0000;
+/// The type of the handles of the HMAC sessions.
+pub const HT_HMAC_SESSION: u32 = 0x0200_0000;
+/// The type of the handles of the policy sessions.
+pub const HT_POLICY_SESSION: u32 = 0x0300_0000;
 
 /// The startup type of `TPM2_Startup` after a reset.
 pub const SU_CLEAR: u16 = 0;
@@ -69,6 +107,12 @@ pub fn duration(cc: u32) -> u64 {
         0x177 | 0x131 | 0x153 | 0x191 => DURATION_LONG_LONG,
         _ => DURATION_DEFAULT,
     }
+}
+
+/// The value of the response code `rc` without the number of the handle, parameter or session
+/// of a format-one code, as `tpm2_rc_value` of Linux.
+pub fn rc_value(rc: u32) -> u32 {
+    if rc & (1 << 7) != 0 { rc & 0xbf } else { rc }
 }
 
 /// Reads the big-endian `u16` at `at`.
@@ -138,6 +182,38 @@ pub fn startup(su: u16) -> Vec<u8> {
 /// `TPM2_SelfTest`. With `full`, the TPM tests all of its functions.
 pub fn self_test(full: bool) -> Vec<u8> {
     Command::new(CC_SELF_TEST).u8(u8::from(full)).finish()
+}
+
+/// `TPM2_GetCapability` for `count` values of the capability `cap` from the property `property`.
+pub fn get_capability(cap: u32, property: u32, count: u32) -> Vec<u8> {
+    Command::new(CC_GET_CAPABILITY).u32(cap).u32(property).u32(count).finish()
+}
+
+/// `TPM2_ContextSave` of the handle `handle`.
+pub fn context_save(handle: u32) -> Vec<u8> {
+    Command::new(CC_CONTEXT_SAVE).u32(handle).finish()
+}
+
+/// `TPM2_ContextLoad` of the context `context`, a `TPMS_CONTEXT` that `TPM2_ContextSave` gave.
+pub fn context_load(context: &[u8]) -> Vec<u8> {
+    Command::new(CC_CONTEXT_LOAD).bytes(context).finish()
+}
+
+/// `TPM2_FlushContext` of the handle `handle`.
+pub fn flush_context(handle: u32) -> Vec<u8> {
+    Command::new(CC_FLUSH_CONTEXT).u32(handle).finish()
+}
+
+/// Gives the `more` flag and the values of a response to `TPM2_GetCapability` for a capability
+/// whose values are `u32`, as `TPM2_CAP_HANDLES` and `TPM2_CAP_COMMANDS`.
+pub fn parse_capability_u32(rsp: &[u8], cap: u32) -> Option<(bool, Vec<u32>)> {
+    let more = *rsp.get(HEADER_SIZE)? != 0;
+    if be32(rsp, HEADER_SIZE + 1)? != cap {
+        return None;
+    }
+    let count = be32(rsp, HEADER_SIZE + 5)? as usize;
+    let values = (0..count).map(|i| be32(rsp, HEADER_SIZE + 9 + 4 * i));
+    Some((more, values.collect::<Option<Vec<u32>>>()?))
 }
 
 /// `TPM2_GetRandom` for `n` bytes.

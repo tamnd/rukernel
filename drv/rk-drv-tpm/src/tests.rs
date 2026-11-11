@@ -453,7 +453,21 @@ fn the_device_sends_one_command_at_a_time() {
     assert_eq!(head, [0x80, 1, 0, 0]);
     assert_eq!(rest[..12], [0, 16, 0, 0, 0, 0, 0, 4, 0, 1, 2, 3]);
     assert_eq!(ops.read(&file, &mut rest), Ok(0));
+    // A write after a read of a part of the response drops the rest, as Linux.
+    assert_eq!(ops.write(&file, &c), Ok(c.len()));
+    assert_eq!(ops.read(&file, &mut head), Ok(4));
+    assert_eq!(ops.write(&file, &c), Ok(c.len()));
+    assert_eq!(ops.read(&file, &mut rest), Ok(16));
     assert_eq!(ops.write(&file, &[0u8; 4]), Err(Errno::EINVAL));
+    // The size field must not be larger than the write.
+    let mut long = c.clone();
+    long[5] += 1;
+    assert_eq!(ops.write(&file, &long), Err(Errno::EINVAL));
+    // Linux sends the bytes of the size field, and drops the bytes after them.
+    long[5] -= 1;
+    long.push(0);
+    assert_eq!(ops.write(&file, &long), Ok(long.len()));
+    assert_eq!(ops.read(&file, &mut rest), Ok(16));
     assert_eq!(ops.write(&file, &[0u8; cmd::BUFSIZE + 1]), Err(Errno::E2BIG));
     drop(file);
     drop(ops);
@@ -476,4 +490,272 @@ fn the_sysfs_files_have_the_pcrs() {
     let want = alloc::format!("{}\n", "0A".repeat(32));
     assert_eq!(pcrs[10].1, rk_vfs::input::SysEntry::File(want.into_bytes()));
     assert!(dev::sysfs(&chip, &["pcr-sha1"]).is_none());
+}
+
+/// A model of a TPM for the resource manager: it makes objects and sessions, and saves, loads
+/// and flushes their contexts. It gives the attributes of at most 2 commands in a response to
+/// `TPM2_GetCapability`, so that the driver must ask more than once.
+#[derive(Default)]
+struct SpaceModel {
+    /// The loaded objects: the handle and the number of the object.
+    objects: Vec<(u32, u32)>,
+    /// The sessions, and whether each one is loaded.
+    sessions: Vec<(u32, bool)>,
+    next: u32,
+    /// The codes of the commands that came.
+    seen: Vec<u32>,
+}
+
+const CC_CREATE_PRIMARY: u32 = 0x131;
+const CC_START_AUTH_SESSION: u32 = 0x176;
+
+/// The attributes of the commands of the model, as TPM2_GetCapability gives them: the number of
+/// handles at bit 25, and the bit 28 for a handle in the response.
+const MODEL_ATTRS: [u32; 6] = [
+    CC_CREATE_PRIMARY | 1 << 25 | 1 << 28,
+    cmd::CC_CONTEXT_LOAD | 1 << 28,
+    cmd::CC_CONTEXT_SAVE | 1 << 25,
+    cmd::CC_FLUSH_CONTEXT,
+    CC_START_AUTH_SESSION | 2 << 25 | 1 << 28,
+    cmd::CC_GET_CAPABILITY,
+];
+
+impl SpaceModel {
+    fn answer(&mut self, c: &[u8]) -> Vec<u8> {
+        let cc = cmd::code(c).unwrap();
+        self.seen.push(cc);
+        let h = cmd::be32(c, 10).unwrap_or(0);
+        match cc {
+            CC_CREATE_PRIMARY => {
+                self.next += 1;
+                let handle = (0x8000_0000..).find(|h| self.objects.iter().all(|o| o.0 != *h));
+                self.objects.push((handle.unwrap(), self.next));
+                response(0, &handle.unwrap().to_be_bytes())
+            }
+            CC_START_AUTH_SESSION => {
+                self.next += 1;
+                let handle = 0x0200_0000 + self.next;
+                self.sessions.push((handle, true));
+                response(0, &handle.to_be_bytes())
+            }
+            cmd::CC_CONTEXT_SAVE => {
+                let mut ctx = 7u64.to_be_bytes().to_vec();
+                ctx.extend_from_slice(&h.to_be_bytes());
+                ctx.extend_from_slice(&0x4000_0001u32.to_be_bytes());
+                if let Some(o) = self.objects.iter().find(|o| o.0 == h) {
+                    ctx.extend_from_slice(&4u16.to_be_bytes());
+                    ctx.extend_from_slice(&o.1.to_be_bytes());
+                } else if let Some(s) = self.sessions.iter_mut().find(|s| s.0 == h && s.1) {
+                    s.1 = false;
+                    ctx.extend_from_slice(&0u16.to_be_bytes());
+                } else {
+                    return response(cmd::RC_REFERENCE_H0, &[]);
+                }
+                response(0, &ctx)
+            }
+            cmd::CC_CONTEXT_LOAD => {
+                let saved = cmd::be32(c, 18).unwrap();
+                if saved & 0xff00_0000 == cmd::HT_TRANSIENT {
+                    let id = cmd::be32(c, 28).unwrap();
+                    let handle = (0x8000_0000..).find(|h| self.objects.iter().all(|o| o.0 != *h));
+                    self.objects.push((handle.unwrap(), id));
+                    return response(0, &handle.unwrap().to_be_bytes());
+                }
+                match self.sessions.iter_mut().find(|s| s.0 == saved && !s.1) {
+                    Some(s) => {
+                        s.1 = true;
+                        response(0, &saved.to_be_bytes())
+                    }
+                    None => response(cmd::RC_HANDLE | 0x100 | 0x40, &[]),
+                }
+            }
+            cmd::CC_FLUSH_CONTEXT => {
+                let (o, s) = (self.objects.len(), self.sessions.len());
+                self.objects.retain(|x| x.0 != h);
+                self.sessions.retain(|x| x.0 != h);
+                if (o, s) == (self.objects.len(), self.sessions.len()) {
+                    return response(cmd::RC_HANDLE | 0x100 | 0x40, &[]);
+                }
+                response(0, &[])
+            }
+            cmd::CC_GET_CAPABILITY => {
+                let cap = cmd::be32(c, 10).unwrap();
+                let from = cmd::be32(c, 14).unwrap();
+                let values: Vec<u32> = if cap == cmd::CAP_COMMANDS {
+                    MODEL_ATTRS.iter().copied().filter(|a| a & 0xffff >= from).collect()
+                } else {
+                    let mut all: Vec<u32> = self.objects.iter().map(|o| o.0).collect();
+                    all.extend(self.sessions.iter().map(|s| s.0));
+                    all.into_iter().filter(|&h| h >= from).collect()
+                };
+                let n = if cap == cmd::CAP_COMMANDS { values.len().min(2) } else { values.len() };
+                let mut body = vec![u8::from(n < values.len())];
+                body.extend_from_slice(&cap.to_be_bytes());
+                body.extend_from_slice(&(n as u32).to_be_bytes());
+                for v in &values[..n] {
+                    body.extend_from_slice(&v.to_be_bytes());
+                }
+                response(0, &body)
+            }
+            _ => response(cmd::RC_COMMAND_CODE, &[]),
+        }
+    }
+}
+
+/// The interface of `SpaceModel`.
+struct SpaceTransport(Arc<Mutex<SpaceModel>>);
+
+impl Transport for SpaceTransport {
+    fn transmit(&mut self, _: &dyn Clock, c: &[u8], rsp: &mut [u8], _: u64) -> Result<usize> {
+        let r = self.0.lock().unwrap().answer(c);
+        rsp[..r.len()].copy_from_slice(&r);
+        Ok(r.len())
+    }
+
+    fn name(&self) -> &'static str {
+        "model"
+    }
+}
+
+fn space_chip() -> (Arc<Mutex<SpaceModel>>, Chip) {
+    let model = Arc::new(Mutex::new(SpaceModel::default()));
+    let chip = Chip::new(Box::new(SpaceTransport(model.clone())), clock());
+    (model, chip)
+}
+
+/// A command with the code `cc` and the handles `handles`.
+fn with_handles(cc: u32, handles: &[u32]) -> Vec<u8> {
+    let mut c = response(cc, &[]);
+    for h in handles {
+        c.extend_from_slice(&h.to_be_bytes());
+    }
+    let len = c.len() as u32;
+    c[2..6].copy_from_slice(&len.to_be_bytes());
+    c
+}
+
+/// The transient handles that `TPM2_GetCapability` gives in the space `s`.
+fn space_handles(chip: &Chip, s: &mut space::Space) -> Vec<u32> {
+    let c = cmd::get_capability(cmd::CAP_HANDLES, cmd::HT_TRANSIENT, 16);
+    let r = space::transmit(&mut chip.lock(), s, &c).unwrap();
+    let (more, handles) = cmd::parse_capability_u32(&r, cmd::CAP_HANDLES).unwrap();
+    assert!(!more);
+    assert_eq!(cmd::size(&r), Some(r.len()));
+    handles
+}
+
+#[test]
+fn reads_the_attributes_of_the_commands() {
+    let (model, chip) = space_chip();
+    assert!(!chip.has_cc_attrs());
+    chip.read_cc_attrs().unwrap();
+    assert_eq!(model.lock().unwrap().seen, [cmd::CC_GET_CAPABILITY; 3]);
+    assert_eq!(chip.cc_attrs(CC_CREATE_PRIMARY), Some(MODEL_ATTRS[0]));
+    // The flush and the save get one handle.
+    assert_eq!(chip.cc_attrs(cmd::CC_FLUSH_CONTEXT), Some(cmd::CC_FLUSH_CONTEXT | 1 << 25));
+    assert_eq!(chip.cc_attrs(cmd::CC_CONTEXT_SAVE), Some(cmd::CC_CONTEXT_SAVE | 1 << 25));
+    assert_eq!(chip.cc_attrs(cmd::CC_GET_RANDOM), None);
+    assert_eq!(chip.cc_attrs(CC_CREATE_PRIMARY | 1 << 29), None);
+}
+
+#[test]
+fn two_spaces_do_not_see_their_objects() {
+    let (model, chip) = space_chip();
+    chip.read_cc_attrs().unwrap();
+    let (mut a, mut b) = (space::Space::new(), space::Space::new());
+    let create = with_handles(CC_CREATE_PRIMARY, &[0x4000_0001]);
+    let create_in = |s: &mut space::Space| {
+        let r = space::transmit(&mut chip.lock(), s, &create).unwrap();
+        assert_eq!(cmd::code(&r), Some(0));
+        assert_eq!(cmd::be32(&r, 10).unwrap() & 0xff00_0000, cmd::HT_TRANSIENT);
+    };
+    create_in(&mut a);
+    create_in(&mut b);
+    create_in(&mut a);
+    // Between the commands, the TPM has no objects of the spaces.
+    assert!(model.lock().unwrap().objects.is_empty());
+    assert_eq!(space_handles(&chip, &mut a), [0x80ff_ffff, 0x80ff_fffe]);
+    assert_eq!(space_handles(&chip, &mut b), [0x80ff_ffff]);
+    // A flush of a virtual handle flushes the object of the space.
+    let flush = cmd::flush_context(0x80ff_ffff);
+    let r = space::transmit(&mut chip.lock(), &mut a, &flush).unwrap();
+    assert_eq!(cmd::code(&r), Some(0));
+    assert_eq!(space_handles(&chip, &mut a), [0x80ff_fffe]);
+    assert_eq!(space_handles(&chip, &mut b), [0x80ff_ffff]);
+    // A handle that is not in the space gives EINVAL, and the space does not change.
+    let r = space::transmit(&mut chip.lock(), &mut a, &cmd::flush_context(0x8012_3456));
+    assert_eq!(r, Err(Errno::EINVAL));
+    assert_eq!(space_handles(&chip, &mut a), [0x80ff_fffe]);
+    assert!(model.lock().unwrap().objects.is_empty());
+}
+
+#[test]
+fn a_full_space_flushes_the_new_object() {
+    let (model, chip) = space_chip();
+    chip.read_cc_attrs().unwrap();
+    let mut a = space::Space::new();
+    let create = with_handles(CC_CREATE_PRIMARY, &[0x4000_0001]);
+    for _ in 0..space::SLOTS {
+        space::transmit(&mut chip.lock(), &mut a, &create).unwrap();
+    }
+    assert_eq!(space::transmit(&mut chip.lock(), &mut a, &create), Err(Errno::ENOMEM));
+    assert!(model.lock().unwrap().objects.is_empty());
+    assert_eq!(space_handles(&chip, &mut a).len(), space::SLOTS);
+}
+
+#[test]
+fn a_command_that_the_tpm_does_not_have_gets_the_layer_of_the_resource_manager() {
+    let (model, chip) = space_chip();
+    chip.read_cc_attrs().unwrap();
+    let mut a = space::Space::new();
+    let r = space::transmit(&mut chip.lock(), &mut a, &cmd::get_random(8)).unwrap();
+    assert_eq!(cmd::code(&r), Some(cmd::RC_COMMAND_CODE | cmd::RC_RESMGR_LAYER));
+    assert_eq!(r.len(), 10);
+    assert_eq!(model.lock().unwrap().seen.len(), 3);
+    // A command that is shorter than its handles is not correct.
+    let short = with_handles(CC_START_AUTH_SESSION, &[0x4000_0007]);
+    assert_eq!(space::transmit(&mut chip.lock(), &mut a, &short), Err(Errno::EINVAL));
+    // Without the attributes, the resource manager does not send commands.
+    let (_, bare) = space_chip();
+    assert_eq!(space::transmit(&mut bare.lock(), &mut a, &short), Err(Errno::EINVAL));
+}
+
+#[test]
+fn sessions_stay_saved_and_go_when_the_file_closes() {
+    use rk_vfs::device::CharDevice;
+    use rk_vfs::file::File;
+
+    let (model, chip) = space_chip();
+    chip.read_cc_attrs().unwrap();
+    let chip = Arc::new(chip);
+    let device = dev::TpmrmDevice::new(chip.clone());
+    let ops = device.open(0).unwrap();
+    // Many files of /dev/tpmrm0 can be open.
+    let other = device.open(0).unwrap();
+    let file = File::with_ops(ops.clone(), None, 2);
+    let c = with_handles(CC_START_AUTH_SESSION, &[0x4000_0007, 0x4000_0007]);
+    assert_eq!(ops.write(&file, &c), Ok(c.len()));
+    let mut r = [0u8; 64];
+    assert_eq!(ops.read(&file, &mut r), Ok(14));
+    let session = cmd::be32(&r, 10).unwrap();
+    assert_eq!(session & 0xff00_0000, cmd::HT_HMAC_SESSION);
+    // The TPM keeps the session, but it is not loaded between the commands.
+    assert_eq!(model.lock().unwrap().sessions, [(session, false)]);
+    let cap = cmd::get_capability(cmd::CAP_HANDLES, 0, 16);
+    assert_eq!(ops.write(&file, &cap), Ok(cap.len()));
+    let n = ops.read(&file, &mut r).unwrap();
+    assert_eq!(cmd::parse_capability_u32(&r[..n], cmd::CAP_HANDLES).unwrap().1, [session]);
+    assert_eq!(model.lock().unwrap().sessions, [(session, false)]);
+    // An error of a nonblocking write comes in the next read.
+    let nonblock = File::with_ops(other.clone(), None, 2 | rk_abi::native::open::O_NONBLOCK);
+    let bad = cmd::flush_context(0x8012_3456);
+    assert_eq!(other.write(&nonblock, &bad), Ok(bad.len()));
+    assert_ne!(other.poll(&nonblock) & rk_abi::native::poll::POLLIN, 0);
+    assert_eq!(other.read(&nonblock, &mut r), Err(Errno::EINVAL));
+    assert_eq!(other.read(&nonblock, &mut r), Ok(0));
+    assert_eq!(other.write(&file, &bad), Err(Errno::EINVAL));
+    drop(file);
+    drop(ops);
+    assert!(model.lock().unwrap().sessions.is_empty());
+    assert_eq!(model.lock().unwrap().seen.last(), Some(&cmd::CC_FLUSH_CONTEXT));
 }

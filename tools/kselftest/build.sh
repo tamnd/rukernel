@@ -6,6 +6,9 @@
 # The script needs docker. It takes the selftests of the Linux release in LINUX_TAG, and builds
 # only the tests in TESTS. The test programs go to OUT_DIR. `cargo xtask boot-test` finds them in
 # target/kselftest, or in the directory that RK_KSELFTEST gives.
+#
+# The Python tests of tpm2 go to OUT_DIR/tpm2. The `kselftest` boot test does not run them: the
+# `tpm` boot test runs them with the python3 of tools/tpm/build.sh, on x86-64 and on arm64.
 set -eu
 
 LINUX_TAG=v6.17
@@ -46,6 +49,9 @@ for t in $TESTS; do
 		-lcap -lpthread
 	strip "/out/${t##*/}"
 done
+mkdir -p /out/tpm2
+cp tpm2/test_smoke.sh tpm2/test_space.sh tpm2/test_async.sh tpm2/tpm2.py tpm2/tpm2_tests.py \
+	/out/tpm2/
 echo "$LINUX_TAG" > /out/VERSION
 '
 echo "kselftest: the tests are in $out"

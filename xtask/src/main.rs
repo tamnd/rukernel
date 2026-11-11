@@ -1238,8 +1238,9 @@ fn rootfs_initramfs(kernel: &Path, name: &str) -> PathBuf {
 
 /// The script that runs as /init in the `tpm` boot test, after the checks of the kernel. It runs
 /// `tpm2_getrandom 8` and `tpm2_pcrread sha256:0,7` of tpm2-tools on /dev/tpm0, and compares the
-/// PCRs with the files of `pcr-sha256` in sysfs. `set -e` stops it at the first command that
-/// fails.
+/// PCRs with the files of `pcr-sha256` in sysfs. Then, if the initramfs has the tpm2 kselftests,
+/// it runs test_smoke.sh, test_space.sh and test_async.sh on /dev/tpm0 and /dev/tpmrm0. `set -e`
+/// stops it at the first command that fails.
 const TPM_INIT: &str = "#!/bin/sh
 /bin/busybox mkdir -p /proc /sys /tmp /sbin /usr/sbin
 /bin/busybox --install -s
@@ -1253,6 +1254,8 @@ grep -qx 2 /sys/class/tpm/tpm0/tpm_version_major
 grep -qx 10:224 /sys/class/tpm/tpm0/dev
 grep -qx MAJOR=10 /sys/class/tpm/tpm0/uevent
 grep -qx DEVNAME=tpm0 /sys/class/tpm/tpm0/uevent
+test -c /dev/tpmrm0
+grep -qx 253:65536 /sys/class/tpmrm/tpmrm0/dev
 test \"$(ls /sys/class/tpm/tpm0/pcr-sha256 | wc -l)\" -eq 24
 tpm2_getrandom 8 > /tmp/a
 tpm2_getrandom 8 > /tmp/b
@@ -1267,10 +1270,33 @@ for pcr in 0 7; do
     grep -q \"^ *$pcr *: *0x$want$\" /tmp/pcrs
 done
 echo 'tpm: the PCRs of tpm2_pcrread are the PCRs of pcr-sha256'
+test -d /kselftest/tpm2 || exit 0
+cd /kselftest/tpm2
+for t in test_smoke.sh test_space.sh test_async.sh; do
+    code=0
+    sh ./$t > /tmp/kselftest.log 2>&1 || code=$?
+    grep -E '^(Ran|OK|FAILED)' /tmp/kselftest.log | sed \"s/^/tpm: kselftest tpm2: $t: /\"
+    if [ $code -ne 0 ]; then
+        cat /tmp/kselftest.log
+        echo \"tpm: kselftest tpm2: $t: FAIL with $code\"
+        exit 1
+    fi
+    echo \"tpm: kselftest tpm2: $t: pass\"
+done
+echo 'tpm: the tpm2 kselftests pass'
 ";
 
-/// The line of `TPM_INIT` after all of its checks.
+/// The line of `TPM_INIT` after the checks of tpm2-tools.
 const TPM_TOOLS_PASS: &str = "tpm: the PCRs of tpm2_pcrread are the PCRs of pcr-sha256";
+
+/// The line of `TPM_INIT` after the tpm2 kselftests.
+const TPM_KSELFTEST_PASS: &str = "tpm: the tpm2 kselftests pass";
+
+/// Tells if the log of the `tpm` test has the lines of `TPM_INIT`. `kselftest` tells that the
+/// initramfs has the tpm2 kselftests.
+fn tpm_init_passes(log: &str, kselftest: bool) -> bool {
+    log.contains(TPM_TOOLS_PASS) && (!kselftest || log.contains(TPM_KSELFTEST_PASS))
+}
 
 /// The command line of the `tpm` boot test with tpm2-tools: init runs after the checks of the
 /// kernel.
@@ -1287,9 +1313,11 @@ fn tpm_tools_dir() -> Option<PathBuf> {
 }
 
 /// Writes the initramfs of the `tpm` boot test for `arch` next to the kernel: the tree of
-/// tools/tpm/build.sh and `TPM_INIT` as /init. Gives `None` if there is no tree, and the test
-/// then checks only the kernel.
-fn tpm_initramfs(kernel: &Path, arch: &str) -> Result<Option<PathBuf>> {
+/// tools/tpm/build.sh and `TPM_INIT` as /init. If the tree has python3 and the kselftest
+/// directory has `tpm2`, the tpm2 kselftests go to /kselftest/tpm2. Gives `None` if there is no
+/// tree, and the test then checks only the kernel. Else gives the path, and tells if the
+/// initramfs has the kselftests.
+fn tpm_initramfs(kernel: &Path, arch: &str) -> Result<Option<(PathBuf, bool)>> {
     let Some(root) = tpm_tools_dir().map(|d| d.join(arch).join("root")).filter(|r| r.is_dir())
     else {
         println!("boot test tpm: tpm2-tools skipped, run tools/tpm/build.sh");
@@ -1299,9 +1327,29 @@ fn tpm_initramfs(kernel: &Path, arch: &str) -> Result<Option<PathBuf>> {
     w.add(b".", 0o040_755, b"");
     add_tree(&mut w, &root, &root)?;
     w.add(b"init", 0o100_755, TPM_INIT.as_bytes());
+    let tests = kselftest_dir().map(|d| d.join("tpm2")).filter(|d| d.is_dir());
+    // usr/bin/python3 is a link, so its target is not on the host.
+    let tests = tests.filter(|_| fs::symlink_metadata(root.join("usr/bin/python3")).is_ok());
+    if let Some(dir) = &tests {
+        w.add(b"kselftest", 0o040_755, b"");
+        w.add(b"kselftest/tpm2", 0o040_755, b"");
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        for name in names {
+            let path = dir.join(&name);
+            let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            w.add(format!("kselftest/tpm2/{name}").as_bytes(), 0o100_755, &bytes);
+        }
+    } else {
+        println!("boot test tpm: the tpm2 kselftests skipped, run tools/kselftest/build.sh");
+    }
     let path = kernel.with_file_name("initramfs-tpm.cpio");
     fs::write(&path, w.finish()).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Some(path))
+    Ok(Some((path, tests.is_some())))
 }
 
 /// The directory of gdb, strace and their test program that tools/debug/build.sh makes:
@@ -1593,8 +1641,12 @@ fn build_suite_initramfs(
     w.add(b"etc/group", 0o100_644, b"root:x:0:\n");
     let mut names = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-        let file = entry.map_err(|e| e.to_string())?.file_name();
-        let file = file.to_string_lossy().into_owned();
+        let entry = entry.map_err(|e| e.to_string())?;
+        // A directory, as the tpm2 kselftests, goes to another boot test.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let file = entry.file_name().to_string_lossy().into_owned();
         if file != "VERSION" {
             names.push(file);
         }
@@ -2594,7 +2646,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         let server = if *test == "inet" { Some(TcpServer::start()?) } else { None };
         // The `tpm` test runs tpm2-tools after the checks of the kernel, if they are there.
         let tpm_initrd = if *test == "tpm" { tpm_initramfs(&kernel, "x86_64")? } else { None };
-        let (mut cmd, timeout) = if let Some(initrd) = &tpm_initrd {
+        let (mut cmd, timeout) = if let Some((initrd, _)) = &tpm_initrd {
             (qemu_command_with(&kernel, initrd, &tpm_cmdline(test)), ROOTFS_TIMEOUT)
         } else if *test == "ltp" {
             let initrd = kernel.with_file_name("initramfs-ltp.cpio");
@@ -2715,8 +2767,11 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             QEMU_PASS
         };
         let mut passed = status == Some(want) && log.contains(&pass_line(test));
-        if tpm_initrd.is_some() && passed && !log.contains(TPM_TOOLS_PASS) {
-            println!("boot test tpm: the log does not have \"{TPM_TOOLS_PASS}\"");
+        if let Some((_, kselftest)) = &tpm_initrd
+            && passed
+            && !tpm_init_passes(&log, *kselftest)
+        {
+            println!("boot test tpm: the log does not have all of the lines of the init of tpm");
             passed = false;
         }
         if *test == "blk" && passed && !blk_disk_has_note(&kernel.with_file_name("blk.img"))? {
@@ -3014,7 +3069,7 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         if let Some((initrd, _)) = initrd.as_ref().filter(|_| user_tests.contains(test)) {
             cmd.arg("-initrd").arg(initrd);
         }
-        if let Some(initrd) = &tpm_initrd {
+        if let Some((initrd, _)) = &tpm_initrd {
             cmd.arg("-initrd").arg(initrd);
         }
         // The `virt` machine has a virtio-net-pci device by default. The PCI runs remove it, so
@@ -3053,7 +3108,7 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
             && log.contains("aarch64 booting with linux")
             && log.contains(&format!("smp: {smp} CPUs run"))
             && log.contains(&pass_line(test))
-            && (tpm_initrd.is_none() || log.contains(TPM_TOOLS_PASS));
+            && tpm_initrd.as_ref().is_none_or(|(_, k)| tpm_init_passes(&log, *k));
         // The driver tells the bus of the device and the kind of its interrupt. virtio-blk has
         // one queue and virtio-net two, and the configuration has one more MSI-X vector.
         let (device, msix) =

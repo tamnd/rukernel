@@ -1211,8 +1211,8 @@ fn net_test() -> bool {
 
 /// The kernel finds the TPM of the machine: the CRB of the ACPI `TPM2` table on x86-64, and the
 /// FIFO interface of the device tree on arm64. The driver starts it as Linux does. Then the test
-/// sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read`. `cargo xtask boot-test` gives the
-/// machine a new swtpm for this test.
+/// sends `TPM2_Startup`, `TPM2_GetRandom` and `TPM2_PCR_Read`, and finds /dev/tpm0 and
+/// /dev/tpmrm0. `cargo xtask boot-test` gives the machine a new swtpm for this test.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn tpm_test() -> bool {
     use rk_drv_tpm::cmd;
@@ -1265,6 +1265,12 @@ fn tpm_test() -> bool {
     ok &= check("pcr-sha256 in sysfs has the 24 PCRs, and PCRs 0 and 7 are the same", {
         files.as_ref().is_some_and(|f| f.len() == 24) && same
     });
+    let tpmrm0 = devices.iter().find(|d| d.name == "tpmrm0" && d.class == "tpmrm");
+    ok &= check(
+        "the resource manager is /dev/tpmrm0 with the number 253:65536",
+        chip.has_cc_attrs()
+            && tpmrm0.is_some_and(|d| d.rdev == rk_drv_tpm::dev::TPMRM0_RDEV && !d.block),
+    );
     ok
 }
 

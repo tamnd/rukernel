@@ -9,8 +9,9 @@
 //! TPM without an interrupt.
 //!
 //! The chip sends one command at a time. At boot `init` does the startup of Linux
-//! (`tpm2_auto_startup`): `TPM2_SelfTest`, and `TPM2_Startup` if the TPM is not started. Then it
-//! adds `/dev/tpm0` and its directory in sysfs, with `dev`.
+//! (`tpm2_auto_startup`): `TPM2_SelfTest`, and `TPM2_Startup` if the TPM is not started. It reads
+//! the attributes of the commands for the resource manager of `space`. Then it adds `/dev/tpm0`,
+//! `/dev/tpmrm0` and their directories in sysfs, with `dev`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -20,6 +21,7 @@ extern crate alloc;
 pub mod cmd;
 pub mod crb;
 pub mod dev;
+pub mod space;
 #[cfg(test)]
 mod tests;
 pub mod tis;
@@ -130,20 +132,26 @@ pub struct Chip {
     free: WaitQueue,
     clock: Box<dyn Clock>,
     name: &'static str,
+    /// The attributes of the commands of the TPM, as `cc_attrs_tbl` of Linux. `read_cc_attrs`
+    /// fills it.
+    cc_attrs: SpinLock<Vec<u32>>,
 }
 
-impl Chip {
-    /// Makes a chip with the interface `transport`.
-    pub fn new(transport: Box<dyn Transport>, clock: Box<dyn Clock>) -> Self {
-        let name = transport.name();
-        Self { transport: SpinLock::new(Some(transport)), free: WaitQueue::new(), clock, name }
-    }
+/// A chip that one caller has. Other callers wait until the guard goes, so that the commands of
+/// the caller have no other commands between them, as `tpm_try_get_ops` of Linux.
+pub struct ChipGuard<'a> {
+    chip: &'a Chip,
+    transport: Option<Box<dyn Transport>>,
+}
 
-    /// The name of the interface.
-    pub fn name(&self) -> &'static str {
-        self.name
+impl Drop for ChipGuard<'_> {
+    fn drop(&mut self) {
+        *self.chip.transport.lock() = self.transport.take();
+        self.chip.free.wake_all();
     }
+}
 
+impl ChipGuard<'_> {
     /// Sends the command `cmd` and copies the response to `rsp`, as `tpm_transmit` of Linux. The
     /// command waits up to its duration. A response of `TPM_RC_RETRY` or `TPM_RC_TESTING` sends
     /// the command again after a wait that doubles each time, up to the long duration. Gives the
@@ -154,40 +162,89 @@ impl Chip {
     /// `EINVAL` for a command that is shorter than a header, `E2BIG` for a command whose size
     /// field is not its length or is too large, `EFAULT` for a response whose size field is not
     /// its length, and the errors of `Transport::transmit`.
-    pub fn transmit(&self, cmd: &[u8], rsp: &mut [u8]) -> Result<usize> {
+    pub fn transmit(&mut self, cmd: &[u8], rsp: &mut [u8]) -> Result<usize> {
         if cmd.len() < cmd::HEADER_SIZE {
             return Err(Errno::EINVAL);
         }
         if cmd.len() > cmd::BUFSIZE || cmd::size(cmd) != Some(cmd.len()) {
             return Err(Errno::E2BIG);
         }
+        let clock = &*self.chip.clock;
+        let t = self.transport.as_mut().ok_or(Errno::ENODEV)?;
         let cc = cmd::code(cmd).unwrap_or(0);
         let duration = cmd::duration(cc);
-        let mut t = self.free.wait_until(|| self.transport.lock().take());
         let mut delay = cmd::DURATION_SHORT;
-        let result = loop {
-            let n = match t.transmit(&*self.clock, cmd, rsp, duration) {
+        loop {
+            let n = match t.transmit(clock, cmd, rsp, duration) {
                 Ok(n) if n >= cmd::HEADER_SIZE && cmd::size(rsp) == Some(n) => n,
-                Ok(_) => break Err(Errno::EFAULT),
-                Err(e) => break Err(e),
+                Ok(_) => return Err(Errno::EFAULT),
+                Err(e) => return Err(e),
             };
             let rc = cmd::code(rsp).unwrap_or(0);
             if rc != cmd::RC_RETRY && rc != cmd::RC_TESTING {
-                break Ok(n);
+                return Ok(n);
             }
             // A self test that runs gives its answer at once, so that the boot is not slower.
             if (rc == cmd::RC_TESTING && cc == cmd::CC_SELF_TEST) || delay > cmd::DURATION_LONG {
-                break Ok(n);
+                return Ok(n);
             }
-            let stop = self.clock.now_ms() + delay;
-            while self.clock.now_ms() < stop {
-                self.clock.sleep();
+            let stop = clock.now_ms() + delay;
+            while clock.now_ms() < stop {
+                clock.sleep();
             }
             delay *= 2;
-        };
-        *self.transport.lock() = Some(t);
-        self.free.wake_all();
-        result
+        }
+    }
+
+    /// Sends the command `cmd` and gives the response and its response code.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `transmit`.
+    pub fn command(&mut self, cmd: &[u8]) -> Result<(u32, Vec<u8>)> {
+        let mut rsp = vec![0u8; cmd::BUFSIZE];
+        let n = self.transmit(cmd, &mut rsp)?;
+        rsp.truncate(n);
+        Ok((cmd::code(&rsp).unwrap_or(0), rsp))
+    }
+
+    /// The chip.
+    pub fn chip(&self) -> &Chip {
+        self.chip
+    }
+}
+
+impl Chip {
+    /// Makes a chip with the interface `transport`.
+    pub fn new(transport: Box<dyn Transport>, clock: Box<dyn Clock>) -> Self {
+        let name = transport.name();
+        Self {
+            transport: SpinLock::new(Some(transport)),
+            free: WaitQueue::new(),
+            clock,
+            name,
+            cc_attrs: SpinLock::new(Vec::new()),
+        }
+    }
+
+    /// The name of the interface.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Waits until no other caller has the chip, and gives it to this caller.
+    pub fn lock(&self) -> ChipGuard<'_> {
+        let t = self.free.wait_until(|| self.transport.lock().take());
+        ChipGuard { chip: self, transport: Some(t) }
+    }
+
+    /// Sends the command `cmd` and copies the response to `rsp`, as `ChipGuard::transmit`.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `ChipGuard::transmit`.
+    pub fn transmit(&self, cmd: &[u8], rsp: &mut [u8]) -> Result<usize> {
+        self.lock().transmit(cmd, rsp)
     }
 
     /// Sends the command `cmd` and gives the response and its response code.
@@ -196,10 +253,53 @@ impl Chip {
     ///
     /// The errors of `transmit`.
     pub fn command(&self, cmd: &[u8]) -> Result<(u32, Vec<u8>)> {
-        let mut rsp = vec![0u8; cmd::BUFSIZE];
-        let n = self.transmit(cmd, &mut rsp)?;
-        rsp.truncate(n);
-        Ok((cmd::code(&rsp).unwrap_or(0), rsp))
+        self.lock().command(cmd)
+    }
+
+    /// Reads the attributes of all of the commands of the TPM with `TPM2_GetCapability`, as
+    /// `tpm2_get_cc_attrs_tbl` of Linux. `TPM2_ContextSave` and `TPM2_FlushContext` get one
+    /// handle, because the resource manager must change the handle in their parameter too.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `transmit`, and `EIO` for an error of the TPM or a bad response.
+    pub fn read_cc_attrs(&self) -> Result<()> {
+        let mut attrs = Vec::new();
+        let mut next = cmd::CC_FIRST;
+        loop {
+            let (rc, rsp) = self.command(&cmd::get_capability(cmd::CAP_COMMANDS, next, 256))?;
+            if rc != cmd::RC_SUCCESS {
+                return Err(Errno::EIO);
+            }
+            let (more, values) =
+                cmd::parse_capability_u32(&rsp, cmd::CAP_COMMANDS).ok_or(Errno::EIO)?;
+            let Some(&last) = values.last() else { break };
+            attrs.extend(values);
+            next = (last & 0xffff) + 1;
+            if !more || attrs.len() > 0xffff {
+                break;
+            }
+        }
+        for a in &mut attrs {
+            let cc = *a & 0xffff;
+            if cc == cmd::CC_CONTEXT_SAVE || cc == cmd::CC_FLUSH_CONTEXT {
+                *a = (*a & !(7 << cmd::CC_ATTR_CHANDLES)) | (1 << cmd::CC_ATTR_CHANDLES);
+            }
+        }
+        *self.cc_attrs.lock() = attrs;
+        Ok(())
+    }
+
+    /// The attributes of the command with the code `cc`, as `tpm2_find_cc` of Linux. A command
+    /// of the vendor has the bit `CC_ATTR_VENDOR` in its code.
+    pub fn cc_attrs(&self, cc: u32) -> Option<u32> {
+        let mask = (1 << cmd::CC_ATTR_VENDOR) | 0xffff;
+        self.cc_attrs.lock().iter().copied().find(|a| a & mask == cc)
+    }
+
+    /// Tells if `read_cc_attrs` read the attributes of the commands.
+    pub fn has_cc_attrs(&self) -> bool {
+        !self.cc_attrs.lock().is_empty()
     }
 
     /// Sends `TPM2_SelfTest`, first a test of the functions that are not tested yet, then a full
@@ -340,9 +440,9 @@ impl Clock for KernelClock {
     }
 }
 
-/// Finds the TPM of the machine, makes its driver, starts it and adds `/dev/tpm0`. Does nothing if
-/// there is no TPM or if it does not answer. A second call gives the chip of the first. Gives the
-/// chip.
+/// Finds the TPM of the machine, makes its driver, starts it and adds `/dev/tpm0` and
+/// `/dev/tpmrm0`. Does nothing if there is no TPM or if it does not answer. A second call gives
+/// the chip of the first. Gives the chip.
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn init() -> Option<Arc<Chip>> {
     use rk_frame::println;
@@ -391,6 +491,9 @@ pub fn init() -> Option<Arc<Chip>> {
             println!("{name}: the TPM at {:#x} does not start, error {}", dev.phys(), e.get());
             return None;
         }
+    }
+    if let Err(e) = chip.read_cc_attrs() {
+        println!("{name}: no attributes of the commands, error {}, so no /dev/tpmrm0", e.get());
     }
     let chip = Arc::new(chip);
     *CHIP.lock() = Some(chip.clone());
