@@ -1,0 +1,16 @@
+[package]
+name = "rk-crypto"
+description = "The crypto API of rukernel: SHA, HMAC, AES and the modes ECB, CBC, CTR and XTS, as crypto/ of Linux."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+
+[lints]
+workspace = true

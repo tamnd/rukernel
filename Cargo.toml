@@ -11,6 +11,7 @@ members = [
     "core/rk-cgroup",
     "core/rk-proc",
     "core/rk-syscall",
+    "sec/rk-crypto",
     "drv/rk-drv-mem",
     "drv/rk-drv-virtio",
     "drv/rk-drv-tty",
@@ -56,6 +57,7 @@ rk-bpf = { path = "core/rk-bpf", version = "0.5.0" }
 rk-cgroup = { path = "core/rk-cgroup", version = "0.5.0" }
 rk-proc = { path = "core/rk-proc", version = "0.5.0" }
 rk-syscall = { path = "core/rk-syscall", version = "0.5.0" }
+rk-crypto = { path = "sec/rk-crypto", version = "0.5.0" }
 rk-block = { path = "block/rk-block", version = "0.5.0" }
 rk-drv-mem = { path = "drv/rk-drv-mem", version = "0.5.0" }
 rk-drv-tpm = { path = "drv/rk-drv-tpm", version = "0.5.0" }
