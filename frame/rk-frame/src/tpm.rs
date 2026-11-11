@@ -6,7 +6,11 @@
 //! `0xfed40000`. On arm64 the device tree node with `compatible = "tcg,tpm-tis-mmio"` gives a TIS,
 //! as `tpm_tis_init` of Linux finds it.
 //!
-//! rk-drv-tpm sends the commands. This module only finds the registers and maps them.
+//! The firmware can keep an event log of its measurements: the log area of the ACPI `TPM2` table,
+//! or the properties `linux,sml-base` and `linux,sml-size` of the device tree node. [`event_log`]
+//! copies it, as `tpm_read_log_acpi` and `tpm_read_log_of` of Linux.
+//!
+//! rk-drv-tpm sends the commands. This module only finds the registers and the log and maps them.
 
 use crate::iomem::IoMem;
 
@@ -107,10 +111,60 @@ pub fn tpm() -> Option<TpmDevice> {
 #[cfg(target_arch = "aarch64")]
 static TIS: crate::sync::SpinLock<Option<(u64, u64)>> = crate::sync::SpinLock::new(None);
 
-/// Keeps the TIS of the device tree. The boot path calls this.
+/// The physical address and the size of the event log of the device tree.
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn set_tis(phys: u64, len: u64) {
+static LOG: crate::sync::SpinLock<Option<(u64, u64)>> = crate::sync::SpinLock::new(None);
+
+/// Keeps the TIS of the device tree and its event log. The boot path calls this.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn set_tis(phys: u64, len: u64, log: Option<(u64, u64)>) {
     *TIS.lock() = Some((phys, len));
+    *LOG.lock() = log;
+}
+
+/// The largest event log that the kernel copies, and the end of the physical addresses that the
+/// kernel reads it at.
+const MAX_LOG: u64 = 16 << 20;
+const MAX_LOG_END: u64 = 1 << 46;
+
+/// Tells if the kernel copies a log of `len` bytes at `start`.
+fn log_fits(start: u64, len: u64) -> bool {
+    len <= MAX_LOG && start.checked_add(len).is_some_and(|end| end <= MAX_LOG_END)
+}
+
+/// Gives a copy of the event log of the firmware: the log area of the ACPI `TPM2` table, as
+/// `tpm_read_log_acpi` of Linux. The area has the length that the table gives, and the events
+/// fill only its start. Gives `None` if the table has no log area, or if the area is not in the
+/// direct map.
+#[cfg(target_arch = "x86_64")]
+pub fn event_log() -> Option<alloc::vec::Vec<u8>> {
+    use crate::arch::imp::acpi;
+    let (start, len) = acpi::tpm2_log().filter(|&(start, len)| log_fits(start, len))?;
+    acpi::copy(start, usize::try_from(len).ok()?)
+}
+
+/// Gives a copy of the event log of the firmware: the area of `linux,sml-base` and
+/// `linux,sml-size` of the device tree node of the TPM, as `tpm_read_log_of` of Linux. Gives
+/// `None` if the node has no log, or if the log is not in the direct map.
+#[cfg(target_arch = "aarch64")]
+pub fn event_log() -> Option<alloc::vec::Vec<u8>> {
+    use crate::addr::VirtAddr;
+    use crate::mm::frame::query;
+    let (start, len) = (*LOG.lock()).filter(|&(start, len)| log_fits(start, len))?;
+    let len = usize::try_from(len).ok()?;
+    let virt = crate::arch::imp::paging::phys_to_virt(start);
+    let last = virt.checked_add(len - 1)?;
+    // Each page of the range must be in the direct map.
+    let mut page = virt & !(crate::addr::PAGE_SIZE - 1);
+    while page <= last {
+        query(VirtAddr::new(page))?;
+        page += crate::addr::PAGE_SIZE;
+    }
+    // SAFETY: the loop above tells that the direct map has each page of the range. The direct map
+    // has RAM only, and the firmware keeps the log in RAM that the kernel does not use. The bytes
+    // are copied out.
+    let bytes = unsafe { core::slice::from_raw_parts(virt as *const u8, len) };
+    Some(bytes.to_vec())
 }
 
 /// Maps `len` bytes of device registers at `phys`, if the range is not on RAM.

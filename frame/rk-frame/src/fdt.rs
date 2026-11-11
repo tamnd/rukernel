@@ -111,6 +111,9 @@ pub(crate) struct Platform {
     /// The physical address and the size of the registers of a TPM with the FIFO interface
     /// (`tcg,tpm-tis-mmio`).
     pub(crate) tpm_tis: Option<(u64, u64)>,
+    /// The physical address and the size of the event log of the TPM, from the properties
+    /// `linux,sml-base` and `linux,sml-size` of its node.
+    pub(crate) tpm_log: Option<(u64, u64)>,
 }
 
 impl Default for Platform {
@@ -136,6 +139,7 @@ impl Default for Platform {
             virtio_mmio: [(0, 0, None); MAX_VIRTIO_MMIO],
             virtio_mmio_count: 0,
             tpm_tis: None,
+            tpm_log: None,
         }
     }
 }
@@ -152,6 +156,9 @@ struct Node<'a> {
     interrupt_map: &'a [u8],
     interrupt_map_mask: &'a [u8],
     msi_map: &'a [u8],
+    /// The `linux,sml-base` and `linux,sml-size` of a TPM.
+    sml_base: &'a [u8],
+    sml_size: &'a [u8],
     /// The `#address-cells`, `#size-cells` and `#interrupt-cells` of the children of the node.
     address_cells: Option<u32>,
     size_cells: Option<u32>,
@@ -220,6 +227,7 @@ impl<'a> Node<'a> {
             }
         } else if self.is("tcg,tpm-tis-mmio") && platform.tpm_tis.is_none() {
             platform.tpm_tis = first;
+            platform.tpm_log = self.tpm_log();
         } else if self.is("pci-host-ecam-generic") && platform.pci_ecam.is_none() {
             platform.pci_ecam = first;
             self.pci_windows(platform, addr_cells);
@@ -275,7 +283,17 @@ impl<'a> Node<'a> {
             platform.tpm_tis = self.reg(0, cells.0, cells.1).and_then(|(start, len)| {
                 Some((parent.translate(start, len, cells, root_cells)?, len))
             });
+            platform.tpm_log = self.tpm_log();
         }
+    }
+
+    /// The event log of a TPM node, as `tpm_read_log_of` of Linux reads it: a 64-bit address and
+    /// a 32-bit size, big-endian. A node without the two properties, or with a size of 0, gives
+    /// `None`.
+    fn tpm_log(&self) -> Option<(u64, u64)> {
+        let base = be64(self.sml_base, 0)?;
+        let size = be32(self.sml_size, 0)?;
+        (size != 0).then_some((base, u64::from(size)))
     }
 
     /// Gives the address of the parent bus for the address `start` of a child of this node, from
@@ -528,6 +546,8 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
             (2, "compatible") => child.compatible = value,
             (2, "reg") => child.reg = value,
             (2, "status") => child.status = value,
+            (2, "linux,sml-base") => child.sml_base = value,
+            (2, "linux,sml-size") => child.sml_size = value,
             _ => {}
         }
         match (depth, prop) {
@@ -539,6 +559,8 @@ pub(crate) fn read(blob: &[u8], phys: u64, info: &mut BootInfo) -> Result<Platfo
             (1, "interrupt-map") => node.interrupt_map = value,
             (1, "interrupt-map-mask") => node.interrupt_map_mask = value,
             (1, "msi-map") => node.msi_map = value,
+            (1, "linux,sml-base") => node.sml_base = value,
+            (1, "linux,sml-size") => node.sml_size = value,
             (1, "#address-cells") => node.address_cells = be32(value, 0),
             (1, "#size-cells") => node.size_cells = be32(value, 0),
             (1, "#interrupt-cells") => node.interrupt_cells = be32(value, 0),
@@ -914,6 +936,7 @@ mod tests {
         let mut info = BootInfo::new("test");
         let p = read(&blob, 0x5000_0000, &mut info).unwrap();
         assert_eq!(p.tpm_tis, Some((0x0c00_0000, 0x5000)));
+        assert_eq!(p.tpm_log, None);
 
         // A TPM at depth 1, and a TPM outside the ranges of its bus.
         let mut b = Builder::default();
@@ -923,11 +946,15 @@ mod tests {
         b.begin("tpm@fed40000");
         b.prop("compatible", b"tcg,tpm-tis-mmio\0");
         b.prop("reg", &be(&[0, 0xfed4_0000, 0, 0x5000]));
+        // The event log of the firmware, as `tpm_read_log_of` of Linux reads it.
+        b.prop("linux,sml-base", &be(&[0x1, 0x2000_0000]));
+        b.prop("linux,sml-size", &be(&[0x1_0000]));
         b.end();
         b.end();
         let blob = b.finish(&[]);
         let p = read(&blob, 0x5000_0000, &mut BootInfo::new("test")).unwrap();
         assert_eq!(p.tpm_tis, Some((0xfed4_0000, 0x5000)));
+        assert_eq!(p.tpm_log, Some((0x1_2000_0000, 0x1_0000)));
         let ranges = be(&[0, 0, 0x0c00_0000, 0x1_0000]);
         let bus = Node { ranges: &ranges, ..Node::default() };
         assert_eq!(bus.translate(0x800, 0x5000, (1, 1), 2), Some(0x0c00_0800));

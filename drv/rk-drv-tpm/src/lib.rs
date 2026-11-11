@@ -11,7 +11,8 @@
 //! The chip sends one command at a time. At boot `init` does the startup of Linux
 //! (`tpm2_auto_startup`): `TPM2_SelfTest`, and `TPM2_Startup` if the TPM is not started. It reads
 //! the attributes of the commands for the resource manager of `space`. Then it adds `/dev/tpm0`,
-//! `/dev/tpmrm0` and their directories in sysfs, with `dev`.
+//! `/dev/tpmrm0` and their directories in sysfs, with `dev`, and the event log of the firmware in
+//! securityfs, with `eventlog`.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -21,6 +22,7 @@ extern crate alloc;
 pub mod cmd;
 pub mod crb;
 pub mod dev;
+pub mod eventlog;
 pub mod space;
 #[cfg(test)]
 mod tests;
@@ -440,8 +442,8 @@ impl Clock for KernelClock {
     }
 }
 
-/// Finds the TPM of the machine, makes its driver, starts it and adds `/dev/tpm0` and
-/// `/dev/tpmrm0`. Does nothing if there is no TPM or if it does not answer. A second call gives
+/// Finds the TPM of the machine, makes its driver, starts it and adds `/dev/tpm0`, `/dev/tpmrm0`
+/// and `/sys/kernel/security/tpm0/binary_bios_measurements`. Does nothing if there is no TPM or if it does not answer. A second call gives
 /// the chip of the first. Gives the chip.
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub fn init() -> Option<Arc<Chip>> {
@@ -498,5 +500,13 @@ pub fn init() -> Option<Arc<Chip>> {
     let chip = Arc::new(chip);
     *CHIP.lock() = Some(chip.clone());
     dev::register(chip.clone());
+    if let Some(log) = rk_frame::tpm::event_log() {
+        match eventlog::register(&log) {
+            Some(n) => println!("{name}: the event log of the firmware has {n} events"),
+            None => {
+                println!("{name}: the event log of the firmware does not have the TPM 2.0 format")
+            }
+        }
+    }
     Some(chip)
 }

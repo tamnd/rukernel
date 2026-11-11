@@ -1,5 +1,5 @@
 //! The ACPI tables that the kernel reads: the MADT, for the local APIC ID of each CPU, and the
-//! `TPM2` table, for the TPM.
+//! `TPM2` table, for the TPM and its event log.
 //!
 //! The RSDP points to the RSDT or the XSDT, which point to the other tables. The kernel reads the
 //! tables through the direct map. A table that is not in the direct map is not read.
@@ -101,4 +101,40 @@ pub(crate) fn tpm2() -> Option<(u64, u32)> {
         return None;
     }
     Some((read::<u64>(table + TPM2_CONTROL_AREA)?, read::<u32>(table + TPM2_START_METHOD)?))
+}
+
+/// The offsets in the `TPM2` table of the minimum length and of the start address of the log
+/// area, after the 12 bytes of the parameters of the start method. A table without them is
+/// shorter than `TPM2_LOG_END`.
+const TPM2_LOG_LEN: u64 = 64;
+const TPM2_LOG_START: u64 = 68;
+const TPM2_LOG_END: u64 = 76;
+
+/// Gives the start address and the length of the log area of the `TPM2` table, as
+/// `tpm_read_log_acpi` of Linux reads them. A table without a log area, or with an address or a
+/// length of 0, gives `None`.
+pub(crate) fn tpm2_log() -> Option<(u64, u64)> {
+    let table = find_table(b"TPM2")?;
+    if u64::from(read::<Header>(table)?.length) < TPM2_LOG_END {
+        return None;
+    }
+    let len = u64::from(read::<u32>(table + TPM2_LOG_LEN)?);
+    let start = read::<u64>(table + TPM2_LOG_START)?;
+    (start != 0 && len != 0).then_some((start, len))
+}
+
+/// Copies `len` bytes at the physical address `addr`, if the direct map has all of them.
+pub(crate) fn copy(addr: u64, len: usize) -> Option<alloc::vec::Vec<u8>> {
+    const CHUNK: usize = 64;
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    let mut at = addr;
+    while out.len() + CHUNK <= len {
+        out.extend_from_slice(&read::<[u8; CHUNK]>(at)?);
+        at += CHUNK as u64;
+    }
+    while out.len() < len {
+        out.push(read::<u8>(at)?);
+        at += 1;
+    }
+    Some(out)
 }
