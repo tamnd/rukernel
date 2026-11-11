@@ -16,6 +16,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - fanotify has `FAN_REPORT_MNT`. A group with this flag marks a mount namespace with `FAN_MARK_MNTNS` and gets `FAN_MNT_ATTACH` and `FAN_MNT_DETACH` when a mount of the namespace is attached, moved or unmounted. Each event has a `FAN_EVENT_INFO_TYPE_MNT` record with the unique mount ID, and the errors and the record layout are the same as in Linux. The `init` boot test checks the errors, the fdinfo line and the events of mount, move and umount. (#539)
 - The `sdbpf` boot test runs the unit tests test-bpf-devices, test-bpf-firewall and test-bpf-foreign-programs of systemd. They attach cgroup programs with `BPF_PROG_ATTACH`, `BPF_PROG_DETACH`, `BPF_PROG_QUERY` and `BPF_LINK_CREATE`, and all three pass. `RK_SYSTEMD_PACKAGES` of tools/systemd/build.sh adds packages to the systemd tree, and this test needs `systemd-tests` and `iputils-ping` (#537).
+- The expressions `numgen` and `hash` of nf_tables, as nft_numgen.c and nft_hash.c of Linux, and more keys of `meta`, as nft_meta.c: `priority`, `pkttype`, `cpu`, `iifgroup`, `oifgroup`, `random`, `iifkind`, `oifkind`, `time`, `day`, `hour`, `sdif` and `sdifname`. A rule sets `meta priority` and `meta pkttype` too. A packet now has a priority and a type, as `skb->priority` and `skb->pkt_type`. `meta iif` and `meta iifname` of a packet with no device give 0 and "", as in Linux (#542).
 
 ### Fixed
 

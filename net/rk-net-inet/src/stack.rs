@@ -865,6 +865,14 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
         return;
     }
     frame.protocol = eth.ethertype;
+    // The type of the frame, as `eth_type_trans` of Linux.
+    frame.pkt_type = if eth.dst.is_broadcast() {
+        rk_net::packet::PACKET_BROADCAST
+    } else if eth.dst.is_multicast() {
+        rk_net::packet::PACKET_MULTICAST
+    } else {
+        rk_net::packet::PACKET_HOST
+    };
     match u32::from(eth.ethertype) {
         ETH_P_ARP => arp_input(dev, frame.data()),
         // A frame to a link multicast or broadcast address is not `PACKET_HOST`, and the stack

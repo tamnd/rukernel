@@ -39,6 +39,7 @@ use crate::netfilter::{
     nf_pktinfo as nft_pktinfo,
 };
 use crate::netlink::msg::{ATTR_HDRLEN, Attrs, Builder, HDRLEN};
+use crate::packet::PACKET_OTHERHOST;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -57,9 +58,10 @@ mod nft_objects;
 #[cfg(test)]
 pub(crate) use self::nft_exprs::nft_log_line;
 use self::nft_exprs::{
-    NftByteorder, NftLimit, NftRange, NftReject, nft_byteorder_eval, nft_byteorder_init,
-    nft_limit_eval, nft_limit_init, nft_log_init, nft_range_eval, nft_range_init, nft_reject_eval,
-    nft_reject_init,
+    NftByteorder, NftHash, NftLimit, NftNumgen, NftRange, NftReject, nft_byteorder_eval,
+    nft_byteorder_init, nft_hash_eval, nft_hash_init, nft_limit_eval, nft_limit_init, nft_log_init,
+    nft_numgen_eval, nft_numgen_init, nft_prandom, nft_range_eval, nft_range_init, nft_realtime_ns,
+    nft_reject_eval, nft_reject_init,
 };
 pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
 use self::nft_flowtable::nft_flow_offload_init;
@@ -167,6 +169,7 @@ const NFTA_META_KEY: u32 = 2;
 const NFTA_META_SREG: u32 = 3;
 const NFT_META_LEN: u32 = 0;
 const NFT_META_PROTOCOL: u32 = 1;
+const NFT_META_PRIORITY: u32 = 2;
 const NFT_META_MARK: u32 = 3;
 const NFT_META_IIF: u32 = 4;
 const NFT_META_OIF: u32 = 5;
@@ -176,6 +179,18 @@ const NFT_META_IIFTYPE: u32 = 8;
 const NFT_META_OIFTYPE: u32 = 9;
 const NFT_META_NFPROTO: u32 = 15;
 const NFT_META_L4PROTO: u32 = 16;
+const NFT_META_PKTTYPE: u32 = 19;
+const NFT_META_CPU: u32 = 20;
+const NFT_META_IIFGROUP: u32 = 21;
+const NFT_META_OIFGROUP: u32 = 22;
+const NFT_META_PRANDOM: u32 = 24;
+const NFT_META_IIFKIND: u32 = 26;
+const NFT_META_OIFKIND: u32 = 27;
+const NFT_META_TIME_NS: u32 = 30;
+const NFT_META_TIME_DAY: u32 = 31;
+const NFT_META_TIME_HOUR: u32 = 32;
+const NFT_META_SDIF: u32 = 33;
+const NFT_META_SDIFNAME: u32 = 34;
 
 // `NFTA_BITWISE_*` and `enum nft_bitwise_ops`.
 const NFTA_BITWISE_SREG: u32 = 1;
@@ -244,8 +259,8 @@ pub(super) enum NftExpr {
     Payload { base: u32, offset: usize, len: usize, dreg: usize },
     /// `meta` that loads a key of the packet, as `nft_meta_get_eval`.
     Meta { key: u32, dreg: usize },
-    /// `meta mark set`, as `nft_meta_set_eval`.
-    MetaSet { sreg: usize },
+    /// `meta mark set`, `meta priority set` and `meta pkttype set`, as `nft_meta_set_eval`.
+    MetaSet { key: u32, sreg: usize },
     /// `bitwise` with `NFT_BITWISE_BOOL`, as nft_bitwise.c.
     Bitwise { sreg: usize, dreg: usize, mask: Vec<u8>, xor: Vec<u8> },
     /// `bitwise` with `NFT_BITWISE_LSHIFT` or `NFT_BITWISE_RSHIFT`, as nft_bitwise.c. The
@@ -279,6 +294,10 @@ pub(super) enum NftExpr {
     Byteorder(NftByteorder),
     /// `range`, as nft_range.c.
     Range(NftRange),
+    /// `numgen`, as nft_numgen.c. The copies of the rule share the counter.
+    Numgen(NftNumgen),
+    /// `hash`, as nft_hash.c.
+    Hash(NftHash),
     /// `limit`, as nft_limit.c. The copies of the rule share the bucket.
     Limit(Arc<NftLimit>),
     /// `quota`, as nft_quota.c. The copies of the rule share the bytes.
@@ -569,18 +588,28 @@ pub(super) fn nf_tables_expr_parse(
                 return Err(Errno::EINVAL);
             }
             if a.has(NFTA_META_SREG) {
-                // Of the keys that a rule can set, only the mark is here.
-                if key != NFT_META_MARK {
-                    return Err(Errno::EOPNOTSUPP);
-                }
-                let sreg = nft_parse_register(&a, NFTA_META_SREG, 4)?;
-                return Ok(NftExpr::MetaSet { sreg });
+                // The keys that a rule can set. The kernel has no security marks and no
+                // trace of the rules.
+                let len = match key {
+                    NFT_META_MARK | NFT_META_PRIORITY => 4,
+                    NFT_META_PKTTYPE => 1,
+                    _ => return Err(Errno::EOPNOTSUPP),
+                };
+                let sreg = nft_parse_register(&a, NFTA_META_SREG, len)?;
+                return Ok(NftExpr::MetaSet { key, sreg });
             }
+            // The kernel has no sockets for the packets, no security marks, no classes of the
+            // routes, no cgroups, no IPsec and no bridges, so the keys of these are not here.
             let len = match key {
-                NFT_META_LEN | NFT_META_MARK | NFT_META_IIF | NFT_META_OIF => 4,
-                NFT_META_IIFNAME | NFT_META_OIFNAME => IFNAMSIZ,
                 NFT_META_PROTOCOL | NFT_META_IIFTYPE | NFT_META_OIFTYPE => 2,
-                NFT_META_NFPROTO | NFT_META_L4PROTO => 1,
+                NFT_META_NFPROTO | NFT_META_L4PROTO | NFT_META_LEN | NFT_META_PRIORITY
+                | NFT_META_MARK | NFT_META_IIF | NFT_META_OIF | NFT_META_SDIF
+                | NFT_META_PKTTYPE | NFT_META_CPU | NFT_META_IIFGROUP | NFT_META_OIFGROUP
+                | NFT_META_PRANDOM | NFT_META_TIME_HOUR => 4,
+                NFT_META_IIFNAME | NFT_META_OIFNAME | NFT_META_IIFKIND | NFT_META_OIFKIND
+                | NFT_META_SDIFNAME => IFNAMSIZ,
+                NFT_META_TIME_NS => 8,
+                NFT_META_TIME_DAY => 1,
                 _ => return Err(Errno::EOPNOTSUPP),
             };
             let dreg = nft_parse_register(&a, NFTA_META_DREG, len)?;
@@ -677,6 +706,8 @@ pub(super) fn nf_tables_expr_parse(
         b"redir" => nft_redir_init(table, data),
         b"byteorder" => Ok(NftExpr::Byteorder(nft_byteorder_init(data)?)),
         b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
+        b"numgen" => Ok(NftExpr::Numgen(nft_numgen_init(data)?)),
+        b"hash" => Ok(NftExpr::Hash(nft_hash_init(data)?)),
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
         b"quota" => Ok(NftExpr::Quota(nft_quota_init(data)?)),
         b"connlimit" => nft_connlimit_expr_init(table, data),
@@ -865,6 +896,11 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
         )),
         NftExpr::Xt(x) if x.hooks() != 0 => Some((x.hooks(), false)),
         NftExpr::FlowOffload { .. } => Some((1 << NF_INET_FORWARD, false)),
+        // As `nft_meta_get_validate_sdif` and `nft_meta_set_validate` of Linux.
+        NftExpr::Meta { key: NFT_META_SDIF | NFT_META_SDIFNAME, .. } => {
+            Some((1 << NF_INET_LOCAL_IN | 1 << NF_INET_FORWARD, false))
+        }
+        NftExpr::MetaSet { key: NFT_META_PKTTYPE, .. } => Some((1 << NF_INET_PRE_ROUTING, false)),
         _ => None,
     }
 }
@@ -1541,30 +1577,64 @@ fn nft_eval(
                     let p = if state.pf == NFPROTO_IPV6 { ETH_P_IPV6 } else { ETH_P_IP };
                     regs.store(*dreg, &p.to_be_bytes());
                 }
-                NFT_META_IIF if state.in_dev != 0 => {
-                    regs.store(*dreg, &state.in_dev.to_ne_bytes());
-                }
-                NFT_META_OIF if state.out_dev != 0 => {
-                    regs.store(*dreg, &state.out_dev.to_ne_bytes());
-                }
+                // As `nft_meta_store_ifindex`: a packet with no device gives 0.
+                NFT_META_IIF => regs.store(*dreg, &state.in_dev.to_ne_bytes()),
+                NFT_META_OIF => regs.store(*dreg, &state.out_dev.to_ne_bytes()),
                 NFT_META_MARK => regs.store(*dreg, &skb.mark.to_ne_bytes()),
+                NFT_META_PRIORITY => regs.store(*dreg, &skb.priority.to_ne_bytes()),
+                NFT_META_PKTTYPE => regs.store(*dreg, &[skb.pkt_type]),
                 NFT_META_NFPROTO => regs.store(*dreg, &[state.pf]),
                 NFT_META_L4PROTO if pkt.thoff.is_some() => regs.store(*dreg, &[pkt.l4proto]),
-                // The name and the type of the device, as `nft_meta_store_ifname` and
-                // `nft_meta_store_iftype`. A packet with no device does not match.
-                NFT_META_IIFNAME | NFT_META_OIFNAME | NFT_META_IIFTYPE | NFT_META_OIFTYPE => {
+                NFT_META_CPU => regs.store(*dreg, &(rk_frame::cpu::id() as u32).to_ne_bytes()),
+                NFT_META_PRANDOM => regs.store(*dreg, &nft_prandom().to_ne_bytes()),
+                // As `nft_meta_get_eval_time`, with the time zone of UTC.
+                NFT_META_TIME_NS => regs.store(*dreg, &nft_realtime_ns().to_ne_bytes()),
+                NFT_META_TIME_DAY => {
+                    let days = nft_realtime_ns() / 1_000_000_000 / 86_400;
+                    regs.store(*dreg, &[((4 + days) % 7) as u8]);
+                }
+                NFT_META_TIME_HOUR => {
+                    let secs = nft_realtime_ns() / 1_000_000_000 % 86_400;
+                    regs.store(*dreg, &(secs as u32).to_ne_bytes());
+                }
+                // The kernel has no devices of VRF, so a packet has no second device, as
+                // `nft_meta_get_eval_sdif` with no `l3mdev`.
+                NFT_META_SDIF => regs.store(*dreg, &0u32.to_ne_bytes()),
+                NFT_META_SDIFNAME => regs.store(*dreg, &[0u8; IFNAMSIZ]),
+                // The name, the type, the group and the kind of the device, as
+                // `nft_meta_store_ifname`, `nft_meta_store_iftype`, `nft_meta_store_ifgroup`
+                // and `nft_meta_get_eval_kind`. A packet with no device has the name "", and
+                // it does not match the other keys.
+                NFT_META_IIFNAME | NFT_META_OIFNAME | NFT_META_IIFTYPE | NFT_META_OIFTYPE
+                | NFT_META_IIFGROUP | NFT_META_OIFGROUP | NFT_META_IIFKIND | NFT_META_OIFKIND => {
                     let ifindex = match *key {
-                        NFT_META_IIFNAME | NFT_META_IIFTYPE => state.in_dev,
+                        NFT_META_IIFNAME | NFT_META_IIFTYPE | NFT_META_IIFGROUP
+                        | NFT_META_IIFKIND => state.in_dev,
                         _ => state.out_dev,
                     };
                     let dev = if ifindex == 0 { None } else { crate::dev::by_index(ifindex) };
+                    let mut name = [0u8; IFNAMSIZ];
                     match (dev, *key) {
-                        (Some(d), NFT_META_IIFNAME | NFT_META_OIFNAME) => {
-                            let mut name = [0u8; IFNAMSIZ];
-                            let n = d.name();
-                            let len = n.len().min(IFNAMSIZ);
-                            name[..len].copy_from_slice(&n.as_bytes()[..len]);
+                        (dev, NFT_META_IIFNAME | NFT_META_OIFNAME) => {
+                            if let Some(d) = dev {
+                                let n = d.name();
+                                let len = n.len().min(IFNAMSIZ);
+                                name[..len].copy_from_slice(&n.as_bytes()[..len]);
+                            }
                             regs.store(*dreg, &name);
+                        }
+                        (Some(d), NFT_META_IIFKIND | NFT_META_OIFKIND) => match d.link_kind() {
+                            Some(k) => {
+                                let len = k.len().min(IFNAMSIZ);
+                                name[..len].copy_from_slice(&k.as_bytes()[..len]);
+                                regs.store(*dreg, &name);
+                            }
+                            None => regs.verdict = NFT_BREAK,
+                        },
+                        // The kernel has no groups of devices: each device is in the group 0,
+                        // `INIT_NETDEV_GROUP`.
+                        (Some(_), NFT_META_IIFGROUP | NFT_META_OIFGROUP) => {
+                            regs.store(*dreg, &0u32.to_ne_bytes());
                         }
                         (Some(d), _) => regs.store(*dreg, &d.kind().arphrd().to_ne_bytes()),
                         (None, _) => regs.verdict = NFT_BREAK,
@@ -1572,9 +1642,20 @@ fn nft_eval(
                 }
                 _ => regs.verdict = NFT_BREAK,
             },
-            NftExpr::MetaSet { sreg } => {
+            // As `nft_meta_set_eval` of Linux.
+            NftExpr::MetaSet { key, sreg } => {
                 let r = &regs.data[*sreg..*sreg + 4];
-                skb.mark = u32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
+                let v = u32::from_ne_bytes([r[0], r[1], r[2], r[3]]);
+                match *key {
+                    NFT_META_MARK => skb.mark = v,
+                    NFT_META_PRIORITY => skb.priority = v,
+                    _ => {
+                        // As `skb_pkt_type_ok`: the types up to `PACKET_OTHERHOST`.
+                        if r[0] <= PACKET_OTHERHOST && skb.pkt_type <= PACKET_OTHERHOST {
+                            skb.pkt_type = r[0];
+                        }
+                    }
+                }
             }
             NftExpr::Bitwise { sreg, dreg, mask, xor } => {
                 let mut v = [0u8; NFT_REGS_LEN];
@@ -1666,6 +1747,8 @@ fn nft_eval(
             }
             NftExpr::Byteorder(b) => nft_byteorder_eval(b, regs),
             NftExpr::Range(r) => nft_range_eval(r, regs),
+            NftExpr::Numgen(n) => nft_numgen_eval(n, regs),
+            NftExpr::Hash(h) => nft_hash_eval(h, regs, skb, state.pf, pkt),
             NftExpr::Limit(l) => nft_limit_eval(l, regs, skb),
             NftExpr::Quota(q) => nft_quota_eval(q, regs, skb),
             NftExpr::Connlimit(c) => nft_connlimit_eval(c, regs, skb),
@@ -1860,7 +1943,7 @@ mod tests {
         // meta mark set 5; meta mark 5 drop; meta iifname "lo" drop.
         let set = vec![
             e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(5u32.to_ne_bytes().to_vec()) }),
-            e(NftExpr::MetaSet { sreg: R1 }),
+            e(NftExpr::MetaSet { key: NFT_META_MARK, sreg: R1 }),
         ];
         let read = || {
             vec![
@@ -1894,7 +1977,7 @@ mod tests {
             }),
             e(shift(true, 8)),
             e(shift(false, 4)),
-            e(NftExpr::MetaSet { sreg: R1 }),
+            e(NftExpr::MetaSet { key: NFT_META_MARK, sreg: R1 }),
         ];
         let prog = NftProg { chains: vec![vec![set]], sets: vec![], nat: false };
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
@@ -1918,6 +2001,60 @@ mod tests {
         // The packet has no input device, so the name does not match.
         let prog = NftProg { chains: vec![vec![name]], sets: vec![], nat: false };
         assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_ACCEPT);
+    }
+
+    #[test]
+    fn meta_sets_the_priority_and_the_type_and_reads_the_other_keys() {
+        let s = state(NFPROTO_IPV4);
+        let imm = |v: &[u8]| e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(v.to_vec()) });
+        let is = |key: u32, v: &[u8]| {
+            [
+                e(NftExpr::Meta { key, dreg: R1 }),
+                e(NftExpr::Cmp { sreg: R1, op: NFT_CMP_EQ, data: v.to_vec() }),
+            ]
+        };
+        // meta priority set 7; meta pkttype set broadcast.
+        let mut r = vec![
+            imm(&7u32.to_ne_bytes()),
+            e(NftExpr::MetaSet { key: NFT_META_PRIORITY, sreg: R1 }),
+            imm(&[1]),
+            e(NftExpr::MetaSet { key: NFT_META_PKTTYPE, sreg: R1 }),
+        ];
+        r.extend(is(NFT_META_PRIORITY, &7u32.to_ne_bytes()));
+        r.extend(is(NFT_META_PKTTYPE, &[1]));
+        // No input device: iif 0 and iifname "". The host has CPU 0 and the time 0, a
+        // Thursday.
+        r.extend(is(NFT_META_IIF, &0u32.to_ne_bytes()));
+        r.extend(is(NFT_META_IIFNAME, &[0; IFNAMSIZ]));
+        r.extend(is(NFT_META_CPU, &0u32.to_ne_bytes()));
+        r.extend(is(NFT_META_TIME_DAY, &[4]));
+        r.extend(is(NFT_META_TIME_HOUR, &0u32.to_ne_bytes()));
+        r.extend(is(NFT_META_SDIF, &0u32.to_ne_bytes()));
+        r.push(verdict(NF_DROP, 0));
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+        let mut p = udp4(9);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_DROP);
+        assert_eq!((p.priority, p.pkt_type), (7, 1));
+        // A type over `PACKET_OTHERHOST` does not change the packet.
+        let r = vec![imm(&[7]), e(NftExpr::MetaSet { key: NFT_META_PKTTYPE, sreg: R1 })];
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
+        assert_eq!(p.pkt_type, 1);
+        // The group and the kind of a device that is not there do not match.
+        for key in [NFT_META_IIFGROUP, NFT_META_IIFKIND, NFT_META_IIFTYPE] {
+            let mut r = vec![e(NftExpr::Meta { key, dreg: R1 })];
+            r.push(verdict(NF_DROP, 0));
+            let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+            assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s), NF_ACCEPT, "{key}");
+        }
+        // meta pkttype set is only in prerouting, and meta sdif only in input and forward.
+        let set = NftExpr::MetaSet { key: NFT_META_PKTTYPE, sreg: R1 };
+        assert_eq!(nft_expr_hooks(&set), Some((1 << NF_INET_PRE_ROUTING, false)));
+        let sdif = NftExpr::Meta { key: NFT_META_SDIFNAME, dreg: R1 };
+        assert_eq!(
+            nft_expr_hooks(&sdif),
+            Some((1 << NF_INET_LOCAL_IN | 1 << NF_INET_FORWARD, false))
+        );
     }
 
     #[test]
