@@ -21,10 +21,11 @@ pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
     NFT_OBJECT_MAX, NFTA_FLOWTABLE_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr, NftFlowtable, NftObj,
-    NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj, nf_tables_expr_parse,
+    NftObjState, NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj, nf_tables_expr_parse,
     nf_tables_getflowtable, nf_tables_getobj, nft_check_loops, nft_do_chain, nft_expr_dump,
     nft_expr_needs_validate, nft_expr_targets, nft_expr_validate, nft_obj_commit, nft_prog,
-    nft_rule_needs_ct, nft_setelem_parse_obj, nft_table_validate,
+    nft_rule_needs_ct, nft_set_exprs_dump, nft_set_exprs_parse, nft_setelem_parse_obj,
+    nft_table_validate,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
@@ -378,6 +379,8 @@ struct NftElem {
     timeout: u64,
     /// The time of the clock in nanoseconds when the element expires, or 0.
     expires: u64,
+    /// The stateful expressions of the element, as `NFT_SET_EXT_EXPRESSIONS` of Linux.
+    exprs: Vec<NftObjState>,
 }
 
 impl NftElem {
@@ -476,6 +479,8 @@ struct NftSet {
     timeout: u64,
     /// `NFTA_SET_GC_INTERVAL`, kept for the dump.
     gc_int: u32,
+    /// The stateful expressions of the set, that each new element gets a copy of.
+    exprs: Vec<NftObjState>,
     elems: BTreeMap<ElemKey, NftElem>,
     /// The elements of `dynset` since the last commit.
     dynamic: DynElems,
@@ -488,6 +493,14 @@ struct NftSet {
 }
 
 impl NftSet {
+    /// The set or one of its elements has `connlimit`, that needs connection tracking.
+    fn needs_ct(&self) -> bool {
+        self.exprs
+            .iter()
+            .chain(self.elems.values().flat_map(|e| &e.exprs))
+            .any(NftObjState::is_connlimit)
+    }
+
     /// The type of the data of the elements, as `nft_set_datatype` of Linux.
     fn datatype(&self) -> u32 {
         if self.flags & NFT_SET_MAP != 0 { self.dtype } else { NFT_DATA_VALUE }
@@ -1096,6 +1109,7 @@ fn nf_tables_fill_set(
         b.end_nest(concat);
     }
     b.end_nest(nest);
+    nft_set_exprs_dump(&mut b, (NFTA_SET_EXPR, NFTA_SET_EXPRESSIONS), &set.exprs, false);
     b.finish()
 }
 
@@ -1142,6 +1156,7 @@ fn nf_tables_fill_setelem(
         Some(d) => nft_data_dump(b, NFTA_SET_ELEM_DATA, d, table),
         None => {}
     }
+    nft_set_exprs_dump(b, (NFTA_SET_ELEM_EXPR, NFTA_SET_ELEM_EXPRESSIONS), &elem.exprs, false);
     if elem.flags != 0 {
         b.put(NFTA_SET_ELEM_FLAGS as u16, &elem.flags.to_be_bytes());
     }
@@ -2365,10 +2380,6 @@ impl NftBatch {
         {
             return Err(Errno::EOPNOTSUPP);
         }
-        // The expressions of the sets come later.
-        if flags & NFT_SET_EXPR != 0 || nla.has(NFTA_SET_EXPR) || nla.has(NFTA_SET_EXPRESSIONS) {
-            return Err(Errno::EOPNOTSUPP);
-        }
         let (mut dtype, mut dlen) = (0, 0);
         if let Some(d) = be32(nla, NFTA_SET_DATA_TYPE)? {
             if flags & NFT_SET_MAP == 0 {
@@ -2417,6 +2428,17 @@ impl NftBatch {
         let t = nft_table_lookup(&self.tables, table_name, ctx.family, ctx.portid)
             .map_err(|e| bad(info, nla, NFTA_SET_TABLE, e))?;
         let table = &self.tables[t];
+        // The stateful expressions, as `nft_set_expr_alloc` of Linux. A list needs
+        // `NFT_SET_EXPR`.
+        let exprs = nft_set_exprs_parse(
+            table,
+            flags,
+            nla,
+            (NFTA_SET_EXPR, NFTA_SET_EXPRESSIONS),
+            flags & NFT_SET_EXPR != 0,
+            &[],
+        )?
+        .unwrap_or_default();
         match nft_set_lookup(table, Some(name)) {
             Ok(s) => {
                 if ctx.has(NLM_F_EXCL) {
@@ -2440,6 +2462,8 @@ impl NftBatch {
                     || set.field_len != field_len
                     || set.timeout != timeout
                     || set.gc_int != gc_int
+                    || set.exprs.len() != exprs.len()
+                    || set.exprs.iter().zip(&exprs).any(|(a, b)| a.name() != b.name())
                 {
                     return Err(bad(info, nla, NFTA_SET_NAME, Errno::EEXIST));
                 }
@@ -2470,6 +2494,7 @@ impl NftBatch {
             udata,
             timeout,
             gc_int,
+            exprs,
             elems: BTreeMap::new(),
             dynamic: DynElems::default(),
             touched: BTreeSet::new(),
@@ -2588,9 +2613,19 @@ impl NftBatch {
         };
         let expires =
             if timeout == 0 { 0 } else { nft_now_ns().saturating_add(expiration * 1_000_000) };
-        if ea.has(NFTA_SET_ELEM_EXPR) || ea.has(NFTA_SET_ELEM_EXPRESSIONS) {
-            return Err(Errno::EOPNOTSUPP);
-        }
+        // The stateful expressions: the ones of the element, or a copy of the ones of the set.
+        let exprs = match nft_set_exprs_parse(
+            table,
+            set.flags,
+            &ea,
+            (NFTA_SET_ELEM_EXPR, NFTA_SET_ELEM_EXPRESSIONS),
+            true,
+            &set.exprs,
+        )? {
+            Some(e) => e,
+            None if end => Vec::new(),
+            None => set.exprs.iter().map(NftObjState::fresh).collect(),
+        };
         let key_end = match ea.get(NFTA_SET_ELEM_KEY_END) {
             Some(k) => Some(nft_value_init(k, set.klen)?),
             None => None,
@@ -2632,7 +2667,7 @@ impl NftBatch {
         if matches!(data, Some(NftData::Verdict { chain: Some(_), .. })) {
             self.validate = true;
         }
-        let elem = NftElem { key_end, data, flags, udata, timeout, expires };
+        let elem = NftElem { key_end, data, flags, udata, timeout, expires, exprs };
         // The elements that have expired go, as the garbage collection of Linux.
         let now = nft_now_ns();
         let set = &mut self.tables[t].sets[s];
@@ -2767,7 +2802,8 @@ fn nft_sync_ct(net: &mut NftablesPernet, tables: &[NftTable]) -> Result<()> {
     for t in tables {
         // A rule with a `ct` expression or NAT, and a chain of NAT.
         let uses = t.chains.iter().flat_map(|c| &c.rules).any(|r| nft_rule_needs_ct(&r.parsed))
-            || t.chains.iter().any(|c| c.base.as_ref().is_some_and(|b| b.ty.nat));
+            || t.chains.iter().any(|c| c.base.as_ref().is_some_and(|b| b.ty.nat))
+            || t.sets.iter().any(NftSet::needs_ct);
         if uses && !want.contains(&t.family) {
             want.push(t.family);
         }
@@ -2964,6 +3000,7 @@ mod tests {
             udata: None,
             timeout: 0,
             gc_int: 0,
+            exprs: Vec::new(),
             elems: BTreeMap::new(),
             dynamic: DynElems::default(),
             touched: BTreeSet::new(),
@@ -3090,6 +3127,7 @@ mod tests {
             udata: None,
             timeout: 0,
             expires: 0,
+            exprs: Vec::new(),
         };
         m.elems.insert(key, elem);
         t.sets.push(m);
@@ -3151,6 +3189,7 @@ mod tests {
             udata: None,
             timeout: 0,
             expires: 0,
+            exprs: Vec::new(),
         };
         m.elems.insert(key, elem);
         t.sets.push(m);
@@ -3192,6 +3231,7 @@ mod tests {
             udata: Some(alloc::vec![1]),
             timeout: if expires == 0 { 0 } else { 60_000 },
             expires,
+            exprs: Vec::new(),
         };
         let mut s = set(b"d");
         s.elems.insert(k(1), elem(0));
