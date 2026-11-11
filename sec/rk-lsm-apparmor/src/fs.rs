@@ -142,11 +142,18 @@ impl Tree for AppArmorFs {
     }
 }
 
-/// The text of `profiles`: a line for each profile, as `seq_show_profile` of Linux.
+/// The text of `profiles`: a line for each profile, as `seq_show_profile` of Linux. The
+/// profiles of the root namespace come first, then the profiles of each child namespace as
+/// `:NS:NAME`, the newest namespace first.
 fn profiles_text() -> String {
     let mut s = String::new();
     for p in ROOT.profiles() {
         s.push_str(&format!("{} ({})\n", p.name, p.mode.name()));
+    }
+    for ns in ROOT.children_ns() {
+        for p in ns.profiles() {
+            s.push_str(&format!(":{}:{} ({})\n", ns.name, p.name, p.mode.name()));
+        }
     }
     s
 }
@@ -189,7 +196,9 @@ mod tests {
         assert_eq!(TREE.read("features/domain/version").unwrap(), b"1.2\n");
         assert_eq!(TREE.read(".ns_name").unwrap(), b"root\n");
         assert_eq!(TREE.read("revision").unwrap(), b"0\n");
-        assert_eq!(TREE.read("profiles").unwrap(), b"");
+        // The test of a stack in task.rs loads `rk_test` in the root namespace.
+        let profiles = TREE.read("profiles").unwrap();
+        assert!(profiles.is_empty() || profiles.starts_with(b"rk_test"));
         assert_eq!(TREE.read(".load"), Err(Errno::EINVAL));
     }
 

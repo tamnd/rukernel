@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- AppArmor has child policy namespaces, as policy_ns.c of Linux. A load of a profile `:NS:NAME`, or of a policy with the namespace `NS`, makes the namespace `NS` if it is not there, and the load records end with `ns="NS"`. The file `profiles` lists these profiles as `:NS:NAME`, and a remove of `:NS:NAME` or `:NS:` removes the profile or the namespace. Thus `apparmor_parser` loads all the profiles of Ubuntu 26.04, also `:glycin:loaders` and `:glycin:bwrap`, and `aa-status` lists them. A task changes to a profile of a namespace with `change_profile` or `change_onexec` of `:NS://NAME`, as `aa-exec --namespace` does. The task sees the names of its namespace without the namespace, and the attach at exec looks in its namespace. A task can also put a profile on a stack with its label, with `stack NAME` or `changeprofile &NAME`, now or at the next exec. The label of the task is then `A//&B`, and each profile of the stack checks the file accesses and changes at an exec. For a script, the exec hook of AppArmor now gets the script and not its interpreter, as on Linux, so the rules for the script give the profile and `AT_SECURE`. tools/apparmor runs the AppArmor regression tests in complain mode under QEMU, on rukernel and on a Linux reference kernel, and tools/apparmor/report.md compares the results (#540).
+
 ### Fixed
 
 - A kill of the processes of a cgroup with `memory.oom.group` counts the victim again in `oom_kill` of `memory.events`, as `oom_kill_memcg_member` of Linux kills each process of the group, the victim too. It also counts a process that is on its way out. Before, the count was one less than on Linux, and `test_memcg_oom_group_score_events` of the cgroup kselftests failed (#536).

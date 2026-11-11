@@ -2,10 +2,15 @@
 //! file.c and procattr.c of Linux.
 //!
 //! The credentials blob holds the label of the task: 0 for `unconfined`, or the number of the
-//! name of a profile. The name gives the newest version of the profile, as the proxy of a label
-//! of Linux does. A profile that was removed gives `unconfined`. After the label, the blob holds
-//! the context of the task, `struct aa_task_ctx` of Linux: the label before a hat, the label
-//! for the next exec and the token of the hat ([`slot`]).
+//! name of a label. The name of a label is the full name of a profile, or a stack of profiles:
+//! their full names with `//&` between them, as Linux writes a label. The name gives the newest
+//! version of each profile, as the proxy of a label of Linux does. A profile that was removed
+//! goes out of the label, and a label with no profile is `unconfined`. After the label, the blob
+//! holds the context of the task, `struct aa_task_ctx` of Linux: the label before a hat, the
+//! label for the next exec and the token of the hat ([`slot`]).
+//!
+//! Each profile of a stack checks each operation, and the exec of a task with a stack changes
+//! each profile of the stack, as on Linux.
 //!
 //! This kernel does not deny an operation. Each profile acts as a profile in complain mode: the
 //! log tells what the policy does not allow, and the operation goes on. Linux also stops some
@@ -13,7 +18,7 @@
 
 use crate::audit::{self, Kind};
 use crate::dfa::{NOMATCH, State};
-use crate::policy::{Mode, Profile, ROOT};
+use crate::policy::{self, Mode, Profile};
 use crate::unpack::{Pdb, Perms, class, perm, x};
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -42,13 +47,14 @@ pub const CRED_BLOB: usize = 32;
 
 /// The byte offsets of the words in the part of AppArmor in the credentials blob.
 pub mod slot {
-    /// The label of the task: 0 for `unconfined`, or the number of the name of a profile.
+    /// The label of the task: 0 for `unconfined`, or the number of the name of a label.
     pub const LABEL: usize = 0;
     /// The label before the change to a hat, `previous`, as a [`super::label_ref`].
     pub const PREVIOUS: usize = 8;
     /// The label for the next exec, `onexec`, as a [`super::label_ref`].
     pub const ONEXEC: usize = 16;
-    /// The token of the hat, `token`.
+    /// The token of the hat, `token`. With a label for the next exec, it is 1 if the label
+    /// goes on a stack.
     pub const TOKEN: usize = 24;
 }
 
@@ -93,20 +99,44 @@ pub fn label_id(cred: &Cred) -> u64 {
     load(cred, slot::LABEL)
 }
 
-/// The word that refers to the label `p` in the context of a task. 0 is no label, so
-/// `unconfined` has its own value.
-pub fn label_ref(p: Option<&Profile>) -> u64 {
-    p.map_or(UNCONFINED_REF, |p| intern(&p.name))
+/// A label: the profiles of a stack, or one profile. No profile is `unconfined`.
+pub type Label = Vec<Arc<Profile>>;
+
+/// The separator of the profiles of a stack in the name of a label.
+pub const STACK: &str = "//&";
+
+/// The name of the label `l` for the blob: the full names of its profiles with `//&` between
+/// them. Gives `None` for `unconfined`.
+fn label_name(l: &[Arc<Profile>]) -> Option<String> {
+    let names: Vec<_> = l.iter().map(|p| p.fqname()).collect();
+    (!names.is_empty()).then(|| names.join(STACK))
 }
 
-/// The newest label of the word `v` of the context of a task. `None` is no label, and
-/// `Some(None)` is `unconfined`.
-pub fn ref_label(v: u64) -> Option<Option<Arc<Profile>>> {
+/// The word that refers to the label `l` in the context of a task. 0 is no label, so
+/// `unconfined` has its own value.
+pub fn label_ref(l: &[Arc<Profile>]) -> u64 {
+    label_name(l).map_or(UNCONFINED_REF, |n| intern(&n))
+}
+
+/// The newest label of the word `v` of the context of a task. `None` is no label.
+pub fn ref_label(v: u64) -> Option<Label> {
     match v {
         0 => None,
-        UNCONFINED_REF => Some(None),
-        v => Some(profile_by_id(v)),
+        UNCONFINED_REF => Some(Vec::new()),
+        v => Some(label_by_id(v)),
     }
+}
+
+/// The stack of the labels `a` and `b`, as `aa_label_merge` of Linux: the profiles of `a`, then
+/// the profiles of `b` that are not in `a`.
+pub fn merge(a: &[Arc<Profile>], b: &[Arc<Profile>]) -> Label {
+    let mut out = a.to_vec();
+    for p in b {
+        if !out.iter().any(|q| q.fqname() == p.fqname()) {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 /// Clears the label before the hat, the label for the next exec and the token, as
@@ -117,31 +147,50 @@ pub fn clear_trans(cred: &Cred) {
     }
 }
 
-/// The newest profile of the label number `id`, `aa_get_newest_label` of Linux. `None` is
-/// `unconfined`.
-pub fn profile_by_id(id: u64) -> Option<Arc<Profile>> {
-    let i = usize::try_from(id).ok()?.checked_sub(1)?;
-    let name = NAMES.lock().names.get(i)?.clone();
-    ROOT.lookup(&name)
+/// The newest label of the label number `id`, `aa_get_newest_label` of Linux. A profile that
+/// was removed goes out of the label.
+pub fn label_by_id(id: u64) -> Label {
+    let Some(i) = usize::try_from(id).ok().and_then(|i| i.checked_sub(1)) else {
+        return Vec::new();
+    };
+    let Some(name) = NAMES.lock().names.get(i).cloned() else { return Vec::new() };
+    name.split(STACK).filter_map(policy::lookup_fq).collect()
 }
 
-/// The profile of `cred`, `aa_get_newest_cred_label` of Linux. `None` is `unconfined`.
+/// The first profile of the label number `id`. `None` is `unconfined`.
+pub fn profile_by_id(id: u64) -> Option<Arc<Profile>> {
+    label_by_id(id).into_iter().next()
+}
+
+/// The label of `cred`, `aa_get_newest_cred_label` of Linux.
+pub fn label_of(cred: &Cred) -> Label {
+    label_by_id(label_id(cred))
+}
+
+/// The first profile of the label of `cred`, for a view of the names. `None` is `unconfined`.
 pub fn profile_of(cred: &Cred) -> Option<Arc<Profile>> {
     profile_by_id(label_id(cred))
 }
 
-/// Sets the profile of `cred`, `set_cred_label` of Linux. `None` is `unconfined`.
-pub fn set_profile(cred: &Cred, p: Option<&Profile>) {
-    store(cred, slot::LABEL, p.map_or(0, |p| intern(&p.name)));
+/// Sets the label of `cred`, `set_cred_label` of Linux.
+pub fn set_label(cred: &Cred, l: &[Arc<Profile>]) {
+    store(cred, slot::LABEL, label_name(l).map_or(0, |n| intern(&n)));
 }
 
-/// The text of a label with its mode, as `aa_getprocattr` of Linux gives it, without the new
-/// line. `unconfined` has no mode.
-pub fn label_text(p: Option<&Profile>) -> String {
-    match p {
-        None => String::from("unconfined"),
-        Some(p) => format!("{} ({})", p.name, p.mode.name()),
-    }
+/// Sets the label of `cred` to the profile `p`. `None` is `unconfined`.
+pub fn set_profile(cred: &Cred, p: Option<&Arc<Profile>>) {
+    set_label(cred, p.map(core::slice::from_ref).unwrap_or_default());
+}
+
+/// The text of the label `l` with its mode, as `aa_getprocattr` of Linux gives it to a task with
+/// the profile `view`, without the new line. `unconfined` has no mode, and a stack of profiles
+/// with different modes has the mode `mixed`.
+pub fn label_text(l: &[Arc<Profile>], view: Option<&Profile>) -> String {
+    let Some(first) = l.first() else { return String::from("unconfined") };
+    let names: Vec<_> = l.iter().map(|p| p.name_in(view)).collect();
+    let same = l.iter().all(|p| p.mode == first.mode);
+    let mode = if same { first.mode.name() } else { "mixed" };
+    format!("{} ({mode})", names.join(STACK))
 }
 
 /// A read of `/proc/PID/attr/NAME`, `apparmor_getprocattr` of Linux. `current` gives the
@@ -152,12 +201,13 @@ pub fn label_text(p: Option<&Profile>) -> String {
 /// Gives `EINVAL` for `prev` and `exec` when the task has no such label, and for another name.
 pub fn getprocattr(task: &Task<'_>, name: &str) -> Result<Vec<u8>> {
     let label = match name {
-        "current" => profile_of(task.cred),
+        "current" => label_of(task.cred),
         "prev" => ref_label(load(task.cred, slot::PREVIOUS)).ok_or(Errno::EINVAL)?,
         "exec" => ref_label(load(task.cred, slot::ONEXEC)).ok_or(Errno::EINVAL)?,
         _ => return Err(Errno::EINVAL),
     };
-    let mut s = label_text(label.as_deref());
+    let view = profile_of(&rk_vfs::cred::current());
+    let mut s = label_text(&label, view.as_deref());
     s.push('\n');
     Ok(s.into_bytes())
 }
@@ -172,12 +222,13 @@ pub fn getprocattr(task: &Task<'_>, name: &str) -> Result<Vec<u8>> {
 pub fn getselfattr(attr: u64, task: &Task<'_>) -> Result<Vec<u8>> {
     use rk_vfs::security::attr;
     let label = match attr {
-        attr::CURRENT => profile_of(task.cred),
+        attr::CURRENT => label_of(task.cred),
         attr::PREV => ref_label(load(task.cred, slot::PREVIOUS)).ok_or(Errno::ENOENT)?,
         attr::EXEC => ref_label(load(task.cred, slot::ONEXEC)).ok_or(Errno::ENOENT)?,
         _ => return Err(Errno::EOPNOTSUPP),
     };
-    Ok(label_text(label.as_deref()).into_bytes())
+    let view = profile_of(task.cred);
+    Ok(label_text(&label, view.as_deref()).into_bytes())
 }
 
 /// The permissions of the accept state `state` for the owner of the file or for the others,
@@ -186,6 +237,21 @@ fn lookup_fperms(pdb: &Pdb, state: State, owner: bool) -> Perms {
     let Some(d) = pdb.dfa.as_ref() else { return Perms::default() };
     let index = d.accept().get(state as usize).copied().unwrap_or(0) as usize;
     pdb.perms.get(index + usize::from(!owner)).copied().unwrap_or_default()
+}
+
+/// Adds the permissions `b` to the permissions `a` of all the parts of a label,
+/// `aa_perms_accum` of Linux.
+fn accum(a: &mut Perms, b: &Perms) {
+    a.deny |= b.deny;
+    a.allow &= b.allow & !a.deny;
+    a.audit |= b.audit & a.allow;
+    a.quiet &= b.quiet & !a.allow;
+    a.kill |= b.kill & !a.allow;
+    a.complain |= b.complain & !a.allow & !a.deny;
+    a.cond |= b.cond & !a.allow & !a.deny;
+    a.hide &= b.hide & !a.allow;
+    a.prompt |= b.prompt & !a.allow & !a.deny;
+    a.subtree |= b.subtree & !a.deny;
 }
 
 /// The permissions of the file rules for the path `name`, `aa_str_perms` of Linux. `owner`
@@ -312,12 +378,13 @@ pub fn audit_file_as(p: Option<&Profile>, perms: &Perms, a: &FileAudit<'_>, kind
         audit::untrusted(&mut tail, t.as_bytes());
     }
     let name = String::from_utf8_lossy(a.name);
+    let fq = p.map(Profile::fqname);
     let d = audit::Data {
         op: Some(a.op),
         class: Some("file"),
         info: a.info,
         error: a.error.map_or(0, |e| -i32::from(e.get())),
-        profile: Some(p.map_or("unconfined", |p| &p.name)),
+        profile: Some(fq.as_deref().unwrap_or("unconfined")),
         name: (!a.name.is_empty()).then_some(name.as_ref()),
     };
     audit::log(kind, &d, &tail);
@@ -376,12 +443,11 @@ fn x_table_lookup(p: &Profile, xindex: u32) -> (Option<Arc<Profile>>, Option<Str
     let next = String::from_utf8_lossy(first).into_owned();
     let lookup = next.strip_prefix('&').unwrap_or(&next);
     let found = if xindex & x::CHILD != 0 {
-        ROOT.lookup(&format!("{}//{lookup}", p.name))
+        policy::with_ns(p.ns.as_deref(), |ns| ns.lookup(&format!("{}//{lookup}", p.name)))
     } else if lookup.starts_with(':') {
-        // No namespace is there other than the root namespace.
-        None
+        policy::lookup_fq(lookup)
     } else {
-        ROOT.lookup(lookup)
+        policy::with_ns(p.ns.as_deref(), |ns| ns.lookup(lookup))
     };
     (found, Some(next))
 }
@@ -410,7 +476,8 @@ fn x_to_label(p: &Arc<Profile>, name: &[u8], xindex: u32) -> Option<Transition> 
     }
     if by_name {
         let parent = if xindex & x::CHILD != 0 { Some(p.name.as_str()) } else { None };
-        let (found, i) = find_attach(&ROOT.children(parent), name);
+        let list = policy::with_ns(p.ns.as_deref(), |ns| ns.children(parent));
+        let (found, i) = find_attach(&list, name);
         info = i;
         new = found.map(Some);
     }
@@ -475,7 +542,8 @@ fn profile_transition(p: &Arc<Profile>, name: &[u8], ouid: u32) -> (Option<Arc<P
         }
         None => {
             // No exec permission: a learning profile, as `aa_new_learning_profile` of Linux.
-            let learn = ROOT.learning(p, false, &String::from_utf8_lossy(name));
+            let base = String::from_utf8_lossy(name);
+            let learn = policy::with_ns(p.ns.as_deref(), |ns| ns.learning(p, false, &base));
             a.error = Some(Errno::EACCES);
             let target = learn.name.clone();
             (Some(learn), false, target)
@@ -492,7 +560,13 @@ fn profile_transition(p: &Arc<Profile>, name: &[u8], ouid: u32) -> (Option<Arc<P
 /// # Errors
 ///
 /// Gives `EACCES` if the rules have no match for the label, as on Linux in each mode.
-fn profile_onexec(p: &Profile, onexec: Option<&Profile>, name: &[u8], ouid: u32) -> Result<bool> {
+fn profile_onexec(
+    p: &Profile,
+    onexec: &[Arc<Profile>],
+    stack: bool,
+    name: &[u8],
+    ouid: u32,
+) -> Result<bool> {
     let fsuid = rk_vfs::cred::current().fsuid;
     let empty = Pdb::default();
     let file = p.rules.as_ref().map_or(&empty, |r| &r.file);
@@ -501,14 +575,28 @@ fn profile_onexec(p: &Profile, onexec: Option<&Profile>, name: &[u8], ouid: u32)
     let mut info = Some("change_profile onexec");
     let mut error = Some(Errno::EACCES);
     let mut secure = false;
-    let target = label_text_plain(onexec);
+    // A rule `change_profile -> &NAME` matches a stack with `&` before the name.
+    let pre = if stack { "&" } else { "" };
+    let target = format!("{pre}{}", label_text_plain(onexec, Some(p)));
     if perms.allow & perm::ONEXEC == 0 {
         info = Some("no change_onexec valid for executable");
     } else {
         // The rule `exec\0change_profile` pairs the exec with the change of the profile.
         let next = file.dfa.as_ref().map_or(NOMATCH, |d| d.next(state, 0));
-        let (tp, ok) =
-            change_perms(file, next, &target, perm::ONEXEC, fsuid).ok_or(Errno::EACCES)?;
+        let mut found = change_perms(file, next, &target, perm::ONEXEC, fsuid);
+        if !matches!(found, Some((_, true))) && onexec.len() > 1 {
+            // As `label_components_match` of Linux, each profile of the label can match a
+            // rule of its own. The permissions are the permissions that all the rules give.
+            let mut all = Perms { allow: !0, quiet: !0, hide: !0, ..Perms::default() };
+            for c in onexec {
+                let one = format!("{pre}{}", label_text_plain(core::slice::from_ref(c), Some(p)));
+                let (cp, _) =
+                    change_perms(file, next, &one, perm::ONEXEC, fsuid).ok_or(Errno::EACCES)?;
+                accum(&mut all, &cp);
+            }
+            found = Some((all, all.allow & perm::ONEXEC == perm::ONEXEC));
+        }
+        let (tp, ok) = found.ok_or(Errno::EACCES)?;
         perms = tp;
         if ok {
             error = None;
@@ -530,9 +618,22 @@ fn profile_onexec(p: &Profile, onexec: Option<&Profile>, name: &[u8], ouid: u32)
     Ok(secure)
 }
 
-/// The name of the label `p`, without the mode.
-pub fn label_text_plain(p: Option<&Profile>) -> String {
-    String::from(p.map_or("unconfined", |p| p.name.as_str()))
+/// The name of the label `l` without the mode, as the rules of the profile `view` match it,
+/// `match_component` of Linux: `:NS:NAME` for a profile of another namespace, and `//&` between
+/// the profiles of a stack.
+pub fn label_text_plain(l: &[Arc<Profile>], view: Option<&Profile>) -> String {
+    if l.is_empty() {
+        return String::from("unconfined");
+    }
+    let view_ns = view.and_then(|v| v.ns.as_deref());
+    let names: Vec<_> = l
+        .iter()
+        .map(|p| match p.ns.as_deref() {
+            Some(ns) if view_ns != Some(ns) => format!(":{ns}:{}", p.name),
+            _ => p.name.clone(),
+        })
+        .collect();
+    names.join(STACK)
 }
 
 /// The permissions of the file rules of a profile for a change to the label `target` from the
@@ -567,50 +668,70 @@ pub fn change_perms(
 ///
 /// Gives `EACCES` if the label for the exec has no match in the rules, as [`profile_onexec`].
 pub fn bprm_creds_for_exec(bprm: &mut Bprm<'_>) -> Result<()> {
-    let old = profile_of(bprm.cred);
+    let old = label_of(bprm.cred);
     let name = bprm.file.absolute_path();
     let ouid = bprm.file.inode().metadata().uid;
     let onexec = ref_label(load(bprm.cred, slot::ONEXEC));
+    // As `ctx->token` of Linux, the token tells if the label for the exec goes on a stack.
+    let stack = load(bprm.cred, slot::TOKEN) == 1;
     // The program starts with no hat and no label for the next exec, as
     // `apparmor_bprm_committed_creds` of Linux.
     clear_trans(bprm.cred);
     if let Some(target) = onexec {
-        let secure = match old.as_ref().filter(|p| p.mode != Mode::Unconfined) {
-            Some(p) => profile_onexec(p, target.as_deref(), &name, ouid)?,
-            None => false,
-        };
+        let mut secure = false;
+        for p in old.iter().filter(|p| p.mode != Mode::Unconfined) {
+            secure |= profile_onexec(p, &target, stack, &name, ouid)?;
+        }
         if secure {
             bprm.secureexec = true;
         }
-        set_profile(bprm.cred, target.as_deref());
+        // A stack goes on the label of the task, as `aa_label_merge` in `handle_onexec`.
+        let target = if stack { merge(&old, &target) } else { target };
+        set_label(bprm.cred, &target);
         return Ok(());
     }
-    let (new, secure) = match old.as_ref().filter(|p| p.mode != Mode::Unconfined) {
-        Some(p) => profile_transition(p, &name, ouid),
-        None => {
-            // An unconfined task gets the profile that attaches to the program, if there is one.
-            let (found, info) = find_attach(&ROOT.children(None), &name);
-            if let Some(info) = info {
-                let perms = Perms { allow: perm::EXEC, audit: perm::EXEC, ..Perms::default() };
-                let a = FileAudit {
-                    op: "exec",
-                    request: perm::EXEC,
-                    name: &name,
-                    target: None,
-                    ouid,
-                    info: Some(info),
-                    error: None,
-                };
-                audit_file(old.as_deref(), &perms, &a);
-            }
-            (found.or(old), false)
-        }
-    };
+    // Each profile of a stack changes, as `fn_label_build` in `handle_onexec` and
+    // `apparmor_bprm_creds_for_exec` of Linux.
+    let mut new = Vec::new();
+    let mut secure = false;
+    for p in &old {
+        let (next, s) = if p.mode == Mode::Unconfined {
+            (Some(attach_unconfined(Some(p), &name, ouid).unwrap_or_else(|| p.clone())), false)
+        } else {
+            profile_transition(p, &name, ouid)
+        };
+        secure |= s;
+        new = merge(&new, next.as_slice());
+    }
+    if old.is_empty() {
+        new.extend(attach_unconfined(None, &name, ouid));
+    }
     if secure {
         bprm.secureexec = true;
     }
-    set_profile(bprm.cred, new.as_deref());
+    set_label(bprm.cred, &new);
     Ok(())
+}
+
+/// The profile that attaches to the program `name` for an unconfined task with the profile
+/// `old`, if there is one.
+fn attach_unconfined(old: Option<&Profile>, name: &[u8], ouid: u32) -> Option<Arc<Profile>> {
+    let list = policy::with_ns(old.and_then(|p| p.ns.as_deref()), |ns| ns.children(None));
+    let (found, info) = find_attach(&list, name);
+    if let Some(info) = info {
+        let perms = Perms { allow: perm::EXEC, audit: perm::EXEC, ..Perms::default() };
+        let a = FileAudit {
+            op: "exec",
+            request: perm::EXEC,
+            name,
+            target: None,
+            ouid,
+            info: Some(info),
+            error: None,
+        };
+        audit_file(old, &perms, &a);
+    }
+    found
 }
 
 #[cfg(test)]
@@ -657,9 +778,27 @@ mod tests {
         assert_eq!(str_perms(file, b"/etc/passwd", true).allow, perm::GETATTR);
         let learn = ns.learning(&p, false, "/tmp/rk-sub");
         assert_eq!(learn.name, "rk_test//null-/tmp/rk-sub");
-        assert_eq!(label_text(Some(&learn)), "rk_test//null-/tmp/rk-sub (complain)");
+        let l = [learn.clone()];
+        assert_eq!(label_text(&l, None), "rk_test//null-/tmp/rk-sub (complain)");
+        let two = merge(&l, &[p.clone(), learn.clone()]);
+        assert_eq!(label_text(&two, None), "rk_test//null-/tmp/rk-sub//&rk_test (complain)");
+        assert_eq!(label_text_plain(&two, None), "rk_test//null-/tmp/rk-sub//&rk_test");
         assert!(Arc::ptr_eq(&learn, &ns.learning(&p, false, "/tmp/rk-sub")));
-        assert_eq!(label_text(None), "unconfined");
+        assert_eq!(label_text(&[], None), "unconfined");
+    }
+
+    #[test]
+    fn the_parts_of_a_label_give_the_permissions_that_all_of_them_give() {
+        let mut all = Perms { allow: !0, quiet: !0, hide: !0, ..Perms::default() };
+        let a = Perms { allow: perm::ONEXEC | perm::READ, audit: perm::READ, ..Perms::default() };
+        let b = Perms { allow: perm::ONEXEC | perm::WRITE, deny: perm::READ, ..Perms::default() };
+        accum(&mut all, &a);
+        assert_eq!(all.allow, perm::ONEXEC | perm::READ);
+        accum(&mut all, &b);
+        assert_eq!((all.allow, all.deny, all.audit), (perm::ONEXEC, perm::READ, perm::READ));
+        // As on Linux, the permissions of the parts have no exec transition, thus no
+        // `AT_SECURE` exception.
+        assert_eq!(all.xindex & x::UNSAFE, 0);
     }
 
     #[test]

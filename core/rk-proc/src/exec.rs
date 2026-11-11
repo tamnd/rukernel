@@ -407,6 +407,8 @@ fn build(
     // The first lookup uses the start and the flags of `execveat`. An interpreter of a script
     // is a path from the working directory, as Linux.
     let mut first = Some((args.start.take(), args.follow));
+    // The file that the caller gave, when it is a script or a program of binfmt_misc.
+    let mut script = None;
     let (at, header) = loop {
         let at = match first.take() {
             Some((start, follow)) => open_exec_at(fs, start.as_ref(), &path, follow)?,
@@ -420,6 +422,7 @@ fn build(
                 return Err(Errno::ELOOP);
             }
             let (interp, arg) = parse_script(&head[..n])?;
+            script.get_or_insert_with(|| at.clone());
             // The new arguments: the interpreter, its argument, the path of the script and the
             // arguments after the first one.
             let mut argv = vec![interp.clone()];
@@ -441,6 +444,7 @@ fn build(
         // As `load_misc_binary` of Linux: the interpreter gets the path of the file as its
         // second argument. Without the flag `P`, the old `argv[0]` is not there.
         let (interp, flags) = rk_vfs::binfmt::find(&head, &path).ok_or(Errno::ENOEXEC)?;
+        script.get_or_insert_with(|| at.clone());
         depth += 1;
         if depth > MAX_SCRIPT_DEPTH {
             return Err(Errno::ELOOP);
@@ -466,9 +470,13 @@ fn build(
     let old_permitted = cred.cap_permitted;
     let (mut cred, secure) = cred.exec(file);
     // The checks and the changes of the security modules, as `bprm_creds_for_exec`,
-    // `bprm_creds_from_file` and `bprm_check` in `bprm_execve` of Linux.
-    let mut bprm = Bprm { filename: &args.path, file: &at, cred: &mut cred, secureexec: secure };
+    // `bprm_creds_from_file` and `bprm_check` in `bprm_execve` of Linux. As on Linux,
+    // `bprm_creds_for_exec` gets the file that the caller gave, also for a script, and the
+    // other hooks get the program that runs.
+    let given = script.as_ref().unwrap_or(&at);
+    let mut bprm = Bprm { filename: &args.path, file: given, cred: &mut cred, secureexec: secure };
     security::bprm_creds_for_exec(&mut bprm)?;
+    bprm.file = &at;
     security::bprm_creds_from_file(&mut bprm)?;
     security::bprm_check(&mut bprm)?;
     let secure = bprm.secureexec;
