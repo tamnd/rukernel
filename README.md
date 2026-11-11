@@ -66,6 +66,8 @@ The `tpm` boot test always gives the machine a TPM, on x86-64 and on arm64. The 
 
 The driver gives the TPM as `/dev/tpm0` (10:224), which takes one command at a time, and as `/sys/class/tpm/tpm0` with `dev`, `uevent`, `tpm_version_major` and `pcr-sha256`. `tools/tpm/build.sh target/tpm-tools` installs tpm2-tools from Alpine for x86-64 and for arm64 with docker. With that tree, or the tree that `RK_TPM_TOOLS` gives, the `tpm` boot test runs init after the checks of the kernel. Init runs `tpm2_getrandom 8` and `tpm2_pcrread sha256:0,7` on `/dev/tpm0`, and compares the PCRs with the files of `pcr-sha256`.
 
+`/dev/tpmrm0` (253:65536) is the resource manager of Linux: each open file has its own transient objects and sessions, with virtual handles. `tools/tpm/build.sh` also installs python3, and `tools/kselftest/build.sh` copies the tpm2 kselftests of Linux to `target/kselftest/tpm2`. With both, the init of the `tpm` boot test also runs test_smoke.sh on `/dev/tpm0`, test_space.sh on `/dev/tpmrm0` and test_async.sh on both.
+
 The `init` and `tty` boot tests run the C programs in `tests/user`. The build compiles them with `musl-gcc` or `zig cc`, or with the command in `RK_USER_CC`. The `busybox` boot test runs the BusyBox shell as init. The shell runs a pipeline, and `^C` stops a job in the foreground. The first run downloads a static BusyBox from busybox.net and checks its SHA-256. `RK_BUSYBOX` gives the path of a different BusyBox. To use the shell yourself, run this command:
 
 ```
