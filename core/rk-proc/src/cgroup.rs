@@ -331,9 +331,15 @@ fn kill_victim(victim: &Arc<Process>, domain: CgId, why: &str) {
     let mut killed = alloc::vec![victim.clone()];
     if let Some(group) = group {
         rk_cgroup::with(|h| h.count_oom_group_kill(group));
+        // As `oom_kill_memcg_member` of Linux, the kill of the group takes each process with an
+        // address space and without `oom_score_adj` -1000, the victim too. So the victim counts
+        // two kills in `memory.events`, as in Linux.
         for p in processes_in(group) {
-            if !Arc::ptr_eq(&p, victim) && p.oom_score_adj() > -1000 && p.group_exit().is_none() {
-                rk_cgroup::with(|h| h.count_oom_kill(p.cgroup()));
+            if p.oom_score_adj() <= -1000 || p.vm().is_none() {
+                continue;
+            }
+            rk_cgroup::with(|h| h.count_oom_kill(p.cgroup()));
+            if !Arc::ptr_eq(&p, victim) && p.group_exit().is_none() {
                 kill_group(&p, WaitStatus::signaled(SIGKILL, false));
                 killed.push(p);
             }
