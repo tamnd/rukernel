@@ -135,14 +135,29 @@ fn socket(cx: &Cx<'_>, fd: u64) -> Result<(Arc<File>, Arc<dyn Socket>), Errno> {
     Ok((file, sock))
 }
 
-/// The view of `sock` and its file for the hooks of the security modules.
-fn lsm_sock<'a>(file: &'a File, sock: &dyn Socket) -> rk_vfs::security::Sock<'a> {
+/// A socket for the hooks of the security modules. The hooks read the addresses only when
+/// they need them.
+struct Names<'s>(&'s dyn Socket);
+
+impl rk_vfs::security::SockNames for Names<'_> {
+    fn name(&self) -> Vec<u8> {
+        self.0.name()
+    }
+
+    fn peer_name(&self) -> Option<Vec<u8>> {
+        self.0.peer_name().ok()
+    }
+}
+
+/// The view of the socket of `n` and its file for the hooks of the security modules.
+fn lsm_sock<'a>(file: &'a File, n: &'a Names<'_>) -> rk_vfs::security::Sock<'a> {
     static EMPTY: rk_vfs::security::Blob = rk_vfs::security::Blob::EMPTY;
     rk_vfs::security::Sock {
-        family: sock.family(),
-        kind: sock.kind(),
-        protocol: sock.protocol(),
+        family: n.0.family(),
+        kind: n.0.kind(),
+        protocol: n.0.protocol(),
         security: rk_net::sock_security(file).unwrap_or(&EMPTY),
+        names: Some(n),
     }
 }
 
@@ -266,7 +281,7 @@ pub(crate) fn socket_call(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64) ->
     let (kind, flags) = split_type(kind)?;
     let sock = new_socket(cx, domain, kind, protocol)?;
     let file = rk_net::new_file(sock.clone(), flags & O_NONBLOCK, sock_owner(cx));
-    rk_vfs::security::socket_post_create(&lsm_sock(&file, &*sock), false)?;
+    rk_vfs::security::socket_post_create(&lsm_sock(&file, &Names(&*sock)), false)?;
     Ok(cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)? as u64)
 }
 
@@ -283,7 +298,8 @@ pub(crate) fn socketpair(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64, sv:
     let (a, b) = Unix::pair(kind)?;
     let fa = rk_net::new_file(a.clone(), flags & O_NONBLOCK, sock_owner(cx));
     let fb = rk_net::new_file(b.clone(), flags & O_NONBLOCK, sock_owner(cx));
-    let (sa, sb) = (lsm_sock(&fa, &*a), lsm_sock(&fb, &*b));
+    let (na, nb) = (Names(&*a), Names(&*b));
+    let (sa, sb) = (lsm_sock(&fa, &na), lsm_sock(&fb, &nb));
     rk_vfs::security::socket_post_create(&sa, false)?;
     rk_vfs::security::socket_post_create(&sb, false)?;
     rk_vfs::security::socket_socketpair(&sa, &sb)?;
@@ -338,7 +354,7 @@ fn write_addr(cx: &Cx<'_>, addr: u64, lenp: u64, value: &[u8]) -> Result<(), Err
 pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
     let mut addr = read_addr(cx, addr, len)?;
-    rk_vfs::security::socket_bind(&lsm_sock(&file, &*sock), &addr)?;
+    rk_vfs::security::socket_bind(&lsm_sock(&file, &Names(&*sock)), &addr)?;
     // The programs of the cgroup can change the address, as `inet_bind_sk` of Linux.
     let flags = cgroup_run_sock_addr(&*sock, &mut addr, SockAddrHook::Bind, None)?;
     // A UDP or TCP port below 1024 needs `CAP_NET_BIND_SERVICE`, as `inet_bind_sk` of Linux and
@@ -358,7 +374,7 @@ pub(crate) fn bind(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
 pub(crate) fn connect(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
     let mut addr = read_addr(cx, addr, len)?;
-    rk_vfs::security::socket_connect(&lsm_sock(&file, &*sock), &addr)?;
+    rk_vfs::security::socket_connect(&lsm_sock(&file, &Names(&*sock)), &addr)?;
     // The programs of the cgroup can change the address, as the `pre_connect` of TCP and UDP
     // and `unix_stream_connect` of Linux.
     cgroup_run_sock_addr(&*sock, &mut addr, SockAddrHook::Connect, None)?;
@@ -369,7 +385,7 @@ pub(crate) fn connect(cx: &Cx<'_>, fd: u64, addr: u64, len: u64) -> SysResult {
 pub(crate) fn listen(cx: &Cx<'_>, fd: u64, backlog: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
     let backlog = (backlog as u32).min(SOMAXCONN);
-    rk_vfs::security::socket_listen(&lsm_sock(&file, &*sock), backlog as i32)?;
+    rk_vfs::security::socket_listen(&lsm_sock(&file, &Names(&*sock)), backlog as i32)?;
     sock.listen(backlog)?;
     Ok(0)
 }
@@ -380,7 +396,7 @@ pub(crate) fn accept4(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64, flags: u64) ->
         return Err(Errno::EINVAL);
     }
     let (file, sock) = socket(cx, fd)?;
-    rk_vfs::security::socket_accept(&lsm_sock(&file, &*sock))?;
+    rk_vfs::security::socket_accept(&lsm_sock(&file, &Names(&*sock)))?;
     let new = sock.accept(file.flags().nonblock())?;
     let mut peer = new.peer_name().unwrap_or_else(|_| (AF_UNIX as u16).to_ne_bytes().to_vec());
     // `inet_getname` and `unix_getname` run the programs of `getpeername` on the address that
@@ -400,7 +416,7 @@ pub(crate) fn accept4(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64, flags: u64) ->
 
 pub(crate) fn getsockname(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    rk_vfs::security::socket_getsockname(&lsm_sock(&file, &*sock))?;
+    rk_vfs::security::socket_getsockname(&lsm_sock(&file, &Names(&*sock)))?;
     let mut name = sock.name();
     // The programs of the cgroup can change the address, as `inet_getname` of Linux.
     let _ = cgroup_run_sock_addr(&*sock, &mut name, SockAddrHook::Getsockname, None);
@@ -410,7 +426,7 @@ pub(crate) fn getsockname(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64) -> SysResu
 
 pub(crate) fn getpeername(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    rk_vfs::security::socket_getpeername(&lsm_sock(&file, &*sock))?;
+    rk_vfs::security::socket_getpeername(&lsm_sock(&file, &Names(&*sock)))?;
     let mut peer = sock.peer_name()?;
     let _ = cgroup_run_sock_addr(&*sock, &mut peer, SockAddrHook::Getpeername, None);
     write_addr(cx, addr, lenp, &peer)?;
@@ -419,7 +435,7 @@ pub(crate) fn getpeername(cx: &Cx<'_>, fd: u64, addr: u64, lenp: u64) -> SysResu
 
 pub(crate) fn shutdown(cx: &Cx<'_>, fd: u64, how: u64) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    rk_vfs::security::socket_shutdown(&lsm_sock(&file, &*sock), how as i32)?;
+    rk_vfs::security::socket_shutdown(&lsm_sock(&file, &Names(&*sock)), how as i32)?;
     sock.shutdown(u32::try_from(how).map_err(|_| Errno::EINVAL)?)?;
     Ok(0)
 }
@@ -433,7 +449,11 @@ pub(crate) fn getsockopt(
     lenp: u64,
 ) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    rk_vfs::security::socket_getsockopt(&lsm_sock(&file, &*sock), level as i32, name as i32)?;
+    rk_vfs::security::socket_getsockopt(
+        &lsm_sock(&file, &Names(&*sock)),
+        level as i32,
+        name as i32,
+    )?;
     let len: i32 = cx.read_val(lenp)?;
     let len = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
     if level as u32 == SOL_SOCKET && name as u32 == SO_PEERPIDFD {
@@ -460,7 +480,11 @@ pub(crate) fn setsockopt(
     len: u64,
 ) -> SysResult {
     let (file, sock) = socket(cx, fd)?;
-    rk_vfs::security::socket_setsockopt(&lsm_sock(&file, &*sock), level as i32, name as i32)?;
+    rk_vfs::security::socket_setsockopt(
+        &lsm_sock(&file, &Names(&*sock)),
+        level as i32,
+        name as i32,
+    )?;
     let len = usize::try_from(len as i32).map_err(|_| Errno::EINVAL)?;
     if level as u32 == SOL_SOCKET && name as u32 == SO_ATTACH_BPF {
         // `sk_setsockopt` of Linux: the value is the descriptor of a program.
@@ -597,7 +621,12 @@ fn cgroup_recvmsg(sock: &dyn Socket, r: &mut Received) {
 /// Sends the bytes of `msg` on `sock`.
 fn send(cx: &Cx<'_>, file: &File, sock: &dyn Socket, mut msg: Message, flags: u32) -> SysResult {
     // As `security_socket_sendmsg` in `sock_sendmsg` of Linux.
-    rk_vfs::security::socket_sendmsg(&lsm_sock(file, sock), msg.data.len())?;
+    rk_vfs::security::socket_sendmsg(
+        &lsm_sock(file, &Names(sock)),
+        msg.addr.as_deref(),
+        flags,
+        msg.data.len(),
+    )?;
     cgroup_sendmsg(sock, &mut msg)?;
     let r = sock.send(&Paths { cx }, msg, flags, file.flags().nonblock()).map(|n| n as u64);
     sigpipe(cx, flags, r)
@@ -633,7 +662,7 @@ pub(crate) fn recvfrom(
     let flags = flags as u32;
     let (file, sock) = socket(cx, fd)?;
     let len = (len as usize).min(SEND_MAX);
-    rk_vfs::security::socket_recvmsg(&lsm_sock(&file, &*sock), len, flags)?;
+    rk_vfs::security::socket_recvmsg(&lsm_sock(&file, &Names(&*sock)), len, flags)?;
     let mut r = sock.recv(len, flags & !MSG_CMSG_CLOEXEC, file.flags().nonblock())?;
     if !r.data.is_empty() {
         cx.write_bytes(buf, &r.data)?;
@@ -899,7 +928,7 @@ fn recvmsg_one(
     let iovs = read_iovecs(cx, hdr.iov, hdr.iovlen)?;
     let len = iovs.iter().fold(0usize, |t, v| t.saturating_add(v.iov_len as usize));
     let nonblock = nonblock || file.flags().nonblock();
-    rk_vfs::security::socket_recvmsg(&lsm_sock(file, sock), len.min(SEND_MAX), flags)?;
+    rk_vfs::security::socket_recvmsg(&lsm_sock(file, &Names(sock)), len.min(SEND_MAX), flags)?;
     let mut r = sock.recv(len.min(SEND_MAX), flags & !MSG_CMSG_CLOEXEC, nonblock)?;
     scatter(cx, &iovs, &r.data)?;
     let n = result_len(sock, &r, flags);
@@ -1001,7 +1030,7 @@ pub(crate) fn read_socket(
     if len == 0 {
         return Ok(0);
     }
-    rk_vfs::security::socket_recvmsg(&lsm_sock(file, sock), len.min(SEND_MAX), 0)?;
+    rk_vfs::security::socket_recvmsg(&lsm_sock(file, &Names(sock)), len.min(SEND_MAX), 0)?;
     let r = sock.recv(len.min(SEND_MAX), 0, nonblock)?;
     scatter(cx, iovs, &r.data)?;
     Ok(r.data.len() as u64)

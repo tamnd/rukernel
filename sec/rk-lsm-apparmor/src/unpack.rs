@@ -41,12 +41,16 @@ pub mod class {
     pub const FILE: usize = 2;
     /// The capability rules.
     pub const CAP: usize = 3;
+    /// The network rules of an old policy, `AA_CLASS_NET_COMPAT` of Ubuntu.
+    pub const NET_COMPAT: usize = 4;
     /// The ptrace rules.
     pub const PTRACE: usize = 9;
     /// The signal rules.
     pub const SIGNAL: usize = 10;
     /// The attach rules.
     pub const XMATCH: usize = 11;
+    /// The network rules, `AA_CLASS_NETV8`.
+    pub const NET: usize = 14;
     /// The rules of a label, `AA_CLASS_LABEL`.
     pub const LABEL: usize = 16;
     /// The last class, `AA_CLASS_LAST`.

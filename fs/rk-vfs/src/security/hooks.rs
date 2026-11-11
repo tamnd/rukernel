@@ -611,8 +611,15 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
-    /// `socket_sendmsg`: the caller sends `len` bytes on `sock`.
-    fn socket_sendmsg(&self, sock: &Sock<'_>, len: usize) -> Result<()> {
+    /// `socket_sendmsg`: the caller sends `len` bytes on `sock` to `addr`, with the `MSG_*`
+    /// bits `flags`.
+    fn socket_sendmsg(
+        &self,
+        sock: &Sock<'_>,
+        addr: Option<&[u8]>,
+        flags: u32,
+        len: usize,
+    ) -> Result<()> {
         Ok(())
     }
 

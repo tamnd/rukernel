@@ -7,8 +7,9 @@
 //! that holds the profiles ([`policy`]), the audit records ([`audit`]), the label of a task
 //! with its change at an exec ([`domain`]), the changes that a task asks for with
 //! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]), the checks
-//! of the capabilities ([`capability`]), and the checks of the signals ([`ipc`]) and of `ptrace`
-//! ([`ptrace`]) with the label of the other task ([`label`]).
+//! of the capabilities ([`capability`]), the checks of the signals ([`ipc`]) and of `ptrace`
+//! ([`ptrace`]) with the label of the other task ([`label`]), and the checks of the sockets
+//! ([`net`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -29,6 +30,7 @@ pub mod file;
 pub mod fs;
 pub mod ipc;
 pub mod label;
+pub mod net;
 pub mod policy;
 pub mod ptrace;
 pub mod task;
@@ -45,7 +47,7 @@ use rk_vfs::file::File;
 use rk_vfs::inode::Result;
 use rk_vfs::security::{
     self, BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks,
-    Task, id,
+    Sock, Task, id,
 };
 
 /// The hooks of AppArmor. A hook gives the error of a denial of a profile in enforce mode.
@@ -66,6 +68,60 @@ impl SecurityHooks for AppArmor {
 
     fn task_kill(&self, target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
         ipc::task_kill(cred, target.cred, sig)
+    }
+
+    fn socket_create(&self, family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
+        net::create(family, kind, protocol, kern)
+    }
+
+    fn socket_bind(&self, sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
+        net::bind(sock, addr)
+    }
+
+    fn socket_connect(&self, sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
+        net::connect(sock, addr)
+    }
+
+    fn socket_listen(&self, sock: &Sock<'_>, backlog: i32) -> Result<()> {
+        net::listen(sock, backlog)
+    }
+
+    fn socket_accept(&self, sock: &Sock<'_>) -> Result<()> {
+        net::accept(sock)
+    }
+
+    fn socket_sendmsg(
+        &self,
+        sock: &Sock<'_>,
+        addr: Option<&[u8]>,
+        flags: u32,
+        _len: usize,
+    ) -> Result<()> {
+        net::sendmsg(sock, addr, flags)
+    }
+
+    fn socket_recvmsg(&self, sock: &Sock<'_>, _len: usize, _flags: u32) -> Result<()> {
+        net::recvmsg(sock)
+    }
+
+    fn socket_getsockname(&self, sock: &Sock<'_>) -> Result<()> {
+        net::sk_perm("getsockname", net::GETATTR, sock)
+    }
+
+    fn socket_getpeername(&self, sock: &Sock<'_>) -> Result<()> {
+        net::sk_perm("getpeername", net::GETATTR, sock)
+    }
+
+    fn socket_getsockopt(&self, sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
+        net::opt_perm("getsockopt", net::GETOPT, sock, level, name)
+    }
+
+    fn socket_setsockopt(&self, sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
+        net::opt_perm("setsockopt", net::SETOPT, sock, level, name)
+    }
+
+    fn socket_shutdown(&self, sock: &Sock<'_>, _how: i32) -> Result<()> {
+        net::sk_perm("socket_shutdown", net::SHUTDOWN, sock)
     }
 
     fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {

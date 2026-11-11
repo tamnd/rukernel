@@ -39,7 +39,7 @@ sys_time sys_tty_config mknod lease audit_write audit_control setfcap mac_overri
 syslog wake_alarm block_suspend audit_read perfmon bpf checkpoint_restore";
 
 /// The address families, `AA_SFS_AF_MASK`.
-const AF_MASK: &str = "unspec unix inet ax25 ipx appletalk netrom bridge atmpvc x25 inet6 rose \
+pub(crate) const AF_MASK: &str = "unspec unix inet ax25 ipx appletalk netrom bridge atmpvc x25 inet6 rose \
 netbeui security key netlink packet ash econet atmsvc rds sna irda pppox wanpipe llc ib mpls can \
 tipc bluetooth iucv rxrpc isdn phonet ieee802154 caif alg nfc vsock kcm qipcrtr smc xdp mctp";
 
