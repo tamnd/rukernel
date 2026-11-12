@@ -9,6 +9,15 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - fanotify has `FAN_REPORT_MNT`. A group with this flag marks a mount namespace with `FAN_MARK_MNTNS` and gets `FAN_MNT_ATTACH` and `FAN_MNT_DETACH` when a mount of the namespace is attached, moved or unmounted. Each event has a `FAN_EVENT_INFO_TYPE_MNT` record with the unique mount ID, and the errors and the record layout are the same as in Linux. The `init` boot test checks the errors, the fdinfo line and the events of mount, move and umount. (#539)
 - The `sdbpf` boot test runs the unit tests test-bpf-devices, test-bpf-firewall and test-bpf-foreign-programs of systemd. They attach cgroup programs with `BPF_PROG_ATTACH`, `BPF_PROG_DETACH`, `BPF_PROG_QUERY` and `BPF_LINK_CREATE`, and all three pass. `RK_SYSTEMD_PACKAGES` of tools/systemd/build.sh adds packages to the systemd tree, and this test needs `systemd-tests` and `iputils-ping` (#537).
 
+### Fixed
+
+- `NFT_MSG_GETSETELEM` of nf_tables in a set with `NFT_SET_INTERVAL` gives the range that has the key, as the `get` operations of nft_set_rbtree.c and nft_set_pipapo.c of Linux. Before this change, it gave `ENOENT` for a key that is not the start or the end of a range (#542).
+- A range of a set with a key of more than one field matches a key that is in the range in each field, as nft_set_pipapo.c of Linux. Before this change, the key was compared as one number (#542).
+- A new element of a set of nf_tables with `NFT_SET_INTERVAL` that overlaps a range of the set gives `EEXIST`, as `__nft_rbtree_insert` and `nft_pipapo_insert` of Linux. The add of an element no longer looks at all of the elements of a set with no timeouts, so that a batch of 65000 ranges does not take minutes (#542).
+- A range of a set of nf_tables that starts where the range before it ends matches its keys. Before this change, the start and the end at the same key were in the wrong order, and the two ranges did not match (#542).
+- The dump of a set of nf_tables with ranges of keys of more than one field gives the elements in the order of their inserts, as `nft_pipapo_walk` of Linux. Before this change, the elements were in the order of their keys (#542).
+- A set of nf_tables with ranges of keys of more than one field takes a range again when a later range also has its first key, as `nft_pipapo_insert` of Linux. Before this change, the set gave `EEXIST` (#542).
+
 ## [0.5.23] - 2026-11-12
 
 ### Added

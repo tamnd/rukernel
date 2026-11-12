@@ -1083,6 +1083,8 @@ struct ProgSet {
     /// The ranges of a set with `NFT_SET_INTERVAL`: the start, the end, if the range has its
     /// end, and the data.
     ranges: Vec<(Vec<u8>, Vec<u8>, bool, ProgData)>,
+    /// The lengths of the fields of a concatenated key, for the ranges with their end.
+    fields: Vec<usize>,
     /// The catch-all element, for a key that no other element has.
     catchall: Option<ProgData>,
     /// The stateful expressions of the elements that have them, by the start of their key,
@@ -1157,8 +1159,11 @@ impl ProgSet {
             .filter(|_| live(key))
             .or_else(|| {
                 self.ranges.iter().find_map(|(s, e, with_end, d)| {
-                    let inside = s.as_slice() <= key
-                        && (key < e.as_slice() || (*with_end && key == e.as_slice()));
+                    let inside = if *with_end {
+                        super::nft_range_has(&self.fields, s, e, key)
+                    } else {
+                        s.as_slice() <= key && key < e.as_slice()
+                    };
                     (inside && live(s)).then(|| (d.clone(), self.exprs_of(s)))
                 })
             })
@@ -1228,6 +1233,7 @@ fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) -> Vec<NftO
                 timeout,
                 expires: if timeout == 0 { 0 } else { now.saturating_add(timeout * 1_000_000) },
                 exprs: exprs.clone(),
+                seq: super::nft_elem_seq(),
             };
             // An element of `dynset` that expired has its place in the count.
             if !matches!(g.elems.get(&key), Some(DynElem::Add(_))) {
@@ -1292,6 +1298,7 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
         dynamic: (changed || set.flags & NFT_SET_EVAL != 0).then(|| set.dynamic.clone()),
         size: set.size as usize,
         timeout: set.timeout,
+        fields: super::nft_set_fields(set),
         ..ProgSet::default()
     };
     let now = super::nft_now_ns();
