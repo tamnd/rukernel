@@ -11,6 +11,7 @@
 
 use crate::dfa::NOMATCH;
 use crate::domain::{self, FileAudit, audit_file, str_perms};
+use crate::net;
 use crate::policy::{Mode, Profile};
 use crate::unpack::{Perms, class, perm, x};
 use alloc::string::String;
@@ -226,7 +227,7 @@ fn label_name_perm(
 /// # Errors
 ///
 /// Gives the error of the last profile that denies the request.
-fn label_path_perm(
+pub(crate) fn label_path_perm(
     op: &'static str,
     l: &[Arc<Profile>],
     at: &Location,
@@ -455,7 +456,9 @@ pub fn file_perm(op: &'static str, file: &File, request: u32) -> Result<()> {
     if flabel == 0 || (denied == 0 && flabel == label) {
         return Ok(());
     }
-    let Some(at) = file.location() else { return Ok(()) };
+    let Some(at) = file.location() else {
+        return sock_perm(op, file, request, denied, (label, flabel), allow);
+    };
     // The newest version of the label of the task. A profile that was removed goes out of
     // the label. Each profile of a stack checks the access.
     let l = domain::label_by_id(label);
@@ -469,6 +472,43 @@ pub fn file_perm(op: &'static str, file: &File, request: u32) -> Result<()> {
     }
     // As `update_file_ctx` of Linux. This kernel keeps one label for a file, so the file gets
     // the label of the task.
+    blob.store(off + LABEL, label);
+    blob.store(off + ALLOW, u64::from(allow | request));
+    Ok(())
+}
+
+/// The check of a read or a write of a socket file, `__file_sock_perm` of Linux. The label of
+/// the task checks the access, and the label of the file also checks the new permissions
+/// `denied`. `labels` has the numbers of the labels of the task and of the file. A file that is
+/// not a socket has no check.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the access.
+fn sock_perm(
+    op: &'static str,
+    file: &File,
+    request: u32,
+    denied: u32,
+    labels: (u64, u64),
+    allow: u32,
+) -> Result<()> {
+    let (label, flabel) = labels;
+    let Some(off) = file_offset() else { return Ok(()) };
+    let (Some(socket), Some(security)) = (rk_net::socket_of(file), rk_net::sock_security(file))
+    else {
+        return Ok(());
+    };
+    let names = rk_net::LsmNames(&*socket);
+    let sock = rk_net::lsm_sock(&*socket, security, &names);
+    let mut result = net::sock_file_perm(&domain::label_by_id(label), op, request, &sock);
+    if denied != 0 {
+        if let Err(e) = net::sock_file_perm(&domain::label_by_id(flabel), op, request, &sock) {
+            result = Err(e);
+        }
+    }
+    result?;
+    let blob = file.security();
     blob.store(off + LABEL, label);
     blob.store(off + ALLOW, u64::from(allow | request));
     Ok(())

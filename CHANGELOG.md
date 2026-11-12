@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - AppArmor checks the mounts, as mount.c of Linux: a mount, a remount, a bind mount, a change of the propagation, a move, `move_mount`, `umount2` and `pivot_root` need a `mount`, `umount` or `pivot_root` rule. A `mount` rule matches the mount point, the source, the type, the flags and the options. A denial gives `EACCES` and a record of the class `mount`. The VFS has the hooks `sb_mount`, `sb_umount`, `sb_pivotroot` and `move_mount` of Linux, and `mount(2)` calls `sb_mount` before the check of `CAP_SYS_ADMIN`, as `path_mount` of Linux (#540).
+- AppArmor checks the Unix sockets, as af_unix.c of the Ubuntu kernel. A `unix` rule matches the type and the protocol of the socket, its address, the operation, and the address and the label of the peer. A connect, a send of a datagram, and a read or a write of a connected socket need the rules of the two sides. A `read` and a `write` of a socket have the check of the file, as `rw_verify_area` of Linux, and the checks of a receive and a send, as `sock_read_iter` and `sock_write_iter` of Linux. A socket with a path name has the checks of the file rules on its socket file. A socket has the label of the task that made it, and `SO_PEERSEC` gives the label of the peer. `features/network/af_unix` tells `apparmor_parser` that the kernel has these rules. A denial gives `EACCES` and a record of the class `net` with the addresses of the sockets (#540).
 
 ## [0.5.28] - 2026-11-13
 

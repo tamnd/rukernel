@@ -48,7 +48,9 @@ use rk_abi::native::open::O_RDWR;
 use rk_abi::native::sockios::SIOCGIFCONF;
 use rk_abi::native::stat::S_IFSOCK;
 use rk_frame::sync::SpinLock;
+use rk_vfs::dentry::Location;
 use rk_vfs::inode::Result;
+use rk_vfs::security::{Blob, Sock, SockNames};
 use rk_vfs::wait::PollTable;
 use rk_vfs::wait::{WaitQueue, interrupted};
 use rk_vfs::{File, FileOps, Metadata, UserMemory};
@@ -150,8 +152,9 @@ pub struct NodeId {
 /// The operations on the tree that a socket with a path name needs. The system call layer gives
 /// them, because the walk uses the root and the current directory of the process.
 pub trait PathOps {
-    /// Makes the socket file `path` for `bind`. Gives `EADDRINUSE` if the name is in use.
-    fn make_node(&self, path: &[u8]) -> Result<NodeId>;
+    /// Makes the socket file `path` for `bind`, and gives it with its place in the tree. Gives
+    /// `EADDRINUSE` if the name is in use.
+    fn make_node(&self, path: &[u8]) -> Result<(NodeId, Location)>;
     /// Finds the socket file `path` for `connect` and `sendto`.
     fn find_node(&self, path: &[u8]) -> Result<NodeId>;
 }
@@ -160,7 +163,7 @@ pub trait PathOps {
 pub struct NoPaths;
 
 impl PathOps for NoPaths {
-    fn make_node(&self, _path: &[u8]) -> Result<NodeId> {
+    fn make_node(&self, _path: &[u8]) -> Result<(NodeId, Location)> {
         Err(Errno::EINVAL)
     }
 
@@ -288,6 +291,59 @@ pub trait Socket: Send + Sync {
     }
     /// The socket as `Any`, for the operations of one family.
     fn as_any(&self) -> &dyn Any;
+    /// The blob of the security modules of a socket that keeps its own blob, as a Unix socket
+    /// that a connection makes before it has a file. `None` uses the blob of the file.
+    fn security(&self) -> Option<&Blob> {
+        None
+    }
+    /// The socket file of a socket with a path name, for the security modules.
+    fn lsm_path(&self) -> Option<Location> {
+        None
+    }
+    /// The peer of a Unix socket, as `unix_peer` of Linux, for the security modules.
+    fn lsm_peer(&self) -> Option<Arc<dyn Socket>> {
+        None
+    }
+}
+
+/// The blob of a socket that has none.
+pub static NO_BLOB: Blob = Blob::EMPTY;
+
+/// A socket for the hooks of the security modules. The hooks read the addresses only when
+/// they need them.
+pub struct LsmNames<'s>(pub &'s dyn Socket);
+
+impl SockNames for LsmNames<'_> {
+    fn name(&self) -> Vec<u8> {
+        self.0.name()
+    }
+
+    fn peer_name(&self) -> Option<Vec<u8>> {
+        self.0.peer_name().ok()
+    }
+
+    fn path(&self) -> Option<Location> {
+        self.0.lsm_path()
+    }
+
+    fn with_peer(&self, f: &mut dyn FnMut(&Sock<'_>)) -> bool {
+        let Some(peer) = self.0.lsm_peer() else { return false };
+        let names = LsmNames(&*peer);
+        f(&lsm_sock(&*peer, peer.security().unwrap_or(&NO_BLOB), &names));
+        true
+    }
+}
+
+/// The view of the socket `sock` with the blob `security` for the hooks of the security
+/// modules.
+pub fn lsm_sock<'a>(sock: &dyn Socket, security: &'a Blob, names: &'a LsmNames<'_>) -> Sock<'a> {
+    Sock {
+        family: sock.family(),
+        kind: sock.kind(),
+        protocol: sock.protocol(),
+        security,
+        names: Some(names),
+    }
 }
 
 /// Gives a new inode number for a socket file.
@@ -336,14 +392,28 @@ impl Drop for SocketFile {
     }
 }
 
+impl SocketFile {
+    /// The socket for the hooks of the security modules, as [`sock_security`] gives the blob.
+    fn with_lsm<T>(&self, f: impl FnOnce(&Sock<'_>) -> T) -> T {
+        let names = LsmNames(&*self.socket);
+        let security = self.socket.security().unwrap_or(&self.security);
+        f(&lsm_sock(&*self.socket, security, &names))
+    }
+}
+
 impl FileOps for SocketFile {
     fn read(&self, file: &File, buf: &mut [u8]) -> Result<usize> {
+        // A read is a receive, so the security modules check it, as `sock_read_iter` calls
+        // `sock_recvmsg` and `security_socket_recvmsg` in Linux.
+        self.with_lsm(|s| rk_vfs::security::socket_recvmsg(s, buf.len(), 0))?;
         let r = self.socket.recv(buf.len(), 0, file.nonblock())?;
         buf[..r.data.len()].copy_from_slice(&r.data);
         Ok(r.data.len())
     }
 
     fn write(&self, file: &File, buf: &[u8]) -> Result<usize> {
+        // A write is a send with no address, as `sock_write_iter` of Linux.
+        self.with_lsm(|s| rk_vfs::security::socket_sendmsg(s, None, 0, buf.len()))?;
         let msg = Message { data: buf.to_vec(), ..Message::default() };
         self.socket.send(&NoPaths, msg, 0, file.flags().nonblock())
     }
@@ -458,7 +528,7 @@ impl SockInode {
 /// socket.
 pub fn sock_security(file: &File) -> Option<&rk_vfs::security::Blob> {
     let ops = file.ops().as_any()?.downcast_ref::<SocketFile>()?;
-    Some(&ops.security)
+    Some(ops.socket.security().unwrap_or(&ops.security))
 }
 
 /// Gives the socket of `file`, or `None` if the file is not a socket.
