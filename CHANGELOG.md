@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The `sdbpf` boot test runs the unit tests test-bpf-devices, test-bpf-firewall and test-bpf-foreign-programs of systemd. They attach cgroup programs with `BPF_PROG_ATTACH`, `BPF_PROG_DETACH`, `BPF_PROG_QUERY` and `BPF_LINK_CREATE`, and all three pass. `RK_SYSTEMD_PACKAGES` of tools/systemd/build.sh adds packages to the systemd tree, and this test needs `systemd-tests` and `iputils-ping` (#537).
+
 ## [0.5.23] - 2026-11-12
 
 ### Added
