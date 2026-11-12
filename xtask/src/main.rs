@@ -404,8 +404,12 @@ const SYSTEMD_MEMORY: &str = "2G";
 /// the interface of the virtio-net-pci device must have its predictable name from `net_id`. In
 /// the `networkd` test, systemd-networkd gets an IPv4 address with DHCP from the user network of
 /// QEMU and sets a static IPv6 address, `networkctl` must give `routable` for the interface, and
-/// `resolvectl query` must give an address.
-const SYSTEMD_TESTS: &[&str] = &["udevd", "networkd"];
+/// `resolvectl query` must give an address. In the `sdbpf` test, the unit tests test-bpf-devices,
+/// test-bpf-firewall and test-bpf-foreign-programs of systemd must pass. They attach cgroup BPF
+/// programs and ping the addresses of the loopback interface. They come from the package
+/// systemd-tests, and ping comes from iputils-ping, so the tree needs both (see
+/// tools/systemd/build.sh).
+const SYSTEMD_TESTS: &[&str] = &["udevd", "networkd", "sdbpf"];
 
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -462,6 +466,7 @@ const BOOT_TESTS: &[&str] = &[
     "systemd",
     "udevd",
     "networkd",
+    "sdbpf",
     "fstests",
 ];
 
@@ -1092,6 +1097,31 @@ if [ -n "$other" ]; then
 fi
 case $state in
 running | degraded) [ -n "$other" ] || echo 'rk-networkd: pass' ;;
+esac
+systemctl poweroff
+END
+fi
+# The `sdbpf` test: the unit tests of systemd for the cgroup BPF programs. A test that it skips
+# exits with 77, and that is a failure here.
+if [ "${1:-}" = sdbpf ]; then
+cat > /usr/local/bin/rk-check << 'END'
+#!/bin/sh
+other=
+state=$(systemctl is-system-running --wait || true)
+echo "rk-sdbpf: state $state"
+dir=/usr/lib/systemd/tests/unit-tests
+[ -d $dir ] || echo 'rk-sdbpf: no systemd-tests in the tree, see tools/systemd/build.sh'
+command -v ping > /dev/null || echo 'rk-sdbpf: no ping in the tree, see tools/systemd/build.sh'
+for test in test-bpf-devices test-bpf-firewall test-bpf-foreign-programs; do
+    $dir/$test > /tmp/$test.log 2>&1
+    status=$?
+    tail -n 60 /tmp/$test.log | sed "s/^/rk-sdbpf: $test: /"
+    echo "rk-sdbpf: $test: exit $status"
+    [ $status = 0 ] || other="$other $test"
+done
+[ -z "$other" ] || echo "rk-sdbpf: bad:$other"
+case $state in
+running | degraded) [ -n "$other" ] || echo 'rk-sdbpf: pass' ;;
 esac
 systemctl poweroff
 END
