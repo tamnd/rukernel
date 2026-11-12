@@ -2341,6 +2341,158 @@ static void test_pidfd_setns_mnt(void)
 	close(fds[1]);
 }
 
+/* fanotify with FAN_REPORT_MNT: a mark on a mount namespace gets FAN_MNT_ATTACH for a mount,
+ * FAN_MNT_DETACH for an unmount and both for a move. Each event has no descriptor, and has the
+ * record of the unique mount ID after the record of the pidfd, as fanotify_user.c of Linux
+ * (#539). */
+#define RK_FAN_NONBLOCK 0x2u
+#define RK_FAN_CLASS_CONTENT 0x4u
+#define RK_FAN_REPORT_PIDFD 0x80u
+#define RK_FAN_REPORT_FID 0x200u
+#define RK_FAN_REPORT_MNT 0x4000u
+#define RK_FAN_MARK_ADD 0x1u
+#define RK_FAN_MARK_MNTNS 0x110u
+#define RK_FAN_OPEN 0x20ul
+#define RK_FAN_MNT_ATTACH 0x01000000ul
+#define RK_FAN_MNT_DETACH 0x02000000ul
+
+static int fan_mark(int fd, unsigned int flags, unsigned long mask, const char *path)
+{
+	return syscall(SYS_fanotify_mark, fd, flags, mask, AT_FDCWD, path);
+}
+
+/* The unique mount ID of statx with STATX_MNT_ID_UNIQUE, at offset 144 of struct statx. */
+static unsigned long long unique_mnt_id(const char *path)
+{
+	unsigned char buf[256] = {0};
+	unsigned long long id = 0;
+	if (syscall(SYS_statx, AT_FDCWD, path, 0, 0x4000, buf) == 0)
+		memcpy(&id, buf + 144, 8);
+	return id;
+}
+
+/* Reads one event of a group with FAN_REPORT_MNT and FAN_REPORT_PIDFD. Gives the mask and the
+ * mount ID, or 0 if there is no event or if the layout is not the layout of Linux. */
+static unsigned long long fan_mnt_event(int fd, unsigned long long *id)
+{
+	unsigned char buf[256];
+	unsigned long long mask;
+	unsigned int len;
+	unsigned short hlen;
+	int efd, pid, pidfd;
+
+	if (read(fd, buf, sizeof(buf)) != 48)
+		return 0;
+	memcpy(&len, buf, 4);
+	memcpy(&mask, buf + 8, 8);
+	memcpy(&efd, buf + 16, 4);
+	memcpy(&pid, buf + 20, 4);
+	if (len != 48 || buf[4] != 3 || efd != -1 || pid != getpid())
+		return 0;
+	/* The pidfd record: type 4, length 8. */
+	memcpy(&hlen, buf + 26, 2);
+	memcpy(&pidfd, buf + 28, 4);
+	if (buf[24] != 4 || hlen != 8 || pidfd < 0)
+		return 0;
+	close(pidfd);
+	/* The mount record: type 7, length 16, 4 bytes of padding and the ID. */
+	memcpy(&hlen, buf + 34, 2);
+	if (buf[32] != 7 || hlen != 16 || buf[36] || buf[37] || buf[38] || buf[39])
+		return 0;
+	memcpy(id, buf + 40, 8);
+	return mask;
+}
+
+static void test_fanotify_mnt(void)
+{
+	unsigned long long id, got = 0;
+	char line[128], want[128], buf[64];
+	struct stat st;
+	int status = -1;
+
+	if (access("/proc/self/ns", F_OK) != 0) {
+		mkdir("/proc", 0555);
+		mount("proc", "/proc", "proc", 0, NULL);
+	}
+	errno = 0;
+	check("fanotify_init with FAN_REPORT_MNT and FAN_CLASS_CONTENT gives EINVAL",
+	      syscall(SYS_fanotify_init, RK_FAN_REPORT_MNT | RK_FAN_CLASS_CONTENT, 0) == -1 && errno == EINVAL);
+	errno = 0;
+	check("fanotify_init with FAN_REPORT_MNT and FAN_REPORT_FID gives EINVAL",
+	      syscall(SYS_fanotify_init, RK_FAN_REPORT_MNT | RK_FAN_REPORT_FID, 0) == -1 && errno == EINVAL);
+	int plain = syscall(SYS_fanotify_init, 0, 0);
+	errno = 0;
+	check("a group without FAN_REPORT_MNT cannot mark a mount namespace",
+	      plain >= 0 && fan_mark(plain, RK_FAN_MARK_ADD | RK_FAN_MARK_MNTNS, RK_FAN_MNT_ATTACH,
+				     "/proc/self/ns/mnt") == -1 && errno == EINVAL);
+	close(plain);
+	int fd = syscall(SYS_fanotify_init, RK_FAN_REPORT_MNT | RK_FAN_REPORT_PIDFD | RK_FAN_NONBLOCK, 0);
+	check("fanotify_init with FAN_REPORT_MNT", fd >= 0);
+	errno = 0;
+	check("a group with FAN_REPORT_MNT cannot mark an inode",
+	      fan_mark(fd, RK_FAN_MARK_ADD, RK_FAN_MNT_ATTACH, "/") == -1 && errno == EINVAL);
+	errno = 0;
+	check("a mark on a mount namespace with FAN_OPEN gives EINVAL",
+	      fan_mark(fd, RK_FAN_MARK_ADD | RK_FAN_MARK_MNTNS, RK_FAN_OPEN, "/proc/self/ns/mnt") == -1 &&
+		      errno == EINVAL);
+	errno = 0;
+	check("FAN_MARK_MNTNS on a file that is not a mount namespace gives EINVAL",
+	      fan_mark(fd, RK_FAN_MARK_ADD | RK_FAN_MARK_MNTNS, RK_FAN_MNT_ATTACH, "/proc/self/ns/uts") == -1 &&
+		      errno == EINVAL);
+	check("FAN_MARK_MNTNS on /proc/self/ns/mnt",
+	      fan_mark(fd, RK_FAN_MARK_ADD | RK_FAN_MARK_MNTNS, RK_FAN_MNT_ATTACH | RK_FAN_MNT_DETACH,
+		       "/proc/self/ns/mnt") == 0);
+	snprintf(want, sizeof(want), "fanotify mnt_ns:%llu mflags:0 mask:3000000 ignored_mask:0",
+		 stat("/proc/self/ns/mnt", &st) == 0 ? (unsigned long long)st.st_ino : 0ULL);
+	check("fdinfo of the group shows the mark on the mount namespace",
+	      fdinfo_line(fd, "fanotify mnt_ns:", line, sizeof(line)) == 0 && strcmp(line, want) == 0);
+	mkdir("/fanm", 0755);
+	mkdir("/fanm/a", 0755);
+	mkdir("/fanm/b", 0755);
+	check("mount a tmpfs for the mount events", mount("none", "/fanm/a", "tmpfs", 0, NULL) == 0);
+	id = unique_mnt_id("/fanm/a");
+	check("a mount gives FAN_MNT_ATTACH with the unique mount ID",
+	      fan_mnt_event(fd, &got) == RK_FAN_MNT_ATTACH && id != 0 && got == id);
+	check("move the tmpfs", mount("/fanm/a", "/fanm/b", NULL, MS_MOVE, NULL) == 0);
+	check("a move gives FAN_MNT_ATTACH and FAN_MNT_DETACH in one event",
+	      fan_mnt_event(fd, &got) == (RK_FAN_MNT_ATTACH | RK_FAN_MNT_DETACH) && got == id);
+	check("umount the tmpfs", umount("/fanm/b") == 0);
+	check("an unmount gives FAN_MNT_DETACH", fan_mnt_event(fd, &got) == RK_FAN_MNT_DETACH && got == id);
+	errno = 0;
+	check("a group of mount events has no other event", read(fd, buf, sizeof(buf)) == -1 && errno == EAGAIN);
+	close(fd);
+	rmdir("/fanm/a");
+	rmdir("/fanm/b");
+	rmdir("/fanm");
+
+	/* A user without CAP_SYS_ADMIN can make a group of mount events, and can mark only a mount
+	 * namespace that its user namespace owns. */
+	pid_t pid = fork();
+	if (pid == 0) {
+		if (setresgid(65534, 65534, 65534) != 0 || setresuid(65534, 65534, 65534) != 0)
+			_exit(10);
+		int g = syscall(SYS_fanotify_init, RK_FAN_REPORT_MNT, 0);
+		if (g < 0)
+			_exit(11);
+		errno = 0;
+		if (fan_mark(g, RK_FAN_MARK_ADD | RK_FAN_MARK_MNTNS, RK_FAN_MNT_ATTACH, "/proc/self/ns/mnt") != -1 ||
+		    errno != EPERM)
+			_exit(12);
+		close(g);
+		if (unshare(CLONE_NEWUSER) != 0 || unshare(CLONE_NEWNS) != 0)
+			_exit(13);
+		g = syscall(SYS_fanotify_init, RK_FAN_REPORT_MNT, 0);
+		if (g < 0 || fan_mark(g, RK_FAN_MARK_ADD | RK_FAN_MARK_MNTNS, RK_FAN_MNT_ATTACH, "/proc/self/ns/mnt") != 0)
+			_exit(14);
+		_exit(0);
+	}
+	waitpid(pid, &status, 0);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		printf("init: the unprivileged child of the mount events exited with %d\n", status);
+	check("a user marks only a mount namespace that its own user namespace owns",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 /* A thread that ends with SYS_exit a second after its start. */
 static void *pidfd_late_thread(void *arg)
 {
@@ -15347,6 +15499,7 @@ static void test_all(void)
 	test_pidfd_leader_exit();
 	test_process_mrelease();
 	test_scm_pidfd();
+	test_fanotify_mnt();
 	test_signalfd_poll();
 	test_seccomp();
 	test_ptrace();
@@ -16110,6 +16263,8 @@ int main(int argc, char **argv)
 		test_pidfd_leader_exit();
 		test_process_mrelease();
 	}
+	if (argc > 1 && strcmp(argv[1], "fanotify") == 0)
+		test_fanotify_mnt();
 	if (argc > 1 && strcmp(argv[1], "bpf") == 0)
 		test_bpf();
 	if (argc > 1 && strcmp(argv[1], "userns") == 0)

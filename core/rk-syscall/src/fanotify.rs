@@ -1,8 +1,9 @@
 //! fanotify: `fanotify_init` and `fanotify_mark`, as fs/notify/fanotify/fanotify_user.c of
 //! Linux. The group, its queue and its marks are in `rk_vfs::notify::fanotify`.
 //!
-//! The groups of mount events (`FAN_REPORT_MNT`) are not supported: `fanotify_init` gives
-//! `EINVAL` for them.
+//! A group with `FAN_REPORT_MNT` gets the mount events of the mount namespaces that it marks
+//! with `FAN_MARK_MNTNS`. The path of such a mark is a file of a mount namespace, as
+//! `/proc/self/ns/mnt`.
 
 use crate::cx::{Cx, SysResult};
 use alloc::sync::Arc;
@@ -25,6 +26,7 @@ use rk_vfs::notify::Object;
 use rk_vfs::notify::fanotify::{
     EVENT_FLAGS, FD_EVENTS, FID_BITS, Fanotify, FanotifyFile, Kind, PATH_EVENTS, PERM_EVENTS,
 };
+use rk_vfs::nsfs::NsKind;
 use rk_vfs::user_ns::UcountKind;
 
 /// The bits of the classes that need a privilege, `FANOTIFY_PERM_CLASSES` of Linux.
@@ -100,7 +102,12 @@ pub(crate) fn fanotify_init(cx: &Cx<'_>, flags: u64, event_f_flags: u64) -> SysR
     if flags & !(ADMIN_INIT_FLAGS | USER_INIT_FLAGS | FAN_ENABLE_AUDIT) != 0 {
         return Err(Errno::EINVAL);
     }
-    if flags & FAN_REPORT_MNT != 0 {
+    // A group of mount events is of the notification class and reports no file handle and no
+    // error of a descriptor.
+    if flags & FAN_REPORT_MNT != 0
+        && (flags & FAN_ALL_CLASS_BITS != FAN_CLASS_NOTIF
+            || flags & (FID_BITS | FAN_REPORT_FD_ERROR) != 0)
+    {
         return Err(Errno::EINVAL);
     }
     if f_flags & !EVENT_F_BITS != 0 || f_flags & o::O_ACCMODE == o::O_ACCMODE {
@@ -137,7 +144,15 @@ pub(crate) fn fanotify_init(cx: &Cx<'_>, flags: u64, event_f_flags: u64) -> SysR
     let charge = rk_vfs::user_ns::charge(&cred.user_ns, cred.euid, UcountKind::FanotifyGroups)
         .ok_or(Errno::EMFILE)?;
     let unpriv = !cred.capable(cap::SYS_ADMIN);
-    let ops = FanotifyFile::new(flags, f_flags, priority, unlimited, unpriv, Some(charge));
+    let ops = FanotifyFile::new(
+        flags,
+        f_flags,
+        priority,
+        unlimited,
+        unpriv,
+        cred.user_ns.clone(),
+        Some(charge),
+    );
     let nonblock = if flags & FAN_NONBLOCK != 0 { o::O_NONBLOCK } else { 0 };
     let file = File::with_ops(Arc::new(ops), None, o::O_RDWR | nonblock);
     file.set_nonotify();
@@ -195,8 +210,7 @@ pub(crate) fn fanotify_mark(
         FAN_MARK_INODE => Kind::Inode,
         FAN_MARK_MOUNT => Kind::Mount,
         FAN_MARK_FILESYSTEM => Kind::Fs,
-        // A mark on a mount name space needs `FAN_REPORT_MNT`, which is not supported.
-        FAN_MARK_MNTNS => Kind::Mount,
+        FAN_MARK_MNTNS => Kind::MntNs,
         _ => return Err(Errno::EINVAL),
     };
     let cmd = flags & MARK_CMD_BITS;
@@ -223,13 +237,25 @@ pub(crate) fn fanotify_mark(
         umask = EVENT_FLAGS;
     }
     let g = group(cx, fd)?;
-    if mask & MOUNT_EVENTS != 0 || mark_type == FAN_MARK_MNTNS {
+    // A group of mount events has marks on mount namespaces only, with the mount events only.
+    // The other groups cannot have them.
+    if g.init_flags() & FAN_REPORT_MNT != 0 {
+        if mask & !MOUNT_EVENTS != 0 || mark_type != FAN_MARK_MNTNS {
+            return Err(Errno::EINVAL);
+        }
+    } else if mask & MOUNT_EVENTS != 0 || mark_type == FAN_MARK_MNTNS {
         return Err(Errno::EINVAL);
     }
-    // A user without `CAP_SYS_ADMIN` and a group that such a user made can mark inodes only.
-    if mark_type != FAN_MARK_INODE
-        && (g.unprivileged() || !cx.process().cred().capable(cap::SYS_ADMIN))
-    {
+    // A user without `CAP_SYS_ADMIN` and a group that such a user made can mark inodes only. A
+    // mark on a mount namespace needs `CAP_SYS_ADMIN` in the user namespace of the group, as
+    // Linux, so a user can watch the mount namespaces of its own user namespace.
+    let cred = cx.process().cred();
+    let allowed = if mark_type == FAN_MARK_MNTNS {
+        cred.ns_capable(g.user_ns(), cap::SYS_ADMIN)
+    } else {
+        mark_type == FAN_MARK_INODE || (!g.unprivileged() && cred.capable(cap::SYS_ADMIN))
+    };
+    if !allowed {
         return Err(Errno::EPERM);
     }
     // The permission events need a class above notification, and the pre-content events the
@@ -307,6 +333,20 @@ pub(crate) fn fanotify_mark(
         Kind::Inode => Object::Inode(at.inode().clone()),
         Kind::Mount => Object::Mount(at.mount.clone()),
         Kind::Fs => Object::Fs(at.inode().fs_id()),
+        // The path is the file of a mount namespace, and the mark needs `CAP_SYS_ADMIN` in the
+        // user namespace that owns the namespace, as `mnt_ns_from_dentry` in
+        // `do_fanotify_mark` of Linux.
+        Kind::MntNs => {
+            let id = match rk_vfs::nsfs::ns_of(at.inode()) {
+                Some((NsKind::Mnt, id)) => id,
+                _ => return Err(Errno::EINVAL),
+            };
+            let ns = rk_proc::ns::mnt_ns(id).ok_or(Errno::EINVAL)?;
+            if !cred.ns_capable(ns.owner(), cap::SYS_ADMIN) {
+                return Err(Errno::EPERM);
+            }
+            Object::MntNs(Arc::downgrade(&ns), id)
+        }
     };
     // `FAN_MARK_IGNORE` needs `FAN_MARK_IGNORED_SURV_MODIFY` on a mount, a file system and a
     // directory.

@@ -13,13 +13,17 @@
 //! metadata: the handle of the directory and the name of the entry, the new directory and the
 //! new name of a rename, and the handle of the file.
 //!
-//! The mount events and the pre-content events are not supported.
+//! A group with `FAN_REPORT_MNT` has marks on mount namespaces only. It gets the mount events of
+//! the namespaces: `FAN_MNT_ATTACH` and `FAN_MNT_DETACH`, or both for a move. Each event has no
+//! descriptor and has a record with the unique ID of the mount.
+//!
+//! The pre-content events are not supported.
 
 use super::{Found, FsEvent, Group, Mark, Object, add_object_mark, destroy_mark, mask};
 use crate::dentry::Location;
 use crate::file::{File, FileOps, UserMemory, events};
 use crate::inode::Result;
-use crate::user_ns::{Charge, UcountKind};
+use crate::user_ns::{Charge, UcountKind, UserNs};
 use crate::wait::{PollTable, WaitQueue};
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -30,12 +34,12 @@ use rk_abi::Errno;
 use rk_abi::native::fanotify::{
     FAN_ALLOW, FAN_AUDIT, FAN_DENY, FAN_ENABLE_AUDIT, FAN_EPIDFD, FAN_ERRNO_MASK, FAN_ERRNO_SHIFT,
     FAN_EVENT_INFO_TYPE_DFID, FAN_EVENT_INFO_TYPE_DFID_NAME, FAN_EVENT_INFO_TYPE_FID,
-    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
+    FAN_EVENT_INFO_TYPE_MNT, FAN_EVENT_INFO_TYPE_NEW_DFID_NAME, FAN_EVENT_INFO_TYPE_OLD_DFID_NAME,
     FAN_EVENT_INFO_TYPE_PIDFD, FAN_EVENT_METADATA_LEN, FAN_INFO, FAN_MARK_EVICTABLE,
     FAN_MARK_IGNORE, FAN_MARK_IGNORED_MASK, FAN_MARK_IGNORED_SURV_MODIFY, FAN_NOFD, FAN_NOPIDFD,
     FAN_ONDIR, FAN_PRE_ACCESS, FAN_REPORT_DFID_NAME_TARGET, FAN_REPORT_DIR_FID,
-    FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_NAME, FAN_REPORT_PIDFD, FAN_REPORT_TARGET_FID,
-    FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FANOTIFY_METADATA_VERSION,
+    FAN_REPORT_FD_ERROR, FAN_REPORT_FID, FAN_REPORT_MNT, FAN_REPORT_NAME, FAN_REPORT_PIDFD,
+    FAN_REPORT_TARGET_FID, FAN_REPORT_TID, FAN_UNLIMITED_MARKS, FANOTIFY_METADATA_VERSION,
 };
 use rk_abi::native::open as o;
 use rk_abi::native::types::{FanotifyEventMetadata, FanotifyResponse};
@@ -59,7 +63,7 @@ pub const FD_EVENTS: u32 = PATH_EVENTS | PERM_EVENTS;
 pub const EVENT_FLAGS: u32 = mask::EVENT_ON_CHILD | FAN_ONDIR;
 
 /// The bits of `ALL_FSNOTIFY_EVENTS` of Linux: each event, without the flags.
-const ALL_FS_EVENTS: u32 = 0x00ff_ffff | mask::RENAME;
+const ALL_FS_EVENTS: u32 = 0x00ff_ffff | mask::MNT_EVENTS | mask::RENAME;
 
 /// The events that a read gives in a group that reports a descriptor, `FANOTIFY_OUTGOING_EVENTS`
 /// of Linux without the event flags.
@@ -81,6 +85,9 @@ const FID_INFO_HDR_LEN: usize = 20;
 
 /// The size of `struct fanotify_event_info_pidfd`, `FANOTIFY_PIDFD_INFO_LEN` of Linux.
 const PIDFD_INFO_LEN: usize = 8;
+
+/// The size of `struct fanotify_event_info_mnt`, `FANOTIFY_MNT_INFO_LEN` of Linux.
+const MNT_INFO_LEN: usize = 16;
 
 /// `fs.fanotify.max_queued_events`: the most events in the queue of a new group without
 /// `FAN_UNLIMITED_QUEUE`.
@@ -134,6 +141,8 @@ pub enum Kind {
     Mount,
     /// A file system.
     Fs,
+    /// A mount namespace, `FAN_MARK_MNTNS`.
+    MntNs,
 }
 
 impl Kind {
@@ -142,6 +151,7 @@ impl Kind {
             Object::Inode(_) => Self::Inode,
             Object::Mount(_) => Self::Mount,
             Object::Fs(_) => Self::Fs,
+            Object::MntNs(..) => Self::MntNs,
         }
     }
 }
@@ -206,6 +216,8 @@ enum Info {
     Path(Location),
     /// The handles, for a group that reports a file handle.
     Fid(Fid),
+    /// The unique ID of the mount of a mount event, for a group with `FAN_REPORT_MNT`.
+    Mnt(u64),
 }
 
 /// An event in the queue, as `struct fanotify_event` of Linux.
@@ -250,6 +262,8 @@ pub struct Fanotify {
     priority: u32,
     /// A user without `CAP_SYS_ADMIN` made the group, `FANOTIFY_UNPRIV` of Linux.
     unpriv: bool,
+    /// The user namespace of the task that made the group, `user_ns` of Linux.
+    user_ns: Arc<UserNs>,
     max_events: usize,
     state: SpinLock<State>,
     /// The readers wait here.
@@ -313,6 +327,12 @@ impl Fanotify {
     /// The class of the group: 0 for notification, 1 for content and 2 for pre-content.
     pub fn priority(&self) -> u32 {
         self.priority
+    }
+
+    /// The user namespace of the task that made the group. A mark on a mount namespace needs
+    /// `CAP_SYS_ADMIN` in it.
+    pub fn user_ns(&self) -> &Arc<UserNs> {
+        &self.user_ns
     }
 
     fn wake(&self) {
@@ -416,6 +436,9 @@ impl Fanotify {
     /// The size of the event in a read, as `fanotify_event_len` of Linux.
     fn event_len(&self, item: &Item) -> usize {
         let pidfd = if self.flags & FAN_REPORT_PIDFD != 0 { PIDFD_INFO_LEN } else { 0 };
+        if let Item::Event(Event { info: Info::Mnt(_), .. }) = item {
+            return META_LEN + pidfd + MNT_INFO_LEN;
+        }
         let Item::Event(Event { info: Info::Fid(fid), mask: m, .. }) = item else {
             return META_LEN + pidfd;
         };
@@ -704,6 +727,10 @@ impl Fanotify {
                 }
                 Object::Mount(mount) => format!("fanotify mnt_id:{:x} ", mount.id()),
                 Object::Fs(id) => format!("fanotify sdev:{:x} ", kernel_dev(*id)),
+                Object::MntNs(_, id) => {
+                    let ino = crate::nsfs::NsInode::ino(crate::nsfs::NsKind::Mnt, *id);
+                    format!("fanotify mnt_ns:{ino} ")
+                }
             };
             out.extend_from_slice(line.as_bytes());
             out.extend_from_slice(
@@ -785,6 +812,16 @@ fn put_fid(out: &mut Vec<u8>, ty: u32, fsid: [i32; 2], fh: &Fh, name: &[u8]) {
         out.push(0);
     }
     out.resize(start + len, 0);
+}
+
+/// Puts the record of a mount event in `out`, as `struct fanotify_event_info_mnt` of Linux: the
+/// header, 4 bytes of padding, and the unique ID of the mount.
+fn put_mnt(out: &mut Vec<u8>, mnt_id: u64) {
+    out.push(FAN_EVENT_INFO_TYPE_MNT as u8);
+    out.push(0);
+    out.extend_from_slice(&(MNT_INFO_LEN as u16).to_ne_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&mnt_id.to_ne_bytes());
 }
 
 impl Group for Fanotify {
@@ -908,6 +945,44 @@ impl Group for Fanotify {
             None => Ok(()),
         }
     }
+
+    fn handle_mnt(&self, m: u32, mnt_id: u64, marks: &[Arc<Mark>]) {
+        // As `fanotify_group_event_mask` of Linux: only a group with `FAN_REPORT_MNT` gets the
+        // mount events.
+        if self.flags & FAN_REPORT_MNT == 0 {
+            return;
+        }
+        let mut want = 0;
+        let mut ignore = 0;
+        for mark in marks.iter().filter(|mark| mark.alive()) {
+            ignore |= effective_ignore(mark, false, false);
+            want |= mark.mask();
+        }
+        let test = m & want & !ignore & mask::MNT_EVENTS;
+        if test == 0 {
+            return;
+        }
+        let (tgid, tid) = HOOKS.get().map_or((0, 0), |h| (h.current)());
+        let pid = if self.flags & FAN_REPORT_TID != 0 { tid } else { tgid };
+        // A mount event never joins another event, as `fanotify_should_merge` of Linux.
+        {
+            let mut st = self.state.lock();
+            if st.closed {
+                return;
+            }
+            if st.queue.len() >= self.max_events {
+                if st.overflow {
+                    return;
+                }
+                st.overflow = true;
+                st.queue.push_back(Item::Overflow);
+            } else {
+                let event = Event { mask: test, info: Info::Mnt(mnt_id), pid, perm: None };
+                st.queue.push_back(Item::Event(event));
+            }
+        }
+        self.wake();
+    }
 }
 
 /// The operations of the file of a fanotify group.
@@ -919,14 +994,16 @@ impl FanotifyFile {
     /// Makes a new group, as `fanotify_init` of Linux after the checks of the flags. `flags` are
     /// the flags of the group, `f_flags` the flags of the files of the events, and `priority` the
     /// class: 0 for notification, 1 for content and 2 for pre-content.
-    /// `unpriv` tells that a user without `CAP_SYS_ADMIN` makes the group, and `charge` is the
-    /// count of the group for its user. The marks of the group then count for the same user.
+    /// `unpriv` tells that a user without `CAP_SYS_ADMIN` makes the group, `user_ns` is the user
+    /// namespace of the user, and `charge` is the count of the group for its user. The marks of
+    /// the group then count for the same user.
     pub fn new(
         flags: u32,
         f_flags: u32,
         priority: u32,
         unlimited: bool,
         unpriv: bool,
+        user_ns: Arc<UserNs>,
         charge: Option<Charge>,
     ) -> Self {
         let group = Arc::new_cyclic(|me| Fanotify {
@@ -935,6 +1012,7 @@ impl FanotifyFile {
             f_flags,
             priority,
             unpriv,
+            user_ns,
             max_events: if unlimited {
                 usize::MAX
             } else {
@@ -1037,6 +1115,7 @@ impl FileOps for FanotifyFile {
                 Err(_) => break,
             };
             let mut fid = None;
+            let mut mnt = None;
             let (m, fd, mut pid, perm) = match item {
                 // An event without a file has `-EBADF` with `FAN_REPORT_FD_ERROR`, as Linux.
                 Item::Overflow if g.flags & FAN_REPORT_FD_ERROR != 0 => {
@@ -1045,6 +1124,10 @@ impl FileOps for FanotifyFile {
                 Item::Overflow => (mask::Q_OVERFLOW, FAN_NOFD as i32, 0, None),
                 Item::Event(Event { info: Info::Fid(f), mask: m, pid, perm }) => {
                     fid = Some(f);
+                    (m, FAN_NOFD as i32, pid, perm)
+                }
+                Item::Event(Event { info: Info::Mnt(id), mask: m, pid, perm }) => {
+                    mnt = Some(id);
                     (m, FAN_NOFD as i32, pid, perm)
                 }
                 Item::Event(Event { info: Info::Path(at), mask: m, pid, perm }) => {
@@ -1085,6 +1168,10 @@ impl FileOps for FanotifyFile {
                 records.push(0);
                 records.extend_from_slice(&(PIDFD_INFO_LEN as u16).to_ne_bytes());
                 records.extend_from_slice(&pidfd.to_ne_bytes());
+            }
+            // The record of the mount is the last, as `copy_mnt_info_to_user` of Linux.
+            if let Some(id) = mnt {
+                put_mnt(&mut records, id);
             }
             let meta = FanotifyEventMetadata {
                 event_len: FAN_EVENT_METADATA_LEN + records.len() as u32,
@@ -1190,6 +1277,17 @@ mod tests {
         let mut out = Vec::new();
         put_fid(&mut out, FAN_EVENT_INFO_TYPE_FID, [0, 0], &empty, b"");
         assert_eq!(i32::from_ne_bytes([out[16], out[17], out[18], out[19]]), 0xff);
+    }
+
+    #[test]
+    fn a_mount_record_has_the_id_after_the_padding() {
+        let mut out = Vec::new();
+        put_mnt(&mut out, 0x1_0000_0005);
+        assert_eq!(out.len(), MNT_INFO_LEN);
+        assert_eq!(out[0], FAN_EVENT_INFO_TYPE_MNT as u8);
+        assert_eq!(u16::from_ne_bytes([out[2], out[3]]), 16);
+        assert_eq!(&out[4..8], &[0; 4]);
+        assert_eq!(u64::from_ne_bytes(out[8..16].try_into().unwrap()), 0x1_0000_0005);
     }
 
     #[test]
