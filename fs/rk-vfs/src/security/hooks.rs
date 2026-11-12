@@ -424,6 +424,76 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
+    /// `path_unlink`: `unlink` of the file `at` in the directory `dir`.
+    fn path_unlink(&self, dir: &Location, at: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_mkdir`: `mkdir` of the new directory `name` in `dir` with the mode `mode`.
+    fn path_mkdir(&self, dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_rmdir`: `rmdir` of the directory `at` in the directory `dir`.
+    fn path_rmdir(&self, dir: &Location, at: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_mknod`: `mknod` of the new file `name` in `dir` with the mode `mode`, with the
+    /// file type, and the device `dev`.
+    fn path_mknod(&self, dir: &Location, name: &[u8], mode: u32, dev: u64) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_truncate`: `truncate` of the file `at`.
+    fn path_truncate(&self, at: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_symlink`: `symlink` of the new link `name` in `dir` to `target`.
+    fn path_symlink(&self, dir: &Location, name: &[u8], target: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_link`: `link` of the file `old` to the new name `name` in `dir`.
+    fn path_link(&self, old: &Location, dir: &Location, name: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_rename`: `rename` of the file `old` to the name `name` in `dir`. `new` is the file
+    /// that has the name now, if there is one. `flags` are the flags of `renameat2`.
+    fn path_rename(
+        &self,
+        old: &Location,
+        dir: &Location,
+        name: &[u8],
+        new: Option<&Location>,
+        flags: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_chmod`: `chmod` of the file `at` to the mode `mode`.
+    fn path_chmod(&self, at: &Location, mode: u32) -> Result<()> {
+        Ok(())
+    }
+
+    /// `path_chown`: `chown` of the file `at` to the user `uid` and the group `gid`. `None`
+    /// keeps the ID.
+    fn path_chown(&self, at: &Location, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
+        Ok(())
+    }
+
+    /// `inode_getattr`: `stat` of the file `at`.
+    fn inode_getattr(&self, at: &Location) -> Result<()> {
+        Ok(())
+    }
+
+    /// `file_truncate`: `ftruncate` of `file`.
+    fn file_truncate(&self, file: &File) -> Result<()> {
+        Ok(())
+    }
+
     /// `task_alloc`: `child` is made by `clone` with `clone_flags`. `child.security` is the new
     /// task blob, and it has a copy of the blob of the parent.
     fn task_alloc(&self, child: &Task<'_>, clone_flags: u64) -> Result<()> {

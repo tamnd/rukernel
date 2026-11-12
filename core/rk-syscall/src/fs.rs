@@ -764,7 +764,12 @@ pub(crate) fn lseek(cx: &Cx<'_>, fd: u64, offset: u64, whence: u64) -> SysResult
 }
 
 pub(crate) fn fstat(cx: &Cx<'_>, fd: u64, buf: u64) -> SysResult {
-    let meta = cx.file(fd)?.metadata()?;
+    let file = cx.file(fd)?;
+    // The LSM check of `vfs_getattr` of Linux.
+    if let Some(at) = file.location() {
+        rk_vfs::security::inode_getattr(at)?;
+    }
+    let meta = file.metadata()?;
     cx.write_val(buf, &stat_of(&meta))?;
     Ok(0)
 }
@@ -784,6 +789,10 @@ fn lookup(
     flags: u32,
 ) -> Result<(Metadata, Option<rk_vfs::InodeRef>, u64), Errno> {
     let (meta, inode, at) = lookup_at(cx, dirfd, path, flags)?;
+    // The LSM check of `vfs_getattr` of Linux.
+    if let Some(at) = &at {
+        rk_vfs::security::inode_getattr(at)?;
+    }
     Ok((meta, inode, at.map_or(0, |at| at.mount.id())))
 }
 
@@ -844,6 +853,10 @@ pub(crate) fn statx(
         return Err(Errno::EINVAL);
     }
     let (meta, inode, at) = lookup_at(cx, dirfd, path, flags)?;
+    // The LSM check of `vfs_getattr` of Linux.
+    if let Some(at) = &at {
+        rk_vfs::security::inode_getattr(at)?;
+    }
     let mnt_id = at.as_ref().map_or(0, |at| at.mount.id());
     let mut s = Statx::new_zeroed();
     // The unique ID if the caller asks for it, else the ID of mountinfo, as `vfs_statx_path` of
@@ -993,6 +1006,38 @@ pub(crate) fn getdents64(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResul
     let n = file.read_dir(&mut data)?;
     cx.write_bytes(buf, &data[..n])?;
     Ok(n as u64)
+}
+
+/// The `getdents` call of x86_64, which gives the records of the old format `linux_dirent`. A
+/// record of `linux_dirent64` has the same length, so the records are changed in place: the name
+/// moves to offset 18, and the type goes in the last byte of the record, as `filldir` of Linux.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn getdents(cx: &Cx<'_>, fd: u64, buf: u64, count: u64) -> SysResult {
+    let file = cx.file(fd)?;
+    let mut data = vec![0u8; (count as usize).min(CHUNK)];
+    let n = file.read_dir(&mut data)?;
+    to_old_dirents(&mut data[..n]);
+    cx.write_bytes(buf, &data[..n])?;
+    Ok(n as u64)
+}
+
+/// Changes the `linux_dirent64` records in `data` to `linux_dirent` records in place.
+#[cfg(target_arch = "x86_64")]
+fn to_old_dirents(data: &mut [u8]) {
+    let mut at = 0;
+    while at + 19 < data.len() {
+        let reclen = usize::from(u16::from_ne_bytes([data[at + 16], data[at + 17]]));
+        if reclen < 20 || at + reclen > data.len() {
+            break;
+        }
+        let rec = &mut data[at..at + reclen];
+        let kind = rec[18];
+        let len = rec[19..].iter().position(|&b| b == 0).unwrap_or(reclen - 20);
+        rec.copy_within(19..19 + len, 18);
+        rec[18 + len..].fill(0);
+        rec[reclen - 1] = kind;
+        at += reclen;
+    }
 }
 
 pub(crate) fn ioctl(cx: &Cx<'_>, fd: u64, cmd: u64, arg: u64) -> SysResult {
@@ -1627,6 +1672,14 @@ fn change_attr(
     attr: &SetAttr,
     change: Change,
 ) -> SysResult {
+    // The LSM checks come before `notify_change`, as `chmod_common` and `chown_common` of Linux.
+    if let Some(at) = at {
+        if change == Change::Owner {
+            rk_vfs::security::path_chown(at, attr.uid, attr.gid)?;
+        } else if let Some(mode) = attr.mode {
+            rk_vfs::security::path_chmod(at, mode)?;
+        }
+    }
     rk_vfs::inode::check_set_attr(&**inode, attr)?;
     let meta = inode.metadata();
     // A symbolic link has no mode of its own, as `notify_change` of Linux. A path through a
@@ -1813,6 +1866,7 @@ pub(crate) fn truncate(cx: &Cx<'_>, path: u64, size: u64) -> SysResult {
     // `get_write_access` and `break_lease` in `vfs_truncate` of Linux.
     let _access = rk_vfs::file::WriteAccess::new(at.inode())?;
     rk_vfs::lease::break_lease(at.inode(), rk_abi::native::open::O_WRONLY)?;
+    rk_vfs::security::path_truncate(&at)?;
     fsize_check(cx, &at.inode().metadata(), size)?;
     let mode = fs.cred().write_kill(&at.inode().metadata());
     let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };

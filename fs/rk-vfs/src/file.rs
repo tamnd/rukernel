@@ -1550,6 +1550,8 @@ impl File {
         let mode = crate::cred::current().write_kill(&inode.metadata());
         let attr = SetAttr { size: Some(size), mode, ..SetAttr::default() };
         check_set_attr(&**inode, &attr)?;
+        // The LSM check comes before the truncate, as `do_ftruncate` of Linux.
+        crate::security::file_truncate(self)?;
         crate::mapped::extend(inode, size);
         inode.set_attr(&attr)?;
         crate::mapped::changed(inode, size, u64::MAX);

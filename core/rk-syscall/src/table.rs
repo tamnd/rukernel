@@ -352,6 +352,8 @@ fn handle(cx: &mut Cx<'_>, n: u32, a: [u64; 6]) -> SysResult {
             Ok(u64::from(cx.vnr(cx.thread.tid())))
         }
         nr::GETDENTS64 => fs::getdents64(cx, a[0], a[1], a[2]),
+        #[cfg(target_arch = "x86_64")]
+        nr::GETDENTS => fs::getdents(cx, a[0], a[1], a[2]),
         nr::CLOCK_GETTIME => info::clock_gettime(cx, a[0], a[1]),
         nr::CLOCK_SETTIME => info::clock_settime(cx, a[0], a[1]),
         nr::CLOCK_ADJTIME => info::clock_adjtime(cx, a[0], a[1]),

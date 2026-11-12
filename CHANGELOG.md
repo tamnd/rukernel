@@ -7,6 +7,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The `AF_ALG` sockets with the type `skcipher`, as crypto/algif_skcipher.c of Linux, for `ecb(aes)`, `cbc(aes)`, `ctr(aes)` and `xts(aes)` of `rk-crypto`. A `sendmsg` gives the operation with `ALG_SET_OP` and the IV with `ALG_SET_IV` in control messages, and adds the data to the queue. A `recv` encrypts or decrypts the data of the queue in blocks. With `MSG_MORE`, the operation continues in the next `send`, and the IV goes from one `recv` to the next. libcryptsetup uses these sockets to open a LUKS2 key slot without dm-crypt (#541).
+- The `getdents` call of x86_64, with the records of the old format `linux_dirent`, as `filldir` of Linux. The `readdir` test of the AppArmor regression tests uses it (#540).
+- AppArmor checks the path operations, as the path hooks of lsm.c of Linux: a create, a `mkdir`, a `mknod`, a symbolic link, a hard link, a rename, an `unlink`, an `rmdir`, a truncate, a `chmod`, a `chown` and a `stat`. The VFS has the hooks `path_*`, `inode_getattr` and `file_truncate` of Linux, at the places where Linux calls them (#540).
 
 ## [0.5.24] - 2026-11-12
 

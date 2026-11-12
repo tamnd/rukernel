@@ -28,10 +28,13 @@ pub mod policy;
 pub mod task;
 pub mod unpack;
 
+use crate::unpack::perm;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+use rk_abi::native::stat::{S_IFDIR, S_IFLNK};
 use rk_vfs::cred::Cred;
+use rk_vfs::dentry::Location;
 use rk_vfs::file::File;
 use rk_vfs::inode::Result;
 use rk_vfs::security::{
@@ -65,6 +68,62 @@ impl SecurityHooks for AppArmor {
 
     fn mmap_file(&self, f: Option<&File>, _reqprot: u64, prot: u64, flags: u64) -> Result<()> {
         file::mmap_file(f, prot, flags)
+    }
+
+    fn path_unlink(&self, _dir: &Location, at: &Location) -> Result<()> {
+        file::path_cond(file::op::UNLINK, at, perm::DELETE)
+    }
+
+    fn path_mkdir(&self, dir: &Location, name: &[u8], _mode: u32) -> Result<()> {
+        file::path_create(file::op::MKDIR, dir, name, S_IFDIR)
+    }
+
+    fn path_rmdir(&self, _dir: &Location, at: &Location) -> Result<()> {
+        file::path_cond(file::op::RMDIR, at, perm::DELETE)
+    }
+
+    fn path_mknod(&self, dir: &Location, name: &[u8], mode: u32, _dev: u64) -> Result<()> {
+        file::path_create(file::op::MKNOD, dir, name, mode)
+    }
+
+    fn path_truncate(&self, at: &Location) -> Result<()> {
+        file::path_cond(file::op::TRUNC, at, perm::WRITE | perm::SETATTR)
+    }
+
+    fn path_symlink(&self, dir: &Location, name: &[u8], _target: &[u8]) -> Result<()> {
+        file::path_create(file::op::SYMLINK, dir, name, S_IFLNK)
+    }
+
+    fn path_link(&self, old: &Location, dir: &Location, name: &[u8]) -> Result<()> {
+        file::path_link(old, dir, name)
+    }
+
+    fn path_rename(
+        &self,
+        old: &Location,
+        dir: &Location,
+        name: &[u8],
+        new: Option<&Location>,
+        flags: u32,
+    ) -> Result<()> {
+        file::path_rename(old, dir, name, new, flags)
+    }
+
+    fn path_chmod(&self, at: &Location, _mode: u32) -> Result<()> {
+        file::path_cond(file::op::CHMOD, at, perm::CHMOD)
+    }
+
+    fn path_chown(&self, at: &Location, _uid: Option<u32>, _gid: Option<u32>) -> Result<()> {
+        file::path_cond(file::op::CHOWN, at, perm::CHOWN)
+    }
+
+    fn inode_getattr(&self, at: &Location) -> Result<()> {
+        file::path_cond(file::op::GETATTR, at, perm::GETATTR)
+    }
+
+    fn file_truncate(&self, f: &File) -> Result<()> {
+        // As Linux, the check is the check of the path of the file.
+        f.location().map_or(Ok(()), |at| self.path_truncate(at))
     }
 
     fn getselfattr(&self, attr: u64, task: &Task<'_>) -> Result<Vec<u8>> {

@@ -9,14 +9,17 @@
 //! in [`crate::domain`]. Each profile of a stack makes its record, and the access gives the error
 //! of the last profile that denies it, as `fn_for_each` of Linux.
 
+use crate::dfa::NOMATCH;
 use crate::domain::{self, FileAudit, audit_file, str_perms};
 use crate::policy::{Mode, Profile};
-use crate::unpack::{Perms, perm};
+use crate::unpack::{Perms, class, perm, x};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_abi::native::mman::{MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
 use rk_abi::native::open as o;
+use rk_abi::native::stat::{S_IFDIR, S_IFMT};
 use rk_vfs::cred::Cred;
 use rk_vfs::dentry::Location;
 use rk_vfs::file::File;
@@ -41,12 +44,48 @@ pub mod op {
     pub const FLOCK: &str = "file_lock";
     /// `OP_FMMAP`.
     pub const FMMAP: &str = "file_mmap";
+    /// `OP_UNLINK`.
+    pub const UNLINK: &str = "unlink";
+    /// `OP_MKDIR`.
+    pub const MKDIR: &str = "mkdir";
+    /// `OP_RMDIR`.
+    pub const RMDIR: &str = "rmdir";
+    /// `OP_MKNOD`. An open that makes a file also has this name.
+    pub const MKNOD: &str = "mknod";
+    /// `OP_TRUNC`.
+    pub const TRUNC: &str = "truncate";
+    /// `OP_LINK`.
+    pub const LINK: &str = "link";
+    /// `OP_SYMLINK`.
+    pub const SYMLINK: &str = "symlink";
+    /// `OP_RENAME_SRC`.
+    pub const RENAME_SRC: &str = "rename_src";
+    /// `OP_RENAME_DEST`.
+    pub const RENAME_DEST: &str = "rename_dest";
+    /// `OP_CHMOD`.
+    pub const CHMOD: &str = "chmod";
+    /// `OP_CHOWN`.
+    pub const CHOWN: &str = "chown";
+    /// `OP_GETATTR`.
+    pub const GETATTR: &str = "getattr";
 }
 
 /// `LOCK_EX` of `flock`.
 const LOCK_EX: u32 = 2;
 /// `LOCK_NB` of `flock`.
 const LOCK_NB: u32 = 4;
+
+/// `RENAME_EXCHANGE` of `renameat2`.
+const RENAME_EXCHANGE: u32 = 2;
+
+/// The permission that tells that a link must be a subset of its target, `AA_LINK_SUBSET` of
+/// Linux. It has the bit of the lock.
+const LINK_SUBSET: u32 = perm::LOCK;
+
+/// The permissions that the old name of a rename asks for.
+const RENAME_SRC: u32 = perm::READ | perm::GETATTR | perm::WRITE | perm::SETATTR | perm::DELETE;
+/// The permissions that the new name of a rename asks for.
+const RENAME_DEST: u32 = perm::WRITE | perm::SETATTR | perm::CREATE;
 
 /// The byte offset of the part of AppArmor in the blob of a file, or `None` if the module is
 /// not active.
@@ -108,29 +147,81 @@ pub fn path_name(path: Vec<u8>, dir: bool) -> Vec<u8> {
     name
 }
 
-/// Checks the permissions `request` on the file at `at` for the profile `p`, and logs the
-/// result, as `profile_path_perm` and `__aa_path_perm` of Linux. `fsuid` is the file system
-/// user ID of the task.
+/// The condition of a check of a path, `struct path_cond` of Linux: the owner of the file and
+/// the type. The name of a directory ends with a `/`.
+#[derive(Clone, Copy)]
+struct Cond {
+    uid: u32,
+    dir: bool,
+}
+
+impl Cond {
+    /// The condition of the file at `at`.
+    fn of(at: &Location) -> Self {
+        let meta = at.inode().metadata();
+        Self { uid: meta.uid, dir: meta.file_type() == Some(FileType::Directory) }
+    }
+}
+
+/// The name of the new file `name` in the directory `dir`, for a file that is not there yet.
+fn child_name(dir: &Location, name: &[u8], is_dir: bool) -> Vec<u8> {
+    let mut path = dir.absolute_path();
+    if path != b"/" {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path_name(path, is_dir)
+}
+
+/// Checks the permissions `request` on the file with the name `name` for the profile `p`, and
+/// logs the result, as `__aa_path_perm` of Linux. `fsuid` is the file system user ID of the
+/// task.
 ///
 /// # Errors
 ///
 /// Gives `EACCES` if the policy does not allow the request, except in complain mode.
-fn path_perm(op: &'static str, p: &Profile, at: &Location, request: u32, fsuid: u32) -> Result<()> {
+fn name_perm(
+    op: &'static str,
+    p: &Profile,
+    name: &[u8],
+    request: u32,
+    cond: Cond,
+    fsuid: u32,
+) -> Result<()> {
     if p.mode == Mode::Unconfined {
         return Ok(());
     }
-    let meta = at.inode().metadata();
-    let dir = meta.file_type() == Some(FileType::Directory);
-    let name = path_name(at.absolute_path(), dir);
-    let owner = fsuid == meta.uid;
-    let perms = p.rules.as_ref().map_or(Perms::default(), |r| str_perms(&r.file, &name, owner));
+    let owner = fsuid == cond.uid;
+    let perms = p.rules.as_ref().map_or(Perms::default(), |r| str_perms(&r.file, name, owner));
     let error = (request & !perms.allow != 0).then_some(Errno::EACCES);
-    let a = FileAudit { op, request, name: &name, target: None, ouid: meta.uid, info: None, error };
+    let a = FileAudit { op, request, name, target: None, ouid: cond.uid, info: None, error };
     audit_file(Some(p), &perms, &a)
 }
 
 /// The check of each profile of `l` that is not unconfined, `fn_for_each_confined` of Linux.
 /// Each profile makes its record, so the check does not stop at the first denial.
+///
+/// # Errors
+///
+/// Gives the error of the last profile that denies the request.
+fn label_name_perm(
+    op: &'static str,
+    l: &[Arc<Profile>],
+    name: &[u8],
+    request: u32,
+    cond: Cond,
+    fsuid: u32,
+) -> Result<()> {
+    let mut result = Ok(());
+    for p in l.iter().filter(|p| p.mode != Mode::Unconfined) {
+        if let Err(e) = name_perm(op, p, name, request, cond, fsuid) {
+            result = Err(e);
+        }
+    }
+    result
+}
+
+/// [`label_name_perm`] for the file at `at`, `aa_path_perm` of Linux.
 ///
 /// # Errors
 ///
@@ -142,13 +233,178 @@ fn label_path_perm(
     request: u32,
     fsuid: u32,
 ) -> Result<()> {
+    let cond = Cond::of(at);
+    let name = path_name(at.absolute_path(), cond.dir);
+    label_name_perm(op, l, &name, request, cond, fsuid)
+}
+
+/// The label of the current task and its file system user ID. `None` is `unconfined`, which
+/// has no check.
+fn current_label() -> Option<(domain::Label, u32)> {
+    let cred = rk_vfs::cred::current();
+    if domain::label_id(&cred) == 0 {
+        return None;
+    }
+    Some((domain::label_of(&cred), cred.fsuid))
+}
+
+/// The check of the permissions `request` on the file at `at` by the current task,
+/// `common_perm_cond` of Linux. It is for a remove, a truncate, a `chmod`, a `chown` and a
+/// `stat`.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the request.
+pub fn path_cond(op: &'static str, at: &Location, request: u32) -> Result<()> {
+    let Some((l, fsuid)) = current_label() else { return Ok(()) };
+    label_path_perm(op, &l, at, request, fsuid)
+}
+
+/// The check of a new file `name` with the mode `mode` in the directory `dir`,
+/// `common_perm_create` of Linux. The task is the owner of the new file.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the create.
+pub fn path_create(op: &'static str, dir: &Location, name: &[u8], mode: u32) -> Result<()> {
+    let Some((l, fsuid)) = current_label() else { return Ok(()) };
+    let cond = Cond { uid: fsuid, dir: mode & S_IFMT == S_IFDIR };
+    let name = child_name(dir, name, cond.dir);
+    label_name_perm(op, &l, &name, perm::CREATE, cond, fsuid)
+}
+
+/// `apparmor_path_rename` of Linux: a rename of the file `old` to the name `name` in `dir`. `new`
+/// is the file that has the new name now. The old name asks for the permissions of a read, a
+/// write and a delete, and the new name for a write and a create. An exchange also checks the
+/// two names the other way.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the rename.
+pub fn path_rename(
+    old: &Location,
+    dir: &Location,
+    name: &[u8],
+    new: Option<&Location>,
+    flags: u32,
+) -> Result<()> {
+    let Some((l, fsuid)) = current_label() else { return Ok(()) };
+    let cond = Cond::of(old);
+    if flags & RENAME_EXCHANGE != 0
+        && let Some(new) = new
+    {
+        // As Linux, the condition of the other way has the type of the new file and the owner
+        // of the old file.
+        let other = Cond { uid: cond.uid, dir: Cond::of(new).dir };
+        let new_name = child_name(dir, name, other.dir);
+        label_name_perm(op::RENAME_SRC, &l, &new_name, RENAME_SRC, other, fsuid)?;
+        let old_name = path_name(old.absolute_path(), other.dir);
+        label_name_perm(op::RENAME_DEST, &l, &old_name, RENAME_DEST, other, fsuid)?;
+    }
+    let old_name = path_name(old.absolute_path(), cond.dir);
+    label_name_perm(op::RENAME_SRC, &l, &old_name, RENAME_SRC, cond, fsuid)?;
+    let new_name = child_name(dir, name, cond.dir);
+    label_name_perm(op::RENAME_DEST, &l, &new_name, RENAME_DEST, cond, fsuid)
+}
+
+/// `apparmor_path_link` and `aa_path_link` of Linux: a hard link with the name `name` in `dir`
+/// to the file `old`.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the link.
+pub fn path_link(old: &Location, dir: &Location, name: &[u8]) -> Result<()> {
+    let Some((l, fsuid)) = current_label() else { return Ok(()) };
+    let cond = Cond::of(old);
+    // The names of a link have no `/` at the end, as `aa_path_link` of Linux.
+    let lname = child_name(dir, name, false);
+    let tname = old.absolute_path();
     let mut result = Ok(());
     for p in l.iter().filter(|p| p.mode != Mode::Unconfined) {
-        if let Err(e) = path_perm(op, p, at, request, fsuid) {
+        if let Err(e) = profile_path_link(p, &lname, &tname, cond, fsuid) {
             result = Err(e);
         }
     }
     result
+}
+
+/// Tells if the exec transition of a link is a subset of the transition of its target,
+/// `xindex_is_subset` of Linux.
+fn xindex_is_subset(link: u32, target: u32) -> bool {
+    (link & !x::UNSAFE) == (target & !x::UNSAFE)
+        && (link & x::UNSAFE == 0 || target & x::UNSAFE != 0)
+}
+
+/// The check of a link with the name `lname` to the file `tname` for the profile `p`,
+/// `profile_path_link` of Linux. The pair of the names must have the link permission. If the
+/// pair has the subset permission, the permissions of the link must be a subset of the
+/// permissions of the target.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the policy does not allow the link, except in complain mode.
+fn profile_path_link(
+    p: &Profile,
+    lname: &[u8],
+    tname: &[u8],
+    cond: Cond,
+    fsuid: u32,
+) -> Result<()> {
+    let owner = fsuid == cond.uid;
+    let pdb = p.rules.as_ref().map(|r| &r.file);
+    let mut request = perm::LINK;
+    let mut info = None;
+    let (state, mut lperms) = match pdb {
+        Some(f) => domain::str_perms_at(f, f.start[class::FILE], lname, owner),
+        None => (NOMATCH, Perms::default()),
+    };
+    let error = 'check: {
+        let Some(f) = pdb.filter(|_| lperms.allow & perm::LINK != 0) else {
+            break 'check Some(Errno::EACCES);
+        };
+        // The target follows the link name after a null byte.
+        let next = f.dfa.as_ref().map_or(NOMATCH, |d| d.next(state, 0));
+        let (_, perms) = domain::str_perms_at(f, next, tname, owner);
+        // The audit, quiet and kill masks of a link are in the entry of the pair.
+        lperms.audit = perms.audit;
+        lperms.quiet = perms.quiet;
+        lperms.kill = perms.kill;
+        if perms.allow & perm::LINK == 0 {
+            info = Some("target restricted");
+            lperms = perms;
+            break 'check Some(Errno::EACCES);
+        }
+        if perms.allow & LINK_SUBSET == 0 {
+            break 'check None;
+        }
+        // The permissions of the link, other than the link, must be a subset of the
+        // permissions of the target.
+        let perms = str_perms(f, tname, owner);
+        request = lperms.allow & !perm::LINK;
+        lperms.allow &= perms.allow | perm::LINK;
+        request |= domain::AUDIT_FILE_MASK & (lperms.allow & !perms.allow);
+        if request & !lperms.allow != 0 {
+            break 'check Some(Errno::EACCES);
+        }
+        if lperms.allow & perm::EXEC != 0 && !xindex_is_subset(lperms.xindex, perms.xindex) {
+            lperms.allow &= !perm::EXEC;
+            request |= perm::EXEC;
+            info = Some("link not subset of target");
+            break 'check Some(Errno::EACCES);
+        }
+        None
+    };
+    let target = String::from_utf8_lossy(tname);
+    let a = FileAudit {
+        op: op::LINK,
+        request,
+        name: lname,
+        target: Some(&target),
+        ouid: cond.uid,
+        info,
+        error,
+    };
+    audit_file(Some(p), &lperms, &a)
 }
 
 /// `apparmor_file_alloc_security` of Linux: the file gets the label of the task.
@@ -291,6 +547,15 @@ mod tests {
         let other = str_perms(file, b"/etc/rk_test.aa", true);
         assert_eq!((perm::READ | perm::EXEC_MMAP) & !other.allow, perm::READ | perm::EXEC_MMAP);
         assert_eq!(perm::READ & !str_perms(file, b"/usr/bin/", true).allow, perm::READ);
+    }
+
+    #[test]
+    fn the_exec_of_a_link_must_be_the_exec_of_its_target() {
+        let name = x::NAME | 1;
+        assert!(xindex_is_subset(name, name));
+        assert!(xindex_is_subset(name, name | x::UNSAFE));
+        assert!(!xindex_is_subset(name | x::UNSAFE, name));
+        assert!(!xindex_is_subset(name, x::NAME | 2));
     }
 
     #[test]

@@ -15838,12 +15838,14 @@ static int aa_write(const char *path, const char *data, size_t len, int flags)
  * that the file checks log: an open with a create in /tmp, an exclusive lock of that file, an
  * open of /etc/rk_test.aa, an executable map of it and an open of the directory /usr/bin.
  * With the argument "exec", it checks that it has no label for the next exec. With the argument
- * "deny", it checks that rk_test in enforce mode denies an open, a lock and an exec with EACCES,
- * and gives 0 or the number of the first check that failed. It does not read its label, because
- * the rules do not allow it.
+ * "deny", it checks that rk_test in enforce mode denies an open, a lock, a stat, a change of the
+ * attributes, a truncate to the size argv[2], a link, a rename, a create, a remove and an exec
+ * with EACCES, and gives 0 or the number of the first check that failed. It does not read its
+ * label, because the rules do not allow it. The names are in /etc, which has no rule.
  */
 static int aa_label_helper(int argc, char **argv)
 {
+	struct stat st;
 	char buf[256];
 	int n, w;
 	char *args[] = { "rk-sub", NULL };
@@ -15856,6 +15858,27 @@ static int aa_label_helper(int argc, char **argv)
 			return 3;
 		if (flock(w, LOCK_EX) == 0 || errno != EACCES)
 			return 4;
+		/* As on Linux, the map of the old format of the policy allows getattr in each state. */
+		if (stat("/etc/rk_test.aa", &st) != 0)
+			return 6;
+		if (chmod("/etc/rk_test.aa", 0644) == 0 || errno != EACCES)
+			return 7;
+		if (argc < 3 || truncate("/etc/rk_test.aa", atol(argv[2])) == 0 || errno != EACCES)
+			return 8;
+		if (link("/etc/rk_test.aa", "/etc/rk-aa-l") == 0 || errno != EACCES)
+			return 9;
+		if (rename("/etc/rk_test.aa", "/etc/rk-aa-r") == 0 || errno != EACCES)
+			return 10;
+		if (mkdir("/etc/rk-aa-d", 0755) == 0 || errno != EACCES)
+			return 11;
+		if (rmdir("/usr/bin") == 0 || errno != EACCES)
+			return 12;
+		if (symlink("x", "/etc/rk-aa-s") == 0 || errno != EACCES)
+			return 13;
+		if (mknod("/etc/rk-aa-n", S_IFIFO | 0644, 0) == 0 || errno != EACCES)
+			return 14;
+		if (unlink("/etc/rk_test.aa") == 0 || errno != EACCES)
+			return 15;
 		execv("/tmp/rk-sub", args);
 		return errno == EACCES ? 0 : 5;
 	}
@@ -16162,7 +16185,8 @@ static void test_apparmor(void)
 	{
 		/* The flags of rk_test: not a hat, and the mode 1 (complain). The mode 0 is enforce. */
 		static const char flags[] = "flags\0\x07\x02\0\0\0\0\x02\x01";
-		char *five[] = { "rk-test", "deny", NULL };
+		char size[32];
+		char *five[] = { "rk-test", "deny", size, NULL };
 		int i, at = -1;
 
 		fd = open("/etc/rk_test.aa", O_RDONLY);
@@ -16174,13 +16198,15 @@ static void test_apparmor(void)
 				at = i;
 		if (at >= 0)
 			big[at + sizeof(flags) - 2] = 0;
+		/* A truncate to the same size changes nothing if the check fails. */
+		snprintf(size, sizeof(size), "%d", n);
 		check("apparmor: a replace of rk_test in enforce mode works", at >= 0 && aa_write("/sys/kernel/security/apparmor/.replace", big, n, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 256) > 0 && strstr(buf, "rk_test (enforce)\n") != NULL);
 		pid = fork();
 		if (pid == 0) {
 			execv("/usr/bin/rk-test", five);
 			_exit(127);
 		}
-		check("apparmor: in enforce mode, an open, a lock and an exec that the rules do not allow give EACCES", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		check("apparmor: in enforce mode, an open, a lock, a path operation and an exec that the rules do not allow give EACCES", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
 			printf("init: the AppArmor enforce checks failed at the check %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 		pid = fork();
@@ -16196,6 +16222,8 @@ static void test_apparmor(void)
 		n = klogctl(3, buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = 0;
 		check("apparmor: the kernel log has the denials, as on Linux", n > 0 && strstr(buf, "apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"file_lock\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"exec\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-sub\" pid=") != NULL);
+		check("apparmor: the kernel log has the denials of the path operations, as on Linux", strstr(buf, "operation=\"getattr\"") == NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"chmod\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "operation=\"truncate\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "operation=\"rename_src\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "operation=\"unlink\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL);
+		check("apparmor: the kernel log has the denials of the link and the creates, as on Linux", strstr(buf, "operation=\"link\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-l\" pid=") != NULL && strstr(buf, " requested_mask=\"l\" denied_mask=\"l\" fsuid=0 ouid=0 target=\"/etc/rk_test.aa\"") != NULL && strstr(buf, "operation=\"mkdir\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-d/\" pid=") != NULL && strstr(buf, "operation=\"rmdir\" class=\"file\" profile=\"rk_test\" name=\"/usr/bin/\" pid=") != NULL && strstr(buf, "operation=\"symlink\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-s\" pid=") != NULL && strstr(buf, "operation=\"mknod\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk-aa-n\" pid=") != NULL);
 		check("apparmor: the kernel log has the missing profile in enforce mode", strstr(buf, "apparmor=\"DENIED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"rk_test\" name=\"rk_none\" pid=") != NULL);
 	}
 	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);
