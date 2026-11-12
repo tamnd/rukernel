@@ -658,10 +658,37 @@ pub fn exec(
     let mut cred = cred;
     let bprm =
         Bprm { filename: &path, file: &at, cred: &mut cred, secureexec: false, tracer: None };
-    security::bprm_committing_creds(&bprm);
+    let mut files =
+        security::ExecFiles::new(process.files().map_or_else(Vec::new, |f| {
+            f.lock().iter().map(|(fd, e)| (fd, e.file.clone())).collect()
+        }));
+    security::bprm_committing_creds(&bprm, &mut files);
+    revoke_files(&ctx, process, files.revoked());
     process.set_cred(cred);
     security::bprm_committed_creds(&path, &at);
     thread.exec_keys();
     process.set_image(&argv, at, auxv, deny);
     Ok(image)
+}
+
+/// Puts a file of `/dev/null` in place of each descriptor of `fds`, the files that a security
+/// module revoked at the exec, as `aa_inherit_files` of Linux. The new descriptor has no
+/// `FD_CLOEXEC`, as `replace_fd`. If the open of `/dev/null` fails, the descriptors close.
+fn revoke_files(ctx: &FsContext, process: &crate::process::Process, fds: &[i32]) {
+    if fds.is_empty() {
+        return;
+    }
+    let Some(files) = process.files() else { return };
+    let null = ctx.open(ctx.root(), b"/dev/null", rk_abi::native::open::O_RDWR, 0).ok();
+    // The old files close after the lock, as the other closes of a descriptor.
+    let mut old = Vec::new();
+    let mut table = files.lock();
+    for &fd in fds {
+        old.extend(match &null {
+            Some(null) => table.set(fd, null.clone(), false).ok().flatten(),
+            None => table.remove(fd).ok(),
+        });
+    }
+    drop(table);
+    drop(old);
 }

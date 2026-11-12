@@ -25,7 +25,7 @@ use rk_vfs::cred::Cred;
 use rk_vfs::dentry::Location;
 use rk_vfs::file::File;
 use rk_vfs::inode::{FileType, Result};
-use rk_vfs::security::id;
+use rk_vfs::security::{Bprm, ExecFiles, id};
 
 /// The size of the part of AppArmor in the blob of a file: the label and the permissions.
 pub const FILE_BLOB: usize = 16;
@@ -45,6 +45,8 @@ pub mod op {
     pub const FLOCK: &str = "file_lock";
     /// `OP_FMMAP`.
     pub const FMMAP: &str = "file_mmap";
+    /// `OP_INHERIT`: the check of an open file at an exec.
+    pub const INHERIT: &str = "file_inherit";
     /// `OP_UNLINK`.
     pub const UNLINK: &str = "unlink";
     /// `OP_MKDIR`.
@@ -441,9 +443,13 @@ pub fn file_open(file: &File, cred: &Cred, flags: u32) -> Result<()> {
 ///
 /// Gives `EACCES` if the policy does not allow the access.
 pub fn file_perm(op: &'static str, file: &File, request: u32) -> Result<()> {
+    cred_file_perm(op, &rk_vfs::cred::current(), file, request)
+}
+
+/// [`file_perm`] for the label of `cred`.
+fn cred_file_perm(op: &'static str, cred: &Cred, file: &File, request: u32) -> Result<()> {
     let Some(off) = file_offset() else { return Ok(()) };
-    let cred = rk_vfs::cred::current();
-    let label = domain::label_id(&cred);
+    let label = domain::label_id(cred);
     if label == 0 {
         return Ok(());
     }
@@ -512,6 +518,32 @@ fn sock_perm(
     blob.store(off + LABEL, label);
     blob.store(off + ALLOW, u64::from(allow | request));
     Ok(())
+}
+
+/// `apparmor_bprm_committing_creds` and `aa_inherit_files` of Linux: an exec that changes the
+/// label checks each open file again with the new label of `bprm`. The exec revokes a file that
+/// the new label cannot use. A new label that is unconfined has no check.
+pub fn inherit_files(bprm: &Bprm<'_>, files: &mut ExecFiles) {
+    let cred: &Cred = &*bprm.cred;
+    let unconfined = domain::label_of(cred).iter().all(|p| p.mode == Mode::Unconfined);
+    if unconfined || domain::label_id(cred) == domain::label_id(&rk_vfs::cred::current()) {
+        return;
+    }
+    files.revalidate(|f| cred_file_perm(op::INHERIT, cred, f, map_file_perms(f)).is_ok());
+}
+
+/// The permissions of the open file `file`, `aa_map_file_to_perms` of Linux. Linux keeps no
+/// `O_TRUNC` and no `O_CREAT` in an open file, so they are not here.
+fn map_file_perms(file: &File) -> u32 {
+    let flags = file.flags();
+    let mut p = 0;
+    if flags.writable() {
+        p |= if flags.append() { perm::APPEND } else { perm::WRITE };
+    }
+    if flags.readable() {
+        p |= perm::READ;
+    }
+    p
 }
 
 /// `apparmor_file_lock` of Linux: a `flock` with the operation `cmd`. An exclusive lock also
