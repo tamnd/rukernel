@@ -1,15 +1,17 @@
-//! The expressions `byteorder`, `range`, `limit`, `log` and `reject` of nf_tables, as
-//! nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c, nf_log_syslog.c, nft_reject.c,
-//! nft_reject_ipv4.c, nft_reject_ipv6.c and nft_reject_inet.c of Linux.
+//! The expressions `byteorder`, `range`, `limit`, `log`, `reject`, `numgen` and `hash` of
+//! nf_tables, as nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c, nf_log_syslog.c,
+//! nft_reject.c, nft_reject_ipv4.c, nft_reject_ipv6.c, nft_reject_inet.c, nft_numgen.c and
+//! nft_hash.c of Linux.
 
 use super::{NFT_BREAK, NftRegs, be32, be64, len_attr, nft_parse_register, nft_value};
 use crate::buf::NetBuf;
 use crate::netfilter::nf_reject::{NfReject, nf_send_reject};
-use crate::netfilter::{NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NfHookState};
+use crate::netfilter::{NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NfHookState, NfPktinfo};
 use crate::netlink::msg::Attrs;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_frame::sync::SpinLock;
 use rk_vfs::inode::Result;
@@ -72,6 +74,25 @@ const NFT_REJECT_ICMPX_MAX: u8 = 3;
 const ICMPX_V4: [u8; 4] = [0, 3, 1, 13];
 /// The ICMPv6 codes of the codes of `NFT_REJECT_ICMPX_UNREACH`, as `icmp_code_v6` of Linux.
 const ICMPX_V6: [u8; 4] = [0, 4, 3, 1];
+
+// `NFTA_NG_*` and `enum nft_ng_types`.
+const NFTA_NG_DREG: u32 = 1;
+const NFTA_NG_MODULUS: u32 = 2;
+const NFTA_NG_TYPE: u32 = 3;
+const NFTA_NG_OFFSET: u32 = 4;
+const NFT_NG_INCREMENTAL: u32 = 0;
+const NFT_NG_RANDOM: u32 = 1;
+
+// `NFTA_HASH_*` and `enum nft_hash_types`.
+const NFTA_HASH_SREG: u32 = 1;
+const NFTA_HASH_DREG: u32 = 2;
+const NFTA_HASH_LEN: u32 = 3;
+const NFTA_HASH_MODULUS: u32 = 4;
+const NFTA_HASH_SEED: u32 = 5;
+const NFTA_HASH_OFFSET: u32 = 6;
+const NFTA_HASH_TYPE: u32 = 7;
+const NFT_HASH_JENKINS: u32 = 0;
+const NFT_HASH_SYM: u32 = 1;
 
 /// `byteorder`, as nft_byteorder.c.
 #[derive(Clone, Debug)]
@@ -551,6 +572,242 @@ pub(crate) fn nft_log_eval(l: &NftLog, skb: &NetBuf, state: &NfHookState) {
     rk_frame::console::log_emit(l.level, &line);
 }
 
+/// A pseudo-random number, as `get_random_u32` and `prandom_u32_state` for `numgen random`,
+/// `meta random` and the seed of `jhash`. The first call takes a seed from the CPU.
+pub(super) fn nft_prandom() -> u32 {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let mut s = STATE.load(Ordering::Relaxed);
+    if s == 0 {
+        s = rk_frame::arch::random_seed() | 1;
+    }
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    STATE.store(s, Ordering::Relaxed);
+    (s >> 32) as u32
+}
+
+/// The real time in nanoseconds, as `ktime_get_real_ns` of Linux. The host has no clock.
+pub(super) fn nft_realtime_ns() -> u64 {
+    #[cfg(target_os = "none")]
+    let ns = rk_frame::time::realtime_ns();
+    #[cfg(not(target_os = "none"))]
+    let ns = 0;
+    ns
+}
+
+/// Puts `v` in the range from 0 to `n` less 1, as `reciprocal_scale` of Linux.
+fn reciprocal_scale(v: u32, n: u32) -> u32 {
+    ((u64::from(v) * u64::from(n)) >> 32) as u32
+}
+
+/// The hash of `key` with the seed `initval`, as `jhash` of Linux (lookup3.c of Bob Jenkins).
+pub(super) fn jhash(key: &[u8], initval: u32) -> u32 {
+    let init = 0xdead_beef_u32.wrapping_add(key.len() as u32).wrapping_add(initval);
+    let (mut a, mut b, mut c) = (init, init, init);
+    let word = |k: &[u8]| {
+        let mut w = [0u8; 4];
+        w[..k.len()].copy_from_slice(k);
+        u32::from_le_bytes(w)
+    };
+    // The words of the loop are in the order of the CPU, as `__get_unaligned_cpu32`.
+    let cpu = |k: &[u8]| u32::from_ne_bytes([k[0], k[1], k[2], k[3]]);
+    let mut k = key;
+    while k.len() > 12 {
+        a = a.wrapping_add(cpu(&k[0..4]));
+        b = b.wrapping_add(cpu(&k[4..8]));
+        c = c.wrapping_add(cpu(&k[8..12]));
+        // `__jhash_mix`.
+        a = a.wrapping_sub(c) ^ c.rotate_left(4);
+        c = c.wrapping_add(b);
+        b = b.wrapping_sub(a) ^ a.rotate_left(6);
+        a = a.wrapping_add(c);
+        c = c.wrapping_sub(b) ^ b.rotate_left(8);
+        b = b.wrapping_add(a);
+        a = a.wrapping_sub(c) ^ c.rotate_left(16);
+        c = c.wrapping_add(b);
+        b = b.wrapping_sub(a) ^ a.rotate_left(19);
+        a = a.wrapping_add(c);
+        c = c.wrapping_sub(b) ^ b.rotate_left(4);
+        b = b.wrapping_add(a);
+        k = &k[12..];
+    }
+    if k.is_empty() {
+        return c;
+    }
+    // The last bytes, in the order of a little-endian word, as the `switch` of `jhash`.
+    a = a.wrapping_add(word(&k[..k.len().min(4)]));
+    if k.len() > 4 {
+        b = b.wrapping_add(word(&k[4..k.len().min(8)]));
+    }
+    if k.len() > 8 {
+        c = c.wrapping_add(word(&k[8..]));
+    }
+    // `__jhash_final`.
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(14));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(11));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(25));
+    c ^= b;
+    c = c.wrapping_sub(b.rotate_left(16));
+    a ^= c;
+    a = a.wrapping_sub(c.rotate_left(4));
+    b ^= a;
+    b = b.wrapping_sub(a.rotate_left(14));
+    c ^= b;
+    c.wrapping_sub(b.rotate_left(24))
+}
+
+/// Checks the modulus and the offset of `numgen` and `hash`, as `nft_ng_inc_init` and
+/// `nft_jhash_init` of Linux: the last number must not go over `u32::MAX`.
+fn nft_modulus_check(modulus: u32, offset: u32) -> Result<()> {
+    if modulus == 0 {
+        return Err(Errno::ERANGE);
+    }
+    offset.checked_add(modulus - 1).map(|_| ()).ok_or(Errno::EOVERFLOW)
+}
+
+/// `numgen`, as nft_numgen.c: a number from 0 to the modulus less 1, plus the offset.
+#[derive(Clone, Debug)]
+pub(crate) struct NftNumgen {
+    dreg: usize,
+    modulus: u32,
+    offset: u32,
+    /// The last number of `NFT_NG_INCREMENTAL`, or `None` for `NFT_NG_RANDOM`.
+    counter: Option<Arc<AtomicU32>>,
+}
+
+/// Reads a `numgen`, as `nft_ng_select_ops`, `nft_ng_inc_init` and `nft_ng_random_init` of
+/// Linux.
+pub(super) fn nft_numgen_init(data: &[u8]) -> Result<NftNumgen> {
+    let a = Attrs::parse(data, 6);
+    let (Some(modulus), Some(ty)) = (be32(&a, NFTA_NG_MODULUS)?, be32(&a, NFTA_NG_TYPE)?) else {
+        return Err(Errno::EINVAL);
+    };
+    if !a.has(NFTA_NG_DREG) || !matches!(ty, NFT_NG_INCREMENTAL | NFT_NG_RANDOM) {
+        return Err(Errno::EINVAL);
+    }
+    let offset = be32(&a, NFTA_NG_OFFSET)?.unwrap_or(0);
+    nft_modulus_check(modulus, offset)?;
+    let dreg = nft_parse_register(&a, NFTA_NG_DREG, 4)?;
+    // The first number of `NFT_NG_INCREMENTAL` is 0.
+    let counter = (ty == NFT_NG_INCREMENTAL).then(|| Arc::new(AtomicU32::new(modulus - 1)));
+    Ok(NftNumgen { dreg, modulus, offset, counter })
+}
+
+/// Puts the next number in the register, as `nft_ng_inc_eval` and `nft_ng_random_eval`.
+pub(super) fn nft_numgen_eval(e: &NftNumgen, regs: &mut NftRegs) {
+    let n = match &e.counter {
+        Some(c) => {
+            let next = |o: u32| if o + 1 < e.modulus { o + 1 } else { 0 };
+            let old = c
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |o| Some(next(o)))
+                .unwrap_or_else(|o| o);
+            next(old)
+        }
+        None => reciprocal_scale(nft_prandom(), e.modulus),
+    };
+    regs.store(e.dreg, &(n + e.offset).to_ne_bytes());
+}
+
+/// `hash`, as nft_hash.c: a hash of a register, or a hash of the flow that is the same in the
+/// two directions, from 0 to the modulus less 1, plus the offset.
+#[derive(Clone, Debug)]
+pub(crate) struct NftHash {
+    /// The register and the length of the data of `NFT_HASH_JENKINS`, or `None` for
+    /// `NFT_HASH_SYM`.
+    src: Option<(usize, usize)>,
+    dreg: usize,
+    modulus: u32,
+    offset: u32,
+    seed: u32,
+}
+
+/// Reads a `hash`, as `nft_hash_select_ops`, `nft_jhash_init` and `nft_symhash_init` of Linux.
+/// A `jhash` with no seed gets a random seed.
+pub(super) fn nft_hash_init(data: &[u8]) -> Result<NftHash> {
+    let a = Attrs::parse(data, 9);
+    let sym = match be32(&a, NFTA_HASH_TYPE)? {
+        None | Some(NFT_HASH_JENKINS) => false,
+        Some(NFT_HASH_SYM) => true,
+        Some(_) => return Err(Errno::EOPNOTSUPP),
+    };
+    let Some(modulus) = be32(&a, NFTA_HASH_MODULUS)? else { return Err(Errno::EINVAL) };
+    if !a.has(NFTA_HASH_DREG) || (!sym && !(a.has(NFTA_HASH_SREG) && a.has(NFTA_HASH_LEN))) {
+        return Err(Errno::EINVAL);
+    }
+    let offset = be32(&a, NFTA_HASH_OFFSET)?.unwrap_or(0);
+    let mut src = None;
+    let mut seed = nft_hashrnd();
+    if !sym {
+        let len = match be32(&a, NFTA_HASH_LEN)? {
+            Some(l @ 1..=255) => l as usize,
+            _ => return Err(Errno::ERANGE),
+        };
+        src = Some((nft_parse_register(&a, NFTA_HASH_SREG, len)?, len));
+        seed = be32(&a, NFTA_HASH_SEED)?.unwrap_or_else(nft_prandom);
+    }
+    nft_modulus_check(modulus, offset)?;
+    let dreg = nft_parse_register(&a, NFTA_HASH_DREG, 4)?;
+    Ok(NftHash { src, dreg, modulus, offset, seed })
+}
+
+/// The seed of the hashes of the flows, as `hashrnd` of flow_dissector.c of Linux. It is the
+/// same for all of the boot.
+fn nft_hashrnd() -> u32 {
+    static SEED: AtomicU32 = AtomicU32::new(0);
+    let s = SEED.load(Ordering::Relaxed);
+    if s != 0 {
+        return s;
+    }
+    let _ = SEED.compare_exchange(0, nft_prandom() | 1, Ordering::Relaxed, Ordering::Relaxed);
+    SEED.load(Ordering::Relaxed)
+}
+
+/// The hash of the flow of the packet `d` of the family `pf`, as `__skb_get_hash_symmetric`
+/// of Linux: the addresses, the ports and the protocol, in an order that does not change with
+/// the direction. The hash is not 0.
+fn nft_symhash(d: &[u8], pf: u8, pkt: &NfPktinfo, seed: u32) -> u32 {
+    let (at, alen) = if pf == NFPROTO_IPV6 { (8, 16) } else { (12, 4) };
+    let (Some(s), Some(t)) = (d.get(at..at + alen), d.get(at + alen..at + 2 * alen)) else {
+        return 0;
+    };
+    // TCP, UDP, DCCP, SCTP and UDP-Lite have the ports in the first 4 bytes.
+    let ports = match (pkt.thoff, pkt.l4proto) {
+        (Some(off), 6 | 17 | 33 | 132 | 136) => d.get(off..off + 4),
+        _ => None,
+    };
+    let (sp, tp) = ports.map_or(([0u8; 2], [0u8; 2]), |p| ([p[0], p[1]], [p[2], p[3]]));
+    let (lo, hi) = if (t, tp) < (s, sp) { ((t, tp), (s, sp)) } else { ((s, sp), (t, tp)) };
+    let mut key = [0u8; 37];
+    key[..alen].copy_from_slice(lo.0);
+    key[alen..2 * alen].copy_from_slice(hi.0);
+    key[2 * alen..2 * alen + 2].copy_from_slice(&lo.1);
+    key[2 * alen + 2..2 * alen + 4].copy_from_slice(&hi.1);
+    key[2 * alen + 4] = pkt.l4proto;
+    match jhash(&key[..2 * alen + 5], seed) {
+        0 => 1,
+        h => h,
+    }
+}
+
+/// Puts the hash in the register, as `nft_jhash_eval` and `nft_symhash_eval` of Linux.
+pub(super) fn nft_hash_eval(
+    e: &NftHash,
+    regs: &mut NftRegs,
+    skb: &NetBuf,
+    pf: u8,
+    pkt: &NfPktinfo,
+) {
+    let h = match e.src {
+        Some((sreg, len)) => jhash(&regs.data[sreg..sreg + len], e.seed),
+        None => nft_symhash(skb.data(), pf, pkt, e.seed),
+    };
+    regs.store(e.dreg, &(reciprocal_scale(h, e.modulus) + e.offset).to_ne_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{NFT_CONTINUE, NFT_REG_SIZE};
@@ -577,6 +834,130 @@ mod tests {
     /// `NFTA_DATA_VALUE` in a nest.
     fn value(v: &[u8]) -> Vec<u8> {
         attrs(&[(1, v)])
+    }
+
+    #[test]
+    fn jhash_gives_the_values_of_linux() {
+        let d: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(7) + 1).collect();
+        let want = [
+            (0, 0xf0e2_1567),
+            (1, 0x4015_8784),
+            (3, 0xd8f0_e5df),
+            (4, 0xf7e6_ac94),
+            (5, 0x236b_f5cd),
+            (8, 0xdc12_b871),
+            (12, 0xe8f4_c145),
+            (13, 0xa2fb_e119),
+            (24, 0x56fa_96df),
+            (25, 0xe5fc_355e),
+            (40, 0x9d69_5eda),
+        ];
+        for (len, h) in want {
+            assert_eq!(jhash(&d[..len], 0x1234_5678), h, "{len}");
+        }
+        assert_eq!(jhash(&[10, 0, 0, 1], 0), 0x2fa5_f781);
+    }
+
+    #[test]
+    fn numgen_counts_up_to_the_modulus_and_adds_the_offset() {
+        let be = |v: u32| v.to_be_bytes();
+        let ng = |ty: u32, modulus: u32, offset: u32| {
+            nft_numgen_init(&attrs(&[
+                (NFTA_NG_DREG as u16, &be(R1)),
+                (NFTA_NG_MODULUS as u16, &be(modulus)),
+                (NFTA_NG_TYPE as u16, &be(ty)),
+                (NFTA_NG_OFFSET as u16, &be(offset)),
+            ]))
+        };
+        let n = ng(NFT_NG_INCREMENTAL, 3, 10).unwrap();
+        let mut r = regs();
+        let mut got = Vec::new();
+        for _ in 0..5 {
+            nft_numgen_eval(&n, &mut r);
+            got.push(u32::from_ne_bytes(
+                r.data[NFT_REG_SIZE..NFT_REG_SIZE + 4].try_into().unwrap(),
+            ));
+        }
+        assert_eq!(got, [10, 11, 12, 10, 11]);
+        // A copy of the rule goes on from the same number.
+        nft_numgen_eval(&n.clone(), &mut r);
+        assert_eq!(r.data[NFT_REG_SIZE..NFT_REG_SIZE + 4], 12u32.to_ne_bytes());
+        let n = ng(NFT_NG_RANDOM, 4, 0).unwrap();
+        for _ in 0..20 {
+            nft_numgen_eval(&n, &mut r);
+            assert!(
+                u32::from_ne_bytes(r.data[NFT_REG_SIZE..NFT_REG_SIZE + 4].try_into().unwrap()) < 4
+            );
+        }
+        assert_eq!(ng(NFT_NG_INCREMENTAL, 0, 0).unwrap_err(), Errno::ERANGE);
+        assert_eq!(ng(NFT_NG_INCREMENTAL, 2, u32::MAX).unwrap_err(), Errno::EOVERFLOW);
+        assert_eq!(ng(2, 2, 0).unwrap_err(), Errno::EINVAL);
+        let no_type = attrs(&[(NFTA_NG_DREG as u16, &be(R1)), (NFTA_NG_MODULUS as u16, &be(2))]);
+        assert_eq!(nft_numgen_init(&no_type).unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn hash_puts_a_register_or_the_flow_in_the_modulus() {
+        let be = |v: u32| v.to_be_bytes();
+        // jhash ip saddr mod 10 seed 0x0 offset 100.
+        let h = nft_hash_init(&attrs(&[
+            (NFTA_HASH_SREG as u16, &be(R1)),
+            (NFTA_HASH_DREG as u16, &be(R1)),
+            (NFTA_HASH_LEN as u16, &be(4)),
+            (NFTA_HASH_MODULUS as u16, &be(10)),
+            (NFTA_HASH_SEED as u16, &be(0)),
+            (NFTA_HASH_OFFSET as u16, &be(100)),
+            (NFTA_HASH_TYPE as u16, &be(NFT_HASH_JENKINS)),
+        ]))
+        .unwrap();
+        let mut r = regs();
+        r.data[NFT_REG_SIZE..NFT_REG_SIZE + 4].copy_from_slice(&[10, 0, 0, 1]);
+        let skb = NetBuf::from_slice(&[0x45; 28]);
+        let pkt = NfPktinfo { thoff: None, l4proto: 0 };
+        nft_hash_eval(&h, &mut r, &skb, NFPROTO_IPV4, &pkt);
+        let want = reciprocal_scale(0x2fa5_f781, 10) + 100;
+        assert_eq!(r.data[NFT_REG_SIZE..NFT_REG_SIZE + 4], want.to_ne_bytes());
+        // symhash mod 1000: the two directions of a flow get the same number.
+        let sym = nft_hash_init(&attrs(&[
+            (NFTA_HASH_DREG as u16, &be(R1)),
+            (NFTA_HASH_MODULUS as u16, &be(1000)),
+            (NFTA_HASH_TYPE as u16, &be(NFT_HASH_SYM)),
+        ]))
+        .unwrap();
+        let udp = |s: [u8; 4], d: [u8; 4], sp: u16, dp: u16| {
+            let mut p = [0u8; 28];
+            p[0] = 0x45;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&s);
+            p[16..20].copy_from_slice(&d);
+            p[20..22].copy_from_slice(&sp.to_be_bytes());
+            p[22..24].copy_from_slice(&dp.to_be_bytes());
+            NetBuf::from_slice(&p)
+        };
+        let pkt = NfPktinfo { thoff: Some(20), l4proto: 17 };
+        let mut get = |b: &NetBuf| {
+            nft_hash_eval(&sym, &mut r, b, NFPROTO_IPV4, &pkt);
+            u32::from_ne_bytes(r.data[NFT_REG_SIZE..NFT_REG_SIZE + 4].try_into().unwrap())
+        };
+        let a = get(&udp([10, 0, 0, 1], [10, 0, 0, 2], 1000, 53));
+        assert_eq!(a, get(&udp([10, 0, 0, 2], [10, 0, 0, 1], 53, 1000)));
+        assert!(a < 1000);
+        let bad = |list: &[(u16, &[u8])]| nft_hash_init(&attrs(list)).unwrap_err();
+        let len = |l: u32| {
+            bad(&[
+                (NFTA_HASH_SREG as u16, &be(R1)),
+                (NFTA_HASH_DREG as u16, &be(R1)),
+                (NFTA_HASH_LEN as u16, &be(l)),
+                (NFTA_HASH_MODULUS as u16, &be(10)),
+            ])
+        };
+        assert_eq!(len(0), Errno::ERANGE);
+        assert_eq!(len(256), Errno::ERANGE);
+        assert_eq!(
+            bad(&[(NFTA_HASH_DREG as u16, &be(R1)), (NFTA_HASH_MODULUS as u16, &be(10))]),
+            Errno::EINVAL
+        );
+        assert_eq!(bad(&[(NFTA_HASH_TYPE as u16, &be(2))]), Errno::EOPNOTSUPP);
     }
 
     #[test]

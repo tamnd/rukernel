@@ -40,6 +40,12 @@ pub struct NetBuf {
     /// The mark of the packet, as `skb->mark` of Linux. A rule of nf_tables sets it with
     /// `meta mark set` and reads it with `meta mark`.
     pub mark: u32,
+    /// The priority of the packet, as `skb->priority` of Linux. A rule of nf_tables sets it
+    /// with `meta priority set` and reads it with `meta priority`.
+    pub priority: u32,
+    /// The type of the link address that the frame came to, `PACKET_HOST`,
+    /// `PACKET_BROADCAST` or `PACKET_MULTICAST`, as `skb->pkt_type` of Linux.
+    pub pkt_type: u8,
 }
 
 impl NetBuf {
@@ -58,6 +64,8 @@ impl NetBuf {
             csum_ok: false,
             nfct: NfCt::default(),
             mark: 0,
+            priority: 0,
+            pkt_type: 0,
         }
     }
 
@@ -73,6 +81,8 @@ impl NetBuf {
             csum_ok: false,
             nfct: NfCt::default(),
             mark: 0,
+            priority: 0,
+            pkt_type: 0,
         }
     }
 
@@ -88,6 +98,8 @@ impl NetBuf {
             csum_ok: false,
             nfct: NfCt::default(),
             mark: 0,
+            priority: 0,
+            pkt_type: 0,
         }
     }
 
