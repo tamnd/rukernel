@@ -367,7 +367,7 @@ fn csum_addr(d: &mut [u8], at: usize, old: &[u8], new: &[u8]) {
 }
 
 /// The CRC32c of SCTP, as `sctp_compute_cksum` of Linux, with the checksum field as 0.
-fn sctp_crc(d: &[u8]) -> u32 {
+pub(super) fn sctp_crc(d: &[u8]) -> u32 {
     let mut crc = !0u32;
     for (i, &b) in d.iter().enumerate() {
         let b = if (8..12).contains(&i) { 0 } else { b };
