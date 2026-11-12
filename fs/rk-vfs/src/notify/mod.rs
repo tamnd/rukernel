@@ -7,7 +7,8 @@
 //! the inode, and to each mark of the parent directory that wants the events of its children.
 //!
 //! The marks do not depend on inotify: dnotify and fanotify are other groups. An inotify mark and
-//! a dnotify mark are on an inode. A fanotify mark can also be on a mount or on a file system.
+//! a dnotify mark are on an inode. A fanotify mark can also be on a mount, on a file system or
+//! on a mount namespace. A mark on a mount namespace gets the mount events of the namespace.
 //! fanotify gets each event with its objects in an [`FsEvent`], as the arguments of `fsnotify` of
 //! Linux: the path of an open file, the file, its directory and its name, and the new directory
 //! and the new name of a rename. A global count of the marks lets each hook return at once when
@@ -21,10 +22,10 @@ pub mod fanotify;
 pub mod inotify;
 pub mod queue;
 
-use crate::dentry::{Dentry, Location, Mount};
+use crate::dentry::{Dentry, Location, Mount, MountNamespace};
 use crate::inode::{InodeRef, Result, SetAttr};
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use rk_frame::sync::SpinLock;
@@ -71,6 +72,14 @@ pub mod mask {
     pub const OPEN_EXEC_PERM: u32 = 0x4_0000;
     /// The permission events.
     pub const PERM_EVENTS: u32 = OPEN_PERM | ACCESS_PERM | OPEN_EXEC_PERM;
+    /// A mount was attached to the mount namespace, `FS_MNT_ATTACH`.
+    pub const MNT_ATTACH: u32 = 0x0100_0000;
+    /// A mount was detached from the mount namespace, `FS_MNT_DETACH`.
+    pub const MNT_DETACH: u32 = 0x0200_0000;
+    /// A mount moved in the mount namespace, `FS_MNT_MOVE`.
+    pub const MNT_MOVE: u32 = MNT_ATTACH | MNT_DETACH;
+    /// The mount events, `FSNOTIFY_MNT_EVENTS`.
+    pub const MNT_EVENTS: u32 = MNT_ATTACH | MNT_DETACH;
     /// Only the events after the child is unlinked, `IN_EXCL_UNLINK`: a mark with it does not
     /// get the events of a file that has no name.
     pub const EXCL_UNLINK: u32 = 0x0400_0000;
@@ -152,6 +161,13 @@ pub trait Group: Send + Sync {
         let _ = (ev, marks);
         Ok(())
     }
+
+    /// Takes the mount event `mask` of the mount with the unique ID `mnt_id`. `marks` are the
+    /// marks of the group on the mount namespace of the event, as `fsnotify` of Linux with
+    /// `FSNOTIFY_EVENT_MNT`.
+    fn handle_mnt(&self, mask: u32, mnt_id: u64, marks: &[Arc<Mark>]) {
+        let _ = (mask, mnt_id, marks);
+    }
 }
 
 /// The object of a mark, as the connector types of Linux.
@@ -163,6 +179,9 @@ pub enum Object {
     Mount(Arc<Mount>),
     /// A file system, by its ID.
     Fs(u64),
+    /// A mount namespace, with the ID of its nsfs file. The mark does not hold the namespace.
+    /// The marks go away when the namespace stops.
+    MntNs(Weak<MountNamespace>, u32),
 }
 
 impl Object {
@@ -171,6 +190,7 @@ impl Object {
             Self::Inode(inode) => (0, key(inode)),
             Self::Mount(mount) => (1, Arc::as_ptr(mount) as usize),
             Self::Fs(id) => (2, *id as usize),
+            Self::MntNs(ns, _) => (3, ns.as_ptr() as usize),
         }
     }
 
@@ -746,7 +766,7 @@ pub fn unmount(fs_id: u64) {
     for mark in marks {
         let on_fs = match &mark.object {
             Object::Inode(inode) => inode.fs_id() == fs_id,
-            Object::Mount(_) => false,
+            Object::Mount(_) | Object::MntNs(..) => false,
             Object::Fs(id) => *id == fs_id,
         };
         if on_fs {
@@ -759,6 +779,38 @@ pub fn unmount(fs_id: u64) {
         }
     }
     for mark in &gone {
+        destroy_mark(mark);
+    }
+}
+
+/// The key of the marks on the mount namespace `ns`.
+fn ns_key(ns: &MountNamespace) -> (u8, usize) {
+    (3, core::ptr::from_ref(ns) as usize)
+}
+
+/// The mount event `mask` of the mount with the unique ID `mnt_id` in the namespace `ns`, as
+/// `fsnotify_mnt` of Linux. Only the marks on `ns` get it.
+pub fn mnt_event(ns: &MountNamespace, mask: u32, mnt_id: u64) {
+    if PATH_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut found = MARKS.lock().get(&ns_key(ns)).cloned().unwrap_or_default();
+    while let Some(first) = found.first() {
+        let group = first.group.clone();
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            found.into_iter().partition(|m| Arc::ptr_eq(&m.group, &group));
+        found = rest;
+        group.handle_mnt(mask, mnt_id, &mine);
+    }
+}
+
+/// The mount namespace `ns` stops: its marks go away, as `fsnotify_mntns_delete` of Linux.
+pub fn mntns_delete(ns: &MountNamespace) {
+    if none() {
+        return;
+    }
+    let marks = MARKS.lock().get(&ns_key(ns)).cloned().unwrap_or_default();
+    for mark in &marks {
         destroy_mark(mark);
     }
 }

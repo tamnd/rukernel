@@ -883,6 +883,13 @@ pub struct MountNamespace {
     owner: Arc<UserNs>,
 }
 
+impl Drop for MountNamespace {
+    /// The marks on the name space go away, as `fsnotify_mntns_delete` of Linux.
+    fn drop(&mut self) {
+        crate::notify::mntns_delete(self);
+    }
+}
+
 /// The waits of `poll` on `/proc/PID/mounts` wait here for a change of the mounts of a name
 /// space, as `poll` of `struct mnt_namespace` of Linux. One queue serves each name space.
 static NS_POLL: WaitQueue = WaitQueue::new();
@@ -1107,6 +1114,7 @@ impl MountNamespace {
         self.mounts.lock().push(mount.clone());
         ATTACHED.lock().push(Arc::downgrade(mount));
         self.touch();
+        crate::notify::mnt_event(self, crate::notify::mask::MNT_ATTACH, mount.unique_id());
     }
 
     /// Counts a change of the mounts and wakes the waits of `poll`, as `touch_mnt_namespace` of
@@ -1213,6 +1221,7 @@ impl MountNamespace {
         mounts.push(mount.clone());
         drop(mounts);
         self.touch();
+        crate::notify::mnt_event(self, crate::notify::mask::MNT_MOVE, mount.unique_id());
         Ok(())
     }
 
@@ -1250,6 +1259,9 @@ impl MountNamespace {
         mounts.insert(index, mount.clone());
         drop(mounts);
         self.touch();
+        // Only the mount of `from` moves for the mount events, as `attach_recursive_mnt` of
+        // Linux.
+        crate::notify::mnt_event(self, crate::notify::mask::MNT_MOVE, mount.unique_id());
         Ok(())
     }
 
@@ -1298,6 +1310,7 @@ impl MountNamespace {
         mount.change_propagation(PropagationType::Private);
         *mount.ns.lock() = Weak::new();
         ATTACHED.lock().retain(|m| !core::ptr::eq(m.as_ptr(), Arc::as_ptr(mount)));
+        crate::notify::mnt_event(self, crate::notify::mask::MNT_DETACH, mount.unique_id());
         true
     }
 
@@ -1348,6 +1361,9 @@ impl MountNamespace {
         mounts.push(root_mnt.clone());
         drop(mounts);
         self.touch();
+        // The old root moves first, then the new root, as `path_pivot_root` of Linux.
+        crate::notify::mnt_event(self, crate::notify::mask::MNT_MOVE, root_mnt.unique_id());
+        crate::notify::mnt_event(self, crate::notify::mask::MNT_MOVE, new_mnt.unique_id());
         Ok(())
     }
 

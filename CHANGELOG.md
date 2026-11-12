@@ -6,6 +6,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- fanotify has `FAN_REPORT_MNT`. A group with this flag marks a mount namespace with `FAN_MARK_MNTNS` and gets `FAN_MNT_ATTACH` and `FAN_MNT_DETACH` when a mount of the namespace is attached, moved or unmounted. Each event has a `FAN_EVENT_INFO_TYPE_MNT` record with the unique mount ID, and the errors and the record layout are the same as in Linux. The `init` boot test checks the errors, the fdinfo line and the events of mount, move and umount. (#539)
 - The `sdbpf` boot test runs the unit tests test-bpf-devices, test-bpf-firewall and test-bpf-foreign-programs of systemd. They attach cgroup programs with `BPF_PROG_ATTACH`, `BPF_PROG_DETACH`, `BPF_PROG_QUERY` and `BPF_LINK_CREATE`, and all three pass. `RK_SYSTEMD_PACKAGES` of tools/systemd/build.sh adds packages to the systemd tree, and this test needs `systemd-tests` and `iputils-ping` (#537).
 
 ## [0.5.23] - 2026-11-12
