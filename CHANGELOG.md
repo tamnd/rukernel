@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- A socket has the owner and the mode of its inode, as sockfs of Linux. A new socket has the file system user and group IDs of the process and the mode 0777. `fchown`, `fchmod` and `fchownat` with `AT_EMPTY_PATH` change them. After the release of the socket, a change of the owner gives `ENOENT`, as `sockfs_setattr` of Linux for CVE-2019-8912. LTP af_alg07 tests this (#541).
+
 ## [0.5.25] - 2026-11-13
 
 ### Added

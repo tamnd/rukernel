@@ -38,7 +38,7 @@ pub mod veth;
 
 pub use options::{Options, Timeout};
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -310,11 +310,21 @@ fn sock_dev() -> u64 {
     }
 }
 
+/// The owner, the group and the permission bits of the inode of a socket, as the inode of sockfs
+/// of Linux.
+#[derive(Clone, Copy)]
+struct SockAttr {
+    uid: u32,
+    gid: u32,
+    mode: u32,
+}
+
 /// The operations of the file of a socket.
 struct SocketFile {
     socket: Arc<dyn Socket>,
     /// The socket blob of the security modules, as `sk_security` of Linux.
     security: rk_vfs::security::Blob,
+    attr: SpinLock<SockAttr>,
 }
 
 impl Drop for SocketFile {
@@ -377,11 +387,14 @@ impl FileOps for SocketFile {
     }
 
     fn metadata(&self) -> Option<Metadata> {
+        let attr = *self.attr.lock();
         Some(Metadata {
             dev: sock_dev(),
             ino: self.socket.ino(),
-            mode: S_IFSOCK | 0o777,
+            mode: S_IFSOCK | attr.mode,
             nlink: 1,
+            uid: attr.uid,
+            gid: attr.gid,
             blksize: 4096,
             ..Metadata::default()
         })
@@ -392,10 +405,53 @@ impl FileOps for SocketFile {
     }
 }
 
-/// Makes the file of `socket`. `flags` can hold `O_NONBLOCK`.
-pub fn new_file(socket: Arc<dyn Socket>, flags: u32) -> Arc<File> {
+/// Makes the file of `socket`. `flags` can hold `O_NONBLOCK`. The inode gets the mode 0777 and
+/// the owner `owner`, a user ID and a group ID, as `sock_alloc` of Linux gives it the file system
+/// IDs of the caller.
+pub fn new_file(socket: Arc<dyn Socket>, flags: u32, owner: (u32, u32)) -> Arc<File> {
     let security = rk_vfs::security::Blob::sock();
-    File::with_ops(Arc::new(SocketFile { socket, security }), None, O_RDWR | flags)
+    let attr = SpinLock::new(SockAttr { uid: owner.0, gid: owner.1, mode: 0o777 });
+    File::with_ops(Arc::new(SocketFile { socket, security, attr }), None, O_RDWR | flags)
+}
+
+/// The inode of a socket file, for a change of its attributes. It does not keep the socket open,
+/// as a path of Linux keeps the inode of sockfs but not the file. The socket closes with its last
+/// file, as `sock_close` of Linux.
+pub struct SockInode(Weak<dyn FileOps>);
+
+impl SockInode {
+    /// Gives the inode of `file`, or `None` if the file is not a socket.
+    pub fn of(file: &File) -> Option<Self> {
+        file.ops().as_any()?.downcast_ref::<SocketFile>()?;
+        Some(Self(Arc::downgrade(file.ops())))
+    }
+
+    /// Changes the mode, the owner and the group, as `sockfs_setattr` of Linux. The other
+    /// attributes of `attr` have no effect.
+    ///
+    /// # Errors
+    ///
+    /// Gives `ENOENT` for a change of the owner after the socket closed, as the release of a
+    /// socket sets `sock->sk` to NULL in Linux (CVE-2019-8912).
+    pub fn set_attr(&self, attr: &rk_vfs::inode::SetAttr) -> Result<()> {
+        let Some(ops) = self.0.upgrade() else {
+            return if attr.uid.is_some() { Err(Errno::ENOENT) } else { Ok(()) };
+        };
+        let Some(file) = ops.as_any().and_then(|a| a.downcast_ref::<SocketFile>()) else {
+            return Ok(());
+        };
+        let mut a = file.attr.lock();
+        if let Some(mode) = attr.mode {
+            a.mode = mode & 0o7777;
+        }
+        if let Some(uid) = attr.uid {
+            a.uid = uid;
+        }
+        if let Some(gid) = attr.gid {
+            a.gid = gid;
+        }
+        Ok(())
+    }
 }
 
 /// Gives the socket blob of the security modules of `file`, or `None` if the file is not a
