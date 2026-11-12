@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.24] - 2026-11-12
+
 ### Added
 
 - fanotify has `FAN_REPORT_MNT`. A group with this flag marks a mount namespace with `FAN_MARK_MNTNS` and gets `FAN_MNT_ATTACH` and `FAN_MNT_DETACH` when a mount of the namespace is attached, moved or unmounted. Each event has a `FAN_EVENT_INFO_TYPE_MNT` record with the unique mount ID, and the errors and the record layout are the same as in Linux. The `init` boot test checks the errors, the fdinfo line and the events of mount, move and umount. (#539)
@@ -1589,6 +1591,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.24]: https://github.com/tamnd/rukernel/compare/v0.5.23...v0.5.24
 [0.5.23]: https://github.com/tamnd/rukernel/compare/v0.5.22...v0.5.23
 [0.5.22]: https://github.com/tamnd/rukernel/compare/v0.5.21...v0.5.22
 [0.5.21]: https://github.com/tamnd/rukernel/compare/v0.5.20...v0.5.21
