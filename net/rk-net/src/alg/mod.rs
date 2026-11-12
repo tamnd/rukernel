@@ -5,7 +5,8 @@
 //! `setsockopt` with the level `SOL_ALG` and `ALG_SET_KEY` sets the key. `accept` on the bound
 //! socket gives an operation socket. The program writes the data to the operation socket and
 //! reads the result from it. The module `hash` has the operation sockets of the type `hash`, as
-//! crypto/algif_hash.c of Linux.
+//! crypto/algif_hash.c of Linux, and the module `skcipher` has the operation sockets of the type
+//! `skcipher`, as crypto/algif_skcipher.c of Linux.
 //!
 //! The algorithms come from the crate `rk_crypto`. A program can bind only the algorithms of the
 //! allow list of the type, as `af_alg_check_restriction` of Linux with `crypto.af_alg_restrict`
@@ -17,6 +18,7 @@
 //! key of the bound socket cannot change while it has an operation socket with a key.
 
 mod hash;
+mod skcipher;
 #[cfg(test)]
 mod tests;
 
@@ -84,6 +86,7 @@ fn check_restriction(name: &str, list: AllowList) -> Result<()> {
 /// The algorithm of a bound socket, as the `private` of a `struct alg_sock` of Linux.
 enum Tfm {
     Hash(Box<dyn rk_crypto::Hash>),
+    Skcipher(Box<dyn rk_crypto::Skcipher>),
 }
 
 impl Tfm {
@@ -91,6 +94,7 @@ impl Tfm {
     fn bind(kind: &str, name: &str) -> Result<Self> {
         match kind {
             "hash" => hash::bind(name).map(Self::Hash),
+            "skcipher" => skcipher::bind(name).map(Self::Skcipher),
             _ => Err(Errno::ENOENT),
         }
     }
@@ -98,12 +102,14 @@ impl Tfm {
     fn needs_key(&self) -> bool {
         match self {
             Self::Hash(h) => h.needs_key(),
+            Self::Skcipher(c) => c.needs_key(),
         }
     }
 
     fn set_key(&mut self, key: &[u8]) -> Result<()> {
         match self {
             Self::Hash(h) => h.set_key(key),
+            Self::Skcipher(c) => c.set_key(key),
         }
     }
 }
@@ -123,12 +129,14 @@ struct Bound(SpinLock<Shared>);
 /// A new operation socket.
 enum Child {
     Hash(Arc<hash::HashSocket>),
+    Skcipher(Arc<skcipher::SkcipherSocket>),
 }
 
 impl Child {
     fn socket(self) -> Arc<dyn Socket> {
         match self {
             Self::Hash(s) => s,
+            Self::Skcipher(s) => s,
         }
     }
 }
@@ -144,6 +152,9 @@ impl Bound {
         let nokey = tfm.needs_key();
         let child = match tfm {
             Tfm::Hash(h) => Child::Hash(hash::HashSocket::new(self.clone(), h.box_clone(), nokey)),
+            Tfm::Skcipher(c) => {
+                Child::Skcipher(skcipher::SkcipherSocket::new(self.clone(), c.box_clone(), nokey))
+            }
         };
         s.children += 1;
         if nokey {

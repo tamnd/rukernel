@@ -80,8 +80,9 @@ impl HashSocket {
             return Ok(());
         }
         self.bound.check_key(|tfm| {
-            let Tfm::Hash(h) = tfm;
-            ctx.hash = h.box_clone();
+            if let Tfm::Hash(h) = tfm {
+                ctx.hash = h.box_clone();
+            }
         })?;
         ctx.nokey = false;
         Ok(())
@@ -122,7 +123,10 @@ impl Socket for HashSocket {
             self.check_key(&mut ctx)?;
             ctx.more.then(|| ctx.hash.box_clone())
         };
-        let Child::Hash(child) = self.bound.accept()?;
+        // The bound socket of a hash socket has a hash.
+        let Child::Hash(child) = self.bound.accept()? else {
+            return Err(Errno::EINVAL);
+        };
         if let Some(hash) = state {
             let mut c = child.ctx.lock();
             c.hash = hash;

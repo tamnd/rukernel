@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The `AF_ALG` sockets with the type `skcipher`, as crypto/algif_skcipher.c of Linux, for `ecb(aes)`, `cbc(aes)`, `ctr(aes)` and `xts(aes)` of `rk-crypto`. A `sendmsg` gives the operation with `ALG_SET_OP` and the IV with `ALG_SET_IV` in control messages, and adds the data to the queue. A `recv` encrypts or decrypts the data of the queue in blocks. With `MSG_MORE`, the operation continues in the next `send`, and the IV goes from one `recv` to the next. libcryptsetup uses these sockets to open a LUKS2 key slot without dm-crypt (#541).
+
 ## [0.5.24] - 2026-11-12
 
 ### Added
