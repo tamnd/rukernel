@@ -67,12 +67,13 @@ pub(super) use self::nft_flowtable::{
     NFTA_FLOWTABLE_MAX, NftFlowtable, nf_tables_dump_flowtable, nf_tables_getflowtable,
 };
 pub(super) use self::nft_objects::{
-    NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftObj, nf_tables_dump_obj, nf_tables_getobj, nft_obj_commit,
-    nft_setelem_parse_obj,
+    NFT_OBJECT_MAX, NFTA_OBJ_MAX, NftObj, NftObjState, nf_tables_dump_obj, nf_tables_getobj,
+    nft_obj_commit, nft_set_exprs_dump, nft_set_exprs_parse, nft_setelem_parse_obj,
 };
 use self::nft_objects::{
-    NFTA_OBJREF_SET_ID, NFTA_OBJREF_SET_NAME, NftObjState, NftQuota, nft_obj_eval, nft_objref_init,
-    nft_quota_eval, nft_quota_init,
+    NFTA_OBJREF_SET_ID, NFTA_OBJREF_SET_NAME, NftConnlimit, NftQuota, nft_connlimit_eval,
+    nft_connlimit_init, nft_obj_eval, nft_objref_init, nft_quota_eval, nft_quota_init,
+    nft_set_elem_update_expr,
 };
 
 // The attributes of an expression, `NFTA_EXPR_*`.
@@ -282,6 +283,8 @@ pub(super) enum NftExpr {
     Limit(Arc<NftLimit>),
     /// `quota`, as nft_quota.c. The copies of the rule share the bytes.
     Quota(Arc<NftQuota>),
+    /// `connlimit`, as nft_connlimit.c. The copies of the rule share the connections.
+    Connlimit(Arc<NftConnlimit>),
     /// `objref` with the object `obj` (a handle), as nft_objref.c.
     Objref { obj: u64 },
     /// `flow_offload`, as nft_flow_offload.c, with the handle of its flowtable.
@@ -313,10 +316,12 @@ pub(super) struct NftDynset {
     /// The timeout in milliseconds of the new elements, or 0 for the one of the set.
     timeout: u64,
     invert: bool,
+    /// The expressions that a new element gets a copy of: the ones of `dynset`, or else the
+    /// ones of the set.
+    exprs: Vec<NftObjState>,
 }
 
-/// Reads a `dynset` expression, as `nft_dynset_init` of Linux. The expressions of the
-/// elements come later.
+/// Reads a `dynset` expression, as `nft_dynset_init` of Linux.
 fn nft_dynset_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
     let a = Attrs::parse(data, NFTA_DYNSET_MAX);
     let name = a.str(NFTA_DYNSET_SET_NAME).map(|n| n.split(|&c| c == 0).next().unwrap_or(n));
@@ -357,12 +362,24 @@ fn nft_dynset_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
     } else {
         None
     };
-    if a.has(NFTA_DYNSET_EXPR) || a.has(NFTA_DYNSET_EXPRESSIONS) {
-        if set.flags & NFT_SET_EVAL == 0 {
-            return Err(Errno::EINVAL);
-        }
-        return Err(Errno::EOPNOTSUPP);
+    if (a.has(NFTA_DYNSET_EXPR) || a.has(NFTA_DYNSET_EXPRESSIONS)) && set.flags & NFT_SET_EVAL == 0
+    {
+        return Err(Errno::EINVAL);
     }
+    // The expressions of the new elements, as `nft_dynset_expr_alloc` of Linux. One expression
+    // must be the first of the set, and the set must have no other one.
+    let exprs = match nft_set_exprs_parse(
+        table,
+        set.flags,
+        &a,
+        (NFTA_DYNSET_EXPR, NFTA_DYNSET_EXPRESSIONS),
+        flags & NFT_DYNSET_F_EXPR != 0,
+        &set.exprs,
+    )? {
+        Some(e) if e.len() == 1 && set.exprs.len() > 1 => return Err(Errno::EOPNOTSUPP),
+        Some(e) => e,
+        None => set.exprs.iter().map(NftObjState::fresh).collect(),
+    };
     Ok(NftExpr::Dynset(NftDynset {
         set: set.handle,
         op,
@@ -371,6 +388,7 @@ fn nft_dynset_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
         sreg_data,
         timeout,
         invert: flags & NFT_DYNSET_F_INV != 0,
+        exprs,
     }))
 }
 
@@ -661,6 +679,7 @@ pub(super) fn nf_tables_expr_parse(
         b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
         b"quota" => Ok(NftExpr::Quota(nft_quota_init(data)?)),
+        b"connlimit" => nft_connlimit_expr_init(table, data),
         b"objref" => nft_objref_init(table, data),
         b"flow_offload" => nft_flow_offload_init(table, data),
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
@@ -672,6 +691,15 @@ pub(super) fn nf_tables_expr_parse(
         }
         _ => Err(Errno::ENOENT),
     }
+}
+
+/// Reads a `connlimit` expression, as `nft_connlimit_init` of Linux: it needs connection
+/// tracking.
+fn nft_connlimit_expr_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
+    if !matches!(table.family, NFPROTO_IPV4 | NFPROTO_IPV6 | NFPROTO_INET) {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    Ok(NftExpr::Connlimit(nft_connlimit_init(data)?))
 }
 
 /// Reads a `ct` expression, as `nft_ct_get_init` and `nft_ct_set_init` of Linux. The keys that
@@ -922,7 +950,9 @@ pub(super) fn nft_rule_needs_ct(exprs: &[NftExpr]) -> bool {
                 | NftExpr::Masq { .. }
                 | NftExpr::Redir { .. }
                 | NftExpr::FlowOffload { .. }
+                | NftExpr::Connlimit(_)
         ) || matches!(e, NftExpr::Xt(x) if x.needs_ct())
+            || matches!(e, NftExpr::Dynset(d) if d.exprs.iter().any(NftObjState::is_connlimit))
     })
 }
 
@@ -1055,6 +1085,10 @@ struct ProgSet {
     ranges: Vec<(Vec<u8>, Vec<u8>, bool, ProgData)>,
     /// The catch-all element, for a key that no other element has.
     catchall: Option<ProgData>,
+    /// The stateful expressions of the elements that have them, by the start of their key,
+    /// and of the catch-all element.
+    exprs: BTreeMap<Vec<u8>, Vec<NftObjState>>,
+    catchall_exprs: Vec<NftObjState>,
     /// The time in nanoseconds when the elements with a timeout expire, by the start of their
     /// key, and of the catch-all element. Empty for a set with no timeouts.
     expires: BTreeMap<Vec<u8>, u64>,
@@ -1083,6 +1117,16 @@ impl ProgSet {
     /// The data of the element of `key`, as the `lookup` of the backends of sets of Linux. An
     /// element that has expired does not match.
     fn find(&self, key: &[u8]) -> Option<ProgData> {
+        self.find_elem(key).map(|(d, _)| d)
+    }
+
+    /// The expressions of the element with the start `start`.
+    fn exprs_of(&self, start: &[u8]) -> Vec<NftObjState> {
+        self.exprs.get(start).cloned().unwrap_or_default()
+    }
+
+    /// The data and the stateful expressions of the element of `key`.
+    fn find_elem(&self, key: &[u8]) -> Option<(ProgData, Vec<NftObjState>)> {
         let now = if self.expires.is_empty() && self.catchall_expires == 0 && self.dynamic.is_none()
         {
             0
@@ -1093,27 +1137,29 @@ impl ProgSet {
             self.catchall
                 .clone()
                 .filter(|_| self.catchall_expires == 0 || now < self.catchall_expires)
+                .map(|d| (d, self.catchall_exprs.clone()))
         };
+        let committed = |k: &[u8]| self.keys.get(k).map(|d| (d.clone(), self.exprs_of(k)));
         if let Some(d) = &self.dynamic {
             match d.0.lock().elems.get(key) {
-                Some(DynElem::Add(e)) if !e.expired(now) => return Some(prog_data(e)),
+                Some(DynElem::Add(e)) if !e.expired(now) => {
+                    return Some((prog_data(e), e.exprs.clone()));
+                }
                 Some(&DynElem::Refresh(x)) if now < x => {
-                    return self.keys.get(key).cloned().or_else(catchall);
+                    return committed(key).or_else(catchall);
                 }
                 Some(_) => return catchall(),
                 None => {}
             }
         }
         let live = |k: &[u8]| self.expires.get(k).is_none_or(|&t| now < t);
-        self.keys
-            .get(key)
+        committed(key)
             .filter(|_| live(key))
-            .cloned()
             .or_else(|| {
                 self.ranges.iter().find_map(|(s, e, with_end, d)| {
                     let inside = s.as_slice() <= key
                         && (key < e.as_slice() || (*with_end && key == e.as_slice()));
-                    (inside && live(s)).then(|| d.clone())
+                    (inside && live(s)).then(|| (d.clone(), self.exprs_of(s)))
                 })
             })
             .or_else(catchall)
@@ -1123,9 +1169,9 @@ impl ProgSet {
 /// Runs `dynset` on the set `set`, as `nft_dynset_eval` of Linux: adds the key of the
 /// registers, updates the expiration of its element, or removes it. A key that is not there
 /// and does not fit in the set ends the rule, and with `NFT_DYNSET_F_INV` a key that is there
-/// or that fits.
-fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) {
-    let Some(dy) = &set.dynamic else { return };
+/// or that fits. Gives the stateful expressions of the element that the packet must run.
+fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) -> Vec<NftObjState> {
+    let Some(dy) = &set.dynamic else { return Vec::new() };
     let key = regs.data[d.sreg_key..d.sreg_key + d.klen].to_vec();
     let now = super::nft_now_ns();
     let mut g = dy.0.lock();
@@ -1147,10 +1193,15 @@ fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) {
             g.elems.insert(key, DynElem::Del);
             g.delta -= 1;
         }
-        return;
+        return Vec::new();
     }
+    let mut exprs = Vec::new();
     let ok = match present {
         Some(t) => {
+            exprs = match g.elems.get(&key) {
+                Some(DynElem::Add(e)) => e.exprs.clone(),
+                _ => set.exprs_of(&key),
+            };
             // An update starts the timeout of the element again.
             if d.op == NFT_DYNSET_OP_UPDATE && t != 0 {
                 let t = if d.timeout != 0 { d.timeout } else { t };
@@ -1168,6 +1219,7 @@ fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) {
         None => {
             let timeout = if d.timeout != 0 { d.timeout } else { set.timeout };
             let data = d.sreg_data.map(|(r, l)| NftData::Value(regs.data[r..r + l].to_vec()));
+            exprs = d.exprs.iter().map(NftObjState::fresh).collect();
             let elem = super::NftElem {
                 key_end: None,
                 data,
@@ -1175,6 +1227,7 @@ fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) {
                 udata: None,
                 timeout,
                 expires: if timeout == 0 { 0 } else { now.saturating_add(timeout * 1_000_000) },
+                exprs: exprs.clone(),
             };
             // An element of `dynset` that expired has its place in the count.
             if !matches!(g.elems.get(&key), Some(DynElem::Add(_))) {
@@ -1188,6 +1241,7 @@ fn nft_dynset_eval(d: &NftDynset, set: &ProgSet, regs: &mut NftRegs) {
     if ok == d.invert {
         regs.verdict = NFT_BREAK;
     }
+    exprs
 }
 
 /// The program of a base chain: the chains that it can reach, the first is the base chain.
@@ -1249,6 +1303,13 @@ fn prog_set(table: &NftTable, s: usize, chains: &mut ProgChains) -> ProgSet {
             p.catchall_expires = e.expires;
         } else {
             p.expires.insert(k.key.clone(), e.expires);
+        }
+    }
+    for (k, e) in set.elems.iter().filter(|(_, e)| !e.exprs.is_empty()) {
+        if k.catchall {
+            p.catchall_exprs = e.exprs.clone();
+        } else if !k.end {
+            p.exprs.insert(k.key.clone(), e.exprs.clone());
         }
     }
     let mut data = |e: &super::NftElem| match &e.data {
@@ -1378,6 +1439,21 @@ impl NftRegs {
     }
 }
 
+/// Runs the stateful expressions of the element that a `lookup` or a `dynset` found, after
+/// the verdict that it gave, as `nft_set_elem_update_expr` of Linux. An expression that ends
+/// the rule changes the verdict.
+fn nft_elem_exprs_eval(exprs: &[NftObjState], regs: &mut NftRegs, skb: &NetBuf) {
+    if exprs.is_empty() {
+        return;
+    }
+    let verdict = regs.verdict;
+    regs.verdict = NFT_CONTINUE;
+    nft_set_elem_update_expr(exprs, regs, skb);
+    if regs.verdict != NFT_BREAK {
+        regs.verdict = verdict;
+    }
+}
+
 /// Runs an expression.
 fn nft_eval(
     e: &ProgExpr,
@@ -1393,21 +1469,26 @@ fn nft_eval(
             regs.chain = *chain;
         }
         ProgExpr::Lookup { set, sreg, len, invert, dreg } => {
-            let found = prog.sets[*set].find(&regs.data[*sreg..*sreg + *len]);
+            let found = prog.sets[*set].find_elem(&regs.data[*sreg..*sreg + *len]);
             if found.is_some() == *invert {
                 regs.verdict = NFT_BREAK;
                 return;
             }
-            match (found, dreg) {
-                (Some(ProgData::Value(v)), Some(dreg)) => regs.store(*dreg, &v),
-                (Some(ProgData::Verdict { code, chain }), Some(_)) => {
+            let Some((data, exprs)) = found else { return };
+            match (data, dreg) {
+                (ProgData::Value(v), Some(dreg)) => regs.store(*dreg, &v),
+                (ProgData::Verdict { code, chain }, Some(_)) => {
                     regs.verdict = code;
                     regs.chain = chain;
                 }
                 _ => {}
             }
+            nft_elem_exprs_eval(&exprs, regs, skb);
         }
-        ProgExpr::Dynset { set, d } => nft_dynset_eval(d, &prog.sets[*set], regs),
+        ProgExpr::Dynset { set, d } => {
+            let exprs = nft_dynset_eval(d, &prog.sets[*set], regs);
+            nft_elem_exprs_eval(&exprs, regs, skb);
+        }
         ProgExpr::Obj(o) => nft_obj_eval(o, regs, skb),
         // As `nft_objref_map_eval` of Linux: a key with no element ends the rule.
         ProgExpr::ObjMap { set, sreg, len } => {
@@ -1580,6 +1661,7 @@ fn nft_eval(
             NftExpr::Range(r) => nft_range_eval(r, regs),
             NftExpr::Limit(l) => nft_limit_eval(l, regs, skb),
             NftExpr::Quota(q) => nft_quota_eval(q, regs, skb),
+            NftExpr::Connlimit(c) => nft_connlimit_eval(c, regs, skb),
             NftExpr::Log(l) => nft_log_eval(l, skb, state),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {
@@ -1968,6 +2050,7 @@ mod tests {
             sreg_data: None,
             timeout,
             invert: false,
+            exprs: Vec::new(),
         };
         let mut regs = NftRegs { verdict: NFT_CONTINUE, chain: 0, data: [0; NFT_REGS_LEN] };
         regs.data[R1..R1 + 2].copy_from_slice(&k(5));
@@ -1995,7 +2078,16 @@ mod tests {
             e(NftExpr::Payload { base: NFT_PAYLOAD_TRANSPORT_HEADER, offset: 2, len: 2, dreg: R1 });
         let dynset = |set, op, invert| ProgExpr::Dynset {
             set,
-            d: NftDynset { set: 0, op, sreg_key: R1, klen: 2, sreg_data: None, timeout: 0, invert },
+            d: NftDynset {
+                set: 0,
+                op,
+                sreg_key: R1,
+                klen: 2,
+                sreg_data: None,
+                timeout: 0,
+                invert,
+                exprs: Vec::new(),
+            },
         };
         let mut r0 = vec![load, lookup(0)];
         r0.push(verdict(NF_DROP, 0));

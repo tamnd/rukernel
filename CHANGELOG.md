@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The eBPF verifier gives the result of kernel/bpf/verifier.c of Linux for all programs of bpf/test_verifier of the socket filter and cgroup program types. It prunes the paths with equal states at the jump targets and refuses a loop that does not end, it refines the bounds of a register after `BPF_JSET` and after a `BPF_JMP32` that compares as 64 bits, and it checks the alignment of the pointers and the size of each context field as Linux, with the errors and the log messages of Linux in the same order. `bpf(BPF_PROG_TEST_RUN)` runs a program on a packet or a context from user space. The kselftest boot test runs bpf/test_verifier, and tools/kselftest/bpf.md gives the result: 281 passed and 0 failed (#537).
+- The stateful expressions of the sets of nf_tables, as `nft_set_elem_expr_alloc` of Linux: `NFTA_SET_EXPR` and `NFTA_SET_EXPRESSIONS` of a set, `NFTA_SET_ELEM_EXPR` and `NFTA_SET_ELEM_EXPRESSIONS` of an element, and `NFTA_DYNSET_EXPR` and `NFTA_DYNSET_EXPRESSIONS` of `dynset`. The expressions are `counter`, `quota`, `limit` and `connlimit`, two at most. Each element has its own state: a copy of the expressions of the set, or the ones that it gives with the same types. A `lookup` and a `dynset` run the expressions of the element that they find. The `connlimit` expression of nft_connlimit.c counts the connections that connection tracking still has (#542).
 
 ## [0.5.22] - 2026-11-12
 
