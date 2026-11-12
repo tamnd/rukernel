@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 rk-abi.workspace = true
+rk-crypto.workspace = true
 rk-frame.workspace = true
 rk-vfs.workspace = true
 

@@ -51,7 +51,7 @@ impl Block {
     /// `xts_init_crypt` of Linux.
     fn check(&self, len: usize) -> Result<()> {
         let ok = match self.mode {
-            Mode::Ecb | Mode::Cbc => len % BLOCK == 0,
+            Mode::Ecb | Mode::Cbc => len.is_multiple_of(BLOCK),
             Mode::Ctr => true,
             Mode::Xts => len >= BLOCK,
         };
@@ -164,7 +164,7 @@ impl Skcipher for Block {
         }
         if self.mode == Mode::Xts {
             // `xts_verify_key` of Linux: the two halves have the same size.
-            if key.len() % 2 != 0 {
+            if !key.len().is_multiple_of(2) {
                 return Err(Errno::EINVAL);
             }
             let (a, b) = key.split_at(key.len() / 2);

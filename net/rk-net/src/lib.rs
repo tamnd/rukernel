@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+pub mod alg;
 pub mod arp;
 pub mod buf;
 pub mod consts;
