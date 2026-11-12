@@ -85,6 +85,10 @@ impl Env for BpfEnv<'_, '_> {
         self.0.process().cred().uid
     }
 
+    fn helpers(&self) -> &dyn rk_bpf::helpers::HelperEnv {
+        &TaskHelperEnv
+    }
+
     fn cgroup_get_from_fd(&self, fd: u32) -> Result<rk_cgroup::CgId, Errno> {
         let file = self.fdget(fd as i32)?;
         let inode = file.inode().ok_or(Errno::EBADF)?;

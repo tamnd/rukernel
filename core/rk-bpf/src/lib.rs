@@ -21,6 +21,7 @@ pub mod link;
 pub mod map;
 pub mod prog;
 pub mod syscall;
+pub mod test_run;
 pub mod tnum;
 pub mod uapi;
 pub mod value;

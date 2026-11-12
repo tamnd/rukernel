@@ -6379,10 +6379,15 @@ static void test_bpf_prog(void)
 	errno = 0;
 	ok = bpf_prog_new(insns, 11, log, 16) == -1 && errno == ENOSPC && strlen(log) == 15;
 	check("a log that does not fit gives ENOSPC", ok);
+	/*
+	 * A jump to itself. With CAP_BPF, check_cfg of Linux allows a back edge, and do_check finds
+	 * the same state again at the jump. The NULL check is back, so that the store is valid.
+	 */
+	insns[6] = bpf_insn(0x15, 0, 0, 2, 0);
 	insns[10] = bpf_insn(0x05, 0, 0, -1, 0);
 	errno = 0;
 	ok = bpf_prog_new(insns, 11, log, sizeof(log)) == -1 && errno == EINVAL &&
-	     strstr(log, "back-edge from insn 10 to 10");
+	     strstr(log, "infinite loop detected at insn 10");
 	check("the verifier refuses a loop", ok);
 	close(map);
 }
@@ -6427,11 +6432,14 @@ static void test_bpf_interp(void)
 	close(sk[0]);
 	close(sk[1]);
 	close(prog);
-	/* A call to itself is a loop. */
+	/*
+	 * A call to itself. With CAP_BPF, check_cfg of Linux allows the back edge, and each call
+	 * makes a new frame until the limit of 8 frames.
+	 */
 	insns[10] = bpf_insn(0x85, 0, 1, 0, -2);
 	errno = 0;
-	ok = bpf_prog_new(insns, 12, log, sizeof(log)) == -1 && errno == EINVAL &&
-	     strstr(log, "back-edge from insn 10 to 9");
+	ok = bpf_prog_new(insns, 12, log, sizeof(log)) == -1 && errno == E2BIG &&
+	     strstr(log, "the call stack of 9 frames is too deep");
 	check("the verifier refuses recursion", ok);
 	close(map);
 }

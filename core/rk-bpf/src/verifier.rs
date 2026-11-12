@@ -5,15 +5,17 @@
 //! stops. This first verifier is smaller than the verifier of Linux, and it refuses what it
 //! cannot prove:
 //!
-//! - `check_cfg` refuses back edges, so there are no loops, and each instruction must be
-//!   reachable.
+//! - `check_cfg` refuses back edges for a loader without `CAP_BPF`, and each instruction must be
+//!   reachable. With `CAP_BPF`, `do_check` follows each round of a loop, so a loop must end
+//!   within `BPF_COMPLEXITY_LIMIT_INSNS`.
 //! - `do_check` follows each path of the program with the state of the registers and of the
 //!   stack. It does not prune states, so the number of paths is limited by
 //!   `BPF_COMPLEXITY_LIMIT_INSNS`.
 //! - A scalar has a tnum and the unsigned and signed bounds. A pointer is to the context, to the
 //!   stack, to a map, or to a map value that can be NULL until the program checks it.
 //! - A call of a function of the program gets a new frame, and the verifier checks the function
-//!   again at each call, as Linux does for a static function. Recursion is a back edge.
+//!   again at each call, as Linux does for a static function. Recursion stops at the limit of
+//!   the frames.
 //! - `BPF_LD_[ABS|IND]` and tail calls are allowed only in the main program, because rukernel
 //!   has no BTF. Kernel functions and callbacks are refused.
 //!
@@ -30,6 +32,7 @@ use crate::tnum::{TNUM_UNKNOWN, Tnum};
 use crate::uapi::attach_type::*;
 use crate::uapi::flags::{BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG};
 use crate::uapi::map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PROG_ARRAY};
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -52,6 +55,11 @@ pub const BPF_LOG_MASK: u32 = BPF_LOG_LEVEL1 | BPF_LOG_LEVEL2 | BPF_LOG_STATS | 
 
 /// The most states that wait to be checked, `BPF_COMPLEXITY_LIMIT_JMP_SEQ` of Linux.
 const BPF_COMPLEXITY_LIMIT_JMP_SEQ: usize = 8192;
+/// The most states that `do_check` keeps for the pruning. A state is about 5 KiB.
+const MAX_KEPT_STATES: usize = 1024;
+/// The most states that `do_check` keeps for one instruction. The states of a loop are all
+/// different, and each round compares the state with each kept state.
+const MAX_KEPT_STATES_PER_INSN: usize = 16;
 /// The largest offset of a pointer, `BPF_MAX_VAR_OFF` of Linux.
 const BPF_MAX_VAR_OFF: i64 = 1 << 29;
 
@@ -241,12 +249,12 @@ impl StackSlot {
 }
 
 /// The state of a path, `struct bpf_verifier_state` of Linux. `regs` and `stack` are of the
-/// frame that runs now.
-#[derive(Clone, Debug)]
+/// frame that runs now. The registers and the stack are on the heap, because the kernel stack
+/// is small. A debug build keeps many copies of a state on the stack when the state is large.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
-    regs: [Reg; MAX_BPF_REG],
-    /// The slots of the stack. They are on the heap, because a state is large and the kernel
-    /// stack is small.
+    regs: Box<[Reg; MAX_BPF_REG]>,
+    /// The slots of the stack.
     stack: Vec<StackSlot>,
     /// The function of the program that runs now.
     subprog: usize,
@@ -255,9 +263,9 @@ struct State {
 }
 
 /// The state of a caller, `struct bpf_func_state` of Linux.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Frame {
-    regs: [Reg; MAX_BPF_REG],
+    regs: Box<[Reg; MAX_BPF_REG]>,
     stack: Vec<StackSlot>,
     subprog: usize,
     /// The instruction of the call.
@@ -301,10 +309,24 @@ const BPF_MAX_SUBPROGS: usize = 256;
 const MAX_USED_MAPS: usize = 64;
 /// `ENOTSUPP` of include/linux/errno.h. Linux gives this number of the kernel to user space
 /// when the kernel cannot call a kernel function.
-const ENOTSUPP: Errno = match Errno::new(524) {
-    Some(e) => e,
-    None => Errno::EINVAL,
-};
+const ENOTSUPP: Errno = Errno::ENOTSUPP;
+
+/// Shows a tnum as `tnum_strn` of Linux, which prints with `%#llx`: 0 is `0`, and other numbers
+/// have `0x`.
+struct TnumStr(Tnum);
+
+impl core::fmt::Display for TnumStr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let hex = |f: &mut core::fmt::Formatter<'_>, v: u64| {
+            if v == 0 { f.write_str("0") } else { write!(f, "{v:#x}") }
+        };
+        f.write_str("(")?;
+        hex(f, self.0.value)?;
+        f.write_str("; ")?;
+        hex(f, self.0.mask)?;
+        f.write_str(")")
+    }
+}
 
 /// The verifier, `struct bpf_verifier_env` of Linux.
 struct Env<'a> {
@@ -314,12 +336,18 @@ struct Env<'a> {
     expected_attach_type: u32,
     bpf_capable: bool,
     allow_ptr_leaks: bool,
+    /// The loader gave `BPF_F_STRICT_ALIGNMENT`, `strict_alignment` of Linux.
+    strict_alignment: bool,
+    /// The access of an atomic instruction must be aligned, `strict_alignment_once` of Linux.
+    strict_once: bool,
     log: &'a mut BpfVerifierLog,
     enforce_expected_attach_type: bool,
     id_gen: u32,
     insn_processed: u32,
     /// The functions of the program, ordered by their first instruction.
     subprogs: Vec<Subprog>,
+    /// The type of the pointer of each load or store, `insn_aux_data[].ptr_type` of Linux.
+    ptr_types: Vec<RegType>,
 }
 
 /// What the program does with a memory access.
@@ -351,6 +379,9 @@ pub struct VerifierOpts {
     pub bpf_capable: bool,
     /// The loader has `CAP_PERFMON`, so a program can show addresses, `allow_ptr_leaks` of Linux.
     pub allow_ptr_leaks: bool,
+    /// Each access of memory must be aligned to its size, as `BPF_F_STRICT_ALIGNMENT`. x86_64
+    /// and arm64 have efficient unaligned access, so this is false without the flag.
+    pub strict_alignment: bool,
 }
 
 /// Tells if the verifier knows the program type, as `find_prog_type` of Linux.
@@ -383,11 +414,14 @@ pub fn bpf_check(
             expected_attach_type: opts.expected_attach_type,
             bpf_capable: opts.bpf_capable,
             allow_ptr_leaks: opts.allow_ptr_leaks,
+            strict_alignment: opts.strict_alignment,
+            strict_once: false,
             log: &mut *log,
             enforce_expected_attach_type: false,
             id_gen: 0,
             insn_processed: 0,
             subprogs: Vec::new(),
+            ptr_types: Vec::new(),
         };
         let r = env
             .add_subprogs()
@@ -410,11 +444,14 @@ pub fn bpf_check(
         expected_attach_type: opts.expected_attach_type,
         bpf_capable: opts.bpf_capable,
         allow_ptr_leaks: opts.allow_ptr_leaks,
+        strict_alignment: opts.strict_alignment,
+        strict_once: false,
         log,
         enforce_expected_attach_type: false,
         id_gen: 0,
         insn_processed: 0,
         subprogs,
+        ptr_types: vec![RegType::NotInit; insns.len()],
     };
     let r = env
         .check_cfg()
@@ -851,7 +888,7 @@ impl Env<'_> {
                 }
                 let w = w as usize;
                 if half[w] {
-                    verbose!(self, "jump into the middle of ldimm64 insn {}\n", w);
+                    verbose!(self, "jump into the middle of ldimm64 insn {}\n", w - 1);
                     return Err(Errno::EINVAL);
                 }
                 match state[w] {
@@ -859,6 +896,10 @@ impl Env<'_> {
                         state[w] = DISCOVERED;
                         stack.push((w, 0));
                     }
+                    // A loader with `CAP_BPF` can have loops. `do_check` follows each round of a
+                    // loop, and refuses a loop that does not end within
+                    // `BPF_COMPLEXITY_LIMIT_INSNS`.
+                    DISCOVERED if self.bpf_capable => {}
                     DISCOVERED => {
                         verbose!(self, "back-edge from insn {} to {}\n", t, w);
                         return Err(Errno::EINVAL);
@@ -881,14 +922,40 @@ impl Env<'_> {
 
     /// Follows each path of the program, as `do_check` of Linux.
     fn do_check(&mut self) -> Result<()> {
-        let mut regs = [Reg::NOT_INIT; MAX_BPF_REG];
+        let mut regs = Box::new([Reg::NOT_INIT; MAX_BPF_REG]);
         regs[1] = Reg::ptr(RegType::PtrToCtx);
         regs[BPF_REG_FP as usize] = Reg::ptr(RegType::PtrToStack);
         let st =
             State { regs, stack: vec![StackSlot::EMPTY; SLOTS], subprog: 0, callers: Vec::new() };
-        let mut pending: Vec<(usize, State)> = vec![(0, st)];
-        while let Some((mut pc, mut st)) = pending.pop() {
+        // The pruning of `is_state_visited` of Linux, with states that are equal. A state that
+        // is equal to a state of the same instruction gives the same result, so the path stops.
+        // When the earlier state is on the current path, the path is a loop that does not end.
+        // A path that waits in `pending` remembers the length of `path` when it starts, because
+        // the states after that length are of a branch that is complete when it starts.
+        let prune = self.prune_points();
+        let mut kept: Vec<Vec<(State, bool)>> = vec![Vec::new(); self.insns.len()];
+        let mut nkept = 0;
+        let mut path: Vec<(usize, usize)> = Vec::new();
+        let mut pending: Vec<(usize, State, usize)> = vec![(0, st, 0)];
+        while let Some((mut pc, mut st, depth)) = pending.pop() {
+            for (p, i) in path.drain(depth..) {
+                kept[p][i].1 = false;
+            }
             loop {
+                if prune[pc] {
+                    if let Some(&(_, on_path)) = kept[pc].iter().find(|(s, _)| *s == st) {
+                        if on_path {
+                            verbose!(self, "infinite loop detected at insn {}\n", pc);
+                            return Err(Errno::EINVAL);
+                        }
+                        break;
+                    }
+                    if nkept < MAX_KEPT_STATES && kept[pc].len() < MAX_KEPT_STATES_PER_INSN {
+                        kept[pc].push((st.clone(), true));
+                        path.push((pc, kept[pc].len() - 1));
+                        nkept += 1;
+                    }
+                }
                 self.insn_processed += 1;
                 if self.insn_processed > BPF_COMPLEXITY_LIMIT_INSNS {
                     verbose!(
@@ -912,7 +979,7 @@ impl Env<'_> {
                             );
                             return Err(Errno::E2BIG);
                         }
-                        pending.push((other, *other_state));
+                        pending.push((other, *other_state, path.len()));
                         pc = next;
                     }
                     Next::Exit => break,
@@ -922,8 +989,30 @@ impl Env<'_> {
         Ok(())
     }
 
+    /// The instructions where `do_check` compares the states, as `mark_prune_point` of Linux:
+    /// the targets of the jumps and the instructions after the conditional jumps.
+    fn prune_points(&self) -> Vec<bool> {
+        let n = self.insns.len();
+        let mut prune = vec![false; n];
+        for i in 0..n {
+            let class = bpf_class(self.insns[i].code);
+            if (class != BPF_JMP && class != BPF_JMP32)
+                || matches!(bpf_op(self.insns[i].code), BPF_EXIT | BPF_CALL)
+            {
+                continue;
+            }
+            for w in successors(self.insns, i).into_iter().flatten() {
+                if (0..n as i64).contains(&w) {
+                    prune[w as usize] = true;
+                }
+            }
+        }
+        prune
+    }
+
     /// Reads a register, as `check_reg_arg` with `SRC_OP` of Linux.
     fn read_reg(&mut self, st: &State, regno: u8) -> Result<Reg> {
+        self.check_regno(regno)?;
         let r = st.regs[regno as usize];
         if r.ty == RegType::NotInit {
             verbose!(self, "R{} !read_ok\n", regno);
@@ -934,6 +1023,7 @@ impl Env<'_> {
 
     /// Checks that a register can be written, as `check_reg_arg` with `DST_OP` of Linux.
     fn check_dst(&mut self, regno: u8) -> Result<()> {
+        self.check_regno(regno)?;
         if regno == BPF_REG_FP {
             verbose!(self, "frame pointer is read only\n");
             return Err(Errno::EACCES);
@@ -941,13 +1031,25 @@ impl Env<'_> {
         Ok(())
     }
 
-    fn do_insn(&mut self, pc: usize, st: &mut State) -> Result<Next> {
-        let insn = self.insns[pc];
-        if insn.dst_reg as usize >= MAX_BPF_REG || insn.src_reg as usize >= MAX_BPF_REG {
-            verbose!(self, "R{} is invalid\n", insn.dst_reg.max(insn.src_reg));
+    /// The first check of `check_reg_arg` of Linux.
+    fn check_regno(&mut self, regno: u8) -> Result<()> {
+        if regno as usize >= MAX_BPF_REG {
+            verbose!(self, "R{} is invalid\n", regno);
             return Err(Errno::EINVAL);
         }
-        match bpf_class(insn.code) {
+        Ok(())
+    }
+
+    fn do_insn(&mut self, pc: usize, st: &mut State) -> Result<Next> {
+        let insn = self.insns[pc];
+        let class = bpf_class(insn.code);
+        // `check_alu_op` checks the reserved fields before the registers. The other classes
+        // check the registers first here, because they use the register numbers at once.
+        if !matches!(class, BPF_ALU | BPF_ALU64) {
+            self.check_regno(insn.dst_reg)?;
+            self.check_regno(insn.src_reg)?;
+        }
+        match class {
             BPF_ALU | BPF_ALU64 => {
                 self.check_alu_op(insn, st)?;
                 Ok(Next::Go(pc + 1))
@@ -965,6 +1067,7 @@ impl Env<'_> {
                     Access::Read,
                     None,
                 )?;
+                self.save_aux_ptr_type(pc, src.ty)?;
                 st.regs[insn.dst_reg as usize] =
                     if bpf_mode(insn.code) == BPF_MEMSX { Reg::unknown() } else { v };
                 Ok(Next::Go(pc + 1))
@@ -990,6 +1093,7 @@ impl Env<'_> {
                     Access::Write,
                     Some((insn.src_reg, src)),
                 )?;
+                self.save_aux_ptr_type(pc, dst.ty)?;
                 Ok(Next::Go(pc + 1))
             }
             BPF_ST => {
@@ -1013,9 +1117,14 @@ impl Env<'_> {
                     Access::Write,
                     Some((u8::MAX, v)),
                 )?;
+                self.save_aux_ptr_type(pc, dst.ty)?;
                 Ok(Next::Go(pc + 1))
             }
             BPF_LD if insn.is_ld_imm64() => {
+                if insn.off != 0 {
+                    verbose!(self, "BPF_LD_IMM64 uses reserved fields\n");
+                    return Err(Errno::EINVAL);
+                }
                 self.check_dst(insn.dst_reg)?;
                 let next = self.insns[pc + 1];
                 st.regs[insn.dst_reg as usize] = match insn.src_reg {
@@ -1311,6 +1420,7 @@ impl Env<'_> {
         t: Access,
         val: Option<(u8, Reg)>,
     ) -> Result<Reg> {
+        self.check_ptr_alignment(reg, off, size)?;
         if let Some((vregno, v)) = val
             && v.is_pointer()
             && !self.allow_ptr_leaks
@@ -1405,6 +1515,49 @@ impl Env<'_> {
         }
     }
 
+    /// Keeps the pointer type of a load or a store, `save_aux_ptr_type` of Linux. An
+    /// instruction cannot access the context on one path and other memory on another path.
+    fn save_aux_ptr_type(&mut self, pc: usize, ty: RegType) -> Result<()> {
+        let prev = self.ptr_types[pc];
+        if prev == RegType::NotInit {
+            self.ptr_types[pc] = ty;
+        } else if ty != prev && (ty == RegType::PtrToCtx || prev == RegType::PtrToCtx) {
+            verbose!(self, "same insn cannot be used with different pointers\n");
+            return Err(Errno::EINVAL);
+        }
+        Ok(())
+    }
+
+    /// Checks the alignment of an access, `check_ptr_alignment` of Linux. An access of the stack
+    /// must always be aligned. An access of other memory must be aligned only with
+    /// `BPF_F_STRICT_ALIGNMENT`, or for an atomic instruction.
+    fn check_ptr_alignment(&mut self, reg: Reg, off: i16, size: u32) -> Result<()> {
+        let (desc, strict) = match reg.ty {
+            RegType::PtrToStack => ("stack ", true),
+            RegType::PtrToCtx => ("context ", self.strict_alignment),
+            RegType::PtrToMapValue => ("value ", self.strict_alignment),
+            _ => ("", self.strict_alignment),
+        };
+        if !(strict || self.strict_once) || size == 1 {
+            return Ok(());
+        }
+        let reg_off = reg.var.add(Tnum::constant((reg.off as i64 + off as i64) as u64));
+        // `tnum_is_aligned`.
+        if (reg_off.value | reg_off.mask) & (u64::from(size) - 1) != 0 {
+            verbose!(
+                self,
+                "misaligned {}access off {}+{}+{} size {}\n",
+                desc,
+                TnumStr(reg.var),
+                reg.off,
+                off,
+                size
+            );
+            return Err(Errno::EACCES);
+        }
+        Ok(())
+    }
+
     /// Checks an access of the stack and gives the offset from the frame pointer, as
     /// `check_stack_access_within_bounds` and `check_ptr_alignment` of Linux.
     fn check_stack_off(&mut self, regno: u8, reg: Reg, off: i16, size: u32) -> Result<i64> {
@@ -1415,16 +1568,6 @@ impl Env<'_> {
         let off = reg.off as i64 + off as i64;
         if off < -(MAX_BPF_STACK as i64) || off + size as i64 > 0 {
             verbose!(self, "invalid stack R{} off={} size={}\n", regno, off, size);
-            return Err(Errno::EACCES);
-        }
-        if off.rem_euclid(size as i64) != 0 {
-            verbose!(
-                self,
-                "misaligned stack access off {}+{} size {}\n",
-                reg.off,
-                off - reg.off as i64,
-                size
-            );
             return Err(Errno::EACCES);
         }
         Ok(off)
@@ -1444,8 +1587,10 @@ impl Env<'_> {
             }
             return Ok(Reg::unknown_of_size(size));
         }
+        // A loader with `CAP_PERFMON` can read bytes that the program did not write,
+        // `allow_uninit_stack` of Linux.
         for b in start..start + size as usize {
-            if stack[b / 8].slot_type[b % 8] == STACK_INVALID {
+            if stack[b / 8].slot_type[b % 8] == STACK_INVALID && !self.allow_ptr_leaks {
                 verbose!(self, "invalid read from stack off {}+{} size {}\n", off, b - start, size);
                 return Err(Errno::EACCES);
             }
@@ -1462,30 +1607,53 @@ impl Env<'_> {
         size: u32,
         value_size: u32,
     ) -> Result<()> {
-        let lo = reg.off as i64 + off as i64 + reg.umin as i64;
-        let hi = reg.off as i64 + off as i64 + reg.umax as i64;
-        if lo < 0 {
-            verbose!(self, "R{} min value is outside of the allowed memory range\n", regno);
+        // `check_mem_region_access` of Linux.
+        let off = reg.off as i64 + off as i64;
+        if reg.smin < 0
+            && (reg.smin == i64::MIN
+                || off + reg.smin != i64::from((off + reg.smin) as i32)
+                || reg.smin + off < 0)
+        {
             verbose!(
                 self,
-                "invalid access to map value, value_size={} off={} size={}\n",
-                value_size,
-                lo,
-                size
+                "R{} min value is negative, either use unsigned index or do a if (index >=0) check.\n",
+                regno
             );
             return Err(Errno::EACCES);
         }
-        if hi + size as i64 > value_size as i64 {
+        if !self.check_mem_size(reg.smin + off, size, value_size) {
+            verbose!(self, "R{} min value is outside of the allowed memory range\n", regno);
+            return Err(Errno::EACCES);
+        }
+        if reg.umax >= BPF_MAX_VAR_OFF as u64 {
             verbose!(
                 self,
-                "invalid access to map value, value_size={} off={} size={}\n",
-                value_size,
-                hi,
-                size
+                "R{} unbounded memory access, make sure to bounds check any such access\n",
+                regno
             );
+            return Err(Errno::EACCES);
+        }
+        if !self.check_mem_size(reg.umax as i64 + off, size, value_size) {
+            verbose!(self, "R{} max value is outside of the allowed memory range\n", regno);
             return Err(Errno::EACCES);
         }
         Ok(())
+    }
+
+    /// Tells if an access of a map value is in the value, and logs the error if not, as
+    /// `__check_mem_access` of Linux.
+    fn check_mem_size(&mut self, off: i64, size: u32, value_size: u32) -> bool {
+        if off >= 0 && size > 0 && off as u64 + u64::from(size) <= u64::from(value_size) {
+            return true;
+        }
+        verbose!(
+            self,
+            "invalid access to map value, value_size={} off={} size={}\n",
+            value_size,
+            off as i32,
+            size
+        );
+        false
     }
 
     /// The `is_valid_access` of the program type, as `bpf_verifier_ops` of Linux.
@@ -1495,8 +1663,10 @@ impl Env<'_> {
         }
         let off = off as u32;
         match self.prog_type {
-            BPF_PROG_TYPE_SOCKET_FILTER => skb_is_valid_access(off, size, t, false),
-            BPF_PROG_TYPE_CGROUP_SKB => skb_is_valid_access(off, size, t, true),
+            BPF_PROG_TYPE_SOCKET_FILTER => {
+                skb_is_valid_access(off, size, t, false, self.bpf_capable)
+            }
+            BPF_PROG_TYPE_CGROUP_SKB => skb_is_valid_access(off, size, t, true, self.bpf_capable),
             BPF_PROG_TYPE_CGROUP_SOCK => {
                 sock_filter_is_valid_access(off, size, t, self.expected_attach_type)
             }
@@ -1548,6 +1718,14 @@ impl Env<'_> {
             | BPF_PROG_TYPE_CGROUP_DEVICE => (0, 1),
             _ => return Ok(()),
         };
+        if r0.is_pointer() {
+            verbose!(
+                self,
+                "At program exit the register R0 is not a known value ({})\n",
+                reg_type_str(r0.ty)
+            );
+            return Err(Errno::EINVAL);
+        }
         // The 32-bit value is the result, as `return_32bit` of Linux.
         let (min, max) = if r0.umax <= u64::from(u32::MAX) {
             (r0.umin as i64, r0.umax as i64)
@@ -1586,12 +1764,12 @@ impl Env<'_> {
         let dst = self.read_reg(st, insn.dst_reg)?;
         if imm == BPF_CMPXCHG {
             let r0 = self.read_reg(st, 0)?;
-            if r0.is_pointer() {
+            if r0.is_pointer() && !self.allow_ptr_leaks {
                 verbose!(self, "R0 leaks addr into mem\n");
                 return Err(Errno::EACCES);
             }
         }
-        if src.is_pointer() {
+        if src.is_pointer() && !self.allow_ptr_leaks {
             verbose!(self, "R{} leaks addr into mem\n", insn.src_reg);
             return Err(Errno::EACCES);
         }
@@ -1605,37 +1783,37 @@ impl Env<'_> {
                 );
                 return Err(Errno::EACCES);
             }
-            RegType::PtrToMapValue => {
-                // The interpreter needs an aligned word for the atomic operation.
-                let total = dst.off as i64 + insn.off as i64;
-                if !dst.var.is_const() || total.rem_euclid(size as i64) != 0 {
-                    verbose!(
-                        self,
-                        "misaligned value access off {}+{} size {}\n",
-                        dst.off,
-                        insn.off,
-                        size
-                    );
-                    return Err(Errno::EACCES);
-                }
-            }
             _ => {}
         }
-        self.check_mem_access(st, insn.dst_reg, dst, insn.off, size, Access::Read, None)?;
-        self.check_mem_access(
-            st,
-            insn.dst_reg,
-            dst,
-            insn.off,
-            size,
-            Access::Write,
-            Some((insn.src_reg, Reg::unknown_of_size(size))),
-        )?;
-        if imm == BPF_CMPXCHG {
-            st.regs[0] = Reg::unknown_of_size(size);
+        let load_reg = if imm == BPF_CMPXCHG {
+            Some(0)
         } else if imm & BPF_FETCH != 0 {
             self.check_dst(insn.src_reg)?;
-            st.regs[insn.src_reg as usize] = Reg::unknown_of_size(size);
+            Some(insn.src_reg)
+        } else {
+            None
+        };
+        // The interpreter needs an aligned word for the atomic operation. A fetch gets the old
+        // value, which can be a pointer that the program spilled to the stack.
+        self.strict_once = true;
+        let old = self.check_mem_access(st, insn.dst_reg, dst, insn.off, size, Access::Read, None);
+        let r = old.and_then(|old| {
+            self.check_mem_access(
+                st,
+                insn.dst_reg,
+                dst,
+                insn.off,
+                size,
+                Access::Write,
+                Some((u8::MAX, Reg::unknown_of_size(size))),
+            )?;
+            Ok(old)
+        });
+        self.strict_once = false;
+        if let Some(load_reg) = load_reg {
+            st.regs[load_reg as usize] = r?;
+        } else {
+            r?;
         }
         Ok(())
     }
@@ -1673,7 +1851,8 @@ impl Env<'_> {
                     verbose!(self, "R0 !read_ok\n");
                     return Err(Errno::EACCES);
                 }
-                if r0.is_pointer() {
+                // A loader with `CAP_PERFMON` can return a pointer, `is_pointer_value` of Linux.
+                if r0.is_pointer() && !self.allow_ptr_leaks {
                     verbose!(self, "R0 leaks addr as return value\n");
                     return Err(Errno::EACCES);
                 }
@@ -1749,27 +1928,34 @@ impl Env<'_> {
             mark_ptr_or_null_regs(null_state, dst.id, true);
             mark_ptr_or_null_regs(ptr_state, dst.id, false);
             // `st` is the fall-through state and `other` the jump state.
-            return Ok(Next::Branch(pc + 1, target, alloc::boxed::Box::new(other)));
+            return Ok(Next::Branch(pc + 1, target, Box::new(other)));
         }
         if dst.is_pointer() || src.is_pointer() {
             if !self.allow_ptr_leaks {
                 verbose!(self, "R{} pointer comparison prohibited\n", d);
                 return Err(Errno::EACCES);
             }
-            return Ok(Next::Branch(pc + 1, target, alloc::boxed::Box::new(st.clone())));
+            return Ok(Next::Branch(pc + 1, target, Box::new(st.clone())));
         }
-        let (a, b) = if jmp32 { (zext32(dst), zext32(src)) } else { (dst, src) };
-        let (a, b) = if jmp32 && !(a.is_const() && b.is_const()) {
-            (Reg::unknown(), Reg::unknown())
+        // A comparison of 32 bits with a constant is a comparison of 64 bits when the upper
+        // half of `dst` follows from the lower half. Then the bounds of 64 bits refine as for
+        // JMP. Otherwise the verifier learns nothing.
+        let (a, b, both_const) = if !jmp32 {
+            (dst, src, false)
+        } else if dst.is_const() && src.is_const() {
+            (zext32(dst), zext32(src), true)
         } else {
-            (a, b)
+            match jmp32_as_jmp64(op, dst, src) {
+                Some(b) => (dst, b, false),
+                None => (Reg::unknown(), Reg::unknown(), false),
+            }
         };
-        match is_branch_taken(op, a, b, jmp32) {
+        match is_branch_taken(op, a, b, both_const) {
             Some(true) => Ok(Next::Go(target)),
             Some(false) => Ok(Next::Go(pc + 1)),
             None => {
                 let mut other = st.clone();
-                if !jmp32 && b.is_const() {
+                if a == dst && b.is_const() {
                     // `reg_set_min_max` of Linux, for a comparison with a constant.
                     let taken = refine(op, dst, b.var.value, true);
                     let not_taken = refine(op, dst, b.var.value, false);
@@ -1789,7 +1975,7 @@ impl Env<'_> {
                         (None, None) => return Ok(Next::Exit),
                     }
                 }
-                Ok(Next::Branch(pc + 1, target, alloc::boxed::Box::new(other)))
+                Ok(Next::Branch(pc + 1, target, Box::new(other)))
             }
         }
     }
@@ -1806,18 +1992,17 @@ impl Env<'_> {
             return Err(Errno::E2BIG);
         }
         // The function gets R1 to R5 and a new frame pointer, as `set_callee_state`.
-        let mut regs = [Reg::NOT_INIT; MAX_BPF_REG];
+        let mut regs = Box::new([Reg::NOT_INIT; MAX_BPF_REG]);
         regs[1..=5].copy_from_slice(&st.regs[1..=5]);
         regs[BPF_REG_FP as usize] =
             Reg { frameno: cur as u32 + 1, ..Reg::ptr(RegType::PtrToStack) };
         // `clear_caller_saved_regs`.
-        let mut caller_regs = st.regs;
+        let mut caller_regs = core::mem::replace(&mut st.regs, regs);
         for r in caller_regs.iter_mut().take(6) {
             *r = Reg::NOT_INIT;
         }
         let stack = core::mem::replace(&mut st.stack, vec![StackSlot::EMPTY; SLOTS]);
         st.callers.push(Frame { regs: caller_regs, stack, subprog: st.subprog, callsite: pc });
-        st.regs = regs;
         st.subprog = subprog;
         Ok(Next::Go(target))
     }
@@ -2089,7 +2274,8 @@ impl Env<'_> {
                     let ok = match slot.slot_type[b % 8] {
                         STACK_MISC => true,
                         STACK_SPILL => slot.spilled.ty == RegType::Scalar || self.allow_ptr_leaks,
-                        _ => false,
+                        // `allow_uninit_stack` of Linux.
+                        _ => self.allow_ptr_leaks,
                     };
                     if !ok {
                         verbose!(
@@ -2142,7 +2328,7 @@ enum Next {
     /// The next instruction.
     Go(usize),
     /// Both ways of a jump: the first one now, the second one with its state later.
-    Branch(usize, usize, alloc::boxed::Box<State>),
+    Branch(usize, usize, Box<State>),
     /// The end of the path.
     Exit,
 }
@@ -2407,11 +2593,47 @@ fn is_branch_taken(op: u8, a: Reg, b: Reg, jmp32: bool) -> Option<bool> {
     }
 }
 
+/// The constant of 64 bits that `dst op src` of JMP compares with, when it gives the same result
+/// as `dst op src` of JMP32. `src` must be a constant. When `dst` is a zero extension of its lower
+/// 32 bits, the unsigned comparisons are the same with the zero extension of `src`. When `dst` is
+/// a sign extension of its lower 32 bits, the signed comparisons are the same with the sign
+/// extension of `src`. `BPF_JSET` is always the same with the zero extension.
+fn jmp32_as_jmp64(op: u8, dst: Reg, src: Reg) -> Option<Reg> {
+    if !src.is_const() || dst.ty != RegType::Scalar {
+        return None;
+    }
+    let lo = src.var.value as u32;
+    let zext = dst.umax <= u32::MAX as u64;
+    let sext = dst.smin >= i32::MIN as i64 && dst.smax <= i32::MAX as i64;
+    let v = match op {
+        BPF_JSET => lo as u64,
+        BPF_JGT | BPF_JGE | BPF_JLT | BPF_JLE if zext => lo as u64,
+        BPF_JSGT | BPF_JSGE | BPF_JSLT | BPF_JSLE if sext => lo as i32 as i64 as u64,
+        BPF_JEQ | BPF_JNE if zext => lo as u64,
+        BPF_JEQ | BPF_JNE if sext => lo as i32 as i64 as u64,
+        _ => return None,
+    };
+    Some(Reg::known(v))
+}
+
 /// The bounds of `r` when `r op v` is `taken`, as `reg_set_min_max` of Linux. `None` is a
 /// path that cannot occur.
 fn refine(op: u8, r: Reg, v: u64, taken: bool) -> Option<Reg> {
     let mut r = r;
     let sv = v as i64;
+    if op == BPF_JSET {
+        // When the jump is taken, a bit of `v` is set, and the verifier knows which bit only
+        // when `v` has one bit. When it is not taken, all the bits of `v` are clear.
+        if taken {
+            if !v.is_power_of_two() {
+                return Some(r);
+            }
+            r.var = r.var.or(Tnum::constant(v));
+        } else {
+            r.var = r.var.and(Tnum::constant(!v));
+        }
+        return if r.bounds_sync() { Some(r) } else { None };
+    }
     // A jump that is not taken is the opposite comparison.
     let op = if taken {
         op
@@ -2497,34 +2719,66 @@ fn stack_write(stack: &mut [StackSlot], off: i64, size: u32, v: Reg) {
     }
 }
 
-/// `bpf_skb_is_valid_access` of Linux with the rules of `sk_filter_is_valid_access` or, for
-/// `cgroup` true, of `cg_skb_is_valid_access`. rukernel has no packet pointers in the verifier,
-/// so `data` and `data_end` are not readable, as for a loader without `CAP_BPF`. `tstamp`,
-/// `hwtstamp` and `sk` are not readable either.
-fn skb_is_valid_access(off: u32, size: u32, t: Access, cgroup: bool) -> bool {
+/// `sk_filter_is_valid_access` and `cg_skb_is_valid_access` of Linux, with
+/// `bpf_skb_is_valid_access`. rukernel has no packet pointers and no `PTR_TO_SOCK_COMMON`, so a
+/// program cannot read `data`, `data_end` or `sk`.
+fn skb_is_valid_access(off: u32, size: u32, t: Access, cgroup: bool, bpf_capable: bool) -> bool {
     use sk_buff::*;
-    if off >= SIZE {
+    let within = |start: u32, len: u32| (start..start + len).contains(&off);
+    if cgroup {
+        if within(TC_CLASSID, 4) || within(DATA_META, 4) || within(WIRE_LEN, 4) {
+            return false;
+        }
+        if t == Access::Write
+            && !(within(MARK, 4)
+                || within(PRIORITY, 4)
+                || (CB..CB_END).contains(&off)
+                || (within(TSTAMP, 8) && bpf_capable))
+        {
+            return false;
+        }
+    } else {
+        if within(TC_CLASSID, 4)
+            || within(DATA, 4)
+            || within(DATA_META, 4)
+            || within(DATA_END, 4)
+            || (FAMILY..LOCAL_PORT + 4).contains(&off)
+            || within(TSTAMP, 8)
+            || within(WIRE_LEN, 4)
+            || within(HWTSTAMP, 8)
+        {
+            return false;
+        }
+        if t == Access::Write && !(CB..CB_END).contains(&off) {
+            return false;
+        }
+    }
+    // `bpf_skb_is_valid_access`.
+    if off >= SIZE || !off.is_multiple_of(size) {
         return false;
     }
     if (CB..CB_END).contains(&off) {
         return off + size <= CB_END;
     }
-    let field = off & !3;
-    if t == Access::Write {
-        // A cgroup program can also write `mark` and `priority`.
-        return cgroup && matches!(field, MARK | PRIORITY) && size == 4;
-    }
-    let readable = field < CB
-        || matches!(field, HASH | NAPI_ID | GSO_SEGS | GSO_SIZE)
-        || (cgroup && (FAMILY..=LOCAL_PORT).contains(&field));
-    if !readable {
+    if within(DATA, 4) || within(DATA_META, 4) || within(DATA_END, 4) || within(SK, 8) {
         return false;
     }
-    // The addresses can only be read whole. For the other fields a narrow read must be in the
-    // field, as `bpf_ctx_narrow_access_ok` of Linux.
-    if (REMOTE_IP4..REMOTE_PORT).contains(&field) {
+    if (REMOTE_IP4..REMOTE_PORT).contains(&off) {
         return size == 4;
     }
+    if within(FLOW_KEYS, 8) || off == TSTAMP_TYPE || (TSTAMP_TYPE + 1..HWTSTAMP).contains(&off) {
+        return false;
+    }
+    if within(HWTSTAMP, 8) {
+        return t == Access::Read && size == 8;
+    }
+    if within(TSTAMP, 8) {
+        return size == 8;
+    }
+    if t == Access::Write {
+        return size == 4;
+    }
+    // `bpf_ctx_narrow_access_ok`.
     size <= 4
 }
 
@@ -2603,10 +2857,12 @@ fn sock_addr_is_valid_access(off: u32, size: u32, t: Access, attach_type: u32) -
     if !family_ok {
         return false;
     }
-    // An 8-byte access of an IPv6 address, `bpf_ctx_wide_access_ok` of Linux.
+    // An 8-byte access of an IPv6 address, `bpf_ctx_wide_access_ok` of Linux. The access must be
+    // aligned and in the address. The address `msg_src_ip6` ends at 60.
+    let in_field = |start: u32, end: u32| start <= off && off + size <= end;
     let wide = size == 8
         && off.is_multiple_of(8)
-        && ((USER_IP6..USER_PORT).contains(&off) || (MSG_SRC_IP6..SK).contains(&off));
+        && (in_field(USER_IP6, USER_PORT) || in_field(MSG_SRC_IP6, MSG_SRC_IP6 + 16));
     match field {
         USER_IP4 | USER_PORT | MSG_SRC_IP4 => {
             if t == Access::Read {
@@ -2675,6 +2931,7 @@ mod tests {
             expected_attach_type: 0,
             bpf_capable: caps,
             allow_ptr_leaks: caps,
+            strict_alignment: false,
         };
         let mut log = BpfVerifierLog::new(1);
         let r = bpf_check(
@@ -2908,9 +3165,47 @@ mod tests {
 
     #[test]
     fn loops_dead_code_and_bad_jumps_are_refused() {
-        let (r, log) = check(&[mov64_imm(0, 0), jmp_imm(BPF_JA, 0, 0, -2), exit()], true);
+        let (r, log) = check(&[mov64_imm(0, 0), jmp_imm(BPF_JA, 0, 0, -2), exit()], false);
         assert_eq!(r.err(), Some(Errno::EINVAL));
         assert!(log.contains("back-edge from insn 1 to 0"), "{log}");
+        // With `CAP_BPF` a loop is allowed, but it must end.
+        let (r, log) = check(&[mov64_imm(0, 0), jmp_imm(BPF_JEQ, 0, 0, -2), exit()], true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("infinite loop detected at insn 0"), "{log}");
+        let p = [mov64_imm(0, 0), alu64_imm(BPF_ADD, 0, 1), jmp_imm(BPF_JNE, 0, 0, -2), exit()];
+        let (r, log) = check(&p, true);
+        assert_eq!(r.err(), Some(Errno::E2BIG));
+        assert!(log.contains("BPF program is too large. Processed 1000001 insn"), "{log}");
+        // "jump test 4" of test_verifier: 2^36 paths with the same state. The pruning checks
+        // each instruction once.
+        let mut p = Vec::new();
+        for i in 0..36 {
+            p.push(jmp_imm(BPF_JEQ, 1, 10, i % 4 + 1));
+        }
+        p.extend([jmp_imm(BPF_JEQ, 1, 10, 0); 4]);
+        p.extend([mov64_imm(0, 0), exit()]);
+        let (r, log) = check(&p, true);
+        assert!(r.is_ok(), "{log}");
+        let p = [mov64_imm(0, 0), alu64_imm(BPF_ADD, 0, 1), jmp_imm(BPF_JLT, 0, 10, -2), exit()];
+        let (r, log) = check(&p, true);
+        assert!(r.is_ok(), "{log}");
+        // The back edge of a branch that is never taken, from "dead code: start" of
+        // test_verifier.
+        let p = [
+            jmp_imm(BPF_JA, 0, 0, 2),
+            BpfInsn {
+                code: BPF_LDX | BPF_MEM | BPF_B,
+                dst_reg: 8,
+                src_reg: 9,
+                ..BpfInsn::default()
+            },
+            jmp_imm(BPF_JA, 0, 0, 2),
+            mov64_imm(0, 7),
+            jmp_imm(BPF_JGE, 0, 10, -4),
+            exit(),
+        ];
+        let (r, log) = check(&p, true);
+        assert!(r.is_ok(), "{log}");
         let (r, log) = check(&[mov64_imm(0, 0), exit(), exit()], true);
         assert_eq!(r.err(), Some(Errno::EINVAL));
         assert!(log.contains("unreachable insn 2"), "{log}");
@@ -2927,9 +3222,11 @@ mod tests {
         let (r, log) = check(&[exit()], true);
         assert_eq!(r.err(), Some(Errno::EACCES));
         assert!(log.contains("R0 !read_ok"), "{log}");
-        let (r, log) = check(&[ldx_mem(BPF_DW, 0, BPF_REG_FP, -8), exit()], true);
+        let (r, log) = check(&[ldx_mem(BPF_DW, 0, BPF_REG_FP, -8), exit()], false);
         assert_eq!(r.err(), Some(Errno::EACCES));
         assert!(log.contains("invalid read from stack"), "{log}");
+        // With `CAP_PERFMON`, the read gives an unknown value.
+        assert!(check(&[ldx_mem(BPF_DW, 0, BPF_REG_FP, -8), exit()], true).0.is_ok());
         let (r, log) = check(&[mov64_imm(BPF_REG_FP, 0), mov64_imm(0, 0), exit()], true);
         assert_eq!(r.err(), Some(Errno::EACCES));
         assert!(log.contains("frame pointer is read only"), "{log}");
@@ -2998,9 +3295,10 @@ mod tests {
                 exit(),
             ],
         ]);
-        let (r, log) = check(&p, true);
+        let (r, log) = check(&p, false);
         assert_eq!(r.err(), Some(Errno::EACCES));
         assert!(log.contains("invalid indirect read from stack"), "{log}");
+        assert!(check(&p, true).0.is_ok());
         // A bad map descriptor.
         let p = concat(&[&ld_imm64(1, BPF_PSEUDO_MAP_FD, 9), &[mov64_imm(0, 0), exit()]]);
         let (r, log) = check(&p, true);
@@ -3021,6 +3319,108 @@ mod tests {
         assert!(log.contains("invalid shift 64"), "{log}");
     }
 
+    /// `BPF_RAND_UEXT_R7` of test_verifier: R7 is a random value of 31 bits.
+    fn rand_uext_r7() -> [BpfInsn; 4] {
+        [
+            call(crate::helpers::func::BPF_FUNC_get_prandom_u32),
+            mov64_reg(7, 0),
+            alu64_imm(BPF_LSH, 7, 33),
+            alu64_imm(BPF_RSH, 7, 33),
+        ]
+    }
+
+    /// The load from R9, which is not set, that test_verifier puts on a path that must be dead.
+    fn bad_load() -> BpfInsn {
+        ldx_mem(BPF_B, 8, 9, 0)
+    }
+
+    fn jmp32_imm(op: u8, dst: u8, imm: i32, off: i16) -> BpfInsn {
+        BpfInsn { code: BPF_JMP32 | op | BPF_K, ..jmp_imm(op, dst, imm, off) }
+    }
+
+    #[test]
+    fn jset_and_jmp32_refine_the_bounds() {
+        // "jset: range" of test_verifier.
+        let p = [
+            call(crate::helpers::func::BPF_FUNC_get_prandom_u32),
+            mov64_reg(1, 0),
+            mov64_imm(0, 0),
+            alu64_imm(BPF_AND, 1, 0xff),
+            jmp_imm(BPF_JSET, 1, 0xf0, 3),
+            jmp_imm(BPF_JLT, 1, 0x10, 1),
+            bad_load(),
+            exit(),
+            jmp_imm(BPF_JSET, 1, 0x10, 1),
+            exit(),
+            jmp_imm(BPF_JGE, 1, 0x10, 1),
+            bad_load(),
+            exit(),
+        ];
+        let (r, log) = check(&p, true);
+        assert!(r.is_ok(), "{log}");
+        // "jset32: min/max deduction" and "jne32: min/max deduction".
+        let jset32 = concat(&[
+            &rand_uext_r7(),
+            &[
+                mov64_imm(0, 0),
+                jmp32_imm(BPF_JSET, 7, 0x10, 1),
+                exit(),
+                jmp32_imm(BPF_JGE, 7, 0x10, 1),
+                bad_load(),
+                exit(),
+            ],
+        ]);
+        let (r, log) = check(&jset32, true);
+        assert!(r.is_ok(), "{log}");
+        let jne32 = concat(&[
+            &rand_uext_r7(),
+            &[
+                mov64_imm(0, 0),
+                jmp32_imm(BPF_JNE, 7, 0x10, 1),
+                jmp_imm(BPF_JNE, 7, 0x10, 1),
+                exit(),
+                bad_load(),
+                exit(),
+            ],
+        ]);
+        let (r, log) = check(&jne32, true);
+        assert!(r.is_ok(), "{log}");
+        // The upper half of an unknown value can be set, so JMP32 tells nothing about JMP.
+        let p = [
+            call(crate::helpers::func::BPF_FUNC_get_prandom_u32),
+            mov64_reg(7, 0),
+            alu64_imm(BPF_LSH, 7, 1),
+            mov64_imm(0, 0),
+            jmp32_imm(BPF_JNE, 7, 0x10, 1),
+            jmp_imm(BPF_JNE, 7, 0x10, 1),
+            exit(),
+            bad_load(),
+            exit(),
+        ];
+        let (r, log) = check(&p, true);
+        assert_eq!(r.err(), Some(Errno::EACCES));
+        assert!(log.contains("R9 !read_ok"), "{log}");
+    }
+
+    #[test]
+    fn the_order_of_the_errors_is_as_in_linux() {
+        // "junk insn5": the reserved fields of an ALU instruction come before the registers.
+        let junk = BpfInsn { code: 0x7f, dst_reg: 15, src_reg: 15, off: -1, imm: -1 };
+        let (r, log) = check(&[junk, exit()], true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("BPF_ALU uses reserved fields"), "{log}");
+        // "test1 ld_imm64": the log gives the first half of the 64-bit load.
+        let p = concat(&[
+            &[jmp_imm(BPF_JEQ, 1, 0, 1)],
+            &ld_imm64(0, 0, 0),
+            &ld_imm64(0, 0, 1),
+            &[exit()],
+        ]);
+        let (r, log) = check(&p, true);
+        assert_eq!(r.err(), Some(Errno::EINVAL));
+        assert!(log.contains("jump into the middle of ldimm64 insn 1"), "{log}");
+    }
+
     #[test]
     fn sock_addr_access() {
         use crate::prog::bpf_sock_addr::*;
@@ -3031,6 +3431,10 @@ mod tests {
         assert!(!sock_addr_is_valid_access(USER_IP4, 2, Access::Write, v4));
         assert!(!sock_addr_is_valid_access(USER_IP6, 4, Access::Read, v4));
         assert!(sock_addr_is_valid_access(USER_IP6, 8, Access::Write, v6));
+        let send6 = BPF_CGROUP_UDP6_SENDMSG;
+        assert!(sock_addr_is_valid_access(MSG_SRC_IP6 + 4, 8, Access::Read, send6));
+        assert!(!sock_addr_is_valid_access(MSG_SRC_IP6 + 12, 8, Access::Read, send6));
+        assert!(!sock_addr_is_valid_access(MSG_SRC_IP6 + 12, 8, Access::Write, send6));
         assert!(!sock_addr_is_valid_access(USER_IP4, 4, Access::Read, v6));
         assert!(sock_addr_is_valid_access(USER_PORT, 4, Access::Write, v6));
         assert!(!sock_addr_is_valid_access(FAMILY, 4, Access::Write, v6));
@@ -3126,9 +3530,10 @@ mod tests {
 
     #[test]
     fn recursion_and_deep_calls_are_refused() {
+        // As on Linux, recursion stops at the limit of the frames.
         let (r, log) = check(&[call_local(1), exit(), call_local(-1), exit()], true);
-        assert_eq!(r.err(), Some(Errno::EINVAL));
-        assert!(log.contains("back-edge from insn 2 to 2"), "{log}");
+        assert_eq!(r.err(), Some(Errno::E2BIG));
+        assert!(log.contains("the call stack of 9 frames is too deep"), "{log}");
         // A chain of `n` functions after main.
         let chain = |n: usize| {
             let mut p = Vec::new();

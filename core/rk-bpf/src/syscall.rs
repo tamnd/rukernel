@@ -99,6 +99,8 @@ pub trait Env {
     fn boot_ns(&self) -> u64;
     /// The real user ID of the caller.
     fn uid(&self) -> u32;
+    /// What the helpers of a program see when the call runs it: the task of the caller.
+    fn helpers(&self) -> &dyn crate::helpers::HelperEnv;
     /// The cgroup of the cgroup2 directory `fd`, `cgroup_get_from_fd` of Linux. Another file
     /// gives `EBADF`.
     fn cgroup_get_from_fd(&self, fd: u32) -> Result<CgId>;
@@ -192,6 +194,7 @@ pub fn sys_bpf(
         BPF_PROG_ATTACH => bpf_prog_attach(env, &attr),
         BPF_PROG_DETACH => bpf_prog_detach(env, &attr),
         BPF_PROG_QUERY => bpf_prog_query(env, &attr, uattr, size),
+        BPF_PROG_TEST_RUN => bpf_prog_test_run(env, &attr, uattr),
         BPF_LINK_CREATE => link_create_cmd(env, &attr),
         BPF_LINK_UPDATE => link_update_cmd(env, &attr),
         BPF_LINK_DETACH => link_detach(env, &attr),
@@ -400,6 +403,8 @@ fn bpf_prog_load(env: &dyn Env, attr: &BpfAttr, log_attr: &BpfLogAttr) -> Result
         expected_attach_type,
         bpf_capable: bpf_cap,
         allow_ptr_leaks: env.capable(CAP_PERFMON) || env.capable(CAP_SYS_ADMIN),
+        strict_alignment: prog_flags & BPF_F_STRICT_ALIGNMENT != 0
+            && prog_flags & BPF_F_ANY_ALIGNMENT == 0,
     };
     let map_by_fd = |fd: i32| -> Result<Arc<BpfMap>> {
         let file = env.fdget(fd)?;
@@ -1140,6 +1145,41 @@ fn bpf_obj_get_info_by_fd(env: &dyn Env, attr: &BpfAttr, uattr: u64) -> Result<i
     Err(Errno::EINVAL)
 }
 
+/// The test run of a program, `bpf_prog_test_run` of Linux.
+fn bpf_prog_test_run(env: &dyn Env, attr: &BpfAttr, uattr: u64) -> Result<i64> {
+    use crate::test_run::test;
+    if attr.check_attr(last_field::BPF_PROG_TEST_RUN) {
+        return Err(Errno::EINVAL);
+    }
+    let both = |size: usize, ptr: usize| (attr.u32(size) == 0) == (attr.u64(ptr) == 0);
+    if !both(test::CTX_SIZE_IN, test::CTX_IN) || !both(test::CTX_SIZE_OUT, test::CTX_OUT) {
+        return Err(Errno::EINVAL);
+    }
+    let prog = bpf_prog_get(env, attr.u32(test::PROG_FD))?;
+    crate::test_run::bpf_prog_test_run(&EnvTestRun(env), &prog, attr, uattr)
+}
+
+/// The caller of a test run.
+struct EnvTestRun<'a>(&'a dyn Env);
+
+impl crate::test_run::TestRunEnv for EnvTestRun<'_> {
+    fn copy_from_user(&self, addr: u64, buf: &mut [u8]) -> Result<()> {
+        self.0.copy_from_user(addr, buf)
+    }
+
+    fn copy_to_user(&self, addr: u64, buf: &[u8]) -> Result<()> {
+        self.0.copy_to_user(addr, buf)
+    }
+
+    fn helpers(&self) -> &dyn crate::helpers::HelperEnv {
+        self.0.helpers()
+    }
+
+    fn now_ns(&self) -> u64 {
+        self.0.boot_ns()
+    }
+}
+
 /// The program of a descriptor, `bpf_prog_get` of Linux.
 fn bpf_prog_get(env: &dyn Env, fd: u32) -> Result<Arc<BpfProg>> {
     bpf_prog_of(&*env.fdget(fd as i32)?).ok_or(Errno::EINVAL)
@@ -1590,6 +1630,10 @@ mod tests {
 
         fn uid(&self) -> u32 {
             1000
+        }
+
+        fn helpers(&self) -> &dyn crate::helpers::HelperEnv {
+            &crate::core::tests::NoEnv
         }
 
         // The descriptors from 5000 are the cgroups 5000 and up, each one the child of the
