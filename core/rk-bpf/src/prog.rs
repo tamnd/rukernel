@@ -240,6 +240,14 @@ pub struct SkBuff<'a> {
     pub remote_port: u32,
     /// The local port, in host byte order.
     pub local_port: u32,
+    /// `skb->tstamp`, the time of the packet in nanoseconds.
+    pub tstamp: u64,
+    /// `gso_segs` of the shared info of the packet.
+    pub gso_segs: u32,
+    /// `gso_size` of the shared info of the packet.
+    pub gso_size: u32,
+    /// The time stamp of the hardware, in nanoseconds.
+    pub hwtstamp: u64,
 }
 
 /// The offsets in `struct bpf_sock`, the context of `BPF_PROG_TYPE_CGROUP_SOCK`.
@@ -509,8 +517,15 @@ pub mod sk_buff {
     pub const LOCAL_IP6: u32 = 116;
     pub const REMOTE_PORT: u32 = 132;
     pub const LOCAL_PORT: u32 = 136;
+    pub const DATA_META: u32 = 140;
+    pub const FLOW_KEYS: u32 = 144;
+    pub const TSTAMP: u32 = 152;
+    pub const WIRE_LEN: u32 = 160;
     pub const GSO_SEGS: u32 = 164;
+    pub const SK: u32 = 168;
     pub const GSO_SIZE: u32 = 176;
+    pub const TSTAMP_TYPE: u32 = 180;
+    pub const HWTSTAMP: u32 = 184;
     /// `sizeof(struct __sk_buff)`.
     pub const SIZE: u32 = 192;
 }
@@ -524,6 +539,11 @@ impl ProgCtx for SkBuff<'_> {
             let mut v = [0u8; 8];
             v[..b.len()].copy_from_slice(b);
             return Some(u64::from_le_bytes(v));
+        }
+        match off {
+            TSTAMP => return Some(self.tstamp),
+            HWTSTAMP => return Some(self.hwtstamp),
+            _ => {}
         }
         // A narrow load reads the low bytes of the 32-bit field, as `bpf_ctx_narrow_access_ok`.
         let field = off & !3;
@@ -549,8 +569,9 @@ impl ProgCtx for SkBuff<'_> {
                 let at = (f - LOCAL_IP6) as usize;
                 u32::from_ne_bytes(self.local_ip[at..at + 4].try_into().ok()?)
             }
-            QUEUE_MAPPING | VLAN_PRESENT | VLAN_TCI | VLAN_PROTO | TC_INDEX | NAPI_ID
-            | GSO_SEGS | GSO_SIZE => 0,
+            GSO_SEGS => self.gso_segs,
+            GSO_SIZE => self.gso_size,
+            QUEUE_MAPPING | VLAN_PRESENT | VLAN_TCI | VLAN_PROTO | TC_INDEX | NAPI_ID => 0,
             _ => return None,
         };
         let shift = (off - field) * 8;
@@ -563,6 +584,7 @@ impl ProgCtx for SkBuff<'_> {
         match off {
             MARK => self.mark = value as u32,
             PRIORITY => self.priority = value as u32,
+            TSTAMP => self.tstamp = value,
             _ if (CB..CB_END).contains(&off) => {}
             _ => return None,
         }

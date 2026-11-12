@@ -22,6 +22,8 @@ pub mod cmd {
     pub const BPF_PROG_ATTACH: u32 = 8;
     /// Detaches a program from a hook.
     pub const BPF_PROG_DETACH: u32 = 9;
+    /// Runs a program on a packet of the caller.
+    pub const BPF_PROG_TEST_RUN: u32 = 10;
     /// Gives the program ID after `start_id`.
     pub const BPF_PROG_GET_NEXT_ID: u32 = 11;
     /// Gives the map ID after `start_id`.

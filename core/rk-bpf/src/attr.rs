@@ -48,6 +48,8 @@ pub mod last_field {
     pub const BPF_PROG_ATTACH: usize = 32;
     /// `BPF_PROG_DETACH`: `expected_revision`.
     pub const BPF_PROG_DETACH: usize = 32;
+    /// `BPF_PROG_TEST_RUN`: `test.batch_size`.
+    pub const BPF_PROG_TEST_RUN: usize = 76;
     /// `BPF_PROG_QUERY`: `query.revision`.
     pub const BPF_PROG_QUERY: usize = 64;
     /// `BPF_LINK_CREATE`: `link_create.uprobe_multi.path_fd`.

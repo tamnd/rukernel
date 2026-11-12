@@ -30,6 +30,9 @@ impl Errno {
     /// The buffer is too small, as `ETOOSMALL` of include/linux/errno.h. Linux gives it to user
     /// space from `ETHTOOL_GPERMADDR`, so user space sees this number.
     pub const ETOOSMALL: Self = Self(525);
+    /// The operation is not supported, as `ENOTSUPP` of include/linux/errno.h. `bpf(2)` gives it
+    /// to user space, for example from `BPF_PROG_TEST_RUN` of a program type without a test run.
+    pub const ENOTSUPP: Self = Self(524);
 
     /// Tells if the number is one of the restart numbers of the kernel.
     pub const fn is_restart(self) -> bool {

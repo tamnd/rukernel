@@ -668,7 +668,7 @@ impl Run<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::insn::asm::*;
     use crate::map::MapEnv;
@@ -694,7 +694,7 @@ mod tests {
         }
     }
 
-    fn prog(insns: &[BpfInsn], maps: Vec<Arc<BpfMap>>) -> BpfProg {
+    pub(crate) fn prog(insns: &[BpfInsn], maps: Vec<Arc<BpfMap>>) -> BpfProg {
         BpfProg {
             prog_type: 1,
             expected_attach_type: 0,
