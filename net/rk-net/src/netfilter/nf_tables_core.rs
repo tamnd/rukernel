@@ -74,9 +74,9 @@ pub(super) use self::nft_objects::{
     nft_obj_commit, nft_set_exprs_dump, nft_set_exprs_parse, nft_setelem_parse_obj,
 };
 use self::nft_objects::{
-    NFTA_OBJREF_SET_ID, NFTA_OBJREF_SET_NAME, NftConnlimit, NftQuota, nft_connlimit_eval,
-    nft_connlimit_init, nft_obj_eval, nft_objref_init, nft_quota_eval, nft_quota_init,
-    nft_set_elem_update_expr,
+    NFTA_OBJREF_IMM_NAME, NFTA_OBJREF_SET_ID, NFTA_OBJREF_SET_NAME, NftConnlimit, NftQuota,
+    nft_connlimit_eval, nft_connlimit_init, nft_obj_eval, nft_objref_init, nft_quota_eval,
+    nft_quota_init, nft_set_elem_update_expr,
 };
 
 // The attributes of an expression, `NFTA_EXPR_*`.
@@ -131,6 +131,7 @@ const NFT_CT_STATE: u32 = 0;
 const NFT_CT_DIRECTION: u32 = 1;
 const NFT_CT_STATUS: u32 = 2;
 const NFT_CT_MARK: u32 = 3;
+const NFT_CT_HELPER: u32 = 6;
 const NFT_CT_EXPIRATION: u32 = 5;
 const NFT_CT_L3PROTOCOL: u32 = 7;
 const NFT_CT_SRC: u32 = 8;
@@ -491,15 +492,24 @@ fn nla_raw(b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
 /// give the name of their set:
 /// the rule can give a name with `%d` or only the ID of the set in the batch, as `nft` does for
 /// an anonymous set, and `nft` then finds the set in the dump with its real name. The ID is not
-/// in the dump. The other expressions give the bytes of the rule.
+/// in the dump. An `objref` gives the name of its object with a NUL byte, as `nla_put_string`:
+/// libnftnl puts the name with no NUL byte, and a name of 8 bytes then has no padding. The
+/// other expressions give the bytes of the rule.
 pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec<u8> {
-    let (set, name_ty, id_ty) = match expr {
-        NftExpr::Lookup { set, .. } => (*set, NFTA_LOOKUP_SET, NFTA_LOOKUP_SET_ID),
-        NftExpr::Dynset(d) => (d.set, NFTA_DYNSET_SET_NAME, NFTA_DYNSET_SET_ID),
-        NftExpr::ObjrefMap { set, .. } => (*set, NFTA_OBJREF_SET_NAME, NFTA_OBJREF_SET_ID),
+    let set_name = |set| table.sets.iter().find(|s| s.handle == set).map(|s| &s.name[..]);
+    let (name, name_ty, id_ty) = match expr {
+        NftExpr::Lookup { set, .. } => (set_name(*set), NFTA_LOOKUP_SET, NFTA_LOOKUP_SET_ID),
+        NftExpr::Dynset(d) => (set_name(d.set), NFTA_DYNSET_SET_NAME, NFTA_DYNSET_SET_ID),
+        NftExpr::ObjrefMap { set, .. } => {
+            (set_name(*set), NFTA_OBJREF_SET_NAME, NFTA_OBJREF_SET_ID)
+        }
+        NftExpr::Objref { obj } => {
+            let o = table.objs.iter().find(|o| o.handle == *obj);
+            (o.map(|o| &o.name[..]), NFTA_OBJREF_IMM_NAME, u32::MAX)
+        }
         _ => return nla.to_vec(),
     };
-    let Some(set) = table.sets.iter().find(|s| s.handle == set) else { return nla.to_vec() };
+    let Some(name) = name else { return nla.to_vec() };
     let mut b = Builder::new(0, 0, 0, 0);
     for (ty, data) in nla_raw(nla) {
         if u32::from(ty & NLA_TYPE_MASK as u16) != NFTA_EXPR_DATA {
@@ -510,7 +520,7 @@ pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec
         for (t, v) in nla_raw(data) {
             match u32::from(t & NLA_TYPE_MASK as u16) {
                 n if n == name_ty => {
-                    b.put(t, &cstr(&set.name));
+                    b.put(t, &cstr(name));
                 }
                 n if n == id_ty => {}
                 _ => {
@@ -782,6 +792,8 @@ fn nft_ct_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
         NFT_CT_SRC_IP | NFT_CT_DST_IP => (4, true),
         NFT_CT_SRC_IP6 | NFT_CT_DST_IP6 => (16, true),
         NFT_CT_PROTO_SRC | NFT_CT_PROTO_DST => (2, true),
+        // `NF_CT_HELPER_NAME_LEN`, the name of the helper.
+        NFT_CT_HELPER => (16, false),
         _ => return Err(Errno::EOPNOTSUPP),
     };
     if needs_dir != dir.is_some() {
@@ -979,6 +991,8 @@ fn nft_ct_get(key: u32, dir: usize, len: usize, skb: &NetBuf) -> Option<Vec<u8>>
         // The ports are in the order of the network, as `tuple->src.u.all`.
         NFT_CT_PROTO_SRC => Some(t.src_u.to_be_bytes().to_vec()),
         NFT_CT_PROTO_DST => Some(t.dst_u.to_be_bytes().to_vec()),
+        // The connections of rk have no helper, and Linux gives `NFT_BREAK` for a connection
+        // with no helper.
         _ => None,
     }
 }
