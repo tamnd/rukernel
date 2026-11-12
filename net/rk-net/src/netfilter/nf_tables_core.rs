@@ -58,10 +58,11 @@ mod nft_objects;
 #[cfg(test)]
 pub(crate) use self::nft_exprs::nft_log_line;
 use self::nft_exprs::{
-    NftByteorder, NftHash, NftLimit, NftNumgen, NftRange, NftReject, nft_byteorder_eval,
-    nft_byteorder_init, nft_hash_eval, nft_hash_init, nft_limit_eval, nft_limit_init, nft_log_init,
-    nft_numgen_eval, nft_numgen_init, nft_prandom, nft_range_eval, nft_range_init, nft_realtime_ns,
-    nft_reject_eval, nft_reject_init,
+    NftByteorder, NftHash, NftLimit, NftNumgen, NftPayloadSet, NftQueue, NftRange, NftReject,
+    nft_byteorder_eval, nft_byteorder_init, nft_hash_eval, nft_hash_init, nft_limit_eval,
+    nft_limit_init, nft_log_init, nft_numgen_eval, nft_numgen_init, nft_payload_set_eval,
+    nft_payload_set_init, nft_prandom, nft_queue_eval, nft_queue_init, nft_range_eval,
+    nft_range_init, nft_realtime_ns, nft_reject_eval, nft_reject_init,
 };
 pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
 use self::nft_flowtable::nft_flow_offload_init;
@@ -298,6 +299,10 @@ pub(super) enum NftExpr {
     Numgen(NftNumgen),
     /// `hash`, as nft_hash.c.
     Hash(NftHash),
+    /// `payload` that writes a register to the packet, as `nft_payload_set_eval`.
+    PayloadSet(NftPayloadSet),
+    /// `queue`, as nft_queue.c.
+    Queue(NftQueue),
     /// `limit`, as nft_limit.c. The copies of the rule share the bucket.
     Limit(Arc<NftLimit>),
     /// `quota`, as nft_quota.c. The copies of the rule share the bytes.
@@ -558,11 +563,7 @@ pub(super) fn nf_tables_expr_parse(
             Ok(NftExpr::Cmp { sreg, op, data: v })
         }
         b"payload" => {
-            let a = Attrs::parse(data, 5);
-            if a.has(NFTA_PAYLOAD_SREG) {
-                // The change of the packet comes later.
-                return Err(Errno::EOPNOTSUPP);
-            }
+            let a = Attrs::parse(data, 8);
             let base = match be32(&a, NFTA_PAYLOAD_BASE)? {
                 Some(
                     b @ (NFT_PAYLOAD_LL_HEADER
@@ -572,6 +573,12 @@ pub(super) fn nf_tables_expr_parse(
                 Some(_) => return Err(Errno::EOPNOTSUPP),
                 None => return Err(Errno::EINVAL),
             };
+            if a.has(NFTA_PAYLOAD_SREG) {
+                if a.has(NFTA_PAYLOAD_DREG) {
+                    return Err(Errno::EINVAL);
+                }
+                return Ok(NftExpr::PayloadSet(nft_payload_set_init(&a, base)?));
+            }
             let Some(offset) = be32(&a, NFTA_PAYLOAD_OFFSET)? else { return Err(Errno::EINVAL) };
             if offset > u32::from(u8::MAX) {
                 return Err(Errno::ERANGE);
@@ -707,6 +714,7 @@ pub(super) fn nf_tables_expr_parse(
         b"byteorder" => Ok(NftExpr::Byteorder(nft_byteorder_init(data)?)),
         b"range" => Ok(NftExpr::Range(nft_range_init(data)?)),
         b"numgen" => Ok(NftExpr::Numgen(nft_numgen_init(data)?)),
+        b"queue" => Ok(NftExpr::Queue(nft_queue_init(data)?)),
         b"hash" => Ok(NftExpr::Hash(nft_hash_init(data)?)),
         b"limit" => Ok(NftExpr::Limit(nft_limit_init(data)?)),
         b"quota" => Ok(NftExpr::Quota(nft_quota_init(data)?)),
@@ -1748,6 +1756,8 @@ fn nft_eval(
             NftExpr::Byteorder(b) => nft_byteorder_eval(b, regs),
             NftExpr::Range(r) => nft_range_eval(r, regs),
             NftExpr::Numgen(n) => nft_numgen_eval(n, regs),
+            NftExpr::PayloadSet(p) => nft_payload_set_eval(p, regs, skb, pkt),
+            NftExpr::Queue(q) => nft_queue_eval(q, regs),
             NftExpr::Hash(h) => nft_hash_eval(h, regs, skb, state.pf, pkt),
             NftExpr::Limit(l) => nft_limit_eval(l, regs, skb),
             NftExpr::Quota(q) => nft_quota_eval(q, regs, skb),
@@ -1824,7 +1834,9 @@ pub(super) fn nft_do_chain(
 
 #[cfg(test)]
 mod tests {
+    use super::nft_exprs::{NFT_PAYLOAD_CSUM_INET, NFT_PAYLOAD_CSUM_NONE};
     use super::*;
+    use crate::netfilter::nf_nat::{csum_add, csum_fold};
     use crate::netfilter::{NF_ACCEPT, NF_INET_LOCAL_OUT};
     use alloc::vec;
 
@@ -2300,5 +2312,127 @@ mod tests {
         assert_eq!(reg(NFT_REG32_15, 8), Err(Errno::ERANGE));
         assert_eq!(reg(NFT_REG_VERDICT, 4), Err(Errno::EINVAL));
         assert_eq!(reg(1, 0), Err(Errno::EINVAL));
+    }
+
+    /// An IPv4 TCP packet from 10.0.0.1:1000 to 10.0.0.2:80 with good checksums.
+    fn tcp4() -> NetBuf {
+        let mut p = vec![0u8; 44];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&44u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 6;
+        p[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        p[20..22].copy_from_slice(&1000u16.to_be_bytes());
+        p[22..24].copy_from_slice(&80u16.to_be_bytes());
+        p[32] = 0x50;
+        p[40..44].copy_from_slice(b"data");
+        fix_csums(&mut p);
+        NetBuf::from_slice(&p)
+    }
+
+    /// Computes the checksums of the IPv4 header and the TCP header of `p` again.
+    fn fix_csums(p: &mut [u8]) {
+        p[10..12].fill(0);
+        let s = csum_fold(csum_add(0, &p[..20]));
+        p[10..12].copy_from_slice(&s.to_be_bytes());
+        p[36..38].fill(0);
+        let mut s = csum_add(0, &p[12..20]);
+        s = csum_add(s, &[0, 6, 0, 24]);
+        let s = csum_fold(csum_add(s, &p[20..]));
+        p[36..38].copy_from_slice(&s.to_be_bytes());
+    }
+
+    fn payload_set(
+        base: u32,
+        offset: usize,
+        len: usize,
+        csum_type: u32,
+        csum_offset: usize,
+        l4csum: bool,
+    ) -> NftExpr {
+        NftExpr::PayloadSet(NftPayloadSet {
+            base,
+            offset,
+            len,
+            sreg: R1,
+            csum_type,
+            csum_offset,
+            l4csum,
+        })
+    }
+
+    #[test]
+    fn payload_set_writes_the_packet_and_changes_the_checksums() {
+        let s = state(NFPROTO_IPV4);
+        // ip daddr set 192.168.7.9, with the checksums of the IP header and of TCP.
+        let r = vec![
+            e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(vec![192, 168, 7, 9]) }),
+            e(payload_set(NFT_PAYLOAD_NETWORK_HEADER, 16, 4, NFT_PAYLOAD_CSUM_INET, 10, true)),
+        ];
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+        let mut p = tcp4();
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
+        let mut want = tcp4().data().to_vec();
+        want[16..20].copy_from_slice(&[192, 168, 7, 9]);
+        fix_csums(&mut want);
+        assert_eq!(p.data(), &want[..]);
+
+        // tcp dport set 8080, with the checksum of TCP at offset 16.
+        let r = vec![
+            e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(8080u16.to_be_bytes().to_vec()) }),
+            e(payload_set(NFT_PAYLOAD_TRANSPORT_HEADER, 2, 2, NFT_PAYLOAD_CSUM_INET, 16, false)),
+        ];
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+        let mut p = tcp4();
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
+        let mut want = tcp4().data().to_vec();
+        want[22..24].copy_from_slice(&8080u16.to_be_bytes());
+        fix_csums(&mut want);
+        assert_eq!(p.data(), &want[..]);
+
+        // A write past the end of the packet ends the rule, and the packet stays.
+        let r = vec![
+            e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(vec![1, 2, 3, 4]) }),
+            e(payload_set(NFT_PAYLOAD_TRANSPORT_HEADER, 22, 4, NFT_PAYLOAD_CSUM_NONE, 0, false)),
+            verdict(NF_DROP, 0),
+        ];
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+        let mut p = tcp4();
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_ACCEPT);
+        assert_eq!(p.data(), tcp4().data());
+
+        // A UDP datagram with no checksum gets the write and keeps no checksum, as in Linux.
+        let r = vec![
+            e(NftExpr::Immediate { dreg: R1, data: NftImm::Value(vec![10, 0, 0, 3]) }),
+            e(payload_set(NFT_PAYLOAD_NETWORK_HEADER, 16, 4, NFT_PAYLOAD_CSUM_NONE, 0, true)),
+            verdict(NF_DROP, 0),
+        ];
+        let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+        let mut p = udp4(9);
+        assert_eq!(nft_do_chain(&prog, NF_ACCEPT, &mut p, &s), NF_DROP);
+        let mut want = udp4(9).data().to_vec();
+        want[16..20].copy_from_slice(&[10, 0, 0, 3]);
+        assert_eq!(p.data(), &want[..]);
+        assert_eq!(p.data()[26..28], [0, 0]);
+    }
+
+    #[test]
+    fn queue_gives_the_verdict_of_the_queue() {
+        use crate::netfilter::{NF_VERDICT_FLAG_QUEUE_BYPASS, nf_queue_nr};
+        let s = state(NFPROTO_IPV4);
+        let q = |data: &[u8]| {
+            let r = vec![e(NftExpr::Queue(nft_queue_init(data).unwrap()))];
+            let prog = NftProg { chains: vec![vec![r]], sets: vec![], nat: false };
+            nft_do_chain(&prog, NF_ACCEPT, &mut udp4(9), &s)
+        };
+        // queue num 3 bypass: NFTA_QUEUE_NUM and NFTA_QUEUE_FLAGS.
+        let a = [6, 0, 1, 0, 0, 3, 0, 0, 6, 0, 3, 0, 0, 1, 0, 0];
+        assert_eq!(q(&a), nf_queue_nr(3) | NF_VERDICT_FLAG_QUEUE_BYPASS);
+        assert_eq!(q(&a[..8]), nf_queue_nr(3));
+        // A queue number and a register together are not valid, and neither is no queue.
+        let both = [6, 0, 1, 0, 0, 3, 0, 0, 8, 0, 4, 0, 0, 0, 0, 1];
+        assert_eq!(nft_queue_init(&both).unwrap_err(), Errno::EINVAL);
+        assert_eq!(nft_queue_init(&a[8..]).unwrap_err(), Errno::EINVAL);
     }
 }

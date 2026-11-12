@@ -1,12 +1,21 @@
 //! The expressions `byteorder`, `range`, `limit`, `log`, `reject`, `numgen` and `hash` of
 //! nf_tables, as nft_byteorder.c, nft_range.c, nft_limit.c, nft_log.c, nf_log_syslog.c,
 //! nft_reject.c, nft_reject_ipv4.c, nft_reject_ipv6.c, nft_reject_inet.c, nft_numgen.c and
-//! nft_hash.c of Linux.
+//! nft_hash.c of Linux, and `payload` that writes the packet and `queue`, as nft_payload.c and
+//! nft_queue.c of Linux.
 
-use super::{NFT_BREAK, NftRegs, be32, be64, len_attr, nft_parse_register, nft_value};
+use super::{
+    NFT_BREAK, NFT_PAYLOAD_NETWORK_HEADER, NFT_PAYLOAD_TRANSPORT_HEADER, NFTA_PAYLOAD_LEN,
+    NFTA_PAYLOAD_OFFSET, NFTA_PAYLOAD_SREG, NftRegs, be32, be64, len_attr, nft_parse_register,
+    nft_value,
+};
 use crate::buf::NetBuf;
+use crate::netfilter::nf_nat::{csum_add, csum_fold, sctp_crc};
 use crate::netfilter::nf_reject::{NfReject, nf_send_reject};
-use crate::netfilter::{NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NfHookState, NfPktinfo};
+use crate::netfilter::{
+    NF_VERDICT_FLAG_QUEUE_BYPASS, NFPROTO_INET, NFPROTO_IPV4, NFPROTO_IPV6, NfHookState, NfPktinfo,
+    nf_queue_nr,
+};
 use crate::netlink::msg::Attrs;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1172,4 +1181,237 @@ mod tests {
         let (mask, nat) = super::super::nft_expr_hooks(&e).unwrap();
         assert!(!nat && mask & 1 << crate::netfilter::NF_INET_POST_ROUTING == 0);
     }
+}
+
+// `NFTA_PAYLOAD_CSUM_*`, `enum nft_payload_csum_types` and `enum nft_payload_csum_flags`.
+const NFTA_PAYLOAD_CSUM_TYPE: u32 = 6;
+const NFTA_PAYLOAD_CSUM_OFFSET: u32 = 7;
+const NFTA_PAYLOAD_CSUM_FLAGS: u32 = 8;
+pub(super) const NFT_PAYLOAD_CSUM_NONE: u32 = 0;
+pub(super) const NFT_PAYLOAD_CSUM_INET: u32 = 1;
+pub(super) const NFT_PAYLOAD_CSUM_SCTP: u32 = 2;
+const NFT_PAYLOAD_L4CSUM_PSEUDOHDR: u32 = 1;
+
+const IPPROTO_TCP: u8 = 6;
+const IPPROTO_UDP: u8 = 17;
+const IPPROTO_ICMPV6: u8 = 58;
+const IPPROTO_SCTP: u8 = 132;
+const IPPROTO_UDPLITE: u8 = 136;
+
+/// `payload` that writes a register to the packet, as `nft_payload_set` of Linux.
+#[derive(Clone, Debug)]
+pub(crate) struct NftPayloadSet {
+    pub(super) base: u32,
+    pub(super) offset: usize,
+    pub(super) len: usize,
+    pub(super) sreg: usize,
+    pub(super) csum_type: u32,
+    pub(super) csum_offset: usize,
+    /// `NFT_PAYLOAD_L4CSUM_PSEUDOHDR`: the bytes are in the pseudo header of the checksum of
+    /// the transport header too.
+    pub(super) l4csum: bool,
+}
+
+/// Reads `payload` with `NFTA_PAYLOAD_SREG`, as `nft_payload_set_init` of Linux. `base` is a
+/// base that the packet can have.
+pub(super) fn nft_payload_set_init(a: &Attrs<'_>, base: u32) -> Result<NftPayloadSet> {
+    let Some(offset) = be32(a, NFTA_PAYLOAD_OFFSET)? else { return Err(Errno::EINVAL) };
+    if offset > u32::from(u8::MAX) {
+        return Err(Errno::ERANGE);
+    }
+    let len = len_attr(a, NFTA_PAYLOAD_LEN)?;
+    let csum_type = be32(a, NFTA_PAYLOAD_CSUM_TYPE)?.unwrap_or(NFT_PAYLOAD_CSUM_NONE);
+    let csum_offset = match be32(a, NFTA_PAYLOAD_CSUM_OFFSET)? {
+        Some(o) if o > u32::from(u8::MAX) => return Err(Errno::ERANGE),
+        o => o.unwrap_or(0) as usize,
+    };
+    let flags = be32(a, NFTA_PAYLOAD_CSUM_FLAGS)?.unwrap_or(0);
+    if flags & !NFT_PAYLOAD_L4CSUM_PSEUDOHDR != 0 {
+        return Err(Errno::EINVAL);
+    }
+    match csum_type {
+        NFT_PAYLOAD_CSUM_NONE | NFT_PAYLOAD_CSUM_INET => {}
+        // The checksum of SCTP is at offset 8 of its header.
+        NFT_PAYLOAD_CSUM_SCTP if base == NFT_PAYLOAD_TRANSPORT_HEADER && csum_offset == 8 => {}
+        NFT_PAYLOAD_CSUM_SCTP => return Err(Errno::EINVAL),
+        _ => return Err(Errno::EOPNOTSUPP),
+    }
+    let sreg = nft_parse_register(a, NFTA_PAYLOAD_SREG, len)?;
+    Ok(NftPayloadSet {
+        base,
+        offset: offset as usize,
+        len,
+        sreg,
+        csum_type,
+        csum_offset,
+        l4csum: flags != 0,
+    })
+}
+
+/// Writes the register of `p` to the packet and changes the checksums, as
+/// `nft_payload_set_eval` of Linux. A write that the packet cannot take ends the rule.
+pub(super) fn nft_payload_set_eval(
+    p: &NftPayloadSet,
+    regs: &mut NftRegs,
+    skb: &mut NetBuf,
+    pkt: &NfPktinfo,
+) {
+    let src = &regs.data[p.sreg..p.sreg + p.len];
+    if nft_payload_set(skb, pkt, src, p).is_none() {
+        regs.verdict = NFT_BREAK;
+    }
+}
+
+fn nft_payload_set(skb: &mut NetBuf, pkt: &NfPktinfo, src: &[u8], p: &NftPayloadSet) -> Option<()> {
+    let start = match p.base {
+        NFT_PAYLOAD_NETWORK_HEADER => 0,
+        NFT_PAYLOAD_TRANSPORT_HEADER => pkt.thoff?,
+        // The packet has no link layer header at the hooks of IPv4 and IPv6.
+        _ => return None,
+    };
+    let at = start + p.offset;
+    let end = at + src.len();
+    let d = skb.data_mut();
+    if end > d.len() {
+        return None;
+    }
+    if p.csum_type == NFT_PAYLOAD_CSUM_INET || p.l4csum {
+        let fsum = csum_add(0, &d[at..end]);
+        let tsum = csum_add(0, src);
+        if p.csum_type == NFT_PAYLOAD_CSUM_INET {
+            nft_csum_replace(d, start + p.csum_offset, fsum, tsum)?;
+        }
+        // A packet with no checksum of the transport header keeps none, as
+        // `nft_payload_l4csum_update` of Linux.
+        if p.l4csum
+            && let Some(l4) = nft_payload_l4csum_offset(pkt, d)
+        {
+            nft_csum_replace(d, l4, fsum, tsum)?;
+        }
+    }
+    d[at..end].copy_from_slice(src);
+    if p.csum_type == NFT_PAYLOAD_CSUM_SCTP && pkt.l4proto == IPPROTO_SCTP {
+        let t = pkt.thoff?;
+        let ip_end = nft_ip_end(d).min(d.len());
+        if ip_end < t + 12 {
+            return None;
+        }
+        let crc = sctp_crc(&d[t..ip_end]);
+        d[t + 8..t + 12].copy_from_slice(&crc.to_le_bytes());
+    }
+    Some(())
+}
+
+/// Changes the checksum at `at` of `d` for the bytes of the sum `tsum` in place of the bytes
+/// of the sum `fsum`, as `nft_csum_replace` of Linux.
+fn nft_csum_replace(d: &mut [u8], at: usize, fsum: u32, tsum: u32) -> Option<()> {
+    let w = d.get_mut(at..at + 2)?;
+    let old = u16::from_be_bytes([w[0], w[1]]);
+    // `csum_fold` gives the complement of the sum.
+    let s = u32::from(!old) + u32::from(csum_fold(fsum)) + u32::from(!csum_fold(tsum));
+    let sum = match csum_fold(s) {
+        0 => 0xffff,
+        s => s,
+    };
+    w.copy_from_slice(&sum.to_be_bytes());
+    Some(())
+}
+
+/// The offset of the checksum of the transport header that has the pseudo header, as
+/// `nft_payload_l4csum_offset` of Linux. A UDP datagram with no checksum has none.
+fn nft_payload_l4csum_offset(pkt: &NfPktinfo, d: &[u8]) -> Option<usize> {
+    let t = pkt.thoff?;
+    let at = match pkt.l4proto {
+        IPPROTO_TCP => 16,
+        IPPROTO_UDP => {
+            if d.get(t + 6..t + 8)? == [0, 0] {
+                return None;
+            }
+            6
+        }
+        IPPROTO_UDPLITE => 6,
+        IPPROTO_ICMPV6 => 2,
+        _ => return None,
+    };
+    Some(t + at)
+}
+
+/// The end of the IP packet `d`, from the length in its header.
+fn nft_ip_end(d: &[u8]) -> usize {
+    match d.first().map(|b| b >> 4) {
+        Some(4) if d.len() >= 4 => usize::from(u16::from_be_bytes([d[2], d[3]])),
+        Some(6) if d.len() >= 6 => 40 + usize::from(u16::from_be_bytes([d[4], d[5]])),
+        _ => d.len(),
+    }
+}
+
+// `NFTA_QUEUE_*` and `NFT_QUEUE_FLAG_*`.
+const NFTA_QUEUE_NUM: u32 = 1;
+const NFTA_QUEUE_TOTAL: u32 = 2;
+const NFTA_QUEUE_FLAGS: u32 = 3;
+const NFTA_QUEUE_SREG_QNUM: u32 = 4;
+const NFT_QUEUE_FLAG_BYPASS: u16 = 0x01;
+const NFT_QUEUE_FLAG_CPU_FANOUT: u16 = 0x02;
+const NFT_QUEUE_FLAG_MASK: u16 = 0x03;
+
+fn be16_attr(a: &Attrs<'_>, ty: u32) -> Result<Option<u16>> {
+    match a.get(ty) {
+        None => Ok(None),
+        Some(&[x, y]) => Ok(Some(u16::from_be_bytes([x, y]))),
+        Some(_) => Err(Errno::EINVAL),
+    }
+}
+
+/// `queue`, as nft_queue.c of Linux: the queue `num`, or the queue in the register `sreg`.
+#[derive(Clone, Debug)]
+pub(crate) struct NftQueue {
+    num: u16,
+    sreg: Option<usize>,
+    bypass: bool,
+}
+
+/// Reads `queue`, as `nft_queue_select_ops`, `nft_queue_init` and `nft_queue_sreg_init` of
+/// Linux.
+pub(super) fn nft_queue_init(data: &[u8]) -> Result<NftQueue> {
+    let a = Attrs::parse(data, 4);
+    let flags = be16_attr(&a, NFTA_QUEUE_FLAGS)?.unwrap_or(0);
+    if flags & !NFT_QUEUE_FLAG_MASK != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let bypass = flags & NFT_QUEUE_FLAG_BYPASS != 0;
+    match (a.has(NFTA_QUEUE_NUM), a.has(NFTA_QUEUE_SREG_QNUM)) {
+        (true, true) | (false, false) => Err(Errno::EINVAL),
+        (true, false) => {
+            let num = be16_attr(&a, NFTA_QUEUE_NUM)?.unwrap_or(0);
+            let total = be16_attr(&a, NFTA_QUEUE_TOTAL)?.unwrap_or(1);
+            if total == 0 {
+                return Err(Errno::EINVAL);
+            }
+            if u32::from(total) - 1 + u32::from(num) > u32::from(u16::MAX) {
+                return Err(Errno::ERANGE);
+            }
+            Ok(NftQueue { num, sreg: None, bypass })
+        }
+        (false, true) => {
+            let sreg = nft_parse_register(&a, NFTA_QUEUE_SREG_QNUM, 4)?;
+            if flags & NFT_QUEUE_FLAG_CPU_FANOUT != 0 {
+                return Err(Errno::EOPNOTSUPP);
+            }
+            Ok(NftQueue { num: 0, sreg: Some(sreg), bypass })
+        }
+    }
+}
+
+/// Gives the packet to its queue, as `nft_queue_eval` and `nft_queue_sreg_eval` of Linux. A
+/// spread of the packets over more than one queue is not here: the first queue gets them.
+pub(super) fn nft_queue_eval(q: &NftQueue, regs: &mut NftRegs) {
+    let num = match q.sreg {
+        Some(r) => {
+            let w = &regs.data[r..r + 4];
+            u32::from_ne_bytes([w[0], w[1], w[2], w[3]]) as u16
+        }
+        None => q.num,
+    };
+    let bypass = if q.bypass { NF_VERDICT_FLAG_QUEUE_BYPASS } else { 0 };
+    regs.verdict = nf_queue_nr(num) | bypass;
 }

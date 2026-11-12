@@ -17,6 +17,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - fanotify has `FAN_REPORT_MNT`. A group with this flag marks a mount namespace with `FAN_MARK_MNTNS` and gets `FAN_MNT_ATTACH` and `FAN_MNT_DETACH` when a mount of the namespace is attached, moved or unmounted. Each event has a `FAN_EVENT_INFO_TYPE_MNT` record with the unique mount ID, and the errors and the record layout are the same as in Linux. The `init` boot test checks the errors, the fdinfo line and the events of mount, move and umount. (#539)
 - The `sdbpf` boot test runs the unit tests test-bpf-devices, test-bpf-firewall and test-bpf-foreign-programs of systemd. They attach cgroup programs with `BPF_PROG_ATTACH`, `BPF_PROG_DETACH`, `BPF_PROG_QUERY` and `BPF_LINK_CREATE`, and all three pass. `RK_SYSTEMD_PACKAGES` of tools/systemd/build.sh adds packages to the systemd tree, and this test needs `systemd-tests` and `iputils-ping` (#537).
+- The expression `payload` of nf_tables writes the packet, as `nft_payload_set_eval` of Linux, with the checksums of IP, of the transport header and of SCTP. The expression `queue`, as nft_queue.c of Linux, gives the packet to its queue (#542).
 
 ### Fixed
 
