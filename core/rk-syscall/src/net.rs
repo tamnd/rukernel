@@ -240,6 +240,7 @@ fn family_socket(
             let protocol = u32::try_from(protocol).map_err(|_| Errno::EINVAL)?;
             Ok(rk_net::packet::PacketSocket::new(kind, protocol)?)
         }
+        rk_net::alg::AF_ALG => Ok(rk_net::alg::AlgSocket::new(kind, protocol)?),
         AF_NETLINK => {
             let protocol = u32::try_from(protocol as i32).map_err(|_| Errno::EPROTONOSUPPORT)?;
             Ok(rk_net::netlink::NetlinkSocket::new(kind, protocol)?)

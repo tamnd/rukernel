@@ -223,6 +223,7 @@ name = "rk-net"
 version = "0.5.22"
 dependencies = [
  "rk-abi",
+ "rk-crypto",
  "rk-frame",
  "rk-vfs",
 ]
