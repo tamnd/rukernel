@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - `/sys/firmware/acpi/tables` with a copy of each ACPI table, as Linux: the tables of the RSDT or the XSDT, and the DSDT and the FACS of the FADT. Duplicate signatures get a number from 1, for example `SSDT1`, and the files are mode 0400. After a boot with EFI, `/sys/firmware/efi` is there with `fw_platform_size`. With `RK_TPM=1`, the `systemd` boot test starts the kernel from OVMF, so `systemd-analyze has-tpm2` gives the full TPM2 support and the test compares `systemd-analyze pcrs` with tpm2_pcrread (#541).
+- The boot test `ubuntu`: `cargo xtask boot-test ubuntu` boots Ubuntu 26.04 with systemd and AppArmor in enforce mode to `multi-user.target`. apparmor.service loads the profiles of Ubuntu, and a check service checks the state of systemd, the profiles in enforce mode and a denial with `EACCES`. Set RK_UBUNTU to the tree of `RK_SYSTEMD_PACKAGES=apparmor tools/systemd/build.sh OUT_FILE amd64 ubuntu:26.04` (#540).
 
 ## [0.5.30] - 2026-11-14
 

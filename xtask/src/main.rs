@@ -413,6 +413,13 @@ const SYSTEMD_MEMORY: &str = "2G";
 /// of the TPM. The machine of this test has a TPM, see `tpm_for`.
 const SYSTEMD_TESTS: &[&str] = &["udevd", "networkd", "sdbpf", "cryptenroll"];
 
+/// Tells if the boot test `test` boots a tree with systemd as PID 1: the `systemd` test, the
+/// tests of `SYSTEMD_TESTS` and the `ubuntu` test. A service of the tree prints the line of the
+/// result and stops the machine.
+fn boots_systemd(test: &str) -> bool {
+    test == "systemd" || test == "ubuntu" || SYSTEMD_TESTS.contains(&test)
+}
+
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -472,6 +479,7 @@ const BOOT_TESTS: &[&str] = &[
     "networkd",
     "sdbpf",
     "cryptenroll",
+    "ubuntu",
     "fstests",
 ];
 
@@ -1198,6 +1206,94 @@ echo "rk-systemd: $(/usr/lib/systemd/systemd --version | head -n 1)"
 exec /usr/lib/systemd/systemd
 "#,
         glibc_programs: &["bpfpin", "cgunit"],
+        debug_tools: false,
+    },
+    Rootfs {
+        name: "ubuntu",
+        url: "",
+        sha256: "",
+        var: "RK_UBUNTU",
+        // `RK_SYSTEMD_PACKAGES=apparmor tools/systemd/build.sh OUT_FILE amd64 ubuntu:26.04` makes
+        // the tree: Ubuntu 26.04 with systemd and AppArmor. The kernel runs with `apparmor=1`, so
+        // apparmor.service loads the profiles of /etc/apparmor.d in enforce mode at the start. At
+        // multi-user.target rk-check.service prints the state of the system and the units that
+        // failed, and stops the machine. The test passes if the state is `running`, or `degraded`
+        // with only the units of `allowed` in the failed list, apparmor.service is active, the
+        // kernel has profiles in enforce mode, and the profile `rk-deny` lets `cat` read
+        // /etc/rk-public but not /etc/rk-secret, where `cat` gives `EACCES`.
+        init: r#"#!/bin/sh
+set -e
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+rm -f /.dockerenv
+echo public > /etc/rk-public
+echo secret > /etc/rk-secret
+cat > /etc/apparmor.d/rk-deny << 'END'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile rk-deny {
+  include <abstractions/base>
+  /usr/** mrix,
+  /etc/rk-public r,
+}
+END
+cat > /etc/systemd/system/rk-check.service << 'END'
+[Unit]
+Description=The check of the ubuntu boot test of rukernel
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rk-check
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/console
+END
+mkdir -p /etc/systemd/system/multi-user.target.wants /usr/local/bin
+ln -sf ../rk-check.service /etc/systemd/system/multi-user.target.wants/rk-check.service
+cat > /usr/local/bin/rk-check << 'END'
+#!/bin/sh
+allowed=''
+other=
+state=$(systemctl is-system-running --wait || true)
+echo "rk-ubuntu: state $state"
+. /etc/os-release
+echo "rk-ubuntu: $PRETTY_NAME"
+[ "$ID" = ubuntu ] || other="$other os-release"
+echo "rk-ubuntu: aa-enabled $(aa-enabled 2>&1 || true)"
+systemctl is-active -q apparmor.service || other="$other apparmor.service"
+profiles=$(grep -c . /sys/kernel/security/apparmor/profiles || true)
+enforce=$(grep -c ' (enforce)$' /sys/kernel/security/apparmor/profiles || true)
+echo "rk-ubuntu: $profiles profiles, $enforce in enforce mode"
+[ "$enforce" -gt 0 ] || other="$other enforce"
+grep -qx 'rk-deny (enforce)' /sys/kernel/security/apparmor/profiles || other="$other rk-deny"
+if [ "$(aa-exec -p rk-deny -- cat /etc/rk-public)" = public ]; then
+    echo 'rk-ubuntu: rk-deny: cat reads /etc/rk-public'
+else
+    other="$other rk-public"
+fi
+if out=$(aa-exec -p rk-deny -- cat /etc/rk-secret 2>&1); then
+    other="$other rk-secret"
+fi
+echo "rk-ubuntu: rk-deny: $out"
+case $out in *'Permission denied'*) ;; *) other="$other EACCES" ;; esac
+failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
+for unit in $failed; do
+    echo "rk-ubuntu: failed $unit"
+    systemctl status --no-pager --lines=5 "$unit" | sed 's/^/rk-ubuntu:   /'
+    case " $allowed " in *" $unit "*) ;; *) other="$other $unit" ;; esac
+done
+[ -z "$other" ] || echo "rk-ubuntu: bad:$other"
+case $state in
+running | degraded) [ -n "$other" ] || echo 'rk-ubuntu: pass' ;;
+esac
+systemctl poweroff
+END
+chmod 755 /usr/local/bin/rk-check
+echo "rk-ubuntu: $(/usr/lib/systemd/systemd --version | head -n 1)"
+exec /usr/lib/systemd/systemd
+"#,
+        glibc_programs: &[],
         debug_tools: false,
     },
 ];
@@ -2432,6 +2528,10 @@ fn base_cmdline(test: &str) -> String {
         // settings that the tree does not have. The tree of Arch has no time zone, so without it
         // the boot stops at the question of the time zone.
         "systemd" => String::from("console=ttyS0 rk.test=init rdinit=/init systemd.firstboot=no"),
+        // The `ubuntu` test boots with AppArmor active.
+        "ubuntu" => {
+            String::from("console=ttyS0 rk.test=init rdinit=/init systemd.firstboot=no apparmor=1")
+        }
         t if SYSTEMD_TESTS.contains(&t) => {
             format!("console=ttyS0 rk.test=init rdinit=/init systemd.firstboot=no -- {t}")
         }
@@ -2445,7 +2545,7 @@ fn base_cmdline(test: &str) -> String {
 /// The line that the kernel prints when the boot test `test` passes. In the `systemd` test and
 /// the tests of `SYSTEMD_TESTS`, the check service prints the line.
 fn pass_line(test: &str) -> String {
-    if test == "systemd" || SYSTEMD_TESTS.contains(&test) {
+    if boots_systemd(test) {
         return format!("rk-{test}: pass");
     }
     let test = if matches!(
@@ -2810,8 +2910,10 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .and_then(|s| s.parse().ok())
                 .map_or(FSTESTS_TIMEOUT, Duration::from_secs);
             (cmd, timeout)
-        } else if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
-            let initrd = rootfs_initramfs(&kernel, "systemd");
+        } else if boots_systemd(test) {
+            // The `ubuntu` test has its own tree, with AppArmor.
+            let tree = if *test == "ubuntu" { "ubuntu" } else { "systemd" };
+            let initrd = rootfs_initramfs(&kernel, tree);
             // With a TPM, the `systemd` test boots with UEFI if there is OVMF. systemd 257 gives
             // the full TPM2 support of `systemd-analyze has-tpm2`, and with it the PCR values of
             // `systemd-analyze pcrs`, only after a boot with EFI (`efi_has_tpm2`). OVMF puts the
@@ -2909,11 +3011,7 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
         let _tpm =
             Swtpm::attach_for(&mut cmd, kernel.with_file_name("swtpm"), X86_TPM_DEVICE, test)?;
         let (status, log) = run_with_timeout(cmd, timeout, test_input(test))?;
-        let want = if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
-            QEMU_POWER_OFF
-        } else {
-            QEMU_PASS
-        };
+        let want = if boots_systemd(test) { QEMU_POWER_OFF } else { QEMU_PASS };
         let mut passed = status == Some(want) && log.contains(&pass_line(test));
         if let Some((_, kselftest)) = &tpm_initrd
             && passed
