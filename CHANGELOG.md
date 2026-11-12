@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.22] - 2026-11-12
+
 ### Added
 
 - The crypto API in the new crate `rk-crypto`, as crypto/ of Linux: the hashes SHA-1, SHA-224, SHA-256, SHA-384 and SHA-512, the template `hmac`, the block cipher AES, and the templates `ecb`, `cbc`, `ctr` and `xts` with ciphertext stealing. The code is plain Rust. The unit tests use the vectors of crypto/testmgr.h of Linux (#541).
@@ -1565,6 +1567,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.22]: https://github.com/tamnd/rukernel/compare/v0.5.21...v0.5.22
 [0.5.21]: https://github.com/tamnd/rukernel/compare/v0.5.20...v0.5.21
 [0.5.20]: https://github.com/tamnd/rukernel/compare/v0.5.19...v0.5.20
 [0.5.19]: https://github.com/tamnd/rukernel/compare/v0.5.18...v0.5.19
