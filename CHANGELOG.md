@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.23] - 2026-11-12
+
 ### Added
 
 - The eBPF verifier gives the result of kernel/bpf/verifier.c of Linux for all programs of bpf/test_verifier of the socket filter and cgroup program types. It prunes the paths with equal states at the jump targets and refuses a loop that does not end, it refines the bounds of a register after `BPF_JSET` and after a `BPF_JMP32` that compares as 64 bits, and it checks the alignment of the pointers and the size of each context field as Linux, with the errors and the log messages of Linux in the same order. `bpf(BPF_PROG_TEST_RUN)` runs a program on a packet or a context from user space. The kselftest boot test runs bpf/test_verifier, and tools/kselftest/bpf.md gives the result: 281 passed and 0 failed (#537).
@@ -1573,6 +1575,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.23]: https://github.com/tamnd/rukernel/compare/v0.5.22...v0.5.23
 [0.5.22]: https://github.com/tamnd/rukernel/compare/v0.5.21...v0.5.22
 [0.5.21]: https://github.com/tamnd/rukernel/compare/v0.5.20...v0.5.21
 [0.5.20]: https://github.com/tamnd/rukernel/compare/v0.5.19...v0.5.20
