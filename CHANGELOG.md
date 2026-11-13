@@ -4,13 +4,16 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- AppArmor checks the mounts, as mount.c of Linux: a mount, a remount, a bind mount, a change of the propagation, a move, `move_mount`, `umount2` and `pivot_root` need a `mount`, `umount` or `pivot_root` rule. A `mount` rule matches the mount point, the source, the type, the flags and the options. A denial gives `EACCES` and a record of the class `mount`. The VFS has the hooks `sb_mount`, `sb_umount`, `sb_pivotroot` and `move_mount` of Linux, and `mount(2)` calls `sb_mount` before the check of `CAP_SYS_ADMIN`, as `path_mount` of Linux (#540).
+
 ## [0.5.28] - 2026-11-13
 
 ### Added
 
 - AppArmor checks the sockets, as net.c and af_inet.c of the Ubuntu kernel: a create, a bind, a connect, a listen, an accept, a send, a receive, `getsockname`, `getpeername`, `getsockopt`, `setsockopt` and `shutdown` need a network rule for the family and the type of the socket. For IPv4 and IPv6, a rule can also name the protocol, the addresses and the ports, the option and the backlog. A denial gives `EACCES` and a record of the class `net` (#540).
 - AppArmor checks the creation of a user namespace, as task.c and lsm.c of the Ubuntu kernel. A profile with `userns` rules needs a rule that allows it, and a rule can give the label of the task in the new namespace. The new files `kernel.apparmor_restrict_unprivileged_userns`, `_force` and `_complain` of `/proc/sys` work as on Ubuntu: with the first at 1, an `unconfined` task without `CAP_SYS_ADMIN` goes to the profile `unprivileged_userns`, or gets `EACCES` if that profile is not there. A denial gives `EACCES` and a record of the class `namespace`. A security module can now give files of `/proc/sys` (#540).
-- AppArmor checks the mounts, as mount.c of Linux: a mount, a remount, a bind mount, a change of the propagation, a move, `move_mount`, `umount2` and `pivot_root` need a `mount`, `umount` or `pivot_root` rule. A `mount` rule matches the mount point, the source, the type, the flags and the options. A denial gives `EACCES` and a record of the class `mount`. The VFS has the hooks `sb_mount`, `sb_umount`, `sb_pivotroot` and `move_mount` of Linux, and `mount(2)` calls `sb_mount` before the check of `CAP_SYS_ADMIN`, as `path_mount` of Linux (#540).
 
 ### Fixed
 
