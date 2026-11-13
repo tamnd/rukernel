@@ -816,7 +816,7 @@ fn nft_nat_flags(flags: u32) -> Result<u32> {
     if flags & !NF_NAT_RANGE_MASK != 0 {
         return Err(Errno::EINVAL);
     }
-    if flags & (NF_NAT_RANGE_NETMAP | NF_NAT_RANGE_PROTO_OFFSET) != 0 {
+    if flags & NF_NAT_RANGE_PROTO_OFFSET != 0 {
         return Err(Errno::EOPNOTSUPP);
     }
     Ok(flags)
@@ -956,6 +956,27 @@ fn nft_nat_range(
         r.max_proto = u16::from_be_bytes([regs.data[hi], regs.data[hi + 1]]);
     }
     r
+}
+
+/// `nft_nat_setup_netmap`: the address of the packet with the prefix of the range. The first
+/// address of the range has the prefix, and the bits that are the same in the first and the last
+/// address are the prefix.
+fn nft_nat_setup_netmap(r: &mut NfNatRange, d: &[u8], pf: u8, mtype: u8) {
+    let src = mtype == NF_NAT_MANIP_SRC;
+    let at = match pf {
+        NFPROTO_IPV4 if src => 12..16,
+        NFPROTO_IPV4 => 16..20,
+        _ if src => 8..24,
+        _ => 24..40,
+    };
+    let Some(addr) = d.get(at) else { return };
+    let mut new = [0u8; 16];
+    for (i, &a) in addr.iter().enumerate() {
+        let netmask = !(r.min_addr[i] ^ r.max_addr[i]);
+        new[i] = a & !netmask | r.min_addr[i] & netmask;
+    }
+    r.min_addr = new;
+    r.max_addr = new;
 }
 
 /// Loads the key `key` of the connection of `skb`, as `nft_ct_get_eval` of Linux. A packet
@@ -1751,7 +1772,10 @@ fn nft_eval(
                     && hook2manip(state.hook) == *mtype
                     && let Some((ct, _)) = skb.nfct.get()
                 {
-                    let r = nft_nat_range(regs, *flags, *alen, *addr, *proto);
+                    let mut r = nft_nat_range(regs, *flags, *alen, *addr, *proto);
+                    if *flags & NF_NAT_RANGE_NETMAP != 0 && addr.is_some() {
+                        nft_nat_setup_netmap(&mut r, skb.data(), state.pf, *mtype);
+                    }
                     regs.verdict = nf_nat_setup_info(ct, &r, *mtype);
                 }
             }
@@ -2448,5 +2472,40 @@ mod tests {
         let both = [6, 0, 1, 0, 0, 3, 0, 0, 8, 0, 4, 0, 0, 0, 0, 1];
         assert_eq!(nft_queue_init(&both).unwrap_err(), Errno::EINVAL);
         assert_eq!(nft_queue_init(&a[8..]).unwrap_err(), Errno::EINVAL);
+    }
+
+    #[test]
+    fn a_netmap_keeps_the_bits_of_the_address_that_are_not_in_the_prefix() {
+        // 10.141.11.0/24 to 192.168.2.0/24: 10.141.11.7 is 192.168.2.7.
+        let mut r = NfNatRange { flags: NF_NAT_RANGE_NETMAP, ..NfNatRange::default() };
+        r.min_addr[..4].copy_from_slice(&[192, 168, 2, 0]);
+        r.max_addr[..4].copy_from_slice(&[192, 168, 2, 255]);
+        let mut p = vec![0u8; 20];
+        p[12..16].copy_from_slice(&[10, 141, 11, 7]);
+        p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        let mut s = r;
+        nft_nat_setup_netmap(&mut s, &p, NFPROTO_IPV4, NF_NAT_MANIP_SRC);
+        assert_eq!(s.min_addr[..4], [192, 168, 2, 7]);
+        assert_eq!(s.min_addr, s.max_addr);
+        let mut d = r;
+        nft_nat_setup_netmap(&mut d, &p, NFPROTO_IPV4, NF_NAT_MANIP_DST);
+        assert_eq!(d.min_addr[..4], [192, 168, 2, 2]);
+        // A short packet keeps the range.
+        let mut t = r;
+        nft_nat_setup_netmap(&mut t, &p[..16], NFPROTO_IPV4, NF_NAT_MANIP_DST);
+        assert_eq!(t, r);
+        // 2001:db8:1111::/64 to 2001:db8:2222::/64.
+        let mut r6 = NfNatRange { flags: NF_NAT_RANGE_NETMAP, ..NfNatRange::default() };
+        r6.min_addr[..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x22, 0x22]);
+        r6.max_addr = r6.min_addr;
+        r6.max_addr[8..].fill(0xff);
+        let mut p6 = vec![0u8; 40];
+        p6[8..14].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x11, 0x11]);
+        p6[20..24].copy_from_slice(&[0, 0, 0, 9]);
+        nft_nat_setup_netmap(&mut r6, &p6, NFPROTO_IPV6, NF_NAT_MANIP_SRC);
+        let mut want = [0u8; 16];
+        want[..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x22, 0x22]);
+        want[15] = 9;
+        assert_eq!((r6.min_addr, r6.max_addr), (want, want));
     }
 }
