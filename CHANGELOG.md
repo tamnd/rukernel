@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.26] - 2026-11-13
+
 ### Added
 
 - A socket has the owner and the mode of its inode, as sockfs of Linux. A new socket has the file system user and group IDs of the process and the mode 0777. `fchown`, `fchmod` and `fchownat` with `AT_EMPTY_PATH` change them. After the release of the socket, a change of the owner gives `ENOENT`, as `sockfs_setattr` of Linux for CVE-2019-8912. LTP af_alg07 tests this (#541).
@@ -1611,6 +1613,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.26]: https://github.com/tamnd/rukernel/compare/v0.5.25...v0.5.26
 [0.5.25]: https://github.com/tamnd/rukernel/compare/v0.5.24...v0.5.25
 [0.5.24]: https://github.com/tamnd/rukernel/compare/v0.5.23...v0.5.24
 [0.5.23]: https://github.com/tamnd/rukernel/compare/v0.5.22...v0.5.23
