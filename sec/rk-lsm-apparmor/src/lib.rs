@@ -9,7 +9,8 @@
 //! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]), the checks
 //! of the capabilities ([`capability`]), the checks of the signals ([`ipc`]) and of `ptrace`
 //! ([`ptrace`]) with the label of the other task ([`label`]), the checks of the sockets
-//! ([`net`]), of the user namespaces ([`ns`]) and of the mounts ([`mount`]).
+//! ([`net`]) and of the Unix sockets ([`unix`]), of the user namespaces ([`ns`]) and of the
+//! mounts ([`mount`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -36,6 +37,7 @@ pub mod ns;
 pub mod policy;
 pub mod ptrace;
 pub mod task;
+pub mod unix;
 pub mod unpack;
 
 use crate::unpack::perm;
@@ -78,6 +80,23 @@ impl SecurityHooks for AppArmor {
 
     fn socket_create(&self, family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
         net::create(family, kind, protocol, kern)
+    }
+
+    fn socket_post_create(&self, sock: &Sock<'_>, kern: bool) -> Result<()> {
+        unix::post_create(sock, kern);
+        Ok(())
+    }
+
+    fn unix_stream_connect(&self, sock: &Sock<'_>, other: &Sock<'_>, new: &Sock<'_>) -> Result<()> {
+        unix::stream_connect(sock, other, new)
+    }
+
+    fn unix_may_send(&self, sock: &Sock<'_>, other: &Sock<'_>) -> Result<()> {
+        unix::may_send(sock, other)
+    }
+
+    fn socket_getpeersec_stream(&self, sock: &Sock<'_>) -> Option<Result<Vec<u8>>> {
+        Some(unix::getpeersec(sock))
     }
 
     fn socket_bind(&self, sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
@@ -256,7 +275,12 @@ pub static LSM: LsmInfo = LsmInfo {
     id: LsmId { name: "apparmor", id: id::APPARMOR },
     order: Order::Mutable,
     flags: FLAG_LEGACY_MAJOR | FLAG_EXCLUSIVE,
-    blobs: BlobSizes { cred: domain::CRED_BLOB, file: file::FILE_BLOB, ..BlobSizes::NONE },
+    blobs: BlobSizes {
+        cred: domain::CRED_BLOB,
+        file: file::FILE_BLOB,
+        sock: unix::SOCK_BLOB,
+        ..BlobSizes::NONE
+    },
     hooks: &AppArmor,
 };
 

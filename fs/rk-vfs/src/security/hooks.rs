@@ -603,6 +603,17 @@ pub trait SecurityHooks: Sync {
         None
     }
 
+    /// `unix_stream_connect`: `sock` connects to the listener `other`, and `new` is the socket
+    /// of the connection for the listener. The caller holds the lock of `other`.
+    fn unix_stream_connect(&self, sock: &Sock<'_>, other: &Sock<'_>, new: &Sock<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    /// `unix_may_send`: the Unix datagram socket `sock` connects or sends to `other`.
+    fn unix_may_send(&self, sock: &Sock<'_>, other: &Sock<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// `socket_create`: the caller makes a socket. `kern` is true for a socket of the kernel.
     fn socket_create(&self, family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
         Ok(())
@@ -678,6 +689,12 @@ pub trait SecurityHooks: Sync {
     /// `socket_shutdown`: the caller stops a direction of `sock`. `how` is `SHUT_*`.
     fn socket_shutdown(&self, sock: &Sock<'_>, how: i32) -> Result<()> {
         Ok(())
+    }
+
+    /// `socket_getpeersec_stream`: the security context of the peer of `sock` for
+    /// `SO_PEERSEC`, without a 0 at the end. A module that does not give one gives `None`.
+    fn socket_getpeersec_stream(&self, sock: &Sock<'_>) -> Option<Result<Vec<u8>>> {
+        None
     }
 
     /// `ipc_permission`: the access `flag` (the permission bits, as 0o444 for a read) to the

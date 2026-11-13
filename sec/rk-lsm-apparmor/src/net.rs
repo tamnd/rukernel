@@ -12,14 +12,18 @@
 //! apparmor="DENIED" operation="create" class="net" profile="P" pid=PID comm="COMM"
 //!     family="inet" sock_type="stream" protocol=0 requested="create" denied="create"
 //! ```
+//!
+//! The checks of the Unix sockets are in [`crate::unix`].
 
 use crate::dfa::{NOMATCH, State};
 use crate::domain;
 use crate::label;
 use crate::policy::{Mode, Profile};
+use crate::unix::{self, AF_UNIX};
 use crate::unpack::{Pdb, Perms, class, perm};
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_vfs::cred::Cred;
@@ -111,7 +115,8 @@ fn mask_text(mask: u32) -> String {
     format!("\"{}\"", names.join(" "))
 }
 
-/// The fields of a record of the class `net` after `comm`, `audit_net_cb` of Linux.
+/// The fields of a record of the class `net` after `comm`, `audit_net_cb` of Linux, without
+/// the fields of a Unix socket.
 fn tail(family: u32, kind: u32, protocol: u32, request: u32, denied: u32) -> String {
     let mut s = String::new();
     match family_name(family) {
@@ -247,7 +252,7 @@ fn local(sock: &Sock<'_>) -> Result<Addr> {
 }
 
 /// The state after `bytes` from `state`, `aa_dfa_match_len` of Linux.
-fn walk(pdb: &Pdb, state: State, bytes: &[u8]) -> State {
+pub(crate) fn walk(pdb: &Pdb, state: State, bytes: &[u8]) -> State {
     pdb.dfa.as_ref().map_or(NOMATCH, |d| d.match_bytes(state, bytes))
 }
 
@@ -331,33 +336,49 @@ fn match_to_cmd(
 }
 
 /// The fields of a check for the record.
-struct Req<'x> {
+pub(crate) struct Req<'x> {
     /// The name of the operation.
-    op: &'x str,
+    pub(crate) op: &'x str,
     /// The requested permissions.
-    request: u32,
+    pub(crate) request: u32,
     /// The family, the type and the protocol of the socket.
-    family: u32,
-    kind: u32,
-    protocol: u32,
+    pub(crate) family: u32,
+    pub(crate) kind: u32,
+    pub(crate) protocol: u32,
+    /// The fields of the family after the permissions, from the requested permissions, as the
+    /// addresses of a Unix socket.
+    pub(crate) extra: Option<&'x dyn Fn(u32) -> String>,
 }
 
 /// `do_perms` of af_inet.c: the check of the permissions of `state`, or of `perms` when the
 /// match stopped early.
-fn do_perms(p: &Profile, pdb: &Pdb, state: State, perms: Option<Perms>, r: &Req<'_>) -> Result<()> {
+pub(crate) fn do_perms(
+    p: &Profile,
+    pdb: &Pdb,
+    state: State,
+    perms: Option<Perms>,
+    r: &Req<'_>,
+) -> Result<()> {
     let mut perms = match perms {
         Some(x) if state == NOMATCH => x,
         _ => label::lookup(pdb, state),
     };
     label::apply_modes(p, &mut perms);
-    label::check_perms(p, &perms, r.request, r.op, "net", |q, d| {
-        tail(r.family, r.kind, r.protocol, q, d)
-    })
+    label::check_perms(p, &perms, r.request, r.op, "net", |q, d| record(r, q, d))
+}
+
+/// The fields of the record of the check `r` after `comm`, with `q` requested and `d` denied.
+fn record(r: &Req<'_>, q: u32, d: u32) -> String {
+    let mut s = tail(r.family, r.kind, r.protocol, q, d);
+    if let Some(extra) = r.extra {
+        s.push_str(&extra(q));
+    }
+    s
 }
 
 /// The check of a socket of the family and the type of `r` for the profile `p`,
 /// `aa_profile_af_perm` of net.c. The match has only the family and the type.
-fn profile_af_perm(p: &Profile, r: &Req<'_>) -> Result<()> {
+pub(crate) fn profile_af_perm(p: &Profile, r: &Req<'_>) -> Result<()> {
     if p.mode == Mode::Unconfined || r.family >= AF_MAX || r.kind >= SOCK_MAX {
         return Ok(());
     }
@@ -376,13 +397,28 @@ fn af_perm(cred: &Cred, r: &Req<'_>) -> Result<()> {
     if domain::label_id(cred) == 0 {
         return Ok(());
     }
+    label_af_perm(&domain::label_of(cred), r)
+}
+
+/// The check of `r` for each confined profile of the label `l`.
+fn label_af_perm(l: &[Arc<Profile>], r: &Req<'_>) -> Result<()> {
     let mut result = Ok(());
-    for p in domain::label_of(cred).iter() {
+    for p in l.iter() {
         if let Err(e) = profile_af_perm(p, r) {
             result = Err(e);
         }
     }
     result
+}
+
+/// The state of the rules of `p` for the address family `family`, `RULE_MEDIATES_AF` of
+/// Ubuntu: the network rules, then the family as 16 bits in network byte order. Gives `None` if
+/// the profile has no rule for the family.
+pub(crate) fn mediates_af(p: &Profile, family: u32) -> Option<(&Pdb, State)> {
+    let (pdb, start) =
+        label::mediates(p, class::NET).or_else(|| label::mediates(p, class::NET_COMPAT))?;
+    let state = walk(pdb, start, &(family as u16).to_be_bytes());
+    (state != NOMATCH).then_some((pdb, state))
 }
 
 /// The operation of a check on an IPv4 or an IPv6 socket, with its addresses.
@@ -406,16 +442,9 @@ fn inet_profile_perm(p: &Profile, r: &Req<'_>, sock: Option<&Sock<'_>>, op: &Op)
     if p.mode == Mode::Unconfined {
         return Ok(());
     }
-    // `RULE_MEDIATES_AF` of Ubuntu: the network rules, then the family.
-    let Some((pdb, start)) =
-        label::mediates(p, class::NET).or_else(|| label::mediates(p, class::NET_COMPAT))
-    else {
+    let Some((pdb, state)) = mediates_af(p, r.family) else {
         return profile_af_perm(p, r);
     };
-    let state = walk(pdb, start, &(r.family as u16).to_be_bytes());
-    if state == NOMATCH {
-        return profile_af_perm(p, r);
-    }
     let (mut state, mut perms) = match (op, sock) {
         (Op::Create, _) | (_, None) => match_to_prot(pdb, state, r.request, r.kind, r.protocol),
         (Op::Sock(a), Some(s)) => match_to_sk(pdb, state, r.request, s, a),
@@ -470,7 +499,7 @@ fn is_inet(family: u32) -> bool {
 
 /// The fields of a check of `request` on `sock` for the record.
 fn req<'x>(op: &'x str, request: u32, sock: &Sock<'_>) -> Req<'x> {
-    Req { op, request, family: sock.family, kind: sock.kind, protocol: sock.protocol }
+    Req { op, request, family: sock.family, kind: sock.kind, protocol: sock.protocol, extra: None }
 }
 
 /// `apparmor_socket_create` of the Ubuntu kernel: the current task makes a socket. A socket
@@ -484,7 +513,10 @@ pub fn create(family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
     if kern {
         return Ok(());
     }
-    let r = Req { op: "create", request: CREATE, family, kind, protocol };
+    if family == AF_UNIX {
+        return unix::create(kind, protocol);
+    }
+    let r = Req { op: "create", request: CREATE, family, kind, protocol, extra: None };
     if is_inet(family) {
         return inet_perm(&r, None, || Ok(Op::Create));
     }
@@ -497,7 +529,10 @@ pub fn create(family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
 /// # Errors
 ///
 /// Gives `EACCES` if a profile of the task does not allow `request` on the socket.
-pub fn sk_perm(op: &str, request: u32, sock: &Sock<'_>) -> Result<()> {
+pub fn sk_perm(op: &'static str, request: u32, sock: &Sock<'_>) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return unix::sock_perm(op, request, sock);
+    }
     let r = req(op, request, sock);
     if is_inet(sock.family) {
         return inet_perm(&r, Some(sock), || Ok(Op::Sock(local(sock)?)));
@@ -513,6 +548,9 @@ pub fn sk_perm(op: &str, request: u32, sock: &Sock<'_>) -> Result<()> {
 /// Gives `EACCES` if a profile of the task does not allow the bind to `addr`, and `EINVAL` or
 /// `EAFNOSUPPORT` for an address that the bind of Linux does not take.
 pub fn bind(sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return unix::bind(sock, addr);
+    }
     let r = req("bind", BIND, sock);
     if !is_inet(sock.family) {
         return af_perm(&rk_vfs::cred::current(), &r);
@@ -528,13 +566,17 @@ pub fn bind(sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
 }
 
 /// `apparmor_socket_connect` of the Ubuntu kernel. A connect to `AF_UNSPEC` disconnects the
-/// socket, and is not mediated.
+/// socket, and is not mediated. The connect of a Unix socket has its checks in
+/// [`unix::stream_connect`] and [`unix::may_send`].
 ///
 /// # Errors
 ///
 /// Gives `EACCES` if a profile of the task does not allow the connect to `addr`, and `EINVAL`
 /// for an address with no family.
 pub fn connect(sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return Ok(());
+    }
     let r = req("connect", CONNECT, sock);
     if !is_inet(sock.family) {
         return af_perm(&rk_vfs::cred::current(), &r);
@@ -556,6 +598,9 @@ pub fn connect(sock: &Sock<'_>, addr: &[u8]) -> Result<()> {
 ///
 /// Gives `EACCES` if a profile of the task does not allow the listen.
 pub fn listen(sock: &Sock<'_>, backlog: i32) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return unix::listen(sock, backlog);
+    }
     let r = req("listen", LISTEN, sock);
     if !is_inet(sock.family) {
         return af_perm(&rk_vfs::cred::current(), &r);
@@ -569,11 +614,18 @@ pub fn listen(sock: &Sock<'_>, backlog: i32) -> Result<()> {
 ///
 /// Gives `EACCES` if a profile of the task does not allow the accept.
 pub fn accept(sock: &Sock<'_>) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return unix::accept(sock);
+    }
     sk_perm("accept", ACCEPT, sock)
 }
 
-/// `aa_sock_msg_perm` of the Ubuntu kernel: a send to `addr` or a receive on `sock`.
+/// `aa_sock_msg_perm` of the Ubuntu kernel: a send to `addr` or a receive on `sock`. A Unix
+/// socket has the checks of [`unix::may_send`] and of the connection.
 fn msg_perm(op: &str, request: u32, sock: &Sock<'_>, addr: Option<&[u8]>) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return Ok(());
+    }
     let r = req(op, request, sock);
     if !is_inet(sock.family) {
         return af_perm(&rk_vfs::cred::current(), &r);
@@ -619,12 +671,44 @@ pub fn recvmsg(sock: &Sock<'_>) -> Result<()> {
 /// # Errors
 ///
 /// Gives `EACCES` if a profile of the task does not allow `request` for the option.
-pub fn opt_perm(op: &str, request: u32, sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
+pub fn opt_perm(
+    op: &'static str,
+    request: u32,
+    sock: &Sock<'_>,
+    level: i32,
+    name: i32,
+) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return unix::opt_perm(op, request, sock, name);
+    }
     let r = req(op, request, sock);
     if !is_inet(sock.family) {
         return af_perm(&rk_vfs::cred::current(), &r);
     }
     inet_perm(&r, Some(sock), || Ok(Op::Opt(local(sock)?, level, name)))
+}
+
+/// The check of a read or a write of the socket file of `sock` by the label `l`,
+/// `aa_sock_file_perm` of the Ubuntu kernel.
+///
+/// # Errors
+///
+/// Gives `EACCES` if a profile of `l` does not allow `request` on the socket.
+pub(crate) fn sock_file_perm(
+    l: &[Arc<Profile>],
+    op: &'static str,
+    request: u32,
+    sock: &Sock<'_>,
+) -> Result<()> {
+    if sock.family == AF_UNIX {
+        return unix::file_perm(l, op, request, sock);
+    }
+    // An IPv4 or an IPv6 socket does not have the checks of its addresses of
+    // `aa_inet_file_perm` yet.
+    if is_inet(sock.family) {
+        return Ok(());
+    }
+    label_af_perm(l, &req(op, request, sock))
 }
 
 #[cfg(test)]

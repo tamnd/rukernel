@@ -362,6 +362,17 @@ pub trait SockNames {
     fn name(&self) -> Vec<u8>;
     /// The address of the peer, as `getpeername`. `None` if the socket has no peer.
     fn peer_name(&self) -> Option<Vec<u8>>;
+    /// The socket file of a Unix socket with a path name, as `unix_sk(sk)->path` of Linux.
+    /// `None` for another socket.
+    fn path(&self) -> Option<Location> {
+        None
+    }
+    /// Calls `f` with the peer of the socket, as `unix_peer` of Linux. Gives `false` if the
+    /// socket has no peer.
+    fn with_peer(&self, f: &mut dyn FnMut(&Sock<'_>)) -> bool {
+        let _ = f;
+        false
+    }
 }
 
 /// `security_capable`: the task with `cred` has the capability `cap`. `opts` has the
@@ -775,6 +786,31 @@ pub fn socket_setsockopt(sock: &Sock<'_>, level: i32, name: i32) -> Result<()> {
 /// `security_socket_shutdown`.
 pub fn socket_shutdown(sock: &Sock<'_>, how: i32) -> Result<()> {
     call_int_hook!(socket_shutdown, sock, how)
+}
+
+/// `security_unix_stream_connect`: `sock` connects to the listener `other`. `new` is the socket
+/// of the connection that the listener takes with `accept`. The caller holds the lock of
+/// `other`.
+pub fn unix_stream_connect(sock: &Sock<'_>, other: &Sock<'_>, new: &Sock<'_>) -> Result<()> {
+    call_int_hook!(unix_stream_connect, sock, other, new)
+}
+
+/// `security_unix_may_send`: the Unix datagram socket `sock` connects or sends to `other`.
+pub fn unix_may_send(sock: &Sock<'_>, other: &Sock<'_>) -> Result<()> {
+    call_int_hook!(unix_may_send, sock, other)
+}
+
+/// `security_socket_getpeersec_stream`: the security context of the peer of `sock`, for
+/// `SO_PEERSEC`. The first module that gives a context or an error stops the calls.
+///
+/// # Errors
+///
+/// Gives `ENOPROTOOPT` if no module gives a context, as Linux.
+pub fn socket_getpeersec_stream(sock: &Sock<'_>) -> Result<Vec<u8>> {
+    modules()
+        .iter()
+        .find_map(|m| m.info.hooks.socket_getpeersec_stream(sock))
+        .unwrap_or(Err(Errno::ENOPROTOOPT))
 }
 
 /// `security_ipc_permission`, for [`Cred::ipc_permission`].

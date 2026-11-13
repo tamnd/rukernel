@@ -41,7 +41,9 @@ use rk_net::{
     Cred, Message, NO_CRED, NodeId, Options, PathOps, Received, Socket, current_cred, wait_for,
 };
 use rk_vfs::File;
+use rk_vfs::dentry::Location;
 use rk_vfs::inode::Result;
+use rk_vfs::security::{Blob, Sock, SockNames};
 use rk_vfs::wait::{PollTable, WaitQueue};
 
 /// The offset of `sun_path` in `struct sockaddr_un`.
@@ -210,6 +212,9 @@ enum Conn {
 struct State {
     /// The address for `getsockname`.
     addr: Option<Vec<u8>>,
+    /// The socket file of a socket with a path name, `unix_sk(sk)->path` of Linux. An accepted
+    /// socket has the file of the listener.
+    path: Option<Location>,
     /// The name in `NAMES`. An accepted socket has the address of the listener, but no key.
     key: Option<Key>,
     conn: Conn,
@@ -260,6 +265,9 @@ pub struct Unix {
     events: AtomicU64,
     /// The ID of the network namespace that made the socket, for the abstract names.
     net: u32,
+    /// The blob of the security modules, `sk_security` of Linux. The socket keeps it, because
+    /// a connection makes the socket of the listener before it has a file.
+    security: Blob,
     this: Weak<Unix>,
 }
 
@@ -289,6 +297,7 @@ impl Unix {
             ino: rk_net::next_ino(),
             state: SpinLock::new(State {
                 addr: None,
+                path: None,
                 key: None,
                 conn: Conn::Unconnected,
                 peer: None,
@@ -312,6 +321,7 @@ impl Unix {
             inflight: AtomicUsize::new(0),
             events: AtomicU64::new(0),
             net: rk_net::ns::current().id(),
+            security: Blob::sock(),
             this: this.clone(),
         });
         ALL.lock().insert(sock.ino, Arc::downgrade(&sock));
@@ -475,6 +485,26 @@ impl Unix {
         self.wake();
     }
 
+    /// The view of this socket with the names `names` for the hooks of the security modules.
+    fn lsm_sock<'a>(&'a self, names: &'a Snap) -> Sock<'a> {
+        Sock {
+            family: AF_UNIX,
+            kind: self.kind,
+            protocol: 0,
+            security: &self.security,
+            names: Some(names),
+        }
+    }
+
+    /// The check of the security modules before this datagram socket connects or sends to
+    /// `other`, `security_unix_may_send` of Linux.
+    fn lsm_may_send(&self, other: &Unix) -> Result<()> {
+        let me = Snap::of(&self.state.lock());
+        // A socket can send to itself, so the two locks are not held at the same time.
+        let them = Snap::of(&other.state.lock());
+        rk_vfs::security::unix_may_send(&self.lsm_sock(&me), &other.lsm_sock(&them))
+    }
+
     fn connect_dgram(&self, paths: &dyn PathOps, addr: &[u8]) -> Result<()> {
         if addr.len() < SUN_PATH {
             return Err(Errno::EINVAL);
@@ -494,6 +524,7 @@ impl Unix {
         if !may_send(&other, self) {
             return Err(Errno::EPERM);
         }
+        self.lsm_may_send(&other)?;
         let old = self.state.lock().peer.replace(other.clone());
         if let Some(old) = old
             && !Arc::ptr_eq(&old, &other)
@@ -546,12 +577,23 @@ impl Unix {
                 return Err(Errno::EISCONN);
             }
             let server = Self::new(self.kind)?;
+            // The check of the security modules, with the lock of the listener, as
+            // `security_unix_stream_connect` in `unix_stream_connect` of Linux. The views of
+            // the sockets have copies of their names, because the locks are held.
+            let (me, listener) = (Snap::of(&s), Snap::of(&o));
+            let new = Snap { name: o.addr.clone(), path: o.path.clone() };
+            rk_vfs::security::unix_stream_connect(
+                &self.lsm_sock(&me),
+                &other.lsm_sock(&listener),
+                &server.lsm_sock(&new),
+            )?;
             {
                 let mut n = server.state.lock();
                 n.conn = Conn::Connected;
                 n.peer = Some(self.me());
                 n.peer_cred = Some(current_cred());
                 n.addr = o.addr.clone();
+                n.path = o.path.clone();
                 n.options.sndbuf = o.options.sndbuf;
                 n.options.rcvbuf = o.options.rcvbuf;
             }
@@ -667,6 +709,11 @@ impl Unix {
         };
         if self.state.lock().shut_wr {
             return Err(Errno::EPIPE);
+        }
+        // Each datagram has the check of the security modules, as `security_unix_may_send` in
+        // `unix_dgram_sendmsg` of Linux. A seqpacket socket has the check at the connection.
+        if self.kind == SOCK_DGRAM {
+            self.lsm_may_send(&other)?;
         }
         // The filter of the receiver, as `sk_filter` in `unix_dgram_sendmsg` of Linux. The
         // sender does not see a dropped datagram.
@@ -943,6 +990,35 @@ impl Unix {
     }
 }
 
+/// A copy of the names of a socket for the hooks of the security modules, for a hook that runs
+/// with the lock of the socket held.
+struct Snap {
+    /// The address, or `None` for a socket with no name.
+    name: Option<Vec<u8>>,
+    /// The socket file of a socket with a path name.
+    path: Option<Location>,
+}
+
+impl Snap {
+    fn of(s: &State) -> Self {
+        Self { name: s.addr.clone(), path: s.path.clone() }
+    }
+}
+
+impl SockNames for Snap {
+    fn name(&self) -> Vec<u8> {
+        self.name.clone().unwrap_or_else(unnamed)
+    }
+
+    fn peer_name(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    fn path(&self) -> Option<Location> {
+        self.path.clone()
+    }
+}
+
 /// Tells if `sender` can send to `other`: `other` has no peer, or `sender` is its peer, as
 /// `unix_may_send` of Linux.
 fn may_send(other: &Unix, sender: &Unix) -> bool {
@@ -982,9 +1058,12 @@ impl Socket for Unix {
         if self.state.lock().addr.is_some() {
             return Err(Errno::EINVAL);
         }
-        let key = match &name {
-            Name::Path(p) => Key::Path(paths.make_node(p)?),
-            Name::Abstract(a) => Key::Abstract(self.net, a.clone()),
+        let (key, path) = match &name {
+            Name::Path(p) => {
+                let (node, at) = paths.make_node(p)?;
+                (Key::Path(node), Some(at))
+            }
+            Name::Abstract(a) => (Key::Abstract(self.net, a.clone()), None),
         };
         let mut s = self.state.lock();
         if s.addr.is_some() {
@@ -996,6 +1075,7 @@ impl Socket for Unix {
         }
         names.insert(key.clone(), self.this.clone());
         s.addr = Some(name.address());
+        s.path = path;
         s.key = Some(key);
         Ok(())
     }
@@ -1288,6 +1368,18 @@ impl Socket for Unix {
 
     fn release(&self) {
         self.close(false);
+    }
+
+    fn security(&self) -> Option<&Blob> {
+        Some(&self.security)
+    }
+
+    fn lsm_path(&self) -> Option<Location> {
+        self.state.lock().path.clone()
+    }
+
+    fn lsm_peer(&self) -> Option<Arc<dyn Socket>> {
+        self.state.lock().peer.clone().map(|p| p as Arc<dyn Socket>)
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -15,7 +15,8 @@ use rk_abi::native::inet::{IPPROTO_TCP, IPPROTO_UDP};
 use rk_abi::native::open::{O_CLOEXEC, O_NONBLOCK};
 use rk_abi::native::signal::SIGPIPE;
 use rk_abi::native::socket::{
-    SO_ATTACH_BPF, SO_ATTACH_FILTER, SO_PASSCRED, SO_PASSPIDFD, SO_PEERPIDFD, SOL_SOCKET,
+    SO_ATTACH_BPF, SO_ATTACH_FILTER, SO_PASSCRED, SO_PASSPIDFD, SO_PEERPIDFD, SO_PEERSEC,
+    SOL_SOCKET,
 };
 use rk_abi::native::types::Iovec;
 use rk_net::consts::{
@@ -23,7 +24,7 @@ use rk_net::consts::{
     MSG_NOSIGNAL, MSG_TRUNC, MSG_WAITFORONE, SCM_CREDENTIALS, SCM_MAX_FD, SCM_RIGHTS, SOCK_CLOEXEC,
     SOCK_NONBLOCK, SOCK_STREAM, SOCK_TYPE_MASK, SOMAXCONN,
 };
-use rk_net::{Cred, Message, NodeId, PathOps, ProcessRef, Received, Socket};
+use rk_net::{Cred, LsmNames as Names, Message, NodeId, PathOps, ProcessRef, Received, Socket};
 use rk_net_inet::Proto as InetProto;
 use rk_net_unix::Unix;
 use rk_proc::signal::{SI_USER, SigInfo};
@@ -103,11 +104,11 @@ impl Paths<'_, '_> {
 }
 
 impl PathOps for Paths<'_, '_> {
-    fn make_node(&self, path: &[u8]) -> Result<NodeId, Errno> {
+    fn make_node(&self, path: &[u8]) -> Result<(NodeId, rk_vfs::Location), Errno> {
         let fs = self.cx.fs()?;
         let start = self.cx.dir_start(&fs, AT_FDCWD as u64, path)?;
         match fs.mknod(&start, path, S_IFSOCK | 0o777, 0) {
-            Ok(at) => Ok(Self::node(&at)),
+            Ok(at) => Ok((Self::node(&at), at)),
             Err(Errno::EEXIST) => Err(Errno::EADDRINUSE),
             Err(e) => Err(e),
         }
@@ -135,30 +136,9 @@ fn socket(cx: &Cx<'_>, fd: u64) -> Result<(Arc<File>, Arc<dyn Socket>), Errno> {
     Ok((file, sock))
 }
 
-/// A socket for the hooks of the security modules. The hooks read the addresses only when
-/// they need them.
-struct Names<'s>(&'s dyn Socket);
-
-impl rk_vfs::security::SockNames for Names<'_> {
-    fn name(&self) -> Vec<u8> {
-        self.0.name()
-    }
-
-    fn peer_name(&self) -> Option<Vec<u8>> {
-        self.0.peer_name().ok()
-    }
-}
-
 /// The view of the socket of `n` and its file for the hooks of the security modules.
 fn lsm_sock<'a>(file: &'a File, n: &'a Names<'_>) -> rk_vfs::security::Sock<'a> {
-    static EMPTY: rk_vfs::security::Blob = rk_vfs::security::Blob::EMPTY;
-    rk_vfs::security::Sock {
-        family: n.0.family(),
-        kind: n.0.kind(),
-        protocol: n.0.protocol(),
-        security: rk_net::sock_security(file).unwrap_or(&EMPTY),
-        names: Some(n),
-    }
+    rk_net::lsm_sock(n.0, rk_net::sock_security(file).unwrap_or(&rk_net::NO_BLOB), n)
 }
 
 /// Gives the type and the flags of the argument `type` of `socket`.
@@ -459,6 +439,9 @@ pub(crate) fn getsockopt(
     if level as u32 == SOL_SOCKET && name as u32 == SO_PEERPIDFD {
         return peer_pidfd(cx, &*sock, value, lenp, len);
     }
+    if level as u32 == SOL_SOCKET && name as u32 == SO_PEERSEC {
+        return peer_sec(cx, &file, &*sock, value, lenp, len);
+    }
     // A few options read their value first, as `PACKET_HDRLEN` of Linux.
     let need = sock.option_input(level as u32, name as u32);
     let input = if need > 0 && len > 0 { cx.read_bytes(value, len.min(need))? } else { Vec::new() };
@@ -468,6 +451,29 @@ pub(crate) fn getsockopt(
         cx.write_bytes(value, &v[..n])?;
     }
     cx.write_val(lenp, &(n as i32))?;
+    Ok(0)
+}
+
+/// `SO_PEERSEC`: the security context of the peer from the security modules, without a 0 at
+/// the end. A buffer that is too small gives `ERANGE` and the length that it needs, as
+/// `apparmor_socket_getpeersec_stream` of Linux.
+fn peer_sec(
+    cx: &Cx<'_>,
+    file: &File,
+    sock: &dyn Socket,
+    value: u64,
+    lenp: u64,
+    len: usize,
+) -> SysResult {
+    let names = Names(sock);
+    let ctx = rk_vfs::security::socket_getpeersec_stream(&lsm_sock(file, &names))?;
+    let n = i32::try_from(ctx.len()).map_err(|_| Errno::ERANGE)?;
+    if ctx.len() > len {
+        cx.write_val(lenp, &n)?;
+        return Err(Errno::ERANGE);
+    }
+    cx.write_bytes(value, &ctx)?;
+    cx.write_val(lenp, &n)?;
     Ok(0)
 }
 
@@ -1026,6 +1032,8 @@ pub(crate) fn read_socket(
     iovs: &[Iovec],
     nonblock: bool,
 ) -> SysResult {
+    // The check of the file before the read, as `rw_verify_area` in `vfs_read` of Linux.
+    rk_vfs::security::file_permission(file, rk_vfs::cred::may::READ)?;
     let len = iovs.iter().fold(0usize, |t, v| t.saturating_add(v.iov_len as usize));
     if len == 0 {
         return Ok(0);
@@ -1044,6 +1052,8 @@ pub(crate) fn write_socket(
     iovs: &[Iovec],
     nowait: bool,
 ) -> SysResult {
+    // The check of the file before the write, as `rw_verify_area` in `vfs_write` of Linux.
+    rk_vfs::security::file_permission(file, rk_vfs::cred::may::WRITE)?;
     let data = gather(cx, iovs)?;
     if data.is_empty() && sock.kind() == SOCK_STREAM {
         return Ok(0);
