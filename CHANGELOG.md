@@ -12,9 +12,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - A read end of a FIFO gives `POLLHUP` in `poll` only after a writer opened after the end and closed, as `pipe_poll` of Linux. Before, a reader that waited in `select` for the first writer woke at once (#540).
-
-### Fixed
-
 - A tmpfs mount with `size=N%` takes N percent of the memory as its limit, as `shmem_parse_one` of Linux, and `size=0` has no limit. Before this, a size in percent had no limit, so `statfs` gave 0 free blocks, and systemd refused `daemon-reload` because /run had less than 16 MiB free. systemd mounts /run with `size=20%` (#538).
 
 ## [0.5.27] - 2026-11-13
