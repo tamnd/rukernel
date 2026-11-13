@@ -399,6 +399,13 @@ pub trait Inode: Any + Send + Sync {
         false
     }
 
+    /// Checks the access `mask` (the bits of [`crate::cred::may`]) of `cred` to the inode, as the
+    /// `permission` inode operation of Linux. The default is `None`: the VFS then uses the mode,
+    /// the ACL and the capabilities, as `generic_permission`.
+    fn permission(&self, _cred: &crate::cred::Cred, _mask: u32) -> Option<Result<()>> {
+        None
+    }
+
     /// Finds the inode of `name` in this directory.
     fn lookup(&self, _name: &[u8]) -> Result<InodeRef> {
         Err(Errno::ENOTDIR)

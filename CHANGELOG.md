@@ -15,6 +15,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - nf_tables: the dump of a rule gives the packets and the bytes that its `counter` counted, as `nft_counter_dump` of Linux. Before, it gave the values of the rule as it came, so `nft list ruleset` showed `counter packets 0 bytes 0` for each rule. The named counters were right. This made transactions/table_onoff, sets/sets_with_ifnames and maps/typeof_maps_add_delete fail (#542).
 - nf_tables: the dump of a set with a key of one or two bytes and none of the flags `interval`, `map`, `timeout` and `dynamic` has the elements in the order of their inserts, as nft_set_bitmap.c of Linux, that `nft_select_set_ops` gives such a set to. Before, the elements came in the order of their keys. `nft list` sorts them by the first flag of a bitmask, and keeps elements with the same sort value in the reverse of the order of the kernel, so the listing of sets/0055tcpflags_0 was not the one of Linux (#542).
 
+### Fixed
+
+- A process with `CAP_NET_ADMIN` in the network namespace can write the files of /proc/sys/net, as `net_ctl_permissions` of Linux: it has the access of root. Root has the owner bits also without `CAP_DAC_OVERRIDE`, and `CAP_DAC_OVERRIDE` does not apply to the others, as `proc_sys_permission`. An inode can now have its own check of an access, as the `permission` inode operation of Linux. Before, systemd-networkd, which runs as the user systemd-network, got `EACCES` for each write to /proc/sys/net/ipv6/conf/IFNAME and /proc/sys/net/ipv4/conf/IFNAME, so it could not set `accept_ra`, `promote_secondaries`, `forwarding` and the other values of a link (#538).
+
 ## [0.5.34] - 2026-11-15
 
 ### Added

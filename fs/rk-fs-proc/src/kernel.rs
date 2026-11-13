@@ -2,8 +2,8 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{
-    FindFn, WriteFn, data_file, dead_link, dir, file, join, jump_link, link, ops_file, rw_file,
-    set_gone, set_owner, sysctl_file,
+    FindFn, WriteFn, data_file, dead_link, dir, file, join, jump_link, link, net_sysctl_access,
+    ops_file, rw_file, set_access, set_gone, set_owner, sysctl_file,
 };
 use crate::procmap;
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
@@ -1225,6 +1225,14 @@ fn sys_net_dir(path: String) -> InodeRef {
                             file(fpath.as_bytes(), move || rk_net::sysctl::read(&sub))
                         }
                     };
+                    // A process with `CAP_NET_ADMIN` in the network namespace has the access of
+                    // root to the files, as `net_ctl_permissions` of Linux.
+                    if let rk_net::sysctl::Entry::File(rw) = kind {
+                        let perm = if rw { 0o644 } else { 0o444 };
+                        set_access(&node, move |cred, mask| {
+                            net_sysctl_access(perm, rk_net::ioctl::net_admin(), cred, mask)
+                        });
+                    }
                     (name.into_bytes(), node)
                 })
                 .collect())
