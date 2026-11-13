@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.25] - 2026-11-13
+
 ### Added
 
 - The `AF_ALG` sockets with the type `skcipher`, as crypto/algif_skcipher.c of Linux, for `ecb(aes)`, `cbc(aes)`, `ctr(aes)` and `xts(aes)` of `rk-crypto`. A `sendmsg` gives the operation with `ALG_SET_OP` and the IV with `ALG_SET_IV` in control messages, and adds the data to the queue. A `recv` encrypts or decrypts the data of the queue in blocks. With `MSG_MORE`, the operation continues in the next `send`, and the IV goes from one `recv` to the next. libcryptsetup uses these sockets to open a LUKS2 key slot without dm-crypt (#541).
@@ -1599,6 +1601,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.25]: https://github.com/tamnd/rukernel/compare/v0.5.24...v0.5.25
 [0.5.24]: https://github.com/tamnd/rukernel/compare/v0.5.23...v0.5.24
 [0.5.23]: https://github.com/tamnd/rukernel/compare/v0.5.22...v0.5.23
 [0.5.22]: https://github.com/tamnd/rukernel/compare/v0.5.21...v0.5.22
