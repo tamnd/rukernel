@@ -2,7 +2,9 @@
 //! SMBIOS tables of x86-64, as drivers/firmware/dmi_scan.c and dmi-id.c of Linux, and
 //! `/sys/firmware/devicetree/base` and `/sys/firmware/fdt` from the device tree of arm64, as
 //! drivers/of/fdt.c and drivers/of/kobj.c of Linux. `systemd-detect-virt` reads them to know the
-//! hypervisor.
+//! hypervisor. `/sys/firmware/acpi/tables` has the ACPI tables, as drivers/acpi/sysfs.c of Linux,
+//! and `/sys/firmware/efi` is there after a boot from EFI firmware, as drivers/firmware/efi/efi.c.
+//! systemd reads the two to know if the firmware has a TPM 2.0 (`efi_has_tpm2`).
 
 use crate::Kind;
 use alloc::format;
@@ -214,9 +216,43 @@ pub(crate) fn dmi_entries(
 pub(crate) fn private(path: &str) -> bool {
     match path.split('/').collect::<Vec<_>>()[..] {
         ["devices", "virtual", "dmi", "id", name] => DMI_PRIVATE.contains(&name),
-        ["firmware", "dmi", "tables", _] | ["firmware", "fdt"] => true,
+        ["firmware", "dmi" | "acpi", "tables", _] | ["firmware", "fdt"] => true,
         _ => false,
     }
+}
+
+/// The names of the ACPI tables with the signatures `signatures`, as `acpi_table_attr_init` of
+/// Linux gives them: the signature, and a number from 1 after it if two or more tables have the
+/// same signature, as `SSDT1` and `SSDT2`.
+pub(crate) fn acpi_names(signatures: &[[u8; 4]]) -> Vec<String> {
+    let mut out = Vec::with_capacity(signatures.len());
+    for (i, sig) in signatures.iter().enumerate() {
+        let name: String = sig.iter().map(|&b| char::from(b)).collect();
+        let before = signatures[..i].iter().filter(|s| *s == sig).count();
+        if before == 0 && !signatures[i + 1..].contains(sig) {
+            out.push(name);
+        } else {
+            out.push(format!("{name}{}", before + 1));
+        }
+    }
+    out
+}
+
+/// The files of `/sys/firmware/acpi/tables`: one for each table, with all of its bytes.
+pub(crate) fn acpi_entries(tables: &[rk_frame::firmware::AcpiTable]) -> Vec<(String, Kind)> {
+    let signatures: Vec<[u8; 4]> = tables.iter().map(|t| t.signature).collect();
+    acpi_names(&signatures)
+        .into_iter()
+        .zip(tables)
+        .map(|(name, t)| (name, Kind::File(t.bytes.to_vec())))
+        .collect()
+}
+
+/// The files of `/sys/firmware/efi`. The kernel does not call the runtime services of EFI, so
+/// there is no `efivars` and no `runtime`, as Linux with `efi=noruntime`. `fw_platform_size` is
+/// the width of the firmware in bits, as on x86-64 Linux.
+pub(crate) fn efi_entries() -> Vec<(String, Kind)> {
+    Vec::from([(String::from("fw_platform_size"), Kind::File(b"64\n".to_vec()))])
 }
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
@@ -397,6 +433,16 @@ mod tests {
         assert!(private("devices/virtual/dmi/id/product_uuid"));
         assert!(!private("devices/virtual/dmi/id/product_name"));
         assert!(private("firmware/dmi/tables/DMI"));
+    }
+
+    #[test]
+    fn the_acpi_tables_have_the_names_of_linux() {
+        let sigs = [*b"FACP", *b"DSDT", *b"FACS", *b"SSDT", *b"APIC", *b"SSDT", *b"TPM2"];
+        assert_eq!(
+            acpi_names(&sigs),
+            ["FACP", "DSDT", "FACS", "SSDT1", "APIC", "SSDT2", "TPM2"].map(String::from)
+        );
+        assert!(private("firmware/acpi/tables/TPM2"));
     }
 
     #[test]

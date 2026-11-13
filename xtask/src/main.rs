@@ -1014,8 +1014,14 @@ else
 fi
 # With a TPM (RK_TPM=1), `systemd-analyze pcrs` must give the SHA-256 values of the PCRs that
 # tpm2_pcrread gives. systemd shows the values only with the full TPM2 support of
-# `systemd-analyze has-tpm2`, and the part `firmware` of it needs a boot with EFI.
+# `systemd-analyze has-tpm2`, and the part `firmware` of it needs a boot with EFI and the ACPI
+# table TPM2 in /sys/firmware/acpi/tables. xtask boots this test with OVMF when it has a TPM, so
+# after a boot with EFI the support must be full.
 if [ -e /dev/tpmrm0 ]; then
+    if [ -d /sys/firmware/efi ]; then
+        echo 'rk-systemd: boot with EFI'
+        systemd-analyze has-tpm2 -q || other="$other has-tpm2"
+    fi
     systemd-analyze has-tpm2 --no-pager | sed 's/^/rk-systemd:   /'
     tss=$(tpm2_pcrread sha256 |
         sed -n 's/^ *\([0-9]*\) *: *0x\([0-9A-Fa-f]*\)$/\1 \2/p' | tr A-F a-f)
@@ -2806,9 +2812,29 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             (cmd, timeout)
         } else if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
             let initrd = rootfs_initramfs(&kernel, "systemd");
+            // With a TPM, the `systemd` test boots with UEFI if there is OVMF. systemd 257 gives
+            // the full TPM2 support of `systemd-analyze has-tpm2`, and with it the PCR values of
+            // `systemd-analyze pcrs`, only after a boot with EFI (`efi_has_tpm2`). OVMF puts the
+            // ACPI tables and the initramfs in memory that it allocates, so `-initrd` is correct.
+            let ovmf = if *test == "systemd" && tpm_for(test) { find_ovmf()? } else { None };
             // The command line has `rk.test=init`, so the TPM of `cryptenroll` comes from the name
             // of the test.
-            let mut cmd = qemu_command_for(&kernel, &initrd, &test_cmdline(test), tpm_for(test));
+            let mut cmd = match &ovmf {
+                Some(firmware) => {
+                    let elf =
+                        fs::read(&kernel).map_err(|e| format!("{}: {e}", kernel.display()))?;
+                    let image = kernel.with_file_name("bzImage");
+                    fs::write(&image, bzimage(&elf)?)
+                        .map_err(|e| format!("{}: {e}", image.display()))?;
+                    let mut cmd = qemu_command_for(&image, &initrd, &test_cmdline(test), false);
+                    cmd.arg("-drive").arg(format!(
+                        "if=pflash,format=raw,readonly=on,file={}",
+                        firmware.display()
+                    ));
+                    cmd
+                }
+                None => qemu_command_for(&kernel, &initrd, &test_cmdline(test), tpm_for(test)),
+            };
             // QEMU uses the last `-m`.
             cmd.args(["-m", SYSTEMD_MEMORY]);
             // systemd stops the generators after 90 s (`DEFAULT_TIMEOUT_USEC` in
