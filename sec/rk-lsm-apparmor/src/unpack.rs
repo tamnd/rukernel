@@ -1236,6 +1236,8 @@ mod tests {
         let tmp = allow(&t.file, class::FILE, b"/tmp/a/b", 0);
         assert_eq!(tmp & (perm::READ | perm::WRITE), perm::READ | perm::WRITE);
         assert_eq!(allow(&t.file, class::FILE, b"/etc/passwd", 0) & perm::READ, 0);
+        // The profile has no capability rule.
+        assert_eq!(t.caps, Caps::default());
     }
 
     /// A small policy: the profile `rk_min` in complain mode, with no rules.

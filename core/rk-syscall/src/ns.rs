@@ -297,7 +297,6 @@ pub(crate) fn may_join_mnt_ns(cred: &Cred, ns: &MountNamespace) -> Result<(), Er
     if !cred.ns_capable(ns.owner(), cap::SYS_ADMIN)
         || !cred.has_cap(cap::SYS_CHROOT)
         || !cred.has_cap(cap::SYS_ADMIN)
-        || !rk_vfs::security::capable(cred, cap::SYS_ADMIN, 0)
     {
         return Err(Errno::EPERM);
     }

@@ -316,10 +316,7 @@ fn new_cgroup_ns(process: &Process, cred: &Cred) -> Result<(), Errno> {
 /// `EPERM` without the capabilities.
 fn may_install(cred: &Cred, owner: &UserNs) -> Result<(), Errno> {
     let cap = rk_vfs::cred::cap::SYS_ADMIN;
-    if !cred.ns_capable(owner, cap)
-        || !cred.has_cap(cap)
-        || !rk_vfs::security::capable(cred, cap, 0)
-    {
+    if !cred.ns_capable(owner, cap) || !cred.has_cap(cap) {
         return Err(Errno::EPERM);
     }
     Ok(())
@@ -334,10 +331,7 @@ fn may_install(cred: &Cred, owner: &UserNs) -> Result<(), Errno> {
 /// `EPERM` without the capabilities.
 fn may_join_cgroup_ns(old: &Cred, cred: &Cred, ns: u32) -> Result<(), Errno> {
     let cap = rk_vfs::cred::cap::SYS_ADMIN;
-    if !old.ns_capable(&crate::ns::cgroup_owner(ns), cap)
-        || !old.ns_capable(&cred.user_ns, cap)
-        || !rk_vfs::security::capable(old, cap, 0)
-    {
+    if !old.ns_capable(&crate::ns::cgroup_owner(ns), cap) || !old.ns_capable(&cred.user_ns, cap) {
         return Err(Errno::EPERM);
     }
     Ok(())
