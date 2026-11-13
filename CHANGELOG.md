@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - AppArmor checks the sockets, as net.c and af_inet.c of the Ubuntu kernel: a create, a bind, a connect, a listen, an accept, a send, a receive, `getsockname`, `getpeername`, `getsockopt`, `setsockopt` and `shutdown` need a network rule for the family and the type of the socket. For IPv4 and IPv6, a rule can also name the protocol, the addresses and the ports, the option and the backlog. A denial gives `EACCES` and a record of the class `net` (#540).
 
+### Fixed
+
+- A tmpfs mount with `size=N%` takes N percent of the memory as its limit, as `shmem_parse_one` of Linux, and `size=0` has no limit. Before this, a size in percent had no limit, so `statfs` gave 0 free blocks, and systemd refused `daemon-reload` because /run had less than 16 MiB free. systemd mounts /run with `size=20%` (#538).
+
 ## [0.5.27] - 2026-11-13
 
 ### Added
@@ -19,7 +23,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Fixed
 
-- A tmpfs mount with `size=N%` takes N percent of the memory as its limit, as `shmem_parse_one` of Linux, and `size=0` has no limit. Before this, a size in percent had no limit, so `statfs` gave 0 free blocks, and systemd refused `daemon-reload` because /run had less than 16 MiB free. systemd mounts /run with `size=20%` (#538).
 
 ## [0.5.26] - 2026-11-13
 
