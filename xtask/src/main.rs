@@ -429,7 +429,9 @@ fn self_test_timeout(cmdline: &str) -> Duration {
 
 /// The longest time that the `smp` boot test can take. It runs the init checks on `SMP_CPUS` CPUs,
 /// and on a busy host it can take more than 300 s, because a spin of one CPU of the machine uses a
-/// CPU of the host.
+/// CPU of the host. On a quiet host the release kernel needs about 30 s, with or without
+/// `RK_TPM=1`. On server2 (6 CPUs) at load 25, the test needs more than 900 s, also without the
+/// TPM, so a timeout at that load is the effect of the load and not of the TPM (#541).
 const SMP_TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The longest time that a boot test of a root file system can take. The `alpine` test makes and
