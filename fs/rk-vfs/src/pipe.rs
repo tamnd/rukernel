@@ -90,6 +90,10 @@ struct PipeEnd {
     write: bool,
     /// The end is of a FIFO, so `fstat` gives the attributes of the file of the FIFO.
     named: bool,
+    /// For a read end of a FIFO, the count of the opens of write ends when this end opened. As
+    /// `f_version` of Linux, `poll` gives `POLLHUP` only after a writer opened after this end.
+    /// Then a reader that waits in `poll` before a writer comes does not wake at once.
+    writer_opens: Option<u64>,
 }
 
 impl PipeEnd {
@@ -103,7 +107,7 @@ impl PipeEnd {
     /// that are open, and the count of their opens. A reader looks at the writers, and a writer
     /// looks at the readers.
     fn open(pipe: Arc<Pipe>, read: bool, write: bool, named: bool) -> (Self, usize, u64) {
-        let partner = {
+        let (partner, writer_opens) = {
             let mut s = pipe.state.lock();
             if read {
                 s.readers += 1;
@@ -113,13 +117,16 @@ impl PipeEnd {
                 s.writers += 1;
                 s.writer_opens += 1;
             }
-            if read { (s.writers, s.writer_opens) } else { (s.readers, s.reader_opens) }
+            let seen = (named && read).then_some(s.writer_opens);
+            let partner =
+                if read { (s.writers, s.writer_opens) } else { (s.readers, s.reader_opens) };
+            (partner, seen)
         };
         if named {
             pipe.wake_only(true);
             pipe.wake_only(false);
         }
-        (Self { pipe, read, write, named }, partner.0, partner.1)
+        (Self { pipe, read, write, named, writer_opens }, partner.0, partner.1)
     }
 }
 
@@ -309,7 +316,7 @@ impl FileOps for PipeEnd {
             if !s.buf.is_empty() {
                 ev |= events::POLLIN;
             }
-            if s.writers == 0 {
+            if s.writers == 0 && self.writer_opens != Some(s.writer_opens) {
                 ev |= events::POLLHUP;
             }
         }
@@ -702,6 +709,16 @@ mod tests {
         let mut buf = [0u8; 4];
         assert_eq!(r.read(&mut buf).unwrap(), 3);
         assert!(w.metadata().is_err());
+        drop(w);
+        assert_eq!(r.poll(), events::POLLHUP);
+        // A new reader sees no hang up before a writer opens and closes, as on Linux.
+        let r2 = File::with_ops(open_fifo(9, 1, O_RDONLY | O_NONBLOCK).unwrap(), None, O_RDONLY);
+        assert_eq!(r2.poll(), 0);
+        let w = File::with_ops(open_fifo(9, 1, O_WRONLY | O_NONBLOCK).unwrap(), None, O_WRONLY);
+        drop(w);
+        assert_eq!(r2.poll(), events::POLLHUP);
+        drop(r2);
+        let w = File::with_ops(open_fifo(9, 1, O_WRONLY | O_NONBLOCK).unwrap(), None, O_WRONLY);
         let rw = File::with_ops(open_fifo(9, 2, O_RDWR).unwrap(), None, O_RDWR);
         assert_eq!(rw.write(b"x").unwrap(), 1);
         assert_eq!(rw.poll(), events::POLLIN | events::POLLOUT);

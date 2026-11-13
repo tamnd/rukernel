@@ -8,8 +8,8 @@
 //! with its change at an exec ([`domain`]), the changes that a task asks for with
 //! `change_hat` and `change_profile` ([`task`]), the checks of the files ([`file`]), the checks
 //! of the capabilities ([`capability`]), the checks of the signals ([`ipc`]) and of `ptrace`
-//! ([`ptrace`]) with the label of the other task ([`label`]), and the checks of the sockets
-//! ([`net`]).
+//! ([`ptrace`]) with the label of the other task ([`label`]), the checks of the sockets
+//! ([`net`]) and the checks of the user namespaces ([`ns`]).
 //!
 //! The module is active when the command line has `apparmor=1`, or when `lsm=` names it. With
 //! `apparmor=0` it is not active. This is the value 0 of the old
@@ -31,6 +31,7 @@ pub mod fs;
 pub mod ipc;
 pub mod label;
 pub mod net;
+pub mod ns;
 pub mod policy;
 pub mod ptrace;
 pub mod task;
@@ -68,6 +69,10 @@ impl SecurityHooks for AppArmor {
 
     fn task_kill(&self, target: &Task<'_>, sig: u32, cred: &Cred) -> Result<()> {
         ipc::task_kill(cred, target.cred, sig)
+    }
+
+    fn userns_create(&self, cred: &Cred, new: &Cred) -> Result<()> {
+        ns::userns_create(cred, new)
     }
 
     fn socket_create(&self, family: u32, kind: u32, protocol: u32, kern: bool) -> Result<()> {
@@ -288,6 +293,7 @@ pub fn init() {
         return;
     }
     ENABLED.store(true, Ordering::Relaxed);
+    rk_vfs::security::register_sysctls(&ns::SYSCTLS);
     fs::init();
 }
 

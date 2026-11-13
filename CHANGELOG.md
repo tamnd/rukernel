@@ -7,9 +7,11 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - AppArmor checks the sockets, as net.c and af_inet.c of the Ubuntu kernel: a create, a bind, a connect, a listen, an accept, a send, a receive, `getsockname`, `getpeername`, `getsockopt`, `setsockopt` and `shutdown` need a network rule for the family and the type of the socket. For IPv4 and IPv6, a rule can also name the protocol, the addresses and the ports, the option and the backlog. A denial gives `EACCES` and a record of the class `net` (#540).
+- AppArmor checks the creation of a user namespace, as task.c and lsm.c of the Ubuntu kernel. A profile with `userns` rules needs a rule that allows it, and a rule can give the label of the task in the new namespace. The new files `kernel.apparmor_restrict_unprivileged_userns`, `_force` and `_complain` of `/proc/sys` work as on Ubuntu: with the first at 1, an `unconfined` task without `CAP_SYS_ADMIN` goes to the profile `unprivileged_userns`, or gets `EACCES` if that profile is not there. A denial gives `EACCES` and a record of the class `namespace`. A security module can now give files of `/proc/sys` (#540).
 
 ### Fixed
 
+- A read end of a FIFO gives `POLLHUP` in `poll` only after a writer opened after the end and closed, as `pipe_poll` of Linux. Before, a reader that waited in `select` for the first writer woke at once (#540).
 - A tmpfs mount with `size=N%` takes N percent of the memory as its limit, as `shmem_parse_one` of Linux, and `size=0` has no limit. Before this, a size in percent had no limit, so `statfs` gave 0 free blocks, and systemd refused `daemon-reload` because /run had less than 16 MiB free. systemd mounts /run with `size=20%` (#538).
 
 ## [0.5.27] - 2026-11-13

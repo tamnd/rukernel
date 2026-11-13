@@ -489,7 +489,7 @@ fn find_attach(list: &[Arc<Profile>], name: &[u8]) -> (Option<Arc<Profile>>, Opt
 /// The profile of the transition table entry of `xindex` in `p`, `x_table_lookup` of Linux.
 /// Gives the profile and the name of the entry. Only the first name of the entry counts, as on
 /// Linux.
-fn x_table_lookup(p: &Profile, xindex: u32) -> (Option<Arc<Profile>>, Option<String>) {
+pub(crate) fn x_table_lookup(p: &Profile, xindex: u32) -> (Option<Arc<Profile>>, Option<String>) {
     let Some(r) = p.rules.as_ref() else { return (None, None) };
     let index = (xindex & x::INDEX_MASK) as usize;
     let Some(ent) = r.file.trans.get(index) else { return (None, None) };

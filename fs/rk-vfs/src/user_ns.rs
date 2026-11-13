@@ -485,8 +485,9 @@ impl Drop for Charge {
 ///
 /// # Errors
 ///
-/// Gives `ENOSPC` if the namespace is too deep or the user has too many namespaces, and
-/// `EPERM` if the parent does not map the effective user or group.
+/// Gives `ENOSPC` if the namespace is too deep or the user has too many namespaces,
+/// `EPERM` if the parent does not map the effective user or group, and the error of the
+/// `userns_create` hook of a security module.
 pub fn create(cred: &Cred) -> Result<Cred, Errno> {
     let parent = &cred.user_ns;
     if parent.level >= MAX_LEVEL {
@@ -509,12 +510,14 @@ pub fn create(cred: &Cred) -> Result<Cred, Errno> {
         counts: SpinLock::new(BTreeMap::new()),
         _charge: Some(charge),
     });
+    let new = cred.in_user_ns(ns.clone());
+    crate::security::userns_create(cred, &new)?;
     {
         let mut live = LIVE.lock();
         live.retain(|w| w.strong_count() > 0);
         live.push(Arc::downgrade(&ns));
     }
-    Ok(cred.in_user_ns(ns))
+    Ok(new)
 }
 
 /// Parses the text of a write to a map file into extents, as the loop of `map_write` of Linux:

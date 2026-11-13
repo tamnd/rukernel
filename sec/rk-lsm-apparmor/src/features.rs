@@ -81,6 +81,7 @@ pub const FILES: &[(&str, Value)] = &[
     ("namespaces/mask", Value::Str("userns_create")),
     ("namespaces/pivot_root", Value::Bool(false)),
     ("namespaces/profile", Value::Bool(true)),
+    ("namespaces/userns_create", Value::Str("pciu&")),
     ("network_v8/af_inet", Value::Bool(true)),
     ("network_v8/af_mask", Value::Str(AF_MASK)),
     ("network_v8/tcp-fast-open", Value::Bool(true)),
