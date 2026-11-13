@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - A route of IPv6 of the type `blackhole`, `unreachable` or `prohibit` goes on the loopback device, as Linux does. Thus `ip -6 route` shows `dev lo` for it, as the tests of systemd-networkd expect for the routes of DHCPv6 prefix delegation and for the static routes (#538).
+- With `net.ipv4.conf.*.promote_secondaries`, the removal of a primary IPv4 address makes the first secondary address of its subnet primary, as `__inet_del_ifa` of Linux, and sends `RTM_NEWADDR` for it. The routes of the subnet then use it as the source. Before this, the secondary addresses went away with the primary address, and systemd-networkd, which sets the value, could not remove them (#538).
 
 ## [0.5.36] - 2026-11-17
 
