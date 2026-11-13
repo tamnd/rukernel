@@ -1113,6 +1113,24 @@ fn the_size_option_limits_the_data() {
 }
 
 #[test]
+fn a_size_in_percent_is_a_part_of_the_memory() {
+    // 20% of 1000 pages, as systemd mounts /run.
+    assert_eq!(size_pages(b"20%", 1000), Some(200));
+    // Linux rounds a part of a page up.
+    assert_eq!(size_pages(b"1%", 150), Some(2));
+    assert_eq!(size_pages(b"150%", 100), Some(150));
+    assert_eq!(size_pages(b"8k", 1000), Some(2));
+    assert_eq!(size_pages(b"x%", 1000), None);
+    assert_eq!(size_pages(b"%", 1000), None);
+    // A size of 0 has no limit, as Linux.
+    let args = MountArgs { data: b"size=0", dev: None, read_only: false, lookup: None };
+    let fs = FsContext::new(MountNamespace::new(mount(&args).unwrap()));
+    let root = fs.root().clone();
+    let f = fs.open(&root, b"/a", o::O_RDWR | o::O_CREAT, 0o644).unwrap();
+    assert_eq!(f.write_at(0, &[1u8; 3 * 4096]), Ok(3 * 4096));
+}
+
+#[test]
 fn a_removed_directory_takes_no_new_name() {
     let (fs, root) = setup();
     fs.mkdir(&root, b"/d", 0o755).unwrap();

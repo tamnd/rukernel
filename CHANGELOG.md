@@ -17,6 +17,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - The boot test `cryptenroll` on x86-64 and arm64, with a TPM. cryptsetup makes a LUKS2 image in a file, systemd-cryptenroll adds a key slot that the TPM seals to PCR 7, and cryptsetup opens the key slot with the token of the TPM only. libcryptsetup uses the `skcipher` sockets of `AF_ALG` for the key slots. tools/systemd/build.sh adds cryptsetup, systemd-cryptenroll and tpm2-tools to the tree. With `RK_TPM=1`, the `systemd` boot test prints `systemd-analyze has-tpm2`, and with the full TPM2 support of systemd (a boot with EFI) it compares the PCRs of `systemd-analyze pcrs` with the PCRs of tpm2_pcrread. `RK_RELEASE=1` makes the boot tests use the release kernel, which unpacks the initramfs of the systemd tree much faster on a host without KVM (#541).
 - `snat` and `dnat` to a prefix of nf_tables (`snat ip prefix to ip saddr map { 10.141.11.0/24 : 192.168.2.0/24 }`), as `NF_NAT_RANGE_NETMAP` of nft_nat.c of Linux. The address keeps the bits that are not in the prefix (#542).
 
+### Fixed
+
+- A tmpfs mount with `size=N%` takes N percent of the memory as its limit, as `shmem_parse_one` of Linux, and `size=0` has no limit. Before this, a size in percent had no limit, so `statfs` gave 0 free blocks, and systemd refused `daemon-reload` because /run had less than 16 MiB free. systemd mounts /run with `size=20%` (#538).
+
 ## [0.5.26] - 2026-11-13
 
 ### Added

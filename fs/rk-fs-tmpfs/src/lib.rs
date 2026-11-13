@@ -99,9 +99,9 @@ pub const FS_TYPE: rk_vfs::fstype::FsType =
 
 /// Makes a new tmpfs for `mount(2)`. The option `mode=` gives the permission bits of the root in
 /// octal. The default is 1777, as Linux gives. The option `size=` gives the largest size of the
-/// data, in bytes with an optional suffix `k`, `m` or `g`, and `nr_blocks=` gives it in pages. A
-/// write past it gives `ENOSPC`. A size in percent of the memory has no limit. A mount with
-/// `MS_RDONLY` makes an empty file system that is read only, as Linux.
+/// data, in bytes with an optional suffix `k`, `m` or `g`, or in percent of the memory, and
+/// `nr_blocks=` gives it in pages. A write past it gives `ENOSPC`. A size of 0 has no limit, as
+/// Linux. A mount with `MS_RDONLY` makes an empty file system that is read only, as Linux.
 pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let perm = match rk_vfs::fstype::option(args.data, b"mode") {
         Some(v) => parse_octal(v).ok_or(Errno::EINVAL)?,
@@ -111,11 +111,11 @@ pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
         rk_vfs::fstype::option(args.data, b"size"),
         rk_vfs::fstype::option(args.data, b"nr_blocks"),
     ) {
-        (Some(v), _) if v.ends_with(b"%") => u64::MAX,
-        (Some(v), _) => parse_size(v).ok_or(Errno::EINVAL)?.div_ceil(PAGE),
+        (Some(v), _) => size_pages(v, memory_pages()).ok_or(Errno::EINVAL)?,
         (None, Some(v)) => parse_size(v).ok_or(Errno::EINVAL)?,
-        (None, None) => u64::MAX,
+        (None, None) => 0,
     };
+    let max = if max == 0 { u64::MAX } else { max };
     let root = make(perm, max);
     root.set_read_only(args.read_only)?;
     Ok(root)
@@ -158,6 +158,31 @@ fn make_dirs(root: &InodeRef, path: &str) -> Result<InodeRef> {
         };
     }
     Ok(dir)
+}
+
+/// The pages of the memory.
+#[cfg(target_os = "none")]
+fn memory_pages() -> u64 {
+    rk_frame::mm::frame_stats().total as u64
+}
+
+/// The pages of the memory. The unit tests on the host take 1 GiB.
+#[cfg(not(target_os = "none"))]
+fn memory_pages() -> u64 {
+    (1 << 30) / PAGE
+}
+
+/// The pages of the option `size=`, for a memory of `total` pages. A size with `%` is in percent
+/// of the memory, as `shmem_parse_one` of Linux. systemd mounts /run with `size=20%`, and it does
+/// not reload when statfs gives less than 16 MiB free there.
+fn size_pages(v: &[u8], total: u64) -> Option<u64> {
+    match v.strip_suffix(b"%") {
+        Some(n) => {
+            let bytes = u128::from(parse_size(n)?) * u128::from(PAGE) * u128::from(total) / 100;
+            u64::try_from(bytes.div_ceil(u128::from(PAGE))).ok()
+        }
+        None => Some(parse_size(v)?.div_ceil(PAGE)),
+    }
 }
 
 /// Parses a number with an optional suffix `k`, `m`, `g`, `t`, `p` or `e`, as `memparse` of
