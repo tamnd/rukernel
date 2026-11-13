@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.27] - 2026-11-13
+
 ### Added
 
 - AppArmor checks `ptrace`, as task.c of Linux: an attach and a `PTRACE_TRACEME` need the ptrace rules of the tracer and of the tracee. A profile without ptrace rules needs `CAP_SYS_PTRACE` to trace a task with another label. An exec of a traced task changes the label only if the tracer can trace the new label, as `may_change_ptraced_domain` of Linux. A denial gives `EACCES` and a record of the class `ptrace` (#540).
@@ -1620,6 +1622,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.27]: https://github.com/tamnd/rukernel/compare/v0.5.26...v0.5.27
 [0.5.26]: https://github.com/tamnd/rukernel/compare/v0.5.25...v0.5.26
 [0.5.25]: https://github.com/tamnd/rukernel/compare/v0.5.24...v0.5.25
 [0.5.24]: https://github.com/tamnd/rukernel/compare/v0.5.23...v0.5.24
