@@ -762,6 +762,9 @@ pub fn bprm_creds_for_exec(bprm: &mut Bprm<'_>) -> Result<()> {
         }
         // A stack goes on the label of the task, as `aa_label_merge` in `handle_onexec`.
         let target = if stack { merge(&old, &target) } else { target };
+        if let Some(tracer) = bprm.tracer {
+            ptraced_change(&old, tracer, &target, &name, ouid)?;
+        }
         set_label(bprm.cred, &target);
         return Ok(());
     }
@@ -781,11 +784,52 @@ pub fn bprm_creds_for_exec(bprm: &mut Bprm<'_>) -> Result<()> {
     if old.is_empty() {
         new.extend(attach_unconfined(None, &name, ouid));
     }
+    if let Some(tracer) = bprm.tracer {
+        ptraced_change(&old, tracer, &new, &name, ouid)?;
+    }
     if secure {
         bprm.secureexec = true;
     }
     set_label(bprm.cred, &new);
     Ok(())
+}
+
+/// The check of an exec of a traced task, `may_change_ptraced_domain` of Linux: the task with
+/// the label `old` changes to the label `new` only if the rules let the tracer with the
+/// credentials `tracer` trace a task with `new`. A denial gives a record of the exec with the
+/// text `ptrace prevents transition` for each profile of `old`, as `apparmor_bprm_creds_for_exec`
+/// of Linux.
+///
+/// # Errors
+///
+/// Gives the error of [`crate::ptrace::may_ptrace`], `EACCES` or `EPERM`.
+fn ptraced_change(old: &Label, tracer: &Cred, new: &Label, name: &[u8], ouid: u32) -> Result<()> {
+    let tracer = label_of(tracer);
+    if tracer.iter().all(|p| p.mode == Mode::Unconfined) {
+        return Ok(());
+    }
+    let Err(error) = crate::ptrace::may_ptrace(&tracer, new, perm::WRITE) else { return Ok(()) };
+    let target = label_text(new, None);
+    let a = FileAudit {
+        op: "exec",
+        request: perm::EXEC,
+        name,
+        target: Some(&target),
+        ouid,
+        info: Some("ptrace prevents transition"),
+        error: Some(error),
+    };
+    let perms = Perms::default();
+    if old.is_empty() {
+        return audit_file(None, &perms, &a);
+    }
+    let mut result = Ok(());
+    for p in old {
+        if let Err(e) = audit_file(Some(p), &perms, &a) {
+            result = Err(e);
+        }
+    }
+    result
 }
 
 /// The profile that attaches to the program `name` for an unconfined task with the profile

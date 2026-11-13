@@ -41,10 +41,14 @@ pub mod class {
     pub const FILE: usize = 2;
     /// The capability rules.
     pub const CAP: usize = 3;
+    /// The ptrace rules.
+    pub const PTRACE: usize = 9;
     /// The signal rules.
     pub const SIGNAL: usize = 10;
     /// The attach rules.
     pub const XMATCH: usize = 11;
+    /// The rules of a label, `AA_CLASS_LABEL`.
+    pub const LABEL: usize = 16;
     /// The last class, `AA_CLASS_LAST`.
     pub const LAST: usize = 32;
 }
@@ -1242,6 +1246,7 @@ mod tests {
         assert_eq!(t.caps, Caps::default());
         // The policy DB mediates the signals, but has no signal rule.
         assert_ne!(t.policy.start[class::SIGNAL], dfa::NOMATCH);
+        assert_ne!(t.policy.start[class::PTRACE], dfa::NOMATCH);
     }
 
     /// A small policy: the profile `rk_min` in complain mode, with no rules.

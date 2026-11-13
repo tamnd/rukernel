@@ -236,6 +236,16 @@ impl Thread {
         tracer.is_some_and(|t| t.cred().capable(rk_vfs::cred::cap::SYS_PTRACE))
     }
 
+    /// The credentials of the tracer while a tracer traces the thread, as `ptrace_parent` of
+    /// Linux. A security module checks them at an `execve` of the thread.
+    pub fn tracer_cred(&self) -> Option<Arc<rk_vfs::cred::Cred>> {
+        let tracer = {
+            let pt = self.ptrace.lock();
+            pt.as_ref().filter(|p| !p.detached).and_then(|p| p.tracer.upgrade())
+        };
+        tracer.map(|t| t.cred())
+    }
+
     /// Tells if the thread is in a stop of `ptrace`.
     pub fn is_trace_stopped(&self) -> bool {
         self.ptrace.lock().as_ref().is_some_and(|p| p.stop.is_some_and(|s| s.resume.is_none()))

@@ -95,7 +95,7 @@ fn audit_caps(
 /// # Errors
 ///
 /// Gives `EPERM` if the profile does not allow the capability, except in complain mode.
-fn profile_capable(p: &Arc<Profile>, cap: u32, opts: u32) -> Result<()> {
+pub(crate) fn profile_capable(p: &Arc<Profile>, cap: u32, opts: u32) -> Result<()> {
     let caps = p.rules.as_ref().map(|r| r.caps).unwrap_or_default();
     let error = (caps.allow & bit(cap) == 0).then_some(Errno::EPERM);
     let mut info = None;

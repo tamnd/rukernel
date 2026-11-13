@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- AppArmor checks `ptrace`, as task.c of Linux: an attach and a `PTRACE_TRACEME` need the ptrace rules of the tracer and of the tracee. A profile without ptrace rules needs `CAP_SYS_PTRACE` to trace a task with another label. An exec of a traced task changes the label only if the tracer can trace the new label, as `may_change_ptraced_domain` of Linux. A denial gives `EACCES` and a record of the class `ptrace` (#540).
+
 ## [0.5.26] - 2026-11-13
 
 ### Added

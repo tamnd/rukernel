@@ -398,7 +398,7 @@ fn build(
     mut args: ExecArgs,
     random: [u8; 16],
     cred: &Cred,
-    (no_new_privs, traced): (bool, bool),
+    (no_new_privs, traced, tracer): (bool, bool, Option<&Cred>),
     (memcg, personality): (u32, u32),
     time_ns: &crate::timens::TimeNs,
 ) -> Result<Built, Errno> {
@@ -474,7 +474,8 @@ fn build(
     // `bprm_creds_for_exec` gets the file that the caller gave, also for a script, and the
     // other hooks get the program that runs.
     let given = script.as_ref().unwrap_or(&at);
-    let mut bprm = Bprm { filename: &args.path, file: given, cred: &mut cred, secureexec: secure };
+    let mut bprm =
+        Bprm { filename: &args.path, file: given, cred: &mut cred, secureexec: secure, tracer };
     security::bprm_creds_for_exec(&mut bprm)?;
     bprm.file = &at;
     security::bprm_creds_from_file(&mut bprm)?;
@@ -600,7 +601,10 @@ pub fn exec(
     // A tracer cannot follow a program that gets more rights, so the bits have no effect then.
     // A tracer with `CAP_SYS_PTRACE` can, as `cap_bprm_creds_from_file` of Linux.
     let traced = thread.is_traced() && !thread.tracer_capable();
-    let setid = (thread.no_new_privs(), traced);
+    // The security modules check the change of the credentials of a traced thread, as
+    // `LSM_UNSAFE_PTRACE` of Linux.
+    let tracer = if thread.is_traced() { thread.tracer_cred() } else { None };
+    let setid = (thread.no_new_privs(), traced, tracer.as_deref());
     let personality = process.personality();
     // The new program runs in the time namespace of the children, as `exec_task_namespaces` of
     // Linux.
@@ -652,7 +656,8 @@ pub fn exec(
     process.set_dumpable(dumpable);
     process.set_personality(personality & !per_clear);
     let mut cred = cred;
-    let bprm = Bprm { filename: &path, file: &at, cred: &mut cred, secureexec: false };
+    let bprm =
+        Bprm { filename: &path, file: &at, cred: &mut cred, secureexec: false, tracer: None };
     security::bprm_committing_creds(&bprm);
     process.set_cred(cred);
     security::bprm_committed_creds(&path, &at);
