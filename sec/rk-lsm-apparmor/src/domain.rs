@@ -242,7 +242,7 @@ fn lookup_fperms(pdb: &Pdb, state: State, owner: bool) -> Perms {
 
 /// Adds the permissions `b` to the permissions `a` of all the parts of a label,
 /// `aa_perms_accum` of Linux.
-fn accum(a: &mut Perms, b: &Perms) {
+pub fn accum(a: &mut Perms, b: &Perms) {
     a.deny |= b.deny;
     a.allow &= b.allow & !a.deny;
     a.audit |= b.audit & a.allow;

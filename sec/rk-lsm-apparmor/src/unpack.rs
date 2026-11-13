@@ -41,6 +41,8 @@ pub mod class {
     pub const FILE: usize = 2;
     /// The capability rules.
     pub const CAP: usize = 3;
+    /// The signal rules.
+    pub const SIGNAL: usize = 10;
     /// The attach rules.
     pub const XMATCH: usize = 11;
     /// The last class, `AA_CLASS_LAST`.
@@ -1238,6 +1240,8 @@ mod tests {
         assert_eq!(allow(&t.file, class::FILE, b"/etc/passwd", 0) & perm::READ, 0);
         // The profile has no capability rule.
         assert_eq!(t.caps, Caps::default());
+        // The policy DB mediates the signals, but has no signal rule.
+        assert_ne!(t.policy.start[class::SIGNAL], dfa::NOMATCH);
     }
 
     /// A small policy: the profile `rk_min` in complain mode, with no rules.
