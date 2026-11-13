@@ -408,8 +408,10 @@ const SYSTEMD_MEMORY: &str = "2G";
 /// test-bpf-firewall and test-bpf-foreign-programs of systemd must pass. They attach cgroup BPF
 /// programs and ping the addresses of the loopback interface. They come from the package
 /// systemd-tests, and ping comes from iputils-ping, so the tree needs both (see
-/// tools/systemd/build.sh).
-const SYSTEMD_TESTS: &[&str] = &["udevd", "networkd", "sdbpf"];
+/// tools/systemd/build.sh). The `cryptenroll` test does not start systemd: the init script makes a
+/// LUKS2 image, binds a key slot to the TPM with systemd-cryptenroll, and opens it with the token
+/// of the TPM. The machine of this test has a TPM, see `tpm_for`.
+const SYSTEMD_TESTS: &[&str] = &["udevd", "networkd", "sdbpf", "cryptenroll"];
 
 /// The longest time that one boot test can take. TCG on a slow CI runner is the slowest case.
 const BOOT_TEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -467,6 +469,7 @@ const BOOT_TESTS: &[&str] = &[
     "udevd",
     "networkd",
     "sdbpf",
+    "cryptenroll",
     "fstests",
 ];
 
@@ -910,6 +913,41 @@ echo 'debian: done'
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 rm -f /.dockerenv
+# The `cryptenroll` test runs without systemd as PID 1. cryptsetup makes a LUKS2 image in a
+# file, systemd-cryptenroll adds a key slot with a key that the TPM seals to PCR 7, and cryptsetup
+# opens the key slot with the token of the TPM only. libcryptsetup encrypts and decrypts the key
+# slots with the `skcipher` sockets of `AF_ALG`, so there is no device mapper.
+if [ "${1:-}" = cryptenroll ]; then
+# The tree comes from `docker export`, and its /dev/console is a regular file. So the script
+# mounts devtmpfs, as systemd does, and writes to the console of devtmpfs.
+mount -t devtmpfs dev /dev
+exec < /dev/console > /dev/console 2>&1
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs run /run
+mount -t tmpfs tmp /tmp
+other=
+img=/tmp/luks.img
+echo "rk-cryptenroll: $(cryptsetup --version)"
+echo "rk-cryptenroll: $(systemd-cryptenroll --version | head -n 1)"
+ls -l /dev/tpmrm0 /sys/class/tpmrm | sed 's/^/rk-cryptenroll:   /'
+truncate -s 32M $img
+printf rk-pass > /tmp/pass
+cryptsetup luksFormat -q --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
+    --key-file /tmp/pass $img || other="$other luksFormat"
+cryptsetup open --test-passphrase --key-file /tmp/pass $img || other="$other passphrase"
+PASSWORD=rk-pass systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 $img ||
+    other="$other systemd-cryptenroll"
+cryptsetup luksDump $img | sed 's/^/rk-cryptenroll:   /'
+cryptsetup luksDump $img | grep -q 'systemd-tpm2' || other="$other token"
+if cryptsetup open --test-passphrase --token-only $img; then
+    echo 'rk-cryptenroll: the TPM token opens the key slot'
+else
+    other="$other token-only"
+fi
+if [ -n "$other" ]; then echo "rk-cryptenroll: bad:$other"; else echo 'rk-cryptenroll: pass'; fi
+systemctl poweroff -ff
+fi
 cat > /etc/systemd/system/rk-check.service << 'END'
 [Unit]
 Description=The check of the systemd boot test of rukernel
@@ -971,6 +1009,27 @@ if systemctl start rk-dev.service; then
     echo 'rk-systemd: DevicePolicy=closed: the open of /dev/vda gives EPERM'
 else
     other="$other rk-dev.service"
+fi
+# With a TPM (RK_TPM=1), `systemd-analyze pcrs` must give the SHA-256 values of the PCRs that
+# tpm2_pcrread gives. systemd shows the values only with the full TPM2 support of
+# `systemd-analyze has-tpm2`, and the part `firmware` of it needs a boot with EFI.
+if [ -e /dev/tpmrm0 ]; then
+    systemd-analyze has-tpm2 --no-pager | sed 's/^/rk-systemd:   /'
+    tss=$(tpm2_pcrread sha256 |
+        sed -n 's/^ *\([0-9]*\) *: *0x\([0-9A-Fa-f]*\)$/\1 \2/p' | tr A-F a-f)
+    if systemd-analyze has-tpm2 -q; then
+        sd=$(systemd-analyze pcrs --no-pager |
+            awk '$1 ~ /^[0-9]+$/ && length($NF) == 64 { print $1, $NF }')
+        if [ -n "$sd" ] && [ "$sd" = "$tss" ]; then
+            echo 'rk-systemd: systemd-analyze pcrs gives the PCRs of tpm2_pcrread'
+        else
+            echo "$tss" | sed 's/^/rk-systemd: tpm2_pcrread: /'
+            systemd-analyze pcrs --no-pager | sed 's/^/rk-systemd:   /'
+            other="$other pcrs"
+        fi
+    else
+        echo "rk-systemd: no full TPM2 support, $(echo "$tss" | wc -l) PCRs of tpm2_pcrread"
+    fi
 fi
 failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
 for unit in $failed; do
@@ -1743,6 +1802,14 @@ fn build_ltp_initramfs(kernel: &Path, busybox: Option<&[u8]>) -> Result<bool> {
     Ok(true)
 }
 
+/// The cargo profile of the kernel of the boot tests: `debug`, or `release` with `RK_RELEASE=1`.
+/// On a busy host without KVM, the debug kernel can need more than the time limit of the systemd
+/// tests only to unpack the initramfs of the systemd tree (180 MiB). The release kernel is much
+/// faster.
+fn kernel_profile() -> &'static str {
+    if std::env::var_os("RK_RELEASE").is_some_and(|v| v == "1") { "release" } else { "debug" }
+}
+
 /// Builds the x86-64 kernel and the initramfs of the boot tests, and gives the path of the ELF
 /// image. The initramfs is in the same directory.
 fn build_kernel() -> Result<PathBuf> {
@@ -1753,8 +1820,12 @@ fn build_kernel() -> Result<PathBuf> {
     if !features.is_empty() {
         args.extend(["--features", features.as_str()]);
     }
+    if kernel_profile() == "release" {
+        args.push("--release");
+    }
     cargo(&args)?;
-    let kernel = workspace_root().join("target/x86_64-unknown-none/debug/rukernel");
+    let kernel =
+        workspace_root().join(format!("target/x86_64-unknown-none/{}/rukernel", kernel_profile()));
     let dir = kernel.parent().ok_or("the kernel path has no directory")?;
     let user = build_user(dir)?;
     let busybox = busybox(dir)?;
@@ -2087,9 +2158,9 @@ fn tpm_wanted() -> bool {
 }
 
 /// Tells if the machine of the boot test `test` gets a TPM: with `RK_TPM=1`, and always for the
-/// `tpm` test.
+/// `tpm` and `cryptenroll` tests.
 fn tpm_for(test: &str) -> bool {
-    tpm_wanted() || test == "tpm"
+    tpm_wanted() || matches!(test, "tpm" | "cryptenroll")
 }
 
 /// A TPM 2.0 for one QEMU machine: a swtpm process that QEMU connects to through the socket of
@@ -2733,7 +2804,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             (cmd, timeout)
         } else if *test == "systemd" || SYSTEMD_TESTS.contains(test) {
             let initrd = rootfs_initramfs(&kernel, "systemd");
-            let mut cmd = qemu_command_with(&kernel, &initrd, &test_cmdline(test));
+            // The command line has `rk.test=init`, so the TPM of `cryptenroll` comes from the name
+            // of the test.
+            let mut cmd = qemu_command_for(&kernel, &initrd, &test_cmdline(test), tpm_for(test));
             // QEMU uses the last `-m`.
             cmd.args(["-m", SYSTEMD_MEMORY]);
             // systemd stops the generators after 90 s (`DEFAULT_TIMEOUT_USEC` in
@@ -2743,8 +2816,9 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
             // environment for executing generators: Protocol error". With `-icount`, the clock of
             // the guest counts the instructions that it runs (1 ns each), so the load of the
             // host does not change the time that the guest sees. With `sleep=off`, an idle guest
-            // goes at once to its next timer.
-            if !cmd.get_args().any(|a| a == "kvm") {
+            // goes at once to its next timer. The `cryptenroll` test does not start systemd, and
+            // `-icount` makes TCG slower, so that test runs without it.
+            if !cmd.get_args().any(|a| a == "kvm") && *test != "cryptenroll" {
                 cmd.args(["-icount", "shift=0,sleep=off"]);
             }
             (cmd, SYSTEMD_TIMEOUT)
@@ -2912,6 +2986,23 @@ const AARCH64_TESTS: &[&str] =
 /// `AARCH64_PCI_RUNS`.
 const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "apparmor", "inet", "busybox"];
 
+/// The tests of `SYSTEMD_TESTS` that `boot-test aarch64` runs on the arm64 tree of the `systemd`
+/// test. `RK_SYSTEMD_AARCH64` gives the tarball of the tree, from
+/// `tools/systemd/build.sh OUT_FILE arm64`. The tree has no programs of tests/user.
+const AARCH64_SYSTEMD_TESTS: &[&str] = &["cryptenroll"];
+
+/// Writes the initramfs of the arm64 tree of the `systemd` test next to the arm64 kernel `elf`,
+/// with the init script of the `systemd` test. Gives `false` without `RK_SYSTEMD_AARCH64`.
+fn aarch64_systemd_initramfs(elf: &Path) -> Result<bool> {
+    let systemd = ROOTFS.iter().find(|r| r.name == "systemd").ok_or("no systemd tree")?;
+    let rootfs = Rootfs { var: "RK_SYSTEMD_AARCH64", glibc_programs: &[], ..*systemd };
+    if build_rootfs_initramfs(elf, &rootfs)? {
+        return Ok(true);
+    }
+    let _ = fs::remove_file(rootfs_initramfs(elf, "systemd"));
+    Ok(false)
+}
+
 /// The time limit of each test of `AARCH64_USER_TESTS`. QEMU emulates each instruction, and the
 /// `init` test runs all of the general checks of init.
 const AARCH64_USER_TIMEOUT: Duration = Duration::from_secs(1500);
@@ -3036,8 +3127,13 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         println!("boot tests on arm64: skipped, no {}", qemu.display());
         return Ok(());
     }
-    cargo(&["build", "--package", "rukernel", "--target", "aarch64-unknown-none"])?;
-    let elf_path = workspace_root().join("target/aarch64-unknown-none/debug/rukernel");
+    let mut args = vec!["build", "--package", "rukernel", "--target", "aarch64-unknown-none"];
+    if kernel_profile() == "release" {
+        args.push("--release");
+    }
+    cargo(&args)?;
+    let elf_path =
+        workspace_root().join(format!("target/aarch64-unknown-none/{}/rukernel", kernel_profile()));
     let elf = fs::read(&elf_path).map_err(|e| format!("{}: {e}", elf_path.display()))?;
     let image = elf_path.with_file_name("Image");
     fs::write(&image, arm64_image(&elf)?).map_err(|e| format!("{}: {e}", image.display()))?;
@@ -3058,9 +3154,12 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         .iter()
         .filter(|(t, _)| user_tests.contains(t))
         .map(|(t, pci)| (*t, "3", *pci));
+    let systemd_tests =
+        if aarch64_systemd_initramfs(&elf_path)? { AARCH64_SYSTEMD_TESTS } else { &[] };
     let runs = [("boot", "2", ArmPci::No)]
         .into_iter()
         .chain(AARCH64_TESTS.iter().chain(&user_tests).map(|t| (*t, "3", ArmPci::No)))
+        .chain(systemd_tests.iter().map(|t| (*t, "3", ArmPci::No)))
         .chain(pci_runs);
     // RK_AARCH64_TESTS gives a list of test names with commas, for a run by hand.
     let only = std::env::var("RK_AARCH64_TESTS").ok();
@@ -3118,6 +3217,12 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         if let Some((initrd, _)) = &tpm_initrd {
             cmd.arg("-initrd").arg(initrd);
         }
+        let systemd = systemd_tests.contains(test);
+        if systemd {
+            // QEMU uses the last `-m`.
+            cmd.arg("-initrd").arg(rootfs_initramfs(&elf_path, "systemd"));
+            cmd.args(["-m", SYSTEMD_MEMORY]);
+        }
         // The `virt` machine has a virtio-net-pci device by default. The PCI runs remove it, so
         // that the device of the test is the first device on bus 0.
         if pci != ArmPci::No {
@@ -3141,7 +3246,9 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
         // PSCI SYSTEM_OFF stops QEMU with the status 0 for a pass and for a failure, so the log
         // gives the result.
         // QEMU emulates each arm64 instruction on an x86-64 host, so init has more time.
-        let timeout = if user_tests.contains(test) || tpm_initrd.is_some() {
+        let timeout = if systemd {
+            SYSTEMD_TIMEOUT
+        } else if user_tests.contains(test) || tpm_initrd.is_some() {
             AARCH64_USER_TIMEOUT
         } else {
             BOOT_TEST_TIMEOUT
