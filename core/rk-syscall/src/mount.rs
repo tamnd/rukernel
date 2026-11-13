@@ -96,12 +96,20 @@ pub(crate) fn mount(
     flags: u64,
     data: u64,
 ) -> SysResult {
-    may_mount(cx)?;
     let mut flags = flags as u32;
     // Old programs put the magic number 0xC0ED in the high 16 bits.
     if flags & MS_MGC_MSK == MS_MGC_VAL {
         flags &= !MS_MGC_MSK;
     }
+    // The strings first, then the target, as `ksys_mount` of Linux.
+    let vm = cx.vm()?;
+    let read = |addr: u64, max: usize| match addr {
+        0 => Ok(None),
+        addr => vm.read_cstr(addr as usize, max).map(Some),
+    };
+    let type_name = read(fstype, PATH_MAX)?;
+    let dev_name = read(source, PATH_MAX)?;
+    let data = read(data, DATA_MAX)?;
     let target = cx.read_path(target)?;
     let fs = cx.fs()?;
     let at = fs.resolve(fs.cwd(), &target, true)?;
@@ -110,6 +118,22 @@ pub(crate) fn mount(
     if at.inode().metadata().file_type() == Some(rk_vfs::FileType::Symlink) {
         return Err(Errno::ENOENT);
     }
+    // The security modules check the mount before the capability, as `path_mount` of Linux.
+    let lookup = |path: &[u8]| fs.resolve(fs.cwd(), path, true);
+    let fs_flags = type_name
+        .as_deref()
+        .and_then(fstype::find)
+        .map(|t| rk_vfs::security::FsFlags { requires_dev: !t.nodev, binary: false });
+    rk_vfs::security::sb_mount(&rk_vfs::security::MountReq {
+        at: &at,
+        dev_name: dev_name.as_deref(),
+        fstype: type_name.as_deref(),
+        flags,
+        data: data.as_deref(),
+        fs_flags,
+        lookup: &lookup,
+    })?;
+    may_mount(cx)?;
     let ns = fs.namespace();
     if flags & MS_REMOUNT != 0 {
         if !at.is_mount_root() {
@@ -146,19 +170,15 @@ pub(crate) fn mount(
         ns.move_to(&from, &at)?;
         return Ok(0);
     }
-    let vm = cx.vm()?;
     // A new mount needs a type, as `do_new_mount` of Linux.
-    if fstype == 0 {
-        return Err(Errno::EINVAL);
-    }
-    let name = vm.read_cstr(fstype as usize, PATH_MAX)?;
+    let Some(name) = type_name else { return Err(Errno::EINVAL) };
     let ty = fstype::find(&name).ok_or(Errno::ENODEV)?;
-    let data = if data == 0 { Vec::new() } else { vm.read_cstr(data as usize, DATA_MAX)? };
-    let source = match source {
+    let data = data.unwrap_or_default();
+    let source = match dev_name {
         // A file system on a device needs a source, as `get_tree_bdev` of Linux.
-        0 if !ty.nodev => return Err(Errno::EINVAL),
-        0 => Vec::from(&b"none"[..]),
-        addr => vm.read_cstr(addr as usize, PATH_MAX)?,
+        None if !ty.nodev => return Err(Errno::EINVAL),
+        None => Vec::from(&b"none"[..]),
+        Some(name) => name,
     };
     let root = make(&fs, ty, &source, &data, flags & MS_RDONLY != 0)?;
     // The same file system does not go again on the root of its mount, as `do_add_mount` of
@@ -259,6 +279,7 @@ pub(crate) fn umount2(cx: &Cx<'_>, target: u64, flags: u64) -> SysResult {
     if !at.is_mount_root() {
         return Err(Errno::EINVAL);
     }
+    rk_vfs::security::sb_umount(&at, flags as u32)?;
     // An open file keeps the mount, as `propagate_mount_busy` of Linux.
     if flags & MNT_DETACH == 0 && at.mount.open_files() != 0 {
         return Err(Errno::EBUSY);
@@ -288,6 +309,7 @@ pub(crate) fn pivot_root(cx: &Cx<'_>, new_root: u64, put_old: u64) -> SysResult 
         return Err(Errno::ENOTDIR);
     }
     may_mount(cx)?;
+    rk_vfs::security::sb_pivotroot(&old, &new)?;
     let root = fs.root().clone();
     fs.namespace().pivot_root(&new, &old, &root)?;
     for p in rk_proc::processes() {
@@ -664,6 +686,7 @@ pub(crate) fn move_mount(
         flags & MOVE_MOUNT_T_EMPTY_PATH != 0,
         flags & MOVE_MOUNT_T_SYMLINKS != 0,
     )?;
+    rk_vfs::security::move_mount(&from, &to)?;
     let ns = fs.namespace();
     if !from.is_mount_root() {
         return Err(Errno::EINVAL);

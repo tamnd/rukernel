@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- AppArmor checks the mounts, as mount.c of Linux: a mount, a remount, a bind mount, a change of the propagation, a move, `move_mount`, `umount2` and `pivot_root` need a `mount`, `umount` or `pivot_root` rule. A `mount` rule matches the mount point, the source, the type, the flags and the options. A denial gives `EACCES` and a record of the class `mount`. The VFS has the hooks `sb_mount`, `sb_umount`, `sb_pivotroot` and `move_mount` of Linux, and `mount(2)` calls `sb_mount` before the check of `CAP_SYS_ADMIN`, as `path_mount` of Linux (#540).
+
 ## [0.5.28] - 2026-11-13
 
 ### Added

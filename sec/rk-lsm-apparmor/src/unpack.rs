@@ -43,6 +43,8 @@ pub mod class {
     pub const CAP: usize = 3;
     /// The network rules of an old policy, `AA_CLASS_NET_COMPAT` of Ubuntu.
     pub const NET_COMPAT: usize = 4;
+    /// The mount rules, `AA_CLASS_MOUNT`.
+    pub const MOUNT: usize = 7;
     /// The ptrace rules.
     pub const PTRACE: usize = 9;
     /// The signal rules.
