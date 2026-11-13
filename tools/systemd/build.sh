@@ -1,6 +1,8 @@
 #!/bin/sh
-# Builds the root file system of the `systemd`, `udevd` and `networkd` boot tests: a distribution
-# with systemd, udev, systemd-resolved, dbus and kmod, in a container of the distribution.
+# Builds the root file system of the `systemd`, `udevd`, `networkd` and `cryptenroll` boot tests: a
+# distribution with systemd, udev, systemd-resolved, dbus and kmod, in a container of the
+# distribution. The trees of Debian and Ubuntu also have cryptsetup, systemd-cryptenroll and
+# tpm2-tools.
 #
 # Usage: tools/systemd/build.sh OUT_FILE [ARCH [IMAGE]]
 #
@@ -29,7 +31,8 @@ debian:* | ubuntu:*)
 	install='
 apt-get update -qq >/dev/null
 DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends systemd kmod \
-	systemd-sysv dbus udev systemd-resolved $RK_SYSTEMD_PACKAGES >/dev/null
+	systemd-sysv dbus udev systemd-resolved cryptsetup-bin systemd-cryptsetup tpm2-tools \
+	libtss2-tcti-device0t64 $RK_SYSTEMD_PACKAGES >/dev/null
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 '
