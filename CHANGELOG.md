@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - AppArmor checks `ptrace`, as task.c of Linux: an attach and a `PTRACE_TRACEME` need the ptrace rules of the tracer and of the tracee. A profile without ptrace rules needs `CAP_SYS_PTRACE` to trace a task with another label. An exec of a traced task changes the label only if the tracer can trace the new label, as `may_change_ptraced_domain` of Linux. A denial gives `EACCES` and a record of the class `ptrace` (#540).
+- The objects `ct helper`, `ct timeout`, `ct expectation` and `synproxy` of nf_tables, as nft_ct.c and nft_synproxy.c of Linux, with the checks of Linux and their dumps, and the `ct` key `helper`. The objects do not change the packets yet: the connections of rk have no helpers, no timeouts of their own and no expectations, and rk has no SYN proxy. The dump of a rule now gives the name of its object with a NUL byte, as Linux. Before, `ct expectation set "ctexpect"` came back with a wrong byte at the end of the name (#542).
 
 ## [0.5.26] - 2026-11-13
 
