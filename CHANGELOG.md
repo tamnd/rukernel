@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The labels of the IPv6 addresses, as addrlabel.c of Linux: `RTM_NEWADDRLABEL`, `RTM_DELADDRLABEL` and `RTM_GETADDRLABEL` with the default policy of RFC 6724 in each network namespace. `ip addrlabel` and `networkctl label` use them (#538).
+
 ### Fixed
 
 - A route of IPv6 of the type `blackhole`, `unreachable` or `prohibit` goes on the loopback device, as Linux does. Thus `ip -6 route` shows `dev lo` for it, as the tests of systemd-networkd expect for the routes of DHCPv6 prefix delegation and for the static routes (#538).

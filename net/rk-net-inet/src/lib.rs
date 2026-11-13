@@ -25,6 +25,7 @@
 extern crate alloc;
 
 mod addrconf;
+mod addrlabel;
 pub mod checksum;
 pub mod config;
 pub mod fib;
@@ -79,6 +80,7 @@ pub fn init() {
     rules::init();
     nexthop::init();
     addrconf::init();
+    addrlabel::init();
     procfs::init();
     rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af);
     rk_net::ioctl::set_ifconf(fib::ifconf);
@@ -111,6 +113,7 @@ fn ns_init() {}
 fn ns_exit() {
     tcp::ns_exit();
     nexthop::ns_exit();
+    addrlabel::ns_exit();
     stack6::ns_exit();
     stack::ns_exit();
     igmp::ns_exit();
