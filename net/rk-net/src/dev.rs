@@ -343,6 +343,8 @@ pub struct NetDevice {
     hw_features: AtomicU64,
     /// The features that the administrator asked for, as `dev->wanted_features`.
     wanted_features: AtomicU64,
+    /// The CPUs of Receive Packet Steering of the receive queue, as the `rps_map` of Linux.
+    rps_cpus: AtomicU64,
     driver: Arc<dyn NetDriver>,
 }
 
@@ -574,6 +576,19 @@ impl NetDevice {
     /// The MTU.
     pub fn mtu(&self) -> u32 {
         self.mtu.load(Ordering::Relaxed)
+    }
+
+    /// The mask of the CPUs of Receive Packet Steering of the receive queue, as `rps_cpus` in
+    /// sysfs of Linux. A new device has 0, which is no steering.
+    pub fn rps_cpus(&self) -> u64 {
+        self.rps_cpus.load(Ordering::Relaxed)
+    }
+
+    /// Sets the mask of the CPUs of Receive Packet Steering, as `store_rps_map` of Linux. The
+    /// device has one receive queue, and the stack does not steer the frames to other CPUs, so
+    /// the mask only goes back to the reader.
+    pub fn set_rps_cpus(&self, mask: u64) {
+        self.rps_cpus.store(mask, Ordering::Relaxed);
     }
 
     /// The length of the transmit queue, as `dev->tx_queue_len` of Linux.
@@ -938,6 +953,7 @@ pub fn register_at(
             features: AtomicU64::new(f),
             hw_features: AtomicU64::new(hw),
             wanted_features: AtomicU64::new(wanted),
+            rps_cpus: AtomicU64::new(0),
             driver,
         });
         devices.push(dev.clone());

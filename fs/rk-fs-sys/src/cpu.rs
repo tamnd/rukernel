@@ -9,6 +9,7 @@ use crate::Kind;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use rk_abi::Errno;
 use rk_frame::cpu::MAX_CPUS;
 
 /// The kernel runs on x86-64. Some files differ from arm64.
@@ -36,12 +37,18 @@ const TOPOLOGY: [&str; 13] = [
 /// of 32 bits in hexadecimal, separated by commas, with the high group first. Only the first
 /// group is shorter than 8 digits.
 pub(crate) fn mask(n: usize, cpus: core::ops::Range<usize>) -> String {
+    mask_bits(n, cpus.filter(|&c| c < 64).fold(0, |m, c| m | 1 << c))
+}
+
+/// The mask `bits` of `n` bits, as `%*pb`. A bit is a CPU.
+pub(crate) fn mask_bits(n: usize, bits: u64) -> String {
     let groups = n.div_ceil(32).max(1);
     let mut out = String::new();
     for g in (0..groups).rev() {
         let mut word = 0u32;
         for bit in 0..32 {
-            if cpus.contains(&(g * 32 + bit)) {
+            let at = g * 32 + bit;
+            if at < 64 && (bits >> at) & 1 != 0 {
                 word |= 1 << bit;
             }
         }
@@ -54,6 +61,60 @@ pub(crate) fn mask(n: usize, cpus: core::ops::Range<usize>) -> String {
     }
     out.push('\n');
     out
+}
+
+/// Reads a mask of `n` bits in the format of `%*pb`, as `bitmap_parse` of Linux: groups of at
+/// most 8 hexadecimal digits with commas between them, with the low group last. A newline ends
+/// the text, and space and commas around the groups do nothing. An empty text gives 0. Gives
+/// `EINVAL` for a character that is not a digit, and `EOVERFLOW` for a group with more than 8
+/// digits, for too many groups, and for a bit at `n` or at 64 or above.
+pub(crate) fn parse_mask(text: &[u8], n: usize) -> Result<u64, Errno> {
+    let text = &text[..text.iter().position(|&c| c == b'\n').unwrap_or(text.len())];
+    let end_of_group = |c: u8| c.is_ascii_whitespace() || c == b',';
+    let digit = |c: u8| (c as char).to_digit(16);
+    let mut groups: Vec<u32> = Vec::new();
+    // The text goes from the end to the start, as the low group is last.
+    let mut i = text.len();
+    loop {
+        while i > 0 && end_of_group(text[i - 1]) {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        if groups.len() == n.div_ceil(32) {
+            return Err(Errno::EOVERFLOW);
+        }
+        let mut word = 0u32;
+        let mut shift = 0;
+        loop {
+            i -= 1;
+            word |= digit(text[i]).ok_or(Errno::EINVAL)? << shift;
+            shift += 4;
+            if i == 0 || end_of_group(text[i - 1]) {
+                break;
+            }
+            if shift == 32 {
+                // `bitmap_get_x32_reverse` of Linux takes the character before 8 digits too.
+                i -= 1;
+                if digit(text[i]).is_some() {
+                    return Err(Errno::EOVERFLOW);
+                }
+                break;
+            }
+        }
+        groups.push(word);
+    }
+    // The mask has 64 bits. A machine with more CPUs cannot use a CPU at 64 or above.
+    if groups.iter().skip(2).any(|&w| w != 0) {
+        return Err(Errno::EOVERFLOW);
+    }
+    let bits =
+        groups.iter().take(2).enumerate().fold(0u64, |m, (g, &w)| m | u64::from(w) << (32 * g));
+    if n < 64 && bits >> n != 0 {
+        return Err(Errno::EOVERFLOW);
+    }
+    Ok(bits)
 }
 
 /// The list of the CPUs in `cpus`, as `%*pbl`: `0-3`, or `2` for one CPU, or an empty line.
@@ -176,6 +237,25 @@ mod tests {
         assert_eq!(mask(32, 0..1), "00000001\n");
         assert_eq!(mask(40, 0..40), "ff,ffffffff\n");
         assert_eq!(mask(64, 63..64), "80000000,00000000\n");
+    }
+
+    #[test]
+    fn a_mask_reads_as_bitmap_parse_of_linux() {
+        assert_eq!(parse_mask(b"3\n", 2), Ok(3));
+        assert_eq!(parse_mask(b"", 2), Ok(0));
+        assert_eq!(parse_mask(b"0", 2), Ok(0));
+        assert_eq!(parse_mask(b"00000001", 2), Ok(1));
+        assert_eq!(parse_mask(b"1,00000002", 40), Ok(0x1_0000_0002));
+        assert_eq!(parse_mask(b"80000000,00000000", 64), Ok(1 << 63));
+        // A bit of a CPU that the machine does not have, 9 digits in a group, too many groups
+        // and a character that is not a digit.
+        assert_eq!(parse_mask(b"4", 2), Err(Errno::EOVERFLOW));
+        assert_eq!(parse_mask(b"000000001", 2), Err(Errno::EOVERFLOW));
+        assert_eq!(parse_mask(b"1,00000000", 2), Err(Errno::EOVERFLOW));
+        assert_eq!(parse_mask(b"x1", 2), Err(Errno::EINVAL));
+        // A machine with more than 64 CPUs can use only the first 64.
+        assert_eq!(parse_mask(b"0,00000000,00000001", 100), Ok(1));
+        assert_eq!(parse_mask(b"1,00000000,00000000", 100), Err(Errno::EOVERFLOW));
     }
 
     #[test]

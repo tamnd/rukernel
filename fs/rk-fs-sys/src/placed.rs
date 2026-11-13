@@ -116,6 +116,9 @@ pub(crate) fn entries(path: &str, placed: &[Placed]) -> Option<Vec<(String, Kind
                 .collect()
         }
         ("/statistics", Placed::Net(n)) => super::net_statistics(n),
+        (rest, Placed::Net(n)) if rest.starts_with("/queues") => {
+            super::net_queues(n, &rest["/queues".len()..])?
+        }
         _ => return None,
     };
     Some(out)
