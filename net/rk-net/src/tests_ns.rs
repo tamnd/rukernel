@@ -50,7 +50,7 @@ fn namespaces_have_their_own_devices_and_values() {
     // A pair joins two namespaces. The peer is made first, in its namespace.
     let (va, vb) = {
         let _in = ns::enter(&a);
-        veth::create(Some(b"va"), Some(b"vb"), Some(&b)).unwrap()
+        veth::create(Some(b"va"), Some(b"vb"), Some(&b), [None; 2]).unwrap()
     };
     assert_eq!((va.net(), vb.net()), (a.index(), b.index()));
     assert_eq!(va.link_kind(), Some(veth::KIND));
@@ -89,7 +89,7 @@ fn namespaces_have_their_own_devices_and_values() {
     assert_eq!(dev::move_to(&lo, &a).err(), Some(Errno::EINVAL));
     {
         let _in = ns::enter(&a);
-        let other = veth::create(Some(b"vb"), None, None).unwrap();
+        let other = veth::create(Some(b"vb"), None, None, [None; 2]).unwrap();
         assert_eq!(dev::move_to(&vb, &a).err(), Some(Errno::EEXIST));
         dev::unregister(&other.0);
         assert!(dev::by_name(&other.1.name()).is_none());

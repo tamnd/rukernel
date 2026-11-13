@@ -323,6 +323,9 @@ fn set(d: &NetDevice, cmd: u32, r: &IfReq) -> Result<()> {
             d.set_txqlen(u32::try_from(r.int()).map_err(|_| Errno::EINVAL)?);
             Ok(())
         }
+        // `ifr_hwaddr` is a `struct sockaddr` with the `ARPHRD_*` type in its family, as
+        // `dev_set_mac_address_user` of Linux.
+        SIOCSIFHWADDR => d.set_mac(r.family(), MacAddr(r.hwaddr())),
         SIOCSIFHWBROADCAST => {
             if r.family() != d.kind().arphrd() {
                 return Err(Errno::EINVAL);
@@ -345,10 +348,9 @@ fn set(d: &NetDevice, cmd: u32, r: &IfReq) -> Result<()> {
                 d.mc_del(addr)
             }
         }
-        // The drivers cannot change the hardware address and have no MII registers, time
-        // stamps, configuration or bonding, as drivers without the operations in Linux.
+        // The drivers have no metric, MII registers, time stamps, configuration or bonding, as
+        // drivers without the operations in Linux.
         SIOCSIFMETRIC
-        | SIOCSIFHWADDR
         | SIOCSIFMAP
         | SIOCSMIIREG
         | SIOCSHWTSTAMP

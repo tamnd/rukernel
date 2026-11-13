@@ -217,7 +217,7 @@ fn a_packet_socket_sees_its_device_go_down() {
 
     let _serial = crate::TEST_DEVICES.lock();
     dev::init();
-    let d = crate::dummy::create(Some(b"pkdown0")).unwrap();
+    let d = crate::dummy::create(Some(b"pkdown0"), None).unwrap();
     d.set_up(true);
     let protocol = (ETH_P_IP as u16).to_be();
     let p = PacketSocket::new(crate::consts::SOCK_RAW, u32::from(protocol)).unwrap();
@@ -238,4 +238,33 @@ fn a_packet_socket_sees_its_device_go_down() {
     dev::unregister(&d);
     let msg = Message { data: alloc::vec![0; HLEN], ..Message::default() };
     assert_eq!(p.send(&NoPaths, msg, 0, true).err(), Some(Errno::ENXIO));
+}
+
+#[test]
+fn set_mac_changes_the_address_of_a_dummy_device_as_eth_mac_addr() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let d = crate::dummy::create(Some(b"hwaddr0"), None).unwrap();
+    assert_eq!(d.addr_assign_type(), dev::NET_ADDR_RANDOM);
+    assert!(d.mac().is_valid());
+    let ether = LinkKind::Ether.arphrd();
+    let m = MacAddr([0x00, 0x50, 0x56, 0xc0, 0x00, 0x28]);
+    // The family must be the type of the device, and the address must not be multicast or
+    // zero, as `dev_set_mac_address` and `eth_prepare_mac_addr_change` of Linux.
+    assert_eq!(d.set_mac(LinkKind::Loopback.arphrd(), m).err(), Some(Errno::EINVAL));
+    assert_eq!(d.set_mac(ether, MacAddr::BROADCAST).err(), Some(Errno::EADDRNOTAVAIL));
+    assert_eq!(d.set_mac(ether, MacAddr::ZERO).err(), Some(Errno::EADDRNOTAVAIL));
+    assert_eq!(d.addr_assign_type(), dev::NET_ADDR_RANDOM);
+    // A dummy device has `IFF_LIVE_ADDR_CHANGE`, so it can change its address while it is up.
+    d.set_up(true);
+    d.set_mac(ether, m).unwrap();
+    assert_eq!((d.mac(), d.addr_assign_type()), (m, dev::NET_ADDR_SET));
+    dev::unregister(&d);
+    let d = crate::dummy::create(Some(b"hwaddr0"), Some(m)).unwrap();
+    assert_eq!((d.mac(), d.addr_assign_type()), (m, dev::NET_ADDR_SET));
+    dev::unregister(&d);
+    // The loopback device has no `ndo_set_mac_address`.
+    let lo = dev::by_name("lo").unwrap();
+    assert_eq!(lo.set_mac(LinkKind::Loopback.arphrd(), m).err(), Some(Errno::EOPNOTSUPP));
+    assert_eq!(lo.addr_assign_type(), dev::NET_ADDR_PERM);
 }

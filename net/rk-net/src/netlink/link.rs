@@ -6,6 +6,7 @@ use super::policy::{self, Check, Kind, Policy};
 use super::{Origin, Request, notify, register};
 use crate::consts::IFNAMSIZ;
 use crate::dev::{self, Event, LinkKind, NetDevice};
+use crate::ether::MacAddr;
 use crate::ns::{self, NetNs};
 use crate::veth;
 use alloc::sync::Arc;
@@ -207,8 +208,10 @@ fn fill_event(
     let xdp = b.nest(IFLA_XDP as u16);
     b.u8(IFLA_XDP_ATTACHED as u16, XDP_ATTACHED_NONE as u8);
     b.end_nest(xdp);
-    if dev.mac().0 != [0; 6] {
-        b.put(IFLA_PERM_ADDRESS as u16, &dev.mac().0);
+    // A device with a random address has no permanent address, as `dev->perm_addr` of Linux.
+    let perm = dev.driver().perm_addr();
+    if perm != MacAddr::ZERO {
+        b.put(IFLA_PERM_ADDRESS as u16, &perm.0);
     }
     b.str(IFLA_QDISC as u16, dev.qdisc());
     if let Some(kind) = dev.link_kind() {
@@ -340,8 +343,8 @@ fn dump(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
         .collect())
 }
 
-/// Changes a device, as `do_setlink` of Linux: the namespace, the MTU, the name, the flags and
-/// the length of the queue. A change of the hardware address gives `EOPNOTSUPP`.
+/// Changes a device, as `do_setlink` of Linux: the namespace, the hardware address, the MTU, the
+/// name, the flags and the length of the queue.
 fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
     // The move to another namespace comes first, as in `do_setlink` of Linux, so the other
     // changes apply in the new namespace.
@@ -353,8 +356,14 @@ fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
             return Err(Errno::EINVAL);
         }
     }
-    if a.has(IFLA_MAP) || a.has(IFLA_ADDRESS) {
+    if a.has(IFLA_MAP) {
         return Err(Errno::EOPNOTSUPP);
+    }
+    if let Some(v) = a.get(IFLA_ADDRESS) {
+        // The family is the type of the device, as in `do_setlink` of Linux.
+        let mut m = [0; 6];
+        m.copy_from_slice(&v[..6]);
+        dev.set_mac(dev.kind().arphrd(), MacAddr(m))?;
     }
     if let Some(mtu) = a.u32(IFLA_MTU)? {
         dev.set_mtu(mtu)?;
@@ -430,7 +439,7 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
         let dev_ns = target_ns(a)?;
         let dev = {
             let _in = dev_ns.as_deref().map(ns::enter);
-            crate::dummy::create(a.str(IFLA_IFNAME))?
+            crate::dummy::create(a.str(IFLA_IFNAME), new_addr(a)?)?
         };
         return configure(&dev, h, a).inspect_err(|_| dev::unregister(&dev));
     }
@@ -445,6 +454,7 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
         None => (&[0u8; IFINFO_LEN][..], Attrs::parse(&[], IFLA_MAX)),
     };
     check_policy(&peer_a)?;
+    let macs = [new_addr(a)?, new_addr(&peer_a)?];
     let dev_ns = target_ns(a)?;
     let current = ns::current();
     let peer_ns = target_ns(&peer_a)?.unwrap_or_else(|| current.clone());
@@ -452,12 +462,24 @@ fn create(h: &[u8], a: &Attrs<'_>) -> Result<()> {
     let peer_name = peer_a.str(IFLA_IFNAME);
     let (dev, peer) = {
         let _in = dev_ns.as_deref().map(ns::enter);
-        veth::create(name, peer_name, Some(&peer_ns))?
+        veth::create(name, peer_name, Some(&peer_ns), macs)?
     };
     // An error removes the pair.
     configure(&peer, peer_h, &peer_a)
         .and_then(|()| configure(&dev, h, a))
         .inspect_err(|_| dev::unregister(&dev))
+}
+
+/// The address in `IFLA_ADDRESS` of a new device, as `dummy_validate` and `veth_validate` of
+/// Linux. Gives `EINVAL` for an address that is not six bytes, and `EADDRNOTAVAIL` for a
+/// multicast or zero address.
+fn new_addr(a: &Attrs<'_>) -> Result<Option<MacAddr>> {
+    let Some(v) = a.get(IFLA_ADDRESS) else { return Ok(None) };
+    let m = MacAddr(v.try_into().map_err(|_| Errno::EINVAL)?);
+    if !m.is_valid() {
+        return Err(Errno::EADDRNOTAVAIL);
+    }
+    Ok(Some(m))
 }
 
 /// Sets the other attributes of a new device, as `rtnl_configure_link` of Linux.
@@ -518,7 +540,7 @@ fn setlink(req: &Request<'_>) -> Result<()> {
 fn event(dev: &NetDevice, e: Event) {
     let (ty, change, event) = match e {
         Event::Flags(c) => (RTM_NEWLINK, c, IFLA_EVENT_NONE),
-        Event::Mtu | Event::Name => (RTM_NEWLINK, 0, IFLA_EVENT_NONE),
+        Event::Mtu | Event::Name | Event::Address => (RTM_NEWLINK, 0, IFLA_EVENT_NONE),
         Event::Features => (RTM_NEWLINK, 0, IFLA_EVENT_FEATURES),
         Event::Register => (RTM_NEWLINK, u32::MAX, IFLA_EVENT_NONE),
         Event::Unregister => (RTM_DELLINK, u32::MAX, IFLA_EVENT_NONE),

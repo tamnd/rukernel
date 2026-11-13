@@ -184,6 +184,24 @@ pub trait NetDriver: Send + Sync {
         MacAddr::ZERO
     }
 
+    /// How the device got the address of `mac`, one of the `NET_ADDR_*` values, as
+    /// `dev->addr_assign_type` of Linux. A device with an address but no permanent address
+    /// made a random address, as `eth_hw_addr_random` of Linux.
+    fn addr_assign_type(&self) -> u8 {
+        if self.perm_addr() == MacAddr::ZERO && self.mac() != MacAddr::ZERO {
+            NET_ADDR_RANDOM
+        } else {
+            NET_ADDR_PERM
+        }
+    }
+
+    /// Tells if a process can change the hardware address, also while the device is up, as a
+    /// driver with `eth_mac_addr` and `IFF_LIVE_ADDR_CHANGE` in Linux. The other drivers have
+    /// no `ndo_set_mac_address`.
+    fn can_set_mac(&self) -> bool {
+        false
+    }
+
     /// Sends one frame. Gives `ENOBUFS` if the queue of the device is full.
     fn transmit(&self, frame: NetBuf) -> Result<()>;
 
@@ -261,6 +279,8 @@ pub enum Event {
     Register,
     /// The device goes away from the namespace, as `NETDEV_UNREGISTER`. It is down.
     Unregister,
+    /// The hardware address changed, as `NETDEV_CHANGEADDR`.
+    Address,
     /// The active features changed, as `NETDEV_FEAT_CHANGE`.
     Features,
 }
@@ -292,6 +312,11 @@ pub struct NetDevice {
     /// How the device got its name, one of the `NET_NAME_*` values, as `dev->name_assign_type`
     /// of Linux.
     name_assign_type: AtomicU8,
+    /// The hardware address in the low six bytes, as `dev->dev_addr` of Linux.
+    addr: AtomicU64,
+    /// How the device got its hardware address, one of the `NET_ADDR_*` values, as
+    /// `dev->addr_assign_type` of Linux.
+    addr_assign_type: AtomicU8,
     /// The alternative names, in the order of their creation, as the list of `name_node` of
     /// Linux.
     altnames: SpinLock<Vec<String>>,
@@ -320,6 +345,13 @@ pub struct NetDevice {
     wanted_features: AtomicU64,
     driver: Arc<dyn NetDriver>,
 }
+
+/// The device has its permanent address, as `NET_ADDR_PERM` of Linux.
+pub const NET_ADDR_PERM: u8 = 0;
+/// The driver made a random address, as `NET_ADDR_RANDOM`.
+pub const NET_ADDR_RANDOM: u8 = 1;
+/// A process set the address, as `NET_ADDR_SET`.
+pub const NET_ADDR_SET: u8 = 3;
 
 /// The kernel gave the name with the next free number, as `eth0`, as `NET_NAME_ENUM` of Linux.
 pub const NET_NAME_ENUM: u8 = 1;
@@ -482,7 +514,38 @@ impl NetDevice {
 
     /// The hardware address.
     pub fn mac(&self) -> MacAddr {
-        self.driver.mac()
+        let b = self.addr.load(Ordering::Relaxed).to_le_bytes();
+        MacAddr([b[0], b[1], b[2], b[3], b[4], b[5]])
+    }
+
+    /// How the device got its hardware address, one of the `NET_ADDR_*` values. udev reads it
+    /// in `addr_assign_type` of sysfs, and `MACAddressPolicy=` changes only a random address.
+    pub fn addr_assign_type(&self) -> u8 {
+        self.addr_assign_type.load(Ordering::Relaxed)
+    }
+
+    /// Sets the hardware address, as `dev_set_mac_address` and `eth_mac_addr` of Linux. `family`
+    /// is the `ARPHRD_*` type of the address. Gives `EOPNOTSUPP` if the driver cannot change
+    /// the address, `EINVAL` for a family that is not the type of the device, and
+    /// `EADDRNOTAVAIL` for a multicast or zero address. The address is then a set address.
+    pub fn set_mac(&self, family: u16, addr: MacAddr) -> Result<()> {
+        if !self.driver.can_set_mac() {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if family != self.kind.arphrd() {
+            return Err(Errno::EINVAL);
+        }
+        // Linux calls the driver only for a new address, but the address is a set address
+        // after each call.
+        if addr != self.mac() {
+            if !addr.is_valid() {
+                return Err(Errno::EADDRNOTAVAIL);
+            }
+            self.addr.store(pack_mac(addr), Ordering::Relaxed);
+        }
+        self.addr_assign_type.store(NET_ADDR_SET, Ordering::Relaxed);
+        notify(self, Event::Address);
+        Ok(())
     }
 
     /// Adds the link multicast address `addr`, as `dev_mc_add_global` in net/core/dev_addr_lists.c
@@ -859,6 +922,8 @@ pub fn register_at(
         let dev = Arc::new(NetDevice {
             name: SpinLock::new(name),
             name_assign_type: AtomicU8::new(assign),
+            addr: AtomicU64::new(pack_mac(driver.mac())),
+            addr_assign_type: AtomicU8::new(driver.addr_assign_type()),
             altnames: SpinLock::new(Vec::new()),
             ifindex: AtomicU32::new(ifindex),
             net: AtomicUsize::new(net),
@@ -880,6 +945,13 @@ pub fn register_at(
     };
     notify(&dev, Event::Register);
     Ok(dev)
+}
+
+/// The hardware address `m` in the low six bytes of a `u64`.
+fn pack_mac(m: MacAddr) -> u64 {
+    let mut b = [0; 8];
+    b[..6].copy_from_slice(&m.0);
+    u64::from_le_bytes(b)
 }
 
 /// Tells if `dev` is registered.

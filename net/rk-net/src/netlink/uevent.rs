@@ -206,7 +206,7 @@ mod tests {
         let (there, d) = {
             let _in = ns::enter(&other);
             let s = listener(NETLINK_KOBJECT_UEVENT);
-            (s, crate::dummy::create(Some(b"uev9")).unwrap())
+            (s, crate::dummy::create(Some(b"uev9"), None).unwrap())
         };
         {
             let _in = ns::enter(&other);
@@ -230,7 +230,7 @@ mod tests {
             ]
         );
         let _in = ns::enter(&other);
-        let d2 = crate::dummy::create(Some(b"uev7")).unwrap();
+        let d2 = crate::dummy::create(Some(b"uev7"), None).unwrap();
         let add = got(&there, "uev7").remove(0);
         assert_eq!(add[3], "SUBSYSTEM=net");
         assert_eq!(add[4], "INTERFACE=uev7");
