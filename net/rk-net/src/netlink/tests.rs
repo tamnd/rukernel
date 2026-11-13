@@ -1,7 +1,7 @@
 use super::msg::{self, Attrs, Builder, HDRLEN, Header};
 use super::{ADDR_LEN, NetlinkSocket, link};
 use crate::consts::{
-    AF_NETLINK, IFF_UP, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_NETLINK,
+    AF_NETLINK, IFF_LOWER_UP, IFF_UP, MSG_TRUNC, SOCK_DGRAM, SOCK_RAW, SOCK_STREAM, SOL_NETLINK,
 };
 use crate::{Message, NoPaths, Socket, dev};
 use alloc::vec::Vec;
@@ -337,4 +337,46 @@ fn setlink_changes_the_hardware_address_and_sends_a_new_link() {
     send(&s, r.finish());
     assert_eq!(ack_error(&s), i32::from(Errno::EOPNOTSUPP.get()));
     dev::unregister(&d);
+}
+
+#[test]
+fn the_other_end_of_a_veth_pair_tells_of_its_new_carrier() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let s = socket();
+    s.bind(&NoPaths, &addr(0, 1 << (RTNLGRP_LINK - 1))).unwrap();
+    let (a, b) = crate::veth::create(Some(b"vca"), Some(b"vcb"), None, [None; 2]).unwrap();
+    a.set_up(true);
+    recv_all(&s);
+    // The messages of a link: its index and its flags.
+    let links = |got: Vec<Vec<u8>>| -> Vec<(i32, u32)> {
+        got.iter()
+            .filter(|m| Header::parse(m).unwrap().ty == RTM_NEWLINK as u16)
+            .map(|m| {
+                let ifi = &m[HDRLEN..];
+                let index = i32::from_ne_bytes(ifi[4..8].try_into().unwrap());
+                (index, u32::from_ne_bytes(ifi[8..12].try_into().unwrap()))
+            })
+            .collect()
+    };
+    // When `vcb` goes up, `vca` gets its carrier, and a message tells of it, as the link
+    // watch of Linux does after `veth_open`.
+    b.set_up(true);
+    let got = links(recv_all(&s));
+    let of_a: Vec<_> = got.iter().filter(|(i, _)| *i == a.ifindex() as i32).collect();
+    assert_eq!(of_a.len(), 1);
+    assert_ne!(of_a[0].1 & IFF_LOWER_UP, 0);
+    // When `vcb` goes down, `vca` loses it.
+    b.set_up(false);
+    let got = links(recv_all(&s));
+    let of_a: Vec<_> = got.iter().filter(|(i, _)| *i == a.ifindex() as i32).collect();
+    assert_eq!(of_a.len(), 1);
+    assert_eq!(of_a[0].1 & IFF_LOWER_UP, 0);
+    // An end that is down gets no message.
+    a.set_up(false);
+    recv_all(&s);
+    b.set_up(true);
+    let got = links(recv_all(&s));
+    assert!(got.iter().all(|(i, _)| *i == b.ifindex() as i32));
+    dev::unregister(&a);
+    dev::unregister(&b);
 }

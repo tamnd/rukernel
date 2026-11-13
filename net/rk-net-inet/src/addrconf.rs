@@ -522,7 +522,8 @@ pub(crate) fn event(d: &NetDevice, e: Event) {
         | Event::Name
         | Event::Register
         | Event::Features
-        | Event::Address => {}
+        | Event::Address
+        | Event::Change => {}
     }
 }
 

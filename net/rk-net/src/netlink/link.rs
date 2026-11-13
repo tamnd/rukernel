@@ -540,7 +540,9 @@ fn setlink(req: &Request<'_>) -> Result<()> {
 fn event(dev: &NetDevice, e: Event) {
     let (ty, change, event) = match e {
         Event::Flags(c) => (RTM_NEWLINK, c, IFLA_EVENT_NONE),
-        Event::Mtu | Event::Name | Event::Address => (RTM_NEWLINK, 0, IFLA_EVENT_NONE),
+        Event::Mtu | Event::Name | Event::Address | Event::Change => {
+            (RTM_NEWLINK, 0, IFLA_EVENT_NONE)
+        }
         Event::Features => (RTM_NEWLINK, 0, IFLA_EVENT_FEATURES),
         Event::Register => (RTM_NEWLINK, u32::MAX, IFLA_EVENT_NONE),
         Event::Unregister => (RTM_DELLINK, u32::MAX, IFLA_EVENT_NONE),
