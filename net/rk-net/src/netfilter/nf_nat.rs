@@ -47,7 +47,7 @@ pub const NF_NAT_RANGE_PERSISTENT: u32 = 1 << 3;
 pub const NF_NAT_RANGE_PROTO_RANDOM_FULLY: u32 = 1 << 4;
 /// The port is an offset from a base, which this NAT does not do.
 pub const NF_NAT_RANGE_PROTO_OFFSET: u32 = 1 << 5;
-/// A map of a prefix to a prefix, which this NAT does not do.
+/// A map of a prefix to a prefix. The bits of the address that are not in the prefix stay.
 pub const NF_NAT_RANGE_NETMAP: u32 = 1 << 6;
 /// The flags that are known.
 pub const NF_NAT_RANGE_MASK: u32 = (1 << 7) - 1;
