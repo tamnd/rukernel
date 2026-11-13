@@ -1727,9 +1727,41 @@ fn set_attr_at(
 /// calls with `AT_EMPTY_PATH` of Linux, which find the file with a path walk.
 fn set_attr_fd(cx: &Cx<'_>, fd: u64, raw: bool, attr: &SetAttr, change: Change) -> SysResult {
     let file = if raw { cx.file(fd)? } else { cx.fdget(fd)? };
+    if let Some(sock) = rk_net::SockInode::of(&file) {
+        return set_attr_sock(cx, file, raw, &sock, attr, change);
+    }
     let inode = file.inode().ok_or(Errno::EBADF)?;
     file.want_write()?;
     change_attr(cx, file.location(), inode, attr, change)
+}
+
+/// Changes the attributes of the socket of `file`, as `notify_change` and `sockfs_setattr` of
+/// Linux. With `raw`, the call is `AT_EMPTY_PATH` with an empty path. The path lookup of Linux
+/// then holds the inode but not the file, so the file goes before the change. If another thread
+/// closes the last descriptor of the socket in the meantime, the socket closes, and a change of
+/// the owner gives `ENOENT`. LTP af_alg07 checks this race.
+fn set_attr_sock(
+    cx: &Cx<'_>,
+    file: Arc<File>,
+    raw: bool,
+    sock: &rk_net::SockInode,
+    attr: &SetAttr,
+    change: Change,
+) -> SysResult {
+    file.want_write()?;
+    let meta = file.metadata()?;
+    let _file = (!raw).then_some(file);
+    let cred = cx.process().cred();
+    if change == Change::Touch && !cred.owns(&meta) {
+        cred.permission(&meta, rk_vfs::cred::may::WRITE)?;
+    }
+    let mut attr = *attr;
+    cred.setattr_prepare(&meta, &mut attr)?;
+    if change == Change::Owner {
+        cred.chown_kill(&meta, &mut attr);
+    }
+    sock.set_attr(&attr)?;
+    Ok(0)
 }
 
 pub(crate) fn fchmodat(cx: &Cx<'_>, dirfd: u64, path: u64, mode: u64) -> SysResult {

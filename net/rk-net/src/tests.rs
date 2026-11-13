@@ -62,3 +62,23 @@ fn busy_poll() {
     assert_eq!(o.set(SO_BUSY_POLL, &(-1_i32).to_ne_bytes()), Err(Errno::EINVAL));
     assert_eq!(o.get(SO_BUSY_POLL), Ok(50_i32.to_ne_bytes().to_vec()));
 }
+
+/// The inode of a socket file has the owner of `new_file` and the mode 0777, a change of the
+/// attributes shows in `metadata`, and a change of the owner after the last file goes gives
+/// `ENOENT`, as `sockfs_setattr` of Linux.
+#[test]
+fn socket_inode_attributes() {
+    use rk_vfs::inode::SetAttr;
+    let sock = crate::alg::AlgSocket::new(crate::consts::SOCK_SEQPACKET, 0).unwrap();
+    let file = super::new_file(sock, 0, (1000, 100));
+    let meta = file.metadata().unwrap();
+    assert_eq!((meta.uid, meta.gid, meta.mode & 0o7777), (1000, 100, 0o777));
+    let inode = super::SockInode::of(&file).unwrap();
+    let attr = SetAttr { uid: Some(0), mode: Some(0o600), ..SetAttr::default() };
+    assert_eq!(inode.set_attr(&attr), Ok(()));
+    let meta = file.metadata().unwrap();
+    assert_eq!((meta.uid, meta.gid, meta.mode & 0o7777), (0, 100, 0o600));
+    drop(file);
+    assert_eq!(inode.set_attr(&attr), Err(Errno::ENOENT));
+    assert_eq!(inode.set_attr(&SetAttr { mode: Some(0o644), ..SetAttr::default() }), Ok(()));
+}

@@ -249,16 +249,23 @@ fn family_socket(
     }
 }
 
+/// The owner of the inode of a new socket: the file system user and group IDs of the caller, as
+/// `sock_alloc` of Linux.
+fn sock_owner(cx: &Cx<'_>) -> (u32, u32) {
+    let cred = cx.process().cred();
+    (cred.fsuid, cred.fsgid)
+}
+
 /// Adds the file of `sock` to the descriptor table.
 fn install(cx: &Cx<'_>, sock: Arc<dyn Socket>, flags: u32) -> Result<i32, Errno> {
-    let file = rk_net::new_file(sock, flags & O_NONBLOCK);
+    let file = rk_net::new_file(sock, flags & O_NONBLOCK, sock_owner(cx));
     cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)
 }
 
 pub(crate) fn socket_call(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64) -> SysResult {
     let (kind, flags) = split_type(kind)?;
     let sock = new_socket(cx, domain, kind, protocol)?;
-    let file = rk_net::new_file(sock.clone(), flags & O_NONBLOCK);
+    let file = rk_net::new_file(sock.clone(), flags & O_NONBLOCK, sock_owner(cx));
     rk_vfs::security::socket_post_create(&lsm_sock(&file, &*sock), false)?;
     Ok(cx.files()?.lock().insert(file, flags & O_CLOEXEC != 0)? as u64)
 }
@@ -274,8 +281,8 @@ pub(crate) fn socketpair(cx: &Cx<'_>, domain: u64, kind: u64, protocol: u64, sv:
     rk_net_unix::check_protocol(u32::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?)?;
     rk_vfs::security::socket_create(AF_UNIX, kind, protocol as u32, false)?;
     let (a, b) = Unix::pair(kind)?;
-    let fa = rk_net::new_file(a.clone(), flags & O_NONBLOCK);
-    let fb = rk_net::new_file(b.clone(), flags & O_NONBLOCK);
+    let fa = rk_net::new_file(a.clone(), flags & O_NONBLOCK, sock_owner(cx));
+    let fb = rk_net::new_file(b.clone(), flags & O_NONBLOCK, sock_owner(cx));
     let (sa, sb) = (lsm_sock(&fa, &*a), lsm_sock(&fb, &*b));
     rk_vfs::security::socket_post_create(&sa, false)?;
     rk_vfs::security::socket_post_create(&sb, false)?;
