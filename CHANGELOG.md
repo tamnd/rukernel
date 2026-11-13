@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.28] - 2026-11-13
+
 ### Added
 
 - AppArmor checks the sockets, as net.c and af_inet.c of the Ubuntu kernel: a create, a bind, a connect, a listen, an accept, a send, a receive, `getsockname`, `getpeername`, `getsockopt`, `setsockopt` and `shutdown` need a network rule for the family and the type of the socket. For IPv4 and IPv6, a rule can also name the protocol, the addresses and the ports, the option and the backlog. A denial gives `EACCES` and a record of the class `net` (#540).
@@ -1635,6 +1637,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.28]: https://github.com/tamnd/rukernel/compare/v0.5.27...v0.5.28
 [0.5.27]: https://github.com/tamnd/rukernel/compare/v0.5.26...v0.5.27
 [0.5.26]: https://github.com/tamnd/rukernel/compare/v0.5.25...v0.5.26
 [0.5.25]: https://github.com/tamnd/rukernel/compare/v0.5.24...v0.5.25
