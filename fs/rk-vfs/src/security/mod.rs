@@ -321,6 +321,16 @@ pub struct Sock<'a> {
     pub protocol: u32,
     /// The socket blob.
     pub security: &'a Blob,
+    /// The addresses of the socket, or `None` for a new socket.
+    pub names: Option<&'a dyn SockNames>,
+}
+
+/// The addresses of a socket for the hooks, as `getname` of `struct proto_ops` of Linux.
+pub trait SockNames {
+    /// The local address, as `getsockname`.
+    fn name(&self) -> Vec<u8>;
+    /// The address of the peer, as `getpeername`. `None` if the socket has no peer.
+    fn peer_name(&self) -> Option<Vec<u8>>;
 }
 
 /// `security_capable`: the task with `cred` has the capability `cap`. `opts` has the
@@ -645,9 +655,10 @@ pub fn socket_accept(sock: &Sock<'_>) -> Result<()> {
     call_int_hook!(socket_accept, sock)
 }
 
-/// `security_socket_sendmsg`.
-pub fn socket_sendmsg(sock: &Sock<'_>, len: usize) -> Result<()> {
-    call_int_hook!(socket_sendmsg, sock, len)
+/// `security_socket_sendmsg`. `addr` is the address of the destination and `flags` has the
+/// `MSG_*` bits of the message.
+pub fn socket_sendmsg(sock: &Sock<'_>, addr: Option<&[u8]>, flags: u32, len: usize) -> Result<()> {
+    call_int_hook!(socket_sendmsg, sock, addr, flags, len)
 }
 
 /// `security_socket_recvmsg`.

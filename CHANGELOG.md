@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- AppArmor checks the sockets, as net.c and af_inet.c of the Ubuntu kernel: a create, a bind, a connect, a listen, an accept, a send, a receive, `getsockname`, `getpeername`, `getsockopt`, `setsockopt` and `shutdown` need a network rule for the family and the type of the socket. For IPv4 and IPv6, a rule can also name the protocol, the addresses and the ports, the option and the backlog. A denial gives `EACCES` and a record of the class `net` (#540).
+
 ## [0.5.27] - 2026-11-13
 
 ### Added
