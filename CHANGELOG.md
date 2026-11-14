@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - nf_tables: the expression `fib`, as nft_fib.c, nft_fib_ipv4.c and nft_fib_ipv6.c of Linux. It gives the type of an address of the packet, or the device that the route to an address goes out on, for example `fib saddr . iif oif missing drop` of firewalld. The stack of IPv4 and IPv6 does the route lookups (#542).
 
+### Fixed
+
+- A message on a stream or seqpacket Unix socket that `accept` did not take yet gets the credentials of the sender, as `maybe_add_creds` of Linux. Before, the receiver got the overflow IDs when it set `SO_PASSCRED` after the accept. Thus systemd-udevd logged "Invalid sender uid 65534" and ignored `udevadm control --reload`, so a new .link file did not apply (#538).
+
 ## [0.5.32] - 2026-11-15
 
 ### Added

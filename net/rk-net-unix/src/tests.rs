@@ -160,3 +160,30 @@ fn shutdown_ends_connect() {
     server.shutdown(SHUT_RD).unwrap();
     assert_eq!(in_thread(move || waiter.join().unwrap()), Err(Errno::ECONNREFUSED));
 }
+
+#[test]
+fn a_message_before_the_accept_has_the_credentials_of_the_sender() {
+    // As `udevadm control`: the client sends before the server accepts, and the server sets
+    // `SO_PASSCRED` on the new socket after the accept.
+    for (kind, name) in [(SOCK_SEQPACKET, b"rk-test-cred-q"), (SOCK_STREAM, b"rk-test-cred-s")] {
+        let server = Unix::new(kind).unwrap();
+        let addr = abstract_addr(name);
+        server.bind(&NoPaths, &addr).unwrap();
+        server.listen(1).unwrap();
+        let client = Unix::new(kind).unwrap();
+        client.connect(&NoPaths, &addr, true).unwrap();
+        client.send(&NoPaths, msg(b"early"), 0, true).unwrap();
+        let conn = server.accept(true).unwrap();
+        // A message after the accept gets no credentials: no side has `SO_PASSCRED`.
+        client.send(&NoPaths, msg(b"late"), 0, true).unwrap();
+        conn.set_option(SOL_SOCKET, SO_PASSCRED, &1_i32.to_ne_bytes()).unwrap();
+        let r = conn.recv(5, 0, true).unwrap();
+        assert_eq!(r.data, b"early");
+        let cred = r.cred.unwrap();
+        assert_eq!((cred.uid, cred.gid), (current_cred().uid, current_cred().gid));
+        assert_ne!(cred.uid, NO_CRED.uid);
+        let r = conn.recv(5, 0, true).unwrap();
+        assert_eq!(r.data, b"late");
+        assert_eq!(r.cred.map(|c| c.uid), Some(NO_CRED.uid));
+    }
+}
