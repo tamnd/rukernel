@@ -51,12 +51,16 @@ use rk_vfs::inode::Result;
 
 #[path = "nft_exprs.rs"]
 mod nft_exprs;
+#[path = "nft_exthdr.rs"]
+mod nft_exthdr;
 #[path = "nft_fib.rs"]
 mod nft_fib;
 #[path = "nft_flowtable.rs"]
 mod nft_flowtable;
 #[path = "nft_objects.rs"]
 mod nft_objects;
+#[path = "nft_rt.rs"]
+mod nft_rt;
 
 #[cfg(test)]
 pub(crate) use self::nft_exprs::nft_log_line;
@@ -68,6 +72,7 @@ use self::nft_exprs::{
     nft_range_init, nft_realtime_ns, nft_reject_eval, nft_reject_init,
 };
 pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
+use self::nft_exthdr::{NftExthdr, nft_exthdr_eval, nft_exthdr_init};
 use self::nft_fib::{NftFib, nft_fib_eval, nft_fib_init};
 pub use self::nft_fib::{NftFibFlow, NftFibRouteFn, NftFibTypeFn, nft_fib_set_fns};
 use self::nft_flowtable::nft_flow_offload_init;
@@ -83,6 +88,8 @@ use self::nft_objects::{
     nft_connlimit_eval, nft_connlimit_init, nft_obj_eval, nft_objref_init, nft_quota_eval,
     nft_quota_init, nft_set_elem_update_expr,
 };
+use self::nft_rt::{NftRt, nft_rt_eval, nft_rt_init};
+pub use self::nft_rt::{NftRtRouteFn, nft_rt_set_fn};
 
 // The attributes of an expression, `NFTA_EXPR_*`.
 const NFTA_EXPR_NAME: u32 = 1;
@@ -328,6 +335,10 @@ pub(super) enum NftExpr {
     Reject(NftReject),
     /// `fib`, as nft_fib.c.
     Fib(NftFib),
+    /// `rt`, as nft_rt.c.
+    Rt(NftRt),
+    /// `exthdr`, as nft_exthdr.c.
+    Exthdr(NftExthdr),
     /// `dynset`, as nft_dynset.c.
     Dynset(NftDynset),
     /// `match` and `target`, an extension of xtables, as nft_compat.c.
@@ -786,6 +797,8 @@ pub(super) fn nf_tables_expr_parse(
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
         b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
         b"fib" => Ok(NftExpr::Fib(nft_fib_init(table.family, data)?)),
+        b"rt" => Ok(NftExpr::Rt(nft_rt_init(table.family, data)?)),
+        b"exthdr" => Ok(NftExpr::Exthdr(nft_exthdr_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
         b"match" | b"target" => {
             let target = name == b"target";
@@ -969,6 +982,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
         )),
         NftExpr::Xt(x) if x.hooks() != 0 => Some((x.hooks(), false)),
         NftExpr::Fib(f) => Some((f.hooks(), false)),
+        NftExpr::Rt(r) => r.hooks().map(|h| (h, false)),
         NftExpr::FlowOffload { .. } => Some((1 << NF_INET_FORWARD, false)),
         // As `nft_meta_get_validate_sdif` and `nft_meta_set_validate` of Linux.
         NftExpr::Meta { key: NFT_META_SDIF | NFT_META_SDIFNAME, .. } => {
@@ -1856,6 +1870,8 @@ fn nft_eval(
             NftExpr::Connlimit(c) => nft_connlimit_eval(c, regs, skb),
             NftExpr::Log(l) => nft_log_eval(l, skb, state),
             NftExpr::Fib(f) => nft_fib_eval(f, regs, skb.data(), skb.mark, pkt.l4proto, state),
+            NftExpr::Rt(r) => nft_rt_eval(r, regs, skb.data(), skb.mark, state),
+            NftExpr::Exthdr(x) => nft_exthdr_eval(x, regs, skb, state, pkt),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {
                 regs.verdict = if nft_expr_hooks(e).is_some_and(|(m, _)| m & 1 << state.hook == 0) {

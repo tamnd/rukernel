@@ -1304,7 +1304,7 @@ fn nft_payload_set(skb: &mut NetBuf, pkt: &NfPktinfo, src: &[u8], p: &NftPayload
 
 /// Changes the checksum at `at` of `d` for the bytes of the sum `tsum` in place of the bytes
 /// of the sum `fsum`, as `nft_csum_replace` of Linux.
-fn nft_csum_replace(d: &mut [u8], at: usize, fsum: u32, tsum: u32) -> Option<()> {
+pub(super) fn nft_csum_replace(d: &mut [u8], at: usize, fsum: u32, tsum: u32) -> Option<()> {
     let w = d.get_mut(at..at + 2)?;
     let old = u16::from_be_bytes([w[0], w[1]]);
     // `csum_fold` gives the complement of the sum.

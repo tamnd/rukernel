@@ -8,6 +8,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ### Added
 
+- nf_tables: the expression `exthdr`, as nft_exthdr.c of Linux. It reads the extension headers of IPv6, the options of IPv4 and TCP and the chunks of SCTP, and tells if a packet of DCCP has an option, as `tcp option maxseg size`, `exthdr frag exists` or `ip option rr exists`. A rule can also write a TCP option (`tcp option maxseg size set 1360`) and remove one (`reset tcp option sack-perm`), with the checksum of TCP (#542).
+- nf_tables: the expression `rt`, as nft_rt.c of Linux: the next hop of the route of the packet (`rt ip nexthop`, `rt ip6 nexthop`), the TCP MSS of the path (`rt mtu`, as in `tcp option maxseg size set rt mtu`), `rt classid` and `rt ipsec`. The stack of IPv4 and IPv6 does the route lookups. The routes of rk have no realms and no IPsec, so `rt classid` and `rt ipsec` give 0 (#542).
 - nf_tables: the expression `fib`, as nft_fib.c, nft_fib_ipv4.c and nft_fib_ipv6.c of Linux. It gives the type of an address of the packet, or the device that the route to an address goes out on, for example `fib saddr . iif oif missing drop` of firewalld. The stack of IPv4 and IPv6 does the route lookups (#542).
 - The `systemd` boot test checks the keys if the tree has keyutils: the key `invocation_id` that systemd gives to each service, the upcall to /sbin/request-key with `keyctl request2` (instantiate, a payload from a pipe, negate and reject), a `dns_resolver` key, and a `big_key` key of 64 KiB. tools/systemd/build.sh puts keyutils in the tree. `KEYCTL_CAPABILITIES` gives `KEYCTL_CAPS0_BIG_KEY`, as Linux with `CONFIG_BIG_KEYS`. (#539)
 

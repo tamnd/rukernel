@@ -777,6 +777,25 @@ pub(crate) fn nft_fib_route(pf: u8, fl: &NftFibFlow) -> Option<(u32, u32)> {
     Some((ty, n.ifindex))
 }
 
+/// The route of a lookup of the nf_tables expression `rt`: the next hop and the MTU of the
+/// path, as `dst_mtu` of Linux: the metric `mtu` of the route, or the MTU of its device.
+pub(crate) fn nft_rt_route(pf: u8, fl: &NftFibFlow) -> Option<([u8; 16], u32)> {
+    let dev_mtu = |i| dev::by_index(i).map_or(0, |d| d.mtu());
+    if pf == rk_net::netfilter::NFPROTO_IPV6 {
+        let t = crate::stack6::ROUTES6.lock();
+        let (n, _) = t.lookup_flow(&fib_flow(fl, t.loopback())).ok()?;
+        let mtu = if n.mtu != 0 { n.mtu } else { dev_mtu(n.ifindex) };
+        return Some((n.hop, mtu));
+    }
+    let t = ROUTES.lock();
+    let (n, r) = t.lookup_flow(&fib_flow(fl, t.loopback())).ok()?;
+    let metric = r.map_or(0, |r| r.metrics[usize::from(route::RTAX_MTU - 1)]);
+    let mtu = if metric != 0 { metric } else { dev_mtu(n.ifindex) };
+    let mut hop = [0u8; 16];
+    hop[..4].copy_from_slice(&n.hop);
+    Some((hop, mtu))
+}
+
 /// The type of the destination of a lookup of the nf_tables expression `fib` on the interface
 /// `dev` (0 for any), as `inet_dev_addr_type` in `nft_fib4_eval_type` and
 /// `__nft_fib6_eval_type` of Linux.
