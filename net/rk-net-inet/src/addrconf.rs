@@ -732,7 +732,7 @@ fn check_route(r: &mut Route6) -> Result<()> {
         };
     }
     if let Some(gw) = r.gateway {
-        if t.is_local(&gw) || ipv6::is_multicast(&gw) {
+        if t.is_local_gateway(&gw, r.ifindex) || ipv6::is_multicast(&gw) {
             return Err(Errno::EINVAL);
         }
         if r.ifindex == 0 {

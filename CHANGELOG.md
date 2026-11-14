@@ -14,6 +14,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A route of IPv6 of the type `blackhole`, `unreachable` or `prohibit` goes on the loopback device, as Linux does. Thus `ip -6 route` shows `dev lo` for it, as the tests of systemd-networkd expect for the routes of DHCPv6 prefix delegation and for the static routes (#538).
 - With `net.ipv4.conf.*.promote_secondaries`, the removal of a primary IPv4 address makes the first secondary address of its subnet primary, as `__inet_del_ifa` of Linux, and sends `RTM_NEWADDR` for it. The routes of the subnet then use it as the source. Before this, the secondary addresses went away with the primary address, and systemd-networkd, which sets the value, could not remove them (#538).
 - A new MTU of a network device is its IPv6 MTU too, and a write of `net.ipv6.conf.DEV.mtu` larger than the MTU of the device gives `EINVAL`, as `addrconf_notify` and `addrconf_sysctl_mtu` of Linux. The MTU tests of systemd-networkd-tests.py expect this (#538).
+- An IPv6 route or nexthop through a link local gateway that is an address of another device is valid, as `ip6_validate_gw` of Linux. Before, the RA tests of systemd-networkd-tests.py got "Gateway can not be a local address" for the route through the router on the other end of a veth pair (#538).
 
 ## [0.5.36] - 2026-11-17
 

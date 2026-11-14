@@ -891,7 +891,7 @@ fn create6(req: &Request<'_>, c: &Config, info: &mut Info) -> Result<()> {
     }
     if let Gateway::V6(gw) = info.gateway {
         let t = ROUTES6.lock();
-        if t.is_local(&gw) {
+        if t.is_local_gateway(&gw, oif) {
             return Err(inval("Gateway can not be a local address"));
         }
         if !ipv6::is_link_local(&gw) {
