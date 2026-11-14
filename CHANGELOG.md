@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- `/sys/firmware/acpi/tables` with a copy of each ACPI table, as Linux: the tables of the RSDT or the XSDT, and the DSDT and the FACS of the FADT. Duplicate signatures get a number from 1, for example `SSDT1`, and the files are mode 0400. After a boot with EFI, `/sys/firmware/efi` is there with `fw_platform_size`. With `RK_TPM=1`, the `systemd` boot test starts the kernel from OVMF, so `systemd-analyze has-tpm2` gives the full TPM2 support and the test compares `systemd-analyze pcrs` with tpm2_pcrread (#541).
+
 ## [0.5.30] - 2026-11-14
 
 ### Added

@@ -1,5 +1,5 @@
 //! The ACPI tables that the kernel reads: the MADT, for the local APIC ID of each CPU, and the
-//! `TPM2` table, for the TPM and its event log.
+//! `TPM2` table, for the TPM and its event log. sysfs shows a copy of each table.
 //!
 //! The RSDP points to the RSDT or the XSDT, which point to the other tables. The kernel reads the
 //! tables through the direct map. A table that is not in the direct map is not read.
@@ -35,17 +35,28 @@ struct Header {
     creator_revision: u32,
 }
 
-/// Gives the physical address of the table with the signature `signature`.
-fn find_table(signature: &[u8; 4]) -> Option<u64> {
+/// The RSDT or the XSDT: its physical address, the size of each entry and the number of entries.
+fn root_table() -> Option<(u64, u64, u64)> {
     let rsdp = crate::boot::info()?.rsdp()?.get();
     let revision = read::<u8>(rsdp + 15)?;
     let xsdt = if revision >= 2 { read::<u64>(rsdp + 24)? } else { 0 };
     let (root, entry) = if xsdt != 0 { (xsdt, 8) } else { (u64::from(read::<u32>(rsdp + 16)?), 4) };
     let header = read::<Header>(root)?;
     let count = (u64::from(header.length).saturating_sub(size_of::<Header>() as u64)) / entry;
-    (0..count).find_map(|i| {
-        let at = root + size_of::<Header>() as u64 + i * entry;
-        let table = if entry == 8 { read::<u64>(at)? } else { u64::from(read::<u32>(at)?) };
+    Some((root, entry, count))
+}
+
+/// Gives the physical address of the entry `i` of the RSDT or the XSDT.
+fn root_entry((root, entry, _): (u64, u64, u64), i: u64) -> Option<u64> {
+    let at = root + size_of::<Header>() as u64 + i * entry;
+    if entry == 8 { read::<u64>(at) } else { read::<u32>(at).map(u64::from) }
+}
+
+/// Gives the physical address of the table with the signature `signature`.
+fn find_table(signature: &[u8; 4]) -> Option<u64> {
+    let root = root_table()?;
+    (0..root.2).find_map(|i| {
+        let table = root_entry(root, i)?;
         (read::<Header>(table)?.signature == *signature).then_some(table)
     })
 }
@@ -121,6 +132,55 @@ pub(crate) fn tpm2_log() -> Option<(u64, u64)> {
     let len = u64::from(read::<u32>(table + TPM2_LOG_LEN)?);
     let start = read::<u64>(table + TPM2_LOG_START)?;
     (start != 0 && len != 0).then_some((start, len))
+}
+
+/// The largest table that `tables` copies.
+const TABLE_MAX: u32 = 1 << 20;
+
+/// The offsets in the FADT of the 32-bit and the 64-bit addresses of the FACS and of the DSDT.
+const FADT_FACS: u64 = 36;
+const FADT_DSDT: u64 = 40;
+const FADT_X_FACS: u64 = 132;
+const FADT_X_DSDT: u64 = 140;
+
+/// Copies the table at the physical address `addr`. Each table starts with its signature and its
+/// length, also the FACS, which has no other part of the header.
+fn copy_table(addr: u64) -> Option<crate::firmware::AcpiTable> {
+    let signature = read::<[u8; 4]>(addr)?;
+    let len = read::<u32>(addr + 4)?;
+    if !(8..=TABLE_MAX).contains(&len) {
+        return None;
+    }
+    let bytes = alloc::vec::Vec::leak(copy(addr, len as usize)?);
+    Some(crate::firmware::AcpiTable { signature, bytes })
+}
+
+/// Reads the little endian number of `N` bytes at the offset `at` of `bytes`.
+fn field<const N: usize>(bytes: &[u8], at: u64) -> Option<u64> {
+    let b: [u8; N] = bytes.get(at as usize..at as usize + N)?.try_into().ok()?;
+    let mut v = [0; 8];
+    v[..N].copy_from_slice(&b);
+    Some(u64::from_le_bytes(v)).filter(|&a| a != 0)
+}
+
+/// Copies each table of the RSDT or the XSDT, and the DSDT and the FACS of the FADT, as ACPICA
+/// installs them for `/sys/firmware/acpi/tables` of Linux. The 64-bit address in the FADT comes
+/// first, if it is not 0, as `acpi_tb_select_address` of ACPICA.
+pub(crate) fn tables() -> alloc::vec::Vec<crate::firmware::AcpiTable> {
+    let mut out = alloc::vec::Vec::new();
+    let Some(root) = root_table() else { return out };
+    for table in (0..root.2).filter_map(|i| root_entry(root, i)) {
+        let Some(t) = copy_table(table) else { continue };
+        let mut more = [None, None];
+        if &t.signature == b"FACP" {
+            let b = t.bytes;
+            more[0] = field::<8>(b, FADT_X_DSDT).or_else(|| field::<4>(b, FADT_DSDT));
+            more[1] = field::<8>(b, FADT_X_FACS).or_else(|| field::<4>(b, FADT_FACS));
+        }
+        out.push(t);
+        out.extend(more.into_iter().flatten().filter_map(copy_table));
+    }
+    out
 }
 
 /// Copies `len` bytes at the physical address `addr`, if the direct map has all of them.

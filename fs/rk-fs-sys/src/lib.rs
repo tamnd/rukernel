@@ -434,6 +434,7 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         classes.insert(DMI);
     }
     let fdt = rk_frame::firmware::device_tree();
+    let acpi = rk_frame::firmware::acpi_tables();
     let net = placed::net_devices(ns);
     // The interfaces in `/sys/devices/virtual/net`.
     let net_dev = |name: &str| {
@@ -474,17 +475,26 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         }
         ["firmware"] => {
             let mut out = Vec::new();
+            if !acpi.is_empty() {
+                out.push((String::from("acpi"), Kind::Dir));
+            }
             if fdt.is_some() {
                 out.push((String::from("devicetree"), Kind::Dir));
             }
             if smbios.is_some() {
                 out.push((String::from("dmi"), Kind::Dir));
             }
+            if rk_frame::firmware::efi_boot() {
+                out.push((String::from("efi"), Kind::Dir));
+            }
             if let Some(blob) = fdt {
                 out.push((String::from("fdt"), Kind::File(blob.to_vec())));
             }
             out
         }
+        ["firmware", "acpi"] if !acpi.is_empty() => dirs(&mut ["tables"].into_iter()),
+        ["firmware", "acpi", "tables"] if !acpi.is_empty() => firmware::acpi_entries(acpi),
+        ["firmware", "efi"] if rk_frame::firmware::efi_boot() => firmware::efi_entries(),
         ["firmware", "dmi"] if smbios.is_some() => dirs(&mut ["tables"].into_iter()),
         ["firmware", "dmi", "tables"] => {
             let s = smbios?;
