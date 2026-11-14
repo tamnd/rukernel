@@ -1,12 +1,14 @@
 //! The dummy devices, as drivers/net/dummy.c of Linux.
 //!
-//! A dummy device takes each frame and drops it. Its link is always up. Programs use it as a
-//! place for addresses and routes, and LTP uses it to test the namespaces.
+//! A dummy device takes each frame and drops it. Its link is up, unless a program sets the
+//! carrier off with `IFLA_CARRIER`, as `ip link set DEV carrier off`. Programs use it as a place
+//! for addresses and routes, and LTP uses it to test the namespaces.
 
 use crate::buf::NetBuf;
 use crate::dev::{self, LinkKind, NetDevice, NetDriver};
 use crate::ether::MacAddr;
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use rk_vfs::inode::Result;
 
 /// The kind of the device, for `IFLA_INFO_KIND`.
@@ -20,6 +22,8 @@ pub struct Dummy {
     mac: MacAddr,
     /// How the device got `mac`, one of the `NET_ADDR_*` values.
     assign: u8,
+    /// The carrier. It is on at the start, as `netif_carrier_on` in `dummy_dev_init` of Linux.
+    carrier: AtomicBool,
 }
 
 impl NetDriver for Dummy {
@@ -44,6 +48,15 @@ impl NetDriver for Dummy {
         MAX_MTU
     }
 
+    fn link_up(&self) -> bool {
+        self.carrier.load(Ordering::Relaxed)
+    }
+
+    /// Sets the carrier, as `dummy_change_carrier` of Linux.
+    fn change_carrier(&self, on: bool) -> Result<bool> {
+        Ok(self.carrier.swap(on, Ordering::Relaxed) != on)
+    }
+
     fn link_kind(&self) -> Option<&'static str> {
         Some(KIND)
     }
@@ -65,6 +78,7 @@ pub fn create(name: Option<&[u8]>, mac: Option<MacAddr>) -> Result<Arc<NetDevice
     let d = Dummy {
         mac: mac.unwrap_or_else(crate::veth::random_mac),
         assign: if mac.is_some() { dev::NET_ADDR_SET } else { dev::NET_ADDR_RANDOM },
+        carrier: AtomicBool::new(true),
     };
     dev::register_named(Arc::new(d), name)
 }

@@ -27,6 +27,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A device uses router advertisements only when `accept_ra` allows it, as `ipv6_accept_ra` of Linux: `accept_ra` is not 0, or `accept_ra` is 2 on a device that forwards. Another device sends no router solicitation and only learns the link address of the router. Before, the kernel took each advertisement, and it made addresses and routes on the devices where systemd-networkd sets `accept_ra` to 0 and takes the advertisements itself (#538).
 - An IPv4 address with a peer, as `ip address add 192.0.2.1 peer 192.0.2.2/32`, gets the route of the kernel to the peer, `192.0.2.2 proto kernel scope link src 192.0.2.1`, as Linux. Before, the kernel compared the prefix with the peer address in place of the local address and added no route, so a static route through the peer did not work and systemd-networkd did not configure the link (#538).
 - selinuxfs: the directory `policy_capabilities` has the inode number 32 of Linux, not 28 (#540).
+- `IFLA_CARRIER` sets the carrier of a dummy device, as `ndo_change_carrier` of Linux, so `ip link set DEV carrier off` works on a dummy device and the other devices give `EOPNOTSUPP`. Before, the kernel ignored the attribute. The systemd-networkd tests of `ConfigureWithoutCarrier=` use it (#538).
 
 ## [0.5.36] - 2026-11-17
 

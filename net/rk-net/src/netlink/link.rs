@@ -352,7 +352,7 @@ fn dump(req: &Request<'_>) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Changes a device, as `do_setlink` of Linux: the namespace, the hardware address, the MTU, the
-/// name, the flags and the length of the queue.
+/// name, the flags, the length of the queue and the carrier.
 fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
     // The move to another namespace comes first, as in `do_setlink` of Linux, so the other
     // changes apply in the new namespace.
@@ -388,6 +388,11 @@ fn setlink_dev(dev: &Arc<NetDevice>, h: &[u8], a: &Attrs<'_>) -> Result<()> {
     }
     if let Some(len) = a.u32(IFLA_TXQLEN)? {
         dev.set_txqlen(len);
+    }
+    // The carrier comes after the flags, as in `do_setlink` of Linux, so `ip link set DEV up
+    // carrier off` brings the device up without a carrier.
+    if let Some(on) = a.u8(IFLA_CARRIER)? {
+        dev.change_carrier(on != 0)?;
     }
     Ok(())
 }

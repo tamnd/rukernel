@@ -6,7 +6,7 @@ use crate::consts::{
 use crate::{Message, NoPaths, Socket, dev};
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_abi::native::if_link::{IFLA_ADDRESS, IFLA_IFNAME, IFLA_LINKINFO, IFLA_MTU};
+use rk_abi::native::if_link::{IFLA_ADDRESS, IFLA_CARRIER, IFLA_IFNAME, IFLA_LINKINFO, IFLA_MTU};
 use rk_abi::native::netlink::{
     NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CAPPED, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
     NLM_F_MULTI, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR,
@@ -379,4 +379,40 @@ fn the_other_end_of_a_veth_pair_tells_of_its_new_carrier() {
     assert!(got.iter().all(|(i, _)| *i == b.ifindex() as i32));
     dev::unregister(&a);
     dev::unregister(&b);
+}
+
+#[test]
+fn setlink_sets_the_carrier_of_a_dummy_device() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let s = socket();
+    s.bind(&NoPaths, &addr(0, 1 << (RTNLGRP_LINK - 1))).unwrap();
+    let d = crate::dummy::create(Some(b"cad0"), None).unwrap();
+    recv_all(&s);
+    // `ip link set cad0 up carrier off`: the device is up without a carrier, and the last
+    // message tells of it.
+    let mut r = link_req(RTM_SETLINK, NLM_F_ACK, d.ifindex() as i32, IFF_UP, IFF_UP);
+    r.put(IFLA_CARRIER as u16, &[0]);
+    send(&s, r.finish());
+    let got = recv_all(&s);
+    let e = got.last().unwrap();
+    assert_eq!(i32::from_ne_bytes([e[16], e[17], e[18], e[19]]), 0);
+    assert!(d.is_up() && !d.carrier());
+    assert_eq!(d.flags() & IFF_LOWER_UP, 0);
+    let n = got.iter().rev().find(|m| Header::parse(m).unwrap().ty == RTM_NEWLINK as u16);
+    let attrs = Attrs::parse(&n.unwrap()[HDRLEN + link::IFINFO_LEN..], 69);
+    assert_eq!(attrs.get(IFLA_CARRIER), Some(&[0][..]));
+    // `carrier on` gives the carrier back.
+    let mut r = link_req(RTM_SETLINK, NLM_F_ACK, d.ifindex() as i32, 0, 0);
+    r.put(IFLA_CARRIER as u16, &[1]);
+    send(&s, r.finish());
+    recv_all(&s);
+    assert!(d.carrier());
+    assert_ne!(d.flags() & IFF_LOWER_UP, 0);
+    // The loopback device has no `ndo_change_carrier`.
+    let lo = dev::by_name("lo").unwrap();
+    let mut r = link_req(RTM_SETLINK, NLM_F_ACK, lo.ifindex() as i32, 0, 0);
+    r.put(IFLA_CARRIER as u16, &[0]);
+    send(&s, r.finish());
+    assert_eq!(ack_error(&s), i32::from(Errno::EOPNOTSUPP.get()));
+    dev::unregister(&d);
 }
