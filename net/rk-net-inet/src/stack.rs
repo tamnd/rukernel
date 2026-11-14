@@ -977,7 +977,7 @@ pub fn receive(dev: &NetDevice, mut frame: NetBuf) {
 }
 
 /// Takes an ARP packet, as `arp_process` of Linux: it learns the address of the sender, sends
-/// the packets that waited for it, and answers a request for a local address.
+/// the packets that waited for it, and answers a request for a local address from another host.
 fn arp_input(dev: &NetDevice, data: &[u8]) {
     let Some(p) = ArpPacket::parse(data) else { return };
     if p.op != ARPOP_REQUEST && p.op != ARPOP_REPLY {
@@ -986,8 +986,15 @@ fn arp_input(dev: &NetDevice, data: &[u8]) {
     if ipv4::is_multicast(p.target_ip) || ipv4::is_loopback(p.target_ip) {
         return;
     }
-    let ours = { ROUTES.lock().is_local(p.target_ip) };
-    let proxied = !ours && p.op == ARPOP_REQUEST && proxy_arp(dev, &p);
+    // A sender with a local address is a martian, and the host does not answer it. The
+    // announcement of an address on one end of a veth pair comes to the other end so.
+    let accept_local = crate::forward::orconf(dev.ifindex(), "accept_local");
+    let (ours, remote) = {
+        let t = ROUTES.lock();
+        let remote = crate::forward::arp_sender_remote(&t, p.sender_ip, accept_local);
+        (remote && t.is_local(p.target_ip), remote)
+    };
+    let proxied = remote && !ours && p.op == ARPOP_REQUEST && proxy_arp(dev, &p);
     // A probe for duplicate addresses has the sender 0.0.0.0, and it does not go in the table.
     if p.sender_ip != ipv4::ANY && !p.sender_mac.is_multicast() {
         let key = (dev.ifindex(), p.sender_ip);
