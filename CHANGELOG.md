@@ -8,6 +8,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - At an exec that changes the label, AppArmor checks each open file again with the new label, as `aa_inherit_files` of Linux. The exec puts a file of `/dev/null` in place of each file that the new label cannot use. The security modules get the open files in the hook `bprm_committing_creds` (#540).
 
+### Changed
+
+- tools/nftables/report.md has the results of the full run of tests/shell on x86_64 and arm64 after the flowtables, the objects, `snat` to a prefix and the other work of #542: 349 of the 380 tests pass on x86_64, and 277 before. 343 pass on arm64, which ran in full for the first time (#542).
+
 ## [0.5.29] - 2026-11-14
 
 ### Added
