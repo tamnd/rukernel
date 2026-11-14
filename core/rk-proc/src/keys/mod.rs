@@ -2,11 +2,11 @@
 //! `add_key`, `request_key` and `keyctl`.
 //!
 //! A key has a type, a description, an owner, a group, permissions and a payload. The types are
-//! `user`, `logon`, `keyring`, `dns_resolver`, `big_key` and `asymmetric`. A keyring holds links
-//! to other keys. Each thread can have a thread keyring, each process a process keyring and a
-//! session keyring, and each user has a user keyring and a user session keyring. A key is
-//! possessed when the caller can find it from these keyrings, and the possessor bits of its
-//! permissions then apply too.
+//! `user`, `logon`, `keyring`, `dns_resolver`, `big_key`, `asymmetric` and `encrypted`. A keyring
+//! holds links to other keys. Each thread can have a thread keyring, each process a process
+//! keyring and a session keyring, and each user has a user keyring and a user session keyring. A
+//! key is possessed when the caller can find it from these keyrings, and the possessor bits of
+//! its permissions then apply too.
 //!
 //! The functions here do not touch user memory or the clock. The system calls copy the strings
 //! and the payload, and give the time in a `Caller`, so the host tests can run them.
@@ -30,6 +30,7 @@
 mod construct;
 mod ctl;
 mod dh;
+mod encrypted;
 mod pkey;
 mod text;
 
@@ -155,6 +156,9 @@ pub enum Kind {
     /// A public or private key, as `crypto/asymmetric_keys`. The payload is an X.509
     /// certificate or a PKCS#8 private key. The type has no read and no update.
     Asymmetric,
+    /// A key that a read gives encrypted with a master key, as
+    /// `security/keys/encrypted-keys`. See [`encrypted`].
+    Encrypted,
 }
 
 impl Kind {
@@ -168,6 +172,7 @@ impl Kind {
             Kind::BigKey => "big_key",
             Kind::RequestKeyAuth => ".request_key_auth",
             Kind::Asymmetric => "asymmetric",
+            Kind::Encrypted => "encrypted",
         }
     }
 
@@ -180,13 +185,14 @@ impl Kind {
             b"dns_resolver" => Some(Kind::DnsResolver),
             b"big_key" => Some(Kind::BigKey),
             b"asymmetric" => Some(Kind::Asymmetric),
+            b"encrypted" => Some(Kind::Encrypted),
             _ => None,
         }
     }
 
     /// The type can change its payload.
     fn can_update(self) -> bool {
-        matches!(self, Kind::User | Kind::Logon | Kind::BigKey)
+        matches!(self, Kind::User | Kind::Logon | Kind::BigKey | Kind::Encrypted)
     }
 
     /// A process can read the payload of the type.
@@ -215,6 +221,8 @@ impl Kind {
             Kind::BigKey => (1..=MAX_BIG_KEY_PAYLOAD).contains(&payload.len()),
             Kind::DnsResolver => return dns_preparse(payload).map(|_| ()),
             Kind::RequestKeyAuth | Kind::Asymmetric => false,
+            // The type checks the payload when it makes or changes the key.
+            Kind::Encrypted => true,
         };
         if ok { Ok(()) } else { Err(Errno::EINVAL) }
     }
@@ -231,6 +239,11 @@ impl Kind {
                 desc,
                 ..Prep::default()
             });
+        }
+        if self == Kind::Encrypted {
+            // The payload is the text that `encrypted::instantiate` reads after the checks of
+            // the keyring, as the `instantiate` of a type without `preparse`.
+            return Ok(Prep { payload, ..Prep::default() });
         }
         if self != Kind::DnsResolver {
             self.check_payload(&payload)?;
@@ -282,6 +295,8 @@ pub(super) struct Prep {
     asym: Option<Arc<Parsed>>,
     /// The description that the type proposes for a key without one.
     desc: Option<Vec<u8>>,
+    /// The payload of an `encrypted` key.
+    enc: Option<Arc<encrypted::Encrypted>>,
 }
 
 impl Prep {
@@ -400,6 +415,8 @@ struct State {
     restriction: Option<Restriction>,
     /// The key of an `asymmetric` key.
     asym: Option<Arc<Parsed>>,
+    /// The payload of an `encrypted` key.
+    enc: Option<Arc<encrypted::Encrypted>>,
     /// The bytes of the quota of the owner that the key takes.
     quota_bytes: u32,
     /// The key is under construction: it has no payload and no error yet, as
@@ -713,6 +730,7 @@ fn alloc(
                 links: Vec::new(),
                 restriction: None,
                 asym: prep.asym,
+                enc: prep.enc,
                 quota_bytes: bytes,
                 pending: false,
                 auth: None,

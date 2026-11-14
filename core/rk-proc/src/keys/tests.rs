@@ -536,3 +536,71 @@ fn asymmetric_keys_and_restrictions() {
     // A keyring has one restriction.
     assert_eq!(restrict(&cx, chain, None, None), Err(Errno::EEXIST));
 }
+
+/// The text of `load` for the master key `foo`, the IV 0 to 15 and the data 100 to 119, from the
+/// algorithm of Linux in Python.
+const ENC_LOAD: &[u8] = b"load default user:masterkey 20 000102030405060708090a0b0c0d0e0f00\
+bcf6f5da64267b9fd27ec59531f7ac5aa8c6c0a2a00dc5f8627f4c5428004a1932f19d95a131388d53bbc60a9ac98b\
+944f08aac0769b4185c21951e60efbe94d";
+
+#[test]
+fn encrypted_keys() {
+    let (c, o) = (cred(5016), TestOwner::default());
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    // The payloads of keyctl09.
+    let data = "abcdefABCDEF1234567890aaaaaaaaaaabcdefABCDEF1234567890aaaaaaaaaa";
+    let new = alloc::format!("new enc32 user:masterkey 32 {data}");
+    let k = add_key(&cx, b"encrypted", Some(b"k1"), new.into_bytes(), PROC).unwrap();
+    // Without the master key, a read gives only the length.
+    assert_eq!(read(&cx, k, 128).unwrap(), (186, Vec::new()));
+    assert_eq!(read(&cx, k, 186), Err(Errno::ENOKEY));
+    let bad = b"new enc32 user:masterkey 32 plaintext123@123!123@123!123@123plaintext123@123!123@123!123@123";
+    assert_eq!(add_key(&cx, b"encrypted", Some(b"k2"), bad.to_vec(), PROC), Err(Errno::EINVAL));
+    // The key that `load` gives has the data of the text.
+    add_key(&cx, b"user", Some(b"masterkey"), b"foo".to_vec(), PROC).unwrap();
+    let l = add_key(&cx, b"encrypted", Some(b"l"), ENC_LOAD.to_vec(), PROC).unwrap();
+    let (n, text) = read(&cx, l, 4096).unwrap();
+    assert_eq!((n, &text[..]), (ENC_LOAD.len() - 5, &ENC_LOAD[5..]));
+    let r = find(l).unwrap();
+    let want: Vec<u8> = (100..120).collect();
+    assert_eq!(r.state.lock().enc.as_ref().unwrap().data, want);
+    // A bad HMAC, and a text of a bad length.
+    let mut tampered = ENC_LOAD.to_vec();
+    *tampered.last_mut().unwrap() = b'e';
+    let e = add_key(&cx, b"encrypted", Some(b"t"), tampered.clone(), PROC);
+    assert_eq!(e, Err(Errno::EINVAL));
+    tampered.pop();
+    let e = add_key(&cx, b"encrypted", Some(b"t"), tampered, PROC);
+    assert_eq!(e, Err(Errno::EINVAL));
+    // A read of a new key and a load of the text give the same data.
+    let (_, text) = read(&cx, k, 4096).unwrap();
+    let mut load = b"load ".to_vec();
+    load.extend_from_slice(&text);
+    let k2 = add_key(&cx, b"encrypted", Some(b"k3"), load, PROC).unwrap();
+    assert_eq!(read(&cx, k2, 4096).unwrap().1, text);
+    let got = find(k2).unwrap().state.lock().enc.as_ref().unwrap().data.clone();
+    assert_eq!(rk_crypto::asym::hex(&got), data.to_ascii_lowercase().into_bytes());
+    // An update changes only the master key, to one of the same type.
+    assert_eq!(update(&cx, k, b"update trusted:m".to_vec()), Err(Errno::EINVAL));
+    assert_eq!(update(&cx, k, b"new user:m 32".to_vec()), Err(Errno::EINVAL));
+    update(&cx, k, b"update user:other".to_vec()).unwrap();
+    assert_eq!(read(&cx, k, 4096), Err(Errno::ENOKEY));
+    // An add of a key that is there is an update.
+    let again = add_key(&cx, b"encrypted", Some(b"k1"), b"update user:masterkey".to_vec(), PROC);
+    assert_eq!(again, Ok(k));
+    assert_eq!(read(&cx, k, 4096).unwrap().0, 186);
+    // The lengths and the formats.
+    for bad in ["new user:m 19", "new user:m 4097", "new enc32 user:m 20", "new user:m 20 00"] {
+        let e = add_key(&cx, b"encrypted", Some(b"b"), bad.as_bytes().to_vec(), PROC);
+        assert_eq!(e, Err(Errno::EINVAL), "{bad}");
+    }
+    let e = add_key(&cx, b"encrypted", Some(b"ecr"), b"new ecryptfs user:m 64".to_vec(), PROC);
+    assert_eq!(e, Err(Errno::EINVAL));
+    let desc = b"0123456789abcdef";
+    let e = add_key(&cx, b"encrypted", Some(desc), b"new ecryptfs user:m 64".to_vec(), PROC);
+    let text = alloc::string::String::from_utf8(keys_text(&cx)).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&alloc::format!("{:08x} ", e.unwrap())));
+    assert!(line.unwrap().ends_with(" 0123456789abcdef: 873"), "{line:?}");
+    let t = add_key(&cx, b"encrypted", Some(b"tr"), b"new trusted:m 32".to_vec(), PROC).unwrap();
+    assert_eq!(read(&cx, t, 4096), Err(Errno::EOPNOTSUPP));
+}
