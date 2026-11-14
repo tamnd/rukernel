@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- Each network interface has the directory `queues` in sysfs, with `rx-0` and `tx-0`, as Linux. `queues/rx-0/rps_cpus` gives the mask of the CPUs of Receive Packet Steering in the format `%*pb`, and a write sets it with the rules of `bitmap_parse` and `store_rps_map` of Linux. Before this, udev could not apply `ReceivePacketSteeringCPUMask=` of a .link file, and the file was missing (#538).
+
 ## [0.5.31] - 2026-11-15
 
 ### Added

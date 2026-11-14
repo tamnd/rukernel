@@ -29,8 +29,9 @@
 //!   `nr_hugepages` and `nr_overcommit_hugepages` take a write, as in Linux. LTP looks for that
 //!   directory to know if it can mount hugetlbfs.
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
-//!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directory
-//!   `statistics`. `/sys/class/net/NAME` is a link to it.
+//!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directories
+//!   `statistics` and `queues`. `queues/rx-0/rps_cpus` takes a write, as in Linux.
+//!   `/sys/class/net/NAME` is a link to it.
 //! - `/sys/devices/virtual/input/inputN` is the directory of an input device, from
 //!   `rk_vfs::input`, with `name`, `id`, `capabilities` and a directory for each handler, as
 //!   `mouse0` and `event0`. `/sys/class/input` has a link to each of them.
@@ -130,6 +131,7 @@ fn writable(path: &str) -> bool {
     path.strip_prefix(THP_DIR).is_some_and(|f| f == "/enabled" || f == "/defrag")
         || uevent_device(path).is_some()
         || bus::is_uevent(path)
+        || path.ends_with(RPS_CPUS)
 }
 
 /// The class and the name of the device of the file `uevent` at `path`.
@@ -251,6 +253,41 @@ const NET: &str = "net";
 const OPERSTATES: [&str; 7] =
     ["unknown", "notpresent", "down", "lowerlayerdown", "testing", "dormant", "up"];
 
+/// The path of the file `rps_cpus` below the directory of an interface.
+const RPS_CPUS: &str = "/queues/rx-0/rps_cpus";
+
+/// The entries of the directory `queues` of an interface and of its directories, as
+/// `net_rx_queue_update_kobjects` and `netdev_queue_update_kobjects` of Linux. `rest` is the path
+/// below `queues`. A device has one receive queue and one transmit queue.
+fn net_queues(d: &NetDevice, rest: &str) -> Option<Vec<(String, Kind)>> {
+    let file = |name: &str, text: String| (String::from(name), Kind::File(text.into_bytes()));
+    Some(match rest {
+        "" => Vec::from([(String::from("rx-0"), Kind::Dir), (String::from("tx-0"), Kind::Dir)]),
+        "/rx-0" => Vec::from([
+            file("rps_cpus", cpu::mask_bits(rk_frame::cpu::count(), d.rps_cpus())),
+            file("rps_flow_cnt", String::from("0\n")),
+        ]),
+        "/tx-0" => Vec::from([file("tx_timeout", String::from("0\n"))]),
+        _ => return None,
+    })
+}
+
+/// Sets the CPUs of Receive Packet Steering of the interface of the file `rps_cpus` at `path`,
+/// as `store_rps_map` of Linux. `ns` is the network namespace of the mount. Gives `EPERM`
+/// without `CAP_NET_ADMIN`, the error of `cpu::parse_mask`, and `ENODEV` when the interface is
+/// gone. Each CPU takes part in the steering, so a mask that is not empty stays as it is.
+fn write_rps(path: &str, ns: &Weak<NetNs>, text: &[u8]) -> Result<()> {
+    if !rk_net::ioctl::net_admin() {
+        return Err(Errno::EPERM);
+    }
+    let mask = cpu::parse_mask(text, rk_frame::cpu::count())?;
+    let dir = path.strip_suffix(RPS_CPUS).ok_or(Errno::EACCES)?;
+    let devices = placed::net_devices(ns);
+    let d = devices.iter().find(|d| placed::net_path(d).trim_start_matches('/') == dir);
+    d.ok_or(Errno::ENODEV)?.set_rps_cpus(mask);
+    Ok(())
+}
+
 /// The files of the directory `statistics` of an interface, as `netstat_attrs` of Linux. The
 /// device layer does not keep the counters that are not in `Stats`, so they are 0.
 fn net_statistics(d: &NetDevice) -> Vec<(String, Kind)> {
@@ -318,6 +355,7 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
         file("mtu", format!("{}\n", d.mtu())),
         file("name_assign_type", format!("{}\n", d.name_assign_type())),
         file("operstate", format!("{}\n", OPERSTATES[usize::from(d.operstate()).min(6)])),
+        (String::from("queues"), Kind::Dir),
         (String::from("statistics"), Kind::Dir),
         (
             String::from("subsystem"),
@@ -512,6 +550,10 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         }
         ["devices", "virtual", NET, name] => net_entries(&*net_dev(name)?),
         ["devices", "virtual", NET, name, "statistics"] => net_statistics(&*net_dev(name)?),
+        ["devices", "virtual", NET, name, "queues"] => net_queues(&*net_dev(name)?, "")?,
+        ["devices", "virtual", NET, name, "queues", queue] => {
+            net_queues(&*net_dev(name)?, &format!("/{queue}"))?
+        }
         ["class", class] => list
             .iter()
             .filter(|d| d.class == class)
@@ -683,6 +725,9 @@ impl Inode for Node {
             Kind::File(_) if bus::is_uevent(&self.path) => {
                 bus::write_uevent(&self.path, buf).map(|()| buf.len())
             }
+            Kind::File(_) if self.path.ends_with(RPS_CPUS) => {
+                write_rps(&self.path, &self.net, buf).map(|()| buf.len())
+            }
             Kind::File(_) => write_file(&self.path, buf).map(|()| buf.len()),
             Kind::Mm { .. } => Err(Errno::EACCES),
             _ => Err(Errno::EINVAL),
@@ -830,6 +875,33 @@ mod tests {
         a.set_mac(rk_net::consts::ARPHRD_ETHER, mac).unwrap();
         assert_eq!(assign("sha"), Kind::File(b"3\n".to_vec()));
         rk_net::dev::unregister(&a);
+    }
+
+    #[test]
+    fn rps_cpus_of_the_receive_queue_takes_a_write() {
+        rk_net::dev::init();
+        let d = rk_net::dummy::create(Some(b"srps0"), None).unwrap();
+        let dir = "devices/virtual/net/srps0/queues";
+        assert_eq!(names(dir), ["rx-0", "tx-0"]);
+        assert_eq!(names(&format!("{dir}/rx-0")), ["rps_cpus", "rps_flow_cnt"]);
+        assert_eq!(names(&format!("{dir}/tx-0")), ["tx_timeout"]);
+        // The unit tests have one CPU, so the mask has one digit.
+        assert_eq!(get(&format!("{dir}/rx-0/rps_cpus")), Kind::File(b"0\n".to_vec()));
+        let path = format!("{dir}/rx-0/rps_cpus");
+        let rps = Node { kind: get(&path), path, net: init() };
+        assert_eq!(rps.metadata().mode, mode::S_IFREG | 0o644);
+        assert_eq!(rps.write_at(0, b"1\n").unwrap(), 2);
+        assert_eq!(d.rps_cpus(), 1);
+        assert_eq!(get(&format!("{dir}/rx-0/rps_cpus")), Kind::File(b"1\n".to_vec()));
+        // A CPU that the machine does not have and a bad text give an error, as
+        // `bitmap_parse` of Linux, and the mask does not change.
+        assert_eq!(rps.write_at(0, b"2").unwrap_err(), Errno::EOVERFLOW);
+        assert_eq!(rps.write_at(0, b"z").unwrap_err(), Errno::EINVAL);
+        assert_eq!(d.rps_cpus(), 1);
+        assert_eq!(rps.write_at(0, b"0").unwrap(), 1);
+        assert_eq!(d.rps_cpus(), 0);
+        rk_net::dev::unregister(&d);
+        assert_eq!(rps.write_at(0, b"1").unwrap_err(), Errno::ENODEV);
     }
 
     #[test]
