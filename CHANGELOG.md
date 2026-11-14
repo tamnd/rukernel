@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.30] - 2026-11-14
+
 ### Added
 
 - At an exec that changes the label, AppArmor checks each open file again with the new label, as `aa_inherit_files` of Linux. The exec puts a file of `/dev/null` in place of each file that the new label cannot use. The security modules get the open files in the hook `bprm_committing_creds` (#540).
@@ -1656,6 +1658,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.30]: https://github.com/tamnd/rukernel/compare/v0.5.29...v0.5.30
 [0.5.29]: https://github.com/tamnd/rukernel/compare/v0.5.28...v0.5.29
 [0.5.28]: https://github.com/tamnd/rukernel/compare/v0.5.27...v0.5.28
 [0.5.27]: https://github.com/tamnd/rukernel/compare/v0.5.26...v0.5.27
