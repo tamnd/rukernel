@@ -330,6 +330,29 @@ fn kernel_routes() {
     assert_eq!((r.protocol, r.prefsrc, r.ifindex), (RTPROT_KERNEL as u8, Some([10, 0, 2, 15]), 2));
 }
 
+/// An address with a peer gets a route of the kernel to the peer, as `fib_add_ifaddr` of Linux:
+/// `ip address add 192.0.2.1 peer 192.0.2.2/32` gives `192.0.2.2 proto kernel scope link src
+/// 192.0.2.1`. A static route through the peer needs it.
+#[test]
+fn an_address_with_a_peer_has_a_route_to_the_peer() {
+    let mut t = qemu_table();
+    let mut a = IfAddr::new(2, [192, 0, 2, 1], 32, "eth0");
+    a.address = [192, 0, 2, 2];
+    t.insert_addr(a).unwrap();
+    t.sync_link(ETH);
+    let r = t.routes().iter().find(|r| r.dst == [192, 0, 2, 2]).expect("no route to the peer");
+    assert_eq!(
+        (r.table, r.prefix, r.kind, r.scope, r.prefsrc, r.ifindex),
+        (RT_TABLE_MAIN, 32, RTN_UNICAST as u8, RT_SCOPE_LINK as u8, Some([192, 0, 2, 1]), 2)
+    );
+    assert!(t.routes().iter().any(|r| r.dst == [192, 0, 2, 1] && r.table == RT_TABLE_LOCAL));
+    // A /32 address without a peer has no route of its subnet.
+    let mut t = qemu_table();
+    t.insert_addr(IfAddr::new(2, [192, 0, 2, 1], 32, "eth0")).unwrap();
+    t.sync_link(ETH);
+    assert!(!t.routes().iter().any(|r| r.dst == [192, 0, 2, 1] && r.table == RT_TABLE_MAIN));
+}
+
 #[test]
 fn addresses_and_link_state() {
     let mut t = qemu_table();
