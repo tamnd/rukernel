@@ -269,7 +269,7 @@ fn session_and_user_rings() {
     assert_eq!(set_reqkey(&cx, -1), Ok(1));
     assert_eq!(set_reqkey(&cx, 6), Err(Errno::EINVAL));
     assert!(!keys_text(&cx).is_empty());
-    assert_eq!(capabilities(), [0xf1, 0x03]);
+    assert_eq!(capabilities(), [0xf5, 0x03]);
 }
 
 #[test]
@@ -446,4 +446,33 @@ fn assume_authority_errors() {
     assert_eq!(assume_authority(&cx, i32::MAX), Err(Errno::ENOKEY));
     assert_eq!(reject(&cx, 1, 0, Errno::ENOKEY, 0), Err(Errno::EPERM));
     assert_eq!(get_keyring_id(&cx, KEY_SPEC_REQUESTOR_KEYRING, false), Err(Errno::ENOKEY));
+}
+
+#[test]
+fn dh_compute_checks() {
+    let (c, o) = (cred(5201), TestOwner::default());
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    // A small prime gives EINVAL from the crypto API. The value of the full test is in rk-crypto.
+    let mut p = alloc::vec![0xffu8; 192];
+    let x = add_key(&cx, b"user", Some(b"x"), alloc::vec![3], PROC).unwrap();
+    let g = add_key(&cx, b"user", Some(b"g"), alloc::vec![2], PROC).unwrap();
+    let small = add_key(&cx, b"user", Some(b"p1"), alloc::vec![0xff; 190], PROC).unwrap();
+    assert_eq!(dh_compute(&cx, x, small, g, 0, None), Err(Errno::EINVAL));
+    p[191] = 0xfd;
+    let pk = add_key(&cx, b"user", Some(b"p"), p, PROC).unwrap();
+    assert_eq!(dh_compute(&cx, x, pk, g, 0, None).unwrap(), (192, Vec::new()));
+    assert_eq!(dh_compute(&cx, x, pk, g, 191, None), Err(Errno::EOVERFLOW));
+    let (n, v) = dh_compute(&cx, x, pk, g, 256, None).unwrap();
+    assert_eq!(n, 192);
+    assert_eq!(v[..191], [0; 191]);
+    assert_eq!(v[191], 8);
+    // The errors of the keys.
+    assert_eq!(dh_compute(&cx, x, i32::MAX, g, 0, None), Err(Errno::ENOKEY));
+    let ring = add_key(&cx, b"keyring", Some(b"r"), Vec::new(), PROC).unwrap();
+    assert_eq!(dh_compute(&cx, x, pk, ring, 0, None), Err(Errno::EOPNOTSUPP));
+    // The KDF gives `buflen` bytes.
+    let hash = rk_crypto::alloc_hash("sha256").unwrap();
+    let kdf = Kdf { hash, otherinfo: b"info".to_vec() };
+    let (n, v) = dh_compute(&cx, x, pk, g, 40, Some(kdf)).unwrap();
+    assert_eq!((n, v.len()), (40, 40));
 }

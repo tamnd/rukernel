@@ -255,6 +255,7 @@ version = "0.5.33"
 dependencies = [
  "rk-abi",
  "rk-cgroup",
+ "rk-crypto",
  "rk-frame",
  "rk-mm",
  "rk-net",
@@ -277,6 +278,7 @@ dependencies = [
  "rk-abi",
  "rk-bpf",
  "rk-cgroup",
+ "rk-crypto",
  "rk-drv-mem",
  "rk-drv-tty",
  "rk-frame",

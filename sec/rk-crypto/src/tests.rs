@@ -223,3 +223,68 @@ fn cipher_errors() {
         assert_eq!(alloc_skcipher(bad).err(), Some(Errno::ENOENT), "{bad}");
     }
 }
+
+/// The bytes of the hex string `s`.
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+/// The 2048-bit MODP prime of RFC 3526, as LTP keyctl_dh_data.h.
+const MODP2048: &str = "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356208552bb9ed529077096966d670c354e4abc9804f1746c08ca18217c32905e462e36ce3be39e772c180e86039b2783a2ec07a28fb5c55df06f4c52c9de2bcbf6955817183995497cea956ae515d2261898fa051015728e5a8aacaa68ffffffffffffffff";
+
+#[test]
+fn mpi_small() {
+    use crate::mpi::Mpi;
+    let r = Mpi::from_u64(4).pow_mod(&Mpi::from_u64(13), &Mpi::from_u64(497));
+    assert_eq!(r, Mpi::from_u64(445));
+    // An even modulus takes the slow path.
+    let r = Mpi::from_u64(3).pow_mod(&Mpi::from_u64(200), &Mpi::from_u64(1000));
+    assert_eq!(r, Mpi::from_u64(1));
+    assert_eq!(Mpi::from_u64(7).pow_mod(&Mpi::zero(), &Mpi::from_u64(11)), Mpi::from_u64(1));
+    assert_eq!(Mpi::from_u64(7).pow_mod(&Mpi::from_u64(5), &Mpi::from_u64(1)), Mpi::zero());
+    let m = Mpi::from_be(&unhex("0000ff01"));
+    assert_eq!(m.byte_len(), 2);
+    assert_eq!(m.to_be(), vec![0xff, 1]);
+    assert_eq!(m.to_be_padded(4).unwrap(), vec![0, 0, 0xff, 1]);
+    assert!(m.to_be_padded(1).is_none());
+    // A value of more than one limb against a modulus of two limbs.
+    let m = Mpi::from_be(&unhex("f123456789abcdef0123456789abcdef"));
+    let x = Mpi::from_be(&unhex("0123456789abcdef0123456789abcdef0123456789abcdef"));
+    let x2 = x.mul(&x).rem(&m);
+    assert_eq!(x.pow_mod(&Mpi::from_u64(2), &m), x2);
+    assert_eq!(x.pow_mod(&Mpi::from_u64(3), &m), x2.mul(&x).rem(&m));
+}
+
+#[test]
+fn dh_ltp_vectors() {
+    // The vectors of LTP keyctl25 and keyctl28.
+    let p = unhex(MODP2048);
+    let x = unhex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    let g = unhex(
+        "dd5d87a6f9df57f13df2c658e501abd72adba34863613bd16769eef955258e3611ee8ec542a426e375c6b4d83b717c97f88504b43acc5df03a4904e88d2619dfb7fb3cda68bc136c468dfedf1c5a5b73046408866fec8949beb587a0a4b6e6c0def5f24405385184a69e9dce4208f363adb0e1ce881863eb8d82d4aead5e1c195047d70d9bdc447bda027684b4351d98503fee1bcf827ffd07501701c7f3912422dd2f42b26cf40adde07d63e235f42f6521402a90dd2cea4a2e177640742d3cac853e96fa494413fee945972b2423a0f51becf28528c9db926002c50ffe2b1a97c978cf488ba29bbb472e7e63282ddd320a15a072d8176075204f7ded293561",
+    );
+    let z = dh::compute(&x, &p, &g).unwrap();
+    let want = "61fc0d4d01cee152340f52b45328aa11d86e92ce8e8f7ba29180f62d999bc7714cbb05efde22bddf6f8dbb00df4efa1c14ea5420acec51cdbdd063fc357bd9ab367f1b67c3b1514e2d190550be1d44515ffe65f8f612ad6cc58496d9c3c9397d8798a78e524d1f26be6214f466cf9a904d28dd29116e510c7b181eac5549ce1defcc6ca20e80d30d24c0776887f8a3050f8daa586bbb6bd076ea875cc33eef19669ec7d44e85df06610b949cd35823a7b1f636af6b4cf18840d45f6e9d1fa73c8bc271ba87cdc29b33cf18ee598ef66c76ccedcc09fee1f8ce5c78b3b9e3f52914aa67d0b5cb7a7ed12e8397f16bfbe4fbebdd18540d4ca765c10c11adea839f";
+    assert_eq!(z, unhex(want));
+    let mut h = alloc_hash("sha256").unwrap();
+    let mut info = z.clone();
+    info.extend_from_slice(b"info");
+    let mut out = [0u8; 32];
+    dh::kdf108_ctr(h.as_mut(), &info, &mut out).unwrap();
+    assert_eq!(
+        out.to_vec(),
+        unhex("bf18e2a730acaed25b76a06a78199970231087afb1815d71efafb3b2c17ac913")
+    );
+    // More than one block, and a block cut short.
+    let mut long = [0u8; 40];
+    dh::kdf108_ctr(h.as_mut(), &info, &mut long).unwrap();
+    assert_eq!(long[..32], out);
+    // The errors of crypto_dh_decode_key and dh_set_params.
+    assert_eq!(dh::compute(&p, &x, &g), Err(Errno::EINVAL));
+    assert_eq!(dh::compute(&x, &[0; 256], &g), Err(Errno::EINVAL));
+    assert_eq!(dh::compute(&x, &p[..128], &x), Err(Errno::EINVAL));
+    // A prime with zero bytes at the start gives a shorter result.
+    let mut p0 = vec![0u8; 8];
+    p0.extend_from_slice(&p);
+    assert_eq!(dh::compute(&x, &p0, &g).unwrap(), unhex(want));
+}

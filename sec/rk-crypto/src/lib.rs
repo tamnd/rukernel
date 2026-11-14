@@ -12,6 +12,9 @@
 //! the name of its inner algorithm in parentheses (`cbc(aes)` or `cbc(aes-generic)`), and the
 //! driver of an instance has the driver of the inner algorithm (`cbc(aes-generic)`). A name that
 //! the crate does not have gives `ENOENT`.
+//!
+//! For the key retention service, the crate also has integers of any size in [`mpi`], and
+//! Diffie-Hellman with the key derivation function of SP800-108 in [`dh`].
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -19,8 +22,10 @@
 extern crate alloc;
 
 pub mod aes;
+pub mod dh;
 pub mod hmac;
 pub mod modes;
+pub mod mpi;
 pub mod sha1;
 pub mod sha256;
 pub mod sha512;
