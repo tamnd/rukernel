@@ -363,17 +363,26 @@ fn ns_exit() {
     TABLES.reset();
 }
 
-/// Makes and removes the values of a device, as `inetdev_init` and `ipv6_add_dev` of Linux.
+/// The smallest MTU of a link of IPv6, `IPV6_MIN_MTU` of Linux.
+const IPV6_MIN_MTU: u32 = 1280;
+
+/// Makes and removes the values of a device, as `inetdev_init` and `ipv6_add_dev` of Linux. A
+/// new MTU of the device is the IPv6 MTU of the device too, as `addrconf_notify` of Linux does
+/// for `NETDEV_CHANGEMTU`.
 fn event(d: &NetDevice, e: Event) {
     let index = d.ifindex();
+    let mtu = IPV6_CONF.iter().position(|p| p.name == "mtu").unwrap_or(0);
     let mut t = TABLES.lock();
     match e {
         Event::Register => {
             let mut c = t.default.clone();
-            if let Some(at) = IPV6_CONF.iter().position(|p| p.name == "mtu") {
-                c.v6[at] = d.mtu().max(1280) as i32;
-            }
+            c.v6[mtu] = d.mtu().max(IPV6_MIN_MTU) as i32;
             t.devs.insert(index, c);
+        }
+        Event::Mtu if d.mtu() >= IPV6_MIN_MTU => {
+            if let Some(c) = t.devs.get_mut(&index) {
+                c.v6[mtu] = d.mtu().min(i32::MAX as u32) as i32;
+            }
         }
         Event::Unregister => {
             t.devs.remove(&index);
@@ -692,6 +701,14 @@ pub fn write(path: &str, data: &[u8]) -> Result<()> {
             if v < param.min || v > param.max {
                 return Err(Errno::EINVAL);
             }
+            // The IPv6 MTU of a device is not larger than the MTU of the device, as
+            // `addrconf_sysctl_mtu` of Linux.
+            if let (Family::Ipv6, "mtu", Scope::Dev(i)) = (f, param.name, scope) {
+                let max = dev::by_index(i).map_or(u32::MAX, |d| d.mtu());
+                if v as u32 > max {
+                    return Err(Errno::EINVAL);
+                }
+            }
             conf_write(f, scope, param.name, at, v);
             Ok(())
         }
@@ -833,5 +850,24 @@ mod tests {
         assert_eq!(read("ipv4/conf/lo/forwarding").unwrap(), b"1\n");
         write("ipv4/conf/all/forwarding", b"0").unwrap();
         assert_eq!(read("ipv4/ip_forward").unwrap(), b"0\n");
+    }
+
+    /// systemd-networkd-tests.py NetworkdMTUTests: a new MTU of a device is its IPv6 MTU too,
+    /// and the IPv6 MTU is not larger than the MTU of the device.
+    #[test]
+    fn the_ipv6_mtu_follows_the_mtu_of_the_device() {
+        let _serial = crate::TEST_DEVICES.lock();
+        dev::init();
+        let d = crate::dummy::create(Some(b"mtu6dummy0"), None).unwrap();
+        assert_eq!(read("ipv6/conf/mtu6dummy0/mtu").unwrap(), b"1500\n");
+        write("ipv6/conf/mtu6dummy0/mtu", b"1400").unwrap();
+        assert_eq!(write("ipv6/conf/mtu6dummy0/mtu", b"1550"), Err(Errno::EINVAL));
+        assert_eq!(read("ipv6/conf/mtu6dummy0/mtu").unwrap(), b"1400\n");
+        d.set_mtu(1600).unwrap();
+        assert_eq!(read("ipv6/conf/mtu6dummy0/mtu").unwrap(), b"1600\n");
+        write("ipv6/conf/mtu6dummy0/mtu", b"1550").unwrap();
+        d.set_mtu(1500).unwrap();
+        assert_eq!(read("ipv6/conf/mtu6dummy0/mtu").unwrap(), b"1500\n");
+        dev::unregister(&d);
     }
 }
