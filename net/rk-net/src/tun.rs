@@ -322,11 +322,11 @@ impl NetDriver for Tun {
         Ok(())
     }
 
-    /// The carrier is on while a queue is enabled, as `tun_attach` and `__tun_detach` of Linux
-    /// set it.
+    /// The carrier is on while a file is on the device, as `tun_attach` and `__tun_detach` of
+    /// Linux set it. A queue that `IFF_DETACH_QUEUE` took off still counts, as `numdisabled` of
+    /// Linux, so the carrier stays on until the file closes.
     fn link_up(&self) -> bool {
-        self.queues.lock().iter().any(|q| q.enabled.load(Ordering::Relaxed))
-            && self.config.lock().carrier
+        !self.queues.lock().is_empty() && self.config.lock().carrier
     }
 
     /// Puts the frame in the queue of the reads of one file, as `tun_net_xmit` of Linux. Without
@@ -450,10 +450,13 @@ impl TunFile {
                     return Err(Errno::EINVAL);
                 }
                 tun.attach(&self.queue)?;
-                // Only the first queue sets the flags, as Linux.
+                // Only the first queue sets the flags, as Linux. The carrier comes on with it.
                 if tun.queues.lock().len() == 1 {
-                    let mut c = tun.config.lock();
-                    c.flags = (c.flags & !FEATURES) | (flags & FEATURES);
+                    {
+                        let mut c = tun.config.lock();
+                        c.flags = (c.flags & !FEATURES) | (flags & FEATURES);
+                    }
+                    dev.carrier_changed();
                 }
                 (tun, dev)
             }
@@ -512,16 +515,19 @@ impl TunFile {
     }
 
     /// Takes the file off its device, as `tun_detach` of Linux. A device that is not persistent
-    /// goes away with its last queue.
+    /// goes away with its last queue, and a persistent device loses its carrier.
     fn detach(&self) {
         let Some((tun, dev)) = self.attached.lock().take() else { return };
         let left = tun.detach(&self.queue, false);
-        if left == 0
-            && tun.config.lock().flags & IFF_PERSIST == 0
-            && !tun.gone.load(Ordering::Relaxed)
-        {
+        if left != 0 || tun.gone.load(Ordering::Relaxed) {
+            return;
+        }
+        if tun.config.lock().flags & IFF_PERSIST == 0 {
             let _in = ns::enter_index(dev.net());
             dev::unregister(&dev);
+        } else {
+            // The last file closed, so the carrier goes off.
+            dev.carrier_changed();
         }
     }
 }

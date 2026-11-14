@@ -678,6 +678,14 @@ impl NetDevice {
         Ok(())
     }
 
+    /// Tells the users of a device that is up that its carrier changed, as the link watch of
+    /// Linux does after `netif_carrier_on` and `netif_carrier_off`.
+    pub fn carrier_changed(&self) {
+        if self.is_up() {
+            notify(self, Event::Change);
+        }
+    }
+
     /// The flags, as `netif_get_flags` of Linux: the flags of the device, and `IFF_RUNNING` and
     /// `IFF_LOWER_UP` when the device is up and the link is up.
     pub fn flags(&self) -> u32 {
