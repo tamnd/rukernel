@@ -2,10 +2,11 @@
 //! `add_key`, `request_key` and `keyctl`.
 //!
 //! A key has a type, a description, an owner, a group, permissions and a payload. The types are
-//! `user`, `logon` and `keyring`. A keyring holds links to other keys. Each thread can have a
-//! thread keyring, each process a process keyring and a session keyring, and each user has a user
-//! keyring and a user session keyring. A key is possessed when the caller can find it from these
-//! keyrings, and the possessor bits of its permissions then apply too.
+//! `user`, `logon`, `keyring`, `dns_resolver`, `big_key` and `asymmetric`. A keyring holds links
+//! to other keys. Each thread can have a thread keyring, each process a process keyring and a
+//! session keyring, and each user has a user keyring and a user session keyring. A key is
+//! possessed when the caller can find it from these keyrings, and the possessor bits of its
+//! permissions then apply too.
 //!
 //! The functions here do not touch user memory or the clock. The system calls copy the strings
 //! and the payload, and give the time in a `Caller`, so the host tests can run them.
@@ -29,6 +30,7 @@
 mod construct;
 mod ctl;
 mod dh;
+mod pkey;
 mod text;
 
 #[cfg(test)]
@@ -43,6 +45,8 @@ pub use ctl::{
     session_to_parent, set_perm, set_reqkey, set_timeout, unlink, update,
 };
 pub use dh::{KDF_MAX_OTHERINFO, KDF_MAX_OUTPUT, Kdf, dh_compute};
+pub use pkey::{Pkey, pkey_open};
+pub use rk_crypto::asym::{Op as PkeyOp, Query as PkeyQuery};
 pub use text::{key_users_text, keys_text};
 
 use alloc::collections::BTreeMap;
@@ -55,6 +59,7 @@ use rk_abi::native::keyctl::{
     KEY_SPEC_REQUESTOR_KEYRING, KEY_SPEC_SESSION_KEYRING, KEY_SPEC_THREAD_KEYRING,
     KEY_SPEC_USER_KEYRING, KEY_SPEC_USER_SESSION_KEYRING,
 };
+use rk_crypto::asym::Parsed;
 use rk_frame::sync::SpinLock;
 use rk_vfs::cred::Cred;
 
@@ -147,6 +152,9 @@ pub enum Kind {
     /// `security/keys/request_key_auth.c`. The payload is the callout information. A process
     /// cannot make a key of this type.
     RequestKeyAuth,
+    /// A public or private key, as `crypto/asymmetric_keys`. The payload is an X.509
+    /// certificate or a PKCS#8 private key. The type has no read and no update.
+    Asymmetric,
 }
 
 impl Kind {
@@ -159,6 +167,7 @@ impl Kind {
             Kind::DnsResolver => "dns_resolver",
             Kind::BigKey => "big_key",
             Kind::RequestKeyAuth => ".request_key_auth",
+            Kind::Asymmetric => "asymmetric",
         }
     }
 
@@ -170,6 +179,7 @@ impl Kind {
             b"keyring" => Some(Kind::Keyring),
             b"dns_resolver" => Some(Kind::DnsResolver),
             b"big_key" => Some(Kind::BigKey),
+            b"asymmetric" => Some(Kind::Asymmetric),
             _ => None,
         }
     }
@@ -181,7 +191,7 @@ impl Kind {
 
     /// A process can read the payload of the type.
     fn can_read(self) -> bool {
-        self != Kind::Logon
+        !matches!(self, Kind::Logon | Kind::Asymmetric)
     }
 
     /// The permissions of a new key of this type from `add_key` or `request_key`. Only a keyring
@@ -204,7 +214,7 @@ impl Kind {
             Kind::User | Kind::Logon => (1..=MAX_USER_PAYLOAD).contains(&payload.len()),
             Kind::BigKey => (1..=MAX_BIG_KEY_PAYLOAD).contains(&payload.len()),
             Kind::DnsResolver => return dns_preparse(payload).map(|_| ()),
-            Kind::RequestKeyAuth => false,
+            Kind::RequestKeyAuth | Kind::Asymmetric => false,
         };
         if ok { Ok(()) } else { Err(Errno::EINVAL) }
     }
@@ -212,15 +222,31 @@ impl Kind {
     /// Checks the payload of a new key and gives what the key keeps, as the `preparse` of the
     /// type.
     fn preparse(self, mut payload: Vec<u8>) -> Result<Prep, Errno> {
+        if self == Kind::Asymmetric {
+            let mut parsed = rk_crypto::asym::parse(&payload)?;
+            let desc = parsed.desc.take();
+            return Ok(Prep {
+                quota: rk_crypto::asym::QUOTA,
+                asym: Some(Arc::new(parsed)),
+                desc,
+                ..Prep::default()
+            });
+        }
         if self != Kind::DnsResolver {
             self.check_payload(&payload)?;
             let quota = if self == Kind::BigKey { BIG_KEY_QUOTA } else { payload.len() as u32 };
-            return Ok(Prep { payload, quota, short: false, error: None });
+            return Ok(Prep { payload, quota, ..Prep::default() });
         }
         let dns = dns_preparse(&payload)?;
         // As Linux, a key with an error keeps no data.
         payload.truncate(if dns.error.is_some() { 0 } else { dns.len });
-        Ok(Prep { quota: payload.len() as u32, payload, short: dns.short, error: dns.error })
+        Ok(Prep {
+            quota: payload.len() as u32,
+            payload,
+            short: dns.short,
+            error: dns.error,
+            ..Prep::default()
+        })
     }
 
     /// Checks the description of a new key, as the `vet_description` of the type. A `logon` key
@@ -252,12 +278,16 @@ pub(super) struct Prep {
     short: bool,
     /// The error that a read of the key gives, as `dns_key_error` of a `dns_resolver` key.
     error: Option<Errno>,
+    /// The key of an `asymmetric` key.
+    asym: Option<Arc<Parsed>>,
+    /// The description that the type proposes for a key without one.
+    desc: Option<Vec<u8>>,
 }
 
 impl Prep {
     /// A payload that takes its length in the quota.
     fn new(payload: Vec<u8>) -> Self {
-        Prep { quota: payload.len() as u32, payload, short: false, error: None }
+        Prep { quota: payload.len() as u32, payload, ..Prep::default() }
     }
 }
 
@@ -366,8 +396,10 @@ struct State {
     error: Option<Errno>,
     /// The links of a keyring. At most one key of each type and description.
     links: Vec<Arc<Key>>,
-    /// The keyring accepts no new links. Only the reject-all restriction is available.
-    restricted: bool,
+    /// The restriction of the links that the keyring accepts, as `restrict_link`.
+    restriction: Option<Restriction>,
+    /// The key of an `asymmetric` key.
+    asym: Option<Arc<Parsed>>,
     /// The bytes of the quota of the owner that the key takes.
     quota_bytes: u32,
     /// The key is under construction: it has no payload and no error yet, as
@@ -679,7 +711,8 @@ fn alloc(
                 datalen: prep.quota,
                 error: prep.error,
                 links: Vec::new(),
-                restricted: false,
+                restriction: None,
+                asym: prep.asym,
                 quota_bytes: bytes,
                 pending: false,
                 auth: None,
@@ -796,6 +829,9 @@ struct Search<'a> {
     target: Option<&'a KeyData>,
     kind: Kind,
     desc: &'a [u8],
+    /// An `asymmetric` key with this ID in place of the description: one of its first two IDs,
+    /// or its third ID if the flag is true, as the `ex:` and `dn:` searches.
+    asym_id: Option<(&'a [u8], bool)>,
     /// Skip the revoked, invalidated, expired and negative keys, with their errors.
     state_check: bool,
     /// An expired key does not give `EKEYEXPIRED`.
@@ -806,9 +842,22 @@ struct Search<'a> {
 
 impl Search<'_> {
     fn matches(&self, key: &Arc<Key>) -> bool {
-        match self.target {
-            Some(t) => core::ptr::eq(t, &***key),
-            None => key.kind == self.kind && key.desc == self.desc,
+        if let Some(t) = self.target {
+            return core::ptr::eq(t, &***key);
+        }
+        if key.kind != self.kind {
+            return false;
+        }
+        let Some((id, by_name)) = self.asym_id else {
+            return key.desc == self.desc;
+        };
+        let Some(kids) = asym_ids(key) else {
+            return false;
+        };
+        if by_name {
+            same_id(kids[2].as_deref(), Some(id))
+        } else {
+            kids[..2].iter().any(|k| same_id(k.as_deref(), Some(id)))
         }
     }
 
@@ -987,7 +1036,7 @@ fn user_rings(cx: &Caller<'_>) -> Result<(Arc<Key>, Arc<Key>), Errno> {
         None,
         true,
     )?;
-    insert_link(&session, &user)?;
+    insert_link(None, &session, &user)?;
     let mut rings = USER_RINGS.lock();
     // Another thread can make them first. The new keyrings then go after the lock.
     let r = rings.entry(uid).or_insert((user.clone(), session.clone())).clone();
@@ -1116,6 +1165,7 @@ fn is_possessed(cx: &Caller<'_>, key: &KeyData) -> bool {
         target: Some(key),
         kind: key.kind,
         desc: &key.desc,
+        asym_id: None,
         state_check: false,
         skip_expired: false,
         check_perm: true,
@@ -1144,10 +1194,11 @@ fn check_cycle(ring: &Arc<Key>, key: &Arc<Key>) -> Result<(), Errno> {
     walk(key, ring, 0)
 }
 
-/// Checks that a key of `kind` and `desc` can go in `ring`, as `__key_link_begin` and the check
-/// of the restriction after it: `ENOTDIR`, `EKEYREVOKED`, `EDQUOT` and `EPERM`. Takes the quota
-/// of a new link. Gives true if the link replaces a link of the same type and description. The
-/// caller holds `LINK_LOCK`, and calls [`abort_link`] if it does not commit the link.
+/// Checks that a key of `kind` and `desc` can go in `ring`, as `__key_link_begin`:
+/// `ENOTDIR`, `EKEYREVOKED` and `EDQUOT`. Takes the quota of a new link. Gives true if the link
+/// replaces a link of the same type and description. The caller holds `LINK_LOCK`, checks the
+/// restriction of the keyring with [`check_restriction`], and calls [`abort_link`] if it does
+/// not commit the link.
 fn begin_link(ring: &Arc<Key>, kind: Kind, desc: &[u8]) -> Result<bool, Errno> {
     if !ring.is_keyring() {
         return Err(Errno::ENOTDIR);
@@ -1159,11 +1210,249 @@ fn begin_link(ring: &Arc<Key>, kind: Kind, desc: &[u8]) -> Result<bool, Errno> {
     if !replace {
         charge(&mut ring.state.lock(), LINK_BYTES)?;
     }
-    if ring.state.lock().restricted {
+    Ok(replace)
+}
+
+/// [`begin_link`] and then [`check_restriction`] for a key of `kind` with the key `asym`.
+fn begin_restricted_link(
+    cx: Option<&Caller<'_>>,
+    ring: &Arc<Key>,
+    kind: Kind,
+    desc: &[u8],
+    asym: Option<&Parsed>,
+) -> Result<bool, Errno> {
+    let replace = begin_link(ring, kind, desc)?;
+    if let Err(e) = check_restriction(cx, ring, kind, asym) {
         abort_link(ring, replace);
-        return Err(Errno::EPERM);
+        return Err(e);
     }
     Ok(replace)
+}
+
+/// The restriction of a keyring, as `struct key_restriction`.
+#[derive(Clone)]
+enum Restriction {
+    /// The keyring accepts no new links, as `restrict_link_reject`.
+    RejectAll,
+    /// The keyring accepts only the `asymmetric` keys that a key of the builtin trusted keyring
+    /// signs, as `restrict_link_by_builtin_trusted`. The builtin trusted keyring is empty.
+    Builtin,
+    /// The keyring accepts only the `asymmetric` keys that `key` signs, or a key in the keyring
+    /// `key`, as `restrict_link_by_key_or_keyring`. With `chain`, a key in the keyring itself can
+    /// sign them too, and `key` can be `None`.
+    KeyOrKeyring {
+        /// The key or the keyring of the signers.
+        key: Option<Arc<Key>>,
+        /// The keyring itself has signers too.
+        chain: bool,
+    },
+}
+
+/// Parses the restriction text of the `asymmetric` type, as `asymmetric_lookup_restriction`:
+/// `builtin_trusted`, `builtin_and_secondary_trusted`, or `key_or_keyring:SERIAL` with an
+/// optional `:chain`.
+///
+/// # Errors
+///
+/// Gives `EINVAL` for a bad text, or `ENOKEY` if the key `SERIAL` is not there.
+fn asymmetric_restriction(text: &[u8]) -> Result<Restriction, Errno> {
+    if text == b"builtin_trusted" || text == b"builtin_and_secondary_trusted" {
+        return Ok(Restriction::Builtin);
+    }
+    let mut parts = text.splitn(3, |&b| b == b':');
+    let (Some(b"key_or_keyring"), Some(serial)) = (parts.next(), parts.next()) else {
+        return Err(Errno::EINVAL);
+    };
+    let chain = match parts.next() {
+        None => false,
+        Some(b"chain") => true,
+        Some(_) => return Err(Errno::EINVAL),
+    };
+    let serial = parse_s32(serial).ok_or(Errno::EINVAL)?;
+    let key = if serial == 0 && chain { None } else { Some(find(serial).ok_or(Errno::ENOKEY)?) };
+    Ok(Restriction::KeyOrKeyring { key, chain })
+}
+
+/// Parses a signed 32-bit number as `kstrtos32` with the base 0: a sign, then `0x` for
+/// hexadecimal or `0` for octal, and one newline at the end.
+fn parse_s32(text: &[u8]) -> Option<i32> {
+    let text = text.strip_suffix(b"\n").unwrap_or(text);
+    let (neg, text) = match text.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, text),
+    };
+    let (radix, digits) =
+        if let Some(h) = text.strip_prefix(b"0x").or_else(|| text.strip_prefix(b"0X")) {
+            (16, h)
+        } else if text.len() > 1 && text[0] == b'0' {
+            (8, &text[1..])
+        } else {
+            (10, text)
+        };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for &b in digits {
+        let d = i64::from((b as char).to_digit(radix)?);
+        v = v * i64::from(radix) + d;
+        if v > i64::from(u32::MAX) + 1 {
+            return None;
+        }
+    }
+    i32::try_from(if neg { -v } else { v }).ok()
+}
+
+/// True if the restriction of `ring` leads back to `dest` through the keyrings of the
+/// restrictions, as `keyring_detect_restriction_cycle`.
+fn restriction_cycle(dest: &Arc<Key>, res: &Restriction) -> bool {
+    let mut next = match res {
+        Restriction::KeyOrKeyring { key: Some(k), .. } => k.clone(),
+        _ => return false,
+    };
+    loop {
+        if !next.is_keyring() {
+            return false;
+        }
+        if Arc::ptr_eq(&next, dest) {
+            return true;
+        }
+        let r = next.state.lock().restriction.clone();
+        next = match r {
+            Some(Restriction::KeyOrKeyring { key: Some(k), .. }) => k,
+            _ => return false,
+        };
+    }
+}
+
+/// Puts the restriction `res` on the keyring `ring`, as the end of `keyring_restrict`.
+///
+/// # Errors
+///
+/// Gives `EEXIST` if the keyring has a restriction, or `EDEADLK` if the restriction makes a
+/// cycle.
+fn set_restriction(ring: &Arc<Key>, res: Restriction) -> Result<(), Errno> {
+    let _g = LINK_LOCK.lock();
+    if ring.state.lock().restriction.is_some() {
+        return Err(Errno::EEXIST);
+    }
+    if restriction_cycle(ring, &res) {
+        return Err(Errno::EDEADLK);
+    }
+    ring.state.lock().restriction = Some(res);
+    Ok(())
+}
+
+/// True if the two IDs are there and are the same, as `asymmetric_key_id_same`.
+fn same_id(a: Option<&[u8]>, b: Option<&[u8]>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a == b)
+}
+
+/// The IDs of an `asymmetric` key.
+fn asym_ids(key: &Key) -> Option<[Option<Vec<u8>>; 3]> {
+    key.state.lock().asym.as_ref().and_then(|p| p.ids.clone())
+}
+
+/// Finds an `asymmetric` key in the tree of `ring` with the IDs of a signature, as
+/// `find_asymmetric_key` with no partial match.
+fn find_asymmetric(
+    cx: &Caller<'_>,
+    ring: &Arc<Key>,
+    ids: &[Option<Vec<u8>>; 3],
+) -> Option<Arc<Key>> {
+    let [id0, id1, id2] = ids;
+    let (id, by_name) = match (id0, id1) {
+        (Some(id), _) | (None, Some(id)) => (id, false),
+        (None, None) => (id2.as_ref()?, true),
+    };
+    let search = Search {
+        cx,
+        target: None,
+        kind: Kind::Asymmetric,
+        desc: b"",
+        asym_id: Some((id, by_name)),
+        state_check: true,
+        skip_expired: false,
+        check_perm: true,
+    };
+    let key = search.in_ring(ring, true).ok()?;
+    if let (Some(_), Some(id1)) = (id0, id1) {
+        let kids = asym_ids(&key)?;
+        if !same_id(Some(id1), kids[1].as_deref()) {
+            return None;
+        }
+    }
+    Some(key)
+}
+
+/// Checks that `ring` accepts a key of `kind` with the key `asym`, as the `check` of the
+/// restriction of the keyring.
+///
+/// # Errors
+///
+/// Gives `EPERM` for a keyring that accepts no links, `EOPNOTSUPP` for a key that is not an
+/// `asymmetric` key, `ENOPKG` for a key without a signature that the kernel can check, `ENOKEY`
+/// if no trusted key signs it, or the error of the check of the signature.
+fn check_restriction(
+    cx: Option<&Caller<'_>>,
+    ring: &Arc<Key>,
+    kind: Kind,
+    asym: Option<&Parsed>,
+) -> Result<(), Errno> {
+    let Some(res) = ring.state.lock().restriction.clone() else {
+        return Ok(());
+    };
+    let (trusted, chain) = match res {
+        Restriction::RejectAll => return Err(Errno::EPERM),
+        Restriction::Builtin => (None, false),
+        Restriction::KeyOrKeyring { key, chain } => {
+            if key.is_none() && !chain {
+                return Err(Errno::ENOKEY);
+            }
+            (key, chain)
+        }
+    };
+    if kind != Kind::Asymmetric {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    let sig = asym.and_then(|p| p.sig.as_ref()).ok_or(Errno::ENOPKG)?;
+    let ids = &sig.auth_ids;
+    if ids.iter().all(Option::is_none) {
+        return Err(Errno::ENOKEY);
+    }
+    // The builtin trusted keyring is empty, so no key signs the key.
+    let cx = cx.ok_or(Errno::ENOKEY)?;
+    let mut signer = None;
+    if let Some(t) = trusted {
+        if t.is_keyring() {
+            signer = find_asymmetric(cx, &t, ids);
+        } else if t.kind == Kind::Asymmetric {
+            // As `key_or_keyring_common`: the first ID of the signature that is there must be
+            // one of the first two IDs of the key, and the second ID must be the second ID.
+            let kids = asym_ids(&t).unwrap_or_default();
+            let either = |id: Option<&[u8]>| {
+                same_id(kids[0].as_deref(), id) || same_id(kids[1].as_deref(), id)
+            };
+            let ok = match (ids[0].as_deref(), ids[1].as_deref()) {
+                (None, None) => same_id(kids[2].as_deref(), ids[2].as_deref()),
+                (Some(id), None) | (None, Some(id)) => either(Some(id)),
+                (Some(a), Some(b)) => same_id(kids[1].as_deref(), Some(b)) && either(Some(a)),
+            };
+            if ok {
+                signer = Some(t);
+            }
+        } else {
+            return Err(Errno::EOPNOTSUPP);
+        }
+    }
+    if chain && signer.is_none() {
+        signer = find_asymmetric(cx, ring, ids);
+    }
+    let signer = signer.ok_or(Errno::ENOKEY)?;
+    signer.validate(cx.now)?;
+    let key = signer.state.lock().asym.clone().ok_or(Errno::EINVAL)?;
+    rk_crypto::asym::verify(&key.key, sig)
 }
 
 /// Gives back the quota that [`begin_link`] took.
@@ -1189,10 +1478,12 @@ fn commit_link(ring: &Arc<Key>, key: &Arc<Key>) {
     drop(old);
 }
 
-/// Links `key` into `ring` with all the checks, as `key_link`.
-fn insert_link(ring: &Arc<Key>, key: &Arc<Key>) -> Result<(), Errno> {
+/// Links `key` into `ring` with all the checks, as `key_link`. `cx` is the caller, or `None`
+/// for a keyring of the kernel without a restriction.
+fn insert_link(cx: Option<&Caller<'_>>, ring: &Arc<Key>, key: &Arc<Key>) -> Result<(), Errno> {
     let _g = LINK_LOCK.lock();
-    let replace = begin_link(ring, key.kind, &key.desc)?;
+    let asym = key.state.lock().asym.clone();
+    let replace = begin_restricted_link(cx, ring, key.kind, &key.desc, asym.as_deref())?;
     if let Err(e) = check_cycle(ring, key) {
         abort_link(ring, replace);
         return Err(e);

@@ -67,6 +67,16 @@ fn key_line(out: &mut String, key: &KeyData, now: u64) {
             } else {
                 let _ = write!(out, ": {links}");
             }
+        } else if let Some(p) = &s.asym {
+            // As `asymmetric_key_describe`: the format, the algorithm, the end of the subject
+            // key identifier, and the capabilities, which Linux leaves empty.
+            let _ = write!(out, ": {}.{}", p.key.id_type, p.key.algo);
+            if let Some(Some(kid)) = p.ids.as_ref().map(|ids| &ids[1]) {
+                let tail = &kid[kid.len().saturating_sub(4)..];
+                out.push(' ');
+                out.push_str(&String::from_utf8_lossy(&rk_crypto::asym::hex(tail)));
+            }
+            out.push_str(" []");
         } else if let Some(e) = s.error {
             let _ = write!(out, ": -{}", e.get());
         } else if key.kind == Kind::BigKey {
