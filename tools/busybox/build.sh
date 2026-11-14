@@ -5,9 +5,9 @@
 #
 # The script needs docker, and qemu-user with binfmt_misc to run the arm64 container on another
 # host. It takes the BusyBox release in VERSION, checks its SHA-256 and builds the default
-# configuration as a static program. The program goes to OUT_DIR/busybox. `cargo xtask boot-test
-# aarch64` puts it in the initramfs of the arm64 `busybox` test when RK_BUSYBOX_AARCH64 gives its
-# path.
+# configuration as a static program, with the full modprobe. The program goes to OUT_DIR/busybox.
+# `cargo xtask boot-test aarch64` puts it in the initramfs of the arm64 `busybox` test when
+# RK_BUSYBOX_AARCH64 gives its path.
 set -eu
 
 ALPINE=3.22
@@ -33,6 +33,14 @@ make defconfig >/dev/null
 sed -i -e "s/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/" -e "s/^CONFIG_TC=y/# CONFIG_TC is not set/" \
 	-e "s/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/" \
 	-e "s/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/" .config
+# The default configuration has the small modprobe. It does not read modules.builtin, and it
+# gives 1 for a module that is in the kernel. The full modprobe gives 0, as kmod does. LTP (for
+# example keyctl05) runs "modprobe dns_resolver", and tools/ltp/run.py writes modules.builtin.
+sed -i -e "/CONFIG_MODPROBE_SMALL/d" -e "/CONFIG_INSMOD/d" -e "/CONFIG_RMMOD/d" -e "/CONFIG_LSMOD/d" \
+	-e "/CONFIG_MODPROBE[ =]/d" -e "/CONFIG_DEPMOD/d" .config
+printf "%s\n" "# CONFIG_MODPROBE_SMALL is not set" CONFIG_INSMOD=y CONFIG_RMMOD=y CONFIG_LSMOD=y \
+	CONFIG_MODPROBE=y CONFIG_DEPMOD=y >> .config
+yes "" | make oldconfig >/dev/null
 make -j"$(nproc)" busybox >/dev/null
 strip busybox
 cp busybox /out/busybox
