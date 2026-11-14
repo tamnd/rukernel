@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.31] - 2026-11-15
+
 ### Added
 
 - `/sys/firmware/acpi/tables` with a copy of each ACPI table, as Linux: the tables of the RSDT or the XSDT, and the DSDT and the FACS of the FADT. Duplicate signatures get a number from 1, for example `SSDT1`, and the files are mode 0400. After a boot with EFI, `/sys/firmware/efi` is there with `fw_platform_size`. With `RK_TPM=1`, the `systemd` boot test starts the kernel from OVMF, so `systemd-analyze has-tpm2` gives the full TPM2 support and the test compares `systemd-analyze pcrs` with tpm2_pcrread (#541).
@@ -1663,6 +1665,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.31]: https://github.com/tamnd/rukernel/compare/v0.5.30...v0.5.31
 [0.5.30]: https://github.com/tamnd/rukernel/compare/v0.5.29...v0.5.30
 [0.5.29]: https://github.com/tamnd/rukernel/compare/v0.5.28...v0.5.29
 [0.5.28]: https://github.com/tamnd/rukernel/compare/v0.5.27...v0.5.28
