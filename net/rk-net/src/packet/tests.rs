@@ -24,7 +24,7 @@ fn int(v: i32) -> [u8; 4] {
 /// Makes a socket of `kind` for all protocols, bound to a new dummy device `name` that is up.
 fn bound(kind: u32, name: &[u8]) -> (Arc<PacketSocket>, Arc<NetDevice>) {
     dev::init();
-    let d = crate::dummy::create(Some(name)).unwrap();
+    let d = crate::dummy::create(Some(name), None).unwrap();
     d.set_up(true);
     let p = PacketSocket::new(kind, u32::from(ALL)).unwrap();
     bind(&p, &d);

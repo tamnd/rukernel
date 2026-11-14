@@ -299,7 +299,7 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
     // Linux. Another device gives its own index.
     let iflink = d.peer().map_or(index, |p| p.ifindex());
     let mut out = Vec::from([
-        file("addr_assign_type", String::from("0\n")),
+        file("addr_assign_type", format!("{}\n", d.addr_assign_type())),
         file("addr_len", format!("{}\n", d.mac().0.len())),
         file("address", format!("{}\n", d.mac())),
         file("broadcast", format!("{}\n", d.broadcast())),
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn the_iflink_of_a_veth_end_is_the_index_of_the_other_end() {
         rk_net::dev::init();
-        let (a, b) = rk_net::veth::create(Some(b"sva"), Some(b"svb"), None).unwrap();
+        let (a, b) = rk_net::veth::create(Some(b"sva"), Some(b"svb"), None, [None; 2]).unwrap();
         let iflink = |name: &str| get(&format!("devices/virtual/net/{name}/iflink"));
         assert_eq!(iflink("sva"), Kind::File(format!("{}\n", b.ifindex()).into_bytes()));
         assert_eq!(iflink("svb"), Kind::File(format!("{}\n", a.ifindex()).into_bytes()));
@@ -803,6 +803,23 @@ mod tests {
         assert!(names("class/net").contains(&String::from("sva")));
         rk_net::dev::unregister(&a);
         assert!(!names("class/net").contains(&String::from("svb")));
+    }
+
+    #[test]
+    fn addr_assign_type_tells_how_the_device_got_its_address() {
+        rk_net::dev::init();
+        let mac = rk_net::ether::MacAddr([0x02, 0, 0, 0, 0, 0x28]);
+        let (a, _) =
+            rk_net::veth::create(Some(b"sha"), Some(b"shb"), None, [None, Some(mac)]).unwrap();
+        let assign = |name: &str| get(&format!("devices/virtual/net/{name}/addr_assign_type"));
+        // A random address gives 1, a set address gives 3, and a permanent address gives 0, as
+        // `NET_ADDR_*` of Linux.
+        assert_eq!(assign("sha"), Kind::File(b"1\n".to_vec()));
+        assert_eq!(assign("shb"), Kind::File(b"3\n".to_vec()));
+        assert_eq!(assign("lo"), Kind::File(b"0\n".to_vec()));
+        a.set_mac(rk_net::consts::ARPHRD_ETHER, mac).unwrap();
+        assert_eq!(assign("sha"), Kind::File(b"3\n".to_vec()));
+        rk_net::dev::unregister(&a);
     }
 
     #[test]

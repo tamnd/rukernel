@@ -6,10 +6,10 @@ use crate::consts::{
 use crate::{Message, NoPaths, Socket, dev};
 use alloc::vec::Vec;
 use rk_abi::Errno;
-use rk_abi::native::if_link::{IFLA_IFNAME, IFLA_MTU};
+use rk_abi::native::if_link::{IFLA_ADDRESS, IFLA_IFNAME, IFLA_LINKINFO, IFLA_MTU};
 use rk_abi::native::netlink::{
-    NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CAPPED, NLM_F_DUMP, NLM_F_MULTI,
-    NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR,
+    NETLINK_PKTINFO, NETLINK_ROUTE, NLM_F_ACK, NLM_F_CAPPED, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
+    NLM_F_MULTI, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR,
 };
 use rk_abi::native::rtnetlink::{RTM_GETLINK, RTM_NEWLINK, RTM_SETLINK, RTNLGRP_LINK};
 
@@ -247,4 +247,94 @@ fn pktinfo_gives_the_group_of_each_datagram() {
     s.set_option(SOL_NETLINK, NETLINK_PKTINFO, &0i32.to_ne_bytes()).unwrap();
     send(&s, link_req(RTM_GETLINK, NLM_F_ACK, lo.ifindex() as i32, 0, 0).finish());
     assert!(s.recv(65536, 0, true).unwrap().control.is_empty());
+}
+
+/// The error of the ack of a request.
+fn ack_error(s: &NetlinkSocket) -> i32 {
+    let d = s.recv(4096, 0, true).unwrap().data;
+    assert_eq!(Header::parse(&d).unwrap().ty, NLMSG_ERROR as u16);
+    -i32::from_ne_bytes([d[16], d[17], d[18], d[19]])
+}
+
+/// A request to make a veth pair `hwv0` and `hwv1` with the addresses `a` and `b`.
+fn new_veth(a: &[u8], b: Option<&[u8]>) -> Vec<u8> {
+    // `IFLA_INFO_KIND`, `IFLA_INFO_DATA` and `VETH_INFO_PEER` of Linux.
+    let (info_kind, info_data, info_peer) = (1, 2, 1);
+    let mut r = link_req(RTM_NEWLINK, NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL, 0, 0, 0);
+    r.str(IFLA_IFNAME as u16, "hwv0").put(IFLA_ADDRESS as u16, a);
+    let info = r.nest(IFLA_LINKINFO as u16);
+    r.str(info_kind, "veth");
+    let data = r.nest(info_data);
+    let peer = r.nest(info_peer);
+    r.fixed(&[0; link::IFINFO_LEN]).str(IFLA_IFNAME as u16, "hwv1");
+    if let Some(b) = b {
+        r.put(IFLA_ADDRESS as u16, b);
+    }
+    r.end_nest(peer).end_nest(data).end_nest(info);
+    r.finish()
+}
+
+#[test]
+fn a_new_veth_pair_takes_the_addresses_of_ifla_address() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let s = socket();
+    let (a, b) = ([0x00, 0x50, 0x56, 0xc0, 0x00, 0x28], [0x00, 0x50, 0x56, 0xc0, 0x00, 0x29]);
+    // A multicast address, a zero address and a short address give an error, as
+    // `veth_validate` of Linux, and no device stays.
+    send(&s, new_veth(&[0x01, 0, 0, 0, 0, 1], None));
+    assert_eq!(ack_error(&s), i32::from(Errno::EADDRNOTAVAIL.get()));
+    send(&s, new_veth(&a, Some(&[0u8; 6][..])));
+    assert_eq!(ack_error(&s), i32::from(Errno::EADDRNOTAVAIL.get()));
+    send(&s, new_veth(&a[..5], None));
+    assert_eq!(ack_error(&s), i32::from(Errno::EINVAL.get()));
+    assert!(dev::by_name("hwv0").is_none() && dev::by_name("hwv1").is_none());
+    send(&s, new_veth(&a, Some(&b[..])));
+    assert_eq!(ack_error(&s), 0);
+    let (d0, d1) = (dev::by_name("hwv0").unwrap(), dev::by_name("hwv1").unwrap());
+    assert_eq!((d0.mac().0, d0.addr_assign_type()), (a, dev::NET_ADDR_SET));
+    assert_eq!((d1.mac().0, d1.addr_assign_type()), (b, dev::NET_ADDR_SET));
+    dev::unregister(&d0);
+    // Without `IFLA_ADDRESS` in the peer, the peer has a random address.
+    send(&s, new_veth(&a, None));
+    assert_eq!(ack_error(&s), 0);
+    let d1 = dev::by_name("hwv1").unwrap();
+    assert_eq!(d1.addr_assign_type(), dev::NET_ADDR_RANDOM);
+    assert!(d1.mac().is_valid());
+    dev::unregister(&d1);
+}
+
+#[test]
+fn setlink_changes_the_hardware_address_and_sends_a_new_link() {
+    let _serial = crate::TEST_DEVICES.lock();
+    let s = socket();
+    s.bind(&NoPaths, &addr(0, 1 << (RTNLGRP_LINK - 1))).unwrap();
+    let d = crate::dummy::create(Some(b"hwd0"), None).unwrap();
+    let m = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+    recv_all(&s);
+    let mut r = link_req(RTM_SETLINK, NLM_F_ACK, d.ifindex() as i32, 0, 0);
+    r.put(IFLA_ADDRESS as u16, &m);
+    send(&s, r.finish());
+    let got = recv_all(&s);
+    assert_eq!(d.mac().0, m);
+    assert_eq!(d.addr_assign_type(), dev::NET_ADDR_SET);
+    // The notification comes first, and it has the new address.
+    let n = &got[0];
+    assert_eq!(Header::parse(n).unwrap().ty, RTM_NEWLINK as u16);
+    let attrs = Attrs::parse(&n[HDRLEN + link::IFINFO_LEN..], 69);
+    assert_eq!(attrs.get(IFLA_ADDRESS), Some(&m[..]));
+    let e = got.last().unwrap();
+    assert_eq!(Header::parse(e).unwrap().ty, NLMSG_ERROR as u16);
+    assert_eq!(i32::from_ne_bytes([e[16], e[17], e[18], e[19]]), 0);
+    // A multicast address gives `EADDRNOTAVAIL`, and the loopback device cannot change its
+    // address.
+    let mut r = link_req(RTM_SETLINK, NLM_F_ACK, d.ifindex() as i32, 0, 0);
+    r.put(IFLA_ADDRESS as u16, &[0x03, 0, 0, 0, 0, 1]);
+    send(&s, r.finish());
+    assert_eq!(ack_error(&s), i32::from(Errno::EADDRNOTAVAIL.get()));
+    let lo = dev::by_name("lo").unwrap();
+    let mut r = link_req(RTM_SETLINK, NLM_F_ACK, lo.ifindex() as i32, 0, 0);
+    r.put(IFLA_ADDRESS as u16, &m);
+    send(&s, r.finish());
+    assert_eq!(ack_error(&s), i32::from(Errno::EOPNOTSUPP.get()));
+    dev::unregister(&d);
 }

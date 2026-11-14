@@ -28,6 +28,8 @@ const BACKLOG: usize = 1000;
 /// One end of a pair.
 pub struct Veth {
     mac: MacAddr,
+    /// How the device got `mac`, one of the `NET_ADDR_*` values.
+    assign: u8,
     queue: SpinLock<VecDeque<NetBuf>>,
     /// The driver of the other end.
     peer: SpinLock<Weak<Veth>>,
@@ -49,9 +51,12 @@ pub(crate) fn random_mac() -> MacAddr {
 }
 
 impl Veth {
-    fn new() -> Arc<Self> {
+    /// A new end with the address `mac`, else with a random address, as `veth_newlink` of
+    /// Linux.
+    fn new(mac: Option<MacAddr>) -> Arc<Self> {
         Arc::new(Self {
-            mac: random_mac(),
+            mac: mac.unwrap_or_else(random_mac),
+            assign: if mac.is_some() { dev::NET_ADDR_SET } else { dev::NET_ADDR_RANDOM },
             queue: SpinLock::new(VecDeque::new()),
             peer: SpinLock::new(Weak::new()),
             peer_dev: SpinLock::new(Weak::new()),
@@ -66,6 +71,15 @@ impl NetDriver for Veth {
 
     fn mac(&self) -> MacAddr {
         self.mac
+    }
+
+    fn addr_assign_type(&self) -> u8 {
+        self.assign
+    }
+
+    /// The device has `eth_mac_addr` and `IFF_LIVE_ADDR_CHANGE`, as `veth_setup` of Linux.
+    fn can_set_mac(&self) -> bool {
+        true
     }
 
     fn max_mtu(&self) -> u32 {
@@ -140,13 +154,15 @@ impl NetDriver for Veth {
 
 /// Makes a pair, as `veth_newlink` of Linux. The end `peer_name` is made first in the namespace
 /// `peer_ns`, and then the end `name` in the current namespace. A missing name gives `vethN`.
-/// Gives the two devices, the end `name` first.
+/// Gives the two devices, the end `name` first. `macs` has the addresses of the end `name` and
+/// of the end `peer_name`. A missing address gives a random address.
 pub fn create(
     name: Option<&[u8]>,
     peer_name: Option<&[u8]>,
     peer_ns: Option<&NetNs>,
+    macs: [Option<MacAddr>; 2],
 ) -> Result<(Arc<NetDevice>, Arc<NetDevice>)> {
-    let (a, b) = (Veth::new(), Veth::new());
+    let (a, b) = (Veth::new(macs[0]), Veth::new(macs[1]));
     *a.peer.lock() = Arc::downgrade(&b);
     *b.peer.lock() = Arc::downgrade(&a);
     let peer = {

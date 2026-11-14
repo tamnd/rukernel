@@ -280,6 +280,12 @@ impl NetDriver for Tun {
         if self.tap { self.mac } else { MacAddr::ZERO }
     }
 
+    /// A TAP device has `eth_mac_addr` and `IFF_LIVE_ADDR_CHANGE`, as `tun_net_init` of Linux.
+    /// A TUN device has no hardware address.
+    fn can_set_mac(&self) -> bool {
+        self.tap
+    }
+
     fn max_mtu(&self) -> u32 {
         MAX_MTU
     }

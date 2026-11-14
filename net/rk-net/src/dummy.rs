@@ -18,6 +18,8 @@ const MAX_MTU: u32 = 65535;
 /// A dummy device.
 pub struct Dummy {
     mac: MacAddr,
+    /// How the device got `mac`, one of the `NET_ADDR_*` values.
+    assign: u8,
 }
 
 impl NetDriver for Dummy {
@@ -27,6 +29,15 @@ impl NetDriver for Dummy {
 
     fn mac(&self) -> MacAddr {
         self.mac
+    }
+
+    fn addr_assign_type(&self) -> u8 {
+        self.assign
+    }
+
+    /// The device has `eth_mac_addr` and `IFF_LIVE_ADDR_CHANGE`, as `dummy_setup` of Linux.
+    fn can_set_mac(&self) -> bool {
+        true
     }
 
     fn max_mtu(&self) -> u32 {
@@ -48,7 +59,12 @@ impl NetDriver for Dummy {
 }
 
 /// Makes a dummy device in the current namespace, as `dummy_setup` and `rtnl_newlink` of Linux.
-/// A missing name gives `dummyN`.
-pub fn create(name: Option<&[u8]>) -> Result<Arc<NetDevice>> {
-    dev::register_named(Arc::new(Dummy { mac: crate::veth::random_mac() }), name)
+/// A missing name gives `dummyN`. A missing address gives a random address, as
+/// `eth_hw_addr_random` of Linux.
+pub fn create(name: Option<&[u8]>, mac: Option<MacAddr>) -> Result<Arc<NetDevice>> {
+    let d = Dummy {
+        mac: mac.unwrap_or_else(crate::veth::random_mac),
+        assign: if mac.is_some() { dev::NET_ADDR_SET } else { dev::NET_ADDR_RANDOM },
+    };
+    dev::register_named(Arc::new(d), name)
 }

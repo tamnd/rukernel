@@ -12,6 +12,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - tools/nftables/report.md has the results of the full run of tests/shell on x86_64 and arm64 after the flowtables, the objects, `snat` to a prefix and the other work of #542: 349 of the 380 tests pass on x86_64, and 277 before. 343 pass on arm64, which ran in full for the first time (#542).
 
+### Fixed
+
+- A process can set the hardware address of a dummy, veth or TAP device with `IFLA_ADDRESS` in `RTM_NEWLINK` and `RTM_SETLINK`, and with `SIOCSIFHWADDR`, as `eth_mac_addr` of Linux. A multicast or zero address gives `EADDRNOTAVAIL`, a wrong family gives `EINVAL`, and the other devices give `EOPNOTSUPP`. The change sends `RTM_NEWLINK`. `addr_assign_type` in sysfs is now 1 for a random address and 3 for a set address, so udev applies `MACAddressPolicy=` as on Linux, and `IFLA_PERM_ADDRESS` is only for a device with a permanent address. Before this, `MACAddress=` of a systemd-networkd netdev had no effect (#538).
+
 ## [0.5.29] - 2026-11-14
 
 ### Added

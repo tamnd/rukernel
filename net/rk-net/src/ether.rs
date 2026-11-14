@@ -28,6 +28,12 @@ impl MacAddr {
     pub fn is_multicast(&self) -> bool {
         self.0[0] & 1 != 0
     }
+
+    /// Tells if a device can have the address: it is not multicast and not zero, as
+    /// `is_valid_ether_addr` of Linux.
+    pub fn is_valid(&self) -> bool {
+        !self.is_multicast() && *self != Self::ZERO
+    }
 }
 
 /// The form of `ip link`: six bytes in lower case hexadecimal with colons.
