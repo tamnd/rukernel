@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.32] - 2026-11-15
+
 ### Added
 
 - The `apparmor` boot test checks that the records of AppArmor go to auditd and to the group `AUDIT_NLGRP_READLOG` through `NETLINK_AUDIT`, with the fields of Linux. A record that goes to auditd does not go to the kernel log, as `kauditd_thread` of Linux (#540).
@@ -1674,6 +1676,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.32]: https://github.com/tamnd/rukernel/compare/v0.5.31...v0.5.32
 [0.5.31]: https://github.com/tamnd/rukernel/compare/v0.5.30...v0.5.31
 [0.5.30]: https://github.com/tamnd/rukernel/compare/v0.5.29...v0.5.30
 [0.5.29]: https://github.com/tamnd/rukernel/compare/v0.5.28...v0.5.29
