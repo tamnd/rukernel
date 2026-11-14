@@ -764,6 +764,18 @@ impl Table {
         self.table_lookup(RT_TABLE_LOCAL, a, 0, 0).map_or(RTN_UNICAST, |r| u32::from(r.kind))
     }
 
+    /// The type of the address `a` for the interface `dev`, as `inet_dev_addr_type` of Linux: as
+    /// `addr_type`, but a route of the local table through another interface gives
+    /// `RTN_UNICAST`. `dev` 0 is any interface.
+    pub fn dev_addr_type(&self, a: Addr, dev: u32) -> u32 {
+        if dev == 0 || a == ipv4::ANY || a == ipv4::BROADCAST || ipv4::is_multicast(a) {
+            return self.addr_type(a);
+        }
+        self.table_lookup(RT_TABLE_LOCAL, a, 0, 0)
+            .filter(|r| r.ifindex == dev)
+            .map_or(RTN_UNICAST, |r| u32::from(r.kind))
+    }
+
     /// Tells if `a` is a local address.
     pub fn is_local(&self, a: Addr) -> bool {
         self.addr_type(a) == RTN_LOCAL

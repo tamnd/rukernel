@@ -51,6 +51,8 @@ use rk_vfs::inode::Result;
 
 #[path = "nft_exprs.rs"]
 mod nft_exprs;
+#[path = "nft_fib.rs"]
+mod nft_fib;
 #[path = "nft_flowtable.rs"]
 mod nft_flowtable;
 #[path = "nft_objects.rs"]
@@ -66,6 +68,8 @@ use self::nft_exprs::{
     nft_range_init, nft_realtime_ns, nft_reject_eval, nft_reject_init,
 };
 pub(crate) use self::nft_exprs::{NftLog, nft_log_eval};
+use self::nft_fib::{NftFib, nft_fib_eval, nft_fib_init};
+pub use self::nft_fib::{NftFibFlow, NftFibRouteFn, NftFibTypeFn, nft_fib_set_fns};
 use self::nft_flowtable::nft_flow_offload_init;
 pub(super) use self::nft_flowtable::{
     NFTA_FLOWTABLE_MAX, NftFlowtable, nf_tables_dump_flowtable, nf_tables_getflowtable,
@@ -322,6 +326,8 @@ pub(super) enum NftExpr {
     Log(NftLog),
     /// `reject`, as nft_reject.c.
     Reject(NftReject),
+    /// `fib`, as nft_fib.c.
+    Fib(NftFib),
     /// `dynset`, as nft_dynset.c.
     Dynset(NftDynset),
     /// `match` and `target`, an extension of xtables, as nft_compat.c.
@@ -779,6 +785,7 @@ pub(super) fn nf_tables_expr_parse(
         b"flow_offload" => nft_flow_offload_init(table, data),
         b"log" => Ok(NftExpr::Log(nft_log_init(data)?)),
         b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
+        b"fib" => Ok(NftExpr::Fib(nft_fib_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
         b"match" | b"target" => {
             let target = name == b"target";
@@ -961,6 +968,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
             false,
         )),
         NftExpr::Xt(x) if x.hooks() != 0 => Some((x.hooks(), false)),
+        NftExpr::Fib(f) => Some((f.hooks(), false)),
         NftExpr::FlowOffload { .. } => Some((1 << NF_INET_FORWARD, false)),
         // As `nft_meta_get_validate_sdif` and `nft_meta_set_validate` of Linux.
         NftExpr::Meta { key: NFT_META_SDIF | NFT_META_SDIFNAME, .. } => {
@@ -1847,6 +1855,7 @@ fn nft_eval(
             NftExpr::Quota(q) => nft_quota_eval(q, regs, skb),
             NftExpr::Connlimit(c) => nft_connlimit_eval(c, regs, skb),
             NftExpr::Log(l) => nft_log_eval(l, skb, state),
+            NftExpr::Fib(f) => nft_fib_eval(f, regs, skb.data(), skb.mark, pkt.l4proto, state),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {
                 regs.verdict = if nft_expr_hooks(e).is_some_and(|(m, _)| m & 1 << state.hook == 0) {
