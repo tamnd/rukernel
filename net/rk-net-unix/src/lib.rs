@@ -237,6 +237,10 @@ struct State {
     passcred: bool,
     passsec: bool,
     passpidfd: bool,
+    /// The socket of a connection that `accept` did not take, which has no file yet. A message
+    /// to it gets the credentials of the sender, as `!other->sk_socket` in `maybe_add_creds`
+    /// of Linux, because the receiver can set `SO_PASSCRED` only after the accept.
+    embryo: bool,
     peek_off: i32,
     options: Options,
     /// The program of `SO_ATTACH_BPF`, which filters the datagrams that the socket receives.
@@ -311,6 +315,7 @@ impl Unix {
                 closed: false,
                 error: None,
                 passcred: false,
+                embryo: false,
                 passsec: false,
                 passpidfd: false,
                 peek_off: -1,
@@ -592,6 +597,7 @@ impl Unix {
                 n.conn = Conn::Connected;
                 n.peer = Some(self.me());
                 n.peer_cred = Some(current_cred());
+                n.embryo = true;
                 n.addr = o.addr.clone();
                 n.path = o.path.clone();
                 n.options.sndbuf = o.options.sndbuf;
@@ -609,12 +615,15 @@ impl Unix {
     }
 
     /// Tells if a message to `peer` gets the credentials of the sender: `SO_PASSCRED` or
-    /// `SO_PASSPIDFD` is set on this socket or on `peer`.
+    /// `SO_PASSPIDFD` is set on this socket or on `peer`, or `accept` did not take `peer` yet.
     fn may_passcred(&self, peer: &Self) -> bool {
         // The lock of this socket goes before the lock of the peer is taken. Two sockets that
         // send to each other on two CPUs then do not wait for each other.
         let mine = self.state.lock().may_passcred();
-        mine || peer.state.lock().may_passcred()
+        mine || {
+            let p = peer.state.lock();
+            p.may_passcred() || p.embryo
+        }
     }
 
     /// The send of a stream socket: the data goes in pieces into the queue of the peer.
@@ -768,7 +777,8 @@ impl Unix {
                 return if nonblock { Err(Errno::EAGAIN) } else { Ok(None) };
             }
             let Some(msg) = msg.take() else { return Ok(Some(())) };
-            let cred = msg.cred.or_else(|| (passcred || o.may_passcred()).then(current_cred));
+            let add = passcred || o.may_passcred() || o.embryo;
+            let cred = msg.cred.or_else(|| add.then(current_cred));
             let from = if Arc::ptr_eq(&other, &me) { o.addr.clone() } else { my_addr.clone() };
             o.queue.push_back(Packet {
                 data: msg.data,
@@ -1128,6 +1138,7 @@ impl Socket for Unix {
                 let mut n = new.state.lock();
                 n.passcred = s.passcred;
                 n.passpidfd = s.passpidfd;
+                n.embryo = false;
                 drop(n);
                 return Ok(Some(new));
             }
