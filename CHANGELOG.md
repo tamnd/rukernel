@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.33] - 2026-11-15
+
 ### Added
 
 - nf_tables: the expression `fib`, as nft_fib.c, nft_fib_ipv4.c and nft_fib_ipv6.c of Linux. It gives the type of an address of the packet, or the device that the route to an address goes out on, for example `fib saddr . iif oif missing drop` of firewalld. The stack of IPv4 and IPv6 does the route lookups (#542).
@@ -1689,6 +1691,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.33]: https://github.com/tamnd/rukernel/compare/v0.5.32...v0.5.33
 [0.5.32]: https://github.com/tamnd/rukernel/compare/v0.5.31...v0.5.32
 [0.5.31]: https://github.com/tamnd/rukernel/compare/v0.5.30...v0.5.31
 [0.5.30]: https://github.com/tamnd/rukernel/compare/v0.5.29...v0.5.30
