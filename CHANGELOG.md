@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- Each network interface has the directory `queues` in sysfs, with `rx-0` and `tx-0`, as Linux. `queues/rx-0/rps_cpus` gives the mask of the CPUs of Receive Packet Steering in the format `%*pb`, and a write sets it with the rules of `bitmap_parse` and `store_rps_map` of Linux. Before this, udev could not apply `ReceivePacketSteeringCPUMask=` of a .link file, and the file was missing (#538).
+
 ## [0.5.31] - 2026-11-15
 
 ### Added
@@ -24,7 +28,6 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - A process can set the hardware address of a dummy, veth or TAP device with `IFLA_ADDRESS` in `RTM_NEWLINK` and `RTM_SETLINK`, and with `SIOCSIFHWADDR`, as `eth_mac_addr` of Linux. A multicast or zero address gives `EADDRNOTAVAIL`, a wrong family gives `EINVAL`, and the other devices give `EOPNOTSUPP`. The change sends `RTM_NEWLINK`. `addr_assign_type` in sysfs is now 1 for a random address and 3 for a set address, so udev applies `MACAddressPolicy=` as on Linux, and `IFLA_PERM_ADDRESS` is only for a device with a permanent address. Before this, `MACAddress=` of a systemd-networkd netdev had no effect (#538).
-- Each network interface has the directory `queues` in sysfs, with `rx-0` and `tx-0`, as Linux. `queues/rx-0/rps_cpus` gives the mask of the CPUs of Receive Packet Steering in the format `%*pb`, and a write sets it with the rules of `bitmap_parse` and `store_rps_map` of Linux. Before this, udev could not apply `ReceivePacketSteeringCPUMask=` of a .link file, and the file was missing (#538).
 
 ## [0.5.29] - 2026-11-14
 
