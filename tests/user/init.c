@@ -16201,6 +16201,8 @@ static void test_apparmor(void)
 		char size[32];
 		char *five[] = { "rk-test", "deny", size, NULL };
 		int i, at = -1;
+		char want[256];
+		pid_t aa_pid = -1;
 
 		fd = open("/etc/rk_test.aa", O_RDONLY);
 		n = fd >= 0 ? read(fd, big, sizeof(big)) : -1;
@@ -16232,6 +16234,38 @@ static void test_apparmor(void)
 			_exit(write(two, "changeprofile rk_test//hat1", 27) < 0 && errno == EACCES && write(two, "changeprofile rk_none", 21) < 0 && errno == ENOENT ? 0 : 1);
 		}
 		check("apparmor: in enforce mode, a change_profile that the rules do not allow gives EACCES", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		{
+			/* The records of AppArmor go to auditd and to the group AUDIT_NLGRP_READLOG, as auditd and journald read them (#540, item 7). */
+			/* AUDIT_SET makes a record AUDIT_CONFIG_CHANGE only when audit is on (audit_do_config_change of Linux), and on Linux the record comes after the ack, through kauditd. So the checks read only the ack, and audit_wait skips the record. */
+			struct sockaddr_nl g = { .nl_family = AF_NETLINK, .nl_groups = 1 };
+			uint32_t set[11] = { 4 };
+			int ad = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_AUDIT);
+			int rd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_AUDIT);
+			char rec[1024], grp[1024];
+			int m, r;
+
+			set[3] = getpid();
+			check("apparmor: a process registers as auditd", ad >= 0 && rd >= 0 && bind(rd, (struct sockaddr *)&g, sizeof(g)) == 0 && audit_send(ad, 1001, set, sizeof(set)) == 0 && audit_ack(ad) == 0);
+			aa_pid = fork();
+			if (aa_pid == 0) {
+				int one = open("/proc/self/attr/current", O_WRONLY);
+
+				if (one < 0 || write(one, "changeprofile rk_test", 21) != 21)
+					_exit(2);
+				_exit(open("/etc/rk_test.aa", O_RDONLY) < 0 && errno == EACCES ? 0 : 1);
+			}
+			check("apparmor: in enforce mode, an open that the rules do not allow gives EACCES", aa_pid > 0 && waitpid(aa_pid, &status, 0) == aa_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+			snprintf(want, sizeof(want), "): apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=%d comm=\"init\" requested_mask=\"r\" denied_mask=\"r\" fsuid=0 ouid=0", aa_pid);
+			m = audit_wait(ad, 1400, rec, sizeof(rec));
+			check("apparmor: the denial goes to auditd as a record of the type AVC, with the length of the text in nlmsg_len, as on Linux", m > 0 && ((struct nlmsghdr *)rec)->nlmsg_len == (uint32_t)(m - NLMSG_HDRLEN) && strncmp(rec + NLMSG_HDRLEN, "audit(", 6) == 0 && strstr(rec + NLMSG_HDRLEN, want) != NULL);
+			r = audit_wait(rd, 1400, grp, sizeof(grp));
+			check("apparmor: the group AUDIT_NLGRP_READLOG gets the same record, with the full length in nlmsg_len, as on Linux", r == m && m > 0 && ((struct nlmsghdr *)grp)->nlmsg_len == (uint32_t)r && strcmp(grp + NLMSG_HDRLEN, rec + NLMSG_HDRLEN) == 0);
+			set[3] = 0;
+			audit_send(ad, 1001, set, sizeof(set));
+			check("apparmor: auditd stops itself", audit_ack(ad) == 0);
+			close(ad);
+			close(rd);
+		}
 		n = klogctl(3, buf, sizeof(buf) - 1);
 		buf[n > 0 ? n : 0] = 0;
 		check("apparmor: the kernel log has the denials, as on Linux", n > 0 && strstr(buf, "apparmor=\"DENIED\" operation=\"open\" class=\"file\" profile=\"rk_test\" name=\"/etc/rk_test.aa\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"file_lock\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-aa-w\" pid=") != NULL && strstr(buf, "apparmor=\"DENIED\" operation=\"exec\" class=\"file\" profile=\"rk_test\" name=\"/tmp/rk-sub\" pid=") != NULL);
@@ -16240,6 +16274,8 @@ static void test_apparmor(void)
 		check("apparmor: the kernel log has the denials of the capabilities, as on Linux", strstr(buf, "apparmor=\"DENIED\" operation=\"capable\" class=\"cap\" profile=\"rk_test\" pid=") != NULL && strstr(buf, " capability=18  capname=\"sys_chroot\"") != NULL && strstr(buf, " capability=21  capname=\"sys_admin\"") != NULL);
 		check("apparmor: the kernel log has the denial of the signal, as on Linux", strstr(buf, "apparmor=\"DENIED\" operation=\"signal\" class=\"signal\" profile=\"rk_test\" pid=") != NULL && strstr(buf, " requested_mask=\"send\" denied_mask=\"send\" signal=exists peer=\"unconfined\"") != NULL);
 		check("apparmor: the kernel log has the denials of the ptrace of the tracer and of the tracee, as on Linux", strstr(buf, "apparmor=\"DENIED\" operation=\"ptrace\" class=\"ptrace\" profile=\"rk_test\" pid=") != NULL && strstr(buf, " requested_mask=\"trace\" denied_mask=\"trace\" peer=\"rk_test\"") != NULL && strstr(buf, " requested_mask=\"tracedby\" denied_mask=\"tracedby\" peer=\"rk_test\"") != NULL);
+		snprintf(want, sizeof(want), "name=\"/etc/rk_test.aa\" pid=%d ", aa_pid);
+		check("apparmor: a record that goes to auditd does not go to the kernel log, as on Linux", aa_pid > 0 && strstr(buf, want) == NULL);
 		check("apparmor: the kernel log has the missing profile in enforce mode", strstr(buf, "apparmor=\"DENIED\" operation=\"change_profile\" class=\"file\" info=\"label not found\" error=-2 profile=\"rk_test\" name=\"rk_none\" pid=") != NULL);
 	}
 	check("apparmor: a remove of rk_test removes its children", aa_write("/sys/kernel/security/apparmor/.remove", "rk_test", 7, 0) == 0 && aa_read("/sys/kernel/security/apparmor/profiles", buf, 64) == 0);

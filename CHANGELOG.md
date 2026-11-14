@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The `apparmor` boot test checks that the records of AppArmor go to auditd and to the group `AUDIT_NLGRP_READLOG` through `NETLINK_AUDIT`, with the fields of Linux. A record that goes to auditd does not go to the kernel log, as `kauditd_thread` of Linux (#540).
+
 ### Fixed
 
 - Each network interface has the directory `queues` in sysfs, with `rx-0` and `tx-0`, as Linux. `queues/rx-0/rps_cpus` gives the mask of the CPUs of Receive Packet Steering in the format `%*pb`, and a write sets it with the rules of `bitmap_parse` and `store_rps_map` of Linux. Before this, udev could not apply `ReceivePacketSteeringCPUMask=` of a .link file, and the file was missing (#538).
