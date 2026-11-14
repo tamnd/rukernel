@@ -69,6 +69,10 @@ pub fn init() {
     rk_net::netfilter::init();
     rk_net::netfilter::nf_nat::nf_nat_set_src_fn(stack::nat_src);
     rk_net::netfilter::nf_reject::nf_reject_set_fn(stack::nf_reject);
+    rk_net::netfilter::nf_tables_api::nft_fib_set_fns(
+        stack::nft_fib_route,
+        stack::nft_fib_addr_type,
+    );
     rtnl::init();
     rules::init();
     nexthop::init();

@@ -19,7 +19,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use rk_abi::Errno;
 use rk_abi::native::if_ether::{ETH_P_ARP, ETH_P_IP, ETH_P_IPV6};
-use rk_abi::native::rtnetlink::{RT_SCOPE_LINK, RT_SCOPE_UNIVERSE};
+use rk_abi::native::rtnetlink::{
+    RT_SCOPE_LINK, RT_SCOPE_UNIVERSE, RTN_BLACKHOLE, RTN_BROADCAST, RTN_LOCAL, RTN_MULTICAST,
+    RTN_PROHIBIT, RTN_THROW, RTN_UNICAST, RTN_UNREACHABLE, RTN_UNSPEC,
+};
 use rk_abi::native::socket::SO_BINDTOIFINDEX;
 use rk_frame::sync::SpinLock;
 use rk_net::arp::ArpPacket;
@@ -33,6 +36,7 @@ use rk_net::consts::{
 use rk_net::dev::{self, LinkKind, NetDevice};
 use rk_net::ether::{EthHeader, MacAddr};
 use rk_net::netfilter::nf_reject::{NfReject, nf_reject_tcp_rst};
+use rk_net::netfilter::nf_tables_api::NftFibFlow;
 use rk_net::netfilter::{
     NF_INET_LOCAL_IN, NF_INET_LOCAL_OUT, NF_INET_POST_ROUTING, NF_INET_PRE_ROUTING, NFPROTO_IPV4,
     nf_hook, nf_hook_active,
@@ -735,6 +739,70 @@ pub(crate) fn nat_src(pf: u8, ifindex: u32, dst: &[u8; 16]) -> Option<[u8; 16]> 
     let src = ROUTES.lock().select_addr(ifindex, d, RT_SCOPE_UNIVERSE as u8)?;
     a[..4].copy_from_slice(&src);
     Some(a)
+}
+
+/// The flow of the rules for a lookup of the nf_tables expression `fib`. An input interface of
+/// 0 is the loopback device.
+fn fib_flow(fl: &NftFibFlow, loopback: u32) -> crate::rules::Flow {
+    crate::rules::Flow {
+        dst: fl.dst,
+        src: fl.src,
+        iif: if fl.iif == 0 { loopback } else { fl.iif },
+        oif: fl.oif,
+        mark: fl.mark,
+        tos: fl.tos,
+        proto: fl.proto,
+        flowlabel: fl.flowlabel,
+        ..crate::rules::Flow::default()
+    }
+}
+
+/// The route of a lookup of the nf_tables expression `fib`: the type of the route and its
+/// interface, as `fib_lookup` in `nft_fib4_eval` and `ip6_route_lookup` in `nft_fib6_eval` of
+/// Linux. A route that rejects gives `None`.
+pub(crate) fn nft_fib_route(pf: u8, fl: &NftFibFlow) -> Option<(u32, u32)> {
+    if pf == rk_net::netfilter::NFPROTO_IPV6 {
+        let t = crate::stack6::ROUTES6.lock();
+        let (n, r) = t.lookup_flow(&fib_flow(fl, t.loopback())).ok()?;
+        let ty = if n.local { RTN_LOCAL } else { r.map_or(RTN_UNICAST, |r| u32::from(r.kind)) };
+        return Some((ty, n.ifindex));
+    }
+    let t = ROUTES.lock();
+    let (n, r) = t.lookup_flow(&fib_flow(fl, t.loopback())).ok()?;
+    let ty = match (n.local, n.broadcast) {
+        (true, _) => RTN_LOCAL,
+        (_, true) => RTN_BROADCAST,
+        _ => r.map_or(RTN_UNICAST, |r| u32::from(r.kind)),
+    };
+    Some((ty, n.ifindex))
+}
+
+/// The type of the destination of a lookup of the nf_tables expression `fib` on the interface
+/// `dev` (0 for any), as `inet_dev_addr_type` in `nft_fib4_eval_type` and
+/// `__nft_fib6_eval_type` of Linux.
+pub(crate) fn nft_fib_addr_type(pf: u8, dev: u32, fl: &NftFibFlow) -> u32 {
+    if pf != rk_net::netfilter::NFPROTO_IPV6 {
+        let mut a = [0u8; 4];
+        a.copy_from_slice(&fl.dst[..4]);
+        return ROUTES.lock().dev_addr_type(a, dev);
+    }
+    let t = crate::stack6::ROUTES6.lock();
+    let local = dev != 0 && t.addrs_of(dev).any(|a| a.addr == fl.dst);
+    let n = match t.lookup_flow(&fib_flow(fl, t.loopback())) {
+        Ok((n, _)) => n,
+        Err(Errno::EINVAL) => return RTN_BLACKHOLE,
+        Err(Errno::EACCES) => return RTN_PROHIBIT,
+        Err(Errno::EAGAIN) => return RTN_THROW,
+        Err(_) => return RTN_UNREACHABLE,
+    };
+    if local || (dev == 0 && n.local) {
+        return RTN_LOCAL;
+    }
+    match fl.dst {
+        [0xff, ..] => RTN_MULTICAST,
+        a if a == [0; 16] => RTN_UNSPEC,
+        _ => RTN_UNICAST,
+    }
 }
 
 /// Sends the answer of the nf_tables expression `reject` to `packet`, as `nf_send_unreach`,

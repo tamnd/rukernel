@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- nf_tables: the expression `fib`, as nft_fib.c, nft_fib_ipv4.c and nft_fib_ipv6.c of Linux. It gives the type of an address of the packet, or the device that the route to an address goes out on, for example `fib saddr . iif oif missing drop` of firewalld. The stack of IPv4 and IPv6 does the route lookups (#542).
+
 ## [0.5.32] - 2026-11-15
 
 ### Added

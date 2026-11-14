@@ -17,6 +17,7 @@ mod nf_tables_core;
 
 #[cfg(test)]
 pub(crate) use self::nf_tables_core::nft_log_line;
+pub use self::nf_tables_core::{NftFibFlow, NftFibRouteFn, NftFibTypeFn, nft_fib_set_fns};
 pub(crate) use self::nf_tables_core::{NftLog, nft_log_eval};
 
 use self::nf_tables_core::{
