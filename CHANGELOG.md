@@ -11,6 +11,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - Each network interface has the directory `queues` in sysfs, with `rx-0` and `tx-0`, as Linux. `queues/rx-0/rps_cpus` gives the mask of the CPUs of Receive Packet Steering in the format `%*pb`, and a write sets it with the rules of `bitmap_parse` and `store_rps_map` of Linux. Before this, udev could not apply `ReceivePacketSteeringCPUMask=` of a .link file, and the file was missing (#538).
+- nf_tables: a rule can jump to a binding chain, as `nft` does for `jump { ... }`. A dump of the rule gives the name of the chain, as `nft_data_dump` of Linux. The chain goes when the rule that jumps to it goes, and a batch with a new binding chain that no rule jumps to fails with `EINVAL`, as on Linux. A set that `dynset` fills gets a size of 65535 if it has none, as `nft_dynset_init` of Linux (#542).
 
 ## [0.5.31] - 2026-11-15
 

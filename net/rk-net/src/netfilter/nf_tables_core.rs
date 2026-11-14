@@ -21,8 +21,9 @@ use super::{
     DynElem, NF_DROP, NFPROTO_IPV6, NFT_BREAK, NFT_CONTINUE, NFT_DATA_VALUE_MAXLEN,
     NFT_DATA_VERDICT, NFT_GOTO, NFT_JUMP, NFT_RETURN, NFT_SET_ANONYMOUS, NFT_SET_CONSTANT,
     NFT_SET_ELEM_INTERVAL_END, NFT_SET_EVAL, NFT_SET_INTERVAL, NFT_SET_MAP, NFT_SET_OBJECT,
-    NFT_SET_TIMEOUT, NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NftChainType, NftData,
-    NftTable, be32, be64, cstr, nft_set_lookup_global, nft_verdict_init,
+    NFT_SET_TIMEOUT, NFTA_DATA_MAX, NFTA_DATA_VALUE, NFTA_DATA_VERDICT, NFTA_VERDICT_CHAIN,
+    NFTA_VERDICT_CHAIN_ID, NftChainType, NftData, NftTable, be32, be64, cstr,
+    nft_set_lookup_global, nft_verdict_init,
 };
 use crate::buf::NetBuf;
 use crate::consts::IFNAMSIZ;
@@ -346,6 +347,23 @@ pub(super) struct NftDynset {
     exprs: Vec<NftObjState>,
 }
 
+impl NftDynset {
+    /// A `dynset` that adds the key in register 1 to the set `set`.
+    #[cfg(test)]
+    pub(super) fn add(set: u64) -> Self {
+        Self {
+            set,
+            op: 0,
+            sreg_key: 1,
+            klen: 4,
+            sreg_data: None,
+            timeout: 0,
+            invert: false,
+            exprs: Vec::new(),
+        }
+    }
+}
+
 /// Reads a `dynset` expression, as `nft_dynset_init` of Linux.
 fn nft_dynset_init(table: &NftTable, data: &[u8]) -> Result<NftExpr> {
     let a = Attrs::parse(data, NFTA_DYNSET_MAX);
@@ -493,11 +511,19 @@ fn nla_raw(b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
 /// the rule can give a name with `%d` or only the ID of the set in the batch, as `nft` does for
 /// an anonymous set, and `nft` then finds the set in the dump with its real name. The ID is not
 /// in the dump. An `objref` gives the name of its object with a NUL byte, as `nla_put_string`:
-/// libnftnl puts the name with no NUL byte, and a name of 8 bytes then has no padding. The
-/// other expressions give the bytes of the rule.
+/// libnftnl puts the name with no NUL byte, and a name of 8 bytes then has no padding. An
+/// `immediate` with a jump gives the name of its chain, as `nft_data_dump`: `nft` gives only
+/// the ID of a binding chain, and the binding chain gets its name in the kernel. The other
+/// expressions give the bytes of the rule.
 pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec<u8> {
     let set_name = |set| table.sets.iter().find(|s| s.handle == set).map(|s| &s.name[..]);
     let (name, name_ty, id_ty) = match expr {
+        NftExpr::Immediate { data: NftImm::Verdict { chain: Some(c), .. }, .. } => {
+            let mut b = Builder::new(0, 0, 0, 0);
+            let path = [NFTA_EXPR_DATA, NFTA_IMMEDIATE_DATA, NFTA_DATA_VERDICT];
+            nft_verdict_chain_dump(&mut b, nla, &path, table.chain_name(*c));
+            return b.finish()[HDRLEN..].to_vec();
+        }
         NftExpr::Lookup { set, .. } => (set_name(*set), NFTA_LOOKUP_SET, NFTA_LOOKUP_SET_ID),
         NftExpr::Dynset(d) => (set_name(d.set), NFTA_DYNSET_SET_NAME, NFTA_DYNSET_SET_ID),
         NftExpr::ObjrefMap { set, .. } => {
@@ -533,6 +559,26 @@ pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec
     b.finish()[HDRLEN..].to_vec()
 }
 
+/// Copies the attributes `nla` to `b`, with the name `chain` in place of the chain of the
+/// verdict at the end of the nested attributes `path`.
+fn nft_verdict_chain_dump(b: &mut Builder, nla: &[u8], path: &[u32], chain: &[u8]) {
+    for (ty, data) in nla_raw(nla) {
+        match (u32::from(ty & NLA_TYPE_MASK as u16), path) {
+            (t, [p, rest @ ..]) if t == *p => {
+                let at = b.nest(ty);
+                nft_verdict_chain_dump(b, data, rest, chain);
+                b.end_nest(at);
+            }
+            (NFTA_VERDICT_CHAIN | NFTA_VERDICT_CHAIN_ID, []) => {
+                b.put(NFTA_VERDICT_CHAIN as u16, &cstr(chain));
+            }
+            _ => {
+                b.put(ty, data);
+            }
+        }
+    }
+}
+
 /// Reads an expression of a rule of `table`, as `nf_tables_expr_parse` and the `init` of each
 /// expression of Linux.
 pub(super) fn nf_tables_expr_parse(
@@ -551,7 +597,7 @@ pub(super) fn nf_tables_expr_parse(
             if be32(&a, NFTA_IMMEDIATE_DREG)? == Some(NFT_REG_VERDICT) {
                 let v = Attrs::parse(d, NFTA_DATA_MAX);
                 let Some(v) = v.get(NFTA_DATA_VERDICT) else { return Err(Errno::EINVAL) };
-                let NftData::Verdict { code, chain } = nft_verdict_init(table, v)? else {
+                let NftData::Verdict { code, chain } = nft_verdict_init(table, v, false)? else {
                     return Err(Errno::EINVAL);
                 };
                 return Ok(NftExpr::Immediate { dreg: 0, data: NftImm::Verdict { code, chain } });
