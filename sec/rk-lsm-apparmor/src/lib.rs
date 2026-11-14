@@ -50,8 +50,8 @@ use rk_vfs::dentry::Location;
 use rk_vfs::file::File;
 use rk_vfs::inode::Result;
 use rk_vfs::security::{
-    self, BlobSizes, Bprm, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order, SecurityHooks,
-    Sock, Task, id,
+    self, BlobSizes, Bprm, ExecFiles, FLAG_EXCLUSIVE, FLAG_LEGACY_MAJOR, LsmId, LsmInfo, Order,
+    SecurityHooks, Sock, Task, id,
 };
 
 /// The hooks of AppArmor. A hook gives the error of a denial of a profile in enforce mode.
@@ -151,6 +151,10 @@ impl SecurityHooks for AppArmor {
 
     fn bprm_creds_for_exec(&self, bprm: &mut Bprm<'_>) -> Result<()> {
         domain::bprm_creds_for_exec(bprm)
+    }
+
+    fn bprm_committing_creds(&self, bprm: &Bprm<'_>, files: &mut ExecFiles) {
+        file::inherit_files(bprm, files);
     }
 
     fn file_alloc_security(&self, f: &File) {

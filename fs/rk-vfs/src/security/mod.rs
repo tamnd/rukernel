@@ -24,6 +24,7 @@ use crate::dentry::Location;
 use crate::file::File;
 use crate::inode::{Inode, Result};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
@@ -342,6 +343,36 @@ pub struct Bprm<'a> {
     pub tracer: Option<&'a Cred>,
 }
 
+/// The open files of a process at `bprm_committing_creds`, as `current->files` in
+/// `aa_inherit_files` of Linux. A module can revoke a file that the new program must not use.
+/// The exec then puts a file of `/dev/null` in place of the file, as `replace_fd` of Linux.
+pub struct ExecFiles {
+    files: Vec<(i32, Arc<File>)>,
+    revoked: Vec<i32>,
+}
+
+impl ExecFiles {
+    /// The files `files` with their descriptors.
+    pub fn new(files: Vec<(i32, Arc<File>)>) -> Self {
+        Self { files, revoked: Vec::new() }
+    }
+
+    /// Calls `keep` for each file that is not revoked, and revokes the file if `keep` gives
+    /// false, as `iterate_fd` with `match_file` of Linux.
+    pub fn revalidate(&mut self, mut keep: impl FnMut(&File) -> bool) {
+        for (fd, file) in &self.files {
+            if !self.revoked.contains(fd) && !keep(file) {
+                self.revoked.push(*fd);
+            }
+        }
+    }
+
+    /// The descriptors of the revoked files.
+    pub fn revoked(&self) -> &[i32] {
+        &self.revoked
+    }
+}
+
 /// A socket for the hooks, as `struct socket` of Linux.
 pub struct Sock<'a> {
     /// The address family, `AF_*`.
@@ -426,9 +457,9 @@ pub fn bprm_check(bprm: &mut Bprm<'_>) -> Result<()> {
     call_int_hook!(bprm_check_security, &mut *bprm)
 }
 
-/// `security_bprm_committing_creds`.
-pub fn bprm_committing_creds(bprm: &Bprm<'_>) {
-    call_void_hook!(bprm_committing_creds, bprm);
+/// `security_bprm_committing_creds`. `files` has the open files of the process.
+pub fn bprm_committing_creds(bprm: &Bprm<'_>, files: &mut ExecFiles) {
+    call_void_hook!(bprm_committing_creds, bprm, &mut *files);
 }
 
 /// `security_bprm_committed_creds`.

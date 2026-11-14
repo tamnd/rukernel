@@ -7,7 +7,7 @@
 //! module of Linux puts only some hooks in its `security_hook_list`.
 
 use super::blob::{Blob, IpcSecurity};
-use super::{Bprm, Sock, Task};
+use super::{Bprm, ExecFiles, Sock, Task};
 use crate::cred::{Cred, IpcOwner};
 use crate::dentry::Location;
 use crate::file::File;
@@ -353,8 +353,9 @@ pub trait SecurityHooks: Sync {
         Ok(())
     }
 
-    /// `bprm_committing_creds`: the process gets the new credentials now.
-    fn bprm_committing_creds(&self, bprm: &Bprm<'_>) {}
+    /// `bprm_committing_creds`: the process gets the new credentials now. A module can revoke
+    /// the open files in `files` that the new program must not use.
+    fn bprm_committing_creds(&self, bprm: &Bprm<'_>, files: &mut ExecFiles) {}
 
     /// `bprm_committed_creds`: the process has the new credentials, which are now the current
     /// credentials. `filename` and `file` are the program, as in [`Bprm`].

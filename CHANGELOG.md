@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- At an exec that changes the label, AppArmor checks each open file again with the new label, as `aa_inherit_files` of Linux. The exec puts a file of `/dev/null` in place of each file that the new label cannot use. The security modules get the open files in the hook `bprm_committing_creds` (#540).
+
 ## [0.5.29] - 2026-11-14
 
 ### Added
