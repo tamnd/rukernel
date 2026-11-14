@@ -128,6 +128,8 @@ const NFT_MSG_MAX: usize = 34;
 const NFT_NAME_MAXLEN: usize = 256;
 /// The longest user data, `NFT_USERDATA_MAXLEN`.
 const NFT_USERDATA_MAXLEN: usize = 256;
+/// The size that `nft_dynset_init` of Linux gives to a set with no size.
+const NFT_DYNSET_DEFAULT_SIZE: u32 = 0xffff;
 /// The longest name of a chain type, `NFT_MODULE_AUTOLOAD_LIMIT`.
 const NFT_MODULE_AUTOLOAD_LIMIT: usize = 64 - "nft-chain-255-".len();
 
@@ -816,6 +818,30 @@ impl NftTable {
         (rules + refs + jumps) as u32
     }
 
+    /// A rule jumps to the chain `handle`. For a binding chain this is `nft_chain_is_bound` of
+    /// Linux; a regular chain with a jump to it is not bound.
+    fn chain_bound(&self, handle: u64) -> bool {
+        self.chains
+            .iter()
+            .flat_map(|c| c.rules.iter())
+            .flat_map(|r| r.parsed.iter())
+            .any(|e| e.jump_target() == Some(handle))
+    }
+
+    /// The binding chains that no rule jumps to go, as `nft_immediate_deactivate` of Linux
+    /// does with the chain of a rule that goes. A new binding chain must have a jump to it.
+    fn nft_chain_unbind(&mut self) -> Result<()> {
+        let unbound =
+            |t: &Self, c: &NftChain| c.flags & NFT_CHAIN_BINDING != 0 && !t.chain_bound(c.handle);
+        if self.chains.iter().any(|c| c.txn_id.is_some() && unbound(self, c)) {
+            return Err(Errno::EINVAL);
+        }
+        let keep: Vec<bool> = self.chains.iter().map(|c| !unbound(self, c)).collect();
+        let mut keep = keep.into_iter();
+        self.chains.retain(|_| keep.next().unwrap_or(true));
+        Ok(())
+    }
+
     /// The set `handle` has a rule that looks it up, as `set->use` of Linux.
     fn set_in_use(&self, handle: u64) -> bool {
         self.chains.iter().flat_map(|c| c.rules.iter()).flat_map(|r| r.parsed.iter()).any(|e| {
@@ -823,6 +849,18 @@ impl NftTable {
                 | NftExpr::Dynset(NftDynset { set, .. })
                 | NftExpr::ObjrefMap { set, .. } if *set == handle)
         })
+    }
+
+    /// A set that a dynset of `exprs` fills gets a size of 0xffff if it has none, as
+    /// `nft_dynset_init` of Linux.
+    fn dynset_default_size(&mut self, exprs: &[NftExpr]) {
+        for e in exprs {
+            if let NftExpr::Dynset(NftDynset { set, .. }) = e
+                && let Some(s) = self.sets.iter_mut().find(|s| s.handle == *set && s.size == 0)
+            {
+                s.size = NFT_DYNSET_DEFAULT_SIZE;
+            }
+        }
     }
 
     /// A new handle, as `nf_tables_alloc_handle` of Linux.
@@ -1753,8 +1791,9 @@ fn nft_setelem_parse_elemkey(set: &NftSet, ea: &Attrs<'_>, flags: u32) -> Result
 }
 
 /// Reads a verdict, as `nft_verdict_init` of Linux. A jump goes to a chain of `table` that is
-/// not a base chain.
-fn nft_verdict_init(table: &NftTable, nla: &[u8]) -> Result<NftData> {
+/// not a base chain. A jump to a binding chain is not in an element (`setelem`), and the chain
+/// has no other jump to it.
+fn nft_verdict_init(table: &NftTable, nla: &[u8], setelem: bool) -> Result<NftData> {
     let tb = Attrs::parse(nla, NFTA_VERDICT_MAX);
     let Some(code) = be32(&tb, NFTA_VERDICT_CODE)? else { return Err(Errno::EINVAL) };
     let chain = match code {
@@ -1771,7 +1810,8 @@ fn nft_verdict_init(table: &NftTable, nla: &[u8]) -> Result<NftData> {
             if chain.base.is_some() {
                 return Err(Errno::EOPNOTSUPP);
             }
-            if chain.flags & NFT_CHAIN_BINDING != 0 {
+            if chain.flags & NFT_CHAIN_BINDING != 0 && (setelem || table.chain_bound(chain.handle))
+            {
                 return Err(Errno::EINVAL);
             }
             Some(chain.handle)
@@ -1786,7 +1826,7 @@ fn nft_setelem_parse_data(table: &NftTable, set: &NftSet, nla: &[u8]) -> Result<
     let tb = Attrs::parse(nla, NFTA_DATA_MAX);
     if set.datatype() == NFT_DATA_VERDICT {
         let Some(v) = tb.get(NFTA_DATA_VERDICT) else { return Err(Errno::EINVAL) };
-        return nft_verdict_init(table, v);
+        return nft_verdict_init(table, v, true);
     }
     nft_value_init(nla, set.dlen).map(NftData::Value)
 }
@@ -2093,6 +2133,9 @@ impl NftBatch {
     /// Removes a table with its rules, sets, flowtables, objects and chains, as `nft_flush_table`
     /// of Linux.
     fn nft_flush_table(&mut self, ctx: &NftCtx, t: usize) {
+        // The binding chains go with the rules that jump to them, with no notice.
+        let binding = |c: &NftChain| c.flags & NFT_CHAIN_BINDING != 0;
+        self.tables[t].chains.retain(|c| !binding(c));
         for c in 0..self.tables[t].chains.len() {
             while !self.tables[t].chains[c].rules.is_empty() {
                 self.notify_rule(ctx, NFT_MSG_DELRULE, t, c, 0);
@@ -2373,6 +2416,9 @@ impl NftBatch {
             return Err(Errno::EINVAL);
         };
         let chain = &table.chains[c];
+        if chain.flags & NFT_CHAIN_BINDING != 0 && table.chain_bound(chain.handle) {
+            return Err(Errno::EOPNOTSUPP);
+        }
         let mut old = None;
         let handle = if let Some(h) = be64(nla, NFTA_RULE_HANDLE)? {
             let r = nft_rule_lookup(chain, h).map_err(|e| bad(info, nla, NFTA_RULE_HANDLE, e))?;
@@ -2421,6 +2467,17 @@ impl NftBatch {
             for target in nft_expr_targets(table, &expr) {
                 nft_check_loops(table, chain.handle, target)?;
             }
+            // The rule binds a binding chain that it jumps to, as `nf_tables_bind_chain`.
+            if let Some(b) = expr.jump_target()
+                && table.chains.iter().any(|c| c.handle == b && c.flags & NFT_CHAIN_BINDING != 0)
+            {
+                if chain.flags & NFT_CHAIN_BINDING != 0 {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                if parsed.iter().any(|e: &NftExpr| e.jump_target() == Some(b)) {
+                    return Err(Errno::EBUSY);
+                }
+            }
             dump.put(NFTA_LIST_ELEM | NLA_F_NESTED as u16, &nft_expr_dump(table, e, &expr));
             parsed.push(expr);
         }
@@ -2431,10 +2488,14 @@ impl NftBatch {
             _ => None,
         };
         let txn_id = be32(nla, NFTA_RULE_ID)?;
+        if ctx.has(NLM_F_REPLACE) && chain.flags & NFT_CHAIN_BINDING != 0 {
+            return Err(Errno::EOPNOTSUPP);
+        }
         if parsed.iter().any(nft_expr_needs_validate) {
             self.validate = true;
         }
         let table = &mut self.tables[t];
+        table.dynset_default_size(&parsed);
         let handle = if handle == 0 { table.alloc_handle() } else { handle };
         let rule = NftRule { handle, exprs, parsed, udata, txn_id };
         let at = if let (true, Some(o)) = (ctx.has(NLM_F_REPLACE), old) {
@@ -3065,6 +3126,9 @@ impl NfnlBatch for NftBatch {
         // Each base chain must be able to have the expressions of the chains that it reaches,
         // and the jumps must not go too deep, as `nf_tables_validate` of Linux. Linux then runs
         // the batch again to give the error to the message; here the error goes to the batch.
+        for t in &mut self.tables {
+            t.nft_chain_unbind()?;
+        }
         if self.validate {
             for t in &self.tables {
                 nft_table_validate(t)?;
@@ -3398,6 +3462,94 @@ mod tests {
         t.chains.last_mut().unwrap().rules.push(rule(jump(26)));
         t.chains.push(chain(26, Vec::new()));
         assert_eq!(nft_table_validate(&t), Err(Errno::EMLINK));
+    }
+
+    #[test]
+    fn a_binding_chain_goes_with_the_rule_that_jumps_to_it() {
+        use super::nf_tables_core::NftImm;
+        let jump = |h| NftExpr::Immediate {
+            dreg: 0,
+            data: NftImm::Verdict { code: NFT_JUMP, chain: Some(h) },
+        };
+        let rule = |e: NftExpr| NftRule {
+            handle: 1,
+            exprs: Vec::new(),
+            parsed: alloc::vec![e],
+            udata: None,
+            txn_id: None,
+        };
+        let chain = |handle, flags, rules: Vec<NftRule>, txn_id| NftChain {
+            name: format!("c{handle}").into_bytes(),
+            handle,
+            flags,
+            udata: None,
+            base: None,
+            rules,
+            txn_id,
+        };
+        // c1: jump c2. c2 and c3 are binding chains, and no rule jumps to c3.
+        let mut t = table();
+        t.chains.push(chain(1, 0, alloc::vec![rule(jump(2))], None));
+        t.chains.push(chain(2, NFT_CHAIN_BINDING, Vec::new(), None));
+        t.chains.push(chain(3, NFT_CHAIN_BINDING, Vec::new(), None));
+        assert!(t.chain_bound(2) && !t.chain_bound(3));
+        t.nft_chain_unbind().unwrap();
+        assert_eq!(t.chains.iter().map(|c| c.handle).collect::<Vec<_>>(), [1, 2]);
+        // The rule goes, and its binding chain goes at the commit.
+        t.chains[0].rules.clear();
+        t.nft_chain_unbind().unwrap();
+        assert_eq!(t.chains.iter().map(|c| c.handle).collect::<Vec<_>>(), [1]);
+        // A new binding chain with no jump to it stops the commit.
+        t.chains.push(chain(4, NFT_CHAIN_BINDING, Vec::new(), Some(7)));
+        assert_eq!(t.nft_chain_unbind(), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn the_dump_of_a_jump_to_a_binding_chain_gives_the_name_of_the_chain() {
+        use super::nf_tables_core::{nf_tables_expr_parse, nft_expr_dump};
+        // `immediate` with a jump, as `nft` gives it for `jump { accept; }`: the binding chain
+        // is new in the batch, and the jump has its ID.
+        let jump = |chain: (u32, &[u8])| {
+            // NFTA_EXPR_NAME, NFTA_EXPR_DATA, NFTA_IMMEDIATE_DREG and NFTA_IMMEDIATE_DATA.
+            let nested = NLA_F_NESTED as u16;
+            let mut b = Builder::new(0, 0, 0, 0);
+            b.put(1, b"immediate\0");
+            let d = b.nest(2 | nested);
+            b.put(1, &0u32.to_be_bytes());
+            let i = b.nest(2 | nested);
+            let v = b.nest(NFTA_DATA_VERDICT as u16 | nested);
+            b.put(NFTA_VERDICT_CODE as u16, &NFT_JUMP.to_be_bytes());
+            b.put(chain.0 as u16, chain.1);
+            b.end_nest(v).end_nest(i).end_nest(d);
+            b.finish()[msg::HDRLEN..].to_vec()
+        };
+        let mut t = table();
+        t.chains.push(NftChain {
+            name: b"__chain1".to_vec(),
+            handle: 2,
+            flags: NFT_CHAIN_BINDING,
+            udata: None,
+            base: None,
+            rules: Vec::new(),
+            txn_id: Some(7),
+        });
+        let raw = jump((NFTA_VERDICT_CHAIN_ID, &7u32.to_be_bytes()));
+        let e = nf_tables_expr_parse(&t, &raw, None).unwrap();
+        // The dump has the name of the chain in place of its ID, as Linux.
+        assert_eq!(nft_expr_dump(&t, &raw, &e), jump((NFTA_VERDICT_CHAIN, b"__chain1\0")));
+    }
+
+    #[test]
+    fn a_dynset_gives_its_set_the_default_size() {
+        let mut t = table();
+        t.sets.push(set(b"a"));
+        t.sets.push(NftSet { handle: 2, size: 10, ..set(b"b") });
+        t.sets.push(NftSet { handle: 3, ..set(b"c") });
+        let d = |set| NftExpr::Dynset(NftDynset::add(set));
+        let l = NftExpr::Lookup { set: 3, sreg: 1, len: 4, invert: false, dreg: None };
+        t.dynset_default_size(&[d(1), d(2), l]);
+        let sizes: Vec<u32> = t.sets.iter().map(|s| s.size).collect();
+        assert_eq!(sizes, [0xffff, 10, 0]);
     }
 
     #[test]
