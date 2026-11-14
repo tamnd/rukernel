@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the root file system of the `systemd`, `udevd`, `networkd` and `cryptenroll` boot tests: a
-# distribution with systemd, udev, systemd-resolved, dbus and kmod, in a container of the
-# distribution. The trees of Debian and Ubuntu also have cryptsetup, systemd-cryptenroll and
+# distribution with systemd, udev, systemd-resolved, dbus, kmod and keyutils, in a container of
+# the distribution. The trees of Debian and Ubuntu also have cryptsetup, systemd-cryptenroll and
 # tpm2-tools.
 #
 # Usage: tools/systemd/build.sh OUT_FILE [ARCH [IMAGE]]
@@ -35,7 +35,7 @@ debian:* | ubuntu:*)
 apt-get update -qq >/dev/null
 DEBIAN_FRONTEND=noninteractive apt-get install -qq -y --no-install-recommends systemd kmod \
 	systemd-sysv dbus udev systemd-resolved cryptsetup-bin systemd-cryptsetup tpm2-tools \
-	libtss2-tcti-device0t64 $RK_SYSTEMD_PACKAGES >/dev/null
+	libtss2-tcti-device0t64 keyutils $RK_SYSTEMD_PACKAGES >/dev/null
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 '
@@ -43,13 +43,13 @@ rm -rf /var/lib/apt/lists/*
 fedora:*)
 	install='
 dnf -q -y install --setopt=install_weak_deps=False systemd systemd-udev systemd-resolved \
-	dbus-broker kmod gawk $RK_SYSTEMD_PACKAGES >/dev/null
+	dbus-broker kmod gawk keyutils $RK_SYSTEMD_PACKAGES >/dev/null
 dnf -q clean all
 '
 	;;
 archlinux:*)
 	install='
-pacman -Syu --noconfirm --needed systemd dbus kmod gawk $RK_SYSTEMD_PACKAGES >/dev/null
+pacman -Syu --noconfirm --needed systemd dbus kmod gawk keyutils $RK_SYSTEMD_PACKAGES >/dev/null
 pacman -Scc --noconfirm >/dev/null
 '
 	;;

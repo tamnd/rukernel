@@ -918,7 +918,11 @@ echo 'debian: done'
         // `DevicePolicy=closed`, and the open of /dev/vda must give `EPERM`. systemd does these
         // with programs of `BPF_PROG_TYPE_CGROUP_SKB` and `BPF_PROG_TYPE_CGROUP_DEVICE`.
         // `systemd-detect-virt` must give `qemu` with TCG or `kvm` with KVM, as on Linux. It reads
-        // CPUID and /sys/class/dmi/id.
+        // CPUID and /sys/class/dmi/id. With keyutils in the tree, the session keyring of the
+        // service must have the key `invocation_id` of systemd, and `keyctl request2` must make
+        // keys through the upcall to /sbin/request-key: instantiate, a payload from a pipe,
+        // negate, reject, and a `dns_resolver` key. A `big_key` key of 64 KiB must give its
+        // payload back.
         init: r#"#!/bin/sh
 set -e
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -1046,6 +1050,52 @@ if [ -e /dev/tpmrm0 ]; then
     else
         echo "rk-systemd: no full TPM2 support, $(echo "$tss" | wc -l) PCRs of tpm2_pcrread"
     fi
+fi
+# The keys. systemd gives each service its own session keyring with the key `invocation_id`, the
+# invocation ID of the unit (setup_keyring in src/core/exec-invoke.c). Then keyctl of keyutils
+# asks for keys that the kernel does not have. The kernel runs /sbin/request-key, which assumes
+# the authority of the key and runs the program of the rule in /etc/request-key.conf. The rules
+# of keyutils for `debug:*` instantiate the key, read the payload from a pipe, negate it or
+# reject it, and key.dns_resolver gives the addresses of a name.
+if command -v keyctl > /dev/null; then
+    keys=
+    ses=$(keyctl rdescribe @s)
+    echo "rk-systemd: keyctl: session keyring $ses"
+    case $ses in 'keyring;0;0;'*';_ses') ;; *) keys="$keys session" ;; esac
+    desc=$(keyctl rdescribe %user:invocation_id)
+    inv=$(keyctl pipe %user:invocation_id | od -An -tx1 | tr -d ' \n')
+    echo "rk-systemd: keyctl: $desc $inv, INVOCATION_ID $INVOCATION_ID"
+    [ "$desc" = 'user;0;0;0b0b0000;invocation_id' ] || keys="$keys invocation_id"
+    [ -n "$inv" ] && [ "$inv" = "$INVOCATION_ID" ] || keys="$keys invocation_id"
+    keyctl security @s > /dev/null || keys="$keys security"
+    req() {
+        id=$(keyctl request2 "$1" "$2" "$3" @s 2> /tmp/rk-keyctl.err)
+        echo "rk-systemd: keyctl: request2 $1 $2 $3: ${id:-$(cat /tmp/rk-keyctl.err)}" >&2
+        [ -n "$id" ] && keyctl print "$id"
+    }
+    [ "$(req user debug:rk-keys rk)" = 'Debug rk' ] || keys="$keys instantiate"
+    [ "$(req user debug:loop:rk-keys rk-pipe)" = rk-pipe ] || keys="$keys pipe"
+    req user debug:rk-negate negate > /dev/null || :
+    grep -q 'Required key not available' /tmp/rk-keyctl.err || keys="$keys negate"
+    req user debug:rk-reject rejected > /dev/null || :
+    grep -q 'Key was rejected by service' /tmp/rk-keyctl.err || keys="$keys reject"
+    req user rk-none none > /dev/null || :
+    grep -q 'Required key not available' /tmp/rk-keyctl.err || keys="$keys negate"
+    grep -qs localhost /etc/hosts || echo '127.0.0.1 localhost' >> /etc/hosts
+    case $(req dns_resolver localhost '') in *127.0.0.1*) ;; *) keys="$keys dns_resolver" ;; esac
+    head -c 65536 /dev/urandom > /tmp/rk-big
+    big=$(keyctl padd big_key rk-big @s < /tmp/rk-big)
+    keyctl pipe "$big" | cmp -s - /tmp/rk-big || keys="$keys big_key"
+    if [ -n "$keys" ]; then
+        sed 's/^/rk-systemd: keyctl: /' /proc/keys
+        journalctl -b --no-pager -t request-key -t key.dns_resolver | tail -n 20 |
+            sed 's/^/rk-systemd: keyctl: /'
+        other="$other keyctl:$(echo $keys | tr ' ' ,)"
+    else
+        echo 'rk-systemd: keyctl: the keys pass'
+    fi
+else
+    echo 'rk-systemd: keyctl: no keyutils in the tree, see tools/systemd/build.sh'
 fi
 failed=$(systemctl list-units --failed --no-legend --plain | awk '{print $1}')
 for unit in $failed; do
