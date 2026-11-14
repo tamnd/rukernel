@@ -389,6 +389,30 @@ impl TunFile {
         }
     }
 
+    /// The device of the file, also if `IFF_DETACH_QUEUE` took its queue off, as `tun_get` of
+    /// Linux: the ioctls of a detached file act on its device. Gives `EBADFD` if the file has
+    /// no device.
+    fn bound(&self) -> Result<(Arc<Tun>, Arc<NetDevice>)> {
+        let a = self.attached.lock().clone();
+        match a {
+            Some((tun, dev)) if !tun.gone.load(Ordering::Relaxed) => Ok((tun, dev)),
+            _ => Err(Errno::EBADFD),
+        }
+    }
+
+    /// Sets or clears `IFF_PERSIST`, for `TUNSETPERSIST`. A persistent device stays after its
+    /// last file closes.
+    pub(crate) fn set_persist(&self, on: bool) -> Result<()> {
+        let (tun, _) = self.bound()?;
+        let mut c = tun.config.lock();
+        if on {
+            c.flags |= IFF_PERSIST;
+        } else {
+            c.flags &= !IFF_PERSIST;
+        }
+        Ok(())
+    }
+
     /// The device of a file that `IFF_DETACH_QUEUE` took off, as `tfile->detached` of Linux.
     fn detached(&self) -> Option<Arc<Tun>> {
         let a = self.attached.lock();
@@ -712,7 +736,7 @@ impl FileOps for TunFile {
                 return Ok(0);
             }
             TUNSETIFINDEX => {
-                if self.device().is_ok() {
+                if self.bound().is_ok() {
                     return Err(Errno::EPERM);
                 }
                 let v = read_int(mem, arg)?;
@@ -724,7 +748,10 @@ impl FileOps for TunFile {
             }
             _ => {}
         }
-        let (tun, dev) = self.device()?;
+        // A detached file has its device, as `tun_get` in `__tun_chr_ioctl` of Linux. Thus
+        // systemd-networkd can make a persistent device with `MultiQueue=`: it detaches the
+        // queue with `TUNSETQUEUE` and then sends `TUNSETPERSIST`.
+        let (tun, dev) = self.bound()?;
         match cmd {
             TUNGETIFF => {
                 let mut req = [0u8; IFREQ];
@@ -736,12 +763,7 @@ impl FileOps for TunFile {
             }
             TUNSETNOCSUM | TUNSETDEBUG => Ok(0),
             TUNSETPERSIST => {
-                let mut c = tun.config.lock();
-                if arg != 0 {
-                    c.flags |= IFF_PERSIST;
-                } else {
-                    c.flags &= !IFF_PERSIST;
-                }
+                self.set_persist(arg != 0)?;
                 Ok(0)
             }
             TUNSETOWNER => {

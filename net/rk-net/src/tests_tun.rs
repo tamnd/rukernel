@@ -124,3 +124,24 @@ fn multi_queue_devices_spread_frames_and_detach_queues() {
     drop(_in);
     drop(net);
 }
+
+#[test]
+fn a_detached_file_makes_its_device_persistent() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let net = ns::new().unwrap();
+    let _in = ns::enter(&net);
+    // A file without a device has nothing to change.
+    let f = TunFile::new(net.clone());
+    assert_eq!(f.set_persist(true).err(), Some(Errno::EBADFD));
+    // As systemd-networkd with `MultiQueue=yes`: `TUNSETIFF`, `TUNSETQUEUE` with
+    // `IFF_DETACH_QUEUE`, `TUNSETPERSIST`, and then the close of the file.
+    f.set_iff("pq0", IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE).unwrap();
+    f.set_queue(IFF_DETACH_QUEUE).unwrap();
+    assert_eq!(f.device().err(), Some(Errno::EBADFD));
+    f.set_persist(true).unwrap();
+    drop(f);
+    let dev = dev::by_name("pq0").unwrap();
+    dev::unregister(&dev);
+    assert!(dev::by_name("pq0").is_none());
+}
