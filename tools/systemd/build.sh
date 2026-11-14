@@ -16,6 +16,9 @@
 # missing files of the image from the boot log. RK_SYSTEMD_PACKAGES adds more packages of the
 # distribution to the tree. The `sdbpf` boot test needs a Debian tree with
 # `RK_SYSTEMD_PACKAGES="systemd-tests iputils-ping"`.
+# `RK_SYSTEMD_PACKAGES=apparmor tools/systemd/build.sh OUT_FILE amd64 ubuntu:26.04` makes the tree
+# of the `ubuntu` boot test: set RK_UBUNTU to OUT_FILE, and `cargo xtask boot-test ubuntu` boots
+# it with AppArmor in enforce mode.
 set -eu
 
 usage='usage: tools/systemd/build.sh OUT_FILE [ARCH [IMAGE]]'
