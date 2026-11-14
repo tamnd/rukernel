@@ -15,6 +15,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - With `net.ipv4.conf.*.promote_secondaries`, the removal of a primary IPv4 address makes the first secondary address of its subnet primary, as `__inet_del_ifa` of Linux, and sends `RTM_NEWADDR` for it. The routes of the subnet then use it as the source. Before this, the secondary addresses went away with the primary address, and systemd-networkd, which sets the value, could not remove them (#538).
 - A new MTU of a network device is its IPv6 MTU too, and a write of `net.ipv6.conf.DEV.mtu` larger than the MTU of the device gives `EINVAL`, as `addrconf_notify` and `addrconf_sysctl_mtu` of Linux. The MTU tests of systemd-networkd-tests.py expect this (#538).
 - An IPv6 route or nexthop through a link local gateway that is an address of another device is valid, as `ip6_validate_gw` of Linux. Before, the RA tests of systemd-networkd-tests.py got "Gateway can not be a local address" for the route through the router on the other end of a veth pair (#538).
+- A packet to a link local address of another interface goes out on the link of the interface that the sender gives, for example with the scope ID of the address, as Linux. Before, the kernel took the address as local and gave the packet back to the host with the destination as the source. dnsmasq on one end of a veth pair answers a router solicitation of systemd-networkd on the other end so, and networkd dropped the answer as its own packet (#538).
 
 ## [0.5.36] - 2026-11-17
 

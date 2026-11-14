@@ -1070,6 +1070,28 @@ fn an_ipv6_reject_route_is_on_the_loopback_device() {
     }
 }
 
+/// systemd-networkd-tests.py puts dnsmasq and networkd on the two ends of a veth pair in one
+/// namespace. dnsmasq answers a router solicitation with an advertisement to the link local
+/// address of the client, through the interface of the router. On Linux the advertisement goes
+/// out on that link, with the link local address of the router as the source.
+#[test]
+fn a_link_local_address_of_another_interface_is_reached_through_the_link() {
+    use crate::route6::{Addr6, Table6};
+    let mut t = Table6::new();
+    t.set_loopback(1);
+    t.insert_addr(Addr6::new(1, ip::LOOPBACK, 128)).unwrap();
+    let router = v6([0xfe80, 0, 0, 0, 0x1034, 0x56ff, 0xfe78, 0x9abd]);
+    let client = v6([0xfe80, 0, 0, 0, 0x1034, 0x56ff, 0xfe78, 0x9abc]);
+    t.insert_addr(Addr6::new(3, router, 64)).unwrap();
+    t.insert_addr(Addr6::new(4, client, 64)).unwrap();
+    let n = t.lookup(&client, 3).unwrap();
+    assert_eq!((n.ifindex, n.hop, n.src, n.local), (3, client, router, false));
+    // Without an interface, or through its own interface, the address is local.
+    let n = t.lookup(&client, 0).unwrap();
+    assert_eq!((n.ifindex, n.src, n.local), (1, client, true));
+    assert!(t.lookup(&client, 4).unwrap().local);
+}
+
 #[test]
 fn ipv6_addresses_and_routes() {
     use crate::route6::{Addr6, Route6, Table6};

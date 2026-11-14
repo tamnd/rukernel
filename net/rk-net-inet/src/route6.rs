@@ -649,7 +649,12 @@ impl Table6 {
     /// Gives the errors of `lookup`, and the error of a rule that rejects.
     pub fn lookup_flow(&self, fl: &Flow) -> Result<(Next6, Option<&Route6>)> {
         let (dst, oif) = (&fl.dst, fl.oif);
-        if let Some(a) = self.addrs.iter().find(|a| a.addr == *dst) {
+        // A link local address of another interface is not local to a flow out of `oif`. Linux
+        // looks up such a flow with `RT6_LOOKUP_F_IFACE`, so the packet goes out on the link of
+        // `oif`. A router and its client on the two ends of a veth pair in one namespace talk so.
+        let strict = oif != 0 && ipv6::needs_scope(dst);
+        let found = self.addrs.iter().find(|a| a.addr == *dst && (!strict || a.ifindex == oif));
+        if let Some(a) = found {
             let ifindex = if self.loopback != 0 { self.loopback } else { a.ifindex };
             let next = Next6 { ifindex, hop: *dst, src: *dst, local: true, mtu: 0 };
             let route = self.routes.iter().find(|r| r.same(&Route6::local(a, self.loopback)));
