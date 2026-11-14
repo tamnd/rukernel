@@ -73,6 +73,7 @@ pub fn init() {
         stack::nft_fib_route,
         stack::nft_fib_addr_type,
     );
+    rk_net::netfilter::nf_tables_api::nft_rt_set_fn(stack::nft_rt_route);
     rtnl::init();
     rules::init();
     nexthop::init();
