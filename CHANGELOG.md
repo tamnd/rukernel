@@ -7,10 +7,12 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - nf_tables: the expression `fib`, as nft_fib.c, nft_fib_ipv4.c and nft_fib_ipv6.c of Linux. It gives the type of an address of the packet, or the device that the route to an address goes out on, for example `fib saddr . iif oif missing drop` of firewalld. The stack of IPv4 and IPv6 does the route lookups (#542).
+- The `systemd` boot test checks the keys if the tree has keyutils: the key `invocation_id` that systemd gives to each service, the upcall to /sbin/request-key with `keyctl request2` (instantiate, a payload from a pipe, negate and reject), a `dns_resolver` key, and a `big_key` key of 64 KiB. tools/systemd/build.sh puts keyutils in the tree. `KEYCTL_CAPABILITIES` gives `KEYCTL_CAPS0_BIG_KEY`, as Linux with `CONFIG_BIG_KEYS`. (#539)
 
 ### Fixed
 
 - A message on a stream or seqpacket Unix socket that `accept` did not take yet gets the credentials of the sender, as `maybe_add_creds` of Linux. Before, the receiver got the overflow IDs when it set `SO_PASSCRED` after the accept. Thus systemd-udevd logged "Invalid sender uid 65534" and ignored `udevadm control --reload`, so a new .link file did not apply (#538).
+- tools/busybox/build.sh builds the full modprobe of BusyBox, and not the small modprobe of the default configuration. The small modprobe does not read modules.builtin and gives 1 for a module that is in the kernel, so LTP keyctl05, keyctl23, keyctl29 and keyctl30 stopped with TBROK on arm64. The full modprobe gives 0, as kmod. (#539)
 
 ## [0.5.32] - 2026-11-15
 
@@ -29,6 +31,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - `/sys/firmware/acpi/tables` with a copy of each ACPI table, as Linux: the tables of the RSDT or the XSDT, and the DSDT and the FACS of the FADT. Duplicate signatures get a number from 1, for example `SSDT1`, and the files are mode 0400. After a boot with EFI, `/sys/firmware/efi` is there with `fw_platform_size`. With `RK_TPM=1`, the `systemd` boot test starts the kernel from OVMF, so `systemd-analyze has-tpm2` gives the full TPM2 support and the test compares `systemd-analyze pcrs` with tpm2_pcrread (#541).
 - The boot test `ubuntu`: `cargo xtask boot-test ubuntu` boots Ubuntu 26.04 with systemd and AppArmor in enforce mode to `multi-user.target`. apparmor.service loads the profiles of Ubuntu, and a check service checks the state of systemd, the profiles in enforce mode and a denial with `EACCES`. Set RK_UBUNTU to the tree of `RK_SYSTEMD_PACKAGES=apparmor tools/systemd/build.sh OUT_FILE amd64 ubuntu:26.04` (#540).
+
+### Fixed
+
 
 ## [0.5.30] - 2026-11-14
 

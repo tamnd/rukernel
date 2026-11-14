@@ -269,7 +269,7 @@ fn session_and_user_rings() {
     assert_eq!(set_reqkey(&cx, -1), Ok(1));
     assert_eq!(set_reqkey(&cx, 6), Err(Errno::EINVAL));
     assert!(!keys_text(&cx).is_empty());
-    assert_eq!(capabilities(), [0xe1, 0x03]);
+    assert_eq!(capabilities(), [0xf1, 0x03]);
 }
 
 #[test]
