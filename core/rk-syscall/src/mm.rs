@@ -769,6 +769,8 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
             MADV_DONTNEED | MADV_REMOVE => vma.locked,
             MADV_FREE => vma.locked || vma.shared || !anon,
             MADV_WIPEONFORK => vma.shared || !anon,
+            // `can_madv_lru_vma` of Linux.
+            MADV_COLD | MADV_PAGEOUT => vma.locked || vma.hugetlb,
             _ => false,
         };
         if bad || (advice == MADV_REMOVE && !vma.shared) {
@@ -781,11 +783,14 @@ pub(crate) fn madvise(cx: &Cx<'_>, addr: u64, len: u64, advice: u64) -> SysResul
         return Ok(0);
     }
     // `MADV_DONTNEED` and `MADV_FREE` remove the frames, so anonymous memory gives zero pages
-    // again. The advice for huge pages, for `fork` and for core dumps goes in the areas, as `madvise_update_vma`
+    // again. `MADV_PAGEOUT` writes the private anonymous pages to swap. The advice for huge pages, for `fork` and for core dumps goes in the areas, as `madvise_update_vma`
     // of Linux. Each other advice is only a hint, so it has no effect.
     let (addr, len) = (addr as usize, len as usize);
     match advice {
         MADV_DONTNEED | MADV_DONTNEED_LOCKED | MADV_FREE => vm.discard(addr, len),
+        MADV_PAGEOUT => {
+            vm.page_out(addr, len);
+        }
         MADV_HUGEPAGE => vm.set_huge_advice(addr, len, HugeAdvice::Huge)?,
         MADV_NOHUGEPAGE => vm.set_huge_advice(addr, len, HugeAdvice::NoHuge)?,
         MADV_DONTFORK => vm.set_fork_advice(addr, len, Some(true), None)?,

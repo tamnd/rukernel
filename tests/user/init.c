@@ -8392,6 +8392,84 @@ static int write_swap_header(int fd, unsigned int pages)
 }
 
 /* The swap areas of swapon and swapoff, with the disk /dev/vda of the swap boot test. */
+/* Gives the value of `name` in /proc/vmstat, or -1. */
+static long long swap_vmstat(const char *name)
+{
+	static char buf[16384];
+
+	return read_small("/proc/vmstat", buf, sizeof(buf)) > 0 ? vmstat_value(buf, name) : -1;
+}
+
+/* The byte at `i` of the pages that go to swap. */
+static unsigned char swap_byte(long i)
+{
+	return (unsigned char)(i * 7 + i / 4096);
+}
+
+/* Tells if the `n` bytes at `m` have the bytes of swap_byte. */
+static int swap_data(const unsigned char *m, long n)
+{
+	for (long i = 0; i < n; i++)
+		if (m[i] != swap_byte(i))
+			return 0;
+	return 1;
+}
+
+/* MADV_PAGEOUT writes private anonymous pages to the swap area, as madvise_pageout of Linux, and
+ * the next access reads them back, as do_swap_page. A child of fork gets the swap entries. */
+static void test_pageout(void)
+{
+	enum { N = 64 };
+	long len = N * 4096L;
+	long free = meminfo("SwapFree");
+	long long out = swap_vmstat("pswpout"), in = swap_vmstat("pswpin");
+	unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	check("mmap of the pages for swap", m != MAP_FAILED);
+	if (m == MAP_FAILED)
+		return;
+	for (long i = 0; i < len; i++)
+		m[i] = swap_byte(i);
+	check("MADV_PAGEOUT of the pages", madvise(m, len, MADV_PAGEOUT) == 0);
+	unsigned char vec[N];
+	int gone = mincore(m, len, vec) == 0;
+	for (int i = 0; gone && i < N; i++)
+		gone = !(vec[i] & 1);
+	check("mincore gives no page in memory after MADV_PAGEOUT", gone);
+	check("pswpout of /proc/vmstat counts the pages", swap_vmstat("pswpout") == out + N);
+	check("SwapFree goes down by the pages", meminfo("SwapFree") == free - N * 4);
+	char buf[2048], *at = NULL;
+	check("VmSwap of /proc/self/status has the pages",
+	      read_small("/proc/self/status", buf, sizeof(buf)) > 0 &&
+		      (at = strstr(buf, "VmSwap:")) != NULL && strtol(at + 7, NULL, 10) == N * 4);
+
+	pid_t pid = fork();
+	if (pid == 0)
+		_exit(swap_data(m, len) ? 0 : 1);
+	int status = 0;
+	check("a child of fork reads the pages from swap",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+		      WEXITSTATUS(status) == 0);
+	check("the pages come back from swap", swap_data(m, len));
+	check("pswpin counts the pages of the parent and of the child",
+	      swap_vmstat("pswpin") == in + 2 * N);
+	check("SwapFree comes back after the pages come back", meminfo("SwapFree") == free);
+
+	/* A write to a page in swap reads it first. mremap moves the swap entries. */
+	check("MADV_PAGEOUT of the pages again", madvise(m, len, MADV_PAGEOUT) == 0);
+	m[5 * 4096] = swap_byte(5 * 4096);
+	unsigned char *to = mmap(NULL, 2 * len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	unsigned char *r = to == MAP_FAILED ? MAP_FAILED :
+		mremap(m, len, 2 * len, MREMAP_MAYMOVE | MREMAP_FIXED, to);
+	check("mremap of pages in swap", r == to);
+	if (r != MAP_FAILED)
+		m = r;
+	check("the pages come back from swap after mremap", swap_data(m, len));
+	check("MADV_PAGEOUT of the pages a third time", madvise(m, len, MADV_PAGEOUT) == 0);
+	check("SwapFree goes down again", meminfo("SwapFree") == free - N * 4);
+	munmap(m, r == MAP_FAILED ? len : 2 * len);
+	check("munmap frees the pages of the swap area", meminfo("SwapFree") == free);
+}
+
 static void test_swap(void)
 {
 	/* With the argument "only", the general checks did not make /proc. */
@@ -8416,6 +8494,7 @@ static void test_swap(void)
 	check("sysinfo gives the free swap",
 	      sysinfo(&si) == 0 && si.totalswap * si.mem_unit == 16380 * 1024ULL &&
 		      si.freeswap == si.totalswap);
+	test_pageout();
 	check("swapoff of the swap disk", syscall(SYS_swapoff, "/dev/vda") == 0);
 	check("SwapTotal goes back after swapoff", meminfo("SwapTotal") == total);
 	umount("/proc");

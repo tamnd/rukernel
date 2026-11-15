@@ -18,9 +18,8 @@
 //! a run of pages with the same status is one area.
 
 use super::{
-    Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, Prepared,
-    SharedAnon, State, charge_commit, map_error, next_fork_anon, page_prot, uncharge_commit,
-    write_back,
+    Access, AddressSpace, FileRef, LOW32, MMAP_MIN_ADDR, MMAP_TOP, MmapRequest, SharedAnon, State,
+    charge_commit, map_error, next_fork_anon, page_prot, uncharge_commit, write_back,
 };
 use crate::hugetlb::HPAGE_SIZE;
 use crate::pttree::{RangeLock, TREE_END, Table, Tree};
@@ -649,11 +648,10 @@ impl AddressSpace {
             if let Some(vma) = area {
                 // The read of the file runs with no lock of the block, as in `handle_fault`.
                 if prepared.is_none()
-                    && let Some((file, index)) = self.read_first(&vma, addr, access)
+                    && let Some(read) = self.read_first(&vma, addr, access)
                 {
                     drop(lock);
-                    let frame = file.page(index)?;
-                    prepared = Some(Prepared { file, index, frame });
+                    prepared = Some(read.run(self.memcg())?);
                     continue;
                 }
                 return self.fault_area(&vma, addr, access, prepared.as_ref());

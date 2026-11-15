@@ -390,6 +390,13 @@ pub fn init() {
         },
         limit: rk_frame::mm::frame_stats().total * 4096 / 4,
     });
+    // The anonymous pages that go to swap use the swap areas of `swapon`.
+    rk_frame::mm::set_swap_ops(rk_frame::mm::SwapOps {
+        alloc: |_| rk_vfs::swap::alloc(),
+        free: |entry, _| rk_vfs::swap::free(entry),
+        write: |entry, data| rk_vfs::swap::write_page(entry, data).map_err(drop),
+        read: |entry, buf| rk_vfs::swap::read_page(entry, buf).map_err(drop),
+    });
     rk_drv_tty::set_signal_handler(|pgrp, sig| {
         let _ = crate::signal::signal_group(pgrp, SigInfo::new(sig, SI_KERNEL, 0));
     });

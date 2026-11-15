@@ -17,7 +17,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_frame::addr::VirtAddr;
-use rk_frame::mm::{Frame, HUGE_FRAMES, alloc_huge_frames, alloc_zeroed_frame, frame_stats};
+use rk_frame::mm::{
+    Frame, HUGE_FRAMES, SwapSlot, alloc_huge_frames, alloc_zeroed_frame, frame_stats, swap_in_use,
+};
 use rk_frame::sync::{Once, SpinLock};
 #[cfg(not(feature = "corten"))]
 use rk_frame::vm::ForkArea;
@@ -351,12 +353,47 @@ impl Drop for StateGuard<'_> {
     }
 }
 
-/// A page of a file that a fault read with no lock of the address space held. The fault takes
-/// the lock again and maps this frame if the area still maps the same page of the same file.
-struct Prepared {
-    file: FileRef,
-    index: u64,
-    frame: Arc<Frame>,
+/// A page that a fault read with no lock of the address space held. The fault takes the lock
+/// again and maps this frame if the area still maps the same page of the same file, or if the
+/// page table still has the same swap entry.
+enum Prepared {
+    /// A page of a file.
+    File { file: FileRef, index: u64, frame: Arc<Frame> },
+    /// A page that came back from a swap area, as `do_swap_page` of Linux reads it.
+    Swap { slot: Arc<SwapSlot>, frame: Arc<Frame> },
+}
+
+/// A read that a fault must do with no lock held, before it maps the page.
+enum Read {
+    /// The page `index` of `file`.
+    File(FileRef, u64),
+    /// The page of a swap entry.
+    Swap(Arc<SwapSlot>),
+}
+
+impl Read {
+    /// Does the read. A page from swap goes in a new frame that is charged to the memory cgroup
+    /// `memcg`.
+    ///
+    /// # Errors
+    ///
+    /// The error of the file, `ENOMEM` if no frame is free, and `EIO` if the swap area gives an
+    /// error. The kernel then sends `SIGBUS`, as Linux does for a swap entry it cannot read.
+    fn run(self, memcg: u32) -> Result<Prepared, Errno> {
+        match self {
+            Self::File(file, index) => {
+                let frame = file.page(index)?;
+                Ok(Prepared::File { file, index, frame })
+            }
+            Self::Swap(slot) => {
+                above_reserve()?;
+                let frame = charged(rk_frame::mm::alloc_frame(), memcg)?;
+                slot.read(&frame).map_err(|()| Errno::EIO)?;
+                frame.set_anon();
+                Ok(Prepared::Swap { slot, frame })
+            }
+        }
+    }
 }
 
 /// The lock of the areas. The VMA backend has one read-write lock for the whole address space, as
@@ -1133,6 +1170,11 @@ impl AddressSpace {
         self.vm.pages_in(VirtAddr::new(start), VirtAddr::new(end))
     }
 
+    /// The number of pages in `start..end` that are in a swap area.
+    pub fn swapped_pages(&self, start: usize, end: usize) -> usize {
+        self.vm.swapped_in(VirtAddr::new(start), VirtAddr::new(end))
+    }
+
     /// Copies the page at `addr` to `buf` for a core dump, as `get_dump_page` in mm/gup.c of
     /// Linux. A page with a frame gives its bytes, and the permissions of the page have no
     /// effect. A page of a file area with no frame gives the page of the file. Gives `false` for
@@ -1320,6 +1362,14 @@ impl AddressSpace {
                 self.vm.map(VirtAddr::new(to + off), frame, prot).map_err(map_error)?;
             }
         }
+        // The swap entries move with the pages.
+        let (from, until) = (VirtAddr::new(addr), VirtAddr::new(addr + old_len));
+        for (at, slot) in self.vm.take_swapped(from, until) {
+            let off = at - addr;
+            if off < new_len {
+                self.vm.put_swapped(VirtAddr::new(to + off), slot).map_err(map_error)?;
+            }
+        }
         // The old pages have no entries now, as `move_ptes` of Linux.
         self.soft.unmapped(addr, addr + old_len);
         if dont_unmap {
@@ -1457,11 +1507,10 @@ impl AddressSpace {
             // The read of a page of a file can wait for the disk. It runs with no lock held, and
             // the fault then starts again, as `filemap_fault` of Linux with `FAULT_FLAG_RETRY`.
             if prepared.is_none()
-                && let Some((file, index)) = self.read_first(vma, addr, access)
+                && let Some(read) = self.read_first(vma, addr, access)
             {
                 drop(st);
-                let frame = file.page(index)?;
-                prepared = Some(Prepared { file, index, frame });
+                prepared = Some(read.run(self.memcg())?);
                 continue;
             }
             let _block = self.state.fault_lock(addr).lock();
@@ -1469,22 +1518,22 @@ impl AddressSpace {
         }
     }
 
-    /// Gives the file and the index of the page that a fault at `addr` in `vma` must read from
-    /// the file first, or `None` if the fault does not read the file. The page is not mapped and
-    /// the file must read it ([`MmFile::ready`] is `false`).
-    fn read_first(
-        &self,
-        vma: &Vma<FileRef>,
-        addr: usize,
-        access: Access,
-    ) -> Option<(FileRef, u64)> {
-        let Backing::File { file, offset } = &vma.backing else { return None };
-        let page = addr & !(PAGE_SIZE - 1);
-        if vma.hugetlb || !allowed(vma, access) || self.vm.page(VirtAddr::new(page)).is_some() {
+    /// Gives the read that a fault at `addr` in `vma` must do first, or `None` if the fault does
+    /// not read. The page is not mapped, and it has a swap entry, or the file must read it
+    /// ([`MmFile::ready`] is `false`).
+    fn read_first(&self, vma: &Vma<FileRef>, addr: usize, access: Access) -> Option<Read> {
+        let page = VirtAddr::new(addr & !(PAGE_SIZE - 1));
+        if vma.hugetlb || !allowed(vma, access) || self.vm.page(page).is_some() {
             return None;
         }
-        let index = file_index(vma, *offset, page);
-        (!file.ready(index)).then(|| (file.clone(), index))
+        if swap_in_use()
+            && let Some(slot) = self.vm.swapped(page)
+        {
+            return Some(Read::Swap(slot));
+        }
+        let Backing::File { file, offset } = &vma.backing else { return None };
+        let index = file_index(vma, *offset, page.get());
+        (!file.ready(index)).then(|| Read::File(file.clone(), index))
     }
 
     /// Makes the area above `addr` grow down to the page of `addr`. The new pages keep the
@@ -1551,7 +1600,23 @@ impl AddressSpace {
         if write && !vma.shared && !vma.hugetlb && self.thp_cow(vma, page) {
             return Ok(());
         }
-        match self.vm.page(at) {
+        let current = self.vm.page(at);
+        // A page in a swap area comes back in the frame that the fault read with no lock. If the
+        // fault has no frame for this entry, it starts again.
+        if current.is_none()
+            && swap_in_use()
+            && let Some(slot) = self.vm.swapped(at)
+        {
+            return match prepared {
+                Some(Prepared::Swap { slot: read, frame }) if Arc::ptr_eq(read, &slot) => {
+                    drop(slot);
+                    let prot = page_prot(vma, true);
+                    self.vm.swap_in(at, read, frame.clone(), prot).map(drop).map_err(map_error)
+                }
+                _ => Ok(()),
+            };
+        }
+        match current {
             // The first write to a range of an anonymous area can get a huge page.
             None if write && self.map_huge(vma, page) => Ok(()),
             None => {
@@ -1564,8 +1629,14 @@ impl AddressSpace {
                         // cache, which a write or a truncate after the read changed. Another
                         // file gives the frame of the read.
                         let frame = match prepared {
-                            Some(p) if same_file(&p.file, file) && p.index == index => {
-                                if file.ready(index) { file.page(index)? } else { p.frame.clone() }
+                            Some(Prepared::File { file: f, index: i, frame })
+                                if same_file(f, file) && *i == index =>
+                            {
+                                if file.ready(index) {
+                                    file.page(index)?
+                                } else {
+                                    frame.clone()
+                                }
                             }
                             _ => file.page(index)?,
                         };
@@ -1581,7 +1652,12 @@ impl AddressSpace {
                         }
                     }
                 };
-                self.vm.map(at, frame, page_prot(vma, exclusive)).map_err(map_error)?;
+                // A swap entry that came after the check above stays, and the fault starts
+                // again.
+                match self.vm.map(at, frame, page_prot(vma, exclusive)) {
+                    Err(MapError::Mapped) => return Ok(()),
+                    r => r.map_err(map_error)?,
+                }
                 // The page is dirty after it is writable, so a write back that runs between the
                 // two steps cannot make the page clean and leave it writable.
                 if let Some((file, index)) = dirty {
@@ -1755,7 +1831,10 @@ impl AddressSpace {
             return false;
         }
         let range = (VirtAddr::new(block), VirtAddr::new(block + HUGE_PAGE_SIZE));
-        if self.vm.pages_in(range.0, range.1) != 0 {
+        // A block with a page in swap keeps its 4 KiB pages.
+        if self.vm.pages_in(range.0, range.1) != 0
+            || (swap_in_use() && self.vm.swapped_in(range.0, range.1) != 0)
+        {
             return false;
         }
         let stats = frame_stats();
@@ -1805,6 +1884,42 @@ impl AddressSpace {
                 self.unmap_pages(VirtAddr::new(from), VirtAddr::new(to));
             }
         }
+    }
+
+    /// Writes the private anonymous pages of `addr..addr + len` to a swap area and frees their
+    /// frames, for `MADV_PAGEOUT`, as `madvise_pageout` of Linux. A page goes only if this space
+    /// is the only user of it: a page that `fork` shares, a KSM page, a huge page and a page of a
+    /// locked area stay. The next access to a page reads it back. Gives the number of pages that
+    /// went.
+    pub fn page_out(&self, addr: usize, len: usize) -> usize {
+        let Ok((start, end)) = Self::lock_range(addr, len) else { return 0 };
+        let st = self.state.lock();
+        let mut pages = Vec::new();
+        for vma in st.vmas.iter().filter(|v| v.start < end && start < v.end) {
+            if !vma.shared && !vma.hugetlb && !vma.locked {
+                let (from, to) = (start.max(vma.start), end.min(vma.end));
+                pages.extend(self.vm.mapped_pages(VirtAddr::new(from), VirtAddr::new(to)));
+            }
+        }
+        // The writes wait for the disk, so they run with no lock of the areas, as the write back
+        // of `munmap`.
+        drop(st);
+        let mut n = 0;
+        for page in pages {
+            let Some(slot) = SwapSlot::alloc(self.memcg()) else { break };
+            n += usize::from(self.swap_out(page, slot));
+        }
+        n
+    }
+
+    /// Writes the page at `page` to the swap entry `slot`, and puts the entry in place of the
+    /// page, as `shrink_folio_list` of Linux does for an anonymous page. The write runs with no
+    /// lock, and the page is read only while it runs. Gives `false` if the page cannot go or the
+    /// write failed. Then the entry is free again, and the next write to the page makes it
+    /// writable again.
+    fn swap_out(&self, page: VirtAddr, slot: SwapSlot) -> bool {
+        let Some(frame) = self.vm.swap_out_start(page) else { return false };
+        slot.write(&frame).is_ok() && self.vm.swap_out_end(page, &frame, Arc::new(slot))
     }
 
     /// Tells if an area of the space maps a file of hugetlbfs.

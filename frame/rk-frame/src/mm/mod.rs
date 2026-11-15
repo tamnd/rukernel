@@ -29,3 +29,7 @@ pub use frame::{
 pub use heap::{HeapStats, heap_stats};
 pub mod reclaim;
 pub use reclaim::{ReclaimCounts, Reclaimer, count_reclaim, reclaim_counts};
+#[cfg(target_os = "none")]
+pub mod swap;
+#[cfg(target_os = "none")]
+pub use swap::{SwapOps, SwapSlot, set_swap_ops, swap_counts, swap_in_use};
