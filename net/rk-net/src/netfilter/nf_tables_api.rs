@@ -544,6 +544,21 @@ impl NftSet {
         self.flags & NFT_SET_INTERVAL != 0 && self.field_len.len() >= 2
     }
 
+    /// The set is one that `nft_select_set_ops` of Linux gives to nft_set_bitmap.c: a key of at
+    /// most 2 bytes, no stateful expression, and none of the flags that the type has no
+    /// feature for. Its lookup and its space are both O(1), so it wins with the default policy.
+    /// With `NFT_SET_POL_MEMORY` this takes it only for a set with no size, as Linux compares
+    /// the sizes then. Its dump has the elements in the order of their inserts, as
+    /// `nft_bitmap_walk` goes through the list that `nft_bitmap_insert` adds to at the tail.
+    fn is_bitmap(&self) -> bool {
+        let features =
+            NFT_SET_INTERVAL | NFT_SET_MAP | NFT_SET_TIMEOUT | NFT_SET_OBJECT | NFT_SET_EVAL;
+        self.klen <= 2
+            && self.exprs.is_empty()
+            && self.flags & features == 0
+            && (self.policy != NFT_SET_POL_MEMORY || self.size == 0)
+    }
+
     /// The number of elements that count for the size of the set.
     fn nelems(&self) -> usize {
         // The catch-all elements come last. Only a set with timeouts has elements that expire.
@@ -1660,7 +1675,7 @@ fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8
     let mut size = 0;
     let view = set.view();
     let mut elems: Vec<(&ElemKey, &NftElem)> = view.iter().collect();
-    if set.is_pipapo() {
+    if set.is_pipapo() || set.is_bitmap() {
         elems.sort_by_key(|(k, e)| (k.catchall, e.seq));
     }
     for (k, e) in elems {
@@ -3553,6 +3568,21 @@ mod tests {
         t.dynset_default_size(&[d(1), d(2), l]);
         let sizes: Vec<u32> = t.sets.iter().map(|s| s.size).collect();
         assert_eq!(sizes, [0xffff, 10, 0]);
+    }
+
+    #[test]
+    fn a_set_of_a_short_key_dumps_in_the_order_of_the_inserts_as_a_bitmap() {
+        // sets/0055tcpflags_0 of nftables: a constant set of `tcp_flag`, a key of one byte.
+        let flags = NftSet { klen: 1, flags: NFT_SET_CONSTANT, ..set(b"f") };
+        assert!(flags.is_bitmap());
+        assert!(NftSet { klen: 2, ..set(b"p") }.is_bitmap());
+        assert!(!set(b"a").is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_INTERVAL, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_MAP, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_TIMEOUT, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_EVAL, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { policy: NFT_SET_POL_MEMORY, size: 4, ..flags.clone() }.is_bitmap());
+        assert!(NftSet { policy: NFT_SET_POL_MEMORY, ..flags }.is_bitmap());
     }
 
     #[test]

@@ -22,6 +22,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - When one end of a veth pair goes up or down, the other end, if it is up, sends `RTM_NEWLINK` with its new carrier, as the link watch of Linux after `veth_open` and `veth_close`. Before this, systemd-networkd saw no carrier on the end that went up first, and a DHCP server on it did not start (#538).
 
+### Fixed
+
+- nf_tables: the dump of a set with a key of one or two bytes and none of the flags `interval`, `map`, `timeout` and `dynamic` has the elements in the order of their inserts, as nft_set_bitmap.c of Linux, that `nft_select_set_ops` gives such a set to. Before, the elements came in the order of their keys. `nft list` sorts them by the first flag of a bitmask, and keeps elements with the same sort value in the reverse of the order of the kernel, so the listing of sets/0055tcpflags_0 was not the one of Linux (#542).
+
 ## [0.5.33] - 2026-11-15
 
 ### Added
