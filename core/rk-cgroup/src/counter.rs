@@ -100,6 +100,10 @@ pub(crate) struct Counters {
     pub(crate) files_seq: AtomicU64,
     /// `cpu.weight`.
     pub(crate) weight: AtomicU32,
+    /// The sum of `cpu.weight` of the children that use the cpu controller and have a task in
+    /// their subtree. The tree sets it when `populated` of a child, a `cpu.weight` or the
+    /// controllers change, so the scheduler can read the weights of a level with no lock.
+    pub(crate) child_weight: AtomicU64,
     /// The CPU time and the quota of `cpu.max`.
     pub(crate) cpu: SpinLock<Cpu>,
     /// The pressure of the subtree.
@@ -137,6 +141,7 @@ impl Counters {
             nr_procs: AtomicU32::new(0),
             files_seq: AtomicU64::new(1),
             weight: AtomicU32::new(WEIGHT_DEFAULT),
+            child_weight: AtomicU64::new(0),
             cpu: SpinLock::new(Cpu { period_start: now, ..Cpu::default() }),
             psi: SpinLock::new(psi::Psi::new(now, root)),
         };
@@ -365,11 +370,20 @@ impl Counters {
         let mut path: Vec<&Counters> = self.path().filter(|c| c.id != ROOT && c.on(CPU)).collect();
         path.reverse();
         let Some(top) = path.first() else { return WEIGHT_UNIT };
-        let mut f = u128::from(WEIGHT_UNIT);
-        for c in &path {
-            f = f * u128::from(c.weight.load(Ordering::Relaxed)) / u128::from(WEIGHT_DEFAULT);
+        let weight = |c: &Counters| u128::from(c.weight.load(Ordering::Relaxed));
+        let default = u128::from(WEIGHT_DEFAULT);
+        let mut f = u128::from(WEIGHT_UNIT) * weight(top) / default;
+        for (i, c) in path.iter().enumerate() {
+            // The entities of the group: its threads with the weight of nice 0, and its children
+            // with threads. Without such children the group schedules each thread of its
+            // subtree, as the children then do not use the cpu controller or have no thread.
+            let children = u128::from(c.child_weight.load(Ordering::Relaxed));
+            let threads = if children > 0 { &c.pids.local } else { &c.pids.current };
+            let threads = u128::from(threads.load(Ordering::Relaxed));
+            // The next group of the path, or the thread itself.
+            let next = path.get(i + 1).map_or(default, |n| weight(n));
+            f = f * next / (threads * default + children).max(next);
         }
-        f /= u128::from(top.pids.current.load(Ordering::Relaxed).max(1));
         u64::try_from(f.max(1)).unwrap_or(u64::MAX)
     }
 }

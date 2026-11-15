@@ -245,6 +245,49 @@ fn cpu_weight_scales_the_threads_of_a_group() {
 }
 
 #[test]
+fn cpu_weight_shares_each_level() {
+    // The cgroups of test_cpucg_nested_weight_overprovisioned of the kselftests of Linux: a
+    // leaf with the weight 1000, and a child with the weight 1000 that has two leaves with the
+    // weight 5000. Each leaf has two threads.
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+cpu", 0).unwrap();
+    let p = h.mkdir(ROOT, b"p", 0).unwrap();
+    h.write(p, "cgroup.subtree_control", b"+cpu", 0).unwrap();
+    let c = h.mkdir(p, b"c", 0).unwrap();
+    h.write(c, "cgroup.subtree_control", b"+cpu", 0).unwrap();
+    h.write(c, "cpu.weight", b"1000", 0).unwrap();
+    let l0 = h.mkdir(p, b"l0", 0).unwrap();
+    let l1 = h.mkdir(c, b"l1", 0).unwrap();
+    let l2 = h.mkdir(c, b"l2", 0).unwrap();
+    h.write(l0, "cpu.weight", b"1000", 0).unwrap();
+    h.write(l1, "cpu.weight", b"5000", 0).unwrap();
+    h.write(l2, "cpu.weight", b"5000", 0).unwrap();
+    h.charge_pids(l0, 2).unwrap();
+    // Alone, the leaf gets all the weight of `p`.
+    assert_eq!(h.weight_factor(l0), WEIGHT_UNIT / 2);
+    h.charge_pids(l1, 2).unwrap();
+    h.charge_pids(l2, 2).unwrap();
+    // `l0` and `c` get one half each, and `l1` and `l2` get one half of `c` each.
+    assert_eq!(h.weight_factor(l0), WEIGHT_UNIT / 4);
+    assert_eq!(h.weight_factor(l1), WEIGHT_UNIT / 8);
+    assert_eq!(h.weight_factor(l2), WEIGHT_UNIT / 8);
+    // A new weight of a child changes the parts of its level.
+    h.write(l2, "cpu.weight", b"10000", 0).unwrap();
+    assert_eq!(h.weight_factor(l1), WEIGHT_UNIT / 12);
+    assert_eq!(h.weight_factor(l2), WEIGHT_UNIT / 6);
+    // A child without threads does not count.
+    h.uncharge_pids(l2, 2);
+    assert_eq!(h.weight_factor(l1), WEIGHT_UNIT / 4);
+    // Without the controller in `p`, the threads of the subtree share the weight of `p`.
+    h.uncharge_pids(l1, 2);
+    h.write(c, "cgroup.subtree_control", b"-cpu", 0).unwrap();
+    h.write(p, "cgroup.subtree_control", b"-cpu", 0).unwrap();
+    h.charge_pids(l1, 2).unwrap();
+    assert_eq!(h.weight_factor(l0), WEIGHT_UNIT / 4);
+    assert_eq!(h.weight_factor(l1), WEIGHT_UNIT / 4);
+}
+
+#[test]
 fn cpuset_limits_the_cpus() {
     let mut h = Hierarchy::new(0, 0b1111);
     h.write(ROOT, "cgroup.subtree_control", b"+cpuset", 0).unwrap();

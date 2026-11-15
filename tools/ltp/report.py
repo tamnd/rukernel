@@ -40,13 +40,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 LTP_URL = "https://github.com/linux-test-project/ltp/blob/{}/testcases/{}"
 LINUX_URL = "https://github.com/torvalds/linux/blob/v{}/{}"
-GROUPS = ["syscalls", "mm", "sched", "net", "pty"]
+GROUPS = ["syscalls", "mm", "sched", "net", "pty", "controllers"]
 TITLES = {
     "syscalls": "LTP syscalls results",
     "mm": "LTP mm results",
     "sched": "LTP sched results",
     "net": "LTP net results",
     "pty": "LTP pty results",
+    "controllers": "LTP controllers results",
 }
 
 # The status of each result of run.py. A code is the exit code of the test. LTP gives 32 (TCONF)
@@ -122,9 +123,14 @@ def reason_of(status, lines):
     return ""
 
 
-def read_logs(logs):
+# The first line of the log of Linux, with its version.
+LINUX_VERSION = re.compile(r"Linux version (\S+)")
+
+
+def read_logs(logs, versions=None):
     """Gives the newest result of each test: (runtest, tag) -> (when, status, code, reason), and
-    the commands of the tests: (runtest, tag) -> command."""
+    the commands of the tests: (runtest, tag) -> command. The set `versions` gets the versions of
+    Linux in the logs, for the logs of a Linux reference kernel."""
     results, tests = {}, {}
     for name in sorted(os.listdir(logs)):
         m = re.match(r"^(.+)-\d+$", name)
@@ -144,6 +150,9 @@ def read_logs(logs):
         with open(path, errors="replace") as f:
             for line in f:
                 line = line.rstrip("\r\n")
+                v = LINUX_VERSION.search(line) if versions is not None else None
+                if v:
+                    versions.add(v.group(1))
                 if line.startswith("ltp-start: "):
                     out = []
                 elif line.startswith("ltp-out: "):
@@ -194,6 +203,7 @@ GROUP_DIRS = {
     "sched": "kernel/sched/",
     "net": "network/",
     "pty": "kernel/pty/",
+    "controllers": "kernel/controllers/",
 }
 
 
@@ -446,20 +456,39 @@ def result_text(row):
     return row["status"]
 
 
-def write_table(path, group, rows, tag, linux, arch="x86_64"):
+def counts(statuses):
+    """Gives the text of the number of each status, as "3 pass, 1 fail"."""
     count = {s: 0 for s in ORDER}
+    for s in statuses:
+        count[s] += 1
+    return ", ".join(f"{count[s]} {s}" for s in ORDER if count[s])
+
+
+def write_table(path, group, rows, tag, linux, arch="x86_64", ref=None):
+    """Writes the table of a group. `ref` is (version, results) of a Linux reference kernel, or
+    None. With `ref`, the table has a column with the result of each test on that kernel."""
+    ref_results = ref[1] if ref else {}
+    ref_status = {}
     for r in rows:
-        count[r["status"]] += 1
+        if (r["runtest"], r["tag"]) in ref_results:
+            res = ref_results[(r["runtest"], r["tag"])]
+            ref_status[r["tag"]] = (res[1], res[2])
+    if not ref_status:
+        ref = None
     net = group == "net"
     lines = []
     for r in rows:
         note = r["note"] or r["reason"]
         first = f"| {r['runtest']} " if net else ""
+        on_ref = ""
+        if ref:
+            status, code = ref_status.get(r["tag"], ("no result", ""))
+            on_ref = f"| {result_text({'status': status, 'code': code})} "
         lines.append(
             f"{first}| {test_link(r, tag)} | {r['desc']} | {links(r['linux'], linux)} "
-            f"| {result_text(r)} | {day(r['when'])} | {note} |"
+            f"| {result_text(r)} {on_ref}| {day(r['when'])} | {note} |"
         )
-    parts = [f"{count[s]} {s}" for s in ORDER if count[s]]
+    parts = counts(r["status"] for r in rows)
     with open(path, "w") as f:
         on = " on arm64" if arch == "aarch64" else ""
         f.write(f"# {TITLES[group]}{on}\n\n")
@@ -479,11 +508,38 @@ def write_table(path, group, rows, tag, linux, arch="x86_64"):
             "note is the note in notes.txt, or else the first TFAIL, TBROK or TCONF line of the "
             "output.\n\n"
         )
-        f.write(f"rukernel: {', '.join(parts)}, of {len(rows)} tests.\n\n")
+        f.write(f"rukernel: {parts}, of {len(rows)} tests.\n\n")
+        if ref:
+            f.write(write_ref(rows, ref[0], ref_status, tag))
         head = "| Runtest " if net else ""
-        f.write(f"{head}| Test | What the test checks | Linux code | rukernel | Last run | Note |\n")
-        f.write(("| --- " if net else "") + "| --- | --- | --- | --- | --- | --- |\n")
+        f.write(f"{head}| Test | What the test checks | Linux code | rukernel "
+                + ("| Linux " if ref else "") + "| Last run | Note |\n")
+        f.write(("| --- " if net else "") + "| --- | --- | --- | --- | --- | --- |"
+                + (" --- |" if ref else "") + "\n")
         f.write("\n".join(lines) + "\n")
+
+
+def write_ref(rows, version, ref_status, tag):
+    """Gives the text about the results of the Linux reference kernel: the numbers, and the tests
+    that pass on Linux and do not pass on rukernel."""
+    statuses = [ref_status.get(r["tag"], ("no result", ""))[0] for r in rows]
+    out = (
+        f"Linux {version}: {counts(statuses)}. The Linux column has the result of each test on "
+        f"this kernel, the reference, with the same LTP programs and the same init script.\n\n"
+    )
+    behind = [r for r in rows
+              if ref_status.get(r["tag"], ("", ""))[0] == "pass" and r["status"] != "pass"]
+    ahead = [r for r in rows
+             if r["status"] == "pass" and ref_status.get(r["tag"], ("", ""))[0] != "pass"]
+    out += f"Tests that pass on Linux and not on rukernel: {len(behind)}"
+    if behind:
+        shown = [f"{test_link(r, tag)} ({result_text(r)})" for r in behind]
+        out += f": {names_of(shown)}"
+    out += ".\n\n"
+    if ahead:
+        shown = [test_link(r, tag) for r in ahead]
+        out += f"Tests that pass on rukernel and not on Linux: {len(ahead)}: {names_of(shown)}.\n\n"
+    return out
 
 
 def names_of(tests):
@@ -657,9 +713,21 @@ def main():
     p.add_argument("--out", default=HERE)
     p.add_argument("--arch", choices=["x86_64", "aarch64"], default="x86_64",
                    help="the architecture of the runs of run.py")
+    p.add_argument("--linux-logs", help="the logs of the runs of `run.py --linux` on a Linux "
+                   "reference kernel")
+    p.add_argument("--groups", help="write only these groups, with a comma between them. "
+                   "README.md then does not change")
     a = p.parse_args()
 
     results, tests = read_logs(a.logs)
+    ref = None
+    if a.linux_logs:
+        versions = set()
+        ref_results, ref_tests = read_logs(a.linux_logs, versions)
+        for key, cmd in ref_tests.items():
+            tests.setdefault(key, cmd)
+        ref = (", ".join(sorted(versions)) or "reference", ref_results)
+    groups = a.groups.split(",") if a.groups else GROUPS
     notbuilt = read_notbuilt(a.notbuilt)
     notes = read_notes()
     tag = version("tools/ltp/build.sh", r"^LTP_TAG=(\S+)")
@@ -671,16 +739,17 @@ def main():
     keys = list(dict.fromkeys(list(tests) + list(results) + sorted(notbuilt)))
     out = []
     suffix = "-aarch64" if a.arch == "aarch64" else ""
-    for group in GROUPS:
+    for group in groups:
         # The arm64 runs are for some groups only, so a group without results has no file.
         if a.arch == "aarch64" and not any(group_of(k[0]) == group for k in results):
             continue
         gkeys = [k for k in keys if group_of(k[0]) == group]
         rows = rows_of(gkeys, results, tests, notbuilt, notes, a.src, index, code)
-        write_table(os.path.join(a.out, f"{group}{suffix}.md"), group, rows, tag, linux, a.arch)
+        write_table(os.path.join(a.out, f"{group}{suffix}.md"), group, rows, tag, linux, a.arch,
+                    ref)
         out.append((group, rows))
         print(f"{group}: {len(rows)} tests", file=sys.stderr)
-    if a.arch == "aarch64":
+    if a.arch == "aarch64" or a.groups:
         return
     newest = max([v[0] for v in results.values()] + [0])
     write_readme(os.path.join(a.out, "README.md"), out, newest, tag, linux)

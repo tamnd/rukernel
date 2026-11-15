@@ -942,6 +942,24 @@ impl Hierarchy {
         for &id in self.nodes.keys() {
             self.set_ctrl(id);
         }
+        for &id in self.nodes.keys() {
+            self.sync_child_weight(id);
+        }
+    }
+
+    /// Sets the sum of `cpu.weight` of the children of `id` that use the cpu controller and are
+    /// populated, for `weight_factor`.
+    fn sync_child_weight(&self, id: CgId) {
+        let Some(n) = self.nodes.get(&id) else { return };
+        let sum: u64 = n
+            .children
+            .values()
+            .filter(|&&c| self.populated(c))
+            .filter_map(|c| self.nodes.get(c))
+            .filter(|c| c.c.on(CPU))
+            .map(|c| u64::from(c.c.weight.load(Ordering::Relaxed)))
+            .sum();
+        n.c.child_weight.store(sum, Ordering::Relaxed);
     }
 
     /// Lets the removed cgroups from `id` up to the root go if they have no charge left.
@@ -1340,6 +1358,7 @@ impl Hierarchy {
             } else {
                 p.nr_populated_children = p.nr_populated_children.saturating_sub(1);
             }
+            self.sync_child_weight(parent);
             at = parent;
         }
     }
@@ -1673,12 +1692,15 @@ impl Hierarchy {
     /// The factor of the weight of a thread of `id` in the fair class, in units of
     /// `WEIGHT_UNIT`.
     ///
-    /// Linux schedules a group as one entity with the weight of `cpu.weight`, and the threads of
-    /// the group share the time of the group. This hierarchy gives each thread the product of
-    /// `cpu.weight / 100` of the cgroups of its path that use the cpu controller, divided by the
-    /// threads of the highest of those cgroups. With one level of cgroups the shares are as in
-    /// Linux. A thread that sleeps still counts, so a group with sleeping threads gets less. The
-    /// root cgroup has no `cpu.weight`, so a thread of the root keeps its weight, as in Linux.
+    /// Linux schedules a group as one entity with the weight of `cpu.weight` in the queue of its
+    /// parent, and the threads and the child groups of the group share the time of the group.
+    /// The queue of rukernel has only threads, so each thread gets the part of the weight of the
+    /// group that Linux gives it. A cgroup below the root that uses the cpu controller gets
+    /// `cpu.weight / 100` of the weight of a thread of nice 0. At each level below it, the part of
+    /// a child is its `cpu.weight` divided by the sum of the weights of the entities of the
+    /// level: 100 for each thread of the cgroup, and `cpu.weight` for each child with threads.
+    /// A thread that sleeps still counts, so a group with sleeping threads gets less. The root
+    /// cgroup has no `cpu.weight`, so a thread of the root keeps its weight, as in Linux.
     pub fn weight_factor(&self, id: CgId) -> u64 {
         if id == ROOT {
             return WEIGHT_UNIT;
@@ -2108,6 +2130,12 @@ impl Hierarchy {
             "misc.max" => return Err(Errno::EINVAL),
             _ => return Err(Errno::EINVAL),
         };
+        // The weight of a child with threads is a part of the weights of the level of its parent.
+        if name.starts_with("cpu.weight")
+            && let Some(p) = self.parent(id)
+        {
+            self.sync_child_weight(p);
+        }
         Ok(effect)
     }
 

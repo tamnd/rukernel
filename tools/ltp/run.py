@@ -28,6 +28,11 @@ At most --jobs batches run at the same time. A batch with the file `done` in its
 not run again, unless --force is given. report.py takes the newest result of each test, so a
 second run with --only and --first 101 runs some tests again and keeps the other results. Without KVM, QEMU uses TCG, and a batch is slow.
 
+--linux is for a Linux reference kernel, as /boot/vmlinuz of the host. The kernel command line then
+has `panic=-1`, so that QEMU stops when init ends, and `cgroup_no_v1=all`, as a distribution with
+systemd 256 or later boots, because that systemd needs cgroup2 only. --kconfig gives the kernel
+options of that kernel, as /boot/config-VERSION, for the tests that check them.
+
 --arch aarch64 runs an arm64 kernel and an arm64 LTP tree (`build.sh --full --arch aarch64`) on
 the QEMU `virt` machine. --kernel is then the kernel ELF file or its `Image`. The disks are
 virtio-pci devices on the PCI bus of the ECAM host, so they have the same names as on x86-64.
@@ -92,6 +97,12 @@ LIMITS = {
     "dccp01": 900,
     "dccp01_ipv6": 900,
 }
+
+# The kernel options for a Linux reference kernel (--linux). Linux stops with a panic when init
+# ends, and `panic=-1` then reboots at once, so QEMU with -no-reboot stops. A distribution with
+# systemd 256 or later has no cgroup v1 hierarchies, and `cgroup_no_v1=all` keeps the cgroup v1
+# tests of LTP from a mount of the v1 controllers.
+LINUX_ARGS = " panic=-1 cgroup_no_v1=all"
 
 # The tests that run in their own boot. memcontrol03 and memcontrol04 can leave cgroups with
 # charges or processes when they fail, and these cgroups then change the tests after them.
@@ -344,7 +355,7 @@ class Batch:
     def initramfs(self, tests):
         with open(self.a.busybox, "rb") as f:
             busybox = f.read()
-        with open(os.path.join(HERE, "kconfig"), "rb") as f:
+        with open(self.a.kconfig, "rb") as f:
             kconfig = f.read()
         init = INIT.replace("@MUL@", str(self.a.mul))
         lst = "".join(f"{tag}\t{self.limit(tag)}\t{cmd}\n" for _, tag, cmd in tests)
@@ -411,7 +422,7 @@ class Batch:
             "-m", self.a.memory, "-smp", str(self.a.smp),
             "-display", "none", "-serial", "stdio", "-no-reboot", "-monitor", "none",
             "-kernel", self.a.kernel, "-initrd", initrd,
-            "-append", f"console={console} rk.test=init rdinit=/init",
+            "-append", f"console={console} rk.test=init rdinit=/init" + LINUX_ARGS * self.a.linux,
             "-drive", f"if=none,id=dev,format=raw,cache=unsafe,file={disk}",
             "-device", "virtio-blk-pci,drive=dev",
             "-drive", f"if=none,id=ltp,format=raw,readonly=on,file={self.a.image}",
@@ -444,7 +455,7 @@ class Batch:
                         done.add(line.split("ltp-result: ", 1)[1].split()[0])
                         current = None
                         since, limit = time.monotonic(), self.a.timeout + 120
-                    elif "kernel panic" in line and not line.startswith("ltp-"):
+                    elif "kernel panic" in line.lower() and not line.startswith("ltp-"):
                         how = "panic"
             elif time.monotonic() - since > limit:
                 how = "hang"
@@ -516,11 +527,15 @@ def main():
     p.add_argument("--first", type=int, default=1, help="the number of the first batch of each "
                    "runtest file, for example 101 for a second run that keeps the logs of the first")
     p.add_argument("--force", action="store_true", help="run the batches that are done again")
+    p.add_argument("--linux", action="store_true", help="the kernel is a Linux reference kernel")
+    p.add_argument("--kconfig", default=os.path.join(HERE, "kconfig"),
+                   help="the kernel options for KCONFIG_PATH, by default the kconfig of rukernel")
     p.add_argument("groups", nargs="+")
     a = p.parse_args()
     a.out = os.path.abspath(a.out)
     a.kernel = os.path.abspath(a.kernel)
     a.busybox = os.path.abspath(a.busybox)
+    a.kconfig = os.path.abspath(a.kconfig)
     a.ip = a.ip and os.path.abspath(a.ip)
     a.tools = a.tools and os.path.abspath(a.tools)
     os.makedirs(a.out, exist_ok=True)

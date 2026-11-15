@@ -129,6 +129,11 @@ impl<T> Eevdf<T> {
         self.tasks.len() == 0
     }
 
+    /// The sum of the weights of the queue.
+    pub fn weight(&self) -> u64 {
+        u64::try_from(self.load.max(0)).unwrap_or(u64::MAX)
+    }
+
     /// The part of `e` in the sum of the keys.
     fn key_of(&self, e: &Entity) -> i128 {
         i128::from(e.weight) * (i128::from(e.vruntime) - i128::from(self.min_vruntime))
@@ -248,20 +253,20 @@ impl<T> Eevdf<T> {
         self.load -= i128::from(e.weight);
     }
 
-    /// Removes a task for which `ok` gives `true`, so that it moves to the queue of another CPU,
-    /// as `detach_tasks` of the Linux load balancer does. Of those tasks, the task with the latest
-    /// deadline moves, because it waits longest here. The entity of the task has its lag, against
-    /// the average of this queue and of `curr`, so that `place` on the other queue keeps it. This
-    /// can take O(n) time.
+    /// Removes a task for which `ok` gives `true` with the task and its entity, so that it moves
+    /// to the queue of another CPU, as `detach_tasks` of the Linux load balancer does. Of those
+    /// tasks, the task with the latest deadline moves, because it waits longest here. The entity
+    /// of the task has its lag, against the average of this queue and of `curr`, so that `place`
+    /// on the other queue keeps it. This can take O(n) time.
     pub fn steal(
         &mut self,
         curr: Option<&Entity>,
         tick_ns: u64,
-        mut ok: impl FnMut(&T) -> bool,
+        mut ok: impl FnMut(&T, &Entity) -> bool,
     ) -> Option<(T, Entity)> {
         // The task is in the queue, so the average counts it, as `update_entity_lag` of Linux.
         let avg = self.avg_vruntime(curr);
-        let (task, mut e) = self.tasks.remove_last(|t, _| ok(t))?;
+        let (task, mut e) = self.tasks.remove_last(|t, e| ok(t, e))?;
         self.remove_sums(&e);
         if self.is_empty() {
             self.lowest = None;
@@ -402,7 +407,12 @@ mod glue {
         }
 
         fn load(&self) -> Load {
-            Load { queued: self.queue.len(), running: self.curr.is_some() }
+            let running = self.curr.map(|(_, e)| e.weight);
+            Load {
+                queued: self.queue.len(),
+                running: running.is_some(),
+                weight: self.queue.weight().saturating_add(running.unwrap_or(0)),
+            }
         }
 
         /// The entity of the task that runs at the time `now`, if it is not the task `id`. The
@@ -488,12 +498,12 @@ mod glue {
             preempt
         }
 
-        /// Removes a task for which `ok` gives `true` from the queue of `cpu`. The entity has
-        /// the lag of the task.
+        /// Removes a task for which `ok` gives `true` with the task and its entity from the queue
+        /// of `cpu`. The entity has the lag of the task.
         fn steal(
             &self,
             cpu: usize,
-            ok: impl FnMut(&Arc<Task>) -> bool,
+            ok: impl FnMut(&Arc<Task>, &Entity) -> bool,
         ) -> Option<(Arc<Task>, Entity)> {
             let mut rq = self.rqs[cpu].lock();
             let curr = rq.curr.map(|(_, e)| e);
@@ -508,9 +518,11 @@ mod glue {
             while let Some(src) = balance::busiest(this, &loads[..Self::cpus()], skip) {
                 // A task that is still on its CPU stays there, as `can_migrate_task` of Linux does
                 // for `task_on_cpu`.
-                let ok = |t: &Arc<Task>| {
+                let (own, from) = (loads[this], loads[src]);
+                let ok = |t: &Arc<Task>, e: &Entity| {
                     !t.is_on_cpu()
                         && balance::allows(data(t).affinity.load(Ordering::Relaxed), this)
+                        && balance::movable(&own, &from, e.weight)
                 };
                 if let Some((task, e)) = self.steal(src, ok) {
                     self.push(this, task, e, Some(false));
@@ -727,7 +739,7 @@ mod glue {
             }
             // A task in the queue of a CPU that the mask does not allow moves now. A task that
             // runs moves at its next `should_yield`.
-            let (t, e) = self.steal(cpu, |t| t.id() == task.id())?;
+            let (t, e) = self.steal(cpu, |t, _| t.id() == task.id())?;
             let to = self.select(task, cpu, false);
             self.push(to, t, e, Some(false));
             Some(to)

@@ -149,9 +149,10 @@ fn read_prog(cx: &Cx<'_>, addr: u64) -> Result<alloc::vec::Vec<bpf::Insn>, Errno
     if len == 0 || len > bpf::BPF_MAXINSNS {
         return Err(Errno::EINVAL);
     }
-    // A filter needs `CAP_SYS_ADMIN` or the no_new_privs bit, as `seccomp_prepare_filter` in
-    // kernel/seccomp.c of Linux.
-    if !cx.thread.no_new_privs() && !cx.process().cred().capable(rk_vfs::cred::cap::SYS_ADMIN) {
+    // A filter needs `CAP_SYS_ADMIN` in the user namespace of the caller or the no_new_privs bit,
+    // as `seccomp_prepare_filter` in kernel/seccomp.c of Linux. A process in a new user namespace
+    // has the capability there.
+    if !cx.thread.no_new_privs() && !cx.process().cred().has_cap(rk_vfs::cred::cap::SYS_ADMIN) {
         return Err(Errno::EACCES);
     }
     let prog = bpf::from_bytes(&cx.read_bytes(u64::from_ne_bytes(ptr), len * INSN_SIZE)?);
