@@ -9,6 +9,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - nf_tables: the expression `exthdr`, as nft_exthdr.c of Linux. It reads the extension headers of IPv6, the options of IPv4 and TCP and the chunks of SCTP, and tells if a packet of DCCP has an option, as `tcp option maxseg size`, `exthdr frag exists` or `ip option rr exists`. A rule can also write a TCP option (`tcp option maxseg size set 1360`) and remove one (`reset tcp option sack-perm`), with the checksum of TCP (#542).
 - nf_tables: the expression `rt`, as nft_rt.c of Linux: the next hop of the route of the packet (`rt ip nexthop`, `rt ip6 nexthop`), the TCP MSS of the path (`rt mtu`, as in `tcp option maxseg size set rt mtu`), `rt classid` and `rt ipsec`. The stack of IPv4 and IPv6 does the route lookups. The routes of rk have no realms and no IPsec, so `rt classid` and `rt ipsec` give 0 (#542).
 
+### Fixed
+
+- When one end of a veth pair goes up or down, the other end, if it is up, sends `RTM_NEWLINK` with its new carrier, as the link watch of Linux after `veth_open` and `veth_close`. Before this, systemd-networkd saw no carrier on the end that went up first, and a DHCP server on it did not start (#538).
+
 ## [0.5.33] - 2026-11-15
 
 ### Added

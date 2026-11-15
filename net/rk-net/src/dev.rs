@@ -283,6 +283,8 @@ pub enum Event {
     Address,
     /// The active features changed, as `NETDEV_FEAT_CHANGE`.
     Features,
+    /// The carrier changed, as `NETDEV_CHANGE` from `linkwatch_do_dev`.
+    Change,
 }
 
 /// A function that gets the changes of each device, as a `notifier_block` of Linux.
@@ -664,6 +666,14 @@ impl NetDevice {
         }
         if changes != 0 {
             notify(self, Event::Flags(changes));
+        }
+        // The other end of a veth pair gets or loses its carrier when this end goes up or
+        // down, as `veth_open` and `veth_close` of Linux. The link watch then tells of it.
+        if changes & IFF_UP != 0
+            && let Some(peer) = self.peer()
+            && peer.is_up()
+        {
+            notify(&peer, Event::Change);
         }
         Ok(())
     }
