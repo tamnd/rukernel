@@ -13,8 +13,8 @@
 use super::{
     Caller, KEY_SPEC_REQKEY_AUTH_KEY, KEY_SPEC_REQUESTOR_KEYRING, Key, Kind, LINK, LINK_LOCK,
     LOOKUP_CREATE, NEGATIVE_TIMEOUT, Need, Owner, POS, POS_ALL, Prep, Quota, READ, SEARCH, Search,
-    Slot, USERS, USR, VIEW, WRITE, abort_link, alloc, begin_link, commit_link, insert_link, lookup,
-    set_payload, user_rings,
+    Slot, USERS, USR, VIEW, WRITE, abort_link, alloc, begin_link, begin_restricted_link,
+    commit_link, insert_link, lookup, set_payload, user_rings,
 };
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -185,7 +185,13 @@ pub(super) fn construct(
         false,
     )?;
     set_pending(&key);
-    if let Err(e) = insert_link(&dest, &key) {
+    // As `construct_alloc_key`: the link of the new key does not check the restriction of the
+    // keyring.
+    let linked = {
+        let _g = LINK_LOCK.lock();
+        begin_link(&dest, key.kind, &key.desc).map(|_| commit_link(&dest, &key))
+    };
+    if let Err(e) = linked {
         complete(&key, cx.now);
         return Err(e);
     }
@@ -236,7 +242,7 @@ fn upcall(cx: &Caller<'_>, key: &Arc<Key>, callout: &[u8], dest: Arc<Key>) -> Re
         None,
         false,
     )?;
-    insert_link(&ring, &auth)?;
+    insert_link(Some(cx), &ring, &auth)?;
     let request = Request {
         op: b"create",
         key: key.serial,
@@ -277,6 +283,7 @@ fn finish(key: &Key, result: Result<Prep, (Errno, u64)>, now: u64) -> Result<(),
             Ok(prep) => {
                 let old = set_payload(&mut s, prep.payload, prep.quota)?;
                 s.error = prep.error;
+                s.asym = prep.asym;
                 if prep.short {
                     s.expiry = now + 1;
                 }
@@ -375,9 +382,14 @@ fn end(
     ring: Option<Arc<Key>>,
     result: Result<Prep, (Errno, u64)>,
 ) -> Result<(), Errno> {
+    // As `key_reject_and_link`: a restricted keyring takes no rejected key.
+    if result.is_err() && ring.as_ref().is_some_and(|r| r.state.lock().restriction.is_some()) {
+        return Err(Errno::EPERM);
+    }
     let guard = LINK_LOCK.lock();
+    let asym = result.as_ref().ok().and_then(|p| p.asym.as_deref());
     let replace = match &ring {
-        Some(r) => Some(begin_link(r, target.kind, &target.desc)?),
+        Some(r) => Some(begin_restricted_link(Some(cx), r, target.kind, &target.desc, asym)?),
         None => None,
     };
     if let Err(e) = finish(target, result, cx.now) {
@@ -452,6 +464,7 @@ pub fn assume_authority(cx: &Caller<'_>, id: i32) -> Result<i32, Errno> {
         target: None,
         kind: Kind::RequestKeyAuth,
         desc: desc.as_bytes(),
+        asym_id: None,
         state_check: true,
         skip_expired: false,
         check_perm: true,

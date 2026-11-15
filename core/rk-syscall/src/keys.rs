@@ -234,6 +234,64 @@ fn dh_compute(cx: &Cx<'_>, params: u64, buf: u64, buflen: u64, kdf: u64) -> SysR
     Ok(len as u64)
 }
 
+/// The size of `struct keyctl_pkey_params`.
+const PKEY_PARAMS_SIZE: usize = 40;
+/// The size of `struct keyctl_pkey_query`.
+const PKEY_QUERY_SIZE: usize = 56;
+
+/// Reads a buffer of `len` bytes for an operation of `KEYCTL_PKEY_*`, as `memdup_user`.
+fn read_buf(cx: &Cx<'_>, addr: u64, len: u32) -> Result<Vec<u8>, Errno> {
+    if len == 0 { Ok(Vec::new()) } else { cx.read_bytes(addr, len as usize) }
+}
+
+/// `keyctl(KEYCTL_PKEY_QUERY, key, 0, info, result)`, as `keyctl_pkey_query`.
+fn pkey_query(cx: &Cx<'_>, id: i32, info: u64, res: u64) -> SysResult {
+    let info = read_str(cx, info, PAGE_SIZE)?;
+    let q = cx.thread.with_keys(|k| keys::pkey_open(k, id, &info)?.query())?;
+    let mut out = [0u8; PKEY_QUERY_SIZE];
+    out[0..4].copy_from_slice(&q.supported_ops.to_ne_bytes());
+    out[4..8].copy_from_slice(&q.key_size.to_ne_bytes());
+    out[8..10].copy_from_slice(&q.max_data_size.to_ne_bytes());
+    out[10..12].copy_from_slice(&q.max_sig_size.to_ne_bytes());
+    out[12..14].copy_from_slice(&q.max_enc_size.to_ne_bytes());
+    out[14..16].copy_from_slice(&q.max_dec_size.to_ne_bytes());
+    cx.write_bytes(res, &out)?;
+    Ok(0)
+}
+
+/// `keyctl(KEYCTL_PKEY_ENCRYPT, params, info, in, out)` and the operations to decrypt, to sign
+/// and to check a signature, as `keyctl_pkey_e_d_s` and `keyctl_pkey_verify`. For a check,
+/// `out` is the signature.
+fn pkey_op(
+    cx: &Cx<'_>,
+    op: keys::PkeyOp,
+    params: u64,
+    info: u64,
+    input: u64,
+    out: u64,
+) -> SysResult {
+    let raw = cx.read_bytes(params, PKEY_PARAMS_SIZE)?;
+    let word = |at: usize| u32::from_ne_bytes(raw[at..at + 4].try_into().unwrap_or([0; 4]));
+    let (id, in_len, out_len) = (word(0) as i32, word(4), word(8));
+    let info = read_str(cx, info, PAGE_SIZE)?;
+    let pkey = cx.thread.with_keys(|k| {
+        let p = keys::pkey_open(k, id, &info)?;
+        p.check_lengths(op, in_len, out_len)?;
+        Ok::<_, Errno>(p)
+    })?;
+    let data = read_buf(cx, input, in_len)?;
+    if op == keys::PkeyOp::Verify {
+        let sig = read_buf(cx, out, out_len)?;
+        pkey.verify(&data, &sig)?;
+        return Ok(0);
+    }
+    let result = pkey.eds(op, &data, out_len as usize)?;
+    if !result.is_empty() {
+        cx.write_bytes(out, &result)?;
+    }
+    Ok(result.len() as u64)
+}
+
 /// `keyctl(operation, arg2, arg3, arg4, arg5)`.
 pub(crate) fn keyctl(cx: &mut Cx<'_>, op: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> SysResult {
     let id = a2 as i32;
@@ -316,6 +374,16 @@ pub(crate) fn keyctl(cx: &mut Cx<'_>, op: u64, a2: u64, a3: u64, a4: u64, a5: u6
             Ok(0)
         }
         KEYCTL_DH_COMPUTE => dh_compute(cx, a2, a3, a4, a5),
+        KEYCTL_PKEY_QUERY => {
+            if a3 != 0 {
+                return Err(Errno::EINVAL);
+            }
+            pkey_query(cx, id, a4, a5)
+        }
+        KEYCTL_PKEY_ENCRYPT => pkey_op(cx, keys::PkeyOp::Encrypt, a2, a3, a4, a5),
+        KEYCTL_PKEY_DECRYPT => pkey_op(cx, keys::PkeyOp::Decrypt, a2, a3, a4, a5),
+        KEYCTL_PKEY_SIGN => pkey_op(cx, keys::PkeyOp::Sign, a2, a3, a4, a5),
+        KEYCTL_PKEY_VERIFY => pkey_op(cx, keys::PkeyOp::Verify, a2, a3, a4, a5),
         KEYCTL_CAPABILITIES => {
             let caps = keys::capabilities();
             if a3 > 0 {

@@ -288,3 +288,132 @@ fn dh_ltp_vectors() {
     p0.extend_from_slice(&p);
     assert_eq!(dh::compute(&x, &p0, &g).unwrap(), unhex(want));
 }
+
+/// A self-signed certificate of an RSA-2048 key, made with `openssl req -x509 -newkey rsa:2048
+/// -subj /O=rukernel/CN=rk-test-key`.
+const CERT: &[u8] = include_bytes!("testdata/cert.der");
+/// The private key of [`CERT`] in PKCS#8.
+const PKCS8: &[u8] = include_bytes!("testdata/key.der");
+/// A self-signed certificate with `sha1WithRSAEncryption`.
+const CERT_SHA1: &[u8] = include_bytes!("testdata/sha1.der");
+/// The signature of `rukernel` with SHA-256, made with `openssl dgst -sha256 -sign`.
+const MSG_SIG: &[u8] = include_bytes!("testdata/msg.sig");
+
+fn sha256_of(data: &[u8]) -> Vec<u8> {
+    let mut h = alloc_hash("sha256").unwrap();
+    digest(h.as_mut(), data, data.len().max(1))
+}
+
+#[test]
+fn x509_parse() {
+    let p = asym::parse(CERT).unwrap();
+    assert_eq!(p.key.id_type, "X509");
+    assert!(!p.key.is_private);
+    let skid = unhex("987d54853a1cfc4027b413c4f4d9914becc3188a");
+    let desc = b"rukernel: rk-test-key: 987d54853a1cfc4027b413c4f4d9914becc3188a";
+    assert_eq!(p.desc.as_deref(), Some(&desc[..]));
+    let ids = p.ids.unwrap();
+    assert_eq!(ids[1].as_deref(), Some(&skid[..]));
+    let sig = p.sig.unwrap();
+    assert_eq!(sig.hash_algo, "sha256");
+    assert_eq!(sig.auth_ids[1].as_deref(), Some(&skid[..]));
+    assert_eq!(sig.auth_ids[2], ids[2]);
+    // The signature of the certificate is good, and a changed signature is not.
+    asym::verify(&p.key, &sig).unwrap();
+    let mut bad = CERT.to_vec();
+    *bad.last_mut().unwrap() ^= 1;
+    assert!(asym::parse(&bad).is_err());
+    // A changed byte in the issuer and the subject changes the digest.
+    let mut bad = CERT.to_vec();
+    while let Some(at) = bad.windows(11).position(|w| w == b"rk-test-key") {
+        bad[at] = b'R';
+    }
+    assert_eq!(asym::parse(&bad).unwrap_err(), Errno::EKEYREJECTED);
+    // Linux 6.8 has no sha1WithRSAEncryption in x509_note_sig_algo.
+    assert_eq!(asym::parse(CERT_SHA1).unwrap_err(), Errno::ENOPKG);
+    // No data, bad data, and too much data.
+    assert_eq!(asym::parse(b"").unwrap_err(), Errno::EINVAL);
+    assert_eq!(asym::parse(b"bogus").unwrap_err(), Errno::EBADMSG);
+    assert_eq!(asym::parse(&CERT[..CERT.len() - 1]).unwrap_err(), Errno::EBADMSG);
+    assert_eq!(asym::parse(&vec![0x30; 70000]).unwrap_err(), Errno::EMSGSIZE);
+    // The bytes after the certificate are not checked.
+    let mut more = CERT.to_vec();
+    more.extend_from_slice(b"more");
+    asym::parse(&more).unwrap();
+}
+
+#[test]
+fn pkcs8_parse() {
+    let p = asym::parse(PKCS8).unwrap();
+    assert_eq!(p.key.id_type, "PKCS8");
+    assert!(p.key.is_private && p.ids.is_none() && p.sig.is_none() && p.desc.is_none());
+    // A version other than 0.
+    let mut bad = PKCS8.to_vec();
+    let at = bad.windows(3).position(|w| w == [0x02, 0x01, 0x00]).unwrap();
+    bad[at + 2] = 1;
+    assert_eq!(asym::parse(&bad).unwrap_err(), Errno::EBADMSG);
+}
+
+#[test]
+fn pkey_ops() {
+    use asym::{Op, SUPPORTS_DECRYPT, SUPPORTS_ENCRYPT, SUPPORTS_VERIFY};
+    let public = asym::parse(CERT).unwrap().key;
+    let private = asym::parse(PKCS8).unwrap().key;
+    let mut n = 0u64;
+    let mut random = move || {
+        n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        n >> 33
+    };
+    // KEYCTL_PKEY_QUERY, as LTP keyctl29 and keyctl30.
+    let q = public.query("pkcs1", None).unwrap();
+    assert_eq!(q.supported_ops, SUPPORTS_ENCRYPT | SUPPORTS_VERIFY);
+    assert_eq!((q.key_size, q.max_enc_size, q.max_sig_size), (2048, 256, 256));
+    let q = private.query("pkcs1", Some("sha256")).unwrap();
+    assert_eq!(q.supported_ops, 15);
+    assert_eq!(
+        private.query("raw", None).unwrap().supported_ops,
+        SUPPORTS_ENCRYPT | SUPPORTS_DECRYPT
+    );
+    assert_eq!(public.query("raw", Some("sha256")).unwrap_err(), Errno::EINVAL);
+    assert_eq!(public.query("oaep", None).unwrap_err(), Errno::EINVAL);
+    assert_eq!(public.query("pkcs1", Some("md4")).unwrap_err(), Errno::ENOENT);
+    // Sign gives the signature of OpenSSL, and the public key checks it.
+    let d = sha256_of(b"rukernel");
+    let s = private.eds(Op::Sign, "pkcs1", Some("sha256"), &d, 256, &mut random).unwrap();
+    assert_eq!(s, MSG_SIG);
+    public.verify("pkcs1", Some("sha256"), &s, &d).unwrap();
+    assert_eq!(
+        public.verify("pkcs1", Some("sha256"), &s, &sha256_of(b"x")),
+        Err(Errno::EKEYREJECTED)
+    );
+    assert_eq!(public.verify("pkcs1", Some("sha1"), &s, &d[..20]), Err(Errno::EBADMSG));
+    assert_eq!(public.verify("raw", None, &s, &d), Err(Errno::ENOSYS));
+    assert_eq!(
+        public.eds(Op::Sign, "pkcs1", Some("sha256"), &d, 256, &mut random),
+        Err(Errno::EINVAL)
+    );
+    // Encrypt and decrypt with the padding of PKCS#1, and with no padding.
+    let c = public.eds(Op::Encrypt, "pkcs1", None, b"secret", 256, &mut random).unwrap();
+    assert_eq!(c.len(), 256);
+    assert_eq!(private.eds(Op::Decrypt, "pkcs1", None, &c, 256, &mut random).unwrap(), b"secret");
+    assert_eq!(private.eds(Op::Decrypt, "pkcs1", None, &c, 3, &mut random), Err(Errno::EOVERFLOW));
+    assert_eq!(public.eds(Op::Decrypt, "pkcs1", None, &c, 256, &mut random), Err(Errno::EINVAL));
+    assert_eq!(
+        public.eds(Op::Encrypt, "pkcs1", None, b"x", 255, &mut random),
+        Err(Errno::EOVERFLOW)
+    );
+    assert_eq!(
+        public.eds(Op::Encrypt, "pkcs1", None, &[1; 246], 256, &mut random),
+        Err(Errno::EOVERFLOW)
+    );
+    // The hash of `pkcs1pad(rsa,sha256)` does not change the encryption.
+    let c = public.eds(Op::Encrypt, "pkcs1", Some("sha256"), b"x", 256, &mut random).unwrap();
+    assert_eq!(private.eds(Op::Decrypt, "pkcs1", None, &c, 256, &mut random).unwrap(), b"x");
+    let c = public.eds(Op::Encrypt, "raw", None, b"secret", 256, &mut random).unwrap();
+    let m = private.eds(Op::Decrypt, "raw", None, &c, 256, &mut random).unwrap();
+    assert_eq!((m.len(), &m[250..]), (256, &b"secret"[..]));
+    assert_eq!(
+        public.eds(Op::Encrypt, "raw", None, &[0xff; 256], 256, &mut random),
+        Err(Errno::EINVAL)
+    );
+}

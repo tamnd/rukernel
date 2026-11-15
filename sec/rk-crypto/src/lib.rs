@@ -22,10 +22,13 @@
 extern crate alloc;
 
 pub mod aes;
+pub mod asn1;
+pub mod asym;
 pub mod dh;
 pub mod hmac;
 pub mod modes;
 pub mod mpi;
+pub mod rsa;
 pub mod sha1;
 pub mod sha256;
 pub mod sha512;

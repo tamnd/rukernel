@@ -4,9 +4,10 @@
 
 use super::{
     Caller, Kind, LINK, LINK_LOCK, LOOKUP_CREATE, LOOKUP_PARTIAL, NO_GID, Need, Prep, Quota, READ,
-    SEARCH, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE, abort_link, all_keys, alloc,
-    begin_link, check_cycle, collect, commit_link, insert_link, limits, lookup, permission,
-    process_ring, remove_link, set_payload, thread_ring, uncharge, user_rings,
+    Restriction, SEARCH, SESSION_PERM, SETATTR, Search, Slot, USERS, VIEW, WRITE, abort_link,
+    all_keys, alloc, asymmetric_restriction, begin_restricted_link, check_cycle, collect,
+    commit_link, insert_link, limits, lookup, permission, process_ring, remove_link, set_payload,
+    set_restriction, thread_ring, uncharge, user_rings,
 };
 use super::{GRP_ALL, Key, OTH_ALL, POS_ALL, USR_ALL};
 use alloc::sync::Arc;
@@ -19,8 +20,8 @@ use rk_abi::native::keyctl::{
     KEY_REQKEY_DEFL_THREAD_KEYRING, KEY_REQKEY_DEFL_USER_KEYRING,
     KEY_REQKEY_DEFL_USER_SESSION_KEYRING, KEY_SPEC_SESSION_KEYRING, KEYCTL_CAPS0_BIG_KEY,
     KEYCTL_CAPS0_CAPABILITIES, KEYCTL_CAPS0_DIFFIE_HELLMAN, KEYCTL_CAPS0_INVALIDATE,
-    KEYCTL_CAPS0_MOVE, KEYCTL_CAPS0_RESTRICT_KEYRING, KEYCTL_CAPS1_NS_KEY_TAG,
-    KEYCTL_CAPS1_NS_KEYRING_NAME, KEYCTL_MOVE_EXCL,
+    KEYCTL_CAPS0_MOVE, KEYCTL_CAPS0_PUBLIC_KEY, KEYCTL_CAPS0_RESTRICT_KEYRING,
+    KEYCTL_CAPS1_NS_KEY_TAG, KEYCTL_CAPS1_NS_KEYRING_NAME, KEYCTL_MOVE_EXCL,
 };
 use rk_vfs::cred::{Cred, cap};
 
@@ -49,11 +50,13 @@ pub fn add_key(
     if !ring.key.is_keyring() {
         return Err(Errno::ENOTDIR);
     }
-    let prep = kind.preparse(payload)?;
+    let mut prep = kind.preparse(payload)?;
     let short = prep.short;
-    let desc = desc.ok_or(Errno::EINVAL)?;
+    // A key without a description takes the description that its type proposes.
+    let proposed = prep.desc.take();
+    let desc = desc.or(proposed.as_deref()).ok_or(Errno::EINVAL)?;
     let _g = LINK_LOCK.lock();
-    let replace = begin_link(&ring.key, kind, desc)?;
+    let replace = begin_restricted_link(Some(cx), &ring.key, kind, desc, prep.asym.as_deref())?;
     if kind.can_update() {
         let old = ring.key.links().into_iter().find(|k| {
             k.kind == kind && k.desc == desc && !k.is_invalidated() && !k.state.lock().revoked
@@ -135,6 +138,7 @@ pub fn request_key(
         target: None,
         kind,
         desc,
+        asym_id: None,
         state_check: true,
         skip_expired: true,
         check_perm: true,
@@ -142,7 +146,7 @@ pub fn request_key(
     match search.in_process() {
         Ok(key) => {
             if let Some(d) = &dest {
-                insert_link(d, &key)?;
+                insert_link(Some(cx), d, &key)?;
             }
             return super::construct::result(&key);
         }
@@ -428,7 +432,7 @@ pub fn clear(cx: &Caller<'_>, id: i32) -> Result<(), Errno> {
 pub fn link(cx: &Caller<'_>, id: i32, ring: i32) -> Result<(), Errno> {
     let ring = lookup(cx, ring, LOOKUP_CREATE, Need::Perm(WRITE))?;
     let key = lookup(cx, id, LOOKUP_CREATE, Need::Perm(LINK))?;
-    insert_link(&ring.key, &key.key)
+    insert_link(Some(cx), &ring.key, &key.key)
 }
 
 /// Removes the link to a key from a keyring, as `KEYCTL_UNLINK`.
@@ -470,7 +474,8 @@ pub fn move_key(cx: &Caller<'_>, id: i32, from: i32, to: i32, flags: u32) -> Res
     if !from.links().iter().any(|k| Arc::ptr_eq(k, &key)) {
         return Err(Errno::ENOENT);
     }
-    let replace = begin_link(&to, key.kind, &key.desc)?;
+    let asym = key.state.lock().asym.clone();
+    let replace = begin_restricted_link(Some(cx), &to, key.kind, &key.desc, asym.as_deref())?;
     let check = if replace && flags & KEYCTL_MOVE_EXCL as u32 != 0 {
         Err(Errno::EEXIST)
     } else {
@@ -511,6 +516,7 @@ pub fn search(
         target: None,
         kind,
         desc,
+        asym_id: None,
         state_check: true,
         skip_expired: false,
         check_perm: true,
@@ -521,7 +527,7 @@ pub fn search(
     };
     if let Some(d) = dest {
         permission(cx, &key, ring.possessed, LINK)?;
-        insert_link(&d, &key)?;
+        insert_link(Some(cx), &d, &key)?;
     }
     Ok(key.serial)
 }
@@ -643,13 +649,15 @@ pub fn invalidate(cx: &Caller<'_>, id: i32) -> Result<(), Errno> {
 }
 
 /// Restricts the links that a keyring accepts, as `KEYCTL_RESTRICT_KEYRING`. With no type and
-/// no restriction, the keyring accepts no new links. No type of rukernel has a restriction.
+/// no restriction, the keyring accepts no new links. Only the `asymmetric` type has
+/// restrictions.
 ///
 /// # Errors
 ///
 /// Gives `EINVAL` for a type without a restriction or a restriction without a type, the error
 /// of the lookup, `ENOTDIR`, `ENOKEY` for an unknown type, `ENOENT` for a type without
-/// restrictions, or `EEXIST` if the keyring has a restriction.
+/// restrictions, the error of the restriction text, `EEXIST` if the keyring has a restriction,
+/// or `EDEADLK` if the restriction makes a cycle.
 pub fn restrict(
     cx: &Caller<'_>,
     id: i32,
@@ -663,16 +671,16 @@ pub fn restrict(
     if !r.key.is_keyring() {
         return Err(Errno::ENOTDIR);
     }
-    if let Some(kind) = kind {
-        Kind::from_name(kind).ok_or(Errno::ENOKEY)?;
-        return Err(Errno::ENOENT);
-    }
-    let mut s = r.key.state.lock();
-    if s.restricted {
-        return Err(Errno::EEXIST);
-    }
-    s.restricted = true;
-    Ok(())
+    let res = match (kind, restriction) {
+        (Some(kind), Some(text)) => {
+            if Kind::from_name(kind).ok_or(Errno::ENOKEY)? != Kind::Asymmetric {
+                return Err(Errno::ENOENT);
+            }
+            asymmetric_restriction(text)?
+        }
+        _ => Restriction::RejectAll,
+    };
+    set_restriction(&r.key, res)
 }
 
 /// The parent process of the caller, for [`session_to_parent`].
@@ -724,6 +732,7 @@ pub fn session_to_parent(cx: &Caller<'_>, parent: Option<Parent<'_>>) -> Result<
 /// The capabilities of the key service, as `KEYCTL_CAPABILITIES`.
 pub fn capabilities() -> [u8; 2] {
     let caps0 = KEYCTL_CAPS0_CAPABILITIES
+        | KEYCTL_CAPS0_PUBLIC_KEY
         | KEYCTL_CAPS0_DIFFIE_HELLMAN
         | KEYCTL_CAPS0_BIG_KEY
         | KEYCTL_CAPS0_INVALIDATE

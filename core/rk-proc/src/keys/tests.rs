@@ -193,7 +193,7 @@ fn restrict_reject_all() {
     let r = add_key(&cx, b"keyring", Some(b"r"), Vec::new(), PROC).unwrap();
     let k = add_key(&cx, b"user", Some(b"k"), b"1".to_vec(), PROC).unwrap();
     assert_eq!(restrict(&cx, r, Some(b"user"), None), Err(Errno::EINVAL));
-    assert_eq!(restrict(&cx, r, Some(b"asymmetric"), Some(b"x")), Err(Errno::ENOKEY));
+    assert_eq!(restrict(&cx, r, Some(b"asymmetric"), Some(b"x")), Err(Errno::EINVAL));
     assert_eq!(restrict(&cx, r, Some(b"user"), Some(b"x")), Err(Errno::ENOENT));
     restrict(&cx, r, None, None).unwrap();
     assert_eq!(restrict(&cx, r, None, None), Err(Errno::EEXIST));
@@ -269,7 +269,7 @@ fn session_and_user_rings() {
     assert_eq!(set_reqkey(&cx, -1), Ok(1));
     assert_eq!(set_reqkey(&cx, 6), Err(Errno::EINVAL));
     assert!(!keys_text(&cx).is_empty());
-    assert_eq!(capabilities(), [0xf5, 0x03]);
+    assert_eq!(capabilities(), [0xfd, 0x03]);
 }
 
 #[test]
@@ -475,4 +475,64 @@ fn dh_compute_checks() {
     let kdf = Kdf { hash, otherinfo: b"info".to_vec() };
     let (n, v) = dh_compute(&cx, x, pk, g, 40, Some(kdf)).unwrap();
     assert_eq!((n, v.len()), (40, 40));
+}
+
+/// A self-signed RSA certificate and an RSA certificate signed with SHA-1, from rk-crypto.
+const CERT: &[u8] = include_bytes!("../../../../sec/rk-crypto/src/testdata/cert.der");
+const CERT_SHA1: &[u8] = include_bytes!("../../../../sec/rk-crypto/src/testdata/sha1.der");
+
+#[test]
+fn asymmetric_keys_and_restrictions() {
+    let (c, o) = (cred(5015), TestOwner::default());
+    let cx = Caller { cred: &c, now: 0, owner: &o };
+    // Without a description, the key takes the description of the parser.
+    let k = add_key(&cx, b"asymmetric", None, CERT.to_vec(), PROC).unwrap();
+    let desc = describe(&cx, k).unwrap();
+    let want = b";rukernel: rk-test-key: 987d54853a1cfc4027b413c4f4d9914becc3188a\0";
+    assert!(desc.ends_with(want), "{:?}", alloc::string::String::from_utf8_lossy(&desc));
+    let text = alloc::string::String::from_utf8(keys_text(&cx)).unwrap();
+    let line = text.lines().find(|l| l.starts_with(&alloc::format!("{k:08x} "))).unwrap();
+    assert!(line.ends_with(": X509.rsa ecc3188a []"), "{line}");
+    assert_eq!(add_key(&cx, b"asymmetric", None, b"x".to_vec(), PROC), Err(Errno::EBADMSG));
+    // The errors of the restriction texts.
+    let r = add_key(&cx, b"keyring", Some(b"r"), Vec::new(), PROC).unwrap();
+    for bad in [&b"bogus"[..], b"key_or_keyring", b"key_or_keyring:", b"key_or_keyring:1:x"] {
+        assert_eq!(restrict(&cx, r, Some(b"asymmetric"), Some(bad)), Err(Errno::EINVAL));
+    }
+    assert_eq!(
+        restrict(&cx, r, Some(b"asymmetric"), Some(b"key_or_keyring:0x")),
+        Err(Errno::EINVAL)
+    );
+    // Only a chain can have no key.
+    for missing in [&b"key_or_keyring:2147483647"[..], b"key_or_keyring:0"] {
+        assert_eq!(restrict(&cx, r, Some(b"asymmetric"), Some(missing)), Err(Errno::ENOKEY));
+    }
+    let own = alloc::format!("key_or_keyring:{r}:chain");
+    assert_eq!(restrict(&cx, r, Some(b"asymmetric"), Some(own.as_bytes())), Err(Errno::EDEADLK));
+    // The builtin trusted keyring is empty, so it signs no key.
+    restrict(&cx, r, Some(b"asymmetric"), Some(b"builtin_trusted")).unwrap();
+    let r2 = Some(&b"builtin_and_secondary_trusted"[..]);
+    assert_eq!(restrict(&cx, r, Some(b"asymmetric"), r2), Err(Errno::EEXIST));
+    let u = add_key(&cx, b"user", Some(b"u"), b"1".to_vec(), PROC).unwrap();
+    assert_eq!(link(&cx, u, r), Err(Errno::EOPNOTSUPP));
+    assert_eq!(link(&cx, k, r), Err(Errno::ENOKEY));
+    assert_eq!(add_key(&cx, b"asymmetric", None, CERT.to_vec(), r), Err(Errno::ENOKEY));
+    // The kernel cannot check a signature with SHA-1, so the key has no signature.
+    let sha1 = add_key(&cx, b"asymmetric", Some(b"s"), CERT_SHA1.to_vec(), r);
+    assert_eq!(sha1, Err(Errno::ENOPKG));
+    // The key signs itself.
+    let signed = add_key(&cx, b"keyring", Some(b"signed"), Vec::new(), PROC).unwrap();
+    let by_key = alloc::format!("key_or_keyring:{k}");
+    restrict(&cx, signed, Some(b"asymmetric"), Some(by_key.as_bytes())).unwrap();
+    link(&cx, k, signed).unwrap();
+    // A chain finds the signer in the keyring itself.
+    let chain = add_key(&cx, b"keyring", Some(b"chain"), Vec::new(), PROC).unwrap();
+    restrict(&cx, chain, Some(b"asymmetric"), Some(b"key_or_keyring:0:chain")).unwrap();
+    assert_eq!(link(&cx, k, chain), Err(Errno::ENOKEY));
+    let by_ring = add_key(&cx, b"keyring", Some(b"by_ring"), Vec::new(), PROC).unwrap();
+    let text = alloc::format!("key_or_keyring:{signed}");
+    restrict(&cx, by_ring, Some(b"asymmetric"), Some(text.as_bytes())).unwrap();
+    add_key(&cx, b"asymmetric", Some(b"copy"), CERT.to_vec(), by_ring).unwrap();
+    // A keyring has one restriction.
+    assert_eq!(restrict(&cx, chain, None, None), Err(Errno::EEXIST));
 }

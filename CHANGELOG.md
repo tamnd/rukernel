@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The `asymmetric` key type, as crypto/asymmetric_keys of Linux: the X.509 parser and the PKCS#8 parser in rk-crypto, RSA keys, `KEYCTL_PKEY_QUERY`, `KEYCTL_PKEY_ENCRYPT`, `KEYCTL_PKEY_DECRYPT`, `KEYCTL_PKEY_SIGN` and `KEYCTL_PKEY_VERIFY` with the `pkcs1` and `raw` encodings, and the keyring restrictions `builtin_trusted` and `key_or_keyring` of `KEYCTL_RESTRICT_KEYRING`. `KEYCTL_CAPABILITIES` gives `KEYCTL_CAPS0_PUBLIC_KEY`. LTP keyctl23, keyctl24, keyctl29 and keyctl30 pass. (#539)
+
 ## [0.5.34] - 2026-11-15
 
 ### Added
