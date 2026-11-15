@@ -939,3 +939,34 @@ fn hugetlb_rdma_and_misc_have_the_files_of_linux() {
     assert_eq!(h.write(a, "misc.max", b"sev 1", 0), Err(Errno::EINVAL));
     assert_eq!(h.read(a, "misc.capacity", 0), Err(Errno::ENOENT));
 }
+
+#[test]
+fn memory_stat_counts_the_reclaim_of_the_subtree() {
+    let stat = |h: &mut Hierarchy, id: CgId, key: &str| -> u64 {
+        let text = h.read(id, "memory.stat", 0).unwrap();
+        let line = text.lines().find(|l| l.split(' ').next() == Some(key)).unwrap();
+        line.split(' ').nth(1).unwrap().parse().unwrap()
+    };
+    let mut h = Hierarchy::new(0, 1);
+    h.write(ROOT, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let a = h.mkdir(ROOT, b"a", 0).unwrap();
+    h.write(a, "cgroup.subtree_control", b"+memory", 0).unwrap();
+    let b = h.mkdir(a, b"b", 0).unwrap();
+    let c = h.mkdir(a, b"c", 0).unwrap();
+    // A direct reclaim of B looks at 10 pages and frees 6, and `kswapd` frees 3 of 4 pages of C.
+    h.count_reclaim(b, false, 10, 6);
+    h.count_reclaim(c, true, 4, 3);
+    assert_eq!((stat(&mut h, b, "pgscan"), stat(&mut h, b, "pgsteal")), (10, 6));
+    assert_eq!((stat(&mut h, b, "pgscan_direct"), stat(&mut h, b, "pgscan_kswapd")), (10, 0));
+    assert_eq!((stat(&mut h, c, "pgscan_kswapd"), stat(&mut h, c, "pgsteal_kswapd")), (4, 3));
+    assert_eq!((stat(&mut h, c, "pgscan_direct"), stat(&mut h, c, "pgsteal_direct")), (0, 0));
+    // The counts of a cgroup have the counts of its subtree, as in Linux.
+    assert_eq!((stat(&mut h, a, "pgscan"), stat(&mut h, a, "pgsteal")), (14, 9));
+    assert_eq!((stat(&mut h, a, "pgscan_direct"), stat(&mut h, a, "pgsteal_kswapd")), (10, 3));
+    // The sums come before the counts of each reclaimer, as `memory_stat_format` of Linux.
+    let text = h.read(a, "memory.stat", 0).unwrap();
+    assert!(text.contains(
+        "\npgscan 14\npgsteal 9\npgscan_kswapd 4\npgscan_direct 10\npgscan_khugepaged 0\n\
+         pgsteal_kswapd 3\npgsteal_direct 6\npgsteal_khugepaged 0\npgfault 0\n"
+    ));
+}

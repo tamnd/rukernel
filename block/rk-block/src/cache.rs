@@ -36,6 +36,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rk_abi::Errno;
+use rk_frame::mm::Reclaimer;
 use rk_frame::sync::{Once, SpinLock, SpinLockGuard};
 
 /// The size of a page.
@@ -93,6 +94,9 @@ pub struct MemcgOps {
     /// Takes back the cache of the cgroups over their limit after a charge to a memory cgroup.
     /// The cache calls it without its lock.
     pub balance: fn(u32),
+    /// Counts a reclaim of the page cache: the memory cgroup of the folios (or 0), the task
+    /// that takes them back, the pages that it looked at, and the pages that it freed.
+    pub reclaimed: fn(u32, Reclaimer, u64, u64),
     /// The largest number of bytes in the charged folios of all caches.
     pub limit: usize,
 }
@@ -112,6 +116,17 @@ pub fn set_memcg_ops(ops: MemcgOps) {
 /// The bytes that a folio of `len` bytes charges: whole pages.
 fn charge_of(len: usize) -> usize {
     len.next_multiple_of(PAGE_SIZE)
+}
+
+/// Counts a reclaim of `who` that looked at `scanned` and freed `stolen` bytes of the folios of
+/// the memory cgroup `memcg`. See `MemcgOps::reclaimed`.
+fn count_reclaim(memcg: u32, who: Reclaimer, scanned: usize, stolen: usize) {
+    if scanned > 0
+        && let Some(ops) = MEMCG.get()
+    {
+        let pages = |b: usize| (b / PAGE_SIZE) as u64;
+        (ops.reclaimed)(memcg, who, pages(scanned), pages(stolen));
+    }
 }
 
 /// The data of up to `FOLIO_PAGES` pages, from a multiple of `FOLIO_SIZE`.
@@ -662,27 +677,54 @@ impl<S: Store> PageCache<S> {
         }
     }
 
+    /// Drops the clean folios, as a direct reclaim before an OOM kill of the system. Unlike
+    /// `drop_clean`, the reclaim counts in `/proc/vmstat` and in `memory.stat`.
+    pub fn reclaim_all(&self) {
+        let mut inner = self.inner.lock();
+        let clean: Vec<(u64, u32, usize)> = inner
+            .folios
+            .iter()
+            .filter(|(_, f)| f.dirty == 0 && !f.busy())
+            .map(|(i, f)| (*i, f.memcg, charge_of(f.data.len())))
+            .collect();
+        let mut by_memcg: BTreeMap<u32, usize> = BTreeMap::new();
+        for (index, memcg, len) in clean {
+            Self::drop_folio(&mut inner, index);
+            *by_memcg.entry(memcg).or_default() += len;
+        }
+        drop(inner);
+        for (memcg, len) in by_memcg {
+            count_reclaim(memcg, Reclaimer::Direct, len, len);
+        }
+    }
+
     /// Drops the clean folios charged to the memory cgroup `memcg` that were used least
     /// recently, until `bytes` bytes of charges are gone. Gives the bytes of the charges that
     /// went. A cache that another task holds now gives nothing, so a reclaim never waits for
-    /// a cache.
+    /// a cache. As `shrink_inactive_list` of Linux, a dirty folio or a folio under I/O on the
+    /// way counts as scanned, but it stays.
     pub fn reclaim(&self, memcg: u32, bytes: u64) -> u64 {
         let Some(mut inner) = self.inner.try_lock() else { return 0 };
-        let mut clean: Vec<(u64, u64, usize)> = inner
+        let mut lru: Vec<(u64, u64, usize, bool)> = inner
             .folios
             .iter()
-            .filter(|(_, f)| f.dirty == 0 && !f.busy() && f.memcg == memcg)
-            .map(|(i, f)| (f.used, *i, charge_of(f.data.len())))
+            .filter(|(_, f)| f.memcg == memcg)
+            .map(|(i, f)| (f.used, *i, charge_of(f.data.len()), f.dirty == 0 && !f.busy()))
             .collect();
-        clean.sort_unstable();
-        let mut freed = 0;
-        for (_, index, len) in clean {
+        lru.sort_unstable();
+        let (mut freed, mut scanned) = (0, 0);
+        for (_, index, len, clean) in lru {
             if freed >= bytes {
                 break;
             }
-            Self::drop_folio(&mut inner, index);
-            freed += len as u64;
+            scanned += len;
+            if clean {
+                Self::drop_folio(&mut inner, index);
+                freed += len as u64;
+            }
         }
+        drop(inner);
+        count_reclaim(memcg, Reclaimer::Cgroup, scanned, freed as usize);
         freed
     }
 
@@ -724,16 +766,23 @@ impl<S: Store> PageCache<S> {
             .map(|(i, f)| (f.used, *i))
             .collect();
         clean.sort_unstable();
+        // The bytes that went, by memory cgroup, for the counts of `kswapd`.
+        let mut by_memcg: BTreeMap<u32, usize> = BTreeMap::new();
         for (_, index) in clean {
             if !over(inner, low_cache, low_charged) {
                 break;
             }
             // A charged folio goes only for the limit of the charged folios.
-            let charged = inner.folios[&index].memcg != 0;
-            if charged == (inner.cached - inner.charged > low_cache) {
+            let folio = &inner.folios[&index];
+            let (memcg, len) = (folio.memcg, charge_of(folio.data.len()));
+            if (memcg != 0) == (inner.cached - inner.charged > low_cache) {
                 continue;
             }
             Self::drop_folio(inner, index);
+            *by_memcg.entry(memcg).or_default() += len;
+        }
+        for (memcg, len) in by_memcg {
+            count_reclaim(memcg, Reclaimer::Kswapd, len, len);
         }
     }
 }

@@ -385,6 +385,9 @@ pub fn init() {
         charge: rk_cgroup::charge_file,
         uncharge: rk_cgroup::uncharge_file,
         balance: rk_cgroup::balance_file,
+        reclaimed: |memcg, who, scanned, stolen| {
+            rk_cgroup::count_reclaim(memcg, who, false, scanned, stolen);
+        },
         limit: rk_frame::mm::frame_stats().total * 4096 / 4,
     });
     rk_drv_tty::set_signal_handler(|pgrp, sig| {

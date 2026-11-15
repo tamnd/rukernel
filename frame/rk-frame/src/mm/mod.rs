@@ -27,3 +27,5 @@ pub use frame::{
 };
 #[cfg(target_os = "none")]
 pub use heap::{HeapStats, heap_stats};
+pub mod reclaim;
+pub use reclaim::{ReclaimCounts, Reclaimer, count_reclaim, reclaim_counts};

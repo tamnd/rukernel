@@ -139,6 +139,8 @@ pub struct VmCounts {
     pub pgpgin: u64,
     /// The KiB that the block devices wrote.
     pub pgpgout: u64,
+    /// The counts of the reclaim.
+    pub reclaim: rk_frame::mm::ReclaimCounts,
     /// `vm.min_free_kbytes`.
     pub min_free_kbytes: u64,
     /// The first frame and the end of the frames of the zone.
@@ -157,6 +159,14 @@ fn vm_value(c: &VmCounts, name: &str) -> u64 {
         "pgfault" => c.faults,
         "pgpgin" => c.pgpgin,
         "pgpgout" => c.pgpgout,
+        "pgscan_kswapd" => c.reclaim.scan[0],
+        "pgscan_direct" => c.reclaim.scan[1],
+        "pgsteal_kswapd" => c.reclaim.steal[0],
+        "pgsteal_direct" => c.reclaim.steal[1],
+        "pgscan_anon" => c.reclaim.scan_kind[0],
+        "pgscan_file" => c.reclaim.scan_kind[1],
+        "pgsteal_anon" => c.reclaim.steal_kind[0],
+        "pgsteal_file" => c.reclaim.steal_kind[1],
         // The defaults of vm.dirty_ratio and vm.dirty_background_ratio, 20 and 10 percent of
         // the free memory, as `global_dirty_limits` of Linux.
         "nr_dirty_threshold" => c.free / 5,
@@ -937,6 +947,12 @@ mod tests {
             total: 131_072,
             free: 120_000,
             faults: 42,
+            reclaim: rk_frame::mm::ReclaimCounts {
+                scan: [3, 4],
+                steal: [2, 1],
+                scan_kind: [0, 9],
+                steal_kind: [0, 5],
+            },
             min_free_kbytes: 5792,
             span: (1, 131_040),
             blocks,
@@ -947,6 +963,9 @@ mod tests {
         assert_eq!(v.lines().count(), 178);
         assert!(v.starts_with("nr_free_pages 120000\nnr_zone_inactive_anon 0\n"));
         assert!(v.contains("\npgfault 42\n"));
+        assert!(v.contains("\npgsteal_kswapd 2\npgsteal_direct 1\npgsteal_khugepaged 0\n"));
+        assert!(v.contains("\npgscan_kswapd 3\npgscan_direct 4\npgscan_khugepaged 0\n"));
+        assert!(v.contains("\npgscan_anon 0\npgscan_file 9\npgsteal_anon 0\npgsteal_file 5\n"));
         assert!(v.contains("\nnr_dirty_threshold 24000\nnr_dirty_background_threshold 12000\n"));
         assert!(v.ends_with("\nnr_unstable 0\n"));
         assert_eq!(

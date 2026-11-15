@@ -322,6 +322,16 @@ pub fn drop_clean_all() {
     }
 }
 
+/// Removes the clean pages of each block device from the cache, as a direct reclaim before an OOM
+/// kill of the system. The reclaim counts in `/proc/vmstat` and in `memory.stat`.
+pub fn reclaim_all() {
+    let caches: Vec<Arc<DiskCache>> =
+        BLOCK_DEVICES.lock().values().map(|e| e.cache.clone()).collect();
+    for cache in caches {
+        cache.reclaim_all();
+    }
+}
+
 /// Drops up to `bytes` bytes of the clean cache that is charged to the memory cgroup `memcg`,
 /// from the block devices. Gives the bytes that went. The memory cgroups call this for a reclaim,
 /// also in a page fault, so it does not wait for a lock.

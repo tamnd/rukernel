@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Added
+
+- The reclaim counters of a memory cgroup, as mm/vmscan.c and mm/memcontrol.c of Linux: `memory.stat` gives `pgscan`, `pgsteal`, `pgscan_kswapd`, `pgscan_direct`, `pgsteal_kswapd` and `pgsteal_direct` of the subtree, and `/proc/vmstat` gives `pgscan_kswapd`, `pgscan_direct`, `pgsteal_kswapd`, `pgsteal_direct`, `pgscan_file` and `pgsteal_file`. The page cache counts each page that a reclaim scans and drops. A cgroup over `memory.high` now reclaims its page cache at the return to user space, as `reclaim_high` of Linux, and a write of `memory.max` reclaims before the OOM kill. systemd-oomd needs `pgscan` above 0 to kill. (#752)
+
 ### Fixed
 
 - On arm64, a process can read CTR_EL0 and DCZID_EL0 and run `DC ZVA`, `DC CVAU`, `IC IVAU` and `WFE`, as on Linux: SCTLR_EL1 has the bits UCT, DZE, UCI, nTWE, SA0 and SED of `INIT_SCTLR_EL1_MMU_ON`. Before, a read of CTR_EL0 trapped and the process got SIGSEGV, as `dig` in TEST-75-RESOLVED of systemd (#759).
