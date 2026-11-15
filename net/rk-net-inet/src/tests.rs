@@ -730,6 +730,7 @@ fn loopback_sockets() {
     tcp_loopback();
     ipv6_loopback();
     ipv6_groups();
+    ipv6_interface_options();
     ipv4_groups();
     bind_no_port();
     resolved_options();
@@ -1443,6 +1444,51 @@ fn ipv6_loopback() {
     c4.release();
     s4.release();
     l.release();
+}
+
+/// `IPV6_MULTICAST_IF` and `IPV6_UNICAST_IF` give the interface of a send that has no other
+/// interface, as `udpv6_sendmsg` of Linux. The `loopback_sockets` test calls this. The
+/// loopback device has no route to a link local address and no link local source, so a send
+/// without the interface gives `ENETUNREACH`, and a send through it gives `EADDRNOTAVAIL`.
+fn ipv6_interface_options() {
+    use rk_abi::native::in6::{IPV6_MULTICAST_IF, IPV6_UNICAST_IF};
+    use rk_abi::native::inet::IPPROTO_IPV6;
+    use rk_abi::native::socket::{SO_BINDTOIFINDEX, SOL_SOCKET};
+    let int = |v: i32| v.to_ne_bytes().to_vec();
+    let be = |i: u32| i.to_be_bytes().to_vec();
+    let group = v6([0xff02, 0, 0, 0, 0, 0, 0, 0x4567]);
+    let link = v6([0xfe80, 0, 0, 0, 0, 0, 0, 1]);
+    let s = Dgram::new6(Proto::Udp);
+    let set = |name, v: &[u8]| s.set_option(IPPROTO_IPV6, name, v);
+    let get = |name| s.get_option(IPPROTO_IPV6, name);
+
+    assert_eq!(get(IPV6_MULTICAST_IF), Ok(int(0)));
+    assert_eq!(set(IPV6_MULTICAST_IF, &[1]), Err(Errno::EINVAL));
+    assert_eq!(set(IPV6_MULTICAST_IF, &int(99)), Err(Errno::ENODEV));
+    assert_eq!(set(IPV6_MULTICAST_IF, &int(-1)), Err(Errno::ENODEV));
+    assert_eq!(send6(&s, Some((group, 9)), b"mc"), Err(Errno::ENETUNREACH));
+    set(IPV6_MULTICAST_IF, &int(1)).unwrap();
+    assert_eq!(get(IPV6_MULTICAST_IF), Ok(int(1)));
+    assert_eq!(send6(&s, Some((group, 9)), b"mc"), Err(Errno::EADDRNOTAVAIL));
+    // `IPV6_MULTICAST_IF` is only for the groups.
+    assert_eq!(send6(&s, Some((link, 9)), b"uc"), Err(Errno::ENETUNREACH));
+
+    // `IPV6_UNICAST_IF` has the index in the byte order of the network, as `IP_UNICAST_IF`.
+    assert_eq!(get(IPV6_UNICAST_IF), Ok(be(0)));
+    assert_eq!(set(IPV6_UNICAST_IF, &[1]), Err(Errno::EINVAL));
+    assert_eq!(set(IPV6_UNICAST_IF, &be(99)), Err(Errno::EADDRNOTAVAIL));
+    set(IPV6_UNICAST_IF, &be(1)).unwrap();
+    assert_eq!(get(IPV6_UNICAST_IF), Ok(be(1)));
+    assert_eq!(send6(&s, Some((link, 9)), b"uc"), Err(Errno::EADDRNOTAVAIL));
+    s.release();
+
+    // A socket with a device takes `IPV6_MULTICAST_IF` only for that device, and no
+    // `IPV6_UNICAST_IF`.
+    let d = Dgram::new6(Proto::Udp);
+    d.set_option(SOL_SOCKET, SO_BINDTOIFINDEX, &int(1)).unwrap();
+    assert_eq!(d.set_option(IPPROTO_IPV6, IPV6_MULTICAST_IF, &int(1)), Ok(()));
+    assert_eq!(d.set_option(IPPROTO_IPV6, IPV6_UNICAST_IF, &be(1)), Err(Errno::EINVAL));
+    d.release();
 }
 
 /// The multicast groups of a socket of IPv6: `IPV6_JOIN_GROUP`, `MCAST_JOIN_GROUP` and their

@@ -360,6 +360,28 @@ pub(crate) fn unicast_if(bound: u32, value: &[u8]) -> Result<u32> {
     Ok(ifindex)
 }
 
+/// The interface of `IPV6_MULTICAST_IF` for a socket on the device `bound`, as
+/// `do_ipv6_setsockopt` of Linux: 0 or an interface that exists, and the device of the socket
+/// if it has one.
+///
+/// # Errors
+///
+/// Gives `ENODEV` for an interface that does not exist, and `EINVAL` for another interface
+/// than the device of the socket.
+pub(crate) fn multicast_if6(bound: u32, value: i32) -> Result<u32> {
+    if value == 0 {
+        return Ok(0);
+    }
+    let ifindex = u32::try_from(value).map_err(|_| Errno::ENODEV)?;
+    if dev::by_index(ifindex).is_none() {
+        return Err(Errno::ENODEV);
+    }
+    if bound != 0 && bound != ifindex {
+        return Err(Errno::EINVAL);
+    }
+    Ok(ifindex)
+}
+
 /// The value of `SO_BINDTODEVICE` or `SO_BINDTOIFINDEX` for a socket on the device `bound`, as
 /// `sock_getbindtodevice` of Linux: the name with its zero, or no bytes if the socket has no
 /// device.

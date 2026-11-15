@@ -325,6 +325,11 @@ struct State {
     flags6: BTreeMap<u32, i32>,
     /// The interface index of `IPV6_PKTINFO`, `np->sticky_pktinfo.ipi6_ifindex` of Linux.
     sticky_ifindex: u32,
+    /// `IPV6_MULTICAST_IF`: the interface of a packet to a group, `np->mcast_oif` of Linux, or
+    /// 0.
+    mc_oif6: u32,
+    /// `IPV6_UNICAST_IF`: the interface of another packet, `np->ucast_oif` of Linux, or 0.
+    uc_oif6: u32,
     shut_rd: bool,
     shut_wr: bool,
     closed: bool,
@@ -634,6 +639,8 @@ impl Dgram {
                 filter6: [0; 8],
                 flags6: BTreeMap::new(),
                 sticky_ifindex: 0,
+                mc_oif6: 0,
+                uc_oif6: 0,
                 shut_rd: false,
                 shut_wr: false,
                 closed: false,
@@ -1121,6 +1128,12 @@ impl Dgram {
         if oif == 0 && self.proto == Proto::Udp {
             oif = s.sticky_ifindex;
         }
+        // Then a packet to a group goes out on `IPV6_MULTICAST_IF`, and another packet on
+        // `IPV6_UNICAST_IF`, as `udpv6_sendmsg`, `ping_v6_sendmsg` and `rawv6_sendmsg` of Linux.
+        // dnsmasq sends its router advertisements to `ff02::1` so.
+        if oif == 0 {
+            oif = if ipv6::is_multicast(&dst) { s.mc_oif6 } else { s.uc_oif6 };
+        }
         if let Proto::Raw(_) = self.proto
             && s.hdrincl
         {
@@ -1261,6 +1274,9 @@ impl Dgram {
             IPV6_UNICAST_HOPS => i32::from(s.hops.unwrap_or(ipv6::DEFAULT_HOPS)),
             IPV6_MULTICAST_HOPS => s.mc_hops,
             IPV6_MULTICAST_LOOP => i32::from(s.multicast_loop),
+            IPV6_MULTICAST_IF => s.mc_oif6 as i32,
+            // The index is in the order of the network, as `htonl` in `do_ipv6_getsockopt`.
+            IPV6_UNICAST_IF => i32::from_ne_bytes(s.uc_oif6.to_be_bytes()),
             IPV6_TCLASS => i32::from(s.tclass),
             IPV6_RECVERR => i32::from(s.recverr),
             IPV6_MTU_DISCOVER => s.mtu_discover,
@@ -1327,8 +1343,6 @@ impl Dgram {
                 | IPV6_FLOWINFO
                 | IPV6_FLOWINFO_SEND
                 | IPV6_ROUTER_ALERT_ISOLATE
-                | IPV6_UNICAST_IF
-                | IPV6_MULTICAST_IF
         )
     }
 
@@ -1373,6 +1387,8 @@ impl Dgram {
             IPV6_UNICAST_HOPS => s.hops = u8::try_from(hops(v)?).ok(),
             IPV6_MULTICAST_HOPS => s.mc_hops = if hops(v)? == -1 { 1 } else { v },
             IPV6_MULTICAST_LOOP => s.multicast_loop = v != 0,
+            IPV6_MULTICAST_IF => s.mc_oif6 = stack::multicast_if6(s.oif, v)?,
+            IPV6_UNICAST_IF => s.uc_oif6 = stack::unicast_if(s.oif, value)?,
             IPV6_TCLASS if (-1..=255).contains(&v) => s.tclass = v.max(0) as u8,
             IPV6_TCLASS => return Err(Errno::EINVAL),
             IPV6_RECVERR => s.recverr = v != 0,
@@ -1756,7 +1772,15 @@ impl Socket for Dgram {
                 if ipv6::needs_scope(&dst) && scope != 0 {
                     s.oif = scope;
                 }
-                (dst, stack6::route(&dst, s.oif)?.src)
+                // A group with a scope and no interface binds the socket to the interface of
+                // `IPV6_MULTICAST_IF`, as `__ip6_datagram_connect` of Linux. The route to
+                // another group goes through it, as `ip6_datagram_flow_key_init`.
+                let mcast = ipv6::is_multicast(&dst);
+                if mcast && ipv6::needs_scope(&dst) && s.oif == 0 {
+                    s.oif = s.mc_oif6;
+                }
+                let oif = if mcast && s.oif == 0 { s.mc_oif6 } else { s.oif };
+                (dst, stack6::route(&dst, oif)?.src)
             }
         };
         self.autobind(&mut s)?;
