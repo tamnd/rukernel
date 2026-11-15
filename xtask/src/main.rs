@@ -461,6 +461,7 @@ const BOOT_TESTS: &[&str] = &[
     "tty",
     "smp",
     "blk",
+    "swap",
     "apparmor",
     "selinux",
     "net",
@@ -2250,6 +2251,8 @@ fn qemu_command(kernel: &Path, cmdline: &str) -> Command {
 const BLK_DISK_SIZE: usize = 1 << 20;
 /// The size of the ext2 disk of the `blk` boot test, as the device of the LTP runner.
 const EXT2_DISK_SIZE: u64 = 512 << 20;
+/// The size of the disk of the `swap` boot test. tests/user/init.c has the same value.
+const SWAP_DISK_SIZE: u64 = 16 << 20;
 /// The size of the disk that the `alpine` test makes an ext4 file system on.
 const EXT4_DISK_SIZE: u64 = 64 << 20;
 /// The size of the disk that the `alpine` test makes an XFS file system on. mkfs.xfs does not make
@@ -2264,6 +2267,12 @@ const BLK_CACHED_AT: usize = 512 << 10;
 const BLK_CACHED_LEN: usize = 512 << 10;
 fn blk_cached_byte(k: usize) -> u8 {
     (k * 13 + k / 4096) as u8
+}
+
+/// Makes the empty disk of the `swap` boot test. The test writes the header of `mkswap` on it.
+fn make_swap_disk(path: &Path) -> Result {
+    let file = fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.set_len(SWAP_DISK_SIZE).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Writes the disk of the `blk` boot test. The byte at offset k has a value from k, so that the
@@ -2491,7 +2500,7 @@ fn qemu(args: &[String]) -> Result {
 /// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
-        "init" | "tty" | "smp" | "blk" | "apparmor" | "selinux" | "inet" => {
+        "init" | "tty" | "smp" | "blk" | "swap" | "apparmor" | "selinux" | "inet" => {
             kernel.with_file_name("user-init").exists()
         }
         "busybox" | "netcfg" | "inet6" | "netns" => kernel.with_file_name("busybox-ready").exists(),
@@ -2589,6 +2598,8 @@ fn base_cmdline(test: &str) -> String {
         "tty" => String::from("console=ttyS0 rk.test=init -- tty"),
         "smp" => String::from("console=ttyS0 rk.test=init -- smp"),
         "blk" => String::from("console=ttyS0 rk.test=init -- blk"),
+        // The `swap` test has only its own checks.
+        "swap" => String::from("console=ttyS0 rk.test=init -- only swap"),
         // AppArmor is active only with `apparmor=1`. The other checks of init run without it.
         "apparmor" => String::from("console=ttyS0 rk.test=init apparmor=1 -- only apparmor"),
         // SELinux is active only with `selinux=1`.
@@ -2633,6 +2644,7 @@ fn pass_line(test: &str) -> String {
         "tty"
             | "smp"
             | "blk"
+            | "swap"
             | "apparmor"
             | "selinux"
             | "inet"
@@ -3054,6 +3066,14 @@ fn x86_boot_tests(names: &[String], errors: &mut Vec<String>) -> Result {
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .args(["-device", "virtio-blk-pci,drive=disk0"]);
         }
+        // The `swap` test makes the disk a swap area.
+        if *test == "swap" {
+            let disk = kernel.with_file_name("swap.img");
+            make_swap_disk(&disk)?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=swap,format=raw,cache=unsafe,file={}", disk.display()))
+                .args(["-device", "virtio-blk-pci,drive=swap"]);
+        }
         // The `blk` test writes 50 MB to a file on an ext2 disk, as memcontrol03 of LTP.
         if *test == "blk" {
             let disk = kernel.with_file_name("ext2.img");
@@ -3192,7 +3212,7 @@ const AARCH64_TESTS: &[&str] =
 /// `blk` and `inet` tests also run with virtio-pci devices on the PCI bus of the ECAM host, see
 /// `AARCH64_PCI_RUNS`.
 const AARCH64_USER_TESTS: &[&str] =
-    &["init", "smp", "blk", "apparmor", "selinux", "inet", "busybox"];
+    &["init", "smp", "blk", "swap", "apparmor", "selinux", "inet", "busybox"];
 
 /// The tests of `SYSTEMD_TESTS` that `boot-test aarch64` runs on the arm64 tree of the `systemd`
 /// test. `RK_SYSTEMD_AARCH64` gives the tarball of the tree, from
@@ -3446,6 +3466,14 @@ fn aarch64_boot_tests(errors: &mut Vec<String>) -> Result {
                 .arg(format!("if=none,id=disk0,format=raw,file={}", disk.display()))
                 .arg("-device")
                 .arg(format!("{blk_device},drive=disk0{bus}"));
+        }
+        if *test == "swap" {
+            let disk = elf_path.with_file_name("swap.img");
+            make_swap_disk(&disk)?;
+            cmd.arg("-drive")
+                .arg(format!("if=none,id=swap,format=raw,cache=unsafe,file={}", disk.display()))
+                .arg("-device")
+                .arg(format!("{blk_device},drive=swap{bus}"));
         }
         if *test == "inet" {
             let device = format!("{net_device},netdev=n0{bus}");
