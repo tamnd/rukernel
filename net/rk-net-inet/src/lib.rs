@@ -36,6 +36,7 @@ mod ioctl;
 pub mod ip;
 pub mod ipv4;
 pub mod ipv6;
+mod link6;
 mod mcast6;
 pub mod neigh;
 mod nexthop;
@@ -81,6 +82,7 @@ pub fn init() {
     nexthop::init();
     addrconf::init();
     addrlabel::init();
+    link6::init();
     procfs::init();
     rk_net::netlink::link::register_af(AF_INET as u16, fib::fill_link_af);
     rk_net::ioctl::set_ifconf(fib::ifconf);
