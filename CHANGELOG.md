@@ -20,6 +20,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - A TUN file that `TUNSETQUEUE` with `IFF_DETACH_QUEUE` took off its queue gives `POLLOUT`, not `POLLERR`, as `tun_chr_poll` of Linux. systemd-networkd keeps the files of a `MultiQueue=yes` device in the fd store of systemd, and systemd closed each file that gave `POLLERR`, so the device went away (#538).
 - A TUN or TAP device has `tun_flags`, `owner` and `group` in sysfs, as `tun_attr_group` of Linux. Before, `ip tuntap show` failed with "fopen /sys/class/net/NAME/tun_flags: No such file or directory", so `NetworkdNetDevTests.test_tuntap` could not see the devices (#538).
 - `IFLA_LINKINFO` of a TUN or TAP device has `IFLA_INFO_DATA` with the type, `pi`, `vnet_hdr`, `persist`, `multi_queue`, the owner, the group and the counts of the queues, as `tun_fill_info` of Linux. `ip -d link show` prints them, for example "tun type tun pi on vnet_hdr on multi_queue", and `NetworkdNetDevTests.test_tuntap` checks this (#538).
+- A route of IPv6 of the type `blackhole`, `unreachable` or `prohibit` goes on the loopback device, as Linux does. Thus `ip -6 route` shows `dev lo` for it, as the tests of systemd-networkd expect for the routes of DHCPv6 prefix delegation and for the static routes (#538).
 
 ## [0.5.35] - 2026-11-16
 

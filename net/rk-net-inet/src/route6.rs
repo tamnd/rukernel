@@ -265,6 +265,14 @@ impl Table6 {
         self.loopback
     }
 
+    /// Sets the next hop of a route that rejects: no gateway, and the loopback device, as
+    /// `fib6_nh_init` of Linux does for a reject route. Thus `ip -6 route` shows `dev lo` for it,
+    /// and the route stays when its device goes away.
+    pub fn set_reject_dev(&self, r: &mut Route6) {
+        r.gateway = None;
+        r.ifindex = self.loopback;
+    }
+
     /// The addresses.
     pub fn addrs(&self) -> &[Addr6] {
         &self.addrs

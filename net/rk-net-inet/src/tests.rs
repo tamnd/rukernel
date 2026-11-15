@@ -1009,6 +1009,38 @@ fn ipv6_checksum_and_header() {
     assert_eq!(crate::ipv6::Header::parse(&pkt[..44]), Err(crate::ipv6::Bad::Length));
 }
 
+/// A route of IPv6 that rejects goes on the loopback device, as `fib6_nh_init` of Linux. Thus
+/// `ip -6 route` shows `blackhole 2001:db8::/64 dev lo`, and the route stays when the device of
+/// the request goes away.
+#[test]
+fn an_ipv6_reject_route_is_on_the_loopback_device() {
+    use crate::route6::{Addr6, Route6, Table6};
+    use rk_abi::native::rtnetlink::{RTN_BLACKHOLE, RTN_PROHIBIT, RTN_UNREACHABLE};
+    let mut t = Table6::new();
+    t.set_loopback(1);
+    t.insert_addr(Addr6::new(1, ip::LOOPBACK, 128)).unwrap();
+    t.insert_addr(Addr6::new(2, v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]), 64)).unwrap();
+    let cases = [
+        (RTN_BLACKHOLE, 0x10, Errno::EINVAL),
+        (RTN_UNREACHABLE, 0x20, Errno::ENETUNREACH),
+        (RTN_PROHIBIT, 0x30, Errno::EACCES),
+    ];
+    for (kind, net, err) in cases {
+        let dst = v6([0x2001, 0xdb8, net, 0, 0, 0, 0, 0]);
+        let mut r = Route6::new(dst, 64, Some(v6([0xfd00, 0, 0, 0, 0, 0, 0, 2])), 2);
+        r.kind = kind as u8;
+        t.set_reject_dev(&mut r);
+        assert_eq!((r.ifindex, r.gateway), (1, None));
+        t.insert_route(r, NLM_F_CREATE).unwrap();
+        assert_eq!(t.lookup(&v6([0x2001, 0xdb8, net, 0, 0, 0, 0, 5]), 0).err(), Some(err));
+    }
+    t.link_down(2);
+    let kinds: Vec<u8> = t.routes().iter().filter(|r| r.ifindex == 1).map(|r| r.kind).collect();
+    for kind in [RTN_BLACKHOLE, RTN_UNREACHABLE, RTN_PROHIBIT] {
+        assert!(kinds.contains(&(kind as u8)));
+    }
+}
+
 #[test]
 fn ipv6_addresses_and_routes() {
     use crate::route6::{Addr6, Route6, Table6};
