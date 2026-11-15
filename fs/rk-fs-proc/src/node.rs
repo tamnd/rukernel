@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use rk_abi::Errno;
 use rk_frame::sync::{Once, SpinLock};
+use rk_vfs::cred::{Cred, may};
 use rk_vfs::inode::mode;
 use rk_vfs::{DirEntry, FileType, Inode, InodeRef, Metadata, Result, SetAttr, now};
 
@@ -85,10 +86,16 @@ pub(crate) struct Node {
     owner: Once<OwnerFn>,
     /// Tells that the inode is gone, for `Inode::stale`. Without it, the inode stays.
     gone: Once<GoneFn>,
+    /// The check of an access, for `Inode::permission`. Without it, the VFS checks the mode.
+    access: Once<AccessFn>,
 }
 
 /// The function that tells that an inode of procfs is gone.
 type GoneFn = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// The function that checks an access to an inode of procfs: the credentials and the bits of
+/// `may`.
+type AccessFn = Box<dyn Fn(&Cred, u32) -> Result<()> + Send + Sync>;
 
 /// The device of procfs. Each mount of procfs shows the same files, so they have one device.
 fn dev() -> u64 {
@@ -127,6 +134,7 @@ pub(crate) fn file(
         },
         owner: Once::new(),
         gone: Once::new(),
+        access: Once::new(),
     })
 }
 
@@ -142,7 +150,14 @@ pub(crate) fn rw_file(
         text: SpinLock::new(None),
         open: None,
     };
-    Arc::new(Node { ino: ino(path), perm: 0o644, kind, owner: Once::new(), gone: Once::new() })
+    Arc::new(Node {
+        ino: ino(path),
+        perm: 0o644,
+        kind,
+        owner: Once::new(),
+        gone: Once::new(),
+        access: Once::new(),
+    })
 }
 
 /// Makes a file with the permission bits `perm` whose open files have the operations that
@@ -160,7 +175,14 @@ pub(crate) fn ops_file(
         text: SpinLock::new(None),
         open: Some(Box::new(open)),
     };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind,
+        owner: Once::new(),
+        gone: Once::new(),
+        access: Once::new(),
+    })
 }
 
 /// Makes a file of /proc/sys with the permission bits `perm`. It gives text, takes writes if
@@ -179,7 +201,14 @@ pub(crate) fn sysctl_file(
         text: SpinLock::new(None),
         open: Some(Box::new(open)),
     };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind,
+        owner: Once::new(),
+        gone: Once::new(),
+        access: Once::new(),
+    })
 }
 
 /// Makes a file that reads and writes at an offset, with the permission bits `perm`.
@@ -190,7 +219,14 @@ pub(crate) fn data_file(
     write: impl Fn(u64, &[u8]) -> Result<usize> + Send + Sync + 'static,
 ) -> InodeRef {
     let kind = Kind::Data { read: Box::new(read), write: Box::new(write) };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind,
+        owner: Once::new(),
+        gone: Once::new(),
+        access: Once::new(),
+    })
 }
 
 /// Makes a symbolic link with the permission bits `perm`.
@@ -205,6 +241,7 @@ pub(crate) fn link(
         kind: Kind::Link(Box::new(target), Follow::Path),
         owner: Once::new(),
         gone: Once::new(),
+        access: Once::new(),
     })
 }
 
@@ -221,6 +258,7 @@ pub(crate) fn dead_link(
         kind: Kind::Link(Box::new(target), Follow::Error(error)),
         owner: Once::new(),
         gone: Once::new(),
+        access: Once::new(),
     })
 }
 
@@ -239,6 +277,7 @@ pub(crate) fn jump_link(
         kind: Kind::Link(Box::new(target), follow),
         owner: Once::new(),
         gone: Once::new(),
+        access: Once::new(),
     })
 }
 
@@ -252,7 +291,14 @@ pub(crate) fn dir(
     find: Option<FindFn>,
 ) -> InodeRef {
     let kind = Kind::Dir { parent: ino(parent), list: Box::new(list), find };
-    Arc::new(Node { ino: ino(path), perm, kind, owner: Once::new(), gone: Once::new() })
+    Arc::new(Node {
+        ino: ino(path),
+        perm,
+        kind,
+        owner: Once::new(),
+        gone: Once::new(),
+        access: Once::new(),
+    })
 }
 
 /// Gives `node` the owner and the group that `owner` gives at each `stat`, as the files of a
@@ -270,6 +316,46 @@ pub(crate) fn set_gone(node: &InodeRef, gone: impl Fn() -> bool + Send + Sync + 
     let any: &dyn Any = &**node;
     if let Some(node) = any.downcast_ref::<Node>() {
         node.gone.call_once(|| Box::new(gone));
+    }
+}
+
+/// Gives `node` the check `access` in place of the check of the mode. The function is set one
+/// time.
+pub(crate) fn set_access(
+    node: &InodeRef,
+    access: impl Fn(&Cred, u32) -> Result<()> + Send + Sync + 'static,
+) {
+    let any: &dyn Any = &**node;
+    if let Some(node) = any.downcast_ref::<Node>() {
+        node.access.call_once(|| Box::new(access));
+    }
+}
+
+/// Checks the access `mask` of `cred` to a file of /proc/sys/net with the permission bits
+/// `perm`, as `proc_sys_permission` and `net_ctl_permissions` of Linux. If `net_admin`, the
+/// process has `CAP_NET_ADMIN` in the network namespace, and it has the access of the owner,
+/// root. The other bits then are the same as the owner bits. Root, the effective user ID 0, has
+/// the owner bits, and a member of the group 0 the group bits. `CAP_DAC_OVERRIDE` does not
+/// apply, as `test_perm` of Linux.
+///
+/// # Errors
+///
+/// Gives `EACCES` if the access is not allowed.
+pub(crate) fn net_sysctl_access(perm: u32, net_admin: bool, cred: &Cred, mask: u32) -> Result<()> {
+    let mut perm = perm & 0o777;
+    if net_admin {
+        let owner = perm >> 6;
+        perm = owner << 6 | owner << 3 | owner;
+    }
+    if cred.euid == 0 {
+        perm >>= 6;
+    } else if cred.egid == 0 || cred.groups.binary_search(&0).is_ok() {
+        perm >>= 3;
+    }
+    if mask & (may::READ | may::WRITE | may::EXEC) & !perm == 0 {
+        Ok(())
+    } else {
+        Err(Errno::EACCES)
     }
 }
 
@@ -358,6 +444,10 @@ impl Inode for Node {
 
     fn stale(&self) -> bool {
         self.gone.get().is_some_and(|gone| gone())
+    }
+
+    fn permission(&self, cred: &Cred, mask: u32) -> Option<Result<()>> {
+        self.access.get().map(|access| access(cred, mask))
     }
 
     fn lookup(&self, name: &[u8]) -> Result<InodeRef> {
@@ -573,6 +663,40 @@ mod tests {
         set_owner(&text, || (1000, 100));
         set_owner(&text, || (2000, 200));
         assert_eq!((text.metadata().uid, text.metadata().gid), (1000, 100));
+    }
+
+    #[test]
+    fn a_net_sysctl_file_takes_a_write_of_a_network_administrator() {
+        static ADMIN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+        let node = rw_file(b"/sys/net/ipv6/conf/all/accept_ra", || Ok(b"1\n".to_vec()), |_| Ok(()));
+        let mut user = Cred::root();
+        (user.euid, user.fsuid, user.egid, user.fsgid, user.cap_effective) =
+            (998, 998, 998, 998, 0);
+        // The mode 0644 alone lets the user only read.
+        assert_eq!(user.inode_permission(&*node, may::READ), Ok(()));
+        assert_eq!(user.inode_permission(&*node, may::WRITE), Err(Errno::EACCES));
+        set_access(&node, |cred, mask| {
+            net_sysctl_access(0o644, ADMIN.load(Ordering::Relaxed), cred, mask)
+        });
+        assert_eq!(user.inode_permission(&*node, may::READ | may::WRITE), Ok(()));
+        assert_eq!(user.inode_permission(&*node, may::EXEC), Err(Errno::EACCES));
+        ADMIN.store(false, Ordering::Relaxed);
+        assert_eq!(user.inode_permission(&*node, may::READ), Ok(()));
+        assert_eq!(user.inode_permission(&*node, may::WRITE), Err(Errno::EACCES));
+        // CAP_DAC_OVERRIDE does not apply. Root has the owner bits with no capability.
+        user.cap_effective = rk_vfs::cred::cap::ALL;
+        assert_eq!(user.inode_permission(&*node, may::WRITE), Err(Errno::EACCES));
+        let mut root = Cred::root();
+        root.cap_effective = 0;
+        assert_eq!(root.inode_permission(&*node, may::READ | may::WRITE), Ok(()));
+        // A file that takes no write stays read only for root and for an administrator.
+        assert_eq!(net_sysctl_access(0o444, true, &user, may::WRITE), Err(Errno::EACCES));
+        assert_eq!(net_sysctl_access(0o444, true, &root, may::WRITE), Err(Errno::EACCES));
+        assert_eq!(net_sysctl_access(0o444, false, &user, may::READ), Ok(()));
+        // The group 0 has the group bits.
+        user.egid = 0;
+        assert_eq!(net_sysctl_access(0o640, false, &user, may::READ), Ok(()));
+        assert_eq!(net_sysctl_access(0o604, false, &user, may::READ), Err(Errno::EACCES));
     }
 
     #[test]

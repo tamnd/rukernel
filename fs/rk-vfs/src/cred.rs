@@ -365,13 +365,17 @@ impl Cred {
     }
 
     /// Checks the access `mask` to `inode`, as [`Cred::permission`], with the access ACL of the
-    /// inode if it has one.
+    /// inode if it has one. An inode with its own check, [`Inode::permission`], uses that check
+    /// in place of the mode and the ACL, as `inode_permission` of Linux.
     ///
     /// # Errors
     ///
     /// Gives `EACCES` if the access is not allowed, and `EIO` for a damaged ACL.
     pub fn inode_permission(&self, inode: &dyn Inode, mask: u32) -> Result<()> {
-        self.check(&inode.metadata(), mask, || acl::access(inode))?;
+        match inode.permission(self, mask) {
+            Some(r) => r?,
+            None => self.check(&inode.metadata(), mask, || acl::access(inode))?,
+        }
         crate::security::inode_permission(self, inode, mask)
     }
 
