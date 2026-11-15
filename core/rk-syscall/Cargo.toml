@@ -15,6 +15,7 @@ rk-bpf.workspace = true
 rk-drv-mem.workspace = true
 rk-drv-tty.workspace = true
 rk-cgroup.workspace = true
+rk-crypto.workspace = true
 rk-frame.workspace = true
 rk-fs-cgroup.workspace = true
 rk-fs-hugetlbfs.workspace = true

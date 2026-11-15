@@ -28,6 +28,7 @@
 
 mod construct;
 mod ctl;
+mod dh;
 mod text;
 
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub use ctl::{
     invalidate, join_session, link, move_key, read, request_key, restrict, revoke, search,
     session_to_parent, set_perm, set_reqkey, set_timeout, unlink, update,
 };
+pub use dh::{KDF_MAX_OTHERINFO, KDF_MAX_OUTPUT, Kdf, dh_compute};
 pub use text::{key_users_text, keys_text};
 
 use alloc::collections::BTreeMap;

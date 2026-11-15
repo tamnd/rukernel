@@ -187,6 +187,53 @@ fn instantiate(cx: &Cx<'_>, id: i32, parts: &[(u64, u64)], ring: i32) -> SysResu
     Ok(0)
 }
 
+/// The size of `struct keyctl_dh_params`: the serial numbers of the private key, the prime and
+/// the base.
+const DH_PARAMS_SIZE: usize = 12;
+/// The size of `struct keyctl_kdf_params` on a 64-bit system: two pointers, the length of the
+/// other information, 8 spare words and the padding.
+const KDF_PARAMS_SIZE: usize = 56;
+
+/// `keyctl(KEYCTL_DH_COMPUTE, params, buffer, buflen, kdf)`, as `keyctl_dh_compute`.
+fn dh_compute(cx: &Cx<'_>, params: u64, buf: u64, buflen: u64, kdf: u64) -> SysResult {
+    let kdf = if kdf == 0 {
+        None
+    } else {
+        let raw = cx.read_bytes(kdf, KDF_PARAMS_SIZE)?;
+        let word = |at: usize| u64::from_ne_bytes(raw[at..at + 8].try_into().unwrap_or([0; 8]));
+        let (hashname, otherinfo) = (word(0), word(8));
+        let oilen = u32::from_ne_bytes(raw[16..20].try_into().unwrap_or([0; 4])) as usize;
+        Some((hashname, otherinfo, oilen, raw[20..52].iter().any(|&b| b != 0)))
+    };
+    if params == 0 || (buf == 0 && buflen != 0) {
+        return Err(Errno::EINVAL);
+    }
+    let raw = cx.read_bytes(params, DH_PARAMS_SIZE)?;
+    let id = |at: usize| i32::from_ne_bytes(raw[at..at + 4].try_into().unwrap_or([0; 4]));
+    let kdf = match kdf {
+        None => None,
+        Some((_, _, _, true)) => return Err(Errno::EINVAL),
+        Some((hashname, otherinfo, oilen, false)) => {
+            if buflen > keys::KDF_MAX_OUTPUT as u64 || oilen > keys::KDF_MAX_OTHERINFO {
+                return Err(Errno::EMSGSIZE);
+            }
+            let name = read_str(cx, hashname, rk_crypto::MAX_ALG_NAME)?;
+            let name = core::str::from_utf8(&name).map_err(|_| Errno::ENOENT)?;
+            let hash = rk_crypto::alloc_hash(name)?;
+            // Linux copies the other information after the computation. Only the order of
+            // the errors differs.
+            let otherinfo = if oilen == 0 { Vec::new() } else { cx.read_bytes(otherinfo, oilen)? };
+            Some(keys::Kdf { hash, otherinfo })
+        }
+    };
+    let (len, data) =
+        cx.thread.with_keys(|k| keys::dh_compute(k, id(0), id(4), id(8), buflen as usize, kdf))?;
+    if !data.is_empty() {
+        cx.write_bytes(buf, &data)?;
+    }
+    Ok(len as u64)
+}
+
 /// `keyctl(operation, arg2, arg3, arg4, arg5)`.
 pub(crate) fn keyctl(cx: &mut Cx<'_>, op: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> SysResult {
     let id = a2 as i32;
@@ -268,6 +315,7 @@ pub(crate) fn keyctl(cx: &mut Cx<'_>, op: u64, a2: u64, a3: u64, a4: u64, a5: u6
             t.with_keys(|k| keys::move_key(k, id, a3 as i32, a4 as i32, a5 as u32))?;
             Ok(0)
         }
+        KEYCTL_DH_COMPUTE => dh_compute(cx, a2, a3, a4, a5),
         KEYCTL_CAPABILITIES => {
             let caps = keys::capabilities();
             if a3 > 0 {

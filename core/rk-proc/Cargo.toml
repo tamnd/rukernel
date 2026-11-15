@@ -16,6 +16,7 @@ rk-mm.workspace = true
 rk-vfs.workspace = true
 rk-cgroup.workspace = true
 rk-net.workspace = true
+rk-crypto.workspace = true
 zerocopy.workspace = true
 
 [lints]
