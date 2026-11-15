@@ -240,6 +240,25 @@ pub fn log_avc(text: &str) {
     log(AVC, text);
 }
 
+/// The type of the record of a policy load of SELinux, `AUDIT_MAC_POLICY_LOAD` of Linux.
+pub const MAC_POLICY_LOAD: u16 = 1403;
+
+/// The type of the record of a change of the mode of SELinux, `AUDIT_MAC_STATUS` of Linux.
+pub const MAC_STATUS: u16 = 1404;
+
+/// Sends a record of the type `ty` of a security module, with the text `text`, as
+/// `audit_log` of Linux.
+pub fn log_lsm(ty: u16, text: &str) {
+    log(ty, text);
+}
+
+/// The login user ID and the audit session ID of the current task, the `auid` and the `ses`
+/// of a record. A value that is not set is `AUDIT_UNSET`.
+pub fn login_ids() -> (u32, u32) {
+    let t = task();
+    (t.auid, t.ses)
+}
+
 /// Sends a `CONFIG_CHANGE` record, as `audit_log_config_change` of Linux.
 fn log_config_change(name: &str, new: u32, old: u32, res: bool) {
     let t = task();

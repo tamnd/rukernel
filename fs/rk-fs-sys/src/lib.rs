@@ -67,6 +67,19 @@ mod placed;
 
 pub use bus::{Param, add_param};
 
+/// The mount points below `/sys/fs` that [`add_fs_mount_point`] added.
+static FS_MOUNT_POINTS: rk_frame::sync::SpinLock<Vec<&'static str>> =
+    rk_frame::sync::SpinLock::new(Vec::new());
+
+/// Adds the empty directory `/sys/fs/NAME`, where a file system of a module is mounted, as
+/// `sysfs_create_mount_point(fs_kobj, NAME)` of Linux. SELinux adds `selinux`.
+pub fn add_fs_mount_point(name: &'static str) {
+    let mut points = FS_MOUNT_POINTS.lock();
+    if !points.contains(&name) {
+        points.push(name);
+    }
+}
+
 use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::String;
@@ -607,8 +620,16 @@ fn entries(path: &str, list: &[DeviceInfo], ns: &Weak<NetNs>) -> Option<Vec<(Str
         // `/sys/fs/cgroup` is the place where the init system mounts cgroup2, and `/sys/fs/bpf`
         // is the place for bpffs.
         // `/sys/fs/fuse/connections` is the place of fusectl.
-        ["fs"] => dirs(&mut ["bpf", "cgroup", "ext4", "fuse"].into_iter()),
+        ["fs"] => {
+            let mut names = Vec::from(["bpf", "cgroup", "ext4", "fuse"]);
+            names.extend(FS_MOUNT_POINTS.lock().iter().copied());
+            names.sort_unstable();
+            names.dedup();
+            dirs(&mut names.into_iter())
+        }
         ["fs", "bpf"] | ["fs", "cgroup"] | ["fs", "fuse", "connections"] => Vec::new(),
+        // A mount point that a module added, as `/sys/fs/selinux` of SELinux.
+        ["fs", name] if FS_MOUNT_POINTS.lock().contains(&name) => Vec::new(),
         ["fs", "fuse"] => dirs(&mut ["connections"].into_iter()),
         ["fs", "ext4"] => dirs(&mut ["features"].into_iter()),
         ["fs", "ext4", "features"] => EXT4_FEATURES
@@ -1074,8 +1095,16 @@ mod tests {
     }
 
     #[test]
+    fn a_module_adds_a_mount_point_below_fs() {
+        add_fs_mount_point("selinux");
+        add_fs_mount_point("selinux");
+        assert_eq!(names("fs"), ["bpf", "cgroup", "ext4", "fuse", "selinux"]);
+        assert!(names("fs/selinux").is_empty());
+    }
+
+    #[test]
     fn ext4_tells_its_features() {
-        assert_eq!(names("fs"), ["bpf", "cgroup", "ext4", "fuse"]);
+        assert!(names("fs").starts_with(&["bpf", "cgroup", "ext4", "fuse"].map(String::from)));
         assert!(names("fs/fuse/connections").is_empty());
         assert!(names("fs/bpf").is_empty());
         assert!(names("fs/cgroup").is_empty());

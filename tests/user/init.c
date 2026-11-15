@@ -16069,6 +16069,69 @@ static const unsigned char aa_min[] = "\x04\x08\x00" "version\x00" "\x02\x07\x00
 	"\x05\x07\x00" "rk_min\x00" "\x04\x06\x00" "flags\x00" "\x07" "\x02\x00\x00\x00\x00" "\x02\x01\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08"
 	"\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08";
 
+/*
+ * The checks of SELinux in permissive mode, with selinux=1: selinuxfs, the load of the policy
+ * /etc/rk_test.sel, which checkpolicy makes from sec/rk-lsm-selinux/tests/rk_test.conf, and a
+ * change of the mode. The values are those of Linux.
+ */
+static void test_selinux(void)
+{
+	static char buf[65536], pol[65536], back[65536];
+	unsigned long long ids[4] = { 0 };
+	unsigned int size = sizeof(ids), st4[5];
+	struct statfs sfs;
+	struct stat st;
+	int n, fd, len;
+
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("selinux: the boot log names SELinux after Yama", n > 0 && strstr(buf, "LSM: initializing lsm=capability,yama,selinux") != NULL && strstr(buf, "SELinux:  Initializing.") != NULL);
+	check("selinux: lsm_list_modules gives SELinux last", syscall(461, ids, &size, 0) == 3 && ids[0] == 100 && ids[1] == 105 && ids[2] == 101);
+	mkdir("/sys", 0755);
+	check("selinux: sysfs mounts", mount("sysfs", "/sys", "sysfs", 0, NULL) == 0);
+	check("selinux: /sys/fs/selinux is there", stat("/sys/fs/selinux", &st) == 0 && S_ISDIR(st.st_mode));
+	check("selinux: selinuxfs mounts", mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL) == 0);
+	check("selinux: statfs gives SELINUX_MAGIC", statfs("/sys/fs/selinux", &sfs) == 0 && (unsigned long)sfs.f_type == 0xf97cff8cUL);
+	check("selinux: load has the mode 0600 and the inode 3", stat("/sys/fs/selinux/load", &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 07777) == 0600 && st.st_ino == 3);
+	check("selinux: enforce is 0", aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	check("selinux: policyvers is 35", aa_read("/sys/fs/selinux/policyvers", buf, 64) == 2 && strcmp(buf, "35") == 0);
+	check("selinux: mls is 0 and deny_unknown is 1 before the load", aa_read("/sys/fs/selinux/mls", buf, 64) == 1 && strcmp(buf, "0") == 0 && aa_read("/sys/fs/selinux/deny_unknown", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	check("selinux: policy gives EINVAL before the load", aa_read("/sys/fs/selinux/policy", buf, 64) < 0 && errno == EINVAL);
+	n = aa_read("/sys/fs/selinux/status", buf, 64);
+	memcpy(st4, buf, sizeof(st4));
+	check("selinux: status has the version 1 and no load", n == 20 && st4[0] == 1 && st4[2] == 0 && st4[3] == 0 && st4[4] == 1);
+	check("selinux: a load of data that is not a policy gives EINVAL", aa_write("/sys/fs/selinux/load", "x", 1, 0) == EINVAL);
+	fd = open("/etc/rk_test.sel", O_RDONLY);
+	len = fd >= 0 ? read(fd, pol, sizeof(pol)) : -1;
+	if (fd >= 0)
+		close(fd);
+	check("selinux: a load of the policy rk_test works", len > 0 && aa_write("/sys/fs/selinux/load", pol, len, 0) == 0);
+	check("selinux: mls is 1 after the load", aa_read("/sys/fs/selinux/mls", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	check("selinux: policy_capabilities/open_perms is 1", aa_read("/sys/fs/selinux/policy_capabilities/open_perms", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	check("selinux: policy_capabilities/cgroup_seclabel is 0", aa_read("/sys/fs/selinux/policy_capabilities/cgroup_seclabel", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	n = aa_read("/sys/fs/selinux/policy", back, sizeof(back));
+	check("selinux: policy gives the policy back", n == len && memcmp(back, pol, len) == 0);
+	n = aa_read("/sys/fs/selinux/status", buf, 64);
+	memcpy(st4, buf, sizeof(st4));
+	check("selinux: status counts the load", n == 20 && st4[1] == 2 && st4[2] == 0 && st4[3] == 1);
+	check("selinux: a write of 1 to enforce works", aa_write("/sys/fs/selinux/enforce", "1", 1, O_TRUNC) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	n = aa_read("/sys/fs/selinux/status", buf, 64);
+	memcpy(st4, buf, sizeof(st4));
+	check("selinux: status has the enforcing mode", n == 20 && st4[1] == 4 && st4[2] == 1);
+	check("selinux: a write of 0 to enforce works", aa_write("/sys/fs/selinux/enforce", "0\n", 2, 0) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	check("selinux: a write of text to enforce gives EINVAL", aa_write("/sys/fs/selinux/enforce", "x", 1, 0) == EINVAL);
+	check("selinux: a write to checkreqprot does nothing", aa_write("/sys/fs/selinux/checkreqprot", "1", 1, 0) == 0 && aa_read("/sys/fs/selinux/checkreqprot", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	n = klogctl(3, buf, sizeof(buf) - 1);
+	buf[n > 0 ? n : 0] = 0;
+	check("selinux: the kernel log has the policy capabilities", n > 0 && strstr(buf, "SELinux:  policy capability network_peer_controls=1") != NULL && strstr(buf, "SELinux:  policy capability always_check_network=0") != NULL && strstr(buf, "SELinux:  policy capability bpf_token_perms=0") != NULL);
+	check("selinux: the kernel log has the failed load", strstr(buf, "SELinux: failed to load policy") != NULL);
+	check("selinux: the kernel log has the audit record of the load", strstr(buf, "audit: type=1403 audit(") != NULL && strstr(buf, "lsm=selinux res=1") != NULL);
+	check("selinux: the kernel log has the audit records of the mode", strstr(buf, "audit: type=1404 audit(") != NULL && strstr(buf, "enforcing=1 old_enforcing=0 auid=") != NULL && strstr(buf, "enforcing=0 old_enforcing=1 auid=") != NULL && strstr(buf, "enabled=1 old-enabled=1 lsm=selinux res=1") != NULL);
+	check("selinux: the kernel log has the write to checkreqprot", strstr(buf, "wrote to checkreqprot. This is no longer supported.") != NULL);
+	umount("/sys/fs/selinux");
+	umount("/sys");
+}
+
 /* AppArmor with apparmor=1, as security/apparmor of Linux: the module, its parameter, its files in securityfs, the load of a policy and the attach at exec. */
 static void test_apparmor(void)
 {
@@ -16358,6 +16421,8 @@ int main(int argc, char **argv)
 		test_lsm();
 	if (argc > 1 && strcmp(argv[1], "apparmor") == 0)
 		test_apparmor();
+	if (argc > 1 && strcmp(argv[1], "selinux") == 0)
+		test_selinux();
 	if (argc > 1 && strcmp(argv[1], "audit") == 0)
 		test_audit();
 	if (argc > 1 && strcmp(argv[1], "keys") == 0) {

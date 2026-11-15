@@ -462,6 +462,7 @@ const BOOT_TESTS: &[&str] = &[
     "smp",
     "blk",
     "apparmor",
+    "selinux",
     "net",
     "tpm",
     "inet",
@@ -2042,6 +2043,10 @@ fn build_kernel() -> Result<PathBuf> {
 /// `apparmor_parser` 4.0.1, which attaches to /usr/bin/rk-test.
 const AA_TEST_POLICY: &[u8] = include_bytes!("../../sec/rk-lsm-apparmor/tests/rk_test.bin");
 
+/// The SELinux policy of the boot test `selinux`: tests/rk_test.conf of the crate, from
+/// `checkpolicy` 3.11 in the policy version 35.
+const SEL_TEST_POLICY: &[u8] = include_bytes!("../../sec/rk-lsm-selinux/tests/rk_test.35.bin");
+
 fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>, busybox: Option<&[u8]>) -> Vec<u8> {
     let mut w = rk_vfs::cpio::Writer::new();
     w.add(b".", 0o040_755, b"");
@@ -2055,6 +2060,7 @@ fn test_initramfs(user: Option<&(Vec<u8>, Vec<u8>)>, busybox: Option<&[u8]>) -> 
             w.add(b"bin", 0o040_755, b"");
             w.add(b"bin/hello", 0o100_755, hello);
             w.add(b"etc/rk_test.aa", 0o100_644, AA_TEST_POLICY);
+            w.add(b"etc/rk_test.sel", 0o100_644, SEL_TEST_POLICY);
         }
         None => w.add(b"init", 0o100_755, b"#!/bin/sh\n"),
     }
@@ -2483,7 +2489,7 @@ fn qemu(args: &[String]) -> Result {
 /// the `busybox` test needs BusyBox.
 fn can_run(kernel: &Path, test: &str) -> bool {
     match test {
-        "init" | "tty" | "smp" | "blk" | "apparmor" | "inet" => {
+        "init" | "tty" | "smp" | "blk" | "apparmor" | "selinux" | "inet" => {
             kernel.with_file_name("user-init").exists()
         }
         "busybox" | "netcfg" | "inet6" | "netns" => kernel.with_file_name("busybox-ready").exists(),
@@ -2583,6 +2589,8 @@ fn base_cmdline(test: &str) -> String {
         "blk" => String::from("console=ttyS0 rk.test=init -- blk"),
         // AppArmor is active only with `apparmor=1`. The other checks of init run without it.
         "apparmor" => String::from("console=ttyS0 rk.test=init apparmor=1 -- only apparmor"),
+        // SELinux is active only with `selinux=1`.
+        "selinux" => String::from("console=ttyS0 rk.test=init selinux=1 -- only selinux"),
         // The address, the netmask and the gateway of the user network of QEMU.
         "inet" => {
             String::from("console=ttyS0 rk.test=init ip=10.0.2.15::10.0.2.2:255.255.255.0 -- inet")
@@ -2624,6 +2632,7 @@ fn pass_line(test: &str) -> String {
             | "smp"
             | "blk"
             | "apparmor"
+            | "selinux"
             | "inet"
             | "netcfg"
             | "inet6"
@@ -3180,7 +3189,8 @@ const AARCH64_TESTS: &[&str] =
 /// also needs an arm64 BusyBox from `RK_BUSYBOX_AARCH64`, which tools/busybox/build.sh makes. The
 /// `blk` and `inet` tests also run with virtio-pci devices on the PCI bus of the ECAM host, see
 /// `AARCH64_PCI_RUNS`.
-const AARCH64_USER_TESTS: &[&str] = &["init", "smp", "blk", "apparmor", "inet", "busybox"];
+const AARCH64_USER_TESTS: &[&str] =
+    &["init", "smp", "blk", "apparmor", "selinux", "inet", "busybox"];
 
 /// The tests of `SYSTEMD_TESTS` that `boot-test aarch64` runs on the arm64 tree of the `systemd`
 /// test. `RK_SYSTEMD_AARCH64` gives the tarball of the tree, from

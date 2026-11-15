@@ -1,0 +1,21 @@
+[package]
+name = "rk-lsm-selinux"
+description = "SELinux for rukernel: the security module that labels tasks and objects and checks each access against a policy."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+rk-abi.workspace = true
+rk-frame.workspace = true
+rk-fs-sys.workspace = true
+rk-net.workspace = true
+rk-proc.workspace = true
+rk-vfs.workspace = true
+
+[lints]
+workspace = true
