@@ -5,7 +5,9 @@
 //! that wakes goes to an idle CPU if one is free, as `select_idle_sibling` of Linux does, and
 //! else to the CPU where it ran last. A CPU that becomes idle pulls a task from the busiest queue,
 //! as `sched_balance_newidle` of Linux does, and a busy CPU evens out the queues at intervals, as
-//! `sched_balance_rq` does. The load of a queue is its number of tasks. Linux uses the PELT load.
+//! `sched_balance_rq` does. An idle CPU looks at the number of tasks of a queue, and a busy CPU
+//! looks at the sum of the weights of its tasks, as Linux does with `migrate_task` and
+//! `migrate_load`. Linux uses the PELT load, and this balancer uses the weights of now.
 
 /// The load of the run queue of one CPU.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -14,6 +16,9 @@ pub struct Load {
     pub queued: usize,
     /// Tells if a task of the fair class runs on the CPU.
     pub running: bool,
+    /// The sum of the weights of the tasks that wait and of the task that runs, as the load of a
+    /// queue in Linux. The weights include the part of `cpu.weight` of the cgroups.
+    pub weight: u64,
 }
 
 impl Load {
@@ -63,17 +68,36 @@ pub fn select_cpu(prev: usize, this: usize, allowed: u64, loads: &[Load], new: b
 }
 
 /// The CPU from which the CPU `this` pulls a task, as `sched_balance_find_src_rq` of Linux finds
-/// it. The CPUs in the mask `skip` do not count. A CPU counts if it has a task that waits and has
-/// at least two tasks more than `this`, so that the move of one task makes the loads more equal.
+/// it. The CPUs in the mask `skip` do not count. A CPU counts only if it has a task that waits.
+///
+/// An idle CPU counts the tasks, as Linux does when the local group has spare capacity: a CPU
+/// counts if it has at least two tasks, so that the move of one task makes the loads more equal.
 /// An idle CPU can also pull from a CPU that has a task in its queue but runs no task yet. That
 /// CPU can be slow to wake up, and the task then runs at once on `this`. Of those CPUs, the CPU
 /// with the most tasks comes first, and then the CPU with the lowest number.
+///
+/// A busy CPU compares the weights, as Linux does when both groups are busy: a CPU counts if its
+/// weight is more than the weight of `this`, and `movable` then tells which task can move. Of
+/// those CPUs, the CPU with the most weight comes first, and then the CPU with the lowest number.
 pub fn busiest(this: usize, loads: &[Load], skip: u64) -> Option<usize> {
     let own = loads.get(this)?;
-    let floor = own.nr() + 2;
-    let counts = |l: &Load| l.queued > 0 && (l.nr() >= floor || (own.is_idle() && !l.running));
+    let idle = own.is_idle();
+    let counts = |l: &Load| {
+        l.queued > 0 && if idle { l.nr() >= 2 || !l.running } else { l.weight > own.weight }
+    };
+    let key = |l: &Load| if idle { u64::try_from(l.nr()).unwrap_or(u64::MAX) } else { l.weight };
     (0..loads.len())
         .filter(|&c| c != this && !allows(skip, c))
         .filter(|&c| counts(&loads[c]))
-        .max_by_key(|&c| (loads[c].nr(), core::cmp::Reverse(c)))
+        .max_by_key(|&c| (key(&loads[c]), core::cmp::Reverse(c)))
+}
+
+/// Tells if a task with the weight `weight` that waits on the CPU with the load `src` can move to
+/// the CPU with the load `own`, after `busiest` chose `src`. Each task can move to an idle CPU. To
+/// a busy CPU, a task moves only if the loads after the move are not further apart and the load of
+/// `src` stays at least the load of `own`, as `detach_tasks` of Linux moves a task only if its
+/// load is not more than the imbalance, half the difference. With equal weights, this is a
+/// difference of at least two tasks.
+pub fn movable(own: &Load, src: &Load, weight: u64) -> bool {
+    own.is_idle() || weight.saturating_mul(2) <= src.weight.saturating_sub(own.weight)
 }

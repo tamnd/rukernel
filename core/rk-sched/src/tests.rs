@@ -328,10 +328,10 @@ fn a_stolen_task_keeps_its_lag_on_the_other_queue() {
     src.push('c', entity(2000, 9000));
     // The average of the source is 2000. `c` has the latest deadline, but the test does not let
     // it move, so `b` moves. Its lag is negative, because it ran more than the average.
-    let (t, mut e) = src.steal(None, 4_000_000, |&t| t != 'c').expect("a task");
+    let (t, mut e) = src.steal(None, 4_000_000, |&t, _| t != 'c').expect("a task");
     assert_eq!((t, e.lag), ('b', -1000));
     src.push(t, entity(3000, 6000));
-    let (t, e2) = src.steal(None, 4_000_000, |&t| t == 'a').expect("a task");
+    let (t, e2) = src.steal(None, 4_000_000, |&t, _| t == 'a').expect("a task");
     assert_eq!((t, e2.lag), ('a', 1000));
     assert_eq!(src.len(), 2);
     assert_eq!(src.avg_vruntime(None), 2500);
@@ -343,14 +343,21 @@ fn a_stolen_task_keeps_its_lag_on_the_other_queue() {
     dst.place(&mut e, None, false);
     assert_eq!(e.vruntime, 50_000 - 2000);
     // A task that no test allows stays.
-    assert!(src.steal(None, 4_000_000, |_| false).is_none());
+    assert!(src.steal(None, 4_000_000, |_, _| false).is_none());
     assert_eq!(src.len(), 2);
+}
+
+/// The load of a CPU with `queued` tasks that wait, and a task that runs if `running`, all with
+/// the weight of nice 0.
+fn equal_load(queued: usize, running: bool) -> balance::Load {
+    let nr = queued + usize::from(running);
+    balance::Load { queued, running, weight: nr as u64 * weight_of(0) }
 }
 
 #[test]
 fn a_task_that_wakes_goes_to_an_idle_cpu() {
     use balance::{Load, select_cpu};
-    let busy = Load { queued: 1, running: true };
+    let busy = equal_load(1, true);
     let idle = Load::default();
     // The CPU that wakes the task is idle: the task runs there.
     assert_eq!(select_cpu(2, 1, u64::MAX, &[busy, idle, idle, busy], false), 1);
@@ -360,7 +367,7 @@ fn a_task_that_wakes_goes_to_an_idle_cpu() {
     assert_eq!(select_cpu(3, 0, u64::MAX, &[busy, busy, idle, busy], false), 2);
     // No CPU is idle: a task that wakes stays on its last CPU, and a new task goes to the CPU
     // with the fewest tasks.
-    let one = Load { queued: 0, running: true };
+    let one = equal_load(0, true);
     assert_eq!(select_cpu(0, 0, u64::MAX, &[busy, one, busy], false), 0);
     assert_eq!(select_cpu(0, 0, u64::MAX, &[busy, one, busy], true), 1);
 }
@@ -368,7 +375,7 @@ fn a_task_that_wakes_goes_to_an_idle_cpu() {
 #[test]
 fn the_choice_of_a_cpu_follows_the_affinity_mask() {
     use balance::{Load, select_cpu};
-    let busy = Load { queued: 2, running: true };
+    let busy = equal_load(2, true);
     let idle = Load::default();
     // CPU 1 is idle, but the mask has only CPUs 2 and 3.
     assert_eq!(select_cpu(0, 0, 0b1100, &[busy, idle, busy, busy], false), 2);
@@ -379,8 +386,8 @@ fn the_choice_of_a_cpu_follows_the_affinity_mask() {
 
 #[test]
 fn an_idle_cpu_pulls_from_the_busiest_queue() {
-    use balance::{Load, busiest};
-    let load = |queued, running| Load { queued, running };
+    use balance::busiest;
+    let load = equal_load;
     let loads = [load(0, false), load(1, true), load(3, true), load(2, true)];
     assert_eq!(busiest(0, &loads, 0), Some(2));
     // The balancer skips a CPU that has no task that can move.
@@ -394,24 +401,52 @@ fn an_idle_cpu_pulls_from_the_busiest_queue() {
 
 #[test]
 fn the_periodic_balance_evens_out_the_queues() {
-    use balance::{Load, busiest};
-    let load = |queued, running| Load { queued, running };
+    use balance::{Load, busiest, movable};
+    let load = equal_load;
+    let w = weight_of(0);
     // A move of one task from 2 tasks to 1 task does not make the loads more equal.
-    assert_eq!(busiest(0, &[load(0, true), load(1, true)], 0), None);
-    assert_eq!(busiest(0, &[load(0, true), load(2, true)], 0), Some(1));
+    assert_eq!(busiest(0, &[load(0, true), load(1, true)], 0), Some(1));
+    assert!(!movable(&load(0, true), &load(1, true), w));
+    assert!(movable(&load(0, true), &load(2, true), w));
     // Repeated balances end with loads that differ by at most one.
     let mut loads = [load(0, true), load(7, true), load(0, true), load(1, true)];
     for _ in 0..20 {
         for this in 0..loads.len() {
-            if let Some(src) = busiest(this, &loads, 0) {
-                loads[src].queued -= 1;
-                loads[this].queued += 1;
+            if let Some(src) = busiest(this, &loads, 0)
+                && movable(&loads[this], &loads[src], w)
+            {
+                loads[src] = load(loads[src].queued - 1, true);
+                loads[this] = load(loads[this].queued + 1, true);
             }
         }
     }
     let nr: Vec<usize> = loads.iter().map(Load::nr).collect();
     assert_eq!(nr.iter().sum::<usize>(), 12);
     assert!(nr.iter().all(|&n| n == 3), "{nr:?}");
+}
+
+#[test]
+fn a_busy_cpu_evens_out_the_weights() {
+    use balance::{Load, busiest, movable};
+    // Two tasks of a cgroup with the weight 2 and one task of a cgroup with the weight 1 are on
+    // CPU 0, and three tasks with the weight 1 are on CPU 1, as in the test
+    // test_cpucg_nested_weight_overprovisioned of kselftest. The numbers of tasks are equal, but
+    // CPU 0 has more weight, so a task with the weight 1 moves, as in Linux.
+    let cpu0 = Load { queued: 2, running: true, weight: 5 };
+    let cpu1 = Load { queued: 2, running: true, weight: 3 };
+    assert_eq!(busiest(1, &[cpu0, cpu1], 0), Some(0));
+    assert!(movable(&cpu1, &cpu0, 1));
+    assert!(!movable(&cpu1, &cpu0, 2));
+    // After the move, the weights are equal and no task moves.
+    let cpu0 = Load { queued: 1, running: true, weight: 4 };
+    let cpu1 = Load { queued: 3, running: true, weight: 4 };
+    assert_eq!(busiest(0, &[cpu0, cpu1], 0), None);
+    assert_eq!(busiest(1, &[cpu0, cpu1], 0), None);
+    // An idle CPU counts the tasks: it takes a heavy task that waits.
+    let idle = Load::default();
+    let two = Load { queued: 1, running: true, weight: 9 };
+    assert_eq!(busiest(0, &[idle, two], 0), Some(1));
+    assert!(movable(&idle, &two, 8));
 }
 
 #[test]

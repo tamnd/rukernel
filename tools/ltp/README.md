@@ -1,12 +1,13 @@
 # LTP
 
-This directory has the files that run the Linux Test Project (LTP) on rukernel, and the record of the results of the syscalls, mm, sched, net and pty groups. The exit of R4 uses the first four groups.
+This directory has the files that run the Linux Test Project (LTP) on rukernel, and the record of the results of the syscalls, mm, sched, net, pty and controllers groups. The exit of R4 uses the first four groups.
 
 - `build.sh` builds LTP as static musl programs in an Alpine container. Without `--full`, it builds the tests of the `ltp` boot test. With `--full`, it builds all of LTP.
 - `tests.txt` has the tests that `cargo xtask boot-test ltp` runs, and the reasons why other tests are not in it.
 - `kconfig` tells LTP the kernel options of rukernel.
 - `run.py` runs runtest files of LTP on rukernel under QEMU, in batches.
 - `syscalls.md`, `mm.md`, `sched.md`, `net.md` and `pty.md` have the result of each test of a group.
+- `controllers.md` has the result of each test of runtest/controllers on rukernel and on the Linux 6.8 reference kernel (#536).
 - `notes.txt` has a note for some tests: the missing feature, or the pull request that fixed the test.
 - `linux.txt` has the Linux code that each test checks, as paths in the Linux tree.
 - `report.py` makes the result files from the logs of the runs, and `update.sh` copies the logs from the test server and runs `report.py`.
@@ -295,3 +296,12 @@ tools/ltp/report.py --logs RUNS --src SRC/testcases --notbuilt NOTBUILT
 Each test links to its source in LTP at the tag of `build.sh`, and the description is the first sentence of the description in the source. Each test also links to the code of the reference kernel, Linux 7.3, from `linux.txt`. The version comes from `tools/rk-abigen`. If the Linux tarball of `rk-abigen` is in its cache, `report.py` stops when a path of `linux.txt` is not in that version. When a test links to the wrong code, change `linux.txt`.
 
 Write a new line in `notes.txt` when a pull request fixes a test, or when a test needs a feature that rukernel does not have. The note then shows in the tables and gives the group of the test in the work that remains. Without a note, `report.py` finds the cause in the first `TFAIL`, `TBROK` or `TCONF` line of the output of the test.
+
+`controllers.md` compares rukernel with a Linux reference kernel. `run.py --linux` boots the Linux kernel with the same LTP tree and init script, and adds `panic=-1 cgroup_no_v1=all` to its command line. `--kconfig` gives the options of that kernel. `report.py --linux-logs` then adds a Linux column, and `--groups` writes only the given groups and does not change this file. The runs of #536 used the Ubuntu kernel 6.8.0-147-generic, with one CPU and TCG on a quiet host. Under a high load (more than 20), the cgroup_fj_stress tests do not end in their time limit, on both kernels.
+
+```sh
+tools/ltp/run.py --kernel KERNEL --ltp ~/rkltp/ltp --busybox BUSYBOX --jobs 1 --out RK controllers
+tools/ltp/run.py --linux --kernel /boot/vmlinuz-6.8.0-147-generic --kconfig /boot/config-6.8.0-147-generic \
+    --ltp ~/rkltp/ltp --busybox BUSYBOX --jobs 1 --out LINUX controllers
+tools/ltp/report.py --logs RK --linux-logs LINUX --groups controllers --src SRC/testcases --notbuilt NOTBUILT
+```

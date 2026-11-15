@@ -18,7 +18,8 @@ TESTS="seccomp/seccomp_bpf net/af_unix/scm_pidfd timens/timens timens/timerfd ti
 	lsm/lsm_get_self_attr_test lsm/lsm_set_self_attr_test lsm/lsm_list_modules_test
 	pidfd/pidfd_fdinfo_test pidfd/pidfd_file_handle_test pidfd/pidfd_info_test
 	pidfd/pidfd_exec_helper pidfd/pidfd_setns_test
-	cgroup/test_core cgroup/test_cpuset cgroup/test_freezer cgroup/test_kill"
+	cgroup/test_core cgroup/test_cpuset cgroup/test_freezer cgroup/test_kill
+	cgroup/test_memcontrol cgroup/test_cpu"
 
 out=${1:?usage: tools/kselftest/build.sh OUT_DIR}
 mkdir -p "$out"
