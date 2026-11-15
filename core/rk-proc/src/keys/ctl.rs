@@ -55,6 +55,10 @@ pub fn add_key(
     // A key without a description takes the description that its type proposes.
     let proposed = prep.desc.take();
     let desc = desc.or(proposed.as_deref()).ok_or(Errno::EINVAL)?;
+    // An `encrypted` key is made here, because a `load` can wait for its master key. Its
+    // error comes where Linux calls `instantiate`, after the checks of the keyring.
+    let enc =
+        (kind == Kind::Encrypted).then(|| super::encrypted::instantiate(cx, desc, &prep.payload));
     let _g = LINK_LOCK.lock();
     let replace = begin_restricted_link(Some(cx), &ring.key, kind, desc, prep.asym.as_deref())?;
     if kind.can_update() {
@@ -64,10 +68,18 @@ pub fn add_key(
         if let Some(key) = old {
             abort_link(&ring.key, replace);
             permission(cx, &key, ring.possessed, WRITE)?;
-            change_payload(&key, prep.payload)?;
+            update_key(&key, prep.payload)?;
             return Ok(key.serial);
         }
     }
+    let prep = match enc {
+        None => prep,
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
+            abort_link(&ring.key, replace);
+            return Err(e);
+        }
+    };
     let key = alloc(
         kind,
         desc,
@@ -93,9 +105,19 @@ pub fn add_key(
     Ok(key.serial)
 }
 
-/// Puts a new payload in `key` and makes it positive, as `__key_update`. The old payload goes
-/// after the lock.
-fn change_payload(key: &Key, payload: Vec<u8>) -> Result<(), Errno> {
+/// Puts a new payload in `key` and makes it positive, as `__key_update` and the `update` of the
+/// type. The old payload goes after the lock.
+fn update_key(key: &Key, payload: Vec<u8>) -> Result<(), Errno> {
+    if key.kind == Kind::Encrypted {
+        let old = key.state.lock().enc.clone();
+        let enc = super::encrypted::update(old.as_deref(), &payload)?;
+        let mut s = key.state.lock();
+        set_payload(&mut s, Vec::new(), enc.quota())?;
+        let old = s.enc.replace(Arc::new(enc));
+        drop(s);
+        drop(old);
+        return Ok(());
+    }
     let old = {
         let mut s = key.state.lock();
         // An update takes the length of the payload in the quota, as `user_update` and
@@ -274,7 +296,7 @@ pub fn update(cx: &Caller<'_>, id: i32, payload: Vec<u8>) -> Result<(), Errno> {
         return Err(Errno::EOPNOTSUPP);
     }
     r.key.kind.check_payload(&payload)?;
-    change_payload(&r.key, payload)
+    update_key(&r.key, payload)
 }
 
 /// Revokes a key, as `KEYCTL_REVOKE`. The write or the setattr permission is necessary. The
@@ -571,6 +593,10 @@ pub fn read(cx: &Caller<'_>, id: i32, buflen: usize) -> Result<(usize, Vec<u8>),
         }
         let out = links.iter().flat_map(|k| k.serial.to_ne_bytes()).collect();
         return Ok((full, out));
+    }
+    if key.kind == Kind::Encrypted {
+        let enc = key.state.lock().enc.clone().ok_or(Errno::EKEYREVOKED)?;
+        return super::encrypted::read(cx, &enc, buflen);
     }
     let s = key.state.lock();
     if let Some(e) = s.error {

@@ -284,6 +284,7 @@ fn finish(key: &Key, result: Result<Prep, (Errno, u64)>, now: u64) -> Result<(),
                 let old = set_payload(&mut s, prep.payload, prep.quota)?;
                 s.error = prep.error;
                 s.asym = prep.asym;
+                s.enc = prep.enc;
                 if prep.short {
                     s.expiry = now + 1;
                 }
@@ -419,7 +420,10 @@ fn end(
 pub fn instantiate(cx: &Caller<'_>, id: i32, payload: Vec<u8>, ring: i32) -> Result<(), Errno> {
     let (auth, target, dest) = authority(cx, id)?;
     let ring = dest_ring(cx, ring, dest)?;
-    let payload = target.kind.preparse(payload)?;
+    let payload = match target.kind {
+        Kind::Encrypted => super::encrypted::instantiate(cx, &target.desc, &payload)?,
+        kind => kind.preparse(payload)?,
+    };
     end(cx, &auth, &target, ring, Ok(payload))
 }
 
