@@ -8,6 +8,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The `encrypted` key type, as security/keys/encrypted-keys of Linux: the kernel keeps the decrypted data, and a read gives the data encrypted with AES-CBC and an HMAC with SHA-256, with keys that come from a `user` master key. `new` with the data in hexadecimal is available, as Linux with `CONFIG_USER_DECRYPTED_DATA`, and `load` and `update` too. LTP keyctl09 passes. (#539)
 - The `asymmetric` key type, as crypto/asymmetric_keys of Linux: the X.509 parser and the PKCS#8 parser in rk-crypto, RSA keys, `KEYCTL_PKEY_QUERY`, `KEYCTL_PKEY_ENCRYPT`, `KEYCTL_PKEY_DECRYPT`, `KEYCTL_PKEY_SIGN` and `KEYCTL_PKEY_VERIFY` with the `pkcs1` and `raw` encodings, and the keyring restrictions `builtin_trusted` and `key_or_keyring` of `KEYCTL_RESTRICT_KEYRING`. `KEYCTL_CAPABILITIES` gives `KEYCTL_CAPS0_PUBLIC_KEY`. LTP keyctl23, keyctl24, keyctl29 and keyctl30 pass. (#539)
+- nf_tables: the expression `xfrm`, as nft_xfrm.c of Linux, for `ipsec in reqid`, `ipsec out spi` and the addresses of the IPsec state. The checks of the attributes and of the hooks are the same as on Linux. rukernel has no IPsec, so the expression gives no result, as on Linux for a packet that IPsec did not touch (#542).
 
 ## [0.5.34] - 2026-11-15
 
