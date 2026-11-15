@@ -1102,7 +1102,8 @@ pub(crate) fn ip_input(dev: &NetDevice, mut frame: NetBuf, host: bool) {
     };
     let Some(h) = nf_hook4(NF_INET_LOCAL_IN, &mut frame, h, dev.ifindex(), 0) else { return };
     let dif = dif_of(dev);
-    let info = Info6::of4(&h, dev.ifindex(), spec_dst(dev, &h, local && !broadcast && !mcast));
+    let unicast = local && !broadcast && !mcast;
+    let info = Info6::of4(&h, rx_ifindex(dev, &h, unicast), spec_dst(dev, &h, unicast));
     let raw = raw_sockets(AF_INET, h.protocol);
     for sock in &raw {
         sock.deliver_raw(&h, frame.data(), dif, info);
@@ -1344,6 +1345,16 @@ fn spec_dst(dev: &NetDevice, h: &Header, unicast: bool) -> Addr {
     }
     let scope = if h.src == ipv4::ANY { RT_SCOPE_LINK } else { RT_SCOPE_UNIVERSE } as u8;
     ROUTES.lock().select_addr(dev.ifindex(), h.src, scope).unwrap_or(ipv4::ANY)
+}
+
+/// The interface index of `IP_PKTINFO` for the packet `h` that came in on `dev`, as
+/// `ipv4_pktinfo_prepare` of Linux. A packet on the loopback device to a local address gives
+/// the device of the address, which is the `rt_iif` of its route, and not the loopback device.
+/// systemd-resolved takes the interface of a DNS reply from it.
+fn rx_ifindex(dev: &NetDevice, h: &Header, unicast: bool) -> u32 {
+    let loopback = dev.kind() == LinkKind::Loopback;
+    let local = if loopback && unicast { ROUTES.lock().local_dev(h.dst) } else { None };
+    local.unwrap_or(dev.ifindex())
 }
 
 /// Takes a UDP datagram, as `udp_rcv` of Linux. `packet` has the IPv4 header, and it came in

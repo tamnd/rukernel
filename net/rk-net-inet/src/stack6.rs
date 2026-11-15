@@ -943,7 +943,7 @@ pub(crate) fn input(dev: &NetDevice, frame: NetBuf, host: bool) {
     }
     match h.protocol {
         PROTO_ICMPV6 => icmp_input(dev, &h, packet, mcast),
-        PROTO_UDP => udp_input(&h, ifindex, packet, mcast, dif),
+        PROTO_UDP => udp_input(&h, ifindex, packet, mcast, dif, rx_ifindex(dev, &h, mcast)),
         PROTO_TCP => crate::tcp::input(h.src, h.dst, packet, payload, mcast, dif, ifindex, false),
         NEXT_NONE => {}
         _ if raw.is_empty() => {
@@ -1369,9 +1369,20 @@ fn ndisc_ra(dev: &NetDevice, h: &Header, msg: &[u8]) {
     }
 }
 
+/// The interface of a received packet for `IPV6_PKTINFO` and the scope of a link local source,
+/// as `inet6_iif` of Linux. A packet on the loopback device to a local address gives the
+/// interface of the address, as the device of `rt6i_idev` of its route, and not the loopback
+/// device. systemd-resolved takes the interface of a DNS reply from it.
+fn rx_ifindex(dev: &NetDevice, h: &Header, mcast: bool) -> u32 {
+    let loopback = dev.kind() == LinkKind::Loopback;
+    let local = if loopback && !mcast { ROUTES6.lock().local_dev(&h.dst) } else { None };
+    local.unwrap_or(dev.ifindex())
+}
+
 /// Takes a UDP datagram over IPv6, as `udpv6_rcv` of Linux. `packet` has the IPv6 header.
-/// IPv6 needs the checksum of UDP.
-fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool, dif: u32) {
+/// IPv6 needs the checksum of UDP. `rx` is the interface for the control messages and the
+/// scope of the source.
+fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool, dif: u32, rx: u32) {
     let d = &packet[h.l4..];
     let Some(u) = UdpHeader::parse(d) else { return count(&COUNTERS6.udp_in_errors) };
     let d = &d[..usize::from(u.len)];
@@ -1387,8 +1398,8 @@ fn udp_input(h: &Header, ifindex: u32, packet: &[u8], mcast: bool, dif: u32) {
         }
         return;
     };
-    let info = Some(Info6::of(h, ifindex));
-    let (scope, data) = (scope_of(&h.src, ifindex), d[UDP_HLEN..].to_vec());
+    let info = Some(Info6::of(h, rx));
+    let (scope, data) = (scope_of(&h.src, rx), d[UDP_HLEN..].to_vec());
     if sock.deliver(packet, h.src, scope, u.src, data, info) {
         count(&COUNTERS6.udp_in);
     } else {

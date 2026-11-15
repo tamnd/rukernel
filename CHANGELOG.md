@@ -31,6 +31,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - selinuxfs: the directory `policy_capabilities` has the inode number 32 of Linux, not 28 (#540).
 - `IFLA_CARRIER` sets the carrier of a dummy device, as `ndo_change_carrier` of Linux, so `ip link set DEV carrier off` works on a dummy device and the other devices give `EOPNOTSUPP`. Before, the kernel ignored the attribute. The systemd-networkd tests of `ConfigureWithoutCarrier=` use it (#538).
 - A send on a TCP socket with `MSG_FASTOPEN` connects to the address of the message, as `tcp_sendmsg_fastopen` of Linux. Without a cookie the SYN takes no data, so a send without a wait gives `EINPROGRESS`. Before this, the send gave `EPIPE`, so systemd-resolved with `DNSOverTLS=opportunistic` changed the server for each query and did not fall back to plain DNS (#538).
+- For a packet on the loopback device to a local address, `IP_PKTINFO` and `IPV6_PKTINFO` give the device of the address, as Linux does. Before, they gave the loopback device, and systemd-resolved gave no ifindex in the answer of `ResolveService` (#538).
 
 ## [0.5.36] - 2026-11-17
 

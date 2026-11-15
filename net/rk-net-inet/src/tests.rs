@@ -305,6 +305,27 @@ fn routes() {
     assert_eq!(t.lookup([8, 8, 8, 8]), Err(Errno::ENETUNREACH));
 }
 
+/// For a packet on the loopback device to a local address, `IP_PKTINFO` and `IPV6_PKTINFO`
+/// give the device of the address, as Linux does. systemd-resolved uses it as the ifindex of
+/// the answer.
+#[test]
+fn a_local_address_has_the_device_of_its_route() {
+    use crate::route6::{Addr6, Table6};
+    let t = qemu_table();
+    assert_eq!(t.local_dev([10, 0, 2, 15]), Some(2));
+    assert_eq!(t.local_dev([127, 1, 2, 3]), Some(1));
+    assert_eq!(t.local_dev([10, 0, 2, 3]), None);
+    assert_eq!(t.local_dev([10, 0, 2, 255]), None);
+    let mut t = Table6::new();
+    t.set_loopback(1);
+    t.insert_addr(Addr6::new(1, ip::LOOPBACK, 128)).unwrap();
+    let site = v6([0xfd00, 0, 0, 0, 0, 0, 0, 1]);
+    t.insert_addr(Addr6::new(2, site, 64)).unwrap();
+    assert_eq!(t.local_dev(&site), Some(2));
+    assert_eq!(t.local_dev(&ip::LOOPBACK), Some(1));
+    assert_eq!(t.local_dev(&v6([0xfd00, 0, 0, 0, 0, 0, 0, 2])), None);
+}
+
 /// The routes of the kernel for the addresses, in the order of `ip route show table all`.
 #[test]
 fn kernel_routes() {
