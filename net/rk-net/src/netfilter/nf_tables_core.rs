@@ -61,6 +61,8 @@ mod nft_flowtable;
 mod nft_objects;
 #[path = "nft_rt.rs"]
 mod nft_rt;
+#[path = "nft_xfrm.rs"]
+mod nft_xfrm;
 
 #[cfg(test)]
 pub(crate) use self::nft_exprs::nft_log_line;
@@ -90,6 +92,7 @@ use self::nft_objects::{
 };
 use self::nft_rt::{NftRt, nft_rt_eval, nft_rt_init};
 pub use self::nft_rt::{NftRtRouteFn, nft_rt_set_fn};
+use self::nft_xfrm::{NftXfrm, nft_xfrm_eval, nft_xfrm_init};
 
 // The attributes of an expression, `NFTA_EXPR_*`.
 const NFTA_EXPR_NAME: u32 = 1;
@@ -337,6 +340,8 @@ pub(super) enum NftExpr {
     Fib(NftFib),
     /// `rt`, as nft_rt.c.
     Rt(NftRt),
+    /// `xfrm`, as nft_xfrm.c.
+    Xfrm(NftXfrm),
     /// `exthdr`, as nft_exthdr.c.
     Exthdr(NftExthdr),
     /// `dynset`, as nft_dynset.c.
@@ -576,6 +581,21 @@ pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec
     b.finish()[HDRLEN..].to_vec()
 }
 
+/// The bytes of an expression with a state that changes after the rule came, as `counter`, at
+/// the time of a dump, as `nft_counter_dump` of Linux gives the bytes and the packets that the
+/// rule counted so far. The other expressions give `None`: their bytes stay the ones of
+/// `nft_expr_dump`.
+pub(super) fn nft_expr_dump_state(expr: &NftExpr) -> Option<Vec<u8>> {
+    let NftExpr::Counter { packets, bytes } = expr else { return None };
+    let mut b = Builder::new(0, 0, 0, 0);
+    b.put(NFTA_EXPR_NAME as u16, b"counter\0");
+    let at = b.nest(NFTA_EXPR_DATA as u16);
+    b.put(NFTA_COUNTER_BYTES as u16, &bytes.load(Ordering::Relaxed).to_be_bytes())
+        .put(NFTA_COUNTER_PACKETS as u16, &packets.load(Ordering::Relaxed).to_be_bytes());
+    b.end_nest(at);
+    Some(b.finish()[HDRLEN..].to_vec())
+}
+
 /// Copies the attributes `nla` to `b`, with the name `chain` in place of the chain of the
 /// verdict at the end of the nested attributes `path`.
 fn nft_verdict_chain_dump(b: &mut Builder, nla: &[u8], path: &[u32], chain: &[u8]) {
@@ -798,6 +818,7 @@ pub(super) fn nf_tables_expr_parse(
         b"reject" => Ok(NftExpr::Reject(nft_reject_init(table.family, data)?)),
         b"fib" => Ok(NftExpr::Fib(nft_fib_init(table.family, data)?)),
         b"rt" => Ok(NftExpr::Rt(nft_rt_init(table.family, data)?)),
+        b"xfrm" => Ok(NftExpr::Xfrm(nft_xfrm_init(table.family, data)?)),
         b"exthdr" => Ok(NftExpr::Exthdr(nft_exthdr_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
         b"match" | b"target" => {
@@ -983,6 +1004,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
         NftExpr::Xt(x) if x.hooks() != 0 => Some((x.hooks(), false)),
         NftExpr::Fib(f) => Some((f.hooks(), false)),
         NftExpr::Rt(r) => r.hooks().map(|h| (h, false)),
+        NftExpr::Xfrm(x) => Some((x.hooks(), false)),
         NftExpr::FlowOffload { .. } => Some((1 << NF_INET_FORWARD, false)),
         // As `nft_meta_get_validate_sdif` and `nft_meta_set_validate` of Linux.
         NftExpr::Meta { key: NFT_META_SDIF | NFT_META_SDIFNAME, .. } => {
@@ -1871,6 +1893,7 @@ fn nft_eval(
             NftExpr::Log(l) => nft_log_eval(l, skb, state),
             NftExpr::Fib(f) => nft_fib_eval(f, regs, skb.data(), skb.mark, pkt.l4proto, state),
             NftExpr::Rt(r) => nft_rt_eval(r, regs, skb.data(), skb.mark, state),
+            NftExpr::Xfrm(x) => nft_xfrm_eval(x, regs),
             NftExpr::Exthdr(x) => nft_exthdr_eval(x, regs, skb, state, pkt),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {

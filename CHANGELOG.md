@@ -8,6 +8,12 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - The `encrypted` key type, as security/keys/encrypted-keys of Linux: the kernel keeps the decrypted data, and a read gives the data encrypted with AES-CBC and an HMAC with SHA-256, with keys that come from a `user` master key. `new` with the data in hexadecimal is available, as Linux with `CONFIG_USER_DECRYPTED_DATA`, and `load` and `update` too. LTP keyctl09 passes. (#539)
 - The `asymmetric` key type, as crypto/asymmetric_keys of Linux: the X.509 parser and the PKCS#8 parser in rk-crypto, RSA keys, `KEYCTL_PKEY_QUERY`, `KEYCTL_PKEY_ENCRYPT`, `KEYCTL_PKEY_DECRYPT`, `KEYCTL_PKEY_SIGN` and `KEYCTL_PKEY_VERIFY` with the `pkcs1` and `raw` encodings, and the keyring restrictions `builtin_trusted` and `key_or_keyring` of `KEYCTL_RESTRICT_KEYRING`. `KEYCTL_CAPABILITIES` gives `KEYCTL_CAPS0_PUBLIC_KEY`. LTP keyctl23, keyctl24, keyctl29 and keyctl30 pass. (#539)
+- nf_tables: the expression `xfrm`, as nft_xfrm.c of Linux, for `ipsec in reqid`, `ipsec out spi` and the addresses of the IPsec state. The checks of the attributes and of the hooks are the same as on Linux. rukernel has no IPsec, so the expression gives no result, as on Linux for a packet that IPsec did not touch (#542).
+
+### Fixed
+
+- nf_tables: the dump of a rule gives the packets and the bytes that its `counter` counted, as `nft_counter_dump` of Linux. Before, it gave the values of the rule as it came, so `nft list ruleset` showed `counter packets 0 bytes 0` for each rule. The named counters were right. This made transactions/table_onoff, sets/sets_with_ifnames and maps/typeof_maps_add_delete fail (#542).
+- nf_tables: the dump of a set with a key of one or two bytes and none of the flags `interval`, `map`, `timeout` and `dynamic` has the elements in the order of their inserts, as nft_set_bitmap.c of Linux, that `nft_select_set_ops` gives such a set to. Before, the elements came in the order of their keys. `nft list` sorts them by the first flag of a bitmask, and keeps elements with the same sort value in the reverse of the order of the kernel, so the listing of sets/0055tcpflags_0 was not the one of Linux (#542).
 
 ## [0.5.34] - 2026-11-15
 
@@ -20,6 +26,9 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Fixed
 
 - When one end of a veth pair goes up or down, the other end, if it is up, sends `RTM_NEWLINK` with its new carrier, as the link watch of Linux after `veth_open` and `veth_close`. Before this, systemd-networkd saw no carrier on the end that went up first, and a DHCP server on it did not start (#538).
+
+### Fixed
+
 
 ## [0.5.33] - 2026-11-15
 

@@ -26,9 +26,9 @@ use self::nf_tables_core::{
     NFT_OBJECT_MAX, NFTA_FLOWTABLE_MAX, NFTA_OBJ_MAX, NftDynset, NftExpr, NftFlowtable, NftObj,
     NftObjState, NftProg, nf_tables_dump_flowtable, nf_tables_dump_obj, nf_tables_expr_parse,
     nf_tables_getflowtable, nf_tables_getobj, nft_check_loops, nft_do_chain, nft_expr_dump,
-    nft_expr_needs_validate, nft_expr_targets, nft_expr_validate, nft_obj_commit, nft_prog,
-    nft_rule_needs_ct, nft_set_exprs_dump, nft_set_exprs_parse, nft_setelem_parse_obj,
-    nft_table_validate,
+    nft_expr_dump_state, nft_expr_needs_validate, nft_expr_targets, nft_expr_validate,
+    nft_obj_commit, nft_prog, nft_rule_needs_ct, nft_set_exprs_dump, nft_set_exprs_parse,
+    nft_setelem_parse_obj, nft_table_validate,
 };
 use crate::buf::NetBuf;
 use crate::netfilter::nf_conntrack::{nf_ct_netns_get, nf_ct_netns_put};
@@ -542,6 +542,21 @@ impl NftSet {
     /// inserts, as `nft_pipapo_walk`, and the catch-all elements last.
     fn is_pipapo(&self) -> bool {
         self.flags & NFT_SET_INTERVAL != 0 && self.field_len.len() >= 2
+    }
+
+    /// The set is one that `nft_select_set_ops` of Linux gives to nft_set_bitmap.c: a key of at
+    /// most 2 bytes, no stateful expression, and none of the flags that the type has no
+    /// feature for. Its lookup and its space are both O(1), so it wins with the default policy.
+    /// With `NFT_SET_POL_MEMORY` this takes it only for a set with no size, as Linux compares
+    /// the sizes then. Its dump has the elements in the order of their inserts, as
+    /// `nft_bitmap_walk` goes through the list that `nft_bitmap_insert` adds to at the tail.
+    fn is_bitmap(&self) -> bool {
+        let features =
+            NFT_SET_INTERVAL | NFT_SET_MAP | NFT_SET_TIMEOUT | NFT_SET_OBJECT | NFT_SET_EVAL;
+        self.klen <= 2
+            && self.exprs.is_empty()
+            && self.flags & features == 0
+            && (self.policy != NFT_SET_POL_MEMORY || self.size == 0)
     }
 
     /// The number of elements that count for the size of the set.
@@ -1247,7 +1262,18 @@ fn nf_tables_fill_rule_info(
     if event != NFT_MSG_DELRULE && event != NFT_MSG_DESTROYRULE && prev != 0 {
         b.put(NFTA_RULE_POSITION as u16, &prev.to_be_bytes());
     }
-    b.put(NFTA_RULE_EXPRESSIONS as u16, &rule.exprs);
+    // A `counter` gives what it counted so far, as `nft_counter_dump` of Linux. The other
+    // expressions give the bytes that the rule kept.
+    if rule.parsed.iter().any(|e| matches!(e, NftExpr::Counter { .. })) {
+        let mut d = Builder::new(0, 0, 0, 0);
+        for ((_, e), expr) in msg::attrs(&rule.exprs).zip(&rule.parsed) {
+            let live = nft_expr_dump_state(expr);
+            d.put(NFTA_LIST_ELEM | NLA_F_NESTED as u16, live.as_deref().unwrap_or(e));
+        }
+        b.put(NFTA_RULE_EXPRESSIONS as u16, &d.finish()[msg::HDRLEN..]);
+    } else {
+        b.put(NFTA_RULE_EXPRESSIONS as u16, &rule.exprs);
+    }
     if let Some(u) = &rule.udata {
         b.put(NFTA_RULE_USERDATA as u16, u);
     }
@@ -1660,7 +1686,7 @@ fn nf_tables_dump_set(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8
     let mut size = 0;
     let view = set.view();
     let mut elems: Vec<(&ElemKey, &NftElem)> = view.iter().collect();
-    if set.is_pipapo() {
+    if set.is_pipapo() || set.is_bitmap() {
         elems.sort_by_key(|(k, e)| (k.catchall, e.seq));
     }
     for (k, e) in elems {
@@ -3543,6 +3569,45 @@ mod tests {
     }
 
     #[test]
+    fn the_dump_of_a_rule_gives_what_its_counter_counted() {
+        use super::nf_tables_core::nf_tables_expr_parse;
+        use crate::netlink::nfnetlink::NFGENMSG_LEN;
+        // `counter` as `nft` gives it, with 0 packets and 0 bytes.
+        let mut b = Builder::new(0, 0, 0, 0);
+        b.put(1, b"counter\0");
+        let d = b.nest(2 | NLA_F_NESTED as u16);
+        b.put(1, &0u64.to_be_bytes()).put(2, &0u64.to_be_bytes());
+        b.end_nest(d);
+        let raw = b.finish()[msg::HDRLEN..].to_vec();
+        let t = table();
+        let e = nf_tables_expr_parse(&t, &raw, None).unwrap();
+        let NftExpr::Counter { packets, bytes } = &e else { panic!() };
+        packets.fetch_add(3, Ordering::Relaxed);
+        bytes.fetch_add(252, Ordering::Relaxed);
+        let mut l = Builder::new(0, 0, 0, 0);
+        l.put(NFTA_LIST_ELEM | NLA_F_NESTED as u16, &raw);
+        let exprs = l.finish()[msg::HDRLEN..].to_vec();
+        let rule = NftRule { handle: 1, exprs, parsed: alloc::vec![e], udata: None, txn_id: None };
+        let chain = NftChain {
+            name: b"c".to_vec(),
+            handle: 2,
+            flags: 0,
+            udata: None,
+            base: None,
+            rules: Vec::new(),
+            txn_id: None,
+        };
+        let m = nf_tables_fill_rule_info(0, 0, NFT_MSG_NEWRULE, 0, 1, &t, &chain, &rule, 0);
+        let (_, list) = msg::attrs(&m[msg::HDRLEN + NFGENMSG_LEN..])
+            .find(|(ty, _)| u32::from(*ty) == NFTA_RULE_EXPRESSIONS)
+            .unwrap();
+        let (_, dumped) = msg::attrs(list).next().unwrap();
+        let got = nf_tables_expr_parse(&t, dumped, None).unwrap();
+        let NftExpr::Counter { packets, bytes } = &got else { panic!() };
+        assert_eq!((packets.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed)), (3, 252));
+    }
+
+    #[test]
     fn a_dynset_gives_its_set_the_default_size() {
         let mut t = table();
         t.sets.push(set(b"a"));
@@ -3553,6 +3618,21 @@ mod tests {
         t.dynset_default_size(&[d(1), d(2), l]);
         let sizes: Vec<u32> = t.sets.iter().map(|s| s.size).collect();
         assert_eq!(sizes, [0xffff, 10, 0]);
+    }
+
+    #[test]
+    fn a_set_of_a_short_key_dumps_in_the_order_of_the_inserts_as_a_bitmap() {
+        // sets/0055tcpflags_0 of nftables: a constant set of `tcp_flag`, a key of one byte.
+        let flags = NftSet { klen: 1, flags: NFT_SET_CONSTANT, ..set(b"f") };
+        assert!(flags.is_bitmap());
+        assert!(NftSet { klen: 2, ..set(b"p") }.is_bitmap());
+        assert!(!set(b"a").is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_INTERVAL, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_MAP, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_TIMEOUT, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { flags: NFT_SET_EVAL, ..flags.clone() }.is_bitmap());
+        assert!(!NftSet { policy: NFT_SET_POL_MEMORY, size: 4, ..flags.clone() }.is_bitmap());
+        assert!(NftSet { policy: NFT_SET_POL_MEMORY, ..flags }.is_bitmap());
     }
 
     #[test]
