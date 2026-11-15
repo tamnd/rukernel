@@ -7,6 +7,7 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 ### Added
 
 - The reclaim counters of a memory cgroup, as mm/vmscan.c and mm/memcontrol.c of Linux: `memory.stat` gives `pgscan`, `pgsteal`, `pgscan_kswapd`, `pgscan_direct`, `pgsteal_kswapd` and `pgsteal_direct` of the subtree, and `/proc/vmstat` gives `pgscan_kswapd`, `pgscan_direct`, `pgsteal_kswapd`, `pgsteal_direct`, `pgscan_file` and `pgsteal_file`. The page cache counts each page that a reclaim scans and drops. A cgroup over `memory.high` now reclaims its page cache at the return to user space, as `reclaim_high` of Linux, and a write of `memory.max` reclaims before the OOM kill. systemd-oomd needs `pgscan` above 0 to kill. (#752)
+- nf_tables: the expression `osf`, as nft_osf.c of Linux, for `osf name "Linux"` and `osf version`, and the subsystem `NFNL_SUBSYS_OSF` of nfnetlink_osf.c, that loads the fingerprints of pf.os (`OSF_MSG_ADD` and `OSF_MSG_REMOVE`). The expression gives the genre of the first fingerprint that a TCP SYN matches (its length, TTL, DF bit, window and TCP options), or `unknown` (#542).
 
 ### Fixed
 

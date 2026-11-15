@@ -59,6 +59,8 @@ mod nft_fib;
 mod nft_flowtable;
 #[path = "nft_objects.rs"]
 mod nft_objects;
+#[path = "nft_osf.rs"]
+mod nft_osf;
 #[path = "nft_rt.rs"]
 mod nft_rt;
 #[path = "nft_xfrm.rs"]
@@ -90,6 +92,7 @@ use self::nft_objects::{
     nft_connlimit_eval, nft_connlimit_init, nft_obj_eval, nft_objref_init, nft_quota_eval,
     nft_quota_init, nft_set_elem_update_expr,
 };
+use self::nft_osf::{NftOsf, nft_osf_eval, nft_osf_init};
 use self::nft_rt::{NftRt, nft_rt_eval, nft_rt_init};
 pub use self::nft_rt::{NftRtRouteFn, nft_rt_set_fn};
 use self::nft_xfrm::{NftXfrm, nft_xfrm_eval, nft_xfrm_init};
@@ -342,6 +345,8 @@ pub(super) enum NftExpr {
     Rt(NftRt),
     /// `xfrm`, as nft_xfrm.c.
     Xfrm(NftXfrm),
+    /// `osf`, as nft_osf.c.
+    Osf(NftOsf),
     /// `exthdr`, as nft_exthdr.c.
     Exthdr(NftExthdr),
     /// `dynset`, as nft_dynset.c.
@@ -819,6 +824,7 @@ pub(super) fn nf_tables_expr_parse(
         b"fib" => Ok(NftExpr::Fib(nft_fib_init(table.family, data)?)),
         b"rt" => Ok(NftExpr::Rt(nft_rt_init(table.family, data)?)),
         b"xfrm" => Ok(NftExpr::Xfrm(nft_xfrm_init(table.family, data)?)),
+        b"osf" => Ok(NftExpr::Osf(nft_osf_init(table.family, data)?)),
         b"exthdr" => Ok(NftExpr::Exthdr(nft_exthdr_init(table.family, data)?)),
         b"dynset" => nft_dynset_init(table, data),
         b"match" | b"target" => {
@@ -1005,6 +1011,7 @@ fn nft_expr_hooks(e: &NftExpr) -> Option<(u32, bool)> {
         NftExpr::Fib(f) => Some((f.hooks(), false)),
         NftExpr::Rt(r) => r.hooks().map(|h| (h, false)),
         NftExpr::Xfrm(x) => Some((x.hooks(), false)),
+        NftExpr::Osf(o) => Some((o.hooks(), false)),
         NftExpr::FlowOffload { .. } => Some((1 << NF_INET_FORWARD, false)),
         // As `nft_meta_get_validate_sdif` and `nft_meta_set_validate` of Linux.
         NftExpr::Meta { key: NFT_META_SDIF | NFT_META_SDIFNAME, .. } => {
@@ -1894,6 +1901,7 @@ fn nft_eval(
             NftExpr::Fib(f) => nft_fib_eval(f, regs, skb.data(), skb.mark, pkt.l4proto, state),
             NftExpr::Rt(r) => nft_rt_eval(r, regs, skb.data(), skb.mark, state),
             NftExpr::Xfrm(x) => nft_xfrm_eval(x, regs),
+            NftExpr::Osf(o) => nft_osf_eval(o, regs, skb.data(), state, pkt),
             NftExpr::Exthdr(x) => nft_exthdr_eval(x, regs, skb, state, pkt),
             // A chain that a jump reaches from a hook with no `reject` does not reject.
             NftExpr::Reject(r) => {

@@ -74,6 +74,7 @@ pub fn init() {
         stack::nft_fib_addr_type,
     );
     rk_net::netfilter::nf_tables_api::nft_rt_set_fn(stack::nft_rt_route);
+    rk_net::netfilter::nfnetlink_osf::nf_osf_set_subnet_fn(stack::osf_subnet);
     rtnl::init();
     rules::init();
     nexthop::init();

@@ -24,6 +24,8 @@ pub const NETLINK_NETFILTER: u32 = 12;
 // this header yet, so the values are written by hand.
 /// The subsystem ctnetlink, for the connections of conntrack.
 pub const NFNL_SUBSYS_CTNETLINK: u8 = 1;
+/// The subsystem of the fingerprints of the passive OS fingerprinting.
+pub const NFNL_SUBSYS_OSF: u8 = 5;
 /// The subsystem nf_tables.
 pub const NFNL_SUBSYS_NFTABLES: u8 = 10;
 /// The subsystem of the xtables extensions in nf_tables.
@@ -179,6 +181,7 @@ static SUBSYSTEMS: &[&NfnlSubsystem] = &[
     &crate::netfilter::nf_conntrack::nf_conntrack_netlink::CTNETLINK_SUBSYS,
     &crate::netfilter::nf_tables_api::NF_TABLES_SUBSYS,
     &crate::netfilter::nft_compat::NFT_COMPAT_SUBSYS,
+    &crate::netfilter::nfnetlink_osf::NFNL_OSF_SUBSYS,
 ];
 
 fn nfnetlink_get_subsys(subsys_id: u16) -> Option<&'static NfnlSubsystem> {

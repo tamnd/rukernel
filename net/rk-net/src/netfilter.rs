@@ -27,6 +27,7 @@ pub mod nf_conntrack;
 pub mod nf_nat;
 pub mod nf_reject;
 pub mod nf_tables_api;
+pub mod nfnetlink_osf;
 pub mod nft_compat;
 
 /// The verdict that drops the packet.
