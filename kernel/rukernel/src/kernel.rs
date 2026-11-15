@@ -48,6 +48,7 @@ fn main(boot: &'static BootInfo) -> ! {
     }
     // The security modules start before the first file and the first task, as `security_init`
     // in `start_kernel` of Linux.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     rk_vfs::security::register(&rk_proc::yama::LSM);
     if rk_lsm_apparmor::wanted(param(boot.cmdline(), "apparmor"), param(boot.cmdline(), "lsm")) {
         rk_vfs::security::register(&rk_lsm_apparmor::LSM);
