@@ -581,6 +581,21 @@ pub(super) fn nft_expr_dump(table: &NftTable, nla: &[u8], expr: &NftExpr) -> Vec
     b.finish()[HDRLEN..].to_vec()
 }
 
+/// The bytes of an expression with a state that changes after the rule came, as `counter`, at
+/// the time of a dump, as `nft_counter_dump` of Linux gives the bytes and the packets that the
+/// rule counted so far. The other expressions give `None`: their bytes stay the ones of
+/// `nft_expr_dump`.
+pub(super) fn nft_expr_dump_state(expr: &NftExpr) -> Option<Vec<u8>> {
+    let NftExpr::Counter { packets, bytes } = expr else { return None };
+    let mut b = Builder::new(0, 0, 0, 0);
+    b.put(NFTA_EXPR_NAME as u16, b"counter\0");
+    let at = b.nest(NFTA_EXPR_DATA as u16);
+    b.put(NFTA_COUNTER_BYTES as u16, &bytes.load(Ordering::Relaxed).to_be_bytes())
+        .put(NFTA_COUNTER_PACKETS as u16, &packets.load(Ordering::Relaxed).to_be_bytes());
+    b.end_nest(at);
+    Some(b.finish()[HDRLEN..].to_vec())
+}
+
 /// Copies the attributes `nla` to `b`, with the name `chain` in place of the chain of the
 /// verdict at the end of the nested attributes `path`.
 fn nft_verdict_chain_dump(b: &mut Builder, nla: &[u8], path: &[u32], chain: &[u8]) {
