@@ -280,6 +280,19 @@ impl NetDriver for Tun {
         if self.tap { self.mac } else { MacAddr::ZERO }
     }
 
+    /// `tun_flags`, `owner` and `group`, as `tun_attr_group` of Linux. `ip tuntap show` reads
+    /// them. An owner or a group that is not set gives -1.
+    fn sysfs_files(&self) -> Vec<(&'static str, String)> {
+        let flags = self.flags();
+        let config = self.config.lock();
+        let id = |v: Option<u32>| v.map_or(String::from("-1\n"), |v| format!("{v}\n"));
+        Vec::from([
+            ("group", id(config.group)),
+            ("owner", id(config.owner)),
+            ("tun_flags", format!("{flags:#x}\n")),
+        ])
+    }
+
     /// A TAP device has `eth_mac_addr` and `IFF_LIVE_ADDR_CHANGE`, as `tun_net_init` of Linux.
     /// A TUN device has no hardware address.
     fn can_set_mac(&self) -> bool {

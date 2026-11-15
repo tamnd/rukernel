@@ -15,6 +15,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 - On arm64, a process can read CTR_EL0 and DCZID_EL0 and run `DC ZVA`, `DC CVAU`, `IC IVAU` and `WFE`, as on Linux: SCTLR_EL1 has the bits UCT, DZE, UCI, nTWE, SA0 and SED of `INIT_SCTLR_EL1_MMU_ON`. Before, a read of CTR_EL0 trapped and the process got SIGSEGV, as `dig` in TEST-75-RESOLVED of systemd (#759).
 - A TUN file that `TUNSETQUEUE` with `IFF_DETACH_QUEUE` took off its queue gives `POLLOUT`, not `POLLERR`, as `tun_chr_poll` of Linux. systemd-networkd keeps the files of a `MultiQueue=yes` device in the fd store of systemd, and systemd closed each file that gave `POLLERR`, so the device went away (#538).
+- A TUN or TAP device has `tun_flags`, `owner` and `group` in sysfs, as `tun_attr_group` of Linux. Before, `ip tuntap show` failed with "fopen /sys/class/net/NAME/tun_flags: No such file or directory", so `NetworkdNetDevTests.test_tuntap` could not see the devices (#538).
+
 
 ## [0.5.35] - 2026-11-16
 

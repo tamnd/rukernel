@@ -3,9 +3,10 @@ use crate::dev;
 use crate::ether::{EthHeader, MacAddr};
 use crate::ns;
 use crate::tun::{
-    IFF_ATTACH_QUEUE, IFF_DETACH_QUEUE, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TUN, MAX_TAP_QUEUES,
-    TunFile, flow_hash,
+    IFF_ATTACH_QUEUE, IFF_DETACH_QUEUE, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TAP, IFF_TUN, IFF_VNET_HDR,
+    MAX_TAP_QUEUES, TunFile, flow_hash,
 };
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::Errno;
@@ -159,4 +160,33 @@ fn a_detached_file_makes_its_device_persistent() {
     assert!(!dev.carrier());
     dev::unregister(&dev);
     assert!(dev::by_name("pq0").is_none());
+}
+
+#[test]
+fn a_device_has_tun_flags_owner_and_group_in_sysfs() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let net = ns::new().unwrap();
+    let _in = ns::enter(&net);
+    // As the TAP device of `NetworkdNetDevTests.test_tuntap`: `ip tuntap show` prints
+    // "tap pi multi_queue vnet_hdr" from `tun_flags`.
+    let f = TunFile::new(net.clone());
+    f.set_iff("mqtap0", IFF_TAP | IFF_VNET_HDR | IFF_MULTI_QUEUE).unwrap();
+    let dev = dev::by_name("mqtap0").unwrap();
+    assert_eq!(
+        dev.driver().sysfs_files(),
+        [
+            ("group", String::from("-1\n")),
+            ("owner", String::from("-1\n")),
+            ("tun_flags", String::from("0x4102\n")),
+        ]
+    );
+    // A device of another driver adds no file.
+    let d = crate::dummy::create(Some(b"sdum0"), None).unwrap();
+    assert!(d.driver().sysfs_files().is_empty());
+    dev::unregister(&d);
+    drop(f);
+    assert!(dev::by_name("mqtap0").is_none());
+    drop(_in);
+    drop(net);
 }

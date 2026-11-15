@@ -30,8 +30,9 @@
 //!   directory to know if it can mount hugetlbfs.
 //! - `/sys/devices/virtual/net/NAME` is the directory of a network interface, from the list of
 //!   `rk_net::dev`. It has the attributes of net/core/net-sysfs.c of Linux and the directories
-//!   `statistics` and `queues`. `queues/rx-0/rps_cpus` takes a write, as in Linux.
-//!   `/sys/class/net/NAME` is a link to it.
+//!   `statistics` and `queues`. `queues/rx-0/rps_cpus` takes a write, as in Linux. A TUN or
+//!   TAP device also has `tun_flags`, `owner` and `group`. `/sys/class/net/NAME` is a link to
+//!   it.
 //! - `/sys/devices/virtual/input/inputN` is the directory of an input device, from
 //!   `rk_vfs::input`, with `name`, `id`, `capabilities` and a directory for each handler, as
 //!   `mouse0` and `event0`. `/sys/class/input` has a link to each of them.
@@ -378,6 +379,9 @@ fn net_entries(d: &NetDevice) -> Vec<(String, Kind)> {
         file("type", format!("{}\n", d.kind().arphrd())),
         file("uevent", format!("INTERFACE={}\nIFINDEX={index}\n", d.name())),
     ]);
+    // The files of the driver, as `tun_flags` of a TUN or TAP device, in the order of the names.
+    out.extend(d.driver().sysfs_files().into_iter().map(|(name, text)| file(name, text)));
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
 
