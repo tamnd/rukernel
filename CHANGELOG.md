@@ -19,6 +19,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 - `cpu.weight` of a nested cgroup gives each thread the part of the CPU time that Linux gives it: the weight of a thread is its part of the weight of its cgroup at each level of the tree. The load balance of rk-sched compares the sum of the weights of the tasks of a busy CPU, as `migrate_load` of Linux, and not only the number of tasks. test_cpucg_nested_weight_overprovisioned of the Linux selftests now passes on x86_64 and arm64 (#536).
 - A seccomp filter needs `CAP_SYS_ADMIN` in the user namespace of the caller, as Linux, not in the first user namespace. A root process in a new user namespace can add a filter without the no_new_privs bit, so user_notification_child_pid_ns and user_notification_fault_recv of seccomp_bpf pass in the `kselftest` boot test (#536).
 
+### Fixed
+
+- The kernel builds for riscv64 again. The kernel registered the Yama module on each architecture, but rk-proc has Yama only on x86_64 and aarch64, so `cargo xtask targets` failed on riscv64. The kernel now registers Yama only on x86_64 and aarch64 (#540).
+
 ## [0.5.34] - 2026-11-15
 
 ### Added
