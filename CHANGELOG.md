@@ -4,6 +4,8 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+## [0.5.35] - 2026-11-16
+
 ### Added
 
 - The `encrypted` key type, as security/keys/encrypted-keys of Linux: the kernel keeps the decrypted data, and a read gives the data encrypted with AES-CBC and an HMAC with SHA-256, with keys that come from a `user` master key. `new` with the data in hexadecimal is available, as Linux with `CONFIG_USER_DECRYPTED_DATA`, and `load` and `update` too. LTP keyctl09 passes. (#539)
@@ -1733,6 +1735,7 @@ This release completes milestone R0, the skeleton. `rkc l1 --reference 7.3` pass
 - The kernel binary, `rukernel`. It boots on x86-64 under QEMU through the PVH entry, prints the boot log on the serial port and reads the memory map.
 - `cargo xtask qemu` and `cargo xtask boot-test`, and a CI job that runs the boot tests.
 
+[0.5.35]: https://github.com/tamnd/rukernel/compare/v0.5.34...v0.5.35
 [0.5.34]: https://github.com/tamnd/rukernel/compare/v0.5.33...v0.5.34
 [0.5.33]: https://github.com/tamnd/rukernel/compare/v0.5.32...v0.5.33
 [0.5.32]: https://github.com/tamnd/rukernel/compare/v0.5.31...v0.5.32
