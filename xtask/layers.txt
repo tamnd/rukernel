@@ -31,6 +31,7 @@ rk-drv-tty 3
 rk-drv-tpm 3
 rk-drv-virtio 3
 rk-lsm-apparmor 3
+rk-lsm-selinux 3
 rk-syscall 5
 rukernel  5
 rk-abigen tool

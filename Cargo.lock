@@ -210,6 +210,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-lsm-selinux"
+version = "0.5.34"
+dependencies = [
+ "rk-abi",
+ "rk-frame",
+ "rk-fs-sys",
+ "rk-net",
+ "rk-proc",
+ "rk-vfs",
+]
+
+[[package]]
 name = "rk-mm"
 version = "0.5.34"
 dependencies = [
@@ -324,6 +336,7 @@ dependencies = [
  "rk-fs-tmpfs",
  "rk-fs-xfs",
  "rk-lsm-apparmor",
+ "rk-lsm-selinux",
  "rk-mm",
  "rk-net",
  "rk-net-inet",

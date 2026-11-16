@@ -53,10 +53,19 @@ fn main(boot: &'static BootInfo) -> ! {
     if rk_lsm_apparmor::wanted(param(boot.cmdline(), "apparmor"), param(boot.cmdline(), "lsm")) {
         rk_vfs::security::register(&rk_lsm_apparmor::LSM);
     }
+    let selinux = param(boot.cmdline(), "selinux");
+    if rk_lsm_selinux::wanted(
+        selinux,
+        param(boot.cmdline(), "lsm"),
+        param(boot.cmdline(), "security"),
+    ) {
+        rk_vfs::security::register(&rk_lsm_selinux::LSM);
+    }
     let lsm =
         rk_vfs::security::init(param(boot.cmdline(), "lsm"), param(boot.cmdline(), "security"));
     println!("LSM: initializing lsm={lsm}");
     rk_lsm_apparmor::init();
+    rk_lsm_selinux::init(param(boot.cmdline(), "enforcing"));
     rootfs::init(boot);
 
     let test = param(boot.cmdline(), "rk.test");
