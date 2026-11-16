@@ -682,23 +682,7 @@ fn nft_state_dump(s: &NftObjState, b: &mut Builder, reset: bool, update: Option<
                 c.packets.fetch_sub(packets, Ordering::Relaxed);
             }
         }
-        NftObjState::Quota(q) => {
-            let (quota, mut flags) = update
-                .unwrap_or((q.quota.load(Ordering::Relaxed), q.flags.load(Ordering::Relaxed)));
-            let consumed = q.consumed.load(Ordering::Relaxed);
-            let shown = if consumed >= quota {
-                flags |= NFT_QUOTA_F_DEPLETED;
-                quota
-            } else {
-                consumed
-            };
-            b.put(NFTA_QUOTA_BYTES as u16, &quota.to_be_bytes())
-                .put(NFTA_QUOTA_CONSUMED as u16, &shown.to_be_bytes())
-                .put(NFTA_QUOTA_FLAGS as u16, &flags.to_be_bytes());
-            if reset {
-                q.consumed.fetch_sub(consumed, Ordering::Relaxed);
-            }
-        }
+        NftObjState::Quota(q) => nft_quota_dump(q, b, reset, update),
         NftObjState::Limit(_, data) => {
             for (ty, v) in nla_raw(data) {
                 b.put(ty, v);
@@ -714,6 +698,32 @@ fn nft_state_dump(s: &NftObjState, b: &mut Builder, reset: bool, update: Option<
                 b.put(ty, v);
             }
         }
+    }
+}
+
+/// Adds the attributes of a quota, as `nft_quota_do_dump` of Linux: a quota that the packets
+/// used up gives `NFT_QUOTA_F_DEPLETED`, and a reset takes off the bytes that it gave.
+/// `update` is the quota and the flags that a batch gives a quota object.
+pub(super) fn nft_quota_dump(
+    q: &NftQuota,
+    b: &mut Builder,
+    reset: bool,
+    update: Option<(u64, u32)>,
+) {
+    let (quota, mut flags) =
+        update.unwrap_or((q.quota.load(Ordering::Relaxed), q.flags.load(Ordering::Relaxed)));
+    let consumed = q.consumed.load(Ordering::Relaxed);
+    let shown = if consumed >= quota {
+        flags |= NFT_QUOTA_F_DEPLETED;
+        quota
+    } else {
+        consumed
+    };
+    b.put(NFTA_QUOTA_BYTES as u16, &quota.to_be_bytes())
+        .put(NFTA_QUOTA_CONSUMED as u16, &shown.to_be_bytes())
+        .put(NFTA_QUOTA_FLAGS as u16, &flags.to_be_bytes());
+    if reset {
+        q.consumed.fetch_sub(consumed, Ordering::Relaxed);
     }
 }
 
@@ -1002,6 +1012,23 @@ mod tests {
         let mut b = Builder::new(0, 0, 0, 0);
         b.put(ty as u16, v);
         b.finish()[crate::netlink::msg::HDRLEN..].to_vec()
+    }
+
+    #[test]
+    fn a_reset_of_a_quota_gives_what_it_used_then_takes_it_off() {
+        let mut d = attr(NFTA_QUOTA_BYTES, &100u64.to_be_bytes());
+        d.extend(attr(NFTA_QUOTA_CONSUMED, &100u64.to_be_bytes()));
+        let q = nft_quota_init(&d).unwrap();
+        let dump = |reset| {
+            let mut b = Builder::new(0, 0, 0, 0);
+            nft_quota_dump(&q, &mut b, reset, None);
+            let m = b.finish();
+            let a = Attrs::parse(&m[crate::netlink::msg::HDRLEN..], 4);
+            (be64(&a, NFTA_QUOTA_CONSUMED).unwrap(), be32(&a, NFTA_QUOTA_FLAGS).unwrap())
+        };
+        // A quota that the packets used up is depleted, as Linux.
+        assert_eq!(dump(true), (Some(100), Some(NFT_QUOTA_F_DEPLETED)));
+        assert_eq!(dump(false), (Some(0), Some(0)));
     }
 
     #[test]

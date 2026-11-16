@@ -110,6 +110,8 @@ pub const NFT_MSG_NEWFLOWTABLE: u8 = 22;
 pub const NFT_MSG_GETFLOWTABLE: u8 = 23;
 /// Deletes a flowtable, or devices of it.
 pub const NFT_MSG_DELFLOWTABLE: u8 = 24;
+/// Gets or dumps the rules, and resets their counters and quotas.
+pub const NFT_MSG_GETRULE_RESET: u8 = 25;
 /// Deletes a table, with no error if it is not there.
 pub const NFT_MSG_DESTROYTABLE: u8 = 26;
 /// Deletes a chain, with no error if it is not there.
@@ -978,6 +980,8 @@ static NF_TABLES_CB: [NfnlCallback; NFT_MSG_MAX] = {
     cb[NFT_MSG_GETRULE as usize] =
         rcu(Some(nf_tables_getrule), Some(nf_tables_dump_rules), NFTA_RULE_MAX);
     cb[NFT_MSG_DELRULE as usize] = batch(NFTA_RULE_MAX);
+    cb[NFT_MSG_GETRULE_RESET as usize] =
+        rcu(Some(nf_tables_getrule), Some(nf_tables_dump_rules), NFTA_RULE_MAX);
     cb[NFT_MSG_DESTROYRULE as usize] = batch(NFTA_RULE_MAX);
     cb[NFT_MSG_NEWSET as usize] = batch(NFTA_SET_MAX);
     cb[NFT_MSG_GETSET as usize] =
@@ -1246,6 +1250,7 @@ fn nf_tables_fill_rule_info(
     chain: &NftChain,
     rule: &NftRule,
     prev: u64,
+    reset: bool,
 ) -> Vec<u8> {
     let mut b = nfnl_msg_put(
         portid,
@@ -1262,12 +1267,13 @@ fn nf_tables_fill_rule_info(
     if event != NFT_MSG_DELRULE && event != NFT_MSG_DESTROYRULE && prev != 0 {
         b.put(NFTA_RULE_POSITION as u16, &prev.to_be_bytes());
     }
-    // A `counter` gives what it counted so far, as `nft_counter_dump` of Linux. The other
-    // expressions give the bytes that the rule kept.
-    if rule.parsed.iter().any(|e| matches!(e, NftExpr::Counter { .. })) {
+    // A `counter` or a `quota` gives what it counted so far, as `nft_counter_dump` and
+    // `nft_quota_dump` of Linux, and a reset sets it back to 0. The other expressions give the
+    // bytes that the rule kept.
+    if rule.parsed.iter().any(|e| matches!(e, NftExpr::Counter { .. } | NftExpr::Quota(_))) {
         let mut d = Builder::new(0, 0, 0, 0);
         for ((_, e), expr) in msg::attrs(&rule.exprs).zip(&rule.parsed) {
-            let live = nft_expr_dump_state(expr);
+            let live = nft_expr_dump_state(expr, reset);
             d.put(NFTA_LIST_ELEM | NLA_F_NESTED as u16, live.as_deref().unwrap_or(e));
         }
         b.put(NFTA_RULE_EXPRESSIONS as u16, &d.finish()[msg::HDRLEN..]);
@@ -1557,7 +1563,10 @@ fn nf_tables_dump_chains(info: &NfnlInfo<'_>, _nla: &Attrs<'_>) -> Result<Vec<Ve
     Ok(out)
 }
 
+/// Gets one rule, as `nf_tables_getrule` of Linux. `NFT_MSG_GETRULE_RESET` also resets its
+/// counters and quotas.
 fn nf_tables_getrule(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
+    let reset = nfnl_msg_type(info.nlh.ty) == NFT_MSG_GETRULE_RESET;
     let nft = NFT.lock();
     let family = info.nfmsg.nfgen_family;
     let t = nft_table_lookup(&nft.tables, nla_name(nla, NFTA_RULE_TABLE)?, family, 0)
@@ -1578,6 +1587,7 @@ fn nf_tables_getrule(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
         chain,
         &chain.rules[r],
         0,
+        reset,
     );
     drop(nft);
     info.req.reply(m);
@@ -1585,8 +1595,10 @@ fn nf_tables_getrule(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<()> {
 }
 
 /// The dump of the rules, as `nf_tables_dump_rules` of Linux. `NFTA_RULE_TABLE` and
-/// `NFTA_RULE_CHAIN` limit the dump to one table and one chain.
+/// `NFTA_RULE_CHAIN` limit the dump to one table and one chain. `NFT_MSG_GETRULE_RESET` also
+/// resets the counters and the quotas of the rules.
 fn nf_tables_dump_rules(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<u8>>> {
+    let reset = nfnl_msg_type(info.nlh.ty) == NFT_MSG_GETRULE_RESET;
     let table_name = nla_name(nla, NFTA_RULE_TABLE)?;
     let chain_name = nla_name(nla, NFTA_RULE_CHAIN)?;
     let nft = NFT.lock();
@@ -1612,6 +1624,7 @@ fn nf_tables_dump_rules(info: &NfnlInfo<'_>, nla: &Attrs<'_>) -> Result<Vec<Vec<
                     c,
                     r,
                     prev,
+                    reset,
                 ));
                 prev = r.handle;
             }
@@ -2009,6 +2022,7 @@ impl NftBatch {
                 chain,
                 &chain.rules[r],
                 prev,
+                false,
             )
         });
         self.notify(ctx, m);
@@ -3597,14 +3611,21 @@ mod tests {
             rules: Vec::new(),
             txn_id: None,
         };
-        let m = nf_tables_fill_rule_info(0, 0, NFT_MSG_NEWRULE, 0, 1, &t, &chain, &rule, 0);
-        let (_, list) = msg::attrs(&m[msg::HDRLEN + NFGENMSG_LEN..])
-            .find(|(ty, _)| u32::from(*ty) == NFTA_RULE_EXPRESSIONS)
-            .unwrap();
-        let (_, dumped) = msg::attrs(list).next().unwrap();
-        let got = nf_tables_expr_parse(&t, dumped, None).unwrap();
-        let NftExpr::Counter { packets, bytes } = &got else { panic!() };
-        assert_eq!((packets.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed)), (3, 252));
+        let dump = |reset| {
+            let m =
+                nf_tables_fill_rule_info(0, 0, NFT_MSG_NEWRULE, 0, 1, &t, &chain, &rule, 0, reset);
+            let (_, list) = msg::attrs(&m[msg::HDRLEN + NFGENMSG_LEN..])
+                .find(|(ty, _)| u32::from(*ty) == NFTA_RULE_EXPRESSIONS)
+                .unwrap();
+            let (_, dumped) = msg::attrs(list).next().unwrap();
+            let got = nf_tables_expr_parse(&t, dumped, None).unwrap();
+            let NftExpr::Counter { packets, bytes } = &got else { panic!() };
+            (packets.load(Ordering::Relaxed), bytes.load(Ordering::Relaxed))
+        };
+        assert_eq!(dump(false), (3, 252));
+        // A reset gives what the counter counted, then sets it back to 0, as Linux.
+        assert_eq!(dump(true), (3, 252));
+        assert_eq!(dump(false), (0, 0));
     }
 
     #[test]
