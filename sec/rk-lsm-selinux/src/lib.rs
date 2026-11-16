@@ -4,7 +4,9 @@
 //! accesses a context can do. `load_policy` writes the binary policy to the file `load` of
 //! selinuxfs, which is mounted on `/sys/fs/selinux`. This crate has the module, selinuxfs
 //! ([`selinuxfs`]), the read of the binary policy ([`policydb`]) with its bitmaps
-//! ([`ebitmap`]) and its rules ([`avtab`]).
+//! ([`ebitmap`]) and its rules ([`avtab`]), the security server ([`server`] and [`services`])
+//! with its table of SIDs ([`sidtab`]), the text of the contexts ([`context`]), the classes of
+//! the kernel ([`classmap`]) and the access vector cache ([`avc`]).
 //!
 //! The module is active when the command line has `selinux=1`, when `lsm=` names it, or with
 //! `security=selinux`. With `selinux=0` it is not active. The module starts in permissive
@@ -18,12 +20,18 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod avc;
 pub mod avtab;
+pub mod classmap;
+pub mod context;
 pub mod ebitmap;
 pub mod policydb;
 pub mod selinuxfs;
+pub mod server;
+pub mod services;
+pub mod sidtab;
 
-use crate::policydb::Policydb;
+pub use crate::server::Policy;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -68,15 +76,6 @@ pub const POLICYCAP_NAMES: [&str; 15] = [
     "memfd_class",
     "bpf_token_perms",
 ];
-
-/// A loaded policy with the bytes that `load_policy` wrote, which the file `policy` of
-/// selinuxfs gives back.
-pub struct Policy {
-    /// The policy.
-    pub db: Policydb,
-    /// The binary policy.
-    pub data: Vec<u8>,
-}
 
 /// The module is active, `selinux_enabled_boot` of Linux.
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -134,6 +133,12 @@ fn current() -> (u32, Vec<u8>) {
     (0, Vec::new())
 }
 
+/// The SID of the current task, as `current_sid` of Linux. The tasks have no label of their
+/// own yet, so each task has the SID of the kernel.
+pub fn current_sid() -> u32 {
+    sidtab::sid::KERNEL
+}
+
 /// Tells if the module can be active, from the values of the parameters `selinux=`, `lsm=`
 /// and `security=` of the command line, as `selinux_enabled_setup` of Linux. `selinux=` takes
 /// a number, and a value that is not 0 makes the module active. Without `selinux=`, the
@@ -183,7 +188,8 @@ pub fn init(enforcing: Option<&str>) {
 }
 
 /// Changes the mode, as `sel_write_enforce` of Linux. A change makes an `MAC_STATUS` audit
-/// record and updates the status page.
+/// record and updates the status page. A change to the enforcing mode removes the decisions
+/// of the cache, because a denial in permissive mode adds the permissions to the cache.
 pub fn set_enforcing(new: bool) {
     let _guard = POLICY_MUTEX.lock();
     let old = ENFORCING.swap(new, Ordering::Relaxed);
@@ -197,36 +203,20 @@ pub fn set_enforcing(new: bool) {
         u8::from(old)
     );
     rk_net::netlink::audit::log_lsm(rk_net::netlink::audit::MAC_STATUS, &text);
+    if new {
+        avc::reset(0);
+    }
     SEQUENCE.fetch_add(2, Ordering::Relaxed);
 }
 
-/// Loads a binary policy, as `security_load_policy` and `selinux_policy_commit` of Linux. The
-/// load prints the policy capabilities, makes an `MAC_POLICY_LOAD` audit record and updates
-/// the status page.
+/// Loads a binary policy with [`server::load_policy`] and makes an `MAC_POLICY_LOAD` audit
+/// record, as `sel_write_load` of Linux.
 ///
 /// # Errors
 ///
 /// `EINVAL` if the policy is bad.
 pub fn load_policy(data: &[u8]) -> rk_vfs::inode::Result<()> {
-    let db = Policydb::read(data).map_err(|e| {
-        rk_frame::println!("SELinux:  policydb: {e}");
-        rk_abi::Errno::EINVAL
-    })?;
-    for (i, name) in POLICYCAP_NAMES.iter().enumerate() {
-        rk_frame::println!(
-            "SELinux:  policy capability {name}={}",
-            u8::from(db.policycap(i as u32))
-        );
-    }
-    for c in db.policycaps.iter().filter(|&c| c as usize >= POLICYCAP_NAMES.len()) {
-        rk_frame::println!("SELinux:  unknown policy capability {c}");
-    }
-    {
-        let _guard = POLICY_MUTEX.lock();
-        *POLICY.lock() = Some(Arc::new(Policy { db, data: data.to_vec() }));
-        POLICYLOAD.fetch_add(1, Ordering::Relaxed);
-        SEQUENCE.fetch_add(2, Ordering::Relaxed);
-    }
+    server::load_policy(data)?;
     let (auid, ses) = rk_net::netlink::audit::login_ids();
     let text = format!("auid={auid} ses={ses} lsm=selinux res=1");
     rk_net::netlink::audit::log_lsm(rk_net::netlink::audit::MAC_POLICY_LOAD, &text);
@@ -268,6 +258,10 @@ pub fn status() -> [u8; 20] {
     out
 }
 
+/// Serializes the unit tests that change the policy or the mode.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +283,7 @@ mod tests {
 
     #[test]
     fn a_policy_load_and_a_change_of_the_mode_update_the_status() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = status();
         assert_eq!(&before[..4], &1u32.to_ne_bytes());
         load_policy(include_bytes!("../tests/rk_test.35.bin")).unwrap();

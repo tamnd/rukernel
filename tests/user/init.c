@@ -16755,10 +16755,31 @@ static const unsigned char aa_min[] = "\x04\x08\x00" "version\x00" "\x02\x07\x00
 	"\x05\x07\x00" "rk_min\x00" "\x04\x06\x00" "flags\x00" "\x07" "\x02\x00\x00\x00\x00" "\x02\x01\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08"
 	"\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x02\x00\x00\x00\x00" "\x08";
 
+/* Writes the request req to the transaction file at path and reads the answer to buf, as libselinux does. Gives the size of the answer, or minus the errno. */
+static int sel_xact(const char *path, const char *req, char *buf, int size)
+{
+	int fd = open(path, O_RDWR), n;
+
+	if (fd < 0)
+		return -errno;
+	if (write(fd, req, strlen(req)) < 0) {
+		n = -errno;
+		close(fd);
+		return n;
+	}
+	n = read(fd, buf, size - 1);
+	if (n < 0)
+		n = -errno;
+	close(fd);
+	buf[n > 0 ? n : 0] = 0;
+	return n;
+}
+
 /*
- * The checks of SELinux in permissive mode, with selinux=1: selinuxfs, the load of the policy
- * /etc/rk_test.sel, which checkpolicy makes from sec/rk-lsm-selinux/tests/rk_test.conf, and a
- * change of the mode. The values are those of Linux.
+ * The checks of SELinux with selinux=1: selinuxfs, the load of the policy /etc/rk_test.sel,
+ * which checkpolicy makes from sec/rk-lsm-selinux/tests/rk_test.conf, the requests to the
+ * security server, the denials of the access vector cache, and a change to the enforcing mode.
+ * The values are those of Linux.
  */
 static void test_selinux(void)
 {
@@ -16800,11 +16821,31 @@ static void test_selinux(void)
 	n = aa_read("/sys/fs/selinux/status", buf, 64);
 	memcpy(st4, buf, sizeof(st4));
 	check("selinux: status counts the load", n == 20 && st4[1] == 2 && st4[2] == 0 && st4[3] == 1);
-	check("selinux: a write of 1 to enforce works", aa_write("/sys/fs/selinux/enforce", "1", 1, O_TRUNC) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
+	/* The security server. The test task has the SID kernel, and the policy gives kernel_t no permission of the class security, so each check makes a denial record. */
+	check("selinux: access gives the decision of the policy", sel_xact("/sys/fs/selinux/access", "system_u:system_r:init_t:s0 system_u:object_r:etc_t:s0 6", buf, 256) > 0 && strcmp(buf, "44012 ffffffff 4 ffffffff 1 0") == 0);
+	check("selinux: access gives EINVAL for a bad context", sel_xact("/sys/fs/selinux/access", "system_u:object_r:nothing_t:s0 system_u:object_r:etc_t:s0 6", buf, 256) == -EINVAL);
+	n = sel_xact("/sys/fs/selinux/context", "system_u:object_r:sbin_t:s0", buf, 256);
+	check("selinux: context gives the canonical context with a NUL", n == 27 && strcmp(buf, "system_u:object_r:bin_t:s0") == 0);
+	n = sel_xact("/sys/fs/selinux/create", "system_u:system_r:init_t:s0 system_u:object_r:tmpfs_t:s1 6", buf, 256);
+	check("selinux: create follows the type_transition rule", n > 0 && strcmp(buf, "system_u:object_r:etc_t:s1") == 0);
+	n = sel_xact("/sys/fs/selinux/create", "system_u:system_r:init_t:s0 system_u:object_r:tmpfs_t:s1 7 na%6Ded+", buf, 256);
+	check("selinux: create with a name that is not in a rule", n > 0 && strcmp(buf, "system_u:object_r:tmpfs_t:s0") == 0);
+	n = sel_xact("/sys/fs/selinux/create", "system_u:system_r:init_t:s0 system_u:object_r:tmpfs_t:s1 7 na%6Ded", buf, 256);
+	check("selinux: create follows the name rule", n > 0 && strcmp(buf, "system_u:object_r:bin_t:s0") == 0);
+	n = sel_xact("/sys/fs/selinux/relabel", "system_u:system_r:init_t:s0 system_u:object_r:etc_t:s0 6", buf, 256);
+	check("selinux: relabel follows the type_change rule", n > 0 && strcmp(buf, "system_u:object_r:bin_t:s0") == 0);
+	n = sel_xact("/sys/fs/selinux/member", "system_u:system_r:init_t:s0 system_u:object_r:tmpfs_t:s1 7", buf, 256);
+	check("selinux: member follows the type_member rule", n > 0 && strcmp(buf, "system_u:object_r:tmpfs_t:s0") == 0);
+	check("selinux: a second load works in permissive mode", aa_write("/sys/fs/selinux/load", pol, len, 0) == 0);
+	n = aa_read("/sys/fs/selinux/initial_contexts/kernel", buf, 256);
+	check("selinux: initial_contexts/kernel gives the context of the policy", n > 0 && strcmp(buf, "system_u:system_r:kernel_t:s0-s1:c0.c2") == 0);
+	n = aa_read("/sys/fs/selinux/avc/cache_stats", buf, 256);
+	check("selinux: avc/cache_stats has the counters", n > 0 && strncmp(buf, "lookups hits misses allocations reclaims frees\n", 47) == 0);
+	check("selinux: a write of 1 to enforce works in permissive mode", aa_write("/sys/fs/selinux/enforce", "1", 1, O_TRUNC) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
 	n = aa_read("/sys/fs/selinux/status", buf, 64);
 	memcpy(st4, buf, sizeof(st4));
-	check("selinux: status has the enforcing mode", n == 20 && st4[1] == 4 && st4[2] == 1);
-	check("selinux: a write of 0 to enforce works", aa_write("/sys/fs/selinux/enforce", "0\n", 2, 0) == 0 && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "0") == 0);
+	check("selinux: status has the enforcing mode and the second load", n == 20 && st4[1] == 6 && st4[2] == 1 && st4[3] == 2);
+	check("selinux: a write of 0 to enforce gives EACCES in enforcing mode", aa_write("/sys/fs/selinux/enforce", "0\n", 2, 0) == EACCES && aa_read("/sys/fs/selinux/enforce", buf, 64) == 1 && strcmp(buf, "1") == 0);
 	check("selinux: a write of text to enforce gives EINVAL", aa_write("/sys/fs/selinux/enforce", "x", 1, 0) == EINVAL);
 	check("selinux: a write to checkreqprot does nothing", aa_write("/sys/fs/selinux/checkreqprot", "1", 1, 0) == 0 && aa_read("/sys/fs/selinux/checkreqprot", buf, 64) == 1 && strcmp(buf, "0") == 0);
 	n = klogctl(3, buf, sizeof(buf) - 1);
@@ -16812,8 +16853,12 @@ static void test_selinux(void)
 	check("selinux: the kernel log has the policy capabilities", n > 0 && strstr(buf, "SELinux:  policy capability network_peer_controls=1") != NULL && strstr(buf, "SELinux:  policy capability always_check_network=0") != NULL && strstr(buf, "SELinux:  policy capability bpf_token_perms=0") != NULL);
 	check("selinux: the kernel log has the failed load", strstr(buf, "SELinux: failed to load policy") != NULL);
 	check("selinux: the kernel log has the audit record of the load", strstr(buf, "audit: type=1403 audit(") != NULL && strstr(buf, "lsm=selinux res=1") != NULL);
-	check("selinux: the kernel log has the audit records of the mode", strstr(buf, "audit: type=1404 audit(") != NULL && strstr(buf, "enforcing=1 old_enforcing=0 auid=") != NULL && strstr(buf, "enforcing=0 old_enforcing=1 auid=") != NULL && strstr(buf, "enabled=1 old-enabled=1 lsm=selinux res=1") != NULL);
+	check("selinux: the kernel log has the audit records of the mode", strstr(buf, "audit: type=1404 audit(") != NULL && strstr(buf, "enforcing=1 old_enforcing=0 auid=") != NULL && strstr(buf, "enabled=1 old-enabled=1 lsm=selinux res=1") != NULL);
 	check("selinux: the kernel log has the write to checkreqprot", strstr(buf, "wrote to checkreqprot. This is no longer supported.") != NULL);
+	check("selinux: the kernel log has the denial of setenforce in permissive mode", strstr(buf, "avc:  denied  { setenforce } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:object_r:security_t:s0 tclass=security permissive=1") != NULL);
+	check("selinux: the kernel log has the denial of setenforce in enforcing mode", strstr(buf, "{ setenforce } for  pid=1 comm=\"init\" scontext=system_u:system_r:kernel_t:s0-s1:c0.c2 tcontext=system_u:object_r:security_t:s0 tclass=security permissive=0") != NULL);
+	check("selinux: the kernel log has the denials of the other files", strstr(buf, "{ compute_av } for") != NULL && strstr(buf, "{ check_context } for") != NULL && strstr(buf, "{ compute_create } for") != NULL && strstr(buf, "{ load_policy } for") != NULL);
+	check("selinux: the kernel log has the unknown classes", strstr(buf, "SELinux:  Class tcp_socket not defined in policy.") != NULL && strstr(buf, "SELinux: the above unknown classes and permissions will be denied") != NULL);
 	umount("/sys/fs/selinux");
 	umount("/sys");
 }
