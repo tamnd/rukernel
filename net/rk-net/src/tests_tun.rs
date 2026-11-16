@@ -190,3 +190,51 @@ fn a_device_has_tun_flags_owner_and_group_in_sysfs() {
     drop(_in);
     drop(net);
 }
+
+#[test]
+fn a_device_gives_its_flags_in_ifla_info_data() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let net = ns::new().unwrap();
+    let _in = ns::enter(&net);
+    // As the TUN device of `NetworkdNetDevTests.test_tuntap`: `ip -d link show` prints
+    // "tun type tun pi on vnet_hdr on multi_queue" from `IFLA_INFO_DATA`.
+    let f = TunFile::new(net.clone());
+    f.set_iff("itun0", IFF_TUN | IFF_VNET_HDR | IFF_MULTI_QUEUE).unwrap();
+    let dev = dev::by_name("itun0").unwrap();
+    let data = |persist: u8, queues: u32, disabled: u32| {
+        Vec::from([
+            (3, Vec::from([1])),
+            (4, Vec::from([1])),
+            (5, Vec::from([1])),
+            (6, Vec::from([persist])),
+            (7, Vec::from([1])),
+            (8, queues.to_ne_bytes().to_vec()),
+            (9, disabled.to_ne_bytes().to_vec()),
+        ])
+    };
+    assert_eq!(dev.driver().link_info_data(), data(0, 1, 0));
+    // As systemd-networkd: the queue goes off the device, and the device stays.
+    f.set_queue(IFF_DETACH_QUEUE).unwrap();
+    f.set_persist(true).unwrap();
+    assert_eq!(dev.driver().link_info_data(), data(1, 0, 1));
+    // A device without `IFF_MULTI_QUEUE` has no count of queues, and `IFF_NO_PI` gives "pi off".
+    let g = TunFile::new(net.clone());
+    g.set_iff("itap0", IFF_TAP | IFF_NO_PI).unwrap();
+    let tap = dev::by_name("itap0").unwrap();
+    let want: Vec<(u16, Vec<u8>)> = Vec::from([
+        (3, Vec::from([2])),
+        (4, Vec::from([0])),
+        (5, Vec::from([0])),
+        (6, Vec::from([0])),
+        (7, Vec::from([0])),
+    ]);
+    assert_eq!(tap.driver().link_info_data(), want);
+    drop(g);
+    drop(f);
+    dev::unregister(&dev);
+    assert!(dev::by_name("itun0").is_none());
+    assert!(dev::by_name("itap0").is_none());
+    drop(_in);
+    drop(net);
+}

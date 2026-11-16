@@ -38,6 +38,17 @@ use rk_vfs::{File, FileOps, UserMemory};
 /// The kind of the device, for `IFLA_INFO_KIND`.
 pub const KIND: &str = "tun";
 
+/// The attributes in `IFLA_INFO_DATA` of a TUN or TAP device, `IFLA_TUN_*` of <linux/if_link.h>.
+const IFLA_TUN_OWNER: u16 = 1;
+const IFLA_TUN_GROUP: u16 = 2;
+const IFLA_TUN_TYPE: u16 = 3;
+const IFLA_TUN_PI: u16 = 4;
+const IFLA_TUN_VNET_HDR: u16 = 5;
+const IFLA_TUN_PERSIST: u16 = 6;
+const IFLA_TUN_MULTI_QUEUE: u16 = 7;
+const IFLA_TUN_NUM_QUEUES: u16 = 8;
+const IFLA_TUN_NUM_DISABLED_QUEUES: u16 = 9;
+
 /// The device number of `/dev/net/tun`: the misc major 10 and the minor `TUN_MINOR` 200.
 pub const TUN_RDEV: u64 = makedev(10, 200);
 
@@ -291,6 +302,40 @@ impl NetDriver for Tun {
             ("owner", id(config.owner)),
             ("tun_flags", format!("{flags:#x}\n")),
         ])
+    }
+
+    /// The attributes of `IFLA_INFO_DATA`, as `tun_fill_info` of Linux. `ip -d link show` prints
+    /// them, for example "tun type tun pi on vnet_hdr on multi_queue numqueues 0 numdisabled 1".
+    /// An owner or a group that is not set has no attribute.
+    fn link_info_data(&self) -> Vec<(u16, Vec<u8>)> {
+        let flags = self.flags();
+        let (owner, group) = {
+            let config = self.config.lock();
+            (config.owner, config.group)
+        };
+        let (all, enabled) = {
+            let queues = self.queues.lock();
+            (queues.len(), queues.iter().filter(|q| q.enabled.load(Ordering::Relaxed)).count())
+        };
+        let flag = |f: u32| Vec::from([u8::from(flags & f != 0)]);
+        let word = |v: u32| v.to_ne_bytes().to_vec();
+        let kind = (flags & (IFF_TUN | IFF_TAP)) as u8;
+        let mut data = Vec::from([(IFLA_TUN_TYPE, Vec::from([kind]))]);
+        if let Some(uid) = owner {
+            data.push((IFLA_TUN_OWNER, word(uid)));
+        }
+        if let Some(gid) = group {
+            data.push((IFLA_TUN_GROUP, word(gid)));
+        }
+        data.push((IFLA_TUN_PI, Vec::from([u8::from(flags & IFF_NO_PI == 0)])));
+        data.push((IFLA_TUN_VNET_HDR, flag(IFF_VNET_HDR)));
+        data.push((IFLA_TUN_PERSIST, flag(IFF_PERSIST)));
+        data.push((IFLA_TUN_MULTI_QUEUE, flag(IFF_MULTI_QUEUE)));
+        if flags & IFF_MULTI_QUEUE != 0 {
+            data.push((IFLA_TUN_NUM_QUEUES, word(enabled as u32)));
+            data.push((IFLA_TUN_NUM_DISABLED_QUEUES, word((all - enabled) as u32)));
+        }
+        data
     }
 
     /// A TAP device has `eth_mac_addr` and `IFF_LIVE_ADDR_CHANGE`, as `tun_net_init` of Linux.
