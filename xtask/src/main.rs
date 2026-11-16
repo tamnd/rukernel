@@ -1725,7 +1725,9 @@ const KSELFTEST_SCRIPT: &str = concat!(
     "    args=\n    [ \"$t\" = seccomp_bpf ] && args='-V attached'\n",
     "    $p $args > /tmp/kselftest.log 2>&1\n",
     "    code=$?\n",
-    "    grep -E '^# (Totals|PASSED|FAILED)' /tmp/kselftest.log | sed \"s/^#/kselftest: $t:/\"\n",
+    // test_verifier gives its counts in a `Summary:` line.
+    "    grep -E '^(# (Totals|PASSED|FAILED)|Summary: )' /tmp/kselftest.log |\n",
+    "        sed \"s/^#/kselftest: $t:/; s/^Summary:/kselftest: $t: Summary:/\"\n",
     "    case $code in\n",
     "    0) echo \"kselftest: $t: pass\" ;;\n",
     "    4) echo \"kselftest: $t: does not apply\" ;;\n",
