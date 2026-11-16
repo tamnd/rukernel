@@ -824,9 +824,67 @@ pub fn interrupts(cpus: usize, tlb: Option<&[u64]>) -> String {
     out
 }
 
+/// The values of `/proc/PID/sched` that rukernel keeps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sched {
+    /// The name of the thread.
+    pub comm: Vec<u8>,
+    /// The ID of the thread.
+    pub pid: u32,
+    /// The number of threads of the process.
+    pub threads: usize,
+    /// The CPU time of the thread, in nanoseconds.
+    pub runtime_ns: u64,
+    /// The policy, as `sched_getscheduler` gives it.
+    pub policy: u32,
+    /// The priority of the kernel: 99 minus the real time priority for `SCHED_FIFO` and
+    /// `SCHED_RR`, -1 for `SCHED_DEADLINE`, and 120 plus the nice value for the others.
+    pub prio: i32,
+}
+
+/// The text of `/proc/PID/sched`, as `proc_sched_show_task` in kernel/sched/debug.c of Linux,
+/// with the lines of the values that rukernel keeps. A program reads the line of a key, for
+/// example `policy` and `prio` in TEST-07-PID1 of systemd.
+pub fn sched(s: &Sched) -> Vec<u8> {
+    let mut out = s.comm.clone();
+    out.extend_from_slice(format!(" ({}, #threads: {})\n", s.pid, s.threads).as_bytes());
+    let mut text = format!("{}\n", "-".repeat(67));
+    let ns = s.runtime_ns;
+    let _ = writeln!(
+        text,
+        "{:<45}:{:>14}.{:06}",
+        "se.sum_exec_runtime",
+        ns / 1_000_000,
+        ns % 1_000_000
+    );
+    let _ = writeln!(text, "{:<45}:{:>21}", "policy", s.policy);
+    let _ = writeln!(text, "{:<45}:{:>21}", "prio", s.prio);
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sched_has_the_format_of_linux() {
+        let s = Sched {
+            comm: b"bash".to_vec(),
+            pid: 42,
+            threads: 1,
+            runtime_ns: 12_345_678_901,
+            policy: 1,
+            prio: 89,
+        };
+        let text = String::from_utf8(sched(&s)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "bash (42, #threads: 1)");
+        assert_eq!(lines[1].len(), 67);
+        assert_eq!(lines[2], "se.sum_exec_runtime                          :         12345.678901");
+        assert_eq!(lines[3], "policy                                       :                    1");
+        assert_eq!(lines[4], "prio                                         :                   89");
+    }
 
     #[test]
     fn interrupts_has_the_format_of_linux() {

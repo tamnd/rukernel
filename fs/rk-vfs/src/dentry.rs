@@ -1295,6 +1295,31 @@ impl MountNamespace {
         Ok(())
     }
 
+    /// Removes the mount on `at` and each mount under it, for `umount2` with `MNT_DETACH`, as
+    /// `umount_tree` of Linux. A mount goes before the mount that it is on, and each removal
+    /// goes to the receivers as `unmount`. Gives `EINVAL` if `at` is not the root of a mount
+    /// that is on another mount.
+    pub fn unmount_tree(&self, at: &Location) -> Result<()> {
+        if !at.is_mount_root() || at.mount.mountpoint().is_none() {
+            return Err(Errno::EINVAL);
+        }
+        let depth = |m: &Arc<Mount>| {
+            let mut n = 0usize;
+            let mut up = m.mountpoint();
+            while let Some(p) = up {
+                n += 1;
+                up = p.mount.mountpoint();
+            }
+            n
+        };
+        let mut tree = self.tree(&at.mount, true);
+        tree.sort_by_key(|m| core::cmp::Reverse(depth(m)));
+        for mount in tree {
+            self.unmount(&Location { dentry: mount.root.clone(), mount })?;
+        }
+        Ok(())
+    }
+
     /// Removes `mount` from the name space, if no mount is on it. Tells if it removed it.
     fn remove(&self, mount: &Arc<Mount>) -> bool {
         {

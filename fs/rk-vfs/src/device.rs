@@ -171,10 +171,14 @@ pub fn devcgroup_check_permission(dev_type: u32, rdev: u64, access: u32) -> Resu
     }
 }
 
-/// `devcgroup_inode_permission` of Linux, for the open of a device file with the access mask
-/// `mask` of `MAY_*`.
+/// `devcgroup_inode_permission` of Linux, for the access mask `mask` of `MAY_*` to a device file.
+/// [`crate::cred::Cred::inode_permission`] calls it, so it applies to `open`, `access` and
+/// `faccessat`. A device file with the number 0:0 needs no check, as in Linux.
 pub fn devcgroup_inode_permission(block: bool, rdev: u64, mask: u32) -> Result<()> {
     use crate::cred::may;
+    if rdev == 0 {
+        return Ok(());
+    }
     let mut access = 0;
     if mask & may::WRITE != 0 {
         access |= devcg::ACC_WRITE;

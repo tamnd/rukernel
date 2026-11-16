@@ -71,8 +71,6 @@ enum Kind {
 enum Follow {
     /// The walk reads the target as a path.
     Path,
-    /// The walk gives the error.
-    Error(Errno),
     /// The walk goes to the place, as at a magic link of Linux.
     Jump(JumpFn),
 }
@@ -88,7 +86,14 @@ pub(crate) struct Node {
     gone: Once<GoneFn>,
     /// The check of an access, for `Inode::permission`. Without it, the VFS checks the mode.
     access: Once<AccessFn>,
+    /// The check of an access before the other checks, for `Inode::permission`, as
+    /// `proc_pid_permission` of Linux for `hidepid`. If it allows the access, `access` or the
+    /// mode decide.
+    check: Once<CheckFn>,
 }
+
+/// The function that checks an access to an inode of procfs, with the caller and the mask.
+type CheckFn = Box<dyn Fn(&Cred, u32) -> Result<()> + Send + Sync>;
 
 /// The function that tells that an inode of procfs is gone.
 type GoneFn = Box<dyn Fn() -> bool + Send + Sync>;
@@ -118,24 +123,20 @@ pub(crate) fn ino(path: &[u8]) -> u64 {
     (h >> 1) | 2
 }
 
+/// Makes the node of the path `path` with the permission bits `perm`.
+fn new_node(path: &[u8], perm: u32, kind: Kind) -> InodeRef {
+    let (owner, gone, access, check) = (Once::new(), Once::new(), Once::new(), Once::new());
+    Arc::new(Node { ino: ino(path), perm, kind, owner, gone, access, check })
+}
+
 /// Makes a file that only gives text.
 pub(crate) fn file(
     path: &[u8],
     read: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
 ) -> InodeRef {
-    Arc::new(Node {
-        ino: ino(path),
-        perm: 0o444,
-        kind: Kind::File {
-            read: Box::new(read),
-            write: None,
-            text: SpinLock::new(None),
-            open: None,
-        },
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    let kind =
+        Kind::File { read: Box::new(read), write: None, text: SpinLock::new(None), open: None };
+    new_node(path, 0o444, kind)
 }
 
 /// Makes a file that gives text and takes writes.
@@ -150,14 +151,7 @@ pub(crate) fn rw_file(
         text: SpinLock::new(None),
         open: None,
     };
-    Arc::new(Node {
-        ino: ino(path),
-        perm: 0o644,
-        kind,
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, 0o644, kind)
 }
 
 /// Makes a file with the permission bits `perm` whose open files have the operations that
@@ -175,14 +169,7 @@ pub(crate) fn ops_file(
         text: SpinLock::new(None),
         open: Some(Box::new(open)),
     };
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind,
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, perm, kind)
 }
 
 /// Makes a file of /proc/sys with the permission bits `perm`. It gives text, takes writes if
@@ -201,14 +188,7 @@ pub(crate) fn sysctl_file(
         text: SpinLock::new(None),
         open: Some(Box::new(open)),
     };
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind,
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, perm, kind)
 }
 
 /// Makes a file that reads and writes at an offset, with the permission bits `perm`.
@@ -219,14 +199,7 @@ pub(crate) fn data_file(
     write: impl Fn(u64, &[u8]) -> Result<usize> + Send + Sync + 'static,
 ) -> InodeRef {
     let kind = Kind::Data { read: Box::new(read), write: Box::new(write) };
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind,
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, perm, kind)
 }
 
 /// Makes a symbolic link with the permission bits `perm`.
@@ -235,31 +208,7 @@ pub(crate) fn link(
     perm: u32,
     target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
 ) -> InodeRef {
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind: Kind::Link(Box::new(target), Follow::Path),
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
-}
-
-/// Makes a symbolic link that a walk cannot follow: the walk gives `error`.
-pub(crate) fn dead_link(
-    path: &[u8],
-    perm: u32,
-    target: impl Fn() -> Result<Vec<u8>> + Send + Sync + 'static,
-    error: Errno,
-) -> InodeRef {
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind: Kind::Link(Box::new(target), Follow::Error(error)),
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, perm, Kind::Link(Box::new(target), Follow::Path))
 }
 
 /// Makes a magic link: a walk that follows it goes to the place that `jump` gives and does not
@@ -271,14 +220,7 @@ pub(crate) fn jump_link(
     jump: impl Fn() -> Result<rk_vfs::Location> + Send + Sync + 'static,
 ) -> InodeRef {
     let follow = Follow::Jump(Box::new(jump));
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind: Kind::Link(Box::new(target), follow),
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, perm, Kind::Link(Box::new(target), follow))
 }
 
 /// Makes a directory. `parent` is the path of the parent directory, for `..`. `find` finds one
@@ -291,14 +233,7 @@ pub(crate) fn dir(
     find: Option<FindFn>,
 ) -> InodeRef {
     let kind = Kind::Dir { parent: ino(parent), list: Box::new(list), find };
-    Arc::new(Node {
-        ino: ino(path),
-        perm,
-        kind,
-        owner: Once::new(),
-        gone: Once::new(),
-        access: Once::new(),
-    })
+    new_node(path, perm, kind)
 }
 
 /// Gives `node` the owner and the group that `owner` gives at each `stat`, as the files of a
@@ -356,6 +291,18 @@ pub(crate) fn net_sysctl_access(perm: u32, net_admin: bool, cred: &Cred, mask: u
         Ok(())
     } else {
         Err(Errno::EACCES)
+    }
+}
+
+/// Gives `node` a check of each access before the check of the mode bits, as the `permission`
+/// operation of an inode in Linux. The check is set one time.
+pub(crate) fn set_check(
+    node: &InodeRef,
+    check: impl Fn(&Cred, u32) -> Result<()> + Send + Sync + 'static,
+) {
+    let any: &dyn Any = &**node;
+    if let Some(node) = any.downcast_ref::<Node>() {
+        node.check.call_once(|| Box::new(check));
     }
 }
 
@@ -447,6 +394,9 @@ impl Inode for Node {
     }
 
     fn permission(&self, cred: &Cred, mask: u32) -> Option<Result<()>> {
+        if let Some(Err(e)) = self.check.get().map(|check| check(cred, mask)) {
+            return Some(Err(e));
+        }
         self.access.get().map(|access| access(cred, mask))
     }
 
@@ -488,13 +438,6 @@ impl Inode for Node {
         match &self.kind {
             Kind::Link(target, _) => target(),
             _ => Err(Errno::EINVAL),
-        }
-    }
-
-    fn follow_link(&self) -> Result<Vec<u8>> {
-        match &self.kind {
-            Kind::Link(_, Follow::Error(e)) => Err(*e),
-            _ => self.read_link(),
         }
     }
 
@@ -700,10 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_link_gives_its_error_to_a_walk() {
-        let node = dead_link(b"/fd/3", 0o700, || Ok(b"socket:[7]".to_vec()), Errno::ENXIO);
-        assert_eq!(node.read_link().unwrap(), b"socket:[7]");
-        assert_eq!(node.follow_link().err(), Some(Errno::ENXIO));
+    fn a_magic_link_goes_to_its_place_and_a_link_reads_its_target() {
         let node = link(b"/fd/4", 0o700, || Ok(b"/tmp".to_vec()));
         assert_eq!(node.follow_link().unwrap(), b"/tmp");
         assert!(node.magic_link().is_none());

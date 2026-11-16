@@ -56,6 +56,13 @@ pub(crate) fn name_to_handle_at(
         return Err(Errno::EINVAL);
     }
     let path = cx.read_path_opt(path, flags & AT_EMPTY_PATH != 0)?;
+    // A socket, a pipe or another file without a place is in an internal file system of Linux,
+    // as sockfs, without the operations of a handle, so the call gives `EOPNOTSUPP` and not
+    // `ENOTDIR`. systemd then compares the files with `fstat`. With `AT_HANDLE_FID`, Linux gives
+    // the inode number in the mount of that file system, and rukernel has no such mount.
+    if path.is_empty() && dirfd as i32 != AT_FDCWD && cx.file(dirfd)?.location().is_none() {
+        return Err(Errno::EOPNOTSUPP);
+    }
     let fs = cx.fs()?;
     let start = cx.dir_start(&fs, dirfd, &path)?;
     let at = if path.is_empty() {

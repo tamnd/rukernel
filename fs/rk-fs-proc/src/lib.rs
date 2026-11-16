@@ -14,6 +14,7 @@ extern crate alloc;
 mod kernel;
 #[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod node;
+pub mod options;
 // The kernel uses all of the module, and the unit tests use a part of it.
 #[cfg(any(test, all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 #[cfg_attr(test, allow(dead_code))]
@@ -31,15 +32,18 @@ use rk_vfs::fstype::FsType;
 /// The file system type of procfs, for `mount -t proc`.
 pub const FS_TYPE: FsType = FsType { name: "proc", nodev: true, make: mount };
 
-/// Makes the root of a mount of procfs. procfs takes no options yet, so `data` has no effect.
+/// Makes the root of a mount of procfs, with the options in `data` (see [`options::parse`]).
 /// The mount shows the PID namespace of the caller, as `proc_fill_super` of Linux.
 #[cfg(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64")))]
-fn mount(_args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
-    Ok(kernel::root(rk_proc::current_thread().and_then(|t| t.process().pid_ns().cloned())))
+fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
+    let opts = options::parse(args.data)?;
+    let ns = rk_proc::current_thread().and_then(|t| t.process().pid_ns().cloned());
+    Ok(kernel::root(ns, opts))
 }
 
 /// A host build has no processes, so it has no procfs.
 #[cfg(not(all(target_os = "none", any(target_arch = "x86_64", target_arch = "aarch64"))))]
-fn mount(_args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
+fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> rk_vfs::Result<rk_vfs::InodeRef> {
+    options::parse(args.data)?;
     Err(rk_abi::Errno::ENODEV)
 }

@@ -2,8 +2,11 @@
 //! `/proc/sys` and the directory of each process.
 
 use crate::node::{
-    FindFn, WriteFn, data_file, dead_link, dir, file, join, jump_link, link, net_sysctl_access,
-    ops_file, rw_file, set_access, set_gone, set_owner, sysctl_file,
+    FindFn, WriteFn, data_file, dir, file, join, jump_link, link, net_sysctl_access, ops_file,
+    rw_file, set_access, set_check, set_gone, set_owner, sysctl_file,
+};
+use crate::options::{
+    HIDEPID_INVISIBLE, HIDEPID_NO_ACCESS, HIDEPID_OFF, HIDEPID_PTRACEABLE, Options,
 };
 use crate::procmap;
 use crate::text::{self, MapLine, MemInfo, SmapsArea, Statm};
@@ -20,6 +23,7 @@ use rk_proc::exec::USER_HZ;
 use rk_proc::pid_namespace::{self, PidNamespace};
 use rk_proc::signal::{NSIG, SIG_IGN};
 use rk_proc::{Pid, Process, Thread};
+use rk_vfs::cred::Cred;
 use rk_vfs::{InodeRef, Location, Result};
 
 /// The facts about the kernel that procfs shows, which a higher layer knows.
@@ -50,28 +54,89 @@ fn info() -> KernelInfo {
 type PidNs = Option<Arc<PidNamespace>>;
 
 /// Makes the root directory of a mount of procfs. The mount shows the processes of the PID
-/// namespace `ns` with their IDs in it, as the `pid_ns` of the superblock of Linux.
-pub(crate) fn root(ns: PidNs) -> InodeRef {
+/// namespace `ns` with their IDs in it, as the `pid_ns` of the superblock of Linux. `opts` are the
+/// options of the mount.
+pub(crate) fn root(ns: PidNs, opts: Options) -> InodeRef {
     let find_ns = ns.clone();
     let find: FindFn = Box::new(move |name: &[u8]| {
         if let Some(nr) = parse_pid(name) {
             let pid = pid_namespace::find_pid_ns(nr, find_ns.as_ref()).ok_or(Errno::ENOENT)?;
             if let Some(p) = rk_proc::find_process(pid) {
-                return Ok(process_dir(&p, &find_ns));
+                if !caller_sees(&opts, &p) {
+                    return Err(Errno::ENOENT);
+                }
+                return Ok(process_dir(&p, &find_ns, opts));
             }
             // A thread that is not the leader has a directory too, which `ls` does not show.
             if let Some(t) = rk_proc::find_thread(pid) {
-                return Ok(thread_dir(&t, &join(b"/", name), b"/", &find_ns));
+                if !caller_sees(&opts, t.process()) {
+                    return Err(Errno::ENOENT);
+                }
+                let node = thread_dir(&t, &join(b"/", name), b"/", &find_ns);
+                guard(&node, Arc::downgrade(t.process()), opts);
+                return Ok(node);
             }
             return Err(Errno::ENOENT);
         }
         root_files(&find_ns)
             .into_iter()
+            .filter(|(n, _)| !opts.pid_only || is_pid_link(n))
             .find(|(n, _)| n == name)
             .map(|(_, i)| i)
             .ok_or(Errno::ENOENT)
     });
-    dir(b"/", b"/", 0o555, move || root_list(&ns), Some(find))
+    dir(b"/", b"/", 0o555, move || root_list(&ns, opts), Some(find))
+}
+
+/// Tells if `name` is a link of the root that the option `subset=pid` keeps, as
+/// `proc_pid_readdir` of Linux gives them.
+fn is_pid_link(name: &[u8]) -> bool {
+    name == b"self" || name == b"thread-self"
+}
+
+/// Tells if the process with the credentials `cred` can see the process `p` in a mount with the
+/// options `opts`, as `has_pid_permissions` in fs/proc/base.c of Linux. The check applies if
+/// `hidepid` is `min` or more, and the members of the group `gid` pass it. With
+/// `hidepid=ptraceable`, only the processes that the caller can trace pass.
+fn has_pid_permissions(opts: &Options, cred: &Cred, p: &Arc<Process>, min: u32) -> bool {
+    if opts.hidepid != HIDEPID_PTRACEABLE
+        && (opts.hidepid < min || opts.gid.is_some_and(|gid| cred.in_group(gid)))
+    {
+        return true;
+    }
+    // `ptrace_may_access` of Linux: a process can always trace itself.
+    rk_proc::current_thread().is_some_and(|t| Arc::ptr_eq(t.process(), p))
+        || cred.may_ptrace(&p.cred())
+}
+
+/// Tells if the caller sees the directory of `p` in the root, as `proc_pid_readdir` and
+/// `pid_getattr` of Linux with `hidepid=invisible`, and `proc_pid_lookup` with
+/// `hidepid=ptraceable`. The kernel itself sees all processes.
+fn caller_sees(opts: &Options, p: &Arc<Process>) -> bool {
+    if opts.hidepid == HIDEPID_OFF {
+        return true;
+    }
+    rk_proc::current_thread()
+        .is_none_or(|t| has_pid_permissions(opts, &t.process().cred(), p, HIDEPID_INVISIBLE))
+}
+
+/// Gives the directory `node` of the process `w` the check of `proc_pid_permission` of Linux: a
+/// caller without the permission of `hidepid` gets `EPERM`, or `ENOENT` with
+/// `hidepid=invisible`.
+fn guard(node: &InodeRef, w: Weak<Process>, opts: Options) {
+    if opts.hidepid == HIDEPID_OFF {
+        return;
+    }
+    set_check(node, move |cred, _| {
+        let Some(p) = w.upgrade() else { return Ok(()) };
+        if has_pid_permissions(&opts, cred, &p, HIDEPID_NO_ACCESS) {
+            Ok(())
+        } else if opts.hidepid == HIDEPID_INVISIBLE {
+            Err(Errno::ENOENT)
+        } else {
+            Err(Errno::EPERM)
+        }
+    });
 }
 
 /// The text that `show` makes from the block devices, in the order of their numbers.
@@ -122,12 +187,15 @@ fn vm_counts() -> text::VmCounts {
 
 /// The entries of the root: the files, and a directory for each process of the namespace `ns`,
 /// with its ID in `ns`.
-fn root_list(ns: &PidNs) -> Result<Vec<(Vec<u8>, InodeRef)>> {
+fn root_list(ns: &PidNs, opts: Options) -> Result<Vec<(Vec<u8>, InodeRef)>> {
     let mut out = root_files(ns);
+    if opts.pid_only {
+        out.retain(|(n, _)| is_pid_link(n));
+    }
     for p in rk_proc::processes() {
         let nr = pid_namespace::pid_nr_ns(p.pid(), ns.as_ref());
-        if nr != 0 {
-            out.push((format!("{nr}").into_bytes(), process_dir(&p, ns)));
+        if nr != 0 && caller_sees(&opts, &p) {
+            out.push((format!("{nr}").into_bytes(), process_dir(&p, ns, opts)));
         }
     }
     Ok(out)
@@ -145,7 +213,7 @@ fn text_file(path: &[u8], f: fn() -> Vec<u8>) -> InodeRef {
 }
 
 fn root_files(ns: &PidNs) -> Vec<(Vec<u8>, InodeRef)> {
-    let files: [(&[u8], fn() -> Vec<u8>); 13] = [
+    let files: [(&[u8], fn() -> Vec<u8>); 12] = [
         (b"meminfo", || {
             let f = rk_frame::mm::frame_stats();
             let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
@@ -209,17 +277,13 @@ fn root_files(ns: &PidNs) -> Vec<(Vec<u8>, InodeRef)> {
             }
             out.into_bytes()
         }),
-        (b"swaps", || {
-            let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
-            let mut out = String::from(text::SWAPS_HEADER);
-            rk_vfs::swap::for_each(|s| {
-                out.push_str(&text::swap_line(&s.path, s.partition, s.pages * kb, 0, s.priority));
-            });
-            out.into_bytes()
-        }),
     ];
     let mut out: Vec<(Vec<u8>, InodeRef)> =
         files.iter().map(|&(name, f)| (name.to_vec(), text_file(&join(b"/", name), f))).collect();
+    out.push((
+        b"swaps".to_vec(),
+        ops_file(b"/swaps", 0o444, || Ok(swaps_text()), || Some(SwapsFile::open())),
+    ));
     out.push((b"mounts".to_vec(), link(b"/mounts", 0o777, || Ok(b"self/mounts".to_vec()))));
     out.push((b"net".to_vec(), link(b"/net", 0o777, || Ok(b"self/net".to_vec()))));
     // A machine with a device tree has `/proc/device-tree`, as `proc_device_tree_init` of Linux.
@@ -1875,6 +1939,70 @@ impl rk_vfs::file::FileOps for SysctlFile {
     }
 }
 
+/// The text of `/proc/swaps`.
+fn swaps_text() -> Vec<u8> {
+    let kb = (rk_mm::PAGE_SIZE / 1024) as u64;
+    let mut out = String::from(text::SWAPS_HEADER);
+    rk_vfs::swap::for_each(|s| {
+        out.push_str(&text::swap_line(&s.path, s.partition, s.pages * kb, 0, s.priority));
+    });
+    out.into_bytes()
+}
+
+/// An open file of `/proc/swaps`. It reads the text of its inode, and has an event of `POLLPRI`
+/// and `POLLERR` after a `swapon` or a `swapoff`, as `swaps_poll` in mm/swapfile.c of Linux.
+/// systemd watches the file with epoll, and epoll refuses a file without `poll`.
+struct SwapsFile {
+    /// The count of the changes that `poll` saw last.
+    seen: AtomicU64,
+}
+
+impl SwapsFile {
+    /// Opens the file. The changes before the open have no event.
+    fn open() -> Arc<dyn rk_vfs::file::FileOps> {
+        Arc::new(Self { seen: AtomicU64::new(rk_vfs::swap::event()) })
+    }
+}
+
+impl rk_vfs::file::FileOps for SwapsFile {
+    fn read(&self, file: &rk_vfs::file::File, buf: &mut [u8]) -> Result<usize> {
+        let pos = file.pos();
+        let n = file.inode().ok_or(Errno::EINVAL)?.read_at(pos, buf)?;
+        file.set_pos(pos + n as u64);
+        Ok(n)
+    }
+
+    fn read_at(&self, file: &rk_vfs::file::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        file.inode().ok_or(Errno::EINVAL)?.read_at(offset, buf)
+    }
+
+    fn seekable(&self) -> bool {
+        true
+    }
+
+    fn poll(&self, _file: &rk_vfs::file::File) -> u32 {
+        use rk_abi::native::poll::{POLLERR, POLLIN, POLLPRI, POLLRDNORM};
+        let event = rk_vfs::swap::event();
+        if self.seen.swap(event, Ordering::Relaxed) == event {
+            POLLIN | POLLRDNORM
+        } else {
+            POLLIN | POLLRDNORM | POLLERR | POLLPRI
+        }
+    }
+
+    fn pollable(&self) -> bool {
+        true
+    }
+
+    fn poll_wait(&self, _file: &rk_vfs::file::File, table: &mut rk_vfs::wait::PollTable) {
+        table.add_static(rk_vfs::swap::poll_queue());
+    }
+
+    fn event_count(&self) -> u64 {
+        rk_vfs::swap::event()
+    }
+}
+
 /// An open file of `/proc/PID/mounts` or `/proc/PID/mountinfo`. It reads the text of its inode, and has an event of
 /// `POLLPRI` and `POLLERR` when the mounts of the name space change, as `mounts_poll` in
 /// fs/proc_namespace.c of Linux.
@@ -2054,11 +2182,21 @@ fn fd_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
                         + 0o100 * u32::from(flags.writable()) * 2
                         + 0o100;
                     let path = join(&me, &name);
-                    // A socket cannot open again through its link, as `sock_no_open` of Linux.
-                    // A walk goes to the open file itself, so a pipe and a file without a name
-                    // open again, as the magic links of Linux.
+                    // A walk goes to the open file itself, as the magic links of Linux. So a
+                    // pipe and a file without a name open again, and `stat` of a socket gives
+                    // the socket. A socket cannot open again, as `sock_no_open` of Linux.
                     let node = if target.starts_with(b"socket:[") {
-                        dead_link(&path, perm, move || Ok(target.clone()), Errno::ENXIO)
+                        let file = Arc::downgrade(&file);
+                        jump_link(
+                            &path,
+                            perm,
+                            move || Ok(target.clone()),
+                            move || {
+                                let file = file.upgrade().ok_or(Errno::ENOENT)?;
+                                let inode: InodeRef = Arc::new(SockInode(file.metadata()?));
+                                Ok(Location::detached(inode))
+                            },
+                        )
                     } else if file.location().is_some() || target.starts_with(b"pipe:[") {
                         let file = Arc::downgrade(&file);
                         jump_link(
@@ -2083,6 +2221,20 @@ fn fd_dir(w: Weak<Process>, base: &[u8]) -> InodeRef {
         },
         None,
     )
+}
+
+/// The inode that the link of a socket in `/proc/PID/fd` goes to, as the inode of sockfs in
+/// Linux. It has the attributes of the socket. Its type is `S_IFSOCK`, so an open gives `ENXIO`.
+struct SockInode(rk_vfs::Metadata);
+
+impl rk_vfs::Inode for SockInode {
+    fn metadata(&self) -> rk_vfs::Metadata {
+        self.0
+    }
+
+    fn set_attr(&self, _attr: &rk_vfs::SetAttr) -> Result<()> {
+        Err(Errno::EPERM)
+    }
 }
 
 /// The text of `/proc/PID/fdinfo/FD`, as `seq_show` in fs/proc/fd.c of Linux.
@@ -2594,6 +2746,34 @@ fn process_files(
             Ok(format!("{ns} 0 0\n").into_bytes())
         }),
     ));
+    // As `proc_sched_show_task` in kernel/sched/debug.c of Linux, with the values that rukernel
+    // keeps. TEST-07-PID1 of systemd reads `policy` and `prio` there.
+    let p_ = w.clone();
+    let t_ = t.clone();
+    let ns_ = ns.clone();
+    out.push((
+        b"sched".to_vec(),
+        file(&join(base, b"sched"), move || {
+            let p = alive(&p_)?;
+            let t = slack_thread(&p_, &t_)?;
+            let sp = t.sched();
+            let prio = if sp.is_deadline() {
+                -1
+            } else if sp.is_rt() {
+                99 - sp.priority as i32
+            } else {
+                120 + sp.nice
+            };
+            Ok(text::sched(&text::Sched {
+                comm: p.comm(),
+                pid: pid_namespace::pid_nr_ns(t.tid(), ns_.as_ref()),
+                threads: p.threads().len(),
+                runtime_ns: (t.user_ticks() + t.sys_ticks()) * (1_000_000_000 / rk_frame::time::HZ),
+                policy: sp.policy,
+                prio,
+            }))
+        }),
+    ));
     let p_ = w.clone();
     out.push((
         b"mountstats".to_vec(),
@@ -2683,7 +2863,7 @@ fn owned(w: &Weak<Process>, node: InodeRef) -> InodeRef {
     node
 }
 
-fn process_dir(p: &Arc<Process>, ns: &PidNs) -> InodeRef {
+fn process_dir(p: &Arc<Process>, ns: &PidNs, opts: Options) -> InodeRef {
     let w = Arc::downgrade(p);
     // The inode numbers come from the serial number too, so that a new process with the same PID
     // has new inodes, as in Linux.
@@ -2704,12 +2884,17 @@ fn process_dir(p: &Arc<Process>, ns: &PidNs) -> InodeRef {
         None,
     );
     // The directory is gone when the process is not in the table of processes: after the wait
-    // that reaped it, also when a new process has the PID now, as `pid_revalidate` of Linux.
+    // that reaped it, also when a new process has the PID now, as `pid_revalidate` of Linux. It
+    // is gone too for a caller that does not see it because of `hidepid`, so that the lookup
+    // checks again.
     let gone = owner.clone();
     set_gone(&node, move || {
-        gone.upgrade()
-            .is_none_or(|p| rk_proc::find_process(p.pid()).is_none_or(|now| !Arc::ptr_eq(&now, &p)))
+        gone.upgrade().is_none_or(|p| {
+            rk_proc::find_process(p.pid()).is_none_or(|now| !Arc::ptr_eq(&now, &p))
+                || !caller_sees(&opts, &p)
+        })
     });
+    guard(&node, owner.clone(), opts);
     owned(&owner, node)
 }
 
