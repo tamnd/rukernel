@@ -322,11 +322,11 @@ impl NetDriver for Tun {
         Ok(())
     }
 
-    /// The carrier is on while a queue is enabled, as `tun_attach` and `__tun_detach` of Linux
-    /// set it.
+    /// The carrier is on while a file is on the device, as `tun_attach` and `__tun_detach` of
+    /// Linux set it. A queue that `IFF_DETACH_QUEUE` took off still counts, as `numdisabled` of
+    /// Linux, so the carrier stays on until the file closes.
     fn link_up(&self) -> bool {
-        self.queues.lock().iter().any(|q| q.enabled.load(Ordering::Relaxed))
-            && self.config.lock().carrier
+        !self.queues.lock().is_empty() && self.config.lock().carrier
     }
 
     /// Puts the frame in the queue of the reads of one file, as `tun_net_xmit` of Linux. Without
@@ -389,6 +389,30 @@ impl TunFile {
         }
     }
 
+    /// The device of the file, also if `IFF_DETACH_QUEUE` took its queue off, as `tun_get` of
+    /// Linux: the ioctls of a detached file act on its device. Gives `EBADFD` if the file has
+    /// no device.
+    fn bound(&self) -> Result<(Arc<Tun>, Arc<NetDevice>)> {
+        let a = self.attached.lock().clone();
+        match a {
+            Some((tun, dev)) if !tun.gone.load(Ordering::Relaxed) => Ok((tun, dev)),
+            _ => Err(Errno::EBADFD),
+        }
+    }
+
+    /// Sets or clears `IFF_PERSIST`, for `TUNSETPERSIST`. A persistent device stays after its
+    /// last file closes.
+    pub(crate) fn set_persist(&self, on: bool) -> Result<()> {
+        let (tun, _) = self.bound()?;
+        let mut c = tun.config.lock();
+        if on {
+            c.flags |= IFF_PERSIST;
+        } else {
+            c.flags &= !IFF_PERSIST;
+        }
+        Ok(())
+    }
+
     /// The device of a file that `IFF_DETACH_QUEUE` took off, as `tfile->detached` of Linux.
     fn detached(&self) -> Option<Arc<Tun>> {
         let a = self.attached.lock();
@@ -426,10 +450,13 @@ impl TunFile {
                     return Err(Errno::EINVAL);
                 }
                 tun.attach(&self.queue)?;
-                // Only the first queue sets the flags, as Linux.
+                // Only the first queue sets the flags, as Linux. The carrier comes on with it.
                 if tun.queues.lock().len() == 1 {
-                    let mut c = tun.config.lock();
-                    c.flags = (c.flags & !FEATURES) | (flags & FEATURES);
+                    {
+                        let mut c = tun.config.lock();
+                        c.flags = (c.flags & !FEATURES) | (flags & FEATURES);
+                    }
+                    dev.carrier_changed();
                 }
                 (tun, dev)
             }
@@ -488,16 +515,19 @@ impl TunFile {
     }
 
     /// Takes the file off its device, as `tun_detach` of Linux. A device that is not persistent
-    /// goes away with its last queue.
+    /// goes away with its last queue, and a persistent device loses its carrier.
     fn detach(&self) {
         let Some((tun, dev)) = self.attached.lock().take() else { return };
         let left = tun.detach(&self.queue, false);
-        if left == 0
-            && tun.config.lock().flags & IFF_PERSIST == 0
-            && !tun.gone.load(Ordering::Relaxed)
-        {
+        if left != 0 || tun.gone.load(Ordering::Relaxed) {
+            return;
+        }
+        if tun.config.lock().flags & IFF_PERSIST == 0 {
             let _in = ns::enter_index(dev.net());
             dev::unregister(&dev);
+        } else {
+            // The last file closed, so the carrier goes off.
+            dev.carrier_changed();
         }
     }
 }
@@ -712,7 +742,7 @@ impl FileOps for TunFile {
                 return Ok(0);
             }
             TUNSETIFINDEX => {
-                if self.device().is_ok() {
+                if self.bound().is_ok() {
                     return Err(Errno::EPERM);
                 }
                 let v = read_int(mem, arg)?;
@@ -724,7 +754,10 @@ impl FileOps for TunFile {
             }
             _ => {}
         }
-        let (tun, dev) = self.device()?;
+        // A detached file has its device, as `tun_get` in `__tun_chr_ioctl` of Linux. Thus
+        // systemd-networkd can make a persistent device with `MultiQueue=`: it detaches the
+        // queue with `TUNSETQUEUE` and then sends `TUNSETPERSIST`.
+        let (tun, dev) = self.bound()?;
         match cmd {
             TUNGETIFF => {
                 let mut req = [0u8; IFREQ];
@@ -736,12 +769,7 @@ impl FileOps for TunFile {
             }
             TUNSETNOCSUM | TUNSETDEBUG => Ok(0),
             TUNSETPERSIST => {
-                let mut c = tun.config.lock();
-                if arg != 0 {
-                    c.flags |= IFF_PERSIST;
-                } else {
-                    c.flags &= !IFF_PERSIST;
-                }
+                self.set_persist(arg != 0)?;
                 Ok(0)
             }
             TUNSETOWNER => {

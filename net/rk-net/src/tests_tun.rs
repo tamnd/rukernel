@@ -124,3 +124,34 @@ fn multi_queue_devices_spread_frames_and_detach_queues() {
     drop(_in);
     drop(net);
 }
+
+#[test]
+fn a_detached_file_makes_its_device_persistent() {
+    let _serial = crate::TEST_DEVICES.lock();
+    dev::init();
+    let net = ns::new().unwrap();
+    let _in = ns::enter(&net);
+    // A file without a device has nothing to change.
+    let f = TunFile::new(net.clone());
+    assert_eq!(f.set_persist(true).err(), Some(Errno::EBADFD));
+    // As systemd-networkd with `MultiQueue=yes`: `TUNSETIFF`, `TUNSETQUEUE` with
+    // `IFF_DETACH_QUEUE`, `TUNSETPERSIST`, and then the close of the file.
+    f.set_iff("pq0", IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE).unwrap();
+    let dev = dev::by_name("pq0").unwrap();
+    assert!(dev.carrier());
+    f.set_queue(IFF_DETACH_QUEUE).unwrap();
+    assert_eq!(f.device().err(), Some(Errno::EBADFD));
+    f.set_persist(true).unwrap();
+    // The detached file still holds the device, so the carrier stays on until the close.
+    assert!(dev.carrier());
+    drop(f);
+    assert!(!dev.carrier());
+    // A new file on the device brings the carrier back.
+    let g = TunFile::new(net.clone());
+    g.set_iff("pq0", IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE).unwrap();
+    assert!(dev.carrier());
+    drop(g);
+    assert!(!dev.carrier());
+    dev::unregister(&dev);
+    assert!(dev::by_name("pq0").is_none());
+}
