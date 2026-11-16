@@ -9,9 +9,10 @@
 use crate::FileType;
 use crate::file::File;
 use crate::inode::{FiemapExtent, Inode, InodeRef, Result};
+use crate::wait::WaitQueue;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use rk_abi::Errno;
 use rk_block::cache::PAGE_SIZE;
 use rk_frame::sync::SpinLock;
@@ -76,6 +77,28 @@ static SWAPS: SpinLock<Vec<Swap>> = SpinLock::new(Vec::new());
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 /// The priority of the last area without `SWAP_FLAG_PREFER`.
 static LEAST: SpinLock<i32> = SpinLock::new(-1);
+/// The count of the changes of the areas, as `proc_poll_event` of Linux.
+static EVENT: AtomicU64 = AtomicU64::new(0);
+/// The queue that a change of the areas wakes, as `proc_poll_wait` of Linux.
+static POLL: WaitQueue = WaitQueue::new();
+
+/// Counts a change of the areas and wakes the waits of `poll` on `/proc/swaps`.
+fn touch() {
+    EVENT.fetch_add(1, Ordering::Relaxed);
+    POLL.wake_all();
+}
+
+/// The count of the changes of the areas. An open file of `/proc/swaps` has an event of
+/// `POLLPRI` and `POLLERR` when the count changes, as `swaps_poll` of Linux. systemd watches the
+/// file for its swap units.
+pub fn event() -> u64 {
+    EVENT.load(Ordering::Relaxed)
+}
+
+/// The queue that a change of the areas wakes.
+pub fn poll_queue() -> &'static WaitQueue {
+    &POLL
+}
 
 fn key(inode: &dyn Inode) -> usize {
     core::ptr::from_ref(inode).cast::<()>() as usize
@@ -253,6 +276,8 @@ pub fn activate(file: Arc<File>, path: Vec<u8>, swap_flags: u32) -> Result<()> {
     }
     swaps.push(Swap { file, path, partition, pages: pages - 1, priority });
     ACTIVE.store(swaps.len(), Ordering::Release);
+    drop(swaps);
+    touch();
     Ok(())
 }
 
@@ -278,6 +303,7 @@ pub fn deactivate(inode: &InodeRef) -> Result<()> {
     }
     drop(swaps);
     drop(swap);
+    touch();
     Ok(())
 }
 

@@ -24,8 +24,10 @@
 //! `ELOOP` for a symbolic link on a mount with `MS_NOSYMFOLLOW`. `mmap` does not enforce
 //! `MS_NOEXEC` yet.
 //!
-//! `umount2` gives `EBUSY` for a mount with an open file, unless `MNT_DETACH` is set. The working
-//! directory of a process does not make a mount busy.
+//! `umount2` gives `EBUSY` for a mount with an open file or with a mount on it, unless
+//! `MNT_DETACH` is set. `MNT_DETACH` removes the mount and each mount under it, so
+//! `pivot_root(".", ".")` and then `umount2(".", MNT_DETACH)` remove the old root tree. The
+//! working directory of a process does not make a mount busy.
 
 use crate::cx::{Cx, PATH_MAX, SysResult};
 use alloc::sync::Arc;
@@ -289,7 +291,13 @@ pub(crate) fn umount2(cx: &Cx<'_>, target: u64, flags: u64) -> SysResult {
     if flags & MNT_EXPIRE != 0 && !at.mount.expire() {
         return Err(Errno::EAGAIN);
     }
-    fs.namespace().unmount(&at)?;
+    // `MNT_DETACH` also removes the mounts under the mount, as `umount_tree` of Linux. Without
+    // it, a mount on the mount makes it busy.
+    if flags & MNT_DETACH != 0 {
+        fs.namespace().unmount_tree(&at)?;
+    } else {
+        fs.namespace().unmount(&at)?;
+    }
     Ok(0)
 }
 

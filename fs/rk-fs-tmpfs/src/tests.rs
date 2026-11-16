@@ -703,6 +703,17 @@ fn mount_options() {
         mount(&MountArgs { data: b"mode=9", dev: None, read_only: false, lookup: None }).err(),
         Some(Errno::EINVAL)
     );
+    // systemd-user-runtime-dir mounts `/run/user/UID` with the owner in the options.
+    let data = b"mode=0700,uid=4711,gid=4712,size=10m";
+    let meta =
+        mount(&MountArgs { data, dev: None, read_only: false, lookup: None }).unwrap().metadata();
+    assert_eq!((meta.uid, meta.gid), (4711, 4712));
+    for data in [&b"uid=x"[..], b"gid=-1", b"uid=4294967295"] {
+        assert_eq!(
+            mount(&MountArgs { data, dev: None, read_only: false, lookup: None }).err(),
+            Some(Errno::EINVAL)
+        );
+    }
 }
 
 #[test]

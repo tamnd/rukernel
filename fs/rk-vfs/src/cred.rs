@@ -370,11 +370,24 @@ impl Cred {
     ///
     /// # Errors
     ///
-    /// Gives `EACCES` if the access is not allowed, and `EIO` for a damaged ACL.
+    /// Gives `EACCES` if the access is not allowed, `EPERM` if the device controller of the
+    /// cgroup refuses the access to a device file, and `EIO` for a damaged ACL. The file system
+    /// can give another error.
     pub fn inode_permission(&self, inode: &dyn Inode, mask: u32) -> Result<()> {
+        let meta = inode.metadata();
         match inode.permission(self, mask) {
             Some(r) => r?,
-            None => self.check(&inode.metadata(), mask, || acl::access(inode))?,
+            None => self.check(&meta, mask, || acl::access(inode))?,
+        }
+        // The device controller checks a device file after the check of the access, as
+        // `devcgroup_inode_permission` in `inode_permission` of Linux. So `access` and
+        // `faccessat` get its result too, and not only `open`.
+        if let Some(kind @ (FileType::CharDevice | FileType::BlockDevice)) = meta.file_type() {
+            crate::device::devcgroup_inode_permission(
+                kind == FileType::BlockDevice,
+                meta.rdev,
+                mask,
+            )?;
         }
         crate::security::inode_permission(self, inode, mask)
     }
@@ -1522,5 +1535,50 @@ mod tests {
         assert_eq!((c.egid, c.sgid), (50, 50));
         let (c, _) = user(1000).exec(ExecFile { mode: 0o2745, uid: 0, gid: 50, no_setid: false });
         assert_eq!(c.egid, 1000);
+    }
+
+    /// A device file with only the attributes, for the check of the device controller.
+    struct DeviceFile(Metadata);
+
+    impl Inode for DeviceFile {
+        fn metadata(&self) -> Metadata {
+            self.0
+        }
+
+        fn set_attr(&self, _attr: &SetAttr) -> Result<()> {
+            Err(Errno::EPERM)
+        }
+    }
+
+    /// A device controller that refuses a write to the character device 250:77 only.
+    fn refuse_writes_to_250_77(dev_type: u32, major: u32, minor: u32, access: u32) -> Result<()> {
+        use crate::device::devcg;
+        if dev_type == devcg::DEV_CHAR
+            && (major, minor) == (250, 77)
+            && access & devcg::ACC_WRITE != 0
+        {
+            return Err(Errno::EPERM);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_device_controller_checks_each_access_and_not_only_open() {
+        crate::device::set_devcgroup_check(refuse_writes_to_250_77);
+        let root = Cred::root();
+        let dev =
+            Metadata { rdev: crate::device::makedev(250, 77), ..meta(mode::S_IFCHR, 0o666, 0, 0) };
+        let file = DeviceFile(dev);
+        // `access(W_OK)` of root gets the result of the device controller after the mode bits.
+        assert_eq!(root.inode_permission(&file, may::WRITE), Err(Errno::EPERM));
+        assert_eq!(root.inode_permission(&file, may::READ), Ok(()));
+        // The mode bits come first.
+        let file = DeviceFile(Metadata { mode: mode::S_IFCHR | 0o600, ..dev });
+        assert_eq!(user(1000).inode_permission(&file, may::WRITE), Err(Errno::EACCES));
+        // A block device with the same number, and a regular file, are not refused.
+        let file = DeviceFile(Metadata { mode: mode::S_IFBLK | 0o666, ..dev });
+        assert_eq!(root.inode_permission(&file, may::WRITE), Ok(()));
+        let file = DeviceFile(Metadata { mode: mode::S_IFREG | 0o666, ..dev });
+        assert_eq!(root.inode_permission(&file, may::WRITE), Ok(()));
     }
 }

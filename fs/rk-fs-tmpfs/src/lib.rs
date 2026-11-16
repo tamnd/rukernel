@@ -101,7 +101,10 @@ pub const FS_TYPE: rk_vfs::fstype::FsType =
 /// octal. The default is 1777, as Linux gives. The option `size=` gives the largest size of the
 /// data, in bytes with an optional suffix `k`, `m` or `g`, or in percent of the memory, and
 /// `nr_blocks=` gives it in pages. A write past it gives `ENOSPC`. A size of 0 has no limit, as
-/// Linux. A mount with `MS_RDONLY` makes an empty file system that is read only, as Linux.
+/// Linux. The options `uid=` and `gid=` give the owner and the group of the root, as
+/// `shmem_parse_one` of Linux. systemd-user-runtime-dir mounts `/run/user/UID` with them, and
+/// pam_systemd then checks the owner. A mount with `MS_RDONLY` makes an empty file system that is
+/// read only, as Linux.
 pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
     let perm = match rk_vfs::fstype::option(args.data, b"mode") {
         Some(v) => parse_octal(v).ok_or(Errno::EINVAL)?,
@@ -116,7 +119,22 @@ pub fn mount(args: &rk_vfs::fstype::MountArgs<'_>) -> Result<InodeRef> {
         (None, None) => 0,
     };
     let max = if max == 0 { u64::MAX } else { max };
+    // The ID -1 is not valid, as `make_kuid` of Linux gives for it.
+    let id = |key: &[u8]| {
+        rk_vfs::fstype::option(args.data, key)
+            .map(|v| {
+                let id = core::str::from_utf8(v).ok().and_then(|v| v.parse::<u32>().ok());
+                id.filter(|&id| id != u32::MAX).ok_or(Errno::EINVAL)
+            })
+            .transpose()
+    };
+    let (uid, gid) = (id(b"uid")?, id(b"gid")?);
     let root = make(perm, max);
+    {
+        let mut a = root.attrs.lock();
+        a.uid = uid.unwrap_or(a.uid);
+        a.gid = gid.unwrap_or(a.gid);
+    }
     root.set_read_only(args.read_only)?;
     Ok(root)
 }

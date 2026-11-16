@@ -3275,6 +3275,27 @@ static void test_memfd(void)
 	close(again);
 	close(p[0]);
 	close(p[1]);
+	/* systemd tests a passed socket with "test -S /dev/fd/3". */
+	struct stat st, fst;
+	int sv[2] = {-1, -1};
+	check("socketpair for /proc/self/fd", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+	snprintf(path, sizeof(path), "/proc/self/fd/%d", sv[0]);
+	check("stat through /proc/self/fd gives the socket",
+	      stat(path, &st) == 0 && S_ISSOCK(st.st_mode) && fstat(sv[0], &fst) == 0 && st.st_ino == fst.st_ino);
+	errno = 0;
+	check("an open of a socket through /proc/self/fd gives ENXIO", open(path, O_RDWR) == -1 && errno == ENXIO);
+	/* sockfs of Linux has no file handles. systemd-run -t compares stdin and stdout with them. */
+	struct {
+		unsigned int bytes;
+		int type;
+		unsigned char f[128];
+	} sfh = {.bytes = 128};
+	int smnt = -1;
+	errno = 0;
+	check("name_to_handle_at of a socket gives EOPNOTSUPP",
+	      syscall(SYS_name_to_handle_at, sv[0], "", &sfh, &smnt, AT_EMPTY_PATH) == -1 && errno == EOPNOTSUPP);
+	close(sv[0]);
+	close(sv[1]);
 	umount("/proc");
 	close(fd);
 	errno = 0;
@@ -3474,11 +3495,17 @@ static void test_mount(void)
 	check("umount the copies", umount("/mnt3/sub") == 0 && umount("/mnt3") == 0 && umount("/mnt/sub") == 0);
 	rmdir("/mnt3");
 	check("mount --make-private", mount(NULL, "/mnt", NULL, MS_PRIVATE, NULL) == 0);
+	check("mount tmpfs under the tmpfs again", mount("none", "/mnt/sub", "tmpfs", 0, NULL) == 0);
 	check("mount -o remount,ro", mount(NULL, "/mnt", NULL, MS_REMOUNT | MS_RDONLY, NULL) == 0);
 	errno = 0;
 	check("an unknown type gives ENODEV", mount("none", "/mnt", "nofs", 0, NULL) == -1 && errno == ENODEV);
 	check("umount the bind mount", umount("/mnt2") == 0);
+	errno = 0;
+	check("umount of a mount with a mount on it gives EBUSY", umount("/mnt") == -1 && errno == EBUSY);
 	check("umount2 with MNT_DETACH", umount2("/mnt", MNT_DETACH) == 0);
+	errno = 0;
+	check("MNT_DETACH also removes the mount under the mount",
+	      access("/mnt/sub", F_OK) == -1 && errno == ENOENT);
 	errno = 0;
 	check("umount of a directory gives EINVAL", umount("/mnt") == -1 && errno == EINVAL);
 	check("the file is gone with the mount", access("/mnt/f", F_OK) == -1 && errno == ENOENT);
@@ -7805,6 +7832,17 @@ static void test_proc_pid_files(void)
 	check("/proc/self/wchan", read_file("/proc/self/wchan", buf, sizeof(buf)) == 1 && !strcmp(buf, "0"));
 	check("/proc/self/schedstat", read_file("/proc/self/schedstat", buf, sizeof(buf)) > 0 &&
 					      sscanf(buf, "%llu %llu %llu", &ns, &delay, &runs) == 3 && buf[strlen(buf) - 1] == '\n');
+	{
+		/* As proc_sched_show_task of Linux: the comm and pid line, then one value on each line. */
+		char *pol, *pri;
+		int n = read_file("/proc/self/sched", buf, sizeof(buf));
+
+		pol = n > 0 ? strstr(buf, "\npolicy ") : NULL;
+		pri = n > 0 ? strstr(buf, "\nprio ") : NULL;
+		check("/proc/self/sched", n > 0 && strstr(buf, ", #threads: ") && strstr(buf, ")\n---") &&
+						  pol && strchr(pol, ':') && atoi(strchr(pol, ':') + 1) == 0 &&
+						  pri && strchr(pri, ':') && atoi(strchr(pri, ':') + 1) == 120);
+	}
 	check("/proc/self/mountstats", read_file("/proc/self/mountstats", buf, sizeof(buf)) > 0 &&
 					       strstr(buf, "device proc mounted on /proc with fstype proc\n"));
 	pid = fork();
@@ -7819,6 +7857,57 @@ static void test_proc_pid_files(void)
 	}
 	check("/proc/self/loginuid is set once", pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	umount("/proc");
+}
+
+/*
+ * The options hidepid and subset of procfs, which ProtectProc= and ProcSubset= of systemd use
+ * (TEST-07-PID1 exec-context, #536). A child of the user 1000 checks the directory of this
+ * process, which it cannot trace. Bit n of the exit code tells that check n failed.
+ */
+static void test_proc_hidepid(void)
+{
+	char me[64], status_path[64];
+	struct stat st;
+	int status;
+
+	mkdir("/tmp/hp1", 0555);
+	mkdir("/tmp/hp2", 0555);
+	errno = 0;
+	check("procfs refuses hidepid=3", mount("proc", "/tmp/hp1", "proc", 0, "hidepid=3") == -1 && errno == EINVAL);
+	check("procfs takes hidepid=noaccess", mount("proc", "/tmp/hp1", "proc", 0, "hidepid=noaccess") == 0);
+	check("procfs takes hidepid=invisible,subset=pid",
+	      mount("proc", "/tmp/hp2", "proc", 0, "hidepid=invisible,subset=pid") == 0);
+	snprintf(me, sizeof(me), "/tmp/hp2/%d", getpid());
+	check("root sees all processes with hidepid=invisible", stat(me, &st) == 0);
+	check("subset=pid hides /proc/meminfo", stat("/tmp/hp2/meminfo", &st) == -1 && errno == ENOENT);
+	snprintf(status_path, sizeof(status_path), "/tmp/hp1/%d", getpid());
+	pid_t pid = fork();
+	if (pid == 0) {
+		int bad = 0;
+		if (setresgid(1000, 1000, 1000) != 0 || setresuid(1000, 1000, 1000) != 0)
+			_exit(0x7f);
+		if (stat(status_path, &st) != 0)
+			bad |= 1;
+		if (access(status_path, R_OK) == 0 || errno != EPERM)
+			bad |= 2;
+		if (access("/tmp/hp1/self/comm", R_OK) != 0)
+			bad |= 4;
+		if (stat(me, &st) == 0 || errno != ENOENT)
+			bad |= 8;
+		if (access("/tmp/hp2/self/comm", R_OK) != 0 || access("/tmp/hp2/thread-self", F_OK) != 0)
+			bad |= 16;
+		if (stat("/tmp/hp2/cpuinfo", &st) == 0)
+			bad |= 32;
+		_exit(bad);
+	}
+	check("hidepid hides the other processes from a user",
+	      pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (pid > 0 && WIFEXITED(status) && WEXITSTATUS(status) != 0)
+		printf("hidepid: failed checks 0x%x\n", WEXITSTATUS(status));
+	umount("/tmp/hp1");
+	umount("/tmp/hp2");
+	rmdir("/tmp/hp1");
+	rmdir("/tmp/hp2");
 }
 
 static void test_proc(void)
@@ -7860,6 +7949,16 @@ static void test_proc(void)
 		      access("/tmp/sticky/link", F_OK) == 0);
 	unlink("/tmp/sticky/link");
 	rmdir("/tmp/sticky");
+	test_proc_hidepid();
+	/* systemd watches /proc/swaps with epoll and EPOLLPRI for its swap units (#536). */
+	{
+		int sw = open("/proc/swaps", O_RDONLY | O_CLOEXEC), sep = epoll_create1(EPOLL_CLOEXEC);
+		struct epoll_event sev = {.events = EPOLLPRI};
+		check("epoll takes /proc/swaps", sw >= 0 && sep >= 0 && epoll_ctl(sep, EPOLL_CTL_ADD, sw, &sev) == 0 &&
+							epoll_wait(sep, &sev, 1, 0) == 0);
+		close(sw);
+		close(sep);
+	}
 	fd = open("/proc/self/oom_score_adj", O_WRONLY);
 	check("write /proc/self/oom_score_adj", fd >= 0 && write(fd, "-500\n", 5) == 5);
 	close(fd);
