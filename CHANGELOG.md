@@ -4,6 +4,10 @@ This file records each release. The format follows [Keep a Changelog](https://ke
 
 ## Unreleased
 
+### Fixed
+
+- On arm64, a process can read CTR_EL0 and DCZID_EL0 and run `DC ZVA`, `DC CVAU`, `IC IVAU` and `WFE`, as on Linux: SCTLR_EL1 has the bits UCT, DZE, UCI, nTWE, SA0 and SED of `INIT_SCTLR_EL1_MMU_ON`. Before, a read of CTR_EL0 trapped and the process got SIGSEGV, as `dig` in TEST-75-RESOLVED of systemd (#759).
+
 ## [0.5.35] - 2026-11-16
 
 ### Added

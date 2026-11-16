@@ -96,8 +96,22 @@ pub(crate) const TCR: u64 = 16
 pub(crate) const TCR_EPD0: u64 = 1 << 7;
 /// SCTLR_EL1 with the MMU and the caches off: the bits that are RES1 in Armv8.0.
 pub(crate) const SCTLR_MMU_OFF: u64 = 0x30d0_0800;
-/// SCTLR_EL1 with the MMU, the caches and the stack alignment check on.
-pub(crate) const SCTLR_MMU_ON: u64 = SCTLR_MMU_OFF | (1 << 0) | (1 << 2) | (1 << 3) | (1 << 12);
+/// SCTLR_EL1 with the MMU, the caches and the stack alignment checks on, and the access of EL0
+/// that Linux gives in `INIT_SCTLR_EL1_MMU_ON`: M (0), C (2), SA (3), SA0 (4), SED (8), I (12),
+/// DZE (14, `DC ZVA`), UCT (15, CTR_EL0), nTWE (18, `WFE`) and UCI (26, `DC CVAU`, `DC CIVAC`,
+/// `DC CVAC` and `IC IVAU`). Without UCT, a read of CTR_EL0 at EL0 traps, and the process gets
+/// SIGSEGV, as `dig` did.
+pub(crate) const SCTLR_MMU_ON: u64 = SCTLR_MMU_OFF
+    | (1 << 0)
+    | (1 << 2)
+    | (1 << 3)
+    | (1 << 4)
+    | (1 << 8)
+    | (1 << 12)
+    | (1 << 14)
+    | (1 << 15)
+    | (1 << 18)
+    | (1 << 26);
 
 unsafe extern "C" {
     static rk_boot_k_l0: u8;

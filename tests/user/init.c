@@ -1024,6 +1024,50 @@ static void test_vdso_sigreturn(void)
 }
 #endif
 
+#if defined(__aarch64__)
+/* SCTLR_EL1.UCT, DZE and UCI let EL0 read CTR_EL0 and DCZID_EL0 and run DC ZVA, DC CVAU and
+ * IC IVAU, as on Linux. Without them each one traps, and the process gets SIGSEGV. The child runs
+ * them, so that a trap ends only the child. The buffer is in the data of init, so DC ZVA in the
+ * child writes a copy-on-write page first. */
+static unsigned char el0_cache_buf[4096] __attribute__((aligned(4096)));
+
+static void test_el0_cache_ops(void)
+{
+	memset(el0_cache_buf, 0xa5, sizeof(el0_cache_buf));
+	pid_t pid = fork();
+	if (pid == 0) {
+		unsigned long ctr, dczid;
+		__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+		__asm__ volatile("mrs %0, dczid_el0" : "=r"(dczid));
+		/* DCZID_EL0.DZP (bit 4) is 0, so DC ZVA is allowed. BS (bits 3:0) is the log2 of the
+		 * block size in words. CTR_EL0.DminLine (bits 19:16) and IminLine (bits 3:0) are the
+		 * log2 of the smallest cache lines in words. */
+		if (dczid & 16)
+			_exit(2);
+		unsigned long block = 4UL << (dczid & 15);
+		unsigned long dline = 4UL << ((ctr >> 16) & 15), iline = 4UL << (ctr & 15);
+		if (block > 2048 || dline > 2048 || iline > 2048)
+			_exit(3);
+		__asm__ volatile("dc zva, %0" : : "r"(el0_cache_buf) : "memory");
+		for (unsigned long i = 0; i < block; i++)
+			if (el0_cache_buf[i] != 0)
+				_exit(4);
+		if (el0_cache_buf[block] != 0xa5)
+			_exit(5);
+		__asm__ volatile("dc cvau, %0\n\tdsb ish\n\tic ivau, %0\n\tdsb ish\n\tisb"
+				 :
+				 : "r"(el0_cache_buf)
+				 : "memory");
+		_exit(0);
+	}
+	int status = 0;
+	check("fork for the EL0 cache instructions", pid > 0 && waitpid(pid, &status, 0) == pid);
+	check("EL0 reads CTR_EL0 and DCZID_EL0, and runs DC ZVA, DC CVAU and IC IVAU",
+	      WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	check("DC ZVA in the child does not change the page of the parent", el0_cache_buf[0] == 0xa5);
+}
+#endif
+
 static void test_vdso(void)
 {
 	/* arm64 has the time functions under the names __kernel_*, and no time or getcpu, as on
@@ -15580,6 +15624,9 @@ static void test_all(void)
 	test_exec_personality();
 	test_time();
 	test_vdso();
+#if defined(__aarch64__)
+	test_el0_cache_ops();
+#endif
 	test_signals();
 	test_sigwait();
 	test_timers();
