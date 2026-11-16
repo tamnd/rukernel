@@ -803,6 +803,7 @@ impl AddressSpace {
                 prot: req.prot,
                 shared: req.shared,
                 may_write: req.may_write,
+                may_exec: req.may_exec,
                 locked,
                 grows_down: req.grows_down,
                 mergeable: false,
@@ -871,7 +872,7 @@ impl AddressSpace {
         if Self::corten_splits_huge(&range, start, end) {
             return Err(Errno::EINVAL);
         }
-        if prot.write && old.iter().any(|v| !v.may_write) {
+        if old.iter().any(|v| (prot.write && !v.may_write) || (prot.exec && !v.may_exec)) {
             return Err(Errno::EACCES);
         }
         // A private area that gets write access goes in the commit count, as in Linux.

@@ -15,7 +15,7 @@ use crate::uapi::BPF_OBJ_NAME_LEN;
 use crate::uapi::elem::{BPF_F_ALL_CPUS, BPF_F_CPU, BPF_F_LOCK};
 use crate::uapi::flags::{BPF_F_RDONLY_PROG, BPF_F_WRONLY_PROG};
 use crate::uapi::map_type::*;
-use crate::value::MapValue;
+use crate::value::{MapValue, Page};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::sync::Arc;
@@ -40,6 +40,14 @@ impl Elem {
         for _ in 0..n {
             vals.push(MapValue::zeroed(size)?);
         }
+        Ok(Self { vals })
+    }
+
+    /// An element with the one value `value`.
+    pub fn with_value(value: MapValue) -> Result<Self> {
+        let mut vals = Vec::new();
+        vals.try_reserve_exact(1).map_err(|_| Errno::ENOMEM)?;
+        vals.push(value);
         Ok(Self { vals })
     }
 
@@ -97,6 +105,11 @@ pub trait BpfMapOps: Send + Sync {
     fn map_mem_usage(&self) -> u64;
     /// The last descriptor or pin of the map closed, as `map_release_uref`.
     fn map_release_uref(&self) {}
+    /// The pages that a process maps at the page `pgoff` for `len` bytes, as `map_mmap`. A type
+    /// that a process cannot map gives `ENOTSUPP`.
+    fn map_mmap(&self, _pgoff: u64, _len: u64) -> Result<Arc<[Arc<Page>]>> {
+        Err(Errno::ENOTSUPP)
+    }
     /// The program array, for a map of `BPF_MAP_TYPE_PROG_ARRAY`.
     fn as_prog_array(&self) -> Option<&prog_array::ProgArray> {
         None

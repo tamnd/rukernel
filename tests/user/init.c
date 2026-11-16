@@ -7653,6 +7653,188 @@ static void test_bpffs(void)
  * The maps of bpf(2): hash, array, per CPU array and LPM trie, the size rules of union
  * bpf_attr, the fdinfo of a map and the sysctl kernel.unprivileged_bpf_disabled (#537).
  */
+/* BPF_MAP_FREEZE of a map. */
+static long bpf_freeze(int fd)
+{
+	unsigned char attr[168] = { 0 };
+
+	bpf_put32(attr, 0, fd);
+	return bpf_call(22, attr, 4);
+}
+
+/*
+ * mmap of an array map with BPF_F_MMAPABLE, as prog_tests/mmap.c of the Linux selftests (#762).
+ * The selftest runs its program at raw_tracepoint/sys_enter, which rukernel does not have, so a
+ * socket filter does the same work here for each datagram.
+ */
+static void test_bpf_mmap(void)
+{
+	const size_t page = 4096, map_sz = 4 * page;
+	unsigned char minfo[104] = { 0 };
+	unsigned int len = sizeof(minfo), zero = 0, map_id = 0, next;
+	unsigned long long val = 111, *data, *bss, *p;
+	int rd, bmap, dmap, prog, fd, sk[2], i, ok;
+	char *t0, *t1, *t2;
+
+	/* rdonly_map, the .bss map with in_val and out_val, and data_map of 4 pages. */
+	rd = bpf_map_new(2, 4, 1, page, (1 << 10) | (1 << 7));
+	bmap = bpf_map_new(2, 4, 16, 1, 1 << 10);
+	dmap = bpf_map_new(2, 4, 8, map_sz / 8, 1 << 10);
+	unsigned long long insns[] = {
+		bpf_insn(0x18, 6, 1, 0, bmap), 0,	/* r6 = the .bss map */
+		bpf_insn(0x62, 10, 0, -4, 0),		/* *(u32 *)(fp - 4) = 0 */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -4),		/* r2 += -4 */
+		bpf_insn(0xbf, 1, 6, 0, 0),		/* r1 = r6 */
+		bpf_insn(0x85, 0, 0, 0, 1),		/* r0 = map_lookup_elem(r1, r2) */
+		bpf_insn(0x15, 0, 0, 44, 0),		/* if r0 == 0 goto exit */
+		bpf_insn(0xbf, 7, 0, 0, 0),		/* r7 = r0 */
+		bpf_insn(0x79, 1, 7, 0, 0),		/* r1 = in_val */
+		bpf_insn(0x7b, 7, 1, 8, 0),		/* out_val = r1 */
+		bpf_insn(0x7b, 10, 1, -16, 0),		/* *(u64 *)(fp - 16) = r1 */
+		bpf_insn(0x62, 10, 0, -4, 2),		/* *(u32 *)(fp - 4) = 2 */
+		bpf_insn(0x18, 1, 1, 0, dmap), 0,	/* r1 = data_map */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -4),		/* r2 += -4 */
+		bpf_insn(0xbf, 3, 10, 0, 0),		/* r3 = fp */
+		bpf_insn(0x07, 3, 0, 0, -16),		/* r3 += -16 */
+		bpf_insn(0xb7, 4, 0, 0, 0),		/* r4 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 2),		/* data_map[2] = in_val */
+		bpf_insn(0x62, 10, 0, -4, 0),		/* *(u32 *)(fp - 4) = 0 */
+		bpf_insn(0x18, 1, 1, 0, dmap), 0,	/* r1 = data_map */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -4),		/* r2 += -4 */
+		bpf_insn(0x85, 0, 0, 0, 1),		/* r0 = map_lookup_elem(r1, r2) */
+		bpf_insn(0x15, 0, 0, 12, 0),		/* if r0 == 0 goto far */
+		bpf_insn(0x79, 1, 0, 0, 0),		/* r1 = data_map[0] */
+		bpf_insn(0x27, 1, 0, 0, 2),		/* r1 *= 2 */
+		bpf_insn(0x7b, 10, 1, -16, 0),		/* *(u64 *)(fp - 16) = r1 */
+		bpf_insn(0x62, 10, 0, -4, 1),		/* *(u32 *)(fp - 4) = 1 */
+		bpf_insn(0x18, 1, 1, 0, dmap), 0,	/* r1 = data_map */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -4),		/* r2 += -4 */
+		bpf_insn(0xbf, 3, 10, 0, 0),		/* r3 = fp */
+		bpf_insn(0x07, 3, 0, 0, -16),		/* r3 += -16 */
+		bpf_insn(0xb7, 4, 0, 0, 0),		/* r4 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 2),		/* data_map[1] = data_map[0] * 2 */
+		bpf_insn(0x79, 1, 7, 0, 0),		/* far: r1 = in_val */
+		bpf_insn(0x27, 1, 0, 0, 3),		/* r1 *= 3 */
+		bpf_insn(0x7b, 10, 1, -16, 0),		/* *(u64 *)(fp - 16) = r1 */
+		bpf_insn(0x62, 10, 0, -4, 1500),	/* *(u32 *)(fp - 4) = 1500 */
+		bpf_insn(0x18, 1, 1, 0, dmap), 0,	/* r1 = data_map */
+		bpf_insn(0xbf, 2, 10, 0, 0),		/* r2 = fp */
+		bpf_insn(0x07, 2, 0, 0, -4),		/* r2 += -4 */
+		bpf_insn(0xbf, 3, 10, 0, 0),		/* r3 = fp */
+		bpf_insn(0x07, 3, 0, 0, -16),		/* r3 += -16 */
+		bpf_insn(0xb7, 4, 0, 0, 0),		/* r4 = 0 */
+		bpf_insn(0x85, 0, 0, 0, 2),		/* data_map[1500] = in_val * 3 */
+		bpf_insn(0xb7, 0, 0, 0, 0),		/* exit: r0 = 0 */
+		bpf_insn(0x95, 0, 0, 0, 0),		/* exit */
+	};
+	prog = bpf_prog_new(insns, sizeof(insns) / 8, NULL, 0);
+	ok = rd >= 0 && bmap >= 0 && dmap >= 0 && prog >= 0;
+	ok = ok && socketpair(AF_UNIX, SOCK_DGRAM, 0, sk) == 0 &&
+	     setsockopt(sk[1], SOL_SOCKET, SO_ATTACH_BPF, &prog, sizeof(prog)) == 0;
+	check("the maps and the program of the mmap test load", ok);
+
+	errno = 0;
+	p = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, rd, 0);
+	ok = p == MAP_FAILED && errno == EACCES;
+	p = mmap(NULL, page, PROT_READ, MAP_SHARED, rd, 0);
+	ok = ok && p != MAP_FAILED && munmap(p, page) == 0;
+	check("a map with BPF_F_RDONLY_PROG maps only to read", ok);
+	errno = 0;
+	ok = mmap(NULL, page, PROT_READ, MAP_PRIVATE, bmap, 0) == MAP_FAILED && errno == EINVAL;
+	check("a private mapping of a map gives EINVAL", ok);
+	errno = 0;
+	fd = bpf_map_new(1, 4, 8, 1, 0);
+	ok = mmap(NULL, page, PROT_READ, MAP_SHARED, fd, 0) == MAP_FAILED && errno == 524;
+	close(fd);
+	check("a mapping of a hash map gives ENOTSUPP", ok);
+
+	ok = bpf_info(dmap, minfo, &len) == 0;
+	memcpy(&map_id, minfo + 4, 4);
+	bss = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, bmap, 0);
+	data = mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_SHARED, dmap, 0);
+	ok = ok && bss != MAP_FAILED && data != MAP_FAILED && !bss[0] && !bss[1] && !data[0] &&
+	     !data[1] && !data[2] && !data[1500];
+	check("a map with BPF_F_MMAPABLE maps to read and write", ok);
+	if (!ok) {
+		close(sk[0]);
+		close(sk[1]);
+		close(prog);
+		close(rd);
+		close(bmap);
+		close(dmap);
+		return;
+	}
+
+	bss[0] = 123;
+	ok = bpf_elem(2, dmap, &zero, &val, 0) == 0 && write(sk[0], "x", 1) == 1;
+	ok = ok && bss[1] == 123 && data[0] == 111 && data[1] == 222 && data[2] == 123 &&
+	     data[1500] == 3 * 123;
+	val = 0;
+	i = 1500;
+	ok = ok && bpf_elem(1, dmap, &i, &val, 0) == 0 && val == 3 * 123;
+	check("a program and the process share the values of a mapped map", ok);
+
+	errno = 0;
+	ok = bpf_freeze(dmap) == -1 && errno == EBUSY;
+	check("BPF_MAP_FREEZE of a map with a mapping that can write gives EBUSY", ok);
+	ok = mprotect(data, map_sz, PROT_READ) == 0 && munmap(data, map_sz) == 0;
+	data = mmap(NULL, map_sz, PROT_READ, MAP_SHARED, dmap, 0);
+	errno = 0;
+	ok = ok && data != MAP_FAILED && mprotect(data, map_sz, PROT_WRITE) == -1 && errno == EACCES;
+	errno = 0;
+	ok = ok && mprotect(data, map_sz, PROT_EXEC) == -1 && errno == EACCES;
+	check("a mapping of a map that only reads cannot get write or exec access", ok);
+	for (i = 0; i < 10; i++) {
+		p = mmap(NULL, map_sz, i % 2 ? PROT_READ : PROT_WRITE, MAP_SHARED, dmap, 0);
+		ok = ok && p != MAP_FAILED && munmap(p, map_sz) == 0;
+	}
+	ok = ok && bpf_freeze(dmap) == 0;
+	errno = 0;
+	ok = ok && mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_SHARED, dmap, 0) == MAP_FAILED &&
+	     errno == EPERM;
+	check("BPF_MAP_FREEZE works after the last mapping that can write, and then none can", ok);
+
+	bss[0] = 321;
+	ok = write(sk[0], "y", 1) == 1 && bss[1] == 321 && data[0] == 111 && data[1] == 222 &&
+	     data[2] == 321 && data[1500] == 3 * 321;
+	check("a program writes a frozen map, and the mapping sees it", ok);
+
+	t0 = mmap(NULL, map_sz, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	t1 = mmap(t0, 3 * page, PROT_READ, MAP_SHARED | MAP_FIXED, dmap, 0);
+	ok = t0 != MAP_FAILED && t1 == t0 && munmap(t1 + page, page) == 0;
+	t2 = mmap(t1 + page, page, PROT_READ, MAP_SHARED | MAP_FIXED, dmap, 0);
+	ok = ok && t2 == t1 + page;
+	t2 = mmap(t1, map_sz, PROT_READ, MAP_SHARED | MAP_FIXED, dmap, 0);
+	p = (unsigned long long *)t2;
+	ok = ok && t2 == t1 && p[0] == 111 && p[1] == 222 && p[2] == 321 && p[1500] == 3 * 321;
+	munmap(t2, map_sz);
+	errno = 0;
+	ok = ok && mmap(NULL, map_sz, PROT_READ, MAP_SHARED, dmap, page) == MAP_FAILED &&
+	     errno == EINVAL;
+	check("the pages of a map map at their offsets, and not past the end", ok);
+
+	p = mmap(NULL, map_sz, PROT_READ, MAP_SHARED, dmap, 0);
+	close(sk[0]);
+	close(sk[1]);
+	close(prog);
+	close(rd);
+	close(bmap);
+	close(dmap);
+	ok = munmap(bss, page) == 0 && munmap(data, map_sz) == 0;
+	fd = bpf_id(14, map_id, NULL);
+	ok = ok && p != MAP_FAILED && fd >= 0;
+	close(fd);
+	munmap(p, map_sz);
+	errno = 0;
+	ok = ok && bpf_id(14, map_id, NULL) == -1 && errno == ENOENT;
+	ok = ok && (bpf_id(12, map_id - 1, &next) == -1 || next > map_id);
+	check("a mapping holds the map, and the map goes with the last mapping", ok);
+}
+
 static void test_bpf(void)
 {
 	unsigned char attr[256] = { 0 };
@@ -7766,6 +7948,7 @@ static void test_bpf(void)
 	test_bpf_cgroup_sock_addr();
 	test_bpf_cgroup_sock_msg();
 	test_bpffs();
+	test_bpf_mmap();
 	umount("/proc");
 }
 

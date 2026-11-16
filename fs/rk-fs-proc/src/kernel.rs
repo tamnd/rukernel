@@ -1591,7 +1591,7 @@ fn vm_flags(a: &Vma<FileRef>, soft_dirty: bool) -> Vec<&'static str> {
         (a.shared && a.may_write, "sh"),
         (true, "mr"),
         (!vvar && (a.may_write || a.kind == VmaKind::Vdso), "mw"),
-        (!vvar, "me"),
+        (!vvar && a.may_exec, "me"),
         (a.shared, "ms"),
         (a.grows_down || a.kind == VmaKind::Stack, "gd"),
         (vvar, "pf"),

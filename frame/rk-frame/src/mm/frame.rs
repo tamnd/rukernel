@@ -539,6 +539,20 @@ impl Frame {
         unsafe { self.word_ptr(index).write_volatile(value) };
     }
 
+    /// The word `index` of the frame as an atomic word, for memory that the kernel and user
+    /// mappings share, as the values of a BPF array map that a process maps.
+    ///
+    /// # Panics
+    ///
+    /// If `index` is not less than `Frame::WORDS`.
+    pub fn atomic_u64(&self, index: usize) -> &AtomicU64 {
+        // SAFETY: the word is in the frame, which the direct map has while this value lives, and
+        // it is 8 byte aligned because the frame is page aligned. The reference does not live
+        // longer than `self`. The kernel accesses such a frame only with copies and atomic
+        // operations, so no access to it is a data race with an atomic operation on the word.
+        unsafe { AtomicU64::from_ptr(self.word_ptr(index)) }
+    }
+
     /// Fills the frame with zeros.
     pub fn zero(&mut self) {
         // SAFETY: as for `write_u64`, for all of the frame.

@@ -10,6 +10,7 @@ use super::{
 use crate::uapi::elem::{BPF_EXIST, BPF_F_ALL_CPUS, BPF_F_LOCK, BPF_NOEXIST};
 use crate::uapi::flags::*;
 use crate::uapi::map_type::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY};
+use crate::value::{MapValue, PAGE_SIZE, Page, zeroed_pages};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use rk_abi::Errno;
@@ -59,6 +60,8 @@ pub struct BpfArray {
     /// The memory of the map, for `map_mem_usage`.
     mem: u64,
     value: Vec<Arc<Elem>>,
+    /// The pages of the values of a map with `BPF_F_MMAPABLE`, which a process can map.
+    pages: Option<Arc<[Arc<Page>]>>,
 }
 
 impl BpfArray {
@@ -80,10 +83,26 @@ impl BpfArray {
         }
         let mut value = Vec::new();
         value.try_reserve_exact(attr.max_entries as usize).map_err(|_| Errno::ENOMEM)?;
-        for _ in 0..attr.max_entries {
-            value.push(Arc::new(Elem::zeroed(nr_vals, elem_size as usize)?));
+        // The values of a map that a process can map are in pages, one after the other, as
+        // `bpf_map_area_mmapable_alloc` of Linux.
+        let pages = if attr.map_flags & BPF_F_MMAPABLE != 0 {
+            let size = usize::try_from(u64::from(attr.max_entries) * elem_size)
+                .map_err(|_| Errno::E2BIG)?;
+            Some(zeroed_pages(size)?)
+        } else {
+            None
+        };
+        for i in 0..attr.max_entries as usize {
+            let elem = match &pages {
+                Some(pages) => {
+                    let size = elem_size as usize;
+                    Elem::with_value(MapValue::in_pages(pages, i * size, size))?
+                }
+                None => Elem::zeroed(nr_vals, elem_size as usize)?,
+            };
+            value.push(Arc::new(elem));
         }
-        Ok(Self { value_size: attr.value_size, percpu, mem, value })
+        Ok(Self { value_size: attr.value_size, percpu, mem, value, pages })
     }
 
     fn index(key: &[u8]) -> usize {
@@ -158,6 +177,16 @@ impl BpfMapOps for BpfArray {
     fn map_mem_usage(&self) -> u64 {
         self.mem
     }
+
+    /// `array_map_mmap` of Linux: the mapping is in the pages of the values.
+    fn map_mmap(&self, pgoff: u64, len: u64) -> Result<Arc<[Arc<Page>]>> {
+        let pages = self.pages.as_ref().ok_or(Errno::EINVAL)?;
+        let end = pgoff.checked_mul(PAGE_SIZE as u64).and_then(|o| o.checked_add(len));
+        if end.is_none_or(|end| end > (pages.len() * PAGE_SIZE) as u64) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(pages.clone())
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +247,22 @@ mod tests {
         e.value(1).read(0, &mut b);
         assert_eq!(&b, b"3333\0\0\0\0");
         assert_eq!(m.map_update_elem(&key(0), b"3333", BPF_NOEXIST, true, ENV), Err(Errno::EEXIST));
+    }
+
+    #[test]
+    fn a_mmapable_array_keeps_its_values_in_pages() {
+        let mut a = attr(BPF_MAP_TYPE_ARRAY);
+        a.map_flags = BPF_F_MMAPABLE;
+        a.max_entries = 600;
+        let m = BpfArray::alloc(&a, 2, u64::MAX).unwrap();
+        m.map_update_elem(&key(512), b"abcd", BPF_ANY, false, ENV).unwrap();
+        let pages = m.map_mmap(0, 2 * PAGE_SIZE as u64).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[1].atomic_u64(0).load(core::sync::atomic::Ordering::Relaxed), 0x6463_6261);
+        assert_eq!(m.map_mmap(1, PAGE_SIZE as u64 + 1).err(), Some(Errno::EINVAL));
+        assert_eq!(m.map_mmap(u64::MAX, 1).err(), Some(Errno::EINVAL));
+        let plain = BpfArray::alloc(&attr(BPF_MAP_TYPE_ARRAY), 2, u64::MAX).unwrap();
+        assert_eq!(plain.map_mmap(0, 1).err(), Some(Errno::EINVAL));
     }
 
     #[test]

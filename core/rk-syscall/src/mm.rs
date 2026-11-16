@@ -396,6 +396,28 @@ impl MmFile for SocketPages {
     }
 }
 
+/// The pages of a mapping of a BPF map, the values of an array map with `BPF_F_MMAPABLE`. The
+/// mapping holds the file, as `vm_file` of Linux, so the map and its ID stay while it exists.
+struct BpfMapPages {
+    map: rk_bpf::file::MapMmap,
+    _file: Arc<rk_vfs::file::File>,
+    dev: u64,
+    ino: u64,
+}
+
+impl MmFile for BpfMapPages {
+    fn page(&self, index: u64) -> Result<Arc<Frame>, Errno> {
+        let index = usize::try_from(index).map_err(|_| Errno::EIO)?;
+        self.map.pages.get(index).cloned().ok_or(Errno::EIO)
+    }
+
+    /// The map shows as `anon_inode:bpf-map` in `/proc/PID/maps`, as the anonymous inode of
+    /// Linux.
+    fn name(&self) -> (u64, u64, Vec<u8>) {
+        (self.dev, self.ino, b"anon_inode:bpf-map".to_vec())
+    }
+}
+
 /// Tells if a shared mapping that can write `inode` exists, as `mapping_writably_mapped` of
 /// Linux.
 pub(crate) fn writably_mapped(inode: &InodeRef) -> bool {
@@ -434,8 +456,26 @@ pub(crate) fn mmap(
     // As `security_mmap_file` in `vm_mmap_pgoff` of Linux.
     rk_vfs::security::mmap_file(file.as_deref(), reqprot, reqprot, u64::from(flags))?;
     let mut may_write = file.as_ref().is_none_or(|f| !shared || f.flags().writable());
+    let mut may_exec = true;
     let file = match file {
         None => None,
+        // A BPF map maps the pages of its values, as `bpf_map_mmap` of Linux.
+        Some(file) if rk_bpf::file::bpf_map_of(&file).is_some() => {
+            let map = rk_bpf::file::bpf_map_of(&file).ok_or(Errno::ENODEV)?;
+            if !file.flags().readable() || (shared && prot.write && !file.flags().writable()) {
+                return Err(Errno::EACCES);
+            }
+            let size = (len as usize).checked_next_multiple_of(PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+            let pgoff = offset / PAGE_SIZE as u64;
+            let map = rk_bpf::file::bpf_map_mmap(&map, shared, prot.write, pgoff, size as u64)?;
+            may_write = map.may_write;
+            // A program reads the values, so no process runs them.
+            may_exec = false;
+            let meta = file.metadata()?;
+            let (dev, ino) = (meta.dev, meta.ino);
+            let pages: Arc<dyn MmFile> = Arc::new(BpfMapPages { map, _file: file, dev, ino });
+            Some((pages, offset))
+        }
         // A socket maps its own pages, as the mapped rings of a packet socket.
         Some(file) if file.inode().is_none() && rk_net::socket_of(&file).is_some() => {
             let sock = rk_net::socket_of(&file).ok_or(Errno::ENODEV)?;
@@ -503,6 +543,7 @@ pub(crate) fn mmap(
         noreplace: flags & MAP_FIXED_NOREPLACE != 0,
         low32: low32(flags),
         may_write,
+        may_exec,
         locked: flags & MAP_LOCKED != 0,
         populate: flags & MAP_POPULATE != 0,
         grows_down: flags & MAP_GROWSDOWN != 0,
@@ -609,13 +650,14 @@ pub(crate) fn remap_file_pages(
             && v.prot == first.prot
             && v.shared
             && v.may_write == first.may_write
+            && v.may_exec == first.may_exec
             && v.locked == first.locked
     };
     if !areas.iter().all(same) {
         return Err(Errno::EINVAL);
     }
-    let (prot, may_write, locked, hugetlb) =
-        (first.prot, first.may_write, first.locked, first.hugetlb);
+    let (prot, may_write, may_exec, locked, hugetlb) =
+        (first.prot, first.may_write, first.may_exec, first.locked, first.hugetlb);
     let file = file.clone();
     drop(areas);
     // The old map goes first, and the file can refuse the new map: a System V segment that
@@ -632,6 +674,7 @@ pub(crate) fn remap_file_pages(
         noreplace: false,
         low32: false,
         may_write,
+        may_exec,
         locked,
         populate: flags as u32 & MAP_NONBLOCK == 0,
         grows_down: false,
