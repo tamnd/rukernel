@@ -777,6 +777,12 @@ pub(crate) fn nft_fib_route(pf: u8, fl: &NftFibFlow) -> Option<(u32, u32)> {
     Some((ty, n.ifindex))
 }
 
+/// Tells if `addr` is in the subnet of an address of the interface `ifindex`, as
+/// `inet_ifa_match` of Linux on each address of the device, for the TTL of nfnetlink_osf.
+pub(crate) fn osf_subnet(ifindex: u32, addr: Addr) -> bool {
+    ROUTES.lock().addrs_of(ifindex).any(|a| ipv4::same_net(addr, a.address, a.prefix))
+}
+
 /// The route of a lookup of the nf_tables expression `rt`: the next hop and the MTU of the
 /// path, as `dst_mtu` of Linux: the metric `mtu` of the route, or the MTU of its device.
 pub(crate) fn nft_rt_route(pf: u8, fl: &NftFibFlow) -> Option<([u8; 16], u32)> {
