@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use rk_abi::Errno;
 use rk_abi::native::if_ether::ETH_P_IP;
+use rk_abi::native::poll::{POLLERR, POLLOUT, POLLWRNORM};
 
 /// An IPv4 UDP frame from `src:sport` to `dst:dport`, with an Ethernet header.
 fn udp(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16) -> NetBuf {
@@ -134,6 +135,7 @@ fn a_detached_file_makes_its_device_persistent() {
     // A file without a device has nothing to change.
     let f = TunFile::new(net.clone());
     assert_eq!(f.set_persist(true).err(), Some(Errno::EBADFD));
+    assert_eq!(f.poll_mask(), POLLERR);
     // As systemd-networkd with `MultiQueue=yes`: `TUNSETIFF`, `TUNSETQUEUE` with
     // `IFF_DETACH_QUEUE`, `TUNSETPERSIST`, and then the close of the file.
     f.set_iff("pq0", IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE).unwrap();
@@ -141,6 +143,9 @@ fn a_detached_file_makes_its_device_persistent() {
     assert!(dev.carrier());
     f.set_queue(IFF_DETACH_QUEUE).unwrap();
     assert_eq!(f.device().err(), Some(Errno::EBADFD));
+    // A detached file can be written, as `tun_chr_poll` of Linux. systemd closes a file of its fd
+    // store that gives `POLLERR`.
+    assert_eq!(f.poll_mask(), POLLOUT | POLLWRNORM);
     f.set_persist(true).unwrap();
     // The detached file still holds the device, so the carrier stays on until the close.
     assert!(dev.carrier());

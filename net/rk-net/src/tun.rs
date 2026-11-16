@@ -532,6 +532,20 @@ impl TunFile {
     }
 }
 
+impl TunFile {
+    /// The poll mask of the file, as `tun_chr_poll` of Linux: `POLLERR` only for a file without
+    /// a device. A file that `IFF_DETACH_QUEUE` took off its queue keeps its device (`tun_get`),
+    /// so it can be written. systemd keeps the files of systemd-networkd in its fd store, polls
+    /// them, and closes a file that gives `POLLERR`.
+    pub(crate) fn poll_mask(&self) -> u32 {
+        if self.bound().is_err() {
+            return POLLERR;
+        }
+        let read = if self.queue.out.lock().is_empty() { 0 } else { POLLIN | POLLRDNORM };
+        read | POLLOUT | POLLWRNORM
+    }
+}
+
 impl Drop for TunFile {
     fn drop(&mut self) {
         self.detach();
@@ -822,11 +836,7 @@ impl FileOps for TunFile {
 
     /// A file without a device gives `POLLERR`, as `tun_chr_poll` of Linux.
     fn poll(&self, _file: &File) -> u32 {
-        if self.device().is_err() {
-            return POLLERR;
-        }
-        let read = if self.queue.out.lock().is_empty() { 0 } else { POLLIN | POLLRDNORM };
-        read | POLLOUT | POLLWRNORM
+        self.poll_mask()
     }
 
     fn pollable(&self) -> bool {
