@@ -33,7 +33,7 @@ apt-get install -qq -y --no-install-recommends gcc libc6-dev libcap-dev linux-li
 git clone --quiet --depth 1 --branch "$LINUX_TAG" --filter=blob:none --sparse \
 	https://github.com/torvalds/linux /linux
 cd /linux
-git sparse-checkout set --no-cone /tools/ /kernel/bpf/disasm.c /kernel/bpf/disasm.h >/dev/null
+git sparse-checkout set --no-cone /tools/ /scripts/bpf_doc.py /kernel/bpf/disasm.c /kernel/bpf/disasm.h >/dev/null
 cd tools/testing/selftests
 for t in $TESTS; do
 	# The tests of lsm also need lsm/common.c, as their Makefile.

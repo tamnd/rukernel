@@ -30,5 +30,5 @@ The skipped tests:
 ## Notes
 
 - rukernel cannot load bpf_testmod.ko. build.sh changes test_verifier so that it runs on without the module. No test of the five program types fails without the module.
-- The verifier prunes a path when its state is equal to a state that it saw before at the same jump target, as `is_state_visited` of Linux. A path that comes back to an equal state is a loop that does not end, and the verifier gives "infinite loop detected at insn N". A loop that changes its state goes on to the limit of 1000000 instructions and gives "BPF program is too large".
+- The verifier prunes a path when its state is within a safe state that it kept before at the same prune point, as `is_state_visited` and `states_equal` of Linux (#762). A path that comes back to a state on the path that is equal to it is a loop that does not end, and the verifier gives "infinite loop detected at insn N". A loop that changes its state goes on to the limit of 1000000 instructions and gives "BPF program is too large".
 - The registers and the stack of a verifier state are on the heap. A debug build of the kernel keeps many copies of a state on the stack, and the 32 KiB kernel stack overflowed with large states.

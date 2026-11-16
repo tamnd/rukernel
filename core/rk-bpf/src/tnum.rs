@@ -160,6 +160,14 @@ impl Tnum {
         (self.value & !mu) == (b.value & !mu)
     }
 
+    /// Tells if each number of `b` is a number of `self`, `tnum_in` of Linux.
+    pub fn contains(self, b: Self) -> bool {
+        if b.mask & !self.mask != 0 {
+            return false;
+        }
+        self.value == b.value & !self.mask
+    }
+
     /// The tnum of the numbers that are in both, `tnum_intersect` of Linux.
     pub fn intersect(self, b: Self) -> Self {
         let v = self.value | b.value;
@@ -200,5 +208,15 @@ mod tests {
         assert_eq!(x.max(), 7);
         assert!(x.can_equal(Tnum::constant(5)));
         assert!(!x.can_equal(Tnum::constant(8)));
+    }
+
+    #[test]
+    fn a_tnum_contains_the_tnums_with_fewer_numbers() {
+        let low = Tnum::range(0, 7);
+        assert!(low.contains(Tnum::constant(5)));
+        assert!(low.contains(Tnum::range(0, 3)));
+        assert!(!low.contains(Tnum::constant(8)));
+        assert!(!Tnum::constant(5).contains(low));
+        assert!(TNUM_UNKNOWN.contains(low));
     }
 }

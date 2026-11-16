@@ -9,8 +9,8 @@
 //!   reachable. With `CAP_BPF`, `do_check` follows each round of a loop, so a loop must end
 //!   within `BPF_COMPLEXITY_LIMIT_INSNS`.
 //! - `do_check` follows each path of the program with the state of the registers and of the
-//!   stack. It does not prune states, so the number of paths is limited by
-//!   `BPF_COMPLEXITY_LIMIT_INSNS`.
+//!   stack. It keeps states at the prune points, and a path stops when its state is within a
+//!   kept state whose paths are all safe, as `is_state_visited` of Linux (see `states`).
 //! - A scalar has a tnum and the unsigned and signed bounds. A pointer is to the context, to the
 //!   stack, to a map, or to a map value that can be NULL until the program checks it.
 //! - A call of a function of the program gets a new frame, and the verifier checks the function
@@ -40,6 +40,12 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use rk_abi::Errno;
 
+mod states;
+#[cfg(test)]
+mod systemd_tests;
+
+use states::{StateLists, Stats, Visit};
+
 type Result<T> = core::result::Result<T, Errno>;
 
 /// The log level that writes the errors and the statistics, `BPF_LOG_LEVEL1` of Linux.
@@ -55,11 +61,6 @@ pub const BPF_LOG_MASK: u32 = BPF_LOG_LEVEL1 | BPF_LOG_LEVEL2 | BPF_LOG_STATS | 
 
 /// The most states that wait to be checked, `BPF_COMPLEXITY_LIMIT_JMP_SEQ` of Linux.
 const BPF_COMPLEXITY_LIMIT_JMP_SEQ: usize = 8192;
-/// The most states that `do_check` keeps for the pruning. A state is about 5 KiB.
-const MAX_KEPT_STATES: usize = 1024;
-/// The most states that `do_check` keeps for one instruction. The states of a loop are all
-/// different, and each round compares the state with each kept state.
-const MAX_KEPT_STATES_PER_INSN: usize = 16;
 /// The largest offset of a pointer, `BPF_MAX_VAR_OFF` of Linux.
 const BPF_MAX_VAR_OFF: i64 = 1 << 29;
 
@@ -344,6 +345,10 @@ struct Env<'a> {
     enforce_expected_attach_type: bool,
     id_gen: u32,
     insn_processed: u32,
+    /// The jumps that `do_check` looked at, `jmps_processed` of Linux.
+    jmps_processed: u32,
+    /// The statistics of the kept states.
+    stats: Stats,
     /// The functions of the program, ordered by their first instruction.
     subprogs: Vec<Subprog>,
     /// The type of the pointer of each load or store, `insn_aux_data[].ptr_type` of Linux.
@@ -420,6 +425,8 @@ pub fn bpf_check(
             enforce_expected_attach_type: false,
             id_gen: 0,
             insn_processed: 0,
+            jmps_processed: 0,
+            stats: Stats::default(),
             subprogs: Vec::new(),
             ptr_types: Vec::new(),
         };
@@ -433,7 +440,7 @@ pub fn bpf_check(
         match r.and_then(|()| resolve_pseudo_ldimm64(&mut insns, map_by_fd, fd_array, log)) {
             Ok(m) => m,
             Err(e) => {
-                print_verification_stats(log, 0);
+                print_verification_stats(log, 0, Stats::default());
                 return Err(e);
             }
         };
@@ -450,6 +457,8 @@ pub fn bpf_check(
         enforce_expected_attach_type: false,
         id_gen: 0,
         insn_processed: 0,
+        jmps_processed: 0,
+        stats: Stats::default(),
         subprogs,
         ptr_types: vec![RegType::NotInit; insns.len()],
     };
@@ -458,7 +467,7 @@ pub fn bpf_check(
         .and_then(|()| env.do_check())
         .and_then(|()| env.check_max_stack_depth())
         .and_then(|()| env.fixup_call_args());
-    print_verification_stats(env.log, env.insn_processed);
+    print_verification_stats(env.log, env.insn_processed, env.stats);
     r?;
     let insn_processed = env.insn_processed;
     let enforce_expected_attach_type = env.enforce_expected_attach_type;
@@ -466,11 +475,15 @@ pub fn bpf_check(
 }
 
 /// The last line of the log, `print_verification_stats` of Linux.
-fn print_verification_stats(log: &mut BpfVerifierLog, insn_processed: u32) {
+fn print_verification_stats(log: &mut BpfVerifierLog, insn_processed: u32, stats: Stats) {
     log.write(format_args!(
-        "processed {} insns (limit {}) max_states_per_insn 0 total_states 0 peak_states 0 \
+        "processed {} insns (limit {}) max_states_per_insn {} total_states {} peak_states {} \
          mark_read 0\n",
-        insn_processed, BPF_COMPLEXITY_LIMIT_INSNS
+        insn_processed,
+        BPF_COMPLEXITY_LIMIT_INSNS,
+        stats.max_states_per_insn,
+        stats.total_states,
+        stats.peak_states
     ));
 }
 
@@ -927,35 +940,28 @@ impl Env<'_> {
         regs[BPF_REG_FP as usize] = Reg::ptr(RegType::PtrToStack);
         let st =
             State { regs, stack: vec![StackSlot::EMPTY; SLOTS], subprog: 0, callers: Vec::new() };
-        // The pruning of `is_state_visited` of Linux, with states that are equal. A state that
-        // is equal to a state of the same instruction gives the same result, so the path stops.
-        // When the earlier state is on the current path, the path is a loop that does not end.
-        // A path that waits in `pending` remembers the length of `path` when it starts, because
-        // the states after that length are of a branch that is complete when it starts.
         let prune = self.prune_points();
-        let mut kept: Vec<Vec<(State, bool)>> = vec![Vec::new(); self.insns.len()];
-        let mut nkept = 0;
-        let mut path: Vec<(usize, usize)> = Vec::new();
+        let live = states::live_regs(self.insns);
+        let mut lists = StateLists::new(self.insns.len());
+        // A branch that waits remembers the length of the path of kept states when it starts.
         let mut pending: Vec<(usize, State, usize)> = vec![(0, st, 0)];
+        let r = self.check_paths(&prune, &live, &mut lists, &mut pending);
+        self.stats = lists.stats;
+        r
+    }
+
+    /// The loop of `do_check`.
+    fn check_paths(
+        &mut self,
+        prune: &[bool],
+        live: &[u16],
+        lists: &mut StateLists,
+        pending: &mut Vec<(usize, State, usize)>,
+    ) -> Result<()> {
         while let Some((mut pc, mut st, depth)) = pending.pop() {
-            for (p, i) in path.drain(depth..) {
-                kept[p][i].1 = false;
-            }
+            lists.leave_path(depth);
             loop {
-                if prune[pc] {
-                    if let Some(&(_, on_path)) = kept[pc].iter().find(|(s, _)| *s == st) {
-                        if on_path {
-                            verbose!(self, "infinite loop detected at insn {}\n", pc);
-                            return Err(Errno::EINVAL);
-                        }
-                        break;
-                    }
-                    if nkept < MAX_KEPT_STATES && kept[pc].len() < MAX_KEPT_STATES_PER_INSN {
-                        kept[pc].push((st.clone(), true));
-                        path.push((pc, kept[pc].len() - 1));
-                        nkept += 1;
-                    }
-                }
+                // Linux counts the instruction where the path stops.
                 self.insn_processed += 1;
                 if self.insn_processed > BPF_COMPLEXITY_LIMIT_INSNS {
                     verbose!(
@@ -965,8 +971,29 @@ impl Env<'_> {
                     );
                     return Err(Errno::E2BIG);
                 }
+                if prune[pc] {
+                    match lists.visit(
+                        pc,
+                        &mut st,
+                        live,
+                        self.bpf_capable,
+                        self.allow_ptr_leaks,
+                        self.insn_processed,
+                        self.jmps_processed,
+                    ) {
+                        Visit::Prune => break,
+                        Visit::Loop => {
+                            verbose!(self, "infinite loop detected at insn {}\n", pc);
+                            return Err(Errno::EINVAL);
+                        }
+                        Visit::Go => {}
+                    }
+                }
                 if self.log.level & BPF_LOG_LEVEL2 != 0 {
                     verbose!(self, "{}: (code {:02x})\n", pc, self.insns[pc].code);
+                }
+                if matches!(bpf_class(self.insns[pc].code), BPF_JMP | BPF_JMP32) {
+                    self.jmps_processed += 1;
                 }
                 match self.do_insn(pc, &mut st)? {
                     Next::Go(next) => pc = next,
@@ -979,7 +1006,7 @@ impl Env<'_> {
                             );
                             return Err(Errno::E2BIG);
                         }
-                        pending.push((other, *other_state, path.len()));
+                        pending.push((other, *other_state, lists.path_len()));
                         pc = next;
                     }
                     Next::Exit => break,
@@ -989,21 +1016,38 @@ impl Env<'_> {
         Ok(())
     }
 
-    /// The instructions where `do_check` compares the states, as `mark_prune_point` of Linux:
-    /// the targets of the jumps and the instructions after the conditional jumps.
+    /// The instructions where `do_check` compares the states, as `mark_prune_point` in
+    /// `visit_insn` of Linux: a conditional jump and its target, the target of `BPF_JA`, the
+    /// instruction after a call, and a call of a function of the program and its first
+    /// instruction.
     fn prune_points(&self) -> Vec<bool> {
         let n = self.insns.len();
         let mut prune = vec![false; n];
+        let mut mark = |w: i64| {
+            if (0..n as i64).contains(&w) {
+                prune[w as usize] = true;
+            }
+        };
         for i in 0..n {
-            let class = bpf_class(self.insns[i].code);
-            if (class != BPF_JMP && class != BPF_JMP32)
-                || matches!(bpf_op(self.insns[i].code), BPF_EXIT | BPF_CALL)
-            {
+            let insn = self.insns[i];
+            let class = bpf_class(insn.code);
+            if class != BPF_JMP && class != BPF_JMP32 {
                 continue;
             }
-            for w in successors(self.insns, i).into_iter().flatten() {
-                if (0..n as i64).contains(&w) {
-                    prune[w as usize] = true;
+            let succ = successors(self.insns, i);
+            match bpf_op(insn.code) {
+                BPF_EXIT => {}
+                BPF_JA => succ.into_iter().flatten().for_each(&mut mark),
+                BPF_CALL => {
+                    mark(i as i64 + 1);
+                    if insn.src_reg == BPF_PSEUDO_CALL {
+                        mark(i as i64);
+                        succ[1].into_iter().for_each(&mut mark);
+                    }
+                }
+                _ => {
+                    mark(i as i64);
+                    succ[1].into_iter().for_each(&mut mark);
                 }
             }
         }
@@ -3171,7 +3215,7 @@ mod tests {
         // With `CAP_BPF` a loop is allowed, but it must end.
         let (r, log) = check(&[mov64_imm(0, 0), jmp_imm(BPF_JEQ, 0, 0, -2), exit()], true);
         assert_eq!(r.err(), Some(Errno::EINVAL));
-        assert!(log.contains("infinite loop detected at insn 0"), "{log}");
+        assert!(log.contains("infinite loop detected at insn 1"), "{log}");
         let p = [mov64_imm(0, 0), alu64_imm(BPF_ADD, 0, 1), jmp_imm(BPF_JNE, 0, 0, -2), exit()];
         let (r, log) = check(&p, true);
         assert_eq!(r.err(), Some(Errno::E2BIG));
